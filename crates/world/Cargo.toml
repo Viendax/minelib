@@ -1,0 +1,7 @@
+[package]
+name = "minelib-world"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytemuck.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "minelib-assets"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+zip.workspace = true
+image.workspace = true

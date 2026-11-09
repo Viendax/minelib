@@ -1,0 +1,40 @@
+CREDITS – VoxelArt Libre
+========================
+Toutes les licences ci-dessous sont compatibles avec un jeu sous GPLv3.
+Le détail fichier par fichier (auteur, licence, source, modifications) est dans LICENSES.csv.
+
+--- TEXTURES -------------------------------------------------------------------
+
+« ProgrammerArt » par deathcap – CC BY 4.0 (ATTRIBUTION OBLIGATOIRE)
+  https://creativecommons.org/licenses/by/4.0/ – texte complet : licenses/CC-BY-4.0.txt
+  Source : https://github.com/deathcap/ProgrammerArt (commit 037dba4)
+  Modifications : sélection, renommage de fichiers (redstone -> energy, netherrack -> hellrock,
+  nether_wart -> fire_wart, soul_sand -> ash_sand, ice_packed -> packed_ice),
+  recoloration de leaves_birch, leaves_birch_opaque, snow et piston_bottom.
+
+« Minecraft-Textures » par Auseawesome – CC0
+  https://github.com/Auseawesome/Minecraft-Textures (commit 149e1b2)
+
+Interface, ciel, particules, missing.png – créés pour ce pack – CC0
+
+--- SONS (tous CC0) --------------------------------------------------------------
+Kenney (kenney.nl)     : 50 RPG sound effects, Interface Sounds, 51 UI sound effects
+rubberduck             : 100 CC0 SFX, 100 CC0 metal and wood SFX, 80 CC0 creature SFX,
+                         80 CC0 RPG SFX, 75 CC0 breaking/falling/hit sfx, 25 CC0 bang/firework SFX
+TinyWorlds             : Different steps on wood, stone, leaves, gravel and mud
+Till Behrend (greenfox): Glass Break
+themightyglider        : Shovel Sound
+petenice               : splash (Freesound 9508)
+Tous via https://opengameart.org (sauf petenice : freesound.org). Convertis en mono, normalisés ;
+certains filtrés ou transposés (sable, neige…), voir LICENSES.csv.
+
+--- MUSIQUES (toutes CC0) --------------------------------------------------------
+calm theme – pebonius            | Cave Theme – haeldb
+Beautiful Forest – nene          | Exploration Theme – Cleyton Kauffman
+First Light Particles – yoiyami  | Another August – cynicmusic
+Contemplation – joth             | Happy Lullaby (song17) – cynicmusic
+
+--- POLICES ----------------------------------------------------------------------
+KenPixel – Kenney – CC0 (licenses/kenney-fonts-CC0.txt)
+
+Le CC0 n'exige aucune mention, mais créditer les auteurs est apprécié.

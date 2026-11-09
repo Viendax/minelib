@@ -1,0 +1,19 @@
+[package]
+name = "minelib"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+env_logger.workspace = true
+log.workspace = true
+glam.workspace = true
+winit.workspace = true
+flate2 = "1"
+image.workspace = true
+# Presse-papier (image de la dernière capture d'écran).
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+minelib-platform = { path = "../platform" }
+minelib-render = { path = "../render" }
+minelib-world = { path = "../world" }
+minelib-assets = { path = "../assets" }

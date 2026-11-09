@@ -1,0 +1,17 @@
+[package]
+name = "minelib-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+font8x8.workspace = true
+winit.workspace = true
+minelib-world = { path = "../world" }
+minelib-assets = { path = "../assets" }
+

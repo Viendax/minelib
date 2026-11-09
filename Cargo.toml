@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/platform", "crates/render", "crates/world", "crates/assets", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+winit = "0.30"
+wgpu = "25"
+glam = { version = "0.30", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+font8x8 = { version = "0.3", default-features = false }
+zip = { version = "2", default-features = false, features = ["deflate", "deflate64", "bzip2"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.dev.package."*"]
+opt-level = 2 # dépendances optimisées même en debug (génération/maillage plus fluides)
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
