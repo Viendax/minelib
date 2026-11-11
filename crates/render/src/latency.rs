@@ -34,10 +34,106 @@ pub enum Marker {
     InputSample = 6,
 }
 
+/// Décide, image par image, s'il faut laisser le pilote faire attendre le jeu (Reflex,
+/// Anti-Lag). Cette attente ne réduit la latence que si la carte graphique est le frein
+/// (des images s'empilent devant elle) ; quand c'est le processeur qui limite, la file est
+/// déjà vide et l'attente du pilote, arrondie à ~0,5 ms par Windows, ne fait que plafonner
+/// les FPS (paliers à 320 / 390 images par seconde). On reconnaît la carte saturée au temps
+/// que le jeu passe bloqué à lui remettre l'image.
+#[derive(Clone, Debug)]
+pub struct Pacer {
+    /// Attente du pilote en service.
+    pub driver_wait: bool,
+    /// Part lissée de l'image passée bloquée sur la carte graphique.
+    blocked: f32,
+    /// Temps depuis le dernier changement d'état.
+    timer: f32,
+    /// Délai avant le prochain essai sans attente (doublé à chaque essai manqué).
+    retry: f32,
+    /// Durée lissée d'une image sans l'attente du pilote (s).
+    frame: f32,
+}
+
+impl Default for Pacer {
+    fn default() -> Self {
+        Self {
+            driver_wait: true,
+            blocked: 0.0,
+            timer: 0.0,
+            retry: Self::RETRY_MIN,
+            frame: 0.0,
+        }
+    }
+}
+
+impl Pacer {
+    const RETRY_MIN: f32 = 3.0;
+    const RETRY_MAX: f32 = 60.0;
+    /// Au-delà de cette part de l'image passée bloquée, la carte graphique est le frein.
+    const GPU_BOUND: f32 = 0.6;
+    /// En dessous de cette durée d'image (plus de 250 images par seconde), l'attente du
+    /// pilote ne sert plus : même avec la carte saturée, les images en file ne coûtent que
+    /// 2 à 4 ms de retard, alors que l'attente retire un tiers des images par seconde
+    /// (mesuré : 2,1 ms par image sans elle, 3,2 ms avec).
+    const SLOW_FRAME: f32 = 0.004;
+    /// Durée d'un essai sans attente avant de le juger réussi.
+    const TRIAL: f32 = 0.5;
+
+    /// `dt` : durée de l'image précédente ; `blocked` : temps passé bloqué à attendre la
+    /// carte graphique (image de la fenêtre, envoi, présentation). Renvoie vrai si l'état
+    /// a changé.
+    pub fn blocked_share(&self) -> f32 {
+        self.blocked
+    }
+
+    pub fn update(&mut self, dt: f32, blocked: f32) -> bool {
+        if dt <= 0.0 || dt > 0.25 {
+            return false;
+        }
+        self.timer += dt;
+        if self.driver_wait {
+            // Avec l'attente du pilote, rien ne dit qui limite : essai périodique sans.
+            if self.timer >= self.retry {
+                self.driver_wait = false;
+                self.timer = 0.0;
+                self.blocked = 0.0;
+                self.frame = 0.0;
+                return true;
+            }
+            return false;
+        }
+        let k = (dt / 0.1).min(1.0);
+        self.blocked += ((blocked / dt).clamp(0.0, 1.0) - self.blocked) * k;
+        self.frame = if self.frame == 0.0 {
+            dt
+        } else {
+            self.frame + (dt - self.frame) * k
+        };
+        if self.blocked > Self::GPU_BOUND && self.frame > Self::SLOW_FRAME {
+            // Carte saturée : l'attente du pilote reprend ; essai suivant plus tard si
+            // celui-ci venait de commencer.
+            if self.timer < Self::TRIAL * 4.0 {
+                self.retry = (self.retry * 2.0).min(Self::RETRY_MAX);
+            } else {
+                self.retry = Self::RETRY_MIN;
+            }
+            self.driver_wait = true;
+            self.timer = 0.0;
+            return true;
+        }
+        if self.timer > Self::TRIAL * 4.0 {
+            self.retry = Self::RETRY_MIN;
+        }
+        false
+    }
+}
+
 pub struct LowLatency {
     kind: LowLatencyKind,
     enabled: bool,
     frame: u64,
+    pacer: Pacer,
+    last: Option<std::time::Instant>,
     #[cfg(windows)]
     imp: win::Imp,
 }
@@ -65,6 +161,8 @@ impl LowLatency {
                 kind,
                 enabled: false,
                 frame: 0,
+                pacer: Pacer::default(),
+                last: None,
                 imp,
             })
         }
@@ -97,15 +195,42 @@ impl LowLatency {
         );
     }
 
-    /// Début d'image, avant la lecture des entrées : attente pilotée par le pilote.
-    pub fn frame_begin(&mut self) {
+    /// Début d'image, avant la lecture des entrées : attente pilotée par le pilote, si la
+    /// carte graphique est le frein (voir `Pacer`). `blocked` : temps passé bloqué sur la
+    /// carte pendant l'image précédente (s).
+    pub fn frame_begin(&mut self, blocked: f32) {
         self.frame += 1;
+        let now = std::time::Instant::now();
+        let dt = self.last.map_or(0.0, |t| (now - t).as_secs_f32());
+        if self.enabled && self.pacer.update(dt, blocked) {
+            log::info!(
+                "{} : attente du pilote {} — image {:.2} ms, part bloquée sur la carte {:.0} %",
+                self.kind.label(),
+                if self.pacer.driver_wait {
+                    "reprise (carte graphique saturée, moins de 250 images par seconde)"
+                } else {
+                    "suspendue (essai)"
+                },
+                dt * 1000.0,
+                self.pacer.blocked_share() * 100.0
+            );
+        }
         #[cfg(windows)]
         if self.enabled {
-            self.imp.sleep();
+            if self.pacer.driver_wait {
+                self.imp.sleep();
+            }
             self.imp.marker(self.frame, Marker::SimulationStart);
             self.imp.marker(self.frame, Marker::InputSample);
         }
+        // L'image se compte après l'attente : elle n'entre pas dans la part bloquée.
+        self.last = Some(std::time::Instant::now());
+        let _ = now;
+    }
+
+    /// L'attente du pilote est-elle en service en ce moment ?
+    pub fn driver_wait(&self) -> bool {
+        self.enabled && self.pacer.driver_wait
     }
 
     pub fn marker(&self, m: Marker) {
@@ -355,4 +480,45 @@ mod win {
     const _: () = assert!(std::mem::size_of::<SleepModeParams>() == 44);
     const _: () = assert!(std::mem::size_of::<MarkerParams>() == 88);
     const _: () = assert!(std::mem::size_of::<AntiLagData>() == 32);
+}
+
+#[cfg(test)]
+mod pacer_tests {
+    use super::Pacer;
+
+    fn run(p: &mut Pacer, secs: f32, dt: f32, blocked: f32) {
+        for _ in 0..(secs / dt) as usize {
+            p.update(dt, blocked);
+        }
+    }
+
+    #[test]
+    fn driver_wait_is_dropped_when_the_cpu_is_the_limit_and_kept_when_the_gpu_is() {
+        let mut p = Pacer::default();
+        assert!(p.driver_wait);
+        // Processeur limitant : 1 ms par image dont 0,4 ms de présentation.
+        run(&mut p, 4.0, 0.001, 0.0004);
+        assert!(!p.driver_wait, "essai lancé puis gardé");
+        run(&mut p, 10.0, 0.001, 0.0004);
+        assert!(!p.driver_wait);
+        // Carte saturée mais images très courtes (2 ms) : l'attente coûterait plus qu'elle
+        // ne rapporte.
+        run(&mut p, 2.0, 0.002, 0.0015);
+        assert!(
+            !p.driver_wait,
+            "plus de 250 images par seconde : pas d'attente"
+        );
+        // La carte sature pour de bon : 5 ms par image dont 4 ms bloquées.
+        run(&mut p, 0.5, 0.005, 0.004);
+        assert!(p.driver_wait, "attente reprise");
+        // Tant qu'elle sature, les essais échouent vite et s'espacent.
+        let mut free = 0.0;
+        for _ in 0..(60.0f32 / 0.005) as usize {
+            p.update(0.005, 0.004);
+            if !p.driver_wait {
+                free += 0.005;
+            }
+        }
+        assert!(free < 3.0, "sans attente {free} s sur 60");
+    }
 }

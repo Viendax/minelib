@@ -30,6 +30,8 @@
 //!   MINELIB_DEMO=1              nouveau monde : mur + toutes les torches colorées
 //!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé)
 //!   MINELIB_EXIT_AFTER=<s>      quitter automatiquement (tests)
+//!   MINELIB_SMOKE=<x>,<y>,<z>   mode FPS : fumigène posée là toutes les 18 s (essais)
+//!   MINELIB_SMOKE_Q=<n>,<pas>   qualité des fumigènes : pas max et longueur (essais)
 
 // Windows : pas de fenêtre de console à côté du jeu (le journal va dans .minelib/logs).
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -48,6 +50,7 @@ mod keys;
 mod mcimport;
 mod menu;
 mod player;
+mod player_model;
 mod save;
 mod session;
 mod streaming;
@@ -328,12 +331,18 @@ impl Game {
         }
     }
 
+    /// Limite d'images par seconde : variable MINELIB_FPS_MAX, sinon le réglage.
+    fn fps_limit(&self) -> Option<f32> {
+        self.fps_max
+            .or((self.options.fps_max > 0).then_some(self.options.fps_max as f32))
+    }
+
     fn limit_fps(&mut self) {
         // Hors du jeu, les menus n'ont pas besoin de plus de 120 images/s.
         let max = if self.session.is_some() {
-            self.fps_max
+            self.fps_limit()
         } else {
-            Some(self.fps_max.unwrap_or(120.0).min(120.0))
+            Some(self.fps_limit().unwrap_or(120.0).min(120.0))
         };
         if let Some(max) = max {
             let _s = minelib_render::perf::scope("limiteur de FPS (attente voulue)");
@@ -1043,6 +1052,27 @@ impl Game {
             scale = ((0.5 + f * 0.5) * 20.0).round() / 20.0;
         }
         y += step;
+        // Limite de FPS : 30 à 500 par pas de 10, tout à droite = illimité. Moins d'images,
+        // moins de chauffe : les FPS restent stables au lieu de baisser quand le PC chauffe.
+        let cur = self.options.fps_max;
+        let label = if cur == 0 {
+            "Limite de FPS : illimité".to_string()
+        } else {
+            format!("Limite de FPS : {cur}")
+        };
+        let frac = if cur == 0 {
+            1.0
+        } else {
+            (cur.clamp(30, 500) - 30) as f32 / 470.0 * 0.985
+        };
+        if let Some(f) = c.slider(6, &mut self.slider_drag, &label, frac, cx, y, 300.0) {
+            self.options.fps_max = if f > 0.985 {
+                0
+            } else {
+                (30.0 + f / 0.985 * 470.0).round() as u32 / 10 * 10
+            };
+        }
+        y += step;
         let ds = (s / 2.0).floor().max(1.0);
         // Raytracing des reflets (écrit pour Minelib : marche sur toutes les cartes).
         let rt_label = if raytracing {
@@ -1176,6 +1206,16 @@ impl GameLoop for Game {
                 gpu_plan::apply(&mut r, &mut self.options, first_launch);
                 // Anticrénelage temporel : toujours actif (MINELIB_TAA=0 seulement pour les tests).
                 r.set_antialiasing(std::env::var("MINELIB_TAA").map_or(true, |v| v != "0"));
+                // Essais : MINELIB_SMOKE_Q=<pas max>,<longueur d'un pas> (qualité des fumigènes).
+                if let Ok(q) = std::env::var("MINELIB_SMOKE_Q") {
+                    let v: Vec<f32> = q.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                    if v.len() == 2 {
+                        r.set_smoke_quality(minelib_render::SmokeQuality {
+                            max_steps: v[0] as u32,
+                            step: v[1],
+                        });
+                    }
+                }
                 self.sysmon.set_gpu_name(&r.adapter_name);
                 // Mémoire vidéo : 80 % de la mémoire dédiée de la carte, moins 512 Mo pour
                 // l'image, l'anticrénelage et les textures.
@@ -1410,7 +1450,7 @@ impl GameLoop for Game {
             let frames = debug::frame_summary(&self.frame_times);
             let stats = self.last_stats;
             let sys = self.sysmon.latest();
-            let fps_max = self.fps_max;
+            let fps_max = self.fps_limit();
             if let Some(s) = &mut self.session {
                 s.update(input, dt, &mut renderer, active);
                 let _ui = minelib_render::perf::scope("interface");

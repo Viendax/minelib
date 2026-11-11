@@ -207,39 +207,58 @@ impl Taa {
         };
         let vl = std::slice::from_ref(vertex_layout);
         let greater = wgpu::CompareFunction::Greater; // Z inversé
-        let block = mk(
-            "blocs (TAA)",
-            "vs_block",
-            "fs_block_fast_mv",
-            vl,
-            Some(wgpu::Face::Back),
-            true,
-            greater,
-            None,
-            wgpu::ColorWrites::ALL,
-        );
-        let reflective = mk(
-            "reflets (TAA)",
-            "vs_block",
-            "fs_block_mv",
-            vl,
-            Some(wgpu::Face::Back),
-            true,
-            greater,
-            None,
-            wgpu::ColorWrites::ALL,
-        );
-        // Translucides : couleur mélangée, on garde le mouvement de ce qui est derrière.
-        let translucent = mk(
-            "translucide (TAA)",
-            "vs_block",
-            "fs_block_translucent_mv",
-            vl,
-            None,
-            false,
-            greater,
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-            wgpu::ColorWrites::empty(),
+                                                      // Shaders lourds du monde compilés en parallèle (plusieurs secondes chacun sous DirectX).
+        let t0 = std::time::Instant::now();
+        let (block, reflective, translucent) = std::thread::scope(|sc| {
+            let block = sc.spawn(|| {
+                mk(
+                    "blocs (TAA)",
+                    "vs_block",
+                    "fs_block_fast_mv",
+                    vl,
+                    Some(wgpu::Face::Back),
+                    true,
+                    greater,
+                    None,
+                    wgpu::ColorWrites::ALL,
+                )
+            });
+            let reflective = sc.spawn(|| {
+                mk(
+                    "reflets (TAA)",
+                    "vs_block",
+                    "fs_block_mv",
+                    vl,
+                    Some(wgpu::Face::Back),
+                    true,
+                    greater,
+                    None,
+                    wgpu::ColorWrites::ALL,
+                )
+            });
+            // Translucides : couleur mélangée, on garde le mouvement de ce qui est derrière.
+            let translucent = sc.spawn(|| {
+                mk(
+                    "translucide (TAA)",
+                    "vs_block",
+                    "fs_block_translucent_mv",
+                    vl,
+                    None,
+                    false,
+                    greater,
+                    Some(wgpu::BlendState::ALPHA_BLENDING),
+                    wgpu::ColorWrites::empty(),
+                )
+            });
+            (
+                block.join().expect("pipeline des blocs (TAA)"),
+                reflective.join().expect("pipeline réfléchissant (TAA)"),
+                translucent.join().expect("pipeline translucide (TAA)"),
+            )
+        });
+        log::info!(
+            "shaders du monde (TAA) compilés en {:.1} s",
+            t0.elapsed().as_secs_f32()
         );
         let sky = mk(
             "ciel (TAA)",

@@ -30,6 +30,13 @@ pub fn resolve(pack: &ResourcePack, src: &TexSrc) -> Rgba {
     match src {
         TexSrc::Pack(n) => load(n).unwrap_or_else(|| Rgba::missing(16)),
         TexSrc::Flat(c) => flat(*c),
+        TexSrc::Glass(tint, mask) => connected(
+            stained(load("glass").unwrap_or_else(|| Rgba::missing(16)), *tint),
+            *mask,
+        ),
+        TexSrc::Banner(n, lower) => {
+            banner_half(load(n).unwrap_or_else(|| Rgba::missing(16)), *lower)
+        }
         TexSrc::Tint(n, c) => {
             let mut img = load(n).unwrap_or_else(|| Rgba::missing(16));
             for px in img.data.chunks_exact_mut(4) {
@@ -40,6 +47,100 @@ pub fn resolve(pack: &ResourcePack, src: &TexSrc) -> Rgba {
             img
         }
     }
+}
+
+/// Verre teinté à partir du verre incolore : le vide prend la couleur, translucide ; le
+/// cadre et les reflets se teintent en restant plus clairs. Blanc : inchangé.
+fn stained(mut img: Rgba, tint: [u8; 3]) -> Rgba {
+    if tint == [255; 3] {
+        return img;
+    }
+    for px in img.data.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            px[..3].copy_from_slice(&tint);
+            px[3] = 96;
+        } else {
+            for k in 0..3 {
+                let c = tint[k] as f32 * 0.6 + 255.0 * 0.4;
+                px[k] = (px[k] as f32 * c / 255.0) as u8;
+            }
+            px[3] = px[3].max(150);
+        }
+    }
+    img
+}
+
+/// Verre raccordé : les bords du masque (1 haut, 2 droite, 4 bas, 8 gauche) prennent la
+/// couleur la plus fréquente de l'intérieur (transparent pour le verre incolore). Un coin
+/// ne disparaît que si ses deux bords disparaissent.
+fn connected(mut img: Rgba, mask: u8) -> Rgba {
+    let (w, h) = (img.width as usize, img.height as usize);
+    if mask == 0 || w < 4 || h < 4 {
+        return img;
+    }
+    let edge = (w / 16).max(1);
+    let px = |img: &Rgba, x: usize, y: usize| {
+        let i = (y * w + x) * 4;
+        [
+            img.data[i],
+            img.data[i + 1],
+            img.data[i + 2],
+            img.data[i + 3],
+        ]
+    };
+    let mut counts: std::collections::HashMap<[u8; 4], usize> = Default::default();
+    for y in edge..h - edge {
+        for x in edge..w - edge {
+            *counts.entry(px(&img, x, y)).or_default() += 1;
+        }
+    }
+    let fill = counts
+        .into_iter()
+        .max_by_key(|&(c, n)| (n, c))
+        .map_or([0; 4], |(c, _)| c);
+    for y in 0..h {
+        for x in 0..w {
+            let top = y < edge;
+            let bottom = y >= h - edge;
+            let left = x < edge;
+            let right = x >= w - edge;
+            let edges = [(top, 1u8), (right, 2), (bottom, 4), (left, 8)];
+            let on: Vec<u8> = edges.iter().filter(|e| e.0).map(|e| e.1).collect();
+            if !on.is_empty() && on.iter().all(|&b| mask & b != 0) {
+                let i = (y * w + x) * 4;
+                img.data[i..i + 4].copy_from_slice(&fill);
+            }
+        }
+    }
+    img
+}
+
+/// Moitié d'une bannière de deux blocs : la moitié du haut perd la rangée du bas de la
+/// texture, celle du bas (retournée, pour ne pas répéter le motif) perd sa rangée du haut,
+/// remplacées par des rangées du milieu : pas de bord foncé à la jointure.
+fn banner_half(mut img: Rgba, lower: bool) -> Rgba {
+    let (w, h) = (img.width as usize, img.height as usize);
+    if h < 4 {
+        return img;
+    }
+    let row = |img: &Rgba, y: usize| img.data[y * w * 4..(y + 1) * w * 4].to_vec();
+    if lower {
+        // Retournée de haut en bas.
+        let rows: Vec<Vec<u8>> = (0..h).rev().map(|y| row(&img, y)).collect();
+        img.data = rows.concat();
+    }
+    // Rangée(s) de bord à la jointure (1 pixel sur 16, plus sur les textures HD).
+    let edge = (h / 16).max(1);
+    for k in 0..edge {
+        let (dst, src) = if lower {
+            (k, h / 2 + k)
+        } else {
+            (h - 1 - k, h / 2 - 1 - k)
+        };
+        let r = row(&img, src);
+        img.data[dst * w * 4..(dst + 1) * w * 4].copy_from_slice(&r);
+    }
+    img
 }
 
 /// Couleur unie avec un léger grain (16 × 16), pour les blocs absents du pack.
@@ -62,13 +163,75 @@ fn flat(c: [u8; 3]) -> Rgba {
     }
 }
 
+/// Donne aux pixels entièrement transparents (trous d'une trappe, d'une porte, feuillage)
+/// la couleur moyenne de leurs voisins visibles. Ils restent transparents, mais vus de loin
+/// la carte graphique mélange les pixels voisins : sans cela la couleur cachée du trou
+/// (souvent du blanc) déteint sur le bord et fait des points clairs, comme si on voyait
+/// à travers le bloc.
+pub fn bleed_transparent(img: &mut Rgba) {
+    let (w, h) = (img.width as i32, img.height as i32);
+    let visible: Vec<bool> = img.data.chunks_exact(4).map(|p| p[3] > 0).collect();
+    if visible.iter().all(|&v| v) || !visible.iter().any(|&v| v) {
+        return;
+    }
+    let mut known = visible;
+    // De proche en proche, jusqu'à ce que tous les trous aient une couleur.
+    for _ in 0..(w + h) {
+        let prev = known.clone();
+        let mut changed = false;
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) as usize;
+                if prev[i] {
+                    continue;
+                }
+                let (mut acc, mut n) = ([0u32; 3], 0u32);
+                for (dx, dy) in [
+                    (1, 0),
+                    (-1, 0),
+                    (0, 1),
+                    (0, -1),
+                    (1, 1),
+                    (-1, -1),
+                    (1, -1),
+                    (-1, 1),
+                ] {
+                    // La texture se répète d'un bloc à l'autre.
+                    let j = ((y + dy).rem_euclid(h) * w + (x + dx).rem_euclid(w)) as usize;
+                    if prev[j] {
+                        for (k, v) in acc.iter_mut().enumerate() {
+                            *v += img.data[j * 4 + k] as u32;
+                        }
+                        n += 1;
+                    }
+                }
+                if let Some(mean) = acc
+                    .map(|v| v.checked_div(n))
+                    .into_iter()
+                    .collect::<Option<Vec<u32>>>()
+                {
+                    for (k, v) in mean.into_iter().enumerate() {
+                        img.data[i * 4 + k] = v as u8;
+                    }
+                    known[i] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 pub fn load_block_textures(pack: &ResourcePack) -> BlockTextures {
     // Les textures animées (bandes verticales) : on garde la première image.
     let mut images: Vec<Rgba> = registry()
         .textures
         .iter()
         .map(|t| {
-            let img = resolve(pack, t);
+            let mut img = resolve(pack, t);
+            bleed_transparent(&mut img);
             if img.height > img.width {
                 crop(&img, img.width)
             } else {
@@ -114,6 +277,7 @@ pub fn downsample(img: &Rgba) -> Rgba {
     for y in 0..h {
         for x in 0..w {
             let mut acc = [0u32; 4];
+            let mut plain = [0u32; 3];
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 let p = img.pixel(
                     (x * 2 + dx).min(img.width - 1),
@@ -122,10 +286,21 @@ pub fn downsample(img: &Rgba) -> Rgba {
                 let a = p[3] as u32;
                 for k in 0..3 {
                     acc[k] += p[k] as u32 * a;
+                    plain[k] += p[k] as u32;
                 }
                 acc[3] += a;
             }
-            let a = acc[3].max(1);
+            // Tout transparent : la couleur (déjà celle des voisins visibles) est gardée.
+            if acc[3] == 0 {
+                data.extend_from_slice(&[
+                    (plain[0] / 4) as u8,
+                    (plain[1] / 4) as u8,
+                    (plain[2] / 4) as u8,
+                    0,
+                ]);
+                continue;
+            }
+            let a = acc[3];
             data.extend_from_slice(&[
                 (acc[0] / a) as u8,
                 (acc[1] / a) as u8,
@@ -312,6 +487,30 @@ pub fn block_icon(block: BlockId, layers: &[Rgba]) -> Rgba {
         let t = tex(def.tex[1]).resize_nearest(n, n);
         return t;
     }
+    if def.key.starts_with("banner_") {
+        // Bannière : deux blocs de haut, comme posée (moitié du haut sur celle du bas, sans
+        // bord à la jointure), sur toute la hauteur de l'icône.
+        let (up, low) = (tex(def.tex[1]), tex(def.tex[2]));
+        let w = n / 2;
+        let x0 = (n - w) / 2;
+        for y in 0..n {
+            for x in 0..w {
+                let (img, v) = if y < n / 2 {
+                    (up, y as f32 / (n / 2) as f32)
+                } else {
+                    (low, (y - n / 2) as f32 / (n / 2) as f32)
+                };
+                let u = x as f32 / w as f32;
+                let c = img.pixel(
+                    ((u * img.width as f32) as u32).min(img.width - 1),
+                    ((v * img.height as f32) as u32).min(img.height - 1),
+                );
+                let i = ((y * n + x0 + x) * 4) as usize;
+                out.data[i..i + 4].copy_from_slice(&c);
+            }
+        }
+        return out;
+    }
     let boxes = if def.full {
         vec![([0u8; 3], [16u8; 3])]
     } else {
@@ -476,5 +675,27 @@ mod tests {
         assert!(a
             .sprites
             .contains_key(&format!("icon/block/{}", BlockId::GRASS.0)));
+    }
+}
+
+#[cfg(test)]
+mod bleed_tests {
+    use super::*;
+
+    #[test]
+    fn holes_take_the_colour_around_them_and_stay_transparent() {
+        // Planche brune avec un trou blanc transparent au milieu.
+        let mut img = Rgba {
+            width: 4,
+            height: 4,
+            data: [120u8, 80, 40, 255].repeat(16),
+        };
+        for i in [5usize, 6] {
+            img.data[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, 0]);
+        }
+        bleed_transparent(&mut img);
+        assert_eq!(&img.data[5 * 4..5 * 4 + 4], &[120, 80, 40, 0]);
+        let m = downsample(&img);
+        assert!(m.data.chunks_exact(4).all(|p| p[0] == 120 && p[2] == 40));
     }
 }

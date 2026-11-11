@@ -14,7 +14,7 @@ Le détail fichier par fichier (auteur, licence, source, modifications) est dans
   Modifications : sélection, renommage de certains fichiers (redstone -> energy, nether -> hell,
   netherite -> darksteel, soul -> spirit/ash), quelques textures recolorées ou retouchées
   (cactus_bottom, tnt_bottom, barrel_top_open, bell_bottom, composter_compost, white_tulip,
-  crimson_sign, warped_sign) : voir LICENSES.csv.
+  crimson_sign, warped_sign, iron_bars éclairci) : voir LICENSES.csv.
 
 Mineclonia – https://codeberg.org/mineclonia/mineclonia (commit 04b02d2)
   loom_bottom/front/side/top.png – MrRar – CC BY-SA 4.0 (licenses/CC-BY-SA-4.0.txt)
@@ -24,7 +24,11 @@ Mineclonia – https://codeberg.org/mineclonia/mineclonia (commit 04b02d2)
 « Minecraft-Textures » par Auseawesome – CC0 (métaux, gemmes, électronique, baobab…)
   https://github.com/Auseawesome/Minecraft-Textures (commit 149e1b2)
 
-Interface, ciel, particules, missing.png, tripwire.png, energy_dust_overlay.png
+Kenney – « Voxel Pack » – CC0 – https://opengameart.org/content/voxel-pack
+  glass.png : verre 128 px redessiné en 16 px (cadre, reflets semi-transparents)
+
+Interface, ciel, particules, missing.png, tripwire.png, energy_dust_overlay.png,
+  iron_block.png, gold_block.png, glass_pane_top.png
   – créés pour VoxelArt Libre – CC0
 
 Ancienne version (v2) : les textures ProgrammerArt (deathcap, CC BY 4.0) ne sont plus utilisées.

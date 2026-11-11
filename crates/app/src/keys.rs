@@ -87,6 +87,8 @@ pub enum Action {
     Chat,
     Zoom,
     DayNight,
+    /// Vue à la 1re / 3e personne (F5), hors mode FPS.
+    Perspective,
     Command,
     Debug,
     Screenshot,
@@ -131,7 +133,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 55] = [
+    pub const ALL: [Action; 56] = [
         Action::Attack,
         Action::Use,
         Action::Pick,
@@ -146,6 +148,7 @@ impl Action {
         Action::Chat,
         Action::Zoom,
         Action::DayNight,
+        Action::Perspective,
         Action::Command,
         Action::Debug,
         Action::Screenshot,
@@ -204,7 +207,8 @@ impl Action {
             | Action::Inventory
             | Action::Chat
             | Action::Zoom
-            | Action::DayNight => Group::Build,
+            | Action::DayNight
+            | Action::Perspective => Group::Build,
             Action::Command | Action::Debug | Action::Screenshot => Group::Shared,
             Action::FpsForward
             | Action::FpsBack
@@ -288,6 +292,7 @@ impl Action {
             Action::Chat => "Tchat",
             Action::Zoom => "Zoom",
             Action::DayNight => "Jour / nuit",
+            Action::Perspective => "Vue (1re / 3e personne)",
             Action::Command => "Commande",
             Action::Debug => "Debug (F3)",
             Action::Screenshot => "Capture d'écran",
@@ -348,6 +353,7 @@ impl Action {
             Action::Chat => "chat",
             Action::Zoom => "zoom",
             Action::DayNight => "daynight",
+            Action::Perspective => "perspective",
             Action::Command => "command",
             Action::Debug => "debug",
             Action::Screenshot => "screenshot",
@@ -411,6 +417,7 @@ impl Action {
             Action::Chat => Some(Bind::Key(KeyCode::KeyT)),
             Action::Zoom => Some(Bind::Key(KeyCode::KeyC)),
             Action::DayNight => Some(Bind::Key(KeyCode::KeyN)),
+            Action::Perspective => Some(Bind::Key(KeyCode::F5)),
             Action::Command => Some(Bind::Key(KeyCode::Slash)),
             Action::Debug => Some(Bind::Key(KeyCode::F3)),
             Action::Screenshot => Some(Bind::Key(KeyCode::F2)),

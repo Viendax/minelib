@@ -14,6 +14,8 @@ pub struct GpuTimes {
     pub scene: f32,
     pub taa: f32,
     pub present: f32,
+    /// Du début de la scène à la fin de l'affichage, temps morts entre passes compris.
+    pub span: f32,
 }
 
 impl GpuTimes {
@@ -169,6 +171,7 @@ pub fn gpu(t: GpuTimes) {
         p.window_gpu.0.scene += t.scene;
         p.window_gpu.0.taa += t.taa;
         p.window_gpu.0.present += t.present;
+        p.window_gpu.0.span += t.span;
         p.window_gpu.1 += 1;
     });
 }
@@ -254,7 +257,7 @@ pub fn frame_end() {
             let gpu = if p.window_gpu.1 > 0 {
                 let k = p.window_gpu.1 as f32;
                 let g = p.window_gpu.0;
-                format!(" | GPU moyen : scène {:.2}, TAA {:.2}, affichage {:.2} ms", g.scene / k, g.taa / k, g.present / k)
+                format!(" | GPU moyen : scène {:.2}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2})", g.scene / k, g.taa / k, g.present / k, g.span / k)
             } else {
                 " | GPU : mesure indisponible".to_string()
             };

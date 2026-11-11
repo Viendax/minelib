@@ -92,6 +92,8 @@ pub struct Options {
     /// Échelle de rendu du monde (0,5 … 1) : en dessous de 1, le monde est calculé en plus
     /// petit puis reconstruit en pleine résolution par l'anticrénelage (plus de FPS).
     pub render_scale: f32,
+    /// Limite d'images par seconde (0 = illimité) : moins de chauffe, FPS stables.
+    pub fps_max: u32,
     /// Répartition du processeur : uniforme (tous les cœurs pour les tâches de fond, à basse
     /// priorité) ou réservée (cœurs dédiés au jeu et au pilote).
     pub cpu_uniform: bool,
@@ -116,6 +118,7 @@ impl Default for Options {
             sensitivity: DEFAULT_SENSITIVITY,
             raytracing: true,
             render_scale: 1.0,
+            fps_max: 0,
             cpu_uniform: true,
             fullscreen: false,
             volume: 0.6,
@@ -149,6 +152,9 @@ impl Options {
             if let Some(v) = kv.get("cpu_sharing") {
                 o.cpu_uniform = v != "reserved";
             }
+            if let Some(v) = kv.get("fps_max").and_then(|v| v.parse::<u32>().ok()) {
+                o.fps_max = if v == 0 { 0 } else { v.clamp(30, 1000) };
+            }
             if let Some(v) = kv.get("render_scale").and_then(|v| v.parse::<f32>().ok()) {
                 o.render_scale = v.clamp(0.5, 1.0);
             }
@@ -166,9 +172,10 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\n",
+                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
-                self.volume
+                self.volume,
+                self.fps_max
             ),
         )?;
         Ok(())

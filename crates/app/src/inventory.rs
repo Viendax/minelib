@@ -188,6 +188,8 @@ struct Creative {
     search: (f32, f32, f32, f32),
     grid: (f32, f32),
     scrollbar: (f32, f32, f32, f32),
+    /// Inventaire de survie (entre le catalogue et la barre rapide).
+    storage: (f32, f32),
     hotbar: (f32, f32),
     trash: (f32, f32),
 }
@@ -203,11 +205,12 @@ impl Creative {
         let title = 14.0 * s;
         let gap = 6.0 * s;
         let pw = slot * (CAT_COLS + 1) as f32 + 2.0 * pad + 4.0 * s;
-        let ph = pad + title + slot * CAT_ROWS as f32 + gap + slot + pad;
+        let ph = pad + title + slot * CAT_ROWS as f32 + gap + slot * ROWS as f32 + gap + slot + pad;
         let (px, py) = ((w - pw) / 2.0, (h - ph) / 2.0);
         let grid = (px + pad, py + pad + title);
         let right = grid.0 + slot * CAT_COLS as f32 + 4.0 * s;
-        let hotbar = (grid.0, grid.1 + slot * CAT_ROWS as f32 + gap);
+        let storage = (grid.0, grid.1 + slot * CAT_ROWS as f32 + gap);
+        let hotbar = (grid.0, storage.1 + slot * ROWS as f32 + gap);
         Self {
             s,
             slot,
@@ -220,6 +223,7 @@ impl Creative {
             ),
             grid,
             scrollbar: (right + 6.0 * s, grid.1, 8.0 * s, slot * CAT_ROWS as f32),
+            storage,
             hotbar,
             trash: (right, hotbar.1),
         }
@@ -247,6 +251,18 @@ impl Creative {
 
     fn hotbar_at(&self, x: f32, y: f32) -> Option<usize> {
         (0..HOTBAR).find(|&i| Self::inside(self.hotbar_pos(i), self.slot, x, y))
+    }
+
+    /// Case `i` (0..COLS×ROWS) de l'inventaire de survie.
+    fn storage_pos(&self, i: usize) -> (f32, f32) {
+        (
+            self.storage.0 + (i % COLS) as f32 * self.slot,
+            self.storage.1 + (i / COLS) as f32 * self.slot,
+        )
+    }
+
+    fn storage_at(&self, x: f32, y: f32) -> Option<usize> {
+        (0..COLS * ROWS).find(|&i| Self::inside(self.storage_pos(i), self.slot, x, y))
     }
 }
 
@@ -562,6 +578,8 @@ impl Inventory {
         }
         if let Some(i) = c.hotbar_at(x, y) {
             self.click_slot(i, right);
+        } else if let Some(i) = c.storage_at(x, y) {
+            self.click_slot(HOTBAR + i, right);
         }
     }
 
@@ -760,7 +778,15 @@ impl Inventory {
             (bh * shown).max(4.0 * s),
             col([200, 200, 210], 1.0),
         );
-        // Barre d'objets.
+        // Inventaire de survie, puis barre d'objets.
+        for i in 0..COLS * ROWS {
+            let (x, y) = c.storage_pos(i);
+            let hover = Creative::inside((x, y), c.slot, mx, my);
+            if hover {
+                hover_item = self.slots[HOTBAR + i].map(|st| st.item);
+            }
+            self.draw_slot(ui, &l, x, y, self.slots[HOTBAR + i], false, hover);
+        }
         for i in 0..HOTBAR {
             let (x, y) = c.hotbar_pos(i);
             let hover = Creative::inside((x, y), c.slot, mx, my);

@@ -104,6 +104,22 @@ sont reconnus. Le pack par défaut, *VoxelArt Libre*, est sous licences libres.
 
 ---
 
+## 🧱 Construction
+
+- **Dalles** : posées sur le dessus d'un bloc → dalle du bas ; au plafond → dalle du haut ;
+  contre un mur → dalle verticale (accroupi : du haut ou du bas selon l'endroit visé).
+  Deux dalles du même matériau dans une case forment un bloc complet.
+- **Portes** : 2 blocs de haut, s'ouvrent et se ferment au clic droit (les deux moitiés).
+  Accroupi, le clic droit pose le bloc tenu au lieu d'ouvrir (portes et trappes).
+- **Trappes** : en haut ou en bas de la case ; clic droit pour les relever ou les rabattre.
+- **Verre** (incolore et des 16 couleurs, même motif) : deux blocs collés se raccordent, le
+  cadre n'entoure que l'ensemble.
+- **Bannières** : 2 blocs de haut (posées comme en objet), bord seulement autour du
+  rectangle ; la moitié du bas ne s'affiche pas dans un bloc plein (seulement dans le vide
+  ou derrière du verre).
+- **Vue F5** : 1re personne, 3e personne de dos ou de face (4 blocs, comme Minecraft),
+  avec le modèle du joueur animé. Désactivée en mode FPS.
+
 ## 🎮 Modes de jeu
 
 Changez de mode avec `/gm <n>` (ou `/gamemode <n>`) :
@@ -111,7 +127,7 @@ Changez de mode avec `/gm <n>` (ou `/gamemode <n>`) :
 | `/gm` | Mode | Description |
 |:----:|------|-------------|
 | `0` | **Survie** | Santé, dégâts de chute, inventaire (piles de 64). `/fly` autorise le vol. |
-| `1` | **Créatif** | Blocs illimités, vol (double appui sur Espace), WorldEdit. |
+| `1` | **Créatif** | Blocs illimités (rien n'est consommé), vol (double appui sur Espace), WorldEdit. L'inventaire (E) montre le catalogue, l'inventaire de survie et la barre rapide. |
 | `2` | **FPS** | Combat façon Counter-Strike : armes, grenades, argent, menu d'achat. |
 | `3` | **Spectateur** | Vol forcé, on traverse les blocs, aucune interaction. |
 
@@ -136,6 +152,7 @@ On peut choisir « maintenir » ou « bascule » pour marcher et s'accroupir.
 | C (maintenu) | Zoom | | N | Jour / nuit |
 | F2 | Capture d'écran | | F3 | Écran de debug |
 | Page ↑ / ↓ | Distance de rendu | | Échap | Menu |
+| F5 | Vue 1re / 3e personne (dos, face) | | Clic droit sur porte / trappe | Ouvrir / fermer |
 
 ### FPS
 
@@ -186,8 +203,10 @@ Le tchat accepte jusqu'à 256 caractères et coupe les messages longs sur plusie
 - **Grenades** :
   - **HE** : explosion à dégâts dégressifs.
   - **Flash** : l'aveuglement dépend de l'angle de vue.
-  - **Fumigène** : 18 s, faite de milliers de petites bouffées. Chaque balle y creuse un
-    tunnel qui se referme en 1,5 s.
+  - **Fumigène** : 18 s, fumée en volume calculée par la carte graphique. Elle remplit un
+    volume fixe en contournant les murs (elle s'étale dans les couloirs, comme dans CS2),
+    opaque vue de dehors comme de dedans. Chaque balle y perce un tout petit trou qui se
+    referme en 0,75 s. Elle remplit aussi le vide des blocs non pleins (trappes, dalles…).
   - **Molotov** : feu au sol.
   - **Leurre**.
 - **Sons** : tir, rechargement, lunette, sortie de chaque arme et couteau. Tous les sons
@@ -280,7 +299,7 @@ cargo clippy --release --all-targets
 - **Code** : [GNU AGPL v3](LICENSE).
 - **Textures (VoxelArt Libre)** : *Pixel Perfection* de XSSheep et la communauté
   (CC BY-SA 4.0), Mineclonia (CC BY-SA 4.0 / CC0), *Minecraft-Textures* d'Auseawesome
-  (CC0). Le détail est dans `assets/CREDITS_VoxelArt_Libre.txt`.
+  (CC0), verre d'après le *Voxel Pack* de Kenney (CC0). Le détail est dans `assets/CREDITS_VoxelArt_Libre.txt`.
 - **Modèles d'armes** : *Ultimate Gun Pack* de [Quaternius](https://quaternius.com) (CC0).
 - **Sons** : *Free Firearm Sound Library*, *gun reload sounds*, *Fantasy Weapons and
   Apparel SFX Library*, *Tinysized SFX* et d'autres, tous en CC0. Le détail est dans

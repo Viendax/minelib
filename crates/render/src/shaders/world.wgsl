@@ -32,6 +32,16 @@ struct Globals {
     // de leur dernier calcul (w = 1 si l'image des reflets est valable).
     refl_vp: mat4x4<f32>,
     refl_cam: vec4<f32>,
+    // Le joueur vu dans les reflets : x = nombre de pavés, yzw = lumière reçue (linéaire) ;
+    // pour chaque pavé, monde → repère du pavé (pixels du skin), coins min (w = sorte :
+    // 0 tête, 1 corps, 2 bras, 3 jambe, 4 bloc tenu, 5 objet tenu, 6 lumineux, 7 bloc lumineux) et max (w = couche de
+    // texture du bloc, ou couleur 0xRRGGBB de l'objet).
+    ray_info: vec4<f32>,
+    ray_inv: array<mat4x4<f32>, 8>,
+    ray_min: array<vec4<f32>, 8>,
+    ray_max: array<vec4<f32>, 8>,
+    // Rectangle de texture (u0, v0, u1, v1) d'un morceau de bloc tenu (sortes 4 et 7).
+    ray_uv: array<vec4<f32>, 8>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -206,8 +216,8 @@ fn shade(i: VOut) -> vec4<f32> {
 
 /// Reflet lu dans la dernière image des reflets (calculée à son propre rythme) : la surface
 /// y est retrouvée par sa position dans le monde, donc juste même si la caméra a bougé
-/// depuis. Si elle n'y figurait pas (cachée, hors champ), on lance le rayon ici.
-fn cached_reflection(p: vec3<f32>, r: vec3<f32>) -> vec3<f32> {
+/// depuis. a = 0 si elle n'y figurait pas (cachée, hors champ) : on lance alors le rayon.
+fn cached_reflection(p: vec3<f32>) -> vec4<f32> {
     let clip = g.refl_vp * vec4<f32>(p, 1.0);
     let ndc = clip.xy / max(clip.w, 1e-6);
     let uv = ndc * vec2<f32>(0.5, -0.5) + 0.5;
@@ -217,11 +227,7 @@ fn cached_reflection(p: vec3<f32>, r: vec3<f32>) -> vec3<f32> {
     let expected = length(p - g.refl_cam.xyz);
     let inside = clip.w > 0.0 && all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
     let ok = g.refl_cam.w > 0.5 && inside && t.a > 0.0 && abs(t.a - expected) < expected * 0.02 + 0.05;
-    var env = t.rgb;
-    if !ok {
-        env = trace(p, r);
-    }
-    return env;
+    return vec4<f32>(t.rgb, select(0.0, 1.0, ok));
 }
 
 /// Passe des reflets (à son propre rythme) : rayon depuis chaque surface réfléchissante
@@ -232,7 +238,7 @@ fn fs_reflect(i: VOut) -> @location(0) vec4<f32> {
     let to_frag = i.world - g.cam_pos.xyz;
     let dist = length(to_frag);
     let r = reflect(to_frag / max(dist, 1e-4), n);
-    let env = trace(i.world + n * 0.02, r);
+    let env = trace(i.world + n * 0.02, r, false).rgb;
     return vec4<f32>(env, dist);
 }
 
@@ -309,8 +315,10 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
     var color = albedo * (sky_light * ao + torch);
 
     // Bloc visé légèrement éclairci (le contour est dessiné à part, en lignes).
-    let eps = vec3<f32>(0.01);
-    if g.sel_min.w > 0.5 && all(i.world >= g.sel_min.xyz - eps) && all(i.world <= g.sel_max.xyz + eps) {
+    // Seulement ses propres faces (point pris juste derrière la face), pas celles des
+    // voisins qui le touchent et qu'on voit à travers du verre.
+    let eps = vec3<f32>(0.0005);
+    if g.sel_min.w > 0.5 && all(p >= g.sel_min.xyz - eps) && all(p <= g.sel_max.xyz + eps) {
         color = color * 1.25 + 0.02;
     }
 
@@ -325,26 +333,31 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
         let r = reflect(v, n);
         var env: vec3<f32>;
         var cover = 1.0;
-        if i.short != 0u {
-            // Métal : seulement les objets proches (pas le ciel ni le lointain).
-            if g.rt.x > 0.5 {
-                let e = trace_short(i.world + n * 0.02, r);
+        // Métal (`short`) : seulement les objets proches, pas le ciel ni le lointain.
+        let short = i.short != 0u;
+        if g.rt.x > 0.5 {
+            // Un seul appel à `trace` (le compilateur de DirectX recopie tout à chaque appel).
+            var found = false;
+            if cached && !short {
+                let c = cached_reflection(i.world + n * 0.02);
+                env = c.rgb;
+                found = c.a > 0.5;
+            }
+            if !found {
+                let e = trace(i.world + n * 0.02, r, short);
                 env = e.rgb;
                 cover = e.a;
-            } else {
-                env = vec3<f32>(0.0);
-                cover = 0.0;
             }
-        } else if g.rt.x > 0.5 && cached {
-            env = cached_reflection(i.world + n * 0.02, r);
-        } else if g.rt.x > 0.5 {
-            env = trace(i.world + n * 0.02, r);
         } else {
             env = sky_color(r);
+            cover = select(1.0, 0.0, short);
         }
         let fresnel = pow(1.0 - max(dot(-v, n), 0.0), 5.0);
         let k = select(i.reflect * (0.55 + 0.45 * fresnel), 0.96, i.reflect > 0.99) * reflect_fade * cover;
-        color = mix(color, env, k);
+        // Métal : le reflet prend la couleur du métal (fer gris, or jaune, diamant bleu) au
+        // lieu de la remplacer : le bloc garde sa teinte et ne paraît pas transparent.
+        let tinted = select(env, env * albedo * 1.6, i.short != 0u);
+        color = mix(color, tinted, k);
         // Points lumineux : chaque source proche se reflète (couleur de sa flamme), net
         // sur un miroir, plus étalé sur le métal ; avec ou sans raytracing.
         if g.rt.x < 0.5 || i.reflect < 0.99 {
@@ -612,6 +625,143 @@ fn box_hit(o: vec3<f32>, d: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> vec3<f32
     return vec3<f32>(tn, select(-1.0, tf, tf >= max(tn, 0.0)), axis);
 }
 
+/// Couleur (sRGB 0xRRGGBB) d'un pixel du skin du joueur : même dessin que
+/// `player_model::skin` (sorte de pavé, face 0 devant 1 derrière 2 côté 3 dessus 4 dessous,
+/// pixel u, v avec v = 0 en haut, largeur n de la face).
+fn skin_color(kind: u32, face: u32, u: u32, v: u32, n: u32) -> u32 {
+    let SKIN = 0xd6a684u;
+    let SKIN_DARK = 0xc08f6du;
+    let HAIR = 0x241c18u;
+    let SHIRT = 0xb5523au;
+    let SHIRT_DARK = 0x8f3f2cu;
+    let PANTS = 0x5b6b3au;
+    let SHOES = 0x5a3a22u;
+    if kind == 0u {
+        if face == 3u {
+            return HAIR;
+        }
+        if face == 4u {
+            return SKIN;
+        }
+        if face == 1u {
+            return select(SKIN, HAIR, v <= 6u);
+        }
+        if face == 2u {
+            return select(SKIN, HAIR, v <= 1u || (v <= 4u && (u <= 1u || u + 2u >= n)));
+        }
+        if v <= 1u || ((u == 0u || u == 7u) && v == 2u) {
+            return HAIR;
+        }
+        if v == 4u && (u == 1u || u == 6u) {
+            return 0xf2f2f2u;
+        }
+        if v == 4u && (u == 2u || u == 5u) {
+            return 0x5a3a1eu;
+        }
+        if (u == 3u || u == 4u) && v == 5u {
+            return SKIN_DARK;
+        }
+        if (u == 3u || u == 4u) && v == 6u {
+            return 0x8a5a48u;
+        }
+        return SKIN;
+    }
+    if kind == 1u {
+        if face == 0u && v == 0u && (u == 3u || u == 4u) {
+            return SKIN;
+        }
+        return select(SHIRT, SHIRT_DARK, face <= 1u && v == 11u);
+    }
+    if kind == 2u {
+        if face == 3u {
+            return SHIRT;
+        }
+        if face == 4u {
+            return SKIN;
+        }
+        return select(select(SHIRT, SHIRT_DARK, v == 3u), SKIN, v > 3u);
+    }
+    if face == 3u {
+        return PANTS;
+    }
+    return select(PANTS, SHOES, face == 4u || v >= 9u);
+}
+
+fn srgb_hex(c: u32) -> vec3<f32> {
+    return lin(vec3<f32>(f32((c >> 16u) & 255u), f32((c >> 8u) & 255u), f32(c & 255u)) / 255.0);
+}
+
+/// Le joueur dans un reflet : pavé le plus proche touché avant `max_t`. Couleur finale
+/// (déjà éclairée) en rgb, distance en w (< 0 : rien).
+fn player_hit(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> vec4<f32> {
+    var best = vec4<f32>(0.0, 0.0, 0.0, -1.0);
+    var bt = max_t;
+    let count = i32(g.ray_info.x);
+    for (var k = 0; k < 8; k++) {
+        if k >= count {
+            break;
+        }
+        let m = g.ray_inv[k];
+        let lo = (m * vec4<f32>(o, 1.0)).xyz;
+        let ld = (m * vec4<f32>(d, 0.0)).xyz;
+        let mn = g.ray_min[k].xyz;
+        let mx = g.ray_max[k].xyz;
+        let h = box_hit(lo, ld, mn, mx);
+        // Rayon parti de l'intérieur (pied dans l'eau…) : ignoré.
+        if h.y < 0.0 || h.x <= 1e-3 || h.x >= bt {
+            continue;
+        }
+        bt = h.x;
+        let p = lo + ld * h.x;
+        let ax = i32(h.z);
+        let dax = select(select(ld.z, ld.y, ax == 1), ld.x, ax == 0);
+        let s = dax < 0.0; // face du côté + du pavé
+        let kind = u32(g.ray_min[k].w);
+        var face = 0u;
+        var u = 0.0;
+        var v = 0.0;
+        var n = 1.0;
+        if ax == 2 {
+            face = select(0u, 1u, s);
+            u = select(mx.x - p.x, p.x - mn.x, s);
+            v = mx.y - p.y;
+            n = mx.x - mn.x;
+        } else if ax == 0 {
+            face = 2u;
+            u = select(p.z - mn.z, mx.z - p.z, s);
+            v = mx.y - p.y;
+            n = mx.z - mn.z;
+        } else {
+            face = select(4u, 3u, s);
+            u = p.x - mn.x;
+            v = select(p.z - mn.z, mx.z - p.z, s);
+            n = mx.x - mn.x;
+        }
+        var albedo: vec3<f32>;
+        if kind == 4u || kind == 7u {
+            let size = vec2<f32>(n, select(mx.y - mn.y, mx.z - mn.z, ax == 1));
+            let layer = i32(g.ray_max[k].w);
+            let rect = g.ray_uv[k];
+            let st = clamp(vec2<f32>(u, v) / size, vec2<f32>(0.0), vec2<f32>(0.999));
+            albedo = textureSampleLevel(blocks, block_sampler, mix(rect.xy, rect.zw, st), layer, 0.0).rgb;
+        } else if kind >= 5u {
+            albedo = srgb_hex(u32(g.ray_max[k].w));
+        } else {
+            let iu = u32(clamp(u, 0.0, n - 0.5));
+            albedo = srgb_hex(skin_color(kind, face, iu, u32(max(v, 0.0)), u32(n + 0.5)));
+        }
+        // Ombrage selon l'orientation de la face dans le monde, comme le modèle.
+        let sg = select(-1.0, 1.0, s);
+        let ln = select(select(vec3<f32>(0.0, 0.0, sg), vec3<f32>(0.0, sg, 0.0), ax == 1), vec3<f32>(sg, 0.0, 0.0), ax == 0);
+        let wn = normalize((transpose(m) * vec4<f32>(ln, 0.0)).xyz);
+        let shade = clamp(0.78 + 0.22 * wn.y + 0.06 * wn.x, 0.45, 1.0);
+        // Flamme et bâton d'une torche (6) : leur propre lumière.
+        let lit = select(g.ray_info.yzw, vec3<f32>(1.0), kind >= 6u);
+        best = vec4<f32>(albedo * shade * lit, h.x);
+    }
+    return best;
+}
+
 /// Boîte d'un bloc non plein (voir `rt::shape_texel`) : coin bas et coin haut dans la case.
 fn box_lo(b: u32) -> vec3<f32> {
     return vec3<f32>(f32(b & 15u), f32((b >> 4u) & 15u), f32((b >> 8u) & 15u)) / 16.0;
@@ -854,8 +1004,11 @@ fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
         }
         let fs = -vec3<f32>(step);
         let nrm = select(select(vec3<f32>(0.0, 0.0, fs.z), vec3<f32>(0.0, fs.y, 0.0), hax == 1), vec3<f32>(fs.x, 0.0, 0.0), hax == 0);
-        // Reflet d'un métal : déjà un peu flou, très flou à partir de 3 blocs.
-        let lod = clamp(log2(max(ht, 1.0) * 0.6) + ray_blur * (1.0 + 3.0 * smoothstep(2.5, 4.0, ht)), 0.0, 6.0);
+        // Miroir : texture nette (pleine résolution jusqu'à ~30 blocs, comme vue en
+        // direct). Reflet d'un métal : déjà un peu flou, très flou à partir de 3 blocs.
+        let sharp_lod = log2(max(ht * 0.03, 1.0));
+        let blur_lod = log2(max(ht, 1.0) * 0.6) + 1.0 + 3.0 * smoothstep(2.5, 4.0, ht);
+        let lod = clamp(select(sharp_lod, blur_lod, ray_blur > 0.5), 0.0, 6.0);
         let texel = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), lod);
         // Pixels transparents d'un bloc fin (rail, échelle) : le rayon passe.
         if partial && texel.a < 0.5 {
@@ -871,27 +1024,11 @@ fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
     return RayHit(sky_color(d), 1e9, vec3<f32>(0.0), 0.0, -1.0, vec3<f32>(0.0), 1.0);
 }
 
-/// Reflet d'un métal depuis `o` dans la direction `d` : seulement ce qui est à moins de
-/// 4 blocs (a = part visible : 1 jusqu'à 3 blocs, puis fondu jusqu'à 0 à 4 blocs).
-fn trace_short(o: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
-    ray_blur = 1.0;
-    let h = march(o, d, METAL_RANGE);
-    ray_blur = 0.0;
-    var color = h.color;
-    if h.shade >= 0.0 {
-        let p = o + d * h.t;
-        let day = g.light.x;
-        let diffuse = max(dot(h.normal, normalize(g.sun.xyz)), 0.0);
-        let sky_light = ((g.sun.w + (1.0 - g.sun.w) * diffuse) * day + 0.04 * (1.0 - day)) * h.sky * h.sky + 0.012;
-        let lit = max(point_light(p + h.normal * 0.02, h.normal), held_light(p + h.normal * 0.02, h.normal));
-        color = h.color * (sky_light * mix(1.0, h.shade, 0.35) + lit * 0.8 + h.glow * 0.5);
-    }
-    let a = select(0.0, 1.0 - smoothstep(METAL_BLUR, METAL_RANGE, h.t), h.t < METAL_RANGE);
-    return vec4<f32>(color, a);
-}
-
 /// Reflet vu depuis `o` dans la direction `d` : jusqu'à 4 rebonds de miroir en miroir.
-fn trace(o0: vec3<f32>, d0: vec3<f32>) -> vec3<f32> {
+/// `short` : reflet d'un métal, seulement ce qui est à moins de 4 blocs, sans rebond ;
+/// a = part visible (1 jusqu'à 3 blocs, fondu jusqu'à 0 à 4 blocs). Un seul appel à
+/// `march` par shader : le compilateur de DirectX (FXC) met bien moins longtemps.
+fn trace(o0: vec3<f32>, d0: vec3<f32>, short: bool) -> vec4<f32> {
     var o = o0;
     var d = d0;
     var acc = vec3<f32>(0.0);
@@ -901,8 +1038,15 @@ fn trace(o0: vec3<f32>, d0: vec3<f32>) -> vec3<f32> {
     // déroule pas la boucle).
     let max_bounces = 64 + i32(g.screen.w);
     var travelled = 0.0;
+    let range = select(REFLECT_RANGE, METAL_RANGE, short);
+    ray_blur = select(0.0, 1.0, short);
     for (var bounce = 0; bounce < max_bounces; bounce++) {
-        let h = march(o, d, REFLECT_RANGE - travelled);
+        var h = march(o, d, range - travelled);
+        // Le joueur (et ce qu'il tient), devant ce que le rayon a touché.
+        let ph = player_hit(o, d, min(h.t, range - travelled));
+        if ph.w > 0.0 {
+            h = RayHit(ph.rgb, ph.w, -d, 0.0, -1.0, vec3<f32>(0.0), 1.0);
+        }
         var color = h.color;
         if h.shade >= 0.0 {
             let p = o + d * h.t;
@@ -914,18 +1058,22 @@ fn trace(o0: vec3<f32>, d0: vec3<f32>) -> vec3<f32> {
             let lit = max(point_light(p + h.normal * 0.02, h.normal), held_light(p + h.normal * 0.02, h.normal));
             color = h.color * (sky_light * mix(1.0, h.shade, 0.35) + lit * 0.8 + h.glow * 0.5);
         }
+        if short {
+            let a = select(0.0, 1.0 - smoothstep(METAL_BLUR, METAL_RANGE, h.t), h.t < METAL_RANGE);
+            return vec4<f32>(color, a);
+        }
         // Brouillard de fin de portée, comme en fin de vue : vers la couleur du ciel.
         let far = travelled + min(h.t, REFLECT_RANGE);
         color = mix(color, sky_color(d), smoothstep(REFLECT_RANGE * 0.6, REFLECT_RANGE, far));
         travelled = far;
         if h.k <= 0.0 || bounce == max_bounces - 1 || thr * h.k < 0.02 || travelled >= REFLECT_RANGE {
             acc += thr * color;
-            return acc;
+            return vec4<f32>(acc, 1.0);
         }
         acc += thr * (1.0 - h.k) * color;
         thr *= h.k;
         o = o + d * h.t + h.normal * 0.002;
         d = reflect(d, h.normal);
     }
-    return acc;
+    return vec4<f32>(acc, 1.0);
 }

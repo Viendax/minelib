@@ -106,7 +106,6 @@ type LoadoutIcon = (Sel, Vec<weapons::Tri>);
 /// Temps d'armement du R8 avant que le coup parte (CS : environ 0,4 s).
 const R8_PRIME: f32 = 0.4;
 /// Gris des bouffées de fumée (couleur linéaire, multipliée par leur teinte).
-const SMOKE_GREY: f32 = 0.3;
 /// Arme sortie : délai avant de pouvoir tirer, frapper ou lancer (s).
 pub const DEPLOY_S: f32 = 0.75;
 
@@ -1030,7 +1029,7 @@ impl Fps {
         view_proj: Mat4,
         eye: Vec3,
         world: &World,
-        daylight: f32,
+        _daylight: f32,
     ) -> Vec<VmVertex> {
         let mut out = Vec::new();
         let cam_right = |p: Vec3, d: Vec3| d.cross(p - eye).normalize_or_zero();
@@ -1121,46 +1120,8 @@ impl Fps {
                         push_tri(&mut out, view_proj, [e1, m1, m0], rim);
                     }
                 }
-                Effect::Smoke(cloud) => {
-                    // Milliers de petites bouffées opaques ombrées comme des boules (centre
-                    // clair, bord plus sombre, dessus éclairé) : seule la surface du nuage est
-                    // dessinée, l'intérieur seulement quand on peut le voir (trou, dedans,
-                    // nuage qui gonfle ou se dissipe).
-                    let lum = SMOKE_GREY * (0.22 + 0.78 * daylight);
-                    let inside = cloud.contains(eye);
-                    for (i, p) in cloud.puffs.iter().enumerate() {
-                        let pos = cloud.puff_pos(p);
-                        if p.inner && !cloud.inner_visible(pos, inside) {
-                            continue;
-                        }
-                        let k = cloud.puff_scale(p);
-                        if k <= 0.03 || !seen(pos) {
-                            continue;
-                        }
-                        let (u, v) = cam(pos);
-                        let r = p.r * k;
-                        let g = lum * p.shade;
-                        let tone = |rad: f32, up: f32| {
-                            let t = g * (1.08 - 0.3 * rad * rad) * (1.0 + 0.16 * up * rad);
-                            [t, t, t * 1.03, 1.0]
-                        };
-                        let n = 7;
-                        let turn = i as f32 * 0.7; // bords pas tous alignés
-                        for q in 0..n {
-                            let a0 = turn + q as f32 / n as f32 * std::f32::consts::TAU;
-                            let a1 = turn + (q + 1) as f32 / n as f32 * std::f32::consts::TAU;
-                            let (s0, s1) = (a0.sin(), a1.sin());
-                            let e0 = pos + (u * a0.cos() + v * s0) * r;
-                            let e1 = pos + (u * a1.cos() + v * s1) * r;
-                            push_tri_c(
-                                &mut out,
-                                view_proj,
-                                [pos, e0, e1],
-                                [tone(0.0, 0.0), tone(1.0, s0), tone(1.0, s1)],
-                            );
-                        }
-                    }
-                }
+                // Fumigène : dessinée en volume par la carte graphique (voir `smokes`).
+                Effect::Smoke(_) => {}
                 Effect::Fire(cells, a) => {
                     let fade = ((7.0 - a) / 1.0).clamp(0.0, 1.0);
                     for (i, c) in cells.iter().enumerate() {
@@ -1191,6 +1152,14 @@ impl Fps {
                 if h.distance < dist - 0.06 {
                     continue;
                 }
+            }
+            // Caché par une fumigène (derrière ou dedans).
+            if self
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::Smoke(c) if c.hides(eye, *p)))
+            {
+                continue;
             }
             let u = if n.y.abs() > 0.5 { Vec3::X } else { Vec3::Y };
             let v = n.cross(u);
@@ -1488,14 +1457,59 @@ impl Fps {
         }
     }
 
+    /// Essais : fumigène posée directement en `p` (variable MINELIB_SMOKE).
+    pub fn spawn_test_smoke(&mut self, p: Vec3, world: &World) {
+        let mut rnd = || 0.5;
+        // Posée au sol, comme une grenade qui a fini de rouler.
+        let mut p = p;
+        let solid = |p: Vec3| {
+            world
+                .get(
+                    p.x.floor() as i32,
+                    p.y.floor() as i32 - 1,
+                    p.z.floor() as i32,
+                )
+                .is_solid()
+        };
+        for _ in 0..64 {
+            if solid(p) {
+                break;
+            }
+            p.y -= 1.0;
+        }
+        p.y = p.y.floor() + 0.05;
+        let c = equip::SmokeCloud::new(p, world, &mut rnd);
+        self.effects.push(Effect::Smoke(c));
+    }
+
+    /// Fumigènes en cours, pour le rendu en volume.
+    pub fn smoke_volumes(&self) -> Vec<minelib_render::SmokeVolume<'_>> {
+        self.effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Smoke(c) => Some(minelib_render::SmokeVolume {
+                    id: c.id,
+                    origin: c.origin,
+                    cell: equip::SMOKE_CELL,
+                    dims: c.dims,
+                    cells: &c.cells,
+                    grow: equip::smoke_grow(c.age),
+                    age: c.age,
+                    tunnels: c
+                        .tunnels
+                        .iter()
+                        .map(|t| (t.a, t.b, equip::tunnel_radius(t.age)))
+                        .collect(),
+                    bounds: c.bounds,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Effets plein écran : flash (blanc qui s'estompe) et fumée quand on est dedans.
     /// `eye` : position de l'œil.
-    pub fn screen_fx(&self, ui: &mut Ui, size: (f32, f32), eye: Vec3) {
-        let depth = equip::smoke_depth(&self.effects, eye);
-        if depth < 1.0 {
-            let a = ((1.0 - depth) * 2.5).clamp(0.0, 0.97);
-            ui.rect(0.0, 0.0, size.0, size.1, [0.05, 0.05, 0.055, a]);
-        }
+    pub fn screen_fx(&self, ui: &mut Ui, size: (f32, f32), _eye: Vec3) {
         if self.blind > 0.0 {
             // Totalement blanc tant qu'il reste plus d'une seconde, puis s'éclaircit.
             let a = self.blind.min(1.0);

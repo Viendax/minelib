@@ -44,6 +44,8 @@ pub struct SessionConfig {
 }
 
 pub struct Session {
+    /// Essais : temps avant la prochaine fumigène de MINELIB_SMOKE.
+    test_smoke_timer: f32,
     pub dir: PathBuf,
     pub meta: WorldMeta,
     pub world: World,
@@ -90,6 +92,13 @@ pub struct Session {
     /// Main et objet tenu (première personne), et leur éclairage.
     hand: Hand,
     hand_light: [f32; 3],
+    /// Vue (F5) : 0 première personne, 1 troisième personne de dos, 2 de face.
+    perspective: u8,
+    /// Marche du modèle du joueur : phase (radians) et ampleur 0..1.
+    walk_phase: f32,
+    walk_amp: f32,
+    /// Portes et trappes ouvertes pendant la partie : bloc fermé d'origine (pour refermer).
+    opened: HashMap<[i32; 3], BlockId>,
     /// Raytracing : coin de la grille envoyée au GPU, changements depuis, délai.
     vox_origin: Option<[i32; 3]>,
     vox_dirty: bool,
@@ -179,6 +188,7 @@ impl Session {
             .min(ram_view_limit());
         log::info!("monde « {} » (graine {})", data.meta.name, data.meta.seed);
         Ok(Self {
+            test_smoke_timer: 0.0,
             dir,
             workers: Workers::new(data.meta.seed, world.generator),
             streamer: Streamer::new(radius),
@@ -212,6 +222,10 @@ impl Session {
             fps_duck_on: false,
             hand: Hand::default(),
             hand_light: [1.0; 3],
+            perspective: 0,
+            walk_phase: 0.0,
+            walk_amp: 0.0,
+            opened: HashMap::new(),
             vox_origin: None,
             vox_dirty: false,
             vox_timer: 0.0,
@@ -440,6 +454,10 @@ impl Session {
                 && (self.keys.pressed(input, Action::Attack)
                     || self.keys.pressed(input, Action::Use));
             self.hand.update(dt, speed, swung, held);
+            // Balancement des bras et des jambes du modèle (vue F5).
+            self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
+            let target = (speed / 4.3).min(1.0);
+            self.walk_amp += (target - self.walk_amp) * (dt * 10.0).min(1.0);
             self.hand_light = self.light_at_player(held);
             self.handle_blocks(input, dt);
             if self.inventory.open {
@@ -512,6 +530,10 @@ impl Session {
         }
         if self.keys.pressed(input, Action::DayNight) {
             self.night = !self.night;
+        }
+        // F5 : 1re personne → 3e de dos → 3e de face (pas en mode FPS).
+        if self.keys.pressed(input, Action::Perspective) && self.game.mode != GameMode::Fps {
+            self.perspective = (self.perspective + 1) % 3;
         }
         // Double appui sur Espace : vol (toujours en créatif, en survie après /fly).
         if self.keys.pressed(input, Action::Jump) && !self.inventory.open {
@@ -625,7 +647,34 @@ impl Session {
             return;
         }
 
+        // Clic droit sur une porte ou une trappe : elle s'ouvre ou se ferme (accroupi : on
+        // pose le bloc tenu contre elle, comme dans Minecraft).
+        if keys.pressed(input, Action::Use)
+            && hinged(hit.id).is_some()
+            && !keys.held(input, Action::Sneak)
+        {
+            let look = self.player.look_dir();
+            let changes = toggle_hinged(&mut self.world, &mut self.opened, hit.block, look);
+            for (p, b) in changes {
+                self.dirty.extend(self.world.set(p[0], p[1], p[2], b));
+            }
+            self.place_cooldown = 0.22;
+            return;
+        }
         if breaking && hit.id.is_breakable() {
+            self.opened.remove(&hit.block);
+            // Porte : les deux moitiés partent ensemble.
+            if let Some(Hinged::Door { upper, .. }) = hinged(hit.id) {
+                let [x, y, z] = hit.block;
+                let other = if upper { y - 1 } else { y + 1 };
+                if matches!(
+                    hinged(self.world.get(x, other, z)),
+                    Some(Hinged::Door { .. })
+                ) {
+                    self.dirty.extend(self.world.set(x, other, z, BlockId::AIR));
+                    self.opened.remove(&[x, other, z]);
+                }
+            }
             let [x, y, z] = hit.block;
             // Une torche cassée rend une torche ordinaire : le sel restant est perdu.
             let item = if hit.id.is_torch() {
@@ -634,17 +683,54 @@ impl Session {
                 Item::Block(hit.id)
             };
             self.dirty.extend(self.world.set(x, y, z, BlockId::AIR));
-            self.inventory.add(item, 1);
+            // En créatif, comme dans Minecraft : le bloc cassé ne s'ajoute pas à l'inventaire.
+            if self.game.mode != GameMode::Creative {
+                self.inventory.add(item, 1);
+            }
             self.break_cooldown = 0.22;
         }
 
         if placing {
+            // Portes (2 blocs, au bord le plus proche du joueur) et trappes (en haut ou en
+            // bas de la case selon l'endroit visé).
+            if let Some(Item::Block(b)) = self.inventory.selected_item() {
+                let point = self.player.eye() + self.player.look_dir() * hit.distance;
+                if let Some(cells) = hinged_placement(&hit, b, self.player.look_dir(), point) {
+                    let free = cells.iter().all(|(p, _)| {
+                        !self.world.get(p[0], p[1], p[2]).is_targetable()
+                            && !self.player.overlaps_block(*p)
+                    });
+                    if free {
+                        for (p, id) in cells {
+                            self.dirty.extend(self.world.set(p[0], p[1], p[2], id));
+                        }
+                        self.use_selected();
+                    }
+                    self.place_cooldown = 0.22;
+                    return;
+                }
+            }
+            // Dalles : orientation selon la face visée, et deux dalles du même matériau dans
+            // une case font un bloc complet (comme dans Minecraft).
+            if let Some(Item::Block(b)) = self.inventory.selected_item() {
+                let sneaking = keys.held(input, Action::Sneak);
+                let point = self.player.eye() + self.player.look_dir() * hit.distance;
+                if let Some((p, id)) = slab_placement(&self.world, &hit, b, point, sneaking) {
+                    let changes = self.world.get(p[0], p[1], p[2]) != id;
+                    if changes && (!self.player.overlaps_block(p) || !id.is_solid()) {
+                        self.dirty.extend(self.world.set(p[0], p[1], p[2], id));
+                        self.use_selected();
+                    }
+                    self.place_cooldown = 0.22;
+                    return;
+                }
+            }
             let [x, y, z] = hit.adjacent();
             let free = !self.world.get(x, y, z).is_targetable();
             match self.inventory.selected_item() {
                 Some(Item::Block(b)) if free && !self.player.overlaps_block([x, y, z]) => {
                     self.dirty.extend(self.world.set(x, y, z, b));
-                    self.inventory.take_selected();
+                    self.use_selected();
                 }
                 // Torche : au sol sur le dessus d'un bloc, murale contre un côté, pas au plafond.
                 Some(Item::Torch(chem)) if free && hit.normal[1] >= 0 => {
@@ -661,7 +747,7 @@ impl Session {
                     if self.game.mode == GameMode::Creative && chem.is_some() {
                         self.world.set_torch_infinite([x, y, z]);
                     }
-                    self.inventory.take_selected();
+                    self.use_selected();
                 }
                 _ => {}
             }
@@ -692,6 +778,13 @@ impl Session {
                 });
                 self.inventory.select(slot);
             }
+        }
+    }
+
+    /// Objet posé : retiré de la main, sauf en créatif (réserve illimitée).
+    fn use_selected(&mut self) {
+        if self.game.mode != GameMode::Creative {
+            self.inventory.take_selected();
         }
     }
 
@@ -943,6 +1036,23 @@ impl Session {
             on_ground: self.player.on_ground || self.player.flying,
         };
         let eye = self.player.eye();
+        // Essais de performances : MINELIB_SMOKE=x,y,z pose une fumigène 6 s après le
+        // départ, puis toutes les 18 s.
+        if let Ok(v) = std::env::var("MINELIB_SMOKE") {
+            let mut v: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            // Un seul nombre : à cette distance devant le joueur.
+            if v.len() == 1 {
+                let (sy, cy) = self.player.yaw.sin_cos();
+                let p = eye + Vec3::new(sy, 0.0, -cy) * v[0];
+                v = vec![p.x, p.y + 1.0, p.z];
+            }
+            self.test_smoke_timer += dt;
+            if v.len() == 3 && self.test_smoke_timer > 6.0 {
+                self.test_smoke_timer = 6.0 - 18.0;
+                self.fps
+                    .spawn_test_smoke(Vec3::new(v[0], v[1], v[2]), &self.world);
+            }
+        }
         self.fps
             .update(dt, &c, &self.world, eye, self.player.yaw, self.player.pitch);
         self.fps.tick_effects(dt);
@@ -1339,7 +1449,58 @@ impl Session {
         } else {
             self.fov
         };
-        let view = self.view_with_punch();
+        // Vue F5 : caméra à 4 blocs derrière (ou devant) les yeux, comme dans Minecraft,
+        // rapprochée si un bloc est sur le chemin. Pas en mode FPS.
+        let third = if fps_mode { 0 } else { self.perspective };
+        let (cam, view) = if third == 0 {
+            (self.player.eye(), self.view_with_punch())
+        } else {
+            let eye = self.player.eye();
+            let look = self.player.look_dir();
+            let back = if third == 1 { -look } else { look };
+            let dist = raycast(&self.world, eye.into(), back.into(), THIRD_PERSON_DIST)
+                .map_or(THIRD_PERSON_DIST, |h| (h.distance - 0.25).max(0.3));
+            let cam = eye + back * dist;
+            (cam, Mat4::look_to_rh(cam, -back, Vec3::Y))
+        };
+        use crate::player_model::Held;
+        let held = if fps_mode {
+            Some(Held::Stick([38, 38, 42]))
+        } else if self.game.mode.has_inventory() {
+            match self.held_item() {
+                Some(Item::Block(b)) => Some(Held::Block(b)),
+                Some(Item::Torch(chem)) => Some(Held::Torch(
+                    chem.and_then(|i| minelib_world::flame::CHEMICALS.get(i))
+                        .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb),
+                )),
+                Some(Item::Wand) => Some(Held::Stick([70, 60, 90])),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let pose = crate::player_model::Pose {
+            feet: self.player.pos,
+            yaw: self.player.yaw,
+            pitch: self.player.pitch,
+            walk: self.walk_phase,
+            swing: self.walk_amp,
+            crouch: self.player.crouch,
+            light: self.hand_light,
+            held,
+        };
+        let visible = self.game.mode != GameMode::Spectator;
+        let model = if third != 0 && visible {
+            crate::player_model::build(&pose)
+        } else {
+            Vec::new()
+        };
+        // Le joueur se voit dans les miroirs (et l'eau, le métal), même à la 1re personne.
+        let ray_boxes = if visible {
+            crate::player_model::ray_boxes(&pose)
+        } else {
+            Vec::new()
+        };
         let hand = if fps_mode {
             // Arme en main, puis balles traçantes, étincelles et impacts dans le monde.
             let mut v = self.fps.viewmodel(renderer.aspect(), self.hand_light);
@@ -1351,12 +1512,17 @@ impl Session {
             );
             v
         } else {
-            let mut v = self.hand.build(
-                self.held_item(),
-                renderer.aspect(),
-                self.hand_light,
-                self.game.mode != GameMode::Spectator,
-            );
+            // À la 3e personne : pas de main à l'écran (le modèle est dans le monde).
+            let mut v = if third == 0 {
+                self.hand.build(
+                    self.held_item(),
+                    renderer.aspect(),
+                    self.hand_light,
+                    self.game.mode != GameMode::Spectator,
+                )
+            } else {
+                Vec::new()
+            };
             // Sélection WorldEdit : arêtes de la zone et coins (en créatif, baguette en main).
             if self.game.mode == GameMode::Creative
                 && self.inventory.selected_item() == Some(Item::Wand)
@@ -1366,13 +1532,20 @@ impl Session {
                     renderer.aspect(),
                     0.05,
                 );
-                v.extend(selection_lines(&self.we, proj * view, self.player.eye()));
+                v.extend(selection_lines(&self.we, proj * view, cam));
             }
             v
         };
+        let smokes = self.fps.smoke_volumes();
         let params = FrameParams {
+            ray_boxes: &ray_boxes,
+            smokes: &smokes,
+            held_light_pos: crate::player_model::torch_tip(&pose),
+            ray_light: self.hand_light,
             viewmodel: &hand,
-            eye: self.player.eye(),
+            entities: &model,
+            eye: cam,
+            player_eye: self.player.eye(),
             view,
             fov_y: fov.to_radians(),
             fog_start: fog_end * 0.45,
@@ -1400,6 +1573,296 @@ impl Session {
         renderer.render(&params)
     }
 }
+
+/// Porte ou trappe.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Hinged {
+    Door {
+        wood: &'static str,
+        upper: bool,
+        side: u8,
+    },
+    Trapdoor {
+        kind: &'static str,
+        side: u8,
+    },
+}
+
+fn hinged(id: BlockId) -> Option<Hinged> {
+    let key: &'static str = &id.def().key;
+    if let Some(rest) = key.strip_prefix("door_") {
+        let mut it = rest.split(':');
+        let wood = it.next()?;
+        let half = it.next()?;
+        let side = it.next()?.parse().ok()?;
+        return Some(Hinged::Door {
+            wood,
+            upper: half == "upper",
+            side,
+        });
+    }
+    let (kind, side) = key.split_once(':')?;
+    if kind == "trapdoor" || kind == "iron_trapdoor" {
+        return Some(Hinged::Trapdoor {
+            kind,
+            side: side.parse().ok()?,
+        });
+    }
+    None
+}
+
+fn hinged_block(h: Hinged) -> Option<BlockId> {
+    let reg = minelib_world::registry::registry();
+    match h {
+        Hinged::Door { wood, upper, side } => reg.by_key(&format!(
+            "door_{wood}:{}:{side}",
+            if upper { "upper" } else { "lower" }
+        )),
+        Hinged::Trapdoor { kind, side } => reg.by_key(&format!("{kind}:{side}")),
+    }
+}
+
+/// Même porte ou même trappe (essence, moitié), orientation mise à part.
+fn same_family(a: BlockId, b: BlockId) -> bool {
+    match (hinged(a), hinged(b)) {
+        (
+            Some(Hinged::Door {
+                wood: w1,
+                upper: u1,
+                ..
+            }),
+            Some(Hinged::Door {
+                wood: w2,
+                upper: u2,
+                ..
+            }),
+        ) => w1 == w2 && u1 == u2,
+        (Some(Hinged::Trapdoor { kind: k1, .. }), Some(Hinged::Trapdoor { kind: k2, .. })) => {
+            k1 == k2
+        }
+        _ => false,
+    }
+}
+
+/// Côté vertical (0 +X, 1 −X, 4 +Z, 5 −Z) dans la direction horizontale dominante de `v`.
+fn side_toward(v: Vec3) -> u8 {
+    if v.x.abs() > v.z.abs() {
+        if v.x > 0.0 {
+            0
+        } else {
+            1
+        }
+    } else if v.z > 0.0 {
+        4
+    } else {
+        5
+    }
+}
+
+/// Porte : quart de tour (même sens que les portes de Minecraft importées).
+fn door_turn(side: u8) -> u8 {
+    match side {
+        1 => 5,
+        5 => 0,
+        0 => 4,
+        _ => 1,
+    }
+}
+
+/// Ouvre ou ferme la porte / trappe en `p` ; renvoie les blocs à changer. Une porte
+/// ouverte pendant la partie retrouve exactement sa place en se refermant ; une trappe se
+/// relève contre le côté opposé au joueur.
+fn toggle_hinged(
+    world: &mut World,
+    opened: &mut HashMap<[i32; 3], BlockId>,
+    p: [i32; 3],
+    look: Vec3,
+) -> Vec<([i32; 3], BlockId)> {
+    let id = world.get(p[0], p[1], p[2]);
+    let Some(h) = hinged(id) else {
+        return Vec::new();
+    };
+    match h {
+        Hinged::Door { upper, .. } => {
+            let other = [p[0], if upper { p[1] - 1 } else { p[1] + 1 }, p[2]];
+            let mut cells = vec![p];
+            if matches!(
+                hinged(world.get(other[0], other[1], other[2])),
+                Some(Hinged::Door { .. })
+            ) {
+                cells.push(other);
+            }
+            let mut out = Vec::new();
+            for c in cells {
+                let cur = world.get(c[0], c[1], c[2]);
+                if let Some(closed) = opened.remove(&c).filter(|&b| same_family(b, cur)) {
+                    out.push((c, closed));
+                } else if let Some(Hinged::Door { wood, upper, side }) = hinged(cur) {
+                    let open = Hinged::Door {
+                        wood,
+                        upper,
+                        side: door_turn(side),
+                    };
+                    if let Some(b) = hinged_block(open) {
+                        opened.insert(c, cur);
+                        out.push((c, b));
+                    }
+                }
+            }
+            out
+        }
+        Hinged::Trapdoor { kind, side } => {
+            if let Some(closed) = opened.remove(&p).filter(|&b| same_family(b, id)) {
+                return vec![(p, closed)];
+            }
+            let new_side = if side == 2 || side == 3 {
+                side_toward(look)
+            } else {
+                3
+            };
+            match hinged_block(Hinged::Trapdoor {
+                kind,
+                side: new_side,
+            }) {
+                Some(b) => {
+                    if side == 2 || side == 3 {
+                        opened.insert(p, id);
+                    }
+                    vec![(p, b)]
+                }
+                None => Vec::new(),
+            }
+        }
+    }
+}
+
+/// Pose d'une porte (moitiés basse et haute, au bord de la case le plus proche du joueur)
+/// ou d'une trappe (dessous / plafond / moitié visée sur un côté). `None` sinon.
+fn hinged_placement(
+    hit: &Hit,
+    item: BlockId,
+    look: Vec3,
+    point: Vec3,
+) -> Option<Vec<([i32; 3], BlockId)>> {
+    let p = hit.adjacent();
+    match hinged(item)? {
+        Hinged::Door { wood, .. } => {
+            // Bord le plus proche du joueur : à l'opposé du regard.
+            let side = side_toward(-look);
+            let lower = hinged_block(Hinged::Door {
+                wood,
+                upper: false,
+                side,
+            })?;
+            let upper = hinged_block(Hinged::Door {
+                wood,
+                upper: true,
+                side,
+            })?;
+            Some(vec![(p, lower), ([p[0], p[1] + 1, p[2]], upper)])
+        }
+        Hinged::Trapdoor { kind, .. } => {
+            let side = match hit.normal {
+                [0, 1, 0] => 3,
+                [0, -1, 0] => 2,
+                _ if point.y - point.y.floor() > 0.5 => 2,
+                _ => 3,
+            };
+            Some(vec![(p, hinged_block(Hinged::Trapdoor { kind, side })?)])
+        }
+    }
+}
+
+/// Dalle : matériau et côté occupé (0 +X, 1 −X, 2 haut, 3 bas, 4 +Z, 5 −Z).
+fn slab_parts(id: BlockId) -> Option<(&'static str, u8)> {
+    let rest = id.def().key.strip_prefix("slab:")?;
+    let (mat, half) = rest.rsplit_once(':')?;
+    let side = match half {
+        "bottom" => 3,
+        "top" => 2,
+        h => h.parse().ok()?,
+    };
+    Some((mat, side))
+}
+
+fn slab_of(mat: &str, side: u8) -> Option<BlockId> {
+    let half = match side {
+        2 => "top".to_string(),
+        3 => "bottom".to_string(),
+        s => s.to_string(),
+    };
+    minelib_world::registry::registry().by_key(&format!("slab:{mat}:{half}"))
+}
+
+/// Normale du côté `side` d'une case.
+fn side_dir(side: u8) -> [i32; 3] {
+    match side {
+        0 => [1, 0, 0],
+        1 => [-1, 0, 0],
+        2 => [0, 1, 0],
+        3 => [0, -1, 0],
+        4 => [0, 0, 1],
+        _ => [0, 0, -1],
+    }
+}
+
+/// Où et quoi poser quand on pose la dalle `item` sur le bloc visé `hit` (`point` : point
+/// touché) : `None` si `item` n'est pas une dalle.
+/// - sur la moitié libre d'une dalle du même matériau, ou dans une case qui en contient
+///   une : bloc complet ;
+/// - sur le dessus d'un bloc : dalle du bas ; au plafond : dalle du haut ;
+/// - contre un mur : dalle verticale collée au mur ; accroupi : du haut ou du bas selon la
+///   hauteur visée.
+fn slab_placement(
+    world: &World,
+    hit: &Hit,
+    item: BlockId,
+    point: Vec3,
+    sneaking: bool,
+) -> Option<([i32; 3], BlockId)> {
+    let (mat, _) = slab_parts(item)?;
+    let reg = minelib_world::registry::registry();
+    let full = reg
+        .by_key(mat)
+        .filter(|b| matches!(b.def().shape, minelib_world::registry::Shape::Cube));
+    // Dalle visée du même matériau, cliquée sur sa face intérieure : on la complète.
+    if let (Some((m, side)), Some(full)) = (slab_parts(hit.id), full) {
+        let d = side_dir(side);
+        if m == mat && hit.normal == [-d[0], -d[1], -d[2]] {
+            return Some((hit.block, full));
+        }
+    }
+    let p = hit.adjacent();
+    let there = world.get(p[0], p[1], p[2]);
+    if let (Some((m, _)), Some(full)) = (slab_parts(there), full) {
+        if m == mat {
+            return Some((p, full));
+        }
+    }
+    if there.is_targetable() {
+        return Some((p, there)); // case occupée : rien ne change
+    }
+    let side = match hit.normal {
+        [0, 1, 0] => 3,
+        [0, -1, 0] => 2,
+        _ if sneaking => {
+            if point.y - point.y.floor() > 0.5 {
+                2
+            } else {
+                3
+            }
+        }
+        // Contre un mur : la dalle est collée à la face visée (le mur est du côté −normale).
+        [1, 0, 0] => 1,
+        [-1, 0, 0] => 0,
+        [0, 0, 1] => 5,
+        _ => 4,
+    };
+    Some((p, slab_of(mat, side).unwrap_or(item)))
+}
+
+/// Recul de la caméra à la 3e personne (F5), en blocs, comme dans Minecraft.
+const THIRD_PERSON_DIST: f32 = 4.0;
 
 /// Scène de démonstration : un mur de briques et toutes les torches colorées devant.
 fn build_demo(world: &mut World) {
@@ -1866,4 +2329,88 @@ fn selection_lines(
         );
     }
     out
+}
+
+#[cfg(test)]
+mod slab_tests {
+    use super::*;
+
+    fn key(id: BlockId) -> &'static str {
+        &id.def().key
+    }
+
+    #[test]
+    fn slabs_orient_and_merge_into_a_full_block() {
+        let reg = minelib_world::registry::registry();
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        let stone = reg.by_key("stone").unwrap();
+        let slab = reg.by_key("slab:stone:bottom").unwrap();
+        w.set(4, 10, 4, stone);
+        let hit = |block: [i32; 3], normal: [i32; 3], id: BlockId| Hit {
+            block,
+            normal,
+            id,
+            distance: 2.0,
+        };
+        let pt = Vec3::new(4.5, 10.2, 4.5);
+        // Sur le dessus d'un bloc : dalle du bas.
+        let (p, id) =
+            slab_placement(&w, &hit([4, 10, 4], [0, 1, 0], stone), slab, pt, false).unwrap();
+        assert_eq!((p, key(id)), ([4, 11, 4], "slab:stone:bottom"));
+        w.set(4, 11, 4, id);
+        // Sur sa moitié libre : bloc complet.
+        let (p, id) = slab_placement(&w, &hit([4, 11, 4], [0, 1, 0], id), slab, pt, false).unwrap();
+        assert_eq!((p, key(id)), ([4, 11, 4], "stone"));
+        // Contre un mur (face +X du bloc) : dalle verticale collée au mur (côté −X).
+        let (p, id) =
+            slab_placement(&w, &hit([4, 10, 4], [1, 0, 0], stone), slab, pt, false).unwrap();
+        assert_eq!((p, key(id)), ([5, 10, 4], "slab:stone:1"));
+        w.set(5, 10, 4, id);
+        // Deuxième dalle contre la première : le bloc se remplit.
+        let (p, id) = slab_placement(&w, &hit([5, 10, 4], [1, 0, 0], id), slab, pt, false).unwrap();
+        assert_eq!((p, key(id)), ([5, 10, 4], "stone"));
+        // Accroupi contre un mur, en visant le haut : dalle du haut.
+        let up = Vec3::new(5.0, 10.8, 4.5);
+        let (_, id) =
+            slab_placement(&w, &hit([4, 10, 4], [0, 0, 1], stone), slab, up, true).unwrap();
+        assert_eq!(key(id), "slab:stone:top");
+        // Pas une dalle : rien de spécial.
+        assert!(slab_placement(&w, &hit([4, 10, 4], [0, 1, 0], stone), stone, pt, false).is_none());
+    }
+
+    #[test]
+    fn doors_and_trapdoors_open_and_close() {
+        let reg = minelib_world::registry::registry();
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        let mut opened = HashMap::new();
+        let lower = reg.by_key("door_wood:lower:1").unwrap();
+        let upper = reg.by_key("door_wood:upper:1").unwrap();
+        w.set(3, 10, 3, lower);
+        w.set(3, 11, 3, upper);
+        let look = Vec3::new(1.0, 0.0, 0.0);
+        let ch = toggle_hinged(&mut w, &mut opened, [3, 11, 3], look);
+        assert_eq!(ch.len(), 2, "les deux moitiés s'ouvrent");
+        for (p, b) in &ch {
+            w.set(p[0], p[1], p[2], *b);
+        }
+        assert_eq!(key(w.get(3, 10, 3)), "door_wood:lower:5");
+        for (p, b) in toggle_hinged(&mut w, &mut opened, [3, 10, 3], look) {
+            w.set(p[0], p[1], p[2], b);
+        }
+        assert_eq!(w.get(3, 10, 3), lower);
+        assert_eq!(w.get(3, 11, 3), upper);
+        // Trappe : se relève contre le côté opposé au joueur, puis se rabat.
+        let trap = reg.by_key("trapdoor:3").unwrap();
+        w.set(6, 10, 6, trap);
+        for (p, b) in toggle_hinged(&mut w, &mut opened, [6, 10, 6], Vec3::new(0.0, -0.5, 1.0)) {
+            w.set(p[0], p[1], p[2], b);
+        }
+        assert_eq!(key(w.get(6, 10, 6)), "trapdoor:4");
+        for (p, b) in toggle_hinged(&mut w, &mut opened, [6, 10, 6], Vec3::Z) {
+            w.set(p[0], p[1], p[2], b);
+        }
+        assert_eq!(w.get(6, 10, 6), trap);
+    }
 }

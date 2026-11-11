@@ -10,10 +10,12 @@
 
 mod arena;
 mod capture;
+mod entity;
 mod gpu_timer;
 pub mod igpu;
 mod occlusion;
 mod reflections;
+mod smoke;
 pub use wgpu;
 mod latency;
 mod overlay;
@@ -25,8 +27,10 @@ pub mod viewmodel;
 
 pub use capture::Screenshot;
 
+pub use entity::EntityVertex;
 pub use latency::{LowLatencyKind, Marker};
 pub use overlay::{Line, Overlay, Ui};
+pub use smoke::{SmokeQuality, SmokeVolume};
 pub use viewmodel::{VmVertex, FLAME, NO_TEXTURE};
 
 use std::collections::HashMap;
@@ -71,6 +75,91 @@ struct Globals {
     /// Reflets calculés à part : vue-projection et caméra de leur dernier calcul.
     refl_vp: [[f32; 4]; 4],
     refl_cam: [f32; 4],
+    /// Modèle du joueur dans les reflets : nombre de pavés et lumière reçue (rgb).
+    ray_info: [f32; 4],
+    ray_inv: [[[f32; 4]; 4]; MAX_RAY_BOXES],
+    ray_min: [[f32; 4]; MAX_RAY_BOXES],
+    ray_max: [[f32; 4]; MAX_RAY_BOXES],
+    ray_uv: [[f32; 4]; MAX_RAY_BOXES],
+}
+
+/// Nombre maximal de pavés du joueur vus dans les reflets.
+pub const MAX_RAY_BOXES: usize = 8;
+
+/// Sorte de pavé du joueur dans les reflets (couleurs calculées par le shader).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RayBoxKind {
+    Head,
+    Body,
+    Arm,
+    Leg,
+    /// Morceau de bloc tenu : couche de texture, rectangle de la texture (u0, v0, u1, v1)
+    /// plaqué sur chaque face, et `glow` s'il s'éclaire lui-même (bâton d'une torche).
+    Block {
+        layer: u32,
+        uv: [f32; 4],
+        glow: bool,
+    },
+    /// Objet tenu : couleur unie (sRGB).
+    Flat([u8; 3]),
+    /// Lumineux (flamme d'une torche, bâton éclairé par elle) : couleur finale, sans
+    /// l'éclairage du lieu.
+    Glow([u8; 3]),
+}
+
+/// Pavé du modèle du joueur pour les reflets : `world_to_local` ramène un point du monde
+/// dans le repère du pavé (en pixels du skin), où il occupe `min`..`max`.
+#[derive(Clone, Copy, Debug)]
+pub struct RayBox {
+    pub world_to_local: Mat4,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub kind: RayBoxKind,
+}
+
+/// Uniformes des pavés du joueur : (nombre et lumière, matrices, coins min, coins max).
+type RayGlobals = (
+    [f32; 4],
+    [[[f32; 4]; 4]; MAX_RAY_BOXES],
+    [[f32; 4]; MAX_RAY_BOXES],
+    [[f32; 4]; MAX_RAY_BOXES],
+    [[f32; 4]; MAX_RAY_BOXES],
+);
+
+fn ray_globals(boxes: &[RayBox], light: [f32; 3]) -> RayGlobals {
+    let n = boxes.len().min(MAX_RAY_BOXES);
+    let mut inv = [[[0.0; 4]; 4]; MAX_RAY_BOXES];
+    let mut mn = [[0.0; 4]; MAX_RAY_BOXES];
+    let mut mx = [[0.0; 4]; MAX_RAY_BOXES];
+    let mut uv = [[0.0, 0.0, 1.0, 1.0]; MAX_RAY_BOXES];
+    for (i, b) in boxes.iter().take(n).enumerate() {
+        inv[i] = b.world_to_local.to_cols_array_2d();
+        let (kind, extra) = match b.kind {
+            RayBoxKind::Head => (0.0, 0.0),
+            RayBoxKind::Body => (1.0, 0.0),
+            RayBoxKind::Arm => (2.0, 0.0),
+            RayBoxKind::Leg => (3.0, 0.0),
+            RayBoxKind::Block {
+                layer,
+                uv: rect,
+                glow,
+            } => {
+                uv[i] = rect;
+                (if glow { 7.0 } else { 4.0 }, layer as f32)
+            }
+            RayBoxKind::Flat(c) => (
+                5.0,
+                (c[0] as u32 * 65536 + c[1] as u32 * 256 + c[2] as u32) as f32,
+            ),
+            RayBoxKind::Glow(c) => (
+                6.0,
+                (c[0] as u32 * 65536 + c[1] as u32 * 256 + c[2] as u32) as f32,
+            ),
+        };
+        mn[i] = [b.min[0], b.min[1], b.min[2], kind];
+        mx[i] = [b.max[0], b.max[1], b.max[2], extra];
+    }
+    ([n as f32, light[0], light[1], light[2]], inv, mn, mx, uv)
 }
 
 /// Nombre maximal de reflets de sources de lumière par les miroirs.
@@ -107,7 +196,10 @@ pub struct PointLight {
 
 /// Paramètres d'une image, fournis par le jeu.
 pub struct FrameParams<'a> {
+    /// Position de la caméra (les yeux, ou derrière le joueur à la 3e personne).
     pub eye: Vec3,
+    /// Yeux du joueur (torche tenue en main), même à la 3e personne.
+    pub player_eye: Vec3,
     pub view: Mat4,
     pub fov_y: f32,
     pub fog_start: f32,
@@ -121,8 +213,18 @@ pub struct FrameParams<'a> {
     pub ui: Option<&'a Ui>,
     /// Main et objet tenu (triangles déjà projetés).
     pub viewmodel: &'a [VmVertex],
+    /// Entités dans le monde (modèle du joueur à la 3e personne), coordonnées monde.
+    pub entities: &'a [EntityVertex],
     /// Torche tenue en main : couleur (sRGB) et portée en blocs.
     pub held_light: Option<([u8; 3], f32)>,
+    /// Flamme de la torche tenue (bout de la torche dans la main du modèle du joueur) ;
+    /// sinon un peu devant les yeux.
+    pub held_light_pos: Option<Vec3>,
+    /// Le joueur (et l'objet tenu) vu dans les reflets, et la lumière qu'il reçoit.
+    pub ray_boxes: &'a [RayBox],
+    /// Fumigènes à dessiner en volume.
+    pub smokes: &'a [SmokeVolume<'a>],
+    pub ray_light: [f32; 3],
     /// Écran de debug (F3) à afficher par-dessus la scène.
     pub overlay: Option<&'a Overlay>,
 }
@@ -277,6 +379,11 @@ pub struct Renderer {
     draw_list: Vec<(f32, MeshKey)>,
     overlay: overlay::OverlayRenderer,
     viewmodel: viewmodel::ViewModel,
+    entities: entity::Entities,
+    /// Temps passé bloqué sur la carte graphique pendant l'image (s), pour Reflex.
+    blocked: f32,
+    /// Fumigènes en volume.
+    smokes: smoke::Smokes,
     voxels: rt::Voxels,
     gpu_timer: Option<gpu_timer::GpuTimer>,
     cull_order: Vec<usize>,
@@ -616,73 +723,100 @@ impl Renderer {
             })
         };
 
-        let block_pipeline = make(
-            "blocs",
-            "vs_block",
-            "fs_block_fast",
-            std::slice::from_ref(&vertex_layout),
-            Some(wgpu::Face::Back),
-            true,
-            wgpu::CompareFunction::Greater, // Z inversé : 1 = près, 0 = infini
-            None,
-        );
-        // Passe des reflets (raytracing à son propre rythme) : surfaces réfléchissantes
-        // seulement, dans l'image des reflets.
-        let reflect_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("reflets (raytracing)"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_block"),
-                compilation_options: Default::default(),
-                buffers: std::slice::from_ref(&vertex_layout),
-            },
-            primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Greater,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_reflect"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: reflections::FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
-        });
-        // Miroirs et métaux : shader complet (reflets), sur peu de pixels.
-        let reflective_pipeline = make(
-            "reflets",
-            "vs_block",
-            "fs_block",
-            std::slice::from_ref(&vertex_layout),
-            Some(wgpu::Face::Back),
-            true,
-            wgpu::CompareFunction::Greater,
-            None,
-        );
-        // Eau, glace, verre teinté : mélange alpha, sans écrire la profondeur, visibles des deux côtés.
-        let translucent_pipeline = make(
-            "translucide",
-            "vs_block",
-            "fs_block_translucent",
-            std::slice::from_ref(&vertex_layout),
-            None,
-            false,
-            wgpu::CompareFunction::Greater,
-            Some(wgpu::BlendState::ALPHA_BLENDING),
+        // Les pipelines lourds (shader du monde avec raytracing) sont compilés en parallèle :
+        // sous DirectX, chaque compilation (FXC) prend plusieurs secondes.
+        let reflect_desc = |device: &wgpu::Device| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("reflets (raytracing)"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_block"),
+                    compilation_options: Default::default(),
+                    buffers: std::slice::from_ref(&vertex_layout),
+                },
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Greater,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_reflect"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: reflections::FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let vl = std::slice::from_ref(&vertex_layout);
+        let t0 = std::time::Instant::now();
+        let (block_pipeline, reflect_pipeline, reflective_pipeline, translucent_pipeline) =
+            std::thread::scope(|sc| {
+                let block = sc.spawn(|| {
+                    make(
+                        "blocs",
+                        "vs_block",
+                        "fs_block_fast",
+                        vl,
+                        Some(wgpu::Face::Back),
+                        true,
+                        wgpu::CompareFunction::Greater, // Z inversé : 1 = près, 0 = infini
+                        None,
+                    )
+                });
+                // Passe des reflets (raytracing à son propre rythme) : surfaces
+                // réfléchissantes seulement, dans l'image des reflets.
+                let reflect = sc.spawn(|| reflect_desc(&device));
+                // Miroirs et métaux : shader complet (reflets), sur peu de pixels.
+                let reflective = sc.spawn(|| {
+                    make(
+                        "reflets",
+                        "vs_block",
+                        "fs_block",
+                        vl,
+                        Some(wgpu::Face::Back),
+                        true,
+                        wgpu::CompareFunction::Greater,
+                        None,
+                    )
+                });
+                // Eau, glace, verre : mélange alpha, sans écrire la profondeur, visibles des
+                // deux côtés.
+                let translucent = sc.spawn(|| {
+                    make(
+                        "translucide",
+                        "vs_block",
+                        "fs_block_translucent",
+                        vl,
+                        None,
+                        false,
+                        wgpu::CompareFunction::Greater,
+                        Some(wgpu::BlendState::ALPHA_BLENDING),
+                    )
+                });
+                (
+                    block.join().expect("pipeline des blocs"),
+                    reflect.join().expect("pipeline des reflets"),
+                    reflective.join().expect("pipeline réfléchissant"),
+                    translucent.join().expect("pipeline translucide"),
+                )
+            });
+        log::info!(
+            "shaders du monde compilés en {:.1} s",
+            t0.elapsed().as_secs_f32()
         );
         let sky_pipeline = make(
             "ciel",
@@ -710,6 +844,8 @@ impl Renderer {
             overlay::OverlayRenderer::new(&device, &queue, config.format, DEPTH_FORMAT, &atlas);
 
         let viewmodel = viewmodel::ViewModel::new(&device, &bgl, config.format);
+        let entities = entity::Entities::new(&device, &bgl, config.format);
+        let smokes = smoke::Smokes::new(&device, &queue, &bgl, config.format);
         let indirect = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dessins indirects"),
             size: 20 * 4096,
@@ -758,6 +894,9 @@ impl Renderer {
             world_shader: shader,
             overlay,
             viewmodel,
+            entities,
+            blocked: 0.0,
+            smokes,
             voxels,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
             lights_col: [[0.0; 4]; MAX_LIGHTS],
@@ -980,6 +1119,11 @@ impl Renderer {
         self.latency.as_ref().map(|l| (l.kind(), l.enabled()))
     }
 
+    /// Reflex / Anti-Lag fait-il attendre le jeu en ce moment (carte graphique saturée) ?
+    pub fn low_latency_waiting(&self) -> bool {
+        self.latency.as_ref().is_some_and(|l| l.driver_wait())
+    }
+
     pub fn raytracing(&self) -> bool {
         self.raytracing
     }
@@ -1062,6 +1206,11 @@ impl Renderer {
         self.render_scale
     }
 
+    /// Qualité des fumigènes (pas de la marche dans le volume).
+    pub fn set_smoke_quality(&mut self, q: SmokeQuality) {
+        self.smokes.quality = q;
+    }
+
     pub fn set_raytracing(&mut self, on: bool) {
         self.raytracing = on;
     }
@@ -1112,8 +1261,9 @@ impl Renderer {
 
     /// À appeler en début d'image, avant de lire les entrées du joueur.
     pub fn frame_begin(&mut self) {
+        let blocked = std::mem::take(&mut self.blocked);
         if let Some(l) = &mut self.latency {
-            l.frame_begin();
+            l.frame_begin(blocked);
         }
     }
 
@@ -1137,7 +1287,9 @@ impl Renderer {
             .iter()
             .filter_map(|t| match t {
                 minelib_world::registry::TexSrc::Pack(n)
-                | minelib_world::registry::TexSrc::Tint(n, _) => Some(*n),
+                | minelib_world::registry::TexSrc::Tint(n, _)
+                | minelib_world::registry::TexSrc::Banner(n, _) => Some(*n),
+                minelib_world::registry::TexSrc::Glass(_, _) => Some("glass"),
                 _ => None,
             })
             .collect();
@@ -1492,6 +1644,7 @@ impl Renderer {
         let view_proj = proj * p.view;
         let (sel_min, sel_max) = selection(p.selected);
         self.outline = p.selected.is_some();
+        let rg = ray_globals(p.ray_boxes, p.ray_light);
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
@@ -1524,6 +1677,11 @@ impl Renderer {
             mirror_plane: self.mirror_lights[2],
             refl_vp: self.refl.globals().0,
             refl_cam: self.refl.globals().1,
+            ray_info: rg.0,
+            ray_inv: rg.1,
+            ray_min: rg.2,
+            ray_max: rg.3,
+            ray_uv: rg.4,
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
@@ -1533,6 +1691,9 @@ impl Renderer {
         let hand = self
             .viewmodel
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
+        self.entities.prepare(&self.queue, p.entities);
+        self.smokes
+            .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -1569,6 +1730,8 @@ impl Renderer {
                 ],
                 &mut stats,
             );
+            self.entities.draw(&mut pass, self.world_group(), false);
+            self.smokes.draw(&mut pass, self.world_group(), false);
         }
         // Main + objet tenu (profondeur à part), puis l'interface.
         {
@@ -1659,6 +1822,7 @@ impl Renderer {
         }
         let (sel_min, sel_max) = selection(p.selected);
         self.outline = p.selected.is_some();
+        let rg = ray_globals(p.ray_boxes, p.ray_light);
         let globals = Globals {
             view_proj: jittered.to_cols_array_2d(),
             inv_view_proj: jittered.inverse().to_cols_array_2d(),
@@ -1686,12 +1850,20 @@ impl Renderer {
             mirror_plane: self.mirror_lights[2],
             refl_vp: self.refl.globals().0,
             refl_cam: self.refl.globals().1,
+            ray_info: rg.0,
+            ray_inv: rg.1,
+            ray_min: rg.2,
+            ray_max: rg.3,
+            ray_uv: rg.4,
         };
         self.overlay
             .prepare(&self.device, &self.queue, p.overlay, p.ui, size);
         let hand = self
             .viewmodel
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
+        self.entities.prepare(&self.queue, p.entities);
+        self.smokes
+            .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = {
             let _c = perf::scope("rendu : tri des chunks");
             self.cull(view_proj, p.eye, p.fog_end)
@@ -1721,6 +1893,7 @@ impl Renderer {
         // Image de la fenêtre demandée le plus tard possible : tout le travail CPU ci-dessus
         // se fait pendant que le GPU termine les images précédentes.
         let acquire = perf::scope("rendu : attente de l'image (GPU)");
+        let t_acquire = std::time::Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -1735,6 +1908,7 @@ impl Renderer {
             }
         };
         drop(acquire);
+        self.blocked += t_acquire.elapsed().as_secs_f32();
         let encode = perf::scope("rendu : commandes");
         let view = frame.texture.create_view(&Default::default());
         if let Some(t) = &mut self.gpu_timer {
@@ -1812,6 +1986,8 @@ impl Renderer {
                 ],
                 &mut stats,
             );
+            self.entities.draw(&mut pass, self.world_group(), true);
+            self.smokes.draw(&mut pass, self.world_group(), true);
         }
         taa.resolve(
             &self.queue,
@@ -1857,6 +2033,7 @@ impl Renderer {
             .encode(&self.device, &mut encoder, &frame.texture);
         self.marker(Marker::SimulationEnd);
         self.marker(Marker::RenderSubmitStart);
+        let t_submit = std::time::Instant::now();
         {
             let _s = perf::scope("rendu : envoi au GPU");
             self.queue.submit([encoder.finish()]);
@@ -1867,6 +2044,7 @@ impl Renderer {
             let _s = perf::scope("rendu : présentation");
             frame.present();
         }
+        self.blocked += t_submit.elapsed().as_secs_f32();
         self.marker(Marker::PresentEnd);
         if let Some(t) = &mut self.gpu_timer {
             if let Some(g) = t.after_submit(&self.device) {
@@ -1928,7 +2106,9 @@ fn held_light(p: &FrameParams) -> ([f32; 4], [f32; 4]) {
     match p.held_light {
         Some((rgb, radius)) => {
             let fwd = (p.view.inverse().transform_vector3(-Vec3::Z)).normalize_or_zero();
-            let pos = p.eye + fwd * 0.4 - Vec3::Y * 0.2;
+            let pos = p
+                .held_light_pos
+                .unwrap_or(p.player_eye + fwd * 0.4 - Vec3::Y * 0.2);
             // sRGB → linéaire, même échelle que les torches posées.
             let c = rgb.map(|v| (v as f32 / 255.0).powf(2.2) * 1.25);
             ([pos.x, pos.y, pos.z, radius], [c[0], c[1], c[2], 0.0])

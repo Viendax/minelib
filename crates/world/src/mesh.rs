@@ -458,8 +458,9 @@ impl LightGrid {
     }
 }
 
-/// Pavé en coordonnées monde, faces émises sauf celles que `skip(face)` élimine.
-fn emit_box(
+/// Pavé `min`..`max` d'un bloc, avec une transformation des sommets (torche murale penchée).
+#[allow(clippy::too_many_arguments)]
+fn emit_box_xf(
     out: &mut MeshData,
     min: [f32; 3],
     max: [f32; 3],
@@ -467,17 +468,31 @@ fn emit_box(
     light: [[u8; 4]; 6],
     extra: u32,
     skip: impl Fn(usize) -> bool,
+    xf: &dyn Fn([f32; 3]) -> [f32; 3],
+    local_uv: bool,
 ) {
-    emit_box_xf(out, min, max, id, light, extra, skip, &|p| p, false);
+    emit_box_t(
+        out,
+        min,
+        max,
+        id,
+        &|f| face_tex(id, f),
+        light,
+        extra,
+        skip,
+        xf,
+        local_uv,
+    );
 }
 
-/// Comme `emit_box`, avec une transformation des sommets (torche murale penchée).
+/// Comme `emit_box_xf`, avec la texture de chaque face donnée par `tex_of`.
 #[allow(clippy::too_many_arguments)]
-fn emit_box_xf(
+fn emit_box_t(
     out: &mut MeshData,
     min: [f32; 3],
     max: [f32; 3],
     id: BlockId,
+    tex_of: &dyn Fn(u32) -> u32,
     light: [[u8; 4]; 6],
     extra: u32,
     skip: impl Fn(usize) -> bool,
@@ -494,7 +509,7 @@ fn emit_box_xf(
         let base: [f32; 3] = std::array::from_fn(|i| min[i] + if n[i] > 0 { e[i] } else { 0.0 });
         let (du, dv) = (e[axis(u)], e[axis(v)]);
         let start = out.vertices.len() as u32;
-        let tex = face_tex(id, face as u32) | extra;
+        let tex = tex_of(face as u32) | extra;
         for (a, c) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
             let p: [f32; 3] =
                 std::array::from_fn(|i| base[i] + a * du * u[i] as f32 + c * dv * v[i] as f32);
@@ -946,8 +961,24 @@ fn mesh_block(
                                 }
                             }
                         }
-                        let lit = light_at(b);
-                        for (mn, mx) in boxes {
+                        // Bannière : deux blocs de haut, elle pend dans la case du dessous
+                        // (seul le bloc du haut a une hitbox, comme dans Minecraft).
+                        let banner = def.key.starts_with("banner_");
+                        // Moitié du bas seulement dans le vide ou derrière du verre : dans
+                        // un bloc, on ne voit que le bloc (pas de scintillement).
+                        let below = pad.get(x, y - 1, z);
+                        let banner_low =
+                            banner && (below == BlockId::AIR || below.def().translucent);
+                        type Part = (([u8; 3], [u8; 3]), i32);
+                        let parts: Vec<Part> = boxes
+                            .iter()
+                            .map(|&bx| (bx, 0))
+                            .chain(boxes.iter().filter(|_| banner_low).map(|&bx| (bx, -1)))
+                            .collect();
+                        for ((mn, mx), dy) in parts {
+                            let b = add(b, [0, dy, 0]);
+                            let lit = light_at(b);
+                            let wy = wy + dy as f32;
                             let lo = mn.map(|v| v as f32 / 16.0);
                             let hi = mx.map(|v| v as f32 / 16.0);
                             // Face au bord du bloc : éclairée par la case voisine qu'elle
@@ -967,18 +998,32 @@ fn mesh_block(
                             // Face sur le bord du bloc et voisin plein : cachée.
                             let skip = |face: usize| {
                                 let (nrm, _, _) = FACES[face];
+                                // Jointure entre les deux moitiés d'une bannière : rien.
+                                if banner_low
+                                    && (nrm[1] == -1 && dy == 0 || nrm[1] == 1 && dy == -1)
+                                {
+                                    return true;
+                                }
                                 let k = nrm.iter().position(|&c| c != 0).unwrap();
                                 let on_edge = if nrm[k] > 0 { mx[k] == 16 } else { mn[k] == 0 };
                                 on_edge && opaque(add(b, nrm))
                             };
-                            emit_box(
+                            // Bannière : moitié du haut (texture des côtés) ou du bas
+                            // (texture du dessous) sur toutes ses faces.
+                            let t = id.def().tex;
+                            let half = if dy == 0 { t[1] } else { t[2] } as u32;
+                            let tex_of = |f: u32| if banner { half } else { face_tex(id, f) };
+                            emit_box_t(
                                 out,
                                 [wx + lo[0], wy + lo[1], wz + lo[2]],
                                 [wx + hi[0], wy + hi[1], wz + hi[2]],
                                 id,
+                                &tex_of,
                                 face_light,
                                 0,
                                 skip,
+                                &|p| p,
+                                false,
                             );
                         }
                         return;
@@ -986,8 +1031,14 @@ fn mesh_block(
                 }
                 for (face, &(n, u, v)) in FACES.iter().enumerate() {
                     let front = add(b, n);
+                    let facing = pad.get(front[0], front[1], front[2]);
+                    // Cachée par un bloc plein, par le même bloc (verre, eau), ou par la
+                    // face pleine d'une dalle ou d'un escalier collée contre elle (sinon
+                    // les deux surfaces au même endroit scintillent sous du verre).
+                    let covered = crate::registry::light_faces(facing) & (1 << (face ^ 1)) != 0;
                     if opaque(front)
-                        || (def.cull_same && pad.get(front[0], front[1], front[2]) == id)
+                        || (def.cull_same && facing == id)
+                        || (covered && !def.translucent)
                     {
                         continue;
                     }
@@ -1038,6 +1089,44 @@ fn mesh_block(
                         (0..3).for_each(|k| l[k] = (rgb[k] / rgb_cnt) as u8);
                         lights[i] = l;
                     }
+                    // Verre contre un bloc non plein (dalle, escalier, trappe…) : la face
+                    // reste (sa teinte compte) mais rentre d'un cheveu, sinon elle est au
+                    // même endroit que celle du voisin et passe devant en scintillant.
+                    // Contre une face pleine, elle est éclairée par la case du verre (celle
+                    // de la dalle est noire).
+                    let inset = if def.translucent && facing != BlockId::AIR && facing != id {
+                        0.002
+                    } else {
+                        0.0
+                    };
+                    if covered {
+                        ao = [3; 4];
+                        lights = [light_at(b); 4];
+                    }
+                    // Verre : bords cachés du côté des voisins du même verre.
+                    let tex = if def.connect != 0 {
+                        let k = n.iter().position(|&c| c != 0).unwrap();
+                        let same = |d: [i32; 3]| pad.get(x + d[0], y + d[1], z + d[2]) == id;
+                        // Voisins (haut, droite, bas, gauche) dans le repère de la texture
+                        // (u, v) que le shader tire de la position monde.
+                        let dirs: [[i32; 3]; 4] = match k {
+                            0 => [[0, 1, 0], [0, 0, 1], [0, -1, 0], [0, 0, -1]],
+                            1 => [[0, 0, -1], [1, 0, 0], [0, 0, 1], [-1, 0, 0]],
+                            _ => [[0, 1, 0], [1, 0, 0], [0, -1, 0], [-1, 0, 0]],
+                        };
+                        let mask = dirs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, &d)| same(d))
+                            .fold(0u32, |m, (i, _)| m | 1 << i);
+                        if mask == 0 {
+                            face_tex(id, face as u32)
+                        } else {
+                            def.connect as u32 + mask - 1
+                        }
+                    } else {
+                        face_tex(id, face as u32)
+                    };
                     let start = out.vertices.len() as u32;
                     for (i, &(a, c)) in corners.iter().enumerate() {
                         let p = [
@@ -1046,10 +1135,14 @@ fn mesh_block(
                             base[2] + a * u[2] + c * v[2],
                         ];
                         out.vertices.push(Vertex {
-                            pos: [(ox + p[0]) as f32, p[1] as f32, (oz + p[2]) as f32],
+                            pos: [
+                                (ox + p[0]) as f32 - n[0] as f32 * inset,
+                                p[1] as f32 - n[1] as f32 * inset,
+                                (oz + p[2]) as f32 - n[2] as f32 * inset,
+                            ],
                             data: Vertex::block_data(face as u32, ao[i], lights[i])
                                 | reflect_bits(id),
-                            tex: face_tex(id, face as u32),
+                            tex,
                         });
                     }
                     if ao[0] + ao[2] >= ao[1] + ao[3] {
@@ -1525,6 +1618,31 @@ mod tests {
     }
 
     #[test]
+    fn banner_hangs_below_only_into_air_or_glass() {
+        let reg = crate::registry::registry();
+        let banner = reg.by_key("banner_red:4").unwrap();
+        let below_count = |under: BlockId| {
+            let mut w = empty_world_with_block(4, 100, 4);
+            w.set(4, 100, 4, banner);
+            w.set(4, 99, 4, under);
+            let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+            m.vertices
+                .iter()
+                .filter(|v| {
+                    v.pos[1] < 100.0 && v.pos[1] >= 99.0 && v.pos[0] >= 4.0 && v.pos[0] <= 5.0
+                })
+                .filter(|v| v.pos[2] > 4.0 && v.pos[2] < 5.0)
+                .count()
+        };
+        assert!(below_count(BlockId::AIR) > 0, "moitié du bas dans le vide");
+        assert!(
+            below_count(reg.by_key("glass").unwrap()) > 0,
+            "derrière du verre"
+        );
+        assert_eq!(below_count(BlockId::STONE), 0, "pas dans un bloc plein");
+    }
+
+    #[test]
     fn adjacent_blocks_hide_shared_faces() {
         let mut w = empty_world_with_block(4, 100, 4);
         w.set(5, 100, 4, BlockId::STONE);
@@ -1612,5 +1730,55 @@ mod bench_empty {
             std::hint::black_box(LightGrid::build(&n));
         }
         println!("lumière : {:?}", t.elapsed() / runs);
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+    use crate::world::World;
+
+    #[test]
+    fn glass_face_against_a_top_slab_is_hidden() {
+        let reg = crate::registry::registry();
+        let glass = reg.by_key("glass").unwrap();
+        let count = |under: BlockId| {
+            let mut w = World::new(0);
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    w.insert_empty(ChunkPos { x: dx, z: dz });
+                }
+            }
+            w.set(4, 100, 4, glass);
+            w.set(4, 99, 4, under);
+            let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+            m.vertices
+                .iter()
+                .filter(|v| v.face() == 3 && (v.pos[1] - 100.0).abs() < 0.01)
+                .count()
+        };
+        assert_eq!(count(BlockId::AIR), 4);
+        // Contre une dalle du haut : gardée, rentrée d'un cheveu (pas au même endroit).
+        assert_eq!(count(reg.by_key("slab:stone:top").unwrap()), 4);
+        let mut w = World::new(0);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                w.insert_empty(ChunkPos { x: dx, z: dz });
+            }
+        }
+        w.set(4, 99, 4, reg.by_key("slab:stone:top").unwrap());
+        w.set(4, 100, 4, glass);
+        let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        let inset: Vec<_> = m
+            .vertices
+            .iter()
+            .filter(|v| v.face() == 3 && (v.pos[1] - 100.002).abs() < 1e-4)
+            .collect();
+        assert_eq!(inset.len(), 4);
+        assert!(
+            inset.iter().all(|v| v.sky() == 15),
+            "éclairée par la case du verre"
+        );
+        assert_eq!(count(reg.by_key("slab:stone:bottom").unwrap()), 4);
     }
 }

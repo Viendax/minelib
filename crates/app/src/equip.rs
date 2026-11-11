@@ -127,107 +127,236 @@ pub const SMOKE_LIFE: f32 = 18.0;
 /// Demi-largeur et hauteur du nuage (blocs).
 const SMOKE_RX: f32 = 4.65;
 const SMOKE_H: f32 = 3.4;
-/// Tunnel creusé par une balle : rayon, ouvert 1 s, refermé à 1,5 s.
-const TUNNEL_R: f32 = 0.38;
-const TUNNEL_OPEN: f32 = 1.0;
-const TUNNEL_SHUT: f32 = 1.5;
-const MAX_TUNNELS: usize = 48;
-
-/// Bouffée d'un nuage : décalage depuis le centre, rayon, moment où elle apparaît et où
-/// elle se dissipe, teinte et phase de son mouvement.
-#[derive(Clone, Debug)]
-pub struct Puff {
-    pub off: Vec3,
-    pub r: f32,
-    delay: f32,
-    end: f32,
-    pub shade: f32,
-    phase: f32,
-    /// Entourée de bouffées de tous côtés : cachée tant que le nuage est plein.
-    pub inner: bool,
-}
+/// Tunnel creusé par une balle : rayon (petit trou), ouvert 0,5 s, refermé à 0,75 s.
+const TUNNEL_R: f32 = 0.1;
+const TUNNEL_OPEN: f32 = 0.5;
+const TUNNEL_SHUT: f32 = 0.75;
+/// Au plus autant de tunnels par nuage (envoyés à la carte graphique).
+pub const MAX_TUNNELS: usize = 16;
 
 /// Trait de balle à travers la fumée (segment) et son âge.
 #[derive(Clone, Debug)]
-struct Tunnel {
-    a: Vec3,
-    b: Vec3,
-    age: f32,
+pub struct Tunnel {
+    pub a: Vec3,
+    pub b: Vec3,
+    pub age: f32,
 }
 
-/// Nuage de fumigène : des bouffées opaques serrées qui remplissent un dôme (sans passer
-/// à travers les murs), gonflent depuis la grenade, ondulent, et se dissipent une à une à
-/// la fin. Les balles y creusent des tunnels qui se referment entre 1 et 1,5 s.
+/// Moment d'arrivée de la fumée rangé ×0,8 dans la grille (0..204) : une case jamais
+/// atteinte (255) se lit 1,25, bien au-delà du front, même lissée par la carte graphique.
+pub const SMOKE_REACH_SCALE: f32 = 0.8;
+
+/// Taille d'une case de la grille de fumée (blocs) : 4 cases par bloc.
+pub const SMOKE_CELL: f32 = 0.25;
+
+/// Nuage de fumigène simulé sur une grille fine (4 cases par bloc) : la fumée part de la
+/// grenade et remplit un volume fixe (celui d'un dôme de 9,3 × 3,4 blocs en terrain
+/// dégagé) en contournant les murs ; gênée, elle s'étale dans les couloirs comme dans CS2.
+/// Chaque case garde le moment où la fumée l'atteint (`reach`, 0 au centre … 1 au bord) :
+/// la carte graphique en tire la densité (gonflement, volutes, dissipation) et la dessine
+/// en volume, opaque, vue de dehors comme de dedans. Les balles y percent de petits
+/// tunnels qui se referment entre 1 et 1,5 s.
 #[derive(Clone, Debug)]
 pub struct SmokeCloud {
-    pub center: Vec3,
+    /// Identifiant unique (la carte graphique garde la grille tant qu'il ne change pas).
+    pub id: u64,
     pub age: f32,
-    pub puffs: Vec<Puff>,
-    tunnels: Vec<Tunnel>,
+    /// Coin bas de la grille (monde) et nombre de cases.
+    pub origin: Vec3,
+    pub dims: [u32; 3],
+    /// Par case : (reach × 0,8 × 255, 255 = pas de fumée ; 255 = bloc plein).
+    pub cells: Vec<[u8; 2]>,
+    pub tunnels: Vec<Tunnel>,
+    /// Boîte (monde) des cases que la fumée atteint, avec une case de marge.
+    pub bounds: (Vec3, Vec3),
 }
 
 impl SmokeCloud {
-    pub fn new(p: Vec3, world: &World, rnd: &mut dyn FnMut() -> f32) -> Self {
+    pub fn new(p: Vec3, world: &World, _rnd: &mut dyn FnMut() -> f32) -> Self {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let center = p - Vec3::Y * 0.1;
-        let solid = |q: Vec3| {
-            world
-                .get(q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32)
-                .is_solid()
-        };
-        let step = 0.28;
-        let n = (SMOKE_RX / step).ceil() as i32;
-        let ny = (SMOKE_H / step).ceil() as i32;
-        let mut puffs = Vec::new();
-        let mut grid = std::collections::HashMap::new();
-        for iy in 0..=ny {
-            for iz in -n..=n {
-                for ix in -n..=n {
-                    let jitter = Vec3::new(rnd(), rnd(), rnd()) * 0.1;
-                    let off = Vec3::new(ix as f32, iy as f32 + 0.6, iz as f32) * step + jitter;
-                    let e = (off.x * off.x + off.z * off.z) / (SMOKE_RX * SMOKE_RX)
-                        + (off.y / SMOKE_H).powi(2);
-                    // Dôme, et pas de fumée dans les blocs ni derrière un mur.
-                    if e > 1.0
-                        || solid(center + off)
-                        || !visible(world, center + Vec3::Y * 0.4, center + off)
-                    {
+        // Grille alignée sur les blocs : 13 × 6 × 13 blocs autour de la grenade.
+        let base = [
+            center.x.floor() as i32 - 6,
+            center.y.floor() as i32 - 1,
+            center.z.floor() as i32 - 6,
+        ];
+        let blocks = [13, 6, 13];
+        let per = (1.0 / SMOKE_CELL) as i32;
+        let dims = blocks.map(|b| (b * per) as u32);
+        let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
+        let idx = |x: usize, y: usize, z: usize| (z * ny + y) * nx + x;
+        let mut solid = vec![false; nx * ny * nz];
+        for bz in 0..blocks[2] {
+            for by in 0..blocks[1] {
+                for bx in 0..blocks[0] {
+                    let block = world.get(base[0] + bx, base[1] + by, base[2] + bz);
+                    if !block.is_solid() {
                         continue;
                     }
-                    let reach = e.sqrt();
-                    grid.insert([ix, iy, iz], puffs.len());
-                    puffs.push(Puff {
-                        off,
-                        r: 0.22 + rnd().abs() * 0.1,
-                        delay: reach * 1.0 + rnd().abs() * 0.15,
-                        // CS : nuage plein jusqu'à ~15 s, puis les bords s'effilochent en
-                        // premier et tout a disparu à 18 s (dissipation de 1,2 s par bouffée).
-                        end: 15.2 - reach * 1.0 + rnd().abs() * 1.6,
-                        // Haut du nuage plus clair (éclairé), bas plus sombre.
-                        shade: 0.82 + 0.18 * (off.y / SMOKE_H) + rnd() * 0.04,
-                        phase: rnd() * std::f32::consts::TAU,
-                        inner: false,
-                    });
+                    // Bloc non plein (dalle, trappe, escalier, clôture…) : seules les cases
+                    // dans sa matière sont fermées, la fumée remplit le reste.
+                    let def = block.def();
+                    let boxes = if def.full { Vec::new() } else { def.boxes() };
+                    for k in 0..per * per * per {
+                        let (cx, cy, cz) = (k % per, (k / per) % per, k / (per * per));
+                        let mid = [cx, cy, cz].map(|c| (c * 16 / per + 8 / per) as u8);
+                        if !def.full
+                            && !boxes
+                                .iter()
+                                .any(|(a, b)| (0..3).all(|i| mid[i] >= a[i] && mid[i] < b[i]))
+                        {
+                            continue;
+                        }
+                        solid[idx(
+                            (bx * per + cx) as usize,
+                            (by * per + cy) as usize,
+                            (bz * per + cz) as usize,
+                        )] = true;
+                    }
                 }
             }
         }
-        // Bouffées intérieures : leurs 6 voisines existent (on ne dessine que la surface).
-        for (&[x, y, z], &i) in &grid {
-            puffs[i].inner = [
-                [1, 0, 0],
-                [-1, 0, 0],
-                [0, 1, 0],
-                [0, -1, 0],
-                [0, 0, 1],
-                [0, 0, -1],
-            ]
-            .iter()
-            .all(|d| grid.contains_key(&[x + d[0], y + d[1], z + d[2]]) || (y == 0 && d[1] == -1));
+        let origin = Vec3::new(base[0] as f32, base[1] as f32, base[2] as f32);
+        // Case de départ : celle de la grenade (ou la première libre au-dessus).
+        let cell_of = |q: Vec3| {
+            let c = ((q - origin) / SMOKE_CELL).floor();
+            [c.x as usize, c.y as usize, c.z as usize]
+        };
+        let mut start = cell_of(center + Vec3::Y * 0.15);
+        while start[1] + 1 < ny && solid[idx(start[0], start[1], start[2])] {
+            start[1] += 1;
+        }
+        // Volume du dôme en terrain dégagé, en cases.
+        let target = (2.0 / 3.0 * std::f32::consts::PI * SMOKE_RX * SMOKE_RX * SMOKE_H
+            / SMOKE_CELL.powi(3)) as usize;
+        // Plus court chemin (Dijkstra, 26 voisins) ; monter coûte plus que s'étaler
+        // (proportions du dôme), descendre un peu moins que monter (la fumée retombe).
+        let mut dist = vec![f32::INFINITY; nx * ny * nz];
+        let mut heap = BinaryHeap::new();
+        let key = |d: f32| Reverse((d * 4096.0) as u32);
+        dist[idx(start[0], start[1], start[2])] = 0.0;
+        heap.push((key(0.0), start));
+        let mut order: Vec<usize> = Vec::with_capacity(target);
+        let up = SMOKE_RX / SMOKE_H;
+        while let Some((Reverse(k), [x, y, z])) = heap.pop() {
+            let i = idx(x, y, z);
+            if (k as f32 / 4096.0) > dist[i] + 1e-3 {
+                continue;
+            }
+            order.push(i);
+            if order.len() >= target {
+                break;
+            }
+            for dz in -1i32..=1 {
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 && dz == 0 {
+                            continue;
+                        }
+                        let (qx, qy, qz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                        if qx < 0
+                            || qy < 0
+                            || qz < 0
+                            || qx >= nx as i32
+                            || qy >= ny as i32
+                            || qz >= nz as i32
+                        {
+                            continue;
+                        }
+                        let j = idx(qx as usize, qy as usize, qz as usize);
+                        if solid[j] {
+                            continue;
+                        }
+                        // Pas en diagonale à travers un coin de mur.
+                        if (dx != 0 && solid[idx(qx as usize, y, z)])
+                            || (dy != 0 && solid[idx(x, qy as usize, z)])
+                            || (dz != 0 && solid[idx(x, y, qz as usize)])
+                        {
+                            continue;
+                        }
+                        let vy = if dy > 0 { up } else { up * 0.8 };
+                        let step = Vec3::new(dx as f32, dy as f32 * vy, dz as f32).length();
+                        let nd = dist[i] + step;
+                        if nd < dist[j] {
+                            dist[j] = nd;
+                            heap.push((key(nd), [qx as usize, qy as usize, qz as usize]));
+                        }
+                    }
+                }
+            }
+        }
+        let far = order.last().map_or(1.0, |&i| dist[i]).max(1.0);
+        // Front lissé : la distance par cases voisines fait des arêtes (octogone) ; deux
+        // flous 3×3×3 (sans traverser les murs) arrondissent le nuage.
+        let mut reach = vec![1.2f32; nx * ny * nz];
+        for &i in &order {
+            reach[i] = (dist[i] / far).min(1.0);
+        }
+        for _ in 0..2 {
+            let src = reach.clone();
+            for z in 1..nz - 1 {
+                for y in 1..ny - 1 {
+                    for x in 1..nx - 1 {
+                        let i = idx(x, y, z);
+                        if solid[i] {
+                            continue;
+                        }
+                        let (mut sum, mut n) = (0.0, 0.0);
+                        for k in 0..27 {
+                            let j = idx(x + k % 3 - 1, y + (k / 3) % 3 - 1, z + k / 9 - 1);
+                            if !solid[j] {
+                                sum += src[j];
+                                n += 1.0;
+                            }
+                        }
+                        reach[i] = sum / n;
+                    }
+                }
+            }
+        }
+        let (mut lo, mut hi) = ([usize::MAX; 3], [0usize; 3]);
+        for (i, &r) in reach.iter().enumerate() {
+            if r < 1.0 && !solid[i] {
+                let c = [i % nx, (i / nx) % ny, i / (nx * ny)];
+                for k in 0..3 {
+                    lo[k] = lo[k].min(c[k]);
+                    hi[k] = hi[k].max(c[k] + 1);
+                }
+            }
+        }
+        let bounds = if lo[0] == usize::MAX {
+            (origin, origin)
+        } else {
+            let v = |c: [usize; 3]| Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32);
+            (
+                origin + (v(lo) - Vec3::ONE).max(Vec3::ZERO) * SMOKE_CELL,
+                origin
+                    + (v(hi) + Vec3::ONE).min(Vec3::new(nx as f32, ny as f32, nz as f32))
+                        * SMOKE_CELL,
+            )
+        };
+        let mut cells = vec![[255u8, 0u8]; nx * ny * nz];
+        for (c, &r) in cells.iter_mut().zip(&reach) {
+            if r < 1.0 {
+                c[0] = (r * SMOKE_REACH_SCALE * 255.0) as u8;
+            }
+        }
+        for (c, &s) in cells.iter_mut().zip(&solid) {
+            if s {
+                c[1] = 255;
+            }
         }
         Self {
-            center,
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             age: 0.0,
-            puffs,
+            origin,
+            dims,
+            cells,
             tunnels: Vec::new(),
+            bounds,
         }
     }
 
@@ -239,69 +368,29 @@ impl SmokeCloud {
         self.tunnels.retain(|t| t.age < TUNNEL_SHUT);
     }
 
-    /// Position actuelle d'une bouffée : elle part de la grenade, s'écarte en gonflant,
-    /// puis tourne lentement autour du centre en ondulant.
-    pub fn puff_pos(&self, p: &Puff) -> Vec3 {
-        let t = ((self.age - p.delay * 0.6) / 1.2).clamp(0.0, 1.0);
-        let out = 1.0 - (1.0 - t).powi(3);
-        let spin = self.age * 0.05 * (1.2 - p.off.length() / SMOKE_RX);
-        let (sn, cs) = spin.sin_cos();
-        let o = Vec3::new(
-            p.off.x * cs - p.off.z * sn,
-            p.off.y,
-            p.off.x * sn + p.off.z * cs,
-        );
-        let bob = Vec3::new(
-            (self.age * 0.5 + p.phase).sin() * 0.08,
-            (self.age * 0.7 + p.phase * 1.3).sin() * 0.1,
-            (self.age * 0.4 + p.phase * 0.7).cos() * 0.08,
-        );
-        self.center + o * (0.25 + 0.75 * out) + bob
-    }
-
-    /// Taille relative d'une bouffée (0 = invisible) : naissance, dissipation, tunnels.
-    pub fn puff_scale(&self, p: &Puff) -> f32 {
-        let born = ((self.age - p.delay) / 0.7).clamp(0.0, 1.0);
-        let born = 1.0 - (1.0 - born) * (1.0 - born);
-        let gone = 1.0 - ((self.age - p.end) / 1.2).clamp(0.0, 1.0);
-        let breathe = 1.0 + 0.06 * (self.age * 0.9 + p.phase).sin();
-        let mut k = born * gone * breathe;
-        if k <= 0.0 {
-            return 0.0;
-        }
-        let pos = self.puff_pos(p);
-        for t in &self.tunnels {
-            let r = tunnel_radius(t.age);
-            if r <= 0.0 {
-                continue;
-            }
-            let d = dist_to_segment(pos, t.a, t.b);
-            // La bouffée rétrécit près du trou : plus rien sur l'axe, normale à r + 0,6 p.r
-            // (le passage dégagé fait alors un peu plus d'un bloc de large).
-            k *= ((d - r) / (p.r * 0.6)).clamp(0.0, 1.0);
-        }
-        k
-    }
-
-    /// Une balle traverse le nuage (rayon `from` + `dir` × `dist`) : tunnel.
+    /// Une balle traverse la grille (rayon `from` + `dir` × `dist`) : petit tunnel.
     pub fn carve(&mut self, from: Vec3, dir: Vec3, dist: f32) {
         if self.age < 0.3 {
             return;
         }
-        // Entrée et sortie du dôme, approché par une sphère aplatie.
-        let k = Vec3::new(1.0 / SMOKE_RX, 1.0 / SMOKE_H, 1.0 / SMOKE_RX);
-        let o = (from - self.center) * k;
-        let d = dir * k;
-        let a = d.dot(d);
-        let b = 2.0 * o.dot(d);
-        let c = o.dot(o) - 1.3 * 1.3;
-        let disc = b * b - 4.0 * a * c;
-        if disc <= 0.0 {
-            return;
-        }
-        let sq = disc.sqrt();
-        let t0 = ((-b - sq) / (2.0 * a)).max(0.0);
-        let t1 = ((-b + sq) / (2.0 * a)).min(dist);
+        let max = self.origin
+            + Vec3::new(
+                self.dims[0] as f32,
+                self.dims[1] as f32,
+                self.dims[2] as f32,
+            ) * SMOKE_CELL;
+        let safe = |v: f32| {
+            if v.abs() < 1e-6 {
+                1e-6f32.copysign(v)
+            } else {
+                v
+            }
+        };
+        let inv = Vec3::new(1.0 / safe(dir.x), 1.0 / safe(dir.y), 1.0 / safe(dir.z));
+        let t1 = (self.origin - from) * inv;
+        let t2 = (max - from) * inv;
+        let t0 = t1.min(t2).max_element().max(0.0);
+        let t1 = t1.max(t2).min_element().min(dist);
         if t1 <= t0 {
             return;
         }
@@ -315,41 +404,57 @@ impl SmokeCloud {
         });
     }
 
-    /// Faut-il dessiner les bouffées intérieures autour de `pos` ? Oui pendant que le
-    /// nuage gonfle ou se dissipe, quand l'œil est dedans, ou près d'un tunnel ouvert.
-    pub fn inner_visible(&self, pos: Vec3, eye_inside: bool) -> bool {
-        self.age < 2.0
-            || self.age > 14.0
-            || eye_inside
-            || self.tunnels.iter().any(|t| {
-                tunnel_radius(t.age) > 0.0 && dist_to_segment(pos, t.a, t.b) < TUNNEL_R + 0.9
-            })
+    /// La fumée cache-t-elle `b` vu de `a` ? (impacts de balle derrière ou dans le nuage)
+    pub fn hides(&self, a: Vec3, b: Vec3) -> bool {
+        let len = (b - a).length();
+        let n = (len / 0.3).ceil().max(1.0) as usize;
+        let mut depth = 0.0;
+        for i in 0..=n {
+            depth += self.density(a + (b - a) * (i as f32 / n as f32)) * len / n as f32;
+            if depth > 0.2 {
+                return true;
+            }
+        }
+        false
     }
 
-    /// L'œil est-il dans le nuage ?
-    pub fn contains(&self, eye: Vec3) -> bool {
-        let d = (eye - self.center) / Vec3::new(SMOKE_RX + 0.5, SMOKE_H + 0.5, SMOKE_RX + 0.5);
-        d.y > -0.2 && d.length() < 1.0
-    }
-
-    /// 0..1 : l'œil est dans un tunnel encore ouvert.
-    fn tunnel_open(&self, eye: Vec3) -> f32 {
-        self.tunnels
-            .iter()
-            .map(|t| {
-                let r = tunnel_radius(t.age);
-                if r <= 0.0 {
-                    0.0
-                } else {
-                    (1.0 - dist_to_segment(eye, t.a, t.b) / r).clamp(0.0, 1.0)
-                }
-            })
-            .fold(0.0, f32::max)
+    /// Fumée (0..1) au point `q`, comme le shader la calcule (sans les volutes).
+    pub fn density(&self, q: Vec3) -> f32 {
+        let c = ((q - self.origin) / SMOKE_CELL).floor();
+        if c.min_element() < 0.0
+            || c.x >= self.dims[0] as f32
+            || c.y >= self.dims[1] as f32
+            || c.z >= self.dims[2] as f32
+        {
+            return 0.0;
+        }
+        let (nx, ny) = (self.dims[0] as usize, self.dims[1] as usize);
+        let cell = self.cells[(c.z as usize * ny + c.y as usize) * nx + c.x as usize];
+        if cell[1] != 0 || cell[0] == 255 {
+            return 0.0;
+        }
+        let reach = cell[0] as f32 / 255.0 / SMOKE_REACH_SCALE;
+        let mut d = ((smoke_grow(self.age) - reach) * 8.0).clamp(0.0, 1.0);
+        for t in &self.tunnels {
+            let r = tunnel_radius(t.age);
+            if r > 0.0 {
+                d *= ((dist_to_segment(q, t.a, t.b) - r) / 0.08).clamp(0.0, 1.0);
+            }
+        }
+        d
     }
 }
 
-/// Rayon d'un tunnel selon son âge : ouvert 1 s, puis se referme jusqu'à 1,5 s.
-fn tunnel_radius(age: f32) -> f32 {
+/// Front de la fumée (même formule que le shader) : gonfle en ~1,6 s, reste pleine, puis
+/// se retire du bord vers le centre de 14,5 s à 18 s.
+pub fn smoke_grow(age: f32) -> f32 {
+    let grow = 1.0 - (1.0 - (age / 1.6).clamp(0.0, 1.0)).powi(3);
+    let fade = ((age - 14.5) / (SMOKE_LIFE - 14.5)).clamp(0.0, 1.0);
+    grow * 1.12 - fade * 1.25
+}
+
+/// Rayon d'un tunnel selon son âge : ouvert 0,5 s, puis se referme jusqu'à 0,75 s.
+pub fn tunnel_radius(age: f32) -> f32 {
     if age < TUNNEL_OPEN {
         TUNNEL_R
     } else {
@@ -612,22 +717,6 @@ pub fn tick_effects(
     effects.retain(|e| e.alive());
 }
 
-/// Distance de l'œil au nuage de fumée le plus proche, relative au rayon (< 1 : dedans).
-pub fn smoke_depth(effects: &[Effect], eye: Vec3) -> f32 {
-    effects
-        .iter()
-        .filter_map(|e| match e {
-            Effect::Smoke(c) if c.age > 0.8 && c.age < SMOKE_LIFE - 1.5 => {
-                let d = eye - (c.center + Vec3::Y * 1.0);
-                // Dans un tunnel creusé par les balles : on voit encore un peu.
-                let open = c.tunnel_open(eye);
-                Some((d / Vec3::new(SMOKE_RX, SMOKE_H * 0.6, SMOKE_RX)).length() + open * 0.6)
-            }
-            _ => None,
-        })
-        .fold(f32::MAX, f32::min)
-}
-
 // ------------------------------------------------------------ modèles
 
 /// Grenade : cylindre (corps) + bouchon et cuillère, haut = +Y, centrée.
@@ -870,47 +959,80 @@ mod tests {
     }
 
     #[test]
-    fn smoke_is_dense_and_bullets_carve_tunnels_that_close() {
+    fn smoke_fills_a_dome_and_bullets_carve_small_tunnels_that_close() {
         let w = floor();
-        let mut rnd = {
-            let mut x = 1u32;
-            move || {
-                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
-                (x >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
-            }
-        };
+        let mut rnd = || 0.5;
+        let t0 = std::time::Instant::now();
         let mut c = SmokeCloud::new(Vec3::new(8.5, 11.05, 8.5), &w, &mut rnd);
-        assert!(c.puffs.len() > 3000, "{} bouffées", c.puffs.len());
-        assert!(c.puffs.iter().filter(|p| !p.inner).count() < c.puffs.len() / 2);
-        eprintln!("{} bouffées", c.puffs.len());
-        assert!(c.puffs.iter().all(|p| p.off.y > 0.0), "rien sous le sol");
+        eprintln!("simulation : {:?}", t0.elapsed());
         c.tick(4.0);
-        // Bouffée la plus proche de l'axe du tir (à hauteur d'œil) : visible avant.
-        let near = c
-            .puffs
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| c.puff_scale(p) > 0.5)
-            .min_by(|a, b| {
-                let d = |p: &Puff| {
-                    let q = c.puff_pos(p);
-                    (q.y - 12.6).abs().max((q.z - 8.5).abs())
-                };
-                d(a.1).total_cmp(&d(b.1))
-            })
-            .map(|(i, _)| i)
-            .unwrap();
-        let axis = |c: &SmokeCloud| c.puff_scale(&c.puffs[near]);
-        assert!(axis(&c) > 0.5);
-        c.carve(Vec3::new(-2.0, 12.6, 8.5), Vec3::X, 30.0);
+        let eye_h = 12.6;
+        // Pleine au centre et jusqu'à ~4 blocs ; rien sous le sol ni au-delà de ~5,5 blocs.
+        assert!(c.density(Vec3::new(8.5, eye_h, 8.5)) > 0.99);
+        assert!(c.density(Vec3::new(12.0, eye_h - 1.0, 8.5)) > 0.99);
+        assert_eq!(c.density(Vec3::new(14.5, eye_h, 8.5)), 0.0);
+        assert_eq!(c.density(Vec3::new(8.5, 10.5, 8.5)), 0.0);
+        assert!(
+            c.density(Vec3::new(8.5, 13.5, 8.5)) > 0.99,
+            "3 blocs de haut"
+        );
+        // Tir à travers : trou de 0,2 bloc de rayon, ouvert à 0,5 s, refermé à 1,5 s.
+        c.carve(Vec3::new(-2.0, eye_h, 8.5), Vec3::X, 30.0);
         c.tick(0.5);
-        let open = axis(&c);
-        assert!(open < 0.15, "trou ouvert à 0,5 s : {open}");
-        // Il se referme entre 1 et 1,5 s.
-        assert_eq!(tunnel_radius(0.9), TUNNEL_R);
-        assert!(tunnel_radius(1.25) > 0.0 && tunnel_radius(1.25) < TUNNEL_R);
+        assert_eq!(c.density(Vec3::new(8.5, eye_h, 8.5)), 0.0);
+        assert!(
+            c.density(Vec3::new(8.5, eye_h + 0.35, 8.5)) > 0.99,
+            "petit trou"
+        );
+        assert_eq!(tunnel_radius(0.4), TUNNEL_R);
         c.tick(1.1);
-        assert!(axis(&c) > 0.5, "refermé à 1,5 s : {}", axis(&c));
+        assert!(c.density(Vec3::new(8.5, eye_h, 8.5)) > 0.99, "refermé");
+        // Dissipée à la fin.
+        c.tick(SMOKE_LIFE - c.age);
+        assert_eq!(c.density(Vec3::new(8.5, eye_h, 8.5)), 0.0);
+    }
+
+    #[test]
+    fn smoke_flows_around_walls_and_down_corridors() {
+        // Couloir de 2 blocs de large fermé de chaque côté : la fumée s'y étale plus loin.
+        let mut w = floor();
+        for x in -8..24 {
+            for y in 11..16 {
+                w.set(x, y, 7, BlockId::STONE);
+                w.set(x, y, 10, BlockId::STONE);
+            }
+        }
+        let mut rnd = || 0.5;
+        let mut c = SmokeCloud::new(Vec3::new(8.5, 11.05, 8.5), &w, &mut rnd);
+        c.tick(4.0);
+        assert!(
+            c.density(Vec3::new(14.0, 11.5, 8.5)) > 0.99,
+            "plus loin dans le couloir"
+        );
+        assert_eq!(
+            c.density(Vec3::new(8.5, 11.5, 11.5)),
+            0.0,
+            "pas derrière le mur"
+        );
+    }
+
+    #[test]
+    fn smoke_fills_around_partial_blocks() {
+        // Trappe au plafond d'une case et dalle du bas : la fumée remplit le reste.
+        let mut w = floor();
+        let reg = minelib_world::registry::registry();
+        w.set(9, 12, 8, reg.by_key("trapdoor:2").unwrap());
+        w.set(7, 11, 8, reg.by_key("slab:stone:bottom").unwrap());
+        let mut rnd = || 0.5;
+        let mut c = SmokeCloud::new(Vec3::new(8.5, 11.05, 8.5), &w, &mut rnd);
+        c.tick(4.0);
+        assert!(
+            c.density(Vec3::new(9.5, 12.4, 8.5)) > 0.99,
+            "sous la trappe"
+        );
+        assert_eq!(c.density(Vec3::new(9.5, 12.95, 8.5)), 0.0, "dans la trappe");
+        assert!(c.density(Vec3::new(7.5, 11.8, 8.5)) > 0.99, "sur la dalle");
+        assert_eq!(c.density(Vec3::new(7.5, 11.2, 8.5)), 0.0, "dans la dalle");
     }
 
     #[test]

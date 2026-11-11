@@ -22,6 +22,13 @@ pub enum TexSrc {
     Flat([u8; 3]),
     /// Texture du pack multipliée par une couleur (feuillage, lianes…).
     Tint(&'static str, [u8; 3]),
+    /// Moitié d'une bannière de deux blocs taillée dans une texture du pack (`true` : moitié
+    /// du bas) : le bord foncé n'entoure que le rectangle entier, pas la jointure.
+    Banner(&'static str, bool),
+    /// Verre : texture `glass` du pack teintée (blanc = incolore), sans les bords indiqués
+    /// par le masque pour se raccorder aux voisins (1 haut, 2 droite, 4 bas, 8 gauche, dans
+    /// le repère de la texture).
+    Glass([u8; 3], u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +95,9 @@ pub struct BlockDef {
     pub reflect: u8,
     /// Métal (fer, or, diamant) : reflet court et flou (voir `mesh::REFLECT_SHORT`).
     pub metal: bool,
+    /// Verre raccordé : couche de la variante au masque de bords cachés n° 1 (les masques
+    /// 2..15 suivent ; le masque 0 est la texture du bloc) ; 0 = pas de raccord.
+    pub connect: u16,
 }
 
 impl BlockDef {
@@ -476,6 +486,7 @@ impl Builder {
             translucent: p.translucent,
             reflect: 0,
             metal: false,
+            connect: 0,
         });
         self.r.keys.insert(key, id);
         id
@@ -674,7 +685,8 @@ fn build() -> Registry {
                 target: true,
                 cull_same: true,
                 light: None,
-                translucent: false,
+                // Reflets semi-transparents de la texture (Kenney) : passe translucide.
+                translucent: true,
             },
         ),
         (
@@ -981,7 +993,8 @@ fn build() -> Registry {
     };
     let wool = dye_tex("wool_colored_");
     let clay = dye_tex("hardened_clay_stained_");
-    let glass = dye_tex("glass_");
+    // Verre teinté : même texture que le verre incolore, teintée de la couleur.
+    let glass: Vec<TexSrc> = DYE_RGB.iter().map(|&c| TexSrc::Glass(c, 0)).collect();
     let pane = dye_tex("glass_pane_top_");
     for i in 0..16 {
         let c = DYES_FR[i];
@@ -1074,6 +1087,10 @@ fn build() -> Registry {
             &[wool[i].clone(), wool[i].clone(), wool[i].clone()],
             DECOR,
         );
+        let TexSrc::Pack(w) = wool[i] else {
+            unreachable!()
+        };
+        let (banner_up, banner_low) = (TexSrc::Banner(w, false), TexSrc::Banner(w, true));
         for side in [0u8, 1, 4, 5] {
             b.add(
                 format!("banner_{}:{side}", DYES[i]),
@@ -1084,7 +1101,7 @@ fn build() -> Registry {
                     y0: 0,
                     y1: 16,
                 },
-                &[wool[i].clone(), wool[i].clone(), wool[i].clone()],
+                &[banner_up.clone(), banner_up.clone(), banner_low.clone()],
                 DECOR,
             );
         }
@@ -1094,7 +1111,10 @@ fn build() -> Registry {
         "vitre".into(),
         Shape::Post(PostKind::Pane),
         &[p("glass_pane_top"), p("glass"), p("glass_pane_top")],
-        PART,
+        Props {
+            translucent: true,
+            ..PART
+        },
     );
     b.add(
         "iron_bars".into(),
@@ -1554,11 +1574,40 @@ fn build() -> Registry {
         SOLID,
     );
     b.r.defs[id as usize].reflect = 15;
+    // Dalles verticales (contre un mur), pour chaque matériau qui a des dalles : ajoutées à
+    // la fin, les identifiants déjà sauvegardés ne bougent pas.
+    let slabs: Vec<BlockDef> =
+        b.r.defs
+            .iter()
+            .filter(|d| d.key.starts_with("slab:") && d.key.ends_with(":bottom"))
+            .cloned()
+            .collect();
+    for d in slabs {
+        let mat = d.key["slab:".len()..d.key.len() - ":bottom".len()].to_string();
+        for side in [0u8, 1, 4, 5] {
+            let key = format!("slab:{mat}:{side}");
+            if b.r.keys.contains_key(&key) {
+                continue;
+            }
+            let id = b.r.defs.len() as u16;
+            b.r.defs.push(BlockDef {
+                key: key.clone(),
+                shape: Shape::Panel {
+                    side,
+                    thick: 8,
+                    y0: 0,
+                    y1: 16,
+                },
+                ..d.clone()
+            });
+            b.r.keys.insert(key, id);
+        }
+    }
     for (key, v) in [
-        // Métaux : reflet discret (le fer reflétait trop avec le raytracing).
-        ("iron_block", 2u8),
-        ("gold_block", 2),
-        ("diamond_block", 2),
+        // Métaux : reflet court (4 blocs), teinté par la couleur du métal (voir world.wgsl).
+        ("iron_block", 3u8),
+        ("gold_block", 3),
+        ("diamond_block", 3),
         ("ice", 2),
         ("packed_ice", 2),
         ("water", 3),
@@ -1567,6 +1616,26 @@ fn build() -> Registry {
             b.r.defs[i as usize].reflect = v;
             b.r.defs[i as usize].metal = key.ends_with("_block");
         }
+    }
+
+    // Verre (incolore et teinté) : deux blocs collés se raccordent sans bord au milieu.
+    let glass_keys: Vec<String> = std::iter::once("glass".to_string())
+        .chain(DYES.iter().map(|d| format!("glass_{d}")))
+        .collect();
+    for key in glass_keys {
+        let Some(&i) = b.r.keys.get(&key) else {
+            continue;
+        };
+        let tint = match b.r.textures[b.r.defs[i as usize].tex[1] as usize] {
+            TexSrc::Glass(c, _) => c,
+            _ => [255; 3],
+        };
+        let first = b.r.textures.len() as u16;
+        for mask in 1..16u8 {
+            let t = b.tex(&TexSrc::Glass(tint, mask));
+            assert_eq!(t, first + mask as u16 - 1, "variantes de verre contiguës");
+        }
+        b.r.defs[i as usize].connect = first;
     }
 
     legacy_table(&mut b);
@@ -2144,5 +2213,15 @@ mod tests {
         assert_eq!(name(188, 0), "fence_spruce");
         assert!(r.get(r.legacy(166, 0).unwrap()).solid);
         assert!(!r.get(r.legacy(31, 1).unwrap()).solid);
+    }
+}
+
+#[cfg(test)]
+mod count_tests {
+    #[test]
+    fn registry_fits_the_raytracing_palette() {
+        let n = super::registry().defs.len();
+        eprintln!("{n} blocs");
+        assert!(n < 4096, "{n} blocs");
     }
 }

@@ -319,7 +319,12 @@ pub fn build(d: &DebugInfo) -> Overlay {
         right.push(Line::white(format!(
             "{} : {}",
             kind.label(),
-            if on { "activé" } else { "désactivé" }
+            match (on, r.low_latency_waiting()) {
+                (false, _) => "désactivé",
+                (true, true) => "activé",
+                // Images très courtes : l'attente du pilote coûterait plus qu'elle ne rapporte.
+                (true, false) => "activé (au repos : plus de 250 FPS)",
+            }
         )));
     }
 

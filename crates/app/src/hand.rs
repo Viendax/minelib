@@ -230,6 +230,30 @@ pub fn block_icon(cx: f32, cy: f32, size: f32, block: BlockId) -> Vec<VmVertex> 
     let t = def.tex;
     let layers = [t[0] as u32, t[1] as u32, t[2] as u32];
     let mut out = Vec::new();
+    if def.key.starts_with("banner_") {
+        // Bannière : deux blocs de haut, à plat, moitié du haut sur celle du bas (raccordées
+        // comme une fois posée).
+        let (w, h) = (size / 4.0, size / 2.0);
+        for (layer, y0, y1) in [(layers[1], -h, 0.0), (layers[2], 0.0, h)] {
+            let corners = [
+                (-w, y1, 0.0, 1.0),
+                (w, y1, 1.0, 1.0),
+                (w, y0, 1.0, 0.0),
+                (-w, y0, 0.0, 0.0),
+            ];
+            for i in [0usize, 1, 2, 2, 3, 0] {
+                let (x, y, u, v) = corners[i];
+                out.push(VmVertex {
+                    clip: [cx + x, cy + y, 0.5, 1.0],
+                    uv: [u, v],
+                    layer,
+                    _pad: 0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                });
+            }
+        }
+        return out;
+    }
     if matches!(def.shape, Shape::Cross | Shape::Air | Shape::Invisible) {
         // Image plate : un carré texturé face à l'écran.
         let h = size / 2.0;
@@ -375,20 +399,31 @@ impl Hand {
                         } else {
                             def.boxes()
                         };
-                        for (a, c) in boxes {
-                            let v = |p: [u8; 3]| {
-                                Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) / 16.0
-                            };
-                            push_box(
-                                &mut out,
-                                proj * m,
-                                v(a),
-                                v(c),
-                                Some(layers),
-                                [1.0; 3],
-                                light,
-                                false,
-                            );
+                        // Bannière : deux blocs de haut, comme posée.
+                        let halves: &[(f32, [u32; 3])] = if def.key.starts_with("banner_") {
+                            &[(0.5, [layers[1]; 3]), (-0.5, [layers[2]; 3])]
+                        } else {
+                            &[(0.0, layers)]
+                        };
+                        for &(dy, half) in halves {
+                            // Moitié déplacée par la transformation (pas par ses
+                            // coordonnées, dont la texture est tirée).
+                            let m = m * Mat4::from_translation(Vec3::new(0.0, dy, 0.0));
+                            for &(a, c) in &boxes {
+                                let v = |p: [u8; 3]| {
+                                    Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) / 16.0
+                                };
+                                push_box(
+                                    &mut out,
+                                    proj * m,
+                                    v(a),
+                                    v(c),
+                                    Some(half),
+                                    [1.0; 3],
+                                    light,
+                                    false,
+                                );
+                            }
                         }
                     }
                 }

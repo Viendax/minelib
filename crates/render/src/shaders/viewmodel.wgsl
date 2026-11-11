@@ -61,7 +61,9 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
         }
         return vec4<f32>(i.color.rgb, 1.0);
     }
-    if tex.a < 0.5 {
+    // Verre teinté (alpha entre les deux) : damier fin, la teinte se voit sur l'objet.
+    let px = vec2<i32>(i.clip.xy);
+    if tex.a < 0.15 || (tex.a < 0.5 && ((px.x + px.y) & 1) == 0) {
         discard;
     }
     return vec4<f32>(tex.rgb * i.color.rgb, 1.0);

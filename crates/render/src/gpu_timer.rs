@@ -122,6 +122,11 @@ impl GpuTimer {
                     scene: ms(0),
                     taa: ms(1),
                     present: ms(2),
+                    span: if t[5] > t[0] && t[0] != 0 {
+                        (t[5] - t[0]) as f32 * self.period_ns / 1e6
+                    } else {
+                        0.0
+                    },
                 });
             }
             buf.unmap();
