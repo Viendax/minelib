@@ -10,7 +10,6 @@
 pub mod block;
 pub mod flame;
 pub mod gen;
-pub mod lod;
 pub mod mesh;
 pub mod noise;
 pub mod raycast;
@@ -180,26 +179,7 @@ impl Chunk {
         }
         (i == c.blocks.len()).then_some(c)
     }
-
-    /// Plus haut bloc non-air de chaque colonne : (y, bloc), index x + 16 z.
-    pub fn surface(&self) -> Box<[[u16; 2]; 256]> {
-        let mut out = Box::new([[0u16; 2]; 256]);
-        for z in 0..CHUNK_SIZE {
-            for x in 0..CHUNK_SIZE {
-                if let Some(y) = (0..self.top)
-                    .rev()
-                    .find(|&y| self.get(x, y, z) != BlockId::AIR && !self.get(x, y, z).is_torch())
-                {
-                    out[x + 16 * z] = [y as u16, self.get(x, y, z).0];
-                }
-            }
-        }
-        out
-    }
 }
-
-/// Surface des chunks importés (pour le LOD) : chunk → (y, bloc) par colonne.
-pub type SurfaceMap = std::collections::HashMap<ChunkPos, Box<[[u16; 2]; 256]>>;
 
 #[cfg(test)]
 mod tests {
@@ -225,7 +205,6 @@ mod tests {
         assert_eq!(d.blocks, c.blocks);
         assert_eq!(d.top(), 71);
         assert!(c.to_rle().len() < 400);
-        assert_eq!(d.surface()[5 + 16 * 5], [70, BlockId::STONE.0]);
         assert!(Chunk::from_rle(c.pos, &[1, 0, 5, 0]).is_none());
     }
 

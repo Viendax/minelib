@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 
 use minelib_platform::sysmon::SysStats;
 use minelib_render::{FrameStats, Line, Overlay, Renderer};
-use minelib_world::lod::LodSettings;
 use minelib_world::raycast::Hit;
 use minelib_world::{ChunkPos, CHUNK_SIZE};
 
@@ -14,7 +13,6 @@ use crate::streaming::StreamStats;
 /// Réglages et état du moteur affichés par F3.
 pub struct EngineInfo {
     pub view_distance: i32,
-    pub lod: LodSettings,
     pub stream: StreamStats,
     pub workers: usize,
     pub fps_max: Option<f32>,
@@ -55,6 +53,8 @@ pub struct DebugInfo<'a> {
     pub stats: FrameStats,
     pub held: String,
     pub torch_info: Option<String>,
+    /// Mode FPS : affiche la fatigue des jambes.
+    pub fps: bool,
     pub torches: usize,
     pub sys: SysStats,
     pub renderer: &'a Renderer,
@@ -151,6 +151,26 @@ pub fn build(d: &DebugInfo) -> Overlay {
         )),
         Line::white(""),
     ];
+    if d.fps {
+        let p = d.player;
+        left.insert(
+            left.len() - 1,
+            Line::new(
+                format!(
+                    "Jambes : fatigue {:.0} / {:.0}   accroupi {:.1} / {:.0}",
+                    p.stamina,
+                    crate::player::cs::STAMINA_MAX,
+                    p.duck_speed,
+                    crate::player::cs::DUCK_SPEED_MAX
+                ),
+                if p.stamina > 0.0 {
+                    Line::WARN
+                } else {
+                    Line::WHITE
+                },
+            ),
+        );
+    }
     // Une seule ligne sur le bloc visé (à portée), avec la durée des torches.
     match d.hit {
         Some(h) => {
@@ -192,28 +212,10 @@ pub fn build(d: &DebugInfo) -> Overlay {
         "Chunks : {} dessinés / {} maillés / {} en mémoire",
         st.chunks_drawn, st.chunks_total, d.chunks_loaded
     )));
-    if e.lod.enabled() {
-        left.push(Line::white(format!(
-            "LOD : {} tuiles dessinées / {} prêtes / {} voulues (niveau max {})",
-            st.lod_drawn, st.lod_total, e.stream.wanted_tiles, e.stream.max_level
-        )));
-    } else {
-        left.push(Line::new("LOD : désactivé (L)", Line::DIM));
-    }
+    left.push(Line::white(format!("Triangles : {}k", st.triangles / 1000)));
     left.push(Line::white(format!(
-        "Triangles : {}k   (dont LOD {}k)",
-        st.triangles / 1000,
-        st.lod_triangles / 1000
-    )));
-    left.push(Line::white(format!(
-        "Pleine résolution : {} chunks ({} blocs)   lointain : {}",
-        e.view_distance,
-        e.lod.detail as i32,
-        if e.lod.enabled() {
-            format!("{} blocs", e.lod.max_distance as i32)
-        } else {
-            "non".into()
-        }
+        "Distance de rendu : {} chunks ({} chunks voulus)",
+        e.view_distance, e.stream.wanted_chunks
     )));
     left.push(Line::white(format!(
         "Threads : {} workers   {} tâches en cours",
@@ -286,10 +288,9 @@ pub fn build(d: &DebugInfo) -> Overlay {
         ));
     }
     right.push(Line::white(format!(
-        "VRAM moteur : {}   (chunks {}, LOD {})",
+        "VRAM moteur : {}   (chunks {})",
         mo(r.engine_gpu_bytes()),
-        mo(r.chunk_gpu_bytes()),
-        mo(r.lod_gpu_bytes())
+        mo(r.chunk_gpu_bytes())
     )));
     right.push(Line::white(""));
     let limit = match e.fps_max {

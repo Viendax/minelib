@@ -25,7 +25,8 @@ pub struct VmVertex {
     pub color: [f32; 4],
 }
 
-const MAX_VERTICES: usize = 32768;
+/// Main, effets du monde et icônes 3D de l'interface (menu d'achat : toutes les armes).
+const MAX_VERTICES: usize = 524_288;
 
 pub struct ViewModel {
     pipeline: wgpu::RenderPipeline,

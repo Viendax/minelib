@@ -12,6 +12,8 @@ winit.workspace = true
 flate2 = "1"
 image.workspace = true
 # Presse-papier (image de la dernière capture d'écran).
+# Sons (tir, rechargement, lunette) : sortie audio et décodage Ogg Vorbis.
+rodio = { version = "0.19", default-features = false, features = ["vorbis"] }
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 minelib-platform = { path = "../platform" }
 minelib-render = { path = "../render" }

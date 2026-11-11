@@ -347,6 +347,15 @@ impl Hand {
                     * Mat4::from_translation(Vec3::new(-0.5, -0.1, -0.5));
                 torch_model(&mut out, proj * m, chem, light);
             }
+            Item::Wand => {
+                // Tenue droite, logo en haut, légèrement tournée vers le centre.
+                let m = base
+                    * Mat4::from_translation(Vec3::new(0.36, -0.58, -0.92))
+                    * Mat4::from_rotation_y(-0.45)
+                    * Mat4::from_rotation_z(0.1)
+                    * Mat4::from_scale(Vec3::splat(0.34));
+                crate::wand::model(&mut out, proj * m, light);
+            }
             Item::Block(b) => {
                 let def = b.def();
                 let t = def.tex;

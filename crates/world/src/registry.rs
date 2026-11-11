@@ -86,6 +86,8 @@ pub struct BlockDef {
     pub translucent: bool,
     /// Reflet (0 = mat … 15 = miroir parfait), pour le raytracing.
     pub reflect: u8,
+    /// Métal (fer, or, diamant) : reflet court et flou (voir `mesh::REFLECT_SHORT`).
+    pub metal: bool,
 }
 
 impl BlockDef {
@@ -473,6 +475,7 @@ impl Builder {
             light: p.light,
             translucent: p.translucent,
             reflect: 0,
+            metal: false,
         });
         self.r.keys.insert(key, id);
         id
@@ -1552,8 +1555,9 @@ fn build() -> Registry {
     );
     b.r.defs[id as usize].reflect = 15;
     for (key, v) in [
-        ("iron_block", 4u8),
-        ("gold_block", 3),
+        // Métaux : reflet discret (le fer reflétait trop avec le raytracing).
+        ("iron_block", 2u8),
+        ("gold_block", 2),
         ("diamond_block", 2),
         ("ice", 2),
         ("packed_ice", 2),
@@ -1561,6 +1565,7 @@ fn build() -> Registry {
     ] {
         if let Some(&i) = b.r.keys.get(key) {
             b.r.defs[i as usize].reflect = v;
+            b.r.defs[i as usize].metal = key.ends_with("_block");
         }
     }
 

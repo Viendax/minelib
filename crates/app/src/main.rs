@@ -15,15 +15,14 @@
 //!   1 à 0, molette choisir dans la barre        clic molette copier le bloc visé
 //!   E              inventaire (10 × 3)          N            jour / nuit
 //!   C (maintenu)   zoom                         V            VSync on/off
-//!   L              terrain lointain (LOD)       Page ↑ / ↓   distance pleine résolution
+//!   Page ↑ / ↓     distance de rendu
 //!   F3             écran de debug
 //!
 //! Variables d'environnement :
 //!   MINELIB_HOME=<dossier>      remplace le dossier .minelib
 //!   MINELIB_WORLD=<nom>         ouvre (ou crée) directement ce monde
 //!   MINELIB_SEED=<n>            graine d'un monde créé par MINELIB_WORLD
-//!   MINELIB_VIEW=<chunks>       rayon pleine résolution (défaut 10)
-//!   MINELIB_LOD=<blocs>         distance du terrain lointain (défaut 4096, 0 = coupé)
+//!   MINELIB_VIEW=<chunks>       distance de rendu (défaut 10)
 //!   MINELIB_VSYNC=1             démarrer avec la VSync (défaut : FPS illimités)
 //!   MINELIB_FPS_MAX=<n>         plafond de FPS optionnel
 //!   MINELIB_DEBUG=1             F3 ouvert au démarrage
@@ -32,8 +31,13 @@
 //!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé)
 //!   MINELIB_EXIT_AFTER=<s>      quitter automatiquement (tests)
 
+// Windows : pas de fenêtre de console à côté du jeu (le journal va dans .minelib/logs).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod audio;
 mod chat;
 mod debug;
+mod equip;
 mod fps;
 mod gpu_plan;
 mod gpu_report;
@@ -47,7 +51,9 @@ mod player;
 mod save;
 mod session;
 mod streaming;
+mod wand;
 mod weapons;
+mod worldedit;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -109,6 +115,11 @@ struct Game {
     /// Touches du jeu, et action en attente d'une nouvelle touche.
     keys: keys::Bindings,
     binding: Option<keys::Action>,
+    /// Menu des touches : onglet FPS (sinon Build) et lignes défilées.
+    keys_tab_fps: bool,
+    keys_scroll: usize,
+    /// Barre de défilement du menu des touches tenue à la souris.
+    keys_drag: bool,
     session: Option<Session>,
     config: SessionConfig,
     ui: Ui,
@@ -152,7 +163,6 @@ impl Game {
         let paths = minelib_assets::init()?;
         let keys = keys::Bindings::load(&paths.root.join("keys.txt"));
         let options = Options::load(&paths.options);
-        let full_detail = options.full_detail;
         jobs::set_uniform_sharing(options.cpu_uniform);
         let packs = list_packs(&paths.resourcepacks);
         let pack = packs
@@ -164,9 +174,6 @@ impl Game {
                     .ok()
             })
             .map_or_else(ResourcePack::builtin, Ok)?;
-        let lod_distance = env_parse::<f32>("MINELIB_LOD")
-            .unwrap_or(options.lod_distance)
-            .max(0.0);
         let view_distance = env_parse("MINELIB_VIEW")
             .unwrap_or(options.render_distance)
             .clamp(2, session::MAX_VIEW_DISTANCE);
@@ -187,12 +194,11 @@ impl Game {
             sens_focus: false,
             keys,
             binding: None,
+            keys_tab_fps: false,
+            keys_scroll: 0,
+            keys_drag: false,
             session: None,
-            config: SessionConfig {
-                view_distance,
-                lod_distance,
-                full_detail,
-            },
+            config: SessionConfig { view_distance },
             ui: Ui::default(),
             sysmon: SysMonitor::start(),
             time: 0.0,
@@ -278,6 +284,7 @@ impl Game {
         match Session::open(dir, self.config) {
             Ok(mut s) => {
                 s.sensitivity = self.options.sensitivity;
+                s.volume = self.options.volume;
                 s.keys = self.keys.clone();
                 self.session = Some(s);
                 self.screen = Screen::Playing;
@@ -673,6 +680,20 @@ impl Game {
         let controls = c.button("Régler les touches", cx, y, 200.0, true);
         y += 24.0 * s;
         let packs = c.button("Packs de textures", cx, y, 200.0, true);
+        y += 24.0 * s;
+        // Volume des sons (tirs, rechargements, lunette).
+        let vol = self.options.volume;
+        let label = format!("Volume : {} %", (vol * 100.0).round());
+        if let Some(f) = c.slider(7, &mut self.slider_drag, &label, vol, cx, y, 200.0) {
+            let v = (f * 20.0).round() / 20.0;
+            if v != self.options.volume {
+                self.options.volume = v;
+                if let Some(sess) = &mut self.session {
+                    sess.volume = v;
+                }
+                crate::audio::play(crate::audio::Sfx::Dry, 0.0, v);
+            }
+        }
         let done = c.button("Terminé", cx, c.h * 0.72, 200.0, true);
         if graphics {
             self.screen = Screen::Graphics;
@@ -688,6 +709,10 @@ impl Game {
             self.screen = Screen::Packs;
         }
         if done || input.pressed(KeyCode::Escape) {
+            self.slider_drag = None;
+            if let Err(e) = self.options.save(&self.paths.options) {
+                log::error!("options : {e:#}");
+            }
             self.screen = self.settings_return;
         }
     }
@@ -704,9 +729,27 @@ impl Game {
             c.background();
         }
         let s = c.s;
-        c.text_center("Régler les touches", c.h * 0.08, s * 2.0, WHITE);
+        c.text_center("Régler les touches", c.h * 0.06, s * 2.0, WHITE);
         let cx = c.w / 2.0;
-        let y = c.h * 0.2;
+        // Deux onglets : Build (modes de construction) et FPS (touches de CS:GO).
+        let tab_y = c.h * 0.06 + 22.0 * s;
+        let fps_tab = self.keys_tab_fps;
+        let (build_label, fps_label) = if fps_tab {
+            ("Build", "> FPS <")
+        } else {
+            ("> Build <", "FPS")
+        };
+        if c.button(build_label, cx - 52.0 * s, tab_y, 100.0, true) {
+            self.keys_tab_fps = false;
+            self.keys_scroll = 0;
+            self.binding = None;
+        }
+        if c.button(fps_label, cx + 52.0 * s, tab_y, 100.0, true) {
+            self.keys_tab_fps = true;
+            self.keys_scroll = 0;
+            self.binding = None;
+        }
+        let y = tab_y + 26.0 * s;
         // Curseur 0,1 à 8 (plage du jeu Counter-Strike) ; le champ accepte 0,01 à 20.
         let (lo, hi) = (0.1f32, 8.0f32);
         let label = format!("Sensibilité souris : {}", format_sens(sens));
@@ -769,18 +812,96 @@ impl Game {
             }
         }
 
+        // Onglet FPS : marcher et s'accroupir en « maintenir » ou « bascule ».
+        let mut top = y + 34.0 * s;
+        if self.keys_tab_fps {
+            let mode = |t: bool| if t { "bascule" } else { "maintenir" };
+            let walk = format!("Marcher : {}", mode(self.keys.walk_toggle));
+            let duck = format!("S'accroupir : {}", mode(self.keys.duck_toggle));
+            if c.button(&walk, cx - 124.0 * s, top, 240.0, true) {
+                self.keys.walk_toggle = !self.keys.walk_toggle;
+            }
+            if c.button(&duck, cx + 124.0 * s, top, 240.0, true) {
+                self.keys.duck_toggle = !self.keys.duck_toggle;
+            }
+            top += 24.0 * s;
+        }
+
         // Une ligne par action : nom, bouton de la touche (cliquer puis appuyer sur la
-        // nouvelle touche ou cliquer), bouton X pour la retirer. Deux colonnes.
-        let rows = keys::Action::ALL.len().div_ceil(2);
-        let top = y + 34.0 * s;
+        // nouvelle touche ou cliquer), bouton X pour la retirer. Deux colonnes ; la molette
+        // fait défiler quand tout ne tient pas.
+        let actions = keys::Action::tab(self.keys_tab_fps);
         let row_h = 20.0 * s;
         let col_w = 244.0 * s;
-        for (i, action) in keys::Action::ALL.into_iter().enumerate() {
-            let col = i / rows;
-            let row = i % rows;
+        let done_y = c.h * 0.91;
+        let rows = actions.len().div_ceil(2);
+        let visible = (((done_y - 14.0 * s - top) / row_h).floor() as usize).max(1);
+        let max_scroll = rows.saturating_sub(visible);
+        if input.scroll.abs() >= 1.0 {
+            self.keys_scroll = if input.scroll > 0.0 {
+                self.keys_scroll.saturating_sub(1)
+            } else {
+                self.keys_scroll + 1
+            };
+        }
+        // Barre de défilement (comme dans l'inventaire créatif) : on attrape le curseur et
+        // la liste suit la souris ; un clic dans la barre y saute.
+        if max_scroll > 0 {
+            let (bx, by, bw, bh) = (
+                cx + 256.0 * s,
+                top,
+                8.0 * s,
+                visible as f32 * row_h - 4.0 * s,
+            );
+            if let Some((mx, my)) = c.cursor {
+                if c.click
+                    && mx >= bx - 3.0 * s
+                    && mx <= bx + bw + 3.0 * s
+                    && my >= by
+                    && my <= by + bh
+                {
+                    self.keys_drag = true;
+                    c.click = false;
+                }
+                if self.keys_drag {
+                    let frac = ((my - by) / bh).clamp(0.0, 1.0);
+                    let first = frac * rows as f32 - visible as f32 / 2.0;
+                    self.keys_scroll = first.round().max(0.0) as usize;
+                }
+            }
+            if !c.held {
+                self.keys_drag = false;
+            }
+            self.keys_scroll = self.keys_scroll.min(max_scroll);
+            let shown = (visible as f32 / rows as f32).min(1.0);
+            let start = self.keys_scroll as f32 / rows as f32;
+            c.ui.rect(bx, by, bw, bh, [0.041, 0.041, 0.05, 1.0]);
+            c.ui.rect(
+                bx + s,
+                by + bh * start,
+                bw - 2.0 * s,
+                (bh * shown).max(4.0 * s),
+                [0.578, 0.578, 0.64, 1.0],
+            );
+        } else {
+            self.keys_drag = false;
+        }
+        self.keys_scroll = self.keys_scroll.min(max_scroll);
+        for (i, action) in actions.into_iter().enumerate() {
+            let (row, col) = (i / 2, i % 2);
+            if row < self.keys_scroll || row >= self.keys_scroll + visible {
+                continue;
+            }
             let x0 = cx - col_w + col as f32 * (col_w + 6.0 * s);
-            let ry = top + row as f32 * row_h;
-            c.ui.text(x0, ry + 6.0 * s, s, WHITE, action.label());
+            let ry = top + (row - self.keys_scroll) as f32 * row_h;
+            let grey = action.coming_soon();
+            c.ui.text(
+                x0,
+                ry + 6.0 * s,
+                s,
+                if grey { GREY } else { WHITE },
+                action.label(),
+            );
             let waiting = self.binding == Some(action);
             let key = self.keys.get(action);
             let text = if waiting {
@@ -798,6 +919,24 @@ impl Game {
                     self.binding = None;
                 }
             }
+        }
+        if max_scroll > 0 || self.keys_tab_fps {
+            let mut hint = String::new();
+            if max_scroll > 0 {
+                hint = format!(
+                    "Molette : faire défiler ({}-{} sur {} lignes)",
+                    self.keys_scroll + 1,
+                    (self.keys_scroll + visible).min(rows),
+                    rows
+                );
+            }
+            if self.keys_tab_fps {
+                if !hint.is_empty() {
+                    hint += "   ";
+                }
+                hint += "En gris : pas encore dans le jeu (la touche est gardée).";
+            }
+            c.text_center(&hint, done_y - 11.0 * s, ds, GREY);
         }
         let done = c.button("Terminé", cx, c.h * 0.91, 200.0, true);
         if self.sens_focus {
@@ -874,8 +1013,7 @@ impl Game {
         let cx = c.w / 2.0;
         let mut y = c.h * 0.21;
         let step = 21.5 * s;
-        // Distance de rendu : 2 à 32 chunks.
-        // Distance de rendu : 2 à 256 chunks (curseur plus fin aux petites valeurs).
+        // Distance de rendu : 2 à 64 chunks (curseur plus fin aux petites valeurs).
         let max = session::MAX_VIEW_DISTANCE;
         let ram = self.ram_view_limit;
         let label = if cfg.view_distance > ram {
@@ -889,49 +1027,6 @@ impl Game {
         let frac = ((cfg.view_distance - 2) as f32 / (max - 2) as f32).sqrt();
         if let Some(f) = c.slider(1, &mut self.slider_drag, &label, frac, cx, y, 300.0) {
             cfg.view_distance = 2 + (f * f * (max - 2) as f32).round() as i32;
-        }
-        y += step;
-        // Rendu lointain (LOD) : désactivé, ou 16 à 512 chunks.
-        let lod_chunks = (cfg.lod_distance / 16.0).round() as i32;
-        let label = if lod_chunks <= 0 {
-            "Rendu lointain : désactivé".to_string()
-        } else {
-            format!("Rendu lointain : {lod_chunks} chunks")
-        };
-        let frac = if lod_chunks <= 0 {
-            0.0
-        } else {
-            (lod_chunks as f32 - 16.0) / (512.0 - 16.0) * 0.95 + 0.05
-        };
-        if let Some(f) = c.slider(2, &mut self.slider_drag, &label, frac, cx, y, 300.0) {
-            cfg.lod_distance = if f < 0.025 {
-                0.0
-            } else {
-                let ch = 16.0 + ((f - 0.05).max(0.0) / 0.95) * (512.0 - 16.0);
-                (ch / 16.0).round() * 16.0 * 16.0
-            };
-        }
-        y += step;
-        // Pleine résolution jusqu'à N chunks, terrain simplifié au-delà (beaucoup moins de
-        // triangles : c'est ce qui coûte le plus à la carte graphique au loin).
-        // Auto : ajusté au temps GPU (rayon actuel affiché). Le rendu lointain désactivé
-        // ne fait que ne rien dessiner au-delà de la distance de rendu.
-        let radius = self.session.as_ref().map(|s| s.detail_radius());
-        let detail_label = match cfg.full_detail {
-            session::DETAIL_AUTO => match radius {
-                Some(r) => format!("Détail complet : auto ({r} chunks)"),
-                None => "Détail complet : auto".to_string(),
-            },
-            0 => "Détail complet : partout (lent)".to_string(),
-            n => format!("Détail complet : {n} chunks"),
-        };
-        if c.button(&detail_label, cx, y, 300.0, true) {
-            const STEPS: [i32; 9] = [session::DETAIL_AUTO, 8, 12, 16, 24, 32, 48, 64, 0];
-            let i = STEPS
-                .iter()
-                .position(|&v| v == cfg.full_detail)
-                .unwrap_or(0);
-            cfg.full_detail = STEPS[(i + 1) % STEPS.len()];
         }
         y += step;
         // Échelle de rendu : 50 à 100 % (par pas de 5 %), reconstruite par l'anticrénelage.
@@ -1010,10 +1105,7 @@ impl Game {
         let done = c.button("Terminé", cx, c.h * 0.78, 200.0, true);
         let leave = done || input.pressed(KeyCode::Escape);
 
-        if cfg.view_distance != self.config.view_distance
-            || cfg.lod_distance != self.config.lod_distance
-            || cfg.full_detail != self.config.full_detail
-        {
+        if cfg.view_distance != self.config.view_distance {
             self.config = cfg;
             if let Some(sess) = &mut self.session {
                 sess.apply_config(cfg);
@@ -1033,8 +1125,6 @@ impl Game {
         if leave {
             self.slider_drag = None;
             self.options.render_distance = self.config.view_distance;
-            self.options.lod_distance = self.config.lod_distance;
-            self.options.full_detail = self.config.full_detail;
             if let Some((_, on)) = renderer.low_latency() {
                 self.options.low_latency = on;
             }
@@ -1084,7 +1174,6 @@ impl GameLoop for Game {
                 // Répartition du travail selon la carte (et réglages du 1er lancement).
                 let first_launch = !self.paths.options.exists();
                 gpu_plan::apply(&mut r, &mut self.options, first_launch);
-                self.config.full_detail = self.options.full_detail;
                 // Anticrénelage temporel : toujours actif (MINELIB_TAA=0 seulement pour les tests).
                 r.set_antialiasing(std::env::var("MINELIB_TAA").map_or(true, |v| v != "0"));
                 self.sysmon.set_gpu_name(&r.adapter_name);
@@ -1106,13 +1195,10 @@ impl GameLoop for Game {
                     if !a.has_display {
                         if let Some(d) = adapters.iter().find(|d| d.has_display) {
                             self.optimus = Some(d.name.clone());
-                            self.message = Some((
-                                format!(
-                                    "Écran sur « {} » : active le mode GPU dédié (MUX) du portable pour plus de FPS",
-                                    d.name
-                                ),
-                                10.0,
-                            ));
+                            log::info!(
+                                "écran sur « {} » : le mode GPU dédié (MUX) donnerait plus de FPS",
+                                d.name
+                            );
                         }
                     }
                 }
@@ -1186,10 +1272,6 @@ impl GameLoop for Game {
                 if let (Some(m), Some(n)) = (&target, &name) {
                     log::info!("écran {n} branché sur la carte qui dessine : le jeu s'y affiche (pas de recopie entre cartes)");
                     self.optimus = None;
-                    self.message = Some((
-                        "Écran branché sur la carte NVIDIA détecté : le jeu s'y affiche, sans recopie".into(),
-                        6.0,
-                    ));
                     if !self.options.fullscreen {
                         window.set_outer_position(m.position());
                     }
@@ -1236,10 +1318,8 @@ impl GameLoop for Game {
         {
             self.show_debug = !self.show_debug;
         }
-        // F2 : capture d'écran (interface comprise), comme dans Minecraft.
-        if self.keys.pressed(input, keys::Action::Screenshot)
-            && !self.session.as_ref().is_some_and(|s| s.chat.open)
-        {
+        // F2 : capture d'écran (interface comprise), comme dans Minecraft, même tchat ouvert.
+        if self.keys.pressed(input, keys::Action::Screenshot) {
             renderer.request_screenshot();
         }
         if let Some(shot) = renderer.take_screenshot() {
@@ -1338,7 +1418,7 @@ impl GameLoop for Game {
                     s.build_debug(frames, sys, &renderer, stats, fps_max);
                 }
                 if active {
-                    s.draw_hud(&mut self.ui, sizef, input);
+                    s.draw_hud(&mut self.ui, sizef, input, self.show_debug);
                 }
             }
             match self.screen {

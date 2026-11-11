@@ -1,5 +1,6 @@
 Modèles d'armes : « Ultimate Gun Pack » (juillet 2019) par Quaternius
 https://quaternius.com — https://opengameart.org/content/low-poly-guns-pack
 Licence : CC0 1.0 (domaine public), utilisables librement, même commercialement.
-Fichiers OBJ / MTL d'origine, non modifiés ; les noms d'armes du jeu leur sont associés
+Fichiers OBJ / MTL d'origine, non modifiés (armes et silencieux Silencer_1 / _Short /
+_long) ; les noms d'armes du jeu leur sont associés
 dans crates/app/src/weapons.rs.

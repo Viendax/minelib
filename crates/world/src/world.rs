@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::flame::{CHEMICALS, WOOD_FLAME};
 use crate::gen::{generate, Generator};
-use crate::{BlockId, Chunk, ChunkPos, SurfaceMap, CHUNK_HEIGHT, CHUNK_SIZE};
+use crate::{BlockId, Chunk, ChunkPos, CHUNK_HEIGHT, CHUNK_SIZE};
 
 /// Portée de la lumière d'une torche (blocs). Doit rester < 16 : le maillage d'un
 /// chunk ne voit que ses 8 voisins.
@@ -38,8 +38,6 @@ pub struct World {
     /// Chunks importés (ex. monde Minecraft converti), compressés : ils remplacent la
     /// génération procédurale à leur emplacement.
     bases: HashMap<ChunkPos, Arc<Vec<u8>>>,
-    /// Surface de ces chunks, partagée avec les threads du LOD.
-    surface: Arc<SurfaceMap>,
     /// Horloge du monde en secondes (avancée par le jeu).
     pub clock: f64,
     /// Génération des chunks hors zone importée.
@@ -54,7 +52,6 @@ impl World {
             torches: HashMap::new(),
             edits: HashMap::new(),
             bases: HashMap::new(),
-            surface: Arc::new(SurfaceMap::new()),
             clock: 0.0,
             generator: Generator::Procedural,
         }
@@ -62,15 +59,12 @@ impl World {
 
     /// Installe des chunks importés (compressés en RLE). Les chunks invalides sont ignorés.
     pub fn set_bases(&mut self, bases: HashMap<ChunkPos, Vec<u8>>) {
-        let mut surface = SurfaceMap::new();
         self.bases.clear();
         for (pos, rle) in bases {
-            if let Some(c) = Chunk::from_rle(pos, &rle) {
-                surface.insert(pos, c.surface());
+            if Chunk::from_rle(pos, &rle).is_some() {
                 self.bases.insert(pos, Arc::new(rle));
             }
         }
-        self.surface = Arc::new(surface);
         // Les chunks déjà chargés à ces emplacements sont remplacés.
         let loaded: Vec<ChunkPos> = self
             .chunks
@@ -90,10 +84,6 @@ impl World {
 
     pub fn base_count(&self) -> usize {
         self.bases.len()
-    }
-
-    pub fn surface_map(&self) -> Arc<SurfaceMap> {
-        self.surface.clone()
     }
 
     /// Chunk importé à cet emplacement, sinon génération procédurale.

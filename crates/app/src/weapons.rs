@@ -22,6 +22,17 @@ pub enum Category {
 }
 
 impl Category {
+    /// Imprécision ajoutée (degrés) en courant à pleine vitesse : faible au pistolet,
+    /// énorme au fusil (il faut s'arrêter pour tirer juste).
+    pub fn move_inaccuracy(self) -> f32 {
+        match self {
+            Category::Pistol => 2.5,
+            Category::Smg => 3.5,
+            Category::Heavy => 5.0,
+            Category::Rifle => 7.0,
+        }
+    }
+
     pub const ALL: [Category; 4] = [
         Category::Pistol,
         Category::Smg,
@@ -64,8 +75,9 @@ pub struct WeaponDef {
     /// Recul vertical par balle (degrés) et amplitude du balayage latéral.
     pub kick: f32,
     pub sway: f32,
-    /// Lunette : champ de vision (degrés) au clic droit.
-    pub scope: Option<f32>,
+    /// Lunette : grossissements successifs au clic droit (×2 pour l'AUG et le SG 553,
+    /// ×2 puis ×4 pour les fusils de précision), puis retour sans lunette.
+    pub scope: &'static [f32],
 }
 
 use Category::*;
@@ -81,7 +93,7 @@ const fn w(
     auto: bool,
     reload_s: f32,
     (pellets, spread, kick, sway): (u32, f32, f32, f32),
-    scope: Option<f32>,
+    scope: &'static [f32],
 ) -> WeaponDef {
     WeaponDef {
         name,
@@ -104,7 +116,7 @@ const fn w(
 }
 
 /// Toutes les armes, par catégorie.
-pub static WEAPONS: [WeaponDef; 33] = [
+pub static WEAPONS: [WeaponDef; 34] = [
     // Pistolets
     w(
         "Glock-18",
@@ -116,7 +128,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.2,
         (1, 0.35, 0.9, 0.4),
-        None,
+        &[],
     ),
     w(
         "USP-S",
@@ -128,7 +140,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.2,
         (1, 0.25, 1.0, 0.4),
-        None,
+        &[],
     ),
     w(
         "P2000",
@@ -140,7 +152,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.2,
         (1, 0.3, 1.0, 0.4),
-        None,
+        &[],
     ),
     w(
         "Dual Berettas",
@@ -152,7 +164,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         3.8,
         (1, 0.45, 0.9, 0.6),
-        None,
+        &[],
     ),
     w(
         "P250",
@@ -164,7 +176,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.2,
         (1, 0.35, 1.2, 0.5),
-        None,
+        &[],
     ),
     w(
         "Five-SeveN",
@@ -176,7 +188,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.2,
         (1, 0.3, 1.1, 0.5),
-        None,
+        &[],
     ),
     w(
         "Tec-9",
@@ -188,7 +200,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.5,
         (1, 0.45, 1.1, 0.6),
-        None,
+        &[],
     ),
     w(
         "CZ75-Auto",
@@ -200,7 +212,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         2.7,
         (1, 0.5, 1.3, 0.8),
-        None,
+        &[],
     ),
     w(
         "Desert Eagle",
@@ -212,7 +224,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.2,
         (1, 0.4, 2.6, 0.8),
-        None,
+        &[],
     ),
     w(
         "R8 Revolver",
@@ -224,7 +236,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.3,
         (1, 0.35, 3.0, 0.6),
-        None,
+        &[],
     ),
     // Mitraillettes
     w(
@@ -237,7 +249,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         2.6,
         (1, 0.7, 0.6, 1.0),
-        None,
+        &[],
     ),
     w(
         "MP9",
@@ -249,7 +261,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         2.1,
         (1, 0.6, 0.55, 0.9),
-        None,
+        &[],
     ),
     w(
         "MP7",
@@ -261,7 +273,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         3.1,
         (1, 0.5, 0.55, 0.8),
-        None,
+        &[],
     ),
     w(
         "MP5-SD",
@@ -273,7 +285,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         2.6,
         (1, 0.5, 0.5, 0.7),
-        None,
+        &[],
     ),
     w(
         "UMP-45",
@@ -285,7 +297,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         3.5,
         (1, 0.55, 0.7, 0.8),
-        None,
+        &[],
     ),
     w(
         "P90",
@@ -297,7 +309,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         3.3,
         (1, 0.6, 0.45, 0.7),
-        None,
+        &[],
     ),
     w(
         "PP-Bizon",
@@ -309,7 +321,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         2.4,
         (1, 0.6, 0.45, 0.7),
-        None,
+        &[],
     ),
     // Armes lourdes
     w(
@@ -322,7 +334,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         4.0,
         (9, 3.5, 3.0, 0.5),
-        None,
+        &[],
     ),
     w(
         "XM1014",
@@ -334,7 +346,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         4.0,
         (6, 3.8, 2.0, 0.6),
-        None,
+        &[],
     ),
     w(
         "Sawed-Off",
@@ -346,7 +358,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         4.0,
         (8, 5.0, 3.0, 0.6),
-        None,
+        &[],
     ),
     w(
         "MAG-7",
@@ -358,7 +370,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         2.5,
         (8, 3.0, 3.2, 0.6),
-        None,
+        &[],
     ),
     w(
         "M249",
@@ -370,7 +382,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         5.7,
         (1, 0.8, 0.6, 1.1),
-        None,
+        &[],
     ),
     w(
         "Negev",
@@ -382,7 +394,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         5.7,
         (1, 0.9, 0.5, 1.2),
-        None,
+        &[],
     ),
     // Fusils
     w(
@@ -395,7 +407,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         3.0,
         (1, 0.4, 0.75, 1.0),
-        None,
+        &[],
     ),
     w(
         "FAMAS",
@@ -407,7 +419,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         3.3,
         (1, 0.35, 0.7, 0.9),
-        None,
+        &[],
     ),
     w(
         "AK-47",
@@ -419,7 +431,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         2.5,
         (1, 0.3, 1.0, 1.3),
-        None,
+        &[],
     ),
     w(
         "M4A4",
@@ -431,7 +443,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         3.1,
         (1, 0.28, 0.8, 1.0),
-        None,
+        &[],
     ),
     w(
         "M4A1-S",
@@ -443,7 +455,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         3.1,
         (1, 0.25, 0.7, 0.8),
-        None,
+        &[],
     ),
     w(
         "SG 553",
@@ -455,7 +467,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         2.8,
         (1, 0.3, 0.9, 1.0),
-        Some(40.0),
+        &[2.0],
     ),
     w(
         "AUG",
@@ -467,7 +479,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         3.8,
         (1, 0.28, 0.8, 0.9),
-        Some(40.0),
+        &[2.0],
     ),
     w(
         "SSG 08",
@@ -479,7 +491,7 @@ pub static WEAPONS: [WeaponDef; 33] = [
         false,
         3.7,
         (1, 0.15, 2.5, 0.3),
-        Some(20.0),
+        &[2.0, 4.0],
     ),
     w(
         "AWP",
@@ -487,11 +499,12 @@ pub static WEAPONS: [WeaponDef; 33] = [
         4750,
         "SniperRifle_3",
         1.15,
-        (115, 41.0, 5, 30),
+        // Réarmement 50 % plus rapide que dans CS (41 → 61,5 coups par minute).
+        (115, 61.5, 5, 30),
         false,
         3.7,
         (1, 0.1, 4.0, 0.4),
-        Some(15.0),
+        &[2.0, 4.0],
     ),
     w(
         "G3SG1",
@@ -503,7 +516,19 @@ pub static WEAPONS: [WeaponDef; 33] = [
         true,
         4.7,
         (1, 0.2, 1.8, 0.5),
-        Some(20.0),
+        &[2.0, 4.0],
+    ),
+    w(
+        "SCAR-20",
+        Rifle,
+        5000,
+        "SniperRifle_2",
+        1.1,
+        (80, 240.0, 20, 90),
+        true,
+        3.1,
+        (1, 0.2, 1.8, 0.5),
+        &[2.0, 4.0],
     ),
 ];
 
@@ -597,6 +622,10 @@ static FILES: &[(&str, &str, &str)] = models!(
     "SniperRifle_2",
     "SniperRifle_3",
     "SniperRifle_4",
+    "Silencer_1",
+    "Silencer_Short",
+    "Silencer_long",
+    "Bayonet",
 );
 
 /// Modèle de l'arme `i` (chargé une fois).
@@ -611,10 +640,82 @@ pub fn model(i: usize) -> &'static GunModel {
                     .find(|f| f.0 == d.model)
                     .copied()
                     .unwrap_or(FILES[0]);
-                load_obj(obj, mtl, d.length)
+                let mut m = load_obj(obj, mtl, d.length);
+                dress(d.name, &mut m);
+                m
             })
             .collect()
     })[i]
+}
+
+/// Couteau (baïonnette du pack), lame vers −Z, 30 cm.
+pub fn knife_model() -> &'static GunModel {
+    static KNIFE: OnceLock<GunModel> = OnceLock::new();
+    KNIFE.get_or_init(|| file_model("Bayonet", 0.3))
+}
+
+/// Modèle d'un fichier du pack, à la longueur donnée.
+fn file_model(name: &str, length: f32) -> GunModel {
+    let (_, obj, mtl) = FILES
+        .iter()
+        .find(|f| f.0 == name)
+        .copied()
+        .unwrap_or(FILES[0]);
+    load_obj(obj, mtl, length)
+}
+
+/// Détails propres à certaines armes, avec les pièces du même pack : silencieux vissé au
+/// bout du canon (USP-S, M4A1-S, MP5-SD), deux pistolets côte à côte (Dual Berettas),
+/// teinte sable (Five-SeveN, pour le distinguer du P2000 qui a le même modèle).
+fn dress(name: &str, m: &mut GunModel) {
+    let silencer = match name {
+        "USP-S" => Some(("Silencer_Short", 0.11)),
+        "M4A1-S" => Some(("Silencer_long", 0.22)),
+        "MP5-SD" => Some(("Silencer_1", 0.16)),
+        _ => None,
+    };
+    if let Some((file, len)) = silencer {
+        let s = file_model(file, len);
+        // Bout du canon : centre des sommets les plus en avant.
+        let pts = m.tris.iter().flat_map(|t| t.p);
+        let zmin = pts.clone().map(|p| p.z).fold(f32::MAX, f32::min);
+        let (lo, hi) = pts.filter(|p| p.z < zmin + 0.008).fold(
+            (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+            |(lo, hi), p| (lo.min(p), hi.max(p)),
+        );
+        let tip = Vec3::new((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, zmin);
+        m.muzzle = tip;
+        // Le silencieux (centré) prolonge le canon : son arrière touche la bouche.
+        let at = m.muzzle - Vec3::new(0.0, 0.0, len * 0.5);
+        m.tris.extend(s.tris.iter().map(|t| Tri {
+            p: t.p.map(|p| p + at),
+            color: t.color,
+        }));
+        m.muzzle.z -= len;
+    }
+    match name {
+        "Dual Berettas" => {
+            let copy: Vec<Tri> = m
+                .tris
+                .iter()
+                .map(|t| Tri {
+                    p: t.p.map(|p| p + Vec3::new(-0.13, 0.0, 0.02)),
+                    color: t.color,
+                })
+                .collect();
+            m.tris.extend(copy);
+        }
+        "Five-SeveN" => {
+            for t in &mut m.tris {
+                // Gris foncé → vert-sable (polymère du Five-seveN), le métal reste gris.
+                let l = (t.color[0] + t.color[1] + t.color[2]) / 3.0;
+                if l < 0.2 {
+                    t.color = [l * 1.6 + 0.08, l * 1.6 + 0.07, l * 1.1 + 0.03];
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Lit un OBJ (triangulé en éventail) avec les couleurs de son MTL, puis l'oriente :
@@ -744,9 +845,18 @@ mod tests {
                 .flat_map(|t| t.p)
                 .map(|p| p.z)
                 .fold(f32::MIN, f32::max);
+            // Longueur de l'arme, silencieux en plus pour les armes « -S » / « -SD ».
+            let extra = if d.name.ends_with("-S") || d.name.ends_with("-SD") {
+                0.25
+            } else if d.name.starts_with("Dual") {
+                0.03
+            } else {
+                0.0
+            };
+            let l = zmax - zmin;
             assert!(
-                ((zmax - zmin) - d.length).abs() < 0.02,
-                "{} : longueur",
+                l > d.length - 0.02 && l < d.length + extra + 0.02,
+                "{} : longueur {l}",
                 d.name
             );
             assert!(d.magazine > 0 && d.rpm > 0.0 && d.damage > 0);

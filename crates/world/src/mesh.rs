@@ -13,9 +13,8 @@ use crate::world::{Light, LIGHT_RADIUS};
 use crate::{BlockId, Chunk, ChunkPos, World, CHUNK_HEIGHT, CHUNK_SIZE};
 
 /// Sommet compact envoyé au GPU.
-/// `data` : bits 0..8 = bloc, 8..11 = face (0..6), 11..13 = AO (0 = sombre, 3 = clair),
-/// bit 13 = sommet de LOD lointain, bits 14..32 = couleur RVB 6:6:6 :
-/// - LOD : inutilisés (pas de lumière de torche au loin) ;
+/// `data` : bits 0..4 = ciel, 4..8 = reflet, 8..11 = face (0..6), 11..13 = AO (0 = sombre,
+/// 3 = clair), bit 13 = métal (reflet court), bits 14..32 = couleur RVB 6:6:6 :
 /// - blocs : lumière colorée reçue des torches (intensité par canal) ;
 /// - flamme ([`BlockId::FLAME`]) : couleur émise.
 ///
@@ -59,9 +58,6 @@ impl Vertex {
     pub fn ao(&self) -> u32 {
         (self.data >> 11) & 0x3
     }
-    pub fn is_lod(&self) -> bool {
-        self.data & (1 << 13) != 0
-    }
 
     /// Lumière colorée (ou couleur) portée par le sommet, 0..63 par canal.
     pub fn rgb6(&self) -> [u32; 3] {
@@ -77,16 +73,15 @@ impl Vertex {
         let [r, g, b] = [light[0], light[1], light[2]].map(|c| (c >> 2) as u32);
         (light[3] as u32 & 15) | (face << 8) | (ao << 11) | (r << 14) | (g << 20) | (b << 26)
     }
-
-    /// Données d'un sommet de LOD : face, AO et bloc dont on prend la texture.
-    pub fn lod_data(face: u32, ao: u32, _block: BlockId) -> u32 {
-        (1 << 13) | 15 | (face << 8) | (ao << 11)
-    }
 }
 
-/// Bits 4-7 des données de sommet : reflet du bloc (0 mat … 15 miroir).
+/// Bit 13 des données de sommet : métal, reflet court (4 blocs) et flou.
+pub const REFLECT_SHORT: u32 = 1 << 13;
+
+/// Bits 4-7 des données de sommet : reflet du bloc (0 mat … 15 miroir) ; bit 13 : métal.
 fn reflect_bits(id: BlockId) -> u32 {
-    (id.def().reflect as u32 & 15) << 4
+    let d = id.def();
+    (d.reflect as u32 & 15) << 4 | if d.metal { REFLECT_SHORT } else { 0 }
 }
 
 #[derive(Default, Debug)]
@@ -107,7 +102,7 @@ pub struct MeshData {
     /// `section_counts[direction][tranche]` (somme = `face_counts[direction]`).
     pub section_counts: [[u32; SECTIONS]; 7],
     /// Passages par l'air de chaque tranche (voir `section_connectivity`) ; `None` : pas de
-    /// découpage (rendu lointain), tout est toujours dessiné.
+    /// découpage, tout est toujours dessiné.
     pub connectivity: Option<[u64; SECTIONS]>,
 }
 

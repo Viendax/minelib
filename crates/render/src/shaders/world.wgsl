@@ -92,8 +92,8 @@ struct VOut {
     @location(1) @interpolate(flat) block: u32,
     @location(2) @interpolate(flat) face: u32,
     @location(3) ao: f32,
-    // Terrain lointain (LOD) : couleur sRGB par sommet, w = 1.
-    @location(4) lod: vec4<f32>,
+    // Métal (fer, or, diamant) : reflet court (4 blocs) et flou.
+    @location(4) @interpolate(flat) short: u32,
     // Blocs : lumière colorée des torches (0..1 par canal). Flamme : couleur émise.
     @location(5) light: vec3<f32>,
     // Couche du tableau de textures, bit 12 = émissif.
@@ -116,6 +116,7 @@ fn vs_block(v: VIn) -> VOut {
     o.reflect = f32((v.data >> 4u) & 15u) / 15.0;
     o.face = (v.data >> 8u) & 7u;
     o.ao = f32((v.data >> 11u) & 3u) / 3.0;
+    o.short = (v.data >> 13u) & 1u;
     o.tex = v.tex;
     o.uv = vec2<f32>(f32((v.tex >> 16u) & 255u), f32((v.tex >> 24u) & 255u)) / 128.0;
     let rgb = vec3<f32>(
@@ -123,13 +124,7 @@ fn vs_block(v: VIn) -> VOut {
         f32((v.data >> 20u) & 63u),
         f32((v.data >> 26u) & 63u),
     ) / 63.0;
-    if ((v.data >> 13u) & 1u) == 1u {
-        o.lod = vec4<f32>(rgb, 1.0);
-        o.light = vec3<f32>(0.0);
-    } else {
-        o.lod = vec4<f32>(0.0);
-        o.light = rgb;
-    }
+    o.light = rgb;
     return o;
 }
 
@@ -253,7 +248,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
 
     // Texture du pack : coordonnées tirées de la position monde (1 bloc = 1 texture),
     // dérivées calculées avant tout branchement, sur les coordonnées continues
-    // (pas de couture de mipmap aux bords des blocs, ni sur les grandes faces du LOD).
+    // (pas de couture de mipmap aux bords des blocs).
     let an = abs(n);
     let raw = select(
         select(
@@ -281,8 +276,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
         }
         return vec4<f32>(fc, 1.0);
     }
-    // Terrain lointain : toujours opaque (les trous du feuillage disparaissent au loin).
-    let alpha = select(tex.a, 1.0, i.lod.w > 0.5);
+    let alpha = tex.a;
     let albedo = tex.rgb;
 
     // Éclairage : soleil diffus + ambiant (selon l'heure), modulé par l'occlusion ambiante.
@@ -300,7 +294,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
     var torch = pow(i.light, vec3<f32>(2.0)) * g.light.y * flicker * mix(0.55, 1.0, i.ao);
     // Lumière de la torche tenue en main (dynamique, sans ombres) : décroît avec la distance,
     // plus forte sur les faces tournées vers le joueur.
-    if g.held_pos.w > 0.0 && i.lod.w < 0.5 {
+    if g.held_pos.w > 0.0 {
         let to_l = g.held_pos.xyz - i.world;
         let d = length(to_l);
         let f = clamp(1.0 - d / g.held_pos.w, 0.0, 1.0);
@@ -309,14 +303,14 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
         torch = max(torch, held);
     }
     // Lumière des torches renvoyée par les miroirs (raytracing).
-    if g.rt.x > 0.5 && i.lod.w < 0.5 && g.light.w > 0.0 {
+    if g.rt.x > 0.5 && g.light.w > 0.0 {
         torch = max(torch, mirror_light(i.world + n * 0.01, n) * flicker * mix(0.55, 1.0, i.ao));
     }
     var color = albedo * (sky_light * ao + torch);
 
     // Bloc visé légèrement éclairci (le contour est dessiné à part, en lignes).
     let eps = vec3<f32>(0.01);
-    if g.sel_min.w > 0.5 && i.lod.w < 0.5 && all(i.world >= g.sel_min.xyz - eps) && all(i.world <= g.sel_max.xyz + eps) {
+    if g.sel_min.w > 0.5 && all(i.world >= g.sel_min.xyz - eps) && all(i.world <= g.sel_max.xyz + eps) {
         color = color * 1.25 + 0.02;
     }
 
@@ -326,11 +320,22 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
     // 100 % de 4 chunks (≈ 38 → 64 blocs) ; au-delà la surface est opaque (et aucun rayon
     // n'est lancé : plus de FPS).
     let reflect_fade = 1.0 - smoothstep(REFLECT_RANGE * 0.6, REFLECT_RANGE, dist);
-    if reflections && i.reflect > 0.0 && i.lod.w < 0.5 && reflect_fade > 0.0 {
+    if reflections && i.reflect > 0.0 && reflect_fade > 0.0 {
         let v = to_frag / max(dist, 1e-4);
         let r = reflect(v, n);
         var env: vec3<f32>;
-        if g.rt.x > 0.5 && cached {
+        var cover = 1.0;
+        if i.short != 0u {
+            // Métal : seulement les objets proches (pas le ciel ni le lointain).
+            if g.rt.x > 0.5 {
+                let e = trace_short(i.world + n * 0.02, r);
+                env = e.rgb;
+                cover = e.a;
+            } else {
+                env = vec3<f32>(0.0);
+                cover = 0.0;
+            }
+        } else if g.rt.x > 0.5 && cached {
             env = cached_reflection(i.world + n * 0.02, r);
         } else if g.rt.x > 0.5 {
             env = trace(i.world + n * 0.02, r);
@@ -338,7 +343,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
             env = sky_color(r);
         }
         let fresnel = pow(1.0 - max(dot(-v, n), 0.0), 5.0);
-        let k = select(i.reflect * (0.55 + 0.45 * fresnel), 0.96, i.reflect > 0.99) * reflect_fade;
+        let k = select(i.reflect * (0.55 + 0.45 * fresnel), 0.96, i.reflect > 0.99) * reflect_fade * cover;
         color = mix(color, env, k);
         // Points lumineux : chaque source proche se reflète (couleur de sa flamme), net
         // sur un miroir, plus étalé sur le métal ; avec ou sans raytracing.
@@ -607,6 +612,82 @@ fn box_hit(o: vec3<f32>, d: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> vec3<f32
     return vec3<f32>(tn, select(-1.0, tf, tf >= max(tn, 0.0)), axis);
 }
 
+/// Boîte d'un bloc non plein (voir `rt::shape_texel`) : coin bas et coin haut dans la case.
+fn box_lo(b: u32) -> vec3<f32> {
+    return vec3<f32>(f32(b & 15u), f32((b >> 4u) & 15u), f32((b >> 8u) & 15u)) / 16.0;
+}
+fn box_hi(b: u32) -> vec3<f32> {
+    return (vec3<f32>(f32((b >> 12u) & 15u), f32((b >> 16u) & 15u), f32((b >> 20u) & 15u)) + 1.0) / 16.0;
+}
+
+/// Côté horizontal `s` d'un poteau : 0 +X, 1 −X, 2 +Z, 3 −Z.
+fn side_dir(s: i32) -> vec3<i32> {
+    return select(select(select(vec3<i32>(0, 0, -1), vec3<i32>(0, 0, 1), s == 2), vec3<i32>(-1, 0, 0), s == 1), vec3<i32>(1, 0, 0), s == 0);
+}
+
+/// Bras vers +X (`lo`, `hi`) tourné vers le côté `s`.
+fn arm_lo(lo: vec3<f32>, hi: vec3<f32>, s: i32) -> vec3<f32> {
+    return select(select(select(vec3<f32>(lo.z, lo.y, 1.0 - hi.x), vec3<f32>(lo.z, lo.y, lo.x), s == 2), vec3<f32>(1.0 - hi.x, lo.y, lo.z), s == 1), lo, s == 0);
+}
+fn arm_hi(lo: vec3<f32>, hi: vec3<f32>, s: i32) -> vec3<f32> {
+    return select(select(select(vec3<f32>(hi.z, hi.y, 1.0 - lo.x), vec3<f32>(hi.z, hi.y, hi.x), s == 2), vec3<f32>(1.0 - lo.x, hi.y, hi.z), s == 1), hi, s == 0);
+}
+
+/// Un poteau se relie-t-il à la case `c` ? (bloc plein ou autre poteau, comme le maillage)
+fn post_link(c: vec3<i32>) -> bool {
+    let raw = voxel(c);
+    let id = raw & 4095u;
+    let kind = textureLoad(palette, i32(id) + 4096, 0).w & 3u;
+    let torch = (textureLoad(palette, i32(id), 0).w >> 8u) & 7u;
+    return raw != 0xffffu && id != 0u && torch == 0u && (kind == 0u || kind == 2u);
+}
+
+/// Boîte la plus proche touchée par le rayon dans un bloc non plein (dalle, escalier,
+/// clôture, muret, vitre, panneau…) : x = distance (< 0 : rien), y = axe de la face.
+fn shape_hit(o: vec3<f32>, d: vec3<f32>, cell: vec3<i32>, shp: vec4<u32>, t_in: f32) -> vec2<f32> {
+    let lo = o - vec3<f32>(cell);
+    let b0 = shp.x | ((shp.y & 255u) << 16u);
+    let b1 = (shp.y >> 8u) | (shp.z << 8u);
+    let kind = shp.w & 3u;
+    let post = (shp.w >> 2u) & 3u;
+    // Poteau : voisins auxquels il se relie (vitre isolée : en croix).
+    var link = vec4<bool>(false);
+    if kind == 2u {
+        link = vec4<bool>(post_link(cell + side_dir(0)), post_link(cell + side_dir(1)), post_link(cell + side_dir(2)), post_link(cell + side_dir(3)));
+        if post == 2u && !any(link) {
+            link = vec4<bool>(true);
+        }
+    }
+    var best = vec2<f32>(-1.0, 0.0);
+    var bt = 1e9;
+    for (var k = 0; k < 10; k++) {
+        var mn = box_lo(b0);
+        var mx = box_hi(b0);
+        var used = k == 0;
+        if k == 1 {
+            mn = box_lo(b1);
+            mx = box_hi(b1);
+            used = kind == 1u && b1 != 0u;
+        } else if k >= 2 {
+            let side = (k - 2) / 2;
+            let second = (k - 2) % 2 == 1;
+            // Clôture : deuxième traverse 6/16 plus haut ; muret et vitre : un seul bras.
+            let lift = vec3<f32>(0.0, select(0.0, 0.375, second), 0.0);
+            mn = arm_lo(box_lo(b1), box_hi(b1), side) + lift;
+            mx = arm_hi(box_lo(b1), box_hi(b1), side) + lift;
+            used = kind == 2u && link[side] && (!second || post == 0u);
+        }
+        if used {
+            let h = box_hit(lo, d, mn, mx);
+            if h.y >= 0.0 && h.x >= t_in - 1e-3 && h.x < bt {
+                bt = h.x;
+                best = vec2<f32>(h.x, h.z);
+            }
+        }
+    }
+    return best;
+}
+
 /// Flamme animée, comme celle des torches posées (`y` : hauteur dans le bloc).
 fn flame_color(light: vec3<f32>, y: f32, cell: vec3<i32>) -> vec3<f32> {
     let t = g.cam_pos.w;
@@ -652,6 +733,11 @@ struct RayHit {
 /// total, rebonds compris), avec le même fondu vers le ciel que la fin de la vue ; et les
 /// surfaces plus loin que ça de la caméra ne reflètent plus.
 const REFLECT_RANGE: f32 = 64.0;
+/// Reflets des métaux : rien au-delà de 4 blocs, flou et fondu à partir de 3.
+const METAL_RANGE: f32 = 4.0;
+const METAL_BLUR: f32 = 3.0;
+/// 1 pendant le rayon d'un reflet de métal (textures lues plus floues).
+var<private> ray_blur: f32 = 0.0;
 
 fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
     var cell = vec3<i32>(floor(o));
@@ -736,31 +822,72 @@ fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
             }
             continue;
         }
+        // Bloc non plein : la boîte touchée dans la case (sinon le rayon continue).
+        let shp = textureLoad(palette, i32(id) + 4096, 0);
+        var ht = t;
+        var hax = axis;
+        var sky_hit = sky_face;
+        let partial = (shp.w & 3u) != 0u;
+        if partial {
+            let sh = shape_hit(o, d, cell, shp, t);
+            if sh.x < 0.0 {
+                continue;
+            }
+            ht = sh.x;
+            hax = i32(sh.y);
+            // Face dans la case (dessus d'une dalle) : éclairée par l'air de la case.
+            sky_hit = max(sky_face, sky_cell);
+        }
         // Point touché et coordonnées de texture comme pour les faces du monde.
-        let p = o + d * t;
+        let p = o + d * ht;
         var uv = vec2<f32>(p.x, p.z);
         var layer = select(pal.z, pal.x, step.y < 0);
         var shade = select(0.5, 1.0, step.y < 0);
-        if axis == 0 {
+        if hax == 0 {
             uv = vec2<f32>(p.z, -p.y);
             layer = pal.y;
             shade = 0.62;
-        } else if axis == 2 {
+        } else if hax == 2 {
             uv = vec2<f32>(p.x, -p.y);
             layer = pal.y;
             shade = 0.8;
         }
         let fs = -vec3<f32>(step);
-        let nrm = select(select(vec3<f32>(0.0, 0.0, fs.z), vec3<f32>(0.0, fs.y, 0.0), axis == 1), vec3<f32>(fs.x, 0.0, 0.0), axis == 0);
-        let lod = clamp(log2(max(t, 1.0) * 0.6), 0.0, 4.0);
-        let albedo = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), lod).rgb;
+        let nrm = select(select(vec3<f32>(0.0, 0.0, fs.z), vec3<f32>(0.0, fs.y, 0.0), hax == 1), vec3<f32>(fs.x, 0.0, 0.0), hax == 0);
+        // Reflet d'un métal : déjà un peu flou, très flou à partir de 3 blocs.
+        let lod = clamp(log2(max(ht, 1.0) * 0.6) + ray_blur * (1.0 + 3.0 * smoothstep(2.5, 4.0, ht)), 0.0, 6.0);
+        let texel = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), lod);
+        // Pixels transparents d'un bloc fin (rail, échelle) : le rayon passe.
+        if partial && texel.a < 0.5 {
+            continue;
+        }
+        let albedo = texel.rgb;
         if (pal.w & 1u) != 0u {
-            return RayHit(albedo * 1.2, t, nrm, 0.0, -1.0, vec3<f32>(0.0), 1.0); // bloc lumineux
+            return RayHit(albedo * 1.2, ht, nrm, 0.0, -1.0, vec3<f32>(0.0), 1.0); // bloc lumineux
         }
         let r = f32((pal.w >> 4u) & 15u) / 15.0;
-        return RayHit(albedo, t, nrm, select(0.0, 0.96, r > 0.99), shade, vec3<f32>(0.0), sky_face);
+        return RayHit(albedo, ht, nrm, select(0.0, 0.96, r > 0.99), shade, vec3<f32>(0.0), sky_hit);
     }
     return RayHit(sky_color(d), 1e9, vec3<f32>(0.0), 0.0, -1.0, vec3<f32>(0.0), 1.0);
+}
+
+/// Reflet d'un métal depuis `o` dans la direction `d` : seulement ce qui est à moins de
+/// 4 blocs (a = part visible : 1 jusqu'à 3 blocs, puis fondu jusqu'à 0 à 4 blocs).
+fn trace_short(o: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
+    ray_blur = 1.0;
+    let h = march(o, d, METAL_RANGE);
+    ray_blur = 0.0;
+    var color = h.color;
+    if h.shade >= 0.0 {
+        let p = o + d * h.t;
+        let day = g.light.x;
+        let diffuse = max(dot(h.normal, normalize(g.sun.xyz)), 0.0);
+        let sky_light = ((g.sun.w + (1.0 - g.sun.w) * diffuse) * day + 0.04 * (1.0 - day)) * h.sky * h.sky + 0.012;
+        let lit = max(point_light(p + h.normal * 0.02, h.normal), held_light(p + h.normal * 0.02, h.normal));
+        color = h.color * (sky_light * mix(1.0, h.shade, 0.35) + lit * 0.8 + h.glow * 0.5);
+    }
+    let a = select(0.0, 1.0 - smoothstep(METAL_BLUR, METAL_RANGE, h.t), h.t < METAL_RANGE);
+    return vec4<f32>(color, a);
 }
 
 /// Reflet vu depuis `o` dans la direction `d` : jusqu'à 4 rebonds de miroir en miroir.

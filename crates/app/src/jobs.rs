@@ -1,4 +1,4 @@
-//! Pool de threads de travail : génération de chunks, maillage, tuiles LOD.
+//! Pool de threads de travail : génération de chunks et maillage.
 //!
 //! Le thread principal soumet les tâches dans l'ordre de priorité (les plus proches
 //! d'abord) et garde la file courte (`capacity`), pour que les priorités suivent le
@@ -78,14 +78,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use minelib_world::gen::{generate, Generator};
-use minelib_world::lod::{build_lod_mesh, Node};
 use minelib_world::mesh::{mesh_neighborhood, MeshData, Neighborhood};
-use minelib_world::{Chunk, ChunkPos, SurfaceMap};
+use minelib_world::{Chunk, ChunkPos};
 
 pub enum Job {
     Generate(ChunkPos),
     Mesh { n: Neighborhood, version: u32 },
-    Lod(Node),
 }
 
 pub enum Done {
@@ -93,11 +91,7 @@ pub enum Done {
     Meshed {
         pos: ChunkPos,
         version: u32,
-        mesh: MeshData,
-    },
-    Lod {
-        node: Node,
-        mesh: MeshData,
+        mesh: Box<MeshData>,
     },
 }
 
@@ -154,7 +148,7 @@ pub struct Workers {
 }
 
 impl Workers {
-    pub fn new(seed: u32, surface: Arc<SurfaceMap>, gen: Generator) -> Self {
+    pub fn new(seed: u32, gen: Generator) -> Self {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2);
@@ -168,7 +162,6 @@ impl Workers {
             .filter_map(|i| {
                 let queue = queue.clone();
                 let done_tx = done_tx.clone();
-                let surface = surface.clone();
                 let cancel = cancel.clone();
                 std::thread::Builder::new()
                     .name(format!("minelib-worker-{i}"))
@@ -180,7 +173,7 @@ impl Workers {
                         } else {
                             minelib_platform::lower_thread_priority();
                         }
-                        worker_loop(i, &queue, &cancel, &done_tx, &surface, gen, seed)
+                        worker_loop(i, &queue, &cancel, &done_tx, gen, seed)
                     })
                     .ok()
             })
@@ -244,7 +237,6 @@ fn worker_loop(
     queue: &Queue,
     cancel: &AtomicBool,
     done_tx: &std::sync::mpsc::Sender<Done>,
-    surface: &SurfaceMap,
     gen: Generator,
     seed: u32,
 ) {
@@ -277,17 +269,11 @@ fn worker_loop(
                     log::error!("maillage du chunk {pos:?} en erreur : chunk laissé vide");
                     MeshData::default()
                 });
-                Done::Meshed { pos, version, mesh }
-            }
-            Job::Lod(node) => {
-                let mesh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    build_lod_mesh(seed, node, surface, gen)
-                }))
-                .unwrap_or_else(|_| {
-                    log::error!("terrain lointain {node:?} en erreur : tuile laissée vide");
-                    MeshData::default()
-                });
-                Done::Lod { node, mesh }
+                Done::Meshed {
+                    pos,
+                    version,
+                    mesh: Box::new(mesh),
+                }
             }
         };
         if done_tx.send(done).is_err() {

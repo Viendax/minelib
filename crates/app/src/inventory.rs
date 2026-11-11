@@ -20,12 +20,15 @@ pub enum Item {
     Block(BlockId),
     /// Torche, éventuellement chargée de 5 g d'un sel (index dans `CHEMICALS`).
     Torch(Option<usize>),
+    /// Baguette de sélection (WorldEdit) : clic gauche coin 1, clic droit coin 2.
+    Wand,
 }
 
 impl Item {
     pub fn name(self) -> String {
         match self {
             Item::Block(b) => capitalize(b.name()),
+            Item::Wand => "Baguette de sélection".into(),
             Item::Torch(None) => "Torche".into(),
             Item::Torch(Some(i)) => {
                 let c = &CHEMICALS[i];
@@ -45,7 +48,7 @@ impl Item {
         match self {
             Item::Torch(None) => Some(WOOD_FLAME),
             Item::Torch(Some(i)) => Some(CHEMICALS[i].rgb),
-            Item::Block(_) => None,
+            Item::Block(_) | Item::Wand => None,
         }
     }
 
@@ -56,6 +59,11 @@ impl Item {
         let mut lines = vec![(self.name(), self.flame().map_or(WHITE, brighten))];
         match self {
             Item::Block(_) => lines.push(("Bloc de construction".into(), GREY)),
+            Item::Wand => {
+                lines.push(("Clic gauche : coin 1, clic droit : coin 2".into(), WHITE));
+                lines.push(("Clic molette : effacer la sélection".into(), WHITE));
+                lines.push(("Commandes //set, //copy, //paste… (//help)".into(), GREY));
+            }
             Item::Torch(None) => {
                 lines.push(("Flamme orange (bois)".into(), WHITE));
                 lines.push(("Lumière permanente".into(), GREY));
@@ -126,7 +134,8 @@ pub fn catalogue() -> &'static [Item] {
     static CAT: std::sync::OnceLock<Vec<Item>> = std::sync::OnceLock::new();
     CAT.get_or_init(|| {
         use minelib_world::registry::{registry, Shape};
-        let mut items: Vec<Item> = std::iter::once(Item::Torch(None))
+        let mut items: Vec<Item> = [Item::Wand, Item::Torch(None)]
+            .into_iter()
             .chain((0..CHEMICALS.len()).map(|i| Item::Torch(Some(i))))
             .collect();
         let mut seen = std::collections::HashSet::new();
@@ -368,6 +377,7 @@ impl Inventory {
                     match it {
                         Item::Block(b) => fold(&b.def().key).contains(&q),
                         Item::Torch(_) => "torche".contains(&q),
+                        Item::Wand => "baguette wand worldedit".contains(&q),
                     }
                 }
             })
@@ -898,6 +908,8 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
             15.0 * s,
             chem,
         )),
+        // Baguette : image en pixels.
+        Item::Wand => crate::wand::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s),
         // Bloc : vrai modèle 3D, net à toutes les résolutions.
         Item::Block(b) => ui.model(crate::hand::block_icon(
             x + slot / 2.0,

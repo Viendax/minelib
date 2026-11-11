@@ -64,6 +64,12 @@ pub fn init() -> Result<Paths> {
     if !default_zip.exists() && !default_dir.exists() {
         fs::write(&default_zip, DEFAULT_PACK_ZIP)?;
         log::info!("pack par défaut installé : {}", default_zip.display());
+    } else if default_zip.exists()
+        && fs::read(&default_zip).map_or(true, |old| old != DEFAULT_PACK_ZIP)
+    {
+        // Nouvelle version du jeu : le pack par défaut installé est remplacé par le sien.
+        fs::write(&default_zip, DEFAULT_PACK_ZIP)?;
+        log::info!("pack par défaut mis à jour : {}", default_zip.display());
     }
     log::info!("dossier du jeu : {}", paths.root.display());
     Ok(paths)
@@ -75,10 +81,8 @@ pub fn init() -> Result<Paths> {
 #[derive(Clone, Debug)]
 pub struct Options {
     pub resource_pack: String,
-    /// Distance de rendu détaillé, en chunks.
+    /// Distance de rendu, en chunks.
     pub render_distance: i32,
-    /// Distance du rendu lointain (LOD), en blocs ; 0 = désactivé.
-    pub lod_distance: f32,
     /// NVIDIA Reflex / AMD Anti-Lag 2 (si la carte le propose).
     pub low_latency: bool,
     /// Sensibilité de la souris, valeur Counter-Strike (0,022° par unité de souris × valeur).
@@ -94,10 +98,8 @@ pub struct Options {
     /// Plein écran (sans bordure) : Windows affiche l'image directement, sans passer par le
     /// compositeur du bureau (plus de FPS, moins de latence).
     pub fullscreen: bool,
-    /// Rayon (chunks) dessiné en pleine résolution ; au-delà, jusqu'à la distance de rendu,
-    /// le terrain est simplifié (LOD). 0 = tout en pleine résolution, -1 = automatique
-    /// (ajusté au temps GPU).
-    pub full_detail: i32,
+    /// Volume général des sons (0..1).
+    pub volume: f32,
 }
 
 /// Sensibilité par défaut de Counter-Strike 2.
@@ -110,14 +112,13 @@ impl Default for Options {
         Self {
             resource_pack: DEFAULT_PACK.into(),
             render_distance: 10,
-            lod_distance: 4096.0,
             low_latency: false,
             sensitivity: DEFAULT_SENSITIVITY,
             raytracing: true,
             render_scale: 1.0,
             cpu_uniform: true,
             fullscreen: false,
-            full_detail: -1,
+            volume: 0.6,
         }
     }
 }
@@ -134,24 +135,13 @@ impl Options {
                 .get("render_distance")
                 .and_then(|v| v.parse::<i32>().ok())
             {
-                o.render_distance = v.clamp(2, 256);
-            }
-            if let Some(v) = kv.get("lod_distance").and_then(|v| v.parse::<f32>().ok()) {
-                o.lod_distance = v.clamp(0.0, 16384.0);
+                o.render_distance = v.clamp(2, 64);
             }
             if let Some(v) = kv.get("low_latency") {
                 o.low_latency = v == "true";
             }
             if let Some(v) = kv.get("raytracing") {
                 o.raytracing = v != "false";
-            }
-            // Clé `detail` (l'ancienne `full_detail` est ignorée : on repart en automatique).
-            if let Some(v) = kv.get("detail") {
-                o.full_detail = if v == "auto" {
-                    -1
-                } else {
-                    v.parse::<i32>().map_or(-1, |n| n.clamp(0, 256))
-                };
             }
             if let Some(v) = kv.get("fullscreen") {
                 o.fullscreen = v == "true";
@@ -161,6 +151,9 @@ impl Options {
             }
             if let Some(v) = kv.get("render_scale").and_then(|v| v.parse::<f32>().ok()) {
                 o.render_scale = v.clamp(0.5, 1.0);
+            }
+            if let Some(v) = kv.get("volume").and_then(|v| v.parse::<f32>().ok()) {
+                o.volume = v.clamp(0.0, 1.0);
             }
             if let Some(v) = kv.get("sensitivity").and_then(|v| v.parse::<f32>().ok()) {
                 o.sensitivity = v.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
@@ -173,8 +166,9 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nlod_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\ndetail={}\n",
-                self.resource_pack, self.render_distance, self.lod_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen, if self.full_detail < 0 { "auto".to_string() } else { self.full_detail.to_string() }
+                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\n",
+                self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
+                self.volume
             ),
         )?;
         Ok(())
@@ -383,7 +377,13 @@ impl ResourcePack {
     /// `textures/block/<nom>` (Minecraft 1.13+, ex. `oak_planks`), en teintant les textures
     /// grises de Minecraft (herbe, feuillage, eau) ; à défaut, le pack par défaut.
     pub fn block_image(&self, name: &str) -> Option<Rgba> {
-        if let Some(img) = self.image_own(&format!("textures/blocks/{name}.png")) {
+        if let Some(mut img) = self.image_own(&format!("textures/blocks/{name}.png")) {
+            // Feuillage, herbe, eau en gris dans le pack : teinte de Minecraft.
+            if let Some(color) = biome_tint(name) {
+                if is_grayscale(&img) {
+                    tint_gray(&mut img, color);
+                }
+            }
             return Some(img);
         }
         for modern in modern_names(name) {
@@ -398,10 +398,17 @@ impl ResourcePack {
     }
 
     fn modern_block(&self, name: &str, modern: &str) -> Option<Rgba> {
-        let mut img = self.image_own(&format!("textures/block/{modern}.png"))?;
+        // Noms modernes dans `textures/block/` (Minecraft 1.13+) ou dans `textures/blocks/`
+        // (packs libres qui gardent l'ancien dossier, comme VoxelArt Libre v3).
+        let mut img = self
+            .image_own(&format!("textures/block/{modern}.png"))
+            .or_else(|| self.image_own(&format!("textures/blocks/{modern}.png")))?;
         // Côté de l'herbe : la bande verte est une surcouche grise à teinter.
         if modern == "grass_block_side" {
-            if let Some(mut over) = self.image_own("textures/block/grass_block_side_overlay.png") {
+            let overlay = self
+                .image_own("textures/block/grass_block_side_overlay.png")
+                .or_else(|| self.image_own("textures/blocks/grass_block_side_overlay.png"));
+            if let Some(mut over) = overlay {
                 tint(&mut over, GRASS_TINT);
                 if over.width == img.width && over.height == img.height {
                     blend_over(&mut img, &over);
@@ -452,9 +459,10 @@ impl ResourcePack {
             .iter()
             .filter(|n| {
                 self.read_own(&format!("textures/blocks/{n}.png")).is_some()
-                    || modern_names(n)
-                        .iter()
-                        .any(|m| self.read_own(&format!("textures/block/{m}.png")).is_some())
+                    || modern_names(n).iter().any(|m| {
+                        self.read_own(&format!("textures/block/{m}.png")).is_some()
+                            || self.read_own(&format!("textures/blocks/{m}.png")).is_some()
+                    })
             })
             .count()
     }
@@ -487,10 +495,20 @@ fn biome_tint(name: &str) -> Option<[u8; 3]> {
 /// Texture surtout grise (à teinter comme Minecraft) : au moins 60 % des pixels visibles
 /// sans couleur. Les feuilles de jungle ont des fruits jaunes (≈ 12 % des pixels) : la
 /// moyenne seule les faisait passer pour colorées et elles restaient grises.
+/// Pixel « sans couleur » : gris pur, ou gris chaud peu saturé (base sépia de Pixel
+/// Perfection, utilisée par VoxelArt Libre v3), à teinter comme du gris.
+fn gray_px(px: &[u8]) -> bool {
+    let (hi, lo) = (
+        px[0].max(px[1]).max(px[2]) as u32,
+        px[0].min(px[1]).min(px[2]) as u32,
+    );
+    hi - lo < 12 || (hi - lo) * 100 < hi * 25
+}
+
 fn is_grayscale(img: &Rgba) -> bool {
     let (mut gray, mut n) = (0u64, 0u64);
     for px in img.data.chunks_exact(4).filter(|p| p[3] > 0) {
-        if px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2]) < 12 {
+        if gray_px(px) {
             gray += 1;
         }
         n += 1;
@@ -502,9 +520,11 @@ fn is_grayscale(img: &Rgba) -> bool {
 /// feuilles de jungle, fleurs…) gardent leur couleur.
 fn tint_gray(img: &mut Rgba, c: [u8; 3]) {
     for px in img.data.chunks_exact_mut(4) {
-        if px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2]) < 12 {
+        if gray_px(px) {
+            // Luminosité du pixel × teinte (une base sépia ne doit pas brunir le vert).
+            let l = (px[0] as u32 + px[1] as u32 + px[2] as u32) / 3;
             for k in 0..3 {
-                px[k] = (px[k] as u32 * c[k] as u32 / 255) as u8;
+                px[k] = (l * c[k] as u32 / 255) as u8;
             }
         }
     }
@@ -601,11 +621,11 @@ pub fn modern_names(name: &str) -> Vec<String> {
         ("prismarine_rough", &["prismarine"]),
         ("prismarine_dark", &["dark_prismarine"]),
         ("hellrock", &["netherrack"]),
-        ("hellrock_brick", &["nether_bricks"]),
+        ("hellrock_brick", &["nether_bricks", "hell_bricks"]),
         ("ash_sand", &["soul_sand"]),
         ("energy_block", &["redstone_block"]),
         ("energy_lamp_on", &["redstone_lamp_on"]),
-        ("energy_lamp_off", &["redstone_lamp"]),
+        ("energy_lamp_off", &["redstone_lamp", "energy_lamp"]),
         ("dirt_podzol_top", &["podzol_top"]),
         ("dirt_podzol_side", &["podzol_side"]),
         ("torch_on", &["torch"]),
@@ -863,7 +883,7 @@ mod tests {
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].name, DEFAULT_PACK);
         let pack = ResourcePack::open(&packs[0]).unwrap();
-        assert!(pack.image("textures/blocks/grass_top.png").is_some());
+        assert!(pack.block_image("grass_top").is_some());
         let mut o = Options::load(&paths.options);
         o.resource_pack = "Autre".into();
         o.save(&paths.options).unwrap();

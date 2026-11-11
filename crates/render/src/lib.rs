@@ -2,7 +2,6 @@
 //!
 //! - surface + tampon de profondeur, recréés au redimensionnement ;
 //! - un tampon de sommets / d'indices par chunk ;
-//! - tuiles de terrain lointain (LOD) dans le même pipeline que les chunks ;
 //! - élimination de ce qui est hors du champ de vision (frustum culling) et tri
 //!   de l'avant vers l'arrière (moins de pixels calculés pour rien) ;
 //! - profondeur en « Z inversé » avec projection infinie : précision quasi constante
@@ -37,7 +36,6 @@ use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use minelib_assets::ResourcePack;
-use minelib_world::lod::Node;
 use minelib_world::mesh::{MeshData, Vertex};
 use minelib_world::ChunkPos;
 use winit::window::Window;
@@ -133,9 +131,6 @@ pub struct FrameParams<'a> {
 pub struct FrameStats {
     pub chunks_drawn: usize,
     pub chunks_total: usize,
-    pub lod_drawn: usize,
-    pub lod_total: usize,
-    pub lod_triangles: usize,
     pub triangles: usize,
 }
 
@@ -143,7 +138,6 @@ pub struct FrameStats {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MeshKey {
     Chunk(ChunkPos),
-    Lod(Node),
 }
 
 struct ChunkGpu {
@@ -860,10 +854,9 @@ impl Renderer {
             self.mesh_changes = 8;
             self.mesh_version += 1;
         }
-        if let MeshKey::Chunk(p) = key {
-            if self.conn.remove(&p).is_some() {
-                self.vis_dirty = true;
-            }
+        let MeshKey::Chunk(p) = key;
+        if self.conn.remove(&p).is_some() {
+            self.vis_dirty = true;
         }
     }
 
@@ -918,15 +911,6 @@ impl Renderer {
 
     pub fn cave_culling(&self) -> bool {
         self.cave_culling
-    }
-
-    /// Envoie (ou remplace) le maillage d'une tuile LOD.
-    pub fn upload_lod(&mut self, node: Node, mesh: &MeshData) {
-        self.upload(MeshKey::Lod(node), mesh);
-    }
-
-    pub fn remove_lod(&mut self, node: Node) {
-        self.drop_mesh(MeshKey::Lod(node));
     }
 
     pub fn upload(&mut self, key: MeshKey, mesh: &MeshData) {
@@ -987,22 +971,9 @@ impl Renderer {
         chunks + depth + self.overlay.gpu_bytes + std::mem::size_of::<Globals>() as u64
     }
 
-    /// Mémoire GPU des maillages de chunks pleine résolution, en octets.
+    /// Mémoire GPU des maillages de chunks, en octets.
     pub fn chunk_gpu_bytes(&self) -> u64 {
-        self.meshes
-            .iter()
-            .filter(|(k, _)| matches!(k, MeshKey::Chunk(_)))
-            .map(|(_, c)| c.bytes)
-            .sum()
-    }
-
-    /// Mémoire GPU des tuiles LOD, en octets.
-    pub fn lod_gpu_bytes(&self) -> u64 {
-        self.meshes
-            .iter()
-            .filter(|(k, _)| matches!(k, MeshKey::Lod(_)))
-            .map(|(_, c)| c.bytes)
-            .sum()
+        self.meshes.values().map(|c| c.bytes).sum()
     }
 
     pub fn low_latency(&self) -> Option<(LowLatencyKind, bool)> {
@@ -1308,16 +1279,12 @@ impl Renderer {
         self.draw_list.clear();
         let mut hidden = 0u32;
         for (key, c) in &self.meshes {
-            match key {
-                MeshKey::Chunk(_) => stats.chunks_total += 1,
-                MeshKey::Lod(_) => stats.lod_total += 1,
-            }
+            stats.chunks_total += 1;
             // Chunk dont aucune tranche n'est visible depuis la caméra (sous la roche).
-            if let MeshKey::Chunk(p) = key {
-                if self.vis.get(p) == Some(&0) {
-                    hidden += 1;
-                    continue;
-                }
+            let MeshKey::Chunk(p) = key;
+            if self.vis.get(p) == Some(&0) {
+                hidden += 1;
+                continue;
             }
             // Distance horizontale de l'œil à la boîte.
             let dx = (c.min.x - eye.x).max(0.0).max(eye.x - c.max.x);
@@ -1352,10 +1319,8 @@ impl Renderer {
             .iter()
             .map(|&i| {
                 let key = self.draw_list[i].1;
-                let mask = match key {
-                    MeshKey::Chunk(p) => self.vis.get(&p).copied().unwrap_or(occlusion::ALL),
-                    MeshKey::Lod(_) => occlusion::ALL,
-                };
+                let MeshKey::Chunk(p) = key;
+                let mask = self.vis.get(&p).copied().unwrap_or(occlusion::ALL);
                 (&self.meshes[&key], mask)
             })
             .filter(|(c, _)| c.count > 0)
@@ -1469,15 +1434,8 @@ impl Renderer {
         }
         for (_, key) in &self.draw_list {
             let c = &self.meshes[key];
-            let tris = (c.count + c.reflective + c.translucent) as usize / 3;
             stats.triangles += (c.reflective + c.translucent) as usize / 3;
-            match key {
-                MeshKey::Chunk(_) => stats.chunks_drawn += 1,
-                MeshKey::Lod(_) => {
-                    stats.lod_drawn += 1;
-                    stats.lod_triangles += tris;
-                }
-            }
+            stats.chunks_drawn += 1;
         }
 
         // Miroirs et métaux : seulement les chunks qui en ont, avec le shader des reflets.

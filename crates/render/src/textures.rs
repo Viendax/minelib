@@ -420,8 +420,9 @@ mod tests {
         let pack = ResourcePack::builtin().unwrap();
         for t in &registry().textures {
             if let TexSrc::Pack(n) | TexSrc::Tint(n, _) = t {
+                // « missing » : damier dessiné par le jeu si le pack n'en a pas.
                 assert!(
-                    pack.image(&format!("textures/blocks/{n}.png")).is_some(),
+                    *n == "missing" || pack.block_image(n).is_some(),
                     "texture manquante : {n}"
                 );
             }

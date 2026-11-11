@@ -105,7 +105,11 @@ pub fn generate_chunk(seed: u32, pos: ChunkPos) -> Chunk {
             } else {
                 BlockId::GRASS
             };
-            let under = if h <= SAND_LEVEL { BlockId::SAND } else { BlockId::DIRT };
+            let under = if h <= SAND_LEVEL {
+                BlockId::SAND
+            } else {
+                BlockId::DIRT
+            };
 
             for y in 0..=h {
                 let id = if y == 0 {
@@ -140,10 +144,13 @@ pub fn generate_chunk(seed: u32, pos: ChunkPos) -> Chunk {
 }
 
 /// Un arbre pousse-t-il sur la colonne (`wx`, `wz`) de hauteur `h` ? Renvoie la hauteur
-/// du tronc. Partagé par la génération des chunks et celle des LOD lointains.
+/// du tronc.
 pub fn tree_at(seed: u32, wx: i32, wz: i32, h: i32) -> Option<i32> {
     let edge = 2..CHUNK_SIZE as i32 - 2;
-    let (lx, lz) = (wx.rem_euclid(CHUNK_SIZE as i32), wz.rem_euclid(CHUNK_SIZE as i32));
+    let (lx, lz) = (
+        wx.rem_euclid(CHUNK_SIZE as i32),
+        wz.rem_euclid(CHUNK_SIZE as i32),
+    );
     if !edge.contains(&lx) || !edge.contains(&lz) || h <= SAND_LEVEL || h >= SNOW_LEVEL {
         return None;
     }

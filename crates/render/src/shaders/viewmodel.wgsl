@@ -51,6 +51,14 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
         return vec4<f32>(c * 1.3 * wobble + c * core * 0.5 + vec3<f32>(0.25, 0.22, 0.18) * core, 1.0);
     }
     if i.layer == 0xffffffffu {
+        // Alpha < 1 (fumée) : tramage animé, lissé par l'anticrénelage temporel.
+        if i.color.a < 0.999 {
+            let ign = fract(52.9829189 * fract(dot(i.clip.xy, vec2<f32>(0.06711056, 0.00583715))));
+            let n = fract(ign + g.cam_pos.w * 7.31);
+            if n > i.color.a {
+                discard;
+            }
+        }
         return vec4<f32>(i.color.rgb, 1.0);
     }
     if tex.a < 0.5 {

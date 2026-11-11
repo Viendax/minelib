@@ -7,7 +7,6 @@ use anyhow::Result;
 use glam::{Mat4, Vec3};
 use minelib_platform::{Input, KeyCode, Mouse};
 use minelib_render::{FrameParams, FrameStats, Overlay, Renderer, Ui};
-use minelib_world::lod::LodSettings;
 use minelib_world::raycast::{raycast, Hit};
 use minelib_world::{BlockId, ChunkPos, World, CHUNK_SIZE};
 
@@ -42,9 +41,6 @@ const MAX_PINGS: usize = 3;
 #[derive(Clone, Copy)]
 pub struct SessionConfig {
     pub view_distance: i32,
-    pub lod_distance: f32,
-    /// Rayon en pleine résolution (chunks), 0 = tout.
-    pub full_detail: i32,
 }
 
 pub struct Session {
@@ -55,13 +51,9 @@ pub struct Session {
     workers: Workers,
     streamer: Streamer,
     view_distance: i32,
-    lod_distance: f32,
-    lod_enabled: bool,
-    full_detail: i32,
-    /// Rayon actuel du mode « Détail complet : auto ».
-    auto_detail: i32,
-    auto_timer: f32,
     dirty: HashSet<ChunkPos>,
+    /// Sélection et commandes `//…` façon WorldEdit.
+    we: crate::worldedit::WorldEdit,
     pub inventory: Inventory,
     night: bool,
     daylight: f32,
@@ -70,6 +62,8 @@ pub struct Session {
     pub fov: f32,
     /// Sensibilité de la souris (valeur Counter-Strike).
     pub sensitivity: f32,
+    /// Volume général des sons (0..1).
+    pub volume: f32,
     /// Touches choisies dans « Régler les touches ».
     pub keys: Bindings,
     autosave: f32,
@@ -88,6 +82,9 @@ pub struct Session {
     hurt: f32,
     /// Pings (mode FPS) : point visé et âge en secondes.
     pings: Vec<(Vec3, f32)>,
+    /// Mode FPS : marcher / s'accroupir actifs (maintenus ou basculés).
+    fps_walk_on: bool,
+    fps_duck_on: bool,
     /// Mode FPS : vie sur 100, armes, tir, menu d'achat.
     pub fps: crate::fps::Fps,
     /// Main et objet tenu (première personne), et leur éclairage.
@@ -105,7 +102,7 @@ pub struct Session {
 }
 
 /// Distance de rendu maximale réglable (chunks).
-pub const MAX_VIEW_DISTANCE: i32 = 256;
+pub const MAX_VIEW_DISTANCE: i32 = 64;
 
 /// Distance de rendu que la mémoire vive permet : les chunks détaillés gardés en mémoire
 /// (blocs, lumière…) prennent environ 200 Ko chacun ; on s'autorise 60 % de la mémoire
@@ -120,46 +117,6 @@ pub fn ram_view_limit() -> i32 {
     // Zone gardée ≈ carré de (2r + 3) chunks de côté.
     let r = ((chunks.sqrt() - 3.0) / 2.0).floor() as i32;
     r.clamp(2, MAX_VIEW_DISTANCE)
-}
-
-/// Réglage « Détail complet » automatique : le rayon en pleine résolution s'ajuste au temps
-/// GPU mesuré (plus de triangles quand la carte a de la marge, moins quand elle sature).
-pub const DETAIL_AUTO: i32 = -1;
-/// Bornes et cible du mode automatique.
-const AUTO_MIN: i32 = 8;
-const AUTO_MAX: i32 = 48;
-/// Temps GPU de la scène visé par image (ms). L'anticrénelage et l'affichage (~1 ms, fixes)
-/// ne comptent pas : ils ne dépendent pas du nombre de chunks.
-const AUTO_TARGET_MS: f32 = 1.5;
-/// Attente après un changement (s) : le chargement qu'il déclenche fausse la mesure.
-const AUTO_SETTLE_S: f32 = 8.0;
-
-/// Pleine résolution jusqu'à `detail` chunks (0 : jusqu'à la distance de rendu), bornée par
-/// la mémoire vive (`ram_limit`, seuls les chunks détaillés en consomment), puis terrain
-/// simplifié (LOD) jusqu'à la distance de rendu, ou plus loin si le rendu lointain va
-/// au-delà. Sans rendu lointain ni rayon de détail plus court : tout en pleine résolution.
-fn lod_settings(
-    view_distance: i32,
-    ram_limit: i32,
-    lod_distance: f32,
-    lod_enabled: bool,
-    detail: i32,
-) -> LodSettings {
-    let wanted = if detail > 0 { detail } else { view_distance };
-    let detail_chunks = view_distance.min(wanted).min(ram_limit);
-    let view = (view_distance * CHUNK_SIZE as i32) as f32;
-    let detail = (detail_chunks * CHUNK_SIZE as i32) as f32;
-    let max_distance = if lod_enabled {
-        lod_distance.max(view)
-    } else if detail < view {
-        view
-    } else {
-        0.0
-    };
-    LodSettings {
-        detail,
-        max_distance,
-    }
 }
 
 impl Session {
@@ -216,41 +173,21 @@ impl Session {
         }
         let spawn = player.pos;
         let night = data.night || std::env::var("MINELIB_NIGHT").is_ok_and(|v| v.trim() == "1");
-        let lod_enabled = cfg.lod_distance > 0.0;
-        let auto_detail = 24;
-        let first = lod_settings(
-            cfg.view_distance,
-            ram_view_limit(),
-            cfg.lod_distance,
-            lod_enabled,
-            if cfg.full_detail == DETAIL_AUTO {
-                auto_detail
-            } else {
-                cfg.full_detail
-            },
-        );
-        if first.enabled() {
-            log::info!(
-                "pleine résolution jusqu'à {:.0} chunks, terrain simplifié (LOD) jusqu'à {:.0} chunks",
-                first.detail / CHUNK_SIZE as f32,
-                first.max_distance / CHUNK_SIZE as f32
-            );
-        }
+        let radius = cfg
+            .view_distance
+            .clamp(2, MAX_VIEW_DISTANCE)
+            .min(ram_view_limit());
         log::info!("monde « {} » (graine {})", data.meta.name, data.meta.seed);
         Ok(Self {
             dir,
-            workers: Workers::new(data.meta.seed, world.surface_map(), world.generator),
-            streamer: Streamer::new(first),
+            workers: Workers::new(data.meta.seed, world.generator),
+            streamer: Streamer::new(radius),
             meta: data.meta,
             world,
             player,
-            view_distance: cfg.view_distance,
-            lod_distance: cfg.lod_distance.max(0.0),
-            lod_enabled,
-            full_detail: cfg.full_detail,
-            auto_detail,
-            auto_timer: 3.0 - AUTO_SETTLE_S,
+            view_distance: cfg.view_distance.clamp(2, MAX_VIEW_DISTANCE),
             dirty: HashSet::new(),
+            we: crate::worldedit::WorldEdit::default(),
             inventory: data.inventory.unwrap_or_else(Inventory::starter),
             night,
             daylight: if night { 0.0 } else { 1.0 },
@@ -258,6 +195,7 @@ impl Session {
             place_cooldown: 0.0,
             fov: FOV,
             sensitivity: minelib_assets::DEFAULT_SENSITIVITY,
+            volume: 0.6,
             keys: Bindings::default(),
             autosave: AUTOSAVE_S,
             hit: None,
@@ -270,6 +208,8 @@ impl Session {
             hurt: 0.0,
             fps: crate::fps::Fps::new(),
             pings: Vec::new(),
+            fps_walk_on: false,
+            fps_duck_on: false,
             hand: Hand::default(),
             hand_light: [1.0; 3],
             vox_origin: None,
@@ -306,133 +246,53 @@ impl Session {
     /// Nouveaux réglages graphiques (écran Paramètres), appliqués tout de suite.
     pub fn apply_config(&mut self, cfg: SessionConfig) {
         self.view_distance = cfg.view_distance.clamp(2, MAX_VIEW_DISTANCE);
-        self.full_detail = cfg.full_detail;
-        self.lod_enabled = cfg.lod_distance > 0.0;
-        if self.lod_enabled {
-            self.lod_distance = cfg.lod_distance;
-        }
         self.settings_changed();
     }
 
     pub fn config(&self) -> SessionConfig {
         SessionConfig {
             view_distance: self.view_distance,
-            lod_distance: if self.lod_enabled {
-                self.lod_distance
-            } else {
-                0.0
-            },
-            full_detail: self.full_detail,
-        }
-    }
-
-    /// Rayon en pleine résolution actuel (mode auto compris).
-    pub fn detail_radius(&self) -> i32 {
-        (self.streamer.settings.detail / CHUNK_SIZE as f32) as i32
-    }
-
-    /// Mode « Détail complet : auto » : toutes les 3 s, compare le temps GPU moyen à la cible
-    /// et ajuste le rayon en pleine résolution (pas de 4 chunks, entre 8 et 48). Le nombre
-    /// de triangles suit à peu près le carré du rayon.
-    fn auto_detail_tick(&mut self, dt: f32) {
-        if self.full_detail != DETAIL_AUTO {
-            return;
-        }
-        self.auto_timer += dt;
-        if self.auto_timer < 3.0 {
-            return;
-        }
-        self.auto_timer = 0.0;
-        let Some(gpu) = minelib_render::perf::gpu_scene_recent() else {
-            return;
-        };
-        let cap = AUTO_MAX.min(self.view_distance);
-        // Pendant un chargement, les envois au GPU gonflent la mesure : on ne réduit alors
-        // que si la carte est vraiment saturée (2 × la cible), et on n'élargit jamais.
-        let loading = !self.streamer.idle();
-        let too_slow = if loading {
-            AUTO_TARGET_MS * 2.0
-        } else {
-            AUTO_TARGET_MS * 1.2
-        };
-        let next = if gpu > too_slow && self.auto_detail > AUTO_MIN {
-            (self.auto_detail - 4).max(AUTO_MIN)
-        } else if gpu < AUTO_TARGET_MS * 0.6 && self.auto_detail < cap && !loading {
-            (self.auto_detail + 4).min(cap)
-        } else {
-            self.auto_detail
-        };
-        if next != self.auto_detail {
-            log::info!(
-                "détail complet auto : {} → {next} chunks (scène {gpu:.2} ms GPU par image, cible {AUTO_TARGET_MS} ms)",
-                self.auto_detail
-            );
-            self.auto_detail = next;
-            self.auto_timer = 3.0 - AUTO_SETTLE_S;
-            self.settings_changed();
         }
     }
 
     fn settings_changed(&mut self) {
         // Garde-fou : jamais plus de chunks que la mémoire vive ne peut en contenir.
         let limit = ram_view_limit();
-        let detail = if self.full_detail == DETAIL_AUTO {
-            self.auto_detail
-        } else {
-            self.full_detail
-        };
-        let s = lod_settings(
-            self.view_distance,
-            limit,
-            self.lod_distance,
-            self.lod_enabled,
-            detail,
-        );
-        let detailed = (s.detail / CHUNK_SIZE as f32) as i32;
-        if detailed == limit
-            && limit
-                < self
-                    .view_distance
-                    .min(if detail > 0 { detail } else { i32::MAX })
-        {
-            log::warn!("pleine résolution limitée à {limit} chunks par la mémoire vive disponible");
+        let radius = self.view_distance.min(limit);
+        if radius < self.view_distance {
+            log::warn!("distance de rendu limitée à {limit} chunks par la mémoire vive disponible");
         }
         log::info!(
-            "distance de rendu : {} chunks ({} chunks détaillés environ)",
-            self.view_distance,
-            (2 * detailed + 1).pow(2)
+            "distance de rendu : {radius} chunks ({} chunks environ)",
+            (2 * radius + 1).pow(2)
         );
-        if s.enabled() {
-            log::info!(
-                "pleine résolution jusqu'à {:.0} chunks, terrain simplifié (LOD) jusqu'à {:.0} chunks",
-                s.detail / CHUNK_SIZE as f32,
-                s.max_distance / CHUNK_SIZE as f32
-            );
-        }
-        self.streamer.set_settings(s);
+        self.streamer.set_radius(radius);
     }
 
     fn fog_end(&self) -> f32 {
-        let s = &self.streamer.settings;
-        if s.enabled() {
-            s.max_distance
-        } else {
-            s.detail
-        }
+        (self.streamer.radius * CHUNK_SIZE as i32) as f32
     }
 
     /// Une image de jeu. `active` : faux quand le jeu est en pause (temps figé, pas d'entrées).
     pub fn update(&mut self, input: &Input, dt: f32, renderer: &mut Renderer, active: bool) {
         use minelib_render::perf;
         let logic = perf::scope("jeu : logique et physique");
-        self.auto_detail_tick(dt);
         crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
+        // Menu, pause ou souris libre : le clic qui fait reprendre ne tire pas.
+        if !active || !input.grabbed {
+            self.fps.block_fire();
+        }
         if active {
             // Tchat : saisie, puis ouverture par `t` ou `/` (jamais par-dessus l'inventaire).
             let was_open = self.chat.open;
             let mut sent = self.chat.update(input, dt);
             if !was_open && !self.inventory.open {
-                let by_chat = self.keys.pressed(input, Action::Chat);
+                let by_chat = if self.game.mode == GameMode::Fps {
+                    self.keys.pressed(input, Action::FpsChat)
+                        || self.keys.pressed(input, Action::FpsTeamChat)
+                } else {
+                    self.keys.pressed(input, Action::Chat)
+                };
                 let by_command = self.keys.pressed(input, Action::Command);
                 sent = sent.or_else(|| self.chat.try_open(input, by_chat, by_command));
             }
@@ -461,7 +321,7 @@ impl Session {
                         input.scroll,
                     );
                 }
-            } else if !typing {
+            } else if !typing && self.game.mode != GameMode::Fps {
                 self.handle_keys(input);
                 self.handle_hotbar(input);
             }
@@ -471,9 +331,13 @@ impl Session {
             self.daylight += (target_day - self.daylight) * (dt * 1.5).min(1.0);
 
             let k = &self.keys;
-            let zooming = !typing && k.held(input, Action::Zoom) && !self.inventory.open;
-            let sprinting =
-                !typing && k.held(input, Action::Sprint) && self.player.vel.length() > 5.0;
+            let fps_mode = self.game.mode == GameMode::Fps;
+            let zooming =
+                !fps_mode && !typing && k.held(input, Action::Zoom) && !self.inventory.open;
+            let sprinting = !fps_mode
+                && !typing
+                && k.held(input, Action::Sprint)
+                && self.player.vel.length() > 5.0;
             let target_fov = if zooming {
                 ZOOM_FOV
             } else if sprinting {
@@ -485,21 +349,61 @@ impl Session {
 
             if input.grabbed {
                 let (dx, dy) = input.mouse_delta;
-                let k = (CS_DEGREES_PER_COUNT * self.sensitivity).to_radians() * (self.fov / FOV);
+                // Lunette : sensibilité réduite comme le champ de vision (CS :
+                // zoom_sensitivity_ratio 1).
+                let fov = if fps_mode {
+                    self.fps.scope_fov().unwrap_or(self.fov)
+                } else {
+                    self.fov
+                };
+                let k = (CS_DEGREES_PER_COUNT * self.sensitivity).to_radians() * (fov / FOV);
                 self.player.rotate(dx as f32 * k, dy as f32 * k);
+            }
+            // Mode FPS : touches de l'onglet FPS ; marcher et s'accroupir peuvent basculer.
+            if fps_mode && !typing && !self.inventory.open {
+                if self.keys.walk_toggle {
+                    if self.keys.pressed(input, Action::FpsWalk) {
+                        self.fps_walk_on = !self.fps_walk_on;
+                    }
+                } else {
+                    self.fps_walk_on = self.keys.held(input, Action::FpsWalk);
+                }
+                if self.keys.duck_toggle {
+                    if self.keys.pressed(input, Action::FpsDuck) {
+                        self.fps_duck_on = !self.fps_duck_on;
+                    }
+                } else {
+                    self.fps_duck_on = self.keys.held(input, Action::FpsDuck);
+                }
             }
             let keys = &self.keys;
             let axis = |pos: Action, neg: Action| {
                 keys.held(input, pos) as i32 as f32 - keys.held(input, neg) as i32 as f32
             };
-            let mut m = MoveInput {
-                forward: axis(Action::Forward, Action::Back),
-                strafe: axis(Action::Right, Action::Left),
-                up: axis(Action::Jump, Action::Sneak),
-                jump: keys.held(input, Action::Jump),
-                sprint: keys.held(input, Action::Sprint),
-                sneak: keys.held(input, Action::Sneak),
-                fps: self.game.mode == GameMode::Fps,
+            let mut m = if fps_mode {
+                MoveInput {
+                    forward: axis(Action::FpsForward, Action::FpsBack),
+                    strafe: axis(Action::FpsRight, Action::FpsLeft),
+                    up: 0.0,
+                    jump: keys.held(input, Action::FpsJump),
+                    // Comme dans CS : on court par défaut, « Marcher » ralentit.
+                    sprint: !self.fps_walk_on,
+                    sneak: self.fps_duck_on,
+                    // La molette change d'arme (comme dans CS) ; on saute avec la touche.
+                    jump_pressed: keys.pressed(input, Action::FpsJump),
+                    fps: true,
+                }
+            } else {
+                MoveInput {
+                    forward: axis(Action::Forward, Action::Back),
+                    strafe: axis(Action::Right, Action::Left),
+                    up: axis(Action::Jump, Action::Sneak),
+                    jump: keys.held(input, Action::Jump),
+                    sprint: keys.held(input, Action::Sprint),
+                    sneak: keys.held(input, Action::Sneak),
+                    jump_pressed: keys.pressed(input, Action::Jump),
+                    fps: false,
+                }
             };
             if self.inventory.open || typing {
                 m = MoveInput::default();
@@ -530,6 +434,7 @@ impl Session {
                 0.0
             };
             let swung = input.grabbed
+                && !fps_mode
                 && !typing
                 && !self.inventory.open
                 && (self.keys.pressed(input, Action::Attack)
@@ -618,13 +523,6 @@ impl Session {
                 self.since_space = 0.0;
             }
         }
-        if self.keys.pressed(input, Action::Lod) {
-            self.lod_enabled = !self.lod_enabled;
-            if self.lod_distance <= 0.0 {
-                self.lod_distance = 4096.0;
-            }
-            self.settings_changed();
-        }
         let mut dv = 0;
         if input.pressed(KeyCode::PageUp) {
             dv += 2;
@@ -656,7 +554,8 @@ impl Session {
                 self.inventory.select(i);
             }
         }
-        if !self.inventory.open && input.scroll.abs() >= 1.0 {
+        // En mode FPS la molette sert à sauter.
+        if !self.inventory.open && input.scroll.abs() >= 1.0 && self.game.mode != GameMode::Fps {
             self.inventory.scroll(-input.scroll.signum() as i32);
         }
     }
@@ -668,7 +567,11 @@ impl Session {
             return;
         }
         let keys = &self.keys;
-        let pick = keys.pressed(input, Action::Pick);
+        let pick = if self.game.mode == GameMode::Fps {
+            keys.pressed(input, Action::FpsPing)
+        } else {
+            keys.pressed(input, Action::Pick)
+        };
         // Spectateur : on regarde seulement.
         if self.game.mode == GameMode::Spectator {
             return;
@@ -697,7 +600,30 @@ impl Session {
             self.player.look_dir().into(),
             REACH,
         );
+        // Baguette : clic molette (touche « Copier le bloc ») efface la sélection, même
+        // sans bloc visé.
+        if self.inventory.selected_item() == Some(Item::Wand) && pick {
+            if self.we.pos1.is_some() || self.we.pos2.is_some() {
+                self.we.pos1 = None;
+                self.we.pos2 = None;
+                self.chat.say("Sélection effacée", chat::LIGHT_PURPLE);
+            }
+            return;
+        }
         let Some(hit) = hit else { return };
+
+        // Baguette de sélection : clic gauche coin 1, clic droit coin 2 (rien n'est cassé
+        // ni posé).
+        if self.inventory.selected_item() == Some(Item::Wand) {
+            if keys.pressed(input, Action::Attack) {
+                self.we.pos1 = Some(hit.block);
+                self.say_selection(1, hit.block);
+            } else if keys.pressed(input, Action::Use) {
+                self.we.pos2 = Some(hit.block);
+                self.say_selection(2, hit.block);
+            }
+            return;
+        }
 
         if breaking && hit.id.is_breakable() {
             let [x, y, z] = hit.block;
@@ -908,7 +834,8 @@ impl Session {
             let height = from - p.pos.y;
             if self.game.mode == GameMode::Fps {
                 // Mode FPS : 100 points de vie, dégâts selon la vitesse d'impact.
-                let dmg = crate::fps::Fps::fall_damage(height, SAFE_FALL);
+                // Un bloc de plus qu'en survie avant les premiers dégâts.
+                let dmg = crate::fps::Fps::fall_damage(height, SAFE_FALL + 1.0);
                 if !p.flying && dmg > 0 {
                     self.fps.hp = self.fps.hp.saturating_sub(dmg);
                     self.hurt = 0.35;
@@ -956,7 +883,7 @@ impl Session {
     fn update_fps(&mut self, input: &Input, dt: f32, renderer: &Renderer, typing: bool) {
         let (w, h) = renderer.size();
         let size = (w as f32, h as f32);
-        if !typing && self.keys.pressed(input, Action::Buy) {
+        if !typing && self.keys.pressed(input, Action::FpsBuy) {
             self.fps.buy_open = !self.fps.buy_open;
         } else {
             self.fps.buy_input(input, size);
@@ -964,19 +891,54 @@ impl Session {
         let free = input.grabbed && !typing && !self.fps.buy_open;
         let k = &self.keys;
         let c = crate::fps::Controls {
-            trigger_pressed: free && k.pressed(input, Action::Attack),
-            trigger_held: free && k.held(input, Action::Attack),
-            reload: free && k.pressed(input, Action::Reload),
-            scope: free && k.pressed(input, Action::Use),
+            trigger_pressed: free && k.pressed(input, Action::FpsFire),
+            trigger_held: free && k.held(input, Action::FpsFire),
+            trigger_down: k.held(input, Action::FpsFire),
+            reload: free && k.pressed(input, Action::FpsReload),
+            scope: free && k.pressed(input, Action::FpsScope),
             slot: if !free {
                 None
-            } else if input.pressed(KeyCode::Digit1) {
+            } else if k.pressed(input, Action::FpsPrimary) {
                 Some(0)
-            } else if input.pressed(KeyCode::Digit2) {
+            } else if k.pressed(input, Action::FpsSecondary) {
                 Some(1)
+            } else if k.pressed(input, Action::FpsKnife) {
+                Some(2)
+            } else if k.pressed(input, Action::FpsGrenade) {
+                Some(3)
             } else {
                 None
             },
+            last_weapon: free && k.pressed(input, Action::FpsLastWeapon),
+            next_weapon: free && k.pressed(input, Action::FpsNextWeapon),
+            // Molette (comme dans CS) : vers le bas arme suivante, vers le haut précédente.
+            wheel: if !free {
+                0
+            } else if k.pressed(input, Action::FpsPrevWeapon) || input.scroll >= 1.0 {
+                -1
+            } else if input.scroll <= -1.0 {
+                1
+            } else {
+                0
+            },
+            nade_key: if !free {
+                None
+            } else {
+                [
+                    (Action::FpsHe, crate::equip::Nade::He),
+                    (Action::FpsFlash, crate::equip::Nade::Flash),
+                    (Action::FpsSmoke, crate::equip::Nade::Smoke),
+                    (Action::FpsDecoy, crate::equip::Nade::Decoy),
+                    (Action::FpsMolotov, crate::equip::Nade::Molotov),
+                ]
+                .into_iter()
+                .find(|(a, _)| k.pressed(input, *a))
+                .map(|(_, n)| n)
+            },
+            vel: self.player.vel,
+            drop: free && k.pressed(input, Action::FpsDrop),
+            rebuy: !typing
+                && (k.pressed(input, Action::FpsRebuy) || k.pressed(input, Action::FpsAutoBuy)),
             speed: Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length(),
             on_ground: self.player.on_ground || self.player.flying,
         };
@@ -984,6 +946,72 @@ impl Session {
         self.fps
             .update(dt, &c, &self.world, eye, self.player.yaw, self.player.pitch);
         self.fps.tick_effects(dt);
+        for (sfx, delay, gain) in self.fps.sounds.drain(..) {
+            crate::audio::play(sfx, delay, self.volume * gain);
+        }
+        // Explosion, feu : mort à 0 point de vie.
+        if self.fps.hp == 0 {
+            self.die();
+        }
+    }
+
+    /// Coin de sélection posé avec la baguette.
+    fn say_selection(&mut self, n: u8, p: [i32; 3]) {
+        let size = self
+            .we
+            .region()
+            .map(|(a, b)| {
+                format!(
+                    " ({} blocs)",
+                    (b[0] - a[0] + 1) as i64 * (b[1] - a[1] + 1) as i64 * (b[2] - a[2] + 1) as i64
+                )
+            })
+            .unwrap_or_default();
+        self.chat.say(
+            format!("Coin {n} : {} {} {}{size}", p[0], p[1], p[2]),
+            chat::LIGHT_PURPLE,
+        );
+    }
+
+    /// Commande WorldEdit (`//set stone`…).
+    fn worldedit(&mut self, line: &str) {
+        if self.game.mode != GameMode::Creative {
+            self.chat.say(
+                "Les commandes // sont réservées au mode créatif.",
+                chat::RED,
+            );
+            return;
+        }
+        let mut parts = line.split_whitespace();
+        let name = parts.next().unwrap_or("").to_lowercase();
+        let args: Vec<&str> = parts.collect();
+        if name == "wand" {
+            // Baguette dans la main (emplacement actuel de la barre).
+            let i = self.inventory.selected;
+            self.inventory.slots[i] = Some(inventory::Stack {
+                item: Item::Wand,
+                count: 1,
+            });
+            self.chat.say(
+                "Baguette : clic gauche coin 1, clic droit coin 2, clic molette efface.",
+                chat::LIGHT_PURPLE,
+            );
+            return;
+        }
+        let look = self.player.look_dir();
+        let feet = self.player.pos.floor().as_ivec3().to_array();
+        let target = self.hit.map(|h| h.block);
+        let mut ctx = crate::worldedit::Ctx {
+            world: &mut self.world,
+            feet,
+            look: look.to_array(),
+            target,
+            dirty: &mut self.dirty,
+        };
+        match self.we.command(&name, &args, &mut ctx) {
+            Ok(msg) => self.chat.say(msg, chat::LIGHT_PURPLE),
+            Err(e) => self.chat.say(e, chat::RED),
+        }
     }
 
     /// Vue du joueur avec le recul du mode FPS (la vue remonte pendant une rafale).
@@ -1003,6 +1031,11 @@ impl Session {
             self.chat.say(format!("<Joueur> {text}"), chat::WHITE);
             return;
         };
+        // `//…` : commandes WorldEdit (mode créatif).
+        if let Some(we) = cmd.strip_prefix('/') {
+            self.worldedit(we);
+            return;
+        }
         let mut parts = cmd.split_whitespace();
         let name = parts.next().unwrap_or("").to_lowercase();
         let arg = parts.next();
@@ -1128,24 +1161,28 @@ impl Session {
     }
 
     /// Barre d'objets / inventaire (et réticule du pack).
-    pub fn draw_hud(&self, ui: &mut Ui, size: (f32, f32), input: &Input) {
+    pub fn draw_hud(&self, ui: &mut Ui, size: (f32, f32), input: &Input, debug: bool) {
         let s = (size.1 / 360.0).floor().max(1.0);
         if self.hurt > 0.0 {
             ui.rect(0.0, 0.0, size.0, size.1, [0.7, 0.0, 0.0, self.hurt * 0.6]);
         }
         if !self.inventory.open {
             let c = 15.0 * s;
-            ui.image(
-                "gui/crosshair",
-                (size.0 - c) / 2.0,
-                (size.1 - c) / 2.0,
-                c,
-                c,
-                [1.0, 1.0, 1.0, 0.9],
-            );
+            // Mode FPS : viseur façon CS dessiné par le HUD FPS.
+            if self.game.mode != GameMode::Fps {
+                ui.image(
+                    "gui/crosshair",
+                    (size.0 - c) / 2.0,
+                    (size.1 - c) / 2.0,
+                    c,
+                    c,
+                    [1.0, 1.0, 1.0, 0.9],
+                );
+            }
             // Mode FPS : vie sur 100, munitions, solde, menu d'achat.
             if self.game.mode == GameMode::Fps {
-                self.fps.hud(ui, size, input.cursor);
+                self.fps.screen_fx(ui, size, self.player.eye());
+                self.fps.hud(ui, size, input.cursor, debug);
             }
             // Cœurs (survie) : au-dessus de la barre d'objets, à gauche, images du pack.
             if self.game.mode == GameMode::Survival {
@@ -1272,12 +1309,12 @@ impl Session {
                     _ => "flamme normale : durée infinie".into(),
                 })
             }),
+            fps: self.game.mode == GameMode::Fps,
             torches: self.world.torch_count(),
             sys,
             renderer,
             engine: debug::EngineInfo {
                 view_distance: self.view_distance,
-                lod: self.streamer.settings,
                 stream: self.streamer.stats,
                 workers: self.workers.count(),
                 fps_max,
@@ -1310,16 +1347,28 @@ impl Session {
                 Mat4::perspective_infinite_reverse_rh(fov.to_radians(), renderer.aspect(), 0.05);
             v.extend(
                 self.fps
-                    .world_fx(proj * view, self.player.eye(), &self.world),
+                    .world_fx(proj * view, self.player.eye(), &self.world, self.daylight),
             );
             v
         } else {
-            self.hand.build(
+            let mut v = self.hand.build(
                 self.held_item(),
                 renderer.aspect(),
                 self.hand_light,
                 self.game.mode != GameMode::Spectator,
-            )
+            );
+            // Sélection WorldEdit : arêtes de la zone et coins (en créatif, baguette en main).
+            if self.game.mode == GameMode::Creative
+                && self.inventory.selected_item() == Some(Item::Wand)
+            {
+                let proj = Mat4::perspective_infinite_reverse_rh(
+                    fov.to_radians(),
+                    renderer.aspect(),
+                    0.05,
+                );
+                v.extend(selection_lines(&self.we, proj * view, self.player.eye()));
+            }
+            v
         };
         let params = FrameParams {
             viewmodel: &hand,
@@ -1732,25 +1781,89 @@ fn build_voxel_grid(
     (ids, planes)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detail_radius_and_far_terrain() {
-        let c = CHUNK_SIZE as f32;
-        // 64 chunks voulus, détail 24 : pleine résolution 24, simplifié jusqu'au rendu lointain.
-        let s = lod_settings(64, 200, 4096.0, true, 24);
-        assert_eq!((s.detail, s.max_distance), (24.0 * c, 4096.0));
-        // Mémoire vive limitée à 16 chunks détaillés : la distance reste 64 en simplifié.
-        let s = lod_settings(64, 16, 0.0, false, 0);
-        assert_eq!((s.detail, s.max_distance), (16.0 * c, 64.0 * c));
-        // Rendu lointain désactivé et détail partout : tout en pleine résolution.
-        let s = lod_settings(10, 200, 0.0, false, 0);
-        assert!(!s.enabled());
-        assert_eq!(s.detail, 10.0 * c);
-        // Détail plus grand que la distance de rendu : borné par elle.
-        let s = lod_settings(10, 200, 0.0, false, 24);
-        assert!(!s.enabled());
+/// Arêtes de la sélection WorldEdit (bleu), coin 1 (rouge) et coin 2 (bleu clair) : traits
+/// fins dessinés avec la main (toujours visibles, comme l'affichage de WorldEdit).
+fn selection_lines(
+    we: &crate::worldedit::WorldEdit,
+    vp: Mat4,
+    eye: Vec3,
+) -> Vec<minelib_render::VmVertex> {
+    let mut out = Vec::new();
+    // Profondeur devant la caméra (w du clip, linéaire le long d'un segment).
+    let depth = |p: Vec3| (vp * p.extend(1.0)).w;
+    const NEAR: f32 = 0.06;
+    let mut line = |a: Vec3, b: Vec3, c: [f32; 4]| {
+        // Arête découpée en morceaux (épaisseur adaptée à la distance de chacun), et chaque
+        // morceau coupé au ras de la caméra : quand on est dans la sélection, les arêtes
+        // qui passent derrière nous restent visibles devant.
+        let pieces = ((b - a).length() / 1.5).ceil().max(1.0) as usize;
+        for k in 0..pieces {
+            let mut p0 = a.lerp(b, k as f32 / pieces as f32);
+            let mut p1 = a.lerp(b, (k + 1) as f32 / pieces as f32);
+            let (w0, w1) = (depth(p0), depth(p1));
+            if w0 < NEAR && w1 < NEAR {
+                continue;
+            }
+            if w0 < NEAR {
+                p0 = p0.lerp(p1, (NEAR - w0) / (w1 - w0));
+            } else if w1 < NEAR {
+                p1 = p1.lerp(p0, (NEAR - w1) / (w0 - w1));
+            }
+            let mid = (p0 + p1) * 0.5;
+            let w = (p1 - p0).cross(mid - eye).normalize_or_zero()
+                * (0.012 * (mid - eye).length().max(1.0)).min(0.08);
+            for p in [p0 - w, p1 - w, p1 + w, p1 + w, p0 + w, p0 - w] {
+                let q = vp * p.extend(1.0);
+                out.push(minelib_render::VmVertex {
+                    clip: [q.x, q.y, q.z, q.w.max(1e-3)],
+                    uv: [0.0, 0.0],
+                    layer: minelib_render::NO_TEXTURE,
+                    _pad: 0,
+                    color: c,
+                });
+            }
+        }
+    };
+    let cube = |lo: Vec3, hi: Vec3, c: [f32; 4], line: &mut dyn FnMut(Vec3, Vec3, [f32; 4])| {
+        let v = |x: bool, y: bool, z: bool| {
+            Vec3::new(
+                if x { hi.x } else { lo.x },
+                if y { hi.y } else { lo.y },
+                if z { hi.z } else { lo.z },
+            )
+        };
+        for a in [false, true] {
+            for b in [false, true] {
+                line(v(false, a, b), v(true, a, b), c);
+                line(v(a, false, b), v(a, true, b), c);
+                line(v(a, b, false), v(a, b, true), c);
+            }
+        }
+    };
+    let f = |p: [i32; 3]| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
+    if let Some((a, b)) = we.region() {
+        cube(
+            f(a) - Vec3::splat(0.01),
+            f(b) + Vec3::splat(1.01),
+            [0.1, 0.45, 1.6, 1.0],
+            &mut line,
+        );
     }
+    if let Some(p) = we.pos1 {
+        cube(
+            f(p) - Vec3::splat(0.02),
+            f(p) + Vec3::splat(1.02),
+            [1.6, 0.15, 0.1, 1.0],
+            &mut line,
+        );
+    }
+    if let Some(p) = we.pos2 {
+        cube(
+            f(p) - Vec3::splat(0.02),
+            f(p) + Vec3::splat(1.02),
+            [0.3, 0.8, 1.8, 1.0],
+            &mut line,
+        );
+    }
+    out
 }

@@ -17,9 +17,55 @@ const SPRINT: f32 = 6.6;
 const SNEAK: f32 = 1.3;
 /// Les yeux descendent de 30 cm accroupi.
 const CROUCH_DROP: f32 = 0.3;
-/// Mode FPS : marche réduite de 50 %, sprint de 25 %.
-pub const FPS_WALK: f32 = WALK * 0.5;
+/// Mode FPS : marche (touche « Marcher ») à 62,5 % de la marche du mode Build (réduite de
+/// 50 % puis augmentée de 25 %), course à 75 % du sprint.
+pub const FPS_WALK: f32 = WALK * 0.5 * 1.25;
 pub const FPS_SPRINT: f32 = SPRINT * 0.75;
+
+/// Déplacements du mode FPS, façon Counter-Strike (moteur Source). Les valeurs sont les
+/// réglages publics par défaut de CS:GO (`sv_accelerate`, `sv_friction`…) exprimés en
+/// unités du moteur (1 unité = 1 pouce = 2,54 cm) puis converties en blocs (1 bloc = 1 m).
+/// Les formules (friction, accélération au sol et en l'air) sont celles documentées par
+/// la communauté (physique Quake/Source) ; le code est le nôtre.
+pub mod cs {
+    /// Blocs par unité Source.
+    pub const UNIT: f32 = 0.0254;
+    /// `sv_gravity` 800 u/s².
+    pub const GRAVITY: f32 = 800.0 * UNIT;
+    /// `sv_jump_impulse` 301,993 u/s : saut de 57 unités (1,45 bloc).
+    pub const JUMP_IMPULSE: f32 = 301.993 * UNIT;
+    /// `sv_accelerate` 5,5 et `sv_airaccelerate` 12.
+    pub const ACCELERATE: f32 = 5.5;
+    pub const AIR_ACCELERATE: f32 = 12.0;
+    /// `sv_friction` 5,2 et `sv_stopspeed` 80 u/s. Nos vitesses de course étant plus
+    /// basses que les 250 u/s de CS, `sv_stopspeed` garde la même proportion (32 % de la
+    /// course) : sinon la friction l'emporterait sur l'accélération accroupi et on
+    /// n'avancerait plus.
+    pub const FRICTION: f32 = 5.2;
+    pub const STOP_SPEED: f32 = super::FPS_SPRINT * 80.0 / 250.0;
+    /// En l'air, la vitesse voulue est plafonnée à 30 u/s : c'est ce qui permet de
+    /// gagner de la vitesse en tournant la souris du côté où l'on se décale (air strafe,
+    /// bunny hop).
+    pub const AIR_WISH_CAP: f32 = 30.0 * UNIT;
+    /// Accroupi : 34 % de la vitesse de course.
+    pub const DUCK_MULT: f32 = 0.34;
+    /// Fatigue (`sv_staminamax` 80, `sv_staminajumpcost` 0,08, `sv_staminalandcost`
+    /// 0,05, `sv_staminarecoveryrate` 60/s). Coûts proportionnels à la vitesse verticale
+    /// en u/s ; la fatigue réduit le saut et ralentit au sol de `fatigue` %.
+    pub const STAMINA_MAX: f32 = 80.0;
+    pub const STAMINA_JUMP_COST: f32 = 0.08;
+    pub const STAMINA_LAND_COST: f32 = 0.05;
+    pub const STAMINA_RECOVERY: f32 = 60.0;
+    /// Vitesse d'accroupissement : 8 au repos, −2 à chaque nouvel appui (accroupis
+    /// répétés), reprise de 3 par seconde ; plus elle est basse, plus on s'accroupit
+    /// lentement.
+    pub const DUCK_SPEED_MAX: f32 = 8.0;
+    pub const DUCK_SPEED_COST: f32 = 2.0;
+    pub const DUCK_SPEED_MIN: f32 = 1.5;
+    pub const DUCK_SPEED_RECOVERY: f32 = 3.0;
+    /// Pas de temps du serveur de CS (64 ticks/s) : la fatigue au sol s'applique par tick.
+    pub const TICK: f32 = 1.0 / 64.0;
+}
 const FLY: f32 = 12.0;
 const FLY_SPRINT: f32 = 30.0;
 /// Tolérance de contact (erreurs d'arrondi) : en deçà, deux faces se touchent sans se
@@ -40,6 +86,13 @@ pub struct Player {
     pub crouch: f32,
     /// Spectateur : traverse les blocs.
     pub noclip: bool,
+    /// Mode FPS : fatigue des jambes (0..80, voir [`cs`]).
+    pub stamina: f32,
+    /// Mode FPS : vitesse d'accroupissement (8 = reposé).
+    pub duck_speed: f32,
+    /// Mode FPS : appui sur saut encore valable (s) ; il faut réappuyer pour ressauter.
+    jump_buffer: f32,
+    sneak_was_held: bool,
 }
 
 /// Intention de déplacement pour une image (indépendante du clavier).
@@ -51,8 +104,10 @@ pub struct MoveInput {
     pub jump: bool,
     pub sprint: bool,
     pub sneak: bool,
-    /// Mode FPS : vitesses réduites et vitesse horizontale plafonnée (le saut
-    /// ne fait pas aller plus vite).
+    /// Saut appuyé à cette image (pas seulement maintenu) : le mode FPS demande un nouvel
+    /// appui pour chaque saut (espace ou molette, comme dans CS).
+    pub jump_pressed: bool,
+    /// Mode FPS : déplacements façon Counter-Strike (voir [`cs`]).
     pub fps: bool,
 }
 
@@ -67,6 +122,10 @@ impl Player {
             on_ground: false,
             crouch: 0.0,
             noclip: false,
+            stamina: 0.0,
+            duck_speed: cs::DUCK_SPEED_MAX,
+            jump_buffer: 0.0,
+            sneak_was_held: false,
         }
     }
 
@@ -117,25 +176,23 @@ impl Player {
         }
 
         let crouching = m.sneak && !self.flying;
+        let fps = m.fps && !self.flying && !self.noclip;
+        let duck_rate = if fps { self.duck_speed * 1.5 } else { 12.0 };
         let target = if crouching { 1.0 } else { 0.0 };
-        self.crouch += (target - self.crouch) * (dt * 12.0).min(1.0);
+        self.crouch += (target - self.crouch) * (dt * duck_rate).min(1.0);
 
         if self.flying {
             let speed = if m.sprint { FLY_SPRINT } else { FLY };
             let target = wish * speed + Vec3::Y * m.up * speed;
             // Accélération/freinage doux en vol.
             self.vel = self.vel.lerp(target, (dt * 10.0).min(1.0));
+        } else if fps {
+            self.cs_move(m, wish, dt);
         } else {
             let speed = if crouching {
                 SNEAK
             } else if m.sprint {
-                if m.fps {
-                    FPS_SPRINT
-                } else {
-                    SPRINT
-                }
-            } else if m.fps {
-                FPS_WALK
+                SPRINT
             } else {
                 WALK
             };
@@ -149,17 +206,9 @@ impl Player {
             if m.jump && self.on_ground {
                 self.vel.y = JUMP_SPEED;
             }
-            if m.fps {
-                // Plafond strict : ni le saut ni l'élan ne dépassent la vitesse permise.
-                let h = Vec3::new(self.vel.x, 0.0, self.vel.z);
-                let len = h.length();
-                if len > speed {
-                    let h = h * (speed / len);
-                    self.vel.x = h.x;
-                    self.vel.z = h.z;
-                }
-            }
         }
+        let fall_speed = -self.vel.y;
+        let crouching = crouching && !fps;
 
         let delta = self.vel * dt;
         if self.noclip {
@@ -188,6 +237,127 @@ impl Player {
                 }
             }
         }
+        // Atterrissage en mode FPS : les jambes encaissent selon la vitesse de chute.
+        if fps && self.on_ground && !was_on_ground && fall_speed > 0.0 {
+            self.stamina =
+                (self.stamina + cs::STAMINA_LAND_COST * fall_speed / cs::UNIT).min(cs::STAMINA_MAX);
+        }
+    }
+
+    /// Vitesse horizontale (blocs/s).
+    pub fn ground_speed(&self) -> f32 {
+        Vec3::new(self.vel.x, 0.0, self.vel.z).length()
+    }
+
+    /// Une image de déplacement façon Counter-Strike : saut (nouvel appui exigé),
+    /// friction au sol sauf l'image du saut (bunny hop), accélération au sol, contrôle
+    /// en l'air avec la vitesse voulue plafonnée (air strafe), fatigue des jambes.
+    fn cs_move(&mut self, m: &MoveInput, wish: Vec3, dt: f32) {
+        // Fatigue : récupération ; accroupis répétés.
+        self.stamina = (self.stamina - cs::STAMINA_RECOVERY * dt).max(0.0);
+        if m.sneak && !self.sneak_was_held {
+            self.duck_speed = (self.duck_speed - cs::DUCK_SPEED_COST).max(cs::DUCK_SPEED_MIN);
+        }
+        self.sneak_was_held = m.sneak;
+        self.duck_speed = (self.duck_speed + cs::DUCK_SPEED_RECOVERY * dt).min(cs::DUCK_SPEED_MAX);
+        // Un appui sur saut reste valable un tick de CS (1/64 s) : sauter à l'atterrissage.
+        if m.jump_pressed {
+            self.jump_buffer = cs::TICK;
+        } else {
+            self.jump_buffer = (self.jump_buffer - dt).max(0.0);
+        }
+
+        // Accroupi : vitesse d'accroupi tout de suite (dès l'appui, sans attendre que
+        // le corps soit descendu).
+        let max_speed = if m.sneak {
+            FPS_SPRINT * cs::DUCK_MULT
+        } else if m.sprint {
+            FPS_SPRINT
+        } else {
+            FPS_WALK
+        };
+        let wish_len = wish.length();
+        let wish_dir = if wish_len > 1e-4 {
+            wish / wish_len
+        } else {
+            Vec3::ZERO
+        };
+        let wish_speed = max_speed * wish_len.min(1.0);
+        let rested = 1.0 - self.stamina / 100.0;
+
+        if self.on_ground {
+            if self.jump_buffer > 0.0 {
+                // Saut : pas de friction à cette image (c'est ce qui permet le bunny hop).
+                self.jump_buffer = 0.0;
+                self.vel.y = cs::JUMP_IMPULSE * rested;
+                self.stamina = (self.stamina + cs::STAMINA_JUMP_COST * cs::JUMP_IMPULSE / cs::UNIT)
+                    .min(cs::STAMINA_MAX);
+                self.on_ground = false;
+                self.accelerate(
+                    wish_dir,
+                    wish_speed,
+                    cs::AIR_ACCELERATE,
+                    Some(cs::AIR_WISH_CAP),
+                    dt,
+                );
+            } else {
+                self.friction(dt);
+                // Accroupi au sol : ralenti net à la vitesse d'accroupi.
+                let speed = self.ground_speed();
+                if m.sneak && speed > max_speed {
+                    let k = max_speed / speed;
+                    self.vel.x *= k;
+                    self.vel.z *= k;
+                }
+                // Jambes fatiguées : ralenti au sol, tick après tick.
+                if self.stamina > 0.0 {
+                    let k = rested.powf(dt / cs::TICK);
+                    self.vel.x *= k;
+                    self.vel.z *= k;
+                }
+                self.accelerate(wish_dir, wish_speed * rested, cs::ACCELERATE, None, dt);
+            }
+        } else {
+            self.accelerate(
+                wish_dir,
+                wish_speed,
+                cs::AIR_ACCELERATE,
+                Some(cs::AIR_WISH_CAP),
+                dt,
+            );
+        }
+        self.vel.y = (self.vel.y - cs::GRAVITY * dt).max(-3500.0 * cs::UNIT);
+    }
+
+    /// Friction au sol : au moins `sv_stopspeed` est retiré, pour s'arrêter net.
+    fn friction(&mut self, dt: f32) {
+        let speed = self.ground_speed();
+        if speed < 0.1 * cs::UNIT {
+            self.vel.x = 0.0;
+            self.vel.z = 0.0;
+            return;
+        }
+        let drop = speed.max(cs::STOP_SPEED) * cs::FRICTION * dt;
+        let k = (speed - drop).max(0.0) / speed;
+        self.vel.x *= k;
+        self.vel.z *= k;
+    }
+
+    /// Accélération vers `dir` : seul ce qui manque pour atteindre la vitesse voulue
+    /// (plafonnée à `cap` en l'air) dans cette direction est ajouté.
+    fn accelerate(&mut self, dir: Vec3, wish_speed: f32, accel: f32, cap: Option<f32>, dt: f32) {
+        if wish_speed <= 0.0 {
+            return;
+        }
+        let target = cap.map_or(wish_speed, |c| wish_speed.min(c));
+        let current = self.vel.x * dir.x + self.vel.z * dir.z;
+        let add = target - current;
+        if add <= 0.0 {
+            return;
+        }
+        let gain = (accel * wish_speed * dt).min(add);
+        self.vel.x += gain * dir.x;
+        self.vel.z += gain * dir.z;
     }
 
     /// Déplacement sur un axe, avec atterrissage et montée automatique des marches.
@@ -549,27 +719,203 @@ mod tests {
         assert!(peak > 1.05 && peak < 1.6, "hauteur de saut = {peak}");
     }
 
+    const TICK: f32 = 1.0 / 128.0;
+
+    fn fps_input() -> MoveInput {
+        MoveInput {
+            fps: true,
+            ..Default::default()
+        }
+    }
+
+    /// Saute (nouvel appui) et renvoie la hauteur atteinte.
+    fn jump_peak(p: &mut Player, w: &World) -> f32 {
+        let y0 = p.pos.y;
+        let jump = MoveInput {
+            jump: true,
+            jump_pressed: true,
+            ..fps_input()
+        };
+        p.update(w, &jump, TICK);
+        let mut peak: f32 = 0.0;
+        for _ in 0..400 {
+            p.update(w, &fps_input(), TICK);
+            peak = peak.max(p.pos.y - y0);
+            if p.on_ground {
+                break;
+            }
+        }
+        peak
+    }
+
     #[test]
-    fn fps_speed_is_capped_even_when_jumping() {
+    fn fps_ground_speed_and_jump_like_cs() {
         let w = flat_world();
         let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
-        p.update(&w, &MoveInput::default(), 1.0 / 60.0);
-        let mut max: f32 = 0.0;
-        for i in 0..240 {
-            let m = MoveInput {
-                forward: 1.0,
-                strafe: 1.0,
-                sprint: i < 120,
-                jump: true,
-                fps: true,
-                ..Default::default()
-            };
-            p.update(&w, &m, 1.0 / 60.0);
-            let h = Vec3::new(p.vel.x, 0.0, p.vel.z).length();
-            let cap = if i < 120 { FPS_SPRINT } else { FPS_WALK };
-            assert!(h <= cap + 1e-3, "vitesse {h} > {cap} (image {i})");
-            max = max.max(h);
+        let run = MoveInput {
+            forward: 1.0,
+            sprint: true,
+            ..fps_input()
+        };
+        for _ in 0..512 {
+            p.update(&w, &run, TICK);
+            p.pos.x = 8.5;
+            p.pos.z = 8.5;
+            assert!(p.ground_speed() <= FPS_SPRINT + 1e-3);
         }
-        assert!(max > FPS_SPRINT * 0.95, "le sprint FPS doit être atteint");
+        assert!(p.ground_speed() > FPS_SPRINT * 0.99, "{}", p.ground_speed());
+        // Friction : arrêt en moins d'une demi-seconde.
+        for _ in 0..64 {
+            p.update(&w, &fps_input(), TICK);
+        }
+        assert_eq!(p.ground_speed(), 0.0);
+        // Saut de 57 unités (≈ 1,45 bloc) reposé.
+        let h = jump_peak(&mut p, &w);
+        assert!((1.40..1.50).contains(&h), "saut = {h}");
+        // Garder la touche enfoncée ne ressaute pas : il faut réappuyer.
+        let hold = MoveInput {
+            jump: true,
+            ..fps_input()
+        };
+        for _ in 0..256 {
+            p.update(&w, &hold, TICK);
+            assert!(p.on_ground, "saut sans nouvel appui");
+        }
+    }
+
+    #[test]
+    fn tired_legs_jump_lower_and_recover() {
+        let w = flat_world();
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        for _ in 0..8 {
+            p.update(&w, &fps_input(), TICK);
+        }
+        let fresh = jump_peak(&mut p, &w);
+        // Ressauter tout de suite à l'atterrissage : plus bas, de plus en plus.
+        let second = jump_peak(&mut p, &w);
+        let third = jump_peak(&mut p, &w);
+        assert!(second < fresh * 0.95, "{fresh} puis {second}");
+        assert!(third < fresh * 0.95, "{fresh} puis {third}");
+        assert!(p.stamina > 0.0);
+        // Deux secondes de repos : les jambes récupèrent.
+        for _ in 0..256 {
+            p.update(&w, &fps_input(), TICK);
+        }
+        assert_eq!(p.stamina, 0.0);
+        let rested = jump_peak(&mut p, &w);
+        assert!((rested - fresh).abs() < 0.02, "{fresh} / {rested}");
+    }
+
+    #[test]
+    fn bunny_hop_with_air_strafe_gains_speed_but_landing_slows() {
+        let w = flat_world();
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        let run = MoveInput {
+            forward: 1.0,
+            sprint: true,
+            ..fps_input()
+        };
+        for _ in 0..512 {
+            p.update(&w, &run, TICK);
+            p.pos.x = 8.5;
+            p.pos.z = 8.5;
+        }
+        let start = p.ground_speed();
+        assert!(start > FPS_SPRINT * 0.99);
+        // Bunny hop : saut à chaque atterrissage, décalage à droite en tournant la souris
+        // pour garder la direction voulue perpendiculaire à la vitesse.
+        for _ in 0..(128 * 4) {
+            p.yaw = p.vel.x.atan2(-p.vel.z);
+            let m = MoveInput {
+                strafe: 1.0,
+                sprint: true,
+                jump: true,
+                jump_pressed: p.on_ground,
+                ..fps_input()
+            };
+            p.update(&w, &m, TICK);
+            // Large monde plat : on revient au centre pour rester sur le sol chargé.
+            p.pos.x = 8.5;
+            p.pos.z = 8.5;
+        }
+        let hopped = p.ground_speed();
+        assert!(hopped > start * 1.3, "bunny hop : {start} → {hopped}");
+        // Atterrir sans ressauter : fatigue + friction, la vitesse s'effondre.
+        for _ in 0..200 {
+            p.update(&w, &fps_input(), TICK);
+            if p.on_ground {
+                break;
+            }
+            p.pos.x = 8.5;
+            p.pos.z = 8.5;
+        }
+        for _ in 0..16 {
+            p.update(&w, &fps_input(), TICK);
+            p.pos.x = 8.5;
+            p.pos.z = 8.5;
+        }
+        assert!(p.ground_speed() < hopped * 0.5);
+    }
+
+    #[test]
+    fn crouching_slows_down_at_once() {
+        let w = flat_world();
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        let run = MoveInput {
+            forward: 1.0,
+            sprint: true,
+            ..fps_input()
+        };
+        for _ in 0..256 {
+            p.update(&w, &run, TICK);
+            p.pos.x = 8.5;
+            p.pos.z = 8.5;
+        }
+        let duck = MoveInput { sneak: true, ..run };
+        p.update(&w, &duck, TICK);
+        assert!(
+            p.ground_speed() <= FPS_SPRINT * cs::DUCK_MULT + 1e-3,
+            "{}",
+            p.ground_speed()
+        );
+        // On continue d'avancer accroupi, à la vitesse d'accroupi.
+        for _ in 0..256 {
+            p.update(&w, &duck, TICK);
+            p.pos.x = 8.5;
+            p.pos.z = 8.5;
+        }
+        assert!(
+            p.ground_speed() > FPS_SPRINT * cs::DUCK_MULT * 0.95,
+            "accroupi immobile : {}",
+            p.ground_speed()
+        );
+        // Et en repartant de l'arrêt.
+        let mut q = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        for _ in 0..256 {
+            q.update(&w, &duck, TICK);
+            q.pos.x = 8.5;
+            q.pos.z = 8.5;
+        }
+        assert!(q.ground_speed() > FPS_SPRINT * cs::DUCK_MULT * 0.95);
+    }
+
+    #[test]
+    fn crouch_spam_tires_the_legs() {
+        let w = flat_world();
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        for i in 0..8 {
+            let m = MoveInput {
+                sneak: i % 2 == 0,
+                ..fps_input()
+            };
+            for _ in 0..4 {
+                p.update(&w, &m, TICK);
+            }
+        }
+        assert!(p.duck_speed < cs::DUCK_SPEED_MAX - 5.0, "{}", p.duck_speed);
+        for _ in 0..(128 * 3) {
+            p.update(&w, &fps_input(), TICK);
+        }
+        assert_eq!(p.duck_speed, cs::DUCK_SPEED_MAX);
     }
 }

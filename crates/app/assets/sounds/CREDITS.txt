@@ -1,0 +1,41 @@
+Sons du mode FPS de Minelib — tous sous licence CC0 (domaine public, aucune attribution
+requise ; crédités ici par courtoisie). Découpés, ré-accordés (hauteur) et convertis en
+Ogg Vorbis mono pour le jeu.
+
+Tirs (shot_*.ogg) : « The Free Firearm Sound Library » (Prepared SFX Library), CC0
+  https://opengameart.org/content/the-free-firearm-sound-library
+  Enregistrements réels : Walther PPQ, Bersa, 1911, Ruger Mark III, S&W 642, Carl Gustav
+  M45, PPSh, Benelli Nova, Winchester Model 12, Charles Daly, Mossberg 190, AK-47, AR-15,
+  Norinco SKS, Savage 10, Tikka T3, Springfield 1917, Arisaka. Les armes « silencieuses »
+  (USP-S, M4A1-S, MP5-SD) sont filtrées à partir de ces tirs.
+
+Rechargements :
+  reload_pistol.ogg — « handgun reload sound effect », CC0
+    https://opengameart.org/content/handgun-reload-sound-effect
+  reload_rifle.ogg, reload_sniper.ogg, pump.ogg — « gun reload sounds », CC0
+    https://opengameart.org/content/gun-reload-sounds
+
+Déclics (scope_in, scope_out, dry, pin, hammer, reload_end) : extraits de
+  « equipment clicks III », CC0 — https://opengameart.org/content/equipment-clicks-iii
+
+Grenades et couteau :
+  he.ogg, flash.ogg — « 25 CC0 bang / firework SFX » (rubberduck), CC0
+    https://opengameart.org/content/25-cc0-bang-firework-sfx
+  bounce.ogg — « 100 CC0 SFX » (rubberduck), CC0
+    https://opengameart.org/content/100-cc0-sfx
+  molotov.ogg — « Glass Break », CC0 — https://opengameart.org/content/glass-break
+  throw.ogg, smoke.ogg, fire.ogg — créés pour Minelib (bruit filtré par ffmpeg), sous la
+    licence du projet.
+  knife_swing.ogg, knife_swing2.ogg (tube-plastic-whoosh), knife_hit.ogg (apple-cut et
+    sword-knife-clash), draw_nade.ogg (cloth-pouch-shake) — « Fantasy Sound Effects
+    (Tinysized SFX) » et « Fantasy Weapons and Apparel SFX Library » (Jan Schupke /
+    vehiclemusic), CC0
+    https://opengameart.org/content/fantasy-sound-effects-tinysized-sfx
+    https://opengameart.org/content/fantasy-weapons-and-apparel-sfx-library
+  draw_knife.ogg — knife-unsheathe, même bibliothèque « Weapons and Apparel », CC0.
+
+Arme sortie (draw_<arme>.ogg, un son par arme) : mélange d'un frottement de cuir
+  (quiver-leather-squeeze, sheath-squeeze, belt-buckle… de la « Fantasy Weapons and Apparel
+  SFX Library », CC0) et du mécanisme de l'arme (glissière, levier d'armement, culasse,
+  pompe) tiré de « gun reload sounds » et « handgun reload sound effect » (CC0), avec une
+  hauteur et un frottement différents pour chaque arme.

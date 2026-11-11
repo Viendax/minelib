@@ -279,6 +279,7 @@ pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
 fn item_code(item: Item) -> String {
     match item {
         Item::Block(b) => format!("block;{}", b.0),
+        Item::Wand => "wand;-".into(),
         Item::Torch(None) => "torch;-".into(),
         Item::Torch(Some(i)) => format!("torch;{i}"),
     }
@@ -288,6 +289,7 @@ fn parse_item(kind: &str, arg: &str) -> Option<Item> {
     match kind {
         "block" => Some(Item::Block(BlockId(arg.parse().ok()?))),
         "torch" => Some(Item::Torch(arg.parse().ok())),
+        "wand" => Some(Item::Wand),
         _ => None,
     }
 }
@@ -709,67 +711,5 @@ mod tests {
         assert_eq!(parse_seed("12345"), 12345);
         assert_eq!(parse_seed("bonjour"), parse_seed("bonjour"));
         assert_ne!(parse_seed("bonjour"), parse_seed("salut"));
-    }
-
-    #[test]
-    #[ignore]
-    fn probe_user_world() {
-        let dir = std::path::PathBuf::from(std::env::var("PROBE_WORLD").unwrap());
-        let (_, mut w) = load_world(&dir).unwrap();
-        for cz in 2..=6 {
-            for cx in -5..=0 {
-                w.ensure_chunk(ChunkPos { x: cx, z: cz });
-            }
-        }
-        for p in [[-31, 80, 75], [-31, 79, 74], [-31, 80, 74], [-31, 79, 75]] {
-            let id = w.get(p[0], p[1], p[2]);
-            let d = id.def();
-            println!(
-                "{p:?} {} {} {:?} full={} transl={} mask={:#x}",
-                id.0,
-                d.key,
-                d.shape,
-                d.full,
-                d.translucent,
-                minelib_world::registry::light_faces(id)
-            );
-        }
-        let mesh = minelib_world::mesh::mesh_chunk(&w, ChunkPos { x: -2, z: 4 });
-        for v in &mesh.vertices {
-            let r = (v.data >> 14) & 63;
-            if (v.data >> 8) & 7 == 1
-                && v.pos[0] == -30.0
-                && (76.0..=80.0).contains(&v.pos[2])
-                && v.pos[1] >= 80.0
-                && v.pos[1] <= 86.0
-            {
-                println!(
-                    "W {:?} sky={} r={r} g={} ao={}",
-                    v.pos,
-                    v.data & 15,
-                    (v.data >> 20) & 63,
-                    (v.data >> 11) & 3
-                );
-            }
-            if r > 0
-                && (-34.0..=-27.0).contains(&v.pos[0])
-                && (80.6..=84.0).contains(&v.pos[1])
-                && (72.0..=79.0).contains(&v.pos[2])
-            {
-                println!("V {:?} face={} r={r}", v.pos, (v.data >> 8) & 7);
-            }
-        }
-        for y in 78..=82 {
-            println!("y = {y}");
-            for z in 72..=78 {
-                let mut line = String::new();
-                for x in -34..=-28 {
-                    let id = w.get(x, y, z);
-                    let l = minelib_world::mesh::light_probe(&w, [x, y, z]);
-                    line += &format!("{:>14}:{:>3} ", &id.name()[..id.name().len().min(14)], l[0]);
-                }
-                println!("z={z} {line}");
-            }
-        }
     }
 }
