@@ -247,7 +247,7 @@ pub fn signature(bytes: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ToHost {
     /// Arrivée dans la partie, avec l'empreinte de la carte qu'on a.
     Hello {
@@ -349,8 +349,11 @@ pub enum ToPeer {
         pos: [f32; 3],
         vel: [f32; 3],
     },
-    /// État complet de la partie pour le garant de secours (toutes les secondes).
+    /// État complet de la partie pour le garant de secours (toutes les secondes), en
+    /// morceaux (un message du relais fait au plus 64 Kio) : morceau `part` sur `of`.
     Backup {
+        part: u16,
+        of: u16,
         data: Vec<u8>,
     },
     /// Armes au sol (liste complète, à chaque changement).

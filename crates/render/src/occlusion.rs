@@ -16,7 +16,7 @@ use minelib_world::mesh::SECTIONS;
 use minelib_world::ChunkPos;
 
 /// Masque « toutes les tranches visibles ».
-pub const ALL: u16 = u16::MAX;
+pub const ALL: u32 = u32::MAX;
 
 /// Tranches visibles de chaque chunk de `conn` depuis la tranche `cam_sec` du chunk `cam`.
 /// Vide si la caméra n'est pas dans un chunk connu (alors rien n'est caché).
@@ -24,8 +24,8 @@ pub fn visible_sections(
     conn: &HashMap<ChunkPos, [u64; SECTIONS]>,
     cam: ChunkPos,
     cam_sec: i32,
-) -> HashMap<ChunkPos, u16> {
-    let mut seen: HashMap<ChunkPos, u16> = HashMap::with_capacity(conn.len());
+) -> HashMap<ChunkPos, u32> {
+    let mut seen: HashMap<ChunkPos, u32> = HashMap::with_capacity(conn.len());
     if !conn.contains_key(&cam) {
         return seen;
     }

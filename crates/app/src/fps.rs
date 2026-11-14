@@ -368,6 +368,14 @@ impl Fps {
         }
     }
 
+    /// Garant indépendant (sans joueur) : avance les grenades de la partie (dégâts).
+    pub fn simulate_nades(&mut self, dt: f32, world: &World) {
+        if self.online.is_none() {
+            self.online = Some(Online::default());
+        }
+        self.tick_nades(dt, world, Vec3::new(0.0, -1000.0, 0.0), 0.0, 0.0);
+    }
+
     /// Cases en feu : (position, lanceur).
     pub fn fire_cells(&self) -> Vec<(Vec3, u64)> {
         self.effects

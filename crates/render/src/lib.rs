@@ -263,7 +263,7 @@ struct ChunkGpu {
 /// nombre de triangles dessinés.
 fn chunk_commands(
     c: &ChunkGpu,
-    mask: u16,
+    mask: u32,
     eye: Vec3,
     cmds: &mut Vec<u8>,
     groups: &mut Vec<(usize, u32, u32)>,
@@ -400,10 +400,10 @@ pub struct Renderer {
     /// Passages par l'air des tranches de chaque chunk, tranches visibles calculées depuis
     /// la caméra (voir `occlusion`), et calcul en cours.
     conn: HashMap<ChunkPos, [u64; minelib_world::mesh::SECTIONS]>,
-    vis: HashMap<ChunkPos, u16>,
+    vis: HashMap<ChunkPos, u32>,
     vis_cam: Option<(ChunkPos, i32)>,
     vis_dirty: bool,
-    vis_job: Option<std::sync::mpsc::Receiver<HashMap<ChunkPos, u16>>>,
+    vis_job: Option<std::sync::mpsc::Receiver<HashMap<ChunkPos, u32>>>,
     vis_launch: Option<std::time::Instant>,
     cave_culling: bool,
     /// Reflets calculés à leur propre rythme (désactivé : synchronisés avec chaque image).
@@ -1477,7 +1477,7 @@ impl Renderer {
         // visibles. Les commandes de chaque chunk ne dépendent que de lui : avec beaucoup de
         // chunks (grande distance en pleine résolution), elles sont calculées en parallèle
         // sur plusieurs cœurs puis mises bout à bout dans le même ordre.
-        let items: Vec<(&ChunkGpu, u16)> = order
+        let items: Vec<(&ChunkGpu, u32)> = order
             .iter()
             .map(|&i| {
                 let key = self.draw_list[i].1;

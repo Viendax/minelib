@@ -123,6 +123,35 @@ pub fn publish(me: Ad) {
         });
 }
 
+/// Début d'une connexion passée par le tunnel : « MLPX », une longueur, puis qui est
+/// le joueur distant (son adresse IP, ou à défaut son identifiant iroh).
+pub const PREAMBLE: &[u8; 4] = b"MLPX";
+
+pub fn preamble(who: &str) -> Vec<u8> {
+    let who = &who.as_bytes()[..who.len().min(255)];
+    let mut v = PREAMBLE.to_vec();
+    v.push(who.len() as u8);
+    v.extend_from_slice(who);
+    v
+}
+
+/// Qui est au bout de `conn` : son IP quand on la connaît (connexion directe), sinon
+/// son identifiant iroh (la connexion passe alors par un serveur relais d'iroh).
+fn remote_key(conn: &iroh::endpoint::Connection, first: Option<std::net::IpAddr>) -> String {
+    let direct = conn.paths().iter().find_map(|p| match p.remote_addr() {
+        iroh::TransportAddr::Ip(a) => Some(a.ip()),
+        _ => None,
+    });
+    match direct.or(first) {
+        Some(ip) => ip.to_canonical().to_string(),
+        None => {
+            let id = conn.remote_id();
+            let hex: String = id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            format!("iroh:{hex}")
+        }
+    }
+}
+
 /// Nœud iroh de ce jeu (un par processus).
 pub struct Node {
     rt: tokio::runtime::Runtime,
@@ -167,17 +196,29 @@ impl Node {
         *self.ep.id().as_bytes()
     }
 
-    /// Rend le relais local `local` joignable par ce nœud.
+    /// Rend le relais local `local` joignable par ce nœud. Chaque connexion commence
+    /// par un préambule ([`preamble`]) qui donne au relais la vraie adresse du joueur
+    /// distant : sans lui, tout le monde arriverait de 127.0.0.1.
     pub fn serve(&self, local: SocketAddr) {
         let ep = self.ep.clone();
         self.rt.spawn(async move {
             while let Some(incoming) = ep.accept().await {
                 tokio::spawn(async move {
+                    let first = match incoming.remote_addr() {
+                        iroh::endpoint::IncomingAddr::Ip(a) => Some(a.ip()),
+                        _ => None,
+                    };
                     let Ok(conn) = incoming.await else { return };
                     while let Ok((send, recv)) = conn.accept_bi().await {
+                        let who = remote_key(&conn, first);
                         tokio::spawn(async move {
                             match tokio::net::TcpStream::connect(local).await {
-                                Ok(tcp) => pipe(tcp, send, recv).await,
+                                Ok(mut tcp) => {
+                                    use tokio::io::AsyncWriteExt;
+                                    if tcp.write_all(&preamble(&who)).await.is_ok() {
+                                        pipe(tcp, send, recv).await
+                                    }
+                                }
                                 Err(e) => log::warn!("tunnel vers le relais local : {e}"),
                             }
                         });
@@ -262,8 +303,16 @@ mod tests {
         use std::io::{Read, Write};
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let local = server.local_addr().unwrap();
+        let (who_tx, who_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let (mut s, _) = server.accept().unwrap();
+            // Préambule : « MLPX », longueur, qui est au bout.
+            let mut head = [0u8; 5];
+            s.read_exact(&mut head).unwrap();
+            assert_eq!(&head[..4], PREAMBLE);
+            let mut who = vec![0u8; head[4] as usize];
+            s.read_exact(&mut who).unwrap();
+            who_tx.send(String::from_utf8(who).unwrap()).unwrap();
             let mut b = [0u8; 5];
             s.read_exact(&mut b).unwrap();
             s.write_all(&b).unwrap();
@@ -277,5 +326,7 @@ mod tests {
         let mut back = [0u8; 5];
         c.read_exact(&mut back).unwrap();
         assert_eq!(&back, b"salut");
+        let who = who_rx.recv().unwrap();
+        assert!(!who.is_empty() && who != "127.0.0.1", "vraie adresse : {who}");
     }
 }

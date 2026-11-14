@@ -11,6 +11,7 @@ mod hardware;
 mod limits;
 mod maps;
 mod registry;
+mod servers;
 mod stats;
 mod zones;
 
@@ -48,6 +49,66 @@ pub struct Handle {
     pub addr: SocketAddr,
     /// Clé publique du canal chiffré (celle que les jeux retiennent).
     pub public: [u8; 32],
+    whois: Arc<Mutex<Option<WhoisFn>>>,
+}
+
+/// Interroge les autres relais : clés des comptes qui y portent ce pseudo.
+pub type WhoisFn = Arc<dyn Fn(&str) -> Vec<[u8; 32]> + Send + Sync>;
+
+impl Handle {
+    /// Les pseudos deviennent uniques avec les autres relais : avant chaque inscription,
+    /// `f` leur demande si le pseudo est déjà pris.
+    pub fn set_whois(&self, f: WhoisFn) {
+        *self.whois.lock().unwrap() = Some(f);
+    }
+}
+
+/// Recherche dans les autres relais du DHT (par tunnel iroh), sauf ce relais (`me`).
+/// La liste des relais est relue au plus toutes les 5 minutes.
+pub fn federated_whois(node: &'static minelib_p2p::Node, me: [u8; 32]) -> WhoisFn {
+    let cache: Arc<Mutex<(Option<Instant>, Vec<minelib_p2p::Ad>)>> =
+        Arc::new(Mutex::new((None, Vec::new())));
+    Arc::new(move |pseudo: &str| {
+        let ads = {
+            let mut c = cache.lock().unwrap();
+            if c.0.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+                if let Ok(list) = minelib_p2p::find_relays() {
+                    c.1 = list;
+                }
+                c.0 = Some(Instant::now());
+            }
+            c.1.clone()
+        };
+        let now = minelib_p2p::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut asked = 0;
+        for ad in ads
+            .into_iter()
+            .filter(|a| a.noise != me && now.saturating_sub(a.seen) < 3600)
+            .take(8)
+        {
+            asked += 1;
+            let tx = tx.clone();
+            let pseudo = pseudo.to_string();
+            std::thread::spawn(move || {
+                let r = node
+                    .tunnel(ad.node)
+                    .and_then(|a| minelib_net::client::whois(&a.to_string(), ad.noise, &pseudo));
+                let _ = tx.send(r.ok().flatten());
+            });
+        }
+        drop(tx);
+        let end = Instant::now() + Duration::from_secs(6);
+        let mut keys = Vec::new();
+        for _ in 0..asked {
+            match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+                Ok(Some(k)) => keys.push(k),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        keys
+    })
 }
 
 /// Clés du relais, créées au premier lancement.
@@ -97,6 +158,10 @@ struct Conn {
     joined: Instant,
     /// Banni pendant la session : la connexion est coupée.
     kicked: bool,
+    /// Disponible comme garant indépendant (au menu).
+    garant: bool,
+    /// Garant écarté (désaccords rejetés par les joueurs) : plus choisi cette session.
+    garant_banned: bool,
 }
 
 /// Partie annoncée : l'hôte fait tourner le serveur, le relais transmet les données.
@@ -122,18 +187,48 @@ struct Room {
     build: zones::Build,
     /// FPS : garant de secours désigné par l'hôte.
     backup: Option<u64>,
+    /// Garants indépendants en attente (membres cachés, pas des joueurs) et prêts.
+    hidden: Vec<u64>,
+    ready_standby: Vec<u64>,
+    /// La partie est servie par un garant indépendant (pas par un joueur).
+    garant_hosted: bool,
+    /// Désaccords : en attente de jugement (n° → joueur jugé, vérificateur), confirmés,
+    /// rejetés.
+    judges: HashMap<u64, (u64, u64)>,
+    confirmed: u32,
+    dismissed: u32,
+    /// Résultat trouvé par le garant vérificateur (empreinte).
+    audited: Option<[u8; 32]>,
+    /// Construction : créateur du serveur (OP d'office) et clé de ses OP et bannis.
+    creator: String,
+    server: String,
 }
 
 impl Room {
+    /// Joueurs de la partie (l'hôte s'il joue, les membres ; pas les garants).
     fn everyone(&self) -> impl Iterator<Item = u64> + '_ {
-        std::iter::once(self.host).chain(self.members.iter().copied())
+        let host = (!self.garant_hosted).then_some(self.host);
+        host.into_iter().chain(
+            self.members
+                .iter()
+                .copied()
+                .filter(|m| !self.hidden.contains(m)),
+        )
+    }
+
+    fn player_count(&self) -> usize {
+        self.everyone().count()
     }
 }
 
 struct State {
+    /// Recherche des pseudos dans les autres relais (voir `Handle::set_whois`).
+    whois: Arc<Mutex<Option<WhoisFn>>>,
     conns: HashMap<u64, Conn>,
     rooms: HashMap<u64, Room>,
     next_id: u64,
+    /// Dernier passage de l'entretien des garants.
+    last_upkeep: Instant,
     cfg: Config,
     id: Identity,
     registry: Registry,
@@ -142,6 +237,7 @@ struct State {
     stats: stats::Store,
     maps: maps::Store,
     hardware: hardware::Store,
+    servers: servers::Store,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -165,10 +261,13 @@ pub fn start(cfg: Config) -> Result<Handle> {
         crypto::hex(&public),
         registry.accounts()
     );
+    let whois: Arc<Mutex<Option<WhoisFn>>> = Arc::new(Mutex::new(None));
     let state = Arc::new(Mutex::new(State {
+        whois: whois.clone(),
         conns: HashMap::new(),
         rooms: HashMap::new(),
         next_id: 1,
+        last_upkeep: Instant::now(),
         cfg,
         id,
         registry,
@@ -177,6 +276,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         stats,
         maps,
         hardware: hardware::Store::open(cfg_dir.join("hardware.bin")),
+        servers: servers::Store::open(cfg_dir.join("serveurs.bin")),
     }));
     std::thread::Builder::new()
         .name("relais : écoute".into())
@@ -187,17 +287,62 @@ pub fn start(cfg: Config) -> Result<Handle> {
                 let _ = std::thread::Builder::new()
                     .name("relais : client".into())
                     .spawn(move || {
-                        let peer = stream
-                            .peer_addr()
-                            .map(|a| a.ip().to_string())
-                            .unwrap_or_default();
+                        let ip = stream.peer_addr().map(|a| a.ip()).ok();
+                        let mut peer = ip.map(|a| a.to_string()).unwrap_or_default();
+                        // Par le tunnel iroh, le joueur arrive de ce PC : le tunnel dit
+                        // d'abord qui il est vraiment.
+                        if ip.is_some_and(|a| a.is_loopback()) {
+                            match tunnel_peer(&stream) {
+                                Ok(Some(who)) => peer = who,
+                                Ok(None) => {}
+                                Err(_) => return,
+                            }
+                        }
                         if let Err(e) = serve(stream, &state, &peer) {
                             log::debug!("client {peer} : {e:#}");
                         }
                     });
             }
         })?;
-    Ok(Handle { addr, public })
+    Ok(Handle {
+        addr,
+        public,
+        whois,
+    })
+}
+
+/// Lit le préambule « MLPX » que met le tunnel iroh devant chaque connexion (voir
+/// `minelib_p2p::preamble`). `None` : connexion locale ordinaire, rien n'est consommé.
+/// Seules les connexions venues de ce PC sont lues ainsi : un joueur distant ne peut
+/// donc pas se faire passer pour un autre.
+fn tunnel_peer(stream: &TcpStream) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    const MAGIC: &[u8; 4] = minelib_p2p::PREAMBLE;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let start = Instant::now();
+    let mut head = [0u8; 4];
+    loop {
+        let n = stream.peek(&mut head)?;
+        if n == 0 || head[..n] != MAGIC[..n] {
+            stream.set_read_timeout(None)?;
+            return Ok(None);
+        }
+        if n == 4 {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut r = stream;
+    let mut buf = [0u8; 5];
+    r.read_exact(&mut buf)?;
+    let mut who = vec![0u8; buf[4] as usize];
+    r.read_exact(&mut who)?;
+    stream.set_read_timeout(None)?;
+    let who = String::from_utf8_lossy(&who).into_owned();
+    Ok(Some(if who.is_empty() { "iroh:?".into() } else { who }))
 }
 
 /// Étape de la session d'un client.
@@ -237,6 +382,8 @@ fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
                 caps: proto::GarantCaps::default(),
                 joined: Instant::now(),
                 kicked: false,
+                garant: false,
+                garant_banned: false,
             },
         );
         id
@@ -286,6 +433,8 @@ fn serve_loop(chan: &mut Channel, state: &Mutex<State>, peer: &str, id: u64) -> 
                 Request::Hello { .. } => Some(err(ErrorCode::Protocol, "")),
                 _ => Some(err(ErrorCode::Protocol, "bonjour attendu")),
             }
+        } else if let Some(taken) = taken_elsewhere(&req, state) {
+            Some(taken)
         } else {
             handle(req, state, &mut session, peer, id)
         };
@@ -293,6 +442,27 @@ fn serve_loop(chan: &mut Channel, state: &Mutex<State>, peer: &str, id: u64) -> 
             chan.send(&r)?;
         }
     }
+}
+
+/// Inscription d'un pseudo qu'un autre relais connu porte déjà, avec une autre clé :
+/// refusée (les pseudos sont uniques entre relais). Même clé : c'est le compte qui
+/// arrive d'un autre relais, il passe. La question est posée sans bloquer le relais.
+fn taken_elsewhere(req: &Request, state: &Mutex<State>) -> Option<Response> {
+    let Request::Register { pseudo, pubkey, .. } = req else {
+        return None;
+    };
+    let ask = {
+        let st = state.lock().unwrap();
+        if !proto::valid_pseudo(pseudo) || st.registry.lookup(pseudo).is_some() {
+            return None;
+        }
+        let f = st.whois.lock().unwrap().clone();
+        f
+    }?;
+    let keys = ask(pseudo);
+    keys.iter()
+        .any(|k| k != pubkey)
+        .then(|| err(ErrorCode::PseudoTaken, "pris sur un autre relais"))
 }
 
 /// Le jeu `id` quitte sa partie : ferme celle qu'il héberge, prévient l'hôte sinon.
@@ -303,41 +473,52 @@ fn leave_room(st: &mut State, id: u64) {
     let Some(room) = st.rooms.get_mut(&room_id) else {
         return;
     };
+    // Garant en attente qui s'en va : simplement retiré.
+    if room.hidden.contains(&id) {
+        room.hidden.retain(|&h| h != id);
+        room.ready_standby.retain(|&h| h != id);
+        room.members.retain(|&m| m != id);
+        if room.backup == Some(id) {
+            room.backup = None;
+        }
+        // Plus de vérificateur : le résultat des joueurs peut suffire.
+        try_apply_result(st, room_id);
+        return;
+    }
     // FPS : le garant de secours reprend la partie (sans coupure pour les autres).
-    if room.host == id && room.kind == 0 && !room.members.is_empty() {
-        let new = room
-            .backup
-            .filter(|b| room.members.contains(b))
-            .unwrap_or(room.members[0]);
-        room.members.retain(|&m| m != new);
-        room.host = new;
-        room.backup = None;
-        let members: Vec<u64> = room.members.clone();
-        let pseudo_of = |c: u64| {
-            st.conns
-                .get(&c)
-                .and_then(|c| c.pseudo.clone())
-                .unwrap_or_default()
+    // Construction : le joueur le plus adapté devient propriétaire du monde.
+    if room.host == id
+        && room
+            .members
+            .iter()
+            .any(|m| !room.hidden.contains(m) || room.kind == 0)
+    {
+        let kind = room.kind;
+        let new = if kind == 1 {
+            let cands = candidates(st, room_id);
+            cands
+                .iter()
+                .filter(|c| c.id != id)
+                .max_by(|a, b| zones::aptitude(a).total_cmp(&zones::aptitude(b)))
+                .map(|c| c.id)
+                .unwrap_or(st.rooms[&room_id].members[0])
+        } else {
+            // Un garant indépendant prêt d'abord, sinon le garant de secours, sinon un
+            // joueur.
+            room.ready_standby
+                .first()
+                .copied()
+                .or(room.backup.filter(|b| room.members.contains(b)))
+                .unwrap_or(room.members[0])
         };
-        let host_pseudo = pseudo_of(new);
-        let list: Vec<(u64, String)> = members.iter().map(|&m| (m, pseudo_of(m))).collect();
-        if let Some(r) = st.rooms.get_mut(&room_id) {
-            r.host_pseudo = host_pseudo.clone();
-        }
-        if let Some(c) = st.conns.get(&new) {
-            transport::push(&c.tx, &Response::Promoted { members: list });
-        }
-        for m in members {
-            if let Some(c) = st.conns.get(&m) {
-                transport::push(
-                    &c.tx,
-                    &Response::HostChanged {
-                        host: host_pseudo.clone(),
-                    },
-                );
+        switch_host(st, room_id, new, None);
+        if kind == 1 {
+            let cands = candidates(st, room_id);
+            if let Some(room) = st.rooms.get_mut(&room_id) {
+                let changes = room.build.left(id, &cands);
+                announce(st, room_id, changes);
             }
         }
-        log::info!("partie {room_id} : l'hôte est parti, « {host_pseudo} » reprend");
         return;
     }
     if room.host == id {
@@ -360,6 +541,243 @@ fn leave_room(st: &mut State, id: u64) {
             let room = st.rooms.get_mut(&room_id).expect("partie");
             let changes = room.build.left(id, &cands);
             announce(st, room_id, changes);
+        }
+    }
+}
+
+/// `new` devient l'hôte de la partie ; `stays` : l'ancien hôte reste (comme joueur).
+fn switch_host(st: &mut State, room_id: u64, new: u64, stays: Option<u64>) {
+    let Some(room) = st.rooms.get_mut(&room_id) else {
+        return;
+    };
+    let old = room.host;
+    let kind = room.kind;
+    room.members.retain(|&m| m != new);
+    let was_hidden = room.hidden.contains(&new);
+    room.hidden.retain(|&h| h != new);
+    room.ready_standby.retain(|&h| h != new);
+    if let Some(o) = stays {
+        if !room.members.contains(&o) {
+            room.members.push(o);
+        }
+    }
+    room.host = new;
+    room.backup = None;
+    room.garant_hosted = was_hidden;
+    room.judges.clear();
+    room.confirmed = 0;
+    room.dismissed = 0;
+    let members: Vec<u64> = room
+        .members
+        .iter()
+        .copied()
+        .filter(|m| !room.hidden.contains(m))
+        .collect();
+    let hidden: Vec<u64> = room.hidden.clone();
+    let pseudo_of = |c: u64| {
+        st.conns
+            .get(&c)
+            .and_then(|c| c.pseudo.clone())
+            .unwrap_or_default()
+    };
+    let host_pseudo = pseudo_of(new);
+    let list: Vec<(u64, String)> = members.iter().map(|&m| (m, pseudo_of(m))).collect();
+    if let Some(r) = st.rooms.get_mut(&room_id) {
+        r.host_pseudo = host_pseudo.clone();
+    }
+    if let Some(c) = st.conns.get(&new) {
+        transport::push(
+            &c.tx,
+            &Response::Promoted {
+                members: list,
+                old_host: stays.map(|_| old),
+            },
+        );
+    }
+    if kind == 1 {
+        // Le nouveau propriétaire reçoit tout ce qui a été construit (pour l'enregistrer).
+        if let Some(room) = st.rooms.get(&room_id) {
+            if let Some(c) = st.conns.get(&new) {
+                for (zone, log) in room.build.all_logs() {
+                    let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
+                    for data in log {
+                        transport::push(
+                            &c.tx,
+                            &Response::FromZone {
+                                peer: 0,
+                                chunk,
+                                data,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for m in members {
+        if let Some(c) = st.conns.get(&m) {
+            transport::push(
+                &c.tx,
+                &Response::HostChanged {
+                    host: host_pseudo.clone(),
+                },
+            );
+        }
+    }
+    // Les autres garants en attente : nouvel hôte à qui demander les copies.
+    for h in hidden {
+        if let Some(c) = st.conns.get(&new) {
+            transport::push(&c.tx, &Response::BackupIs { peer: h });
+        }
+    }
+    log::info!("partie {room_id} : « {host_pseudo} » sert maintenant la partie");
+}
+
+/// Après un jugement : 2 désaccords confirmés, l'hôte est remplacé par le vérificateur
+/// et perd en réputation ; 3 rejetés, le vérificateur est écarté.
+fn judge_outcome(st: &mut State, rid: u64, host: u64, auditor: u64) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    if room.confirmed >= 2 {
+        let stays = (!room.garant_hosted).then_some(host);
+        let cheater = st.conns.get(&host).and_then(|c| c.pseudo.clone());
+        if let Some(p) = &cheater {
+            st.stats.get_mut(p).reports += 2;
+            st.stats.save(p);
+            log::warn!("partie {rid} : l'hôte « {p} » triche, le vérificateur reprend");
+        }
+        if let Some(c) = st.conns.get_mut(&host) {
+            c.garant_banned = true;
+        }
+        if let Some(r) = st.rooms.get_mut(&rid) {
+            if !r.ready_standby.contains(&auditor) {
+                r.ready_standby.push(auditor);
+            }
+        }
+        switch_host(st, rid, auditor, stays);
+        // Un garant tricheur quitte la partie (il n'y jouait pas).
+        if stays.is_none() {
+            if let Some(c) = st.conns.get_mut(&host) {
+                c.room = None;
+                transport::push(&c.tx, &Response::RoomClosed);
+            }
+        }
+    } else if room.dismissed >= 3 {
+        if let Some(c) = st.conns.get_mut(&auditor) {
+            c.garant_banned = true;
+        }
+        leave_room(st, auditor);
+        if let Some(c) = st.conns.get(&auditor) {
+            transport::push(&c.tx, &Response::RoomClosed);
+        }
+    }
+}
+
+/// Ce garant peut servir une partie de ces joueurs : disponible, au menu, au moins 3
+/// parties jouées, peu signalé, aucun lien avec eux (amis, signalements).
+fn garant_ok(st: &State, g: u64, players: &[String]) -> bool {
+    let Some(c) = st.conns.get(&g) else {
+        return false;
+    };
+    let Some(p) = c.pseudo.as_deref() else {
+        return false;
+    };
+    if !c.garant || c.garant_banned || c.room.is_some() || c.kicked {
+        return false;
+    }
+    let me = st.stats.get(p).cloned().unwrap_or_default();
+    if me.games < 3 || me.ratio() > 0.25 {
+        return false;
+    }
+    players.iter().all(|q| {
+        !q.eq_ignore_ascii_case(p)
+            && !me.avoids(q)
+            && !me.friends.iter().any(|f| f.eq_ignore_ascii_case(q))
+            && st.stats.get(q).is_none_or(|s| {
+                !s.avoids(p) && !s.friends.iter().any(|f| f.eq_ignore_ascii_case(p))
+            })
+    })
+}
+
+/// Le garant disponible le plus adapté pour ces joueurs.
+fn pick_garant(st: &State, players: &[String]) -> Option<u64> {
+    st.conns
+        .iter()
+        .filter(|(&g, _)| garant_ok(st, g, players))
+        .map(|(&g, c)| {
+            let cand = zones::Candidate {
+                id: g,
+                caps: c.caps,
+                uptime: c.joined.elapsed(),
+                ratio: c.pseudo.as_deref().map_or(0.0, |p| st.stats.ratio(p)),
+            };
+            (g, zones::aptitude(&cand))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(g, _)| g)
+}
+
+/// Entretien (toutes les 2 s) : chaque partie FPS reçoit un garant indépendant en
+/// attente ; une partie servie par un joueur passe à ce garant dès qu'il est prêt.
+fn upkeep(st: &mut State) {
+    if st.last_upkeep.elapsed() < Duration::from_secs(2) {
+        return;
+    }
+    st.last_upkeep = Instant::now();
+    let rooms: Vec<u64> = st
+        .rooms
+        .iter()
+        .filter(|(_, r)| r.kind == 0)
+        .map(|(&id, _)| id)
+        .collect();
+    for rid in rooms {
+        let Some(room) = st.rooms.get(&rid) else {
+            continue;
+        };
+        // Passage au garant prêt.
+        if !room.garant_hosted {
+            if let Some(&g) = room.ready_standby.first() {
+                let old = room.host;
+                switch_host(st, rid, g, Some(old));
+                continue;
+            }
+        }
+        if !room.hidden.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = room
+            .everyone()
+            .chain(std::iter::once(room.host))
+            .filter_map(|m| st.conns.get(&m).and_then(|c| c.pseudo.clone()))
+            .collect();
+        let Some(g) = pick_garant(st, &names) else {
+            continue;
+        };
+        let room = st.rooms.get_mut(&rid).expect("partie");
+        room.members.push(g);
+        room.hidden.push(g);
+        let (host, map_sig, map) = (room.host, room.map_sig, room.map.clone());
+        let members: Vec<(u64, String)> = room
+            .everyone()
+            .filter(|&m| m != host)
+            .map(|m| (m, String::new()))
+            .collect();
+        if let Some(c) = st.conns.get_mut(&g) {
+            c.room = Some(rid);
+            transport::push(
+                &c.tx,
+                &Response::GarantTask {
+                    room: rid,
+                    map_sig,
+                    map,
+                    members,
+                    standby: true,
+                },
+            );
+        }
+        if let Some(c) = st.conns.get(&host) {
+            transport::push(&c.tx, &Response::BackupIs { peer: g });
         }
     }
 }
@@ -417,14 +835,26 @@ fn try_apply_result(st: &mut State, room_id: u64) {
         return;
     }
     let need = room.roster.len().max(1) / 2 + 1;
-    let Some(summary) = room
+    let Some((hash, summary)) = room
         .results
-        .values()
-        .find(|(_, who)| who.len() >= need)
-        .map(|(m, _)| m.clone())
+        .iter()
+        .find(|(_, (_, who))| who.len() >= need)
+        .map(|(h, (m, _))| (*h, m.clone()))
     else {
         return;
     };
+    // Un garant vérificateur suit la partie : il faut aussi son accord (une majorité
+    // complice de l'hôte ne peut pas imposer un faux résultat).
+    if room.ready_standby.iter().any(|g| room.hidden.contains(g)) {
+        match room.audited {
+            None => return,
+            Some(a) if a != hash => {
+                log::warn!("partie {room_id} : résultat refusé par le vérificateur");
+                return;
+            }
+            Some(_) => {}
+        }
+    }
     room.applied = true;
     let sig = room.map_sig;
     st.stats.apply_match(&summary);
@@ -482,6 +912,15 @@ fn open_room(
             reports: HashSet::new(),
             build: zones::Build::default(),
             backup: None,
+            hidden: Vec::new(),
+            ready_standby: Vec::new(),
+            garant_hosted: false,
+            judges: HashMap::new(),
+            confirmed: 0,
+            dismissed: 0,
+            audited: None,
+            creator: pseudo.to_string(),
+            server: servers::key(pseudo, &map),
         },
     );
     if let Some(c) = st.conns.get_mut(&id) {
@@ -496,11 +935,24 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
     let Some(r) = st.rooms.get_mut(&room) else {
         return err(ErrorCode::Refused, "Partie introuvable.");
     };
-    if r.max_players > 0 && r.members.len() + 1 >= r.max_players as usize {
+    if r.max_players > 0 && r.player_count() >= r.max_players as usize {
         return err(ErrorCode::Refused, "Partie pleine.");
     }
     if r.kind == 0 && r.started {
         return err(ErrorCode::Refused, "Partie déjà commencée.");
+    }
+    if r.kind == 1 {
+        if let Some(why) = st.servers.banned(&r.server, pseudo) {
+            let why = if why.is_empty() {
+                String::new()
+            } else {
+                format!(" ({why})")
+            };
+            return err(
+                ErrorCode::Refused,
+                format!("Tu es banni de ce serveur{why}."),
+            );
+        }
     }
     r.members.push(id);
     let (host, host_pseudo, map, map_sig) =
@@ -538,7 +990,7 @@ fn find_room(st: &State, pseudo: &str, map_sig: [u8; 32]) -> Option<u64> {
         if r.kind != 0 || r.started || r.map_sig != map_sig {
             continue;
         }
-        let n = r.members.len() + 1;
+        let n = r.player_count();
         if n >= proto::FPS_PLAYERS as usize {
             continue;
         }
@@ -582,6 +1034,7 @@ fn reputation_tolerance(a: f64, b: f64) -> f64 {
 
 /// Requêtes de parties (connecté seulement).
 fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Response> {
+    upkeep(st);
     let my_room = st.conns.get(&id).and_then(|c| c.room);
     Some(match req {
         Request::Servers { kind } => {
@@ -594,7 +1047,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     host: r.host_pseudo.clone(),
                     name: r.name.clone(),
                     map: r.map.clone(),
-                    players: r.members.len() as u32 + 1,
+                    players: r.player_count() as u32,
                     max_players: r.max_players,
                     region: st.cfg.name.clone(),
                 })
@@ -617,6 +1070,37 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             leave_room(st, id);
             match find_room(st, pseudo, map_sig) {
                 Some(room) => join_room(st, id, pseudo, room),
+                // Personne en attente : un garant indépendant ouvre la partie s'il y en a un.
+                None if pick_garant(st, &[pseudo.to_string()]).is_some() => {
+                    let g = pick_garant(st, &[pseudo.to_string()]).expect("garant");
+                    let gp = st.conns[&g].pseudo.clone().unwrap_or_default();
+                    let rid = open_room(
+                        st,
+                        g,
+                        &gp,
+                        0,
+                        format!("Partie servie par {gp}"),
+                        map.clone(),
+                        map_sig,
+                        proto::FPS_PLAYERS,
+                    );
+                    if let Some(r) = st.rooms.get_mut(&rid) {
+                        r.garant_hosted = true;
+                    }
+                    if let Some(c) = st.conns.get(&g) {
+                        transport::push(
+                            &c.tx,
+                            &Response::GarantTask {
+                                room: rid,
+                                map_sig,
+                                map,
+                                members: Vec::new(),
+                                standby: false,
+                            },
+                        );
+                    }
+                    join_room(st, id, pseudo, rid)
+                }
                 None => {
                     let rid = open_room(
                         st,
@@ -728,6 +1212,65 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             );
             Response::Done
         }
+        Request::ServerAdmin {
+            action,
+            pseudo: target,
+            reason,
+        } => {
+            let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1))
+            else {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Seulement sur un serveur de construction.",
+                ));
+            };
+            let (server, creator) = {
+                let r = &st.rooms[&rid];
+                (r.server.clone(), r.creator.clone())
+            };
+            let act = match action {
+                proto::SERVER_BAN => servers::Action::Ban,
+                proto::SERVER_UNBAN => servers::Action::Unban,
+                proto::SERVER_OP => servers::Action::Op,
+                proto::SERVER_DEOP => servers::Action::Deop,
+                _ => servers::Action::List,
+            };
+            match st
+                .servers
+                .act(&server, &creator, pseudo, act, &target, &reason)
+            {
+                Ok(text) => {
+                    // Banni : exclu tout de suite s'il est sur le serveur.
+                    if act == servers::Action::Ban {
+                        let ids: Vec<u64> = st
+                            .conns
+                            .iter()
+                            .filter(|(_, c)| {
+                                c.room == Some(rid)
+                                    && c.pseudo
+                                        .as_deref()
+                                        .is_some_and(|p| p.eq_ignore_ascii_case(&target))
+                            })
+                            .map(|(&i, _)| i)
+                            .collect();
+                        for i in ids {
+                            leave_room(st, i);
+                            if let Some(c) = st.conns.get(&i) {
+                                let why = if reason.is_empty() {
+                                    format!("Banni de ce serveur par {pseudo}.")
+                                } else {
+                                    format!("Banni de ce serveur par {pseudo} : {reason}")
+                                };
+                                transport::push(&c.tx, &Response::Kicked { reason: why });
+                            }
+                        }
+                        log::info!("« {target} » banni du serveur {server} par « {pseudo} »");
+                    }
+                    Response::ServerAdmin { text }
+                }
+                Err(e) => err(ErrorCode::Refused, e),
+            }
+        }
         Request::Unreport { pseudo: target } => {
             let low = target.to_ascii_lowercase();
             let me = st.stats.get_mut(pseudo);
@@ -758,6 +1301,14 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let Some(room) = st.rooms.get_mut(&rid) else {
                 return Some(Response::Done);
             };
+            // Le garant vérificateur a rejoué toute la partie : son résultat fait foi.
+            if room.hidden.contains(&id) && room.host != id {
+                if room.started && summary.map_sig == room.map_sig {
+                    room.audited = Some(game::signature(&data));
+                    try_apply_result(st, rid);
+                }
+                return Some(Response::Done);
+            }
             // Seulement les joueurs du début, chacun une fois, sur la bonne carte.
             let names: HashSet<String> = summary
                 .players
@@ -816,7 +1367,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         Request::Maps => {
             let mut list = st.maps.entries();
             for r in st.rooms.values().filter(|r| r.kind == 0) {
-                let n = r.members.len() as u32 + 1;
+                let n = r.player_count() as u32;
                 match list.iter_mut().find(|e| e.sig == r.map_sig) {
                     Some(e) => {
                         if !r.started {
@@ -1009,6 +1560,31 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         Request::ToHost { data } => {
             if let Some(r) = my_room.and_then(|r| st.rooms.get(&r)) {
+                // Tirs, grenades, achats… : le garant vérificateur en reçoit une copie
+                // attestée (l'hôte ne peut ni en inventer ni en taire).
+                let witness = r.kind == 0
+                    && !r.hidden.contains(&id)
+                    && game::decode::<game::ToHost>(&data).is_some_and(|m| {
+                        matches!(
+                            m,
+                            game::ToHost::Fire { .. }
+                                | game::ToHost::Throw { .. }
+                                | game::ToHost::Buy(_)
+                                | game::ToHost::Action { .. }
+                                | game::ToHost::Team(_)
+                        )
+                    });
+                if witness {
+                    let copy = Response::Witness {
+                        peer: id,
+                        data: data.clone(),
+                    };
+                    for h in r.hidden.iter().filter(|&&h| h != r.host) {
+                        if let Some(c) = st.conns.get(h) {
+                            transport::push(&c.tx, &copy);
+                        }
+                    }
+                }
                 if let Some(c) = st.conns.get(&r.host) {
                     transport::push(&c.tx, &Response::FromPeer { peer: id, data });
                 }
@@ -1028,6 +1604,74 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     }
                 }
             }
+            return None;
+        }
+        Request::GarantAvailable { on } => {
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.garant = on;
+            }
+            return None;
+        }
+        Request::GarantReady => {
+            if let Some(r) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
+                if r.hidden.contains(&id) && !r.ready_standby.contains(&id) {
+                    r.ready_standby.push(id);
+                }
+            }
+            return None;
+        }
+        Request::Conflict {
+            player,
+            seq,
+            host_pos,
+            audit_pos,
+            proof,
+        } => {
+            let rid = my_room?;
+            let room = st.rooms.get_mut(&rid)?;
+            if !room.hidden.contains(&id) {
+                return None;
+            }
+            let host = room.host;
+            if proof || player == 0 {
+                room.confirmed += 1;
+            } else if room.members.contains(&player) {
+                let n = st.next_id;
+                st.next_id += 1;
+                let room = st.rooms.get_mut(&rid)?;
+                room.judges.insert(n, (player, id));
+                if let Some(c) = st.conns.get(&player) {
+                    transport::push(
+                        &c.tx,
+                        &Response::Judge {
+                            conflict: n,
+                            seq,
+                            host_pos,
+                            audit_pos,
+                        },
+                    );
+                }
+            }
+            judge_outcome(st, rid, host, id);
+            return None;
+        }
+        Request::Vote {
+            conflict,
+            auditor_right,
+        } => {
+            let rid = my_room?;
+            let room = st.rooms.get_mut(&rid)?;
+            let (player, auditor) = room.judges.remove(&conflict)?;
+            if player != id {
+                return None;
+            }
+            if auditor_right {
+                room.confirmed += 1;
+            } else {
+                room.dismissed += 1;
+            }
+            let host = room.host;
+            judge_outcome(st, rid, host, auditor);
             return None;
         }
         Request::SetBackup { peer } => {
@@ -1082,6 +1726,7 @@ fn handle(
             | Request::Report { .. }
             | Request::Unreport { .. }
             | Request::Ban { .. }
+            | Request::ServerAdmin { .. }
             | Request::MatchResult { .. }
             | Request::Leaderboard { .. }
             | Request::Friend { .. }
@@ -1097,6 +1742,10 @@ fn handle(
             | Request::Leave
             | Request::ToHost { .. }
             | Request::SetBackup { .. }
+            | Request::GarantAvailable { .. }
+            | Request::GarantReady
+            | Request::Conflict { .. }
+            | Request::Vote { .. }
             | Request::Voice { .. }
             | Request::ToPeer { .. }
             | Request::Broadcast { .. }
@@ -1121,6 +1770,9 @@ fn handle_account(
     match req {
         Request::Hello { .. } => err(ErrorCode::Protocol, "déjà dit bonjour"),
         Request::Ping => Response::Pong,
+        Request::Whois { pseudo } => Response::Whois {
+            pubkey: st.registry.lookup(&pseudo).map(|r| r.1),
+        },
         Request::Register {
             pseudo,
             pubkey,
@@ -1174,10 +1826,11 @@ fn handle_account(
             totp,
             hw,
         } => {
-            let keys = [
-                format!("ip:{peer}"),
-                format!("pseudo:{}", pseudo.to_ascii_lowercase()),
-            ];
+            // Par le tunnel iroh, `peer` est la vraie adresse du joueur (préambule).
+            let mut keys = vec![format!("pseudo:{}", pseudo.to_ascii_lowercase())];
+            if peer != "127.0.0.1" && peer != "::1" {
+                keys.push(format!("ip:{peer}"));
+            }
             if let Some(wait) = keys.iter().filter_map(|k| st.limits.wait(k)).max() {
                 return err(
                     ErrorCode::TooManyAttempts,
@@ -1320,6 +1973,29 @@ fn handle_account(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tunnel_preamble_gives_the_real_address() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(&minelib_p2p::preamble("203.0.113.7")).unwrap();
+        c.write_all(b"suite").unwrap();
+        let (s, _) = l.accept().unwrap();
+        assert_eq!(super::tunnel_peer(&s).unwrap().as_deref(), Some("203.0.113.7"));
+        let mut rest = [0u8; 5];
+        (&s).read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"suite");
+        // Connexion locale ordinaire : rien n'est consommé.
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(b"\x00\x20abc").unwrap();
+        let (s, _) = l.accept().unwrap();
+        assert_eq!(super::tunnel_peer(&s).unwrap(), None);
+        let mut rest = [0u8; 5];
+        (&s).read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"\x00\x20abc");
+    }
+
     use super::*;
     use minelib_net::client::{Client, Cmd, Event};
     use std::time::Instant;
@@ -1385,6 +2061,7 @@ mod tests {
             pseudo: "Viendax".into(),
             password: "mauvais!!".into(),
             totp: None,
+            backup: None,
         });
         assert!(wait_error(&c2).contains("incorrect"));
         // Double authentification : activation, puis connexion qui la demande.
@@ -1403,6 +2080,7 @@ mod tests {
             pseudo: "viendax".into(),
             password: "motdepasse1".into(),
             totp: None,
+            backup: None,
         });
         wait(&c2, |e| matches!(e, Event::NeedTotp));
         // Le code déjà utilisé pour l'activation est refusé, le suivant accepté.
@@ -1410,12 +2088,14 @@ mod tests {
             pseudo: "viendax".into(),
             password: "motdepasse1".into(),
             totp: Some(totp::code(&secret, now)),
+            backup: None,
         });
         assert!(wait_error(&c2).contains("double authentification"));
         c2.send(Cmd::Login {
             pseudo: "viendax".into(),
             password: "motdepasse1".into(),
             totp: Some(totp::code(&secret, now + 1)),
+            backup: None,
         });
         match wait(&c2, |e| matches!(e, Event::LoggedIn { .. })) {
             Event::LoggedIn { pseudo, totp, .. } => {
@@ -1522,7 +2202,7 @@ mod tests {
         }
         // L'hôte part : l'invité reprend la partie (garant de secours).
         host.send(Cmd::Leave);
-        wait(&guest, |e| matches!(e, Event::Promoted(_)));
+        wait(&guest, |e| matches!(e, Event::Promoted { .. }));
         guest.send(Cmd::Leave);
         wait(&guest, |e| matches!(e, Event::Left));
         let _ = std::fs::remove_dir_all(dir);
@@ -1711,12 +2391,315 @@ mod tests {
             pseudo: "Tricheur".into(),
             password: "motdepasse".into(),
             totp: None,
+            backup: None,
         });
         assert!(wait_error(&again).contains("vie"));
         // Nouveau compte sur la même machine : machine bannie.
         let other = register("Nouveau");
         let e = wait_error(&other);
         assert!(e.contains("machine"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Serveur de construction : le créateur est OP, nomme les OP, qui bannissent.
+    #[test]
+    fn build_server_ops_ban_and_the_creator_is_op_by_default() {
+        let dir = std::env::temp_dir().join(format!("minelib-op-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let admin = |c: &Client, action: u8, pseudo: &str| {
+            c.send(Cmd::ServerAdmin {
+                action,
+                pseudo: pseudo.into(),
+                reason: "grief".into(),
+            });
+        };
+        let ok = |c: &Client| match wait(c, |e| matches!(e, Event::ServerAdmin(_))) {
+            Event::ServerAdmin(t) => t,
+            _ => unreachable!(),
+        };
+        let creator = login("Createur");
+        creator.send(Cmd::Host {
+            kind: 1,
+            name: "Mon serveur".into(),
+            map: "monde".into(),
+            map_sig: [3; 32],
+            max_players: 0,
+        });
+        let room = match wait(&creator, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let bob = login("Bob");
+        let eve = login("Eve");
+        for c in [&bob, &eve] {
+            c.send(Cmd::Join(room));
+            wait(c, |e| matches!(e, Event::Joined { .. }));
+        }
+        // Bob n'est pas OP.
+        admin(&bob, proto::SERVER_BAN, "Eve");
+        assert!(wait_error(&bob).contains("OP"));
+        admin(&creator, proto::SERVER_OP, "bob");
+        assert!(ok(&creator).contains("OP"));
+        // Seul le créateur nomme les OP ; personne ne bannit le créateur.
+        admin(&bob, proto::SERVER_OP, "Eve");
+        assert!(wait_error(&bob).contains("créateur"));
+        admin(&bob, proto::SERVER_BAN, "Createur");
+        assert!(wait_error(&bob).contains("créateur"));
+        // Bob bannit Eve : exclue tout de suite, ne peut plus revenir.
+        admin(&bob, proto::SERVER_BAN, "eve");
+        ok(&bob);
+        match wait(&eve, |e| matches!(e, Event::Kicked(_))) {
+            Event::Kicked(r) => assert!(r.contains("Bob") && r.contains("grief"), "{r}"),
+            _ => unreachable!(),
+        }
+        eve.send(Cmd::Join(room));
+        assert!(wait_error(&eve).contains("banni"));
+        admin(&creator, proto::SERVER_LIST, "");
+        let list = ok(&creator);
+        assert!(list.contains("bob") && list.contains("eve"), "{list}");
+        // Débannie : elle revient.
+        admin(&bob, proto::SERVER_UNBAN, "Eve");
+        ok(&bob);
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_account_moves_to_a_new_relay_with_its_kept_vault() {
+        let mk = |n: &str| {
+            let dir = std::env::temp_dir().join(format!("minelib-{n}-{}", rand::random::<u32>()));
+            let h = start(Config {
+                dir: dir.clone(),
+                bind: "127.0.0.1:0".into(),
+                pow_bits: 4,
+                name: n.into(),
+            })
+            .unwrap();
+            (dir, h)
+        };
+        let (d1, h1) = mk("ancien");
+        let c = Client::spawn(h1.addr.to_string(), Some(h1.public));
+        c.send(Cmd::Register {
+            pseudo: "Nomade".into(),
+            password: "motdepasse".into(),
+        });
+        let vault = match wait(&c, |e| matches!(e, Event::AccountBackup { .. })) {
+            Event::AccountBackup { vault, .. } => vault,
+            _ => unreachable!(),
+        };
+        let fp1 = match wait(&c, |e| matches!(e, Event::LoggedIn { .. })) {
+            Event::LoggedIn { fingerprint, .. } => fingerprint,
+            _ => unreachable!(),
+        };
+        // Nouveau relais : même compte (même clé) grâce au coffre gardé.
+        let (d2, h2) = mk("nouveau");
+        // Les deux relais se connaissent : un pseudo pris sur l'un l'est sur l'autre.
+        let (a1, k1) = (h1.addr.to_string(), h1.public);
+        h2.set_whois(Arc::new(move |p: &str| {
+            minelib_net::client::whois(&a1, k1, p)
+                .ok()
+                .flatten()
+                .into_iter()
+                .collect()
+        }));
+        let squat = Client::spawn(h2.addr.to_string(), Some(h2.public));
+        squat.send(Cmd::Register {
+            pseudo: "NOMADE".into(),
+            password: "autremotdepasse".into(),
+        });
+        let e = wait_error(&squat);
+        assert!(e.to_lowercase().contains("pris"), "{e}");
+        let c2 = Client::spawn(h2.addr.to_string(), Some(h2.public));
+        c2.send(Cmd::Login {
+            pseudo: "Nomade".into(),
+            password: "mauvais!!".into(),
+            totp: None,
+            backup: Some(vault.clone()),
+        });
+        assert!(
+            wait_error(&c2).contains("incorrect"),
+            "mauvais mot de passe : rien"
+        );
+        c2.send(Cmd::Login {
+            pseudo: "Nomade".into(),
+            password: "motdepasse".into(),
+            totp: None,
+            backup: Some(vault),
+        });
+        match wait(&c2, |e| matches!(e, Event::LoggedIn { .. })) {
+            Event::LoggedIn { fingerprint, .. } => assert_eq!(fingerprint, fp1),
+            _ => unreachable!(),
+        }
+        let _ = std::fs::remove_dir_all(d1);
+        let _ = std::fs::remove_dir_all(d2);
+    }
+
+    /// Un garant indépendant (au menu, 3 parties jouées, sans lien avec les joueurs) sert
+    /// la partie ; un second la vérifie et la reprend quand l'hôte triche.
+    #[test]
+    fn independent_garants_serve_check_and_replace_a_cheating_host() {
+        let dir = std::env::temp_dir().join(format!("minelib-garants-{}", rand::random::<u32>()));
+        {
+            let mut st = stats::Store::open(dir.join("stats")).unwrap();
+            for g in ["Garant", "Verif"] {
+                st.get_mut(g).games = 5;
+                st.save(g);
+            }
+        }
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let g = login("Garant");
+        g.send(Cmd::GarantAvailable(true));
+        let novice = login("Novice");
+        novice.send(Cmd::GarantAvailable(true));
+        let p = Client::spawn(addr.clone(), Some(h.public));
+        p.send(Cmd::Register {
+            pseudo: "Joueur".into(),
+            password: "motdepasse".into(),
+        });
+        let plink = match wait(&p, |e| matches!(e, Event::Link(_))) {
+            Event::Link(l) => l,
+            _ => unreachable!(),
+        };
+        wait(&p, |e| matches!(e, Event::LoggedIn { .. }));
+        std::thread::sleep(Duration::from_millis(200));
+        p.send(Cmd::Search {
+            map_sig: [9; 32],
+            map: "dust".into(),
+        });
+        match wait(&p, |e| matches!(e, Event::Joined { .. } | Event::Hosted(_))) {
+            Event::Joined { host, .. } => assert_eq!(host, "Garant", "pas « Novice » (0 partie)"),
+            e => panic!("servie par un garant : {e:?}"),
+        }
+        match wait(&g, |e| matches!(e, Event::GarantTask { .. })) {
+            Event::GarantTask { standby, .. } => assert!(!standby),
+            _ => unreachable!(),
+        }
+        // Un second garant arrive : mis en attente (vérificateur), désigné à l'hôte.
+        let v = login("Verif");
+        v.send(Cmd::GarantAvailable(true));
+        std::thread::sleep(Duration::from_millis(2100));
+        p.send(Cmd::Maps);
+        match wait(&v, |e| matches!(e, Event::GarantTask { .. })) {
+            Event::GarantTask { standby, .. } => assert!(standby),
+            _ => unreachable!(),
+        }
+        wait(&g, |e| matches!(e, Event::BackupIs(_)));
+        // Le vérificateur reçoit une copie attestée des tirs du joueur (pas du tchat).
+        let to_host = |m: &game::ToHost| {
+            transport::push(
+                &plink,
+                &Request::ToHost {
+                    data: game::encode(m),
+                },
+            );
+        };
+        to_host(&game::ToHost::Chat("salut".into()));
+        let fire = game::ToHost::Fire {
+            weapon: 1,
+            origin: [0.0; 3],
+            dirs: vec![[1.0, 0.0, 0.0]],
+            view_tick: 5,
+        };
+        to_host(&fire);
+        match wait(&v, |e| matches!(e, Event::Witness { .. })) {
+            Event::Witness { data, .. } => {
+                assert_eq!(game::decode::<game::ToHost>(&data), Some(fire))
+            }
+            _ => unreachable!(),
+        }
+        wait(&g, |e| matches!(e, Event::FromPeer { .. }));
+        wait(&g, |e| matches!(e, Event::FromPeer { .. }));
+        // Résultat : la majorité des joueurs ne suffit pas, il faut aussi le vérificateur.
+        g.send(Cmd::RoomStarted(true));
+        v.send(Cmd::GarantReady);
+        std::thread::sleep(Duration::from_millis(300));
+        let summary = game::MatchSummary {
+            map_sig: [9; 32],
+            score: [13, 5],
+            rounds: 18,
+            players: vec![game::SummaryPlayer {
+                pseudo: "Joueur".into(),
+                start_team: 0,
+                kills: 20,
+                deaths: 10,
+                assists: 2,
+                headshots: 5,
+                damage: 2500,
+                mvps: 3,
+                score: 50,
+                rounds: 18,
+            }],
+        };
+        let matches = |p: &Client| {
+            p.send(Cmd::Leaderboard { friends: false });
+            match wait(p, |e| matches!(e, Event::Leaderboard { .. })) {
+                Event::Leaderboard { me, .. } => me.map_or(0, |m| m.wins + m.losses + m.ties),
+                _ => unreachable!(),
+            }
+        };
+        p.send(Cmd::MatchResult(game::encode(&summary)));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(matches(&p), 0, "pas sans le vérificateur");
+        let mut other = summary.clone();
+        other.score = [5, 13];
+        v.send(Cmd::MatchResult(game::encode(&other)));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(matches(&p), 0, "pas contre le vérificateur");
+        v.send(Cmd::MatchResult(game::encode(&summary)));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(matches(&p), 1, "le vérificateur confirme");
+        // Deux preuves de triche : le vérificateur reprend, l'hôte tricheur est écarté.
+        for _ in 0..2 {
+            v.send(Cmd::Conflict {
+                player: 0,
+                seq: 0,
+                host_pos: [0.0; 3],
+                audit_pos: [1.0; 3],
+                proof: true,
+            });
+        }
+        match wait(&v, |e| matches!(e, Event::Promoted { .. })) {
+            Event::Promoted { old_host, .. } => assert_eq!(old_host, None),
+            _ => unreachable!(),
+        }
+        wait(&g, |e| matches!(e, Event::RoomClosed));
+        match wait(&p, |e| matches!(e, Event::HostChanged(_))) {
+            Event::HostChanged(h) => assert_eq!(h, "Verif"),
+            _ => unreachable!(),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

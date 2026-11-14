@@ -27,6 +27,9 @@ pub enum Cmd {
         pseudo: String,
         password: String,
         totp: Option<u32>,
+        /// Coffre du compte gardé sur ce PC : sur un relais qui ne connaît pas le compte,
+        /// il y est réinscrit tel quel (même clé, même pseudo).
+        backup: Option<Vec<u8>>,
     },
     TotpBegin,
     TotpConfirm(u32),
@@ -51,7 +54,26 @@ pub enum Cmd {
     },
     Report(String),
     Unreport(String),
+    GarantAvailable(bool),
+    GarantReady,
+    Conflict {
+        player: u64,
+        seq: u32,
+        host_pos: [f32; 3],
+        audit_pos: [f32; 3],
+        proof: bool,
+    },
+    Vote {
+        conflict: u64,
+        auditor_right: bool,
+    },
     Ban {
+        pseudo: String,
+        reason: String,
+    },
+    /// OP du serveur de construction : `proto::SERVER_…`.
+    ServerAdmin {
+        action: u8,
         pseudo: String,
         reason: String,
     },
@@ -80,6 +102,11 @@ pub enum Event {
     Pinned([u8; 32]),
     /// Étape en cours (affichage).
     Progress(&'static str),
+    /// Coffre chiffré du compte, à garder sur ce PC (réinscription sur un autre relais).
+    AccountBackup {
+        pseudo: String,
+        vault: Vec<u8>,
+    },
     LoggedIn {
         pseudo: String,
         fingerprint: String,
@@ -110,6 +137,10 @@ pub enum Event {
     Reported(String),
     Unreported(String),
     BanDone(String),
+    /// Réponse d'une commande d'OP (texte à afficher).
+    ServerAdmin(String),
+    /// Exclu du serveur (banni), avec la raison.
+    Kicked(String),
     Leaderboard {
         friends: bool,
         list: Vec<crate::proto::RankEntry>,
@@ -140,7 +171,24 @@ pub enum Event {
     },
     PeerLeft(u64),
     RoomClosed,
-    Promoted(Vec<(u64, String)>),
+    Promoted {
+        members: Vec<(u64, String)>,
+        old_host: Option<u64>,
+    },
+    GarantTask {
+        room: u64,
+        map_sig: [u8; 32],
+        map: String,
+        members: Vec<(u64, String)>,
+        standby: bool,
+    },
+    BackupIs(u64),
+    Judge {
+        conflict: u64,
+        seq: u32,
+        host_pos: [f32; 3],
+        audit_pos: [f32; 3],
+    },
     Voice {
         from: u64,
         data: Vec<u8>,
@@ -151,6 +199,11 @@ pub enum Event {
         data: Vec<u8>,
     },
     FromHost(Vec<u8>),
+    /// Garant vérificateur : copie d'une demande d'un joueur à l'hôte.
+    Witness {
+        peer: u64,
+        data: Vec<u8>,
+    },
 }
 
 pub struct Client {
@@ -194,6 +247,29 @@ impl Client {
 }
 
 /// Message d'une erreur du relais, pour le joueur.
+/// Demande au relais `addr` (clé `key`) si `pseudo` y a un compte : sa clé publique.
+pub fn whois(addr: &str, key: [u8; 32], pseudo: &str) -> Result<Option<[u8; 32]>> {
+    let (mut chan, got) = Channel::connect(addr, Duration::from_secs(4))?;
+    if got != key {
+        return Err(anyhow!("clé du relais inattendue"));
+    }
+    chan.send(&Request::Hello {
+        protocol: proto::PROTOCOL,
+        client: format!("relais minelib {}", env!("CARGO_PKG_VERSION")),
+    })?;
+    match chan.recv::<Response>()? {
+        Response::Hello { .. } => {}
+        r => return Err(anyhow!("réponse inattendue : {r:?}")),
+    }
+    chan.send(&Request::Whois {
+        pseudo: pseudo.to_string(),
+    })?;
+    match chan.recv::<Response>()? {
+        Response::Whois { pubkey } => Ok(pubkey),
+        r => Err(anyhow!("réponse inattendue : {r:?}")),
+    }
+}
+
 pub fn error_text(code: ErrorCode, message: &str) -> String {
     let base = match code {
         ErrorCode::Protocol => "Version du jeu incompatible avec le relais.",
@@ -309,11 +385,38 @@ impl Worker {
             Response::PeerJoined { peer, pseudo } => Event::PeerJoined { peer, pseudo },
             Response::PeerLeft { peer } => Event::PeerLeft(peer),
             Response::RoomClosed => Event::RoomClosed,
-            Response::Promoted { members } => Event::Promoted(members),
+            Response::Promoted { members, old_host } => Event::Promoted { members, old_host },
+            Response::GarantTask {
+                room,
+                map_sig,
+                map,
+                members,
+                standby,
+            } => Event::GarantTask {
+                room,
+                map_sig,
+                map,
+                members,
+                standby,
+            },
+            Response::BackupIs { peer } => Event::BackupIs(peer),
+            Response::Judge {
+                conflict,
+                seq,
+                host_pos,
+                audit_pos,
+            } => Event::Judge {
+                conflict,
+                seq,
+                host_pos,
+                audit_pos,
+            },
             Response::Voice { from, data } => Event::Voice { from, data },
             Response::HostChanged { host } => Event::HostChanged(host),
+            Response::Kicked { reason } => Event::Kicked(reason),
             Response::FromPeer { peer, data } => Event::FromPeer { peer, data },
             Response::FromHost { data } => Event::FromHost(data),
+            Response::Witness { peer, data } => Event::Witness { peer, data },
             Response::Zones { gained, lost } => Event::Zones { gained, lost },
             Response::FromZone { peer, chunk, data } => Event::FromZone { peer, chunk, data },
             // Banni pendant la session : déconnecté.
@@ -443,12 +546,36 @@ impl Worker {
                 pseudo,
                 password,
                 totp,
+                backup,
             } => {
                 self.chan = None;
                 self.connect()?;
                 self.emit(Event::Progress("Vérification du mot de passe…"));
                 let keys = crypto::derive(&pseudo, &password)?;
-                self.login(&pseudo, &keys, totp)
+                let wrong = error_text(ErrorCode::WrongCredentials, "");
+                match self.login(&pseudo, &keys, totp) {
+                    Err(e) if e.to_string() == wrong && backup.is_some() => {
+                        // Compte inconnu de ce relais (nouveau relais) : réinscription avec
+                        // le coffre gardé, s'il s'ouvre avec ce mot de passe.
+                        let vault = backup.unwrap_or_default();
+                        let id = crypto::open_identity(&keys, &vault).map_err(|_| e)?;
+                        let pubkey = id.verifying_key().to_bytes();
+                        self.emit(Event::Progress("Compte transféré sur ce relais…"));
+                        let pow = crypto::pow_solve(&pseudo, &pubkey, self.pow_bits);
+                        match self.request(&Request::Register {
+                            pseudo: pseudo.clone(),
+                            pubkey,
+                            auth: keys.auth,
+                            vault,
+                            pow,
+                        })? {
+                            Response::Registered { .. } => {}
+                            r => return self.unexpected(r),
+                        }
+                        self.login(&pseudo, &keys, totp)
+                    }
+                    r => r,
+                }
             }
             Cmd::TotpBegin => match self.request(&Request::TotpBegin)? {
                 Response::TotpSecret { secret } => {
@@ -563,6 +690,55 @@ impl Worker {
                 }
                 r => self.unexpected(r),
             },
+            Cmd::ServerAdmin {
+                action,
+                pseudo,
+                reason,
+            } => match self.request(&Request::ServerAdmin {
+                action,
+                pseudo,
+                reason,
+            })? {
+                Response::ServerAdmin { text } => {
+                    self.emit(Event::ServerAdmin(text));
+                    Ok(())
+                }
+                r => self.unexpected(r),
+            },
+            Cmd::GarantAvailable(on) => {
+                self.oneway(&Request::GarantAvailable { on })?;
+                Ok(())
+            }
+            Cmd::GarantReady => {
+                self.oneway(&Request::GarantReady)?;
+                Ok(())
+            }
+            Cmd::Conflict {
+                player,
+                seq,
+                host_pos,
+                audit_pos,
+                proof,
+            } => {
+                self.oneway(&Request::Conflict {
+                    player,
+                    seq,
+                    host_pos,
+                    audit_pos,
+                    proof,
+                })?;
+                Ok(())
+            }
+            Cmd::Vote {
+                conflict,
+                auditor_right,
+            } => {
+                self.oneway(&Request::Vote {
+                    conflict,
+                    auditor_right,
+                })?;
+                Ok(())
+            }
             Cmd::Unreport(pseudo) => match self.request(&Request::Unreport {
                 pseudo: pseudo.clone(),
             })? {
@@ -694,6 +870,14 @@ impl Worker {
         }
     }
 
+    /// Envoi sans réponse attendue.
+    fn oneway(&mut self, req: &Request) -> Result<()> {
+        self.chan
+            .as_mut()
+            .ok_or_else(|| anyhow!("pas connecté"))?
+            .send(req)
+    }
+
     fn unexpected(&self, r: Response) -> Result<()> {
         match r {
             Response::Error { code, message } => Err(anyhow!(error_text(code, &message))),
@@ -702,7 +886,7 @@ impl Worker {
     }
 
     fn login(&mut self, pseudo: &str, keys: &crypto::Keys, totp: Option<u32>) -> Result<()> {
-        let hw = crate::hw::fingerprint_for(&self.relay_pub);
+        let hw = crate::hw::fingerprints_for(&self.relay_pub);
         let r = self.request(&Request::Login {
             pseudo: pseudo.to_string(),
             auth: keys.auth,
@@ -719,6 +903,10 @@ impl Worker {
         };
         let id = crypto::open_identity(keys, &vault)?;
         let signature = id.sign(&challenge).to_bytes().to_vec();
+        self.emit(Event::AccountBackup {
+            pseudo: pseudo.to_string(),
+            vault: vault.clone(),
+        });
         match self.request(&Request::Prove { signature })? {
             Response::Welcome { pseudo, totp } => {
                 self.pseudo = pseudo.clone();

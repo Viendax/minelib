@@ -45,6 +45,7 @@ mod debug;
 mod equip;
 mod fps;
 mod fpsmap;
+mod garant;
 mod gpu_plan;
 mod gpu_report;
 mod hand;
@@ -129,6 +130,10 @@ struct Game {
     fps_status: Option<String>,
     /// Mise à jour automatique (GitHub).
     updater: update::Updater,
+    /// Garant indépendant (au menu : sert ou vérifie la partie d'autres joueurs).
+    garant: Option<garant::Garant>,
+    /// Disponibilité de garant annoncée au relais.
+    garant_announced: Option<bool>,
     /// Un monde a été ouvert depuis le lancement (plus de mise à jour automatique sans
     /// demander : bouton sur l'accueil).
     played: bool,
@@ -238,6 +243,8 @@ impl Game {
             pending_build: None,
             fps_status: None,
             updater: update::Updater::new(),
+            garant: None,
+            garant_announced: None,
             played: false,
             renderer: None,
             worlds: save::list_worlds(&paths.saves),
@@ -341,6 +348,11 @@ impl Game {
         // Nouveau monde : rien de l'ancien ne doit rester à l'écran.
         self.session = None;
         self.played = true;
+        // On joue : plus garant (le garant en attente ou un joueur reprend sans coupure).
+        if self.garant.take().is_some() {
+            self.accounts.room(minelib_net::client::Cmd::Leave);
+        }
+        self.announce_garant(false);
         // Le rendu est emprunté pendant l'image : on vide ses maillages en fin d'image.
         self.clear_meshes = true;
         match Session::open(dir, self.config) {
@@ -615,6 +627,60 @@ impl Game {
     fn handle_game_events(&mut self) {
         use minelib_net::client::{Cmd, Event};
         for e in std::mem::take(&mut self.accounts.game_events) {
+            // Garant indépendant (au menu) : ses événements de partie.
+            if self.session.is_none() && self.garant.is_some() {
+                match &e {
+                    Event::PeerJoined { .. }
+                    | Event::PeerLeft(_)
+                    | Event::FromPeer { .. }
+                    | Event::Witness { .. }
+                    | Event::FromHost(_)
+                    | Event::Promoted { .. }
+                    | Event::HostChanged(_)
+                    | Event::BackupIs(_) => {
+                        if let Some(g) = &mut self.garant {
+                            g.event(&e);
+                        }
+                        continue;
+                    }
+                    Event::RoomClosed => {
+                        self.garant = None;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if let Event::GarantTask {
+                room,
+                map_sig,
+                map,
+                members,
+                standby,
+            } = &e
+            {
+                if self.session.is_some() || self.searching.is_some() {
+                    self.accounts.room(Cmd::Leave);
+                    continue;
+                }
+                let Some(link) = self.accounts.link.clone() else {
+                    continue;
+                };
+                let dir = self.local_map(map_sig);
+                if dir.is_none() {
+                    self.accounts.room(Cmd::DownloadMap(*map_sig));
+                }
+                self.garant = Some(garant::Garant::new(
+                    *room,
+                    *map_sig,
+                    map.clone(),
+                    members.clone(),
+                    *standby,
+                    link,
+                    self.accounts.pseudo(),
+                    dir,
+                ));
+                continue;
+            }
             match &e {
                 Event::Hosted(room) => {
                     if let Some((sig, name, Some(dir))) = self.searching.take() {
@@ -671,7 +737,21 @@ impl Game {
                         .map(|m| m.name.clone())
                         .or_else(|| self.pending_build.as_ref().map(|p| p.1.clone()))
                         .unwrap_or_else(|| "Carte".into());
+                    let for_garant = self
+                        .garant
+                        .as_ref()
+                        .is_some_and(|g| g.needs_map() && g.sig == *sig);
+                    let name = if for_garant {
+                        self.garant.as_ref().map_or(name, |g| g.map.clone())
+                    } else {
+                        name
+                    };
                     match fpsmap::unpack(&self.paths.root.join("maps"), &name, bytes) {
+                        Ok(dir) if for_garant => {
+                            if let Some(g) = &mut self.garant {
+                                g.set_dir(dir);
+                            }
+                        }
                         Ok(dir) => {
                             if let Some((_, _, host)) = self.pending_build.take() {
                                 self.fps_status = None;
@@ -703,6 +783,17 @@ impl Game {
                             chat::YELLOW,
                         );
                     }
+                }
+                Event::ServerAdmin(text) => {
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(text, chat::YELLOW);
+                    }
+                }
+                Event::Kicked(reason) => {
+                    if self.session.as_ref().is_some_and(|s| s.build.is_some()) {
+                        self.leave_world();
+                    }
+                    self.notify(reason);
                 }
                 Event::BanDone(p) => {
                     if let Some(s) = &mut self.session {
@@ -773,6 +864,31 @@ impl Game {
             if std::mem::take(&mut s.voice_dirty) {
                 save_volumes(&self.paths.root.join("voice.txt"), &s.voice_volumes);
             }
+        }
+    }
+
+    /// Garant indépendant : simulation, disponibilité annoncée au relais.
+    fn garant_update(&mut self, dt: f32) {
+        let free = self.session.is_none()
+            && self.accounts.logged_in()
+            && self.searching.is_none()
+            && self.options.garant;
+        self.announce_garant(free);
+        if self.session.is_some() {
+            return;
+        }
+        if let Some(g) = &mut self.garant {
+            for cmd in g.update(dt) {
+                self.accounts.room(cmd);
+            }
+        }
+    }
+
+    fn announce_garant(&mut self, on: bool) {
+        if self.garant_announced != Some(on) && self.accounts.logged_in() {
+            self.garant_announced = Some(on);
+            self.accounts
+                .room(minelib_net::client::Cmd::GarantAvailable(on));
         }
     }
 
@@ -914,6 +1030,8 @@ impl Game {
                 });
             }
             multiplayer::FpsAction::Search(i) => {
+                // On va jouer : plus garant (le relais fait reprendre la partie servie).
+                self.garant = None;
                 if let Some(m) = self.map_rows.get(i).cloned() {
                     self.searching = Some((m.sig, m.name.clone(), m.local.clone()));
                     if m.local.is_some() {
@@ -944,6 +1062,9 @@ impl Game {
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Fps;
+            // Pas de vol en partie en ligne.
+            s.game.can_fly = false;
+            s.player.flying = false;
             s.voice = Some(voice::Voice::new(link.clone()));
             s.net = Some(netgame::NetGame::host(
                 link,
@@ -968,6 +1089,9 @@ impl Game {
         self.play(dir);
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Fps;
+            // Pas de vol en partie en ligne.
+            s.game.can_fly = false;
+            s.player.flying = false;
             s.voice = Some(voice::Voice::new(link.clone()));
             s.net = Some(netgame::NetGame::guest(link, sig));
             s.chat
@@ -2092,6 +2216,7 @@ impl GameLoop for Game {
         self.poll_accounts();
         self.handle_game_events();
         self.updater.poll(!self.played);
+        self.garant_update(dt);
 
         // Échap : pause / reprise / fermeture de l'inventaire.
         if input.pressed(KeyCode::Escape) {

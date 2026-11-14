@@ -93,8 +93,8 @@ Copiez le dossier du monde (celui qui contient `level.dat` et `region/`) dans
 - Java Edition, format Anvil : avant 1.13, de 1.13 à 1.17, et 1.18 ou plus récent.
 - Les fichiers d'origine **ne sont jamais modifiés**. Minelib écrit sa propre sauvegarde
   à côté (`level.txt`, `chunks.bin`, `edits.bin`).
-- La hauteur est de 256 blocs : un monde 1.18+ (Y −64 à 319) est décalé de +64, et ce qui
-  dépasse Y 191 est ignoré.
+- La hauteur est de 512 blocs : un monde 1.18+ (Y −64 à 319) est décalé de +64 et tient
+  en entier (Y 0 à 383) ; les mondes plus anciens (Y 0 à 255) ne sont pas décalés.
 
 ### Ajouter un pack de textures
 
@@ -256,6 +256,9 @@ e-mail, ni numéro de téléphone.
   titre), scanne le QR code avec Authy, Aegis, Google Authenticator, 2FAS ou Bitwarden.
 - Les pseudos sont inscrits dans un **registre public signé** par le relais : impossible
   de le modifier en douce. Aucune base de données ni donnée personnelle.
+- **Un pseudo n'existe qu'une fois** : « Bob », « bob » et « BOB » sont le même pseudo, et
+  avant chaque inscription le relais demande aux autres relais du DHT s'il y est déjà pris
+  (avec une autre clé : refusé ; avec la même : c'est le même compte qui arrive).
 
 ### Relais (aucun réglage, aucun port à ouvrir)
 
@@ -272,11 +275,18 @@ Avec `relay=auto` (par défaut), le jeu le trouve tout seul :
 3. sinon, ce PC devient le relais : joignable de partout sans ouvrir de port, inscrit
    dans le DHT pour les suivants.
 
-Le protocole Minelib reste chiffré de bout en bout (Noise) dans le tunnel.
+Le protocole Minelib reste chiffré de bout en bout (Noise) dans le tunnel. Le tunnel dit
+au relais qui est vraiment au bout (son adresse IP, ou son identifiant iroh s'il passe
+par un serveur relais d'iroh) : les limites d'inscription (3 par heure et par adresse,
+20 par heure en tout pour les joueurs sans IP connue) et d'essais de connexion
+s'appliquent par joueur, en plus de la preuve de travail.
 `minelib-relay.exe` est le même relais sans le jeu : allumé en permanence, il devient
 naturellement le relais de tout le monde (le plus ancien est choisi). Une adresse fixe
-dans `relay=` reste possible. Limite : les comptes et le classement sont gardés par le
-relais choisi ; si un autre relais prend sa place, il faut s'y inscrire.
+dans `relay=` reste possible. Le **compte suit le joueur** : son coffre chiffré est gardé
+sur son PC (`.minelib/comptes`), et sur un relais qui ne le connaît pas, il y est réinscrit
+tout seul (même pseudo, même clé) dès qu'on se connecte avec le bon mot de passe. Le
+classement, lui, reste propre à chaque relais (un relais ne peut pas vérifier les
+statistiques d'un autre).
 
 ## 🌐 Multijoueur
 
@@ -325,7 +335,7 @@ Pas de liste de serveurs : en haut le **classement**, en bas le **choix de la ca
   morts, MVP, % tête, ADR, score, manches gagnées). En fin de partie, le tableau reste
   affiché avec **victoire / défaite**, et le résultat part au classement : il compte quand
   plus de la moitié des joueurs envoient le même.
-- Réseau : simulation à 128 pas par seconde ; chacun prédit son mouvement et se corrige
+- Réseau : simulation à 256 pas par seconde (états envoyés 64 fois par seconde) ; chacun prédit son mouvement et se corrige
   sur l'hôte ; les autres sont interpolés (~50 ms) et l'hôte rembobine les cibles pour
   juger les tirs (tête ×4, jambes ×0,75).
 
@@ -344,14 +354,42 @@ clic droit), puis :
 Les réglages vont dans `fps.txt`, dans le dossier du monde, et font partie de la
 signature de la carte.
 
-### Garant de secours
+### Garants indépendants et anti-triche
 
-L'hôte d'une partie FPS envoie chaque seconde l'état complet de la partie (manches, argent,
-positions, armes au sol) à un **garant de secours** choisi parmi les joueurs. Si l'hôte
-part, le garant reprend la partie là où elle en était, sans la fermer : les autres
-joueurs continuent avec lui (l'ancien hôte reste au résultat). Le résultat d'une partie ne
-compte au classement que si la majorité des joueurs envoient le même : les joueurs jugent
-en cas de désaccord.
+- **Garant indépendant** : un joueur resté au menu (et qui le permet, `garant=true` dans
+  `options.txt`, par défaut) peut servir la partie d'autres joueurs sans y jouer. Le relais
+  le choisit parmi les disponibles : au moins 3 parties jouées, peu signalé, **aucun lien
+  avec les joueurs** (ni ami, ni signalé, ni signalant), et le plus adapté (processeur,
+  images par seconde, mémoire, ancienneté). S'il n'y en a aucun au départ, un joueur sert
+  la partie, puis elle passe à un garant indépendant dès qu'il y en a un, sans coupure.
+- **Garant en attente et vérificateur** : un second garant indépendant reçoit chaque
+  seconde une copie complète de la partie avec le **journal des coups**, chaînés dans une
+  **chaîne de coups** (chaque maillon est l'empreinte du précédent et du coup : on ne peut
+  ni effacer ni changer un coup). Le journal contient tout ce qui change la partie :
+  entrées de chaque joueur à chaque pas, réapparitions, tirs, grenades, explosions et
+  feu, achats, touches (poser, désamorcer), équipes, arrivées et départs. Le vérificateur
+  **rejoue la partie entière** avec le même code que l'hôte : déplacements, chaque tir sur
+  les positions rembobinées, chaque touche et ses dégâts (tête, jambes, gilet), les
+  chutes, les grenades, l'argent, la bombe, les éliminations, les manches et le score, et
+  compare tout avec l'hôte, au bit près. Une explosion sans HE lancée, du feu sans
+  molotov, des dégâts sortis de nulle part ou un score retouché sont des preuves.
+- **Le relais témoigne** : chaque tir, grenade, achat, touche ou changement d'équipe d'un
+  joueur arrive aussi au vérificateur directement par le relais, qui atteste qui l'a
+  envoyé. Un tir que l'hôte invente au nom d'un joueur, ou qu'il « oublie », est une preuve.
+- **Les joueurs jugent** : quand le vérificateur n'est pas d'accord avec l'hôte sur un
+  joueur, ce joueur tranche avec sa propre prédiction de son mouvement. Un hôte qui triche
+  sur lui-même (chaîne faussée, position sans entrée qui l'explique) est pris sans appel.
+  Deux désaccords confirmés : le vérificateur reprend la partie, l'hôte tricheur est écarté
+  et perd en réputation ; trois désaccords rejetés : c'est le vérificateur qui est écarté.
+- **Relève** : quand un garant lance lui-même une partie (ou part), le garant en attente
+  reprend aussitôt, au pas près ; s'il n'y en a pas, un joueur (le garant de secours).
+- **Contre les « wallhacks » et le « ghosting »** : un adversaire caché derrière un mur
+  n'est pas envoyé au joueur (sauf tout près ou s'il vient de tirer, on l'entend) ; le
+  serveur ne joue pas, il n'a pas d'équipe à renseigner.
+- Le résultat d'une partie ne compte au classement que si la majorité des joueurs envoient
+  le même, **et**, quand un vérificateur suit la partie, que s'il trouve le même résultat
+  en rejouant la partie : une majorité complice de l'hôte ne peut pas imposer un faux
+  résultat.
 
 ### Détails de CS
 
@@ -374,16 +412,27 @@ retenu dans `voice.txt`).
 
 ### Bans
 
-Les administrateurs d'un relais (pseudos dans `admins.txt`, dans le dossier du relais)
-tapent `/ban <pseudo> [raison]` : le compte est banni **à vie** (inscrit au registre
-signé) et ses machines pour **3 mois**. L'empreinte d'une machine n'est jamais envoyée
-telle quelle : le jeu n'envoie qu'une empreinte salée par la clé du relais, différente pour
-chaque relais.
+**Serveurs de construction** : le créateur du serveur est **OP** d'office ; lui seul nomme
+d'autres OP (`/op <pseudo>`, `/deop <pseudo>`, `/op` seul pour la liste). Les OP bannissent
+(`/ban <pseudo> [raison]` : exclu tout de suite, ne peut plus rejoindre ce serveur) et
+débannissent (`/unban <pseudo>`). Personne ne peut bannir le créateur ni lui retirer l'OP.
+La liste est gardée par le relais, pour ce créateur et ce monde : elle reste valable quand
+le monde change de propriétaire en cours de partie, et quand le créateur le rouvre. `/ban`
+n'existe pas en FPS.
+
+**Relais** : ses administrateurs (pseudos dans `admins.txt`, dans le dossier du relais)
+tapent `/banrelais <pseudo> [raison]` : le compte est banni **à vie** (inscrit au registre
+signé) et ses machines pour **3 mois**. Une machine est reconnue par plusieurs composants
+(identifiant Windows, carte mère, BIOS, processeur, disque, volume, carte réseau) : il
+faut en changer au moins tous sauf un pour échapper au ban. Rien n'est envoyé tel quel :
+pour chaque composant, le jeu n'envoie qu'une empreinte salée par la clé du relais,
+différente pour chaque relais.
 
 ### Construction en ligne (joueurs illimités)
 
 **Ouvrir un monde** : le monde est envoyé au relais, les autres le téléchargent en
-rejoignant. Le monde est découpé en zones de 4 × 4 chunks ; chaque zone active a un
+rejoignant. Si celui qui l'a ouvert part, le joueur le plus adapté devient propriétaire du
+monde (il reçoit tout ce qui a été construit et l'enregistre) : la partie continue. Le monde est découpé en zones de 4 × 4 chunks ; chaque zone active a un
 **garant** (un des joueurs) qui valide les blocs posés (bloc valide, dans la zone, 20 par
 seconde au plus) et les publie aux joueurs proches. Les garants sont choisis parmi les
 joueurs disponibles, **les plus adaptés d'abord** (processeur, images par seconde,
@@ -400,7 +449,9 @@ joueurs n'est pas limité.
 | `/unreport <pseudo>` | Annuler son signalement (on peut de nouveau tomber avec lui) |
 | `/ami <pseudo>`, `/ami retirer <pseudo>`, `/amis` | Amis (onglet du classement) |
 | `/equipe ct` / `/equipe t` | Changer d'équipe pendant l'échauffement |
-| `/ban <pseudo> [raison]` | Bannir (administrateurs du relais) |
+| `/ban <pseudo> [raison]`, `/unban <pseudo>` | Construction : bannir d'un serveur (ses OP) |
+| `/op <pseudo>`, `/deop <pseudo>`, `/op` | Construction : OP du serveur (son créateur) |
+| `/banrelais <pseudo> [raison]` | Bannir du relais (administrateurs du relais) |
 
 ## 🔄 Mises à jour automatiques
 

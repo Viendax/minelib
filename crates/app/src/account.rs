@@ -86,6 +86,8 @@ fn auto_relay(
     let mine = SocketAddr::from(([127, 0, 0, 1], h.addr.port()));
     if let Some(node) = node() {
         node.serve(mine);
+        // Pseudos uniques avec les autres relais du DHT.
+        h.set_whois(minelib_relay::federated_whois(node, h.public));
         minelib_p2p::publish(minelib_p2p::Ad {
             node: node.id(),
             noise: h.public,
@@ -191,6 +193,13 @@ impl Accounts {
             maps: Vec::new(),
             lan_relay: false,
         }
+    }
+
+    /// Coffre du compte gardé sur ce PC (chiffré par le mot de passe).
+    fn backup_path(&self, pseudo: &str) -> PathBuf {
+        self.relay_dir
+            .with_file_name("comptes")
+            .join(format!("{}.coffre", pseudo.to_lowercase()))
     }
 
     pub fn logged_in(&self) -> bool {
@@ -337,6 +346,13 @@ impl Accounts {
                     self.game_events.push(Event::Error(m));
                 }
                 Event::Link(l) => self.link = Some(l),
+                Event::AccountBackup { pseudo, vault } => {
+                    let p = self.backup_path(&pseudo);
+                    if let Some(d) = p.parent() {
+                        let _ = std::fs::create_dir_all(d);
+                    }
+                    let _ = std::fs::write(p, vault);
+                }
                 Event::Leaderboard { friends, list, me } => {
                     self.busy = None;
                     self.leaderboard = Some((friends, list, me));
@@ -354,6 +370,8 @@ impl Accounts {
                 | Event::Reported(_)
                 | Event::Unreported(_)
                 | Event::BanDone(_)
+                | Event::ServerAdmin(_)
+                | Event::Kicked(_)
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)
                 | Event::MapDownloaded { .. }
@@ -365,10 +383,14 @@ impl Accounts {
                 | Event::PeerJoined { .. }
                 | Event::PeerLeft(_)
                 | Event::RoomClosed
-                | Event::Promoted(_)
+                | Event::Promoted { .. }
+                | Event::GarantTask { .. }
+                | Event::BackupIs(_)
+                | Event::Judge { .. }
                 | Event::Voice { .. }
                 | Event::HostChanged(_)
                 | Event::FromPeer { .. }
+                | Event::Witness { .. }
                 | Event::FromHost(_)) => self.game_events.push(e),
             }
         }
@@ -624,10 +646,12 @@ impl Accounts {
             let password = self.password.clone();
             if page == Page::Login {
                 let totp = self.need_totp.then(|| self.code.parse().unwrap_or(0));
+                let backup = std::fs::read(self.backup_path(&pseudo)).ok();
                 self.send(Cmd::Login {
                     pseudo,
                     password,
                     totp,
+                    backup,
                 });
             } else {
                 self.send(Cmd::Register { pseudo, password });

@@ -1,5 +1,8 @@
 //! Limitation des essais : après 5 échecs (par adresse ou par pseudo), attente de 30 s qui
 //! double à chaque nouvel échec (15 min au plus). Inscriptions : 3 par heure et par adresse.
+//! Par le tunnel iroh, l'adresse est celle que donne le préambule du tunnel ; quand le
+//! joueur passe par un serveur relais d'iroh, on n'a que son identifiant iroh (« iroh:… »),
+//! qui ne coûte rien à changer : ces inscriptions-là ont en plus une limite commune.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -12,6 +15,9 @@ pub struct Limits {
 
 const FREE_TRIES: u32 = 5;
 const MAX_WAIT: u64 = 15 * 60;
+/// Inscriptions par heure, toutes ensemble, des joueurs dont on ne connaît pas l'IP.
+const IROH_PER_HOUR: usize = 20;
+const IROH_ALL: &str = "iroh:*";
 
 impl Limits {
     /// Secondes à attendre avant le prochain essai, s'il y en a.
@@ -44,9 +50,23 @@ impl Limits {
     }
 
     pub fn register_wait(&mut self, ip: &str) -> Option<u64> {
-        let list = self.registrations.entry(ip.to_string()).or_default();
+        // Ce PC lui-même (relais intégré, essais) : pas de limite.
+        if ip == "127.0.0.1" || ip == "::1" {
+            return None;
+        }
+        let own = self.bucket_wait(ip, 3);
+        let shared = if ip.starts_with("iroh:") {
+            self.bucket_wait(IROH_ALL, IROH_PER_HOUR)
+        } else {
+            None
+        };
+        own.max(shared)
+    }
+
+    fn bucket_wait(&mut self, key: &str, max: usize) -> Option<u64> {
+        let list = self.registrations.entry(key.to_string()).or_default();
         list.retain(|t| t.elapsed() < Duration::from_secs(3600));
-        if list.len() >= 3 {
+        if list.len() >= max {
             let oldest = list.iter().min()?;
             Some(3600u64.saturating_sub(oldest.elapsed().as_secs()).max(1))
         } else {
@@ -55,10 +75,17 @@ impl Limits {
     }
 
     pub fn registered(&mut self, ip: &str) {
+        let now = Instant::now();
         self.registrations
             .entry(ip.to_string())
             .or_default()
-            .push(Instant::now());
+            .push(now);
+        if ip.starts_with("iroh:") {
+            self.registrations
+                .entry(IROH_ALL.to_string())
+                .or_default()
+                .push(now);
+        }
     }
 }
 
@@ -82,5 +109,13 @@ mod tests {
             l.registered("ip");
         }
         assert!(l.register_wait("ip").is_some());
+        // Sans IP connue : 3 par identifiant, 20 en tout.
+        for i in 0..20 {
+            let k = format!("iroh:{i}");
+            assert!(l.register_wait(&k).is_none(), "{i}");
+            l.registered(&k);
+        }
+        assert!(l.register_wait("iroh:neuf").is_some());
+        assert!(l.register_wait("1.2.3.4").is_none());
     }
 }

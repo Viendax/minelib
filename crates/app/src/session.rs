@@ -43,11 +43,11 @@ pub struct SessionConfig {
     pub view_distance: i32,
 }
 
-/// Pas de la simulation du joueur : 128 fois par seconde, quelle que soit la cadence
+/// Pas de la simulation du joueur : 256 fois par seconde, quelle que soit la cadence
 /// d'images (même résultat sur toutes les machines, base du multijoueur).
-pub const SIM_TICK: f32 = 1.0 / 128.0;
+pub const SIM_TICK: f32 = 1.0 / 256.0;
 /// Au plus tant de pas par image (125 ms) : après un gel, on ne rattrape pas indéfiniment.
-const MAX_TICKS: u32 = 16;
+const MAX_TICKS: u32 = 32;
 
 /// État simulé du joueur et état montré (interpolé entre les deux derniers pas).
 #[derive(Clone, Copy)]
@@ -176,7 +176,7 @@ pub fn ram_view_limit() -> i32 {
         return MAX_VIEW_DISTANCE;
     }
     let budget = available as f64 * 0.6;
-    let chunks = budget / (200.0 * 1024.0);
+    let chunks = budget / (330.0 * 1024.0);
     // Zone gardée ≈ carré de (2r + 3) chunks de côté.
     let r = ((chunks.sqrt() - 3.0) / 2.0).floor() as i32;
     r.clamp(2, MAX_VIEW_DISTANCE)
@@ -1275,6 +1275,18 @@ impl Session {
         }
         if let Some(b) = &mut self.build {
             match e {
+                Event::Promoted { .. } => {
+                    b.set_owner();
+                    self.chat.say(
+                        "Le propriétaire du monde est parti : tu le deviens (le monde sera \
+                         enregistré chez toi en quittant).",
+                        chat::YELLOW,
+                    );
+                }
+                Event::HostChanged(host) => self.chat.say(
+                    format!("Le propriétaire est parti : {host} garde le monde."),
+                    chat::YELLOW,
+                ),
                 Event::Zones { gained, lost } => {
                     if let Some(t) = b.zones_changed(gained, lost) {
                         self.chat.say(t, chat::GREY);
@@ -1290,7 +1302,7 @@ impl Session {
         }
         let Some(n) = &mut self.net else { return };
         match e {
-            Event::Promoted(members) => {
+            Event::Promoted { members, old_host } => {
                 let me = n.me();
                 let pseudo = n
                     .rows()
@@ -1298,7 +1310,7 @@ impl Session {
                     .find(|r| r.id == me)
                     .map_or_else(String::new, |r| r.pseudo);
                 let map = crate::fpsmap::load(&self.dir);
-                let resumed = n.promote(pseudo, members, &self.player, map);
+                let resumed = n.promote(pseudo, members, &self.player, map, *old_host);
                 let t = if resumed {
                     "L'hôte est parti : tu étais garant de secours, tu reprends la partie."
                 } else {
@@ -1308,11 +1320,42 @@ impl Session {
                 return;
             }
             Event::HostChanged(host) => {
-                n.host_changed();
-                self.chat.say(
-                    format!("L'hôte est parti : {host} reprend la partie."),
-                    chat::YELLOW,
-                );
+                let was_host = n.is_host();
+                if was_host {
+                    // Un garant indépendant prend la partie : on devient un joueur comme
+                    // les autres (il fait foi, plus nous).
+                    n.demote();
+                    self.chat.say(
+                        format!("Le garant indépendant {host} sert maintenant la partie."),
+                        chat::YELLOW,
+                    );
+                } else {
+                    n.host_changed();
+                    self.chat.say(
+                        format!("Changement de serveur : {host} sert la partie."),
+                        chat::YELLOW,
+                    );
+                }
+                return;
+            }
+            Event::BackupIs(peer) => {
+                n.designate_backup(*peer);
+                return;
+            }
+            Event::Judge {
+                conflict,
+                seq,
+                host_pos,
+                audit_pos,
+            } => {
+                // Notre propre prédiction tranche : la position la plus proche a raison.
+                if let Some(mine) = n.predicted_at(*seq) {
+                    let d = |p: &[f32; 3]| (Vec3::from(*p) - Vec3::from(mine)).length();
+                    self.relay_cmds.push(minelib_net::client::Cmd::Vote {
+                        conflict: *conflict,
+                        auditor_right: d(audit_pos) < d(host_pos),
+                    });
+                }
                 return;
             }
             _ => {}
@@ -1596,10 +1639,51 @@ impl Session {
                     .push(minelib_net::client::Cmd::Report(target.to_string()));
                 true
             }
-            "ban" | "bannir" => {
+            // OP d'un serveur de construction (le créateur l'est d'office).
+            "ban" | "bannir" | "unban" | "debannir" | "débannir" | "op" | "deop" => {
+                use minelib_net::proto;
+                let name = first.to_lowercase();
+                if self.build.is_none() {
+                    self.chat.say(
+                        format!(
+                            "/{name} : seulement sur un serveur de construction en ligne, \
+                             pour ses OP."
+                        ),
+                        chat::RED,
+                    );
+                    return true;
+                }
+                let action = match name.as_str() {
+                    "ban" | "bannir" => proto::SERVER_BAN,
+                    "unban" | "debannir" | "débannir" => proto::SERVER_UNBAN,
+                    "op" if words.len() < 2 => proto::SERVER_LIST,
+                    "op" => proto::SERVER_OP,
+                    _ => proto::SERVER_DEOP,
+                };
+                let target = words.get(1).map_or(String::new(), |t| t.to_string());
+                if target.is_empty() && action != proto::SERVER_LIST {
+                    self.chat.say(
+                        match action {
+                            proto::SERVER_BAN => "Usage : /ban <pseudo> [raison] (OP du serveur).",
+                            proto::SERVER_UNBAN => "Usage : /unban <pseudo> (OP du serveur).",
+                            _ => "Usage : /deop <pseudo> (créateur du serveur).",
+                        },
+                        chat::GREY,
+                    );
+                    return true;
+                }
+                self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                    action,
+                    pseudo: target,
+                    reason: words.get(2..).map_or(String::new(), |w| w.join(" ")),
+                });
+                true
+            }
+            // Administrateurs du relais (admins.txt) : compte banni partout, à vie.
+            "banrelais" => {
                 let Some(target) = words.get(1) else {
                     self.chat.say(
-                        "Usage : /ban <pseudo> [raison] (administrateurs).",
+                        "Usage : /banrelais <pseudo> [raison] (administrateurs du relais).",
                         chat::GREY,
                     );
                     return true;
@@ -1764,6 +1848,24 @@ impl Session {
             return;
         };
         if self.online_command(cmd) {
+            return;
+        }
+        // Partie FPS en ligne : aucune autre commande (pas de triche : mode de jeu, vol,
+        // objets, santé, WorldEdit…). Construction en ligne : pas de WorldEdit (les blocs
+        // passent un par un par le garant).
+        if self.net.is_some() {
+            self.chat.say(
+                "Commande interdite en partie en ligne. Permises : /report, /unreport, /ami, \
+                 /equipe.",
+                chat::RED,
+            );
+            return;
+        }
+        if self.build.is_some() && cmd.starts_with('/') {
+            self.chat.say(
+                "WorldEdit est désactivé en construction en ligne.",
+                chat::RED,
+            );
             return;
         }
         // `//…` : commandes WorldEdit (mode créatif).

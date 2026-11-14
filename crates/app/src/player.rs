@@ -74,6 +74,7 @@ const TOUCH: f32 = 1e-4;
 /// Hauteur franchie sans sauter (dalles, marches d'escalier).
 const STEP_HEIGHT: f32 = 0.6;
 
+#[derive(Clone)]
 pub struct Player {
     /// Position des pieds (centre de la base de la boîte).
     pub pos: Vec3,
@@ -744,7 +745,12 @@ mod tests {
         assert!(peak > 1.05 && peak < 1.6, "hauteur de saut = {peak}");
     }
 
-    const TICK: f32 = 1.0 / 128.0;
+    const TICK: f32 = crate::session::SIM_TICK;
+
+    /// `n` pas de 1/128 s, convertis en pas du jeu (la durée reste la même).
+    fn ticks(n: usize) -> usize {
+        (n as f32 / 128.0 / TICK).round() as usize
+    }
 
     fn fps_input() -> MoveInput {
         MoveInput {
@@ -763,7 +769,7 @@ mod tests {
         };
         p.update(w, &jump, TICK);
         let mut peak: f32 = 0.0;
-        for _ in 0..400 {
+        for _ in 0..ticks(400) {
             p.update(w, &fps_input(), TICK);
             peak = peak.max(p.pos.y - y0);
             if p.on_ground {
@@ -782,7 +788,7 @@ mod tests {
             sprint: true,
             ..fps_input()
         };
-        for _ in 0..512 {
+        for _ in 0..ticks(512) {
             p.update(&w, &run, TICK);
             p.pos.x = 8.5;
             p.pos.z = 8.5;
@@ -790,7 +796,7 @@ mod tests {
         }
         assert!(p.ground_speed() > FPS_SPRINT * 0.99, "{}", p.ground_speed());
         // Friction : arrêt en moins d'une demi-seconde.
-        for _ in 0..64 {
+        for _ in 0..ticks(64) {
             p.update(&w, &fps_input(), TICK);
         }
         assert_eq!(p.ground_speed(), 0.0);
@@ -802,7 +808,7 @@ mod tests {
             jump: true,
             ..fps_input()
         };
-        for _ in 0..256 {
+        for _ in 0..ticks(256) {
             p.update(&w, &hold, TICK);
             assert!(p.on_ground, "saut sans nouvel appui");
         }
@@ -812,7 +818,7 @@ mod tests {
     fn tired_legs_jump_lower_and_recover() {
         let w = flat_world();
         let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
-        for _ in 0..8 {
+        for _ in 0..ticks(8) {
             p.update(&w, &fps_input(), TICK);
         }
         let fresh = jump_peak(&mut p, &w);
@@ -823,7 +829,7 @@ mod tests {
         assert!(third < fresh * 0.95, "{fresh} puis {third}");
         assert!(p.stamina > 0.0);
         // Deux secondes de repos : les jambes récupèrent.
-        for _ in 0..256 {
+        for _ in 0..ticks(256) {
             p.update(&w, &fps_input(), TICK);
         }
         assert_eq!(p.stamina, 0.0);
@@ -840,7 +846,7 @@ mod tests {
             sprint: true,
             ..fps_input()
         };
-        for _ in 0..512 {
+        for _ in 0..ticks(512) {
             p.update(&w, &run, TICK);
             p.pos.x = 8.5;
             p.pos.z = 8.5;
@@ -866,7 +872,7 @@ mod tests {
         let hopped = p.ground_speed();
         assert!(hopped > start * 1.3, "bunny hop : {start} → {hopped}");
         // Atterrir sans ressauter : fatigue + friction, la vitesse s'effondre.
-        for _ in 0..200 {
+        for _ in 0..ticks(200) {
             p.update(&w, &fps_input(), TICK);
             if p.on_ground {
                 break;
@@ -874,7 +880,7 @@ mod tests {
             p.pos.x = 8.5;
             p.pos.z = 8.5;
         }
-        for _ in 0..16 {
+        for _ in 0..ticks(16) {
             p.update(&w, &fps_input(), TICK);
             p.pos.x = 8.5;
             p.pos.z = 8.5;
@@ -891,7 +897,7 @@ mod tests {
             sprint: true,
             ..fps_input()
         };
-        for _ in 0..256 {
+        for _ in 0..ticks(256) {
             p.update(&w, &run, TICK);
             p.pos.x = 8.5;
             p.pos.z = 8.5;
@@ -904,7 +910,7 @@ mod tests {
             p.ground_speed()
         );
         // On continue d'avancer accroupi, à la vitesse d'accroupi.
-        for _ in 0..256 {
+        for _ in 0..ticks(256) {
             p.update(&w, &duck, TICK);
             p.pos.x = 8.5;
             p.pos.z = 8.5;
@@ -916,7 +922,7 @@ mod tests {
         );
         // Et en repartant de l'arrêt.
         let mut q = Player::new(Vec3::new(8.5, 11.0, 8.5));
-        for _ in 0..256 {
+        for _ in 0..ticks(256) {
             q.update(&w, &duck, TICK);
             q.pos.x = 8.5;
             q.pos.z = 8.5;
@@ -933,12 +939,12 @@ mod tests {
                 sneak: i % 2 == 0,
                 ..fps_input()
             };
-            for _ in 0..4 {
+            for _ in 0..ticks(4) {
                 p.update(&w, &m, TICK);
             }
         }
         assert!(p.duck_speed < cs::DUCK_SPEED_MAX - 5.0, "{}", p.duck_speed);
-        for _ in 0..(128 * 3) {
+        for _ in 0..ticks(384) {
             p.update(&w, &fps_input(), TICK);
         }
         assert_eq!(p.duck_speed, cs::DUCK_SPEED_MAX);

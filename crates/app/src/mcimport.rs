@@ -9,8 +9,8 @@
 //! - 1.13 à 1.17 : `Level.Sections[].{ Palette, BlockStates }` ;
 //! - avant 1.13 : identifiants numériques (`Blocks`, `Add`).
 //!
-//! La hauteur de Minelib est de 256 blocs : pour les mondes 1.18+, Y −64..191 devient
-//! 0..255 (décalage de +64) ; au-delà, les blocs sont ignorés.
+//! La hauteur de Minelib est de 512 blocs : pour les mondes 1.18+, Y −64..319 devient
+//! 0..383 (décalage de +64) et tient en entier.
 
 use std::collections::HashMap;
 use std::fs;
@@ -232,19 +232,44 @@ pub fn read_level(dir: &Path) -> Result<McLevel> {
         .and_then(Nbt::as_i64)
         .unwrap_or(0);
     let player = data.get("Player").and_then(|p| {
-        let pos: Vec<f64> = p.get("Pos")?.as_list().iter().filter_map(Nbt::as_f64).collect();
-        let rot: Vec<f64> = p.get("Rotation").map(|r| r.as_list().iter().filter_map(Nbt::as_f64).collect()).unwrap_or_default();
-        (pos.len() == 3).then(|| ([pos[0], pos[1], pos[2]], [rot.first().copied().unwrap_or(0.0) as f32, rot.get(1).copied().unwrap_or(0.0) as f32]))
+        let pos: Vec<f64> = p
+            .get("Pos")?
+            .as_list()
+            .iter()
+            .filter_map(Nbt::as_f64)
+            .collect();
+        let rot: Vec<f64> = p
+            .get("Rotation")
+            .map(|r| r.as_list().iter().filter_map(Nbt::as_f64).collect())
+            .unwrap_or_default();
+        (pos.len() == 3).then(|| {
+            (
+                [pos[0], pos[1], pos[2]],
+                [
+                    rot.first().copied().unwrap_or(0.0) as f32,
+                    rot.get(1).copied().unwrap_or(0.0) as f32,
+                ],
+            )
+        })
     });
     let int = |k: &str| data.get(k).and_then(Nbt::as_i64).unwrap_or(0) as i32;
     Ok(McLevel {
-        name: data.get("LevelName").and_then(Nbt::as_str).unwrap_or("Monde Minecraft").to_owned(),
+        name: data
+            .get("LevelName")
+            .and_then(Nbt::as_str)
+            .unwrap_or("Monde Minecraft")
+            .to_owned(),
         seed,
         data_version: int("DataVersion"),
-        last_played_s: (data.get("LastPlayed").and_then(Nbt::as_i64).unwrap_or(0) / 1000).max(0) as u64,
+        last_played_s: (data.get("LastPlayed").and_then(Nbt::as_i64).unwrap_or(0) / 1000).max(0)
+            as u64,
         player,
         spawn: [int("SpawnX"), int("SpawnY"), int("SpawnZ")],
-        generator: data.get("generatorName").and_then(Nbt::as_str).unwrap_or("default").to_lowercase(),
+        generator: data
+            .get("generatorName")
+            .and_then(Nbt::as_str)
+            .unwrap_or("default")
+            .to_lowercase(),
     })
 }
 
@@ -256,14 +281,29 @@ pub fn map_block_state(full: &str, props: &HashMap<String, String>) -> BlockId {
 }
 
 const MODERN_DYES: [&str; 16] = [
-    "white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray", "light_gray", "cyan", "purple",
-    "blue", "brown", "green", "red", "black",
+    "white",
+    "orange",
+    "magenta",
+    "light_blue",
+    "yellow",
+    "lime",
+    "pink",
+    "gray",
+    "light_gray",
+    "cyan",
+    "purple",
+    "blue",
+    "brown",
+    "green",
+    "red",
+    "black",
 ];
 
 /// Matériau Minelib pour un préfixe moderne (`stone_brick` dans `stone_brick_stairs`).
 fn modern_material(m: &str) -> &'static str {
     match m {
-        "oak" | "spruce" | "birch" | "jungle" | "acacia" | "dark_oak" | "mangrove" | "cherry" | "bamboo" | "crimson" | "warped" | "pale_oak" | "petrified_oak" => {
+        "oak" | "spruce" | "birch" | "jungle" | "acacia" | "dark_oak" | "mangrove" | "cherry"
+        | "bamboo" | "crimson" | "warped" | "pale_oak" | "petrified_oak" => {
             registry::planks_key(registry::wood_index(m))
         }
         "stone" => "stone",
@@ -335,7 +375,9 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 
     // Familles colorées.
     for (i, c) in MODERN_DYES.iter().enumerate() {
-        let Some(rest) = n.strip_prefix(c).and_then(|r| r.strip_prefix('_')) else { continue };
+        let Some(rest) = n.strip_prefix(c).and_then(|r| r.strip_prefix('_')) else {
+            continue;
+        };
         let d = registry::DYES[i];
         let k = match rest {
             "wool" => format!("wool_{d}"),
@@ -362,7 +404,11 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
             Some("north") => 3,
             _ => 0,
         };
-        let half = if prop("half") == Some("top") { "top" } else { "bottom" };
+        let half = if prop("half") == Some("top") {
+            "top"
+        } else {
+            "bottom"
+        };
         return key(&format!("stairs:{}:{dir}:{half}", modern_material(m)));
     }
     if let Some(m) = n.strip_suffix("_slab") {
@@ -378,19 +424,44 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
             return key("fence_nether");
         }
         let wood = n.split("_fence").next().unwrap_or("oak");
-        return key(&format!("fence_{}", registry::wood_key(registry::wood_index(wood))));
+        return key(&format!(
+            "fence_{}",
+            registry::wood_key(registry::wood_index(wood))
+        ));
     }
-    if n.ends_with("_wall") && !n.ends_with("_banner") && !n.contains("sign") && !n.contains("torch") && !n.contains("head") && !n.contains("skull") {
-        return key(if n.contains("mossy") { "wall_cobblestone_mossy" } else { "wall_cobblestone" });
+    if n.ends_with("_wall")
+        && !n.ends_with("_banner")
+        && !n.contains("sign")
+        && !n.contains("torch")
+        && !n.contains("head")
+        && !n.contains("skull")
+    {
+        return key(if n.contains("mossy") {
+            "wall_cobblestone_mossy"
+        } else {
+            "wall_cobblestone"
+        });
     }
     if let Some(w) = n.strip_suffix("_door") {
-        let d = if w == "iron" { 6 } else { registry::wood_index(w) };
-        let half = if prop("half") == Some("upper") { "upper" } else { "lower" };
+        let d = if w == "iron" {
+            6
+        } else {
+            registry::wood_index(w)
+        };
+        let half = if prop("half") == Some("upper") {
+            "upper"
+        } else {
+            "lower"
+        };
         let side = registry::door_side(horizontal(prop("facing")), prop("open") == Some("true"));
         return key(&format!("door_{}:{half}:{side}", registry::door_key(d)));
     }
     if let Some(w) = n.strip_suffix("_trapdoor") {
-        let kind = if w == "iron" { "iron_trapdoor" } else { "trapdoor" };
+        let kind = if w == "iron" {
+            "iron_trapdoor"
+        } else {
+            "trapdoor"
+        };
         let side = if prop("open") == Some("true") {
             match prop("facing") {
                 Some("north") => 4,
@@ -406,7 +477,11 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         return key(&format!("{kind}:{side}"));
     }
     if n.ends_with("_button") {
-        let mat = if n.contains("stone") || n.contains("blackstone") { "button_stone" } else { "button_wood" };
+        let mat = if n.contains("stone") || n.contains("blackstone") {
+            "button_stone"
+        } else {
+            "button_wood"
+        };
         return match prop("face") {
             Some("floor") => key(&format!("{mat}:floor")),
             Some("ceiling") => key(&format!("{mat}:ceiling")),
@@ -420,10 +495,17 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         return key("sign");
     }
     if n.ends_with("_pressure_plate") {
-        return key(if n.contains("stone") || n.contains("weighted") { "pressure_plate_stone" } else { "pressure_plate_wood" });
+        return key(if n.contains("stone") || n.contains("weighted") {
+            "pressure_plate_stone"
+        } else {
+            "pressure_plate_wood"
+        });
     }
     if let Some(w) = n.strip_suffix("_leaves") {
-        return key(&format!("leaves_{}", registry::wood_key(registry::wood_index(w))));
+        return key(&format!(
+            "leaves_{}",
+            registry::wood_key(registry::wood_index(w))
+        ));
     }
     if let Some(w) = n.strip_suffix("_planks") {
         return key(registry::planks_key(registry::wood_index(w)));
@@ -488,7 +570,11 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         "melon" => "melon",
         "piston" | "sticky_piston" | "piston_head" => "piston",
         "cauldron" | "water_cauldron" | "lava_cauldron" => "cauldron",
-        "command_block" | "chain_command_block" | "repeating_command_block" | "structure_block" | "jigsaw" => "command_block",
+        "command_block"
+        | "chain_command_block"
+        | "repeating_command_block"
+        | "structure_block"
+        | "jigsaw" => "command_block",
         "slime_block" => "slime",
         "jukebox" => "jukebox",
         "note_block" => "noteblock",
@@ -500,12 +586,23 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         "glowstone" => "glowstone",
         "sea_lantern" => "sea_lantern",
         "jack_o_lantern" => "jack_o_lantern",
-        "redstone_lamp" => if prop("lit") == Some("true") { "lamp_on" } else { "lamp_off" },
+        "redstone_lamp" => {
+            if prop("lit") == Some("true") {
+                "lamp_on"
+            } else {
+                "lamp_off"
+            }
+        }
         "barrier" => "barrier",
         "glass" | "tinted_glass" => "glass",
         "glass_pane" => "pane",
         "iron_bars" => "iron_bars",
-        "torch" | "wall_torch" | "soul_torch" | "soul_wall_torch" | "redstone_torch" | "redstone_wall_torch" => "torch",
+        "torch"
+        | "wall_torch"
+        | "soul_torch"
+        | "soul_wall_torch"
+        | "redstone_torch"
+        | "redstone_wall_torch" => "torch",
         "ladder" => return key(&format!("ladder:{}", wall_side(prop("facing")))),
         "vine" => {
             let side = if prop("south") == Some("true") {
@@ -520,7 +617,15 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
             return key(&format!("vine:{side}"));
         }
         "tripwire_hook" => return key(&format!("tripwire_hook:{}", wall_side(prop("facing")))),
-        "snow" => return key(&format!("snow_layer:{}", prop("layers").and_then(|l| l.parse::<u8>().ok()).unwrap_or(1).clamp(1, 8))),
+        "snow" => {
+            return key(&format!(
+                "snow_layer:{}",
+                prop("layers")
+                    .and_then(|l| l.parse::<u8>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 8)
+            ))
+        }
         "chest" | "trapped_chest" | "ender_chest" | "barrel" => "chest",
         "flower_pot" => "flower_pot",
         "end_rod" => "end_rod",
@@ -538,7 +643,13 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         "lever" => "lever",
         "rail" | "powered_rail" | "detector_rail" | "activator_rail" => "rail",
         "lily_pad" => "lily_pad",
-        "skeleton_skull" | "player_head" | "zombie_head" | "creeper_head" | "dragon_head" | "piglin_head" | "wither_skeleton_skull" => "skull",
+        "skeleton_skull"
+        | "player_head"
+        | "zombie_head"
+        | "creeper_head"
+        | "dragon_head"
+        | "piglin_head"
+        | "wither_skeleton_skull" => "skull",
         "short_grass" | "grass" => "plant:tallgrass",
         "fern" => "plant:fern",
         "dead_bush" => "plant:deadbush",
@@ -564,7 +675,11 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
                 "rose_bush" => "rose_bush",
                 other => other,
             };
-            let half = if prop("half") == Some("upper") { "upper" } else { "lower" };
+            let half = if prop("half") == Some("upper") {
+                "upper"
+            } else {
+                "lower"
+            };
             return key(&format!("plant:{base}_{half}"));
         }
         _ if n.ends_with("_sapling") || n.ends_with("_propagule") => "plant:sapling",
@@ -578,8 +693,12 @@ pub fn map_block_name(full: &str) -> BlockId {
     let n = full.strip_prefix("minecraft:").unwrap_or(full);
     let has = |s: &str| n.contains(s);
     match n {
-        "air" | "cave_air" | "void_air" | "structure_void" | "light" | "barrier" => return BlockId::AIR,
-        "water" | "bubble_column" | "seagrass" | "tall_seagrass" | "kelp" | "kelp_plant" => return BlockId::WATER,
+        "air" | "cave_air" | "void_air" | "structure_void" | "light" | "barrier" => {
+            return BlockId::AIR
+        }
+        "water" | "bubble_column" | "seagrass" | "tall_seagrass" | "kelp" | "kelp_plant" => {
+            return BlockId::WATER
+        }
         "lava" | "magma_block" => return BlockId::LAVA,
         "grass_block" | "mycelium" | "moss_block" => return BlockId::GRASS,
         "bedrock" => return BlockId::BEDROCK,
@@ -594,17 +713,89 @@ pub fn map_block_name(full: &str) -> BlockId {
     }
     // Objets non cubiques, plantes, décor fin : rien (Minelib n'a que des cubes).
     const THIN: &[&str] = &[
-        "door", "rail", "button", "pressure_plate", "sign", "banner", "carpet", "flower", "sapling", "grass", "fern",
-        "bush", "lantern", "fence", "pane", "bars", "chain", "ladder", "vine", "lever", "redstone_wire", "tripwire",
-        "head", "skull", "pot", "candle", "rod", "coral", "wheat", "carrots", "potatoes", "beetroots", "cocoa",
-        "roots", "sprouts", "lichen", "dripleaf", "snow", "cobweb", "dandelion", "poppy", "orchid", "allium",
-        "tulip", "daisy", "bluet", "lily", "rose", "peony", "lilac", "sunflower", "mushroom", "sugar_cane",
-        "bamboo", "cactus_flower", "torchflower", "pitcher", "spore", "hanging", "string", "scaffolding",
-        "repeater", "comparator", "trapdoor", "end_rod", "brewing", "cake", "bed", "frogspawn", "petals",
-        "glow_berries", "cave_vines", "amethyst_cluster", "bud", "dead_bush", "nether_wart", "melon_stem",
-        "pumpkin_stem", "attached",
+        "door",
+        "rail",
+        "button",
+        "pressure_plate",
+        "sign",
+        "banner",
+        "carpet",
+        "flower",
+        "sapling",
+        "grass",
+        "fern",
+        "bush",
+        "lantern",
+        "fence",
+        "pane",
+        "bars",
+        "chain",
+        "ladder",
+        "vine",
+        "lever",
+        "redstone_wire",
+        "tripwire",
+        "head",
+        "skull",
+        "pot",
+        "candle",
+        "rod",
+        "coral",
+        "wheat",
+        "carrots",
+        "potatoes",
+        "beetroots",
+        "cocoa",
+        "roots",
+        "sprouts",
+        "lichen",
+        "dripleaf",
+        "snow",
+        "cobweb",
+        "dandelion",
+        "poppy",
+        "orchid",
+        "allium",
+        "tulip",
+        "daisy",
+        "bluet",
+        "lily",
+        "rose",
+        "peony",
+        "lilac",
+        "sunflower",
+        "mushroom",
+        "sugar_cane",
+        "bamboo",
+        "cactus_flower",
+        "torchflower",
+        "pitcher",
+        "spore",
+        "hanging",
+        "string",
+        "scaffolding",
+        "repeater",
+        "comparator",
+        "trapdoor",
+        "end_rod",
+        "brewing",
+        "cake",
+        "bed",
+        "frogspawn",
+        "petals",
+        "glow_berries",
+        "cave_vines",
+        "amethyst_cluster",
+        "bud",
+        "dead_bush",
+        "nether_wart",
+        "melon_stem",
+        "pumpkin_stem",
+        "attached",
     ];
-    const SOLID_HINTS: &[&str] = &["block", "log", "wood", "planks", "slab", "stairs", "leaves", "hyphae", "path"];
+    const SOLID_HINTS: &[&str] = &[
+        "block", "log", "wood", "planks", "slab", "stairs", "leaves", "hyphae", "path",
+    ];
     if THIN.iter().any(|t| has(t)) && !SOLID_HINTS.iter().any(|t| has(t)) {
         return BlockId::AIR;
     }
@@ -628,7 +819,10 @@ pub fn map_block_name(full: &str) -> BlockId {
     if has("planks") || has("bookshelf") || has("crafting_table") || has("barrel") || has("chest") {
         return BlockId::PLANKS;
     }
-    for wood in ["oak", "spruce", "birch", "jungle", "acacia", "mangrove", "cherry", "bamboo", "crimson", "warped"] {
+    for wood in [
+        "oak", "spruce", "birch", "jungle", "acacia", "mangrove", "cherry", "bamboo", "crimson",
+        "warped",
+    ] {
         if has(wood) && (has("stairs") || has("slab")) {
             return BlockId::PLANKS;
         }
@@ -674,7 +868,9 @@ pub fn map_block_name(full: &str) -> BlockId {
 
 /// Anciens identifiants numériques (avant 1.13) : registre (avec `meta`), sinon repli.
 fn map_legacy(id: u16, meta: u8) -> BlockId {
-    registry::registry().legacy(id, meta).unwrap_or_else(|| map_legacy_id(id))
+    registry::registry()
+        .legacy(id, meta)
+        .unwrap_or_else(|| map_legacy_id(id))
 }
 
 fn map_legacy_id(id: u16) -> BlockId {
@@ -709,9 +905,47 @@ fn map_legacy_id(id: u16) -> BlockId {
         98 | 109 => BlockId::STONE_BRICKS,
         159 | 172 => BlockId::TERRACOTTA,
         // Plantes, objets fins, décor : rien.
-        6 | 26 | 27 | 28 | 30..=32 | 37..=40 | 50..=51 | 55 | 59 | 63..=66 | 68..=72 | 75..=78 | 81 | 83
-        | 85 | 90 | 93 | 94 | 96 | 101 | 104..=107 | 111 | 113 | 115 | 131 | 132 | 140 | 141 | 142 | 143
-        | 144 | 147 | 148 | 149 | 150 | 157 | 171 | 175 | 176 | 177 | 188..=197 => BlockId::AIR,
+        6
+        | 26
+        | 27
+        | 28
+        | 30..=32
+        | 37..=40
+        | 50..=51
+        | 55
+        | 59
+        | 63..=66
+        | 68..=72
+        | 75..=78
+        | 81
+        | 83
+        | 85
+        | 90
+        | 93
+        | 94
+        | 96
+        | 101
+        | 104..=107
+        | 111
+        | 113
+        | 115
+        | 131
+        | 132
+        | 140
+        | 141
+        | 142
+        | 143
+        | 144
+        | 147
+        | 148
+        | 149
+        | 150
+        | 157
+        | 171
+        | 175
+        | 176
+        | 177
+        | 188..=197 => BlockId::AIR,
         _ => BlockId::STONE,
     }
 }
@@ -731,7 +965,11 @@ fn packed(data: &[i64], i: usize, bits: usize, spanning: bool) -> usize {
         let bit = i * bits;
         let (w, off) = (bit / 64, bit % 64);
         let lo = data.get(w).copied().unwrap_or(0) as u64 >> off;
-        let v = if off + bits > 64 { lo | (data.get(w + 1).copied().unwrap_or(0) as u64) << (64 - off) } else { lo };
+        let v = if off + bits > 64 {
+            lo | (data.get(w + 1).copied().unwrap_or(0) as u64) << (64 - off)
+        } else {
+            lo
+        };
         (v & mask) as usize
     } else {
         let per = 64 / bits;
@@ -754,7 +992,11 @@ pub fn convert_chunk(root: &Nbt, y_offset: i32) -> Result<Converted> {
     let pos = ChunkPos { x, z };
     let mut chunk = Chunk::new(pos);
     let mut torches = Vec::new();
-    let sections = level.get("sections").or_else(|| level.get("Sections")).map(Nbt::as_list).unwrap_or(&[]);
+    let sections = level
+        .get("sections")
+        .or_else(|| level.get("Sections"))
+        .map(Nbt::as_list)
+        .unwrap_or(&[]);
 
     for sec in sections {
         let sy = sec.get("Y").and_then(Nbt::as_i64).unwrap_or(0) as i32;
@@ -787,10 +1029,18 @@ pub fn convert_chunk(root: &Nbt, y_offset: i32) -> Result<Converted> {
                 .iter()
                 .map(|p| {
                     let props: HashMap<String, String> = match p.get("Properties") {
-                        Some(Nbt::Compound(m)) => m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect(),
+                        Some(Nbt::Compound(m)) => m
+                            .iter()
+                            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                            .collect(),
                         _ => HashMap::new(),
                     };
-                    map_block_state(p.get("Name").and_then(Nbt::as_str).unwrap_or("minecraft:air"), &props)
+                    map_block_state(
+                        p.get("Name")
+                            .and_then(Nbt::as_str)
+                            .unwrap_or("minecraft:air"),
+                        &props,
+                    )
                 })
                 .collect();
             if ids.is_empty() {
@@ -833,7 +1083,11 @@ pub fn convert_chunk(root: &Nbt, y_offset: i32) -> Result<Converted> {
                 }
                 let meta = data.and_then(|d| d.get(i / 2)).map_or(0, |&n| {
                     let n = n as u8;
-                    if i % 2 == 0 { n & 15 } else { n >> 4 }
+                    if i % 2 == 0 {
+                        n & 15
+                    } else {
+                        n >> 4
+                    }
                 });
                 put(i, map_legacy(id, meta));
             }
@@ -853,9 +1107,17 @@ fn fix_upper_halves(chunk: &mut Chunk) {
                 let id = chunk.get(x, y, z);
                 let key = &id.def().key;
                 let below = &chunk.get(x, y - 1, z).def().key;
-                let fixed = if key.starts_with("door_") && key.contains(":upper:") && below.starts_with("door_") && below.contains(":lower:") {
+                let fixed = if key.starts_with("door_")
+                    && key.contains(":upper:")
+                    && below.starts_with("door_")
+                    && below.contains(":lower:")
+                {
                     reg.by_key(&below.replace(":lower:", ":upper:"))
-                } else if key.starts_with("plant:") && key.ends_with("_upper") && below.starts_with("plant:") && below.ends_with("_lower") {
+                } else if key.starts_with("plant:")
+                    && key.ends_with("_upper")
+                    && below.starts_with("plant:")
+                    && below.ends_with("_lower")
+                {
                     reg.by_key(&below.replace("_lower", "_upper"))
                 } else {
                     None
@@ -871,19 +1133,35 @@ fn fix_upper_halves(chunk: &mut Chunk) {
 /// Couleur des bannières (1.12 : `TileEntities[].Base`, indice de teinture inversé).
 fn color_banners(chunk: &mut Chunk, level: &Nbt, cx: i32, cz: i32, y_offset: i32) {
     let reg = registry::registry();
-    let list = level.get("TileEntities").or_else(|| level.get("block_entities")).map(Nbt::as_list).unwrap_or(&[]);
+    let list = level
+        .get("TileEntities")
+        .or_else(|| level.get("block_entities"))
+        .map(Nbt::as_list)
+        .unwrap_or(&[]);
     for te in list {
-        let Some(base) = te.get("Base").and_then(Nbt::as_i64) else { continue };
-        let (Some(x), Some(y), Some(z)) = (te.get("x").and_then(Nbt::as_i64), te.get("y").and_then(Nbt::as_i64), te.get("z").and_then(Nbt::as_i64)) else {
+        let Some(base) = te.get("Base").and_then(Nbt::as_i64) else {
+            continue;
+        };
+        let (Some(x), Some(y), Some(z)) = (
+            te.get("x").and_then(Nbt::as_i64),
+            te.get("y").and_then(Nbt::as_i64),
+            te.get("z").and_then(Nbt::as_i64),
+        ) else {
             continue;
         };
         let (lx, ly, lz) = (x as i32 - cx * 16, y as i32 + y_offset, z as i32 - cz * 16);
-        if !(0..16).contains(&lx) || !(0..16).contains(&lz) || !(0..CHUNK_HEIGHT as i32).contains(&ly) {
+        if !(0..16).contains(&lx)
+            || !(0..16).contains(&lz)
+            || !(0..CHUNK_HEIGHT as i32).contains(&ly)
+        {
             continue;
         }
         let id = chunk.get(lx as usize, ly as usize, lz as usize);
         let key = &id.def().key;
-        if let Some(side) = key.strip_prefix("banner_").and_then(|r| r.split(':').nth(1)) {
+        if let Some(side) = key
+            .strip_prefix("banner_")
+            .and_then(|r| r.split(':').nth(1))
+        {
             let color = registry::DYES[(15 - base.clamp(0, 15)) as usize];
             if let Some(b) = reg.by_key(&format!("banner_{color}:{side}")) {
                 chunk.set(lx as usize, ly as usize, lz as usize, b);
@@ -906,7 +1184,9 @@ pub fn read_region(bytes: &[u8]) -> Vec<Nbt> {
         }
         let len = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         let kind = bytes[offset + 4];
-        let Some(payload) = bytes.get(offset + 5..offset + 4 + len) else { continue };
+        let Some(payload) = bytes.get(offset + 5..offset + 4 + len) else {
+            continue;
+        };
         let raw = match kind {
             1 => gunzip(payload),
             2 => unzlib(payload),
@@ -946,12 +1226,25 @@ pub fn import_world(dir: &Path) -> Result<Import> {
         let Ok(bytes) = fs::read(&f) else { continue };
         for nbt in read_region(&bytes) {
             // Chunks pas encore entièrement générés par Minecraft : ignorés.
-            let status = nbt.get("Status").or_else(|| nbt.path(&["Level", "Status"])).and_then(Nbt::as_str).unwrap_or("full");
+            let status = nbt
+                .get("Status")
+                .or_else(|| nbt.path(&["Level", "Status"]))
+                .and_then(Nbt::as_str)
+                .unwrap_or("full");
             let status = status.strip_prefix("minecraft:").unwrap_or(status);
             // Étapes de génération où le terrain n'est pas encore complet (noms 1.13 à 1.21).
             const EARLY: &[&str] = &[
-                "empty", "structure_starts", "structure_references", "biomes", "noise", "surface", "carvers",
-                "liquid_carvers", "base", "carved", "liquid_carved",
+                "empty",
+                "structure_starts",
+                "structure_references",
+                "biomes",
+                "noise",
+                "surface",
+                "carvers",
+                "liquid_carvers",
+                "base",
+                "carved",
+                "liquid_carved",
             ];
             if EARLY.contains(&status) {
                 skipped += 1;
@@ -966,8 +1259,18 @@ pub fn import_world(dir: &Path) -> Result<Import> {
             }
         }
     }
-    log::info!("monde Minecraft « {} » : {} chunks convertis, {} ignorés", level.name, chunks.len(), skipped);
-    Ok(Import { level, y_offset, chunks, torches })
+    log::info!(
+        "monde Minecraft « {} » : {} chunks convertis, {} ignorés",
+        level.name,
+        chunks.len(),
+        skipped
+    );
+    Ok(Import {
+        level,
+        y_offset,
+        chunks,
+        torches,
+    })
 }
 
 #[cfg(test)]
@@ -1053,7 +1356,13 @@ pub mod tests {
     pub fn modern_chunk(x: i32, z: i32) -> Nbt {
         let stone_section = compound(vec![
             ("Y", Nbt::Byte(-4)),
-            ("block_states", compound(vec![("palette", Nbt::List(vec![block("minecraft:deepslate")]))])),
+            (
+                "block_states",
+                compound(vec![(
+                    "palette",
+                    Nbt::List(vec![block("minecraft:deepslate")]),
+                )]),
+            ),
         ]);
         // Section Y = 4 (64..79) : palette [air, grass_block, torch], 4 bits par entrée.
         let mut idx = vec![0usize; 4096];
@@ -1070,7 +1379,14 @@ pub mod tests {
             (
                 "block_states",
                 compound(vec![
-                    ("palette", Nbt::List(vec![block("minecraft:air"), block("minecraft:grass_block"), block("minecraft:torch")])),
+                    (
+                        "palette",
+                        Nbt::List(vec![
+                            block("minecraft:air"),
+                            block("minecraft:grass_block"),
+                            block("minecraft:torch"),
+                        ]),
+                    ),
                     ("data", Nbt::LongArray(longs)),
                 ]),
             ),
@@ -1090,7 +1406,8 @@ pub mod tests {
         let mut header = vec![0u8; 8192];
         let mut body = Vec::new();
         for (k, c) in chunks.iter().enumerate() {
-            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
             enc.write_all(&root(c)).unwrap();
             let z = enc.finish().unwrap();
             let sector = 2 + body.len() / 4096;
@@ -1137,18 +1454,30 @@ pub mod tests {
     #[test]
     fn block_names() {
         assert_eq!(map_block_name("minecraft:oak_log"), BlockId::WOOD);
-        assert_eq!(map_block_name("minecraft:deepslate_iron_ore"), BlockId::IRON_ORE);
+        assert_eq!(
+            map_block_name("minecraft:deepslate_iron_ore"),
+            BlockId::IRON_ORE
+        );
         assert_eq!(map_block_name("minecraft:short_grass"), BlockId::AIR);
         assert_eq!(map_block_name("minecraft:grass_block"), BlockId::GRASS);
         assert_eq!(map_block_name("minecraft:spruce_planks"), BlockId::PLANKS);
         assert_eq!(map_block_name("minecraft:wall_torch"), BlockId::TORCH);
         assert_eq!(map_block_name("minecraft:water"), BlockId::WATER);
-        assert_eq!(map_block_name("minecraft:stone_bricks"), BlockId::STONE_BRICKS);
-        assert_eq!(map_block_name("minecraft:red_mushroom_block"), BlockId::STONE);
+        assert_eq!(
+            map_block_name("minecraft:stone_bricks"),
+            BlockId::STONE_BRICKS
+        );
+        assert_eq!(
+            map_block_name("minecraft:red_mushroom_block"),
+            BlockId::STONE
+        );
         assert_eq!(map_legacy_id(17), BlockId::WOOD);
         assert_eq!(map_block_name("minecraft:crimson_stem"), BlockId::WOOD);
         assert_eq!(map_block_name("minecraft:bamboo_planks"), BlockId::PLANKS);
-        assert_eq!(map_block_name("minecraft:flowering_azalea_leaves"), BlockId::LEAVES);
+        assert_eq!(
+            map_block_name("minecraft:flowering_azalea_leaves"),
+            BlockId::LEAVES
+        );
         assert_eq!(map_block_name("minecraft:dirt_path"), BlockId::DIRT);
         assert_eq!(map_block_name("minecraft:snow"), BlockId::AIR);
     }
@@ -1161,7 +1490,9 @@ mod real_files {
     /// Lit de vrais fichiers .mca : `MINELIB_MCA=chemin cargo test real_region -- --nocapture`.
     #[test]
     fn real_region() {
-        let Ok(paths) = std::env::var("MINELIB_MCA") else { return };
+        let Ok(paths) = std::env::var("MINELIB_MCA") else {
+            return;
+        };
         for path in paths.split(';') {
             let bytes = fs::read(path).unwrap();
             let chunks = read_region(&bytes);
@@ -1181,10 +1512,16 @@ mod real_files {
                     }
                 }
             }
-            let dv = chunks.first().and_then(|c| c.get("DataVersion")).and_then(Nbt::as_i64);
+            let dv = chunks
+                .first()
+                .and_then(|c| c.get("DataVersion"))
+                .and_then(Nbt::as_i64);
             let mut h: Vec<_> = hist.into_iter().collect();
             h.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-            println!("{path}: {} chunks lus, {ok} convertis, DataVersion {dv:?}", chunks.len());
+            println!(
+                "{path}: {} chunks lus, {ok} convertis, DataVersion {dv:?}",
+                chunks.len()
+            );
             for (b, n) in h.iter().take(10) {
                 println!("   {:<22} {n}", b.name());
             }
@@ -1200,7 +1537,9 @@ mod real_world {
     /// `MINELIB_MC_WORLD=dossier cargo test real_world -- --nocapture`
     #[test]
     fn real_world_coverage() {
-        let Ok(dir) = std::env::var("MINELIB_MC_WORLD") else { return };
+        let Ok(dir) = std::env::var("MINELIB_MC_WORLD") else {
+            return;
+        };
         let dir = Path::new(&dir);
         let reg = registry::registry();
         let mut missing: HashMap<(u16, u8), usize> = HashMap::new();
@@ -1209,7 +1548,11 @@ mod real_world {
             for nbt in read_region(&bytes) {
                 let level = nbt.get("Level").unwrap_or(&nbt);
                 for sec in level.get("Sections").map(Nbt::as_list).unwrap_or(&[]) {
-                    let (Some(Nbt::ByteArray(b)), Some(Nbt::ByteArray(d))) = (sec.get("Blocks"), sec.get("Data")) else { continue };
+                    let (Some(Nbt::ByteArray(b)), Some(Nbt::ByteArray(d))) =
+                        (sec.get("Blocks"), sec.get("Data"))
+                    else {
+                        continue;
+                    };
                     for i in 0..4096 {
                         let id = b[i] as u8 as u16;
                         let meta = (d[i / 2] as u8 >> ((i % 2) * 4)) & 15;
@@ -1223,7 +1566,15 @@ mod real_world {
         println!("variantes sans correspondance : {missing:?}");
         let t = std::time::Instant::now();
         let imp = import_world(dir).unwrap();
-        println!("« {} » : {} chunks en {:.2} s, générateur {:?}, joueur {:?}, apparition {:?}", imp.level.name, imp.chunks.len(), t.elapsed().as_secs_f32(), imp.level.generator, imp.level.player, imp.level.spawn);
+        println!(
+            "« {} » : {} chunks en {:.2} s, générateur {:?}, joueur {:?}, apparition {:?}",
+            imp.level.name,
+            imp.chunks.len(),
+            t.elapsed().as_secs_f32(),
+            imp.level.generator,
+            imp.level.player,
+            imp.level.spawn
+        );
         let mut hist: HashMap<BlockId, usize> = HashMap::new();
         let mut bytes = 0;
         for (p, rle) in &imp.chunks {
@@ -1237,9 +1588,16 @@ mod real_world {
                 }
             }
         }
-        let mut h: Vec<_> = hist.into_iter().filter(|(b, _)| *b != BlockId::AIR).collect();
+        let mut h: Vec<_> = hist
+            .into_iter()
+            .filter(|(b, _)| *b != BlockId::AIR)
+            .collect();
         h.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        println!("chunks compressés : {} Ko ; {} types de blocs Minelib", bytes / 1024, h.len());
+        println!(
+            "chunks compressés : {} Ko ; {} types de blocs Minelib",
+            bytes / 1024,
+            h.len()
+        );
         for (b, n) in h.iter().take(25) {
             println!("   {:<40} {n}", b.def().key);
         }

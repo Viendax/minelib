@@ -20,7 +20,7 @@ pub use block::BlockId;
 pub use world::{Light, Torch, World, LIGHT_RADIUS};
 
 pub const CHUNK_SIZE: usize = 16;
-pub const CHUNK_HEIGHT: usize = 256;
+pub const CHUNK_HEIGHT: usize = 512;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkPos {
@@ -177,13 +177,37 @@ impl Chunk {
             }
             i += run;
         }
-        (i == c.blocks.len()).then_some(c)
+        // Chunk enregistré moins haut (256 blocs avant la v65) : le reste est de l'air.
+        (i <= c.blocks.len() && i.is_multiple_of(CHUNK_SIZE * CHUNK_SIZE)).then_some(c)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_world_is_512_high_and_old_256_chunks_still_load() {
+        let mut c = Chunk::new(ChunkPos { x: 0, z: 0 });
+        c.set(1, 500, 2, BlockId(1));
+        assert_eq!(c.get(1, 500, 2), BlockId(1));
+        let back = Chunk::from_rle(c.pos, &c.to_rle()).unwrap();
+        assert_eq!(back.get(1, 500, 2), BlockId(1));
+        // Ancien chunk de 256 blocs de haut : pierre jusqu'à 63, air au-dessus.
+        let mut old = Vec::new();
+        for (id, run) in [(1u16, 16 * 16 * 64u32), (0u16, 16 * 16 * 192)] {
+            let mut left = run;
+            while left > 0 {
+                let r = left.min(u16::MAX as u32);
+                old.extend_from_slice(&id.to_le_bytes());
+                old.extend_from_slice(&(r as u16).to_le_bytes());
+                left -= r;
+            }
+        }
+        let o = Chunk::from_rle(c.pos, &old).expect("ancien format");
+        assert_eq!(o.get(0, 63, 0), BlockId(1));
+        assert_eq!(o.get(0, 300, 0), BlockId::AIR);
+    }
 
     #[test]
     fn set_then_get() {

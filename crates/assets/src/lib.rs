@@ -104,6 +104,8 @@ pub struct Options {
     pub volume: f32,
     /// Adresse du relais (comptes, liste des parties).
     pub relay: String,
+    /// Au menu, ce jeu peut servir de garant indépendant pour les parties des autres.
+    pub garant: bool,
     /// Clé du relais retenue au premier contact (hexadécimal, vide = pas encore).
     pub relay_key: String,
     /// Dernier pseudo utilisé (prérempli à la connexion).
@@ -129,6 +131,7 @@ impl Default for Options {
             fullscreen: false,
             volume: 0.6,
             relay: "auto".into(),
+            garant: true,
             relay_key: String::new(),
             pseudo: String::new(),
         }
@@ -170,6 +173,9 @@ impl Options {
             if let Some(v) = kv.get("relay").filter(|v| !v.trim().is_empty()) {
                 o.relay = v.trim().to_string();
             }
+            if let Some(v) = kv.get("garant") {
+                o.garant = v != "false";
+            }
             if let Some(v) = kv.get("relay_key") {
                 o.relay_key = v.trim().to_string();
             }
@@ -190,13 +196,14 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\n",
+                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.fps_max,
                 self.relay,
                 self.relay_key,
-                self.pseudo
+                self.pseudo,
+                self.garant
             ),
         )?;
         Ok(())

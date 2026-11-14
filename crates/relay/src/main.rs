@@ -45,6 +45,9 @@ fn main() -> Result<()> {
     let _node = if dht {
         match minelib_p2p::Node::start() {
             Ok(node) => {
+                let node: &'static minelib_p2p::Node = Box::leak(Box::new(node));
+                // Pseudos uniques avec les autres relais du DHT.
+                h.set_whois(minelib_relay::federated_whois(node, h.public));
                 let local = std::net::SocketAddr::from(([127, 0, 0, 1], h.addr.port()));
                 node.serve(local);
                 minelib_p2p::publish(minelib_p2p::Ad {

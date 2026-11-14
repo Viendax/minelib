@@ -14,7 +14,7 @@
 //!   poser ou désamorcer. Les T encore en vie quand le temps est écoulé ne touchent rien.
 //! - Tir sur un coéquipier : un tiers des dégâts ; élimination d'un coéquipier : −300 $.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use glam::Vec3;
 use minelib_net::game::{
@@ -114,7 +114,7 @@ pub struct MPlayer {
     round_kills: u16,
     round_damage: u32,
     /// Dégâts infligés à chaque adversaire cette manche (passes décisives).
-    dealt: HashMap<u64, u32>,
+    dealt: BTreeMap<u64, u32>,
     dead_for: f32,
     /// Touches maintenues : poser, désamorcer.
     pub plant_key: bool,
@@ -162,7 +162,7 @@ pub enum Ev {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Match {
-    pub players: HashMap<u64, MPlayer>,
+    pub players: BTreeMap<u64, MPlayer>,
     pub phase: u8,
     pub time: f32,
     /// Manches jouées.
@@ -191,6 +191,8 @@ pub struct Match {
     planted_this_round: bool,
     /// Compte à rebours du début lancé (10 joueurs).
     countdown: bool,
+    /// Carte sans zones de départ : centre des départs CT et T (achats autour).
+    pub fallback_spawns: Option<[Vec3; 2]>,
 }
 
 fn other(team: u8) -> u8 {
@@ -227,7 +229,7 @@ impl Match {
 
     pub fn new(map: minelib_net::game::FpsMap, map_sig: [u8; 32], seed: u32) -> Self {
         Self {
-            players: HashMap::new(),
+            players: BTreeMap::new(),
             phase: phase::WARMUP,
             time: 0.0,
             played: 0,
@@ -249,6 +251,7 @@ impl Match {
             rng: seed | 1,
             planted_this_round: false,
             countdown: false,
+            fallback_spawns: None,
         }
     }
 
@@ -327,7 +330,7 @@ impl Match {
                 rounds: 0,
                 round_kills: 0,
                 round_damage: 0,
-                dealt: HashMap::new(),
+                dealt: BTreeMap::new(),
                 dead_for: 0.0,
                 plant_key: false,
                 defuse_key: false,
@@ -416,7 +419,15 @@ impl Match {
                 };
                 grown.contains(f.to_array())
             }
-            _ => true,
+            // Carte sans zones : autour du départ de son camp.
+            (None, Some(f)) => match self.fallback_spawns {
+                Some(b) => {
+                    let c = b[p.team.min(1) as usize];
+                    Vec3::new(f.x - c.x, 0.0, f.z - c.z).length() < 8.0
+                }
+                None => true,
+            },
+            (_, None) => true,
         }
     }
 
@@ -637,7 +648,7 @@ impl Match {
     }
 
     /// Un pas des règles (`places` : où est chaque joueur).
-    pub fn tick(&mut self, dt: f32, places: &HashMap<u64, Place>) -> Vec<Ev> {
+    pub fn tick(&mut self, dt: f32, places: &BTreeMap<u64, Place>) -> Vec<Ev> {
         let mut ev = Vec::new();
         self.time -= dt;
         match self.phase {
@@ -785,7 +796,7 @@ impl Match {
         ev.push(Ev::Say(format!("Manche {}.", self.played + 1)));
     }
 
-    fn tick_bomb(&mut self, dt: f32, places: &HashMap<u64, Place>, ev: &mut Vec<Ev>) {
+    fn tick_bomb(&mut self, dt: f32, places: &BTreeMap<u64, Place>, ev: &mut Vec<Ev>) {
         match self.bomb {
             bomb::CARRIED => {
                 let Some(c) = self.carrier else { return };
@@ -909,7 +920,7 @@ impl Match {
         }
     }
 
-    fn check_round(&mut self, ev: &mut Vec<Ev>, _places: &HashMap<u64, Place>) {
+    fn check_round(&mut self, ev: &mut Vec<Ev>, _places: &BTreeMap<u64, Place>) {
         let (ct, t) = (self.alive(CT), self.alive(T));
         let end = match self.bomb {
             bomb::EXPLODED => Some((T, reason::EXPLODED)),
@@ -1193,7 +1204,7 @@ mod tests {
         }
         assert_eq!(m.count(CT), 5);
         assert_eq!(m.count(T), 5);
-        let places = HashMap::new();
+        let places = BTreeMap::new();
         // Compte à rebours de 10 s puis début.
         let mut started = false;
         for _ in 0..(12 * 128) {
@@ -1230,7 +1241,7 @@ mod tests {
     }
 
     fn run(m: &mut Match, secs: f32) -> Vec<Ev> {
-        let places = HashMap::new();
+        let places = BTreeMap::new();
         let mut ev = Vec::new();
         for _ in 0..(secs * 128.0) as usize {
             ev.extend(m.tick(1.0 / 128.0, &places));
@@ -1308,7 +1319,7 @@ mod tests {
         let c = m.carrier.expect("un T a la bombe");
         let ct = *m.players.iter().find(|(_, p)| p.team == CT).unwrap().0;
         m.players.get_mut(&ct).unwrap().kit = true;
-        let mut places = HashMap::new();
+        let mut places = BTreeMap::new();
         let on = |x: f32| Place {
             feet: Vec3::new(x, 1.0, 12.0),
             on_ground: true,
@@ -1360,6 +1371,39 @@ mod tests {
         assert!(!m.finished());
         m.wins = [19, 17];
         assert!(m.finished());
+    }
+
+    #[test]
+    fn buying_only_in_ones_own_spawn() {
+        let map = FpsMap {
+            ct: Some(Zone::new([0, 0, 0], [4, 3, 4])),
+            t: Some(Zone::new([50, 0, 50], [54, 3, 54])),
+            ..Default::default()
+        };
+        let mut m = Match::new(map, [0; 32], 1);
+        m.join(1, "A");
+        let team = m.players[&1].team;
+        let (home, away) = if team == CT {
+            (Vec3::new(2.0, 1.0, 2.0), Vec3::new(52.0, 1.0, 52.0))
+        } else {
+            (Vec3::new(52.0, 1.0, 52.0), Vec3::new(2.0, 1.0, 2.0))
+        };
+        assert!(m.can_buy(1, Some(home)));
+        assert!(!m.can_buy(1, Some(away)), "pas dans le départ adverse");
+        assert!(
+            !m.can_buy(1, Some(Vec3::new(25.0, 1.0, 25.0))),
+            "pas au milieu"
+        );
+        let mut m = Match::new(FpsMap::default(), [0; 32], 1);
+        m.fallback_spawns = Some([Vec3::new(-10.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0)]);
+        m.join(1, "A");
+        let x = if m.players[&1].team == CT {
+            -10.0
+        } else {
+            10.0
+        };
+        assert!(m.can_buy(1, Some(Vec3::new(x, 0.0, 1.0))));
+        assert!(!m.can_buy(1, Some(Vec3::new(x + 30.0, 0.0, 1.0))));
     }
 
     #[test]

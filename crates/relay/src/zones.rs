@@ -173,6 +173,16 @@ impl Build {
         out
     }
 
+    /// Historique de toutes les zones (nouveau propriétaire du monde).
+    pub fn all_logs(&self) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
+        self.zones
+            .iter()
+            .map(|(&k, z)| (k, z.log.clone()))
+            .chain(self.orphan_logs.iter().map(|(&k, (l, _))| (k, l.clone())))
+            .filter(|(_, l)| !l.is_empty())
+            .collect()
+    }
+
     /// Historique d'une zone (nouveau garant).
     pub fn log(&self, zone: [i32; 2]) -> Vec<Vec<u8>> {
         self.zones

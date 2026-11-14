@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 6;
 
 /// Morceau d'une carte transférée (octets).
 pub const MAP_PART: usize = 48 * 1024;
@@ -15,6 +15,13 @@ pub const FPS_PLAYERS: u16 = 10;
 
 /// Pseudo : 3 à 16 caractères, lettres sans accent, chiffres et `_`. Unique sans tenir
 /// compte des majuscules.
+/// Actions des OP d'un serveur de construction (`Request::ServerAdmin`).
+pub const SERVER_BAN: u8 = 0;
+pub const SERVER_UNBAN: u8 = 1;
+pub const SERVER_OP: u8 = 2;
+pub const SERVER_DEOP: u8 = 3;
+pub const SERVER_LIST: u8 = 4;
+
 pub fn valid_pseudo(p: &str) -> bool {
     (3..=16).contains(&p.chars().count())
         && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -31,6 +38,11 @@ pub enum Request {
         protocol: u32,
         client: String,
     },
+    /// Entre relais : ce pseudo a-t-il un compte ici (et avec quelle clé) ? Les pseudos
+    /// sont uniques sur tous les relais qui se connaissent (ceux du DHT).
+    Whois {
+        pseudo: String,
+    },
     /// Création d'un compte : clé publique, preuve de mot de passe, coffre chiffré et
     /// preuve de travail (`crypto::pow_ok`).
     Register {
@@ -45,11 +57,18 @@ pub enum Request {
         pseudo: String,
         auth: [u8; 32],
         totp: Option<u32>,
-        /// Empreinte de la machine, salée par la clé du relais (`hw`).
-        hw: [u8; 32],
+        /// Empreintes des composants de la machine, salées par la clé du relais (`hw`).
+        hw: Vec<[u8; 32]>,
     },
     /// Administrateur du relais : bannit un compte (à vie) et ses machines (3 mois).
     Ban {
+        pseudo: String,
+        reason: String,
+    },
+    /// OP du serveur de construction où l'on est : `action` = `SERVER_BAN`, `…_UNBAN`,
+    /// `…_OP`, `…_DEOP` ou `…_LIST`.
+    ServerAdmin {
+        action: u8,
         pseudo: String,
         reason: String,
     },
@@ -93,6 +112,25 @@ pub enum Request {
     /// reprend si l'hôte part).
     SetBackup {
         peer: u64,
+    },
+    /// Ce jeu peut servir de garant indépendant (au menu, sans partie).
+    GarantAvailable {
+        on: bool,
+    },
+    /// Garant en attente : copie reçue, prêt à reprendre la partie.
+    GarantReady,
+    /// Garant vérificateur : désaccord avec l'hôte.
+    Conflict {
+        player: u64,
+        seq: u32,
+        host_pos: [f32; 3],
+        audit_pos: [f32; 3],
+        proof: bool,
+    },
+    /// Jugement d'un joueur sur un désaccord le concernant.
+    Vote {
+        conflict: u64,
+        auditor_right: bool,
     },
     /// Chat vocal (`voice::VoiceMsg` chiffré) à ces joueurs de la partie (0 = l'hôte en
     /// FPS). Le relais ne peut pas le lire.
@@ -179,6 +217,10 @@ impl Request {
             self,
             Request::ToHost { .. }
                 | Request::SetBackup { .. }
+                | Request::GarantAvailable { .. }
+                | Request::GarantReady
+                | Request::Conflict { .. }
+                | Request::Vote { .. }
                 | Request::Voice { .. }
                 | Request::ToPeer { .. }
                 | Request::Broadcast { .. }
@@ -279,6 +321,10 @@ pub enum Response {
     },
     /// Le compte a la double authentification : renvoyer `Login` avec le code.
     NeedTotp,
+    /// Clé du compte qui porte ce pseudo sur ce relais (aucune : pseudo libre).
+    Whois {
+        pubkey: Option<[u8; 32]>,
+    },
     /// Coffre chiffré et défi à signer.
     Vault {
         vault: Vec<u8>,
@@ -354,11 +400,40 @@ pub enum Response {
     /// L'hôte est parti : ce jeu devient l'hôte (avec les joueurs restants).
     Promoted {
         members: Vec<(u64, String)>,
+        /// L'ancien hôte reste dans la partie (remplacé par un garant) : son numéro.
+        old_host: Option<u64>,
+    },
+    /// Garant indépendant : une partie à servir (`standby` : en attente, vérificateur).
+    GarantTask {
+        room: u64,
+        map_sig: [u8; 32],
+        map: String,
+        members: Vec<(u64, String)>,
+        standby: bool,
+    },
+    /// À l'hôte : le garant de secours désigné (garant indépendant).
+    BackupIs {
+        peer: u64,
+    },
+    /// À un joueur : un désaccord le concerne ; juger avec sa propre prédiction.
+    Judge {
+        conflict: u64,
+        seq: u32,
+        host_pos: [f32; 3],
+        audit_pos: [f32; 3],
     },
     /// Chat vocal d'un joueur (0 = l'hôte en FPS).
     Voice {
         from: u64,
         data: Vec<u8>,
+    },
+    /// Réponse à `ServerAdmin` : texte à afficher.
+    ServerAdmin {
+        text: String,
+    },
+    /// Exclu de la partie (banni de ce serveur), avec la raison.
+    Kicked {
+        reason: String,
     },
     /// L'hôte est parti : `host` reprend la partie.
     HostChanged {
@@ -369,6 +444,12 @@ pub enum Response {
         data: Vec<u8>,
     },
     FromHost {
+        data: Vec<u8>,
+    },
+    /// Copie, pour le garant vérificateur, d'une demande d'un joueur à l'hôte (tir,
+    /// grenade, achat…) : le relais atteste qu'elle vient bien de ce joueur.
+    Witness {
+        peer: u64,
         data: Vec<u8>,
     },
     Error {
@@ -386,10 +467,15 @@ impl Response {
                 | Response::PeerLeft { .. }
                 | Response::RoomClosed
                 | Response::Promoted { .. }
+                | Response::GarantTask { .. }
+                | Response::BackupIs { .. }
+                | Response::Judge { .. }
                 | Response::Voice { .. }
                 | Response::HostChanged { .. }
+                | Response::Kicked { .. }
                 | Response::FromPeer { .. }
                 | Response::FromHost { .. }
+                | Response::Witness { .. }
                 | Response::Zones { .. }
                 | Response::FromZone { .. }
         )

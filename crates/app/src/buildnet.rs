@@ -95,6 +95,11 @@ impl BuildNet {
         self.owner
     }
 
+    /// Le propriétaire est parti : ce jeu le devient (il enregistrera le monde).
+    pub fn set_owner(&mut self) {
+        self.owner = true;
+    }
+
     fn send(&self, req: Request) {
         transport::push(&self.link, &req);
     }
