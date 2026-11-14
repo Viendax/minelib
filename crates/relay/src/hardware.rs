@@ -75,6 +75,15 @@ impl Store {
         self.save();
     }
 
+    /// Ces deux comptes ont-ils été vus sur une même machine ?
+    pub fn share_machine(&self, a: &str, b: &str) -> bool {
+        let of = |p: &str| self.data.seen.get(&p.to_ascii_lowercase());
+        match (of(a), of(b)) {
+            (Some(x), Some(y)) => x.iter().any(|m| y.iter().any(|n| same_machine(m, n))),
+            _ => false,
+        }
+    }
+
     /// Fin du ban de cette machine, si elle est bannie.
     pub fn banned_until(&self, hw: &[[u8; 32]]) -> Option<u64> {
         let t = now();

@@ -31,6 +31,8 @@ pub enum Sfx {
     /// Couteau : coup dans le vide, coup sur un bloc.
     KnifeSwing,
     KnifeHit,
+    /// Couteau qui touche un joueur.
+    KnifeFlesh,
     /// Grenades : goupille, lancer, rebond, explosion, flash, fumée, verre du molotov, feu,
     /// faux tir du leurre.
     Pin,
@@ -46,6 +48,8 @@ pub enum Sfx {
     Draw(usize),
     DrawKnife,
     DrawNade,
+    /// Une cartouche glissée dans un fusil à pompe.
+    Shell,
     /// Fin de rechargement, chien du R8 qui se lève.
     ReloadEnd,
     Hammer,
@@ -138,6 +142,8 @@ static FILES: &[(&str, &[u8])] = sounds!(
     "dry",
     "knife_swing",
     "knife_hit",
+    "knife_flesh",
+    "shell",
     "pin",
     "throw",
     "bounce",
@@ -228,6 +234,7 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
             (if alt { "knife_swing2" } else { "knife_swing" }, 0.6)
         }
         Sfx::KnifeHit => ("knife_hit", 0.7),
+        Sfx::KnifeFlesh => ("knife_flesh", 0.9),
         Sfx::Pin => ("pin", 0.6),
         Sfx::Throw => ("throw", 0.5),
         Sfx::Bounce => ("bounce", 0.5),
@@ -242,6 +249,7 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
         Sfx::DrawNade => ("draw_nade", 0.6),
         Sfx::ReloadEnd => ("reload_end", 0.55),
         Sfx::Hammer => ("hammer", 0.6),
+        Sfx::Shell => ("shell", 0.7),
     }
 }
 

@@ -558,24 +558,65 @@ impl WeaponDef {
         }
     }
 
-    /// Part des dégâts qui traverse le gilet pare-balles (« armor penetration » de CS).
+    /// Part des dégâts qui traverse le gilet pare-balles (« armor penetration » de CS2,
+    /// arme par arme).
     pub fn armor_pen(&self) -> f32 {
         match self.name {
-            "AWP" => 0.975,
+            "Glock-18" => 0.47,
+            "USP-S" | "P2000" => 0.505,
+            "Dual Berettas" => 0.575,
+            "P250" => 0.64,
+            "Five-SeveN" => 0.9115,
+            "Tec-9" => 0.906,
+            "CZ75-Auto" => 0.7765,
             "Desert Eagle" | "R8 Revolver" => 0.932,
-            "SSG 08" => 0.85,
-            "G3SG1" | "SCAR-20" => 0.825,
-            "AK-47" => 0.775,
-            "M249" | "Negev" => 0.8,
+            "MAC-10" | "PP-Bizon" => 0.575,
+            "MP9" => 0.6,
+            "MP7" | "MP5-SD" => 0.625,
+            "UMP-45" => 0.65,
             "P90" => 0.69,
+            "Nova" => 0.5,
             "XM1014" => 0.8,
-            _ => match self.category {
-                Category::Pistol => 0.5,
-                Category::Smg => 0.6,
-                Category::Heavy => 0.5,
-                Category::Rifle => 0.7,
-            },
+            "Sawed-Off" | "MAG-7" => 0.75,
+            "M249" => 0.8,
+            "Negev" => 0.71,
+            "Galil AR" | "AK-47" => 0.775,
+            "FAMAS" | "M4A4" | "M4A1-S" => 0.7,
+            "SG 553" => 1.0,
+            "AUG" => 0.9,
+            "SSG 08" => 0.85,
+            "AWP" => 0.975,
+            "G3SG1" | "SCAR-20" => 0.825,
+            _ => 0.6,
         }
+    }
+
+    /// Perte de dégâts avec la distance (« range modifier » de CS2) : les dégâts sont
+    /// multipliés par ce nombre tous les 500 unités de CS ([`RANGE_STEP`] blocs).
+    pub fn range_mod(&self) -> f32 {
+        match self.name {
+            "Glock-18" | "Desert Eagle" | "MP7" | "MP5-SD" | "CZ75-Auto" => 0.85,
+            "USP-S" | "P2000" => 0.91,
+            "Dual Berettas" | "Tec-9" => 0.79,
+            "P250" => 0.9,
+            "Five-SeveN" => 0.81,
+            "R8 Revolver" | "M4A1-S" => 0.94,
+            "MAC-10" | "PP-Bizon" => 0.8,
+            "MP9" => 0.87,
+            "UMP-45" => 0.75,
+            "P90" => 0.86,
+            "Nova" | "XM1014" => 0.7,
+            "Sawed-Off" | "MAG-7" => 0.45,
+            "M249" | "Negev" | "M4A4" => 0.97,
+            "FAMAS" => 0.96,
+            "AWP" => 0.99,
+            _ => 0.98,
+        }
+    }
+
+    /// Dégâts d'une balle à `dist` blocs, avant la partie du corps et le gilet.
+    pub fn damage_at(&self, dist: f32) -> f32 {
+        self.damage as f32 * self.range_mod().powf(dist.max(0.0) / RANGE_STEP)
     }
 
     /// Prime d'élimination de CS2.
@@ -924,4 +965,82 @@ mod tests {
         );
         assert_eq!(ak.spray(0), (0.0, 0.0), "première balle droite");
     }
+}
+
+/// 500 unités de CS, en blocs (une unité = 2,54 cm).
+pub const RANGE_STEP: f32 = 12.7;
+
+/// Trajet d'une balle : elle traverse un mur d'**un bloc** d'épaisseur (pas deux), puis
+/// s'arrête au mur suivant. Même calcul chez le tireur (impacts), l'hôte et le
+/// vérificateur (dégâts).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BulletPath {
+    /// Distance du premier mur (ou la portée) : avant, pleins dégâts.
+    pub first: f32,
+    /// Mur traversé : distance de la sortie, puis de l'arrêt final. Entre les deux, les
+    /// dégâts sont réduits ([`THROUGH_WALL`]).
+    pub through: Option<(f32, f32)>,
+    /// Impacts à dessiner : entrée, sortie, arrivée (point, normale de la face).
+    pub impacts: Vec<(glam::Vec3, glam::Vec3)>,
+}
+
+/// Part des dégâts qui restent après un mur.
+pub const THROUGH_WALL: f32 = 0.5;
+
+pub fn bullet_path(
+    world: &minelib_world::World,
+    origin: glam::Vec3,
+    dir: glam::Vec3,
+    range: f32,
+) -> BulletPath {
+    use glam::Vec3;
+    use minelib_world::raycast::raycast;
+    let normal = |n: [i32; 3]| Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32);
+    let Some(h) = raycast(world, origin.into(), dir.into(), range) else {
+        return BulletPath {
+            first: range,
+            ..Default::default()
+        };
+    };
+    let mut path = BulletPath {
+        first: h.distance,
+        through: None,
+        impacts: vec![(origin + dir * h.distance, normal(h.normal))],
+    };
+    // On avance dans le mur : la balle ressort si la case suivante sur sa route est vide.
+    let solid = |p: Vec3| {
+        let c = p.floor().as_ivec3();
+        (world.get(c.x, c.y, c.z).def().solid, c)
+    };
+    let (_, entry) = solid(origin + dir * (h.distance + 0.01));
+    let mut t = h.distance + 0.01;
+    let exit = loop {
+        t += 0.02;
+        if t > h.distance + 1.8 || t >= range {
+            return path;
+        }
+        let (full, cell) = solid(origin + dir * t);
+        if cell != entry {
+            if full {
+                return path;
+            }
+            break t;
+        }
+    };
+    let out = origin + dir * (exit + 0.01);
+    // Face de sortie : vue depuis l'autre côté.
+    if let Some(back) = raycast(world, out.into(), (-dir).into(), 0.2) {
+        path.impacts
+            .push((out - dir * back.distance, normal(back.normal)));
+    }
+    let last = match raycast(world, out.into(), dir.into(), range - exit) {
+        Some(h2) => {
+            path.impacts
+                .push((out + dir * h2.distance, normal(h2.normal)));
+            exit + 0.01 + h2.distance
+        }
+        None => range,
+    };
+    path.through = Some((exit, last));
+    path
 }

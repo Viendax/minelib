@@ -94,7 +94,40 @@ pub struct Player {
     /// Mode FPS : appui sur saut encore valable (s) ; il faut réappuyer pour ressauter.
     jump_buffer: f32,
     sneak_was_held: bool,
+    /// Les autres joueurs, solides : on ne les traverse pas, on peut monter sur une tête.
+    /// À remplir avant chaque pas (vide : personne).
+    pub others: Vec<Other>,
+    /// Atterri sur un joueur déjà perché sur un autre : on glisse de sa tête (son centre).
+    slide: Option<Vec3>,
 }
+
+/// Un autre joueur, vu comme un obstacle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Other {
+    /// Ses pieds.
+    pub feet: Vec3,
+    /// Il est lui-même debout sur la tête d'un joueur : personne ne tient sur la sienne.
+    pub stacked: bool,
+}
+
+/// Obstacles que forment les joueurs aux pieds `feet` (les autres que soi, vivants).
+pub fn others_from(feet: &[Vec3]) -> Vec<Other> {
+    feet.iter()
+        .enumerate()
+        .map(|(i, &f)| Other {
+            feet: f,
+            stacked: feet.iter().enumerate().any(|(j, &g)| {
+                j != i
+                    && (f.y - (g.y + HEIGHT)).abs() < 0.05
+                    && (f.x - g.x).abs() < 2.0 * HALF_WIDTH
+                    && (f.z - g.z).abs() < 2.0 * HALF_WIDTH
+            }),
+        })
+        .collect()
+}
+
+/// Vitesse à laquelle on glisse de la tête d'un joueur déjà perché (blocs/s).
+const SLIDE: f32 = 3.5;
 
 /// Intention de déplacement pour une image (indépendante du clavier).
 #[derive(Default, Clone, Copy)]
@@ -127,6 +160,8 @@ impl Player {
             duck_speed: cs::DUCK_SPEED_MAX,
             jump_buffer: 0.0,
             sneak_was_held: false,
+            others: Vec::new(),
+            slide: None,
         }
     }
 
@@ -205,7 +240,16 @@ impl Player {
         let fps = m.fps && !self.flying && !self.noclip;
         let duck_rate = if fps { self.duck_speed * 1.5 } else { 12.0 };
         let target = if crouching { 1.0 } else { 0.0 };
+        let crouch_before = self.crouch;
         self.crouch += (target - self.crouch) * (dt * duck_rate).min(1.0);
+        // Saut accroupi (mode FPS) : s'accroupir en l'air replie les jambes, les pieds
+        // montent d'autant que la vue descend (la vue ne bouge pas) ; se relever en l'air
+        // les redescend. Saut (1,45 bloc) + jambes repliées : on atteint 1,5 bloc.
+        if fps && !self.on_ground {
+            let lift = CROUCH_DROP * (self.crouch - crouch_before);
+            self.move_axis(world, 1, lift);
+            self.slide = None;
+        }
 
         if self.flying {
             let speed = if m.sprint { FLY_SPRINT } else { FLY };
@@ -394,7 +438,16 @@ impl Player {
         }
         if axis == 1 {
             if d < 0.0 {
-                self.on_ground = true;
+                match self.slide.take() {
+                    // Tête d'un joueur déjà perché : on n'y tient pas, on glisse du côté
+                    // le plus proche du bord.
+                    Some(c) => {
+                        let off = self.pos - c;
+                        let ax = if off.x.abs() >= off.z.abs() { 0 } else { 2 };
+                        self.vel[ax] = if off[ax] < 0.0 { -SLIDE } else { SLIDE };
+                    }
+                    None => self.on_ground = true,
+                }
             }
             self.vel.y = 0.0;
             return;
@@ -423,6 +476,7 @@ impl Player {
         let saved = self.pos;
         let hit = self.move_axis(world, 1, -0.6);
         self.pos = saved;
+        self.slide = None;
         hit
     }
 
@@ -449,6 +503,33 @@ impl Player {
             (HALF_WIDTH, HALF_WIDTH)
         };
         let mut hit = false;
+        // Les autres joueurs : mêmes règles que les blocs (on ne s'arrête que contre un
+        // joueur qui était devant ; deux joueurs déjà l'un dans l'autre peuvent se séparer).
+        self.slide = None;
+        let mut on_player: Option<(f32, Other)> = None;
+        for i in 0..self.others.len() {
+            let o = self.others[i];
+            let h = Vec3::new(HALF_WIDTH, 0.0, HALF_WIDTH);
+            let (bmin, bmax) = (o.feet - h, o.feet + h + Vec3::Y * HEIGHT);
+            let (pmin, pmax) = self.bounds();
+            let side = (0..3)
+                .all(|k| k == axis || (pmin[k] < bmax[k] - TOUCH && pmax[k] > bmin[k] + TOUCH));
+            if !side {
+                continue;
+            }
+            if d > 0.0 {
+                if bmin[axis] >= bmax0[axis] - TOUCH && pmax[axis] > bmin[axis] {
+                    self.pos[axis] = self.pos[axis].min(bmin[axis] - above);
+                    hit = true;
+                }
+            } else if bmax[axis] <= bmin0[axis] + TOUCH && pmin[axis] < bmax[axis] {
+                self.pos[axis] = self.pos[axis].max(bmax[axis] + below);
+                hit = true;
+                if axis == 1 && on_player.is_none_or(|(top, _)| bmax.y > top) {
+                    on_player = Some((bmax.y, o));
+                }
+            }
+        }
         for y in lo.y..=hi.y {
             for z in lo.z..=hi.z {
                 for x in lo.x..=hi.x {
@@ -474,6 +555,12 @@ impl Player {
                         }
                     }
                 }
+            }
+        }
+        // Posé sur la tête d'un joueur (et pas sur un bloc plus haut) qui est lui-même perché.
+        if let Some((top, o)) = on_player {
+            if o.stacked && (self.pos.y - top).abs() < TOUCH {
+                self.slide = Some(o.feet);
             }
         }
         hit
@@ -777,6 +864,127 @@ mod tests {
             }
         }
         peak
+    }
+
+    /// Saut accroupi : saut, puis accroupi maintenu en l'air. Les pieds passent 1,5 bloc
+    /// (pas sans s'accroupir), et on se pose sur un obstacle de 1,5 bloc.
+    #[test]
+    fn crouch_jump_reaches_one_and_a_half_blocks() {
+        let w = flat_world();
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        for _ in 0..ticks(64) {
+            p.update(&w, &fps_input(), TICK);
+        }
+        let plain = jump_peak(&mut p, &w);
+        assert!(plain < 1.5, "saut simple : {plain}");
+        for _ in 0..ticks(512) {
+            p.update(&w, &fps_input(), TICK);
+        }
+        let y0 = p.pos.y;
+        let jump = MoveInput {
+            jump: true,
+            jump_pressed: true,
+            ..fps_input()
+        };
+        let duck = MoveInput {
+            sneak: true,
+            jump: true,
+            ..fps_input()
+        };
+        p.update(&w, &jump, TICK);
+        let mut peak: f32 = 0.0;
+        for _ in 0..ticks(400) {
+            p.update(&w, &duck, TICK);
+            peak = peak.max(p.pos.y - y0);
+            if p.on_ground {
+                break;
+            }
+        }
+        assert!(peak > 1.55 && peak < 1.85, "saut accroupi : {peak}");
+        assert!((p.pos.y - y0).abs() < 1e-3, "retombé au sol");
+        // Sur un mur de 1,5 bloc (un bloc et une dalle), en avançant.
+        let mut w = flat_world();
+        for z in 6..11 {
+            w.set(11, 11, z, BlockId::STONE);
+            let slab = minelib_world::registry::registry()
+                .by_key("slab:stone:bottom")
+                .unwrap();
+            w.set(11, 12, z, slab);
+        }
+        let mut p = Player::new(Vec3::new(10.69, 11.0, 8.5));
+        p.yaw = std::f32::consts::FRAC_PI_2;
+        for _ in 0..ticks(64) {
+            p.update(&w, &fps_input(), TICK);
+        }
+        let fwd = |m: MoveInput| MoveInput { forward: 1.0, ..m };
+        p.update(&w, &fwd(jump), TICK);
+        let mut on_wall = false;
+        for _ in 0..ticks(300) {
+            p.update(&w, &fwd(duck), TICK);
+            on_wall |= p.on_ground && (p.pos.y - 12.5).abs() < 1e-3;
+        }
+        assert!(on_wall, "monté sur le mur : {:?}", p.pos);
+    }
+
+    /// Les joueurs sont solides entre eux : on ne se traverse pas, on monte sur une tête,
+    /// mais un troisième glisse de la tête de celui qui est déjà perché.
+    #[test]
+    fn players_collide_stack_and_the_third_slides_off() {
+        let w = flat_world();
+        let a = Vec3::new(8.5, 11.0, 8.5);
+        // On marche vers A : arrêté contre lui.
+        let mut p = Player::new(Vec3::new(6.5, 11.0, 8.5));
+        p.yaw = std::f32::consts::FRAC_PI_2;
+        p.others = others_from(&[a]);
+        let run = MoveInput {
+            forward: 1.0,
+            sprint: true,
+            ..fps_input()
+        };
+        for _ in 0..ticks(512) {
+            p.update(&w, &run, TICK);
+        }
+        assert!(
+            (p.pos.x - (a.x - 2.0 * HALF_WIDTH)).abs() < 1e-3,
+            "{:?}",
+            p.pos
+        );
+        // B tombe sur la tête de A : il y tient.
+        let mut b = Player::new(a + Vec3::Y * 3.0);
+        b.others = others_from(&[a]);
+        for _ in 0..ticks(256) {
+            b.update(&w, &fps_input(), TICK);
+        }
+        assert!(
+            b.on_ground && (b.pos.y - (a.y + HEIGHT)).abs() < 1e-3,
+            "{:?}",
+            b.pos
+        );
+        // C tombe sur la tête de B (perché sur A), un peu décalé : il glisse et finit au sol,
+        // du côté où il était.
+        let mut c = Player::new(b.pos + Vec3::new(0.1, 3.0, 0.0));
+        c.others = others_from(&[a, b.pos]);
+        assert!(c.others[1].stacked && !c.others[0].stacked);
+        for _ in 0..ticks(512) {
+            c.update(&w, &fps_input(), TICK);
+        }
+        assert!(
+            c.on_ground && (c.pos.y - 11.0).abs() < 1e-3,
+            "au sol : {:?}",
+            c.pos
+        );
+        assert!(
+            c.pos.x > a.x + 2.0 * HALF_WIDTH - 1e-3,
+            "du côté le plus proche"
+        );
+        // Deux joueurs l'un dans l'autre (même point d'apparition) peuvent se séparer.
+        let mut d = Player::new(a + Vec3::new(0.1, 0.0, 0.0));
+        d.yaw = std::f32::consts::FRAC_PI_2;
+        d.others = others_from(&[a]);
+        for _ in 0..ticks(256) {
+            d.update(&w, &run, TICK);
+        }
+        assert!(d.pos.x > a.x + 1.0, "{:?}", d.pos);
     }
 
     #[test]

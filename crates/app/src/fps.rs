@@ -183,6 +183,9 @@ pub fn spread_deg(
     spread
 }
 
+/// Temps pour glisser une cartouche dans un fusil à pompe (s).
+const SHELL_S: f32 = 0.5;
+
 pub struct Fps {
     /// Tirs de cette image pour le multijoueur : arme, origine, direction de chaque plomb.
     pub shots: Vec<(u8, Vec3, Vec<Vec3>)>,
@@ -218,6 +221,8 @@ pub struct Fps {
     tracers: Vec<Tracer>,
     holes: Vec<(Vec3, Vec3)>,
     sparks: Vec<(Vec3, Vec3, f32)>,
+    /// Gouttes de sang (position, vitesse, âge) : un joueur touché.
+    blood: Vec<(Vec3, Vec3, f32)>,
     flash: f32,
     kick: f32,
     pub buy_open: bool,
@@ -285,6 +290,7 @@ impl Fps {
             tracers: Vec::new(),
             holes: Vec::new(),
             sparks: Vec::new(),
+            blood: Vec::new(),
             flash: 0.0,
             kick: 0.0,
             buy_open: false,
@@ -309,17 +315,16 @@ impl Fps {
         }
     }
 
-    /// Armes portées (indices, 255 = aucune) : principale, secondaire.
-    pub fn loadout_ids(&self) -> (u8, u8) {
-        (
-            self.primary.map_or(255, |g| g.def as u8),
-            self.secondary.map_or(255, |g| g.def as u8),
-        )
-    }
-
     /// Partie en ligne : nouvelle manche. `reset` : mort ou changement de côté, on repart
     /// avec le pistolet de départ de son camp (Glock-18 pour les T, USP-S pour les CT).
-    pub fn new_round(&mut self, reset: bool, team: u8) {
+    /// `clear` : vraie nouvelle manche, les grenades et fumées en cours disparaissent.
+    pub fn new_round(&mut self, reset: bool, team: u8, clear: bool) {
+        // Ce qui est dans le monde (grenades en vol, fumées, feu) ne dépend pas de soi :
+        // gardé quand on réapparaît seul (échauffement), effacé à une nouvelle manche.
+        let world = (
+            std::mem::take(&mut self.thrown),
+            std::mem::take(&mut self.effects),
+        );
         if reset {
             self.respawn();
             let name = if team == minelib_net::game::T {
@@ -345,8 +350,24 @@ impl Fps {
                 g.reserve = WEAPONS[g.def].reserve;
             }
         }
-        self.thrown.clear();
-        self.effects.clear();
+        if !clear {
+            (self.thrown, self.effects) = world;
+        }
+    }
+
+    /// En ligne : ce que l'hôte dit que l'on porte. On s'y remet si on s'en est écarté
+    /// (changement d'hôte, message perdu) ; les armes déjà bonnes gardent leurs balles.
+    pub fn set_guns(&mut self, guns: (u8, u8), nades: [u8; 5]) {
+        let fix = |slot: &mut Option<Gun>, want: u8| {
+            let have = slot.map_or(255, |g| g.def as u8);
+            if have != want {
+                *slot = ((want as usize) < WEAPONS.len()).then(|| Gun::new(want as usize));
+            }
+        };
+        fix(&mut self.primary, guns.0);
+        fix(&mut self.secondary, guns.1);
+        self.nades = nades;
+        self.reload = None;
     }
 
     /// Objet acheté (accepté par l'hôte).
@@ -684,7 +705,12 @@ impl Fps {
         }
         if c.rebuy {
             if let Some(i) = self.last_bought {
-                self.buy(i);
+                // En ligne, c'est l'hôte qui vend.
+                if self.online.is_some() {
+                    self.requests.push(i as u16);
+                } else {
+                    self.buy(i);
+                }
             }
         }
         // Lâcher : seulement l'arme principale (on garde toujours un pistolet).
@@ -700,12 +726,24 @@ impl Fps {
             *t -= dt;
             if *t <= 0.0 {
                 self.reload = None;
-                self.sounds.push((Sfx::ReloadEnd, 0.0, 1.0));
+                let mut again = None;
                 if let Some(g) = self.active_mut() {
-                    let need = WEAPONS[g.def].magazine - g.mag;
-                    let n = need.min(g.reserve);
+                    let def = &WEAPONS[g.def];
+                    let need = def.magazine - g.mag;
+                    // Fusils à pompe : une cartouche à la fois, tant qu'il en manque.
+                    let n = if def.pellets > 1 { 1 } else { need }.min(g.reserve);
                     g.mag += n;
                     g.reserve -= n;
+                    if def.pellets > 1 && g.mag < def.magazine && g.reserve > 0 {
+                        again = Some(g.def);
+                    }
+                }
+                match again {
+                    Some(_) => {
+                        self.reload = Some(SHELL_S);
+                        self.sounds.push((Sfx::Shell, 0.0, 1.0));
+                    }
+                    None => self.sounds.push((Sfx::ReloadEnd, 0.0, 1.0)),
                 }
             }
         }
@@ -721,9 +759,7 @@ impl Fps {
             self.still >= SETTLE_S,
         );
         if c.reload && self.reload.is_none() && gun.mag < def.magazine && gun.reserve > 0 {
-            self.reload = Some(def.reload_s);
-            self.sounds.push((Sfx::Reload(gun.def), 0.0, 1.0));
-            self.scoped = 0;
+            self.start_reload(gun.def);
         }
         // Clic droit : ×2, (×4), puis retour sans lunette.
         if c.scope && !def.scope.is_empty() {
@@ -778,6 +814,10 @@ impl Fps {
             } else {
                 c.trigger_pressed
             };
+        // Fusil à pompe : tirer interrompt le rechargement (s'il reste une cartouche).
+        if wants && self.reload.is_some() && def.pellets > 1 && gun.mag > 0 {
+            self.reload = None;
+        }
         if !wants || self.reload.is_some() {
             self.cooldown = self.cooldown.max(0.0);
             return;
@@ -788,9 +828,7 @@ impl Fps {
             let mag = self.active().map_or(0, |g| g.mag);
             if mag == 0 {
                 if self.active().is_some_and(|g| g.reserve > 0) {
-                    self.reload = Some(def.reload_s);
-                    self.scoped = 0;
-                    self.sounds.push((Sfx::Reload(gun.def), 0.0, 1.0));
+                    self.start_reload(gun.def);
                 } else if c.trigger_pressed {
                     self.sounds.push((Sfx::Dry, 0.0, 1.0));
                 }
@@ -805,6 +843,23 @@ impl Fps {
             }
         }
         self.cooldown = self.cooldown.max(-def.interval());
+    }
+
+    /// Début d'un rechargement : chargeur entier, ou première cartouche d'un fusil à pompe.
+    fn start_reload(&mut self, def: usize) {
+        let shotgun = WEAPONS[def].pellets > 1;
+        self.reload = Some(if shotgun {
+            SHELL_S
+        } else {
+            WEAPONS[def].reload_s
+        });
+        self.scoped = 0;
+        let sfx = if shotgun {
+            Sfx::Shell
+        } else {
+            Sfx::Reload(def)
+        };
+        self.sounds.push((sfx, 0.0, 1.0));
     }
 
     /// Un tir : munition, recul (motif), imprécision, balles traçantes, impacts.
@@ -860,10 +915,10 @@ impl Fps {
             let y = yaw + side.to_radians() + r * a.cos();
             let dir = Vec3::new(y.sin() * p.cos(), p.sin(), -y.cos() * p.cos());
             dirs.push(dir);
-            let (dist, hit) = match raycast(world, eye.into(), dir.into(), RANGE) {
-                Some(h) => (h.distance, Some(h)),
-                None => (RANGE, None),
-            };
+            // La balle traverse un mur d'un bloc : impacts à l'entrée, à la sortie et à
+            // l'arrivée (même calcul que l'hôte pour les dégâts).
+            let path = weapons::bullet_path(world, eye, dir, RANGE);
+            let dist = path.through.map_or(path.first, |t| t.1);
             let target = eye + dir * dist;
             // La balle creuse un tunnel dans les fumigènes qu'elle traverse.
             for e in &mut self.effects {
@@ -878,15 +933,14 @@ impl Fps {
                 dist: (target - muzzle).length(),
                 travelled: 0.0,
             });
-            if let Some(h) = hit {
-                let n = Vec3::new(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
+            for (at, n) in path.impacts {
                 if self.holes.len() >= MAX_HOLES {
                     self.holes.remove(0);
                 }
-                self.holes.push((target + n * 0.004, n));
+                self.holes.push((at + n * 0.004, n));
                 for _ in 0..5 {
                     let v = n * 2.0 + Vec3::new(self.random(), self.random(), self.random()) * 2.5;
-                    self.sparks.push((target + n * 0.02, v, 0.0));
+                    self.sparks.push((at + n * 0.02, v, 0.0));
                 }
             }
         }
@@ -1054,6 +1108,56 @@ impl Fps {
             s.0 += s.1 * dt;
         }
         self.sparks.retain(|s| s.2 < 0.35);
+        for b in &mut self.blood {
+            b.2 += dt;
+            b.1.y -= 14.0 * dt;
+            b.0 += b.1 * dt;
+        }
+        self.blood.retain(|b| b.2 < 0.6);
+    }
+
+    /// En ligne : un autre joueur tire depuis `pos` (on l'entend, plus faible de loin).
+    pub fn heard_shot(&mut self, weapon: u8, pos: Vec3, eye: Vec3) {
+        let sfx = if (weapon as usize) < WEAPONS.len() {
+            Sfx::Shot(weapon as usize)
+        } else {
+            Sfx::KnifeSwing
+        };
+        self.sound_at(sfx, 0.0, pos, eye);
+    }
+
+    /// En ligne : un joueur est touché en `at` (sang ; bruit du couteau dans la chair).
+    pub fn blood_at(&mut self, at: Vec3, knife: bool, eye: Vec3) {
+        for _ in 0..10 {
+            let v = Vec3::new(self.random(), self.random() * 0.5 + 0.6, self.random()) * 1.8;
+            self.blood.push((at, v, 0.0));
+        }
+        if self.blood.len() > 400 {
+            let extra = self.blood.len() - 400;
+            self.blood.drain(..extra);
+        }
+        if knife {
+            self.sound_at(Sfx::KnifeFlesh, 0.0, at, eye);
+        }
+    }
+
+    /// Aveuglé par une flash (pour le fil des éliminations).
+    pub fn is_blind(&self) -> bool {
+        self.blind > 0.3
+    }
+
+    /// Fumées en cours : (centre, rayon).
+    pub fn smoke_spheres(&self) -> Vec<(Vec3, f32)> {
+        self.effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Smoke(c) => {
+                    let size = c.bounds.1 - c.bounds.0;
+                    Some(((c.bounds.0 + c.bounds.1) * 0.5, size.x.max(size.z) * 0.4))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Position du bout du canon dans le monde (départ des balles traçantes).
@@ -1217,6 +1321,18 @@ impl Fps {
                 view_proj,
                 [b + w, a + w, a - w],
                 [3.0, 2.4, 1.2, 1.0],
+            );
+        }
+        for (p, v, age) in &self.blood {
+            let s = 0.045 * (1.0 - age / 0.6);
+            let d = v.normalize_or_zero();
+            let w = cam_right(*p, d) * s;
+            let tail = *p - d * s * 2.5;
+            push_tri(
+                &mut out,
+                view_proj,
+                [tail, *p - w, *p + w],
+                [0.55, 0.01, 0.01, 1.0],
             );
         }
         for (p, v, age) in &self.sparks {
@@ -2470,6 +2586,76 @@ mod tests {
             },
         );
         assert_eq!(f.active().map(|g| WEAPONS[g.def].name), Some("SG 553"));
+    }
+
+    /// Fusil à pompe : une cartouche à la fois ; tirer interrompt le rechargement. Et la
+    /// balle traverse un mur d'un bloc : impacts à l'entrée, à la sortie et à l'arrivée.
+    #[test]
+    fn shotguns_load_shell_by_shell_and_bullets_cross_one_block() {
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        for y in 0..16 {
+            for x in 0..16 {
+                w.set(x, y, 8, BlockId::STONE); // mur d'un bloc
+                w.set(x, y, 2, BlockId::STONE); // mur du fond, deux blocs
+                w.set(x, y, 1, BlockId::STONE);
+            }
+        }
+        let eye = Vec3::new(8.5, 8.0, 12.5);
+        let north = Vec3::new(0.0, 0.0, -1.0);
+        let p = weapons::bullet_path(&w, eye, north, 250.0);
+        assert!((p.first - 3.5).abs() < 1e-3);
+        let (exit, last) = p.through.expect("traverse un bloc");
+        assert!(
+            (exit - 4.5).abs() < 0.05 && (last - 9.5).abs() < 0.05,
+            "{exit} {last}"
+        );
+        assert_eq!(p.impacts.len(), 3, "entrée, sortie, arrivée");
+        assert_eq!(p.impacts[0].1, Vec3::Z);
+        assert_eq!(p.impacts[1].1, -Vec3::Z);
+        // Depuis l'autre côté du premier mur : le fond fait deux blocs, la balle s'arrête.
+        let p = weapons::bullet_path(&w, Vec3::new(8.5, 8.0, 6.5), north, 250.0);
+        assert!(p.through.is_none() && p.impacts.len() == 1);
+
+        let mut f = Fps::new();
+        let nova = WEAPONS.iter().position(|d| d.name == "Nova").unwrap();
+        f.buy(nova);
+        let full = WEAPONS[nova].magazine;
+        f.active_mut().unwrap().mag = full - 3;
+        let step = |f: &mut Fps, c: &Controls, n: usize| {
+            for _ in 0..n {
+                f.update(1.0 / 60.0, c, &w, eye, 0.0, 0.0);
+            }
+        };
+        let idle = Controls {
+            on_ground: true,
+            ..Default::default()
+        };
+        let reload = Controls {
+            reload: true,
+            ..idle
+        };
+        step(&mut f, &idle, 90); // arme sortie
+        step(&mut f, &reload, 1);
+        step(&mut f, &idle, 35); // 0,6 s : une cartouche, pas trois
+        assert_eq!(f.active().unwrap().mag, full - 2);
+        // Tirer interrompt.
+        let fire = Controls {
+            trigger_pressed: true,
+            trigger_held: true,
+            ..idle
+        };
+        step(&mut f, &fire, 1);
+        assert!(f.reload.is_none());
+        assert_eq!(f.active().unwrap().mag, full - 3, "un tir");
+        // Laissé tranquille : rechargé jusqu'au bout, une par une.
+        step(&mut f, &idle, 60);
+        step(&mut f, &reload, 1);
+        step(&mut f, &idle, 60);
+        assert!(f.active().unwrap().mag < full, "pas tout d'un coup");
+        step(&mut f, &idle, 120);
+        assert_eq!(f.active().unwrap().mag, full);
+        assert!(f.reload.is_none());
     }
 
     #[test]

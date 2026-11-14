@@ -146,7 +146,10 @@ fn remote_key(conn: &iroh::endpoint::Connection, first: Option<std::net::IpAddr>
         Some(ip) => ip.to_canonical().to_string(),
         None => {
             let id = conn.remote_id();
-            let hex: String = id.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let hex: String = id.as_bytes()[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             format!("iroh:{hex}")
         }
     }
@@ -327,6 +330,9 @@ mod tests {
         c.read_exact(&mut back).unwrap();
         assert_eq!(&back, b"salut");
         let who = who_rx.recv().unwrap();
-        assert!(!who.is_empty() && who != "127.0.0.1", "vraie adresse : {who}");
+        assert!(
+            !who.is_empty() && who != "127.0.0.1",
+            "vraie adresse : {who}"
+        );
     }
 }

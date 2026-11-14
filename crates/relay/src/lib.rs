@@ -953,6 +953,19 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
                 format!("Tu es banni de ce serveur{why}."),
             );
         }
+        // Un nouveau compte sur la machine d'un banni ne passe pas non plus.
+        let server = r.server.clone();
+        if st
+            .servers
+            .bans(&server)
+            .iter()
+            .any(|b| st.hardware.share_machine(b, pseudo))
+        {
+            return err(
+                ErrorCode::Refused,
+                "Un compte de cette machine est banni de ce serveur.",
+            );
+        }
     }
     r.members.push(id);
     let (host, host_pseudo, map, map_sig) =
@@ -1217,8 +1230,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             pseudo: target,
             reason,
         } => {
-            let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1))
-            else {
+            let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1)) else {
                 return Some(err(
                     ErrorCode::Refused,
                     "Seulement sur un serveur de construction.",
@@ -1572,6 +1584,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                                 | game::ToHost::Buy(_)
                                 | game::ToHost::Action { .. }
                                 | game::ToHost::Team(_)
+                                | game::ToHost::Drop { .. }
+                                | game::ToHost::Pickup { .. }
                         )
                     });
                 if witness {
@@ -1982,7 +1996,10 @@ mod tests {
         c.write_all(&minelib_p2p::preamble("203.0.113.7")).unwrap();
         c.write_all(b"suite").unwrap();
         let (s, _) = l.accept().unwrap();
-        assert_eq!(super::tunnel_peer(&s).unwrap().as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            super::tunnel_peer(&s).unwrap().as_deref(),
+            Some("203.0.113.7")
+        );
         let mut rest = [0u8; 5];
         (&s).read_exact(&mut rest).unwrap();
         assert_eq!(&rest, b"suite");
@@ -2632,6 +2649,7 @@ mod tests {
             origin: [0.0; 3],
             dirs: vec![[1.0, 0.0, 0.0]],
             view_tick: 5,
+            blind: false,
         };
         to_host(&fire);
         match wait(&v, |e| matches!(e, Event::Witness { .. })) {

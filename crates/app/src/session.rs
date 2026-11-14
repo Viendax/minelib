@@ -82,6 +82,8 @@ pub struct Session {
     pub game_over: Option<(minelib_net::game::MatchSummary, f32)>,
     /// Bandeau de fin de manche (texte, couleur, temps restant).
     banner: Option<(String, [f32; 4], f32)>,
+    /// Fil des éliminations (en haut à droite) : élimination, âge (s).
+    feed: Vec<(crate::netgame::Kill, f32)>,
     /// Demandes pour le relais : signaler, amis.
     pub relay_cmds: Vec<minelib_net::client::Cmd>,
     /// Construction en ligne.
@@ -253,6 +255,7 @@ impl Session {
             match_result: None,
             game_over: None,
             banner: None,
+            feed: Vec::new(),
             relay_cmds: Vec::new(),
             build: None,
             fps_avg: 0.0,
@@ -555,13 +558,13 @@ impl Session {
                         Vec::new()
                     },
                 };
+                n.set_sight(self.fps.is_blind(), self.fps.smoke_spheres());
                 let mut locals = n.end_frame(&self.world, shots, weapon, nades, dt);
                 for item in std::mem::take(&mut self.fps.requests) {
                     locals.extend(n.buy(item));
                 }
-                // Armes : portées, lâchées (G), ramassées (E près d'une arme au sol).
-                let (p, s2) = self.fps.loadout_ids();
-                n.set_loadout(p, s2);
+                // Armes : lâchées (G), ramassées (E près d'une arme au sol). Ce que chacun
+                // porte, c'est l'hôte qui le sait (achats, ramassages).
                 for w in std::mem::take(&mut self.fps.dropped) {
                     n.drop_weapon(w);
                 }
@@ -626,6 +629,10 @@ impl Session {
                 });
                 self.chat.names = n.pseudos();
                 net_locals = locals;
+                for f in &mut self.feed {
+                    f.1 += dt;
+                }
+                self.feed.retain(|f| f.1 < 6.0);
                 if let Some(b) = &mut self.banner {
                     b.2 -= dt;
                     if b.2 <= 0.0 {
@@ -1151,6 +1158,8 @@ impl Session {
             self.prev_crouch = self.player.crouch;
             let mut mt = *m;
             mt.jump_pressed = std::mem::take(&mut self.pending_jump);
+            // En ligne (FPS) : les autres joueurs sont solides.
+            self.player.others = self.net.as_ref().map_or_else(Vec::new, |n| n.obstacles());
             self.player.update(&self.world, &mt, SIM_TICK);
             if let Some(n) = &mut self.net {
                 n.on_tick(&self.world, &self.player, &mt, SIM_TICK);
@@ -1311,6 +1320,9 @@ impl Session {
                     .map_or_else(String::new, |r| r.pseudo);
                 let map = crate::fpsmap::load(&self.dir);
                 let resumed = n.promote(pseudo, members, &self.player, map, *old_host);
+                if let Some((guns, nades)) = n.my_guns() {
+                    self.fps.set_guns(guns, nades);
+                }
                 let t = if resumed {
                     "L'hôte est parti : tu étais garant de secours, tu reprends la partie."
                 } else {
@@ -1398,13 +1410,40 @@ impl Session {
                     self.sim = None;
                     self.prev_pos = self.player.pos;
                     self.fall_from = None;
-                    self.fps.new_round(reset, team);
+                    // Échauffement : on réapparaît seul, les fumées des autres restent.
+                    let warmup = self
+                        .net
+                        .as_ref()
+                        .is_some_and(|n| n.hud().phase == minelib_net::game::phase::WARMUP);
+                    self.fps.new_round(reset, team, !warmup);
                     self.net_dead = false;
                 }
                 Local::Chat(t) => self.chat.say(t, chat::WHITE),
                 Local::Notice(t) => self.chat.say(t, chat::YELLOW),
                 Local::Hit { head } => self.fps.hit_marker = (0.25, head),
                 Local::Give(item) => self.fps.give(item),
+                Local::Kill(k) => {
+                    self.feed.push((k, 0.0));
+                    if self.feed.len() > 6 {
+                        self.feed.remove(0);
+                    }
+                }
+                Local::Shot {
+                    weapon,
+                    pos,
+                    heard,
+                    hits,
+                } => {
+                    let eye = self.player.eye();
+                    if heard {
+                        self.fps.heard_shot(weapon, pos, eye);
+                    }
+                    let knife = weapon >= crate::netgame::KNIFE_HEAVY;
+                    for h in hits {
+                        self.fps.blood_at(h, knife, eye);
+                    }
+                }
+                Local::Guns { guns, nades } => self.fps.set_guns(guns, nades),
                 Local::RoundEnd {
                     winner,
                     reason: why,
@@ -2023,17 +2062,16 @@ impl Session {
                 )
             })
         };
-        // Pseudos : coéquipiers toujours (couleur de l'équipe), adversaires seulement vus.
+        // Pseudos : au-dessus des coéquipiers seulement (couleur de l'équipe).
         for v in n.views().iter().filter(|v| v.alive) {
             let head = v.pos + Vec3::Y * 2.1;
             let to = head - Vec3::Y * 0.4 - eye;
             let dist = to.length();
-            let mate = v.team == my_team;
-            let blocked = raycast(&self.world, eye.into(), (to / dist.max(1e-3)).into(), dist)
-                .is_some_and(|h| h.distance < dist - 0.3);
-            if (!mate && blocked) || dist > 60.0 {
+            // Pas de pseudo au-dessus des adversaires.
+            if v.team != my_team || dist > 60.0 {
                 continue;
             }
+            let mate = true;
             let Some((x, y)) = to_screen(head) else {
                 continue;
             };
@@ -2208,6 +2246,69 @@ impl Session {
                 [1.0, 1.0, 1.0, 1.0],
                 t,
             );
+        }
+        // Fil des éliminations, en haut à droite, comme dans CS : tueur, arme, marques
+        // (aveuglé, tir en tête, à travers un mur, à travers une fumée), mort.
+        let mut fy = 30.0 * s;
+        for (k, age) in &self.feed {
+            let alpha = (6.0 - age).clamp(0.0, 1.0);
+            let fade = |c: [f32; 4]| [c[0], c[1], c[2], c[3] * alpha];
+            let weapon = crate::netgame::weapon_name(k.weapon);
+            use minelib_net::game::{KILL_BLIND, KILL_SMOKE, KILL_WALL};
+            let icon = 9.0 * s;
+            let mut marks: Vec<&[&str; 7]> = Vec::new();
+            if k.flags & KILL_WALL != 0 {
+                marks.push(&ICON_WALL);
+            }
+            if k.flags & KILL_SMOKE != 0 {
+                marks.push(&ICON_SMOKE);
+            }
+            if k.head {
+                marks.push(&ICON_HEAD);
+            }
+            let blind = k.flags & KILL_BLIND != 0;
+            let gap = 4.0 * s;
+            let (kw, ww, vw) = (
+                Ui::text_width(&k.killer, s),
+                Ui::text_width(weapon, s),
+                Ui::text_width(&k.victim, s),
+            );
+            let total = kw
+                + if k.killer.is_empty() { 0.0 } else { gap }
+                + if blind { icon + gap } else { 0.0 }
+                + ww
+                + gap
+                + marks.len() as f32 * (icon + gap)
+                + vw;
+            let mut x = size.0 - 6.0 * s - total;
+            ui.rect(
+                x - 3.0 * s,
+                fy - 2.0 * s,
+                total + 6.0 * s,
+                12.0 * s,
+                fade([0.0, 0.0, 0.0, 0.5]),
+            );
+            if !k.killer.is_empty() {
+                ui.text(x, fy, s, fade(team_color(k.teams[0])), k.killer.clone());
+                x += kw + gap;
+            }
+            if blind {
+                draw_icon(ui, x, fy, s, &ICON_BLIND, fade([1.0, 1.0, 1.0, 1.0]));
+                x += icon + gap;
+            }
+            ui.text(x, fy, s, fade([0.9, 0.9, 0.9, 1.0]), weapon);
+            x += ww + gap;
+            for m in marks {
+                let col = if std::ptr::eq(m, &ICON_HEAD) {
+                    [1.0, 0.35, 0.3, 1.0]
+                } else {
+                    [1.0, 1.0, 1.0, 1.0]
+                };
+                draw_icon(ui, x, fy, s, m, fade(col));
+                x += icon + gap;
+            }
+            ui.text(x, fy, s, fade(team_color(k.teams[1])), k.victim.clone());
+            fy += 14.0 * s;
         }
         // Bandeau de fin de manche.
         if let Some((text, col, _)) = &self.banner {
@@ -3746,6 +3847,31 @@ fn scoreboard_lines(
         y += 4.0 * s;
     }
     out
+}
+
+/// Petites images du fil des éliminations (7 × 7 points, dessinées pour Minelib).
+const ICON_HEAD: [&str; 7] = [
+    "..###..", ".#####.", ".#.#.#.", ".#####.", "..###..", "..#.#..", ".......",
+];
+const ICON_WALL: [&str; 7] = [
+    "#######", "#..#..#", "#######", ".#..#..", "#######", "#..#..#", "#######",
+];
+const ICON_SMOKE: [&str; 7] = [
+    "..##...", ".####.#", "######.", "#######", ".#####.", ".......", ".......",
+];
+const ICON_BLIND: [&str; 7] = [
+    "......#", ".###.#.", "#..##.#", "#.#.#.#", "#.##..#", ".#.###.", "#......",
+];
+
+fn draw_icon(ui: &mut Ui, x: f32, y: f32, s: f32, icon: &[&str; 7], color: [f32; 4]) {
+    let px = 9.0 * s / 7.0;
+    for (j, row) in icon.iter().enumerate() {
+        for (i, c) in row.bytes().enumerate() {
+            if c == b'#' {
+                ui.rect(x + i as f32 * px, y + j as f32 * px, px, px, color);
+            }
+        }
+    }
 }
 
 /// Couleur d'une équipe (CT bleu, T orangé).

@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 
 use glam::Vec3;
 use minelib_net::game::{
-    bomb, phase, reason, MatchHud, MatchSummary, ScoreRow, SummaryPlayer, Zone, CT, ITEM_HELMET,
-    ITEM_KEVLAR, ITEM_KIT, ITEM_NADE, T,
+    bomb, phase, reason, GroundGun, MatchHud, MatchSummary, ScoreRow, SummaryPlayer, Zone, CT,
+    ITEM_HELMET, ITEM_KEVLAR, ITEM_KIT, ITEM_NADE, T,
 };
 
 use crate::weapons::WEAPONS;
@@ -119,6 +119,14 @@ pub struct MPlayer {
     /// Touches maintenues : poser, désamorcer.
     pub plant_key: bool,
     pub defuse_key: bool,
+    /// Armes portées (principale, secondaire ; 255 : aucune) et grenades par type. C'est
+    /// l'hôte qui fait foi : on ne tire qu'avec une arme qu'on porte.
+    pub guns: (u8, u8),
+    pub nades: [u8; 5],
+    /// Cadence de tir : tirs encore permis (se recharge à la cadence de l'arme) et pas
+    /// de la dernière recharge.
+    shots_left: f32,
+    shots_tick: u32,
     /// Il faudra repartir avec le pistolet de départ (mort pendant la manche).
     pub reset: bool,
 }
@@ -193,6 +201,23 @@ pub struct Match {
     countdown: bool,
     /// Carte sans zones de départ : centre des départs CT et T (achats autour).
     pub fallback_spawns: Option<[Vec3; 2]>,
+    /// Armes au sol.
+    pub ground: Vec<GroundGun>,
+    next_gun: u32,
+    /// Pas de règles écoulés (cadences de tir).
+    ticks: u32,
+}
+
+/// Tirs d'avance permis (les messages arrivent parfois groupés).
+const BURST: f32 = 3.0;
+
+/// Pistolet de départ d'une équipe (Glock-18 pour les T, USP-S pour les CT).
+pub fn starter(team: u8) -> u8 {
+    let name = if team == T { "Glock-18" } else { "USP-S" };
+    WEAPONS
+        .iter()
+        .position(|w| w.name == name)
+        .map_or(255, |i| i as u8)
 }
 
 fn other(team: u8) -> u8 {
@@ -252,6 +277,137 @@ impl Match {
             planted_this_round: false,
             countdown: false,
             fallback_spawns: None,
+            ground: Vec::new(),
+            next_gun: 1,
+            ticks: 0,
+        }
+    }
+
+    /// Réapparition : `reset` (mort, changement de côté) remet le pistolet de départ.
+    fn spawn(&mut self, id: u64, reset: bool) -> Ev {
+        if reset {
+            if let Some(p) = self.players.get_mut(&id) {
+                p.guns = (255, starter(p.team));
+                p.nades = [0; 5];
+            }
+        }
+        Ev::Spawn { id, reset }
+    }
+
+    pub fn has_gun(&self, id: u64, weapon: u8) -> bool {
+        weapon != 255
+            && self
+                .players
+                .get(&id)
+                .is_some_and(|p| p.guns.0 == weapon || p.guns.1 == weapon)
+    }
+
+    /// Un tir de `id` avec `weapon` (255 / 254 : couteau) de `rays` rayons : permis s'il
+    /// porte l'arme, qu'elle tire autant de plombs, et à sa cadence (avec un peu d'avance,
+    /// les messages arrivant parfois groupés). Le tir est alors compté.
+    pub fn shoot(&mut self, id: u64, weapon: u8, rays: usize) -> bool {
+        let knife = weapon >= 254;
+        let (rpm, pellets) = if knife {
+            (150.0, 1)
+        } else {
+            match WEAPONS.get(weapon as usize) {
+                Some(w) if self.has_gun(id, weapon) => (w.rpm, w.pellets.max(1) as usize),
+                _ => return false,
+            }
+        };
+        if rays == 0 || rays > pellets {
+            return false;
+        }
+        let now = self.ticks;
+        let Some(p) = self.players.get_mut(&id) else {
+            return false;
+        };
+        let gained = now.wrapping_sub(p.shots_tick) as f32 * rpm / (60.0 * 256.0);
+        p.shots_left = (p.shots_left + gained).min(BURST);
+        p.shots_tick = now;
+        if p.shots_left < 1.0 {
+            return false;
+        }
+        p.shots_left -= 1.0;
+        true
+    }
+
+    /// Lancer d'une grenade : il faut en porter une de ce type (elle est retirée).
+    pub fn throw(&mut self, id: u64, nade: u8) -> bool {
+        match self
+            .players
+            .get_mut(&id)
+            .and_then(|p| p.nades.get_mut(nade as usize))
+        {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Pose au sol une arme que le joueur porte (lâchée, ou celle d'un mort).
+    pub fn drop_gun(&mut self, id: u64, weapon: u8, at: Vec3) -> bool {
+        if WEAPONS.get(weapon as usize).is_none() || !self.has_gun(id, weapon) {
+            return false;
+        }
+        let p = self.players.get_mut(&id).expect("joueur");
+        if p.guns.0 == weapon {
+            p.guns.0 = 255;
+        } else {
+            p.guns.1 = 255;
+        }
+        if self.ground.len() >= 48 {
+            self.ground.remove(0);
+        }
+        self.ground.push(GroundGun {
+            id: self.next_gun,
+            weapon,
+            pos: (at + Vec3::Y * 0.05).to_array(),
+        });
+        self.next_gun += 1;
+        true
+    }
+
+    /// Ramasse l'arme au sol `gun` : vivant, à portée ; celle du même emplacement est
+    /// lâchée à la place (échange, comme dans CS). Renvoie l'arme prise.
+    pub fn pickup(&mut self, id: u64, gun: u32, feet: Vec3) -> Option<u8> {
+        if !self.players.get(&id).is_some_and(|p| p.alive) {
+            return None;
+        }
+        let k = self
+            .ground
+            .iter()
+            .position(|g| g.id == gun && (Vec3::from(g.pos) - feet).length() < 2.0)?;
+        let g = self.ground.remove(k);
+        let primary = WEAPONS[g.weapon as usize].primary();
+        let lo = self.players[&id].guns;
+        let old = if primary { lo.0 } else { lo.1 };
+        if old != 255 {
+            self.drop_gun(id, old, feet);
+        }
+        let p = self.players.get_mut(&id).expect("joueur");
+        if primary {
+            p.guns.0 = g.weapon;
+        } else {
+            p.guns.1 = g.weapon;
+        }
+        Some(g.weapon)
+    }
+
+    /// Un joueur vient de mourir à `at` : sa meilleure arme tombe, il perd le reste.
+    pub fn dropped_dead(&mut self, id: u64, at: Option<Vec3>) {
+        let Some(lo) = self.players.get(&id).map(|p| p.guns) else {
+            return;
+        };
+        let best = if lo.0 != 255 { lo.0 } else { lo.1 };
+        if let (Some(at), true) = (at, best != 255) {
+            self.drop_gun(id, best, at);
+        }
+        if let Some(p) = self.players.get_mut(&id) {
+            p.guns = (255, 255);
+            p.nades = [0; 5];
         }
     }
 
@@ -334,13 +490,17 @@ impl Match {
                 dead_for: 0.0,
                 plant_key: false,
                 defuse_key: false,
+                guns: (255, starter(team)),
+                nades: [0; 5],
+                shots_left: BURST,
+                shots_tick: 0,
                 reset: true,
             },
         );
         let side = if team == CT { "CT" } else { "T" };
         let mut ev = vec![Ev::Say(format!("{pseudo} rejoint les {side}."))];
         if !self.started() {
-            ev.push(Ev::Spawn { id, reset: true });
+            ev.push(self.spawn(id, true));
         }
         ev
     }
@@ -373,7 +533,7 @@ impl Match {
         }
         p.team = team;
         p.start_team = team;
-        Some(Ev::Spawn { id, reset: true })
+        Some(self.spawn(id, true))
     }
 
     /// Côté actuel d'une équipe de départ.
@@ -447,7 +607,10 @@ impl Match {
                 }
             }
             n if (ITEM_NADE..ITEM_NADE + 5).contains(&n) => {
-                Some(crate::equip::Nade::ALL[(n - ITEM_NADE) as usize].price())
+                let kind = crate::equip::Nade::ALL[(n - ITEM_NADE) as usize];
+                let total: u8 = p.nades.iter().sum();
+                (p.nades[kind.index()] < kind.max() && total < crate::equip::MAX_NADES)
+                    .then(|| kind.price())
             }
             w => {
                 let def = WEAPONS.get(w as usize)?;
@@ -482,7 +645,14 @@ impl Match {
                 p.armor = 100;
                 p.helmet = true;
             }
-            _ => {}
+            n if (ITEM_NADE..ITEM_NADE + 5).contains(&n) => p.nades[(n - ITEM_NADE) as usize] += 1,
+            w => {
+                if WEAPONS[w as usize].primary() {
+                    p.guns.0 = w as u8;
+                } else {
+                    p.guns.1 = w as u8;
+                }
+            }
         }
         Ok(())
     }
@@ -650,6 +820,7 @@ impl Match {
     /// Un pas des règles (`places` : où est chaque joueur).
     pub fn tick(&mut self, dt: f32, places: &BTreeMap<u64, Place>) -> Vec<Ev> {
         let mut ev = Vec::new();
+        self.ticks = self.ticks.wrapping_add(1);
         self.time -= dt;
         match self.phase {
             phase::WARMUP => self.tick_warmup(dt, &mut ev),
@@ -693,7 +864,7 @@ impl Match {
                 p.hp = 100;
                 p.money = MAX_MONEY;
             }
-            ev.push(Ev::Spawn { id, reset: true });
+            ev.push(self.spawn(id, true));
         }
         let full = self.count(CT) >= TEAM_MAX && self.count(T) >= TEAM_MAX;
         if !full {
@@ -779,7 +950,7 @@ impl Match {
             p.dealt.clear();
             p.dead_for = 0.0;
             p.reset = false;
-            ev.push(Ev::Spawn { id: *id, reset });
+            ev.push(self.spawn(*id, reset));
         }
         // La bombe à un T au hasard.
         let ts: Vec<u64> = ids
@@ -792,6 +963,7 @@ impl Match {
             self.carrier = Some(ts[i]);
             self.bomb = bomb::CARRIED;
         }
+        self.ground.clear();
         ev.push(Ev::NewRound);
         ev.push(Ev::Say(format!("Manche {}.", self.played + 1)));
     }

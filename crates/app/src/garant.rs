@@ -215,6 +215,7 @@ impl Garant {
                 blasts: std::mem::take(&mut self.fps.blasts),
                 fires: self.fps.fire_cells(),
             };
+            net.set_sight(false, self.fps.smoke_spheres());
             locals = net.end_frame(world, Vec::new(), 255, nades, dt);
             if locals
                 .iter()

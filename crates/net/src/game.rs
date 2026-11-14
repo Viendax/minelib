@@ -34,6 +34,42 @@ pub struct SimState {
     pub sneak_held: bool,
 }
 
+/// Position d'un joueur à un pas (message court) : regard en 65536e de tour, accroupi
+/// et vitesse sur un octet.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct Pose {
+    pub id: u64,
+    pub pos: [f32; 3],
+    pub yaw: i16,
+    pub pitch: i16,
+    pub crouch: u8,
+    pub speed: u8,
+}
+
+impl Pose {
+    pub fn of(p: &NetPlayer) -> Self {
+        let turn = |a: f32| (a / std::f32::consts::TAU * 65536.0).round() as i64 as i16;
+        Pose {
+            id: p.id,
+            pos: p.pos,
+            yaw: turn(p.yaw),
+            pitch: turn(p.pitch),
+            crouch: (p.crouch.clamp(0.0, 1.0) * 255.0) as u8,
+            speed: (p.speed * 10.0).clamp(0.0, 255.0) as u8,
+        }
+    }
+
+    /// Met `p` à cette position.
+    pub fn apply(&self, p: &mut NetPlayer) {
+        let angle = |a: i16| a as f32 / 65536.0 * std::f32::consts::TAU;
+        p.pos = self.pos;
+        p.yaw = angle(self.yaw);
+        p.pitch = angle(self.pitch);
+        p.crouch = self.crouch as f32 / 255.0;
+        p.speed = self.speed as f32 / 10.0;
+    }
+}
+
 /// Un joueur vu par les autres.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct NetPlayer {
@@ -266,6 +302,8 @@ pub enum ToHost {
         origin: [f32; 3],
         dirs: Vec<[f32; 3]>,
         view_tick: u32,
+        /// Le tireur est aveuglé par une flash (affiché au fil des éliminations).
+        blind: bool,
     },
     Chat(String),
     /// Achat (code `ITEM_…` ou indice d'arme).
@@ -298,6 +336,11 @@ pub enum ToHost {
     },
 }
 
+/// Fil des éliminations : à travers un mur, à travers une fumée, tireur aveuglé.
+pub const KILL_WALL: u8 = 1;
+pub const KILL_SMOKE: u8 = 2;
+pub const KILL_BLIND: u8 = 4;
+
 /// Arme posée au sol.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct GroundGun {
@@ -325,9 +368,24 @@ pub enum ToPeer {
         players: Vec<NetPlayer>,
         hud: MatchHud,
     },
+    /// Entre deux `Snapshot` (envoyés 64 fois par seconde) : seulement ce qui bouge, à
+    /// chaque pas (256 fois par seconde).
+    Moves {
+        tick: u32,
+        ack: u32,
+        you: SimState,
+        players: Vec<Pose>,
+    },
     /// Achat accepté : l'objet à donner.
     Give {
         item: u16,
+    },
+    /// Ce que le joueur porte vraiment selon l'hôte (armes, grenades par type) : son jeu
+    /// s'y remet s'il s'en est écarté.
+    Guns {
+        primary: u8,
+        secondary: u8,
+        nades: [u8; 5],
     },
     /// Tableau des scores (toutes les demi-secondes).
     Scoreboard {
@@ -371,6 +429,18 @@ pub enum ToPeer {
         victim: String,
         weapon: u8,
         head: bool,
+        /// `KILL_WALL`, `KILL_SMOKE`, `KILL_BLIND`.
+        flags: u8,
+        /// Équipes du tueur (255 : personne) et du mort.
+        teams: [u8; 2],
+    },
+    /// Un joueur tire depuis `pos` (les autres l'entendent) ; `hits` : points où il
+    /// touche un joueur (sang).
+    Shot {
+        who: u64,
+        weapon: u8,
+        pos: [f32; 3],
+        hits: Vec<[f32; 3]>,
     },
     /// Réapparition (après une mort) à cette position.
     Respawn {

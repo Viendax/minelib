@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 70;
+pub const VERSION: u32 = 71;
 const API: &str = "https://api.github.com/repos/Viendax/minelib/releases/latest";
 const EVERY: Duration = Duration::from_secs(600);
 
@@ -123,6 +123,18 @@ pub struct Updater {
     /// Message à afficher (téléchargement, erreur).
     pub status: Option<String>,
     downloading: bool,
+    /// Résultat de la dernière vérification.
+    pub check: Check,
+}
+
+/// Ce que l'on sait de la version : pas encore vérifiée, à jour, ou impossible à vérifier.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Check {
+    Pending,
+    UpToDate,
+    Unreachable,
+    /// Mises à jour coupées (`MINELIB_NO_UPDATE`, ou pas sous Windows).
+    Off,
 }
 
 impl Updater {
@@ -138,6 +150,7 @@ impl Updater {
             available: None,
             status: None,
             downloading: false,
+            check: if enabled { Check::Pending } else { Check::Off },
         }
     }
 
@@ -182,6 +195,13 @@ impl Updater {
                 }
             }
             Msg::Failed(e) => {
+                if !self.downloading && self.available.is_none() {
+                    self.check = if e.is_empty() {
+                        Check::UpToDate
+                    } else {
+                        Check::Unreachable
+                    };
+                }
                 self.downloading = false;
                 if !e.is_empty() {
                     log::info!("mise à jour : {e}");
@@ -211,6 +231,24 @@ impl Updater {
 
     pub fn busy(&self) -> bool {
         self.downloading
+    }
+
+    /// Ligne « version » à afficher (accueil, pause) et sa couleur.
+    pub fn line(&self) -> (String, [f32; 4]) {
+        let (state, color) = match (&self.available, self.check) {
+            (Some(r), _) => (
+                format!("version {} disponible", r.version),
+                [1.0, 0.8, 0.2, 1.0],
+            ),
+            (None, Check::UpToDate) => ("à jour".to_string(), [0.5, 1.0, 0.5, 1.0]),
+            (None, Check::Pending) => ("vérification…".to_string(), [0.7, 0.7, 0.7, 1.0]),
+            (None, Check::Unreachable) => (
+                "version non vérifiée (GitHub injoignable)".to_string(),
+                [1.0, 0.55, 0.4, 1.0],
+            ),
+            (None, Check::Off) => ("mises à jour désactivées".to_string(), [0.7, 0.7, 0.7, 1.0]),
+        };
+        (format!("Minelib v{VERSION} - {state}"), color)
     }
 }
 

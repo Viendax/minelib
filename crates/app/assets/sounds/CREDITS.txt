@@ -39,3 +39,7 @@ Arme sortie (draw_<arme>.ogg, un son par arme) : mélange d'un frottement de cui
   SFX Library », CC0) et du mécanisme de l'arme (glissière, levier d'armement, culasse,
   pompe) tiré de « gun reload sounds » et « handgun reload sound effect » (CC0), avec une
   hauteur et un frottement différents pour chaque arme.
+  knife_flesh.ogg (couteau qui touche un joueur) — créé pour Minelib (bruit filtré et
+    note grave par ffmpeg), sous la licence du projet.
+  shell.ogg (cartouche glissée dans un fusil à pompe) — reload_end.ogg (« equipment
+    clicks III », CC0) baissé d'une tierce.

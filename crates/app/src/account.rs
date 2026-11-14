@@ -49,10 +49,22 @@ fn auto_relay(
     if let Some(node) = node() {
         match minelib_p2p::find_relays() {
             Ok(list) => {
-                if let Some(ad) = list
+                // Le relais où l'on jouait déjà passe avant « le plus ancien » : la date
+                // d'un relais n'est que ce qu'il annonce, un faux relais pourrait se dire
+                // plus vieux que tous pour attirer les joueurs.
+                let known_path = dir.with_file_name("relais_connu");
+                let known: Option<[u8; 32]> = std::fs::read_to_string(&known_path)
+                    .ok()
+                    .and_then(|t| crypto::unhex(t.trim()))
+                    .and_then(|v| v.try_into().ok());
+                let usable =
+                    |a: &&minelib_p2p::Ad| !failed.contains(&a.node) && a.node != node.id();
+                let pick = list
                     .iter()
-                    .find(|a| !failed.contains(&a.node) && a.node != node.id())
-                {
+                    .filter(usable)
+                    .find(|a| Some(a.noise) == known)
+                    .or_else(|| list.iter().find(usable));
+                if let Some(ad) = pick {
                     failed.push(ad.node);
                     let addr = node.tunnel(ad.node)?;
                     log::info!(
@@ -60,6 +72,9 @@ fn auto_relay(
                         ad.name,
                         crypto::hex(&ad.node[..8])
                     );
+                    if known.is_none() {
+                        let _ = std::fs::write(&known_path, crypto::hex(&ad.noise));
+                    }
                     return Ok((addr.to_string(), Some(ad.noise)));
                 }
             }
@@ -161,6 +176,10 @@ pub struct Accounts {
     pub maps: Vec<proto::MapEntry>,
     /// Relais d'un autre PC du réseau local (sa clé n'est pas retenue).
     lan_relay: bool,
+    /// Connexion en cours (pseudo, mot de passe) : gardée sur ce PC si elle réussit.
+    sent: Option<(String, String)>,
+    /// La connexion automatique du lancement a été tentée.
+    auto_tried: bool,
 }
 
 impl Accounts {
@@ -192,7 +211,61 @@ impl Accounts {
             friends: Vec::new(),
             maps: Vec::new(),
             lan_relay: false,
+            sent: None,
+            auto_tried: false,
         }
+    }
+
+    /// Compte gardé sur ce PC pour la connexion automatique (chiffré avec une clé propre
+    /// à cette session Windows : le fichier copié sur un autre PC ne s'ouvre pas).
+    fn session_path(&self) -> PathBuf {
+        self.relay_dir.with_file_name("comptes").join("session")
+    }
+
+    fn session_key(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"minelib/session/v1");
+        for var in ["COMPUTERNAME", "USERNAME", "USERDOMAIN", "HOSTNAME", "USER"] {
+            h.update(std::env::var(var).unwrap_or_default().as_bytes());
+            h.update([0]);
+        }
+        h.update(self.relay_dir.to_string_lossy().as_bytes());
+        h.finalize().into()
+    }
+
+    fn remember(&self, pseudo: &str, password: &str) {
+        let p = self.session_path();
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let plain = format!("{pseudo}\n{password}");
+        let _ = std::fs::write(p, crypto::seal(&self.session_key(), plain.as_bytes()));
+    }
+
+    fn remembered(&self) -> Option<(String, String)> {
+        let sealed = std::fs::read(self.session_path()).ok()?;
+        let plain = crypto::open(&self.session_key(), &sealed).ok()?;
+        let text = String::from_utf8(plain).ok()?;
+        let (pseudo, password) = text.split_once('\n')?;
+        Some((pseudo.to_string(), password.to_string()))
+    }
+
+    /// Au lancement : reconnecte le compte gardé sur ce PC, s'il y en a un.
+    fn auto_login(&mut self) {
+        let Some((pseudo, password)) = self.remembered() else {
+            return;
+        };
+        let backup = std::fs::read(self.backup_path(&pseudo)).ok();
+        self.sent = Some((pseudo.clone(), password.clone()));
+        self.pseudo = pseudo.clone();
+        self.send(Cmd::Login {
+            pseudo,
+            password,
+            totp: None,
+            backup,
+        });
+        self.busy = None;
     }
 
     /// Coffre du compte gardé sur ce PC (chiffré par le mot de passe).
@@ -272,6 +345,12 @@ impl Accounts {
 
     /// Lit les réponses du relais (à chaque image, quel que soit l'écran).
     pub fn poll(&mut self) {
+        if !self.auto_tried {
+            self.auto_tried = true;
+            if self.account.is_none() && self.client.is_none() {
+                self.auto_login();
+            }
+        }
         let Some(client) = &self.client else { return };
         let mut events = Vec::new();
         while let Some(e) = client.poll() {
@@ -293,6 +372,10 @@ impl Accounts {
                 } => {
                     self.busy = None;
                     self.need_totp = false;
+                    // Compte gardé sur ce PC : connexion automatique au prochain lancement.
+                    if let Some((p, w)) = self.sent.take() {
+                        self.remember(&p, &w);
+                    }
                     self.password.clear();
                     self.confirm.clear();
                     self.code.clear();
@@ -342,6 +425,7 @@ impl Accounts {
                 }
                 Event::Error(m) => {
                     self.busy = None;
+                    self.sent = None;
                     self.error = Some(m.clone());
                     self.game_events.push(Event::Error(m));
                 }
@@ -542,6 +626,18 @@ impl Accounts {
         let register = c.button("Créer un compte", cx, y, 200.0, true);
         y += step * 1.5;
         let offline = c.button("Jouer hors ligne (solo)", cx, y, 200.0, true);
+        // Compte gardé sur ce PC : la connexion se fait toute seule.
+        if self.account.is_some() {
+            return Outcome::Leave;
+        }
+        if let Some((p, _)) = &self.sent {
+            c.text_center(
+                &format!("Connexion de {p}…"),
+                c.h * 0.42 - 20.0 * s,
+                s,
+                WHITE,
+            );
+        }
         let ds = (s / 2.0).floor().max(1.0);
         c.text_center(
             "Un pseudo et un mot de passe suffisent : ni e-mail, ni numéro.",
@@ -647,6 +743,7 @@ impl Accounts {
             if page == Page::Login {
                 let totp = self.need_totp.then(|| self.code.parse().unwrap_or(0));
                 let backup = std::fs::read(self.backup_path(&pseudo)).ok();
+                self.sent = Some((pseudo.clone(), password.clone()));
                 self.send(Cmd::Login {
                     pseudo,
                     password,
@@ -654,6 +751,7 @@ impl Accounts {
                     backup,
                 });
             } else {
+                self.sent = Some((pseudo.clone(), password.clone()));
                 self.send(Cmd::Register { pseudo, password });
             }
         }
@@ -712,6 +810,8 @@ impl Accounts {
         if logout {
             self.client().send(Cmd::Logout);
             self.account = None;
+            // Déconnexion voulue : le compte n'est plus gardé sur ce PC.
+            let _ = std::fs::remove_file(self.session_path());
             return Outcome::Goto(Page::Welcome);
         }
         if back {

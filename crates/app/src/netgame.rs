@@ -24,17 +24,19 @@ use minelib_world::raycast::raycast;
 use minelib_world::World;
 
 use crate::cs::{self, Ev, Hurt, Match, Place};
-use crate::player::{MoveInput, Player, HALF_WIDTH, HEIGHT};
+use crate::player::{MoveInput, Other, Player, HALF_WIDTH, HEIGHT};
 use crate::weapons::WEAPONS;
 
 /// Un état envoyé aux invités tous les 4 pas (64 fois par seconde).
 const SNAPSHOT_EVERY: u32 = 4;
+/// Entre deux états complets, les positions partent à chaque pas (256 par seconde).
+const MOVES_EVERY: u32 = 1;
 /// Tableau des scores : toutes les demi-secondes.
 const SCOREBOARD_EVERY: u32 = 128;
 /// Positions gardées pour rembobiner les tirs : 1 s.
 const HISTORY: usize = 256;
 /// Retard d'affichage des autres joueurs chez l'invité (pas) : ~47 ms.
-const INTERP_TICKS: f32 = 12.0;
+const INTERP_TICKS: f32 = 8.0;
 /// Écart (blocs) au-delà duquel l'invité reprend la position de l'hôte.
 const CORRECT: f32 = 0.01;
 /// Au plus tant d'entrées en retard traitées par pas pour un invité (rattrapage).
@@ -125,6 +127,21 @@ pub enum Local {
     },
     /// Achat accepté.
     Give(u16),
+    /// Élimination, pour le fil en haut à droite.
+    Kill(Kill),
+    /// Un joueur a tiré depuis `pos` (`heard` : un autre que soi, à faire entendre) et
+    /// touché des joueurs en `hits` (sang).
+    Shot {
+        weapon: u8,
+        pos: Vec3,
+        heard: bool,
+        hits: Vec<Vec3>,
+    },
+    /// Ce que le joueur porte vraiment selon l'hôte (armes, grenades).
+    Guns {
+        guns: (u8, u8),
+        nades: [u8; 5],
+    },
     RoundEnd {
         winner: u8,
         reason: u8,
@@ -160,6 +177,9 @@ struct Remote {
     weapon: u8,
     ready: bool,
     fall_from: Option<f32>,
+    /// Entrées qu'il peut encore jouer : une de plus à chaque pas (personne n'avance
+    /// plus vite que le temps), avec un peu d'avance pour rattraper un à-coup du réseau.
+    budget: u32,
 }
 
 /// Copie de la partie confiée au garant de secours : de quoi la reprendre si l'hôte
@@ -170,9 +190,6 @@ struct Backup {
     host_pseudo: String,
     /// Joueurs (0 = l'hôte) : pseudo, état de déplacement, arme en main.
     players: Vec<(u64, String, SimState, u8)>,
-    ground: Vec<GroundGun>,
-    next_gun: u32,
-    loadouts: Vec<(u64, (u8, u8))>,
     tick: u32,
     spawn: [f32; 3],
     /// Coups joués depuis la copie précédente (pas, joueur, coup) : de quoi les rejouer.
@@ -231,6 +248,8 @@ pub fn witnessed(m: &ToHost) -> bool {
             | ToHost::Buy(_)
             | ToHost::Action { .. }
             | ToHost::Team(_)
+            | ToHost::Drop { .. }
+            | ToHost::Pickup { .. }
     )
 }
 
@@ -267,12 +286,52 @@ fn player_from(s: &SimState) -> Player {
     p
 }
 
-/// Un tir est-il recevable ? Tireur vivant, tir depuis ses yeux, pas pendant le départ.
-fn fire_ok(m: &Match, shooter: u64, eye: Option<Vec3>, origin: Vec3, rays: usize) -> bool {
+/// Un tir est-il recevable ? Tireur vivant, pas pendant le départ, tir depuis ses yeux
+/// (au retard du réseau près, et sans mur entre ses yeux et le départ du tir) ; puis les
+/// règles : il porte l'arme, elle tire autant de plombs, à sa cadence (`Match::shoot`,
+/// qui compte le tir).
+fn fire_ok(
+    m: &mut Match,
+    world: &World,
+    shooter: u64,
+    eye: Option<Vec3>,
+    weapon: u8,
+    origin: Vec3,
+    rays: usize,
+) -> bool {
+    let Some(eye) = eye else { return false };
+    let gap = origin - eye;
+    let d = gap.length();
+    let clear =
+        d < 0.05 || raycast(world, eye.into(), (gap / d).into(), d).is_none_or(|h| h.distance >= d);
     m.players.get(&shooter).is_some_and(|p| p.alive)
-        && eye.is_some_and(|e| (e - origin).length() < 2.5)
-        && rays <= 16
         && !m.frozen()
+        && d < 2.5
+        && clear
+        && m.shoot(shooter, weapon, rays)
+}
+
+/// Entrées d'avance qu'un joueur peut rattraper d'un coup (après un à-coup du réseau).
+const INPUT_BURST: u32 = 64;
+
+/// Rembobinage maximal d'un tir (pas) : 400 ms. Au-delà, on tirerait sur le passé.
+const MAX_REWIND: u32 = 102;
+
+/// Les autres joueurs, obstacles pour `me`.
+fn others_except(feet: &BTreeMap<u64, Vec3>, me: u64) -> Vec<Other> {
+    let list: Vec<Vec3> = feet
+        .iter()
+        .filter(|(id, _)| **id != me)
+        .map(|(_, f)| *f)
+        .collect();
+    crate::player::others_from(&list)
+}
+
+/// Pieds d'un joueur pour les règles (le vérificateur : seulement ceux qui sont en jeu).
+fn feet_in(players: &BTreeMap<u64, Player>, ready: &BTreeSet<u64>, id: u64) -> Option<Vec3> {
+    (id == 0 || ready.contains(&id))
+        .then(|| players.get(&id).map(|p| p.pos))
+        .flatten()
 }
 
 /// Positions gardées au pas le plus proche de `view_tick`.
@@ -284,7 +343,17 @@ fn pick_frame(history: &VecDeque<(u32, Frame)>, view_tick: u32) -> Frame {
         .unwrap_or_default()
 }
 
-/// Dégâts d'un tir (rayons `dirs` depuis `origin`) aux joueurs vivants de `frame`.
+/// Une touche d'un tir : dégâts, nature, à travers un mur ?, où.
+#[derive(Clone, Copy, Debug)]
+struct Touch {
+    damage: u32,
+    hurt: Hurt,
+    wall: bool,
+    point: Vec3,
+}
+
+/// Dégâts d'un tir (rayons `dirs` depuis `origin`) aux joueurs vivants de `frame`. Une
+/// balle traverse un mur d'un bloc (dégâts réduits derrière), pas le couteau.
 fn shot(
     m: &Match,
     frame: &Frame,
@@ -293,28 +362,53 @@ fn shot(
     origin: Vec3,
     dirs: &[Vec3],
     world: &World,
-) -> BTreeMap<u64, Vec<(u32, Hurt)>> {
+) -> BTreeMap<u64, Vec<Touch>> {
     let knife = weapon == KNIFE_LIGHT || weapon == KNIFE_HEAVY;
     let range = if knife { KNIFE_RANGE } else { RANGE };
-    let mut damage: BTreeMap<u64, Vec<(u32, Hurt)>> = BTreeMap::new();
+    let mut damage: BTreeMap<u64, Vec<Touch>> = BTreeMap::new();
     for &dir in dirs {
-        let wall = raycast(world, origin.into(), dir.into(), range).map_or(range, |h| h.distance);
-        let mut best: Option<(f32, u64, u32, Hurt)> = None;
+        let path = if knife {
+            crate::weapons::BulletPath {
+                first: raycast(world, origin.into(), dir.into(), range)
+                    .map_or(range, |h| h.distance),
+                ..Default::default()
+            }
+        } else {
+            crate::weapons::bullet_path(world, origin, dir, range)
+        };
+        let mut best: Option<(f32, u64, Touch)> = None;
         for &(id, feet, crouch) in frame {
             if id == shooter || !m.players.get(&id).is_some_and(|p| p.alive) {
                 continue;
             }
             let (min, max, head_y) = hitbox(feet, crouch);
             if let Some(t) = ray_box(origin, dir, min, max) {
-                if t < wall && best.is_none_or(|b| t < b.0) {
-                    let y = (origin + dir * t).y;
-                    let (d, hurt) = damage_at(weapon, y, feet.y, head_y);
-                    best = Some((t, id, d, hurt));
+                let wall = path
+                    .through
+                    .is_some_and(|(exit, last)| t > exit && t < last);
+                if (t < path.first || wall) && best.is_none_or(|b| t < b.0) {
+                    let point = origin + dir * t;
+                    let (d, hurt) = damage_at(weapon, t, point.y, feet.y, head_y);
+                    let damage = if wall {
+                        (d as f32 * crate::weapons::THROUGH_WALL) as u32
+                    } else {
+                        d
+                    };
+                    best = Some((
+                        t,
+                        id,
+                        Touch {
+                            damage,
+                            hurt,
+                            wall,
+                            point,
+                        },
+                    ));
                 }
             }
         }
-        if let Some((_, id, d, hurt)) = best {
-            damage.entry(id).or_default().push((d, hurt));
+        if let Some((_, id, touch)) = best {
+            damage.entry(id).or_default().push(touch);
         }
     }
     damage
@@ -426,10 +520,12 @@ pub struct Auditor {
     copies: u32,
     /// Fins de partie trouvées en rejouant (résultat à envoyer au relais).
     pub results: Vec<MatchSummary>,
+    /// Point de réapparition de l'hôte qu'il n'a pas encore pris.
+    cand0: Option<Player>,
 }
 
 /// Une demande vue par le relais doit apparaître au journal dans les copies qui suivent.
-const WITNESS_LATE: u32 = 4;
+const WITNESS_LATE: u32 = 10;
 const TICKS_PER_S: u32 = 256;
 
 impl Auditor {
@@ -487,19 +583,56 @@ impl Auditor {
         let mut burns: BTreeMap<u64, f32> = prev.burns.iter().copied().collect();
         // L'hôte : son déplacement rejoué, et le point de réapparition pas encore pris.
         let mut sim0: Option<Player> = players.get(&0).cloned();
-        let mut cand0: Option<Player> = None;
+        // (Gardé d'une copie à l'autre : la réapparition peut tomber à la jointure.)
+        let mut cand0: Option<Player> = self.cand0.take();
         let mut verifiable = true;
         let mut skip: BTreeSet<u64> = BTreeSet::new();
         let mut last_seq: BTreeMap<u64, u32> = BTreeMap::new();
         let mut events: Vec<Ev> = Vec::new();
         let alive = |m: &Match, id: u64| m.players.get(&id).is_some_and(|p| p.alive);
+        // Pas de l'hôte (dernières positions gardées) et entrées jouées par chacun.
+        let mut now = prev.tick;
+        let mut ticks = 0u32;
+        let mut inputs: BTreeMap<u64, u32> = BTreeMap::new();
+        // Obstacles que sont les autres joueurs (vivants, en jeu) pour `me`, comme chez l'hôte.
+        let solid = |m: &Match,
+                     players: &BTreeMap<u64, Player>,
+                     ready: &BTreeSet<u64>,
+                     me: u64|
+         -> Vec<Other> {
+            let list: Vec<Vec3> = players
+                .iter()
+                .filter(|(id, _)| {
+                    **id != me
+                        && (**id == 0 || ready.contains(id))
+                        && m.players.get(id).is_some_and(|p| p.alive)
+                })
+                .map(|(_, p)| p.pos)
+                .collect();
+            crate::player::others_from(&list)
+        };
+        // Suites des événements des règles, comme chez l'hôte : un mort lâche son arme.
+        macro_rules! settle {
+            ($ev:expr) => {{
+                let ev: Vec<Ev> = $ev;
+                for e in &ev {
+                    if let Ev::Killed { victim, .. } = e {
+                        let at = feet_in(&players, &ready, *victim);
+                        m.dropped_dead(*victim, at);
+                    }
+                }
+                events.extend(ev);
+            }};
+        }
         for (t, who, mv) in &new.log {
             let (t, who) = (*t, *who);
             match mv {
                 Move::Input(seq, input) => {
+                    let others = solid(&m, &players, &ready, who);
                     let Some(p) = players.get_mut(&who) else {
                         continue;
                     };
+                    p.others = others;
                     let moving =
                         input.forward != 0 || input.strafe != 0 || input.jump || input.jump_pressed;
                     if !alive(&m, who) || ((m.frozen() || m.busy(who)) && moving) {
@@ -507,14 +640,18 @@ impl Auditor {
                     }
                     step(p, world, input, dt);
                     last_seq.insert(who, *seq);
+                    *inputs.entry(who).or_insert(0) += 1;
                 }
                 Move::Own(input, state) => {
+                    let others = solid(&m, &players, &ready, 0);
                     let mut s = sim0.take().unwrap_or_else(|| player_from(state));
+                    s.others = others.clone();
                     step(&mut s, world, input, dt);
                     // Réapparition : l'hôte la prend à la fin de son image (quelques pas
                     // plus tard), en repartant du point d'apparition.
                     if let Some(c) = &cand0 {
                         let mut c = c.clone();
+                        c.others = others;
                         step(&mut c, world, input, dt);
                         if (c.pos - Vec3::from(state.pos)).length() < 0.05 {
                             s = c;
@@ -560,7 +697,7 @@ impl Auditor {
                             ready.insert(who);
                             players.entry(who).or_insert_with(|| Player::new(spawn));
                             if !m.players.get(&who).is_some_and(|p| p.present) {
-                                events.extend(m.join(who, pseudo));
+                                settle!(m.join(who, pseudo));
                             }
                         } else {
                             ready.remove(&who);
@@ -584,14 +721,15 @@ impl Auditor {
                             }
                         }
                         for (id, d) in hurt {
-                            events.extend(m.hurt(None, id, d, Hurt::World));
+                            settle!(m.hurt(None, id, d, Hurt::World));
                         }
                         let places: BTreeMap<u64, Place> = players
                             .iter()
                             .filter(|(id, _)| **id == 0 || ready.contains(id))
                             .map(|(&id, p)| (id, place(p)))
                             .collect();
-                        events.extend(m.tick(dt, &places));
+                        ticks += 1;
+                        settle!(m.tick(dt, &places));
                     }
                     Rule::Frame(tick) => {
                         let frame: Frame = players
@@ -599,6 +737,7 @@ impl Auditor {
                             .filter(|(id, _)| **id == 0 || ready.contains(id))
                             .map(|(&id, p)| (id, p.pos, p.crouch))
                             .collect();
+                        now = *tick;
                         self.history.push_back((*tick, frame));
                         if self.history.len() > HISTORY {
                             self.history.pop_front();
@@ -628,27 +767,33 @@ impl Auditor {
                                 origin,
                                 dirs,
                                 view_tick,
+                                ..
                             } => {
                                 let origin = Vec3::from(*origin);
                                 let dirs: Vec<Vec3> = dirs
                                     .iter()
                                     .map(|d| Vec3::from(*d).normalize_or_zero())
                                     .collect();
-                                if fire_ok(&m, who, me.map(|p| p.eye()), origin, dirs.len()) {
-                                    let covered = self
-                                        .history
-                                        .front()
-                                        .is_some_and(|f| f.0 <= *view_tick)
+                                let eye = me.map(|p| p.eye());
+                                if fire_ok(&mut m, world, who, eye, *weapon, origin, dirs.len()) {
+                                    let view =
+                                        (*view_tick).clamp(now.saturating_sub(MAX_REWIND), now);
+                                    let covered = self.history.front().is_some_and(|f| f.0 <= view)
                                         || self.history.len() >= HISTORY;
-                                    let frame = pick_frame(&self.history, *view_tick);
+                                    let frame = pick_frame(&self.history, view);
                                     if !covered || !rays_loaded(world, &frame, origin, &dirs) {
                                         verifiable = false;
                                     } else {
                                         let hits =
                                             shot(&m, &frame, who, *weapon, origin, &dirs, world);
                                         for (victim, hits) in hits {
-                                            for (d, h) in hits {
-                                                events.extend(m.hurt(Some(who), victim, d, h));
+                                            for h in hits {
+                                                settle!(m.hurt(
+                                                    Some(who),
+                                                    victim,
+                                                    h.damage,
+                                                    h.hurt
+                                                ));
                                             }
                                         }
                                     }
@@ -657,13 +802,18 @@ impl Auditor {
                             ToHost::Throw { nade, pos, vel } => {
                                 let pos = Vec3::from(*pos);
                                 let vel = Vec3::from(*vel);
-                                let ok = who == 0
-                                    || (alive(&m, who)
+                                // Il faut porter la grenade (elle est retirée).
+                                let ok = if who == 0 {
+                                    m.throw(0, *nade)
+                                } else {
+                                    alive(&m, who)
                                         && players
                                             .get(&who)
                                             .is_some_and(|p| (p.eye() - pos).length() < 3.0)
                                         && *nade < 5
-                                        && vel.length() < 40.0);
+                                        && vel.length() < 40.0
+                                        && m.throw(who, *nade)
+                                };
                                 if ok {
                                     self.throws.push((t, who, *nade, pos, vel.length(), false));
                                 }
@@ -673,7 +823,19 @@ impl Auditor {
                                 let _ = m.buy(who, *item, at);
                             }
                             ToHost::Action { plant, defuse } => m.keys(who, *plant, *defuse),
-                            ToHost::Team(team) => events.extend(m.switch_team(who, *team)),
+                            ToHost::Team(team) => {
+                                settle!(m.switch_team(who, *team).into_iter().collect())
+                            }
+                            ToHost::Drop { weapon } => {
+                                if let Some(at) = me.map(|p| p.pos) {
+                                    m.drop_gun(who, *weapon, at);
+                                }
+                            }
+                            ToHost::Pickup { id } => {
+                                if let Some(at) = me.map(|p| p.pos) {
+                                    m.pickup(who, *id, at);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -727,19 +889,20 @@ impl Auditor {
                         let hurts =
                             nade_hurts(world, &targets, &blasts, &fires, *frame_dt, &mut burns);
                         for (owner, victim, d, h) in hurts {
-                            events.extend(m.hurt(Some(owner), victim, d, h));
+                            settle!(m.hurt(Some(owner), victim, d, h));
                         }
                     }
                     Rule::SelfHurt(amount) => {
                         if who != 0 {
                             wrong.push("dégâts « à soi » d'un autre joueur");
                         } else {
-                            events.extend(m.hurt(None, 0, *amount, Hurt::World));
+                            settle!(m.hurt(None, 0, *amount, Hurt::World));
                         }
                     }
                 },
             }
         }
+        self.cand0 = cand0;
         let last = new.tick;
         self.throws
             .retain(|th| last.saturating_sub(th.0) <= 20 * TICKS_PER_S);
@@ -756,6 +919,10 @@ impl Auditor {
         });
         if ignored > 0 {
             wrong.push("demande d'un joueur ignorée par l'hôte");
+        }
+        // Personne n'avance plus vite que le temps : une entrée par pas, à la marge près.
+        if inputs.values().any(|&n| n > ticks + INPUT_BURST + 8) {
+            wrong.push("joueur plus rapide que le temps");
         }
         // Positions annoncées par l'hôte.
         for (id, _, state, _) in &new.players {
@@ -868,14 +1035,20 @@ pub struct Host {
     local_keys: (bool, bool),
     /// Copie à envoyer au prochain pas (fin de partie).
     backup_now: bool,
+    /// Fumées en cours (centre, rayon), joueur de l'hôte aveuglé, et marques de
+    /// l'élimination en cours (pour le fil des éliminations).
+    smokes: Vec<(Vec3, f32)>,
+    local_blind: bool,
+    kill_flags: u8,
     /// Copies envoyées d'elles-mêmes (les essais les prennent à la main).
     auto_backup: bool,
     out: Vec<Local>,
-    /// Armes au sol, et armes portées par chacun (principale, secondaire).
-    ground: Vec<GroundGun>,
-    next_gun: u32,
+    /// Les armes au sol (dans les règles) ont changé : à renvoyer à tous.
     ground_dirty: bool,
-    loadouts: HashMap<u64, (u8, u8)>,
+    /// Dernier rappel de ses armes envoyé à chacun (pas).
+    resync: HashMap<u64, u32>,
+    /// Qui voit qui (spectateur, cible), au dernier état complet.
+    seen: std::cell::RefCell<HashMap<(u64, u64), bool>>,
     /// Garant de secours actuel, et celui désigné par le relais (garant indépendant).
     backup: Option<u64>,
     designated: Option<u64>,
@@ -898,6 +1071,10 @@ pub struct Guest {
     outbox_first: u32,
     /// Derniers états reçus des autres joueurs (pas, joueurs).
     snaps: VecDeque<(u32, Vec<NetPlayer>)>,
+    /// Joueurs du dernier état complet (pseudo, vie, arme… entre deux).
+    full: Vec<NetPlayer>,
+    /// Aveuglé par une flash (dit à l'hôte avec chaque tir, pour le fil des éliminations).
+    blind: bool,
     /// Dernier état reçu pour soi : (pas confirmé, état, vie, vivant).
     latest: Option<(u32, SimState, u8, bool)>,
     /// Horloge de l'hôte estimée (pas, avec fraction).
@@ -952,38 +1129,60 @@ fn ray_box(o: Vec3, d: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
 }
 
 /// Dégâts d'un coup selon l'endroit touché : tête ×4, jambes ×0,75 (balles).
-fn damage_at(weapon: u8, hit_y: f32, feet_y: f32, head_y: f32) -> (u32, Hurt) {
+fn damage_at(weapon: u8, dist: f32, hit_y: f32, feet_y: f32, head_y: f32) -> (u32, Hurt) {
     if weapon == KNIFE_LIGHT || weapon == KNIFE_HEAVY {
         let d = if weapon == KNIFE_HEAVY { 55 } else { 34 };
         return (d, Hurt::Knife);
     }
-    let base = WEAPONS.get(weapon as usize).map_or(30, |w| w.damage) as f32;
-    let (head, legs) = (hit_y >= head_y, hit_y < feet_y + 0.75);
+    // Comme dans CS2 : dégâts de l'arme, perdus avec la distance, puis partie du corps
+    // (tête ×4, ventre ×1,25, poitrine et bras ×1, jambes ×0,75). Le gilet et le casque
+    // sont comptés par les règles.
+    let base = WEAPONS
+        .get(weapon as usize)
+        .map_or(30.0, |w| w.damage_at(dist));
+    let h = hit_y - feet_y;
+    let (head, legs) = (hit_y >= head_y, h < 0.75);
     let d = if head {
         base * 4.0
     } else if legs {
         base * 0.75
+    } else if h < 1.05 {
+        base * 1.25
     } else {
         base
     };
     (d as u32, Hurt::Bullet { weapon, head, legs })
 }
 
-/// Ligne du fil des éliminations.
-pub fn kill_line(killer: &str, victim: &str, weapon: u8, head: bool) -> String {
-    let w = match weapon {
+/// Le segment `a`–`b` passe-t-il à moins de `r` de `c` ?
+fn segment_near(a: Vec3, b: Vec3, c: Vec3, r: f32) -> bool {
+    let ab = b - a;
+    let t = ((c - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+    (a + ab * t - c).length() < r
+}
+
+/// Une élimination du fil : qui, par qui (vide : personne), avec quoi et comment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Kill {
+    pub killer: String,
+    pub victim: String,
+    pub weapon: u8,
+    pub head: bool,
+    /// `game::KILL_WALL`, `KILL_SMOKE`, `KILL_BLIND`.
+    pub flags: u8,
+    /// Équipes du tueur (255 : personne) et du mort.
+    pub teams: [u8; 2],
+}
+
+/// Nom de l'arme d'une élimination.
+pub fn weapon_name(weapon: u8) -> &'static str {
+    match weapon {
         cs::W_KNIFE | KNIFE_HEAVY => "couteau",
         cs::W_HE => "grenade",
         cs::W_FIRE => "feu",
         cs::W_BOMB => "bombe",
         cs::W_WORLD => "chute",
         w => WEAPONS.get(w as usize).map_or("?", |w| w.name),
-    };
-    let hs = if head { " (tête)" } else { "" };
-    if killer.is_empty() {
-        format!("[{w}] {victim}")
-    } else {
-        format!("{killer} [{w}{hs}] {victim}")
     }
 }
 
@@ -1019,12 +1218,14 @@ impl NetGame {
             burns: BTreeMap::new(),
             local_keys: (false, false),
             backup_now: false,
+            smokes: Vec::new(),
+            local_blind: false,
+            kill_flags: 0,
             auto_backup: true,
             out: Vec::new(),
-            ground: Vec::new(),
-            next_gun: 1,
             ground_dirty: false,
-            loadouts: HashMap::new(),
+            resync: HashMap::new(),
+            seen: Default::default(),
             backup: None,
             designated: None,
             playing: true,
@@ -1080,6 +1281,8 @@ impl NetGame {
             outbox: Vec::new(),
             outbox_first: 1,
             snaps: VecDeque::new(),
+            full: Vec::new(),
+            blind: false,
             latest: None,
             clock: 0.0,
             weapon: 255,
@@ -1115,6 +1318,35 @@ impl NetGame {
                 .and_then(game::decode::<Backup>)
                 .map(|b| b.players.iter().map(|p| Vec3::from(p.2.pos)).collect())
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Pour le fil des éliminations : le joueur de ce PC est-il aveuglé, et où sont les
+    /// fumées (centre, rayon) ? À donner à chaque image.
+    pub fn set_sight(&mut self, blind: bool, smokes: Vec<(Vec3, f32)>) {
+        match self {
+            NetGame::Host(h) => {
+                h.local_blind = blind;
+                h.smokes = smokes;
+            }
+            NetGame::Guest(g) => g.blind = blind,
+        }
+    }
+
+    /// Les autres joueurs, obstacles pour le joueur de ce PC (à donner à son `Player`
+    /// avant chaque pas) : exacts chez l'hôte, tels qu'on les voit chez un invité.
+    pub fn obstacles(&self) -> Vec<Other> {
+        match self {
+            NetGame::Host(h) => others_except(&h.solid_feet(), 0),
+            NetGame::Guest(g) => {
+                let list: Vec<Vec3> = g
+                    .views()
+                    .iter()
+                    .filter(|v| v.alive)
+                    .map(|v| v.pos)
+                    .collect();
+                crate::player::others_from(&list)
+            }
         }
     }
 
@@ -1197,6 +1429,7 @@ impl NetGame {
                     weapon: 255,
                     ready: false,
                     fall_from: None,
+                    budget: INPUT_BURST / 4,
                 },
             );
         }
@@ -1346,6 +1579,7 @@ impl NetGame {
                         origin: origin.to_array(),
                         dirs: dirs.iter().map(|d| d.to_array()).collect(),
                         view_tick: h.tick,
+                        blind: h.local_blind,
                     };
                     out.extend(h.request(0, msg, world));
                 }
@@ -1358,6 +1592,7 @@ impl NetGame {
                             vel: vel.to_array(),
                         })),
                     );
+                    let _ = h.m.throw(0, nade);
                     h.broadcast(&ToPeer::Throw {
                         owner: 0,
                         nade,
@@ -1395,6 +1630,7 @@ impl NetGame {
                         origin: origin.to_array(),
                         dirs: dirs.iter().map(|d| d.to_array()).collect(),
                         view_tick,
+                        blind: g.blind,
                     });
                 }
                 for (nade, pos, vel) in nades.throws {
@@ -1575,16 +1811,9 @@ impl NetGame {
                     weapon: state.map_or(255, |q| q.3),
                     ready: false,
                     fall_from,
+                    budget: INPUT_BURST / 4,
                 },
             );
-        }
-        let mut loadouts: HashMap<u64, (u8, u8)> = b.loadouts.into_iter().collect();
-        let old = loadouts.remove(&0);
-        if let (Some(o), Some(l)) = (old_host, old) {
-            loadouts.insert(o, l);
-        }
-        if let Some(l) = loadouts.remove(&me) {
-            loadouts.insert(0, l);
         }
         *self = NetGame::Host(Box::new(Host {
             link,
@@ -1602,12 +1831,14 @@ impl NetGame {
             burns: b.burns.iter().copied().collect(),
             local_keys: (false, false),
             backup_now: false,
+            smokes: Vec::new(),
+            local_blind: false,
+            kill_flags: 0,
             auto_backup: true,
             out: Vec::new(),
-            ground: b.ground,
-            next_gun: b.next_gun,
             ground_dirty: true,
-            loadouts,
+            resync: HashMap::new(),
+            seen: Default::default(),
             backup: None,
             designated: None,
             playing: true,
@@ -1645,23 +1876,16 @@ impl NetGame {
     /// Armes au sol.
     pub fn ground(&self) -> Vec<GroundGun> {
         match self {
-            NetGame::Host(h) => h.ground.clone(),
+            NetGame::Host(h) => h.m.ground.clone(),
             NetGame::Guest(g) => g.ground.clone(),
         }
     }
 
-    /// Armes portées (envoyées à l'hôte quand elles changent).
-    pub fn set_loadout(&mut self, primary: u8, secondary: u8) {
+    /// Armes portées selon l'hôte (il fait foi) : principale, secondaire, grenades.
+    pub fn my_guns(&self) -> Option<((u8, u8), [u8; 5])> {
         match self {
-            NetGame::Host(h) => {
-                h.loadouts.insert(0, (primary, secondary));
-            }
-            NetGame::Guest(g) => {
-                if g.loadout != (primary, secondary) {
-                    g.loadout = (primary, secondary);
-                    g.to_host(&ToHost::Loadout { primary, secondary });
-                }
-            }
+            NetGame::Host(h) => h.m.players.get(&0).map(|p| (p.guns, p.nades)),
+            NetGame::Guest(_) => None,
         }
     }
 
@@ -1670,7 +1894,8 @@ impl NetGame {
         match self {
             NetGame::Host(h) => {
                 let at = h.local_pos;
-                h.drop_gun(0, weapon, at);
+                h.record(0, Move::Rule(Rule::Msg(ToHost::Drop { weapon })));
+                h.ground_dirty |= h.m.drop_gun(0, weapon, at);
             }
             NetGame::Guest(g) => g.to_host(&ToHost::Drop { weapon }),
         }
@@ -1679,7 +1904,10 @@ impl NetGame {
     /// Ramasser l'arme au sol `id`.
     pub fn pickup(&mut self, id: u32) -> Vec<Local> {
         match self {
-            NetGame::Host(h) => h.pickup(0, id),
+            NetGame::Host(h) => {
+                h.record(0, Move::Rule(Rule::Msg(ToHost::Pickup { id })));
+                h.pickup(0, id)
+            }
             NetGame::Guest(g) => {
                 g.to_host(&ToHost::Pickup { id });
                 Vec::new()
@@ -1868,9 +2096,6 @@ impl Host {
             m: self.m.clone(),
             host_pseudo: self.pseudo.clone(),
             players,
-            ground: self.ground.clone(),
-            next_gun: self.next_gun,
-            loadouts: self.loadouts.iter().map(|(&k, &v)| (k, v)).collect(),
             tick: self.tick,
             spawn: self.spawn.to_array(),
             log: std::mem::take(&mut self.log),
@@ -1925,77 +2150,50 @@ impl Host {
         }
     }
 
-    /// Pose une arme au sol (lâchée ou d'un mort).
-    fn drop_gun(&mut self, id: u64, weapon: u8, at: Vec3) {
-        if WEAPONS.get(weapon as usize).is_none() {
-            return;
-        }
-        // Seulement une arme qu'il porte.
-        let lo = self.loadouts.get(&id).copied().unwrap_or((255, 255));
-        if lo.0 != weapon && lo.1 != weapon {
-            return;
-        }
-        let e = self.loadouts.entry(id).or_insert((255, 255));
-        if e.0 == weapon {
-            e.0 = 255;
-        } else {
-            e.1 = 255;
-        }
-        if self.ground.len() >= 48 {
-            self.ground.remove(0);
-        }
-        self.ground.push(GroundGun {
-            id: self.next_gun,
-            weapon,
-            pos: (at + Vec3::Y * 0.05).to_array(),
-        });
-        self.next_gun += 1;
-        self.ground_dirty = true;
-    }
-
-    /// Ramasse une arme : à portée, vivant ; l'arme du même emplacement est lâchée à
-    /// la place (échange, comme dans CS).
+    /// Ramasse une arme au sol (règles : vivant, à portée, échange avec l'ancienne).
     fn pickup(&mut self, id: u64, gun: u32) -> Vec<Local> {
         let mut out = Vec::new();
-        let alive = self.m.players.get(&id).is_some_and(|p| p.alive);
         let Some(feet) = self.feet_of(id) else {
             return out;
         };
-        let Some(k) = self
-            .ground
-            .iter()
-            .position(|g| g.id == gun && (Vec3::from(g.pos) - feet).length() < 2.0)
-        else {
+        let Some(weapon) = self.m.pickup(id, gun, feet) else {
             return out;
         };
-        if !alive {
-            return out;
-        }
-        let g = self.ground.remove(k);
         self.ground_dirty = true;
-        let primary = WEAPONS[g.weapon as usize].primary();
-        let lo = self.loadouts.get(&id).copied().unwrap_or((255, 255));
-        let old = if primary { lo.0 } else { lo.1 };
-        if old != 255 {
-            self.drop_gun(id, old, feet);
-        }
-        let e = self.loadouts.entry(id).or_insert((255, 255));
-        if primary {
-            e.0 = g.weapon;
-        } else {
-            e.1 = g.weapon;
-        }
         if id == 0 {
-            out.push(Local::Give(g.weapon as u16));
+            out.push(Local::Give(weapon as u16));
         } else {
             self.send_to(
                 id,
                 &ToPeer::Give {
-                    item: g.weapon as u16,
+                    item: weapon as u16,
                 },
             );
         }
         out
+    }
+
+    /// Rappelle à un joueur ce qu'il porte vraiment (au plus une fois par demi-seconde) :
+    /// son jeu s'y remet s'il s'en est écarté (changement d'hôte, message perdu).
+    fn send_guns(&mut self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let last = self.resync.get(&id).copied();
+        if last.is_some_and(|t| self.tick.wrapping_sub(t) < 128) {
+            return;
+        }
+        self.resync.insert(id, self.tick);
+        if let Some(p) = self.m.players.get(&id) {
+            self.send_to(
+                id,
+                &ToPeer::Guns {
+                    primary: p.guns.0,
+                    secondary: p.guns.1,
+                    nades: p.nades,
+                },
+            );
+        }
     }
 
     /// Fait réapparaître ceux que les règles ont demandés.
@@ -2055,23 +2253,31 @@ impl Host {
                     weapon,
                     head,
                 } => {
-                    // Le mort lâche sa meilleure arme.
-                    if let Some(at) = self.feet_of(victim) {
-                        let lo = self.loadouts.get(&victim).copied().unwrap_or((255, 255));
-                        let best = if lo.0 != 255 { lo.0 } else { lo.1 };
-                        if best != 255 {
-                            self.drop_gun(victim, best, at);
-                        }
-                    }
+                    // Le mort lâche sa meilleure arme et perd le reste.
+                    let at = self.feet_of(victim);
+                    self.m.dropped_dead(victim, at);
+                    self.ground_dirty = true;
                     let k = killer.map(|k| self.pseudo_of(k)).unwrap_or_default();
                     let v = self.pseudo_of(victim);
+                    let team = |id: u64| self.m.players.get(&id).map_or(255, |p| p.team);
+                    let teams = [killer.map_or(255, team), team(victim)];
+                    let flags = self.kill_flags;
                     self.broadcast(&ToPeer::Kill {
                         killer: k.clone(),
                         victim: v.clone(),
                         weapon,
                         head,
+                        flags,
+                        teams,
                     });
-                    out.push(Local::Chat(kill_line(&k, &v, weapon, head)));
+                    out.push(Local::Kill(Kill {
+                        killer: k,
+                        victim: v,
+                        weapon,
+                        head,
+                        flags,
+                        teams,
+                    }));
                 }
                 Ev::Hp(id) => {
                     if id == 0 {
@@ -2100,7 +2306,6 @@ impl Host {
                 }
                 Ev::Started => out.push(Local::Started),
                 Ev::NewRound => {
-                    self.ground.clear();
                     self.ground_dirty = true;
                 }
             }
@@ -2114,6 +2319,7 @@ impl Host {
             origin,
             ref dirs,
             view_tick,
+            blind,
         } = msg
         else {
             return Vec::new();
@@ -2131,13 +2337,17 @@ impl Host {
                 .filter(|r| r.ready)
                 .map(|r| r.player.eye())
         };
-        let ok = fire_ok(&self.m, who, eye, origin, dirs.len());
         if who == 0 {
             self.record(0, Move::Rule(Rule::Msg(msg)));
         }
-        if ok {
-            self.fire(who, weapon, origin, &dirs, view_tick, world)
+        if fire_ok(&mut self.m, world, who, eye, weapon, origin, dirs.len()) {
+            let view = view_tick.clamp(self.tick.saturating_sub(MAX_REWIND), self.tick);
+            self.fire(who, weapon, origin, &dirs, view, blind, world)
         } else {
+            // Refusé (arme qu'il ne porte pas ?) : on lui rappelle ce qu'il porte.
+            if !self.m.has_gun(who, weapon) && weapon < 254 {
+                self.send_guns(who);
+            }
             Vec::new()
         }
     }
@@ -2168,10 +2378,12 @@ impl Host {
                     },
                 );
                 if ok {
+                    self.resync.remove(&peer);
+                    self.send_guns(peer);
                     self.send_to(
                         peer,
                         &ToPeer::Ground {
-                            guns: self.ground.clone(),
+                            guns: self.m.ground.clone(),
                         },
                     );
                     let pseudo = self.pseudo_of(peer);
@@ -2233,12 +2445,11 @@ impl Host {
                     self.events(vec![ev], &mut out);
                 }
             }
-            ToHost::Loadout { primary, secondary } => {
-                self.loadouts.insert(peer, (primary, secondary));
-            }
+            // Ce que le joueur dit porter ne compte pas : les règles le savent.
+            ToHost::Loadout { .. } => {}
             ToHost::Drop { weapon } => {
                 if let Some(at) = self.feet_of(peer) {
-                    self.drop_gun(peer, weapon, at);
+                    self.ground_dirty |= self.m.drop_gun(peer, weapon, at);
                 }
             }
             ToHost::Pickup { id } => out.extend(self.pickup(peer, id)),
@@ -2248,7 +2459,15 @@ impl Host {
                     .peers
                     .get(&peer)
                     .is_some_and(|r| (r.player.eye() - Vec3::from(pos)).length() < 3.0);
-                if alive && near && nade < 5 && Vec3::from(vel).length() < 40.0 {
+                let ok = alive
+                    && near
+                    && nade < 5
+                    && Vec3::from(vel).length() < 40.0
+                    && self.m.throw(peer, nade);
+                if !ok {
+                    self.send_guns(peer);
+                }
+                if ok {
                     let msg = ToPeer::Throw {
                         owner: peer,
                         nade,
@@ -2272,6 +2491,21 @@ impl Host {
         out
     }
 
+    /// Pieds des joueurs vivants et en jeu (obstacles les uns pour les autres).
+    fn solid_feet(&self) -> BTreeMap<u64, Vec3> {
+        let alive = |id: u64| self.m.players.get(&id).is_some_and(|p| p.alive);
+        let mut feet = BTreeMap::new();
+        if self.playing && alive(0) {
+            feet.insert(0, self.local_pos);
+        }
+        for (&id, r) in &self.peers {
+            if r.ready && alive(id) {
+                feet.insert(id, r.player.pos);
+            }
+        }
+        feet
+    }
+
     fn tick(&mut self, world: &World, local: &Player, dt: f32) {
         self.tick += 1;
         self.local_pos = local.pos;
@@ -2279,10 +2513,17 @@ impl Host {
         let frozen = self.m.frozen();
         let mut falls: Vec<(u64, u32)> = Vec::new();
         let mut moves: Vec<(u64, Move)> = Vec::new();
-        for (&id, r) in self.peers.iter_mut() {
+        // Les joueurs sont solides entre eux : chacun avance contre les autres là où ils
+        // sont, dans l'ordre des numéros (le vérificateur rejoue dans le même ordre).
+        let mut feet = self.solid_feet();
+        let mut ids: Vec<u64> = self.peers.keys().copied().collect();
+        ids.sort();
+        for id in ids {
+            let r = self.peers.get_mut(&id).expect("joueur");
             if !r.ready {
                 continue;
             }
+            r.budget = (r.budget + 1).min(INPUT_BURST);
             let alive = self.m.players.get(&id).is_some_and(|p| p.alive);
             if !alive {
                 // Mort : les entrées sont confirmées sans bouger.
@@ -2293,20 +2534,30 @@ impl Host {
             }
             let still_now = frozen || self.m.busy(id);
             // Une entrée par pas ; quelques-unes de plus si elles ont pris du retard.
+            // Trop de retard pour être rattrapé (longue coupure, ou jeu accéléré) : les
+            // plus vieilles entrées sont perdues, le joueur repart de là où il est ici.
+            while r.queue.len() > r.budget as usize + 8 {
+                if let Some((seq, _)) = r.queue.pop_front() {
+                    r.ack = seq;
+                }
+            }
             let n = if r.queue.len() > CATCH_UP {
                 CATCH_UP
             } else {
                 1
             };
-            for _ in 0..n {
+            for _ in 0..n.min(r.budget as usize) {
                 if let Some((seq, mut input)) = r.queue.pop_front() {
+                    r.budget -= 1;
                     if still_now {
                         input.forward = 0;
                         input.strafe = 0;
                         input.jump = false;
                         input.jump_pressed = false;
                     }
+                    r.player.others = others_except(&feet, id);
                     step(&mut r.player, world, &input, dt);
+                    feet.insert(id, r.player.pos);
                     r.ack = seq;
                     moves.push((id, Move::Input(seq, input)));
                 }
@@ -2359,8 +2610,8 @@ impl Host {
         if self.history.len() > HISTORY {
             self.history.pop_front();
         }
-        if self.tick.is_multiple_of(SNAPSHOT_EVERY) {
-            self.snapshots(local, world);
+        if self.tick.is_multiple_of(MOVES_EVERY) {
+            self.snapshots(local, world, self.tick.is_multiple_of(SNAPSHOT_EVERY));
         }
         let due = self.tick.is_multiple_of(BACKUP_EVERY) || std::mem::take(&mut self.backup_now);
         if due && self.auto_backup {
@@ -2369,7 +2620,7 @@ impl Host {
         if self.ground_dirty {
             self.ground_dirty = false;
             self.broadcast(&ToPeer::Ground {
-                guns: self.ground.clone(),
+                guns: self.m.ground.clone(),
             });
         }
         if self.tick.is_multiple_of(SCOREBOARD_EVERY) {
@@ -2423,7 +2674,7 @@ impl Host {
         })
     }
 
-    fn snapshots(&self, local: &Player, world: &World) {
+    fn snapshots(&self, local: &Player, world: &World, full: bool) {
         let me = self
             .playing
             .then(|| self.net_player(0, &self.pseudo, local, 255));
@@ -2441,8 +2692,19 @@ impl Host {
             let mp = self.m.players.get(&id);
             let eye = r.player.eye();
             let my_team = team(id);
+            // Qui voit qui : recalculé avec chaque état complet, gardé entre deux.
             let visible = |o: u64, p: &NetPlayer| {
-                team(o) == my_team || !p.alive || self.sees(world, eye, o, Vec3::from(p.pos))
+                if team(o) == my_team || !p.alive {
+                    return true;
+                }
+                let mut seen = self.seen.borrow_mut();
+                if full {
+                    let v = self.sees(world, eye, o, Vec3::from(p.pos));
+                    seen.insert((id, o), v);
+                    v
+                } else {
+                    seen.get(&(id, o)).copied().unwrap_or(false)
+                }
             };
             let mut players = Vec::new();
             if let Some(me) = &me {
@@ -2455,6 +2717,18 @@ impl Host {
                     .filter(|(o, p)| *o != id && visible(*o, p))
                     .map(|(_, p)| p.clone()),
             );
+            if !full {
+                self.send_to(
+                    id,
+                    &ToPeer::Moves {
+                        tick: self.tick,
+                        ack: r.ack,
+                        you: r.player.net_state(),
+                        players: players.iter().map(game::Pose::of).collect(),
+                    },
+                );
+                continue;
+            }
             self.send_to(
                 id,
                 &ToPeer::Snapshot {
@@ -2471,6 +2745,7 @@ impl Host {
     }
 
     /// Tir de `shooter` (0 = l'hôte) : cibles rembobinées au pas `view_tick`.
+    #[allow(clippy::too_many_arguments)]
     fn fire(
         &mut self,
         shooter: u64,
@@ -2478,21 +2753,36 @@ impl Host {
         origin: Vec3,
         dirs: &[Vec3],
         view_tick: u32,
+        blind: bool,
         world: &World,
     ) -> Vec<Local> {
         let mut out = Vec::new();
         self.last_shot.insert(shooter, self.tick);
         let frame = pick_frame(&self.history, view_tick);
         let damage = shot(&self.m, &frame, shooter, weapon, origin, dirs, world);
+        // Tout le monde entend le tir et voit le sang des touches.
+        let hits: Vec<Vec3> = damage.values().flatten().map(|t| t.point).collect();
+        self.broadcast(&ToPeer::Shot {
+            who: shooter,
+            weapon,
+            pos: origin.to_array(),
+            hits: hits.iter().map(|p| p.to_array()).collect(),
+        });
+        out.push(Local::Shot {
+            weapon,
+            pos: origin,
+            heard: shooter != 0,
+            hits,
+        });
         for (victim, hits) in damage {
             let head = hits
                 .iter()
-                .any(|(_, h)| matches!(h, Hurt::Bullet { head: true, .. }));
+                .any(|t| matches!(t.hurt, Hurt::Bullet { head: true, .. }));
             // Marqueur de touche au tireur.
             if shooter == 0 {
                 out.push(Local::Hit { head });
             } else {
-                let total: u32 = hits.iter().map(|h| h.0).sum();
+                let total: u32 = hits.iter().map(|h| h.damage).sum();
                 self.send_to(
                     shooter,
                     &ToPeer::Hit {
@@ -2501,9 +2791,18 @@ impl Host {
                     },
                 );
             }
-            for (d, hurt) in hits {
-                let ev = self.m.hurt(Some(shooter), victim, d, hurt);
+            for t in hits {
+                // Pour le fil des éliminations : à travers un mur, une fumée, aveuglé.
+                let smoke = self
+                    .smokes
+                    .iter()
+                    .any(|&(c, r)| segment_near(origin, t.point, c, r));
+                self.kill_flags = if t.wall { game::KILL_WALL } else { 0 }
+                    | if smoke { game::KILL_SMOKE } else { 0 }
+                    | if blind { game::KILL_BLIND } else { 0 };
+                let ev = self.m.hurt(Some(shooter), victim, t.damage, t.hurt);
                 self.events(ev, &mut out);
+                self.kill_flags = 0;
             }
         }
         out
@@ -2568,6 +2867,14 @@ impl Guest {
     fn receive(&mut self, msg: ToPeer) -> Vec<Local> {
         let mut out = Vec::new();
         match msg {
+            ToPeer::Guns {
+                primary,
+                secondary,
+                nades,
+            } => out.push(Local::Guns {
+                guns: (primary, secondary),
+                nades,
+            }),
             ToPeer::Welcome { you, tick, map_ok } => {
                 self.hello_timer = f32::INFINITY;
                 self.you = Some(you);
@@ -2592,11 +2899,12 @@ impl Guest {
                 if (self.clock - t).abs() > 64.0 {
                     self.clock = t;
                 } else {
-                    self.clock += (t - self.clock) * 0.05;
+                    self.clock += (t - self.clock) * 0.0125;
                 }
                 if self.snaps.back().is_none_or(|(s, _)| *s < tick) {
+                    self.full = players.clone();
                     self.snaps.push_back((tick, players));
-                    while self.snaps.len() > 32 {
+                    while self.snaps.len() > 128 {
                         self.snaps.pop_front();
                     }
                 }
@@ -2607,13 +2915,64 @@ impl Guest {
                     out.push(Local::SetHp(hp as u32));
                 }
             }
+            ToPeer::Moves {
+                tick,
+                ack,
+                you,
+                players,
+            } => {
+                let t = tick as f32;
+                if (self.clock - t).abs() > 64.0 {
+                    self.clock = t;
+                } else {
+                    self.clock += (t - self.clock) * 0.0125;
+                }
+                if self.snaps.back().is_none_or(|(s, _)| *s < tick) {
+                    // Le reste (pseudo, vie, arme…) vient du dernier état complet.
+                    let list: Vec<NetPlayer> = players
+                        .iter()
+                        .filter_map(|pose| {
+                            let mut p = self.full.iter().find(|p| p.id == pose.id)?.clone();
+                            pose.apply(&mut p);
+                            Some(p)
+                        })
+                        .collect();
+                    self.snaps.push_back((tick, list));
+                    while self.snaps.len() > 128 {
+                        self.snaps.pop_front();
+                    }
+                }
+                if let Some(l) = self.latest {
+                    self.latest = Some((ack, you, l.2, l.3));
+                }
+            }
             ToPeer::Hit { head, .. } => out.push(Local::Hit { head }),
             ToPeer::Kill {
                 killer,
                 victim,
                 weapon,
                 head,
-            } => out.push(Local::Chat(kill_line(&killer, &victim, weapon, head))),
+                flags,
+                teams,
+            } => out.push(Local::Kill(Kill {
+                killer,
+                victim,
+                weapon,
+                head,
+                flags,
+                teams,
+            })),
+            ToPeer::Shot {
+                who,
+                weapon,
+                pos,
+                hits,
+            } => out.push(Local::Shot {
+                weapon,
+                pos: Vec3::from(pos),
+                heard: self.you != Some(who),
+                hits: hits.into_iter().map(Vec3::from).collect(),
+            }),
             ToPeer::Respawn { state, reset, team } => {
                 self.pending.clear();
                 self.outbox.clear();
@@ -2833,6 +3192,12 @@ mod tests {
             if let Some(g) = &mut guest {
                 g.reconcile(&mut guest_p, &world, dt);
             }
+            // L'invité porte une AK (les règles le savent : on ne tire qu'avec son arme).
+            if let NetGame::Host(h) = &mut host {
+                for p in h.m.players.values_mut() {
+                    p.guns.0 = ak();
+                }
+            }
             for _ in 0..4 {
                 host_p.update(&world, &idle, dt);
                 host.on_tick(&world, &host_p, &idle, dt);
@@ -2891,20 +3256,18 @@ mod tests {
         let mut g = NetGame::host(tx, "Hote".into(), FpsMap::default(), [0; 32], spawn);
         let awp = WEAPONS.iter().position(|w| w.name == "AWP").unwrap() as u8;
         let ak = ak();
-        g.set_loadout(ak, 255);
+        host(&mut g).m.players.get_mut(&0).unwrap().guns = (ak, 255);
         g.drop_weapon(awp);
         assert!(g.ground().is_empty(), "pas une arme qu'il porte");
         g.drop_weapon(ak);
         assert_eq!(g.ground().len(), 1);
-        let NetGame::Host(h) = &mut g else {
-            unreachable!()
-        };
-        h.ground.push(GroundGun {
+        let h = host(&mut g);
+        h.m.ground.push(GroundGun {
             id: 99,
             weapon: awp,
             pos: spawn.to_array(),
         });
-        h.loadouts.insert(0, (ak, 255));
+        h.m.players.get_mut(&0).unwrap().guns = (ak, 255);
         let out = g.pickup(99);
         assert!(matches!(out.as_slice(), [Local::Give(w)] if *w == awp as u16));
         let ground = g.ground();
@@ -3161,6 +3524,9 @@ mod tests {
         let mut started = false;
         let mut conflicts = Vec::new();
         let mut thrown: Vec<(usize, u64, Vec3)> = Vec::new();
+        let mut he_thrown = 0;
+        // Lancers acceptés par l'hôte (la grenade n'explose que si elle a été lancée).
+        let mut accepted: Vec<u64> = Vec::new();
         let begin = Instant::now();
         let mut frame: u64 = 0;
         // Après la fin chez tous, encore un peu de temps (dernière copie au vérificateur).
@@ -3192,6 +3558,7 @@ mod tests {
                             match l {
                                 Local::Started => started = true,
                                 Local::GameOver(s) => host_over = Some(s),
+                                Local::Thrown { owner, .. } => accepted.push(owner),
                                 _ => {}
                             }
                         }
@@ -3219,19 +3586,31 @@ mod tests {
                 unreachable!()
             };
             let frozen = h.m.frozen();
-            let state: Vec<(u64, bool, u8, Vec3)> = h
-                .m
-                .players
-                .iter()
-                .map(|(&id, p)| {
-                    let at = if id == 0 {
-                        host_p.pos
-                    } else {
-                        h.peers.get(&id).map_or(Vec3::ZERO, |r| r.player.pos)
-                    };
-                    (id, p.alive, p.team, at)
-                })
-                .collect();
+            let state: Vec<(u64, bool, u8, Vec3)> =
+                h.m.players
+                    .iter()
+                    .map(|(&id, p)| {
+                        let at = if id == 0 {
+                            host_p.pos
+                        } else {
+                            h.peers.get(&id).map_or(Vec3::ZERO, |r| r.player.pos)
+                        };
+                        (id, p.alive, p.team, at)
+                    })
+                    .collect();
+            // Qui porte une HE (achetée pendant le départ de manche).
+            let with_he: Vec<u64> =
+                h.m.players
+                    .iter()
+                    .filter(|(_, p)| p.alive && p.nades[HE as usize] > 0)
+                    .map(|(&id, _)| id)
+                    .collect();
+            let gun = |id: u64| {
+                state
+                    .iter()
+                    .find(|s| s.0 == id)
+                    .map_or(255, |s| crate::cs::starter(s.2))
+            };
             let phase_frame = frame % 400;
             // Déplacements : quelques pas de côté au début de chaque période, puis immobiles.
             let walk = |k: usize| MoveInput {
@@ -3262,10 +3641,12 @@ mod tests {
             };
             let hm = walk(0);
             for _ in 0..4 {
+                host_p.others = host.obstacles();
                 host_p.update(&world, &hm, dt);
                 host.on_tick(&world, &host_p, &hm, dt);
                 for (k, b) in bots.iter_mut().enumerate() {
                     let m = walk(k + 1);
+                    b.p.others = b.net.obstacles();
                     b.p.update(&world, &m, dt);
                     b.net.on_tick(&world, &b.p, &m, dt);
                 }
@@ -3276,6 +3657,8 @@ mod tests {
                 for (k, b) in bots.iter_mut().enumerate() {
                     if k % 2 == 0 {
                         let _ = b.net.buy(game::ITEM_KEVLAR);
+                    } else {
+                        let _ = b.net.buy(game::ITEM_NADE + HE as u16);
                     }
                     b.net.keys(k % 3 == 0, false);
                 }
@@ -3290,27 +3673,33 @@ mod tests {
             let mut host_nades = NadeOut::default();
             // Une HE de temps en temps : lancée par un joueur, elle explose 1,6 s après.
             if started && !frozen && phase_frame == 80 {
-                let k = (frame / 400) as usize % bots.len();
-                let b = &bots[k];
-                if state.iter().any(|s| s.0 == b.id && s.1) {
+                if let Some(k) = bots.iter().position(|b| with_he.contains(&b.id)) {
+                    let b = &bots[k];
+                    he_thrown += 1;
                     thrown.push((frame as usize + 100, b.id, b.p.eye()));
                     let nades = NadeOut {
                         throws: vec![(HE, b.p.eye(), Vec3::new(0.0, 2.0, 3.0))],
                         ..Default::default()
                     };
-                    bots[k].net.end_frame(&world, Vec::new(), ak(), nades, 4.0 * dt);
+                    bots[k]
+                        .net
+                        .end_frame(&world, Vec::new(), ak(), nades, 4.0 * dt);
                 }
             }
             thrown.retain(|&(when, owner, at)| {
-                if when == frame as usize {
-                    host_nades.blasts.push((at + Vec3::new(0.0, -1.0, 4.0), owner));
+                let ok = accepted.iter().position(|o| *o == owner);
+                if let (true, Some(k)) = (when == frame as usize, ok) {
+                    accepted.remove(k);
+                    host_nades
+                        .blasts
+                        .push((at + Vec3::new(0.0, -1.0, 4.0), owner));
                 }
                 when > frame as usize
             });
             let mut host_shots = Vec::new();
             if frame.is_multiple_of(12) {
                 if let Some(d) = aim(0, host_p.eye()) {
-                    host_shots.push((ak(), host_p.eye(), vec![d]));
+                    host_shots.push((gun(0), host_p.eye(), vec![d]));
                 }
             }
             for l in host.end_frame(&world, host_shots, ak(), host_nades, 4.0 * dt) {
@@ -3325,12 +3714,13 @@ mod tests {
                 let mut shots = Vec::new();
                 if (frame + k as u64).is_multiple_of(12) && b.id != 0 {
                     if let Some(d) = aim(b.id, b.p.eye()) {
-                        shots.push((ak(), b.p.eye(), vec![d]));
+                        shots.push((gun(b.id), b.p.eye(), vec![d]));
                     }
                 }
-                b.net.end_frame(&world, shots, ak(), NadeOut::default(), 4.0 * dt);
+                b.net
+                    .end_frame(&world, shots, ak(), NadeOut::default(), 4.0 * dt);
             }
-            if frame.is_multiple_of(8) {
+            if frame.is_multiple_of(4) {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -3347,8 +3737,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(started, "la partie a commencé à 10");
+        assert!(he_thrown > 3, "des HE ont été lancées : {he_thrown}");
         let summary = host_over.expect("fin de partie chez l'hôte");
-        assert!(summary.score[0] >= 13 || summary.score[1] >= 13, "{:?}", summary.score);
+        assert!(
+            summary.score[0] >= 13 || summary.score[1] >= 13,
+            "{:?}",
+            summary.score
+        );
         assert_eq!(summary.players.len(), 10);
         let NetGame::Host(h) = &host else {
             unreachable!()
@@ -3411,6 +3806,9 @@ mod tests {
         };
         let why = |c: &[Conflict]| c.iter().map(|c| c.why).collect::<Vec<_>>();
         host(&mut g).auto_backup = false;
+        for p in host(&mut g).m.players.values_mut() {
+            p.guns.0 = ak();
+        }
         run(&mut g, &mut local, 300);
         let mut a = Auditor {
             witnessing: true,
@@ -3425,6 +3823,7 @@ mod tests {
             origin: eye.to_array(),
             dirs: vec![((local.pos + Vec3::Y * 1.1) - eye).normalize().to_array()],
             view_tick: host(&mut g).tick,
+            blind: false,
         };
         a.witness(7, fire.clone());
         g.receive(Some(7), &game::encode(&fire), &world);
@@ -3445,6 +3844,7 @@ mod tests {
             origin: eye.to_array(),
             dirs: vec![[1.0, 0.0, 0.0]],
             view_tick: host(&mut g).tick,
+            blind: false,
         };
         g.receive(Some(7), &game::encode(&fake), &world);
         run(&mut g, &mut local, 100);
@@ -3458,7 +3858,8 @@ mod tests {
         for _ in 0..=WITNESS_LATE + 1 {
             run(&mut g, &mut local, 50);
             let b = backup(&mut g, &local);
-            found |= why(&a.audit(&prev, &b, &world)).contains(&"demande d'un joueur ignorée par l'hôte");
+            found |= why(&a.audit(&prev, &b, &world))
+                .contains(&"demande d'un joueur ignorée par l'hôte");
             prev = b;
         }
         assert!(found, "tir ignoré signalé");
@@ -3481,6 +3882,39 @@ mod tests {
         b6.m.players.get_mut(&7).unwrap().kills += 5;
         let c = a.audit(&b5, &b6, &world);
         assert!(why(&c).iter().any(|w| w.starts_with("règles")), "{c:?}");
+    }
+
+    /// Dégâts comme dans CS2 : une balle de Glock dans la tête sans casque tue de près
+    /// (120), plus à 20 blocs ; l'AK tue toujours d'une balle dans la tête ; ventre ×1,25.
+    #[test]
+    fn bullet_damage_follows_cs2() {
+        let gun = |n: &str| WEAPONS.iter().position(|w| w.name == n).unwrap() as u8;
+        let (feet, head_y) = (0.0, 1.5);
+        let dmg = |w: u8, dist: f32, y: f32| damage_at(w, dist, y, feet, head_y).0;
+        let glock = gun("Glock-18");
+        assert_eq!(dmg(glock, 0.0, 1.6), 120);
+        assert!(dmg(glock, 20.0, 1.6) < 100, "{}", dmg(glock, 20.0, 1.6));
+        assert_eq!(dmg(glock, 0.0, 1.2), 30, "poitrine");
+        assert_eq!(dmg(glock, 0.0, 0.9), 37, "ventre");
+        assert_eq!(dmg(glock, 0.0, 0.3), 22, "jambes");
+        let ak = gun("AK-47");
+        assert!(
+            dmg(ak, 60.0, 1.6) > 100,
+            "AK : une balle dans la tête, même de loin"
+        );
+        // Avec casque : le Glock ne tue jamais d'une balle (47 % passent), l'AK si.
+        let mut m = Match::new(FpsMap::default(), [0; 32], 7);
+        m.join(1, "A");
+        m.join(2, "B");
+        let hit = |m: &mut Match, w: u8| {
+            let p = m.players.get_mut(&2).unwrap();
+            (p.hp, p.armor, p.helmet, p.alive) = (100, 100, true, true);
+            let (d, h) = damage_at(w, 0.0, 1.6, feet, head_y);
+            m.hurt(Some(1), 2, d, h);
+            m.players[&2].hp
+        };
+        assert_eq!(hit(&mut m, glock), 100 - 56);
+        assert_eq!(hit(&mut m, ak), 0);
     }
 
     fn host(g: &mut NetGame) -> &mut Host {

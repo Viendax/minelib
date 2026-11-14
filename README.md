@@ -185,6 +185,23 @@ Le tchat accepte jusqu'à 256 caractères et coupe les messages longs sur plusie
 
 - **Déplacements de Counter-Strike** : accélération dans les airs (*air strafe*), friction au
   sol, **bunny hop**, et fatigue des jambes si l'on saute ou s'accroupit trop souvent.
+- **Saut accroupi** : sauter, puis maintenir « s'accroupir » en l'air replie les jambes ;
+  on monte ainsi sur un obstacle de **1,5 bloc** (un saut simple atteint 1,45 bloc).
+- **Joueurs solides** (en ligne) : on ne se traverse pas, on peut monter sur la tête d'un
+  joueur ; un troisième qui atterrit sur celui qui est déjà perché glisse et retombe du
+  côté le plus proche.
+- **Dégâts de CS2** : dégâts de chaque arme, perdus avec la distance (propre à chaque
+  arme), tête ×4, ventre ×1,25, jambes ×0,75, gilet et casque selon la pénétration de
+  l'arme. Une balle de Glock dans la tête fait 120 de près sans casque, moins de 100
+  au-delà de 14 blocs, et 56 avec un casque ; l'AK-47 tue toujours d'une balle en tête.
+- **Balles qui traversent un mur d'un bloc** (pas deux), à moitié dégâts derrière ; impacts
+  à l'entrée, à la sortie et sur le bloc d'arrivée.
+- **Fusils à pompe** : rechargés une cartouche à la fois ; tirer interrompt le rechargement.
+- **Fil des éliminations** en haut à droite, comme dans CS : tueur, arme, mort, et les
+  marques « aveuglé », « tir en tête », « à travers un mur », « à travers une fumée ».
+- On **entend les tirs des autres** (plus faibles de loin), un joueur touché **saigne**,
+  et le couteau fait son bruit en touchant un joueur. Pas de pseudo au-dessus des
+  adversaires (seulement des coéquipiers).
 - **34 armes** :
   - **Pistolets** : Glock-18, USP-S, P2000, Dual Berettas, P250, Five-SeveN, Tec-9,
     CZ75-Auto, Desert Eagle, R8 Revolver.
@@ -254,6 +271,9 @@ e-mail, ni numéro de téléphone.
   relais garde sans pouvoir la lire. Un mot de passe oublié ne se récupère pas.
 - **Double authentification** (facultative) : dans *Compte* (en haut à droite de l'écran
   titre), scanne le QR code avec Authy, Aegis, Google Authenticator, 2FAS ou Bitwarden.
+- **Le compte reste connecté sur ce PC** : après une connexion réussie, le jeu se
+  reconnecte tout seul au lancement (fichier chiffré, lié à cette session Windows ;
+  « Se déconnecter » l'efface).
 - Les pseudos sont inscrits dans un **registre public signé** par le relais : impossible
   de le modifier en douce. Aucune base de données ni donnée personnelle.
 - **Un pseudo n'existe qu'une fois** : « Bob », « bob » et « BOB » sont le même pseudo, et
@@ -281,7 +301,9 @@ par un serveur relais d'iroh) : les limites d'inscription (3 par heure et par ad
 20 par heure en tout pour les joueurs sans IP connue) et d'essais de connexion
 s'appliquent par joueur, en plus de la preuve de travail.
 `minelib-relay.exe` est le même relais sans le jeu : allumé en permanence, il devient
-naturellement le relais de tout le monde (le plus ancien est choisi). Une adresse fixe
+naturellement le relais de tout le monde (le plus ancien est choisi ; ensuite chaque jeu
+reste fidèle au relais où il a déjà joué, pour qu'un faux relais qui se dirait « plus
+ancien » n'attire pas les joueurs). Une adresse fixe
 dans `relay=` reste possible. Le **compte suit le joueur** : son coffre chiffré est gardé
 sur son PC (`.minelib/comptes`), et sur un relais qui ne le connaît pas, il y est réinscrit
 tout seul (même pseudo, même clé) dès qu'on se connecte avec le bon mot de passe. Le
@@ -335,9 +357,11 @@ Pas de liste de serveurs : en haut le **classement**, en bas le **choix de la ca
   morts, MVP, % tête, ADR, score, manches gagnées). En fin de partie, le tableau reste
   affiché avec **victoire / défaite**, et le résultat part au classement : il compte quand
   plus de la moitié des joueurs envoient le même.
-- Réseau : simulation à 256 pas par seconde (états envoyés 64 fois par seconde) ; chacun prédit son mouvement et se corrige
-  sur l'hôte ; les autres sont interpolés (~50 ms) et l'hôte rembobine les cibles pour
-  juger les tirs (tête ×4, jambes ×0,75).
+- Réseau : simulation à 256 pas par seconde, et **positions envoyées 256 fois par
+  seconde** (un message court à chaque pas, l'état complet 64 fois par seconde) ; chacun
+  prédit son mouvement et se corrige sur l'hôte ; les autres sont interpolés (~30 ms) et
+  l'hôte rembobine les cibles (400 ms au plus) pour juger les tirs (tête ×4, jambes ×0,75).
+  À 10 joueurs, l'hôte envoie environ 0,7 Mo par seconde.
 
 ### Préparer une carte FPS
 
@@ -381,6 +405,12 @@ signature de la carte.
   sur lui-même (chaîne faussée, position sans entrée qui l'explique) est pris sans appel.
   Deux désaccords confirmés : le vérificateur reprend la partie, l'hôte tricheur est écarté
   et perd en réputation ; trois désaccords rejetés : c'est le vérificateur qui est écarté.
+- **Armes, cadence, grenades** : c'est l'hôte (les règles) qui sait ce que chacun porte.
+  On ne tire qu'avec une arme achetée ou ramassée, à sa cadence, avec son nombre de
+  plombs, depuis ses yeux (sans mur entre les deux) ; on ne lance que les grenades
+  achetées. Le vérificateur rejoue tout cela aussi.
+- **Vitesse** : une entrée de déplacement par pas, pas plus ; un jeu accéléré n'avance
+  pas plus vite, ses entrées en trop sont perdues.
 - **Relève** : quand un garant lance lui-même une partie (ou part), le garant en attente
   reprend aussitôt, au pas près ; s'il n'y en a pas, un joueur (le garant de secours).
 - **Contre les « wallhacks » et le « ghosting »** : un adversaire caché derrière un mur
@@ -415,7 +445,8 @@ retenu dans `voice.txt`).
 **Serveurs de construction** : le créateur du serveur est **OP** d'office ; lui seul nomme
 d'autres OP (`/op <pseudo>`, `/deop <pseudo>`, `/op` seul pour la liste). Les OP bannissent
 (`/ban <pseudo> [raison]` : exclu tout de suite, ne peut plus rejoindre ce serveur) et
-débannissent (`/unban <pseudo>`). Personne ne peut bannir le créateur ni lui retirer l'OP.
+débannissent (`/unban <pseudo>`). Un nouveau compte créé sur la machine d'un banni est
+refusé aussi. Personne ne peut bannir le créateur ni lui retirer l'OP.
 La liste est gardée par le relais, pour ce créateur et ce monde : elle reste valable quand
 le monde change de propriétaire en cours de partie, et quand le créateur le rouvre. `/ban`
 n'existe pas en FPS.
@@ -460,6 +491,9 @@ Au lancement, le jeu regarde la dernière version publiée sur GitHub (Releases 
 dépôt) : s'il y en a une plus récente, il la télécharge, prend sa place et redémarre
 dessus. Pendant le jeu, il revérifie toutes les 10 minutes ; une nouvelle version fait
 apparaître le bouton **Mettre à jour** sur l'accueil. Aucune action des joueurs.
+En bas à gauche de l'accueil et du menu pause, une ligne dit où l'on en est :
+« Minelib v71 - à jour » (vert), « version 72 disponible » (jaune) ou « version non
+vérifiée » (GitHub injoignable).
 
 Publication : à chaque envoi sur GitHub, `.github/workflows/release.yml` compile le jeu
 pour Windows et publie la Release `vNN` si le numéro de version (`VERSION` dans

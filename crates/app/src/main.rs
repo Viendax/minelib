@@ -477,13 +477,9 @@ impl Game {
         y += step * 1.5;
         let quit = c.button("Quitter le jeu", cx, y, 200.0, true);
         let ds = (s / 2.0).floor().max(1.0);
-        c.ui.text(
-            4.0 * s,
-            c.h - 10.0 * ds - 2.0 * s,
-            ds,
-            GREY,
-            format!("Minelib v{}", update::VERSION),
-        );
+        // Version et état (à jour, mise à jour disponible…), bien lisible.
+        let (line, color) = self.updater.line();
+        c.ui.text(4.0 * s, c.h - 12.0 * s, s, color, line);
         // Nouvelle version publiée : bouton en haut à gauche.
         let mut do_update = false;
         if let Some(r) = &self.updater.available {
@@ -1491,6 +1487,8 @@ impl Game {
             "Sauvegarder et quitter"
         };
         let quit = c.button(label, cx, c.h * 0.72, 200.0, true);
+        let (line, color) = self.updater.line();
+        c.ui.text(4.0 * s, c.h - 12.0 * s, s, color, line);
         if resume {
             self.screen = Screen::Playing;
         }

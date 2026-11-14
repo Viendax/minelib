@@ -68,6 +68,14 @@ impl Store {
         })
     }
 
+    /// Pseudos bannis de ce serveur.
+    pub fn bans(&self, server: &str) -> Vec<String> {
+        self.servers
+            .get(server)
+            .map(|a| a.bans.iter().map(|b| b.0.clone()).collect())
+            .unwrap_or_default()
+    }
+
     /// `by` fait `action` sur `target` dans le serveur `server` de `creator`. Renvoie le
     /// message à lui afficher, ou pourquoi c'est refusé.
     pub fn act(
@@ -154,9 +162,15 @@ mod tests {
         let mut s = Store::open(path.clone());
         let k = key("Createur", "monde");
         let act = |s: &mut Store, by: &str, a: Action, t: &str| s.act(&k, "Createur", by, a, t, "");
-        assert!(act(&mut s, "Bob", Action::Ban, "Eve").is_err(), "Bob n'est pas OP");
+        assert!(
+            act(&mut s, "Bob", Action::Ban, "Eve").is_err(),
+            "Bob n'est pas OP"
+        );
         assert!(act(&mut s, "createur", Action::Op, "Bob").is_ok());
-        assert!(act(&mut s, "Bob", Action::Op, "Eve").is_err(), "seul le créateur nomme");
+        assert!(
+            act(&mut s, "Bob", Action::Op, "Eve").is_err(),
+            "seul le créateur nomme"
+        );
         assert!(act(&mut s, "Bob", Action::Ban, "Eve").is_ok());
         assert!(s.banned(&k, "EVE").is_some());
         assert!(act(&mut s, "Bob", Action::Ban, "Createur").is_err());
