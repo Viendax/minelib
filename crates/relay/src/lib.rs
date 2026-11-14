@@ -1169,7 +1169,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             if !is_admin(&st.cfg.dir, pseudo) {
                 return Some(err(
                     ErrorCode::Refused,
-                    "Réservé aux administrateurs du relais (admins.txt).",
+                    "Réservé aux administrateurs du relais (admins.txt), pour la triche.",
                 ));
             }
             let Some(rec) = st.accounts.load(&target) else {

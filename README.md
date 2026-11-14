@@ -420,8 +420,9 @@ La liste est gardée par le relais, pour ce créateur et ce monde : elle reste v
 le monde change de propriétaire en cours de partie, et quand le créateur le rouvre. `/ban`
 n'existe pas en FPS.
 
-**Relais** : ses administrateurs (pseudos dans `admins.txt`, dans le dossier du relais)
-tapent `/banrelais <pseudo> [raison]` : le compte est banni **à vie** (inscrit au registre
+**Relais, pour la triche seulement** : par défaut, on n'est jamais banni d'un relais, seulement
+d'un serveur. Pour un tricheur, les administrateurs du relais (pseudos dans `admins.txt`,
+dans le dossier du relais) tapent `/bantriche <pseudo> <preuve>` : le compte est banni **à vie** (inscrit au registre
 signé) et ses machines pour **3 mois**. Une machine est reconnue par plusieurs composants
 (identifiant Windows, carte mère, BIOS, processeur, disque, volume, carte réseau) : il
 faut en changer au moins tous sauf un pour échapper au ban. Rien n'est envoyé tel quel :
@@ -451,7 +452,7 @@ joueurs n'est pas limité.
 | `/equipe ct` / `/equipe t` | Changer d'équipe pendant l'échauffement |
 | `/ban <pseudo> [raison]`, `/unban <pseudo>` | Construction : bannir d'un serveur (ses OP) |
 | `/op <pseudo>`, `/deop <pseudo>`, `/op` | Construction : OP du serveur (son créateur) |
-| `/banrelais <pseudo> [raison]` | Bannir du relais (administrateurs du relais) |
+| `/bantriche <pseudo> <preuve>` | Tricheur : banni de tout le relais (administrateurs du relais) |
 
 ## 🔄 Mises à jour automatiques
 

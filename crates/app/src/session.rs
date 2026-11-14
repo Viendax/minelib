@@ -1679,11 +1679,13 @@ impl Session {
                 });
                 true
             }
-            // Administrateurs du relais (admins.txt) : compte banni partout, à vie.
-            "banrelais" => {
-                let Some(target) = words.get(1) else {
+            // Triche seulement : banni de tout le relais (administrateurs, admins.txt).
+            // Sinon on n'est banni que d'un serveur (/ban de ses OP).
+            "bantriche" => {
+                let (Some(target), true) = (words.get(1), words.len() > 2) else {
                     self.chat.say(
-                        "Usage : /banrelais <pseudo> [raison] (administrateurs du relais).",
+                        "Usage : /bantriche <pseudo> <preuve de la triche> (administrateurs \
+                         du relais). Pour le reste, /ban sur un serveur.",
                         chat::GREY,
                     );
                     return true;

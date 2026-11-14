@@ -798,7 +798,10 @@ impl Game {
                 Event::BanDone(p) => {
                     if let Some(s) = &mut self.session {
                         s.chat.say(
-                            format!("{p} est banni : compte à vie, machines pour 3 mois."),
+                            format!(
+                                "{p} est banni du relais pour triche : compte à vie, \
+                                 machines pour 3 mois."
+                            ),
                             chat::YELLOW,
                         );
                     }
