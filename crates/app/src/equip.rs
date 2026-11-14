@@ -479,6 +479,31 @@ pub struct Thrown {
     pub age: f32,
     /// Temps passé immobile (fumigène, leurre).
     pub still: f32,
+    /// Lanceur (partie en ligne : 0 = soi chez l'hôte, sinon le joueur).
+    pub owner: u64,
+    /// Graine du hasard de l'effet (même fumée chez tout le monde).
+    pub seed: u32,
+}
+
+impl Thrown {
+    /// Nouvelle grenade : la graine vient de son point de départ (identique chez tous les
+    /// joueurs qui la simulent).
+    pub fn new(kind: Nade, pos: Vec3, vel: Vec3, owner: u64) -> Self {
+        let bits = pos.x.to_bits()
+            ^ pos.y.to_bits().rotate_left(11)
+            ^ pos.z.to_bits().rotate_left(22)
+            ^ vel.x.to_bits().rotate_left(5)
+            ^ vel.z.to_bits().rotate_left(17);
+        Self {
+            kind,
+            pos,
+            vel,
+            age: 0.0,
+            still: 0.0,
+            owner,
+            seed: bits | 1,
+        }
+    }
 }
 
 /// Effet en cours dans le monde.
@@ -487,8 +512,8 @@ pub enum Effect {
     Blast(Vec3, f32),
     /// Nuage de fumée (voir `SmokeCloud`).
     Smoke(SmokeCloud),
-    /// Feu au sol : cases en flammes (dessus des blocs), âge.
-    Fire(Vec<Vec3>, f32),
+    /// Feu au sol : cases en flammes (dessus des blocs), âge, lanceur.
+    Fire(Vec<Vec3>, f32, u64),
     /// Leurre : position, âge, prochain faux tir.
     Decoy(Vec3, f32, f32),
 }
@@ -498,7 +523,7 @@ impl Effect {
         match self {
             Effect::Blast(_, a) => *a < 0.6,
             Effect::Smoke(c) => c.age < SMOKE_LIFE,
-            Effect::Fire(_, a) => *a < 7.0,
+            Effect::Fire(_, a, _) => *a < 7.0,
             Effect::Decoy(_, a, _) => *a < 15.0,
         }
     }
@@ -668,7 +693,7 @@ pub fn detonate(
                     }
                 }
             }
-            effects.push(Effect::Fire(cells, 0.0));
+            effects.push(Effect::Fire(cells, 0.0, t.owner));
         }
     }
 }
@@ -686,7 +711,7 @@ pub fn tick_effects(
         match e {
             Effect::Blast(_, a) => *a += dt,
             Effect::Smoke(c) => c.tick(dt),
-            Effect::Fire(cells, a) => {
+            Effect::Fire(cells, a, _) => {
                 *a += dt;
                 // Dans les flammes : environ 40 points de vie par seconde (comme CS).
                 if cells.iter().any(|c| {
@@ -866,6 +891,8 @@ mod tests {
             vel: throw_velocity(Vec3::new(0.0, 0.0, -1.0), true, Vec3::ZERO),
             age: 0.0,
             still: 0.0,
+            owner: 0,
+            seed: 1,
         };
         let mut sounds = Vec::new();
         let mut fired = false;
@@ -892,6 +919,8 @@ mod tests {
                 vel: throw_velocity(Vec3::new(0.0, -0.3, -1.0).normalize(), false, Vec3::ZERO),
                 age: 0.0,
                 still: 0.0,
+                owner: 0,
+                seed: 1,
             };
             let mut sounds = Vec::new();
             let mut fired = None;
@@ -916,6 +945,8 @@ mod tests {
             vel: Vec3::ZERO,
             age: 2.0,
             still: 0.0,
+            owner: 0,
+            seed: 1,
         };
         let mut rnd = || 0.5;
         let mut hits = Hits::default();
@@ -940,6 +971,8 @@ mod tests {
             vel: Vec3::ZERO,
             age: 2.0,
             still: 0.0,
+            owner: 0,
+            seed: 1,
         };
         let eye = Vec3::new(8.5, 12.6, 8.5);
         let mut rnd = || 0.5;
@@ -1044,6 +1077,8 @@ mod tests {
             vel: Vec3::ZERO,
             age: 0.2,
             still: 0.0,
+            owner: 0,
+            seed: 1,
         };
         assert!(detonates(&t, &w));
         let mut rnd = || 0.5;

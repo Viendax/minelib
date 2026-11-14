@@ -1369,6 +1369,10 @@ impl Renderer {
         let view = frame.texture.create_view(&Default::default());
         self.overlay
             .prepare(&self.device, &self.queue, None, Some(ui), self.size());
+        // Objets 3D des menus (logos, icônes de blocs) : sans main.
+        let hand = self
+            .viewmodel
+            .prepare_with(&self.queue, &[], &self.overlay.models);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1397,7 +1401,13 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            self.overlay.draw(&mut pass);
+            draw_hud(
+                &mut pass,
+                &self.viewmodel,
+                &self.overlay,
+                self.world_group(),
+                hand,
+            );
         }
         self.capture
             .encode(&self.device, &mut encoder, &frame.texture);

@@ -566,3 +566,59 @@ mod held_tests {
         assert!(tip.y > hand.y + 0.2 && tip.z < hand.z, "{tip:?}");
     }
 }
+
+/// Bombe posée ou lâchée : boîtier kaki, voyant rouge (allumé quand `blink`).
+pub fn bomb(pos: Vec3, blink: bool, light: [f32; 3]) -> Vec<EntityVertex> {
+    let mut out = Vec::new();
+    let xf = Mat4::from_translation(pos) * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+    emit_item(
+        &mut out,
+        xf,
+        [-4.0, 0.0, -3.0],
+        [4.0, 3.0, 3.0],
+        RayBoxKind::Flat([96, 92, 62]),
+        light,
+    );
+    emit_item(
+        &mut out,
+        xf,
+        [-3.0, 3.0, -2.0],
+        [1.0, 3.5, 2.0],
+        RayBoxKind::Flat([40, 40, 40]),
+        light,
+    );
+    let led = if blink {
+        RayBoxKind::Glow([255, 40, 30])
+    } else {
+        RayBoxKind::Flat([90, 20, 20])
+    };
+    emit_item(&mut out, xf, [2.0, 3.0, -1.0], [3.0, 3.6, 0.0], led, light);
+    out
+}
+
+/// Arme posée au sol : silhouette sombre de sa longueur, tournée selon `turn`.
+pub fn gun_on_ground(pos: Vec3, length: f32, turn: f32, light: [f32; 3]) -> Vec<EntityVertex> {
+    let mut out = Vec::new();
+    let xf = Mat4::from_translation(pos)
+        * Mat4::from_rotation_y(turn)
+        * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+    let half = (length * 16.0 / 2.0).max(3.0);
+    emit_item(
+        &mut out,
+        xf,
+        [-half, 0.0, -0.8],
+        [half, 1.6, 0.8],
+        RayBoxKind::Flat([46, 46, 50]),
+        light,
+    );
+    // Crosse et poignée.
+    emit_item(
+        &mut out,
+        xf,
+        [-half * 0.4, 0.0, -0.6],
+        [-half * 0.4 + 1.6, 0.6, 2.8],
+        RayBoxKind::Flat([60, 48, 36]),
+        light,
+    );
+    out
+}

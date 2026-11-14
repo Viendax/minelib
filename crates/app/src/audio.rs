@@ -254,6 +254,8 @@ struct Cmd {
     file: &'static str,
     volume: f32,
     delay: f32,
+    /// Chat vocal : (joueur, échantillons 16 kHz mono) au lieu d'un son du jeu.
+    voice: Option<(u64, Vec<i16>)>,
 }
 
 fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
@@ -272,8 +274,27 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                     rodio::source::Buffered<Decoder<Cursor<&'static [u8]>>>,
                 > = HashMap::new();
                 let mut sinks: Vec<Sink> = Vec::new();
+                // Une file par joueur qui parle.
+                let mut voices: HashMap<u64, Sink> = HashMap::new();
                 while let Ok(cmd) = rx.recv() {
                     sinks.retain(|s| !s.empty());
+                    if let Some((who, samples)) = cmd.voice {
+                        let sink = voices
+                            .entry(who)
+                            .or_insert_with(|| Sink::try_new(&handle).expect("sortie son"));
+                        sink.set_volume(cmd.volume);
+                        // Trop de retard accumulé : on repart au présent.
+                        if sink.len() > 8 {
+                            sink.clear();
+                            sink.play();
+                        }
+                        sink.append(rodio::buffer::SamplesBuffer::new(
+                            1,
+                            minelib_net::voice::RATE,
+                            samples,
+                        ));
+                        continue;
+                    }
                     let Some(src) = cache.get(cmd.file).cloned().or_else(|| {
                         let bytes = FILES.iter().find(|f| f.0 == cmd.file)?.1;
                         let dec = Decoder::new(Cursor::new(bytes)).ok()?.buffered();
@@ -310,6 +331,21 @@ pub fn play(sfx: Sfx, delay: f32, master: f32) {
                 file,
                 volume: volume * master,
                 delay,
+                voice: None,
+            });
+        }
+    }
+}
+
+/// Joue un paquet de voix d'un joueur (`volume` : réglage du joueur × distance).
+pub fn voice(who: u64, samples: Vec<i16>, volume: f32) {
+    if let Some(tx) = sender() {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(Cmd {
+                file: "",
+                volume,
+                delay: 0.0,
+                voice: Some((who, samples)),
             });
         }
     }

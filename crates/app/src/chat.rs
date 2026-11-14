@@ -29,6 +29,10 @@ pub struct Chat {
     history: Vec<String>,
     history_pos: Option<usize>,
     time: f32,
+    /// Pseudos pour compléter le dernier mot avec Tab (joueurs de la partie).
+    pub names: Vec<String>,
+    /// Complétion en cours : (début tapé, rang de la proposition).
+    completing: Option<(String, usize)>,
 }
 
 pub const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -49,6 +53,8 @@ impl Default for Chat {
             history: Vec::new(),
             history_pos: None,
             time: 0.0,
+            names: Vec::new(),
+            completing: None,
         }
     }
 }
@@ -104,6 +110,30 @@ impl Chat {
         None
     }
 
+    /// Tab : complète le dernier mot avec un pseudo ; Tab encore, le suivant.
+    fn complete(&mut self) {
+        let start = self.input.rfind(' ').map_or(0, |i| i + 1);
+        let (typed, rank) = match &self.completing {
+            Some((t, r)) => (t.clone(), r + 1),
+            None => (self.input[start..].trim_start_matches('/').to_string(), 0),
+        };
+        let low = typed.to_lowercase();
+        let mut found: Vec<&String> = self
+            .names
+            .iter()
+            .filter(|n| n.to_lowercase().starts_with(&low))
+            .collect();
+        found.sort();
+        found.dedup();
+        if found.is_empty() || start == 0 {
+            return;
+        }
+        let pick = found[rank % found.len()].clone();
+        self.input.truncate(start);
+        self.input.push_str(&pick);
+        self.completing = Some((typed, rank));
+    }
+
     fn send(&mut self) -> Option<String> {
         let text = self.input.trim().to_string();
         self.close();
@@ -143,6 +173,11 @@ impl Chat {
         }
         if input.pressed(KeyCode::Backspace) {
             self.input.pop();
+        }
+        if input.pressed(KeyCode::Tab) {
+            self.complete();
+        } else if !input.text.is_empty() || input.pressed(KeyCode::Backspace) {
+            self.completing = None;
         }
         if input.pressed(KeyCode::ArrowUp) && !self.history.is_empty() {
             let i = self
@@ -312,5 +347,23 @@ mod tests {
             .iter()
             .all(|l| Ui::text_width(l, s) <= 120.0));
         assert_eq!(wrap("court", s, 120.0), vec!["court".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn tab_completes_the_last_word_with_a_pseudo() {
+        let mut c = Chat {
+            names: vec!["Viendax".into(), "Victor".into(), "Bob".into()],
+            input: "/report vi".into(),
+            ..Default::default()
+        };
+        c.complete();
+        assert_eq!(c.input, "/report Victor");
+        c.complete();
+        assert_eq!(c.input, "/report Viendax", "Tab encore : le suivant");
     }
 }

@@ -42,6 +42,9 @@ pub struct World {
     pub clock: f64,
     /// Génération des chunks hors zone importée.
     pub generator: Generator,
+    /// Journal des blocs posés par `set` (activé pour le jeu en ligne : ce que le joueur
+    /// change est envoyé aux autres).
+    pub journal: Option<Vec<([i32; 3], BlockId)>>,
 }
 
 impl World {
@@ -54,6 +57,7 @@ impl World {
             bases: HashMap::new(),
             clock: 0.0,
             generator: Generator::Procedural,
+            journal: None,
         }
     }
 
@@ -298,6 +302,26 @@ impl World {
     }
 
     /// Recharge des modifications (sauvegarde) avant que les chunks soient générés.
+    /// Pose un bloc venu d'un autre joueur (sans le noter au journal) ; chunk pas chargé :
+    /// gardé pour sa génération.
+    pub fn set_remote(&mut self, x: i32, y: i32, z: i32, id: BlockId) -> Vec<ChunkPos> {
+        if !(0..CHUNK_HEIGHT as i32).contains(&y) {
+            return Vec::new();
+        }
+        let pos = ChunkPos::containing(x, z);
+        if !self.chunks.contains_key(&pos) {
+            let index = x.rem_euclid(CHUNK_SIZE as i32) as u32
+                + 16 * z.rem_euclid(CHUNK_SIZE as i32) as u32
+                + 256 * y as u32;
+            self.load_edit(pos, index, id);
+            return Vec::new();
+        }
+        let journal = self.journal.take();
+        let dirty = self.set(x, y, z, id);
+        self.journal = journal;
+        dirty
+    }
+
     pub fn load_edit(&mut self, chunk: ChunkPos, index: u32, id: BlockId) {
         self.edits.entry(chunk).or_default().insert(index, id);
     }
@@ -319,6 +343,14 @@ impl World {
 
     pub fn contains(&self, pos: ChunkPos) -> bool {
         self.chunks.contains_key(&pos)
+    }
+
+    /// Chunk tel qu'il serait chargé (génération ou import, puis modifications), sans le
+    /// garder : pour sonder un endroit éloigné.
+    pub fn make_chunk(&self, pos: ChunkPos) -> Chunk {
+        let mut c = self.base_or_generate(pos);
+        self.apply_edits(&mut c);
+        c
     }
 
     /// Génère le chunk s'il n'est pas déjà chargé.
@@ -391,6 +423,11 @@ impl World {
         );
         let old = chunk.get(lx as usize, y as usize, lz as usize);
         chunk.set(lx as usize, y as usize, lz as usize, id);
+        if let Some(j) = &mut self.journal {
+            if old != id {
+                j.push(([x, y, z], id));
+            }
+        }
         let index = lx as u32 + 16 * lz as u32 + 256 * y as u32;
         self.edits.entry(pos).or_default().insert(index, id);
         if old.is_torch() && !id.is_torch() {

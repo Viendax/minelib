@@ -244,6 +244,177 @@ La zone s'affiche en bleu tant qu'on tient la baguette.
 
 ---
 
+## 👤 Compte
+
+Au lancement, le jeu propose de **se connecter**, de **créer un compte** ou de **jouer hors
+ligne** (solo seulement). Un compte, c'est juste un **pseudo** et un **mot de passe** : ni
+e-mail, ni numéro de téléphone.
+
+- Le mot de passe ne quitte jamais le PC : il sert à chiffrer la clé du compte, que le
+  relais garde sans pouvoir la lire. Un mot de passe oublié ne se récupère pas.
+- **Double authentification** (facultative) : dans *Compte* (en haut à droite de l'écran
+  titre), scanne le QR code avec Authy, Aegis, Google Authenticator, 2FAS ou Bitwarden.
+- Les pseudos sont inscrits dans un **registre public signé** par le relais : impossible
+  de le modifier en douce. Aucune base de données ni donnée personnelle.
+
+### Relais (aucun réglage, aucun port à ouvrir)
+
+Le **relais** met les joueurs en relation, transmet les données des parties (personne ne
+voit l'adresse IP des autres), garde les comptes, le classement et les cartes partagées.
+Avec `relay=auto` (par défaut), le jeu le trouve tout seul :
+
+1. un relais sur ce PC ou **sur le réseau local** (il s'annonce tout seul) ;
+2. sinon, la liste des relais en ligne dans le **DHT de BitTorrent** (« Mainline », des
+   millions de nœuds, bibliothèque [mainline](https://github.com/pubky/mainline), MIT) :
+   le jeu prend le plus ancien et s'y relie par [iroh](https://iroh.computer)
+   (MIT / Apache-2.0), qui perce les box (QUIC) et passe par les relais publics gratuits
+   de l'équipe d'iroh quand c'est impossible ;
+3. sinon, ce PC devient le relais : joignable de partout sans ouvrir de port, inscrit
+   dans le DHT pour les suivants.
+
+Le protocole Minelib reste chiffré de bout en bout (Noise) dans le tunnel.
+`minelib-relay.exe` est le même relais sans le jeu : allumé en permanence, il devient
+naturellement le relais de tout le monde (le plus ancien est choisi). Une adresse fixe
+dans `relay=` reste possible. Limite : les comptes et le classement sont gardés par le
+relais choisi ; si un autre relais prend sa place, il faut s'y inscrire.
+
+## 🌐 Multijoueur
+
+Menu **Multijoueur** (compte connecté) : deux grands boutons, **FPS** (logo d'AK) et
+**Construction** (cube).
+
+### FPS compétitif (5 contre 5, règles de CS2)
+
+Pas de liste de serveurs : en haut le **classement**, en bas le **choix de la carte**.
+
+- **Classement** : les 50 meilleurs du monde, ou l'onglet **Amis** (ajouter un ami par son
+  pseudo). Rang **Elo** calculé comme aux échecs (1200 au départ ; K = 40 les 30
+  premières parties, 20 ensuite, 10 au-dessus de 2400 ; Elo moyen de chaque équipe),
+  avec les statistiques de CS : matchs, victoires, K/D, % de tirs à la tête, dégâts par
+  manche (ADR), étoiles d'homme du match (MVP).
+- **Cartes** : chaque carte n'apparaît **qu'une fois**, par sa **signature** (empreinte du
+  terrain, des blocs posés, des départs et des sites). Deux copies identiques sont la même
+  carte, même sous deux noms ; changer un départ ou un site, c'est une nouvelle carte. Les
+  cartes des autres se téléchargent toutes seules (vérifiées par leur signature).
+- **Rechercher une partie** : le jeu rejoint une partie qui attend des joueurs sur cette
+  carte, ou en ouvre une s'il n'y en a pas (tu joues seul en attendant les autres).
+- **Matchmaking** : on ne tombe jamais avec quelqu'un qu'on a signalé (ni qui nous a
+  signalés) ; plus un joueur est signalé par partie jouée, plus il est mis avec des
+  joueurs dans le même cas.
+- À l'arrivée, chacun va chez les **CT** ou les **T** au hasard (5 au plus par équipe).
+  Échauffement en attendant (réapparitions, achats gratuits). À **10 joueurs**, compte à
+  rebours de 10 s puis la partie commence.
+- **Règles de CS2** : 24 manches au plus, premier à 13, changement de côté après 12 ;
+  à 12-12, prolongations par blocs de 6 manches (premier à 4, 12 500 $). Manche :
+  20 s de départ immobile (achats), 1 min 55 de jeu, 20 s d'achats ; la bombe va à un T
+  au hasard, se pose en 3,2 s sur un site, explose au bout de 40 s ; désamorçage en 10 s,
+  **5 s avec le kit**. Argent : 800 $ au départ, 16 000 $ au plus, victoire 3 250 $
+  (3 500 $ par la bombe), défaite 1 400 $ + 500 $ par défaite d'affilée (3 400 $ au plus),
+  +800 $ aux T qui ont posé, primes d'élimination selon l'arme (couteau 1 500 $, fusil à
+  pompe 900 $, mitraillette 600 $, AWP 100 $…), 300 $ pour poser ou désamorcer.
+- **Achats** (B, dans sa zone de départ) : armes de son camp seulement, grenades,
+  **gilet**, **gilet + casque** et **kit de désamorçage** (CT). Le gilet absorbe une part
+  des dégâts selon l'arme ; le casque protège la tête.
+- Poser la bombe : maintenir **E** (ou **5**) sur un site, immobile. Désamorcer :
+  maintenir **E** près de la bombe. Tir sur un coéquipier : un tiers des dégâts.
+- Les apparitions sont tirées au hasard dans la zone de son équipe, à **1,5 m** au moins
+  les uns des autres.
+- Grenades : tout le monde voit les fumées, flashs et feux des autres (même fumée chez
+  tous) ; l'hôte calcule les dégâts.
+- **Tab** : tableau des scores façon CS (argent des coéquipiers, éliminations, passes,
+  morts, MVP, % tête, ADR, score, manches gagnées). En fin de partie, le tableau reste
+  affiché avec **victoire / défaite**, et le résultat part au classement : il compte quand
+  plus de la moitié des joueurs envoient le même.
+- Réseau : simulation à 128 pas par seconde ; chacun prédit son mouvement et se corrige
+  sur l'hôte ; les autres sont interpolés (~50 ms) et l'hôte rembobine les cibles pour
+  juger les tirs (tête ×4, jambes ×0,75).
+
+### Préparer une carte FPS
+
+Dans son monde (solo, créatif) : sélectionner une zone à la **baguette** (clic gauche,
+clic droit), puis :
+
+| Commande | Effet |
+|----------|-------|
+| `/fps set ct spawn` / `/fps set t spawn` | Zone de départ des CT / des T |
+| `/fps set a site` / `b site` / `c site` | Site de bombe A, B ou C |
+| `/fps clear …` | Effacer un réglage |
+| `/fps info` | Voir les réglages |
+
+Les réglages vont dans `fps.txt`, dans le dossier du monde, et font partie de la
+signature de la carte.
+
+### Garant de secours
+
+L'hôte d'une partie FPS envoie chaque seconde l'état complet de la partie (manches, argent,
+positions, armes au sol) à un **garant de secours** choisi parmi les joueurs. Si l'hôte
+part, le garant reprend la partie là où elle en était, sans la fermer : les autres
+joueurs continuent avec lui (l'ancien hôte reste au résultat). Le résultat d'une partie ne
+compte au classement que si la majorité des joueurs envoient le même : les joueurs jugent
+en cas de désaccord.
+
+### Détails de CS
+
+- Mort : on suit un coéquipier en vie (clic : le suivant).
+- Le mort lâche sa meilleure arme ; **G** lâche l'arme principale ; **E** près d'une arme
+  au sol la ramasse (échange avec celle du même emplacement). Le sol est vidé à chaque
+  manche.
+- La bombe se voit sur le dos de celui qui la porte.
+
+### Chat vocal (chiffré de bout en bout)
+
+Maintenir **K** (touche « Micro ») pour parler. En **FPS**, on parle à son équipe ; en
+**construction**, aux joueurs proches (48 blocs, plus bas avec la distance). Chaque joueur
+chiffre sa voix avec sa propre clé (ChaCha20-Poly1305) et ne la donne qu'à ceux qui doivent
+l'entendre, scellée pour chacun (X25519) ; elle change quand quelqu'un ne doit plus
+entendre. **Ni le relais, ni l'hôte, ni les garants ne peuvent écouter.** Son : 16 kHz
+mono, ADPCM (codec écrit pour Minelib). **Tab** maintenu puis **clic droit** : la souris est
+libre et un curseur règle le volume de chaque joueur (0 à 200 %, pour soi seulement,
+retenu dans `voice.txt`).
+
+### Bans
+
+Les administrateurs d'un relais (pseudos dans `admins.txt`, dans le dossier du relais)
+tapent `/ban <pseudo> [raison]` : le compte est banni **à vie** (inscrit au registre
+signé) et ses machines pour **3 mois**. L'empreinte d'une machine n'est jamais envoyée
+telle quelle : le jeu n'envoie qu'une empreinte salée par la clé du relais, différente pour
+chaque relais.
+
+### Construction en ligne (joueurs illimités)
+
+**Ouvrir un monde** : le monde est envoyé au relais, les autres le téléchargent en
+rejoignant. Le monde est découpé en zones de 4 × 4 chunks ; chaque zone active a un
+**garant** (un des joueurs) qui valide les blocs posés (bloc valide, dans la zone, 20 par
+seconde au plus) et les publie aux joueurs proches. Les garants sont choisis parmi les
+joueurs disponibles, **les plus adaptés d'abord** (processeur, images par seconde,
+mémoire, temps de présence, réputation) et **les moins chargés** : les zones les plus
+actives vont à des garants différents, et le garant d'une zone très active est remplacé
+au bout de 10 minutes. Seuls les joueurs proches reçoivent ce qui se passe : le nombre de
+joueurs n'est pas limité.
+
+### Commandes en ligne
+
+| Commande | Effet |
+|----------|-------|
+| `/report <pseudo>` | Signaler un joueur de sa partie (**Tab** complète le pseudo) |
+| `/unreport <pseudo>` | Annuler son signalement (on peut de nouveau tomber avec lui) |
+| `/ami <pseudo>`, `/ami retirer <pseudo>`, `/amis` | Amis (onglet du classement) |
+| `/equipe ct` / `/equipe t` | Changer d'équipe pendant l'échauffement |
+| `/ban <pseudo> [raison]` | Bannir (administrateurs du relais) |
+
+## 🔄 Mises à jour automatiques
+
+Au lancement, le jeu regarde la dernière version publiée sur GitHub (Releases de ce
+dépôt) : s'il y en a une plus récente, il la télécharge, prend sa place et redémarre
+dessus. Pendant le jeu, il revérifie toutes les 10 minutes ; une nouvelle version fait
+apparaître le bouton **Mettre à jour** sur l'accueil. Aucune action des joueurs.
+
+Publication : à chaque envoi sur GitHub, `.github/workflows/release.yml` compile le jeu
+pour Windows et publie la Release `vNN` si le numéro de version (`VERSION` dans
+`crates/app/src/update.rs`) est nouveau. Réglages du dépôt nécessaires une fois :
+*Settings → Actions → General* : « Allow all actions » et « Read and write permissions ».
+`MINELIB_NO_UPDATE=1` désactive les mises à jour.
+
 ## 🖥️ Rendu et technique
 
 | Domaine | Détails |

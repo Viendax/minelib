@@ -96,7 +96,7 @@ pub struct Player {
 }
 
 /// Intention de déplacement pour une image (indépendante du clavier).
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct MoveInput {
     pub forward: f32, // -1..1
     pub strafe: f32,  // -1..1 (positif = droite)
@@ -127,6 +127,31 @@ impl Player {
             jump_buffer: 0.0,
             sneak_was_held: false,
         }
+    }
+
+    /// État du déplacement pour le réseau (de quoi reprendre la simulation à l'identique).
+    pub fn net_state(&self) -> minelib_net::game::SimState {
+        minelib_net::game::SimState {
+            pos: self.pos.to_array(),
+            vel: self.vel.to_array(),
+            on_ground: self.on_ground,
+            crouch: self.crouch,
+            stamina: self.stamina,
+            duck_speed: self.duck_speed,
+            jump_buffer: self.jump_buffer,
+            sneak_held: self.sneak_was_held,
+        }
+    }
+
+    pub fn set_net_state(&mut self, s: &minelib_net::game::SimState) {
+        self.pos = Vec3::from(s.pos);
+        self.vel = Vec3::from(s.vel);
+        self.on_ground = s.on_ground;
+        self.crouch = s.crouch;
+        self.stamina = s.stamina;
+        self.duck_speed = s.duck_speed;
+        self.jump_buffer = s.jump_buffer;
+        self.sneak_was_held = s.sneak_held;
     }
 
     pub fn eye(&self) -> Vec3 {

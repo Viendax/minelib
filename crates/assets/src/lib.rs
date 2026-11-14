@@ -102,6 +102,12 @@ pub struct Options {
     pub fullscreen: bool,
     /// Volume général des sons (0..1).
     pub volume: f32,
+    /// Adresse du relais (comptes, liste des parties).
+    pub relay: String,
+    /// Clé du relais retenue au premier contact (hexadécimal, vide = pas encore).
+    pub relay_key: String,
+    /// Dernier pseudo utilisé (prérempli à la connexion).
+    pub pseudo: String,
 }
 
 /// Sensibilité par défaut de Counter-Strike 2.
@@ -122,6 +128,9 @@ impl Default for Options {
             cpu_uniform: true,
             fullscreen: false,
             volume: 0.6,
+            relay: "auto".into(),
+            relay_key: String::new(),
+            pseudo: String::new(),
         }
     }
 }
@@ -158,6 +167,15 @@ impl Options {
             if let Some(v) = kv.get("render_scale").and_then(|v| v.parse::<f32>().ok()) {
                 o.render_scale = v.clamp(0.5, 1.0);
             }
+            if let Some(v) = kv.get("relay").filter(|v| !v.trim().is_empty()) {
+                o.relay = v.trim().to_string();
+            }
+            if let Some(v) = kv.get("relay_key") {
+                o.relay_key = v.trim().to_string();
+            }
+            if let Some(v) = kv.get("pseudo") {
+                o.pseudo = v.trim().to_string();
+            }
             if let Some(v) = kv.get("volume").and_then(|v| v.parse::<f32>().ok()) {
                 o.volume = v.clamp(0.0, 1.0);
             }
@@ -172,10 +190,13 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\n",
+                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
-                self.fps_max
+                self.fps_max,
+                self.relay,
+                self.relay_key,
+                self.pseudo
             ),
         )?;
         Ok(())

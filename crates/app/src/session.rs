@@ -31,7 +31,7 @@ const AUTOSAVE_S: f32 = 300.0;
 const DOUBLE_TAP_S: f32 = 0.3;
 /// Chute sans dégâts (blocs).
 /// Hauteur de chute sans dégâts (blocs) : au-delà, les dégâts commencent.
-const SAFE_FALL: f32 = 4.0;
+pub const SAFE_FALL: f32 = 4.0;
 /// Durée d'affichage d'un ping, portée, nombre maximal à l'écran.
 const PING_S: f32 = 8.0;
 const PING_RANGE: f32 = 400.0;
@@ -43,9 +43,63 @@ pub struct SessionConfig {
     pub view_distance: i32,
 }
 
+/// Pas de la simulation du joueur : 128 fois par seconde, quelle que soit la cadence
+/// d'images (même résultat sur toutes les machines, base du multijoueur).
+pub const SIM_TICK: f32 = 1.0 / 128.0;
+/// Au plus tant de pas par image (125 ms) : après un gel, on ne rattrape pas indéfiniment.
+const MAX_TICKS: u32 = 16;
+
+/// État simulé du joueur et état montré (interpolé entre les deux derniers pas).
+#[derive(Clone, Copy)]
+struct SimState {
+    pos: Vec3,
+    crouch: f32,
+    shown_pos: Vec3,
+    shown_crouch: f32,
+}
+
 pub struct Session {
     /// Essais : temps avant la prochaine fumigène de MINELIB_SMOKE.
     test_smoke_timer: f32,
+    /// Temps pas encore simulé (moins d'un pas).
+    tick_acc: f32,
+    /// Position au pas précédent (interpolation de l'affichage).
+    prev_pos: Vec3,
+    prev_crouch: f32,
+    /// Vraie position simulée pendant que `player` montre la position interpolée.
+    sim: Option<SimState>,
+    /// Appui sur saut arrivé entre deux pas (pris par le pas suivant).
+    pending_jump: bool,
+    /// Partie en ligne (hôte ou invité).
+    pub net: Option<crate::netgame::NetGame>,
+    /// Invité mort, en attente de réapparition.
+    net_dead: bool,
+    /// Hôte : la partie commence (elle n'est plus proposée par la recherche).
+    pub room_started: Option<bool>,
+    /// Résultat de la partie à envoyer au relais (classement).
+    pub match_result: Option<minelib_net::game::MatchSummary>,
+    /// Tableau de fin de partie affiché (résultat, temps depuis la fin).
+    pub game_over: Option<(minelib_net::game::MatchSummary, f32)>,
+    /// Bandeau de fin de manche (texte, couleur, temps restant).
+    banner: Option<(String, [f32; 4], f32)>,
+    /// Demandes pour le relais : signaler, amis.
+    pub relay_cmds: Vec<minelib_net::client::Cmd>,
+    /// Construction en ligne.
+    pub build: Option<crate::buildnet::BuildNet>,
+    /// Images par seconde moyennes (capacités de garant).
+    fps_avg: f32,
+    /// Chat vocal (partie en ligne).
+    pub voice: Option<crate::voice::Voice>,
+    /// Volume choisi pour chaque joueur (pseudo en minuscules → 0..2), et à enregistrer.
+    pub voice_volumes: HashMap<String, f32>,
+    pub voice_dirty: bool,
+    /// Tab + clic droit : souris libre pour régler les volumes.
+    pub cursor_free: bool,
+    /// Taille de la fenêtre (pour les curseurs de volume).
+    screen_size: (f32, f32),
+    /// Mort en ligne : coéquipier suivi (pseudo) et rang dans la liste.
+    spectating: Option<String>,
+    spectate_idx: usize,
     pub dir: PathBuf,
     pub meta: WorldMeta,
     pub world: World,
@@ -189,6 +243,27 @@ impl Session {
         log::info!("monde « {} » (graine {})", data.meta.name, data.meta.seed);
         Ok(Self {
             test_smoke_timer: 0.0,
+            tick_acc: 0.0,
+            prev_pos: Vec3::ZERO,
+            prev_crouch: 0.0,
+            sim: None,
+            pending_jump: false,
+            net: None,
+            net_dead: false,
+            match_result: None,
+            game_over: None,
+            banner: None,
+            relay_cmds: Vec::new(),
+            build: None,
+            fps_avg: 0.0,
+            spectating: None,
+            spectate_idx: 0,
+            voice: None,
+            voice_volumes: HashMap::new(),
+            voice_dirty: false,
+            cursor_free: false,
+            screen_size: (1280.0, 720.0),
+            room_started: None,
             dir,
             workers: Workers::new(data.meta.seed, world.generator),
             streamer: Streamer::new(radius),
@@ -289,6 +364,8 @@ impl Session {
 
     /// Une image de jeu. `active` : faux quand le jeu est en pause (temps figé, pas d'entrées).
     pub fn update(&mut self, input: &Input, dt: f32, renderer: &mut Renderer, active: bool) {
+        let (sw, sh) = renderer.size();
+        self.screen_size = (sw as f32, sh as f32);
         use minelib_render::perf;
         let logic = perf::scope("jeu : logique et physique");
         crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
@@ -433,14 +510,134 @@ impl Session {
                 self.player.pos.z.floor() as i32,
             );
             if self.player.flying || self.world.contains(here) {
-                self.player.update(&self.world, &m, dt);
+                self.simulate(&m, dt);
+            } else {
+                self.check_fall();
             }
-            self.check_fall();
             if self.game.mode == GameMode::Fps {
                 self.update_fps(input, dt, renderer, typing);
             } else {
                 self.fps.buy_open = false;
             }
+            // Partie en ligne : envoi des entrées et des tirs, marqueur de touche.
+            let shots = std::mem::take(&mut self.fps.shots);
+            let mut net_locals = Vec::new();
+            self.fps.hit_marker.0 = (self.fps.hit_marker.0 - dt).max(0.0);
+            // Construction en ligne : blocs changés envoyés au garant, position aux voisins.
+            if dt > 0.0 {
+                self.fps_avg += (1.0 / dt - self.fps_avg) * 0.02;
+            }
+            if let Some(b) = &mut self.build {
+                if self.world.journal.is_none() {
+                    self.world.journal = Some(Vec::new());
+                }
+                let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
+                if let Some(caps) = b.update(
+                    &mut self.world,
+                    self.player.pos,
+                    (self.player.yaw, self.player.pitch),
+                    self.player.crouch,
+                    speed,
+                    self.fps_avg,
+                    dt,
+                ) {
+                    self.relay_cmds.push(minelib_net::client::Cmd::Caps(caps));
+                }
+            }
+            if let Some(n) = &mut self.net {
+                let weapon = self.fps.held_weapon();
+                let nades = crate::netgame::NadeOut {
+                    throws: std::mem::take(&mut self.fps.throws),
+                    blasts: std::mem::take(&mut self.fps.blasts),
+                    fires: if n.is_host() {
+                        self.fps.fire_cells()
+                    } else {
+                        Vec::new()
+                    },
+                };
+                let mut locals = n.end_frame(&self.world, shots, weapon, nades, dt);
+                for item in std::mem::take(&mut self.fps.requests) {
+                    locals.extend(n.buy(item));
+                }
+                // Armes : portées, lâchées (G), ramassées (E près d'une arme au sol).
+                let (p, s2) = self.fps.loadout_ids();
+                n.set_loadout(p, s2);
+                for w in std::mem::take(&mut self.fps.dropped) {
+                    n.drop_weapon(w);
+                }
+                let use_pressed = input.grabbed
+                    && !typing
+                    && !self.net_dead
+                    && self.keys.pressed(input, Action::FpsUse);
+                if use_pressed {
+                    let feet = self.player.pos;
+                    let near = n
+                        .ground()
+                        .into_iter()
+                        .filter(|g| (Vec3::from(g.pos) - feet).length() < 1.6)
+                        .min_by(|a, b| {
+                            let da = (Vec3::from(a.pos) - feet).length();
+                            let db = (Vec3::from(b.pos) - feet).length();
+                            da.total_cmp(&db)
+                        });
+                    if let Some(g) = near {
+                        locals.extend(n.pickup(g.id));
+                    }
+                }
+                // Mort : on suit un coéquipier (clic : le suivant).
+                if self.net_dead {
+                    let hud = n.hud();
+                    let mates: Vec<crate::netgame::View> = n
+                        .views()
+                        .into_iter()
+                        .filter(|v| v.alive && v.team == hud.team)
+                        .collect();
+                    if mates.is_empty() {
+                        self.spectating = None;
+                    } else {
+                        if input.grabbed && self.keys.pressed(input, Action::FpsFire) {
+                            self.spectate_idx += 1;
+                        }
+                        let v = &mates[self.spectate_idx % mates.len()];
+                        self.player.pos = v.pos;
+                        self.player.yaw = v.yaw;
+                        self.player.pitch = v.pitch;
+                        self.player.vel = Vec3::ZERO;
+                        self.spectating = Some(v.pseudo.clone());
+                    }
+                } else {
+                    self.spectating = None;
+                }
+                // Poser (touche Utiliser ou Bombe maintenue) / désamorcer (Utiliser).
+                let free = input.grabbed && !typing && !self.net_dead;
+                let use_key = free && self.keys.held(input, Action::FpsUse);
+                let bomb_key = free && self.keys.held(input, Action::FpsBomb);
+                n.keys(use_key || bomb_key, use_key);
+                // Argent et équipement venus de l'hôte.
+                let hud = n.hud();
+                self.fps.online = Some(crate::fps::Online {
+                    team: hud.team,
+                    money: hud.money,
+                    armor: hud.armor,
+                    helmet: hud.helmet,
+                    kit: hud.kit,
+                    can_buy: hud.can_buy,
+                    warmup: hud.phase == minelib_net::game::phase::WARMUP,
+                });
+                self.chat.names = n.pseudos();
+                net_locals = locals;
+                if let Some(b) = &mut self.banner {
+                    b.2 -= dt;
+                    if b.2 <= 0.0 {
+                        self.banner = None;
+                    }
+                }
+                if let Some(g) = &mut self.game_over {
+                    g.1 += dt;
+                }
+            }
+            self.apply_net(net_locals);
+            self.update_voice(input, dt, typing);
             let held = self.held_item();
             let speed = if self.player.on_ground && !self.player.flying {
                 Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length()
@@ -914,9 +1111,75 @@ impl Session {
     }
 
     /// Dégâts de chute (survie) : un demi-cœur par bloc au-delà de 3.
+    /// Avance la simulation du joueur par pas fixes de `SIM_TICK`, puis montre une
+    /// position interpolée entre les deux derniers pas (mouvement fluide à toute cadence).
+    fn simulate(&mut self, m: &MoveInput, dt: f32) {
+        // Reprend la vraie position, sauf si quelqu'un a déplacé le joueur depuis
+        // (téléportation, réapparition) : on part alors de là.
+        if let Some(s) = self.sim.take() {
+            if self.player.pos == s.shown_pos && self.player.crouch == s.shown_crouch {
+                self.player.pos = s.pos;
+                self.player.crouch = s.crouch;
+            } else {
+                self.prev_pos = self.player.pos;
+                self.prev_crouch = self.player.crouch;
+            }
+        } else {
+            self.prev_pos = self.player.pos;
+            self.prev_crouch = self.player.crouch;
+        }
+        if let Some(n) = &mut self.net {
+            n.reconcile(&mut self.player, &self.world, SIM_TICK);
+        }
+        let dead_input = MoveInput {
+            fps: true,
+            ..Default::default()
+        };
+        let frozen_input;
+        let m = if self.net_dead {
+            &dead_input
+        } else if self.net.as_ref().is_some_and(|n| n.frozen()) {
+            frozen_input = crate::netgame::still(m);
+            &frozen_input
+        } else {
+            m
+        };
+        self.pending_jump |= m.jump_pressed;
+        self.tick_acc = (self.tick_acc + dt).min(SIM_TICK * MAX_TICKS as f32);
+        while self.tick_acc >= SIM_TICK {
+            self.prev_pos = self.player.pos;
+            self.prev_crouch = self.player.crouch;
+            let mut mt = *m;
+            mt.jump_pressed = std::mem::take(&mut self.pending_jump);
+            self.player.update(&self.world, &mt, SIM_TICK);
+            if let Some(n) = &mut self.net {
+                n.on_tick(&self.world, &self.player, &mt, SIM_TICK);
+            }
+            self.tick_acc -= SIM_TICK;
+            self.check_fall();
+        }
+        let a = self.tick_acc / SIM_TICK;
+        let s = SimState {
+            pos: self.player.pos,
+            crouch: self.player.crouch,
+            shown_pos: self.prev_pos.lerp(self.player.pos, a),
+            shown_crouch: self.prev_crouch + (self.player.crouch - self.prev_crouch) * a,
+        };
+        self.player.pos = s.shown_pos;
+        self.player.crouch = s.shown_crouch;
+        self.sim = Some(s);
+    }
+
     fn check_fall(&mut self) {
         let p = &self.player;
         if self.game.mode.mortal() && p.pos.y < -40.0 {
+            if let Some(n) = &mut self.net {
+                if !self.net_dead {
+                    let l = n.local_hurt(1000);
+                    self.apply_net(l);
+                }
+                return;
+            }
             self.die();
             return;
         }
@@ -929,6 +1192,15 @@ impl Session {
                 // Mode FPS : 100 points de vie, dégâts selon la vitesse d'impact.
                 // Un bloc de plus qu'en survie avant les premiers dégâts.
                 let dmg = crate::fps::Fps::fall_damage(height, SAFE_FALL + 1.0);
+                // En ligne, l'hôte fait foi : l'invité attend ses points de vie.
+                if let Some(n) = &mut self.net {
+                    if dmg > 0 && !p.flying {
+                        let l = n.local_hurt(dmg);
+                        self.hurt = 0.35;
+                        self.apply_net(l);
+                    }
+                    return;
+                }
                 if !p.flying && dmg > 0 {
                     self.fps.hp = self.fps.hp.saturating_sub(dmg);
                     self.hurt = 0.35;
@@ -954,6 +1226,10 @@ impl Session {
     }
 
     fn die(&mut self) {
+        // En ligne, la mort et la réapparition viennent de l'hôte.
+        if self.net.is_some() {
+            return;
+        }
         self.chat
             .say("Vous êtes mort ! Retour au point d'apparition.", chat::RED);
         self.player.pos = self.spawn;
@@ -970,6 +1246,160 @@ impl Session {
         self.game.health = MAX_HEALTH;
         self.fall_from = None;
         self.fps.respawn();
+    }
+
+    /// Point d'apparition du monde.
+    pub fn spawn_pos(&self) -> Vec3 {
+        self.spawn
+    }
+
+    /// Événement du relais pour la partie en ligne.
+    pub fn net_event(&mut self, e: &minelib_net::client::Event) {
+        use minelib_net::client::Event;
+        if let Event::Voice { from, data } = e {
+            let (name, dist) = self.speaker(*from);
+            let mut gain = self.volume.max(0.05) * 1.6;
+            gain *= self
+                .voice_volumes
+                .get(&name.to_lowercase())
+                .copied()
+                .unwrap_or(1.0);
+            // Construction : plus bas avec la distance, muet au-delà de 48 blocs.
+            if let Some(d) = dist {
+                gain *= (1.0 - d / VOICE_RANGE).clamp(0.0, 1.0);
+            }
+            if let Some(v) = &mut self.voice {
+                v.receive(*from, data, gain);
+            }
+            return;
+        }
+        if let Some(b) = &mut self.build {
+            match e {
+                Event::Zones { gained, lost } => {
+                    if let Some(t) = b.zones_changed(gained, lost) {
+                        self.chat.say(t, chat::GREY);
+                    }
+                }
+                Event::FromZone { peer, chunk, data } => {
+                    let dirty = b.receive(*peer, *chunk, data, &mut self.world);
+                    self.dirty.extend(dirty);
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Some(n) = &mut self.net else { return };
+        match e {
+            Event::Promoted(members) => {
+                let me = n.me();
+                let pseudo = n
+                    .rows()
+                    .into_iter()
+                    .find(|r| r.id == me)
+                    .map_or_else(String::new, |r| r.pseudo);
+                let map = crate::fpsmap::load(&self.dir);
+                let resumed = n.promote(pseudo, members, &self.player, map);
+                let t = if resumed {
+                    "L'hôte est parti : tu étais garant de secours, tu reprends la partie."
+                } else {
+                    "L'hôte est parti : tu ouvres une nouvelle partie sur la même carte."
+                };
+                self.chat.say(t, chat::YELLOW);
+                return;
+            }
+            Event::HostChanged(host) => {
+                n.host_changed();
+                self.chat.say(
+                    format!("L'hôte est parti : {host} reprend la partie."),
+                    chat::YELLOW,
+                );
+                return;
+            }
+            _ => {}
+        }
+        let locals = match e {
+            Event::PeerJoined { peer, pseudo } => {
+                n.peer_joined(*peer, pseudo.clone());
+                Vec::new()
+            }
+            Event::PeerLeft(peer) => {
+                n.peer_left(*peer);
+                Vec::new()
+            }
+            Event::FromPeer { peer, data } => n.receive(Some(*peer), data, &self.world),
+            Event::FromHost(data) => n.receive(None, data, &self.world),
+            _ => Vec::new(),
+        };
+        self.apply_net(locals);
+    }
+
+    fn apply_net(&mut self, locals: Vec<crate::netgame::Local>) {
+        use crate::netgame::Local;
+        use minelib_net::game::{reason, CT};
+        for l in locals {
+            match l {
+                Local::SetHp(hp) => {
+                    if hp < self.fps.hp {
+                        self.hurt = 0.35;
+                    }
+                    self.fps.hp = hp;
+                    if hp == 0 && !self.net_dead {
+                        self.net_dead = true;
+                        self.fps.buy_open = false;
+                        self.chat.say("Tu es mort.", chat::RED);
+                    }
+                }
+                Local::Respawn { state, reset, team } => {
+                    self.player.set_net_state(&state);
+                    self.player.vel = Vec3::ZERO;
+                    self.sim = None;
+                    self.prev_pos = self.player.pos;
+                    self.fall_from = None;
+                    self.fps.new_round(reset, team);
+                    self.net_dead = false;
+                }
+                Local::Chat(t) => self.chat.say(t, chat::WHITE),
+                Local::Notice(t) => self.chat.say(t, chat::YELLOW),
+                Local::Hit { head } => self.fps.hit_marker = (0.25, head),
+                Local::Give(item) => self.fps.give(item),
+                Local::RoundEnd {
+                    winner,
+                    reason: why,
+                } => {
+                    let side = if winner == CT {
+                        "Les antiterroristes gagnent"
+                    } else {
+                        "Les terroristes gagnent"
+                    };
+                    let how = match why {
+                        reason::EXPLODED => " : la bombe a explosé",
+                        reason::DEFUSED => " : bombe désamorcée",
+                        reason::TIME => " : temps écoulé",
+                        _ => "",
+                    };
+                    let col = if winner == CT {
+                        [0.45, 0.65, 1.0, 1.0]
+                    } else {
+                        [1.0, 0.75, 0.3, 1.0]
+                    };
+                    self.banner = Some((format!("{side}{how}"), col, 5.0));
+                }
+                Local::GameOver(summary) => {
+                    self.match_result = Some(summary.clone());
+                    self.game_over = Some((summary, 0.0));
+                }
+                Local::Thrown {
+                    owner,
+                    nade,
+                    pos,
+                    vel,
+                } => self.fps.add_thrown(owner, nade, pos, vel),
+                Local::Started => {
+                    self.room_started = Some(true);
+                    self.game_over = None;
+                }
+            }
+        }
     }
 
     /// Mode FPS, à chaque image : menu d'achat, tir, rechargement, choix de l'arme.
@@ -1059,8 +1489,8 @@ impl Session {
         for (sfx, delay, gain) in self.fps.sounds.drain(..) {
             crate::audio::play(sfx, delay, self.volume * gain);
         }
-        // Explosion, feu : mort à 0 point de vie.
-        if self.fps.hp == 0 {
+        // Explosion, feu : mort à 0 point de vie (en ligne, l'hôte en décide).
+        if self.fps.hp == 0 && self.net.is_none() {
             self.die();
         }
     }
@@ -1136,11 +1566,206 @@ impl Session {
     }
 
     /// Message ou commande envoyé dans le tchat.
+    /// Commandes de la partie en ligne et des cartes FPS. Renvoie vrai si traitée.
+    fn online_command(&mut self, cmd: &str) -> bool {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let Some(first) = words.first() else {
+            return false;
+        };
+        match first.to_lowercase().as_str() {
+            "report" | "signaler" => {
+                let Some(target) = words.get(1) else {
+                    self.chat.say(
+                        "Usage : /report <pseudo> (Tab complète le pseudo).",
+                        chat::GREY,
+                    );
+                    return true;
+                };
+                let in_game = self
+                    .net
+                    .as_ref()
+                    .is_some_and(|n| n.pseudos().iter().any(|p| p.eq_ignore_ascii_case(target)));
+                if !in_game {
+                    self.chat.say(
+                        "On ne peut signaler qu'un joueur de sa partie, pendant la partie.",
+                        chat::RED,
+                    );
+                    return true;
+                }
+                self.relay_cmds
+                    .push(minelib_net::client::Cmd::Report(target.to_string()));
+                true
+            }
+            "ban" | "bannir" => {
+                let Some(target) = words.get(1) else {
+                    self.chat.say(
+                        "Usage : /ban <pseudo> [raison] (administrateurs).",
+                        chat::GREY,
+                    );
+                    return true;
+                };
+                let reason = words[2..].join(" ");
+                self.relay_cmds.push(minelib_net::client::Cmd::Ban {
+                    pseudo: target.to_string(),
+                    reason,
+                });
+                true
+            }
+            "unreport" | "designaler" => {
+                let Some(target) = words.get(1) else {
+                    self.chat.say("Usage : /unreport <pseudo>.", chat::GREY);
+                    return true;
+                };
+                self.relay_cmds
+                    .push(minelib_net::client::Cmd::Unreport(target.to_string()));
+                true
+            }
+            "ami" | "amis" | "friend" => {
+                let (pseudo, add) = match (words.get(1), words.get(2)) {
+                    (Some(&"retirer") | Some(&"remove"), Some(p)) => (p.to_string(), false),
+                    (Some(&"ajouter") | Some(&"add"), Some(p)) => (p.to_string(), true),
+                    (Some(p), None) => (p.to_string(), true),
+                    _ => (String::new(), true),
+                };
+                self.relay_cmds
+                    .push(minelib_net::client::Cmd::Friend { pseudo, add });
+                true
+            }
+            "equipe" | "équipe" | "team" => {
+                let team = match words.get(1).map(|w| w.to_lowercase()) {
+                    Some(w) if w == "ct" => minelib_net::game::CT,
+                    Some(w) if w == "t" => minelib_net::game::T,
+                    _ => {
+                        self.chat
+                            .say("Usage : /equipe ct|t (pendant l'échauffement).", chat::GREY);
+                        return true;
+                    }
+                };
+                match &mut self.net {
+                    Some(n) => n.choose_team(team),
+                    None => self.chat.say("Pas de partie en ligne.", chat::RED),
+                }
+                true
+            }
+            "fps" => {
+                self.fps_command(&words[1..]);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `/fps set ct|t spawn`, `/fps set a|b|c site` (zone sélectionnée à la baguette),
+    /// `/fps clear …`, `/fps info`.
+    fn fps_command(&mut self, args: &[&str]) {
+        use minelib_net::game::Zone;
+        const USAGE: &str = "Usage : /fps set ct spawn | t spawn | a site | b site | c site \
+                             (sélection à la baguette), /fps clear …, /fps info";
+        if self.net.is_some() {
+            self.chat.say(
+                "Les réglages de carte se font hors partie en ligne.",
+                chat::RED,
+            );
+            return;
+        }
+        let mut map = crate::fpsmap::load(&self.dir);
+        let lower: Vec<String> = args.iter().map(|a| a.to_lowercase()).collect();
+        let what = |l: &[String]| -> Option<usize> {
+            match (l.first().map(String::as_str), l.get(1).map(String::as_str)) {
+                (Some("ct"), Some("spawn")) => Some(0),
+                (Some("t"), Some("spawn")) => Some(1),
+                (Some("a"), Some("site")) => Some(2),
+                (Some("b"), Some("site")) => Some(3),
+                (Some("c"), Some("site")) => Some(4),
+                _ => None,
+            }
+        };
+        let name = |k: usize| match k {
+            0 => "départ CT".to_string(),
+            1 => "départ T".to_string(),
+            k => format!("site {}", crate::fpsmap::SITE_NAMES[k - 2]),
+        };
+        fn slot(map: &mut minelib_net::game::FpsMap, k: usize) -> &mut Option<Zone> {
+            match k {
+                0 => &mut map.ct,
+                1 => &mut map.t,
+                k => &mut map.sites[k - 2],
+            }
+        }
+        match lower.first().map(String::as_str) {
+            Some("set") => {
+                let Some(k) = what(&lower[1..]) else {
+                    self.chat.say(USAGE, chat::GREY);
+                    return;
+                };
+                let Some((a, b)) = self.we.region() else {
+                    self.chat.say(
+                        "Sélectionne d'abord la zone avec la baguette (clic gauche, clic droit).",
+                        chat::RED,
+                    );
+                    return;
+                };
+                *slot(&mut map, k) = Some(Zone::new(a, b));
+            }
+            Some("clear") => {
+                let Some(k) = what(&lower[1..]) else {
+                    self.chat.say(USAGE, chat::GREY);
+                    return;
+                };
+                *slot(&mut map, k) = None;
+            }
+            Some("info") | None => {
+                for k in 0..5 {
+                    let z = *slot(&mut map, k);
+                    let t = match z {
+                        Some(z) => format!("{} : {:?} → {:?}", name(k), z.min, z.max),
+                        None => format!("{} : pas défini", name(k)),
+                    };
+                    self.chat.say(t, chat::LIGHT_PURPLE);
+                }
+                return;
+            }
+            _ => {
+                self.chat.say(USAGE, chat::GREY);
+                return;
+            }
+        }
+        match crate::fpsmap::save(&self.dir, &map) {
+            Ok(()) => {
+                let k = what(&lower[1..]).unwrap_or(0);
+                let verb = if lower[0] == "set" {
+                    "défini"
+                } else {
+                    "effacé"
+                };
+                self.chat.say(
+                    format!(
+                        "{} {verb}. La carte change de signature : c'est une nouvelle carte \
+                         dans la liste FPS.",
+                        name(k)
+                    ),
+                    chat::LIGHT_PURPLE,
+                );
+            }
+            Err(e) => self.chat.say(format!("fps.txt : {e:#}"), chat::RED),
+        }
+    }
+
     fn submit(&mut self, text: &str) {
         let Some(cmd) = text.strip_prefix('/') else {
+            if let Some(n) = &mut self.net {
+                n.chat(text);
+                if n.is_host() {
+                    self.chat.say(format!("<moi> {text}"), chat::WHITE);
+                }
+                return;
+            }
             self.chat.say(format!("<Joueur> {text}"), chat::WHITE);
             return;
         };
+        if self.online_command(cmd) {
+            return;
+        }
         // `//…` : commandes WorldEdit (mode créatif).
         if let Some(we) = cmd.strip_prefix('/') {
             self.worldedit(we);
@@ -1271,8 +1896,592 @@ impl Session {
     }
 
     /// Barre d'objets / inventaire (et réticule du pack).
+    /// Partie en ligne : pseudos au-dessus des joueurs visibles, scores (Tab maintenu).
+    fn draw_net(&self, ui: &mut Ui, size: (f32, f32), input: &Input, s: f32) {
+        use minelib_net::game::{bomb, phase, CT};
+        let Some(n) = &self.net else { return };
+        let hud = n.hud();
+        let my_team = hud.team;
+        let eye = self.player.eye();
+        let proj = Mat4::perspective_rh(
+            self.fov.to_radians(),
+            size.0 / size.1.max(1.0),
+            0.05,
+            1000.0,
+        );
+        let vp = proj * self.view_with_punch();
+        let to_screen = |p: Vec3| -> Option<(f32, f32)> {
+            let c = vp * p.extend(1.0);
+            (c.w > 0.0).then(|| {
+                (
+                    (c.x / c.w * 0.5 + 0.5) * size.0,
+                    (0.5 - c.y / c.w * 0.5) * size.1,
+                )
+            })
+        };
+        // Pseudos : coéquipiers toujours (couleur de l'équipe), adversaires seulement vus.
+        for v in n.views().iter().filter(|v| v.alive) {
+            let head = v.pos + Vec3::Y * 2.1;
+            let to = head - Vec3::Y * 0.4 - eye;
+            let dist = to.length();
+            let mate = v.team == my_team;
+            let blocked = raycast(&self.world, eye.into(), (to / dist.max(1e-3)).into(), dist)
+                .is_some_and(|h| h.distance < dist - 0.3);
+            if (!mate && blocked) || dist > 60.0 {
+                continue;
+            }
+            let Some((x, y)) = to_screen(head) else {
+                continue;
+            };
+            let col = team_color(v.team);
+            let mut name = v.pseudo.clone();
+            if mate && v.flags & minelib_net::game::FLAG_BOMB != 0 {
+                name += " [bombe]";
+            }
+            let tw = Ui::text_width(&name, s);
+            ui.rect(
+                x - tw / 2.0 - s,
+                y - s,
+                tw + 2.0 * s,
+                10.0 * s,
+                [0.0, 0.0, 0.0, 0.45],
+            );
+            ui.text(x - tw / 2.0, y, s, col, name);
+        }
+        // Bombe posée ou lâchée (connue de l'équipe) : repère à l'écran.
+        if matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED) {
+            if let Some((x, y)) = to_screen(Vec3::from(hud.bomb_pos) + Vec3::Y * 0.4) {
+                let t = if hud.bomb == bomb::PLANTED {
+                    "BOMBE"
+                } else {
+                    "bombe lâchée"
+                };
+                let tw = Ui::text_width(t, s);
+                ui.text(x - tw / 2.0, y, s, [1.0, 0.3, 0.25, 1.0], t);
+            }
+        }
+        // Haut de l'écran : score, temps, joueurs en vie.
+        let (cx, top) = (size.0 / 2.0, 4.0 * s);
+        let time = hud.time.ceil() as u32;
+        let clock = format!("{}:{:02}", time / 60, time % 60);
+        let (mid, mid_col) = match hud.phase {
+            phase::WARMUP => {
+                if hud.time > 0.0 {
+                    (format!("Début dans {time} s"), [1.0, 0.9, 0.35, 1.0])
+                } else {
+                    (
+                        format!("Échauffement {} / 10", hud.players),
+                        [0.85, 0.85, 0.85, 1.0],
+                    )
+                }
+            }
+            phase::PLANTED => ("BOMBE".to_string(), [1.0, 0.3, 0.25, 1.0]),
+            phase::HALFTIME => ("Mi-temps".to_string(), [1.0, 0.9, 0.35, 1.0]),
+            phase::GAME_OVER => ("Fin".to_string(), [1.0, 0.9, 0.35, 1.0]),
+            phase::FREEZE => (clock, [0.6, 0.85, 1.0, 1.0]),
+            _ => (clock, [1.0, 1.0, 1.0, 1.0]),
+        };
+        let mw = Ui::text_width(&mid, s * 1.5);
+        let w = (150.0 * s).max(mw + 60.0 * s);
+        ui.rect(cx - w / 2.0, top, w, 22.0 * s, [0.0, 0.0, 0.0, 0.5]);
+        ui.text(cx - mw / 2.0, top + 3.0 * s, s * 1.5, mid_col, mid.clone());
+        if hud.phase != phase::WARMUP {
+            let l = format!("{}", hud.score[0]);
+            let r = format!("{}", hud.score[1]);
+            ui.text(
+                cx - w / 2.0 + 6.0 * s,
+                top + 3.0 * s,
+                s * 1.5,
+                team_color(CT),
+                l,
+            );
+            let rw = Ui::text_width(&r, s * 1.5);
+            ui.text(
+                cx + w / 2.0 - 6.0 * s - rw,
+                top + 3.0 * s,
+                s * 1.5,
+                team_color(minelib_net::game::T),
+                r,
+            );
+            let alive = format!(
+                "{} en vie  manche {}  {} en vie",
+                hud.alive[0], hud.round, hud.alive[1]
+            );
+            let aw = Ui::text_width(&alive, s);
+            ui.text(
+                cx - aw / 2.0,
+                top + 15.0 * s,
+                s,
+                [0.8, 0.8, 0.8, 1.0],
+                alive,
+            );
+        }
+        // Équipe, bombe, achats.
+        let mut line = format!(
+            "Équipe : {}",
+            if my_team == CT {
+                "antiterroristes (CT)"
+            } else {
+                "terroristes (T)"
+            }
+        );
+        if hud.bomb == bomb::CARRIED {
+            line += "   Tu as la bombe : maintiens E (ou 5) sur un site";
+        }
+        if hud.can_buy && hud.phase != phase::WARMUP {
+            line += "   Achats ouverts (B)";
+        }
+        ui.text(
+            cx - Ui::text_width(&line, s) / 2.0,
+            top + 26.0 * s,
+            s,
+            team_color(my_team),
+            line,
+        );
+        // Mort : qui on suit.
+        if let Some(name) = &self.spectating {
+            let t = format!("Tu regardes {name} (clic : suivant)");
+            ui.text(
+                cx - Ui::text_width(&t, s) / 2.0,
+                size.1 * 0.8,
+                s,
+                [1.0, 1.0, 1.0, 1.0],
+                t,
+            );
+        }
+        // Arme au sol à portée.
+        if self.spectating.is_none() && !self.net_dead {
+            let feet = self.player.pos;
+            if let Some(g) = n
+                .ground()
+                .into_iter()
+                .find(|g| (Vec3::from(g.pos) - feet).length() < 1.6)
+            {
+                let name = crate::weapons::WEAPONS
+                    .get(g.weapon as usize)
+                    .map_or("?", |w| w.name);
+                let t = format!("E : ramasser {name}");
+                ui.text(
+                    cx - Ui::text_width(&t, s) / 2.0,
+                    size.1 * 0.66,
+                    s,
+                    [1.0, 1.0, 1.0, 1.0],
+                    t,
+                );
+            }
+        }
+        // Barre de pose / désamorçage.
+        if hud.progress > 0.0 {
+            let (bw, bh) = (120.0 * s, 6.0 * s);
+            let (bx, by) = (cx - bw / 2.0, size.1 * 0.62);
+            let label = if my_team == CT {
+                if hud.kit {
+                    "Désamorçage (kit)"
+                } else {
+                    "Désamorçage"
+                }
+            } else {
+                "Pose de la bombe"
+            };
+            ui.text(
+                cx - Ui::text_width(label, s) / 2.0,
+                by - 10.0 * s,
+                s,
+                [1.0, 1.0, 1.0, 1.0],
+                label,
+            );
+            ui.rect(bx, by, bw, bh, [0.0, 0.0, 0.0, 0.6]);
+            ui.rect(bx, by, bw * hud.progress, bh, [0.95, 0.75, 0.2, 0.95]);
+        } else if my_team == CT
+            && hud.bomb == bomb::PLANTED
+            && (Vec3::from(hud.bomb_pos) - self.player.pos).length() < 1.8
+        {
+            let t = "Maintiens E pour désamorcer";
+            ui.text(
+                cx - Ui::text_width(t, s) / 2.0,
+                size.1 * 0.62,
+                s,
+                [1.0, 1.0, 1.0, 1.0],
+                t,
+            );
+        }
+        // Bandeau de fin de manche.
+        if let Some((text, col, _)) = &self.banner {
+            let tw = Ui::text_width(text, s * 2.0);
+            ui.rect(
+                cx - tw / 2.0 - 8.0 * s,
+                size.1 * 0.22 - 4.0 * s,
+                tw + 16.0 * s,
+                24.0 * s,
+                [0.0, 0.0, 0.0, 0.55],
+            );
+            ui.text(cx - tw / 2.0, size.1 * 0.22, s * 2.0, *col, text.clone());
+        }
+        // Tableau des scores : Tab maintenu, ou fin de partie.
+        let over = self.game_over.as_ref();
+        if over.is_some() || (!self.chat.open && input.held(KeyCode::Tab)) {
+            self.draw_scoreboard(ui, size, s, n, over.map(|o| &o.0));
+        }
+    }
+
+    /// Pseudo d'un joueur qui parle, et sa distance (construction seulement).
+    fn speaker(&self, id: u64) -> (String, Option<f32>) {
+        if let Some(b) = &self.build {
+            return b
+                .others
+                .get(&id)
+                .map_or((String::new(), Some(VOICE_RANGE)), |o| {
+                    (o.pseudo.clone(), Some((o.pos - self.player.pos).length()))
+                });
+        }
+        let name = self
+            .net
+            .as_ref()
+            .and_then(|n| n.rows().into_iter().find(|r| r.id == id))
+            .map_or_else(String::new, |r| r.pseudo);
+        (name, None)
+    }
+
+    /// Joueurs de la partie (pour le vocal) : tous, et ceux qui doivent m'entendre.
+    fn voice_peers(&self) -> (Vec<u64>, Vec<u64>) {
+        if let Some(n) = &self.net {
+            let me = n.me();
+            let rows = n.rows();
+            let team = n.hud().team;
+            let all: Vec<u64> = rows.iter().filter(|r| r.id != me).map(|r| r.id).collect();
+            let mates = rows
+                .iter()
+                .filter(|r| r.id != me && r.team == team)
+                .map(|r| r.id)
+                .collect();
+            return (all, mates);
+        }
+        if let Some(b) = &self.build {
+            let all: Vec<u64> = b.others.keys().copied().collect();
+            let near = b
+                .others
+                .iter()
+                .filter(|(_, o)| (o.pos - self.player.pos).length() < VOICE_RANGE)
+                .map(|(&id, _)| id)
+                .collect();
+            return (all, near);
+        }
+        (Vec::new(), Vec::new())
+    }
+
+    /// Micro (touche maintenue), volumes au curseur (Tab + clic droit).
+    fn update_voice(&mut self, input: &Input, dt: f32, typing: bool) {
+        if self.voice.is_none() {
+            return;
+        }
+        let ptt = !typing && self.keys.held(input, Action::FpsVoice);
+        let (all, listen) = self.voice_peers();
+        if let Some(v) = &mut self.voice {
+            v.update(dt, &all, &listen, ptt);
+        }
+        // Tab maintenu : clic droit libère la souris ; Tab lâché : on rejoue.
+        let tab = !self.chat.open && input.held(KeyCode::Tab);
+        if tab && input.mouse_pressed(minelib_platform::Mouse::Right) {
+            self.cursor_free = true;
+        }
+        if !tab {
+            self.cursor_free = false;
+        }
+        if self.cursor_free && input.mouse_held(minelib_platform::Mouse::Left) {
+            if let Some((cx, cy)) = input.cursor {
+                let size = self.screen_size;
+                for (name, x, y, w, h) in self.volume_sliders(size) {
+                    if cx >= x - 4.0 && cx <= x + w + 4.0 && cy >= y && cy <= y + h {
+                        let v = ((cx - x) / w).clamp(0.0, 1.0) * 2.0;
+                        self.voice_volumes.insert(name.to_lowercase(), v);
+                        self.voice_dirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Curseurs de volume : (pseudo, x, y, largeur, hauteur), à droite du tableau des
+    /// scores (FPS) ou dans la liste des joueurs proches (construction).
+    fn volume_sliders(&self, size: (f32, f32)) -> Vec<(String, f32, f32, f32, f32)> {
+        let s = (size.1 / 360.0).floor().max(1.0);
+        let mut out = Vec::new();
+        if let Some(n) = &self.net {
+            let me = n.me();
+            for (row, y) in scoreboard_lines(size, &n.rows()) {
+                if row.id != me {
+                    let (x, _, w) = scoreboard_frame(size);
+                    out.push((row.pseudo.clone(), x + w + 6.0 * s, y, 60.0 * s, 8.0 * s));
+                }
+            }
+        } else if let Some(b) = &self.build {
+            for (i, (pseudo, _)) in self.build_list(b).into_iter().enumerate() {
+                let (x, y) = (
+                    size.0 / 2.0 + 40.0 * s,
+                    size.1 * 0.18 + 12.0 * s * (i as f32 + 1.5),
+                );
+                out.push((pseudo, x, y, 60.0 * s, 8.0 * s));
+            }
+        }
+        out
+    }
+
+    /// Joueurs proches en construction, du plus près au plus loin.
+    fn build_list(&self, b: &crate::buildnet::BuildNet) -> Vec<(String, f32)> {
+        let mut v: Vec<(String, f32)> = b
+            .others
+            .values()
+            .map(|o| (o.pseudo.clone(), (o.pos - self.player.pos).length()))
+            .collect();
+        v.sort_by(|a, b| a.1.total_cmp(&b.1));
+        v.truncate(20);
+        v
+    }
+
+    /// Curseurs de volume et qui parle.
+    fn draw_voice(&self, ui: &mut Ui, size: (f32, f32), input: &Input, s: f32) {
+        let Some(v) = &self.voice else { return };
+        // Qui parle, en haut à gauche ; le micro quand on émet.
+        let mut y = 40.0 * s;
+        if v.talking {
+            ui.text(8.0 * s, y, s, [1.0, 0.4, 0.35, 1.0], "Micro ouvert");
+            y += 11.0 * s;
+        }
+        for id in v.speaking.keys() {
+            let (name, _) = self.speaker(*id);
+            ui.text(8.0 * s, y, s, [0.6, 1.0, 0.6, 1.0], format!("> {name}"));
+            y += 11.0 * s;
+        }
+        let tab = !self.chat.open && input.held(KeyCode::Tab);
+        if !tab {
+            return;
+        }
+        // Construction : liste des joueurs proches.
+        if let Some(b) = &self.build {
+            let list = self.build_list(b);
+            let (x, y0) = (size.0 / 2.0 - 120.0 * s, size.1 * 0.18);
+            let h = 12.0 * s * (list.len() as f32 + 2.0);
+            ui.rect(x, y0, 240.0 * s, h, [0.0, 0.0, 0.0, 0.7]);
+            ui.text(
+                x + 6.0 * s,
+                y0 + 4.0 * s,
+                s,
+                [1.0, 0.9, 0.35, 1.0],
+                "Joueurs proches",
+            );
+            for (i, (name, d)) in list.iter().enumerate() {
+                let ry = y0 + 12.0 * s * (i as f32 + 1.5);
+                ui.text(
+                    x + 6.0 * s,
+                    ry,
+                    s,
+                    [1.0, 1.0, 1.0, 1.0],
+                    format!("{name}  {d:.0} m"),
+                );
+            }
+        }
+        for (name, x, y, w, h) in self.volume_sliders(size) {
+            let vol = self
+                .voice_volumes
+                .get(&name.to_lowercase())
+                .copied()
+                .unwrap_or(1.0);
+            ui.rect(x, y + h * 0.35, w, h * 0.3, [0.25, 0.25, 0.3, 0.9]);
+            ui.rect(
+                x,
+                y + h * 0.35,
+                w * vol / 2.0,
+                h * 0.3,
+                [0.5, 0.8, 0.5, 0.95],
+            );
+            ui.rect(x + w * vol / 2.0 - s, y, 2.0 * s, h, [1.0, 1.0, 1.0, 1.0]);
+            ui.text(
+                x + w + 3.0 * s,
+                y,
+                s,
+                [0.85, 0.85, 0.85, 1.0],
+                format!("{:.0} %", vol * 100.0),
+            );
+        }
+        if !self.cursor_free {
+            let t = "Clic droit : régler le volume de chaque joueur";
+            ui.text(
+                (size.0 - Ui::text_width(t, s)) / 2.0,
+                size.1 - 60.0 * s,
+                s,
+                [0.85, 0.85, 0.85, 1.0],
+                t,
+            );
+        }
+    }
+
+    /// Construction en ligne : pseudos des joueurs proches.
+    fn draw_build_names(&self, ui: &mut Ui, size: (f32, f32), s: f32) {
+        let Some(b) = &self.build else { return };
+        let proj = Mat4::perspective_rh(
+            self.fov.to_radians(),
+            size.0 / size.1.max(1.0),
+            0.05,
+            1000.0,
+        );
+        let vp = proj * self.view_with_punch();
+        for o in b.others.values() {
+            let c = vp * (o.pos + Vec3::Y * 2.1).extend(1.0);
+            if c.w <= 0.0 || (o.pos - self.player.pos).length() > 64.0 {
+                continue;
+            }
+            let (x, y) = (
+                (c.x / c.w * 0.5 + 0.5) * size.0,
+                (0.5 - c.y / c.w * 0.5) * size.1,
+            );
+            let tw = Ui::text_width(&o.pseudo, s);
+            ui.rect(
+                x - tw / 2.0 - s,
+                y - s,
+                tw + 2.0 * s,
+                10.0 * s,
+                [0.0, 0.0, 0.0, 0.45],
+            );
+            ui.text(x - tw / 2.0, y, s, [1.0, 1.0, 1.0, 1.0], o.pseudo.clone());
+        }
+    }
+
+    /// Tableau des scores façon CS : une partie par équipe, argent des coéquipiers,
+    /// éliminations, passes, morts, étoiles d'homme du match, % de tirs à la tête, dégâts
+    /// moyens par manche, score ; manches gagnées en haut. En fin de partie : victoire ou
+    /// défaite.
+    fn draw_scoreboard(
+        &self,
+        ui: &mut Ui,
+        size: (f32, f32),
+        s: f32,
+        n: &crate::netgame::NetGame,
+        over: Option<&minelib_net::game::MatchSummary>,
+    ) {
+        use minelib_net::game::{CT, T};
+        let rows = n.rows();
+        let hud = n.hud();
+        let me = n.me();
+        let rounds = n.round_history();
+        let played = rounds.len().max(1) as f32;
+        let row = 11.0 * s;
+        let (x, mut y, w) = scoreboard_frame(size);
+        let header = 30.0 * s;
+        let count = |t: u8| rows.iter().filter(|r| r.team == t).count().max(1) as f32;
+        let h = header + (count(CT) + count(T) + 2.0) * row + 16.0 * s;
+        ui.rect(x, y, w, h, [0.02, 0.02, 0.03, 0.82]);
+        // Titre : résultat ou score.
+        let title = match over {
+            Some(sum) => {
+                let mine = rows.iter().find(|r| r.id == me).map(|r| r.pseudo.clone());
+                let start = mine
+                    .and_then(|p| sum.players.iter().find(|q| q.pseudo == p))
+                    .map_or(0, |q| q.start_team as usize);
+                let (a, b) = (sum.score[start], sum.score[1 - start]);
+                let verdict = if a > b {
+                    "VICTOIRE"
+                } else if a < b {
+                    "DÉFAITE"
+                } else {
+                    "ÉGALITÉ"
+                };
+                format!("{verdict}  {a} - {b}   (Échap : quitter la partie)")
+            }
+            None if hud.round == 0 => "Échauffement".to_string(),
+            None => format!(
+                "CT {}  -  {} T      manche {}",
+                hud.score[0], hud.score[1], hud.round
+            ),
+        };
+        ui.text(
+            x + 6.0 * s,
+            y + 4.0 * s,
+            s * 1.5,
+            [1.0, 0.9, 0.35, 1.0],
+            title,
+        );
+        // Manches : un carré par manche, couleur du côté qui l'a gagnée.
+        let sq = 5.0 * s;
+        for (i, (start_winner, _)) in rounds.iter().enumerate() {
+            let side = side_of_start(*start_winner, i as u32);
+            let rx = x + 6.0 * s + i as f32 * (sq + s);
+            if rx + sq > x + w {
+                break;
+            }
+            ui.rect(rx, y + 18.0 * s, sq, sq, team_color(side));
+        }
+        y += header;
+        let cols: [(&str, f32); 8] = [
+            ("$", 0.36),
+            ("K", 0.47),
+            ("A", 0.53),
+            ("D", 0.59),
+            ("MVP", 0.65),
+            ("HS%", 0.73),
+            ("ADR", 0.82),
+            ("Score", 0.91),
+        ];
+        for team in [CT, T] {
+            let col = team_color(team);
+            ui.text(
+                x + 6.0 * s,
+                y,
+                s,
+                col,
+                if team == CT {
+                    "Antiterroristes"
+                } else {
+                    "Terroristes"
+                },
+            );
+            for (name, fx) in cols {
+                ui.text(x + w * fx, y, s, [0.7, 0.7, 0.75, 1.0], name);
+            }
+            y += row;
+            for r in rows.iter().filter(|r| r.team == team) {
+                let bright = if r.alive || over.is_some() { 1.0 } else { 0.5 };
+                let c = [col[0] * bright, col[1] * bright, col[2] * bright, 1.0];
+                if r.id == me {
+                    ui.rect(x + 2.0 * s, y - s, w - 4.0 * s, row, [1.0, 1.0, 1.0, 0.08]);
+                }
+                ui.text(x + 6.0 * s, y, s, c, r.pseudo.clone());
+                let hs = if r.kills > 0 {
+                    r.headshots as f32 * 100.0 / r.kills as f32
+                } else {
+                    0.0
+                };
+                let vals = [
+                    if team == hud.team || over.is_some() {
+                        format!("{}", r.money)
+                    } else {
+                        String::new()
+                    },
+                    format!("{}", r.kills),
+                    format!("{}", r.assists),
+                    format!("{}", r.deaths),
+                    if r.mvps > 0 {
+                        format!("*{}", r.mvps)
+                    } else {
+                        String::new()
+                    },
+                    format!("{hs:.0}"),
+                    format!("{:.0}", r.damage as f32 / played),
+                    format!("{}", r.score),
+                ];
+                for ((_, fx), v) in cols.iter().zip(vals) {
+                    ui.text(x + w * fx, y, s, [0.95, 0.95, 0.95, bright], v);
+                }
+                y += row;
+            }
+            y += 4.0 * s;
+        }
+    }
+
     pub fn draw_hud(&self, ui: &mut Ui, size: (f32, f32), input: &Input, debug: bool) {
         let s = (size.1 / 360.0).floor().max(1.0);
+        self.draw_net(ui, size, input, s);
+        self.draw_build_names(ui, size, s);
+        self.draw_voice(ui, size, input, s);
         if self.hurt > 0.0 {
             ui.rect(0.0, 0.0, size.0, size.1, [0.7, 0.0, 0.0, self.hurt * 0.6]);
         }
@@ -1490,18 +2699,89 @@ impl Session {
             held,
         };
         let visible = self.game.mode != GameMode::Spectator;
-        let model = if third != 0 && visible {
+        let mut model = if third != 0 && visible {
             crate::player_model::build(&pose)
         } else {
             Vec::new()
         };
+        // Partie en ligne : les autres joueurs.
+        if let Some(n) = &self.net {
+            for v in n.views().iter().filter(|v| v.alive) {
+                let held = (v.weapon != 255).then_some(Held::Stick([38, 38, 42]));
+                model.extend(crate::player_model::build(&crate::player_model::Pose {
+                    feet: v.pos,
+                    yaw: v.yaw,
+                    pitch: v.pitch,
+                    walk: time * v.speed * 2.6,
+                    swing: (v.speed / 4.3).min(1.0),
+                    crouch: v.crouch,
+                    light: self.hand_light,
+                    held,
+                }));
+            }
+            // Bombe sur le dos de celui qui la porte.
+            for v in n.views().iter().filter(|v| v.alive) {
+                if v.flags & minelib_net::game::FLAG_BOMB != 0 {
+                    let back = Vec3::new(-v.yaw.sin(), 0.0, v.yaw.cos()) * 0.3;
+                    model.extend(crate::player_model::bomb(
+                        v.pos + back + Vec3::Y * 1.1,
+                        false,
+                        self.hand_light,
+                    ));
+                }
+            }
+            // Armes au sol.
+            for g in n.ground() {
+                let len = crate::weapons::WEAPONS
+                    .get(g.weapon as usize)
+                    .map_or(0.6, |w| w.length);
+                model.extend(crate::player_model::gun_on_ground(
+                    Vec3::from(g.pos),
+                    len,
+                    g.id as f32 * 1.7,
+                    self.hand_light,
+                ));
+            }
+            // Bombe posée ou lâchée : le voyant clignote, de plus en plus vite.
+            let hud = n.hud();
+            use minelib_net::game::bomb;
+            if matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED) {
+                let rate = if hud.bomb == bomb::PLANTED {
+                    1.0 + (40.0 - hud.time).max(0.0) / 8.0
+                } else {
+                    0.0
+                };
+                let blink = rate > 0.0 && (time * rate).fract() < 0.3;
+                model.extend(crate::player_model::bomb(
+                    Vec3::from(hud.bomb_pos),
+                    blink,
+                    self.hand_light,
+                ));
+            }
+        }
+        if let Some(b) = &self.build {
+            for o in b.others.values() {
+                model.extend(crate::player_model::build(&crate::player_model::Pose {
+                    feet: o.pos,
+                    yaw: o.yaw,
+                    pitch: o.pitch,
+                    walk: time * o.speed * 2.6,
+                    swing: (o.speed / 4.3).min(1.0),
+                    crouch: o.crouch,
+                    light: self.hand_light,
+                    held: None,
+                }));
+            }
+        }
         // Le joueur se voit dans les miroirs (et l'eau, le métal), même à la 1re personne.
         let ray_boxes = if visible {
             crate::player_model::ray_boxes(&pose)
         } else {
             Vec::new()
         };
-        let hand = if fps_mode {
+        let hand = if self.spectating.is_some() {
+            Vec::new()
+        } else if fps_mode {
             // Arme en main, puis balles traçantes, étincelles et impacts dans le monde.
             let mut v = self.fps.viewmodel(renderer.aspect(), self.hand_light);
             let proj =
@@ -2329,6 +3609,62 @@ fn selection_lines(
         );
     }
     out
+}
+
+/// Portée du chat vocal de proximité (construction), en blocs.
+const VOICE_RANGE: f32 = 48.0;
+
+/// Cadre du tableau des scores : (x, y, largeur).
+fn scoreboard_frame(size: (f32, f32)) -> (f32, f32, f32) {
+    let s = (size.1 / 360.0).floor().max(1.0);
+    let w = (420.0 * s).min(size.0 - 80.0 * s);
+    ((size.0 - w) / 2.0 - 35.0 * s, size.1 * 0.12, w)
+}
+
+/// Lignes des joueurs du tableau des scores et leur hauteur à l'écran (même ordre que
+/// le dessin : CT puis T).
+fn scoreboard_lines(
+    size: (f32, f32),
+    rows: &[minelib_net::game::ScoreRow],
+) -> Vec<(minelib_net::game::ScoreRow, f32)> {
+    use minelib_net::game::{CT, T};
+    let s = (size.1 / 360.0).floor().max(1.0);
+    let row = 11.0 * s;
+    let (_, mut y, _) = scoreboard_frame(size);
+    y += 30.0 * s;
+    let mut out = Vec::new();
+    for team in [CT, T] {
+        y += row;
+        for r in rows.iter().filter(|r| r.team == team) {
+            out.push((r.clone(), y));
+            y += row;
+        }
+        y += 4.0 * s;
+    }
+    out
+}
+
+/// Couleur d'une équipe (CT bleu, T orangé).
+fn team_color(team: u8) -> [f32; 4] {
+    if team == minelib_net::game::CT {
+        [0.45, 0.65, 1.0, 1.0]
+    } else {
+        [1.0, 0.72, 0.3, 1.0]
+    }
+}
+
+/// Côté qu'occupait l'équipe de départ `start` à la manche `i` (0 = première) : les
+/// équipes changent de côté après la manche 12, puis toutes les 3 manches en
+/// prolongations.
+fn side_of_start(start: u8, i: u32) -> u8 {
+    let swaps = (1..=i)
+        .filter(|&n| n == 12 || (n >= 24 && (n - 24) % 3 == 0))
+        .count();
+    if swaps % 2 == 0 {
+        start
+    } else {
+        1 - start
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,57 @@
+# Publication automatique : à chaque envoi sur GitHub, si le numéro de version du jeu
+# (`VERSION` dans crates/app/src/update.rs) n'a pas encore de Release, GitHub compile le
+# jeu pour Windows et publie la Release `vNN` avec l'exécutable. Les jeux installés la
+# voient et se mettent à jour tout seuls.
+name: Release
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Numéro de version
+        id: v
+        shell: bash
+        run: |
+          n=$(grep -oE 'pub const VERSION: u32 = [0-9]+' crates/app/src/update.rs | grep -oE '[0-9]+$')
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          if gh release view "v$n" >/dev/null 2>&1; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Rust
+        if: steps.v.outputs.exists == '0'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compilation
+        if: steps.v.outputs.exists == '0'
+        run: cargo build --release -p minelib -p minelib-relay
+
+      - name: Publication
+        if: steps.v.outputs.exists == '0'
+        shell: bash
+        run: |
+          n=${{ steps.v.outputs.n }}
+          cp target/release/minelib.exe "minelib_v$n.exe"
+          cp target/release/minelib-relay.exe "minelib-relay_v$n.exe"
+          gh release create "v$n" "minelib_v$n.exe" "minelib-relay_v$n.exe" \
+            --title "Minelib v$n" --notes "Version $n (publiée automatiquement)." --latest
+        env:
+          GH_TOKEN: ${{ github.token }}

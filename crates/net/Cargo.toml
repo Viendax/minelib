@@ -1,0 +1,20 @@
+[package]
+name = "minelib-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+snow = "0.9"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

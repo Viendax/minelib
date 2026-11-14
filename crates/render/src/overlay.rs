@@ -702,16 +702,6 @@ impl OverlayRenderer {
         }
     }
 
-    pub(crate) fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        if self.count == 0 {
-            return;
-        }
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.set_vertex_buffer(0, self.buffer.slice(..));
-        pass.draw(0..self.count, 0..1);
-    }
-
     /// Une partie des sommets 2D (entre deux objets 3D).
     pub(crate) fn draw_range<'a>(
         &'a self,

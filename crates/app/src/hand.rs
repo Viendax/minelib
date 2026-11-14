@@ -221,6 +221,29 @@ pub fn torch_icon(cx: f32, cy: f32, size: f32, chem: Option<usize>) -> Vec<VmVer
     out
 }
 
+/// Cube blanc en 3D (dessus clair, côtés ombrés), centré en (`cx`, `cy`), large de `size`
+/// pixels : logo du mode construction.
+pub fn white_cube_icon(cx: f32, cy: f32, size: f32) -> Vec<VmVertex> {
+    let k = size / 1.62;
+    let m = Mat4::from_translation(Vec3::new(cx, cy, 0.5))
+        * Mat4::from_scale(Vec3::new(k, -k, 0.02))
+        * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_6)
+        * Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_4)
+        * Mat4::from_translation(Vec3::splat(-0.5));
+    let mut out = Vec::new();
+    push_box(
+        &mut out,
+        m,
+        Vec3::ZERO,
+        Vec3::ONE,
+        None,
+        [1.0; 3],
+        [1.0; 3],
+        false,
+    );
+    out
+}
+
 /// Icône 3D d'un bloc pour l'interface (vue isométrique, en pixels d'écran), centrée en
 /// (`cx`, `cy`) et large de `size` pixels. Dessinée par la carte avec les vraies textures
 /// des blocs : nette à toutes les tailles d'écran (plus d'image pré-calculée agrandie).

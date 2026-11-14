@@ -98,6 +98,37 @@ pub enum Sel {
 pub enum BuyItem {
     Weapon(usize),
     Nade(Nade),
+    /// Gilet, gilet + casque, kit de désamorçage (`game::ITEM_…`).
+    Gear(u16),
+}
+
+/// Équipement de la partie en ligne, tenu par l'hôte (repris de son HUD).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Online {
+    pub team: u8,
+    pub money: u32,
+    pub armor: u8,
+    pub helmet: bool,
+    pub kit: bool,
+    pub can_buy: bool,
+    /// Échauffement : achats gratuits.
+    pub warmup: bool,
+}
+
+const GEAR: [(u16, &str); 3] = [
+    (minelib_net::game::ITEM_KEVLAR, "Gilet"),
+    (minelib_net::game::ITEM_HELMET, "Gilet+casque"),
+    (minelib_net::game::ITEM_KIT, "Kit (CT)"),
+];
+
+fn gear_price(item: u16, o: &Online) -> u32 {
+    use minelib_net::game::{ITEM_HELMET, ITEM_KEVLAR};
+    match item {
+        ITEM_KEVLAR => crate::cs::KEVLAR_PRICE,
+        ITEM_HELMET if o.armor >= 100 => crate::cs::HELMET_PRICE - crate::cs::KEVLAR_PRICE,
+        ITEM_HELMET => crate::cs::HELMET_PRICE,
+        _ => crate::cs::KIT_PRICE,
+    }
 }
 
 /// Icône d'équipement du bas d'écran : ce qu'elle représente et son modèle.
@@ -153,6 +184,10 @@ pub fn spread_deg(
 }
 
 pub struct Fps {
+    /// Tirs de cette image pour le multijoueur : arme, origine, direction de chaque plomb.
+    pub shots: Vec<(u8, Vec3, Vec<Vec3>)>,
+    /// Marqueur de touche (s restantes) et tir à la tête.
+    pub hit_marker: (f32, bool),
     pub hp: u32,
     /// Solde : 0 en solo (les achats ne le changent pas).
     pub money: u32,
@@ -206,6 +241,17 @@ pub struct Fps {
     r8: f32,
     /// Dégâts en fraction de point (feu, explosion) pas encore retirés.
     damage_acc: f32,
+    /// Partie en ligne : argent et équipement venus de l'hôte (les grenades ne blessent
+    /// alors que par l'hôte).
+    pub online: Option<Online>,
+    /// Achats demandés à l'hôte (partie en ligne).
+    pub requests: Vec<u16>,
+    /// Grenades lancées à cette image : (type, position, vitesse), pour les autres joueurs.
+    pub throws: Vec<(u8, Vec3, Vec3)>,
+    /// Explosions de HE à cette image : (position, lanceur).
+    pub blasts: Vec<(Vec3, u64)>,
+    /// Armes lâchées à cette image (partie en ligne : elles vont au sol).
+    pub dropped: Vec<u8>,
 }
 
 impl Default for Fps {
@@ -231,6 +277,8 @@ impl Fps {
             still: 0.0,
             hold_fire: false,
             sounds: Vec::new(),
+            shots: Vec::new(),
+            hit_marker: (0.0, false),
             cur_spread: 0.0,
             scoped: 0,
             last_bought: None,
@@ -253,7 +301,88 @@ impl Fps {
             toss: 0.0,
             r8: 0.0,
             damage_acc: 0.0,
+            online: None,
+            requests: Vec::new(),
+            throws: Vec::new(),
+            blasts: Vec::new(),
+            dropped: Vec::new(),
         }
+    }
+
+    /// Armes portées (indices, 255 = aucune) : principale, secondaire.
+    pub fn loadout_ids(&self) -> (u8, u8) {
+        (
+            self.primary.map_or(255, |g| g.def as u8),
+            self.secondary.map_or(255, |g| g.def as u8),
+        )
+    }
+
+    /// Partie en ligne : nouvelle manche. `reset` : mort ou changement de côté, on repart
+    /// avec le pistolet de départ de son camp (Glock-18 pour les T, USP-S pour les CT).
+    pub fn new_round(&mut self, reset: bool, team: u8) {
+        if reset {
+            self.respawn();
+            let name = if team == minelib_net::game::T {
+                "Glock-18"
+            } else {
+                "USP-S"
+            };
+            if let Some(i) = WEAPONS.iter().position(|w| w.name == name) {
+                self.secondary = Some(Gun::new(i));
+            }
+            self.last_bought = None;
+        } else {
+            self.hp = MAX_HP;
+            self.reload = None;
+            self.scoped = 0;
+            self.blind = 0.0;
+            // Chargeurs pleins pour la nouvelle manche, comme dans CS.
+            for g in [&mut self.primary, &mut self.secondary]
+                .into_iter()
+                .flatten()
+            {
+                g.mag = WEAPONS[g.def].magazine;
+                g.reserve = WEAPONS[g.def].reserve;
+            }
+        }
+        self.thrown.clear();
+        self.effects.clear();
+    }
+
+    /// Objet acheté (accepté par l'hôte).
+    pub fn give(&mut self, item: u16) {
+        use minelib_net::game::ITEM_NADE;
+        match item {
+            n if (ITEM_NADE..ITEM_NADE + 5).contains(&n) => {
+                self.buy_nade(Nade::ALL[(n - ITEM_NADE) as usize]);
+            }
+            w if (w as usize) < WEAPONS.len() => self.buy(w as usize),
+            _ => {}
+        }
+    }
+
+    /// Grenade lancée par un autre joueur (simulée ici aussi).
+    pub fn add_thrown(&mut self, owner: u64, nade: u8, pos: Vec3, vel: Vec3) {
+        if let Some(&kind) = Nade::ALL.get(nade as usize) {
+            self.thrown.push(Thrown::new(kind, pos, vel, owner));
+        }
+    }
+
+    /// Cases en feu : (position, lanceur).
+    pub fn fire_cells(&self) -> Vec<(Vec3, u64)> {
+        self.effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Fire(cells, _, owner) => Some(cells.iter().map(|c| (*c, *owner))),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Arme en main (indice dans `WEAPONS`), 255 pour le couteau, les grenades ou rien.
+    pub fn held_weapon(&self) -> u8 {
+        self.active().map_or(255, |g| g.def as u8)
     }
 
     fn active(&self) -> Option<&Gun> {
@@ -552,6 +681,9 @@ impl Fps {
         }
         // Lâcher : seulement l'arme principale (on garde toujours un pistolet).
         if c.drop && self.sel == Sel::Primary && self.primary.is_some() {
+            if let Some(g) = self.primary {
+                self.dropped.push(g.def as u8);
+            }
             self.primary = None;
             self.switch(false);
         }
@@ -712,12 +844,14 @@ impl Fps {
             self.still >= SETTLE_S,
         ) + extra;
         let muzzle = self.muzzle_world(eye, yaw, pitch);
+        let mut dirs = Vec::new();
         for _ in 0..def.pellets.max(1) {
             let r = spread.to_radians() * self.random().abs().sqrt();
             let a = self.random() * std::f32::consts::PI;
             let p = pitch + up.to_radians() + r * a.sin();
             let y = yaw + side.to_radians() + r * a.cos();
             let dir = Vec3::new(y.sin() * p.cos(), p.sin(), -y.cos() * p.cos());
+            dirs.push(dir);
             let (dist, hit) = match raycast(world, eye.into(), dir.into(), RANGE) {
                 Some(h) => (h.distance, Some(h)),
                 None => (RANGE, None),
@@ -748,6 +882,7 @@ impl Fps {
                 }
             }
         }
+        self.shots.push((gun.def as u8, eye, dirs));
     }
 
     /// Son venant de `pos` : plus faible avec la distance.
@@ -770,9 +905,18 @@ impl Fps {
             seed ^= seed << 5;
             (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
+        let mut blasts = Vec::new();
         thrown.retain_mut(|t| {
             equip::step_thrown(t, world, dt, &mut sounds);
             if equip::detonates(t, world) {
+                // Hasard propre à la grenade : même fumée chez tous les joueurs.
+                let mut tseed = t.seed;
+                let mut trnd = || {
+                    tseed ^= tseed << 13;
+                    tseed ^= tseed >> 17;
+                    tseed ^= tseed << 5;
+                    (tseed as f32 / u32::MAX as f32) * 2.0 - 1.0
+                };
                 equip::detonate(
                     t,
                     world,
@@ -781,8 +925,11 @@ impl Fps {
                     &mut effects,
                     &mut sounds,
                     &mut hits,
-                    &mut rnd,
+                    &mut trnd,
                 );
+                if t.kind == Nade::He {
+                    blasts.push((t.pos, t.owner));
+                }
                 false
             } else {
                 true
@@ -795,6 +942,11 @@ impl Fps {
         self.effects = effects;
         for (sfx, delay, pos) in sounds {
             self.sound_at(sfx, delay, pos, eye);
+        }
+        self.blasts.extend(blasts);
+        // En ligne, les dégâts des grenades viennent de l'hôte.
+        if self.online.is_some() {
+            hits.damage = 0.0;
         }
         if hits.damage > 0.0 {
             self.damage_acc += hits.damage;
@@ -821,6 +973,13 @@ impl Fps {
         self.swing = 1.0;
         self.knife_cd = if heavy { 1.0 } else { 0.4 };
         let dir = look_dir(yaw, pitch);
+        // En ligne : l'hôte juge si le coup touche quelqu'un.
+        let code = if heavy {
+            crate::netgame::KNIFE_HEAVY
+        } else {
+            crate::netgame::KNIFE_LIGHT
+        };
+        self.shots.push((code, eye, vec![dir]));
         match raycast(world, eye.into(), dir.into(), 2.0) {
             Some(h) => {
                 let n = Vec3::new(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
@@ -851,13 +1010,10 @@ impl Fps {
         }
         let look = look_dir(yaw, pitch);
         let right = Vec3::new(yaw.cos(), 0.0, yaw.sin());
-        self.thrown.push(Thrown {
-            kind,
-            pos: eye + look * 0.3 + right * 0.15 - Vec3::Y * 0.1,
-            vel: equip::throw_velocity(look, lob, c.vel),
-            age: 0.0,
-            still: 0.0,
-        });
+        let pos = eye + look * 0.3 + right * 0.15 - Vec3::Y * 0.1;
+        let vel = equip::throw_velocity(look, lob, c.vel);
+        self.thrown.push(Thrown::new(kind, pos, vel, 0));
+        self.throws.push((kind.index() as u8, pos, vel));
         self.sounds.push((Sfx::Pin, 0.0, 1.0));
         self.sounds.push((Sfx::Throw, 0.05, 1.0));
         self.toss = 1.0;
@@ -1122,7 +1278,7 @@ impl Fps {
                 }
                 // Fumigène : dessinée en volume par la carte graphique (voir `smokes`).
                 Effect::Smoke(_) => {}
-                Effect::Fire(cells, a) => {
+                Effect::Fire(cells, a, _) => {
                     let fade = ((7.0 - a) / 1.0).clamp(0.0, 1.0);
                     for (i, c) in cells.iter().enumerate() {
                         if !seen(*c + Vec3::Y * 0.3) {
@@ -1299,8 +1455,28 @@ impl Fps {
                 8.0 * s,
                 s * 1.5,
                 col([120, 220, 120], 1.0),
-                format!("{} $", self.money),
+                format!("{} $", self.online.map_or(self.money, |o| o.money)),
             );
+        }
+        // Gilet (et casque), kit : à côté de la vie.
+        if let Some(o) = self.online {
+            let mut t = String::new();
+            if o.armor > 0 {
+                t += &format!(
+                    "Gilet {}{}",
+                    o.armor,
+                    if o.helmet { " + casque" } else { "" }
+                );
+            }
+            if o.kit {
+                if !t.is_empty() {
+                    t += "   ";
+                }
+                t += "Kit";
+            }
+            if !t.is_empty() {
+                ui.text(8.0 * s, size.1 - 32.0 * s, s, col([150, 190, 235], 1.0), t);
+            }
         }
         // Viseur de fusil d'assaut (AUG, SG 553) : cercle assombri autour, point rouge.
         if self.scope_mag().is_some() && !self.sniper_scope() {
@@ -1533,6 +1709,23 @@ impl Fps {
         let t = (s * 0.67).round().max(1.0);
         let green = [0.0, 0.85, 0.05, 1.0];
         let outline = [0.0, 0.0, 0.0, 0.6];
+        // Marqueur de touche : petite croix en diagonale (rouge à la tête).
+        if self.hit_marker.0 > 0.0 {
+            let c = if self.hit_marker.1 {
+                [1.0, 0.25, 0.2, 1.0]
+            } else {
+                [1.0, 1.0, 1.0, 1.0]
+            };
+            let a = (self.hit_marker.0 / 0.25).min(1.0);
+            let c = [c[0], c[1], c[2], a];
+            for k in 0..4 {
+                let (dx, dy) = [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)][k];
+                for i in 0..4 {
+                    let d = (4.0 + i as f32) * s;
+                    ui.rect(cx + dx * d - s / 2.0, cy + dy * d - s / 2.0, s, s, c);
+                }
+            }
+        }
         let half = (t / 2.0).floor();
         let bars = [
             (cx - gap - len, cy - half, len, t),
@@ -1586,7 +1779,52 @@ impl Fps {
         for (k, n) in Nade::ALL.into_iter().enumerate() {
             v.push((BuyItem::Nade(n), heavy, below + k));
         }
+        for (k, (g, _)) in GEAR.into_iter().enumerate() {
+            v.push((BuyItem::Gear(g), heavy, below + Nade::ALL.len() + k));
+        }
         v
+    }
+
+    /// Prix, possédé, achetable (camp, argent, temps et zone d'achat en ligne).
+    fn buy_state(&self, item: BuyItem) -> (u32, bool, bool) {
+        let (price, owned, mut ok) = match item {
+            BuyItem::Weapon(i) => (
+                WEAPONS[i].price,
+                self.primary.is_some_and(|g| g.def == i)
+                    || self.secondary.is_some_and(|g| g.def == i),
+                true,
+            ),
+            BuyItem::Nade(n) => (n.price(), self.nades[n.index()] > 0, self.can_buy_nade(n)),
+            BuyItem::Gear(g) => {
+                let o = self.online.unwrap_or_default();
+                let owned = match g {
+                    minelib_net::game::ITEM_KEVLAR => o.armor >= 100,
+                    minelib_net::game::ITEM_HELMET => o.armor >= 100 && o.helmet,
+                    _ => o.kit,
+                };
+                let side_ok = g != minelib_net::game::ITEM_KIT || o.team == minelib_net::game::CT;
+                (
+                    gear_price(g, &o),
+                    owned,
+                    side_ok && !owned && self.online.is_some(),
+                )
+            }
+        };
+        if let Some(o) = self.online {
+            if let BuyItem::Weapon(i) = item {
+                ok &= WEAPONS[i].side().is_none_or(|s| s == o.team);
+            }
+            ok &= o.can_buy && (o.warmup || o.money >= price);
+        }
+        (price, owned, ok)
+    }
+
+    fn item_code(item: BuyItem) -> u16 {
+        match item {
+            BuyItem::Weapon(i) => i as u16,
+            BuyItem::Nade(n) => minelib_net::game::ITEM_NADE + n.index() as u16,
+            BuyItem::Gear(g) => g,
+        }
     }
 
     fn buy_cells_rows() -> usize {
@@ -1604,6 +1842,19 @@ impl Fps {
 
     /// Clic dans le menu d'achat.
     pub fn buy_click(&mut self, size: (f32, f32), cursor: (f32, f32)) {
+        // En ligne : la demande part à l'hôte, qui vérifie l'argent et donne l'objet.
+        if self.online.is_some() {
+            if let Some(item) = Self::buy_at(size, cursor.0, cursor.1) {
+                if self.buy_state(item).2 {
+                    self.requests.push(Self::item_code(item));
+                    if matches!(item, BuyItem::Weapon(_)) {
+                        self.buy_open = false;
+                    }
+                }
+                self.hold_fire = true;
+            }
+            return;
+        }
         match Self::buy_at(size, cursor.0, cursor.1) {
             // Solo : prix affiché, mais rien n'est débité (le solde reste à 0).
             Some(BuyItem::Weapon(i)) => {
@@ -1616,7 +1867,7 @@ impl Fps {
                 self.buy_nade(n);
                 self.hold_fire = true;
             }
-            None => {}
+            Some(BuyItem::Gear(_)) | None => {}
         }
     }
 
@@ -1638,7 +1889,12 @@ impl Fps {
             col([240, 240, 240], 1.0),
             "Menu d'achat",
         );
-        let solde = format!("Solde : {} $   (solo : achats gratuits)", self.money);
+        let solde = match self.online {
+            Some(o) if o.warmup => "Échauffement : achats gratuits".to_string(),
+            Some(o) if !o.can_buy => format!("Solde : {} $   (achats fermés)", o.money),
+            Some(o) => format!("Solde : {} $", o.money),
+            None => format!("Solde : {} $   (solo : achats gratuits)", self.money),
+        };
         let tw = Ui::text_width(&solde, s);
         ui.text(
             px + w - tw - 8.0 * s,
@@ -1665,23 +1921,22 @@ impl Fps {
         for (item, ci, k) in Self::buy_grid() {
             let x = px + 8.0 * s + ci as f32 * cw;
             let y = py + 28.0 * s + k as f32 * rh;
-            let (name, price, owned, enabled) = match item {
-                BuyItem::Weapon(i) => (
-                    WEAPONS[i].name.to_string(),
-                    WEAPONS[i].price,
-                    self.primary.is_some_and(|g| g.def == i)
-                        || self.secondary.is_some_and(|g| g.def == i),
-                    true,
-                ),
+            let (price, owned, enabled) = self.buy_state(item);
+            let name = match item {
+                BuyItem::Weapon(i) => WEAPONS[i].name.to_string(),
                 BuyItem::Nade(n) => {
                     let have = self.nades[n.index()];
-                    let name = if have > 0 {
+                    if have > 0 {
                         format!("{} x{}", n.name(), have)
                     } else {
                         n.name().to_string()
-                    };
-                    (name, n.price(), have > 0, self.can_buy_nade(n))
+                    }
                 }
+                BuyItem::Gear(g) => GEAR
+                    .iter()
+                    .find(|(c, _)| *c == g)
+                    .map_or("?", |(_, n)| n)
+                    .to_string(),
             };
             let bg = if hover == Some(item) && enabled {
                 col([70, 90, 120], 0.95)
@@ -1696,6 +1951,7 @@ impl Fps {
             let tris: Vec<weapons::Tri> = match item {
                 BuyItem::Weapon(i) => weapons::model(i).tris.clone(),
                 BuyItem::Nade(n) => equip::nade_model(n),
+                BuyItem::Gear(_) => Vec::new(),
             };
             ui.model(icon_3d(
                 &tris,
@@ -1743,6 +1999,13 @@ impl Fps {
                 n.name(),
                 n.max()
             ),
+            Some(BuyItem::Gear(minelib_net::game::ITEM_KIT)) => {
+                "Kit de désamorçage (CT) : désamorce en 5 s au lieu de 10.".to_string()
+            }
+            Some(BuyItem::Gear(minelib_net::game::ITEM_HELMET)) => {
+                "Gilet + casque : protège le corps et la tête.".to_string()
+            }
+            Some(BuyItem::Gear(_)) => "Gilet : protège le corps (pas la tête).".to_string(),
             None => String::new(),
         };
         ui.text(

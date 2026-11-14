@@ -36,11 +36,15 @@
 // Windows : pas de fenêtre de console à côté du jeu (le journal va dans .minelib/logs).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod account;
 mod audio;
+mod buildnet;
 mod chat;
+mod cs;
 mod debug;
 mod equip;
 mod fps;
+mod fpsmap;
 mod gpu_plan;
 mod gpu_report;
 mod hand;
@@ -49,11 +53,15 @@ mod jobs;
 mod keys;
 mod mcimport;
 mod menu;
+mod multiplayer;
+mod netgame;
 mod player;
 mod player_model;
 mod save;
 mod session;
 mod streaming;
+mod update;
+mod voice;
 mod wand;
 mod weapons;
 mod worldedit;
@@ -84,6 +92,15 @@ enum Screen {
     Loading,
     Playing,
     Paused,
+    /// Multijoueur : choix du mode, puis liste des parties de ce mode.
+    Multiplayer,
+    Servers(multiplayer::Kind),
+    /// FPS : classement et choix de la carte.
+    FpsHome,
+    /// Compte : accueil, connexion, inscription, profil, double authentification.
+    Account(account::Page),
+    /// Choix du monde à ouvrir en construction en ligne.
+    HostPick,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +110,28 @@ enum Field {
 }
 
 struct Game {
+    /// Compte du joueur et dialogue avec le relais.
+    accounts: account::Accounts,
+    /// Écran où aller une fois connecté.
+    after_login: Screen,
+    /// Parties annoncées par le relais (vide tant que le réseau n'existe pas) et ligne
+    /// choisie dans la liste.
+    servers: Vec<multiplayer::ServerInfo>,
+    server_selected: Option<usize>,
+    fps_home: multiplayer::FpsHome,
+    fps_home_maps_seen: usize,
+    map_rows: Vec<multiplayer::MapRow>,
+    sig_cache: fpsmap::SigCache,
+    /// Recherche FPS en cours : carte (signature, nom, dossier s'il est là).
+    searching: Option<([u8; 32], String, Option<PathBuf>)>,
+    /// Monde de construction rejoint mais pas encore téléchargé : (signature, nom, hôte).
+    pending_build: Option<([u8; 32], String, String)>,
+    fps_status: Option<String>,
+    /// Mise à jour automatique (GitHub).
+    updater: update::Updater,
+    /// Un monde a été ouvert depuis le lancement (plus de mise à jour automatique sans
+    /// demander : bouton sur l'accueil).
+    played: bool,
     renderer: Option<Renderer>,
     paths: Paths,
     options: Options,
@@ -180,13 +219,32 @@ impl Game {
         let view_distance = env_parse("MINELIB_VIEW")
             .unwrap_or(options.render_distance)
             .clamp(2, session::MAX_VIEW_DISTANCE);
+        let accounts = account::Accounts::new(
+            options.relay.clone(),
+            &options.relay_key,
+            paths.root.join("relay"),
+            options.pseudo.clone(),
+        );
         Ok(Self {
+            accounts,
+            after_login: Screen::Title,
+            servers: Vec::new(),
+            server_selected: None,
+            fps_home: multiplayer::FpsHome::default(),
+            fps_home_maps_seen: usize::MAX,
+            map_rows: Vec::new(),
+            sig_cache: fpsmap::SigCache::default(),
+            searching: None,
+            pending_build: None,
+            fps_status: None,
+            updater: update::Updater::new(),
+            played: false,
             renderer: None,
             worlds: save::list_worlds(&paths.saves),
             paths,
             options,
             startup_pack: Some(pack),
-            screen: Screen::Title,
+            screen: Screen::Account(account::Page::Welcome),
             packs_return: Screen::Title,
             settings_return: Screen::Title,
             slider_drag: None,
@@ -282,10 +340,12 @@ impl Game {
     fn play(&mut self, dir: PathBuf) {
         // Nouveau monde : rien de l'ancien ne doit rester à l'écran.
         self.session = None;
+        self.played = true;
         // Le rendu est emprunté pendant l'image : on vide ses maillages en fin d'image.
         self.clear_meshes = true;
         match Session::open(dir, self.config) {
             Ok(mut s) => {
+                s.voice_volumes = load_volumes(&self.paths.root.join("voice.txt"));
                 s.sensitivity = self.options.sensitivity;
                 s.volume = self.options.volume;
                 s.keys = self.keys.clone();
@@ -299,8 +359,17 @@ impl Game {
     /// Enregistre et ferme le monde en cours.
     fn leave_world(&mut self) {
         if let Some(mut s) = self.session.take() {
-            if let Err(e) = s.save() {
-                log::error!("sauvegarde impossible : {e:#}");
+            // Partie en ligne : on la quitte ; un invité n'enregistre pas la carte de l'hôte.
+            // Partie FPS en ligne : la carte ne change pas (sa signature non plus).
+            let online = s.net.is_some();
+            let guest_build = s.build.as_ref().is_some_and(|b| !b.is_owner());
+            if online || s.build.is_some() {
+                self.accounts.room(minelib_net::client::Cmd::Leave);
+            }
+            if !online && !guest_build {
+                if let Err(e) = s.save() {
+                    log::error!("sauvegarde impossible : {e:#}");
+                }
             }
         }
         // Le rendu est emprunté pendant l'image : on vide ses maillages en fin d'image.
@@ -377,6 +446,21 @@ impl Game {
         let step = 24.0 * s;
         let solo = c.button("Solo", cx, y, 200.0, true);
         y += step;
+        let multi = c.button("Multijoueur", cx, y, 200.0, true);
+        // Compte, en haut à droite : pseudo connecté ou invitation à se connecter.
+        let account_label = match &self.accounts.account {
+            Some(a) => format!("Compte : {}", a.pseudo),
+            None => "Hors ligne - Se connecter".to_string(),
+        };
+        let aw = (Ui::text_width(&account_label, s) / s + 16.0).max(100.0);
+        let account = c.button(
+            &account_label,
+            c.w - (aw / 2.0 + 6.0) * s,
+            6.0 * s,
+            aw,
+            true,
+        );
+        y += step;
         let settings = c.button("Paramètres", cx, y, 200.0, true);
         y += step * 1.5;
         let quit = c.button("Quitter le jeu", cx, y, 200.0, true);
@@ -386,8 +470,23 @@ impl Game {
             c.h - 10.0 * ds - 2.0 * s,
             ds,
             GREY,
-            format!("Minelib {}", env!("CARGO_PKG_VERSION")),
+            format!("Minelib v{}", update::VERSION),
         );
+        // Nouvelle version publiée : bouton en haut à gauche.
+        let mut do_update = false;
+        if let Some(r) = &self.updater.available {
+            let label = format!("Mettre à jour (v{})", r.version);
+            do_update = c.button(
+                &label,
+                6.0 * s + 60.0 * s,
+                6.0 * s,
+                120.0,
+                !self.updater.busy(),
+            );
+        }
+        if let Some(t) = &self.updater.status {
+            c.ui.text(6.0 * s, 30.0 * s, ds, GOLD, t.clone());
+        }
         let credit = "Textures : VoxelArt Libre (CC BY 4.0 / CC0) - voir CREDITS.txt";
         let tw = Ui::text_width(credit, ds);
         c.ui.text(
@@ -401,12 +500,607 @@ impl Game {
             self.refresh_worlds();
             self.screen = Screen::Solo;
         }
+        if multi {
+            if self.accounts.logged_in() {
+                self.screen = Screen::Multiplayer;
+            } else {
+                self.after_login = Screen::Multiplayer;
+                self.goto_account(account::Page::Welcome);
+            }
+        }
+        if account {
+            if self.accounts.logged_in() {
+                self.after_login = Screen::Title;
+                self.goto_account(account::Page::Profile);
+            } else {
+                self.after_login = Screen::Title;
+                self.goto_account(account::Page::Welcome);
+            }
+        }
         if settings {
             self.settings_return = Screen::Title;
             self.screen = Screen::Settings;
         }
+        if do_update {
+            self.updater.start();
+        }
         if quit {
             self.quit = true;
+        }
+    }
+
+    /// Choix de la carte (un monde de `saves`) pour héberger une partie FPS.
+    fn host_pick_screen(&mut self, input: &Input, size: (u32, u32)) {
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        c.background();
+        let s = c.s;
+        c.text_center(
+            "Ouvrir un monde en construction en ligne",
+            12.0 * s,
+            s * 2.0,
+            WHITE,
+        );
+        let list_w = 280.0 * s;
+        let list_x = (c.w - list_w) / 2.0;
+        let list_y = 36.0 * s;
+        let row_h = 24.0 * s;
+        let list_h = (c.h - 64.0 * s - list_y).max(row_h);
+        c.frame(list_x, list_y, list_w, list_h);
+        let ds = (s / 2.0).floor().max(1.0);
+        c.text_center(
+            "Le monde est envoyé au relais : les joueurs le téléchargent en rejoignant.",
+            list_y + list_h + 4.0 * s,
+            ds,
+            GREY,
+        );
+        let visible = ((list_h - 4.0 * s) / row_h).floor() as usize;
+        let mut chosen = None;
+        for (i, w) in self
+            .worlds
+            .iter()
+            .filter(|w| !w.minecraft)
+            .take(visible)
+            .enumerate()
+        {
+            let y = list_y + 2.0 * s + i as f32 * row_h;
+            let detail = format!("graine {}", w.meta.seed);
+            if c.list_row(
+                list_x + 2.0 * s,
+                y,
+                list_w - 4.0 * s,
+                row_h - s,
+                &w.meta.name,
+                &detail,
+                false,
+            ) {
+                chosen = Some(w.dir.clone());
+            }
+        }
+        let back = c.button("Retour", c.w / 2.0, c.h - 28.0 * s, 150.0, true);
+        if let Some(dir) = chosen {
+            self.host_build(dir);
+        } else if back || input.pressed(KeyCode::Escape) {
+            self.screen = Screen::Servers(multiplayer::Kind::Build);
+        }
+    }
+
+    fn goto_account(&mut self, page: account::Page) {
+        self.accounts.enter(page);
+        self.screen = Screen::Account(page);
+    }
+
+    fn account_screen(&mut self, input: &Input, size: (u32, u32), page: account::Page) {
+        let time = self.time;
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        match self.accounts.screen(&mut c, input, page, time) {
+            account::Outcome::None => {}
+            account::Outcome::Goto(p) => self.goto_account(p),
+            account::Outcome::Leave => {
+                // Hors ligne : seulement le solo.
+                let target = if self.accounts.logged_in() {
+                    self.after_login
+                } else {
+                    Screen::Title
+                };
+                self.after_login = Screen::Title;
+                self.screen = target;
+                if let Screen::Servers(kind) = target {
+                    self.accounts.refresh_servers(kind as u8);
+                }
+            }
+        }
+    }
+
+    /// Événements de partie en ligne reçus du relais.
+    fn handle_game_events(&mut self) {
+        use minelib_net::client::{Cmd, Event};
+        for e in std::mem::take(&mut self.accounts.game_events) {
+            match &e {
+                Event::Hosted(room) => {
+                    if let Some((sig, name, Some(dir))) = self.searching.take() {
+                        self.fps_status = None;
+                        self.host_world(dir.clone(), sig);
+                        // La carte part au relais (s'il ne l'a pas) pour les suivants.
+                        if let Ok(p) = fpsmap::package(&dir) {
+                            self.accounts.room(Cmd::UploadMap {
+                                sig,
+                                name,
+                                bytes: p.to_bytes(),
+                            });
+                        }
+                        log::info!("partie FPS {room} ouverte, en attente de joueurs");
+                    } else if let Some(s) = &mut self.session {
+                        s.chat.say(
+                            format!("Monde ouvert en ligne (partie n° {room})."),
+                            chat::YELLOW,
+                        );
+                    }
+                }
+                Event::Joined {
+                    map, host, map_sig, ..
+                } => {
+                    let fps = self.searching.is_some();
+                    let searched = self.searching.take().and_then(|s| s.2);
+                    let dir = searched.or_else(|| self.local_map(map_sig));
+                    match dir {
+                        Some(dir) if fps => {
+                            self.fps_status = None;
+                            self.join_world(dir, *map_sig, host.clone());
+                        }
+                        Some(dir) => self.join_build(dir, host.clone()),
+                        None => {
+                            // Monde pas encore sur ce PC : on le télécharge d'abord.
+                            self.fps_status = Some(format!("Téléchargement de « {map} »…"));
+                            self.pending_build = Some((*map_sig, map.clone(), host.clone()));
+                            self.accounts.room(Cmd::DownloadMap(*map_sig));
+                        }
+                    }
+                }
+                Event::MapProgress(_, f, up) => {
+                    if self.session.is_none() {
+                        let what = if *up { "Envoi" } else { "Téléchargement" };
+                        self.fps_status = Some(format!("{what} de la carte : {:.0} %", f * 100.0));
+                    }
+                }
+                Event::MapUploaded(_) => log::info!("carte envoyée au relais"),
+                Event::MapDownloaded { sig, bytes } => {
+                    let name = self
+                        .map_rows
+                        .iter()
+                        .find(|m| m.sig == *sig)
+                        .map(|m| m.name.clone())
+                        .or_else(|| self.pending_build.as_ref().map(|p| p.1.clone()))
+                        .unwrap_or_else(|| "Carte".into());
+                    match fpsmap::unpack(&self.paths.root.join("maps"), &name, bytes) {
+                        Ok(dir) => {
+                            if let Some((_, _, host)) = self.pending_build.take() {
+                                self.fps_status = None;
+                                self.join_build(dir, host);
+                            } else if let Some(search) = &mut self.searching {
+                                search.2 = Some(dir);
+                                self.fps_status = Some("Recherche d'une partie…".into());
+                                self.accounts.room(Cmd::Search {
+                                    map_sig: *sig,
+                                    map: name,
+                                });
+                            }
+                        }
+                        Err(e) => self.fps_status = Some(format!("Carte illisible : {e:#}")),
+                    }
+                }
+                Event::MapFailed(_, m) => {
+                    self.searching = None;
+                    if self.pending_build.take().is_some() {
+                        self.accounts.room(Cmd::Leave);
+                    }
+                    self.fps_status = Some(format!("Carte : {m}"));
+                    self.notify(format!("Carte : {m}"));
+                }
+                Event::Reported(p) => {
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(
+                            format!("{p} est signalé : tu ne joueras plus avec ce joueur."),
+                            chat::YELLOW,
+                        );
+                    }
+                }
+                Event::BanDone(p) => {
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(
+                            format!("{p} est banni : compte à vie, machines pour 3 mois."),
+                            chat::YELLOW,
+                        );
+                    }
+                }
+                Event::Unreported(p) => {
+                    if let Some(s) = &mut self.session {
+                        s.chat
+                            .say(format!("Signalement de {p} annulé."), chat::YELLOW);
+                    }
+                }
+                Event::Friends(list) => {
+                    if let Some(s) = &mut self.session {
+                        let t = if list.is_empty() {
+                            "Aucun ami pour l'instant (/ami <pseudo>).".to_string()
+                        } else {
+                            format!("Amis : {}", list.join(", "))
+                        };
+                        s.chat.say(t, chat::YELLOW);
+                    }
+                    if self.screen == Screen::FpsHome {
+                        self.accounts.room(Cmd::Leaderboard { friends: true });
+                    }
+                }
+                Event::RoomClosed => {
+                    let online = self
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.net.is_some() || s.build.is_some());
+                    if online {
+                        self.leave_world();
+                        self.notify("L'hôte a fermé la partie.".to_string());
+                    }
+                }
+                Event::Error(m) => {
+                    if self.searching.take().is_some() || self.screen == Screen::FpsHome {
+                        self.fps_status = Some(m.clone());
+                    }
+                    if let Some(s) = &mut self.session {
+                        if s.net.is_some() || s.build.is_some() {
+                            s.chat.say(m.clone(), chat::RED);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(s) = &mut self.session {
+                        s.net_event(&e);
+                    }
+                }
+            }
+        }
+        if let Some(s) = &mut self.session {
+            if let Some(started) = s.room_started.take() {
+                self.accounts.room(Cmd::RoomStarted(started));
+            }
+            // Résultat de la partie : chaque joueur l'envoie, le relais les compare.
+            if let Some(summary) = s.match_result.take() {
+                self.accounts
+                    .room(Cmd::MatchResult(minelib_net::game::encode(&summary)));
+            }
+            for cmd in std::mem::take(&mut s.relay_cmds) {
+                self.accounts.room(cmd);
+            }
+            if std::mem::take(&mut s.voice_dirty) {
+                save_volumes(&self.paths.root.join("voice.txt"), &s.voice_volumes);
+            }
+        }
+    }
+
+    /// Dossier d'une carte de ce PC, par sa signature.
+    fn local_map(&mut self, sig: &[u8; 32]) -> Option<PathBuf> {
+        if let Some(d) = self
+            .map_rows
+            .iter()
+            .find(|m| m.sig == *sig)
+            .and_then(|m| m.local.clone())
+        {
+            return Some(d);
+        }
+        let dir = fpsmap::downloaded_dir(&self.paths.root.join("maps"), sig);
+        if dir.join("level.txt").exists() {
+            return Some(dir);
+        }
+        let worlds = self.local_worlds();
+        worlds
+            .into_iter()
+            .map(|(d, _)| d)
+            .find(|d| self.sig_cache.signature(d).as_ref() == Some(sig))
+    }
+
+    /// Mondes de ce PC utilisables comme cartes : `saves` et cartes téléchargées.
+    fn local_worlds(&self) -> Vec<(PathBuf, String)> {
+        let mut v: Vec<(PathBuf, String)> = save::list_worlds(&self.paths.saves)
+            .into_iter()
+            .filter(|w| !w.minecraft)
+            .map(|w| (w.dir, w.meta.name))
+            .collect();
+        v.extend(
+            save::list_worlds(&self.paths.root.join("maps"))
+                .into_iter()
+                .map(|w| (w.dir, w.meta.name)),
+        );
+        v
+    }
+
+    /// Écran FPS : classement et cartes à jour.
+    fn open_fps_home(&mut self) {
+        use minelib_net::client::Cmd;
+        self.fps_status = None;
+        self.searching = None;
+        self.accounts.room(Cmd::Maps);
+        self.accounts.room(Cmd::Leaderboard {
+            friends: self.fps_home.friends_tab,
+        });
+        self.rebuild_map_rows();
+        self.screen = Screen::FpsHome;
+    }
+
+    /// Cartes de ce PC et du relais, chacune une seule fois (signature).
+    fn rebuild_map_rows(&mut self) {
+        let mut rows: Vec<multiplayer::MapRow> = Vec::new();
+        for (dir, name) in self.local_worlds() {
+            let Some(sig) = self.sig_cache.signature(&dir) else {
+                continue;
+            };
+            if rows.iter().any(|r| r.sig == sig) {
+                continue;
+            }
+            let fps = fpsmap::load(&dir);
+            rows.push(multiplayer::MapRow {
+                sig,
+                name,
+                author: self.accounts.pseudo(),
+                local: Some(dir),
+                waiting: 0,
+                plays: 0,
+                configured: fps.ct.is_some() && fps.t.is_some(),
+            });
+        }
+        for m in &self.accounts.maps {
+            match rows.iter_mut().find(|r| r.sig == m.sig) {
+                Some(r) => {
+                    r.waiting = m.waiting;
+                    r.plays = m.plays;
+                    r.author = m.author.clone();
+                }
+                None if m.stored => rows.push(multiplayer::MapRow {
+                    sig: m.sig,
+                    name: m.name.clone(),
+                    author: m.author.clone(),
+                    local: None,
+                    waiting: m.waiting,
+                    plays: m.plays,
+                    configured: true,
+                }),
+                None => {}
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.waiting
+                .cmp(&a.waiting)
+                .then(b.plays.cmp(&a.plays))
+                .then(a.name.cmp(&b.name))
+        });
+        self.map_rows = rows;
+    }
+
+    fn fps_home_screen(&mut self, input: &Input, size: (u32, u32)) {
+        use minelib_net::client::Cmd;
+        // Liste du relais reçue : on refait la liste des cartes.
+        let relay_maps = self.accounts.maps.len();
+        if relay_maps != self.fps_home_maps_seen {
+            self.fps_home_maps_seen = relay_maps;
+            self.rebuild_map_rows();
+        }
+        let time = self.time;
+        let busy = self.searching.is_some();
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        let action = multiplayer::fps_screen(
+            &mut c,
+            input,
+            &mut self.fps_home,
+            self.accounts.leaderboard.as_ref(),
+            &self.map_rows,
+            self.fps_status.as_deref(),
+            busy,
+            time,
+        );
+        match action {
+            multiplayer::FpsAction::Back => {
+                self.searching = None;
+                self.screen = Screen::Multiplayer;
+            }
+            multiplayer::FpsAction::Refresh => {
+                self.sig_cache = fpsmap::SigCache::default();
+                self.open_fps_home();
+            }
+            multiplayer::FpsAction::Tab(friends) => {
+                self.accounts.room(Cmd::Leaderboard { friends });
+            }
+            multiplayer::FpsAction::AddFriend(p) => {
+                self.accounts.room(Cmd::Friend {
+                    pseudo: p,
+                    add: true,
+                });
+            }
+            multiplayer::FpsAction::Search(i) => {
+                if let Some(m) = self.map_rows.get(i).cloned() {
+                    self.searching = Some((m.sig, m.name.clone(), m.local.clone()));
+                    if m.local.is_some() {
+                        self.fps_status = Some("Recherche d'une partie…".into());
+                        self.accounts.room(Cmd::Search {
+                            map_sig: m.sig,
+                            map: m.name,
+                        });
+                    } else {
+                        self.fps_status = Some("Téléchargement de la carte…".into());
+                        self.accounts.room(Cmd::DownloadMap(m.sig));
+                    }
+                }
+            }
+            multiplayer::FpsAction::None => {}
+        }
+    }
+
+    /// Ouvre la partie FPS trouvée par la recherche, dont ce jeu est l'hôte (seul en
+    /// attendant les autres).
+    fn host_world(&mut self, dir: PathBuf, sig: [u8; 32]) {
+        let Some(link) = self.accounts.link.clone() else {
+            self.notify("Connecte-toi d'abord à ton compte.".to_string());
+            return;
+        };
+        let map = fpsmap::load(&dir);
+        self.play(dir);
+        let pseudo = self.accounts.pseudo();
+        if let Some(s) = &mut self.session {
+            s.game.mode = save::GameMode::Fps;
+            s.voice = Some(voice::Voice::new(link.clone()));
+            s.net = Some(netgame::NetGame::host(
+                link,
+                pseudo,
+                map,
+                sig,
+                s.spawn_pos(),
+            ));
+            s.chat.say(
+                "Aucune partie en attente : tu es dans la tienne. Elle commence à 10 joueurs \
+                 (échauffement en attendant).",
+                chat::YELLOW,
+            );
+        }
+    }
+
+    /// Partie FPS rejointe : même carte (signature vérifiée par l'hôte).
+    fn join_world(&mut self, dir: PathBuf, sig: [u8; 32], host: String) {
+        let Some(link) = self.accounts.link.clone() else {
+            return;
+        };
+        self.play(dir);
+        if let Some(s) = &mut self.session {
+            s.game.mode = save::GameMode::Fps;
+            s.voice = Some(voice::Voice::new(link.clone()));
+            s.net = Some(netgame::NetGame::guest(link, sig));
+            s.chat
+                .say(format!("Partie de {host} rejointe."), chat::YELLOW);
+        }
+    }
+
+    /// Ouvre un monde en construction en ligne (ce jeu en est le propriétaire).
+    fn host_build(&mut self, dir: PathBuf) {
+        let Some(link) = self.accounts.link.clone() else {
+            self.notify("Connecte-toi d'abord à ton compte.".to_string());
+            return;
+        };
+        let Ok(p) = fpsmap::package(&dir) else {
+            self.notify("Monde illisible.".to_string());
+            return;
+        };
+        let sig = p.signature();
+        let name = save::list_worlds(&self.paths.saves)
+            .into_iter()
+            .find(|w| w.dir == dir)
+            .map_or_else(|| "Monde".into(), |w| w.meta.name);
+        self.play(dir);
+        let pseudo = self.accounts.pseudo();
+        if let Some(s) = &mut self.session {
+            if s.game.mode == save::GameMode::Fps {
+                s.game.mode = save::GameMode::Creative;
+            }
+            s.voice = Some(voice::Voice::new(link.clone()));
+            s.build = Some(buildnet::BuildNet::new(link, pseudo.clone(), true));
+        }
+        self.accounts.room(minelib_net::client::Cmd::Host {
+            kind: 1,
+            name: format!("{name} ({pseudo})"),
+            map: name.clone(),
+            map_sig: sig,
+            max_players: 0,
+        });
+        self.accounts.room(minelib_net::client::Cmd::UploadMap {
+            sig,
+            name,
+            bytes: p.to_bytes(),
+        });
+    }
+
+    /// Monde de construction rejoint.
+    fn join_build(&mut self, dir: PathBuf, host: String) {
+        let Some(link) = self.accounts.link.clone() else {
+            return;
+        };
+        self.play(dir);
+        let pseudo = self.accounts.pseudo();
+        if let Some(s) = &mut self.session {
+            s.game.mode = save::GameMode::Creative;
+            s.voice = Some(voice::Voice::new(link.clone()));
+            s.build = Some(buildnet::BuildNet::new(link, pseudo, false));
+            s.chat
+                .say(format!("Monde de {host} rejoint."), chat::YELLOW);
+        }
+    }
+
+    /// Réponses du relais, et options à enregistrer (clé du relais, dernier pseudo).
+    fn poll_accounts(&mut self) {
+        self.accounts.poll();
+        let mut changed = false;
+        if let Some(k) = self.accounts.new_relay_key.take() {
+            self.options.relay_key = k;
+            changed = true;
+        }
+        if let Some(p) = self.accounts.new_pseudo.take() {
+            if self.options.pseudo != p {
+                self.options.pseudo = p;
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(e) = self.options.save(&self.paths.options) {
+                log::error!("options : {e:#}");
+            }
+        }
+    }
+
+    fn multiplayer_screen(&mut self, input: &Input, size: (u32, u32)) {
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        match multiplayer::mode_screen(&mut c) {
+            multiplayer::Action::Open(multiplayer::Kind::Fps) => self.open_fps_home(),
+            multiplayer::Action::Open(kind) => {
+                self.server_selected = None;
+                self.accounts.refresh_servers(kind as u8);
+                self.screen = Screen::Servers(kind);
+            }
+            multiplayer::Action::Back => self.screen = Screen::Title,
+            _ => {
+                if input.pressed(KeyCode::Escape) {
+                    self.screen = Screen::Title;
+                }
+            }
+        }
+    }
+
+    fn servers_screen(&mut self, input: &Input, size: (u32, u32), kind: multiplayer::Kind) {
+        self.servers = self
+            .accounts
+            .servers
+            .iter()
+            .map(|e| multiplayer::ServerInfo {
+                name: e.name.clone(),
+                map: e.map.clone(),
+                players: e.players,
+                max_players: e.max_players,
+                ping: 0,
+                region: e.region.clone(),
+            })
+            .collect();
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        let action =
+            multiplayer::list_screen(&mut c, kind, &self.servers, &mut self.server_selected);
+        match action {
+            multiplayer::Action::Refresh => self.accounts.refresh_servers(kind as u8),
+            multiplayer::Action::Join(i) => {
+                if let Some(e) = self.accounts.servers.get(i) {
+                    let id = e.id;
+                    self.accounts.room(minelib_net::client::Cmd::Join(id));
+                }
+            }
+            multiplayer::Action::Create => {
+                self.refresh_worlds();
+                self.screen = Screen::HostPick;
+            }
+            _ => {}
+        }
+        if matches!(action, multiplayer::Action::Back) || input.pressed(KeyCode::Escape) {
+            self.screen = Screen::Multiplayer;
         }
     }
 
@@ -660,7 +1354,16 @@ impl Game {
         let resume = c.button("Reprendre", cx, y, 200.0, true);
         y += 24.0 * s;
         let settings = c.button("Paramètres", cx, y, 200.0, true);
-        let quit = c.button("Sauvegarder et quitter", cx, c.h * 0.72, 200.0, true);
+        let online = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.net.is_some() || s.build.as_ref().is_some_and(|b| !b.is_owner()));
+        let label = if online {
+            "Quitter la partie"
+        } else {
+            "Sauvegarder et quitter"
+        };
+        let quit = c.button(label, cx, c.h * 0.72, 200.0, true);
         if resume {
             self.screen = Screen::Playing;
         }
@@ -1385,6 +2088,11 @@ impl GameLoop for Game {
             }
         }
 
+        // Relais : réponses, partie en ligne.
+        self.poll_accounts();
+        self.handle_game_events();
+        self.updater.poll(!self.played);
+
         // Échap : pause / reprise / fermeture de l'inventaire.
         if input.pressed(KeyCode::Escape) {
             match self.screen {
@@ -1490,6 +2198,7 @@ impl GameLoop for Game {
                 }
             }
         } else {
+            self.poll_accounts();
             match self.screen {
                 Screen::Title => self.title_screen(input, size),
                 Screen::Solo => self.solo_screen(input, size),
@@ -1499,6 +2208,11 @@ impl GameLoop for Game {
                 Screen::Graphics => self.graphics_screen(input, size, false, &mut renderer),
                 Screen::Controls => self.controls_screen(input, size, false),
                 Screen::Loading => self.loading_screen(input, size),
+                Screen::Multiplayer => self.multiplayer_screen(input, size),
+                Screen::Servers(kind) => self.servers_screen(input, size, kind),
+                Screen::Account(page) => self.account_screen(input, size, page),
+                Screen::HostPick => self.host_pick_screen(input, size),
+                Screen::FpsHome => self.fps_home_screen(input, size),
                 Screen::Playing | Screen::Paused => self.screen = Screen::Title,
             }
             self.draw_message(size, dt);
@@ -1534,10 +2248,9 @@ impl GameLoop for Game {
 
     fn ui_open(&self) -> bool {
         match self.screen {
-            Screen::Playing => self
-                .session
-                .as_ref()
-                .is_some_and(|s| s.inventory.open || s.chat.open || s.fps.buy_open),
+            Screen::Playing => self.session.as_ref().is_some_and(|s| {
+                s.inventory.open || s.chat.open || s.fps.buy_open || s.cursor_free
+            }),
             _ => true,
         }
     }
@@ -1731,4 +2444,22 @@ fn main() -> anyhow::Result<()> {
         }
     }
     result
+}
+
+/// Volumes du chat vocal choisis pour chaque joueur (`pseudo=volume`, une ligne chacun).
+fn load_volumes(path: &std::path::Path) -> std::collections::HashMap<String, f32> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            Some((k.trim().to_lowercase(), v.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+fn save_volumes(path: &std::path::Path, v: &std::collections::HashMap<String, f32>) {
+    let mut lines: Vec<String> = v.iter().map(|(k, x)| format!("{k}={x:.2}")).collect();
+    lines.sort();
+    let _ = std::fs::write(path, lines.join("\n") + "\n");
 }

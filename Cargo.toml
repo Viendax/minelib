@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/platform", "crates/render", "crates/world", "crates/assets", "crates/app"]
+members = ["crates/platform", "crates/render", "crates/world", "crates/assets", "crates/net", "crates/relay", "crates/p2p", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,7 +13,7 @@ log = "0.4"
 env_logger = "0.11"
 winit = "0.30"
 wgpu = "25"
-glam = { version = "0.30", features = ["bytemuck"] }
+glam = { version = "0.30", features = ["bytemuck", "serde"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 font8x8 = { version = "0.3", default-features = false }

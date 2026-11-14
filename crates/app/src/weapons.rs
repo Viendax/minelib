@@ -546,6 +546,50 @@ impl WeaponDef {
         self.category != Category::Pistol
     }
 
+    /// Camp qui peut l'acheter (`game::CT` ou `game::T`), `None` pour les deux (CS2).
+    pub fn side(&self) -> Option<u8> {
+        use minelib_net::game::{CT, T};
+        match self.name {
+            "Glock-18" | "Tec-9" | "MAC-10" | "Sawed-Off" | "Galil AR" | "AK-47" | "SG 553"
+            | "G3SG1" => Some(T),
+            "USP-S" | "P2000" | "Five-SeveN" | "MP9" | "MAG-7" | "FAMAS" | "M4A4" | "M4A1-S"
+            | "AUG" | "SCAR-20" => Some(CT),
+            _ => None,
+        }
+    }
+
+    /// Part des dégâts qui traverse le gilet pare-balles (« armor penetration » de CS).
+    pub fn armor_pen(&self) -> f32 {
+        match self.name {
+            "AWP" => 0.975,
+            "Desert Eagle" | "R8 Revolver" => 0.932,
+            "SSG 08" => 0.85,
+            "G3SG1" | "SCAR-20" => 0.825,
+            "AK-47" => 0.775,
+            "M249" | "Negev" => 0.8,
+            "P90" => 0.69,
+            "XM1014" => 0.8,
+            _ => match self.category {
+                Category::Pistol => 0.5,
+                Category::Smg => 0.6,
+                Category::Heavy => 0.5,
+                Category::Rifle => 0.7,
+            },
+        }
+    }
+
+    /// Prime d'élimination de CS2.
+    pub fn kill_reward(&self) -> u32 {
+        match self.name {
+            "AWP" => 100,
+            "P90" => 300,
+            "XM1014" => 600,
+            _ if self.pellets > 1 => 900,
+            _ if self.category == Category::Smg => 600,
+            _ => 300,
+        }
+    }
+
     /// Décalage de visée (tangage vers le haut, lacet vers la droite, en degrés) de la
     /// balle n° `n` d'une rafale : les premières montent presque droit, puis l'arme balaie
     /// à droite puis à gauche en continuant à monter un peu (motif fixe, apprenable).
