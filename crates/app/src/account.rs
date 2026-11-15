@@ -699,6 +699,7 @@ impl Accounts {
                 | Event::Kicked(_)
                 | Event::Slain(_)
                 | Event::SetGamemode { .. }
+                | Event::BulkDone { .. }
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)
                 | Event::MapDownloaded { .. }

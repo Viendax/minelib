@@ -86,6 +86,15 @@ const STEP_HEIGHT: f32 = 0.6;
 /// Vitesse sur une échelle (blocs/s), et élan quand on saute pour s'en décrocher.
 const LADDER_SPEED: f32 = 2.6;
 const LADDER_PUSH: f32 = 3.0;
+/// Temps pour atteindre la pleine vitesse sur une échelle (s).
+const LADDER_RAMP: f32 = 0.5;
+/// Vitesse accroupi sur une échelle (part de la pleine vitesse) : sous le seuil du bruit.
+const LADDER_SNEAK: f32 = 0.5;
+
+/// Vitesse verticale sur une échelle à partir de laquelle elle fait du bruit (à fond).
+pub const LADDER_NOISY: f32 = LADDER_SPEED * 0.95;
+/// Hauteur grimpée entre deux bruits d'échelle (un barreau sur deux).
+pub const LADDER_RUNG: f32 = 0.5;
 
 #[derive(Clone)]
 pub struct Player {
@@ -251,17 +260,33 @@ impl Player {
         (self.pos - h, self.pos + h + Vec3::Y * HEIGHT)
     }
 
-    /// Échelle touchée (côté du mur où elle est accrochée : 0 +X, 1 −X, 4 +Z, 5 −Z).
+    /// Échelle touchée (côté du mur où elle est accrochée : 0 +X, 1 −X, 4 +Z, 5 −Z) : il
+    /// faut être contre sa planche, pas seulement dans sa case.
     fn ladder(&self, world: &World) -> Option<u8> {
         let (min, max) = self.bounds();
-        let pad = Vec3::new(0.1, 0.0, 0.1);
-        let lo = (min - pad).floor().as_ivec3();
-        let hi = (max + pad - Vec3::splat(TOUCH)).floor().as_ivec3();
+        let pad = Vec3::new(0.02, 0.0, 0.02);
+        let (min, max) = (min - pad, max + pad);
+        let lo = min.floor().as_ivec3();
+        let hi = (max - Vec3::splat(TOUCH)).floor().as_ivec3();
         for y in lo.y..=hi.y {
             for z in lo.z..=hi.z {
                 for x in lo.x..=hi.x {
-                    let key: &str = &world.get(x, y, z).def().key;
-                    if let Some(side) = key.strip_prefix("ladder:") {
+                    let def = world.get(x, y, z).def();
+                    let Some(side) = def.key.strip_prefix("ladder:") else {
+                        continue;
+                    };
+                    let o = Vec3::new(x as f32, y as f32, z as f32);
+                    let touches = def.boxes().iter().any(|(a, b)| {
+                        let a = o + Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32) / 16.0;
+                        let b = o + Vec3::new(b[0] as f32, b[1] as f32, b[2] as f32) / 16.0;
+                        min.x < b.x
+                            && max.x > a.x
+                            && min.y < b.y
+                            && max.y > a.y
+                            && min.z < b.z
+                            && max.z > a.z
+                    });
+                    if touches {
                         return side.parse().ok();
                     }
                 }
@@ -271,6 +296,8 @@ impl Player {
     }
 
     pub fn update(&mut self, world: &World, m: &MoveInput, dt: f32) {
+        // Vitesse verticale d'avant ce pas (sur une échelle, la gravité n'y est pas).
+        let vy0 = self.vel.y;
         let (sy, cy) = self.yaw.sin_cos();
         let fwd = Vec3::new(sy, 0.0, -cy);
         let right = Vec3::new(cy, 0.0, sy);
@@ -343,14 +370,25 @@ impl Player {
                     } else {
                         m.forward.signum()
                     };
-                    self.vel.y = if climb < 0.0 && self.on_ground {
+                    // Accroupi : plus lent (et silencieux, voir `ladder_noise`).
+                    let cap = if m.sneak {
+                        LADDER_SPEED * LADDER_SNEAK
+                    } else {
+                        LADDER_SPEED
+                    };
+                    let target = if climb < 0.0 && self.on_ground {
                         0.0
                     } else {
-                        climb * LADDER_SPEED
+                        climb * cap
                     };
+                    // On prend de la vitesse : la pleine vitesse en LADDER_RAMP secondes.
+                    let step = LADDER_SPEED / LADDER_RAMP * dt;
+                    // En arrivant sur l'échelle en tombant : on s'y rattrape aussitôt.
+                    let from = vy0.clamp(-cap, cap);
+                    self.vel.y = from + (target - from).clamp(-step, step);
                     let flat = Vec3::new(self.vel.x, 0.0, self.vel.z);
-                    if flat.length() > LADDER_SPEED {
-                        let f = flat.normalize() * LADDER_SPEED;
+                    if flat.length() > cap {
+                        let f = flat.normalize() * cap;
                         self.vel.x = f.x;
                         self.vel.z = f.z;
                     }
@@ -951,32 +989,63 @@ mod tests {
             w.set(9, y, 8, ladder);
         }
         for fps in [false, true] {
-            let mut p = Player::new(Vec3::new(9.5, 11.0, 8.5));
+            let mut p = Player::new(Vec3::new(9.4, 11.0, 8.5));
             p.yaw = std::f32::consts::FRAC_PI_2; // vers +X (le mur)
             let dt = 1.0 / 64.0;
+            let still = MoveInput {
+                fps,
+                ..Default::default()
+            };
+            // Dans la case de l'échelle mais pas contre sa planche : rien.
+            p.update(&w, &still, dt);
+            assert!(!p.on_ladder, "pas contre la planche (fps {fps})");
             let up = MoveInput {
                 forward: 1.0,
                 fps,
                 ..Default::default()
             };
-            for _ in 0..64 {
+            // On prend de la vitesse en une demi-seconde environ.
+            for _ in 0..20 {
                 p.update(&w, &up, dt);
             }
             assert!(p.on_ladder, "fps {fps}");
-            assert!(p.pos.y > 12.5, "monte (fps {fps}) : y = {}", p.pos.y);
-            // Rien : on reste accroché.
+            assert!(
+                p.vel.y > 0.0 && p.vel.y < LADDER_NOISY,
+                "pas tout de suite à fond"
+            );
+            for _ in 0..44 {
+                p.update(&w, &up, dt);
+            }
+            assert!(p.vel.y >= LADDER_NOISY, "à fond (fps {fps}) : {}", p.vel.y);
+            assert!(p.pos.y > 12.2, "monte (fps {fps}) : y = {}", p.pos.y);
+            // Rien : on ralentit puis on reste accroché.
+            for _ in 0..40 {
+                p.update(&w, &still, dt);
+            }
             let y = p.pos.y;
-            let still = MoveInput {
-                fps,
-                ..Default::default()
-            };
             for _ in 0..64 {
                 p.update(&w, &still, dt);
             }
-            assert!((p.pos.y - y).abs() < 0.05, "accroché (fps {fps})");
+            assert!((p.pos.y - y).abs() < 0.01, "accroché (fps {fps})");
+            // Accroupi : on monte, mais sous la vitesse qui fait du bruit.
+            let sneak = MoveInput {
+                forward: 1.0,
+                sneak: true,
+                fps,
+                ..Default::default()
+            };
+            let mut top = 0.0f32;
+            for _ in 0..64 {
+                p.update(&w, &sneak, dt);
+                top = top.max(p.vel.y);
+            }
+            assert!(
+                top > 0.5 && top < LADDER_NOISY,
+                "accroupi (fps {fps}) : {top}"
+            );
             // En regardant vers le bas : on descend jusqu'au sol, sans dégâts de chute.
             p.pitch = -1.0;
-            for _ in 0..256 {
+            for _ in 0..400 {
                 p.update(&w, &up, dt);
             }
             assert!(

@@ -47,6 +47,8 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 
 Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 
+- **Échelles comme dans CS** : contre l'échelle, on monte en avançant (on descend en regardant vers le bas), avec une demi-seconde pour prendre de la vitesse. À pleine vitesse, ses barreaux s'entendent ; accroupi, on grimpe plus lentement et sans bruit.
+- **Couleurs des coéquipiers** : vert, jaune, orange, bleu, violet, puis bleu ciel, rouge, blanc, marron, gris. Teintes de la palette d'Okabe et Ito, distinctes aussi pour les daltoniens.
 - **Joue avec tes amis** : le panneau de droite liste tes amis (en ligne en vert) ; un clic invite dans ton **lobby** (jusqu'à 10 joueurs : il doit tenir dans une équipe de la carte, 5 pour un 5 contre 5, 10 pour un 10 contre 10). Celui qui invite en premier est l'hôte du lobby : il lance la partie pour tout le monde, et vous êtes **toujours dans la même équipe**. Clic droit sur un membre : *Exclure* ou *Promouvoir hôte*.
 
 - Chaque carte affiche clairement son format (**5 contre 5**, 2 contre 2, jusqu'à 10 contre 10). **Seules les cartes 5 contre 5 comptent au classement.**
@@ -115,7 +117,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 
 - **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts.
 - **Survie, créatif, spectateur** (`/gm 0`, `1`, `3`).
-- **WorldEdit intégré** : plus de 40 commandes `//` (remplir, copier, coller, tourner, sphères, cylindres, annuler…).
+- **WorldEdit intégré** : plus de 40 commandes `//` (remplir, copier, coller, tourner, sphères, cylindres, annuler…). Sur un serveur de construction en ligne, réservé à ses OP : le relais vérifie et envoie les blocs à tous.
 - **Des blocs qui se posent comme on s'y attend** : escaliers face à toi (à l'envers au plafond), dalles, portes, trappes, vitres qui se raccordent, bannières.
 - **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`).
 - **Importe tes mondes Java** (format Anvil, toutes versions) et tes **packs de textures** : les fichiers d'origine ne sont jamais modifiés.
@@ -183,7 +185,7 @@ Le tchat se navigue avec ← → (Début, Fin, Suppr).
 | `/ami <pseudo>` · `/ami retirer <pseudo>` · `/amis` | Amis (aussi `/friend add <pseudo>`) |
 | `/equipe ct` · `/equipe t` | Changer d'équipe pendant l'échauffement (aussi `/team`) |
 | `/op` · `/deop` · `/ban` · `/unban` | Gérer son serveur de construction |
-| `//…` | WorldEdit (créatif) |
+| `//…` | WorldEdit (créatif ; en ligne, OP du serveur seulement) |
 
 </details>
 

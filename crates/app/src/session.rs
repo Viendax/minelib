@@ -129,6 +129,10 @@ pub struct Session {
     dirty: HashSet<ChunkPos>,
     /// Sélection et commandes `//…` façon WorldEdit.
     we: crate::worldedit::WorldEdit,
+    /// Dernier refus de WorldEdit affiché (un seul message par commande).
+    bulk_refused: std::time::Instant,
+    /// Hauteur grimpée à pleine vitesse sur une échelle depuis le dernier bruit.
+    ladder_climb: f32,
     pub inventory: Inventory,
     night: bool,
     daylight: f32,
@@ -315,6 +319,8 @@ impl Session {
             view_distance: cfg.view_distance.clamp(2, MAX_VIEW_DISTANCE),
             dirty: HashSet::new(),
             we: crate::worldedit::WorldEdit::default(),
+            bulk_refused: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            ladder_climb: 0.0,
             inventory: data.inventory.unwrap_or_else(Inventory::starter),
             night,
             daylight: if night { 0.0 } else { 1.0 },
@@ -1534,6 +1540,16 @@ impl Session {
                     expires,
                     mac,
                 } => b.set_ticket(*room, pseudo.clone(), *expires, *mac),
+                // WorldEdit refusé (pas OP) : les blocs reviennent.
+                Event::BulkDone { id, error } => {
+                    let dirty = b.bulk_done(*id, error, &mut self.world);
+                    self.dirty.extend(dirty);
+                    if !error.is_empty() && self.bulk_refused.elapsed().as_secs_f32() > 2.0 {
+                        self.bulk_refused = std::time::Instant::now();
+                        self.chat.say(error.clone(), chat::RED);
+                    }
+                    return;
+                }
                 // Mode de jeu donné par un OP (ou par défaut du serveur, à l'arrivée).
                 Event::SetGamemode { mode, by } => {
                     if let Some(m) = GameMode::parse(mode).filter(|m| *m != GameMode::Fps) {
@@ -1862,6 +1878,18 @@ impl Session {
         if self.step_offset.abs() < 1e-3 {
             self.step_offset = 0.0;
         }
+        // Échelle à pleine vitesse (pas accroupi) : ses barreaux, un bruit tous les deux (les
+        // autres l'entendent aussi, voir l'hôte).
+        let vy = self.player.vel.y.abs();
+        if alive && self.player.on_ladder && vy >= crate::player::LADDER_NOISY {
+            self.ladder_climb += vy * dt;
+            if self.ladder_climb >= crate::player::LADDER_RUNG {
+                self.ladder_climb -= crate::player::LADDER_RUNG;
+                self.fps.sounds.push((crate::audio::Sfx::Ladder, 0.0, 0.6));
+            }
+        } else {
+            self.ladder_climb = crate::player::LADDER_RUNG * 0.8;
+        }
         // Plongeon dans l'eau (les autres l'entendent aussi), sinon réception d'une chute
         // d'au moins 1,3 bloc.
         if crate::player::in_water(&self.world, self.player.pos) {
@@ -1954,6 +1982,9 @@ impl Session {
         let look = self.player.look_dir();
         let feet = self.player.pos.floor().as_ivec3().to_array();
         let target = self.hit.map(|h| h.block);
+        // En ligne : ce que la commande change part au relais (réservé aux OP : refusé, tout
+        // est remis comme avant), pas aux garants bloc par bloc.
+        let before = self.world.journal.as_ref().map_or(0, Vec::len);
         let mut ctx = crate::worldedit::Ctx {
             world: &mut self.world,
             feet,
@@ -1961,7 +1992,14 @@ impl Session {
             target,
             dirty: &mut self.dirty,
         };
-        match self.we.command(&name, &args, &mut ctx) {
+        let r = self.we.command(&name, &args, &mut ctx);
+        if let (Some(b), Some(j)) = (&mut self.build, &mut self.world.journal) {
+            let cells: Vec<_> = j.drain(before.min(j.len())..).collect();
+            if !cells.is_empty() {
+                b.bulk(cells);
+            }
+        }
+        match r {
             Ok(msg) => self.chat.say(msg, chat::LIGHT_PURPLE),
             Err(e) => self.chat.say(e, chat::RED),
         }
@@ -2390,13 +2428,7 @@ impl Session {
             );
             return;
         }
-        if self.build.is_some() && cmd.starts_with('/') {
-            self.chat.say(
-                "WorldEdit est désactivé en construction en ligne.",
-                chat::RED,
-            );
-            return;
-        }
+
         // `//…` : commandes WorldEdit (mode créatif).
         if let Some(we) = cmd.strip_prefix('/') {
             self.worldedit(we);

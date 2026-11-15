@@ -94,6 +94,10 @@ pub struct BuildNet {
     caps_sent: bool,
     pending: HashMap<[i32; 3], Pending>,
     shards: Shards,
+    /// Modifications en masse (WorldEdit d'un OP) envoyées au relais : blocs d'avant, pour
+    /// les remettre s'il refuse.
+    bulks: HashMap<u32, Vec<([i32; 3], BlockId)>>,
+    next_bulk: u32,
 }
 
 /// Relais de région (voir `minelib_relay::shard`) : la liste reçue du relais du monde, le
@@ -197,6 +201,8 @@ impl BuildNet {
             rate: HashMap::new(),
             caps_sent: false,
             pending: HashMap::new(),
+            bulks: HashMap::new(),
+            next_bulk: 0,
             shards: Shards::default(),
         }
     }
@@ -254,6 +260,37 @@ impl BuildNet {
 
     fn send(&self, req: Request) {
         transport::push(&self.link, &req);
+    }
+
+    /// WorldEdit d'un OP : les blocs changés (case, nouveau, ancien), déjà posés ici, partent
+    /// au relais par paquets (il vérifie qu'on est OP et les publie à tous).
+    pub fn bulk(&mut self, cells: Vec<([i32; 3], BlockId, BlockId)>) {
+        for part in cells.chunks(4096) {
+            self.next_bulk += 1;
+            let id = self.next_bulk;
+            self.bulks
+                .insert(id, part.iter().map(|&(p, _, old)| (p, old)).collect());
+            self.send(Request::BulkEdit {
+                id,
+                cells: part.iter().map(|&(p, b, _)| (p, b.0)).collect(),
+            });
+        }
+    }
+
+    /// Réponse du relais à un paquet de `bulk` : refusé, on remet les blocs d'avant.
+    /// Renvoie les chunks à remailler.
+    pub fn bulk_done(&mut self, id: u32, error: &str, world: &mut World) -> Vec<ChunkPos> {
+        let Some(olds) = self.bulks.remove(&id) else {
+            return Vec::new();
+        };
+        if error.is_empty() {
+            return Vec::new();
+        }
+        let mut dirty = Vec::new();
+        for (p, old) in olds.into_iter().rev() {
+            dirty.extend(world.set_remote(p[0], p[1], p[2], old));
+        }
+        dirty
     }
 
     fn garant_of(&self, chunk: [i32; 2]) -> bool {

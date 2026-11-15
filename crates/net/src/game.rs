@@ -428,6 +428,8 @@ pub const STEP_LAND: u8 = 1;
 pub const STEP_PAIN: u8 = 2;
 /// Plongeon dans l'eau d'assez haut.
 pub const STEP_SPLASH: u8 = 3;
+/// On grimpe ou descend une échelle à pleine vitesse (pas accroupi).
+pub const STEP_LADDER: u8 = 4;
 
 /// Fil des éliminations : à travers un mur, à travers une fumée, tireur aveuglé.
 pub const KILL_WALL: u8 = 1;

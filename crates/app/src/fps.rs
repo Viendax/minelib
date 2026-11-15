@@ -1214,6 +1214,7 @@ impl Fps {
             crate::netgame::STEP_LAND => Sfx::Land,
             crate::netgame::STEP_PAIN => Sfx::Pain,
             crate::netgame::STEP_SPLASH => Sfx::Splash,
+            crate::netgame::STEP_LADDER => Sfx::Ladder,
             _ => Sfx::Step,
         };
         self.sounds.push((sfx, 0.0, 0.9 / (1.0 + d / 8.0)));

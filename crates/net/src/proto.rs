@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 17;
+pub const PROTOCOL: u32 = 18;
 
 /// Morceau d'une carte transférée (octets).
 pub const MAP_PART: usize = 48 * 1024;
@@ -278,6 +278,13 @@ pub enum Request {
     Rtt {
         ms: u16,
     },
+    /// Modifications en masse d'un OP (WorldEdit) dans un monde de construction : le
+    /// relais vérifie qu'il est OP, les publie comme des blocs validés et répond par
+    /// `BulkDone` (même `id`).
+    BulkEdit {
+        id: u32,
+        cells: Vec<([i32; 3], u16)>,
+    },
 }
 
 impl Request {
@@ -301,6 +308,7 @@ impl Request {
                 | Request::RegionLog { .. }
                 | Request::ShardReady { .. }
                 | Request::Rtt { .. }
+                | Request::BulkEdit { .. }
         )
     }
 }
@@ -611,6 +619,11 @@ pub enum Response {
         mode: String,
         by: String,
     },
+    /// Réponse à `BulkEdit` : `error` vide si tout est publié, sinon pourquoi c'est refusé.
+    BulkDone {
+        id: u32,
+        error: String,
+    },
 }
 
 impl Response {
@@ -634,6 +647,7 @@ impl Response {
                 | Response::Kicked { .. }
                 | Response::Slain { .. }
                 | Response::SetGamemode { .. }
+                | Response::BulkDone { .. }
                 | Response::Arbitrate { .. }
                 | Response::Evidence { .. }
                 | Response::FromPeer { .. }

@@ -1050,6 +1050,78 @@ fn relieve_garants(st: &mut State, rid: u64) {
     }
 }
 
+/// Modifications en masse au plus par demande (WorldEdit d'un OP).
+const BULK_MAX: usize = 8192;
+
+/// WorldEdit d'un OP dans un monde de construction : chaque bloc est publié comme un bloc
+/// validé (historique des zones, joueurs proches, copie du relais de région s'il y en a
+/// un). Renvoie pourquoi c'est refusé (vide : publié).
+fn bulk_edit(
+    st: &mut State,
+    my_room: Option<u64>,
+    id: u64,
+    pseudo: &str,
+    cells: Vec<([i32; 3], u16)>,
+) -> String {
+    let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1)) else {
+        return "Seulement sur un serveur de construction.".into();
+    };
+    let (server, creator) = {
+        let r = &st.rooms[&rid];
+        (r.server.clone(), r.creator.clone())
+    };
+    if !st.servers.is_op(&server, &creator, pseudo) {
+        return "WorldEdit est réservé aux OP de ce serveur.".into();
+    }
+    if cells.len() > BULK_MAX {
+        return "Trop de blocs d'un coup.".into();
+    }
+    let room = st.rooms.get_mut(&rid).expect("partie");
+    for (pos, block) in cells {
+        if !(0..256).contains(&pos[1]) {
+            continue;
+        }
+        let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
+        let zone = proto::zone_of(chunk);
+        let data = game::encode(&game::BuildMsg::Set {
+            pos,
+            block,
+            by: pseudo.to_string(),
+        });
+        let to = room.build.listeners(chunk, id);
+        for (m, items) in room.build.mirror_to(zone, &data, &to) {
+            if let Some(c) = st.conns.get(&m) {
+                for data in items {
+                    transport::push(
+                        &c.tx,
+                        &Response::FromZone {
+                            peer: 0,
+                            chunk,
+                            data,
+                        },
+                    );
+                }
+            }
+        }
+        // Région servie par son propre relais : il en garde aussi la copie.
+        if let Some(c) = room
+            .shards
+            .get(&proto::region_of(chunk))
+            .and_then(|s| st.conns.get(&s.host))
+        {
+            transport::push(
+                &c.tx,
+                &Response::FromZone {
+                    peer: 0,
+                    chunk,
+                    data,
+                },
+            );
+        }
+    }
+    String::new()
+}
+
 /// Aller-retour (ms) au-delà duquel l'hôte d'une partie a une mauvaise connexion.
 const BAD_RTT: f32 = 180.0;
 /// Un remplaçant doit avoir au plus cet aller-retour (et moitié moins que l'hôte).
@@ -3122,6 +3194,13 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             judge_outcome(st, rid, host, auditor);
             return None;
         }
+        Request::BulkEdit { id: bulk, cells } => {
+            let error = bulk_edit(st, my_room, id, pseudo, cells);
+            if let Some(c) = st.conns.get(&id) {
+                transport::push(&c.tx, &Response::BulkDone { id: bulk, error });
+            }
+            return None;
+        }
         Request::Rtt { ms } => {
             if let Some(c) = st.conns.get_mut(&id) {
                 let ms = ms as f32;
@@ -3212,6 +3291,7 @@ fn handle(
             | Request::ToHost { .. }
             | Request::SetBackup { .. }
             | Request::Rtt { .. }
+            | Request::BulkEdit { .. }
             | Request::GarantAvailable { .. }
             | Request::GarantReady
             | Request::Conflict { .. }
@@ -4371,6 +4451,78 @@ mod tests {
         );
         match wait(&createur, |e| matches!(e, Event::FromZone { .. })) {
             Event::FromZone { data, .. } => assert_eq!(data, set),
+            _ => unreachable!(),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// WorldEdit en ligne : réservé aux OP ; leurs blocs vont aux joueurs proches.
+    #[test]
+    fn only_ops_send_bulk_edits_and_players_nearby_get_them() {
+        let dir = std::env::temp_dir().join(format!("minelib-bulk-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        let (createur, clink) = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [5; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&elink, &Request::Position { chunk: [0, 0] });
+        let cells = vec![([1, 70, 2], 3u16), ([2, 70, 2], 3)];
+        // Eve n'est pas OP : refusé.
+        transport::push(
+            &elink,
+            &Request::BulkEdit {
+                id: 1,
+                cells: cells.clone(),
+            },
+        );
+        match wait(&eve, |e| matches!(e, Event::BulkDone { .. })) {
+            Event::BulkDone { id, error } => assert!(id == 1 && error.contains("OP"), "{error}"),
+            _ => unreachable!(),
+        }
+        // Le créateur (OP) : publié, Eve (tout près) reçoit les blocs.
+        transport::push(&clink, &Request::BulkEdit { id: 7, cells });
+        match wait(&createur, |e| matches!(e, Event::BulkDone { .. })) {
+            Event::BulkDone { id, error } => assert!(id == 7 && error.is_empty(), "{error}"),
+            _ => unreachable!(),
+        }
+        match wait(&eve, |e| matches!(e, Event::FromZone { .. })) {
+            Event::FromZone { data, .. } => match game::decode::<game::BuildMsg>(&data) {
+                Some(game::BuildMsg::Set { pos, block, by }) => {
+                    assert_eq!((pos, block, by.as_str()), ([1, 70, 2], 3, "Createur"))
+                }
+                m => panic!("{m:?}"),
+            },
             _ => unreachable!(),
         }
         let _ = std::fs::remove_dir_all(dir);

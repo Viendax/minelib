@@ -1217,7 +1217,7 @@ type Frame = Vec<(u64, Vec3, f32)>;
 /// Bruits de pas : au-dessus de cette vitesse au sol (blocs/s), on court et les autres
 /// l'entendent (135 unités de CS sur 250).
 pub const STEP_SPEED: f32 = crate::player::FPS_SPRINT * 135.0 / 250.0;
-pub use minelib_net::game::{STEP_LAND, STEP_PAIN, STEP_RUN, STEP_SPLASH};
+pub use minelib_net::game::{STEP_LADDER, STEP_LAND, STEP_PAIN, STEP_RUN, STEP_SPLASH};
 
 /// Hauteur de chute dans l'eau à partir de laquelle on entend le plongeon (blocs).
 pub const SPLASH_HEIGHT: f32 = 1.0;
@@ -1233,6 +1233,8 @@ struct Stride {
     last: Vec3,
     dist: f32,
     top: Option<f32>,
+    /// Hauteur grimpée à pleine vitesse sur une échelle depuis le dernier bruit.
+    climb: f32,
 }
 
 /// Distance entre deux pas (blocs).
@@ -1254,6 +1256,8 @@ pub struct Host {
     /// Réapparitions demandées par les règles, faites au prochain pas (monde nécessaire).
     spawns: Vec<(u64, bool)>,
     local_pos: Vec3,
+    /// Le joueur local est accroché à une échelle.
+    local_ladder: bool,
     /// État du joueur de l'hôte au dernier pas (ses yeux, pour ses tirs).
     local_state: SimState,
     /// Brûlure en cours de chacun (fraction de point).
@@ -1455,6 +1459,7 @@ impl NetGame {
             rng: seed | 1,
             spawns: Vec::new(),
             local_pos: spawn,
+            local_ladder: false,
             local_state: Player::new(spawn).net_state(),
             burns: BTreeMap::new(),
             local_keys: (false, false),
@@ -2098,6 +2103,7 @@ impl NetGame {
             rng: b.tick | 1,
             spawns: Vec::new(),
             local_pos: local.pos,
+            local_ladder: local.on_ladder,
             local_state: local.net_state(),
             burns: b.burns.iter().copied().collect(),
             local_keys: (false, false),
@@ -2260,14 +2266,24 @@ impl Host {
     /// blocs (comme dans CS : marcher ou s'accroupir est silencieux pour les autres).
     fn footsteps(&mut self, world: &World, local_ground: bool, dt: f32, out: &mut Vec<Local>) {
         let mut walkers: Vec<(u64, Vec3, bool)> = Vec::new();
+        let mut on_ladder: Vec<u64> = Vec::new();
         if self.playing {
             walkers.push((0, self.local_pos, local_ground));
+            if self.local_ladder {
+                on_ladder.push(0);
+            }
         }
         walkers.extend(
             self.peers
                 .iter()
                 .filter(|(_, r)| r.ready)
                 .map(|(&id, r)| (id, r.player.pos, r.player.on_ground)),
+        );
+        on_ladder.extend(
+            self.peers
+                .iter()
+                .filter(|(_, r)| r.ready && r.player.on_ladder)
+                .map(|(&id, _)| id),
         );
         walkers.sort_by_key(|w| w.0);
         let alive = |m: &Match, id: u64| m.players.get(&id).is_some_and(|p| p.alive);
@@ -2277,12 +2293,28 @@ impl Host {
                 last: pos,
                 dist: 0.0,
                 top: None,
+                climb: 0.0,
             });
             let d = Vec3::new(pos.x - e.last.x, 0.0, pos.z - e.last.z).length();
             let teleport = (pos - e.last).length() > 3.0;
             let before = e.last;
             e.last = pos;
             let living = alive(&self.m, id);
+            // Échelle : à pleine vitesse (pas accroupi), un bruit tous les deux barreaux.
+            if on_ladder.contains(&id) {
+                e.top = None;
+                let dy = (pos.y - before.y).abs();
+                if living && !teleport && dy / dt.max(1e-4) >= crate::player::LADDER_NOISY {
+                    e.climb += dy;
+                    if e.climb >= crate::player::LADDER_RUNG {
+                        e.climb -= crate::player::LADDER_RUNG;
+                        steps.push((id, pos, STEP_LADDER));
+                    }
+                } else {
+                    e.climb = crate::player::LADDER_RUNG * 0.8;
+                }
+                continue;
+            }
             // Plongeon : tombé dans l'eau d'au moins un bloc (tout le monde l'entend).
             if crate::player::in_water(world, pos) {
                 if let Some(top) = e.top.take() {
@@ -2970,6 +3002,7 @@ impl Host {
             }
         }
         self.local_pos = local.pos;
+        self.local_ladder = local.on_ladder;
         self.local_state = local.net_state();
         self.local_carry = local.carry;
         let frozen = self.m.frozen();

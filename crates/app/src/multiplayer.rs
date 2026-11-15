@@ -692,19 +692,23 @@ pub fn fps_screen(
     action
 }
 
-/// Couleurs des joueurs (lobby, bandeau des têtes, triangles) : vert, jaune, orange, bleu,
-/// violet, puis cyan, rose, blanc, brun et rouge (équipes de 10).
+/// Couleurs des joueurs d'une équipe (lobby, bandeau des têtes, triangles, carte) : des
+/// couleurs que tout le monde sait nommer, dans l'ordre de CS (vert, jaune, orange, bleu,
+/// violet) puis bleu ciel, rouge, blanc, marron et gris pour les équipes de 10. Les teintes
+/// viennent de la palette d'Okabe et Ito, faite pour rester distinctes pour les daltoniens
+/// (protanopes, deutéranopes, tritanopes) ; le blanc, le marron et le gris s'en distinguent
+/// par leur clarté.
 pub const PLAYER_COLORS: [[f32; 4]; 10] = [
-    [0.30, 0.85, 0.35, 1.0],
-    [0.95, 0.85, 0.20, 1.0],
-    [0.98, 0.55, 0.15, 1.0],
-    [0.30, 0.60, 1.00, 1.0],
-    [0.70, 0.40, 0.95, 1.0],
-    [0.25, 0.90, 0.90, 1.0],
-    [1.00, 0.50, 0.75, 1.0],
-    [0.92, 0.92, 0.92, 1.0],
-    [0.62, 0.42, 0.25, 1.0],
-    [0.92, 0.25, 0.25, 1.0],
+    [0.0, 0.62, 0.451, 1.0],    // vert
+    [0.941, 0.894, 0.259, 1.0], // jaune
+    [0.902, 0.624, 0.0, 1.0],   // orange
+    [0.0, 0.447, 0.698, 1.0],   // bleu
+    [0.8, 0.475, 0.655, 1.0],   // violet
+    [0.337, 0.706, 0.914, 1.0], // bleu ciel
+    [0.835, 0.369, 0.0, 1.0],   // rouge
+    [1.0, 1.0, 1.0, 1.0],       // blanc
+    [0.478, 0.29, 0.118, 1.0],  // marron
+    [0.549, 0.549, 0.549, 1.0], // gris
 ];
 
 /// Panneau du lobby, à droite : recherche d'amis en haut, amis en dessous (clic : inviter),

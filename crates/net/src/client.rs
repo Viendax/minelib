@@ -202,6 +202,11 @@ pub enum Event {
         mode: String,
         by: String,
     },
+    /// Réponse du relais à des modifications en masse (WorldEdit) : `error` vide si publiées.
+    BulkDone {
+        id: u32,
+        error: String,
+    },
     Leaderboard {
         friends: bool,
         list: Vec<crate::proto::RankEntry>,
@@ -576,6 +581,7 @@ impl Worker {
             Response::Kicked { reason } => Event::Kicked(reason),
             Response::Slain { by } => Event::Slain(by),
             Response::SetGamemode { mode, by } => Event::SetGamemode { mode, by },
+            Response::BulkDone { id, error } => Event::BulkDone { id, error },
             Response::Arbitrate { case, map_sig, map } => Event::Arbitrate { case, map_sig, map },
             Response::Evidence {
                 case,
