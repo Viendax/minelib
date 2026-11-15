@@ -18,6 +18,7 @@ mod reflections;
 mod smoke;
 pub use wgpu;
 mod latency;
+mod lazy;
 mod overlay;
 pub mod perf;
 pub mod rt;
@@ -46,6 +47,128 @@ use winit::window::Window;
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32, 2 => Uint32];
+
+
+/// Disposition des sommets des blocs.
+pub(crate) fn world_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Vertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &VERTEX_ATTRS,
+    }
+}
+
+/// Un pipeline du monde qui dessine dans l'image de l'écran (sans anticrénelage).
+#[allow(clippy::too_many_arguments)]
+fn surface_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    label: &str,
+    vs: &str,
+    fs: &str,
+    buffers: &[wgpu::VertexBufferLayout],
+    cull: Option<wgpu::Face>,
+    depth_write: bool,
+    depth_compare: wgpu::CompareFunction,
+    blend: Option<wgpu::BlendState>,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(vs),
+            compilation_options: Default::default(),
+            buffers,
+        },
+        primitive: wgpu::PrimitiveState {
+            // Le contour du bloc visé est fait de lignes.
+            topology: if vs == "vs_outline" {
+                wgpu::PrimitiveTopology::LineList
+            } else {
+                wgpu::PrimitiveTopology::TriangleList
+            },
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: cull,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: depth_write,
+            depth_compare,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// Passe des reflets (raytracing) : surfaces réfléchissantes seulement, dans l'image des
+/// reflets.
+fn reflect_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    let vertex_layout = world_vertex_layout();
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("reflets (raytracing)"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_block"),
+            compilation_options: Default::default(),
+            buffers: std::slice::from_ref(&vertex_layout),
+        },
+        primitive: wgpu::PrimitiveState {
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Greater,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_reflect"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: reflections::FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// Pipelines d'une passe du monde : le ciel et le contour tout de suite, les shaders
+/// lourds (blocs, miroirs, translucides) quand ils sont compilés.
+struct ScenePipes<'p> {
+    sky: &'p wgpu::RenderPipeline,
+    outline: &'p wgpu::RenderPipeline,
+    heavy: Option<&'p taa::Heavy>,
+}
+
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 #[repr(C)]
@@ -357,10 +480,10 @@ pub struct Renderer {
     block_view: wgpu::TextureView,
     refl: reflections::Reflections,
     pub pack_name: String,
-    block_pipeline: wgpu::RenderPipeline,
-    reflective_pipeline: wgpu::RenderPipeline,
-    reflect_pipeline: wgpu::RenderPipeline,
-    translucent_pipeline: wgpu::RenderPipeline,
+    /// Pipelines du monde sans anticrénelage (essais) : compilés à la première utilisation.
+    plain: std::sync::OnceLock<taa::Heavy>,
+    /// Passe des reflets : prête un peu après le lancement.
+    reflect_pipeline: lazy::Lazy<wgpu::RenderPipeline>,
     sky_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     /// Le contour du bloc visé est-il à dessiner ?
@@ -666,175 +789,42 @@ impl Renderer {
         });
         let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/world.wgsl"));
 
-        let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &VERTEX_ATTRS,
-        };
-
-        let make = |label: &str,
-                    vs: &str,
-                    fs: &str,
-                    buffers: &[wgpu::VertexBufferLayout],
-                    cull: Option<wgpu::Face>,
-                    depth_write: bool,
-                    depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    // Le contour du bloc visé est fait de lignes.
-                    topology: if vs == "vs_outline" {
-                        wgpu::PrimitiveTopology::LineList
-                    } else {
-                        wgpu::PrimitiveTopology::TriangleList
-                    },
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: cull,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: depth_write,
-                    depth_compare,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview: None,
-                cache: None,
+        // Reflets (raytracing à son propre rythme) : shader lourd, compilé sur un fil à part
+        // sans retarder l'ouverture du jeu. Les pipelines du monde sans anticrénelage ne
+        // servent qu'aux essais : compilés à la demande (`plain_pipes`).
+        let reflect_pipeline = {
+            let (device, layout, shader) = (device.clone(), layout.clone(), shader.clone());
+            lazy::Lazy::spawn("shader des reflets", move || {
+                let t0 = std::time::Instant::now();
+                let p = reflect_pipeline(&device, &layout, &shader);
+                log::info!(
+                    "shader des reflets compilé en {:.1} s (en tâche de fond)",
+                    t0.elapsed().as_secs_f32()
+                );
+                p
             })
         };
-
-        // Les pipelines lourds (shader du monde avec raytracing) sont compilés en parallèle :
-        // sous DirectX, chaque compilation (FXC) prend plusieurs secondes.
-        let reflect_desc = |device: &wgpu::Device| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("reflets (raytracing)"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_block"),
-                    compilation_options: Default::default(),
-                    buffers: std::slice::from_ref(&vertex_layout),
-                },
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: Some(wgpu::Face::Back),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Greater,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_reflect"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: reflections::FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview: None,
-                cache: None,
-            })
+        let make = |label: &str, vs: &str, fs: &str, compare, blend| {
+            surface_pipeline(
+                &device,
+                &layout,
+                &shader,
+                config.format,
+                label,
+                vs,
+                fs,
+                &[],
+                None,
+                false,
+                compare,
+                blend,
+            )
         };
-        let vl = std::slice::from_ref(&vertex_layout);
-        let t0 = std::time::Instant::now();
-        let (block_pipeline, reflect_pipeline, reflective_pipeline, translucent_pipeline) =
-            std::thread::scope(|sc| {
-                let block = sc.spawn(|| {
-                    make(
-                        "blocs",
-                        "vs_block",
-                        "fs_block_fast",
-                        vl,
-                        Some(wgpu::Face::Back),
-                        true,
-                        wgpu::CompareFunction::Greater, // Z inversé : 1 = près, 0 = infini
-                        None,
-                    )
-                });
-                // Passe des reflets (raytracing à son propre rythme) : surfaces
-                // réfléchissantes seulement, dans l'image des reflets.
-                let reflect = sc.spawn(|| reflect_desc(&device));
-                // Miroirs et métaux : shader complet (reflets), sur peu de pixels.
-                let reflective = sc.spawn(|| {
-                    make(
-                        "reflets",
-                        "vs_block",
-                        "fs_block",
-                        vl,
-                        Some(wgpu::Face::Back),
-                        true,
-                        wgpu::CompareFunction::Greater,
-                        None,
-                    )
-                });
-                // Eau, glace, verre : mélange alpha, sans écrire la profondeur, visibles des
-                // deux côtés.
-                let translucent = sc.spawn(|| {
-                    make(
-                        "translucide",
-                        "vs_block",
-                        "fs_block_translucent",
-                        vl,
-                        None,
-                        false,
-                        wgpu::CompareFunction::Greater,
-                        Some(wgpu::BlendState::ALPHA_BLENDING),
-                    )
-                });
-                (
-                    block.join().expect("pipeline des blocs"),
-                    reflect.join().expect("pipeline des reflets"),
-                    reflective.join().expect("pipeline réfléchissant"),
-                    translucent.join().expect("pipeline translucide"),
-                )
-            });
-        log::info!(
-            "shaders du monde compilés en {:.1} s",
-            t0.elapsed().as_secs_f32()
-        );
-        let sky_pipeline = make(
-            "ciel",
-            "vs_sky",
-            "fs_sky",
-            &[],
-            None,
-            false,
-            wgpu::CompareFunction::Always,
-            None,
-        );
+        let sky_pipeline = make("ciel", "vs_sky", "fs_sky", wgpu::CompareFunction::Always, None);
         let outline_pipeline = make(
             "contour",
             "vs_outline",
             "fs_outline",
-            &[],
-            None,
-            false,
             wgpu::CompareFunction::GreaterEqual,
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
@@ -917,10 +907,8 @@ impl Renderer {
             block_view,
             refl,
             pack_name: pack.name.clone(),
-            block_pipeline,
-            reflective_pipeline,
+            plain: std::sync::OnceLock::new(),
             reflect_pipeline,
-            translucent_pipeline,
             sky_pipeline,
             outline_pipeline,
             outline: false,
@@ -1332,22 +1320,85 @@ impl Renderer {
         self.taa.is_some()
     }
 
+    /// Les shaders lourds du monde sont-ils compilés ? (Ils le sont en tâche de fond au
+    /// lancement ; d'ici là le monde ne montre que le ciel.)
+    pub fn world_ready(&self) -> bool {
+        match &self.taa {
+            Some(t) => t.heavy.try_get().is_some(),
+            None => true,
+        }
+    }
+
+    /// Attend la fin de la compilation des shaders lourds (essais, captures).
+    pub fn wait_world_ready(&self) {
+        if let Some(t) = &self.taa {
+            let _ = t.heavy.get();
+        }
+    }
+
+    /// Pipelines du monde sans anticrénelage, compilés à la première utilisation (essais).
+    fn plain_pipes(&self) -> &taa::Heavy {
+        self.plain.get_or_init(|| {
+            let vertex_layout = world_vertex_layout();
+            let vl = std::slice::from_ref(&vertex_layout);
+            let greater = wgpu::CompareFunction::Greater; // Z inversé : 1 = près, 0 = infini
+            let (device, layout, shader, format) = (
+                &self.device,
+                &self.world_layout,
+                &self.world_shader,
+                self.config.format,
+            );
+            let mk = |label: &str, fs: &str, cull, depth_write, blend| {
+                surface_pipeline(
+                    device,
+                    layout,
+                    shader,
+                    format,
+                    label,
+                    "vs_block",
+                    fs,
+                    vl,
+                    cull,
+                    depth_write,
+                    greater,
+                    blend,
+                )
+            };
+            let back = Some(wgpu::Face::Back);
+            std::thread::scope(|sc| {
+                let block = sc.spawn(|| mk("blocs", "fs_block_fast", back, true, None));
+                // Miroirs et métaux : shader complet (reflets), sur peu de pixels.
+                let reflective = sc.spawn(|| mk("reflets", "fs_block", back, true, None));
+                // Eau, glace, verre : mélange alpha, sans écrire la profondeur, visibles des
+                // deux côtés.
+                let translucent = sc.spawn(|| {
+                    mk(
+                        "translucide",
+                        "fs_block_translucent",
+                        None,
+                        false,
+                        Some(wgpu::BlendState::ALPHA_BLENDING),
+                    )
+                });
+                taa::Heavy {
+                    block: block.join().expect("pipeline des blocs"),
+                    reflective: reflective.join().expect("pipeline réfléchissant"),
+                    translucent: translucent.join().expect("pipeline translucide"),
+                }
+            })
+        })
+    }
+
     /// Active ou coupe l'anticrénelage temporel (TAA).
     pub fn set_antialiasing(&mut self, on: bool) {
         if on == self.taa.is_some() {
             return;
         }
         self.taa = on.then(|| {
-            let vertex_layout = wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<Vertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &VERTEX_ATTRS,
-            };
             taa::Taa::new(
                 &self.device,
                 &self.world_layout,
                 &self.world_shader,
-                &vertex_layout,
                 self.config.format,
             )
         });
@@ -1571,17 +1622,21 @@ impl Renderer {
     fn draw_scene<'p>(
         &'p self,
         pass: &mut wgpu::RenderPass<'p>,
-        pipes: [&'p wgpu::RenderPipeline; 5],
+        pipes: ScenePipes<'p>,
         stats: &mut FrameStats,
     ) {
         pass.set_bind_group(0, self.world_group(), &[]);
 
-        pass.set_pipeline(pipes[0]);
+        pass.set_pipeline(pipes.sky);
         pass.draw(0..3, 0..1);
+        // Shaders lourds pas encore compilés (tout début du jeu) : le ciel seulement.
+        let Some(heavy) = pipes.heavy else {
+            return;
+        };
 
         // Blocs opaques : une page entière par appel (dessin indirect multiple), sinon un
         // appel par chunk mais sans changer de tampon.
-        pass.set_pipeline(pipes[1]);
+        pass.set_pipeline(&heavy.block);
         for &(page, first, count) in &self.page_groups {
             let pg = &self.arena.pages[page];
             pass.set_vertex_buffer(0, pg.vertices.slice(..));
@@ -1601,7 +1656,7 @@ impl Renderer {
         }
 
         // Miroirs et métaux : seulement les chunks qui en ont, avec le shader des reflets.
-        pass.set_pipeline(pipes[4]);
+        pass.set_pipeline(&heavy.reflective);
         self.draw_reflective(pass);
 
         // Opaques réellement envoyés (faces tournées vers la caméra seulement).
@@ -1611,11 +1666,11 @@ impl Renderer {
             self.drawn_triangles as f32 / 1000.0,
         );
         if self.outline {
-            pass.set_pipeline(pipes[3]);
+            pass.set_pipeline(pipes.outline);
             pass.draw(0..24, 0..1);
         }
         // Translucides de l'arrière vers l'avant, par-dessus la scène opaque.
-        pass.set_pipeline(pipes[2]);
+        pass.set_pipeline(&heavy.translucent);
         let mut bound = usize::MAX;
         for (_, key) in self.draw_list.iter().rev() {
             let c = &self.meshes[key];
@@ -1731,13 +1786,11 @@ impl Renderer {
             });
             self.draw_scene(
                 &mut pass,
-                [
-                    &self.sky_pipeline,
-                    &self.block_pipeline,
-                    &self.translucent_pipeline,
-                    &self.outline_pipeline,
-                    &self.reflective_pipeline,
-                ],
+                ScenePipes {
+                    sky: &self.sky_pipeline,
+                    outline: &self.outline_pipeline,
+                    heavy: Some(self.plain_pipes()),
+                },
                 &mut stats,
             );
             self.entities.draw(&mut pass, self.world_group(), false);
@@ -1887,8 +1940,11 @@ impl Renderer {
             .any(|(_, k)| self.meshes[k].reflective > 0);
         // Reflets synchronisés (par défaut) : calculés à chaque image sur les surfaces mêmes
         // (`refl_cam.w` reste à 0, le shader lance les rayons directement).
-        let do_refl =
-            self.async_reflections && self.raytracing && has_reflective && self.refl.due();
+        let do_refl = self.async_reflections
+            && self.raytracing
+            && has_reflective
+            && self.reflect_pipeline.try_get().is_some()
+            && self.refl.due();
         let mut globals = globals;
         if do_refl {
             self.refl.ran(jittered.to_cols_array_2d(), p.eye.to_array());
@@ -1950,7 +2006,10 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.bind_groups[1 - write], &[]);
-            pass.set_pipeline(&self.reflect_pipeline);
+            if let Some(p) = self.reflect_pipeline.try_get() {
+                pass.set_pipeline(p);
+                self.draw_reflective(&mut pass);
+            }
             self.draw_reflective(&mut pass);
         }
         if let Some(t) = &taa.targets {
@@ -1987,13 +2046,11 @@ impl Renderer {
             });
             self.draw_scene(
                 &mut pass,
-                [
-                    &taa.sky,
-                    &taa.block,
-                    &taa.translucent,
-                    &taa.outline,
-                    &taa.reflective,
-                ],
+                ScenePipes {
+                    sky: &taa.sky,
+                    outline: &taa.outline,
+                    heavy: taa.heavy.try_get(),
+                },
                 &mut stats,
             );
             self.entities.draw(&mut pass, self.world_group(), true);

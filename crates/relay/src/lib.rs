@@ -111,6 +111,14 @@ pub fn federated_whois(node: &'static minelib_p2p::Node, me: [u8; 32]) -> WhoisF
     })
 }
 
+/// Clé publique du relais de ce dossier, s'il en a déjà été un (sans le lancer).
+pub fn public_key(dir: &Path) -> Option<[u8; 32]> {
+    let bytes = std::fs::read(dir.join("relay.key")).ok()?;
+    postcard::from_bytes::<Identity>(&bytes)
+        .ok()
+        .map(|i| i.noise_public)
+}
+
 /// Clés du relais, créées au premier lancement.
 #[derive(Serialize, Deserialize)]
 struct Identity {

@@ -2560,6 +2560,12 @@ impl GameLoop for Game {
             Err(e) => log::error!("initialisation du rendu impossible : {e:#}"),
         }
         // Lancement direct dans un monde (tests, raccourci).
+        if self.auto_world.is_some() {
+            // Essais : l'image attendue dès la première (pas de ciel seul).
+            if let Some(r) = &self.renderer {
+                r.wait_world_ready();
+            }
+        }
         if let Some(name) = self.auto_world.take() {
             let existing = self
                 .worlds
@@ -2791,6 +2797,15 @@ impl GameLoop for Game {
                 Screen::Controls => self.controls_screen(input, size, true),
                 _ => {}
             }
+            // Monde ouvert dans les toutes premières secondes du jeu : les shaders lourds
+            // finissent de se compiler en tâche de fond.
+            if !renderer.world_ready() {
+                let s = (sizef.1 / 300.0).floor().max(1.0);
+                let t = "Préparation des shaders…";
+                let w = Ui::text_width(t, s);
+                self.ui
+                    .text((sizef.0 - w) / 2.0, sizef.1 * 0.4, s, GOLD, t);
+            }
             self.draw_message(size, dt);
             if let Some(s) = &self.session {
                 self.last_stats = s.render(
@@ -2866,7 +2881,7 @@ impl GameLoop for Game {
         // connexion automatique au compte terminée (12 s au plus : relais lent ou absent).
         self.renderer.is_some()
             && self.frames_drawn >= 3
-            && (self.accounts.auto_settled() || self.started.elapsed().as_secs() >= 12)
+            && (self.accounts.auto_settled() || self.started.elapsed().as_secs() >= 8)
     }
 
     fn on_shown(&mut self) {

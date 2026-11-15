@@ -16,7 +16,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -85,10 +85,21 @@ pub fn upsert(mut list: Vec<Ad>, me: Ad) -> Vec<u8> {
     }
 }
 
+/// Client du DHT, créé une fois et gardé (le rejoindre prend une à deux secondes).
+fn dht() -> Result<mainline::Dht> {
+    static DHT: std::sync::Mutex<Option<mainline::Dht>> = std::sync::Mutex::new(None);
+    let mut g = DHT.lock().unwrap();
+    if g.is_none() {
+        // Pas de réseau au lancement : on réessaiera à la prochaine demande.
+        *g = Some(mainline::Dht::client().map_err(|e| anyhow!("DHT : {e}"))?);
+    }
+    Ok(g.clone().expect("DHT"))
+}
+
 /// Lit la liste des relais dans le DHT (quelques secondes).
 #[allow(deprecated)]
 pub fn find_relays() -> Result<Vec<Ad>> {
-    let dht = mainline::Dht::client().context("DHT")?;
+    let dht = dht()?;
     let key = shared_key();
     let item = dht.get_mutable_most_recent(key.verifying_key().as_bytes(), Some(SALT));
     Ok(item.map(|i| decode_ads(i.value())).unwrap_or_default())
@@ -101,7 +112,7 @@ pub fn publish(me: Ad) {
         .spawn(move || {
             #[allow(deprecated)]
             let run = |me: &Ad| -> Result<()> {
-                let dht = mainline::Dht::client()?;
+                let dht = dht()?;
                 let key = shared_key();
                 let current =
                     dht.get_mutable_most_recent(key.verifying_key().as_bytes(), Some(SALT));
@@ -179,6 +190,13 @@ async fn pipe(
 
 impl Node {
     pub fn start() -> Result<Self> {
+        Self::start_with(None)
+    }
+
+    /// Nœud d'identité fixe (`secret`, 32 octets gardés sur le disque) : d'un lancement à
+    /// l'autre il garde le même identifiant, et reconnaît donc ses propres annonces dans
+    /// le DHT au lieu de les prendre pour le relais de quelqu'un d'autre.
+    pub fn start_with(secret: Option<[u8; 32]>) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("iroh")
@@ -186,13 +204,42 @@ impl Node {
             .build()?;
         let ep = rt
             .block_on(async {
-                iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-                    .alpns(vec![ALPN.to_vec()])
-                    .bind()
-                    .await
+                let mut b =
+                    iroh::Endpoint::builder(iroh::endpoint::presets::N0).alpns(vec![ALPN.to_vec()]);
+                if let Some(s) = secret {
+                    b = b.secret_key(iroh::SecretKey::from_bytes(&s));
+                }
+                b.bind().await
             })
             .map_err(|e| anyhow!("iroh : {e}"))?;
         Ok(Self { rt, ep })
+    }
+
+    /// Comme [`Node::tunnel`], mais attend que le nœud distant réponde (au plus `wait`) :
+    /// un relais éteint dont l'annonce traîne encore dans le DHT est écarté tout de suite,
+    /// au lieu de faire échouer la connexion dix secondes plus tard.
+    pub fn tunnel_checked(&self, remote: [u8; 32], wait: Duration) -> Result<SocketAddr> {
+        let id = iroh::EndpointId::from_bytes(&remote).map_err(|e| anyhow!("{e}"))?;
+        let addr: iroh::EndpointAddr = id.into();
+        let ep = self.ep.clone();
+        let (conn, listener) = self.rt.block_on(async move {
+            let conn = tokio::time::timeout(wait, ep.connect(addr, ALPN))
+                .await
+                .map_err(|_| anyhow!("le relais distant ne répond pas"))?
+                .map_err(|e| anyhow!("relais distant : {e}"))?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            anyhow::Ok((conn, listener))
+        })?;
+        let local = listener.local_addr()?;
+        self.rt.spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let Ok((send, recv)) = conn.open_bi().await else {
+                    break;
+                };
+                tokio::spawn(pipe(tcp, send, recv));
+            }
+        });
+        Ok(local)
     }
 
     pub fn id(&self) -> [u8; 32] {

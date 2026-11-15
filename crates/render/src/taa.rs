@@ -42,9 +42,8 @@ pub struct Targets {
 }
 
 pub struct Taa {
-    pub block: wgpu::RenderPipeline,
-    pub reflective: wgpu::RenderPipeline,
-    pub translucent: wgpu::RenderPipeline,
+    /// Blocs, miroirs, translucides : prêts un peu après le lancement.
+    pub heavy: crate::lazy::Lazy<Heavy>,
     pub sky: wgpu::RenderPipeline,
     pub outline: wgpu::RenderPipeline,
     resolve: wgpu::RenderPipeline,
@@ -141,126 +140,147 @@ fn fullscreen(
     })
 }
 
+/// Pipelines lourds du monde (shader complet).
+pub struct Heavy {
+    pub block: wgpu::RenderPipeline,
+    pub reflective: wgpu::RenderPipeline,
+    pub translucent: wgpu::RenderPipeline,
+}
+
+/// Un pipeline du monde qui écrit la couleur et le mouvement (TAA).
+#[allow(clippy::too_many_arguments)]
+fn world_pipeline(
+    device: &wgpu::Device,
+    world_layout: &wgpu::PipelineLayout,
+    world_shader: &wgpu::ShaderModule,
+    label: &str,
+    vs: &str,
+    fs: &str,
+    buffers: &[wgpu::VertexBufferLayout],
+    cull: Option<wgpu::Face>,
+    depth_write: bool,
+    compare: wgpu::CompareFunction,
+    blend: Option<wgpu::BlendState>,
+    motion_writes: wgpu::ColorWrites,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(world_layout),
+        vertex: wgpu::VertexState {
+            module: world_shader,
+            entry_point: Some(vs),
+            compilation_options: Default::default(),
+            buffers,
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: if vs == "vs_outline" {
+                wgpu::PrimitiveTopology::LineList
+            } else {
+                wgpu::PrimitiveTopology::TriangleList
+            },
+            cull_mode: cull,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: depth_write,
+            depth_compare: compare,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: world_shader,
+            entry_point: Some(fs),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: COLOR_FORMAT,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: MOTION_FORMAT,
+                    blend: None,
+                    write_mask: motion_writes,
+                }),
+            ],
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
 impl Taa {
     pub fn new(
         device: &wgpu::Device,
         world_layout: &wgpu::PipelineLayout,
         world_shader: &wgpu::ShaderModule,
-        vertex_layout: &wgpu::VertexBufferLayout,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
-        let mk = |label: &str,
-                  vs: &str,
-                  fs: &str,
-                  buffers: &[wgpu::VertexBufferLayout],
-                  cull: Option<wgpu::Face>,
-                  depth_write: bool,
-                  compare: wgpu::CompareFunction,
-                  blend: Option<wgpu::BlendState>,
-                  motion_writes: wgpu::ColorWrites| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(world_layout),
-                vertex: wgpu::VertexState {
-                    module: world_shader,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: if vs == "vs_outline" {
-                        wgpu::PrimitiveTopology::LineList
-                    } else {
-                        wgpu::PrimitiveTopology::TriangleList
-                    },
-                    cull_mode: cull,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: depth_write,
-                    depth_compare: compare,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: world_shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[
-                        Some(wgpu::ColorTargetState {
-                            format: COLOR_FORMAT,
-                            blend,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: MOTION_FORMAT,
-                            blend: None,
-                            write_mask: motion_writes,
-                        }),
-                    ],
-                }),
-                multiview: None,
-                cache: None,
+        // Shaders lourds du monde : compilés en parallèle sur des fils à part (plusieurs
+        // secondes chacun sous DirectX), sans retarder l'ouverture du jeu. Les menus n'en
+        // ont pas besoin ; le monde s'affiche dès qu'ils sont prêts.
+        let heavy = {
+            let (device, layout, shader) =
+                (device.clone(), world_layout.clone(), world_shader.clone());
+            crate::lazy::Lazy::spawn("shaders du monde (TAA)", move || {
+                let vertex_layout = crate::world_vertex_layout();
+                let vl = std::slice::from_ref(&vertex_layout);
+                let greater = wgpu::CompareFunction::Greater; // Z inversé
+                let t0 = std::time::Instant::now();
+                let mk = |label: &str, fs: &str, cull, depth_write, blend, motion_writes| {
+                    world_pipeline(
+                        &device,
+                        &layout,
+                        &shader,
+                        label,
+                        "vs_block",
+                        fs,
+                        vl,
+                        cull,
+                        depth_write,
+                        greater,
+                        blend,
+                        motion_writes,
+                    )
+                };
+                let all = wgpu::ColorWrites::ALL;
+                let back = Some(wgpu::Face::Back);
+                let out = std::thread::scope(|sc| {
+                    let block =
+                        sc.spawn(|| mk("blocs (TAA)", "fs_block_fast_mv", back, true, None, all));
+                    let reflective =
+                        sc.spawn(|| mk("reflets (TAA)", "fs_block_mv", back, true, None, all));
+                    // Translucides : couleur mélangée, on garde le mouvement de ce qui est
+                    // derrière.
+                    let translucent = sc.spawn(|| {
+                        mk(
+                            "translucide (TAA)",
+                            "fs_block_translucent_mv",
+                            None,
+                            false,
+                            Some(wgpu::BlendState::ALPHA_BLENDING),
+                            wgpu::ColorWrites::empty(),
+                        )
+                    });
+                    Heavy {
+                        block: block.join().expect("pipeline des blocs (TAA)"),
+                        reflective: reflective.join().expect("pipeline réfléchissant (TAA)"),
+                        translucent: translucent.join().expect("pipeline translucide (TAA)"),
+                    }
+                });
+                log::info!(
+                    "shaders du monde (TAA) compilés en {:.1} s (en tâche de fond)",
+                    t0.elapsed().as_secs_f32()
+                );
+                out
             })
         };
-        let vl = std::slice::from_ref(vertex_layout);
-        let greater = wgpu::CompareFunction::Greater; // Z inversé
-                                                      // Shaders lourds du monde compilés en parallèle (plusieurs secondes chacun sous DirectX).
-        let t0 = std::time::Instant::now();
-        let (block, reflective, translucent) = std::thread::scope(|sc| {
-            let block = sc.spawn(|| {
-                mk(
-                    "blocs (TAA)",
-                    "vs_block",
-                    "fs_block_fast_mv",
-                    vl,
-                    Some(wgpu::Face::Back),
-                    true,
-                    greater,
-                    None,
-                    wgpu::ColorWrites::ALL,
-                )
-            });
-            let reflective = sc.spawn(|| {
-                mk(
-                    "reflets (TAA)",
-                    "vs_block",
-                    "fs_block_mv",
-                    vl,
-                    Some(wgpu::Face::Back),
-                    true,
-                    greater,
-                    None,
-                    wgpu::ColorWrites::ALL,
-                )
-            });
-            // Translucides : couleur mélangée, on garde le mouvement de ce qui est derrière.
-            let translucent = sc.spawn(|| {
-                mk(
-                    "translucide (TAA)",
-                    "vs_block",
-                    "fs_block_translucent_mv",
-                    vl,
-                    None,
-                    false,
-                    greater,
-                    Some(wgpu::BlendState::ALPHA_BLENDING),
-                    wgpu::ColorWrites::empty(),
-                )
-            });
-            (
-                block.join().expect("pipeline des blocs (TAA)"),
-                reflective.join().expect("pipeline réfléchissant (TAA)"),
-                translucent.join().expect("pipeline translucide (TAA)"),
-            )
-        });
-        log::info!(
-            "shaders du monde (TAA) compilés en {:.1} s",
-            t0.elapsed().as_secs_f32()
-        );
-        let sky = mk(
+        let sky = world_pipeline(
+            device,
+            world_layout,
+            world_shader,
             "ciel (TAA)",
             "vs_sky",
             "fs_sky_mv",
@@ -271,8 +291,10 @@ impl Taa {
             None,
             wgpu::ColorWrites::ALL,
         );
-
-        let outline = mk(
+        let outline = world_pipeline(
+            device,
+            world_layout,
+            world_shader,
             "contour (TAA)",
             "vs_outline",
             "fs_outline_mv",
@@ -348,9 +370,7 @@ impl Taa {
             mapped_at_creation: false,
         });
         Self {
-            block,
-            reflective,
-            translucent,
+            heavy,
             sky,
             outline,
             resolve,

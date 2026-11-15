@@ -148,6 +148,9 @@ pub enum Event {
     Servers(Vec<ServerEntry>),
     LoggedOut,
     Error(String),
+    /// Relais injoignable (réseau, relais éteint) : pas une erreur du joueur, on peut
+    /// réessayer.
+    Offline(String),
     /// Session ouverte : file pour envoyer des données de jeu sans attendre
     /// (`transport::push` d'un `Request::ToHost`, `ToPeer` ou `Broadcast`).
     Link(Sender<Inbound>),
@@ -302,7 +305,16 @@ impl Client {
     }
 }
 
-/// Message d'une erreur du relais, pour le joueur.
+/// Marque d'une erreur de connexion au relais (pas d'une réponse du relais).
+#[derive(Debug)]
+struct Offline;
+
+impl std::fmt::Display for Offline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("pas de connexion au relais")
+    }
+}
+
 /// Demande au relais `addr` (clé `key`) si `pseudo` y a un compte : sa clé publique.
 pub fn whois(addr: &str, key: [u8; 32], pseudo: &str) -> Result<Option<[u8; 32]>> {
     let (mut chan, got) = Channel::connect(addr, Duration::from_secs(4))?;
@@ -402,7 +414,12 @@ impl Worker {
             if let Some(cmd) = cmd {
                 if let Err(e) = self.handle(cmd) {
                     log::warn!("relais : {e:#}");
-                    self.emit(Event::Error(format!("{e:#}")));
+                    if e.downcast_ref::<Offline>().is_some() {
+                        // Le message utile est la cause (« Relais injoignable… »).
+                        self.emit(Event::Offline(format!("{:#}", e.root_cause())));
+                    } else {
+                        self.emit(Event::Error(format!("{e:#}")));
+                    }
                 }
                 continue;
             }
@@ -513,8 +530,26 @@ impl Worker {
         self.emit(e);
     }
 
-    /// Nouvelle connexion au relais (vérifie sa clé).
+    /// Nouvelle connexion au relais (vérifie sa clé). Relais trouvé automatiquement : en cas
+    /// d'échec on en cherche un autre, sans rien montrer au joueur (trois essais).
     fn connect(&mut self) -> Result<()> {
+        let tries = if self.resolve.is_some() { 3 } else { 1 };
+        let mut last = None;
+        for n in 1..=tries {
+            match self.connect_once() {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if n < tries {
+                        log::info!("connexion au relais : {e:#} — nouvel essai ({n}/{tries})");
+                    }
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.expect("au moins un essai").context(Offline))
+    }
+
+    fn connect_once(&mut self) -> Result<()> {
         if self.addr.is_empty() && self.resolve.is_some() {
             {
                 let _ = self
@@ -631,9 +666,15 @@ impl Worker {
                 device,
             } => {
                 self.chan = None;
+                // Les clés du compte se calculent (une seconde environ) pendant qu'on
+                // cherche le relais et qu'on s'y connecte.
+                let (p, w) = (pseudo.clone(), password.clone());
+                let deriving = std::thread::spawn(move || crypto::derive(&p, &w));
                 self.connect()?;
                 self.emit(Event::Progress("Vérification du mot de passe…"));
-                let keys = crypto::derive(&pseudo, &password)?;
+                let keys = deriving
+                    .join()
+                    .map_err(|_| anyhow!("calcul des clés du compte interrompu"))??;
                 let wrong = error_text(ErrorCode::WrongCredentials, "");
                 match self.login(&pseudo, &keys, totp, device) {
                     Err(e) if e.to_string() == wrong && backup.is_some() => {

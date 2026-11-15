@@ -17,68 +17,168 @@ use minelib_render::Ui;
 
 use crate::menu::{self, Ctx, GOLD, GREY, RED, WHITE};
 
-/// Nœud iroh du jeu (un seul, gardé pour la durée du jeu).
-fn node() -> Option<&'static minelib_p2p::Node> {
+/// Nœud iroh du jeu (un seul, gardé pour la durée du jeu). Son identité est gardée à côté
+/// du dossier du relais (`noeud.key`) : la même à chaque lancement.
+fn node(dir: &std::path::Path) -> Option<&'static minelib_p2p::Node> {
     static NODE: std::sync::OnceLock<Option<minelib_p2p::Node>> = std::sync::OnceLock::new();
-    NODE.get_or_init(|| match minelib_p2p::Node::start() {
-        Ok(n) => Some(n),
-        Err(e) => {
-            log::warn!("iroh : {e:#}");
-            None
+    NODE.get_or_init(|| {
+        let path = dir.with_file_name("noeud.key");
+        let secret: [u8; 32] = std::fs::read(&path)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or_else(|| {
+                let k: [u8; 32] = minelib_net::transport::generate_static().0;
+                let _ = std::fs::write(&path, k);
+                k
+            });
+        match minelib_p2p::Node::start_with(Some(secret)) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                log::warn!("iroh : {e:#}");
+                None
+            }
         }
     })
     .as_ref()
 }
 
+/// Relais du DHT qui répond vraiment : chaque candidat est essayé en même temps (tunnel
+/// iroh, puis poignée de main chiffrée avec la clé annoncée), le premier qui répond est
+/// pris, le relais déjà connu d'abord s'il répond aussi vite. Un relais éteint dont
+/// l'annonce traîne encore est écarté en quelques secondes, sans erreur pour le joueur.
+fn reachable_relay(
+    node: &'static minelib_p2p::Node,
+    ads: Vec<minelib_p2p::Ad>,
+    known: Option<[u8; 32]>,
+) -> Option<(SocketAddr, minelib_p2p::Ad)> {
+    const WAIT: Duration = Duration::from_secs(4);
+    if ads.is_empty() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let n = ads.len();
+    for ad in ads {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let found = node.tunnel_checked(ad.node, WAIT).ok().filter(|addr| {
+                minelib_net::transport::Channel::connect(&addr.to_string(), WAIT)
+                    .is_ok_and(|(_, key)| key == ad.noise)
+            });
+            if found.is_none() {
+                log::info!(
+                    "relais « {} » du DHT injoignable (nœud {}) : écarté",
+                    ad.name,
+                    crypto::hex(&ad.node[..8])
+                );
+            }
+            let _ = tx.send(found.map(|a| (a, ad)));
+        });
+    }
+    drop(tx);
+    let end = std::time::Instant::now() + WAIT + WAIT + Duration::from_secs(1);
+    let mut first: Option<(SocketAddr, minelib_p2p::Ad)> = None;
+    let mut first_at = std::time::Instant::now();
+    for _ in 0..n {
+        // Un relais a répondu : on laisse 300 ms au relais connu pour répondre aussi.
+        let limit = match &first {
+            Some(_) => first_at + Duration::from_millis(300),
+            None => end,
+        };
+        let left = limit.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Some(r)) => {
+                if Some(r.1.noise) == known {
+                    return Some(r);
+                }
+                if first.is_none() {
+                    first_at = std::time::Instant::now();
+                    first = Some(r);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    }
+    first
+}
+
 /// Trouve un relais sans réglage : sur ce PC, sur le réseau local, puis dans le DHT de
-/// BitTorrent (le plus ancien en ligne, par un tunnel iroh) ; sinon ce PC devient le
-/// relais (visible du réseau local et inscrit dans le DHT).
+/// BitTorrent (par un tunnel iroh) ; sinon ce PC devient le relais (visible du réseau
+/// local et inscrit dans le DHT). Le réseau local et le DHT sont interrogés en même
+/// temps, et un relais n'est retenu que s'il répond : jamais d'erreur « relais
+/// injoignable » à cause d'une vieille annonce.
 fn auto_relay(
     dir: &std::path::Path,
     failed: &mut Vec<[u8; 32]>,
 ) -> anyhow::Result<(String, Option<[u8; 32]>)> {
+    let t0 = std::time::Instant::now();
     let port = minelib_net::DEFAULT_PORT;
     let local = SocketAddr::from(([127, 0, 0, 1], port));
     if TcpStream::connect_timeout(&local, Duration::from_millis(300)).is_ok() {
         return Ok((local.to_string(), None));
     }
-    if let Some((lan, key)) = minelib_net::lan::discover(Duration::from_millis(1500)) {
+    // Réseau local et DHT en même temps.
+    let (lan_tx, lan_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = lan_tx.send(minelib_net::lan::discover(Duration::from_millis(1200)));
+    });
+    let (dht_tx, dht_rx) = std::sync::mpsc::channel();
+    let dir2 = dir.to_path_buf();
+    std::thread::spawn(move || {
+        let node = node(&dir2);
+        let list = minelib_p2p::find_relays();
+        let _ = dht_tx.send((node, list));
+    });
+    if let Ok(Some((lan, key))) = lan_rx.recv() {
         log::info!("relais trouvé sur le réseau local : {lan}");
         return Ok((lan.to_string(), Some(key)));
     }
-    if let Some(node) = node() {
-        match minelib_p2p::find_relays() {
-            Ok(list) => {
-                // Le relais où l'on jouait déjà passe avant « le plus ancien » : la date
-                // d'un relais n'est que ce qu'il annonce, un faux relais pourrait se dire
-                // plus vieux que tous pour attirer les joueurs.
-                let known_path = dir.with_file_name("relais_connu");
-                let known: Option<[u8; 32]> = std::fs::read_to_string(&known_path)
-                    .ok()
-                    .and_then(|t| crypto::unhex(t.trim()))
-                    .and_then(|v| v.try_into().ok());
-                let usable =
-                    |a: &&minelib_p2p::Ad| !failed.contains(&a.node) && a.node != node.id();
-                let pick = list
-                    .iter()
-                    .filter(usable)
-                    .find(|a| Some(a.noise) == known)
-                    .or_else(|| list.iter().find(usable));
-                if let Some(ad) = pick {
-                    failed.push(ad.node);
-                    let addr = node.tunnel(ad.node)?;
-                    log::info!(
-                        "relais « {} » trouvé dans le DHT (nœud {})",
-                        ad.name,
-                        crypto::hex(&ad.node[..8])
-                    );
-                    if known.is_none() {
-                        let _ = std::fs::write(&known_path, crypto::hex(&ad.noise));
-                    }
-                    return Ok((addr.to_string(), Some(ad.noise)));
-                }
+    // Le DHT répond en 2 à 3 secondes ; au-delà (réseau filtré), on fait sans.
+    let left = Duration::from_secs(6).saturating_sub(t0.elapsed());
+    let (found, list) = match dht_rx.recv_timeout(left) {
+        Ok((n, Ok(list))) => (n, list),
+        Ok((n, Err(e))) => {
+            log::warn!("DHT : {e:#}");
+            (n, Vec::new())
+        }
+        Err(_) => {
+            log::warn!("DHT : pas de réponse à temps");
+            (None, Vec::new())
+        }
+    };
+    if let Some(node) = found {
+        // Le relais où l'on jouait déjà passe avant les autres : la date d'un relais n'est
+        // que ce qu'il annonce, un faux relais pourrait se dire plus vieux que tous pour
+        // attirer les joueurs.
+        let known_path = dir.with_file_name("relais_connu");
+        let known: Option<[u8; 32]> = std::fs::read_to_string(&known_path)
+            .ok()
+            .and_then(|t| crypto::unhex(t.trim()))
+            .and_then(|v| v.try_into().ok());
+        // Ni un relais déjà essayé sans succès, ni soi-même : ce nœud, ou une ancienne
+        // annonce de ce PC (reconnue à la clé de son propre relais).
+        let mine = minelib_relay::public_key(dir);
+        let ads: Vec<minelib_p2p::Ad> = list
+            .into_iter()
+            .filter(|a| {
+                !failed.contains(&a.node) && a.node != node.id() && Some(a.noise) != mine
+            })
+            .take(4)
+            .collect();
+        for a in &ads {
+            failed.push(a.node);
+        }
+        if let Some((addr, ad)) = reachable_relay(node, ads, known) {
+            log::info!(
+                "relais « {} » trouvé dans le DHT (nœud {}), en {:.1} s",
+                ad.name,
+                crypto::hex(&ad.node[..8]),
+                t0.elapsed().as_secs_f32()
+            );
+            if known.is_none() {
+                let _ = std::fs::write(&known_path, crypto::hex(&ad.noise));
             }
-            Err(e) => log::warn!("DHT : {e:#}"),
+            return Ok((addr.to_string(), Some(ad.noise)));
         }
     }
     // Personne : ce PC devient le relais.
@@ -96,22 +196,31 @@ fn auto_relay(
             name: "Relais d'un joueur".into(),
         })
     })?;
-    log::info!("ce PC devient le relais ({})", h.addr);
+    log::info!(
+        "ce PC devient le relais ({}), après {:.1} s de recherche",
+        h.addr,
+        t0.elapsed().as_secs_f32()
+    );
     minelib_net::lan::announce(h.addr.port(), h.public);
     let mine = SocketAddr::from(([127, 0, 0, 1], h.addr.port()));
-    if let Some(node) = node() {
+    let public = h.public;
+    // Joignable de partout (tunnel iroh) et inscrit dans le DHT : en tâche de fond, le
+    // joueur est connecté à son relais sans attendre.
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        let Some(node) = node(&dir) else { return };
         node.serve(mine);
         // Pseudos uniques avec les autres relais du DHT.
-        h.set_whois(minelib_relay::federated_whois(node, h.public));
+        h.set_whois(minelib_relay::federated_whois(node, public));
         minelib_p2p::publish(minelib_p2p::Ad {
             node: node.id(),
-            noise: h.public,
+            noise: public,
             name: "Relais d'un joueur".into(),
             since: minelib_p2p::now(),
             seen: minelib_p2p::now(),
         });
-    }
-    Ok((mine.to_string(), Some(h.public)))
+    });
+    Ok((mine.to_string(), Some(public)))
 }
 
 /// Compte connecté.
@@ -186,6 +295,11 @@ pub struct Accounts {
     sent: Option<(String, String)>,
     /// La connexion automatique du lancement a été tentée.
     auto_tried: bool,
+    /// Connexion automatique en cours ; essais ratés faute de relais joignable, et moment
+    /// du prochain essai (silencieux : le joueur n'a rien fait de mal).
+    auto_pending: bool,
+    auto_fails: u8,
+    auto_next: Option<std::time::Instant>,
 }
 
 impl Accounts {
@@ -222,6 +336,9 @@ impl Accounts {
             lan_relay: false,
             sent: None,
             auto_tried: false,
+            auto_pending: false,
+            auto_fails: 0,
+            auto_next: None,
         }
     }
 
@@ -290,6 +407,7 @@ impl Accounts {
             return;
         };
         let backup = std::fs::read(self.backup_path(&pseudo)).ok();
+        self.auto_pending = true;
         self.sent = Some((pseudo.clone(), password.clone()));
         self.pseudo = pseudo.clone();
         let device = self.device(&pseudo);
@@ -391,6 +509,27 @@ impl Accounts {
             if self.account.is_none() && self.client.is_none() {
                 self.auto_login();
             }
+            // Essais : `MINELIB_TEST_ACCOUNT=pseudo:motdepasse` crée ce compte au premier
+            // lancement (il est ensuite gardé, comme après une inscription à la main).
+            if let Some((p, w)) = std::env::var("MINELIB_TEST_ACCOUNT")
+                .ok()
+                .as_deref()
+                .and_then(|v| v.split_once(':'))
+                .filter(|_| self.sent.is_none())
+            {
+                self.sent = Some((p.to_string(), w.to_string()));
+                self.send(Cmd::Register {
+                    pseudo: p.to_string(),
+                    password: w.to_string(),
+                });
+            }
+        }
+        // Connexion automatique ratée faute de relais joignable : nouvel essai, en silence.
+        if self.auto_next.is_some_and(|t| std::time::Instant::now() >= t) {
+            self.auto_next = None;
+            if self.account.is_none() && !self.need_totp {
+                self.auto_login();
+            }
         }
         let Some(client) = &self.client else { return };
         let mut events = Vec::new();
@@ -413,6 +552,8 @@ impl Accounts {
                 } => {
                     self.busy = None;
                     self.need_totp = false;
+                    self.auto_pending = false;
+                    self.auto_fails = 0;
                     // Compte gardé sur ce PC : connexion automatique au prochain lancement.
                     if let Some((p, w)) = self.sent.take() {
                         self.remember(&p, &w);
@@ -431,6 +572,7 @@ impl Accounts {
                 Event::DeviceTrusted { pseudo, token } => self.keep_device(&pseudo, &token),
                 Event::NeedTotp => {
                     self.busy = None;
+                    self.auto_pending = false;
                     self.need_totp = true;
                     self.code.clear();
                     self.focus = 2;
@@ -471,6 +613,30 @@ impl Accounts {
                 Event::Error(m) => {
                     self.busy = None;
                     self.sent = None;
+                    self.auto_pending = false;
+                    self.error = Some(m.clone());
+                    self.game_events.push(Event::Error(m));
+                }
+                // Pas de relais joignable pendant la connexion automatique : ce n'est pas
+                // une erreur du joueur. On réessaie tout seul (5 fois, de plus en plus
+                // espacées), sans message ; le jeu s'ouvre en attendant.
+                Event::Offline(m) if self.auto_pending && self.auto_fails < 5 => {
+                    self.busy = None;
+                    self.sent = None;
+                    self.auto_pending = false;
+                    self.auto_fails += 1;
+                    let wait = Duration::from_secs(2 * self.auto_fails as u64);
+                    self.auto_next = Some(std::time::Instant::now() + wait);
+                    log::info!(
+                        "connexion automatique : {m} — nouvel essai dans {} s ({}/5)",
+                        wait.as_secs(),
+                        self.auto_fails
+                    );
+                }
+                Event::Offline(m) => {
+                    self.busy = None;
+                    self.sent = None;
+                    self.auto_pending = false;
                     self.error = Some(m.clone());
                     self.game_events.push(Event::Error(m));
                 }
