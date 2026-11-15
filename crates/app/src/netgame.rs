@@ -655,6 +655,15 @@ impl Auditor {
                     let moving =
                         input.forward != 0 || input.strafe != 0 || input.jump || input.jump_pressed;
                     if !alive(&m, who) || ((m.frozen() || m.busy(who)) && moving) {
+                        if std::env::var_os("MINELIB_AUDIT_DEBUG").is_some() {
+                            eprintln!(
+                                "AUDIT t={t} who={who} seq={seq} alive={} frozen={} busy={} phase={} input={input:?}",
+                                alive(&m, who),
+                                m.frozen(),
+                                m.busy(who),
+                                m.phase
+                            );
+                        }
                         wrong.push("déplacement d'un joueur mort ou immobilisé");
                     }
                     step(p, world, input, dt);

@@ -221,14 +221,37 @@ fn install(dir: &Path, r: &Release, state: &Shared) -> Result<()> {
     Ok(())
 }
 
-/// Lance le jeu (qui sait alors qu'il est tenu à jour par le lanceur).
+/// Fichier que le jeu écrit quand sa fenêtre apparaît, entièrement chargée.
+fn ready_path(dir: &Path) -> PathBuf {
+    dir.join("pret")
+}
+
+/// Lance le jeu (qui sait alors qu'il est tenu à jour par le lanceur), puis attend qu'il
+/// soit chargé : sa fenêtre n'apparaît qu'une fois prête, le lanceur reste affiché d'ici là.
 fn launch(dir: &Path) -> Result<()> {
-    std::process::Command::new(game_path(dir))
+    let ready = ready_path(dir);
+    let _ = std::fs::remove_file(&ready);
+    let mut child = std::process::Command::new(game_path(dir))
         .current_dir(dir)
         .env("MINELIB_LAUNCHER", "1")
+        .env("MINELIB_READY_FILE", &ready)
         .spawn()
         .context("lancement du jeu")?;
-    Ok(())
+    let start = Instant::now();
+    loop {
+        if ready.exists() {
+            let _ = std::fs::remove_file(&ready);
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!("le jeu s'est fermé pendant son chargement ({status}) : voir minelib.log");
+        }
+        // Très long : le jeu se montrera de lui-même, on n'attend plus.
+        if start.elapsed().as_secs() > 120 {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +290,9 @@ fn work(state: Shared, proxy: EventLoopProxy<()>) {
         Plan::Launch => Ok(()),
         Plan::Fail(e) => Err(e),
     };
+    if result.is_ok() {
+        state.lock().unwrap().phase = Phase::Launching;
+    }
     let next = match result.and_then(|()| launch(&dir).map_err(|e| format!("{e:#}"))) {
         Ok(()) => {
             state.lock().unwrap().done = true;
@@ -284,7 +310,6 @@ struct App {
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     started: Instant,
-    launched_at: Option<Instant>,
 }
 
 impl App {
@@ -346,7 +371,7 @@ impl App {
                     Some(f),
                 )
             }
-            Phase::Launching => ("Lancement du jeu…".into(), Some(1.0)),
+            Phase::Launching => ("Chargement du jeu…".into(), None),
             Phase::Failed(e) => (e.clone(), None),
         };
         let failed = matches!(phase, Phase::Failed(_));
@@ -382,12 +407,21 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes()
             .with_title("Minelib")
             .with_inner_size(LogicalSize::new(560.0, 260.0))
-            .with_resizable(false);
+            .with_resizable(false)
+            .with_visible(false);
         let Ok(window) = el.create_window(attrs) else {
             el.exit();
             return;
         };
         let window = Arc::new(window);
+        // Au centre de l'écran, puis montrée.
+        if let Some(m) = window.current_monitor().or_else(|| el.primary_monitor()) {
+            let (mp, ms, ws) = (m.position(), m.size(), window.outer_size());
+            let x = mp.x + (ms.width as i32 - ws.width as i32) / 2;
+            let y = mp.y + (ms.height as i32 - ws.height as i32) / 2;
+            window.set_outer_position(winit::dpi::PhysicalPosition::new(x.max(mp.x), y.max(mp.y)));
+        }
+        window.set_visible(true);
         let surface = softbuffer::Context::new(window.clone())
             .and_then(|ctx| softbuffer::Surface::new(&ctx, window.clone()))
             .ok();
@@ -422,13 +456,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // Jeu lancé : on laisse sa fenêtre s'ouvrir, puis on ferme le lanceur.
+        // Jeu chargé et affiché : le lanceur se ferme.
         if self.state.lock().unwrap().done {
-            let t = *self.launched_at.get_or_insert_with(Instant::now);
-            if t.elapsed().as_millis() > 1500 {
-                el.exit();
-                return;
-            }
+            el.exit();
+            return;
         }
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -510,7 +541,6 @@ fn main() {
         window: None,
         surface: None,
         started: Instant::now(),
-        launched_at: None,
     };
     let _ = event_loop.run_app(&mut app);
 }

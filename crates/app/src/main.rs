@@ -200,6 +200,8 @@ struct Game {
     last_stats: FrameStats,
     title_timer: f32,
     exit_after: Option<f32>,
+    /// Images dessinées depuis le lancement (la fenêtre apparaît après les premières).
+    frames_drawn: u32,
     /// Capture automatique à ce temps (essais).
     shot_at: Option<f32>,
     show_debug: bool,
@@ -312,6 +314,7 @@ impl Game {
             title_timer: 0.0,
             exit_after: env_parse("MINELIB_EXIT_AFTER"),
             shot_at: env_parse("MINELIB_SHOT_AT"),
+            frames_drawn: 0,
             show_debug: env_parse::<u8>("MINELIB_DEBUG").is_some_and(|v| v != 0),
             fps_max: env_parse::<f32>("MINELIB_FPS_MAX").filter(|&f| f > 0.0),
             frame_start: Instant::now(),
@@ -2846,9 +2849,23 @@ impl GameLoop for Game {
             self.select_pack(&mut renderer, &info);
         }
         self.renderer = Some(renderer);
+        self.frames_drawn = self.frames_drawn.saturating_add(1);
         self.limit_fps();
         minelib_render::perf::frame_end();
         !self.quit
+    }
+
+    fn loaded(&self) -> bool {
+        // Rendu prêt et quelques images déjà dessinées (textures envoyées à la carte).
+        self.renderer.is_some() && self.frames_drawn >= 3
+    }
+
+    fn on_shown(&mut self) {
+        log::info!("fenêtre affichée après {} images", self.frames_drawn);
+        // Le lanceur attend ce fichier pour se fermer.
+        if let Some(path) = std::env::var_os("MINELIB_READY_FILE") {
+            let _ = std::fs::write(path, b"ok");
+        }
     }
 
     fn ui_open(&self) -> bool {

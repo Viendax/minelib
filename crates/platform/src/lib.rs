@@ -108,7 +108,17 @@ pub trait GameLoop {
     fn ui_open(&self) -> bool {
         false
     }
+    /// Le jeu est-il prêt à être montré ? La fenêtre reste cachée jusque-là (pas de fenêtre
+    /// noire ou à moitié dessinée pendant le chargement).
+    fn loaded(&self) -> bool {
+        true
+    }
+    /// La fenêtre vient d'apparaître.
+    fn on_shown(&mut self) {}
 }
+
+/// Au plus ce temps avant de montrer la fenêtre, prête ou non.
+const SHOW_AFTER: std::time::Duration = std::time::Duration::from_secs(25);
 
 pub fn run<G: GameLoop>(title: &str, game: G) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
@@ -120,6 +130,8 @@ pub fn run<G: GameLoop>(title: &str, game: G) -> anyhow::Result<()> {
         input: Input::default(),
         last: Instant::now(),
         ui_was_open: false,
+        shown: false,
+        created: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -132,6 +144,9 @@ struct App<G: GameLoop> {
     input: Input,
     last: Instant,
     ui_was_open: bool,
+    /// Fenêtre montrée (elle est créée cachée), et quand elle a été créée.
+    shown: bool,
+    created: Instant,
 }
 
 impl<G: GameLoop> App<G> {
@@ -162,7 +177,8 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
         }
         let attrs = Window::default_attributes()
             .with_title(self.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+            .with_visible(false);
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -172,6 +188,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
         window.request_redraw();
         self.window = Some(window);
         self.last = Instant::now();
+        self.created = Instant::now();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -260,6 +277,17 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
         let Some(w) = self.window.clone() else { return };
         let keep_running = self.game.on_frame(&w, &self.input, dt);
         self.input.end_frame();
+        // Chargé (ou trop long) : la fenêtre apparaît, déjà dessinée.
+        if !self.shown && (self.game.loaded() || self.created.elapsed() > SHOW_AFTER) {
+            self.shown = true;
+            // Au centre de l'écran, sauf en plein écran (déjà posé sur l'écran).
+            if w.fullscreen().is_none() {
+                center(&w);
+            }
+            w.set_visible(true);
+            w.focus_window();
+            self.game.on_shown();
+        }
         // Ouverture / fermeture d'une interface : libère ou recapture la souris.
         let open = self.game.ui_open();
         if open && self.input.grabbed {
@@ -282,6 +310,18 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
             }
         }
     }
+}
+
+/// Place la fenêtre au centre de l'écran où elle s'ouvre (l'écran principal sinon).
+fn center(w: &Window) {
+    let Some(m) = w.current_monitor().or_else(|| w.primary_monitor()) else {
+        return;
+    };
+    let (mp, ms) = (m.position(), m.size());
+    let ws = w.outer_size();
+    let x = mp.x + (ms.width as i32 - ws.width as i32) / 2;
+    let y = mp.y + (ms.height as i32 - ws.height as i32) / 2;
+    w.set_outer_position(winit::dpi::PhysicalPosition::new(x.max(mp.x), y.max(mp.y)));
 }
 
 /// Caractère de la touche physique `k` selon la disposition du clavier (Windows), ex. « Z »
