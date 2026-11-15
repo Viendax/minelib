@@ -537,13 +537,21 @@ fn leave_room(st: &mut State, id: u64) {
             e.0.get_or_insert_with(Instant::now);
         }
     }
-    // Garant en attente qui s'en va : simplement retiré.
+    // Garant en attente (ou garant extérieur d'un monde) qui s'en va : simplement retiré,
+    // ses zones passent à un autre.
     if room.hidden.contains(&id) {
         room.hidden.retain(|&h| h != id);
         room.ready_standby.retain(|&h| h != id);
         room.members.retain(|&m| m != id);
         if room.backup == Some(id) {
             room.backup = None;
+        }
+        if room.kind == 1 {
+            let cands = zone_candidates(st, room_id);
+            let room = st.rooms.get_mut(&room_id).expect("partie");
+            let changes = room.build.left(id, &cands);
+            announce(st, room_id, changes);
+            return;
         }
         // Plus de vérificateur : le résultat des joueurs peut suffire.
         try_apply_result(st, room_id);
@@ -577,7 +585,7 @@ fn leave_room(st: &mut State, id: u64) {
         };
         switch_host(st, room_id, new, None);
         if kind == 1 {
-            let cands = candidates(st, room_id);
+            let cands = zone_candidates(st, room_id);
             if let Some(room) = st.rooms.get_mut(&room_id) {
                 let changes = room.build.left(id, &cands);
                 announce(st, room_id, changes);
@@ -602,7 +610,7 @@ fn leave_room(st: &mut State, id: u64) {
             transport::push(&c.tx, &Response::PeerLeft { peer: id });
         }
         if room.kind == 1 {
-            let cands = candidates(st, room_id);
+            let cands = zone_candidates(st, room_id);
             let room = st.rooms.get_mut(&room_id).expect("partie");
             let changes = room.build.left(id, &cands);
             announce(st, room_id, changes);
@@ -998,6 +1006,7 @@ fn upkeep(st: &mut State) {
         return;
     }
     st.last_upkeep = Instant::now();
+    upkeep_build(st);
     let rooms: Vec<u64> = st
         .rooms
         .iter()
@@ -1067,22 +1076,124 @@ fn upkeep(st: &mut State) {
     }
 }
 
-/// Joueurs d'une partie de construction pouvant être garants.
+/// Joueurs d'une partie de construction (pas ses garants extérieurs) : parmi eux se
+/// choisit le propriétaire du monde.
 fn candidates(st: &State, room_id: u64) -> Vec<zones::Candidate> {
     let Some(room) = st.rooms.get(&room_id) else {
         return Vec::new();
     };
     room.everyone()
-        .filter_map(|id| {
-            let c = st.conns.get(&id)?;
-            Some(zones::Candidate {
-                id,
-                caps: c.caps,
-                uptime: c.joined.elapsed(),
-                ratio: c.pseudo.as_deref().map_or(0.0, |p| st.stats.ratio(p)),
-            })
-        })
+        .filter(|id| !room.hidden.contains(id))
+        .filter_map(|id| candidate(st, id))
         .collect()
+}
+
+fn candidate(st: &State, id: u64) -> Option<zones::Candidate> {
+    let c = st.conns.get(&id)?;
+    Some(zones::Candidate {
+        id,
+        caps: c.caps,
+        uptime: c.joined.elapsed(),
+        ratio: c.pseudo.as_deref().map_or(0.0, |p| st.stats.ratio(p)),
+    })
+}
+
+/// Garants possibles des zones d'un monde : ses garants extérieurs (joueurs d'autres
+/// parties, sans lien avec celle-ci : personne ici n'a intérêt à les attaquer) ; s'il n'y
+/// en a aucun, ses propres joueurs.
+fn zone_candidates(st: &State, room_id: u64) -> Vec<zones::Candidate> {
+    let Some(room) = st.rooms.get(&room_id) else {
+        return Vec::new();
+    };
+    let outside: Vec<zones::Candidate> = room
+        .hidden
+        .iter()
+        .filter_map(|&id| candidate(st, id))
+        .collect();
+    if outside.is_empty() {
+        candidates(st, room_id)
+    } else {
+        outside
+    }
+}
+
+/// Garants extérieurs voulus pour un monde de construction : un, plus un par tranche de
+/// 8 joueurs (au plus 4).
+fn build_garants_wanted(players: usize) -> usize {
+    (1 + players / 8).min(4)
+}
+
+/// Le garant extérieur le plus adapté pour un monde de construction : la connexion de
+/// garant d'un joueur d'un autre serveur de construction d'abord, sinon d'une partie FPS.
+fn pick_build_garant(st: &State, players: &[String]) -> Option<u64> {
+    st.conns
+        .iter()
+        .filter(|(&g, c)| c.garant_only && garant_ok(st, g, players))
+        .filter_map(|(&g, c)| {
+            let p = c.pseudo.as_deref().unwrap_or_default();
+            let own = own_room_kind(st, p)?;
+            let mut score = zones::aptitude(&candidate(st, g)?);
+            if own == 1 {
+                score += 1_000_000.0;
+            }
+            Some((g, score))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(g, _)| g)
+}
+
+/// Sorte de la partie que joue ce pseudo (sur sa connexion de joueur), s'il en joue une.
+fn own_room_kind(st: &State, pseudo: &str) -> Option<u8> {
+    st.conns
+        .values()
+        .filter(|c| !c.garant_only)
+        .filter(|c| {
+            c.pseudo
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(pseudo))
+        })
+        .find_map(|c| st.rooms.get(&c.room?))
+        .map(|r| r.kind)
+}
+
+/// Mondes de construction : chacun reçoit ses garants extérieurs, à qui les zones passent.
+fn upkeep_build(st: &mut State) {
+    let rooms: Vec<u64> = st
+        .rooms
+        .iter()
+        .filter(|(_, r)| r.kind == 1)
+        .map(|(&id, _)| id)
+        .collect();
+    for rid in rooms {
+        let Some(room) = st.rooms.get(&rid) else {
+            continue;
+        };
+        let players = room.everyone().filter(|m| !room.hidden.contains(m)).count();
+        if room.hidden.len() >= build_garants_wanted(players) {
+            continue;
+        }
+        let names: Vec<String> = room
+            .everyone()
+            .chain(std::iter::once(room.host))
+            .filter_map(|m| st.conns.get(&m).and_then(|c| c.pseudo.clone()))
+            .collect();
+        let Some(g) = pick_build_garant(st, &names) else {
+            continue;
+        };
+        let room = st.rooms.get_mut(&rid).expect("partie");
+        room.members.push(g);
+        room.hidden.push(g);
+        if let Some(c) = st.conns.get_mut(&g) {
+            c.room = Some(rid);
+            transport::push(&c.tx, &Response::BuildGarant { room: rid });
+        }
+        log::info!("monde {rid} : garant extérieur {g}");
+        // Les zones passent au garant extérieur.
+        let cands = zone_candidates(st, rid);
+        let room = st.rooms.get_mut(&rid).expect("partie");
+        let changes = room.build.balance(&cands);
+        announce(st, rid, changes);
+    }
 }
 
 /// Prévient les garants de leurs nouvelles zones (avec leur historique) et des zones
@@ -2335,7 +2446,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         }
                     }
                 }
-                let cands = candidates(st, rid);
+                let cands = zone_candidates(st, rid);
                 let changes = st
                     .rooms
                     .get_mut(&rid)
@@ -2349,7 +2460,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         Request::ToZone { chunk, data } => {
             let rid = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1))?;
             let zone = proto::zone_of(chunk);
-            let cands = candidates(st, rid);
+            let cands = zone_candidates(st, rid);
             let room = st.rooms.get_mut(&rid).expect("partie");
             room.build.touch(zone);
             let (garant, changes) = room.build.garant(zone, &cands);
@@ -3686,6 +3797,107 @@ mod tests {
 
     /// Un garant indépendant (au menu, 3 parties jouées, sans lien avec les joueurs) sert
     /// la partie ; un second la vérifie et la reprend quand l'hôte triche.
+    #[test]
+    fn build_worlds_take_their_zone_garants_from_other_worlds() {
+        let dir =
+            std::env::temp_dir().join(format!("minelib-garant-monde-{}", rand::random::<u32>()));
+        {
+            let mut st = stats::Store::open(dir.join("stats")).unwrap();
+            st.get_mut("Ailleurs").games = 5;
+            st.save("Ailleurs");
+        }
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        let host = |c: &Client, sig: u8| {
+            c.send(Cmd::Host {
+                kind: 1,
+                name: "Monde".into(),
+                map: "monde".into(),
+                map_sig: [sig; 32],
+                max_players: 0,
+            });
+            match wait(c, |e| matches!(e, Event::Hosted(_))) {
+                Event::Hosted(r) => r,
+                _ => unreachable!(),
+            }
+        };
+        // « Ailleurs » construit sur son propre monde ; sa connexion de garant est libre.
+        let (ailleurs, _) = login("Ailleurs");
+        host(&ailleurs, 3);
+        let g = Client::spawn_garant(addr.clone(), h.public);
+        g.send(Cmd::Login {
+            pseudo: "Ailleurs".into(),
+            password: "motdepasse".into(),
+            totp: None,
+            backup: None,
+            device: None,
+        });
+        let glink = match wait(&g, |e| matches!(e, Event::Link(_))) {
+            Event::Link(l) => l,
+            _ => unreachable!(),
+        };
+        wait(&g, |e| matches!(e, Event::LoggedIn { .. }));
+        g.send(Cmd::GarantAvailable(true));
+        // Un autre monde s'ouvre : il reçoit ce garant extérieur.
+        let (createur, clink) = login("Createur");
+        let room = host(&createur, 4);
+        std::thread::sleep(Duration::from_millis(2100));
+        createur.send(Cmd::Maps);
+        match wait(&g, |e| matches!(e, Event::BuildGarant(_))) {
+            Event::BuildGarant(r) => assert_eq!(r, room),
+            _ => unreachable!(),
+        }
+        // Une modification du créateur va au garant extérieur (pas à lui-même), qui la publie.
+        transport::push(&clink, &Request::Position { chunk: [0, 0] });
+        let edit = vec![1, 2, 3];
+        transport::push(
+            &clink,
+            &Request::ToZone {
+                chunk: [0, 0],
+                data: edit.clone(),
+            },
+        );
+        wait(
+            &g,
+            |e| matches!(e, Event::Zones { gained, .. } if gained.contains(&[0, 0])),
+        );
+        match wait(&g, |e| matches!(e, Event::FromZone { .. })) {
+            Event::FromZone { data, .. } => assert_eq!(data, edit),
+            _ => unreachable!(),
+        }
+        transport::push(
+            &glink,
+            &Request::ToZone {
+                chunk: [0, 0],
+                data: vec![9],
+            },
+        );
+        match wait(&createur, |e| matches!(e, Event::FromZone { .. })) {
+            Event::FromZone { data, .. } => assert_eq!(data, vec![9]),
+            _ => unreachable!(),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_player_whose_game_just_started_is_the_preferred_garant() {
         let dir =

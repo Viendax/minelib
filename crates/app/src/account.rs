@@ -710,6 +710,7 @@ impl Accounts {
                 | Event::Promoted { .. }
                 | Event::GarantTask { .. }
                 | Event::BackupIs(_)
+                | Event::BuildGarant(_)
                 | Event::Judge { .. }
                 | Event::Voice { .. }
                 | Event::HostChanged(_)

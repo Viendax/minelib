@@ -246,6 +246,8 @@ pub enum Event {
         members: Vec<(u64, String)>,
         standby: bool,
     },
+    /// Garant extérieur d'un serveur de construction (voir `Response::BuildGarant`).
+    BuildGarant(u64),
     BackupIs(u64),
     Judge {
         conflict: u64,
@@ -540,6 +542,7 @@ impl Worker {
             Response::FromHost { data } => Event::FromHost(data),
             Response::Witness { peer, data } => Event::Witness { peer, data },
             Response::Zones { gained, lost } => Event::Zones { gained, lost },
+            Response::BuildGarant { room } => Event::BuildGarant(room),
             Response::FromZone { peer, chunk, data } => Event::FromZone { peer, chunk, data },
             // Banni pendant la session : déconnecté.
             Response::Error { code, message } => {

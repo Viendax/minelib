@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 14;
+pub const PROTOCOL: u32 = 15;
 
 /// Morceau d'une carte transférée (octets).
 pub const MAP_PART: usize = 48 * 1024;
@@ -478,6 +478,11 @@ pub enum Response {
         map: String,
         members: Vec<(u64, String)>,
         standby: bool,
+    },
+    /// Garant extérieur d'un serveur de construction (un joueur d'une autre partie, sans
+    /// lien avec celle-ci) : il recevra ses zones (`Zones`) et validera les modifications.
+    BuildGarant {
+        room: u64,
     },
     /// À l'hôte : le garant de secours désigné (garant indépendant).
     BackupIs {

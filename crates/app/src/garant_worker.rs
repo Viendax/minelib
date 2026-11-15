@@ -79,12 +79,16 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
     let mut logged = false;
     let mut link = None;
     let mut garant: Option<Garant> = None;
+    // Garant extérieur d'un monde de construction : il valide les modifications de ses
+    // zones (sans avoir besoin du monde lui-même).
+    let mut build: Option<(crate::buildnet::BuildNet, minelib_world::World)> = None;
     let mut last = Instant::now();
     let started = Instant::now();
+    let mut wiped = Instant::now();
     log::info!("garant en jeu : connexion de garant ouverte");
     loop {
         if stop.load(Ordering::Relaxed) {
-            if garant.is_some() {
+            if garant.is_some() || build.is_some() {
                 client.send(Cmd::Leave);
             }
             client.send(Cmd::GarantAvailable(false));
@@ -158,7 +162,34 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                         }
                     }
                 }
-                Event::RoomClosed => garant = None,
+                Event::RoomClosed => {
+                    garant = None;
+                    build = None;
+                }
+                Event::BuildGarant(room) => {
+                    if let Some(l) = link.clone() {
+                        log::info!("garant en jeu : zones du monde {room}");
+                        let net = crate::buildnet::BuildNet::new(l, login.pseudo.clone(), false);
+                        build = Some((net, minelib_world::World::new(0)));
+                    }
+                }
+                Event::Zones {
+                    ref gained,
+                    ref lost,
+                } => {
+                    if let Some((b, _)) = &mut build {
+                        b.zones_changed(gained, lost);
+                    }
+                }
+                Event::FromZone {
+                    peer,
+                    chunk,
+                    ref data,
+                } => {
+                    if let Some((b, w)) = &mut build {
+                        b.receive(peer, chunk, data, w);
+                    }
+                }
                 Event::PeerJoined { .. }
                 | Event::PeerLeft(_)
                 | Event::FromPeer { .. }
@@ -178,6 +209,14 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
         if !logged && started.elapsed() > Duration::from_secs(30) {
             log::info!("garant en jeu : pas de session, abandon");
             return;
+        }
+        // Le monde du garant extérieur ne sert à rien (il ne fait que valider) : on vide
+        // de temps en temps les modifications qu'il a gardées.
+        if let Some((_, w)) = &mut build {
+            if wiped.elapsed() > Duration::from_secs(600) {
+                wiped = Instant::now();
+                *w = minelib_world::World::new(0);
+            }
         }
         let dt = last.elapsed().as_secs_f32().min(0.1);
         last = Instant::now();

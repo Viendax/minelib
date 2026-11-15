@@ -1064,14 +1064,15 @@ impl Game {
             && self.searching.is_none()
             && self.options.garant;
         self.announce_garant(free);
-        // En pleine partie FPS en ligne : une deuxième connexion peut servir de garant à
-        // d'autres joueurs (le relais la préfère quand la partie vient de commencer).
+        // En pleine partie FPS en ligne (ou sur un serveur de construction) : une deuxième
+        // connexion peut servir de garant à d'autres joueurs (le relais la préfère quand la
+        // partie vient de commencer ; les mondes de construction prennent leurs garants
+        // parmi les joueurs d'autres mondes).
         let playing = self.options.garant
             && self.accounts.logged_in()
-            && self
-                .session
-                .as_ref()
-                .is_some_and(|s| s.net.is_some() && s.game.mode == save::GameMode::Fps);
+            && self.session.as_ref().is_some_and(|s| {
+                (s.net.is_some() && s.game.mode == save::GameMode::Fps) || s.build.is_some()
+            });
         if playing {
             if self.garant_worker.is_none() && !self.garant_worker_tried {
                 self.garant_worker_tried = true;
