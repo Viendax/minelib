@@ -1206,10 +1206,16 @@ impl Fps {
         self.sound_at(sfx, 0.0, pos, eye);
     }
 
-    /// En ligne : un autre joueur court en `pos` (bruit de pas).
-    pub fn heard_step(&mut self, pos: Vec3, eye: Vec3) {
+    /// En ligne : bruit d'un joueur en `pos` (`netgame::STEP_…` : pas, réception d'une
+    /// chute, cri de douleur).
+    pub fn heard_step(&mut self, pos: Vec3, eye: Vec3, kind: u8) {
         let d = (pos - eye).length();
-        self.sounds.push((Sfx::Step, 0.0, 0.9 / (1.0 + d / 8.0)));
+        let sfx = match kind {
+            crate::netgame::STEP_LAND => Sfx::Land,
+            crate::netgame::STEP_PAIN => Sfx::Pain,
+            _ => Sfx::Step,
+        };
+        self.sounds.push((sfx, 0.0, 0.9 / (1.0 + d / 8.0)));
     }
 
     /// En ligne : un joueur est touché en `at` (sang ; bruit du couteau dans la chair).
@@ -2709,8 +2715,18 @@ mod tests {
         }
         let eye = Vec3::new(8.5, 8.0, 12.5);
         let north = Vec3::new(0.0, 0.0, -1.0);
+        // Une torche sur le chemin : la balle passe à travers (pas un bloc).
+        w.place_torch(8, 8, 11, None);
+        let low = Vec3::new(8.5, 8.3, 12.5);
+        let aim = minelib_world::raycast::raycast(&w, low.into(), north.into(), 250.0);
+        assert!(
+            aim.is_some_and(|h| h.distance < 2.0),
+            "la visée touche la torche"
+        );
+        let p = weapons::bullet_path(&w, low, north, 250.0);
+        assert!((p.first - 3.5).abs() < 1e-3, "{}", p.first);
         let p = weapons::bullet_path(&w, eye, north, 250.0);
-        assert!((p.first - 3.5).abs() < 1e-3);
+        assert!((p.first - 3.5).abs() < 1e-3, "{}", p.first);
         // Un bloc (moitié des dégâts), puis le mur du fond de deux blocs : trop épais pour
         // ce qui reste (deux blocs en tout), la balle s'y arrête.
         assert_eq!(p.through.len(), 1, "{:?}", p.through);

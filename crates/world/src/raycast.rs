@@ -22,8 +22,26 @@ impl Hit {
     }
 }
 
-/// Premier bloc solide le long du rayon, à au plus `max_dist` blocs.
+/// Premier bloc visable (y compris torches, panneaux, boutons) le long du rayon, à au plus
+/// `max_dist` blocs.
 pub fn raycast(world: &World, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<Hit> {
+    raycast_with(world, origin, dir, max_dist, BlockId::is_targetable)
+}
+
+/// Premier bloc solide (qui arrête les déplacements) le long du rayon : les balles passent
+/// à travers les torches, panneaux, boutons, plantes…
+pub fn raycast_solid(world: &World, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<Hit> {
+    raycast_with(world, origin, dir, max_dist, BlockId::is_solid)
+}
+
+/// Premier bloc retenu par `stops` le long du rayon.
+pub fn raycast_with(
+    world: &World,
+    origin: [f32; 3],
+    dir: [f32; 3],
+    max_dist: f32,
+    stops: impl Fn(BlockId) -> bool,
+) -> Option<Hit> {
     let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
     if len < 1e-6 {
         return None;
@@ -50,7 +68,7 @@ pub fn raycast(world: &World, origin: [f32; 3], dir: [f32; 3], max_dist: f32) ->
     let mut t = 0.0;
     while t <= max_dist {
         let id = world.get(cell[0], cell[1], cell[2]);
-        if id.is_targetable() && cell[1] >= 0 {
+        if stops(id) && cell[1] >= 0 {
             let def = id.def();
             if def.full {
                 return Some(Hit {

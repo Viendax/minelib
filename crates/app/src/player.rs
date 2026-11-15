@@ -315,6 +315,18 @@ impl Player {
                 }
             }
         }
+        // Mode FPS : en descendant d'une dalle (une marche d'au plus STEP_HEIGHT), on reste
+        // collé au sol, sans chute ni atterrissage (sauf si on vient de sauter).
+        if fps && was_on_ground && !self.on_ground && !self.flying && self.vel.y <= 0.0 {
+            let saved = self.pos;
+            if self.move_axis(world, 1, -STEP_HEIGHT) && self.slide.is_none() {
+                self.on_ground = true;
+                self.vel.y = 0.0;
+            } else {
+                self.pos = saved;
+                self.slide = None;
+            }
+        }
         // Atterrissage en mode FPS : les jambes encaissent selon la vitesse de chute.
         if fps && self.on_ground && !was_on_ground && fall_speed > 0.0 {
             self.stamina =
@@ -751,6 +763,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fps_steps_down_half_blocks_without_falling() {
+        // Mode FPS : en descendant une dalle, les pieds suivent le sol aussitôt (pas une
+        // image en l'air) ; d'un bloc entier, on tombe.
+        let reg = minelib_world::registry::registry();
+        let slab = reg.by_key("slab:stone:bottom").unwrap();
+        let mut w = flat_world();
+        for z in 0..16 {
+            w.set(8, 11, z, slab);
+            w.set(9, 11, z, slab);
+        }
+        let mut p = Player::new(Vec3::new(8.5, 11.5, 8.5));
+        p.yaw = std::f32::consts::FRAC_PI_2; // vers +X
+        let m = MoveInput {
+            forward: 1.0,
+            sprint: true,
+            fps: true,
+            ..Default::default()
+        };
+        let dt = 1.0 / 128.0;
+        for _ in 0..30 {
+            p.update(
+                &w,
+                &MoveInput {
+                    fps: true,
+                    ..Default::default()
+                },
+                dt,
+            );
+        }
+        assert!(p.on_ground && p.pos.y == 11.5);
+        let mut stepped = false;
+        for _ in 0..200 {
+            p.update(&w, &m, dt);
+            assert!(p.on_ground, "en l'air en x = {} (y = {})", p.pos.x, p.pos.y);
+            if p.pos.x > 10.5 {
+                stepped = true;
+                break;
+            }
+        }
+        assert!(stepped);
+        assert_eq!(p.pos.y, 11.0, "descendu de la dalle");
     }
 
     #[test]

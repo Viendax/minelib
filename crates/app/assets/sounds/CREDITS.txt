@@ -44,6 +44,10 @@ Arme sortie (draw_<arme>.ogg, un son par arme) : mélange d'un frottement de cui
   shell.ogg (cartouche glissée dans un fusil à pompe) — reload_end.ogg (« equipment
     clicks III », CC0) baissé d'une tierce.
 
-Pas (step_1 à step_6.ogg) : « Footsteps » (enregistrés dans un passage souterrain), CC0
-  https://opengameart.org/content/footsteps-0
-  Normalisés, fondu de fin, convertis en Ogg Vorbis mono.
+Pas (step_1 à step_6.ogg) et réception (land.ogg) : « Fantozzi's Footsteps (Grass/Sand &
+  Stone) » (Fantozzi), CC0 — https://opengameart.org/content/fantozzis-footsteps-grasssand-stone
+  Pas sur la pierre, pieds gauche et droit ; land.ogg mêle deux pas, graves renforcés.
+
+Cris de douleur (pain_1 à pain_4.ogg) : « 15 vocal male strain/hurt/pain/jump sounds »
+  (slightscream-01, 03, 06, 08), CC0
+  https://opengameart.org/content/15-vocal-male-strainhurtpainjump-sounds

@@ -141,8 +141,9 @@ pub enum Local {
         heard: bool,
         hits: Vec<Vec3>,
     },
-    /// Un autre joueur court près d'ici : bruit de pas en `pos`.
-    Step(Vec3),
+    /// Bruit d'un joueur en `pos` : pas (`STEP_RUN`), réception d'une chute (`STEP_LAND`),
+    /// cri de douleur après une chute (`STEP_PAIN`).
+    Step(Vec3, u8),
     /// Ce que le joueur porte vraiment selon l'hôte (armes, grenades).
     Guns {
         guns: (u8, u8),
@@ -1116,6 +1117,21 @@ type Frame = Vec<(u64, Vec3, f32)>;
 /// Bruits de pas : au-dessus de cette vitesse au sol (blocs/s), on court et les autres
 /// l'entendent (135 unités de CS sur 250).
 pub const STEP_SPEED: f32 = crate::player::FPS_SPRINT * 135.0 / 250.0;
+pub use minelib_net::game::{STEP_LAND, STEP_PAIN, STEP_RUN};
+
+/// Chute d'au moins cette hauteur (blocs, du sol quitté au sol où l'on retombe) : bruit de
+/// réception, entendu des autres.
+pub const LAND_HEIGHT: f32 = 1.3;
+
+/// Suivi d'un joueur pour ses bruits : dernière position, distance courue depuis le dernier
+/// pas, hauteur du sol qu'il a quitté (en l'air).
+#[derive(Clone, Copy)]
+struct Stride {
+    last: Vec3,
+    dist: f32,
+    top: Option<f32>,
+}
+
 /// Distance entre deux pas (blocs).
 pub const STRIDE: f32 = crate::player::FPS_SPRINT * 0.34;
 /// Portée des bruits de pas (blocs).
@@ -1149,8 +1165,10 @@ pub struct Host {
     local_blind: bool,
     /// Vitesse permise par ce que tient le joueur de l'hôte (unités de CS).
     local_carry: u8,
-    /// Bruits de pas : dernière position et distance parcourue en courant, par joueur.
-    strides: HashMap<u64, (Vec3, f32)>,
+    /// Bruits de pas et de réception, par joueur.
+    strides: HashMap<u64, Stride>,
+    /// Blessés par une chute à cette image (cri de douleur, entendu de tous).
+    pains: Vec<u64>,
     kill_flags: u8,
     /// Copies envoyées d'elles-mêmes (les essais les prennent à la main).
     auto_backup: bool,
@@ -1334,6 +1352,7 @@ impl NetGame {
             local_blind: false,
             local_carry: 250,
             strides: HashMap::new(),
+            pains: Vec::new(),
             kill_flags: 0,
             auto_backup: true,
             out: Vec::new(),
@@ -1847,6 +1866,9 @@ impl NetGame {
         let mut out = Vec::new();
         if let NetGame::Host(h) = self {
             h.record(0, Move::Rule(Rule::SelfHurt(amount)));
+            if amount > 0 {
+                h.pains.push(0);
+            }
             let ev = h.m.hurt(None, 0, amount, Hurt::World);
             h.events(ev, &mut out);
         }
@@ -1970,6 +1992,7 @@ impl NetGame {
             local_blind: false,
             local_carry: 250,
             strides: HashMap::new(),
+            pains: Vec::new(),
             kill_flags: 0,
             auto_backup: true,
             out: Vec::new(),
@@ -2114,32 +2137,58 @@ impl Host {
         let alive = |m: &Match, id: u64| m.players.get(&id).is_some_and(|p| p.alive);
         let mut steps = Vec::new();
         for &(id, pos, ground) in &walkers {
-            let e = self.strides.entry(id).or_insert((pos, 0.0));
-            let d = Vec3::new(pos.x - e.0.x, 0.0, pos.z - e.0.z).length();
-            e.0 = pos;
+            let e = self.strides.entry(id).or_insert(Stride {
+                last: pos,
+                dist: 0.0,
+                top: None,
+            });
+            let d = Vec3::new(pos.x - e.last.x, 0.0, pos.z - e.last.z).length();
+            let teleport = (pos - e.last).length() > 3.0;
+            let before = e.last;
+            e.last = pos;
+            let living = alive(&self.m, id);
+            // Réception : tombé d'assez haut (pas une réapparition).
+            if ground {
+                if let Some(top) = e.top.take() {
+                    if living && !teleport && top - pos.y >= LAND_HEIGHT {
+                        steps.push((id, pos, STEP_LAND));
+                    }
+                }
+            } else if e.top.is_none() {
+                // Hauteur du sol quitté : un saut sur place ne compte pas, une chute oui.
+                e.top = Some(before.y);
+            }
             let running = d / dt.max(1e-4) > STEP_SPEED && d < 2.0;
-            if ground && running && alive(&self.m, id) {
-                e.1 += d;
-                if e.1 >= STRIDE {
-                    e.1 -= STRIDE;
-                    steps.push((id, pos));
+            if ground && running && living {
+                e.dist += d;
+                if e.dist >= STRIDE {
+                    e.dist -= STRIDE;
+                    steps.push((id, pos, STEP_RUN));
                 }
             } else {
                 // Le premier pas d'une course vient vite.
-                e.1 = STRIDE * 0.7;
+                e.dist = STRIDE * 0.7;
             }
         }
         self.strides
             .retain(|id, _| walkers.iter().any(|w| w.0 == *id));
-        for (who, pos) in steps {
+        // Cris de douleur (chute) : aussi pour le blessé lui-même.
+        for who in std::mem::take(&mut self.pains) {
+            if let Some(w) = walkers.iter().find(|w| w.0 == who) {
+                steps.push((who, w.1, STEP_PAIN));
+            }
+        }
+        for (who, pos, kind) in steps {
             let msg = ToPeer::Step {
                 who,
                 pos: pos.to_array(),
+                kind,
             };
             for &(id, at, _) in &walkers {
-                if id != who && (at - pos).length() < HEARD_STEPS {
+                let me = id == who && kind == STEP_PAIN;
+                if (id != who || me) && (at - pos).length() < HEARD_STEPS {
                     if id == 0 {
-                        out.push(Local::Step(pos));
+                        out.push(Local::Step(pos, kind));
                     } else {
                         self.send_to(id, &msg);
                     }
@@ -2550,6 +2599,7 @@ impl Host {
             self.peers.get(&who).filter(|r| r.ready).map(|r| &r.player)
         };
         let ok = fire_ok(&mut self.m, world, who, shooter, weapon, origin, dirs.len());
+        let present = shooter.is_some();
         if who == 0 {
             self.record(0, Move::Rule(Rule::Msg(msg)));
         }
@@ -2560,6 +2610,17 @@ impl Host {
             // Refusé (arme qu'il ne porte pas ?) : on lui rappelle ce qu'il porte.
             if !self.m.has_gun(who, weapon) && weapon < 254 {
                 self.send_guns(who);
+            }
+            // Coup de couteau dans le vide pendant le temps d'achat : sans effet, mais les
+            // autres l'entendent quand même.
+            let alive = self.m.players.get(&who).is_some_and(|p| p.alive);
+            if weapon >= KNIFE_HEAVY && alive && self.m.frozen() && present {
+                self.broadcast(&ToPeer::Shot {
+                    who,
+                    weapon,
+                    pos: origin.to_array(),
+                    hits: Vec::new(),
+                });
             }
             Vec::new()
         }
@@ -2790,6 +2851,9 @@ impl Host {
         falls.sort();
         let mut out = Vec::new();
         for (id, d) in falls {
+            if d > 0 {
+                self.pains.push(id);
+            }
             let ev = self.m.hurt(None, id, d, Hurt::World);
             self.events(ev, &mut out);
         }
@@ -3228,9 +3292,9 @@ impl Guest {
                 heard: self.you != Some(who),
                 hits: hits.into_iter().map(Vec3::from).collect(),
             }),
-            ToPeer::Step { who, pos } => {
-                if self.you != Some(who) {
-                    out.push(Local::Step(Vec3::from(pos)));
+            ToPeer::Step { who, pos, kind } => {
+                if self.you != Some(who) || kind == STEP_PAIN {
+                    out.push(Local::Step(Vec3::from(pos), kind));
                 }
             }
             ToPeer::Respawn { state, reset, team } => {

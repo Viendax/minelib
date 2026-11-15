@@ -68,6 +68,8 @@ pub struct Session {
     /// (état, position du porteur).
     bomb_fly: Option<(Vec3, Vec3, f32)>,
     bomb_last: (u8, Option<Vec3>),
+    /// Hauteur du sol quitté, en l'air (bruit de réception).
+    fall_top: Option<f32>,
     /// Bruits de ses propres pas : distance parcourue depuis le dernier.
     stride: f32,
     /// Temps pas encore simulé (moins d'un pas).
@@ -270,6 +272,7 @@ impl Session {
         Ok(Self {
             test_smoke_timer: 0.0,
             stride: 0.0,
+            fall_top: None,
             ground_fly: std::collections::HashMap::new(),
             ground_seen: std::collections::HashSet::new(),
             bomb_fly: None,
@@ -1593,9 +1596,9 @@ impl Session {
                         self.fps.blood_at(h, knife, eye);
                     }
                 }
-                Local::Step(pos) => {
+                Local::Step(pos, kind) => {
                     let eye = self.player.eye();
-                    self.fps.heard_step(pos, eye);
+                    self.fps.heard_step(pos, eye, kind);
                 }
                 Local::Guns { guns, nades } => self.fps.set_guns(guns, nades),
                 Local::RoundEnd {
@@ -1728,6 +1731,17 @@ impl Session {
         // doux en marchant ou accroupi (eux ne les entendent pas).
         let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
         let alive = !(self.net.is_some() && self.net_dead);
+        // Réception d'une chute d'au moins 1,3 bloc (les autres l'entendent aussi).
+        if self.player.on_ground || self.player.flying {
+            if let Some(top) = self.fall_top.take() {
+                if alive && top - self.player.pos.y >= crate::netgame::LAND_HEIGHT {
+                    self.fps.sounds.push((crate::audio::Sfx::Land, 0.0, 0.9));
+                }
+            }
+        } else if self.fall_top.is_none() {
+            // Hauteur du sol quitté : un saut sur place ne fait pas ce bruit.
+            self.fall_top = Some(self.player.pos.y);
+        }
         if alive && self.player.on_ground && !self.player.flying && speed > 0.6 {
             self.stride += speed * dt;
             let run = speed > crate::netgame::STEP_SPEED;

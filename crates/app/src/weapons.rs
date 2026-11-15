@@ -1042,7 +1042,7 @@ pub fn bullet_path(
     range: f32,
 ) -> BulletPath {
     use glam::Vec3;
-    use minelib_world::raycast::raycast;
+    use minelib_world::raycast::raycast_solid as raycast;
     let normal = |n: [i32; 3]| Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32);
     let Some(h) = raycast(world, origin.into(), dir.into(), range) else {
         return BulletPath {

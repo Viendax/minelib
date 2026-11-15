@@ -364,6 +364,11 @@ pub enum ToHost {
     Color(u8),
 }
 
+/// Sortes de `ToPeer::Step`.
+pub const STEP_RUN: u8 = 0;
+pub const STEP_LAND: u8 = 1;
+pub const STEP_PAIN: u8 = 2;
+
 /// Fil des éliminations : à travers un mur, à travers une fumée, tireur aveuglé.
 pub const KILL_WALL: u8 = 1;
 pub const KILL_SMOKE: u8 = 2;
@@ -476,10 +481,12 @@ pub enum ToPeer {
         pos: [f32; 3],
         hits: Vec<[f32; 3]>,
     },
-    /// Un joueur proche court : bruit de pas en `pos`.
+    /// Bruit d'un joueur proche en `pos` : `STEP_RUN` (il court), `STEP_LAND` (il retombe
+    /// d'au moins 1,3 bloc), `STEP_PAIN` (une chute le blesse : cri de douleur).
     Step {
         who: u64,
         pos: [f32; 3],
+        kind: u8,
     },
     /// Réapparition (après une mort) à cette position.
     Respawn {

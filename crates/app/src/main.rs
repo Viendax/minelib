@@ -3105,9 +3105,10 @@ fn main() -> anyhow::Result<()> {
     prune(&logs, "crash_", 19);
     let file = std::fs::File::create(&log_path).ok();
     let latest = std::fs::File::create(dir.join("minelib.log")).ok();
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"),
-    )
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        // DHT (mainline) : une ligne par nœud injoignable, des centaines par seconde.
+        "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,mainline=error",
+    ))
     .target(env_logger::Target::Pipe(Box::new(Tee(file, latest))))
     .init();
     log::info!(

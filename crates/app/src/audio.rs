@@ -53,8 +53,13 @@ pub enum Sfx {
     /// Fin de rechargement, chien du R8 qui se lève.
     ReloadEnd,
     Hammer,
-    /// Bruit de pas (sol dur), un des six enregistrements pris à tour de rôle.
+    /// Bruit de pas (sol dur), un des six enregistrements pris à tour de rôle (pied
+    /// gauche, pied droit).
     Step,
+    /// Réception après une chute.
+    Land,
+    /// Cri de douleur (chute qui blesse), un des quatre à tour de rôle.
+    Pain,
 }
 
 macro_rules! sounds {
@@ -70,6 +75,11 @@ static FILES: &[(&str, &[u8])] = sounds!(
     "step_4",
     "step_5",
     "step_6",
+    "land",
+    "pain_1",
+    "pain_2",
+    "pain_3",
+    "pain_4",
     "shot_glock",
     "shot_usp",
     "shot_p2000",
@@ -261,9 +271,16 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
         Sfx::Step => {
             // Jamais deux fois le même pas de suite.
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            const STEPS: [&str; 6] = ["step_3", "step_1", "step_5", "step_2", "step_6", "step_4"];
+            const STEPS: [&str; 6] = ["step_1", "step_2", "step_3", "step_4", "step_5", "step_6"];
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (STEPS[n % 6], 0.55)
+            (STEPS[n % 6], 0.45)
+        }
+        Sfx::Land => ("land", 0.75),
+        Sfx::Pain => {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            const PAINS: [&str; 4] = ["pain_1", "pain_2", "pain_3", "pain_4"];
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (PAINS[n % 4], 0.8)
         }
     }
 }
