@@ -2,142 +2,145 @@
 
 # ⛏️ Minelib
 
-**Moteur de jeu voxel / FPS multiplateforme, écrit en Rust de A à Z.**
+### Construis ton monde. Fais-en ton champ de bataille.
 
-Construire comme dans un jeu de blocs, se battre comme dans un FPS tactique,
-avec du raytracing en temps réel, dans un seul moteur original.
+**Un jeu de blocs et un FPS tactique 5 contre 5, dans un seul jeu, avec du raytracing en temps réel.**
+Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 
-![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)
-![wgpu](https://img.shields.io/badge/rendu-wgpu%2025-blue)
-![Plateformes](https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
+![Linux](https://img.shields.io/badge/Linux-Vulkan-lightgrey)
 ![Licence](https://img.shields.io/badge/licence-AGPL--3.0-green)
+![Rust](https://img.shields.io/badge/fait%20en-Rust-orange?logo=rust)
+
+**[⬇️ Télécharger le lanceur](../../releases/latest/download/minelib-launcher.exe)** · `minelib-launcher.exe` : il télécharge le jeu à jour depuis GitHub et le lance
 
 </div>
 
 ---
 
-## ✨ En bref
+## Pourquoi Minelib ?
 
-- 🧱 **Monde voxel infini** : génération procédurale (continents, collines, montagnes,
-  grottes en « spaghetti », arbres), chunks de 16 × 16 × 256 chargés en fond sur tous les cœurs.
-- 💡 **Lumière** : soleil, cycle jour/nuit, torches à lumière colorée (13 sels chimiques,
-  vrai « test de flamme »), occultation ambiante, lumière qui respecte la forme des blocs
-  (dalles, escaliers…).
-- 🪞 **Raytracing en temps réel** : miroirs (jusqu'à 4 rebonds), reflets sur l'eau, la glace
-  et les métaux (fer, or, diamant : reflet proche et flou).
-- 🔫 **Mode FPS** : déplacements façon Counter-Strike (bunny hop, fatigue), 34 armes,
-  5 grenades, menu d'achat, lunettes, fumigènes qu'on perce à la balle.
-- 🛠️ **WorldEdit intégré** : baguette de sélection et plus de 40 commandes `//…`.
-- 📦 **Compatible Minecraft** : import des mondes Java (Anvil) et des packs de textures.
-- 🖥️ **Multiplateforme** : un seul code pour Windows, Linux et macOS.
+| | |
+|---|---|
+| 🧱 **Crée sans limite** | Un monde infini à façonner : continents, montagnes, grottes, forêts. Mode créatif, survie, et un **WorldEdit intégré** pour bâtir des villes entières en quelques commandes. |
+| 🔫 **Joue en compétitif** | Ta carte devient une arène **5 contre 5 aux règles de CS2** : 34 armes, 5 grenades, économie, bombe, classement Elo. Une carte se prépare en 4 commandes. |
+| 💡 **Une image qui claque** | Raytracing en temps réel : miroirs, reflets sur l'eau, la glace et les métaux, lumière colorée des torches, fumigènes en volume qui contournent les murs. |
+| 🛡️ **Du fair-play, vraiment** | Les parties sont servies par des joueurs neutres, **rejouées et vérifiées au bit près**, avec un arbitre indépendant en cas de doute. Un facteur de confiance range les tricheurs ensemble. |
+| 🔒 **Ta vie privée respectée** | Un pseudo et un mot de passe, c'est tout. Pas d'e-mail, pas de téléphone, personne ne voit ton adresse IP, chat vocal chiffré de bout en bout. |
+| ⚡ **Zéro réglage** | Pas de serveur à louer, pas de port à ouvrir : lance le jeu, appuie sur **Jouer**. |
 
 ---
 
-## 🚀 Démarrage rapide
+## 🎯 Le mode FPS
 
-### Windows
+**La sensation d'un FPS tactique de référence, dans un monde que tu as construit.**
 
-Téléchargez `minelib_vXX.exe` (onglet *Releases* ou racine du dépôt) et lancez-le.
-Aucune installation n'est nécessaire.
+- **Déplacements au poil** : *air strafe*, **bunny hop**, saut accroupi pour monter à 1,5 bloc, et une vitesse qui dépend de l'arme en main (couteau rapide, AWP lourde).
+- **Des dégâts qui ne pardonnent pas** : valeurs de CS2 pour chaque arme, perte avec la distance, tête ×4, gilet et casque. Les balles traversent un mur fin.
+- **34 armes et 5 grenades** : pistolets, mitraillettes, fusils à pompe, fusils d'assaut, fusils de précision ; HE, flash, fumigène, molotov et leurre (qui imite *ton* arme principale).
+- **Tout ce qu'on attend d'un compétitif** : menu d'achat par camp, économie, bombe et kit, prolongations, tableau des scores, fil des éliminations avec tirs en tête, à travers un mur ou une fumée, armes et grenades qu'on lâche et qu'on ramasse.
+- **Ton équipe, d'un coup d'œil** : un triangle à la couleur de chaque coéquipier, visible à travers les murs, et son nom quand tu le vois ; en haut, le bandeau des joueurs des deux camps (les morts s'assombrissent), et ta couleur préférée parmi vert, jaune, orange, bleu et violet.
+- **Minimap** en haut à droite, avec les règles de CS : tes coéquipiers toujours, les adversaires seulement quand ils sont repérés, les sites de bombe et la bombe quand ton équipe la connaît.
+- **Réseau à 256 Hz** : positions envoyées 256 fois par seconde, prédiction et rembobinage des tirs. À 10 joueurs, l'hôte envoie moins de 1 Mo par seconde.
 
-### Depuis les sources
+### Jouer en ligne
 
-```bash
-git clone <url-du-dépôt> minelib
-cd minelib
-cargo run --release
-```
+Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 
-Il faut **Rust 1.85 ou plus récent** ([rustup.rs](https://rustup.rs)) et un pilote graphique
-récent (Vulkan, DirectX 12 ou Metal).
+- **Joue avec tes amis** : le panneau de droite liste tes amis (en ligne en vert) ; un clic invite dans ton **lobby** (5 joueurs). Celui qui invite en premier est l'hôte du lobby : il lance la partie pour tout le monde, et vous êtes **toujours dans la même équipe**. Clic droit sur un membre : *Exclure* ou *Promouvoir hôte*.
 
-| Plateforme | API graphique (via wgpu) | État |
-|------------|--------------------------|------|
-| Windows 10/11 | DirectX 12 ou Vulkan | ✅ testé |
-| Linux | Vulkan | ✅ testé |
-| macOS | Metal | ⚠️ prévu par wgpu, pas encore testé |
+- Chaque carte affiche clairement son format (**5 contre 5**, 2 contre 2…). **Seules les cartes 5 contre 5 comptent au classement.**
+- **Les cartes de la communauté** : toute carte déjà lancée en partie FPS en ligne apparaît dans la liste de tout le monde et se télécharge toute seule. Elle reste disponible tant qu'un joueur qui y a joué l'a encore (son jeu la renvoie au relais si besoin). Tes autres mondes restent privés.
+- Pendant l'échauffement, **les autres joueurs restent anonymes** (« Joueur 3 ») : on ne quitte pas la recherche parce qu'on a vu un nom. Les pseudos s'affichent quand la partie commence au complet.
+- **Matchmaking équitable** : d'abord un niveau Elo proche de l'équipe déjà formée (moyenne du lobby), puis les nouveaux avec les nouveaux, puis un facteur de confiance proche (le plus bas du lobby). Jamais avec quelqu'un que tu as signalé.
+- **Classement** : tes amis d'abord, le **Top mondial** à côté. Elo calculé comme aux échecs sur les parties 5 contre 5 des 10 cartes les plus jouées, avec les statistiques de CS (K/D, % de tirs à la tête, ADR, MVP).
 
-Compiler l'exécutable Windows depuis Linux :
+### Le facteur de confiance
 
-```bash
-rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu
-```
+Chaque compte a un **facteur de confiance** de **0 à 1000**. Un nouveau compte commence à **500**.
 
----
+| Événement | Effet |
+|---|---|
+| Partie finie sans signalement | **+8**, plus 1 par tranche de 150 points déjà acquis (+11 à 500, +14 à 1000) |
+| Signalement reçu | **−40** (rendus si le joueur retire son signalement) |
+| Absence de moins de 2 minutes | **0** |
+| Absence plus longue | **−5 à −140** selon la part de la partie manquée (sur une partie de 30 min : 5 min ≈ −13, 10 min = −50, 15 min ≈ −113) |
+| Abandon (absent 90 % de la partie ou plus) | **−150** |
+| Triche prouvée | **−400**, et bannissement si l'arbitre la confirme |
 
-## 📁 Dossier du jeu, mondes et packs de textures
+Le facteur est **lié à la machine** : c'est le plus bas des comptes utilisés sur ton PC qui compte. Recréer un compte ne remet pas les compteurs à zéro.
 
-Toutes les données du joueur sont dans le dossier **`.minelib`** :
+**Déconnecté ?** Appuie sur **Jouer** : tu reviens dans ta partie en cours.
+**Tir sur les alliés** : au 3ᵉ coéquipier tué, tu es exclu de la partie (sans perte de confiance pour ça seul, sauf signalements).
 
-| Système | Emplacement |
-|---------|-------------|
-| Windows | `%APPDATA%\.minelib` (touches **Win + R**, tapez `%appdata%`, puis ouvrez `.minelib`) |
-| Linux / macOS | `~/.minelib` |
+### Anti-triche
 
-```text
-.minelib/
-├── saves/           un dossier par monde (Minelib ou Minecraft importé)
-├── resourcepacks/   packs de textures (.zip ou dossiers)
-├── screenshots/     captures d'écran (F2)
-├── logs/            journal du jeu
-├── options.txt      réglages
-└── keys.txt         touches personnalisées
-```
+- **Des serveurs neutres** : la partie est servie par un **garant indépendant**, un joueur au menu sans aucun lien avec les joueurs (ni ami, ni signalé).
+- **Tout est rejoué** : un second garant reçoit le journal complet de la partie, chaîné et infalsifiable, et **rejoue chaque déplacement, chaque tir, chaque grenade** avec le même code. Le moindre écart est une preuve.
+- **Un arbitre tranche** : en cas d'accusation, le relais confie ses propres pièces à un troisième garant sans lien avec personne. Triche confirmée par l'arbitre : **bannissement automatique** du compte et de la machine.
+- **Contre les wallhacks** : un adversaire caché derrière un mur n'est tout simplement pas envoyé à ton jeu.
+- **Le résultat d'une partie** ne compte que si la majorité des joueurs **et** le vérificateur trouvent le même.
 
-### Importer un monde Minecraft
+### Crée ta carte
 
-Copiez le dossier du monde (celui qui contient `level.dat` et `region/`) dans
-`.minelib/saves/`. Il apparaît dans la liste **Solo**.
+Dans ton monde en créatif, sélectionne une zone avec la baguette (`//wand`), puis :
 
-- Java Edition, format Anvil : avant 1.13, de 1.13 à 1.17, et 1.18 ou plus récent.
-- Les fichiers d'origine **ne sont jamais modifiés**. Minelib écrit sa propre sauvegarde
-  à côté (`level.txt`, `chunks.bin`, `edits.bin`).
-- La hauteur est de 256 blocs : un monde 1.18+ (Y −64 à 319) est décalé de +64, et ce qui
-  dépasse Y 191 est ignoré.
+| Commande | Effet |
+|----------|-------|
+| `/fps set spawn ct` · `/fps set spawn t` | Zone de départ des CT / des T |
+| `/fps set site a` · `b` · `c` | Site de bombe |
+| `/fps set maxplayer <n>` | Nombre de joueurs (2 à 10 ; 10 = classé) |
+| `/fps info` · `/fps clear …` | Voir ou effacer les réglages |
 
-### Ajouter un pack de textures
-
-Déposez le `.zip` (ou le dossier) dans `.minelib/resourcepacks/`, puis choisissez-le dans
-**Échap → Packs de textures**. Les noms de textures de Minecraft, anciens comme récents,
-sont reconnus. Le pack par défaut, *VoxelArt Libre*, est sous licences libres.
+Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aussi). Ta carte est partagée avec tout le monde dès que tu lances une partie dessus.
 
 ---
 
-## 🎮 Modes de jeu
+## 🧱 Le mode construction
 
-Changez de mode avec `/gm <n>` (ou `/gamemode <n>`) :
+- **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts.
+- **Survie, créatif, spectateur** (`/gm 0`, `1`, `3`).
+- **WorldEdit intégré** : plus de 40 commandes `//` (remplir, copier, coller, tourner, sphères, cylindres, annuler…).
+- **Des blocs qui se posent comme on s'y attend** : escaliers face à toi (à l'envers au plafond), dalles, portes, trappes, vitres qui se raccordent, bannières.
+- **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`).
+- **Importe tes mondes Java** (format Anvil, toutes versions) et tes **packs de textures** : les fichiers d'origine ne sont jamais modifiés.
 
-| `/gm` | Mode | Description |
-|:----:|------|-------------|
-| `0` | **Survie** | Santé, dégâts de chute, inventaire (piles de 64). `/fly` autorise le vol. |
-| `1` | **Créatif** | Blocs illimités, vol (double appui sur Espace), WorldEdit. |
-| `2` | **FPS** | Combat façon Counter-Strike : armes, grenades, argent, menu d'achat. |
-| `3` | **Spectateur** | Vol forcé, on traverse les blocs, aucune interaction. |
+---
+
+## 👤 Ton compte
+
+- **Pseudo + mot de passe**, rien d'autre. Ton mot de passe ne quitte jamais ton PC.
+- **Double authentification** facultative (Authy, Aegis, Google Authenticator, 2FAS, Bitwarden), demandée **une seule fois par appareil**.
+- **Connexion automatique** au lancement, sans retaper ton mot de passe ni ton code.
+- **Un pseudo est unique** sur tous les relais, inscrit dans un registre public signé.
+- **Amis** : ajoute-les depuis le jeu, retrouve-les dans le classement.
+- **Ton skin** : dans **Paramètres**, un aperçu en 3D de ton personnage et le bouton **Changer de skin** (PNG de 64 × 64 au format des jeux de blocs). Les autres joueurs le voient ; il change en direct en construction, et reste le même pendant une partie FPS. Pendant l'échauffement, tout le monde garde le modèle par défaut (anonymat).
+- **7 langues** : français, English, español, Deutsch, italiano, português, Nederlands (Paramètres → Langue).
+- **Chat vocal chiffré de bout en bout** : à ton équipe en FPS, aux joueurs proches en construction. Ni le relais, ni l'hôte ne peuvent écouter.
 
 ---
 
 ## ⌨️ Commandes
 
-Les touches sont **physiques** : elles restent à la même place en AZERTY comme en QWERTY
-(la touche « W » est le **Z** d'un clavier AZERTY). Tout se règle dans
-**Échap → Options → Régler les touches**, avec un onglet **Build** et un onglet **FPS**.
-On peut choisir « maintenir » ou « bascule » pour marcher et s'accroupir.
+Les touches sont **physiques** (même place en AZERTY et en QWERTY) et se règlent dans **Échap → Options → Régler les touches**, avec un onglet Build et un onglet FPS. La **sensibilité de la souris** se règle séparément pour chaque mode.
 
-### Construction (survie, créatif)
+<details>
+<summary><b>Construction</b></summary>
 
 | Touche | Action | | Touche | Action |
 |--------|--------|-|--------|--------|
 | Z Q S D | Se déplacer | | Clic gauche | Casser |
-| Espace | Sauter / monter | | Clic droit | Poser |
+| Espace | Sauter / monter | | Clic droit | Poser / ouvrir |
 | Maj gauche | S'accroupir / descendre | | Clic molette | Copier le bloc visé |
 | Ctrl gauche | Courir | | 1 à 0, molette | Barre d'objets |
 | E | Inventaire | | T / `/` | Tchat / commande |
-| C (maintenu) | Zoom | | N | Jour / nuit |
+| C (maintenu) | Zoom | | F5 | Vue 1re / 3e personne |
 | F2 | Capture d'écran | | F3 | Écran de debug |
-| Page ↑ / ↓ | Distance de rendu | | Échap | Menu |
 
-### FPS
+</details>
+
+<details>
+<summary><b>FPS</b></summary>
 
 | Touche | Action | | Touche | Action |
 |--------|--------|-|--------|--------|
@@ -146,145 +149,98 @@ On peut choisir « maintenir » ou « bascule » pour marcher et s'accroupir.
 | Ctrl gauche | S'accroupir | | R | Recharger |
 | Maj gauche | Marcher (silencieux) | | B | Menu d'achat |
 | 1 / 2 / 3 / 4 | Principale / pistolet / couteau / grenades | | F4 | Racheter |
-| Molette | Arme suivante / précédente | | A | Dernière arme |
-| G | Lâcher l'arme | | Clic molette | Signaler (ping) |
+| G | Lâcher l'arme ou la grenade | | E | Ramasser, poser, désamorcer |
+| Tab | Scores | | K (maintenu) | Micro |
 
-### Commandes du tchat
+</details>
+
+<details>
+<summary><b>Commandes du tchat</b></summary>
+
+Le tchat se navigue avec ← → (Début, Fin, Suppr).
 
 | Commande | Effet |
 |----------|-------|
-| `/help` | Liste des commandes |
-| `/gm <0-3>` | Changer de mode de jeu |
-| `/fly` | Autoriser ou interdire le vol en survie |
-| `/heal` | Rendre toute la santé |
-| `/give <bloc> [nombre]` | Obtenir un bloc (ex. `/give mirror`, `/give iron_block`) |
-| `//…` | Commandes WorldEdit (créatif, voir plus bas) |
+| `/help` | Toutes les commandes |
+| `/gm <0-3>` | Mode de jeu |
+| `/kill [pseudo]` | Mourir, ou tuer un joueur (OP d'un serveur de construction) |
+| `/report <pseudo>` · `/unreport <pseudo>` | Signaler un joueur de ta partie, ou annuler |
+| `/ami <pseudo>` · `/ami retirer <pseudo>` · `/amis` | Amis (aussi `/friend add <pseudo>`) |
+| `/equipe ct` · `/equipe t` | Changer d'équipe pendant l'échauffement (aussi `/team`) |
+| `/op` · `/deop` · `/ban` · `/unban` | Gérer son serveur de construction |
+| `//…` | WorldEdit (créatif) |
 
-Le tchat accepte jusqu'à 256 caractères et coupe les messages longs sur plusieurs lignes.
-
----
-
-## 🔫 Mode FPS
-
-- **Déplacements de Counter-Strike** : accélération dans les airs (*air strafe*), friction au
-  sol, **bunny hop**, et fatigue des jambes si l'on saute ou s'accroupit trop souvent.
-- **34 armes** :
-  - **Pistolets** : Glock-18, USP-S, P2000, Dual Berettas, P250, Five-SeveN, Tec-9,
-    CZ75-Auto, Desert Eagle, R8 Revolver.
-  - **Pistolets-mitrailleurs** : MAC-10, MP9, MP7, MP5-SD, UMP-45, P90, PP-Bizon.
-  - **Fusils à pompe** : Nova, XM1014, Sawed-Off, MAG-7.
-  - **Mitrailleuses** : M249, Negev.
-  - **Fusils** : Galil AR, FAMAS, AK-47, M4A4, M4A1-S, SG 553, AUG.
-  - **Fusils de précision** : SSG 08, AWP, G3SG1, SCAR-20.
-- **Précision réaliste** : la dispersion augmente avec la vitesse, une rafale part droit
-  quand on est immobile, et un tir sans lunette à l'arrêt depuis 0,2 s est plus précis.
-- **Lunettes** : ×2 pour l'AUG et la SG 553 ; ×2 puis ×4 pour les fusils de précision.
-  Le R8 doit armer son chien avant de tirer.
-- **Équipement comme dans CS** : une arme principale, un pistolet, un couteau et jusqu'à
-  4 grenades (2 flashs au plus). Il faut attendre 0,75 s après un changement d'arme avant
-  de tirer.
-- **Grenades** :
-  - **HE** : explosion à dégâts dégressifs.
-  - **Flash** : l'aveuglement dépend de l'angle de vue.
-  - **Fumigène** : 18 s, faite de milliers de petites bouffées. Chaque balle y creuse un
-    tunnel qui se referme en 1,5 s.
-  - **Molotov** : feu au sol.
-  - **Leurre**.
-- **Sons** : tir, rechargement, lunette, sortie de chaque arme et couteau. Tous les sons
-  sont libres (CC0).
+</details>
 
 ---
 
-## 🛠️ WorldEdit
+## 🚀 Installation
 
-Disponible en **créatif**. `//wand` donne la **baguette de sélection** :
+**Windows** : télécharge **`minelib-launcher.exe`** (lien en haut de la page) et lance-le. Le lanceur ne contient pas le jeu : il demande à GitHub la dernière version publiée, la télécharge avec une barre de progression, vérifie son empreinte SHA-256, puis lance le jeu. Les fois suivantes, il ne télécharge que s'il y a une nouvelle version (et si GitHub est injoignable, il lance celle déjà installée). Le jeu est rangé dans `%APPDATA%\.minelib\bin`.
 
-- **clic gauche** : coin 1 ;
-- **clic droit** : coin 2 ;
-- **clic molette** : effacer la sélection.
+Le jeu compare aussi son propre fichier à la version officielle (« fichiers vérifiés », ou « exécutable non officiel » s'il a été modifié ou abîmé : une alerte honnête, pas une protection absolue, ce sont les garants qui empêchent la triche). La ligne en bas à gauche de l'accueil indique la version, par exemple « Minelib v77 - à jour (lanceur) ».
 
-La zone s'affiche en bleu tant qu'on tient la baguette.
+Tes mondes, captures et réglages sont dans `%APPDATA%\.minelib` (Windows) ou `~/.minelib` (Linux). Dépose un monde Java dans `saves/` ou un pack de textures dans `resourcepacks/`.
 
-| Catégorie | Commandes |
-|-----------|-----------|
-| **Sélection** | `//pos1` `//pos2` (pieds), `//hpos1` `//hpos2` (bloc visé), `//sel` (effacer), `//size`, `//wand` |
-| **Zone** | `//expand <n> [direction \| vert]`, `//contract <n> [direction]`, `//shift <n> [direction]` |
-| **Remplir** | `//set <motif>`, `//replace [<de>] <vers>`, `//walls`, `//faces` (`//outline`), `//overlay`, `//center`, `//naturalize`, `//line`, `//drain [rayon]`, `//replacenear <rayon> <de> <vers>` |
-| **Formes** (aux pieds) | `//sphere` `//hsphere <motif> <rayon>`, `//cyl` `//hcyl <motif> <rayon> [hauteur]`, `//pyramid` `//hpyramid <motif> <taille>` |
-| **Déplacer** | `//move <n> [direction]`, `//stack <n> [direction]` |
-| **Presse-papiers** | `//copy`, `//cut`, `//paste [-a]` (`-a` : sans l'air), `//rotate [90 \| 180 \| 270]`, `//flip [direction]` |
-| **Historique** | `//undo`, `//redo` (30 opérations) |
-| **Infos** | `//count <blocs>`, `//distr`, `//help` |
-
-- **Motifs** : un nom français ou une clé (`pierre`, `stone`, `planks_oak`,
-  `slab:stone:bottom`), un numéro de bloc, ou un mélange : `//set 50%stone,50%dirt`.
-- **Directions** : `me` (le regard, par défaut), `back`, `left`, `right`, `up`, `down`,
-  `north`, `south`, `east`, `west` (ou `n`, `s`, `e`, `w`, `u`, `d`).
-- **Limites** : 4 millions de blocs par commande, uniquement dans les chunks chargés.
-  `//rotate` ne réoriente pas encore les escaliers ni les torches.
+| Plateforme | État |
+|------------|------|
+| Windows 10/11 (DirectX 12, Vulkan) | ✅ |
+| Linux (Vulkan) | ✅ |
+| macOS (Metal) | bientôt |
+| Android, iOS | en préparation |
 
 ---
 
-## 🖥️ Rendu et technique
+<details>
+<summary><h2>🛠️ Pour les développeurs</h2></summary>
 
-| Domaine | Détails |
-|---------|---------|
-| **API graphique** | [wgpu](https://wgpu.rs) 25 : DirectX 12, Vulkan ou Metal |
-| **Profondeur** | Z inversé et projection infinie : précision constante à plusieurs km |
-| **Visibilité** | Élimination hors champ (frustum), tri de l'avant vers l'arrière, occlusion par tranches de chunk |
-| **Lumière** | Propagation par blocs avec couverture 4 × 4 par face, lumière colorée RVB, AO lissée |
-| **Raytracing** | Grille de voxels sur le GPU (cubes, dalles, escaliers, clôtures, murets, panneaux, torches) ; miroirs, eau, glace, métaux |
-| **Image** | Échelle de rendu réglable, anticrénelage temporel, VSync ou FPS illimités, mode faible latence |
-| **Multicœur** | Génération et maillage sur un pool de threads basse priorité, jeu et rendu en haute priorité |
-| **GPU hybrides** | Détection de la carte dédiée et réglages adaptés (dédiée, intégrée, logiciel) |
-| **Mémoire** | Distance de rendu (2 à 64 chunks) plafonnée selon la mémoire vive disponible |
-| **Audio** | [rodio](https://github.com/RustAudio/rodio) (Ogg Vorbis), fil audio dédié |
-| **Fenêtre et entrées** | [winit](https://github.com/rust-windowing/winit) 0.30, touches physiques |
+### Compiler
 
-### Organisation du code
+```bash
+git clone <url-du-dépôt> minelib && cd minelib
+cargo run --release                                     # le jeu
+cargo build --release --target x86_64-pc-windows-gnu    # l'exe Windows depuis Linux
+cargo test --release && cargo clippy --release --all-targets
+```
+
+Il faut Rust 1.85 ou plus récent.
+
+### Organisation
 
 ```text
 crates/
-├── platform/   fenêtre, boucle d'événements, entrées, temps (winit)
-├── render/     rendu wgpu : chunks, ciel, interface, raytracing, armes en main
-├── world/      blocs, chunks, génération, lumière, maillage, lancer de rayons
+├── platform/   fenêtre, entrées, temps (winit)
+├── render/     rendu wgpu : chunks, ciel, interface, raytracing, armes
+├── world/      blocs, génération, lumière, maillage
 ├── assets/     dossier .minelib, options, packs de textures
-└── app/        le jeu : menus, joueur, modes, FPS, WorldEdit, sauvegardes, import Minecraft
+├── net/        protocole, chiffrement (Noise), client du relais
+├── relay/      relais : comptes, classement, cartes, parties, arbitrage
+├── p2p/        découverte des relais (DHT) et tunnels (iroh)
+└── app/        le jeu : menus, modes, FPS, WorldEdit, réseau de partie
 ```
 
-### Variables d'environnement (développement)
+### Relais
 
-| Variable | Effet |
-|----------|-------|
-| `MINELIB_HOME=<dossier>` | Remplace le dossier `.minelib` |
-| `MINELIB_WORLD=<nom>` | Ouvre (ou crée) directement ce monde |
-| `MINELIB_SEED=<n>` | Graine du monde créé par `MINELIB_WORLD` |
-| `MINELIB_VIEW=<chunks>` | Distance de rendu au lancement |
-| `MINELIB_VSYNC=1` | Démarrer avec la VSync |
-| `MINELIB_FPS_MAX=<n>` | Plafond de FPS |
-| `MINELIB_DEBUG=1` | Écran F3 ouvert au démarrage |
-| `MINELIB_NIGHT=1` | Commencer de nuit |
-| `MINELIB_START=x,y,z[,lacet,tangage]` | Position de départ |
+Le relais met les joueurs en relation, transmet les données des parties, garde les comptes, le classement et les cartes. Le jeu le trouve tout seul (réseau local, puis DHT de BitTorrent, sinon ce PC devient le relais, joignable sans ouvrir de port grâce à iroh). `minelib-relay.exe` est le même relais sans le jeu ; les administrateurs (`admins.txt`) peuvent bannir un tricheur avec `/bantriche <pseudo> <preuve>`.
 
-### Tests
+### Publication
 
-```bash
-cargo test --release
-cargo clippy --release --all-targets
-```
+À chaque envoi sur GitHub, `.github/workflows/release.yml` compile le jeu pour Windows et publie la Release `vNN` si `VERSION` (`crates/app/src/update.rs`) est nouveau. `MINELIB_NO_UPDATE=1` désactive les mises à jour.
+
+### Variables d'environnement
+
+`MINELIB_HOME`, `MINELIB_WORLD`, `MINELIB_SEED`, `MINELIB_VIEW`, `MINELIB_VSYNC`, `MINELIB_FPS_MAX`, `MINELIB_DEBUG`, `MINELIB_NIGHT`, `MINELIB_START=x,y,z[,lacet,tangage]`.
+
+</details>
 
 ---
 
 ## 📜 Licences et crédits
 
 - **Code** : [GNU AGPL v3](LICENSE).
-- **Textures (VoxelArt Libre)** : *Pixel Perfection* de XSSheep et la communauté
-  (CC BY-SA 4.0), Mineclonia (CC BY-SA 4.0 / CC0), *Minecraft-Textures* d'Auseawesome
-  (CC0), verre d'après le *Voxel Pack* de Kenney (CC0). Le détail est dans `assets/CREDITS_VoxelArt_Libre.txt`.
+- **Textures (VoxelArt Libre)** : *Pixel Perfection* de XSSheep et la communauté (CC BY-SA 4.0), Mineclonia (CC BY-SA 4.0 / CC0), *Minecraft-Textures* d'Auseawesome (CC0), verre d'après le *Voxel Pack* de Kenney (CC0). Détail : `assets/CREDITS_VoxelArt_Libre.txt`.
 - **Modèles d'armes** : *Ultimate Gun Pack* de [Quaternius](https://quaternius.com) (CC0).
-- **Sons** : *Free Firearm Sound Library*, *gun reload sounds*, *Fantasy Weapons and
-  Apparel SFX Library*, *Tinysized SFX* et d'autres, tous en CC0. Le détail est dans
-  `crates/app/assets/sounds/CREDITS.txt`.
+- **Sons** : bibliothèques libres (CC0). Détail : `crates/app/assets/sounds/CREDITS.txt`.
+- **Bibliothèques** : wgpu, winit, rodio, mainline, iroh et d'autres, sous licences MIT / Apache-2.0.
 
-Minelib est un projet indépendant, sans lien avec Mojang, Microsoft ou Valve.
-Minecraft et Counter-Strike sont des marques de leurs propriétaires respectifs.
+Minelib est un projet indépendant, sans lien avec Mojang, Microsoft ou Valve. Minecraft et Counter-Strike sont des marques de leurs propriétaires respectifs.
