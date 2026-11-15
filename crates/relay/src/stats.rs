@@ -37,15 +37,122 @@ pub struct Stats {
     pub reported: Vec<String>,
     pub reported_by: Vec<String>,
     pub friends: Vec<String>,
+    /// Facteur de confiance (0 à 1000 ; 500 pour un compte neuf). Baisse un peu à chaque
+    /// signalement, coéquipier tué ou longue absence, remonte lentement à chaque partie
+    /// propre : les joueurs sérieux creusent l'écart. Les parties se forment entre
+    /// facteurs proches (le plus bas des comptes de la même machine compte).
+    pub trust: i32,
+    /// Coéquipiers tués, et parties quittées trop longtemps.
+    pub teamkills: u32,
+    pub absences: u32,
+}
+
+/// Facteur de confiance d'un compte neuf, et bornes.
+pub const TRUST_START: i32 = 500;
+pub const TRUST_MAX: i32 = 1000;
+
+/// Ce qui fait bouger le facteur de confiance.
+pub mod trust {
+    /// Partie finie sans signalement : remonte lentement.
+    pub const CLEAN_GAME: i32 = 8;
+    /// Signalement reçu (rendu si le signalement est retiré).
+    pub const REPORT: i32 = -40;
+    /// Partie abandonnée (jusqu'à la fin).
+    pub const ABANDON: i32 = -150;
+    /// Triche prouvée par les garants.
+    pub const CHEAT: i32 = -400;
+}
+
+/// Statistiques enregistrées avant le facteur de confiance (relues, puis complétées).
+#[derive(Deserialize)]
+struct StatsV1 {
+    pseudo: String,
+    elo: f64,
+    matches: u32,
+    wins: u32,
+    losses: u32,
+    ties: u32,
+    kills: u32,
+    deaths: u32,
+    assists: u32,
+    headshots: u32,
+    damage: u64,
+    rounds: u32,
+    mvps: u32,
+    games: u32,
+    reports: u32,
+    reported: Vec<String>,
+    reported_by: Vec<String>,
+    friends: Vec<String>,
+}
+
+impl From<StatsV1> for Stats {
+    fn from(o: StatsV1) -> Self {
+        // Facteur de départ d'un ancien compte : 500, moins ses signalements passés.
+        let trust = (TRUST_START + trust::REPORT * o.reports as i32).clamp(0, TRUST_MAX);
+        Stats {
+            pseudo: o.pseudo,
+            elo: o.elo,
+            matches: o.matches,
+            wins: o.wins,
+            losses: o.losses,
+            ties: o.ties,
+            kills: o.kills,
+            deaths: o.deaths,
+            assists: o.assists,
+            headshots: o.headshots,
+            damage: o.damage,
+            rounds: o.rounds,
+            mvps: o.mvps,
+            games: o.games,
+            reports: o.reports,
+            reported: o.reported,
+            reported_by: o.reported_by,
+            friends: o.friends,
+            trust,
+            teamkills: 0,
+            absences: 0,
+        }
+    }
 }
 
 impl Stats {
-    fn new(pseudo: &str) -> Self {
+    pub fn new(pseudo: &str) -> Self {
         Self {
             pseudo: pseudo.to_string(),
             elo: START_ELO,
+            trust: TRUST_START,
             ..Default::default()
         }
+    }
+
+    /// Fait bouger le facteur de confiance (borné à 0..1000).
+    pub fn trust_by(&mut self, d: i32) {
+        self.trust = (self.trust + d).clamp(0, TRUST_MAX);
+    }
+
+    /// Gain d'une partie propre : plus on a la confiance, plus elle monte (les joueurs
+    /// sérieux creusent l'écart).
+    pub fn clean_gain(&self) -> i32 {
+        trust::CLEAN_GAME + self.trust.max(0) / 150
+    }
+
+    /// Compte neuf (moins de 5 parties) : mis de préférence avec d'autres comptes neufs.
+    pub fn is_new(&self) -> bool {
+        self.games < 5
+    }
+
+    /// Pénalité pour être parti `away` d'une partie qui a duré `len` (secondes) : rien
+    /// sous 2 minutes, puis de plus en plus (10 minutes sur 30 : −50), jusqu'à l'abandon.
+    pub fn absence_penalty(away: f64, len: f64) -> i32 {
+        if away < 120.0 {
+            return 0;
+        }
+        let frac = (away / len.max(600.0)).min(1.0);
+        if frac >= 0.9 {
+            return trust::ABANDON;
+        }
+        -((frac * frac * 450.0).round() as i32).clamp(5, -trust::ABANDON - 10)
     }
 
     /// Signalements par partie jouée.
@@ -107,10 +214,11 @@ impl Store {
         let mut all = HashMap::new();
         for e in std::fs::read_dir(&dir)?.flatten() {
             if e.path().extension().is_some_and(|x| x == "stats") {
-                if let Some(s) = std::fs::read(e.path())
-                    .ok()
-                    .and_then(|b| postcard::from_bytes::<Stats>(&b).ok())
-                {
+                let bytes = std::fs::read(e.path()).unwrap_or_default();
+                let read = postcard::from_bytes::<Stats>(&bytes).ok().or_else(|| {
+                    postcard::from_bytes::<StatsV1>(&bytes).ok().map(Stats::from)
+                });
+                if let Some(s) = read {
                     all.insert(s.pseudo.to_ascii_lowercase(), s);
                 }
             }
@@ -133,6 +241,11 @@ impl Store {
         self.all
             .entry(pseudo.to_ascii_lowercase())
             .or_insert_with(|| Stats::new(pseudo))
+    }
+
+    /// Facteur de confiance d'un compte (500 s'il n'a jamais joué).
+    pub fn trust(&self, pseudo: &str) -> i32 {
+        self.get(pseudo).map_or(TRUST_START, |s| s.trust)
     }
 
     pub fn ratio(&self, pseudo: &str) -> f64 {
@@ -251,6 +364,50 @@ mod tests {
     use minelib_net::game::SummaryPlayer;
 
     #[test]
+    fn trust_moves_slowly() {
+        // Absences : rien sous 2 minutes, cher vers 10 minutes sur 30, abandon.
+        assert_eq!(Stats::absence_penalty(90.0, 1800.0), 0);
+        assert!(Stats::absence_penalty(600.0, 1800.0) <= -40);
+        assert!(Stats::absence_penalty(300.0, 1800.0) > -20);
+        assert_eq!(Stats::absence_penalty(1700.0, 1800.0), trust::ABANDON);
+        let mut s = Stats::new("a");
+        assert_eq!(s.trust, TRUST_START);
+        s.trust_by(5000);
+        assert_eq!(s.trust, TRUST_MAX);
+        s.trust_by(-5000);
+        assert_eq!(s.trust, 0);
+        // Les joueurs fiables gagnent plus par partie propre.
+        let (lo, hi) = (Stats::new("b"), Stats { trust: 900, ..Stats::new("c") });
+        assert!(hi.clean_gain() > lo.clean_gain());
+    }
+
+    #[test]
+    fn old_stats_still_read() {
+        let old = StatsV1 {
+            pseudo: "x".into(),
+            elo: 1000.0,
+            matches: 3,
+            wins: 1,
+            losses: 1,
+            ties: 1,
+            kills: 0,
+            deaths: 0,
+            assists: 0,
+            headshots: 0,
+            damage: 0,
+            rounds: 0,
+            mvps: 0,
+            games: 3,
+            reports: 2,
+            reported: vec![],
+            reported_by: vec![],
+            friends: vec![],
+        };
+        let s = Stats::from(old);
+        assert_eq!(s.trust, TRUST_START - 80);
+    }
+
+    #[test]
     fn elo_moves_like_chess() {
         assert!((expected(1200.0, 1200.0) - 0.5).abs() < 1e-9);
         assert!((expected(1600.0, 1200.0) - 0.909).abs() < 1e-3);
@@ -267,6 +424,7 @@ mod tests {
             mvps: 1,
             score: 25,
             rounds: 20,
+            teamkills: 0,
         };
         st.apply_match(&MatchSummary {
             map_sig: [0; 32],

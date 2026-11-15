@@ -35,18 +35,21 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn hovered(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
-        self.cursor.is_some_and(|(cx, cy)| cx >= x && cx < x + w && cy >= y && cy < y + h)
+        self.cursor
+            .is_some_and(|(cx, cy)| cx >= x && cx < x + w && cy >= y && cy < y + h)
     }
 
     /// Fond de menu du pack, en mosaïque.
     pub fn background(&mut self) {
         let s = self.s * 2.0;
-        self.ui.tiled("gui/menu_background", 0.0, 0.0, self.w, self.h, s, WHITE);
+        self.ui
+            .tiled("gui/menu_background", 0.0, 0.0, self.w, self.h, s, WHITE);
     }
 
     /// Voile sombre (menu par-dessus le jeu).
     pub fn dim(&mut self, alpha: f32) {
-        self.ui.rect(0.0, 0.0, self.w, self.h, [0.0, 0.0, 0.0, alpha]);
+        self.ui
+            .rect(0.0, 0.0, self.w, self.h, [0.0, 0.0, 0.0, alpha]);
     }
 
     pub fn text_center(&mut self, text: &str, y: f32, scale: f32, color: [f32; 4]) {
@@ -69,10 +72,21 @@ impl<'a> Ctx<'a> {
             "gui/button"
         };
         self.ui.nine_slice(sprite, x, y, w, h, 3.0, s);
-        let ts = s;
+        // Jamais de texte qui dépasse : plus petit, puis coupé.
+        let mut ts = s;
+        while ts > 1.0 && Ui::text_width(label, ts) > w - 6.0 * s {
+            ts -= 1.0;
+        }
+        let label = &fit(label, w - 4.0 * s, ts);
         let tw = Ui::text_width(label, ts);
         let color = if enabled { WHITE } else { GREY };
-        self.ui.text(x + (w - tw) / 2.0, y + (h - 8.0 * ts) / 2.0, ts, color, label);
+        self.ui.text(
+            x + (w - tw) / 2.0,
+            y + (h - 8.0 * ts) / 2.0,
+            ts,
+            color,
+            label,
+        );
         hover && self.click
     }
 
@@ -80,7 +94,16 @@ impl<'a> Ctx<'a> {
     /// `drag` mémorise le curseur tenu d'une image à l'autre (identifiant `id`).
     /// Renvoie la nouvelle position quand l'utilisateur le déplace.
     #[allow(clippy::too_many_arguments)]
-    pub fn slider(&mut self, id: u32, drag: &mut Option<u32>, label: &str, frac: f32, cx: f32, y: f32, width: f32) -> Option<f32> {
+    pub fn slider(
+        &mut self,
+        id: u32,
+        drag: &mut Option<u32>,
+        label: &str,
+        frac: f32,
+        cx: f32,
+        y: f32,
+        width: f32,
+    ) -> Option<f32> {
         let s = self.s;
         let (w, h) = (width * s, 20.0 * s);
         let x = cx - w / 2.0;
@@ -92,7 +115,8 @@ impl<'a> Ctx<'a> {
             *drag = None;
         }
         let active = *drag == Some(id);
-        self.ui.nine_slice("gui/button_disabled", x, y, w, h, 3.0, s);
+        self.ui
+            .nine_slice("gui/button_disabled", x, y, w, h, 3.0, s);
         let knob = 8.0 * s;
         let mut f = frac.clamp(0.0, 1.0);
         let mut changed = None;
@@ -106,21 +130,37 @@ impl<'a> Ctx<'a> {
             }
         }
         let kx = x + f * (w - knob);
-        let sprite = if hover || active { "gui/button_hover" } else { "gui/button" };
+        let sprite = if hover || active {
+            "gui/button_hover"
+        } else {
+            "gui/button"
+        };
         self.ui.nine_slice(sprite, kx, y, knob, h, 3.0, s);
         let tw = Ui::text_width(label, s);
-        self.ui.text(x + (w - tw) / 2.0, y + (h - 8.0 * s) / 2.0, s, WHITE, label);
+        self.ui
+            .text(x + (w - tw) / 2.0, y + (h - 8.0 * s) / 2.0, s, WHITE, label);
         changed
     }
 
     /// Cadre sombre (listes, champs).
     pub fn frame(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        self.ui.nine_slice("gui/panel_dark", x, y, w, h, 4.0, self.s);
+        self.ui
+            .nine_slice("gui/panel_dark", x, y, w, h, 4.0, self.s);
     }
 
     /// Champ de texte. Renvoie vrai s'il vient d'être cliqué (prise du focus).
     #[allow(clippy::too_many_arguments)]
-    pub fn text_field(&mut self, label: &str, value: &str, placeholder: &str, cx: f32, y: f32, width: f32, focused: bool, time: f32) -> bool {
+    pub fn text_field(
+        &mut self,
+        label: &str,
+        value: &str,
+        placeholder: &str,
+        cx: f32,
+        y: f32,
+        width: f32,
+        focused: bool,
+        time: f32,
+    ) -> bool {
         let s = self.s;
         let (w, h) = (width * s, 20.0 * s);
         let x = cx - w / 2.0;
@@ -144,20 +184,51 @@ impl<'a> Ctx<'a> {
 
     /// Ligne cliquable d'une liste. Renvoie vrai si cliquée.
     #[allow(clippy::too_many_arguments)]
-    pub fn list_row(&mut self, x: f32, y: f32, w: f32, h: f32, title: &str, detail: &str, selected: bool) -> bool {
+    pub fn list_row(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        title: &str,
+        detail: &str,
+        selected: bool,
+    ) -> bool {
         let s = self.s;
         let hover = self.hovered(x, y, w, h);
         if selected {
             self.ui.rect(x, y, w, h, [0.85, 0.85, 0.9, 0.9]);
-            self.ui.rect(x + s, y + s, w - 2.0 * s, h - 2.0 * s, [0.05, 0.05, 0.07, 0.95]);
+            self.ui.rect(
+                x + s,
+                y + s,
+                w - 2.0 * s,
+                h - 2.0 * s,
+                [0.05, 0.05, 0.07, 0.95],
+            );
         } else if hover {
             self.ui.rect(x, y, w, h, [1.0, 1.0, 1.0, 0.08]);
         }
-        self.ui.text(x + 6.0 * s, y + 4.0 * s, s, WHITE, title);
+        let room = w - 8.0 * s;
+        self.ui.text(x + 6.0 * s, y + 4.0 * s, s, WHITE, fit(title, room, s));
         let ds = (s / 2.0).floor().max(1.0);
-        self.ui.text(x + 6.0 * s, y + 15.0 * s, ds, GREY, detail);
+        self.ui
+            .text(x + 6.0 * s, y + 15.0 * s, ds, GREY, fit(detail, room, ds));
         hover && self.click
     }
+}
+
+/// Coupe un texte pour qu'il tienne dans `max_w` pixels (avec « … »).
+pub fn fit(text: &str, max_w: f32, scale: f32) -> String {
+    // Coupé dans la langue affichée.
+    let text = &minelib_render::tr(text);
+    if Ui::text_width(text, scale) <= max_w {
+        return text.to_string();
+    }
+    let mut out: String = text.to_string();
+    while !out.is_empty() && Ui::text_width(&format!("{out}…"), scale) > max_w {
+        out.pop();
+    }
+    format!("{out}…")
 }
 
 /// Applique la saisie clavier à un champ de texte (caractères tapés + effacement).

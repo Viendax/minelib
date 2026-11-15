@@ -75,6 +75,21 @@ impl Store {
         self.save();
     }
 
+    /// Comptes vus sur une des machines de ce compte (lui compris, en minuscules).
+    pub fn siblings(&self, pseudo: &str) -> Vec<String> {
+        let me = pseudo.to_ascii_lowercase();
+        let Some(mine) = self.data.seen.get(&me) else {
+            return vec![me];
+        };
+        let mut out = vec![me.clone()];
+        for (p, ms) in &self.data.seen {
+            if *p != me && ms.iter().any(|m| mine.iter().any(|n| same_machine(m, n))) {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
+
     /// Ces deux comptes ont-ils été vus sur une même machine ?
     pub fn share_machine(&self, a: &str, b: &str) -> bool {
         let of = |p: &str| self.data.seen.get(&p.to_ascii_lowercase());

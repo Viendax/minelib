@@ -591,6 +591,33 @@ impl WeaponDef {
         }
     }
 
+    /// Vitesse de course arme en main (unités de CS2 ; 250 au couteau), et à la lunette.
+    pub fn speed(&self, scoped: bool) -> u8 {
+        let (open, scope) = match self.name {
+            "Glock-18" | "USP-S" | "P2000" | "Dual Berettas" | "P250" | "Five-SeveN"
+            | "Tec-9" | "CZ75-Auto" | "MAC-10" | "MP9" | "PP-Bizon" => (240, 240),
+            "Desert Eagle" => (230, 230),
+            "R8 Revolver" => (220, 220),
+            "MP7" | "Nova" | "FAMAS" => (220, 220),
+            "MP5-SD" => (235, 235),
+            "UMP-45" | "P90" | "SSG 08" => (230, 230),
+            "XM1014" | "Galil AR" | "AK-47" => (215, 215),
+            "Sawed-Off" | "SG 553" => (210, 150),
+            "MAG-7" | "M4A4" | "M4A1-S" => (225, 225),
+            "M249" => (195, 195),
+            "Negev" => (150, 150),
+            "AUG" => (220, 150),
+            "AWP" => (200, 100),
+            "G3SG1" | "SCAR-20" => (215, 120),
+            _ => (230, 230),
+        };
+        if scoped {
+            scope
+        } else {
+            open
+        }
+    }
+
     /// Perte de dégâts avec la distance (« range modifier » de CS2) : les dégâts sont
     /// multipliés par ce nombre tous les 500 unités de CS ([`RANGE_STEP`] blocs).
     pub fn range_mod(&self) -> f32 {

@@ -52,6 +52,7 @@ pub struct Other {
     pub yaw: f32,
     pub pitch: f32,
     pub crouch: f32,
+    #[allow(dead_code)]
     pub speed: f32,
     seen: f32,
 }
@@ -194,12 +195,7 @@ impl BuildNet {
             self.zones.insert(*z);
         }
         log::info!("garant : {} zone(s)", self.zones.len());
-        (!gained.is_empty()).then(|| {
-            format!(
-                "Tu es garant de {} zone(s) : tu valides les constructions qui s'y font.",
-                self.zones.len()
-            )
-        })
+        None
     }
 
     /// Message d'un autre joueur ou d'un garant. Renvoie les chunks à remailler.

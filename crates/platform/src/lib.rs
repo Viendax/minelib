@@ -43,6 +43,18 @@ pub struct Input {
 }
 
 impl Input {
+    /// Essais : appuie sur une touche pour cette image (et la tient).
+    pub fn press(&mut self, k: KeyCode) {
+        self.held.insert(k);
+        self.pressed.insert(k);
+    }
+
+    /// Essais : début d'une nouvelle image (touches toujours tenues, plus « pressées »).
+    pub fn next_frame(&mut self) {
+        self.pressed.clear();
+        self.text.clear();
+    }
+
     pub fn held(&self, k: KeyCode) -> bool {
         self.held.contains(&k)
     }

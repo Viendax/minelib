@@ -87,6 +87,8 @@ pub struct Options {
     pub low_latency: bool,
     /// Sensibilité de la souris, valeur Counter-Strike (0,022° par unité de souris × valeur).
     pub sensitivity: f32,
+    /// Sensibilité en mode FPS (réglée à part de la construction).
+    pub sensitivity_fps: f32,
     /// Reflets en raytracing (miroir, métal, eau…).
     pub raytracing: bool,
     /// Échelle de rendu du monde (0,5 … 1) : en dessous de 1, le monde est calculé en plus
@@ -110,6 +112,10 @@ pub struct Options {
     pub relay_key: String,
     /// Dernier pseudo utilisé (prérempli à la connexion).
     pub pseudo: String,
+    /// Couleur préférée en FPS (0 à 4 : vert, jaune, orange, bleu, violet ; 255 : aucune).
+    pub fps_color: u8,
+    /// Langue de l'interface (code : « fr », « en »…).
+    pub language: String,
 }
 
 /// Sensibilité par défaut de Counter-Strike 2.
@@ -124,6 +130,9 @@ impl Default for Options {
             render_distance: 10,
             low_latency: false,
             sensitivity: DEFAULT_SENSITIVITY,
+            sensitivity_fps: DEFAULT_SENSITIVITY,
+            fps_color: 255,
+            language: "fr".into(),
             raytracing: true,
             render_scale: 1.0,
             fps_max: 0,
@@ -187,6 +196,19 @@ impl Options {
             }
             if let Some(v) = kv.get("sensitivity").and_then(|v| v.parse::<f32>().ok()) {
                 o.sensitivity = v.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
+                o.sensitivity_fps = o.sensitivity;
+            }
+            if let Some(v) = kv.get("sensitivity_fps").and_then(|v| v.parse::<f32>().ok()) {
+                o.sensitivity_fps = v.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
+            }
+            if let Some(v) = kv.get("fps_color").and_then(|v| v.parse::<u8>().ok()) {
+                o.fps_color = if v < 5 { v } else { 255 };
+            }
+            if let Some(v) = kv.get("language") {
+                let v = v.trim();
+                if !v.is_empty() && v.len() <= 8 {
+                    o.language = v.to_string();
+                }
             }
         }
         o
@@ -196,14 +218,17 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\n",
+                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.fps_max,
                 self.relay,
                 self.relay_key,
                 self.pseudo,
-                self.garant
+                self.garant,
+                self.sensitivity_fps,
+                self.fps_color,
+                self.language
             ),
         )?;
         Ok(())

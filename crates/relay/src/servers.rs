@@ -34,6 +34,8 @@ pub enum Action {
     Op,
     Deop,
     List,
+    /// Tuer un joueur (OP) : rien à garder, juste la permission.
+    Kill,
 }
 
 impl Store {
@@ -109,6 +111,7 @@ impl Store {
                 ));
             }
             _ if target.is_empty() => return Err("Pseudo manquant.".into()),
+            Action::Kill => return Ok(format!("{target} est tué.")),
             Action::Ban if is_creator => return Err("On ne bannit pas le créateur.".into()),
             Action::Ban if by.eq_ignore_ascii_case(target) => {
                 return Err("On ne se bannit pas soi-même.".into())

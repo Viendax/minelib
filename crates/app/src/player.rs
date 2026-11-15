@@ -94,6 +94,9 @@ pub struct Player {
     /// Mode FPS : appui sur saut encore valable (s) ; il faut réappuyer pour ressauter.
     jump_buffer: f32,
     sneak_was_held: bool,
+    /// Mode FPS : vitesse permise par ce qu'on tient, en unités de CS (250 : couteau,
+    /// 215 : AK-47, 200 : AWP, 100 : AWP à la lunette…). 0 : 250.
+    pub carry: u8,
     /// Les autres joueurs, solides : on ne les traverse pas, on peut monter sur une tête.
     /// À remplir avant chaque pas (vide : personne).
     pub others: Vec<Other>,
@@ -162,6 +165,7 @@ impl Player {
             sneak_was_held: false,
             others: Vec::new(),
             slide: None,
+            carry: 250,
         }
     }
 
@@ -176,6 +180,7 @@ impl Player {
             duck_speed: self.duck_speed,
             jump_buffer: self.jump_buffer,
             sneak_held: self.sneak_was_held,
+            carry: self.carry,
         }
     }
 
@@ -188,6 +193,9 @@ impl Player {
         self.duck_speed = s.duck_speed;
         self.jump_buffer = s.jump_buffer;
         self.sneak_was_held = s.sneak_held;
+        if s.carry != 0 {
+            self.carry = s.carry;
+        }
     }
 
     pub fn eye(&self) -> Vec3 {
@@ -339,13 +347,16 @@ impl Player {
 
         // Accroupi : vitesse d'accroupi tout de suite (dès l'appui, sans attendre que
         // le corps soit descendu).
-        let max_speed = if m.sneak {
-            FPS_SPRINT * cs::DUCK_MULT
-        } else if m.sprint {
-            FPS_SPRINT
-        } else {
-            FPS_WALK
-        };
+        // Arme en main : même rapport que dans CS (vitesse de l'arme / 250).
+        let carry = if self.carry == 0 { 250.0 } else { self.carry as f32 } / 250.0;
+        let max_speed = carry
+            * if m.sneak {
+                FPS_SPRINT * cs::DUCK_MULT
+            } else if m.sprint {
+                FPS_SPRINT
+            } else {
+                FPS_WALK
+            };
         let wish_len = wish.length();
         let wish_dir = if wish_len > 1e-4 {
             wish / wish_len

@@ -24,8 +24,6 @@ use minelib_net::game::{
 
 use crate::weapons::WEAPONS;
 
-pub const PLAYERS: usize = 10;
-pub const TEAM_MAX: usize = 5;
 const HALF: u32 = 12;
 const WIN: u8 = 13;
 pub const FREEZE_S: f32 = 20.0;
@@ -50,6 +48,8 @@ const LOSS_STEP: u32 = 500;
 const PLANT_TEAM_BONUS: u32 = 800;
 const OBJECTIVE_REWARD: u32 = 300;
 const TEAMKILL_PENALTY: u32 = 300;
+/// Coéquipiers tués avant d'être exclu de la partie.
+pub const TEAMKILL_KICK: u16 = 3;
 pub const KIT_PRICE: u32 = 400;
 pub const KEVLAR_PRICE: u32 = 650;
 pub const HELMET_PRICE: u32 = 1_000;
@@ -93,6 +93,13 @@ impl Hurt {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MPlayer {
+    /// Lobby (0 : seul) : les joueurs d'un même lobby sont dans la même équipe.
+    pub party: u64,
+    /// Couleur dans l'équipe (0 à 4) et couleur préférée (255 : aucune).
+    pub color: u8,
+    pub pref: u8,
+    /// Coéquipiers tués dans cette partie (3 : exclu).
+    pub teamkills: u16,
     pub pseudo: String,
     pub team: u8,
     pub start_team: u8,
@@ -166,6 +173,8 @@ pub enum Ev {
     Started,
     /// Nouvelle manche (les armes au sol disparaissent).
     NewRound,
+    /// Trois coéquipiers tués : ce joueur est exclu de la partie.
+    TeamKillKick(u64),
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -210,6 +219,12 @@ pub struct Match {
 
 /// Tirs d'avance permis (les messages arrivent parfois groupés).
 const BURST: f32 = 3.0;
+
+/// Type de grenade d'un objet au sol (`ITEM_NADE` + type), sinon `None` (arme).
+pub fn nade_code(weapon: u8) -> Option<usize> {
+    let n = (weapon as u16).checked_sub(ITEM_NADE)? as usize;
+    (n < 5).then_some(n)
+}
 
 /// Pistolet de départ d'une équipe (Glock-18 pour les T, USP-S pour les CT).
 pub fn starter(team: u8) -> u8 {
@@ -283,6 +298,11 @@ impl Match {
         }
     }
 
+    /// Joueurs par équipe (5 pour une carte 5 contre 5).
+    pub fn team_max(&self) -> usize {
+        (self.map.players() / 2).max(1) as usize
+    }
+
     /// Réapparition : `reset` (mort, changement de côté) remet le pistolet de départ.
     fn spawn(&mut self, id: u64, reset: bool) -> Ev {
         if reset {
@@ -332,12 +352,16 @@ impl Match {
         true
     }
 
-    /// Lancer d'une grenade : il faut en porter une de ce type (elle est retirée).
+    /// Lancer d'une grenade (code réseau : type, ou leurre qui imite une arme) : il faut
+    /// en porter une de ce type (elle est retirée).
     pub fn throw(&mut self, id: u64, nade: u8) -> bool {
+        let Some((kind, _)) = crate::equip::nade_from_net(nade) else {
+            return false;
+        };
         match self
             .players
             .get_mut(&id)
-            .and_then(|p| p.nades.get_mut(nade as usize))
+            .and_then(|p| p.nades.get_mut(kind.index()))
         {
             Some(n) if *n > 0 => {
                 *n -= 1;
@@ -349,14 +373,22 @@ impl Match {
 
     /// Pose au sol une arme que le joueur porte (lâchée, ou celle d'un mort).
     pub fn drop_gun(&mut self, id: u64, weapon: u8, at: Vec3) -> bool {
-        if WEAPONS.get(weapon as usize).is_none() || !self.has_gun(id, weapon) {
-            return false;
-        }
-        let p = self.players.get_mut(&id).expect("joueur");
-        if p.guns.0 == weapon {
-            p.guns.0 = 255;
+        // Grenade (`ITEM_NADE` + type) : une de moins.
+        if let Some(n) = nade_code(weapon) {
+            match self.players.get_mut(&id) {
+                Some(p) if p.nades[n] > 0 => p.nades[n] -= 1,
+                _ => return false,
+            }
         } else {
-            p.guns.1 = 255;
+            if WEAPONS.get(weapon as usize).is_none() || !self.has_gun(id, weapon) {
+                return false;
+            }
+            let p = self.players.get_mut(&id).expect("joueur");
+            if p.guns.0 == weapon {
+                p.guns.0 = 255;
+            } else {
+                p.guns.1 = 255;
+            }
         }
         if self.ground.len() >= 48 {
             self.ground.remove(0);
@@ -380,6 +412,17 @@ impl Match {
             .ground
             .iter()
             .position(|g| g.id == gun && (Vec3::from(g.pos) - feet).length() < 2.0)?;
+        // Grenade : prise s'il reste de la place (mêmes limites qu'à l'achat).
+        if let Some(n) = nade_code(self.ground[k].weapon) {
+            let kind = crate::equip::Nade::ALL[n];
+            let p = self.players.get_mut(&id)?;
+            let total: u8 = p.nades.iter().sum();
+            if p.nades[n] >= kind.max() || total >= crate::equip::MAX_NADES {
+                return None;
+            }
+            p.nades[n] += 1;
+            return Some(self.ground.remove(k).weapon);
+        }
         let g = self.ground.remove(k);
         let primary = WEAPONS[g.weapon as usize].primary();
         let lo = self.players[&id].guns;
@@ -440,12 +483,62 @@ impl Match {
         self.phase != phase::WARMUP
     }
 
+    /// Nom montré aux joueurs : pendant l'échauffement (tant que tout le monde n'est pas
+    /// là), « Joueur n » : personne ne sait avec ou contre qui il va jouer.
+    pub fn shown(&self, id: u64) -> String {
+        let Some(p) = self.players.get(&id) else {
+            return String::new();
+        };
+        if self.started() {
+            return p.pseudo.clone();
+        }
+        let n = self.players.keys().position(|&k| k == id).unwrap_or(0) + 1;
+        format!("Joueur {n}")
+    }
+
     /// Un joueur arrive : CT ou T au hasard, 5 par équipe au plus.
     pub fn join(&mut self, id: u64, pseudo: &str) -> Vec<Ev> {
+        self.join_party(id, pseudo, 0)
+    }
+
+    /// Un joueur arrive avec son lobby (`party`, 0 : seul) : avec ses amis déjà là.
+    pub fn join_party(&mut self, id: u64, pseudo: &str, party: u64) -> Vec<Ev> {
+        // Retour d'un joueur parti en pleine partie : il retrouve sa place (équipe, argent,
+        // statistiques) et revient à la manche suivante. Exclu (coéquipiers tués) : non.
+        let back = self
+            .players
+            .iter()
+            .find(|(_, p)| !p.present && p.pseudo.eq_ignore_ascii_case(pseudo))
+            .map(|(&k, _)| k);
+        if let (true, Some(old)) = (self.started(), back) {
+            let mut p = self.players.remove(&old).expect("joueur");
+            if p.teamkills >= TEAMKILL_KICK {
+                self.players.insert(id, p);
+                return vec![Ev::TeamKillKick(id)];
+            }
+            p.present = true;
+            p.alive = false;
+            p.reset = true;
+            let name = p.pseudo.clone();
+            self.players.insert(id, p);
+            return vec![Ev::Say(format!("{name} est de retour."))];
+        }
         let (ct, t) = (self.count(CT), self.count(T));
-        let team = if ct >= TEAM_MAX {
+        let max = self.team_max();
+        let friends = (party != 0)
+            .then(|| {
+                self.players
+                    .values()
+                    .find(|p| p.present && p.party == party)
+                    .map(|p| p.team)
+            })
+            .flatten()
+            .filter(|&team| self.count(team) < max);
+        let team = if let Some(team) = friends {
+            team
+        } else if ct >= max {
             T
-        } else if t >= TEAM_MAX {
+        } else if t >= max {
             CT
         } else if ct == t {
             if self.rand() & 1 == 0 {
@@ -466,6 +559,10 @@ impl Match {
         self.players.insert(
             id,
             MPlayer {
+                party,
+                color: 0,
+                pref: 255,
+                teamkills: 0,
                 pseudo: pseudo.to_string(),
                 team,
                 start_team: if self.swapped { other(team) } else { team },
@@ -497,8 +594,9 @@ impl Match {
                 reset: true,
             },
         );
+        self.assign_colors(team);
         let side = if team == CT { "CT" } else { "T" };
-        let mut ev = vec![Ev::Say(format!("{pseudo} rejoint les {side}."))];
+        let mut ev = vec![Ev::Say(format!("{} rejoint les {side}.", self.shown(id)))];
         if !self.started() {
             ev.push(self.spawn(id, true));
         }
@@ -524,16 +622,58 @@ impl Match {
 
     /// Échauffement : le joueur change d'équipe (s'il y a de la place).
     pub fn switch_team(&mut self, id: u64, team: u8) -> Option<Ev> {
-        if self.started() || team > T || self.count(team) >= TEAM_MAX {
+        if self.started() || team > T || self.count(team) >= self.team_max() {
             return None;
         }
         let p = self.players.get_mut(&id)?;
         if p.team == team {
             return None;
         }
+        let old = p.team;
         p.team = team;
         p.start_team = team;
+        self.assign_colors(old);
+        self.assign_colors(team);
         Some(self.spawn(id, true))
+    }
+
+    /// Couleur préférée d'un joueur (gardée si personne d'autre ne l'a dans l'équipe).
+    pub fn set_color(&mut self, id: u64, pref: u8) {
+        let Some(p) = self.players.get_mut(&id) else {
+            return;
+        };
+        p.pref = if pref < 5 { pref } else { 255 };
+        let team = p.team;
+        self.assign_colors(team);
+    }
+
+    /// Couleurs d'une équipe : chacun la sienne ; les préférences d'abord (le premier
+    /// arrivé garde la sienne), les autres prennent les couleurs libres dans l'ordre.
+    fn assign_colors(&mut self, team: u8) {
+        let ids: Vec<u64> = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.team == team && p.present)
+            .map(|(&k, _)| k)
+            .collect();
+        let mut taken = [false; 5];
+        let mut rest = Vec::new();
+        for &k in &ids {
+            let pref = self.players[&k].pref;
+            if pref < 5 && !taken[pref as usize] {
+                taken[pref as usize] = true;
+                self.players.get_mut(&k).expect("joueur").color = pref;
+            } else {
+                rest.push(k);
+            }
+        }
+        for k in rest {
+            let c = taken.iter().position(|t| !t).unwrap_or(0);
+            if c < 5 {
+                taken[c] = true;
+            }
+            self.players.get_mut(&k).expect("joueur").color = c as u8;
+        }
     }
 
     /// Côté actuel d'une équipe de départ.
@@ -776,10 +916,18 @@ impl Match {
                     kp.kills = kp.kills.saturating_sub(1);
                     kp.score -= 2;
                     kp.money = kp.money.saturating_sub(TEAMKILL_PENALTY);
+                    kp.teamkills += 1;
                     ev.push(Ev::Say(format!(
-                        "{} a tué un coéquipier (−300 $).",
-                        kp.pseudo
+                        "{} a tué un coéquipier (−300 $, {} / {TEAMKILL_KICK}).",
+                        kp.pseudo, kp.teamkills
                     )));
+                    if kp.teamkills >= TEAMKILL_KICK {
+                        ev.push(Ev::Say(format!(
+                            "{} est exclu de la partie ({TEAMKILL_KICK} coéquipiers tués).",
+                            kp.pseudo
+                        )));
+                        ev.push(Ev::TeamKillKick(k));
+                    }
                 } else {
                     kp.kills += 1;
                     kp.round_kills += 1;
@@ -866,7 +1014,7 @@ impl Match {
             }
             ev.push(self.spawn(id, true));
         }
-        let full = self.count(CT) >= TEAM_MAX && self.count(T) >= TEAM_MAX;
+        let full = self.count(CT) >= self.team_max() && self.count(T) >= self.team_max();
         if !full {
             if self.countdown {
                 ev.push(Ev::Say(
@@ -881,7 +1029,8 @@ impl Match {
             self.countdown = true;
             self.time = START_S;
             ev.push(Ev::Say(format!(
-                "10 joueurs : la partie commence dans {} s.",
+                "{} joueurs : la partie commence dans {} s.",
+                self.team_max() * 2,
                 START_S as u32
             )));
             return;
@@ -1249,6 +1398,7 @@ impl Match {
                 mvps: p.mvps,
                 score: p.score,
                 rounds: p.rounds,
+                teamkills: p.teamkills,
             })
             .collect();
         players.sort_by(|a, b| a.pseudo.cmp(&b.pseudo));
@@ -1313,7 +1463,7 @@ impl Match {
             .filter(|(_, p)| p.present || self.started())
             .map(|(&id, p)| ScoreRow {
                 id,
-                pseudo: p.pseudo.clone(),
+                pseudo: self.shown(id),
                 team: p.team,
                 kills: p.kills,
                 deaths: p.deaths,
@@ -1325,6 +1475,7 @@ impl Match {
                 alive: p.alive && p.present,
                 money: p.money,
                 elo: 0,
+                color: p.color,
             })
             .collect();
         v.sort_by(|a, b| b.score.cmp(&a.score).then(b.kills.cmp(&a.kills)));
@@ -1368,6 +1519,22 @@ impl Match {
 mod tests {
     use super::*;
     use minelib_net::game::FpsMap;
+
+    #[test]
+    fn a_lobby_plays_on_the_same_team() {
+        for seed in 1..20 {
+            let mut m = Match::new(FpsMap::default(), [0; 32], seed);
+            m.join(0, "Seul");
+            for i in 2..7u64 {
+                m.join_party(i, &format!("Ami{i}"), 42);
+            }
+            let team = m.players[&2].team;
+            assert!((2..7).all(|i| m.players[&i].team == team), "graine {seed}");
+            // L'équipe du lobby est pleine : les suivants vont en face.
+            m.join(7, "Tard");
+            assert_ne!(m.players[&7].team, team);
+        }
+    }
 
     fn full_match() -> Match {
         let mut m = Match::new(FpsMap::default(), [0; 32], 7);

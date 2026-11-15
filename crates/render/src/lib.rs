@@ -29,7 +29,7 @@ pub use capture::Screenshot;
 
 pub use entity::EntityVertex;
 pub use latency::{LowLatencyKind, Marker};
-pub use overlay::{Line, Overlay, Ui};
+pub use overlay::{set_translator, tr, Line, Overlay, Ui};
 pub use smoke::{SmokeQuality, SmokeVolume};
 pub use viewmodel::{VmVertex, FLAME, NO_TEXTURE};
 

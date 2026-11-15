@@ -21,9 +21,44 @@ pub struct Account {
     /// Dernière période 2FA utilisée (un code ne sert qu'une fois).
     pub last_totp_step: u64,
     pub created: u64,
+    /// Appareils de confiance (empreintes de leur jeton) : la 2FA ne leur est plus
+    /// redemandée. Huit au plus, les plus récents.
+    pub devices: Vec<[u8; 32]>,
+}
+
+/// Compte enregistré avant les appareils de confiance (relu, puis réenregistré au nouveau
+/// format).
+#[derive(Deserialize)]
+struct AccountV1 {
+    pseudo: String,
+    pubkey: [u8; 32],
+    auth_hash: String,
+    vault: Vec<u8>,
+    totp: Option<Vec<u8>>,
+    totp_pending: Option<Vec<u8>>,
+    last_totp_step: u64,
+    created: u64,
 }
 
 impl Account {
+    /// Jeton d'appareil de confiance : `true` s'il est connu.
+    pub fn trusts(&self, token: &[u8; 32]) -> bool {
+        let h: [u8; 32] = Sha256::digest(token).into();
+        self.devices.contains(&h)
+    }
+
+    /// Nouvel appareil de confiance : renvoie son jeton (seule son empreinte est gardée).
+    pub fn trust_new_device(&mut self) -> [u8; 32] {
+        use rand::RngCore;
+        let mut token = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut token);
+        self.devices.push(Sha256::digest(token).into());
+        if self.devices.len() > 8 {
+            self.devices.remove(0);
+        }
+        token
+    }
+
     pub fn new(pseudo: &str, pubkey: [u8; 32], auth: &[u8; 32], vault: Vec<u8>) -> Result<Self> {
         let salt = SaltString::generate(&mut rand::rngs::OsRng);
         let auth_hash = Argon2::default()
@@ -41,6 +76,7 @@ impl Account {
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
+            devices: Vec::new(),
         })
     }
 }
@@ -88,7 +124,20 @@ impl Store {
 
     pub fn load(&self, pseudo: &str) -> Option<Account> {
         let bytes = std::fs::read(self.path(pseudo)).ok()?;
-        postcard::from_bytes(&bytes).ok()
+        postcard::from_bytes(&bytes).ok().or_else(|| {
+            let o: AccountV1 = postcard::from_bytes(&bytes).ok()?;
+            Some(Account {
+                pseudo: o.pseudo,
+                pubkey: o.pubkey,
+                auth_hash: o.auth_hash,
+                vault: o.vault,
+                totp: o.totp,
+                totp_pending: o.totp_pending,
+                last_totp_step: o.last_totp_step,
+                created: o.created,
+                devices: Vec::new(),
+            })
+        })
     }
 
     pub fn save(&self, a: &Account) -> Result<()> {

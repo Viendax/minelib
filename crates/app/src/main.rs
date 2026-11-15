@@ -30,6 +30,8 @@
 //!   MINELIB_DEMO=1              nouveau monde : mur + toutes les torches colorées
 //!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé)
 //!   MINELIB_EXIT_AFTER=<s>      quitter automatiquement (tests)
+//!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
+//!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
 //!   MINELIB_SMOKE=<x>,<y>,<z>   mode FPS : fumigène posée là toutes les 18 s (essais)
 //!   MINELIB_SMOKE_Q=<n>,<pas>   qualité des fumigènes : pas max et longueur (essais)
 
@@ -49,6 +51,7 @@ mod garant;
 mod gpu_plan;
 mod gpu_report;
 mod hand;
+mod i18n;
 mod inventory;
 mod jobs;
 mod keys;
@@ -58,6 +61,8 @@ mod multiplayer;
 mod netgame;
 mod player;
 mod player_model;
+mod radar;
+mod skin;
 mod save;
 mod session;
 mod streaming;
@@ -120,7 +125,26 @@ struct Game {
     servers: Vec<multiplayer::ServerInfo>,
     server_selected: Option<usize>,
     fps_home: multiplayer::FpsHome,
-    fps_home_maps_seen: usize,
+    fps_home_maps_seen: u64,
+    /// Cartes de ce PC déjà jouées en partie FPS en ligne (hébergées ou rejointes) : on
+    /// les renvoie au relais s'il ne les a pas, pour qu'elles restent disponibles à tous.
+    /// Les autres mondes du joueur ne sont jamais partagés.
+    shared_maps: std::collections::HashSet<[u8; 32]>,
+    reshared: std::collections::HashSet<[u8; 32]>,
+    maps_rev_seen: u64,
+    maps_asked: bool,
+    /// Son skin (`.minelib/skin.png`), envoyé au relais à la connexion ; fenêtre « Ouvrir »
+    /// en cours ; message de l'écran des paramètres ; rotation de l'aperçu.
+    my_skin: Option<std::sync::Arc<skin::Skin>>,
+    skin_sent: bool,
+    skin_pick: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    skin_msg: Option<(String, bool)>,
+    /// Menu déroulant des langues ouvert.
+    lang_open: bool,
+    /// Amis connus (pour ne refaire leur classement que si la liste change).
+    friend_names: Vec<String>,
+    /// Lobby : l'hôte du lobby a trouvé cette partie, on la rejoint (après la carte).
+    party_go: Option<u64>,
     map_rows: Vec<multiplayer::MapRow>,
     sig_cache: fpsmap::SigCache,
     /// Recherche FPS en cours : carte (signature, nom, dossier s'il est là).
@@ -176,6 +200,8 @@ struct Game {
     last_stats: FrameStats,
     title_timer: f32,
     exit_after: Option<f32>,
+    /// Capture automatique à ce temps (essais).
+    shot_at: Option<f32>,
     show_debug: bool,
     fps_max: Option<f32>,
     frame_start: Instant,
@@ -236,7 +262,18 @@ impl Game {
             servers: Vec::new(),
             server_selected: None,
             fps_home: multiplayer::FpsHome::default(),
-            fps_home_maps_seen: usize::MAX,
+            friend_names: Vec::new(),
+            my_skin: None,
+            skin_sent: false,
+            skin_pick: None,
+            skin_msg: None,
+            lang_open: false,
+            party_go: None,
+            fps_home_maps_seen: u64::MAX,
+            shared_maps: Default::default(),
+            reshared: Default::default(),
+            maps_rev_seen: 0,
+            maps_asked: false,
             map_rows: Vec::new(),
             sig_cache: fpsmap::SigCache::default(),
             searching: None,
@@ -274,6 +311,7 @@ impl Game {
             last_stats: FrameStats::default(),
             title_timer: 0.0,
             exit_after: env_parse("MINELIB_EXIT_AFTER"),
+            shot_at: env_parse("MINELIB_SHOT_AT"),
             show_debug: env_parse::<u8>("MINELIB_DEBUG").is_some_and(|v| v != 0),
             fps_max: env_parse::<f32>("MINELIB_FPS_MAX").filter(|&f| f > 0.0),
             frame_start: Instant::now(),
@@ -295,6 +333,42 @@ impl Game {
             quit: false,
             optimus: None,
             vram: None,
+        })
+        .map(|mut g| {
+            minelib_render::set_translator(i18n::translate);
+            i18n::set(&g.options.language);
+            g.shared_maps = load_shared(&g.paths.root);
+            g.my_skin = std::fs::read(g.paths.root.join("skin.png"))
+                .ok()
+                .and_then(|b| skin::Skin::from_png(&b).ok());
+            if std::env::var("MINELIB_UI").is_ok_and(|v| v == "settings") {
+                g.screen = Screen::Settings;
+            }
+            // Essais de l'interface : écran FPS avec un lobby d'exemple.
+            if std::env::var("MINELIB_UI").is_ok_and(|v| v == "lobby") {
+                g.screen = Screen::FpsHome;
+                g.accounts.friends = vec![
+                    ("Alice".into(), true),
+                    ("Bastien_le_tres_long_pseudo".into(), true),
+                    ("Chloé".into(), false),
+                    ("Dimitri".into(), true),
+                    ("Emma".into(), false),
+                ];
+                g.accounts.party = (7, vec!["Alice".into(), "Moi".into(), "Dimitri".into()]);
+                g.accounts.invites = vec!["Zoé".into()];
+                g.map_rows = vec![multiplayer::MapRow {
+                    sig: [1; 32],
+                    name: "Dust de blocs".into(),
+                    author: "Alice".into(),
+                    local: None,
+                    waiting: 3,
+                    plays: 12,
+                    configured: true,
+                    players: 10,
+                    stored: true,
+                }];
+            }
+            g
         })
     }
 
@@ -359,6 +433,9 @@ impl Game {
             Ok(mut s) => {
                 s.voice_volumes = load_volumes(&self.paths.root.join("voice.txt"));
                 s.sensitivity = self.options.sensitivity;
+                s.sensitivity_fps = self.options.sensitivity_fps;
+                s.fps_color = self.options.fps_color;
+                s.skins.set_mine(self.my_skin.clone());
                 s.volume = self.options.volume;
                 s.keys = self.keys.clone();
                 self.session = Some(s);
@@ -639,12 +716,43 @@ impl Game {
                         }
                         continue;
                     }
+                    Event::Evidence {
+                        case,
+                        part,
+                        of,
+                        data,
+                    } => {
+                        if let Some(g) = &mut self.garant {
+                            g.evidence(*case, *part, *of, data);
+                        }
+                        continue;
+                    }
                     Event::RoomClosed => {
                         self.garant = None;
                         continue;
                     }
                     _ => {}
                 }
+            }
+            // Troisième garant : arbitre entre un vérificateur et un hôte (au menu seulement ;
+            // sinon le relais fera sans lui).
+            if let Event::Arbitrate { case, map_sig, map } = &e {
+                if self.session.is_none() && self.searching.is_none() && self.garant.is_none() {
+                    if let Some(link) = self.accounts.link.clone() {
+                        let dir = self.local_map(map_sig);
+                        if dir.is_none() {
+                            self.accounts.room(Cmd::DownloadMap(*map_sig));
+                        }
+                        self.garant = Some(garant::Garant::arbiter(
+                            *case,
+                            *map_sig,
+                            map.clone(),
+                            link,
+                            dir,
+                        ));
+                    }
+                }
+                continue;
             }
             if let Event::GarantTask {
                 room,
@@ -681,6 +789,7 @@ impl Game {
                 Event::Hosted(room) => {
                     if let Some((sig, name, Some(dir))) = self.searching.take() {
                         self.fps_status = None;
+                        self.mark_shared(sig);
                         self.host_world(dir.clone(), sig);
                         // La carte part au relais (s'il ne l'a pas) pour les suivants.
                         if let Ok(p) = fpsmap::package(&dir) {
@@ -688,6 +797,7 @@ impl Game {
                                 sig,
                                 name,
                                 bytes: p.to_bytes(),
+                                fps: true,
                             });
                         }
                         log::info!("partie FPS {room} ouverte, en attente de joueurs");
@@ -707,6 +817,7 @@ impl Game {
                     match dir {
                         Some(dir) if fps => {
                             self.fps_status = None;
+                            self.mark_shared(*map_sig);
                             self.join_world(dir, *map_sig, host.clone());
                         }
                         Some(dir) => self.join_build(dir, host.clone()),
@@ -717,6 +828,42 @@ impl Game {
                             self.accounts.room(Cmd::DownloadMap(*map_sig));
                         }
                     }
+                }
+                Event::PartyGo { room, map, map_sig } => {
+                    // L'hôte du lobby lance : on le suit (même partie, même équipe).
+                    if self.session.is_some() {
+                        self.leave_world();
+                    }
+                    self.garant = None;
+                    let dir = self.local_map(map_sig);
+                    self.searching = Some((*map_sig, map.clone(), dir.clone()));
+                    self.screen = Screen::FpsHome;
+                    if dir.is_some() {
+                        self.fps_status = Some("On rejoint le lobby…".into());
+                        self.accounts.room(Cmd::Join(*room));
+                    } else {
+                        self.party_go = Some(*room);
+                        self.fps_status = Some("Téléchargement de la carte…".into());
+                        self.accounts.room(Cmd::DownloadMap(*map_sig));
+                    }
+                }
+                Event::Skin { pseudo, png } => {
+                    if let Some(s) = &mut self.session {
+                        s.skins.received(pseudo, png);
+                    }
+                }
+                Event::SkinChanged(pseudo) => {
+                    // En construction seulement (en FPS, le skin du début reste).
+                    if let Some(s) = self.session.as_mut().filter(|s| s.build.is_some()) {
+                        s.skins.forget(pseudo);
+                    }
+                }
+                Event::PartyInvite(from) => {
+                    let t = format!("{from} t'invite dans son lobby (Multijoueur → FPS).");
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(t.clone(), chat::YELLOW);
+                    }
+                    self.notify(t);
                 }
                 Event::MapProgress(_, f, up) => {
                     if self.session.is_none() {
@@ -753,12 +900,19 @@ impl Game {
                                 self.fps_status = None;
                                 self.join_build(dir, host);
                             } else if let Some(search) = &mut self.searching {
+                                let players = fpsmap::load(&dir).players();
                                 search.2 = Some(dir);
-                                self.fps_status = Some("Recherche d'une partie…".into());
-                                self.accounts.room(Cmd::Search {
-                                    map_sig: *sig,
-                                    map: name,
-                                });
+                                if let Some(room) = self.party_go.take() {
+                                    self.fps_status = Some("On rejoint le lobby…".into());
+                                    self.accounts.room(Cmd::Join(room));
+                                } else {
+                                    self.fps_status = Some("Recherche d'une partie…".into());
+                                    self.accounts.room(Cmd::Search {
+                                        map_sig: *sig,
+                                        map: name,
+                                        players,
+                                    });
+                                }
                             }
                         }
                         Err(e) => self.fps_status = Some(format!("Carte illisible : {e:#}")),
@@ -813,12 +967,28 @@ impl Game {
                         let t = if list.is_empty() {
                             "Aucun ami pour l'instant (/ami <pseudo>).".to_string()
                         } else {
-                            format!("Amis : {}", list.join(", "))
+                            let names: Vec<String> = list
+                                .iter()
+                                .map(|(p, on)| {
+                                    if *on {
+                                        format!("{p} (en ligne)")
+                                    } else {
+                                        p.clone()
+                                    }
+                                })
+                                .collect();
+                            format!("Amis : {}", names.join(", "))
                         };
                         s.chat.say(t, chat::YELLOW);
                     }
-                    if self.screen == Screen::FpsHome {
-                        self.accounts.room(Cmd::Leaderboard { friends: true });
+                    // Classement des amis à refaire si la liste a changé (pas pour un
+                    // simple changement « en ligne »).
+                    let names: Vec<String> = list.iter().map(|f| f.0.clone()).collect();
+                    if self.screen == Screen::FpsHome && names != self.friend_names {
+                        self.friend_names = names;
+                        if !self.fps_home.world_tab {
+                            self.accounts.room(Cmd::Leaderboard { friends: true });
+                        }
                     }
                 }
                 Event::RoomClosed => {
@@ -864,6 +1034,11 @@ impl Game {
                 save_volumes(&self.paths.root.join("voice.txt"), &s.voice_volumes);
             }
         }
+        // Exclu par les règles (trois coéquipiers tués) : on quitte la partie.
+        if let Some(reason) = self.session.as_mut().and_then(|s| s.kicked.take()) {
+            self.leave_world();
+            self.notify(reason);
+        }
     }
 
     /// Garant indépendant : simulation, disponibilité annoncée au relais.
@@ -879,6 +1054,10 @@ impl Game {
         if let Some(g) = &mut self.garant {
             for cmd in g.update(dt) {
                 self.accounts.room(cmd);
+            }
+            // Arbitre : verdict rendu, il redevient libre.
+            if g.done {
+                self.garant = None;
             }
         }
     }
@@ -934,7 +1113,7 @@ impl Game {
         self.searching = None;
         self.accounts.room(Cmd::Maps);
         self.accounts.room(Cmd::Leaderboard {
-            friends: self.fps_home.friends_tab,
+            friends: !self.fps_home.world_tab,
         });
         self.rebuild_map_rows();
         self.screen = Screen::FpsHome;
@@ -959,6 +1138,8 @@ impl Game {
                 waiting: 0,
                 plays: 0,
                 configured: fps.ct.is_some() && fps.t.is_some(),
+                players: fps.players(),
+                stored: true,
             });
         }
         for m in &self.accounts.maps {
@@ -968,7 +1149,9 @@ impl Game {
                     r.plays = m.plays;
                     r.author = m.author.clone();
                 }
-                None if m.stored => rows.push(multiplayer::MapRow {
+                // Une carte dont la recherche vient de commencer apparaît tout de suite,
+                // même si elle n'est pas encore arrivée entière au relais.
+                None => rows.push(multiplayer::MapRow {
                     sig: m.sig,
                     name: m.name.clone(),
                     author: m.author.clone(),
@@ -976,8 +1159,9 @@ impl Game {
                     waiting: m.waiting,
                     plays: m.plays,
                     configured: true,
+                    players: m.players,
+                    stored: m.stored,
                 }),
-                None => {}
             }
         }
         rows.sort_by(|a, b| {
@@ -992,14 +1176,22 @@ impl Game {
     fn fps_home_screen(&mut self, input: &Input, size: (u32, u32)) {
         use minelib_net::client::Cmd;
         // Liste du relais reçue : on refait la liste des cartes.
-        let relay_maps = self.accounts.maps.len();
+        let relay_maps = self.accounts.maps_rev;
         if relay_maps != self.fps_home_maps_seen {
             self.fps_home_maps_seen = relay_maps;
             self.rebuild_map_rows();
         }
         let time = self.time;
         let busy = self.searching.is_some();
+        let me = self.accounts.pseudo();
         let mut c = Ctx::new(&mut self.ui, input, size);
+        let lobby = multiplayer::LobbyView {
+            me: &me,
+            friends: &self.accounts.friends,
+            members: &self.accounts.party.1,
+            invites: &self.accounts.invites,
+            color: self.options.fps_color,
+        };
         let action = multiplayer::fps_screen(
             &mut c,
             input,
@@ -1009,11 +1201,33 @@ impl Game {
             self.fps_status.as_deref(),
             busy,
             time,
+            lobby,
         );
         match action {
             multiplayer::FpsAction::Back => {
                 self.searching = None;
                 self.screen = Screen::Multiplayer;
+            }
+            multiplayer::FpsAction::Poll => {
+                self.accounts.room(Cmd::Maps);
+                // Amis en ligne (pour les inviter).
+                self.accounts.room(Cmd::Friend {
+                    pseudo: String::new(),
+                    add: false,
+                });
+            }
+            multiplayer::FpsAction::Color(c) => {
+                self.options.fps_color = c;
+                let _ = self.options.save(&self.paths.options);
+            }
+            multiplayer::FpsAction::Party(action, pseudo) => {
+                use minelib_net::proto;
+                if action == proto::PARTY_ACCEPT || action == proto::PARTY_DECLINE {
+                    self.accounts
+                        .invites
+                        .retain(|p| !p.eq_ignore_ascii_case(&pseudo));
+                }
+                self.accounts.room(Cmd::Party { action, pseudo });
             }
             multiplayer::FpsAction::Refresh => {
                 self.sig_cache = fpsmap::SigCache::default();
@@ -1038,6 +1252,7 @@ impl Game {
                         self.accounts.room(Cmd::Search {
                             map_sig: m.sig,
                             map: m.name,
+                            players: m.players,
                         });
                     } else {
                         self.fps_status = Some("Téléchargement de la carte…".into());
@@ -1046,6 +1261,159 @@ impl Game {
                 }
             }
             multiplayer::FpsAction::None => {}
+        }
+    }
+
+    /// Skins : le sien envoyé au relais à chaque connexion, celui choisi dans la fenêtre
+    /// « Ouvrir » vérifié puis gardé, ceux des autres joueurs demandés au relais.
+    fn skin_upkeep(&mut self) {
+        use minelib_net::client::Cmd;
+        if !self.accounts.logged_in() {
+            self.skin_sent = false;
+        } else if !self.skin_sent {
+            self.skin_sent = true;
+            let png = std::fs::read(self.paths.root.join("skin.png")).unwrap_or_default();
+            self.accounts.room(Cmd::SkinPut(png));
+        }
+        if let Some(rx) = &self.skin_pick {
+            match rx.try_recv() {
+                Ok(Some(path)) => {
+                    self.skin_pick = None;
+                    self.use_skin_file(&path);
+                }
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.skin_pick = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(s) = &mut self.session {
+            for p in s.skins.take_wanted() {
+                self.accounts.room(Cmd::SkinGet(p));
+            }
+        }
+    }
+
+    /// Carte jouée en partie FPS en ligne : on la gardera disponible pour les autres.
+    fn mark_shared(&mut self, sig: [u8; 32]) {
+        if self.shared_maps.insert(sig) {
+            let text: String = self
+                .shared_maps
+                .iter()
+                .map(|s| format!("{}\n", minelib_net::crypto::hex(s)))
+                .collect();
+            let path = self.paths.root.join("maps").join("partagees.txt");
+            if let Some(d) = path.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    /// Cartes FPS de ce PC que le relais n'a pas (relais changé, PC-relais éteint) : on
+    /// les lui renvoie, une ou deux à la fois. Seulement celles déjà jouées en ligne.
+    fn maps_upkeep(&mut self) {
+        use minelib_net::client::Cmd;
+        if !self.accounts.logged_in() {
+            self.maps_asked = false;
+            self.reshared.clear();
+            return;
+        }
+        if !self.maps_asked {
+            self.maps_asked = true;
+            self.accounts.room(Cmd::Maps);
+            return;
+        }
+        if self.accounts.maps_rev == self.maps_rev_seen {
+            return;
+        }
+        self.maps_rev_seen = self.accounts.maps_rev;
+        let missing: Vec<[u8; 32]> = self
+            .shared_maps
+            .iter()
+            .filter(|s| !self.reshared.contains(*s))
+            .filter(|s| !self.accounts.maps.iter().any(|m| m.sig == **s && m.stored))
+            .copied()
+            .take(2)
+            .collect();
+        for sig in missing {
+            self.reshared.insert(sig);
+            let Some(dir) = self.local_map(&sig) else {
+                continue;
+            };
+            let Ok(p) = fpsmap::package(&dir) else {
+                continue;
+            };
+            // Le monde a pu changer depuis la partie : seulement s'il est identique.
+            if p.signature() != sig {
+                continue;
+            }
+            let name = self
+                .local_worlds()
+                .into_iter()
+                .find(|(d, _)| *d == dir)
+                .map_or_else(|| "Carte".into(), |(_, n)| n);
+            log::info!("carte {} renvoyée au relais", minelib_net::crypto::hex(&sig[..6]));
+            self.accounts.room(Cmd::UploadMap {
+                sig,
+                name,
+                bytes: p.to_bytes(),
+                fps: true,
+            });
+        }
+    }
+
+    /// Prend ce fichier comme skin (vérifié : PNG de 64 × 64 ou 64 × 32).
+    fn use_skin_file(&mut self, path: &std::path::Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.skin_msg = Some((format!("Lecture impossible : {e}"), false));
+                return;
+            }
+        };
+        match skin::Skin::from_png(&bytes) {
+            Ok(sk) => {
+                if let Err(e) = std::fs::write(self.paths.root.join("skin.png"), &bytes) {
+                    self.skin_msg = Some((format!("Enregistrement impossible : {e}"), false));
+                    return;
+                }
+                self.my_skin = Some(sk.clone());
+                if let Some(s) = &mut self.session {
+                    s.skins.set_mine(Some(sk));
+                }
+                // Envoyé au relais (les autres le verront).
+                self.skin_sent = false;
+                self.skin_msg = Some(("Skin changé.".into(), true));
+            }
+            Err(e) => self.skin_msg = Some((format!("Skin refusé : {e:#}"), false)),
+        }
+    }
+
+    /// Ouvre la fenêtre « Ouvrir » (Windows) pour choisir un skin, sans bloquer le jeu.
+    fn pick_skin(&mut self) {
+        #[cfg(windows)]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let file = rfd::FileDialog::new()
+                    .set_title("Choisir un skin (PNG 64 × 64)")
+                    .add_filter("Skin", &["png"])
+                    .pick_file();
+                let _ = tx.send(file);
+            });
+            self.skin_pick = Some(rx);
+        }
+        #[cfg(not(windows))]
+        {
+            let path = self.paths.root.join("skin.png");
+            self.skin_msg = Some((
+                format!("Dépose ton skin ici : {}", path.display()),
+                true,
+            ));
+            if path.exists() {
+                self.use_skin_file(&path);
+            }
         }
     }
 
@@ -1065,13 +1433,10 @@ impl Game {
             s.game.can_fly = false;
             s.player.flying = false;
             s.voice = Some(voice::Voice::new(link.clone()));
-            s.net = Some(netgame::NetGame::host(
-                link,
-                pseudo,
-                map,
-                sig,
-                s.spawn_pos(),
-            ));
+            let mut net = netgame::NetGame::host(link, pseudo, map, sig, s.spawn_pos());
+            // Ses amis du lobby le rejoindront dans son équipe.
+            net.set_own_party(self.accounts.party.0);
+            s.net = Some(net);
             s.chat.say(
                 "Aucune partie en attente : tu es dans la tienne. Elle commence à 10 joueurs \
                  (échauffement en attendant).",
@@ -1094,7 +1459,14 @@ impl Game {
             s.voice = Some(voice::Voice::new(link.clone()));
             s.net = Some(netgame::NetGame::guest(link, sig));
             s.chat
-                .say(format!("Partie de {host} rejointe."), chat::YELLOW);
+                .say(
+                    if host.is_empty() {
+                        "Partie rejointe.".to_string()
+                    } else {
+                        format!("Partie de {host} rejointe.")
+                    },
+                    chat::YELLOW,
+                );
         }
     }
 
@@ -1129,10 +1501,12 @@ impl Game {
             map_sig: sig,
             max_players: 0,
         });
+        // Monde de construction : pour ceux qui le rejoignent, pas pour la liste des cartes.
         self.accounts.room(minelib_net::client::Cmd::UploadMap {
             sig,
             name,
             bytes: p.to_bytes(),
+            fps: false,
         });
     }
 
@@ -1399,7 +1773,7 @@ impl Game {
             c.background();
         }
         let s = c.s;
-        c.text_center("Packs de textures", 12.0 * s, s * 2.0, WHITE);
+        c.text_center("Textures", 12.0 * s, s * 2.0, WHITE);
         let list_w = 260.0 * s;
         let list_x = (c.w - list_w) / 2.0;
         let list_y = 36.0 * s;
@@ -1516,7 +1890,18 @@ impl Game {
         y += 24.0 * s;
         let controls = c.button("Régler les touches", cx, y, 200.0, true);
         y += 24.0 * s;
-        let packs = c.button("Packs de textures", cx, y, 200.0, true);
+        let packs = c.button("Textures", cx, y, 200.0, true);
+        y += 24.0 * s;
+        // Langue : menu déroulant (ouvert plus bas, par-dessus le reste).
+        let lang = i18n::LANGS
+            .get(i18n::current())
+            .map_or("Français", |l| l.1);
+        let lang_y = y;
+        let arrow = if self.lang_open { "^" } else { "v" };
+        let lang_label = format!("Langue : {lang} {arrow}");
+        if c.button(&lang_label, cx, y, 200.0, true) {
+            self.lang_open = !self.lang_open;
+        }
         y += 24.0 * s;
         // Volume des sons (tirs, rechargements, lunette).
         let vol = self.options.volume;
@@ -1532,11 +1917,80 @@ impl Game {
             }
         }
         let done = c.button("Terminé", cx, c.h * 0.72, 200.0, true);
+        // Skin : aperçu en 3D qui tourne, à droite, et le bouton pour en changer.
+        let mut want_pick = false;
+        let px = (c.w * 0.82).max(cx + 130.0 * s);
+        if px + 40.0 * s < c.w {
+            let ph = (c.h * 0.42).min(150.0 * s);
+            let py = c.h * 0.22;
+            c.frame(px - 45.0 * s, py - 6.0 * s, 90.0 * s, ph + 60.0 * s);
+            let yaw = self.time * 0.8;
+            c.ui.model(skin::preview(self.my_skin.clone(), px, py + ph / 2.0, ph, yaw));
+            let busy = self.skin_pick.is_some();
+            want_pick = c.button("Changer de skin", px, py + ph + 8.0 * s, 84.0, !busy);
+            if self.my_skin.is_some()
+                && c.button("Retirer le skin", px, py + ph + 30.0 * s, 84.0, !busy)
+            {
+                let _ = std::fs::remove_file(self.paths.root.join("skin.png"));
+                self.my_skin = None;
+                if let Some(sess) = &mut self.session {
+                    sess.skins.set_mine(None);
+                }
+                self.skin_sent = false;
+            }
+            if let Some((m, ok)) = &self.skin_msg {
+                let col = if *ok { GOLD } else { [1.0, 0.45, 0.4, 1.0] };
+                let t = crate::menu::fit(m, 120.0 * s, (s / 2.0).floor().max(1.0));
+                let tw = Ui::text_width(&t, (s / 2.0).floor().max(1.0));
+                c.ui.text(px - tw / 2.0, py + ph + 52.0 * s, (s / 2.0).floor().max(1.0), col, t);
+            }
+        }
+        // Liste des langues, par-dessus.
+        let mut picked = None;
+        if self.lang_open {
+            let row = 14.0 * s;
+            let lw = 200.0 * s;
+            let top = lang_y + 11.0 * s;
+            c.ui.rect(cx - lw / 2.0, top, lw, row * i18n::LANGS.len() as f32, [0.05, 0.05, 0.07, 0.97]);
+            for (i, (code, name)) in i18n::LANGS.iter().enumerate() {
+                let ry = top + i as f32 * row;
+                let hover = c.hovered(cx - lw / 2.0, ry, lw, row);
+                if hover || i == i18n::current() {
+                    c.ui.rect(cx - lw / 2.0, ry, lw, row, [1.0, 1.0, 1.0, if hover { 0.15 } else { 0.07 }]);
+                }
+                // Le nom de chaque langue dans sa langue (jamais traduit).
+                let tw = Ui::text_width(name, s);
+                c.ui.text(cx - tw / 2.0, ry + 3.0 * s, s, WHITE, *name);
+                if hover && c.click {
+                    picked = Some(*code);
+                }
+            }
+            if c.click && picked.is_none() && !c.hovered(cx - lw / 2.0, lang_y - 10.0 * s, lw, row * 8.0 + 22.0 * s) {
+                self.lang_open = false;
+            }
+        }
+        if want_pick {
+            self.pick_skin();
+        }
+        if let Some(code) = picked {
+            i18n::set(code);
+            self.options.language = code.to_string();
+            self.lang_open = false;
+            let _ = self.options.save(&self.paths.options);
+            return;
+        }
+        if self.lang_open {
+            return;
+        }
         if graphics {
             self.screen = Screen::Graphics;
         }
         if controls {
-            self.sens_text = format_sens(self.options.sensitivity);
+            self.sens_text = format_sens(if self.keys_tab_fps {
+                self.options.sensitivity_fps
+            } else {
+                self.options.sensitivity
+            });
             self.sens_focus = false;
             self.screen = Screen::Controls;
         }
@@ -1558,7 +2012,13 @@ impl Game {
     /// ou en tapant la valeur dans le champ à droite.
     fn controls_screen(&mut self, input: &Input, size: (u32, u32), over_game: bool) {
         let time = self.time;
-        let mut sens = self.options.sensitivity;
+        // Sensibilité de l'onglet affiché : construction ou FPS, chacune à part.
+        let fps_sens = self.keys_tab_fps;
+        let mut sens = if fps_sens {
+            self.options.sensitivity_fps
+        } else {
+            self.options.sensitivity
+        };
         let mut c = Ctx::new(&mut self.ui, input, size);
         if over_game {
             c.dim(0.7);
@@ -1580,16 +2040,24 @@ impl Game {
             self.keys_tab_fps = false;
             self.keys_scroll = 0;
             self.binding = None;
+            self.sens_text = format_sens(self.options.sensitivity);
+            self.sens_focus = false;
         }
         if c.button(fps_label, cx + 52.0 * s, tab_y, 100.0, true) {
             self.keys_tab_fps = true;
             self.keys_scroll = 0;
             self.binding = None;
+            self.sens_text = format_sens(self.options.sensitivity_fps);
+            self.sens_focus = false;
         }
         let y = tab_y + 26.0 * s;
         // Curseur 0,1 à 8 (plage du jeu Counter-Strike) ; le champ accepte 0,01 à 20.
         let (lo, hi) = (0.1f32, 8.0f32);
-        let label = format!("Sensibilité souris : {}", format_sens(sens));
+        let label = format!(
+            "Sensibilité souris ({}) : {}",
+            if fps_sens { "FPS" } else { "construction" },
+            format_sens(sens)
+        );
         let frac = (sens.clamp(lo, hi) - lo) / (hi - lo);
         if let Some(f) = c.slider(
             3,
@@ -1802,7 +2270,12 @@ impl Game {
         if !self.sens_focus {
             self.sens_text = format_sens(sens);
         }
-        if sens != self.options.sensitivity {
+        if fps_sens && self.keys_tab_fps && sens != self.options.sensitivity_fps {
+            self.options.sensitivity_fps = sens;
+            if let Some(sess) = &mut self.session {
+                sess.sensitivity_fps = sens;
+            }
+        } else if !fps_sens && !self.keys_tab_fps && sens != self.options.sensitivity {
             self.options.sensitivity = sens;
             if let Some(sess) = &mut self.session {
                 sess.sensitivity = sens;
@@ -2187,7 +2660,11 @@ impl GameLoop for Game {
             self.show_debug = !self.show_debug;
         }
         // F2 : capture d'écran (interface comprise), comme dans Minecraft, même tchat ouvert.
-        if self.keys.pressed(input, keys::Action::Screenshot) {
+        let auto_shot = self.shot_at.is_some_and(|t| self.time >= t);
+        if auto_shot {
+            self.shot_at = None;
+        }
+        if self.keys.pressed(input, keys::Action::Screenshot) || auto_shot {
             renderer.request_screenshot();
         }
         if let Some(shot) = renderer.take_screenshot() {
@@ -2216,6 +2693,8 @@ impl GameLoop for Game {
         // Relais : réponses, partie en ligne.
         self.poll_accounts();
         self.handle_game_events();
+        self.skin_upkeep();
+        self.maps_upkeep();
         self.updater.poll(!self.played);
         self.garant_update(dt);
 
@@ -2390,6 +2869,25 @@ impl GameLoop for Game {
         }
         self.renderer = None; // libère le GPU avant la fermeture de la fenêtre
     }
+}
+
+/// Cartes déjà jouées en ligne (`maps/partagees.txt`, une signature par ligne).
+fn load_shared(root: &std::path::Path) -> std::collections::HashSet<[u8; 32]> {
+    std::fs::read_to_string(root.join("maps").join("partagees.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.len() != 64 {
+                return None;
+            }
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(l.get(2 * i..2 * i + 2)?, 16).ok()?;
+            }
+            Some(out)
+        })
+        .collect()
 }
 
 /// Ouvre un dossier dans l'explorateur de fichiers du système.

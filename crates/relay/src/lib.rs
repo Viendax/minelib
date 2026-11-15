@@ -15,7 +15,7 @@ mod servers;
 mod stats;
 mod zones;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -162,6 +162,11 @@ struct Conn {
     garant: bool,
     /// Garant écarté (désaccords rejetés par les joueurs) : plus choisi cette session.
     garant_banned: bool,
+    /// Garant arbitre d'une affaire de cette partie, en ce moment.
+    arbitrating: Option<u64>,
+    /// Lobby (n°), et lobbies qui l'ont invité.
+    party: Option<u64>,
+    invited: Vec<u64>,
 }
 
 /// Partie annoncée : l'hôte fait tourner le serveur, le relais transmet les données.
@@ -181,6 +186,13 @@ struct Room {
     /// Résultats reçus : empreinte → (résultat, joueurs qui l'ont envoyé).
     results: HashMap<[u8; 32], (game::MatchSummary, HashSet<u64>)>,
     applied: bool,
+    /// Début de la partie FPS, et absences des joueurs du début (pseudo en minuscules →
+    /// parti depuis, secondes d'absence déjà cumulées). Réglées une fois (`settled`).
+    started_at: Option<Instant>,
+    away: HashMap<String, (Option<Instant>, f64)>,
+    settled: bool,
+    /// Places gardées pour les joueurs d'un lobby qui arrivent (pseudo, depuis).
+    reserved: Vec<(String, Instant)>,
     /// Signalements déjà comptés dans cette partie (de, contre).
     reports: HashSet<(String, String)>,
     /// Construction : garants de zones.
@@ -199,6 +211,13 @@ struct Room {
     dismissed: u32,
     /// Résultat trouvé par le garant vérificateur (empreinte).
     audited: Option<[u8; 32]>,
+    /// Pièces gardées par le relais lui-même pour un arbitrage : ce que le vérificateur
+    /// reçoit, dans l'ordre (demande d'un joueur, ou copie entière de la partie par
+    /// l'hôte). Les 12 dernières copies.
+    evidence: VecDeque<(Option<u64>, Vec<u8>)>,
+    evidence_parts: Vec<Vec<u8>>,
+    /// Affaire en cours : numéro, arbitre, vérificateur qui accuse, début.
+    arbitration: Option<(u64, u64, u64, Instant)>,
     /// Construction : créateur du serveur (OP d'office) et clé de ses OP et bannis.
     creator: String,
     server: String,
@@ -219,6 +238,14 @@ impl Room {
     fn player_count(&self) -> usize {
         self.everyone().count()
     }
+
+    /// Places gardées (lobby en route), une minute au plus.
+    fn reserved_count(&self) -> usize {
+        self.reserved
+            .iter()
+            .filter(|(_, t)| t.elapsed() < Duration::from_secs(60))
+            .count()
+    }
 }
 
 struct State {
@@ -226,6 +253,8 @@ struct State {
     whois: Arc<Mutex<Option<WhoisFn>>>,
     conns: HashMap<u64, Conn>,
     rooms: HashMap<u64, Room>,
+    /// Lobbies : n° → connexions (la première est l'hôte du lobby).
+    parties: HashMap<u64, Vec<u64>>,
     next_id: u64,
     /// Dernier passage de l'entretien des garants.
     last_upkeep: Instant,
@@ -266,6 +295,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         whois: whois.clone(),
         conns: HashMap::new(),
         rooms: HashMap::new(),
+        parties: HashMap::new(),
         next_id: 1,
         last_upkeep: Instant::now(),
         cfg,
@@ -384,12 +414,16 @@ fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
                 kicked: false,
                 garant: false,
                 garant_banned: false,
+                arbitrating: None,
+                party: None,
+                invited: Vec::new(),
             },
         );
         id
     };
     let result = serve_loop(&mut chan, state, peer, id);
     let mut st = state.lock().unwrap();
+    party_leave(&mut st, id);
     leave_room(&mut st, id);
     st.maps.forget(id);
     st.conns.remove(&id);
@@ -470,9 +504,19 @@ fn leave_room(st: &mut State, id: u64) {
     let Some(room_id) = st.conns.get_mut(&id).and_then(|c| c.room.take()) else {
         return;
     };
+    let me = st.conns.get(&id).and_then(|c| c.pseudo.clone());
     let Some(room) = st.rooms.get_mut(&room_id) else {
         return;
     };
+    // Joueur du début qui quitte une partie FPS en cours : absent (il peut revenir).
+    if let Some(p) = me {
+        let low = p.to_ascii_lowercase();
+        let in_roster = room.roster.iter().any(|r| r.eq_ignore_ascii_case(&p));
+        if room.kind == 0 && room.started && !room.settled && in_roster {
+            let e = room.away.entry(low).or_insert((None, 0.0));
+            e.0.get_or_insert_with(Instant::now);
+        }
+    }
     // Garant en attente qui s'en va : simplement retiré.
     if room.hidden.contains(&id) {
         room.hidden.retain(|&h| h != id);
@@ -522,7 +566,8 @@ fn leave_room(st: &mut State, id: u64) {
         return;
     }
     if room.host == id {
-        let room = st.rooms.remove(&room_id).expect("partie");
+        let mut room = st.rooms.remove(&room_id).expect("partie");
+        settle_absences(st, &mut room, &[]);
         for m in room.members {
             if let Some(c) = st.conns.get_mut(&m) {
                 c.room = None;
@@ -552,6 +597,9 @@ fn switch_host(st: &mut State, room_id: u64, new: u64, stays: Option<u64>) {
     };
     let old = room.host;
     let kind = room.kind;
+    // Nouvel hôte : les pièces gardées (copies de l'ancien) ne valent plus.
+    room.evidence.clear();
+    room.evidence_parts.clear();
     room.members.retain(|&m| m != new);
     let was_hidden = room.hidden.contains(&new);
     room.hidden.retain(|&h| h != new);
@@ -643,7 +691,9 @@ fn judge_outcome(st: &mut State, rid: u64, host: u64, auditor: u64) {
         let stays = (!room.garant_hosted).then_some(host);
         let cheater = st.conns.get(&host).and_then(|c| c.pseudo.clone());
         if let Some(p) = &cheater {
-            st.stats.get_mut(p).reports += 2;
+            let s = st.stats.get_mut(p);
+            s.reports += 2;
+            s.trust_by(stats::trust::CHEAT);
             st.stats.save(p);
             log::warn!("partie {rid} : l'hôte « {p} » triche, le vérificateur reprend");
         }
@@ -674,6 +724,130 @@ fn judge_outcome(st: &mut State, rid: u64, host: u64, auditor: u64) {
     }
 }
 
+/// Garde une copie de la partie (reçue en morceaux) parmi les pièces ; 12 au plus.
+fn keep_evidence(r: &mut Room, part: u16, of: u16, data: Vec<u8>) {
+    if part == 0 {
+        r.evidence_parts.clear();
+    }
+    if part as usize != r.evidence_parts.len() || of == 0 {
+        r.evidence_parts.clear();
+        return;
+    }
+    r.evidence_parts.push(data);
+    if r.evidence_parts.len() < of as usize {
+        return;
+    }
+    let whole = std::mem::take(&mut r.evidence_parts).concat();
+    r.evidence.push_back((None, whole));
+    let copies = |r: &Room| r.evidence.iter().filter(|e| e.0.is_none()).count();
+    while copies(r) > 12 {
+        // Jusqu'à la plus vieille copie comprise.
+        while let Some((who, _)) = r.evidence.pop_front() {
+            if who.is_none() {
+                break;
+            }
+        }
+    }
+}
+
+/// Lance un arbitrage : choisit un troisième garant sans lien avec la partie (ni avec
+/// l'hôte, ni avec le vérificateur) et lui envoie les pièces. Faux s'il n'y en a pas.
+fn arbitrate(st: &mut State, rid: u64, auditor: u64) -> bool {
+    let Some(room) = st.rooms.get(&rid) else {
+        return false;
+    };
+    let mut people: Vec<String> = room
+        .everyone()
+        .chain([room.host, auditor])
+        .filter_map(|m| st.conns.get(&m).and_then(|c| c.pseudo.clone()))
+        .collect();
+    people.extend(room.roster.iter().cloned());
+    let Some(arbiter) = pick_garant(st, &people) else {
+        return false;
+    };
+    let case = st.next_id;
+    st.next_id += 1;
+    let items: Vec<(Option<u64>, Vec<u8>)> = room.evidence.iter().cloned().collect();
+    let bytes = postcard::to_allocvec(&items).unwrap_or_default();
+    let (map_sig, map) = (room.map_sig, room.map.clone());
+    let Some(c) = st.conns.get_mut(&arbiter) else {
+        return false;
+    };
+    c.arbitrating = Some(rid);
+    transport::push(&c.tx, &Response::Arbitrate { case, map_sig, map });
+    let parts: Vec<&[u8]> = bytes.chunks(proto::MAP_PART).collect();
+    let of = parts.len() as u16;
+    for (i, p) in parts.into_iter().enumerate() {
+        transport::push(
+            &c.tx,
+            &Response::Evidence {
+                case,
+                part: i as u16,
+                of,
+                data: p.to_vec(),
+            },
+        );
+    }
+    log::info!("partie {rid} : arbitrage n° {case} confié à un troisième garant");
+    if let Some(r) = st.rooms.get_mut(&rid) {
+        r.arbitration = Some((case, arbiter, auditor, Instant::now()));
+    }
+    true
+}
+
+/// Fin d'un arbitrage : `guilty` (l'hôte a triché : le vérificateur reprend la partie),
+/// innocent (le vérificateur accusait à tort : il est écarté), ou pas de réponse (`None` :
+/// on retombe sur la règle sans arbitre, deux preuves du vérificateur).
+fn arbitration_done(st: &mut State, rid: u64, guilty: Option<bool>) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let Some((case, arbiter, auditor, _)) = room.arbitration.take() else {
+        return;
+    };
+    let host = room.host;
+    let host_pseudo = (!room.garant_hosted || guilty == Some(true))
+        .then(|| st.conns.get(&host).and_then(|c| c.pseudo.clone()))
+        .flatten();
+    let room = st.rooms.get_mut(&rid).expect("partie");
+    match guilty {
+        Some(true) => room.confirmed = 2,
+        Some(false) => {
+            room.confirmed = 0;
+            room.dismissed = 3;
+        }
+        None => room.confirmed += 1,
+    }
+    log::info!("partie {rid} : arbitrage n° {case} : {guilty:?}");
+    if let Some(c) = st.conns.get_mut(&arbiter) {
+        c.arbitrating = None;
+    }
+    if room_has(st, rid, auditor) {
+        judge_outcome(st, rid, host, auditor);
+    }
+    // Triche sûre (le vérificateur et un arbitre sans lien la constatent, en rejouant la
+    // partie) : bannissement automatique du compte et de ses machines.
+    if guilty == Some(true) {
+        if let Some(p) = host_pseudo {
+            let why = format!("triche constatée par arbitrage (partie {rid}, n° {case})");
+            match ban_cheater(st, &p, &why) {
+                Ok(n) => log::warn!("« {p} » banni automatiquement ({n} machine(s)) : {why}"),
+                Err(e) => log::warn!("ban automatique de « {p} » impossible : {e}"),
+            }
+        }
+    }
+    if let Some(r) = st.rooms.get_mut(&rid) {
+        r.confirmed = r.confirmed.min(1);
+        r.dismissed = 0;
+    }
+}
+
+fn room_has(st: &State, rid: u64, who: u64) -> bool {
+    st.rooms
+        .get(&rid)
+        .is_some_and(|r| r.hidden.contains(&who) || r.members.contains(&who))
+}
+
 /// Ce garant peut servir une partie de ces joueurs : disponible, au menu, au moins 3
 /// parties jouées, peu signalé, aucun lien avec eux (amis, signalements).
 fn garant_ok(st: &State, g: u64, players: &[String]) -> bool {
@@ -683,7 +857,7 @@ fn garant_ok(st: &State, g: u64, players: &[String]) -> bool {
     let Some(p) = c.pseudo.as_deref() else {
         return false;
     };
-    if !c.garant || c.garant_banned || c.room.is_some() || c.kicked {
+    if !c.garant || c.garant_banned || c.room.is_some() || c.kicked || c.arbitrating.is_some() {
         return false;
     }
     let me = st.stats.get(p).cloned().unwrap_or_default();
@@ -735,6 +909,13 @@ fn upkeep(st: &mut State) {
         let Some(room) = st.rooms.get(&rid) else {
             continue;
         };
+        // Arbitre parti ou muet depuis une minute : on fait sans lui.
+        if let Some((_, arbiter, _, since)) = room.arbitration {
+            if !st.conns.contains_key(&arbiter) || since.elapsed() > Duration::from_secs(60) {
+                arbitration_done(st, rid, None);
+            }
+            continue;
+        }
         // Passage au garant prêt.
         if !room.garant_hosted {
             if let Some(&g) = room.ready_standby.first() {
@@ -825,6 +1006,84 @@ fn announce(st: &State, room_id: u64, changes: zones::Changes) {
     }
 }
 
+/// Règle les absences d'une partie FPS (une fois) : chaque joueur du début parti trop
+/// longtemps perd en confiance (rien sous 2 minutes, beaucoup vers 10 minutes sur 30,
+/// abandon jusqu'à la fin). `spared` : exclus par la partie (coéquipiers tués), déjà
+/// punis par l'exclusion. Rend les joueurs pénalisés.
+fn settle_absences(st: &mut State, room: &mut Room, spared: &[String]) -> HashSet<String> {
+    let mut hit = HashSet::new();
+    if room.settled || room.kind != 0 {
+        return hit;
+    }
+    let Some(t0) = room.started_at else {
+        return hit;
+    };
+    room.settled = true;
+    let len = t0.elapsed().as_secs_f64();
+    for (p, (since, total)) in &room.away {
+        let away = total + since.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        let pen = stats::Stats::absence_penalty(away, len);
+        if pen == 0 || spared.contains(p) {
+            continue;
+        }
+        let s = st.stats.get_mut(p);
+        s.trust_by(pen);
+        s.absences += 1;
+        st.stats.save(p);
+        hit.insert(p.clone());
+        log::info!("« {p} » absent {away:.0} s sur {len:.0} s : confiance {pen}");
+    }
+    hit
+}
+
+/// Facteur de confiance effectif : le plus bas des comptes vus sur ses machines (un
+/// nouveau compte ne blanchit pas un tricheur).
+fn trust_of(st: &State, pseudo: &str) -> i32 {
+    st.hardware
+        .siblings(pseudo)
+        .iter()
+        .map(|p| st.stats.trust(p))
+        .min()
+        .unwrap_or(stats::TRUST_START)
+}
+
+/// Bannit un compte pour triche : registre (tous les relais), machines 3 mois,
+/// connexions coupées.
+fn ban_cheater(st: &mut State, target: &str, reason: &str) -> Result<usize, String> {
+    let Some(rec) = st.accounts.load(target) else {
+        return Err(format!("Joueur « {target} » inconnu."));
+    };
+    if !st.registry.is_banned(&rec.pubkey) {
+        use sha2::{Digest, Sha256};
+        let proof: [u8; 32] = Sha256::digest(reason.as_bytes()).into();
+        st.registry
+            .append(Body::Ban {
+                pubkey: rec.pubkey,
+                proof,
+            })
+            .map_err(|e| format!("{e:#}"))?;
+    }
+    let machines = st.hardware.ban_account_machines(&rec.pseudo);
+    let ids: Vec<u64> = st
+        .conns
+        .iter()
+        .filter(|(_, c)| {
+            c.pseudo
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(target))
+        })
+        .map(|(&i, _)| i)
+        .collect();
+    for i in ids {
+        leave_room(st, i);
+        if let Some(c) = st.conns.get_mut(&i) {
+            c.kicked = true;
+            transport::push(&c.tx, &err(ErrorCode::Banned, "Compte banni."));
+        }
+    }
+    Ok(machines)
+}
+
 /// Le résultat d'une partie est accepté quand plus de la moitié des joueurs présents au
 /// début (l'hôte compris) ont envoyé le même.
 fn try_apply_result(st: &mut State, room_id: u64) {
@@ -857,7 +1116,40 @@ fn try_apply_result(st: &mut State, room_id: u64) {
     }
     room.applied = true;
     let sig = room.map_sig;
-    st.stats.apply_match(&summary);
+    // Seules les parties à 5 contre 5 comptent pour le classement.
+    let ranked = room.max_players == proto::FPS_PLAYERS as u32;
+    // Classement : seulement sur les 10 cartes les plus jouées.
+    let ranked_map = st.maps.among_top(&room.map_sig, 10);
+    let room = st.rooms.get_mut(&room_id).expect("partie");
+    let reported: HashSet<String> = room.reports.iter().map(|r| r.1.clone()).collect();
+    let roster = room.roster.clone();
+    // Exclus pour avoir tué 3 coéquipiers : pas de pénalité d'absence en plus.
+    let tk_kicked: Vec<String> = summary
+        .players
+        .iter()
+        .filter(|p| p.teamkills >= 3)
+        .map(|p| p.pseudo.to_ascii_lowercase())
+        .collect();
+    let mut room = st.rooms.remove(&room_id).expect("partie");
+    let absent = settle_absences(st, &mut room, &tk_kicked);
+    st.rooms.insert(room_id, room);
+    for p in &summary.players {
+        let s = st.stats.get_mut(&p.pseudo);
+        s.teamkills += p.teamkills as u32;
+    }
+    // Partie propre (pas signalé, pas parti longtemps) : la confiance remonte un peu.
+    for p in &roster {
+        let low = p.to_ascii_lowercase();
+        if ranked && !reported.contains(&low) && !absent.contains(&low) {
+            let s = st.stats.get_mut(p);
+            let g = s.clean_gain();
+            s.trust_by(g);
+        }
+        st.stats.save(p);
+    }
+    if ranked && ranked_map {
+        st.stats.apply_match(&summary);
+    }
     st.maps.played(&sig);
     log::info!(
         "partie {room_id} terminée {}-{} : classement mis à jour",
@@ -881,10 +1173,13 @@ fn open_room(
     leave_room(st, id);
     let rid = st.next_id;
     st.next_id += 1;
+    if kind == 0 {
+        st.maps.mark_fps(map_sig);
+    }
     let name: String = name.chars().take(32).collect();
     // FPS : 10 joueurs ; construction : sans limite (0).
     let max_players = if kind == 0 {
-        proto::FPS_PLAYERS as u32
+        (max_players.clamp(2, proto::FPS_PLAYERS) & !1) as u32
     } else if max_players == 0 {
         0
     } else {
@@ -909,6 +1204,10 @@ fn open_room(
             roster: Vec::new(),
             results: HashMap::new(),
             applied: false,
+            started_at: None,
+            away: HashMap::new(),
+            settled: false,
+            reserved: Vec::new(),
             reports: HashSet::new(),
             build: zones::Build::default(),
             backup: None,
@@ -919,6 +1218,9 @@ fn open_room(
             confirmed: 0,
             dismissed: 0,
             audited: None,
+            evidence: VecDeque::new(),
+            evidence_parts: Vec::new(),
+            arbitration: None,
             creator: pseudo.to_string(),
             server: servers::key(pseudo, &map),
         },
@@ -935,11 +1237,22 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
     let Some(r) = st.rooms.get_mut(&room) else {
         return err(ErrorCode::Refused, "Partie introuvable.");
     };
-    if r.max_players > 0 && r.player_count() >= r.max_players as usize {
+    // Une place gardée pour lui (lobby) : la sienne ; sinon les places gardées comptent.
+    let low = pseudo.to_ascii_lowercase();
+    let mine = r.reserved.iter().any(|(p, _)| *p == low);
+    let held = if mine { 0 } else { r.reserved_count() };
+    if r.max_players > 0 && r.player_count() + held >= r.max_players as usize {
         return err(ErrorCode::Refused, "Partie pleine.");
     }
-    if r.kind == 0 && r.started {
+    // Une partie FPS commencée : seuls ses joueurs du début peuvent y revenir.
+    let back = r.roster.iter().any(|p| p.eq_ignore_ascii_case(pseudo));
+    if r.kind == 0 && r.started && !back {
         return err(ErrorCode::Refused, "Partie déjà commencée.");
+    }
+    if let Some((since, total)) = r.away.get_mut(&pseudo.to_ascii_lowercase()) {
+        if let Some(t) = since.take() {
+            *total += t.elapsed().as_secs_f64();
+        }
     }
     if r.kind == 1 {
         if let Some(why) = st.servers.banned(&r.server, pseudo) {
@@ -967,9 +1280,17 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
             );
         }
     }
+    r.reserved.retain(|(p, t)| *p != low && t.elapsed() < Duration::from_secs(60));
     r.members.push(id);
-    let (host, host_pseudo, map, map_sig) =
-        (r.host, r.host_pseudo.clone(), r.map.clone(), r.map_sig);
+    // FPS : pas de nom tant que la partie n'a pas commencé (on ne choisit pas ses
+    // adversaires en quittant la recherche).
+    let shown = if r.kind == 0 {
+        String::new()
+    } else {
+        r.host_pseudo.clone()
+    };
+    let (host, host_pseudo, map, map_sig) = (r.host, shown, r.map.clone(), r.map_sig);
+    let party = st.conns.get(&id).and_then(|c| c.party).unwrap_or(0);
     if let Some(c) = st.conns.get_mut(&id) {
         c.room = Some(room);
         c.joined = Instant::now();
@@ -980,6 +1301,7 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
             &Response::PeerJoined {
                 peer: id,
                 pseudo: pseudo.to_string(),
+                party,
             },
         );
     }
@@ -995,40 +1317,302 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
 /// (ou qui nous a signalés), avec une réputation proche : plus on est signalé (par partie
 /// jouée), plus on est mis avec des joueurs dans le même cas. Parmi celles-là, la plus
 /// proche en réputation, puis la plus remplie.
-fn find_room(st: &State, pseudo: &str, map_sig: [u8; 32]) -> Option<u64> {
-    let me = st.stats.get(pseudo).cloned().unwrap_or_default();
-    let my_ratio = me.ratio();
-    let mut best: Option<(f64, usize, u64)> = None;
+fn find_room(st: &State, group: &[String], map_sig: [u8; 32]) -> Option<u64> {
+    let size = group.len().max(1);
+    let stats_of = |p: &str| {
+        st.stats
+            .get(p)
+            .cloned()
+            .unwrap_or_else(|| stats::Stats::new(p))
+    };
+    let mine: Vec<stats::Stats> = group.iter().map(|p| stats_of(p)).collect();
+    // Un lobby compte comme son plus bas facteur de confiance, son Elo moyen, et il est
+    // « neuf » si la plupart de ses joueurs le sont.
+    let my_trust = group
+        .iter()
+        .map(|p| trust_of(st, p))
+        .min()
+        .unwrap_or(stats::TRUST_START);
+    let my_elo = mine.iter().map(|s| s.elo).sum::<f64>() / size as f64;
+    let my_new = mine.iter().filter(|s| s.is_new()).count() * 2 >= size;
+    // Clé de choix : d'abord l'écart d'Elo avec l'équipe déjà formée (par tranches de 100,
+    // pour laisser jouer les critères suivants), puis neufs avec neufs, puis la confiance,
+    // puis la partie la plus remplie.
+    let mut best: Option<((i64, u8, i32, usize), u64)> = None;
     for (&rid, r) in &st.rooms {
         if r.kind != 0 || r.started || r.map_sig != map_sig {
             continue;
         }
-        let n = r.player_count();
-        if n >= proto::FPS_PLAYERS as usize {
+        let n = r.player_count() + r.reserved_count();
+        if n + size > r.max_players as usize {
+            continue;
+        }
+        // Le lobby doit tenir dans une équipe (les autres se répartissent à parts égales).
+        let team_max = (r.max_players as usize / 2).max(1);
+        if size > 1 && size > team_max.saturating_sub(n / 2) {
             continue;
         }
         let names: Vec<&str> = r
             .everyone()
             .filter_map(|m| st.conns.get(&m).and_then(|c| c.pseudo.as_deref()))
             .collect();
-        let blocked = names
-            .iter()
-            .any(|p| me.avoids(p) || st.stats.get(p).is_some_and(|s| s.avoids(pseudo)));
+        let blocked = names.iter().any(|p| {
+            mine.iter().any(|me| me.avoids(p))
+                || st
+                    .stats
+                    .get(p)
+                    .is_some_and(|s| group.iter().any(|g| s.avoids(g)))
+        });
         if blocked {
             continue;
         }
-        let ratio =
-            names.iter().map(|p| st.stats.ratio(p)).sum::<f64>() / names.len().max(1) as f64;
-        let diff = (ratio - my_ratio).abs();
-        if diff > reputation_tolerance(my_ratio, ratio) {
+        // Confiance moyenne de la partie, et part de comptes neufs.
+        let trust =
+            names.iter().map(|p| trust_of(st, p)).sum::<i32>() / names.len().max(1) as i32;
+        let news = names
+            .iter()
+            .filter(|p| st.stats.get(p).is_none_or(|s| s.is_new()))
+            .count();
+        let mostly_new = news * 2 >= names.len().max(1);
+        if (trust - my_trust).abs() > trust_tolerance(my_trust, trust) {
             continue;
         }
-        let better = best.is_none_or(|(d, m, _)| diff < d - 1e-9 || (diff <= d + 1e-9 && n > m));
-        if better {
-            best = Some((diff, n, rid));
+        // Elo moyen de ceux qui attendent déjà (l'équipe formée en secret).
+        let elo = names
+            .iter()
+            .map(|p| st.stats.get(p).map_or(stats::START_ELO, |s| s.elo))
+            .sum::<f64>()
+            / names.len().max(1) as f64;
+        let key = (
+            ((elo - my_elo).abs() / 100.0) as i64,
+            u8::from(mostly_new != my_new),
+            (trust - my_trust).abs(),
+            usize::MAX - n,
+        );
+        if best.as_ref().is_none_or(|(k, _)| key < *k) {
+            best = Some((key, rid));
         }
     }
-    best.map(|b| b.2)
+    best.map(|b| b.1)
+}
+
+/// Fichier du skin d'un joueur (nom tiré du pseudo : rien de dangereux dans le chemin).
+fn skin_path(dir: &Path, pseudo: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let h: [u8; 32] = Sha256::digest(pseudo.to_ascii_lowercase().as_bytes()).into();
+    dir.join("skins")
+        .join(format!("{}.png", crypto::hex(&h[..12])))
+}
+
+/// Un skin acceptable : PNG de 64 × 64 ou 64 × 32, 24 Ko au plus (en-tête vérifié ; le jeu
+/// qui l'affiche le décode et le revérifie).
+fn valid_skin(png: &[u8]) -> bool {
+    const MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if png.len() > 24 * 1024 || png.len() < 33 || png[..8] != MAGIC || &png[12..16] != b"IHDR" {
+        return false;
+    }
+    let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+    let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+    w == 64 && (h == 64 || h == 32)
+}
+
+/// Lobby de cette connexion : ses membres (l'hôte d'abord).
+fn party_of(st: &State, id: u64) -> Vec<u64> {
+    st.conns
+        .get(&id)
+        .and_then(|c| c.party)
+        .and_then(|p| st.parties.get(&p))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Envoie à chaque membre l'état de son lobby (dissous s'il ne reste qu'un joueur).
+fn party_push(st: &mut State, pid: u64) {
+    let members = st.parties.get(&pid).cloned().unwrap_or_default();
+    if members.len() <= 1 {
+        st.parties.remove(&pid);
+        for m in &members {
+            if let Some(c) = st.conns.get_mut(m) {
+                c.party = None;
+                transport::push(
+                    &c.tx,
+                    &Response::Party {
+                        id: 0,
+                        members: Vec::new(),
+                    },
+                );
+            }
+        }
+        return;
+    }
+    let names: Vec<String> = members
+        .iter()
+        .filter_map(|m| st.conns.get(m).and_then(|c| c.pseudo.clone()))
+        .collect();
+    for m in &members {
+        if let Some(c) = st.conns.get(m) {
+            transport::push(
+                &c.tx,
+                &Response::Party {
+                    id: pid,
+                    members: names.clone(),
+                },
+            );
+        }
+    }
+}
+
+/// Quitte son lobby (déconnexion, départ, exclusion).
+fn party_leave(st: &mut State, id: u64) {
+    let Some(pid) = st.conns.get_mut(&id).and_then(|c| c.party.take()) else {
+        return;
+    };
+    if let Some(v) = st.parties.get_mut(&pid) {
+        v.retain(|&m| m != id);
+    }
+    if let Some(c) = st.conns.get(&id) {
+        transport::push(
+            &c.tx,
+            &Response::Party {
+                id: 0,
+                members: Vec::new(),
+            },
+        );
+    }
+    party_push(st, pid);
+}
+
+/// Connexion d'un joueur en ligne, par son pseudo.
+fn conn_of(st: &State, pseudo: &str) -> Option<u64> {
+    st.conns
+        .iter()
+        .find(|(_, c)| {
+            !c.kicked
+                && c.pseudo
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(pseudo))
+        })
+        .map(|(&i, _)| i)
+}
+
+/// Requêtes du lobby.
+fn handle_party(st: &mut State, id: u64, pseudo: &str, action: u8, who: &str) -> Response {
+    let target = conn_of(st, who);
+    let mine = st.conns.get(&id).and_then(|c| c.party);
+    let leader = mine
+        .and_then(|p| st.parties.get(&p))
+        .and_then(|v| v.first().copied());
+    match action {
+        proto::PARTY_INVITE => {
+            let Some(t) = target.filter(|&t| t != id) else {
+                return err(ErrorCode::Refused, format!("« {who} » n'est pas en ligne."));
+            };
+            // Pas d'invitation de quelqu'un qu'on évite (ou qui nous évite).
+            let avoid = st.stats.get(pseudo).is_some_and(|s| s.avoids(who))
+                || st.stats.get(who).is_some_and(|s| s.avoids(pseudo));
+            if avoid {
+                return err(ErrorCode::Refused, format!("Impossible d'inviter « {who} »."));
+            }
+            let pid = match mine {
+                Some(p) => p,
+                None => {
+                    let p = st.next_id;
+                    st.next_id += 1;
+                    st.parties.insert(p, vec![id]);
+                    if let Some(c) = st.conns.get_mut(&id) {
+                        c.party = Some(p);
+                    }
+                    p
+                }
+            };
+            let v = &st.parties[&pid];
+            if v.contains(&t) {
+                return err(ErrorCode::Refused, format!("« {who} » est déjà dans le lobby."));
+            }
+            if v.len() >= proto::PARTY_MAX {
+                return err(ErrorCode::Refused, "Lobby complet (5 joueurs).");
+            }
+            if let Some(c) = st.conns.get_mut(&t) {
+                // Une seule invitation par lobby (pas de harcèlement à coups d'invitations).
+                if !c.invited.contains(&pid) {
+                    c.invited.push(pid);
+                    if c.invited.len() > 8 {
+                        c.invited.remove(0);
+                    }
+                    transport::push(
+                        &c.tx,
+                        &Response::PartyInvite {
+                            from: pseudo.to_string(),
+                        },
+                    );
+                }
+            }
+            // Le lobby existe (au moins l'hôte) : on le montre à celui qui invite.
+            if let Some(c) = st.conns.get(&id) {
+                transport::push(
+                    &c.tx,
+                    &Response::Party {
+                        id: pid,
+                        members: st.parties[&pid]
+                            .iter()
+                            .filter_map(|m| st.conns.get(m).and_then(|c| c.pseudo.clone()))
+                            .collect(),
+                    },
+                );
+            }
+            Response::Done
+        }
+        proto::PARTY_ACCEPT | proto::PARTY_DECLINE => {
+            let pid = target.and_then(|t| st.conns.get(&t)).and_then(|c| c.party);
+            let invited = pid.filter(|p| {
+                st.conns
+                    .get(&id)
+                    .is_some_and(|c| c.invited.contains(p))
+            });
+            let Some(pid) = invited else {
+                return err(ErrorCode::Refused, "Invitation expirée.");
+            };
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.invited.retain(|&p| p != pid);
+            }
+            if action == proto::PARTY_DECLINE {
+                return Response::Done;
+            }
+            if st.parties.get(&pid).is_none_or(|v| v.len() >= proto::PARTY_MAX) {
+                return err(ErrorCode::Refused, "Lobby complet.");
+            }
+            party_leave(st, id);
+            st.parties.get_mut(&pid).expect("lobby").push(id);
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.party = Some(pid);
+            }
+            party_push(st, pid);
+            Response::Done
+        }
+        proto::PARTY_LEAVE => {
+            party_leave(st, id);
+            Response::Done
+        }
+        proto::PARTY_KICK | proto::PARTY_PROMOTE => {
+            if leader != Some(id) {
+                return err(ErrorCode::Refused, "Réservé à l'hôte du lobby.");
+            }
+            let pid = mine.expect("lobby");
+            let Some(t) = target.filter(|t| *t != id && st.parties[&pid].contains(t)) else {
+                return err(ErrorCode::Refused, format!("« {who} » n'est pas dans le lobby."));
+            };
+            if action == proto::PARTY_KICK {
+                party_leave(st, t);
+            } else {
+                let v = st.parties.get_mut(&pid).expect("lobby");
+                v.retain(|&m| m != t);
+                v.insert(0, t);
+                party_push(st, pid);
+            }
+            Response::Done
+        }
+        _ => err(ErrorCode::Refused, "Action de lobby inconnue."),
+    }
 }
 
 /// Administrateurs : pseudos listés dans `admins.txt` (un par ligne) dans le dossier du
@@ -1040,9 +1624,16 @@ fn is_admin(dir: &Path, pseudo: &str) -> bool {
         .any(|l| l.trim().eq_ignore_ascii_case(pseudo))
 }
 
-/// Écart de réputation accepté entre un joueur et une partie.
-fn reputation_tolerance(a: f64, b: f64) -> f64 {
-    0.1 + 0.5 * a.max(b)
+/// Écart de confiance accepté entre un joueur et une partie : large au milieu, serré
+/// aux extrêmes (les joueurs très fiables entre eux, les douteux entre eux).
+fn trust_tolerance(a: i32, b: i32) -> i32 {
+    let lo = a.min(b);
+    let hi = a.max(b);
+    if hi >= 800 || lo <= 200 {
+        120
+    } else {
+        250
+    }
 }
 
 /// Requêtes de parties (connecté seulement).
@@ -1079,13 +1670,61 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let rid = open_room(st, id, pseudo, kind, name, map, map_sig, max_players);
             Response::Hosted { room: rid }
         }
-        Request::Search { map_sig, map } => {
-            leave_room(st, id);
-            match find_room(st, pseudo, map_sig) {
+        Request::Search {
+            map_sig,
+            map,
+            players,
+        } => {
+            // En lobby : l'hôte du lobby lance pour tout le monde.
+            let party = party_of(st, id);
+            if party.len() > 1 && party[0] != id {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "C'est l'hôte du lobby qui lance la partie.",
+                ));
+            }
+            let group: Vec<u64> = if party.len() > 1 { party } else { vec![id] };
+            // Un membre en pleine partie FPS n'en est pas arraché (il serait pénalisé).
+            let busy = group.iter().filter(|&&m| m != id).find_map(|m| {
+                let c = st.conns.get(m)?;
+                let r = st.rooms.get(&c.room?)?;
+                (r.kind == 0 && r.started && !r.applied).then(|| c.pseudo.clone().unwrap_or_default())
+            });
+            if let Some(p) = busy {
+                return Some(err(
+                    ErrorCode::Refused,
+                    format!("« {p} » est en pleine partie : attends qu'il ait fini."),
+                ));
+            }
+            for &m in &group {
+                leave_room(st, m);
+            }
+            let names: Vec<String> = group
+                .iter()
+                .filter_map(|m| st.conns.get(m).and_then(|c| c.pseudo.clone()))
+                .collect();
+            let players = (players.clamp(2, 10) & !1) as u16;
+            // Une partie FPS en cours qu'on a quittée : on y retourne d'abord (comme une
+            // reconnexion), quelle que soit la carte demandée.
+            let low = pseudo.to_ascii_lowercase();
+            let unfinished = st
+                .rooms
+                .iter()
+                .find(|(_, r)| {
+                    r.kind == 0
+                        && r.started
+                        && !r.applied
+                        && r.away.get(&low).is_some_and(|a| a.0.is_some())
+                })
+                .map(|(&rid, _)| rid);
+            if let (Some(rid), 1) = (unfinished, group.len()) {
+                return Some(join_room(st, id, pseudo, rid));
+            }
+            let resp = match find_room(st, &names, map_sig) {
                 Some(room) => join_room(st, id, pseudo, room),
                 // Personne en attente : un garant indépendant ouvre la partie s'il y en a un.
-                None if pick_garant(st, &[pseudo.to_string()]).is_some() => {
-                    let g = pick_garant(st, &[pseudo.to_string()]).expect("garant");
+                None if pick_garant(st, &names).is_some() => {
+                    let g = pick_garant(st, &names).expect("garant");
                     let gp = st.conns[&g].pseudo.clone().unwrap_or_default();
                     let rid = open_room(
                         st,
@@ -1095,7 +1734,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         format!("Partie servie par {gp}"),
                         map.clone(),
                         map_sig,
-                        proto::FPS_PLAYERS,
+                        players,
                     );
                     if let Some(r) = st.rooms.get_mut(&rid) {
                         r.garant_hosted = true;
@@ -1106,7 +1745,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             &Response::GarantTask {
                                 room: rid,
                                 map_sig,
-                                map,
+                                map: map.clone(),
                                 members: Vec::new(),
                                 standby: false,
                             },
@@ -1121,13 +1760,89 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         pseudo,
                         0,
                         String::new(),
-                        map,
+                        map.clone(),
                         map_sig,
-                        proto::FPS_PLAYERS,
+                        players,
                     );
                     Response::Hosted { room: rid }
                 }
+            };
+            // Les autres joueurs du lobby suivent : leur place est gardée.
+            let room = st.conns.get(&id).and_then(|c| c.room);
+            if let (Some(rid), true) = (room, group.len() > 1) {
+                let others: Vec<u64> = group.iter().copied().filter(|&m| m != id).collect();
+                if let Some(r) = st.rooms.get_mut(&rid) {
+                    for m in &others {
+                        if let Some(p) = st.conns.get(m).and_then(|c| c.pseudo.clone()) {
+                            r.reserved.push((p.to_ascii_lowercase(), Instant::now()));
+                        }
+                    }
+                }
+                for m in others {
+                    if let Some(c) = st.conns.get(&m) {
+                        transport::push(
+                            &c.tx,
+                            &Response::PartyGo {
+                                room: rid,
+                                map: map.clone(),
+                                map_sig,
+                            },
+                        );
+                    }
+                }
             }
+            resp
+        }
+        Request::Party {
+            action,
+            pseudo: who,
+        } => handle_party(st, id, pseudo, action, &who),
+        Request::SkinPut { png } => {
+            let path = skin_path(&st.cfg.dir, pseudo);
+            if png.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else if !valid_skin(&png) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Skin refusé : PNG de 64 × 64 (ou 64 × 32), 24 Ko au plus.",
+                ));
+            } else {
+                if let Some(d) = path.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                if let Err(e) = accounts::write_atomic(&path, &png) {
+                    return Some(err(ErrorCode::Internal, format!("{e:#}")));
+                }
+            }
+            // Construction : les joueurs de la partie le voient changer (pas en FPS, où le
+            // skin reste celui du début de la partie).
+            if let Some(r) = my_room.and_then(|r| st.rooms.get(&r)).filter(|r| r.kind == 1) {
+                let to: Vec<u64> = r
+                    .members
+                    .iter()
+                    .copied()
+                    .chain([r.host])
+                    .filter(|&m| m != id)
+                    .collect();
+                for m in to {
+                    if let Some(c) = st.conns.get(&m) {
+                        transport::push(
+                            &c.tx,
+                            &Response::SkinChanged {
+                                pseudo: pseudo.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            Response::Done
+        }
+        Request::SkinGet { pseudo: who } => {
+            let png = std::fs::read(skin_path(&st.cfg.dir, &who))
+                .ok()
+                .filter(|p| valid_skin(p))
+                .unwrap_or_default();
+            Response::Skin { pseudo: who, png }
         }
         Request::Report { pseudo: target } => {
             let Some(room) = my_room.and_then(|r| st.rooms.get(&r)) else {
@@ -1163,6 +1878,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 }
                 let them = st.stats.get_mut(&target);
                 them.reports += 1;
+                them.trust_by(stats::trust::REPORT);
                 if !them.reported_by.contains(&key.0) {
                     them.reported_by.push(key.0.clone());
                     if them.reported_by.len() > 1000 {
@@ -1185,41 +1901,10 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     "Réservé aux administrateurs du relais (admins.txt), pour la triche.",
                 ));
             }
-            let Some(rec) = st.accounts.load(&target) else {
-                return Some(err(
-                    ErrorCode::Refused,
-                    format!("Joueur « {target} » inconnu."),
-                ));
+            let machines = match ban_cheater(st, &target, &reason) {
+                Ok(m) => m,
+                Err(e) => return Some(err(ErrorCode::Refused, e)),
             };
-            if !st.registry.is_banned(&rec.pubkey) {
-                use sha2::{Digest, Sha256};
-                let proof: [u8; 32] = Sha256::digest(reason.as_bytes()).into();
-                if let Err(e) = st.registry.append(Body::Ban {
-                    pubkey: rec.pubkey,
-                    proof,
-                }) {
-                    return Some(err(ErrorCode::Internal, format!("{e:#}")));
-                }
-            }
-            let machines = st.hardware.ban_account_machines(&rec.pseudo);
-            // Connexions de ce compte : coupées.
-            let ids: Vec<u64> = st
-                .conns
-                .iter()
-                .filter(|(_, c)| {
-                    c.pseudo
-                        .as_deref()
-                        .is_some_and(|p| p.eq_ignore_ascii_case(&target))
-                })
-                .map(|(&i, _)| i)
-                .collect();
-            for i in ids {
-                leave_room(st, i);
-                if let Some(c) = st.conns.get_mut(&i) {
-                    c.kicked = true;
-                    transport::push(&c.tx, &err(ErrorCode::Banned, "Compte banni."));
-                }
-            }
             log::info!(
                 "« {target} » banni par « {pseudo} » ({machines} machine(s) pour 3 mois) : {reason}"
             );
@@ -1245,6 +1930,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 proto::SERVER_UNBAN => servers::Action::Unban,
                 proto::SERVER_OP => servers::Action::Op,
                 proto::SERVER_DEOP => servers::Action::Deop,
+                proto::SERVER_KILL => servers::Action::Kill,
                 _ => servers::Action::List,
             };
             match st
@@ -1252,6 +1938,30 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 .act(&server, &creator, pseudo, act, &target, &reason)
             {
                 Ok(text) => {
+                    if act == servers::Action::Kill {
+                        let target_conn = st.conns.iter().find(|(_, c)| {
+                            c.room == Some(rid)
+                                && c.pseudo
+                                    .as_deref()
+                                    .is_some_and(|p| p.eq_ignore_ascii_case(&target))
+                        });
+                        match target_conn {
+                            Some((_, c)) => {
+                                transport::push(
+                                    &c.tx,
+                                    &Response::Slain {
+                                        by: pseudo.to_string(),
+                                    },
+                                );
+                            }
+                            None => {
+                                return Some(err(
+                                    ErrorCode::Refused,
+                                    format!("{target} n'est pas sur ce serveur."),
+                                ))
+                            }
+                        }
+                    }
                     // Banni : exclu tout de suite s'il est sur le serveur.
                     if act == servers::Action::Ban {
                         let ids: Vec<u64> = st
@@ -1297,6 +2007,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let mine = pseudo.to_ascii_lowercase();
             let them = st.stats.get_mut(&target);
             them.reported_by.retain(|p| *p != mine);
+            if them.reports > 0 {
+                them.trust_by(-stats::trust::REPORT);
+            }
             them.reports = them.reports.saturating_sub(1);
             st.stats.save(pseudo);
             st.stats.save(&target);
@@ -1374,7 +2087,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 .get(pseudo)
                 .map(|s| s.friends.clone())
                 .unwrap_or_default();
-            Response::Friends { list }
+            let online = list.iter().map(|f| conn_of(st, f).is_some()).collect();
+            Response::Friends { list, online }
         }
         Request::Maps => {
             let mut list = st.maps.entries();
@@ -1389,11 +2103,13 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     None => list.push(proto::MapEntry {
                         sig: r.map_sig,
                         name: r.map.clone(),
-                        author: r.host_pseudo.clone(),
+                        // Personne n'est nommé avant le début de la partie.
+                        author: String::new(),
                         size: 0,
                         plays: 0,
                         waiting: if r.started { 0 } else { n },
                         stored: false,
+                        players: r.max_players as u8,
                     }),
                 }
             }
@@ -1412,15 +2128,21 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             offset,
             total,
             data,
+            fps,
         } => match st.maps.put(id, pseudo, sig, &name, offset, total, &data) {
             maps::Put::Partial(o) => Response::MapStored {
                 offset: o,
                 complete: false,
             },
-            maps::Put::Complete => Response::MapStored {
-                offset: total,
-                complete: true,
-            },
+            maps::Put::Complete => {
+                if fps {
+                    st.maps.mark_fps(sig);
+                }
+                Response::MapStored {
+                    offset: total,
+                    complete: true,
+                }
+            }
             maps::Put::Refused(m) => err(ErrorCode::Refused, m),
         },
         Request::MapGet { sig, offset } => match st.maps.get(&sig, offset) {
@@ -1543,6 +2265,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         first = Some(r.everyone().collect::<Vec<u64>>());
                     }
                     r.started = started;
+                    if started && r.started_at.is_none() {
+                        r.started_at = Some(Instant::now());
+                    }
                 }
             }
             // Début d'une partie FPS : elle compte pour chacun (rapport parties /
@@ -1571,37 +2296,44 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             Response::Left
         }
         Request::ToHost { data } => {
-            if let Some(r) = my_room.and_then(|r| st.rooms.get(&r)) {
-                // Tirs, grenades, achats… : le garant vérificateur en reçoit une copie
-                // attestée (l'hôte ne peut ni en inventer ni en taire).
-                let witness = r.kind == 0
-                    && !r.hidden.contains(&id)
-                    && game::decode::<game::ToHost>(&data).is_some_and(|m| {
-                        matches!(
-                            m,
-                            game::ToHost::Fire { .. }
-                                | game::ToHost::Throw { .. }
-                                | game::ToHost::Buy(_)
-                                | game::ToHost::Action { .. }
-                                | game::ToHost::Team(_)
-                                | game::ToHost::Drop { .. }
-                                | game::ToHost::Pickup { .. }
-                        )
-                    });
-                if witness {
-                    let copy = Response::Witness {
-                        peer: id,
-                        data: data.clone(),
-                    };
-                    for h in r.hidden.iter().filter(|&&h| h != r.host) {
-                        if let Some(c) = st.conns.get(h) {
-                            transport::push(&c.tx, &copy);
-                        }
+            let rid = my_room?;
+            let r = st.rooms.get_mut(&rid)?;
+            // Tirs, grenades, achats… : le garant vérificateur en reçoit une copie
+            // attestée (l'hôte ne peut ni en inventer ni en taire), et le relais la garde
+            // parmi les pièces d'un arbitrage.
+            let witness = r.kind == 0
+                && !r.hidden.contains(&id)
+                && r.hidden.iter().any(|&h| h != r.host)
+                && game::decode::<game::ToHost>(&data).is_some_and(|m| {
+                    matches!(
+                        m,
+                        game::ToHost::Fire { .. }
+                            | game::ToHost::Throw { .. }
+                            | game::ToHost::Buy(_)
+                            | game::ToHost::Action { .. }
+                            | game::ToHost::Team(_)
+                            | game::ToHost::Drop { .. }
+                            | game::ToHost::Pickup { .. }
+                            | game::ToHost::Color(_)
+                    )
+                });
+            if witness {
+                r.evidence.push_back((Some(id), data.clone()));
+                if r.evidence.len() > 50_000 {
+                    r.evidence.pop_front();
+                }
+                let copy = Response::Witness {
+                    peer: id,
+                    data: data.clone(),
+                };
+                for h in r.hidden.iter().filter(|&&h| h != r.host) {
+                    if let Some(c) = st.conns.get(h) {
+                        transport::push(&c.tx, &copy);
                     }
                 }
-                if let Some(c) = st.conns.get(&r.host) {
-                    transport::push(&c.tx, &Response::FromPeer { peer: id, data });
-                }
+            }
+            if let Some(c) = st.conns.get(&r.host) {
+                transport::push(&c.tx, &Response::FromPeer { peer: id, data });
             }
             return None;
         }
@@ -1648,6 +2380,15 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             let host = room.host;
             if proof || player == 0 {
+                // Accusation de triche : un troisième garant, sans lien avec personne,
+                // rejoue les pièces gardées par le relais et tranche.
+                if room.arbitration.is_some() {
+                    return None;
+                }
+                if arbitrate(st, rid, id) {
+                    return None;
+                }
+                let room = st.rooms.get_mut(&rid)?;
                 room.confirmed += 1;
             } else if room.members.contains(&player) {
                 let n = st.next_id;
@@ -1697,6 +2438,15 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             return None;
         }
         Request::ToPeer { peer, data } => {
+            // Copie de la partie pour le vérificateur : le relais en garde les dernières
+            // (pièces d'un arbitrage : personne ne peut les retoucher après coup).
+            if let Some(r) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
+                if r.kind == 0 && r.host == id && r.hidden.contains(&peer) {
+                    if let Some(game::ToPeer::Backup { part, of, data }) = game::decode(&data) {
+                        keep_evidence(r, part, of, data);
+                    }
+                }
+            }
             if let Some(r) = my_room.and_then(|r| st.rooms.get(&r)) {
                 if r.host == id && r.members.contains(&peer) {
                     if let Some(c) = st.conns.get(&peer) {
@@ -1744,6 +2494,9 @@ fn handle(
             | Request::MatchResult { .. }
             | Request::Leaderboard { .. }
             | Request::Friend { .. }
+            | Request::Party { .. }
+            | Request::SkinPut { .. }
+            | Request::SkinGet { .. }
             | Request::Maps
             | Request::MapPut { .. }
             | Request::MapGet { .. }
@@ -1784,6 +2537,17 @@ fn handle_account(
     match req {
         Request::Hello { .. } => err(ErrorCode::Protocol, "déjà dit bonjour"),
         Request::Ping => Response::Pong,
+        Request::Verdict { case, guilty } => {
+            let rid = st
+                .rooms
+                .iter()
+                .find(|(_, r)| r.arbitration.is_some_and(|a| a.0 == case && a.1 == id))
+                .map(|(&rid, _)| rid);
+            if let Some(rid) = rid {
+                arbitration_done(st, rid, Some(guilty));
+            }
+            Response::Done
+        }
         Request::Whois { pseudo } => Response::Whois {
             pubkey: st.registry.lookup(&pseudo).map(|r| r.1),
         },
@@ -1839,6 +2603,7 @@ fn handle_account(
             auth,
             totp,
             hw,
+            device,
         } => {
             // Par le tunnel iroh, `peer` est la vraie adresse du joueur (préambule).
             let mut keys = vec![format!("pseudo:{}", pseudo.to_ascii_lowercase())];
@@ -1871,7 +2636,10 @@ fn handle_account(
                 );
             }
             st.hardware.seen(&record.pseudo, hw);
-            if let Some(sealed) = &record.totp {
+            // Appareil de confiance (code 2FA déjà donné sur cet appareil) : pas de 2FA.
+            let trusted = device.is_some_and(|d| record.trusts(&d));
+            let mut new_device = None;
+            if let (Some(sealed), false) = (&record.totp, trusted) {
                 let Some(code) = totp else {
                     return Response::NeedTotp;
                 };
@@ -1879,6 +2647,7 @@ fn handle_account(
                 match totp::check(&secret, code, totp::now_step()) {
                     Some(step) if step > record.last_totp_step => {
                         record.last_totp_step = step;
+                        new_device = Some(record.trust_new_device());
                         let _ = st.accounts.save(&record);
                     }
                     _ => {
@@ -1902,6 +2671,7 @@ fn handle_account(
             Response::Vault {
                 vault: record.vault,
                 challenge,
+                device: new_device,
             }
         }
         Request::Prove { signature } => {
@@ -2079,6 +2849,7 @@ mod tests {
             password: "mauvais!!".into(),
             totp: None,
             backup: None,
+            device: None,
         });
         assert!(wait_error(&c2).contains("incorrect"));
         // Double authentification : activation, puis connexion qui la demande.
@@ -2098,6 +2869,7 @@ mod tests {
             password: "motdepasse1".into(),
             totp: None,
             backup: None,
+            device: None,
         });
         wait(&c2, |e| matches!(e, Event::NeedTotp));
         // Le code déjà utilisé pour l'activation est refusé, le suivant accepté.
@@ -2106,6 +2878,7 @@ mod tests {
             password: "motdepasse1".into(),
             totp: Some(totp::code(&secret, now)),
             backup: None,
+            device: None,
         });
         assert!(wait_error(&c2).contains("double authentification"));
         c2.send(Cmd::Login {
@@ -2113,7 +2886,12 @@ mod tests {
             password: "motdepasse1".into(),
             totp: Some(totp::code(&secret, now + 1)),
             backup: None,
+            device: None,
         });
+        let token = match wait(&c2, |e| matches!(e, Event::DeviceTrusted { .. })) {
+            Event::DeviceTrusted { token, .. } => token,
+            _ => unreachable!(),
+        };
         match wait(&c2, |e| matches!(e, Event::LoggedIn { .. })) {
             Event::LoggedIn { pseudo, totp, .. } => {
                 assert_eq!(pseudo, "Viendax");
@@ -2121,6 +2899,24 @@ mod tests {
             }
             _ => unreachable!(),
         }
+        // Cet appareil est de confiance : plus de code 2FA (un autre jeton n'y suffit pas).
+        let c3 = Client::spawn(addr.clone(), Some(h.public));
+        c3.send(Cmd::Login {
+            pseudo: "viendax".into(),
+            password: "motdepasse1".into(),
+            totp: None,
+            backup: None,
+            device: Some([7; 32]),
+        });
+        wait(&c3, |e| matches!(e, Event::NeedTotp));
+        c3.send(Cmd::Login {
+            pseudo: "viendax".into(),
+            password: "motdepasse1".into(),
+            totp: None,
+            backup: None,
+            device: Some(token),
+        });
+        wait(&c3, |e| matches!(e, Event::LoggedIn { .. }));
         // Le registre se relit et se vérifie (chaîne et signatures).
         let signer = SigningKey::from_bytes(
             &postcard::from_bytes::<Identity>(&std::fs::read(dir.join("relay.key")).unwrap())
@@ -2129,6 +2925,138 @@ mod tests {
         );
         let reg = Registry::open(&dir.join("registry.log"), signer).unwrap();
         assert!(reg.lookup("VIENDAX").is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_real_skin_headers_are_kept() {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(valid_skin(&png));
+        let mut big = png.clone();
+        big[20..24].copy_from_slice(&128u32.to_be_bytes());
+        assert!(!valid_skin(&big), "128 × 128");
+        assert!(!valid_skin(b"GIF89a................................"));
+        let mut huge = png.clone();
+        huge.resize(25 * 1024, 0);
+        assert!(!valid_skin(&huge));
+        // Le nom du fichier ne dépend pas de ce que tape le joueur.
+        let p = skin_path(Path::new("/r"), "../../etc/passwd");
+        assert!(p.starts_with("/r/skins") && !p.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn a_lobby_launches_together_and_stays_together() {
+        let dir = std::env::temp_dir().join(format!("minelib-lobby-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let a = login("Ana");
+        let b = login("Bob");
+        let c = login("Cid");
+        // Ana invite Bob : le lobby existe, Bob reçoit l'invitation et l'accepte.
+        a.send(Cmd::Party {
+            action: proto::PARTY_INVITE,
+            pseudo: "bob".into(),
+        });
+        match wait(&b, |e| matches!(e, Event::PartyInvite(_))) {
+            Event::PartyInvite(from) => assert_eq!(from, "Ana"),
+            _ => unreachable!(),
+        }
+        // Accepter sans invitation : refusé.
+        c.send(Cmd::Party {
+            action: proto::PARTY_ACCEPT,
+            pseudo: "Ana".into(),
+        });
+        assert!(wait_error(&c).contains("expirée"));
+        b.send(Cmd::Party {
+            action: proto::PARTY_ACCEPT,
+            pseudo: "Ana".into(),
+        });
+        let pid = loop {
+            match wait(&b, |e| matches!(e, Event::Party { .. })) {
+                Event::Party { id, members } if members.len() == 2 => {
+                    assert_eq!(members, vec!["Ana".to_string(), "Bob".to_string()]);
+                    break id;
+                }
+                _ => {}
+            }
+        };
+        assert_ne!(pid, 0);
+        // Seule l'hôte du lobby lance ; Bob suit dans la même partie.
+        let search = |p: &Client| {
+            p.send(Cmd::Search {
+                map_sig: [3; 32],
+                map: "dust".into(),
+                players: 10,
+            })
+        };
+        search(&b);
+        assert!(wait_error(&b).contains("hôte du lobby"));
+        search(&a);
+        let room = match wait(&a, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        match wait(&b, |e| matches!(e, Event::PartyGo { .. })) {
+            Event::PartyGo { room: r, map_sig, .. } => {
+                assert_eq!((r, map_sig), (room, [3; 32]));
+            }
+            _ => unreachable!(),
+        }
+        b.send(Cmd::Join(room));
+        wait(&b, |e| matches!(e, Event::Joined { .. }));
+        match wait(&a, |e| matches!(e, Event::PeerJoined { .. })) {
+            Event::PeerJoined { pseudo, party, .. } => {
+                assert_eq!((pseudo.as_str(), party), ("Bob", pid));
+            }
+            _ => unreachable!(),
+        }
+        // Exclusion par l'hôte du lobby : le lobby est dissous (un seul joueur).
+        b.send(Cmd::Party {
+            action: proto::PARTY_KICK,
+            pseudo: "Ana".into(),
+        });
+        assert!(wait_error(&b).contains("hôte du lobby"));
+        a.send(Cmd::Party {
+            action: proto::PARTY_PROMOTE,
+            pseudo: "Bob".into(),
+        });
+        loop {
+            if let Event::Party { members, .. } = wait(&a, |e| matches!(e, Event::Party { .. })) {
+                if members.first().map(String::as_str) == Some("Bob") {
+                    break;
+                }
+            }
+        }
+        b.send(Cmd::Party {
+            action: proto::PARTY_KICK,
+            pseudo: "Ana".into(),
+        });
+        loop {
+            if let Event::Party { id, .. } = wait(&a, |e| matches!(e, Event::Party { .. })) {
+                if id == 0 {
+                    break;
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2184,7 +3112,7 @@ mod tests {
             _ => unreachable!(),
         }
         let peer = match wait(&host, |e| matches!(e, Event::PeerJoined { .. })) {
-            Event::PeerJoined { peer, pseudo } => {
+            Event::PeerJoined { peer, pseudo, .. } => {
                 assert_eq!(pseudo, "Invite");
                 peer
             }
@@ -2251,11 +3179,15 @@ mod tests {
             cl.send(Cmd::Search {
                 map_sig: map,
                 map: "dust".into(),
+                players: 10,
             });
             wait(cl, |e| matches!(e, Event::Hosted(_) | Event::Joined { .. }))
         };
         // Personne : Ana ouvre la partie ; Bob la rejoint.
-        assert!(matches!(search(&a), Event::Hosted(_)));
+        let ana_room = match search(&a) {
+            Event::Hosted(r) => r,
+            e => panic!("{e:?}"),
+        };
         assert!(matches!(search(&b), Event::Joined { .. }));
         // Hors partie, on ne signale personne ; dans la partie, si.
         c.send(Cmd::Report("Ana".into()));
@@ -2274,7 +3206,11 @@ mod tests {
         b.send(Cmd::Leave);
         wait(&b, |e| matches!(e, Event::Left));
         match search(&b) {
-            Event::Joined { host, .. } => assert_eq!(host, "Ana"),
+            // Partie FPS : le nom de l'hôte n'est pas donné, on reconnaît la partie.
+            Event::Joined { room, host, .. } => {
+                assert_eq!(room, ana_room);
+                assert!(host.is_empty(), "anonyme avant le début");
+            }
             e => panic!("{e:?}"),
         }
         b.send(Cmd::Leave);
@@ -2282,10 +3218,7 @@ mod tests {
         b.send(Cmd::Report("ana".into()));
         assert!(wait_error(&b).contains("partie"), "hors partie : refusé");
         match search(&c) {
-            Event::Joined { host, map_sig, .. } => {
-                assert_eq!(map_sig, map);
-                assert!(host == "Ana" || host == "Bob");
-            }
+            Event::Joined { map_sig, .. } => assert_eq!(map_sig, map),
             e => panic!("{e:?}"),
         }
         // Classement et amis.
@@ -2294,7 +3227,7 @@ mod tests {
             add: true,
         });
         match wait(&a, |e| matches!(e, Event::Friends(_))) {
-            Event::Friends(l) => assert_eq!(l, vec!["Cid".to_string()]),
+            Event::Friends(l) => assert_eq!(l, vec![("Cid".to_string(), true)]),
             _ => unreachable!(),
         }
         a.send(Cmd::Leaderboard { friends: true });
@@ -2330,11 +3263,26 @@ mod tests {
         };
         let bytes = pkg.to_bytes();
         let sig = game::signature(&bytes);
+        // Un monde de construction passe par le relais mais n'est pas proposé à tous.
+        let build = game::MapPackage {
+            seed: 3,
+            generator: "flat".into(),
+            ..Default::default()
+        }
+        .to_bytes();
+        c.send(Cmd::UploadMap {
+            sig: game::signature(&build),
+            name: "Ma maison".into(),
+            bytes: build,
+            fps: false,
+        });
+        wait(&c, |e| matches!(e, Event::MapUploaded(_)));
         // Mauvaise signature : refusée.
         c.send(Cmd::UploadMap {
             sig: [0; 32],
             name: "Fausse".into(),
             bytes: bytes.clone(),
+            fps: true,
         });
         assert!(matches!(
             wait(&c, |e| matches!(e, Event::MapFailed(..))),
@@ -2344,6 +3292,7 @@ mod tests {
             sig,
             name: "Plate".into(),
             bytes: bytes.clone(),
+            fps: true,
         });
         wait(&c, |e| matches!(e, Event::MapUploaded(_)));
         c.send(Cmd::Maps);
@@ -2409,6 +3358,7 @@ mod tests {
             password: "motdepasse".into(),
             totp: None,
             backup: None,
+            device: None,
         });
         assert!(wait_error(&again).contains("vie"));
         // Nouveau compte sur la même machine : machine bannie.
@@ -2549,6 +3499,7 @@ mod tests {
             password: "mauvais!!".into(),
             totp: None,
             backup: Some(vault.clone()),
+            device: None,
         });
         assert!(
             wait_error(&c2).contains("incorrect"),
@@ -2559,6 +3510,7 @@ mod tests {
             password: "motdepasse".into(),
             totp: None,
             backup: Some(vault),
+            device: None,
         });
         match wait(&c2, |e| matches!(e, Event::LoggedIn { .. })) {
             Event::LoggedIn { fingerprint, .. } => assert_eq!(fingerprint, fp1),
@@ -2615,9 +3567,11 @@ mod tests {
         p.send(Cmd::Search {
             map_sig: [9; 32],
             map: "dust".into(),
+            players: 10,
         });
         match wait(&p, |e| matches!(e, Event::Joined { .. } | Event::Hosted(_))) {
-            Event::Joined { host, .. } => assert_eq!(host, "Garant", "pas « Novice » (0 partie)"),
+            // Servie par « Garant » (pas « Novice », 0 partie) : il reçoit la tâche.
+            Event::Joined { .. } => {}
             e => panic!("servie par un garant : {e:?}"),
         }
         match wait(&g, |e| matches!(e, Event::GarantTask { .. })) {
@@ -2679,6 +3633,7 @@ mod tests {
                 mvps: 3,
                 score: 50,
                 rounds: 18,
+                teamkills: 0,
             }],
         };
         let matches = |p: &Client| {
@@ -2719,5 +3674,122 @@ mod tests {
             _ => unreachable!(),
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+    /// Un vérificateur accuse l'hôte : un troisième garant, sans lien avec la partie,
+    /// reçoit les pièces gardées par le relais et tranche. Coupable : le vérificateur
+    /// reprend la partie. Innocent : c'est le vérificateur qui est écarté.
+    #[test]
+    fn a_third_garant_arbitrates_between_the_auditor_and_the_host() {
+        for guilty in [true, false] {
+            let dir = std::env::temp_dir().join(format!("minelib-arb-{}", rand::random::<u32>()));
+            {
+                let mut st = stats::Store::open(dir.join("stats")).unwrap();
+                for g in ["Garant", "Verif", "Arbitre"] {
+                    st.get_mut(g).games = 5;
+                    st.save(g);
+                }
+            }
+            let h = start(Config {
+                dir: dir.clone(),
+                bind: "127.0.0.1:0".into(),
+                pow_bits: 4,
+                name: "essai".into(),
+            })
+            .unwrap();
+            let addr = h.addr.to_string();
+            let login = |pseudo: &str| {
+                let c = Client::spawn(addr.clone(), Some(h.public));
+                c.send(Cmd::Register {
+                    pseudo: pseudo.into(),
+                    password: "motdepasse".into(),
+                });
+                let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                    Event::Link(l) => l,
+                    _ => unreachable!(),
+                };
+                wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+                (c, link)
+            };
+            let (g, glink) = login("Garant");
+            g.send(Cmd::GarantAvailable(true));
+            let (p, plink) = login("Joueur");
+            std::thread::sleep(Duration::from_millis(200));
+            p.send(Cmd::Search {
+                map_sig: [9; 32],
+                map: "dust".into(),
+                players: 10,
+            });
+            wait(&p, |e| matches!(e, Event::Joined { .. }));
+            wait(&g, |e| matches!(e, Event::GarantTask { .. }));
+            let (v, _) = login("Verif");
+            v.send(Cmd::GarantAvailable(true));
+            std::thread::sleep(Duration::from_millis(2100));
+            p.send(Cmd::Maps);
+            wait(&v, |e| matches!(e, Event::GarantTask { .. }));
+            let vid = match wait(&g, |e| matches!(e, Event::BackupIs(_))) {
+                Event::BackupIs(id) => id,
+                _ => unreachable!(),
+            };
+            // L'hôte envoie une copie au vérificateur, un joueur tire : le relais garde les deux.
+            transport::push(
+                &glink,
+                &Request::ToPeer {
+                    peer: vid,
+                    data: game::encode(&game::ToPeer::Backup {
+                        part: 0,
+                        of: 1,
+                        data: b"copie de la partie".to_vec(),
+                    }),
+                },
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            let fire = game::encode(&game::ToHost::Buy(7));
+            transport::push(&plink, &Request::ToHost { data: fire.clone() });
+            wait(&v, |e| matches!(e, Event::Witness { .. }));
+            // Le troisième garant arrive ; le vérificateur accuse l'hôte.
+            let (a, _) = login("Arbitre");
+            a.send(Cmd::GarantAvailable(true));
+            std::thread::sleep(Duration::from_millis(300));
+            v.send(Cmd::Conflict {
+                player: 0,
+                seq: 0,
+                host_pos: [0.0; 3],
+                audit_pos: [1.0; 3],
+                proof: true,
+            });
+            let case = match wait(&a, |e| matches!(e, Event::Arbitrate { .. })) {
+                Event::Arbitrate { case, map_sig, .. } => {
+                    assert_eq!(map_sig, [9; 32]);
+                    case
+                }
+                _ => unreachable!(),
+            };
+            match wait(&a, |e| matches!(e, Event::Evidence { .. })) {
+                Event::Evidence { part, of, data, .. } => {
+                    assert_eq!((part, of), (0, 1));
+                    let items: Vec<(Option<u64>, Vec<u8>)> = game::decode(&data).unwrap();
+                    assert_eq!(items[0], (None, b"copie de la partie".to_vec()));
+                    assert!(items[1].0.is_some() && items[1].1 == fire);
+                }
+                _ => unreachable!(),
+            }
+            a.send(Cmd::Verdict { case, guilty });
+            if guilty {
+                wait(&v, |e| matches!(e, Event::Promoted { .. }));
+                wait(&g, |e| matches!(e, Event::RoomClosed));
+                match wait(&p, |e| matches!(e, Event::HostChanged(_))) {
+                    Event::HostChanged(h) => assert_eq!(h, "Verif"),
+                    _ => unreachable!(),
+                }
+            } else {
+                // Accusation à tort : le vérificateur est écarté, l'hôte reste.
+                wait(&v, |e| matches!(e, Event::RoomClosed));
+                std::thread::sleep(Duration::from_millis(200));
+                while let Some(e) = p.poll() {
+                    assert!(!matches!(e, Event::HostChanged(_)), "l'hôte reste");
+                }
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

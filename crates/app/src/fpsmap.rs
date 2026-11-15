@@ -38,6 +38,10 @@ pub fn load(dir: &Path) -> FpsMap {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
+        if k.trim() == "joueurs" {
+            m.max_players = v.trim().parse().unwrap_or(0);
+            continue;
+        }
         let z = parse_zone(v);
         match k.trim() {
             "ct" => m.ct = z,
@@ -63,6 +67,9 @@ pub fn save(dir: &Path, m: &FpsMap) -> Result<()> {
     put("a", &m.sites[0]);
     put("b", &m.sites[1]);
     put("c", &m.sites[2]);
+    if m.max_players != 0 && m.max_players != 10 {
+        s += &format!("joueurs={}\n", m.max_players);
+    }
     fs::write(dir.join(FILE), s)?;
     Ok(())
 }

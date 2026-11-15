@@ -39,6 +39,11 @@ pub struct Garant {
     queue: Vec<Event>,
     ready_sent: bool,
     started_sent: bool,
+    /// Arbitre : numéro de l'affaire, pièces reçues (morceaux), verdict rendu.
+    case: Option<u64>,
+    parts: Vec<Vec<u8>>,
+    evidence: Option<Vec<(Option<u64>, Vec<u8>)>>,
+    pub done: bool,
 }
 
 impl Garant {
@@ -70,7 +75,65 @@ impl Garant {
             queue: Vec::new(),
             ready_sent: false,
             started_sent: false,
+            case: None,
+            parts: Vec::new(),
+            evidence: None,
+            done: false,
         }
+    }
+
+    /// Troisième garant : arbitre de l'affaire `case` (un vérificateur accuse un hôte).
+    /// Il rejoue les pièces gardées par le relais et rend son verdict, puis s'en va.
+    pub fn arbiter(
+        case: u64,
+        sig: [u8; 32],
+        map: String,
+        link: Sender<Inbound>,
+        dir: Option<PathBuf>,
+    ) -> Self {
+        let mut g = Self::new(0, sig, map, Vec::new(), true, link, String::new(), dir);
+        g.case = Some(case);
+        g
+    }
+
+    /// Un morceau des pièces de l'affaire.
+    pub fn evidence(&mut self, case: u64, part: u16, of: u16, data: &[u8]) {
+        if self.case != Some(case) {
+            return;
+        }
+        if part == 0 {
+            self.parts.clear();
+        }
+        if part as usize != self.parts.len() {
+            return;
+        }
+        self.parts.push(data.to_vec());
+        if self.parts.len() == of as usize {
+            let bytes = std::mem::take(&mut self.parts).concat();
+            self.evidence = Some(game::decode(&bytes).unwrap_or_default());
+        }
+    }
+
+    /// Arbitre : dès que la carte et les pièces sont là, rejoue et rend le verdict.
+    fn judge(&mut self) -> Vec<Cmd> {
+        let (Some(case), Some(dir), Some(items)) = (self.case, &self.dir, &self.evidence) else {
+            return Vec::new();
+        };
+        self.done = true;
+        let Ok((_, mut world)) = crate::save::load_world(dir) else {
+            log::warn!("arbitre : carte illisible");
+            return Vec::new();
+        };
+        let guilty = crate::netgame::arbitrate(items, &mut world, ensure_around);
+        log::info!(
+            "arbitre : affaire {case} : {}",
+            if guilty {
+                "l'hôte a triché"
+            } else {
+                "rien à reprocher à l'hôte"
+            }
+        );
+        vec![Cmd::Verdict { case, guilty }]
     }
 
     /// La carte est arrivée (téléchargée).
@@ -124,8 +187,12 @@ impl Garant {
             return;
         };
         let locals = match e {
-            Event::PeerJoined { peer, pseudo } => {
-                net.peer_joined(*peer, pseudo.clone());
+            Event::PeerJoined {
+                peer,
+                pseudo,
+                party,
+            } => {
+                net.peer_joined_party(*peer, pseudo.clone(), *party);
                 Vec::new()
             }
             Event::PeerLeft(peer) => {
@@ -186,6 +253,9 @@ impl Garant {
     /// À chaque image : simulation (hôte) ; commandes à envoyer au relais.
     pub fn update(&mut self, dt: f32) -> Vec<Cmd> {
         let mut cmds = Vec::new();
+        if self.case.is_some() {
+            return if self.done { cmds } else { self.judge() };
+        }
         if self.net.is_none() {
             if self.dir.is_some() {
                 self.start();

@@ -33,6 +33,10 @@ pub struct Chat {
     pub names: Vec<String>,
     /// Complétion en cours : (début tapé, rang de la proposition).
     completing: Option<(String, usize)>,
+    /// Position du curseur dans la saisie (en caractères), et touche tenue qui se répète
+    /// (gauche, droite, effacer) avec son temps.
+    cursor: usize,
+    repeat: Option<(KeyCode, f32)>,
 }
 
 pub const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -55,6 +59,8 @@ impl Default for Chat {
             time: 0.0,
             names: Vec::new(),
             completing: None,
+            cursor: 0,
+            repeat: None,
         }
     }
 }
@@ -79,6 +85,7 @@ impl Chat {
     pub fn close(&mut self) {
         self.open = false;
         self.input.clear();
+        self.cursor = 0;
         self.history_pos = None;
     }
 
@@ -103,6 +110,7 @@ impl Chat {
         };
         self.input = if command { "/".into() } else { String::new() };
         self.input.extend(rest.chars().take(MAX_INPUT));
+        self.cursor = self.input.chars().count();
         self.history_pos = None;
         if input.pressed(KeyCode::Enter) || input.pressed(KeyCode::NumpadEnter) {
             return self.send();
@@ -131,6 +139,7 @@ impl Chat {
         let pick = found[rank % found.len()].clone();
         self.input.truncate(start);
         self.input.push_str(&pick);
+        self.cursor = self.input.chars().count();
         self.completing = Some((typed, rank));
     }
 
@@ -166,17 +175,61 @@ impl Chat {
                     .map(|h| h.4.clone());
             }
         }
+        // Tout se fait à la place du curseur (flèches gauche et droite, Début, Fin).
+        let byte = |s: &str, i: usize| s.char_indices().nth(i).map_or(s.len(), |(b, _)| b);
         for c in input.text.chars() {
             if self.input.chars().count() < MAX_INPUT {
-                self.input.push(c);
+                let at = byte(&self.input, self.cursor);
+                self.input.insert(at, c);
+                self.cursor += 1;
             }
         }
-        if input.pressed(KeyCode::Backspace) {
-            self.input.pop();
+        // Gauche, droite, effacer : une fois, puis à répétition si la touche reste tenue.
+        let mut act = |k: KeyCode| -> bool {
+            if input.pressed(k) {
+                self.repeat = Some((k, -0.4));
+                return true;
+            }
+            match &mut self.repeat {
+                Some((rk, t)) if *rk == k && input.held(k) => {
+                    *t += dt;
+                    if *t >= 0.035 {
+                        *t = 0.0;
+                        return true;
+                    }
+                    false
+                }
+                _ => false,
+            }
+        };
+        let (left, right) = (act(KeyCode::ArrowLeft), act(KeyCode::ArrowRight));
+        let (back, del) = (act(KeyCode::Backspace), act(KeyCode::Delete));
+        let len = self.input.chars().count();
+        self.cursor = self.cursor.min(len);
+        if left {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
+        if right {
+            self.cursor = (self.cursor + 1).min(len);
+        }
+        if input.pressed(KeyCode::Home) {
+            self.cursor = 0;
+        }
+        if input.pressed(KeyCode::End) {
+            self.cursor = len;
+        }
+        if back && self.cursor > 0 {
+            let at = byte(&self.input, self.cursor - 1);
+            self.input.remove(at);
+            self.cursor -= 1;
+        }
+        if del && self.cursor < self.input.chars().count() {
+            let at = byte(&self.input, self.cursor);
+            self.input.remove(at);
         }
         if input.pressed(KeyCode::Tab) {
             self.complete();
-        } else if !input.text.is_empty() || input.pressed(KeyCode::Backspace) {
+        } else if !input.text.is_empty() || back || del {
             self.completing = None;
         }
         if input.pressed(KeyCode::ArrowUp) && !self.history.is_empty() {
@@ -185,6 +238,7 @@ impl Chat {
                 .map_or(self.history.len() - 1, |i| i.saturating_sub(1));
             self.history_pos = Some(i);
             self.input = self.history[i].clone();
+            self.cursor = self.input.chars().count();
         }
         if input.pressed(KeyCode::ArrowDown) {
             if let Some(i) = self.history_pos {
@@ -195,6 +249,7 @@ impl Chat {
                     self.history_pos = None;
                     self.input.clear();
                 }
+                self.cursor = self.input.chars().count();
             }
         }
         if input.pressed(KeyCode::Enter) || input.pressed(KeyCode::NumpadEnter) {
@@ -272,26 +327,27 @@ impl Chat {
                 line_h + 2.0 * s,
                 [0.0, 0.0, 0.0, 0.6],
             );
-            let caret = if (self.time * 2.0).fract() < 0.5 {
-                "_"
-            } else {
-                ""
-            };
-            // Saisie plus longue que la boîte : on montre la fin (là où l'on écrit).
+            // Saisie plus longue que la boîte : on montre la partie autour du curseur.
+            let chars: Vec<char> = self.input.chars().collect();
+            let cur = self.cursor.min(chars.len());
             let room = size.0 - 12.0 * s - Ui::text_width("_", s);
-            let mut shown = self.input.as_str();
-            while Ui::text_width(shown, s) > room {
-                let mut c = shown.chars();
-                c.next();
-                shown = c.as_str();
+            let width =
+                |a: usize, b: usize| Ui::text_width(&chars[a..b].iter().collect::<String>(), s);
+            let mut start = 0;
+            while start < cur && width(start, cur) > room {
+                start += 1;
             }
-            ui.text(
-                x + 2.0 * s,
-                y + 2.0 * s,
-                s,
-                WHITE,
-                format!("{shown}{caret}"),
-            );
+            let mut end = chars.len();
+            while end > cur && width(start, end) > room {
+                end -= 1;
+            }
+            let shown: String = chars[start..end].iter().collect();
+            ui.text(x + 2.0 * s, y + 2.0 * s, s, WHITE, shown);
+            // Curseur : une barre clignotante entre deux lettres.
+            if (self.time * 2.0).fract() < 0.5 {
+                let cx = x + 2.0 * s + width(start, cur);
+                ui.rect(cx, y + 1.0 * s, s.max(1.0), line_h, WHITE);
+            }
         }
     }
 }
@@ -347,6 +403,45 @@ mod tests {
             .iter()
             .all(|l| Ui::text_width(l, s) <= 120.0));
         assert_eq!(wrap("court", s, 120.0), vec!["court".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn arrows_move_the_cursor_and_typing_goes_there() {
+        let mut c = Chat {
+            open: true,
+            ..Default::default()
+        };
+        let mut i = Input::default();
+        i.text = "bonour".into();
+        c.update(&i, 0.016);
+        for _ in 0..3 {
+            i.next_frame();
+            i.press(KeyCode::ArrowLeft);
+            c.update(&i, 0.016);
+        }
+        i.next_frame();
+        i.text = "j".into();
+        c.update(&i, 0.016);
+        assert_eq!(c.input, "bonjour");
+        i.next_frame();
+        i.press(KeyCode::Home);
+        c.update(&i, 0.016);
+        i.next_frame();
+        i.press(KeyCode::Delete);
+        c.update(&i, 0.016);
+        assert_eq!(c.input, "onjour");
+        i.next_frame();
+        i.press(KeyCode::End);
+        c.update(&i, 0.016);
+        i.next_frame();
+        i.press(KeyCode::Backspace);
+        c.update(&i, 0.016);
+        assert_eq!(c.input, "onjou");
     }
 }
 

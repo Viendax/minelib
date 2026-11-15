@@ -115,14 +115,15 @@ impl Ui {
         self.cmds.push(UiCmd::Rect { x, y, w, h, color });
     }
 
-    /// Texte en police 8×8 agrandie `scale` fois, avec ombre portée.
+    /// Texte en police 8×8 agrandie `scale` fois, avec ombre portée (traduit dans la langue
+    /// de l'interface s'il est connu, voir `set_translator`).
     pub fn text(&mut self, x: f32, y: f32, scale: f32, color: [f32; 4], text: impl Into<String>) {
         self.cmds.push(UiCmd::Text {
             x,
             y,
             scale,
             color,
-            text: text.into(),
+            text: translated(text.into()),
             shadow: true,
         });
     }
@@ -141,7 +142,7 @@ impl Ui {
             y,
             scale,
             color,
-            text: text.into(),
+            text: translated(text.into()),
             shadow: false,
         });
     }
@@ -213,7 +214,11 @@ impl Ui {
 
     /// Largeur en pixels d'un texte à l'échelle `scale`.
     pub fn text_width(text: &str, scale: f32) -> f32 {
-        text.chars().count() as f32 * 8.0 * scale
+        let n = match TRANSLATE.get().and_then(|f| f(text)) {
+            Some(t) => t.chars().count(),
+            None => text.chars().count(),
+        };
+        n as f32 * 8.0 * scale
     }
 }
 
@@ -243,6 +248,45 @@ pub(crate) struct OverlayRenderer {
     pub(crate) splits: Vec<(u32, std::ops::Range<u32>)>,
 }
 
+/// Traduction des textes de l'interface (branchée par le jeu ; `None` : texte inchangé).
+static TRANSLATE: std::sync::OnceLock<fn(&str) -> Option<String>> = std::sync::OnceLock::new();
+
+/// Branche la traduction des textes de l'interface (une fois, au démarrage).
+pub fn set_translator(f: fn(&str) -> Option<String>) {
+    let _ = TRANSLATE.set(f);
+}
+
+/// Texte tel que l'interface l'affichera (traduit s'il est connu).
+pub fn tr(text: &str) -> String {
+    translated(text.to_string())
+}
+
+fn translated(text: String) -> String {
+    match TRANSLATE.get().and_then(|f| f(&text)) {
+        Some(t) => t,
+        None => text,
+    }
+}
+
+/// Cases de la police pour « … » et « → » (codes de contrôle inutilisés).
+const ELLIPSIS: u32 = 0x85;
+const ARROW: u32 = 0x86;
+
+/// Case de la police d'un caractère : Latin-1, quelques signes typographiques ramenés à
+/// leur équivalent, « ? » pour le reste.
+fn font_code(ch: char) -> u32 {
+    match ch {
+        '…' => ELLIPSIS,
+        '→' => ARROW,
+        '’' | '‘' => '\'' as u32,
+        '“' | '”' => '"' as u32,
+        '–' | '—' => '-' as u32,
+        '\u{202f}' | '\u{2009}' => ' ' as u32,
+        c if (c as u32) < 256 => c as u32,
+        _ => '?' as u32,
+    }
+}
+
 /// Police 8×8 en niveaux de gris, 128 × 128 (16 × 16 cases).
 pub(crate) fn font_bitmap() -> Vec<u8> {
     use font8x8::legacy::{BASIC_LEGACY, LATIN_LEGACY};
@@ -250,6 +294,9 @@ pub(crate) fn font_bitmap() -> Vec<u8> {
     for code in 0..256u32 {
         let glyph: [u8; 8] = match code {
             SOLID => [0xff; 8],
+            // Cases libres (codes de contrôle) : points de suspension, flèche.
+            ELLIPSIS => [0, 0, 0, 0, 0, 0, 0b0100_1001, 0],
+            ARROW => [0, 0b0000_1000, 0b0001_1000, 0b0011_1111, 0b0001_1000, 0b0000_1000, 0, 0],
             0..=127 => BASIC_LEGACY[code as usize],
             160..=255 => LATIN_LEGACY[(code - 160) as usize],
             _ => [0; 8],
@@ -334,11 +381,7 @@ impl Builder {
     fn text(&mut self, x: f32, y: f32, scale: f32, color: [f32; 4], text: &str, shadow: bool) {
         let g = 8.0 * scale;
         for (k, ch) in text.chars().enumerate() {
-            let code = if (ch as u32) < 256 {
-                ch as u32
-            } else {
-                '?' as u32
-            };
+            let code = font_code(ch);
             if code == ' ' as u32 {
                 continue;
             }

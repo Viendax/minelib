@@ -30,6 +30,8 @@ pub enum Cmd {
         /// Coffre du compte gardé sur ce PC : sur un relais qui ne connaît pas le compte,
         /// il y est réinscrit tel quel (même clé, même pseudo).
         backup: Option<Vec<u8>>,
+        /// Jeton d'appareil de confiance pour ce compte (pas de 2FA).
+        device: Option<[u8; 32]>,
     },
     TotpBegin,
     TotpConfirm(u32),
@@ -51,6 +53,7 @@ pub enum Cmd {
     Search {
         map_sig: [u8; 32],
         map: String,
+        players: u8,
     },
     Report(String),
     Unreport(String),
@@ -71,6 +74,11 @@ pub enum Cmd {
         pseudo: String,
         reason: String,
     },
+    /// Garant arbitre : verdict de l'affaire.
+    Verdict {
+        case: u64,
+        guilty: bool,
+    },
     /// OP du serveur de construction : `proto::SERVER_…`.
     ServerAdmin {
         action: u8,
@@ -85,12 +93,23 @@ pub enum Cmd {
         pseudo: String,
         add: bool,
     },
+    /// Lobby (`proto::PARTY_*`).
+    Party {
+        action: u8,
+        pseudo: String,
+    },
+    /// Envoie son skin (PNG) au relais.
+    SkinPut(Vec<u8>),
+    /// Demande le skin d'un joueur.
+    SkinGet(String),
     Maps,
     /// Envoie une carte au relais (s'il ne l'a pas déjà).
     UploadMap {
         sig: [u8; 32],
         name: String,
         bytes: Vec<u8>,
+        /// Carte de partie FPS en ligne (proposée à tous).
+        fps: bool,
     },
     DownloadMap([u8; 32]),
     Caps(crate::proto::GarantCaps),
@@ -111,6 +130,12 @@ pub enum Event {
         pseudo: String,
         fingerprint: String,
         totp: bool,
+    },
+    /// Cet appareil est de confiance pour ce compte (la 2FA ne sera plus demandée) : jeton
+    /// à garder.
+    DeviceTrusted {
+        pseudo: String,
+        token: [u8; 32],
     },
     /// Le compte demande un code de double authentification.
     NeedTotp,
@@ -137,16 +162,46 @@ pub enum Event {
     Reported(String),
     Unreported(String),
     BanDone(String),
+    /// Garant arbitre : une affaire à juger (les pièces suivent).
+    Arbitrate {
+        case: u64,
+        map_sig: [u8; 32],
+        map: String,
+    },
+    Evidence {
+        case: u64,
+        part: u16,
+        of: u16,
+        data: Vec<u8>,
+    },
     /// Réponse d'une commande d'OP (texte à afficher).
     ServerAdmin(String),
     /// Exclu du serveur (banni), avec la raison.
     Kicked(String),
+    /// Tué par un OP du serveur (`/kill`).
+    Slain(String),
     Leaderboard {
         friends: bool,
         list: Vec<crate::proto::RankEntry>,
         me: Option<crate::proto::RankEntry>,
     },
-    Friends(Vec<String>),
+    /// Amis, et s'ils sont en ligne.
+    Friends(Vec<(String, bool)>),
+    PartyInvite(String),
+    Skin {
+        pseudo: String,
+        png: Vec<u8>,
+    },
+    SkinChanged(String),
+    Party {
+        id: u64,
+        members: Vec<String>,
+    },
+    PartyGo {
+        room: u64,
+        map: String,
+        map_sig: [u8; 32],
+    },
     Maps(Vec<crate::proto::MapEntry>),
     /// Transfert de carte : (signature, fraction faite, envoi ou réception).
     MapProgress([u8; 32], f32, bool),
@@ -168,6 +223,7 @@ pub enum Event {
     PeerJoined {
         peer: u64,
         pseudo: String,
+        party: u64,
     },
     PeerLeft(u64),
     RoomClosed,
@@ -382,7 +438,19 @@ impl Worker {
     /// Message poussé par le relais (parties, données de jeu).
     fn on_push(&mut self, r: Response) {
         let e = match r {
-            Response::PeerJoined { peer, pseudo } => Event::PeerJoined { peer, pseudo },
+            Response::PeerJoined {
+                peer,
+                pseudo,
+                party,
+            } => Event::PeerJoined {
+                peer,
+                pseudo,
+                party,
+            },
+            Response::PartyInvite { from } => Event::PartyInvite(from),
+            Response::SkinChanged { pseudo } => Event::SkinChanged(pseudo),
+            Response::Party { id, members } => Event::Party { id, members },
+            Response::PartyGo { room, map, map_sig } => Event::PartyGo { room, map, map_sig },
             Response::PeerLeft { peer } => Event::PeerLeft(peer),
             Response::RoomClosed => Event::RoomClosed,
             Response::Promoted { members, old_host } => Event::Promoted { members, old_host },
@@ -414,6 +482,19 @@ impl Worker {
             Response::Voice { from, data } => Event::Voice { from, data },
             Response::HostChanged { host } => Event::HostChanged(host),
             Response::Kicked { reason } => Event::Kicked(reason),
+            Response::Slain { by } => Event::Slain(by),
+            Response::Arbitrate { case, map_sig, map } => Event::Arbitrate { case, map_sig, map },
+            Response::Evidence {
+                case,
+                part,
+                of,
+                data,
+            } => Event::Evidence {
+                case,
+                part,
+                of,
+                data,
+            },
             Response::FromPeer { peer, data } => Event::FromPeer { peer, data },
             Response::FromHost { data } => Event::FromHost(data),
             Response::Witness { peer, data } => Event::Witness { peer, data },
@@ -540,20 +621,21 @@ impl Worker {
                     }
                     r => return Err(anyhow!("réponse inattendue : {r:?}")),
                 }
-                self.login(&pseudo, &keys, None)
+                self.login(&pseudo, &keys, None, None)
             }
             Cmd::Login {
                 pseudo,
                 password,
                 totp,
                 backup,
+                device,
             } => {
                 self.chan = None;
                 self.connect()?;
                 self.emit(Event::Progress("Vérification du mot de passe…"));
                 let keys = crypto::derive(&pseudo, &password)?;
                 let wrong = error_text(ErrorCode::WrongCredentials, "");
-                match self.login(&pseudo, &keys, totp) {
+                match self.login(&pseudo, &keys, totp, device) {
                     Err(e) if e.to_string() == wrong && backup.is_some() => {
                         // Compte inconnu de ce relais (nouveau relais) : réinscription avec
                         // le coffre gardé, s'il s'ouvre avec ce mot de passe.
@@ -572,7 +654,7 @@ impl Worker {
                             Response::Registered { .. } => {}
                             r => return self.unexpected(r),
                         }
-                        self.login(&pseudo, &keys, totp)
+                        self.login(&pseudo, &keys, totp, device)
                     }
                     r => r,
                 }
@@ -648,8 +730,16 @@ impl Worker {
                 }
                 r => self.unexpected(r),
             },
-            Cmd::Search { map_sig, map } => {
-                match self.request(&Request::Search { map_sig, map })? {
+            Cmd::Search {
+                map_sig,
+                map,
+                players,
+            } => {
+                match self.request(&Request::Search {
+                    map_sig,
+                    map,
+                    players,
+                })? {
                     Response::Joined {
                         room,
                         host,
@@ -729,6 +819,10 @@ impl Worker {
                 })?;
                 Ok(())
             }
+            Cmd::Verdict { case, guilty } => {
+                self.oneway(&Request::Verdict { case, guilty })?;
+                Ok(())
+            }
             Cmd::Vote {
                 conflict,
                 auditor_right,
@@ -762,12 +856,34 @@ impl Worker {
                 }
             }
             Cmd::Friend { pseudo, add } => match self.request(&Request::Friend { pseudo, add })? {
-                Response::Friends { list } => {
-                    self.emit(Event::Friends(list));
+                Response::Friends { list, online } => {
+                    let both = list
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, p)| (p, online.get(i).copied().unwrap_or(false)))
+                        .collect();
+                    self.emit(Event::Friends(both));
                     Ok(())
                 }
                 r => self.unexpected(r),
             },
+            Cmd::SkinPut(png) => match self.request(&Request::SkinPut { png })? {
+                Response::Done => Ok(()),
+                r => self.unexpected(r),
+            },
+            Cmd::SkinGet(pseudo) => match self.request(&Request::SkinGet { pseudo })? {
+                Response::Skin { pseudo, png } => {
+                    self.emit(Event::Skin { pseudo, png });
+                    Ok(())
+                }
+                r => self.unexpected(r),
+            },
+            Cmd::Party { action, pseudo } => {
+                match self.request(&Request::Party { action, pseudo })? {
+                    Response::Done => Ok(()),
+                    r => self.unexpected(r),
+                }
+            }
             Cmd::Maps => match self.request(&Request::Maps)? {
                 Response::Maps { list } => {
                     self.emit(Event::Maps(list));
@@ -775,7 +891,12 @@ impl Worker {
                 }
                 r => self.unexpected(r),
             },
-            Cmd::UploadMap { sig, name, bytes } => {
+            Cmd::UploadMap {
+                sig,
+                name,
+                bytes,
+                fps,
+            } => {
                 let total = bytes.len() as u64;
                 let mut offset = 0u64;
                 loop {
@@ -787,6 +908,7 @@ impl Worker {
                         offset,
                         total,
                         data,
+                        fps,
                     })? {
                         Response::MapStored { complete: true, .. } => {
                             self.emit(Event::MapUploaded(sig));
@@ -885,16 +1007,35 @@ impl Worker {
         }
     }
 
-    fn login(&mut self, pseudo: &str, keys: &crypto::Keys, totp: Option<u32>) -> Result<()> {
+    fn login(
+        &mut self,
+        pseudo: &str,
+        keys: &crypto::Keys,
+        totp: Option<u32>,
+        device: Option<[u8; 32]>,
+    ) -> Result<()> {
         let hw = crate::hw::fingerprints_for(&self.relay_pub);
         let r = self.request(&Request::Login {
             pseudo: pseudo.to_string(),
             auth: keys.auth,
             totp,
             hw,
+            device,
         })?;
         let (vault, challenge) = match r {
-            Response::Vault { vault, challenge } => (vault, challenge),
+            Response::Vault {
+                vault,
+                challenge,
+                device,
+            } => {
+                if let Some(token) = device {
+                    self.emit(Event::DeviceTrusted {
+                        pseudo: pseudo.to_string(),
+                        token,
+                    });
+                }
+                (vault, challenge)
+            }
             Response::NeedTotp => {
                 self.emit(Event::NeedTotp);
                 return Ok(());

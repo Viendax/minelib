@@ -19,6 +19,8 @@ pub struct NetInput {
     pub duck: bool,
     pub yaw: f32,
     pub pitch: f32,
+    /// Vitesse permise par ce qu'il tient (unités de CS : 250 couteau, 200 AWP…).
+    pub carry: u8,
 }
 
 /// État complet du déplacement d'un joueur (de quoi reprendre la simulation à l'identique).
@@ -32,6 +34,8 @@ pub struct SimState {
     pub duck_speed: f32,
     pub jump_buffer: f32,
     pub sneak_held: bool,
+    /// Vitesse permise par ce qu'il tient (unités de CS).
+    pub carry: u8,
 }
 
 /// Position d'un joueur à un pas (message court) : regard en 65536e de tour, accroupi
@@ -185,6 +189,8 @@ pub struct ScoreRow {
     pub alive: bool,
     pub money: u32,
     pub elo: i32,
+    /// Couleur du joueur dans son équipe (0 à 4).
+    pub color: u8,
 }
 
 /// Résultat d'une partie, envoyé au relais par l'hôte et confirmé par les joueurs.
@@ -210,6 +216,8 @@ pub struct SummaryPlayer {
     pub mvps: u16,
     pub score: i32,
     pub rounds: u8,
+    /// Coéquipiers tués (le facteur de confiance baisse un peu à chacun).
+    pub teamkills: u16,
 }
 
 /// Une boîte de blocs (coins inclus).
@@ -247,6 +255,18 @@ pub struct FpsMap {
     pub ct: Option<Zone>,
     pub t: Option<Zone>,
     pub sites: [Option<Zone>; 3],
+    /// Nombre de joueurs (pair, 2 à 10 ; 0 : 10). Seule la 5 contre 5 est classée.
+    pub max_players: u8,
+}
+
+impl FpsMap {
+    /// Joueurs d'une partie sur cette carte.
+    pub fn players(&self) -> u8 {
+        match self.max_players {
+            n @ 2..=10 => n & !1,
+            _ => 10,
+        }
+    }
 }
 
 /// Une carte complète, telle qu'on la partage : sa signature est l'empreinte de ces
@@ -334,6 +354,8 @@ pub enum ToHost {
     Pickup {
         id: u32,
     },
+    /// Couleur préférée (0 à 4 : vert, jaune, orange, bleu, violet ; 255 : aucune).
+    Color(u8),
 }
 
 /// Fil des éliminations : à travers un mur, à travers une fumée, tireur aveuglé.
@@ -413,6 +435,10 @@ pub enum ToPeer {
         part: u16,
         of: u16,
         data: Vec<u8>,
+    },
+    /// Exclu de la partie par les règles (trois coéquipiers tués).
+    Kicked {
+        reason: String,
     },
     /// Armes au sol (liste complète, à chaque changement).
     Ground {

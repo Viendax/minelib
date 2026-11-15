@@ -9,6 +9,21 @@
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.contains("windows") {
+        // Nom, éditeur et version dans l'exécutable (même numéro que `update::VERSION`).
+        let update = std::fs::read_to_string("src/update.rs").unwrap_or_default();
+        let version = update
+            .lines()
+            .find_map(|l| l.strip_prefix("pub const VERSION: u32 = "))
+            .map(|v| v.trim_end_matches(';').trim().to_string())
+            .unwrap_or_else(|| "0".into());
+        println!("cargo:rerun-if-changed=src/update.rs");
+        println!("cargo:rerun-if-changed=windows/minelib.rc");
+        let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("minelib.rc");
+        let rc = std::fs::read_to_string("windows/minelib.rc").unwrap_or_default();
+        std::fs::write(&out, rc.replace("@V@", &version)).unwrap();
+        if let Err(e) = embed_resource::compile(&out, embed_resource::NONE).manifest_optional() {
+            println!("cargo:warning=informations de l'exécutable absentes : {e}");
+        }
         if target.contains("msvc") {
             println!("cargo:rustc-link-arg-bins=/STACK:67108864");
             println!("cargo:rustc-link-arg-bins=/EXPORT:NvOptimusEnablement,DATA");

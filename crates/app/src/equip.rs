@@ -483,6 +483,28 @@ pub struct Thrown {
     pub owner: u64,
     /// Graine du hasard de l'effet (même fumée chez tout le monde).
     pub seed: u32,
+    /// Leurre : arme dont il imite les tirs (l'arme principale du lanceur).
+    pub voice: Option<usize>,
+}
+
+/// Code réseau d'une grenade : son type (0 à 4), ou pour un leurre qui imite une arme,
+/// 5 + l'arme.
+pub fn nade_net(kind: Nade, voice: Option<usize>) -> u8 {
+    match (kind, voice) {
+        (Nade::Decoy, Some(w)) if w < 200 => 5 + w as u8,
+        _ => kind.index() as u8,
+    }
+}
+
+/// Type et arme imitée d'un code réseau de grenade.
+pub fn nade_from_net(code: u8) -> Option<(Nade, Option<usize>)> {
+    match code {
+        0..=4 => Some((Nade::ALL[code as usize], None)),
+        c if ((c - 5) as usize) < crate::weapons::WEAPONS.len() => {
+            Some((Nade::Decoy, Some((c - 5) as usize)))
+        }
+        _ => None,
+    }
 }
 
 impl Thrown {
@@ -502,6 +524,7 @@ impl Thrown {
             still: 0.0,
             owner,
             seed: bits | 1,
+            voice: None,
         }
     }
 }
@@ -515,7 +538,8 @@ pub enum Effect {
     /// Feu au sol : cases en flammes (dessus des blocs), âge, lanceur.
     Fire(Vec<Vec3>, f32, u64),
     /// Leurre : position, âge, prochain faux tir.
-    Decoy(Vec3, f32, f32),
+    /// Leurre : position, âge, prochain tir, arme imitée.
+    Decoy(Vec3, f32, f32, Option<usize>),
 }
 
 impl Effect {
@@ -524,7 +548,7 @@ impl Effect {
             Effect::Blast(_, a) => *a < 0.6,
             Effect::Smoke(c) => c.age < SMOKE_LIFE,
             Effect::Fire(_, a, _) => *a < 7.0,
-            Effect::Decoy(_, a, _) => *a < 15.0,
+            Effect::Decoy(_, a, _, _) => *a < 15.0,
         }
     }
 }
@@ -665,7 +689,7 @@ pub fn detonate(
             sounds.push((Sfx::Smoke, 0.0, p));
             effects.push(Effect::Smoke(SmokeCloud::new(p, world, rnd)));
         }
-        Nade::Decoy => effects.push(Effect::Decoy(p, 0.0, 0.5)),
+        Nade::Decoy => effects.push(Effect::Decoy(p, 0.0, 0.5, t.voice)),
         Nade::Molotov => {
             sounds.push((Sfx::Molotov, 0.0, p));
             sounds.push((Sfx::Fire, 0.1, p));
@@ -728,11 +752,13 @@ pub fn tick_effects(
                     }
                 }
             }
-            Effect::Decoy(p, a, next) => {
+            Effect::Decoy(p, a, next, voice) => {
                 *a += dt;
                 *next -= dt;
                 if *next <= 0.0 {
-                    sounds.push((Sfx::Decoy, 0.0, *p));
+                    // Les tirs de l'arme principale du lanceur (sinon un pistolet).
+                    let sfx = voice.map_or(Sfx::Decoy, Sfx::Shot);
+                    sounds.push((sfx, 0.0, *p));
                     // Rafales irrégulières de pistolet.
                     *next = 0.15 + rnd().abs() * if rnd() > 0.3 { 0.25 } else { 1.6 };
                 }
@@ -893,6 +919,7 @@ mod tests {
             still: 0.0,
             owner: 0,
             seed: 1,
+            voice: None,
         };
         let mut sounds = Vec::new();
         let mut fired = false;
@@ -921,6 +948,7 @@ mod tests {
                 still: 0.0,
                 owner: 0,
                 seed: 1,
+                voice: None,
             };
             let mut sounds = Vec::new();
             let mut fired = None;
@@ -947,6 +975,7 @@ mod tests {
             still: 0.0,
             owner: 0,
             seed: 1,
+            voice: None,
         };
         let mut rnd = || 0.5;
         let mut hits = Hits::default();
@@ -973,6 +1002,7 @@ mod tests {
             still: 0.0,
             owner: 0,
             seed: 1,
+            voice: None,
         };
         let eye = Vec3::new(8.5, 12.6, 8.5);
         let mut rnd = || 0.5;
@@ -1079,6 +1109,7 @@ mod tests {
             still: 0.0,
             owner: 0,
             seed: 1,
+            voice: None,
         };
         assert!(detonates(&t, &w));
         let mut rnd = || 0.5;

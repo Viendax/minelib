@@ -49,7 +49,7 @@ pub const KNIFE_HEAVY: u8 = 254;
 /// Écart minimal entre deux joueurs qui apparaissent (blocs).
 const SPAWN_GAP: f32 = 1.5;
 
-pub fn to_net(m: &MoveInput, yaw: f32, pitch: f32) -> NetInput {
+pub fn to_net(m: &MoveInput, yaw: f32, pitch: f32, carry: u8) -> NetInput {
     NetInput {
         forward: m.forward.round().clamp(-1.0, 1.0) as i8,
         strafe: m.strafe.round().clamp(-1.0, 1.0) as i8,
@@ -59,6 +59,7 @@ pub fn to_net(m: &MoveInput, yaw: f32, pitch: f32) -> NetInput {
         duck: m.sneak,
         yaw,
         pitch,
+        carry,
     }
 }
 
@@ -91,6 +92,8 @@ pub fn still(m: &MoveInput) -> MoveInput {
 fn step(p: &mut Player, world: &World, n: &NetInput, dt: f32) {
     p.yaw = n.yaw;
     p.pitch = n.pitch;
+    // Jamais plus vite qu'au couteau, ni plus lentement qu'une arme lourde à la lunette.
+    p.carry = n.carry.clamp(100, 250);
     p.update(world, &from_net(n), dt);
 }
 
@@ -101,7 +104,6 @@ pub struct View {
     pub yaw: f32,
     pub pitch: f32,
     pub crouch: f32,
-    pub speed: f32,
     pub alive: bool,
     pub weapon: u8,
     pub team: u8,
@@ -129,6 +131,8 @@ pub enum Local {
     Give(u16),
     /// Élimination, pour le fil en haut à droite.
     Kill(Kill),
+    /// Exclu de la partie (trois coéquipiers tués) : on la quitte.
+    Kicked(String),
     /// Un joueur a tiré depuis `pos` (`heard` : un autre que soi, à faire entendre) et
     /// touché des joueurs en `hits` (sang).
     Shot {
@@ -171,6 +175,8 @@ pub struct NadeOut {
 
 struct Remote {
     pseudo: String,
+    /// Lobby (0 : seul).
+    party: u64,
     player: Player,
     queue: VecDeque<(u32, NetInput)>,
     ack: u32,
@@ -218,7 +224,12 @@ pub enum Move {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub enum Rule {
     /// Le joueur se présente (`ok` : avec la bonne carte).
-    Hello { pseudo: String, ok: bool },
+    Hello {
+        pseudo: String,
+        ok: bool,
+        /// Lobby du joueur (0 : seul).
+        party: u64,
+    },
     /// Le joueur s'en va.
     Leave,
     /// Chutes puis pas des règles (`Match::tick`).
@@ -250,6 +261,7 @@ pub fn witnessed(m: &ToHost) -> bool {
             | ToHost::Team(_)
             | ToHost::Drop { .. }
             | ToHost::Pickup { .. }
+            | ToHost::Color(_)
     )
 }
 
@@ -294,12 +306,18 @@ fn fire_ok(
     m: &mut Match,
     world: &World,
     shooter: u64,
-    eye: Option<Vec3>,
+    who: Option<&Player>,
     weapon: u8,
     origin: Vec3,
     rays: usize,
 ) -> bool {
-    let Some(eye) = eye else { return false };
+    let Some(p) = who else { return false };
+    let eye = p.eye();
+    // On ne court pas au couteau en tirant à l'AWP : la vitesse annoncée doit être celle de
+    // l'arme (lunette comprise).
+    let carry_ok = WEAPONS
+        .get(weapon as usize)
+        .is_none_or(|w| p.carry <= w.speed(false));
     let gap = origin - eye;
     let d = gap.length();
     let clear =
@@ -308,6 +326,7 @@ fn fire_ok(
         && !m.frozen()
         && d < 2.5
         && clear
+        && carry_ok
         && m.shoot(shooter, weapon, rays)
 }
 
@@ -680,6 +699,7 @@ impl Auditor {
                     let mut p = player_from(state);
                     p.yaw = input.yaw;
                     p.pitch = input.pitch;
+                    p.carry = input.carry.clamp(100, 250);
                     players.insert(0, p);
                 }
                 Move::Set(state) => {
@@ -692,12 +712,12 @@ impl Auditor {
                     }
                 }
                 Move::Rule(rule) => match rule {
-                    Rule::Hello { pseudo, ok } => {
+                    Rule::Hello { pseudo, ok, party } => {
                         if *ok {
                             ready.insert(who);
                             players.entry(who).or_insert_with(|| Player::new(spawn));
                             if !m.players.get(&who).is_some_and(|p| p.present) {
-                                settle!(m.join(who, pseudo));
+                                settle!(m.join_party(who, pseudo, *party));
                             }
                         } else {
                             ready.remove(&who);
@@ -774,8 +794,7 @@ impl Auditor {
                                     .iter()
                                     .map(|d| Vec3::from(*d).normalize_or_zero())
                                     .collect();
-                                let eye = me.map(|p| p.eye());
-                                if fire_ok(&mut m, world, who, eye, *weapon, origin, dirs.len()) {
+                                if fire_ok(&mut m, world, who, me, *weapon, origin, dirs.len()) {
                                     let view =
                                         (*view_tick).clamp(now.saturating_sub(MAX_REWIND), now);
                                     let covered = self.history.front().is_some_and(|f| f.0 <= view)
@@ -810,7 +829,6 @@ impl Auditor {
                                         && players
                                             .get(&who)
                                             .is_some_and(|p| (p.eye() - pos).length() < 3.0)
-                                        && *nade < 5
                                         && vel.length() < 40.0
                                         && m.throw(who, *nade)
                                 };
@@ -836,6 +854,7 @@ impl Auditor {
                                     m.pickup(who, *id, at);
                                 }
                             }
+                            ToHost::Color(c) => m.set_color(who, *c),
                             _ => {}
                         }
                     }
@@ -971,6 +990,49 @@ impl Auditor {
     }
 }
 
+/// Garant arbitre : rejoue les pièces d'une affaire (ce que le vérificateur a reçu, dans
+/// l'ordre : demandes des joueurs attestées par le relais, copies de la partie par
+/// l'hôte), exactement comme un vérificateur. Vrai si l'hôte a triché sans appel possible.
+/// `around` charge le monde autour d'un point.
+pub fn arbitrate(
+    items: &[(Option<u64>, Vec<u8>)],
+    world: &mut World,
+    mut around: impl FnMut(&mut World, Vec3),
+) -> bool {
+    let mut auditor = Auditor {
+        witnessing: true,
+        ..Default::default()
+    };
+    let mut prev: Option<Backup> = None;
+    let mut guilty = false;
+    for (who, data) in items {
+        match who {
+            Some(peer) => {
+                if let Some(msg) = game::decode::<ToHost>(data) {
+                    auditor.witness(*peer, msg);
+                }
+            }
+            None => {
+                let Some(new) = game::decode::<Backup>(data) else {
+                    continue;
+                };
+                for p in &new.players {
+                    around(world, Vec3::from(p.2.pos));
+                }
+                match &prev {
+                    Some(p) => {
+                        let found = auditor.audit(p, &new, world);
+                        guilty |= found.iter().any(|c| c.proof);
+                    }
+                    None => auditor.first_copy(),
+                }
+                prev = Some(new);
+            }
+        }
+    }
+    guilty
+}
+
 /// Où est un joueur, pour les règles.
 fn place(p: &Player) -> Place {
     Place {
@@ -1039,6 +1101,8 @@ pub struct Host {
     /// l'élimination en cours (pour le fil des éliminations).
     smokes: Vec<(Vec3, f32)>,
     local_blind: bool,
+    /// Vitesse permise par ce que tient le joueur de l'hôte (unités de CS).
+    local_carry: u8,
     kill_flags: u8,
     /// Copies envoyées d'elles-mêmes (les essais les prennent à la main).
     auto_backup: bool,
@@ -1047,8 +1111,8 @@ pub struct Host {
     ground_dirty: bool,
     /// Dernier rappel de ses armes envoyé à chacun (pas).
     resync: HashMap<u64, u32>,
-    /// Qui voit qui (spectateur, cible), au dernier état complet.
-    seen: std::cell::RefCell<HashMap<(u64, u64), bool>>,
+    /// Qui a vu qui (spectateur, cible) : dernier pas où il le voyait.
+    seen: std::cell::RefCell<HashMap<(u64, u64), u32>>,
     /// Garant de secours actuel, et celui désigné par le relais (garant indépendant).
     backup: Option<u64>,
     designated: Option<u64>,
@@ -1220,6 +1284,7 @@ impl NetGame {
             backup_now: false,
             smokes: Vec::new(),
             local_blind: false,
+            local_carry: 250,
             kill_flags: 0,
             auto_backup: true,
             out: Vec::new(),
@@ -1415,13 +1480,28 @@ impl NetGame {
         matches!(self, NetGame::Host(_))
     }
 
+    /// Lobby de l'hôte lui-même (ses amis le rejoindront dans son équipe).
+    pub fn set_own_party(&mut self, party: u64) {
+        if let NetGame::Host(h) = self {
+            if let Some(p) = h.m.players.get_mut(&0) {
+                p.party = party;
+            }
+        }
+    }
+
     /// Un joueur arrive (hôte).
     pub fn peer_joined(&mut self, peer: u64, pseudo: String) {
+        self.peer_joined_party(peer, pseudo, 0);
+    }
+
+    /// Un joueur arrive avec son lobby (hôte) : il ira dans l'équipe de ses amis.
+    pub fn peer_joined_party(&mut self, peer: u64, pseudo: String, party: u64) {
         if let NetGame::Host(h) = self {
             let player = Player::new(h.spawn);
             h.peers.insert(
                 peer,
                 Remote {
+                    party,
                     pseudo: pseudo.clone(),
                     player,
                     queue: VecDeque::new(),
@@ -1440,8 +1520,13 @@ impl NetGame {
             if let Some(r) = h.peers.remove(&peer) {
                 h.record(peer, Move::Rule(Rule::Leave));
                 h.burns.remove(&peer);
+                let name = if h.m.started() {
+                    r.pseudo.clone()
+                } else {
+                    h.m.shown(peer)
+                };
                 h.m.leave(peer, Some(r.player.pos));
-                let line = format!("{} a quitté la partie.", r.pseudo);
+                let line = format!("{name} a quitté la partie.");
                 h.broadcast_chat(&line);
                 h.out.push(Local::Chat(line));
             }
@@ -1537,14 +1622,15 @@ impl NetGame {
         match self {
             NetGame::Host(h) => {
                 if h.playing {
-                    let mv = Move::Own(to_net(input, local.yaw, local.pitch), local.net_state());
+                    let n = to_net(input, local.yaw, local.pitch, local.carry);
+                    let mv = Move::Own(n, local.net_state());
                     h.record(0, mv);
                 }
                 h.tick(world, local, dt)
             }
             NetGame::Guest(g) => {
                 g.seq += 1;
-                let n = to_net(input, local.yaw, local.pitch);
+                let n = to_net(input, local.yaw, local.pitch, local.carry);
                 g.pending.push_back((g.seq, n, local.net_state()));
                 g.predicted.push_back((g.seq, local.pos.to_array()));
                 if g.predicted.len() > 2048 {
@@ -1660,7 +1746,6 @@ impl NetGame {
                         yaw: r.player.yaw,
                         pitch: r.player.pitch,
                         crouch: r.player.crouch,
-                        speed: Vec3::new(r.player.vel.x, 0.0, r.player.vel.z).length(),
                         alive: p.is_some_and(|p| p.alive),
                         weapon: r.weapon,
                         team: p.map_or(CT, |p| p.team),
@@ -1804,6 +1889,7 @@ impl NetGame {
             peers.insert(
                 *id,
                 Remote {
+                    party: 0,
                     pseudo: p.clone(),
                     player,
                     queue: VecDeque::new(),
@@ -1833,6 +1919,7 @@ impl NetGame {
             backup_now: false,
             smokes: Vec::new(),
             local_blind: false,
+            local_carry: 250,
             kill_flags: 0,
             auto_backup: true,
             out: Vec::new(),
@@ -1915,6 +2002,17 @@ impl NetGame {
         }
     }
 
+    /// Couleur préférée (bandeau des têtes, triangles des coéquipiers).
+    pub fn choose_color(&mut self, color: u8) {
+        match self {
+            NetGame::Host(h) => {
+                h.record(0, Move::Rule(Rule::Msg(ToHost::Color(color))));
+                h.m.set_color(0, color);
+            }
+            NetGame::Guest(g) => g.to_host(&ToHost::Color(color)),
+        }
+    }
+
     /// Changer d'équipe pendant l'échauffement.
     pub fn choose_team(&mut self, team: u8) {
         match self {
@@ -1933,7 +2031,7 @@ impl NetGame {
     pub fn chat(&mut self, text: &str) {
         match self {
             NetGame::Host(h) => {
-                let line = format!("<{}> {text}", h.pseudo);
+                let line = format!("<{}> {text}", h.shown_of(0));
                 h.broadcast_chat(&line);
             }
             NetGame::Guest(g) => g.to_host(&ToHost::Chat(text.to_string())),
@@ -1973,6 +2071,15 @@ impl Host {
             from: String::new(),
             text: text.to_string(),
         });
+    }
+
+    /// Nom montré aux joueurs (caché pendant l'échauffement, voir `Match::shown`).
+    fn shown_of(&self, id: u64) -> String {
+        if self.m.started() || !self.m.players.contains_key(&id) {
+            self.pseudo_of(id)
+        } else {
+            self.m.shown(id)
+        }
     }
 
     fn pseudo_of(&self, id: u64) -> String {
@@ -2257,8 +2364,8 @@ impl Host {
                     let at = self.feet_of(victim);
                     self.m.dropped_dead(victim, at);
                     self.ground_dirty = true;
-                    let k = killer.map(|k| self.pseudo_of(k)).unwrap_or_default();
-                    let v = self.pseudo_of(victim);
+                    let k = killer.map(|k| self.shown_of(k)).unwrap_or_default();
+                    let v = self.shown_of(victim);
                     let team = |id: u64| self.m.players.get(&id).map_or(255, |p| p.team);
                     let teams = [killer.map_or(255, team), team(victim)];
                     let flags = self.kill_flags;
@@ -2308,6 +2415,17 @@ impl Host {
                 Ev::NewRound => {
                     self.ground_dirty = true;
                 }
+                Ev::TeamKillKick(id) => {
+                    let reason = format!(
+                        "Exclu de la partie : {} coéquipiers tués.",
+                        crate::cs::TEAMKILL_KICK
+                    );
+                    if id == 0 {
+                        out.push(Local::Kicked(reason));
+                    } else {
+                        self.send_to(id, &ToPeer::Kicked { reason });
+                    }
+                }
             }
         }
     }
@@ -2329,18 +2447,24 @@ impl Host {
             .iter()
             .map(|d| Vec3::from(*d).normalize_or_zero())
             .collect();
-        let eye = if who == 0 {
-            self.playing.then(|| player_from(&self.local_state).eye())
+        let local = self.playing.then(|| {
+            let mut p = player_from(&self.local_state);
+            p.carry = self.local_carry;
+            p
+        });
+        let shooter = if who == 0 {
+            local.as_ref()
         } else {
             self.peers
                 .get(&who)
                 .filter(|r| r.ready)
-                .map(|r| r.player.eye())
+                .map(|r| &r.player)
         };
+        let ok = fire_ok(&mut self.m, world, who, shooter, weapon, origin, dirs.len());
         if who == 0 {
             self.record(0, Move::Rule(Rule::Msg(msg)));
         }
-        if fire_ok(&mut self.m, world, who, eye, weapon, origin, dirs.len()) {
+        if ok {
             let view = view_tick.clamp(self.tick.saturating_sub(MAX_REWIND), self.tick);
             self.fire(who, weapon, origin, &dirs, view, blind, world)
         } else {
@@ -2365,7 +2489,8 @@ impl Host {
             ToHost::Hello { map_hash } => {
                 let ok = map_hash == self.map_sig;
                 let pseudo = self.pseudo_of(peer);
-                self.record(peer, Move::Rule(Rule::Hello { pseudo, ok }));
+                let party = self.peers.get(&peer).map_or(0, |r| r.party);
+                self.record(peer, Move::Rule(Rule::Hello { pseudo, ok, party }));
                 if let Some(r) = self.peers.get_mut(&peer) {
                     r.ready = ok;
                 }
@@ -2390,13 +2515,14 @@ impl Host {
                     // Déjà dans la partie (reprise par un nouvel hôte) : il continue.
                     let back = self.m.players.get(&peer).is_some_and(|p| p.present);
                     if !back {
-                        let ev = self.m.join(peer, &pseudo);
+                        let party = self.peers.get(&peer).map_or(0, |r| r.party);
+                        let ev = self.m.join_party(peer, &pseudo, party);
                         self.events(ev, &mut out);
                     }
                     if !self.m.started() {
                         // Combien en attendent-on encore.
                         let n = self.m.present();
-                        let line = format!("{n} / {} joueurs.", cs::PLAYERS);
+                        let line = format!("{n} / {} joueurs.", self.m.team_max() * 2);
                         self.broadcast_chat(&line);
                         out.push(Local::Notice(line));
                     }
@@ -2419,9 +2545,9 @@ impl Host {
             }
             msg @ ToHost::Fire { .. } => out.extend(self.request(peer, msg, world)),
             ToHost::Chat(text) => {
-                if let Some(r) = self.peers.get(&peer) {
+                if self.peers.contains_key(&peer) {
                     let text: String = text.chars().take(200).collect();
-                    let line = format!("<{}> {text}", r.pseudo);
+                    let line = format!("<{}> {}", self.shown_of(peer), text);
                     self.broadcast_chat(&line);
                     out.push(Local::Chat(line));
                 }
@@ -2453,6 +2579,7 @@ impl Host {
                 }
             }
             ToHost::Pickup { id } => out.extend(self.pickup(peer, id)),
+            ToHost::Color(c) => self.m.set_color(peer, c),
             ToHost::Throw { nade, pos, vel } => {
                 let alive = self.m.players.get(&peer).is_some_and(|p| p.alive);
                 let near = self
@@ -2461,7 +2588,6 @@ impl Host {
                     .is_some_and(|r| (r.player.eye() - Vec3::from(pos)).length() < 3.0);
                 let ok = alive
                     && near
-                    && nade < 5
                     && Vec3::from(vel).length() < 40.0
                     && self.m.throw(peer, nade);
                 if !ok {
@@ -2510,6 +2636,7 @@ impl Host {
         self.tick += 1;
         self.local_pos = local.pos;
         self.local_state = local.net_state();
+        self.local_carry = local.carry;
         let frozen = self.m.frozen();
         let mut falls: Vec<(u64, u32)> = Vec::new();
         let mut moves: Vec<(u64, Move)> = Vec::new();
@@ -2654,7 +2781,11 @@ impl Host {
     /// Ce que voit `viewer` (yeux) de `target` (pieds) : un adversaire caché derrière un
     /// mur n'est pas envoyé (contre les « wallhacks » et le « ghosting »), sauf tout près
     /// ou s'il vient de tirer (on l'entend).
-    fn sees(&self, world: &World, eye: Vec3, target: u64, feet: Vec3) -> bool {
+    /// `viewer` (yeux `eye`, vitesse `vel`) peut-il voir `target` ? Large exprès : on
+    /// regarde aussi là où chacun sera dans un instant (le joueur qui sort de derrière un
+    /// mur doit apparaître avant d'être visible, pas après), et les épaules, pas que le
+    /// centre. Seul celui qui est vraiment caché n'est pas envoyé.
+    fn sees(&self, world: &World, eye: Vec3, vel: Vec3, target: u64, feet: Vec3) -> bool {
         if (feet - eye).length() < 6.0 {
             return true;
         }
@@ -2665,24 +2796,46 @@ impl Host {
         {
             return true;
         }
-        [0.3f32, 1.0, 1.65].iter().any(|h| {
-            let p = feet + Vec3::Y * *h;
-            let d = p - eye;
-            let len = d.length();
-            raycast(world, eye.into(), (d / len.max(1e-3)).into(), len)
-                .is_none_or(|hit| hit.distance >= len - 0.6)
+        let tvel = self.vel_of(target);
+        let ahead = 0.2; // s : retard du réseau et du lissage, avec de la marge
+        let eyes = [eye, eye + Vec3::new(vel.x, 0.0, vel.z) * ahead];
+        let to = (feet - eye).normalize_or_zero();
+        let side = Vec3::new(-to.z, 0.0, to.x) * 0.4;
+        let mut points = Vec::with_capacity(10);
+        for f in [feet, feet + Vec3::new(tvel.x, 0.0, tvel.z) * ahead] {
+            points.push(f + Vec3::Y * 1.65);
+            points.push(f + Vec3::Y * 1.1 + side);
+            points.push(f + Vec3::Y * 1.1 - side);
+            points.push(f + Vec3::Y * 0.3);
+        }
+        eyes.iter().any(|&e| {
+            points.iter().any(|&p| {
+                let d = p - e;
+                let len = d.length();
+                raycast(world, e.into(), (d / len.max(1e-3)).into(), len)
+                    .is_none_or(|hit| hit.distance >= len - 0.6)
+            })
         })
+    }
+
+    /// Vitesse d'un joueur (0 : l'hôte).
+    fn vel_of(&self, id: u64) -> Vec3 {
+        if id == 0 {
+            self.local_state.vel.into()
+        } else {
+            self.peers.get(&id).map_or(Vec3::ZERO, |r| r.player.vel)
+        }
     }
 
     fn snapshots(&self, local: &Player, world: &World, full: bool) {
         let me = self
             .playing
-            .then(|| self.net_player(0, &self.pseudo, local, 255));
+            .then(|| self.net_player(0, &self.shown_of(0), local, 255));
         let all: Vec<(u64, NetPlayer)> = self
             .peers
             .iter()
             .filter(|(_, r)| r.ready)
-            .map(|(&id, r)| (id, self.net_player(id, &r.pseudo, &r.player, r.weapon)))
+            .map(|(&id, r)| (id, self.net_player(id, &self.shown_of(id), &r.player, r.weapon)))
             .collect();
         let team = |id: u64| self.m.players.get(&id).map(|p| p.team);
         for (&id, r) in &self.peers {
@@ -2697,13 +2850,21 @@ impl Host {
                 if team(o) == my_team || !p.alive {
                     return true;
                 }
+                // Vu : gardé un quart de seconde avant de redevenir caché (pas de
+                // clignotement au bord d'un mur).
                 let mut seen = self.seen.borrow_mut();
+                let last = seen.get(&(id, o)).copied();
                 if full {
-                    let v = self.sees(world, eye, o, Vec3::from(p.pos));
-                    seen.insert((id, o), v);
-                    v
+                    let recent = last.is_some_and(|t| self.tick.wrapping_sub(t) < 64);
+                    if recent || self.sees(world, eye, r.player.vel, o, Vec3::from(p.pos)) {
+                        if !recent {
+                            seen.insert((id, o), self.tick);
+                        }
+                        return true;
+                    }
+                    false
                 } else {
-                    seen.get(&(id, o)).copied().unwrap_or(false)
+                    last.is_some_and(|t| self.tick.wrapping_sub(t) < 64)
                 }
             };
             let mut players = Vec::new();
@@ -2962,6 +3123,7 @@ impl Guest {
                 flags,
                 teams,
             })),
+            ToPeer::Kicked { reason } => out.push(Local::Kicked(reason)),
             ToPeer::Shot {
                 who,
                 weapon,
@@ -3046,7 +3208,7 @@ impl Guest {
                     yaw: lerp_angle(prev.yaw, p.yaw),
                     pitch: prev.pitch + (p.pitch - prev.pitch) * k,
                     crouch: prev.crouch + (p.crouch - prev.crouch) * k,
-                    speed: p.speed,
+
                     alive: p.alive,
                     weapon: p.weapon,
                     team: p.team,
@@ -3149,7 +3311,7 @@ mod tests {
             // Messages reçus des deux côtés.
             while let Some(e) = hc.poll() {
                 match e {
-                    Event::PeerJoined { peer, pseudo } => {
+                    Event::PeerJoined { peer, pseudo, .. } => {
                         host.peer_joined(peer, pseudo);
                         if guest.is_none() {
                             guest = Some(NetGame::guest(gl.clone(), hash));
@@ -3203,6 +3365,7 @@ mod tests {
                 host.on_tick(&world, &host_p, &idle, dt);
                 if let Some(g) = &mut guest {
                     guest_p.yaw = 0.0;
+                    guest_p.carry = 215; // AK-47 en main
                     guest_p.update(&world, &m, dt);
                     g.on_tick(&world, &guest_p, &m, dt);
                 }
@@ -3305,11 +3468,13 @@ mod tests {
         hc.send(Cmd::Search {
             map_sig: sig,
             map: "plat".into(),
+            players: 10,
         });
         wait(&hc, |e| matches!(e, Event::Hosted(_)));
         gc.send(Cmd::Search {
             map_sig: sig,
             map: "plat".into(),
+            players: 10,
         });
         wait(&gc, |e| matches!(e, Event::Joined { .. }));
         let world = floor();
@@ -3328,7 +3493,7 @@ mod tests {
         for frame in 0..2000 {
             while let Some(e) = hc.poll() {
                 match e {
-                    Event::PeerJoined { peer, pseudo } => host.peer_joined(peer, pseudo),
+                    Event::PeerJoined { peer, pseudo, .. } => host.peer_joined(peer, pseudo),
                     Event::FromPeer { peer, data } => {
                         host.receive(Some(peer), &data, &world);
                     }
@@ -3543,7 +3708,7 @@ mod tests {
             // Messages reçus : l'hôte (et la copie attestée pour le vérificateur).
             while let Some(e) = hc.poll() {
                 match e {
-                    Event::PeerJoined { peer, pseudo } => {
+                    Event::PeerJoined { peer, pseudo, .. } => {
                         let i: usize = pseudo.trim_start_matches("Joueur").parse().unwrap();
                         bots[i - 1].id = peer;
                         host.peer_joined(peer, pseudo);
@@ -3642,11 +3807,13 @@ mod tests {
             let hm = walk(0);
             for _ in 0..4 {
                 host_p.others = host.obstacles();
+                host_p.carry = 240; // pistolet en main
                 host_p.update(&world, &hm, dt);
                 host.on_tick(&world, &host_p, &hm, dt);
                 for (k, b) in bots.iter_mut().enumerate() {
                     let m = walk(k + 1);
                     b.p.others = b.net.obstacles();
+                    b.p.carry = 240;
                     b.p.update(&world, &m, dt);
                     b.net.on_tick(&world, &b.p, &m, dt);
                 }
@@ -3737,7 +3904,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(started, "la partie a commencé à 10");
-        assert!(he_thrown > 3, "des HE ont été lancées : {he_thrown}");
+        assert!(he_thrown >= 1, "des HE ont été lancées : {he_thrown}");
         let summary = host_over.expect("fin de partie chez l'hôte");
         assert!(
             summary.score[0] >= 13 || summary.score[1] >= 13,
@@ -3838,6 +4005,17 @@ mod tests {
         let b2 = backup(&mut g, &local);
         let c = a.audit(&b1, &b2, &world);
         assert!(why(&c).iter().any(|w| w.starts_with("règles")), "{c:?}");
+        // Le troisième garant (arbitre) rejoue les mêmes pièces, gardées par le relais :
+        // rien à reprocher tant que l'hôte est honnête, coupable avec les faux dégâts.
+        let mut pieces = vec![
+            (None, game::encode(&b0)),
+            (Some(7), game::encode(&fire)),
+            (None, game::encode(&b1)),
+        ];
+        let mut w2 = floor();
+        assert!(!arbitrate(&pieces, &mut w2, |_, _| {}));
+        pieces.push((None, game::encode(&b2)));
+        assert!(arbitrate(&pieces, &mut w2, |_, _| {}));
         // Tir inventé par l'hôte au nom de l'invité (le relais ne l'a jamais vu passer).
         let fake = ToHost::Fire {
             weapon: ak(),

@@ -312,27 +312,57 @@ pub struct MapRow {
     pub plays: u32,
     /// Départs et sites définis (`/fps set`).
     pub configured: bool,
+    /// Joueurs d'une partie (10 : 5 contre 5, la seule classée).
+    pub players: u8,
+    /// Le relais l'a entière (sinon : en cours d'envoi, pas encore téléchargeable).
+    pub stored: bool,
 }
 
 pub enum FpsAction {
     None,
     Back,
+    /// Mise à jour automatique de la liste des cartes (toutes les 3 s).
+    Poll,
     Refresh,
     /// Onglet du classement : amis (vrai) ou monde.
     Tab(bool),
     Search(usize),
     AddFriend(String),
+    /// Lobby : action (`proto::PARTY_*`) et pseudo visé.
+    Party(u8, String),
+    /// Couleur préférée (255 : aucune).
+    Color(u8),
+}
+
+/// Ce que le panneau du lobby affiche.
+pub struct LobbyView<'a> {
+    pub me: &'a str,
+    /// Amis et s'ils sont en ligne.
+    pub friends: &'a [(String, bool)],
+    /// Membres du lobby (l'hôte d'abord ; vide : seul).
+    pub members: &'a [String],
+    /// Invitations reçues (pseudos).
+    pub invites: &'a [String],
+    /// Couleur préférée (255 : aucune).
+    pub color: u8,
 }
 
 /// État de l'écran FPS gardé entre les images.
 #[derive(Default)]
 pub struct FpsHome {
-    pub friends_tab: bool,
+    /// Onglet du classement : mondial (sinon les amis, par défaut).
+    pub world_tab: bool,
+    /// Recherche d'amis (panneau du lobby).
+    pub search: String,
+    pub search_focus: bool,
+    /// Menu du clic droit sur un membre du lobby (pseudo, position).
+    pub member_menu: Option<(String, f32, f32)>,
+    pub friends_scroll: usize,
     pub scroll: usize,
     pub map_scroll: usize,
     pub selected: Option<usize>,
-    pub friend_field: String,
-    pub friend_focus: bool,
+    /// Dernière mise à jour automatique de la liste des cartes (horloge de l'écran).
+    pub polled: f32,
 }
 
 /// Écran FPS : classement au-dessus, choix de la carte en dessous.
@@ -350,72 +380,44 @@ pub fn fps_screen(
     status: Option<&str>,
     busy: bool,
     time: f32,
+    lobby: LobbyView,
 ) -> FpsAction {
     c.background();
     let s = c.s;
     let ds = (s / 2.0).floor().max(1.0);
-    c.text_center("FPS - compétitif 5 contre 5", 8.0 * s, s * 1.5, WHITE);
-    let w = (c.w - 24.0 * s).min(440.0 * s);
-    let x = (c.w - w) / 2.0;
-    // Onglets du classement.
+    // Panneau du lobby à droite, le reste à gauche.
+    let panel_w = (c.w * 0.26).clamp(120.0 * s, 170.0 * s);
+    let avail = c.w - panel_w - 12.0 * s;
+    let panel_action = lobby_panel(c, input, st, &lobby, avail + 6.0 * s, panel_w, time);
+    let title = "FPS - compétitif 5 contre 5";
+    let tw = Ui::text_width(title, s * 1.5);
+    c.ui.text((avail - tw) / 2.0, 8.0 * s, s * 1.5, WHITE, title);
+    let w = (avail - 16.0 * s).min(440.0 * s);
+    let x = (avail - w) / 2.0;
+    // Onglets du classement : les amis d'abord, le top mondial à droite.
     let tab_y = 24.0 * s;
-    let tab_w = 130.0;
+    let tab_w = 110.0;
+    let friends = c.button("Amis", x + tab_w * s / 2.0, tab_y, tab_w, st.world_tab);
     let world = c.button(
-        "Top 50 mondial",
-        x + tab_w * s / 2.0,
-        tab_y,
-        tab_w,
-        st.friends_tab,
-    );
-    let friends = c.button(
-        "Amis",
+        "Top mondial",
         x + tab_w * s * 1.5 + 4.0 * s,
         tab_y,
         tab_w,
-        !st.friends_tab,
+        !st.world_tab,
     );
-    let mut action = FpsAction::None;
+    let mut action = panel_action;
     if world {
-        st.friends_tab = false;
+        st.world_tab = true;
         st.scroll = 0;
         action = FpsAction::Tab(false);
     } else if friends {
-        st.friends_tab = true;
+        st.world_tab = false;
         st.scroll = 0;
         action = FpsAction::Tab(true);
     }
-    // Ajout d'un ami (onglet amis).
-    if st.friends_tab {
-        let fx = x + w - 90.0 * s;
-        if c.text_field(
-            "",
-            &st.friend_field,
-            "pseudo d'un ami",
-            fx,
-            tab_y,
-            100.0,
-            st.friend_focus,
-            time,
-        ) {
-            st.friend_focus = true;
-        }
-        if st.friend_focus {
-            crate::menu::edit_text(&mut st.friend_field, input, 16);
-        }
-        let add = c.button(
-            "Ajouter",
-            x + w - 18.0 * s,
-            tab_y,
-            34.0,
-            !st.friend_field.is_empty(),
-        );
-        if add || (st.friend_focus && input.pressed(minelib_platform::KeyCode::Enter)) {
-            action = FpsAction::AddFriend(std::mem::take(&mut st.friend_field));
-        }
-    }
     // Classement.
     let list_y = tab_y + 24.0 * s;
-    let list_h = (c.h * 0.42).max(80.0 * s);
+    let list_h = (c.h * 0.28).max(70.0 * s);
     c.frame(x, list_y, w, list_h);
     let cols: [(&str, f32); 9] = [
         ("#", 0.02),
@@ -454,7 +456,7 @@ pub fn fps_screen(
             c.ui.text(x + w * f, y, s, color, v);
         }
     };
-    match board.filter(|b| b.0 == st.friends_tab) {
+    match board.filter(|b| b.0 != st.world_tab) {
         None => {
             let t = "Chargement du classement…";
             c.ui.text(
@@ -467,7 +469,7 @@ pub fn fps_screen(
         }
         Some((_, list, me)) => {
             if list.is_empty() {
-                let t = if st.friends_tab {
+                let t = if !st.world_tab {
                     "Ajoute des amis pour comparer vos statistiques."
                 } else {
                     "Personne n'a encore fini de partie classée."
@@ -514,7 +516,7 @@ pub fn fps_screen(
     let maps_y = my + 10.0 * s;
     let maps_h = (c.h - maps_y - 56.0 * s).max(40.0 * s);
     c.frame(x, maps_y, w, maps_h);
-    let row_h = 24.0 * s;
+    let row_h = 26.0 * s;
     let vis = ((maps_h - 4.0 * s) / row_h).floor().max(1.0) as usize;
     if c.hovered(x, maps_y, w, maps_h) && input.scroll.abs() >= 1.0 && maps.len() > vis {
         let d = -input.scroll.signum() as i32;
@@ -540,6 +542,9 @@ pub fn fps_screen(
         if !m.configured {
             detail += " - départs non réglés";
         }
+        if !m.stored && m.local.is_none() {
+            detail = "en cours d'envoi au relais…".to_string();
+        }
         if m.plays > 0 {
             detail += &format!(" - {} parties", m.plays);
         }
@@ -555,14 +560,29 @@ pub fn fps_screen(
         ) {
             st.selected = Some(k);
         }
-        if m.waiting > 0 {
-            let t = format!("{} en attente", m.waiting);
+        // Joueurs, bien visibles : « 3 / 10 » en attente, ou le format de la carte.
+        let n = m.players.max(2) as u32;
+        let (t, col) = if m.waiting > 0 {
+            (format!("{} / {n}", m.waiting), GOLD)
+        } else {
+            (format!("{} contre {}", n / 2, n / 2), WHITE)
+        };
+        let big = s * 1.5;
+        c.ui.text(
+            x + w - Ui::text_width(&t, big) - 8.0 * s,
+            y + 3.0 * s,
+            big,
+            col,
+            t,
+        );
+        if n != 10 {
+            let r = "hors classement";
             c.ui.text(
-                x + w - Ui::text_width(&t, s) - 8.0 * s,
-                y + 4.0 * s,
-                s,
-                GOLD,
-                t,
+                x + w - Ui::text_width(r, ds) - 8.0 * s,
+                y + 16.0 * s,
+                ds,
+                GREY,
+                r,
             );
         }
     }
@@ -570,19 +590,24 @@ pub fn fps_screen(
         st.selected = None;
     }
     if let Some(t) = status {
-        c.text_center(t, c.h - 60.0 * s, s, GOLD);
+        let t = crate::menu::fit(t, avail - 8.0 * s, s);
+        let tw = Ui::text_width(&t, s);
+        c.ui.text((avail - tw) / 2.0, c.h - 60.0 * s, s, GOLD, t);
     }
     let by = c.h - 48.0 * s;
-    let cx = c.w / 2.0;
-    let half = (180.0 / 2.0 + 3.0) * s;
+    let cx = avail / 2.0;
+    let half = (150.0 / 2.0 + 3.0) * s;
+    // En lobby, seul son hôte lance (pour tout le monde).
+    let leader = lobby.members.first().is_none_or(|m| m.eq_ignore_ascii_case(lobby.me));
+    let label = if leader { "Jouer" } else { "L'hôte lance" };
     let search = c.button(
-        "Rechercher une partie",
+        label,
         cx - half,
         by,
-        180.0,
-        st.selected.is_some() && !busy,
+        150.0,
+        st.selected.is_some() && !busy && leader,
     );
-    let refresh = c.button("Actualiser", cx + half, by, 180.0, true);
+    let refresh = c.button("Actualiser", cx + half, by, 150.0, true);
     let back = c.button("Retour", cx, by + 24.0 * s, 150.0, true);
     if back || input.pressed(minelib_platform::KeyCode::Escape) {
         return FpsAction::Back;
@@ -593,5 +618,246 @@ pub fn fps_screen(
     if refresh {
         return FpsAction::Refresh;
     }
+    if matches!(action, FpsAction::None) && (time - st.polled).abs() > 3.0 {
+        st.polled = time;
+        return FpsAction::Poll;
+    }
     action
+}
+
+/// Couleurs des joueurs (lobby, bandeau des têtes, triangles) : vert, jaune, orange, bleu,
+/// violet.
+pub const PLAYER_COLORS: [[f32; 4]; 5] = [
+    [0.30, 0.85, 0.35, 1.0],
+    [0.95, 0.85, 0.20, 1.0],
+    [0.98, 0.55, 0.15, 1.0],
+    [0.30, 0.60, 1.00, 1.0],
+    [0.70, 0.40, 0.95, 1.0],
+];
+
+/// Panneau du lobby, à droite : recherche d'amis en haut, amis en dessous (clic : inviter),
+/// invitations reçues, et les membres du lobby en bas (clic droit : exclure, promouvoir).
+fn lobby_panel(
+    c: &mut Ctx,
+    input: &minelib_platform::Input,
+    st: &mut FpsHome,
+    v: &LobbyView,
+    x: f32,
+    w: f32,
+    time: f32,
+) -> FpsAction {
+    use crate::menu::fit;
+    use minelib_net::proto;
+    let s = c.s;
+    let ds = (s / 2.0).floor().max(1.0);
+    let mut out = FpsAction::None;
+    let (y0, h) = (8.0 * s, c.h - 16.0 * s);
+    c.frame(x, y0, w, h);
+    let inner = w - 12.0 * s;
+    let lx = x + 6.0 * s;
+    // Recherche : filtre les amis ; « + » ajoute ce pseudo en ami.
+    let field_w = (inner / s - 26.0).max(40.0);
+    let fy = y0 + 16.0 * s;
+    if c.text_field(
+        "Amis",
+        &st.search,
+        "rechercher",
+        lx + field_w * s / 2.0,
+        fy,
+        field_w,
+        st.search_focus,
+        time,
+    ) {
+        st.search_focus = true;
+    } else if c.click && !c.hovered(x, y0, w, h) {
+        st.search_focus = false;
+    }
+    if st.search_focus {
+        crate::menu::edit_text(&mut st.search, input, 16);
+    }
+    let add = c.button(
+        "+",
+        x + w - 6.0 * s - 11.0 * s,
+        fy,
+        22.0,
+        !st.search.trim().is_empty(),
+    );
+    if add || (st.search_focus && input.pressed(minelib_platform::KeyCode::Enter)) {
+        let p = st.search.trim().to_string();
+        if !p.is_empty() {
+            out = FpsAction::AddFriend(p);
+            st.search.clear();
+        }
+    }
+    // Couleur préférée : celle de ses têtes et de son triangle (si personne ne l'a déjà
+    // dans l'équipe).
+    let cy = fy + 24.0 * s;
+    c.ui.text(lx, cy + 2.0 * s, ds, GREY, "Ta couleur");
+    let sq = 9.0 * s;
+    let cx0 = lx + Ui::text_width("Ta couleur", ds) + 4.0 * s;
+    for (k, col) in PLAYER_COLORS.iter().enumerate() {
+        let bx = cx0 + k as f32 * (sq + 2.0 * s);
+        if bx + sq > lx + inner {
+            break;
+        }
+        let chosen = v.color == k as u8;
+        if chosen {
+            c.ui.rect(bx - s, cy - s, sq + 2.0 * s, sq + 2.0 * s, WHITE);
+        }
+        c.ui.rect(bx, cy, sq, sq, *col);
+        if c.hovered(bx, cy, sq, sq) && c.click {
+            out = FpsAction::Color(if chosen { 255 } else { k as u8 });
+        }
+    }
+    let mut y = cy + 14.0 * s;
+    // Invitations reçues.
+    for from in v.invites.iter().take(2) {
+        c.ui.rect(lx, y, inner, 34.0 * s, [0.9, 0.75, 0.2, 0.15]);
+        let t = fit(&format!("{from} t'invite"), inner - 4.0 * s, s);
+        c.ui.text(lx + 3.0 * s, y + 3.0 * s, s, GOLD, t);
+        let bw = (inner / s - 6.0) / 2.0;
+        let ok = c.button("Accepter", lx + bw * s / 2.0 + s, y + 13.0 * s, bw, true);
+        let no = c.button(
+            "Refuser",
+            lx + inner - bw * s / 2.0 - s,
+            y + 13.0 * s,
+            bw,
+            true,
+        );
+        if ok {
+            out = FpsAction::Party(proto::PARTY_ACCEPT, from.clone());
+        } else if no {
+            out = FpsAction::Party(proto::PARTY_DECLINE, from.clone());
+        }
+        y += 38.0 * s;
+    }
+    // Membres du lobby, en bas : 5 places.
+    let slot_h = 14.0 * s;
+    let members_h = 12.0 * s + slot_h * proto::PARTY_MAX as f32 + 24.0 * s;
+    let members_y = y0 + h - members_h;
+    // Amis (en ligne d'abord), filtrés par la recherche.
+    let q = st.search.trim().to_lowercase();
+    let mut list: Vec<&(String, bool)> = v
+        .friends
+        .iter()
+        .filter(|(p, _)| q.is_empty() || p.to_lowercase().contains(&q))
+        .collect();
+    list.sort_by_key(|(p, on)| (!on, p.to_lowercase()));
+    let row = 12.0 * s;
+    let list_h = (members_y - y - 6.0 * s).max(row);
+    let vis = (list_h / row).floor().max(1.0) as usize;
+    if c.hovered(x, y, w, list_h) && input.scroll.abs() >= 1.0 && list.len() > vis {
+        let d = -input.scroll.signum() as i32;
+        st.friends_scroll =
+            (st.friends_scroll as i32 + d).clamp(0, (list.len() - vis) as i32) as usize;
+    }
+    st.friends_scroll = st.friends_scroll.min(list.len().saturating_sub(vis));
+    if list.is_empty() {
+        let t = if v.friends.is_empty() {
+            "Ajoute un ami avec +"
+        } else {
+            "Aucun ami trouvé"
+        };
+        c.ui.text(lx, y + 2.0 * s, ds, GREY, fit(t, inner, ds));
+    }
+    let in_lobby = |p: &str| v.members.iter().any(|m| m.eq_ignore_ascii_case(p));
+    for (i, (p, on)) in list.iter().skip(st.friends_scroll).take(vis).enumerate() {
+        let ry = y + i as f32 * row;
+        let hover = c.hovered(lx, ry, inner, row);
+        let can = *on && !in_lobby(p) && v.members.len() < proto::PARTY_MAX;
+        if hover && can {
+            c.ui.rect(lx, ry, inner, row, [1.0, 1.0, 1.0, 0.08]);
+        }
+        let dot = if *on {
+            [0.3, 0.85, 0.35, 1.0]
+        } else {
+            [0.45, 0.45, 0.45, 1.0]
+        };
+        c.ui.rect(lx + 2.0 * s, ry + 4.0 * s, 4.0 * s, 4.0 * s, dot);
+        let hint = if hover && can { "inviter" } else { "" };
+        let hw = Ui::text_width(hint, ds);
+        let name = fit(p, inner - 12.0 * s - hw, s);
+        c.ui.text(
+            lx + 9.0 * s,
+            ry + 2.0 * s,
+            s,
+            if *on { WHITE } else { GREY },
+            name,
+        );
+        if !hint.is_empty() {
+            c.ui
+                .text(lx + inner - hw - 2.0 * s, ry + 4.0 * s, ds, GOLD, hint);
+        }
+        if hover && can && c.click {
+            out = FpsAction::Party(proto::PARTY_INVITE, p.clone());
+        }
+    }
+    // Lobby.
+    c.ui.rect(lx, members_y - 3.0 * s, inner, s, [1.0, 1.0, 1.0, 0.15]);
+    c.ui.text(lx, members_y, ds, GREY, "Lobby (clic droit : options)");
+    let leader = v.members.first().map(String::as_str);
+    let i_lead = leader.is_none_or(|l| l.eq_ignore_ascii_case(v.me));
+    let shown: Vec<String> = if v.members.is_empty() {
+        vec![v.me.to_string()]
+    } else {
+        v.members.to_vec()
+    };
+    let right = input.mouse_pressed(minelib_platform::Mouse::Right);
+    for (k, col) in PLAYER_COLORS.iter().enumerate().take(proto::PARTY_MAX) {
+        let sy = members_y + 10.0 * s + k as f32 * slot_h;
+        c.ui.rect(lx, sy, inner, slot_h - s, [0.0, 0.0, 0.0, 0.25]);
+        let Some(p) = shown.get(k) else {
+            c.ui.text(lx + 9.0 * s, sy + 3.0 * s, ds, GREY, "place libre");
+            continue;
+        };
+        c.ui
+            .rect(lx + 2.0 * s, sy + 3.0 * s, 4.0 * s, 6.0 * s, *col);
+        let tag = if k == 0 && v.members.len() > 1 {
+            " (hôte)"
+        } else {
+            ""
+        };
+        let t = fit(&format!("{p}{tag}"), inner - 12.0 * s, s);
+        let me = p.eq_ignore_ascii_case(v.me);
+        c.ui.text(
+            lx + 9.0 * s,
+            sy + 2.0 * s,
+            s,
+            if me { GOLD } else { WHITE },
+            t,
+        );
+        if right && c.hovered(lx, sy, inner, slot_h) && i_lead && !me {
+            if let Some((mx, my)) = c.cursor {
+                st.member_menu = Some((p.clone(), mx, my));
+            }
+        }
+    }
+    if v.members.len() > 1 {
+        let ly = members_y + 12.0 * s + slot_h * proto::PARTY_MAX as f32;
+        if c.button("Quitter le lobby", x + w / 2.0, ly, inner / s, true) {
+            out = FpsAction::Party(proto::PARTY_LEAVE, String::new());
+        }
+    }
+    // Menu du clic droit : exclure, promouvoir hôte.
+    if let Some((p, mx, my)) = st.member_menu.clone() {
+        let (mw, mh) = (100.0 * s, 56.0 * s);
+        let mx = mx.min(c.w - mw - 2.0 * s);
+        let my = my.min(c.h - mh - 2.0 * s);
+        c.ui.rect(mx, my, mw, mh, [0.05, 0.05, 0.07, 0.97]);
+        c.ui.text(mx + 4.0 * s, my + 2.0 * s, ds, GREY, fit(&p, mw - 8.0 * s, ds));
+        let kick = c.button("Exclure", mx + mw / 2.0, my + 10.0 * s, 96.0, true);
+        let promote = c.button("Promouvoir hôte", mx + mw / 2.0, my + 33.0 * s, 96.0, true);
+        if kick {
+            out = FpsAction::Party(proto::PARTY_KICK, p);
+            st.member_menu = None;
+        } else if promote {
+            out = FpsAction::Party(proto::PARTY_PROMOTE, p);
+            st.member_menu = None;
+        } else if ((c.click && !c.hovered(mx, my, mw, mh)) || right)
+            && (!right || !c.hovered(lx, members_y, inner, members_h))
+        {
+            st.member_menu = None;
+        }
+    }
+    out
 }

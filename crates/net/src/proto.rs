@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 7;
+pub const PROTOCOL: u32 = 12;
 
 /// Morceau d'une carte transférée (octets).
 pub const MAP_PART: usize = 48 * 1024;
@@ -21,6 +21,8 @@ pub const SERVER_UNBAN: u8 = 1;
 pub const SERVER_OP: u8 = 2;
 pub const SERVER_DEOP: u8 = 3;
 pub const SERVER_LIST: u8 = 4;
+/// Tuer un joueur du serveur (OP).
+pub const SERVER_KILL: u8 = 5;
 
 pub fn valid_pseudo(p: &str) -> bool {
     (3..=16).contains(&p.chars().count())
@@ -59,6 +61,9 @@ pub enum Request {
         totp: Option<u32>,
         /// Empreintes des composants de la machine, salées par la clé du relais (`hw`).
         hw: Vec<[u8; 32]>,
+        /// Jeton d'appareil de confiance (donné à une connexion avec 2FA) : la 2FA n'est
+        /// pas redemandée sur cet appareil.
+        device: Option<[u8; 32]>,
     },
     /// Administrateur du relais : bannit un compte (à vie) et ses machines (3 mois).
     Ban {
@@ -103,6 +108,8 @@ pub enum Request {
     Search {
         map_sig: [u8; 32],
         map: String,
+        /// Joueurs d'une partie sur cette carte (`FpsMap::players`).
+        players: u8,
     },
     /// Signale un joueur de la partie en cours.
     Report {
@@ -132,6 +139,12 @@ pub enum Request {
         conflict: u64,
         auditor_right: bool,
     },
+    /// Garant arbitre : après avoir rejoué les pièces de l'affaire `case`, l'hôte
+    /// a-t-il triché ?
+    Verdict {
+        case: u64,
+        guilty: bool,
+    },
     /// Chat vocal (`voice::VoiceMsg` chiffré) à ces joueurs de la partie (0 = l'hôte en
     /// FPS). Le relais ne peut pas le lire.
     Voice {
@@ -155,6 +168,20 @@ pub enum Request {
         pseudo: String,
         add: bool,
     },
+    /// Lobby (jusqu'à 5 joueurs qui lancent ensemble, dans la même équipe) : voir
+    /// `PARTY_*` ; `pseudo` : l'invité, celui qui invite, ou le membre visé.
+    Party {
+        action: u8,
+        pseudo: String,
+    },
+    /// Son skin (PNG 64 × 64 ou 64 × 32, 24 Ko au plus ; vide : retirer).
+    SkinPut {
+        png: Vec<u8>,
+    },
+    /// Skin d'un joueur.
+    SkinGet {
+        pseudo: String,
+    },
     /// Cartes FPS connues du relais.
     Maps,
     /// Envoi d'une carte au relais, morceau par morceau.
@@ -164,6 +191,8 @@ pub enum Request {
         offset: u64,
         total: u64,
         data: Vec<u8>,
+        /// Carte de partie FPS en ligne (proposée à tous) ; sinon un monde de construction.
+        fps: bool,
     },
     MapGet {
         sig: [u8; 32],
@@ -221,6 +250,7 @@ impl Request {
                 | Request::GarantReady
                 | Request::Conflict { .. }
                 | Request::Vote { .. }
+                | Request::Verdict { .. }
                 | Request::Voice { .. }
                 | Request::ToPeer { .. }
                 | Request::Broadcast { .. }
@@ -294,6 +324,8 @@ pub struct MapEntry {
     pub waiting: u32,
     /// Le relais a la carte complète (téléchargeable).
     pub stored: bool,
+    /// Joueurs d'une partie sur cette carte (10 : 5 contre 5, la seule classée).
+    pub players: u8,
 }
 
 /// Ce qu'un jeu peut offrir comme garant de zones (construction).
@@ -329,6 +361,8 @@ pub enum Response {
     Vault {
         vault: Vec<u8>,
         challenge: [u8; 32],
+        /// Après un code 2FA juste : jeton de cet appareil, désormais de confiance.
+        device: Option<[u8; 32]>,
     },
     Welcome {
         pseudo: String,
@@ -358,6 +392,32 @@ pub enum Response {
     },
     Friends {
         list: Vec<String>,
+        /// En ligne sur ce relais (même ordre que `list`).
+        online: Vec<bool>,
+    },
+    /// Skin d'un joueur (vide : aucun).
+    Skin {
+        pseudo: String,
+        png: Vec<u8>,
+    },
+    /// Poussé : ce joueur de la partie de construction a changé de skin.
+    SkinChanged {
+        pseudo: String,
+    },
+    /// Poussé : invitation dans le lobby de `from`.
+    PartyInvite {
+        from: String,
+    },
+    /// Poussé : son lobby (id 0 et liste vide : plus de lobby). Le premier est l'hôte.
+    Party {
+        id: u64,
+        members: Vec<String>,
+    },
+    /// Poussé : l'hôte du lobby a trouvé une partie, on la rejoint (même équipe).
+    PartyGo {
+        room: u64,
+        map: String,
+        map_sig: [u8; 32],
     },
     Maps {
         list: Vec<MapEntry>,
@@ -391,6 +451,8 @@ pub enum Response {
     PeerJoined {
         peer: u64,
         pseudo: String,
+        /// Lobby du joueur (0 : seul) : les joueurs d'un même lobby jouent ensemble.
+        party: u64,
     },
     PeerLeft {
         peer: u64,
@@ -415,6 +477,22 @@ pub enum Response {
     BackupIs {
         peer: u64,
     },
+    /// À un troisième garant, sans lien avec la partie : le vérificateur accuse l'hôte de
+    /// tricher. Les pièces suivent (`Evidence`) ; il rejoue tout et rend son `Verdict`.
+    Arbitrate {
+        case: u64,
+        map_sig: [u8; 32],
+        map: String,
+    },
+    /// Pièces de l'affaire, gardées par le relais lui-même (ce que le vérificateur a reçu
+    /// de l'hôte et des joueurs, dans l'ordre), en morceaux : `Vec<(Option<u64>, Vec<u8>)>`
+    /// (joueur et sa demande, ou une copie entière de la partie).
+    Evidence {
+        case: u64,
+        part: u16,
+        of: u16,
+        data: Vec<u8>,
+    },
     /// À un joueur : un désaccord le concerne ; juger avec sa propre prédiction.
     Judge {
         conflict: u64,
@@ -434,6 +512,10 @@ pub enum Response {
     /// Exclu de la partie (banni de ce serveur), avec la raison.
     Kicked {
         reason: String,
+    },
+    /// Tué par un OP du serveur (`/kill`).
+    Slain {
+        by: String,
     },
     /// L'hôte est parti : `host` reprend la partie.
     HostChanged {
@@ -464,6 +546,10 @@ impl Response {
         matches!(
             self,
             Response::PeerJoined { .. }
+                | Response::PartyInvite { .. }
+                | Response::Party { .. }
+                | Response::PartyGo { .. }
+                | Response::SkinChanged { .. }
                 | Response::PeerLeft { .. }
                 | Response::RoomClosed
                 | Response::Promoted { .. }
@@ -473,6 +559,9 @@ impl Response {
                 | Response::Voice { .. }
                 | Response::HostChanged { .. }
                 | Response::Kicked { .. }
+                | Response::Slain { .. }
+                | Response::Arbitrate { .. }
+                | Response::Evidence { .. }
                 | Response::FromPeer { .. }
                 | Response::FromHost { .. }
                 | Response::Witness { .. }
@@ -481,6 +570,16 @@ impl Response {
         )
     }
 }
+
+/// Lobby : inviter, accepter, refuser, quitter, exclure, promouvoir hôte.
+pub const PARTY_INVITE: u8 = 0;
+pub const PARTY_ACCEPT: u8 = 1;
+pub const PARTY_DECLINE: u8 = 2;
+pub const PARTY_LEAVE: u8 = 3;
+pub const PARTY_KICK: u8 = 4;
+pub const PARTY_PROMOTE: u8 = 5;
+/// Joueurs au plus dans un lobby.
+pub const PARTY_MAX: usize = 5;
 
 /// Côté d'une zone de garant, en chunks.
 pub const ZONE: i32 = 4;

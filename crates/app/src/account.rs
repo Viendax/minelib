@@ -172,7 +172,13 @@ pub struct Accounts {
     pub game_events: Vec<Event>,
     /// Classement reçu : (amis ?, lignes, sa propre ligne).
     pub leaderboard: Option<(bool, Vec<proto::RankEntry>, Option<proto::RankEntry>)>,
-    pub friends: Vec<String>,
+    /// Amis et s'ils sont en ligne.
+    pub friends: Vec<(String, bool)>,
+    /// Lobby : n° (0 : seul) et membres (l'hôte d'abord) ; invitations reçues.
+    pub party: (u64, Vec<String>),
+    pub invites: Vec<String>,
+    /// Numéro de la dernière liste des cartes reçue du relais.
+    pub maps_rev: u64,
     pub maps: Vec<proto::MapEntry>,
     /// Relais d'un autre PC du réseau local (sa clé n'est pas retenue).
     lan_relay: bool,
@@ -209,6 +215,9 @@ impl Accounts {
             game_events: Vec::new(),
             leaderboard: None,
             friends: Vec::new(),
+            party: (0, Vec::new()),
+            invites: Vec::new(),
+            maps_rev: 0,
             maps: Vec::new(),
             lan_relay: false,
             sent: None,
@@ -251,6 +260,30 @@ impl Accounts {
         Some((pseudo.to_string(), password.to_string()))
     }
 
+    /// Jeton d'appareil de confiance d'un compte (2FA déjà faite sur ce PC), chiffré comme
+    /// la session.
+    fn device_path(&self, pseudo: &str) -> PathBuf {
+        self.relay_dir
+            .with_file_name("comptes")
+            .join(format!("{}.appareil", pseudo.to_lowercase()))
+    }
+
+    fn device(&self, pseudo: &str) -> Option<[u8; 32]> {
+        let sealed = std::fs::read(self.device_path(pseudo)).ok()?;
+        crypto::open(&self.session_key(), &sealed)
+            .ok()?
+            .try_into()
+            .ok()
+    }
+
+    fn keep_device(&self, pseudo: &str, token: &[u8; 32]) {
+        let p = self.device_path(pseudo);
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, crypto::seal(&self.session_key(), token));
+    }
+
     /// Au lancement : reconnecte le compte gardé sur ce PC, s'il y en a un.
     fn auto_login(&mut self) {
         let Some((pseudo, password)) = self.remembered() else {
@@ -259,11 +292,13 @@ impl Accounts {
         let backup = std::fs::read(self.backup_path(&pseudo)).ok();
         self.sent = Some((pseudo.clone(), password.clone()));
         self.pseudo = pseudo.clone();
+        let device = self.device(&pseudo);
         self.send(Cmd::Login {
             pseudo,
             password,
             totp: None,
             backup,
+            device,
         });
         self.busy = None;
     }
@@ -386,6 +421,8 @@ impl Accounts {
                         totp,
                     });
                 }
+                // Code 2FA juste : ce PC est de confiance, la 2FA ne sera plus demandée ici.
+                Event::DeviceTrusted { pseudo, token } => self.keep_device(&pseudo, &token),
                 Event::NeedTotp => {
                     self.busy = None;
                     self.need_totp = true;
@@ -422,6 +459,8 @@ impl Accounts {
                 Event::LoggedOut => {
                     self.busy = None;
                     self.account = None;
+                    self.party = (0, Vec::new());
+                    self.invites.clear();
                 }
                 Event::Error(m) => {
                     self.busy = None;
@@ -449,13 +488,30 @@ impl Accounts {
                 Event::Maps(list) => {
                     self.busy = None;
                     self.maps = list;
+                    self.maps_rev += 1;
+                }
+                Event::Party { id, members } => {
+                    // Dans un lobby : ses invitations deviennent sans objet.
+                    if id != 0 {
+                        self.invites.retain(|p| !members.contains(p));
+                    }
+                    self.party = (id, members);
+                }
+                Event::PartyInvite(from) => {
+                    self.invites.retain(|p| !p.eq_ignore_ascii_case(&from));
+                    self.invites.insert(0, from.clone());
+                    self.invites.truncate(4);
+                    self.game_events.push(Event::PartyInvite(from));
                 }
                 e @ (Event::Hosted(_)
                 | Event::Reported(_)
                 | Event::Unreported(_)
                 | Event::BanDone(_)
                 | Event::ServerAdmin(_)
+                | Event::Arbitrate { .. }
+                | Event::Evidence { .. }
                 | Event::Kicked(_)
+                | Event::Slain(_)
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)
                 | Event::MapDownloaded { .. }
@@ -463,6 +519,9 @@ impl Accounts {
                 | Event::Zones { .. }
                 | Event::FromZone { .. }
                 | Event::Joined { .. }
+                | Event::PartyGo { .. }
+                | Event::Skin { .. }
+                | Event::SkinChanged(_)
                 | Event::Left
                 | Event::PeerJoined { .. }
                 | Event::PeerLeft(_)
@@ -744,11 +803,13 @@ impl Accounts {
                 let totp = self.need_totp.then(|| self.code.parse().unwrap_or(0));
                 let backup = std::fs::read(self.backup_path(&pseudo)).ok();
                 self.sent = Some((pseudo.clone(), password.clone()));
+                let device = self.device(&pseudo);
                 self.send(Cmd::Login {
                     pseudo,
                     password,
                     totp,
                     backup,
+                    device,
                 });
             } else {
                 self.sent = Some((pseudo.clone(), password.clone()));

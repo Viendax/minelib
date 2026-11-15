@@ -1,0 +1,4 @@
+# Exécutables livrés à côté du code : publiés par GitHub (Releases), pas dans le dépôt.
+/target
+/minelib_v*.exe
+/minelib-launcher.exe

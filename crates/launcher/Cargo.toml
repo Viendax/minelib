@@ -1,0 +1,23 @@
+[package]
+name = "minelib-launcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Lanceur de Minelib : télécharge la dernière version du jeu depuis GitHub et la lance"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "minelib-launcher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+winit.workspace = true
+font8x8.workspace = true
+softbuffer = "0.4"
+ureq = { version = "3", features = ["platform-verifier"] }
+sha2 = "0.10"
+serde_json = "1"
+
+[build-dependencies]
+embed-resource = "3"

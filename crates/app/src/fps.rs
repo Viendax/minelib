@@ -384,8 +384,10 @@ impl Fps {
 
     /// Grenade lancée par un autre joueur (simulée ici aussi).
     pub fn add_thrown(&mut self, owner: u64, nade: u8, pos: Vec3, vel: Vec3) {
-        if let Some(&kind) = Nade::ALL.get(nade as usize) {
-            self.thrown.push(Thrown::new(kind, pos, vel, owner));
+        if let Some((kind, voice)) = equip::nade_from_net(nade) {
+            let mut t = Thrown::new(kind, pos, vel, owner);
+            t.voice = voice;
+            self.thrown.push(t);
         }
     }
 
@@ -412,6 +414,18 @@ impl Fps {
     /// Arme en main (indice dans `WEAPONS`), 255 pour le couteau, les grenades ou rien.
     pub fn held_weapon(&self) -> u8 {
         self.active().map_or(255, |g| g.def as u8)
+    }
+
+    /// Vitesse permise par ce qu'on tient (unités de CS : couteau 250, grenade 245,
+    /// sinon la vitesse de l'arme, plus lente à la lunette).
+    pub fn carry(&self) -> u8 {
+        match self.sel {
+            Sel::Knife => 250,
+            Sel::Nade(_) => 245,
+            _ => self
+                .active()
+                .map_or(250, |g| WEAPONS[g.def].speed(self.scoped > 0)),
+        }
     }
 
     fn active(&self) -> Option<&Gun> {
@@ -713,13 +727,32 @@ impl Fps {
                 }
             }
         }
-        // Lâcher : seulement l'arme principale (on garde toujours un pistolet).
-        if c.drop && self.sel == Sel::Primary && self.primary.is_some() {
-            if let Some(g) = self.primary {
-                self.dropped.push(g.def as u8);
+        // Lâcher (G) : l'arme en main, ou une grenade ; jamais le couteau.
+        if c.drop {
+            match self.sel {
+                Sel::Primary | Sel::Secondary => {
+                    let slot = if self.use_primary && self.primary.is_some() {
+                        &mut self.primary
+                    } else {
+                        &mut self.secondary
+                    };
+                    if let Some(g) = slot.take() {
+                        self.dropped.push(g.def as u8);
+                        self.switch(self.primary.is_some());
+                    }
+                }
+                Sel::Nade(n) => {
+                    let i = n.index();
+                    if self.nades[i] > 0 {
+                        self.nades[i] -= 1;
+                        self.dropped.push(minelib_net::game::ITEM_NADE as u8 + i as u8);
+                        if self.nades[i] == 0 {
+                            self.switch(self.primary.is_some());
+                        }
+                    }
+                }
+                Sel::Knife => {}
             }
-            self.primary = None;
-            self.switch(false);
         }
         // Rechargement.
         if let Some(t) = &mut self.reload {
@@ -1074,8 +1107,13 @@ impl Fps {
         let right = Vec3::new(yaw.cos(), 0.0, yaw.sin());
         let pos = eye + look * 0.3 + right * 0.15 - Vec3::Y * 0.1;
         let vel = equip::throw_velocity(look, lob, c.vel);
-        self.thrown.push(Thrown::new(kind, pos, vel, 0));
-        self.throws.push((kind.index() as u8, pos, vel));
+        let mut t = Thrown::new(kind, pos, vel, 0);
+        // Le leurre imite l'arme principale du lanceur.
+        if kind == Nade::Decoy {
+            t.voice = self.primary.or(self.secondary).map(|g| g.def);
+        }
+        self.throws.push((equip::nade_net(kind, t.voice), pos, vel));
+        self.thrown.push(t);
         self.sounds.push((Sfx::Pin, 0.0, 1.0));
         self.sounds.push((Sfx::Throw, 0.05, 1.0));
         self.toss = 1.0;
@@ -1879,13 +1917,19 @@ impl Fps {
 
     /// Colonne et ligne de chaque article : armes par catégorie, et l'équipement (grenades)
     /// sous les armes lourdes, après une ligne de titre.
-    fn buy_grid() -> Vec<(BuyItem, usize, usize)> {
+    /// En ligne, seules les armes de son camp (pas celles de l'adversaire).
+    fn buy_grid(&self) -> Vec<(BuyItem, usize, usize)> {
+        Self::grid_for(self.online.map(|o| o.team))
+    }
+
+    fn grid_for(team: Option<u8>) -> Vec<(BuyItem, usize, usize)> {
         let mut v = Vec::new();
         for (ci, cat) in Category::ALL.into_iter().enumerate() {
             for (k, (i, _)) in WEAPONS
                 .iter()
                 .enumerate()
                 .filter(|(_, d)| d.category == cat)
+                .filter(|(_, d)| team.is_none_or(|t| d.side().is_none_or(|s| s == t)))
                 .enumerate()
             {
                 v.push((BuyItem::Weapon(i), ci, k));
@@ -1952,13 +1996,13 @@ impl Fps {
     }
 
     fn buy_cells_rows() -> usize {
-        Self::buy_grid().iter().map(|c| c.2 + 1).max().unwrap_or(10)
+        Self::grid_for(None).iter().map(|c| c.2 + 1).max().unwrap_or(10)
     }
 
     /// Article du menu d'achat sous le curseur.
-    fn buy_at(size: (f32, f32), x: f32, y: f32) -> Option<BuyItem> {
+    fn buy_at(&self, size: (f32, f32), x: f32, y: f32) -> Option<BuyItem> {
         let (px, py, _, _, s, cw, rh) = Self::buy_layout(size);
-        Self::buy_grid().into_iter().find_map(|(it, ci, k)| {
+        self.buy_grid().into_iter().find_map(|(it, ci, k)| {
             let (bx, by) = (px + 8.0 * s + ci as f32 * cw, py + 28.0 * s + k as f32 * rh);
             (x >= bx && x < bx + cw - 4.0 * s && y >= by && y < by + rh - 2.0 * s).then_some(it)
         })
@@ -1968,7 +2012,7 @@ impl Fps {
     pub fn buy_click(&mut self, size: (f32, f32), cursor: (f32, f32)) {
         // En ligne : la demande part à l'hôte, qui vérifie l'argent et donne l'objet.
         if self.online.is_some() {
-            if let Some(item) = Self::buy_at(size, cursor.0, cursor.1) {
+            if let Some(item) = self.buy_at(size, cursor.0, cursor.1) {
                 if self.buy_state(item).2 {
                     self.requests.push(Self::item_code(item));
                     if matches!(item, BuyItem::Weapon(_)) {
@@ -1979,7 +2023,7 @@ impl Fps {
             }
             return;
         }
-        match Self::buy_at(size, cursor.0, cursor.1) {
+        match self.buy_at(size, cursor.0, cursor.1) {
             // Solo : prix affiché, mais rien n'est débité (le solde reste à 0).
             Some(BuyItem::Weapon(i)) => {
                 self.buy(i);
@@ -2027,13 +2071,13 @@ impl Fps {
             col([120, 220, 120], 1.0),
             solde,
         );
-        let hover = cursor.and_then(|(x, y)| Self::buy_at(size, x, y));
+        let hover = cursor.and_then(|(x, y)| self.buy_at(size, x, y));
         for (ci, cat) in Category::ALL.into_iter().enumerate() {
             let x = px + 8.0 * s + ci as f32 * cw;
             ui.text(x, py + 19.0 * s, s, col([200, 170, 90], 1.0), cat.label());
         }
         // Titre de l'équipement, sous les armes lourdes.
-        if let Some((_, ci, k)) = Self::buy_grid()
+        if let Some((_, ci, k)) = self.buy_grid()
             .into_iter()
             .find(|c| matches!(c.0, BuyItem::Nade(_)))
         {
@@ -2042,7 +2086,7 @@ impl Fps {
             let t = format!("Équipement ({} / {})", self.nade_count(), equip::MAX_NADES);
             ui.text(x, y + 7.0 * s, s, col([200, 170, 90], 1.0), t);
         }
-        for (item, ci, k) in Self::buy_grid() {
+        for (item, ci, k) in self.buy_grid() {
             let x = px + 8.0 * s + ci as f32 * cw;
             let y = py + 28.0 * s + k as f32 * rh;
             let (price, owned, enabled) = self.buy_state(item);
@@ -2289,7 +2333,7 @@ mod tests {
         let mut spot = None;
         'search: for y in (0..720).step_by(4) {
             for x in (0..1280).step_by(4) {
-                if Fps::buy_at(size, x as f32, y as f32) == Some(BuyItem::Weapon(ak)) {
+                if f.buy_at(size, x as f32, y as f32) == Some(BuyItem::Weapon(ak)) {
                     spot = Some((x as f32, y as f32));
                     break 'search;
                 }

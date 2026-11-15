@@ -20,7 +20,17 @@ jobs:
   release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # Récupération du code sans module extérieur (même `actions/checkout` peut être
+      # refusé par les réglages du dépôt, ce qui empêche le travail de démarrer).
+      - name: Code
+        shell: bash
+        run: |
+          git init -q .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch -q --depth 1 origin "${{ github.sha }}"
+          git checkout -q FETCH_HEAD
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Numéro de version
         id: v
@@ -28,7 +38,7 @@ jobs:
         run: |
           n=$(grep -oE 'pub const VERSION: u32 = [0-9]+' crates/app/src/update.rs | grep -oE '[0-9]+$')
           echo "n=$n" >> "$GITHUB_OUTPUT"
-          if gh release view "v$n" >/dev/null 2>&1; then
+          if gh release view "v$n" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "exists=1" >> "$GITHUB_OUTPUT"
           else
             echo "exists=0" >> "$GITHUB_OUTPUT"
@@ -36,13 +46,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # Rust est déjà installé sur les machines de GitHub (pas de module extérieur, que
+      # les réglages du dépôt peuvent refuser).
       - name: Rust
         if: steps.v.outputs.exists == '0'
-        uses: dtolnay/rust-toolchain@stable
+        shell: bash
+        run: rustup toolchain install stable --profile minimal && rustup default stable
 
       - name: Compilation
         if: steps.v.outputs.exists == '0'
-        run: cargo build --release -p minelib -p minelib-relay
+        run: cargo build --release -p minelib -p minelib-relay -p minelib-launcher
 
       - name: Publication
         if: steps.v.outputs.exists == '0'
@@ -51,7 +64,16 @@ jobs:
           n=${{ steps.v.outputs.n }}
           cp target/release/minelib.exe "minelib_v$n.exe"
           cp target/release/minelib-relay.exe "minelib-relay_v$n.exe"
-          gh release create "v$n" "minelib_v$n.exe" "minelib-relay_v$n.exe" \
+          # Le lanceur garde toujours le même nom : le lien « dernière version » ne change
+          # jamais (releases/latest/download/minelib-launcher.exe).
+          cp target/release/minelib-launcher.exe "minelib-launcher.exe"
+          # Empreintes SHA-256 : le jeu vérifie ce qu'il télécharge, et se compare à la
+          # version officielle.
+          sha256sum "minelib_v$n.exe" | cut -d' ' -f1 > "minelib_v$n.exe.sha256"
+          sha256sum "minelib-relay_v$n.exe" | cut -d' ' -f1 > "minelib-relay_v$n.exe.sha256"
+          gh release create "v$n" "minelib-launcher.exe" "minelib_v$n.exe" "minelib-relay_v$n.exe" \
+            "minelib_v$n.exe.sha256" "minelib-relay_v$n.exe.sha256" \
+            --repo "${{ github.repository }}" \
             --title "Minelib v$n" --notes "Version $n (publiée automatiquement)." --latest
         env:
           GH_TOKEN: ${{ github.token }}

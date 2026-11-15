@@ -82,6 +82,8 @@ pub struct Session {
     pub game_over: Option<(minelib_net::game::MatchSummary, f32)>,
     /// Bandeau de fin de manche (texte, couleur, temps restant).
     banner: Option<(String, [f32; 4], f32)>,
+    /// Exclu de la partie (raison) : le jeu la quitte.
+    pub kicked: Option<String>,
     /// Fil des éliminations (en haut à droite) : élimination, âge (s).
     feed: Vec<(crate::netgame::Kill, f32)>,
     /// Demandes pour le relais : signaler, amis.
@@ -120,6 +122,16 @@ pub struct Session {
     pub fov: f32,
     /// Sensibilité de la souris (valeur Counter-Strike).
     pub sensitivity: f32,
+    /// Sensibilité en mode FPS (réglée à part).
+    pub sensitivity_fps: f32,
+    /// Skins : le sien et ceux des autres joueurs.
+    pub skins: crate::skin::Skins,
+    /// Minimap du mode FPS (sites chargés une fois).
+    radar: crate::radar::Radar,
+    radar_map: bool,
+    /// Couleur préférée en FPS (255 : aucune) et dernière envoyée à l'hôte.
+    pub fps_color: u8,
+    color_sent: Option<u8>,
     /// Volume général des sons (0..1).
     pub volume: f32,
     /// Touches choisies dans « Régler les touches ».
@@ -152,6 +164,9 @@ pub struct Session {
     perspective: u8,
     /// Marche du modèle du joueur : phase (radians) et ampleur 0..1.
     walk_phase: f32,
+    /// Marche des autres joueurs (par pseudo) : comme la sienne en F5, calculée sur leur
+    /// déplacement affiché (fluide, quel que soit le rythme des messages).
+    walks: HashMap<String, Walk>,
     walk_amp: f32,
     /// Portes et trappes ouvertes pendant la partie : bloc fermé d'origine (pour refermer).
     opened: HashMap<[i32; 3], BlockId>,
@@ -256,6 +271,7 @@ impl Session {
             game_over: None,
             banner: None,
             feed: Vec::new(),
+            kicked: None,
             relay_cmds: Vec::new(),
             build: None,
             fps_avg: 0.0,
@@ -283,6 +299,12 @@ impl Session {
             place_cooldown: 0.0,
             fov: FOV,
             sensitivity: minelib_assets::DEFAULT_SENSITIVITY,
+            sensitivity_fps: minelib_assets::DEFAULT_SENSITIVITY,
+            fps_color: 255,
+            color_sent: None,
+            radar: crate::radar::Radar::default(),
+            skins: crate::skin::Skins::default(),
+            radar_map: false,
             volume: 0.6,
             keys: Bindings::default(),
             autosave: AUTOSAVE_S,
@@ -302,6 +324,7 @@ impl Session {
             hand_light: [1.0; 3],
             perspective: 0,
             walk_phase: 0.0,
+            walks: HashMap::new(),
             walk_amp: 0.0,
             opened: HashMap::new(),
             vox_origin: None,
@@ -372,6 +395,22 @@ impl Session {
         use minelib_render::perf;
         let logic = perf::scope("jeu : logique et physique");
         crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
+        // Minimap : grille autour du joueur, sites de la carte.
+        if self.net.is_some() {
+            if !self.radar_map {
+                self.radar.set_map(&crate::fpsmap::load(&self.dir));
+                self.radar_map = true;
+            }
+            self.radar.update(&self.world, self.player.pos);
+        }
+        // Couleur préférée : envoyée une fois qu'on est dans la partie.
+        if let Some(n) = &mut self.net {
+            let me = n.me();
+            if self.color_sent != Some(self.fps_color) && n.rows().iter().any(|r| r.id == me) {
+                n.choose_color(self.fps_color);
+                self.color_sent = Some(self.fps_color);
+            }
+        }
         // Menu, pause ou souris libre : le clic qui fait reprendre ne tire pas.
         if !active || !input.grabbed {
             self.fps.block_fire();
@@ -450,7 +489,12 @@ impl Session {
                 } else {
                     self.fov
                 };
-                let k = (CS_DEGREES_PER_COUNT * self.sensitivity).to_radians() * (fov / FOV);
+                let sens = if fps_mode {
+                    self.sensitivity_fps
+                } else {
+                    self.sensitivity
+                };
+                let k = (CS_DEGREES_PER_COUNT * sens).to_radians() * (fov / FOV);
                 self.player.rotate(dx as f32 * k, dy as f32 * k);
             }
             // Mode FPS : touches de l'onglet FPS ; marcher et s'accroupir peuvent basculer.
@@ -658,8 +702,22 @@ impl Session {
                 && (self.keys.pressed(input, Action::Attack)
                     || self.keys.pressed(input, Action::Use));
             self.hand.update(dt, speed, swung, held);
-            // Balancement des bras et des jambes du modèle (vue F5).
+            // Balancement des bras et des jambes du modèle (vue F5), et des autres joueurs.
             self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
+            let mut seen: Vec<(String, Vec3)> = Vec::new();
+            if let Some(n) = &self.net {
+                seen.extend(n.views().iter().map(|v| (v.pseudo.clone(), v.pos)));
+            }
+            if let Some(b) = &self.build {
+                seen.extend(b.others.values().map(|o| (o.pseudo.clone(), o.pos)));
+            }
+            self.walks.retain(|k, _| seen.iter().any(|s| &s.0 == k));
+            for (name, pos) in seen {
+                self.walks
+                    .entry(name)
+                    .or_insert_with(|| Walk::new(pos))
+                    .update(pos, dt);
+            }
             let target = (speed / 4.3).min(1.0);
             self.walk_amp += (target - self.walk_amp) * (dt * 10.0).min(1.0);
             self.hand_light = self.light_at_player(held);
@@ -914,6 +972,22 @@ impl Session {
                     return;
                 }
             }
+            // Escaliers : le bas tourné vers soi ; à l'envers au plafond ou sur la moitié
+            // haute d'un mur (comme dans Minecraft).
+            if let Some(Item::Block(b)) = self.inventory.selected_item() {
+                let point = self.player.eye() + self.player.look_dir() * hit.distance;
+                if let Some(id) = stairs_placement(&hit, b, self.player.look_dir(), point) {
+                    let [x, y, z] = hit.adjacent();
+                    if !self.world.get(x, y, z).is_targetable()
+                        && !self.player.overlaps_block([x, y, z])
+                    {
+                        self.dirty.extend(self.world.set(x, y, z, id));
+                        self.use_selected();
+                    }
+                    self.place_cooldown = 0.22;
+                    return;
+                }
+            }
             // Dalles : orientation selon la face visée, et deux dalles du même matériau dans
             // une case font un bloc complet (comme dans Minecraft).
             if let Some(Item::Block(b)) = self.inventory.selected_item() {
@@ -1158,6 +1232,8 @@ impl Session {
             self.prev_crouch = self.player.crouch;
             let mut mt = *m;
             mt.jump_pressed = std::mem::take(&mut self.pending_jump);
+            // Mode FPS : on court moins vite avec une arme lourde (comme dans CS).
+            self.player.carry = if self.game.mode == GameMode::Fps { self.fps.carry() } else { 250 };
             // En ligne (FPS) : les autres joueurs sont solides.
             self.player.others = self.net.as_ref().map_or_else(Vec::new, |n| n.obstacles());
             self.player.update(&self.world, &mt, SIM_TICK);
@@ -1284,22 +1360,16 @@ impl Session {
         }
         if let Some(b) = &mut self.build {
             match e {
-                Event::Promoted { .. } => {
-                    b.set_owner();
-                    self.chat.say(
-                        "Le propriétaire du monde est parti : tu le deviens (le monde sera \
-                         enregistré chez toi en quittant).",
-                        chat::YELLOW,
-                    );
-                }
-                Event::HostChanged(host) => self.chat.say(
-                    format!("Le propriétaire est parti : {host} garde le monde."),
-                    chat::YELLOW,
-                ),
+                // Le fonctionnement côté serveur (propriétaire, zones) ne s'affiche pas.
+                Event::Promoted { .. } => b.set_owner(),
+                Event::HostChanged(host) => log::info!("monde gardé par {host}"),
                 Event::Zones { gained, lost } => {
-                    if let Some(t) = b.zones_changed(gained, lost) {
-                        self.chat.say(t, chat::GREY);
-                    }
+                    let _ = b.zones_changed(gained, lost);
+                }
+                // Un OP du serveur a tué ce joueur (/kill).
+                Event::Slain(by) => {
+                    self.chat.say(format!("Tué par {by} (/kill)."), chat::RED);
+                    self.die();
                 }
                 Event::FromZone { peer, chunk, data } => {
                     let dirty = b.receive(*peer, *chunk, data, &mut self.world);
@@ -1373,8 +1443,12 @@ impl Session {
             _ => {}
         }
         let locals = match e {
-            Event::PeerJoined { peer, pseudo } => {
-                n.peer_joined(*peer, pseudo.clone());
+            Event::PeerJoined {
+                peer,
+                pseudo,
+                party,
+            } => {
+                n.peer_joined_party(*peer, pseudo.clone(), *party);
                 Vec::new()
             }
             Event::PeerLeft(peer) => {
@@ -1422,6 +1496,9 @@ impl Session {
                 Local::Notice(t) => self.chat.say(t, chat::YELLOW),
                 Local::Hit { head } => self.fps.hit_marker = (0.25, head),
                 Local::Give(item) => self.fps.give(item),
+                Local::Kicked(reason) => {
+                    self.kicked = Some(reason);
+                }
                 Local::Kill(k) => {
                     self.feed.push((k, 0.0));
                     if self.feed.len() > 6 {
@@ -1678,6 +1755,32 @@ impl Session {
                     .push(minelib_net::client::Cmd::Report(target.to_string()));
                 true
             }
+            // Se tuer (n'importe où hors partie FPS), ou tuer un joueur du serveur (OP).
+            "kill" | "tuer" => {
+                if self.net.is_some() {
+                    self.chat
+                        .say("/kill n'existe pas en partie FPS.", chat::RED);
+                    return true;
+                }
+                match words.get(1) {
+                    None => {
+                        self.game.health = 0;
+                        self.die();
+                    }
+                    Some(_) if self.build.is_none() => {
+                        self.chat.say(
+                            "Tuer un autre joueur : seulement sur un serveur en ligne (OP).",
+                            chat::RED,
+                        );
+                    }
+                    Some(target) => self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                        action: minelib_net::proto::SERVER_KILL,
+                        pseudo: target.to_string(),
+                        reason: String::new(),
+                    }),
+                }
+                true
+            }
             // OP d'un serveur de construction (le créateur l'est d'office).
             "ban" | "bannir" | "unban" | "debannir" | "débannir" | "op" | "deop" => {
                 use minelib_net::proto;
@@ -1745,13 +1848,22 @@ impl Session {
                     .push(minelib_net::client::Cmd::Unreport(target.to_string()));
                 true
             }
-            "ami" | "amis" | "friend" => {
-                let (pseudo, add) = match (words.get(1), words.get(2)) {
-                    (Some(&"retirer") | Some(&"remove"), Some(p)) => (p.to_string(), false),
-                    (Some(&"ajouter") | Some(&"add"), Some(p)) => (p.to_string(), true),
-                    (Some(p), None) => (p.to_string(), true),
-                    _ => (String::new(), true),
+            "ami" | "amis" | "friend" | "friends" => {
+                // Dans n'importe quel ordre : /ami add Bob, /ami Bob add, /friend Bob.
+                let verb = |w: &str| {
+                    let w = w.to_lowercase();
+                    match w.as_str() {
+                        "retirer" | "remove" | "enlever" | "del" => Some(false),
+                        "ajouter" | "add" => Some(true),
+                        _ => None,
+                    }
                 };
+                let rest = &words[1..];
+                let add = rest.iter().find_map(|w| verb(w)).unwrap_or(true);
+                let pseudo = rest
+                    .iter()
+                    .find(|w| verb(w).is_none())
+                    .map_or(String::new(), |p| p.to_string());
                 self.relay_cmds
                     .push(minelib_net::client::Cmd::Friend { pseudo, add });
                 true
@@ -1784,8 +1896,9 @@ impl Session {
     /// `/fps clear …`, `/fps info`.
     fn fps_command(&mut self, args: &[&str]) {
         use minelib_net::game::Zone;
-        const USAGE: &str = "Usage : /fps set ct spawn | t spawn | a site | b site | c site \
-                             (sélection à la baguette), /fps clear …, /fps info";
+        const USAGE: &str = "Usage : /fps set spawn ct | spawn t | site a | site b | site c \
+                             (sélection à la baguette), /fps set maxplayer 2-10, /fps clear …, \
+                             /fps info";
         if self.net.is_some() {
             self.chat.say(
                 "Les réglages de carte se font hors partie en ligne.",
@@ -1796,12 +1909,19 @@ impl Session {
         let mut map = crate::fpsmap::load(&self.dir);
         let lower: Vec<String> = args.iter().map(|a| a.to_lowercase()).collect();
         let what = |l: &[String]| -> Option<usize> {
-            match (l.first().map(String::as_str), l.get(1).map(String::as_str)) {
-                (Some("ct"), Some("spawn")) => Some(0),
-                (Some("t"), Some("spawn")) => Some(1),
-                (Some("a"), Some("site")) => Some(2),
-                (Some("b"), Some("site")) => Some(3),
-                (Some("c"), Some("site")) => Some(4),
+            // Dans les deux ordres : « spawn ct » ou « ct spawn », « site a » ou « a site ».
+            let pair = (l.first().map(String::as_str), l.get(1).map(String::as_str));
+            let (a, b) = match pair {
+                (Some(x @ ("spawn" | "site" | "depart" | "départ")), Some(y)) => (y, x),
+                (Some(y), Some(x)) => (y, x),
+                _ => return None,
+            };
+            match (a, b) {
+                ("ct", "spawn" | "depart" | "départ") => Some(0),
+                ("t", "spawn" | "depart" | "départ") => Some(1),
+                ("a", "site") => Some(2),
+                ("b", "site") => Some(3),
+                ("c", "site") => Some(4),
                 _ => None,
             }
         };
@@ -1816,6 +1936,42 @@ impl Session {
                 1 => &mut map.t,
                 k => &mut map.sites[k - 2],
             }
+        }
+        // Nombre de joueurs de la carte (5 contre 5 par défaut ; seule la 5v5 est classée).
+        if lower.first().map(String::as_str) == Some("set")
+            && matches!(
+                lower.get(1).map(String::as_str),
+                Some("maxplayer" | "maxplayers" | "joueurs")
+            )
+        {
+            let n = lower.get(2).and_then(|n| n.parse::<u8>().ok());
+            match n {
+                Some(n) if (2..=10).contains(&n) && n % 2 == 0 => {
+                    map.max_players = n;
+                    match crate::fpsmap::save(&self.dir, &map) {
+                        Ok(()) => self.chat.say(
+                            format!(
+                                "Carte pour {n} joueurs ({} contre {}){}. Nouvelle signature : \
+                                 c'est une nouvelle carte dans la liste FPS.",
+                                n / 2,
+                                n / 2,
+                                if n == 10 {
+                                    ""
+                                } else {
+                                    ", hors classement (seul le 5 contre 5 compte)"
+                                }
+                            ),
+                            chat::LIGHT_PURPLE,
+                        ),
+                        Err(e) => self.chat.say(format!("fps.txt : {e:#}"), chat::RED),
+                    }
+                }
+                _ => self.chat.say(
+                    "Usage : /fps set maxplayer 2|4|6|8|10 (deux équipes égales).",
+                    chat::GREY,
+                ),
+            }
+            return;
         }
         match lower.first().map(String::as_str) {
             Some("set") => {
@@ -1840,6 +1996,8 @@ impl Session {
                 *slot(&mut map, k) = None;
             }
             Some("info") | None => {
+                self.chat
+                    .say(format!("joueurs : {}", map.players()), chat::LIGHT_PURPLE);
                 for k in 0..5 {
                     let z = *slot(&mut map, k);
                     let t = match z {
@@ -2062,33 +2220,53 @@ impl Session {
                 )
             })
         };
-        // Pseudos : au-dessus des coéquipiers seulement (couleur de l'équipe).
-        for v in n.views().iter().filter(|v| v.alive) {
-            let head = v.pos + Vec3::Y * 2.1;
+        // Coéquipiers : un triangle à leur couleur au-dessus d'eux, même à travers les murs,
+        // et leur pseudo quand on les voit. Rien au-dessus des adversaires.
+        let views = n.views();
+        let rows = n.rows();
+        let mut mates: Vec<&crate::netgame::View> = views
+            .iter()
+            .filter(|v| v.alive && v.team == my_team)
+            .collect();
+        mates.sort_by(|a, b| a.pseudo.cmp(&b.pseudo));
+        for (k, v) in mates.iter().enumerate() {
+            // Couleur donnée par l'hôte (préférences), sinon dans l'ordre.
+            let k = rows
+                .iter()
+                .find(|r| r.pseudo == v.pseudo)
+                .map_or(k, |r| r.color as usize);
+            let head = v.pos + Vec3::Y * 2.05;
             let to = head - Vec3::Y * 0.4 - eye;
             let dist = to.length();
-            // Pas de pseudo au-dessus des adversaires.
-            if v.team != my_team || dist > 60.0 {
-                continue;
-            }
-            let mate = true;
             let Some((x, y)) = to_screen(head) else {
                 continue;
             };
-            let col = team_color(v.team);
+            let col = mate_color(k);
+            // Triangle pointe en bas.
+            let t = 4.0 * s;
+            for row in 0..(t as i32) {
+                let half = (t - row as f32) * 0.9;
+                ui.rect(x - half, y + row as f32, half * 2.0, 1.0, col);
+            }
+            let seen = raycast(&self.world, eye.into(), (to / dist.max(1e-3)).into(), dist)
+                .is_none_or(|h| h.distance >= dist - 0.3);
+            if !seen || dist > 60.0 {
+                continue;
+            }
             let mut name = v.pseudo.clone();
-            if mate && v.flags & minelib_net::game::FLAG_BOMB != 0 {
+            if v.flags & minelib_net::game::FLAG_BOMB != 0 {
                 name += " [bombe]";
             }
             let tw = Ui::text_width(&name, s);
+            let ny = y - 11.0 * s;
             ui.rect(
                 x - tw / 2.0 - s,
-                y - s,
+                ny - s,
                 tw + 2.0 * s,
                 10.0 * s,
                 [0.0, 0.0, 0.0, 0.45],
             );
-            ui.text(x - tw / 2.0, y, s, col, name);
+            ui.text(x - tw / 2.0, ny, s, col, name);
         }
         // Bombe posée ou lâchée (connue de l'équipe) : repère à l'écran.
         if matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED) {
@@ -2126,6 +2304,59 @@ impl Session {
         let mw = Ui::text_width(&mid, s * 1.5);
         let w = (150.0 * s).max(mw + 60.0 * s);
         ui.rect(cx - w / 2.0, top, w, 22.0 * s, [0.0, 0.0, 0.0, 0.5]);
+        // Bandeau des têtes : CT à gauche, T à droite ; ses coéquipiers à leur couleur, les
+        // morts assombris.
+        let head = 14.0 * s;
+        for (side, sign) in [(CT, -1.0f32), (minelib_net::game::T, 1.0)] {
+            let mut team: Vec<&minelib_net::game::ScoreRow> =
+                rows.iter().filter(|r| r.team == side).collect();
+            team.sort_by_key(|r| (r.color, r.id));
+            for (k, r) in team.iter().enumerate() {
+                let off = w / 2.0 + 4.0 * s + k as f32 * (head + 2.0 * s);
+                let x = if sign < 0.0 {
+                    cx - off - head
+                } else {
+                    cx + off
+                };
+                let col = if side == my_team {
+                    mate_color(r.color as usize)
+                } else {
+                    team_color(side)
+                };
+                let dim = if r.alive { 1.0 } else { 0.3 };
+                let c = [col[0] * dim, col[1] * dim, col[2] * dim, 0.95];
+                ui.rect(x, top, head, head + 4.0 * s, [0.0, 0.0, 0.0, 0.55]);
+                ui.rect(x + s, top + s, head - 2.0 * s, head - 2.0 * s, c);
+                // Tête : le visage du skin (pas pendant l'échauffement, anonyme), sinon
+                // l'initiale du pseudo.
+                let skin = if r.id == n.me() {
+                    self.skins.mine()
+                } else if r.pseudo.starts_with("Joueur ") {
+                    None
+                } else {
+                    self.skins.of(&r.pseudo)
+                };
+                if let Some(sk) = skin {
+                    let inner = head - 4.0 * s;
+                    crate::skin::draw_face(ui, &sk.face(), x + 2.0 * s, top + 2.0 * s, inner, dim);
+                } else {
+                    let ch: String = r.pseudo.chars().take(1).collect::<String>().to_uppercase();
+                    let cw = Ui::text_width(&ch, s);
+                    ui.text(
+                        x + (head - cw) / 2.0,
+                        top + 3.0 * s,
+                        s,
+                        [0.0, 0.0, 0.0, 0.8 * dim + 0.2],
+                        ch,
+                    );
+                }
+                // Bande du bas : couleur de l'équipe.
+                ui.rect(x + s, top + head, head - 2.0 * s, 3.0 * s, team_color(side));
+                if !r.alive {
+                    ui.rect(x + 2.0 * s, top + head / 2.0, head - 4.0 * s, s, [0.9, 0.2, 0.2, 0.9]);
+                }
+            }
+        }
         ui.text(cx - mw / 2.0, top + 3.0 * s, s * 1.5, mid_col, mid.clone());
         if hud.phase != phase::WARMUP {
             let l = format!("{}", hud.score[0]);
@@ -2199,9 +2430,12 @@ impl Session {
                 .into_iter()
                 .find(|g| (Vec3::from(g.pos) - feet).length() < 1.6)
             {
-                let name = crate::weapons::WEAPONS
-                    .get(g.weapon as usize)
-                    .map_or("?", |w| w.name);
+                let name = match crate::cs::nade_code(g.weapon) {
+                    Some(n) => crate::equip::Nade::ALL[n].name(),
+                    None => crate::weapons::WEAPONS
+                        .get(g.weapon as usize)
+                        .map_or("?", |w| w.name),
+                };
                 let t = format!("E : ramasser {name}");
                 ui.text(
                     cx - Ui::text_width(&t, s) / 2.0,
@@ -2247,9 +2481,44 @@ impl Session {
                 t,
             );
         }
-        // Fil des éliminations, en haut à droite, comme dans CS : tueur, arme, marques
-        // (aveuglé, tir en tête, à travers un mur, à travers une fumée), mort.
-        let mut fy = 30.0 * s;
+        // Minimap en haut à droite (règles de CS : coéquipiers toujours, adversaires
+        // repérés seulement, bombe connue de son équipe).
+        let radar_size = (72.0 * s).min(size.1 * 0.3);
+        let radar_x = size.0 - radar_size - 6.0 * s;
+        {
+            let mates: Vec<(Vec3, [f32; 4])> = views
+                .iter()
+                .filter(|v| v.alive && v.team == my_team)
+                .map(|v| {
+                    let k = rows
+                        .iter()
+                        .find(|r| r.pseudo == v.pseudo)
+                        .map_or(0, |r| r.color as usize);
+                    (v.pos, mate_color(k))
+                })
+                .collect();
+            let enemies: Vec<Vec3> = views
+                .iter()
+                .filter(|v| v.alive && v.team != my_team)
+                .map(|v| v.pos)
+                .collect();
+            let bomb_at = matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED)
+                .then(|| Vec3::from(hud.bomb_pos));
+            self.radar.draw(
+                ui,
+                radar_x,
+                6.0 * s,
+                radar_size,
+                s,
+                (self.player.pos, self.player.look_dir()),
+                &mates,
+                &enemies,
+                bomb_at,
+            );
+        }
+        // Fil des éliminations, en haut à droite (sous la minimap), comme dans CS : tueur,
+        // arme, marques (aveuglé, tir en tête, à travers un mur, à travers une fumée), mort.
+        let mut fy = 6.0 * s + radar_size + 6.0 * s;
         for (k, age) in &self.feed {
             let alpha = (6.0 - age).clamp(0.0, 1.0);
             let fade = |c: [f32; 4]| [c[0], c[1], c[2], c[3] * alpha];
@@ -2902,6 +3171,7 @@ impl Session {
             crouch: self.player.crouch,
             light: self.hand_light,
             held,
+            skin: self.skins.mine(),
         };
         let visible = self.game.mode != GameMode::Spectator;
         let mut model = if third != 0 && visible {
@@ -2913,15 +3183,17 @@ impl Session {
         if let Some(n) = &self.net {
             for v in n.views().iter().filter(|v| v.alive) {
                 let held = (v.weapon != 255).then_some(Held::Stick([38, 38, 42]));
+                let w = self.walks.get(&v.pseudo).copied().unwrap_or_default();
                 model.extend(crate::player_model::build(&crate::player_model::Pose {
                     feet: v.pos,
                     yaw: v.yaw,
                     pitch: v.pitch,
-                    walk: time * v.speed * 2.6,
-                    swing: (v.speed / 4.3).min(1.0),
+                    walk: w.phase,
+                    swing: w.amp,
                     crouch: v.crouch,
                     light: self.hand_light,
                     held,
+                    skin: self.skins.of(&v.pseudo),
                 }));
             }
             // Bombe sur le dos de celui qui la porte.
@@ -2939,7 +3211,7 @@ impl Session {
             for g in n.ground() {
                 let len = crate::weapons::WEAPONS
                     .get(g.weapon as usize)
-                    .map_or(0.6, |w| w.length);
+                    .map_or(0.18, |w| w.length);
                 model.extend(crate::player_model::gun_on_ground(
                     Vec3::from(g.pos),
                     len,
@@ -2966,15 +3238,17 @@ impl Session {
         }
         if let Some(b) = &self.build {
             for o in b.others.values() {
+                let w = self.walks.get(&o.pseudo).copied().unwrap_or_default();
                 model.extend(crate::player_model::build(&crate::player_model::Pose {
                     feet: o.pos,
                     yaw: o.yaw,
                     pitch: o.pitch,
-                    walk: time * o.speed * 2.6,
-                    swing: (o.speed / 4.3).min(1.0),
+                    walk: w.phase,
+                    swing: w.amp,
                     crouch: o.crouch,
                     light: self.hand_light,
                     held: None,
+                    skin: self.skins.of(&o.pseudo),
                 }));
             }
         }
@@ -3044,7 +3318,8 @@ impl Session {
                 }
                 _ => None,
             },
-            selected: if grabbed {
+            // Pas de contour du bloc visé en mode FPS.
+            selected: if grabbed && self.game.mode != GameMode::Fps {
                 self.hit
                     .map(|h| minelib_world::raycast::selection_box(&self.world, h.block))
             } else {
@@ -3344,6 +3619,67 @@ fn slab_placement(
         _ => 4,
     };
     Some((p, slab_of(mat, side).unwrap_or(item)))
+}
+
+/// Escalier à poser : la marche haute du côté où l'on regarde (le bas vers soi), à
+/// l'envers posé au plafond ou sur la moitié haute d'un côté. `None` : pas un escalier.
+fn stairs_placement(hit: &Hit, item: BlockId, look: Vec3, point: Vec3) -> Option<BlockId> {
+    let key = &item.def().key;
+    let rest = key.strip_prefix("stairs:")?;
+    let mat = rest.split(':').next()?;
+    let dir = if look.x.abs() >= look.z.abs() {
+        if look.x >= 0.0 {
+            0
+        } else {
+            1
+        }
+    } else if look.z >= 0.0 {
+        2
+    } else {
+        3
+    };
+    let top = match hit.normal {
+        [0, -1, 0] => true,
+        [0, 1, 0] => false,
+        _ => point.y - point.y.floor() > 0.5,
+    };
+    let half = if top { "top" } else { "bottom" };
+    minelib_world::registry::registry().by_key(&format!("stairs:{mat}:{dir}:{half}"))
+}
+
+/// Marche d'un autre joueur : même balancement que le sien en F5, d'après la vitesse
+/// de son déplacement à l'écran (lissée : pas d'à-coups).
+#[derive(Clone, Copy, Default)]
+pub struct Walk {
+    pub phase: f32,
+    pub amp: f32,
+    last: Vec3,
+    speed: f32,
+}
+
+impl Walk {
+    fn new(pos: Vec3) -> Self {
+        Walk {
+            last: pos,
+            ..Default::default()
+        }
+    }
+
+    fn update(&mut self, pos: Vec3, dt: f32) {
+        let d = pos - self.last;
+        self.last = pos;
+        let v = if dt > 0.0 {
+            Vec3::new(d.x, 0.0, d.z).length() / dt
+        } else {
+            0.0
+        };
+        // Téléportation (réapparition) : pas un pas de géant.
+        let v = if v > 20.0 { 0.0 } else { v };
+        self.speed += (v - self.speed) * (dt * 12.0).min(1.0);
+        self.phase = (self.phase + self.speed * dt * 2.6) % std::f32::consts::TAU;
+        let target = (self.speed / 4.3).min(1.0);
+        self.amp += (target - self.amp) * (dt * 10.0).min(1.0);
+    }
 }
 
 /// Recul de la caméra à la 3e personne (F5), en blocs, comme dans Minecraft.
@@ -3849,6 +4185,18 @@ fn scoreboard_lines(
     out
 }
 
+/// Couleur d'un coéquipier (comme dans CS : vert, jaune, orange, bleu, violet).
+pub fn mate_color(k: usize) -> [f32; 4] {
+    const C: [[f32; 4]; 5] = [
+        [0.30, 0.85, 0.35, 1.0],
+        [0.95, 0.85, 0.20, 1.0],
+        [0.95, 0.55, 0.15, 1.0],
+        [0.30, 0.60, 1.00, 1.0],
+        [0.70, 0.40, 0.95, 1.0],
+    ];
+    C[k % C.len()]
+}
+
 /// Petites images du fil des éliminations (7 × 7 points, dessinées pour Minelib).
 const ICON_HEAD: [&str; 7] = [
     "..###..", ".#####.", ".#.#.#.", ".#####.", "..###..", "..#.#..", ".......",
@@ -3894,6 +4242,62 @@ fn side_of_start(start: u8, i: u32) -> u8 {
         start
     } else {
         1 - start
+    }
+}
+
+#[cfg(test)]
+mod stairs_tests {
+    use super::*;
+
+    #[test]
+    fn stairs_face_the_player_and_flip_on_ceilings_and_high_halves() {
+        let reg = minelib_world::registry::registry();
+        let st = reg.by_key("stairs:planks_oak:0:bottom").unwrap();
+        let hit = |n: [i32; 3]| Hit {
+            block: [4, 10, 4],
+            normal: n,
+            id: BlockId::STONE,
+            distance: 3.0,
+        };
+        let key = |id: BlockId| id.def().key.clone();
+        // On regarde vers −Z, posé sur le sol : marche haute côté −Z, bas vers soi.
+        let id = stairs_placement(
+            &hit([0, 1, 0]),
+            st,
+            Vec3::new(0.1, -0.5, -1.0),
+            Vec3::new(4.5, 11.0, 4.5),
+        )
+        .unwrap();
+        assert_eq!(key(id), "stairs:planks_oak:3:bottom");
+        let s = minelib_world::registry::stairs_boxes(3, false);
+        assert_eq!(s[1].0[2], 0, "marche haute du côté regardé (−Z)");
+        // Au plafond : à l'envers.
+        let id = stairs_placement(
+            &hit([0, -1, 0]),
+            st,
+            Vec3::new(1.0, 0.5, 0.0),
+            Vec3::new(4.5, 10.0, 4.5),
+        )
+        .unwrap();
+        assert_eq!(key(id), "stairs:planks_oak:0:top");
+        // Contre un mur, moitié haute : à l'envers ; moitié basse : à l'endroit.
+        let id = stairs_placement(
+            &hit([0, 0, 1]),
+            st,
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::new(4.5, 10.8, 5.0),
+        )
+        .unwrap();
+        assert_eq!(key(id), "stairs:planks_oak:3:top");
+        let id = stairs_placement(
+            &hit([0, 0, 1]),
+            st,
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::new(4.5, 10.2, 5.0),
+        )
+        .unwrap();
+        assert_eq!(key(id), "stairs:planks_oak:3:bottom");
+        assert!(stairs_placement(&hit([0, 1, 0]), BlockId::STONE, Vec3::X, Vec3::ZERO).is_none());
     }
 }
 

@@ -42,6 +42,8 @@ pub struct Pose {
     pub light: [f32; 3],
     /// Objet en main.
     pub held: Option<Held>,
+    /// Skin du joueur (sinon le modèle par défaut de Minelib).
+    pub skin: Option<std::sync::Arc<crate::skin::Skin>>,
 }
 
 fn srgb(c: u32) -> [f32; 3] {
@@ -132,6 +134,7 @@ fn emit_box(
     max: [f32; 3],
     part: Part,
     light: [f32; 3],
+    tex: Option<(&crate::skin::Skin, usize)>,
 ) {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
@@ -196,7 +199,11 @@ fn emit_box(
         for v in 0..nv {
             for u in 0..nu {
                 let g = grain(k * 4096 + v * 64 + u + part as usize * 977);
-                let c = srgb(skin(part, face, u, v, nu));
+                let size = [w as u32, h as u32, d as u32];
+                let rgb = tex
+                    .and_then(|(t, i)| t.color(i, k, u as u32, v as u32, size))
+                    .unwrap_or_else(|| skin(part, face, u, v, nu));
+                let c = srgb(rgb);
                 let col = [0, 1, 2].map(|i| c[i] * shade * g * light[i]);
                 let (a, b, cc, dd) = (
                     p(u as f32, v as f32),
@@ -465,8 +472,11 @@ fn emit_item(
 /// Triangles du modèle du joueur dans cette pose (avec l'objet tenu).
 pub fn build(pose: &Pose) -> Vec<EntityVertex> {
     let mut out = Vec::with_capacity(12_000);
-    for (xf, min, max, part) in parts(pose) {
-        emit_box(&mut out, xf, min, max, part, pose.light);
+    // Ordre de `parts` : jambe gauche, jambe droite, corps, bras gauche, bras droit, tête
+    // (les mêmes numéros que `Skin::color`).
+    for (i, (xf, min, max, part)) in parts(pose).into_iter().enumerate() {
+        let tex = pose.skin.as_deref().map(|s| (s, i));
+        emit_box(&mut out, xf, min, max, part, pose.light, tex);
     }
     for (xf, min, max, kind) in held_parts(pose) {
         emit_item(&mut out, xf, min, max, kind, pose.light);
@@ -510,6 +520,7 @@ mod tests {
             crouch: 0.0,
             light: [1.0; 3],
             held: None,
+            skin: None,
         };
         let v = build(&pose);
         assert!(v.len() > 5000 && v.len().is_multiple_of(3));
@@ -556,6 +567,7 @@ mod held_tests {
             crouch: 0.0,
             light: [1.0; 3],
             held: Some(Held::Torch([255, 200, 100])),
+            skin: None,
         };
         let hand = hand_frame(&pose).unwrap().transform_point3(Vec3::ZERO);
         let tip = torch_tip(&pose).unwrap();
