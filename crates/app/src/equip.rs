@@ -768,6 +768,80 @@ pub fn tick_effects(
     effects.retain(|e| e.alive());
 }
 
+// ------------------------------------------------------------ objets lâchés
+
+/// Vitesse du lancer d'un objet lâché (touche G) et pesanteur de sa chute : sur un sol
+/// plat, regard à l'horizontale, il retombe à environ 4 blocs.
+const TOSS_SPEED: f32 = 6.5;
+const TOSS_LIFT: f32 = 2.5;
+const TOSS_GRAVITY: f32 = 16.0;
+
+/// Point de chute (posé sur le sol) d'un objet lâché depuis `eye` en regardant `look` :
+/// il part en cloche, s'arrête contre un mur et retombe jusqu'au sol (au plus 40 blocs
+/// plus bas, sinon il reste où il est). Toujours à moins de `cs::MAX_TOSS` des pieds.
+pub fn toss_landing(world: &World, eye: Vec3, look: Vec3) -> Vec3 {
+    let solid = |p: Vec3| {
+        world
+            .get(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32)
+            .is_solid()
+    };
+    let start = eye - Vec3::Y * 0.3;
+    let mut p = start;
+    if solid(p) {
+        p = eye;
+    }
+    let mut v = look.normalize_or_zero() * TOSS_SPEED + Vec3::Y * TOSS_LIFT;
+    let dt = 1.0 / 240.0;
+    for _ in 0..(240 * 4) {
+        v.y -= TOSS_GRAVITY * dt;
+        let next = p + v * dt;
+        if solid(next) {
+            // Sol (ou plafond) : seule la hauteur bloque.
+            let flat = Vec3::new(next.x, p.y, next.z);
+            if !solid(flat) {
+                if v.y < 0.0 {
+                    p = Vec3::new(flat.x, next.y.floor() + 1.0, flat.z);
+                    break;
+                }
+                v.y = 0.0;
+                p = flat;
+                continue;
+            }
+            // Mur : il glisse le long et retombe.
+            v.x = 0.0;
+            v.z = 0.0;
+            let up = Vec3::new(p.x, next.y, p.z);
+            if solid(up) {
+                if v.y < 0.0 {
+                    p.y = next.y.floor() + 1.0;
+                    break;
+                }
+                v.y = 0.0;
+            } else {
+                p = up;
+            }
+            continue;
+        }
+        p = next;
+    }
+    // Ne pas sortir de la portée permise par l'hôte (ni rester dans un bloc).
+    let feet = eye - Vec3::Y * 1.62;
+    let d = Vec3::new(p.x - feet.x, 0.0, p.z - feet.z);
+    let max = crate::cs::MAX_TOSS - 0.3;
+    if d.length() > max {
+        let q = feet + d.normalize() * max;
+        p.x = q.x;
+        p.z = q.z;
+    }
+    if p.y > feet.y + 2.5 {
+        p.y = feet.y + 2.5;
+    }
+    while solid(p) && p.y < feet.y + 2.5 {
+        p.y = p.y.floor() + 1.0;
+    }
+    p
+}
+
 // ------------------------------------------------------------ modèles
 
 /// Grenade : cylindre (corps) + bouchon et cuillère, haut = +Y, centrée.
@@ -792,6 +866,37 @@ pub fn nade_model(kind: Nade) -> Vec<Tri> {
         Vec3::new(r * 0.9, -0.03, -0.006),
         Vec3::new(r + 0.008, 0.065, 0.006),
         [0.4, 0.4, 0.38],
+    );
+    tris
+}
+
+/// Bombe (C4) : bloc sable, clavier sombre et voyant rouge, haut = +Y, centrée.
+pub fn bomb_model() -> Vec<Tri> {
+    let mut tris = Vec::new();
+    boxy(
+        &mut tris,
+        Vec3::new(-0.11, -0.04, -0.075),
+        Vec3::new(0.11, 0.04, 0.075),
+        [0.36, 0.33, 0.17],
+    );
+    boxy(
+        &mut tris,
+        Vec3::new(-0.07, 0.04, -0.05),
+        Vec3::new(0.03, 0.05, 0.05),
+        [0.05, 0.05, 0.06],
+    );
+    boxy(
+        &mut tris,
+        Vec3::new(0.05, 0.04, -0.02),
+        Vec3::new(0.08, 0.055, 0.01),
+        [0.6, 0.05, 0.04],
+    );
+    // Fils.
+    boxy(
+        &mut tris,
+        Vec3::new(-0.115, -0.02, -0.06),
+        Vec3::new(0.115, 0.0, -0.045),
+        [0.5, 0.08, 0.06],
     );
     tris
 }
@@ -906,6 +1011,29 @@ mod tests {
             }
         }
         w
+    }
+
+    #[test]
+    fn dropped_items_land_about_four_blocks_ahead() {
+        let mut w = floor();
+        let eye = Vec3::new(0.5, 11.0 + 1.62, 0.5);
+        let at = toss_landing(&w, eye, Vec3::new(0.0, 0.0, -1.0));
+        assert!((at.y - 11.0).abs() < 0.05, "posé sur le sol : {at}");
+        let d = 0.5 - at.z;
+        assert!((3.0..5.0).contains(&d), "à environ 4 blocs : {d}");
+        assert!(at.x.abs() - 0.5 < 0.01);
+        // Un mur à 2 blocs : l'objet retombe à son pied, de ce côté.
+        for y in 11..15 {
+            for x in -2..3 {
+                w.set(x, y, -2, BlockId::STONE);
+            }
+        }
+        let at = toss_landing(&w, eye, Vec3::new(0.0, 0.0, -1.0));
+        assert!(at.z > -1.0 && at.z < 0.5, "arrêté par le mur : {at}");
+        assert!((at.y - 11.0).abs() < 0.05, "au sol : {at}");
+        // Regard vers le sol : à ses pieds ou presque, jamais dans le sol.
+        let at = toss_landing(&floor(), eye, Vec3::new(0.0, -1.0, -0.05));
+        assert!((at.y - 11.0).abs() < 0.05 && (at - eye).length() < 3.0, "{at}");
     }
 
     #[test]

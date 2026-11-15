@@ -296,7 +296,16 @@ pub(crate) fn font_bitmap() -> Vec<u8> {
             SOLID => [0xff; 8],
             // Cases libres (codes de contrôle) : points de suspension, flèche.
             ELLIPSIS => [0, 0, 0, 0, 0, 0, 0b0100_1001, 0],
-            ARROW => [0, 0b0000_1000, 0b0001_1000, 0b0011_1111, 0b0001_1000, 0b0000_1000, 0, 0],
+            ARROW => [
+                0,
+                0b0000_1000,
+                0b0001_1000,
+                0b0011_1111,
+                0b0001_1000,
+                0b0000_1000,
+                0,
+                0,
+            ],
             0..=127 => BASIC_LEGACY[code as usize],
             160..=255 => LATIN_LEGACY[(code - 160) as usize],
             _ => [0; 8],

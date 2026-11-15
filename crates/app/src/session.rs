@@ -61,6 +61,15 @@ struct SimState {
 pub struct Session {
     /// Essais : temps avant la prochaine fumigène de MINELIB_SMOKE.
     test_smoke_timer: f32,
+    /// Objets au sol encore en vol (lancés en cloche) : temps depuis leur apparition.
+    ground_fly: std::collections::HashMap<u32, f32>,
+    ground_seen: std::collections::HashSet<u32>,
+    /// Bombe lâchée en vol : départ, arrivée, temps écoulé ; et dernier état connu
+    /// (état, position du porteur).
+    bomb_fly: Option<(Vec3, Vec3, f32)>,
+    bomb_last: (u8, Option<Vec3>),
+    /// Bruits de ses propres pas : distance parcourue depuis le dernier.
+    stride: f32,
     /// Temps pas encore simulé (moins d'un pas).
     tick_acc: f32,
     /// Position au pas précédent (interpolation de l'affichage).
@@ -260,6 +269,11 @@ impl Session {
         log::info!("monde « {} » (graine {})", data.meta.name, data.meta.seed);
         Ok(Self {
             test_smoke_timer: 0.0,
+            stride: 0.0,
+            ground_fly: std::collections::HashMap::new(),
+            ground_seen: std::collections::HashSet::new(),
+            bomb_fly: None,
+            bomb_last: (0, None),
             tick_acc: 0.0,
             prev_pos: Vec3::ZERO,
             prev_crouch: 0.0,
@@ -609,8 +623,11 @@ impl Session {
                 }
                 // Armes : lâchées (G), ramassées (E près d'une arme au sol). Ce que chacun
                 // porte, c'est l'hôte qui le sait (achats, ramassages).
+                // Lancé en cloche devant soi : il retombe à environ 4 blocs.
+                let look = self.player.look_dir();
                 for w in std::mem::take(&mut self.fps.dropped) {
-                    n.drop_weapon(w);
+                    let at = crate::equip::toss_landing(&self.world, self.player.eye(), look);
+                    n.drop_weapon(w, at);
                 }
                 let use_pressed = input.grabbed
                     && !typing
@@ -630,6 +647,55 @@ impl Session {
                     if let Some(g) = near {
                         locals.extend(n.pickup(g.id));
                     }
+                }
+                // Objets lâchés : on anime leur chute en cloche (une fois chacun).
+                let ground = n.ground();
+                for g in &ground {
+                    let fresh = !self.ground_seen.contains(&g.id);
+                    if fresh {
+                        self.ground_seen.insert(g.id);
+                        if Vec3::from(g.from) != Vec3::from(g.pos) {
+                            self.ground_fly.insert(g.id, 0.0);
+                        }
+                    }
+                }
+                self.ground_fly.retain(|id, t| {
+                    *t += dt;
+                    *t < TOSS_FLIGHT && ground.iter().any(|g| g.id == *id)
+                });
+                if self.ground_seen.len() > 512 {
+                    self.ground_seen
+                        .retain(|id| ground.iter().any(|g| g.id == *id));
+                }
+                {
+                    use minelib_net::game::{bomb, FLAG_BOMB};
+                    let hud = n.hud();
+                    let carrier = if hud.carrying {
+                        Some(self.player.pos)
+                    } else {
+                        n.views()
+                            .iter()
+                            .find(|v| v.alive && v.flags & FLAG_BOMB != 0)
+                            .map(|v| v.pos)
+                    };
+                    if hud.bomb == bomb::DROPPED && self.bomb_last.0 == bomb::CARRIED {
+                        if let Some(from) = self.bomb_last.1 {
+                            let to = Vec3::from(hud.bomb_pos);
+                            if (to - from).length() > 0.5 {
+                                self.bomb_fly = Some((from + Vec3::Y * 1.3, to, 0.0));
+                            }
+                        }
+                    }
+                    if let Some(f) = &mut self.bomb_fly {
+                        f.2 += dt;
+                        if f.2 >= TOSS_FLIGHT || hud.bomb != bomb::DROPPED {
+                            self.bomb_fly = None;
+                        }
+                    }
+                    self.bomb_last = (
+                        hud.bomb,
+                        carrier.or(self.bomb_last.1.filter(|_| hud.bomb == bomb::CARRIED)),
+                    );
                 }
                 // Mort : on suit un coéquipier (clic : le suivant).
                 if self.net_dead {
@@ -658,7 +724,9 @@ impl Session {
                 // Poser (touche Utiliser ou Bombe maintenue) / désamorcer (Utiliser).
                 let free = input.grabbed && !typing && !self.net_dead;
                 let use_key = free && self.keys.held(input, Action::FpsUse);
-                let bomb_key = free && self.keys.held(input, Action::FpsBomb);
+                let bomb_key = free
+                    && (self.keys.held(input, Action::FpsBomb)
+                        || (self.fps.holding_bomb() && self.keys.held(input, Action::FpsFire)));
                 n.keys(use_key || bomb_key, use_key);
                 // Argent et équipement venus de l'hôte.
                 let hud = n.hud();
@@ -668,6 +736,7 @@ impl Session {
                     armor: hud.armor,
                     helmet: hud.helmet,
                     kit: hud.kit,
+                    bomb: hud.carrying,
                     can_buy: hud.can_buy,
                     warmup: hud.phase == minelib_net::game::phase::WARMUP,
                 });
@@ -1233,7 +1302,11 @@ impl Session {
             let mut mt = *m;
             mt.jump_pressed = std::mem::take(&mut self.pending_jump);
             // Mode FPS : on court moins vite avec une arme lourde (comme dans CS).
-            self.player.carry = if self.game.mode == GameMode::Fps { self.fps.carry() } else { 250 };
+            self.player.carry = if self.game.mode == GameMode::Fps {
+                self.fps.carry()
+            } else {
+                250
+            };
             // En ligne (FPS) : les autres joueurs sont solides.
             self.player.others = self.net.as_ref().map_or_else(Vec::new, |n| n.obstacles());
             self.player.update(&self.world, &mt, SIM_TICK);
@@ -1520,6 +1593,10 @@ impl Session {
                         self.fps.blood_at(h, knife, eye);
                     }
                 }
+                Local::Step(pos) => {
+                    let eye = self.player.eye();
+                    self.fps.heard_step(pos, eye);
+                }
                 Local::Guns { guns, nades } => self.fps.set_guns(guns, nades),
                 Local::RoundEnd {
                     winner,
@@ -1588,6 +1665,8 @@ impl Session {
                 Some(2)
             } else if k.pressed(input, Action::FpsGrenade) {
                 Some(3)
+            } else if k.pressed(input, Action::FpsBomb) {
+                Some(4)
             } else {
                 None
             },
@@ -1645,6 +1724,26 @@ impl Session {
         self.fps
             .update(dt, &c, &self.world, eye, self.player.yaw, self.player.pitch);
         self.fps.tick_effects(dt);
+        // Ses propres pas : en courant (les autres les entendent aussi, voir l'hôte), plus
+        // doux en marchant ou accroupi (eux ne les entendent pas).
+        let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
+        let alive = !(self.net.is_some() && self.net_dead);
+        if alive && self.player.on_ground && !self.player.flying && speed > 0.6 {
+            self.stride += speed * dt;
+            let run = speed > crate::netgame::STEP_SPEED;
+            let every = if run {
+                crate::netgame::STRIDE
+            } else {
+                crate::netgame::STRIDE * 0.8
+            };
+            if self.stride >= every {
+                self.stride -= every;
+                let gain = if run { 0.75 } else { 0.3 };
+                self.fps.sounds.push((crate::audio::Sfx::Step, 0.0, gain));
+            }
+        } else {
+            self.stride = crate::netgame::STRIDE * 0.7;
+        }
         for (sfx, delay, gain) in self.fps.sounds.drain(..) {
             crate::audio::play(sfx, delay, self.volume * gain);
         }
@@ -2353,7 +2452,13 @@ impl Session {
                 // Bande du bas : couleur de l'équipe.
                 ui.rect(x + s, top + head, head - 2.0 * s, 3.0 * s, team_color(side));
                 if !r.alive {
-                    ui.rect(x + 2.0 * s, top + head / 2.0, head - 4.0 * s, s, [0.9, 0.2, 0.2, 0.9]);
+                    ui.rect(
+                        x + 2.0 * s,
+                        top + head / 2.0,
+                        head - 4.0 * s,
+                        s,
+                        [0.9, 0.2, 0.2, 0.9],
+                    );
                 }
             }
         }
@@ -2398,8 +2503,8 @@ impl Session {
                 "terroristes (T)"
             }
         );
-        if hud.bomb == bomb::CARRIED {
-            line += "   Tu as la bombe : maintiens E (ou 5) sur un site";
+        if hud.carrying {
+            line += "   Tu as la bombe : 5 pour la prendre, tir ou E maintenu sur un site, G pour la lâcher";
         }
         if hud.can_buy && hud.phase != phase::WARMUP {
             line += "   Achats ouverts (B)";
@@ -2502,8 +2607,8 @@ impl Session {
                 .filter(|v| v.alive && v.team != my_team)
                 .map(|v| v.pos)
                 .collect();
-            let bomb_at = matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED)
-                .then(|| Vec3::from(hud.bomb_pos));
+            let bomb_at =
+                matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED).then(|| Vec3::from(hud.bomb_pos));
             self.radar.draw(
                 ui,
                 radar_x,
@@ -3207,17 +3312,53 @@ impl Session {
                     ));
                 }
             }
-            // Armes au sol.
+            // Armes et grenades au sol, avec le modèle tenu en main (plus simple au loin) ;
+            // celles qui viennent d'être lâchées retombent en cloche.
             for g in n.ground() {
-                let len = crate::weapons::WEAPONS
-                    .get(g.weapon as usize)
-                    .map_or(0.18, |w| w.length);
-                model.extend(crate::player_model::gun_on_ground(
-                    Vec3::from(g.pos),
-                    len,
-                    g.id as f32 * 1.7,
-                    self.hand_light,
-                ));
+                let rest = Vec3::from(g.pos);
+                let fly = self.ground_fly.get(&g.id).copied();
+                let (pos, spin) = match fly {
+                    Some(t) => (toss_arc(Vec3::from(g.from), rest, t), t * 11.0),
+                    None => (rest, 0.0),
+                };
+                let turn = g.id as f32 * 1.7;
+                let far = (pos - cam).length();
+                if far > 64.0 {
+                    continue;
+                }
+                let nade = crate::cs::nade_code(g.weapon);
+                if far > 24.0 && fly.is_none() {
+                    let len = crate::weapons::WEAPONS
+                        .get(g.weapon as usize)
+                        .map_or(0.18, |w| w.length);
+                    model.extend(crate::player_model::gun_on_ground(
+                        pos,
+                        len,
+                        turn,
+                        self.hand_light,
+                    ));
+                } else if let Some(k) = nade {
+                    let tris = crate::equip::nade_model(crate::equip::Nade::ALL[k]);
+                    crate::player_model::item_on_ground(
+                        &mut model,
+                        &tris,
+                        pos,
+                        turn,
+                        true,
+                        spin,
+                        self.hand_light,
+                    );
+                } else if (g.weapon as usize) < crate::weapons::WEAPONS.len() {
+                    crate::player_model::item_on_ground(
+                        &mut model,
+                        &crate::weapons::model(g.weapon as usize).tris,
+                        pos,
+                        turn,
+                        true,
+                        spin,
+                        self.hand_light,
+                    );
+                }
             }
             // Bombe posée ou lâchée : le voyant clignote, de plus en plus vite.
             let hud = n.hud();
@@ -3229,11 +3370,11 @@ impl Session {
                     0.0
                 };
                 let blink = rate > 0.0 && (time * rate).fract() < 0.3;
-                model.extend(crate::player_model::bomb(
-                    Vec3::from(hud.bomb_pos),
-                    blink,
-                    self.hand_light,
-                ));
+                let at = match self.bomb_fly {
+                    Some((from, to, t)) if hud.bomb == bomb::DROPPED => toss_arc(from, to, t),
+                    _ => Vec3::from(hud.bomb_pos),
+                };
+                model.extend(crate::player_model::bomb(at, blink, self.hand_light));
             }
         }
         if let Some(b) = &self.build {
@@ -4383,4 +4524,15 @@ mod slab_tests {
         }
         assert_eq!(w.get(6, 10, 6), trap);
     }
+}
+
+/// Durée de la chute en cloche d'un objet lâché (s).
+const TOSS_FLIGHT: f32 = 0.6;
+
+/// Position à l'instant `t` d'un objet lâché de `from` qui retombe en `to` : en cloche,
+/// plus haut au milieu du trajet.
+fn toss_arc(from: Vec3, to: Vec3, t: f32) -> Vec3 {
+    let k = (t / TOSS_FLIGHT).clamp(0.0, 1.0);
+    let lift = 0.9 + (from.y - to.y).max(0.0) * 0.1;
+    from.lerp(to, k) + Vec3::Y * lift * 4.0 * k * (1.0 - k)
 }

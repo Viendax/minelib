@@ -20,7 +20,7 @@ pub struct EntityVertex {
 }
 
 /// Au plus tant de sommets d'entités par image.
-const MAX_VERTICES: usize = 65_536;
+const MAX_VERTICES: usize = 262_144;
 
 pub struct Entities {
     /// Rendu direct (une cible) et rendu avec anticrénelage temporel (couleur + mouvement).

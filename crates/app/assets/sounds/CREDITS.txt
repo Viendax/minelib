@@ -43,3 +43,7 @@ Arme sortie (draw_<arme>.ogg, un son par arme) : mélange d'un frottement de cui
     note grave par ffmpeg), sous la licence du projet.
   shell.ogg (cartouche glissée dans un fusil à pompe) — reload_end.ogg (« equipment
     clicks III », CC0) baissé d'une tierce.
+
+Pas (step_1 à step_6.ogg) : « Footsteps » (enregistrés dans un passage souterrain), CC0
+  https://opengameart.org/content/footsteps-0
+  Normalisés, fondu de fin, convertis en Ogg Vorbis mono.

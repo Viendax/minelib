@@ -91,6 +91,8 @@ pub enum Sel {
     Secondary,
     Knife,
     Nade(Nade),
+    /// La bombe (touche 5), quand on la porte.
+    Bomb,
 }
 
 /// Article du menu d'achat.
@@ -110,6 +112,8 @@ pub struct Online {
     pub armor: u8,
     pub helmet: bool,
     pub kit: bool,
+    /// On porte la bombe.
+    pub bomb: bool,
     pub can_buy: bool,
     /// Échauffement : achats gratuits.
     pub warmup: bool,
@@ -420,7 +424,7 @@ impl Fps {
     /// sinon la vitesse de l'arme, plus lente à la lunette).
     pub fn carry(&self) -> u8 {
         match self.sel {
-            Sel::Knife => 250,
+            Sel::Knife | Sel::Bomb => 250,
             Sel::Nade(_) => 245,
             _ => self
                 .active()
@@ -481,12 +485,18 @@ impl Fps {
     }
 
     /// Prend l'arme principale (`true`) ou secondaire.
-    fn switch(&mut self, primary: bool) {
-        self.select(if primary {
+    /// Arme à prendre quand celle en main disparaît : principale, pistolet, sinon couteau.
+    fn fallback(&mut self) {
+        let sel = if self.primary.is_some() {
             Sel::Primary
-        } else {
+        } else if self.secondary.is_some() {
             Sel::Secondary
-        });
+        } else {
+            Sel::Knife
+        };
+        if sel == Sel::Knife || self.sel != sel {
+            self.select(sel);
+        }
     }
 
     /// Met en main `sel` (s'il est porté) ; l'ancien choix devient la « dernière arme ».
@@ -496,6 +506,7 @@ impl Fps {
             Sel::Secondary => self.secondary.is_some(),
             Sel::Knife => true,
             Sel::Nade(n) => self.nades[n.index()] > 0,
+            Sel::Bomb => self.has_bomb(),
         };
         if !owned || sel == self.sel {
             return;
@@ -507,7 +518,7 @@ impl Fps {
             Sel::Primary => self.primary.map(|g| Sfx::Draw(g.def)),
             Sel::Secondary => self.secondary.map(|g| Sfx::Draw(g.def)),
             Sel::Knife => Some(Sfx::DrawKnife),
-            Sel::Nade(_) => Some(Sfx::DrawNade),
+            Sel::Nade(_) | Sel::Bomb => Some(Sfx::DrawNade),
         };
         if let Some(sfx) = sfx {
             self.sounds.push((sfx, 0.0, 1.0));
@@ -541,7 +552,20 @@ impl Fps {
                 v.push(Sel::Nade(n));
             }
         }
+        if self.has_bomb() {
+            v.push(Sel::Bomb);
+        }
         v
+    }
+
+    /// Porte-t-on la bombe (partie en ligne, selon l'hôte) ?
+    pub fn has_bomb(&self) -> bool {
+        self.online.is_some_and(|o| o.bomb)
+    }
+
+    /// La bombe est en main (le tir maintenu la pose, comme dans CS).
+    pub fn holding_bomb(&self) -> bool {
+        self.sel == Sel::Bomb
     }
 
     /// Molette : arme suivante (`+1`) ou précédente (`-1`).
@@ -668,7 +692,12 @@ impl Fps {
             Some(1) => self.select(Sel::Secondary),
             Some(2) => self.select(Sel::Knife),
             Some(3) => self.next_nade(),
+            Some(4) => self.select(Sel::Bomb),
             _ => {}
+        }
+        // Bombe perdue (posée, lâchée, morte) alors qu'elle était en main.
+        if self.sel == Sel::Bomb && !self.has_bomb() {
+            self.fallback();
         }
         if let Some(n) = c.nade_key {
             self.select(Sel::Nade(n));
@@ -703,8 +732,48 @@ impl Fps {
         } else {
             c
         };
+        // Lâcher (G) : l'arme en main, une grenade ou la bombe ; jamais le couteau.
+        if c.drop {
+            match self.sel {
+                Sel::Primary | Sel::Secondary => {
+                    let slot = if self.use_primary && self.primary.is_some() {
+                        &mut self.primary
+                    } else {
+                        &mut self.secondary
+                    };
+                    if let Some(g) = slot.take() {
+                        self.dropped.push(g.def as u8);
+                        self.fallback();
+                    }
+                }
+                Sel::Nade(n) => {
+                    let i = n.index();
+                    if self.nades[i] > 0 {
+                        self.nades[i] -= 1;
+                        self.dropped
+                            .push(minelib_net::game::ITEM_NADE as u8 + i as u8);
+                        if self.nades[i] == 0 {
+                            self.fallback();
+                        }
+                    }
+                }
+                Sel::Bomb => {
+                    if self.has_bomb() {
+                        self.dropped.push(minelib_net::game::DROP_BOMB);
+                        if let Some(o) = &mut self.online {
+                            o.bomb = false;
+                        }
+                        self.fallback();
+                    }
+                }
+                Sel::Knife => {}
+            }
+        }
         if !matches!(self.sel, Sel::Primary | Sel::Secondary) {
             self.cur_spread = 0.0;
+        }
+        if self.sel == Sel::Bomb {
+            return;
         }
         match self.sel {
             Sel::Knife => {
@@ -725,33 +794,6 @@ impl Fps {
                 } else {
                     self.buy(i);
                 }
-            }
-        }
-        // Lâcher (G) : l'arme en main, ou une grenade ; jamais le couteau.
-        if c.drop {
-            match self.sel {
-                Sel::Primary | Sel::Secondary => {
-                    let slot = if self.use_primary && self.primary.is_some() {
-                        &mut self.primary
-                    } else {
-                        &mut self.secondary
-                    };
-                    if let Some(g) = slot.take() {
-                        self.dropped.push(g.def as u8);
-                        self.switch(self.primary.is_some());
-                    }
-                }
-                Sel::Nade(n) => {
-                    let i = n.index();
-                    if self.nades[i] > 0 {
-                        self.nades[i] -= 1;
-                        self.dropped.push(minelib_net::game::ITEM_NADE as u8 + i as u8);
-                        if self.nades[i] == 0 {
-                            self.switch(self.primary.is_some());
-                        }
-                    }
-                }
-                Sel::Knife => {}
             }
         }
         // Rechargement.
@@ -1164,6 +1206,12 @@ impl Fps {
         self.sound_at(sfx, 0.0, pos, eye);
     }
 
+    /// En ligne : un autre joueur court en `pos` (bruit de pas).
+    pub fn heard_step(&mut self, pos: Vec3, eye: Vec3) {
+        let d = (pos - eye).length();
+        self.sounds.push((Sfx::Step, 0.0, 0.9 / (1.0 + d / 8.0)));
+    }
+
     /// En ligne : un joueur est touché en `at` (sang ; bruit du couteau dans la chair).
     pub fn blood_at(&mut self, at: Vec3, knife: bool, eye: Vec3) {
         for _ in 0..10 {
@@ -1279,6 +1327,14 @@ impl Fps {
                 let m = Mat4::from_translation(Vec3::new(0.17, -0.16 - up * 0.1, -0.28))
                     * Mat4::from_rotation_z(0.25);
                 draw_tris(&mut out, proj, m, &equip::nade_model(n), light);
+                return out;
+            }
+            Sel::Bomb => {
+                // Bombe tenue devant soi, un peu inclinée, en bas à droite.
+                let m = Mat4::from_translation(Vec3::new(0.14, -0.2, -0.34))
+                    * Mat4::from_rotation_x(0.5)
+                    * Mat4::from_rotation_y(-0.3);
+                draw_tris(&mut out, proj, m, &equip::bomb_model(), light);
                 return out;
             }
             _ => {}
@@ -1541,6 +1597,7 @@ impl Fps {
         let held = match self.sel {
             Sel::Knife => Some("Couteau".to_string()),
             Sel::Nade(n) => Some(format!("{}   x{}", n.name(), self.nades[n.index()])),
+            Sel::Bomb => Some("Bombe".to_string()),
             _ => None,
         };
         if let Some(t) = held {
@@ -1996,7 +2053,11 @@ impl Fps {
     }
 
     fn buy_cells_rows() -> usize {
-        Self::grid_for(None).iter().map(|c| c.2 + 1).max().unwrap_or(10)
+        Self::grid_for(None)
+            .iter()
+            .map(|c| c.2 + 1)
+            .max()
+            .unwrap_or(10)
     }
 
     /// Article du menu d'achat sous le curseur.
@@ -2077,7 +2138,8 @@ impl Fps {
             ui.text(x, py + 19.0 * s, s, col([200, 170, 90], 1.0), cat.label());
         }
         // Titre de l'équipement, sous les armes lourdes.
-        if let Some((_, ci, k)) = self.buy_grid()
+        if let Some((_, ci, k)) = self
+            .buy_grid()
             .into_iter()
             .find(|c| matches!(c.0, BuyItem::Nade(_)))
         {

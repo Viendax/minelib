@@ -107,6 +107,8 @@ pub const FLAG_PLANTING: u8 = 8;
 /// Codes d'achat : armes 0..100 (indice dans la liste des armes), grenades 100 + n,
 /// équipement 200 et plus.
 pub const ITEM_NADE: u16 = 100;
+/// Code de `ToHost::Drop` pour lâcher la bombe.
+pub const DROP_BOMB: u8 = 110;
 pub const ITEM_KIT: u16 = 200;
 pub const ITEM_KEVLAR: u16 = 201;
 pub const ITEM_HELMET: u16 = 202;
@@ -161,6 +163,8 @@ pub struct MatchHud {
     pub helmet: bool,
     pub kit: bool,
     pub bomb: u8,
+    /// C'est ce joueur qui porte la bombe.
+    pub carrying: bool,
     pub bomb_pos: [f32; 3],
     /// Pose ou désamorçage en cours (0..1), 0 sinon.
     pub progress: f32,
@@ -346,9 +350,11 @@ pub enum ToHost {
         primary: u8,
         secondary: u8,
     },
-    /// Arme lâchée (touche G).
+    /// Arme, grenade ou bombe (`DROP_BOMB`) lâchée (touche G), lancée en cloche :
+    /// `at` est le point où elle retombe (calculé par le joueur, vérifié par l'hôte).
     Drop {
         weapon: u8,
+        at: [f32; 3],
     },
     /// Ramasser une arme au sol.
     Pickup {
@@ -369,6 +375,8 @@ pub struct GroundGun {
     pub id: u32,
     pub weapon: u8,
     pub pos: [f32; 3],
+    /// D'où elle a été lancée (pour animer sa chute ; `pos` si elle est juste tombée).
+    pub from: [f32; 3],
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -467,6 +475,11 @@ pub enum ToPeer {
         weapon: u8,
         pos: [f32; 3],
         hits: Vec<[f32; 3]>,
+    },
+    /// Un joueur proche court : bruit de pas en `pos`.
+    Step {
+        who: u64,
+        pos: [f32; 3],
     },
     /// Réapparition (après une mort) à cette position.
     Respawn {

@@ -209,7 +209,8 @@ impl<'a> Ctx<'a> {
             self.ui.rect(x, y, w, h, [1.0, 1.0, 1.0, 0.08]);
         }
         let room = w - 8.0 * s;
-        self.ui.text(x + 6.0 * s, y + 4.0 * s, s, WHITE, fit(title, room, s));
+        self.ui
+            .text(x + 6.0 * s, y + 4.0 * s, s, WHITE, fit(title, room, s));
         let ds = (s / 2.0).floor().max(1.0);
         self.ui
             .text(x + 6.0 * s, y + 15.0 * s, ds, GREY, fit(detail, room, ds));

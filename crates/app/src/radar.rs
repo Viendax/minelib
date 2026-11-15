@@ -91,7 +91,13 @@ impl Radar {
         bomb: Option<Vec3>,
     ) {
         let Some(c) = self.center else { return };
-        ui.rect(x - s, y - s, size + 2.0 * s, size + 2.0 * s, [0.0, 0.0, 0.0, 0.6]);
+        ui.rect(
+            x - s,
+            y - s,
+            size + 2.0 * s,
+            size + 2.0 * s,
+            [0.0, 0.0, 0.0, 0.6],
+        );
         let cell = size / SIDE as f32;
         // Cases, par bandes de même teinte (moins de rectangles).
         for row in 0..SIDE {
@@ -115,11 +121,7 @@ impl Radar {
             }
         }
         // Position monde → radar (le nord, -z, en haut). Hors du cadre : collé au bord.
-        let origin = Vec3::new(
-            (c[0] - RADIUS) as f32,
-            0.0,
-            (c[2] - RADIUS) as f32,
-        );
+        let origin = Vec3::new((c[0] - RADIUS) as f32, 0.0, (c[2] - RADIUS) as f32);
         let to = |p: Vec3| -> (f32, f32) {
             let u = ((p.x - origin.x) * cell).clamp(0.0, size);
             let v = ((p.z - origin.z) * cell).clamp(0.0, size);
@@ -133,7 +135,13 @@ impl Radar {
         }
         let dot = |ui: &mut Ui, p: Vec3, col: [f32; 4], r: f32| {
             let (px, py) = to(p);
-            ui.rect(px - r - s, py - r - s, 2.0 * r + 2.0 * s, 2.0 * r + 2.0 * s, [0.0, 0.0, 0.0, 0.8]);
+            ui.rect(
+                px - r - s,
+                py - r - s,
+                2.0 * r + 2.0 * s,
+                2.0 * r + 2.0 * s,
+                [0.0, 0.0, 0.0, 0.8],
+            );
             ui.rect(px - r, py - r, 2.0 * r, 2.0 * r, col);
         };
         if let Some(b) = bomb {
@@ -150,7 +158,13 @@ impl Radar {
         let dir = Vec3::new(me.1.x, 0.0, me.1.z).normalize_or_zero();
         for k in 1..=4 {
             let f = k as f32 * 1.6 * s;
-            ui.rect(px + dir.x * f - s / 2.0, py + dir.z * f - s / 2.0, s, s, [1.0, 1.0, 1.0, 0.9]);
+            ui.rect(
+                px + dir.x * f - s / 2.0,
+                py + dir.z * f - s / 2.0,
+                s,
+                s,
+                [1.0, 1.0, 1.0, 0.9],
+            );
         }
         dot(ui, me.0, [1.0, 1.0, 1.0, 1.0], 2.0 * s);
     }
@@ -206,7 +220,8 @@ mod tests {
         let mut r = Radar::default();
         r.update(&w, Vec3::new(0.5, 11.0, 0.5));
         assert_eq!(r.cells.len(), SIDE * SIDE);
-        let at = |dx: i32, dz: i32| r.cells[((dz + RADIUS) as usize) * SIDE + (dx + RADIUS) as usize];
+        let at =
+            |dx: i32, dz: i32| r.cells[((dz + RADIUS) as usize) * SIDE + (dx + RADIUS) as usize];
         assert_eq!(at(3, 0), 5);
         assert_eq!(at(0, 0), 3);
     }

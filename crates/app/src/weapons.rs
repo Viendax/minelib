@@ -594,8 +594,8 @@ impl WeaponDef {
     /// Vitesse de course arme en main (unités de CS2 ; 250 au couteau), et à la lunette.
     pub fn speed(&self, scoped: bool) -> u8 {
         let (open, scope) = match self.name {
-            "Glock-18" | "USP-S" | "P2000" | "Dual Berettas" | "P250" | "Five-SeveN"
-            | "Tec-9" | "CZ75-Auto" | "MAC-10" | "MP9" | "PP-Bizon" => (240, 240),
+            "Glock-18" | "USP-S" | "P2000" | "Dual Berettas" | "P250" | "Five-SeveN" | "Tec-9"
+            | "CZ75-Auto" | "MAC-10" | "MP9" | "PP-Bizon" => (240, 240),
             "Desert Eagle" => (230, 230),
             "R8 Revolver" => (220, 220),
             "MP7" | "Nova" | "FAMAS" => (220, 220),

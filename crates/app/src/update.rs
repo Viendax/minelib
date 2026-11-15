@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 81;
+pub const VERSION: u32 = 82;
 const REPO: &str = "https://api.github.com/repos/Viendax/minelib/releases";
 const EVERY: Duration = Duration::from_secs(600);
 
@@ -95,7 +95,8 @@ enum Latest {
 }
 
 fn get(url: &str) -> std::result::Result<String, ureq::Error> {
-    let mut resp = http().get(url)
+    let mut resp = http()
+        .get(url)
         .header("User-Agent", "minelib-updater")
         .header("Accept", "application/vnd.github+json")
         .call()?;
@@ -109,7 +110,9 @@ fn fetch_latest() -> Result<Latest> {
             _ => Latest::UpToDate,
         }),
         Err(ureq::Error::StatusCode(404)) => Ok(Latest::NoRelease),
-        Err(ureq::Error::StatusCode(403)) => Err(anyhow!("GitHub limite les demandes, réessai plus tard")),
+        Err(ureq::Error::StatusCode(403)) => {
+            Err(anyhow!("GitHub limite les demandes, réessai plus tard"))
+        }
         Err(e) => Err(anyhow!(e)).context("GitHub injoignable"),
     }
 }
@@ -140,7 +143,8 @@ fn download(r: &Release, done: &AtomicU64) -> Result<Vec<u8>> {
         Some(u) => Some(fetch_sha256(u)?),
         None => None,
     };
-    let mut resp = http().get(&r.url)
+    let mut resp = http()
+        .get(&r.url)
         .header("User-Agent", "minelib-updater")
         .call()
         .context("téléchargement")?;
@@ -165,7 +169,9 @@ fn download(r: &Release, done: &AtomicU64) -> Result<Vec<u8>> {
     if let Some(want) = expected {
         let got: [u8; 32] = Sha256::digest(&bytes).into();
         if got != want {
-            return Err(anyhow!("empreinte différente de celle publiée : fichier refusé"));
+            return Err(anyhow!(
+                "empreinte différente de celle publiée : fichier refusé"
+            ));
         }
     }
     Ok(bytes)
@@ -280,9 +286,8 @@ impl Updater {
     pub fn new() -> Self {
         // Lancé par le lanceur : c'est lui qui tient le jeu à jour depuis GitHub.
         let by_launcher = std::env::var_os("MINELIB_LAUNCHER").is_some();
-        let enabled = cfg!(windows)
-            && std::env::var_os("MINELIB_NO_UPDATE").is_none()
-            && !by_launcher;
+        let enabled =
+            cfg!(windows) && std::env::var_os("MINELIB_NO_UPDATE").is_none() && !by_launcher;
         let mut integrity_rx = None;
         if enabled {
             cleanup();
@@ -460,7 +465,10 @@ mod tests {
         let r = parse_release(json).unwrap();
         assert_eq!(r.sha256_url.as_deref(), Some("https://x/g.sha"));
         let hex = "00".repeat(31) + "ff";
-        assert_eq!(parse_sha256(&format!("{hex}  minelib.exe\n")).unwrap()[31], 0xff);
+        assert_eq!(
+            parse_sha256(&format!("{hex}  minelib.exe\n")).unwrap()[31],
+            0xff
+        );
         assert!(parse_sha256("pas une empreinte").is_none());
         assert!(parse_sha256(&"zz".repeat(32)).is_none());
     }

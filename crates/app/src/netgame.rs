@@ -141,6 +141,8 @@ pub enum Local {
         heard: bool,
         hits: Vec<Vec3>,
     },
+    /// Un autre joueur court près d'ici : bruit de pas en `pos`.
+    Step(Vec3),
     /// Ce que le joueur porte vraiment selon l'hôte (armes, grenades).
     Guns {
         guns: (u8, u8),
@@ -477,7 +479,10 @@ fn dbg_alive(tag: &str, t: u64, who: u64, what: &str, m: &Match) {
         let k = (tag.to_string(), id);
         if map.get(&k) != Some(&p.alive) {
             map.insert(k, p.alive);
-            eprintln!("ALIVE {tag} t={t} after who={who} {what}: joueur {id} -> {}", p.alive);
+            eprintln!(
+                "ALIVE {tag} t={t} after who={who} {what}: joueur {id} -> {}",
+                p.alive
+            );
         }
     }
 }
@@ -875,9 +880,9 @@ impl Auditor {
                             ToHost::Team(team) => {
                                 settle!(m.switch_team(who, *team).into_iter().collect())
                             }
-                            ToHost::Drop { weapon } => {
-                                if let Some(at) = me.map(|p| p.pos) {
-                                    m.drop_gun(who, *weapon, at);
+                            ToHost::Drop { weapon, at } => {
+                                if let Some(from) = me.map(|p| p.pos) {
+                                    m.toss(who, *weapon, from, Vec3::from(*at));
                                 }
                             }
                             ToHost::Pickup { id } => {
@@ -1113,6 +1118,14 @@ const BACKUP_EVERY: u32 = 256;
 /// Positions de tous les joueurs à un pas : (joueur, pieds, accroupi).
 type Frame = Vec<(u64, Vec3, f32)>;
 
+/// Bruits de pas : au-dessus de cette vitesse au sol (blocs/s), on court et les autres
+/// l'entendent (135 unités de CS sur 250).
+pub const STEP_SPEED: f32 = crate::player::FPS_SPRINT * 135.0 / 250.0;
+/// Distance entre deux pas (blocs).
+pub const STRIDE: f32 = crate::player::FPS_SPRINT * 0.34;
+/// Portée des bruits de pas (blocs).
+const HEARD_STEPS: f32 = 32.0;
+
 pub struct Host {
     link: Sender<Inbound>,
     pseudo: String,
@@ -1141,6 +1154,8 @@ pub struct Host {
     local_blind: bool,
     /// Vitesse permise par ce que tient le joueur de l'hôte (unités de CS).
     local_carry: u8,
+    /// Bruits de pas : dernière position et distance parcourue en courant, par joueur.
+    strides: HashMap<u64, (Vec3, f32)>,
     kill_flags: u8,
     /// Copies envoyées d'elles-mêmes (les essais les prennent à la main).
     auto_backup: bool,
@@ -1323,6 +1338,7 @@ impl NetGame {
             smokes: Vec::new(),
             local_blind: false,
             local_carry: 250,
+            strides: HashMap::new(),
             kill_flags: 0,
             auto_backup: true,
             out: Vec::new(),
@@ -1958,6 +1974,7 @@ impl NetGame {
             smokes: Vec::new(),
             local_blind: false,
             local_carry: 250,
+            strides: HashMap::new(),
             kill_flags: 0,
             auto_backup: true,
             out: Vec::new(),
@@ -2014,15 +2031,19 @@ impl NetGame {
         }
     }
 
-    /// Arme lâchée (touche G).
-    pub fn drop_weapon(&mut self, weapon: u8) {
+    /// Arme, grenade ou bombe lâchée (touche G), qui retombe en `at`.
+    pub fn drop_weapon(&mut self, weapon: u8, at: Vec3) {
+        let msg = ToHost::Drop {
+            weapon,
+            at: at.to_array(),
+        };
         match self {
             NetGame::Host(h) => {
-                let at = h.local_pos;
-                h.record(0, Move::Rule(Rule::Msg(ToHost::Drop { weapon })));
-                h.ground_dirty |= h.m.drop_gun(0, weapon, at);
+                let from = h.local_pos;
+                h.record(0, Move::Rule(Rule::Msg(msg)));
+                h.ground_dirty |= h.m.toss(0, weapon, from, at);
             }
-            NetGame::Guest(g) => g.to_host(&ToHost::Drop { weapon }),
+            NetGame::Guest(g) => g.to_host(&msg),
         }
     }
 
@@ -2093,6 +2114,58 @@ impl Host {
                 data: game::encode(msg),
             },
         );
+    }
+
+    /// Bruits de pas : qui court (au-dessus de la vitesse de marche, au sol, vivant) fait
+    /// un pas tous les `STRIDE` blocs, entendu par les joueurs à moins de `HEARD_STEPS`
+    /// blocs (comme dans CS : marcher ou s'accroupir est silencieux pour les autres).
+    fn footsteps(&mut self, local_ground: bool, dt: f32, out: &mut Vec<Local>) {
+        let mut walkers: Vec<(u64, Vec3, bool)> = Vec::new();
+        if self.playing {
+            walkers.push((0, self.local_pos, local_ground));
+        }
+        walkers.extend(
+            self.peers
+                .iter()
+                .filter(|(_, r)| r.ready)
+                .map(|(&id, r)| (id, r.player.pos, r.player.on_ground)),
+        );
+        walkers.sort_by_key(|w| w.0);
+        let alive = |m: &Match, id: u64| m.players.get(&id).is_some_and(|p| p.alive);
+        let mut steps = Vec::new();
+        for &(id, pos, ground) in &walkers {
+            let e = self.strides.entry(id).or_insert((pos, 0.0));
+            let d = Vec3::new(pos.x - e.0.x, 0.0, pos.z - e.0.z).length();
+            e.0 = pos;
+            let running = d / dt.max(1e-4) > STEP_SPEED && d < 2.0;
+            if ground && running && alive(&self.m, id) {
+                e.1 += d;
+                if e.1 >= STRIDE {
+                    e.1 -= STRIDE;
+                    steps.push((id, pos));
+                }
+            } else {
+                // Le premier pas d'une course vient vite.
+                e.1 = STRIDE * 0.7;
+            }
+        }
+        self.strides
+            .retain(|id, _| walkers.iter().any(|w| w.0 == *id));
+        for (who, pos) in steps {
+            let msg = ToPeer::Step {
+                who,
+                pos: pos.to_array(),
+            };
+            for &(id, at, _) in &walkers {
+                if id != who && (at - pos).length() < HEARD_STEPS {
+                    if id == 0 {
+                        out.push(Local::Step(pos));
+                    } else {
+                        self.send_to(id, &msg);
+                    }
+                }
+            }
+        }
     }
 
     fn broadcast(&self, msg: &ToPeer) {
@@ -2494,10 +2567,7 @@ impl Host {
         let shooter = if who == 0 {
             local.as_ref()
         } else {
-            self.peers
-                .get(&who)
-                .filter(|r| r.ready)
-                .map(|r| &r.player)
+            self.peers.get(&who).filter(|r| r.ready).map(|r| &r.player)
         };
         let ok = fire_ok(&mut self.m, world, who, shooter, weapon, origin, dirs.len());
         if who == 0 {
@@ -2612,9 +2682,9 @@ impl Host {
             }
             // Ce que le joueur dit porter ne compte pas : les règles le savent.
             ToHost::Loadout { .. } => {}
-            ToHost::Drop { weapon } => {
-                if let Some(at) = self.feet_of(peer) {
-                    self.ground_dirty |= self.m.drop_gun(peer, weapon, at);
+            ToHost::Drop { weapon, at } => {
+                if let Some(from) = self.feet_of(peer) {
+                    self.ground_dirty |= self.m.toss(peer, weapon, from, Vec3::from(at));
                 }
             }
             ToHost::Pickup { id } => out.extend(self.pickup(peer, id)),
@@ -2625,10 +2695,8 @@ impl Host {
                     .peers
                     .get(&peer)
                     .is_some_and(|r| (r.player.eye() - Vec3::from(pos)).length() < 3.0);
-                let ok = alive
-                    && near
-                    && Vec3::from(vel).length() < 40.0
-                    && self.m.throw(peer, nade);
+                let ok =
+                    alive && near && Vec3::from(vel).length() < 40.0 && self.m.throw(peer, nade);
                 if !ok {
                     self.send_guns(peer);
                 }
@@ -2755,6 +2823,7 @@ impl Host {
         }
         let ev = self.m.tick(dt, &places);
         self.events(ev, &mut out);
+        self.footsteps(local.on_ground, dt, &mut out);
         self.out.extend(out);
         if !self.spawns.is_empty() {
             self.do_spawns(world);
@@ -2874,7 +2943,12 @@ impl Host {
             .peers
             .iter()
             .filter(|(_, r)| r.ready)
-            .map(|(&id, r)| (id, self.net_player(id, &self.shown_of(id), &r.player, r.weapon)))
+            .map(|(&id, r)| {
+                (
+                    id,
+                    self.net_player(id, &self.shown_of(id), &r.player, r.weapon),
+                )
+            })
             .collect();
         let team = |id: u64| self.m.players.get(&id).map(|p| p.team);
         for (&id, r) in &self.peers {
@@ -3174,6 +3248,11 @@ impl Guest {
                 heard: self.you != Some(who),
                 hits: hits.into_iter().map(Vec3::from).collect(),
             }),
+            ToPeer::Step { who, pos } => {
+                if self.you != Some(who) {
+                    out.push(Local::Step(Vec3::from(pos)));
+                }
+            }
             ToPeer::Respawn { state, reset, team } => {
                 self.pending.clear();
                 self.outbox.clear();
@@ -3459,15 +3538,16 @@ mod tests {
         let awp = WEAPONS.iter().position(|w| w.name == "AWP").unwrap() as u8;
         let ak = ak();
         host(&mut g).m.players.get_mut(&0).unwrap().guns = (ak, 255);
-        g.drop_weapon(awp);
+        g.drop_weapon(awp, spawn);
         assert!(g.ground().is_empty(), "pas une arme qu'il porte");
-        g.drop_weapon(ak);
+        g.drop_weapon(ak, spawn);
         assert_eq!(g.ground().len(), 1);
         let h = host(&mut g);
         h.m.ground.push(GroundGun {
             id: 99,
             weapon: awp,
             pos: spawn.to_array(),
+            from: spawn.to_array(),
         });
         h.m.players.get_mut(&0).unwrap().guns = (ak, 255);
         let out = g.pickup(99);
@@ -3972,7 +4052,10 @@ mod tests {
         // forte charge) est toléré, jamais plus de quelques-uns.
         let proofs: Vec<_> = conflicts.iter().filter(|c| c.proof).collect();
         assert!(proofs.is_empty(), "aucune preuve : {proofs:?}");
-        assert!(conflicts.len() <= 3, "presque aucun soupçon : {conflicts:?}");
+        assert!(
+            conflicts.len() <= 3,
+            "presque aucun soupçon : {conflicts:?}"
+        );
         assert_eq!(
             g.audit.results.first().map(game::encode),
             Some(game::encode(&summary)),

@@ -62,9 +62,9 @@ mod netgame;
 mod player;
 mod player_model;
 mod radar;
-mod skin;
 mod save;
 mod session;
+mod skin;
 mod streaming;
 mod update;
 mod voice;
@@ -1362,7 +1362,10 @@ impl Game {
                 .into_iter()
                 .find(|(d, _)| *d == dir)
                 .map_or_else(|| "Carte".into(), |(_, n)| n);
-            log::info!("carte {} renvoyée au relais", minelib_net::crypto::hex(&sig[..6]));
+            log::info!(
+                "carte {} renvoyée au relais",
+                minelib_net::crypto::hex(&sig[..6])
+            );
             self.accounts.room(Cmd::UploadMap {
                 sig,
                 name,
@@ -1416,10 +1419,7 @@ impl Game {
         #[cfg(not(windows))]
         {
             let path = self.paths.root.join("skin.png");
-            self.skin_msg = Some((
-                format!("Dépose ton skin ici : {}", path.display()),
-                true,
-            ));
+            self.skin_msg = Some((format!("Dépose ton skin ici : {}", path.display()), true));
             if path.exists() {
                 self.use_skin_file(&path);
             }
@@ -1467,15 +1467,14 @@ impl Game {
             s.player.flying = false;
             s.voice = Some(voice::Voice::new(link.clone()));
             s.net = Some(netgame::NetGame::guest(link, sig));
-            s.chat
-                .say(
-                    if host.is_empty() {
-                        "Partie rejointe.".to_string()
-                    } else {
-                        format!("Partie de {host} rejointe.")
-                    },
-                    chat::YELLOW,
-                );
+            s.chat.say(
+                if host.is_empty() {
+                    "Partie rejointe.".to_string()
+                } else {
+                    format!("Partie de {host} rejointe.")
+                },
+                chat::YELLOW,
+            );
         }
     }
 
@@ -1902,9 +1901,7 @@ impl Game {
         let packs = c.button("Textures", cx, y, 200.0, true);
         y += 24.0 * s;
         // Langue : menu déroulant (ouvert plus bas, par-dessus le reste).
-        let lang = i18n::LANGS
-            .get(i18n::current())
-            .map_or("Français", |l| l.1);
+        let lang = i18n::LANGS.get(i18n::current()).map_or("Français", |l| l.1);
         let lang_y = y;
         let arrow = if self.lang_open { "^" } else { "v" };
         let lang_label = format!("Langue : {lang} {arrow}");
@@ -1934,7 +1931,13 @@ impl Game {
             let py = c.h * 0.22;
             c.frame(px - 45.0 * s, py - 6.0 * s, 90.0 * s, ph + 60.0 * s);
             let yaw = self.time * 0.8;
-            c.ui.model(skin::preview(self.my_skin.clone(), px, py + ph / 2.0, ph, yaw));
+            c.ui.model(skin::preview(
+                self.my_skin.clone(),
+                px,
+                py + ph / 2.0,
+                ph,
+                yaw,
+            ));
             let busy = self.skin_pick.is_some();
             want_pick = c.button("Changer de skin", px, py + ph + 8.0 * s, 84.0, !busy);
             if self.my_skin.is_some()
@@ -1951,7 +1954,13 @@ impl Game {
                 let col = if *ok { GOLD } else { [1.0, 0.45, 0.4, 1.0] };
                 let t = crate::menu::fit(m, 120.0 * s, (s / 2.0).floor().max(1.0));
                 let tw = Ui::text_width(&t, (s / 2.0).floor().max(1.0));
-                c.ui.text(px - tw / 2.0, py + ph + 52.0 * s, (s / 2.0).floor().max(1.0), col, t);
+                c.ui.text(
+                    px - tw / 2.0,
+                    py + ph + 52.0 * s,
+                    (s / 2.0).floor().max(1.0),
+                    col,
+                    t,
+                );
             }
         }
         // Liste des langues, par-dessus.
@@ -1960,12 +1969,24 @@ impl Game {
             let row = 14.0 * s;
             let lw = 200.0 * s;
             let top = lang_y + 11.0 * s;
-            c.ui.rect(cx - lw / 2.0, top, lw, row * i18n::LANGS.len() as f32, [0.05, 0.05, 0.07, 0.97]);
+            c.ui.rect(
+                cx - lw / 2.0,
+                top,
+                lw,
+                row * i18n::LANGS.len() as f32,
+                [0.05, 0.05, 0.07, 0.97],
+            );
             for (i, (code, name)) in i18n::LANGS.iter().enumerate() {
                 let ry = top + i as f32 * row;
                 let hover = c.hovered(cx - lw / 2.0, ry, lw, row);
                 if hover || i == i18n::current() {
-                    c.ui.rect(cx - lw / 2.0, ry, lw, row, [1.0, 1.0, 1.0, if hover { 0.15 } else { 0.07 }]);
+                    c.ui.rect(
+                        cx - lw / 2.0,
+                        ry,
+                        lw,
+                        row,
+                        [1.0, 1.0, 1.0, if hover { 0.15 } else { 0.07 }],
+                    );
                 }
                 // Le nom de chaque langue dans sa langue (jamais traduit).
                 let tw = Ui::text_width(name, s);
@@ -1974,7 +1995,10 @@ impl Game {
                     picked = Some(*code);
                 }
             }
-            if c.click && picked.is_none() && !c.hovered(cx - lw / 2.0, lang_y - 10.0 * s, lw, row * 8.0 + 22.0 * s) {
+            if c.click
+                && picked.is_none()
+                && !c.hovered(cx - lw / 2.0, lang_y - 10.0 * s, lw, row * 8.0 + 22.0 * s)
+            {
                 self.lang_open = false;
             }
         }
@@ -2803,8 +2827,7 @@ impl GameLoop for Game {
                 let s = (sizef.1 / 300.0).floor().max(1.0);
                 let t = "Préparation des shaders…";
                 let w = Ui::text_width(t, s);
-                self.ui
-                    .text((sizef.0 - w) / 2.0, sizef.1 * 0.4, s, GOLD, t);
+                self.ui.text((sizef.0 - w) / 2.0, sizef.1 * 0.4, s, GOLD, t);
             }
             self.draw_message(size, dt);
             if let Some(s) = &self.session {

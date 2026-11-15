@@ -608,6 +608,60 @@ pub fn bomb(pos: Vec3, blink: bool, light: [f32; 3]) -> Vec<EntityVertex> {
     out
 }
 
+/// Modèle en triangles (le même qu'en main) placé dans le monde par `xf`, éclairé comme
+/// la vue à la première personne.
+pub fn tris_in_world(
+    out: &mut Vec<EntityVertex>,
+    xf: Mat4,
+    tris: &[crate::weapons::Tri],
+    light: [f32; 3],
+) {
+    let sun = Vec3::new(0.3, 0.9, 0.4).normalize();
+    for t in tris {
+        let n = (t.p[1] - t.p[0]).cross(t.p[2] - t.p[0]).normalize_or_zero();
+        let n = xf.transform_vector3(n).normalize_or_zero();
+        let shade = 0.45 + 0.55 * n.dot(sun).abs();
+        let c = [0, 1, 2].map(|i| (t.color[i] * 2.2 + 0.015) * shade * light[i]);
+        for p in t.p {
+            out.push(EntityVertex {
+                pos: xf.transform_point3(p).to_array(),
+                color: c,
+                uv: [0.0, 0.0],
+                layer: -1,
+            });
+        }
+    }
+}
+
+/// Objet posé au sol (ou en train de retomber) : le modèle `tris` couché sur le côté,
+/// tourné selon `turn`, `pos` étant le point du sol où il repose. `spin` fait tourner
+/// l'objet pendant sa chute (0 une fois posé).
+pub fn item_on_ground(
+    out: &mut Vec<EntityVertex>,
+    tris: &[crate::weapons::Tri],
+    pos: Vec3,
+    turn: f32,
+    lie: bool,
+    spin: f32,
+    light: [f32; 3],
+) {
+    let tilt = if lie {
+        Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2)
+    } else {
+        Mat4::IDENTITY
+    };
+    let base = Mat4::from_rotation_y(turn) * Mat4::from_rotation_x(spin) * tilt;
+    // Le point le plus bas touche le sol.
+    let low = tris
+        .iter()
+        .flat_map(|t| t.p)
+        .map(|p| base.transform_point3(p).y)
+        .fold(f32::MAX, f32::min);
+    let low = if low.is_finite() { low } else { 0.0 };
+    let xf = Mat4::from_translation(pos - Vec3::Y * low) * base;
+    tris_in_world(out, xf, tris, light);
+}
+
 /// Arme posée au sol : silhouette sombre de sa longueur, tournée selon `turn`.
 pub fn gun_on_ground(pos: Vec3, length: f32, turn: f32, light: [f32; 3]) -> Vec<EntityVertex> {
     let mut out = Vec::new();

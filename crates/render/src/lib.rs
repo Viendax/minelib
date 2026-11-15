@@ -48,7 +48,6 @@ use winit::window::Window;
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32, 2 => Uint32];
 
-
 /// Disposition des sommets des blocs.
 pub(crate) fn world_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
@@ -820,7 +819,13 @@ impl Renderer {
                 blend,
             )
         };
-        let sky_pipeline = make("ciel", "vs_sky", "fs_sky", wgpu::CompareFunction::Always, None);
+        let sky_pipeline = make(
+            "ciel",
+            "vs_sky",
+            "fs_sky",
+            wgpu::CompareFunction::Always,
+            None,
+        );
         let outline_pipeline = make(
             "contour",
             "vs_outline",

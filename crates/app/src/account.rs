@@ -160,9 +160,7 @@ fn auto_relay(
         let mine = minelib_relay::public_key(dir);
         let ads: Vec<minelib_p2p::Ad> = list
             .into_iter()
-            .filter(|a| {
-                !failed.contains(&a.node) && a.node != node.id() && Some(a.noise) != mine
-            })
+            .filter(|a| !failed.contains(&a.node) && a.node != node.id() && Some(a.noise) != mine)
             .take(4)
             .collect();
         for a in &ads {
@@ -525,7 +523,10 @@ impl Accounts {
             }
         }
         // Connexion automatique ratée faute de relais joignable : nouvel essai, en silence.
-        if self.auto_next.is_some_and(|t| std::time::Instant::now() >= t) {
+        if self
+            .auto_next
+            .is_some_and(|t| std::time::Instant::now() >= t)
+        {
             self.auto_next = None;
             if self.account.is_none() && !self.need_totp {
                 self.auto_login();

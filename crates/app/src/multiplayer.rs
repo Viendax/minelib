@@ -598,7 +598,10 @@ pub fn fps_screen(
     let cx = avail / 2.0;
     let half = (150.0 / 2.0 + 3.0) * s;
     // En lobby, seul son hôte lance (pour tout le monde).
-    let leader = lobby.members.first().is_none_or(|m| m.eq_ignore_ascii_case(lobby.me));
+    let leader = lobby
+        .members
+        .first()
+        .is_none_or(|m| m.eq_ignore_ascii_case(lobby.me));
     let label = if leader { "Jouer" } else { "L'hôte lance" };
     let search = c.button(
         label,
@@ -785,8 +788,7 @@ fn lobby_panel(
             name,
         );
         if !hint.is_empty() {
-            c.ui
-                .text(lx + inner - hw - 2.0 * s, ry + 4.0 * s, ds, GOLD, hint);
+            c.ui.text(lx + inner - hw - 2.0 * s, ry + 4.0 * s, ds, GOLD, hint);
         }
         if hover && can && c.click {
             out = FpsAction::Party(proto::PARTY_INVITE, p.clone());
@@ -810,8 +812,7 @@ fn lobby_panel(
             c.ui.text(lx + 9.0 * s, sy + 3.0 * s, ds, GREY, "place libre");
             continue;
         };
-        c.ui
-            .rect(lx + 2.0 * s, sy + 3.0 * s, 4.0 * s, 6.0 * s, *col);
+        c.ui.rect(lx + 2.0 * s, sy + 3.0 * s, 4.0 * s, 6.0 * s, *col);
         let tag = if k == 0 && v.members.len() > 1 {
             " (hôte)"
         } else {
@@ -844,7 +845,13 @@ fn lobby_panel(
         let mx = mx.min(c.w - mw - 2.0 * s);
         let my = my.min(c.h - mh - 2.0 * s);
         c.ui.rect(mx, my, mw, mh, [0.05, 0.05, 0.07, 0.97]);
-        c.ui.text(mx + 4.0 * s, my + 2.0 * s, ds, GREY, fit(&p, mw - 8.0 * s, ds));
+        c.ui.text(
+            mx + 4.0 * s,
+            my + 2.0 * s,
+            ds,
+            GREY,
+            fit(&p, mw - 8.0 * s, ds),
+        );
         let kick = c.button("Exclure", mx + mw / 2.0, my + 10.0 * s, 96.0, true);
         let promote = c.button("Promouvoir hôte", mx + mw / 2.0, my + 33.0 * s, 96.0, true);
         if kick {

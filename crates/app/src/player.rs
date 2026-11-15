@@ -348,7 +348,11 @@ impl Player {
         // Accroupi : vitesse d'accroupi tout de suite (dès l'appui, sans attendre que
         // le corps soit descendu).
         // Arme en main : même rapport que dans CS (vitesse de l'arme / 250).
-        let carry = if self.carry == 0 { 250.0 } else { self.carry as f32 } / 250.0;
+        let carry = if self.carry == 0 {
+            250.0
+        } else {
+            self.carry as f32
+        } / 250.0;
         let max_speed = carry
             * if m.sneak {
                 FPS_SPRINT * cs::DUCK_MULT

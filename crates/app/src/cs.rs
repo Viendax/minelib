@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use glam::Vec3;
 use minelib_net::game::{
     bomb, phase, reason, GroundGun, MatchHud, MatchSummary, ScoreRow, SummaryPlayer, Zone, CT,
-    ITEM_HELMET, ITEM_KEVLAR, ITEM_KIT, ITEM_NADE, T,
+    DROP_BOMB, ITEM_HELMET, ITEM_KEVLAR, ITEM_KIT, ITEM_NADE, T,
 };
 
 use crate::weapons::WEAPONS;
@@ -55,6 +55,10 @@ pub const KEVLAR_PRICE: u32 = 650;
 pub const HELMET_PRICE: u32 = 1_000;
 /// Distance (blocs) pour ramasser la bombe, et pour la désamorcer.
 const PICKUP: f32 = 1.2;
+/// Distance au sol au plus d'un objet lâché (lancer en cloche d'environ 4 blocs).
+pub const MAX_TOSS: f32 = 6.0;
+/// Hauteur de chute au plus d'un objet lâché (depuis un toit, au-dessus du vide).
+const MAX_TOSS_FALL: f32 = 40.0;
 const DEFUSE_REACH: f32 = 1.8;
 /// Rayon de l'explosion de la bombe (écart type de la courbe de dégâts de CS, en blocs).
 const BOMB_SIGMA: f32 = 14.8;
@@ -194,6 +198,8 @@ pub struct Match {
     pub bomb: u8,
     pub carrier: Option<u64>,
     pub bomb_pos: Vec3,
+    /// Bombe lâchée : celui qui l'a lâchée ne peut la reprendre avant ce délai (s).
+    bomb_lock: Option<(u64, f32)>,
     pub site: u8,
     planter: Option<u64>,
     plant_progress: f32,
@@ -280,6 +286,7 @@ impl Match {
             bomb: bomb::NONE,
             carrier: None,
             bomb_pos: Vec3::ZERO,
+            bomb_lock: None,
             site: 0,
             planter: None,
             plant_progress: 0.0,
@@ -371,8 +378,33 @@ impl Match {
         }
     }
 
-    /// Pose au sol une arme que le joueur porte (lâchée, ou celle d'un mort).
+    /// Pose au sol une arme que le joueur porte (celle d'un mort, ou l'ancienne lors d'un
+    /// échange) : elle tombe à ses pieds.
     pub fn drop_gun(&mut self, id: u64, weapon: u8, at: Vec3) -> bool {
+        self.toss(id, weapon, at, at)
+    }
+
+    /// Lâche (touche G) une arme, une grenade ou la bombe (`DROP_BOMB`) lancée en cloche
+    /// depuis `from` (les pieds du joueur) jusqu'à `at`, le point de chute que le joueur a
+    /// calculé : refusé s'il est trop loin pour un lancer (triche).
+    pub fn toss(&mut self, id: u64, weapon: u8, from: Vec3, at: Vec3) -> bool {
+        let d = at - from;
+        let flat = Vec3::new(d.x, 0.0, d.z).length();
+        if !at.is_finite() || flat > MAX_TOSS || d.y > 3.0 || d.y < -MAX_TOSS_FALL {
+            return false;
+        }
+        if weapon == DROP_BOMB {
+            if self.carrier != Some(id) || self.bomb != bomb::CARRIED {
+                return false;
+            }
+            self.carrier = None;
+            self.bomb = bomb::DROPPED;
+            self.bomb_pos = at;
+            // Celui qui la lâche ne la reprend pas aussitôt (elle peut retomber à ses pieds
+            // contre un mur).
+            self.bomb_lock = Some((id, 1.0));
+            return true;
+        }
         // Grenade (`ITEM_NADE` + type) : une de moins.
         if let Some(n) = nade_code(weapon) {
             match self.players.get_mut(&id) {
@@ -397,7 +429,11 @@ impl Match {
             id: self.next_gun,
             weapon,
             pos: (at + Vec3::Y * 0.05).to_array(),
+            from: (from + Vec3::Y * 1.3).to_array(),
         });
+        if from == at {
+            self.ground.last_mut().expect("posée").from = (at + Vec3::Y * 0.05).to_array();
+        }
         self.next_gun += 1;
         true
     }
@@ -1078,6 +1114,7 @@ impl Match {
         self.live_for = 0.0;
         self.bomb = bomb::NONE;
         self.carrier = None;
+        self.bomb_lock = None;
         self.planter = None;
         self.plant_progress = 0.0;
         self.defuser = None;
@@ -1166,13 +1203,22 @@ impl Match {
                 }
             }
             bomb::DROPPED => {
-                // Un T vivant qui passe dessus la ramasse.
+                // Un T vivant qui passe dessus la ramasse (sauf celui qui vient de la lâcher).
+                if let Some((_, t)) = &mut self.bomb_lock {
+                    *t -= dt;
+                    if *t <= 0.0 {
+                        self.bomb_lock = None;
+                    }
+                }
+                let locked = self.bomb_lock.map(|l| l.0);
                 let taker = places
                     .iter()
                     .filter(|(id, _)| {
-                        self.players
-                            .get(id)
-                            .is_some_and(|p| p.alive && p.present && p.team == T)
+                        Some(**id) != locked
+                            && self
+                                .players
+                                .get(id)
+                                .is_some_and(|p| p.alive && p.present && p.team == T)
                     })
                     .find(|(_, pl)| (pl.feet - self.bomb_pos).length() < PICKUP)
                     .map(|(&id, _)| id);
@@ -1447,6 +1493,7 @@ impl Match {
             helmet: p.is_some_and(|p| p.helmet),
             kit: p.is_some_and(|p| p.kit),
             bomb: bomb_state,
+            carrying: self.bomb == bomb::CARRIED && self.carrier == Some(id),
             bomb_pos: self.bomb_pos.to_array(),
             progress: progress.clamp(0.0, 1.0),
             can_buy: self.can_buy(id, at),
@@ -1551,6 +1598,51 @@ mod tests {
         }
         assert!(started && m.phase == phase::FREEZE);
         m
+    }
+
+    #[test]
+    fn items_are_tossed_within_reach_and_the_bomb_can_be_dropped() {
+        let mut m = full_match();
+        while m.phase == phase::FREEZE {
+            m.tick(1.0 / 128.0, &BTreeMap::new());
+        }
+        let t = m.carrier.expect("un T a la bombe");
+        let feet = Vec3::new(0.0, 10.0, 0.0);
+        let far = feet + Vec3::new(9.0, 0.0, 0.0);
+        let near = feet + Vec3::new(0.0, 0.0, -4.0);
+        assert!(!m.toss(t, DROP_BOMB, feet, far), "trop loin : triche");
+        assert!(m.toss(t, DROP_BOMB, feet, near));
+        assert_eq!(m.bomb, bomb::DROPPED);
+        assert_eq!(m.bomb_pos, near);
+        assert!(m.carrier.is_none());
+        assert!(!m.toss(t, DROP_BOMB, feet, near), "plus de bombe à lâcher");
+        // Retombée à ses pieds : il ne la reprend pas tout de suite, un autre T oui.
+        let place = |at: Vec3| Place {
+            feet: at,
+            on_ground: true,
+            speed: 0.0,
+        };
+        let mut places = BTreeMap::new();
+        places.insert(t, place(near));
+        m.tick(1.0 / 128.0, &places);
+        assert_eq!(m.bomb, bomb::DROPPED, "pas reprise aussitôt");
+        let mate = m
+            .players
+            .iter()
+            .find(|(&i, p)| i != t && p.team == T)
+            .map(|(&i, _)| i)
+            .unwrap();
+        places.insert(mate, place(near));
+        m.tick(1.0 / 128.0, &places);
+        assert_eq!(m.carrier, Some(mate));
+        // Grenade lancée : une de moins, au sol à l'arrivée, avec son point de départ.
+        m.players.get_mut(&mate).unwrap().nades[0] = 1;
+        assert!(m.toss(mate, ITEM_NADE as u8, feet, near));
+        assert_eq!(m.players[&mate].nades[0], 0);
+        let g = *m.ground.last().unwrap();
+        assert!((Vec3::from(g.pos) - near).length() < 0.1);
+        assert!(Vec3::from(g.from).y > feet.y + 1.0);
+        assert!(!m.toss(mate, ITEM_NADE as u8, feet, near), "plus de grenade");
     }
 
     fn kill_team(m: &mut Match, team: u8) {

@@ -25,7 +25,10 @@ impl Skin {
     /// Lit et vérifie un PNG de skin.
     pub fn from_png(bytes: &[u8]) -> Result<Arc<Skin>> {
         if bytes.len() > MAX_BYTES {
-            bail!("fichier trop gros ({} Ko, 24 Ko au plus)", bytes.len() / 1024);
+            bail!(
+                "fichier trop gros ({} Ko, 24 Ko au plus)",
+                bytes.len() / 1024
+            );
         }
         // Taille lue dans l'en-tête avant de décoder : un petit fichier qui annonce une
         // image immense ne fait pas réserver des gigaoctets.
@@ -194,7 +197,12 @@ pub fn preview(
             minelib_render::VmVertex {
                 // Pixels de l'écran ; profondeur à l'envers (plus grand = plus proche, le
                 // regard du modèle est vers −z, vers nous).
-                clip: [cx + p.x * k, cy + height / 2.0 - p.y * k, 0.5 - p.z * 0.1, 1.0],
+                clip: [
+                    cx + p.x * k,
+                    cy + height / 2.0 - p.y * k,
+                    0.5 - p.z * 0.1,
+                    1.0,
+                ],
                 uv: [0.0; 2],
                 layer: minelib_render::NO_TEXTURE,
                 _pad: 0,

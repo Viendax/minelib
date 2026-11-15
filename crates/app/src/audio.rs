@@ -53,6 +53,8 @@ pub enum Sfx {
     /// Fin de rechargement, chien du R8 qui se lève.
     ReloadEnd,
     Hammer,
+    /// Bruit de pas (sol dur), un des six enregistrements pris à tour de rôle.
+    Step,
 }
 
 macro_rules! sounds {
@@ -62,6 +64,12 @@ macro_rules! sounds {
 }
 
 static FILES: &[(&str, &[u8])] = sounds!(
+    "step_1",
+    "step_2",
+    "step_3",
+    "step_4",
+    "step_5",
+    "step_6",
     "shot_glock",
     "shot_usp",
     "shot_p2000",
@@ -250,6 +258,13 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
         Sfx::ReloadEnd => ("reload_end", 0.55),
         Sfx::Hammer => ("hammer", 0.6),
         Sfx::Shell => ("shell", 0.7),
+        Sfx::Step => {
+            // Jamais deux fois le même pas de suite.
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            const STEPS: [&str; 6] = ["step_3", "step_1", "step_5", "step_2", "step_6", "step_4"];
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (STEPS[n % 6], 0.55)
+        }
     }
 }
 
