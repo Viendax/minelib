@@ -48,6 +48,7 @@ mod equip;
 mod fps;
 mod fpsmap;
 mod garant;
+mod garant_worker;
 mod gpu_plan;
 mod gpu_report;
 mod hand;
@@ -156,6 +157,10 @@ struct Game {
     updater: update::Updater,
     /// Garant indépendant (au menu : sert ou vérifie la partie d'autres joueurs).
     garant: Option<garant::Garant>,
+    /// Garant pendant qu'on joue sa propre partie FPS (deuxième connexion, son propre fil),
+    /// et s'il a déjà été tenté pour cette partie.
+    garant_worker: Option<garant_worker::GarantWorker>,
+    garant_worker_tried: bool,
     /// Disponibilité de garant annoncée au relais.
     garant_announced: Option<bool>,
     /// Un monde a été ouvert depuis le lancement (plus de mise à jour automatique sans
@@ -285,6 +290,8 @@ impl Game {
             fps_status: None,
             updater: update::Updater::new(),
             garant: None,
+            garant_worker: None,
+            garant_worker_tried: false,
             garant_announced: None,
             played: false,
             renderer: None,
@@ -1057,6 +1064,38 @@ impl Game {
             && self.searching.is_none()
             && self.options.garant;
         self.announce_garant(free);
+        // En pleine partie FPS en ligne : une deuxième connexion peut servir de garant à
+        // d'autres joueurs (le relais la préfère quand la partie vient de commencer).
+        let playing = self.options.garant
+            && self.accounts.logged_in()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.net.is_some() && s.game.mode == save::GameMode::Fps);
+        if playing {
+            if self.garant_worker.is_none() && !self.garant_worker_tried {
+                self.garant_worker_tried = true;
+                if let Some(login) = self.accounts.garant_login() {
+                    let maps = self
+                        .map_rows
+                        .iter()
+                        .filter_map(|m| Some((m.sig, m.local.clone()?)))
+                        .collect();
+                    self.garant_worker = Some(garant_worker::GarantWorker::start(
+                        login,
+                        maps,
+                        self.paths.root.join("maps"),
+                    ));
+                }
+            }
+            if self.garant_worker.as_ref().is_some_and(|w| !w.alive()) {
+                self.garant_worker = None;
+            }
+        } else {
+            // Partie finie (ou quittée) : la partie servie passe au garant en attente.
+            self.garant_worker = None;
+            self.garant_worker_tried = false;
+        }
         if self.session.is_some() {
             return;
         }

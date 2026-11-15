@@ -85,7 +85,7 @@ Le facteur est **lié à la machine** : c'est le plus bas des comptes utilisés 
 
 ### Anti-triche
 
-- **Des serveurs neutres** : la partie est servie par un **garant indépendant**, un joueur au menu sans aucun lien avec les joueurs (ni ami, ni signalé).
+- **Des serveurs neutres** : la partie est servie par un **garant indépendant**, sans aucun lien avec les joueurs (ni ami, ni signalé). De préférence, c'est un joueur qui **vient de lancer sa propre partie** : il a tout intérêt à rester en jeu. Son jeu sert l'autre partie en arrière-plan, sans toucher à ses images, et un autre garant le **relève avant la fin de sa partie**, sans coupure. À défaut, un joueur au menu sert.
 - **Tout est rejoué** : un second garant reçoit le journal complet de la partie, chaîné et infalsifiable, et **rejoue chaque déplacement, chaque tir, chaque grenade** avec le même code. Le moindre écart est une preuve.
 - **Un arbitre tranche** : en cas d'accusation, le relais confie ses propres pièces à un troisième garant sans lien avec personne. Triche confirmée par l'arbitre : **bannissement automatique** du compte et de la machine.
 - **Contre les wallhacks** : un adversaire caché derrière un mur n'est tout simplement pas envoyé à ton jeu.

@@ -154,6 +154,11 @@ pub enum Event {
     /// Session ouverte : file pour envoyer des données de jeu sans attendre
     /// (`transport::push` d'un `Request::ToHost`, `ToPeer` ou `Broadcast`).
     Link(Sender<Inbound>),
+    /// Relais joint : son adresse et sa clé (pour une deuxième connexion, de garant).
+    Relay {
+        addr: String,
+        key: [u8; 32],
+    },
     Hosted(u64),
     Joined {
         room: u64,
@@ -282,7 +287,22 @@ impl Client {
         Self::spawn_with(String::new(), None, Some(resolve))
     }
 
+    /// Deuxième connexion du compte, qui ne sert que de garant indépendant pendant que le
+    /// joueur joue sa propre partie (même relais, même clé).
+    pub fn spawn_garant(addr: String, pinned: [u8; 32]) -> Self {
+        Self::spawn_inner(addr, Some(pinned), None, true)
+    }
+
     fn spawn_with(addr: String, pinned: Option<[u8; 32]>, resolve: Option<Resolver>) -> Self {
+        Self::spawn_inner(addr, pinned, resolve, false)
+    }
+
+    fn spawn_inner(
+        addr: String,
+        pinned: Option<[u8; 32]>,
+        resolve: Option<Resolver>,
+        garant: bool,
+    ) -> Self {
         let (tx, cmd_rx) = channel::<Cmd>();
         let (ev_tx, rx) = channel::<Event>();
         std::thread::Builder::new()
@@ -290,6 +310,7 @@ impl Client {
             .spawn(move || {
                 let mut w = Worker::new(addr, pinned, ev_tx);
                 w.resolve = resolve;
+                w.garant = garant;
                 w.run(cmd_rx)
             })
             .expect("fil du relais");
@@ -374,6 +395,8 @@ struct Worker {
     pseudo: String,
     /// Clé du relais connecté (sel de l'empreinte matérielle).
     relay_pub: [u8; 32],
+    /// Connexion de garant (deuxième connexion du compte pendant qu'il joue).
+    garant: bool,
 }
 
 impl Worker {
@@ -387,6 +410,7 @@ impl Worker {
             pow_bits: 20,
             pseudo: String::new(),
             relay_pub: [0; 32],
+            garant: false,
         }
     }
 
@@ -591,10 +615,19 @@ impl Worker {
             _ => {}
         }
         self.relay_pub = key;
+        let name = if self.garant {
+            "minelib-garant"
+        } else {
+            "minelib"
+        };
         chan.send(&Request::Hello {
             protocol: proto::PROTOCOL,
-            client: format!("minelib {}", env!("CARGO_PKG_VERSION")),
+            client: format!("{name} {}", env!("CARGO_PKG_VERSION")),
         })?;
+        self.emit(Event::Relay {
+            addr: self.addr.clone(),
+            key,
+        });
         match chan.recv::<Response>()? {
             Response::Hello { pow_bits, .. } => self.pow_bits = pow_bits,
             Response::Error { code, message } => return Err(anyhow!(error_text(code, &message))),

@@ -166,8 +166,12 @@ struct Conn {
     joined: Instant,
     /// Banni pendant la session : la connexion est coupée.
     kicked: bool,
-    /// Disponible comme garant indépendant (au menu).
+    /// Disponible comme garant indépendant (au menu, ou connexion de garant).
     garant: bool,
+    /// Connexion de garant d'un joueur qui joue sa propre partie (deuxième connexion du
+    /// même compte, client « minelib-garant ») : elle ne sert que de garant, on ne la
+    /// prend jamais pour le joueur lui-même.
+    garant_only: bool,
     /// Garant écarté (désaccords rejetés par les joueurs) : plus choisi cette session.
     garant_banned: bool,
     /// Garant arbitre d'une affaire de cette partie, en ce moment.
@@ -423,6 +427,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
                 joined: Instant::now(),
                 kicked: false,
                 garant: false,
+                garant_only: false,
                 garant_banned: false,
                 arbitrating: None,
                 party: None,
@@ -465,9 +470,14 @@ fn serve_loop(chan: &mut Channel, state: &Mutex<State>, peer: &str, id: u64) -> 
         }
         let resp = if !hello {
             match req {
-                Request::Hello { protocol, .. } if protocol == proto::PROTOCOL => {
+                Request::Hello { protocol, client } if protocol == proto::PROTOCOL => {
                     hello = true;
-                    let st = state.lock().unwrap();
+                    let mut st = state.lock().unwrap();
+                    if client.starts_with("minelib-garant") {
+                        if let Some(c) = st.conns.get_mut(&id) {
+                            c.garant_only = true;
+                        }
+                    }
                     Some(Response::Hello {
                         protocol: proto::PROTOCOL,
                         relay: st.cfg.name.clone(),
@@ -884,22 +894,101 @@ fn garant_ok(st: &State, g: u64, players: &[String]) -> bool {
     })
 }
 
-/// Le garant disponible le plus adapté pour ces joueurs.
+/// Garant pris parmi les joueurs qui viennent de lancer leur propre partie : ils ont tout
+/// intérêt à rester en jeu pendant qu'ils servent. Au-delà, ils sont remplacés (leur partie
+/// approche de sa fin).
+const GARANT_FRESH: Duration = Duration::from_secs(6 * 60);
+const GARANT_RETIRE: Duration = Duration::from_secs(25 * 60);
+
+/// Depuis quand le joueur de ce pseudo joue sa propre partie FPS (sur sa connexion de
+/// joueur), s'il en joue une.
+fn own_game_age(st: &State, pseudo: &str) -> Option<Duration> {
+    st.conns
+        .values()
+        .filter(|c| !c.garant_only)
+        .filter(|c| {
+            c.pseudo
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(pseudo))
+        })
+        .filter_map(|c| st.rooms.get(&c.room?))
+        .filter(|r| r.kind == 0)
+        .filter_map(|r| r.started_at)
+        .map(|t| t.elapsed())
+        .min()
+}
+
+/// Ce garant doit-il passer la main (sa propre partie touche à sa fin, ou il n'y est plus) ?
+fn garant_retiring(st: &State, g: u64) -> bool {
+    let Some(c) = st.conns.get(&g) else {
+        return false;
+    };
+    if !c.garant_only {
+        return false;
+    }
+    let p = c.pseudo.as_deref().unwrap_or_default();
+    own_game_age(st, p).is_none_or(|a| a > GARANT_RETIRE)
+}
+
+/// Le garant disponible le plus adapté pour ces joueurs : d'abord un joueur qui vient de
+/// lancer sa propre partie (connexion de garant), sinon un joueur au menu.
 fn pick_garant(st: &State, players: &[String]) -> Option<u64> {
     st.conns
         .iter()
         .filter(|(&g, _)| garant_ok(st, g, players))
-        .map(|(&g, c)| {
+        .filter_map(|(&g, c)| {
             let cand = zones::Candidate {
                 id: g,
                 caps: c.caps,
                 uptime: c.joined.elapsed(),
                 ratio: c.pseudo.as_deref().map_or(0.0, |p| st.stats.ratio(p)),
             };
-            (g, zones::aptitude(&cand))
+            let mut score = zones::aptitude(&cand);
+            if c.garant_only {
+                let p = c.pseudo.as_deref().unwrap_or_default();
+                match own_game_age(st, p) {
+                    Some(a) if a < GARANT_FRESH => score += 1_000_000.0,
+                    // Partie déjà avancée (ou finie) : il faudrait le remplacer bientôt.
+                    _ => return None,
+                }
+            }
+            Some((g, score))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(g, _)| g)
+}
+
+/// Relève les garants dont la propre partie approche de sa fin : le garant en attente
+/// (prêt) reprend la partie servie avant que l'hôte ne s'en aille ; un garant en attente
+/// qui doit partir est simplement remplacé.
+fn relieve_garants(st: &mut State, rid: u64) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let host = room.host;
+    let retiring_host = room.garant_hosted && garant_retiring(st, host);
+    let ready = room
+        .ready_standby
+        .iter()
+        .copied()
+        .find(|&g| !garant_retiring(st, g));
+    let leaving: Vec<u64> = room
+        .hidden
+        .iter()
+        .copied()
+        .filter(|&g| garant_retiring(st, g))
+        .collect();
+    let mut out = leaving;
+    if retiring_host && ready.is_some() {
+        out.push(host);
+    }
+    for g in out {
+        log::info!("partie {rid} : le garant {g} passe la main (sa partie se termine)");
+        leave_room(st, g);
+        if let Some(c) = st.conns.get(&g) {
+            transport::push(&c.tx, &Response::RoomClosed);
+        }
+    }
 }
 
 /// Entretien (toutes les 2 s) : chaque partie FPS reçoit un garant indépendant en
@@ -926,6 +1015,11 @@ fn upkeep(st: &mut State) {
             }
             continue;
         }
+        // Relève des garants dont la propre partie se termine.
+        relieve_garants(st, rid);
+        let Some(room) = st.rooms.get(&rid) else {
+            continue;
+        };
         // Passage au garant prêt.
         if !room.garant_hosted {
             if let Some(&g) = room.ready_standby.first() {
@@ -1531,6 +1625,7 @@ fn conn_of(st: &State, pseudo: &str) -> Option<u64> {
         .iter()
         .find(|(_, c)| {
             !c.kicked
+                && !c.garant_only
                 && c.pseudo
                     .as_deref()
                     .is_some_and(|p| p.eq_ignore_ascii_case(pseudo))
@@ -3591,6 +3686,77 @@ mod tests {
 
     /// Un garant indépendant (au menu, 3 parties jouées, sans lien avec les joueurs) sert
     /// la partie ; un second la vérifie et la reprend quand l'hôte triche.
+    #[test]
+    fn a_player_whose_game_just_started_is_the_preferred_garant() {
+        let dir =
+            std::env::temp_dir().join(format!("minelib-garant-jeu-{}", rand::random::<u32>()));
+        {
+            let mut st = stats::Store::open(dir.join("stats")).unwrap();
+            for g in ["Menu", "Menu2", "Actif"] {
+                st.get_mut(g).games = 5;
+                st.save(g);
+            }
+        }
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        let search = |c: &Client, sig: u8| {
+            c.send(Cmd::Search {
+                map_sig: [sig; 32],
+                map: "carte".into(),
+                players: 10,
+            });
+            wait(c, |e| matches!(e, Event::Joined { .. } | Event::Hosted(_)));
+        };
+        // « Actif » lance sa partie, servie par « Menu » (au menu) ; elle commence.
+        let menu = login("Menu");
+        menu.send(Cmd::GarantAvailable(true));
+        let actif = login("Actif");
+        std::thread::sleep(Duration::from_millis(200));
+        search(&actif, 1);
+        wait(&menu, |e| matches!(e, Event::GarantTask { .. }));
+        menu.send(Cmd::RoomStarted(true));
+        // Sa connexion de garant (même compte), et un autre joueur au menu.
+        let g = Client::spawn_garant(addr.clone(), h.public);
+        g.send(Cmd::Login {
+            pseudo: "Actif".into(),
+            password: "motdepasse".into(),
+            totp: None,
+            backup: None,
+            device: None,
+        });
+        wait(&g, |e| matches!(e, Event::LoggedIn { .. }));
+        g.send(Cmd::GarantAvailable(true));
+        let menu2 = login("Menu2");
+        menu2.send(Cmd::GarantAvailable(true));
+        std::thread::sleep(Duration::from_millis(300));
+        // Une autre partie : servie par le joueur qui vient de lancer la sienne.
+        let autre = login("Autre");
+        search(&autre, 2);
+        match wait(&g, |e| matches!(e, Event::GarantTask { .. })) {
+            Event::GarantTask { standby, .. } => assert!(!standby),
+            _ => unreachable!(),
+        }
+        assert!(menu2
+            .poll()
+            .is_none_or(|e| !matches!(e, Event::GarantTask { .. })));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn independent_garants_serve_check_and_replace_a_cheating_host() {
         let dir = std::env::temp_dir().join(format!("minelib-garants-{}", rand::random::<u32>()));

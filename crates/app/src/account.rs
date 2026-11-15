@@ -275,6 +275,10 @@ pub struct Accounts {
     pub servers: Vec<ServerEntry>,
     /// File pour envoyer des données de jeu au relais sans attendre.
     pub link: Option<std::sync::mpsc::Sender<minelib_net::transport::Inbound>>,
+    /// Relais joint (adresse, clé) et identifiants de la session : une deuxième connexion
+    /// du compte peut y servir de garant pendant qu'on joue.
+    relay_at: Option<(String, [u8; 32])>,
+    login_secret: Option<(String, String)>,
     /// Événements de partie (hôte, invité) à transmettre au jeu.
     pub game_events: Vec<Event>,
     /// Classement reçu : (amis ?, lignes, sa propre ligne).
@@ -324,6 +328,8 @@ impl Accounts {
             new_pseudo: None,
             servers: Vec::new(),
             link: None,
+            relay_at: None,
+            login_secret: None,
             game_events: Vec::new(),
             leaderboard: None,
             friends: Vec::new(),
@@ -557,6 +563,7 @@ impl Accounts {
                     self.auto_fails = 0;
                     // Compte gardé sur ce PC : connexion automatique au prochain lancement.
                     if let Some((p, w)) = self.sent.take() {
+                        self.login_secret = Some((p.clone(), w.clone()));
                         self.remember(&p, &w);
                     }
                     self.password.clear();
@@ -642,6 +649,7 @@ impl Accounts {
                     self.game_events.push(Event::Error(m));
                 }
                 Event::Link(l) => self.link = Some(l),
+                Event::Relay { addr, key } => self.relay_at = Some((addr, key)),
                 Event::AccountBackup { pseudo, vault } => {
                     let p = self.backup_path(&pseudo);
                     if let Some(d) = p.parent() {
@@ -717,6 +725,24 @@ impl Accounts {
         if self.logged_in() {
             self.client().send(cmd);
         }
+    }
+
+    /// De quoi ouvrir une deuxième connexion du compte, de garant : relais joint,
+    /// identifiants de la session, appareil de confiance (pas de 2FA à redemander).
+    pub fn garant_login(&self) -> Option<crate::garant_worker::Login> {
+        let (addr, key) = self.relay_at.clone()?;
+        let (pseudo, password) = self.login_secret.clone().or_else(|| self.remembered())?;
+        if !self.logged_in() || !pseudo.eq_ignore_ascii_case(&self.pseudo()) {
+            return None;
+        }
+        let device = self.device(&pseudo);
+        Some(crate::garant_worker::Login {
+            addr,
+            key,
+            pseudo,
+            password,
+            device,
+        })
     }
 
     pub fn pseudo(&self) -> String {
@@ -1042,6 +1068,7 @@ impl Accounts {
             });
         }
         if logout {
+            self.login_secret = None;
             self.client().send(Cmd::Logout);
             self.account = None;
             // Déconnexion voulue : le compte n'est plus gardé sur ce PC.
