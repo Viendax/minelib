@@ -53,6 +53,23 @@ jobs:
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      # Mémoire de compilation (outil fourni par GitHub) : les bibliothèques déjà compilées
+      # sont reprises de la fois précédente, seul le code du jeu est recompilé (~3 min au
+      # lieu de ~11). Clé : Cargo.lock (bibliothèques et leurs versions) ; s'il change, on
+      # repart de la mémoire la plus proche.
+      - name: Mémoire de compilation
+        if: steps.v.outputs.exists == '0'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            release-windows-
+
       - name: Compilation
         if: steps.v.outputs.exists == '0'
         run: cargo build --release -p minelib -p minelib-relay -p minelib-launcher
