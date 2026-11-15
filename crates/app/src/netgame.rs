@@ -1119,12 +1119,12 @@ type Frame = Vec<(u64, Vec3, f32)>;
 pub const STEP_SPEED: f32 = crate::player::FPS_SPRINT * 135.0 / 250.0;
 pub use minelib_net::game::{STEP_LAND, STEP_PAIN, STEP_RUN};
 
-/// Chute d'au moins cette hauteur (blocs, du sol quitté au sol où l'on retombe) : bruit de
-/// réception, entendu des autres.
+/// Chute d'au moins cette hauteur (blocs, du plus haut point atteint au sol où l'on
+/// retombe, saut compris) : bruit de réception, entendu des autres.
 pub const LAND_HEIGHT: f32 = 1.3;
 
 /// Suivi d'un joueur pour ses bruits : dernière position, distance courue depuis le dernier
-/// pas, hauteur du sol qu'il a quitté (en l'air).
+/// pas, plus haut point atteint depuis qu'il a quitté le sol.
 #[derive(Clone, Copy)]
 struct Stride {
     last: Vec3,
@@ -2154,9 +2154,9 @@ impl Host {
                         steps.push((id, pos, STEP_LAND));
                     }
                 }
-            } else if e.top.is_none() {
-                // Hauteur du sol quitté : un saut sur place ne compte pas, une chute oui.
-                e.top = Some(before.y);
+            } else {
+                // Plus haut point atteint en l'air (un saut normal monte à ~1,45 bloc).
+                e.top = Some(e.top.map_or(before.y.max(pos.y), |t| t.max(pos.y)));
             }
             let running = d / dt.max(1e-4) > STEP_SPEED && d < 2.0;
             if ground && running && living {

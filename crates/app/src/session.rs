@@ -68,7 +68,11 @@ pub struct Session {
     /// (état, position du porteur).
     bomb_fly: Option<(Vec3, Vec3, f32)>,
     bomb_last: (u8, Option<Vec3>),
-    /// Hauteur du sol quitté, en l'air (bruit de réception).
+    /// Caméra adoucie sur les marches (montée ou descente d'une dalle) : décalage de la vue
+    /// qui revient à 0 en un dixième de seconde, et hauteur au sol de l'image d'avant.
+    step_offset: f32,
+    step_prev: Option<f32>,
+    /// Plus haut point atteint en l'air (bruit de réception).
     fall_top: Option<f32>,
     /// Bruits de ses propres pas : distance parcourue depuis le dernier.
     stride: f32,
@@ -273,6 +277,8 @@ impl Session {
             test_smoke_timer: 0.0,
             stride: 0.0,
             fall_top: None,
+            step_offset: 0.0,
+            step_prev: None,
             ground_fly: std::collections::HashMap::new(),
             ground_seen: std::collections::HashSet::new(),
             bomb_fly: None,
@@ -1731,6 +1737,20 @@ impl Session {
         // doux en marchant ou accroupi (eux ne les entendent pas).
         let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
         let alive = !(self.net.is_some() && self.net_dead);
+        // Marche montée ou descendue (dalle) : les pieds changent de hauteur d'un coup, la
+        // caméra suit en douceur.
+        let grounded = self.player.on_ground && !self.player.flying;
+        if let (true, Some(prev)) = (grounded, self.step_prev) {
+            let dy = self.player.pos.y - prev;
+            if dy.abs() > 0.01 && dy.abs() < 0.65 {
+                self.step_offset = (self.step_offset - dy).clamp(-0.65, 0.65);
+            }
+        }
+        self.step_prev = grounded.then_some(self.player.pos.y);
+        self.step_offset *= (-dt * 14.0).exp();
+        if self.step_offset.abs() < 1e-3 {
+            self.step_offset = 0.0;
+        }
         // Réception d'une chute d'au moins 1,3 bloc (les autres l'entendent aussi).
         if self.player.on_ground || self.player.flying {
             if let Some(top) = self.fall_top.take() {
@@ -1738,9 +1758,10 @@ impl Session {
                     self.fps.sounds.push((crate::audio::Sfx::Land, 0.0, 0.9));
                 }
             }
-        } else if self.fall_top.is_none() {
-            // Hauteur du sol quitté : un saut sur place ne fait pas ce bruit.
-            self.fall_top = Some(self.player.pos.y);
+        } else {
+            // Plus haut point atteint en l'air (un saut normal monte à ~1,45 bloc).
+            let y = self.player.pos.y;
+            self.fall_top = Some(self.fall_top.map_or(y, |t| t.max(y)));
         }
         if alive && self.player.on_ground && !self.player.flying && speed > 0.6 {
             self.stride += speed * dt;
@@ -1834,7 +1855,7 @@ impl Session {
         let p = (self.player.pitch + self.fps.punch.0.to_radians()).clamp(-1.55, 1.55);
         let y = self.player.yaw + self.fps.punch.1.to_radians();
         let dir = Vec3::new(y.sin() * p.cos(), p.sin(), -y.cos() * p.cos());
-        Mat4::look_to_rh(self.player.eye(), dir, Vec3::Y)
+        Mat4::look_to_rh(self.player.eye() + Vec3::Y * self.step_offset, dir, Vec3::Y)
     }
 
     /// Message ou commande envoyé dans le tchat.

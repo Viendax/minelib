@@ -57,16 +57,26 @@ Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 
 ### Le facteur de confiance
 
-Chaque compte a un **facteur de confiance** de **0 à 1000**. Un nouveau compte commence à **500**.
+Chaque compte a un **facteur de confiance** de **0 à 1000**. Un nouveau compte commence à **500**. Il sépare trois paliers, et les parties se forment entre joueurs du même palier :
+
+- **joueurs corrects** : vers **900 à 1000** ;
+- **trolls** (souvent signalés, partent en pleine partie) : vers **250 à 350** ;
+- **tricheurs** : **sous 200**, avant même d'être bannis.
 
 | Événement | Effet |
 |---|---|
-| Partie finie sans signalement | **+8**, plus 1 par tranche de 150 points déjà acquis (+11 à 500, +14 à 1000) |
-| Signalement reçu | **−40** (rendus si le joueur retire son signalement) |
+| Partie finie sans signalement compté, sans absence ni soupçon | **+12**, plus 1 par tranche de 150 points déjà acquis (+15 à 500, +18 à 1000) |
+| Signalé par **un seul** joueur de la partie | **0** (un mauvais perdant seul ne coûte rien) |
+| Signalé par **2 joueurs ou plus** de la même partie | **−25 par joueur** qui a signalé |
 | Absence de moins de 2 minutes | **0** |
-| Absence plus longue | **−5 à −140** selon la part de la partie manquée (sur une partie de 30 min : 5 min ≈ −13, 10 min = −50, 15 min ≈ −113) |
-| Abandon (absent 90 % de la partie ou plus) | **−150** |
+| Absence plus longue | **−5 à −90** selon la part de la partie manquée (sur 30 min : 5 min ≈ −8, 10 min ≈ −33, 15 min = −75) |
+| Abandon (absent 90 % de la partie ou plus) | **−100** |
+| Soupçon du vérificateur dans la partie | **−80** |
 | Triche prouvée | **−400**, et bannissement si l'arbitre la confirme |
+
+Les signalements et les absences ne font **jamais descendre sous 300** : c'est le palier des trolls. Seuls les soupçons du vérificateur et la triche prouvée vont plus bas. Un signalement retiré pendant la partie ne compte pas.
+
+Ces valeurs ont été choisies par simulation (2 000 joueurs, 90 jours, en testant aussi deux fois plus de faux signalements que prévu) : les joueurs corrects restent au-dessus de 860 même dans le pire cas, et les trois paliers ne se mélangent pas.
 
 Le facteur est **lié à la machine** : c'est le plus bas des comptes utilisés sur ton PC qui compte. Recréer un compte ne remet pas les compteurs à zéro.
 

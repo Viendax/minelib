@@ -201,8 +201,10 @@ struct Room {
     settled: bool,
     /// Places gardées pour les joueurs d'un lobby qui arrivent (pseudo, depuis).
     reserved: Vec<(String, Instant)>,
-    /// Signalements déjà comptés dans cette partie (de, contre).
+    /// Signalements de cette partie (de, contre), comptés à la fin de la partie.
     reports: HashSet<(String, String)>,
+    /// Joueurs soupçonnés par le vérificateur dans cette partie (pseudos en minuscules).
+    suspects: HashSet<String>,
     /// Construction : garants de zones.
     build: zones::Build,
     /// FPS : garant de secours désigné par l'hôte.
@@ -1035,11 +1037,37 @@ fn settle_absences(st: &mut State, room: &mut Room, spared: &[String]) -> HashSe
             continue;
         }
         let s = st.stats.get_mut(p);
-        s.trust_by(pen);
+        s.trust_soft(pen);
         s.absences += 1;
         st.stats.save(p);
         hit.insert(p.clone());
         log::info!("« {p} » absent {away:.0} s sur {len:.0} s : confiance {pen}");
+    }
+    // Signalements : comptés seulement si au moins deux joueurs de la partie ont signalé
+    // le même (un mauvais perdant seul ne coûte rien) ; baisse douce, jusqu'au plancher.
+    let mut by_target: HashMap<&String, usize> = HashMap::new();
+    for (_, target) in &room.reports {
+        *by_target.entry(target).or_default() += 1;
+    }
+    for (target, n) in by_target {
+        if n < stats::trust::REPORTERS {
+            continue;
+        }
+        let s = st.stats.get_mut(target);
+        s.trust_soft(stats::trust::REPORT * n as i32);
+        s.reports += n as u32;
+        st.stats.save(target);
+        hit.insert(target.clone());
+        log::info!("« {target} » signalé par {n} joueurs de la partie");
+    }
+    // Soupçons du vérificateur : la seule baisse, avec la triche prouvée, qui passe sous le
+    // plancher des trolls.
+    for p in &room.suspects {
+        let s = st.stats.get_mut(p);
+        s.trust_by(stats::trust::SUSPICION);
+        st.stats.save(p);
+        hit.insert(p.clone());
+        log::info!("« {p} » soupçonné par le vérificateur");
     }
     hit
 }
@@ -1129,7 +1157,6 @@ fn try_apply_result(st: &mut State, room_id: u64) {
     // Classement : seulement sur les 10 cartes les plus jouées.
     let ranked_map = st.maps.among_top(&room.map_sig, 10);
     let room = st.rooms.get_mut(&room_id).expect("partie");
-    let reported: HashSet<String> = room.reports.iter().map(|r| r.1.clone()).collect();
     let roster = room.roster.clone();
     // Exclus pour avoir tué 3 coéquipiers : pas de pénalité d'absence en plus.
     let tk_kicked: Vec<String> = summary
@@ -1145,10 +1172,11 @@ fn try_apply_result(st: &mut State, room_id: u64) {
         let s = st.stats.get_mut(&p.pseudo);
         s.teamkills += p.teamkills as u32;
     }
-    // Partie propre (pas signalé, pas parti longtemps) : la confiance remonte un peu.
+    // Partie propre (pas de signalement compté, pas parti longtemps, pas de soupçon) : la
+    // confiance remonte un peu.
     for p in &roster {
         let low = p.to_ascii_lowercase();
-        if ranked && !reported.contains(&low) && !absent.contains(&low) {
+        if ranked && !absent.contains(&low) {
             let s = st.stats.get_mut(p);
             let g = s.clean_gain();
             s.trust_by(g);
@@ -1217,6 +1245,7 @@ fn open_room(
             settled: false,
             reserved: Vec::new(),
             reports: HashSet::new(),
+            suspects: HashSet::new(),
             build: zones::Build::default(),
             backup: None,
             hidden: Vec::new(),
@@ -1903,9 +1932,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         me.reported.remove(0);
                     }
                 }
+                // La confiance n'est touchée qu'à la fin de la partie, si un autre joueur
+                // l'a signalé aussi (voir `settle_absences`).
                 let them = st.stats.get_mut(&target);
-                them.reports += 1;
-                them.trust_by(stats::trust::REPORT);
                 if !them.reported_by.contains(&key.0) {
                     them.reported_by.push(key.0.clone());
                     if them.reported_by.len() > 1000 {
@@ -2037,12 +2066,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             me.reported.retain(|p| *p != low);
             let mine = pseudo.to_ascii_lowercase();
+            // Retiré pendant la partie : il ne comptera pas à la fin.
+            if let Some(r) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
+                r.reports.remove(&(mine.clone(), low.clone()));
+            }
             let them = st.stats.get_mut(&target);
             them.reported_by.retain(|p| *p != mine);
-            if them.reports > 0 {
-                them.trust_by(-stats::trust::REPORT);
-            }
-            them.reports = them.reports.saturating_sub(1);
             st.stats.save(pseudo);
             st.stats.save(&target);
             log::info!("« {pseudo} » annule son signalement de « {target} »");
@@ -2423,6 +2452,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 let room = st.rooms.get_mut(&rid)?;
                 room.confirmed += 1;
             } else if room.members.contains(&player) {
+                if let Some(p) = st.conns.get(&player).and_then(|c| c.pseudo.as_deref()) {
+                    let low = p.to_ascii_lowercase();
+                    if let Some(room) = st.rooms.get_mut(&rid) {
+                        room.suspects.insert(low);
+                    }
+                }
                 let n = st.next_id;
                 st.next_id += 1;
                 let room = st.rooms.get_mut(&rid)?;

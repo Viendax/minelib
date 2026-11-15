@@ -51,14 +51,26 @@ pub struct Stats {
 pub const TRUST_START: i32 = 500;
 pub const TRUST_MAX: i32 = 1000;
 
-/// Ce qui fait bouger le facteur de confiance.
+/// Ce qui fait bouger le facteur de confiance. Trois paliers bien séparés (réglage choisi
+/// par simulation : 2 000 joueurs sur 90 jours, et deux fois plus de faux signalements que
+/// prévu) : les joueurs corrects vers 900 à 1000, les trolls (signalés, partent en cours)
+/// vers 250 à 350, les tricheurs sous 200 avant même leur bannissement.
 pub mod trust {
-    /// Partie finie sans signalement : remonte lentement.
-    pub const CLEAN_GAME: i32 = 8;
-    /// Signalement reçu (rendu si le signalement est retiré).
-    pub const REPORT: i32 = -40;
-    /// Partie abandonnée (jusqu'à la fin).
-    pub const ABANDON: i32 = -150;
+    /// Partie finie sans signalement compté, sans absence ni soupçon : remonte (plus 1 par
+    /// tranche de 150 points déjà acquis).
+    pub const CLEAN_GAME: i32 = 12;
+    /// Par joueur qui signale, quand au moins `REPORTERS` joueurs de la partie ont signalé
+    /// le même (un seul mauvais perdant ne coûte rien).
+    pub const REPORT: i32 = -25;
+    pub const REPORTERS: usize = 2;
+    /// Partie abandonnée (jusqu'à la fin) ; une absence plus courte coûte moins.
+    pub const ABANDON: i32 = -100;
+    /// Signalements et absences ne font pas descendre sous ce plancher : c'est le palier
+    /// des trolls. Seuls les soupçons du vérificateur et la triche prouvée vont plus bas.
+    pub const SOFT_FLOOR: i32 = 300;
+    /// Soupçon du vérificateur dans une partie (écart qui n'est pas une preuve), une fois
+    /// par partie au plus.
+    pub const SUSPICION: i32 = -80;
     /// Triche prouvée par les garants.
     pub const CHEAT: i32 = -400;
 }
@@ -131,6 +143,17 @@ impl Stats {
         self.trust = (self.trust + d).clamp(0, TRUST_MAX);
     }
 
+    /// Baisse « douce » (signalements, absences) : jamais sous le plancher des trolls
+    /// (`trust::SOFT_FLOOR`) ; déjà en dessous, elle ne retire rien.
+    pub fn trust_soft(&mut self, d: i32) {
+        if d < 0 {
+            let floor = self.trust.min(trust::SOFT_FLOOR);
+            self.trust = (self.trust + d).max(floor).clamp(0, TRUST_MAX);
+        } else {
+            self.trust_by(d);
+        }
+    }
+
     /// Gain d'une partie propre : plus on a la confiance, plus elle monte (les joueurs
     /// sérieux creusent l'écart).
     pub fn clean_gain(&self) -> i32 {
@@ -143,7 +166,7 @@ impl Stats {
     }
 
     /// Pénalité pour être parti `away` d'une partie qui a duré `len` (secondes) : rien
-    /// sous 2 minutes, puis de plus en plus (10 minutes sur 30 : −50), jusqu'à l'abandon.
+    /// sous 2 minutes, puis de plus en plus (10 minutes sur 30 : −33), jusqu'à l'abandon.
     pub fn absence_penalty(away: f64, len: f64) -> i32 {
         if away < 120.0 {
             return 0;
@@ -152,7 +175,8 @@ impl Stats {
         if frac >= 0.9 {
             return trust::ABANDON;
         }
-        -((frac * frac * 450.0).round() as i32).clamp(5, -trust::ABANDON - 10)
+        -((frac * frac * (-trust::ABANDON * 3) as f64).round() as i32)
+            .clamp(5, -trust::ABANDON - 10)
     }
 
     /// Signalements par partie jouée.
@@ -369,7 +393,7 @@ mod tests {
     fn trust_moves_slowly() {
         // Absences : rien sous 2 minutes, cher vers 10 minutes sur 30, abandon.
         assert_eq!(Stats::absence_penalty(90.0, 1800.0), 0);
-        assert!(Stats::absence_penalty(600.0, 1800.0) <= -40);
+        assert!(Stats::absence_penalty(600.0, 1800.0) <= -30);
         assert!(Stats::absence_penalty(300.0, 1800.0) > -20);
         assert_eq!(Stats::absence_penalty(1700.0, 1800.0), trust::ABANDON);
         let mut s = Stats::new("a");
@@ -387,6 +411,24 @@ mod tests {
             },
         );
         assert!(hi.clean_gain() > lo.clean_gain());
+        // Signalements et absences s'arrêtent au plancher des trolls ; les soupçons du
+        // vérificateur passent dessous.
+        let mut t = Stats {
+            trust: 340,
+            ..Stats::new("d")
+        };
+        t.trust_soft(trust::REPORT * 3);
+        assert_eq!(t.trust, trust::SOFT_FLOOR);
+        t.trust_soft(trust::ABANDON);
+        assert_eq!(t.trust, trust::SOFT_FLOOR);
+        t.trust_by(trust::SUSPICION);
+        assert_eq!(t.trust, trust::SOFT_FLOOR + trust::SUSPICION);
+        t.trust_soft(trust::REPORT);
+        assert_eq!(
+            t.trust,
+            trust::SOFT_FLOOR + trust::SUSPICION,
+            "déjà dessous : rien"
+        );
     }
 
     #[test]
@@ -412,7 +454,7 @@ mod tests {
             friends: vec![],
         };
         let s = Stats::from(old);
-        assert_eq!(s.trust, TRUST_START - 80);
+        assert_eq!(s.trust, TRUST_START + 2 * trust::REPORT);
     }
 
     #[test]
