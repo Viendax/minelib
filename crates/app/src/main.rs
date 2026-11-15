@@ -202,6 +202,8 @@ struct Game {
     exit_after: Option<f32>,
     /// Images dessinées depuis le lancement (la fenêtre apparaît après les premières).
     frames_drawn: u32,
+    /// Lancement du jeu.
+    started: std::time::Instant,
     /// Capture automatique à ce temps (essais).
     shot_at: Option<f32>,
     show_debug: bool,
@@ -315,6 +317,7 @@ impl Game {
             exit_after: env_parse("MINELIB_EXIT_AFTER"),
             shot_at: env_parse("MINELIB_SHOT_AT"),
             frames_drawn: 0,
+            started: std::time::Instant::now(),
             show_debug: env_parse::<u8>("MINELIB_DEBUG").is_some_and(|v| v != 0),
             fps_max: env_parse::<f32>("MINELIB_FPS_MAX").filter(|&f| f > 0.0),
             frame_start: Instant::now(),
@@ -340,6 +343,9 @@ impl Game {
         .map(|mut g| {
             minelib_render::set_translator(i18n::translate);
             i18n::set(&g.options.language);
+            // Connexion au compte dès le démarrage, pendant que le lanceur est encore affiché
+            // et que le jeu se charge (fenêtre cachée) : on arrive dans le jeu déjà connecté.
+            g.accounts.poll();
             g.shared_maps = load_shared(&g.paths.root);
             g.my_skin = std::fs::read(g.paths.root.join("skin.png"))
                 .ok()
@@ -2856,12 +2862,24 @@ impl GameLoop for Game {
     }
 
     fn loaded(&self) -> bool {
-        // Rendu prêt et quelques images déjà dessinées (textures envoyées à la carte).
-        self.renderer.is_some() && self.frames_drawn >= 3
+        // Rendu prêt et quelques images déjà dessinées (textures envoyées à la carte), et
+        // connexion automatique au compte terminée (12 s au plus : relais lent ou absent).
+        self.renderer.is_some()
+            && self.frames_drawn >= 3
+            && (self.accounts.auto_settled() || self.started.elapsed().as_secs() >= 12)
     }
 
     fn on_shown(&mut self) {
-        log::info!("fenêtre affichée après {} images", self.frames_drawn);
+        log::info!(
+            "fenêtre affichée après {} images, {:.1} s ({})",
+            self.frames_drawn,
+            self.started.elapsed().as_secs_f32(),
+            if self.accounts.logged_in() {
+                "compte connecté"
+            } else {
+                "pas connecté"
+            }
+        );
         // Le lanceur attend ce fichier pour se fermer.
         if let Some(path) = std::env::var_os("MINELIB_READY_FILE") {
             let _ = std::fs::write(path, b"ok");

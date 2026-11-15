@@ -371,7 +371,7 @@ impl App {
                     Some(f),
                 )
             }
-            Phase::Launching => ("Chargement du jeu…".into(), None),
+            Phase::Launching => ("Chargement du jeu et connexion au compte…".into(), None),
             Phase::Failed(e) => (e.clone(), None),
         };
         let failed = matches!(phase, Phase::Failed(_));

@@ -314,6 +314,12 @@ impl Accounts {
         self.account.is_some()
     }
 
+    /// La connexion automatique du lancement est-elle finie (connecté, code 2FA demandé,
+    /// refusée, ou pas de compte gardé) ?
+    pub fn auto_settled(&self) -> bool {
+        self.auto_tried && (self.account.is_some() || self.need_totp || self.sent.is_none())
+    }
+
     fn local_relay(&self) -> Option<SocketAddr> {
         let addr = self.relay_addr.to_socket_addrs().ok()?.next()?;
         addr.ip().is_loopback().then_some(addr)
