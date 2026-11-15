@@ -1037,7 +1037,9 @@ fn build() -> Registry {
         .chain(mats.iter().cloned())
         .collect();
     for m in &mats {
-        let props = if m.key.starts_with("leaves_") {
+        // Feuillage et chaudron (pieds ajourés) : on voit à travers la texture, les blocs
+        // voisins restent dessinés.
+        let props = if m.key.starts_with("leaves_") || m.key == "cauldron" {
             FOLIAGE
         } else {
             SOLID

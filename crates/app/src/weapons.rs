@@ -997,22 +997,43 @@ mod tests {
 /// 500 unités de CS, en blocs (une unité = 2,54 cm).
 pub const RANGE_STEP: f32 = 12.7;
 
-/// Trajet d'une balle : elle traverse un mur d'**un bloc** d'épaisseur (pas deux), puis
-/// s'arrête au mur suivant. Même calcul chez le tireur (impacts), l'hôte et le
-/// vérificateur (dégâts).
+/// Trajet d'une balle : elle traverse au plus **deux blocs** de mur en tout (un mur de
+/// deux, ou deux murs d'un), puis s'arrête au mur suivant. Chaque bloc traversé divise les
+/// dégâts par deux ([`THROUGH_WALL`]) : moitié après un bloc, quart après deux. Même
+/// calcul chez le tireur (impacts), l'hôte et le vérificateur (dégâts).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BulletPath {
     /// Distance du premier mur (ou la portée) : avant, pleins dégâts.
     pub first: f32,
-    /// Mur traversé : distance de la sortie, puis de l'arrêt final. Entre les deux, les
-    /// dégâts sont réduits ([`THROUGH_WALL`]).
-    pub through: Option<(f32, f32)>,
-    /// Impacts à dessiner : entrée, sortie, arrivée (point, normale de la face).
+    /// Après chaque mur traversé : (sortie, arrêt suivant, facteur des dégâts).
+    pub through: Vec<(f32, f32, f32)>,
+    /// Impacts à dessiner : entrées, sorties, arrivée (point, normale de la face).
     pub impacts: Vec<(glam::Vec3, glam::Vec3)>,
 }
 
-/// Part des dégâts qui restent après un mur.
+impl BulletPath {
+    /// Où la balle s'arrête.
+    pub fn end(&self) -> f32 {
+        self.through.last().map_or(self.first, |t| t.1)
+    }
+
+    /// Facteur des dégâts à la distance `t` : 1 avant le premier mur, réduit derrière un
+    /// mur traversé, `None` dans un mur ou après l'arrêt.
+    pub fn factor_at(&self, t: f32) -> Option<f32> {
+        if t < self.first {
+            return Some(1.0);
+        }
+        self.through
+            .iter()
+            .find(|&&(exit, last, _)| t > exit && t < last)
+            .map(|s| s.2)
+    }
+}
+
+/// Facteur des dégâts par bloc de mur traversé.
 pub const THROUGH_WALL: f32 = 0.5;
+/// Épaisseur de mur (en blocs) qu'une balle traverse au plus, en tout.
+pub const MAX_WALL_BLOCKS: u32 = 2;
 
 pub fn bullet_path(
     world: &minelib_world::World,
@@ -1031,43 +1052,60 @@ pub fn bullet_path(
     };
     let mut path = BulletPath {
         first: h.distance,
-        through: None,
+        through: Vec::new(),
         impacts: vec![(origin + dir * h.distance, normal(h.normal))],
     };
-    // On avance dans le mur : la balle ressort si la case suivante sur sa route est vide.
     let solid = |p: Vec3| {
         let c = p.floor().as_ivec3();
         (world.get(c.x, c.y, c.z).def().solid, c)
     };
-    let (_, entry) = solid(origin + dir * (h.distance + 0.01));
-    let mut t = h.distance + 0.01;
-    let exit = loop {
-        t += 0.02;
-        if t > h.distance + 1.8 || t >= range {
-            return path;
-        }
-        let (full, cell) = solid(origin + dir * t);
-        if cell != entry {
-            if full {
+    let mut blocks = 0u32;
+    let mut hit = h.distance;
+    loop {
+        // On avance dans le mur en comptant les blocs traversés jusqu'à ressortir dans le
+        // vide ; trop épais pour ce qu'il reste à la balle : elle s'arrête là.
+        let (_, mut cell) = solid(origin + dir * (hit + 0.01));
+        let mut cells = 1u32;
+        let mut t = hit + 0.01;
+        let exit = loop {
+            t += 0.02;
+            if t >= range {
                 return path;
             }
-            break t;
-        }
-    };
-    let out = origin + dir * (exit + 0.01);
-    // Face de sortie : vue depuis l'autre côté.
-    if let Some(back) = raycast(world, out.into(), (-dir).into(), 0.2) {
-        path.impacts
-            .push((out - dir * back.distance, normal(back.normal)));
-    }
-    let last = match raycast(world, out.into(), dir.into(), range - exit) {
-        Some(h2) => {
+            let (full, c) = solid(origin + dir * t);
+            if c != cell {
+                if !full {
+                    break t;
+                }
+                cell = c;
+                cells += 1;
+                if blocks + cells > MAX_WALL_BLOCKS {
+                    return path;
+                }
+            }
+        };
+        blocks += cells;
+        let out = origin + dir * (exit + 0.01);
+        // Face de sortie : vue depuis l'autre côté.
+        if let Some(back) = raycast(world, out.into(), (-dir).into(), 0.2) {
             path.impacts
-                .push((out + dir * h2.distance, normal(h2.normal)));
-            exit + 0.01 + h2.distance
+                .push((out - dir * back.distance, normal(back.normal)));
         }
-        None => range,
-    };
-    path.through = Some((exit, last));
-    path
+        let factor = THROUGH_WALL.powi(blocks as i32);
+        match raycast(world, out.into(), dir.into(), range - exit) {
+            Some(h2) => {
+                path.impacts
+                    .push((out + dir * h2.distance, normal(h2.normal)));
+                hit = exit + 0.01 + h2.distance;
+                path.through.push((exit, hit, factor));
+                if blocks >= MAX_WALL_BLOCKS {
+                    return path;
+                }
+            }
+            None => {
+                path.through.push((exit, range, factor));
+                return path;
+            }
+        }
+    }
 }

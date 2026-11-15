@@ -8,9 +8,15 @@ use minelib_net::game::FpsMap;
 use minelib_render::Ui;
 use minelib_world::World;
 
-/// Rayon montré, en blocs.
-pub const RADIUS: i32 = 32;
-const SIDE: usize = (RADIUS * 2) as usize;
+/// Rayon montré, en blocs (vue de haut : une bonne partie de la carte).
+pub const RADIUS: i32 = 48;
+/// Rayon gardé en mémoire autour du centre de la grille (plus grand que la vue : on peut
+/// s'éloigner du centre sans voir de bord).
+const GRID: i32 = 72;
+const SIDE: usize = (GRID * 2) as usize;
+/// Lignes de la grille recalculées à chaque image (rafraîchissement continu, sans à-coup :
+/// blocs qui changent, morceaux de carte chargés après coup).
+const ROWS_PER_FRAME: usize = 8;
 
 /// Teintes des cases : vide, sol (4 hauteurs), mur.
 const SHADES: [[f32; 4]; 6] = [
@@ -24,10 +30,12 @@ const SHADES: [[f32; 4]; 6] = [
 
 #[derive(Default)]
 pub struct Radar {
-    /// Bloc au centre de la grille calculée.
+    /// Bloc au centre de la grille gardée.
     center: Option<[i32; 3]>,
     /// Teinte (indice dans `SHADES`) de chaque case, ligne par ligne (z puis x).
     cells: Vec<u8>,
+    /// Prochaine ligne à recalculer.
+    next_row: usize,
     /// Sites de bombe : lettre et centre (x, z).
     sites: Vec<(char, [f32; 2])>,
 }
@@ -51,32 +59,67 @@ impl Radar {
             .collect();
     }
 
-    /// Recalcule la grille quand le joueur s'est éloigné de plus de 4 blocs.
+    /// Suit le joueur : la grille est recentrée (en gardant ce qui est déjà calculé) quand
+    /// il s'éloigne du centre, et quelques lignes sont recalculées à chaque image.
     pub fn update(&mut self, world: &World, feet: Vec3) {
         let c = [
             feet.x.floor() as i32,
             feet.y.floor() as i32,
             feet.z.floor() as i32,
         ];
-        let near = self.center.is_some_and(|o| {
-            (o[0] - c[0]).abs() < 4 && (o[1] - c[1]).abs() < 3 && (o[2] - c[2]).abs() < 4
-        });
-        if near {
-            return;
-        }
-        self.center = Some(c);
-        self.cells = vec![0; SIDE * SIDE];
-        for dz in 0..SIDE as i32 {
-            for dx in 0..SIDE as i32 {
-                let (x, z) = (c[0] - RADIUS + dx, c[2] - RADIUS + dz);
-                self.cells[(dz as usize) * SIDE + dx as usize] = shade(world, x, c[1], z);
+        match self.center {
+            None => {
+                self.center = Some(c);
+                self.cells = vec![0; SIDE * SIDE];
+                // Première fois : tout de suite en entier.
+                for row in 0..SIDE {
+                    self.row(world, row);
+                }
             }
+            Some(o)
+                if (o[0] - c[0]).abs() > GRID - RADIUS - 4
+                    || (o[2] - c[2]).abs() > GRID - RADIUS - 4
+                    || (o[1] - c[1]).abs() >= 3 =>
+            {
+                // Recentrage : ce qui reste dans la grille est déplacé, pas recalculé.
+                let (dx, dz) = (c[0] - o[0], c[2] - o[2]);
+                let mut cells = vec![0; SIDE * SIDE];
+                for z in 0..SIDE as i32 {
+                    for x in 0..SIDE as i32 {
+                        let (ox, oz) = (x + dx, z + dz);
+                        if (0..SIDE as i32).contains(&ox) && (0..SIDE as i32).contains(&oz) {
+                            cells[(z as usize) * SIDE + x as usize] =
+                                self.cells[(oz as usize) * SIDE + ox as usize];
+                        }
+                    }
+                }
+                self.cells = cells;
+                self.center = Some(c);
+            }
+            _ => {}
+        }
+        // Quelques lignes par image, toutes à tour de rôle.
+        for _ in 0..ROWS_PER_FRAME {
+            let row = self.next_row % SIDE;
+            self.row(world, row);
+            self.next_row = (self.next_row + 1) % SIDE;
         }
     }
 
-    /// Dessine le radar (carré de `size` pixels en `x`, `y`). `me` : position et regard ;
-    /// `mates` : coéquipiers en vie (position, couleur) ; `enemies` : adversaires repérés ;
-    /// `bomb` : bombe connue.
+    /// Recalcule la ligne `row` de la grille.
+    fn row(&mut self, world: &World, row: usize) {
+        let Some(c) = self.center else { return };
+        let z = c[2] - GRID + row as i32;
+        for dx in 0..SIDE {
+            let x = c[0] - GRID + dx as i32;
+            self.cells[row * SIDE + dx] = shade(world, x, c[1], z);
+        }
+    }
+
+    /// Dessine le radar (carré de `size` pixels en `x`, `y`), centré exactement sur le
+    /// joueur (il glisse avec lui, sans à-coup). `me` : position, regard et couleur ; `mates` :
+    /// coéquipiers en vie (position, couleur) ; `enemies` : adversaires repérés ; `bomb` :
+    /// bombe connue.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
@@ -85,7 +128,7 @@ impl Radar {
         y: f32,
         size: f32,
         s: f32,
-        me: (Vec3, Vec3),
+        me: (Vec3, Vec3, [f32; 4]),
         mates: &[(Vec3, [f32; 4])],
         enemies: &[Vec3],
         bomb: Option<Vec3>,
@@ -98,9 +141,19 @@ impl Radar {
             size + 2.0 * s,
             [0.0, 0.0, 0.0, 0.6],
         );
-        let cell = size / SIDE as f32;
-        // Cases, par bandes de même teinte (moins de rectangles).
+        let cell = size / (RADIUS * 2) as f32;
+        let (cx, cy) = (x + size / 2.0, y + size / 2.0);
+        // Coin haut gauche de la case (wx, wz) à l'écran.
+        let sx = |wx: f32| cx + (wx - me.0.x) * cell;
+        let sy = |wz: f32| cy + (wz - me.0.z) * cell;
+        let (x1, y1) = (x + size, y + size);
+        // Cases visibles, par bandes de même teinte, coupées au bord du cadre.
         for row in 0..SIDE {
+            let wz = (c[2] - GRID + row as i32) as f32;
+            let (top, bottom) = (sy(wz).max(y), sy(wz + 1.0).min(y1));
+            if bottom <= top {
+                continue;
+            }
             let mut start = 0;
             while start < SIDE {
                 let v = self.cells[row * SIDE + start];
@@ -109,29 +162,30 @@ impl Radar {
                     end += 1;
                 }
                 if v != 0 {
-                    ui.rect(
-                        x + start as f32 * cell,
-                        y + row as f32 * cell,
-                        (end - start) as f32 * cell + 0.5,
-                        cell + 0.5,
-                        SHADES[v as usize],
-                    );
+                    let wx0 = (c[0] - GRID + start as i32) as f32;
+                    let wx1 = (c[0] - GRID + end as i32) as f32;
+                    let (left, right) = (sx(wx0).max(x), sx(wx1).min(x1));
+                    if right > left {
+                        // Un demi-pixel de plus : pas de fente entre les bandes.
+                        ui.rect(
+                            left,
+                            top,
+                            (right - left + 0.5).min(x1 - left),
+                            (bottom - top + 0.5).min(y1 - top),
+                            SHADES[v as usize],
+                        );
+                    }
                 }
                 start = end;
             }
         }
         // Position monde → radar (le nord, -z, en haut). Hors du cadre : collé au bord.
-        let origin = Vec3::new((c[0] - RADIUS) as f32, 0.0, (c[2] - RADIUS) as f32);
-        let to = |p: Vec3| -> (f32, f32) {
-            let u = ((p.x - origin.x) * cell).clamp(0.0, size);
-            let v = ((p.z - origin.z) * cell).clamp(0.0, size);
-            (x + u, y + v)
-        };
+        let to = |p: Vec3| -> (f32, f32) { (sx(p.x).clamp(x, x1), sy(p.z).clamp(y, y1)) };
         for (letter, at) in &self.sites {
-            let (sx, sy) = to(Vec3::new(at[0], 0.0, at[1]));
+            let (px, py) = to(Vec3::new(at[0], 0.0, at[1]));
             let t = letter.to_string();
             let tw = Ui::text_width(&t, s);
-            ui.text(sx - tw / 2.0, sy - 4.0 * s, s, [1.0, 0.45, 0.35, 0.95], t);
+            ui.text(px - tw / 2.0, py - 4.0 * s, s, [1.0, 0.45, 0.35, 0.95], t);
         }
         let dot = |ui: &mut Ui, p: Vec3, col: [f32; 4], r: f32| {
             let (px, py) = to(p);
@@ -153,20 +207,28 @@ impl Radar {
         for (p, col) in mates {
             dot(ui, *p, *col, 1.5 * s);
         }
-        // Soi : point blanc et trait dans la direction du regard.
-        let (px, py) = to(me.0);
+        // Soi : point à sa couleur (cerclé de blanc) au centre, trait dans la direction du
+        // regard.
         let dir = Vec3::new(me.1.x, 0.0, me.1.z).normalize_or_zero();
         for k in 1..=4 {
             let f = k as f32 * 1.6 * s;
             ui.rect(
-                px + dir.x * f - s / 2.0,
-                py + dir.z * f - s / 2.0,
+                cx + dir.x * f - s / 2.0,
+                cy + dir.z * f - s / 2.0,
                 s,
                 s,
                 [1.0, 1.0, 1.0, 0.9],
             );
         }
-        dot(ui, me.0, [1.0, 1.0, 1.0, 1.0], 2.0 * s);
+        let r = 2.0 * s;
+        ui.rect(
+            cx - r - s,
+            cy - r - s,
+            2.0 * r + 2.0 * s,
+            2.0 * r + 2.0 * s,
+            [1.0; 4],
+        );
+        ui.rect(cx - r, cy - r, 2.0 * r, 2.0 * r, me.2);
     }
 }
 
@@ -220,9 +282,15 @@ mod tests {
         let mut r = Radar::default();
         r.update(&w, Vec3::new(0.5, 11.0, 0.5));
         assert_eq!(r.cells.len(), SIDE * SIDE);
-        let at =
-            |dx: i32, dz: i32| r.cells[((dz + RADIUS) as usize) * SIDE + (dx + RADIUS) as usize];
-        assert_eq!(at(3, 0), 5);
-        assert_eq!(at(0, 0), 3);
+        let at = |r: &Radar, dx: i32, dz: i32| {
+            r.cells[((dz + GRID) as usize) * SIDE + (dx + GRID) as usize]
+        };
+        assert_eq!(at(&r, 3, 0), 5);
+        assert_eq!(at(&r, 0, 0), 3);
+        // Le joueur s'éloigne : la grille est recentrée sur lui, ce qui était connu suit
+        // (le mur est toujours au même endroit du monde).
+        r.update(&w, Vec3::new(-30.5, 11.0, 0.5));
+        assert_eq!(r.center, Some([-31, 11, 0]));
+        assert_eq!(at(&r, 34, 0), 5, "le mur, déplacé avec la grille");
     }
 }

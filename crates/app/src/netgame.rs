@@ -404,17 +404,12 @@ fn shot(
             }
             let (min, max, head_y) = hitbox(feet, crouch);
             if let Some(t) = ray_box(origin, dir, min, max) {
-                let wall = path
-                    .through
-                    .is_some_and(|(exit, last)| t > exit && t < last);
-                if (t < path.first || wall) && best.is_none_or(|b| t < b.0) {
+                let factor = path.factor_at(t);
+                let wall = t >= path.first;
+                if let (Some(factor), true) = (factor, best.is_none_or(|b| t < b.0)) {
                     let point = origin + dir * t;
                     let (d, hurt) = damage_at(weapon, t, point.y, feet.y, head_y);
-                    let damage = if wall {
-                        (d as f32 * crate::weapons::THROUGH_WALL) as u32
-                    } else {
-                        d
-                    };
+                    let damage = if wall { (d as f32 * factor) as u32 } else { d };
                     best = Some((
                         t,
                         id,
@@ -2069,21 +2064,6 @@ impl NetGame {
                 h.m.set_color(0, color);
             }
             NetGame::Guest(g) => g.to_host(&ToHost::Color(color)),
-        }
-    }
-
-    /// Changer d'équipe pendant l'échauffement.
-    pub fn choose_team(&mut self, team: u8) {
-        match self {
-            NetGame::Host(h) => {
-                h.record(0, Move::Rule(Rule::Msg(ToHost::Team(team))));
-                if let Some(ev) = h.m.switch_team(0, team) {
-                    let mut out = Vec::new();
-                    h.events(vec![ev], &mut out);
-                    h.out.extend(out);
-                }
-            }
-            NetGame::Guest(g) => g.to_host(&ToHost::Team(team)),
         }
     }
 

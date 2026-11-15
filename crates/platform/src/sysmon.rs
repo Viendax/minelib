@@ -16,7 +16,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind,
+    System,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct SysStats {
@@ -58,7 +61,12 @@ impl SysMonitor {
                 .spawn(move || monitor_loop(stats, gpu_name, stop))
                 .ok()
         };
-        Self { stats, gpu_name, stop, thread }
+        Self {
+            stats,
+            gpu_name,
+            stop,
+            thread,
+        }
     }
 
     /// Nom du GPU utilisé par le rendu, pour choisir le bon adaptateur.
@@ -80,14 +88,20 @@ impl Drop for SysMonitor {
     }
 }
 
-fn monitor_loop(out: Arc<Mutex<SysStats>>, gpu_name: Arc<Mutex<Option<String>>>, stop: Arc<AtomicBool>) {
+fn monitor_loop(
+    out: Arc<Mutex<SysStats>>,
+    gpu_name: Arc<Mutex<Option<String>>>,
+    stop: Arc<AtomicBool>,
+) {
     // Mesures système désactivables (diagnostic, Wine).
     if std::env::var_os("MINELIB_NO_PDH").is_some() {
         return;
     }
     let pid = sysinfo::get_current_pid().ok();
     let mut sys = System::new_with_specifics(
-        RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()).with_memory(MemoryRefreshKind::everything()),
+        RefreshKind::nothing()
+            .with_cpu(CpuRefreshKind::everything())
+            .with_memory(MemoryRefreshKind::everything()),
     );
     let mut gpu = gpu::GpuProbe::new();
 
@@ -105,7 +119,11 @@ fn monitor_loop(out: Arc<Mutex<SysStats>>, gpu_name: Arc<Mutex<Option<String>>>,
         let proc = pid.and_then(|p: Pid| sys.process(p));
 
         let mut s = SysStats {
-            cpu_name: sys.cpus().first().map(|c| c.brand().trim().to_owned()).unwrap_or_default(),
+            cpu_name: sys
+                .cpus()
+                .first()
+                .map(|c| c.brand().trim().to_owned())
+                .unwrap_or_default(),
             cpu_threads: threads,
             // sysinfo donne le % d'un seul cœur : on ramène à la machine entière.
             cpu_process: proc.map(|p| p.cpu_usage() / threads as f32).unwrap_or(0.0),
@@ -148,7 +166,12 @@ mod gpu {
 
     impl GpuProbe {
         pub fn new() -> Self {
-            Self { adapter: None, adapter_for: None, vram_total: None, pdh: Pdh::open() }
+            Self {
+                adapter: None,
+                adapter_for: None,
+                vram_total: None,
+                pdh: Pdh::open(),
+            }
         }
 
         pub fn sample(&mut self, gpu_name: Option<&str>, pid: Option<u32>, s: &mut SysStats) {
@@ -157,7 +180,9 @@ mod gpu {
             }
             if let Some(a) = &self.adapter {
                 let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-                if unsafe { a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }.is_ok() {
+                if unsafe { a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }
+                    .is_ok()
+                {
                     s.vram_process = Some(info.CurrentUsage);
                     s.vram_budget = Some(info.Budget);
                 }
@@ -172,15 +197,25 @@ mod gpu {
         /// sinon celui qui a le plus de VRAM dédiée.
         fn pick_adapter(&mut self, gpu_name: Option<&str>) {
             self.adapter_for = gpu_name.map(str::to_owned);
-            let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else { return };
+            let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+                return;
+            };
             let mut best: Option<(bool, u64, IDXGIAdapter1)> = None;
             for i in 0.. {
-                let Ok(a) = (unsafe { factory.EnumAdapters1(i) }) else { break };
-                let Ok(desc) = (unsafe { a.GetDesc1() }) else { continue };
+                let Ok(a) = (unsafe { factory.EnumAdapters1(i) }) else {
+                    break;
+                };
+                let Ok(desc) = (unsafe { a.GetDesc1() }) else {
+                    continue;
+                };
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
                     continue;
                 }
-                let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                let len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
                 let name = String::from_utf16_lossy(&desc.Description[..len]);
                 let matches = gpu_name.is_some_and(|g| g.contains(name.trim()) || name.contains(g));
                 let vram = desc.DedicatedVideoMemory as u64;
@@ -237,7 +272,12 @@ mod gpu {
                     return None;
                 }
                 let _ = PdhCollectQueryData(query);
-                Some(Self { query, engines, memory, primed: false })
+                Some(Self {
+                    query,
+                    engines,
+                    memory,
+                    primed: false,
+                })
             }
         }
 
@@ -258,14 +298,18 @@ mod gpu {
                 let mut all: HashMap<String, f64> = HashMap::new();
                 let mut mine: HashMap<String, f64> = HashMap::new();
                 for (name, v) in items {
-                    let Some(i) = name.find("engtype_") else { continue };
+                    let Some(i) = name.find("engtype_") else {
+                        continue;
+                    };
                     let ty = name[i..].to_owned();
                     *all.entry(ty.clone()).or_default() += v;
                     if tag.as_ref().is_some_and(|t| name.starts_with(t.as_str())) {
                         *mine.entry(ty).or_default() += v;
                     }
                 }
-                let max = |m: &HashMap<String, f64>| m.values().copied().fold(0.0, f64::max).min(100.0) as f32;
+                let max = |m: &HashMap<String, f64>| {
+                    m.values().copied().fold(0.0, f64::max).min(100.0) as f32
+                };
                 s.gpu_usage = Some(max(&all));
                 s.gpu_process = Some(max(&mine));
             }
@@ -288,14 +332,22 @@ mod gpu {
         unsafe {
             let mut size = 0u32;
             let mut count = 0u32;
-            let _ = PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut size, &mut count, None);
+            let _ =
+                PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut size, &mut count, None);
             if size == 0 {
                 return None;
             }
             // Tampon aligné sur 8 octets pour les structures PDH.
             let mut buf = vec![0u64; (size as usize).div_ceil(8)];
             let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
-            if PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut size, &mut count, Some(items)) != 0 {
+            if PdhGetFormattedCounterArrayW(
+                counter,
+                PDH_FMT_DOUBLE,
+                &mut size,
+                &mut count,
+                Some(items),
+            ) != 0
+            {
                 return None;
             }
             let slice = std::slice::from_raw_parts(items, count as usize);
@@ -303,7 +355,12 @@ mod gpu {
                 slice
                     .iter()
                     .filter(|it| it.FmtValue.CStatus == 0)
-                    .map(|it| (it.szName.to_string().unwrap_or_default(), it.FmtValue.Anonymous.doubleValue))
+                    .map(|it| {
+                        (
+                            it.szName.to_string().unwrap_or_default(),
+                            it.FmtValue.Anonymous.doubleValue,
+                        )
+                    })
                     .collect(),
             )
         }
@@ -327,9 +384,15 @@ mod gpu {
             #[cfg(target_os = "linux")]
             {
                 let read = |card: &std::path::Path, f: &str| -> Option<u64> {
-                    std::fs::read_to_string(card.join("device").join(f)).ok()?.trim().parse().ok()
+                    std::fs::read_to_string(card.join("device").join(f))
+                        .ok()?
+                        .trim()
+                        .parse()
+                        .ok()
                 };
-                let Ok(dir) = std::fs::read_dir("/sys/class/drm") else { return };
+                let Ok(dir) = std::fs::read_dir("/sys/class/drm") else {
+                    return;
+                };
                 for e in dir.flatten() {
                     let p = e.path();
                     let name = e.file_name();

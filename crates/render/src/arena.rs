@@ -111,7 +111,8 @@ impl Arena {
             None => {
                 // Garde-fou : pas de nouvelle page au-delà du budget de mémoire vidéo.
                 if self.pressure
-                    || (self.budget > 0 && (self.pages.len() as u64 + 1) * page_bytes() > self.budget)
+                    || (self.budget > 0
+                        && (self.pages.len() as u64 + 1) * page_bytes() > self.budget)
                 {
                     self.refused += 1;
                     return None;

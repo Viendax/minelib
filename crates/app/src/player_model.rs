@@ -486,23 +486,33 @@ pub fn build(pose: &Pose) -> Vec<EntityVertex> {
 
 /// Pavés du joueur (et de l'objet tenu) pour les reflets du raytracing.
 pub fn ray_boxes(pose: &Pose) -> Vec<RayBox> {
-    let body = parts(pose).into_iter().map(|(xf, min, max, part)| {
-        let kind = match part {
-            Part::Head => RayBoxKind::Head,
-            Part::Body => RayBoxKind::Body,
-            Part::Arm => RayBoxKind::Arm,
-            Part::Leg => RayBoxKind::Leg,
-        };
-        (xf, min, max, kind)
-    });
-    body.chain(held_parts(pose))
-        .map(|(xf, min, max, kind)| RayBox {
-            world_to_local: xf.inverse(),
-            min,
-            max,
-            kind,
-        })
-        .collect()
+    // Avec un skin : chaque partie le lit (mêmes numéros que `build`, plus un).
+    let skinned = pose.skin.is_some();
+    let body = parts(pose)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (xf, min, max, part))| {
+            let kind = match part {
+                Part::Head => RayBoxKind::Head,
+                Part::Body => RayBoxKind::Body,
+                Part::Arm => RayBoxKind::Arm,
+                Part::Leg => RayBoxKind::Leg,
+            };
+            (xf, min, max, kind, if skinned { i as u8 + 1 } else { 0 })
+        });
+    body.chain(
+        held_parts(pose)
+            .into_iter()
+            .map(|(xf, min, max, kind)| (xf, min, max, kind, 0)),
+    )
+    .map(|(xf, min, max, kind, part)| RayBox {
+        world_to_local: xf.inverse(),
+        min,
+        max,
+        kind,
+        part,
+    })
+    .collect()
 }
 
 #[cfg(test)]

@@ -14,7 +14,11 @@ pub struct Hit {
 
 impl Hit {
     pub fn adjacent(&self) -> [i32; 3] {
-        [self.block[0] + self.normal[0], self.block[1] + self.normal[1], self.block[2] + self.normal[2]]
+        [
+            self.block[0] + self.normal[0],
+            self.block[1] + self.normal[1],
+            self.block[2] + self.normal[2],
+        ]
     }
 }
 
@@ -32,7 +36,11 @@ pub fn raycast(world: &World, origin: [f32; 3], dir: [f32; 3], max_dist: f32) ->
     for i in 0..3 {
         if d[i] != 0.0 {
             t_delta[i] = 1.0 / d[i].abs();
-            let boundary = if d[i] > 0.0 { cell[i] as f32 + 1.0 } else { cell[i] as f32 };
+            let boundary = if d[i] > 0.0 {
+                cell[i] as f32 + 1.0
+            } else {
+                cell[i] as f32
+            };
             t_max[i] = (boundary - origin[i]) / d[i];
         } else {
             t_max[i] = f32::INFINITY;
@@ -45,17 +53,31 @@ pub fn raycast(world: &World, origin: [f32; 3], dir: [f32; 3], max_dist: f32) ->
         if id.is_targetable() && cell[1] >= 0 {
             let def = id.def();
             if def.full {
-                return Some(Hit { block: cell, normal, id, distance: t });
+                return Some(Hit {
+                    block: cell,
+                    normal,
+                    id,
+                    distance: t,
+                });
             }
             // Bloc partiel (torche, dalle, clôture…) : il faut toucher sa vraie forme.
             if let Some((dist, n)) = hit_boxes(origin, d, cell, &def.boxes()) {
                 if dist <= max_dist {
-                    return Some(Hit { block: cell, normal: n, id, distance: dist });
+                    return Some(Hit {
+                        block: cell,
+                        normal: n,
+                        id,
+                        distance: dist,
+                    });
                 }
             }
         }
         let axis = if t_max[0] < t_max[1] {
-            if t_max[0] < t_max[2] { 0 } else { 2 }
+            if t_max[0] < t_max[2] {
+                0
+            } else {
+                2
+            }
         } else if t_max[1] < t_max[2] {
             1
         } else {
@@ -85,13 +107,26 @@ pub fn selection_box(world: &World, block: [i32; 3]) -> ([f32; 3], [f32; 3]) {
     }
     let o = block.map(|v| v as f32);
     (
-        [o[0] + lo[0] as f32 / 16.0, o[1] + lo[1] as f32 / 16.0, o[2] + lo[2] as f32 / 16.0],
-        [o[0] + hi[0] as f32 / 16.0, o[1] + hi[1] as f32 / 16.0, o[2] + hi[2] as f32 / 16.0],
+        [
+            o[0] + lo[0] as f32 / 16.0,
+            o[1] + lo[1] as f32 / 16.0,
+            o[2] + lo[2] as f32 / 16.0,
+        ],
+        [
+            o[0] + hi[0] as f32 / 16.0,
+            o[1] + hi[1] as f32 / 16.0,
+            o[2] + hi[2] as f32 / 16.0,
+        ],
     )
 }
 
 /// Premier contact du rayon avec l'une des boîtes (en seizièmes de bloc) d'une case.
-fn hit_boxes(origin: [f32; 3], d: [f32; 3], cell: [i32; 3], boxes: &[([u8; 3], [u8; 3])]) -> Option<(f32, [i32; 3])> {
+fn hit_boxes(
+    origin: [f32; 3],
+    d: [f32; 3],
+    cell: [i32; 3],
+    boxes: &[([u8; 3], [u8; 3])],
+) -> Option<(f32, [i32; 3])> {
     let mut best: Option<(f32, [i32; 3])> = None;
     for (a, b) in boxes {
         let (mut t0, mut t1) = (0.0f32, f32::INFINITY);

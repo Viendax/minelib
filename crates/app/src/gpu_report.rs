@@ -12,13 +12,24 @@ pub fn spawn(render_gpu: String) {
     if std::env::var_os("MINELIB_NO_GPU_REPORT").is_some() {
         return;
     }
-    let out = minelib_assets::data_dir().join("logs").join("bilan_gpu.txt");
+    let out = minelib_assets::data_dir()
+        .join("logs")
+        .join("bilan_gpu.txt");
     if out.exists() {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
-    match std::process::Command::new(exe).arg("--bilan-gpu").arg(&render_gpu).spawn() {
-        Ok(_) => log::info!("bilan des cartes graphiques lancé à part → {}", out.display()),
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    match std::process::Command::new(exe)
+        .arg("--bilan-gpu")
+        .arg(&render_gpu)
+        .spawn()
+    {
+        Ok(_) => log::info!(
+            "bilan des cartes graphiques lancé à part → {}",
+            out.display()
+        ),
         Err(e) => log::warn!("bilan des cartes graphiques impossible : {e}"),
     }
 }
@@ -54,10 +65,15 @@ fn report(render_gpu: &str) {
             if a.has_display { "oui" } else { "non" }
         );
     }
-    let main = dxgi.iter().find(|a| render_gpu.contains(&a.name) || a.name.contains(render_gpu));
+    let main = dxgi
+        .iter()
+        .find(|a| render_gpu.contains(&a.name) || a.name.contains(render_gpu));
     if let Some(m) = main {
         if !m.has_display && dxgi.iter().any(|a| a.has_display) {
-            let shown = dxgi.iter().find(|a| a.has_display).map_or("?", |a| a.name.as_str());
+            let shown = dxgi
+                .iter()
+                .find(|a| a.has_display)
+                .map_or("?", |a| a.name.as_str());
             log::warn!(
                 "affichage : l'écran est branché sur « {shown} », pas sur « {} ». Chaque image est recopiée \
                  d'une carte à l'autre (Optimus) : FPS plafonnés et latence en plus. Pour aller au-delà : mode \
@@ -66,7 +82,10 @@ fn report(render_gpu: &str) {
                 m.name
             );
         } else if m.has_display {
-            log::info!("affichage : l'écran est branché directement sur « {} » (pas de recopie).", m.name);
+            log::info!(
+                "affichage : l'écran est branché directement sur « {} » (pas de recopie).",
+                m.name
+            );
         }
     }
 
@@ -90,13 +109,18 @@ fn report(render_gpu: &str) {
     log::info!("partie graphique intégrée : {}", line(&i));
 
     // Conclusions, chiffrées.
-    let ratio = discrete.as_ref().map_or(0.0, |d| i.gflops / d.gflops.max(1.0));
+    let ratio = discrete
+        .as_ref()
+        .map_or(0.0, |d| i.gflops / d.gflops.max(1.0));
     // Recopier une image 1080p HDR (8 octets par pixel) d'une carte à l'autre passe par la
     // mémoire vive : au moins deux transferts.
     let frame_mb = 1920.0 * 1080.0 * 8.0 / 1e6;
     let transfer_ms = 2.0 * frame_mb / 1e3 / i.upload_gbs.max(0.1) * 1e3;
     let power = if discrete.is_some() {
-        format!("{:.0} % de la puissance de calcul de la carte dédiée", ratio * 100.0)
+        format!(
+            "{:.0} % de la puissance de calcul de la carte dédiée",
+            ratio * 100.0
+        )
     } else {
         format!("{:.0} GFLOPS", i.gflops)
     };

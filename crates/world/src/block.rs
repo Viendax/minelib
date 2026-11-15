@@ -11,7 +11,9 @@ impl BlockId {
 
     /// Torche contre le mur situé du côté `d` (0 +X, 1 −X, 4 +Z, 5 −Z).
     pub fn wall_torch(d: u8) -> BlockId {
-        crate::registry::registry().by_key(&format!("wall_torch:{d}")).unwrap_or(BlockId::TORCH)
+        crate::registry::registry()
+            .by_key(&format!("wall_torch:{d}"))
+            .unwrap_or(BlockId::TORCH)
     }
 
     pub const AIR: BlockId = BlockId(0);

@@ -150,6 +150,123 @@ fn push_box(
     }
 }
 
+/// Bras droit avec le skin du joueur : la boîte 0..1 (long selon z, l'épaule en z = 1,
+/// la main en z = 0, le dessus du bras vers +y) découpée en pixels du skin, colorés comme
+/// le bras du modèle (`skin::Skin::color`, partie 4, 4 × 12 × 4 pixels).
+fn push_skin_arm(
+    out: &mut Vec<VmVertex>,
+    mvp: Mat4,
+    skin: &crate::skin::Skin,
+    fallback: [f32; 3],
+    light: [f32; 3],
+) {
+    let (mn, mx) = (Vec3::ZERO, Vec3::ONE);
+    // Mêmes faces (et sens) que `push_box` : 0 +x, 1 −x, 2 +y, 3 −y, 4 +z, 5 −z.
+    let faces: [(usize, [Vec3; 4]); 6] = [
+        (
+            0,
+            [
+                Vec3::new(mx.x, mn.y, mx.z),
+                Vec3::new(mx.x, mn.y, mn.z),
+                Vec3::new(mx.x, mx.y, mn.z),
+                Vec3::new(mx.x, mx.y, mx.z),
+            ],
+        ),
+        (
+            1,
+            [
+                Vec3::new(mn.x, mn.y, mn.z),
+                Vec3::new(mn.x, mn.y, mx.z),
+                Vec3::new(mn.x, mx.y, mx.z),
+                Vec3::new(mn.x, mx.y, mn.z),
+            ],
+        ),
+        (
+            2,
+            [
+                Vec3::new(mn.x, mx.y, mx.z),
+                Vec3::new(mx.x, mx.y, mx.z),
+                Vec3::new(mx.x, mx.y, mn.z),
+                Vec3::new(mn.x, mx.y, mn.z),
+            ],
+        ),
+        (
+            3,
+            [
+                Vec3::new(mn.x, mn.y, mn.z),
+                Vec3::new(mx.x, mn.y, mn.z),
+                Vec3::new(mx.x, mn.y, mx.z),
+                Vec3::new(mn.x, mn.y, mx.z),
+            ],
+        ),
+        (
+            4,
+            [
+                Vec3::new(mn.x, mn.y, mx.z),
+                Vec3::new(mx.x, mn.y, mx.z),
+                Vec3::new(mx.x, mx.y, mx.z),
+                Vec3::new(mn.x, mx.y, mx.z),
+            ],
+        ),
+        (
+            5,
+            [
+                Vec3::new(mx.x, mn.y, mn.z),
+                Vec3::new(mn.x, mn.y, mn.z),
+                Vec3::new(mn.x, mx.y, mn.z),
+                Vec3::new(mx.x, mx.y, mn.z),
+            ],
+        ),
+    ];
+    let cells = |a: Vec3, b: Vec3| if (b - a).z.abs() > 0.5 { 12 } else { 4 };
+    for (face, q) in faces {
+        let shade = match face {
+            2 => 1.0,
+            3 => 0.5,
+            0 | 1 => 0.62,
+            _ => 0.8,
+        };
+        let (ns, nt) = (cells(q[0], q[1]), cells(q[0], q[3]));
+        let at = |s: f32, t: f32| q[0] + (q[1] - q[0]) * s + (q[3] - q[0]) * t;
+        for j in 0..nt {
+            for i in 0..ns {
+                let (s0, s1) = (i as f32 / ns as f32, (i + 1) as f32 / ns as f32);
+                let (t0, t1) = (j as f32 / nt as f32, (j + 1) as f32 / nt as f32);
+                let c = at((s0 + s1) * 0.5, (t0 + t1) * 0.5);
+                let px = |x: f32, n: f32| ((x * n).floor() as u32).min(n as u32 - 1);
+                let along = px(1.0 - c.z, 12.0);
+                let (sf, u, v) = match face {
+                    2 => (0, px(1.0 - c.x, 4.0), along),
+                    3 => (1, px(c.x, 4.0), along),
+                    0 => (2, px(c.y, 4.0), along),
+                    1 => (3, px(1.0 - c.y, 4.0), along),
+                    4 => (4, px(c.x, 4.0), px(c.y, 4.0)),
+                    _ => (5, px(c.x, 4.0), px(c.y, 4.0)),
+                };
+                let rgb = skin.color(4, sf, u, v, [4, 12, 4]).map_or(fallback, |h| {
+                    lin([(h >> 16) as u8, (h >> 8) as u8, h as u8])
+                });
+                let col = [
+                    rgb[0] * shade * light[0],
+                    rgb[1] * shade * light[1],
+                    rgb[2] * shade * light[2],
+                    1.0,
+                ];
+                let quad = [at(s0, t0), at(s1, t0), at(s1, t1), at(s0, t1)];
+                for k in [0usize, 1, 2, 2, 3, 0] {
+                    out.push(VmVertex {
+                        clip: (mvp * quad[k].extend(1.0)).to_array(),
+                        uv: [0.0, 0.0],
+                        layer: NO_TEXTURE,
+                        _pad: 0,
+                        color: col,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Deux plans en croix (plantes tenues en main).
 fn push_cross(out: &mut Vec<VmVertex>, mvp: Mat4, layer: u32, light: [f32; 3]) {
     for (a, b) in [((0.0, 0.0), (1.0, 1.0)), ((0.0, 1.0), (1.0, 0.0))] {
@@ -350,6 +467,7 @@ impl Hand {
         aspect: f32,
         light: [f32; 3],
         show_arm: bool,
+        skin_tex: Option<&crate::skin::Skin>,
     ) -> Vec<VmVertex> {
         let proj = Mat4::perspective_infinite_reverse_rh(HAND_FOV.to_radians(), aspect, 0.01);
         let mut out = Vec::new();
@@ -371,16 +489,19 @@ impl Hand {
                 * Mat4::from_rotation_x(0.35)
                 * Mat4::from_scale(Vec3::new(0.16, 0.16, 0.78))
                 * Mat4::from_translation(Vec3::new(-0.5, -0.5, -1.0));
-            push_box(
-                &mut out,
-                proj * arm,
-                Vec3::ZERO,
-                Vec3::ONE,
-                None,
-                skin,
-                light,
-                false,
-            );
+            match skin_tex {
+                Some(t) => push_skin_arm(&mut out, proj * arm, t, skin, light),
+                None => push_box(
+                    &mut out,
+                    proj * arm,
+                    Vec3::ZERO,
+                    Vec3::ONE,
+                    None,
+                    skin,
+                    light,
+                    false,
+                ),
+            }
         }
 
         let Some(item) = item else { return out };
@@ -469,7 +590,7 @@ mod tests {
             Some(Item::Block(BlockId::STONE)),
             Some(Item::Torch(Some(2))),
         ] {
-            let v = h.build(item, 16.0 / 9.0, [1.0; 3], true);
+            let v = h.build(item, 16.0 / 9.0, [1.0; 3], true, None);
             assert!(!v.is_empty());
             for p in &v {
                 let [x, y, _z, w] = p.clip;

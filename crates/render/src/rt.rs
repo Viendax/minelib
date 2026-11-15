@@ -18,6 +18,10 @@ pub struct Voxels {
     pub view: wgpu::TextureView,
     pub palette: wgpu::Texture,
     pub palette_view: wgpu::TextureView,
+    /// Skin du joueur (64 × 64 RGBA) pour le voir avec dans les reflets ; transparent :
+    /// modèle par défaut.
+    pub skin: wgpu::Texture,
+    pub skin_view: wgpu::TextureView,
     /// Coin bas de la grille (coordonnées monde), envoyé au shader.
     pub origin: [i32; 3],
 }
@@ -52,13 +56,55 @@ impl Voxels {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let skin = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("raytracing : skin"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         Self {
             view: texture.create_view(&Default::default()),
             palette_view: palette.create_view(&Default::default()),
+            skin_view: skin.create_view(&Default::default()),
             texture,
             palette,
+            skin,
             origin: [0; 3],
         }
+    }
+
+    /// Skin du joueur vu dans les reflets (64 × 64 RGBA, ligne par ligne) ; `None` : modèle
+    /// par défaut.
+    pub fn upload_skin(&self, queue: &wgpu::Queue, rgba: Option<&[u8]>) {
+        let zero = vec![0u8; 64 * 64 * 4];
+        let data = rgba.filter(|d| d.len() == 64 * 64 * 4).unwrap_or(&zero);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.skin,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(64 * 4),
+                rows_per_image: Some(64),
+            },
+            wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Couches de texture de chaque bloc (dessus, côtés, dessous) : le rayon touché lit la

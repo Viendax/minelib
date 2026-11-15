@@ -16,9 +16,20 @@ pub struct Admin {
     pub bans: Vec<(String, String)>,
 }
 
+/// Liste blanche d'un serveur : quand elle est active, seuls le créateur, ses OP et les
+/// pseudos de la liste entrent. Gardée à part (fichier `….whitelist`) : l'ancien fichier
+/// des OP reste lisible.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Whitelist {
+    pub on: bool,
+    /// Pseudos en minuscules.
+    pub names: Vec<String>,
+}
+
 pub struct Store {
     path: PathBuf,
     servers: HashMap<String, Admin>,
+    whitelists: HashMap<String, Whitelist>,
 }
 
 /// Clé d'un serveur : son créateur et son monde.
@@ -36,6 +47,12 @@ pub enum Action {
     List,
     /// Tuer un joueur (OP) : rien à garder, juste la permission.
     Kill,
+    /// Liste blanche (OP).
+    WhitelistOn,
+    WhitelistOff,
+    WhitelistAdd,
+    WhitelistRemove,
+    WhitelistList,
 }
 
 impl Store {
@@ -44,13 +61,36 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
-        Self { path, servers }
+        let whitelists = std::fs::read(Self::wl_path(&path))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            servers,
+            whitelists,
+        }
+    }
+
+    fn wl_path(path: &std::path::Path) -> PathBuf {
+        path.with_extension("whitelist")
     }
 
     fn save(&self) {
         if let Ok(b) = postcard::to_allocvec(&self.servers) {
             let _ = crate::accounts::write_atomic(&self.path, &b);
         }
+        if let Ok(b) = postcard::to_allocvec(&self.whitelists) {
+            let _ = crate::accounts::write_atomic(&Self::wl_path(&self.path), &b);
+        }
+    }
+
+    /// Liste blanche active et `who` n'y est pas (ni créateur, ni OP) : entrée refusée.
+    pub fn whitelisted_out(&self, server: &str, creator: &str, who: &str) -> bool {
+        self.whitelists.get(server).is_some_and(|w| {
+            w.on && !self.is_op(server, creator, who)
+                && !w.names.iter().any(|n| n.eq_ignore_ascii_case(who))
+        })
     }
 
     pub fn is_op(&self, server: &str, creator: &str, who: &str) -> bool {
@@ -94,6 +134,53 @@ impl Store {
         }
         let low = target.to_ascii_lowercase();
         let is_creator = target.eq_ignore_ascii_case(creator);
+        let wl = self.whitelists.entry(server.to_string()).or_default();
+        let msg = match action {
+            Action::WhitelistList => {
+                return Ok(format!(
+                    "Liste blanche {} : {}.",
+                    if wl.on { "active" } else { "inactive" },
+                    if wl.names.is_empty() {
+                        "personne".into()
+                    } else {
+                        wl.names.join(", ")
+                    }
+                ));
+            }
+            Action::WhitelistOn => {
+                wl.on = true;
+                Some(
+                    "Liste blanche active : seuls les OP et les pseudos de la liste entrent."
+                        .to_string(),
+                )
+            }
+            Action::WhitelistOff => {
+                wl.on = false;
+                Some("Liste blanche désactivée : tout le monde peut entrer.".to_string())
+            }
+            Action::WhitelistAdd | Action::WhitelistRemove if target.is_empty() => {
+                return Err("Pseudo manquant.".into())
+            }
+            Action::WhitelistAdd => {
+                if !wl.names.contains(&low) {
+                    wl.names.push(low.clone());
+                }
+                Some(format!("{target} est sur la liste blanche."))
+            }
+            Action::WhitelistRemove => {
+                let before = wl.names.len();
+                wl.names.retain(|n| *n != low);
+                if wl.names.len() == before {
+                    return Err(format!("{target} n'est pas sur la liste blanche."));
+                }
+                Some(format!("{target} n'est plus sur la liste blanche."))
+            }
+            _ => None,
+        };
+        if let Some(msg) = msg {
+            self.save();
+            return Ok(msg);
+        }
         let a = self.servers.entry(server.to_string()).or_default();
         let msg = match action {
             Action::List => {
@@ -112,6 +199,11 @@ impl Store {
             }
             _ if target.is_empty() => return Err("Pseudo manquant.".into()),
             Action::Kill => return Ok(format!("{target} est tué.")),
+            Action::WhitelistOn
+            | Action::WhitelistOff
+            | Action::WhitelistAdd
+            | Action::WhitelistRemove
+            | Action::WhitelistList => unreachable!("traité plus haut"),
             Action::Ban if is_creator => return Err("On ne bannit pas le créateur.".into()),
             Action::Ban if by.eq_ignore_ascii_case(target) => {
                 return Err("On ne se bannit pas soi-même.".into())
@@ -158,6 +250,43 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whitelist_lets_in_only_ops_and_listed_players() {
+        let path = std::env::temp_dir().join(format!("minelib-wl-{}", rand::random::<u32>()));
+        let mut s = Store::open(path.clone());
+        let k = key("Createur", "monde");
+        let act = |s: &mut Store, by: &str, a: Action, t: &str| s.act(&k, "Createur", by, a, t, "");
+        assert!(
+            !s.whitelisted_out(&k, "Createur", "Eve"),
+            "inactive : ouvert"
+        );
+        assert!(
+            act(&mut s, "Eve", Action::WhitelistOn, "").is_err(),
+            "pas OP"
+        );
+        act(&mut s, "Createur", Action::Op, "Bob").unwrap();
+        act(&mut s, "Bob", Action::WhitelistOn, "").unwrap();
+        assert!(s.whitelisted_out(&k, "Createur", "Eve"));
+        assert!(!s.whitelisted_out(&k, "Createur", "bob"), "OP");
+        assert!(!s.whitelisted_out(&k, "Createur", "createur"), "créateur");
+        act(&mut s, "Bob", Action::WhitelistAdd, "Eve").unwrap();
+        assert!(!s.whitelisted_out(&k, "Createur", "EVE"));
+        assert!(act(&mut s, "Bob", Action::WhitelistList, "")
+            .unwrap()
+            .contains("eve"));
+        // Gardé sur disque, et l'ancien fichier des OP reste lisible.
+        let mut s2 = Store::open(path.clone());
+        assert!(!s2.whitelisted_out(&k, "Createur", "eve"));
+        assert!(s2.whitelisted_out(&k, "Createur", "Zoe"));
+        assert!(s2.is_op(&k, "Createur", "bob"));
+        act(&mut s2, "Bob", Action::WhitelistRemove, "eve").unwrap();
+        assert!(s2.whitelisted_out(&k, "Createur", "eve"));
+        act(&mut s2, "Bob", Action::WhitelistOff, "").unwrap();
+        assert!(!s2.whitelisted_out(&k, "Createur", "eve"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("whitelist"));
+    }
 
     #[test]
     fn the_creator_is_op_and_names_the_others() {

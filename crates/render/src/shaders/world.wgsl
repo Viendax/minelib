@@ -51,6 +51,8 @@ struct Globals {
 @group(0) @binding(4) var palette: texture_1d<u32>;
 // Dernière image des reflets : rgb = reflet, a = distance caméra → surface (0 = rien).
 @group(0) @binding(5) var refl_tex: texture_2d<f32>;
+/// Skin du joueur (64 × 64), pour les reflets.
+@group(0) @binding(6) var skin_tex: texture_2d<f32>;
 
 const HORIZON: vec3<f32> = vec3<f32>(0.62, 0.78, 0.95);
 const ZENITH: vec3<f32> = vec3<f32>(0.25, 0.47, 0.85);
@@ -687,6 +689,38 @@ fn skin_color(kind: u32, face: u32, u: u32, v: u32, n: u32) -> u32 {
     return select(PANTS, SHOES, face == 4u || v >= 9u);
 }
 
+/// Pixel du vrai skin (même calcul que `skin::Skin::color`) : partie 0 jambe gauche,
+/// 1 jambe droite, 2 corps, 3 bras gauche, 4 bras droit, 5 tête ; face 0 devant,
+/// 1 derrière, 2 côté droit, 3 côté gauche, 4 dessus, 5 dessous ; taille w × d. Couleur
+/// sRGB et opacité (a < 0,5 : pixel vide, on garde le dessin par défaut).
+fn skin_pixel(part: u32, face: u32, u: u32, v: u32, w: u32, d: u32) -> vec4<f32> {
+    var base = vec2<u32>(0u, 0u);
+    var over = vec2<u32>(32u, 0u);
+    switch part {
+        case 0u: { base = vec2<u32>(16u, 48u); over = vec2<u32>(0u, 48u); }
+        case 1u: { base = vec2<u32>(0u, 16u); over = vec2<u32>(0u, 32u); }
+        case 2u: { base = vec2<u32>(16u, 16u); over = vec2<u32>(16u, 32u); }
+        case 3u: { base = vec2<u32>(32u, 48u); over = vec2<u32>(48u, 48u); }
+        case 4u: { base = vec2<u32>(40u, 16u); over = vec2<u32>(40u, 32u); }
+        default: {}
+    }
+    let ru = w - 1u - min(u, w - 1u);
+    var l = vec2<u32>(d + u, d + v);
+    switch face {
+        case 1u: { l = vec2<u32>(2u * d + w + u, d + v); }
+        case 2u: { l = vec2<u32>(u, d + v); }
+        case 3u: { l = vec2<u32>(d + w + u, d + v); }
+        case 4u: { l = vec2<u32>(d + ru, v); }
+        case 5u: { l = vec2<u32>(d + w + ru, v); }
+        default: {}
+    }
+    let top = textureLoad(skin_tex, min(over + l, vec2<u32>(63u)), 0);
+    if top.a >= 0.5 {
+        return top;
+    }
+    return textureLoad(skin_tex, min(base + l, vec2<u32>(63u)), 0);
+}
+
 fn srgb_hex(c: u32) -> vec3<f32> {
     return lin(vec3<f32>(f32((c >> 16u) & 255u), f32((c >> 8u) & 255u), f32(c & 255u)) / 255.0);
 }
@@ -748,7 +782,24 @@ fn player_hit(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> vec4<f32> {
             albedo = srgb_hex(u32(g.ray_max[k].w));
         } else {
             let iu = u32(clamp(u, 0.0, n - 0.5));
-            albedo = srgb_hex(skin_color(kind, face, iu, u32(max(v, 0.0)), u32(n + 0.5)));
+            let iv = u32(max(v, 0.0));
+            albedo = srgb_hex(skin_color(kind, face, iu, iv, u32(n + 0.5)));
+            // Vrai skin du joueur : face numérotée comme `player_model::emit_box`.
+            let part = u32(g.ray_max[k].w);
+            if part > 0u {
+                var sf = select(0u, 1u, s);
+                if ax == 0 {
+                    sf = select(3u, 2u, s);
+                } else if ax == 1 {
+                    sf = select(5u, 4u, s);
+                }
+                let w = u32(mx.x - mn.x + 0.5);
+                let dd = u32(mx.z - mn.z + 0.5);
+                let px = skin_pixel(part - 1u, sf, iu, iv, w, dd);
+                if px.a >= 0.5 {
+                    albedo = lin(px.rgb);
+                }
+            }
         }
         // Ombrage selon l'orientation de la face dans le monde, comme le modèle.
         let sg = select(-1.0, 1.0, s);

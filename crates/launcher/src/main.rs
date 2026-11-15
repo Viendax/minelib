@@ -66,7 +66,10 @@ fn parse_release(json: &str) -> Option<Release> {
     };
     let game = assets.iter().find(|a| {
         let n = name_of(a);
-        n.ends_with(".exe") && n.contains("minelib") && !n.contains("relay") && !n.contains("launcher")
+        n.ends_with(".exe")
+            && n.contains("minelib")
+            && !n.contains("relay")
+            && !n.contains("launcher")
     })?;
     let exe = name_of(game);
     let sha256_url = assets
@@ -114,15 +117,16 @@ fn plan(installed: Option<u32>, latest: std::result::Result<Latest, String>) -> 
         (Some(v), Ok(Latest::Found(r))) if r.version <= v => Plan::Launch,
         (_, Ok(Latest::Found(r))) => Plan::Download(r),
         (Some(_), _) => Plan::Launch,
-        (None, Ok(Latest::None)) => Plan::Fail(
-            "Aucune version du jeu n'est encore publiée sur GitHub.".into(),
-        ),
+        (None, Ok(Latest::None)) => {
+            Plan::Fail("Aucune version du jeu n'est encore publiée sur GitHub.".into())
+        }
         (None, Err(e)) => Plan::Fail(format!("GitHub injoignable : {e}")),
     }
 }
 
 fn get(url: &str) -> std::result::Result<String, ureq::Error> {
-    http().get(url)
+    http()
+        .get(url)
         .header("User-Agent", "minelib-launcher")
         .header("Accept", "application/vnd.github+json")
         .call()?
@@ -138,7 +142,9 @@ fn fetch_latest() -> std::result::Result<Latest, String> {
             .map(Latest::Found)
             .ok_or_else(|| "réponse de GitHub illisible".to_string()),
         Err(ureq::Error::StatusCode(404)) => Ok(Latest::None),
-        Err(ureq::Error::StatusCode(403)) => Err("trop de demandes, réessaie dans un moment".into()),
+        Err(ureq::Error::StatusCode(403)) => {
+            Err("trop de demandes, réessaie dans un moment".into())
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -154,7 +160,11 @@ fn bin_dir() -> PathBuf {
 }
 
 fn game_path(dir: &Path) -> PathBuf {
-    dir.join(if cfg!(windows) { "minelib.exe" } else { "minelib" })
+    dir.join(if cfg!(windows) {
+        "minelib.exe"
+    } else {
+        "minelib"
+    })
 }
 
 fn installed(dir: &Path) -> Option<u32> {
@@ -179,7 +189,8 @@ fn install(dir: &Path, r: &Release, state: &Shared) -> Result<()> {
         ),
         None => None,
     };
-    let mut resp = http().get(&r.url)
+    let mut resp = http()
+        .get(&r.url)
         .header("User-Agent", "minelib-launcher")
         .call()
         .map_err(|e| anyhow!("téléchargement : {e}"))?;
@@ -228,26 +239,46 @@ fn ready_path(dir: &Path) -> PathBuf {
 
 /// Lance le jeu (qui sait alors qu'il est tenu à jour par le lanceur), puis attend qu'il
 /// soit chargé : sa fenêtre n'apparaît qu'une fois prête, le lanceur reste affiché d'ici là.
-fn launch(dir: &Path) -> Result<()> {
+/// Fermer le lanceur pendant le chargement annule le lancement : le jeu (gardé dans
+/// `state.child`) est arrêté.
+fn launch(dir: &Path, state: &Shared) -> Result<()> {
     let ready = ready_path(dir);
     let _ = std::fs::remove_file(&ready);
-    let mut child = std::process::Command::new(game_path(dir))
+    if state.lock().unwrap().cancelled {
+        bail!("lancement annulé");
+    }
+    let child = std::process::Command::new(game_path(dir))
         .current_dir(dir)
         .env("MINELIB_LAUNCHER", "1")
         .env("MINELIB_READY_FILE", &ready)
         .spawn()
         .context("lancement du jeu")?;
+    state.lock().unwrap().child = Some(child);
     let start = Instant::now();
     loop {
-        if ready.exists() {
-            let _ = std::fs::remove_file(&ready);
-            return Ok(());
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            bail!("le jeu s'est fermé pendant son chargement ({status}) : voir minelib.log");
+        {
+            let mut st = state.lock().unwrap();
+            if st.cancelled {
+                if let Some(mut c) = st.child.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                bail!("lancement annulé");
+            }
+            if ready.exists() {
+                let _ = std::fs::remove_file(&ready);
+                // Le jeu est à lui : on ne l'arrête plus.
+                st.child = None;
+                return Ok(());
+            }
+            if let Some(Ok(Some(status))) = st.child.as_mut().map(|c| c.try_wait()) {
+                st.child = None;
+                bail!("le jeu s'est fermé pendant son chargement ({status}) : voir minelib.log");
+            }
         }
         // Très long : le jeu se montrera de lui-même, on n'attend plus.
         if start.elapsed().as_secs() > 120 {
+            state.lock().unwrap().child = None;
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -267,6 +298,10 @@ type Shared = Arc<Mutex<State>>;
 struct State {
     phase: Phase,
     done: bool,
+    /// Le lanceur a été fermé : on n'installe ni ne lance plus rien.
+    cancelled: bool,
+    /// Jeu lancé, pas encore chargé (arrêté si le lanceur est fermé).
+    child: Option<std::process::Child>,
 }
 
 /// Le travail du lanceur (fil à part) : GitHub, téléchargement, lancement.
@@ -293,7 +328,7 @@ fn work(state: Shared, proxy: EventLoopProxy<()>) {
     if result.is_ok() {
         state.lock().unwrap().phase = Phase::Launching;
     }
-    let next = match result.and_then(|()| launch(&dir).map_err(|e| format!("{e:#}"))) {
+    let next = match result.and_then(|()| launch(&dir, &state).map_err(|e| format!("{e:#}"))) {
         Ok(()) => {
             state.lock().unwrap().done = true;
             Phase::Launching
@@ -323,8 +358,7 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-        else {
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             return;
         };
         if surface.resize(w, h).is_err() {
@@ -354,7 +388,11 @@ impl App {
         let phase = self.state.lock().unwrap().phase.clone();
         let (title, frac): (String, Option<f32>) = match &phase {
             Phase::Checking => ("Recherche de la dernière version…".into(), None),
-            Phase::Downloading { version, done, total } => {
+            Phase::Downloading {
+                version,
+                done,
+                total,
+            } => {
                 let f = if *total > 0 {
                     (*done as f32 / *total as f32).min(1.0)
                 } else {
@@ -377,10 +415,22 @@ impl App {
         let failed = matches!(phase, Phase::Failed(_));
         let ts = scale.max(2) / 2 + usize::from(scale >= 3);
         let title = fit(&title, c.w.saturating_sub(16), ts);
-        c.text_center(&title, cx, c.h / 2 - 12 * ts, ts, if failed { 0xff8a70 } else { 0xffffff });
+        c.text_center(
+            &title,
+            cx,
+            c.h / 2 - 12 * ts,
+            ts,
+            if failed { 0xff8a70 } else { 0xffffff },
+        );
         let (bw, bh) = (c.w * 3 / 4, 6 * scale);
         let (bx, by) = (cx - bw / 2, c.h / 2 + 4 * scale);
-        c.fill(bx.saturating_sub(1), by.saturating_sub(1), bw + 2, bh + 2, 0x000000);
+        c.fill(
+            bx.saturating_sub(1),
+            by.saturating_sub(1),
+            bw + 2,
+            bh + 2,
+            0x000000,
+        );
         c.fill(bx, by, bw, bh, 0x2c2d33);
         match frac {
             Some(f) => c.fill(bx, by, (bw as f32 * f) as usize, bh, 0x59cc66),
@@ -438,7 +488,17 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            // Fermé avant que le jeu soit chargé : le lancement est annulé.
+            WindowEvent::CloseRequested => {
+                let mut st = self.state.lock().unwrap();
+                st.cancelled = true;
+                if let Some(mut c) = st.child.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                drop(st);
+                el.exit();
+            }
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -497,7 +557,13 @@ impl Canvas<'_> {
                 for col in 0..8 {
                     if bits >> col & 1 == 1 {
                         // Ombre puis lettre.
-                        self.fill(x + col * s + s / 2 + 1, y + row * s + s / 2 + 1, s, s, 0x0a0a0c);
+                        self.fill(
+                            x + col * s + s / 2 + 1,
+                            y + row * s + s / 2 + 1,
+                            s,
+                            s,
+                            0x0a0a0c,
+                        );
                         self.fill(x + col * s, y + row * s, s, s, rgb);
                     }
                 }
@@ -536,6 +602,8 @@ fn main() {
         state: Arc::new(Mutex::new(State {
             phase: Phase::Checking,
             done: false,
+            cancelled: false,
+            child: None,
         })),
         proxy: event_loop.create_proxy(),
         window: None,
@@ -566,7 +634,10 @@ mod tests {
             {"name":"minelib_v80.exe","browser_download_url":"https://x/g.exe","size":9},
             {"name":"minelib_v80.exe.sha256","browser_download_url":"https://x/g.sha","size":65}]}"#;
         let r = parse_release(json).unwrap();
-        assert_eq!((r.version, r.url.as_str(), r.size), (80, "https://x/g.exe", 9));
+        assert_eq!(
+            (r.version, r.url.as_str(), r.size),
+            (80, "https://x/g.exe", 9)
+        );
         assert_eq!(r.sha256_url.as_deref(), Some("https://x/g.sha"));
         assert!(parse_sha256(&"ab".repeat(32)).is_some());
         assert!(parse_sha256("court").is_none());
@@ -574,8 +645,14 @@ mod tests {
 
     #[test]
     fn decides_what_to_do() {
-        assert_eq!(plan(None, Ok(Latest::Found(rel(80)))), Plan::Download(rel(80)));
-        assert_eq!(plan(Some(79), Ok(Latest::Found(rel(80)))), Plan::Download(rel(80)));
+        assert_eq!(
+            plan(None, Ok(Latest::Found(rel(80)))),
+            Plan::Download(rel(80))
+        );
+        assert_eq!(
+            plan(Some(79), Ok(Latest::Found(rel(80)))),
+            Plan::Download(rel(80))
+        );
         assert_eq!(plan(Some(80), Ok(Latest::Found(rel(80)))), Plan::Launch);
         // GitHub injoignable ou rien de publié : on joue avec ce qu'on a.
         assert_eq!(plan(Some(80), Err("x".into())), Plan::Launch);

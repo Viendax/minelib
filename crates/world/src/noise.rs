@@ -54,8 +54,16 @@ pub fn value3(seed: u32, x: f32, y: f32, z: f32) -> f32 {
     let (tx, ty, tz) = (smooth(x - x0), smooth(y - y0), smooth(z - z0));
     let (ix, iy, iz) = (x0 as i32, y0 as i32, z0 as i32);
     let v = |dx, dy, dz| rand01(seed, ix + dx, iy + dy, iz + dz);
-    let l0 = lerp(lerp(v(0, 0, 0), v(1, 0, 0), tx), lerp(v(0, 0, 1), v(1, 0, 1), tx), tz);
-    let l1 = lerp(lerp(v(0, 1, 0), v(1, 1, 0), tx), lerp(v(0, 1, 1), v(1, 1, 1), tx), tz);
+    let l0 = lerp(
+        lerp(v(0, 0, 0), v(1, 0, 0), tx),
+        lerp(v(0, 0, 1), v(1, 0, 1), tx),
+        tz,
+    );
+    let l1 = lerp(
+        lerp(v(0, 1, 0), v(1, 1, 0), tx),
+        lerp(v(0, 1, 1), v(1, 1, 1), tx),
+        tz,
+    );
     lerp(l0, l1, ty) * 2.0 - 1.0
 }
 

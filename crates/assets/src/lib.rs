@@ -198,7 +198,10 @@ impl Options {
                 o.sensitivity = v.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
                 o.sensitivity_fps = o.sensitivity;
             }
-            if let Some(v) = kv.get("sensitivity_fps").and_then(|v| v.parse::<f32>().ok()) {
+            if let Some(v) = kv
+                .get("sensitivity_fps")
+                .and_then(|v| v.parse::<f32>().ok())
+            {
                 o.sensitivity_fps = v.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
             }
             if let Some(v) = kv.get("fps_color").and_then(|v| v.parse::<u8>().ok()) {

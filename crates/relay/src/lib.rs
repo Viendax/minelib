@@ -1263,6 +1263,12 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
         }
     }
     if r.kind == 1 {
+        if st.servers.whitelisted_out(&r.server, &r.creator, pseudo) {
+            return err(
+                ErrorCode::Refused,
+                "Ce serveur est sur liste blanche : demande à un OP de t'y ajouter.",
+            );
+        }
         if let Some(why) = st.servers.banned(&r.server, pseudo) {
             let why = if why.is_empty() {
                 String::new()
@@ -1288,7 +1294,8 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
             );
         }
     }
-    r.reserved.retain(|(p, t)| *p != low && t.elapsed() < Duration::from_secs(60));
+    r.reserved
+        .retain(|(p, t)| *p != low && t.elapsed() < Duration::from_secs(60));
     r.members.push(id);
     // FPS : pas de nom tant que la partie n'a pas commencé (on ne choisit pas ses
     // adversaires en quittant la recherche).
@@ -1375,8 +1382,7 @@ fn find_room(st: &State, group: &[String], map_sig: [u8; 32]) -> Option<u64> {
             continue;
         }
         // Confiance moyenne de la partie, et part de comptes neufs.
-        let trust =
-            names.iter().map(|p| trust_of(st, p)).sum::<i32>() / names.len().max(1) as i32;
+        let trust = names.iter().map(|p| trust_of(st, p)).sum::<i32>() / names.len().max(1) as i32;
         let news = names
             .iter()
             .filter(|p| st.stats.get(p).is_none_or(|s| s.is_new()))
@@ -1519,7 +1525,10 @@ fn handle_party(st: &mut State, id: u64, pseudo: &str, action: u8, who: &str) ->
             let avoid = st.stats.get(pseudo).is_some_and(|s| s.avoids(who))
                 || st.stats.get(who).is_some_and(|s| s.avoids(pseudo));
             if avoid {
-                return err(ErrorCode::Refused, format!("Impossible d'inviter « {who} »."));
+                return err(
+                    ErrorCode::Refused,
+                    format!("Impossible d'inviter « {who} »."),
+                );
             }
             let pid = match mine {
                 Some(p) => p,
@@ -1535,7 +1544,10 @@ fn handle_party(st: &mut State, id: u64, pseudo: &str, action: u8, who: &str) ->
             };
             let v = &st.parties[&pid];
             if v.contains(&t) {
-                return err(ErrorCode::Refused, format!("« {who} » est déjà dans le lobby."));
+                return err(
+                    ErrorCode::Refused,
+                    format!("« {who} » est déjà dans le lobby."),
+                );
             }
             if v.len() >= proto::PARTY_MAX {
                 return err(ErrorCode::Refused, "Lobby complet (5 joueurs).");
@@ -1572,11 +1584,7 @@ fn handle_party(st: &mut State, id: u64, pseudo: &str, action: u8, who: &str) ->
         }
         proto::PARTY_ACCEPT | proto::PARTY_DECLINE => {
             let pid = target.and_then(|t| st.conns.get(&t)).and_then(|c| c.party);
-            let invited = pid.filter(|p| {
-                st.conns
-                    .get(&id)
-                    .is_some_and(|c| c.invited.contains(p))
-            });
+            let invited = pid.filter(|p| st.conns.get(&id).is_some_and(|c| c.invited.contains(p)));
             let Some(pid) = invited else {
                 return err(ErrorCode::Refused, "Invitation expirée.");
             };
@@ -1586,7 +1594,11 @@ fn handle_party(st: &mut State, id: u64, pseudo: &str, action: u8, who: &str) ->
             if action == proto::PARTY_DECLINE {
                 return Response::Done;
             }
-            if st.parties.get(&pid).is_none_or(|v| v.len() >= proto::PARTY_MAX) {
+            if st
+                .parties
+                .get(&pid)
+                .is_none_or(|v| v.len() >= proto::PARTY_MAX)
+            {
                 return err(ErrorCode::Refused, "Lobby complet.");
             }
             party_leave(st, id);
@@ -1607,7 +1619,10 @@ fn handle_party(st: &mut State, id: u64, pseudo: &str, action: u8, who: &str) ->
             }
             let pid = mine.expect("lobby");
             let Some(t) = target.filter(|t| *t != id && st.parties[&pid].contains(t)) else {
-                return err(ErrorCode::Refused, format!("« {who} » n'est pas dans le lobby."));
+                return err(
+                    ErrorCode::Refused,
+                    format!("« {who} » n'est pas dans le lobby."),
+                );
             };
             if action == proto::PARTY_KICK {
                 party_leave(st, t);
@@ -1696,7 +1711,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let busy = group.iter().filter(|&&m| m != id).find_map(|m| {
                 let c = st.conns.get(m)?;
                 let r = st.rooms.get(&c.room?)?;
-                (r.kind == 0 && r.started && !r.applied).then(|| c.pseudo.clone().unwrap_or_default())
+                (r.kind == 0 && r.started && !r.applied)
+                    .then(|| c.pseudo.clone().unwrap_or_default())
             });
             if let Some(p) = busy {
                 return Some(err(
@@ -1824,7 +1840,10 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             // Construction : les joueurs de la partie le voient changer (pas en FPS, où le
             // skin reste celui du début de la partie).
-            if let Some(r) = my_room.and_then(|r| st.rooms.get(&r)).filter(|r| r.kind == 1) {
+            if let Some(r) = my_room
+                .and_then(|r| st.rooms.get(&r))
+                .filter(|r| r.kind == 1)
+            {
                 let to: Vec<u64> = r
                     .members
                     .iter()
@@ -1939,6 +1958,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 proto::SERVER_OP => servers::Action::Op,
                 proto::SERVER_DEOP => servers::Action::Deop,
                 proto::SERVER_KILL => servers::Action::Kill,
+                proto::SERVER_WL_ON => servers::Action::WhitelistOn,
+                proto::SERVER_WL_OFF => servers::Action::WhitelistOff,
+                proto::SERVER_WL_ADD => servers::Action::WhitelistAdd,
+                proto::SERVER_WL_REMOVE => servers::Action::WhitelistRemove,
+                proto::SERVER_WL_LIST => servers::Action::WhitelistList,
                 _ => servers::Action::List,
             };
             match st
@@ -3024,7 +3048,9 @@ mod tests {
             _ => unreachable!(),
         };
         match wait(&b, |e| matches!(e, Event::PartyGo { .. })) {
-            Event::PartyGo { room: r, map_sig, .. } => {
+            Event::PartyGo {
+                room: r, map_sig, ..
+            } => {
                 assert_eq!((r, map_sig), (room, [3; 32]));
             }
             _ => unreachable!(),

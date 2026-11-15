@@ -68,6 +68,11 @@ impl Skin {
         Ok(Arc::new(Skin { px, wide }))
     }
 
+    /// Pixels RGBA (64 × 64, ligne par ligne), pour la carte graphique.
+    pub fn rgba(&self) -> Vec<u8> {
+        self.px.iter().flatten().copied().collect()
+    }
+
     fn at(&self, x: u32, y: u32) -> [u8; 4] {
         self.px[(y.min(63) * 64 + x.min(63)) as usize]
     }

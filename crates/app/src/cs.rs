@@ -656,21 +656,10 @@ impl Match {
         }
     }
 
-    /// Échauffement : le joueur change d'équipe (s'il y a de la place).
-    pub fn switch_team(&mut self, id: u64, team: u8) -> Option<Ev> {
-        if self.started() || team > T || self.count(team) >= self.team_max() {
-            return None;
-        }
-        let p = self.players.get_mut(&id)?;
-        if p.team == team {
-            return None;
-        }
-        let old = p.team;
-        p.team = team;
-        p.start_team = team;
-        self.assign_colors(old);
-        self.assign_colors(team);
-        Some(self.spawn(id, true))
+    /// Changer d'équipe : refusé. Les équipes sont faites à l'entrée (matchmaking, lobby
+    /// dans la même équipe) et ne bougent plus, même pendant l'échauffement.
+    pub fn switch_team(&mut self, _id: u64, _team: u8) -> Option<Ev> {
+        None
     }
 
     /// Couleur préférée d'un joueur (gardée si personne d'autre ne l'a dans l'équipe).
@@ -1642,7 +1631,10 @@ mod tests {
         let g = *m.ground.last().unwrap();
         assert!((Vec3::from(g.pos) - near).length() < 0.1);
         assert!(Vec3::from(g.from).y > feet.y + 1.0);
-        assert!(!m.toss(mate, ITEM_NADE as u8, feet, near), "plus de grenade");
+        assert!(
+            !m.toss(mate, ITEM_NADE as u8, feet, near),
+            "plus de grenade"
+        );
     }
 
     fn kill_team(m: &mut Match, team: u8) {

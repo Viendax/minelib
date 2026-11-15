@@ -1920,6 +1920,46 @@ impl Session {
                 });
                 true
             }
+            // Liste blanche d'un serveur de construction (OP) : comme dans Minecraft.
+            "whitelist" | "withlist" | "wl" | "listeblanche" => {
+                use minelib_net::proto;
+                if self.build.is_none() {
+                    self.chat.say(
+                        "/whitelist : seulement sur un serveur de construction en ligne, pour ses OP.",
+                        chat::RED,
+                    );
+                    return true;
+                }
+                let sub = words.get(1).map(|w| w.to_lowercase()).unwrap_or_default();
+                let action = match sub.as_str() {
+                    "on" | "activer" => proto::SERVER_WL_ON,
+                    "off" | "desactiver" | "désactiver" => proto::SERVER_WL_OFF,
+                    "add" | "ajouter" => proto::SERVER_WL_ADD,
+                    "remove" | "retirer" | "del" => proto::SERVER_WL_REMOVE,
+                    "list" | "liste" | "" => proto::SERVER_WL_LIST,
+                    _ => {
+                        self.chat.say(
+                            "Usage : /whitelist on | off | add <pseudo> | remove <pseudo> | list",
+                            chat::GREY,
+                        );
+                        return true;
+                    }
+                };
+                let target = words.get(2).map_or(String::new(), |t| t.to_string());
+                if target.is_empty()
+                    && (action == proto::SERVER_WL_ADD || action == proto::SERVER_WL_REMOVE)
+                {
+                    self.chat
+                        .say(format!("Usage : /whitelist {sub} <pseudo>"), chat::GREY);
+                    return true;
+                }
+                self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                    action,
+                    pseudo: target,
+                    reason: String::new(),
+                });
+                true
+            }
             // Triche seulement : banni de tout le relais (administrateurs, admins.txt).
             // Sinon on n'est banni que d'un serveur (/ban de ses OP).
             "bantriche" => {
@@ -1968,19 +2008,10 @@ impl Session {
                 true
             }
             "equipe" | "équipe" | "team" => {
-                let team = match words.get(1).map(|w| w.to_lowercase()) {
-                    Some(w) if w == "ct" => minelib_net::game::CT,
-                    Some(w) if w == "t" => minelib_net::game::T,
-                    _ => {
-                        self.chat
-                            .say("Usage : /equipe ct|t (pendant l'échauffement).", chat::GREY);
-                        return true;
-                    }
-                };
-                match &mut self.net {
-                    Some(n) => n.choose_team(team),
-                    None => self.chat.say("Pas de partie en ligne.", chat::RED),
-                }
+                self.chat.say(
+                    "On ne change pas d'équipe : elles sont faites au lancement de la partie.",
+                    chat::GREY,
+                );
                 true
             }
             "fps" => {
@@ -2609,13 +2640,19 @@ impl Session {
                 .collect();
             let bomb_at =
                 matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED).then(|| Vec3::from(hud.bomb_pos));
+            // Son point à sa couleur dans l'équipe, comme les coéquipiers.
+            let me_id = n.me();
+            let my_color = rows
+                .iter()
+                .find(|r| r.id == me_id)
+                .map_or([1.0; 4], |r| mate_color(r.color as usize));
             self.radar.draw(
                 ui,
                 radar_x,
                 6.0 * s,
                 radar_size,
                 s,
-                (self.player.pos, self.player.look_dir()),
+                (self.player.pos, self.player.look_dir(), my_color),
                 &mates,
                 &enemies,
                 bomb_at,
@@ -3394,6 +3431,12 @@ impl Session {
             }
         }
         // Le joueur se voit dans les miroirs (et l'eau, le métal), même à la 1re personne.
+        // Avec son vrai skin (envoyé à la carte quand il change).
+        let skin = self.skins.mine();
+        let key = skin
+            .as_ref()
+            .map_or(0, |s| std::sync::Arc::as_ptr(s) as usize);
+        renderer.set_skin(key, || skin.as_ref().map(|s| s.rgba()));
         let ray_boxes = if visible {
             crate::player_model::ray_boxes(&pose)
         } else {
@@ -3419,6 +3462,7 @@ impl Session {
                     renderer.aspect(),
                     self.hand_light,
                     self.game.mode != GameMode::Spectator,
+                    skin.as_deref(),
                 )
             } else {
                 Vec::new()

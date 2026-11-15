@@ -1033,7 +1033,10 @@ mod tests {
         assert!((at.y - 11.0).abs() < 0.05, "au sol : {at}");
         // Regard vers le sol : à ses pieds ou presque, jamais dans le sol.
         let at = toss_landing(&floor(), eye, Vec3::new(0.0, -1.0, -0.05));
-        assert!((at.y - 11.0).abs() < 0.05 && (at - eye).length() < 3.0, "{at}");
+        assert!(
+            (at.y - 11.0).abs() < 0.05 && (at - eye).length() < 3.0,
+            "{at}"
+        );
     }
 
     #[test]

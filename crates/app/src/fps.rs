@@ -990,10 +990,10 @@ impl Fps {
             let y = yaw + side.to_radians() + r * a.cos();
             let dir = Vec3::new(y.sin() * p.cos(), p.sin(), -y.cos() * p.cos());
             dirs.push(dir);
-            // La balle traverse un mur d'un bloc : impacts à l'entrée, à la sortie et à
+            // La balle traverse jusqu'à deux blocs de mur : impacts aux entrées, sorties et à
             // l'arrivée (même calcul que l'hôte pour les dégâts).
             let path = weapons::bullet_path(world, eye, dir, RANGE);
-            let dist = path.through.map_or(path.first, |t| t.1);
+            let dist = path.end();
             let target = eye + dir * dist;
             // La balle creuse un tunnel dans les fumigènes qu'elle traverse.
             for e in &mut self.effects {
@@ -2697,7 +2697,7 @@ mod tests {
     /// Fusil à pompe : une cartouche à la fois ; tirer interrompt le rechargement. Et la
     /// balle traverse un mur d'un bloc : impacts à l'entrée, à la sortie et à l'arrivée.
     #[test]
-    fn shotguns_load_shell_by_shell_and_bullets_cross_one_block() {
+    fn shotguns_load_shell_by_shell_and_bullets_cross_two_blocks() {
         let mut w = World::new(0);
         w.insert_empty(ChunkPos { x: 0, z: 0 });
         for y in 0..16 {
@@ -2711,17 +2711,28 @@ mod tests {
         let north = Vec3::new(0.0, 0.0, -1.0);
         let p = weapons::bullet_path(&w, eye, north, 250.0);
         assert!((p.first - 3.5).abs() < 1e-3);
-        let (exit, last) = p.through.expect("traverse un bloc");
+        // Un bloc (moitié des dégâts), puis le mur du fond de deux blocs : trop épais pour
+        // ce qui reste (deux blocs en tout), la balle s'y arrête.
+        assert_eq!(p.through.len(), 1, "{:?}", p.through);
+        let (exit, last, factor) = p.through[0];
         assert!(
             (exit - 4.5).abs() < 0.05 && (last - 9.5).abs() < 0.05,
             "{exit} {last}"
         );
+        assert_eq!(factor, 0.5);
         assert_eq!(p.impacts.len(), 3, "entrée, sortie, arrivée");
         assert_eq!(p.impacts[0].1, Vec3::Z);
         assert_eq!(p.impacts[1].1, -Vec3::Z);
-        // Depuis l'autre côté du premier mur : le fond fait deux blocs, la balle s'arrête.
+        assert_eq!(p.factor_at(2.0), Some(1.0));
+        assert_eq!(p.factor_at(4.0), None, "dans le mur");
+        assert_eq!(p.factor_at(7.0), Some(0.5));
+        // Depuis l'autre côté du premier mur : le fond fait deux blocs, la balle le
+        // traverse avec un quart des dégâts.
         let p = weapons::bullet_path(&w, Vec3::new(8.5, 8.0, 6.5), north, 250.0);
-        assert!(p.through.is_none() && p.impacts.len() == 1);
+        assert_eq!(p.through.len(), 1, "{:?}", p.through);
+        assert_eq!(p.through[0].2, 0.25);
+        assert!((p.through[0].0 - 5.5).abs() < 0.05, "{:?}", p.through);
+        assert_eq!(p.factor_at(6.0), Some(0.25));
 
         let mut f = Fps::new();
         let nova = WEAPONS.iter().position(|d| d.name == "Nova").unwrap();

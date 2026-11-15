@@ -216,7 +216,9 @@ impl Store {
             if e.path().extension().is_some_and(|x| x == "stats") {
                 let bytes = std::fs::read(e.path()).unwrap_or_default();
                 let read = postcard::from_bytes::<Stats>(&bytes).ok().or_else(|| {
-                    postcard::from_bytes::<StatsV1>(&bytes).ok().map(Stats::from)
+                    postcard::from_bytes::<StatsV1>(&bytes)
+                        .ok()
+                        .map(Stats::from)
                 });
                 if let Some(s) = read {
                     all.insert(s.pseudo.to_ascii_lowercase(), s);
@@ -377,7 +379,13 @@ mod tests {
         s.trust_by(-5000);
         assert_eq!(s.trust, 0);
         // Les joueurs fiables gagnent plus par partie propre.
-        let (lo, hi) = (Stats::new("b"), Stats { trust: 900, ..Stats::new("c") });
+        let (lo, hi) = (
+            Stats::new("b"),
+            Stats {
+                trust: 900,
+                ..Stats::new("c")
+            },
+        );
         assert!(hi.clean_gain() > lo.clean_gain());
     }
 

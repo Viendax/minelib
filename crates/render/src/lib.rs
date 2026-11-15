@@ -237,6 +237,9 @@ pub struct RayBox {
     pub min: [f32; 3],
     pub max: [f32; 3],
     pub kind: RayBoxKind,
+    /// Partie du corps dans le skin (`Renderer::set_skin`) : 1 jambe gauche, 2 jambe
+    /// droite, 3 corps, 4 bras gauche, 5 bras droit, 6 tête ; 0 : dessin par défaut.
+    pub part: u8,
 }
 
 /// Uniformes des pavés du joueur : (nombre et lumière, matrices, coins min, coins max).
@@ -257,10 +260,10 @@ fn ray_globals(boxes: &[RayBox], light: [f32; 3]) -> RayGlobals {
     for (i, b) in boxes.iter().take(n).enumerate() {
         inv[i] = b.world_to_local.to_cols_array_2d();
         let (kind, extra) = match b.kind {
-            RayBoxKind::Head => (0.0, 0.0),
-            RayBoxKind::Body => (1.0, 0.0),
-            RayBoxKind::Arm => (2.0, 0.0),
-            RayBoxKind::Leg => (3.0, 0.0),
+            RayBoxKind::Head => (0.0, b.part as f32),
+            RayBoxKind::Body => (1.0, b.part as f32),
+            RayBoxKind::Arm => (2.0, b.part as f32),
+            RayBoxKind::Leg => (3.0, b.part as f32),
             RayBoxKind::Block {
                 layer,
                 uv: rect,
@@ -507,6 +510,8 @@ pub struct Renderer {
     /// Fumigènes en volume.
     smokes: smoke::Smokes,
     voxels: rt::Voxels,
+    /// Skin des reflets envoyé à la carte (voir `set_skin`).
+    skin_key: Option<usize>,
     gpu_timer: Option<gpu_timer::GpuTimer>,
     cull_order: Vec<usize>,
     cull_cmds: Vec<u8>,
@@ -756,6 +761,17 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Skin du joueur, pour les reflets.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // Pixel art : agrandissement net, réduction lissée entre les mipmaps.
@@ -893,6 +909,7 @@ impl Renderer {
             blocked: 0.0,
             smokes,
             voxels,
+            skin_key: None,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
             lights_col: [[0.0; 4]; MAX_LIGHTS],
             light_count: 0,
@@ -1150,6 +1167,15 @@ impl Renderer {
             "mémoire vidéo pour les chunks : {} Mo au plus",
             bytes / (1024 * 1024)
         );
+    }
+
+    /// Skin du joueur vu dans les miroirs (64 × 64 RGBA) ; `None` : modèle par défaut.
+    /// `key` identifie le skin : rien n'est renvoyé à la carte s'il n'a pas changé.
+    pub fn set_skin(&mut self, key: usize, rgba: impl FnOnce() -> Option<Vec<u8>>) {
+        if self.skin_key != Some(key) {
+            self.skin_key = Some(key);
+            self.voxels.upload_skin(&self.queue, rgba().as_deref());
+        }
     }
 
     fn world_group(&self) -> &wgpu::BindGroup {
@@ -2292,6 +2318,10 @@ fn world_groups(
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(&refl.views[i]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&voxels.skin_view),
                 },
             ],
         })

@@ -23,6 +23,12 @@ pub const SERVER_DEOP: u8 = 3;
 pub const SERVER_LIST: u8 = 4;
 /// Tuer un joueur du serveur (OP).
 pub const SERVER_KILL: u8 = 5;
+/// Liste blanche (OP) : activer, désactiver, ajouter, retirer, montrer.
+pub const SERVER_WL_ON: u8 = 6;
+pub const SERVER_WL_OFF: u8 = 7;
+pub const SERVER_WL_ADD: u8 = 8;
+pub const SERVER_WL_REMOVE: u8 = 9;
+pub const SERVER_WL_LIST: u8 = 10;
 
 pub fn valid_pseudo(p: &str) -> bool {
     (3..=16).contains(&p.chars().count())

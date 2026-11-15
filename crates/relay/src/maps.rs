@@ -86,7 +86,6 @@ impl Store {
         }
     }
 
-
     fn save_index(&self) {
         let v: Vec<&Meta> = self.index.values().collect();
         if let Ok(b) = postcard::to_allocvec(&v) {
