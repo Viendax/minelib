@@ -26,6 +26,10 @@ Grenades et couteau :
   molotov.ogg — « Glass Break », CC0 — https://opengameart.org/content/glass-break
   throw.ogg, smoke.ogg, fire.ogg — créés pour Minelib (bruit filtré par ffmpeg), sous la
     licence du projet.
+  door.ogg (porte, trappe) — créé pour Minelib (grincement et choc synthétisés), sous la
+    licence du projet.
+  splash.ogg (plongeon dans l'eau) — créé pour Minelib (bruit filtré, gouttelettes et
+    « plouf » synthétisés), sous la licence du projet.
   knife_swing.ogg, knife_swing2.ogg (tube-plastic-whoosh), knife_hit.ogg (apple-cut et
     sword-knife-clash), draw_nade.ogg (cloth-pouch-shake) — « Fantasy Sound Effects
     (Tinysized SFX) » et « Fantasy Weapons and Apparel SFX Library » (Jan Schupke /

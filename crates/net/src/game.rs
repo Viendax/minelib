@@ -259,16 +259,43 @@ pub struct FpsMap {
     pub ct: Option<Zone>,
     pub t: Option<Zone>,
     pub sites: [Option<Zone>; 3],
-    /// Nombre de joueurs (pair, 2 à 10 ; 0 : 10). Seule la 5 contre 5 est classée.
+    /// Nombre de joueurs (pair, 2 à 20 ; 0 : 10). Seule la 5 contre 5 est classée.
+    /// Bit `DOORS` : portes et trappes utilisables en partie (`/fps set door true`) ; il
+    /// est rangé ici pour que les cartes déjà partagées se lisent toujours.
     pub max_players: u8,
 }
 
 impl FpsMap {
+    /// Bit de `max_players` : portes utilisables en partie.
+    pub const DOORS: u8 = 0x80;
+
     /// Joueurs d'une partie sur cette carte.
     pub fn players(&self) -> u8 {
-        match self.max_players {
-            n @ 2..=10 => n & !1,
+        match self.max_players & !Self::DOORS {
+            n @ 2..=20 => n & !1,
             _ => 10,
+        }
+    }
+
+    /// Nombre de joueurs choisi (0 : par défaut).
+    pub fn chosen_players(&self) -> u8 {
+        self.max_players & !Self::DOORS
+    }
+
+    pub fn set_players(&mut self, n: u8) {
+        self.max_players = (self.max_players & Self::DOORS) | (n & !Self::DOORS);
+    }
+
+    /// Portes et trappes s'ouvrent et se ferment pendant la partie.
+    pub fn doors(&self) -> bool {
+        self.max_players & Self::DOORS != 0
+    }
+
+    pub fn set_doors(&mut self, on: bool) {
+        if on {
+            self.max_players |= Self::DOORS;
+        } else {
+            self.max_players &= !Self::DOORS;
         }
     }
 }
@@ -360,8 +387,14 @@ pub enum ToHost {
     Pickup {
         id: u32,
     },
-    /// Couleur préférée (0 à 4 : vert, jaune, orange, bleu, violet ; 255 : aucune).
+    /// Couleur préférée (0 à 9 ; 255 : aucune).
     Color(u8),
+    /// Ouvre ou ferme la porte / trappe en `pos` (si la carte le permet). `side` : côté
+    /// vers lequel regarde le joueur (0 +X, 1 −X, 4 +Z, 5 −Z), pour relever une trappe.
+    Door {
+        pos: [i32; 3],
+        side: u8,
+    },
 }
 
 /// Messages d'un monde de construction en ligne (passent par les zones du relais).
@@ -393,6 +426,8 @@ pub enum BuildMsg {
 pub const STEP_RUN: u8 = 0;
 pub const STEP_LAND: u8 = 1;
 pub const STEP_PAIN: u8 = 2;
+/// Plongeon dans l'eau d'assez haut.
+pub const STEP_SPLASH: u8 = 3;
 
 /// Fil des éliminations : à travers un mur, à travers une fumée, tireur aveuglé.
 pub const KILL_WALL: u8 = 1;
@@ -524,6 +559,12 @@ pub enum ToPeer {
     Chat {
         from: String,
         text: String,
+    },
+    /// Portes et trappes changées (case, bloc). `at` : où l'on entend la porte (aucun bruit
+    /// pour l'état complet envoyé à l'arrivée d'un joueur).
+    Doors {
+        cells: Vec<([i32; 3], u16)>,
+        at: Option<[f32; 3]>,
     },
 }
 

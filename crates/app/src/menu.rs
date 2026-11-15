@@ -57,6 +57,73 @@ impl<'a> Ctx<'a> {
         self.ui.text((self.w - tw) / 2.0, y, scale, color, text);
     }
 
+    /// Largeur de la barre de défilement des listes.
+    pub fn bar_w(&self) -> f32 {
+        6.0 * self.s
+    }
+
+    /// Barre de défilement verticale (comme celle des touches et de l'inventaire créatif),
+    /// en `x`, de `y` à `y + h`, pour `rows` lignes dont `visible` à l'écran. On attrape le
+    /// curseur et la liste suit la souris ; un clic dans la barre y saute. Rien n'est
+    /// dessiné si tout tient. `drag` : la barre est tenue (à garder d'une image à l'autre).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scrollbar(
+        &mut self,
+        x: f32,
+        y: f32,
+        h: f32,
+        rows: usize,
+        visible: usize,
+        scroll: &mut usize,
+        drag: &mut bool,
+    ) {
+        let s = self.s;
+        let max = rows.saturating_sub(visible);
+        if max == 0 {
+            *scroll = 0;
+            *drag = false;
+            return;
+        }
+        let bw = self.bar_w();
+        if let Some((mx, my)) = self.cursor {
+            if self.click && mx >= x - 3.0 * s && mx <= x + bw + 3.0 * s && my >= y && my <= y + h {
+                *drag = true;
+                self.click = false;
+            }
+            if *drag {
+                let frac = ((my - y) / h).clamp(0.0, 1.0);
+                let first = frac * rows as f32 - visible as f32 / 2.0;
+                *scroll = first.round().max(0.0) as usize;
+            }
+        }
+        if !self.held {
+            *drag = false;
+        }
+        *scroll = (*scroll).min(max);
+        let shown = (visible as f32 / rows as f32).min(1.0);
+        let start = *scroll as f32 / rows as f32;
+        self.ui.rect(x, y, bw, h, [0.041, 0.041, 0.05, 1.0]);
+        self.ui.rect(
+            x + s,
+            y + h * start,
+            bw - 2.0 * s,
+            (h * shown).max(4.0 * s),
+            [0.578, 0.578, 0.64, 1.0],
+        );
+    }
+
+    /// Molette au-dessus d'une liste : une ligne à la fois.
+    pub fn wheel(input: &Input, over: bool, rows: usize, visible: usize, scroll: &mut usize) {
+        if over && input.scroll.abs() >= 1.0 && rows > visible {
+            *scroll = if input.scroll > 0.0 {
+                scroll.saturating_sub(1)
+            } else {
+                *scroll + 1
+            };
+        }
+        *scroll = (*scroll).min(rows.saturating_sub(visible));
+    }
+
     /// Bouton centré horizontalement en `cx`. Largeur en pixels de texture (×`s`).
     /// Renvoie vrai s'il vient d'être cliqué.
     pub fn button(&mut self, label: &str, cx: f32, y: f32, width: f32, enabled: bool) -> bool {

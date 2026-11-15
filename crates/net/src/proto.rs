@@ -4,14 +4,16 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 16;
+pub const PROTOCOL: u32 = 17;
 
 /// Morceau d'une carte transférée (octets).
 pub const MAP_PART: usize = 48 * 1024;
 /// Taille maximale d'une carte partagée.
 pub const MAP_MAX: u64 = 64 * 1024 * 1024;
-/// Joueurs d'une partie FPS (5 contre 5).
+/// Joueurs d'une partie FPS classée (5 contre 5).
 pub const FPS_PLAYERS: u16 = 10;
+/// Joueurs au plus d'une carte FPS (`/fps set maxplayer`, toujours pair : 10 contre 10).
+pub const FPS_MAX_PLAYERS: u16 = 20;
 
 /// Pseudo : 3 à 16 caractères, lettres sans accent, chiffres et `_`. Unique sans tenir
 /// compte des majuscules.
@@ -29,6 +31,14 @@ pub const SERVER_WL_OFF: u8 = 7;
 pub const SERVER_WL_ADD: u8 = 8;
 pub const SERVER_WL_REMOVE: u8 = 9;
 pub const SERVER_WL_LIST: u8 = 10;
+/// Changer de mode de jeu (OP) : `reason` = le mode, `pseudo` = qui (vide : soi-même).
+pub const SERVER_GAMEMODE: u8 = 11;
+/// Mode de jeu par défaut des joueurs à leur arrivée (OP) : `reason` = le mode (vide :
+/// aucun).
+pub const SERVER_DEFAULT_GAMEMODE: u8 = 12;
+/// À l'arrivée sur un serveur de construction : le relais renvoie (`SetGamemode`) le mode
+/// par défaut du serveur si l'on n'est pas OP. Réponse sans texte.
+pub const SERVER_GAMEMODE_QUERY: u8 = 13;
 
 pub fn valid_pseudo(p: &str) -> bool {
     (3..=16).contains(&p.chars().count())
@@ -209,6 +219,26 @@ pub enum Request {
         caps: GarantCaps,
     },
     /// Construction : position (le relais n'envoie que ce qui se passe autour).
+    /// Relais de région : entrée avec le billet donné par le relais du monde.
+    ShardLogin {
+        room: u64,
+        pseudo: String,
+        expires: u64,
+        mac: [u8; 32],
+    },
+    /// Hôte d'une région (connexion de garant) : son relais de région est prêt.
+    ShardReady {
+        region: [i32; 2],
+        /// Nœud iroh (joignable de partout) et adresse directe (réseau local, essais).
+        node: [u8; 32],
+        addr: String,
+        key: [u8; 32],
+    },
+    /// Hôte d'une région : les modifications que son relais a publiées (copie gardée par
+    /// le relais du monde, qui la remet au propriétaire et à l'hôte suivant).
+    RegionLog {
+        entries: Vec<([i32; 2], Vec<u8>)>,
+    },
     Position {
         chunk: [i32; 2],
     },
@@ -243,6 +273,11 @@ pub enum Request {
     Broadcast {
         data: Vec<u8>,
     },
+    /// Aller-retour mesuré par le jeu jusqu'au relais (ms) : le relais confie la partie
+    /// à qui a la meilleure connexion quand celle de l'hôte est mauvaise.
+    Rtt {
+        ms: u16,
+    },
 }
 
 impl Request {
@@ -263,6 +298,9 @@ impl Request {
                 | Request::Position { .. }
                 | Request::ToZone { .. }
                 | Request::Nearby { .. }
+                | Request::RegionLog { .. }
+                | Request::ShardReady { .. }
+                | Request::Rtt { .. }
         )
     }
 }
@@ -479,6 +517,24 @@ pub enum Response {
         members: Vec<(u64, String)>,
         standby: bool,
     },
+    /// À une connexion de garant : héberger le relais d'une région d'un monde (joueur d'une
+    /// autre partie, sans lien avec celle-ci). L'historique de la région suit (`FromZone`).
+    ShardTask {
+        room: u64,
+        region: [i32; 2],
+        secret: [u8; 32],
+    },
+    /// Aux joueurs d'un monde : relais de ses régions (les autres passent par ce relais).
+    Shards {
+        list: Vec<ShardInfo>,
+    },
+    /// Billet pour entrer dans les relais de région de ce monde.
+    ShardTicket {
+        room: u64,
+        pseudo: String,
+        expires: u64,
+        mac: [u8; 32],
+    },
     /// Garant extérieur d'un serveur de construction (un joueur d'une autre partie, sans
     /// lien avec celle-ci) : il recevra ses zones (`Zones`) et validera les modifications.
     BuildGarant {
@@ -549,6 +605,12 @@ pub enum Response {
         code: ErrorCode,
         message: String,
     },
+    /// Mode de jeu donné par un OP du serveur de construction (`/gamemode`), ou mode par
+    /// défaut du serveur à l'arrivée (`by` vide). `mode` : nom du mode (`creative`…).
+    SetGamemode {
+        mode: String,
+        by: String,
+    },
 }
 
 impl Response {
@@ -571,6 +633,7 @@ impl Response {
                 | Response::HostChanged { .. }
                 | Response::Kicked { .. }
                 | Response::Slain { .. }
+                | Response::SetGamemode { .. }
                 | Response::Arbitrate { .. }
                 | Response::Evidence { .. }
                 | Response::FromPeer { .. }
@@ -578,6 +641,10 @@ impl Response {
                 | Response::Witness { .. }
                 | Response::Zones { .. }
                 | Response::FromZone { .. }
+                | Response::BuildGarant { .. }
+                | Response::ShardTask { .. }
+                | Response::Shards { .. }
+                | Response::ShardTicket { .. }
         )
     }
 }
@@ -589,8 +656,9 @@ pub const PARTY_DECLINE: u8 = 2;
 pub const PARTY_LEAVE: u8 = 3;
 pub const PARTY_KICK: u8 = 4;
 pub const PARTY_PROMOTE: u8 = 5;
-/// Joueurs au plus dans un lobby.
-pub const PARTY_MAX: usize = 5;
+/// Joueurs au plus dans un lobby (une équipe de la plus grande carte). Pour lancer, le
+/// lobby doit tenir dans une équipe de la carte choisie (la moitié de ses joueurs).
+pub const PARTY_MAX: usize = FPS_MAX_PLAYERS as usize / 2;
 
 /// Côté d'une zone de garant, en chunks.
 pub const ZONE: i32 = 4;
@@ -598,4 +666,31 @@ pub const ZONE: i32 = 4;
 /// Zone d'un chunk.
 pub fn zone_of(chunk: [i32; 2]) -> [i32; 2] {
     [chunk[0].div_euclid(ZONE), chunk[1].div_euclid(ZONE)]
+}
+
+/// Côté d'une région (servie par son propre relais quand elle est peuplée), en chunks.
+pub const REGION: i32 = 32;
+
+pub fn region_of(chunk: [i32; 2]) -> [i32; 2] {
+    [chunk[0].div_euclid(REGION), chunk[1].div_euclid(REGION)]
+}
+
+/// Relais d'une région d'un monde.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ShardInfo {
+    pub region: [i32; 2],
+    pub node: [u8; 32],
+    pub addr: String,
+    pub key: [u8; 32],
+}
+
+/// Signature d'un billet de relais de région (secret partagé par le relais du monde et
+/// les hôtes de ses régions).
+pub fn shard_mac(secret: &[u8; 32], room: u64, pseudo: &str, expires: u64) -> [u8; 32] {
+    use hmac::Mac;
+    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("clé");
+    m.update(&room.to_le_bytes());
+    m.update(pseudo.to_ascii_lowercase().as_bytes());
+    m.update(&expires.to_le_bytes());
+    m.finalize().into_bytes().into()
 }

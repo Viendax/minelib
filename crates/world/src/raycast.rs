@@ -29,9 +29,21 @@ pub fn raycast(world: &World, origin: [f32; 3], dir: [f32; 3], max_dist: f32) ->
 }
 
 /// Premier bloc solide (qui arrête les déplacements) le long du rayon : les balles passent
-/// à travers les torches, panneaux, boutons, plantes…
+/// à travers les torches, panneaux, boutons, plantes… et les blocs invisibles (barrières
+/// des cartes : ils arrêtent les joueurs, pas les balles).
 pub fn raycast_solid(world: &World, origin: [f32; 3], dir: [f32; 3], max_dist: f32) -> Option<Hit> {
-    raycast_with(world, origin, dir, max_dist, BlockId::is_solid)
+    raycast_with(world, origin, dir, max_dist, stops_bullets)
+}
+
+/// Le bloc arrête (ou freine) une balle.
+pub fn stops_bullets(id: BlockId) -> bool {
+    let d = id.def();
+    // Ni les blocs invisibles, ni les plaques d'un pixel (échelles).
+    d.solid
+        && !matches!(
+            d.shape,
+            crate::registry::Shape::Invisible | crate::registry::Shape::Panel { thick: 1, .. }
+        )
 }
 
 /// Premier bloc retenu par `stops` le long du rayon.
@@ -79,7 +91,10 @@ pub fn raycast_with(
                 });
             }
             // Bloc partiel (torche, dalle, clôture…) : il faut toucher sa vraie forme.
-            if let Some((dist, n)) = hit_boxes(origin, d, cell, &def.boxes()) {
+            let boxes = crate::registry::placed_boxes(id, |dx, dy, dz| {
+                world.get(cell[0] + dx, cell[1] + dy, cell[2] + dz)
+            });
+            if let Some((dist, n)) = hit_boxes(origin, d, cell, &boxes) {
                 if dist <= max_dist {
                     return Some(Hit {
                         block: cell,
@@ -112,7 +127,10 @@ pub fn raycast_with(
 
 /// Boîte (coins min, max, en coordonnées monde) visée pour un bloc : l'union de ses boîtes.
 pub fn selection_box(world: &World, block: [i32; 3]) -> ([f32; 3], [f32; 3]) {
-    let boxes = world.get(block[0], block[1], block[2]).def().boxes();
+    let boxes =
+        crate::registry::placed_boxes(world.get(block[0], block[1], block[2]), |dx, dy, dz| {
+            world.get(block[0] + dx, block[1] + dy, block[2] + dz)
+        });
     let (mut lo, mut hi) = ([16u8; 3], [0u8; 3]);
     for (a, b) in &boxes {
         for k in 0..3 {

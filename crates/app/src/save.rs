@@ -326,6 +326,10 @@ fn write_level(dir: &Path, d: &SaveData) -> Result<()> {
             }
         }
     }
+    // Monde Minecraft converti : version du convertisseur (une plus récente reconvertit).
+    if mcimport::is_minecraft_world(dir) {
+        s += &format!("import={}\n", mcimport::IMPORT_VERSION);
+    }
     fs::write(dir.join("level.txt"), s)?;
     Ok(())
 }
@@ -343,6 +347,12 @@ pub fn save_world(dir: &Path, d: &SaveData, world: &World) -> Result<()> {
         bin.extend_from_slice(&b.0.to_le_bytes());
     }
     fs::write(dir.join("edits.bin"), bin)?;
+    write_chunks_bin(dir, world)?;
+    write_torches(dir, world)
+}
+
+/// `chunks.bin` : chunks importés (monde Minecraft converti).
+fn write_chunks_bin(dir: &Path, world: &World) -> Result<()> {
     if world.base_count() > 0 {
         // Écriture dans un fichier temporaire puis renommage : pas de fichier à moitié écrit.
         let mut bin = b"MLCH".to_vec();
@@ -357,6 +367,11 @@ pub fn save_world(dir: &Path, d: &SaveData, world: &World) -> Result<()> {
         fs::write(&tmp, bin)?;
         fs::rename(&tmp, dir.join("chunks.bin"))?;
     }
+    Ok(())
+}
+
+/// `torches.txt` : torches posées.
+fn write_torches(dir: &Path, world: &World) -> Result<()> {
     let mut f = fs::File::create(dir.join("torches.txt"))?;
     for (p, t) in world.torches() {
         let chem = t.chemical.map_or(-1, |c| c as i32);
@@ -449,8 +464,40 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
             world.load_edit(ChunkPos { x, z }, i, BlockId(b));
         }
     }
-    if let Ok(bin) = fs::read(dir.join("chunks.bin")) {
-        world.set_bases(read_chunks_bin(&bin));
+    // Monde Minecraft converti par un convertisseur plus ancien : on le reconvertit (les
+    // modifications faites ensuite restent par-dessus).
+    let old_import = mcimport::is_minecraft_world(dir)
+        && kv
+            .get("import")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1)
+            < mcimport::IMPORT_VERSION;
+    let reimported = old_import
+        && match mcimport::import_world(dir) {
+            Ok(imp) => {
+                world.set_bases(imp.chunks);
+                let _ = write_chunks_bin(dir, &world);
+                if let Ok(mut f) = fs::OpenOptions::new()
+                    .append(true)
+                    .open(dir.join("level.txt"))
+                {
+                    let _ = writeln!(f, "import={}", mcimport::IMPORT_VERSION);
+                }
+                log::info!(
+                    "monde Minecraft reconverti (convertisseur {})",
+                    mcimport::IMPORT_VERSION
+                );
+                true
+            }
+            Err(e) => {
+                log::warn!("reconversion du monde Minecraft : {e:#}");
+                false
+            }
+        };
+    if !reimported {
+        if let Ok(bin) = fs::read(dir.join("chunks.bin")) {
+            world.set_bases(read_chunks_bin(&bin));
+        }
     }
     if let Ok(text) = fs::read_to_string(dir.join("torches.txt")) {
         for line in text.lines() {

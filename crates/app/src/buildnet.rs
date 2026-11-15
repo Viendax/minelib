@@ -33,6 +33,7 @@ use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use glam::Vec3;
+use minelib_net::client::{Client, Cmd, Event};
 use minelib_net::game;
 use minelib_net::proto::{self, Request};
 use minelib_net::transport::{self, Inbound};
@@ -53,6 +54,8 @@ const PENDING_TIMEOUT: f32 = 4.0;
 
 pub struct Other {
     pub pseudo: String,
+    /// Son numéro sur le relais du monde (vocal), s'il passe par lui.
+    pub id: Option<u64>,
     /// Position montrée : elle rejoint la dernière reçue en douceur (les joueurs lointains
     /// envoient moins souvent, voir le relais).
     pub pos: Vec3,
@@ -81,14 +84,100 @@ pub struct BuildNet {
     pseudo: String,
     /// Zones dont ce jeu est le garant.
     pub zones: HashSet<[i32; 2]>,
-    pub others: HashMap<u64, Other>,
+    /// Joueurs proches, par pseudo (le même joueur peut passer d'un relais de région à
+    /// l'autre).
+    pub others: HashMap<String, Other>,
     chunk: Option<[i32; 2]>,
     pos_timer: f32,
     /// Modifications acceptées par joueur dans la seconde en cours.
     rate: HashMap<u64, (Instant, u32)>,
     caps_sent: bool,
     pending: HashMap<[i32; 3], Pending>,
+    shards: Shards,
 }
+
+/// Relais de région (voir `minelib_relay::shard`) : la liste reçue du relais du monde, le
+/// billet pour y entrer, et une connexion à chaque région en vue. Chaque message part au
+/// relais de la région qu'il concerne ; une région sans relais passe par le relais du monde.
+#[derive(Default)]
+struct Shards {
+    ticket: Option<(u64, String, u64, [u8; 32])>,
+    list: HashMap<[i32; 2], proto::ShardInfo>,
+    conns: HashMap<[i32; 2], ShardConn>,
+    /// Dossier du nœud iroh (tunnel vers un relais de région hors du réseau local).
+    node_dir: Option<std::path::PathBuf>,
+}
+
+struct ShardConn {
+    info: proto::ShardInfo,
+    client: Client,
+    link: Option<Sender<Inbound>>,
+    /// Dernier chunk annoncé à ce relais.
+    sent_chunk: Option<[i32; 2]>,
+}
+
+impl Shards {
+    fn link(&self, region: [i32; 2]) -> Option<&Sender<Inbound>> {
+        self.conns.get(&region).and_then(|c| c.link.as_ref())
+    }
+
+    /// Se connecte aux relais des régions en vue de `chunk`, quitte les autres.
+    fn keep_near(&mut self, chunk: [i32; 2]) {
+        let lo = proto::region_of([chunk[0] - VIEW_CHUNKS, chunk[1] - VIEW_CHUNKS]);
+        let hi = proto::region_of([chunk[0] + VIEW_CHUNKS, chunk[1] + VIEW_CHUNKS]);
+        let in_view =
+            |r: [i32; 2]| (lo[0]..=hi[0]).contains(&r[0]) && (lo[1]..=hi[1]).contains(&r[1]);
+        self.conns
+            .retain(|r, c| in_view(*r) && self.list.get(r) == Some(&c.info));
+        let Some((room, pseudo, expires, mac)) = self.ticket.clone() else {
+            return;
+        };
+        for (region, info) in &self.list {
+            if !in_view(*region) || self.conns.contains_key(region) {
+                continue;
+            }
+            let (addr, key, node) = (info.addr.clone(), info.key, info.node);
+            let dir = self.node_dir.clone();
+            // Directement (réseau local), sinon par un tunnel iroh vers le nœud de l'hôte.
+            let client = Client::spawn_resolved(Box::new(move || {
+                if let Ok(a) = addr.parse::<std::net::SocketAddr>() {
+                    if std::net::TcpStream::connect_timeout(
+                        &a,
+                        std::time::Duration::from_millis(800),
+                    )
+                    .is_ok()
+                    {
+                        return Ok((addr.clone(), Some(key)));
+                    }
+                }
+                let n = dir
+                    .as_deref()
+                    .and_then(crate::account::p2p_node)
+                    .ok_or_else(|| anyhow::anyhow!("relais de région injoignable"))?;
+                let local = n.tunnel(node)?;
+                Ok((local.to_string(), Some(key)))
+            }));
+            client.send(Cmd::ShardLogin {
+                room,
+                pseudo: pseudo.clone(),
+                expires,
+                mac,
+            });
+            self.conns.insert(
+                *region,
+                ShardConn {
+                    info: info.clone(),
+                    client,
+                    link: None,
+                    sent_chunk: None,
+                },
+            );
+        }
+    }
+}
+
+/// Distance de vue (chunks) : un relais de région à moins de cela est rejoint.
+const VIEW_CHUNKS: i32 = 12;
 
 fn chunk_of(x: i32, z: i32) -> [i32; 2] {
     let c = ChunkPos::containing(x, z);
@@ -108,6 +197,42 @@ impl BuildNet {
             rate: HashMap::new(),
             caps_sent: false,
             pending: HashMap::new(),
+            shards: Shards::default(),
+        }
+    }
+
+    /// Dossier du nœud iroh de ce jeu (tunnels vers les relais de région).
+    pub fn set_node_dir(&mut self, dir: std::path::PathBuf) {
+        self.shards.node_dir = Some(dir);
+    }
+
+    /// Relais des régions du monde (envoyé par le relais du monde).
+    pub fn set_shards(&mut self, list: Vec<proto::ShardInfo>) {
+        self.shards.list = list.into_iter().map(|i| (i.region, i)).collect();
+    }
+
+    /// Billet pour les relais de région.
+    pub fn set_ticket(&mut self, room: u64, pseudo: String, expires: u64, mac: [u8; 32]) {
+        self.shards.ticket = Some((room, pseudo, expires, mac));
+    }
+
+    /// Relais de région rejoints (prêts).
+    #[cfg(test)]
+    pub fn shard_links(&self) -> usize {
+        self.shards
+            .conns
+            .values()
+            .filter(|c| c.link.is_some())
+            .count()
+    }
+
+    /// Envoie au relais de la région de `chunk` (ou au relais du monde).
+    fn send_at(&self, chunk: [i32; 2], req: Request) {
+        match self.shards.link(proto::region_of(chunk)) {
+            Some(l) => {
+                transport::push(l, &req);
+            }
+            None => self.send(req),
         }
     }
 
@@ -119,6 +244,12 @@ impl BuildNet {
     /// Le propriétaire est parti : ce jeu le devient (il enregistrera le monde).
     pub fn set_owner(&mut self) {
         self.owner = true;
+    }
+
+    /// Un autre joueur garde maintenant le monde (meilleure connexion) : on n'en est plus
+    /// le propriétaire.
+    pub fn clear_owner(&mut self) {
+        self.owner = false;
     }
 
     fn send(&self, req: Request) {
@@ -181,10 +312,13 @@ impl BuildNet {
             });
             p.count += 1;
             p.age = 0.0;
-            self.send(Request::ToZone {
+            self.send_at(
                 chunk,
-                data: game::encode(&BuildMsg::Edit { pos, block: id.0 }),
-            });
+                Request::ToZone {
+                    chunk,
+                    data: game::encode(&BuildMsg::Edit { pos, block: id.0 }),
+                },
+            );
         }
         // Sans réponse du garant : la modification n'a pas eu lieu.
         let mut dirty = Vec::new();
@@ -200,8 +334,41 @@ impl BuildNet {
             log::info!("construction : pas de réponse du garant pour {pos:?}, annulé");
             dirty.extend(world.set_remote(pos[0], pos[1], pos[2], old));
         }
-        // Position : aux joueurs proches ; nouveau chunk : au relais.
+        // Relais de région en vue : connexions, messages reçus.
         let chunk = chunk_of(feet.x.floor() as i32, feet.z.floor() as i32);
+        self.shards.keep_near(chunk);
+        let mut received = Vec::new();
+        let mut broken = Vec::new();
+        for (region, c) in &mut self.shards.conns {
+            while let Some(e) = c.client.poll() {
+                match e {
+                    Event::Link(l) => c.link = Some(l),
+                    Event::FromZone { chunk, data, .. } => received.push((chunk, data)),
+                    Event::Error(m) | Event::Offline(m) => {
+                        log::info!("relais de la région {region:?} : {m}");
+                        broken.push(*region);
+                    }
+                    _ => {}
+                }
+            }
+            // Chaque relais doit savoir où l'on est (qui doit recevoir quoi).
+            if c.link.is_some() && c.sent_chunk != Some(chunk) {
+                c.sent_chunk = Some(chunk);
+                if let Some(l) = &c.link {
+                    transport::push(l, &Request::Position { chunk });
+                }
+            }
+        }
+        for r in broken {
+            // La liste sera remise à jour par le relais du monde ; en attendant, on passe
+            // par lui (la connexion sera retentée).
+            self.shards.conns.remove(&r);
+            self.shards.list.remove(&r);
+        }
+        for (c, data) in received {
+            dirty.extend(self.receive(0, c, &data, world));
+        }
+        // Position : aux joueurs proches ; nouveau chunk : au relais.
         if self.chunk != Some(chunk) {
             self.chunk = Some(chunk);
             self.send(Request::Position { chunk });
@@ -217,10 +384,13 @@ impl BuildNet {
                 crouch,
                 speed,
             };
-            self.send(Request::Nearby {
+            self.send_at(
                 chunk,
-                data: game::encode(&msg),
-            });
+                Request::Nearby {
+                    chunk,
+                    data: game::encode(&msg),
+                },
+            );
         }
         for o in self.others.values_mut() {
             o.seen += dt;
@@ -271,7 +441,8 @@ impl BuildNet {
                     block,
                     by: self
                         .others
-                        .get(&peer)
+                        .values()
+                        .find(|o| o.id == Some(peer))
                         .map_or(String::new(), |o| o.pseudo.clone()),
                 };
                 self.send(Request::ToZone {
@@ -311,8 +482,14 @@ impl BuildNet {
                 speed,
             } => {
                 let target = Vec3::from(pos);
-                match self.others.get_mut(&peer) {
+                let key: String = pseudo.chars().take(16).collect();
+                // Numéro sur le relais du monde (le vocal passe par lui).
+                let home = (peer != 0).then_some(peer);
+                match self.others.get_mut(&key) {
                     Some(o) => {
+                        if home.is_some() {
+                            o.id = home;
+                        }
                         // Intervalle mesuré (lissé) ; téléportation : on y va d'un coup.
                         o.interval = o.interval * 0.7 + o.seen.clamp(POS_EVERY, 2.0) * 0.3;
                         if (target - o.pos).length() > 8.0 {
@@ -327,9 +504,10 @@ impl BuildNet {
                     }
                     None => {
                         self.others.insert(
-                            peer,
+                            key.clone(),
                             Other {
-                                pseudo: pseudo.chars().take(16).collect(),
+                                pseudo: key,
+                                id: home,
                                 pos: target,
                                 target,
                                 interval: POS_EVERY,
@@ -392,6 +570,10 @@ mod tests {
         world: World,
         pos: Vec3,
         rejects: u32,
+        /// Relais de région hébergé (connexion de garant).
+        shard: Option<crate::garant_worker::ShardHost>,
+        /// A rejoint au moins un relais de région.
+        used_shard: bool,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -442,6 +624,8 @@ mod tests {
                 world: if garant { World::new(0) } else { flat() },
                 pos: Vec3::new(64.0, 11.0, 16.0),
                 rejects: 0,
+                shard: None,
+                used_shard: false,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
@@ -458,6 +642,32 @@ mod tests {
                         let link = self.link.clone().expect("file d'envoi");
                         self.net = Some(BuildNet::new(link, self.name.clone(), false));
                     }
+                    Event::ShardTask {
+                        room,
+                        region,
+                        secret,
+                    } => {
+                        let link = self.link.clone().expect("file d'envoi");
+                        self.shard = crate::garant_worker::ShardHost::start(
+                            room, region, secret, link, false,
+                        );
+                    }
+                    Event::Shards(list) => {
+                        if let Some(n) = &mut self.net {
+                            n.set_shards(list);
+                        }
+                    }
+                    Event::ShardTicket {
+                        room,
+                        pseudo,
+                        expires,
+                        mac,
+                    } => {
+                        if let Some(n) = &mut self.net {
+                            n.set_ticket(room, pseudo, expires, mac);
+                        }
+                    }
+                    Event::RoomClosed => self.shard = None,
                     Event::Zones { gained, lost } => {
                         if let Some(n) = &mut self.net {
                             n.zones_changed(&gained, &lost);
@@ -505,8 +715,12 @@ mod tests {
 
         fn tick(&mut self, dt: f32) {
             self.pump(&|_| false);
+            if let Some(s) = &self.shard {
+                s.pump();
+            }
             if let Some(n) = &mut self.net {
                 let _ = n.update(&mut self.world, self.pos, (0.0, 0.0), 0.0, 4.0, 144.0, dt);
+                self.used_shard |= n.shard_links() > 0;
             }
         }
     }
@@ -519,6 +733,9 @@ mod tests {
         garant_leaves: bool,
         /// Le propriétaire s'en va au milieu (un joueur reprend le monde et l'enregistre).
         owner_leaves: bool,
+        /// La région est assez peuplée pour avoir son propre relais (hébergé par le joueur
+        /// d'un autre monde).
+        shards: bool,
     }
 
     /// Construction en ligne à petite échelle, de bout en bout (vrai relais, vraies
@@ -536,6 +753,9 @@ mod tests {
             name: "essai".into(),
         })
         .unwrap();
+        if sc.shards {
+            h.set_shard_from(2);
+        }
         let addr = h.addr.to_string();
         // Un autre monde, dont le joueur prête sa connexion de garant.
         let mut ailleurs = Bot::new(&addr, h.public, "Garant", false);
@@ -596,6 +816,7 @@ mod tests {
             if step == 150 && sc.garant_leaves {
                 garant.c.send(Cmd::Leave);
                 garant.net = None;
+                garant.shard = None;
             }
             if step == 150 && sc.owner_leaves {
                 bots[0].c.send(Cmd::Leave);
@@ -629,7 +850,8 @@ mod tests {
                 b.tick(dt);
             }
             garant.tick(dt);
-            had_garant |= garant.net.as_ref().is_some_and(|n| !n.zones.is_empty());
+            had_garant |=
+                garant.net.as_ref().is_some_and(|n| !n.zones.is_empty()) || garant.shard.is_some();
             ailleurs.pump(&|_| false);
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -732,6 +954,25 @@ mod tests {
     }
 
     #[test]
+    fn build_worlds_stay_identical_with_a_region_relay() {
+        run(Scenario {
+            players: 6,
+            shards: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn build_worlds_stay_identical_when_the_region_relay_leaves() {
+        run(Scenario {
+            players: 6,
+            shards: true,
+            garant_leaves: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
     fn far_players_move_smoothly_with_fewer_messages() {
         // Un joueur lointain n'envoie qu'une position par seconde : on le voit avancer à
         // vitesse régulière, pas par bonds.
@@ -757,7 +998,7 @@ mod tests {
                 x += 4.0;
             }
             let _ = b.update(&mut w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, dt);
-            shown.push(b.others[&7].pos.x);
+            shown.push(b.others["Loin"].pos.x);
         }
         // Après la mise en route : jamais de bond de plus de 0,5 bloc d'une image à l'autre.
         let jumps = shown[60..]

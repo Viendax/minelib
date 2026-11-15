@@ -245,6 +245,14 @@ impl Garant {
                     vel,
                 } => self.fps.add_thrown(owner, nade, pos, vel),
                 crate::netgame::Local::Started => self.started_sent = false,
+                // Portes ouvertes ou fermées : le monde du garant suit (on s'y cogne).
+                crate::netgame::Local::Doors { cells, .. } => {
+                    if let Some(w) = &mut self.world {
+                        for (c, b) in cells {
+                            w.set(c[0], c[1], c[2], minelib_world::BlockId(b));
+                        }
+                    }
+                }
                 _ => {}
             }
         }

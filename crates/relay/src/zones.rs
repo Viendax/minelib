@@ -84,6 +84,8 @@ pub struct Candidate {
     pub uptime: Duration,
     /// Signalements par partie.
     pub ratio: f64,
+    /// Aller-retour jusqu'au relais (ms), s'il est connu.
+    pub rtt: Option<f32>,
 }
 
 /// Aptitude d'un joueur à être garant, sans tenir compte de sa charge.
@@ -93,8 +95,10 @@ pub fn aptitude(c: &Candidate) -> f64 {
     let ram = (c.caps.ram_mb.min(32 * 1024) as f64) / 1024.0;
     let minutes = (c.uptime.as_secs_f64() / 60.0).min(60.0);
     let base = cores * 8.0 + fps / 8.0 + ram * 2.0 + minutes;
-    // Un joueur souvent signalé n'est garant qu'en dernier recours.
-    base / (1.0 + 10.0 * c.ratio)
+    // Un joueur souvent signalé n'est garant qu'en dernier recours ; une connexion lente
+    // compte beaucoup (tout passe par lui) : 200 ms divisent l'aptitude par 5.
+    let slow = 1.0 + (c.rtt.unwrap_or(40.0) as f64 / 50.0).powi(2) / 4.0;
+    base / (1.0 + 10.0 * c.ratio) / slow
 }
 
 pub struct Zone {
@@ -236,24 +240,55 @@ impl Build {
         data: &[u8],
         listeners: &[u64],
     ) -> Vec<(u64, Vec<Vec<u8>>)> {
-        let Some(z) = self.zones.get_mut(&zone) else {
+        if !self.zones.contains_key(&zone) {
             return Vec::new();
+        }
+        self.mirror_to(zone, data, listeners)
+    }
+
+    /// Comme `record`, même pour une zone sans garant (relais de région, copie gardée par
+    /// le relais du monde).
+    pub fn mirror_to(
+        &mut self,
+        zone: [i32; 2],
+        data: &[u8],
+        listeners: &[u64],
+    ) -> Vec<(u64, Vec<Vec<u8>>)> {
+        let log = match self.zones.get_mut(&zone) {
+            Some(z) => &mut z.log,
+            None => self.orphan_logs.entry(zone).or_default(),
         };
-        let before = z.log.last();
+        let before = log.last();
         self.next_seq = self.next_seq.max(before) + 1;
         let seq = self.next_seq;
-        z.log.push(seq, data);
+        log.push(seq, data);
         let mut out = Vec::new();
         for &id in listeners {
             let known = self.known.entry(id).or_default().entry(zone).or_insert(0);
             if *known >= before {
                 out.push((id, vec![data.to_vec()]));
             } else {
-                out.push((id, z.log.since(*known)));
+                out.push((id, log.since(*known)));
             }
             *known = seq;
         }
         out
+    }
+
+    /// Garde une modification venue d'ailleurs (relais de région, historique reçu).
+    pub fn mirror(&mut self, zone: [i32; 2], data: &[u8]) {
+        self.mirror_to(zone, data, &[]);
+    }
+
+    /// Zones dont on a l'historique (avec ou sans garant).
+    pub fn logs_in(&self, keep: impl Fn([i32; 2]) -> bool) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
+        self.zones
+            .iter()
+            .map(|(&k, z)| (k, &z.log))
+            .chain(self.orphan_logs.iter().map(|(&k, l)| (k, l)))
+            .filter(|(k, l)| keep(*k) && l.last() > 0)
+            .map(|(k, l)| (k, l.since(0)))
+            .collect()
     }
 
     /// Ce qu'un joueur n'a pas encore reçu : des zones proches de `chunk`, ou de toutes les
@@ -410,6 +445,7 @@ mod tests {
             },
             uptime: Duration::from_secs(600),
             ratio: 0.0,
+            rtt: None,
         }
     }
 

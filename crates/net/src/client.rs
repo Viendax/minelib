@@ -16,6 +16,8 @@ use crate::transport::{Channel, Inbound, Incoming};
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Ping régulier pour garder la session ouverte.
 const KEEPALIVE: Duration = Duration::from_secs(20);
+/// Mesure de l'aller-retour jusqu'au relais (envoyée au relais).
+const RTT_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub enum Cmd {
@@ -32,6 +34,13 @@ pub enum Cmd {
         backup: Option<Vec<u8>>,
         /// Jeton d'appareil de confiance pour ce compte (pas de 2FA).
         device: Option<[u8; 32]>,
+    },
+    /// Entre dans un relais de région avec le billet du relais du monde.
+    ShardLogin {
+        room: u64,
+        pseudo: String,
+        expires: u64,
+        mac: [u8; 32],
     },
     TotpBegin,
     TotpConfirm(u32),
@@ -188,6 +197,11 @@ pub enum Event {
     Kicked(String),
     /// Tué par un OP du serveur (`/kill`).
     Slain(String),
+    /// Mode de jeu imposé par un OP (`by`), ou par défaut du serveur (`by` vide).
+    SetGamemode {
+        mode: String,
+        by: String,
+    },
     Leaderboard {
         friends: bool,
         list: Vec<crate::proto::RankEntry>,
@@ -248,6 +262,21 @@ pub enum Event {
     },
     /// Garant extérieur d'un serveur de construction (voir `Response::BuildGarant`).
     BuildGarant(u64),
+    /// Héberger le relais d'une région (voir `Response::ShardTask`).
+    ShardTask {
+        room: u64,
+        region: [i32; 2],
+        secret: [u8; 32],
+    },
+    /// Relais des régions du monde.
+    Shards(Vec<proto::ShardInfo>),
+    /// Billet pour les relais de région.
+    ShardTicket {
+        room: u64,
+        pseudo: String,
+        expires: u64,
+        mac: [u8; 32],
+    },
     BackupIs(u64),
     Judge {
         conflict: u64,
@@ -422,6 +451,8 @@ impl Worker {
 
     fn run(mut self, cmds: Receiver<Cmd>) {
         let mut last_ping = Instant::now();
+        // Ping en cours de mesure (envoyé à cet instant).
+        let mut ping_sent: Option<Instant> = None;
         loop {
             // Commandes du jeu (sans attendre si une connexion est ouverte).
             let cmd = if self.chan.is_some() {
@@ -460,8 +491,26 @@ impl Worker {
                 Err(e) => Err(e),
             };
             let got = got.and_then(|r| {
-                if last_ping.elapsed() > KEEPALIVE {
+                // Pong : aller-retour mesuré, dit au relais.
+                if matches!(r, Some(Response::Pong)) {
+                    if let Some(t) = ping_sent.take() {
+                        let ms = t.elapsed().as_millis().min(u16::MAX as u128) as u16;
+                        chan.send(&Request::Rtt { ms })?;
+                    }
+                    return Ok(None);
+                }
+                // Pong perdu (répondu pendant une requête) : on remesure.
+                if ping_sent.is_some_and(|t| t.elapsed() > Duration::from_secs(5)) {
+                    ping_sent = None;
+                }
+                let every = if ping_sent.is_none() {
+                    RTT_EVERY
+                } else {
+                    KEEPALIVE
+                };
+                if last_ping.elapsed() > every {
                     last_ping = Instant::now();
+                    ping_sent = Some(last_ping);
                     chan.send(&Request::Ping)?;
                 }
                 Ok(r)
@@ -526,6 +575,7 @@ impl Worker {
             Response::HostChanged { host } => Event::HostChanged(host),
             Response::Kicked { reason } => Event::Kicked(reason),
             Response::Slain { by } => Event::Slain(by),
+            Response::SetGamemode { mode, by } => Event::SetGamemode { mode, by },
             Response::Arbitrate { case, map_sig, map } => Event::Arbitrate { case, map_sig, map },
             Response::Evidence {
                 case,
@@ -543,6 +593,27 @@ impl Worker {
             Response::Witness { peer, data } => Event::Witness { peer, data },
             Response::Zones { gained, lost } => Event::Zones { gained, lost },
             Response::BuildGarant { room } => Event::BuildGarant(room),
+            Response::ShardTask {
+                room,
+                region,
+                secret,
+            } => Event::ShardTask {
+                room,
+                region,
+                secret,
+            },
+            Response::Shards { list } => Event::Shards(list),
+            Response::ShardTicket {
+                room,
+                pseudo,
+                expires,
+                mac,
+            } => Event::ShardTicket {
+                room,
+                pseudo,
+                expires,
+                mac,
+            },
             Response::FromZone { peer, chunk, data } => Event::FromZone { peer, chunk, data },
             // Banni pendant la session : déconnecté.
             Response::Error { code, message } => {
@@ -693,6 +764,35 @@ impl Worker {
                     r => return Err(anyhow!("réponse inattendue : {r:?}")),
                 }
                 self.login(&pseudo, &keys, None, None)
+            }
+            Cmd::ShardLogin {
+                room,
+                pseudo,
+                expires,
+                mac,
+            } => {
+                self.chan = None;
+                self.connect()?;
+                match self.request(&Request::ShardLogin {
+                    room,
+                    pseudo,
+                    expires,
+                    mac,
+                })? {
+                    Response::Welcome { pseudo, .. } => {
+                        self.pseudo = pseudo.clone();
+                        if let Some(c) = &self.chan {
+                            self.emit(Event::Link(c.pusher()));
+                        }
+                        self.emit(Event::LoggedIn {
+                            pseudo,
+                            fingerprint: String::new(),
+                            totp: false,
+                        });
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
             }
             Cmd::Login {
                 pseudo,

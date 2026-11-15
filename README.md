@@ -47,9 +47,9 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 
 Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 
-- **Joue avec tes amis** : le panneau de droite liste tes amis (en ligne en vert) ; un clic invite dans ton **lobby** (5 joueurs). Celui qui invite en premier est l'hôte du lobby : il lance la partie pour tout le monde, et vous êtes **toujours dans la même équipe**. Clic droit sur un membre : *Exclure* ou *Promouvoir hôte*.
+- **Joue avec tes amis** : le panneau de droite liste tes amis (en ligne en vert) ; un clic invite dans ton **lobby** (jusqu'à 10 joueurs : il doit tenir dans une équipe de la carte, 5 pour un 5 contre 5, 10 pour un 10 contre 10). Celui qui invite en premier est l'hôte du lobby : il lance la partie pour tout le monde, et vous êtes **toujours dans la même équipe**. Clic droit sur un membre : *Exclure* ou *Promouvoir hôte*.
 
-- Chaque carte affiche clairement son format (**5 contre 5**, 2 contre 2…). **Seules les cartes 5 contre 5 comptent au classement.**
+- Chaque carte affiche clairement son format (**5 contre 5**, 2 contre 2, jusqu'à 10 contre 10). **Seules les cartes 5 contre 5 comptent au classement.**
 - **Les cartes de la communauté** : toute carte déjà lancée en partie FPS en ligne apparaît dans la liste de tout le monde et se télécharge toute seule. Elle reste disponible tant qu'un joueur qui y a joué l'a encore (son jeu la renvoie au relais si besoin). Tes autres mondes restent privés.
 - Pendant l'échauffement, **les autres joueurs restent anonymes** (« Joueur 3 ») : on ne quitte pas la recherche parce qu'on a vu un nom. Les pseudos s'affichent quand la partie commence au complet.
 - **Matchmaking équitable** : d'abord un niveau Elo proche de l'équipe déjà formée (moyenne du lobby), puis les nouveaux avec les nouveaux, puis un facteur de confiance proche (le plus bas du lobby). Jamais avec quelqu'un que tu as signalé.
@@ -88,6 +88,8 @@ Le facteur est **lié à la machine** : c'est le plus bas des comptes utilisés 
 - **Des serveurs neutres** : la partie est servie par un **garant indépendant**, sans aucun lien avec les joueurs (ni ami, ni signalé). De préférence, c'est un joueur qui **vient de lancer sa propre partie** : il a tout intérêt à rester en jeu. Son jeu sert l'autre partie en arrière-plan, sans toucher à ses images, et un autre garant le **relève avant la fin de sa partie**, sans coupure. À défaut, un joueur au menu sert.
 - **Serveurs de construction** : les zones du monde sont validées par des **joueurs d'autres serveurs de construction**, sans lien avec celui-ci (personne ici n'a intérêt à les attaquer). Le jeu de ces joueurs le fait en arrière-plan pendant qu'ils construisent chez eux. S'il n'y en a aucun, ce sont les joueurs du serveur lui-même.
 - **Construction synchronisée** : chaque bloc posé ou cassé est vérifié par le garant de sa zone, puis envoyé à chacun ; un bloc refusé (par exemple au-delà de 20 par seconde) est annulé chez le joueur. Celui qui arrive ou revient près d'une zone reçoit exactement ce qui lui manque. Les positions des joueurs lointains sont envoyées moins souvent et lissées. Des essais automatiques (joueurs simulés sur un vrai relais : foule, garant ou propriétaire qui s'en va, arrivée en retard) vérifient que tous les mondes restent identiques, case par case.
+- **Des milliers de joueurs sur un monde** : un monde très peuplé est découpé en **régions** (32 × 32 chunks). Dès 24 joueurs dans une région, elle est servie par son **propre relais**, que fait tourner en arrière-plan le jeu d'un joueur **d'un autre monde** (comme les garants FPS : personne n'a intérêt à l'attaquer). Ce relais valide les blocs de sa région, transmet les positions des joueurs proches et renvoie tout au relais du monde, qui en garde la copie : s'il disparaît, la région est reprise sans perte. Le jeu se connecte tout seul aux régions autour de lui (billet signé par le relais du monde), et passe d'une région à l'autre sans coupure.
+- **L'hôte le mieux connecté** : chaque jeu mesure sa connexion au relais. Si celle de l'hôte (FPS ou construction) devient mauvaise et qu'un autre joueur est bien mieux connecté, la partie lui passe en cours de route, sans recommencer.
 - **Tout est rejoué** : un second garant reçoit le journal complet de la partie, chaîné et infalsifiable, et **rejoue chaque déplacement, chaque tir, chaque grenade** avec le même code. Le moindre écart est une preuve.
 - **Un arbitre tranche** : en cas d'accusation, le relais confie ses propres pièces à un troisième garant sans lien avec personne. Triche confirmée par l'arbitre : **bannissement automatique** du compte et de la machine.
 - **Contre les wallhacks** : un adversaire caché derrière un mur n'est tout simplement pas envoyé à ton jeu.
@@ -101,7 +103,8 @@ Dans ton monde en créatif, sélectionne une zone avec la baguette (`//wand`), p
 |----------|-------|
 | `/fps set spawn ct` · `/fps set spawn t` | Zone de départ des CT / des T |
 | `/fps set site a` · `b` · `c` | Site de bombe |
-| `/fps set maxplayer <n>` | Nombre de joueurs (2 à 10 ; 10 = classé) |
+| `/fps set maxplayer <n>` | Nombre de joueurs, toujours pair (2 à 20 ; 10 = classé) |
+| `/fps set door true\|false` | Portes et trappes utilisables en partie (touche *Utiliser*, avec leur bruit) |
 | `/fps info` · `/fps clear …` | Voir ou effacer les réglages |
 
 Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aussi). Ta carte est partagée avec tout le monde dès que tu lances une partie dessus.

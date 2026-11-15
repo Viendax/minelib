@@ -540,7 +540,44 @@ impl Inventory {
         let Some(i) = layout.slot_at(cursor.0, cursor.1, true) else {
             return;
         };
+        if shift && self.held.is_none() {
+            self.quick_move(i);
+            return;
+        }
         self.click_slot(i, right);
+    }
+
+    /// Maj + clic sur un emplacement (rien en main) : sa pile passe de la barre rapide à
+    /// l'inventaire, ou l'inverse, comme dans Minecraft (d'abord sur les piles du même
+    /// objet, puis dans les cases libres). Ce qui ne trouve pas de place reste où il était.
+    pub fn quick_move(&mut self, i: usize) {
+        let Some(mut s) = self.slots[i] else {
+            return;
+        };
+        let dest: Vec<usize> = if i < HOTBAR {
+            (HOTBAR..SLOTS).collect()
+        } else {
+            (0..HOTBAR).collect()
+        };
+        for &k in &dest {
+            if let Some(t) = &mut self.slots[k] {
+                if t.item == s.item && t.count < MAX_STACK {
+                    let n = s.count.min(MAX_STACK - t.count);
+                    t.count += n;
+                    s.count -= n;
+                    if s.count == 0 {
+                        self.slots[i] = None;
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(&k) = dest.iter().find(|&&k| self.slots[k].is_none()) {
+            self.slots[k] = Some(s);
+            self.slots[i] = None;
+            return;
+        }
+        self.slots[i] = Some(s);
     }
 
     fn click_creative(&mut self, size: (f32, f32), cursor: (f32, f32), right: bool, shift: bool) {
@@ -576,10 +613,15 @@ impl Inventory {
             }
             return;
         }
-        if let Some(i) = c.hotbar_at(x, y) {
-            self.click_slot(i, right);
-        } else if let Some(i) = c.storage_at(x, y) {
-            self.click_slot(HOTBAR + i, right);
+        let slot = c
+            .hotbar_at(x, y)
+            .or_else(|| c.storage_at(x, y).map(|i| HOTBAR + i));
+        if let Some(i) = slot {
+            if shift && self.held.is_none() {
+                self.quick_move(i);
+            } else {
+                self.click_slot(i, right);
+            }
         }
     }
 
@@ -978,6 +1020,29 @@ mod tests {
             );
         }
         assert!(items.len() <= SLOTS);
+    }
+
+    #[test]
+    fn shift_click_moves_between_hotbar_and_storage() {
+        let mut inv = Inventory::empty();
+        let stone = Item::Block(BlockId::STONE);
+        inv.slots[2] = Some(Stack {
+            item: stone,
+            count: 10,
+        });
+        inv.slots[HOTBAR + 3] = Some(Stack {
+            item: stone,
+            count: 60,
+        });
+        // Barre → inventaire : d'abord la pile de pierre (4 places), le reste en case libre.
+        inv.quick_move(2);
+        assert!(inv.slots[2].is_none());
+        assert_eq!(inv.slots[HOTBAR + 3].unwrap().count, 64);
+        assert_eq!(inv.slots[HOTBAR].unwrap().count, 6);
+        // Inventaire → barre : première case libre de la barre.
+        inv.quick_move(HOTBAR + 3);
+        assert!(inv.slots[HOTBAR + 3].is_none());
+        assert_eq!(inv.slots[0].unwrap().count, 64);
     }
 
     #[test]

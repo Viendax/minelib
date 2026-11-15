@@ -1057,7 +1057,10 @@ pub fn bullet_path(
     };
     let solid = |p: Vec3| {
         let c = p.floor().as_ivec3();
-        (world.get(c.x, c.y, c.z).def().solid, c)
+        (
+            minelib_world::raycast::stops_bullets(world.get(c.x, c.y, c.z)),
+            c,
+        )
     };
     let mut blocks = 0u32;
     let mut hit = h.distance;

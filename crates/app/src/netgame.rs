@@ -37,6 +37,8 @@ const SCOREBOARD_EVERY: u32 = 128;
 const HISTORY: usize = 256;
 /// Retard d'affichage des autres joueurs chez l'invité (pas) : ~47 ms.
 const INTERP_TICKS: f32 = 8.0;
+/// Retard d'affichage au plus (pas) : au-delà, mieux vaut un saut qu'un retard énorme.
+const MAX_DELAY: f32 = 40.0;
 /// Écart (blocs) au-delà duquel l'invité reprend la position de l'hôte.
 const CORRECT: f32 = 0.01;
 /// Au plus tant d'entrées en retard traitées par pas pour un invité (rattrapage).
@@ -144,6 +146,11 @@ pub enum Local {
     /// Bruit d'un joueur en `pos` : pas (`STEP_RUN`), réception d'une chute (`STEP_LAND`),
     /// cri de douleur après une chute (`STEP_PAIN`).
     Step(Vec3, u8),
+    /// Portes et trappes changées (case, bloc) ; `at` : où l'on entend la porte.
+    Doors {
+        cells: Vec<([i32; 3], u16)>,
+        at: Option<Vec3>,
+    },
     /// Ce que le joueur porte vraiment selon l'hôte (armes, grenades).
     Guns {
         guns: (u8, u8),
@@ -265,7 +272,62 @@ pub fn witnessed(m: &ToHost) -> bool {
             | ToHost::Drop { .. }
             | ToHost::Pickup { .. }
             | ToHost::Color(_)
+            | ToHost::Door { .. }
     )
+}
+
+/// Distance (pieds du joueur au centre de la case) à laquelle on peut ouvrir une porte.
+pub const DOOR_REACH: f32 = 3.5;
+
+/// Porte ou trappe ouverte / fermée par un joueur pendant la partie, si la carte le
+/// permet : renvoie les cases changées (déjà notées dans `m.doors`). Hôte et vérificateur
+/// passent par ici, avec les mêmes données : ils trouvent la même chose.
+pub fn use_door(
+    m: &mut Match,
+    world: &World,
+    feet: Option<Vec3>,
+    alive: bool,
+    pos: [i32; 3],
+    side: u8,
+) -> Vec<([i32; 3], u16)> {
+    use minelib_world::BlockId;
+    let Some(feet) = feet.filter(|_| alive && m.map.doors()) else {
+        return Vec::new();
+    };
+    let center = Vec3::new(pos[0] as f32, pos[1] as f32, pos[2] as f32) + Vec3::splat(0.5);
+    if (feet + Vec3::Y - center).length() > DOOR_REACH {
+        return Vec::new();
+    }
+    let look = match side {
+        0 => Vec3::X,
+        1 => -Vec3::X,
+        4 => Vec3::Z,
+        _ => -Vec3::Z,
+    };
+    let changes: Vec<([i32; 3], u16, u16)> = {
+        let doors = &m.doors;
+        let get = |c: [i32; 3]| {
+            doors
+                .get(&c)
+                .map_or_else(|| world.get(c[0], c[1], c[2]), |e| BlockId(e[0]))
+        };
+        let mut opened: HashMap<[i32; 3], BlockId> =
+            doors.iter().map(|(c, e)| (*c, BlockId(e[1]))).collect();
+        crate::session::toggle_hinged_with(&get, &mut opened, pos, look)
+            .into_iter()
+            .map(|(c, b)| (c, b.0, doors.get(&c).map_or(get(c).0, |e| e[1])))
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (c, b, orig) in changes {
+        if b == orig {
+            m.doors.remove(&c);
+        } else {
+            m.doors.insert(c, [b, orig]);
+        }
+        out.push((c, b));
+    }
+    out
 }
 
 /// Ajoute un coup à la chaîne : chaque maillon dépend de tous les précédents.
@@ -483,9 +545,14 @@ fn dbg_alive(tag: &str, t: u64, who: u64, what: &str, m: &Match) {
     }
 }
 
-fn fall_check(p: &Player, from: &mut Option<f32>) -> Option<u32> {
+fn fall_check(p: &Player, world: &World, from: &mut Option<f32>) -> Option<u32> {
     if p.pos.y < -40.0 {
         return Some(1000);
+    }
+    // L'eau amortit la chute : aucun dégât. Sur une échelle, on ne tombe pas.
+    if p.on_ladder || crate::player::in_water(world, p.pos) {
+        *from = None;
+        return None;
     }
     if !p.on_ground {
         *from = Some(from.map_or(p.pos.y, |f| f.max(p.pos.y)));
@@ -563,6 +630,8 @@ pub struct Auditor {
     pub results: Vec<MatchSummary>,
     /// Point de réapparition de l'hôte qu'il n'a pas encore pris.
     cand0: Option<Player>,
+    /// Bloc d'origine des portes que le vérificateur a changées dans son monde.
+    door_orig: HashMap<[i32; 3], u16>,
 }
 
 /// Une demande vue par le relais doit apparaître au journal dans les copies qui suivent.
@@ -586,14 +655,38 @@ impl Auditor {
     /// L'hôte change : on repart de zéro.
     pub fn reset(&mut self) {
         let witnessing = self.witnessing;
+        let door_orig = std::mem::take(&mut self.door_orig);
         *self = Self {
             witnessing,
+            door_orig,
             ..Self::default()
         };
     }
 
+    /// Met les portes du monde du vérificateur dans l'état `doors` (celui d'une copie).
+    fn sync_doors(&mut self, world: &mut World, doors: &BTreeMap<[i32; 3], [u16; 2]>) {
+        for (c, e) in doors {
+            self.door_orig.entry(*c).or_insert(e[1]);
+        }
+        for (c, orig) in &self.door_orig {
+            let want = minelib_world::BlockId(doors.get(c).map_or(*orig, |e| e[0]));
+            if world.get(c[0], c[1], c[2]) != want {
+                world.set(c[0], c[1], c[2], want);
+            }
+        }
+    }
+
+    /// Portes changées en rejouant : dans le monde du vérificateur aussi (on s'y cogne).
+    fn apply_doors(&mut self, world: &mut World, m: &Match, cells: &[([i32; 3], u16)]) {
+        for &(c, b) in cells {
+            let orig = m.doors.get(&c).map_or(b, |e| e[1]);
+            self.door_orig.entry(c).or_insert(orig);
+            world.set(c[0], c[1], c[2], minelib_world::BlockId(b));
+        }
+    }
+
     /// Rejoue le journal de `new` à partir de `prev` et compare.
-    fn audit(&mut self, prev: &Backup, new: &Backup, world: &World) -> Vec<Conflict> {
+    fn audit(&mut self, prev: &Backup, new: &Backup, world: &mut World) -> Vec<Conflict> {
         let dt = crate::session::SIM_TICK;
         self.copies += 1;
         let mut out = Vec::new();
@@ -613,6 +706,7 @@ impl Auditor {
         let since = *self.since.get_or_insert(prev.tick);
         let spawn = Vec3::from(prev.spawn);
         let mut m = prev.m.clone();
+        self.sync_doors(world, &m.doors);
         let mut players: BTreeMap<u64, Player> = prev
             .players
             .iter()
@@ -768,7 +862,7 @@ impl Auditor {
                                 continue;
                             }
                             let f = falls.entry(id).or_insert(None);
-                            if let Some(d) = fall_check(p, f) {
+                            if let Some(d) = fall_check(p, world, f) {
                                 hurt.push((id, d));
                             }
                         }
@@ -887,6 +981,12 @@ impl Auditor {
                                 }
                             }
                             ToHost::Color(c) => m.set_color(who, *c),
+                            ToHost::Door { pos, side } => {
+                                let living = alive(&m, who);
+                                let cells =
+                                    use_door(&mut m, world, me.map(|p| p.pos), living, *pos, *side);
+                                self.apply_doors(world, &m, &cells);
+                            }
                             _ => {}
                         }
                     }
@@ -1101,7 +1201,7 @@ const MOLOTOV: u8 = 4;
 
 /// Rejoue le journal entre deux copies et compare (vérificateur neuf).
 #[cfg(test)]
-fn audit(prev: &Backup, new: &Backup, world: &World) -> Vec<Conflict> {
+fn audit(prev: &Backup, new: &Backup, world: &mut World) -> Vec<Conflict> {
     Auditor::default().audit(prev, new, world)
 }
 
@@ -1117,7 +1217,10 @@ type Frame = Vec<(u64, Vec3, f32)>;
 /// Bruits de pas : au-dessus de cette vitesse au sol (blocs/s), on court et les autres
 /// l'entendent (135 unités de CS sur 250).
 pub const STEP_SPEED: f32 = crate::player::FPS_SPRINT * 135.0 / 250.0;
-pub use minelib_net::game::{STEP_LAND, STEP_PAIN, STEP_RUN};
+pub use minelib_net::game::{STEP_LAND, STEP_PAIN, STEP_RUN, STEP_SPLASH};
+
+/// Hauteur de chute dans l'eau à partir de laquelle on entend le plongeon (blocs).
+pub const SPLASH_HEIGHT: f32 = 1.0;
 
 /// Chute d'au moins cette hauteur (blocs, du plus haut point atteint au sol où l'on
 /// retombe, saut compris) : bruit de réception, entendu des autres.
@@ -1189,6 +1292,9 @@ pub struct Host {
     chain: [u8; 32],
     /// Dernier tir de chaque joueur (pas) : un tireur s'entend même caché.
     last_shot: HashMap<u64, u32>,
+    /// Position montrée de chaque joueur distant : elle suit sa position simulée en douceur
+    /// (ses entrées arrivent par paquets : sans cela, il avance par sauts à l'écran).
+    shown: HashMap<u64, Vec3>,
 }
 
 pub struct Guest {
@@ -1209,6 +1315,11 @@ pub struct Guest {
     latest: Option<(u32, SimState, u8, bool)>,
     /// Horloge de l'hôte estimée (pas, avec fraction).
     clock: f32,
+    /// Retard d'affichage des autres joueurs (pas) : grandit avec les à-coups du réseau
+    /// pour toujours avoir deux états entre lesquels glisser (sinon ils sautillent).
+    delay: f32,
+    /// Plus grand retard d'arrivée récent d'un état (pas), qui s'oublie lentement.
+    late_peak: f32,
     weapon: u8,
     hud: MatchHud,
     rows: Vec<ScoreRow>,
@@ -1365,6 +1476,7 @@ impl NetGame {
             log: Vec::new(),
             chain: [0; 32],
             last_shot: HashMap::new(),
+            shown: HashMap::new(),
         };
         h.events(ev, &mut out);
         h.out = out;
@@ -1416,6 +1528,8 @@ impl NetGame {
             snaps: VecDeque::new(),
             full: Vec::new(),
             blind: false,
+            delay: INTERP_TICKS,
+            late_peak: 0.0,
             latest: None,
             clock: 0.0,
             weapon: 255,
@@ -1602,7 +1716,7 @@ impl NetGame {
     }
 
     /// Données reçues du relais. Renvoie ce que la session locale doit faire.
-    pub fn receive(&mut self, from: Option<u64>, data: &[u8], world: &World) -> Vec<Local> {
+    pub fn receive(&mut self, from: Option<u64>, data: &[u8], world: &mut World) -> Vec<Local> {
         match self {
             NetGame::Host(h) => match (from, game::decode::<ToHost>(data)) {
                 (Some(peer), Some(msg)) => h.receive(peer, msg, world),
@@ -1777,7 +1891,7 @@ impl NetGame {
                     };
                     g.to_host(&msg);
                 }
-                let view_tick = (g.clock - INTERP_TICKS).max(0.0) as u32;
+                let view_tick = (g.clock - g.delay).max(0.0) as u32;
                 for (w, origin, dirs) in shots {
                     g.to_host(&ToHost::Fire {
                         weapon: w,
@@ -1810,7 +1924,7 @@ impl NetGame {
                     let p = h.m.players.get(&id);
                     View {
                         pseudo: r.pseudo.clone(),
-                        pos: r.player.pos,
+                        pos: h.shown.get(&id).copied().unwrap_or(r.player.pos),
                         yaw: r.player.yaw,
                         pitch: r.player.pitch,
                         crouch: r.player.crouch,
@@ -2005,6 +2119,7 @@ impl NetGame {
             log: Vec::new(),
             chain: b.chain,
             last_shot: HashMap::new(),
+            shown: HashMap::new(),
         }));
         if let NetGame::Host(h) = self {
             h.playing = h.m.players.contains_key(&0);
@@ -2079,6 +2194,27 @@ impl NetGame {
         }
     }
 
+    /// Ouvre ou ferme la porte / trappe visée en `pos` (touche Utiliser, si la carte le
+    /// permet). `side` : côté vers lequel on regarde.
+    pub fn use_door(&mut self, world: &World, pos: [i32; 3], side: u8) -> Vec<Local> {
+        let msg = ToHost::Door { pos, side };
+        match self {
+            NetGame::Host(h) => {
+                h.record(0, Move::Rule(Rule::Msg(msg)));
+                let alive = h.m.players.get(&0).is_some_and(|p| p.alive);
+                let feet = h.playing.then_some(h.local_pos);
+                let cells = use_door(&mut h.m, world, feet, alive, pos, side);
+                let mut out = Vec::new();
+                h.doors_changed(cells, &mut out);
+                out
+            }
+            NetGame::Guest(g) => {
+                g.to_host(&msg);
+                Vec::new()
+            }
+        }
+    }
+
     /// Couleur préférée (bandeau des têtes, triangles des coéquipiers).
     pub fn choose_color(&mut self, color: u8) {
         match self {
@@ -2122,7 +2258,7 @@ impl Host {
     /// Bruits de pas : qui court (au-dessus de la vitesse de marche, au sol, vivant) fait
     /// un pas tous les `STRIDE` blocs, entendu par les joueurs à moins de `HEARD_STEPS`
     /// blocs (comme dans CS : marcher ou s'accroupir est silencieux pour les autres).
-    fn footsteps(&mut self, local_ground: bool, dt: f32, out: &mut Vec<Local>) {
+    fn footsteps(&mut self, world: &World, local_ground: bool, dt: f32, out: &mut Vec<Local>) {
         let mut walkers: Vec<(u64, Vec3, bool)> = Vec::new();
         if self.playing {
             walkers.push((0, self.local_pos, local_ground));
@@ -2147,8 +2283,15 @@ impl Host {
             let before = e.last;
             e.last = pos;
             let living = alive(&self.m, id);
-            // Réception : tombé d'assez haut (pas une réapparition).
-            if ground {
+            // Plongeon : tombé dans l'eau d'au moins un bloc (tout le monde l'entend).
+            if crate::player::in_water(world, pos) {
+                if let Some(top) = e.top.take() {
+                    if living && !teleport && top - pos.y >= SPLASH_HEIGHT {
+                        steps.push((id, pos, STEP_SPLASH));
+                    }
+                }
+            } else if ground {
+                // Réception : tombé d'assez haut (pas une réapparition).
                 if let Some(top) = e.top.take() {
                     if living && !teleport && top - pos.y >= LAND_HEIGHT {
                         steps.push((id, pos, STEP_LAND));
@@ -2236,6 +2379,22 @@ impl Host {
                 |r| r.pseudo.clone(),
             )
         }
+    }
+
+    /// Portes changées : à tous (avec leur bruit), et au monde de l'hôte.
+    fn doors_changed(&mut self, cells: Vec<([i32; 3], u16)>, out: &mut Vec<Local>) {
+        let Some(&(c, _)) = cells.first() else {
+            return;
+        };
+        let at = Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32) + Vec3::splat(0.5);
+        self.broadcast(&ToPeer::Doors {
+            cells: cells.clone(),
+            at: Some(at.to_array()),
+        });
+        out.push(Local::Doors {
+            cells,
+            at: Some(at),
+        });
     }
 
     fn feet_of(&self, id: u64) -> Option<Vec3> {
@@ -2661,6 +2820,16 @@ impl Host {
                             guns: self.m.ground.clone(),
                         },
                     );
+                    // Portes déjà ouvertes ou fermées pendant la partie.
+                    if !self.m.doors.is_empty() {
+                        self.send_to(
+                            peer,
+                            &ToPeer::Doors {
+                                cells: self.m.doors.iter().map(|(c, e)| (*c, e[0])).collect(),
+                                at: None,
+                            },
+                        );
+                    }
                     let pseudo = self.pseudo_of(peer);
                     // Déjà dans la partie (reprise par un nouvel hôte) : il continue.
                     let back = self.m.players.get(&peer).is_some_and(|p| p.present);
@@ -2730,6 +2899,12 @@ impl Host {
             }
             ToHost::Pickup { id } => out.extend(self.pickup(peer, id)),
             ToHost::Color(c) => self.m.set_color(peer, c),
+            ToHost::Door { pos, side } => {
+                let alive = self.m.players.get(&peer).is_some_and(|p| p.alive);
+                let feet = self.feet_of(peer);
+                let cells = use_door(&mut self.m, world, feet, alive, pos, side);
+                self.doors_changed(cells, &mut out);
+            }
             ToHost::Throw { nade, pos, vel } => {
                 let alive = self.m.players.get(&peer).is_some_and(|p| p.alive);
                 let near = self
@@ -2782,6 +2957,18 @@ impl Host {
 
     fn tick(&mut self, world: &World, local: &Player, dt: f32) {
         self.tick += 1;
+        // Positions montrées des autres joueurs (affichage seulement).
+        let peers = &self.peers;
+        self.shown.retain(|id, _| peers.contains_key(id));
+        for (&id, r) in self.peers.iter().filter(|(_, r)| r.ready) {
+            let target = r.player.pos;
+            let p = self.shown.entry(id).or_insert(target);
+            if (target - *p).length() > 3.0 {
+                *p = target;
+            } else {
+                *p += (target - *p) * 0.3;
+            }
+        }
         self.local_pos = local.pos;
         self.local_state = local.net_state();
         self.local_carry = local.carry;
@@ -2838,7 +3025,7 @@ impl Host {
                 }
             }
             // Chute (comme pour le joueur local) et vide.
-            if let Some(d) = fall_check(&r.player, &mut r.fall_from) {
+            if let Some(d) = fall_check(&r.player, world, &mut r.fall_from) {
                 falls.push((id, d));
             }
         }
@@ -2867,7 +3054,7 @@ impl Host {
         }
         let ev = self.m.tick(dt, &places);
         self.events(ev, &mut out);
-        self.footsteps(local.on_ground, dt, &mut out);
+        self.footsteps(world, local.on_ground, dt, &mut out);
         self.out.extend(out);
         if !self.spawns.is_empty() {
             self.do_spawns(world);
@@ -3214,11 +3401,7 @@ impl Guest {
             } => {
                 // Horloge : rattrape l'hôte en douceur.
                 let t = tick as f32;
-                if (self.clock - t).abs() > 64.0 {
-                    self.clock = t;
-                } else {
-                    self.clock += (t - self.clock) * 0.0125;
-                }
+                self.arrived(t);
                 if self.snaps.back().is_none_or(|(s, _)| *s < tick) {
                     self.full = players.clone();
                     self.snaps.push_back((tick, players));
@@ -3240,11 +3423,7 @@ impl Guest {
                 players,
             } => {
                 let t = tick as f32;
-                if (self.clock - t).abs() > 64.0 {
-                    self.clock = t;
-                } else {
-                    self.clock += (t - self.clock) * 0.0125;
-                }
+                self.arrived(t);
                 if self.snaps.back().is_none_or(|(s, _)| *s < tick) {
                     // Le reste (pseudo, vie, arme…) vient du dernier état complet.
                     let list: Vec<NetPlayer> = players
@@ -3303,6 +3482,10 @@ impl Guest {
                 self.hud.team = team;
                 out.push(Local::Respawn { state, reset, team });
             }
+            ToPeer::Doors { cells, at } => out.push(Local::Doors {
+                cells,
+                at: at.map(Vec3::from),
+            }),
             ToPeer::Chat { from, text } => {
                 if from.is_empty() {
                     out.push(Local::Notice(text));
@@ -3339,22 +3522,48 @@ impl Guest {
 
     /// Autres joueurs interpolés entre les deux états reçus qui entourent l'instant
     /// affiché (un peu dans le passé).
-    fn views(&self) -> Vec<View> {
-        let t = self.clock - INTERP_TICKS;
-        let (a, b) = match self.snaps.iter().position(|(s, _)| *s as f32 > t) {
-            Some(0) | None => {
-                let last = self.snaps.back();
-                (last, last)
-            }
-            Some(i) => (self.snaps.get(i - 1), self.snaps.get(i)),
-        };
-        let (Some((ta, pa)), Some((tb, pb))) = (a, b) else {
-            return Vec::new();
-        };
-        let k = if tb > ta {
-            ((t - *ta as f32) / (*tb - *ta) as f32).clamp(0.0, 1.0)
+    /// Un état de l'hôte du pas `t` arrive : horloge et retard d'affichage.
+    fn arrived(&mut self, t: f32) {
+        if (self.clock - t).abs() > 64.0 {
+            self.clock = t;
+            self.late_peak = 0.0;
         } else {
-            1.0
+            // Retard de cet état sur l'horloge (les à-coups du réseau).
+            let late = (self.clock - t).max(0.0);
+            self.late_peak = late.max(self.late_peak * 0.997);
+            self.clock += (t - self.clock) * 0.0125;
+        }
+        let want = (self.late_peak + 4.0).clamp(INTERP_TICKS, MAX_DELAY);
+        // Monte vite (plus de sautillement), redescend doucement (pas de ralenti visible).
+        let rate = if want > self.delay { 0.2 } else { 0.01 };
+        self.delay += (want - self.delay) * rate;
+    }
+
+    fn views(&self) -> Vec<View> {
+        let t = self.clock - self.delay;
+        let (a, b, k) = match self.snaps.iter().position(|(s, _)| *s as f32 > t) {
+            Some(i) if i > 0 => {
+                let (a, b) = (&self.snaps[i - 1], &self.snaps[i]);
+                let k = ((t - a.0 as f32) / (b.0 - a.0).max(1) as f32).clamp(0.0, 1.0);
+                (Some(a), Some(b), k)
+            }
+            Some(_) => (self.snaps.front(), self.snaps.front(), 1.0),
+            // Plus rien de récent : on prolonge un peu le dernier mouvement (au plus 6 pas)
+            // plutôt que de figer les joueurs puis de les faire sauter.
+            None => {
+                let n = self.snaps.len();
+                match (n >= 2).then(|| (&self.snaps[n - 2], &self.snaps[n - 1])) {
+                    Some((a, b)) => {
+                        let span = (b.0 - a.0).max(1) as f32;
+                        let k = 1.0 + ((t - b.0 as f32) / span).clamp(0.0, 6.0 / span);
+                        (Some(a), Some(b), k)
+                    }
+                    None => (self.snaps.back(), self.snaps.back(), 1.0),
+                }
+            }
+        };
+        let (Some((_, pa)), Some((_, pb))) = (a, b) else {
+            return Vec::new();
         };
         pb.iter()
             .map(|p| {
@@ -3362,11 +3571,19 @@ impl Guest {
                 let lerp_angle = |a: f32, b: f32| {
                     let d = (b - a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
                         - std::f32::consts::PI;
-                    a + d * k
+                    a + d * k.min(1.0)
                 };
+                // Au-delà du dernier état : la position seulement (pas de saut au retour
+                // d'un joueur, ni d'angle exagéré).
+                let kp = if (Vec3::from(p.pos) - Vec3::from(prev.pos)).length() > 2.0 {
+                    k.min(1.0)
+                } else {
+                    k
+                };
+                let k = k.min(1.0);
                 View {
                     pseudo: p.pseudo.clone(),
-                    pos: Vec3::from(prev.pos).lerp(Vec3::from(p.pos), k),
+                    pos: Vec3::from(prev.pos).lerp(Vec3::from(p.pos), kp),
                     yaw: lerp_angle(prev.yaw, p.yaw),
                     pitch: prev.pitch + (p.pitch - prev.pitch) * k,
                     crouch: prev.crouch + (p.crouch - prev.crouch) * k,
@@ -3388,6 +3605,49 @@ mod tests {
     use minelib_net::game::FpsMap;
     use minelib_world::{BlockId, ChunkPos};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn doors_open_only_if_the_map_allows_it_and_within_reach() {
+        let reg = minelib_world::registry::registry();
+        let lower = reg.by_key("door_wood:lower:1").unwrap();
+        let upper = reg.by_key("door_wood:upper:1").unwrap();
+        let mut world = floor();
+        world.set(5, 11, 5, lower);
+        world.set(5, 12, 5, upper);
+        let feet = Some(Vec3::new(5.5, 11.0, 7.5));
+        let mut map = FpsMap::default();
+        let mut m = Match::new(map.clone(), [0; 32], 1);
+        assert!(
+            use_door(&mut m, &world, feet, true, [5, 11, 5], 5).is_empty(),
+            "carte sans portes"
+        );
+        map.set_doors(true);
+        assert_eq!(
+            map.players(),
+            10,
+            "le réglage ne change pas le nombre de joueurs"
+        );
+        let mut m = Match::new(map, [0; 32], 1);
+        let far = Some(Vec3::new(5.5, 11.0, 20.0));
+        assert!(
+            use_door(&mut m, &world, far, true, [5, 11, 5], 5).is_empty(),
+            "trop loin"
+        );
+        assert!(
+            use_door(&mut m, &world, feet, false, [5, 11, 5], 5).is_empty(),
+            "mort"
+        );
+        let open = use_door(&mut m, &world, feet, true, [5, 11, 5], 5);
+        assert_eq!(open.len(), 2, "les deux moitiés");
+        assert_eq!(m.doors.len(), 2);
+        assert!(open.iter().all(|&(_, b)| b != lower.0 && b != upper.0));
+        // Fermée par la moitié du haut, avant même que le monde ait changé : chaque moitié
+        // retrouve son bloc d'origine.
+        let mut close = use_door(&mut m, &world, feet, true, [5, 12, 5], 5);
+        close.sort();
+        assert_eq!(close, vec![([5, 11, 5], lower.0), ([5, 12, 5], upper.0)]);
+        assert!(m.doors.is_empty());
+    }
 
     fn floor() -> World {
         let mut w = World::new(0);
@@ -3458,7 +3718,7 @@ mod tests {
         };
         gc.send(Cmd::Join(room));
         wait(&gc, |e| matches!(e, Event::Joined { .. }));
-        let world = floor();
+        let mut world = floor();
         let hash = [1u8; 32];
         let spawn = Vec3::new(8.5, 11.0, 8.5);
         let mut host = NetGame::host(hl, "Hote".into(), FpsMap::default(), hash, spawn);
@@ -3480,7 +3740,7 @@ mod tests {
                         }
                     }
                     Event::FromPeer { peer, data } => {
-                        for l in host.receive(Some(peer), &data, &world) {
+                        for l in host.receive(Some(peer), &data, &mut world) {
                             if let Local::SetHp(hp) = l {
                                 host_hp = hp;
                             }
@@ -3492,7 +3752,7 @@ mod tests {
             if let Some(g) = &mut guest {
                 while let Some(e) = gc.poll() {
                     if let Event::FromHost(data) = e {
-                        for l in g.receive(None, &data, &world) {
+                        for l in g.receive(None, &data, &mut world) {
                             if let Local::Respawn { state, .. } = l {
                                 guest_p.set_net_state(&state);
                                 guest_start = Some(guest_p.pos);
@@ -3640,7 +3900,7 @@ mod tests {
             players: 10,
         });
         wait(&gc, |e| matches!(e, Event::Joined { .. }));
-        let world = floor();
+        let mut world = floor();
         let spawn = Vec3::new(8.5, 11.0, 8.5);
         let mut host = NetGame::host(hl, "Hote".into(), FpsMap::default(), sig, spawn);
         let mut guest = NetGame::guest(gl, sig);
@@ -3658,7 +3918,7 @@ mod tests {
                 match e {
                     Event::PeerJoined { peer, pseudo, .. } => host.peer_joined(peer, pseudo),
                     Event::FromPeer { peer, data } => {
-                        host.receive(Some(peer), &data, &world);
+                        host.receive(Some(peer), &data, &mut world);
                     }
                     _ => {}
                 }
@@ -3666,7 +3926,7 @@ mod tests {
             while let Some(e) = gc.poll() {
                 match e {
                     Event::FromHost(data) => {
-                        guest.receive(None, &data, &world);
+                        guest.receive(None, &data, &mut world);
                     }
                     Event::Promoted { members, .. } => promoted = Some(members),
                     _ => {}
@@ -3712,7 +3972,7 @@ mod tests {
     #[test]
     fn the_auditor_replays_moves_and_catches_a_cheating_host() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let world = floor();
+        let mut world = floor();
         let spawn = Vec3::new(8.5, 11.0, 8.5);
         let mut g = NetGame::host(tx, "Hote".into(), FpsMap::default(), [0; 32], spawn);
         g.peer_joined(7, "Invite".into());
@@ -3759,22 +4019,22 @@ mod tests {
         };
         let b2 = h.make_backup(&local);
         assert!(!b2.log.is_empty());
-        let c = audit(&b1, &b2, &world);
+        let c = audit(&b1, &b2, &mut world);
         assert!(c.is_empty(), "partie honnête : {c:?}");
         // L'hôte se téléporte (sans entrée qui l'explique) : preuve.
         let mut tele = game::decode::<Backup>(&game::encode(&b2)).unwrap();
         tele.players.iter_mut().find(|p| p.0 == 0).unwrap().2.pos[0] += 3.0;
-        let c = audit(&b1, &tele, &world);
+        let c = audit(&b1, &tele, &mut world);
         assert!(c.iter().any(|c| c.player == 0 && c.proof));
         // L'hôte déplace un invité : désaccord à juger par l'invité.
         let mut moved = game::decode::<Backup>(&game::encode(&b2)).unwrap();
         moved.players.iter_mut().find(|p| p.0 == 7).unwrap().2.pos[2] -= 2.0;
-        let c = audit(&b1, &moved, &world);
+        let c = audit(&b1, &moved, &mut world);
         assert!(c.iter().any(|c| c.player == 7 && !c.proof && c.seq > 0));
         // Coup effacé du journal : chaîne fausse.
         let mut cut = game::decode::<Backup>(&game::encode(&b2)).unwrap();
         cut.log.remove(5);
-        assert!(audit(&b1, &cut, &world).iter().any(|c| c.proof));
+        assert!(audit(&b1, &cut, &mut world).iter().any(|c| c.proof));
     }
 
     /// Une vraie partie à 10 joueurs par le relais, jusqu'au bout : 5 contre 5, tirs,
@@ -3816,7 +4076,7 @@ mod tests {
             Event::Hosted(r) => r,
             _ => unreachable!(),
         };
-        let world = floor();
+        let mut world = floor();
         let hash = [1u8; 32];
         let spawn = Vec3::new(8.5, 11.0, 8.5);
         let mut host = NetGame::host(hl, "Hote".into(), FpsMap::default(), hash, spawn);
@@ -3882,7 +4142,7 @@ mod tests {
                                 b.net.witness(peer, &data);
                             }
                         }
-                        for l in host.receive(Some(peer), &data, &world) {
+                        for l in host.receive(Some(peer), &data, &mut world) {
                             match l {
                                 Local::Started => started = true,
                                 Local::GameOver(s) => host_over = Some(s),
@@ -3897,7 +4157,7 @@ mod tests {
             for b in &mut bots {
                 while let Some(e) = b.c.poll() {
                     if let Event::FromHost(data) = e {
-                        for l in b.net.receive(None, &data, &world) {
+                        for l in b.net.receive(None, &data, &mut world) {
                             match l {
                                 Local::Respawn { state, .. } => b.p.set_net_state(&state),
                                 Local::GameOver(_) => b.over = true,
@@ -4059,7 +4319,7 @@ mod tests {
             for b in &mut bots {
                 while let Some(e) = b.c.poll() {
                     if let Event::FromHost(data) = e {
-                        b.net.receive(None, &data, &world);
+                        b.net.receive(None, &data, &mut world);
                     }
                 }
                 conflicts.extend(b.net.take_conflicts());
@@ -4114,11 +4374,13 @@ mod tests {
     fn the_auditor_catches_fake_hits_damage_and_scores() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let world = floor();
+        // Monde à part pour le vérificateur (il y remet les portes de chaque copie).
+        let mut aw = floor();
         let spawn = Vec3::new(8.5, 11.0, 8.5);
         let mut g = NetGame::host(tx, "Hote".into(), FpsMap::default(), [0; 32], spawn);
         g.peer_joined(7, "Invite".into());
         let hello = game::encode(&ToHost::Hello { map_hash: [0; 32] });
-        g.receive(Some(7), &hello, &world);
+        g.receive(Some(7), &hello, &mut aw);
         let dt = crate::session::SIM_TICK;
         let mut local = Player::new(Vec3::new(4.5, 11.0, 4.5));
         let idle = MoveInput {
@@ -4167,17 +4429,17 @@ mod tests {
             blind: false,
         };
         a.witness(7, fire.clone());
-        g.receive(Some(7), &game::encode(&fire), &world);
+        g.receive(Some(7), &game::encode(&fire), &mut aw);
         run(&mut g, &mut local, 100);
         let b1 = backup(&mut g, &local);
-        assert!(a.audit(&b0, &b1, &world).is_empty());
+        assert!(a.audit(&b0, &b1, &mut aw).is_empty());
         assert!(host(&mut g).m.players[&0].hp < 100, "l'hôte est touché");
         // Dégâts qui ne viennent d'aucun coup du journal : règles différentes.
         run(&mut g, &mut local, 50);
         let _ = host(&mut g).m.hurt(Some(7), 0, 30, Hurt::Knife);
         run(&mut g, &mut local, 50);
         let b2 = backup(&mut g, &local);
-        let c = a.audit(&b1, &b2, &world);
+        let c = a.audit(&b1, &b2, &mut aw);
         assert!(why(&c).iter().any(|w| w.starts_with("règles")), "{c:?}");
         // Le troisième garant (arbitre) rejoue les mêmes pièces, gardées par le relais :
         // rien à reprocher tant que l'hôte est honnête, coupable avec les faux dégâts.
@@ -4198,10 +4460,10 @@ mod tests {
             view_tick: host(&mut g).tick,
             blind: false,
         };
-        g.receive(Some(7), &game::encode(&fake), &world);
+        g.receive(Some(7), &game::encode(&fake), &mut aw);
         run(&mut g, &mut local, 100);
         let b3 = backup(&mut g, &local);
-        let c = a.audit(&b2, &b3, &world);
+        let c = a.audit(&b2, &b3, &mut aw);
         assert!(why(&c).contains(&"demande inventée par l'hôte"), "{c:?}");
         // Tir de l'invité que l'hôte « oublie » : signalé quelques copies plus tard.
         a.witness(7, fake.clone());
@@ -4210,7 +4472,7 @@ mod tests {
         for _ in 0..=WITNESS_LATE + 1 {
             run(&mut g, &mut local, 50);
             let b = backup(&mut g, &local);
-            found |= why(&a.audit(&prev, &b, &world))
+            found |= why(&a.audit(&prev, &b, &mut aw))
                 .contains(&"demande d'un joueur ignorée par l'hôte");
             prev = b;
         }
@@ -4218,7 +4480,7 @@ mod tests {
         // Explosion d'une HE que personne n'a lancée, longtemps après le début du suivi.
         run(&mut g, &mut local, 4 * 256);
         let b4 = backup(&mut g, &local);
-        let _ = a.audit(&prev, &b4, &world);
+        let _ = a.audit(&prev, &b4, &mut aw);
         let nades = NadeOut {
             blasts: vec![(local.pos + Vec3::Y, 7)],
             ..Default::default()
@@ -4226,13 +4488,13 @@ mod tests {
         g.end_frame(&world, Vec::new(), 255, nades, dt);
         run(&mut g, &mut local, 20);
         let b5 = backup(&mut g, &local);
-        let c = a.audit(&b4, &b5, &world);
+        let c = a.audit(&b4, &b5, &mut aw);
         assert!(why(&c).contains(&"explosion sans grenade"), "{c:?}");
         // Éliminations ajoutées à la main dans la copie.
         run(&mut g, &mut local, 20);
         let mut b6 = backup(&mut g, &local);
         b6.m.players.get_mut(&7).unwrap().kills += 5;
-        let c = a.audit(&b5, &b6, &world);
+        let c = a.audit(&b5, &b6, &mut aw);
         assert!(why(&c).iter().any(|w| w.starts_with("règles")), "{c:?}");
     }
 

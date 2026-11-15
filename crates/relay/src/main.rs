@@ -10,7 +10,11 @@
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        "info,mainline=error,iroh=warn,iroh_relay=warn,iroh_quinn=warn,iroh_quinn_proto=warn,\
+         quinn=warn,quinn_proto=warn,tracing=warn,portmapper=warn,netwatch=warn,pkarr=warn",
+    ))
+    .init();
     let mut cfg = minelib_relay::Config {
         dir: "relay_data".into(),
         bind: format!("0.0.0.0:{}", minelib_net::DEFAULT_PORT),

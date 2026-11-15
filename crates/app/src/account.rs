@@ -20,6 +20,11 @@ use crate::menu::{self, Ctx, GOLD, GREY, RED, WHITE};
 /// Nœud iroh du jeu (un seul, gardé pour la durée du jeu). Son identité est gardée à côté
 /// du dossier du relais (`noeud.key`) : la même à chaque lancement.
 fn node(dir: &std::path::Path) -> Option<&'static minelib_p2p::Node> {
+    p2p_node(dir)
+}
+
+/// Nœud iroh du jeu (voir `node`), pour les relais de région.
+pub(crate) fn p2p_node(dir: &std::path::Path) -> Option<&'static minelib_p2p::Node> {
     static NODE: std::sync::OnceLock<Option<minelib_p2p::Node>> = std::sync::OnceLock::new();
     NODE.get_or_init(|| {
         let path = dir.with_file_name("noeud.key");
@@ -693,6 +698,7 @@ impl Accounts {
                 | Event::Evidence { .. }
                 | Event::Kicked(_)
                 | Event::Slain(_)
+                | Event::SetGamemode { .. }
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)
                 | Event::MapDownloaded { .. }
@@ -711,6 +717,9 @@ impl Accounts {
                 | Event::GarantTask { .. }
                 | Event::BackupIs(_)
                 | Event::BuildGarant(_)
+                | Event::ShardTask { .. }
+                | Event::Shards(_)
+                | Event::ShardTicket { .. }
                 | Event::Judge { .. }
                 | Event::Voice { .. }
                 | Event::HostChanged(_)
@@ -728,6 +737,11 @@ impl Accounts {
         }
     }
 
+    /// Dossier du relais (le nœud iroh du jeu est gardé à côté).
+    pub fn relay_dir(&self) -> PathBuf {
+        self.relay_dir.clone()
+    }
+
     /// De quoi ouvrir une deuxième connexion du compte, de garant : relais joint,
     /// identifiants de la session, appareil de confiance (pas de 2FA à redemander).
     pub fn garant_login(&self) -> Option<crate::garant_worker::Login> {
@@ -743,6 +757,7 @@ impl Accounts {
             pseudo,
             password,
             device,
+            node_dir: Some(self.relay_dir.clone()),
         })
     }
 

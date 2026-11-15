@@ -215,14 +215,15 @@ pub fn frame_end() {
         }
 
         // Chute : image au moins 2 × plus longue que la moyenne et 2 ms de plus.
-        let slow = warm && dt > (avg * 2.0).max(avg + 0.002);
+        let slow = warm && dt > (avg * 2.0).max(avg + 0.004);
         if slow {
             p.window_slow += 1;
             let now = Instant::now();
-            if now.duration_since(p.slow_logged.0) > Duration::from_secs(1) {
+            // Au plus 2 lignes toutes les 5 s : le journal ne doit pas peser sur le jeu.
+            if now.duration_since(p.slow_logged.0) > Duration::from_secs(5) {
                 p.slow_logged = (now, 0);
             }
-            if p.slow_logged.1 < 5 {
+            if p.slow_logged.1 < 2 {
                 p.slow_logged.1 += 1;
                 let gpu = p.gpu_last.map_or(String::new(), |g| {
                     format!(" | GPU (dernière mesure) : scène {:.2}, TAA {:.2}, affichage {:.2} ms", g.scene, g.taa, g.present)

@@ -158,6 +158,82 @@ pub fn stairs_boxes(dir: u8, top: bool) -> Vec<([u8; 3], [u8; 3])> {
     vec![slab, step]
 }
 
+/// Escalier relié à ses voisins, comme dans Minecraft : un escalier dont le voisin de
+/// derrière (côté haut) est un escalier tourné à angle droit devient un coin extérieur (la
+/// marche n'occupe plus qu'un quart) ; si c'est le voisin de devant, un coin intérieur (la
+/// marche en L). `at(dx, dz)` : l'escalier voisin (sens, en haut), s'il y en a un.
+pub fn stairs_connected(
+    dir: u8,
+    top: bool,
+    at: impl Fn(i32, i32) -> Option<(u8, bool)>,
+) -> Vec<([u8; 3], [u8; 3])> {
+    let off = |d: u8| match d {
+        0 => (1, 0),
+        1 => (-1, 0),
+        2 => (0, 1),
+        _ => (0, -1),
+    };
+    let opp = |d: u8| d ^ 1;
+    let axis = |d: u8| d / 2;
+    // Moitié du bloc (x0, z0, x1, z1) du côté d.
+    let half = |d: u8| -> [u8; 4] {
+        match d {
+            0 => [8, 0, 16, 16],
+            1 => [0, 0, 8, 16],
+            2 => [0, 8, 16, 16],
+            _ => [0, 0, 16, 8],
+        }
+    };
+    let inter = |a: [u8; 4], b: [u8; 4]| {
+        [
+            a[0].max(b[0]),
+            a[1].max(b[1]),
+            a[2].min(b[2]),
+            a[3].min(b[3]),
+        ]
+    };
+    let mut boxes = stairs_boxes(dir, top);
+    let (y0, y1) = (boxes[1].0[1], boxes[1].1[1]);
+    let to_box = |r: [u8; 4]| ([r[0], y0, r[1]], [r[2], y1, r[3]]);
+    // Le voisin dans le sens `d` n'est pas un escalier tourné pareil.
+    let free = |d: u8| {
+        let (dx, dz) = off(d);
+        at(dx, dz) != Some((dir, top))
+    };
+    let (bx, bz) = off(dir);
+    if let Some((d, t)) = at(bx, bz) {
+        if t == top && axis(d) != axis(dir) && free(opp(d)) {
+            boxes[1] = to_box(inter(half(dir), half(d)));
+            return boxes;
+        }
+    }
+    let (fx, fz) = off(opp(dir));
+    if let Some((d, t)) = at(fx, fz) {
+        if t == top && axis(d) != axis(dir) && free(d) {
+            boxes.push(to_box(inter(half(opp(dir)), half(d))));
+        }
+    }
+    boxes
+}
+
+/// Boîtes du bloc `id` placé dans le monde : sa forme, escalier relié à ses voisins
+/// (`get(dx, dy, dz)` : bloc voisin).
+pub fn placed_boxes(
+    id: BlockId,
+    get: impl Fn(i32, i32, i32) -> BlockId,
+) -> Vec<([u8; 3], [u8; 3])> {
+    let def = id.def();
+    match def.shape {
+        Shape::Stairs { dir, top } => {
+            stairs_connected(dir, top, |dx, dz| match get(dx, 0, dz).def().shape {
+                Shape::Stairs { dir, top } => Some((dir, top)),
+                _ => None,
+            })
+        }
+        _ => def.boxes(),
+    }
+}
+
 pub fn post_center(k: PostKind) -> ([u8; 3], [u8; 3]) {
     match k {
         PostKind::Fence => ([6, 0, 6], [10, 16, 10]),
@@ -1211,7 +1287,8 @@ fn build() -> Registry {
                 y1: 16,
             },
             &[p("ladder"), p("ladder"), p("ladder")],
-            DECOR,
+            // Solide (on s'y appuie, on la vise), et on y grimpe (voir le joueur).
+            PART,
         );
         b.add(
             format!("wall_sign:{side}"),
@@ -2188,6 +2265,42 @@ pub fn door_key(i: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stairs_turn_corners_like_minecraft() {
+        // Seul : marche droite.
+        assert_eq!(
+            stairs_connected(0, false, |_, _| None),
+            stairs_boxes(0, false)
+        );
+        // Derrière (côté haut, +X), un escalier tourné vers +Z : coin extérieur, la marche
+        // n'est plus qu'un quart.
+        let outer = stairs_connected(0, false, |dx, dz| {
+            ((dx, dz) == (1, 0)).then_some((2, false))
+        });
+        assert_eq!(
+            outer,
+            vec![([0, 0, 0], [16, 8, 16]), ([8, 8, 8], [16, 16, 16])]
+        );
+        // Devant (−X), un escalier tourné vers +Z : coin intérieur, marche en L.
+        let inner = stairs_connected(0, false, |dx, dz| {
+            ((dx, dz) == (-1, 0)).then_some((2, false))
+        });
+        assert_eq!(
+            inner,
+            vec![
+                ([0, 0, 0], [16, 8, 16]),
+                ([8, 8, 0], [16, 16, 16]),
+                ([0, 8, 8], [8, 16, 16])
+            ]
+        );
+        // Moitiés différentes (haut / bas) : pas de coin.
+        let other = stairs_connected(0, false, |dx, dz| ((dx, dz) == (1, 0)).then_some((2, true)));
+        assert_eq!(other, stairs_boxes(0, false));
+        // Escalier du haut (à l'envers) : même coin, marche en bas.
+        let up = stairs_connected(0, true, |dx, dz| ((dx, dz) == (1, 0)).then_some((3, true)));
+        assert_eq!(up[1], ([8, 0, 0], [16, 8, 8]));
+    }
 
     #[test]
     fn base_ids_are_stable() {

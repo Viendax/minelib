@@ -39,7 +39,11 @@ pub fn load(dir: &Path) -> FpsMap {
             continue;
         };
         if k.trim() == "joueurs" {
-            m.max_players = v.trim().parse().unwrap_or(0);
+            m.set_players(v.trim().parse().unwrap_or(0));
+            continue;
+        }
+        if k.trim() == "portes" {
+            m.set_doors(v.trim() == "1");
             continue;
         }
         let z = parse_zone(v);
@@ -67,8 +71,12 @@ pub fn save(dir: &Path, m: &FpsMap) -> Result<()> {
     put("a", &m.sites[0]);
     put("b", &m.sites[1]);
     put("c", &m.sites[2]);
-    if m.max_players != 0 && m.max_players != 10 {
-        s += &format!("joueurs={}\n", m.max_players);
+    let n = m.chosen_players();
+    if n != 0 && n != 10 {
+        s += &format!("joueurs={n}\n");
+    }
+    if m.doors() {
+        s += "portes=1\n";
     }
     fs::write(dir.join(FILE), s)?;
     Ok(())

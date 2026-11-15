@@ -6,6 +6,16 @@ use minelib_world::registry::{post_arms, Shape};
 use minelib_world::World;
 
 pub const HALF_WIDTH: f32 = 0.3;
+
+/// Le joueur dont les pieds sont en `feet` est dans l'eau (pieds ou corps) : elle amortit
+/// toute chute.
+pub fn in_water(world: &World, feet: Vec3) -> bool {
+    let water = minelib_world::registry::registry().by_key("water");
+    let (x, z) = (feet.x.floor() as i32, feet.z.floor() as i32);
+    [0.05, 0.9]
+        .iter()
+        .any(|dy| Some(world.get(x, (feet.y + dy).floor() as i32, z)) == water)
+}
 pub const HEIGHT: f32 = 1.8;
 pub const EYE: f32 = 1.62;
 
@@ -73,6 +83,9 @@ const FLY_SPRINT: f32 = 30.0;
 const TOUCH: f32 = 1e-4;
 /// Hauteur franchie sans sauter (dalles, marches d'escalier).
 const STEP_HEIGHT: f32 = 0.6;
+/// Vitesse sur une échelle (blocs/s), et élan quand on saute pour s'en décrocher.
+const LADDER_SPEED: f32 = 2.6;
+const LADDER_PUSH: f32 = 3.0;
 
 #[derive(Clone)]
 pub struct Player {
@@ -102,6 +115,8 @@ pub struct Player {
     pub others: Vec<Other>,
     /// Atterri sur un joueur déjà perché sur un autre : on glisse de sa tête (son centre).
     slide: Option<Vec3>,
+    /// Accroché à une échelle (pas de chute : on y monte et descend).
+    pub on_ladder: bool,
 }
 
 /// Un autre joueur, vu comme un obstacle.
@@ -165,6 +180,7 @@ impl Player {
             sneak_was_held: false,
             others: Vec::new(),
             slide: None,
+            on_ladder: false,
             carry: 250,
         }
     }
@@ -235,6 +251,25 @@ impl Player {
         (self.pos - h, self.pos + h + Vec3::Y * HEIGHT)
     }
 
+    /// Échelle touchée (côté du mur où elle est accrochée : 0 +X, 1 −X, 4 +Z, 5 −Z).
+    fn ladder(&self, world: &World) -> Option<u8> {
+        let (min, max) = self.bounds();
+        let pad = Vec3::new(0.1, 0.0, 0.1);
+        let lo = (min - pad).floor().as_ivec3();
+        let hi = (max + pad - Vec3::splat(TOUCH)).floor().as_ivec3();
+        for y in lo.y..=hi.y {
+            for z in lo.z..=hi.z {
+                for x in lo.x..=hi.x {
+                    let key: &str = &world.get(x, y, z).def().key;
+                    if let Some(side) = key.strip_prefix("ladder:") {
+                        return side.parse().ok();
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn update(&mut self, world: &World, m: &MoveInput, dt: f32) {
         let (sy, cy) = self.yaw.sin_cos();
         let fwd = Vec3::new(sy, 0.0, -cy);
@@ -283,6 +318,43 @@ impl Player {
             self.vel.y = self.vel.y.max(-60.0);
             if m.jump && self.on_ground {
                 self.vel.y = JUMP_SPEED;
+            }
+        }
+        // Échelle (comme dans CS) : vers l'avant on monte, ou on descend en regardant vers
+        // le bas ; sans rien, on reste accroché ; un saut nous en décroche.
+        self.on_ladder = false;
+        if !self.flying && !self.noclip {
+            if let Some(side) = self.ladder(world) {
+                let wall = match side {
+                    0 => Vec3::X,
+                    1 => -Vec3::X,
+                    4 => Vec3::Z,
+                    _ => -Vec3::Z,
+                };
+                if m.jump_pressed && !self.on_ground {
+                    self.vel = -wall * LADDER_PUSH + Vec3::Y * LADDER_SPEED * 0.6;
+                } else {
+                    self.on_ladder = true;
+                    let down = self.pitch < -0.35;
+                    let climb = if m.forward == 0.0 {
+                        0.0
+                    } else if down {
+                        -m.forward.signum()
+                    } else {
+                        m.forward.signum()
+                    };
+                    self.vel.y = if climb < 0.0 && self.on_ground {
+                        0.0
+                    } else {
+                        climb * LADDER_SPEED
+                    };
+                    let flat = Vec3::new(self.vel.x, 0.0, self.vel.z);
+                    if flat.length() > LADDER_SPEED {
+                        let f = flat.normalize() * LADDER_SPEED;
+                        self.vel.x = f.x;
+                        self.vel.z = f.z;
+                    }
+                }
             }
         }
         let fall_speed = -self.vel.y;
@@ -483,12 +555,16 @@ impl Player {
         if (was_on_ground || self.on_ground) && !self.flying {
             let blocked = self.pos;
             self.pos = before;
-            if !self.move_axis(world, 1, STEP_HEIGHT) {
+            // On monte autant que le plafond le permet (une marche basse passe sous un
+            // plafond bas : il suffit qu'on tienne debout dessus).
+            self.move_axis(world, 1, STEP_HEIGHT);
+            let raised = self.pos.y - before.y;
+            if raised > 1e-4 {
                 self.move_axis(world, axis, d);
                 if (self.pos[axis] - before[axis]).abs()
                     > (blocked[axis] - before[axis]).abs() + 1e-4
                 {
-                    self.move_axis(world, 1, -STEP_HEIGHT);
+                    self.move_axis(world, 1, -raised);
                     self.on_ground = true;
                     return;
                 }
@@ -601,7 +677,9 @@ fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec3, Vec3)> {
     if !def.solid {
         return Vec::new();
     }
-    let mut boxes = def.boxes();
+    let mut boxes = minelib_world::registry::placed_boxes(world.get(x, y, z), |dx, dy, dz| {
+        world.get(x + dx, y + dy, z + dz)
+    });
     if let Shape::Post(kind) = def.shape {
         for (side, dx, dz) in [(0u8, 1, 0), (1, -1, 0), (4, 0, 1), (5, 0, -1)] {
             let n = world.get(x + dx, y, z + dz).def();
@@ -807,6 +885,106 @@ mod tests {
         }
         assert!(stepped);
         assert_eq!(p.pos.y, 11.0, "descendu de la dalle");
+    }
+
+    #[test]
+    fn steps_onto_a_low_step_under_a_low_ceiling() {
+        // Plafond à 2 blocs du sol, marche basse et solide (≤ 3/16) à droite : il reste
+        // assez de place pour un joueur de 1,8 : on y passe en marchant, sans sauter.
+        let reg = minelib_world::registry::registry();
+        let (low, top) = reg
+            .defs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.solid && !d.full)
+            .filter_map(|(i, d)| {
+                let b = d.boxes();
+                let full = b
+                    .iter()
+                    .any(|(a, c)| a[0] == 0 && a[2] == 0 && c[0] == 16 && c[2] == 16);
+                let h = b.iter().map(|(_, c)| c[1]).max()?;
+                (full && b.iter().all(|(a, _)| a[1] == 0) && (1..=3).contains(&h))
+                    .then_some((BlockId(i as u16), h as f32 / 16.0))
+            })
+            .next()
+            .expect("une marche basse et solide");
+        let mut w = flat_world();
+        for z in 0..16 {
+            for x in 0..16 {
+                w.set(x, 13, z, BlockId::STONE);
+            }
+            for x in 10..16 {
+                w.set(x, 11, z, low);
+            }
+        }
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        p.yaw = std::f32::consts::FRAC_PI_2; // vers +X
+        let m = MoveInput {
+            forward: 1.0,
+            ..Default::default()
+        };
+        let dt = 1.0 / 144.0;
+        for _ in 0..(2.0 / dt) as usize {
+            p.update(&w, &m, dt);
+            if p.pos.x > 12.0 {
+                break;
+            }
+        }
+        assert!(
+            p.pos.x > 12.0,
+            "bloqué en x = {} (y = {})",
+            p.pos.x,
+            p.pos.y
+        );
+        assert!((p.pos.y - (11.0 + top)).abs() < 1e-3, "y = {}", p.pos.y);
+    }
+
+    #[test]
+    fn climbs_and_descends_ladders_like_cs() {
+        let reg = minelib_world::registry::registry();
+        let ladder = reg.by_key("ladder:0").unwrap();
+        let mut w = flat_world();
+        for y in 11..18 {
+            for z in 0..16 {
+                w.set(10, y, z, BlockId::STONE); // le mur
+            }
+            w.set(9, y, 8, ladder);
+        }
+        for fps in [false, true] {
+            let mut p = Player::new(Vec3::new(9.5, 11.0, 8.5));
+            p.yaw = std::f32::consts::FRAC_PI_2; // vers +X (le mur)
+            let dt = 1.0 / 64.0;
+            let up = MoveInput {
+                forward: 1.0,
+                fps,
+                ..Default::default()
+            };
+            for _ in 0..64 {
+                p.update(&w, &up, dt);
+            }
+            assert!(p.on_ladder, "fps {fps}");
+            assert!(p.pos.y > 12.5, "monte (fps {fps}) : y = {}", p.pos.y);
+            // Rien : on reste accroché.
+            let y = p.pos.y;
+            let still = MoveInput {
+                fps,
+                ..Default::default()
+            };
+            for _ in 0..64 {
+                p.update(&w, &still, dt);
+            }
+            assert!((p.pos.y - y).abs() < 0.05, "accroché (fps {fps})");
+            // En regardant vers le bas : on descend jusqu'au sol, sans dégâts de chute.
+            p.pitch = -1.0;
+            for _ in 0..256 {
+                p.update(&w, &up, dt);
+            }
+            assert!(
+                (p.pos.y - 11.0).abs() < 1e-3,
+                "descend (fps {fps}) : y = {}",
+                p.pos.y
+            );
+        }
     }
 
     #[test]

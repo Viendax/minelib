@@ -951,7 +951,7 @@ impl Game {
                     }
                 }
                 Event::ServerAdmin(text) => {
-                    if let Some(s) = &mut self.session {
+                    if let Some(s) = self.session.as_mut().filter(|_| !text.is_empty()) {
                         s.chat.say(text, chat::YELLOW);
                     }
                 }
@@ -1540,7 +1540,9 @@ impl Game {
                 s.game.mode = save::GameMode::Creative;
             }
             s.voice = Some(voice::Voice::new(link.clone()));
-            s.build = Some(buildnet::BuildNet::new(link, pseudo.clone(), true));
+            let mut b = buildnet::BuildNet::new(link, pseudo.clone(), true);
+            b.set_node_dir(self.accounts.relay_dir());
+            s.build = Some(b);
         }
         self.accounts.room(minelib_net::client::Cmd::Host {
             kind: 1,
@@ -1568,10 +1570,18 @@ impl Game {
         if let Some(s) = &mut self.session {
             s.game.mode = save::GameMode::Creative;
             s.voice = Some(voice::Voice::new(link.clone()));
-            s.build = Some(buildnet::BuildNet::new(link, pseudo, false));
+            let mut b = buildnet::BuildNet::new(link, pseudo, false);
+            b.set_node_dir(self.accounts.relay_dir());
+            s.build = Some(b);
             s.chat
                 .say(format!("Monde de {host} rejoint."), chat::YELLOW);
         }
+        // Mode de jeu par défaut du serveur (si l'on n'en est pas OP).
+        self.accounts.room(minelib_net::client::Cmd::ServerAdmin {
+            action: minelib_net::proto::SERVER_GAMEMODE_QUERY,
+            pseudo: String::new(),
+            reason: String::new(),
+        });
     }
 
     /// Réponses du relais, et options à enregistrer (clé du relais, dernier pseudo).
@@ -3146,8 +3156,13 @@ fn main() -> anyhow::Result<()> {
     let file = std::fs::File::create(&log_path).ok();
     let latest = std::fs::File::create(dir.join("minelib.log")).ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
-        // DHT (mainline) : une ligne par nœud injoignable, des centaines par seconde.
-        "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,mainline=error",
+        // DHT (mainline) : une ligne par nœud injoignable, des centaines par seconde. Iroh
+        // (tunnels) : une ligne par paquet envoyé (« poll_send », « tx »), écrite pendant
+        // l'envoi : des centaines par seconde en partie, qui ralentissaient le réseau.
+        "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,mainline=error,iroh=warn,iroh_relay=warn,\
+         iroh_quinn=warn,iroh_quinn_proto=warn,quinn=warn,quinn_proto=warn,tracing=warn,\
+         portmapper=warn,netwatch=warn,n0_watcher=warn,hickory_proto=warn,hickory_resolver=warn,\
+         swarm_discovery=warn,pkarr=warn",
     ))
     .target(env_logger::Target::Pipe(Box::new(Tee(file, latest))))
     .init();

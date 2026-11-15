@@ -30,6 +30,8 @@ pub struct Store {
     path: PathBuf,
     servers: HashMap<String, Admin>,
     whitelists: HashMap<String, Whitelist>,
+    /// Mode de jeu par défaut de chaque serveur (fichier `….defaults`).
+    defaults: HashMap<String, String>,
 }
 
 /// Clé d'un serveur : son créateur et son monde.
@@ -53,6 +55,10 @@ pub enum Action {
     WhitelistAdd,
     WhitelistRemove,
     WhitelistList,
+    /// Changer de mode de jeu (OP) : `target` = qui, `reason` = le mode.
+    Gamemode,
+    /// Mode de jeu par défaut à l'arrivée (OP) : `reason` = le mode (vide : aucun).
+    DefaultGamemode,
 }
 
 impl Store {
@@ -65,11 +71,22 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let defaults = std::fs::read(path.with_extension("defaults"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Self {
             path,
             servers,
             whitelists,
+            defaults,
         }
+    }
+
+    /// Mode de jeu par défaut du serveur (donné aux joueurs qui ne sont pas OP à leur
+    /// arrivée).
+    pub fn default_gamemode(&self, server: &str) -> Option<String> {
+        self.defaults.get(server).cloned()
     }
 
     fn wl_path(path: &std::path::Path) -> PathBuf {
@@ -82,6 +99,9 @@ impl Store {
         }
         if let Ok(b) = postcard::to_allocvec(&self.whitelists) {
             let _ = crate::accounts::write_atomic(&Self::wl_path(&self.path), &b);
+        }
+        if let Ok(b) = postcard::to_allocvec(&self.defaults) {
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("defaults"), &b);
         }
     }
 
@@ -131,6 +151,28 @@ impl Store {
     ) -> Result<String, String> {
         if !self.is_op(server, creator, by) {
             return Err("Réservé aux OP de ce serveur.".into());
+        }
+        let mode: String = reason.chars().take(16).collect();
+        match action {
+            Action::Gamemode => {
+                return Ok(if target.is_empty() || target.eq_ignore_ascii_case(by) {
+                    format!("Mode de jeu : {mode}.")
+                } else {
+                    format!("{target} passe en mode {mode}.")
+                })
+            }
+            Action::DefaultGamemode => {
+                let msg = if mode.is_empty() {
+                    self.defaults.remove(server);
+                    "Plus de mode de jeu par défaut : chacun garde le sien.".to_string()
+                } else {
+                    self.defaults.insert(server.to_string(), mode.clone());
+                    format!("Mode de jeu par défaut : {mode} (pour qui n'est pas OP, à l'arrivée).")
+                };
+                self.save();
+                return Ok(msg);
+            }
+            _ => {}
         }
         let low = target.to_ascii_lowercase();
         let is_creator = target.eq_ignore_ascii_case(creator);
@@ -203,7 +245,9 @@ impl Store {
             | Action::WhitelistOff
             | Action::WhitelistAdd
             | Action::WhitelistRemove
-            | Action::WhitelistList => unreachable!("traité plus haut"),
+            | Action::WhitelistList
+            | Action::Gamemode
+            | Action::DefaultGamemode => unreachable!("traité plus haut"),
             Action::Ban if is_creator => return Err("On ne bannit pas le créateur.".into()),
             Action::Ban if by.eq_ignore_ascii_case(target) => {
                 return Err("On ne se bannit pas soi-même.".into())

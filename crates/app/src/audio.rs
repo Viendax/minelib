@@ -60,6 +60,10 @@ pub enum Sfx {
     Land,
     /// Cri de douleur (chute qui blesse), un des quatre à tour de rôle.
     Pain,
+    /// Plongeon dans l'eau.
+    Splash,
+    /// Porte ou trappe ouverte / fermée.
+    Door,
 }
 
 macro_rules! sounds {
@@ -76,6 +80,8 @@ static FILES: &[(&str, &[u8])] = sounds!(
     "step_5",
     "step_6",
     "land",
+    "splash",
+    "door",
     "pain_1",
     "pain_2",
     "pain_3",
@@ -276,6 +282,8 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
             (STEPS[n % 6], 0.45)
         }
         Sfx::Land => ("land", 0.75),
+        Sfx::Splash => ("splash", 0.8),
+        Sfx::Door => ("door", 0.8),
         Sfx::Pain => {
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             const PAINS: [&str; 4] = ["pain_1", "pain_2", "pain_3", "pain_4"];

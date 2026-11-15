@@ -936,12 +936,17 @@ impl Session {
         } else {
             keys.pressed(input, Action::Pick)
         };
+        let door_key = self.game.mode == GameMode::Fps && keys.pressed(input, Action::FpsUse);
         // Spectateur : on regarde seulement.
         if self.game.mode == GameMode::Spectator {
             return;
         }
         // Mode FPS : ni cassé ni posé ; la touche « Copier / ping » marque l'endroit visé.
         if self.game.mode == GameMode::Fps {
+            // Touche Utiliser sur une porte ou une trappe (si la carte le permet).
+            if door_key {
+                self.fps_door();
+            }
             if pick {
                 let eye = self.player.eye();
                 let dir = self.player.look_dir();
@@ -996,14 +1001,20 @@ impl Session {
             && !keys.held(input, Action::Sneak)
         {
             let look = self.player.look_dir();
-            let changes = toggle_hinged(&mut self.world, &mut self.opened, hit.block, look);
+            let changes = toggle_hinged(&self.world, &mut self.opened, hit.block, look);
+            if !changes.is_empty() {
+                self.fps.sounds.push((crate::audio::Sfx::Door, 0.0, 0.9));
+            }
             for (p, b) in changes {
                 self.dirty.extend(self.world.set(p[0], p[1], p[2], b));
             }
             self.place_cooldown = 0.22;
             return;
         }
-        if breaking && hit.id.is_breakable() {
+        // En créatif, comme dans Minecraft : même la bedrock et les barrières se cassent.
+        let breakable = hit.id.is_breakable()
+            || (self.game.mode == GameMode::Creative && hit.id.is_targetable());
+        if breaking && breakable {
             self.opened.remove(&hit.block);
             // Porte : les deux moitiés partent ensemble.
             if let Some(Hinged::Door { upper, .. }) = hinged(hit.id) {
@@ -1339,6 +1350,62 @@ impl Session {
         self.sim = Some(s);
     }
 
+    /// Change le mode de jeu du joueur.
+    pub fn set_mode(&mut self, mode: GameMode) {
+        self.game.mode = mode;
+        if mode.mortal() && !self.game.can_fly {
+            self.player.flying = false;
+        }
+        if mode == GameMode::Creative {
+            self.game.health = MAX_HEALTH;
+        }
+        if !mode.has_inventory() {
+            self.inventory.close();
+        }
+        if mode == GameMode::Spectator {
+            self.player.flying = true;
+        } else if self.player.noclip {
+            // Sortie du mode spectateur : vol gardé si permis, sinon on tombe.
+            self.player.noclip = false;
+            self.player.flying = mode == GameMode::Creative || self.game.can_fly;
+        }
+        self.fall_from = None;
+        self.chat
+            .say(format!("Mode de jeu : {}", mode.label()), chat::YELLOW);
+    }
+
+    /// Mode FPS : ouvre ou ferme la porte / trappe visée (l'hôte en décide en ligne).
+    fn fps_door(&mut self) {
+        let eye = self.player.eye();
+        let dir = self.player.look_dir();
+        let reach = crate::netgame::DOOR_REACH;
+        let Some(h) = raycast(&self.world, eye.into(), dir.into(), reach) else {
+            return;
+        };
+        if hinged(h.id).is_none() {
+            return;
+        }
+        let side = side_toward(dir);
+        if let Some(n) = &mut self.net {
+            if !self.net_dead {
+                let l = n.use_door(&self.world, h.block, side);
+                self.apply_net(l);
+            }
+            return;
+        }
+        // Hors ligne (essai de sa carte) : selon le réglage de la carte.
+        if !crate::fpsmap::load(&self.dir).doors() {
+            return;
+        }
+        let changes = toggle_hinged(&self.world, &mut self.opened, h.block, dir);
+        if !changes.is_empty() {
+            self.fps.sounds.push((crate::audio::Sfx::Door, 0.0, 0.9));
+        }
+        for (p, b) in changes {
+            self.dirty.extend(self.world.set(p[0], p[1], p[2], b));
+        }
+    }
+
     fn check_fall(&mut self) {
         let p = &self.player;
         if self.game.mode.mortal() && p.pos.y < -40.0 {
@@ -1350,6 +1417,12 @@ impl Session {
                 return;
             }
             self.die();
+            return;
+        }
+        // L'eau amortit la chute : aucun dégât (en survie comme en FPS). Sur une échelle,
+        // on ne tombe pas.
+        if p.on_ladder || crate::player::in_water(&self.world, p.pos) {
+            self.fall_from = None;
             return;
         }
         if !p.flying && !p.on_ground {
@@ -1446,9 +1519,31 @@ impl Session {
             match e {
                 // Le fonctionnement côté serveur (propriétaire, zones) ne s'affiche pas.
                 Event::Promoted { .. } => b.set_owner(),
-                Event::HostChanged(host) => log::info!("monde gardé par {host}"),
+                Event::HostChanged(host) => {
+                    log::info!("monde gardé par {host}");
+                    b.clear_owner();
+                }
                 Event::Zones { gained, lost } => {
                     let _ = b.zones_changed(gained, lost);
+                }
+                // Relais des régions peuplées, et billet pour y entrer.
+                Event::Shards(list) => b.set_shards(list.clone()),
+                Event::ShardTicket {
+                    room,
+                    pseudo,
+                    expires,
+                    mac,
+                } => b.set_ticket(*room, pseudo.clone(), *expires, *mac),
+                // Mode de jeu donné par un OP (ou par défaut du serveur, à l'arrivée).
+                Event::SetGamemode { mode, by } => {
+                    if let Some(m) = GameMode::parse(mode).filter(|m| *m != GameMode::Fps) {
+                        if !by.is_empty() {
+                            self.chat
+                                .say(format!("Mode de jeu donné par {by}."), chat::YELLOW);
+                        }
+                        self.set_mode(m);
+                    }
+                    return;
                 }
                 // Un OP du serveur a tué ce joueur (/kill).
                 Event::Slain(by) => {
@@ -1477,7 +1572,9 @@ impl Session {
                 if let Some((guns, nades)) = n.my_guns() {
                     self.fps.set_guns(guns, nades);
                 }
-                let t = if resumed {
+                let t = if resumed && old_host.is_some() {
+                    "Ta connexion est la meilleure : tu sers maintenant la partie."
+                } else if resumed {
                     "L'hôte est parti : tu étais garant de secours, tu reprends la partie."
                 } else {
                     "L'hôte est parti : tu ouvres une nouvelle partie sur la même carte."
@@ -1492,7 +1589,7 @@ impl Session {
                     // les autres (il fait foi, plus nous).
                     n.demote();
                     self.chat.say(
-                        format!("Le garant indépendant {host} sert maintenant la partie."),
+                        format!("{host} sert maintenant la partie (connexion plus sûre)."),
                         chat::YELLOW,
                     );
                 } else {
@@ -1539,8 +1636,8 @@ impl Session {
                 n.peer_left(*peer);
                 Vec::new()
             }
-            Event::FromPeer { peer, data } => n.receive(Some(*peer), data, &self.world),
-            Event::FromHost(data) => n.receive(None, data, &self.world),
+            Event::FromPeer { peer, data } => n.receive(Some(*peer), data, &mut self.world),
+            Event::FromHost(data) => n.receive(None, data, &mut self.world),
             _ => Vec::new(),
         };
         self.apply_net(locals);
@@ -1607,6 +1704,18 @@ impl Session {
                 Local::Step(pos, kind) => {
                     let eye = self.player.eye();
                     self.fps.heard_step(pos, eye, kind);
+                }
+                Local::Doors { cells, at } => {
+                    for (c, b) in cells {
+                        let b = BlockId(b);
+                        self.dirty.extend(self.world.set(c[0], c[1], c[2], b));
+                    }
+                    if let Some(at) = at {
+                        let d = (at - self.player.eye()).length();
+                        self.fps
+                            .sounds
+                            .push((crate::audio::Sfx::Door, 0.0, 0.9 / (1.0 + d / 8.0)));
+                    }
                 }
                 Local::Guns { guns, nades } => self.fps.set_guns(guns, nades),
                 Local::RoundEnd {
@@ -1753,8 +1862,17 @@ impl Session {
         if self.step_offset.abs() < 1e-3 {
             self.step_offset = 0.0;
         }
-        // Réception d'une chute d'au moins 1,3 bloc (les autres l'entendent aussi).
-        if self.player.on_ground || self.player.flying {
+        // Plongeon dans l'eau (les autres l'entendent aussi), sinon réception d'une chute
+        // d'au moins 1,3 bloc.
+        if crate::player::in_water(&self.world, self.player.pos) {
+            if let Some(top) = self.fall_top.take() {
+                if alive && top - self.player.pos.y >= crate::netgame::SPLASH_HEIGHT {
+                    self.fps.sounds.push((crate::audio::Sfx::Splash, 0.0, 0.9));
+                }
+            }
+        } else if self.player.on_ladder {
+            self.fall_top = None;
+        } else if self.player.on_ground || self.player.flying {
             if let Some(top) = self.fall_top.take() {
                 if alive && top - self.player.pos.y >= crate::netgame::LAND_HEIGHT {
                     self.fps.sounds.push((crate::audio::Sfx::Land, 0.0, 0.9));
@@ -2064,7 +2182,7 @@ impl Session {
     fn fps_command(&mut self, args: &[&str]) {
         use minelib_net::game::Zone;
         const USAGE: &str = "Usage : /fps set spawn ct | spawn t | site a | site b | site c \
-                             (sélection à la baguette), /fps set maxplayer 2-10, /fps clear …, \
+                             (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door true|false, /fps clear …, \
                              /fps info";
         if self.net.is_some() {
             self.chat.say(
@@ -2113,8 +2231,8 @@ impl Session {
         {
             let n = lower.get(2).and_then(|n| n.parse::<u8>().ok());
             match n {
-                Some(n) if (2..=10).contains(&n) && n % 2 == 0 => {
-                    map.max_players = n;
+                Some(n) if (2..=proto_max()).contains(&n) && n % 2 == 0 => {
+                    map.set_players(n);
                     match crate::fpsmap::save(&self.dir, &map) {
                         Ok(()) => self.chat.say(
                             format!(
@@ -2134,9 +2252,47 @@ impl Session {
                     }
                 }
                 _ => self.chat.say(
-                    "Usage : /fps set maxplayer 2|4|6|8|10 (deux équipes égales).",
+                    format!(
+                        "Usage : /fps set maxplayer <nombre pair de 2 à {}> (deux équipes égales).",
+                        proto_max()
+                    ),
                     chat::GREY,
                 ),
+            }
+            return;
+        }
+        // Portes et trappes utilisables pendant la partie.
+        if lower.first().map(String::as_str) == Some("set")
+            && matches!(
+                lower.get(1).map(String::as_str),
+                Some("door" | "doors" | "porte" | "portes")
+            )
+        {
+            let on = match lower.get(2).map(String::as_str) {
+                Some("true" | "on" | "oui" | "1") => true,
+                Some("false" | "off" | "non" | "0") => false,
+                _ => {
+                    self.chat.say(
+                        format!(
+                            "Usage : /fps set door true|false (actuellement : {}).",
+                            map.doors()
+                        ),
+                        chat::GREY,
+                    );
+                    return;
+                }
+            };
+            map.set_doors(on);
+            match crate::fpsmap::save(&self.dir, &map) {
+                Ok(()) => self.chat.say(
+                    if on {
+                        "Portes et trappes : on les ouvre et les ferme en partie (touche                          Utiliser). Nouvelle signature : c'est une nouvelle carte."
+                    } else {
+                        "Portes et trappes : fixes en partie. Nouvelle signature : c'est une                          nouvelle carte."
+                    },
+                    chat::LIGHT_PURPLE,
+                ),
+                Err(e) => self.chat.say(format!("fps.txt : {e:#}"), chat::RED),
             }
             return;
         }
@@ -2165,6 +2321,13 @@ impl Session {
             Some("info") | None => {
                 self.chat
                     .say(format!("joueurs : {}", map.players()), chat::LIGHT_PURPLE);
+                self.chat.say(
+                    format!(
+                        "portes : {}",
+                        if map.doors() { "utilisables" } else { "fixes" }
+                    ),
+                    chat::LIGHT_PURPLE,
+                );
                 for k in 0..5 {
                     let z = *slot(&mut map, k);
                     let t = match z {
@@ -2264,29 +2427,39 @@ impl Session {
                     );
                 }
             }
-            "gamemode" | "gm" => match arg.and_then(GameMode::parse) {
-                Some(mode) => {
-                    self.game.mode = mode;
-                    if mode.mortal() && !self.game.can_fly {
-                        self.player.flying = false;
-                    }
-                    if mode == GameMode::Creative {
-                        self.game.health = MAX_HEALTH;
-                    }
-                    if !mode.has_inventory() {
-                        self.inventory.close();
-                    }
-                    if mode == GameMode::Spectator {
-                        self.player.flying = true;
-                    } else if self.player.noclip {
-                        // Sortie du mode spectateur : vol gardé si permis, sinon on tombe.
-                        self.player.noclip = false;
-                        self.player.flying = mode == GameMode::Creative || self.game.can_fly;
-                    }
-                    self.fall_from = None;
+            // Serveur de construction en ligne : seuls ses OP changent de mode de jeu (le
+            // relais vérifie, puis renvoie le mode au joueur visé).
+            "gamemode" | "gm" | "defaultgamemode" | "dgm" if self.build.is_some() => {
+                let default = matches!(name.as_str(), "defaultgamemode" | "dgm");
+                let who = parts.next().map_or(String::new(), str::to_string);
+                let none = default && matches!(arg, Some("none" | "aucun" | "off"));
+                let mode = arg.and_then(GameMode::parse);
+                if mode == Some(GameMode::Fps) {
                     self.chat
-                        .say(format!("Mode de jeu : {}", mode.label()), chat::YELLOW);
+                        .say("Le mode FPS se joue dans les parties FPS.", chat::RED);
+                } else if mode.is_some() || none {
+                    self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                        action: if default {
+                            minelib_net::proto::SERVER_DEFAULT_GAMEMODE
+                        } else {
+                            minelib_net::proto::SERVER_GAMEMODE
+                        },
+                        pseudo: who,
+                        reason: mode.map_or(String::new(), |m| m.key().to_string()),
+                    });
+                } else {
+                    self.chat.say(
+                        if default {
+                            "Utilisation (OP) : /defaultgamemode <survival|creative|spectator|none>"
+                        } else {
+                            "Utilisation (OP) : /gm <survival|creative|spectator> [pseudo]"
+                        },
+                        chat::RED,
+                    );
                 }
+            }
+            "gamemode" | "gm" => match arg.and_then(GameMode::parse) {
+                Some(mode) => self.set_mode(mode),
                 None => self.chat.say(
                     "Utilisation : /gm <0|1|2|3|survival|creative|fps|spectator>",
                     chat::RED,
@@ -2473,7 +2646,13 @@ impl Session {
         ui.rect(cx - w / 2.0, top, w, 22.0 * s, [0.0, 0.0, 0.0, 0.5]);
         // Bandeau des têtes : CT à gauche, T à droite ; ses coéquipiers à leur couleur, les
         // morts assombris.
-        let head = 14.0 * s;
+        // Plus petites au-delà de 5 par équipe (cartes jusqu'à 10 contre 10).
+        let most = [CT, minelib_net::game::T]
+            .map(|t| rows.iter().filter(|r| r.team == t).count())
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        let head = if most > 5 { 10.0 * s } else { 14.0 * s };
         for (side, sign) in [(CT, -1.0f32), (minelib_net::game::T, 1.0)] {
             let mut team: Vec<&minelib_net::game::ScoreRow> =
                 rows.iter().filter(|r| r.team == side).collect();
@@ -2782,7 +2961,8 @@ impl Session {
         if let Some(b) = &self.build {
             return b
                 .others
-                .get(&id)
+                .values()
+                .find(|o| o.id == Some(id))
                 .map_or((String::new(), Some(VOICE_RANGE)), |o| {
                     (o.pseudo.clone(), Some((o.pos - self.player.pos).length()))
                 });
@@ -2810,12 +2990,12 @@ impl Session {
             return (all, mates);
         }
         if let Some(b) = &self.build {
-            let all: Vec<u64> = b.others.keys().copied().collect();
+            let all: Vec<u64> = b.others.values().filter_map(|o| o.id).collect();
             let near = b
                 .others
-                .iter()
-                .filter(|(_, o)| (o.pos - self.player.pos).length() < VOICE_RANGE)
-                .map(|(&id, _)| id)
+                .values()
+                .filter(|o| (o.pos - self.player.pos).length() < VOICE_RANGE)
+                .filter_map(|o| o.id)
                 .collect();
             return (all, near);
         }
@@ -3558,7 +3738,7 @@ impl Session {
 
 /// Porte ou trappe.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Hinged {
+pub(crate) enum Hinged {
     Door {
         wood: &'static str,
         upper: bool,
@@ -3570,7 +3750,7 @@ enum Hinged {
     },
 }
 
-fn hinged(id: BlockId) -> Option<Hinged> {
+pub(crate) fn hinged(id: BlockId) -> Option<Hinged> {
     let key: &'static str = &id.def().key;
     if let Some(rest) = key.strip_prefix("door_") {
         let mut it = rest.split(':');
@@ -3655,12 +3835,23 @@ fn door_turn(side: u8) -> u8 {
 /// ouverte pendant la partie retrouve exactement sa place en se refermant ; une trappe se
 /// relève contre le côté opposé au joueur.
 fn toggle_hinged(
-    world: &mut World,
+    world: &World,
     opened: &mut HashMap<[i32; 3], BlockId>,
     p: [i32; 3],
     look: Vec3,
 ) -> Vec<([i32; 3], BlockId)> {
-    let id = world.get(p[0], p[1], p[2]);
+    toggle_hinged_with(&|c| world.get(c[0], c[1], c[2]), opened, p, look)
+}
+
+/// Comme `toggle_hinged`, en lisant les blocs avec `get` (monde vu par une partie FPS, avec
+/// ses portes déjà changées).
+pub(crate) fn toggle_hinged_with(
+    get: &dyn Fn([i32; 3]) -> BlockId,
+    opened: &mut HashMap<[i32; 3], BlockId>,
+    p: [i32; 3],
+    look: Vec3,
+) -> Vec<([i32; 3], BlockId)> {
+    let id = get(p);
     let Some(h) = hinged(id) else {
         return Vec::new();
     };
@@ -3668,15 +3859,12 @@ fn toggle_hinged(
         Hinged::Door { upper, .. } => {
             let other = [p[0], if upper { p[1] - 1 } else { p[1] + 1 }, p[2]];
             let mut cells = vec![p];
-            if matches!(
-                hinged(world.get(other[0], other[1], other[2])),
-                Some(Hinged::Door { .. })
-            ) {
+            if matches!(hinged(get(other)), Some(Hinged::Door { .. })) {
                 cells.push(other);
             }
             let mut out = Vec::new();
             for c in cells {
-                let cur = world.get(c[0], c[1], c[2]);
+                let cur = get(c);
                 if let Some(closed) = opened.remove(&c).filter(|&b| same_family(b, cur)) {
                     out.push((c, closed));
                 } else if let Some(Hinged::Door { wood, upper, side }) = hinged(cur) {
@@ -4407,16 +4595,16 @@ fn scoreboard_lines(
     out
 }
 
-/// Couleur d'un coéquipier (comme dans CS : vert, jaune, orange, bleu, violet).
+/// Couleur d'un coéquipier (comme dans CS : vert, jaune, orange, bleu, violet, puis cinq
+/// de plus pour les cartes à 10 contre 10).
 pub fn mate_color(k: usize) -> [f32; 4] {
-    const C: [[f32; 4]; 5] = [
-        [0.30, 0.85, 0.35, 1.0],
-        [0.95, 0.85, 0.20, 1.0],
-        [0.95, 0.55, 0.15, 1.0],
-        [0.30, 0.60, 1.00, 1.0],
-        [0.70, 0.40, 0.95, 1.0],
-    ];
-    C[k % C.len()]
+    let c = &crate::multiplayer::PLAYER_COLORS;
+    c[k % c.len()]
+}
+
+/// Joueurs au plus d'une carte FPS.
+fn proto_max() -> u8 {
+    minelib_net::proto::FPS_MAX_PLAYERS as u8
 }
 
 /// Petites images du fil des éliminations (7 × 7 points, dessinées pour Minelib).
@@ -4582,13 +4770,13 @@ mod slab_tests {
         w.set(3, 10, 3, lower);
         w.set(3, 11, 3, upper);
         let look = Vec3::new(1.0, 0.0, 0.0);
-        let ch = toggle_hinged(&mut w, &mut opened, [3, 11, 3], look);
+        let ch = toggle_hinged(&w, &mut opened, [3, 11, 3], look);
         assert_eq!(ch.len(), 2, "les deux moitiés s'ouvrent");
         for (p, b) in &ch {
             w.set(p[0], p[1], p[2], *b);
         }
         assert_eq!(key(w.get(3, 10, 3)), "door_wood:lower:5");
-        for (p, b) in toggle_hinged(&mut w, &mut opened, [3, 10, 3], look) {
+        for (p, b) in toggle_hinged(&w, &mut opened, [3, 10, 3], look) {
             w.set(p[0], p[1], p[2], b);
         }
         assert_eq!(w.get(3, 10, 3), lower);
@@ -4596,11 +4784,11 @@ mod slab_tests {
         // Trappe : se relève contre le côté opposé au joueur, puis se rabat.
         let trap = reg.by_key("trapdoor:3").unwrap();
         w.set(6, 10, 6, trap);
-        for (p, b) in toggle_hinged(&mut w, &mut opened, [6, 10, 6], Vec3::new(0.0, -0.5, 1.0)) {
+        for (p, b) in toggle_hinged(&w, &mut opened, [6, 10, 6], Vec3::new(0.0, -0.5, 1.0)) {
             w.set(p[0], p[1], p[2], b);
         }
         assert_eq!(key(w.get(6, 10, 6)), "trapdoor:4");
-        for (p, b) in toggle_hinged(&mut w, &mut opened, [6, 10, 6], Vec3::Z) {
+        for (p, b) in toggle_hinged(&w, &mut opened, [6, 10, 6], Vec3::Z) {
             w.set(p[0], p[1], p[2], b);
         }
         assert_eq!(w.get(6, 10, 6), trap);

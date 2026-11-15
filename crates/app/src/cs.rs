@@ -221,7 +221,12 @@ pub struct Match {
     next_gun: u32,
     /// Pas de règles écoulés (cadences de tir).
     ticks: u32,
+    /// Portes et trappes changées pendant la partie : case → (bloc actuel, bloc d'origine).
+    pub doors: BTreeMap<[i32; 3], [u16; 2]>,
 }
+
+/// Couleurs de joueurs d'une équipe (voir `multiplayer::PLAYER_COLORS`).
+const COLORS: usize = crate::multiplayer::PLAYER_COLORS.len();
 
 /// Tirs d'avance permis (les messages arrivent parfois groupés).
 const BURST: f32 = 3.0;
@@ -293,6 +298,7 @@ impl Match {
             defuser: None,
             defuse_progress: 0.0,
             live_for: 0.0,
+            doors: BTreeMap::new(),
             map,
             map_sig,
             rng: seed | 1,
@@ -667,7 +673,7 @@ impl Match {
         let Some(p) = self.players.get_mut(&id) else {
             return;
         };
-        p.pref = if pref < 5 { pref } else { 255 };
+        p.pref = if (pref as usize) < COLORS { pref } else { 255 };
         let team = p.team;
         self.assign_colors(team);
     }
@@ -681,11 +687,11 @@ impl Match {
             .filter(|(_, p)| p.team == team && p.present)
             .map(|(&k, _)| k)
             .collect();
-        let mut taken = [false; 5];
+        let mut taken = [false; COLORS];
         let mut rest = Vec::new();
         for &k in &ids {
             let pref = self.players[&k].pref;
-            if pref < 5 && !taken[pref as usize] {
+            if (pref as usize) < COLORS && !taken[pref as usize] {
                 taken[pref as usize] = true;
                 self.players.get_mut(&k).expect("joueur").color = pref;
             } else {
@@ -694,7 +700,7 @@ impl Match {
         }
         for k in rest {
             let c = taken.iter().position(|t| !t).unwrap_or(0);
-            if c < 5 {
+            if c < COLORS {
                 taken[c] = true;
             }
             self.players.get_mut(&k).expect("joueur").color = c as u8;

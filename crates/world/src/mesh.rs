@@ -37,6 +37,31 @@ pub const TEX_LOCAL_UV: u32 = 1 << 13;
 /// pixels devient transparente et le modèle disparaît, sauf quelques bords.
 pub const TEX_SHARP: u32 = 1 << 14;
 
+/// Pixels pleins de chaque couche de texture, sur une grille de 16 × 16 (ligne `v`, bit
+/// `u`), donnés par le moteur de rendu une fois le pack chargé. Ils servent à fermer les
+/// trous des blocs fins (trappes, portes) : à l'intérieur d'un trou on voit son bord, sur
+/// toute l'épaisseur, et pas le vide.
+static CUTOUTS: std::sync::RwLock<Vec<[u16; 16]>> = std::sync::RwLock::new(Vec::new());
+
+/// La couche de texture a des pixels transparents (d'après `CUTOUTS`).
+fn has_holes(layer: u32) -> bool {
+    CUTOUTS
+        .read()
+        .ok()
+        .and_then(|c| {
+            c.get(layer as usize)
+                .map(|m| m.iter().any(|&r| r != u16::MAX))
+        })
+        .unwrap_or(false)
+}
+
+/// Donne les pixels pleins des couches de texture (voir `CUTOUTS`).
+pub fn set_cutouts(masks: Vec<[u16; 16]>) {
+    if let Ok(mut c) = CUTOUTS.write() {
+        *c = masks;
+    }
+}
+
 /// Couche de texture d'une face (0..6, 6 = plante en croix) d'un bloc.
 pub fn face_tex(id: BlockId, face: u32) -> u32 {
     let t = id.def().tex;
@@ -536,6 +561,119 @@ fn emit_box_t(
     }
 }
 
+/// Bords des trous d'un bloc fin (pavé plein sur deux axes, mince sur le troisième) : pour
+/// chaque pixel transparent de sa grande face voisin d'un pixel plein, une petite face sur
+/// toute l'épaisseur, tournée vers le trou, de la couleur de ce pixel plein.
+#[allow(clippy::too_many_arguments)]
+fn emit_hole_walls(
+    out: &mut MeshData,
+    min: [f32; 3],
+    max: [f32; 3],
+    mn: [u8; 3],
+    mx: [u8; 3],
+    id: BlockId,
+    light: [u8; 4],
+) {
+    // Axe mince : le seul qui ne fait pas tout le bloc.
+    let thin: Vec<usize> = (0..3).filter(|&i| mn[i] != 0 || mx[i] != 16).collect();
+    let [k] = thin[..] else { return };
+    // Texture de la grande face (celle qui regarde vers +k).
+    let big = [0u32, 2, 4][k];
+    let layer = face_tex(id, big) as usize;
+    let mask = match CUTOUTS.read() {
+        Ok(c) => match c.get(layer) {
+            Some(m) => *m,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    if mask.iter().all(|&r| r == u16::MAX) {
+        return;
+    }
+    let solid = |u: i32, v: i32| {
+        (0..16).contains(&u) && (0..16).contains(&v) && mask[v as usize] >> u & 1 == 1
+    };
+    let cell = min.map(|v| v.floor());
+    // Point du bloc pour (u, v) de la texture (0..1) et t le long de l'épaisseur.
+    let at = |u: f32, v: f32, t: f32| -> [f32; 3] {
+        let l = match k {
+            0 => [t, 1.0 - v, u],
+            1 => [u, t, v],
+            _ => [u, 1.0 - v, t],
+        };
+        std::array::from_fn(|i| cell[i] + l[i])
+    };
+    // Faces du bloc qui vont vers +u et +v de la texture.
+    let (face_u, face_v) = match k {
+        0 => (4usize, 3usize),
+        1 => (0, 4),
+        _ => (0, 3),
+    };
+    let (t0, t1) = (min[k] - cell[k], max[k] - cell[k]);
+    let tex = layer as u32 | TEX_SHARP | TEX_LOCAL_UV;
+    let px = 1.0 / 16.0;
+    for v in 0..16i32 {
+        for u in 0..16i32 {
+            if !solid(u, v) {
+                continue;
+            }
+            let q = [(u * 8 + 4) as u32, (v * 8 + 4) as u32];
+            let tex = tex | q[0] << 16 | q[1] << 24;
+            // Voisin transparent (dans la texture) : un bord, tourné vers lui.
+            for (du, dv) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (nu, nv) = (u + du, v + dv);
+                if !(0..16).contains(&nu) || !(0..16).contains(&nv) || solid(nu, nv) {
+                    continue;
+                }
+                let face = match (du, dv) {
+                    (1, _) => face_u,
+                    (-1, _) => face_u ^ 1,
+                    (_, 1) => face_v,
+                    _ => face_v ^ 1,
+                };
+                // Les quatre coins : le bord du pixel, sur l'épaisseur.
+                let (u0, u1, v0, v1) = if du != 0 {
+                    let e = (u + du.max(0)) as f32 * px;
+                    (e, e, v as f32 * px, (v + 1) as f32 * px)
+                } else {
+                    let e = (v + dv.max(0)) as f32 * px;
+                    (u as f32 * px, (u + 1) as f32 * px, e, e)
+                };
+                let corners = [
+                    at(u0, v0, t0),
+                    at(u1, v1, t0),
+                    at(u1, v1, t1),
+                    at(u0, v0, t1),
+                ];
+                // Sens des triangles selon la normale voulue.
+                let (nrm, _, _) = FACES[face];
+                let e1: [f32; 3] = std::array::from_fn(|i| corners[1][i] - corners[0][i]);
+                let e2: [f32; 3] = std::array::from_fn(|i| corners[3][i] - corners[0][i]);
+                let c = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let dot: f32 = (0..3).map(|i| c[i] * nrm[i] as f32).sum();
+                let start = out.vertices.len() as u32;
+                for p in corners {
+                    out.vertices.push(Vertex {
+                        pos: p,
+                        data: Vertex::block_data(face as u32, 3, light) | reflect_bits(id),
+                        tex,
+                    });
+                }
+                let order = if dot > 0.0 {
+                    [0, 1, 2, 2, 3, 0]
+                } else {
+                    [0, 3, 2, 2, 1, 0]
+                };
+                out.indices.extend_from_slice(&order.map(|i| start + i));
+            }
+        }
+    }
+}
+
 /// Repère d'une torche murale : penchée de 22,5° en s'écartant du mur, pied contre le mur,
 /// puis tournée vers le mur `d` (0 +X, 1 −X, 4 +Z, 5 −Z). Coordonnées locales 0..1.
 pub fn wall_torch_xf(d: u8, p: [f32; 3]) -> [f32; 3] {
@@ -940,7 +1078,10 @@ fn mesh_block(
                         return;
                     }
                     _ => {
-                        let mut boxes = def.boxes();
+                        // Escalier : relié à ses voisins (coins).
+                        let mut boxes = crate::registry::placed_boxes(id, |dx, dy, dz| {
+                            pad.get(x + dx, y + dy, z + dz)
+                        });
                         if let Shape::Post(kind) = def.shape {
                             let mut any = false;
                             for (side, d) in [
@@ -1025,6 +1166,17 @@ fn mesh_block(
                                 &|p| p,
                                 false,
                             );
+                            if !banner && matches!(def.shape, Shape::Panel { .. }) {
+                                emit_hole_walls(
+                                    out,
+                                    [wx + lo[0], wy + lo[1], wz + lo[2]],
+                                    [wx + hi[0], wy + hi[1], wz + hi[2]],
+                                    mn,
+                                    mx,
+                                    id,
+                                    lit,
+                                );
+                            }
                         }
                         return;
                     }
@@ -1035,7 +1187,10 @@ fn mesh_block(
                     // Cachée par un bloc plein, par le même bloc (verre, eau), ou par la
                     // face pleine d'une dalle ou d'un escalier collée contre elle (sinon
                     // les deux surfaces au même endroit scintillent sous du verre).
-                    let covered = crate::registry::light_faces(facing) & (1 << (face ^ 1)) != 0;
+                    // Sauf si cette face a des trous (rail, nénuphar) : on verrait le vide
+                    // au travers.
+                    let covered = crate::registry::light_faces(facing) & (1 << (face ^ 1)) != 0
+                        && !has_holes(face_tex(facing, (face ^ 1) as u32));
                     if opaque(front)
                         || (def.cull_same && facing == id)
                         || (covered && !def.translucent)
@@ -1173,6 +1328,9 @@ mod tests {
         [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
     }
 
+    /// Les essais qui changent `CUTOUTS` (globaux) passent l'un après l'autre.
+    static CUTOUT_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn empty_world_with_block(x: i32, y: i32, z: i32) -> World {
         let mut w = World::new(0);
         for dz in -1..=1 {
@@ -1182,6 +1340,92 @@ mod tests {
         }
         w.set(x, y, z, BlockId::STONE);
         w
+    }
+
+    #[test]
+    fn ground_under_a_barrier_stays_visible() {
+        let mut w = empty_world_with_block(3, 40, 3);
+        w.set(3, 41, 3, BlockId::BARRIER);
+        let tops = mesh_chunk(&w, ChunkPos { x: 0, z: 0 })
+            .vertices
+            .chunks_exact(4)
+            .filter(|q| q[0].face() == 2 && q.iter().all(|v| v.pos[1] == 41.0))
+            .count();
+        assert_eq!(tops, 1);
+    }
+
+    #[test]
+    fn ground_under_a_rail_stays_visible() {
+        let rail = crate::registry::registry().by_key("rail").expect("rail");
+        let mut w = empty_world_with_block(3, 40, 3);
+        w.set(3, 41, 3, rail);
+        let tops = |w: &World| {
+            mesh_chunk(w, ChunkPos { x: 0, z: 0 })
+                .vertices
+                .chunks_exact(4)
+                .filter(|q| q[0].face() == 2 && q.iter().all(|v| v.pos[1] == 41.0))
+                .count()
+        };
+        let _guard = CUTOUT_TEST.lock().unwrap();
+        // Rail sans trous connus (pas de pack) : le dessus de la pierre est caché.
+        set_cutouts(Vec::new());
+        assert_eq!(tops(&w), 0);
+        // Rail à trous : on voit la pierre au travers.
+        let layer = face_tex(rail, 3) as usize;
+        let mut masks = vec![[u16::MAX; 16]; layer + 1];
+        masks[layer][4] = 0;
+        set_cutouts(masks);
+        let n = tops(&w);
+        set_cutouts(Vec::new());
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn trapdoor_holes_have_walls_facing_into_the_hole() {
+        let id = crate::registry::registry()
+            .by_key("trapdoor:3")
+            .expect("trappe");
+        let layer = face_tex(id, 2) as usize;
+        // Un seul trou, pixel (5, 6), le reste plein.
+        let _guard = CUTOUT_TEST.lock().unwrap();
+        let mut masks = vec![[u16::MAX; 16]; layer + 1];
+        masks[layer][6] &= !(1 << 5);
+        set_cutouts(masks);
+        let mut w = World::new(0);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                w.insert_empty(ChunkPos { x: dx, z: dz });
+            }
+        }
+        w.set(3, 40, 3, id);
+        let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        set_cutouts(Vec::new());
+        let walls: Vec<_> = m
+            .vertices
+            .chunks_exact(4)
+            .filter(|q| q[0].tex & TEX_LOCAL_UV != 0)
+            .collect();
+        assert_eq!(walls.len(), 4, "un bord par côté du trou");
+        for q in walls {
+            let c: [f32; 3] =
+                std::array::from_fn(|i| q.iter().map(|v| v.pos[i]).sum::<f32>() / 4.0);
+            let f = q[0].face() as usize;
+            let (n, _, _) = FACES[f];
+            // Le trou est au centre du pixel (5, 6) ; vu du bord, il est devant la face.
+            let box_ = id.def().boxes()[0];
+            let k = (0..3).find(|&i| box_.0[i] != 0 || box_.1[i] != 16).unwrap();
+            let (hu, hv) = (5.5 / 16.0, 6.5 / 16.0);
+            let hole = match k {
+                0 => [c[0], 40.0 + 1.0 - hv, 3.0 + hu],
+                1 => [3.0 + hu, c[1], 3.0 + hv],
+                _ => [3.0 + hu, 40.0 + 1.0 - hv, c[2]],
+            };
+            let dot: f32 = (0..3).map(|i| (hole[i] - c[i]) * n[i] as f32).sum();
+            assert!(
+                dot > 0.0,
+                "face {f} au centre {c:?} pas tournée vers le trou"
+            );
+        }
     }
 
     #[test]

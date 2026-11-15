@@ -409,6 +409,15 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         } else {
             "bottom"
         };
+        // Coin intérieur (trois quarts de bloc en haut) : les cartes s'en servent pour
+        // des sols presque plats, souvent forcé sans les voisins qui le donneraient. Minelib
+        // ne garde pas la forme des escaliers (il la tire des voisins) : on pose le bloc
+        // plein de la matière, plus proche que la demi-marche (qui faisait des trous).
+        if matches!(prop("shape"), Some("inner_left" | "inner_right")) {
+            if let Some(b) = key(modern_material(m)) {
+                return Some(b);
+            }
+        }
         return key(&format!("stairs:{}:{dir}:{half}", modern_material(m)));
     }
     if let Some(m) = n.strip_suffix("_slab") {
@@ -687,6 +696,10 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
     };
     key(k)
 }
+
+/// Version du convertisseur : un monde converti par une version plus ancienne l'est de
+/// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein).
+pub const IMPORT_VERSION: u32 = 2;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {
@@ -1602,5 +1615,155 @@ mod real_world {
             println!("   {:<40} {n}", b.def().key);
         }
         assert!(missing.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+
+    /// Noms de blocs d'une région Minecraft qui deviennent de l'air (`MC_REGION=…`).
+    #[test]
+    #[ignore]
+    fn region_names_mapped_to_air() {
+        let Some(path) = std::env::var_os("MC_REGION") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for root in read_region(&bytes) {
+            let level = root.get("Level").unwrap_or(&root);
+            let sections = level
+                .get("sections")
+                .or_else(|| level.get("Sections"))
+                .map(Nbt::as_list)
+                .unwrap_or(&[]);
+            for sec in sections {
+                let palette = sec
+                    .get("block_states")
+                    .and_then(|b| b.get("palette"))
+                    .or_else(|| sec.get("Palette"));
+                for p in palette.map(Nbt::as_list).unwrap_or(&[]) {
+                    let name = p.get("Name").and_then(Nbt::as_str).unwrap_or("");
+                    let props: HashMap<String, String> = match p.get("Properties") {
+                        Some(Nbt::Compound(m)) => m
+                            .iter()
+                            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                            .collect(),
+                        _ => HashMap::new(),
+                    };
+                    let id = map_block_state(name, &props);
+                    let mut pv: Vec<_> = props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    pv.sort();
+                    let key = if name.contains("stairs") {
+                        format!("{name}[{}] -> {}", pv.join(","), id.def().key)
+                    } else {
+                        format!("{name} -> {}", id.def().key)
+                    };
+                    *counts.entry(key).or_default() += 1;
+                }
+            }
+        }
+        let mut v: Vec<_> = counts.into_iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        for (k, n) in v {
+            eprintln!("{n:6} {k}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod dump_column {
+    use super::*;
+
+    /// Colonne de blocs d'une région Minecraft (`MC_REGION`, `MC_X`, `MC_Z`).
+    #[test]
+    #[ignore]
+    fn column() {
+        let Some(path) = std::env::var_os("MC_REGION") else {
+            return;
+        };
+        let gx: i32 = std::env::var("MC_X").unwrap().parse().unwrap();
+        let gz: i32 = std::env::var("MC_Z").unwrap().parse().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        for root in read_region(&bytes) {
+            let level = root.get("Level").unwrap_or(&root);
+            let x = level.get("xPos").and_then(Nbt::as_i64).unwrap() as i32;
+            let z = level.get("zPos").and_then(Nbt::as_i64).unwrap() as i32;
+            if x != gx.div_euclid(16) || z != gz.div_euclid(16) {
+                continue;
+            }
+            let (lx, lz) = (gx.rem_euclid(16) as usize, gz.rem_euclid(16) as usize);
+            for sec in level.get("sections").map(Nbt::as_list).unwrap_or(&[]) {
+                let sy = sec.get("Y").and_then(Nbt::as_i64).unwrap_or(0) as i32;
+                let bs = sec.get("block_states");
+                let pal = bs
+                    .and_then(|b| b.get("palette"))
+                    .map(Nbt::as_list)
+                    .unwrap_or(&[]);
+                let names: Vec<String> = pal
+                    .iter()
+                    .map(|p| {
+                        p.get("Name")
+                            .and_then(Nbt::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect();
+                for ly in 0..16usize {
+                    let i = ly * 256 + lz * 16 + lx;
+                    let k = match bs.and_then(|b| b.get("data")) {
+                        Some(Nbt::LongArray(d)) if names.len() > 1 => {
+                            packed(d, i, bits_for(names.len()), false)
+                        }
+                        _ => 0,
+                    };
+                    let n = names.get(k).cloned().unwrap_or_default();
+                    if n != "minecraft:air" {
+                        eprintln!("y {} {n}", sy * 16 + ly as i32);
+                    }
+                }
+            }
+            let c = convert_chunk(&root, 64).unwrap();
+            for y in 160..172 {
+                eprintln!("minelib y {y} {}", c.chunk.get(lx, y, lz).def().key);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dump_area {
+    use super::*;
+
+    /// Blocs non pleins d'une zone (`MC_REGION`, `MC_Y` en coordonnées Minelib).
+    #[test]
+    #[ignore]
+    fn area() {
+        let Some(path) = std::env::var_os("MC_REGION") else {
+            return;
+        };
+        let y: usize = std::env::var("MC_Y").unwrap().parse().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for root in read_region(&bytes) {
+            let Ok(c) = convert_chunk(&root, 64) else {
+                continue;
+            };
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    let b = c.chunk.get(lx, y, lz);
+                    let up = c.chunk.get(lx, y + 1, lz);
+                    *counts
+                        .entry(format!("{} / dessus {}", b.def().key, up.def().key))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let mut v: Vec<_> = counts.into_iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        for (k, n) in v.iter().take(60) {
+            eprintln!("{n:6} {k}");
+        }
     }
 }

@@ -256,6 +256,26 @@ pub fn load_block_textures(pack: &ResourcePack) -> BlockTextures {
             *img = img.resize_nearest(size, size);
         }
     }
+    // Pixels pleins (grille 16 × 16) : le maillage ferme les bords des trous des blocs
+    // fins (trappes, portes).
+    let masks = images
+        .iter()
+        .map(|img| {
+            std::array::from_fn(|v| {
+                (0..16).fold(0u16, |m, u| {
+                    let x = (u * img.width + img.width / 2) / 16;
+                    let y = (v as u32 * img.height + img.height / 2) / 16;
+                    let a = img.data[((y * img.width + x) * 4 + 3) as usize];
+                    if a > 127 {
+                        m | 1 << u
+                    } else {
+                        m
+                    }
+                })
+            })
+        })
+        .collect();
+    minelib_world::mesh::set_cutouts(masks);
     BlockTextures {
         size,
         layers: images,

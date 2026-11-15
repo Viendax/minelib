@@ -1213,6 +1213,7 @@ impl Fps {
         let sfx = match kind {
             crate::netgame::STEP_LAND => Sfx::Land,
             crate::netgame::STEP_PAIN => Sfx::Pain,
+            crate::netgame::STEP_SPLASH => Sfx::Splash,
             _ => Sfx::Step,
         };
         self.sounds.push((sfx, 0.0, 0.9 / (1.0 + d / 8.0)));
@@ -2727,6 +2728,15 @@ mod tests {
         assert!((p.first - 3.5).abs() < 1e-3, "{}", p.first);
         let p = weapons::bullet_path(&w, eye, north, 250.0);
         assert!((p.first - 3.5).abs() < 1e-3, "{}", p.first);
+        // Un bloc invisible (barrière) sur le chemin : ni arrêt, ni demi-dégâts.
+        let barrier = minelib_world::registry::registry()
+            .by_key("barrier")
+            .unwrap();
+        w.set(8, 8, 10, barrier);
+        let p = weapons::bullet_path(&w, eye, north, 250.0);
+        assert!((p.first - 3.5).abs() < 1e-3, "{}", p.first);
+        assert_eq!(p.factor_at(3.0), Some(1.0));
+        w.set(8, 8, 10, BlockId::AIR);
         // Un bloc (moitié des dégâts), puis le mur du fond de deux blocs : trop épais pour
         // ce qui reste (deux blocs en tout), la balle s'y arrête.
         assert_eq!(p.through.len(), 1, "{:?}", p.through);
