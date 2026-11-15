@@ -602,7 +602,7 @@ impl Session {
                     self.world.journal = Some(Vec::new());
                 }
                 let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
-                if let Some(caps) = b.update(
+                let (caps, dirty) = b.update(
                     &mut self.world,
                     self.player.pos,
                     (self.player.yaw, self.player.pitch),
@@ -610,9 +610,11 @@ impl Session {
                     speed,
                     self.fps_avg,
                     dt,
-                ) {
+                );
+                if let Some(caps) = caps {
                     self.relay_cmds.push(minelib_net::client::Cmd::Caps(caps));
                 }
+                self.dirty.extend(dirty);
             }
             if let Some(n) = &mut self.net {
                 let weapon = self.fps.held_weapon();

@@ -364,6 +364,31 @@ pub enum ToHost {
     Color(u8),
 }
 
+/// Messages d'un monde de construction en ligne (passent par les zones du relais).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum BuildMsg {
+    /// Demande d'un joueur au garant de la zone.
+    Edit { pos: [i32; 3], block: u16 },
+    /// Modification validée par le garant (gardée par le relais, compactée : la dernière
+    /// par case).
+    Set {
+        pos: [i32; 3],
+        block: u16,
+        by: String,
+    },
+    Player {
+        pseudo: String,
+        pos: [f32; 3],
+        yaw: f32,
+        pitch: f32,
+        crouch: f32,
+        speed: f32,
+    },
+    /// Le garant refuse la modification du joueur `peer` en `pos` : le relais ne la remet
+    /// qu'à lui, qui remet le bloc d'avant.
+    Reject { pos: [i32; 3], peer: u64 },
+}
+
 /// Sortes de `ToPeer::Step`.
 pub const STEP_RUN: u8 = 0;
 pub const STEP_LAND: u8 = 1;

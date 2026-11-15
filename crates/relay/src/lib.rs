@@ -672,9 +672,9 @@ fn switch_host(st: &mut State, room_id: u64, new: u64, stays: Option<u64>) {
     }
     if kind == 1 {
         // Le nouveau propriétaire reçoit tout ce qui a été construit (pour l'enregistrer).
-        if let Some(room) = st.rooms.get(&room_id) {
+        if let Some(room) = st.rooms.get_mut(&room_id) {
             if let Some(c) = st.conns.get(&new) {
-                for (zone, log) in room.build.all_logs() {
+                for (zone, log) in room.build.all_logs(new) {
                     let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
                     for data in log {
                         transport::push(
@@ -1118,9 +1118,10 @@ fn zone_candidates(st: &State, room_id: u64) -> Vec<zones::Candidate> {
 }
 
 /// Garants extérieurs voulus pour un monde de construction : un, plus un par tranche de
-/// 8 joueurs (au plus 4).
-fn build_garants_wanted(players: usize) -> usize {
-    (1 + players / 8).min(4)
+/// 8 joueurs, et au moins un pour 4 zones actives (au plus 32) : un monde très peuplé
+/// répartit ses zones sur beaucoup de garants.
+fn build_garants_wanted(players: usize, active_zones: usize) -> usize {
+    (1 + players / 8).max(active_zones.div_ceil(4)).clamp(1, 32)
 }
 
 /// Le garant extérieur le plus adapté pour un monde de construction : la connexion de
@@ -1165,11 +1166,31 @@ fn upkeep_build(st: &mut State) {
         .map(|(&id, _)| id)
         .collect();
     for rid in rooms {
+        // Le propriétaire (qui enregistre le monde) reçoit ce qui a changé, par paquets.
+        if let Some(room) = st.rooms.get_mut(&rid) {
+            let owner = room.host;
+            let items = room.build.catch_up(owner, None);
+            if let Some(c) = st.conns.get(&owner) {
+                for (zone, log) in items {
+                    let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
+                    for data in log {
+                        transport::push(
+                            &c.tx,
+                            &Response::FromZone {
+                                peer: 0,
+                                chunk,
+                                data,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         let Some(room) = st.rooms.get(&rid) else {
             continue;
         };
         let players = room.everyone().filter(|m| !room.hidden.contains(m)).count();
-        if room.hidden.len() >= build_garants_wanted(players) {
+        if room.hidden.len() >= build_garants_wanted(players, room.build.active()) {
             continue;
         }
         let names: Vec<String> = room
@@ -1202,21 +1223,11 @@ fn announce(st: &State, room_id: u64, changes: zones::Changes) {
     let Some(room) = st.rooms.get(&room_id) else {
         return;
     };
+    // Le garant n'a pas besoin de l'historique de ses zones pour valider (les joueurs
+    // reçoivent le leur en s'approchant).
+    let _ = room;
     for (id, gained, lost) in changes {
         let Some(c) = st.conns.get(&id) else { continue };
-        for z in &gained {
-            for data in room.build.log(*z) {
-                let chunk = [z[0] * proto::ZONE, z[1] * proto::ZONE];
-                transport::push(
-                    &c.tx,
-                    &Response::FromZone {
-                        peer: 0,
-                        chunk,
-                        data,
-                    },
-                );
-            }
-        }
         transport::push(&c.tx, &Response::Zones { gained, lost });
     }
 }
@@ -2464,59 +2475,84 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let room = st.rooms.get_mut(&rid).expect("partie");
             room.build.touch(zone);
             let (garant, changes) = room.build.garant(zone, &cands);
-            // Nommé garant à l'instant : sa demande lui revient, à valider comme les autres.
-            let fresh = garant == Some(id) && !changes.is_empty();
             announce(st, rid, changes);
             let room = st.rooms.get_mut(&rid).expect("partie");
-            if fresh {
-                if let Some(c) = st.conns.get(&id) {
-                    transport::push(
-                        &c.tx,
-                        &Response::FromZone {
-                            peer: id,
-                            chunk,
-                            data,
-                        },
-                    );
-                }
-            } else if garant == Some(id) {
-                // Le garant publie : à tous les joueurs proches, à l'hôte (qui enregistre
-                // le monde), et dans l'historique de la zone.
-                room.build.record(zone, &data);
-                let mut to = room.build.listeners(chunk, id);
-                if room.host != id && !to.contains(&room.host) {
-                    to.push(room.host);
-                }
-                let msg = Response::FromZone {
-                    peer: id,
-                    chunk,
-                    data,
-                };
-                for m in to {
-                    if let Some(c) = st.conns.get(&m) {
-                        transport::push(&c.tx, &msg);
+            let msg = game::decode::<game::BuildMsg>(&data);
+            match (msg, garant) {
+                // Une demande va au garant de la zone, même si c'est le demandeur lui-même
+                // (il la valide comme les autres).
+                (Some(game::BuildMsg::Edit { .. }), Some(g)) => {
+                    if let Some(c) = st.conns.get(&g) {
+                        transport::push(
+                            &c.tx,
+                            &Response::FromZone {
+                                peer: id,
+                                chunk,
+                                data,
+                            },
+                        );
                     }
                 }
-            } else if let Some(c) = garant.and_then(|g| st.conns.get(&g)) {
-                transport::push(
-                    &c.tx,
-                    &Response::FromZone {
-                        peer: id,
-                        chunk,
-                        data,
-                    },
-                );
+                // Refus du garant : au seul joueur concerné (il remet le bloc d'avant).
+                (Some(game::BuildMsg::Reject { peer, .. }), Some(g)) if g == id => {
+                    if let Some(c) = st.conns.get(&peer) {
+                        transport::push(
+                            &c.tx,
+                            &Response::FromZone {
+                                peer: id,
+                                chunk,
+                                data,
+                            },
+                        );
+                    }
+                }
+                // Le garant publie : aux joueurs proches (avec ce qui leur manquerait) et
+                // dans l'historique de la zone. Le propriétaire, qui enregistre le monde,
+                // reçoit tout par paquets (voir `upkeep_build`).
+                (Some(game::BuildMsg::Set { .. }), Some(g)) if g == id => {
+                    let to = room.build.listeners(chunk, id);
+                    for (m, items) in room.build.record(zone, &data, &to) {
+                        if let Some(c) = st.conns.get(&m) {
+                            for data in items {
+                                transport::push(
+                                    &c.tx,
+                                    &Response::FromZone {
+                                        peer: id,
+                                        chunk,
+                                        data,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                // Validé par un ancien garant de la zone (elle vient de changer de mains) :
+                // le nouveau garant la revalide.
+                (Some(game::BuildMsg::Set { pos, block, .. }), Some(g)) => {
+                    let edit = game::encode(&game::BuildMsg::Edit { pos, block });
+                    if let Some(c) = st.conns.get(&g) {
+                        transport::push(
+                            &c.tx,
+                            &Response::FromZone {
+                                peer: id,
+                                chunk,
+                                data: edit,
+                            },
+                        );
+                    }
+                }
+                _ => {}
             }
             return None;
         }
         Request::Nearby { chunk, data } => {
-            if let Some(room) = my_room.and_then(|r| st.rooms.get(&r)) {
+            if let Some(room) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
                 let msg = Response::FromZone {
                     peer: id,
                     chunk,
                     data,
                 };
-                for m in room.build.listeners(chunk, id) {
+                for m in room.build.nearby(id, chunk) {
                     if let Some(c) = st.conns.get(&m) {
                         transport::push(&c.tx, &msg);
                     }
@@ -3025,6 +3061,16 @@ fn handle_account(
             resp
         }
         _ => err(ErrorCode::Internal, "requête inattendue"),
+    }
+}
+
+/// Essais (jeux en réseau simulés) : donne des parties jouées à un compte avant de lancer
+/// le relais (un garant doit en avoir joué quelques-unes).
+#[doc(hidden)]
+pub fn test_seed_games(dir: &Path, pseudo: &str, games: u32) {
+    if let Ok(mut st) = stats::Store::open(dir.join("stats")) {
+        st.get_mut(pseudo).games = games;
+        st.save(pseudo);
     }
 }
 
@@ -3868,7 +3914,10 @@ mod tests {
         }
         // Une modification du créateur va au garant extérieur (pas à lui-même), qui la publie.
         transport::push(&clink, &Request::Position { chunk: [0, 0] });
-        let edit = vec![1, 2, 3];
+        let edit = game::encode(&game::BuildMsg::Edit {
+            pos: [1, 64, 1],
+            block: 1,
+        });
         transport::push(
             &clink,
             &Request::ToZone {
@@ -3884,15 +3933,20 @@ mod tests {
             Event::FromZone { data, .. } => assert_eq!(data, edit),
             _ => unreachable!(),
         }
+        let set = game::encode(&game::BuildMsg::Set {
+            pos: [1, 64, 1],
+            block: 1,
+            by: String::new(),
+        });
         transport::push(
             &glink,
             &Request::ToZone {
                 chunk: [0, 0],
-                data: vec![9],
+                data: set.clone(),
             },
         );
         match wait(&createur, |e| matches!(e, Event::FromZone { .. })) {
-            Event::FromZone { data, .. } => assert_eq!(data, vec![9]),
+            Event::FromZone { data, .. } => assert_eq!(data, set),
             _ => unreachable!(),
         }
         let _ = std::fs::remove_dir_all(dir);

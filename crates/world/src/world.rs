@@ -44,7 +44,8 @@ pub struct World {
     pub generator: Generator,
     /// Journal des blocs posés par `set` (activé pour le jeu en ligne : ce que le joueur
     /// change est envoyé aux autres).
-    pub journal: Option<Vec<([i32; 3], BlockId)>>,
+    /// Blocs changés par le joueur local : (position, nouveau bloc, bloc d'avant).
+    pub journal: Option<Vec<([i32; 3], BlockId, BlockId)>>,
 }
 
 impl World {
@@ -425,7 +426,7 @@ impl World {
         chunk.set(lx as usize, y as usize, lz as usize, id);
         if let Some(j) = &mut self.journal {
             if old != id {
-                j.push(([x, y, z], id));
+                j.push(([x, y, z], id, old));
             }
         }
         let index = lx as u32 + 16 * lz as u32 + 256 * y as u32;
