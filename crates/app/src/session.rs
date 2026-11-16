@@ -1430,11 +1430,20 @@ impl Session {
             }
             return;
         }
-        // Hors ligne (essai de sa carte) : selon le réglage de la carte.
-        if !crate::fpsmap::load(&self.dir).doors() {
+        // Hors ligne (essai de sa carte) : selon le réglage de la carte ; sur un serveur de
+        // construction, toujours (les blocs changés partent comme les autres).
+        let map = crate::fpsmap::load(&self.dir);
+        if self.build.is_none() && !map.doors() {
             return;
         }
-        let changes = toggle_hinged(&self.world, &mut self.opened, h.block, dir);
+        let world = &self.world;
+        let changes = toggle_door_pair_with(
+            &|c| world.get(c[0], c[1], c[2]),
+            &mut self.opened,
+            h.block,
+            dir,
+            map.door_sync(),
+        );
         if !changes.is_empty() {
             self.fps.sounds.push((crate::audio::Sfx::Door, 0.0, 0.9));
         }
@@ -1593,7 +1602,7 @@ impl Session {
                 }
                 // Mode de jeu donné par un OP (ou par défaut du serveur, à l'arrivée).
                 Event::SetGamemode { mode, by } => {
-                    if let Some(m) = GameMode::parse(mode).filter(|m| *m != GameMode::Fps) {
+                    if let Some(m) = GameMode::parse(mode) {
                         if !by.is_empty() {
                             self.chat
                                 .say(format!("Mode de jeu donné par {by}."), chat::YELLOW);
@@ -2261,7 +2270,7 @@ impl Session {
     fn fps_command(&mut self, args: &[&str]) {
         use minelib_net::game::Zone;
         const USAGE: &str = "Usage : /fps set spawn ct | spawn t | site a | site b | site c \
-                             (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door true|false, /fps clear …, \
+                             (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door true|false, /fps set doorsync true|false, /fps clear …, \
                              /fps info";
         if self.net.is_some() {
             self.chat.say(
@@ -2340,6 +2349,43 @@ impl Session {
             }
             return;
         }
+        // Double porte : les deux battants s'ouvrent ensemble.
+        if lower.first().map(String::as_str) == Some("set")
+            && matches!(
+                lower.get(1).map(String::as_str),
+                Some("doorsync" | "doublesdoors" | "doubledoor" | "portesdoubles")
+            )
+        {
+            let on = match lower.get(2).map(String::as_str) {
+                Some("true" | "on" | "oui" | "1") => true,
+                Some("false" | "off" | "non" | "0") => false,
+                _ => {
+                    self.chat.say(
+                        format!(
+                            "Usage : /fps set doorsync true|false (actuellement : {}).",
+                            map.door_sync()
+                        ),
+                        chat::GREY,
+                    );
+                    return;
+                }
+            };
+            map.set_door_sync(on);
+            match crate::fpsmap::save(&self.dir, &map) {
+                Ok(()) => self.chat.say(
+                    if on {
+                        "Doubles portes : ouvrir un battant ouvre aussi l'autre en partie. \
+                         Nouvelle signature : c'est une nouvelle carte."
+                    } else {
+                        "Doubles portes : chaque battant s'ouvre seul en partie. Nouvelle \
+                         signature : c'est une nouvelle carte."
+                    },
+                    chat::LIGHT_PURPLE,
+                ),
+                Err(e) => self.chat.say(format!("fps.txt : {e:#}"), chat::RED),
+            }
+            return;
+        }
         // Portes et trappes utilisables pendant la partie.
         if lower.first().map(String::as_str) == Some("set")
             && matches!(
@@ -2404,6 +2450,17 @@ impl Session {
                     format!(
                         "portes : {}",
                         if map.doors() { "utilisables" } else { "fixes" }
+                    ),
+                    chat::LIGHT_PURPLE,
+                );
+                self.chat.say(
+                    format!(
+                        "doubles portes : {}",
+                        if map.door_sync() {
+                            "ensemble"
+                        } else {
+                            "séparées"
+                        }
                     ),
                     chat::LIGHT_PURPLE,
                 );
@@ -2507,10 +2564,7 @@ impl Session {
                 let who = parts.next().map_or(String::new(), str::to_string);
                 let none = default && matches!(arg, Some("none" | "aucun" | "off"));
                 let mode = arg.and_then(GameMode::parse);
-                if mode == Some(GameMode::Fps) {
-                    self.chat
-                        .say("Le mode FPS se joue dans les parties FPS.", chat::RED);
-                } else if mode.is_some() || none {
+                if mode.is_some() || none {
                     self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
                         action: if default {
                             minelib_net::proto::SERVER_DEFAULT_GAMEMODE
@@ -2523,9 +2577,9 @@ impl Session {
                 } else {
                     self.chat.say(
                         if default {
-                            "Utilisation (OP) : /defaultgamemode <survival|creative|spectator|none>"
+                            "Utilisation (OP) : /defaultgamemode <survival|creative|fps|spectator|none>"
                         } else {
-                            "Utilisation (OP) : /gm <survival|creative|spectator> [pseudo]"
+                            "Utilisation (OP) : /gm <survival|creative|fps|spectator> [pseudo]"
                         },
                         chat::RED,
                     );
@@ -3904,6 +3958,103 @@ fn door_turn(side: u8) -> u8 {
     }
 }
 
+/// Case voisine dans la direction du côté `side` (0 +X, 1 −X, 4 +Z, 5 −Z).
+fn side_step(c: [i32; 3], side: u8) -> [i32; 3] {
+    match side {
+        0 => [c[0] + 1, c[1], c[2]],
+        1 => [c[0] - 1, c[1], c[2]],
+        4 => [c[0], c[1], c[2] + 1],
+        _ => [c[0], c[1], c[2] - 1],
+    }
+}
+
+fn opposite_side(side: u8) -> u8 {
+    match side {
+        0 => 1,
+        1 => 0,
+        4 => 5,
+        _ => 4,
+    }
+}
+
+/// Porte fermée en `c` (son état d'origine si elle est ouverte en ce moment).
+fn closed_door(
+    get: &dyn Fn([i32; 3]) -> BlockId,
+    opened: &HashMap<[i32; 3], BlockId>,
+    c: [i32; 3],
+) -> Option<(&'static str, bool, u8)> {
+    let id = opened.get(&c).copied().unwrap_or_else(|| get(c));
+    match hinged(id)? {
+        Hinged::Door { wood, upper, side } => Some((wood, upper, side)),
+        Hinged::Trapdoor { .. } => None,
+    }
+}
+
+/// Double porte : une porte fermée a ses gonds du côté `door_turn` ; si une porte jumelle
+/// (même essence, même moitié, même côté) est collée de ce côté-là, ses gonds passent de
+/// l'autre côté, comme dans Minecraft : les deux battants s'ouvrent en miroir, gonds à
+/// l'extérieur. `Some(true)` : gonds inversés.
+fn door_flipped(
+    get: &dyn Fn([i32; 3]) -> BlockId,
+    opened: &HashMap<[i32; 3], BlockId>,
+    c: [i32; 3],
+) -> Option<bool> {
+    let (wood, upper, side) = closed_door(get, opened, c)?;
+    let n = side_step(c, door_turn(side));
+    Some(closed_door(get, opened, n) == Some((wood, upper, side)))
+}
+
+/// Côté où se range le battant ouvert de la porte en `c` (fermée).
+fn door_open_side(
+    get: &dyn Fn([i32; 3]) -> BlockId,
+    opened: &HashMap<[i32; 3], BlockId>,
+    c: [i32; 3],
+) -> Option<u8> {
+    let (_, _, side) = closed_door(get, opened, c)?;
+    let turn = door_turn(side);
+    Some(if door_flipped(get, opened, c)? {
+        opposite_side(turn)
+    } else {
+        turn
+    })
+}
+
+/// Autre battant de la double porte dont fait partie la porte en `c`, s'il y en a un.
+pub(crate) fn door_partner(
+    get: &dyn Fn([i32; 3]) -> BlockId,
+    opened: &HashMap<[i32; 3], BlockId>,
+    c: [i32; 3],
+) -> Option<[i32; 3]> {
+    let (wood, upper, side) = closed_door(get, opened, c)?;
+    let turn = door_turn(side);
+    if door_flipped(get, opened, c)? {
+        return Some(side_step(c, turn));
+    }
+    let n = side_step(c, opposite_side(turn));
+    (closed_door(get, opened, n) == Some((wood, upper, side))
+        && door_flipped(get, opened, n) == Some(true))
+    .then_some(n)
+}
+
+/// Comme `toggle_hinged_with` ; avec `pair`, l'autre battant d'une double porte suit
+/// (s'il était dans le même état : les deux s'ouvrent ou se ferment ensemble).
+pub(crate) fn toggle_door_pair_with(
+    get: &dyn Fn([i32; 3]) -> BlockId,
+    opened: &mut HashMap<[i32; 3], BlockId>,
+    p: [i32; 3],
+    look: Vec3,
+    pair: bool,
+) -> Vec<([i32; 3], BlockId)> {
+    let partner = pair.then(|| door_partner(get, opened, p)).flatten();
+    let state = |o: &HashMap<[i32; 3], BlockId>, c: [i32; 3]| o.contains_key(&c);
+    let same = partner.is_some_and(|q| state(opened, p) == state(opened, q));
+    let mut out = toggle_hinged_with(get, opened, p, look);
+    if let Some(q) = partner.filter(|_| same && !out.is_empty()) {
+        out.extend(toggle_hinged_with(get, opened, q, look));
+    }
+    out
+}
+
 /// Ouvre ou ferme la porte / trappe en `p` ; renvoie les blocs à changer. Une porte
 /// ouverte pendant la partie retrouve exactement sa place en se refermant ; une trappe se
 /// relève contre le côté opposé au joueur.
@@ -3935,8 +4086,13 @@ pub(crate) fn toggle_hinged_with(
             if matches!(hinged(get(other)), Some(Hinged::Door { .. })) {
                 cells.push(other);
             }
+            // Sens d'ouverture de chaque moitié, calculé avant de toucher à `opened`.
+            let turns: Vec<Option<u8>> = cells
+                .iter()
+                .map(|&c| door_open_side(get, opened, c))
+                .collect();
             let mut out = Vec::new();
-            for c in cells {
+            for (c, turn) in cells.into_iter().zip(turns) {
                 let cur = get(c);
                 if let Some(closed) = opened.remove(&c).filter(|&b| same_family(b, cur)) {
                     out.push((c, closed));
@@ -3944,7 +4100,7 @@ pub(crate) fn toggle_hinged_with(
                     let open = Hinged::Door {
                         wood,
                         upper,
-                        side: door_turn(side),
+                        side: turn.unwrap_or_else(|| door_turn(side)),
                     };
                     if let Some(b) = hinged_block(open) {
                         opened.insert(c, cur);
@@ -4865,6 +5021,87 @@ mod slab_tests {
             w.set(p[0], p[1], p[2], b);
         }
         assert_eq!(w.get(6, 10, 6), trap);
+    }
+
+    #[test]
+    fn double_doors_open_mirrored_and_can_open_together() {
+        let reg = minelib_world::registry::registry();
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        let lower = reg.by_key("door_wood:lower:1").unwrap();
+        let upper = reg.by_key("door_wood:upper:1").unwrap();
+        // Deux battants côte à côte le long de Z : A en z = 3, B en z = 2.
+        for z in [2, 3] {
+            w.set(3, 10, z, lower);
+            w.set(3, 11, z, upper);
+        }
+        let look = Vec3::X;
+        let mut opened = HashMap::new();
+        let apply = |w: &mut World, ch: Vec<([i32; 3], BlockId)>| {
+            for (p, b) in ch {
+                w.set(p[0], p[1], p[2], b);
+            }
+        };
+        // Chacun seul : en miroir, gonds à l'extérieur.
+        let ch = toggle_door_pair_with(
+            &|c| w.get(c[0], c[1], c[2]),
+            &mut opened,
+            [3, 10, 3],
+            look,
+            false,
+        );
+        assert_eq!(ch.len(), 2);
+        apply(&mut w, ch);
+        assert_eq!(key(w.get(3, 10, 3)), "door_wood:lower:4");
+        let ch = toggle_door_pair_with(
+            &|c| w.get(c[0], c[1], c[2]),
+            &mut opened,
+            [3, 11, 2],
+            look,
+            false,
+        );
+        apply(&mut w, ch);
+        assert_eq!(key(w.get(3, 10, 2)), "door_wood:lower:5");
+        assert_eq!(key(w.get(3, 11, 2)), "door_wood:upper:5");
+        // Les deux se referment ensemble (doorsync), depuis n'importe quel battant.
+        let ch = toggle_door_pair_with(
+            &|c| w.get(c[0], c[1], c[2]),
+            &mut opened,
+            [3, 10, 2],
+            look,
+            true,
+        );
+        assert_eq!(ch.len(), 4);
+        apply(&mut w, ch);
+        for z in [2, 3] {
+            assert_eq!(w.get(3, 10, z), lower);
+            assert_eq!(w.get(3, 11, z), upper);
+        }
+        let ch = toggle_door_pair_with(
+            &|c| w.get(c[0], c[1], c[2]),
+            &mut opened,
+            [3, 11, 3],
+            look,
+            true,
+        );
+        assert_eq!(ch.len(), 4);
+        apply(&mut w, ch);
+        assert_eq!(key(w.get(3, 11, 3)), "door_wood:upper:4");
+        assert_eq!(key(w.get(3, 11, 2)), "door_wood:upper:5");
+        // Une porte seule s'ouvre toujours du même côté.
+        let mut solo = World::new(0);
+        solo.insert_empty(ChunkPos { x: 0, z: 0 });
+        solo.set(5, 10, 5, lower);
+        let mut o = HashMap::new();
+        let ch = toggle_door_pair_with(
+            &|c| solo.get(c[0], c[1], c[2]),
+            &mut o,
+            [5, 10, 5],
+            look,
+            true,
+        );
+        assert_eq!(ch.len(), 1);
+        assert_eq!(key(ch[0].1), "door_wood:lower:5");
     }
 }
 

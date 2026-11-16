@@ -109,6 +109,7 @@ Dans ton monde en créatif, sélectionne une zone avec la baguette (`//wand`), p
 | `/fps set site a` · `b` · `c` | Site de bombe |
 | `/fps set maxplayer <n>` | Nombre de joueurs, toujours pair (2 à 20 ; 10 = classé) |
 | `/fps set door true\|false` | Portes et trappes utilisables en partie (touche *Utiliser*, avec leur bruit) |
+| `/fps set doorsync true\|false` | Double porte : ouvrir un battant ouvre aussi l'autre |
 | `/fps info` · `/fps clear …` | Voir ou effacer les réglages |
 
 Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aussi). Ta carte est partagée avec tout le monde dès que tu lances une partie dessus.
@@ -118,7 +119,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 ## 🧱 Le mode construction
 
 - **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts.
-- **Survie, créatif, spectateur** (`/gm 0`, `1`, `3`).
+- **Survie, créatif, spectateur** (`/gm 0`, `1`, `3`), et **FPS** (`/gm 2`) pour essayer sa carte, même sur un serveur de construction.
 - **WorldEdit intégré** : plus de 40 commandes `//` (remplir, copier, coller, tourner, sphères, cylindres, annuler…). Sur un serveur de construction en ligne, réservé à ses OP : le relais vérifie et envoie les blocs à tous.
 - **Des blocs qui se posent comme on s'y attend** : escaliers face à toi (à l'envers au plafond), dalles, portes, trappes, vitres qui se raccordent, bannières.
 - **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`).

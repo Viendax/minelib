@@ -542,6 +542,8 @@ pub struct Renderer {
     mirror_count: usize,
     /// Reflets en raytracing (option graphique).
     raytracing: bool,
+    /// Qualité du raytracing ajustée au temps GPU mesuré.
+    rt_quality: rt::RtQuality,
     pub adapter_name: String,
     /// Type de la carte qui dessine (dédiée, intégrée, logicielle…).
     pub device_type: wgpu::DeviceType,
@@ -916,6 +918,7 @@ impl Renderer {
             mirror_lights: [[[0.0; 4]; MAX_MIRROR_LIGHTS]; 3],
             mirror_count: 0,
             raytracing: false,
+            rt_quality: rt::RtQuality::default(),
             backend,
             surface,
             device,
@@ -1760,8 +1763,8 @@ impl Renderer {
             screen: [
                 self.config.width as f32,
                 self.config.height as f32,
-                0.0,
-                0.0,
+                self.rt_quality.uniforms()[0],
+                self.rt_quality.uniforms()[1],
             ],
             held_pos: held_light(p).0,
             held_color: held_light(p).1,
@@ -1933,7 +1936,12 @@ impl Renderer {
             ],
             cur_view_proj: view_proj.to_cols_array_2d(),
             prev_view_proj: prev.to_cols_array_2d(),
-            screen: [world_size.0 as f32, world_size.1 as f32, 0.0, 0.0],
+            screen: [
+                world_size.0 as f32,
+                world_size.1 as f32,
+                self.rt_quality.uniforms()[0],
+                self.rt_quality.uniforms()[1],
+            ],
             held_pos: held_light(p).0,
             held_color: held_light(p).1,
             rt: self.rt_globals(),
@@ -2146,6 +2154,11 @@ impl Renderer {
         self.marker(Marker::PresentEnd);
         if let Some(t) = &mut self.gpu_timer {
             if let Some(g) = t.after_submit(&self.device) {
+                if self.raytracing {
+                    self.rt_quality.update(g.scene);
+                } else {
+                    self.rt_quality = rt::RtQuality::default();
+                }
                 perf::gpu(g);
             }
         }

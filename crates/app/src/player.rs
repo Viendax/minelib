@@ -411,6 +411,11 @@ impl Player {
                     };
                     // On ne monte que contre la planche ; à côté, on peut descendre.
                     let climb = if touching { climb } else { climb.min(0.0) };
+                    // S'éloigner du mur (dos à l'échelle, on avance) : on descend en restant
+                    // accroché jusqu'au sol, on ne se décolle pas de l'échelle en l'air.
+                    let away = wish.dot(-wall);
+                    let leaving = away > 0.3 && !self.on_ground;
+                    let climb = if leaving { -1.0 } else { climb };
                     // Accroupi : plus lent (et silencieux, voir `ladder_noise`).
                     let cap = if m.sneak {
                         LADDER_SNEAK_SPEED
@@ -432,6 +437,19 @@ impl Player {
                         vy0.clamp(0.0, cap)
                     };
                     self.vel.y = from + (target - from).clamp(-step, step);
+                    // À l'horizontale, on suit les touches comme au sol (sans glisser : immobile
+                    // sur l'échelle, on ne bouge pas), sans jamais s'écarter du mur en l'air.
+                    let mut flat_wish = wish * cap;
+                    if !self.on_ground {
+                        flat_wish -= -wall * flat_wish.dot(-wall).max(0.0);
+                    }
+                    let k = (dt * 14.0).min(1.0);
+                    self.vel.x += (flat_wish.x - self.vel.x) * k;
+                    self.vel.z += (flat_wish.z - self.vel.z) * k;
+                    if !self.on_ground {
+                        let out = Vec3::new(self.vel.x, 0.0, self.vel.z).dot(-wall).max(0.0);
+                        self.vel -= -wall * out;
+                    }
                     let flat = Vec3::new(self.vel.x, 0.0, self.vel.z);
                     if flat.length() > cap {
                         let f = flat.normalize() * cap;
@@ -1119,6 +1137,35 @@ mod tests {
                 "descend (fps {fps}) : y = {}",
                 p.pos.y
             );
+            // Dos à l'échelle, on avance : on descend accroché jusqu'au sol, puis on part.
+            let mut p = Player::new(Vec3::new(9.4, 15.0, 8.5));
+            p.yaw = -std::f32::consts::FRAC_PI_2; // vers −X (dos au mur)
+            p.update(&w, &still, dt);
+            let mut left_in_air = false;
+            for _ in 0..600 {
+                p.update(&w, &up, dt);
+                if p.pos.y > 11.001 && !p.on_ladder {
+                    left_in_air = true;
+                }
+            }
+            assert!(!left_in_air, "décollé de l'échelle en l'air (fps {fps})");
+            assert!(
+                p.pos.x < 9.0,
+                "parti une fois au sol (fps {fps}) : x = {}",
+                p.pos.x
+            );
+            // Immobile sur l'échelle : aucune glissade de côté.
+            let mut p = Player::new(Vec3::new(9.4, 14.0, 8.5));
+            p.update(&w, &still, dt);
+            p.vel.z = 3.0;
+            for _ in 0..64 {
+                p.update(&w, &still, dt);
+            }
+            let z = p.pos.z;
+            for _ in 0..64 {
+                p.update(&w, &still, dt);
+            }
+            assert!((p.pos.z - z).abs() < 1e-3, "glisse de côté (fps {fps})");
         }
     }
 

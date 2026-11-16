@@ -2340,3 +2340,14 @@ mod count_tests {
         assert!(n < 4096, "{n} blocs");
     }
 }
+
+#[cfg(test)]
+mod dump_keys {
+    #[test]
+    #[ignore]
+    fn keys() {
+        for d in &super::registry().defs {
+            eprintln!("K {}", d.key);
+        }
+    }
+}

@@ -268,10 +268,13 @@ pub struct FpsMap {
 impl FpsMap {
     /// Bit de `max_players` : portes utilisables en partie.
     pub const DOORS: u8 = 0x80;
+    /// Bit de `max_players` : une double porte s'ouvre d'un coup (`/fps set doorsync true`).
+    pub const DOOR_SYNC: u8 = 0x40;
+    const FLAGS: u8 = Self::DOORS | Self::DOOR_SYNC;
 
     /// Joueurs d'une partie sur cette carte.
     pub fn players(&self) -> u8 {
-        match self.max_players & !Self::DOORS {
+        match self.max_players & !Self::FLAGS {
             n @ 2..=20 => n & !1,
             _ => 10,
         }
@@ -279,16 +282,29 @@ impl FpsMap {
 
     /// Nombre de joueurs choisi (0 : par défaut).
     pub fn chosen_players(&self) -> u8 {
-        self.max_players & !Self::DOORS
+        self.max_players & !Self::FLAGS
     }
 
     pub fn set_players(&mut self, n: u8) {
-        self.max_players = (self.max_players & Self::DOORS) | (n & !Self::DOORS);
+        self.max_players = (self.max_players & Self::FLAGS) | (n & !Self::FLAGS);
     }
 
     /// Portes et trappes s'ouvrent et se ferment pendant la partie.
     pub fn doors(&self) -> bool {
         self.max_players & Self::DOORS != 0
+    }
+
+    /// Les deux battants d'une double porte s'ouvrent et se ferment ensemble.
+    pub fn door_sync(&self) -> bool {
+        self.max_players & Self::DOOR_SYNC != 0
+    }
+
+    pub fn set_door_sync(&mut self, on: bool) {
+        if on {
+            self.max_players |= Self::DOOR_SYNC;
+        } else {
+            self.max_players &= !Self::DOOR_SYNC;
+        }
     }
 
     pub fn set_doors(&mut self, on: bool) {

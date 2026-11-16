@@ -313,7 +313,7 @@ pub fn use_door(
         };
         let mut opened: HashMap<[i32; 3], BlockId> =
             doors.iter().map(|(c, e)| (*c, BlockId(e[1]))).collect();
-        crate::session::toggle_hinged_with(&get, &mut opened, pos, look)
+        crate::session::toggle_door_pair_with(&get, &mut opened, pos, look, m.map.door_sync())
             .into_iter()
             .map(|(c, b)| (c, b.0, doors.get(&c).map_or(get(c).0, |e| e[1])))
             .collect()

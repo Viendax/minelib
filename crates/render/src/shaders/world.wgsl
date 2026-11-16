@@ -329,7 +329,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
     // Au loin, le reflet s'efface doucement, comme le brouillard de fin de vue : de 60 % à
     // 100 % de 4 chunks (≈ 38 → 64 blocs) ; au-delà la surface est opaque (et aucun rayon
     // n'est lancé : plus de FPS).
-    let reflect_fade = 1.0 - smoothstep(REFLECT_RANGE * 0.6, REFLECT_RANGE, dist);
+    let reflect_fade = 1.0 - smoothstep(refl_range() * 0.6, refl_range(), dist);
     if reflections && i.reflect > 0.0 && reflect_fade > 0.0 {
         let v = to_frag / max(dist, 1e-4);
         let r = reflect(v, n);
@@ -934,6 +934,10 @@ struct RayHit {
 /// total, rebonds compris), avec le même fondu vers le ciel que la fin de la vue ; et les
 /// surfaces plus loin que ça de la caméra ne reflètent plus.
 const REFLECT_RANGE: f32 = 64.0;
+/// Portée des reflets réduite quand le GPU est à la peine (`screen.w`, 0 = pleine portée).
+fn refl_range() -> f32 {
+    return select(REFLECT_RANGE, clamp(g.screen.w, 8.0, REFLECT_RANGE), g.screen.w > 0.0);
+}
 /// Reflets des métaux : rien au-delà de 4 blocs, flou et fondu à partir de 3.
 const METAL_RANGE: f32 = 4.0;
 const METAL_BLUR: f32 = 3.0;
@@ -1087,9 +1091,11 @@ fn trace(o0: vec3<f32>, d0: vec3<f32>, short: bool) -> vec4<f32> {
     // Miroir dans le miroir : on continue tant que le reflet apporte encore quelque chose
     // (au plus 64 rebonds ; borne lue dans les uniformes pour que le compilateur ne
     // déroule pas la boucle).
-    let max_bounces = 64 + i32(g.screen.w);
+    // Qualité adaptative (calculée côté CPU d'après le temps GPU) : nombre de rebonds dans
+    // `screen.z`, portée dans `screen.w`.
+    let max_bounces = max(i32(g.screen.z), 1);
     var travelled = 0.0;
-    let range = select(REFLECT_RANGE, METAL_RANGE, short);
+    let range = select(refl_range(), METAL_RANGE, short);
     ray_blur = select(0.0, 1.0, short);
     for (var bounce = 0; bounce < max_bounces; bounce++) {
         var h = march(o, d, range - travelled);
@@ -1114,10 +1120,10 @@ fn trace(o0: vec3<f32>, d0: vec3<f32>, short: bool) -> vec4<f32> {
             return vec4<f32>(color, a);
         }
         // Brouillard de fin de portée, comme en fin de vue : vers la couleur du ciel.
-        let far = travelled + min(h.t, REFLECT_RANGE);
-        color = mix(color, sky_color(d), smoothstep(REFLECT_RANGE * 0.6, REFLECT_RANGE, far));
+        let far = travelled + min(h.t, range);
+        color = mix(color, sky_color(d), smoothstep(range * 0.6, range, far));
         travelled = far;
-        if h.k <= 0.0 || bounce == max_bounces - 1 || thr * h.k < 0.02 || travelled >= REFLECT_RANGE {
+        if h.k <= 0.0 || bounce == max_bounces - 1 || thr * h.k < 0.02 || travelled >= range {
             acc += thr * color;
             return vec4<f32>(acc, 1.0);
         }

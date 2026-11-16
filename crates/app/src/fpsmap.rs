@@ -42,6 +42,10 @@ pub fn load(dir: &Path) -> FpsMap {
             m.set_players(v.trim().parse().unwrap_or(0));
             continue;
         }
+        if k.trim() == "portes_doubles" {
+            m.set_door_sync(v.trim() == "1");
+            continue;
+        }
         if k.trim() == "portes" {
             m.set_doors(v.trim() == "1");
             continue;
@@ -77,6 +81,9 @@ pub fn save(dir: &Path, m: &FpsMap) -> Result<()> {
     }
     if m.doors() {
         s += "portes=1\n";
+    }
+    if m.door_sync() {
+        s += "portes_doubles=1\n";
     }
     fs::write(dir.join(FILE), s)?;
     Ok(())

@@ -277,7 +277,76 @@ pub fn read_level(dir: &Path) -> Result<McLevel> {
 
 /// Bloc Minelib pour un état de bloc moderne (1.13+) : nom + propriétés.
 pub fn map_block_state(full: &str, props: &HashMap<String, String>) -> BlockId {
-    modern_block(full, props).unwrap_or_else(|| map_block_name(full))
+    recent_block(full)
+        .or_else(|| modern_block(full, props))
+        .unwrap_or_else(|| map_block_name(full))
+}
+
+/// Blocs récents de Minecraft (1.17 et après) sans équivalent exact : le bloc de Minelib
+/// le plus proche à l'œil (ils devenaient de la pierre ou du vide, d'où des trous et des
+/// textures fausses dans les cartes importées).
+fn recent_block(full: &str) -> Option<BlockId> {
+    let n = full.strip_prefix("minecraft:").unwrap_or(full);
+    let reg = registry::registry();
+    let k = match n {
+        "calcite" => "stone_diorite_smooth",
+        "pearlescent_froglight" => "sea_lantern",
+        "ochre_froglight" => "glowstone",
+        "verdant_froglight" => "lamp_on",
+        "netherite_block" => "coal_block",
+        "honey_block" | "honeycomb_block" => "concrete_orange",
+        "dragon_egg" => "obsidian",
+        "grindstone" | "stonecutter" => "smooth_stone",
+        "lectern" => "bookshelf",
+        "beehive" | "bee_nest" => "planks_birch",
+        "bell" => "gold_block",
+        "stripped_bamboo_block" | "bamboo_block" | "bamboo_mosaic" => "hay",
+        "iron_chain" | "chain" => "iron_bars",
+        "player_wall_head" | "player_head" => "skull",
+        "moss_carpet" => "carpet_green",
+        "pale_moss_carpet" => "carpet_silver",
+        "bush" | "short_dry_grass" | "tall_dry_grass" => "plant:tallgrass",
+        "wildflowers" | "pink_petals" | "leaf_litter" => "plant:dandelion",
+        "sweet_berry_bush" => "plant:fern",
+        "tuff" | "polished_tuff" | "chiseled_tuff" => "stone_andesite",
+        "dripstone_block" => "hardened_clay",
+        "amethyst_block" | "budding_amethyst" => "purpur",
+        "raw_iron_block" => "iron_block",
+        "raw_gold_block" => "gold_block",
+        "raw_copper_block" => "concrete_orange",
+        "mud" | "packed_mud" => "coarse_dirt",
+        "sculk" => "wool_black",
+        "reinforced_deepslate" => "stonebrick",
+        "target" => "hay",
+        "lodestone" => "stonebrick_carved",
+        "respawn_anchor" => "obsidian_crying",
+        _ if n.ends_with("_shelf") => "bookshelf",
+        _ if n.starts_with("dead_") && n.ends_with("_coral_block") => "stone_andesite",
+        _ if n.ends_with("_coral_block") => "wool_pink",
+        _ if n.ends_with("_froglight") => "glowstone",
+        _ if n.contains("copper") && !n.contains("ore") => {
+            let oxid = n.contains("oxidized") || n.contains("weathered");
+            let block = if oxid {
+                "prismarine"
+            } else {
+                "concrete_orange"
+            };
+            if n.ends_with("_slab") {
+                return reg
+                    .by_key(&format!("slab:{block}:bottom"))
+                    .or_else(|| reg.by_key(block));
+            }
+            if n.contains("_bulb") || n.contains("lantern") {
+                "lamp_on"
+            } else if n.contains("_door") || n.contains("_trapdoor") || n.contains("_bars") {
+                return None;
+            } else {
+                block
+            }
+        }
+        _ => return None,
+    };
+    reg.by_key(k)
 }
 
 const MODERN_DYES: [&str; 16] = [
@@ -462,7 +531,17 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         } else {
             "lower"
         };
-        let side = registry::door_side(horizontal(prop("facing")), prop("open") == Some("true"));
+        let open = prop("open") == Some("true");
+        let mut side = registry::door_side(horizontal(prop("facing")), open);
+        // Porte ouverte gonds à droite : le battant se range de l'autre côté de la case.
+        if open && prop("hinge") == Some("right") {
+            side = match side {
+                0 => 1,
+                1 => 0,
+                4 => 5,
+                _ => 4,
+            };
+        }
         return key(&format!("door_{}:{half}:{side}", registry::door_key(d)));
     }
     if let Some(w) = n.strip_suffix("_trapdoor") {
@@ -698,8 +777,9 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 }
 
 /// Version du convertisseur : un monde converti par une version plus ancienne l'est de
-/// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein).
-pub const IMPORT_VERSION: u32 = 2;
+/// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
+/// récents, au lieu de pierre ou de vide).
+pub const IMPORT_VERSION: u32 = 3;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {

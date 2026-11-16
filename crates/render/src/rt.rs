@@ -240,8 +240,69 @@ pub fn solid(def: &minelib_world::registry::BlockDef) -> bool {
     matches!(def.shape, Shape::Cube) && !def.translucent
 }
 
+/// Qualité adaptative du raytracing : baisse dès que la scène coûte trop au GPU (miroirs
+/// face à face, grande étendue d'eau…), remonte doucement quand il y a de la marge.
+/// 1 = pleine qualité (64 rebonds, 64 blocs), `MIN_QUALITY` = 2 rebonds, 16 blocs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RtQuality(pub f32);
+
+pub const MIN_QUALITY: f32 = 0.15;
+/// Temps de scène visé (ms) : au-dessus on baisse, bien en dessous on remonte.
+const SCENE_HIGH_MS: f32 = 6.0;
+const SCENE_LOW_MS: f32 = 3.5;
+
+impl Default for RtQuality {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl RtQuality {
+    /// Nouveau temps GPU de la scène (ms).
+    pub fn update(&mut self, scene_ms: f32) {
+        let q = self.0;
+        self.0 = if scene_ms > SCENE_HIGH_MS * 3.0 {
+            q * 0.5 // gros pic : on coupe fort tout de suite
+        } else if scene_ms > SCENE_HIGH_MS {
+            q * 0.9
+        } else if scene_ms < SCENE_LOW_MS {
+            q + 0.01
+        } else {
+            q
+        }
+        .clamp(MIN_QUALITY, 1.0);
+    }
+
+    /// (rebonds, portée en blocs) pour les uniformes (`screen.zw`).
+    pub fn uniforms(self) -> [f32; 2] {
+        let t = ((self.0 - MIN_QUALITY) / (1.0 - MIN_QUALITY)).clamp(0.0, 1.0);
+        let bounces = (2.0 + 62.0 * t * t).round();
+        let range = 16.0 + 48.0 * t;
+        [bounces, range]
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raytracing_quality_drops_on_gpu_spikes_and_recovers_slowly() {
+        let mut q = super::RtQuality::default();
+        assert_eq!(q.uniforms(), [64.0, 64.0]);
+        q.update(270.0);
+        assert!(q.0 <= 0.5);
+        for _ in 0..30 {
+            q.update(9.0);
+        }
+        assert_eq!(q.0, super::MIN_QUALITY);
+        assert_eq!(q.uniforms(), [2.0, 16.0]);
+        q.update(4.5);
+        assert_eq!(q.0, super::MIN_QUALITY);
+        for _ in 0..200 {
+            q.update(2.0);
+        }
+        assert_eq!(q.0, 1.0);
+    }
+
     use super::*;
 
     #[test]
