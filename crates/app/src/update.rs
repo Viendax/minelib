@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 91;
+pub const VERSION: u32 = 92;
 const REPO: &str = "https://api.github.com/repos/Viendax/minelib/releases";
 const EVERY: Duration = Duration::from_secs(600);
 

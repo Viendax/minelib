@@ -263,8 +263,45 @@ impl Player {
 
     /// Échelle touchée (côté du mur où elle est accrochée : 0 +X, 1 −X, 4 +Z, 5 −Z) : il
     /// faut être contre sa planche, pas seulement dans sa case.
-    fn ladder(&self, world: &World) -> Option<u8> {
-        let (min, max) = self.bounds();
+    /// Renvoie aussi si l'on touche sa planche (on n'y monte que là) ; sinon on est
+    /// seulement dans la moitié de sa case côté mur, où l'on ne tombe pas.
+    fn ladder(&self, world: &World) -> Option<(u8, bool)> {
+        let (min0, max0) = self.bounds();
+        let mut held = None;
+        // Moitié de la case côté mur (on y reste accroché, on peut y descendre).
+        let lo = min0.floor().as_ivec3();
+        let hi = (max0 - Vec3::splat(TOUCH)).floor().as_ivec3();
+        for y in lo.y..=hi.y {
+            for z in lo.z..=hi.z {
+                for x in lo.x..=hi.x {
+                    let def = world.get(x, y, z).def();
+                    let Some(side) = def.key.strip_prefix("ladder:") else {
+                        continue;
+                    };
+                    let Ok(side) = side.parse::<u8>() else {
+                        continue;
+                    };
+                    let o = Vec3::new(x as f32, y as f32, z as f32);
+                    let (a, b) = match side {
+                        0 => (Vec3::new(0.5, 0.0, 0.0), Vec3::ONE),
+                        1 => (Vec3::ZERO, Vec3::new(0.5, 1.0, 1.0)),
+                        4 => (Vec3::new(0.0, 0.0, 0.5), Vec3::ONE),
+                        _ => (Vec3::ZERO, Vec3::new(1.0, 1.0, 0.5)),
+                    };
+                    let (a, b) = (o + a, o + b);
+                    if min0.x < b.x
+                        && max0.x > a.x
+                        && min0.y < b.y
+                        && max0.y > a.y
+                        && min0.z < b.z
+                        && max0.z > a.z
+                    {
+                        held = Some(side);
+                    }
+                }
+            }
+        }
+        let (min, max) = (min0, max0);
         let pad = Vec3::new(0.02, 0.0, 0.02);
         let (min, max) = (min - pad, max + pad);
         let lo = min.floor().as_ivec3();
@@ -288,12 +325,12 @@ impl Player {
                             && max.z > a.z
                     });
                     if touches {
-                        return side.parse().ok();
+                        return side.parse().ok().map(|s| (s, true));
                     }
                 }
             }
         }
-        None
+        held.map(|s| (s, false))
     }
 
     pub fn update(&mut self, world: &World, m: &MoveInput, dt: f32) {
@@ -350,9 +387,10 @@ impl Player {
         }
         // Échelle (comme dans CS) : vers l'avant on monte, ou on descend en regardant vers
         // le bas ; sans rien, on reste accroché ; un saut nous en décroche.
+        let was_on_ladder = self.on_ladder;
         self.on_ladder = false;
         if !self.flying && !self.noclip {
-            if let Some(side) = self.ladder(world) {
+            if let Some((side, touching)) = self.ladder(world) {
                 let wall = match side {
                     0 => Vec3::X,
                     1 => -Vec3::X,
@@ -371,6 +409,8 @@ impl Player {
                     } else {
                         m.forward.signum()
                     };
+                    // On ne monte que contre la planche ; à côté, on peut descendre.
+                    let climb = if touching { climb } else { climb.min(0.0) };
                     // Accroupi : plus lent (et silencieux, voir `ladder_noise`).
                     let cap = if m.sneak {
                         LADDER_SNEAK_SPEED
@@ -384,8 +424,13 @@ impl Player {
                     };
                     // On prend de la vitesse : la pleine vitesse en LADDER_RAMP secondes.
                     let step = LADDER_SPEED / LADDER_RAMP * dt;
-                    // En arrivant sur l'échelle en tombant : on s'y rattrape aussitôt.
-                    let from = vy0.clamp(-cap, cap);
+                    // En arrivant sur l'échelle en tombant : arrêté net (on reprend de la
+                    // vitesse ensuite, comme d'habitude).
+                    let from = if was_on_ladder {
+                        vy0.clamp(-cap, cap)
+                    } else {
+                        vy0.clamp(0.0, cap)
+                    };
                     self.vel.y = from + (target - from).clamp(-step, step);
                     let flat = Vec3::new(self.vel.x, 0.0, self.vel.z);
                     if flat.length() > cap {
@@ -990,6 +1035,25 @@ mod tests {
             w.set(9, y, 8, ladder);
         }
         for fps in [false, true] {
+            // Dans la moitié de la case côté mur, sans toucher la planche : on ne tombe pas,
+            // et en tombant on s'y rattrape net.
+            let mut p = Player::new(Vec3::new(9.25, 15.0, 8.5));
+            p.vel.y = -12.0;
+            let none = MoveInput {
+                fps,
+                ..Default::default()
+            };
+            p.update(&w, &none, 1.0 / 64.0);
+            assert!(
+                p.on_ladder && p.vel.y == 0.0,
+                "rattrapé net (fps {fps}) : {}",
+                p.vel.y
+            );
+            let y = p.pos.y;
+            for _ in 0..64 {
+                p.update(&w, &none, 1.0 / 64.0);
+            }
+            assert!((p.pos.y - y).abs() < 1e-3, "tenu sans toucher (fps {fps})");
             let mut p = Player::new(Vec3::new(9.4, 11.0, 8.5));
             p.yaw = std::f32::consts::FRAC_PI_2; // vers +X (le mur)
             let dt = 1.0 / 64.0;
@@ -997,9 +1061,10 @@ mod tests {
                 fps,
                 ..Default::default()
             };
-            // Dans la case de l'échelle mais pas contre sa planche : rien.
-            p.update(&w, &still, dt);
-            assert!(!p.on_ladder, "pas contre la planche (fps {fps})");
+            // Hors de la moitié de la case côté mur : pas accroché.
+            let mut far = Player::new(Vec3::new(9.1, 11.0, 8.5));
+            far.update(&w, &still, dt);
+            assert!(!far.on_ladder, "trop loin (fps {fps})");
             let up = MoveInput {
                 forward: 1.0,
                 fps,
