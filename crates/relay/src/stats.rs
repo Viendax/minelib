@@ -589,6 +589,7 @@ mod tests {
             score: 25,
             rounds: 20,
             teamkills: 0,
+            kicked: false,
         };
         st.apply_match(&MatchSummary {
             map_sig: [0; 32],

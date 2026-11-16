@@ -65,6 +65,12 @@ pub fn set_cutouts(masks: Vec<[u16; 16]>) {
 /// Couche de texture d'une face (0..6, 6 = plante en croix) d'un bloc.
 pub fn face_tex(id: BlockId, face: u32) -> u32 {
     let t = id.def().tex;
+    // Bûche couchée : les cernes aux deux bouts, l'écorce ailleurs.
+    match crate::registry::log_axis(id) {
+        1 => return if face < 2 { t[0] } else { t[1] } as u32,
+        2 => return if face >= 4 { t[0] } else { t[1] } as u32,
+        _ => {}
+    }
     (match face {
         2 => t[0],
         3 => t[2],
@@ -1174,6 +1180,38 @@ fn mesh_block(
                                     mx,
                                     id,
                                     lit,
+                                );
+                            }
+                        }
+                        // Pot de fleurs : la terre dedans (4/16, sous le bord) et les parois
+                        // intérieures, plus foncées.
+                        if def.key == "flower_pot" {
+                            let lit = [light_at(b); 6];
+                            let e = 0.001;
+                            let s16 = |v: f32| v / 16.0;
+                            let (a, z0, z1, top) = (s16(6.0), s16(10.0), s16(4.0), s16(6.0));
+                            let inner = def.tex[2] as u32;
+                            let dirt = BlockId::DIRT.def().tex[0] as u32;
+                            // (min, max, seule face gardée, texture)
+                            let parts: [([f32; 3], [f32; 3], usize, u32); 5] = [
+                                ([a - e, z1, a], [a, top, z0], 0, inner),
+                                ([z0, z1, a], [z0 + e, top, z0], 1, inner),
+                                ([a, z1, a - e], [z0, top, a], 4, inner),
+                                ([a, z1, z0], [z0, top, z0 + e], 5, inner),
+                                ([a, z1 - e, a], [z0, z1, z0], 2, dirt),
+                            ];
+                            for (mn, mx, keep, t) in parts {
+                                emit_box_t(
+                                    out,
+                                    [wx + mn[0], wy + mn[1], wz + mn[2]],
+                                    [wx + mx[0], wy + mx[1], wz + mx[2]],
+                                    id,
+                                    &|_| t,
+                                    lit,
+                                    0,
+                                    |f| f != keep,
+                                    &|p| p,
+                                    true,
                                 );
                             }
                         }

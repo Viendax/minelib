@@ -129,7 +129,9 @@ pub struct SaveData {
     pub generator: Generator,
     pub player: Option<PlayerState>,
     pub clock: f64,
-    pub night: bool,
+    /// Heure du jour (0..24) et cycle arrêté.
+    pub time: f32,
+    pub time_fixed: bool,
     pub inventory: Option<Inventory>,
 }
 
@@ -269,7 +271,8 @@ pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
             generator: Generator::Procedural,
             player: None,
             clock: 0.0,
-            night: false,
+            time: crate::daytime::START_HOUR,
+            time_fixed: false,
             inventory: None,
         },
     )?;
@@ -301,9 +304,10 @@ fn write_level(dir: &Path, d: &SaveData) -> Result<()> {
         d.meta.name, d.meta.seed, d.meta.created, d.meta.last_played
     );
     s += &format!(
-        "clock={}\nnight={}\ngenerator={}\n",
+        "clock={}\nheure={}\nheure_fixe={}\ngenerator={}\n",
         d.clock,
-        d.night as u8,
+        d.time,
+        d.time_fixed as u8,
         d.generator.name()
     );
     s += &format!(
@@ -441,7 +445,15 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
             .get("generator")
             .map_or(Generator::Procedural, |g| Generator::parse(g)),
         clock: kv.get("clock").and_then(|v| v.parse().ok()).unwrap_or(0.0),
-        night: kv.get("night").is_some_and(|v| v == "1"),
+        // Anciens mondes : « night=1 » devient minuit.
+        time: kv.get("heure").and_then(|v| v.parse().ok()).unwrap_or(
+            if kv.get("night").is_some_and(|v| *v == "1") {
+                0.0
+            } else {
+                crate::daytime::START_HOUR
+            },
+        ),
+        time_fixed: kv.get("heure_fixe").is_some_and(|v| *v == "1"),
         meta,
         player,
         inventory,
@@ -609,7 +621,8 @@ fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
         },
         player: Some(player),
         clock: 0.0,
-        night: false,
+        time: crate::daytime::START_HOUR,
+        time_fixed: false,
         inventory: None,
     };
     Ok((data, world))

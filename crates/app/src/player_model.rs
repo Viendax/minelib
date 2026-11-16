@@ -229,8 +229,10 @@ fn emit_box(
 pub enum Held {
     /// Bloc, avec sa forme (dalle, bannière de deux blocs…).
     Block(BlockId),
-    /// Autre objet (baguette, arme) : longue pièce de couleur unie (sRGB).
+    /// Arme : longue pièce de couleur unie (sRGB), pointée vers le regard.
     Stick([u8; 3]),
+    /// Baguette de WorldEdit (couleur sRGB), tenue droite.
+    Wand([u8; 3]),
     /// Torche (couleur de sa flamme, sRGB) : bâton levé devant la main, flamme au bout.
     Torch([u8; 3]),
 }
@@ -261,9 +263,10 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     // Bras : pivot à l'épaule (y = 22 depuis la hanche : 10), balancement inverse des
     // jambes ; le bras droit (x +6) tient l'objet un peu levé devant lui.
     for (side, sign) in [(-6.0f32, -1.0f32), (6.0, 1.0)] {
-        // Bras tendu vers l'avant (rotation positive : la main part vers −z).
+        // Bras tendu vers l'avant (rotation positive : la main part vers −z), qui suit
+        // un peu le regard (l'objet tenu est tourné comme à la 1re personne).
         let raise = if side > 0.0 && pose.held.is_some() {
-            0.65
+            (0.65 + 0.6 * pose.pitch.clamp(-1.4, 1.4)).clamp(0.0, 2.0)
         } else {
             0.0
         };
@@ -281,6 +284,35 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     out
 }
 
+/// Boîtes (coins min, max, monde) qui font l'ombre du joueur : jambes, corps, bras,
+/// tête.
+pub fn shadow_boxes(pose: &Pose) -> Vec<([f32; 3], [f32; 3])> {
+    let mut out: Vec<([f32; 3], [f32; 3])> = Vec::with_capacity(5);
+    for (i, (xf, mn, mx, _)) in parts(pose).into_iter().enumerate() {
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for k in 0..8 {
+            let c = Vec3::new(
+                if k & 1 == 0 { mn[0] } else { mx[0] },
+                if k & 2 == 0 { mn[1] } else { mx[1] },
+                if k & 4 == 0 { mn[2] } else { mx[2] },
+            );
+            let w = xf.transform_point3(c);
+            lo = lo.min(w);
+            hi = hi.max(w);
+        }
+        // Les deux jambes ensemble (une seule boîte).
+        if i == 1 {
+            let l = &mut out[0];
+            l.0 = Vec3::from(l.0).min(lo).into();
+            l.1 = Vec3::from(l.1).max(hi).into();
+        } else {
+            out.push((lo.into(), hi.into()));
+        }
+    }
+    out
+}
+
 /// Repère de la main droite (pixels → monde) : poing en y = 0, objet devant (−z).
 fn hand_frame(pose: &Pose) -> Option<Mat4> {
     parts(pose)
@@ -290,9 +322,20 @@ fn hand_frame(pose: &Pose) -> Option<Mat4> {
         .map(|p| p.0 * Mat4::from_translation(Vec3::new(0.0, -10.0, 0.0)))
 }
 
-/// Repère d'une torche tenue : un peu devant le poing, penchée vers l'avant, bâton sur +y.
-fn torch_frame(hand: Mat4) -> Mat4 {
-    hand * Mat4::from_translation(Vec3::new(0.0, 0.0, -3.0)) * Mat4::from_rotation_x(-0.95)
+/// Repère d'un objet tenu (pixels → monde) : au poing (`fwd` pixels devant), tourné
+/// comme à la 1re personne par rapport au regard (`rot`, voir `hand::block_rotation`).
+fn item_frame(pose: &Pose, hand: Mat4, rot: Mat4, fwd: f32) -> Mat4 {
+    let at = hand.transform_point3(Vec3::new(0.0, 0.0, -fwd));
+    Mat4::from_translation(at)
+        * Mat4::from_rotation_y(-pose.yaw)
+        * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4))
+        * rot
+        * Mat4::from_scale(Vec3::splat(PX))
+}
+
+/// Repère d'une torche tenue : un peu devant le poing, bâton sur +y.
+fn torch_frame(pose: &Pose, hand: Mat4) -> Mat4 {
+    item_frame(pose, hand, crate::hand::torch_rotation(), 3.0)
 }
 
 /// Pavés de l'objet tenu : repère, coins (pixels), sorte.
@@ -323,7 +366,7 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
             let k = 32.0 / 1.8 / 16.0;
             let top = flame.iter().copied().max().unwrap_or(1).max(1) as u32;
             let bright = flame.map(|c| (c as u32 * 255 / top) as u8);
-            let t = torch_frame(hand);
+            let t = torch_frame(pose, hand);
             vec![
                 (
                     t,
@@ -351,10 +394,11 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
             } else {
                 def.boxes()
             };
+            let frame = item_frame(pose, hand, crate::hand::block_rotation(), 0.0);
             let part = |a: [u8; 3], b: [u8; 3], dy: f32, layer: u16| {
                 let (min, max) = block_box(a, b, dy);
                 (
-                    hand,
+                    frame,
                     min,
                     max,
                     RayBoxKind::Block {
@@ -370,10 +414,11 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
                     },
                 )
             };
-            if def.key.starts_with("banner_") {
-                // Bannière : deux blocs de haut, comme posée (panneau fin, deux moitiés).
+            if let Some((top, bottom)) = crate::hand::tall_layers(block) {
+                // Bannière, porte : deux blocs de haut, comme posées (panneau fin, deux
+                // moitiés).
                 let (a, b) = boxes[0];
-                vec![part(a, b, 0.0, t[1]), part(a, b, -6.0, t[2])]
+                vec![part(a, b, 0.0, top as u16), part(a, b, -6.0, bottom as u16)]
             } else {
                 // Au plus deux morceaux (escalier) : le reste des pavés est pour le corps.
                 boxes
@@ -384,9 +429,15 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
             }
         }
         Held::Stick(c) => vec![(
-            hand,
+            item_frame(pose, hand, Mat4::IDENTITY, 0.0),
             [-0.75, -1.0, -10.0],
             [0.75, 0.5, 0.0],
+            RayBoxKind::Flat(c),
+        )],
+        Held::Wand(c) => vec![(
+            item_frame(pose, hand, crate::hand::wand_rotation(), 2.0),
+            [-0.75, -2.0, -0.75],
+            [0.75, 9.0, 0.75],
             RayBoxKind::Flat(c),
         )],
     }
@@ -396,7 +447,7 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
 pub fn torch_tip(pose: &Pose) -> Option<Vec3> {
     match (hand_frame(pose), pose.held) {
         (Some(hand), Some(Held::Torch(_))) => {
-            Some(torch_frame(hand).transform_point3(Vec3::new(0.0, 8.0, 0.0)))
+            Some(torch_frame(pose, hand).transform_point3(Vec3::new(0.0, 8.0, 0.0)))
         }
         _ => None,
     }

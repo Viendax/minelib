@@ -24,6 +24,44 @@ pub struct Hand {
     last: Option<Item>,
 }
 
+// Rotation de chaque objet tenu par rapport au regard (x à droite, y en haut, −z
+// devant). La même sert à la 1re personne et sur le modèle du joueur (F5, reflets,
+// les autres joueurs) : changer l'une change l'autre.
+
+/// Bloc tenu.
+pub fn block_rotation() -> Mat4 {
+    Mat4::from_rotation_y(0.8) * Mat4::from_rotation_x(0.12)
+}
+
+/// Torche tenue.
+pub fn torch_rotation() -> Mat4 {
+    Mat4::from_rotation_y(0.4) * Mat4::from_rotation_x(0.2)
+}
+
+/// Baguette de WorldEdit (tenue droite).
+pub fn wand_rotation() -> Mat4 {
+    Mat4::from_rotation_y(-0.45) * Mat4::from_rotation_z(0.1)
+}
+
+/// Objet de deux blocs de haut (bannière, porte) : textures du haut et du bas. Dessiné
+/// ainsi partout (inventaire, main, modèle du joueur).
+pub fn tall_layers(block: BlockId) -> Option<(u32, u32)> {
+    let def = block.def();
+    if def.key.starts_with("banner_") {
+        return Some((def.tex[1] as u32, def.tex[2] as u32));
+    }
+    if !def.key.starts_with("door_") {
+        return None;
+    }
+    let other = |k: String| minelib_world::registry::registry().by_key(&k);
+    let own = def.tex[1] as u32;
+    if def.key.contains(":upper:") {
+        other(def.key.replacen(":upper:", ":lower:", 1)).map(|lo| (own, lo.def().tex[1] as u32))
+    } else {
+        other(def.key.replacen(":lower:", ":upper:", 1)).map(|up| (up.def().tex[1] as u32, own))
+    }
+}
+
 fn lin(c: [u8; 3]) -> [f32; 3] {
     c.map(|v| (v as f32 / 255.0).powf(2.2))
 }
@@ -370,11 +408,12 @@ pub fn block_icon(cx: f32, cy: f32, size: f32, block: BlockId) -> Vec<VmVertex> 
     let t = def.tex;
     let layers = [t[0] as u32, t[1] as u32, t[2] as u32];
     let mut out = Vec::new();
-    if def.key.starts_with("banner_") {
-        // Bannière : deux blocs de haut, à plat, moitié du haut sur celle du bas (raccordées
-        // comme une fois posée).
+    let tall = tall_layers(block);
+    if let Some((top, bottom)) = tall {
+        // Deux blocs de haut, à plat, moitié du haut sur celle du bas (raccordées comme
+        // une fois posée).
         let (w, h) = (size / 4.0, size / 2.0);
-        for (layer, y0, y1) in [(layers[1], -h, 0.0), (layers[2], 0.0, h)] {
+        for (layer, y0, y1) in [(top, -h, 0.0), (bottom, 0.0, h)] {
             let corners = [
                 (-w, y1, 0.0, 1.0),
                 (w, y1, 1.0, 1.0),
@@ -509,8 +548,7 @@ impl Hand {
             Item::Torch(chem) => {
                 let m = base
                     * Mat4::from_translation(Vec3::new(0.47, -0.5, -0.98))
-                    * Mat4::from_rotation_y(0.4)
-                    * Mat4::from_rotation_x(0.2)
+                    * torch_rotation()
                     * Mat4::from_scale(Vec3::splat(0.5))
                     * Mat4::from_translation(Vec3::new(-0.5, -0.1, -0.5));
                 torch_model(&mut out, proj * m, chem, light);
@@ -519,8 +557,7 @@ impl Hand {
                 // Tenue droite, logo en haut, légèrement tournée vers le centre.
                 let m = base
                     * Mat4::from_translation(Vec3::new(0.36, -0.58, -0.92))
-                    * Mat4::from_rotation_y(-0.45)
-                    * Mat4::from_rotation_z(0.1)
+                    * wand_rotation()
                     * Mat4::from_scale(Vec3::splat(0.34));
                 crate::wand::model(&mut out, proj * m, light);
             }
@@ -530,8 +567,7 @@ impl Hand {
                 let layers = [t[0] as u32, t[1] as u32, t[2] as u32];
                 let m = base
                     * Mat4::from_translation(Vec3::new(0.5, -0.36, -1.02))
-                    * Mat4::from_rotation_y(0.8)
-                    * Mat4::from_rotation_x(0.12)
+                    * block_rotation()
                     * Mat4::from_scale(Vec3::splat(0.26))
                     * Mat4::from_translation(Vec3::splat(-0.5));
                 match def.shape {
@@ -543,13 +579,12 @@ impl Hand {
                         } else {
                             def.boxes()
                         };
-                        // Bannière : deux blocs de haut, comme posée.
-                        let halves: &[(f32, [u32; 3])] = if def.key.starts_with("banner_") {
-                            &[(0.5, [layers[1]; 3]), (-0.5, [layers[2]; 3])]
-                        } else {
-                            &[(0.0, layers)]
+                        // Bannière, porte : deux blocs de haut, comme posées.
+                        let halves: Vec<(f32, [u32; 3])> = match tall_layers(b) {
+                            Some((top, bottom)) => vec![(0.5, [top; 3]), (-0.5, [bottom; 3])],
+                            None => vec![(0.0, layers)],
                         };
-                        for &(dy, half) in halves {
+                        for &(dy, half) in &halves {
                             // Moitié déplacée par la transformation (pas par ses
                             // coordonnées, dont la texture est tirée).
                             let m = m * Mat4::from_translation(Vec3::new(0.0, dy, 0.0));

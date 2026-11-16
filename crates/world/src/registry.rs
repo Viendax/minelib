@@ -1760,6 +1760,29 @@ impl Fluid {
     }
 }
 
+/// Axe d'une bûche : 0 debout (Y), 1 couchée le long de X, 2 le long de Z.
+pub fn log_axis(id: BlockId) -> u8 {
+    static M: OnceLock<Vec<u8>> = OnceLock::new();
+    let m = M.get_or_init(|| {
+        registry()
+            .defs
+            .iter()
+            .map(|d| {
+                if !d.key.starts_with("log_") {
+                    0
+                } else if d.key.ends_with(":x") {
+                    1
+                } else if d.key.ends_with(":z") {
+                    2
+                } else {
+                    0
+                }
+            })
+            .collect()
+    });
+    m.get(id.0 as usize).copied().unwrap_or(0)
+}
+
 /// Fluide et niveau du bloc (`None` : pas un fluide).
 pub fn fluid(id: BlockId) -> Option<(Fluid, u8)> {
     static M: OnceLock<Vec<Option<(Fluid, u8)>>> = OnceLock::new();
@@ -1814,14 +1837,31 @@ fn fluids_and_heads(b: &mut Builder) {
         ..barrier
     });
     b.r.keys.insert("fluid_barrier".into(), id);
-    // Pot de fleurs : de la terre dans le pot (le dessus de la texture est un anneau,
-    // on voyait le sol à travers) ; nénuphar : on peut marcher dessus.
-    let dirt = b.tex(&p("dirt"));
+    // Nénuphar : on peut marcher dessus.
+    // Pot de fleurs : dessus = le bord (texture à trou) ; « dessous » = ses parois
+    // intérieures, plus foncées (le maillage y ajoute la terre, plus bas que le bord).
+    let dark = b.tex(&TexSrc::Tint("flower_pot", [150, 150, 150]));
     if let Some(&i) = b.r.keys.get("flower_pot") {
-        b.r.defs[i as usize].tex[0] = dirt;
+        b.r.defs[i as usize].tex[2] = dark;
     }
     if let Some(&i) = b.r.keys.get("lily_pad") {
         b.r.defs[i as usize].solid = true;
+    }
+    // Bûches couchées (le long de X ou de Z) : posées contre un mur, ou importées.
+    for (log, _) in LOGS.iter() {
+        let Some(&i) = b.r.keys.get(*log) else {
+            continue;
+        };
+        let base = b.r.defs[i as usize].clone();
+        for axis in ["x", "z"] {
+            let key = format!("{log}:{axis}");
+            let id = b.r.defs.len() as u16;
+            b.r.defs.push(BlockDef {
+                key: key.clone(),
+                ..base.clone()
+            });
+            b.r.keys.insert(key, id);
+        }
     }
     // Têtes contre un mur (côté du mur : 0 +X, 1 −X, 4 +Z, 5 −Z).
     let skull = b.r.defs[b.r.keys["skull"] as usize].clone();

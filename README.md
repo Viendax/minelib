@@ -40,6 +40,8 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 - **34 armes et 5 grenades** : pistolets, mitraillettes, fusils à pompe, fusils d'assaut, fusils de précision ; HE, flash, fumigène, molotov et leurre (qui imite *ton* arme principale).
 - **Tout ce qu'on attend d'un compétitif** : menu d'achat par camp, économie, bombe et kit, prolongations, tableau des scores, fil des éliminations avec tirs en tête, à travers un mur ou une fumée, armes et grenades qu'on lâche et qu'on ramasse.
 - **Ton équipe, d'un coup d'œil** : un triangle à la couleur de chaque coéquipier, visible à travers les murs, et son nom quand tu le vois ; en haut, le bandeau des joueurs des deux camps (les morts s'assombrissent), et ta couleur préférée parmi vert, jaune, orange, bleu et violet.
+- **Votes et pauses comme dans CS** (Échap pendant une partie) : proposer d'exclure un coéquipier (tous les autres doivent être d'accord) ou une pause tactique (la majorité ; 3 par équipe, 30 s, au départ de la manche suivante). Le vote s'affiche à gauche : F1 oui, F2 non. Un joueur qui se déconnecte déclenche une pause technique jusqu'à son retour (5 minutes au plus) ; le temps de pause ne compte pas dans les absences.
+- **Ombres des joueurs** au soleil et devant les torches.
 - **Minimap** en haut à droite, avec les règles de CS : tes coéquipiers toujours, les adversaires seulement quand ils sont repérés, les sites de bombe et la bombe quand ton équipe la connaît.
 - **Réseau à 256 Hz** : positions envoyées 256 fois par seconde, prédiction et rembobinage des tirs. À 10 joueurs, l'hôte envoie moins de 1 Mo par seconde.
 
@@ -174,6 +176,7 @@ Les touches sont **physiques** (même place en AZERTY et en QWERTY) et se règle
 | 1 / 2 / 3 / 4 | Principale / pistolet / couteau / grenades | | F4 | Racheter |
 | G | Lâcher l'arme ou la grenade | | E | Ramasser, poser, désamorcer |
 | Tab | Scores | | K (maintenu) | Micro |
+| F5 | Capture d'écran (comme CS) | | F1 / F2 | Voter oui / non |
 
 </details>
 
@@ -191,6 +194,9 @@ Le tchat se navigue avec ← → (Début, Fin, Suppr).
 | `/ami <pseudo>` · `/ami retirer <pseudo>` · `/amis` | Amis (aussi `/friend add <pseudo>`) |
 | `/equipe ct` · `/equipe t` | Changer d'équipe pendant l'échauffement (aussi `/team`) |
 | `/op` · `/deop` · `/ban` · `/unban` | Gérer son serveur de construction |
+| `/timeset <heure>` · `/timefix true\|false` | Régler / arrêter l'heure (`11`, `11.20`, `11:20`, `11h20` ; OP en ligne) |
+| `/fps set time [heure\|default]` | Heure fixe d'une carte FPS (par défaut le soleil de Dust2) |
+| `/worldname <nom>` | Renommer le monde |
 | `//…` | WorldEdit (créatif ; en ligne, OP du serveur seulement) |
 
 </details>

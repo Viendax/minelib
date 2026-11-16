@@ -6,7 +6,15 @@ use std::path::PathBuf;
 use anyhow::Result;
 use glam::{Mat4, Vec3};
 use minelib_platform::{Input, KeyCode, Mouse};
+
 use minelib_render::{FrameParams, FrameStats, Overlay, Renderer, Ui};
+
+/// Boîte (coins min, max, monde) d'un joueur qui fait de l'ombre.
+type ShadowBox = ([f32; 3], [f32; 3]);
+
+/// Menu Échap d'une partie FPS : coéquipiers (identifiant, pseudo), pauses tactiques qui
+/// restent, vote possible maintenant.
+pub type VoteChoices = (Vec<(u64, String)>, u8, bool);
 use minelib_world::raycast::{raycast, Hit};
 use minelib_world::{BlockId, ChunkPos, World, CHUNK_SIZE};
 
@@ -91,6 +99,8 @@ pub struct Session {
     net_dead: bool,
     /// Hôte : la partie commence (elle n'est plus proposée par la recherche).
     pub room_started: Option<bool>,
+    /// Pause de la partie FPS commencée / finie (hôte : à dire au relais).
+    pub room_paused: Option<bool>,
     /// Résultat de la partie à envoyer au relais (classement).
     pub match_result: Option<minelib_net::game::MatchSummary>,
     /// Tableau de fin de partie affiché (résultat, temps depuis la fin).
@@ -134,7 +144,13 @@ pub struct Session {
     /// Hauteur grimpée à pleine vitesse sur une échelle depuis le dernier bruit.
     ladder_climb: f32,
     pub inventory: Inventory,
-    night: bool,
+    /// Heure du jour (0..24) ; arrêtée (`/timefix`).
+    time_h: f32,
+    time_fixed: bool,
+    /// Heure fixe de la carte FPS (`/fps set time`, aucune : soleil de Dust2), lue une fois.
+    fps_time: Option<Option<f32>>,
+    /// Direction vers le soleil.
+    sun: [f32; 3],
     daylight: f32,
     break_cooldown: f32,
     place_cooldown: f32,
@@ -278,7 +294,11 @@ impl Session {
             player.flying = false;
         }
         let spawn = player.pos;
-        let night = data.night || std::env::var("MINELIB_NIGHT").is_ok_and(|v| v.trim() == "1");
+        let time_h = if std::env::var("MINELIB_NIGHT").is_ok_and(|v| v.trim() == "1") {
+            0.0
+        } else {
+            data.time
+        };
         let radius = cfg
             .view_distance
             .clamp(2, MAX_VIEW_DISTANCE)
@@ -317,6 +337,7 @@ impl Session {
             cursor_free: false,
             screen_size: (1280.0, 720.0),
             room_started: None,
+            room_paused: None,
             dir,
             workers: Workers::new(data.meta.seed, world.generator),
             streamer: Streamer::new(radius),
@@ -329,8 +350,11 @@ impl Session {
             bulk_refused: std::time::Instant::now() - std::time::Duration::from_secs(10),
             ladder_climb: 0.0,
             inventory: data.inventory.unwrap_or_else(Inventory::starter),
-            night,
-            daylight: if night { 0.0 } else { 1.0 },
+            time_h,
+            time_fixed: data.time_fixed,
+            fps_time: None,
+            sun: crate::daytime::sun_dir(time_h),
+            daylight: crate::daytime::daylight(time_h),
             break_cooldown: 0.0,
             place_cooldown: 0.0,
             fov: FOV,
@@ -392,7 +416,8 @@ impl Session {
                 flying: self.player.flying,
             }),
             clock: self.world.clock,
-            night: self.night,
+            time: self.time_h,
+            time_fixed: self.time_fixed,
             inventory: Some(inv),
         };
         save::save_world(&self.dir, &data, &self.world)
@@ -422,7 +447,8 @@ impl Session {
                 flying: self.player.flying,
             }),
             clock: self.world.clock,
-            night: self.night,
+            time: self.time_h,
+            time_fixed: self.time_fixed,
             inventory: None,
         };
         save::save_world(&dir, &data, &self.world)?;
@@ -538,8 +564,7 @@ impl Session {
             }
             self.inventory.update(dt);
             self.tick_torches(dt);
-            let target_day = if self.night { 0.0 } else { 1.0 };
-            self.daylight += (target_day - self.daylight) * (dt * 1.5).min(1.0);
+            self.update_sun(dt);
 
             let k = &self.keys;
             let fps_mode = self.game.mode == GameMode::Fps;
@@ -639,6 +664,7 @@ impl Session {
             } else {
                 self.check_fall();
             }
+            self.smooth_steps(dt);
             if self.game.mode == GameMode::Fps {
                 self.update_fps(input, dt, renderer, typing);
             } else {
@@ -955,9 +981,6 @@ impl Session {
         if self.keys.pressed(input, Action::Inventory) && self.game.mode.has_inventory() {
             self.inventory.toggle();
         }
-        if self.keys.pressed(input, Action::DayNight) {
-            self.night = !self.night;
-        }
         // F5 : 1re personne → 3e de dos → 3e de face (pas en mode FPS).
         if self.keys.pressed(input, Action::Perspective) && self.game.mode != GameMode::Fps {
             self.perspective = (self.perspective + 1) % 3;
@@ -1181,6 +1204,23 @@ impl Session {
             }
             let [x, y, z] = hit.adjacent();
             let free = !self.world.get(x, y, z).is_targetable();
+            // Bûche contre un mur : couchée, dans l'axe de la face visée (comme Minecraft).
+            if let Some(Item::Block(b)) = self.inventory.selected_item() {
+                let key = &b.def().key;
+                if key.starts_with("log_") && hit.normal[1] == 0 {
+                    let base = key.split(':').next().unwrap_or(key);
+                    let axis = if hit.normal[0] != 0 { "x" } else { "z" };
+                    let reg = minelib_world::registry::registry();
+                    if let Some(id) = reg.by_key(&format!("{base}:{axis}")) {
+                        if free && !self.player.overlaps_block([x, y, z]) {
+                            self.dirty.extend(self.world.set(x, y, z, id));
+                            self.use_selected();
+                        }
+                        self.place_cooldown = 0.22;
+                        return;
+                    }
+                }
+            }
             // Bannière : toujours contre le mur visé (posée sur le sol ou au plafond : contre
             // le côté de la case opposé au joueur), quelle que soit sa couleur.
             if let Some(Item::Block(b)) = self.inventory.selected_item() {
@@ -1685,6 +1725,12 @@ impl Session {
                     }
                     return;
                 }
+                // Heure du serveur (à l'arrivée, ou changée par un OP).
+                Event::SetTime { hours, fixed } => {
+                    self.time_h = *hours;
+                    self.time_fixed = *fixed;
+                    return;
+                }
                 // Mode de jeu donné par un OP (ou par défaut du serveur, à l'arrivée).
                 Event::SetGamemode { mode, by } => {
                     if let Some(m) = GameMode::parse(mode) {
@@ -1794,6 +1840,31 @@ impl Session {
         self.apply_net(locals);
     }
 
+    /// Menu Échap d'une partie FPS en ligne : propose un vote à son équipe.
+    pub fn call_vote(&mut self, kind: u8, target: u64) {
+        let locals = match &mut self.net {
+            Some(n) => n.call_vote(kind, target),
+            None => return,
+        };
+        self.apply_net(locals);
+    }
+
+    /// Coéquipiers (identifiant, pseudo) qu'on peut proposer d'exclure, et pauses
+    /// tactiques qui restent ; `None` hors partie FPS en ligne.
+    pub fn vote_choices(&self) -> Option<VoteChoices> {
+        let n = self.net.as_ref()?;
+        let hud = n.hud();
+        let me = n.me();
+        let mates = n
+            .rows()
+            .into_iter()
+            .filter(|r| r.team == hud.team && r.id != me)
+            .map(|r| (r.id, r.pseudo))
+            .collect();
+        let started = hud.phase != minelib_net::game::phase::WARMUP;
+        Some((mates, hud.timeouts, started && hud.vote.is_none()))
+    }
+
     fn apply_net(&mut self, locals: Vec<crate::netgame::Local>) {
         use crate::netgame::Local;
         use minelib_net::game::{reason, CT};
@@ -1831,6 +1902,7 @@ impl Session {
                 Local::Kicked(reason) => {
                     self.kicked = Some(reason);
                 }
+                Local::Paused(on) => self.room_paused = Some(on),
                 Local::Kill(k) => {
                     self.feed.push((k, 0.0));
                     if self.feed.len() > 6 {
@@ -1910,6 +1982,50 @@ impl Session {
     }
 
     /// Mode FPS, à chaque image : menu d'achat, tir, rechargement, choix de l'arme.
+    /// Heure et soleil : le cycle de Minecraft (sauf `/timefix`), ou l'heure fixe de la
+    /// carte en mode FPS (par défaut le soleil de Dust2).
+    fn update_sun(&mut self, dt: f32) {
+        use crate::daytime;
+        if self.game.mode == GameMode::Fps {
+            let t = *self
+                .fps_time
+                .get_or_insert_with(|| crate::fpsmap::load_time(&self.dir));
+            match t {
+                Some(h) => {
+                    self.sun = daytime::sun_dir(h);
+                    self.daylight = daytime::daylight(h);
+                }
+                None => {
+                    self.sun = daytime::dust2_sun();
+                    self.daylight = 1.0;
+                }
+            }
+            return;
+        }
+        if !self.time_fixed {
+            self.time_h = daytime::advance(self.time_h, dt);
+        }
+        self.sun = daytime::sun_dir(self.time_h);
+        self.daylight = daytime::daylight(self.time_h);
+    }
+
+    /// Marche montée ou descendue (dalle, demi-bloc) : les pieds changent de hauteur d'un
+    /// coup, la caméra suit en douceur (tous les modes de jeu).
+    fn smooth_steps(&mut self, dt: f32) {
+        let grounded = self.player.on_ground && !self.player.flying;
+        if let (true, Some(prev)) = (grounded, self.step_prev) {
+            let dy = self.player.pos.y - prev;
+            if dy.abs() > 0.01 && dy.abs() < 0.65 {
+                self.step_offset = (self.step_offset - dy).clamp(-0.65, 0.65);
+            }
+        }
+        self.step_prev = grounded.then_some(self.player.pos.y);
+        self.step_offset *= (-dt * 14.0).exp();
+        if self.step_offset.abs() < 1e-3 {
+            self.step_offset = 0.0;
+        }
+    }
+
     fn update_fps(&mut self, input: &Input, dt: f32, renderer: &Renderer, typing: bool) {
         let (w, h) = renderer.size();
         let size = (w as f32, h as f32);
@@ -1917,6 +2033,18 @@ impl Session {
             self.fps.buy_open = !self.fps.buy_open;
         } else {
             self.fps.buy_input(input, size);
+        }
+        // Vote de son équipe : F1 oui, F2 non (comme dans CS).
+        if !typing {
+            let yes = self.keys.pressed(input, Action::FpsVoteYes);
+            let no = self.keys.pressed(input, Action::FpsVoteNo);
+            if yes || no {
+                let locals = match &mut self.net {
+                    Some(n) if n.hud().vote.is_some_and(|v| v.can_vote) => n.ballot(yes),
+                    _ => Vec::new(),
+                };
+                self.apply_net(locals);
+            }
         }
         let free = input.grabbed && !typing && !self.fps.buy_open;
         let k = &self.keys;
@@ -1999,20 +2127,6 @@ impl Session {
         // doux en marchant ou accroupi (eux ne les entendent pas).
         let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
         let alive = !(self.net.is_some() && self.net_dead);
-        // Marche montée ou descendue (dalle) : les pieds changent de hauteur d'un coup, la
-        // caméra suit en douceur.
-        let grounded = self.player.on_ground && !self.player.flying;
-        if let (true, Some(prev)) = (grounded, self.step_prev) {
-            let dy = self.player.pos.y - prev;
-            if dy.abs() > 0.01 && dy.abs() < 0.65 {
-                self.step_offset = (self.step_offset - dy).clamp(-0.65, 0.65);
-            }
-        }
-        self.step_prev = grounded.then_some(self.player.pos.y);
-        self.step_offset *= (-dt * 14.0).exp();
-        if self.step_offset.abs() < 1e-3 {
-            self.step_offset = 0.0;
-        }
         // Échelle à pleine vitesse (pas accroupi) : ses barreaux, un bruit tous les deux (les
         // autres l'entendent aussi, voir l'hôte).
         let vy = self.player.vel.y.abs();
@@ -2143,7 +2257,9 @@ impl Session {
     /// Vue du joueur avec le recul du mode FPS (la vue remonte pendant une rafale).
     fn view_with_punch(&self) -> Mat4 {
         if self.game.mode != GameMode::Fps {
-            return self.player.view();
+            // Marche montée ou descendue : la caméra suit en douceur (voir `smooth_steps`).
+            let eye = self.player.eye() + Vec3::Y * self.step_offset;
+            return Mat4::look_to_rh(eye, self.player.look_dir(), Vec3::Y);
         }
         let p = (self.player.pitch + self.fps.punch.0.to_radians()).clamp(-1.55, 1.55);
         let y = self.player.yaw + self.fps.punch.1.to_radians();
@@ -2434,6 +2550,45 @@ impl Session {
             }
             return;
         }
+        // Heure de la carte : l'heure actuelle, une heure donnée, ou « default » (le soleil
+        // de Dust2 dans CS2).
+        if lower.first().map(String::as_str) == Some("set")
+            && matches!(lower.get(1).map(String::as_str), Some("time" | "heure"))
+        {
+            let time = match lower.get(2).map(String::as_str) {
+                None => Some(self.time_h),
+                Some("default" | "defaut" | "défaut") => None,
+                Some(t) => match crate::daytime::parse(t) {
+                    Some(h) => Some(h),
+                    None => {
+                        self.chat.say(
+                            "Usage : /fps set time [heure | default] (11, 11:20, 11.20, 11h20).",
+                            chat::GREY,
+                        );
+                        return;
+                    }
+                },
+            };
+            match crate::fpsmap::save_time(&self.dir, time) {
+                Ok(()) => {
+                    self.fps_time = Some(time);
+                    self.chat.say(
+                        match time {
+                            Some(h) => format!(
+                                "Heure de la carte : {}. Nouvelle signature : c'est une nouvelle carte.",
+                                crate::daytime::format(h)
+                            ),
+                            None => "Heure de la carte : soleil de Dust2 (par défaut). Nouvelle \
+                                     signature : c'est une nouvelle carte."
+                                .to_string(),
+                        },
+                        chat::LIGHT_PURPLE,
+                    );
+                }
+                Err(e) => self.chat.say(format!("heure.txt : {e:#}"), chat::RED),
+            }
+            return;
+        }
         // Double porte : les deux battants s'ouvrent ensemble.
         if lower.first().map(String::as_str) == Some("set")
             && matches!(
@@ -2715,6 +2870,66 @@ impl Session {
                     ),
                 }
             }
+            // Heure du jour (sur un serveur de construction : OP, pour tout le monde).
+            "timeset" | "heure" => {
+                let Some(h) = arg.and_then(crate::daytime::parse) else {
+                    self.chat.say(
+                        format!(
+                            "Utilisation : /timeset <heure> (11, 11:20, 11.20, 11h20) ; il est {}.",
+                            crate::daytime::format(self.time_h)
+                        ),
+                        chat::RED,
+                    );
+                    return;
+                };
+                if self.build.is_some() {
+                    self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                        action: minelib_net::proto::SERVER_TIMESET,
+                        pseudo: String::new(),
+                        reason: h.to_string(),
+                    });
+                } else {
+                    self.time_h = h;
+                    self.chat.say(
+                        format!("Il est {}.", crate::daytime::format(h)),
+                        chat::YELLOW,
+                    );
+                }
+            }
+            // Arrête ou relance le temps qui passe.
+            "timefix" => {
+                let fixed = match arg.map(str::to_lowercase).as_deref() {
+                    Some("true" | "on" | "oui" | "1") => true,
+                    Some("false" | "off" | "non" | "0") => false,
+                    _ => {
+                        self.chat.say(
+                            format!(
+                                "Utilisation : /timefix true|false (actuellement : {}).",
+                                self.time_fixed
+                            ),
+                            chat::RED,
+                        );
+                        return;
+                    }
+                };
+                if self.build.is_some() {
+                    self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                        action: minelib_net::proto::SERVER_TIMEFIX,
+                        pseudo: String::new(),
+                        reason: (fixed as u8).to_string(),
+                    });
+                } else {
+                    self.time_fixed = fixed;
+                    self.chat.say(
+                        if fixed {
+                            "Heure arrêtée."
+                        } else {
+                            "Le temps passe de nouveau."
+                        },
+                        chat::YELLOW,
+                    );
+                }
+            }
             // Renomme le monde (liste des mondes) ; sur un serveur de construction (OP),
             // aussi son nom dans la liste des serveurs.
             "worldname" | "nommonde" => {
@@ -2763,6 +2978,8 @@ impl Session {
                     "/fly : autorise ou interdit le vol en survie",
                     "/heal : rend tous les coeurs",
                     "/worldname <nom> : renomme le monde",
+                    "/timeset <heure> : règle l'heure (11, 11:20, 11.20, 11h20)",
+                    "/timefix true|false : arrête ou relance le temps",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block",
                     "Vol : deux appuis rapides sur Espace",
                     "Mode FPS : clic molette = ping (pas d'inventaire ni de blocs)",
@@ -2876,6 +3093,18 @@ impl Session {
         let time = hud.time.ceil() as u32;
         let clock = format!("{}:{:02}", time / 60, time % 60);
         let (mid, mid_col) = match hud.phase {
+            _ if hud.pause != 0 => {
+                let t = hud.pause_left.ceil() as u32;
+                let kind = if hud.pause == minelib_net::game::PAUSE_TECHNICAL {
+                    "Pause technique"
+                } else {
+                    "Pause tactique"
+                };
+                (
+                    format!("{kind} {}:{:02}", t / 60, t % 60),
+                    [1.0, 0.75, 0.3, 1.0],
+                )
+            }
             phase::WARMUP => {
                 if hud.time > 0.0 {
                     (format!("Début dans {time} s"), [1.0, 0.9, 0.35, 1.0])
@@ -3014,6 +3243,56 @@ impl Session {
             team_color(my_team),
             line,
         );
+        // Vote de son équipe : à gauche, comme dans CS (F1 oui, F2 non).
+        if let Some(v) = hud.vote {
+            let name = |id: u64| {
+                rows.iter()
+                    .find(|r| r.id == id)
+                    .map_or_else(|| "?".to_string(), |r| r.pseudo.clone())
+            };
+            let title = if v.kind == minelib_net::game::VOTE_KICK {
+                format!("Exclure {} ?", name(v.target))
+            } else {
+                "Pause tactique ?".to_string()
+            };
+            let by = format!("Proposé par {}", name(v.caller));
+            let count = format!(
+                "Oui {}   Non {}   ({} oui nécessaires)  {} s",
+                v.yes,
+                v.no,
+                v.need,
+                v.left.ceil() as u32
+            );
+            let keys = if v.can_vote {
+                format!(
+                    "{} : oui   {} : non",
+                    self.keys
+                        .get(Action::FpsVoteYes)
+                        .map_or_else(|| "-".into(), |b| b.name(input)),
+                    self.keys
+                        .get(Action::FpsVoteNo)
+                        .map_or_else(|| "-".into(), |b| b.name(input))
+                )
+            } else {
+                "Vote enregistré".to_string()
+            };
+            let lines = [title, by, count, keys];
+            let w = lines
+                .iter()
+                .map(|l| Ui::text_width(l, s))
+                .fold(0.0, f32::max)
+                + 10.0 * s;
+            let (x, y) = (6.0 * s, size.1 * 0.35);
+            ui.rect(x, y, w, 50.0 * s, [0.0, 0.0, 0.0, 0.6]);
+            for (i, l) in lines.into_iter().enumerate() {
+                let col = if i == 0 {
+                    [1.0, 0.85, 0.35, 1.0]
+                } else {
+                    [0.9, 0.9, 0.9, 1.0]
+                };
+                ui.text(x + 5.0 * s, y + 4.0 * s + i as f32 * 11.0 * s, s, col, l);
+            }
+        }
         // Mort : qui on suit.
         if let Some(name) = &self.spectating {
             let t = format!("Tu regardes {name} (clic : suivant)");
@@ -3766,7 +4045,7 @@ impl Session {
                     chem.and_then(|i| minelib_world::flame::CHEMICALS.get(i))
                         .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb),
                 )),
-                Some(Item::Wand) => Some(Held::Stick([70, 60, 90])),
+                Some(Item::Wand) => Some(Held::Wand([70, 60, 90])),
                 None => None,
             }
         } else {
@@ -3790,12 +4069,16 @@ impl Session {
             Vec::new()
         };
         model.extend_from_slice(&self.head_vertices);
+        let mut shadows: Vec<(Vec3, Vec<ShadowBox>)> = Vec::new();
+        if visible && self.spectating.is_none() {
+            shadows.push((self.player.pos, crate::player_model::shadow_boxes(&pose)));
+        }
         // Partie en ligne : les autres joueurs.
         if let Some(n) = &self.net {
             for v in n.views().iter().filter(|v| v.alive) {
                 let held = (v.weapon != 255).then_some(Held::Stick([38, 38, 42]));
                 let w = self.walks.get(&v.pseudo).copied().unwrap_or_default();
-                model.extend(crate::player_model::build(&crate::player_model::Pose {
+                let other = crate::player_model::Pose {
                     feet: v.pos,
                     yaw: v.yaw,
                     pitch: v.pitch,
@@ -3805,7 +4088,9 @@ impl Session {
                     light: self.hand_light,
                     held,
                     skin: self.skins.of(&v.pseudo),
-                }));
+                };
+                shadows.push((v.pos, crate::player_model::shadow_boxes(&other)));
+                model.extend(crate::player_model::build(&other));
             }
             // Bombe sur le dos de celui qui la porte.
             for v in n.views().iter().filter(|v| v.alive) {
@@ -3886,7 +4171,7 @@ impl Session {
         if let Some(b) = &self.build {
             for o in b.others.values() {
                 let w = self.walks.get(&o.pseudo).copied().unwrap_or_default();
-                model.extend(crate::player_model::build(&crate::player_model::Pose {
+                let other = crate::player_model::Pose {
                     feet: o.pos,
                     yaw: o.yaw,
                     pitch: o.pitch,
@@ -3896,9 +4181,21 @@ impl Session {
                     light: self.hand_light,
                     held: None,
                     skin: self.skins.of(&o.pseudo),
-                }));
+                };
+                shadows.push((o.pos, crate::player_model::shadow_boxes(&other)));
+                model.extend(crate::player_model::build(&other));
             }
         }
+        // Ombres des joueurs : les plus proches de la caméra (place limitée).
+        shadows.sort_by(|a, b| {
+            a.0.distance_squared(cam)
+                .total_cmp(&b.0.distance_squared(cam))
+        });
+        let shadow_boxes: Vec<([f32; 3], [f32; 3])> = shadows
+            .into_iter()
+            .flat_map(|s| s.1)
+            .take(minelib_render::MAX_SHADOW_BOXES)
+            .collect();
         // Le joueur se voit dans les miroirs (et l'eau, le métal), même à la 1re personne.
         // Avec son vrai skin (envoyé à la carte quand il change).
         let skin = self.skins.mine();
@@ -3955,6 +4252,7 @@ impl Session {
             smokes: &smokes,
             held_light_pos: crate::player_model::torch_tip(&pose),
             ray_light: self.hand_light,
+            shadow_boxes: &shadow_boxes,
             viewmodel: &hand,
             entities: &model,
             eye: cam,
@@ -3981,6 +4279,7 @@ impl Session {
             },
             time,
             daylight: self.daylight,
+            sun: self.sun,
             ui: Some(ui),
             overlay: show_debug.then_some(&self.overlay),
         };

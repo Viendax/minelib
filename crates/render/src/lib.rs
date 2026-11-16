@@ -203,6 +203,31 @@ struct Globals {
     ray_min: [[f32; 4]; MAX_RAY_BOXES],
     ray_max: [[f32; 4]; MAX_RAY_BOXES],
     ray_uv: [[f32; 4]; MAX_RAY_BOXES],
+    /// Ombres des joueurs : x = nombre de boîtes ; coins min et max (monde).
+    shadow_info: [f32; 4],
+    shadow_min: [[f32; 4]; MAX_SHADOW_BOXES],
+    shadow_max: [[f32; 4]; MAX_SHADOW_BOXES],
+}
+
+/// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre.
+pub const MAX_SHADOW_BOXES: usize = 48;
+
+/// Uniformes des ombres des joueurs : (nombre, coins min, coins max).
+fn shadow_globals(
+    boxes: &[([f32; 3], [f32; 3])],
+) -> (
+    [f32; 4],
+    [[f32; 4]; MAX_SHADOW_BOXES],
+    [[f32; 4]; MAX_SHADOW_BOXES],
+) {
+    let n = boxes.len().min(MAX_SHADOW_BOXES);
+    let mut mn = [[0.0; 4]; MAX_SHADOW_BOXES];
+    let mut mx = [[0.0; 4]; MAX_SHADOW_BOXES];
+    for (i, (a, b)) in boxes.iter().take(n).enumerate() {
+        mn[i] = [a[0], a[1], a[2], 0.0];
+        mx[i] = [b[0], b[1], b[2], 0.0];
+    }
+    ([n as f32, 0.0, 0.0, 0.0], mn, mx)
 }
 
 /// Nombre maximal de pavés du joueur vus dans les reflets.
@@ -334,6 +359,8 @@ pub struct FrameParams<'a> {
     pub time: f32,
     /// Lumière du jour : 1 = plein jour, 0 = nuit.
     pub daylight: f32,
+    /// Direction vers le soleil (unitaire).
+    pub sun: [f32; 3],
     /// Interface (inventaire, barre d'objets…) dessinée par-dessus tout.
     pub ui: Option<&'a Ui>,
     /// Main et objet tenu (triangles déjà projetés).
@@ -350,6 +377,9 @@ pub struct FrameParams<'a> {
     /// Fumigènes à dessiner en volume.
     pub smokes: &'a [SmokeVolume<'a>],
     pub ray_light: [f32; 3],
+    /// Boîtes (coins min, max, monde) des joueurs qui font de l'ombre au soleil et aux
+    /// torches.
+    pub shadow_boxes: &'a [([f32; 3], [f32; 3])],
     /// Écran de debug (F3) à afficher par-dessus la scène.
     pub overlay: Option<&'a Overlay>,
 }
@@ -1744,12 +1774,13 @@ impl Renderer {
         let (sel_min, sel_max) = selection(p.selected);
         self.outline = p.selected.is_some();
         let rg = ray_globals(p.ray_boxes, p.ray_light);
+        let sg = shadow_globals(p.shadow_boxes);
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: [p.eye.x, p.eye.y, p.eye.z, p.time],
             fog: [p.fog_start, p.fog_end, self.aspect(), 0.0],
-            sun: [0.45, 0.82, 0.35, 0.48],
+            sun: [p.sun[0], p.sun[1], p.sun[2], 0.48],
             sel_min,
             sel_max,
             light: [
@@ -1781,6 +1812,9 @@ impl Renderer {
             ray_min: rg.2,
             ray_max: rg.3,
             ray_uv: rg.4,
+            shadow_info: sg.0,
+            shadow_min: sg.1,
+            shadow_max: sg.2,
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
@@ -1920,12 +1954,13 @@ impl Renderer {
         let (sel_min, sel_max) = selection(p.selected);
         self.outline = p.selected.is_some();
         let rg = ray_globals(p.ray_boxes, p.ray_light);
+        let sg = shadow_globals(p.shadow_boxes);
         let globals = Globals {
             view_proj: jittered.to_cols_array_2d(),
             inv_view_proj: jittered.inverse().to_cols_array_2d(),
             cam_pos: [p.eye.x, p.eye.y, p.eye.z, p.time],
             fog: [p.fog_start, p.fog_end, self.aspect(), 0.0],
-            sun: [0.45, 0.82, 0.35, 0.48],
+            sun: [p.sun[0], p.sun[1], p.sun[2], 0.48],
             sel_min,
             sel_max,
             light: [
@@ -1957,6 +1992,9 @@ impl Renderer {
             ray_min: rg.2,
             ray_max: rg.3,
             ray_uv: rg.4,
+            shadow_info: sg.0,
+            shadow_min: sg.1,
+            shadow_max: sg.2,
         };
         self.overlay
             .prepare(&self.device, &self.queue, p.overlay, p.ui, size);
@@ -2382,6 +2420,38 @@ fn aabb_visible(planes: &[Vec4; 4], min: Vec3, max: Vec3) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Les shaders se compilent (erreur de WGSL vue avant de lancer le jeu), et les
+    /// uniformes du monde ont la taille que le shader attend.
+    #[test]
+    fn shaders_are_valid() {
+        use wgpu::naga;
+        for (name, src) in [
+            ("world", include_str!("shaders/world.wgsl")),
+            ("entity", include_str!("shaders/entity.wgsl")),
+            ("viewmodel", include_str!("shaders/viewmodel.wgsl")),
+            ("smoke", include_str!("shaders/smoke.wgsl")),
+        ] {
+            let module = naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            drop(info);
+            if name == "world" {
+                let g = module
+                    .types
+                    .iter()
+                    .find(|(_, t)| t.name.as_deref() == Some("Globals"))
+                    .unwrap();
+                let size = g.1.inner.size(module.to_ctx());
+                assert_eq!(size as usize, std::mem::size_of::<Globals>());
+            }
+        }
+    }
 
     #[test]
     fn frustum_culls_boxes_behind_camera() {

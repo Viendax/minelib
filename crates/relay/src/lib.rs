@@ -234,6 +234,12 @@ struct Room {
     started_at: Option<Instant>,
     away: HashMap<String, (Option<Instant>, f64)>,
     settled: bool,
+    /// Pause en cours (depuis) et temps de pause déjà écoulé : ni dans la durée de la
+    /// partie ni dans les absences.
+    paused_since: Option<Instant>,
+    paused_total: f64,
+    /// Partis pendant la pause : leur absence commence à la reprise.
+    paused_away: HashSet<String>,
     /// Places gardées pour les joueurs d'un lobby qui arrivent (pseudo, depuis).
     reserved: Vec<(String, Instant)>,
     /// Signalements de cette partie (de, contre), comptés à la fin de la partie.
@@ -579,8 +585,14 @@ fn leave_room(st: &mut State, id: u64) {
         let low = p.to_ascii_lowercase();
         let in_roster = room.roster.iter().any(|r| r.eq_ignore_ascii_case(&p));
         if room.kind == 0 && room.started && !room.settled && in_roster {
+            let paused = room.paused_since.is_some();
             let e = room.away.entry(low).or_insert((None, 0.0));
-            e.0.get_or_insert_with(Instant::now);
+            // En pause : l'absence ne compte qu'à la reprise.
+            if !paused {
+                e.0.get_or_insert_with(Instant::now);
+            } else if e.0.is_none() {
+                room.paused_away.insert(p.to_ascii_lowercase());
+            }
         }
     }
     // Garant en attente (ou garant extérieur d'un monde) qui s'en va : simplement retiré,
@@ -1595,6 +1607,30 @@ fn announce(st: &State, room_id: u64, changes: zones::Changes) {
     }
 }
 
+/// Pause d'une partie FPS : les absences s'arrêtent pendant la pause (et reprennent
+/// ensuite), le temps de pause ne compte pas dans la durée de la partie.
+fn room_paused(r: &mut Room, paused: bool) {
+    let now = Instant::now();
+    if paused && r.paused_since.is_none() {
+        r.paused_since = Some(now);
+        for (p, (since, total)) in &mut r.away {
+            if let Some(t) = since.take() {
+                *total += t.elapsed().as_secs_f64();
+                r.paused_away.insert(p.clone());
+            }
+        }
+    } else if !paused {
+        if let Some(t) = r.paused_since.take() {
+            r.paused_total += t.elapsed().as_secs_f64();
+        }
+        for p in std::mem::take(&mut r.paused_away) {
+            if let Some(e) = r.away.get_mut(&p) {
+                e.0.get_or_insert(now);
+            }
+        }
+    }
+}
+
 /// Règle les absences d'une partie FPS (une fois) : chaque joueur du début parti trop
 /// longtemps perd en confiance (rien sous 2 minutes, beaucoup vers 10 minutes sur 30,
 /// abandon jusqu'à la fin). `spared` : exclus par la partie (coéquipiers tués), déjà
@@ -1608,7 +1644,8 @@ fn settle_absences(st: &mut State, room: &mut Room, spared: &[String]) -> HashSe
         return hit;
     };
     room.settled = true;
-    let len = t0.elapsed().as_secs_f64();
+    let pause = room.paused_total + room.paused_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
+    let len = (t0.elapsed().as_secs_f64() - pause).max(1.0);
     for (p, (since, total)) in &room.away {
         let away = total + since.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let pen = stats::Stats::absence_penalty(away, len);
@@ -1754,7 +1791,7 @@ fn try_apply_result(st: &mut State, room_id: u64) {
     let tk_kicked: Vec<String> = summary
         .players
         .iter()
-        .filter(|p| p.teamkills >= 3)
+        .filter(|p| p.teamkills >= 3 || p.kicked)
         .map(|p| p.pseudo.to_ascii_lowercase())
         .collect();
     let mut room = st.rooms.remove(&room_id).expect("partie");
@@ -1846,6 +1883,9 @@ fn open_room(
             applied: false,
             started_at: None,
             away: HashMap::new(),
+            paused_since: None,
+            paused_total: 0.0,
+            paused_away: HashSet::new(),
             settled: false,
             reserved: Vec::new(),
             reports: HashSet::new(),
@@ -1968,6 +2008,7 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
     if r.kind == 0 && r.started && !back {
         return err(ErrorCode::Refused, "Partie déjà commencée.");
     }
+    r.paused_away.remove(&pseudo.to_ascii_lowercase());
     if let Some((since, total)) = r.away.get_mut(&pseudo.to_ascii_lowercase()) {
         if let Some(t) = since.take() {
             *total += t.elapsed().as_secs_f64();
@@ -2705,6 +2746,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         },
                     );
                 }
+                // Heure du serveur.
+                if let Some(c) = st.conns.get(&id) {
+                    let (hours, fixed) = st.servers.time(&server);
+                    transport::push(&c.tx, &Response::SetTime { hours, fixed });
+                }
                 if !st.servers.is_op(&server, &creator, pseudo) {
                     if let (Some(mode), Some(c)) =
                         (st.servers.default_gamemode(&server), st.conns.get(&id))
@@ -2736,6 +2782,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 proto::SERVER_GAMEMODE => servers::Action::Gamemode,
                 proto::SERVER_DEFAULT_GAMEMODE => servers::Action::DefaultGamemode,
                 proto::SERVER_RENAME => servers::Action::Rename,
+                proto::SERVER_TIMESET => servers::Action::TimeSet,
+                proto::SERVER_TIMEFIX => servers::Action::TimeFix,
                 _ => servers::Action::List,
             };
             // Nouveau nom : vide ou trop long refusé avant de vérifier qu'on est OP.
@@ -2748,6 +2796,13 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 .act(&server, &creator, pseudo, act, &target, &reason)
             {
                 Ok(text) => {
+                    // Heure changée : à tous les joueurs du serveur.
+                    if matches!(act, servers::Action::TimeSet | servers::Action::TimeFix) {
+                        let (hours, fixed) = st.servers.time(&server);
+                        for c in st.conns.values().filter(|c| c.room == Some(rid)) {
+                            transport::push(&c.tx, &Response::SetTime { hours, fixed });
+                        }
+                    }
                     // Nom affiché dans la liste des serveurs.
                     if act == servers::Action::Rename {
                         if let Some(r) = st.rooms.get_mut(&rid) {
@@ -3250,6 +3305,14 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             Response::Done
         }
+        Request::RoomPaused { paused } => {
+            if let Some(r) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
+                if r.host == id && r.kind == 0 && r.started {
+                    room_paused(r, paused);
+                }
+            }
+            Response::Done
+        }
         Request::Join { room } => {
             leave_room(st, id);
             join_room(st, id, pseudo, room)
@@ -3278,6 +3341,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             | game::ToHost::Drop { .. }
                             | game::ToHost::Pickup { .. }
                             | game::ToHost::Color(_)
+                            | game::ToHost::Door { .. }
+                            | game::ToHost::CallVote { .. }
+                            | game::ToHost::Ballot(_)
                     )
                 });
             if witness {
@@ -4972,6 +5038,7 @@ mod tests {
                 score: 50,
                 rounds: 18,
                 teamkills: 0,
+                kicked: false,
             }],
         };
         let matches = |p: &Client| {

@@ -13,13 +13,18 @@
 //!   de plus aux T quand ils ont posé ; primes d'élimination selon l'arme ; 300 $ pour
 //!   poser ou désamorcer. Les T encore en vie quand le temps est écoulé ne touchent rien.
 //! - Tir sur un coéquipier : un tiers des dégâts ; élimination d'un coéquipier : −300 $.
+//! - Votes d'équipe (F1 oui, F2 non, 30 s) : exclure un coéquipier (tous les autres
+//!   coéquipiers d'accord), pause tactique (la majorité ; 3 par équipe, 30 s, prise au
+//!   départ de la manche suivante). Un joueur déconnecté : pause technique au départ de la
+//!   manche suivante, jusqu'à son retour (5 minutes au plus).
 
 use std::collections::BTreeMap;
 
 use glam::Vec3;
 use minelib_net::game::{
-    bomb, phase, reason, GroundGun, MatchHud, MatchSummary, ScoreRow, SummaryPlayer, Zone, CT,
-    DROP_BOMB, ITEM_HELMET, ITEM_KEVLAR, ITEM_KIT, ITEM_NADE, T,
+    bomb, phase, reason, GroundGun, MatchHud, MatchSummary, ScoreRow, SummaryPlayer, VoteHud, Zone,
+    CT, DROP_BOMB, ITEM_HELMET, ITEM_KEVLAR, ITEM_KIT, ITEM_NADE, PAUSE_TACTICAL, PAUSE_TECHNICAL,
+    T, VOTE_KICK, VOTE_PAUSE,
 };
 
 use crate::weapons::WEAPONS;
@@ -50,6 +55,13 @@ const OBJECTIVE_REWARD: u32 = 300;
 const TEAMKILL_PENALTY: u32 = 300;
 /// Coéquipiers tués avant d'être exclu de la partie.
 pub const TEAMKILL_KICK: u16 = 3;
+/// Durée d'un vote (s).
+pub const VOTE_S: f32 = 30.0;
+/// Pauses tactiques par équipe et durée (s), comme dans CS2.
+pub const TIMEOUTS: u8 = 3;
+pub const TIMEOUT_S: f32 = 30.0;
+/// Pause technique (joueur déconnecté) : au plus 5 minutes.
+pub const TECH_PAUSE_S: f32 = 300.0;
 pub const KIT_PRICE: u32 = 400;
 pub const KEVLAR_PRICE: u32 = 650;
 pub const HELMET_PRICE: u32 = 1_000;
@@ -104,6 +116,9 @@ pub struct MPlayer {
     pub pref: u8,
     /// Coéquipiers tués dans cette partie (3 : exclu).
     pub teamkills: u16,
+    /// Exclu par un vote de son équipe.
+    #[serde(default)]
+    pub kicked: bool,
     pub pseudo: String,
     pub team: u8,
     pub start_team: u8,
@@ -140,6 +155,13 @@ pub struct MPlayer {
     shots_tick: u32,
     /// Il faudra repartir avec le pistolet de départ (mort pendant la manche).
     pub reset: bool,
+}
+
+impl MPlayer {
+    /// Exclu de la partie (coéquipiers tués, vote de son équipe) : ne revient pas.
+    pub fn excluded(&self) -> bool {
+        self.kicked || self.teamkills >= TEAMKILL_KICK
+    }
 }
 
 /// Où se trouve un joueur (fourni par l'hôte à chaque pas).
@@ -179,6 +201,30 @@ pub enum Ev {
     NewRound,
     /// Trois coéquipiers tués : ce joueur est exclu de la partie.
     TeamKillKick(u64),
+    /// Exclu par un vote de son équipe.
+    VoteKick(u64),
+    /// Pause commencée (true) ou finie : le relais ne compte pas ce temps dans les
+    /// absences.
+    Paused(bool),
+}
+
+/// Vote d'une équipe en cours.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Vote {
+    pub kind: u8,
+    pub team: u8,
+    pub caller: u64,
+    pub target: u64,
+    pub yes: Vec<u64>,
+    pub no: Vec<u64>,
+    pub left: f32,
+}
+
+/// Pause en cours.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Pause {
+    pub kind: u8,
+    pub left: f32,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -223,6 +269,20 @@ pub struct Match {
     ticks: u32,
     /// Portes et trappes changées pendant la partie : case → (bloc actuel, bloc d'origine).
     pub doors: BTreeMap<[i32; 3], [u16; 2]>,
+    /// Votes en cours (un par équipe au plus).
+    #[serde(default)]
+    pub votes: Vec<Vote>,
+    /// Pauses tactiques prises, par équipe de départ (0 = a commencé CT).
+    #[serde(default)]
+    pub timeouts: [u8; 2],
+    /// Pauses tactiques votées, à prendre au prochain départ (équipes de départ).
+    #[serde(default)]
+    pub pending_timeouts: Vec<u8>,
+    /// Un joueur s'est déconnecté : pause technique au prochain départ.
+    #[serde(default)]
+    pub tech_pending: bool,
+    #[serde(default)]
+    pub pause: Option<Pause>,
 }
 
 /// Couleurs de joueurs d'une équipe (voir `multiplayer::PLAYER_COLORS`).
@@ -266,6 +326,24 @@ impl Match {
         fix(&mut self.carrier);
         fix(&mut self.planter);
         fix(&mut self.defuser);
+        self.votes
+            .retain(|v| v.caller != from && v.target != from || to.is_some());
+        for v in &mut self.votes {
+            if let Some(to) = to {
+                for id in [&mut v.caller, &mut v.target]
+                    .into_iter()
+                    .chain(v.yes.iter_mut())
+                    .chain(v.no.iter_mut())
+                {
+                    if *id == from {
+                        *id = to;
+                    }
+                }
+            } else {
+                v.yes.retain(|&i| i != from);
+                v.no.retain(|&i| i != from);
+            }
+        }
         if self.carrier.is_none() && self.bomb == bomb::CARRIED {
             self.bomb = bomb::DROPPED;
         }
@@ -308,6 +386,11 @@ impl Match {
             ground: Vec::new(),
             next_gun: 1,
             ticks: 0,
+            votes: Vec::new(),
+            timeouts: [0, 0],
+            pending_timeouts: Vec::new(),
+            tech_pending: false,
+            pause: None,
         }
     }
 
@@ -558,6 +641,10 @@ impl Match {
                 self.players.insert(id, p);
                 return vec![Ev::TeamKillKick(id)];
             }
+            if p.kicked {
+                self.players.insert(id, p);
+                return vec![Ev::VoteKick(id)];
+            }
             p.present = true;
             p.alive = false;
             p.reset = true;
@@ -605,6 +692,7 @@ impl Match {
                 color: 0,
                 pref: 255,
                 teamkills: 0,
+                kicked: false,
                 pseudo: pseudo.to_string(),
                 team,
                 start_team: if self.swapped { other(team) } else { team },
@@ -659,7 +747,16 @@ impl Match {
         } else if let Some(p) = self.players.get_mut(&id) {
             p.present = false;
             p.alive = false;
+            // Déconnecté (pas exclu) : pause technique au prochain départ.
+            if !p.excluded() && self.phase != phase::GAME_OVER {
+                self.tech_pending = true;
+            }
         }
+        for v in &mut self.votes {
+            v.yes.retain(|&i| i != id);
+            v.no.retain(|&i| i != id);
+        }
+        self.votes.retain(|v| v.caller != id && v.target != id);
     }
 
     /// Changer d'équipe : refusé. Les équipes sont faites à l'entrée (matchmaking, lobby
@@ -1004,6 +1101,10 @@ impl Match {
     pub fn tick(&mut self, dt: f32, places: &BTreeMap<u64, Place>) -> Vec<Ev> {
         let mut ev = Vec::new();
         self.ticks = self.ticks.wrapping_add(1);
+        self.tick_votes(dt, &mut ev);
+        if self.tick_pause(dt, &mut ev) {
+            return ev;
+        }
         self.time -= dt;
         match self.phase {
             phase::WARMUP => self.tick_warmup(dt, &mut ev),
@@ -1444,6 +1545,7 @@ impl Match {
                 score: p.score,
                 rounds: p.rounds,
                 teamkills: p.teamkills,
+                kicked: p.kicked,
             })
             .collect();
         players.sort_by(|a, b| a.pseudo.cmp(&b.pseudo));
@@ -1499,6 +1601,25 @@ impl Match {
             alive: [self.alive(CT) as u8, self.alive(T) as u8],
             site: self.site,
             players: self.present() as u8,
+            pause: self.pause.map_or(0, |p| p.kind),
+            pause_left: self.pause.map_or(0.0, |p| p.left.max(0.0)),
+            timeouts: TIMEOUTS.saturating_sub(self.timeouts[self.start_side(team)]),
+            vote: self
+                .votes
+                .iter()
+                .find(|v| v.team == team && p.is_some())
+                .map(|v| VoteHud {
+                    kind: v.kind,
+                    caller: v.caller,
+                    target: v.target,
+                    yes: v.yes.len() as u8,
+                    no: v.no.len() as u8,
+                    need: self.needed(v) as u8,
+                    left: v.left.max(0.0),
+                    can_vote: self.voters(v).contains(&id)
+                        && !v.yes.contains(&id)
+                        && !v.no.contains(&id),
+                }),
         }
     }
 
@@ -1547,6 +1668,214 @@ impl Match {
     }
 
     /// Immobile (départ de manche, mi-temps, fin).
+    /// Équipe de départ (indice de `timeouts`) des joueurs de l'équipe `team` (côté
+    /// actuel).
+    fn start_side(&self, team: u8) -> usize {
+        ((team == T) != self.swapped) as usize
+    }
+
+    /// Joueurs qui votent : coéquipiers présents, sauf le joueur visé.
+    fn voters(&self, v: &Vote) -> Vec<u64> {
+        self.players
+            .iter()
+            .filter(|(&id, p)| {
+                p.present && p.team == v.team && !(v.kind == VOTE_KICK && id == v.target)
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Oui nécessaires : tous les votants (exclusion), la majorité (pause).
+    fn needed(&self, v: &Vote) -> usize {
+        let n = self.voters(v).len();
+        if v.kind == VOTE_KICK {
+            n
+        } else {
+            n / 2 + 1
+        }
+    }
+
+    /// `id` propose un vote à son équipe (`VOTE_KICK` : exclure `target`).
+    pub fn call_vote(&mut self, id: u64, kind: u8, target: u64) -> Result<Vec<Ev>, String> {
+        let Some(me) = self.players.get(&id).filter(|p| p.present) else {
+            return Err("Tu n'es pas dans la partie.".into());
+        };
+        let team = me.team;
+        if self.phase == phase::GAME_OVER {
+            return Err("La partie est finie.".into());
+        }
+        if self.votes.iter().any(|v| v.team == team) {
+            return Err("Un vote est déjà en cours dans ton équipe.".into());
+        }
+        let what = match kind {
+            VOTE_KICK => {
+                let Some(t) = self
+                    .players
+                    .get(&target)
+                    .filter(|t| t.present && t.team == team && target != id)
+                else {
+                    return Err("Ce joueur n'est pas un coéquipier.".into());
+                };
+                format!("exclure {}", t.pseudo)
+            }
+            VOTE_PAUSE => {
+                if !self.started() {
+                    return Err("Pas de pause pendant l'échauffement.".into());
+                }
+                let side = self.start_side(team);
+                let pending = self
+                    .pending_timeouts
+                    .iter()
+                    .filter(|&&s| s as usize == side);
+                if self.timeouts[side] as usize + pending.count() >= TIMEOUTS as usize {
+                    return Err(format!("Ton équipe a déjà pris ses {TIMEOUTS} pauses."));
+                }
+                "une pause tactique".to_string()
+            }
+            _ => return Err("Vote inconnu.".into()),
+        };
+        let v = Vote {
+            kind,
+            team,
+            caller: id,
+            target: if kind == VOTE_KICK { target } else { u64::MAX },
+            yes: vec![id],
+            no: Vec::new(),
+            left: VOTE_S,
+        };
+        let caller = me.pseudo.clone();
+        self.votes.push(v);
+        let mut ev = vec![Ev::Say(format!(
+            "{caller} propose {what} (F1 oui, F2 non)."
+        ))];
+        self.settle_votes(&mut ev);
+        Ok(ev)
+    }
+
+    /// Réponse de `id` au vote de son équipe.
+    pub fn ballot(&mut self, id: u64, yes: bool) -> Vec<Ev> {
+        let mut ev = Vec::new();
+        let Some(team) = self.players.get(&id).filter(|p| p.present).map(|p| p.team) else {
+            return ev;
+        };
+        let Some(k) = self.votes.iter().position(|v| v.team == team) else {
+            return ev;
+        };
+        let voters = self.voters(&self.votes[k]);
+        let v = &mut self.votes[k];
+        if !voters.contains(&id) || v.yes.contains(&id) || v.no.contains(&id) {
+            return ev;
+        }
+        if yes {
+            v.yes.push(id);
+        } else {
+            v.no.push(id);
+        }
+        self.settle_votes(&mut ev);
+        ev
+    }
+
+    fn tick_votes(&mut self, dt: f32, ev: &mut Vec<Ev>) {
+        for v in &mut self.votes {
+            v.left -= dt;
+        }
+        self.settle_votes(ev);
+    }
+
+    /// Votes décidés : acceptés (assez de oui), refusés (trop de non, temps écoulé).
+    fn settle_votes(&mut self, ev: &mut Vec<Ev>) {
+        let mut k = 0;
+        while k < self.votes.len() {
+            let v = self.votes[k].clone();
+            let voters = self.voters(&v).len();
+            let need = self.needed(&v);
+            let yes = v.yes.len();
+            let passed = yes >= need && voters > 0;
+            let failed = !passed && (v.left <= 0.0 || voters.saturating_sub(v.no.len()) < need);
+            if !passed && !failed {
+                k += 1;
+                continue;
+            }
+            self.votes.remove(k);
+            if failed {
+                ev.push(Ev::Say("Vote refusé.".into()));
+                continue;
+            }
+            match v.kind {
+                VOTE_KICK => {
+                    if let Some(t) = self.players.get_mut(&v.target) {
+                        t.kicked = true;
+                        ev.push(Ev::Say(format!("{} est exclu par son équipe.", t.pseudo)));
+                    }
+                    ev.push(Ev::VoteKick(v.target));
+                }
+                _ => {
+                    let side = self.start_side(v.team) as u8;
+                    self.pending_timeouts.push(side);
+                    ev.push(Ev::Say(
+                        "Pause tactique acceptée : au départ de la prochaine manche.".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Pauses : prises au départ d'une manche, le temps de départ ne s'écoule pas.
+    /// Rend vrai si le jeu est en pause.
+    fn tick_pause(&mut self, dt: f32, ev: &mut Vec<Ev>) -> bool {
+        if self.phase != phase::FREEZE {
+            return false;
+        }
+        if self.pause.is_none() {
+            if self.tech_pending && self.absent() > 0 {
+                self.tech_pending = false;
+                self.pause = Some(Pause {
+                    kind: PAUSE_TECHNICAL,
+                    left: TECH_PAUSE_S,
+                });
+                ev.push(Ev::Say(
+                    "Pause technique : un joueur s'est déconnecté (5 minutes au plus).".into(),
+                ));
+                ev.push(Ev::Paused(true));
+            } else if !self.pending_timeouts.is_empty() {
+                let side = self.pending_timeouts.remove(0) as usize;
+                self.timeouts[side] = (self.timeouts[side] + 1).min(TIMEOUTS);
+                self.pause = Some(Pause {
+                    kind: PAUSE_TACTICAL,
+                    left: TIMEOUT_S,
+                });
+                ev.push(Ev::Say(format!(
+                    "Pause tactique ({} / {TIMEOUTS}).",
+                    self.timeouts[side]
+                )));
+                ev.push(Ev::Paused(true));
+            } else {
+                self.tech_pending = false;
+                return false;
+            }
+        }
+        let absent = self.absent();
+        let p = self.pause.as_mut().expect("pause");
+        p.left -= dt;
+        let back = p.kind == PAUSE_TECHNICAL && absent == 0;
+        if p.left <= 0.0 || back {
+            self.pause = None;
+            ev.push(Ev::Say("Fin de la pause.".into()));
+            ev.push(Ev::Paused(false));
+            // Une autre pause votée attend peut-être : au prochain pas.
+            return true;
+        }
+        true
+    }
+
+    /// Joueurs partis (ni exclus) qui peuvent revenir.
+    fn absent(&self) -> usize {
+        self.players
+            .values()
+            .filter(|p| !p.present && !p.excluded())
+            .count()
+    }
+
     pub fn frozen(&self) -> bool {
         matches!(
             self.phase,
@@ -1599,6 +1928,69 @@ mod tests {
         m.join(1, "A");
         m.set_color(1, 4);
         assert_eq!(m.players[&1].color, 4);
+    }
+
+    #[test]
+    fn team_votes_kick_and_pause_like_cs() {
+        let mut m = full_match();
+        let places = BTreeMap::new();
+        let team_of = |m: &Match, t: u8| {
+            m.players
+                .iter()
+                .filter(|(_, p)| p.team == t)
+                .map(|(&i, _)| i)
+                .collect::<Vec<u64>>()
+        };
+        let ct = team_of(&m, CT);
+        // Pause tactique : la majorité (3 sur 5).
+        m.call_vote(ct[0], VOTE_PAUSE, 0).unwrap();
+        assert!(
+            m.call_vote(ct[1], VOTE_PAUSE, 0).is_err(),
+            "un vote à la fois"
+        );
+        m.ballot(ct[1], true);
+        assert_eq!(m.votes.len(), 1);
+        m.ballot(ct[2], true);
+        assert!(m.votes.is_empty());
+        // Au départ de la manche : le temps de départ ne s'écoule plus pendant 30 s.
+        let before = m.time;
+        assert!(m.tick(1.0, &places).contains(&Ev::Paused(true)));
+        assert_eq!(m.time, before);
+        assert_eq!(m.hud(ct[0], None).pause, PAUSE_TACTICAL);
+        for _ in 0..30 {
+            m.tick(1.0, &places);
+        }
+        assert!(m.pause.is_none());
+        assert_eq!(m.hud(ct[0], None).timeouts, TIMEOUTS - 1);
+        // Exclusion : tous les autres coéquipiers d'accord ; le visé ne vote pas.
+        m.call_vote(ct[0], VOTE_KICK, ct[4]).unwrap();
+        assert!(m.hud(ct[4], None).vote.is_some_and(|v| !v.can_vote));
+        assert!(m
+            .hud(ct[1], None)
+            .vote
+            .is_some_and(|v| v.can_vote && v.need == 4));
+        m.ballot(ct[4], false);
+        m.ballot(ct[1], true);
+        m.ballot(ct[2], true);
+        assert!(!m.players[&ct[4]].kicked);
+        assert!(m.ballot(ct[3], true).contains(&Ev::VoteKick(ct[4])));
+        let name = m.players[&ct[4]].pseudo.clone();
+        m.leave(ct[4], None);
+        assert!(!m.tech_pending, "exclu : pas de pause technique");
+        assert_eq!(m.join(99, &name), vec![Ev::VoteKick(99)]);
+        assert!(m.summary().players.iter().any(|p| p.kicked));
+        // Un T se déconnecte : pause technique jusqu'à son retour.
+        let t = team_of(&m, T)[0];
+        let name = m.players[&t].pseudo.clone();
+        m.leave(t, None);
+        assert!(m.tick(1.0, &places).contains(&Ev::Paused(true)));
+        assert_eq!(m.pause.map(|p| p.kind), Some(PAUSE_TECHNICAL));
+        m.join(500, &name);
+        assert!(m.tick(1.0, &places).contains(&Ev::Paused(false)));
+        // Un refus suffit à rejeter une exclusion.
+        m.call_vote(ct[0], VOTE_KICK, ct[1]).unwrap();
+        m.ballot(ct[2], false);
+        assert!(m.votes.is_empty());
     }
 
     fn full_match() -> Match {

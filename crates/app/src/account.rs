@@ -700,6 +700,7 @@ impl Accounts {
                 | Event::Slain(_)
                 | Event::SetGamemode { .. }
                 | Event::BulkDone { .. }
+                | Event::SetTime { .. }
                 | Event::BuildSpawn { .. }
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)

@@ -450,8 +450,10 @@ impl Player {
                 // Sur l'échelle la vitesse verticale est nulle au repos : le sol se cherche juste
                 // sous les pieds.
                 let grounded = self.on_ground || self.support_within(world, 0.02);
-                if m.jump_pressed && !grounded {
-                    self.vel = -wall * LADDER_PUSH + Vec3::Y * LADDER_SPEED * 0.6;
+                if m.jump_pressed {
+                    // Sauter de l'échelle : toujours projeté en arrière, à la vitesse d'un saut.
+                    let jump = if fps { cs::JUMP_IMPULSE } else { JUMP_SPEED };
+                    self.vel = -wall * LADDER_PUSH + Vec3::Y * jump;
                 } else {
                     self.on_ladder = true;
                     let down = self.pitch < -0.35;
@@ -489,10 +491,13 @@ impl Player {
                     };
                     // On prend de la vitesse : la pleine vitesse en LADDER_RAMP secondes.
                     let step = LADDER_SPEED / LADDER_RAMP * dt;
-                    // En arrivant sur l'échelle en tombant : arrêté net (on reprend de la
-                    // vitesse ensuite, comme d'habitude).
+                    // En arrivant sur l'échelle en tombant : arrêté net ; en sautant dessus avec
+                    // de l'élan : l'élan passe dans la montée.
                     let from = if was_on_ladder {
                         vy0.clamp(-cap, cap)
+                    } else if !grounded && vy0 > 0.0 {
+                        let run = Vec3::new(v0.x, 0.0, v0.z).length();
+                        vy0.max(run).clamp(0.0, cap)
                     } else {
                         vy0.clamp(0.0, cap)
                     };
@@ -1328,6 +1333,28 @@ mod tests {
                 "s'éloigne (fps {fps}) : {} au lieu de {}",
                 9.4 - p.pos.x,
                 5.4 - q.pos.x
+            );
+            // Saut sur l'échelle avec de l'élan : l'élan passe dans la montée.
+            let mut p = Player::new(Vec3::new(9.35, 13.0, 8.5));
+            p.yaw = std::f32::consts::FRAC_PI_2;
+            p.vel = Vec3::new(4.0, 2.0, 0.0);
+            p.update(&w, &up, dt);
+            assert!(
+                p.on_ladder && p.vel.y > 2.5,
+                "élan transféré (fps {fps}) : {}",
+                p.vel.y
+            );
+            // Saut depuis l'échelle : projeté en arrière, à la vitesse d'un saut.
+            let jump = MoveInput {
+                jump_pressed: true,
+                fps,
+                ..Default::default()
+            };
+            p.update(&w, &jump, dt);
+            assert!(
+                !p.on_ladder && p.vel.x < -1.0 && p.vel.y > 5.0,
+                "saut arrière (fps {fps}) : {:?}",
+                p.vel
             );
             // Immobile sur l'échelle : aucune glissade de côté.
             let mut p = Player::new(Vec3::new(9.4, 14.0, 8.5));

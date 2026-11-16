@@ -91,6 +91,29 @@ pub fn save(dir: &Path, m: &FpsMap) -> Result<()> {
 
 pub const SITE_NAMES: [&str; 3] = ["A", "B", "C"];
 
+/// Heure fixe de la carte (`/fps set time`), dans son dossier ; absente : le soleil de
+/// Dust2 (`/fps set time default`).
+const TIME_FILE: &str = "heure.txt";
+
+pub fn load_time(dir: &Path) -> Option<f32> {
+    fs::read_to_string(dir.join(TIME_FILE))
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|h| (0.0..24.0).contains(h))
+}
+
+pub fn save_time(dir: &Path, time: Option<f32>) -> Result<()> {
+    match time {
+        Some(h) => fs::write(dir.join(TIME_FILE), format!("{h}\n"))?,
+        None => {
+            let _ = fs::remove_file(dir.join(TIME_FILE));
+        }
+    }
+    Ok(())
+}
+
 /// Paquet partageable d'un monde enregistré.
 pub fn package(dir: &Path) -> Result<MapPackage> {
     let level = fs::read_to_string(dir.join("level.txt"))
@@ -151,6 +174,10 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
             Some(format!("{},{},{},{},0{inf}", v[0], v[1], v[2], v[3]))
         })
         .collect();
+    // Heure fixe de la carte : avec les torches, « heure,… ».
+    if let Some(h) = load_time(dir) {
+        torches.push(format!("heure,{h}"));
+    }
     // Têtes à skin (carte importée) : avec les torches, préfixées « tete, ».
     torches.extend(
         fs::read_to_string(dir.join(crate::mcimport::HEADS_FILE))
@@ -184,6 +211,7 @@ fn stamp(dir: &Path) -> u64 {
         "chunks.bin",
         "torches.txt",
         crate::mcimport::HEADS_FILE,
+        TIME_FILE,
         FILE,
     ]
     .iter()
@@ -251,8 +279,16 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         }
         fs::write(dir.join("chunks.bin"), bin)?;
     }
-    let (heads, torches): (Vec<&String>, Vec<&String>) =
-        p.torches.iter().partition(|l| l.starts_with("tete,"));
+    let time = p
+        .torches
+        .iter()
+        .find_map(|l| l.strip_prefix("heure,")?.parse::<f32>().ok());
+    save_time(&dir, time)?;
+    let (heads, torches): (Vec<&String>, Vec<&String>) = p
+        .torches
+        .iter()
+        .filter(|l| !l.starts_with("heure,"))
+        .partition(|l| l.starts_with("tete,"));
     let mut t = torches
         .iter()
         .map(|s| s.as_str())

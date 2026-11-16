@@ -303,6 +303,11 @@ impl Garant {
                 self.started_sent = true;
                 cmds.push(Cmd::RoomStarted(true));
             }
+            for l in &locals {
+                if let crate::netgame::Local::Paused(on) = l {
+                    cmds.push(Cmd::RoomPaused(*on));
+                }
+            }
         } else {
             // Vérificateur : le monde autour des joueurs, pour rejouer leurs pas et tirs.
             for p in net.positions() {

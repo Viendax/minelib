@@ -271,6 +271,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
     /// Tous les événements en attente sont traités : on calcule et affiche l'image tout de
     /// suite, en boucle, sans attendre de message de Windows (plus de FPS, moins de latence).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        release_stale_keys(&mut self.input);
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
@@ -632,3 +633,34 @@ pub fn memory_info() -> (u64, u64) {
     sys.refresh_memory();
     (sys.total_memory(), sys.available_memory())
 }
+
+/// Touches tenues que le système dit relâchées : le message de relâchement a été perdu ou
+/// arrive en retard (file des messages encombrée) ; sans ce contrôle, le joueur continuait
+/// d'avancer après avoir lâché la touche. Chaque image, l'état réel du clavier fait foi.
+#[cfg(windows)]
+fn release_stale_keys(input: &mut Input) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX,
+    };
+    use winit::platform::scancode::PhysicalKeyExtScancode;
+    let stale: Vec<KeyCode> = input
+        .held
+        .iter()
+        .copied()
+        .filter(|&code| {
+            let Some(sc) = PhysicalKey::Code(code).to_scancode() else {
+                return false;
+            };
+            // SAFETY : simples lectures de l'état du clavier.
+            let vk = unsafe { MapVirtualKeyW(sc, MAPVK_VSC_TO_VK_EX) };
+            vk != 0 && unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 == 0
+        })
+        .collect();
+    for code in stale {
+        log::info!("touche {code:?} relâchée sans message du système : rattrapée");
+        input.held.remove(&code);
+    }
+}
+
+#[cfg(not(windows))]
+fn release_stale_keys(_input: &mut Input) {}

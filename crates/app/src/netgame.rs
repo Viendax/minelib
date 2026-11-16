@@ -133,8 +133,10 @@ pub enum Local {
     Give(u16),
     /// Élimination, pour le fil en haut à droite.
     Kill(Kill),
-    /// Exclu de la partie (trois coéquipiers tués) : on la quitte.
+    /// Exclu de la partie (trois coéquipiers tués, vote) : on la quitte.
     Kicked(String),
+    /// Pause de la partie commencée / finie (hôte : le dire au relais).
+    Paused(bool),
     /// Un joueur a tiré depuis `pos` (`heard` : un autre que soi, à faire entendre) et
     /// touché des joueurs en `hits` (sang).
     Shot {
@@ -273,6 +275,8 @@ pub fn witnessed(m: &ToHost) -> bool {
             | ToHost::Pickup { .. }
             | ToHost::Color(_)
             | ToHost::Door { .. }
+            | ToHost::CallVote { .. }
+            | ToHost::Ballot(_)
     )
 }
 
@@ -999,6 +1003,10 @@ impl Auditor {
                                     use_door(&mut m, world, me.map(|p| p.pos), living, *pos, *side);
                                 self.apply_doors(world, &m, &cells);
                             }
+                            ToHost::CallVote { kind, target } => {
+                                settle!(m.call_vote(who, *kind, *target).unwrap_or_default())
+                            }
+                            ToHost::Ballot(yes) => settle!(m.ballot(who, *yes)),
                             _ => {}
                         }
                     }
@@ -2261,6 +2269,43 @@ impl NetGame {
         }
     }
 
+    /// Propose un vote à son équipe (`VOTE_KICK` : exclure `target`, `VOTE_PAUSE`).
+    pub fn call_vote(&mut self, kind: u8, target: u64) -> Vec<Local> {
+        let msg = ToHost::CallVote { kind, target };
+        match self {
+            NetGame::Host(h) => {
+                h.record(0, Move::Rule(Rule::Msg(msg)));
+                let mut out = Vec::new();
+                match h.m.call_vote(0, kind, target) {
+                    Ok(ev) => h.events(ev, &mut out),
+                    Err(e) => out.push(Local::Notice(e)),
+                }
+                out
+            }
+            NetGame::Guest(g) => {
+                g.to_host(&msg);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Réponse au vote de son équipe (F1 oui, F2 non).
+    pub fn ballot(&mut self, yes: bool) -> Vec<Local> {
+        match self {
+            NetGame::Host(h) => {
+                h.record(0, Move::Rule(Rule::Msg(ToHost::Ballot(yes))));
+                let ev = h.m.ballot(0, yes);
+                let mut out = Vec::new();
+                h.events(ev, &mut out);
+                out
+            }
+            NetGame::Guest(g) => {
+                g.to_host(&ToHost::Ballot(yes));
+                Vec::new()
+            }
+        }
+    }
+
     /// Couleur préférée (bandeau des têtes, triangles des coéquipiers).
     pub fn choose_color(&mut self, color: u8) {
         match self {
@@ -2787,6 +2832,15 @@ impl Host {
                 Ev::NewRound => {
                     self.ground_dirty = true;
                 }
+                Ev::VoteKick(id) => {
+                    let reason = "Exclu de la partie par un vote de ton équipe.".to_string();
+                    if id == 0 {
+                        out.push(Local::Kicked(reason));
+                    } else {
+                        self.send_to(id, &ToPeer::Kicked { reason });
+                    }
+                }
+                Ev::Paused(on) => out.push(Local::Paused(on)),
                 Ev::TeamKillKick(id) => {
                     let reason = format!(
                         "Exclu de la partie : {} coéquipiers tués.",
@@ -2976,6 +3030,20 @@ impl Host {
                 let feet = self.feet_of(peer);
                 let cells = use_door(&mut self.m, world, feet, alive, pos, side);
                 self.doors_changed(cells, &mut out);
+            }
+            ToHost::CallVote { kind, target } => match self.m.call_vote(peer, kind, target) {
+                Ok(ev) => self.events(ev, &mut out),
+                Err(e) => self.send_to(
+                    peer,
+                    &ToPeer::Chat {
+                        from: String::new(),
+                        text: e,
+                    },
+                ),
+            },
+            ToHost::Ballot(yes) => {
+                let ev = self.m.ballot(peer, yes);
+                self.events(ev, &mut out);
             }
             ToHost::Throw { nade, pos, vel } => {
                 let alive = self.m.players.get(&peer).is_some_and(|p| p.alive);

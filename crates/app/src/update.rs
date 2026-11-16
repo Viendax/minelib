@@ -58,7 +58,7 @@ pub fn clear_match_lock(root: &std::path::Path) {
 }
 
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 96;
+pub const VERSION: u32 = 97;
 const REPO: &str = "https://api.github.com/repos/Viendax/minelib/releases";
 const EVERY: Duration = Duration::from_secs(120);
 
@@ -421,6 +421,11 @@ impl Updater {
                 }
             }
             Msg::UpToDate => {
+                static SAID: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    log::info!("mises à jour : version {VERSION} à jour");
+                }
                 if self.check != Check::Launcher {
                     self.check = Check::UpToDate;
                 }

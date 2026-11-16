@@ -44,6 +44,7 @@ mod audio;
 mod buildnet;
 mod chat;
 mod cs;
+mod daytime;
 mod debug;
 mod equip;
 mod fluids;
@@ -146,6 +147,8 @@ struct Game {
     /// Menu déroulant des langues ouvert.
     /// Résultat de « Télécharger la carte » (menu pause d'un serveur de construction).
     download_note: Option<String>,
+    /// Menu Échap d'une partie FPS : liste des coéquipiers à exclure ouverte.
+    kick_pick: bool,
     /// Amis connus (pour ne refaire leur classement que si la liste change).
     friend_names: Vec<String>,
     /// Lobby : l'hôte du lobby a trouvé cette partie, on la rejoint (après la carte).
@@ -286,6 +289,7 @@ impl Game {
             skin_pick: None,
             skin_msg: None,
             download_note: None,
+            kick_pick: false,
             party_go: None,
             fps_home_maps_seen: u64::MAX,
             shared_maps: Default::default(),
@@ -1052,6 +1056,9 @@ impl Game {
         if let Some(s) = &mut self.session {
             if let Some(started) = s.room_started.take() {
                 self.accounts.room(Cmd::RoomStarted(started));
+            }
+            if let Some(paused) = s.room_paused.take() {
+                self.accounts.room(Cmd::RoomPaused(paused));
             }
             // Résultat de la partie : chaque joueur l'envoie, le relais les compare.
             if let Some(summary) = s.match_result.take() {
@@ -1997,6 +2004,34 @@ impl Game {
         if let Some(t) = self.download_note.as_ref().filter(|_| on_build) {
             c.text_center(t, y + 14.0 * s, s, GREY);
         }
+        // Partie FPS en ligne : votes d'équipe (comme dans CS).
+        let choices = self.session.as_ref().and_then(|s| s.vote_choices());
+        let mut vote: Option<(u8, u64)> = None;
+        if let Some((mates, timeouts, can_pause)) = &choices {
+            y += 24.0 * s;
+            let label = format!("Proposer une pause tactique ({timeouts} / 3)");
+            if c.button(&label, cx, y, 240.0, *can_pause && *timeouts > 0) {
+                vote = Some((minelib_net::game::VOTE_PAUSE, u64::MAX));
+            }
+            y += 24.0 * s;
+            if c.button(
+                "Proposer d'exclure un coéquipier",
+                cx,
+                y,
+                240.0,
+                !mates.is_empty(),
+            ) {
+                self.kick_pick = !self.kick_pick;
+            }
+            if self.kick_pick {
+                for (id, name) in mates {
+                    y += 22.0 * s;
+                    if c.button(&format!("Exclure {name}"), cx, y, 160.0, true) {
+                        vote = Some((minelib_net::game::VOTE_KICK, *id));
+                    }
+                }
+            }
+        }
         let online = self
             .session
             .as_ref()
@@ -2009,7 +2044,16 @@ impl Game {
         let quit = c.button(label, cx, (c.h * 0.72).max(y + 40.0 * s), 200.0, true);
         let (line, color) = self.updater.line();
         c.ui.text(4.0 * s, c.h - 12.0 * s, s, color, line);
+        if let Some((kind, target)) = vote {
+            self.kick_pick = false;
+            if let Some(sess) = &mut self.session {
+                sess.call_vote(kind, target);
+                sess.keys.mouse_muted = true;
+            }
+            self.screen = Screen::Playing;
+        }
         if resume {
+            self.kick_pick = false;
             self.screen = Screen::Playing;
             if let Some(sess) = &mut self.session {
                 sess.keys.mouse_muted = true;
@@ -2824,7 +2868,17 @@ impl GameLoop for Game {
         if auto_shot {
             self.shot_at = None;
         }
-        if self.keys.pressed(input, keys::Action::Screenshot) || auto_shot {
+        // Mode FPS : la touche de CS (F5) ; sinon celle de Minecraft (F2).
+        let fps_mode = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.game.mode == save::GameMode::Fps);
+        let shot_key = if fps_mode {
+            keys::Action::FpsScreenshot
+        } else {
+            keys::Action::Screenshot
+        };
+        if self.keys.pressed(input, shot_key) || auto_shot {
             renderer.request_screenshot();
         }
         if let Some(shot) = renderer.take_screenshot() {
@@ -3262,7 +3316,8 @@ fn main() -> anyhow::Result<()> {
     .target(env_logger::Target::Pipe(Box::new(Tee(file, latest))))
     .init();
     log::info!(
-        "Minelib {} — {} {} — journal : {}",
+        "Minelib v{} ({}) — {} {} — journal : {}",
+        update::VERSION,
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,

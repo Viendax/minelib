@@ -86,7 +86,6 @@ pub enum Action {
     Inventory,
     Chat,
     Zoom,
-    DayNight,
     /// Vue à la 1re / 3e personne (F5), hors mode FPS.
     Perspective,
     Command,
@@ -130,10 +129,15 @@ pub enum Action {
     FpsVoice,
     FpsSpray,
     FpsPing,
+    /// Capture d'écran en mode FPS (F5, comme dans CS).
+    FpsScreenshot,
+    /// Votes (exclusion, pause) : F1 oui, F2 non, comme dans CS.
+    FpsVoteYes,
+    FpsVoteNo,
 }
 
 impl Action {
-    pub const ALL: [Action; 56] = [
+    pub const ALL: [Action; 58] = [
         Action::Attack,
         Action::Use,
         Action::Pick,
@@ -147,7 +151,6 @@ impl Action {
         Action::Inventory,
         Action::Chat,
         Action::Zoom,
-        Action::DayNight,
         Action::Perspective,
         Action::Command,
         Action::Debug,
@@ -190,6 +193,9 @@ impl Action {
         Action::FpsVoice,
         Action::FpsSpray,
         Action::FpsPing,
+        Action::FpsScreenshot,
+        Action::FpsVoteYes,
+        Action::FpsVoteNo,
     ];
 
     pub fn group(self) -> Group {
@@ -207,7 +213,6 @@ impl Action {
             | Action::Inventory
             | Action::Chat
             | Action::Zoom
-            | Action::DayNight
             | Action::Perspective => Group::Build,
             Action::Command | Action::Debug | Action::Screenshot => Group::Shared,
             Action::FpsForward
@@ -247,7 +252,10 @@ impl Action {
             | Action::FpsRadio3
             | Action::FpsVoice
             | Action::FpsSpray
-            | Action::FpsPing => Group::Fps,
+            | Action::FpsPing
+            | Action::FpsScreenshot
+            | Action::FpsVoteYes
+            | Action::FpsVoteNo => Group::Fps,
         }
     }
 
@@ -291,7 +299,6 @@ impl Action {
             Action::Inventory => "Inventaire",
             Action::Chat => "Tchat",
             Action::Zoom => "Zoom",
-            Action::DayNight => "Jour / nuit",
             Action::Perspective => "Vue (1re / 3e personne)",
             Action::Command => "Commande",
             Action::Debug => "Debug (F3)",
@@ -334,6 +341,9 @@ impl Action {
             Action::FpsVoice => "Micro",
             Action::FpsSpray => "Graffiti",
             Action::FpsPing => "Signaler (ping)",
+            Action::FpsScreenshot => "Capture d'écran",
+            Action::FpsVoteYes => "Vote : oui",
+            Action::FpsVoteNo => "Vote : non",
         }
     }
 
@@ -352,7 +362,6 @@ impl Action {
             Action::Inventory => "inventory",
             Action::Chat => "chat",
             Action::Zoom => "zoom",
-            Action::DayNight => "daynight",
             Action::Perspective => "perspective",
             Action::Command => "command",
             Action::Debug => "debug",
@@ -395,6 +404,9 @@ impl Action {
             Action::FpsVoice => "fps_voice",
             Action::FpsSpray => "fps_spray",
             Action::FpsPing => "fps_ping",
+            Action::FpsScreenshot => "fps_screenshot",
+            Action::FpsVoteYes => "fps_vote_yes",
+            Action::FpsVoteNo => "fps_vote_no",
         }
     }
 
@@ -416,7 +428,6 @@ impl Action {
             Action::Inventory => Some(Bind::Key(KeyCode::KeyE)),
             Action::Chat => Some(Bind::Key(KeyCode::KeyT)),
             Action::Zoom => Some(Bind::Key(KeyCode::KeyC)),
-            Action::DayNight => Some(Bind::Key(KeyCode::KeyN)),
             Action::Perspective => Some(Bind::Key(KeyCode::F5)),
             Action::Command => Some(Bind::Key(KeyCode::Slash)),
             Action::Debug => Some(Bind::Key(KeyCode::F3)),
@@ -459,6 +470,10 @@ impl Action {
             Action::FpsVoice => Some(Bind::Key(KeyCode::KeyK)),
             Action::FpsSpray => Some(Bind::Key(KeyCode::KeyT)),
             Action::FpsPing => Some(Bind::Mouse(Mouse::Middle)),
+            // Comme dans CS : F5.
+            Action::FpsScreenshot => Some(Bind::Key(KeyCode::F5)),
+            Action::FpsVoteYes => Some(Bind::Key(KeyCode::F1)),
+            Action::FpsVoteNo => Some(Bind::Key(KeyCode::F2)),
         }
     }
 }

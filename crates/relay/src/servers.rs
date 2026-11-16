@@ -38,6 +38,19 @@ pub struct Store {
     positions: HashMap<String, HashMap<String, [f32; 5]>>,
     /// Positions changées depuis le dernier enregistrement.
     positions_dirty: bool,
+    /// Heure de chaque serveur (fichier `….times`) : (heure à l'instant `since` en
+    /// secondes Unix, arrêtée). Elle avance comme dans Minecraft (24 h en 20 minutes).
+    times: HashMap<String, (f32, u64, bool)>,
+}
+
+/// Heure d'un monde neuf, et durée d'une journée (s).
+pub const START_HOUR: f32 = 8.0;
+pub const DAY_S: f32 = 1200.0;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Clé d'un serveur : son créateur et son monde.
@@ -67,6 +80,9 @@ pub enum Action {
     DefaultGamemode,
     /// Renommer le serveur (OP) : `reason` = le nom.
     Rename,
+    /// Heure (OP) : `reason` = l'heure (0..24) ; l'arrêter ou la relancer (`reason` 1/0).
+    TimeSet,
+    TimeFix,
 }
 
 impl Store {
@@ -87,6 +103,10 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let times = std::fs::read(path.with_extension("times"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Self {
             path,
             servers,
@@ -94,6 +114,29 @@ impl Store {
             defaults,
             positions,
             positions_dirty: false,
+            times,
+        }
+    }
+
+    /// Heure du serveur maintenant, et si elle est arrêtée.
+    pub fn time(&self, server: &str) -> (f32, bool) {
+        let (h, since, fixed) =
+            self.times
+                .get(server)
+                .copied()
+                .unwrap_or((START_HOUR, unix_now(), false));
+        if fixed {
+            return (h, true);
+        }
+        let dt = unix_now().saturating_sub(since) as f32;
+        ((h + dt * 24.0 / DAY_S).rem_euclid(24.0), false)
+    }
+
+    fn set_time(&mut self, server: &str, h: f32, fixed: bool) {
+        self.times
+            .insert(server.to_string(), (h.rem_euclid(24.0), unix_now(), fixed));
+        if let Ok(b) = postcard::to_allocvec(&self.times) {
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("times"), &b);
         }
     }
 
@@ -198,6 +241,28 @@ impl Store {
         }
         let mode: String = reason.chars().take(16).collect();
         match action {
+            Action::TimeSet => {
+                let h: f32 = reason
+                    .trim()
+                    .parse()
+                    .map_err(|_| "Heure illisible.".to_string())?;
+                if !(0.0..24.0).contains(&h) {
+                    return Err("Heure entre 0 et 24.".into());
+                }
+                let fixed = self.time(server).1;
+                self.set_time(server, h, fixed);
+                return Ok("Heure changée.".into());
+            }
+            Action::TimeFix => {
+                let fixed = matches!(reason.trim(), "1" | "true" | "oui" | "on");
+                let (h, _) = self.time(server);
+                self.set_time(server, h, fixed);
+                return Ok(if fixed {
+                    "Heure arrêtée.".into()
+                } else {
+                    "Le temps passe de nouveau.".into()
+                });
+            }
             Action::Rename => {
                 return Ok(format!("Serveur renommé : {}.", reason.trim()));
             }
@@ -295,6 +360,8 @@ impl Store {
             | Action::WhitelistList
             | Action::Gamemode
             | Action::Rename
+            | Action::TimeSet
+            | Action::TimeFix
             | Action::DefaultGamemode => unreachable!("traité plus haut"),
             Action::Ban if is_creator => return Err("On ne bannit pas le créateur.".into()),
             Action::Ban if by.eq_ignore_ascii_case(target) => {

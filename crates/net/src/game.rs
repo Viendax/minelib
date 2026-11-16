@@ -175,6 +175,39 @@ pub struct MatchHud {
     pub site: u8,
     /// Joueurs présents / nécessaires pendant l'échauffement.
     pub players: u8,
+    /// Pause en cours : sorte (`PAUSE_…`, 0 aucune), temps restant (s).
+    pub pause: u8,
+    pub pause_left: f32,
+    /// Pauses tactiques qui restent à son équipe.
+    pub timeouts: u8,
+    /// Vote de son équipe en cours.
+    pub vote: Option<VoteHud>,
+}
+
+/// Sortes de votes (comme dans CS) : exclure un coéquipier, pause tactique.
+pub const VOTE_KICK: u8 = 1;
+pub const VOTE_PAUSE: u8 = 2;
+
+/// Sortes de pauses : tactique (30 s, demandée par une équipe), technique (joueur
+/// déconnecté : jusqu'à son retour, 5 minutes au plus).
+pub const PAUSE_TACTICAL: u8 = 1;
+pub const PAUSE_TECHNICAL: u8 = 2;
+
+/// Vote en cours, tel que le voit un joueur de l'équipe (joueurs : identifiants, les
+/// pseudos sont dans le tableau des scores).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct VoteHud {
+    pub kind: u8,
+    pub caller: u64,
+    /// Joueur visé (exclusion).
+    pub target: u64,
+    pub yes: u8,
+    pub no: u8,
+    /// Oui nécessaires.
+    pub need: u8,
+    pub left: f32,
+    /// Ce joueur peut voter (pas encore voté, pas visé).
+    pub can_vote: bool,
 }
 
 /// Une ligne du tableau des scores (touche Tab).
@@ -222,6 +255,9 @@ pub struct SummaryPlayer {
     pub rounds: u8,
     /// Coéquipiers tués (le facteur de confiance baisse un peu à chacun).
     pub teamkills: u16,
+    /// Exclu par un vote de son équipe (pas de pénalité d'absence en plus).
+    #[serde(default)]
+    pub kicked: bool,
 }
 
 /// Une boîte de blocs (coins inclus).
@@ -411,6 +447,13 @@ pub enum ToHost {
         pos: [i32; 3],
         side: u8,
     },
+    /// Propose un vote à son équipe (`VOTE_…`) ; `target` : joueur à exclure.
+    CallVote {
+        kind: u8,
+        target: u64,
+    },
+    /// Réponse au vote de son équipe (F1 oui, F2 non).
+    Ballot(bool),
 }
 
 /// Messages d'un monde de construction en ligne (passent par les zones du relais).

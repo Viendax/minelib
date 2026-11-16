@@ -60,6 +60,7 @@ pub enum Cmd {
         max_players: u16,
     },
     RoomStarted(bool),
+    RoomPaused(bool),
     Join(u64),
     Leave,
     /// Cherche une partie FPS sur cette carte (ou en ouvre une).
@@ -217,6 +218,11 @@ pub enum Event {
         pos: [f32; 3],
         yaw: f32,
         pitch: f32,
+    },
+    /// Heure du serveur de construction.
+    SetTime {
+        hours: f32,
+        fixed: bool,
     },
     /// Réponse du relais à des modifications en masse (WorldEdit) : `error` vide si publiées.
     BulkDone {
@@ -598,6 +604,7 @@ impl Worker {
             Response::Slain { by } => Event::Slain(by),
             Response::SetGamemode { mode, by } => Event::SetGamemode { mode, by },
             Response::BulkDone { id, error } => Event::BulkDone { id, error },
+            Response::SetTime { hours, fixed } => Event::SetTime { hours, fixed },
             Response::BuildSpawn { pos, yaw, pitch } => Event::BuildSpawn { pos, yaw, pitch },
             Response::Arbitrate { case, map_sig, map } => Event::Arbitrate { case, map_sig, map },
             Response::Evidence {
@@ -914,6 +921,10 @@ impl Worker {
                 r => self.unexpected(r),
             },
             Cmd::RoomStarted(started) => match self.request(&Request::RoomStarted { started })? {
+                Response::Done => Ok(()),
+                r => self.unexpected(r),
+            },
+            Cmd::RoomPaused(paused) => match self.request(&Request::RoomPaused { paused })? {
                 Response::Done => Ok(()),
                 r => self.unexpected(r),
             },

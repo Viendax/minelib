@@ -622,7 +622,12 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
     for suf in ["_log", "_wood", "_stem", "_hyphae"] {
         if let Some(w) = n.strip_suffix(suf) {
             let w = w.strip_prefix("stripped_").unwrap_or(w);
-            return key(registry::log_key(registry::wood_index(w)));
+            let base = registry::log_key(registry::wood_index(w));
+            // Couchée le long de X ou de Z (`axis`).
+            return match prop("axis") {
+                Some(a @ ("x" | "z")) => key(&format!("{base}:{a}")),
+                _ => key(base),
+            };
         }
     }
     if n.starts_with("potted_") {
@@ -801,7 +806,7 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
 /// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales ; 5 : décors en entités
 /// d'affichage).
-pub const IMPORT_VERSION: u32 = 5;
+pub const IMPORT_VERSION: u32 = 6;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {

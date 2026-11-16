@@ -1466,7 +1466,7 @@ impl Fps {
         let seen = |p: Vec3| {
             let to = p - eye;
             let d = to.length();
-            d < 0.5 || raycast(world, eye.into(), (to / d).into(), d - 0.3).is_none()
+            d < 0.5 || raycast_view(world, eye.into(), (to / d).into(), d - 0.3).is_none()
         };
         let cam = |p: Vec3| {
             let f = (p - eye).normalize_or_zero();
@@ -1530,7 +1530,7 @@ impl Fps {
             if dist > 64.0 {
                 continue;
             }
-            if let Some(h) = raycast(world, eye.into(), (to / dist).into(), dist - 0.05) {
+            if let Some(h) = raycast_view(world, eye.into(), (to / dist).into(), dist - 0.05) {
                 if h.distance < dist - 0.06 {
                     continue;
                 }
@@ -2377,6 +2377,20 @@ fn quad(out: &mut Vec<VmVertex>, vp: Mat4, c: Vec3, u: Vec3, v: Vec3, color: [f3
     let (a, b, cc, d) = (c - u - v, c + u - v, c + u + v, c - u + v);
     push_tri(out, vp, [a, b, cc], color);
     push_tri(out, vp, [cc, d, a], color);
+}
+
+/// Premier bloc qui cache la vue le long du rayon : ni les blocs invisibles (barrières),
+/// ni le verre et l'eau (on voit les impacts à travers).
+fn raycast_view(
+    world: &World,
+    origin: [f32; 3],
+    dir: [f32; 3],
+    max: f32,
+) -> Option<minelib_world::raycast::Hit> {
+    minelib_world::raycast::raycast_with(world, origin, dir, max, |id| {
+        let d = id.def();
+        d.target && !d.translucent && !matches!(d.shape, minelib_world::registry::Shape::Invisible)
+    })
 }
 
 #[cfg(test)]

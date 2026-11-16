@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 22;
+pub const PROTOCOL: u32 = 23;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.
@@ -51,6 +51,10 @@ pub const SERVER_DEFAULT_GAMEMODE: u8 = 12;
 pub const SERVER_GAMEMODE_QUERY: u8 = 13;
 /// Renommer le serveur (OP) : `reason` = le nouveau nom.
 pub const SERVER_RENAME: u8 = 14;
+/// Heure du serveur (OP) : `reason` = l'heure (0..24) ; l'arrêter (`reason` 1) ou la
+/// relancer (0).
+pub const SERVER_TIMESET: u8 = 15;
+pub const SERVER_TIMEFIX: u8 = 16;
 
 /// Triches trouvées par le rejeu : sauts parfaits en chaîne (script de bunny hop), appuis
 /// plus rapides qu'une main (macro).
@@ -281,6 +285,11 @@ pub enum Request {
     /// La partie a commencé (une partie FPS en cours n'est plus listée) ou non.
     RoomStarted {
         started: bool,
+    },
+    /// Partie FPS en pause (true) ou reprise : le temps de pause ne compte pas dans les
+    /// absences.
+    RoomPaused {
+        paused: bool,
     },
     Join {
         room: u64,
@@ -653,6 +662,11 @@ pub enum Response {
         pitch: f32,
     },
     /// Réponse à `BulkEdit` : `error` vide si tout est publié, sinon pourquoi c'est refusé.
+    /// Heure du serveur de construction (à l'arrivée, et quand un OP la change).
+    SetTime {
+        hours: f32,
+        fixed: bool,
+    },
     BulkDone {
         id: u32,
         error: String,
@@ -681,6 +695,7 @@ impl Response {
                 | Response::Slain { .. }
                 | Response::SetGamemode { .. }
                 | Response::BulkDone { .. }
+                | Response::SetTime { .. }
                 | Response::BuildSpawn { .. }
                 | Response::Arbitrate { .. }
                 | Response::Evidence { .. }
