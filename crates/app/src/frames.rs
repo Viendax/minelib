@@ -67,6 +67,8 @@ pub fn boxes(fr: &Frame) -> (Vec3, Vec3) {
 pub struct Frames {
     list: Vec<Frame>,
     built: Option<([f32; 3], Vec<EntityVertex>)>,
+    /// Version des triangles (change quand ils sont refaits).
+    gen: u64,
 }
 
 impl Frames {
@@ -76,7 +78,11 @@ impl Frames {
             .lines()
             .filter_map(parse)
             .collect();
-        Self { list, built: None }
+        Self {
+            list,
+            built: None,
+            gen: 0,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -123,12 +129,12 @@ impl Frames {
         }
     }
 
-    /// Triangles de tous les cadres ; `changed` : refaits (la lumière a changé).
-    pub fn vertices(&mut self, light: [f32; 3]) -> (&[EntityVertex], bool) {
+    /// Refait les triangles si la lumière a changé (ou qu'un cadre a été cassé).
+    pub fn refresh(&mut self, light: [f32; 3]) {
         let fresh = self
             .built
             .as_ref()
-            .is_some_and(|(l, _)| l.iter().zip(light).all(|(a, b)| (a - b).abs() < 0.02));
+            .is_some_and(|(l, _)| l.iter().zip(light).all(|(a, b)| (a - b).abs() < 0.03));
         if !fresh {
             let mut out = Vec::new();
             for fr in &self.list {
@@ -151,8 +157,16 @@ impl Frames {
                 );
             }
             self.built = Some((light, out));
+            self.gen += 1;
         }
-        (&self.built.as_ref().expect("cadres").1, !fresh)
+    }
+
+    /// Triangles de tous les cadres et leur version.
+    pub fn current(&self) -> (&[EntityVertex], u64) {
+        (
+            self.built.as_ref().map_or(&[][..], |b| b.1.as_slice()),
+            self.gen,
+        )
     }
 }
 

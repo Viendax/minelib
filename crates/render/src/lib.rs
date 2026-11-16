@@ -215,6 +215,7 @@ pub const MAX_SHADOW_BOXES: usize = 48;
 /// Uniformes des ombres des joueurs : (nombre, coins min, coins max).
 fn shadow_globals(
     boxes: &[([f32; 3], [f32; 3])],
+    lights: &[[f32; 4]],
 ) -> (
     [f32; 4],
     [[f32; 4]; MAX_SHADOW_BOXES],
@@ -224,7 +225,20 @@ fn shadow_globals(
     let mut mn = [[0.0; 4]; MAX_SHADOW_BOXES];
     let mut mx = [[0.0; 4]; MAX_SHADOW_BOXES];
     for (i, (a, b)) in boxes.iter().take(n).enumerate() {
-        mn[i] = [a[0], a[1], a[2], 0.0];
+        // Source de lumière la plus proche (à moins de 10 blocs) : la seule dont ce
+        // morceau de joueur projette l'ombre (−1 : aucune). Le shader n'a ainsi qu'un
+        // essai par boîte.
+        let c = [0, 1, 2].map(|k| (a[k] + b[k]) / 2.0);
+        let near = lights
+            .iter()
+            .enumerate()
+            .map(|(j, l)| {
+                let d2: f32 = (0..3).map(|k| (l[k] - c[k]).powi(2)).sum();
+                (j, d2)
+            })
+            .filter(|(_, d2)| *d2 < 100.0)
+            .min_by(|x, y| x.1.total_cmp(&y.1));
+        mn[i] = [a[0], a[1], a[2], near.map_or(-1.0, |(j, _)| j as f32)];
         mx[i] = [b[0], b[1], b[2], 0.0];
     }
     ([n as f32, 0.0, 0.0, 0.0], mn, mx)
@@ -370,9 +384,10 @@ pub struct FrameParams<'a> {
     /// Les premiers sommets d'`entities` suivent la caméra (modèle du joueur local) ; les
     /// autres sont fixés dans le monde.
     pub entities_follow: usize,
-    /// Entités fixes qui changent rarement (têtes, cadres) et leur version : renvoyées à
-    /// la carte graphique seulement quand elle change.
-    pub static_entities: (&'a [EntityVertex], u64),
+    /// Entités fixes qui changent rarement (têtes par zone, cadres) : (identifiant,
+    /// triangles, version) ; chaque lot n'est renvoyé à la carte graphique que quand sa
+    /// version change.
+    pub static_entities: &'a [(u64, &'a [EntityVertex], u64)],
     /// Torche tenue en main : couleur (sRGB) et portée en blocs.
     pub held_light: Option<([u8; 3], f32)>,
     /// Flamme de la torche tenue (bout de la torche dans la main du modèle du joueur) ;
@@ -1780,7 +1795,10 @@ impl Renderer {
         let (sel_min, sel_max) = selection(p.selected);
         self.outline = p.selected.is_some();
         let rg = ray_globals(p.ray_boxes, p.ray_light);
-        let sg = shadow_globals(p.shadow_boxes);
+        let sg = shadow_globals(
+            p.shadow_boxes,
+            &self.lights_pos[..self.light_count.min(MAX_LIGHTS)],
+        );
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
@@ -1832,12 +1850,8 @@ impl Renderer {
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
         self.entities
             .prepare(&self.queue, p.entities, p.entities_follow);
-        self.entities.prepare_static(
-            &self.device,
-            &self.queue,
-            p.static_entities.0,
-            p.static_entities.1,
-        );
+        self.entities
+            .prepare_static(&self.device, &self.queue, p.static_entities);
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
@@ -1967,7 +1981,10 @@ impl Renderer {
         let (sel_min, sel_max) = selection(p.selected);
         self.outline = p.selected.is_some();
         let rg = ray_globals(p.ray_boxes, p.ray_light);
-        let sg = shadow_globals(p.shadow_boxes);
+        let sg = shadow_globals(
+            p.shadow_boxes,
+            &self.lights_pos[..self.light_count.min(MAX_LIGHTS)],
+        );
         let globals = Globals {
             view_proj: jittered.to_cols_array_2d(),
             inv_view_proj: jittered.inverse().to_cols_array_2d(),
@@ -2016,12 +2033,8 @@ impl Renderer {
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
         self.entities
             .prepare(&self.queue, p.entities, p.entities_follow);
-        self.entities.prepare_static(
-            &self.device,
-            &self.queue,
-            p.static_entities.0,
-            p.static_entities.1,
-        );
+        self.entities
+            .prepare_static(&self.device, &self.queue, p.static_entities);
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = {

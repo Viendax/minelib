@@ -179,11 +179,6 @@ pub struct Session {
     heads: Option<crate::heads::Heads>,
     /// Cadres des murs (cartes importées).
     frames: Option<crate::frames::Frames>,
-    head_vertices: Vec<minelib_render::EntityVertex>,
-    /// Triangles des têtes seules, et numéro de version de `head_vertices` (la carte
-    /// graphique ne les reçoit que quand il change).
-    head_part: Vec<minelib_render::EntityVertex>,
-    head_gen: u64,
     autosave: f32,
     hit: Option<Hit>,
     overlay: Overlay,
@@ -377,9 +372,6 @@ impl Session {
             lava_burn: 0.0,
             heads: None,
             frames: None,
-            head_vertices: Vec::new(),
-            head_part: Vec::new(),
-            head_gen: 0,
             autosave: AUTOSAVE_S,
             hit: None,
             overlay: Overlay::default(),
@@ -687,32 +679,17 @@ impl Session {
             let heads = self.heads.get_or_insert_with(|| {
                 crate::heads::Heads::load(&self.dir, minelib_assets::data_dir().join("tetes"))
             });
-            // Têtes et cadres : envoyés à la carte graphique seulement quand ils changent.
+            // Têtes et cadres : triangles gardés sur la carte graphique, refaits (une zone
+            // à la fois) seulement quand ils changent.
             let l = 0.3 + 0.7 * self.daylight;
-            let mut changed = false;
             if !heads.is_empty() {
                 let eye = self.player.eye();
                 heads.update(eye);
-                if let Some(v) = heads.vertices(eye, [l; 3]) {
-                    self.head_part = v.to_vec();
-                    changed = true;
-                }
+                heads.refresh(eye, [l; 3]);
             }
-            let frames = self
-                .frames
-                .get_or_insert_with(|| crate::frames::Frames::load(&self.dir));
-            if !frames.is_empty() {
-                let (v, fresh) = frames.vertices([l; 3]);
-                if fresh || changed {
-                    self.head_vertices.clear();
-                    self.head_vertices.extend_from_slice(&self.head_part);
-                    self.head_vertices.extend_from_slice(v);
-                    self.head_gen += 1;
-                }
-            } else if changed {
-                self.head_vertices = self.head_part.clone();
-                self.head_gen += 1;
-            }
+            self.frames
+                .get_or_insert_with(|| crate::frames::Frames::load(&self.dir))
+                .refresh([l; 3]);
             // Eau et lave qui coulent (hors parties FPS en ligne : la carte y est figée).
             let fluids_on = self.net.is_none() && self.game.mode != GameMode::Fps;
             if fluids_on {
@@ -1213,6 +1190,12 @@ impl Session {
                 }
             }
             let [x, y, z] = hit.block;
+            // Tête d'une carte importée : sa tête texturée part avec le bloc.
+            if hit.id.def().key.starts_with("skull") {
+                if let Some(h) = self.heads.as_mut() {
+                    h.remove_at(hit.block, &self.dir);
+                }
+            }
             // Une torche cassée rend une torche ordinaire : le sel restant est perdu.
             let item = if hit.id.is_torch() {
                 Item::Torch(None)
@@ -4361,6 +4344,15 @@ impl Session {
             v
         };
         let smokes = self.fps.smoke_volumes();
+        // Têtes (par zone) et cadres des cartes importées.
+        let mut statics = self
+            .heads
+            .as_ref()
+            .map_or_else(Vec::new, |h| h.visible(cam));
+        if let Some(f) = self.frames.as_ref().filter(|f| !f.is_empty()) {
+            let (v, gen) = f.current();
+            statics.push((u64::MAX, v, gen));
+        }
         let params = FrameParams {
             ray_boxes: &ray_boxes,
             smokes: &smokes,
@@ -4370,7 +4362,7 @@ impl Session {
             viewmodel: &hand,
             entities: &model,
             entities_follow: follow,
-            static_entities: (&self.head_vertices, self.head_gen),
+            static_entities: &statics,
             eye: cam,
             player_eye: self.player.eye(),
             view,

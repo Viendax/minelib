@@ -634,6 +634,10 @@ fn emit_lantern(
         // Suspendue dans le vide : ni chaîne ni anse.
     } else if hanging {
         // Chaîne jusqu'au plafond : deux maillons pleins (le haut de la texture), droits.
+        // La même chaîne pour les deux lanternes (celle de la lanterne des âmes).
+        let layer = crate::registry::registry()
+            .by_key("soul_lantern")
+            .map_or(layer, |b| face_tex(b, 0));
         for y in [10.0, 13.0] {
             emit_cross_uv(
                 out,

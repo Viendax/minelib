@@ -62,6 +62,39 @@ pub fn tall_layers(block: BlockId) -> Option<(u32, u32)> {
     }
 }
 
+/// Lanterne tenue ou en icône : son modèle 3D posé (corps et chapeau, sans chaîne), taillé
+/// dans sa texture. `m` : transformation d'un bloc 0..1. Faux si ce n'est pas une lanterne.
+fn push_lantern(out: &mut Vec<VmVertex>, m: Mat4, block: BlockId, light: [f32; 3]) -> bool {
+    let def = block.def();
+    if !(def.key.starts_with("lantern") || def.key.starts_with("soul_lantern")) {
+        return false;
+    }
+    // Les coordonnées de texture sont tirées de la position : chaque pavé est placé sur
+    // son morceau de texture, puis ramené au milieu du bloc (grossi : l'objet est petit).
+    let s = 1.0 / 16.0;
+    let m = m
+        * Mat4::from_translation(Vec3::new(0.5, 0.1, 0.5))
+        * Mat4::from_scale(Vec3::splat(1.6))
+        * Mat4::from_translation(Vec3::new(-3.0 * s, -7.0 * s, -3.0 * s));
+    let layer = [def.tex[1] as u32; 3];
+    for (a, b) in [
+        ([0.0, 7.0, 0.0], [6.0, 14.0, 6.0]),
+        ([1.0, 14.0, 1.0], [5.0, 16.0, 5.0]),
+    ] {
+        push_box(
+            out,
+            m,
+            Vec3::from(a) * s,
+            Vec3::from(b) * s,
+            Some(layer),
+            [1.0; 3],
+            light,
+            true,
+        );
+    }
+    true
+}
+
 fn lin(c: [u8; 3]) -> [f32; 3] {
     c.map(|v| (v as f32 / 255.0).powf(2.2))
 }
@@ -461,6 +494,9 @@ pub fn block_icon(cx: f32, cy: f32, size: f32, block: BlockId) -> Vec<VmVertex> 
         * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_6)
         * Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_4)
         * Mat4::from_translation(Vec3::splat(-0.5));
+    if push_lantern(&mut out, m, block, [1.0; 3]) {
+        return out;
+    }
     let boxes = if def.full {
         vec![([0u8, 0, 0], [16u8, 16, 16])]
     } else {
@@ -573,6 +609,7 @@ impl Hand {
                 match def.shape {
                     Shape::Cross => push_cross(&mut out, proj * m, layers[1], light),
                     Shape::Air | Shape::Invisible => {}
+                    _ if push_lantern(&mut out, proj * m, b, light) => {}
                     _ => {
                         let boxes = if def.full {
                             vec![([0, 0, 0], [16, 16, 16])]

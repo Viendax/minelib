@@ -13,9 +13,8 @@ use minelib_render::EntityVertex;
 
 use crate::skin::Skin;
 
-/// Têtes dessinées au plus (les plus proches), et distance maximale (blocs).
-const MAX_SHOWN: usize = 160;
-const RANGE: f32 = 56.0;
+/// Distance maximale des têtes dessinées (blocs).
+const RANGE: f32 = 200.0;
 /// Téléchargements en même temps.
 const PARALLEL: usize = 4;
 
@@ -96,12 +95,48 @@ pub struct Heads {
     running: usize,
     tx: Sender<(String, Option<Vec<u8>>)>,
     rx: Receiver<(String, Option<Vec<u8>>)>,
-    /// Triangles déjà faits par tête (indice dans `list`), avec la lumière utilisée.
-    built: HashMap<usize, ([f32; 3], bool, Vec<EntityVertex>)>,
-    /// Têtes dessinées (indice, texturée), lumière, et leurs triangles.
-    shown: Vec<(usize, bool)>,
-    shown_light: [f32; 3],
-    out: Vec<EntityVertex>,
+    /// Têtes par zone de 16 × 16 blocs : leurs triangles sont faits une fois et gardés
+    /// sur la carte graphique (rien n'est refait quand on se déplace).
+    cells: HashMap<(i32, i32), Cell>,
+    next_gen: u64,
+    /// Têtes cassées (indices dans `list`) : plus dessinées.
+    gone: HashSet<usize>,
+}
+
+/// Têtes d'une zone et leurs triangles.
+struct Cell {
+    heads: Vec<usize>,
+    verts: Vec<EntityVertex>,
+    /// Version des triangles (change quand ils sont refaits) ; 0 : pas encore faits.
+    gen: u64,
+    light: [f32; 3],
+    /// Têtes texturées lors de la dernière construction.
+    textured: usize,
+    /// Finesse de la dernière construction (1 de près, 2 ou 4 de loin).
+    lod: usize,
+}
+
+/// Finesse voulue à cette distance ; `current` : celle en place (on n'en change qu'une
+/// fois la limite franchement passée, pour ne pas refaire la zone sans arrêt).
+fn lod_for(d: f32, current: usize) -> usize {
+    let want = if d < 40.0 {
+        1
+    } else if d < 90.0 {
+        2
+    } else {
+        4
+    };
+    let keep = match current {
+        1 => d < 48.0,
+        2 => (32.0..104.0).contains(&d),
+        4 => d >= 76.0,
+        _ => false,
+    };
+    if keep {
+        current
+    } else {
+        want
+    }
 }
 
 impl Heads {
@@ -113,6 +148,22 @@ impl Heads {
             .filter_map(parse)
             .collect();
         let (tx, rx) = channel();
+        let list: Vec<Head> = list;
+        let mut cells: HashMap<(i32, i32), Cell> = HashMap::new();
+        for (i, h) in list.iter().enumerate() {
+            cells
+                .entry((h.pos[0] >> 4, h.pos[2] >> 4))
+                .or_insert_with(|| Cell {
+                    heads: Vec::new(),
+                    verts: Vec::new(),
+                    gen: 0,
+                    light: [0.0; 3],
+                    textured: 0,
+                    lod: 0,
+                })
+                .heads
+                .push(i);
+        }
         Self {
             list,
             cache,
@@ -121,10 +172,9 @@ impl Heads {
             running: 0,
             tx,
             rx,
-            built: HashMap::new(),
-            shown: Vec::new(),
-            shown_light: [-1.0; 3],
-            out: Vec::new(),
+            cells,
+            next_gen: 0,
+            gone: HashSet::new(),
         }
     }
 
@@ -185,59 +235,113 @@ impl Heads {
         }
     }
 
-    /// Triangles des têtes proches de la caméra : avec leur skin, ou la tête par défaut
-    /// de Minelib en attendant (le bloc uni dessous n'est pas dessiné). `None` : rien n'a
-    /// changé depuis la dernière fois.
-    pub fn vertices(&mut self, cam: Vec3, light: [f32; 3]) -> Option<&[EntityVertex]> {
-        let mut near: Vec<(usize, f32)> = self
-            .list
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (i, center(h).distance(cam)))
-            .filter(|(_, d)| *d < RANGE)
-            .collect();
-        near.sort_by(|a, b| a.1.total_cmp(&b.1));
-        near.truncate(MAX_SHOWN);
-        // Les mêmes têtes (avec ou sans texture) sous la même lumière : rien à refaire
-        // (ni à renvoyer à la carte graphique).
-        let mut shown: Vec<(usize, bool)> = near
-            .iter()
-            .map(|&(i, _)| (i, self.skins.contains_key(&self.list[i].hash)))
-            .collect();
-        shown.sort_unstable();
-        let same_light = self
-            .shown_light
-            .iter()
-            .zip(light)
-            .all(|(a, b)| (a - b).abs() < 0.02);
-        if shown == self.shown && same_light {
-            return None;
-        }
-        if !same_light {
-            self.shown_light = light;
-        }
-        let light = self.shown_light;
-        let mut out = Vec::new();
-        for &(i, _) in &shown {
-            let h = &self.list[i];
-            let skin = self.skins.get(&h.hash);
-            let fresh = self
-                .built
-                .get(&i)
-                .is_some_and(|(l, textured, _)| *textured == skin.is_some() && *l == light);
-            if !fresh {
-                let v = match skin {
-                    Some(skin) => crate::player_model::head(skin, transform(h), light),
-                    None => crate::player_model::default_head(transform(h), light),
-                };
-                self.built.insert(i, (light, skin.is_some(), v));
+    /// Zones proches de la caméra à (re)faire : pas encore construites, texture arrivée,
+    /// lumière changée. Une seule par appel (jamais d'à-coup).
+    pub fn refresh(&mut self, cam: Vec3, light: [f32; 3]) {
+        let mut best: Option<((i32, i32), f32)> = None;
+        for (&key, c) in &self.cells {
+            let d = cell_distance(key, cam);
+            if d > RANGE + 16.0 {
+                continue;
             }
-            out.extend_from_slice(&self.built[&i].2);
+            let textured = c
+                .heads
+                .iter()
+                .filter(|&&i| {
+                    !self.gone.contains(&i) && self.skins.contains_key(&self.list[i].hash)
+                })
+                .count();
+            let dirty = c.gen == 0
+                || lod_for(d, c.lod) != c.lod
+                || textured != c.textured
+                || c.light.iter().zip(light).any(|(a, b)| (a - b).abs() > 0.03);
+            if dirty && best.is_none_or(|b| d < b.1) {
+                best = Some((key, d));
+            }
         }
-        self.shown = shown;
-        self.out = out;
-        Some(&self.out)
+        let Some((key, d)) = best else { return };
+        let lod = lod_for(d, self.cells[&key].lod);
+        let ids = self.cells[&key].heads.clone();
+        let mut verts = Vec::new();
+        let mut textured = 0;
+        for i in ids {
+            if self.gone.contains(&i) {
+                continue;
+            }
+            let h = &self.list[i];
+            match self.skins.get(&h.hash) {
+                Some(skin) => {
+                    textured += 1;
+                    verts.extend(crate::player_model::head(skin, transform(h), light, lod));
+                }
+                None => verts.extend(crate::player_model::default_head(transform(h), light)),
+            }
+        }
+        self.next_gen += 1;
+        let c = self.cells.get_mut(&key).expect("zone");
+        c.verts = verts;
+        c.gen = self.next_gen;
+        c.light = light;
+        c.textured = textured;
+        c.lod = lod;
     }
+
+    /// Le bloc « tête » en `pos` a été cassé : sa tête texturée disparaît (de l'écran et
+    /// du fichier du monde `dir`).
+    pub fn remove_at(&mut self, pos: [i32; 3], dir: &Path) {
+        let Some(i) =
+            (0..self.list.len()).find(|i| self.list[*i].pos == pos && !self.gone.contains(i))
+        else {
+            return;
+        };
+        self.gone.insert(i);
+        if let Some(c) = self.cells.get_mut(&(pos[0] >> 4, pos[2] >> 4)) {
+            // À refaire (version changée même si la zone devient vide).
+            self.next_gen += 1;
+            c.textured = usize::MAX;
+            if c.heads.iter().all(|h| self.gone.contains(h)) {
+                c.verts.clear();
+                c.gen = self.next_gen;
+            }
+        }
+        let path = dir.join(crate::mcimport::HEADS_FILE);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let prefix = format!("{},{},{},", pos[0], pos[1], pos[2]);
+            let kept: Vec<&str> = text
+                .lines()
+                .filter(|l| {
+                    let frame = l.split(',').nth(3).is_some_and(|f| f.starts_with('f'));
+                    !l.starts_with(&prefix) || frame
+                })
+                .collect();
+            let mut t = kept.join("\n");
+            if !t.is_empty() {
+                t.push('\n');
+            }
+            let _ = std::fs::write(&path, t);
+        }
+    }
+
+    /// Zones à dessiner : (identifiant, triangles, version).
+    pub fn visible(&self, cam: Vec3) -> Vec<(u64, &[EntityVertex], u64)> {
+        self.cells
+            .iter()
+            .filter(|(&k, c)| c.gen != 0 && cell_distance(k, cam) < RANGE + 8.0)
+            .map(|(&(x, z), c)| {
+                (
+                    (x as u32 as u64) << 32 | z as u32 as u64,
+                    c.verts.as_slice(),
+                    c.gen,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Distance horizontale de la caméra au centre d'une zone.
+fn cell_distance(key: (i32, i32), cam: Vec3) -> f32 {
+    let c = Vec3::new(key.0 as f32 * 16.0 + 8.0, cam.y, key.1 as f32 * 16.0 + 8.0);
+    c.distance(cam)
 }
 
 fn center(h: &Head) -> Vec3 {

@@ -33,9 +33,9 @@ pub struct Entities {
     follow: u32,
     /// Entités fixes qui changent rarement (têtes et cadres des cartes) : gardées sur la
     /// carte graphique, renvoyées seulement quand leur version change.
-    statics: Option<wgpu::Buffer>,
-    static_count: u32,
-    static_gen: Option<u64>,
+    statics: std::collections::HashMap<u64, (wgpu::Buffer, u32, u64)>,
+    /// Lots à dessiner cette image.
+    static_draw: Vec<u64>,
 }
 
 impl Entities {
@@ -126,40 +126,47 @@ impl Entities {
             buffer,
             count: 0,
             follow: 0,
-            statics: None,
-            static_count: 0,
-            static_gen: None,
+            statics: std::collections::HashMap::new(),
+            static_draw: Vec::new(),
         }
     }
 
-    /// Entités fixes (`gen` : leur version ; mêmes sommets tant qu'elle ne change pas).
+    /// Entités fixes par lots : (identifiant, sommets, version). Un lot n'est renvoyé à
+    /// la carte graphique que si sa version a changé ; les lots absents sont oubliés.
     pub fn prepare_static(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        vertices: &[EntityVertex],
-        gen: u64,
+        lots: &[(u64, &[EntityVertex], u64)],
     ) {
-        if self.static_gen == Some(gen) {
-            return;
+        self.static_draw.clear();
+        for &(key, vertices, gen) in lots {
+            let n = vertices.len() / 3 * 3;
+            if n == 0 {
+                continue;
+            }
+            self.static_draw.push(key);
+            if self.statics.get(&key).is_some_and(|e| e.2 == gen) {
+                continue;
+            }
+            let bytes = (n * std::mem::size_of::<EntityVertex>()) as u64;
+            let reuse = self.statics.remove(&key).filter(|e| e.0.size() >= bytes);
+            let buffer = match reuse {
+                Some(e) => e.0,
+                None => device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("entités fixes (sommets)"),
+                    size: bytes.next_power_of_two(),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            };
+            queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&vertices[..n]));
+            self.statics.insert(key, (buffer, n as u32, gen));
         }
-        self.static_gen = Some(gen);
-        let n = vertices.len() / 3 * 3;
-        self.static_count = n as u32;
-        if n == 0 {
-            return;
+        if self.statics.len() > self.static_draw.len() + 64 {
+            let keep: std::collections::HashSet<u64> = self.static_draw.iter().copied().collect();
+            self.statics.retain(|k, _| keep.contains(k));
         }
-        let bytes = (n * std::mem::size_of::<EntityVertex>()) as u64;
-        if self.statics.as_ref().is_none_or(|b| b.size() < bytes) {
-            self.statics = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("entités fixes (sommets)"),
-                size: bytes.next_power_of_two(),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-        }
-        let buf = self.statics.as_ref().expect("tampon");
-        queue.write_buffer(buf, 0, bytemuck::cast_slice(&vertices[..n]));
     }
 
     /// `follow` : les premiers sommets suivent la caméra (modèle du joueur local), les
@@ -181,10 +188,14 @@ impl Entities {
         taa: bool,
     ) {
         pass.set_bind_group(0, group, &[]);
-        if let Some(b) = self.statics.as_ref().filter(|_| self.static_count > 0) {
+        if !self.static_draw.is_empty() {
             pass.set_pipeline(if taa { &self.taa_world } else { &self.plain });
-            pass.set_vertex_buffer(0, b.slice(..));
-            pass.draw(0..self.static_count, 0..1);
+            for key in &self.static_draw {
+                if let Some((b, n, _)) = self.statics.get(key) {
+                    pass.set_vertex_buffer(0, b.slice(..));
+                    pass.draw(0..*n, 0..1);
+                }
+            }
         }
         if self.count == 0 {
             return;

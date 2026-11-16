@@ -41,7 +41,7 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 - **Tout ce qu'on attend d'un compétitif** : menu d'achat par camp, économie, bombe et kit, prolongations, tableau des scores, fil des éliminations avec tirs en tête, à travers un mur ou une fumée, armes et grenades qu'on lâche et qu'on ramasse.
 - **Ton équipe, d'un coup d'œil** : un triangle à la couleur de chaque coéquipier, visible à travers les murs, et son nom quand tu le vois ; en haut, le bandeau des joueurs des deux camps (les morts s'assombrissent), et ta couleur préférée parmi vert, jaune, orange, bleu et violet.
 - **Votes et pauses comme dans CS** (Échap pendant une partie) : proposer d'exclure un coéquipier (tous les autres doivent être d'accord) ou une pause tactique (la majorité ; 3 par équipe, 30 s, au départ de la manche suivante). Le vote s'affiche à gauche : F1 oui, F2 non. Un joueur qui se déconnecte déclenche une pause technique jusqu'à son retour (5 minutes au plus) ; le temps de pause ne compte pas dans les absences.
-- **Ombres des joueurs** au soleil.
+- **Ombres des joueurs** au soleil et devant la lumière la plus proche (torche, lanterne).
 - **Minimap** en haut à droite, avec les règles de CS : tes coéquipiers toujours, les adversaires seulement quand ils sont repérés, les sites de bombe et la bombe quand ton équipe la connaît.
 - **Réseau à 256 Hz** : positions envoyées 256 fois par seconde, prédiction et rembobinage des tirs. À 10 joueurs, l'hôte envoie moins de 1 Mo par seconde.
 

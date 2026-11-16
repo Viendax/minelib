@@ -136,7 +136,7 @@ fn emit_box(
     light: [f32; 3],
     tex: Option<(&crate::skin::Skin, usize)>,
 ) {
-    emit_box_layer(out, xf, min, max, part, light, tex, None);
+    emit_box_layer(out, xf, min, max, part, light, tex, None, 1);
 }
 
 /// Comme `emit_box` ; `layer` : pixels transparents laissés vides (têtes des cartes :
@@ -152,6 +152,7 @@ fn emit_box_layer(
     light: [f32; 3],
     tex: Option<(&crate::skin::Skin, usize)>,
     layer: Option<bool>,
+    lod: usize,
 ) {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
@@ -225,13 +226,33 @@ fn emit_box_layer(
         // Ombrage selon l'orientation de la face dans le monde.
         let n = xf.transform_vector3(du.cross(dv)).normalize_or_zero();
         let shade = (0.78 + 0.22 * n.y + 0.06 * n.x).clamp(0.45, 1.0);
-        for v in 0..nv {
-            for u in 0..nu {
+        let lod = lod.max(1);
+        for v in (0..nv).step_by(lod) {
+            for u in (0..nu).step_by(lod) {
                 let g = grain(k * 4096 + v * 64 + u + part as usize * 977);
                 let size = [w as u32, h as u32, d as u32];
-                // Pas : la taille d'un pixel du skin (la boîte peut être agrandie, pour le
-                // calque du dessus).
                 let rgb = match (tex, layer) {
+                    // De loin : un carré par groupe de `lod` × `lod` pixels, à leur couleur
+                    // moyenne (vide si la plupart sont transparents).
+                    (Some((t, i)), Some(_)) if lod > 1 => {
+                        let (mut sum, mut n) = ([0u32; 3], 0u32);
+                        for dv2 in 0..lod.min(nv - v) {
+                            for du2 in 0..lod.min(nu - u) {
+                                if let Some(c) =
+                                    t.color(i, k, (u + du2) as u32, (v + dv2) as u32, size)
+                                {
+                                    sum[0] += (c >> 16) & 255;
+                                    sum[1] += (c >> 8) & 255;
+                                    sum[2] += c & 255;
+                                    n += 1;
+                                }
+                            }
+                        }
+                        if n * 2 < (lod * lod) as u32 {
+                            continue;
+                        }
+                        (sum[0] / n) << 16 | (sum[1] / n) << 8 | (sum[2] / n)
+                    }
                     (Some((t, i)), Some(top)) => {
                         let c = if top {
                             t.layer_color(i, k, u as u32, v as u32, size, true)
@@ -248,12 +269,14 @@ fn emit_box_layer(
                         .unwrap_or_else(|| skin(part, face, u, v, nu)),
                 };
                 let c = srgb(rgb);
+                let g = if lod > 1 { 1.0 } else { g };
                 let col = [0, 1, 2].map(|i| c[i] * shade * g * light[i]);
+                let (u1, v1) = ((u + lod).min(nu) as f32, (v + lod).min(nv) as f32);
                 let (a, b, cc, dd) = (
                     p(u as f32, v as f32),
-                    p(u as f32 + 1.0, v as f32),
-                    p(u as f32 + 1.0, v as f32 + 1.0),
-                    p(u as f32, v as f32 + 1.0),
+                    p(u1, v as f32),
+                    p(u1, v1),
+                    p(u as f32, v1),
                 );
                 for q in [a, b, cc, cc, dd, a] {
                     out.push(EntityVertex {
@@ -458,7 +481,26 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
                     },
                 )
             };
-            if let Some((top, bottom)) = crate::hand::tall_layers(block) {
+            if def.key.starts_with("lantern") || def.key.starts_with("soul_lantern") {
+                // Lanterne : corps et chapeau, taillés dans sa texture (sans chaîne).
+                let piece = |a: [u8; 3], b: [u8; 3], uv: [f32; 4]| {
+                    let (min, max) = block_box(a, b, 0.0);
+                    (
+                        frame,
+                        min,
+                        max,
+                        RayBoxKind::Block {
+                            layer: t[1] as u32,
+                            uv: uv.map(|v| v / 16.0),
+                            glow: true,
+                        },
+                    )
+                };
+                vec![
+                    piece([5, 0, 5], [11, 7, 11], [0.0, 2.0, 6.0, 9.0]),
+                    piece([6, 7, 6], [10, 9, 10], [1.0, 0.0, 5.0, 2.0]),
+                ]
+            } else if let Some((top, bottom)) = crate::hand::tall_layers(block) {
                 // Bannière, porte : deux blocs de haut, comme posées (panneau fin, deux
                 // moitiés).
                 let (a, b) = boxes[0];
@@ -566,10 +608,11 @@ pub(crate) fn emit_item(
 
 /// Tête seule (bloc « tête » à skin d'une carte importée) : `xf` va des pixels du modèle
 /// (tête de -4..4 × 0..8 × -4..4, visage vers −z) au monde.
-pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3]) -> Vec<EntityVertex> {
-    let mut out = Vec::with_capacity(2400);
+pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3], lod: usize) -> Vec<EntityVertex> {
+    let mut out = Vec::with_capacity(2400 / (lod * lod).max(1));
     // Exactement à la place de la hitbox du bloc « tête » : un seul pavé, le calque du
     // dessus posé sur le dessous ; les pixels transparents des deux restent vides.
+    // `lod` : 1 de près ; 2, 4 de loin (carrés de 2 × 2 ou 4 × 4 pixels, moins de triangles).
     emit_box_layer(
         &mut out,
         xf,
@@ -579,6 +622,7 @@ pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3]) -> Vec<EntityVe
         light,
         Some((skin, 5)),
         Some(false),
+        lod,
     );
     out
 }
