@@ -1955,6 +1955,22 @@ fn fluids_and_heads(b: &mut Builder) {
             );
         }
     }
+    // Chaîne verticale (au-dessus des lanternes suspendues) : maillons de la texture de
+    // la lanterne des âmes.
+    b.add(
+        "chain".into(),
+        "chaîne".into(),
+        Shape::Box {
+            min: [6, 0, 6],
+            max: [10, 16, 10],
+        },
+        &[
+            p("spirit_lantern"),
+            p("spirit_lantern"),
+            p("spirit_lantern"),
+        ],
+        DECOR,
+    );
     b.add(
         "candle".into(),
         "bougie".into(),
@@ -2038,6 +2054,23 @@ fn fluids_and_heads(b: &mut Builder) {
                 b.r.keys.insert(key, id);
             }
         }
+    }
+    // Portes ouvertes dont les gonds sont de l'autre côté (battant droit d'une double
+    // porte) : `…:m`, texture retournée.
+    let doors: Vec<BlockDef> =
+        b.r.defs
+            .iter()
+            .filter(|d| d.key.starts_with("door_") && !d.key.ends_with(":m"))
+            .cloned()
+            .collect();
+    for d in doors {
+        let k = format!("{}:m", d.key);
+        let id = b.r.defs.len() as u16;
+        b.r.defs.push(BlockDef {
+            key: k.clone(),
+            ..d
+        });
+        b.r.keys.insert(k, id);
     }
     // Pots de fleurs garnis : `flower_pot:<plante>` (une plante en croix dedans).
     let pot = b.r.defs[b.r.keys["flower_pot"] as usize].clone();

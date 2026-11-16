@@ -374,14 +374,22 @@ pub fn start(cfg: Config) -> Result<Handle> {
     std::thread::Builder::new()
         .name("relais : écoute".into())
         .spawn(move || {
+            // Connexions ouvertes par adresse : au-delà de `MAX_PER_PEER`, les suivantes
+            // sont refusées (un seul PC ne peut pas épuiser le relais en connexions).
+            let open: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
             for conn in listener.incoming() {
                 let Ok(stream) = conn else { continue };
                 let state = state.clone();
+                let open = open.clone();
                 let _ = std::thread::Builder::new()
                     .name("relais : client".into())
                     .spawn(move || {
                         let ip = stream.peer_addr().map(|a| a.ip()).ok();
                         let mut peer = ip.map(|a| a.to_string()).unwrap_or_default();
+                        let _slot = match PeerSlot::take(&open, &peer, ip) {
+                            Some(s) => s,
+                            None => return,
+                        };
                         // Par le tunnel iroh, le joueur arrive de ce PC : le tunnel dit
                         // d'abord qui il est vraiment.
                         if ip.is_some_and(|a| a.is_loopback()) {
@@ -403,6 +411,52 @@ pub fn start(cfg: Config) -> Result<Handle> {
         whois,
         shard_from,
     })
+}
+
+/// Connexions ouvertes en même temps par une même adresse.
+const MAX_PER_PEER: usize = 48;
+/// Connexions ouvertes en tout (au-delà, les nouvelles sont refusées).
+const MAX_CONNECTIONS: usize = 60_000;
+
+/// Place prise par une connexion (rendue quand elle se ferme).
+struct PeerSlot {
+    open: Arc<Mutex<HashMap<String, usize>>>,
+    key: String,
+}
+
+impl PeerSlot {
+    fn take(
+        open: &Arc<Mutex<HashMap<String, usize>>>,
+        peer: &str,
+        ip: Option<std::net::IpAddr>,
+    ) -> Option<Self> {
+        let mut m = open.lock().unwrap();
+        let total: usize = m.values().sum();
+        // Ce PC (tunnel iroh, relais intégré, essais) : pas de limite par adresse, le
+        // tunnel a les siennes.
+        let local = ip.is_none_or(|a| a.is_loopback());
+        let n = m.entry(peer.to_string()).or_insert(0);
+        if total >= MAX_CONNECTIONS || (!local && *n >= MAX_PER_PEER) {
+            return None;
+        }
+        *n += 1;
+        Some(Self {
+            open: open.clone(),
+            key: peer.to_string(),
+        })
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut m = self.open.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Lit le préambule « MLPX » que met le tunnel iroh devant chaque connexion (voir
@@ -3270,6 +3324,26 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 for m in room.build.nearby(id, chunk) {
                     if let Some(c) = st.conns.get(&m) {
                         transport::push(&c.tx, &msg);
+                    }
+                }
+                // Modifications pas encore reçues (foule : elles ne sont poussées qu'à une
+                // partie des joueurs, voir `zones::LIVE_MAX`).
+                if room.kind == 1 && room.build.positions.contains_key(&id) {
+                    let logs = room.build.catch_up(id, Some(chunk));
+                    if let Some(c) = st.conns.get(&id) {
+                        for (zone, log) in logs {
+                            let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
+                            for data in log {
+                                transport::push(
+                                    &c.tx,
+                                    &Response::FromZone {
+                                        peer: 0,
+                                        chunk,
+                                        data,
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
             }

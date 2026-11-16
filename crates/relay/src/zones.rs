@@ -124,7 +124,22 @@ pub struct Build {
     next_seq: u64,
     /// Positions envoyées par chaque joueur (pour n'en transmettre qu'une partie au loin).
     pos_count: HashMap<u64, u32>,
+    /// Joueurs par chunk (même contenu que `positions`, rangé pour trouver les voisins
+    /// sans parcourir tout le monde) ; `indexed` : nombre de joueurs rangés.
+    by_chunk: HashMap<[i32; 2], Vec<u64>>,
+    indexed: usize,
 }
+
+/// Une position n'est transmise qu'à ce nombre de joueurs au plus. Dans une foule (des
+/// milliers de joueurs au même endroit, voire tous), chacun voit bouger ses `FANOUT`
+/// voisins, toujours les mêmes, et le travail du relais ne dépend plus de la taille de la
+/// foule : `FANOUT` messages par position reçue, au lieu d'un par joueur présent.
+pub const FANOUT: usize = 64;
+
+/// Une modification du monde est poussée tout de suite à ce nombre de joueurs au plus ;
+/// au-delà (foule), chacun la reçoit avec sa prochaine position, compactée. Le travail par
+/// modification ne dépend plus de la taille de la foule.
+pub const LIVE_MAX: usize = 256;
 
 /// Changements de garants à annoncer : (joueur, zones gagnées, zones perdues).
 pub type Changes = Vec<(u64, Vec<[i32; 2]>, Vec<[i32; 2]>)>;
@@ -142,28 +157,94 @@ fn near_zone(chunk: [i32; 2], zone: [i32; 2]) -> bool {
 }
 
 impl Build {
+    /// Range les joueurs par chunk si ce n'est pas fait (positions changées en direct).
+    fn reindex(&mut self) {
+        if self.indexed == self.positions.len() {
+            return;
+        }
+        self.by_chunk.clear();
+        let mut ids: Vec<(u64, [i32; 2])> = self.positions.iter().map(|(&i, &c)| (i, c)).collect();
+        ids.sort_unstable();
+        for (id, c) in ids {
+            self.by_chunk.entry(c).or_default().push(id);
+        }
+        self.indexed = self.positions.len();
+    }
+
+    /// Note le chunk d'un joueur (`None` : parti).
+    fn place(&mut self, id: u64, chunk: Option<[i32; 2]>) {
+        self.reindex();
+        let old = match chunk {
+            Some(c) => self.positions.insert(id, c),
+            None => self.positions.remove(&id),
+        };
+        if old == chunk {
+            return;
+        }
+        if let Some(o) = old {
+            if let Some(v) = self.by_chunk.get_mut(&o) {
+                v.retain(|&m| m != id);
+                if v.is_empty() {
+                    self.by_chunk.remove(&o);
+                }
+            }
+        }
+        if let Some(c) = chunk {
+            self.by_chunk.entry(c).or_default().push(id);
+        }
+        self.indexed = self.positions.len();
+    }
+
     /// À qui transmettre la position d'un joueur : à chaque fois aux joueurs tout proches
     /// (2 chunks), une fois sur 4 jusqu'à 6 chunks, une fois sur 20 au-delà (12 chunks au
-    /// plus). Dans une foule, le relais n'envoie pas tout à tout le monde, et chacun voit
-    /// bien les joueurs à côté de lui.
+    /// plus), les plus proches d'abord, et à `FANOUT` joueurs au plus. Dans une foule,
+    /// chacun voit bien ses voisins (toujours les mêmes : ceux rangés après lui dans son
+    /// chunk), et le relais ne parcourt ni n'envoie jamais à toute la foule.
     pub fn nearby(&mut self, id: u64, chunk: [i32; 2]) -> Vec<u64> {
+        self.reindex();
         let n = self.pos_count.entry(id).or_insert(0);
         *n = n.wrapping_add(1);
         let n = *n;
-        self.positions
-            .iter()
-            .filter(|(&other, &p)| other != id && near(p, chunk))
-            .filter(|(_, &p)| {
-                let d = (p[0] - chunk[0]).abs().max((p[1] - chunk[1]).abs());
-                let every = match d {
-                    0..=2 => 1,
-                    3..=6 => 4,
-                    _ => 20,
-                };
-                n.is_multiple_of(every)
-            })
-            .map(|(&other, _)| other)
-            .collect()
+        let mut out = Vec::new();
+        for d in 0..=NEAR {
+            let every = match d {
+                0..=2 => 1,
+                3..=6 => 4,
+                _ => 20,
+            };
+            if !n.is_multiple_of(every) {
+                continue;
+            }
+            // Anneau de chunks à la distance `d`.
+            for dx in -d..=d {
+                for dz in -d..=d {
+                    if dx.abs().max(dz.abs()) != d {
+                        continue;
+                    }
+                    let Some(members) = self.by_chunk.get(&[chunk[0] + dx, chunk[1] + dz]) else {
+                        continue;
+                    };
+                    let room = FANOUT - out.len();
+                    if members.len() <= room {
+                        out.extend(members.iter().copied().filter(|&m| m != id));
+                    } else {
+                        // Plus de monde que de place : les voisins de rang (ceux qui
+                        // suivent ce joueur dans le chunk, ou le début pour un autre chunk).
+                        let start = members.iter().position(|&m| m == id).map_or(0, |i| i + 1);
+                        out.extend(
+                            (0..members.len())
+                                .map(|k| members[(start + k) % members.len()])
+                                .filter(|&m| m != id)
+                                .take(room),
+                        );
+                    }
+                    if out.len() >= FANOUT {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Zones actives (des messages ces dernières secondes).
@@ -171,8 +252,20 @@ impl Build {
         self.zones.values().filter(|z| z.activity > 0.05).count()
     }
 
-    /// Joueurs à qui envoyer ce qui se passe au chunk `chunk`.
+    /// Joueurs à qui envoyer ce qui se passe au chunk `chunk` (tous ceux à portée : une
+    /// modification du monde doit arriver à chacun).
     pub fn listeners(&self, chunk: [i32; 2], except: u64) -> Vec<u64> {
+        // Peu de chunks occupés (une foule au même endroit) ou index pas à jour : par les
+        // chunks occupés ; sinon par les chunks voisins.
+        if self.indexed == self.positions.len() {
+            return self
+                .by_chunk
+                .iter()
+                .filter(|(&c, _)| near(c, chunk))
+                .flat_map(|(_, m)| m.iter().copied())
+                .filter(|&id| id != except)
+                .collect();
+        }
         self.positions
             .iter()
             .filter(|(&id, &p)| id != except && near(p, chunk))
@@ -263,7 +356,10 @@ impl Build {
         let seq = self.next_seq;
         log.push(seq, data);
         let mut out = Vec::new();
-        for &id in listeners {
+        // Dans une foule, la modification n'est poussée tout de suite qu'aux `LIVE_MAX`
+        // premiers ; les autres la reçoivent à leur prochaine position (20 fois par
+        // seconde), compactée : la dernière valeur de chaque case, pas chaque étape.
+        for &id in listeners.iter().take(LIVE_MAX) {
             let known = self.known.entry(id).or_default().entry(zone).or_insert(0);
             if *known >= before {
                 out.push((id, vec![data.to_vec()]));
@@ -296,19 +392,37 @@ impl Build {
     pub fn catch_up(&mut self, id: u64, chunk: Option<[i32; 2]>) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
         let known = self.known.entry(id).or_default();
         let mut out = Vec::new();
-        let logs = self
-            .zones
-            .iter()
-            .map(|(&k, z)| (k, &z.log))
-            .chain(self.orphan_logs.iter().map(|(&k, l)| (k, l)));
-        for (zone, log) in logs {
-            if chunk.is_some_and(|c| !near_zone(c, zone)) {
-                continue;
-            }
+        let mut take = |zone: [i32; 2], log: &ZoneLog| {
             let k = known.entry(zone).or_insert(0);
             if log.last() > *k {
                 out.push((zone, log.since(*k)));
                 *k = log.last();
+            }
+        };
+        match chunk {
+            // Autour d'un joueur : seulement les zones à portée (cherchées par leurs
+            // coordonnées, sans parcourir toutes les zones du monde).
+            Some(c) => {
+                let z = minelib_net::proto::ZONE;
+                for zx in (c[0] - NEAR).div_euclid(z)..=(c[0] + NEAR).div_euclid(z) {
+                    for zz in (c[1] - NEAR).div_euclid(z)..=(c[1] + NEAR).div_euclid(z) {
+                        let zone = [zx, zz];
+                        if let Some(zn) = self.zones.get(&zone) {
+                            take(zone, &zn.log);
+                        }
+                        if let Some(l) = self.orphan_logs.get(&zone) {
+                            take(zone, l);
+                        }
+                    }
+                }
+            }
+            None => {
+                for (&zone, zn) in &self.zones {
+                    take(zone, &zn.log);
+                }
+                for (&zone, l) in &self.orphan_logs {
+                    take(zone, l);
+                }
             }
         }
         out
@@ -316,7 +430,7 @@ impl Build {
 
     /// Le joueur s'est déplacé : ce qui lui manque des zones proches.
     pub fn moved(&mut self, id: u64, chunk: [i32; 2]) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
-        self.positions.insert(id, chunk);
+        self.place(id, Some(chunk));
         self.catch_up(id, Some(chunk))
     }
 
@@ -328,7 +442,7 @@ impl Build {
 
     /// Un joueur part : ses zones vont à d'autres.
     pub fn left(&mut self, id: u64, cands: &[Candidate]) -> Changes {
-        self.positions.remove(&id);
+        self.place(id, None);
         self.known.remove(&id);
         self.pos_count.remove(&id);
         let mine: Vec<[i32; 2]> = self
@@ -525,6 +639,46 @@ mod tests {
         assert_eq!(got.get(&21), Some(&20));
         assert_eq!(got.get(&22), Some(&4));
         assert_eq!(got.get(&23), None, "trop loin");
+        // Une foule au même endroit : chaque position ne part qu'à `FANOUT` voisins,
+        // toujours les mêmes, et chacun est le voisin d'autant de joueurs.
+        let mut crowd = Build::default();
+        for id in 0..5000u64 {
+            crowd.moved(id, [3, 3]);
+        }
+        let a = crowd.nearby(100, [3, 3]);
+        assert_eq!(a.len(), FANOUT);
+        assert!(!a.contains(&100));
+        assert_eq!(
+            a,
+            crowd.nearby(100, [3, 3]),
+            "mêmes voisins d'une fois à l'autre"
+        );
+        let mut seen: HashMap<u64, usize> = HashMap::new();
+        for id in 0..5000u64 {
+            for m in crowd.nearby(id, [3, 3]) {
+                *seen.entry(m).or_default() += 1;
+            }
+        }
+        assert!(
+            seen.values().all(|&n| n == FANOUT),
+            "chacun reçoit FANOUT voisins"
+        );
+        assert_eq!(seen.len(), 5000);
+        // Modifications dans une foule : poussées à `LIVE_MAX` joueurs, les autres les
+        // reçoivent à leur prochaine position, compactées (la dernière valeur par case).
+        let to = crowd.listeners([3, 3], u64::MAX);
+        for v in 0..10u16 {
+            let live = crowd.mirror_to([0, 0], &set(1, v), &to);
+            assert_eq!(live.len(), LIVE_MAX);
+        }
+        let late = to[LIVE_MAX + 5];
+        let got = crowd.catch_up(late, Some([3, 3]));
+        assert_eq!(got, vec![([0, 0], vec![set(1, 9)])]);
+        assert!(crowd.catch_up(late, Some([3, 3])).is_empty());
+        // Une modification du monde arrive toujours à tous ceux à portée.
+        assert_eq!(crowd.listeners([3, 3], 0).len(), 4999);
+        crowd.left(7, &[]);
+        assert_eq!(crowd.listeners([3, 3], 0).len(), 4998);
         // Le garant part : sa zone passe à un autre.
         let ch = b.left(1, &cands);
         assert!(ch.iter().any(|(id, g, _)| *id != 1 && g.contains(&[0, 0])));

@@ -64,6 +64,10 @@ impl Input {
     pub fn pressed(&self, k: KeyCode) -> bool {
         self.pressed.contains(&k)
     }
+    /// Touches tenues en ce moment (diagnostic).
+    pub fn held_keys(&self) -> Vec<KeyCode> {
+        self.held.iter().copied().collect()
+    }
     /// Touches enfoncées pendant cette image.
     pub fn pressed_keys(&self) -> Vec<KeyCode> {
         self.pressed.iter().copied().collect()

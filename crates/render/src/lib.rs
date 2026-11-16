@@ -166,6 +166,8 @@ struct ScenePipes<'p> {
     sky: &'p wgpu::RenderPipeline,
     outline: &'p wgpu::RenderPipeline,
     heavy: Option<&'p taa::Heavy>,
+    /// Passe à deux cibles (anticrénelage temporel).
+    taa: bool,
 }
 
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -1754,6 +1756,9 @@ impl Renderer {
             pass.set_pipeline(pipes.outline);
             pass.draw(0..24, 0..1);
         }
+        // Entités (joueurs, têtes, cadres) avant le verre et l'eau : elles se voient à
+        // travers, teintées, au lieu de passer devant.
+        self.entities.draw(pass, self.world_group(), pipes.taa);
         // Translucides de l'arrière vers l'avant, par-dessus la scène opaque.
         pass.set_pipeline(&heavy.translucent);
         let mut bound = usize::MAX;
@@ -1885,10 +1890,10 @@ impl Renderer {
                     sky: &self.sky_pipeline,
                     outline: &self.outline_pipeline,
                     heavy: Some(self.plain_pipes()),
+                    taa: false,
                 },
                 &mut stats,
             );
-            self.entities.draw(&mut pass, self.world_group(), false);
             self.smokes.draw(&mut pass, self.world_group(), false);
         }
         // Main + objet tenu (profondeur à part), puis l'interface.
@@ -2160,10 +2165,10 @@ impl Renderer {
                     sky: &taa.sky,
                     outline: &taa.outline,
                     heavy: taa.heavy.try_get(),
+                    taa: true,
                 },
                 &mut stats,
             );
-            self.entities.draw(&mut pass, self.world_group(), true);
             self.smokes.draw(&mut pass, self.world_group(), true);
         }
         taa.resolve(

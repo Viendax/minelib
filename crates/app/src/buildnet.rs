@@ -541,6 +541,12 @@ impl BuildNet {
                 crouch,
                 speed,
             } => {
+                // Valeurs d'un autre joueur : rien d'infini ni d'absurde n'entre dans le jeu.
+                let sane = pos.iter().all(|v| v.is_finite() && v.abs() < 4.0e7)
+                    && [yaw, pitch, crouch, speed].iter().all(|v| v.is_finite());
+                if !sane {
+                    return Vec::new();
+                }
                 let target = Vec3::from(pos);
                 let key: String = pseudo.chars().take(16).collect();
                 // Numéro sur le relais du monde (le vocal passe par lui).

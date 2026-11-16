@@ -661,25 +661,31 @@ fn emit_lantern(
     }
 }
 
-/// Porte fermée `door_<bois>:<moitié>:<côté>` dont le battant voisin (même porte, même
-/// côté) est du côté où elle tourne (`same` : la case dans cette direction a le même
-/// bloc) : battant droit d'une double porte.
-fn door_is_right(key: &str, same: impl Fn([i32; 3]) -> bool) -> bool {
+/// Texture d'une porte retournée de gauche à droite ? La poignée est du côté opposé aux
+/// gonds : une porte seule l'a d'un côté ; le battant d'une double porte dont le jumeau
+/// (même porte, même moitié, ouvert ou fermé) est du côté où elle tournerait a ses gonds
+/// de l'autre côté, donc la texture inverse ; ouvert, ce battant est le bloc `…:m`.
+/// `family` : la case voisine dans cette direction porte-t-elle la même porte ?
+fn door_is_right(key: &str, family: impl Fn([i32; 3], &str) -> bool) -> bool {
     if !key.starts_with("door_") {
         return false;
     }
-    let side = key.rsplit(':').next().and_then(|s| s.parse::<u8>().ok());
+    if key.ends_with(":m") {
+        return false;
+    }
+    let mut it = key.split(':');
+    let (Some(wood), Some(half), Some(side)) = (it.next(), it.next(), it.next()) else {
+        return false;
+    };
     // Même sens que `door_turn` du jeu (côté vers lequel tourne la porte).
-    // Le battant dont l'autre est du côté opposé à celui où il tourne (vu de devant, à
-    // droite) a sa texture retournée.
-    let d = match side {
-        Some(1) => [0, 0, 1],
-        Some(5) => [-1, 0, 0],
-        Some(0) => [0, 0, -1],
-        Some(4) => [1, 0, 0],
+    let d = match side.parse::<u8>() {
+        Ok(1) => [0, 0, -1],
+        Ok(5) => [1, 0, 0],
+        Ok(0) => [0, 0, 1],
+        Ok(4) => [-1, 0, 0],
         _ => return false,
     };
-    same(d)
+    !family(d, &format!("{wood}:{half}:"))
 }
 
 /// Coordonnées de texture d'`emit_box_t` : tirées de la position par le shader, écrites
@@ -687,6 +693,8 @@ fn door_is_right(key: &str, same: impl Fn([i32; 3]) -> bool) -> bool {
 const UV_WORLD: u8 = 0;
 const UV_LOCAL: u8 = 1;
 const UV_MIRROR: u8 = 2;
+/// Comme `UV_LOCAL`, la texture du dessus et du dessous tournée d'un quart de tour.
+const UV_TOPSWAP: u8 = 3;
 
 /// Comme `emit_box_xf`, avec la texture de chaque face donnée par `tex_of`.
 #[allow(clippy::too_many_arguments)]
@@ -724,6 +732,7 @@ fn emit_box_t(
                 let m = |t: f32| if local_uv == UV_MIRROR { 1.0 - t } else { t };
                 let uv = match axis(n) {
                     0 => [m(l[2]), 1.0 - l[1]],
+                    1 if local_uv == UV_TOPSWAP => [l[2], l[0]],
                     1 => [l[0], l[2]],
                     _ => [m(l[0]), 1.0 - l[1]],
                 };
@@ -1294,7 +1303,36 @@ fn mesh_block(
                                     boxes.extend(post_arms(kind, side));
                                 }
                             }
+                            // Vitre : une seule pièce par direction (pas de faces internes
+                            // visibles à travers le verre entre le centre et les bras).
+                            if kind == PostKind::Pane {
+                                let has = |side: u8| {
+                                    let arm = post_arms(kind, side);
+                                    arm.iter().all(|a| boxes.contains(a))
+                                };
+                                let (e, w, s, n) = (has(0), has(1), has(4), has(5));
+                                let mut merged = Vec::new();
+                                if e || w {
+                                    merged.push((
+                                        [if w { 0 } else { 7 }, 0, 7],
+                                        [if e { 16 } else { 9 }, 16, 9],
+                                    ));
+                                    if s {
+                                        merged.push(([7, 0, 9], [9, 16, 16]));
+                                    }
+                                    if n {
+                                        merged.push(([7, 0, 0], [9, 16, 7]));
+                                    }
+                                } else {
+                                    merged.push((
+                                        [7, 0, if n { 0 } else { 7 }],
+                                        [9, 16, if s { 16 } else { 9 }],
+                                    ));
+                                }
+                                boxes = merged;
+                            }
                         }
+                        let pane = matches!(def.shape, Shape::Post(PostKind::Pane));
                         // Lanternes : modèle 3D taillé dans leur texture.
                         if def.key.starts_with("lantern") || def.key.starts_with("soul_lantern") {
                             emit_lantern(
@@ -1303,9 +1341,29 @@ fn mesh_block(
                                 id,
                                 light_at(b),
                                 def.key.ends_with(":hanging"),
-                                // Chaîne seulement si un bloc la retient au-dessus.
-                                pad.get(x, y + 1, z).def().solid,
+                                // Chaîne seulement si quelque chose la retient au-dessus
+                                // (bloc, barrière, chaîne…).
+                                {
+                                    let up = pad.get(x, y + 1, z).def();
+                                    up.target && !matches!(up.shape, Shape::Cross)
+                                },
                             );
+                            return;
+                        }
+                        // Chaîne : quatre maillons droits sur toute la hauteur.
+                        if def.key == "chain" {
+                            let layer = face_tex(id, 0);
+                            for k in 0..4 {
+                                let y0 = wy + k as f32 * 0.25;
+                                emit_cross_uv(
+                                    out,
+                                    [wx + 6.5 / 16.0, y0, wz + 0.5],
+                                    [wx + 9.5 / 16.0, y0 + 0.25, wz + 0.5],
+                                    layer,
+                                    [11.0, 1.0, 14.0, 5.0],
+                                    light_at(b),
+                                );
+                            }
                             return;
                         }
                         // Bannière : deux blocs de haut, elle pend dans la case du dessous
@@ -1313,8 +1371,8 @@ fn mesh_block(
                         let banner = def.key.starts_with("banner_");
                         // Double porte : le battant qui a l'autre à sa gauche (vu de devant)
                         // a sa texture retournée, comme dans Minecraft.
-                        let mirrored = door_is_right(&def.key, |d| {
-                            pad.get(x + d[0], y, z + d[2]).def().key == def.key
+                        let mirrored = door_is_right(&def.key, |d, family| {
+                            pad.get(x + d[0], y, z + d[2]).def().key.starts_with(family)
                         });
                         // Moitié du bas toujours, sauf dans un bloc plein (on n'y verrait
                         // que le bloc, en scintillant).
@@ -1360,6 +1418,10 @@ fn mesh_block(
                             // Face sur le bord du bloc et voisin plein : cachée.
                             let skip = |face: usize| {
                                 let (nrm, _, _) = FACES[face];
+                                // Vitre : bout d'un bras collé à la pièce du milieu.
+                                if pane && (face == 5 && mn[2] == 9 || face == 4 && mx[2] == 7) {
+                                    return true;
+                                }
                                 // Jointure entre les deux moitiés d'une bannière : rien.
                                 if banner_low
                                     && (nrm[1] == -1 && dy == 0 || nrm[1] == 1 && dy == -1)
@@ -1385,7 +1447,15 @@ fn mesh_block(
                                 0,
                                 skip,
                                 &|p| p,
-                                if mirrored { UV_MIRROR } else { UV_WORLD },
+                                if mirrored {
+                                    UV_MIRROR
+                                } else if pane && mx[0] - mn[0] > mx[2] - mn[2] {
+                                    // Vitre le long de X : la tranche (dessus, dessous)
+                                    // est tournée dans son sens.
+                                    UV_TOPSWAP
+                                } else {
+                                    UV_WORLD
+                                },
                             );
                             if !banner && matches!(def.shape, Shape::Panel { .. }) {
                                 emit_hole_walls(
@@ -1476,7 +1546,13 @@ fn mesh_block(
                     // au travers.
                     let covered = crate::registry::light_faces(facing) & (1 << (face ^ 1)) != 0
                         && !has_holes(face_tex(facing, (face ^ 1) as u32));
+                    // Deux verres différents collés (teintes, vitrail) : pas de face entre
+                    // eux non plus (elle apparaissait noire).
+                    let glass = |d: &crate::registry::BlockDef| {
+                        d.key.starts_with("glass") && matches!(d.shape, Shape::Cube)
+                    };
                     if opaque(front)
+                        || (glass(def) && glass(facing.def()))
                         || (def.cull_same && facing == id)
                         || (covered && !def.translucent)
                     {
@@ -1567,7 +1643,8 @@ fn mesh_block(
                     } else {
                         face_tex(id, face as u32)
                     };
-                    let tex = if fluid_here.is_some() {
+                    // Échafaudage : on voit aussi l'intérieur de ses côtés.
+                    let tex = if fluid_here.is_some() || def.key == "scaffolding" {
                         tex | TEX_TWO_SIDED
                     } else {
                         tex

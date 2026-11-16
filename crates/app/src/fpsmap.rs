@@ -257,12 +257,20 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         .filter(|c| !c.is_control() && *c != '=')
         .take(40)
         .collect();
+    // La carte vient d'un autre joueur : rien de ce qu'elle contient ne peut ajouter de
+    // lignes au fichier du monde.
+    let generator: String = p
+        .generator
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(24)
+        .collect();
     fs::write(
         dir.join("level.txt"),
         format!(
             "name={name}\nseed={}\ncreated=0\nlast_played=0\nclock=0\nnight=0\ngenerator={}\n\
              gamemode=fps\nfly=0\nhealth=20\n",
-            p.seed, p.generator
+            p.seed, generator
         ),
     )?;
     let mut edits = ((p.edits.len() / 14) as u32).to_le_bytes().to_vec();
@@ -282,7 +290,8 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     let time = p
         .torches
         .iter()
-        .find_map(|l| l.strip_prefix("heure,")?.parse::<f32>().ok());
+        .find_map(|l| l.strip_prefix("heure,")?.parse::<f32>().ok())
+        .filter(|h| h.is_finite() && (0.0..24.0).contains(h));
     save_time(&dir, time)?;
     let (heads, torches): (Vec<&String>, Vec<&String>) = p
         .torches

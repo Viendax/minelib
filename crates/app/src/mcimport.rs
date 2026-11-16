@@ -301,7 +301,8 @@ fn recent_block(full: &str) -> Option<BlockId> {
         "beehive" | "bee_nest" => "planks_birch",
         "bell" => "gold_block",
         "stripped_bamboo_block" | "bamboo_block" | "bamboo_mosaic" => "hay",
-        "iron_chain" | "chain" => "iron_bars",
+        // Chaîne : verticale, une vraie chaîne ; couchée, des barreaux.
+        "iron_chain" | "chain" => return None,
         _ if n.ends_with("_coral") || n.ends_with("_coral_fan") => {
             return reg.by_key(&format!("plant:{n}"));
         }
@@ -743,6 +744,13 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         | "redstone_torch"
         | "redstone_wall_torch" => "torch",
         "ladder" => return key(&format!("ladder:{}", wall_side(prop("facing")))),
+        "iron_chain" | "chain" => {
+            return key(if matches!(prop("axis"), Some("x" | "z")) {
+                "iron_bars"
+            } else {
+                "chain"
+            });
+        }
         "lantern" | "soul_lantern" => {
             let hang = if prop("hanging") == Some("true") {
                 ":hanging"
@@ -839,7 +847,7 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
 /// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales ; 5 : décors en entités
 /// d'affichage).
-pub const IMPORT_VERSION: u32 = 8;
+pub const IMPORT_VERSION: u32 = 9;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {
@@ -2430,6 +2438,9 @@ mod dump_displays {
             frames.len(),
             &frames[..frames.len().min(5)]
         );
+        for f in &frames {
+            eprintln!("CADRE {f}");
+        }
     }
 
     #[test]

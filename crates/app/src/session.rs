@@ -179,6 +179,9 @@ pub struct Session {
     heads: Option<crate::heads::Heads>,
     /// Cadres des murs (cartes importées).
     frames: Option<crate::frames::Frames>,
+    /// Temps passé à avancer sans touche tenue (diagnostic), et déjà noté au journal.
+    coast: f32,
+    coast_logged: bool,
     autosave: f32,
     hit: Option<Hit>,
     overlay: Overlay,
@@ -372,6 +375,8 @@ impl Session {
             lava_burn: 0.0,
             heads: None,
             frames: None,
+            coast: 0.0,
+            coast_logged: false,
             autosave: AUTOSAVE_S,
             hit: None,
             overlay: Overlay::default(),
@@ -650,6 +655,35 @@ impl Session {
             if self.inventory.open || typing {
                 m = MoveInput::default();
             }
+            // Diagnostic : le joueur avance encore alors qu'aucune touche de déplacement
+            // n'est tenue (au sol, hors eau et échelle) : noté une fois au journal, avec
+            // tout ce qui peut l'expliquer.
+            let flat = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
+            let idle = m.forward == 0.0 && m.strafe == 0.0;
+            let coasting = idle
+                && flat > 1.0
+                && (self.player.on_ground || self.player.flying)
+                && !self.player.on_ladder
+                && self.player.swimming.is_none();
+            self.coast = if coasting { self.coast + dt } else { 0.0 };
+            if self.coast > 0.6 && !self.coast_logged {
+                self.coast_logged = true;
+                log::warn!(
+                    "le joueur avance sans touche depuis {:.1} s : vitesse {:?}, mode {:?}, \
+                     sol {}, vol {}, touches tenues {:?}, saisie {}, inventaire {}",
+                    self.coast,
+                    self.player.vel,
+                    self.game.mode,
+                    self.player.on_ground,
+                    self.player.flying,
+                    input.held_keys(),
+                    typing,
+                    self.inventory.open
+                );
+            }
+            if !coasting {
+                self.coast_logged = false;
+            }
             // Spectateur : vol forcé, à travers les blocs.
             let spectator = self.game.mode == GameMode::Spectator;
             self.player.noclip = spectator;
@@ -670,6 +704,11 @@ impl Session {
                 self.update_fps(input, dt, renderer, typing);
             } else {
                 self.fps.buy_open = false;
+                // Sons des autres modes (portes…) : joués tout de suite (sinon ils
+                // s'accumulaient et partaient tous d'un coup en passant en mode FPS).
+                for (sfx, delay, gain) in self.fps.sounds.drain(..) {
+                    crate::audio::play(sfx, delay, self.volume * gain);
+                }
             }
             // Partie en ligne : envoi des entrées et des tirs, marqueur de touche.
             let shots = std::mem::take(&mut self.fps.shots);
@@ -1085,9 +1124,21 @@ impl Session {
         );
         // Cadre accroché au mur (carte importée) devant le bloc visé : il se casse.
         if breaking {
-            let max = hit.as_ref().map_or(REACH, |h| h.distance + 0.01);
             let eye = self.player.eye();
             let dir = self.player.look_dir();
+            // Jusqu'au premier bloc visible : une barrière invisible (la collision que la
+            // carte met autour du cadre) ne le protège pas.
+            let seen = minelib_world::raycast::raycast_with(
+                &self.world,
+                eye.into(),
+                dir.into(),
+                REACH,
+                |id| {
+                    let d = id.def();
+                    d.target && !matches!(d.shape, minelib_world::registry::Shape::Invisible)
+                },
+            );
+            let max = seen.as_ref().map_or(REACH, |h| h.distance + 0.01);
             if let Some(frames) = self.frames.as_mut() {
                 if let Some(i) = frames.hit(eye, dir, max) {
                     frames.remove(i, &self.dir);
@@ -1315,6 +1366,23 @@ impl Session {
             }
             match self.inventory.selected_item() {
                 Some(Item::Block(b)) if free && !self.player.overlaps_block([x, y, z]) => {
+                    // Lanterne posée sous un bloc (clic sur son dessous), ou sans rien
+                    // dessous mais avec un bloc au-dessus : suspendue.
+                    let b = {
+                        let key = &b.def().key;
+                        let lantern = key == "lantern" || key == "soul_lantern";
+                        let held = |dy: i32| {
+                            let d = self.world.get(x, y + dy, z).def();
+                            d.target && !matches!(d.shape, minelib_world::registry::Shape::Cross)
+                        };
+                        if lantern && held(1) && (hit.normal == [0, -1, 0] || !held(-1)) {
+                            minelib_world::registry::registry()
+                                .by_key(&format!("{key}:hanging"))
+                                .unwrap_or(b)
+                        } else {
+                            b
+                        }
+                    };
                     self.dirty.extend(self.world.set(x, y, z, b));
                     self.use_selected();
                 }
@@ -4646,7 +4714,18 @@ pub(crate) fn toggle_hinged_with(
                         upper,
                         side: turn.unwrap_or_else(|| door_turn(side)),
                     };
-                    if let Some(b) = hinged_block(open) {
+                    // Gonds de l'autre côté (battant droit d'une double porte) : le bloc
+                    // ouvert garde ce sens (`…:m`, texture retournée).
+                    let flipped = turn.is_some_and(|t| t != door_turn(side));
+                    let block = hinged_block(open).and_then(|b| {
+                        if flipped {
+                            minelib_world::registry::registry()
+                                .by_key(&format!("{}:m", b.def().key))
+                        } else {
+                            Some(b)
+                        }
+                    });
+                    if let Some(b) = block {
                         opened.insert(c, cur);
                         out.push((c, b));
                     }
@@ -5629,7 +5708,7 @@ mod slab_tests {
         );
         assert_eq!(ch.len(), 2);
         apply(&mut w, ch);
-        assert_eq!(key(w.get(3, 10, 3)), "door_wood:lower:4");
+        assert_eq!(key(w.get(3, 10, 3)), "door_wood:lower:4:m");
         let ch = toggle_door_pair_with(
             &|c| w.get(c[0], c[1], c[2]),
             &mut opened,
@@ -5663,7 +5742,7 @@ mod slab_tests {
         );
         assert_eq!(ch.len(), 4);
         apply(&mut w, ch);
-        assert_eq!(key(w.get(3, 11, 3)), "door_wood:upper:4");
+        assert_eq!(key(w.get(3, 11, 3)), "door_wood:upper:4:m");
         assert_eq!(key(w.get(3, 11, 2)), "door_wood:upper:5");
         // Une porte seule s'ouvre toujours du même côté.
         let mut solo = World::new(0);

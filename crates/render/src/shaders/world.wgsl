@@ -84,13 +84,32 @@ fn hash3(v: vec3<i32>) -> f32 {
 }
 
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
+    // Ciel analytique (aucune texture, quelques opérations) : dégradé horizon → zénith,
+    // horizon chaud du côté du soleil quand il est bas, halo et disque du soleil, nuit bleue.
     let day = g.light.x;
+    let sun = normalize(g.sun.xyz);
     let t = clamp(dir.y, 0.0, 1.0);
-    var c = mix(lin(HORIZON), lin(ZENITH), pow(t, 0.6)) * day;
+    let s = max(dot(dir, sun), 0.0);
+    // Soleil bas : crépuscule (0 haut dans le ciel … 1 sur l'horizon).
+    let dusk = (1.0 - smoothstep(0.0, 0.45, abs(sun.y))) * smoothstep(-0.25, 0.05, sun.y);
+    let k = 1.0 - exp(-3.2 * t);
+    var c = mix(lin(HORIZON), lin(ZENITH), k) * day;
+    // Bande chaude à l'horizon, plus forte vers le soleil.
+    let toward = 0.35 + 0.65 * s * s;
+    let warm = mix(vec3<f32>(1.0, 0.42, 0.14), vec3<f32>(0.95, 0.35, 0.45), t * 2.0);
+    c = mix(c, warm * (0.25 + 0.75 * day), dusk * toward * exp(-5.0 * t));
+    // Sous l'horizon : brume plus sombre.
+    c *= 1.0 - 0.35 * clamp(-dir.y * 3.0, 0.0, 1.0);
     // Nuit : bleu très sombre.
     c += mix(vec3<f32>(0.010, 0.014, 0.030), vec3<f32>(0.002, 0.004, 0.012), t) * (1.0 - day);
-    let s = max(dot(dir, normalize(g.sun.xyz)), 0.0);
-    c += vec3<f32>(1.0, 0.9, 0.7) * (pow(s, 900.0) * 6.0 + pow(s, 12.0) * 0.12) * day;
+    // Soleil : disque net, couronne, grand halo ; plus orangé quand il est bas.
+    let tint = mix(vec3<f32>(1.0, 0.93, 0.78), vec3<f32>(1.0, 0.55, 0.22), dusk);
+    let s2 = s * s;
+    let s8 = s2 * s2 * s2 * s2;
+    let s64 = s8 * s8 * s8 * s8 * s8 * s8 * s8 * s8;
+    let disc = smoothstep(0.99955, 0.99975, s);
+    let up = smoothstep(-0.08, 0.02, sun.y);
+    c += tint * (disc * 7.0 + s64 * s64 * 0.5 + s8 * 0.10) * up * max(day, 0.15);
     return c;
 }
 
@@ -146,7 +165,7 @@ fn vs_block(v: VIn) -> VOut {
 
 @fragment
 fn fs_block_fast(i: VOut) -> @location(0) vec4<f32> {
-    let c = shade_with(i, false, false);
+    let c = shade_with(i, false, false, false);
     if c.a < 0.3 || from_behind(i) {
         discard;
     }
@@ -174,7 +193,7 @@ fn fs_block(i: VOut) -> @location(0) vec4<f32> {
 /// Passe translucide (eau, glace, verre teinté) : mélange selon l'alpha de la texture.
 @fragment
 fn fs_block_translucent(i: VOut) -> @location(0) vec4<f32> {
-    let c = shade(i);
+    let c = shade_with(i, true, true, true);
     if c.a < 0.02 || from_behind(i) {
         discard;
     }
@@ -199,7 +218,7 @@ fn motion_of(p: vec4<f32>) -> vec2<f32> {
 
 @fragment
 fn fs_block_fast_mv(i: VOut) -> MvOut {
-    let c = shade_with(i, false, false);
+    let c = shade_with(i, false, false, false);
     if c.a < 0.3 || from_behind(i) {
         discard;
     }
@@ -209,7 +228,7 @@ fn fs_block_fast_mv(i: VOut) -> MvOut {
 @fragment
 fn fs_block_mv(i: VOut) -> MvOut {
     // Reflets lus dans l'image des reflets (calculée à part, à son propre rythme).
-    let c = shade_with(i, true, true);
+    let c = shade_with(i, true, true, false);
     if c.a < 0.3 || from_behind(i) {
         discard;
     }
@@ -218,7 +237,7 @@ fn fs_block_mv(i: VOut) -> MvOut {
 
 @fragment
 fn fs_block_translucent_mv(i: VOut) -> MvOut {
-    let c = shade(i);
+    let c = shade_with(i, true, true, true);
     if c.a < 0.02 || from_behind(i) {
         discard;
     }
@@ -226,7 +245,7 @@ fn fs_block_translucent_mv(i: VOut) -> MvOut {
 }
 
 fn shade(i: VOut) -> vec4<f32> {
-    return shade_with(i, true, false);
+    return shade_with(i, true, false, false);
 }
 
 /// Reflet lu dans la dernière image des reflets (calculée à son propre rythme) : la surface
@@ -259,7 +278,7 @@ fn fs_reflect(i: VOut) -> @location(0) vec4<f32> {
 
 /// `reflections` = false : blocs sans reflet (la grande majorité) ; le compilateur retire
 /// tout le code des reflets, le shader est bien plus léger et la carte va plus vite.
-fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
+fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32> {
     let n = face_normal(i.face);
     let p = i.world - n * 0.001;            // légèrement à l'intérieur du bloc
     let cell = vec3<i32>(floor(p));
@@ -367,6 +386,15 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
                 env = c.rgb;
                 found = c.a > 0.5;
             }
+            // Verre et glace (passe translucide, souvent plusieurs épaisseurs l'une
+            // derrière l'autre) : pas de rayon par pixel et par épaisseur (des images de
+            // 100 ms devant de grandes verrières) ; le ciel, selon ce que la face en voit.
+            // L'eau (face du dessus) garde son vrai reflet.
+            if !found && cheap && i.face != 2u {
+                env = sky_color(r);
+                cover = i.sky * i.sky;
+                found = true;
+            }
             if !found {
                 let e = trace(i.world + n * 0.02, r, short);
                 env = e.rgb;
@@ -432,17 +460,49 @@ fn fs_sky(i: SkyOut) -> @location(0) vec4<f32> {
     return sky_shade(sky_dir(i.ndc));
 }
 
+/// Bruit lissé (2D) pour les nuages : 4 tirages par appel.
+fn cloud_noise(p: vec2<f32>) -> f32 {
+    let i = vec2<i32>(floor(p));
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash3(vec3<i32>(i.x, 17, i.y));
+    let b = hash3(vec3<i32>(i.x + 1, 17, i.y));
+    let c = hash3(vec3<i32>(i.x, 17, i.y + 1));
+    let d = hash3(vec3<i32>(i.x + 1, 17, i.y + 1));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
 fn sky_shade(dir: vec3<f32>) -> vec4<f32> {
     var c = sky_color(dir);
-    // Étoiles la nuit.
-    let night = 1.0 - g.light.x;
-    if night > 0.05 && dir.y > 0.0 {
-        let q = vec3<i32>(floor(dir * 420.0));
-        let h = hash3(q);
-        if h > 0.9975 {
-            c += vec3<f32>(0.8, 0.85, 1.0) * (h - 0.9975) * 400.0 * night * dir.y;
+    let day = g.light.x;
+    let night = 1.0 - day;
+    let sun = normalize(g.sun.xyz);
+    if dir.y > 0.0 {
+        // Étoiles la nuit (elles scintillent doucement).
+        if night > 0.05 {
+            let q = vec3<i32>(floor(dir * 420.0));
+            let h = hash3(q);
+            if h > 0.9975 {
+                let tw = 0.75 + 0.25 * sin(g.cam_pos.w * 2.0 + h * 900.0);
+                c += vec3<f32>(0.8, 0.85, 1.0) * (h - 0.9975) * 400.0 * night * dir.y * tw;
+            }
         }
+        // Nuages : une couche plate très haute, trois octaves de bruit qui dérivent avec
+        // le vent ; éclairés par le soleil (dorés quand il est bas), estompés à l'horizon.
+        let uv = dir.xz / (dir.y + 0.12) * 1.6 + vec2<f32>(g.cam_pos.w * 0.006, g.cam_pos.w * 0.002);
+        let n = cloud_noise(uv) * 0.55 + cloud_noise(uv * 2.3 + 7.1) * 0.30
+            + cloud_noise(uv * 5.1 + 3.7) * 0.15;
+        let cover = smoothstep(0.52, 0.78, n) * smoothstep(0.02, 0.22, dir.y);
+        let dusk = (1.0 - smoothstep(0.0, 0.45, abs(sun.y))) * smoothstep(-0.25, 0.05, sun.y);
+        let lit = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.0, 0.62, 0.38), dusk);
+        let shade = 0.72 + 0.28 * smoothstep(0.55, 0.9, n);
+        let cloud = lit * shade * (0.06 + 0.94 * day);
+        c = mix(c, cloud, cover * 0.85);
     }
+    // Lune : à l'opposé du soleil, la nuit.
+    let m = max(dot(dir, -sun), 0.0);
+    c += vec3<f32>(0.75, 0.8, 0.9) * (smoothstep(0.9993, 0.9996, m) * 0.9 + pow(m, 200.0) * 0.05)
+        * night * smoothstep(-0.05, 0.05, -sun.y);
     return vec4<f32>(c, 1.0);
 }
 

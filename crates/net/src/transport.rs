@@ -17,6 +17,13 @@ const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// Taille maximale d'un message Noise.
 const MAX: usize = 65535;
 
+/// Côté relais : trames reçues d'un client et pas encore traitées au-delà desquelles il
+/// est coupé (il envoie plus vite que le relais ne peut suivre : sa file gonflerait sans
+/// fin).
+pub const FLOOD_BACKLOG: u32 = 20_000;
+/// Côté relais : un client qui ne lit plus rien pendant ce temps est coupé.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Ce qui arrive sur un canal : message chiffré reçu du réseau, message (en clair) déposé
 /// par un autre fil pour être envoyé, ou fin de connexion.
 pub enum Inbound {
@@ -38,6 +45,8 @@ pub struct Channel {
     noise: snow::TransportState,
     rx: Receiver<Inbound>,
     tx: Sender<Inbound>,
+    /// Trames lues du réseau pas encore traitées.
+    backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Dépose un message pour qu'il soit envoyé par le fil qui possède le canal.
@@ -110,7 +119,7 @@ impl Channel {
         );
         let noise = hs.into_transport_mode()?;
         let _ = buf;
-        Ok((Self::finish(stream, noise)?, remote))
+        Ok((Self::finish(stream, noise, None)?, remote))
     }
 
     /// Côté relais : poignée de main avec un jeu qui vient de se connecter.
@@ -130,15 +139,21 @@ impl Channel {
         hs.read_message(&buf[..n], &mut msg)?;
         let noise = hs.into_transport_mode()?;
         let _ = buf;
-        Self::finish(stream, noise)
+        // Un client qui ne lit plus (file d'envoi qui gonfle) ou qui inonde le relais de
+        // messages est coupé.
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        Self::finish(stream, noise, Some(FLOOD_BACKLOG))
     }
 
     /// Après la poignée de main : un fil lit les trames et les dépose dans la file.
-    fn finish(stream: TcpStream, noise: snow::TransportState) -> Result<Self> {
+    /// `flood` : trames en attente au-delà desquelles la connexion est coupée.
+    fn finish(stream: TcpStream, noise: snow::TransportState, flood: Option<u32>) -> Result<Self> {
         stream.set_read_timeout(None)?;
         let mut reader = stream.try_clone()?;
         let (tx, rx) = channel();
         let out = tx.clone();
+        let backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = backlog.clone();
         std::thread::Builder::new()
             .name("réseau : lecture".into())
             .spawn(move || {
@@ -146,6 +161,13 @@ impl Channel {
                 loop {
                     match read_frame(&mut reader, &mut buf) {
                         Ok(n) => {
+                            // Le relais ne suit plus ce client (il l'inonde) : coupé.
+                            let waiting = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if flood.is_some_and(|max| waiting > max as usize) {
+                                let _ = out.send(Inbound::Closed);
+                                let _ = reader.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
                             if out.send(Inbound::Frame(buf[..n].to_vec())).is_err() {
                                 return;
                             }
@@ -162,6 +184,7 @@ impl Channel {
             noise,
             rx,
             tx,
+            backlog,
         })
     }
 
@@ -197,7 +220,11 @@ impl Channel {
         timeout: Duration,
     ) -> Result<Option<Incoming<T>>> {
         match self.rx.recv_timeout(timeout) {
-            Ok(Inbound::Frame(f)) => Ok(Some(Incoming::Msg(self.decode(&f)?))),
+            Ok(Inbound::Frame(f)) => {
+                self.backlog
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(Incoming::Msg(self.decode(&f)?)))
+            }
             Ok(Inbound::Push(p)) => Ok(Some(Incoming::Push(p))),
             Ok(Inbound::Closed) | Err(RecvTimeoutError::Disconnected) => {
                 Err(anyhow!("connexion fermée"))

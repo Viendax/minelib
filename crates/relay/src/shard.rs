@@ -264,6 +264,25 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
                     transport::push(&c.tx, &msg);
                 }
             }
+            // Modifications pas encore reçues (foule, voir `zones::LIVE_MAX`).
+            if st.build.positions.contains_key(&id) {
+                let logs = st.build.catch_up(id, Some(chunk));
+                if let Some(c) = st.conns.get(&id) {
+                    for (zone, log) in logs {
+                        let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
+                        for data in log {
+                            transport::push(
+                                &c.tx,
+                                &Response::FromZone {
+                                    peer: 0,
+                                    chunk,
+                                    data,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             None
         }
         Request::ToZone { chunk, data } => {
