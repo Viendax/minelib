@@ -24,6 +24,8 @@ pub use winit::window::Window as PlatformWindow;
 #[derive(Default)]
 pub struct Input {
     held: HashSet<KeyCode>,
+    /// Moment de l'appui de chaque touche tenue (journal des touches rattrapées).
+    pressed_at: std::collections::HashMap<KeyCode, Instant>,
     pressed: HashSet<KeyCode>,
     mouse_held: [bool; 3],
     mouse_pressed: [bool; 3],
@@ -205,6 +207,11 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
+                    log::info!(
+                        "touche sans code reconnu : {:?} ({:?})",
+                        event.physical_key,
+                        event.state
+                    );
                     return;
                 };
                 match event.state {
@@ -228,6 +235,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                         // retard dans la file, elles faisaient continuer d'avancer.
                         if !event.repeat {
                             self.input.held.insert(code);
+                            self.input.pressed_at.insert(code, Instant::now());
                         }
                         if code == KeyCode::Escape {
                             self.set_grab(false);
@@ -662,7 +670,13 @@ fn release_stale_keys(input: &mut Input) {
         })
         .collect();
     for code in stale {
-        log::info!("touche {code:?} relâchée sans message du système : rattrapée");
+        let since = input
+            .pressed_at
+            .get(&code)
+            .map_or(0.0, |t| t.elapsed().as_secs_f32());
+        log::info!(
+            "touche {code:?} relâchée sans message du système : rattrapée ({since:.2} s après l'appui)"
+        );
         input.held.remove(&code);
     }
 }

@@ -2084,6 +2084,12 @@ impl Session {
             }
             return;
         }
+        // Heure « par défaut » : le soleil de Dust2, immobile.
+        if self.time_h < 0.0 {
+            self.sun = daytime::dust2_sun();
+            self.daylight = 1.0;
+            return;
+        }
         if !self.time_fixed {
             self.time_h = daytime::advance(self.time_h, dt);
         }
@@ -2638,7 +2644,7 @@ impl Session {
             && matches!(lower.get(1).map(String::as_str), Some("time" | "heure"))
         {
             let time = match lower.get(2).map(String::as_str) {
-                None => Some(self.time_h),
+                None => (self.time_h >= 0.0).then_some(self.time_h),
                 Some("default" | "defaut" | "défaut") => None,
                 Some(t) => match crate::daytime::parse(t) {
                     Some(h) => Some(h),
@@ -2963,21 +2969,21 @@ impl Session {
                     self.fps_command(&["set", "time", "default"]);
                     return;
                 }
-                // Construction : l'heure d'un monde neuf, et le temps qui passe.
-                let arg = if default {
+                // Construction : le soleil de Dust2, immobile (heure « -1 »).
+                if default {
                     if self.build.is_some() {
                         self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
-                            action: minelib_net::proto::SERVER_TIMEFIX,
+                            action: minelib_net::proto::SERVER_TIMESET,
                             pseudo: String::new(),
-                            reason: "0".into(),
+                            reason: "-1".into(),
                         });
                     } else {
-                        self.time_fixed = false;
+                        self.time_h = crate::daytime::DUST2;
+                        self.time_fixed = true;
+                        self.chat.say("Soleil de Dust2, immobile.", chat::YELLOW);
                     }
-                    Some("8")
-                } else {
-                    arg
-                };
+                    return;
+                }
                 let Some(h) = arg.and_then(crate::daytime::parse) else {
                     self.chat.say(
                         format!(

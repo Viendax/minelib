@@ -125,7 +125,7 @@ impl Store {
                 .get(server)
                 .copied()
                 .unwrap_or((START_HOUR, unix_now(), false));
-        if fixed {
+        if fixed || h < 0.0 {
             return (h, true);
         }
         let dt = unix_now().saturating_sub(since) as f32;
@@ -133,8 +133,14 @@ impl Store {
     }
 
     fn set_time(&mut self, server: &str, h: f32, fixed: bool) {
-        self.times
-            .insert(server.to_string(), (h.rem_euclid(24.0), unix_now(), fixed));
+        self.times.insert(
+            server.to_string(),
+            (
+                if h < 0.0 { -1.0 } else { h.rem_euclid(24.0) },
+                unix_now(),
+                fixed,
+            ),
+        );
         if let Ok(b) = postcard::to_allocvec(&self.times) {
             let _ = crate::accounts::write_atomic(&self.path.with_extension("times"), &b);
         }
@@ -246,6 +252,11 @@ impl Store {
                     .trim()
                     .parse()
                     .map_err(|_| "Heure illisible.".to_string())?;
+                // −1 : le soleil de Dust2, immobile.
+                if h == -1.0 {
+                    self.set_time(server, h, true);
+                    return Ok("Soleil de Dust2.".into());
+                }
                 if !(0.0..24.0).contains(&h) {
                     return Err("Heure entre 0 et 24.".into());
                 }

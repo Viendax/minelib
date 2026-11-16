@@ -10,6 +10,9 @@
 /// Durée d'une journée complète (s), comme dans Minecraft.
 pub const DAY_S: f32 = 1200.0;
 
+/// Heure « par défaut » (`/timeset default`) : le soleil de Dust2, immobile.
+pub const DUST2: f32 = -1.0;
+
 /// Heure d'un monde neuf.
 pub const START_HOUR: f32 = 8.0;
 
@@ -69,6 +72,9 @@ pub fn parse(text: &str) -> Option<f32> {
 
 /// `11:20`.
 pub fn format(h: f32) -> String {
+    if h < 0.0 {
+        return "soleil de Dust2".into();
+    }
     let total = (h.rem_euclid(24.0) * 60.0).round() as u32 % (24 * 60);
     format!("{}:{:02}", total / 60, total % 60)
 }

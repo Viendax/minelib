@@ -319,9 +319,6 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
     let t = g.cam_pos.w;
     let flicker = 0.93 + 0.07 * sin(t * 9.0 + hash3(cell / vec3<i32>(4)) * 6.28);
     var torch = pow(i.light, vec3<f32>(2.0)) * g.light.y * flicker * mix(0.55, 1.0, i.ao);
-    if shadows && max(i.light.x, max(i.light.y, i.light.z)) > 0.05 {
-        torch = max(torch - torch_shadow(shadow_from) * flicker, torch * 0.35);
-    }
     // Lumière de la torche tenue en main (dynamique, sans ombres) : décroît avec la distance,
     // plus forte sur les faces tournées vers le joueur.
     if g.held_pos.w > 0.0 {
@@ -1193,31 +1190,4 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
         }
     }
     return 0.0;
-}
-
-/// Lumière des sources proches cachée par un joueur entre elles et `p`.
-fn torch_shadow(p: vec3<f32>) -> vec3<f32> {
-    var c = vec3<f32>(0.0);
-    // Aucun joueur à moins de 8 blocs : pas d'ombre (la plupart des pixels).
-    var near = false;
-    for (var k = 0u; k < u32(g.shadow_info.x); k++) {
-        let m = (g.shadow_min[k].xyz + g.shadow_max[k].xyz) * 0.5 - p;
-        near = near || dot(m, m) < 64.0;
-    }
-    if !near {
-        return c;
-    }
-    let count = min(u32(g.light.z), 8u);
-    for (var j = 0u; j < count; j++) {
-        let to_l = g.lights_pos[j].xyz - p;
-        let d = length(to_l);
-        if d > 10.0 || d < 0.3 {
-            continue;
-        }
-        if player_shadow(p, to_l / d, d - 0.2) > 0.5 {
-            let l = g.lights_col[j].rgb * torch_falloff(d);
-            c = max(c, l);
-        }
-    }
-    return c;
 }

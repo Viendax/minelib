@@ -572,9 +572,10 @@ fn emit_cross_uv(
     light: [u8; 4],
 ) {
     let c = [(a[0] + b[0]) / 2.0, (a[2] + b[2]) / 2.0];
-    let h = (b[0] - a[0]).abs().max((b[2] - a[2]).abs()) / 2.0 * std::f32::consts::FRAC_1_SQRT_2;
+    // Plans droits (le long de X et de Z), pas en biais.
+    let h = (b[0] - a[0]).abs().max((b[2] - a[2]).abs()) / 2.0;
     let uv = [[r[0], r[3]], [r[2], r[3]], [r[2], r[1]], [r[0], r[1]]];
-    for (dx, dz) in [(h, h), (h, -h)] {
+    for (dx, dz) in [(h, 0.0), (0.0, h)] {
         let quad = [
             [c[0] - dx, a[1], c[1] - dz],
             [c[0] + dx, a[1], c[1] + dz],
@@ -598,7 +599,14 @@ fn emit_cross_uv(
 
 /// Lanterne (et lanterne des âmes) en 3D, comme dans Minecraft : corps, chapeau, anse
 /// (posée) ou chaîne (suspendue), taillés dans sa texture (`o` : coin de la case).
-fn emit_lantern(out: &mut MeshData, o: [f32; 3], id: BlockId, light: [u8; 4], hanging: bool) {
+fn emit_lantern(
+    out: &mut MeshData,
+    o: [f32; 3],
+    id: BlockId,
+    light: [u8; 4],
+    hanging: bool,
+    chained: bool,
+) {
     let layer = face_tex(id, 0);
     let px = |x: f32, y: f32, z: f32| [o[0] + x / 16.0, o[1] + y / 16.0, o[2] + z / 16.0];
     let dy = if hanging { 1.0 } else { 0.0 };
@@ -622,16 +630,20 @@ fn emit_lantern(out: &mut MeshData, o: [f32; 3], id: BlockId, light: [u8; 4], ha
         [side, side, cap, cap, side, side],
         light,
     );
-    if hanging {
-        // Chaîne jusqu'au plafond.
-        emit_cross_uv(
-            out,
-            px(6.5, 10.0, 8.0),
-            px(9.5, 16.0, 8.0),
-            layer,
-            [11.0, 6.0, 14.0, 12.0],
-            light,
-        );
+    if hanging && !chained {
+        // Suspendue dans le vide : ni chaîne ni anse.
+    } else if hanging {
+        // Chaîne jusqu'au plafond : deux maillons pleins (le haut de la texture), droits.
+        for y in [10.0, 13.0] {
+            emit_cross_uv(
+                out,
+                px(6.5, y, 8.0),
+                px(9.5, y + 3.0, 8.0),
+                layer,
+                [11.0, 1.0, 14.0, 5.0],
+                light,
+            );
+        }
     } else {
         // Anse.
         emit_cross_uv(
@@ -1287,6 +1299,8 @@ fn mesh_block(
                                 id,
                                 light_at(b),
                                 def.key.ends_with(":hanging"),
+                                // Chaîne seulement si un bloc la retient au-dessus.
+                                pad.get(x, y + 1, z).def().solid,
                             );
                             return;
                         }
