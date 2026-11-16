@@ -52,6 +52,8 @@ pub struct DebugInfo<'a> {
     pub chunks_loaded: usize,
     pub stats: FrameStats,
     pub held: String,
+    /// Touches tenues et déplacement demandé (pour un déplacement non voulu).
+    pub keys: String,
     pub torch_info: Option<String>,
     /// Mode FPS : affiche la fatigue des jambes.
     pub fps: bool,
@@ -149,6 +151,7 @@ pub fn build(d: &DebugInfo) -> Overlay {
             "Vitesse : {speed:.2} m/s  vertical {:.2} m/s  ({mode})",
             p.vel.y
         )),
+        Line::white(d.keys.clone()),
         Line::white(""),
     ];
     if d.fps {

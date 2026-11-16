@@ -243,7 +243,25 @@ fn shadow_globals(
         mn[i] = [a[0], a[1], a[2], near.map_or(-1.0, |(j, _)| j as f32)];
         mx[i] = [b[0], b[1], b[2], 0.0];
     }
-    ([n as f32, 0.0, 0.0, 0.0], mn, mx)
+    // Boule qui contient toutes les boîtes (centre dans `info.yzw`, rayon dans
+    // `max[0].w`) : le shader écarte d'un seul essai les points qu'aucune ombre ne peut
+    // toucher (presque tous), au lieu d'essayer chaque boîte.
+    let mut info = [n as f32, 0.0, 0.0, 0.0];
+    if n > 0 {
+        let lo: [f32; 3] =
+            std::array::from_fn(|k| mn[..n].iter().map(|b| b[k]).fold(f32::MAX, f32::min));
+        let hi: [f32; 3] =
+            std::array::from_fn(|k| mx[..n].iter().map(|b| b[k]).fold(f32::MIN, f32::max));
+        let r = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f32>().sqrt() / 2.0;
+        info = [
+            n as f32,
+            (lo[0] + hi[0]) / 2.0,
+            (lo[1] + hi[1]) / 2.0,
+            (lo[2] + hi[2]) / 2.0,
+        ];
+        mx[0][3] = r;
+    }
+    (info, mn, mx)
 }
 
 /// Nombre maximal de pavés du joueur vus dans les reflets.
@@ -373,6 +391,8 @@ pub struct FrameParams<'a> {
     /// Boîte (coins min, max, en coordonnées monde) du bloc visé.
     pub selected: Option<([f32; 3], [f32; 3])>,
     pub time: f32,
+    /// Horloge du ciel (dérive des nuages) : n'avance que si l'heure avance.
+    pub sky_time: f32,
     /// Lumière du jour : 1 = plein jour, 0 = nuit.
     pub daylight: f32,
     /// Direction vers le soleil (unitaire).
@@ -1808,7 +1828,7 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: [p.eye.x, p.eye.y, p.eye.z, p.time],
-            fog: [p.fog_start, p.fog_end, self.aspect(), 0.0],
+            fog: [p.fog_start, p.fog_end, self.aspect(), p.sky_time],
             sun: [p.sun[0], p.sun[1], p.sun[2], 0.48],
             sel_min,
             sel_max,
@@ -1994,7 +2014,7 @@ impl Renderer {
             view_proj: jittered.to_cols_array_2d(),
             inv_view_proj: jittered.inverse().to_cols_array_2d(),
             cam_pos: [p.eye.x, p.eye.y, p.eye.z, p.time],
-            fog: [p.fog_start, p.fog_end, self.aspect(), 0.0],
+            fog: [p.fog_start, p.fog_end, self.aspect(), p.sky_time],
             sun: [p.sun[0], p.sun[1], p.sun[2], 0.48],
             sel_min,
             sel_max,

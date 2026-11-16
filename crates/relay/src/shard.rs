@@ -117,20 +117,37 @@ pub fn start(
     std::thread::Builder::new()
         .name("relais de région".into())
         .spawn(move || {
+            // Connexions ouvertes par joueur (nommé par le tunnel) : limitées, comme sur le
+            // relais du monde.
+            let open: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
             for conn in listener.incoming() {
                 if st.lock().unwrap().closed {
                     return;
                 }
                 let Ok(stream) = conn else { continue };
                 let st = st.clone();
+                let open = open.clone();
                 let _ = std::thread::Builder::new()
                     .name("relais de région : joueur".into())
                     .spawn(move || {
                         // Par le tunnel iroh : le préambule d'abord.
                         let local = stream.peer_addr().is_ok_and(|a| a.ip().is_loopback());
-                        if local && crate::tunnel_peer(&stream).is_err() {
-                            return;
-                        }
+                        let who = if local {
+                            match crate::tunnel_peer(&stream) {
+                                Ok(w) => w,
+                                Err(_) => return,
+                            }
+                        } else {
+                            stream.peer_addr().ok().map(|a| a.ip().to_string())
+                        };
+                        // Connexion locale directe (essais) : pas de limite.
+                        let _slot = match &who {
+                            Some(w) => match crate::PeerSlot::take_named(&open, w) {
+                                Some(s) => Some(s),
+                                None => return,
+                            },
+                            None => None,
+                        };
                         let _ = serve(stream, &st, &private);
                     });
             }

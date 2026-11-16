@@ -130,11 +130,27 @@ pub struct Build {
     indexed: usize,
 }
 
-/// Une position n'est transmise qu'à ce nombre de joueurs au plus. Dans une foule (des
-/// milliers de joueurs au même endroit, voire tous), chacun voit bouger ses `FANOUT`
-/// voisins, toujours les mêmes, et le travail du relais ne dépend plus de la taille de la
-/// foule : `FANOUT` messages par position reçue, au lieu d'un par joueur présent.
-pub const FANOUT: usize = 64;
+/// Positions dans une foule : chaque joueur est vu de tous ceux à portée (jusqu'à
+/// `FANOUT`), mais plus un voisin est loin dans le rang, moins sa position est rafraîchie :
+/// les `FANOUT_FULL` plus proches reçoivent chaque position, puis une sur 4 jusqu'à 256,
+/// une sur 16 jusqu'à 1024, une sur 64 jusqu'à `FANOUT` (le jeu fait avancer chacun en
+/// douceur entre deux). Le travail moyen par position reste borné (≈ 200 envois) quelle
+/// que soit la taille de la foule.
+pub const FANOUT: usize = 4096;
+pub const FANOUT_FULL: usize = 64;
+
+/// À combien de voisins part la `n`-ième position d'un joueur (voir `FANOUT`).
+pub fn reach(n: u32) -> usize {
+    if n.is_multiple_of(64) {
+        FANOUT
+    } else if n.is_multiple_of(16) {
+        1024
+    } else if n.is_multiple_of(4) {
+        256
+    } else {
+        FANOUT_FULL
+    }
+}
 
 /// Une modification du monde est poussée tout de suite à ce nombre de joueurs au plus ;
 /// au-delà (foule), chacun la reçoit avec sa prochaine position, compactée. Le travail par
@@ -197,7 +213,7 @@ impl Build {
 
     /// À qui transmettre la position d'un joueur : à chaque fois aux joueurs tout proches
     /// (2 chunks), une fois sur 4 jusqu'à 6 chunks, une fois sur 20 au-delà (12 chunks au
-    /// plus), les plus proches d'abord, et à `FANOUT` joueurs au plus. Dans une foule,
+    /// plus), les plus proches d'abord, et à `reach(n)` joueurs au plus. Dans une foule,
     /// chacun voit bien ses voisins (toujours les mêmes : ceux rangés après lui dans son
     /// chunk), et le relais ne parcourt ni n'envoie jamais à toute la foule.
     pub fn nearby(&mut self, id: u64, chunk: [i32; 2]) -> Vec<u64> {
@@ -205,6 +221,7 @@ impl Build {
         let n = self.pos_count.entry(id).or_insert(0);
         *n = n.wrapping_add(1);
         let n = *n;
+        let limit = reach(n);
         let mut out = Vec::new();
         for d in 0..=NEAR {
             let every = match d {
@@ -224,7 +241,7 @@ impl Build {
                     let Some(members) = self.by_chunk.get(&[chunk[0] + dx, chunk[1] + dz]) else {
                         continue;
                     };
-                    let room = FANOUT - out.len();
+                    let room = limit - out.len();
                     if members.len() <= room {
                         out.extend(members.iter().copied().filter(|&m| m != id));
                     } else {
@@ -238,7 +255,7 @@ impl Build {
                                 .take(room),
                         );
                     }
-                    if out.len() >= FANOUT {
+                    if out.len() >= limit {
                         return out;
                     }
                 }
@@ -645,24 +662,34 @@ mod tests {
         for id in 0..5000u64 {
             crowd.moved(id, [3, 3]);
         }
-        let a = crowd.nearby(100, [3, 3]);
-        assert_eq!(a.len(), FANOUT);
-        assert!(!a.contains(&100));
+        // Les 64 plus proches à chaque fois, puis de plus en plus loin, de moins en
+        // moins souvent : tout le monde à portée finit par voir chacun.
+        let mut sizes = Vec::new();
+        let mut first = Vec::new();
+        for k in 0..64 {
+            let a = crowd.nearby(100, [3, 3]);
+            assert!(!a.contains(&100));
+            if k == 0 {
+                first = a.clone();
+            }
+            assert_eq!(a[..FANOUT_FULL], first[..FANOUT_FULL], "mêmes voisins");
+            sizes.push(a.len());
+        }
+        let count = |n: usize| sizes.iter().filter(|&&s| s == n).count();
         assert_eq!(
-            a,
-            crowd.nearby(100, [3, 3]),
-            "mêmes voisins d'une fois à l'autre"
+            (count(FANOUT_FULL), count(256), count(1024), count(FANOUT)),
+            (48, 12, 3, 1)
         );
         let mut seen: HashMap<u64, usize> = HashMap::new();
         for id in 0..5000u64 {
-            for m in crowd.nearby(id, [3, 3]) {
-                *seen.entry(m).or_default() += 1;
+            for _ in 0..64 {
+                for m in crowd.nearby(id, [3, 3]) {
+                    *seen.entry(m).or_default() += 1;
+                }
             }
         }
-        assert!(
-            seen.values().all(|&n| n == FANOUT),
-            "chacun reçoit FANOUT voisins"
-        );
+        let each = 48 * FANOUT_FULL + 12 * 256 + 3 * 1024 + FANOUT;
+        assert!(seen.values().all(|&n| n == each), "chacun reçoit autant");
         assert_eq!(seen.len(), 5000);
         // Modifications dans une foule : poussées à `LIVE_MAX` joueurs, les autres les
         // reçoivent à leur prochaine position, compactées (la dernière valeur par case).

@@ -2089,6 +2089,24 @@ fn fluids_and_heads(b: &mut Builder) {
         });
         b.r.keys.insert(k, id);
     }
+    // Portes ouvertes, gonds du côté habituel : `…:o` (le maillage sait ainsi où sont les
+    // gonds, donc la poignée ; `…:m` : ouverte, gonds de l'autre côté). Ajoutées en
+    // dernier : les numéros des blocs d'avant ne changent pas.
+    let doors: Vec<BlockDef> =
+        b.r.defs
+            .iter()
+            .filter(|d| d.key.starts_with("door_") && !d.key.ends_with(":m"))
+            .cloned()
+            .collect();
+    for d in doors {
+        let k = format!("{}:o", d.key);
+        let id = b.r.defs.len() as u16;
+        b.r.defs.push(BlockDef {
+            key: k.clone(),
+            ..d
+        });
+        b.r.keys.insert(k, id);
+    }
 }
 
 /// Plante qu'on peut mettre dans un pot (pas les plantes de deux blocs, ni le blé, la

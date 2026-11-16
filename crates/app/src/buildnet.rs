@@ -60,10 +60,23 @@ fn fluid_edit(old: BlockId, new: BlockId) -> bool {
     };
     (fluid(new).is_some() && open(old)) || (fluid(old).is_some() && set(new))
 }
-/// Position envoyée 20 fois par seconde.
+/// Position envoyée au moins 20 fois par seconde (foule), au plus 256 (peu de joueurs).
 const POS_EVERY: f32 = 0.05;
-/// Un joueur dont on n'a plus de nouvelles depuis ce temps n'est plus montré.
+const POS_FASTEST: f32 = 1.0 / 256.0;
+/// Positions reçues par seconde qu'on vise au plus (tous les voisins proches réunis) : le
+/// rythme d'envoi de chacun baisse quand il y a du monde autour.
+const POS_BUDGET: f32 = 4096.0;
+/// Un joueur dont on n'a plus de nouvelles depuis ce temps (ou trois de ses intervalles,
+/// pour un joueur lointain rafraîchi rarement) n'est plus montré.
 const STALE_S: f32 = 3.0;
+
+/// Intervalle entre deux envois de sa position, selon le nombre de joueurs autour : 256
+/// fois par seconde jusqu'à 16 voisins, puis de moins en moins (64 à 64 voisins), jamais
+/// moins de 20.
+fn pos_every(others: usize) -> f32 {
+    let hz = (POS_BUDGET / others.max(1) as f32).clamp(1.0 / POS_EVERY, 1.0 / POS_FASTEST);
+    1.0 / hz
+}
 
 pub use minelib_net::game::BuildMsg;
 
@@ -433,7 +446,7 @@ impl BuildNet {
         }
         self.pos_timer -= dt;
         if self.pos_timer <= 0.0 {
-            self.pos_timer = POS_EVERY;
+            self.pos_timer = pos_every(self.others.len());
             let msg = BuildMsg::Player {
                 pseudo: self.pseudo.clone(),
                 pos: feet.to_array(),
@@ -454,10 +467,11 @@ impl BuildNet {
             o.seen += dt;
             // Rejoint la dernière position reçue en un intervalle : vitesse régulière même
             // pour un joueur lointain (moins de messages).
-            let k = (dt / o.interval.max(POS_EVERY)).min(1.0);
+            let k = (dt / o.interval.max(POS_FASTEST)).min(1.0);
             o.pos += (o.target - o.pos) * k;
         }
-        self.others.retain(|_, o| o.seen < STALE_S);
+        self.others
+            .retain(|_, o| o.seen < STALE_S.max(o.interval * 3.0));
         (caps, dirty)
     }
 
@@ -557,7 +571,7 @@ impl BuildNet {
                             o.id = home;
                         }
                         // Intervalle mesuré (lissé) ; téléportation : on y va d'un coup.
-                        o.interval = o.interval * 0.7 + o.seen.clamp(POS_EVERY, 2.0) * 0.3;
+                        o.interval = o.interval * 0.7 + o.seen.clamp(POS_FASTEST, 4.0) * 0.3;
                         if (target - o.pos).length() > 8.0 {
                             o.pos = target;
                         }

@@ -182,8 +182,15 @@ pub struct Session {
     /// Temps passé à avancer sans touche tenue (diagnostic), et déjà noté au journal.
     coast: f32,
     coast_logged: bool,
+    coast_air: f32,
+    /// Ligne de l'écran de débogage : touches tenues et déplacement demandé.
+    move_debug: String,
     autosave: f32,
     hit: Option<Hit>,
+    /// Cadre visé (son rang dans `frames`).
+    frame_aim: Option<usize>,
+    /// Horloge du ciel : n'avance qu'avec l'heure (nuages immobiles à heure fixe).
+    sky_clock: f32,
     overlay: Overlay,
     pub chat: Chat,
     /// Mode de jeu, vol autorisé en survie (/fly), santé.
@@ -377,8 +384,12 @@ impl Session {
             frames: None,
             coast: 0.0,
             coast_logged: false,
+            coast_air: 0.0,
+            move_debug: String::new(),
             autosave: AUTOSAVE_S,
             hit: None,
+            frame_aim: None,
+            sky_clock: 0.0,
             overlay: Overlay::default(),
             chat: Chat::default(),
             game,
@@ -660,9 +671,29 @@ impl Session {
             // tout ce qui peut l'expliquer.
             let flat = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
             let idle = m.forward == 0.0 && m.strafe == 0.0;
+            // Écran de débogage (F3) : ce que le jeu lit du clavier, pour voir d'où vient
+            // un déplacement qu'on n'a pas demandé.
+            self.move_debug = format!(
+                "Touches tenues : {:?}   demandé : avant {:+.0} côté {:+.0}{}",
+                input.held_keys(),
+                m.forward,
+                m.strafe,
+                if idle && flat > 0.3 {
+                    "   (avance sans touche)"
+                } else {
+                    ""
+                }
+            );
+            // En l'air, la vitesse se garde : seulement après 2 s (plus long qu'un saut).
+            self.coast_air = if idle && flat > 1.0 && !self.player.on_ground && !self.player.flying
+            {
+                self.coast_air + dt
+            } else {
+                0.0
+            };
             let coasting = idle
-                && flat > 1.0
-                && (self.player.on_ground || self.player.flying)
+                && ((flat > 0.3 && (self.player.on_ground || self.player.flying))
+                    || self.coast_air > 2.0)
                 && !self.player.on_ladder
                 && self.player.swimming.is_none();
             self.coast = if coasting { self.coast + dt } else { 0.0 };
@@ -1077,9 +1108,30 @@ impl Session {
         }
     }
 
+    /// Cadre (carte importée) que le joueur vise, devant tout bloc visible.
+    fn aimed_frame(&self) -> Option<usize> {
+        let frames = self.frames.as_ref().filter(|f| !f.is_empty())?;
+        let eye = self.player.eye();
+        let dir = self.player.look_dir();
+        // Jusqu'au premier bloc visible : une barrière invisible (la collision que la
+        // carte met autour du cadre) ne le protège pas.
+        let seen = minelib_world::raycast::raycast_with(
+            &self.world,
+            eye.into(),
+            dir.into(),
+            REACH,
+            |id| {
+                let d = id.def();
+                d.target && !matches!(d.shape, minelib_world::registry::Shape::Invisible)
+            },
+        );
+        frames.hit(eye, dir, REACH, seen.map(|h| (h.block, h.distance + 0.01)))
+    }
+
     fn handle_blocks(&mut self, input: &Input, dt: f32) {
         self.break_cooldown -= dt;
         self.place_cooldown -= dt;
+        self.frame_aim = None;
         if !input.grabbed || self.inventory.open {
             return;
         }
@@ -1123,28 +1175,12 @@ impl Session {
             REACH,
         );
         // Cadre accroché au mur (carte importée) devant le bloc visé : il se casse.
+        self.frame_aim = self.aimed_frame();
         if breaking {
-            let eye = self.player.eye();
-            let dir = self.player.look_dir();
-            // Jusqu'au premier bloc visible : une barrière invisible (la collision que la
-            // carte met autour du cadre) ne le protège pas.
-            let seen = minelib_world::raycast::raycast_with(
-                &self.world,
-                eye.into(),
-                dir.into(),
-                REACH,
-                |id| {
-                    let d = id.def();
-                    d.target && !matches!(d.shape, minelib_world::registry::Shape::Invisible)
-                },
-            );
-            let max = seen.as_ref().map_or(REACH, |h| h.distance + 0.01);
-            if let Some(frames) = self.frames.as_mut() {
-                if let Some(i) = frames.hit(eye, dir, max) {
-                    frames.remove(i, &self.dir);
-                    self.break_cooldown = 0.22;
-                    return;
-                }
+            if let (Some(i), Some(frames)) = (self.frame_aim.take(), self.frames.as_mut()) {
+                frames.remove(i, &self.dir);
+                self.break_cooldown = 0.22;
+                return;
             }
         }
         // Baguette : clic molette (touche « Copier le bloc ») efface la sélection, même
@@ -2143,6 +2179,8 @@ impl Session {
         }
         if !self.time_fixed {
             self.time_h = daytime::advance(self.time_h, dt);
+            // Le ciel ne bouge (nuages) que si l'heure avance.
+            self.sky_clock += dt;
         }
         self.sun = daytime::sun_dir(self.time_h);
         self.daylight = daytime::daylight(self.time_h);
@@ -4138,6 +4176,7 @@ impl Session {
                 .inventory
                 .selected_item()
                 .map_or("rien".into(), |i| i.name()),
+            keys: self.move_debug.clone(),
             torch_info: hit.filter(|h| h.id.is_torch()).and_then(|h| {
                 let t = self.world.torch(h.block)?;
                 let flame = minelib_world::flame::CHEMICALS;
@@ -4334,7 +4373,16 @@ impl Session {
             }
         }
         if let Some(b) = &self.build {
-            for o in b.others.values() {
+            // Foule : les plus proches en détail, les suivants en modèle simplifié, les
+            // plus lointains en trois pavés (des milliers de joueurs visibles sans
+            // effondrer les images par seconde).
+            let mut others: Vec<_> = b.others.values().collect();
+            others.sort_by(|a, c| {
+                a.pos
+                    .distance_squared(cam)
+                    .total_cmp(&c.pos.distance_squared(cam))
+            });
+            for (rank, o) in others.into_iter().enumerate() {
                 let w = self.walks.get(&o.pseudo).copied().unwrap_or_default();
                 let other = crate::player_model::Pose {
                     feet: o.pos,
@@ -4347,8 +4395,14 @@ impl Session {
                     held: None,
                     skin: self.skins.of(&o.pseudo),
                 };
-                shadows.push((o.pos, crate::player_model::shadow_boxes(&other)));
-                model.extend(crate::player_model::build(&other));
+                if rank < 24 && o.pos.distance_squared(cam) < 48.0 * 48.0 {
+                    shadows.push((o.pos, crate::player_model::shadow_boxes(&other)));
+                    model.extend(crate::player_model::build(&other));
+                } else if rank < 256 {
+                    model.extend(crate::player_model::build_far(&other));
+                } else {
+                    model.extend(crate::player_model::build_tiny(&other));
+                }
             }
         }
         // Ombres des joueurs : les plus proches de la caméra (place limitée).
@@ -4448,12 +4502,17 @@ impl Session {
             },
             // Pas de contour du bloc visé en mode FPS.
             selected: if grabbed && self.game.mode != GameMode::Fps {
-                self.hit
-                    .map(|h| minelib_world::raycast::selection_box(&self.world, h.block))
+                self.frame_aim
+                    .and_then(|i| self.frames.as_ref()?.bounds(i))
+                    .or_else(|| {
+                        self.hit
+                            .map(|h| minelib_world::raycast::selection_box(&self.world, h.block))
+                    })
             } else {
                 None
             },
             time,
+            sky_time: self.sky_clock,
             daylight: self.daylight,
             sun: self.sun,
             ui: Some(ui),
@@ -4589,6 +4648,33 @@ fn opposite_side(side: u8) -> u8 {
     }
 }
 
+/// Bloc fermé d'une porte ouverte (`…:o`, `…:m` : le côté qu'elle fermait se lit dans
+/// son nom) ; `None` pour une porte fermée ou un autre bloc.
+fn door_closed_block(id: BlockId) -> Option<BlockId> {
+    let key: &str = &id.def().key;
+    let flipped = match key.rsplit(':').next() {
+        Some("o") => false,
+        Some("m") => true,
+        _ => return None,
+    };
+    let Hinged::Door { wood, upper, side } = hinged(id)? else {
+        return None;
+    };
+    // Inverse de `door_turn` (après le demi-tour d'une porte à gonds inversés).
+    let turned = if flipped { opposite_side(side) } else { side };
+    let closed = match turned {
+        5 => 1,
+        0 => 5,
+        4 => 0,
+        _ => 4,
+    };
+    hinged_block(Hinged::Door {
+        wood,
+        upper,
+        side: closed,
+    })
+}
+
 /// Porte fermée en `c` (son état d'origine si elle est ouverte en ce moment).
 fn closed_door(
     get: &dyn Fn([i32; 3]) -> BlockId,
@@ -4596,6 +4682,7 @@ fn closed_door(
     c: [i32; 3],
 ) -> Option<(&'static str, bool, u8)> {
     let id = opened.get(&c).copied().unwrap_or_else(|| get(c));
+    let id = door_closed_block(id).unwrap_or(id);
     match hinged(id)? {
         Hinged::Door { wood, upper, side } => Some((wood, upper, side)),
         Hinged::Trapdoor { .. } => None,
@@ -4708,22 +4795,24 @@ pub(crate) fn toggle_hinged_with(
                 let cur = get(c);
                 if let Some(closed) = opened.remove(&c).filter(|&b| same_family(b, cur)) {
                     out.push((c, closed));
+                } else if let Some(closed) = door_closed_block(cur) {
+                    // Ouverte depuis toujours (carte importée, monde rechargé) : elle se
+                    // referme du côté que dit son nom.
+                    out.push((c, closed));
                 } else if let Some(Hinged::Door { wood, upper, side }) = hinged(cur) {
                     let open = Hinged::Door {
                         wood,
                         upper,
                         side: turn.unwrap_or_else(|| door_turn(side)),
                     };
-                    // Gonds de l'autre côté (battant droit d'une double porte) : le bloc
-                    // ouvert garde ce sens (`…:m`, texture retournée).
+                    // Bloc d'une porte ouverte : `…:o`, ou `…:m` si ses gonds sont de l'autre
+                    // côté (battant droit d'une double porte) ; le maillage y lit où sont
+                    // les gonds.
                     let flipped = turn.is_some_and(|t| t != door_turn(side));
                     let block = hinged_block(open).and_then(|b| {
-                        if flipped {
-                            minelib_world::registry::registry()
-                                .by_key(&format!("{}:m", b.def().key))
-                        } else {
-                            Some(b)
-                        }
+                        let state = if flipped { "m" } else { "o" };
+                        minelib_world::registry::registry()
+                            .by_key(&format!("{}:{state}", b.def().key))
                     });
                     if let Some(b) = block {
                         opened.insert(c, cur);
@@ -5644,7 +5733,7 @@ mod slab_tests {
         for (p, b) in &ch {
             w.set(p[0], p[1], p[2], *b);
         }
-        assert_eq!(key(w.get(3, 10, 3)), "door_wood:lower:5");
+        assert_eq!(key(w.get(3, 10, 3)), "door_wood:lower:5:o");
         for (p, b) in toggle_hinged(&w, &mut opened, [3, 10, 3], look) {
             w.set(p[0], p[1], p[2], b);
         }
@@ -5717,8 +5806,8 @@ mod slab_tests {
             false,
         );
         apply(&mut w, ch);
-        assert_eq!(key(w.get(3, 10, 2)), "door_wood:lower:5");
-        assert_eq!(key(w.get(3, 11, 2)), "door_wood:upper:5");
+        assert_eq!(key(w.get(3, 10, 2)), "door_wood:lower:5:o");
+        assert_eq!(key(w.get(3, 11, 2)), "door_wood:upper:5:o");
         // Les deux se referment ensemble (doorsync), depuis n'importe quel battant.
         let ch = toggle_door_pair_with(
             &|c| w.get(c[0], c[1], c[2]),
@@ -5743,7 +5832,7 @@ mod slab_tests {
         assert_eq!(ch.len(), 4);
         apply(&mut w, ch);
         assert_eq!(key(w.get(3, 11, 3)), "door_wood:upper:4:m");
-        assert_eq!(key(w.get(3, 11, 2)), "door_wood:upper:5");
+        assert_eq!(key(w.get(3, 11, 2)), "door_wood:upper:5:o");
         // Une porte seule s'ouvre toujours du même côté.
         let mut solo = World::new(0);
         solo.insert_empty(ChunkPos { x: 0, z: 0 });
@@ -5757,7 +5846,7 @@ mod slab_tests {
             true,
         );
         assert_eq!(ch.len(), 1);
-        assert_eq!(key(ch[0].1), "door_wood:lower:5");
+        assert_eq!(key(ch[0].1), "door_wood:lower:5:o");
     }
 }
 

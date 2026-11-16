@@ -90,20 +90,42 @@ impl Frames {
     }
 
     /// Premier cadre touché par le rayon (`eye`, `dir` unitaire) avant `max` blocs.
-    pub fn hit(&self, eye: Vec3, dir: Vec3, max: f32) -> Option<usize> {
+    /// `seen` : premier bloc visible sur le rayon (sa case, sa distance) ; il cache les
+    /// cadres derrière lui, sauf celui accroché dans sa propre case (panneau, barreau,
+    /// tige… posés au même endroit que le cadre) : un cadre qu'on voit se casse toujours.
+    pub fn hit(
+        &self,
+        eye: Vec3,
+        dir: Vec3,
+        max: f32,
+        seen: Option<([i32; 3], f32)>,
+    ) -> Option<usize> {
         let inv = dir.map(|d| if d.abs() < 1e-6 { 1e6 } else { 1.0 / d });
         let mut best: Option<(usize, f32)> = None;
         for (i, fr) in self.list.iter().enumerate() {
             let (mn, mx) = boxes(fr);
+            // Un rien plus large que ce qu'on voit : le bord se vise aussi.
+            let (mn, mx) = (mn - 0.02, mx + 0.02);
             let t0 = (mn - eye) * inv;
             let t1 = (mx - eye) * inv;
             let near = t0.min(t1).max_element();
             let far = t0.max(t1).min_element();
-            if far >= near.max(0.0) && near < max && best.is_none_or(|b| near < b.1) {
+            let limit = match seen {
+                Some((cell, _)) if cell == fr.pos => max,
+                Some((_, d)) => d.min(max),
+                None => max,
+            };
+            if far >= near.max(0.0) && near < limit && best.is_none_or(|b| near < b.1) {
                 best = Some((i, near));
             }
         }
         best.map(|b| b.0)
+    }
+
+    /// Boîte du cadre `i` (pour montrer qu'il est visé).
+    pub fn bounds(&self, i: usize) -> Option<([f32; 3], [f32; 3])> {
+        let (mn, mx) = boxes(self.list.get(i)?);
+        Some((mn.to_array(), mx.to_array()))
     }
 
     /// Casse le cadre `i` : enlevé de l'affichage et du fichier du monde `dir`.

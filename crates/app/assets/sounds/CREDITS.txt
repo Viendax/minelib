@@ -28,7 +28,7 @@ Grenades et couteau :
     licence du projet.
   ladder.ogg (barreaux d'échelle) — créé pour Minelib (chocs de bois synthétisés), sous la
     licence du projet.
-  door.ogg (porte, trappe) — créé pour Minelib (grincement et choc synthétisés), sous la
+  door.ogg (porte, trappe) — créé pour Minelib (loquet et choc de bois synthétisés, sans grincement), sous la
     licence du projet.
   splash.ogg (plongeon dans l'eau) — créé pour Minelib (bruit filtré, gouttelettes et
     « plouf » synthétisés), sous la licence du projet.

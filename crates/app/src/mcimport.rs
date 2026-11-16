@@ -588,7 +588,16 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
                 _ => 4,
             };
         }
-        return key(&format!("door_{}:{half}:{side}", registry::door_key(d)));
+        // Ouverte : `:o`, ou `:m` gonds à droite (le maillage y lit où sont les gonds).
+        let state = match (open, prop("hinge") == Some("right")) {
+            (false, _) => "",
+            (true, false) => ":o",
+            (true, true) => ":m",
+        };
+        return key(&format!(
+            "door_{}:{half}:{side}{state}",
+            registry::door_key(d)
+        ));
     }
     if let Some(w) = n.strip_suffix("_trapdoor") {
         let kind = if w == "iron" {
@@ -847,7 +856,7 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
 /// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales ; 5 : décors en entités
 /// d'affichage).
-pub const IMPORT_VERSION: u32 = 9;
+pub const IMPORT_VERSION: u32 = 10;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {

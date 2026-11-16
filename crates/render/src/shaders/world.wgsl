@@ -488,8 +488,8 @@ fn sky_shade(dir: vec3<f32>) -> vec4<f32> {
             }
         }
         // Nuages : une couche plate très haute, trois octaves de bruit qui dérivent avec
-        // le vent ; éclairés par le soleil (dorés quand il est bas), estompés à l'horizon.
-        let uv = dir.xz / (dir.y + 0.12) * 1.6 + vec2<f32>(g.cam_pos.w * 0.006, g.cam_pos.w * 0.002);
+        // le vent (immobiles quand l'heure est arrêtée : `fog.w`) ; éclairés par le soleil (dorés quand il est bas), estompés à l'horizon.
+        let uv = dir.xz / (dir.y + 0.12) * 1.6 + vec2<f32>(g.fog.w * 0.006, g.fog.w * 0.002);
         let n = cloud_noise(uv) * 0.55 + cloud_noise(uv * 2.3 + 7.1) * 0.30
             + cloud_noise(uv * 5.1 + 3.7) * 0.15;
         let cover = smoothstep(0.52, 0.78, n) * smoothstep(0.02, 0.22, dir.y);
@@ -1232,6 +1232,16 @@ fn trace(o0: vec3<f32>, d0: vec3<f32>, short: bool) -> vec4<f32> {
 /// Ne regarde que les boîtes à moins de 24 blocs de `o`.
 fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
     let n = u32(g.shadow_info.x);
+    if n == 0u {
+        return 0.0;
+    }
+    // Le rayon passe-t-il seulement près des boîtes ? (boule qui les contient toutes)
+    let bm = g.shadow_info.yzw - o;
+    let br = g.shadow_max[0].w;
+    let bt = dot(bm, d);
+    if bt < -br || dot(bm, bm) - bt * bt > br * br {
+        return 0.0;
+    }
     let inv = 1.0 / select(d, vec3<f32>(1e-6), abs(d) < vec3<f32>(1e-6));
     for (var k = 0u; k < n; k++) {
         let mn = g.shadow_min[k].xyz;
@@ -1260,6 +1270,12 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
 fn torch_shadow(p: vec3<f32>) -> vec3<f32> {
     var c = vec3<f32>(0.0);
     let n = u32(g.shadow_info.x);
+    // Trop loin de toutes les boîtes (boule qui les contient) : aucune ombre possible.
+    let bm = g.shadow_info.yzw - p;
+    let br = g.shadow_max[0].w + 6.0;
+    if n == 0u || dot(bm, bm) > br * br {
+        return c;
+    }
     for (var k = 0u; k < n; k++) {
         let j = i32(g.shadow_min[k].w);
         let mn = g.shadow_min[k].xyz;

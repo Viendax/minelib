@@ -188,6 +188,9 @@ struct Conn {
     garant_banned: bool,
     /// Aller-retour jusqu'au relais mesuré par son jeu (ms, moyenne glissante).
     rtt: Option<f32>,
+    /// Écart moyen (ms) entre deux mesures : une connexion instable (qui saute) est
+    /// écartée comme une connexion lente.
+    rtt_dev: f32,
     /// Garant arbitre d'une affaire de cette partie, en ce moment.
     arbitrating: Option<u64>,
     /// Lobby (n°), et lobbies qui l'ont invité.
@@ -419,7 +422,7 @@ const MAX_PER_PEER: usize = 48;
 const MAX_CONNECTIONS: usize = 60_000;
 
 /// Place prise par une connexion (rendue quand elle se ferme).
-struct PeerSlot {
+pub(crate) struct PeerSlot {
     open: Arc<Mutex<HashMap<String, usize>>>,
     key: String,
 }
@@ -443,6 +446,23 @@ impl PeerSlot {
         Some(Self {
             open: open.clone(),
             key: peer.to_string(),
+        })
+    }
+}
+
+impl PeerSlot {
+    /// Comme `take`, pour un joueur nommé par le tunnel (toujours limité).
+    pub(crate) fn take_named(open: &Arc<Mutex<HashMap<String, usize>>>, who: &str) -> Option<Self> {
+        let mut m = open.lock().unwrap();
+        let total: usize = m.values().sum();
+        let n = m.entry(who.to_string()).or_insert(0);
+        if total >= MAX_CONNECTIONS || *n >= MAX_PER_PEER {
+            return None;
+        }
+        *n += 1;
+        Some(Self {
+            open: open.clone(),
+            key: who.to_string(),
         })
     }
 }
@@ -534,6 +554,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
                 garant_only: false,
                 garant_banned: false,
                 rtt: None,
+                rtt_dev: 0.0,
                 arbitrating: None,
                 party: None,
                 invited: Vec::new(),
@@ -703,10 +724,22 @@ fn leave_room(st: &mut State, id: u64) {
         } else {
             // Un garant indépendant prêt d'abord, sinon le garant de secours, sinon un
             // joueur.
+            // (Sans copie de la partie chez personne : le joueur à la meilleure
+            // connexion, jamais une connexion lente ou instable s'il y a mieux.)
+            let best_link = room
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| m != id)
+                .min_by(|a, b| {
+                    let ms = |m: &u64| st.conns.get(m).and_then(link_ms).unwrap_or(BAD_RTT - 1.0);
+                    ms(a).total_cmp(&ms(b))
+                });
             room.ready_standby
                 .first()
                 .copied()
                 .or(room.backup.filter(|b| room.members.contains(b)))
+                .or(best_link)
                 .unwrap_or(room.members[0])
         };
         switch_host(st, room_id, new, None);
@@ -1020,6 +1053,10 @@ fn garant_ok(st: &State, g: u64, players: &[String]) -> bool {
     if !c.garant || c.garant_banned || c.room.is_some() || c.kicked || c.arbitrating.is_some() {
         return false;
     }
+    // Connexion lente ou instable : jamais garant (toute la partie passerait par elle).
+    if link_bad(c) {
+        return false;
+    }
     let me = st.stats.get(p).cloned().unwrap_or_default();
     if me.games < 3 || me.ratio() > 0.25 {
         return false;
@@ -1085,7 +1122,7 @@ fn pick_garant(st: &State, players: &[String]) -> Option<u64> {
                 caps: c.caps,
                 uptime: c.joined.elapsed(),
                 ratio: c.pseudo.as_deref().map_or(0.0, |p| st.stats.ratio(p)),
-                rtt: c.rtt,
+                rtt: link_ms(c),
             };
             let mut score = zones::aptitude(&cand);
             if c.garant_only {
@@ -1209,6 +1246,26 @@ fn bulk_edit(
 
 /// Aller-retour (ms) au-delà duquel l'hôte d'une partie a une mauvaise connexion.
 const BAD_RTT: f32 = 180.0;
+
+/// Qualité d'une connexion pour servir les autres (hôte, garant) : son aller-retour moyen
+/// plus deux fois son écart moyen, en ms. Une connexion qui saute (Wi-Fi chargé, 4G) vaut
+/// donc comme une connexion bien plus lente : tout le monde subirait ses à-coups.
+fn link_ms(c: &Conn) -> Option<f32> {
+    c.rtt.map(|r| r + 2.0 * c.rtt_dev)
+}
+
+/// Connexion à écarter des rôles d'hôte et de garant (mesurée, et mauvaise).
+fn link_bad(c: &Conn) -> bool {
+    link_ms(c).is_some_and(|ms| ms >= BAD_RTT)
+}
+
+/// Écarte les candidats à mauvaise connexion, s'il en reste d'autres.
+fn good_links(mut cands: Vec<zones::Candidate>) -> Vec<zones::Candidate> {
+    if cands.iter().any(|c| c.rtt.is_none_or(|r| r < BAD_RTT)) {
+        cands.retain(|c| c.rtt.is_none_or(|r| r < BAD_RTT));
+    }
+    cands
+}
 /// Un remplaçant doit avoir au plus cet aller-retour (et moitié moins que l'hôte).
 const GOOD_RTT: f32 = 120.0;
 
@@ -1229,7 +1286,7 @@ fn rebalance_host(st: &mut State, rid: u64) -> bool {
     {
         return false;
     }
-    let rtt = |id: u64| st.conns.get(&id).and_then(|c| c.rtt);
+    let rtt = |id: u64| st.conns.get(&id).and_then(link_ms);
     let host = room.host;
     let Some(h) = rtt(host).filter(|&h| h >= BAD_RTT) else {
         return false;
@@ -1349,10 +1406,12 @@ fn candidates(st: &State, room_id: u64) -> Vec<zones::Candidate> {
     let Some(room) = st.rooms.get(&room_id) else {
         return Vec::new();
     };
-    room.everyone()
-        .filter(|id| !room.hidden.contains(id))
-        .filter_map(|id| candidate(st, id))
-        .collect()
+    good_links(
+        room.everyone()
+            .filter(|id| !room.hidden.contains(id))
+            .filter_map(|id| candidate(st, id))
+            .collect(),
+    )
 }
 
 fn candidate(st: &State, id: u64) -> Option<zones::Candidate> {
@@ -1362,7 +1421,7 @@ fn candidate(st: &State, id: u64) -> Option<zones::Candidate> {
         caps: c.caps,
         uptime: c.joined.elapsed(),
         ratio: c.pseudo.as_deref().map_or(0.0, |p| st.stats.ratio(p)),
-        rtt: c.rtt,
+        rtt: link_ms(c),
     })
 }
 
@@ -1379,7 +1438,9 @@ fn zone_candidates(st: &State, room_id: u64) -> Vec<zones::Candidate> {
         .filter(|&&id| !is_shard_host(room, id))
         .filter_map(|&id| candidate(st, id))
         .collect();
-    if outside.is_empty() {
+    // Garants extérieurs à bonne connexion d'abord ; sinon les joueurs du monde.
+    let outside = good_links(outside);
+    if outside.is_empty() || outside.iter().all(|c| c.rtt.is_some_and(|r| r >= BAD_RTT)) {
         candidates(st, room_id)
     } else {
         outside
@@ -3548,6 +3609,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         Request::Rtt { ms } => {
             if let Some(c) = st.conns.get_mut(&id) {
                 let ms = ms as f32;
+                if let Some(r) = c.rtt {
+                    c.rtt_dev = c.rtt_dev * 0.8 + (ms - r).abs() * 0.2;
+                }
                 c.rtt = Some(c.rtt.map_or(ms, |r| r * 0.8 + ms * 0.2));
             }
             return None;

@@ -642,6 +642,40 @@ pub fn default_head(xf: Mat4, light: [f32; 3]) -> Vec<EntityVertex> {
     out
 }
 
+/// Modèle simplifié pour les joueurs lointains d'une foule : chaque partie d'une couleur
+/// unie (216 sommets au lieu de milliers), même pose.
+pub fn build_far(pose: &Pose) -> Vec<EntityVertex> {
+    let mut out = Vec::with_capacity(216);
+    for (xf, min, max, part) in parts(pose) {
+        let c = match part {
+            Part::Head => SKIN,
+            Part::Body => SHIRT,
+            Part::Arm => SKIN_DARK,
+            Part::Leg => PANTS,
+        };
+        let rgb = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+        emit_item(&mut out, xf, min, max, RayBoxKind::Flat(rgb), pose.light);
+    }
+    out
+}
+
+/// Joueur très loin dans une foule : trois pavés (jambes, corps avec les bras, tête).
+pub fn build_tiny(pose: &Pose) -> Vec<EntityVertex> {
+    let mut out = Vec::with_capacity(108);
+    let base = Mat4::from_translation(pose.feet)
+        * Mat4::from_rotation_y(-pose.yaw)
+        * Mat4::from_scale(Vec3::splat(PX));
+    for (min, max, c) in [
+        ([-4.0, 0.0, -2.0], [4.0, 12.0, 2.0], PANTS),
+        ([-8.0, 12.0, -2.0], [8.0, 24.0, 2.0], SHIRT),
+        ([-4.0, 24.0, -4.0], [4.0, 32.0, 4.0], SKIN),
+    ] {
+        let rgb = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+        emit_item(&mut out, base, min, max, RayBoxKind::Flat(rgb), pose.light);
+    }
+    out
+}
+
 /// Triangles du modèle du joueur dans cette pose (avec l'objet tenu).
 pub fn build(pose: &Pose) -> Vec<EntityVertex> {
     let mut out = Vec::with_capacity(12_000);

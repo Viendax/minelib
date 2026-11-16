@@ -661,38 +661,123 @@ fn emit_lantern(
     }
 }
 
-/// Texture d'une porte retournée de gauche à droite ? La poignée est du côté opposé aux
-/// gonds : une porte seule l'a d'un côté ; le battant d'une double porte dont le jumeau
-/// (même porte, même moitié, ouvert ou fermé) est du côté où elle tournerait a ses gonds
-/// de l'autre côté, donc la texture inverse ; ouvert, ce battant est le bloc `…:m`.
+/// Gonds d'une porte : axe de sa largeur (0 = X, 2 = Z) et vrai s'ils sont du côté haut
+/// de cet axe. La texture a ses gonds à gauche (colonne 0) et sa poignée à droite : elle
+/// est posée des gonds vers le bout libre, sur les deux faces, dans les quatre sens.
+///
+/// - Fermée (`porte:moitié:côté`) : gonds du côté `door_turn` du jeu ; le battant d'une
+///   double porte dont le jumeau (même porte, même moitié, ouvert ou fermé) est de ce
+///   côté-là les a de l'autre côté (gonds à l'extérieur, poignées au milieu).
+/// - Ouverte (`…:o`) : rangée contre le côté où elle a tourné, gonds vers le côté qu'elle
+///   fermait. `…:m` : ouverte, gonds inversés (battant droit d'une double porte).
+///
 /// `family` : la case voisine dans cette direction porte-t-elle la même porte ?
-fn door_is_right(key: &str, family: impl Fn([i32; 3], &str) -> bool) -> bool {
+fn door_hinge(key: &str, family: impl Fn([i32; 3], &str) -> bool) -> Option<(usize, bool)> {
     if !key.starts_with("door_") {
-        return false;
-    }
-    if key.ends_with(":m") {
-        return false;
+        return None;
     }
     let mut it = key.split(':');
-    let (Some(wood), Some(half), Some(side)) = (it.next(), it.next(), it.next()) else {
-        return false;
+    let (wood, half, side) = (it.next()?, it.next()?, it.next()?.parse::<u8>().ok()?);
+    let state = it.next();
+    // Côtés : 0 +X, 1 −X, 4 +Z, 5 −Z. Quart de tour du jeu (`door_turn`) et son inverse.
+    let turn = |s: u8| match s {
+        1 => 5,
+        5 => 0,
+        0 => 4,
+        _ => 1,
     };
-    // Même sens que `door_turn` du jeu (côté vers lequel tourne la porte).
-    let d = match side.parse::<u8>() {
-        Ok(1) => [0, 0, -1],
-        Ok(5) => [1, 0, 0],
-        Ok(0) => [0, 0, 1],
-        Ok(4) => [-1, 0, 0],
-        _ => return false,
+    let back = |s: u8| match s {
+        5 => 1,
+        0 => 5,
+        4 => 0,
+        _ => 4,
     };
-    !family(d, &format!("{wood}:{half}:"))
+    let opposite = |s: u8| match s {
+        0 => 1,
+        1 => 0,
+        4 => 5,
+        _ => 4,
+    };
+    let dir = |s: u8| match s {
+        0 => [1, 0, 0],
+        1 => [-1, 0, 0],
+        4 => [0, 0, 1],
+        _ => [0, 0, -1],
+    };
+    if !matches!(side, 0 | 1 | 4 | 5) {
+        return None;
+    }
+    let hinge = match state {
+        Some("o") => back(side),
+        Some("m") => back(opposite(side)),
+        _ => {
+            let t = turn(side);
+            if family(dir(t), &format!("{wood}:{half}:")) {
+                opposite(t)
+            } else {
+                t
+            }
+        }
+    };
+    Some((if hinge < 2 { 0 } else { 2 }, hinge == 0 || hinge == 4))
 }
 
-/// Coordonnées de texture d'`emit_box_t` : tirées de la position par le shader, écrites
-/// dans les sommets, ou écrites et retournées (battant droit d'une double porte).
+/// Battant de porte : pavé dont la texture va des gonds (colonne 0) au bout libre
+/// (colonne 16) sur les deux grandes faces ; la tranche des gonds montre les colonnes des
+/// gonds, celle du bout libre les colonnes de la poignée, le dessus les lignes du haut.
+#[allow(clippy::too_many_arguments)]
+fn emit_door(
+    out: &mut MeshData,
+    min: [f32; 3],
+    max: [f32; 3],
+    id: BlockId,
+    light: [[u8; 4]; 6],
+    skip: impl Fn(usize) -> bool,
+    width: usize,
+    hinge_high: bool,
+) {
+    let e = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let cell = min.map(|v| v.floor());
+    let thin = 2 - width;
+    let axis = |a: [i32; 3]| a.iter().position(|&c| c != 0).unwrap_or(0);
+    for (face, &(n, u, v)) in FACES.iter().enumerate() {
+        if skip(face) {
+            continue;
+        }
+        let base: [f32; 3] = std::array::from_fn(|i| min[i] + if n[i] > 0 { e[i] } else { 0.0 });
+        let (du, dv) = (e[axis(u)], e[axis(v)]);
+        let start = out.vertices.len() as u32;
+        let layer = face_tex(id, face as u32);
+        for (a, c) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            let p: [f32; 3] =
+                std::array::from_fn(|i| base[i] + a * du * u[i] as f32 + c * dv * v[i] as f32);
+            let l: [f32; 3] = std::array::from_fn(|i| p[i] - cell[i]);
+            // Des gonds (0) au bout libre (1) ; dans l'épaisseur (0 à 3/16).
+            let w = if hinge_high { 1.0 - l[width] } else { l[width] };
+            let t = l[thin] - (min[thin] - cell[thin]);
+            let uv = match axis(n) {
+                1 => [w, t],
+                k if k == thin => [w, 1.0 - l[1]],
+                // Tranches : celle des gonds, celle du bout libre.
+                _ if (n[width] > 0) == hinge_high => [t, 1.0 - l[1]],
+                _ => [1.0 - e[thin] + t, 1.0 - l[1]],
+            };
+            let q = uv.map(|t| (t.clamp(0.0, 1.99) * 128.0).round() as u32);
+            out.vertices.push(Vertex {
+                pos: p,
+                data: Vertex::block_data(face as u32, 3, light[face]) | reflect_bits(id),
+                tex: layer | TEX_LOCAL_UV | q[0] << 16 | q[1] << 24,
+            });
+        }
+        out.indices
+            .extend_from_slice(&[0, 1, 2, 2, 3, 0].map(|i| start + i));
+    }
+}
+
+/// Coordonnées de texture d'`emit_box_t` : tirées de la position par le shader ou écrites
+/// dans les sommets.
 const UV_WORLD: u8 = 0;
 const UV_LOCAL: u8 = 1;
-const UV_MIRROR: u8 = 2;
 /// Comme `UV_LOCAL`, la texture du dessus et du dessous tournée d'un quart de tour.
 const UV_TOPSWAP: u8 = 3;
 
@@ -726,15 +811,13 @@ fn emit_box_t(
                 std::array::from_fn(|i| base[i] + a * du * u[i] as f32 + c * dv * v[i] as f32);
             let mut tex = tex;
             if local_uv != UV_WORLD {
-                // Mêmes coordonnées que le shader tire de la position d'un bloc droit
-                // (`UV_MIRROR` : retournées de gauche à droite sur les côtés).
+                // Mêmes coordonnées que le shader tire de la position d'un bloc droit.
                 let l: [f32; 3] = std::array::from_fn(|i| p[i] - cell[i]);
-                let m = |t: f32| if local_uv == UV_MIRROR { 1.0 - t } else { t };
                 let uv = match axis(n) {
-                    0 => [m(l[2]), 1.0 - l[1]],
+                    0 => [l[2], 1.0 - l[1]],
                     1 if local_uv == UV_TOPSWAP => [l[2], l[0]],
                     1 => [l[0], l[2]],
-                    _ => [m(l[0]), 1.0 - l[1]],
+                    _ => [l[0], 1.0 - l[1]],
                 };
                 let q = uv.map(|t| (t.clamp(0.0, 1.99) * 128.0).round() as u32);
                 tex |= TEX_LOCAL_UV | q[0] << 16 | q[1] << 24;
@@ -1369,9 +1452,8 @@ fn mesh_block(
                         // Bannière : deux blocs de haut, elle pend dans la case du dessous
                         // (seul le bloc du haut a une hitbox, comme dans Minecraft).
                         let banner = def.key.starts_with("banner_");
-                        // Double porte : le battant qui a l'autre à sa gauche (vu de devant)
-                        // a sa texture retournée, comme dans Minecraft.
-                        let mirrored = door_is_right(&def.key, |d, family| {
+                        // Porte : où sont ses gonds (la poignée est à l'autre bout).
+                        let hinge = door_hinge(&def.key, |d, family| {
                             pad.get(x + d[0], y, z + d[2]).def().key.starts_with(family)
                         });
                         // Moitié du bas toujours, sauf dans un bloc plein (on n'y verrait
@@ -1437,6 +1519,19 @@ fn mesh_block(
                             let t = id.def().tex;
                             let half = if dy == 0 { t[1] } else { t[2] } as u32;
                             let tex_of = |f: u32| if banner { half } else { face_tex(id, f) };
+                            if let Some((width, high)) = hinge {
+                                emit_door(
+                                    out,
+                                    [wx + lo[0], wy + lo[1], wz + lo[2]],
+                                    [wx + hi[0], wy + hi[1], wz + hi[2]],
+                                    id,
+                                    face_light,
+                                    skip,
+                                    width,
+                                    high,
+                                );
+                                continue;
+                            }
                             emit_box_t(
                                 out,
                                 [wx + lo[0], wy + lo[1], wz + lo[2]],
@@ -1447,9 +1542,7 @@ fn mesh_block(
                                 0,
                                 skip,
                                 &|p| p,
-                                if mirrored {
-                                    UV_MIRROR
-                                } else if pane && mx[0] - mn[0] > mx[2] - mn[2] {
+                                if pane && mx[0] - mn[0] > mx[2] - mn[2] {
                                     // Vitre le long de X : la tranche (dessus, dessous)
                                     // est tournée dans son sens.
                                     UV_TOPSWAP
@@ -1471,6 +1564,40 @@ fn mesh_block(
                         }
                         // Pot de fleurs : la terre dedans (4/16, sous le bord) et les parois
                         // intérieures, plus foncées.
+                        // Bouton devant une vitre ou une grille : elle se prolonge jusqu'à lui
+                        // (elle s'arrête sinon au bord de sa case, à un bloc du mur).
+                        if def.key.starts_with("button_") {
+                            if let Some(&(bmn, bmx)) = def.boxes().first() {
+                                for (dx, dz) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                                    let nb = pad.get(x + dx, y, z + dz);
+                                    if !matches!(nb.def().shape, Shape::Post(PostKind::Pane)) {
+                                        continue;
+                                    }
+                                    let f = |v: u8| v as f32 / 16.0;
+                                    let (mn, mx) = match (dx, dz) {
+                                        (1, _) => ([f(bmx[0]), 0.0, f(7)], [1.0, 1.0, f(9)]),
+                                        (-1, _) => ([0.0, 0.0, f(7)], [f(bmn[0]), 1.0, f(9)]),
+                                        (_, 1) => ([f(7), 0.0, f(bmx[2])], [f(9), 1.0, 1.0]),
+                                        _ => ([f(7), 0.0, 0.0], [f(9), 1.0, f(bmn[2])]),
+                                    };
+                                    if mx[0] - mn[0] < 0.01 || mx[2] - mn[2] < 0.01 {
+                                        continue;
+                                    }
+                                    emit_box_t(
+                                        out,
+                                        [wx + mn[0], wy + mn[1], wz + mn[2]],
+                                        [wx + mx[0], wy + mx[1], wz + mx[2]],
+                                        nb,
+                                        &|face| face_tex(nb, face),
+                                        [light_at(b); 6],
+                                        0,
+                                        |_| false,
+                                        &|p| p,
+                                        if dx != 0 { UV_TOPSWAP } else { UV_WORLD },
+                                    );
+                                }
+                            }
+                        }
                         // Plante d'un pot garni : en croix, plantée dans la terre.
                         if let Some(plant) = crate::registry::potted_plant(id) {
                             emit_cross_at(out, [wx, wy + 0.25, wz], plant, light_at(b), 0.75);
@@ -1778,6 +1905,34 @@ mod tests {
         let n = tops(&w);
         set_cutouts(Vec::new());
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn door_hinges_are_outside_and_handles_in_the_middle_in_every_direction() {
+        let alone = |key: &str| door_hinge(key, |_, _| false);
+        // Seule, fermée contre −Z : gonds vers +X (le côté où elle tourne).
+        assert_eq!(alone("door_wood:lower:5"), Some((0, true)));
+        assert_eq!(alone("door_wood:lower:0"), Some((2, true)));
+        assert_eq!(alone("door_wood:lower:4"), Some((0, false)));
+        assert_eq!(alone("door_wood:lower:1"), Some((2, false)));
+        // Double porte, dans les quatre sens : le battant qui a son jumeau du côté où il
+        // tournerait a ses gonds de l'autre côté (toujours à l'extérieur de la paire).
+        for (side, toward) in [
+            (5u8, [1, 0, 0]),
+            (0, [0, 0, 1]),
+            (4, [-1, 0, 0]),
+            (1, [0, 0, -1]),
+        ] {
+            let key = format!("door_wood:upper:{side}");
+            let single = alone(&key).unwrap();
+            let twin = door_hinge(&key, |d, f| d == toward && f == "door_wood:upper:").unwrap();
+            assert_eq!(twin, (single.0, !single.1), "côté {side}");
+        }
+        // Ouverte : rangée contre +X après avoir fermé −Z, gonds restés au coin (−Z).
+        assert_eq!(alone("door_wood:lower:0:o"), Some((2, false)));
+        // Battant droit ouvert : rangé contre −X, gonds au même coin −Z.
+        assert_eq!(alone("door_wood:lower:1:m"), Some((2, false)));
+        assert_eq!(alone("stone"), None);
     }
 
     #[test]
