@@ -14,8 +14,8 @@ use minelib_render::EntityVertex;
 use crate::skin::Skin;
 
 /// Têtes dessinées au plus (les plus proches), et distance maximale (blocs).
-const MAX_SHOWN: usize = 48;
-const RANGE: f32 = 40.0;
+const MAX_SHOWN: usize = 160;
+const RANGE: f32 = 56.0;
 /// Téléchargements en même temps.
 const PARALLEL: usize = 4;
 
@@ -94,7 +94,7 @@ pub struct Heads {
     tx: Sender<(String, Option<Vec<u8>>)>,
     rx: Receiver<(String, Option<Vec<u8>>)>,
     /// Triangles déjà faits par tête (indice dans `list`), avec la lumière utilisée.
-    built: HashMap<usize, ([f32; 3], Vec<EntityVertex>)>,
+    built: HashMap<usize, ([f32; 3], bool, Vec<EntityVertex>)>,
 }
 
 impl Heads {
@@ -175,13 +175,13 @@ impl Heads {
         }
     }
 
-    /// Triangles des têtes proches de la caméra dont la texture est là.
+    /// Triangles des têtes proches de la caméra : avec leur skin, ou la tête par défaut
+    /// de Minelib en attendant (le bloc uni dessous n'est pas dessiné).
     pub fn vertices(&mut self, cam: Vec3, light: [f32; 3]) -> Vec<EntityVertex> {
         let mut near: Vec<(usize, f32)> = self
             .list
             .iter()
             .enumerate()
-            .filter(|(_, h)| self.skins.contains_key(&h.hash))
             .map(|(i, h)| (i, center(h).distance(cam)))
             .filter(|(_, d)| *d < RANGE)
             .collect();
@@ -190,16 +190,19 @@ impl Heads {
         let mut out = Vec::new();
         for (i, _) in near {
             let h = &self.list[i];
-            let fresh = self
-                .built
-                .get(&i)
-                .is_some_and(|(l, _)| l.iter().zip(light).all(|(a, b)| (a - b).abs() < 0.02));
+            let skin = self.skins.get(&h.hash);
+            let fresh = self.built.get(&i).is_some_and(|(l, textured, _)| {
+                *textured == skin.is_some()
+                    && l.iter().zip(light).all(|(a, b)| (a - b).abs() < 0.02)
+            });
             if !fresh {
-                let skin = &self.skins[&h.hash];
-                let v = crate::player_model::head(skin, transform(h), light);
-                self.built.insert(i, (light, v));
+                let v = match skin {
+                    Some(skin) => crate::player_model::head(skin, transform(h), light),
+                    None => crate::player_model::default_head(transform(h), light),
+                };
+                self.built.insert(i, (light, skin.is_some(), v));
             }
-            out.extend_from_slice(&self.built[&i].1);
+            out.extend_from_slice(&self.built[&i].2);
         }
         out
     }

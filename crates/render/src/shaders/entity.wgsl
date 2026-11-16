@@ -1,11 +1,20 @@
 // Minelib — entités dans le monde (modèle du joueur) : position monde, couleur unie déjà
 // éclairée par le jeu.
 
-// Début des uniformes du monde : la caméra (avec le tremblement du TAA).
+// Début des uniformes du monde : la caméra (avec le tremblement du TAA), puis les
+// matrices sans tremblement (image courante et précédente) pour les vecteurs de mouvement.
 struct Globals {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     cam_pos: vec4<f32>,
+    fog: vec4<f32>,
+    sun: vec4<f32>,
+    sel_min: vec4<f32>,
+    sel_max: vec4<f32>,
+    light: vec4<f32>,
+    cur_view_proj: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>,
+    screen: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -24,6 +33,7 @@ struct VOut {
     @location(0) color: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) @interpolate(flat) layer: i32,
+    @location(3) world: vec3<f32>,
 };
 
 /// Couleur du pixel : couleur du sommet, texturée pour un bloc tenu (pixels transparents
@@ -46,6 +56,7 @@ fn vs_main(v: VIn) -> VOut {
     o.color = v.color;
     o.uv = v.uv;
     o.layer = v.layer;
+    o.world = v.pos;
     return o;
 }
 
@@ -59,11 +70,26 @@ struct TaaOut {
     @location(1) motion: vec2<f32>,
 };
 
-// Avec l'anticrénelage temporel : pas de vecteur de mouvement (le modèle suit la caméra).
+// Avec l'anticrénelage temporel, le modèle du joueur local (il suit la caméra) : pas de
+// vecteur de mouvement.
 @fragment
 fn fs_taa(i: VOut) -> TaaOut {
     var o: TaaOut;
     o.color = vec4<f32>(texel(i), 1.0);
     o.motion = vec2<f32>(0.0);
+    return o;
+}
+
+// Le reste (têtes des cartes, autres joueurs, bombe, armes au sol) : fixé dans le monde,
+// il bouge à l'écran comme les blocs (sinon l'anticrénelage le fait traîner).
+@fragment
+fn fs_taa_world(i: VOut) -> TaaOut {
+    var o: TaaOut;
+    o.color = vec4<f32>(texel(i), 1.0);
+    let p = vec4<f32>(i.world, 1.0);
+    let cur = g.cur_view_proj * p;
+    let prev = g.prev_view_proj * p;
+    let d = prev.xy / prev.w - cur.xy / cur.w;
+    o.motion = d * vec2<f32>(0.5, -0.5) * g.screen.xy;
     return o;
 }

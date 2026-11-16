@@ -288,7 +288,7 @@ impl Player {
         (self.pos - h, self.pos + h + Vec3::Y * HEIGHT)
     }
 
-    /// Échelle touchée (côté du mur où elle est accrochée : 0 +X, 1 −X, 4 +Z, 5 −Z) : il
+    /// Échelle (ou liane, même physique) touchée (côté du mur où elle est accrochée : 0 +X, 1 −X, 4 +Z, 5 −Z) : il
     /// faut être contre sa planche, pas seulement dans sa case.
     /// Renvoie aussi si l'on touche sa planche (on n'y monte que là) ; sinon on est
     /// seulement dans la moitié de sa case côté mur, où l'on ne tombe pas.
@@ -302,7 +302,7 @@ impl Player {
             for z in lo.z..=hi.z {
                 for x in lo.x..=hi.x {
                     let def = world.get(x, y, z).def();
-                    let Some(side) = def.key.strip_prefix("ladder:") else {
+                    let Some(side) = climbable(&def.key) else {
                         continue;
                     };
                     let Ok(side) = side.parse::<u8>() else {
@@ -337,7 +337,7 @@ impl Player {
             for z in lo.z..=hi.z {
                 for x in lo.x..=hi.x {
                     let def = world.get(x, y, z).def();
-                    let Some(side) = def.key.strip_prefix("ladder:") else {
+                    let Some(side) = climbable(&def.key) else {
                         continue;
                     };
                     let o = Vec3::new(x as f32, y as f32, z as f32);
@@ -889,6 +889,13 @@ fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec3, Vec3)> {
             )
         })
         .collect()
+}
+
+/// Échelle ou liane (`ladder:<côté>`, `vine:<côté>`) : côté du mur où elle est
+/// accrochée. Les lianes se grimpent comme des échelles.
+fn climbable(key: &str) -> Option<&str> {
+    key.strip_prefix("ladder:")
+        .or_else(|| key.strip_prefix("vine:"))
 }
 
 #[cfg(test)]

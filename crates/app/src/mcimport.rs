@@ -302,6 +302,28 @@ fn recent_block(full: &str) -> Option<BlockId> {
         "bell" => "gold_block",
         "stripped_bamboo_block" | "bamboo_block" | "bamboo_mosaic" => "hay",
         "iron_chain" | "chain" => "iron_bars",
+        _ if n.ends_with("_coral") || n.ends_with("_coral_fan") => {
+            return reg.by_key(&format!("plant:{n}"));
+        }
+        _ if n.ends_with("_coral_wall_fan") => {
+            return reg.by_key(&format!("plant:{}", n.replace("_wall_fan", "_fan")));
+        }
+        "crimson_roots" | "warped_roots" => return reg.by_key(&format!("plant:{n}")),
+        "cave_vines"
+        | "cave_vines_plant"
+        | "weeping_vines"
+        | "weeping_vines_plant"
+        | "twisting_vines"
+        | "twisting_vines_plant" => "plant:cave_vines",
+        _ if n.ends_with("candle") => "candle",
+        "decorated_pot" => "decorated_pot",
+        "scaffolding" => "scaffolding",
+        "redstone_wire" => "redstone_wire",
+        "small_dripleaf" | "big_dripleaf" | "big_dripleaf_stem" => "plant:fern",
+        "bamboo" | "bamboo_sapling" => "plant:reeds",
+        "torchflower" | "cactus_flower" | "torchflower_crop" => "plant:tulip_orange",
+        "muddy_mangrove_roots" | "mangrove_roots" => "coarse_dirt",
+        _ if n.ends_with("_bars") => "iron_bars",
         "player_head" => "skull",
         "moss_carpet" => "carpet_green",
         "pale_moss_carpet" => "carpet_silver",
@@ -338,7 +360,9 @@ fn recent_block(full: &str) -> Option<BlockId> {
             }
             if n.contains("_bulb") || n.contains("lantern") {
                 "lamp_on"
-            } else if n.contains("_door") || n.contains("_trapdoor") || n.contains("_bars") {
+            } else if n.contains("_bars") {
+                "iron_bars"
+            } else if n.contains("_door") || n.contains("_trapdoor") {
                 return None;
             } else {
                 block
@@ -571,19 +595,18 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         } else {
             "trapdoor"
         };
-        let side = if prop("open") == Some("true") {
-            match prop("facing") {
-                Some("north") => 4,
-                Some("south") => 5,
-                Some("west") => 0,
-                _ => 1,
-            }
-        } else if prop("half") == Some("top") {
-            2
-        } else {
-            3
+        // Côté contre lequel elle se relève (ouverte), ou se relèvera (fermée).
+        let hinge = match prop("facing") {
+            Some("north") => 4,
+            Some("south") => 5,
+            Some("west") => 0,
+            _ => 1,
         };
-        return key(&format!("{kind}:{side}"));
+        if prop("open") == Some("true") {
+            return key(&format!("{kind}:{hinge}"));
+        }
+        let half = if prop("half") == Some("top") { 2 } else { 3 };
+        return key(&format!("{kind}:{half}:{hinge}"));
     }
     if n.ends_with("_button") {
         let mat = if n.contains("stone") || n.contains("blackstone") {
@@ -718,7 +741,15 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         | "redstone_torch"
         | "redstone_wall_torch" => "torch",
         "ladder" => return key(&format!("ladder:{}", wall_side(prop("facing")))),
-        "vine" => {
+        "lantern" | "soul_lantern" => {
+            let hang = if prop("hanging") == Some("true") {
+                ":hanging"
+            } else {
+                ""
+            };
+            return key(&format!("{n}{hang}"));
+        }
+        "vine" | "glow_lichen" => {
             let side = if prop("south") == Some("true") {
                 4
             } else if prop("west") == Some("true") {
@@ -806,7 +837,7 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
 /// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales ; 5 : décors en entités
 /// d'affichage).
-pub const IMPORT_VERSION: u32 = 6;
+pub const IMPORT_VERSION: u32 = 7;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {
@@ -1082,7 +1113,7 @@ pub struct Converted {
 
 /// Fichier des têtes à skin d'un monde importé : une ligne `x,y,z,pose,empreinte` par
 /// tête (pose : rotation 0..15 au sol, `w0`/`w1`/`w4`/`w5` contre un mur ; empreinte de la
-/// texture sur textures.minecraft.net).
+/// texture sur textures.minecraft.net). Aussi les cadres des murs (`read_frames`).
 pub const HEADS_FILE: &str = "tetes.txt";
 
 pub fn write_heads(dir: &Path, heads: &[String]) {
@@ -1185,7 +1216,7 @@ fn state_props(
 /// Têtes à skin du chunk (voir `HEADS_FILE`).
 fn read_heads(
     level: &Nbt,
-    chunk: &Chunk,
+    chunk: &mut Chunk,
     cx: i32,
     cz: i32,
     y_offset: i32,
@@ -1221,6 +1252,11 @@ fn read_heads(
             continue;
         }
         let key = &chunk.get(lx as usize, wy as usize, lz as usize).def().key;
+        let key = key.strip_suffix(":tex").unwrap_or(key);
+        // Dessinée avec son skin : le bloc uni dessous n'est plus dessiné.
+        if let Some(t) = registry::registry().by_key(&format!("{key}:tex")) {
+            chunk.set(lx as usize, wy as usize, lz as usize, t);
+        }
         let pose = if let Some(side) = key.strip_prefix("skull:wall:") {
             format!("w{side}")
         } else if key == "skull" {
@@ -1374,7 +1410,7 @@ pub fn convert_chunk(root: &Nbt, y_offset: i32) -> Result<Converted> {
     }
     fix_upper_halves(&mut chunk);
     color_banners(&mut chunk, level, x, z, y_offset);
-    let heads = read_heads(level, &chunk, x, z, y_offset, data_version < 2529);
+    let heads = read_heads(level, &mut chunk, x, z, y_offset, data_version < 2529);
     Ok(Converted {
         chunk,
         torches,
@@ -1527,6 +1563,72 @@ fn import_displays(dir: &Path, y_offset: i32, chunks: &mut HashMap<ChunkPos, Chu
         }
     }
     n
+}
+
+/// Cadres des murs (`item_frame`) : lignes `x,y,z,f<côté>,bloc:<clé>` de `HEADS_FILE`
+/// (côté vers lequel le cadre regarde, comme Minecraft : 0 bas, 1 haut, 2 nord, 3 sud,
+/// 4 ouest, 5 est ; `bloc:` vide : cadre vide visible).
+fn read_frames(dir: &Path, y_offset: i32) -> Vec<String> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for f in rd.flatten() {
+        let Ok(bytes) = fs::read(f.path()) else {
+            continue;
+        };
+        for root in read_region(&bytes) {
+            for e in root.get("Entities").map(Nbt::as_list).unwrap_or(&[]) {
+                if let Some(l) = frame_line(e, y_offset) {
+                    out.push(l);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn frame_line(e: &Nbt, y_offset: i32) -> Option<String> {
+    let id = e.get("id").and_then(Nbt::as_str)?;
+    if id != "minecraft:item_frame" && id != "minecraft:glow_item_frame" {
+        return None;
+    }
+    let facing = e.get("Facing").and_then(Nbt::as_i64)?.clamp(0, 5);
+    let tile = |k: &str| e.get(k).and_then(Nbt::as_i64);
+    let (x, y, z) = match e.get("block_pos") {
+        Some(Nbt::IntArray(a)) if a.len() == 3 => (a[0] as i64, a[1] as i64, a[2] as i64),
+        _ => (tile("TileX")?, tile("TileY")?, tile("TileZ")?),
+    };
+    let invisible = e.get("Invisible").and_then(Nbt::as_i64).unwrap_or(0) != 0;
+    let item = e
+        .path(&["Item", "id"])
+        .or_else(|| e.path(&["item", "id"]))
+        .and_then(Nbt::as_str)
+        .unwrap_or("");
+    let key = if item.is_empty() {
+        if invisible {
+            return None;
+        }
+        String::new()
+    } else {
+        let n = item.strip_prefix("minecraft:").unwrap_or(item);
+        let b = map_block_state(item, &HashMap::new());
+        let d = b.def();
+        // Un bloc plein (béton, laine…), ou un tapis : on le voit dans le cadre ; les
+        // autres objets (épée, pain…) ne sont pas dessinés.
+        if b == BlockId::AIR || (b == BlockId::STONE && !n.contains("stone")) {
+            return None;
+        }
+        if !(d.full || d.key.starts_with("carpet") || d.key.starts_with("glass")) {
+            return None;
+        }
+        d.key.clone()
+    };
+    Some(format!(
+        "{x},{},{z},f{facing},bloc:{key}",
+        y as i32 + y_offset
+    ))
 }
 
 /// Cases couvertes par une entité d'affichage (et ses passagers).
@@ -1752,6 +1854,8 @@ pub fn import_world(dir: &Path) -> Result<Import> {
     }
     // Décors faits d'entités d'affichage (1.19.4+) : blocs et objets posés dans le vide ou
     // dans des barrières (qui en font la collision).
+    // Cadres (objets accrochés aux murs) : dessinés à part, comme les têtes.
+    heads.extend(read_frames(&dir.join("entities"), y_offset));
     let shown = import_displays(&dir.join("entities"), y_offset, &mut built);
     if shown > 0 {
         log::info!("{shown} blocs d'entités d'affichage ajoutés");
@@ -2185,6 +2289,53 @@ mod real_world {
 mod dump_tests {
     use super::*;
 
+    /// États des chunks d'un dossier `region/` (`MC_REGION_DIR`) et erreurs de
+    /// conversion.
+    #[test]
+    #[ignore]
+    fn region_statuses() {
+        let Some(dir) = std::env::var_os("MC_REGION_DIR") else {
+            return;
+        };
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for f in fs::read_dir(dir).unwrap().flatten() {
+            let bytes = fs::read(f.path()).unwrap();
+            for nbt in read_region(&bytes) {
+                let status = nbt
+                    .get("Status")
+                    .or_else(|| nbt.path(&["Level", "Status"]))
+                    .and_then(Nbt::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                let r = match convert_chunk(&nbt, 64) {
+                    Ok(c) => {
+                        let mut n = 0;
+                        for y in 0..CHUNK_HEIGHT {
+                            for z in 0..16 {
+                                for x in 0..16 {
+                                    n += (c.chunk.get(x, y, z) != BlockId::AIR) as usize;
+                                }
+                            }
+                        }
+                        if n > 0 {
+                            "pleins".to_string()
+                        } else {
+                            "vides".to_string()
+                        }
+                    }
+                    Err(e) => format!("{e:#}"),
+                };
+                let v = nbt.get("DataVersion").and_then(Nbt::as_i64).unwrap_or(0);
+                *counts.entry(format!("{status} v{v} {r}")).or_default() += 1;
+            }
+        }
+        let mut v: Vec<_> = counts.into_iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        for (k, n) in v {
+            eprintln!("{n:6} {k}");
+        }
+    }
+
     /// Noms de blocs d'une région Minecraft qui deviennent de l'air (`MC_REGION=…`).
     #[test]
     #[ignore]
@@ -2240,6 +2391,45 @@ mod dump_displays {
     use super::*;
 
     /// Blocs d'entités d'affichage d'un dossier `entities/` (`MC_ENTITIES`).
+    #[test]
+    #[ignore]
+    fn entity_kinds() {
+        let Some(dir) = std::env::var_os("MC_ENTITIES") else {
+            return;
+        };
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for f in fs::read_dir(&dir).unwrap().flatten() {
+            let bytes = fs::read(f.path()).unwrap();
+            for root in read_region(&bytes) {
+                for e in root.get("Entities").map(Nbt::as_list).unwrap_or(&[]) {
+                    let id = e.get("id").and_then(Nbt::as_str).unwrap_or("?");
+                    let what = e
+                        .path(&["block_state", "Name"])
+                        .or_else(|| e.path(&["item", "id"]))
+                        .or_else(|| e.path(&["Item", "id"]))
+                        .and_then(Nbt::as_str)
+                        .unwrap_or("");
+                    let mut cells = Vec::new();
+                    display_cells(e, None, 64, &mut cells);
+                    *counts
+                        .entry(format!("{id} {what} cells={}", cells.len().min(1)))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let mut v: Vec<_> = counts.into_iter().collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        for (k, n) in v {
+            eprintln!("{n:6} {k}");
+        }
+        let frames = read_frames(Path::new(&dir), 64);
+        eprintln!(
+            "{} cadres, ex. {:?}",
+            frames.len(),
+            &frames[..frames.len().min(5)]
+        );
+    }
+
     #[test]
     #[ignore]
     fn displays() {

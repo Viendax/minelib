@@ -177,6 +177,8 @@ pub struct Session {
     lava_burn: f32,
     /// Têtes à skin d'une carte importée (chargées au premier pas), et leurs triangles.
     heads: Option<crate::heads::Heads>,
+    /// Cadres des murs (cartes importées).
+    frames: Option<crate::frames::Frames>,
     head_vertices: Vec<minelib_render::EntityVertex>,
     autosave: f32,
     hit: Option<Hit>,
@@ -370,6 +372,7 @@ impl Session {
             fluids: Default::default(),
             lava_burn: 0.0,
             heads: None,
+            frames: None,
             head_vertices: Vec::new(),
             autosave: AUTOSAVE_S,
             hit: None,
@@ -678,11 +681,19 @@ impl Session {
             let heads = self.heads.get_or_insert_with(|| {
                 crate::heads::Heads::load(&self.dir, minelib_assets::data_dir().join("tetes"))
             });
+            let l = 0.3 + 0.7 * self.daylight;
+            self.head_vertices.clear();
             if !heads.is_empty() {
                 let eye = self.player.eye();
                 heads.update(eye);
-                let l = 0.3 + 0.7 * self.daylight;
                 self.head_vertices = heads.vertices(eye, [l; 3]);
+            }
+            let frames = self
+                .frames
+                .get_or_insert_with(|| crate::frames::Frames::load(&self.dir));
+            if !frames.is_empty() {
+                self.head_vertices
+                    .extend_from_slice(frames.vertices([l; 3]));
             }
             // Eau et lave qui coulent (hors parties FPS en ligne : la carte y est figée).
             let fluids_on = self.net.is_none() && self.game.mode != GameMode::Fps;
@@ -4068,6 +4079,9 @@ impl Session {
         } else {
             Vec::new()
         };
+        // Jusqu'ici, le modèle du joueur local (il suit la caméra) ; le reste est fixé
+        // dans le monde (vecteurs de mouvement de l'anticrénelage).
+        let follow = model.len();
         model.extend_from_slice(&self.head_vertices);
         let mut shadows: Vec<(Vec3, Vec<ShadowBox>)> = Vec::new();
         if visible && self.spectating.is_none() {
@@ -4255,6 +4269,7 @@ impl Session {
             shadow_boxes: &shadow_boxes,
             viewmodel: &hand,
             entities: &model,
+            entities_follow: follow,
             eye: cam,
             player_eye: self.player.eye(),
             view,
@@ -4295,9 +4310,13 @@ pub(crate) enum Hinged {
         upper: bool,
         side: u8,
     },
+    /// `side` : 2 plafond, 3 dessous (fermée), sinon côté contre lequel elle est relevée ;
+    /// `hinge` : fermée, côté où elle se relève (choisi à la pose), `None` : trappe
+    /// d'avant (se relève à l'opposé du joueur).
     Trapdoor {
         kind: &'static str,
         side: u8,
+        hinge: Option<u8>,
     },
 }
 
@@ -4314,12 +4333,15 @@ pub(crate) fn hinged(id: BlockId) -> Option<Hinged> {
             side,
         });
     }
-    let (kind, side) = key.split_once(':')?;
+    let mut it = key.split(':');
+    let kind = it.next()?;
     if kind == "trapdoor" || kind == "iron_trapdoor" {
-        return Some(Hinged::Trapdoor {
-            kind,
-            side: side.parse().ok()?,
-        });
+        let side = it.next()?.parse().ok()?;
+        let hinge = match it.next() {
+            Some(h) => Some(h.parse().ok()?),
+            None => None,
+        };
+        return Some(Hinged::Trapdoor { kind, side, hinge });
     }
     None
 }
@@ -4331,7 +4353,12 @@ fn hinged_block(h: Hinged) -> Option<BlockId> {
             "door_{wood}:{}:{side}",
             if upper { "upper" } else { "lower" }
         )),
-        Hinged::Trapdoor { kind, side } => reg.by_key(&format!("{kind}:{side}")),
+        Hinged::Trapdoor {
+            kind,
+            side,
+            hinge: Some(h),
+        } if side == 2 || side == 3 => reg.by_key(&format!("{kind}:{side}:{h}")),
+        Hinged::Trapdoor { kind, side, .. } => reg.by_key(&format!("{kind}:{side}")),
     }
 }
 
@@ -4534,18 +4561,22 @@ pub(crate) fn toggle_hinged_with(
             }
             out
         }
-        Hinged::Trapdoor { kind, side } => {
+        Hinged::Trapdoor { kind, side, hinge } => {
             if let Some(closed) = opened.remove(&p).filter(|&b| same_family(b, id)) {
                 return vec![(p, closed)];
             }
-            let new_side = if side == 2 || side == 3 {
-                side_toward(look)
+            let closed = side == 2 || side == 3;
+            // Fermée : se relève du côté choisi à la pose (trappe d'avant : à l'opposé du
+            // joueur) ; ouverte : se rabat en dessous, en gardant ce côté.
+            let (new_side, new_hinge) = if closed {
+                (hinge.unwrap_or_else(|| side_toward(look)), None)
             } else {
-                3
+                (3, Some(side))
             };
             match hinged_block(Hinged::Trapdoor {
                 kind,
                 side: new_side,
+                hinge: new_hinge,
             }) {
                 Some(b) => {
                     if side == 2 || side == 3 {
@@ -4591,7 +4622,20 @@ fn hinged_placement(
                 _ if point.y - point.y.floor() > 0.5 => 2,
                 _ => 3,
             };
-            Some(vec![(p, hinged_block(Hinged::Trapdoor { kind, side })?)])
+            // Côté où elle se relèvera, comme dans Minecraft : contre le mur visé, sinon
+            // le bord le plus proche du joueur.
+            let hinge = match hit.normal {
+                [0, _, 0] => side_toward(-look),
+                [x, _, z] => side_toward(-Vec3::new(x as f32, 0.0, z as f32)),
+            };
+            Some(vec![(
+                p,
+                hinged_block(Hinged::Trapdoor {
+                    kind,
+                    side,
+                    hinge: Some(hinge),
+                })?,
+            )])
         }
     }
 }
@@ -5445,6 +5489,22 @@ mod slab_tests {
             w.set(p[0], p[1], p[2], b);
         }
         assert_eq!(w.get(6, 10, 6), trap);
+        // Trappe posée : se relève toujours du côté choisi à la pose, d'où qu'on l'ouvre.
+        let trap = reg.by_key("trapdoor:3:1").unwrap();
+        for look in [Vec3::X, -Vec3::X, Vec3::Z] {
+            w.set(6, 10, 6, trap);
+            let mut opened = HashMap::new();
+            for (p, b) in toggle_hinged(&w, &mut opened, [6, 10, 6], look) {
+                w.set(p[0], p[1], p[2], b);
+            }
+            assert_eq!(key(w.get(6, 10, 6)), "trapdoor:1");
+        }
+        // Ouverte sans souvenir (importée) : se rabat et se relève du même côté.
+        let mut opened = HashMap::new();
+        for (p, b) in toggle_hinged(&w, &mut opened, [6, 10, 6], Vec3::Z) {
+            w.set(p[0], p[1], p[2], b);
+        }
+        assert_eq!(key(w.get(6, 10, 6)), "trapdoor:3:1");
     }
 
     #[test]

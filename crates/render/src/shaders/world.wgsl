@@ -147,16 +147,24 @@ fn vs_block(v: VIn) -> VOut {
 @fragment
 fn fs_block_fast(i: VOut) -> @location(0) vec4<f32> {
     let c = shade_with(i, false, false);
-    if c.a < 0.3 {
+    if c.a < 0.3 || from_behind(i) {
         discard;
     }
     return vec4<f32>(c.rgb, 1.0);
 }
 
+/// Face d'un bloc vue de dos, à travers les trous de sa texture (verre, feuillage,
+/// fenêtre d'une porte) : pas dessinée, comme dans Minecraft (sinon les bords du dessous
+/// d'une vitre se superposent à ceux du dessus). Les plantes en croix (face 6) se voient
+/// des deux côtés.
+fn from_behind(i: VOut) -> bool {
+    return i.face < 6u && dot(face_normal(i.face), g.cam_pos.xyz - i.world) < 0.0;
+}
+
 @fragment
 fn fs_block(i: VOut) -> @location(0) vec4<f32> {
     let c = shade(i);
-    if c.a < 0.3 {
+    if c.a < 0.3 || from_behind(i) {
         discard; // pixels transparents (feuillage, torche, verre clair)
     }
     return vec4<f32>(c.rgb, 1.0);
@@ -191,7 +199,7 @@ fn motion_of(p: vec4<f32>) -> vec2<f32> {
 @fragment
 fn fs_block_fast_mv(i: VOut) -> MvOut {
     let c = shade_with(i, false, false);
-    if c.a < 0.3 {
+    if c.a < 0.3 || from_behind(i) {
         discard;
     }
     return MvOut(vec4<f32>(c.rgb, 1.0), motion_of(vec4<f32>(i.world, 1.0)));
@@ -201,7 +209,7 @@ fn fs_block_fast_mv(i: VOut) -> MvOut {
 fn fs_block_mv(i: VOut) -> MvOut {
     // Reflets lus dans l'image des reflets (calculée à part, à son propre rythme).
     let c = shade_with(i, true, true);
-    if c.a < 0.3 {
+    if c.a < 0.3 || from_behind(i) {
         discard;
     }
     return MvOut(vec4<f32>(c.rgb, 1.0), motion_of(vec4<f32>(i.world, 1.0)));

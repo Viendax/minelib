@@ -83,6 +83,24 @@ impl Skin {
     /// `w` × `h` × `d` pixels. Le calque du dessus (chapeau, veste…) passe devant s'il est
     /// opaque. `None` : pixel transparent (on garde le modèle par défaut).
     pub fn color(&self, part: usize, face: usize, u: u32, v: u32, size: [u32; 3]) -> Option<u32> {
+        if part == 5 || self.wide {
+            if let Some(c) = self.layer_color(part, face, u, v, size, true) {
+                return Some(c);
+            }
+        }
+        self.layer_color(part, face, u, v, size, false)
+    }
+
+    /// Couleur d'un seul calque (`top` : celui du dessus) ; `None` : pixel transparent.
+    pub fn layer_color(
+        &self,
+        part: usize,
+        face: usize,
+        u: u32,
+        v: u32,
+        size: [u32; 3],
+        top: bool,
+    ) -> Option<u32> {
         let (base, over) = match part {
             0 => ((16, 48), (0, 48)),
             1 => ((0, 16), (0, 32)),
@@ -105,14 +123,10 @@ impl Skin {
             }
         };
         // Calque du dessus : la tête l'a toujours, le reste seulement au format récent.
-        if part == 5 || self.wide {
-            let (x, y) = local(over);
-            let p = self.at(x, y);
-            if p[3] >= 128 {
-                return Some(rgb(p));
-            }
+        if top && part != 5 && !self.wide {
+            return None;
         }
-        let (x, y) = local(base);
+        let (x, y) = local(if top { over } else { base });
         let p = self.at(x, y);
         (p[3] >= 128).then(|| rgb(p))
     }

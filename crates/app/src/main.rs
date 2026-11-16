@@ -50,6 +50,7 @@ mod equip;
 mod fluids;
 mod fps;
 mod fpsmap;
+mod frames;
 mod garant;
 mod garant_worker;
 mod gpu_plan;

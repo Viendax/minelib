@@ -136,9 +136,36 @@ fn emit_box(
     light: [f32; 3],
     tex: Option<(&crate::skin::Skin, usize)>,
 ) {
+    emit_box_layer(out, xf, min, max, part, light, tex, None);
+}
+
+/// Comme `emit_box` ; `layer` : un seul calque du skin (`false` le dessous, `true` le
+/// dessus), ses pixels transparents laissés vides (têtes des cartes : buissons…).
+#[allow(clippy::too_many_arguments)]
+fn emit_box_layer(
+    out: &mut Vec<EntityVertex>,
+    xf: Mat4,
+    min: [f32; 3],
+    max: [f32; 3],
+    part: Part,
+    light: [f32; 3],
+    tex: Option<(&crate::skin::Skin, usize)>,
+    layer: Option<bool>,
+) {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
-    let (w, h, d) = ((x1 - x0) as usize, (y1 - y0) as usize, (z1 - z0) as usize);
+    // Nombre de pixels du skin par côté (une boîte agrandie garde 8 pixels : chacun un
+    // peu plus grand).
+    let (w, h, d) = (
+        (x1 - x0).round() as usize,
+        (y1 - y0).round() as usize,
+        (z1 - z0).round() as usize,
+    );
+    let k = [
+        (x1 - x0) / w.max(1) as f32,
+        (y1 - y0) / h.max(1) as f32,
+        (z1 - z0) / d.max(1) as f32,
+    ];
     // (face, origine en haut à gauche vue de face, axe u, axe v, largeur, hauteur)
     let faces = [
         (
@@ -190,8 +217,9 @@ fn emit_box(
             d,
         ),
     ];
+    let step = Vec3::from(k);
     for (k, (face, o, du, dv, nu, nv)) in faces.into_iter().enumerate() {
-        let (o, du, dv) = (Vec3::from(o), Vec3::from(du), Vec3::from(dv));
+        let (o, du, dv) = (Vec3::from(o), Vec3::from(du) * step, Vec3::from(dv) * step);
         let p = |u: f32, v: f32| xf.transform_point3(o + du * u + dv * v);
         // Ombrage selon l'orientation de la face dans le monde.
         let n = xf.transform_vector3(du.cross(dv)).normalize_or_zero();
@@ -200,9 +228,19 @@ fn emit_box(
             for u in 0..nu {
                 let g = grain(k * 4096 + v * 64 + u + part as usize * 977);
                 let size = [w as u32, h as u32, d as u32];
-                let rgb = tex
-                    .and_then(|(t, i)| t.color(i, k, u as u32, v as u32, size))
-                    .unwrap_or_else(|| skin(part, face, u, v, nu));
+                // Pas : la taille d'un pixel du skin (la boîte peut être agrandie, pour le
+                // calque du dessus).
+                let rgb = match (tex, layer) {
+                    (Some((t, i)), Some(top)) => {
+                        match t.layer_color(i, k, u as u32, v as u32, size, top) {
+                            Some(c) => c,
+                            None => continue,
+                        }
+                    }
+                    _ => tex
+                        .and_then(|(t, i)| t.color(i, k, u as u32, v as u32, size))
+                        .unwrap_or_else(|| skin(part, face, u, v, nu)),
+                };
                 let c = srgb(rgb);
                 let col = [0, 1, 2].map(|i| c[i] * shade * g * light[i]);
                 let (a, b, cc, dd) = (
@@ -454,7 +492,7 @@ pub fn torch_tip(pose: &Pose) -> Option<Vec3> {
 }
 
 /// Pavé de couleur unie (ou d'une texture de bloc par face) : objet tenu, vu en F5.
-fn emit_item(
+pub(crate) fn emit_item(
     out: &mut Vec<EntityVertex>,
     xf: Mat4,
     min: [f32; 3],
@@ -523,6 +561,34 @@ fn emit_item(
 /// Tête seule (bloc « tête » à skin d'une carte importée) : `xf` va des pixels du modèle
 /// (tête de -4..4 × 0..8 × -4..4, visage vers −z) au monde.
 pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3]) -> Vec<EntityVertex> {
+    let mut out = Vec::with_capacity(4800);
+    // Comme Minecraft : la tête, puis le calque du dessus un peu plus grand (un quart de
+    // pixel de chaque côté) ; les pixels transparents restent vides.
+    emit_box_layer(
+        &mut out,
+        xf,
+        [-4.0, 0.0, -4.0],
+        [4.0, 8.0, 4.0],
+        Part::Head,
+        light,
+        Some((skin, 5)),
+        Some(false),
+    );
+    emit_box_layer(
+        &mut out,
+        xf,
+        [-4.25, -0.25, -4.25],
+        [4.25, 8.25, 4.25],
+        Part::Head,
+        light,
+        Some((skin, 5)),
+        Some(true),
+    );
+    out
+}
+
+/// Tête par défaut de Minelib (texture de la tête pas encore là).
+pub fn default_head(xf: Mat4, light: [f32; 3]) -> Vec<EntityVertex> {
     let mut out = Vec::with_capacity(2400);
     emit_box(
         &mut out,
@@ -531,7 +597,7 @@ pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3]) -> Vec<EntityVe
         [4.0, 8.0, 4.0],
         Part::Head,
         light,
-        Some((skin, 5)),
+        None,
     );
     out
 }

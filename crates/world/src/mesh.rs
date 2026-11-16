@@ -512,9 +512,34 @@ fn emit_box_xf(
         extra,
         skip,
         xf,
-        local_uv,
+        if local_uv { UV_LOCAL } else { UV_WORLD },
     );
 }
+
+/// Porte fermée `door_<bois>:<moitié>:<côté>` dont le battant voisin (même porte, même
+/// côté) est du côté où elle tourne (`same` : la case dans cette direction a le même
+/// bloc) : battant droit d'une double porte.
+fn door_is_right(key: &str, same: impl Fn([i32; 3]) -> bool) -> bool {
+    if !key.starts_with("door_") {
+        return false;
+    }
+    let side = key.rsplit(':').next().and_then(|s| s.parse::<u8>().ok());
+    // Même sens que `door_turn` du jeu (côté vers lequel tourne la porte).
+    let d = match side {
+        Some(1) => [0, 0, -1],
+        Some(5) => [1, 0, 0],
+        Some(0) => [0, 0, 1],
+        Some(4) => [-1, 0, 0],
+        _ => return false,
+    };
+    same(d)
+}
+
+/// Coordonnées de texture d'`emit_box_t` : tirées de la position par le shader, écrites
+/// dans les sommets, ou écrites et retournées (battant droit d'une double porte).
+const UV_WORLD: u8 = 0;
+const UV_LOCAL: u8 = 1;
+const UV_MIRROR: u8 = 2;
 
 /// Comme `emit_box_xf`, avec la texture de chaque face donnée par `tex_of`.
 #[allow(clippy::too_many_arguments)]
@@ -528,7 +553,7 @@ fn emit_box_t(
     extra: u32,
     skip: impl Fn(usize) -> bool,
     xf: &dyn Fn([f32; 3]) -> [f32; 3],
-    local_uv: bool,
+    local_uv: u8,
 ) {
     let e = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
     let cell = min.map(|v| v.floor());
@@ -545,13 +570,15 @@ fn emit_box_t(
             let p: [f32; 3] =
                 std::array::from_fn(|i| base[i] + a * du * u[i] as f32 + c * dv * v[i] as f32);
             let mut tex = tex;
-            if local_uv {
-                // Mêmes coordonnées que le shader tire de la position d'un bloc droit.
+            if local_uv != UV_WORLD {
+                // Mêmes coordonnées que le shader tire de la position d'un bloc droit
+                // (`UV_MIRROR` : retournées de gauche à droite sur les côtés).
                 let l: [f32; 3] = std::array::from_fn(|i| p[i] - cell[i]);
+                let m = |t: f32| if local_uv == UV_MIRROR { 1.0 - t } else { t };
                 let uv = match axis(n) {
-                    0 => [l[2], 1.0 - l[1]],
+                    0 => [m(l[2]), 1.0 - l[1]],
                     1 => [l[0], l[2]],
-                    _ => [l[0], 1.0 - l[1]],
+                    _ => [m(l[0]), 1.0 - l[1]],
                 };
                 let q = uv.map(|t| (t.clamp(0.0, 1.99) * 128.0).round() as u32);
                 tex |= TEX_LOCAL_UV | q[0] << 16 | q[1] << 24;
@@ -1030,6 +1057,9 @@ fn mesh_block(
         {
             {
                 let def = id.def();
+                if def.hidden {
+                    return;
+                }
                 let (wx, wy, wz) = ((ox + x) as f32, y as f32, (oz + z) as f32);
                 match def.shape {
                     Shape::Air | Shape::Invisible => return,
@@ -1111,6 +1141,11 @@ fn mesh_block(
                         // Bannière : deux blocs de haut, elle pend dans la case du dessous
                         // (seul le bloc du haut a une hitbox, comme dans Minecraft).
                         let banner = def.key.starts_with("banner_");
+                        // Double porte : le battant qui a l'autre à sa gauche (vu de devant)
+                        // a sa texture retournée, comme dans Minecraft.
+                        let mirrored = door_is_right(&def.key, |d| {
+                            pad.get(x + d[0], y, z + d[2]).def().key == def.key
+                        });
                         // Moitié du bas toujours, sauf dans un bloc plein (on n'y verrait
                         // que le bloc, en scintillant).
                         let below = pad.get(x, y - 1, z);
@@ -1169,7 +1204,7 @@ fn mesh_block(
                                 0,
                                 skip,
                                 &|p| p,
-                                false,
+                                if mirrored { UV_MIRROR } else { UV_WORLD },
                             );
                             if !banner && matches!(def.shape, Shape::Panel { .. }) {
                                 emit_hole_walls(
@@ -1211,7 +1246,7 @@ fn mesh_block(
                                     0,
                                     |f| f != keep,
                                     &|p| p,
-                                    true,
+                                    UV_LOCAL,
                                 );
                             }
                         }

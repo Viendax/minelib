@@ -101,6 +101,9 @@ pub struct BlockDef {
     /// Verre raccordé : couche de la variante au masque de bords cachés n° 1 (les masques
     /// 2..15 suivent ; le masque 0 est la texture du bloc) ; 0 = pas de raccord.
     pub connect: u16,
+    /// Pas dessiné dans le monde, mais solide (tête de carte dessinée à part, avec son
+    /// skin).
+    pub hidden: bool,
 }
 
 impl BlockDef {
@@ -567,6 +570,7 @@ impl Builder {
             reflect: 0,
             metal: false,
             connect: 0,
+            hidden: false,
         });
         self.r.keys.insert(key, id);
         id
@@ -1879,6 +1883,149 @@ fn fluids_and_heads(b: &mut Builder) {
             ..skull.clone()
         });
         b.r.keys.insert(key, id);
+    }
+    // Blocs récents des cartes importées (coraux, lanternes, bougies…), avec les
+    // textures du pack quand il les a.
+    let lit = |c: [u8; 3], solid: bool| Props {
+        full: false,
+        solid,
+        target: true,
+        cull_same: false,
+        light: Some(c),
+        translucent: false,
+    };
+    for c in ["brain", "bubble", "fire", "horn", "tube"] {
+        for dead in ["", "dead_"] {
+            for fan in ["", "_fan"] {
+                let t: &'static str = Box::leak(format!("{dead}{c}_coral{fan}").into_boxed_str());
+                b.add(
+                    format!("plant:{t}"),
+                    "corail".into(),
+                    Shape::Cross,
+                    &[p(t), p(t), p(t)],
+                    DECOR,
+                );
+            }
+        }
+    }
+    for (k, t) in [
+        ("crimson_roots", "crimson_roots"),
+        ("warped_roots", "warped_roots"),
+        ("cave_vines", "twisting_vines_plant"),
+    ] {
+        b.add(
+            format!("plant:{k}"),
+            "plante".into(),
+            Shape::Cross,
+            &[p(t), p(t), p(t)],
+            DECOR,
+        );
+    }
+    for (k, n, t, c) in [
+        ("lantern", "lanterne", "lantern", [255u8, 200, 120]),
+        (
+            "soul_lantern",
+            "lanterne des âmes",
+            "spirit_lantern",
+            [120, 220, 255],
+        ),
+    ] {
+        for (hang, min, max) in [
+            ("", [5u8, 0, 5], [11u8, 9, 11]),
+            (":hanging", [5, 7, 5], [11, 16, 11]),
+        ] {
+            b.add(
+                format!("{k}{hang}"),
+                n.into(),
+                Shape::Box { min, max },
+                &[p(t), p(t), p(t)],
+                lit(c, true),
+            );
+        }
+    }
+    b.add(
+        "candle".into(),
+        "bougie".into(),
+        Shape::Box {
+            min: [7, 0, 7],
+            max: [9, 6, 9],
+        },
+        &[
+            TexSrc::Flat([240, 225, 190]),
+            TexSrc::Flat([235, 220, 185]),
+            TexSrc::Flat([240, 225, 190]),
+        ],
+        lit([255, 190, 110], false),
+    );
+    b.add(
+        "decorated_pot".into(),
+        "pot décoré".into(),
+        Shape::Box {
+            min: [1, 0, 1],
+            max: [15, 16, 15],
+        },
+        &[p("hardened_clay"), p("hardened_clay"), p("hardened_clay")],
+        PART,
+    );
+    b.add(
+        "scaffolding".into(),
+        "échafaudage".into(),
+        Shape::Cube,
+        &[
+            p("scaffolding_top"),
+            p("scaffolding_side"),
+            p("scaffolding_bottom"),
+        ],
+        FOLIAGE,
+    );
+    b.add(
+        "redstone_wire".into(),
+        "fil d'énergie".into(),
+        Shape::Box {
+            min: [0, 0, 0],
+            max: [16, 1, 16],
+        },
+        &[
+            TexSrc::Tint("energy_dust_dot", [200, 30, 25]),
+            TexSrc::Tint("energy_dust_dot", [200, 30, 25]),
+            TexSrc::Tint("energy_dust_dot", [200, 30, 25]),
+        ],
+        DECOR,
+    );
+    // Têtes à skin des cartes importées : le bloc garde sa forme (on s'y cogne), mais
+    // c'est la tête texturée qui est dessinée (`heads` du jeu).
+    for key in [
+        "skull",
+        "skull:wall:0",
+        "skull:wall:1",
+        "skull:wall:4",
+        "skull:wall:5",
+    ] {
+        let base = b.r.defs[b.r.keys[key] as usize].clone();
+        let k = format!("{key}:tex");
+        let id = b.r.defs.len() as u16;
+        b.r.defs.push(BlockDef {
+            key: k.clone(),
+            hidden: true,
+            ..base
+        });
+        b.r.keys.insert(k, id);
+    }
+    // Trappes fermées (dessous 3 / plafond 2) qui savent de quel côté elles se relèvent
+    // (charnière : 0 +X, 1 −X, 4 +Z, 5 −Z), choisi à la pose comme dans Minecraft.
+    for kind in ["trapdoor", "iron_trapdoor"] {
+        for half in [2u8, 3] {
+            let base = b.r.defs[b.r.keys[&format!("{kind}:{half}")] as usize].clone();
+            for hinge in [0u8, 1, 4, 5] {
+                let key = format!("{kind}:{half}:{hinge}");
+                let id = b.r.defs.len() as u16;
+                b.r.defs.push(BlockDef {
+                    key: key.clone(),
+                    ..base.clone()
+                });
+                b.r.keys.insert(key, id);
+            }
+        }
     }
 }
 

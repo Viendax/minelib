@@ -367,6 +367,9 @@ pub struct FrameParams<'a> {
     pub viewmodel: &'a [VmVertex],
     /// Entités dans le monde (modèle du joueur à la 3e personne), coordonnées monde.
     pub entities: &'a [EntityVertex],
+    /// Les premiers sommets d'`entities` suivent la caméra (modèle du joueur local) ; les
+    /// autres sont fixés dans le monde.
+    pub entities_follow: usize,
     /// Torche tenue en main : couleur (sRGB) et portée en blocs.
     pub held_light: Option<([u8; 3], f32)>,
     /// Flamme de la torche tenue (bout de la torche dans la main du modèle du joueur) ;
@@ -1824,7 +1827,8 @@ impl Renderer {
         let hand = self
             .viewmodel
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
-        self.entities.prepare(&self.queue, p.entities);
+        self.entities
+            .prepare(&self.queue, p.entities, p.entities_follow);
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
@@ -2001,7 +2005,8 @@ impl Renderer {
         let hand = self
             .viewmodel
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
-        self.entities.prepare(&self.queue, p.entities);
+        self.entities
+            .prepare(&self.queue, p.entities, p.entities_follow);
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = {

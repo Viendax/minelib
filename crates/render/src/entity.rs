@@ -20,14 +20,17 @@ pub struct EntityVertex {
 }
 
 /// Au plus tant de sommets d'entités par image.
-const MAX_VERTICES: usize = 262_144;
+const MAX_VERTICES: usize = 1_048_576;
 
 pub struct Entities {
     /// Rendu direct (une cible) et rendu avec anticrénelage temporel (couleur + mouvement).
     plain: wgpu::RenderPipeline,
     taa: wgpu::RenderPipeline,
+    taa_world: wgpu::RenderPipeline,
     buffer: wgpu::Buffer,
     count: u32,
+    /// Premiers sommets qui suivent la caméra (modèle du joueur local).
+    follow: u32,
 }
 
 impl Entities {
@@ -100,6 +103,11 @@ impl Entities {
             "fs_taa",
             &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
         );
+        let taa_world = pipeline(
+            "entités fixes (TAA)",
+            "fs_taa_world",
+            &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
+        );
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("entités (sommets)"),
             size: (MAX_VERTICES * std::mem::size_of::<EntityVertex>()) as u64,
@@ -109,14 +117,19 @@ impl Entities {
         Self {
             plain,
             taa,
+            taa_world,
             buffer,
             count: 0,
+            follow: 0,
         }
     }
 
-    pub fn prepare(&mut self, queue: &wgpu::Queue, vertices: &[EntityVertex]) {
+    /// `follow` : les premiers sommets suivent la caméra (modèle du joueur local), les
+    /// autres sont fixés dans le monde.
+    pub fn prepare(&mut self, queue: &wgpu::Queue, vertices: &[EntityVertex], follow: usize) {
         let n = vertices.len().min(MAX_VERTICES) / 3 * 3;
         self.count = n as u32;
+        self.follow = (follow.min(n) / 3 * 3) as u32;
         if n > 0 {
             queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&vertices[..n]));
         }
@@ -132,9 +145,20 @@ impl Entities {
         if self.count == 0 {
             return;
         }
-        pass.set_pipeline(if taa { &self.taa } else { &self.plain });
         pass.set_bind_group(0, group, &[]);
         pass.set_vertex_buffer(0, self.buffer.slice(..));
-        pass.draw(0..self.count, 0..1);
+        if !taa {
+            pass.set_pipeline(&self.plain);
+            pass.draw(0..self.count, 0..1);
+            return;
+        }
+        if self.follow > 0 {
+            pass.set_pipeline(&self.taa);
+            pass.draw(0..self.follow, 0..1);
+        }
+        if self.count > self.follow {
+            pass.set_pipeline(&self.taa_world);
+            pass.draw(self.follow..self.count, 0..1);
+        }
     }
 }
