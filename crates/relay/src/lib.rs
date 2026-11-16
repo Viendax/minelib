@@ -7,6 +7,7 @@
 //! (preuve de mot de passe, coffre chiffré, secret 2FA chiffré).
 
 mod accounts;
+mod contacts;
 mod hardware;
 mod limits;
 mod maps;
@@ -52,6 +53,9 @@ pub struct Handle {
     pub public: [u8; 32],
     whois: Arc<Mutex<Option<WhoisFn>>>,
     shard_from: Arc<std::sync::atomic::AtomicUsize>,
+    /// État du relais (essais seulement).
+    #[cfg(test)]
+    state: Arc<Mutex<State>>,
 }
 
 /// Interroge les autres relais : clés des comptes qui y portent ce pseudo.
@@ -191,6 +195,10 @@ struct Conn {
     /// Écart moyen (ms) entre deux mesures : une connexion instable (qui saute) est
     /// écartée comme une connexion lente.
     rtt_dev: f32,
+    /// Joueurs à qui il a parlé (vocal) : dernier moment compté pour la fréquentation.
+    talked: HashMap<u64, Instant>,
+    /// Demandes d'objets (au sol, coffres) dans la seconde en cours.
+    item_rate: (Instant, u32),
     /// Garant arbitre d'une affaire de cette partie, en ce moment.
     arbitrating: Option<u64>,
     /// Lobby (n°), et lobbies qui l'ont invité.
@@ -328,6 +336,8 @@ struct State {
     accounts: accounts::Store,
     limits: limits::Limits,
     stats: stats::Store,
+    /// Fréquentation des joueurs entre eux (voir `contacts`).
+    contacts: contacts::Contacts,
     maps: maps::Store,
     hardware: hardware::Store,
     servers: servers::Store,
@@ -370,10 +380,13 @@ pub fn start(cfg: Config) -> Result<Handle> {
         accounts,
         limits: limits::Limits::default(),
         stats,
+        contacts: contacts::Contacts::open(cfg_dir.join("frequentation.bin")),
         maps,
         hardware: hardware::Store::open(cfg_dir.join("hardware.bin")),
         servers: servers::Store::open(cfg_dir.join("serveurs.bin")),
     }));
+    #[cfg(test)]
+    let state_for_tests = state.clone();
     std::thread::Builder::new()
         .name("relais : écoute".into())
         .spawn(move || {
@@ -413,6 +426,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
         public,
         whois,
         shard_from,
+        #[cfg(test)]
+        state: state_for_tests,
     })
 }
 
@@ -555,6 +570,8 @@ fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
                 garant_banned: false,
                 rtt: None,
                 rtt_dev: 0.0,
+                talked: HashMap::new(),
+                item_rate: (Instant::now(), 0),
                 arbitrating: None,
                 party: None,
                 invited: Vec::new(),
@@ -655,6 +672,10 @@ fn leave_room(st: &mut State, id: u64) {
     let Some(room) = st.rooms.get_mut(&room_id) else {
         return;
     };
+    // Ses numéros de demande d'objets repartiront d'ailleurs à sa prochaine venue.
+    if let Some(p) = &me {
+        room.build.items.forget(p);
+    }
     // Joueur du début qui quitte une partie FPS en cours : absent (il peut revenir).
     if let Some(p) = me {
         let low = p.to_ascii_lowercase();
@@ -1063,6 +1084,8 @@ fn garant_ok(st: &State, g: u64, players: &[String]) -> bool {
     }
     players.iter().all(|q| {
         !q.eq_ignore_ascii_case(p)
+            // Ils se fréquentent (se parlent, jouent ou traînent ensemble) : pas garant.
+            && !st.contacts.acquainted(p, q)
             && !me.avoids(q)
             && !me.friends.iter().any(|f| f.eq_ignore_ascii_case(q))
             && st.stats.get(q).is_none_or(|s| {
@@ -1199,6 +1222,7 @@ fn bulk_edit(
         return "Trop de blocs d'un coup.".into();
     }
     let room = st.rooms.get_mut(&rid).expect("partie");
+    let mut touched = Vec::new();
     for (pos, block) in cells {
         if !(0..256).contains(&pos[1]) {
             continue;
@@ -1240,8 +1264,91 @@ fn bulk_edit(
                 },
             );
         }
+        touched.push(pos);
+    }
+    // Un coffre remplacé par WorldEdit : son contenu tombe au sol.
+    for pos in touched {
+        spill_chest(st, rid, pos);
     }
     String::new()
+}
+
+/// Auditeurs d'un message vocal, au plus.
+const VOICE_MAX: usize = 256;
+
+/// Demandes d'objets (au sol, coffres) acceptées par joueur et par seconde.
+const ITEM_RATE: u32 = 40;
+
+/// Publie des états d'objets (voir `minelib_net::items`) : gardés dans l'historique de
+/// leur zone et remis aux joueurs proches, le demandeur `asker` en premier (c'est lui qui
+/// attend la réponse) ; un refus ne va qu'à lui.
+fn publish_items(st: &mut State, rid: u64, asker: u64, msgs: Vec<game::BuildMsg>) {
+    for m in msgs {
+        let data = game::encode(&m);
+        if matches!(m, game::BuildMsg::Denied { .. }) {
+            if let Some(c) = st.conns.get(&asker) {
+                transport::push(
+                    &c.tx,
+                    &Response::FromZone {
+                        peer: 0,
+                        chunk: [0, 0],
+                        data,
+                    },
+                );
+            }
+            continue;
+        }
+        let Some(chunk) = minelib_net::items::chunk_of_msg(&m) else {
+            continue;
+        };
+        let Some(room) = st.rooms.get_mut(&rid) else {
+            return;
+        };
+        // (`asker` 0 : personne n'attend, coffre cassé ou sauvegarde remise.)
+        let mut to: Vec<u64> = (asker != 0).then_some(asker).into_iter().collect();
+        to.extend(room.build.listeners(chunk, asker));
+        let sends = room.build.mirror_to(proto::zone_of(chunk), &data, &to);
+        // Le demandeur, même loin de là (ou pas encore placé) : sa réponse lui arrive.
+        let direct = asker != 0 && !sends.iter().any(|(m, _)| *m == asker);
+        for (m, items) in sends {
+            if let Some(c) = st.conns.get(&m) {
+                for data in items {
+                    transport::push(
+                        &c.tx,
+                        &Response::FromZone {
+                            peer: 0,
+                            chunk,
+                            data,
+                        },
+                    );
+                }
+            }
+        }
+        if direct {
+            if let Some(c) = st.conns.get(&asker) {
+                transport::push(
+                    &c.tx,
+                    &Response::FromZone {
+                        peer: 0,
+                        chunk,
+                        data,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Le bloc en `pos` vient de changer : si c'était un coffre garni, son contenu tombe au
+/// sol (une seule fois).
+fn spill_chest(st: &mut State, rid: u64, pos: [i32; 3]) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let out = room.build.items.spill(pos, rand::random::<u64>);
+    if !out.is_empty() {
+        publish_items(st, rid, 0, out);
+    }
 }
 
 /// Aller-retour (ms) au-delà duquel l'hôte d'une partie a une mauvaise connexion.
@@ -1319,6 +1426,47 @@ fn rebalance_host(st: &mut State, rid: u64) -> bool {
     true
 }
 
+/// Fréquentation (à chaque entretien) : les joueurs d'une même partie FPS lancée, et ceux
+/// qui restent dans le même chunk d'un monde de construction (chacun avec ses 8 voisins
+/// de rang : le travail ne dépend pas de la taille d'une foule).
+fn upkeep_contacts(st: &mut State) {
+    let mut pairs: Vec<(u64, u64, f32)> = Vec::new();
+    for r in st.rooms.values() {
+        if r.kind == 0 {
+            if !r.started {
+                continue;
+            }
+            let players: Vec<u64> = r.everyone().filter(|m| !r.hidden.contains(m)).collect();
+            for (i, &a) in players.iter().enumerate() {
+                for &b in &players[i + 1..] {
+                    pairs.push((a, b, contacts::SAME_MATCH));
+                }
+            }
+        } else {
+            for members in r.build.crowded_chunks() {
+                for (i, &a) in members.iter().enumerate() {
+                    for k in 1..=8.min(members.len() - 1) {
+                        let b = members[(i + k) % members.len()];
+                        if a != b {
+                            pairs.push((a.min(b), a.max(b), contacts::NEARBY));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Chaque paire une seule fois.
+    pairs.sort_unstable_by_key(|x| (x.0, x.1));
+    pairs.dedup_by_key(|x| (x.0, x.1));
+    for (a, b, points) in pairs {
+        let name = |id: u64| st.conns.get(&id).and_then(|c| c.pseudo.clone());
+        if let (Some(p), Some(q)) = (name(a), name(b)) {
+            st.contacts.add(&p, &q, points);
+        }
+    }
+    st.contacts.save_if_due();
+}
+
 /// Entretien (toutes les 2 s) : chaque partie FPS reçoit un garant indépendant en
 /// attente ; une partie servie par un joueur passe à ce garant dès qu'il est prêt.
 fn upkeep(st: &mut State) {
@@ -1326,6 +1474,7 @@ fn upkeep(st: &mut State) {
         return;
     }
     st.last_upkeep = Instant::now();
+    upkeep_contacts(st);
     upkeep_build(st);
     let rooms: Vec<u64> = st
         .rooms
@@ -3250,6 +3399,50 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             announce(st, rid, changes);
             let room = st.rooms.get_mut(&rid).expect("partie");
             let msg = game::decode::<game::BuildMsg>(&data);
+            // Objets au sol et coffres : ce relais arbitre (une demande après l'autre),
+            // publie le résultat aux joueurs proches, ou refuse au seul demandeur.
+            if let Some(m) = msg.as_ref().filter(|m| minelib_net::items::is_request(m)) {
+                // Seulement près de soi (2 chunks) : on ne lâche, ne ramasse ni ne fouille
+                // à l'autre bout du monde ; et pas plus de 40 demandes par seconde.
+                let near = match (
+                    room.build.positions.get(&id),
+                    room.build.items.target_chunk(m),
+                ) {
+                    (Some(h), Some(t)) => (h[0] - t[0]).abs() <= 2 && (h[1] - t[1]).abs() <= 2,
+                    (_, None) => true,
+                    (None, _) => false,
+                };
+                let calm = st.conns.get_mut(&id).is_some_and(|c| {
+                    if c.item_rate.0.elapsed() >= Duration::from_secs(1) {
+                        c.item_rate = (Instant::now(), 0);
+                    }
+                    c.item_rate.1 += 1;
+                    c.item_rate.1 <= ITEM_RATE
+                });
+                let room = st.rooms.get_mut(&rid).expect("partie");
+                let out = if !near || !calm {
+                    let seq = minelib_net::items::request_seq(m).unwrap_or(0);
+                    vec![game::BuildMsg::Denied { seq }]
+                } else {
+                    match room.build.items.apply(m, pseudo) {
+                        Ok(v) => v,
+                        Err(seq) => vec![game::BuildMsg::Denied { seq }],
+                    }
+                };
+                publish_items(st, rid, id, out);
+                return None;
+            }
+            // Le propriétaire remet les objets de sa sauvegarde (à l'ouverture du monde).
+            if matches!(
+                msg,
+                Some(game::BuildMsg::Item { .. } | game::BuildMsg::Slot { .. })
+            ) {
+                if room.host == id {
+                    let out = msg.and_then(|m| room.build.items.seed(&m));
+                    publish_items(st, rid, 0, out.into_iter().collect());
+                }
+                return None;
+            }
             match (msg, garant) {
                 // Une demande va au garant de la zone, même si c'est le demandeur lui-même
                 // (il la valide comme les autres).
@@ -3281,7 +3474,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 // Le garant publie : aux joueurs proches (avec ce qui leur manquerait) et
                 // dans l'historique de la zone. Le propriétaire, qui enregistre le monde,
                 // reçoit tout par paquets (voir `upkeep_build`).
-                (Some(game::BuildMsg::Set { .. }), Some(g)) if g == id => {
+                (Some(game::BuildMsg::Set { pos, .. }), Some(g)) if g == id => {
                     let to = room.build.listeners(chunk, id);
                     for (m, items) in room.build.record(zone, &data, &to) {
                         if let Some(c) = st.conns.get(&m) {
@@ -3297,6 +3490,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             }
                         }
                     }
+                    spill_chest(st, rid, pos);
                 }
                 // Validé par un ancien garant de la zone (elle vient de changer de mains) :
                 // le nouveau garant la revalide.
@@ -3352,10 +3546,17 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 .iter()
                 .find(|(_, s)| s.host == id)
                 .map(|(&r, _)| r)?;
+            let mut changed = Vec::new();
             for (chunk, data) in entries {
                 if proto::region_of(chunk) == region {
                     room.build.mirror(proto::zone_of(chunk), &data);
+                    if let Some(game::BuildMsg::Set { pos, .. }) = game::decode(&data) {
+                        changed.push(pos);
+                    }
                 }
+            }
+            for pos in changed {
+                spill_chest(st, rid, pos);
             }
             return None;
         }
@@ -3458,6 +3659,25 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         Request::ToHost { data } => {
             let rid = my_room?;
+            // Fréquentation : écrire dans le tchat d'une partie, c'est parler à ses joueurs.
+            if data.len() < 400 {
+                if let Some(game::ToHost::Chat(_)) = game::decode::<game::ToHost>(&data) {
+                    let others: Vec<String> = st
+                        .rooms
+                        .get(&rid)
+                        .filter(|r| r.kind == 0)
+                        .map(|r| {
+                            r.everyone()
+                                .filter(|m| *m != id && !r.hidden.contains(m))
+                                .filter_map(|m| st.conns.get(&m)?.pseudo.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for q in others {
+                        st.contacts.add(pseudo, &q, contacts::CHAT);
+                    }
+                }
+            }
             let r = st.rooms.get_mut(&rid)?;
             // Tirs, grenades, achats… : le garant vérificateur en reçoit une copie
             // attestée (l'hôte ne peut ni en inventer ni en taire), et le relais la garde
@@ -3506,12 +3726,39 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let fps = room.kind == 0;
             let from = if fps && room.host == id { 0 } else { id };
             let msg = Response::Voice { from, data };
-            for t in to.into_iter().take(64) {
+            // Jusqu'à 256 auditeurs (une foule autour de soi : le jeu envoie aux plus
+            // proches d'abord).
+            let mut heard = Vec::new();
+            for t in to.into_iter().take(VOICE_MAX) {
                 let t = if fps && t == 0 { room.host } else { t };
                 if t != id && (room.host == t || room.members.contains(&t)) {
                     if let Some(c) = st.conns.get(&t) {
                         transport::push(&c.tx, &msg);
+                        heard.push(t);
                     }
+                }
+            }
+            // Fréquentation : parler à quelqu'un compte, au plus une fois par 30 s et par
+            // auditeur.
+            let now = Instant::now();
+            let mut fresh = Vec::new();
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.talked
+                    .retain(|_, t| now.duration_since(*t) < Duration::from_secs(120));
+                for t in heard {
+                    let due = c
+                        .talked
+                        .get(&t)
+                        .is_none_or(|l| now.duration_since(*l) >= Duration::from_secs(30));
+                    if due && c.talked.len() < 1024 {
+                        c.talked.insert(t, now);
+                        fresh.push(t);
+                    }
+                }
+            }
+            for t in fresh {
+                if let Some(q) = st.conns.get(&t).and_then(|c| c.pseudo.clone()) {
+                    st.contacts.add(pseudo, &q, contacts::VOICE);
                 }
             }
             return None;
@@ -4773,6 +5020,248 @@ mod tests {
 
     /// Un garant indépendant (au menu, 3 parties jouées, sans lien avec les joueurs) sert
     /// la partie ; un second la vérifie et la reprend quand l'hôte triche.
+    /// Objets au sol et coffres sur un vrai relais : deux joueurs qui prennent la même
+    /// chose en même temps, un coffre cassé, une demande rejouée, la sauvegarde du
+    /// propriétaire remise deux fois : jamais un objet de plus qu'au départ.
+    #[test]
+    fn items_and_chests_are_arbitrated_by_the_relay_without_duplication() {
+        use minelib_net::items::{Ledger, Pile};
+        let dir = std::env::temp_dir().join(format!("minelib-objets-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        let (alice, alink) = login("Alice");
+        alice.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [9; 32],
+            max_players: 0,
+        });
+        let room = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let (bob, blink) = login("Bob");
+        bob.send(Cmd::Join(room));
+        wait(&bob, |e| matches!(e, Event::Joined { .. }));
+        for l in [&alink, &blink] {
+            transport::push(l, &Request::Position { chunk: [0, 0] });
+        }
+        let ask = |l: &std::sync::mpsc::Sender<crate::Inbound>, m: &game::BuildMsg| {
+            transport::push(
+                l,
+                &Request::ToZone {
+                    chunk: [0, 0],
+                    data: game::encode(m),
+                },
+            );
+        };
+        // Prochain état d'objet (ou refus) reçu par un joueur.
+        let next = |c: &Client| loop {
+            if let Event::FromZone { data, .. } = wait(c, |e| matches!(e, Event::FromZone { .. })) {
+                match game::decode::<game::BuildMsg>(&data) {
+                    Some(
+                        m @ (game::BuildMsg::Item { .. }
+                        | game::BuildMsg::Slot { .. }
+                        | game::BuildMsg::Denied { .. }),
+                    ) => return m,
+                    _ => continue,
+                }
+            }
+        };
+        let (mut la, mut lb) = (Ledger::starting_at(100), Ledger::starting_at(5000));
+        let (mut bag_a, mut bag_b) = (0u32, 0u32);
+        let give = |l: &mut Ledger, bag: &mut u32, m: &game::BuildMsg, me: &str| {
+            if let Some(minelib_net::items::Credit::Give(p)) = l.on_message(m, me) {
+                *bag += p.count as u32;
+            }
+        };
+        let pile = |n: u8| Pile { item: 1, count: n };
+        // Alice lâche 10 pierres ; la demande part deux fois (réseau) : un seul objet.
+        let req = la.drop_item(42, [1.5, 64.0, 1.5], pile(10));
+        ask(&alink, &req);
+        ask(&alink, &req);
+        for (c, l, bag, me) in [
+            (&alice, &mut la, &mut bag_a, "Alice"),
+            (&bob, &mut lb, &mut bag_b, "Bob"),
+        ] {
+            let m = next(c);
+            assert!(
+                matches!(
+                    m,
+                    game::BuildMsg::Item {
+                        id: 42,
+                        drop: Some(_),
+                        ..
+                    }
+                ),
+                "{m:?}"
+            );
+            give(l, bag, &m, me);
+        }
+        // Les deux le ramassent en même temps : un seul l'a, l'autre est refusé.
+        ask(&alink, &la.take_item(42));
+        ask(&blink, &lb.take_item(42));
+        // Chacun voit l'objet disparaître ; le gagnant le reçoit, le perdant a en plus
+        // son refus (dans un ordre ou l'autre).
+        let m = next(&alice);
+        give(&mut la, &mut bag_a, &m, "Alice");
+        let m = next(&bob);
+        give(&mut lb, &mut bag_b, &m, "Bob");
+        assert_eq!(bag_a + bag_b, 10, "ramassé une seule fois");
+        if bag_a == 0 {
+            let m = next(&alice);
+            give(&mut la, &mut bag_a, &m, "Alice");
+        } else {
+            let m = next(&bob);
+            give(&mut lb, &mut bag_b, &m, "Bob");
+        }
+        assert_eq!(bag_a + bag_b, 10, "ramassé une seule fois");
+        assert_eq!(la.pending() + lb.pending(), 0);
+        // Coffre : Bob y pose 7 objets, Alice et Bob prennent tout en même temps.
+        let chest = [2, 64, 2];
+        ask(&blink, &lb.chest_put(chest, 0, pile(7)));
+        for c in [&alice, &bob] {
+            let m = next(c);
+            assert!(
+                matches!(m, game::BuildMsg::Slot { pile: Some(_), .. }),
+                "{m:?}"
+            );
+            give(&mut lb, &mut bag_b, &m, "Bob");
+        }
+        let before = bag_a + bag_b;
+        ask(&alink, &la.chest_take(chest, 0, 7));
+        ask(&blink, &lb.chest_take(chest, 0, 7));
+        let (was_a, was_b) = (bag_a, bag_b);
+        let m = next(&alice);
+        give(&mut la, &mut bag_a, &m, "Alice");
+        let m = next(&bob);
+        give(&mut lb, &mut bag_b, &m, "Bob");
+        if bag_a == was_a {
+            let m = next(&alice);
+            give(&mut la, &mut bag_a, &m, "Alice");
+        } else {
+            let m = next(&bob);
+            give(&mut lb, &mut bag_b, &m, "Bob");
+        }
+        assert_eq!(
+            bag_a + bag_b,
+            before + 7,
+            "le coffre n'a été vidé qu'une fois"
+        );
+        assert!(bag_a == was_a || bag_b == was_b);
+        assert_eq!(la.pending() + lb.pending(), 0);
+        // Coffre garni puis cassé (son bloc change) : le contenu tombe au sol, une fois.
+        ask(&alink, &la.chest_put(chest, 5, pile(3)));
+        for c in [&alice, &bob] {
+            next(c);
+        }
+        {
+            let mut st = h.state.lock().unwrap();
+            spill_chest(&mut st, room, chest);
+            spill_chest(&mut st, room, chest);
+            let items = &st.rooms[&room].build.items;
+            assert!(items.chests.is_empty());
+            assert_eq!(items.totals()[&1], 3);
+            assert_eq!(items.live_drops().count(), 1);
+        }
+        // Bob voit le coffre se vider puis l'objet apparaître, et le ramasse.
+        let mut id = None;
+        while id.is_none() {
+            if let game::BuildMsg::Item {
+                id: i,
+                drop: Some(_),
+                ..
+            } = next(&bob)
+            {
+                id = Some(i);
+            }
+        }
+        ask(&blink, &lb.take_item(id.unwrap()));
+        let before = bag_b;
+        while bag_b == before {
+            let m = next(&bob);
+            give(&mut lb, &mut bag_b, &m, "Bob");
+        }
+        assert_eq!(bag_b, before + 3);
+        // Loin de soi (plus de 2 chunks) : refusé, rien ne change.
+        for far in [
+            la.drop_item(4242, [200.5, 64.0, 1.5], pile(1)),
+            la.chest_put([200, 64, 2], 0, pile(1)),
+        ] {
+            ask(&alink, &far);
+            // (Après les états déjà en route pour elle.)
+            while !matches!(next(&alice), game::BuildMsg::Denied { .. }) {}
+        }
+        // Le propriétaire remet sa sauvegarde : un objet inconnu revient, l'objet déjà
+        // ramassé et le coffre déjà touché ne reviennent pas.
+        let saved = [
+            game::BuildMsg::Item {
+                id: 42,
+                at: [1.5, 64.0, 1.5],
+                drop: Some(pile(10)),
+                to: String::new(),
+                seq: 0,
+                got: None,
+            },
+            game::BuildMsg::Slot {
+                pos: chest,
+                slot: 0,
+                pile: Some(pile(64)),
+                by: String::new(),
+                seq: 0,
+                got: None,
+            },
+            game::BuildMsg::Item {
+                id: 77,
+                at: [1.5, 64.0, 1.5],
+                drop: Some(pile(2)),
+                to: String::new(),
+                seq: 0,
+                got: None,
+            },
+        ];
+        for m in &saved {
+            ask(&alink, m);
+            // Un autre joueur ne peut rien remettre du tout.
+            ask(&blink, m);
+        }
+        match next(&bob) {
+            game::BuildMsg::Item {
+                id: 77,
+                drop: Some(p),
+                ..
+            } => assert_eq!(p, pile(2)),
+            m => panic!("{m:?}"),
+        }
+        let st = h.state.lock().unwrap();
+        let items = &st.rooms[&room].build.items;
+        assert_eq!(items.totals()[&1], 2);
+        assert!(items.chests.is_empty());
+        // Tout compte fait : 10 + 7 + 3 posés par les joueurs, 20 dans leurs sacs.
+        assert_eq!(bag_a + bag_b, 20);
+    }
+
     #[test]
     fn build_worlds_take_their_zone_garants_from_other_worlds() {
         let dir =

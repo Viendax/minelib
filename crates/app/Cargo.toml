@@ -26,6 +26,7 @@ minelib-render = { path = "../render" }
 minelib-world = { path = "../world" }
 minelib-assets = { path = "../assets" }
 minelib-net = { path = "../net" }
+rand = "0.8"
 minelib-relay = { path = "../relay" }
 # QR code de la double authentification (MIT / Apache-2.0).
 qrcode = { version = "0.14", default-features = false }

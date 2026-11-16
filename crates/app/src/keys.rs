@@ -76,6 +76,8 @@ pub enum Action {
     Attack,
     Use,
     Pick,
+    /// Lâcher l'objet en main (construction).
+    Drop,
     Forward,
     Back,
     Left,
@@ -137,10 +139,11 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 58] = [
+    pub const ALL: [Action; 59] = [
         Action::Attack,
         Action::Use,
         Action::Pick,
+        Action::Drop,
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -203,6 +206,7 @@ impl Action {
             Action::Attack
             | Action::Use
             | Action::Pick
+            | Action::Drop
             | Action::Forward
             | Action::Back
             | Action::Left
@@ -289,6 +293,7 @@ impl Action {
             Action::Attack => "Casser",
             Action::Use => "Poser",
             Action::Pick => "Copier le bloc",
+            Action::Drop => "Lâcher l'objet",
             Action::Forward => "Avancer",
             Action::Back => "Reculer",
             Action::Left => "Gauche",
@@ -352,6 +357,7 @@ impl Action {
             Action::Attack => "attack",
             Action::Use => "use",
             Action::Pick => "pick",
+            Action::Drop => "drop",
             Action::Forward => "forward",
             Action::Back => "back",
             Action::Left => "left",
@@ -418,6 +424,7 @@ impl Action {
             Action::Attack => Some(Bind::Mouse(Mouse::Left)),
             Action::Use => Some(Bind::Mouse(Mouse::Right)),
             Action::Pick => Some(Bind::Mouse(Mouse::Middle)),
+            Action::Drop => Some(Bind::Key(KeyCode::KeyQ)),
             Action::Forward => Some(Bind::Key(KeyCode::KeyW)),
             Action::Back => Some(Bind::Key(KeyCode::KeyS)),
             Action::Left => Some(Bind::Key(KeyCode::KeyA)),

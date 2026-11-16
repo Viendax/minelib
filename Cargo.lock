@@ -2784,6 +2784,7 @@ dependencies = [
  "minelib-render",
  "minelib-world",
  "qrcode",
+ "rand 0.8.8",
  "rfd",
  "rodio",
  "serde",

@@ -46,6 +46,7 @@ mod chat;
 mod cs;
 mod daytime;
 mod debug;
+mod drops;
 mod equip;
 mod fluids;
 mod fps;

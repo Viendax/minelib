@@ -28,16 +28,31 @@ const LOG_MAX: usize = 16 << 20;
 #[derive(Default)]
 pub struct ZoneLog {
     entries: BTreeMap<u64, Vec<u8>>,
-    by_pos: HashMap<[i32; 3], u64>,
+    by_pos: HashMap<LogKey, u64>,
     bytes: usize,
+}
+
+/// Ce qu'une entrée d'historique décrit (la suivante de même clé la remplace).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum LogKey {
+    Block([i32; 3]),
+    Item(u64),
+    Slot([i32; 3], u8),
 }
 
 impl ZoneLog {
     fn push(&mut self, seq: u64, data: &[u8]) {
-        if let Some(minelib_net::game::BuildMsg::Set { pos, .. }) =
-            minelib_net::game::decode::<minelib_net::game::BuildMsg>(data)
-        {
-            if let Some(old) = self.by_pos.insert(pos, seq) {
+        use minelib_net::game::BuildMsg;
+        // Une seule entrée par case, par objet au sol, par emplacement de coffre : la
+        // dernière.
+        let key = match minelib_net::game::decode::<BuildMsg>(data) {
+            Some(BuildMsg::Set { pos, .. }) => Some(LogKey::Block(pos)),
+            Some(BuildMsg::Item { id, .. }) => Some(LogKey::Item(id)),
+            Some(BuildMsg::Slot { pos, slot, .. }) => Some(LogKey::Slot(pos, slot)),
+            _ => None,
+        };
+        if let Some(key) = key {
+            if let Some(old) = self.by_pos.insert(key, seq) {
                 if let Some(d) = self.entries.remove(&old) {
                     self.bytes -= d.len();
                 }
@@ -128,6 +143,8 @@ pub struct Build {
     /// sans parcourir tout le monde) ; `indexed` : nombre de joueurs rangés.
     by_chunk: HashMap<[i32; 2], Vec<u64>>,
     indexed: usize,
+    /// Objets au sol et coffres du monde : ce relais en est l'arbitre.
+    pub items: minelib_net::items::ItemStore,
 }
 
 /// Positions dans une foule : chaque joueur est vu de tous ceux à portée (jusqu'à
@@ -262,6 +279,11 @@ impl Build {
             }
         }
         out
+    }
+
+    /// Chunks où se trouvent au moins deux joueurs (pour la fréquentation).
+    pub fn crowded_chunks(&self) -> impl Iterator<Item = &Vec<u64>> {
+        self.by_chunk.values().filter(|m| m.len() >= 2)
     }
 
     /// Zones actives (des messages ces dernières secondes).

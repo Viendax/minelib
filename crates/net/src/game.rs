@@ -479,6 +479,52 @@ pub enum BuildMsg {
     /// Le garant refuse la modification du joueur `peer` en `pos` : le relais ne la remet
     /// qu'à lui, qui remet le bloc d'avant.
     Reject { pos: [i32; 3], peer: u64 },
+    // ---- Objets au sol et coffres (voir `items`) : demandes à l'arbitre…
+    /// Lâcher `pile` (déjà sortie de l'inventaire) en `pos`, sous le numéro neuf `id`.
+    DropItem {
+        seq: u32,
+        id: u64,
+        pos: [f32; 3],
+        pile: crate::items::Pile,
+    },
+    /// Ramasser l'objet `id`.
+    TakeItem { seq: u32, id: u64 },
+    /// Poser `pile` (déjà sortie de l'inventaire) dans l'emplacement d'un coffre.
+    ChestPut {
+        seq: u32,
+        pos: [i32; 3],
+        slot: u8,
+        pile: crate::items::Pile,
+    },
+    /// Prendre `count` objets d'un emplacement de coffre.
+    ChestTake {
+        seq: u32,
+        pos: [i32; 3],
+        slot: u8,
+        count: u8,
+    },
+    // … et états publiés par l'arbitre.
+    /// Objet au sol `id` : présent (`drop`) ou disparu. `to`, `seq` : le joueur dont la
+    /// demande vient d'être acceptée ; `got` : ce qu'il gagne (objet ramassé).
+    Item {
+        id: u64,
+        at: [f32; 3],
+        drop: Option<crate::items::Pile>,
+        to: String,
+        seq: u32,
+        got: Option<crate::items::Pile>,
+    },
+    /// Emplacement d'un coffre après la demande `seq` de `by` ; `got` : ce qu'il gagne.
+    Slot {
+        pos: [i32; 3],
+        slot: u8,
+        pile: Option<crate::items::Pile>,
+        by: String,
+        seq: u32,
+        got: Option<crate::items::Pile>,
+    },
+    /// Demande `seq` refusée (remise au seul demandeur) : rien n'a changé.
+    Denied { seq: u32 },
 }
 
 /// Sortes de `ToPeer::Step`.

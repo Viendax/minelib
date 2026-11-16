@@ -131,6 +131,12 @@ pub struct BuildNet {
     /// les remettre s'il refuse.
     bulks: HashMap<u32, Vec<([i32; 3], BlockId)>>,
     next_bulk: u32,
+    /// États d'objets (au sol, coffres) et refus reçus du relais du monde, à traiter par
+    /// la partie (voir `crate::drops`).
+    pub item_inbox: Vec<BuildMsg>,
+    /// Message en cours de traitement venu d'un relais de région (tenu par un joueur) :
+    /// seul le relais du monde arbitre les objets, on n'en accepte pas d'ailleurs.
+    from_shard: bool,
 }
 
 /// Relais de région (voir `minelib_relay::shard`) : la liste reçue du relais du monde, le
@@ -235,6 +241,8 @@ impl BuildNet {
             fluid_rate: HashMap::new(),
             caps_sent: false,
             pending: HashMap::new(),
+            item_inbox: Vec::new(),
+            from_shard: false,
             bulks: HashMap::new(),
             next_bulk: 0,
             shards: Shards::default(),
@@ -294,6 +302,38 @@ impl BuildNet {
 
     fn send(&self, req: Request) {
         transport::push(&self.link, &req);
+    }
+
+    /// Demande d'objet (lâcher, ramasser, coffre) : toujours au relais du monde, seul
+    /// arbitre des objets, même dans une région servie par un autre relais.
+    pub fn send_item(&self, chunk: [i32; 2], req: &BuildMsg) {
+        if minelib_net::items::is_request(req) {
+            self.send(Request::ToZone {
+                chunk,
+                data: game::encode(req),
+            });
+        }
+    }
+
+    /// Propriétaire du monde : remet au relais les objets de sa sauvegarde (le relais
+    /// refuse ce qui ferait double emploi).
+    pub fn seed_items(&self, saved: &[BuildMsg]) {
+        if !self.owner {
+            return;
+        }
+        for m in saved {
+            if let Some(chunk) = minelib_net::items::chunk_of_msg(m) {
+                self.send(Request::ToZone {
+                    chunk,
+                    data: game::encode(m),
+                });
+            }
+        }
+    }
+
+    /// Mon pseudo sur ce serveur (celui que le relais met dans ses réponses).
+    pub fn pseudo(&self) -> &str {
+        &self.pseudo
     }
 
     /// WorldEdit d'un OP : les blocs changés (case, nouveau, ancien), déjà posés ici, partent
@@ -436,9 +476,11 @@ impl BuildNet {
             self.shards.conns.remove(&r);
             self.shards.list.remove(&r);
         }
+        self.from_shard = true;
         for (c, data) in received {
             dirty.extend(self.receive(0, c, &data, world));
         }
+        self.from_shard = false;
         // Position : aux joueurs proches ; nouveau chunk : au relais.
         if self.chunk != Some(chunk) {
             self.chunk = Some(chunk);
@@ -540,6 +582,19 @@ impl BuildNet {
                 self.confirm(pos);
                 world.set_remote(pos[0], pos[1], pos[2], BlockId(block))
             }
+            // Objets au sol et coffres : états publiés par le relais du monde (jamais par un
+            // joueur, `peer` 0, ni par un relais de région).
+            BuildMsg::Item { .. } | BuildMsg::Slot { .. } | BuildMsg::Denied { .. } => {
+                if peer == 0 && !self.from_shard {
+                    self.item_inbox.push(msg);
+                }
+                Vec::new()
+            }
+            // Les demandes ne vont qu'au relais.
+            BuildMsg::DropItem { .. }
+            | BuildMsg::TakeItem { .. }
+            | BuildMsg::ChestPut { .. }
+            | BuildMsg::ChestTake { .. } => Vec::new(),
             BuildMsg::Reject { pos, .. } => {
                 // Refusé : le bloc d'avant revient.
                 match self.pending.remove(&pos) {

@@ -25,6 +25,30 @@ pub enum Item {
 }
 
 impl Item {
+    /// Code de l'objet sur le réseau et dans les sauvegardes (objets au sol, coffres).
+    pub fn code(self) -> u32 {
+        match self {
+            Item::Block(b) => b.0 as u32,
+            Item::Torch(None) => 0x1_0000,
+            Item::Torch(Some(i)) => 0x1_0001 + i as u32,
+            Item::Wand => 0x2_0000,
+        }
+    }
+
+    /// Objet d'un code reçu (`None` : code inconnu de cette version du jeu).
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0x2_0000 => Some(Item::Wand),
+            0x1_0000 => Some(Item::Torch(None)),
+            c if c > 0x1_0000 && c < 0x2_0000 => {
+                let i = (c - 0x1_0001) as usize;
+                (i < minelib_world::flame::CHEMICALS.len()).then_some(Item::Torch(Some(i)))
+            }
+            c => (c != 0 && (c as usize) < minelib_world::registry::registry().len())
+                .then_some(Item::Block(BlockId(c as u16))),
+        }
+    }
+
     pub fn name(self) -> String {
         match self {
             Item::Block(b) => capitalize(b.name()),
@@ -129,6 +153,89 @@ pub struct Inventory {
     pub tab: usize,
     /// Barre de défilement du catalogue tenue à la souris.
     dragging: bool,
+    /// Coffre ouvert (sa case) : l'écran montre ses 3 lignes de 10 au-dessus de
+    /// l'inventaire. Son contenu (`chest_slots`) est recopié du monde à chaque image.
+    pub chest: Option<[i32; 3]>,
+    pub chest_slots: [Option<Stack>; CHEST_SLOTS],
+    /// Dernier clic dans l'écran du coffre, à traiter par la partie.
+    pub chest_action: Option<ChestAction>,
+}
+
+/// Emplacements d'un coffre (3 lignes de 10).
+pub const CHEST_SLOTS: usize = minelib_net::items::CHEST_SLOTS;
+
+/// Clic dans l'écran d'un coffre. `all` : toute la pile (clic gauche), sinon un seul objet
+/// (clic droit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChestAction {
+    /// Prendre dans l'emplacement `slot` du coffre.
+    Take { slot: usize, all: bool },
+    /// Poser depuis l'emplacement `slot` de l'inventaire.
+    Put { slot: usize, all: bool },
+}
+
+/// Géométrie de l'écran d'un coffre : sa grille, puis l'inventaire et la barre.
+struct ChestLayout {
+    l: Layout,
+    panel: (f32, f32, f32, f32),
+    chest: (f32, f32),
+    grid: (f32, f32),
+    hotbar: (f32, f32),
+}
+
+impl ChestLayout {
+    fn new(w: f32, h: f32) -> Self {
+        let l = Layout::new(w, h);
+        let (s, slot) = (l.s, l.slot);
+        let pad = 6.0 * s;
+        let title = 12.0 * s;
+        let gap = 6.0 * s;
+        let pw = slot * COLS as f32 + 2.0 * pad;
+        let ph = pad + title + slot * 3.0 + title + slot * ROWS as f32 + gap + slot + pad;
+        let (px, py) = ((w - pw) / 2.0, (h - ph) / 2.0);
+        let chest = (px + pad, py + pad + title);
+        let grid = (chest.0, chest.1 + slot * 3.0 + title);
+        let hotbar = (chest.0, grid.1 + slot * ROWS as f32 + gap);
+        Self {
+            l,
+            panel: (px, py, pw, ph),
+            chest,
+            grid,
+            hotbar,
+        }
+    }
+
+    fn chest_pos(&self, i: usize) -> (f32, f32) {
+        (
+            self.chest.0 + (i % COLS) as f32 * self.l.slot,
+            self.chest.1 + (i / COLS) as f32 * self.l.slot,
+        )
+    }
+
+    /// Emplacement `i` de l'inventaire (barre : 0..HOTBAR).
+    fn inv_pos(&self, i: usize) -> (f32, f32) {
+        if i < HOTBAR {
+            (self.hotbar.0 + i as f32 * self.l.slot, self.hotbar.1)
+        } else {
+            let k = i - HOTBAR;
+            (
+                self.grid.0 + (k % COLS) as f32 * self.l.slot,
+                self.grid.1 + (k / COLS) as f32 * self.l.slot,
+            )
+        }
+    }
+
+    fn hit(&self, pos: (f32, f32), x: f32, y: f32) -> bool {
+        x >= pos.0 && x < pos.0 + self.l.slot && y >= pos.1 && y < pos.1 + self.l.slot
+    }
+
+    fn chest_at(&self, x: f32, y: f32) -> Option<usize> {
+        (0..CHEST_SLOTS).find(|&i| self.hit(self.chest_pos(i), x, y))
+    }
+
+    fn inv_at(&self, x: f32, y: f32) -> Option<usize> {
+        (0..SLOTS).find(|&i| self.hit(self.inv_pos(i), x, y))
+    }
 }
 
 /// Onglets du catalogue créatif (le premier montre tout).
@@ -510,7 +617,18 @@ impl Inventory {
             scroll_row: 0,
             tab: 0,
             dragging: false,
+            chest: None,
+            chest_slots: [None; CHEST_SLOTS],
+            chest_action: None,
         }
+    }
+
+    /// Ouvre l'écran du coffre en `pos`.
+    pub fn open_chest(&mut self, pos: [i32; 3]) {
+        self.close();
+        self.chest = Some(pos);
+        self.chest_slots = [None; CHEST_SLOTS];
+        self.open = true;
     }
 
     /// Souris dans le catalogue créatif ouvert (à chaque image) : clic sur la barre de
@@ -639,6 +757,36 @@ impl Inventory {
         Some(item)
     }
 
+    /// Y a-t-il la place pour `count` objets `item` (piles entamées et cases libres) ?
+    pub fn has_room(&self, item: Item, count: u32) -> bool {
+        let free: u32 = self
+            .slots
+            .iter()
+            .map(|s| match s {
+                None => MAX_STACK,
+                Some(st) if st.item == item => MAX_STACK.saturating_sub(st.count),
+                Some(_) => 0,
+            })
+            .sum();
+        free >= count
+    }
+
+    /// Retire `count` objets de l'emplacement `i` ; renvoie ce qui a été retiré.
+    pub fn take_from(&mut self, i: usize, count: u32) -> Option<Stack> {
+        let slot = self.slots.get_mut(i)?;
+        let st = slot.as_mut()?;
+        let n = count.min(st.count);
+        if n == 0 {
+            return None;
+        }
+        let item = st.item;
+        st.count -= n;
+        if st.count == 0 {
+            *slot = None;
+        }
+        Some(Stack { item, count: n })
+    }
+
     /// Ajoute des objets (piles existantes d'abord, barre puis inventaire). Renvoie le surplus.
     pub fn add(&mut self, item: Item, mut count: u32) -> u32 {
         for slot in self.slots.iter_mut().flatten() {
@@ -686,6 +834,8 @@ impl Inventory {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.chest = None;
+        self.chest_action = None;
         self.search.clear();
         self.scroll_row = 0;
         if let Some(h) = self.held.take() {
@@ -701,6 +851,18 @@ impl Inventory {
     /// `shift` : Maj enfoncée (catalogue : pile directement dans la barre ; poubelle : tout
     /// vider).
     pub fn click(&mut self, size: (f32, f32), cursor: (f32, f32), right: bool, shift: bool) {
+        // Coffre ouvert : un clic prend dans le coffre ou y pose (la partie fait le reste,
+        // avec l'arbitre des objets).
+        if self.chest.is_some() {
+            let c = ChestLayout::new(size.0, size.1);
+            self.chest_action = match (c.chest_at(cursor.0, cursor.1), c.inv_at(cursor.0, cursor.1))
+            {
+                (Some(slot), _) => Some(ChestAction::Take { slot, all: !right }),
+                (_, Some(slot)) => Some(ChestAction::Put { slot, all: !right }),
+                _ => None,
+            };
+            return;
+        }
         if self.creative {
             self.click_creative(size, cursor, right, shift);
             return;
@@ -854,6 +1016,10 @@ impl Inventory {
     // ------------------------------------------------------------ dessin
 
     pub fn draw(&self, ui: &mut Ui, size: (f32, f32), cursor: Option<(f32, f32)>) {
+        if self.open && self.chest.is_some() {
+            self.draw_chest(ui, size, cursor);
+            return;
+        }
         if self.open && self.creative {
             self.draw_creative(ui, size, cursor);
             return;
@@ -927,6 +1093,39 @@ impl Inventory {
             } else if let Some(stack) = hover.and_then(|i| self.slots[i]) {
                 self.draw_tooltip(ui, size, (cx, cy), s, stack.item);
             }
+        }
+    }
+
+    /// Écran d'un coffre : ses trois lignes de dix, puis l'inventaire et la barre.
+    fn draw_chest(&self, ui: &mut Ui, size: (f32, f32), cursor: Option<(f32, f32)>) {
+        let c = ChestLayout::new(size.0, size.1);
+        let s = c.l.s;
+        let (mx, my) = cursor.unwrap_or((-1.0, -1.0));
+        ui.rect(0.0, 0.0, size.0, size.1, [0.0, 0.0, 0.0, 0.45]);
+        let (px, py, pw, ph) = c.panel;
+        ui.nine_slice("gui/panel", px, py, pw, ph, 4.0, s);
+        let ink = col([55, 55, 62], 1.0);
+        ui.text_flat(c.chest.0, py + 4.0 * s, s, ink, "Coffre");
+        ui.text_flat(c.grid.0, c.grid.1 - 10.0 * s, s, ink, "Inventaire");
+        let mut tip = None;
+        for i in 0..CHEST_SLOTS {
+            let (x, y) = c.chest_pos(i);
+            let over = c.hit((x, y), mx, my);
+            self.draw_slot(ui, &c.l, x, y, self.chest_slots[i], false, over);
+            if over {
+                tip = self.chest_slots[i];
+            }
+        }
+        for i in 0..SLOTS {
+            let (x, y) = c.inv_pos(i);
+            let over = c.hit((x, y), mx, my);
+            self.draw_slot(ui, &c.l, x, y, self.slots[i], i == self.selected, over);
+            if over {
+                tip = self.slots[i];
+            }
+        }
+        if let (Some(st), Some(cur)) = (tip, cursor) {
+            self.draw_tooltip(ui, size, cur, s, st.item);
         }
     }
 

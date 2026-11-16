@@ -129,6 +129,9 @@ pub struct Voice {
     seq: u32,
     /// Qui a ma clé actuelle.
     given: HashSet<u64>,
+    /// Un auditeur est parti : la clé doit changer (dès que `rekey_wait` est écoulé).
+    rekey_due: bool,
+    rekey_wait: f32,
     /// Clés de voix des autres : (époque, clé).
     theirs: HashMap<u64, (u32, [u8; 32])>,
     hello: f32,
@@ -152,6 +155,8 @@ impl Voice {
             epoch: 1,
             seq: 0,
             given: HashSet::new(),
+            rekey_due: false,
+            rekey_wait: 0.0,
             theirs: HashMap::new(),
             hello: 0.0,
             mic: None,
@@ -195,7 +200,16 @@ impl Voice {
         }
         // Quelqu'un ne doit plus m'entendre : nouvelle clé.
         let set: HashSet<u64> = listeners.iter().copied().collect();
+        // (Il ne reçoit déjà plus mes messages ; la clé change au plus toutes les 10 s :
+        // dans une foule qui bouge, la changer à chaque départ couperait la voix.)
+        self.rekey_wait -= dt;
         if self.given.iter().any(|g| !set.contains(g)) {
+            self.given.retain(|g| set.contains(g));
+            self.rekey_due = true;
+        }
+        if self.rekey_due && self.rekey_wait <= 0.0 {
+            self.rekey_due = false;
+            self.rekey_wait = 10.0;
             self.my_key = voice::new_voice_key();
             self.epoch += 1;
             self.seq = 0;

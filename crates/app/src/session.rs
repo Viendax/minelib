@@ -189,6 +189,11 @@ pub struct Session {
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
     frame_aim: Option<usize>,
+    /// Objets au sol et coffres (construction).
+    items: crate::drops::Items,
+    /// `items` est-il prêt (sauvegarde relue, ou remise au relais par le propriétaire) ?
+    items_ready: bool,
+    items_seeded: bool,
     /// Horloge du ciel : n'avance qu'avec l'heure (nuages immobiles à heure fixe).
     sky_clock: f32,
     overlay: Overlay,
@@ -389,6 +394,9 @@ impl Session {
             autosave: AUTOSAVE_S,
             hit: None,
             frame_aim: None,
+            items: crate::drops::Items::new(true),
+            items_ready: false,
+            items_seeded: false,
             sky_clock: 0.0,
             overlay: Overlay::default(),
             chat: Chat::default(),
@@ -437,6 +445,10 @@ impl Session {
             time_fixed: self.time_fixed,
             inventory: Some(inv),
         };
+        // Objets au sol et coffres : en solo, ou chez le propriétaire d'un monde en ligne.
+        if self.items_ready && self.build.as_ref().is_none_or(|b| b.is_owner()) {
+            self.items.save(&self.dir);
+        }
         save::save_world(&self.dir, &data, &self.world)
     }
 
@@ -563,7 +575,12 @@ impl Session {
             self.pings.retain(|p| p.1 < PING_S);
             self.since_space += dt;
             self.inventory.creative = self.game.mode == GameMode::Creative;
-            if self.inventory.open && self.inventory.creative && !typing {
+            if self.inventory.open && self.inventory.chest.is_some() && !typing {
+                // Coffre ouvert : E (ou Échap) le referme.
+                if self.keys.pressed(input, Action::Inventory) {
+                    self.inventory.close();
+                }
+            } else if self.inventory.open && self.inventory.creative && !typing {
                 // Catalogue créatif ouvert : le clavier sert à la recherche ; E ferme
                 // seulement quand la recherche est vide (sinon c'est une lettre).
                 if self.keys.pressed(input, Action::Inventory) && self.inventory.search.is_empty() {
@@ -989,14 +1006,17 @@ impl Session {
             self.walk_amp += (target - self.walk_amp) * (dt * 10.0).min(1.0);
             self.hand_light = self.light_at_player(held);
             self.handle_blocks(input, dt);
+            self.update_items(input, typing);
             if self.inventory.open {
                 let (w, h) = renderer.size();
-                self.inventory.pointer(
-                    (w as f32, h as f32),
-                    input.cursor,
-                    input.mouse_pressed(Mouse::Left),
-                    input.mouse_held(Mouse::Left),
-                );
+                if self.inventory.chest.is_none() {
+                    self.inventory.pointer(
+                        (w as f32, h as f32),
+                        input.cursor,
+                        input.mouse_pressed(Mouse::Left),
+                        input.mouse_held(Mouse::Left),
+                    );
+                }
                 if let Some(c) = input.cursor {
                     for (button, right) in [(Mouse::Left, false), (Mouse::Right, true)] {
                         if input.mouse_pressed(button) {
@@ -1128,6 +1148,178 @@ impl Session {
         frames.hit(eye, dir, REACH, seen.map(|h| (h.block, h.distance + 0.01)))
     }
 
+    /// Objets au sol et coffres (construction) : lâcher l'objet en main, ramasser ce qui
+    /// traîne, écran du coffre, et échanges avec l'arbitre (le relais en ligne, ce jeu
+    /// en solo). Voir `crate::drops` et `minelib_net::items`.
+    fn update_items(&mut self, input: &Input, typing: bool) {
+        use crate::drops::Items;
+        use crate::inventory::{ChestAction, Stack, CHEST_SLOTS};
+        use minelib_net::items::Pile;
+        let online = self.build.is_some();
+        // Première image, ou passage du solo au serveur : on repart de la bonne source.
+        if !self.items_ready || online == self.items.is_local() {
+            self.items = Items::new(!online);
+            self.items_ready = true;
+            self.items_seeded = false;
+            if !online && self.net.is_none() {
+                self.items.restore(&Items::load(&self.dir));
+            }
+        }
+        // Propriétaire d'un monde en ligne : sa sauvegarde est remise au relais, une fois.
+        if let Some(b) = &self.build {
+            if b.is_owner() && !self.items_seeded {
+                self.items_seeded = true;
+                b.seed_items(&Items::load(&self.dir));
+            }
+        }
+        let me = self
+            .build
+            .as_ref()
+            .map_or_else(|| "moi".to_string(), |b| b.pseudo().to_string());
+        // Réponses et états publiés par le relais.
+        if let Some(b) = self.build.as_mut() {
+            for m in std::mem::take(&mut b.item_inbox) {
+                // L'objet part de la main de celui qui l'a lâché, si on le voit.
+                let thrower = match &m {
+                    minelib_net::game::BuildMsg::Item { to, .. } => {
+                        let key: String = to.chars().take(16).collect();
+                        b.others.get(&key).map(|o| o.pos + Vec3::Y * 1.3)
+                    }
+                    _ => None,
+                };
+                self.items.hear(&m, &me, thrower);
+            }
+        }
+        let playing = self.game.mode.has_inventory() && self.game.mode != GameMode::Fps;
+        if playing {
+            // Lâcher l'objet en main (Ctrl : toute la pile), comme dans Minecraft.
+            if input.grabbed
+                && !typing
+                && !self.inventory.open
+                && self.keys.pressed(input, Action::Drop)
+            {
+                let all = input.held(KeyCode::ControlLeft) || input.held(KeyCode::ControlRight);
+                let n = if all { crate::inventory::MAX_STACK } else { 1 };
+                if let Some(st) = self.inventory.take_from(self.inventory.selected, n) {
+                    let eye = self.player.eye();
+                    let to = crate::drops::landing(&self.world, eye, self.player.look_dir());
+                    let pile = Pile {
+                        item: st.item.code(),
+                        count: st.count.min(64) as u8,
+                    };
+                    self.items.drop_item(eye - Vec3::Y * 0.3, to, pile);
+                }
+            }
+            // Ramasser ce qui est à portée, s'il y a de la place.
+            let inv = &self.inventory;
+            self.items.pick_up(self.player.pos, |p| {
+                crate::inventory::Item::from_code(p.item)
+                    .is_some_and(|item| inv.has_room(item, p.count as u32))
+            });
+        }
+        // Écran du coffre ouvert.
+        if let Some(pos) = self.inventory.chest {
+            let here = Vec3::new(
+                pos[0] as f32 + 0.5,
+                pos[1] as f32 + 0.5,
+                pos[2] as f32 + 0.5,
+            );
+            let still = self.world.get(pos[0], pos[1], pos[2]).def().key == "chest"
+                && here.distance(self.player.eye()) < REACH + 2.0
+                && playing;
+            if !still {
+                self.inventory.close();
+            } else {
+                let chest = self.items.view.chest(pos);
+                let shown = |p: Pile| {
+                    crate::inventory::Item::from_code(p.item).map(|item| Stack {
+                        item,
+                        count: p.count as u32,
+                    })
+                };
+                for (i, slot) in chest.iter().enumerate().take(CHEST_SLOTS) {
+                    self.inventory.chest_slots[i] = slot.and_then(shown);
+                }
+                match self.inventory.chest_action.take() {
+                    // Prendre : versé à l'inventaire quand l'arbitre répond.
+                    Some(ChestAction::Take { slot, all }) => {
+                        if let Some(p) = chest[slot] {
+                            let n = if all { p.count } else { 1 };
+                            let fits = shown(p)
+                                .is_some_and(|st| self.inventory.has_room(st.item, n as u32));
+                            if fits {
+                                self.items.chest_take(pos, slot as u8, n);
+                            }
+                        }
+                    }
+                    // Poser : la pile quitte l'inventaire tout de suite (rendue si le
+                    // coffre la refuse), sur une pile du même objet ou une case libre.
+                    Some(ChestAction::Put { slot, all }) => {
+                        if let Some(st) = self.inventory.slots[slot] {
+                            let n = if all { st.count.min(64) } else { 1 };
+                            let code = st.item.code();
+                            let target = (0..CHEST_SLOTS)
+                                .find(|&i| {
+                                    chest[i]
+                                        .is_some_and(|p| p.item == code && p.count as u32 + n <= 64)
+                                })
+                                .or_else(|| (0..CHEST_SLOTS).find(|&i| chest[i].is_none()));
+                            if let Some(t) = target {
+                                if let Some(out) = self.inventory.take_from(slot, n) {
+                                    let pile = Pile {
+                                        item: code,
+                                        count: out.count as u8,
+                                    };
+                                    self.items.chest_put(pos, t as u8, pile);
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        // Solo : un coffre garni dont le bloc a disparu (cassé, remplacé) se vide au sol.
+        if self.items.is_local() {
+            let gone: Vec<[i32; 3]> = self
+                .items
+                .view
+                .chests
+                .keys()
+                .copied()
+                .filter(|p| {
+                    self.world.contains(ChunkPos::containing(p[0], p[2]))
+                        && self.world.get(p[0], p[1], p[2]).def().key != "chest"
+                })
+                .collect();
+            for pos in gone {
+                self.items.block_changed(pos, &me);
+            }
+        }
+        self.items.arbitrate(&me);
+        if let Some(b) = &self.build {
+            for (chunk, req) in std::mem::take(&mut self.items.outbox) {
+                b.send_item(chunk, &req);
+            }
+        }
+        // Ce que l'arbitre accorde entre dans l'inventaire ; ce qui n'y tient plus retombe
+        // aux pieds du joueur.
+        for p in std::mem::take(&mut self.items.credits) {
+            let Some(item) = crate::inventory::Item::from_code(p.item) else {
+                continue;
+            };
+            let left = self.inventory.add(item, p.count as u32);
+            if left > 0 {
+                let feet = self.player.pos;
+                let pile = Pile {
+                    item: p.item,
+                    count: left.min(64) as u8,
+                };
+                self.items.drop_item(feet + Vec3::Y, feet, pile);
+            }
+        }
+    }
+
     fn handle_blocks(&mut self, input: &Input, dt: f32) {
         self.break_cooldown -= dt;
         self.place_cooldown -= dt;
@@ -1222,6 +1414,16 @@ impl Session {
             for (p, b) in changes {
                 self.dirty.extend(self.world.set(p[0], p[1], p[2], b));
             }
+            self.place_cooldown = 0.22;
+            return;
+        }
+        // Clic droit sur un coffre : il s'ouvre (accroupi : on pose le bloc tenu contre lui).
+        if keys.pressed(input, Action::Use)
+            && hit.id.def().key == "chest"
+            && !keys.held(input, Action::Sneak)
+            && self.game.mode.has_inventory()
+        {
+            self.inventory.open_chest(hit.block);
             self.place_cooldown = 0.22;
             return;
         }
@@ -3721,12 +3923,23 @@ impl Session {
             return (all, mates);
         }
         if let Some(b) = &self.build {
-            let all: Vec<u64> = b.others.values().filter_map(|o| o.id).collect();
-            let near = b
+            // Dans une foule : les 256 joueurs les plus proches entendent (le relais n'en
+            // sert pas plus par message), et les clés ne s'échangent qu'avec ceux qui
+            // sont à portée ou près de l'être.
+            let me = self.player.pos;
+            let mut by_dist: Vec<(f32, u64)> = b
                 .others
                 .values()
-                .filter(|o| (o.pos - self.player.pos).length() < VOICE_RANGE)
-                .filter_map(|o| o.id)
+                .filter_map(|o| Some(((o.pos - me).length(), o.id?)))
+                .filter(|(d, _)| *d < VOICE_RANGE * 1.5)
+                .collect();
+            by_dist.sort_by(|x, y| x.0.total_cmp(&y.0));
+            by_dist.truncate(VOICE_LISTENERS);
+            let all: Vec<u64> = by_dist.iter().map(|x| x.1).collect();
+            let near = by_dist
+                .iter()
+                .filter(|x| x.0 < VOICE_RANGE)
+                .map(|x| x.1)
                 .collect();
             return (all, near);
         }
@@ -4404,6 +4617,11 @@ impl Session {
                     model.extend(crate::player_model::build_tiny(&other));
                 }
             }
+        }
+        // Objets au sol : ils flottent et tournent.
+        if self.game.mode != GameMode::Fps {
+            let l = 0.35 + 0.65 * self.daylight;
+            self.items.build(cam, [l; 3], &mut model);
         }
         // Ombres des joueurs : les plus proches de la caméra (place limitée).
         shadows.sort_by(|a, b| {
@@ -5522,6 +5740,8 @@ fn selection_lines(
 
 /// Portée du chat vocal de proximité (construction), en blocs.
 const VOICE_RANGE: f32 = 48.0;
+/// Auditeurs d'un message vocal en construction, au plus (les plus proches).
+const VOICE_LISTENERS: usize = 256;
 
 /// Cadre du tableau des scores : (x, y, largeur).
 fn scoreboard_frame(size: (f32, f32)) -> (f32, f32, f32) {

@@ -10,6 +10,7 @@ pub mod client;
 pub mod crypto;
 pub mod game;
 pub mod hw;
+pub mod items;
 pub mod lan;
 pub mod proto;
 pub mod totp;
