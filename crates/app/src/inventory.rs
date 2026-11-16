@@ -125,29 +125,159 @@ pub struct Inventory {
     pub search: String,
     /// Première ligne affichée du catalogue.
     scroll_row: usize,
+    /// Onglet du catalogue créatif (`TABS`).
+    pub tab: usize,
     /// Barre de défilement du catalogue tenue à la souris.
     dragging: bool,
 }
 
-/// Catalogue créatif : torches (toutes les flammes), puis un bloc par famille.
-pub fn catalogue() -> &'static [Item] {
-    static CAT: std::sync::OnceLock<Vec<Item>> = std::sync::OnceLock::new();
+/// Onglets du catalogue créatif (le premier montre tout).
+pub const TABS: [&str; 8] = [
+    "Tout", "Constr.", "Couleurs", "Nature", "Utiles", "Redstone", "Outils", "Opér.",
+];
+
+/// Ordre des couleurs souhaité par la communauté (dégradé : neutres, puis l'arc-en-ciel).
+const COLOR_ORDER: [&str; 16] = [
+    "white",
+    "silver",
+    "gray",
+    "black",
+    "brown",
+    "red",
+    "orange",
+    "yellow",
+    "lime",
+    "green",
+    "cyan",
+    "light_blue",
+    "blue",
+    "purple",
+    "magenta",
+    "pink",
+];
+
+/// Familles colorées, dans l'ordre (chacune : neutre d'abord, puis les 16 teintes).
+const COLOR_FAMILIES: [&str; 10] = [
+    "wool",
+    "carpet",
+    "clay",
+    "concrete",
+    "concrete_powder",
+    "glazed",
+    "glass",
+    "pane",
+    "shulker",
+    "banner",
+];
+
+/// Onglet (1..) et clé de tri d'un bloc du catalogue : rangé comme la communauté aurait
+/// voulu Minecraft (chaque matériau avec ses escaliers, dalles et murets ; les blocs de
+/// couleur par sorte puis par teinte).
+type SortKey = (usize, usize, usize, usize);
+
+fn place_of(key: &str, index: usize) -> (usize, SortKey) {
+    let reg = minelib_world::registry::registry();
+    let first = key.split(':').next().unwrap_or(key);
+    // Couleurs.
+    for (f, fam) in COLOR_FAMILIES.iter().enumerate() {
+        let neutral = matches!(
+            (*fam, first),
+            ("clay", "hardened_clay") | ("glass", "glass") | ("pane", "pane")
+        );
+        let dye = first
+            .strip_prefix(fam)
+            .and_then(|r| r.strip_prefix('_'))
+            .and_then(|d| COLOR_ORDER.iter().position(|c| *c == d));
+        if neutral || dye.is_some() {
+            // « concrete_powder_x » commence aussi par « concrete_ » : la famille la plus longue.
+            if *fam == "concrete" && first.starts_with("concrete_powder") {
+                continue;
+            }
+            return (2, (f, dye.map_or(0, |d| d + 1), 0, index));
+        }
+    }
+    let base = |k: &str| reg.by_key(k).map_or(index, |b| b.0 as usize);
+    let tab = match first {
+        "barrier" | "fluid_barrier" | "command_block" => 7,
+        "redstone_block"
+        | "piston"
+        | "observer"
+        | "dispenser"
+        | "noteblock"
+        | "tnt"
+        | "lever"
+        | "button_stone"
+        | "button_wood"
+        | "pressure_plate_stone"
+        | "pressure_plate_wood"
+        | "tripwire_hook"
+        | "repeater"
+        | "comparator"
+        | "daylight_detector"
+        | "hopper"
+        | "rail"
+        | "lamp_off"
+        | "lamp_on"
+        | "trapdoor"
+        | "iron_trapdoor"
+        | "slime" => 5,
+        _ if first.starts_with("door_") => 5,
+        "crafting_table" | "furnace" | "chest" | "anvil" | "enchanting_table" | "brewing_stand"
+        | "cauldron" | "ladder" | "sign" | "wall_sign" | "flower_pot" | "skull" | "bed"
+        | "jukebox" | "cake" | "glowstone" | "sea_lantern" | "end_rod" | "mirror"
+        | "jack_o_lantern" | "bookshelf" | "iron_bars" => 4,
+        "grass" | "dirt" | "coarse_dirt" | "podzol" | "mycelium" | "farmland" | "grass_path"
+        | "sand" | "red_sand" | "gravel" | "clay" | "snow" | "snow_layer" | "ice"
+        | "packed_ice" | "plant" | "vine" | "lily_pad" | "cactus" | "pumpkin" | "melon"
+        | "netherrack" | "soul_sand" | "magma" | "obsidian" | "obsidian_crying" | "bedrock"
+        | "sponge" | "bone_block" | "hay" | "nether_wart_block" | "water" | "lava" => 3,
+        _ if first.ends_with("_ore")
+            || first.starts_with("log_")
+            || first.starts_with("leaves_") =>
+        {
+            3
+        }
+        _ => 1,
+    };
+    if tab != 1 {
+        return (tab, (0, index, 0, 0));
+    }
+    // Construction : le matériau (rang de son bloc plein), puis bloc, escalier, dalle,
+    // muret, barrière.
+    let parts: Vec<&str> = key.split(':').collect();
+    let (material, variant) = match first {
+        "stairs" => (base(parts.get(1).copied().unwrap_or("")), 1),
+        "slab" => (base(parts.get(1).copied().unwrap_or("")), 2),
+        _ if first.starts_with("wall_") => (base(&first["wall_".len()..]), 3),
+        "fence_nether" => (base("nether_brick"), 4),
+        _ if first.starts_with("fence_") => {
+            (base(&format!("planks_{}", &first["fence_".len()..])), 4)
+        }
+        _ => (index, 0),
+    };
+    (1, (material, variant, index, 0))
+}
+
+/// Catalogue créatif : tous les blocs (un par famille : orientations et moitiés hautes
+/// regroupées), barrières comprises, rangés par onglet ; puis la baguette et les torches.
+/// Chaque entrée porte son onglet.
+pub fn catalogue() -> &'static [(Item, usize)] {
+    static CAT: std::sync::OnceLock<Vec<(Item, usize)>> = std::sync::OnceLock::new();
     CAT.get_or_init(|| {
         use minelib_world::registry::{registry, Shape};
-        let mut items: Vec<Item> = [Item::Wand, Item::Torch(None)]
-            .into_iter()
-            .chain((0..CHEMICALS.len()).map(|i| Item::Torch(Some(i))))
-            .collect();
+        let mut blocks: Vec<(usize, SortKey, Item)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for (i, d) in registry().defs.iter().enumerate() {
-            if matches!(
+            let invisible_ok = matches!(d.key.as_str(), "barrier" | "fluid_barrier");
+            if (matches!(
                 d.shape,
                 Shape::Air
                     | Shape::Invisible
                     | Shape::Torch
                     | Shape::WallTorch(_)
                     | Shape::Fluid(_)
-            ) || d.key.starts_with("reserved")
+            ) && !invisible_ok)
+                || d.key.starts_with("reserved")
                 || d.key.ends_with("_upper")
                 || d.key.contains(":upper")
             {
@@ -161,9 +291,15 @@ pub fn catalogue() -> &'static [Item] {
                 _ => parts[0].to_string(),
             };
             if seen.insert(family) {
-                items.push(Item::Block(BlockId(i as u16)));
+                let (tab, key) = place_of(&d.key, i);
+                blocks.push((tab, key, Item::Block(BlockId(i as u16))));
             }
         }
+        blocks.sort_by_key(|b| (b.0, b.1));
+        let mut items: Vec<(Item, usize)> = blocks.into_iter().map(|(t, _, it)| (it, t)).collect();
+        items.push((Item::Wand, 6));
+        items.push((Item::Torch(None), 6));
+        items.extend((0..CHEMICALS.len()).map(|i| (Item::Torch(Some(i)), 6)));
         items
     })
 }
@@ -196,6 +332,8 @@ struct Creative {
     storage: (f32, f32),
     hotbar: (f32, f32),
     trash: (f32, f32),
+    /// Rangée des onglets (x, y, largeur d'un onglet, hauteur).
+    tabs: (f32, f32, f32, f32),
 }
 
 const CAT_COLS: usize = 10;
@@ -207,11 +345,26 @@ impl Creative {
         let slot = 20.0 * s;
         let pad = 6.0 * s;
         let title = 14.0 * s;
+        let tab_h = 13.0 * s;
         let gap = 6.0 * s;
         let pw = slot * (CAT_COLS + 1) as f32 + 2.0 * pad + 4.0 * s;
-        let ph = pad + title + slot * CAT_ROWS as f32 + gap + slot * ROWS as f32 + gap + slot + pad;
+        let ph = pad
+            + title
+            + tab_h
+            + slot * CAT_ROWS as f32
+            + gap
+            + slot * ROWS as f32
+            + gap
+            + slot
+            + pad;
         let (px, py) = ((w - pw) / 2.0, (h - ph) / 2.0);
-        let grid = (px + pad, py + pad + title);
+        let grid = (px + pad, py + pad + title + tab_h);
+        let tabs = (
+            grid.0,
+            py + pad + title - s,
+            slot * CAT_COLS as f32 / TABS.len() as f32,
+            tab_h - 2.0 * s,
+        );
         let right = grid.0 + slot * CAT_COLS as f32 + 4.0 * s;
         let storage = (grid.0, grid.1 + slot * CAT_ROWS as f32 + gap);
         let hotbar = (grid.0, storage.1 + slot * ROWS as f32 + gap);
@@ -230,7 +383,15 @@ impl Creative {
             storage,
             hotbar,
             trash: (right, hotbar.1),
+            tabs,
         }
+    }
+
+    /// Onglet sous le curseur.
+    fn tab_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (tx, ty, tw, th) = self.tabs;
+        (y >= ty && y < ty + th && x >= tx && x < tx + tw * TABS.len() as f32)
+            .then(|| ((x - tx) / tw) as usize)
     }
 
     fn inside(r: (f32, f32), size: f32, x: f32, y: f32) -> bool {
@@ -347,6 +508,7 @@ impl Inventory {
             creative: false,
             search: String::new(),
             scroll_row: 0,
+            tab: 0,
             dragging: false,
         }
     }
@@ -389,9 +551,12 @@ impl Inventory {
     /// Objets du catalogue qui correspondent à la recherche.
     pub fn filtered(&self) -> Vec<Item> {
         let q = fold(self.search.trim());
+        // Une recherche porte sur tout le catalogue ; sinon l'onglet choisi.
+        let tab = if q.is_empty() { self.tab } else { 0 };
         catalogue()
             .iter()
-            .copied()
+            .filter(|(_, t)| tab == 0 || *t == tab)
+            .map(|(it, _)| *it)
             .filter(|it| {
                 q.is_empty() || fold(&it.name()).contains(&q) || {
                     match it {
@@ -587,6 +752,11 @@ impl Inventory {
     fn click_creative(&mut self, size: (f32, f32), cursor: (f32, f32), right: bool, shift: bool) {
         let c = Creative::new(size.0, size.1);
         let (x, y) = cursor;
+        if let Some(t) = c.tab_at(x, y) {
+            self.tab = t;
+            self.scroll_row = 0;
+            return;
+        }
         // Poubelle : détruit l'objet tenu ; Maj + clic : vide tout l'inventaire.
         if Creative::inside(c.trash, c.slot, x, y) {
             if self.held.take().is_none() && shift {
@@ -781,6 +951,36 @@ impl Inventory {
             (format!("{}_", self.search), col([255, 255, 255], 1.0))
         };
         ui.text(sx + 2.0 * s, sy + 2.0 * s, s, tc, txt);
+        // Onglets (une recherche porte sur tout : aucun onglet en surbrillance).
+        let (tx, ty, tw, th) = c.tabs;
+        let ts = (s / 2.0).floor().max(1.0);
+        let (mx0, my0) = cursor.unwrap_or((-1.0, -1.0));
+        for (i, name) in TABS.iter().enumerate() {
+            let x = tx + i as f32 * tw;
+            let on = self.search.trim().is_empty() && self.tab == i;
+            let over = c.tab_at(mx0, my0) == Some(i);
+            let bg = if on {
+                col([235, 235, 240], 1.0)
+            } else if over {
+                col([170, 170, 182], 1.0)
+            } else {
+                col([120, 120, 130], 1.0)
+            };
+            ui.rect(x + ts, ty, tw - 2.0 * ts, th, bg);
+            let fg = if on {
+                col([30, 30, 36], 1.0)
+            } else {
+                col([245, 245, 250], 1.0)
+            };
+            let w = Ui::text_width(name, ts);
+            ui.text_flat(
+                x + (tw - w) / 2.0,
+                ty + (th - 7.0 * ts) / 2.0,
+                ts,
+                fg,
+                *name,
+            );
+        }
 
         let list = self.filtered();
         let (mx, my) = cursor.unwrap_or((-1.0, -1.0));
@@ -982,6 +1182,23 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
         )),
         // Baguette : image en pixels.
         Item::Wand => crate::wand::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s),
+        // Barrières (invisibles) : un panneau « interdit », rouge (bleu : à fluides).
+        Item::Block(b) if matches!(b.def().shape, minelib_world::registry::Shape::Invisible) => {
+            let c = if b.def().key == "fluid_barrier" {
+                col([60, 120, 230], 1.0)
+            } else {
+                col([210, 45, 40], 1.0)
+            };
+            let (cx, cy, r) = (x + slot / 2.0, y + slot / 2.0, 6.0 * s);
+            ui.rect(cx - r, cy - r, 2.0 * r, 2.0 * s, c);
+            ui.rect(cx - r, cy + r - 2.0 * s, 2.0 * r, 2.0 * s, c);
+            ui.rect(cx - r, cy - r, 2.0 * s, 2.0 * r, c);
+            ui.rect(cx + r - 2.0 * s, cy - r, 2.0 * s, 2.0 * r, c);
+            for k in 0..6 {
+                let t = k as f32 * 2.0 * s;
+                ui.rect(cx - r + t, cy - r + t, 2.0 * s, 2.0 * s, c);
+            }
+        }
         // Bloc : vrai modèle 3D, net à toutes les résolutions.
         Item::Block(b) => ui.model(crate::hand::block_icon(
             x + slot / 2.0,
@@ -1091,9 +1308,36 @@ mod tests {
 
     #[test]
     fn creative_catalogue_search_and_trash() {
-        let cat = catalogue();
+        let cat: Vec<Item> = catalogue().iter().map(|(i, _)| *i).collect();
         // Toutes les torches, et une seule entrée par famille (pas 8 escaliers par matériau).
         assert!(cat.contains(&Item::Torch(None)));
+        // Tous les blocs, barrières comprises ; chaque matériau suivi de ses escaliers et
+        // dalles ; les couleurs dans l'ordre (blanc, gris clair, gris, noir…).
+        let reg = minelib_world::registry::registry();
+        let at = |k: &str| {
+            let b = reg.by_key(k).unwrap();
+            cat.iter()
+                .position(|i| *i == Item::Block(b))
+                .unwrap_or(usize::MAX)
+        };
+        assert!(at("barrier") < cat.len() && at("fluid_barrier") < cat.len());
+        let slab = cat
+            .iter()
+            .position(|i| matches!(i, Item::Block(b) if b.def().key.starts_with("slab:planks_oak")))
+            .unwrap();
+        assert!(
+            at("planks_oak") < slab && slab < at("planks_oak") + 4,
+            "dalle près des planches"
+        );
+        assert!(at("wool_white") < at("wool_silver") && at("wool_silver") < at("wool_black"));
+        assert!(at("wool_pink") < at("carpet_white"), "laine, puis tapis");
+        let mut inv = Inventory::empty();
+        inv.tab = 2;
+        assert!(inv
+            .filtered()
+            .iter()
+            .all(|i| matches!(i, Item::Block(b) if b.def().key.contains('_') || b.def().key == "glass" || b.def().key == "pane")));
+        inv.tab = 0;
         let stairs = cat
             .iter()
             .filter(|i| matches!(i, Item::Block(b) if b.def().key.starts_with("stairs:planks_oak")))

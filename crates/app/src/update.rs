@@ -18,10 +18,49 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 
+/// Orange des messages « mise à jour disponible ».
+pub const ORANGE: [f32; 4] = [1.0, 0.55, 0.1, 1.0];
+
+/// Fichier tenu pendant une partie FPS en ligne (dans le dossier du jeu) : version et
+/// début. Le jeu ne se met pas à jour tant qu'il est là, le lanceur non plus (une partie
+/// commencée dans une version se finit dans cette version).
+pub const MATCH_LOCK: &str = "partie_en_cours.txt";
+/// Au-delà, le fichier est oublié (partie abandonnée).
+pub const MATCH_LOCK_TTL: u64 = 3 * 3600;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Partie en cours notée dans `root` : sa version.
+pub fn match_lock(root: &std::path::Path) -> Option<u32> {
+    let text = std::fs::read_to_string(root.join(MATCH_LOCK)).ok()?;
+    let get = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    let (v, t) = (get("version")?, get("debut")?);
+    (unix_now().saturating_sub(t) < MATCH_LOCK_TTL).then_some(v as u32)
+}
+
+pub fn write_match_lock(root: &std::path::Path) {
+    let _ = std::fs::write(
+        root.join(MATCH_LOCK),
+        format!("version={VERSION}\ndebut={}\n", unix_now()),
+    );
+}
+
+pub fn clear_match_lock(root: &std::path::Path) {
+    let _ = std::fs::remove_file(root.join(MATCH_LOCK));
+}
+
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 95;
+pub const VERSION: u32 = 96;
 const REPO: &str = "https://api.github.com/repos/Viendax/minelib/releases";
-const EVERY: Duration = Duration::from_secs(600);
+const EVERY: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
@@ -274,6 +313,8 @@ pub struct Updater {
     /// Résultat de la dernière vérification.
     pub check: Check,
     pub integrity: Integrity,
+    /// Partie FPS en ligne en cours dans cette version : pas de mise à jour avant sa fin.
+    pub hold: Option<u32>,
 }
 
 /// Ce que l'on sait de la version : pas encore vérifiée, à jour, ou impossible à vérifier.
@@ -331,6 +372,7 @@ impl Updater {
                 Check::Off
             },
             integrity: Integrity::Unknown,
+            hold: None,
         }
     }
 
@@ -374,7 +416,7 @@ impl Updater {
             Msg::Found(r) => {
                 log::info!("version {} disponible (ici {VERSION})", r.version);
                 self.available = Some(r);
-                if fresh {
+                if fresh && self.hold.is_none() {
                     self.start();
                 }
             }
@@ -414,6 +456,12 @@ impl Updater {
         if self.downloading {
             return;
         }
+        if let Some(v) = self.hold {
+            self.status = Some(format!(
+                "Partie en cours en version {v} : mise à jour après la fin de la partie."
+            ));
+            return;
+        }
         self.downloading = true;
         self.done.store(0, Ordering::Relaxed);
         self.status = Some(format!("Mise à jour vers la version {}…", r.version));
@@ -430,10 +478,16 @@ impl Updater {
 
     /// Ligne « version » à afficher (accueil, pause) et sa couleur.
     pub fn line(&self) -> (String, [f32; 4]) {
+        if let Some(v) = self.hold.filter(|&v| v == VERSION) {
+            return (
+                format!("Minelib v{v} - bonne version pour finir ta partie en cours"),
+                [0.4, 1.0, 0.4, 1.0],
+            );
+        }
         let (state, color) = match (&self.available, self.check) {
             (Some(r), _) => (
-                format!("version {} disponible", r.version),
-                [1.0, 0.8, 0.2, 1.0],
+                format!("mise à jour disponible : version {}", r.version),
+                ORANGE,
             ),
             (None, Check::UpToDate) => ("à jour".to_string(), [0.5, 1.0, 0.5, 1.0]),
             (None, Check::Pending) => ("vérification…".to_string(), [0.7, 0.7, 0.7, 1.0]),

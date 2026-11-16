@@ -159,6 +159,22 @@ fn bin_dir() -> PathBuf {
     home.join("bin")
 }
 
+/// Version d'une partie FPS en ligne en cours (fichier du jeu `partie_en_cours.txt`, à
+/// côté du dossier `bin`), si elle date de moins de 3 heures.
+fn match_lock(bin: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(bin.parent()?.join("partie_en_cours.txt")).ok()?;
+    let get = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    let (v, t) = (get("version")?, get("debut")?);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    (now.saturating_sub(t) < 3 * 3600).then_some(v as u32)
+}
+
 fn game_path(dir: &Path) -> PathBuf {
     dir.join(if cfg!(windows) {
         "minelib.exe"
@@ -308,7 +324,15 @@ struct State {
 fn work(state: Shared, proxy: EventLoopProxy<()>) {
     let dir = bin_dir();
     let have = installed(&dir);
-    let result = match plan(have, fetch_latest()) {
+    // Partie FPS en ligne commencée avec la version installée : on la garde jusqu'à la fin
+    // de la partie (une partie se finit dans la version où elle a commencé).
+    let held = have.is_some() && match_lock(&dir) == have;
+    let latest = if held {
+        Err("partie en cours".to_string())
+    } else {
+        fetch_latest()
+    };
+    let result = match plan(have, latest) {
         Plan::Download(r) => {
             state.lock().unwrap().phase = Phase::Downloading {
                 version: r.version,

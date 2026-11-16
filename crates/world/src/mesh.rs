@@ -1105,11 +1105,10 @@ fn mesh_block(
                         // Bannière : deux blocs de haut, elle pend dans la case du dessous
                         // (seul le bloc du haut a une hitbox, comme dans Minecraft).
                         let banner = def.key.starts_with("banner_");
-                        // Moitié du bas seulement dans le vide ou derrière du verre : dans
-                        // un bloc, on ne voit que le bloc (pas de scintillement).
+                        // Moitié du bas toujours, sauf dans un bloc plein (on n'y verrait
+                        // que le bloc, en scintillant).
                         let below = pad.get(x, y - 1, z);
-                        let banner_low =
-                            banner && (below == BlockId::AIR || below.def().translucent);
+                        let banner_low = banner && !below.is_opaque();
                         type Part = (([u8; 3], [u8; 3]), i32);
                         let parts: Vec<Part> = boxes
                             .iter()

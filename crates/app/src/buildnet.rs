@@ -41,6 +41,25 @@ use minelib_world::{BlockId, ChunkPos, World};
 
 /// Modifications acceptées par seconde et par joueur.
 const MAX_EDITS_PER_S: u32 = 20;
+/// Changements dus à l'écoulement de l'eau et de la lave (budget à part, plus large).
+const MAX_FLUID_EDITS_PER_S: u32 = 400;
+
+/// Changement que l'écoulement d'un fluide peut faire : fluide qui avance (dans le vide,
+/// une plante ou un fluide), qui sèche, ou qui se fige (obsidienne, pierre taillée, pierre).
+fn fluid_edit(old: BlockId, new: BlockId) -> bool {
+    use minelib_world::registry::{fluid, Shape};
+    let open = |b: BlockId| {
+        b == BlockId::AIR || fluid(b).is_some() || matches!(b.def().shape, Shape::Cross)
+    };
+    let set = |b: BlockId| {
+        b == BlockId::AIR
+            || fluid(b).is_some()
+            || b == BlockId::COBBLESTONE
+            || b == BlockId::STONE
+            || Some(b) == minelib_world::registry::registry().by_key("obsidian")
+    };
+    (fluid(new).is_some() && open(old)) || (fluid(old).is_some() && set(new))
+}
 /// Position envoyée 20 fois par seconde.
 const POS_EVERY: f32 = 0.05;
 /// Un joueur dont on n'a plus de nouvelles depuis ce temps n'est plus montré.
@@ -91,6 +110,7 @@ pub struct BuildNet {
     pos_timer: f32,
     /// Modifications acceptées par joueur dans la seconde en cours.
     rate: HashMap<u64, (Instant, u32)>,
+    fluid_rate: HashMap<u64, (Instant, u32)>,
     caps_sent: bool,
     pending: HashMap<[i32; 3], Pending>,
     shards: Shards,
@@ -199,6 +219,7 @@ impl BuildNet {
             chunk: None,
             pos_timer: 0.0,
             rate: HashMap::new(),
+            fluid_rate: HashMap::new(),
             caps_sent: false,
             pending: HashMap::new(),
             bulks: HashMap::new(),
@@ -466,7 +487,9 @@ impl BuildNet {
         match msg {
             BuildMsg::Edit { pos, block } => {
                 // Seul le garant reçoit les demandes ; un refus revient au seul demandeur.
-                if !self.validate(peer, chunk, pos, block) {
+                // Eau et lave qui coulent : beaucoup de blocs d'un coup, budget à part.
+                let fluid = fluid_edit(world.get(pos[0], pos[1], pos[2]), BlockId(block));
+                if !self.validate(peer, chunk, pos, block, fluid) {
                     self.send(Request::ToZone {
                         chunk,
                         data: game::encode(&BuildMsg::Reject { pos, peer }),
@@ -574,7 +597,14 @@ impl BuildNet {
 
     /// Vérification du garant : bloc connu, dans une de ses zones, dans le chunk annoncé,
     /// hauteur valide, débit raisonnable.
-    fn validate(&mut self, peer: u64, chunk: [i32; 2], pos: [i32; 3], block: u16) -> bool {
+    fn validate(
+        &mut self,
+        peer: u64,
+        chunk: [i32; 2],
+        pos: [i32; 3],
+        block: u16,
+        fluid: bool,
+    ) -> bool {
         if !self.garant_of(chunk)
             || chunk_of(pos[0], pos[2]) != chunk
             || !(0..minelib_world::CHUNK_HEIGHT as i32).contains(&pos[1])
@@ -583,12 +613,17 @@ impl BuildNet {
             return false;
         }
         let now = Instant::now();
-        let e = self.rate.entry(peer).or_insert((now, 0));
+        let (rate, max) = if fluid {
+            (&mut self.fluid_rate, MAX_FLUID_EDITS_PER_S)
+        } else {
+            (&mut self.rate, MAX_EDITS_PER_S)
+        };
+        let e = rate.entry(peer).or_insert((now, 0));
         if now.duration_since(e.0).as_secs_f32() >= 1.0 {
             *e = (now, 0);
         }
         e.1 += 1;
-        e.1 <= MAX_EDITS_PER_S
+        e.1 <= max
     }
 }
 
@@ -1057,16 +1092,38 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut b = BuildNet::new(tx, "G".into(), false);
         b.zones.insert([0, 0]);
-        assert!(b.validate(7, [1, 1], [20, 64, 20], 1));
-        assert!(!b.validate(7, [9, 9], [150, 64, 150], 1), "pas sa zone");
+        assert!(b.validate(7, [1, 1], [20, 64, 20], 1, false));
         assert!(
-            !b.validate(7, [1, 1], [0, 64, 0], 1),
+            !b.validate(7, [9, 9], [150, 64, 150], 1, false),
+            "pas sa zone"
+        );
+        assert!(
+            !b.validate(7, [1, 1], [0, 64, 0], 1, false),
             "pas le chunk annoncé"
         );
-        assert!(!b.validate(7, [1, 1], [20, 64, 20], 60000), "bloc inconnu");
+        assert!(
+            !b.validate(7, [1, 1], [20, 64, 20], 60000, false),
+            "bloc inconnu"
+        );
         let ok = (0..30)
-            .filter(|_| b.validate(8, [1, 1], [20, 64, 20], 1))
+            .filter(|_| b.validate(8, [1, 1], [20, 64, 20], 1, false))
             .count();
         assert_eq!(ok, MAX_EDITS_PER_S as usize, "20 par seconde au plus");
+        // L'eau qui coule a son propre budget, plus large.
+        let ok = (0..30)
+            .filter(|_| b.validate(8, [1, 1], [20, 64, 20], 1, true))
+            .count();
+        assert_eq!(ok, 30, "écoulement : pas limité à 20/s");
+        let water = minelib_world::registry::Fluid::Water;
+        assert!(fluid_edit(BlockId::AIR, water.block(7)));
+        assert!(fluid_edit(water.block(7), BlockId::AIR));
+        assert!(
+            !fluid_edit(BlockId::STONE, water.block(7)),
+            "l'eau ne casse pas la pierre"
+        );
+        assert!(
+            !fluid_edit(BlockId::AIR, BlockId::STONE),
+            "un bloc posé n'est pas de l'eau"
+        );
     }
 }

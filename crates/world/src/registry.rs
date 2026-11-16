@@ -1814,6 +1814,15 @@ fn fluids_and_heads(b: &mut Builder) {
         ..barrier
     });
     b.r.keys.insert("fluid_barrier".into(), id);
+    // Pot de fleurs : de la terre dans le pot (le dessus de la texture est un anneau,
+    // on voyait le sol à travers) ; nénuphar : on peut marcher dessus.
+    let dirt = b.tex(&p("dirt"));
+    if let Some(&i) = b.r.keys.get("flower_pot") {
+        b.r.defs[i as usize].tex[0] = dirt;
+    }
+    if let Some(&i) = b.r.keys.get("lily_pad") {
+        b.r.defs[i as usize].solid = true;
+    }
     // Têtes contre un mur (côté du mur : 0 +X, 1 −X, 4 +Z, 5 −Z).
     let skull = b.r.defs[b.r.keys["skull"] as usize].clone();
     for (side, min, max) in [

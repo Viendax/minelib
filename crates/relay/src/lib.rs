@@ -193,6 +193,12 @@ struct Conn {
     /// Lobby (n°), et lobbies qui l'ont invité.
     party: Option<u64>,
     invited: Vec<u64>,
+    /// Version du jeu (annoncée au bonjour, 0 : inconnue). Une partie FPS se joue entre
+    /// jeux de la même version, avec un garant de cette version.
+    version: u32,
+    /// Empreinte de la machine (connexion au compte) : une seule partie FPS à la fois par
+    /// machine.
+    hw: Vec<[u8; 32]>,
 }
 
 /// Région d'un monde servie par son propre relais.
@@ -212,6 +218,9 @@ struct Room {
     max_players: u32,
     host: u64,
     host_pseudo: String,
+    /// Version du jeu de l'hôte à l'ouverture (FPS : seuls les jeux de cette version
+    /// rejoignent).
+    version: u32,
     members: Vec<u64>,
     started: bool,
     map_sig: [u8; 32],
@@ -468,6 +477,8 @@ fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
                 arbitrating: None,
                 party: None,
                 invited: Vec::new(),
+                version: 0,
+                hw: Vec::new(),
             },
         );
         id
@@ -509,10 +520,9 @@ fn serve_loop(chan: &mut Channel, state: &Mutex<State>, peer: &str, id: u64) -> 
                 Request::Hello { protocol, client } if protocol == proto::PROTOCOL => {
                     hello = true;
                     let mut st = state.lock().unwrap();
-                    if client.starts_with("minelib-garant") {
-                        if let Some(c) = st.conns.get_mut(&id) {
-                            c.garant_only = true;
-                        }
+                    if let Some(c) = st.conns.get_mut(&id) {
+                        c.garant_only = client.starts_with("minelib-garant");
+                        c.version = proto::client_version(&client);
                     }
                     Some(Response::Hello {
                         protocol: proto::PROTOCOL,
@@ -740,12 +750,18 @@ fn switch_host(st: &mut State, room_id: u64, new: u64, stays: Option<u64>) {
             }
         }
     }
+    // Un garant qui reprend la partie reste anonyme pour les joueurs.
+    let shown = if was_hidden {
+        GARANT_NAME.to_string()
+    } else {
+        host_pseudo.clone()
+    };
     for m in members {
         if let Some(c) = st.conns.get(&m) {
             transport::push(
                 &c.tx,
                 &Response::HostChanged {
-                    host: host_pseudo.clone(),
+                    host: shown.clone(),
                 },
             );
         }
@@ -991,8 +1007,11 @@ fn garant_retiring(st: &State, g: u64) -> bool {
 /// Le garant disponible le plus adapté pour ces joueurs : d'abord un joueur qui vient de
 /// lancer sa propre partie (connexion de garant), sinon un joueur au menu.
 fn pick_garant(st: &State, players: &[String]) -> Option<u64> {
+    // Un garant rejoue la partie : il doit avoir la même version du jeu.
+    let want = players_version(st, players);
     st.conns
         .iter()
+        .filter(|(_, c)| c.version == want)
         .filter(|(&g, _)| garant_ok(st, g, players))
         .filter_map(|(&g, c)| {
             let cand = zones::Candidate {
@@ -1311,9 +1330,10 @@ fn build_garants_wanted(players: usize, active_zones: usize) -> usize {
 /// Le garant extérieur le plus adapté pour un monde de construction : la connexion de
 /// garant d'un joueur d'un autre serveur de construction d'abord, sinon d'une partie FPS.
 fn pick_build_garant(st: &State, players: &[String]) -> Option<u64> {
+    let want = players_version(st, players);
     st.conns
         .iter()
-        .filter(|(&g, c)| c.garant_only && garant_ok(st, g, players))
+        .filter(|(&g, c)| c.garant_only && c.version == want && garant_ok(st, g, players))
         .filter_map(|(&g, c)| {
             let p = c.pseudo.as_deref().unwrap_or_default();
             let own = own_room_kind(st, p)?;
@@ -1710,6 +1730,19 @@ fn try_apply_result(st: &mut State, room_id: u64) {
         }
     }
     room.applied = true;
+    // Statistiques impossibles (plus de têtes que d'éliminations, plus de dégâts que la
+    // vie de tous les adversaires…) : résultat faux, rien n'est compté.
+    let team = (room.max_players / 2).max(1);
+    if let Some((p, why)) = summary
+        .players
+        .iter()
+        .find_map(|p| stats::impossible(p, team).map(|w| (p.pseudo.clone(), w)))
+    {
+        log::warn!(
+            "partie {room_id} : résultat refusé, statistiques impossibles pour « {p} » ({why})"
+        );
+        return;
+    }
     let sig = room.map_sig;
     // Seules les parties à 5 contre 5 comptent pour le classement.
     let ranked = room.max_players == proto::FPS_PLAYERS as u32;
@@ -1744,6 +1777,17 @@ fn try_apply_result(st: &mut State, room_id: u64) {
     }
     if ranked && ranked_map {
         st.stats.apply_match(&summary);
+    }
+    // Statistiques invraisemblables (au-delà des records des meilleurs joueurs) : comme
+    // un soupçon du vérificateur, une fois par partie.
+    for p in &summary.players {
+        if let Some(why) = stats::implausible(p) {
+            let s = st.stats.get_mut(&p.pseudo);
+            s.odd_games += 1;
+            s.trust_by(stats::trust::ODD_STATS);
+            st.stats.save(&p.pseudo);
+            log::warn!("« {} » : statistiques invraisemblables ({why})", p.pseudo);
+        }
     }
     st.maps.played(&sig);
     log::info!(
@@ -1793,6 +1837,7 @@ fn open_room(
             max_players,
             host: id,
             host_pseudo: pseudo.to_string(),
+            version: st.conns.get(&id).map_or(0, |c| c.version),
             members: Vec::new(),
             started: false,
             map_sig,
@@ -1838,7 +1883,76 @@ fn open_room(
     rid
 }
 
+/// Une seule partie FPS à la fois par machine (coupé pour les essais où tous les joueurs
+/// simulés sont sur la même machine).
+pub static ONE_FPS_PER_MACHINE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Nom montré aux joueurs à la place du pseudo d'un garant (ceux qui servent les parties
+/// et les régions restent anonymes).
+const GARANT_NAME: &str = "garant";
+
+/// Autre joueur (autre compte) de cette machine dans une partie FPS en ligne (en attente
+/// ou commencée), s'il y en a un.
+fn fps_elsewhere_on_machine(st: &State, id: u64, pseudo: &str) -> Option<String> {
+    if !ONE_FPS_PER_MACHINE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let mine = &st.conns.get(&id)?.hw;
+    if mine.is_empty() {
+        return None;
+    }
+    st.conns.iter().find_map(|(&o, c)| {
+        let p = c.pseudo.as_deref()?;
+        let busy = o != id
+            && !c.garant_only
+            && !p.eq_ignore_ascii_case(pseudo)
+            && c.room
+                .and_then(|r| st.rooms.get(&r))
+                .is_some_and(|r| r.kind == 0 && !r.applied)
+            && minelib_net::hw::same_machine(&c.hw, mine);
+        busy.then(|| p.to_string())
+    })
+}
+
+/// Version du jeu des joueurs nommés (le premier trouvé) ; 0 : inconnue.
+fn players_version(st: &State, players: &[String]) -> u32 {
+    st.conns
+        .values()
+        .filter(|c| !c.garant_only)
+        .find(|c| {
+            c.pseudo
+                .as_deref()
+                .is_some_and(|p| players.iter().any(|q| q.eq_ignore_ascii_case(p)))
+        })
+        .map_or(0, |c| c.version)
+}
+
 fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
+    // FPS : même version du jeu que la partie, et une seule partie par machine.
+    let (kind, room_version) = match st.rooms.get(&room) {
+        Some(r) => (r.kind, r.version),
+        None => return err(ErrorCode::Refused, "Partie introuvable."),
+    };
+    if kind == 0 {
+        let me = st.conns.get(&id);
+        let version = me.map_or(0, |c| c.version);
+        if room_version != version {
+            return err(
+                ErrorCode::Refused,
+                format!(
+                    "Cette partie se joue en version {} (ton jeu : {version}).",
+                    room_version
+                ),
+            );
+        }
+        if let Some(p) = fps_elsewhere_on_machine(st, id, pseudo) {
+            return err(
+                ErrorCode::Refused,
+                format!("Une partie FPS est déjà en cours sur cet ordinateur (« {p} »)."),
+            );
+        }
+    }
     let Some(r) = st.rooms.get_mut(&room) else {
         return err(ErrorCode::Refused, "Partie introuvable.");
     };
@@ -1929,7 +2043,7 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
 /// (ou qui nous a signalés), avec une réputation proche : plus on est signalé (par partie
 /// jouée), plus on est mis avec des joueurs dans le même cas. Parmi celles-là, la plus
 /// proche en réputation, puis la plus remplie.
-fn find_room(st: &State, group: &[String], map_sig: [u8; 32]) -> Option<u64> {
+fn find_room(st: &State, group: &[String], map_sig: [u8; 32], version: u32) -> Option<u64> {
     let size = group.len().max(1);
     let stats_of = |p: &str| {
         st.stats
@@ -1952,7 +2066,7 @@ fn find_room(st: &State, group: &[String], map_sig: [u8; 32]) -> Option<u64> {
     // puis la partie la plus remplie.
     let mut best: Option<((i64, u8, i32, usize), u64)> = None;
     for (&rid, r) in &st.rooms {
-        if r.kind != 0 || r.started || r.map_sig != map_sig {
+        if r.kind != 0 || r.started || r.map_sig != map_sig || r.version != version {
             continue;
         }
         let n = r.player_count() + r.reserved_count();
@@ -2269,7 +2383,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 .filter(|(_, r)| r.kind == kind && !(kind == 0 && r.started))
                 .map(|(&rid, r)| proto::ServerEntry {
                     id: rid,
-                    host: r.host_pseudo.clone(),
+                    // Garant : jamais nommé aux joueurs.
+                    host: if r.garant_hosted {
+                        GARANT_NAME.to_string()
+                    } else {
+                        r.host_pseudo.clone()
+                    },
                     name: r.name.clone(),
                     map: r.map.clone(),
                     players: r.player_count() as u32,
@@ -2330,6 +2449,16 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     format!("« {p} » est en pleine partie : attends qu'il ait fini."),
                 ));
             }
+            // Une seule partie FPS à la fois par ordinateur (deux comptes sur une machine).
+            if let Some(p) = group.iter().find_map(|&m| {
+                let mp = st.conns.get(&m)?.pseudo.clone()?;
+                fps_elsewhere_on_machine(st, m, &mp)
+            }) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    format!("Une partie FPS est déjà en cours sur cet ordinateur (« {p} »)."),
+                ));
+            }
             for &m in &group {
                 leave_room(st, m);
             }
@@ -2353,7 +2482,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             if let (Some(rid), 1) = (unfinished, group.len()) {
                 return Some(join_room(st, id, pseudo, rid));
             }
-            let resp = match find_room(st, &names, map_sig) {
+            let version = st.conns.get(&id).map_or(0, |c| c.version);
+            let resp = match find_room(st, &names, map_sig, version) {
                 Some(room) => join_room(st, id, pseudo, room),
                 // Personne en attente : un garant indépendant ouvre la partie s'il y en a un.
                 None if pick_garant(st, &names).is_some() => {
@@ -2364,7 +2494,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         g,
                         &gp,
                         0,
-                        format!("Partie servie par {gp}"),
+                        "Partie servie par un garant".to_string(),
                         map.clone(),
                         map_sig,
                         players,
@@ -2605,13 +2735,25 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 proto::SERVER_WL_LIST => servers::Action::WhitelistList,
                 proto::SERVER_GAMEMODE => servers::Action::Gamemode,
                 proto::SERVER_DEFAULT_GAMEMODE => servers::Action::DefaultGamemode,
+                proto::SERVER_RENAME => servers::Action::Rename,
                 _ => servers::Action::List,
             };
+            // Nouveau nom : vide ou trop long refusé avant de vérifier qu'on est OP.
+            let new_name: String = reason.trim().chars().take(32).collect();
+            if act == servers::Action::Rename && new_name.is_empty() {
+                return Some(err(ErrorCode::Refused, "Nom vide."));
+            }
             match st
                 .servers
                 .act(&server, &creator, pseudo, act, &target, &reason)
             {
                 Ok(text) => {
+                    // Nom affiché dans la liste des serveurs.
+                    if act == servers::Action::Rename {
+                        if let Some(r) = st.rooms.get_mut(&rid) {
+                            r.name = new_name.clone();
+                        }
+                    }
                     // Mode de jeu : envoyé au joueur visé (soi-même sans pseudo).
                     if act == servers::Action::Gamemode {
                         let who = if target.is_empty() {
@@ -2720,6 +2862,39 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             st.stats.save(&target);
             log::info!("« {pseudo} » annule son signalement de « {target} »");
             Response::Done
+        }
+        // Garant vérificateur : en rejouant la partie, il a trouvé un script (bunny hop
+        // parfait, macro). Preuve faite sur les entrées mêmes du joueur : confiance à zéro ;
+        // une deuxième preuve trouvée par un autre garant : bannissement.
+        Request::CheatFound {
+            pseudo: target,
+            kind,
+            detail,
+        } => {
+            let rid = my_room?;
+            let room = st.rooms.get(&rid)?;
+            let in_roster = room.roster.iter().any(|p| p.eq_ignore_ascii_case(&target));
+            if !room.hidden.contains(&id) || room.host == id || !in_roster {
+                return None;
+            }
+            let by = pseudo.to_ascii_lowercase();
+            let s = st.stats.get_mut(&target);
+            if s.script_by.contains(&by) && s.scripts > 0 {
+                // Le même garant ne compte qu'une fois.
+                return None;
+            }
+            s.scripts += 1;
+            s.script_by.push(by);
+            s.trust_by(stats::trust::SCRIPT);
+            let distinct = s.script_by.len();
+            st.stats.save(&target);
+            log::warn!(
+                "« {target} » : triche prouvée par le garant « {pseudo} » ({kind} : {detail})"
+            );
+            if distinct >= 2 {
+                let _ = ban_cheater(st, &target, &format!("script ({detail})"));
+            }
+            return None;
         }
         Request::MatchResult { data } => {
             let Some(rid) = my_room else {
@@ -3300,6 +3475,7 @@ fn handle(
             | Request::Ban { .. }
             | Request::ServerAdmin { .. }
             | Request::MatchResult { .. }
+            | Request::CheatFound { .. }
             | Request::Leaderboard { .. }
             | Request::Friend { .. }
             | Request::Party { .. }
@@ -3446,6 +3622,9 @@ fn handle_account(
                     ErrorCode::Banned,
                     format!("Cette machine est bannie encore {days} jour(s)."),
                 );
+            }
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.hw = hw.clone();
             }
             st.hardware.seen(&record.pseudo, hw);
             // Appareil de confiance (code 2FA déjà donné sur cet appareil) : pas de 2FA.
@@ -3773,6 +3952,8 @@ mod tests {
     #[test]
     fn a_lobby_launches_together_and_stays_together() {
         let dir = std::env::temp_dir().join(format!("minelib-lobby-{}", rand::random::<u32>()));
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -3887,6 +4068,8 @@ mod tests {
     #[test]
     fn rooms_are_listed_joined_and_relay_game_data_both_ways() {
         let dir = std::env::temp_dir().join(format!("minelib-salles-{}", rand::random::<u32>()));
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -3980,6 +4163,8 @@ mod tests {
     #[test]
     fn search_never_pairs_a_player_with_someone_he_reported() {
         let dir = std::env::temp_dir().join(format!("minelib-recherche-{}", rand::random::<u32>()));
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4065,6 +4250,8 @@ mod tests {
     #[test]
     fn maps_are_stored_once_verified_and_downloaded() {
         let dir = std::env::temp_dir().join(format!("minelib-cartes-{}", rand::random::<u32>()));
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4139,6 +4326,8 @@ mod tests {
     #[test]
     fn a_ban_locks_the_account_forever_and_the_machine_for_three_months() {
         let dir = std::env::temp_dir().join(format!("minelib-ban-{}", rand::random::<u32>()));
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4196,6 +4385,8 @@ mod tests {
     #[test]
     fn build_server_ops_ban_and_the_creator_is_op_by_default() {
         let dir = std::env::temp_dir().join(format!("minelib-op-{}", rand::random::<u32>()));
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4306,6 +4497,8 @@ mod tests {
     fn an_account_moves_to_a_new_relay_with_its_kept_vault() {
         let mk = |n: &str| {
             let dir = std::env::temp_dir().join(format!("minelib-{n}-{}", rand::random::<u32>()));
+            // Tous les joueurs simulés sont sur cette machine.
+            ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
             let h = start(Config {
                 dir: dir.clone(),
                 bind: "127.0.0.1:0".into(),
@@ -4385,6 +4578,8 @@ mod tests {
             st.get_mut("Ailleurs").games = 5;
             st.save("Ailleurs");
         }
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4489,6 +4684,8 @@ mod tests {
     #[test]
     fn only_ops_send_bulk_edits_and_players_nearby_get_them() {
         let dir = std::env::temp_dir().join(format!("minelib-bulk-{}", rand::random::<u32>()));
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4598,6 +4795,8 @@ mod tests {
                 st.save(g);
             }
         }
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4669,6 +4868,8 @@ mod tests {
                 st.save(g);
             }
         }
+        // Tous les joueurs simulés sont sur cette machine.
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4807,7 +5008,8 @@ mod tests {
         }
         wait(&g, |e| matches!(e, Event::RoomClosed));
         match wait(&p, |e| matches!(e, Event::HostChanged(_))) {
-            Event::HostChanged(h) => assert_eq!(h, "Verif"),
+            // Le garant qui reprend reste anonyme pour les joueurs.
+            Event::HostChanged(h) => assert_eq!(h, GARANT_NAME),
             _ => unreachable!(),
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -4826,6 +5028,8 @@ mod tests {
                     st.save(g);
                 }
             }
+            // Tous les joueurs simulés sont sur cette machine.
+            ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
             let h = start(Config {
                 dir: dir.clone(),
                 bind: "127.0.0.1:0".into(),
@@ -4915,7 +5119,8 @@ mod tests {
                 wait(&v, |e| matches!(e, Event::Promoted { .. }));
                 wait(&g, |e| matches!(e, Event::RoomClosed));
                 match wait(&p, |e| matches!(e, Event::HostChanged(_))) {
-                    Event::HostChanged(h) => assert_eq!(h, "Verif"),
+                    // Le garant qui reprend reste anonyme pour les joueurs.
+                    Event::HostChanged(h) => assert_eq!(h, GARANT_NAME),
                     _ => unreachable!(),
                 }
             } else {

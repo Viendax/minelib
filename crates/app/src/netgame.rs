@@ -632,6 +632,10 @@ pub struct Auditor {
     cand0: Option<Player>,
     /// Bloc d'origine des portes que le vérificateur a changées dans son monde.
     door_orig: HashMap<[i32; 3], u16>,
+    /// Sauts des joueurs (scripts de bunny hop, macros).
+    hops: crate::anticheat::HopTracker,
+    /// Triches prouvées en rejouant (pseudo, preuve), à envoyer au relais.
+    pub cheats: Vec<(String, crate::anticheat::Finding)>,
 }
 
 /// Une demande vue par le relais doit apparaître au journal dans les copies qui suivent.
@@ -783,7 +787,11 @@ impl Auditor {
                         }
                         wrong.push(DEAD_MOVE);
                     }
+                    let before = p.on_ground;
                     step(p, world, input, dt);
+                    let jumped = before && !p.on_ground && p.vel.y > 0.0;
+                    self.hops
+                        .observe(who, t, input.jump_pressed, before, p.on_ground, jumped);
                     last_seq.insert(who, *seq);
                     *inputs.entry(who).or_insert(0) += 1;
                 }
@@ -791,7 +799,11 @@ impl Auditor {
                     let others = solid(&m, &players, &ready, 0);
                     let mut s = sim0.take().unwrap_or_else(|| player_from(state));
                     s.others = others.clone();
+                    let before = s.on_ground;
                     step(&mut s, world, input, dt);
+                    let jumped = before && !s.on_ground && s.vel.y > 0.0;
+                    self.hops
+                        .observe(0, t, input.jump_pressed, before, s.on_ground, jumped);
                     // Réapparition : l'hôte la prend à la fin de son image (quelques pas
                     // plus tard), en repartant du point d'apparition.
                     if let Some(c) = &cand0 {
@@ -1124,6 +1136,13 @@ impl Auditor {
         }
         for c in &out {
             log::warn!("vérificateur : {} (joueur {})", c.why, c.player);
+        }
+        // Scripts trouvés dans les sauts (preuve sur les entrées mêmes du joueur).
+        for (who, f) in self.hops.take_found() {
+            if let Some(p) = m.players.get(&who) {
+                log::warn!("vérificateur : « {} » : {}", p.pseudo, f.detail());
+                self.cheats.push((p.pseudo.clone(), f));
+            }
         }
         out
     }
@@ -1621,6 +1640,14 @@ impl NetGame {
         }
     }
 
+    /// Triches prouvées par le vérificateur en rejouant (à envoyer au relais).
+    pub fn take_cheats(&mut self) -> Vec<(String, crate::anticheat::Finding)> {
+        match self {
+            NetGame::Guest(g) => std::mem::take(&mut g.audit.cheats),
+            NetGame::Host(_) => Vec::new(),
+        }
+    }
+
     /// Fins de partie trouvées par le vérificateur (résultat à envoyer au relais).
     pub fn take_results(&mut self) -> Vec<MatchSummary> {
         match self {
@@ -1789,6 +1816,19 @@ impl NetGame {
         }
         local.yaw = yaw;
         local.pitch = pitch;
+    }
+
+    /// Phase de la partie (`game::phase`).
+    pub fn phase(&self) -> u8 {
+        match self {
+            NetGame::Host(h) => h.m.phase,
+            NetGame::Guest(g) => g.hud.phase,
+        }
+    }
+
+    /// Partie commencée (après l'échauffement) et pas encore finie.
+    pub fn in_progress(&self) -> bool {
+        !matches!(self.phase(), game::phase::WARMUP | game::phase::GAME_OVER)
     }
 
     /// Le joueur local ne peut pas bouger (départ de manche, pose ou désamorçage).
@@ -3716,6 +3756,8 @@ mod tests {
     #[test]
     fn guest_moves_on_the_host_and_shoots_it_through_the_relay() {
         let dir = std::env::temp_dir().join(format!("minelib-net-{}", rand_u32()));
+        // Tous les joueurs simulés sont sur cette machine.
+        minelib_relay::ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = minelib_relay::start(minelib_relay::Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -3898,6 +3940,8 @@ mod tests {
     #[test]
     fn the_backup_garant_takes_over_when_the_host_leaves() {
         let dir = std::env::temp_dir().join(format!("minelib-reprise-{}", rand_u32()));
+        // Tous les joueurs simulés sont sur cette machine.
+        minelib_relay::ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = minelib_relay::start(minelib_relay::Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -4077,6 +4121,8 @@ mod tests {
     #[test]
     fn ten_players_play_a_whole_match_and_the_auditor_agrees() {
         let dir = std::env::temp_dir().join(format!("minelib-dix-{}", rand_u32()));
+        // Tous les joueurs simulés sont sur cette machine.
+        minelib_relay::ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let relay = minelib_relay::start(minelib_relay::Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),

@@ -316,6 +316,13 @@ impl Garant {
             for s in net.take_results() {
                 cmds.push(Cmd::MatchResult(game::encode(&s)));
             }
+            for (pseudo, f) in net.take_cheats() {
+                cmds.push(Cmd::CheatFound {
+                    pseudo,
+                    kind: f.kind(),
+                    detail: f.detail(),
+                });
+            }
             for c in net.take_conflicts() {
                 log::warn!("garant : désaccord avec l'hôte sur le joueur {}", c.player);
                 cmds.push(Cmd::Conflict {

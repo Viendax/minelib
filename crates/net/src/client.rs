@@ -5,6 +5,10 @@
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+/// Version du jeu (numéro des versions publiées), annoncée au relais : il ne fait jouer
+/// ensemble que des jeux de la même version. Réglée par le jeu au démarrage.
+pub static GAME_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 use anyhow::{anyhow, Result};
 use ed25519_dalek::Signer;
 
@@ -95,6 +99,12 @@ pub enum Cmd {
         reason: String,
     },
     MatchResult(Vec<u8>),
+    /// Garant vérificateur : triche prouvée en rejouant (voir `Request::CheatFound`).
+    CheatFound {
+        pseudo: String,
+        kind: u8,
+        detail: String,
+    },
     Leaderboard {
         friends: bool,
     },
@@ -709,7 +719,11 @@ impl Worker {
         };
         chan.send(&Request::Hello {
             protocol: proto::PROTOCOL,
-            client: format!("{name} {}", env!("CARGO_PKG_VERSION")),
+            client: format!(
+                "{name} {} v{}",
+                env!("CARGO_PKG_VERSION"),
+                GAME_VERSION.load(std::sync::atomic::Ordering::Relaxed)
+            ),
         })?;
         self.emit(Event::Relay {
             addr: self.addr.clone(),
@@ -991,6 +1005,18 @@ impl Worker {
             }
             Cmd::GarantReady => {
                 self.oneway(&Request::GarantReady)?;
+                Ok(())
+            }
+            Cmd::CheatFound {
+                pseudo,
+                kind,
+                detail,
+            } => {
+                self.oneway(&Request::CheatFound {
+                    pseudo,
+                    kind,
+                    detail,
+                })?;
                 Ok(())
             }
             Cmd::Conflict {

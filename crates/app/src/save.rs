@@ -475,6 +475,7 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
     let reimported = old_import
         && match mcimport::import_world(dir) {
             Ok(imp) => {
+                mcimport::write_heads(dir, &imp.heads);
                 world.set_bases(imp.chunks);
                 let _ = write_chunks_bin(dir, &world);
                 if let Ok(mut f) = fs::OpenOptions::new()
@@ -549,6 +550,7 @@ fn read_chunks_bin(bin: &[u8]) -> HashMap<ChunkPos, Vec<u8>> {
 /// Convertit un monde Minecraft (lecture seule) en monde Minelib en mémoire.
 fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
     let imp = mcimport::import_world(dir)?;
+    mcimport::write_heads(dir, &imp.heads);
     let seed = imp.level.seed as u32;
     let mut world = World::new(seed);
     // Autour de la carte : plat pour un monde « superflat », vide sinon.

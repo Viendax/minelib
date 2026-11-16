@@ -97,8 +97,10 @@ impl ShardHost {
             .map_err(|e| log::warn!("relais de région : {e:#}"))
             .ok()?;
         let port = handle.addr.port();
+        // Hôte anonyme : joignable seulement par les relais d'iroh (pas d'adresse IP
+        // donnée aux joueurs de la région, ni directe ni de réseau local).
         let node = if p2p {
-            minelib_p2p::Node::start().ok()
+            minelib_p2p::Node::start_private().ok()
         } else {
             None
         };
@@ -110,7 +112,11 @@ impl ShardHost {
             &minelib_net::proto::Request::ShardReady {
                 region,
                 node: node.as_ref().map_or([0; 32], |n| n.id()),
-                addr: format!("{}:{port}", lan_ip()),
+                addr: if node.is_some() {
+                    String::new()
+                } else {
+                    format!("{}:{port}", lan_ip())
+                },
                 key: handle.public,
             },
         );

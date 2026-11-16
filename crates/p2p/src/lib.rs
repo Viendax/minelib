@@ -197,6 +197,17 @@ impl Node {
     /// l'autre il garde le même identifiant, et reconnaît donc ses propres annonces dans
     /// le DHT au lieu de les prendre pour le relais de quelqu'un d'autre.
     pub fn start_with(secret: Option<[u8; 32]>) -> Result<Self> {
+        Self::build(secret, false)
+    }
+
+    /// Nœud anonyme : joignable seulement par les serveurs relais d'iroh, jamais en direct.
+    /// Ceux qui s'y connectent ne voient pas son adresse IP (hôte d'une région d'un monde :
+    /// un joueur d'une autre partie qui doit rester anonyme pour les joueurs servis).
+    pub fn start_private() -> Result<Self> {
+        Self::build(None, true)
+    }
+
+    fn build(secret: Option<[u8; 32]>, private: bool) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("iroh")
@@ -208,6 +219,9 @@ impl Node {
                     iroh::Endpoint::builder(iroh::endpoint::presets::N0).alpns(vec![ALPN.to_vec()]);
                 if let Some(s) = secret {
                     b = b.secret_key(iroh::SecretKey::from_bytes(&s));
+                }
+                if private {
+                    b = b.clear_ip_transports();
                 }
                 b.bind().await
             })

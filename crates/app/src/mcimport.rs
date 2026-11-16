@@ -799,8 +799,9 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 
 /// Version du convertisseur : un monde converti par une version plus ancienne l'est de
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
-/// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales).
-pub const IMPORT_VERSION: u32 = 4;
+/// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales ; 5 : décors en entités
+/// d'affichage).
+pub const IMPORT_VERSION: u32 = 5;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {
@@ -1070,6 +1071,165 @@ fn map_legacy_id(id: u16) -> BlockId {
 pub struct Converted {
     pub chunk: Chunk,
     pub torches: Vec<[i32; 3]>,
+    /// Têtes à skin (lignes de `tetes.txt`).
+    pub heads: Vec<String>,
+}
+
+/// Fichier des têtes à skin d'un monde importé : une ligne `x,y,z,pose,empreinte` par
+/// tête (pose : rotation 0..15 au sol, `w0`/`w1`/`w4`/`w5` contre un mur ; empreinte de la
+/// texture sur textures.minecraft.net).
+pub const HEADS_FILE: &str = "tetes.txt";
+
+pub fn write_heads(dir: &Path, heads: &[String]) {
+    let mut t = heads.join("\n");
+    if !t.is_empty() {
+        t.push('\n');
+    }
+    let _ = fs::write(dir.join(HEADS_FILE), t);
+}
+
+/// Empreinte de la texture d'une tête (`profile` 1.20.5+, ou `SkullOwner` avant).
+fn head_texture(te: &Nbt) -> Option<String> {
+    let props = te
+        .path(&["profile", "properties"])
+        .or_else(|| te.path(&["SkullOwner", "Properties", "textures"]))?;
+    let value = props.as_list().iter().find_map(|p| {
+        p.get("value")
+            .or_else(|| p.get("Value"))
+            .and_then(Nbt::as_str)
+    })?;
+    let json = base64_decode(value)?;
+    let json = String::from_utf8_lossy(&json);
+    let url = json.split("\"url\"").nth(1)?;
+    let start = url.find("/texture/")? + "/texture/".len();
+    let hash: String = url[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    (hash.len() >= 32).then_some(hash)
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0);
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Propriétés d'état du bloc (format à palette) à la position `x`, `y`, `z` (Minecraft,
+/// dans le chunk).
+fn state_props(
+    level: &Nbt,
+    lx: usize,
+    y: i32,
+    lz: usize,
+    spanning: bool,
+) -> HashMap<String, String> {
+    let sections = level
+        .get("sections")
+        .or_else(|| level.get("Sections"))
+        .map(Nbt::as_list)
+        .unwrap_or(&[]);
+    let sy = y.div_euclid(16);
+    let Some(sec) = sections
+        .iter()
+        .find(|s| s.get("Y").and_then(Nbt::as_i64) == Some(sy as i64))
+    else {
+        return HashMap::new();
+    };
+    let (palette, states) = match sec.get("block_states") {
+        Some(bs) => (bs.get("palette"), bs.get("data")),
+        None => (sec.get("Palette"), sec.get("BlockStates")),
+    };
+    let pal = palette.map(Nbt::as_list).unwrap_or(&[]);
+    let i = y.rem_euclid(16) as usize * 256 + lz * 16 + lx;
+    let k = match states {
+        Some(Nbt::LongArray(d)) if pal.len() > 1 => packed(d, i, bits_for(pal.len()), spanning),
+        _ => 0,
+    };
+    match pal.get(k).and_then(|p| p.get("Properties")) {
+        Some(Nbt::Compound(m)) => m
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
+/// Têtes à skin du chunk (voir `HEADS_FILE`).
+fn read_heads(
+    level: &Nbt,
+    chunk: &Chunk,
+    cx: i32,
+    cz: i32,
+    y_offset: i32,
+    spanning: bool,
+) -> Vec<String> {
+    let list = level
+        .get("block_entities")
+        .or_else(|| level.get("TileEntities"))
+        .map(Nbt::as_list)
+        .unwrap_or(&[]);
+    let mut out = Vec::new();
+    for te in list {
+        let id = te.get("id").and_then(Nbt::as_str).unwrap_or("");
+        if !id.contains("skull") && !id.contains("head") {
+            continue;
+        }
+        let Some(hash) = head_texture(te) else {
+            continue;
+        };
+        let (Some(x), Some(y), Some(z)) = (
+            te.get("x").and_then(Nbt::as_i64),
+            te.get("y").and_then(Nbt::as_i64),
+            te.get("z").and_then(Nbt::as_i64),
+        ) else {
+            continue;
+        };
+        let (lx, lz) = (x as i32 - cx * 16, z as i32 - cz * 16);
+        let wy = y as i32 + y_offset;
+        if !(0..16).contains(&lx)
+            || !(0..16).contains(&lz)
+            || !(0..CHUNK_HEIGHT as i32).contains(&wy)
+        {
+            continue;
+        }
+        let key = &chunk.get(lx as usize, wy as usize, lz as usize).def().key;
+        let pose = if let Some(side) = key.strip_prefix("skull:wall:") {
+            format!("w{side}")
+        } else if key == "skull" {
+            state_props(level, lx as usize, y as i32, lz as usize, spanning)
+                .get("rotation")
+                .and_then(|r| r.parse::<u8>().ok())
+                .unwrap_or(0)
+                .to_string()
+        } else {
+            continue;
+        };
+        out.push(format!("{x},{wy},{z},{pose},{hash}"));
+    }
+    out
 }
 
 /// Valeur `i` d'un tableau compacté de `bits` bits par entrée.
@@ -1209,7 +1369,12 @@ pub fn convert_chunk(root: &Nbt, y_offset: i32) -> Result<Converted> {
     }
     fix_upper_halves(&mut chunk);
     color_banners(&mut chunk, level, x, z, y_offset);
-    Ok(Converted { chunk, torches })
+    let heads = read_heads(level, &chunk, x, z, y_offset, data_version < 2529);
+    Ok(Converted {
+        chunk,
+        torches,
+        heads,
+    })
 }
 
 /// Moitiés hautes des portes et plantes doubles : leur forme vient du bloc du dessous.
@@ -1314,12 +1479,217 @@ pub fn read_region(bytes: &[u8]) -> Vec<Nbt> {
     out
 }
 
+/// Entités d'affichage (`block_display`, `item_display`, avec leurs passagers) du dossier
+/// `entities/` : chaque bloc affiché remplit les cases dont le centre est dans sa boîte
+/// (position, rotation de l'entité, puis translation, rotation gauche, échelle, rotation
+/// droite). Seulement dans le vide ou une barrière (un bloc solide y remplace la barrière,
+/// qui servait de collision au décor). Les plaques trop fines (moins d'une demi-case) ne
+/// couvrent aucun centre de case et sont laissées. Renvoie le nombre de blocs posés.
+fn import_displays(dir: &Path, y_offset: i32, chunks: &mut HashMap<ChunkPos, Chunk>) -> usize {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut files: Vec<_> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "mca"))
+        .collect();
+    files.sort();
+    let mut placed = Vec::new();
+    for f in files {
+        let Ok(bytes) = fs::read(&f) else { continue };
+        for root in read_region(&bytes) {
+            for e in root.get("Entities").map(Nbt::as_list).unwrap_or(&[]) {
+                display_cells(e, None, y_offset, &mut placed);
+            }
+        }
+    }
+    let mut n = 0;
+    for (p, b, thin) in placed {
+        let pos = ChunkPos::containing(p[0], p[2]);
+        let Some(c) = chunks.get_mut(&pos) else {
+            continue;
+        };
+        if !(0..CHUNK_HEIGHT as i32).contains(&p[1]) {
+            continue;
+        }
+        let (lx, lz) = (p[0].rem_euclid(16) as usize, p[2].rem_euclid(16) as usize);
+        let cur = c.get(lx, p[1] as usize, lz);
+        let free = (cur == BlockId::AIR && !thin) || (cur == BlockId::BARRIER && b.is_solid());
+        if free {
+            c.set(lx, p[1] as usize, lz, b);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Cases couvertes par une entité d'affichage (et ses passagers).
+fn display_cells(
+    e: &Nbt,
+    vehicle: Option<[f64; 3]>,
+    y_offset: i32,
+    out: &mut Vec<([i32; 3], BlockId, bool)>,
+) {
+    use glam::{Mat4, Quat, Vec3};
+    let list = |k: &str| -> Vec<f64> {
+        e.get(k)
+            .map(Nbt::as_list)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(Nbt::as_f64)
+            .collect()
+    };
+    let pos = match list("Pos").as_slice() {
+        [x, y, z] => [*x, *y, *z],
+        _ => match vehicle {
+            Some(v) => v,
+            None => return,
+        },
+    };
+    for p in e.get("Passengers").map(Nbt::as_list).unwrap_or(&[]) {
+        display_cells(p, Some(pos), y_offset, out);
+    }
+    let id = e.get("id").and_then(Nbt::as_str).unwrap_or("");
+    let (block, centered) = match id {
+        "minecraft:block_display" => {
+            let Some(bs) = e.get("block_state") else {
+                return;
+            };
+            let name = bs
+                .get("Name")
+                .and_then(Nbt::as_str)
+                .unwrap_or("minecraft:air");
+            let mut props = HashMap::new();
+            if let Some(Nbt::Compound(m)) = bs.get("Properties") {
+                for (k, v) in m {
+                    if let Some(v) = v.as_str() {
+                        props.insert(k.clone(), v.to_string());
+                    }
+                }
+            }
+            (map_block_state(name, &props), false)
+        }
+        "minecraft:item_display" => {
+            let item = e.path(&["item", "id"]).and_then(Nbt::as_str).unwrap_or("");
+            let b = map_block_state(item, &HashMap::new());
+            // Objet qui n'est pas un bloc (casque, épée…) : le repli « pierre » de la table.
+            if b == BlockId::STONE && !item.contains("stone") {
+                return;
+            }
+            (b, true)
+        }
+        _ => return,
+    };
+    if block == BlockId::AIR {
+        return;
+    }
+    let f3 = |v: &[f64], d: f32| -> Vec3 {
+        match v {
+            [x, y, z, ..] => Vec3::new(*x as f32, *y as f32, *z as f32),
+            _ => Vec3::splat(d),
+        }
+    };
+    let quat = |v: &[f64]| -> Quat {
+        match v {
+            [x, y, z, w] => Quat::from_xyzw(*x as f32, *y as f32, *z as f32, *w as f32).normalize(),
+            _ => Quat::IDENTITY,
+        }
+    };
+    let t = |k: &str| -> Vec<f64> {
+        e.path(&["transformation", k])
+            .map(Nbt::as_list)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(Nbt::as_f64)
+            .collect()
+    };
+    let rot = list("Rotation");
+    let (yaw, pitch) = match rot.as_slice() {
+        [y, p] => (*y as f32, *p as f32),
+        _ => (0.0, 0.0),
+    };
+    let entity =
+        Quat::from_rotation_y((-yaw).to_radians()) * Quat::from_rotation_x(pitch.to_radians());
+    let origin = Vec3::new(
+        pos[0] as f32,
+        pos[1] as f32 + y_offset as f32,
+        pos[2] as f32,
+    );
+    let m = Mat4::from_translation(origin)
+        * Mat4::from_quat(entity)
+        * Mat4::from_translation(f3(&t("translation"), 0.0))
+        * Mat4::from_quat(quat(&t("left_rotation")))
+        * Mat4::from_scale(f3(&t("scale"), 1.0))
+        * Mat4::from_quat(quat(&t("right_rotation")));
+    if m.determinant().abs() < 1e-6 {
+        return;
+    }
+    let (lo, hi) = if centered { (-0.5, 0.5) } else { (0.0, 1.0) };
+    let corners = (0..8).map(|i| {
+        m.transform_point3(Vec3::new(
+            if i & 1 == 0 { lo } else { hi },
+            if i & 2 == 0 { lo } else { hi },
+            if i & 4 == 0 { lo } else { hi },
+        ))
+    });
+    let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for c in corners {
+        mn = mn.min(c);
+        mx = mx.max(c);
+    }
+    // Garde-fou : un décor géant mal lu ne remplit pas la carte.
+    if (mx - mn).max_element() > 16.0 {
+        return;
+    }
+    let inv = m.inverse();
+    let eps = 1e-3;
+    // Épaisseur de moins d'une demi-case dans un sens : plaque fine (panneau, affiche).
+    let len = |i: usize| m.col(i).truncate().length() * (hi - lo);
+    let thin = (0..3).any(|i| len(i) < 0.5);
+    let before = out.len();
+    for x in mn.x.floor() as i32..=mx.x.floor() as i32 {
+        for y in mn.y.floor() as i32..=mx.y.floor() as i32 {
+            for z in mn.z.floor() as i32..=mx.z.floor() as i32 {
+                let l =
+                    inv.transform_point3(Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5));
+                if !thin
+                    && l.cmpge(Vec3::splat(lo - eps)).all()
+                    && l.cmple(Vec3::splat(hi + eps)).all()
+                {
+                    out.push(([x, y, z], block, false));
+                }
+            }
+        }
+    }
+    // Plaque fine (panneau, affiche) qui ne couvre aucun centre de case : les cases
+    // qu'elle traverse, seulement là où la carte a mis une barrière (sa collision).
+    if out.len() == before {
+        let n = |i: usize| ((len(i) / 0.3).ceil() as usize).clamp(1, 64);
+        let (nx, ny, nz) = (n(0), n(1), n(2));
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..nx {
+            for j in 0..ny {
+                for k in 0..nz {
+                    let f = |c: usize, n: usize| lo + (hi - lo) * (c as f32 + 0.5) / n as f32;
+                    let w = m.transform_point3(Vec3::new(f(i, nx), f(j, ny), f(k, nz)));
+                    let c = [w.x.floor() as i32, w.y.floor() as i32, w.z.floor() as i32];
+                    if seen.insert(c) {
+                        out.push((c, block, true));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Monde Minecraft converti en mémoire.
 pub struct Import {
     pub level: McLevel,
     pub y_offset: i32,
     pub chunks: HashMap<ChunkPos, Vec<u8>>,
     pub torches: Vec<[i32; 3]>,
+    pub heads: Vec<String>,
 }
 
 /// Convertit tout le dossier `region/` (dimension principale).
@@ -1327,8 +1697,9 @@ pub fn import_world(dir: &Path) -> Result<Import> {
     let level = read_level(dir)?;
     // 1.18 (21w37a) a abaissé le bas du monde à Y = −64.
     let y_offset = if level.data_version >= 2825 { 64 } else { 0 };
-    let mut chunks = HashMap::new();
+    let mut built: HashMap<ChunkPos, Chunk> = HashMap::new();
     let mut torches = Vec::new();
+    let mut heads = Vec::new();
     let mut skipped = 0;
     let mut files: Vec<_> = fs::read_dir(dir.join("region"))?
         .flatten()
@@ -1367,23 +1738,34 @@ pub fn import_world(dir: &Path) -> Result<Import> {
             match convert_chunk(&nbt, y_offset) {
                 Ok(c) => {
                     torches.extend(c.torches);
-                    chunks.insert(c.chunk.pos, c.chunk.to_rle());
+                    heads.extend(c.heads);
+                    built.insert(c.chunk.pos, c.chunk);
                 }
                 Err(_) => skipped += 1,
             }
         }
     }
+    // Décors faits d'entités d'affichage (1.19.4+) : blocs et objets posés dans le vide ou
+    // dans des barrières (qui en font la collision).
+    let shown = import_displays(&dir.join("entities"), y_offset, &mut built);
+    if shown > 0 {
+        log::info!("{shown} blocs d'entités d'affichage ajoutés");
+    }
+    let chunks: HashMap<ChunkPos, Vec<u8>> =
+        built.into_iter().map(|(p, c)| (p, c.to_rle())).collect();
     log::info!(
         "monde Minecraft « {} » : {} chunks convertis, {} ignorés",
         level.name,
         chunks.len(),
         skipped
     );
+    heads.sort();
     Ok(Import {
         level,
         y_offset,
         chunks,
         torches,
+        heads,
     })
 }
 
@@ -1464,6 +1846,81 @@ pub mod tests {
 
     fn block(name: &str) -> Nbt {
         compound(vec![("Name", Nbt::String(name.into()))])
+    }
+
+    #[test]
+    fn display_entities_fill_the_cells_they_show() {
+        let d = |v: &[f64]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
+        let f = |v: &[f64]| Nbt::List(v.iter().map(|&x| Nbt::Float(x as f32)).collect());
+        let shown = |name: &str, pos: &[f64], tr: &[f64], scale: &[f64]| {
+            compound(vec![
+                ("id", Nbt::String("minecraft:block_display".into())),
+                ("Pos", d(pos)),
+                ("block_state", block(name)),
+                (
+                    "transformation",
+                    compound(vec![
+                        ("translation", f(tr)),
+                        ("scale", f(scale)),
+                        ("left_rotation", f(&[0.0, 0.0, 0.0, 1.0])),
+                        ("right_rotation", f(&[0.0, 0.0, 0.0, 1.0])),
+                    ]),
+                ),
+            ])
+        };
+        // Un bloc centré sur sa position, et un véhicule « air » qui porte un pavé de 2×1×1.
+        let mut out = Vec::new();
+        display_cells(
+            &shown(
+                "minecraft:white_concrete",
+                &[10.5, 70.5, 10.5],
+                &[-0.5, -0.5, -0.5],
+                &[1.0, 1.0, 1.0],
+            ),
+            None,
+            64,
+            &mut out,
+        );
+        let mut carrier = shown(
+            "minecraft:air",
+            &[3.0, 70.0, 3.0],
+            &[0.0, 0.0, 0.0],
+            &[1.0, 1.0, 1.0],
+        );
+        if let Nbt::Compound(m) = &mut carrier {
+            m.insert(
+                "Passengers".into(),
+                Nbt::List(vec![shown(
+                    "minecraft:quartz_block",
+                    &[3.0, 70.0, 3.0],
+                    &[0.0, 0.0, 0.0],
+                    &[2.0, 1.0, 1.0],
+                )]),
+            );
+        }
+        display_cells(&carrier, None, 64, &mut out);
+        // Plaque fine : seulement dans une barrière.
+        display_cells(
+            &shown(
+                "minecraft:yellow_concrete",
+                &[20.0, 70.0, 20.0],
+                &[0.0, 0.0, 0.5],
+                &[1.0, 1.0, 0.05],
+            ),
+            None,
+            64,
+            &mut out,
+        );
+        let at = |p: [i32; 3]| {
+            out.iter()
+                .find(|c| c.0 == p)
+                .map(|c| (c.1.def().key.clone(), c.2))
+        };
+        assert_eq!(at([10, 134, 10]), Some(("concrete_white".into(), false)));
+        assert_eq!(at([3, 134, 3]), Some(("quartz".into(), false)));
+        assert_eq!(at([4, 134, 3]), Some(("quartz".into(), false)));
+        assert_eq!(at([20, 134, 20]), Some(("concrete_yellow".into(), true)));
+        assert_eq!(out.len(), 4, "{out:?}");
     }
 
     /// Chunk 1.18+ : sol de pierre à Y = −64..−49, herbe à Y = 64, torche à Y = 65 en (3, 4).
@@ -1769,6 +2226,64 @@ mod dump_tests {
         v.sort_by_key(|x| std::cmp::Reverse(x.1));
         for (k, n) in v {
             eprintln!("{n:6} {k}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod dump_displays {
+    use super::*;
+
+    /// Blocs d'entités d'affichage d'un dossier `entities/` (`MC_ENTITIES`).
+    #[test]
+    #[ignore]
+    fn displays() {
+        let Some(dir) = std::env::var_os("MC_ENTITIES") else {
+            return;
+        };
+        let mut out = Vec::new();
+        for f in fs::read_dir(dir).unwrap().flatten() {
+            let bytes = fs::read(f.path()).unwrap();
+            for root in read_region(&bytes) {
+                for e in root.get("Entities").map(Nbt::as_list).unwrap_or(&[]) {
+                    display_cells(e, None, 64, &mut out);
+                }
+            }
+        }
+        // Têtes à skin des régions voisines (`MC_REGIONS`).
+        if let Some(rdir) = std::env::var_os("MC_REGIONS") {
+            let mut heads = Vec::new();
+            for f in fs::read_dir(rdir).unwrap().flatten() {
+                let bytes = fs::read(f.path()).unwrap();
+                for root in read_region(&bytes) {
+                    if let Ok(c) = convert_chunk(&root, 64) {
+                        heads.extend(c.heads);
+                    }
+                }
+            }
+            println!(
+                "{} têtes, ex. {:?}",
+                heads.len(),
+                &heads[..heads.len().min(3)]
+            );
+            let poses: HashMap<String, usize> = heads.iter().fold(HashMap::new(), |mut m, h| {
+                *m.entry(h.split(',').nth(3).unwrap().to_string())
+                    .or_default() += 1;
+                m
+            });
+            println!("poses {poses:?}");
+        }
+        let mut count: HashMap<String, usize> = HashMap::new();
+        for (_, b, _) in &out {
+            *count.entry(b.def().key.clone()).or_default() += 1;
+        }
+        println!("{} cases : {count:?}", out.len());
+        for (p, b, _t) in &out {
+            if (p[0] == -33 && p[2] == -230)
+                || ((4..=7).contains(&p[0]) && (-218..=-216).contains(&p[2]))
+            {
+                println!("{p:?} {} {_t}", b.def().key);
+            }
         }
     }
 }

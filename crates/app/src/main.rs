@@ -39,6 +39,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod account;
+mod anticheat;
 mod audio;
 mod buildnet;
 mod chat;
@@ -53,6 +54,7 @@ mod garant_worker;
 mod gpu_plan;
 mod gpu_report;
 mod hand;
+mod heads;
 mod i18n;
 mod inventory;
 mod jobs;
@@ -157,6 +159,11 @@ struct Game {
     fps_status: Option<String>,
     /// Mise à jour automatique (GitHub).
     updater: update::Updater,
+    /// À l'image d'avant, on jouait (écran de jeu).
+    was_playing: bool,
+    /// Recherche dans la liste des serveurs, et dans celle des mondes solo.
+    server_search: multiplayer::ListSearch,
+    world_search: multiplayer::ListSearch,
     /// Garant indépendant (au menu : sert ou vérifie la partie d'autres joueurs).
     garant: Option<garant::Garant>,
     /// Garant pendant qu'on joue sa propre partie FPS (deuxième connexion, son propre fil),
@@ -291,6 +298,9 @@ impl Game {
             pending_build: None,
             fps_status: None,
             updater: update::Updater::new(),
+            was_playing: false,
+            server_search: Default::default(),
+            world_search: Default::default(),
             garant: None,
             garant_worker: None,
             garant_worker_tried: false,
@@ -356,6 +366,8 @@ impl Game {
             // et que le jeu se charge (fenêtre cachée) : on arrive dans le jeu déjà connecté.
             g.accounts.poll();
             g.shared_maps = load_shared(&g.paths.root);
+            // Partie FPS en ligne laissée en cours : on garde cette version pour la finir.
+            g.updater.hold = update::match_lock(&g.paths.root);
             g.my_skin = std::fs::read(g.paths.root.join("skin.png"))
                 .ok()
                 .and_then(|b| skin::Skin::from_png(&b).ok());
@@ -575,20 +587,21 @@ impl Game {
         // Version et état (à jour, mise à jour disponible…), bien lisible.
         let (line, color) = self.updater.line();
         c.ui.text(4.0 * s, c.h - 12.0 * s, s, color, line);
-        // Nouvelle version publiée : bouton en haut à gauche.
+        // Nouvelle version publiée : bouton tout en bas à gauche, au-dessus de la version
+        // (pas pendant une partie en cours dans cette version).
         let mut do_update = false;
-        if let Some(r) = &self.updater.available {
+        if let (Some(r), None) = (&self.updater.available, self.updater.hold) {
             let label = format!("Mettre à jour (v{})", r.version);
             do_update = c.button(
                 &label,
-                6.0 * s + 60.0 * s,
-                6.0 * s,
-                120.0,
+                4.0 * s + 70.0 * s,
+                c.h - 38.0 * s,
+                140.0,
                 !self.updater.busy(),
             );
         }
         if let Some(t) = &self.updater.status {
-            c.ui.text(6.0 * s, 30.0 * s, ds, GOLD, t.clone());
+            c.ui.text(4.0 * s, c.h - 50.0 * s, ds, update::ORANGE, t.clone());
         }
         let credit = "Textures : VoxelArt Libre (CC BY 4.0 / CC0) - voir CREDITS.txt";
         let tw = Ui::text_width(credit, ds);
@@ -1293,6 +1306,16 @@ impl Game {
                     add: true,
                 });
             }
+            // En ligne, on joue dans la dernière version (une partie en cours se finit dans
+            // la sienne).
+            multiplayer::FpsAction::Search(_)
+                if self.updater.available.is_some() && self.updater.hold.is_none() =>
+            {
+                let v = self.updater.available.as_ref().map_or(0, |r| r.version);
+                self.fps_status = Some(format!(
+                    "Version {v} disponible : mets le jeu à jour (accueil) pour jouer en ligne."
+                ));
+            }
             multiplayer::FpsAction::Search(i) => {
                 // On va jouer : plus garant (le relais fait reprendre la partie servie).
                 self.garant = None;
@@ -1657,9 +1680,17 @@ impl Game {
                 region: e.region.clone(),
             })
             .collect();
+        let time = self.time;
         let mut c = Ctx::new(&mut self.ui, input, size);
-        let action =
-            multiplayer::list_screen(&mut c, kind, &self.servers, &mut self.server_selected);
+        let action = multiplayer::list_screen(
+            &mut c,
+            input,
+            kind,
+            &self.servers,
+            &mut self.server_selected,
+            &mut self.server_search,
+            time,
+        );
         match action {
             multiplayer::Action::Refresh => self.accounts.refresh_servers(kind as u8),
             multiplayer::Action::Join(i) => {
@@ -1687,7 +1718,34 @@ impl Game {
         c.text_center("Mondes", 12.0 * s, s * 2.0, WHITE);
         let list_w = 260.0 * s;
         let list_x = (c.w - list_w) / 2.0;
-        let list_y = 36.0 * s;
+        // Recherche par nom, en haut de la liste.
+        if c.text_field(
+            "",
+            &self.world_search.text,
+            "rechercher un monde",
+            list_x + list_w / 2.0,
+            30.0 * s,
+            list_w / s,
+            self.world_search.focus,
+            time,
+        ) {
+            self.world_search.focus = true;
+        } else if c.click {
+            self.world_search.focus = false;
+        }
+        if self.world_search.focus {
+            menu::edit_text(&mut self.world_search.text, input, 32);
+        }
+        let query = self.world_search.text.trim().to_lowercase();
+        let shown: Vec<usize> = (0..self.worlds.len())
+            .filter(|&i| {
+                query.is_empty() || self.worlds[i].meta.name.to_lowercase().contains(&query)
+            })
+            .collect();
+        if self.selected_world.is_some_and(|k| !shown.contains(&k)) {
+            self.selected_world = None;
+        }
+        let list_y = 50.0 * s;
         let row_h = 26.0 * s;
         let bottom = c.h - 54.0 * s;
         let list_h = (bottom - list_y).max(row_h);
@@ -1703,20 +1761,21 @@ impl Game {
                 GREY,
             );
         }
-        if input.scroll.abs() >= 1.0 && self.worlds.len() > visible {
-            let max = self.worlds.len() - visible;
+        self.world_scroll = self.world_scroll.min(shown.len().saturating_sub(visible));
+        if input.scroll.abs() >= 1.0 && shown.len() > visible {
+            let max = shown.len() - visible;
             let d = -input.scroll.signum() as i32;
             self.world_scroll = (self.world_scroll as i32 + d).clamp(0, max as i32) as usize;
         }
         let mut clicked = None;
-        for (k, w) in self
-            .worlds
+        for (row, &k) in shown
             .iter()
             .enumerate()
             .skip(self.world_scroll)
             .take(visible)
         {
-            let y = list_y + 2.0 * s + (k - self.world_scroll) as f32 * row_h;
+            let w = &self.worlds[k];
+            let y = list_y + 2.0 * s + (row - self.world_scroll) as f32 * row_h;
             let detail = if w.minecraft {
                 "Monde Minecraft   -   converti au lancement (originaux conservés)".to_string()
             } else {
@@ -2797,6 +2856,19 @@ impl GameLoop for Game {
         self.skin_upkeep();
         self.maps_upkeep();
         self.updater.poll(!self.played);
+        // Partie FPS en ligne commencée : notée (pas de mise à jour, ni par le jeu ni par
+        // le lanceur, avant sa fin) ; finie : oubliée.
+        if let Some(n) = self.session.as_ref().and_then(|s| s.net.as_ref()) {
+            if n.in_progress() && self.updater.hold.is_none() {
+                update::write_match_lock(&self.paths.root);
+                self.updater.hold = Some(update::VERSION);
+            } else if n.phase() == minelib_net::game::phase::GAME_OVER
+                && self.updater.hold.is_some()
+            {
+                update::clear_match_lock(&self.paths.root);
+                self.updater.hold = None;
+            }
+        }
         self.garant_update(dt);
 
         // Échap : pause / reprise / fermeture de l'inventaire.
@@ -2849,6 +2921,15 @@ impl GameLoop for Game {
             }
         }
 
+        // Arrivée en jeu (Jouer, Reprendre, rejoindre un serveur…) : le clic qui y mène ne
+        // pose ni ne casse de bloc, la souris compte de nouveau une fois relâchée.
+        let playing = self.screen == Screen::Playing;
+        if playing && !self.was_playing {
+            if let Some(s) = &mut self.session {
+                s.keys.mouse_muted = true;
+            }
+        }
+        self.was_playing = playing;
         let in_world = self.session.is_some()
             && matches!(
                 self.screen,
@@ -3139,6 +3220,8 @@ pub static NvOptimusEnablement: u32 = 1;
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 
 fn main() -> anyhow::Result<()> {
+    // Version annoncée au relais (parties FPS entre jeux de la même version).
+    minelib_net::client::GAME_VERSION.store(update::VERSION, std::sync::atomic::Ordering::Relaxed);
     // Processus de bilan des cartes graphiques (lancé par le jeu, voir `gpu_report`).
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|a| a == "--bilan-gpu") {

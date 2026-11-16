@@ -151,6 +151,14 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
             Some(format!("{},{},{},{},0{inf}", v[0], v[1], v[2], v[3]))
         })
         .collect();
+    // Têtes à skin (carte importée) : avec les torches, préfixées « tete, ».
+    torches.extend(
+        fs::read_to_string(dir.join(crate::mcimport::HEADS_FILE))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| format!("tete,{}", l.trim())),
+    );
     torches.sort();
     torches.dedup();
     Ok(MapPackage {
@@ -170,18 +178,25 @@ pub struct SigCache {
 }
 
 fn stamp(dir: &Path) -> u64 {
-    ["level.txt", "edits.bin", "chunks.bin", "torches.txt", FILE]
-        .iter()
-        .filter_map(|f| fs::metadata(dir.join(f)).ok())
-        .map(|m| {
-            let t = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_millis() as u64);
-            t ^ m.len().rotate_left(17)
-        })
-        .fold(0u64, |a, b| a.rotate_left(7) ^ b)
+    [
+        "level.txt",
+        "edits.bin",
+        "chunks.bin",
+        "torches.txt",
+        crate::mcimport::HEADS_FILE,
+        FILE,
+    ]
+    .iter()
+    .filter_map(|f| fs::metadata(dir.join(f)).ok())
+    .map(|m| {
+        let t = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64);
+        t ^ m.len().rotate_left(17)
+    })
+    .fold(0u64, |a, b| a.rotate_left(7) ^ b)
 }
 
 impl SigCache {
@@ -236,11 +251,22 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         }
         fs::write(dir.join("chunks.bin"), bin)?;
     }
-    let mut t = p.torches.join("\n");
+    let (heads, torches): (Vec<&String>, Vec<&String>) =
+        p.torches.iter().partition(|l| l.starts_with("tete,"));
+    let mut t = torches
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     if !t.is_empty() {
         t.push('\n');
     }
     fs::write(dir.join("torches.txt"), t)?;
+    let heads: Vec<String> = heads
+        .iter()
+        .map(|l| l["tete,".len()..].to_string())
+        .collect();
+    crate::mcimport::write_heads(&dir, &heads);
     save(&dir, &p.fps)?;
     Ok(dir)
 }

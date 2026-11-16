@@ -469,6 +469,22 @@ fn emit_item(
     }
 }
 
+/// Tête seule (bloc « tête » à skin d'une carte importée) : `xf` va des pixels du modèle
+/// (tête de -4..4 × 0..8 × -4..4, visage vers −z) au monde.
+pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3]) -> Vec<EntityVertex> {
+    let mut out = Vec::with_capacity(2400);
+    emit_box(
+        &mut out,
+        xf,
+        [-4.0, 0.0, -4.0],
+        [4.0, 8.0, 4.0],
+        Part::Head,
+        light,
+        Some((skin, 5)),
+    );
+    out
+}
+
 /// Triangles du modèle du joueur dans cette pose (avec l'objet tenu).
 pub fn build(pose: &Pose) -> Vec<EntityVertex> {
     let mut out = Vec::with_capacity(12_000);

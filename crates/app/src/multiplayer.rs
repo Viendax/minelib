@@ -182,11 +182,22 @@ pub fn mode_screen(c: &mut Ctx) -> Action {
 }
 
 /// Liste des parties d'un mode. `selected` : ligne choisie.
+/// Recherche au-dessus d'une liste de serveurs.
+#[derive(Default)]
+pub struct ListSearch {
+    pub text: String,
+    pub focus: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn list_screen(
     c: &mut Ctx,
+    input: &minelib_platform::Input,
     kind: Kind,
     servers: &[ServerInfo],
     selected: &mut Option<usize>,
+    search: &mut ListSearch,
+    time: f32,
 ) -> Action {
     c.background();
     let s = c.s;
@@ -197,7 +208,36 @@ pub fn list_screen(
     c.text_center(title, 12.0 * s, s * 2.0, WHITE);
     let list_w = (c.w - 40.0 * s).min(360.0 * s);
     let list_x = (c.w - list_w) / 2.0;
-    let list_y = 40.0 * s;
+    // Recherche (nom, carte, région), au-dessus de la liste.
+    let field_w = list_w / s;
+    if c.text_field(
+        "",
+        &search.text,
+        "rechercher un serveur",
+        list_x + list_w / 2.0,
+        34.0 * s,
+        field_w,
+        search.focus,
+        time,
+    ) {
+        search.focus = true;
+    } else if c.click {
+        search.focus = false;
+    }
+    if search.focus {
+        crate::menu::edit_text(&mut search.text, input, 32);
+    }
+    let query = search.text.trim().to_lowercase();
+    let shown: Vec<usize> = (0..servers.len())
+        .filter(|&i| {
+            let sv = &servers[i];
+            query.is_empty()
+                || sv.name.to_lowercase().contains(&query)
+                || sv.map.to_lowercase().contains(&query)
+                || sv.region.to_lowercase().contains(&query)
+        })
+        .collect();
+    let list_y = 56.0 * s;
     let list_h = c.h - list_y - 64.0 * s;
     c.frame(list_x, list_y, list_w, list_h);
     // En-têtes des colonnes.
@@ -214,6 +254,17 @@ pub fn list_screen(
     }
     let row_h = 24.0 * s;
     let top = list_y + 16.0 * s;
+    if !servers.is_empty() && shown.is_empty() {
+        let msg = "Aucun serveur ne correspond à la recherche.";
+        let tw = Ui::text_width(msg, s);
+        c.ui.text(
+            list_x + (list_w - tw) / 2.0,
+            list_y + list_h / 2.0 - 10.0 * s,
+            s,
+            GREY,
+            msg,
+        );
+    }
     if servers.is_empty() {
         let msg = match kind {
             Kind::Fps => "Aucune partie en attente pour le moment.",
@@ -241,8 +292,9 @@ pub fn list_screen(
         );
     }
     let visible = ((list_h - 18.0 * s) / row_h).floor().max(0.0) as usize;
-    for (i, sv) in servers.iter().take(visible).enumerate() {
-        let y = top + i as f32 * row_h;
+    for (row, &i) in shown.iter().take(visible).enumerate() {
+        let sv = &servers[i];
+        let y = top + row as f32 * row_h;
         let detail = format!("{} - {}", sv.map, sv.region);
         if c.list_row(
             list_x + 2.0 * s,
@@ -269,7 +321,7 @@ pub fn list_screen(
             format!("{}", sv.ping),
         );
     }
-    if selected.is_some_and(|i| i >= servers.len()) {
+    if selected.is_some_and(|i| i >= servers.len() || !shown.contains(&i)) {
         *selected = None;
     }
     // Boutons : rejoindre, créer, actualiser, retour.

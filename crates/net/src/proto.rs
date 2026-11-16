@@ -4,7 +4,17 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 21;
+pub const PROTOCOL: u32 = 22;
+
+/// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
+/// absente.
+pub fn client_version(client: &str) -> u32 {
+    client
+        .split_whitespace()
+        .rev()
+        .find_map(|w| w.strip_prefix('v')?.parse().ok())
+        .unwrap_or(0)
+}
 
 /// Morceau d'une carte transférée (octets).
 pub const MAP_PART: usize = 48 * 1024;
@@ -39,6 +49,13 @@ pub const SERVER_DEFAULT_GAMEMODE: u8 = 12;
 /// À l'arrivée sur un serveur de construction : le relais renvoie (`SetGamemode`) le mode
 /// par défaut du serveur si l'on n'est pas OP. Réponse sans texte.
 pub const SERVER_GAMEMODE_QUERY: u8 = 13;
+/// Renommer le serveur (OP) : `reason` = le nouveau nom.
+pub const SERVER_RENAME: u8 = 14;
+
+/// Triches trouvées par le rejeu : sauts parfaits en chaîne (script de bunny hop), appuis
+/// plus rapides qu'une main (macro).
+pub const CHEAT_BHOP_SCRIPT: u8 = 1;
+pub const CHEAT_MACRO: u8 = 2;
 // (Elle renvoie aussi `BuildSpawn` : la position qu'on avait sur ce serveur.)
 
 pub fn valid_pseudo(p: &str) -> bool {
@@ -176,6 +193,13 @@ pub enum Request {
     MatchResult {
         data: Vec<u8>,
     },
+    /// Garant vérificateur : en rejouant la partie, triche prouvée sur les entrées d'un
+    /// joueur (`kind` : `CHEAT_BHOP_SCRIPT`, `CHEAT_MACRO`).
+    CheatFound {
+        pseudo: String,
+        kind: u8,
+        detail: String,
+    },
     /// Classement : les 50 meilleurs, ou ses amis.
     Leaderboard {
         friends: bool,
@@ -310,6 +334,7 @@ impl Request {
                 | Request::ShardReady { .. }
                 | Request::Rtt { .. }
                 | Request::BulkEdit { .. }
+                | Request::CheatFound { .. }
         )
     }
 }
@@ -716,4 +741,15 @@ pub fn shard_mac(secret: &[u8; 32], room: u64, pseudo: &str, expires: u64) -> [u
     m.update(pseudo.to_ascii_lowercase().as_bytes());
     m.update(&expires.to_le_bytes());
     m.finalize().into_bytes().into()
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn reads_the_game_version_in_the_hello() {
+        assert_eq!(super::client_version("minelib 0.1.0 v95"), 95);
+        assert_eq!(super::client_version("minelib-garant 0.1.0 v7"), 7);
+        assert_eq!(super::client_version("minelib 0.1.0"), 0);
+        assert_eq!(super::client_version("relais minelib 0.1.0"), 0);
+    }
 }

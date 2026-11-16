@@ -159,6 +159,9 @@ pub struct Session {
     fluids: crate::fluids::Fluids,
     /// Temps avant la prochaine brûlure dans la lave.
     lava_burn: f32,
+    /// Têtes à skin d'une carte importée (chargées au premier pas), et leurs triangles.
+    heads: Option<crate::heads::Heads>,
+    head_vertices: Vec<minelib_render::EntityVertex>,
     autosave: f32,
     hit: Option<Hit>,
     overlay: Overlay,
@@ -342,6 +345,8 @@ impl Session {
             keys: Bindings::default(),
             fluids: Default::default(),
             lava_burn: 0.0,
+            heads: None,
+            head_vertices: Vec::new(),
             autosave: AUTOSAVE_S,
             hit: None,
             overlay: Overlay::default(),
@@ -643,6 +648,16 @@ impl Session {
             let shots = std::mem::take(&mut self.fps.shots);
             let mut net_locals = Vec::new();
             self.fps.hit_marker.0 = (self.fps.hit_marker.0 - dt).max(0.0);
+            // Têtes à skin (cartes importées) : textures téléchargées, têtes proches.
+            let heads = self.heads.get_or_insert_with(|| {
+                crate::heads::Heads::load(&self.dir, minelib_assets::data_dir().join("tetes"))
+            });
+            if !heads.is_empty() {
+                let eye = self.player.eye();
+                heads.update(eye);
+                let l = 0.3 + 0.7 * self.daylight;
+                self.head_vertices = heads.vertices(eye, [l; 3]);
+            }
             // Eau et lave qui coulent (hors parties FPS en ligne : la carte y est figée).
             let fluids_on = self.net.is_none() && self.game.mode != GameMode::Fps;
             if fluids_on {
@@ -1166,6 +1181,33 @@ impl Session {
             }
             let [x, y, z] = hit.adjacent();
             let free = !self.world.get(x, y, z).is_targetable();
+            // Bannière : toujours contre le mur visé (posée sur le sol ou au plafond : contre
+            // le côté de la case opposé au joueur), quelle que soit sa couleur.
+            if let Some(Item::Block(b)) = self.inventory.selected_item() {
+                if let Some(color) = b
+                    .def()
+                    .key
+                    .strip_prefix("banner_")
+                    .and_then(|r| r.split(':').next())
+                {
+                    let side = match hit.normal {
+                        [-1, 0, 0] => 0,
+                        [1, 0, 0] => 1,
+                        [0, 0, -1] => 4,
+                        [0, 0, 1] => 5,
+                        _ => side_toward(self.player.look_dir()),
+                    };
+                    let reg = minelib_world::registry::registry();
+                    if let Some(id) = reg.by_key(&format!("banner_{color}:{side}")) {
+                        if free && !self.player.overlaps_block([x, y, z]) {
+                            self.dirty.extend(self.world.set(x, y, z, id));
+                            self.use_selected();
+                        }
+                    }
+                    self.place_cooldown = 0.22;
+                    return;
+                }
+            }
             match self.inventory.selected_item() {
                 Some(Item::Block(b)) if free && !self.player.overlaps_block([x, y, z]) => {
                     self.dirty.extend(self.world.set(x, y, z, b));
@@ -2673,6 +2715,44 @@ impl Session {
                     ),
                 }
             }
+            // Renomme le monde (liste des mondes) ; sur un serveur de construction (OP),
+            // aussi son nom dans la liste des serveurs.
+            "worldname" | "nommonde" => {
+                let new_name: String = cmd
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, r)| r)
+                    .trim()
+                    .chars()
+                    .take(32)
+                    .collect();
+                if new_name.is_empty() {
+                    self.chat.say(
+                        format!(
+                            "Utilisation : /worldname <nom> (actuel : {})",
+                            self.meta.name
+                        ),
+                        chat::RED,
+                    );
+                    return;
+                }
+                if self.build.is_some() {
+                    self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                        action: minelib_net::proto::SERVER_RENAME,
+                        pseudo: String::new(),
+                        reason: new_name.clone(),
+                    });
+                }
+                let guest = self.build.as_ref().is_some_and(|b| !b.is_owner());
+                if self.net.is_none() && !guest {
+                    self.meta.name = new_name.clone();
+                    match self.save() {
+                        Ok(()) => self
+                            .chat
+                            .say(format!("Monde renommé : {new_name}."), chat::YELLOW),
+                        Err(e) => self.chat.say(format!("Enregistrement : {e:#}"), chat::RED),
+                    }
+                }
+            }
             "heal" => {
                 self.game.health = MAX_HEALTH;
                 self.chat.say("Vous êtes soigné.", chat::YELLOW);
@@ -2682,6 +2762,7 @@ impl Session {
                     "/gm (ou /gamemode) <0|1|2|3> : survie, créatif, fps, spectateur",
                     "/fly : autorise ou interdit le vol en survie",
                     "/heal : rend tous les coeurs",
+                    "/worldname <nom> : renomme le monde",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block",
                     "Vol : deux appuis rapides sur Espace",
                     "Mode FPS : clic molette = ping (pas d'inventaire ni de blocs)",
@@ -3708,6 +3789,7 @@ impl Session {
         } else {
             Vec::new()
         };
+        model.extend_from_slice(&self.head_vertices);
         // Partie en ligne : les autres joueurs.
         if let Some(n) = &self.net {
             for v in n.views().iter().filter(|v| v.alive) {

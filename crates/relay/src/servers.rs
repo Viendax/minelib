@@ -65,6 +65,8 @@ pub enum Action {
     Gamemode,
     /// Mode de jeu par défaut à l'arrivée (OP) : `reason` = le mode (vide : aucun).
     DefaultGamemode,
+    /// Renommer le serveur (OP) : `reason` = le nom.
+    Rename,
 }
 
 impl Store {
@@ -196,6 +198,9 @@ impl Store {
         }
         let mode: String = reason.chars().take(16).collect();
         match action {
+            Action::Rename => {
+                return Ok(format!("Serveur renommé : {}.", reason.trim()));
+            }
             Action::Gamemode => {
                 return Ok(if target.is_empty() || target.eq_ignore_ascii_case(by) {
                     format!("Mode de jeu : {mode}.")
@@ -289,6 +294,7 @@ impl Store {
             | Action::WhitelistRemove
             | Action::WhitelistList
             | Action::Gamemode
+            | Action::Rename
             | Action::DefaultGamemode => unreachable!("traité plus haut"),
             Action::Ban if is_creator => return Err("On ne bannit pas le créateur.".into()),
             Action::Ban if by.eq_ignore_ascii_case(target) => {

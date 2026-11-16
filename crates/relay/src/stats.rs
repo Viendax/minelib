@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use minelib_net::game::SummaryPlayer;
 use minelib_net::game::{MatchSummary, CT, T};
 use minelib_net::proto::RankEntry;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,68 @@ pub struct Stats {
     /// Coéquipiers tués, et parties quittées trop longtemps.
     pub teamkills: u32,
     pub absences: u32,
+    /// Triches prouvées par le rejeu d'un garant vérificateur (script de bunny hop,
+    /// macro…), et les garants qui les ont trouvées (en minuscules) : deux garants
+    /// différents, et c'est le bannissement.
+    pub scripts: u32,
+    pub script_by: Vec<String>,
+    /// Parties aux statistiques invraisemblables (sans être impossibles).
+    pub odd_games: u32,
+}
+
+/// Statistiques enregistrées avant les preuves de script (relues, puis complétées).
+#[derive(Deserialize)]
+struct StatsV2 {
+    pseudo: String,
+    elo: f64,
+    matches: u32,
+    wins: u32,
+    losses: u32,
+    ties: u32,
+    kills: u32,
+    deaths: u32,
+    assists: u32,
+    headshots: u32,
+    damage: u64,
+    rounds: u32,
+    mvps: u32,
+    games: u32,
+    reports: u32,
+    reported: Vec<String>,
+    reported_by: Vec<String>,
+    friends: Vec<String>,
+    trust: i32,
+    teamkills: u32,
+    absences: u32,
+}
+
+impl From<StatsV2> for Stats {
+    fn from(o: StatsV2) -> Self {
+        Stats {
+            pseudo: o.pseudo,
+            elo: o.elo,
+            matches: o.matches,
+            wins: o.wins,
+            losses: o.losses,
+            ties: o.ties,
+            kills: o.kills,
+            deaths: o.deaths,
+            assists: o.assists,
+            headshots: o.headshots,
+            damage: o.damage,
+            rounds: o.rounds,
+            mvps: o.mvps,
+            games: o.games,
+            reports: o.reports,
+            reported: o.reported,
+            reported_by: o.reported_by,
+            friends: o.friends,
+            trust: o.trust,
+            teamkills: o.teamkills,
+            absences: o.absences,
+            ..Default::default()
+        }
+    }
 }
 
 /// Facteur de confiance d'un compte neuf, et bornes.
@@ -73,6 +136,51 @@ pub mod trust {
     pub const SUSPICION: i32 = -80;
     /// Triche prouvée par les garants.
     pub const CHEAT: i32 = -400;
+    /// Script prouvé par le rejeu d'un garant (bunny hop parfait, macro) : la confiance
+    /// tombe à zéro ; deuxième preuve par un autre garant : bannissement.
+    pub const SCRIPT: i32 = -super::TRUST_MAX;
+    /// Partie aux statistiques invraisemblables (possibles, mais presque jamais vues chez
+    /// un joueur honnête) : comme un soupçon du vérificateur.
+    pub const ODD_STATS: i32 = SUSPICION;
+}
+
+/// Statistiques d'une partie impossibles (résultat faux) : par joueur, la règle violée.
+/// `team` : joueurs par équipe (adversaires possibles à chaque manche).
+pub fn impossible(p: &SummaryPlayer, team: u32) -> Option<&'static str> {
+    let rounds = p.rounds as u32;
+    if p.headshots > p.kills {
+        Some("plus de tirs à la tête que d'éliminations")
+    } else if p.deaths as u32 > rounds {
+        Some("plus de morts que de manches")
+    } else if p.mvps as u32 > rounds {
+        Some("plus de MVP que de manches")
+    } else if p.kills as u32 > rounds * team {
+        Some("plus d'éliminations que d'adversaires")
+    } else if p.damage > rounds * team * 100 {
+        Some("plus de dégâts que la vie de tous les adversaires")
+    } else {
+        None
+    }
+}
+
+/// Statistiques d'une partie invraisemblables pour un joueur honnête (seuils au-delà
+/// des meilleures parties connues des joueurs professionnels de CS) : `Some(raison)`.
+pub fn implausible(p: &SummaryPlayer) -> Option<&'static str> {
+    let rounds = (p.rounds as f64).max(1.0);
+    let kills = p.kills as f64;
+    // Toutes les éliminations à la tête, sur au moins 20.
+    if p.kills >= 20 && p.headshots == p.kills {
+        return Some("100 % de tirs à la tête sur 20 éliminations ou plus");
+    }
+    // Plus de 2,2 éliminations par manche sur au moins 16 manches (record pro ≈ 1,9).
+    if p.rounds >= 16 && kills / rounds > 2.2 {
+        return Some("plus de 2,2 éliminations par manche");
+    }
+    // Plus de 220 dégâts par manche en moyenne sur au moins 16 manches (record ≈ 180).
+    if p.rounds >= 16 && p.damage as f64 / rounds > 220.0 {
+        return Some("plus de 220 dégâts par manche");
+    }
+    None
 }
 
 /// Statistiques enregistrées avant le facteur de confiance (relues, puis complétées).
@@ -122,8 +230,7 @@ impl From<StatsV1> for Stats {
             reported_by: o.reported_by,
             friends: o.friends,
             trust,
-            teamkills: 0,
-            absences: 0,
+            ..Default::default()
         }
     }
 }
@@ -239,11 +346,18 @@ impl Store {
         for e in std::fs::read_dir(&dir)?.flatten() {
             if e.path().extension().is_some_and(|x| x == "stats") {
                 let bytes = std::fs::read(e.path()).unwrap_or_default();
-                let read = postcard::from_bytes::<Stats>(&bytes).ok().or_else(|| {
-                    postcard::from_bytes::<StatsV1>(&bytes)
-                        .ok()
-                        .map(Stats::from)
-                });
+                let read = postcard::from_bytes::<Stats>(&bytes)
+                    .ok()
+                    .or_else(|| {
+                        postcard::from_bytes::<StatsV2>(&bytes)
+                            .ok()
+                            .map(Stats::from)
+                    })
+                    .or_else(|| {
+                        postcard::from_bytes::<StatsV1>(&bytes)
+                            .ok()
+                            .map(Stats::from)
+                    });
                 if let Some(s) = read {
                     all.insert(s.pseudo.to_ascii_lowercase(), s);
                 }

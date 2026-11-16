@@ -49,6 +49,8 @@ Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 
 - **Échelles comme dans CS** : contre l'échelle, on monte en avançant (on descend en regardant vers le bas), avec une demi-seconde pour prendre de la vitesse. À pleine vitesse, ses barreaux s'entendent ; accroupi, on grimpe plus lentement et sans bruit.
 - **Couleurs des coéquipiers** : bleu vif, orange vif, vert vif, jaune vif, violet foncé, puis rouge vif, rose flamant rose, blanc, gris clair, marron foncé. À N contre N, seules les N premières servent (les 5 premières en 5 contre 5). Teintes vérifiées pour les daltoniens (protanopie, deutéranopie, tritanopie).
+- **Une version, une partie** : on ne joue en ligne qu'avec la dernière version (bouton *Mettre à jour* en bas à gauche de l'accueil) et seulement avec des joueurs de la même version ; une partie commencée se finit dans sa version (ni le jeu ni le lanceur ne se mettent à jour avant la fin, l'accueil l'indique en vert). Une seule partie FPS à la fois par ordinateur.
+- **Ceux qui servent restent anonymes** : un garant ou l'hôte d'une région n'est jamais nommé aux joueurs, et les régions passent par les relais d'iroh (son adresse IP n'est pas donnée).
 - **Serveurs de construction** : on y revient là où on était (le relais garde la position de chacun), dans une copie à part du monde : ton monde solo n'est jamais touché. *Échap → Télécharger la carte* en garde une copie dans tes mondes solo.
 - **Recherche de cartes** : à droite de « Carte », un champ filtre la liste par nom ou auteur.
 - **Joue avec tes amis** : le panneau de droite liste tes amis (en ligne en vert) ; un clic invite dans ton **lobby** (jusqu'à 10 joueurs : il doit tenir dans une équipe de la carte, 5 pour un 5 contre 5, 10 pour un 10 contre 10). Celui qui invite en premier est l'hôte du lobby : il lance la partie pour tout le monde, et vous êtes **toujours dans la même équipe**. Clic droit sur un membre : *Exclure* ou *Promouvoir hôte*.
@@ -124,7 +126,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 - **L'eau et la lave coulent comme dans Minecraft** : sources infinies, chutes, écoulement vers le trou le plus proche, obsidienne et pierre taillée quand elles se rencontrent ; on y nage (lentement dans la lave, qui brûle). La **barrière à fluides** (`/give fluid_barrier`) est invisible comme la barrière, mais on la traverse : seuls l'eau et la lave s'y arrêtent.
 - **Des blocs qui se posent comme on s'y attend** : escaliers face à toi (à l'envers au plafond), dalles, portes, trappes, vitres qui se raccordent, bannières.
 - **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`).
-- **Importe tes mondes Java** (format Anvil, toutes versions) et tes **packs de textures** : les fichiers d'origine ne sont jamais modifiés.
+- **Importe tes mondes Java** (format Anvil, toutes versions) et tes **packs de textures** : les fichiers d'origine ne sont jamais modifiés. Les décors faits d'**entités d'affichage** (blocs et objets posés, souvent dans des barrières) deviennent de vrais blocs, et les **têtes à skin** gardent leur texture (téléchargée une fois depuis les serveurs de textures de Minecraft, puis gardée sur ton PC).
 
 ---
 
