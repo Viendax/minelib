@@ -32,6 +32,12 @@ pub struct Store {
     whitelists: HashMap<String, Whitelist>,
     /// Mode de jeu par défaut de chaque serveur (fichier `….defaults`).
     defaults: HashMap<String, String>,
+    /// Dernière position de chaque joueur sur chaque serveur (fichier `….positions`) :
+    /// serveur → pseudo (minuscules) → [x, y, z, lacet, tangage]. Le relais en est le
+    /// gardien : on revient là où on était, quoi qu'on ait fait ailleurs entre-temps.
+    positions: HashMap<String, HashMap<String, [f32; 5]>>,
+    /// Positions changées depuis le dernier enregistrement.
+    positions_dirty: bool,
 }
 
 /// Clé d'un serveur : son créateur et son monde.
@@ -75,11 +81,47 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let positions = std::fs::read(path.with_extension("positions"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Self {
             path,
             servers,
             whitelists,
             defaults,
+            positions,
+            positions_dirty: false,
+        }
+    }
+
+    /// Dernière position connue de `pseudo` sur ce serveur.
+    pub fn position(&self, server: &str, pseudo: &str) -> Option<[f32; 5]> {
+        self.positions
+            .get(server)?
+            .get(&pseudo.to_ascii_lowercase())
+            .copied()
+    }
+
+    /// Position actuelle de `pseudo` sur ce serveur (gardée en mémoire ; écrite par
+    /// `save_positions`).
+    pub fn set_position(&mut self, server: &str, pseudo: &str, p: [f32; 5]) {
+        if p.iter().all(|v| v.is_finite()) {
+            self.positions
+                .entry(server.to_string())
+                .or_default()
+                .insert(pseudo.to_ascii_lowercase(), p);
+            self.positions_dirty = true;
+        }
+    }
+
+    /// Écrit les positions si elles ont changé.
+    pub fn save_positions(&mut self) {
+        if !std::mem::take(&mut self.positions_dirty) {
+            return;
+        }
+        if let Ok(b) = postcard::to_allocvec(&self.positions) {
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("positions"), &b);
         }
     }
 

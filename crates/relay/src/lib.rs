@@ -1492,6 +1492,8 @@ fn upkeep_regions(st: &mut State, rid: u64) {
 
 /// Mondes de construction : chacun reçoit ses garants extérieurs, à qui les zones passent.
 fn upkeep_build(st: &mut State) {
+    // Positions des joueurs sur les serveurs (au plus une écriture par entretien).
+    st.servers.save_positions();
     let rooms: Vec<u64> = st
         .rooms
         .iter()
@@ -2560,6 +2562,19 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 (r.server.clone(), r.creator.clone())
             };
             if action == proto::SERVER_GAMEMODE_QUERY {
+                // Arrivée : on reprend sa position sur ce serveur.
+                if let (Some(p), Some(c)) =
+                    (st.servers.position(&server, pseudo), st.conns.get(&id))
+                {
+                    transport::push(
+                        &c.tx,
+                        &Response::BuildSpawn {
+                            pos: [p[0], p[1], p[2]],
+                            yaw: p[3],
+                            pitch: p[4],
+                        },
+                    );
+                }
                 if !st.servers.is_op(&server, &creator, pseudo) {
                     if let (Some(mode), Some(c)) =
                         (st.servers.default_gamemode(&server), st.conns.get(&id))
@@ -3000,6 +3015,20 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             return None;
         }
         Request::Nearby { chunk, data } => {
+            // Position sur ce serveur, gardée pour son retour.
+            if let Some(game::BuildMsg::Player {
+                pos, yaw, pitch, ..
+            }) = game::decode::<game::BuildMsg>(&data)
+            {
+                if let Some(server) = my_room
+                    .and_then(|r| st.rooms.get(&r))
+                    .filter(|r| r.kind == 1)
+                    .map(|r| r.server.clone())
+                {
+                    st.servers
+                        .set_position(&server, pseudo, [pos[0], pos[1], pos[2], yaw, pitch]);
+                }
+            }
             // Le pseudo montré est celui de la session (pas celui que le joueur annonce).
             let data = player_as(&data, pseudo)?;
             if let Some(room) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
@@ -4523,6 +4552,36 @@ mod tests {
                 }
                 m => panic!("{m:?}"),
             },
+            _ => unreachable!(),
+        }
+        // Position d'Eve gardée par le relais : elle la retrouve en revenant.
+        transport::push(
+            &elink,
+            &Request::Nearby {
+                chunk: [0, 0],
+                data: game::encode(&game::BuildMsg::Player {
+                    pseudo: "Eve".into(),
+                    pos: [3.5, 80.0, 4.5],
+                    yaw: 1.0,
+                    pitch: -0.2,
+                    crouch: 0.0,
+                    speed: 0.0,
+                }),
+            },
+        );
+        eve.send(Cmd::Leave);
+        std::thread::sleep(Duration::from_millis(200));
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        eve.send(Cmd::ServerAdmin {
+            action: proto::SERVER_GAMEMODE_QUERY,
+            pseudo: String::new(),
+            reason: String::new(),
+        });
+        match wait(&eve, |e| matches!(e, Event::BuildSpawn { .. })) {
+            Event::BuildSpawn { pos, yaw, pitch } => {
+                assert_eq!((pos, yaw, pitch), ([3.5, 80.0, 4.5], 1.0, -0.2))
+            }
             _ => unreachable!(),
         }
         let _ = std::fs::remove_dir_all(dir);

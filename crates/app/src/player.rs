@@ -83,13 +83,14 @@ const FLY_SPRINT: f32 = 30.0;
 const TOUCH: f32 = 1e-4;
 /// Hauteur franchie sans sauter (dalles, marches d'escalier).
 const STEP_HEIGHT: f32 = 0.6;
-/// Vitesse sur une échelle (blocs/s), et élan quand on saute pour s'en décrocher.
-const LADDER_SPEED: f32 = 2.6;
+/// Vitesse sur une échelle (blocs/s, environ celle de CS), et élan quand on saute pour
+/// s'en décrocher.
+const LADDER_SPEED: f32 = 4.5;
 const LADDER_PUSH: f32 = 3.0;
 /// Temps pour atteindre la pleine vitesse sur une échelle (s).
 const LADDER_RAMP: f32 = 0.5;
-/// Vitesse accroupi sur une échelle (part de la pleine vitesse) : sous le seuil du bruit.
-const LADDER_SNEAK: f32 = 0.5;
+/// Vitesse accroupi sur une échelle (blocs/s) : bien sous le seuil du bruit.
+const LADDER_SNEAK_SPEED: f32 = 1.3;
 
 /// Vitesse verticale sur une échelle à partir de laquelle elle fait du bruit (à fond).
 pub const LADDER_NOISY: f32 = LADDER_SPEED * 0.95;
@@ -372,7 +373,7 @@ impl Player {
                     };
                     // Accroupi : plus lent (et silencieux, voir `ladder_noise`).
                     let cap = if m.sneak {
-                        LADDER_SPEED * LADDER_SNEAK
+                        LADDER_SNEAK_SPEED
                     } else {
                         LADDER_SPEED
                     };

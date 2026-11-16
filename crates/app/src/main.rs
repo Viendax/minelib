@@ -141,7 +141,8 @@ struct Game {
     skin_pick: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
     skin_msg: Option<(String, bool)>,
     /// Menu déroulant des langues ouvert.
-    lang_open: bool,
+    /// Résultat de « Télécharger la carte » (menu pause d'un serveur de construction).
+    download_note: Option<String>,
     /// Amis connus (pour ne refaire leur classement que si la liste change).
     friend_names: Vec<String>,
     /// Lobby : l'hôte du lobby a trouvé cette partie, on la rejoint (après la carte).
@@ -276,7 +277,7 @@ impl Game {
             skin_sent: false,
             skin_pick: None,
             skin_msg: None,
-            lang_open: false,
+            download_note: None,
             party_go: None,
             fps_home_maps_seen: u64::MAX,
             shared_maps: Default::default(),
@@ -1565,6 +1566,24 @@ impl Game {
         let Some(link) = self.accounts.link.clone() else {
             return;
         };
+        // Jamais dans un monde solo de ce PC (même identique) : le serveur a sa copie à
+        // part, et ce qu'on y fait ne touche pas au monde solo (ni l'inverse).
+        let maps = self.paths.root.join("maps");
+        let dir = if dir.starts_with(&maps) {
+            dir
+        } else {
+            let name = save::list_worlds(&self.paths.saves)
+                .into_iter()
+                .find(|w| w.dir == dir)
+                .map_or_else(|| "Monde".into(), |w| w.meta.name);
+            match fpsmap::package(&dir).and_then(|p| fpsmap::unpack(&maps, &name, &p.to_bytes())) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("copie du monde du serveur : {e:#}");
+                    return;
+                }
+            }
+        };
         self.play(dir);
         let pseudo = self.accounts.pseudo();
         if let Some(s) = &mut self.session {
@@ -1909,6 +1928,15 @@ impl Game {
         let resume = c.button("Reprendre", cx, y, 200.0, true);
         y += 24.0 * s;
         let settings = c.button("Paramètres", cx, y, 200.0, true);
+        // Serveur de construction : une copie du monde tel qu'il est, dans ses mondes solo.
+        let on_build = self.session.as_ref().is_some_and(|s| s.build.is_some());
+        let download = on_build && {
+            y += 24.0 * s;
+            c.button("Télécharger la carte", cx, y, 200.0, true)
+        };
+        if let Some(t) = self.download_note.as_ref().filter(|_| on_build) {
+            c.text_center(t, y + 14.0 * s, s, GREY);
+        }
         let online = self
             .session
             .as_ref()
@@ -1918,7 +1946,7 @@ impl Game {
         } else {
             "Sauvegarder et quitter"
         };
-        let quit = c.button(label, cx, c.h * 0.72, 200.0, true);
+        let quit = c.button(label, cx, (c.h * 0.72).max(y + 40.0 * s), 200.0, true);
         let (line, color) = self.updater.line();
         c.ui.text(4.0 * s, c.h - 12.0 * s, s, color, line);
         if resume {
@@ -1928,7 +1956,20 @@ impl Game {
             self.settings_return = Screen::Paused;
             self.screen = Screen::Settings;
         }
+        if download {
+            let saves = self.paths.saves.clone();
+            if let Some(sess) = &mut self.session {
+                self.download_note = Some(match sess.download_copy(&saves) {
+                    Ok(dir) => {
+                        log::info!("carte copiée dans {}", dir.display());
+                        "Copie enregistrée dans tes mondes solo.".into()
+                    }
+                    Err(e) => format!("Copie impossible : {e:#}"),
+                });
+            }
+        }
         if quit {
+            self.download_note = None;
             self.leave_world();
         }
     }
@@ -1950,13 +1991,22 @@ impl Game {
         y += 24.0 * s;
         let packs = c.button("Textures", cx, y, 200.0, true);
         y += 24.0 * s;
-        // Langue : menu déroulant (ouvert plus bas, par-dessus le reste).
-        let lang = i18n::LANGS.get(i18n::current()).map_or("Français", |l| l.1);
-        let lang_y = y;
-        let arrow = if self.lang_open { "^" } else { "v" };
-        let lang_label = format!("Langue : {lang} {arrow}");
-        if c.button(&lang_label, cx, y, 200.0, true) {
-            self.lang_open = !self.lang_open;
+        // Langue : « < Français > » ; les flèches (ou un clic au milieu) passent d'une langue
+        // à l'autre. Chaque langue est écrite dans sa langue (jamais traduite).
+        let n = i18n::LANGS.len();
+        let cur = i18n::current().min(n.saturating_sub(1));
+        let lang = i18n::LANGS.get(cur).map_or("Français", |l| l.1);
+        let prev = c.button("<", cx - 100.0 * s + 11.0 * s, y, 22.0, n > 1);
+        let mid = c.button(&format!("Langue : {lang}"), cx, y, 152.0, n > 1);
+        let next = c.button(">", cx + 100.0 * s - 11.0 * s, y, 22.0, n > 1);
+        let mut picked = None;
+        if n > 1 && (prev || next || mid) {
+            let k = if prev {
+                (cur + n - 1) % n
+            } else {
+                (cur + 1) % n
+            };
+            picked = Some(i18n::LANGS[k].0);
         }
         y += 24.0 * s;
         // Volume des sons (tirs, rechargements, lunette).
@@ -1972,7 +2022,8 @@ impl Game {
                 crate::audio::play(crate::audio::Sfx::Dry, 0.0, v);
             }
         }
-        let done = c.button("Terminé", cx, c.h * 0.72, 200.0, true);
+        y += 30.0 * s;
+        let done = c.button("Terminé", cx, (c.h * 0.72).max(y), 200.0, true);
         // Skin : aperçu en 3D qui tourne, à droite, et le bouton pour en changer.
         let mut want_pick = false;
         let px = (c.w * 0.82).max(cx + 130.0 * s);
@@ -2013,56 +2064,13 @@ impl Game {
                 );
             }
         }
-        // Liste des langues, par-dessus.
-        let mut picked = None;
-        if self.lang_open {
-            let row = 14.0 * s;
-            let lw = 200.0 * s;
-            let top = lang_y + 11.0 * s;
-            c.ui.rect(
-                cx - lw / 2.0,
-                top,
-                lw,
-                row * i18n::LANGS.len() as f32,
-                [0.05, 0.05, 0.07, 0.97],
-            );
-            for (i, (code, name)) in i18n::LANGS.iter().enumerate() {
-                let ry = top + i as f32 * row;
-                let hover = c.hovered(cx - lw / 2.0, ry, lw, row);
-                if hover || i == i18n::current() {
-                    c.ui.rect(
-                        cx - lw / 2.0,
-                        ry,
-                        lw,
-                        row,
-                        [1.0, 1.0, 1.0, if hover { 0.15 } else { 0.07 }],
-                    );
-                }
-                // Le nom de chaque langue dans sa langue (jamais traduit).
-                let tw = Ui::text_width(name, s);
-                c.ui.text(cx - tw / 2.0, ry + 3.0 * s, s, WHITE, *name);
-                if hover && c.click {
-                    picked = Some(*code);
-                }
-            }
-            if c.click
-                && picked.is_none()
-                && !c.hovered(cx - lw / 2.0, lang_y - 10.0 * s, lw, row * 8.0 + 22.0 * s)
-            {
-                self.lang_open = false;
-            }
-        }
         if want_pick {
             self.pick_skin();
         }
         if let Some(code) = picked {
             i18n::set(code);
             self.options.language = code.to_string();
-            self.lang_open = false;
             let _ = self.options.save(&self.paths.options);
-            return;
-        }
-        if self.lang_open {
             return;
         }
         if graphics {

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 18;
+pub const PROTOCOL: u32 = 19;
 
 /// Morceau d'une carte transférée (octets).
 pub const MAP_PART: usize = 48 * 1024;
@@ -39,6 +39,7 @@ pub const SERVER_DEFAULT_GAMEMODE: u8 = 12;
 /// À l'arrivée sur un serveur de construction : le relais renvoie (`SetGamemode`) le mode
 /// par défaut du serveur si l'on n'est pas OP. Réponse sans texte.
 pub const SERVER_GAMEMODE_QUERY: u8 = 13;
+// (Elle renvoie aussi `BuildSpawn` : la position qu'on avait sur ce serveur.)
 
 pub fn valid_pseudo(p: &str) -> bool {
     (3..=16).contains(&p.chars().count())
@@ -619,6 +620,13 @@ pub enum Response {
         mode: String,
         by: String,
     },
+    /// Arrivée sur un serveur de construction : là où l'on était à son départ (le relais
+    /// la garde ; ce qu'on a fait ailleurs entre-temps n'y change rien).
+    BuildSpawn {
+        pos: [f32; 3],
+        yaw: f32,
+        pitch: f32,
+    },
     /// Réponse à `BulkEdit` : `error` vide si tout est publié, sinon pourquoi c'est refusé.
     BulkDone {
         id: u32,
@@ -648,6 +656,7 @@ impl Response {
                 | Response::Slain { .. }
                 | Response::SetGamemode { .. }
                 | Response::BulkDone { .. }
+                | Response::BuildSpawn { .. }
                 | Response::Arbitrate { .. }
                 | Response::Evidence { .. }
                 | Response::FromPeer { .. }

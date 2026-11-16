@@ -48,7 +48,9 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 
 - **Échelles comme dans CS** : contre l'échelle, on monte en avançant (on descend en regardant vers le bas), avec une demi-seconde pour prendre de la vitesse. À pleine vitesse, ses barreaux s'entendent ; accroupi, on grimpe plus lentement et sans bruit.
-- **Couleurs des coéquipiers** : vert, jaune, orange, bleu, violet, puis bleu ciel, rouge, blanc, marron, gris. Teintes de la palette d'Okabe et Ito, distinctes aussi pour les daltoniens.
+- **Couleurs des coéquipiers** : bleu vif, orange vif, vert vif, jaune vif, violet foncé, puis rouge vif, rose flamant rose, blanc, gris clair, marron foncé. À N contre N, seules les N premières servent (les 5 premières en 5 contre 5). Teintes vérifiées pour les daltoniens (protanopie, deutéranopie, tritanopie).
+- **Serveurs de construction** : on y revient là où on était (le relais garde la position de chacun), dans une copie à part du monde : ton monde solo n'est jamais touché. *Échap → Télécharger la carte* en garde une copie dans tes mondes solo.
+- **Recherche de cartes** : à droite de « Carte », un champ filtre la liste par nom ou auteur.
 - **Joue avec tes amis** : le panneau de droite liste tes amis (en ligne en vert) ; un clic invite dans ton **lobby** (jusqu'à 10 joueurs : il doit tenir dans une équipe de la carte, 5 pour un 5 contre 5, 10 pour un 10 contre 10). Celui qui invite en premier est l'hôte du lobby : il lance la partie pour tout le monde, et vous êtes **toujours dans la même équipe**. Clic droit sur un membre : *Exclure* ou *Promouvoir hôte*.
 
 - Chaque carte affiche clairement son format (**5 contre 5**, 2 contre 2, jusqu'à 10 contre 10). **Seules les cartes 5 contre 5 comptent au classement.**

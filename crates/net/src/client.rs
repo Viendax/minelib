@@ -202,6 +202,12 @@ pub enum Event {
         mode: String,
         by: String,
     },
+    /// Position qu'on avait sur ce serveur de construction (à l'arrivée).
+    BuildSpawn {
+        pos: [f32; 3],
+        yaw: f32,
+        pitch: f32,
+    },
     /// Réponse du relais à des modifications en masse (WorldEdit) : `error` vide si publiées.
     BulkDone {
         id: u32,
@@ -582,6 +588,7 @@ impl Worker {
             Response::Slain { by } => Event::Slain(by),
             Response::SetGamemode { mode, by } => Event::SetGamemode { mode, by },
             Response::BulkDone { id, error } => Event::BulkDone { id, error },
+            Response::BuildSpawn { pos, yaw, pitch } => Event::BuildSpawn { pos, yaw, pitch },
             Response::Arbitrate { case, map_sig, map } => Event::Arbitrate { case, map_sig, map },
             Response::Evidence {
                 case,

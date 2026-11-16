@@ -364,6 +364,9 @@ pub struct FpsHome {
     /// Barre de défilement tenue : 1 classement, 2 cartes, 3 amis, 4 lobby.
     pub drag: u8,
     pub selected: Option<usize>,
+    /// Recherche dans les cartes (à droite de « Carte »).
+    pub map_search: String,
+    pub map_search_focus: bool,
     /// Dernière mise à jour automatique de la liste des cartes (horloge de l'écran).
     pub polled: f32,
 }
@@ -391,7 +394,13 @@ pub fn fps_screen(
     // Panneau du lobby à droite, le reste à gauche.
     let panel_w = (c.w * 0.26).clamp(120.0 * s, 170.0 * s);
     let avail = c.w - panel_w - 12.0 * s;
-    let panel_action = lobby_panel(c, input, st, &lobby, avail + 6.0 * s, panel_w, time);
+    // Couleurs proposées : celles d'une équipe de la carte choisie (5 sans carte).
+    let colors = st
+        .selected
+        .and_then(|i| maps.get(i))
+        .map_or(5, |m| (m.players.max(2) / 2) as usize)
+        .clamp(1, PLAYER_COLORS.len());
+    let panel_action = lobby_panel(c, input, st, &lobby, avail + 6.0 * s, panel_w, time, colors);
     let title = "FPS - compétitif";
     let tw = Ui::text_width(title, s * 1.5);
     c.ui.text((avail - tw) / 2.0, 8.0 * s, s * 1.5, WHITE, title);
@@ -542,22 +551,51 @@ pub fn fps_screen(
             }
         }
     }
-    // Choix de la carte.
+    // Choix de la carte : « Carte » en grand, la recherche à sa droite.
     let my = list_y + list_h + 6.0 * s;
-    c.ui.text(x, my, s, GREY, "Carte");
-    let maps_y = my + 10.0 * s;
+    let big = s * 1.5;
+    c.ui.text(x, my + 4.0 * s, big, WHITE, "Carte");
+    let field_x = x + Ui::text_width("Carte", big) + 8.0 * s;
+    let field_w = ((x + w - field_x) / s).min(160.0);
+    if c.text_field(
+        "",
+        &st.map_search,
+        "rechercher une carte",
+        field_x + field_w * s / 2.0,
+        my,
+        field_w,
+        st.map_search_focus,
+        time,
+    ) {
+        st.map_search_focus = true;
+        st.search_focus = false;
+    } else if c.click {
+        st.map_search_focus = false;
+    }
+    if st.map_search_focus {
+        crate::menu::edit_text(&mut st.map_search, input, 24);
+    }
+    let query = st.map_search.trim().to_lowercase();
+    let shown: Vec<usize> = (0..maps.len())
+        .filter(|&i| {
+            query.is_empty()
+                || maps[i].name.to_lowercase().contains(&query)
+                || maps[i].author.to_lowercase().contains(&query)
+        })
+        .collect();
+    let maps_y = my + 24.0 * s;
     let maps_h = (c.h - maps_y - 56.0 * s).max(40.0 * s);
     c.frame(x, maps_y, w, maps_h);
     let row_h = 26.0 * s;
     let vis = ((maps_h - 4.0 * s) / row_h).floor().max(1.0) as usize;
     let over = c.hovered(x, maps_y, w, maps_h);
-    Ctx::wheel(input, over, maps.len(), vis, &mut st.map_scroll);
+    Ctx::wheel(input, over, shown.len(), vis, &mut st.map_scroll);
     let mut drag = st.drag == 2;
     c.scrollbar(
         x + w - bar - 3.0 * s,
         maps_y + 2.0 * s,
         vis as f32 * row_h - s,
-        maps.len(),
+        shown.len(),
         vis,
         &mut st.map_scroll,
         &mut drag,
@@ -570,9 +608,17 @@ pub fn fps_screen(
         st.drag
     };
     // Place laissée à la barre quand elle est là.
-    let right = if maps.len() > vis { bar + 4.0 * s } else { 0.0 };
-    if maps.is_empty() {
-        let t = "Aucune carte : crée un monde, règle les départs avec /fps set, et reviens.";
+    let right = if shown.len() > vis {
+        bar + 4.0 * s
+    } else {
+        0.0
+    };
+    if shown.is_empty() {
+        let t = if maps.is_empty() {
+            "Aucune carte : crée un monde, règle les départs avec /fps set, et reviens."
+        } else {
+            "Aucune carte ne correspond à la recherche."
+        };
         c.ui.text(
             x + (w - Ui::text_width(t, ds)) / 2.0,
             maps_y + 14.0 * s,
@@ -581,7 +627,8 @@ pub fn fps_screen(
             t,
         );
     }
-    for (k, m) in maps.iter().enumerate().skip(st.map_scroll).take(vis) {
+    for (k, &i) in shown.iter().enumerate().skip(st.map_scroll).take(vis) {
+        let m = &maps[i];
         let y = maps_y + 2.0 * s + (k - st.map_scroll) as f32 * row_h;
         let mut detail = if m.local.is_some() {
             "sur ce PC".to_string()
@@ -605,9 +652,9 @@ pub fn fps_screen(
             row_h - s,
             &m.name,
             &detail,
-            st.selected == Some(k),
+            st.selected == Some(i),
         ) {
-            st.selected = Some(k);
+            st.selected = Some(i);
         }
         // Joueurs, bien visibles : « 3 / 10 » en attente, ou le format de la carte.
         let n = m.players.max(2) as u32;
@@ -616,7 +663,6 @@ pub fn fps_screen(
         } else {
             (format!("{} contre {}", n / 2, n / 2), WHITE)
         };
-        let big = s * 1.5;
         c.ui.text(
             x + w - Ui::text_width(&t, big) - 8.0 * s - right,
             y + 3.0 * s,
@@ -692,27 +738,33 @@ pub fn fps_screen(
     action
 }
 
-/// Couleurs des joueurs d'une équipe (lobby, bandeau des têtes, triangles, carte) : des
-/// couleurs que tout le monde sait nommer, dans l'ordre de CS (vert, jaune, orange, bleu,
-/// violet) puis bleu ciel, rouge, blanc, marron et gris pour les équipes de 10. Les teintes
-/// viennent de la palette d'Okabe et Ito, faite pour rester distinctes pour les daltoniens
-/// (protanopes, deutéranopes, tritanopes) ; le blanc, le marron et le gris s'en distinguent
-/// par leur clarté.
+/// Couleurs des joueurs d'une équipe (lobby, bandeau des têtes, triangles, carte), dans
+/// l'ordre où elles servent : une partie à N contre N n'utilise que les N premières (les
+/// 5 premières pour le 5 contre 5, les 2 premières pour le 2 contre 2). Teintes choisies
+/// pour rester distinctes pour les daltoniens : aux simulations de protanopie, deutéranopie
+/// et tritanopie (Machado 2009), l'écart CIEDE2000 entre deux couleurs est d'au moins 15
+/// parmi les 5 premières, 12 parmi les 8 premières et 10 parmi les 10.
 pub const PLAYER_COLORS: [[f32; 4]; 10] = [
-    [0.0, 0.62, 0.451, 1.0],    // vert
-    [0.941, 0.894, 0.259, 1.0], // jaune
-    [0.902, 0.624, 0.0, 1.0],   // orange
-    [0.0, 0.447, 0.698, 1.0],   // bleu
-    [0.8, 0.475, 0.655, 1.0],   // violet
-    [0.337, 0.706, 0.914, 1.0], // bleu ciel
-    [0.835, 0.369, 0.0, 1.0],   // rouge
-    [1.0, 1.0, 1.0, 1.0],       // blanc
-    [0.478, 0.29, 0.118, 1.0],  // marron
-    [0.549, 0.549, 0.549, 1.0], // gris
+    rgb(0x21, 0x8D, 0xDA), // bleu vif
+    rgb(0xF2, 0x61, 0x00), // orange vif
+    rgb(0x2B, 0xD8, 0x82), // vert vif
+    rgb(0xFF, 0xF6, 0x11), // jaune vif
+    rgb(0x5D, 0x2B, 0x90), // violet foncé
+    rgb(0xC7, 0x20, 0x07), // rouge vif
+    rgb(0xFF, 0xB2, 0xC1), // rose flamant rose
+    rgb(0xFF, 0xFF, 0xFF), // blanc
+    rgb(0x99, 0x99, 0x99), // gris clair
+    rgb(0x59, 0x26, 0x10), // marron foncé
 ];
+
+const fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
 
 /// Panneau du lobby, à droite : recherche d'amis en haut, amis en dessous (clic : inviter),
 /// invitations reçues, et les membres du lobby en bas (clic droit : exclure, promouvoir).
+/// `colors` : couleurs proposées (celles d'une équipe de la carte choisie).
+#[allow(clippy::too_many_arguments)]
 fn lobby_panel(
     c: &mut Ctx,
     input: &minelib_platform::Input,
@@ -721,6 +773,7 @@ fn lobby_panel(
     x: f32,
     w: f32,
     time: f32,
+    colors: usize,
 ) -> FpsAction {
     use crate::menu::fit;
     use minelib_net::proto;
@@ -745,6 +798,7 @@ fn lobby_panel(
         time,
     ) {
         st.search_focus = true;
+        st.map_search_focus = false;
     } else if c.click && !c.hovered(x, y0, w, h) {
         st.search_focus = false;
     }
@@ -774,13 +828,13 @@ fn lobby_panel(
     let cx0 = lx + Ui::text_width("Ta couleur", ds) + 4.0 * s;
     // Autant de carrés par ligne que la place le permet (10 couleurs : souvent 2 lignes).
     let per = (((lx + inner - cx0 + 2.0 * s) / step).floor() as usize).max(1);
-    let lines = PLAYER_COLORS.len().div_ceil(per);
-    for (k, col) in PLAYER_COLORS.iter().enumerate() {
+    let lines = colors.div_ceil(per);
+    for (k, col) in PLAYER_COLORS.iter().enumerate().take(colors) {
         let bx = cx0 + (k % per) as f32 * step;
         let cy = cy + (k / per) as f32 * step;
         let chosen = v.color == k as u8;
         if chosen {
-            c.ui.rect(bx - s, cy - s, sq + 2.0 * s, sq + 2.0 * s, WHITE);
+            c.ui.rect(bx - s, cy - s, sq + 2.0 * s, sq + 2.0 * s, GOLD);
         }
         c.ui.rect(bx, cy, sq, sq, *col);
         if c.hovered(bx, cy, sq, sq) && c.click {

@@ -387,6 +387,37 @@ impl Session {
         save::save_world(&self.dir, &data, &self.world)
     }
 
+    /// Copie du monde tel qu'il est maintenant (serveur de construction compris) dans ses
+    /// mondes solo, sous un nouveau nom. Renvoie son dossier.
+    pub fn download_copy(&mut self, saves: &std::path::Path) -> Result<std::path::PathBuf> {
+        let name = format!("{} (copie)", self.meta.name);
+        let dir = save::create_world(saves, &name, self.meta.seed)?;
+        let mut meta = self.meta.clone();
+        meta.name = name;
+        meta.created = save::now();
+        meta.last_played = save::now();
+        let mut game = self.game;
+        if game.mode == GameMode::Fps {
+            game.mode = GameMode::Creative;
+        }
+        let data = SaveData {
+            game,
+            generator: self.world.generator,
+            meta,
+            player: Some(PlayerState {
+                pos: self.player.pos.into(),
+                yaw: self.player.yaw,
+                pitch: self.player.pitch,
+                flying: self.player.flying,
+            }),
+            clock: self.world.clock,
+            night: self.night,
+            inventory: None,
+        };
+        save::save_world(&dir, &data, &self.world)?;
+        Ok(dir)
+    }
+
     /// Nouveaux réglages graphiques (écran Paramètres), appliqués tout de suite.
     pub fn apply_config(&mut self, cfg: SessionConfig) {
         self.view_distance = cfg.view_distance.clamp(2, MAX_VIEW_DISTANCE);
@@ -1541,6 +1572,16 @@ impl Session {
                     mac,
                 } => b.set_ticket(*room, pseudo.clone(), *expires, *mac),
                 // WorldEdit refusé (pas OP) : les blocs reviennent.
+                // Arrivée sur le serveur : là où l'on était (gardé par le relais).
+                Event::BuildSpawn { pos, yaw, pitch } => {
+                    self.player.pos = Vec3::from(*pos);
+                    self.player.vel = Vec3::ZERO;
+                    self.player.yaw = *yaw;
+                    self.player.pitch = *pitch;
+                    self.fall_from = None;
+                    self.fall_top = None;
+                    return;
+                }
                 Event::BulkDone { id, error } => {
                     let dirty = b.bulk_done(*id, error, &mut self.world);
                     self.dirty.extend(dirty);

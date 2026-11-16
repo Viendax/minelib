@@ -678,6 +678,11 @@ impl Match {
         self.assign_colors(team);
     }
 
+    /// Couleurs d'une équipe de cette carte : les N premières à N contre N.
+    fn team_colors(&self) -> usize {
+        (self.map.players() as usize / 2).clamp(1, COLORS)
+    }
+
     /// Couleurs d'une équipe : chacun la sienne ; les préférences d'abord (le premier
     /// arrivé garde la sienne), les autres prennent les couleurs libres dans l'ordre.
     fn assign_colors(&mut self, team: u8) {
@@ -687,11 +692,12 @@ impl Match {
             .filter(|(_, p)| p.team == team && p.present)
             .map(|(&k, _)| k)
             .collect();
+        let n = self.team_colors();
         let mut taken = [false; COLORS];
         let mut rest = Vec::new();
         for &k in &ids {
             let pref = self.players[&k].pref;
-            if (pref as usize) < COLORS && !taken[pref as usize] {
+            if (pref as usize) < n && !taken[pref as usize] {
                 taken[pref as usize] = true;
                 self.players.get_mut(&k).expect("joueur").color = pref;
             } else {
@@ -699,10 +705,8 @@ impl Match {
             }
         }
         for k in rest {
-            let c = taken.iter().position(|t| !t).unwrap_or(0);
-            if c < COLORS {
-                taken[c] = true;
-            }
+            let c = taken[..n].iter().position(|t| !t).unwrap_or(0);
+            taken[c] = true;
             self.players.get_mut(&k).expect("joueur").color = c as u8;
         }
     }
@@ -1576,6 +1580,25 @@ mod tests {
             m.join(7, "Tard");
             assert_ne!(m.players[&7].team, team);
         }
+    }
+
+    #[test]
+    fn a_team_uses_only_the_first_colors_of_its_size() {
+        // 2 contre 2 : bleu et orange seulement, même si l'on préfère le violet.
+        let mut map = FpsMap::default();
+        map.set_players(4);
+        let mut m = Match::new(map, [0; 32], 3);
+        m.join_party(1, "A", 9);
+        m.join_party(2, "B", 9);
+        m.set_color(1, 4);
+        m.set_color(2, 1);
+        assert_eq!(m.players[&2].color, 1);
+        assert_eq!(m.players[&1].color, 0);
+        // 5 contre 5 : le violet (5e couleur) est permis.
+        let mut m = Match::new(FpsMap::default(), [0; 32], 3);
+        m.join(1, "A");
+        m.set_color(1, 4);
+        assert_eq!(m.players[&1].color, 4);
     }
 
     fn full_match() -> Match {
