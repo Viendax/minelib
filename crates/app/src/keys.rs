@@ -470,12 +470,16 @@ pub struct Bindings {
     /// Mode FPS : un appui sur « Marcher » / « S'accroupir » bascule au lieu de maintenir.
     pub walk_toggle: bool,
     pub duck_toggle: bool,
+    /// Boutons de la souris ignorés jusqu'à ce qu'ils soient relâchés (le clic sur
+    /// « Reprendre » ne doit pas poser un bloc).
+    pub mouse_muted: bool,
 }
 
 impl Default for Bindings {
     fn default() -> Self {
         Self {
             keys: Action::ALL.map(|a| a.default_bind()),
+            mouse_muted: false,
             walk_toggle: false,
             duck_toggle: false,
         }
@@ -507,11 +511,15 @@ impl Bindings {
     }
 
     pub fn held(&self, input: &Input, a: Action) -> bool {
-        self.get(a).is_some_and(|k| k.held(input))
+        self.get(a)
+            .filter(|k| !(self.mouse_muted && matches!(k, Bind::Mouse(_))))
+            .is_some_and(|k| k.held(input))
     }
 
     pub fn pressed(&self, input: &Input, a: Action) -> bool {
-        self.get(a).is_some_and(|k| k.pressed(input))
+        self.get(a)
+            .filter(|k| !(self.mouse_muted && matches!(k, Bind::Mouse(_))))
+            .is_some_and(|k| k.pressed(input))
     }
 
     pub fn load(path: &Path) -> Self {

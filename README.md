@@ -121,6 +121,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 - **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts.
 - **Survie, créatif, spectateur** (`/gm 0`, `1`, `3`), et **FPS** (`/gm 2`) pour essayer sa carte, même sur un serveur de construction.
 - **WorldEdit intégré** : plus de 40 commandes `//` (remplir, copier, coller, tourner, sphères, cylindres, annuler…). Sur un serveur de construction en ligne, réservé à ses OP : le relais vérifie et envoie les blocs à tous.
+- **L'eau et la lave coulent comme dans Minecraft** : sources infinies, chutes, écoulement vers le trou le plus proche, obsidienne et pierre taillée quand elles se rencontrent ; on y nage (lentement dans la lave, qui brûle). La **barrière à fluides** (`/give fluid_barrier`) est invisible comme la barrière, mais on la traverse : seuls l'eau et la lave s'y arrêtent.
 - **Des blocs qui se posent comme on s'y attend** : escaliers face à toi (à l'envers au plafond), dalles, portes, trappes, vitres qui se raccordent, bannières.
 - **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`).
 - **Importe tes mondes Java** (format Anvil, toutes versions) et tes **packs de textures** : les fichiers d'origine ne sont jamais modifiés.

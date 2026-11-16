@@ -142,7 +142,11 @@ pub fn catalogue() -> &'static [Item] {
         for (i, d) in registry().defs.iter().enumerate() {
             if matches!(
                 d.shape,
-                Shape::Air | Shape::Invisible | Shape::Torch | Shape::WallTorch(_)
+                Shape::Air
+                    | Shape::Invisible
+                    | Shape::Torch
+                    | Shape::WallTorch(_)
+                    | Shape::Fluid(_)
             ) || d.key.starts_with("reserved")
                 || d.key.ends_with("_upper")
                 || d.key.contains(":upper")

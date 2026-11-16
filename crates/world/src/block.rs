@@ -107,7 +107,10 @@ impl BlockId {
 
     /// Peut-on casser ce bloc ?
     pub fn is_breakable(self) -> bool {
-        self.is_targetable() && self != Self::BEDROCK && self != Self::BARRIER
+        self.is_targetable()
+            && self != Self::BEDROCK
+            && self != Self::BARRIER
+            && self.def().key != "fluid_barrier"
     }
 
     pub fn name(self) -> &'static str {

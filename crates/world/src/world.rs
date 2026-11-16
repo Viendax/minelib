@@ -46,6 +46,9 @@ pub struct World {
     /// change est envoyé aux autres).
     /// Blocs changés par le joueur local : (position, nouveau bloc, bloc d'avant).
     pub journal: Option<Vec<([i32; 3], BlockId, BlockId)>>,
+    /// Cases changées ici (pas celles venues d'autres joueurs), pour l'écoulement de l'eau
+    /// et de la lave ; `None` : pas relevées.
+    pub touched: Option<Vec<[i32; 3]>>,
 }
 
 impl World {
@@ -59,6 +62,7 @@ impl World {
             clock: 0.0,
             generator: Generator::Procedural,
             journal: None,
+            touched: None,
         }
     }
 
@@ -318,8 +322,10 @@ impl World {
             return Vec::new();
         }
         let journal = self.journal.take();
+        let touched = self.touched.take();
         let dirty = self.set(x, y, z, id);
         self.journal = journal;
+        self.touched = touched;
         dirty
     }
 
@@ -427,6 +433,11 @@ impl World {
         if let Some(j) = &mut self.journal {
             if old != id {
                 j.push(([x, y, z], id, old));
+            }
+        }
+        if let Some(t) = &mut self.touched {
+            if old != id {
+                t.push([x, y, z]);
             }
         }
         let index = lx as u32 + 16 * lz as u32 + 256 * y as u32;

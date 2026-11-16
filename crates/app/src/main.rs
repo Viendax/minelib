@@ -45,6 +45,7 @@ mod chat;
 mod cs;
 mod debug;
 mod equip;
+mod fluids;
 mod fps;
 mod fpsmap;
 mod garant;
@@ -1951,6 +1952,9 @@ impl Game {
         c.ui.text(4.0 * s, c.h - 12.0 * s, s, color, line);
         if resume {
             self.screen = Screen::Playing;
+            if let Some(sess) = &mut self.session {
+                sess.keys.mouse_muted = true;
+            }
         }
         if settings {
             self.settings_return = Screen::Paused;

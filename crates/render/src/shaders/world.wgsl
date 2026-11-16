@@ -363,7 +363,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool) -> vec4<f32> {
         // Points lumineux : chaque source proche se reflète (couleur de sa flamme), net
         // sur un miroir, plus étalé sur le métal ; avec ou sans raytracing.
         if g.rt.x < 0.5 || i.reflect < 0.99 {
-            color += specular(i.world, r, i.reflect) * flicker * reflect_fade;
+            color += specular(i.world, r, i.reflect, i.light) * flicker * reflect_fade;
         }
     }
 
@@ -479,7 +479,12 @@ fn voxel(c: vec3<i32>) -> u32 {
 }
 
 /// Reflet des sources de lumière dans la direction réfléchie `r` depuis `p`.
-fn specular(p: vec3<f32>, r: vec3<f32>, k: f32) -> vec3<f32> {
+/// `face_light` : lumière des torches reçue par la face (propagée case par case, donc
+/// arrêtée par les murs) : une source dont la lumière n'arrive pas jusqu'ici est cachée
+/// derrière un mur, son reflet n'apparaît pas.
+fn specular(p: vec3<f32>, r: vec3<f32>, k: f32, face_light: vec3<f32>) -> vec3<f32> {
+    let m = max(face_light.x, max(face_light.y, face_light.z));
+    let lit2 = m * m;
     let shin = exp2(mix(5.0, 13.0, k));
     let gain = mix(0.6, 6.0, k * k);
     var c = vec3<f32>(0.0);
@@ -497,7 +502,12 @@ fn specular(p: vec3<f32>, r: vec3<f32>, k: f32) -> vec3<f32> {
         let size = max(lp.w, 0.25) / max(d, 0.3);
         let cosr = max(dot(r, to_l / d), 0.0);
         let s = pow(cosr, min(shin, 2.0 / (size * size)));
-        c += g.lights_col[j].rgb * s * f * f * gain;
+        // Sans obstacle, la lumière de cette source (−25 % par case, en ligne brisée : au
+        // plus √3 fois la distance) arrive ici à au moins ~0,75^(1,75 (d + 0,7)) (au carré
+        // ici) ; bien moins : elle contourne un mur, la source est cachée.
+        let direct = pow(0.75, 3.5 * (d + 0.7));
+        let seen = smoothstep(0.15, 0.6, lit2 / max(direct, 1e-6));
+        c += g.lights_col[j].rgb * s * f * f * gain * seen;
     }
     if g.held_pos.w > 0.0 {
         let to_l = g.held_pos.xyz - p;

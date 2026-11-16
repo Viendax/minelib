@@ -1027,7 +1027,7 @@ fn mesh_block(
                 let (wx, wy, wz) = ((ox + x) as f32, y as f32, (oz + z) as f32);
                 match def.shape {
                     Shape::Air | Shape::Invisible => return,
-                    Shape::Cube => {}
+                    Shape::Cube | Shape::Fluid(_) => {}
                     Shape::Torch | Shape::WallTorch(_) => {
                         let lit = light_at(b);
                         // Torche murale : même modèle, penché contre le mur.
@@ -1181,9 +1181,37 @@ fn mesh_block(
                         return;
                     }
                 }
+                // Eau, lave : hauteur du dessus (plein si le même fluide est au-dessus) ;
+                // faces cachées contre le même fluide au moins aussi haut.
+                let fluid_here = crate::registry::fluid(id).map(|(f, _)| f);
+                let fluid_top = |p: [i32; 3], f: crate::registry::Fluid| -> Option<f32> {
+                    let here = pad.get(p[0], p[1], p[2]);
+                    if crate::registry::fluid(here).map(|(g, _)| g) != Some(f) {
+                        return None;
+                    }
+                    let above = pad.get(p[0], p[1] + 1, p[2]);
+                    if crate::registry::fluid(above).map(|(g, _)| g) == Some(f) {
+                        return Some(1.0);
+                    }
+                    Some(match here.def().shape {
+                        Shape::Fluid(h) => h as f32 / 16.0,
+                        _ => 1.0,
+                    })
+                };
+                let top = fluid_here.and_then(|f| fluid_top(b, f)).unwrap_or(1.0);
                 for (face, &(n, u, v)) in FACES.iter().enumerate() {
                     let front = add(b, n);
                     let facing = pad.get(front[0], front[1], front[2]);
+                    if let Some(f) = fluid_here {
+                        let hidden = match face {
+                            2 => fluid_top(front, f).is_some(),
+                            3 => fluid_top(front, f).is_some(),
+                            _ => fluid_top(front, f).is_some_and(|h| h >= top),
+                        };
+                        if hidden {
+                            continue;
+                        }
+                    }
                     // Cachée par un bloc plein, par le même bloc (verre, eau), ou par la
                     // face pleine d'une dalle ou d'un escalier collée contre elle (sinon
                     // les deux surfaces au même endroit scintillent sous du verre).
@@ -1289,10 +1317,16 @@ fn mesh_block(
                             base[1] + a * u[1] + c * v[1],
                             base[2] + a * u[2] + c * v[2],
                         ];
+                        // Fluide plus bas qu'un bloc : coins du haut abaissés.
+                        let py = if top < 1.0 && p[1] > y {
+                            y as f32 + top
+                        } else {
+                            p[1] as f32
+                        };
                         out.vertices.push(Vertex {
                             pos: [
                                 (ox + p[0]) as f32 - n[0] as f32 * inset,
-                                p[1] as f32 - n[1] as f32 * inset,
+                                py - n[1] as f32 * inset,
                                 (oz + p[2]) as f32 - n[2] as f32 * inset,
                             ],
                             data: Vertex::block_data(face as u32, ao[i], lights[i])
@@ -1352,6 +1386,33 @@ mod tests {
             .filter(|q| q[0].face() == 2 && q.iter().all(|v| v.pos[1] == 41.0))
             .count();
         assert_eq!(tops, 1);
+    }
+
+    #[test]
+    fn flowing_water_is_lower_and_hides_faces_against_itself() {
+        let reg = crate::registry::registry();
+        let mut w = empty_world_with_block(3, 40, 3);
+        w.set(4, 40, 3, BlockId::STONE);
+        w.set(3, 41, 3, reg.by_key("water_flow:3").unwrap());
+        w.set(4, 41, 3, reg.by_key("water_flow:2").unwrap());
+        let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        let quads: Vec<_> = m.vertices.chunks_exact(4).collect();
+        let top = |h: f32| {
+            quads
+                .iter()
+                .filter(|q| {
+                    q[0].face() == 2 && q.iter().all(|v| (v.pos[1] - (41.0 + h)).abs() < 1e-4)
+                })
+                .count()
+        };
+        assert_eq!(top(6.0 / 16.0), 1, "niveau 3 : 6/16 de haut");
+        assert_eq!(top(4.0 / 16.0), 1, "niveau 2 : 4/16 de haut");
+        // Entre les deux : seule la face du plus haut (vers le plus bas) reste.
+        let between = quads
+            .iter()
+            .filter(|q| q[0].face() < 2 && q.iter().all(|v| (v.pos[0] - 4.0).abs() < 0.01))
+            .count();
+        assert_eq!(between, 1);
     }
 
     #[test]

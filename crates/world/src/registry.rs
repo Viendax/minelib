@@ -68,6 +68,9 @@ pub enum Shape {
     },
     /// Deux plans en croix (plantes).
     Cross,
+    /// Eau ou lave qui coule : cube dont le dessus est à `h` seizièmes (16 si le même
+    /// fluide est au-dessus, voir le maillage).
+    Fluid(u8),
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +130,7 @@ impl BlockDef {
             Shape::Post(k) => vec![post_center(k)],
             Shape::Box { min, max } => vec![(min, max)],
             Shape::Cross => vec![([2, 0, 2], [14, 14, 14])],
+            Shape::Fluid(h) => vec![([0, 0, 0], [16, h.max(1), 16])],
         }
     }
 }
@@ -1717,8 +1721,116 @@ fn build() -> Registry {
         b.r.defs[i as usize].connect = first;
     }
 
+    // Ajouts en fin de registre (identifiants stables) : fluides qui coulent, barrière à
+    // fluides, têtes murales.
+    fluids_and_heads(&mut b);
     legacy_table(&mut b);
     b.r
+}
+
+/// Fluide (eau ou lave) d'un bloc et son niveau : 8 source, 1..7 coulant (7 le plus fort,
+/// à côté d'une source), 9 qui tombe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fluid {
+    Water,
+    Lava,
+}
+
+pub const FLUID_SOURCE: u8 = 8;
+pub const FLUID_FALLING: u8 = 9;
+
+impl Fluid {
+    pub fn key(self) -> &'static str {
+        match self {
+            Fluid::Water => "water",
+            Fluid::Lava => "lava",
+        }
+    }
+
+    /// Bloc de ce fluide au niveau `level` (voir `Fluid`).
+    pub fn block(self, level: u8) -> BlockId {
+        let r = registry();
+        let k = self.key();
+        let id = match level {
+            FLUID_SOURCE => r.by_key(k),
+            FLUID_FALLING => r.by_key(&format!("{k}_fall")),
+            l => r.by_key(&format!("{k}_flow:{}", l.clamp(1, 7))),
+        };
+        id.unwrap_or(BlockId::AIR)
+    }
+}
+
+/// Fluide et niveau du bloc (`None` : pas un fluide).
+pub fn fluid(id: BlockId) -> Option<(Fluid, u8)> {
+    static M: OnceLock<Vec<Option<(Fluid, u8)>>> = OnceLock::new();
+    let m = M.get_or_init(|| {
+        registry()
+            .defs
+            .iter()
+            .map(|d| {
+                let k = d.key.as_str();
+                let (f, rest) = match k.strip_prefix("water") {
+                    Some(r) => (Fluid::Water, r),
+                    None => (Fluid::Lava, k.strip_prefix("lava")?),
+                };
+                let level = match rest {
+                    "" => FLUID_SOURCE,
+                    "_fall" => FLUID_FALLING,
+                    r => r.strip_prefix("_flow:")?.parse().ok()?,
+                };
+                Some((f, level))
+            })
+            .collect()
+    });
+    m.get(id.0 as usize).copied().flatten()
+}
+
+fn fluids_and_heads(b: &mut Builder) {
+    for fluid in ["water", "lava"] {
+        let src = b.r.defs[b.r.keys[fluid] as usize].clone();
+        let mut add = |key: String, h: u8| {
+            let id = b.r.defs.len() as u16;
+            b.r.defs.push(BlockDef {
+                key: key.clone(),
+                shape: Shape::Fluid(h),
+                full: false,
+                ..src.clone()
+            });
+            b.r.keys.insert(key, id);
+        };
+        for level in 1..=7u8 {
+            add(format!("{fluid}_flow:{level}"), level * 2);
+        }
+        add(format!("{fluid}_fall"), 16);
+    }
+    // Barrière à fluides : comme la barrière (invisible, se casse seulement en créatif),
+    // mais on la traverse ; seuls l'eau et la lave s'y arrêtent.
+    let barrier = b.r.defs[b.r.keys["barrier"] as usize].clone();
+    let id = b.r.defs.len() as u16;
+    b.r.defs.push(BlockDef {
+        key: "fluid_barrier".into(),
+        name: "barrière à fluides".into(),
+        solid: false,
+        ..barrier
+    });
+    b.r.keys.insert("fluid_barrier".into(), id);
+    // Têtes contre un mur (côté du mur : 0 +X, 1 −X, 4 +Z, 5 −Z).
+    let skull = b.r.defs[b.r.keys["skull"] as usize].clone();
+    for (side, min, max) in [
+        (0u8, [8u8, 4, 4], [16u8, 12, 12]),
+        (1, [0, 4, 4], [8, 12, 12]),
+        (4, [4, 4, 8], [12, 12, 16]),
+        (5, [4, 4, 0], [12, 12, 8]),
+    ] {
+        let key = format!("skull:wall:{side}");
+        let id = b.r.defs.len() as u16;
+        b.r.defs.push(BlockDef {
+            key: key.clone(),
+            shape: Shape::Box { min, max },
+            ..skull.clone()
+        });
+        b.r.keys.insert(key, id);
+    }
 }
 
 /// Rotation (en seizièmes, autour du centre) du repère de base « mur en +Z » vers le mur `d`.

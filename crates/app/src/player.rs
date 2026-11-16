@@ -2,7 +2,7 @@
 //! boîte englobante / voxels (résolues axe par axe).
 
 use glam::{Mat4, Vec3};
-use minelib_world::registry::{post_arms, Shape};
+use minelib_world::registry::{fluid, post_arms, Fluid, Shape};
 use minelib_world::World;
 
 pub const HALF_WIDTH: f32 = 0.3;
@@ -10,12 +10,32 @@ pub const HALF_WIDTH: f32 = 0.3;
 /// Le joueur dont les pieds sont en `feet` est dans l'eau (pieds ou corps) : elle amortit
 /// toute chute.
 pub fn in_water(world: &World, feet: Vec3) -> bool {
-    let water = minelib_world::registry::registry().by_key("water");
-    let (x, z) = (feet.x.floor() as i32, feet.z.floor() as i32);
-    [0.05, 0.9]
-        .iter()
-        .any(|dy| Some(world.get(x, (feet.y + dy).floor() as i32, z)) == water)
+    in_fluid(world, feet) == Some(Fluid::Water)
 }
+
+/// Fluide (eau ou lave, source ou qui coule) où baigne le joueur (pieds ou corps).
+pub fn in_fluid(world: &World, feet: Vec3) -> Option<Fluid> {
+    let (x, z) = (feet.x.floor() as i32, feet.z.floor() as i32);
+    [0.05, 0.9].iter().find_map(|dy| {
+        let y = feet.y + dy;
+        let id = world.get(x, y.floor() as i32, z);
+        let (f, _) = fluid(id)?;
+        // Fluide bas (qui coule) : seulement sous sa surface.
+        let h = match id.def().shape {
+            Shape::Fluid(h) => h as f32 / 16.0,
+            _ => 1.0,
+        };
+        (y - y.floor() <= h).then_some(f)
+    })
+}
+
+/// Nage (comme dans Minecraft) : lent dans l'eau, très lent dans la lave ; on coule
+/// doucement, Saut fait remonter.
+const SWIM_WATER: f32 = 2.2;
+const SWIM_LAVA: f32 = 1.0;
+const SWIM_UP: f32 = 2.4;
+const SINK_WATER: f32 = -1.2;
+const SINK_LAVA: f32 = -0.6;
 pub const HEIGHT: f32 = 1.8;
 pub const EYE: f32 = 1.62;
 
@@ -91,6 +111,8 @@ const LADDER_PUSH: f32 = 3.0;
 const LADDER_RAMP: f32 = 0.5;
 /// Vitesse accroupi sur une échelle (blocs/s) : bien sous le seuil du bruit.
 const LADDER_SNEAK_SPEED: f32 = 1.3;
+/// Vitesse verticale gardée en quittant l'échelle par le haut (presque pas de saut).
+const LADDER_TOP_POP: f32 = 1.0;
 
 /// Vitesse verticale sur une échelle à partir de laquelle elle fait du bruit (à fond).
 pub const LADDER_NOISY: f32 = LADDER_SPEED * 0.95;
@@ -127,6 +149,8 @@ pub struct Player {
     slide: Option<Vec3>,
     /// Accroché à une échelle (pas de chute : on y monte et descend).
     pub on_ladder: bool,
+    /// Fluide où l'on nage (eau, lave).
+    pub swimming: Option<Fluid>,
 }
 
 /// Un autre joueur, vu comme un obstacle.
@@ -191,6 +215,7 @@ impl Player {
             others: Vec::new(),
             slide: None,
             on_ladder: false,
+            swimming: None,
             carry: 250,
         }
     }
@@ -336,6 +361,7 @@ impl Player {
     pub fn update(&mut self, world: &World, m: &MoveInput, dt: f32) {
         // Vitesse verticale d'avant ce pas (sur une échelle, la gravité n'y est pas).
         let vy0 = self.vel.y;
+        let v0 = self.vel;
         let (sy, cy) = self.yaw.sin_cos();
         let fwd = Vec3::new(sy, 0.0, -cy);
         let right = Vec3::new(cy, 0.0, sy);
@@ -385,6 +411,28 @@ impl Player {
                 self.vel.y = JUMP_SPEED;
             }
         }
+        // Dans l'eau ou la lave : on nage.
+        self.swimming = None;
+        if !self.flying && !self.noclip {
+            if let Some(f) = in_fluid(world, self.pos) {
+                self.swimming = Some(f);
+                let (cap, sink) = match f {
+                    Fluid::Water => (SWIM_WATER * if m.sprint { 1.4 } else { 1.0 }, SINK_WATER),
+                    Fluid::Lava => (SWIM_LAVA, SINK_LAVA),
+                };
+                let k = (dt * 6.0).min(1.0);
+                let target = wish * cap;
+                // Depuis la vitesse d'avant ce pas (sans l'accélération de la marche).
+                self.vel.x = v0.x + (target.x - v0.x) * k;
+                self.vel.z = v0.z + (target.z - v0.z) * k;
+                let up = if m.jump { SWIM_UP } else { sink };
+                // On garde l'élan d'un saut hors de l'eau quelques instants, mais une chute
+                // est freinée aussitôt.
+                // La gravité ne compte pas dans un fluide : on part de la vitesse d'avant.
+                let k = (dt * if vy0 < up { 8.0 } else { 3.0 }).min(1.0);
+                self.vel.y = vy0 + (up - vy0) * k;
+            }
+        }
         // Échelle (comme dans CS) : vers l'avant on monte, ou on descend en regardant vers
         // le bas ; sans rien, on reste accroché ; un saut nous en décroche.
         let was_on_ladder = self.on_ladder;
@@ -397,7 +445,10 @@ impl Player {
                     4 => Vec3::Z,
                     _ => -Vec3::Z,
                 };
-                if m.jump_pressed && !self.on_ground {
+                // Sur l'échelle la vitesse verticale est nulle au repos : le sol se cherche juste
+                // sous les pieds.
+                let grounded = self.on_ground || self.support_within(world, 0.02);
+                if m.jump_pressed && !grounded {
                     self.vel = -wall * LADDER_PUSH + Vec3::Y * LADDER_SPEED * 0.6;
                 } else {
                     self.on_ladder = true;
@@ -413,16 +464,23 @@ impl Player {
                     let climb = if touching { climb } else { climb.min(0.0) };
                     // S'éloigner du mur (dos à l'échelle, on avance) : on descend en restant
                     // accroché jusqu'au sol, on ne se décolle pas de l'échelle en l'air.
+                    // Au sol, on s'en va librement : on ne remonte pas l'échelle en
+                    // s'en éloignant.
                     let away = wish.dot(-wall);
-                    let leaving = away > 0.3 && !self.on_ground;
-                    let climb = if leaving { -1.0 } else { climb };
+                    let leaving = away > 0.3;
+                    let climb = match (leaving, grounded) {
+                        (true, false) => -1.0,
+                        (true, true) => 0.0,
+                        _ => climb,
+                    };
+                    let free = grounded && climb <= 0.0;
                     // Accroupi : plus lent (et silencieux, voir `ladder_noise`).
                     let cap = if m.sneak {
                         LADDER_SNEAK_SPEED
                     } else {
                         LADDER_SPEED
                     };
-                    let target = if climb < 0.0 && self.on_ground {
+                    let target = if climb < 0.0 && grounded {
                         0.0
                     } else {
                         climb * cap
@@ -437,27 +495,41 @@ impl Player {
                         vy0.clamp(0.0, cap)
                     };
                     self.vel.y = from + (target - from).clamp(-step, step);
+                    // Au sol : appuyé dessus (le pas suivant sait qu'on y est, et on y marche
+                    // avec l'adhérence du sol).
+                    if free {
+                        self.vel.y = self.vel.y.min(-0.5);
+                    }
                     // À l'horizontale, on suit les touches comme au sol (sans glisser : immobile
                     // sur l'échelle, on ne bouge pas), sans jamais s'écarter du mur en l'air.
                     let mut flat_wish = wish * cap;
-                    if !self.on_ground {
+                    if free {
+                        // Au sol sans monter : on marche comme d'habitude (vitesse comprise).
+                        flat_wish = Vec3::new(self.vel.x, 0.0, self.vel.z);
+                    }
+                    if !grounded {
                         flat_wish -= -wall * flat_wish.dot(-wall).max(0.0);
                     }
                     let k = (dt * 14.0).min(1.0);
                     self.vel.x += (flat_wish.x - self.vel.x) * k;
                     self.vel.z += (flat_wish.z - self.vel.z) * k;
-                    if !self.on_ground {
+                    if !grounded {
                         let out = Vec3::new(self.vel.x, 0.0, self.vel.z).dot(-wall).max(0.0);
                         self.vel -= -wall * out;
                     }
                     let flat = Vec3::new(self.vel.x, 0.0, self.vel.z);
-                    if flat.length() > cap {
+                    if !free && flat.length() > cap {
                         let f = flat.normalize() * cap;
                         self.vel.x = f.x;
                         self.vel.z = f.z;
                     }
                 }
             }
+        }
+        // Sortie par le haut de l'échelle : on arrive sur le palier sans être projeté en
+        // l'air par la vitesse de montée.
+        if was_on_ladder && !self.on_ladder && !m.jump_pressed && self.swimming.is_none() {
+            self.vel.y = self.vel.y.min(LADDER_TOP_POP);
         }
         let fall_speed = -self.vel.y;
         let crouching = crouching && !fps;
@@ -678,8 +750,13 @@ impl Player {
 
     /// Y a-t-il un appui sous les pieds (à moins de 0,6 bloc) ?
     fn supported(&mut self, world: &World) -> bool {
+        self.support_within(world, 0.6)
+    }
+
+    /// Sol à moins de `d` sous les pieds.
+    fn support_within(&mut self, world: &World, d: f32) -> bool {
         let saved = self.pos;
-        let hit = self.move_axis(world, 1, -0.6);
+        let hit = self.move_axis(world, 1, -d);
         self.pos = saved;
         self.slide = None;
         hit
@@ -849,6 +926,59 @@ mod tests {
             }
         }
         w
+    }
+
+    #[test]
+    fn swims_in_water_and_lava_like_minecraft() {
+        let mut w = flat_world();
+        for y in 11..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    w.set(x, y, z, BlockId::WATER);
+                }
+            }
+        }
+        let dt = 1.0 / 64.0;
+        // On tombe dedans : freiné, puis on coule doucement.
+        let mut p = Player::new(Vec3::new(8.5, 15.0, 8.5));
+        p.vel.y = -15.0;
+        let none = MoveInput::default();
+        for _ in 0..32 {
+            p.update(&w, &none, dt);
+        }
+        assert_eq!(p.swimming, Some(Fluid::Water));
+        assert!(
+            p.vel.y > -1.5 && p.vel.y < 0.0,
+            "coule doucement : {}",
+            p.vel.y
+        );
+        // Saut tenu : on remonte.
+        let y = p.pos.y;
+        let jump = MoveInput {
+            jump: true,
+            ..Default::default()
+        };
+        for _ in 0..32 {
+            p.update(&w, &jump, dt);
+        }
+        assert!(p.pos.y > y + 0.5, "remonte : {} → {}", y, p.pos.y);
+        // Nage lente à l'horizontale.
+        let fwd = MoveInput {
+            forward: 1.0,
+            ..Default::default()
+        };
+        for _ in 0..64 {
+            p.update(&w, &fwd, dt);
+        }
+        let flat = Vec3::new(p.vel.x, 0.0, p.vel.z).length();
+        assert!(flat < SWIM_WATER + 0.01, "{flat}");
+        // Lave : plus lent encore.
+        let lava = minelib_world::registry::registry().by_key("lava").unwrap();
+        w.set(8, 11, 8, lava);
+        w.set(8, 12, 8, lava);
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        p.update(&w, &none, dt);
+        assert_eq!(p.swimming, Some(Fluid::Lava));
     }
 
     #[test]
@@ -1153,6 +1283,44 @@ mod tests {
                 p.pos.x < 9.0,
                 "parti une fois au sol (fps {fps}) : x = {}",
                 p.pos.x
+            );
+            // En haut de l'échelle à pleine vitesse : on arrive sur le mur sans s'envoler.
+            let mut p = Player::new(Vec3::new(9.4, 14.0, 8.5));
+            p.yaw = std::f32::consts::FRAC_PI_2;
+            let mut top = 0.0f32;
+            for _ in 0..400 {
+                p.update(&w, &up, dt);
+                top = top.max(p.pos.y);
+            }
+            assert!(
+                p.pos.x > 10.0 && p.on_ground,
+                "sur le mur (fps {fps}) : {:?}",
+                p.pos
+            );
+            assert!(
+                top < 18.2,
+                "projeté en haut de l'échelle (fps {fps}) : {top}"
+            );
+            // Au sol contre l'échelle : on s'en éloigne sans effort, à vitesse normale.
+            let mut p = Player::new(Vec3::new(9.4, 11.0, 8.5));
+            p.yaw = -std::f32::consts::FRAC_PI_2;
+            p.update(&w, &still, dt);
+            for _ in 0..32 {
+                p.update(&w, &up, dt);
+            }
+            assert!(p.on_ground && p.pos.y < 11.01, "reste au sol (fps {fps})");
+            // Comme sans échelle (à 10 cm près).
+            let mut q = Player::new(Vec3::new(5.4, 11.0, 4.5));
+            q.yaw = -std::f32::consts::FRAC_PI_2;
+            q.update(&w, &still, dt);
+            for _ in 0..32 {
+                q.update(&w, &up, dt);
+            }
+            assert!(
+                (9.4 - p.pos.x) > (5.4 - q.pos.x) - 0.1,
+                "s'éloigne (fps {fps}) : {} au lieu de {}",
+                9.4 - p.pos.x,
+                5.4 - q.pos.x
             );
             // Immobile sur l'échelle : aucune glissade de côté.
             let mut p = Player::new(Vec3::new(9.4, 14.0, 8.5));

@@ -155,6 +155,10 @@ pub struct Session {
     pub volume: f32,
     /// Touches choisies dans « Régler les touches ».
     pub keys: Bindings,
+    /// Écoulement de l'eau et de la lave.
+    fluids: crate::fluids::Fluids,
+    /// Temps avant la prochaine brûlure dans la lave.
+    lava_burn: f32,
     autosave: f32,
     hit: Option<Hit>,
     overlay: Overlay,
@@ -336,6 +340,8 @@ impl Session {
             radar_map: false,
             volume: 0.6,
             keys: Bindings::default(),
+            fluids: Default::default(),
+            lava_burn: 0.0,
             autosave: AUTOSAVE_S,
             hit: None,
             overlay: Overlay::default(),
@@ -454,6 +460,13 @@ impl Session {
         self.screen_size = (sw as f32, sh as f32);
         use minelib_render::perf;
         let logic = perf::scope("jeu : logique et physique");
+        if self.keys.mouse_muted
+            && ![Mouse::Left, Mouse::Right, Mouse::Middle]
+                .iter()
+                .any(|&b| input.mouse_held(b))
+        {
+            self.keys.mouse_muted = false;
+        }
         crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
         // Minimap : grille autour du joueur, sites de la carte.
         if self.net.is_some() {
@@ -630,6 +643,26 @@ impl Session {
             let shots = std::mem::take(&mut self.fps.shots);
             let mut net_locals = Vec::new();
             self.fps.hit_marker.0 = (self.fps.hit_marker.0 - dt).max(0.0);
+            // Eau et lave qui coulent (hors parties FPS en ligne : la carte y est figée).
+            let fluids_on = self.net.is_none() && self.game.mode != GameMode::Fps;
+            if fluids_on {
+                if self.world.touched.is_none() {
+                    self.world.touched = Some(Vec::new());
+                }
+                let touched = self
+                    .world
+                    .touched
+                    .as_mut()
+                    .map(std::mem::take)
+                    .unwrap_or_default();
+                for p in touched {
+                    self.fluids.notify(&self.world, p);
+                }
+                let dirty = self.fluids.update(&mut self.world, dt);
+                self.dirty.extend(dirty);
+            } else {
+                self.world.touched = None;
+            }
             // Construction en ligne : blocs changés envoyés au garant, position aux voisins.
             if dt > 0.0 {
                 self.fps_avg += (1.0 / dt - self.fps_avg) * 0.02;
@@ -1374,6 +1407,16 @@ impl Session {
             }
             self.tick_acc -= SIM_TICK;
             self.check_fall();
+            // Dans la lave (comme dans Minecraft) : 4 points de vie toutes les demi-secondes.
+            if self.player.swimming == Some(minelib_world::registry::Fluid::Lava) {
+                self.lava_burn -= SIM_TICK;
+                if self.lava_burn <= 0.0 {
+                    self.lava_burn = 0.5;
+                    self.damage(4);
+                }
+            } else {
+                self.lava_burn = 0.0;
+            }
         }
         let a = self.tick_acc / SIM_TICK;
         let s = SimState {

@@ -302,7 +302,7 @@ fn recent_block(full: &str) -> Option<BlockId> {
         "bell" => "gold_block",
         "stripped_bamboo_block" | "bamboo_block" | "bamboo_mosaic" => "hay",
         "iron_chain" | "chain" => "iron_bars",
-        "player_wall_head" | "player_head" => "skull",
+        "player_head" => "skull",
         "moss_carpet" => "carpet_green",
         "pale_moss_carpet" => "carpet_silver",
         "bush" | "short_dry_grass" | "tall_dry_grass" => "plant:tallgrass",
@@ -430,6 +430,27 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
     let n = full.strip_prefix("minecraft:").unwrap_or(full);
     let prop = |k: &str| props.get(k).map(String::as_str);
     let key = |k: &str| reg.by_key(k);
+
+    // Eau et lave qui coulent (Minecraft : 0 source, 1 le plus fort … 7, 8 et plus qui
+    // tombe).
+    if n == "water" || n == "lava" || n == "flowing_water" || n == "flowing_lava" {
+        let f = if n.ends_with("water") {
+            registry::Fluid::Water
+        } else {
+            registry::Fluid::Lava
+        };
+        let level: u8 = prop("level").and_then(|l| l.parse().ok()).unwrap_or(0);
+        return Some(match level {
+            0 => f.block(registry::FLUID_SOURCE),
+            1..=7 => f.block(8 - level),
+            _ => f.block(registry::FLUID_FALLING),
+        });
+    }
+
+    // Tête contre un mur : posée du côté opposé à son regard.
+    if n.ends_with("_wall_head") || n.ends_with("_wall_skull") {
+        return key(&format!("skull:wall:{}", wall_side(prop("facing"))));
+    }
 
     // Torche murale : `facing` = côté vers lequel elle penche ; le mur est à l'opposé.
     if n == "wall_torch" || n == "soul_wall_torch" {
@@ -778,8 +799,8 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 
 /// Version du convertisseur : un monde converti par une version plus ancienne l'est de
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
-/// récents, au lieu de pierre ou de vide).
-pub const IMPORT_VERSION: u32 = 3;
+/// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales).
+pub const IMPORT_VERSION: u32 = 4;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {

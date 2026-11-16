@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 93;
+pub const VERSION: u32 = 94;
 const REPO: &str = "https://api.github.com/repos/Viendax/minelib/releases";
 const EVERY: Duration = Duration::from_secs(600);
 
@@ -178,7 +178,7 @@ fn download(r: &Release, done: &AtomicU64) -> Result<Vec<u8>> {
 }
 
 /// Remplace l'exécutable en cours par `bytes` et lance la nouvelle version.
-fn install_and_restart(bytes: &[u8]) -> Result<()> {
+fn install_and_restart(bytes: &[u8], version: u32) -> Result<()> {
     let exe = std::env::current_exe()?;
     let new = exe.with_extension("new");
     let old = exe.with_extension("old");
@@ -188,6 +188,14 @@ fn install_and_restart(bytes: &[u8]) -> Result<()> {
     if let Err(e) = std::fs::rename(&new, &exe) {
         let _ = std::fs::rename(&old, &exe);
         return Err(e).context("mise en place de la nouvelle version");
+    }
+    // Jeu installé par le lanceur : il lit la version dans `version.txt`, à côté.
+    if let Some(v) = exe
+        .parent()
+        .map(|d| d.join("version.txt"))
+        .filter(|v| v.exists())
+    {
+        let _ = std::fs::write(v, version.to_string());
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::Command::new(&exe)
@@ -286,8 +294,9 @@ impl Updater {
     pub fn new() -> Self {
         // Lancé par le lanceur : c'est lui qui tient le jeu à jour depuis GitHub.
         let by_launcher = std::env::var_os("MINELIB_LAUNCHER").is_some();
-        let enabled =
-            cfg!(windows) && std::env::var_os("MINELIB_NO_UPDATE").is_none() && !by_launcher;
+        // Le lanceur met le jeu à jour avant de le lancer ; ensuite, comme sans lanceur, le
+        // jeu vérifie toutes les 10 minutes et propose « Mettre à jour » sur l'accueil.
+        let enabled = cfg!(windows) && std::env::var_os("MINELIB_NO_UPDATE").is_none();
         let mut integrity_rx = None;
         if enabled {
             cleanup();
@@ -303,7 +312,13 @@ impl Updater {
             enabled,
             rx: None,
             integrity_rx,
-            next_check: Instant::now(),
+            // Tout juste mis à jour par le lanceur : première vérification un peu plus tard.
+            next_check: Instant::now()
+                + if by_launcher {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::ZERO
+                },
             available: None,
             status: None,
             downloading: false,
@@ -363,16 +378,21 @@ impl Updater {
                     self.start();
                 }
             }
-            Msg::UpToDate => self.check = Check::UpToDate,
+            Msg::UpToDate => {
+                if self.check != Check::Launcher {
+                    self.check = Check::UpToDate;
+                }
+            }
             Msg::NoRelease => self.check = Check::NoRelease,
             Msg::Downloaded(bytes) => {
-                if let Err(e) = install_and_restart(&bytes) {
+                let version = self.available.as_ref().map_or(VERSION, |r| r.version);
+                if let Err(e) = install_and_restart(&bytes, version) {
                     self.downloading = false;
                     self.status = Some(format!("Mise à jour impossible : {e:#}"));
                 }
             }
             Msg::Failed(e) => {
-                if !self.downloading && self.available.is_none() {
+                if !self.downloading && self.available.is_none() && self.check != Check::Launcher {
                     self.check = Check::Unreachable;
                 }
                 let was_downloading = self.downloading;
