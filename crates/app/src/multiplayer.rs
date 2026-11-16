@@ -367,6 +367,8 @@ pub struct FpsHome {
     /// Recherche dans les cartes (à droite de « Carte »).
     pub map_search: String,
     pub map_search_focus: bool,
+    /// Dernier clic sur une carte (index, horloge) : un double clic lance la partie.
+    pub map_click: Option<(usize, f32)>,
     /// Dernière mise à jour automatique de la liste des cartes (horloge de l'écran).
     pub polled: f32,
 }
@@ -555,8 +557,10 @@ pub fn fps_screen(
     let my = list_y + list_h + 6.0 * s;
     let big = s * 1.5;
     c.ui.text(x, my + 4.0 * s, big, WHITE, "Carte");
-    let field_x = x + Ui::text_width("Carte", big) + 8.0 * s;
-    let field_w = ((x + w - field_x) / s).min(160.0);
+    // Recherche alignée sur le bord droit de la liste.
+    let after_label = x + Ui::text_width("Carte", big) + 8.0 * s;
+    let field_w = ((x + w - after_label) / s).min(160.0);
+    let field_x = x + w - field_w * s;
     if c.text_field(
         "",
         &st.map_search,
@@ -627,6 +631,7 @@ pub fn fps_screen(
             t,
         );
     }
+    let mut double = None;
     for (k, &i) in shown.iter().enumerate().skip(st.map_scroll).take(vis) {
         let m = &maps[i];
         let y = maps_y + 2.0 * s + (k - st.map_scroll) as f32 * row_h;
@@ -655,6 +660,12 @@ pub fn fps_screen(
             st.selected == Some(i),
         ) {
             st.selected = Some(i);
+            if st.map_click.is_some_and(|(j, t)| j == i && time - t < 0.4) {
+                double = Some(i);
+                st.map_click = None;
+            } else {
+                st.map_click = Some((i, time));
+            }
         }
         // Joueurs, bien visibles : « 3 / 10 » en attente, ou le format de la carte.
         let n = m.players.max(2) as u32;
@@ -726,6 +737,10 @@ pub fn fps_screen(
         return FpsAction::Back;
     }
     if let (true, Some(i)) = (search, st.selected) {
+        return FpsAction::Search(i);
+    }
+    // Double clic sur une carte : comme « Jouer » (si on peut jouer).
+    if let Some(i) = double.filter(|_| !busy && leader && fits) {
         return FpsAction::Search(i);
     }
     if refresh {

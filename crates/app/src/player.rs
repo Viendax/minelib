@@ -103,12 +103,14 @@ const FLY_SPRINT: f32 = 30.0;
 const TOUCH: f32 = 1e-4;
 /// Hauteur franchie sans sauter (dalles, marches d'escalier).
 const STEP_HEIGHT: f32 = 0.6;
-/// Vitesse sur une échelle (blocs/s, environ celle de CS), et élan quand on saute pour
-/// s'en décrocher.
-const LADDER_SPEED: f32 = 4.5;
+/// Vitesse sur une échelle : celle de CS (`MAX_CLIMB_SPEED` 200 u/s, soit 5,08 blocs/s,
+/// dans les mêmes unités que la gravité et le saut), et élan quand on saute pour s'en
+/// décrocher.
+const LADDER_SPEED: f32 = 200.0 * cs::UNIT;
 const LADDER_PUSH: f32 = 3.0;
-/// Temps pour atteindre la pleine vitesse sur une échelle (s).
-const LADDER_RAMP: f32 = 0.5;
+/// Temps pour atteindre la pleine vitesse sur une échelle (s) : presque immédiat, comme
+/// dans CS.
+const LADDER_RAMP: f32 = 0.15;
 /// Vitesse accroupi sur une échelle (blocs/s) : bien sous le seuil du bruit.
 const LADDER_SNEAK_SPEED: f32 = 1.3;
 /// Vitesse verticale gardée en quittant l'échelle par le haut (presque pas de saut).
@@ -1218,16 +1220,21 @@ mod tests {
                 fps,
                 ..Default::default()
             };
-            // On prend de la vitesse en une demi-seconde environ.
-            for _ in 0..20 {
+            // On prend de la vitesse en 0,15 s environ.
+            for _ in 0..64 {
                 p.update(&w, &up, dt);
+                if p.vel.y > 0.0 {
+                    break;
+                }
             }
+            p.update(&w, &up, dt);
             assert!(p.on_ladder, "fps {fps}");
             assert!(
                 p.vel.y > 0.0 && p.vel.y < LADDER_NOISY,
-                "pas tout de suite à fond"
+                "pas tout de suite à fond : {}",
+                p.vel.y
             );
-            for _ in 0..44 {
+            for _ in 0..26 {
                 p.update(&w, &up, dt);
             }
             assert!(p.vel.y >= LADDER_NOISY, "à fond (fps {fps}) : {}", p.vel.y);
