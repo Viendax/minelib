@@ -8,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 
 use std::collections::VecDeque;
 
-use crate::registry::{light_cover, post_arms, PostKind, Shape};
+use crate::registry::{light_cover, post_arms, post_connects, PostKind, Shape};
 use crate::world::{Light, LIGHT_RADIUS};
 use crate::{BlockId, Chunk, ChunkPos, World, CHUNK_HEIGHT, CHUNK_SIZE};
 
@@ -516,6 +516,133 @@ fn emit_box_xf(
     );
 }
 
+/// Pavé texturé par morceaux : `rects[face]` = rectangle (u0, v0, u1, v1, en pixels de la
+/// texture 16 × 16) plaqué sur chaque face (ordre de `FACES`). Coordonnées en blocs.
+fn emit_box_uv(
+    out: &mut MeshData,
+    min: [f32; 3],
+    max: [f32; 3],
+    layer: u32,
+    rects: [[f32; 4]; 6],
+    light: [u8; 4],
+) {
+    let e = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let axis = |a: [i32; 3]| a.iter().position(|&c| c != 0).unwrap_or(0);
+    for (face, &(n, u, v)) in FACES.iter().enumerate() {
+        let base: [f32; 3] = std::array::from_fn(|i| min[i] + if n[i] > 0 { e[i] } else { 0.0 });
+        let (du, dv) = (e[axis(u)], e[axis(v)]);
+        let start = out.vertices.len() as u32;
+        let r = rects[face];
+        for (a, c) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            let p: [f32; 3] =
+                std::array::from_fn(|i| base[i] + a * du * u[i] as f32 + c * dv * v[i] as f32);
+            // Place dans le pavé (0..1), comme le shader la tirerait d'un bloc droit.
+            let f = |i: usize| (p[i] - min[i]) / e[i].max(1e-6);
+            let (fu, fv) = match axis(n) {
+                0 => (f(2), 1.0 - f(1)),
+                1 => (f(0), f(2)),
+                _ => (f(0), 1.0 - f(1)),
+            };
+            let uv = [
+                (r[0] + (r[2] - r[0]) * fu) / 16.0,
+                (r[1] + (r[3] - r[1]) * fv) / 16.0,
+            ];
+            let q = uv.map(|t| (t.clamp(0.0, 1.99) * 128.0).round() as u32);
+            out.vertices.push(Vertex {
+                pos: p,
+                data: Vertex::block_data(face as u32, 3, light),
+                tex: layer | TEX_LOCAL_UV | q[0] << 16 | q[1] << 24,
+            });
+        }
+        out.indices
+            .extend_from_slice(&[0, 1, 2, 2, 3, 0].map(|i| start + i));
+    }
+}
+
+/// Deux plans verticaux en croix (anse, chaîne), texturés par le rectangle `r` (pixels),
+/// de `a` à `b` (coordonnées en blocs, coins opposés).
+fn emit_cross_uv(
+    out: &mut MeshData,
+    a: [f32; 3],
+    b: [f32; 3],
+    layer: u32,
+    r: [f32; 4],
+    light: [u8; 4],
+) {
+    let c = [(a[0] + b[0]) / 2.0, (a[2] + b[2]) / 2.0];
+    let h = (b[0] - a[0]).abs().max((b[2] - a[2]).abs()) / 2.0 * std::f32::consts::FRAC_1_SQRT_2;
+    let uv = [[r[0], r[3]], [r[2], r[3]], [r[2], r[1]], [r[0], r[1]]];
+    for (dx, dz) in [(h, h), (h, -h)] {
+        let quad = [
+            [c[0] - dx, a[1], c[1] - dz],
+            [c[0] + dx, a[1], c[1] + dz],
+            [c[0] + dx, b[1], c[1] + dz],
+            [c[0] - dx, b[1], c[1] - dz],
+        ];
+        for order in [[0u32, 1, 2, 2, 3, 0], [0, 2, 1, 2, 0, 3]] {
+            let start = out.vertices.len() as u32;
+            for (p, t) in quad.into_iter().zip(uv) {
+                let q = t.map(|v| ((v / 16.0).clamp(0.0, 1.99) * 128.0).round() as u32);
+                out.vertices.push(Vertex {
+                    pos: p,
+                    data: Vertex::block_data(6, 3, light),
+                    tex: layer | TEX_LOCAL_UV | q[0] << 16 | q[1] << 24,
+                });
+            }
+            out.indices.extend_from_slice(&order.map(|i| start + i));
+        }
+    }
+}
+
+/// Lanterne (et lanterne des âmes) en 3D, comme dans Minecraft : corps, chapeau, anse
+/// (posée) ou chaîne (suspendue), taillés dans sa texture (`o` : coin de la case).
+fn emit_lantern(out: &mut MeshData, o: [f32; 3], id: BlockId, light: [u8; 4], hanging: bool) {
+    let layer = face_tex(id, 0);
+    let px = |x: f32, y: f32, z: f32| [o[0] + x / 16.0, o[1] + y / 16.0, o[2] + z / 16.0];
+    let dy = if hanging { 1.0 } else { 0.0 };
+    let side = [0.0, 2.0, 6.0, 9.0];
+    let cap = [0.0, 9.0, 6.0, 15.0];
+    emit_box_uv(
+        out,
+        px(5.0, dy, 5.0),
+        px(11.0, 7.0 + dy, 11.0),
+        layer,
+        [side, side, cap, cap, side, side],
+        light,
+    );
+    let side = [1.0, 0.0, 5.0, 2.0];
+    let cap = [1.0, 10.0, 5.0, 14.0];
+    emit_box_uv(
+        out,
+        px(6.0, 7.0 + dy, 6.0),
+        px(10.0, 9.0 + dy, 10.0),
+        layer,
+        [side, side, cap, cap, side, side],
+        light,
+    );
+    if hanging {
+        // Chaîne jusqu'au plafond.
+        emit_cross_uv(
+            out,
+            px(6.5, 10.0, 8.0),
+            px(9.5, 16.0, 8.0),
+            layer,
+            [11.0, 6.0, 14.0, 12.0],
+            light,
+        );
+    } else {
+        // Anse.
+        emit_cross_uv(
+            out,
+            px(6.5, 9.0, 8.0),
+            px(9.5, 11.0, 8.0),
+            layer,
+            [11.0, 1.0, 14.0, 3.0],
+            light,
+        );
+    }
+}
+
 /// Porte fermée `door_<bois>:<moitié>:<côté>` dont le battant voisin (même porte, même
 /// côté) est du côté où elle tourne (`same` : la case dans cette direction a le même
 /// bloc) : battant droit d'une double porte.
@@ -726,14 +853,31 @@ pub fn wall_torch_xf(d: u8, p: [f32; 3]) -> [f32; 3] {
 
 /// Deux plans diagonaux visibles des deux côtés (plantes).
 fn emit_cross(out: &mut MeshData, o: [f32; 3], id: BlockId, light: [u8; 4]) {
-    let tex = face_tex(id, 6);
-    let (y0, y1) = (o[1], o[1] + 1.0);
-    for (a, b) in [([0.1, 0.1], [0.9, 0.9]), ([0.1, 0.9], [0.9, 0.1])] {
+    emit_cross_at(out, o, id, light, 1.0);
+}
+
+/// Plante en croix réduite (`size` : hauteur et largeur, en blocs), centrée dans la case.
+/// Coordonnées de texture écrites (la plante n'est pas alignée sur la grille).
+fn emit_cross_at(out: &mut MeshData, o: [f32; 3], id: BlockId, light: [u8; 4], size: f32) {
+    let mut tex = face_tex(id, 6);
+    let (y0, y1) = (o[1], o[1] + size);
+    let (lo, hi) = (0.5 - 0.4 * size, 0.5 + 0.4 * size);
+    if size != 1.0 {
+        tex |= TEX_LOCAL_UV;
+    }
+    for (a, b) in [([lo, lo], [hi, hi]), ([lo, hi], [hi, lo])] {
         let p = |c: [f32; 2], y: f32| [o[0] + c[0], y, o[2] + c[1]];
         let quad = [p(a, y0), p(b, y0), p(b, y1), p(a, y1)];
+        let uv = [[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
         for order in [[0u32, 1, 2, 2, 3, 0], [0, 2, 1, 2, 0, 3]] {
             let start = out.vertices.len() as u32;
-            for q in quad {
+            for (q, t) in quad.into_iter().zip(uv) {
+                let tex = if tex & TEX_LOCAL_UV != 0 {
+                    let q = t.map(|v| (v * 128.0).round() as u32);
+                    tex | q[0] << 16 | q[1] << 24
+                } else {
+                    tex
+                };
                 out.vertices.push(Vertex {
                     pos: q,
                     data: Vertex::block_data(6, 3, light),
@@ -743,13 +887,6 @@ fn emit_cross(out: &mut MeshData, o: [f32; 3], id: BlockId, light: [u8; 4]) {
             out.indices.extend_from_slice(&order.map(|i| start + i));
         }
     }
-}
-
-/// Les voisins horizontaux d'un poteau auxquels il se relie.
-fn post_connects(kind: crate::registry::PostKind, neighbor: BlockId) -> bool {
-    use crate::registry::Shape;
-    let d = neighbor.def();
-    d.full || matches!(d.shape, Shape::Post(k) if k == kind)
 }
 
 /// Lumière du ciel autour d'un chunk (niveaux 0..15) : 15 sous le ciel ouvert, puis −1
@@ -1138,6 +1275,17 @@ fn mesh_block(
                                 }
                             }
                         }
+                        // Lanternes : modèle 3D taillé dans leur texture.
+                        if def.key.starts_with("lantern") || def.key.starts_with("soul_lantern") {
+                            emit_lantern(
+                                out,
+                                [wx, wy, wz],
+                                id,
+                                light_at(b),
+                                def.key.ends_with(":hanging"),
+                            );
+                            return;
+                        }
                         // Bannière : deux blocs de haut, elle pend dans la case du dessous
                         // (seul le bloc du haut a une hitbox, comme dans Minecraft).
                         let banner = def.key.starts_with("banner_");
@@ -1220,7 +1368,11 @@ fn mesh_block(
                         }
                         // Pot de fleurs : la terre dedans (4/16, sous le bord) et les parois
                         // intérieures, plus foncées.
-                        if def.key == "flower_pot" {
+                        // Plante d'un pot garni : en croix, plantée dans la terre.
+                        if let Some(plant) = crate::registry::potted_plant(id) {
+                            emit_cross_at(out, [wx, wy + 0.25, wz], plant, light_at(b), 0.75);
+                        }
+                        if def.key.starts_with("flower_pot") {
                             let lit = [light_at(b); 6];
                             let e = 0.001;
                             let s16 = |v: f32| v / 16.0;

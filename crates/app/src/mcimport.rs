@@ -653,8 +653,10 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
             };
         }
     }
-    if n.starts_with("potted_") {
-        return key("flower_pot");
+    // Pot garni : la plante (en croix) dedans, sinon le pot vide.
+    if let Some(plant) = n.strip_prefix("potted_") {
+        let p = map_block_state(&format!("minecraft:{plant}"), &HashMap::new());
+        return key(&format!("flower_pot:{}", p.def().key)).or_else(|| key("flower_pot"));
     }
     let k = match n {
         "stone" | "infested_stone" | "deepslate" | "calcite" => "stone",
@@ -749,7 +751,7 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
             };
             return key(&format!("{n}{hang}"));
         }
-        "vine" | "glow_lichen" => {
+        "vine" => {
             let side = if prop("south") == Some("true") {
                 4
             } else if prop("west") == Some("true") {
@@ -837,7 +839,7 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
 /// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales ; 5 : décors en entités
 /// d'affichage).
-pub const IMPORT_VERSION: u32 = 7;
+pub const IMPORT_VERSION: u32 = 8;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {

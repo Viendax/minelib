@@ -139,8 +139,9 @@ fn emit_box(
     emit_box_layer(out, xf, min, max, part, light, tex, None);
 }
 
-/// Comme `emit_box` ; `layer` : un seul calque du skin (`false` le dessous, `true` le
-/// dessus), ses pixels transparents laissés vides (têtes des cartes : buissons…).
+/// Comme `emit_box` ; `layer` : pixels transparents laissés vides (têtes des cartes :
+/// buissons…), avec les deux calques du skin (`false`) ou seulement celui du dessus
+/// (`true`).
 #[allow(clippy::too_many_arguments)]
 fn emit_box_layer(
     out: &mut Vec<EntityVertex>,
@@ -232,7 +233,12 @@ fn emit_box_layer(
                 // calque du dessus).
                 let rgb = match (tex, layer) {
                     (Some((t, i)), Some(top)) => {
-                        match t.layer_color(i, k, u as u32, v as u32, size, top) {
+                        let c = if top {
+                            t.layer_color(i, k, u as u32, v as u32, size, true)
+                        } else {
+                            t.color(i, k, u as u32, v as u32, size)
+                        };
+                        match c {
                             Some(c) => c,
                             None => continue,
                         }
@@ -561,9 +567,9 @@ pub(crate) fn emit_item(
 /// Tête seule (bloc « tête » à skin d'une carte importée) : `xf` va des pixels du modèle
 /// (tête de -4..4 × 0..8 × -4..4, visage vers −z) au monde.
 pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3]) -> Vec<EntityVertex> {
-    let mut out = Vec::with_capacity(4800);
-    // Comme Minecraft : la tête, puis le calque du dessus un peu plus grand (un quart de
-    // pixel de chaque côté) ; les pixels transparents restent vides.
+    let mut out = Vec::with_capacity(2400);
+    // Exactement à la place de la hitbox du bloc « tête » : un seul pavé, le calque du
+    // dessus posé sur le dessous ; les pixels transparents des deux restent vides.
     emit_box_layer(
         &mut out,
         xf,
@@ -573,16 +579,6 @@ pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3]) -> Vec<EntityVe
         light,
         Some((skin, 5)),
         Some(false),
-    );
-    emit_box_layer(
-        &mut out,
-        xf,
-        [-4.25, -0.25, -4.25],
-        [4.25, 8.25, 4.25],
-        Part::Head,
-        light,
-        Some((skin, 5)),
-        Some(true),
     );
     out
 }

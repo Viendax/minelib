@@ -12,6 +12,8 @@ pub struct Frame {
     pub facing: u8,
     /// Bloc tenu (`None` : cadre vide).
     pub block: Option<minelib_world::BlockId>,
+    /// Sa ligne dans le fichier (pour l'enlever quand il est cassé).
+    pub line: String,
 }
 
 pub fn parse(line: &str) -> Option<Frame> {
@@ -30,6 +32,7 @@ pub fn parse(line: &str) -> Option<Frame> {
         pos: [x.parse().ok()?, y.parse().ok()?, z.parse().ok()?],
         facing,
         block,
+        line: line.trim().to_string(),
     })
 }
 
@@ -80,8 +83,48 @@ impl Frames {
         self.list.is_empty()
     }
 
-    /// Triangles de tous les cadres (refaits seulement quand la lumière change).
-    pub fn vertices(&mut self, light: [f32; 3]) -> &[EntityVertex] {
+    /// Premier cadre touché par le rayon (`eye`, `dir` unitaire) avant `max` blocs.
+    pub fn hit(&self, eye: Vec3, dir: Vec3, max: f32) -> Option<usize> {
+        let inv = dir.map(|d| if d.abs() < 1e-6 { 1e6 } else { 1.0 / d });
+        let mut best: Option<(usize, f32)> = None;
+        for (i, fr) in self.list.iter().enumerate() {
+            let (mn, mx) = boxes(fr);
+            let t0 = (mn - eye) * inv;
+            let t1 = (mx - eye) * inv;
+            let near = t0.min(t1).max_element();
+            let far = t0.max(t1).min_element();
+            if far >= near.max(0.0) && near < max && best.is_none_or(|b| near < b.1) {
+                best = Some((i, near));
+            }
+        }
+        best.map(|b| b.0)
+    }
+
+    /// Casse le cadre `i` : enlevé de l'affichage et du fichier du monde `dir`.
+    pub fn remove(&mut self, i: usize, dir: &std::path::Path) {
+        let fr = self.list.remove(i);
+        self.built = None;
+        let path = dir.join(crate::mcimport::HEADS_FILE);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let mut gone = false;
+            let kept: Vec<&str> = text
+                .lines()
+                .filter(|l| {
+                    let same = !gone && l.trim() == fr.line;
+                    gone |= same;
+                    !same
+                })
+                .collect();
+            let mut t = kept.join("\n");
+            if !t.is_empty() {
+                t.push('\n');
+            }
+            let _ = std::fs::write(&path, t);
+        }
+    }
+
+    /// Triangles de tous les cadres ; `changed` : refaits (la lumière a changé).
+    pub fn vertices(&mut self, light: [f32; 3]) -> (&[EntityVertex], bool) {
         let fresh = self
             .built
             .as_ref()
@@ -109,7 +152,7 @@ impl Frames {
             }
             self.built = Some((light, out));
         }
-        &self.built.as_ref().expect("cadres").1
+        (&self.built.as_ref().expect("cadres").1, !fresh)
     }
 }
 

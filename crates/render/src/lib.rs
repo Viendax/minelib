@@ -370,6 +370,9 @@ pub struct FrameParams<'a> {
     /// Les premiers sommets d'`entities` suivent la caméra (modèle du joueur local) ; les
     /// autres sont fixés dans le monde.
     pub entities_follow: usize,
+    /// Entités fixes qui changent rarement (têtes, cadres) et leur version : renvoyées à
+    /// la carte graphique seulement quand elle change.
+    pub static_entities: (&'a [EntityVertex], u64),
     /// Torche tenue en main : couleur (sRGB) et portée en blocs.
     pub held_light: Option<([u8; 3], f32)>,
     /// Flamme de la torche tenue (bout de la torche dans la main du modèle du joueur) ;
@@ -1829,6 +1832,12 @@ impl Renderer {
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
         self.entities
             .prepare(&self.queue, p.entities, p.entities_follow);
+        self.entities.prepare_static(
+            &self.device,
+            &self.queue,
+            p.static_entities.0,
+            p.static_entities.1,
+        );
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
@@ -2007,6 +2016,12 @@ impl Renderer {
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
         self.entities
             .prepare(&self.queue, p.entities, p.entities_follow);
+        self.entities.prepare_static(
+            &self.device,
+            &self.queue,
+            p.static_entities.0,
+            p.static_entities.1,
+        );
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = {

@@ -2,7 +2,7 @@
 //! boîte englobante / voxels (résolues axe par axe).
 
 use glam::{Mat4, Vec3};
-use minelib_world::registry::{fluid, post_arms, Fluid, Shape};
+use minelib_world::registry::{fluid, post_arms, post_connects, Fluid, Shape};
 use minelib_world::World;
 
 pub const HALF_WIDTH: f32 = 0.3;
@@ -104,10 +104,8 @@ const TOUCH: f32 = 1e-4;
 /// Hauteur franchie sans sauter (dalles, marches d'escalier).
 const STEP_HEIGHT: f32 = 0.6;
 /// Vitesse sur une échelle : celle de CS (`MAX_CLIMB_SPEED` 200 u/s, soit 5,08 blocs/s,
-/// dans les mêmes unités que la gravité et le saut), et élan quand on saute pour s'en
-/// décrocher.
+/// dans les mêmes unités que la gravité et le saut).
 const LADDER_SPEED: f32 = 200.0 * cs::UNIT;
-const LADDER_PUSH: f32 = 3.0;
 /// Temps pour atteindre la pleine vitesse sur une échelle (s) : presque immédiat, comme
 /// dans CS.
 const LADDER_RAMP: f32 = 0.15;
@@ -292,7 +290,7 @@ impl Player {
     /// faut être contre sa planche, pas seulement dans sa case.
     /// Renvoie aussi si l'on touche sa planche (on n'y monte que là) ; sinon on est
     /// seulement dans la moitié de sa case côté mur, où l'on ne tombe pas.
-    fn ladder(&self, world: &World) -> Option<(u8, bool)> {
+    fn ladder(&self, world: &World, fps: bool) -> Option<(u8, bool)> {
         let (min0, max0) = self.bounds();
         let mut held = None;
         // Moitié de la case côté mur (on y reste accroché, on peut y descendre).
@@ -302,7 +300,7 @@ impl Player {
             for z in lo.z..=hi.z {
                 for x in lo.x..=hi.x {
                     let def = world.get(x, y, z).def();
-                    let Some(side) = climbable(&def.key) else {
+                    let Some(side) = climbable(&def.key, fps) else {
                         continue;
                     };
                     let Ok(side) = side.parse::<u8>() else {
@@ -337,7 +335,7 @@ impl Player {
             for z in lo.z..=hi.z {
                 for x in lo.x..=hi.x {
                     let def = world.get(x, y, z).def();
-                    let Some(side) = climbable(&def.key) else {
+                    let Some(side) = climbable(&def.key, fps) else {
                         continue;
                     };
                     let o = Vec3::new(x as f32, y as f32, z as f32);
@@ -440,20 +438,26 @@ impl Player {
         let was_on_ladder = self.on_ladder;
         self.on_ladder = false;
         if !self.flying && !self.noclip {
-            if let Some((side, touching)) = self.ladder(world) {
-                let wall = match side {
-                    0 => Vec3::X,
-                    1 => -Vec3::X,
-                    4 => Vec3::Z,
-                    _ => -Vec3::Z,
-                };
-                // Sur l'échelle la vitesse verticale est nulle au repos : le sol se cherche juste
-                // sous les pieds.
-                let grounded = self.on_ground || self.support_within(world, 0.02);
+            let wall_of = |side: u8| match side {
+                0 => Vec3::X,
+                1 => -Vec3::X,
+                4 => Vec3::Z,
+                _ => -Vec3::Z,
+            };
+            // Sur l'échelle la vitesse verticale est nulle au repos : le sol se cherche juste
+            // sous les pieds.
+            let grounded = self.on_ground || self.support_within(world, 0.02);
+            // Projeté loin de l'échelle (on vient d'en sauter) : elle ne nous rattrape pas.
+            let ladder = self
+                .ladder(world, fps)
+                .filter(|&(side, _)| grounded || v0.dot(-wall_of(side)) < 1.5);
+            if let Some((side, touching)) = ladder {
+                let wall = wall_of(side);
                 if m.jump_pressed {
-                    // Sauter de l'échelle : toujours projeté en arrière, à la vitesse d'un saut.
+                    // Sauter de l'échelle : projeté en arrière avec la force d'un saut (un peu
+                    // vers le haut), rien ne nous retient.
                     let jump = if fps { cs::JUMP_IMPULSE } else { JUMP_SPEED };
-                    self.vel = -wall * LADDER_PUSH + Vec3::Y * jump;
+                    self.vel = -wall * jump + Vec3::Y * jump * 0.35;
                 } else {
                     self.on_ladder = true;
                     let down = self.pitch < -0.35;
@@ -868,8 +872,7 @@ fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec3, Vec3)> {
     });
     if let Shape::Post(kind) = def.shape {
         for (side, dx, dz) in [(0u8, 1, 0), (1, -1, 0), (4, 0, 1), (5, 0, -1)] {
-            let n = world.get(x + dx, y, z + dz).def();
-            if n.full || matches!(n.shape, Shape::Post(k) if k == kind) {
+            if post_connects(kind, world.get(x + dx, y, z + dz)) {
                 // Bras sur toute la hauteur : on ne passe pas entre les barreaux.
                 boxes.extend(post_arms(kind, side).into_iter().map(|(mut a, mut b)| {
                     a[1] = 0;
@@ -892,10 +895,10 @@ fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec3, Vec3)> {
 }
 
 /// Échelle ou liane (`ladder:<côté>`, `vine:<côté>`) : côté du mur où elle est
-/// accrochée. Les lianes se grimpent comme des échelles.
-fn climbable(key: &str) -> Option<&str> {
+/// accrochée. Les lianes se grimpent comme des échelles (hors mode FPS).
+fn climbable(key: &str, fps: bool) -> Option<&str> {
     key.strip_prefix("ladder:")
-        .or_else(|| key.strip_prefix("vine:"))
+        .or_else(|| key.strip_prefix("vine:").filter(|_| !fps))
 }
 
 #[cfg(test)]
@@ -1359,9 +1362,20 @@ mod tests {
             };
             p.update(&w, &jump, dt);
             assert!(
-                !p.on_ladder && p.vel.x < -1.0 && p.vel.y > 5.0,
+                !p.on_ladder && p.vel.x < -5.0 && p.vel.y > 0.0 && p.vel.y < -p.vel.x,
                 "saut arrière (fps {fps}) : {:?}",
                 p.vel
+            );
+            // Rien ne nous retient : l'échelle ne nous rattrape pas pendant qu'on s'en va.
+            let x0 = p.pos.x;
+            for _ in 0..10 {
+                p.update(&w, &still, dt);
+                assert!(!p.on_ladder, "repris par l'échelle (fps {fps})");
+            }
+            assert!(
+                p.pos.x < x0 - 0.5,
+                "projeté en arrière (fps {fps}) : {}",
+                p.pos.x
             );
             // Immobile sur l'échelle : aucune glissade de côté.
             let mut p = Player::new(Vec3::new(9.4, 14.0, 8.5));

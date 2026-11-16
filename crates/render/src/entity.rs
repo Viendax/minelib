@@ -31,6 +31,11 @@ pub struct Entities {
     count: u32,
     /// Premiers sommets qui suivent la caméra (modèle du joueur local).
     follow: u32,
+    /// Entités fixes qui changent rarement (têtes et cadres des cartes) : gardées sur la
+    /// carte graphique, renvoyées seulement quand leur version change.
+    statics: Option<wgpu::Buffer>,
+    static_count: u32,
+    static_gen: Option<u64>,
 }
 
 impl Entities {
@@ -121,7 +126,40 @@ impl Entities {
             buffer,
             count: 0,
             follow: 0,
+            statics: None,
+            static_count: 0,
+            static_gen: None,
         }
+    }
+
+    /// Entités fixes (`gen` : leur version ; mêmes sommets tant qu'elle ne change pas).
+    pub fn prepare_static(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[EntityVertex],
+        gen: u64,
+    ) {
+        if self.static_gen == Some(gen) {
+            return;
+        }
+        self.static_gen = Some(gen);
+        let n = vertices.len() / 3 * 3;
+        self.static_count = n as u32;
+        if n == 0 {
+            return;
+        }
+        let bytes = (n * std::mem::size_of::<EntityVertex>()) as u64;
+        if self.statics.as_ref().is_none_or(|b| b.size() < bytes) {
+            self.statics = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("entités fixes (sommets)"),
+                size: bytes.next_power_of_two(),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let buf = self.statics.as_ref().expect("tampon");
+        queue.write_buffer(buf, 0, bytemuck::cast_slice(&vertices[..n]));
     }
 
     /// `follow` : les premiers sommets suivent la caméra (modèle du joueur local), les
@@ -142,10 +180,15 @@ impl Entities {
         group: &'a wgpu::BindGroup,
         taa: bool,
     ) {
+        pass.set_bind_group(0, group, &[]);
+        if let Some(b) = self.statics.as_ref().filter(|_| self.static_count > 0) {
+            pass.set_pipeline(if taa { &self.taa_world } else { &self.plain });
+            pass.set_vertex_buffer(0, b.slice(..));
+            pass.draw(0..self.static_count, 0..1);
+        }
         if self.count == 0 {
             return;
         }
-        pass.set_bind_group(0, group, &[]);
         pass.set_vertex_buffer(0, self.buffer.slice(..));
         if !taa {
             pass.set_pipeline(&self.plain);

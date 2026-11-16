@@ -250,6 +250,17 @@ pub fn post_center(k: PostKind) -> ([u8; 3], [u8; 3]) {
 }
 
 /// Bras d'un poteau vers le côté horizontal `side` (0 +X, 1 −X, 4 +Z, 5 −Z).
+/// Les voisins horizontaux d'un poteau auxquels il se relie.
+pub fn post_connects(kind: PostKind, neighbor: BlockId) -> bool {
+    let d = neighbor.def();
+    // Blocs pleins, verre compris (pas `full` : on voit au travers) ; les vitres et
+    // grilles aussi aux boutons posés contre elles.
+    d.full
+        || (d.solid && matches!(d.shape, Shape::Cube))
+        || matches!(d.shape, Shape::Post(k) if k == kind)
+        || (kind == PostKind::Pane && d.key.starts_with("button_"))
+}
+
 pub fn post_arms(k: PostKind, side: u8) -> Vec<([u8; 3], [u8; 3])> {
     let along = |a0: u8, a1: u8, w0: u8, w1: u8, y0: u8, y1: u8| -> ([u8; 3], [u8; 3]) {
         match side {
@@ -1844,7 +1855,8 @@ fn fluids_and_heads(b: &mut Builder) {
     // Nénuphar : on peut marcher dessus.
     // Pot de fleurs : dessus = le bord (texture à trou) ; « dessous » = ses parois
     // intérieures, plus foncées (le maillage y ajoute la terre, plus bas que le bord).
-    let dark = b.tex(&TexSrc::Tint("flower_pot", [150, 150, 150]));
+    // Dessous plein (la texture du pot a un trou au milieu), parois intérieures foncées.
+    let dark = b.tex(&TexSrc::Tint("hardened_clay", [150, 100, 85]));
     if let Some(&i) = b.r.keys.get("flower_pot") {
         b.r.defs[i as usize].tex[2] = dark;
     }
@@ -1932,7 +1944,7 @@ fn fluids_and_heads(b: &mut Builder) {
     ] {
         for (hang, min, max) in [
             ("", [5u8, 0, 5], [11u8, 9, 11]),
-            (":hanging", [5, 7, 5], [11, 16, 11]),
+            (":hanging", [5, 1, 5], [11, 10, 11]),
         ] {
             b.add(
                 format!("{k}{hang}"),
@@ -2027,6 +2039,38 @@ fn fluids_and_heads(b: &mut Builder) {
             }
         }
     }
+    // Pots de fleurs garnis : `flower_pot:<plante>` (une plante en croix dedans).
+    let pot = b.r.defs[b.r.keys["flower_pot"] as usize].clone();
+    let plants: Vec<String> =
+        b.r.defs
+            .iter()
+            .filter(|d| d.key.starts_with("plant:") && pottable(&d.key))
+            .map(|d| d.key.clone())
+            .collect();
+    for plant in plants {
+        let k = format!("flower_pot:{plant}");
+        let id = b.r.defs.len() as u16;
+        b.r.defs.push(BlockDef {
+            key: k.clone(),
+            ..pot.clone()
+        });
+        b.r.keys.insert(k, id);
+    }
+}
+
+/// Plante qu'on peut mettre dans un pot (pas les plantes de deux blocs, ni le blé, la
+/// toile, la canne).
+pub fn pottable(key: &str) -> bool {
+    key.starts_with("plant:")
+        && !key.contains("_lower")
+        && !key.contains("_upper")
+        && !matches!(key, "plant:wheat" | "plant:web" | "plant:reeds")
+}
+
+/// Plante d'un pot garni (`flower_pot:<plante>`).
+pub fn potted_plant(id: BlockId) -> Option<BlockId> {
+    let k = id.def().key.strip_prefix("flower_pot:")?;
+    registry().by_key(k)
 }
 
 /// Rotation (en seizièmes, autour du centre) du repère de base « mur en +Z » vers le mur `d`.
@@ -2573,6 +2617,20 @@ pub fn door_key(i: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flower_pots_hold_plants() {
+        let r = registry();
+        let rose = r.by_key("plant:rose").unwrap();
+        let pot = r.by_key("flower_pot:plant:rose").unwrap();
+        assert_eq!(potted_plant(pot), Some(rose));
+        assert_eq!(
+            pot.def().boxes(),
+            r.by_key("flower_pot").unwrap().def().boxes()
+        );
+        assert!(r.by_key("flower_pot:plant:wheat").is_none());
+        assert!(r.by_key("flower_pot:plant:brain_coral").is_some());
+    }
 
     #[test]
     fn stairs_turn_corners_like_minecraft() {

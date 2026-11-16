@@ -60,7 +60,10 @@ pub fn transform(h: &Head) -> Mat4 {
     let [x, y, z] = h.pos.map(|v| v as f32);
     let (center, dir) = match h.pose {
         Pose::Floor(r) => {
-            let t = r as f32 * std::f32::consts::TAU / 16.0;
+            // Calée sur la hitbox du bloc (un pavé droit) : le quart de tour le plus
+            // proche de sa rotation.
+            let q = ((r as u32 + 2) / 4 % 4) * 4;
+            let t = q as f32 * std::f32::consts::TAU / 16.0;
             (
                 Vec3::new(x + 0.5, y, z + 0.5),
                 Vec3::new(-t.sin(), 0.0, t.cos()),
@@ -78,10 +81,10 @@ pub fn transform(h: &Head) -> Mat4 {
     };
     // Le visage du modèle regarde −z : on le tourne vers `dir`.
     let yaw = (-dir.x).atan2(-dir.z);
-    // Un peu plus grande que le bloc « tête » uni qu'elle recouvre.
-    Mat4::from_translation(center - Vec3::Y * 0.005)
+    // Juste la hitbox du bloc « tête » (8 pixels = un demi-bloc).
+    Mat4::from_translation(center)
         * Mat4::from_quat(Quat::from_rotation_y(yaw))
-        * Mat4::from_scale(Vec3::splat(1.04 / 16.0))
+        * Mat4::from_scale(Vec3::splat(1.0 / 16.0))
 }
 
 pub struct Heads {
@@ -95,6 +98,10 @@ pub struct Heads {
     rx: Receiver<(String, Option<Vec<u8>>)>,
     /// Triangles déjà faits par tête (indice dans `list`), avec la lumière utilisée.
     built: HashMap<usize, ([f32; 3], bool, Vec<EntityVertex>)>,
+    /// Têtes dessinées (indice, texturée), lumière, et leurs triangles.
+    shown: Vec<(usize, bool)>,
+    shown_light: [f32; 3],
+    out: Vec<EntityVertex>,
 }
 
 impl Heads {
@@ -115,6 +122,9 @@ impl Heads {
             tx,
             rx,
             built: HashMap::new(),
+            shown: Vec::new(),
+            shown_light: [-1.0; 3],
+            out: Vec::new(),
         }
     }
 
@@ -176,8 +186,9 @@ impl Heads {
     }
 
     /// Triangles des têtes proches de la caméra : avec leur skin, ou la tête par défaut
-    /// de Minelib en attendant (le bloc uni dessous n'est pas dessiné).
-    pub fn vertices(&mut self, cam: Vec3, light: [f32; 3]) -> Vec<EntityVertex> {
+    /// de Minelib en attendant (le bloc uni dessous n'est pas dessiné). `None` : rien n'a
+    /// changé depuis la dernière fois.
+    pub fn vertices(&mut self, cam: Vec3, light: [f32; 3]) -> Option<&[EntityVertex]> {
         let mut near: Vec<(usize, f32)> = self
             .list
             .iter()
@@ -187,14 +198,33 @@ impl Heads {
             .collect();
         near.sort_by(|a, b| a.1.total_cmp(&b.1));
         near.truncate(MAX_SHOWN);
+        // Les mêmes têtes (avec ou sans texture) sous la même lumière : rien à refaire
+        // (ni à renvoyer à la carte graphique).
+        let mut shown: Vec<(usize, bool)> = near
+            .iter()
+            .map(|&(i, _)| (i, self.skins.contains_key(&self.list[i].hash)))
+            .collect();
+        shown.sort_unstable();
+        let same_light = self
+            .shown_light
+            .iter()
+            .zip(light)
+            .all(|(a, b)| (a - b).abs() < 0.02);
+        if shown == self.shown && same_light {
+            return None;
+        }
+        if !same_light {
+            self.shown_light = light;
+        }
+        let light = self.shown_light;
         let mut out = Vec::new();
-        for (i, _) in near {
+        for &(i, _) in &shown {
             let h = &self.list[i];
             let skin = self.skins.get(&h.hash);
-            let fresh = self.built.get(&i).is_some_and(|(l, textured, _)| {
-                *textured == skin.is_some()
-                    && l.iter().zip(light).all(|(a, b)| (a - b).abs() < 0.02)
-            });
+            let fresh = self
+                .built
+                .get(&i)
+                .is_some_and(|(l, textured, _)| *textured == skin.is_some() && *l == light);
             if !fresh {
                 let v = match skin {
                     Some(skin) => crate::player_model::head(skin, transform(h), light),
@@ -204,7 +234,9 @@ impl Heads {
             }
             out.extend_from_slice(&self.built[&i].2);
         }
-        out
+        self.shown = shown;
+        self.out = out;
+        Some(&self.out)
     }
 }
 
@@ -266,6 +298,21 @@ mod tests {
         assert!(face(Pose::Floor(0)).distance(Vec3::Z) < 1e-4);
         assert!(face(Pose::Floor(4)).distance(-Vec3::X) < 1e-4);
         assert!(face(Pose::Floor(8)).distance(-Vec3::Z) < 1e-4);
+        // Calée sur la hitbox : rotation au quart de tour le plus proche, demi-bloc.
+        assert!(face(Pose::Floor(3)).distance(-Vec3::X) < 1e-4);
+        assert!(face(Pose::Floor(1)).distance(Vec3::Z) < 1e-4);
+        let m = transform(&Head {
+            pos: [0, 0, 0],
+            pose: Pose::Floor(5),
+            hash: hash.into(),
+        });
+        let (a, b) = (
+            m.transform_point3(Vec3::new(-4.0, 0.0, -4.0)),
+            m.transform_point3(Vec3::new(4.0, 8.0, 4.0)),
+        );
+        let (lo, hi) = (a.min(b), a.max(b));
+        assert!(lo.distance(Vec3::new(0.25, 0.0, 0.25)) < 1e-4, "{lo}");
+        assert!(hi.distance(Vec3::new(0.75, 0.5, 0.75)) < 1e-4, "{hi}");
         // Contre le mur nord (côté 5, −z) : regarde le sud.
         assert!(face(Pose::Wall(5)).distance(Vec3::Z) < 1e-4);
         let m = transform(&Head {

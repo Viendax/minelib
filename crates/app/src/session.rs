@@ -180,6 +180,10 @@ pub struct Session {
     /// Cadres des murs (cartes importées).
     frames: Option<crate::frames::Frames>,
     head_vertices: Vec<minelib_render::EntityVertex>,
+    /// Triangles des têtes seules, et numéro de version de `head_vertices` (la carte
+    /// graphique ne les reçoit que quand il change).
+    head_part: Vec<minelib_render::EntityVertex>,
+    head_gen: u64,
     autosave: f32,
     hit: Option<Hit>,
     overlay: Overlay,
@@ -374,6 +378,8 @@ impl Session {
             heads: None,
             frames: None,
             head_vertices: Vec::new(),
+            head_part: Vec::new(),
+            head_gen: 0,
             autosave: AUTOSAVE_S,
             hit: None,
             overlay: Overlay::default(),
@@ -681,19 +687,31 @@ impl Session {
             let heads = self.heads.get_or_insert_with(|| {
                 crate::heads::Heads::load(&self.dir, minelib_assets::data_dir().join("tetes"))
             });
+            // Têtes et cadres : envoyés à la carte graphique seulement quand ils changent.
             let l = 0.3 + 0.7 * self.daylight;
-            self.head_vertices.clear();
+            let mut changed = false;
             if !heads.is_empty() {
                 let eye = self.player.eye();
                 heads.update(eye);
-                self.head_vertices = heads.vertices(eye, [l; 3]);
+                if let Some(v) = heads.vertices(eye, [l; 3]) {
+                    self.head_part = v.to_vec();
+                    changed = true;
+                }
             }
             let frames = self
                 .frames
                 .get_or_insert_with(|| crate::frames::Frames::load(&self.dir));
             if !frames.is_empty() {
-                self.head_vertices
-                    .extend_from_slice(frames.vertices([l; 3]));
+                let (v, fresh) = frames.vertices([l; 3]);
+                if fresh || changed {
+                    self.head_vertices.clear();
+                    self.head_vertices.extend_from_slice(&self.head_part);
+                    self.head_vertices.extend_from_slice(v);
+                    self.head_gen += 1;
+                }
+            } else if changed {
+                self.head_vertices = self.head_part.clone();
+                self.head_gen += 1;
             }
             // Eau et lave qui coulent (hors parties FPS en ligne : la carte y est figée).
             let fluids_on = self.net.is_none() && self.game.mode != GameMode::Fps;
@@ -1088,6 +1106,19 @@ impl Session {
             self.player.look_dir().into(),
             REACH,
         );
+        // Cadre accroché au mur (carte importée) devant le bloc visé : il se casse.
+        if breaking {
+            let max = hit.as_ref().map_or(REACH, |h| h.distance + 0.01);
+            let eye = self.player.eye();
+            let dir = self.player.look_dir();
+            if let Some(frames) = self.frames.as_mut() {
+                if let Some(i) = frames.hit(eye, dir, max) {
+                    frames.remove(i, &self.dir);
+                    self.break_cooldown = 0.22;
+                    return;
+                }
+            }
+        }
         // Baguette : clic molette (touche « Copier le bloc ») efface la sélection, même
         // sans bloc visé.
         if self.inventory.selected_item() == Some(Item::Wand) && pick {
@@ -1129,6 +1160,40 @@ impl Session {
             }
             self.place_cooldown = 0.22;
             return;
+        }
+        // Clic droit sur un pot de fleurs : la plante tenue y est mise ; sur un pot garni,
+        // la plante est enlevée (rendue hors créatif).
+        if keys.pressed(input, Action::Use)
+            && hit.id.def().key.starts_with("flower_pot")
+            && !keys.held(input, Action::Sneak)
+        {
+            let reg = minelib_world::registry::registry();
+            let [x, y, z] = hit.block;
+            let change = match minelib_world::registry::potted_plant(hit.id) {
+                Some(plant) => {
+                    if self.game.mode != GameMode::Creative {
+                        self.inventory.add(Item::Block(plant), 1);
+                    }
+                    reg.by_key("flower_pot")
+                }
+                None => match self.inventory.selected_item() {
+                    Some(Item::Block(plant))
+                        if minelib_world::registry::pottable(&plant.def().key) =>
+                    {
+                        let pot = reg.by_key(&format!("flower_pot:{}", plant.def().key));
+                        if pot.is_some() && self.game.mode != GameMode::Creative {
+                            self.inventory.take_selected();
+                        }
+                        pot
+                    }
+                    _ => None,
+                },
+            };
+            if let Some(b) = change {
+                self.dirty.extend(self.world.set(x, y, z, b));
+                self.place_cooldown = 0.22;
+                return;
+            }
         }
         // En créatif, comme dans Minecraft : même la bedrock et les barrières se cassent.
         let breakable = hit.id.is_breakable()
@@ -1232,15 +1297,21 @@ impl Session {
                     }
                 }
             }
-            // Bannière : toujours contre le mur visé (posée sur le sol ou au plafond : contre
-            // le côté de la case opposé au joueur), quelle que soit sa couleur.
+            // Bannière, échelle, liane : toujours contre le mur visé (posée sur le sol ou au
+            // plafond : contre le côté de la case opposé au joueur).
             if let Some(Item::Block(b)) = self.inventory.selected_item() {
-                if let Some(color) = b
-                    .def()
-                    .key
-                    .strip_prefix("banner_")
-                    .and_then(|r| r.split(':').next())
-                {
+                // Échelle, liane : pareil, contre le mur visé.
+                let key = &b.def().key;
+                let family = if key.starts_with("ladder:") {
+                    Some("ladder".to_string())
+                } else if key.starts_with("vine:") {
+                    Some("vine".to_string())
+                } else {
+                    key.strip_prefix("banner_")
+                        .and_then(|r| r.split(':').next())
+                        .map(|c| format!("banner_{c}"))
+                };
+                if let Some(family) = family {
                     let side = match hit.normal {
                         [-1, 0, 0] => 0,
                         [1, 0, 0] => 1,
@@ -1249,7 +1320,7 @@ impl Session {
                         _ => side_toward(self.player.look_dir()),
                     };
                     let reg = minelib_world::registry::registry();
-                    if let Some(id) = reg.by_key(&format!("banner_{color}:{side}")) {
+                    if let Some(id) = reg.by_key(&format!("{family}:{side}")) {
                         if free && !self.player.overlaps_block([x, y, z]) {
                             self.dirty.extend(self.world.set(x, y, z, id));
                             self.use_selected();
@@ -2883,10 +2954,34 @@ impl Session {
             }
             // Heure du jour (sur un serveur de construction : OP, pour tout le monde).
             "timeset" | "heure" => {
+                let default = matches!(
+                    arg.map(str::to_lowercase).as_deref(),
+                    Some("default" | "defaut" | "défaut")
+                );
+                // Carte FPS : l'heure par défaut est le soleil de Dust2 (`/fps set time`).
+                if default && self.game.mode == GameMode::Fps {
+                    self.fps_command(&["set", "time", "default"]);
+                    return;
+                }
+                // Construction : l'heure d'un monde neuf, et le temps qui passe.
+                let arg = if default {
+                    if self.build.is_some() {
+                        self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                            action: minelib_net::proto::SERVER_TIMEFIX,
+                            pseudo: String::new(),
+                            reason: "0".into(),
+                        });
+                    } else {
+                        self.time_fixed = false;
+                    }
+                    Some("8")
+                } else {
+                    arg
+                };
                 let Some(h) = arg.and_then(crate::daytime::parse) else {
                     self.chat.say(
                         format!(
-                            "Utilisation : /timeset <heure> (11, 11:20, 11.20, 11h20) ; il est {}.",
+                            "Utilisation : /timeset <heure | default> (11, 11:20, 11.20, 11h20) ; il est {}.",
                             crate::daytime::format(self.time_h)
                         ),
                         chat::RED,
@@ -2989,7 +3084,7 @@ impl Session {
                     "/fly : autorise ou interdit le vol en survie",
                     "/heal : rend tous les coeurs",
                     "/worldname <nom> : renomme le monde",
-                    "/timeset <heure> : règle l'heure (11, 11:20, 11.20, 11h20)",
+                    "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
                     "/timefix true|false : arrête ou relance le temps",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block",
                     "Vol : deux appuis rapides sur Espace",
@@ -4082,7 +4177,6 @@ impl Session {
         // Jusqu'ici, le modèle du joueur local (il suit la caméra) ; le reste est fixé
         // dans le monde (vecteurs de mouvement de l'anticrénelage).
         let follow = model.len();
-        model.extend_from_slice(&self.head_vertices);
         let mut shadows: Vec<(Vec3, Vec<ShadowBox>)> = Vec::new();
         if visible && self.spectating.is_none() {
             shadows.push((self.player.pos, crate::player_model::shadow_boxes(&pose)));
@@ -4270,6 +4364,7 @@ impl Session {
             viewmodel: &hand,
             entities: &model,
             entities_follow: follow,
+            static_entities: (&self.head_vertices, self.head_gen),
             eye: cam,
             player_eye: self.player.eye(),
             view,
