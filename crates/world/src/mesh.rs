@@ -36,6 +36,8 @@ pub const TEX_LOCAL_UV: u32 = 1 << 13;
 /// une texture surtout transparente (torche). Avec les mipmaps, de loin, la moyenne des
 /// pixels devient transparente et le modèle disparaît, sauf quelques bords.
 pub const TEX_SHARP: u32 = 1 << 14;
+/// Face vue des deux côtés (surface de l'eau et de la lave, vue d'en dessous).
+pub const TEX_TWO_SIDED: u32 = 1 << 15;
 
 /// Pixels pleins de chaque couche de texture, sur une grille de 16 × 16 (ligne `v`, bit
 /// `u`), donnés par le moteur de rendu une fois le pack chargé. Ils servent à fermer les
@@ -652,11 +654,13 @@ fn door_is_right(key: &str, same: impl Fn([i32; 3]) -> bool) -> bool {
     }
     let side = key.rsplit(':').next().and_then(|s| s.parse::<u8>().ok());
     // Même sens que `door_turn` du jeu (côté vers lequel tourne la porte).
+    // Le battant dont l'autre est du côté opposé à celui où il tourne (vu de devant, à
+    // droite) a sa texture retournée.
     let d = match side {
-        Some(1) => [0, 0, -1],
-        Some(5) => [1, 0, 0],
-        Some(0) => [0, 0, 1],
-        Some(4) => [-1, 0, 0],
+        Some(1) => [0, 0, 1],
+        Some(5) => [-1, 0, 0],
+        Some(0) => [0, 0, -1],
+        Some(4) => [1, 0, 0],
         _ => return false,
     };
     same(d)
@@ -1319,7 +1323,18 @@ fn mesh_block(
                                 let on_edge = if nrm[k] > 0 { mx[k] == 16 } else { mn[k] == 0 };
                                 let nb = add(b, nrm);
                                 if on_edge && !opaque(nb) {
-                                    light_at(nb)
+                                    // Contre du verre (sa case peut être sombre) : jamais
+                                    // plus sombre que la case du bloc.
+                                    let n = light_at(nb);
+                                    let glass = matches!(
+                                        pad.get(nb[0], nb[1], nb[2]).def().shape,
+                                        Shape::Cube
+                                    );
+                                    if glass {
+                                        std::array::from_fn(|k| n[k].max(lit[k]))
+                                    } else {
+                                        n
+                                    }
                                 } else {
                                     lit
                                 }
@@ -1533,6 +1548,11 @@ fn mesh_block(
                         }
                     } else {
                         face_tex(id, face as u32)
+                    };
+                    let tex = if fluid_here.is_some() {
+                        tex | TEX_TWO_SIDED
+                    } else {
+                        tex
                     };
                     let start = out.vertices.len() as u32;
                     for (i, &(a, c)) in corners.iter().enumerate() {

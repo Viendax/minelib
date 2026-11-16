@@ -402,7 +402,10 @@ mod win {
                         let mut p = SleepModeParams {
                             version: nv_version::<SleepModeParams>(1),
                             low_latency_mode: on as u8,
-                            low_latency_boost: 0,
+                            // Garde la carte graphique à pleine fréquence : sans cela, une
+                            // carte peu chargée (images limitées) baisse sa fréquence et les
+                            // images lourdes qui suivent prennent 100 à 250 ms.
+                            low_latency_boost: on as u8,
                             minimum_interval_us: 0,
                             use_markers_to_optimize: on as u8,
                             use_min_queue_time: 0,

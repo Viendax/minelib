@@ -223,7 +223,12 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                                 self.input.key_labels.insert(code, label);
                             }
                         }
-                        self.input.held.insert(code);
+                        // Les répétitions automatiques (touche gardée longtemps) ne
+                        // remettent pas une touche que le système dit relâchée : en
+                        // retard dans la file, elles faisaient continuer d'avancer.
+                        if !event.repeat {
+                            self.input.held.insert(code);
+                        }
                         if code == KeyCode::Escape {
                             self.set_grab(false);
                         }

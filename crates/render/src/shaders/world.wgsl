@@ -158,7 +158,8 @@ fn fs_block_fast(i: VOut) -> @location(0) vec4<f32> {
 /// d'une vitre se superposent à ceux du dessus). Les plantes en croix (face 6) se voient
 /// des deux côtés.
 fn from_behind(i: VOut) -> bool {
-    return i.face < 6u && dot(face_normal(i.face), g.cam_pos.xyz - i.world) < 0.0;
+    return i.face < 6u && (i.tex & 32768u) == 0u
+        && dot(face_normal(i.face), g.cam_pos.xyz - i.world) < 0.0;
 }
 
 @fragment
@@ -174,7 +175,7 @@ fn fs_block(i: VOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_block_translucent(i: VOut) -> @location(0) vec4<f32> {
     let c = shade(i);
-    if c.a < 0.02 {
+    if c.a < 0.02 || from_behind(i) {
         discard;
     }
     return vec4<f32>(c.rgb, max(c.a, 0.25));
@@ -218,7 +219,7 @@ fn fs_block_mv(i: VOut) -> MvOut {
 @fragment
 fn fs_block_translucent_mv(i: VOut) -> MvOut {
     let c = shade(i);
-    if c.a < 0.02 {
+    if c.a < 0.02 || from_behind(i) {
         discard;
     }
     return MvOut(vec4<f32>(c.rgb, max(c.a, 0.25)), vec2<f32>(0.0));
@@ -1197,11 +1198,20 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
 /// Lumière des sources proches cachée par un joueur entre elles et `p`.
 fn torch_shadow(p: vec3<f32>) -> vec3<f32> {
     var c = vec3<f32>(0.0);
-    let count = min(u32(g.light.z), 12u);
+    // Aucun joueur à moins de 8 blocs : pas d'ombre (la plupart des pixels).
+    var near = false;
+    for (var k = 0u; k < u32(g.shadow_info.x); k++) {
+        let m = (g.shadow_min[k].xyz + g.shadow_max[k].xyz) * 0.5 - p;
+        near = near || dot(m, m) < 64.0;
+    }
+    if !near {
+        return c;
+    }
+    let count = min(u32(g.light.z), 8u);
     for (var j = 0u; j < count; j++) {
         let to_l = g.lights_pos[j].xyz - p;
         let d = length(to_l);
-        if d > 12.0 || d < 0.3 {
+        if d > 10.0 || d < 0.3 {
             continue;
         }
         if player_shadow(p, to_l / d, d - 0.2) > 0.5 {
