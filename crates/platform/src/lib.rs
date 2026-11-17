@@ -47,6 +47,12 @@ pub struct Input {
     /// Windows l'a daté et celui où le jeu l'a reçu ; et retards déjà signalés.
     msg_lag: u32,
     lag_warned: u32,
+    /// Appareils d'où viennent les touches (saisie brute) : nom → numéro donné au journal.
+    /// Sans nom : aucune touche physique derrière, c'est un logiciel qui tape (macro,
+    /// script) ; `injected` le retient pour prévenir le joueur.
+    key_devices: std::collections::HashMap<Option<String>, usize>,
+    last_device: usize,
+    injected: bool,
     /// La saisie brute du clavier arrive-t-elle (notée une fois) ?
     raw_seen: bool,
     /// Touches déjà signalées au journal (une fois chacune).
@@ -134,9 +140,10 @@ impl Input {
         let (n, last) = reps.map_or((0, f32::NAN), |r| (r.0, r.1.elapsed().as_secs_f32()));
         log::info!(
             "touche {code:?} relâchée après {held:.2} s (vu par : {source}, message reçu {} ms \
-             après sa date) ; {n} répétitions de Windows, la dernière il y a {last:.2} s ; \
-             clavier brut : {}",
+             après sa date, clavier n° {}) ; {n} répétitions de Windows, la dernière il y a \
+             {last:.2} s ; clavier brut : {}",
             self.msg_lag,
+            self.last_device,
             if !self.raw_seen {
                 "pas de saisie brute"
             } else if self.raw_down.contains(&code) {
@@ -184,6 +191,35 @@ impl Input {
                  arrivent au jeu en retard)",
                 self.msg_lag
             );
+        }
+    }
+
+    /// Des touches arrivent-elles d'un logiciel et non d'un clavier (frappes injectées :
+    /// macro, script, logiciel qui réécrit les touches) ? C'est alors lui qui décide quand
+    /// une touche est relâchée, pas le clavier.
+    pub fn injected_keys(&self) -> bool {
+        self.injected
+    }
+
+    /// Note de quel appareil vient la touche brute en cours (une ligne au journal par
+    /// appareil).
+    fn note_device(&mut self, name: Option<String>) {
+        let next = self.key_devices.len() + 1;
+        let fresh = !self.key_devices.contains_key(&name);
+        let n = *self.key_devices.entry(name.clone()).or_insert(next);
+        self.last_device = n;
+        if fresh {
+            match &name {
+                Some(d) => log::info!("clavier n° {n} : {d}"),
+                None => {
+                    self.injected = true;
+                    log::warn!(
+                        "clavier n° {n} : touches sans appareil — elles sont tapées par un \
+                         logiciel (macro, script, logiciel qui réécrit le clavier), qui décide \
+                         aussi du moment où elles sont relâchées"
+                    );
+                }
+            }
         }
     }
 
@@ -456,7 +492,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
         }
     }
 
-    fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+    fn device_event(&mut self, _el: &ActiveEventLoop, id: DeviceId, event: DeviceEvent) {
         match event {
             DeviceEvent::MouseMotion { delta } => {
                 if self.input.grabbed {
@@ -469,6 +505,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
             // d'avancer).
             DeviceEvent::Key(raw) => {
                 self.input.note_lag("clavier brut");
+                self.input.note_device(device_name(&id));
                 let PhysicalKey::Code(code) = raw.physical_key else {
                     return;
                 };
@@ -878,6 +915,18 @@ fn release_stale_keys(input: &mut Input) {
 
 #[cfg(not(windows))]
 fn release_stale_keys(_input: &mut Input) {}
+
+/// Nom de l'appareil d'un événement brut (`None` : aucun, la frappe vient d'un logiciel).
+#[cfg(windows)]
+fn device_name(id: &DeviceId) -> Option<String> {
+    use winit::platform::windows::DeviceIdExtWindows;
+    id.persistent_identifier()
+}
+
+#[cfg(not(windows))]
+fn device_name(_id: &DeviceId) -> Option<String> {
+    Some("clavier".into())
+}
 
 /// Temps écoulé (ms) depuis la date que Windows a donnée au message en cours de
 /// traitement.

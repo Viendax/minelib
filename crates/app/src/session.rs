@@ -185,6 +185,8 @@ pub struct Session {
     coast_air: f32,
     /// Ligne de l'écran de débogage : touches tenues et déplacement demandé.
     move_debug: String,
+    /// Le joueur a été prévenu qu'un logiciel tape ses touches.
+    injected_warned: bool,
     autosave: f32,
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
@@ -391,6 +393,7 @@ impl Session {
             coast_logged: false,
             coast_air: 0.0,
             move_debug: String::new(),
+            injected_warned: false,
             autosave: AUTOSAVE_S,
             hit: None,
             frame_aim: None,
@@ -698,10 +701,23 @@ impl Session {
                 m.strafe,
                 if idle && flat > 0.3 {
                     "   (avance sans touche)"
+                } else if input.injected_keys() {
+                    "   (touches tapées par un logiciel)"
                 } else {
                     ""
                 }
             );
+            // Un logiciel tape les touches à la place du clavier (macro, script) : c'est lui
+            // qui les relâche, parfois en retard. Le joueur est prévenu une fois.
+            if input.injected_keys() && !self.injected_warned {
+                self.injected_warned = true;
+                self.chat.say(
+                    "Un logiciel tape ou réécrit tes touches (macro, script) : une touche peut \
+                     rester enfoncée après que tu l'as lâchée. Ferme-le pour jouer."
+                        .to_string(),
+                    chat::YELLOW,
+                );
+            }
             // En l'air, la vitesse se garde : seulement après 2 s (plus long qu'un saut).
             self.coast_air = if idle && flat > 1.0 && !self.player.on_ground && !self.player.flying
             {
