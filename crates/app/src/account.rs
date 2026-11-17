@@ -215,6 +215,7 @@ fn auto_relay(
         node.serve(mine);
         // Pseudos uniques avec les autres relais du DHT.
         h.set_whois(minelib_relay::federated_whois(node, public));
+        h.set_peer_servers(minelib_relay::federated_servers(node, public));
         minelib_p2p::publish(minelib_p2p::Ad {
             node: node.id(),
             noise: public,
@@ -300,6 +301,9 @@ pub struct Accounts {
     lan_relay: bool,
     /// Connexion en cours (pseudo, mot de passe) : gardée sur ce PC si elle réussit.
     sent: Option<(String, String)>,
+    /// Partie à rejoindre dès la connexion à son relais (voir `join_elsewhere`).
+    join_after_login: Option<u64>,
+    lan_before: bool,
     /// La connexion automatique du lancement a été tentée.
     auto_tried: bool,
     /// Connexion automatique en cours ; essais ratés faute de relais joignable, et moment
@@ -343,6 +347,8 @@ impl Accounts {
             maps_rev: 0,
             maps: Vec::new(),
             lan_relay: false,
+            join_after_login: None,
+            lan_before: false,
             sent: None,
             auto_tried: false,
             auto_pending: false,
@@ -548,6 +554,9 @@ impl Accounts {
         while let Some(e) = client.poll() {
             events.push(e);
         }
+        // L'autre relais (partie d'un relais fédéré) n'a pas voulu de nous : retour au
+        // relais d'origine.
+        let mut go_home = false;
         for e in events {
             match e {
                 Event::Pinned(k) => {
@@ -580,6 +589,9 @@ impl Accounts {
                         fingerprint,
                         totp,
                     });
+                    if let (Some(room), Some(c)) = (self.join_after_login.take(), &self.client) {
+                        c.send(Cmd::Join(room));
+                    }
                 }
                 // Code 2FA juste : ce PC est de confiance, la 2FA ne sera plus demandée ici.
                 Event::DeviceTrusted { pseudo, token } => self.keep_device(&pseudo, &token),
@@ -624,6 +636,7 @@ impl Accounts {
                     self.invites.clear();
                 }
                 Event::Error(m) => {
+                    go_home |= self.join_after_login.take().is_some();
                     self.busy = None;
                     self.sent = None;
                     self.auto_pending = false;
@@ -647,6 +660,7 @@ impl Accounts {
                     );
                 }
                 Event::Offline(m) => {
+                    go_home |= self.join_after_login.take().is_some();
                     self.busy = None;
                     self.sent = None;
                     self.auto_pending = false;
@@ -721,6 +735,7 @@ impl Accounts {
                 | Event::BackupIs(_)
                 | Event::BuildGarant(_)
                 | Event::ShardTask { .. }
+                | Event::ShardPeers { .. }
                 | Event::Shards(_)
                 | Event::ShardTicket { .. }
                 | Event::Judge { .. }
@@ -730,6 +745,13 @@ impl Accounts {
                 | Event::Witness { .. }
                 | Event::FromHost(_)) => self.game_events.push(e),
             }
+        }
+        if go_home {
+            self.client = None;
+            self.account = None;
+            self.link = None;
+            self.lan_relay = self.lan_before;
+            self.auto_login();
         }
     }
 
@@ -768,6 +790,55 @@ impl Accounts {
         self.account
             .as_ref()
             .map_or(String::new(), |a| a.pseudo.clone())
+    }
+
+    /// Rejoint une partie d'un autre relais (relais fédérés) : le jeu passe sur ce relais
+    /// avec le même compte (il y est inscrit avec le coffre gardé sur ce PC s'il n'y est
+    /// pas connu), puis entre dans la partie.
+    pub fn join_elsewhere(&mut self, e: &ServerEntry) {
+        let Some((pseudo, password)) = self.login_secret.clone().or_else(|| self.remembered())
+        else {
+            self.error = Some("Reconnecte-toi pour rejoindre une partie d'un autre relais.".into());
+            return;
+        };
+        let backup = std::fs::read(self.backup_path(&pseudo)).ok();
+        let device = self.device(&pseudo);
+        let (addr, key, node) = (e.relay_addr.clone(), e.relay_key, e.relay_node);
+        let dir = self.relay_dir.clone();
+        log::info!(
+            "partie « {} » sur le relais « {} » : on y passe",
+            e.name,
+            e.region
+        );
+        // Directement s'il donne une adresse joignable, sinon par un tunnel vers son nœud.
+        self.client = Some(Client::spawn_resolved(Box::new(move || {
+            if let Ok(a) = addr.parse::<SocketAddr>() {
+                if TcpStream::connect_timeout(&a, Duration::from_millis(800)).is_ok() {
+                    return Ok((addr.clone(), Some(key)));
+                }
+            }
+            let n = p2p_node(&dir).ok_or_else(|| anyhow::anyhow!("relais injoignable"))?;
+            Ok((n.tunnel(node)?.to_string(), Some(key)))
+        })));
+        // (La clé du relais d'origine reste celle des options.)
+        self.lan_before = self.lan_relay;
+        self.lan_relay = true;
+        self.link = None;
+        self.relay_at = None;
+        self.servers.clear();
+        self.party = (0, Vec::new());
+        self.join_after_login = Some(e.id);
+        self.sent = Some((pseudo.clone(), password.clone()));
+        self.busy = Some(format!("Passage sur le relais « {} »…", e.region));
+        if let Some(c) = &self.client {
+            c.send(Cmd::Login {
+                pseudo,
+                password,
+                totp: None,
+                backup,
+                device,
+            });
+        }
     }
 
     pub fn refresh_servers(&mut self, kind: u8) {

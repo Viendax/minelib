@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 26;
+pub const PROTOCOL: u32 = 27;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.
@@ -82,6 +82,11 @@ pub enum Request {
     /// sont uniques sur tous les relais qui se connaissent (ceux du DHT).
     Whois {
         pseudo: String,
+    },
+    /// Entre relais : les parties ouvertes ici (0 = FPS en attente, 1 = construction).
+    /// Chaque relais montre à ses joueurs les parties des relais qu'il connaît.
+    PeerServers {
+        kind: u8,
     },
     /// Création d'un compte : clé publique, preuve de mot de passe, coffre chiffré et
     /// preuve de travail (`crypto::pow_ok`).
@@ -271,6 +276,25 @@ pub enum Request {
     Position {
         chunk: [i32; 2],
     },
+    /// Entre relais d'une même région : position d'un joueur entré par le relais qui
+    /// envoie (chaque relais la transmet à ses propres joueurs proches).
+    PeerNearby {
+        peer: u64,
+        chunk: [i32; 2],
+        data: Vec<u8>,
+    },
+    /// Entre relais d'une même région : modification vérifiée par un relais, à mettre en
+    /// ordre par le premier relais de la région.
+    PeerToZone {
+        chunk: [i32; 2],
+        data: Vec<u8>,
+    },
+    /// Entre relais d'une même région : modification mise en ordre par le premier relais,
+    /// à garder et à transmettre à ses joueurs.
+    PeerEdit {
+        chunk: [i32; 2],
+        data: Vec<u8>,
+    },
     /// Construction : données pour le garant de la zone de ce chunk (ou pour tous les
     /// joueurs proches si l'expéditeur en est le garant).
     ToZone {
@@ -307,10 +331,15 @@ pub enum Request {
     Broadcast {
         data: Vec<u8>,
     },
-    /// Aller-retour mesuré par le jeu jusqu'au relais (ms) : le relais confie la partie
-    /// à qui a la meilleure connexion quand celle de l'hôte est mauvaise.
+    /// Aller-retour mesuré par le jeu jusqu'au relais (ms). Le relais mesure aussi
+    /// lui-même (`Response::Probe`) et retient le pire des deux : un jeu modifié ne peut
+    /// pas s'annoncer mieux connecté qu'il ne l'est.
     Rtt {
         ms: u16,
+    },
+    /// Réponse immédiate à `Response::Probe` (même numéro).
+    Echo {
+        nonce: u32,
     },
     /// Modifications en masse d'un OP (WorldEdit) dans un monde de construction : le
     /// relais vérifie qu'il est OP, les publie comme des blocs validés et répond par
@@ -337,11 +366,15 @@ impl Request {
                 | Request::ToPeer { .. }
                 | Request::Broadcast { .. }
                 | Request::Position { .. }
+                | Request::PeerNearby { .. }
+                | Request::PeerToZone { .. }
+                | Request::PeerEdit { .. }
                 | Request::ToZone { .. }
                 | Request::Nearby { .. }
                 | Request::RegionLog { .. }
                 | Request::ShardReady { .. }
                 | Request::Rtt { .. }
+                | Request::Echo { .. }
                 | Request::BulkEdit { .. }
                 | Request::CheatFound { .. }
         )
@@ -377,6 +410,18 @@ pub struct ServerEntry {
     pub players: u32,
     pub max_players: u32,
     pub region: String,
+    /// Partie d'un autre relais (relais fédérés) : son nœud, sa clé et, s'il en donne une,
+    /// son adresse directe. Tout à zéro et vide : une partie de ce relais.
+    pub relay_node: [u8; 32],
+    pub relay_key: [u8; 32],
+    pub relay_addr: String,
+}
+
+impl ServerEntry {
+    /// La partie est-elle sur un autre relais que celui qui a donné la liste ?
+    pub fn elsewhere(&self) -> bool {
+        self.relay_key != [0; 32]
+    }
 }
 
 /// Ligne du classement (statistiques façon CS).
@@ -566,6 +611,15 @@ pub enum Response {
         room: u64,
         region: [i32; 2],
         secret: [u8; 32],
+        /// Rang de ce relais dans sa région (le plus petit met les modifications en
+        /// ordre).
+        slot: u16,
+    },
+    /// À l'hôte d'un relais de région : tous les relais prêts de sa région (lui compris).
+    /// Ils se relient entre eux : une région très peuplée est servie par plusieurs relais.
+    ShardPeers {
+        region: [i32; 2],
+        list: Vec<ShardInfo>,
     },
     /// Aux joueurs d'un monde : relais de ses régions (les autres passent par ce relais).
     Shards {
@@ -671,6 +725,10 @@ pub enum Response {
         id: u32,
         error: String,
     },
+    /// Poussé : le relais mesure l'aller-retour jusqu'à ce jeu, qui renvoie `Echo` aussitôt.
+    Probe {
+        nonce: u32,
+    },
 }
 
 impl Response {
@@ -695,6 +753,7 @@ impl Response {
                 | Response::Slain { .. }
                 | Response::SetGamemode { .. }
                 | Response::BulkDone { .. }
+                | Response::Probe { .. }
                 | Response::SetTime { .. }
                 | Response::BuildSpawn { .. }
                 | Response::Arbitrate { .. }
@@ -706,6 +765,7 @@ impl Response {
                 | Response::FromZone { .. }
                 | Response::BuildGarant { .. }
                 | Response::ShardTask { .. }
+                | Response::ShardPeers { .. }
                 | Response::Shards { .. }
                 | Response::ShardTicket { .. }
         )
@@ -742,9 +802,32 @@ pub fn region_of(chunk: [i32; 2]) -> [i32; 2] {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ShardInfo {
     pub region: [i32; 2],
+    /// Rang dans la région (plusieurs relais par région peuplée).
+    pub slot: u16,
     pub node: [u8; 32],
     pub addr: String,
     pub key: [u8; 32],
+}
+
+/// Nom sous lequel le relais de rang `slot` entre chez les autres relais de sa région
+/// (jamais un pseudo de joueur : `#` n'y est pas permis).
+pub fn shard_peer_name(slot: u16) -> String {
+    format!("#relais{slot}")
+}
+
+/// Le relais de la région que prend le joueur `pseudo` parmi `list` : toujours le même
+/// pour un joueur, les joueurs répartis entre les relais, et quand un relais s'en va seuls
+/// ses joueurs changent (chacun garde le sien tant qu'il est là).
+pub fn shard_for<'a>(list: &'a [ShardInfo], pseudo: &str) -> Option<&'a ShardInfo> {
+    use sha2::Digest;
+    list.iter().max_by_key(|i| {
+        let mut h = sha2::Sha256::new();
+        h.update(pseudo.to_ascii_lowercase().as_bytes());
+        h.update(i.key);
+        h.update(i.slot.to_le_bytes());
+        let d: [u8; 32] = h.finalize().into();
+        u64::from_le_bytes(d[..8].try_into().expect("8 octets"))
+    })
 }
 
 /// Signature d'un billet de relais de région (secret partagé par le relais du monde et

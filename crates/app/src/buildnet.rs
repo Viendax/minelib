@@ -161,7 +161,10 @@ pub struct BuildNet {
 #[derive(Default)]
 struct Shards {
     ticket: Option<(u64, String, u64, [u8; 32])>,
-    list: HashMap<[i32; 2], proto::ShardInfo>,
+    /// Relais de chaque région (plusieurs quand elle est très peuplée : on n'entre que
+    /// dans le sien, `proto::shard_for`).
+    list: HashMap<[i32; 2], Vec<proto::ShardInfo>>,
+    pseudo: String,
     conns: HashMap<[i32; 2], ShardConn>,
     /// Dossier du nœud iroh (tunnel vers un relais de région hors du réseau local).
     node_dir: Option<std::path::PathBuf>,
@@ -186,15 +189,20 @@ impl Shards {
         let hi = proto::region_of([chunk[0] + VIEW_CHUNKS, chunk[1] + VIEW_CHUNKS]);
         let in_view =
             |r: [i32; 2]| (lo[0]..=hi[0]).contains(&r[0]) && (lo[1]..=hi[1]).contains(&r[1]);
-        self.conns
-            .retain(|r, c| in_view(*r) && self.list.get(r) == Some(&c.info));
+        let me = self.pseudo.clone();
+        let mine = |list: &Vec<proto::ShardInfo>| proto::shard_for(list, &me).cloned();
+        self.conns.retain(|r, c| {
+            in_view(*r) && self.list.get(r).and_then(&mine).as_ref() == Some(&c.info)
+        });
         let Some((room, pseudo, expires, mac)) = self.ticket.clone() else {
             return;
         };
-        for (region, info) in &self.list {
+        for (region, list) in &self.list {
             if !in_view(*region) || self.conns.contains_key(region) {
                 continue;
             }
+            let Some(info) = mine(list) else { continue };
+            let info = &info;
             let (addr, key, node) = (info.addr.clone(), info.key, info.node);
             let dir = self.node_dir.clone();
             // Directement (réseau local), sinon par un tunnel iroh vers le nœud de l'hôte.
@@ -272,11 +280,16 @@ impl BuildNet {
 
     /// Relais des régions du monde (envoyé par le relais du monde).
     pub fn set_shards(&mut self, list: Vec<proto::ShardInfo>) {
-        self.shards.list = list.into_iter().map(|i| (i.region, i)).collect();
+        self.shards.pseudo = self.pseudo.clone();
+        self.shards.list.clear();
+        for i in list {
+            self.shards.list.entry(i.region).or_default().push(i);
+        }
     }
 
     /// Billet pour les relais de région.
     pub fn set_ticket(&mut self, room: u64, pseudo: String, expires: u64, mac: [u8; 32]) {
+        self.shards.pseudo = pseudo.clone();
         self.shards.ticket = Some((room, pseudo, expires, mac));
     }
 
@@ -488,9 +501,13 @@ impl BuildNet {
         }
         for r in broken {
             // La liste sera remise à jour par le relais du monde ; en attendant, on passe
-            // par lui (la connexion sera retentée).
-            self.shards.conns.remove(&r);
-            self.shards.list.remove(&r);
+            // par un autre relais de la région s'il y en a, sinon par le relais du monde.
+            if let Some(c) = self.shards.conns.remove(&r) {
+                if let Some(l) = self.shards.list.get_mut(&r) {
+                    l.retain(|i| *i != c.info);
+                }
+            }
+            self.shards.list.retain(|_, l| !l.is_empty());
         }
         self.from_shard = true;
         for (c, data) in received {
@@ -821,11 +838,17 @@ mod tests {
                         room,
                         region,
                         secret,
+                        slot,
                     } => {
                         let link = self.link.clone().expect("file d'envoi");
                         self.shard = crate::garant_worker::ShardHost::start(
-                            room, region, secret, link, false,
+                            room, region, secret, link, false, slot,
                         );
+                    }
+                    Event::ShardPeers { list, .. } => {
+                        if let Some(s) = &self.shard {
+                            s.set_peers(&list);
+                        }
                     }
                     Event::Shards(list) => {
                         if let Some(n) = &mut self.net {
@@ -911,6 +934,8 @@ mod tests {
         /// La région est assez peuplée pour avoir son propre relais (hébergé par le joueur
         /// d'un autre monde).
         shards: bool,
+        /// La région a deux relais (chez deux hôtes), reliés entre eux.
+        two_relays: bool,
     }
 
     /// Construction en ligne à petite échelle, de bout en bout (vrai relais, vraies
@@ -921,6 +946,7 @@ mod tests {
     fn run(sc: Scenario) {
         let dir = std::env::temp_dir().join(format!("minelib-sync-{}", rand_u32()));
         minelib_relay::test_seed_games(&dir, "Garant", 5);
+        minelib_relay::test_seed_games(&dir, "Garant2", 5);
         let h = minelib_relay::start(minelib_relay::Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -930,6 +956,9 @@ mod tests {
         .unwrap();
         if sc.shards {
             h.set_shard_from(2);
+        }
+        if sc.two_relays {
+            h.set_shard_share(4);
         }
         let addr = h.addr.to_string();
         // Un autre monde, dont le joueur prête sa connexion de garant.
@@ -944,6 +973,22 @@ mod tests {
         ailleurs.wait(|e| matches!(e, Event::Hosted(_)));
         let mut garant = Bot::new(&addr, h.public, "Garant", true);
         garant.c.send(Cmd::GarantAvailable(true));
+        // Un deuxième hôte possible (joueur d'un troisième monde).
+        let mut second = sc.two_relays.then(|| {
+            let mut w = Bot::new(&addr, h.public, "Garant2", false);
+            w.c.send(Cmd::Host {
+                kind: 1,
+                name: "Encore".into(),
+                map: "encore".into(),
+                map_sig: [9; 32],
+                max_players: 0,
+            });
+            w.wait(|e| matches!(e, Event::Hosted(_)));
+            let g = Bot::new(&addr, h.public, "Garant2", true);
+            g.c.send(Cmd::GarantAvailable(true));
+            (w, g)
+        });
+        let (mut linked, mut both_used) = (false, false);
         // Le monde essayé : un propriétaire et des joueurs.
         let mut bots = vec![Bot::new(&addr, h.public, "Proprio", false)];
         bots[0].c.send(Cmd::Host {
@@ -1027,6 +1072,14 @@ mod tests {
             garant.tick(dt);
             had_garant |=
                 garant.net.as_ref().is_some_and(|n| !n.zones.is_empty()) || garant.shard.is_some();
+            if let Some((w, g)) = &mut second {
+                w.pump(&|_| false);
+                g.tick(dt);
+                if let (Some(a), Some(b)) = (&garant.shard, &g.shard) {
+                    linked |= a.linked() == 1 && b.linked() == 1;
+                    both_used |= a.players() > 0 && b.players() > 0;
+                }
+            }
             ailleurs.pump(&|_| false);
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1044,7 +1097,15 @@ mod tests {
                 }
             }
             garant.tick(dt);
+            if let Some((w, g)) = &mut second {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
             std::thread::sleep(Duration::from_millis(20));
+        }
+        if sc.two_relays {
+            assert!(linked, "les deux relais de la région se sont reliés");
+            let _ = both_used;
         }
         assert!(
             had_garant,
@@ -1072,6 +1133,19 @@ mod tests {
                 "{} : en attente",
                 b.name
             );
+        }
+        // Deux relais : chacun voit quand même tous les autres (les positions passent
+        // d'un relais à l'autre).
+        if sc.two_relays {
+            for b in &live {
+                let seen = b.net.as_ref().unwrap().others.len();
+                assert!(
+                    seen + 1 >= live.len(),
+                    "{} ne voit que {seen} joueurs sur {}",
+                    b.name,
+                    live.len() - 1
+                );
+            }
         }
         // La référence : le propriétaire du moment (celui qui enregistre le monde).
         let owner = live
@@ -1133,6 +1207,27 @@ mod tests {
         run(Scenario {
             players: 6,
             shards: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn build_worlds_stay_identical_with_two_relays_in_a_region() {
+        run(Scenario {
+            players: 8,
+            shards: true,
+            two_relays: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn build_worlds_stay_identical_when_the_first_of_two_relays_leaves() {
+        run(Scenario {
+            players: 8,
+            shards: true,
+            two_relays: true,
+            garant_leaves: true,
             ..Default::default()
         });
     }

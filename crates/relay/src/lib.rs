@@ -52,7 +52,9 @@ pub struct Handle {
     /// Clé publique du canal chiffré (celle que les jeux retiennent).
     pub public: [u8; 32],
     whois: Arc<Mutex<Option<WhoisFn>>>,
+    peer_servers: Arc<Mutex<Option<ServersFn>>>,
     shard_from: Arc<std::sync::atomic::AtomicUsize>,
+    shard_share: Arc<std::sync::atomic::AtomicUsize>,
     /// État du relais (essais seulement).
     #[cfg(test)]
     state: Arc<Mutex<State>>,
@@ -61,14 +63,45 @@ pub struct Handle {
 /// Interroge les autres relais : clés des comptes qui y portent ce pseudo.
 pub type WhoisFn = Arc<dyn Fn(&str) -> Vec<[u8; 32]> + Send + Sync>;
 
+/// Parties ouvertes sur les autres relais (sans attendre : la dernière liste connue),
+/// chacune avec de quoi joindre son relais (`ServerEntry::relay_*`).
+pub type ServersFn = Arc<dyn Fn(u8) -> Vec<proto::ServerEntry> + Send + Sync>;
+
 /// Joueurs dans une région d'un monde de construction à partir desquels elle a son propre
 /// relais (hébergé par un joueur sans lien avec ce monde).
 pub const SHARD_FROM: usize = 24;
+
+/// Joueurs de plus dans la région pour chaque relais de plus (chez un autre hôte), et
+/// relais au plus par région : une foule est partagée entre plusieurs connexions de
+/// joueurs, aucune ne porte toute la région.
+pub const SHARD_SHARE: usize = 96;
+pub const SHARD_MAX: usize = 8;
+
+/// Relais voulus pour une région de `players` joueurs.
+fn shards_wanted(players: usize, from: usize, share: usize) -> usize {
+    if players < from {
+        0
+    } else {
+        (1 + (players - from) / share.max(1)).min(SHARD_MAX)
+    }
+}
 
 impl Handle {
     /// Change le seuil `SHARD_FROM` (essais à petite échelle).
     pub fn set_shard_from(&self, players: usize) {
         self.shard_from
+            .store(players, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Relais fédérés : les joueurs de ce relais voient aussi les parties des autres
+    /// relais, données par `f`.
+    pub fn set_peer_servers(&self, f: ServersFn) {
+        *self.peer_servers.lock().unwrap() = Some(f);
+    }
+
+    /// Change `SHARD_SHARE` (essais à petite échelle).
+    pub fn set_shard_share(&self, players: usize) {
+        self.shard_share
             .store(players, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -124,6 +157,77 @@ pub fn federated_whois(node: &'static minelib_p2p::Node, me: [u8; 32]) -> WhoisF
             }
         }
         keys
+    })
+}
+
+/// Parties des autres relais du DHT (par tunnel iroh), sauf ce relais (`me`). Un fil de
+/// fond relit leurs listes toutes les 15 s tant que des joueurs les demandent ; la
+/// fonction rendue répond tout de suite avec la dernière liste connue.
+pub fn federated_servers(node: &'static minelib_p2p::Node, me: [u8; 32]) -> ServersFn {
+    type Lists = HashMap<u8, Vec<proto::ServerEntry>>;
+    let lists: Arc<Mutex<Lists>> = Arc::default();
+    let asked: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let (l2, a2) = (lists.clone(), asked.clone());
+    let _ = std::thread::Builder::new()
+        .name("relais fédérés".into())
+        .spawn(move || {
+            let mut ads: (Option<Instant>, Vec<minelib_p2p::Ad>) = (None, Vec::new());
+            loop {
+                std::thread::sleep(Duration::from_secs(3));
+                // Personne ne regarde la liste des serveurs : rien à demander.
+                let wanted = a2
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+                if !wanted {
+                    continue;
+                }
+                if ads.0.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+                    if let Ok(list) = minelib_p2p::find_relays() {
+                        ads.1 = list;
+                    }
+                    ads.0 = Some(Instant::now());
+                }
+                let now = minelib_p2p::now();
+                let mut fresh = Lists::new();
+                for ad in ads
+                    .1
+                    .iter()
+                    .filter(|a| a.noise != me && now.saturating_sub(a.seen) < 3600)
+                    .take(8)
+                {
+                    let Ok(addr) = node.tunnel(ad.node) else {
+                        continue;
+                    };
+                    for kind in [0u8, 1] {
+                        let Ok(list) =
+                            minelib_net::client::peer_servers(&addr.to_string(), ad.noise, kind)
+                        else {
+                            break;
+                        };
+                        fresh
+                            .entry(kind)
+                            .or_default()
+                            .extend(list.into_iter().map(|mut e| {
+                                e.relay_node = ad.node;
+                                e.relay_key = ad.noise;
+                                e.relay_addr = String::new();
+                                e
+                            }));
+                    }
+                }
+                *l2.lock().unwrap() = fresh;
+                std::thread::sleep(Duration::from_secs(12));
+            }
+        });
+    Arc::new(move |kind: u8| {
+        *asked.lock().unwrap() = Some(Instant::now());
+        lists
+            .lock()
+            .unwrap()
+            .get(&kind)
+            .cloned()
+            .unwrap_or_default()
     })
 }
 
@@ -195,6 +299,12 @@ struct Conn {
     /// Écart moyen (ms) entre deux mesures : une connexion instable (qui saute) est
     /// écartée comme une connexion lente.
     rtt_dev: f32,
+    /// Le même aller-retour mesuré par le relais lui-même (question en cours : numéro et
+    /// envoi ; moyenne et écart) : c'est le pire des deux qui compte.
+    probe: Option<(u32, Instant)>,
+    probed: Option<Instant>,
+    probe_rtt: Option<f32>,
+    probe_dev: f32,
     /// Joueurs à qui il a parlé (vocal) : dernier moment compté pour la fréquentation.
     talked: HashMap<u64, Instant>,
     /// Demandes d'objets (au sol, coffres) dans la seconde en cours.
@@ -215,8 +325,10 @@ struct Conn {
 /// Région d'un monde servie par son propre relais.
 struct RegionShard {
     host: u64,
+    /// Rang dans la région (jamais redonné : le plus ancien relais a le plus petit).
+    slot: u16,
     info: Option<proto::ShardInfo>,
-    /// Hôte précédent, fermé dès que celui-ci est prêt.
+    /// Hôte qu'il remplace, fermé dès que celui-ci est prêt.
     previous: Option<u64>,
 }
 
@@ -259,7 +371,9 @@ struct Room {
     suspects: HashSet<String>,
     /// Construction : régions servies par leur propre relais (hôte, relais prêt, hôte
     /// précédent à fermer quand le suivant est prêt), et secret de leurs billets.
-    shards: HashMap<[i32; 2], RegionShard>,
+    shards: HashMap<[i32; 2], Vec<RegionShard>>,
+    /// Rang du prochain relais de région de ce monde.
+    shard_slot: u16,
     shard_secret: [u8; 32],
     /// Version de la liste des relais de région, et version reçue par chaque joueur.
     shards_version: u32,
@@ -289,6 +403,8 @@ struct Room {
     evidence_parts: Vec<Vec<u8>>,
     /// Affaire en cours : numéro, arbitre, vérificateur qui accuse, début.
     arbitration: Option<(u64, u64, u64, Instant)>,
+    /// Contre-arbitrage en cours : le compte à bannir si le deuxième arbitre confirme.
+    ban_review: Option<String>,
     /// Construction : créateur du serveur (OP d'office) et clé de ses OP et bannis.
     creator: String,
     server: String,
@@ -322,7 +438,9 @@ impl Room {
 struct State {
     /// Recherche des pseudos dans les autres relais (voir `Handle::set_whois`).
     whois: Arc<Mutex<Option<WhoisFn>>>,
+    peer_servers: Arc<Mutex<Option<ServersFn>>>,
     shard_from: Arc<std::sync::atomic::AtomicUsize>,
+    shard_share: Arc<std::sync::atomic::AtomicUsize>,
     conns: HashMap<u64, Conn>,
     rooms: HashMap<u64, Room>,
     /// Lobbies : n° → connexions (la première est l'hôte du lobby).
@@ -365,10 +483,14 @@ pub fn start(cfg: Config) -> Result<Handle> {
         registry.accounts()
     );
     let whois: Arc<Mutex<Option<WhoisFn>>> = Arc::new(Mutex::new(None));
+    let peer_servers: Arc<Mutex<Option<ServersFn>>> = Arc::default();
     let shard_from = Arc::new(std::sync::atomic::AtomicUsize::new(SHARD_FROM));
+    let shard_share = Arc::new(std::sync::atomic::AtomicUsize::new(SHARD_SHARE));
     let state = Arc::new(Mutex::new(State {
         whois: whois.clone(),
+        peer_servers: peer_servers.clone(),
         shard_from: shard_from.clone(),
+        shard_share: shard_share.clone(),
         conns: HashMap::new(),
         rooms: HashMap::new(),
         parties: HashMap::new(),
@@ -425,7 +547,9 @@ pub fn start(cfg: Config) -> Result<Handle> {
         addr,
         public,
         whois,
+        peer_servers,
         shard_from,
+        shard_share,
         #[cfg(test)]
         state: state_for_tests,
     })
@@ -570,6 +694,10 @@ fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
                 garant_banned: false,
                 rtt: None,
                 rtt_dev: 0.0,
+                probe: None,
+                probed: None,
+                probe_rtt: None,
+                probe_dev: 0.0,
                 talked: HashMap::new(),
                 item_rate: (Instant::now(), 0),
                 arbitrating: None,
@@ -703,17 +831,25 @@ fn leave_room(st: &mut State, id: u64) {
         if room.kind == 1 {
             // Hôte d'une région qui s'en va : la région revient à ce relais (ou à l'hôte
             // suivant déjà prêt) ; les joueurs reçoivent la nouvelle liste.
-            let mut changed = false;
-            room.shards.retain(|_, sh| {
-                if sh.previous == Some(id) {
-                    sh.previous = None;
+            let mut changed = Vec::new();
+            for (region, list) in &mut room.shards {
+                for sh in list.iter_mut() {
+                    if sh.previous == Some(id) {
+                        sh.previous = None;
+                    }
                 }
-                let gone = sh.host == id;
-                changed |= gone;
-                !gone
-            });
-            if changed {
+                let before = list.len();
+                list.retain(|sh| sh.host != id);
+                if list.len() != before {
+                    changed.push(*region);
+                }
+            }
+            room.shards.retain(|_, list| !list.is_empty());
+            if !changed.is_empty() {
                 room.shards_version += 1;
+            }
+            for region in changed {
+                announce_shard_peers(st, room_id, region);
             }
             let cands = zone_candidates(st, room_id);
             let room = st.rooms.get_mut(&room_id).expect("partie");
@@ -967,16 +1103,24 @@ fn keep_evidence(r: &mut Room, part: u16, of: u16, data: Vec<u8>) {
 /// Lance un arbitrage : choisit un troisième garant sans lien avec la partie (ni avec
 /// l'hôte, ni avec le vérificateur) et lui envoie les pièces. Faux s'il n'y en a pas.
 fn arbitrate(st: &mut State, rid: u64, auditor: u64) -> bool {
+    arbitrate_apart(st, rid, auditor, None)
+}
+
+/// `first` : l'arbitre qui a déjà jugé l'affaire (contre-arbitrage avant un bannissement :
+/// un deuxième arbitre, sans lien avec le premier ni avec le vérificateur).
+fn arbitrate_apart(st: &mut State, rid: u64, auditor: u64, first: Option<u64>) -> bool {
     let Some(room) = st.rooms.get(&rid) else {
         return false;
     };
     let mut people: Vec<String> = room
         .everyone()
         .chain([room.host, auditor])
+        .chain(first)
         .filter_map(|m| st.conns.get(&m).and_then(|c| c.pseudo.clone()))
         .collect();
     people.extend(room.roster.iter().cloned());
-    let Some(arbiter) = pick_garant(st, &people) else {
+    let apart: Vec<u64> = std::iter::once(auditor).chain(first).collect();
+    let Some(arbiter) = pick_garant_apart(st, &people, &apart) else {
         return false;
     };
     let case = st.next_id;
@@ -1019,6 +1163,25 @@ fn arbitration_done(st: &mut State, rid: u64, guilty: Option<bool>) {
     let Some((case, arbiter, auditor, _)) = room.arbitration.take() else {
         return;
     };
+    // Contre-arbitrage (voir plus bas) : seul le bannissement en dépend, la partie a déjà
+    // suivi le premier arbitre.
+    if let Some(p) = room.ban_review.take() {
+        if let Some(c) = st.conns.get_mut(&arbiter) {
+            c.arbitrating = None;
+        }
+        let why = format!("triche constatée par deux arbitres (partie {rid}, n° {case})");
+        match guilty {
+            Some(true) => match ban_cheater(st, &p, &why) {
+                Ok(n) => log::warn!("« {p} » banni automatiquement ({n} machine(s)) : {why}"),
+                Err(e) => log::warn!("ban automatique de « {p} » impossible : {e}"),
+            },
+            _ => log::warn!(
+                "partie {rid} : le deuxième arbitre ne confirme pas la triche de « {p} » \
+                 ({guilty:?}) : pas de bannissement automatique"
+            ),
+        }
+        return;
+    }
     let host = room.host;
     let host_pseudo = (!room.garant_hosted || guilty == Some(true))
         .then(|| st.conns.get(&host).and_then(|c| c.pseudo.clone()))
@@ -1041,18 +1204,26 @@ fn arbitration_done(st: &mut State, rid: u64, guilty: Option<bool>) {
     }
     // Triche sûre (le vérificateur et un arbitre sans lien la constatent, en rejouant la
     // partie) : bannissement automatique du compte et de ses machines.
-    if guilty == Some(true) {
-        if let Some(p) = host_pseudo {
-            let why = format!("triche constatée par arbitrage (partie {rid}, n° {case})");
-            match ban_cheater(st, &p, &why) {
-                Ok(n) => log::warn!("« {p} » banni automatiquement ({n} machine(s)) : {why}"),
-                Err(e) => log::warn!("ban automatique de « {p} » impossible : {e}"),
-            }
-        }
-    }
     if let Some(r) = st.rooms.get_mut(&rid) {
         r.confirmed = r.confirmed.min(1);
         r.dismissed = 0;
+    }
+    // Triche constatée par le vérificateur et un arbitre : la partie change d'hôte tout de
+    // suite, mais le bannissement (à vie, machines comprises) attend un deuxième arbitre,
+    // sur une autre machine et sans lien avec les deux premiers. Deux comptes complices ne
+    // suffisent plus à faire bannir un innocent ; sans deuxième arbitre disponible, pas de
+    // bannissement automatique (un administrateur peut toujours bannir).
+    if guilty == Some(true) {
+        if let Some(p) = host_pseudo {
+            let second = arbitrate_apart(st, rid, auditor, Some(arbiter));
+            match st.rooms.get_mut(&rid) {
+                Some(r) if second => r.ban_review = Some(p),
+                _ => log::warn!(
+                    "partie {rid} : triche de « {p} » constatée par un arbitre (n° {case}), \
+                     pas de deuxième arbitre disponible : pas de bannissement automatique"
+                ),
+            }
+        }
     }
 }
 
@@ -1082,8 +1253,23 @@ fn garant_ok(st: &State, g: u64, players: &[String]) -> bool {
     if me.games < 3 || me.ratio() > 0.25 {
         return false;
     }
+    // Les autres comptes de sa machine comptent comme lui : un compte secondaire ne sert
+    // pas à garantir la partie du compte principal, ni celle de ses fréquentations.
+    let mine = if machines_apart(st) {
+        st.hardware.siblings(p)
+    } else {
+        Vec::new()
+    };
     players.iter().all(|q| {
         !q.eq_ignore_ascii_case(p)
+            && !mine.iter().any(|m| {
+                m.eq_ignore_ascii_case(q)
+                    || st.contacts.acquainted(m, q)
+                    || st
+                        .stats
+                        .get(m)
+                        .is_some_and(|s| s.friends.iter().any(|f| f.eq_ignore_ascii_case(q)))
+            })
             // Ils se fréquentent (se parlent, jouent ou traînent ensemble) : pas garant.
             && !st.contacts.acquainted(p, q)
             && !me.avoids(q)
@@ -1133,11 +1319,36 @@ fn garant_retiring(st: &State, g: u64) -> bool {
 /// Le garant disponible le plus adapté pour ces joueurs : d'abord un joueur qui vient de
 /// lancer sa propre partie (connexion de garant), sinon un joueur au menu.
 fn pick_garant(st: &State, players: &[String]) -> Option<u64> {
+    pick_garant_apart(st, players, &[])
+}
+
+/// Deux connexions viennent-elles de la même machine (un composant en commun) ?
+fn same_machine(a: &Conn, b: &Conn) -> bool {
+    minelib_net::hw::same_machine(&a.hw, &b.hw)
+}
+
+/// Les règles « pas sur la même machine » (garants, arbitres) s'appliquent-elles ? Pas sur
+/// un relais qui n'écoute que cette machine (essais, jeu seul) : tout le monde y est sur
+/// la même.
+fn machines_apart(st: &State) -> bool {
+    !st.cfg.bind.starts_with("127.")
+}
+
+/// Comme `pick_garant`, sur une autre machine que les connexions `apart` (arbitres : deux
+/// comptes d'une même personne ne doivent pas pouvoir s'accuser et se confirmer).
+fn pick_garant_apart(st: &State, players: &[String], apart: &[u64]) -> Option<u64> {
     // Un garant rejoue la partie : il doit avoir la même version du jeu.
     let want = players_version(st, players);
     st.conns
         .iter()
         .filter(|(_, c)| c.version == want)
+        .filter(|(_, c)| {
+            !machines_apart(st)
+                || !apart
+                    .iter()
+                    .filter_map(|o| st.conns.get(o))
+                    .any(|o| same_machine(c, o))
+        })
         .filter(|(&g, _)| garant_ok(st, g, players))
         .filter_map(|(&g, c)| {
             let cand = zones::Candidate {
@@ -1249,20 +1460,23 @@ fn bulk_edit(
                 }
             }
         }
-        // Région servie par son propre relais : il en garde aussi la copie.
-        if let Some(c) = room
+        // Région servie par ses propres relais : ils en gardent aussi la copie.
+        for sh in room
             .shards
             .get(&proto::region_of(chunk))
-            .and_then(|s| st.conns.get(&s.host))
+            .into_iter()
+            .flatten()
         {
-            transport::push(
-                &c.tx,
-                &Response::FromZone {
-                    peer: 0,
-                    chunk,
-                    data,
-                },
-            );
+            if let Some(c) = st.conns.get(&sh.host) {
+                transport::push(
+                    &c.tx,
+                    &Response::FromZone {
+                        peer: 0,
+                        chunk,
+                        data: data.clone(),
+                    },
+                );
+            }
         }
         touched.push(pos);
     }
@@ -1358,7 +1572,44 @@ const BAD_RTT: f32 = 180.0;
 /// plus deux fois son écart moyen, en ms. Une connexion qui saute (Wi-Fi chargé, 4G) vaut
 /// donc comme une connexion bien plus lente : tout le monde subirait ses à-coups.
 fn link_ms(c: &Conn) -> Option<f32> {
-    c.rtt.map(|r| r + 2.0 * c.rtt_dev)
+    // Ce que dit le jeu et ce que le relais mesure lui-même : le pire des deux (un jeu
+    // modifié peut mentir sur le premier, pas raccourcir le second).
+    let said = c.rtt.map(|r| r + 2.0 * c.rtt_dev);
+    let seen = c.probe_rtt.map(|r| r + 2.0 * c.probe_dev);
+    match (said, seen) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Une mesure d'aller-retour faite par le relais.
+fn probe_sample(c: &mut Conn, ms: f32) {
+    if let Some(r) = c.probe_rtt {
+        c.probe_dev = c.probe_dev * 0.8 + (ms - r).abs() * 0.2;
+    }
+    c.probe_rtt = Some(c.probe_rtt.map_or(ms, |r| r * 0.8 + ms * 0.2));
+}
+
+/// À chaque entretien : le relais mesure lui-même l'aller-retour de chaque joueur (une
+/// question toutes les 4 s ; sans réponse en 6 s, la mesure vaut 6 s).
+fn probe_links(st: &mut State) {
+    for c in st.conns.values_mut().filter(|c| c.pseudo.is_some()) {
+        if let Some((_, at)) = c.probe {
+            if at.elapsed() < Duration::from_secs(6) {
+                continue;
+            }
+            c.probe = None;
+            probe_sample(c, 6000.0);
+        }
+        if c.probed
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(4))
+        {
+            let nonce = rand::rngs::OsRng.next_u32();
+            c.probe = Some((nonce, Instant::now()));
+            c.probed = Some(Instant::now());
+            transport::push(&c.tx, &Response::Probe { nonce });
+        }
+    }
 }
 
 /// Connexion à écarter des rôles d'hôte et de garant (mesurée, et mauvaise).
@@ -1398,7 +1649,7 @@ fn rebalance_host(st: &mut State, rid: u64) -> bool {
     let Some(h) = rtt(host).filter(|&h| h >= BAD_RTT) else {
         return false;
     };
-    let shard_hosts: Vec<u64> = room.shards.values().map(|s| s.host).collect();
+    let shard_hosts: Vec<u64> = room.shards.values().flatten().map(|s| s.host).collect();
     let best = room
         .members
         .iter()
@@ -1474,6 +1725,7 @@ fn upkeep(st: &mut State) {
         return;
     }
     st.last_upkeep = Instant::now();
+    probe_links(st);
     upkeep_contacts(st);
     upkeep_build(st);
     let rooms: Vec<u64> = st
@@ -1659,10 +1911,60 @@ pub(crate) fn player_as(data: &[u8], pseudo: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Parties ouvertes sur ce relais (liste des serveurs).
+fn local_servers(st: &State, kind: u8) -> Vec<proto::ServerEntry> {
+    let mut list: Vec<proto::ServerEntry> = st
+        .rooms
+        .iter()
+        .filter(|(_, r)| r.kind == kind && !(kind == 0 && r.started))
+        .map(|(&rid, r)| proto::ServerEntry {
+            id: rid,
+            // Garant : jamais nommé aux joueurs.
+            host: if r.garant_hosted {
+                GARANT_NAME.to_string()
+            } else {
+                r.host_pseudo.clone()
+            },
+            name: r.name.clone(),
+            map: r.map.clone(),
+            players: r.player_count() as u32,
+            max_players: r.max_players,
+            region: st.cfg.name.clone(),
+            relay_node: [0; 32],
+            relay_key: [0; 32],
+            relay_addr: String::new(),
+        })
+        .collect();
+    list.sort_by_key(|e| e.id);
+    list.truncate(200);
+    list
+}
+
 fn is_shard_host(room: &Room, id: u64) -> bool {
     room.shards
         .values()
+        .flatten()
         .any(|r| r.host == id || r.previous == Some(id))
+}
+
+/// Aux hôtes des relais d'une région : la liste des relais prêts (ils se relient entre
+/// eux, et le plus petit rang met les modifications en ordre).
+fn announce_shard_peers(st: &State, rid: u64, region: [i32; 2]) {
+    let Some(list) = st.rooms.get(&rid).and_then(|r| r.shards.get(&region)) else {
+        return;
+    };
+    let ready: Vec<proto::ShardInfo> = list.iter().filter_map(|s| s.info.clone()).collect();
+    for sh in list {
+        if let Some(c) = st.conns.get(&sh.host) {
+            transport::push(
+                &c.tx,
+                &Response::ShardPeers {
+                    region,
+                    list: ready.clone(),
+                },
+            );
+        }
+    }
 }
 
 fn now_secs() -> u64 {
@@ -1690,15 +1992,35 @@ fn upkeep_regions(st: &mut State, rid: u64) {
             *count.entry(proto::region_of(*chunk)).or_default() += 1;
         }
     }
-    // Régions à pourvoir : peuplées sans relais, ou dont l'hôte doit passer la main.
-    let mut wanted: Vec<([i32; 2], Option<u64>)> = count
-        .iter()
-        .filter(|(r, &n)| n >= from && !room.shards.contains_key(*r))
-        .map(|(&r, _)| (r, None))
-        .collect();
-    for (&r, sh) in &room.shards {
-        if sh.previous.is_none() && sh.info.is_some() && garant_retiring(st, sh.host) {
-            wanted.push((r, Some(sh.host)));
+    let share = st
+        .shard_share
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    // Relais à ajouter : régions peuplées qui n'en ont pas assez pour leur foule, et hôtes
+    // qui doivent passer la main (remplacés, ou seulement relevés si la région en a
+    // assez sans eux).
+    let mut wanted: Vec<([i32; 2], Option<u64>)> = Vec::new();
+    let mut relieved: Vec<u64> = Vec::new();
+    for (&r, &n) in &count {
+        let have = room.shards.get(&r).map_or(0, Vec::len);
+        for _ in have..shards_wanted(n, from, share) {
+            wanted.push((r, None));
+        }
+    }
+    for (&r, list) in &room.shards {
+        let need = shards_wanted(count.get(&r).copied().unwrap_or(0), from, share).max(1);
+        let mut ready = list.iter().filter(|s| s.info.is_some()).count();
+        for sh in list {
+            let replaced = list.iter().any(|o| o.previous == Some(sh.host));
+            if sh.info.is_none() || replaced || !garant_retiring(st, sh.host) {
+                continue;
+            }
+            if ready > need {
+                ready -= 1;
+                relieved.push(sh.host);
+            } else {
+                wanted.push((r, Some(sh.host)));
+            }
         }
     }
     wanted.sort();
@@ -1709,20 +2031,49 @@ fn upkeep_regions(st: &mut State, rid: u64) {
         .collect();
     let secret = room.shard_secret;
     for (region, previous) in wanted {
-        let Some(g) = pick_build_garant(st, &names) else {
-            break;
+        let g = match pick_build_garant(st, &names) {
+            Some(g) => {
+                let room = st.rooms.get_mut(&rid).expect("partie");
+                room.members.push(g);
+                room.hidden.push(g);
+                g
+            }
+            // Plus de garant libre : un garant de zones de ce monde devient relais de
+            // région (dans sa région, le relais valide lui-même les modifications : il
+            // sert plus là). Ses zones repassent aux autres.
+            None => {
+                let room = st.rooms.get(&rid).expect("partie");
+                let own = room.hidden.iter().copied().find(|&h| {
+                    !is_shard_host(room, h) && st.conns.get(&h).is_some_and(|c| !link_bad(c))
+                });
+                let Some(g) = own else { break };
+                let cands: Vec<zones::Candidate> = zone_candidates(st, rid)
+                    .into_iter()
+                    .filter(|c| c.id != g)
+                    .collect();
+                let room = st.rooms.get_mut(&rid).expect("partie");
+                let lost: Vec<[i32; 2]> = room
+                    .build
+                    .zones
+                    .iter()
+                    .filter(|(_, z)| z.garant == g)
+                    .map(|(&k, _)| k)
+                    .collect();
+                let mut changes = room.build.left(g, &cands);
+                changes.push((g, Vec::new(), lost));
+                announce(st, rid, changes);
+                g
+            }
         };
         let room = st.rooms.get_mut(&rid).expect("partie");
-        room.members.push(g);
-        room.hidden.push(g);
-        room.shards.insert(
-            region,
-            RegionShard {
-                host: g,
-                info: None,
-                previous,
-            },
-        );
+        let slot = room.shard_slot;
+        room.shard_slot = room.shard_slot.wrapping_add(1);
+        room.shards.entry(region).or_default().push(RegionShard {
+            host: g,
+            slot,
+            info: None,
+            previous,
+        });
         let history: Vec<([i32; 2], Vec<Vec<u8>>)> = room.build.logs_in(|zone| {
             proto::region_of([zone[0] * proto::ZONE, zone[1] * proto::ZONE]) == region
         });
@@ -1734,6 +2085,7 @@ fn upkeep_regions(st: &mut State, rid: u64) {
                     room: rid,
                     region,
                     secret,
+                    slot,
                 },
             );
             for (zone, log) in history {
@@ -1750,7 +2102,14 @@ fn upkeep_regions(st: &mut State, rid: u64) {
                 }
             }
         }
-        log::info!("monde {rid} : région {region:?} confiée au relais de {g}");
+        log::info!("monde {rid} : région {region:?} confiée au relais de {g} (rang {slot})");
+    }
+    // Hôtes relevés sans remplaçant : la région a assez de relais sans eux.
+    for old in relieved {
+        leave_room(st, old);
+        if let Some(c) = st.conns.get(&old) {
+            transport::push(&c.tx, &Response::RoomClosed);
+        }
     }
     // Liste des relais et billets : à chaque joueur qui n'a pas la dernière version.
     let Some(room) = st.rooms.get_mut(&rid) else {
@@ -1759,6 +2118,7 @@ fn upkeep_regions(st: &mut State, rid: u64) {
     let list: Vec<proto::ShardInfo> = room
         .shards
         .values()
+        .flatten()
         .filter_map(|s| s.info.clone())
         .collect();
     let version = room.shards_version;
@@ -1829,7 +2189,9 @@ fn upkeep_build(st: &mut State) {
             .iter()
             .filter(|&&h| !is_shard_host(room, h))
             .count();
-        if garants >= build_garants_wanted(players, room.build.active()) {
+        // Un joueur seul dans son monde n'a personne à tromper : pas de garant extérieur
+        // pour lui (ils servent là où il y a du monde).
+        if players < 2 || garants >= build_garants_wanted(players, room.build.active()) {
             continue;
         }
         let names: Vec<String> = room
@@ -2155,6 +2517,7 @@ fn open_room(
             reports: HashSet::new(),
             suspects: HashSet::new(),
             shards: HashMap::new(),
+            shard_slot: 0,
             shard_secret: {
                 let mut k = [0u8; 32];
                 rand::rngs::OsRng.fill_bytes(&mut k);
@@ -2175,6 +2538,7 @@ fn open_room(
             evidence: VecDeque::new(),
             evidence_parts: Vec::new(),
             arbitration: None,
+            ban_review: None,
             creator: pseudo.to_string(),
             server: servers::key(pseudo, &map),
         },
@@ -2682,27 +3046,16 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
     let my_room = st.conns.get(&id).and_then(|c| c.room);
     Some(match req {
         Request::Servers { kind } => {
-            let mut list: Vec<proto::ServerEntry> = st
-                .rooms
-                .iter()
-                .filter(|(_, r)| r.kind == kind && !(kind == 0 && r.started))
-                .map(|(&rid, r)| proto::ServerEntry {
-                    id: rid,
-                    // Garant : jamais nommé aux joueurs.
-                    host: if r.garant_hosted {
-                        GARANT_NAME.to_string()
-                    } else {
-                        r.host_pseudo.clone()
-                    },
-                    name: r.name.clone(),
-                    map: r.map.clone(),
-                    players: r.player_count() as u32,
-                    max_players: r.max_players,
-                    region: st.cfg.name.clone(),
-                })
-                .collect();
-            list.sort_by_key(|e| e.id);
-            list.truncate(200);
+            let mut list = local_servers(st, kind);
+            // Relais fédérés : les parties des autres relais connus, après celles d'ici
+            // (le jeu s'y connecte avec le même compte pour les rejoindre).
+            let peers = st.peer_servers.lock().unwrap().clone();
+            if let Some(f) = peers {
+                let mut far = f(kind);
+                far.retain(|e| e.elsewhere() && e.relay_key != st.id.noise_public);
+                far.truncate(200);
+                list.extend(far);
+            }
             Response::Servers { list }
         }
         Request::Host {
@@ -3519,16 +3872,22 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         } => {
             let rid = my_room?;
             let room = st.rooms.get_mut(&rid)?;
-            let sh = room.shards.get_mut(&region).filter(|s| s.host == id)?;
+            let sh = room
+                .shards
+                .get_mut(&region)?
+                .iter_mut()
+                .find(|s| s.host == id)?;
             sh.info = Some(proto::ShardInfo {
                 region,
+                slot: sh.slot,
                 node,
                 addr,
                 key,
             });
-            let previous = sh.previous.take();
+            let (previous, slot) = (sh.previous.take(), sh.slot);
             room.shards_version += 1;
-            log::info!("monde {rid} : relais de la région {region:?} prêt");
+            log::info!("monde {rid} : relais {slot} de la région {region:?} prêt");
+            announce_shard_peers(st, rid, region);
             // L'hôte précédent ferme : les joueurs sont déjà passés au nouveau.
             if let Some(old) = previous {
                 leave_room(st, old);
@@ -3544,7 +3903,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let region = room
                 .shards
                 .iter()
-                .find(|(_, s)| s.host == id)
+                .find(|(_, l)| l.iter().any(|s| s.host == id))
                 .map(|(&r, _)| r)?;
             let mut changed = Vec::new();
             for (chunk, data) in entries {
@@ -3863,6 +4222,14 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             return None;
         }
+        Request::Echo { nonce } => {
+            if let Some(c) = st.conns.get_mut(&id) {
+                if let Some((_, at)) = c.probe.take_if(|(n, _)| *n == nonce) {
+                    probe_sample(c, at.elapsed().as_secs_f32() * 1000.0);
+                }
+            }
+            return None;
+        }
         Request::SetBackup { peer } => {
             if let Some(r) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
                 if r.host == id && r.members.contains(&peer) {
@@ -3947,6 +4314,7 @@ fn handle(
             | Request::ToHost { .. }
             | Request::SetBackup { .. }
             | Request::Rtt { .. }
+            | Request::Echo { .. }
             | Request::BulkEdit { .. }
             | Request::GarantAvailable { .. }
             | Request::GarantReady
@@ -3989,6 +4357,9 @@ fn handle_account(
         }
         Request::Whois { pseudo } => Response::Whois {
             pubkey: st.registry.lookup(&pseudo).map(|r| r.1),
+        },
+        Request::PeerServers { kind } => Response::Servers {
+            list: local_servers(st, kind),
         },
         Request::Register {
             pseudo,
@@ -5020,6 +5391,163 @@ mod tests {
 
     /// Un garant indépendant (au menu, 3 parties jouées, sans lien avec les joueurs) sert
     /// la partie ; un second la vérifie et la reprend quand l'hôte triche.
+    /// Le relais mesure lui-même l'aller-retour de chaque joueur, et c'est le pire de sa
+    /// mesure et de ce que le jeu annonce qui compte : un jeu modifié ne peut pas se dire
+    /// mieux connecté qu'il ne l'est pour rester hôte ou garant.
+    #[test]
+    fn the_relay_measures_round_trips_itself() {
+        let dir = std::env::temp_dir().join(format!("minelib-sonde-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let c = Client::spawn(h.addr.to_string(), Some(h.public));
+        c.send(Cmd::Register {
+            pseudo: "Sonde".into(),
+            password: "motdepasse".into(),
+        });
+        wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+        let t = Instant::now();
+        let seen = loop {
+            c.send(Cmd::Servers(1));
+            wait(&c, |e| matches!(e, Event::Servers(_)));
+            let st = h.state.lock().unwrap();
+            let me = st.conns.values().find(|c| c.pseudo.is_some()).unwrap();
+            if let Some(r) = me.probe_rtt {
+                break r;
+            }
+            drop(st);
+            assert!(t.elapsed() < Duration::from_secs(20), "pas de mesure");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(seen < 200.0, "mesure locale : {seen} ms");
+        let mut st = h.state.lock().unwrap();
+        let me = st.conns.values_mut().find(|c| c.pseudo.is_some()).unwrap();
+        // Le jeu annonce 1 ms, le relais en a mesuré 300 : c'est 300 qui compte.
+        me.rtt = Some(1.0);
+        me.probe_rtt = Some(300.0);
+        assert!(link_ms(me).unwrap() >= 300.0 && link_bad(me));
+        // Et un jeu qui s'annonce lent l'est, même si le relais le mesure rapide.
+        me.rtt = Some(400.0);
+        me.probe_rtt = Some(5.0);
+        assert!(link_bad(me));
+        drop(st);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Relais fédérés : un joueur du relais A voit dans sa liste la partie ouverte sur le
+    /// relais B, y passe avec le même compte (inscrit là-bas avec son coffre, même clé) et
+    /// la rejoint. Un autre compte ne peut pas prendre son pseudo sur B.
+    #[test]
+    fn players_see_and_join_the_games_of_another_relay() {
+        let open = |name: &str| {
+            let dir = std::env::temp_dir().join(format!("minelib-fede-{}", rand::random::<u32>()));
+            let h = start(Config {
+                dir: dir.clone(),
+                bind: "127.0.0.1:0".into(),
+                pow_bits: 4,
+                name: name.into(),
+            })
+            .unwrap();
+            (h, dir)
+        };
+        let ((a, da), (b, db)) = (open("Relais A"), open("Relais B"));
+        let (aaddr, akey) = (a.addr.to_string(), a.public);
+        let (baddr, bkey) = (b.addr.to_string(), b.public);
+        // Chacun connaît l'autre (dans le vrai jeu : par le DHT et un tunnel).
+        let (ba, aa) = (baddr.clone(), aaddr.clone());
+        a.set_peer_servers(Arc::new(move |kind| {
+            minelib_net::client::peer_servers(&ba, bkey, kind)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut e| {
+                    e.relay_key = bkey;
+                    e.relay_addr = ba.clone();
+                    e
+                })
+                .collect()
+        }));
+        b.set_whois(Arc::new(move |p: &str| {
+            minelib_net::client::whois(&aa, akey, p)
+                .ok()
+                .flatten()
+                .into_iter()
+                .collect()
+        }));
+        // Un monde ouvert sur B.
+        let host = Client::spawn(baddr.clone(), Some(bkey));
+        host.send(Cmd::Register {
+            pseudo: "Hote".into(),
+            password: "motdepasse".into(),
+        });
+        wait(&host, |e| matches!(e, Event::LoggedIn { .. }));
+        host.send(Cmd::Host {
+            kind: 1,
+            name: "Monde de B".into(),
+            map: "monde".into(),
+            map_sig: [5; 32],
+            max_players: 0,
+        });
+        let room = match wait(&host, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        // Un joueur de A le voit dans sa liste, marqué comme étant sur B.
+        let p = Client::spawn(aaddr.clone(), Some(akey));
+        p.send(Cmd::Register {
+            pseudo: "Voyageur".into(),
+            password: "motdepasse".into(),
+        });
+        let vault = match wait(&p, |e| matches!(e, Event::AccountBackup { .. })) {
+            Event::AccountBackup { vault, .. } => vault,
+            _ => unreachable!(),
+        };
+        wait(&p, |e| matches!(e, Event::LoggedIn { .. }));
+        p.send(Cmd::Servers(1));
+        let list = match wait(&p, |e| matches!(e, Event::Servers(_))) {
+            Event::Servers(l) => l,
+            _ => unreachable!(),
+        };
+        let e = list
+            .iter()
+            .find(|e| e.name == "Monde de B")
+            .expect("la partie de B est dans la liste de A");
+        assert!(e.elsewhere() && e.relay_key == bkey && e.id == room);
+        assert_eq!(e.region, "Relais B");
+        // Un imposteur ne peut pas prendre le pseudo du joueur sur B.
+        let thief = Client::spawn(baddr.clone(), Some(bkey));
+        thief.send(Cmd::Register {
+            pseudo: "voyageur".into(),
+            password: "autremotdepasse".into(),
+        });
+        assert!(wait_error(&thief).contains("autre relais"));
+        // Le joueur passe sur B avec son compte (coffre gardé sur son PC) et rejoint.
+        let q = Client::spawn(e.relay_addr.clone(), Some(e.relay_key));
+        q.send(Cmd::Login {
+            pseudo: "Voyageur".into(),
+            password: "motdepasse".into(),
+            totp: None,
+            backup: Some(vault),
+            device: None,
+        });
+        wait(&q, |e| matches!(e, Event::LoggedIn { .. }));
+        q.send(Cmd::Join(room));
+        wait(&q, |e| matches!(e, Event::Joined { .. }));
+        match wait(&host, |e| matches!(e, Event::PeerJoined { .. })) {
+            Event::PeerJoined { pseudo, .. } => assert_eq!(pseudo, "Voyageur"),
+            _ => unreachable!(),
+        }
+        // La liste de B ne renvoie pas à A ses propres parties comme étant « ailleurs ».
+        let own = minelib_net::client::peer_servers(&baddr, bkey, 1).unwrap();
+        assert!(own.iter().all(|e| !e.elsewhere()));
+        for d in [da, db] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     /// Objets au sol et coffres sur un vrai relais : deux joueurs qui prennent la même
     /// chose en même temps, un coffre cassé, une demande rejouée, la sauvegarde du
     /// propriétaire remise deux fois : jamais un objet de plus qu'au départ.
@@ -5327,6 +5855,10 @@ mod tests {
         // Un autre monde s'ouvre : il reçoit ce garant extérieur.
         let (createur, clink) = login("Createur");
         let room = host(&createur, 4);
+        // (Seul dans son monde, il n'en aurait pas : personne à tromper.)
+        let (invite, _) = login("Invite");
+        invite.send(Cmd::Join(room));
+        wait(&invite, |e| matches!(e, Event::Joined { .. }));
         std::thread::sleep(Duration::from_millis(2100));
         createur.send(Cmd::Maps);
         match wait(&g, |e| matches!(e, Event::BuildGarant(_))) {
@@ -5717,7 +6249,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("minelib-arb-{}", rand::random::<u32>()));
             {
                 let mut st = stats::Store::open(dir.join("stats")).unwrap();
-                for g in ["Garant", "Verif", "Arbitre"] {
+                for g in ["Garant", "Verif", "Arbitre", "Arbitre2"] {
                     st.get_mut(g).games = 5;
                     st.save(g);
                 }
@@ -5744,6 +6276,11 @@ mod tests {
                 };
                 wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
                 (c, link)
+            };
+            let banned = |pseudo: &str| {
+                let st = h.state.lock().unwrap();
+                let key = st.registry.lookup(pseudo).expect("compte").1;
+                st.registry.is_banned(&key)
             };
             let (g, glink) = login("Garant");
             g.send(Cmd::GarantAvailable(true));
@@ -5808,6 +6345,12 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+            // Un deuxième arbitre possible, pour le contre-arbitrage avant bannissement.
+            let (a2, _) = login("Arbitre2");
+            if guilty {
+                a2.send(Cmd::GarantAvailable(true));
+                std::thread::sleep(Duration::from_millis(300));
+            }
             a.send(Cmd::Verdict { case, guilty });
             if guilty {
                 wait(&v, |e| matches!(e, Event::Promoted { .. }));
@@ -5816,6 +6359,22 @@ mod tests {
                     // Le garant qui reprend reste anonyme pour les joueurs.
                     Event::HostChanged(h) => assert_eq!(h, GARANT_NAME),
                     _ => unreachable!(),
+                }
+                // L'hôte a perdu la partie, mais n'est banni qu'après un deuxième arbitre
+                // (deux comptes complices ne suffisent pas).
+                let case2 = match wait(&a2, |e| matches!(e, Event::Arbitrate { .. })) {
+                    Event::Arbitrate { case, .. } => case,
+                    _ => unreachable!(),
+                };
+                assert!(case2 != case && !banned("Garant"));
+                a2.send(Cmd::Verdict {
+                    case: case2,
+                    guilty: true,
+                });
+                let t = Instant::now();
+                while !banned("Garant") {
+                    assert!(t.elapsed() < Duration::from_secs(10), "pas banni");
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             } else {
                 // Accusation à tort : le vérificateur est écarté, l'hôte reste.

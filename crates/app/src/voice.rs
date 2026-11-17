@@ -145,6 +145,19 @@ pub struct Voice {
     pub speaking: HashMap<u64, f32>,
 }
 
+/// Temps minimal entre deux changements de clé (s), selon le nombre d'auditeurs. Quand un
+/// auditeur ne doit plus entendre, la clé change : aussitôt ou presque en petit groupe
+/// (une équipe de FPS, quelques voisins), où cela ne coûte rien ; dans une foule, chaque
+/// changement renvoie la clé à tous, alors on les espace (un relais malveillant garderait
+/// l'ancien auditeur à l'écoute ce temps-là au plus).
+fn rekey_gap(listeners: usize) -> f32 {
+    match listeners {
+        0..=16 => 0.5,
+        17..=64 => 2.0,
+        _ => 10.0,
+    }
+}
+
 impl Voice {
     pub fn new(link: Sender<Inbound>) -> Self {
         Self {
@@ -200,8 +213,8 @@ impl Voice {
         }
         // Quelqu'un ne doit plus m'entendre : nouvelle clé.
         let set: HashSet<u64> = listeners.iter().copied().collect();
-        // (Il ne reçoit déjà plus mes messages ; la clé change au plus toutes les 10 s :
-        // dans une foule qui bouge, la changer à chaque départ couperait la voix.)
+        // (Il ne reçoit déjà plus mes messages ; la clé change presque aussitôt en petit
+        // groupe, moins souvent dans une foule qui bouge : voir `rekey_gap`.)
         self.rekey_wait -= dt;
         if self.given.iter().any(|g| !set.contains(g)) {
             self.given.retain(|g| set.contains(g));
@@ -209,7 +222,7 @@ impl Voice {
         }
         if self.rekey_due && self.rekey_wait <= 0.0 {
             self.rekey_due = false;
-            self.rekey_wait = 10.0;
+            self.rekey_wait = rekey_gap(listeners.len());
             self.my_key = voice::new_voice_key();
             self.epoch += 1;
             self.seq = 0;

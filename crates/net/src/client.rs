@@ -294,6 +294,12 @@ pub enum Event {
         room: u64,
         region: [i32; 2],
         secret: [u8; 32],
+        slot: u16,
+    },
+    /// Hôte d'un relais de région : les relais prêts de sa région.
+    ShardPeers {
+        region: [i32; 2],
+        list: Vec<proto::ShardInfo>,
     },
     /// Relais des régions du monde.
     Shards(Vec<proto::ShardInfo>),
@@ -413,6 +419,28 @@ pub fn whois(addr: &str, key: [u8; 32], pseudo: &str) -> Result<Option<[u8; 32]>
     })?;
     match chan.recv::<Response>()? {
         Response::Whois { pubkey } => Ok(pubkey),
+        r => Err(anyhow!("réponse inattendue : {r:?}")),
+    }
+}
+
+/// Demande au relais `addr` (clé `key`) ses parties ouvertes (voir
+/// `Request::PeerServers`).
+pub fn peer_servers(addr: &str, key: [u8; 32], kind: u8) -> Result<Vec<proto::ServerEntry>> {
+    let (mut chan, got) = Channel::connect(addr, Duration::from_secs(4))?;
+    if got != key {
+        return Err(anyhow!("clé du relais inattendue"));
+    }
+    chan.send(&Request::Hello {
+        protocol: proto::PROTOCOL,
+        client: format!("relais minelib {}", env!("CARGO_PKG_VERSION")),
+    })?;
+    match chan.recv::<Response>()? {
+        Response::Hello { .. } => {}
+        r => return Err(anyhow!("réponse inattendue : {r:?}")),
+    }
+    chan.send(&Request::PeerServers { kind })?;
+    match chan.recv::<Response>()? {
+        Response::Servers { list } => Ok(list),
         r => Err(anyhow!("réponse inattendue : {r:?}")),
     }
 }
@@ -556,6 +584,13 @@ impl Worker {
 
     /// Message poussé par le relais (parties, données de jeu).
     fn on_push(&mut self, r: Response) {
+        // Mesure de l'aller-retour par le relais : réponse immédiate.
+        if let Response::Probe { nonce } = r {
+            if let Some(c) = self.chan.as_mut() {
+                let _ = c.send(&Request::Echo { nonce });
+            }
+            return;
+        }
         let e = match r {
             Response::PeerJoined {
                 peer,
@@ -627,11 +662,14 @@ impl Worker {
                 room,
                 region,
                 secret,
+                slot,
             } => Event::ShardTask {
                 room,
                 region,
                 secret,
+                slot,
             },
+            Response::ShardPeers { region, list } => Event::ShardPeers { region, list },
             Response::Shards { list } => Event::Shards(list),
             Response::ShardTicket {
                 room,

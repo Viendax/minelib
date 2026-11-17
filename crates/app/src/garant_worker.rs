@@ -60,12 +60,11 @@ impl Drop for GarantWorker {
 /// Relais d'une région d'un monde de construction, hébergé par ce jeu pour d'autres
 /// joueurs (voir `minelib_relay::shard`). Il renvoie au relais du monde ce qu'il publie.
 pub struct ShardHost {
-    #[allow(dead_code)]
     pub region: [i32; 2],
     handle: minelib_relay::shard::ShardHandle,
     link: std::sync::mpsc::Sender<minelib_net::transport::Inbound>,
     /// Nœud iroh propre à ce relais (joignable de partout, sans gêner celui du jeu).
-    _node: Option<minelib_p2p::Node>,
+    _node: Option<Arc<minelib_p2p::Node>>,
 }
 
 /// Adresse de ce PC sur le réseau local (sans rien envoyer), sinon la boucle locale.
@@ -89,23 +88,40 @@ impl ShardHost {
         secret: [u8; 32],
         link: std::sync::mpsc::Sender<minelib_net::transport::Inbound>,
         p2p: bool,
+        slot: u16,
     ) -> Option<Self> {
         let blocks = minelib_world::registry::registry()
             .len()
             .min(u16::MAX as usize) as u16;
-        let handle = minelib_relay::shard::start("0.0.0.0:0", room, region, secret, blocks)
+        let handle = minelib_relay::shard::start("0.0.0.0:0", room, region, secret, blocks, slot)
             .map_err(|e| log::warn!("relais de région : {e:#}"))
             .ok()?;
         let port = handle.addr.port();
         // Hôte anonyme : joignable seulement par les relais d'iroh (pas d'adresse IP
         // donnée aux joueurs de la région, ni directe ni de réseau local).
         let node = if p2p {
-            minelib_p2p::Node::start_private().ok()
+            minelib_p2p::Node::start_private().ok().map(Arc::new)
         } else {
             None
         };
         if let Some(n) = &node {
             n.serve(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+            // Les autres relais de la région se joignent comme les joueurs : directement
+            // s'ils donnent une adresse (réseau local), sinon par un tunnel vers leur nœud.
+            let n = n.clone();
+            handle.set_dial(Arc::new(move |info: &minelib_net::proto::ShardInfo| {
+                let (addr, key, remote, n) = (info.addr.clone(), info.key, info.node, n.clone());
+                Box::new(move || {
+                    if let Ok(a) = addr.parse::<std::net::SocketAddr>() {
+                        if std::net::TcpStream::connect_timeout(&a, Duration::from_millis(800))
+                            .is_ok()
+                        {
+                            return Ok((addr.clone(), Some(key)));
+                        }
+                    }
+                    Ok((n.tunnel(remote)?.to_string(), Some(key)))
+                })
+            }));
         }
         minelib_net::transport::push(
             &link,
@@ -133,8 +149,26 @@ impl ShardHost {
         self.handle.seed(chunk, data);
     }
 
+    /// Relais prêts de la région (liste du relais du monde).
+    pub fn set_peers(&self, list: &[minelib_net::proto::ShardInfo]) {
+        self.handle.set_peers(list);
+    }
+
+    /// Relié à ce nombre d'autres relais de la région.
+    #[cfg(test)]
+    pub fn linked(&self) -> usize {
+        self.handle.linked()
+    }
+
+    /// Joueurs entrés dans ce relais.
+    #[cfg(test)]
+    pub fn players(&self) -> usize {
+        self.handle.players()
+    }
+
     /// Renvoie au relais du monde ce que le relais de région a publié.
     pub fn pump(&self) {
+        self.handle.tick();
         let entries: Vec<([i32; 2], Vec<u8>)> = self.handle.published.try_iter().collect();
         if !entries.is_empty() {
             minelib_net::transport::push(
@@ -261,16 +295,29 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                         s.pump();
                     }
                 }
+                Event::ShardPeers { region, ref list } => {
+                    if let Some(s) = shard.as_ref().filter(|s| s.region == region) {
+                        s.set_peers(list);
+                    }
+                }
                 Event::ShardTask {
                     room,
                     region,
                     secret,
+                    slot,
                 } => {
                     if let Some(l) = link.clone() {
                         log::info!(
                             "garant en jeu : relais de la région {region:?} du monde {room}"
                         );
-                        shard = ShardHost::start(room, region, secret, l, login.node_dir.is_some());
+                        shard = ShardHost::start(
+                            room,
+                            region,
+                            secret,
+                            l,
+                            login.node_dir.is_some(),
+                            slot,
+                        );
                         if shard.is_none() {
                             client.send(Cmd::Leave);
                         }

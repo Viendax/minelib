@@ -1703,9 +1703,12 @@ impl Game {
         match action {
             multiplayer::Action::Refresh => self.accounts.refresh_servers(kind as u8),
             multiplayer::Action::Join(i) => {
-                if let Some(e) = self.accounts.servers.get(i) {
-                    let id = e.id;
-                    self.accounts.room(minelib_net::client::Cmd::Join(id));
+                if let Some(e) = self.accounts.servers.get(i).cloned() {
+                    if e.elsewhere() {
+                        self.accounts.join_elsewhere(&e);
+                    } else {
+                        self.accounts.room(minelib_net::client::Cmd::Join(e.id));
+                    }
                 }
             }
             multiplayer::Action::Create => {

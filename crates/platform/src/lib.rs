@@ -43,6 +43,10 @@ pub struct Input {
     /// Touches relâchées parce que leurs répétitions se sont arrêtées (voir
     /// `release_silent_keys`) : une répétition qui revient les remet.
     soft: HashSet<KeyCode>,
+    /// Retard du dernier message de clavier traité (ms) : temps entre le moment où
+    /// Windows l'a daté et celui où le jeu l'a reçu ; et retards déjà signalés.
+    msg_lag: u32,
+    lag_warned: u32,
     /// La saisie brute du clavier arrive-t-elle (notée une fois) ?
     raw_seen: bool,
     /// Touches déjà signalées au journal (une fois chacune).
@@ -129,8 +133,10 @@ impl Input {
         }
         let (n, last) = reps.map_or((0, f32::NAN), |r| (r.0, r.1.elapsed().as_secs_f32()));
         log::info!(
-            "touche {code:?} relâchée après {held:.2} s (vu par : {source}) ; {n} répétitions \
-             de Windows, la dernière il y a {last:.2} s ; clavier brut : {}",
+            "touche {code:?} relâchée après {held:.2} s (vu par : {source}, message reçu {} ms \
+             après sa date) ; {n} répétitions de Windows, la dernière il y a {last:.2} s ; \
+             clavier brut : {}",
+            self.msg_lag,
             if !self.raw_seen {
                 "pas de saisie brute"
             } else if self.raw_down.contains(&code) {
@@ -163,6 +169,22 @@ impl Input {
     }
     pub fn mouse_pressed(&self, b: Mouse) -> bool {
         self.mouse_pressed[b as usize]
+    }
+
+    /// Un message de clavier vient d'arriver : note son retard (date de Windows contre
+    /// maintenant). Un retard net veut dire que les touches arrivent au jeu après coup
+    /// (file de messages encombrée, ou logiciel qui retient le clavier) : relâcher une
+    /// touche n'est alors vu que plus tard. Noté au journal (quelques fois).
+    fn note_lag(&mut self, what: &str) {
+        self.msg_lag = message_lag_ms();
+        if self.msg_lag >= 80 && self.lag_warned < 20 {
+            self.lag_warned += 1;
+            log::warn!(
+                "clavier : message « {what} » reçu {} ms après sa date par Windows (les touches \
+                 arrivent au jeu en retard)",
+                self.msg_lag
+            );
+        }
     }
 
     fn end_frame(&mut self) {
@@ -292,6 +314,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                 self.set_grab(false);
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                self.input.note_lag("touche");
                 // (Même une touche inconnue prend les répétitions pour elle.)
                 if event.state == ElementState::Pressed && !event.repeat {
                     self.input.last_press = Some(Instant::now());
@@ -445,6 +468,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
             // Windows n'arrive jamais (touche qui « reste enfoncée » et fait continuer
             // d'avancer).
             DeviceEvent::Key(raw) => {
+                self.input.note_lag("clavier brut");
                 let PhysicalKey::Code(code) = raw.physical_key else {
                     return;
                 };
@@ -854,3 +878,25 @@ fn release_stale_keys(input: &mut Input) {
 
 #[cfg(not(windows))]
 fn release_stale_keys(_input: &mut Input) {}
+
+/// Temps écoulé (ms) depuis la date que Windows a donnée au message en cours de
+/// traitement.
+#[cfg(windows)]
+fn message_lag_ms() -> u32 {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::WindowsAndMessaging::GetMessageTime;
+    // SAFETY : simples lectures (heure du système, date du dernier message de ce fil).
+    let (now, at) = unsafe { (GetTickCount(), GetMessageTime() as u32) };
+    let lag = now.wrapping_sub(at);
+    // (Horloges à 16 ms près ; une date « dans le futur » compte pour zéro.)
+    if lag > u32::MAX / 2 {
+        0
+    } else {
+        lag
+    }
+}
+
+#[cfg(not(windows))]
+fn message_lag_ms() -> u32 {
+    0
+}

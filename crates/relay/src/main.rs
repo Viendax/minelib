@@ -52,6 +52,8 @@ fn main() -> Result<()> {
                 let node: &'static minelib_p2p::Node = Box::leak(Box::new(node));
                 // Pseudos uniques avec les autres relais du DHT.
                 h.set_whois(minelib_relay::federated_whois(node, h.public));
+                // Relais fédérés : ses joueurs voient aussi les parties des autres relais.
+                h.set_peer_servers(minelib_relay::federated_servers(node, h.public));
                 let local = std::net::SocketAddr::from(([127, 0, 0, 1], h.addr.port()));
                 node.serve(local);
                 minelib_p2p::publish(minelib_p2p::Ad {

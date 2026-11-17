@@ -99,6 +99,9 @@ pub mod cs {
 /// Freinage quand aucune touche de déplacement n'est tenue (par seconde) : en vol, au sol
 /// et en l'air (hors mode FPS, qui suit la friction de CS).
 const FLY_BRAKE: f32 = 45.0;
+/// Mode FPS, au sol, sans touche de direction : vitesse retirée par seconde en plus de la
+/// friction (arrêt en un dixième de seconde au lieu d'un tiers).
+const FPS_IDLE_BRAKE: f32 = 40.0;
 const GROUND_BRAKE: f32 = 30.0;
 const AIR_BRAKE: f32 = 9.0;
 const FLY: f32 = 12.0;
@@ -680,6 +683,14 @@ impl Player {
                 );
             } else {
                 self.friction(dt);
+                // Aucune touche de direction : on s'arrête net (la friction de CS seule
+                // laissait glisser un tiers de seconde après avoir lâché la touche).
+                if wish_len <= 1e-4 {
+                    let speed = self.ground_speed();
+                    let k = (speed - FPS_IDLE_BRAKE * dt).max(0.0) / speed.max(1e-6);
+                    self.vel.x *= k;
+                    self.vel.z *= k;
+                }
                 // Accroupi au sol : ralenti net à la vitesse d'accroupi.
                 let speed = self.ground_speed();
                 if m.sneak && speed > max_speed {
@@ -1935,8 +1946,8 @@ mod stop_tests {
                 }
             }
             assert!(p.on_ground && at.z < -40.0, "il a bien couru : {at:?}");
-            assert!(stopped.is_some_and(|t| t < 0.4), "fps {fps} : {stopped:?}");
-            assert!((p.pos - at).length() < 0.5, "fps {fps}");
+            assert!(stopped.is_some_and(|t| t < 0.15), "fps {fps} : {stopped:?}");
+            assert!((p.pos - at).length() < 0.3, "fps {fps}");
         }
     }
 }
