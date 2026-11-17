@@ -69,6 +69,9 @@ const POS_BUDGET: f32 = 960.0;
 /// Un joueur dont on n'a plus de nouvelles depuis ce temps (ou trois de ses intervalles,
 /// pour un joueur lointain rafraîchi rarement) n'est plus montré.
 const STALE_S: f32 = 3.0;
+/// Servi par un relais de région : là où l'on est, redit au relais du monde toutes les…
+/// (gardé pour notre retour sur ce serveur).
+const SPOT_EVERY: f32 = 10.0;
 
 /// Intervalle entre deux envois de sa position, selon le nombre de joueurs autour : 60
 /// fois par seconde jusqu'à 16 voisins, puis de moins en moins (30 à 32 voisins), jamais
@@ -170,6 +173,12 @@ pub struct BuildNet {
     undone: usize,
     /// Régions annoncées au relais du monde comme servies par un relais de région.
     served_sent: Vec<[i32; 2]>,
+    /// Un relais de région a redit le battement du relais du monde depuis la dernière
+    /// lecture (`take_relayed_beat`) : le relais du monde est en vie (v136 : il ne l'envoie
+    /// plus lui-même deux fois par seconde aux joueurs servis par un relais de région).
+    relayed_beat: bool,
+    /// Prochain envoi au relais du monde de là où l'on est (`Request::Spot`).
+    spot_timer: f32,
     /// Clé du compte (modifications signées dans une région souveraine), et date de la
     /// dernière signature.
     identity: Option<minelib_net::ed25519_dalek::SigningKey>,
@@ -345,6 +354,8 @@ impl BuildNet {
             seen: HashMap::new(),
             names: HashMap::new(),
             served_sent: Vec::new(),
+            relayed_beat: false,
+            spot_timer: 0.0,
             identity: None,
             sign_t: 0,
             caps_sent: false,
@@ -774,6 +785,7 @@ impl BuildNet {
                 match e {
                     Event::Link(l) => c.link = Some(l),
                     Event::FromZone { chunk, data, .. } => received.push((c.serial, chunk, data)),
+                    Event::Paused(_) => self.relayed_beat = true,
                     Event::Error(m) | Event::Offline(m) => {
                         log::info!("relais de la région {region:?} : {m}");
                         broken.push(*region);
@@ -827,6 +839,7 @@ impl BuildNet {
         }
         self.from_shard = None;
         self.pos_timer -= dt;
+        self.spot_timer -= dt;
         if self.pos_timer <= 0.0 {
             self.pos_timer = pos_every(self.others.len());
             let msg = BuildMsg::Player {
@@ -844,6 +857,16 @@ impl BuildNet {
                     data: game::encode(&msg),
                 },
             );
+            // Positions parties au relais de région : le relais du monde n'en sait plus
+            // rien ; il garde tout de même où l'on est pour notre retour (toutes les 10 s).
+            if self.spot_timer <= 0.0 && self.shards.link(proto::region_of(chunk)).is_some() {
+                self.spot_timer = SPOT_EVERY;
+                self.send(Request::Spot {
+                    pos: feet.to_array(),
+                    yaw: look.0,
+                    pitch: look.1,
+                });
+            }
         }
         for o in self.others.values_mut() {
             o.seen += dt;
@@ -855,6 +878,12 @@ impl BuildNet {
         self.others
             .retain(|_, o| o.seen < STALE_S.max(o.interval * 3.0));
         (caps, dirty)
+    }
+
+    /// Un relais de région a redit le battement du relais du monde depuis le dernier appel
+    /// (le relais du monde est en vie : rien à chercher chez son relais de secours).
+    pub fn take_relayed_beat(&mut self) -> bool {
+        std::mem::take(&mut self.relayed_beat)
     }
 
     /// Zones gagnées ou perdues (annoncé par le relais).
@@ -1181,6 +1210,8 @@ mod tests {
         /// Dernier certificat de la clé du compte reçu (comme `Accounts` : il survit à une
         /// reprise, le billet des relais de région non).
         cert: Option<minelib_net::sovereign::Cert>,
+        /// Lots d'autres régions vérifiés pour le relais du monde.
+        audits: u32,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -1245,6 +1276,7 @@ mod tests {
                 voted: crate::garant_worker::VoteBook::open(None),
                 follower: false,
                 cert: None,
+                audits: 0,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
@@ -1282,6 +1314,7 @@ mod tests {
                 voted: crate::garant_worker::VoteBook::open(None),
                 follower: true,
                 cert: None,
+                audits: 0,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b.c.send(Cmd::GarantAvailable(true));
@@ -1408,6 +1441,20 @@ mod tests {
                 Event::RootEdits { edits, .. } => {
                     if let Some(s) = &self.shard {
                         s.root_edits(edits);
+                    }
+                }
+                // (Comme `garant_worker` : vérifie les lots d'autres régions qu'on lui
+                // confie, redit le battement du relais du monde à ses joueurs.)
+                Event::Audit { .. } => {
+                    if let (Some(r), Some(l)) = (crate::garant_worker::audit_reply(&e), &self.link)
+                    {
+                        transport::push(l, &r);
+                        self.audits += 1;
+                    }
+                }
+                Event::WorldBeat { room, paused } => {
+                    if let Some(s) = self.shard.as_ref().filter(|s| s.room == room) {
+                        s.world_beat(paused);
                     }
                 }
                 Event::Identity(key) => {
@@ -1684,7 +1731,7 @@ mod tests {
                 (w, g)
             })
             .collect();
-        let (mut linked, mut both_used) = (false, false);
+        let (mut linked, mut both_used, mut left) = (false, false, false);
         // Modifications mises en ordre par un hôte principal ; triche faite.
         let (mut ordered, mut forged) = (0u64, false);
         // Des blocs sont arrivés à un joueur par un relais de région.
@@ -1733,7 +1780,10 @@ mod tests {
         let mut gone: Vec<usize> = Vec::new();
         // 6 secondes de jeu : on bouge, on construit des deux côtés de la frontière.
         for step in 0..300 {
-            if step == 150 && sc.garant_leaves {
+            // (Une fois les relais de la région reliés : sur une machine chargée, ils
+            // peuvent mettre plus de 3 s.)
+            if step >= 150 && sc.garant_leaves && !left && (linked || relays == 1 || step >= 250) {
+                left = true;
                 garant.c.send(Cmd::Leave);
                 garant.net = None;
                 garant.shard = None;

@@ -143,6 +143,13 @@ struct State {
     cells: HashMap<[i32; 3], u64>,
     /// Messages pour le relais du monde (par la connexion de l'hôte, voir `take_outbox`).
     outbox: Vec<Request>,
+    /// Hôte principal : lots publiés pas encore partis au relais du monde, et depuis quand
+    /// (ils partent ensemble, au plus toutes les `proto::ARCHIVE_EVERY_MS`). Autre relais :
+    /// dernière confirmation à donner (époque, rang, empreinte), et depuis quand.
+    archive: Vec<Batch>,
+    archive_since: Option<Instant>,
+    ack: Option<(u64, u64, [u8; 32])>,
+    ack_since: Option<Instant>,
     /// Essais : le prochain lot scellé comme hôte principal contiendra une modification
     /// inventée (voir `ShardHandle::forge_once`).
     forge: bool,
@@ -268,7 +275,6 @@ impl State {
         let Some(signer) = self.signer.clone() else {
             return;
         };
-        let region = self.region;
         let Some(sv) = self
             .sovereign
             .as_mut()
@@ -308,7 +314,35 @@ impl State {
                 transport::push_raw(l, msg.clone());
             }
         }
-        self.outbox.push(Request::Archive { region, batch });
+        self.archive.push(batch);
+        self.archive_since.get_or_insert_with(Instant::now);
+    }
+
+    /// Lots à archiver et confirmation au relais du monde : regroupés (au plus un message
+    /// de chaque toutes les `proto::ARCHIVE_EVERY_MS`), ou tout de suite (`now`, fin
+    /// d'époque).
+    fn send_root(&mut self, now: bool) {
+        let every = Duration::from_millis(proto::ARCHIVE_EVERY_MS);
+        let region = self.region;
+        let due = |t: Option<Instant>| t.is_some_and(|t| now || t.elapsed() >= every);
+        if due(self.archive_since) || self.archive.len() >= 64 {
+            self.archive_since = None;
+            let batches = std::mem::take(&mut self.archive);
+            if !batches.is_empty() {
+                self.outbox.push(Request::Archive { region, batches });
+            }
+        }
+        if due(self.ack_since) {
+            self.ack_since = None;
+            if let Some((epoch, seq, chain)) = self.ack.take() {
+                self.outbox.push(Request::Ack {
+                    region,
+                    epoch,
+                    seq,
+                    chain,
+                });
+            }
+        }
     }
 
     /// Autre relais d'une région souveraine : un lot de l'hôte principal, à vérifier.
@@ -354,12 +388,8 @@ impl State {
                 Ok(true) => {
                     let (epoch, seq, chain) = (sv.sov.epoch, sv.checker.next, sv.checker.chain);
                     if sv.acks {
-                        self.outbox.push(Request::Ack {
-                            region,
-                            epoch,
-                            seq,
-                            chain,
-                        });
+                        self.ack = Some((epoch, seq, chain));
+                        self.ack_since.get_or_insert_with(Instant::now);
                     }
                     let sv = self.sovereign.as_mut().expect("souveraine");
                     sv.recent.push_back((Instant::now(), b.clone()));
@@ -467,6 +497,27 @@ impl ShardHandle {
         }
     }
 
+    /// Le relais s'arrête (son hôte quitte le monde ou ferme le jeu) : tout ce qui n'est pas
+    /// encore parti au relais du monde part maintenant (modifications en attente scellées en
+    /// lot comme hôte principal, lots, confirmation), au lieu d'attendre la passation par
+    /// l'autre hôte de la région.
+    pub fn flush_root(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.flush(true);
+        st.send_root(true);
+    }
+
+    /// Du relais du monde (par la connexion de l'hôte), deux fois par seconde : le monde
+    /// est servi, ou en pause. Redit à chaque joueur de ce relais : le relais du monde n'a
+    /// plus à l'envoyer lui-même à chacun (v136).
+    pub fn world_beat(&self, paused: bool) {
+        let st = self.state.lock().unwrap();
+        let msg = Response::Paused { paused };
+        for c in st.conns.values().filter(|c| c.pseudo.is_some() && !c.peer) {
+            transport::push(&c.tx, &msg);
+        }
+    }
+
     /// Messages pour le relais du monde (lots à archiver, confirmations, accusations,
     /// passations), à envoyer par la connexion de l'hôte.
     pub fn take_outbox(&self) -> Vec<Request> {
@@ -561,6 +612,7 @@ impl ShardHandle {
             if st.sovereign.as_ref().is_some_and(|s| s.primary) {
                 st.flush(true);
             }
+            st.send_root(true);
             st.hand_over();
         }
         let Some(sov) = sov else { return };
@@ -626,6 +678,7 @@ impl ShardHandle {
     pub fn tick(&self) {
         let mut st = self.state.lock().unwrap();
         st.flush(false);
+        st.send_root(false);
         // Lots trop vieux : plus gardés.
         if let Some(sv) = st.sovereign.as_mut() {
             while sv
@@ -735,6 +788,10 @@ pub fn start(
         orphans: Vec::new(),
         cells: HashMap::new(),
         outbox: Vec::new(),
+        archive: Vec::new(),
+        archive_since: None,
+        ack: None,
+        ack_since: None,
         forge: false,
     }));
     let st = state.clone();
@@ -743,7 +800,7 @@ pub fn start(
         .spawn(move || {
             // Connexions ouvertes par joueur (nommé par le tunnel) : limitées, comme sur le
             // relais du monde.
-            let open: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+            let open: Arc<Mutex<crate::OpenSlots>> = Arc::default();
             for conn in listener.incoming() {
                 if st.lock().unwrap().closed {
                     return;

@@ -1691,6 +1691,14 @@ impl Game {
 
     /// Réponses du relais, et options à enregistrer (clé du relais, dernier pseudo).
     fn poll_accounts(&mut self) {
+        let relayed = self
+            .session
+            .as_mut()
+            .and_then(|s| s.build.as_mut())
+            .is_some_and(|b| b.take_relayed_beat());
+        if relayed {
+            self.accounts.relayed_beat();
+        }
         self.accounts.poll();
         let mut changed = false;
         if let Some(k) = self.accounts.new_relay_key.take() {

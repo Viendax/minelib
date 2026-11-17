@@ -327,6 +327,24 @@ pub enum Event {
         list: Vec<proto::ShardInfo>,
         sov: Option<proto::Sov>,
     },
+    /// Hôte d'un relais de région : un lot d'une autre région à vérifier (surveillance
+    /// mutuelle, voir `Response::Audit`).
+    Audit {
+        id: u64,
+        room: u64,
+        region: [i32; 2],
+        epoch: u64,
+        key: [u8; 32],
+        root: [u8; 32],
+        floor_t: u64,
+        batch: crate::sovereign::Batch,
+    },
+    /// Hôte d'un relais de région : le monde `room` est servi ou en pause (à redire aux
+    /// joueurs de ce relais).
+    WorldBeat {
+        room: u64,
+        paused: bool,
+    },
     /// Hôte principal d'une région souveraine : modifications signées par le relais du
     /// monde à la place de leurs auteurs.
     RootEdits {
@@ -779,6 +797,26 @@ impl Worker {
             Response::Committee { committee } => Event::Committee(committee),
             Response::Released { room, sig } => Event::Released { room, sig },
             Response::Paused { paused } => Event::Paused(paused),
+            Response::Audit {
+                id,
+                room,
+                region,
+                epoch,
+                key,
+                root,
+                floor_t,
+                batch,
+            } => Event::Audit {
+                id,
+                room,
+                region,
+                epoch,
+                key,
+                root,
+                floor_t,
+                batch,
+            },
+            Response::WorldBeat { room, paused } => Event::WorldBeat { room, paused },
             Response::Shards { list } => Event::Shards(list),
             Response::ShardTicket {
                 room,

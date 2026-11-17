@@ -4,7 +4,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 34;
+pub const PROTOCOL: u32 = 35;
+
+/// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
+/// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
+pub const ARCHIVE_EVERY_MS: u64 = 250;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.
@@ -271,11 +275,12 @@ pub enum Request {
         addr: String,
         key: [u8; 32],
     },
-    /// Hôte principal d'une région souveraine, au relais du monde : un lot qu'il vient de
-    /// publier (archivé quand un autre hôte de la région l'a confirmé, `Ack`).
+    /// Hôte principal d'une région souveraine, au relais du monde : les lots qu'il vient
+    /// de publier, qui se suivent (archivés quand un autre hôte de la région les a
+    /// confirmés, `Ack`). Regroupés : un message toutes les `ARCHIVE_EVERY_MS` au plus.
     Archive {
         region: [i32; 2],
-        batch: crate::sovereign::Batch,
+        batches: Vec<crate::sovereign::Batch>,
     },
     /// Autre hôte d'une région souveraine, au relais du monde : il a vérifié tout ce qu'a
     /// publié l'hôte principal jusqu'au rang `seq` exclu, d'empreinte `chain`.
@@ -446,6 +451,19 @@ pub enum Request {
     Served {
         regions: Vec<[i32; 2]>,
     },
+    /// Hôte d'un relais de région, au relais du monde : vérification d'un lot d'une autre
+    /// région qu'il lui a confiée (`Response::Audit`), et la faute trouvée s'il y en a une.
+    Audited {
+        id: u64,
+        fault: Option<String>,
+    },
+    /// Construction, au relais du monde, toutes les 10 s quand ses positions partent à un
+    /// relais de région : où est le joueur (gardé pour son retour sur ce serveur).
+    Spot {
+        pos: [f32; 3],
+        yaw: f32,
+        pitch: f32,
+    },
 }
 
 impl Request {
@@ -485,6 +503,8 @@ impl Request {
                 | Request::BulkEdit { .. }
                 | Request::Served { .. }
                 | Request::CheatFound { .. }
+                | Request::Audited { .. }
+                | Request::Spot { .. }
         )
     }
 }
@@ -920,6 +940,29 @@ pub enum Response {
     Probe {
         nonce: u32,
     },
+    /// Du relais du monde à l'hôte d'un relais de région (surveillance mutuelle) : un lot
+    /// d'une région souveraine d'un autre hôte, tiré au hasard, à vérifier comme le ferait
+    /// le relais du monde (`crate::sovereign::judge`) ; réponse `Request::Audited`. Le
+    /// relais du monde ne revérifie lui-même que ce qui est signalé.
+    Audit {
+        id: u64,
+        room: u64,
+        region: [i32; 2],
+        epoch: u64,
+        /// Clé de l'hôte principal qui a signé le lot, et clé du relais du monde (celle des
+        /// certificats).
+        key: [u8; 32],
+        root: [u8; 32],
+        floor_t: u64,
+        batch: crate::sovereign::Batch,
+    },
+    /// Du relais du monde à l'hôte d'un relais de région, deux fois par seconde : le monde
+    /// `room` est servi (ou en pause). Le relais de région le redit à ses joueurs : le
+    /// relais du monde n'a plus à l'envoyer lui-même à chacun d'eux.
+    WorldBeat {
+        room: u64,
+        paused: bool,
+    },
 }
 
 impl Response {
@@ -960,6 +1003,20 @@ impl Response {
                 | Response::RootEdits { .. }
                 | Response::Shards { .. }
                 | Response::ShardTicket { .. }
+                // (Relais de secours et gardiens, v133 à v135 : poussés eux aussi ; une
+                // requête en cours ne doit pas les prendre pour sa réponse.)
+                | Response::StandbyTask { .. }
+                | Response::Replica { .. }
+                | Response::ReplicaBag { .. }
+                | Response::ReplicaMode { .. }
+                | Response::Beat { .. }
+                | Response::WitnessTask { .. }
+                | Response::Committee { .. }
+                | Response::Released { .. }
+                | Response::Paused { .. }
+                | Response::Standby { .. }
+                | Response::Audit { .. }
+                | Response::WorldBeat { .. }
         )
     }
 }

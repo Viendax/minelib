@@ -653,7 +653,7 @@ struct RootSov {
     chain: [u8; 32],
     /// Lots reçus de l'hôte principal, pas encore confirmés (ils se suivent à partir de
     /// `base`).
-    pending: VecDeque<sovereign::Batch>,
+    pending: VecDeque<PendingBatch>,
     /// Depuis quand quelque chose attend (lot pas confirmé, modification transmise pas
     /// encore publiée) sans que rien n'avance : au-delà de `SOV_STALL`, l'hôte principal
     /// est remplacé.
@@ -679,8 +679,38 @@ struct PastSov {
     chain: [u8; 32],
 }
 
-/// Un lot sur `SPOT_CHECK` de l'hôte principal est vérifié aussi par le relais du monde.
-const SPOT_CHECK: u32 = 8;
+/// Lot reçu de l'hôte principal d'une région souveraine, pas encore archivé : son rang de
+/// fin et son empreinte, calculés une fois à l'arrivée.
+struct PendingBatch {
+    batch: sovereign::Batch,
+    end: u64,
+    chain: [u8; 32],
+}
+
+/// Surveillance mutuelle (v136) : un lot sur `AUDIT_EVERY` de l'hôte principal, tiré au
+/// hasard, est vérifié par l'hôte d'un relais d'une autre région du monde (le relais du
+/// monde ne revérifie que ce qui lui est signalé), et une de ces vérifications sur
+/// `AUDIT_SELF` aussi par le relais du monde lui-même (un vérificateur qui dirait « rien
+/// à signaler » sans regarder finit par être pris).
+const AUDIT_EVERY: u32 = 8;
+const AUDIT_SELF: u32 = 32;
+/// Vérification restée sans réponse au bout de ce temps : comptée contre le vérificateur,
+/// qui n'en reçoit plus après `AUDIT_MISSES` oublis.
+const AUDIT_WAIT: Duration = Duration::from_secs(10);
+const AUDIT_MISSES: u32 = 3;
+/// Lots au plus par message `Archive`.
+const ARCHIVE_MAX: usize = 256;
+
+/// Vérification d'un lot confiée à un autre hôte.
+struct AuditRec {
+    auditor: u64,
+    region: [i32; 2],
+    epoch: u64,
+    batch: sovereign::Batch,
+    at: Instant,
+    /// Vérifié aussi ici : la faute trouvée (ou non).
+    here: Option<Option<String>>,
+}
 /// Une deuxième confirmation qui tarde plus que cela : le relais du monde vérifie lui-même.
 const ACK_WAIT: Duration = Duration::from_secs(2);
 
@@ -749,12 +779,31 @@ struct Room {
     /// Dates (uniques) des modifications signées par ce relais déjà archivées : une même
     /// modification arrivée par deux chemins (passation, puis renvoi) ne compte qu'une fois.
     root_done: std::collections::BTreeSet<u64>,
+    /// Surveillance mutuelle : vérifications de lots confiées à des hôtes (par numéro),
+    /// hôtes prêts qui peuvent en recevoir (connexion, région ; refait à chaque
+    /// entretien), oublis de chacun, prochain numéro.
+    audits: HashMap<u64, AuditRec>,
+    auditors: Vec<(u64, [i32; 2])>,
+    audit_misses: HashMap<u64, u32>,
+    next_audit: u64,
+    /// Joueurs qui doivent recevoir d'ici les blocs d'une région (elle est à portée de vue
+    /// et aucun relais de région qu'ils ont rejoint ne la leur sert), par région ; et ces
+    /// régions pour chaque joueur. Archiver une modification ne regarde qu'eux (dans un
+    /// monde où tout est servi par des relais de région : presque personne).
+    needs: HashMap<[i32; 2], HashSet<u64>>,
+    needs_of: HashMap<u64, Vec<[i32; 2]>>,
+    /// Construction : joueurs qu'aucun relais de région ne sert (ils reçoivent d'ici le
+    /// battement deux fois par seconde ; les autres, par leur relais de région).
+    unserved: HashSet<u64>,
+    /// Passations arrivées pendant une pause (hôte, région, époque, lots) : archivées à la
+    /// reprise.
+    handovers: Vec<(u64, [i32; 2], u64, Vec<sovereign::Batch>)>,
     /// Construction : garants de zones.
     build: zones::Build,
     /// FPS : garant de secours désigné par l'hôte.
     backup: Option<u64>,
     /// Garants indépendants en attente (membres cachés, pas des joueurs) et prêts.
-    hidden: Vec<u64>,
+    hidden: std::collections::BTreeSet<u64>,
     ready_standby: Vec<u64>,
     /// La partie est servie par un garant indépendant (pas par un joueur).
     garant_hosted: bool,
@@ -787,6 +836,33 @@ struct Room {
 }
 
 impl Room {
+    /// Régions dont ce joueur doit maintenant recevoir les blocs d'ici (voir `needs`).
+    fn set_needs(&mut self, id: u64, want: Vec<[i32; 2]>) {
+        let old = self.needs_of.remove(&id).unwrap_or_default();
+        for r in old.iter().filter(|r| !want.contains(r)) {
+            if let Some(set) = self.needs.get_mut(r) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.needs.remove(r);
+                }
+            }
+        }
+        for r in &want {
+            self.needs.entry(*r).or_default().insert(id);
+        }
+        if !want.is_empty() {
+            self.needs_of.insert(id, want);
+        }
+    }
+
+    /// Un joueur quitte le monde de construction.
+    fn build_left(&mut self, id: u64) {
+        self.build.left(id);
+        self.shards_sent.remove(&id);
+        self.set_needs(id, Vec::new());
+        self.unserved.remove(&id);
+    }
+
     /// Joueurs de la partie (l'hôte s'il joue, les membres ; pas les garants).
     fn everyone(&self) -> impl Iterator<Item = u64> + '_ {
         let host = (!self.garant_hosted).then_some(self.host);
@@ -846,6 +922,11 @@ struct State {
     /// `minelib_net::sovereign`) ; date de la dernière signature (strictement croissante).
     cert_key: SigningKey,
     root_t: u64,
+    /// Surveillance mutuelle : un lot sur `audit_every` vérifié par un autre hôte, une de
+    /// ces vérifications sur `audit_self` aussi ici (`AUDIT_EVERY`, `AUDIT_SELF` ; les
+    /// essais en changent).
+    audit_every: u32,
+    audit_self: u32,
     /// Ce relais tient le relais de secours d'un monde d'un autre relais.
     standby: Option<StandbyCopy>,
     /// Essais : un relais de secours sur la machine du relais du monde (voir
@@ -860,6 +941,7 @@ struct State {
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
 pub fn start(cfg: Config) -> Result<Handle> {
+    raise_open_files();
     std::fs::create_dir_all(&cfg.dir)
         .with_context(|| format!("dossier du relais {}", cfg.dir.display()))?;
     let id = Identity::load_or_create(&cfg.dir)?;
@@ -914,6 +996,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
         bags: bags::Store::open(cfg_dir.join("sacs.bin")),
         cert_key,
         root_t: 0,
+        audit_every: AUDIT_EVERY,
+        audit_self: AUDIT_SELF,
         standby: None,
         standby_local: false,
         guard_epoch: Instant::now(),
@@ -955,7 +1039,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
                 };
                 // Connexions ouvertes par adresse : au-delà de `MAX_PER_PEER`, les
                 // suivantes sont refusées (un seul PC ne peut pas épuiser le relais).
-                let open: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+                let open: Arc<Mutex<OpenSlots>> = Arc::default();
                 loop {
                     let (stream, addr) = match listener.accept().await {
                         Ok(c) => c,
@@ -1010,51 +1094,76 @@ pub fn start(cfg: Config) -> Result<Handle> {
 
 /// Connexions ouvertes en même temps par une même adresse.
 const MAX_PER_PEER: usize = 48;
-/// Connexions ouvertes en tout (au-delà, les nouvelles sont refusées).
-const MAX_CONNECTIONS: usize = 60_000;
+/// Connexions ouvertes en tout (au-delà, les nouvelles sont refusées). Chaque joueur d'un
+/// monde de construction en ouvre deux (la sienne et celle de garant) : 250 000, c'est
+/// environ 120 000 joueurs (v136 ; avant, 60 000 connexions, soit 30 000 joueurs). Il faut
+/// alors au relais environ 2,5 Go de mémoire.
+const MAX_CONNECTIONS: usize = 250_000;
+
+/// Linux, macOS : un programme n'a droit par défaut qu'à 1024 connexions ouvertes (fichiers
+/// compris) ; le relais demande tout ce que le système lui permet.
+fn raise_open_files() {
+    #[cfg(unix)]
+    // SAFETY : appels au système avec une structure locale bien formée.
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+            let want = lim.rlim_max.min(MAX_CONNECTIONS as libc::rlim_t + 4096);
+            if want > lim.rlim_cur {
+                lim.rlim_cur = want;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    log::warn!("relais : impossible d'ouvrir plus de connexions à la fois");
+                }
+            }
+        }
+    }
+}
+
+/// Connexions ouvertes : par adresse (ou par joueur nommé par le tunnel), et en tout
+/// (tenu à jour : avant la v136, chaque nouvelle connexion additionnait celles de toutes
+/// les adresses).
+#[derive(Default)]
+pub(crate) struct OpenSlots {
+    per: HashMap<String, usize>,
+    total: usize,
+}
 
 /// Place prise par une connexion (rendue quand elle se ferme).
 pub(crate) struct PeerSlot {
-    open: Arc<Mutex<HashMap<String, usize>>>,
+    open: Arc<Mutex<OpenSlots>>,
     key: String,
 }
 
 impl PeerSlot {
     fn take(
-        open: &Arc<Mutex<HashMap<String, usize>>>,
+        open: &Arc<Mutex<OpenSlots>>,
         peer: &str,
         ip: Option<std::net::IpAddr>,
     ) -> Option<Self> {
-        let mut m = open.lock().unwrap();
-        let total: usize = m.values().sum();
         // Ce PC (tunnel iroh, relais intégré, essais) : pas de limite par adresse, le
         // tunnel a les siennes.
         let local = ip.is_none_or(|a| a.is_loopback());
-        let n = m.entry(peer.to_string()).or_insert(0);
-        if total >= MAX_CONNECTIONS || (!local && *n >= MAX_PER_PEER) {
-            return None;
-        }
-        *n += 1;
-        Some(Self {
-            open: open.clone(),
-            key: peer.to_string(),
-        })
+        Self::take_with(open, peer, if local { usize::MAX } else { MAX_PER_PEER })
     }
-}
 
-impl PeerSlot {
     /// Comme `take`, pour un joueur nommé par le tunnel (toujours limité).
-    pub(crate) fn take_named(open: &Arc<Mutex<HashMap<String, usize>>>, who: &str) -> Option<Self> {
+    pub(crate) fn take_named(open: &Arc<Mutex<OpenSlots>>, who: &str) -> Option<Self> {
+        Self::take_with(open, who, MAX_PER_PEER)
+    }
+
+    fn take_with(open: &Arc<Mutex<OpenSlots>>, key: &str, per_max: usize) -> Option<Self> {
         let mut m = open.lock().unwrap();
-        let total: usize = m.values().sum();
-        let n = m.entry(who.to_string()).or_insert(0);
-        if total >= MAX_CONNECTIONS || *n >= MAX_PER_PEER {
+        if m.total >= MAX_CONNECTIONS || m.per.get(key).is_some_and(|n| *n >= per_max) {
             return None;
         }
-        *n += 1;
+        *m.per.entry(key.to_string()).or_insert(0) += 1;
+        m.total += 1;
         Some(Self {
             open: open.clone(),
-            key: who.to_string(),
+            key: key.to_string(),
         })
     }
 }
@@ -1062,11 +1171,12 @@ impl PeerSlot {
 impl Drop for PeerSlot {
     fn drop(&mut self) {
         let mut m = self.open.lock().unwrap();
-        if let Some(n) = m.get_mut(&self.key) {
+        if let Some(n) = m.per.get_mut(&self.key) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                m.remove(&self.key);
+                m.per.remove(&self.key);
             }
+            m.total = m.total.saturating_sub(1);
         }
     }
 }
@@ -1200,7 +1310,7 @@ fn leave_room(st: &mut State, id: u64) {
     // Garant en attente (ou garant extérieur d'un monde) qui s'en va : simplement retiré,
     // ses zones passent à un autre.
     if room.hidden.contains(&id) {
-        room.hidden.retain(|&h| h != id);
+        room.hidden.remove(&id);
         room.ready_standby.retain(|&h| h != id);
         room.members.retain(|&m| m != id);
         if room.backup == Some(id) {
@@ -1228,8 +1338,7 @@ fn leave_room(st: &mut State, id: u64) {
                 announce_shard_peers(st, room_id, region);
             }
             let room = st.rooms.get_mut(&room_id).expect("partie");
-            room.build.left(id);
-            room.shards_sent.remove(&id);
+            room.build_left(id);
             return;
         }
         // Plus de vérificateur : le résultat des joueurs peut suffire.
@@ -1277,8 +1386,7 @@ fn leave_room(st: &mut State, id: u64) {
         switch_host(st, room_id, new, None);
         if kind == 1 {
             if let Some(room) = st.rooms.get_mut(&room_id) {
-                room.build.left(id);
-                room.shards_sent.remove(&id);
+                room.build_left(id);
             }
         }
         return;
@@ -1301,8 +1409,7 @@ fn leave_room(st: &mut State, id: u64) {
         }
         if room.kind == 1 {
             let room = st.rooms.get_mut(&room_id).expect("partie");
-            room.build.left(id);
-            room.shards_sent.remove(&id);
+            room.build_left(id);
         }
     }
 }
@@ -1319,7 +1426,7 @@ fn switch_host(st: &mut State, room_id: u64, new: u64, stays: Option<u64>) {
     room.evidence_parts.clear();
     room.members.retain(|&m| m != new);
     let was_hidden = room.hidden.contains(&new);
-    room.hidden.retain(|&h| h != new);
+    room.hidden.remove(&new);
     room.ready_standby.retain(|&h| h != new);
     if let Some(o) = stays {
         if !room.members.contains(&o) {
@@ -1338,7 +1445,7 @@ fn switch_host(st: &mut State, room_id: u64, new: u64, stays: Option<u64>) {
         .copied()
         .filter(|m| !room.hidden.contains(m))
         .collect();
-    let hidden: Vec<u64> = room.hidden.clone();
+    let hidden: Vec<u64> = room.hidden.iter().copied().collect();
     let pseudo_of = |c: u64| {
         st.conns
             .get(&c)
@@ -1871,6 +1978,32 @@ fn served_regions(st: &State, rid: u64, id: u64) -> HashSet<[i32; 2]> {
         .collect()
 }
 
+/// Range ce joueur selon les régions dont il doit recevoir les blocs d'ici (voir
+/// `Room::needs`) : après chaque changement de position ou de régions servies.
+fn refresh_needs(st: &mut State, rid: u64, id: u64) {
+    let served = st
+        .conns
+        .get(&id)
+        .map(|c| c.served.clone())
+        .unwrap_or_default();
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let mut want = Vec::new();
+    if let Some(&c) = room.build.positions.get(&id) {
+        let lo = proto::region_of([c[0] - zones::NEAR, c[1] - zones::NEAR]);
+        let hi = proto::region_of([c[0] + zones::NEAR, c[1] + zones::NEAR]);
+        for rx in lo[0]..=hi[0] {
+            for rz in lo[1]..=hi[1] {
+                if !served.contains(&[rx, rz]) {
+                    want.push([rx, rz]);
+                }
+            }
+        }
+    }
+    room.set_needs(id, want);
+}
+
 /// Envoie à un joueur ce qui lui manque des zones proches de `chunk` (les blocs des
 /// régions qu'un relais de région lui sert n'en font pas partie).
 fn send_catch_up(st: &mut State, rid: u64, id: u64, chunk: [i32; 2], moved: bool) {
@@ -2149,6 +2282,15 @@ fn probe_sample(c: &mut Conn, ms: f32) {
 /// À chaque entretien : le relais mesure lui-même l'aller-retour de chaque joueur (une
 /// question toutes les 4 s ; sans réponse en 6 s, la mesure vaut 6 s).
 fn probe_links(st: &mut State) {
+    // Grands mondes de construction : leurs joueurs ne sont mesurés que toutes les minutes
+    // (v136 : il ne s'agit que de choisir parmi eux un propriétaire mieux relié ; les
+    // garants, eux, restent mesurés toutes les 4 s).
+    let big: HashSet<u64> = st
+        .rooms
+        .iter()
+        .filter(|(_, r)| r.kind == 1 && r.members.len() > PROBE_ALL_UPTO)
+        .map(|(&id, _)| id)
+        .collect();
     for c in st.conns.values_mut().filter(|c| c.pseudo.is_some()) {
         if let Some((_, at)) = c.probe {
             if at.elapsed() < Duration::from_secs(6) {
@@ -2157,9 +2299,12 @@ fn probe_links(st: &mut State) {
             c.probe = None;
             probe_sample(c, 6000.0);
         }
-        if c.probed
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(4))
-        {
+        let every = if !c.garant && c.room.is_some_and(|r| big.contains(&r)) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(4)
+        };
+        if c.probed.is_none_or(|t| t.elapsed() >= every) {
             let nonce = rand::rngs::OsRng.next_u32();
             c.probe = Some((nonce, Instant::now()));
             c.probed = Some(Instant::now());
@@ -2167,6 +2312,10 @@ fn probe_links(st: &mut State) {
         }
     }
 }
+
+/// Jusqu'à ce nombre de joueurs, chaque joueur d'un monde de construction est mesuré
+/// toutes les 4 s ; au-delà, toutes les minutes.
+const PROBE_ALL_UPTO: usize = 64;
 
 /// Connexion à écarter des rôles d'hôte et de garant (mesurée, et mauvaise).
 fn link_bad(c: &Conn) -> bool {
@@ -2205,11 +2354,19 @@ fn rebalance_host(st: &mut State, rid: u64) -> bool {
     let Some(h) = rtt(host).filter(|&h| h >= BAD_RTT) else {
         return false;
     };
-    let shard_hosts: Vec<u64> = room.shards.values().flatten().map(|s| s.host).collect();
+    // (Ensembles : dans un monde de 100 000 joueurs, comparer chacun à la liste des
+    // garants coûtait des centaines de millions de comparaisons par entretien.)
+    let not_players: HashSet<u64> = room
+        .shards
+        .values()
+        .flatten()
+        .map(|s| s.host)
+        .chain(room.hidden.iter().copied())
+        .collect();
     let best = room
         .members
         .iter()
-        .filter(|m| !room.hidden.contains(m) && !shard_hosts.contains(m))
+        .filter(|m| !not_players.contains(m))
         .filter_map(|&m| Some((m, rtt(m)?)))
         .filter(|&(_, r)| r <= GOOD_RTT && r * 2.0 <= h)
         .min_by(|a, b| a.1.total_cmp(&b.1));
@@ -2331,7 +2488,7 @@ fn upkeep(st: &mut State) {
         };
         let room = st.rooms.get_mut(&rid).expect("partie");
         room.members.push(g);
-        room.hidden.push(g);
+        room.hidden.insert(g);
         let (host, map_sig, map) = (room.host, room.map_sig, room.map.clone());
         let members: Vec<(u64, String)> = room
             .everyone()
@@ -2645,7 +2802,7 @@ fn upkeep_standby(st: &mut State, rid: u64) {
         owner,
     };
     room.members.push(g);
-    room.hidden.push(g);
+    room.hidden.insert(g);
     room.standby = Some(StandbyRef { host: g, at: None });
     room.build.set_replicating(true);
     let entries = room.build.export_entries();
@@ -2810,6 +2967,15 @@ fn upkeep_sovereignty(st: &mut State, rid: u64) {
     if guards::frozen(st, rid) {
         return;
     }
+    // Passations arrivées pendant la pause.
+    let waiting = st
+        .rooms
+        .get_mut(&rid)
+        .map(|r| std::mem::take(&mut r.handovers))
+        .unwrap_or_default();
+    for (host, region, epoch, batches) in waiting {
+        take_handover(st, rid, host, region, epoch, batches);
+    }
     let root_key = st.cert_key.verifying_key().to_bytes();
     let Some(room) = st.rooms.get(&rid) else {
         return;
@@ -2860,7 +3026,10 @@ fn upkeep_sovereignty(st: &mut State, rid: u64) {
                 root: root_key,
                 floor_t: old.floor_t,
             };
-            let pending: Vec<sovereign::Batch> = std::mem::take(&mut old.pending).into();
+            let pending: Vec<sovereign::Batch> = std::mem::take(&mut old.pending)
+                .into_iter()
+                .map(|p| p.batch)
+                .collect();
             let (done, fault) = sound_prefix(&rules, old.epoch, &old.key, pending);
             if let Some(last) = done.last() {
                 (old.base, old.chain) = (last.end(), last.chain());
@@ -2978,11 +3147,7 @@ fn try_commit(st: &mut State, rid: u64, region: [i32; 2]) {
     let mut covered: Vec<usize> = sv
         .acks
         .values()
-        .filter_map(|(s, c)| {
-            sv.pending
-                .iter()
-                .position(|b| b.end() == *s && b.chain() == *c)
-        })
+        .filter_map(|(s, c)| sv.pending.iter().position(|p| p.end == *s && p.chain == *c))
         .collect();
     covered.sort_unstable_by(|a, b| b.cmp(a));
     let late =
@@ -2996,8 +3161,12 @@ fn try_commit(st: &mut State, rid: u64, region: [i32; 2]) {
                 root,
                 floor_t: sv.floor_t,
             };
-            let head: Vec<sovereign::Batch> =
-                sv.pending.iter().take(covered[0] + 1).cloned().collect();
+            let head: Vec<sovereign::Batch> = sv
+                .pending
+                .iter()
+                .take(covered[0] + 1)
+                .map(|p| p.batch.clone())
+                .collect();
             let (sound, fault) = sound_prefix(&rules, sv.epoch, &sv.key, head);
             if let Some(why) = fault {
                 log::warn!(
@@ -3015,10 +3184,10 @@ fn try_commit(st: &mut State, rid: u64, region: [i32; 2]) {
         }
         None => return,
     };
-    let done: Vec<sovereign::Batch> = sv.pending.drain(..=upto).collect();
+    let done: Vec<PendingBatch> = sv.pending.drain(..=upto).collect();
     let last = done.last().expect("lot");
-    (sv.base, sv.chain) = (last.end(), last.chain());
-    commit_batches(st, rid, region, done);
+    (sv.base, sv.chain) = (last.end, last.chain);
+    commit_batches(st, rid, region, done.into_iter().map(|p| p.batch).collect());
     // Ça avance : ce qui attend encore attend depuis maintenant.
     if let Some(sv) = st.rooms.get_mut(&rid).and_then(|r| r.sov.get_mut(&region)) {
         sv.waiting = (!sv.pending.is_empty() || !sv.sent.is_empty()).then(Instant::now);
@@ -3046,7 +3215,285 @@ fn sound_prefix(
     (done, None)
 }
 
-/// Faute prouvée d'un hôte principal : écarté de tout rôle de garant, il quitte le monde.
+/// Surveillance mutuelle : un lot tiré au hasard part chez l'hôte d'un relais d'une autre
+/// région du monde, qui le vérifie (`Response::Audit`). Sans un tel hôte (petit monde),
+/// ou une fois sur `AUDIT_SELF`, ce relais le vérifie aussi lui-même.
+fn audit_batch(st: &mut State, rid: u64, region: [i32; 2], batch: sovereign::Batch) {
+    let root = st.cert_key.verifying_key().to_bytes();
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let Some(sv) = room.sov.get(&region) else {
+        return;
+    };
+    let (epoch, key, floor_t) = (sv.epoch, sv.key, sv.floor_t);
+    // Au hasard parmi les hôtes prêts des autres régions (pas un de la région : ils
+    // vérifient déjà chaque lot, et l'un d'eux peut être complice), encore dans ce monde
+    // et jamais écartés (la liste n'est refaite qu'à l'entretien).
+    let mut auditor = None;
+    if !room.auditors.is_empty() {
+        for _ in 0..16 {
+            let (a, r) = room.auditors[rand::random::<u32>() as usize % room.auditors.len()];
+            let usable = r != region
+                && room.audit_misses.get(&a).is_none_or(|m| *m < AUDIT_MISSES)
+                && st
+                    .conns
+                    .get(&a)
+                    .is_some_and(|c| !c.garant_banned && c.room == Some(rid));
+            if usable {
+                auditor = Some(a);
+                break;
+            }
+        }
+    }
+    let self_every = st.audit_self.max(1);
+    let here = (auditor.is_none() || rand::random::<u32>().is_multiple_of(self_every)).then(|| {
+        let rules = sovereign::Rules {
+            room: rid,
+            region,
+            root,
+            floor_t,
+        };
+        batch.audit(&rules, epoch, &key)
+    });
+    if let Some(Some(why)) = &here {
+        log::warn!(
+            "monde {rid} : région {region:?}, faute de l'hôte principal vue par ce relais : {why}"
+        );
+        convict(st, rid, region, epoch, &batch);
+    }
+    let Some(auditor) = auditor else {
+        return;
+    };
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let id = room.next_audit;
+    room.next_audit += 1;
+    let msg = Response::Audit {
+        id,
+        room: rid,
+        region,
+        epoch,
+        key: key.to_bytes(),
+        root,
+        floor_t,
+        batch: batch.clone(),
+    };
+    room.audits.insert(
+        id,
+        AuditRec {
+            auditor,
+            region,
+            epoch,
+            batch,
+            at: Instant::now(),
+            here,
+        },
+    );
+    if let Some(c) = st.conns.get(&auditor) {
+        transport::push(&c.tx, &msg);
+    }
+}
+
+/// Réponse d'un vérificateur. Une faute signalée est revérifiée ici sur la copie que ce
+/// relais a reçue de l'hôte principal lui-même : prouvée, l'hôte principal est écarté
+/// (et l'autre hôte de la région qui avait confirmé ce lot) ; fausse, c'est le
+/// vérificateur qui est écarté. Un « rien à signaler » sur un lot où ce relais a trouvé
+/// une faute écarte aussi le vérificateur.
+fn audited(st: &mut State, rid: u64, from: u64, aid: u64, fault: Option<String>) {
+    let root = st.cert_key.verifying_key().to_bytes();
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    if room.audits.get(&aid).is_none_or(|a| a.auditor != from) {
+        return;
+    }
+    let rec = room.audits.remove(&aid).expect("vérification");
+    room.audit_misses.remove(&from);
+    let found = match rec.here {
+        Some(here) => here,
+        None => {
+            if fault.is_none() {
+                return;
+            }
+            // Clé de l'hôte principal de cette époque (en cours ou finie).
+            let key = room
+                .sov
+                .get(&rec.region)
+                .filter(|s| s.epoch == rec.epoch)
+                .map(|s| (s.key, s.floor_t))
+                .or_else(|| {
+                    room.sov_past
+                        .get(&rec.region)?
+                        .iter()
+                        .find(|p| p.epoch == rec.epoch)
+                        .map(|p| (p.key, p.floor_t))
+                });
+            let Some((key, floor_t)) = key else {
+                return;
+            };
+            let rules = sovereign::Rules {
+                room: rid,
+                region: rec.region,
+                root,
+                floor_t,
+            };
+            let found = rec.batch.audit(&rules, rec.epoch, &key);
+            if let Some(why) = &found {
+                log::warn!(
+                    "monde {rid} : région {:?}, faute de l'hôte principal signalée par \
+                     l'hôte {from} et vérifiée ici : {why}",
+                    rec.region
+                );
+                convict(st, rid, rec.region, rec.epoch, &rec.batch);
+            }
+            found
+        }
+    };
+    // Le vérificateur a dit autre chose que ce que ce relais a trouvé : écarté.
+    if found.is_some() != fault.is_some() {
+        log::warn!(
+            "monde {rid} : l'hôte {from} a mal vérifié un lot de la région {:?} ({}) : écarté",
+            rec.region,
+            if fault.is_some() {
+                "faute inventée"
+            } else {
+                "faute pas vue"
+            }
+        );
+        ban_host(st, from);
+    }
+}
+
+/// Faute prouvée dans un lot de l'hôte principal d'une époque : il est écarté, et les
+/// autres hôtes de la région qui avaient confirmé ce lot aussi (ils disaient l'avoir
+/// vérifié). Une nouvelle époque commence avec ceux qui restent.
+fn convict(st: &mut State, rid: u64, region: [i32; 2], epoch: u64, batch: &sovereign::Batch) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let (host, witnesses): (Option<u64>, Vec<u64>) = match room.sov.get(&region) {
+        Some(s) if s.epoch == epoch => (
+            Some(s.primary),
+            s.acks
+                .iter()
+                .filter(|(_, (seq, _))| *seq >= batch.end())
+                .map(|(w, _)| *w)
+                .collect(),
+        ),
+        _ => (
+            room.sov_past
+                .get(&region)
+                .and_then(|p| p.iter().find(|p| p.epoch == epoch))
+                .map(|p| p.host),
+            Vec::new(),
+        ),
+    };
+    for w in witnesses {
+        log::warn!("monde {rid} : région {region:?}, l'hôte {w} avait confirmé ce lot : écarté");
+        ban_host(st, w);
+    }
+    if let Some(h) = host {
+        ban_host(st, h);
+    }
+    upkeep_sovereignty(st, rid);
+}
+
+/// Surveillance mutuelle, à chaque entretien : les hôtes prêts qui peuvent vérifier des
+/// lots, et les vérifications restées sans réponse (comptées contre leur vérificateur).
+fn upkeep_audits(st: &mut State, rid: u64) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let conns = &st.conns;
+    room.auditors = room
+        .shards
+        .iter()
+        .flat_map(|(r, l)| {
+            l.iter()
+                .filter(|s| s.info.is_some())
+                .map(move |s| (s.host, *r))
+        })
+        .filter(|(h, _)| conns.get(h).is_some_and(|c| !c.garant_banned))
+        .collect();
+    let late: Vec<u64> = room
+        .audits
+        .iter()
+        .filter(|(_, a)| a.at.elapsed() > AUDIT_WAIT)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in late {
+        if let Some(a) = room.audits.remove(&id) {
+            *room.audit_misses.entry(a.auditor).or_default() += 1;
+        }
+    }
+    room.audit_misses.retain(|h, _| conns.contains_key(h));
+}
+
+/// D'un hôte de la région en fin d'époque : les lots qu'il avait vérifiés (signés par
+/// l'hôte principal de cette époque), archivés s'ils suivent ce qui l'est déjà.
+fn take_handover(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    region: [i32; 2],
+    epoch: u64,
+    batches: Vec<sovereign::Batch>,
+) {
+    let root = st.cert_key.verifying_key().to_bytes();
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let is_host = room
+        .shards
+        .get(&region)
+        .is_some_and(|l| l.iter().any(|s| s.host == id));
+    let Some(past) = room
+        .sov_past
+        .get_mut(&region)
+        .and_then(|p| p.iter_mut().find(|p| p.epoch == epoch))
+    else {
+        return;
+    };
+    if !is_host {
+        return;
+    }
+    let (mut base, mut chain) = (past.base, past.chain);
+    let mut next = Vec::new();
+    for b in batches {
+        if b.end() <= base || b.epoch != epoch || !b.verify(&past.key) {
+            continue;
+        }
+        if b.first != base || b.prev != chain {
+            break;
+        }
+        (base, chain) = (b.end(), b.chain());
+        next.push(b);
+    }
+    // Ce relais les vérifie lui-même avant de les archiver (l'hôte principal de cette
+    // époque peut remettre lui-même des lots que personne n'a vus) : ce qui précède une
+    // faute est gardé, l'hôte fautif écarté.
+    let rules = sovereign::Rules {
+        room: rid,
+        region,
+        root,
+        floor_t: past.floor_t,
+    };
+    let (done, fault) = sound_prefix(&rules, epoch, &past.key, next);
+    if let Some(last) = done.last() {
+        (past.base, past.chain) = (last.end(), last.chain());
+    }
+    let host = past.host;
+    commit_batches(st, rid, region, done);
+    if let Some(why) = fault {
+        log::warn!("monde {rid} : région {region:?}, passation fautive (époque {epoch}) : {why}");
+        ban_host(st, host);
+    }
+}
+
+/// Faute prouvée d'un hôte (hôte principal, hôte qui avait confirmé un lot fautif,
+/// vérificateur qui a menti) : écarté de tout rôle de garant, il quitte le monde.
 fn ban_host(st: &mut State, host: u64) {
     st.sov_faults
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3150,13 +3597,23 @@ fn commit_batches(st: &mut State, rid: u64, region: [i32; 2], batches: Vec<sover
                 by: e.pseudo.clone(),
                 seq: r.seq,
             });
-            let conns = &st.conns;
+            // Ceux à portée qu'aucun relais de la région ne sert (v136 : rangés à part,
+            // plus besoin de regarder tous les joueurs proches).
             let to: Vec<u64> = room
-                .build
-                .listeners(chunk, u64::MAX)
-                .into_iter()
-                .filter(|m| !conns.get(m).is_some_and(|c| c.served.contains(&region)))
-                .collect();
+                .needs
+                .get(&region)
+                .map(|set| {
+                    set.iter()
+                        .copied()
+                        .filter(|m| {
+                            room.build
+                                .positions
+                                .get(m)
+                                .is_some_and(|&p| zones::near(p, chunk))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let sends = room
                 .build
                 .mirror_at(proto::zone_of(chunk), &data, Some(r.seq), &to);
@@ -3406,7 +3863,7 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
         };
         let room = st.rooms.get_mut(&rid).expect("partie");
         room.members.push(g);
-        room.hidden.push(g);
+        room.hidden.insert(g);
         let slot = room.shard_slot;
         room.shard_slot = room.shard_slot.wrapping_add(1);
         room.shards.entry(region).or_default().push(RegionShard {
@@ -3487,6 +3944,7 @@ fn upkeep_build(st: &mut State) {
         rebalance_host(st, rid);
         upkeep_regions(st, rid, &mut index);
         upkeep_sovereignty(st, rid);
+        upkeep_audits(st, rid);
         upkeep_standby(st, rid);
         flush_replica(st, rid);
         // Le propriétaire (qui enregistre le monde) reçoit ce qui a changé, par paquets.
@@ -3802,9 +4260,17 @@ fn open_room(
             sov_skip: HashMap::new(),
             next_epoch: 1,
             root_done: std::collections::BTreeSet::new(),
+            audits: HashMap::new(),
+            auditors: Vec::new(),
+            audit_misses: HashMap::new(),
+            next_audit: 1,
+            needs: HashMap::new(),
+            needs_of: HashMap::new(),
+            unserved: HashSet::new(),
+            handovers: Vec::new(),
             build: zones::Build::default(),
             backup: None,
-            hidden: Vec::new(),
+            hidden: std::collections::BTreeSet::new(),
             ready_standby: Vec::new(),
             garant_hosted: false,
             standby: None,
@@ -3963,6 +4429,9 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
     r.reserved
         .retain(|(p, t)| *p != low && t.elapsed() < Duration::from_secs(60));
     r.members.push(id);
+    if r.kind == 1 {
+        r.unserved.insert(id);
+    }
     // FPS : pas de nom tant que la partie n'a pas commencé (on ne choisit pas ses
     // adversaires en quittant la recherche).
     let shown = if r.kind == 0 {
@@ -5025,6 +5494,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         Request::Position { chunk } => {
             if let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1)) {
                 send_catch_up(st, rid, id, chunk, true);
+                refresh_needs(st, rid, id);
                 // Les relais des régions maintenant en vue, s'ils ont changé pour lui.
                 send_shards(st, rid, id);
             }
@@ -5032,9 +5502,19 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         Request::Served { regions } => {
             let rid = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1))?;
-            if let Some(c) = st.conns.get_mut(&id) {
+            let served = !regions.is_empty();
+            let player = st.conns.get_mut(&id).is_some_and(|c| {
                 c.served = regions.into_iter().take(16).collect();
+                !c.garant_only
+            });
+            if let Some(room) = st.rooms.get_mut(&rid) {
+                if served {
+                    room.unserved.remove(&id);
+                } else if player {
+                    room.unserved.insert(id);
+                }
             }
+            refresh_needs(st, rid, id);
             // Une région qu'un relais ne lui sert plus : ce qui lui manque, tout de suite.
             let at = st.rooms.get(&rid)?.build.positions.get(&id).copied()?;
             send_catch_up(st, rid, id, at, false);
@@ -5222,46 +5702,56 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         // Région souveraine, de l'hôte principal : un lot qu'il vient de publier, à
         // archiver quand un autre hôte l'aura confirmé.
-        Request::Archive { region, batch } => {
+        Request::Archive { region, batches } => {
             let rid = my_room?;
-            let sv = st.rooms.get_mut(&rid)?.sov.get_mut(&region)?;
-            let (end, chain) = sv
-                .pending
-                .back()
-                .map_or((sv.base, sv.chain), |b| (b.end(), b.chain()));
-            let fits = sv.primary == id
-                && batch.epoch == sv.epoch
-                && batch.first == end
-                && batch.prev == chain
-                && batch.verify(&sv.key);
-            if !fits || sv.pending.len() >= 4096 {
-                return None;
-            }
-            // Un lot sur huit, au hasard, vérifié ici aussi : deux hôtes complices (l'hôte
-            // principal et celui qui confirme) finissent par être pris.
-            if rand::random::<u32>().is_multiple_of(SPOT_CHECK) {
-                let rules = sovereign::Rules {
-                    room: rid,
-                    region,
-                    root: st.cert_key.verifying_key().to_bytes(),
-                    floor_t: sv.floor_t,
-                };
-                if let Some(why) =
-                    sovereign::judge(&rules, sv.epoch, &sv.key, std::slice::from_ref(&batch))
-                {
-                    log::warn!(
-                        "monde {rid} : région {region:?}, faute de l'hôte principal vue par \
-                         ce relais : {why}"
-                    );
-                    ban_host(st, id);
-                    upkeep_sovereignty(st, rid);
+            let mut audit = Vec::new();
+            let audit_every = st.audit_every.max(1);
+            {
+                let sv = st.rooms.get_mut(&rid)?.sov.get_mut(&region)?;
+                if sv.primary != id {
                     return None;
                 }
+                for batch in batches.into_iter().take(ARCHIVE_MAX) {
+                    let (end, chain) = sv
+                        .pending
+                        .back()
+                        .map_or((sv.base, sv.chain), |p| (p.end, p.chain));
+                    // Rien de signé n'est vérifié ici (v136) : l'autre hôte de la région
+                    // vérifie chaque lot avant de le confirmer, et l'hôte d'une autre région
+                    // un lot sur huit tiré au hasard (`audit_batch`). Seulement qu'il est de
+                    // cette époque et suit le précédent.
+                    let fits = batch.room == rid
+                        && batch.region == region
+                        && batch.epoch == sv.epoch
+                        && batch.first == end
+                        && batch.prev == chain
+                        && batch.numbered();
+                    if !fits || sv.pending.len() >= 4096 {
+                        break;
+                    }
+                    if rand::random::<u32>().is_multiple_of(audit_every) {
+                        audit.push(batch.clone());
+                    }
+                    sv.pending.push_back(PendingBatch {
+                        end: batch.end(),
+                        chain: batch.chain(),
+                        batch,
+                    });
+                }
+                sv.waiting.get_or_insert_with(Instant::now);
             }
-            sv.pending.push_back(batch);
-            sv.waiting.get_or_insert_with(Instant::now);
-            // (Les confirmations des autres hôtes ont pu arriver avant le lot.)
+            for b in audit {
+                audit_batch(st, rid, region, b);
+            }
+            // (Les confirmations des autres hôtes ont pu arriver avant les lots.)
             try_commit(st, rid, region);
+            return None;
+        }
+        // Vérification d'un lot confiée à cet hôte : rien à signaler, ou une faute, que ce
+        // relais revérifie sur sa propre copie (il l'a reçue de l'hôte principal lui-même).
+        Request::Audited { id: aid, fault } => {
+            let rid = my_room?;
+            audited(st, rid, id, aid, fault);
             return None;
         }
         // D'un autre hôte de la région : il a vérifié jusqu'au rang `seq`. Les lots
@@ -5351,56 +5841,27 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             batches,
         } => {
             let rid = my_room?;
-            // Monde en pause : rien n'est archivé.
+            // Monde en pause : rien n'est archivé maintenant, mais rien n'est perdu (avant
+            // la v136, la passation était oubliée) : gardée pour la reprise.
             if guards::frozen(st, rid) {
+                let room = st.rooms.get_mut(&rid)?;
+                if room.handovers.len() < 64 {
+                    room.handovers.push((id, region, epoch, batches));
+                }
                 return None;
             }
-            let room = st.rooms.get_mut(&rid)?;
-            let is_host = room
-                .shards
-                .get(&region)
-                .is_some_and(|l| l.iter().any(|s| s.host == id));
-            let past = room
-                .sov_past
-                .get_mut(&region)?
-                .iter_mut()
-                .find(|p| p.epoch == epoch)?;
-            if !is_host {
-                return None;
-            }
-            let (mut base, mut chain) = (past.base, past.chain);
-            let mut next = Vec::new();
-            for b in batches {
-                if b.end() <= base || b.epoch != epoch || !b.verify(&past.key) {
-                    continue;
-                }
-                if b.first != base || b.prev != chain {
-                    break;
-                }
-                (base, chain) = (b.end(), b.chain());
-                next.push(b);
-            }
-            // Ce relais les vérifie lui-même avant de les archiver (l'hôte principal de
-            // cette époque peut remettre lui-même des lots que personne n'a vus) : ce qui
-            // précède une faute est gardé, l'hôte fautif écarté.
-            let rules = sovereign::Rules {
-                room: rid,
-                region,
-                root: st.cert_key.verifying_key().to_bytes(),
-                floor_t: past.floor_t,
-            };
-            let (done, fault) = sound_prefix(&rules, epoch, &past.key, next);
-            if let Some(last) = done.last() {
-                (past.base, past.chain) = (last.end(), last.chain());
-            }
-            let host = past.host;
-            commit_batches(st, rid, region, done);
-            if let Some(why) = fault {
-                log::warn!(
-                    "monde {rid} : région {region:?}, passation fautive (époque {epoch}) : {why}"
-                );
-                ban_host(st, host);
-            }
+            take_handover(st, rid, id, region, epoch, batches);
+            return None;
+        }
+        // Position d'un joueur servi par un relais de région (ses positions ne passent plus
+        // par ici), gardée pour son retour.
+        Request::Spot { pos, yaw, pitch } => {
+            let server = my_room
+                .and_then(|r| st.rooms.get(&r))
+                .filter(|r| r.kind == 1)
+                .map(|r| r.server.clone())?;
+            st.servers
+                .set_position(&server, pseudo, [pos[0], pos[1], pos[2], yaw, pitch]);
             return None;
         }
         Request::Nearby { chunk, data } => {
@@ -5567,13 +6028,21 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // Jusqu'à 256 auditeurs (une foule autour de soi : le jeu envoie aux plus
             // proches d'abord).
             let mut heard = Vec::new();
+            let rid = my_room?;
             for t in to.into_iter().take(VOICE_MAX) {
                 let t = if fps && t == 0 { room.host } else { t };
-                if t != id && (room.host == t || room.members.contains(&t)) {
-                    if let Some(c) = st.conns.get(&t) {
-                        transport::push(&c.tx, &msg);
-                        heard.push(t);
-                    }
+                if t == id {
+                    continue;
+                }
+                // Un joueur de cette partie (par sa connexion : pas de recherche dans la
+                // liste des membres, longue dans un grand monde), pas un garant.
+                if let Some(c) = st
+                    .conns
+                    .get(&t)
+                    .filter(|c| c.room == Some(rid) && !c.garant_only)
+                {
+                    transport::push(&c.tx, &msg);
+                    heard.push(t);
                 }
             }
             // Fréquentation : parler à quelqu'un compte, au plus une fois par 30 s et par
@@ -5794,6 +6263,8 @@ fn handle(
             | Request::Archive { .. }
             | Request::Ack { .. }
             | Request::Accuse { .. }
+            | Request::Audited { .. }
+            | Request::Spot { .. }
             | Request::Handover { .. }
             | Request::RoomStarted { .. }
             | Request::Join { .. }
@@ -8227,7 +8698,7 @@ mod tests {
             &elink,
             &Request::Archive {
                 region: [0, 0],
-                batch: sovereign::Batch {
+                batches: vec![sovereign::Batch {
                     room,
                     region: [0, 0],
                     epoch: 1,
@@ -8236,7 +8707,7 @@ mod tests {
                     records: Vec::new(),
                     certs: Vec::new(),
                     sig: Vec::new(),
-                },
+                }],
             },
         );
         ask(&elink, [0, 0], &game::BuildMsg::Reject { pos, peer: 1 });
@@ -8396,6 +8867,31 @@ mod tests {
         match wait(&eve, |e| matches!(e, Event::BuildSpawn { .. })) {
             Event::BuildSpawn { pos, yaw, pitch } => {
                 assert_eq!((pos, yaw, pitch), ([3.5, 80.0, 4.5], 1.0, -0.2))
+            }
+            _ => unreachable!(),
+        }
+        // Servie par un relais de région, ses positions n'arrivent plus ici : son jeu redit
+        // de temps en temps où elle est, et c'est là qu'elle revient.
+        transport::push(
+            &elink,
+            &Request::Spot {
+                pos: [40.5, 90.0, -7.5],
+                yaw: 2.0,
+                pitch: 0.1,
+            },
+        );
+        eve.send(Cmd::Leave);
+        std::thread::sleep(Duration::from_millis(200));
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        eve.send(Cmd::ServerAdmin {
+            action: proto::SERVER_GAMEMODE_QUERY,
+            pseudo: String::new(),
+            reason: String::new(),
+        });
+        match wait(&eve, |e| matches!(e, Event::BuildSpawn { .. })) {
+            Event::BuildSpawn { pos, yaw, pitch } => {
+                assert_eq!((pos, yaw, pitch), ([40.5, 90.0, -7.5], 2.0, 0.1))
             }
             _ => unreachable!(),
         }
@@ -9121,6 +9617,771 @@ mod tests {
                 msgs / secs,
                 cells / secs,
                 bytes as f64 * 8.0 / secs as f64 / 1e6,
+            );
+            drop(guard);
+            drop(h);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Un monde de 400 joueurs en quatre régions souveraines (deux relais chacune, tenus par
+    /// des joueurs d'autres régions), sans réseau : (joueurs, hôtes → rang du joueur, clés).
+    fn sovereign_crowd(
+        st: &mut State,
+        crowd: &mut Crowd,
+        room: u64,
+    ) -> (Vec<u64>, HashMap<u64, usize>, Vec<SigningKey>) {
+        let home = |i: usize| -> [i32; 2] {
+            let g = (i / 100) as i32;
+            [
+                (g % 2) * 64 + 8 + (i % 10) as i32,
+                (g / 2) * 64 + 8 + (i / 10 % 10) as i32,
+            ]
+        };
+        let mut players = Vec::new();
+        let mut keys = Vec::new();
+        let mut garant_of = HashMap::new();
+        for i in 0..400 {
+            let name = format!("J{i}");
+            let mut b = [9u8; 32];
+            b[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let k = SigningKey::from_bytes(&b);
+            let id = crowd.conn(st, &name, false);
+            st.conns.get_mut(&id).unwrap().account = Some(k.verifying_key().to_bytes());
+            crowd.ask(st, id, Request::Join { room });
+            crowd.ask(st, id, Request::Position { chunk: home(i) });
+            players.push(id);
+            if i % 25 == 7 {
+                let g = crowd.conn(st, &name, true);
+                st.conns.get_mut(&g).unwrap().account = Some(k.verifying_key().to_bytes());
+                garant_of.insert(g, i);
+            }
+            keys.push(k);
+        }
+        crowd.upkeep(st);
+        let tasks: Vec<([i32; 2], u64)> = st.rooms[&room]
+            .shards
+            .iter()
+            .flat_map(|(r, l)| l.iter().map(|s| (*r, s.host)))
+            .collect();
+        for (region, host) in &tasks {
+            crowd.ask(
+                st,
+                *host,
+                Request::ShardReady {
+                    region: *region,
+                    node: [0; 32],
+                    addr: format!("127.0.0.1:{host}"),
+                    key: [1; 32],
+                },
+            );
+        }
+        crowd.upkeep(st);
+        crowd.upkeep(st);
+        (players, garant_of, keys)
+    }
+
+    /// Lot signé par l'hôte principal d'une région souveraine, qui suit ce que le relais du
+    /// monde a reçu ; `forged` : une modification au nom d'un joueur, mal signée (un faux).
+    fn next_batch(
+        st: &State,
+        room: u64,
+        region: [i32; 2],
+        primary_key: &SigningKey,
+        author: (&str, &SigningKey),
+        forged: bool,
+    ) -> sovereign::Batch {
+        let sv = &st.rooms[&room].sov[&region];
+        let (first, prev) = sv
+            .pending
+            .back()
+            .map_or((sv.base, sv.chain), |p| (p.end, p.chain));
+        let c = [region[0] * proto::REGION + 9, region[1] * proto::REGION + 9];
+        let signer = if forged {
+            SigningKey::from_bytes(&[0x66; 32])
+        } else {
+            author.1.clone()
+        };
+        let edit = sovereign::Edit::sign(
+            &signer,
+            room,
+            author.0,
+            [c[0] * 16 + 3, 70, c[1] * 16 + 3],
+            1,
+            false,
+            c,
+            now_ms() + (first - sv.first),
+            false,
+        );
+        let cert = sovereign::Cert::issue(
+            &st.cert_key,
+            room,
+            author.0,
+            author.1.verifying_key().to_bytes(),
+            now_secs() + 3600,
+        );
+        let mut batch = sovereign::Batch {
+            room,
+            region,
+            epoch: sv.epoch,
+            first,
+            prev,
+            records: vec![sovereign::Record { seq: first, edit }],
+            certs: vec![cert],
+            sig: Vec::new(),
+        };
+        batch.sign(primary_key);
+        batch
+    }
+
+    /// Surveillance mutuelle (v136) : le relais du monde ne vérifie plus lui-même les lots
+    /// des régions souveraines ; il en confie au hasard à des hôtes d'autres régions, et ne
+    /// revérifie que ce qu'ils signalent. Deux hôtes complices d'une même région (l'hôte
+    /// principal qui glisse un faux, l'autre qui le confirme) sont pris et écartés tous les
+    /// deux ; un vérificateur qui invente une faute, ou qui laisse passer celle que le relais
+    /// trouve en vérifiant lui-même, est écarté ; un hôte honnête ne l'est jamais.
+    #[test]
+    fn hosts_of_other_regions_check_batches_and_catch_two_accomplices() {
+        let (h, dir) = crowd_world("audit");
+        h.set_shard_share(50);
+        let mut guard = h.state.lock().unwrap();
+        let st = &mut *guard;
+        st.audit_every = 1;
+        st.audit_self = u32::MAX;
+        let mut crowd = Crowd::new();
+        let (_, room) = host_world(&mut crowd, st);
+        let (_, garant_of, keys) = sovereign_crowd(st, &mut crowd, room);
+        let regions: Vec<[i32; 2]> = st.rooms[&room].sov.keys().copied().collect();
+        assert_eq!(regions.len(), 4, "quatre régions souveraines");
+        let hosts_of = |st: &State, r: [i32; 2]| -> (u64, u64) {
+            let sv = &st.rooms[&room].sov[&r];
+            let w = st.rooms[&room].shards[&r]
+                .iter()
+                .map(|s| s.host)
+                .find(|&h| h != sv.primary)
+                .unwrap();
+            (sv.primary, w)
+        };
+        // Ce que le relais du monde a confié aux hôtes : (hôte, vérification).
+        let audits = |crowd: &Crowd| -> Vec<(u64, Response)> {
+            let mut out = Vec::new();
+            for &g in garant_of.keys() {
+                for m in crowd.got(g).0 {
+                    if matches!(m, Response::Audit { .. }) {
+                        out.push((g, m));
+                    }
+                }
+            }
+            out
+        };
+        // Réponse d'un vérificateur honnête : il refait la vérification.
+        let honest = |m: &Response| -> Request {
+            let Response::Audit {
+                id,
+                room,
+                region,
+                epoch,
+                key,
+                root,
+                floor_t,
+                batch,
+            } = m
+            else {
+                unreachable!()
+            };
+            let rules = sovereign::Rules {
+                room: *room,
+                region: *region,
+                root: *root,
+                floor_t: *floor_t,
+            };
+            let key = VerifyingKey::from_bytes(key).unwrap();
+            Request::Audited {
+                id: *id,
+                fault: batch.audit(&rules, *epoch, &key),
+            }
+        };
+        crowd.sent();
+        let r0 = regions[0];
+        let (p0, w0) = hosts_of(st, r0);
+        let author = (format!("J{}", garant_of[&p0]), keys[garant_of[&p0]].clone());
+        // 1. Un lot honnête : vérifié par un hôte d'une autre région (jamais un de la
+        // sienne), rien à signaler, personne d'écarté.
+        let b = next_batch(
+            st,
+            room,
+            r0,
+            &keys[garant_of[&p0]],
+            (&author.0, &author.1),
+            false,
+        );
+        crowd.ask(
+            st,
+            p0,
+            Request::Archive {
+                region: r0,
+                batches: vec![b],
+            },
+        );
+        let got = audits(&crowd);
+        assert_eq!(got.len(), 1, "le lot est confié à un vérificateur");
+        let (auditor, m) = &got[0];
+        let theirs = st.rooms[&room]
+            .shards
+            .iter()
+            .find(|(_, l)| l.iter().any(|s| s.host == *auditor))
+            .map(|(r, _)| *r)
+            .unwrap();
+        assert_ne!(theirs, r0, "un hôte d'une autre région");
+        crowd.ask(st, *auditor, honest(m));
+        assert_eq!(h.sov_faults(), 0);
+        // 2. Deux complices : l'hôte principal glisse un faux, l'autre hôte le confirme ;
+        // le relais du monde l'archive (il ne vérifie plus rien de signé), mais le
+        // vérificateur le signale et le relais, en revérifiant sa propre copie, écarte les
+        // deux.
+        let committed = h.sov_committed();
+        let b = next_batch(
+            st,
+            room,
+            r0,
+            &keys[garant_of[&p0]],
+            (&author.0, &author.1),
+            true,
+        );
+        let ack = Request::Ack {
+            region: r0,
+            epoch: b.epoch,
+            seq: b.end(),
+            chain: b.chain(),
+        };
+        crowd.ask(
+            st,
+            p0,
+            Request::Archive {
+                region: r0,
+                batches: vec![b],
+            },
+        );
+        crowd.ask(st, w0, ack);
+        assert!(
+            h.sov_committed() > committed,
+            "archivé sur la foi du complice"
+        );
+        let got = audits(&crowd);
+        assert_eq!(got.len(), 1);
+        let (auditor, m) = &got[0];
+        let Request::Audited { fault, .. } = honest(m) else {
+            unreachable!()
+        };
+        assert!(fault.is_some(), "le vérificateur voit le faux");
+        crowd.ask(st, *auditor, honest(m));
+        assert_eq!(h.sov_faults(), 2, "l'hôte principal et son complice");
+        assert!(st.conns[&p0].garant_banned && st.conns[&w0].garant_banned);
+        assert!(!st.conns[auditor].garant_banned);
+        // 3. Un vérificateur qui invente une faute dans un lot honnête : c'est lui qui est
+        // écarté.
+        let r1 = regions[1];
+        let (p1, _) = hosts_of(st, r1);
+        let author1 = (format!("J{}", garant_of[&p1]), keys[garant_of[&p1]].clone());
+        let b = next_batch(
+            st,
+            room,
+            r1,
+            &keys[garant_of[&p1]],
+            (&author1.0, &author1.1),
+            false,
+        );
+        crowd.ask(
+            st,
+            p1,
+            Request::Archive {
+                region: r1,
+                batches: vec![b],
+            },
+        );
+        let got = audits(&crowd);
+        assert_eq!(got.len(), 1);
+        let (liar, m) = &got[0];
+        let Response::Audit { id, .. } = m else {
+            unreachable!()
+        };
+        crowd.ask(
+            st,
+            *liar,
+            Request::Audited {
+                id: *id,
+                fault: Some("inventée".into()),
+            },
+        );
+        assert_eq!(h.sov_faults(), 3, "le menteur, pas l'hôte principal");
+        assert!(st.conns[liar].garant_banned);
+        assert!(!st.conns[&p1].garant_banned);
+        // 4. Un vérificateur qui laisse passer un faux que le relais du monde trouve en
+        // vérifiant lui-même (une fois sur `audit_self`, ici à chaque fois) : écarté avec
+        // l'hôte principal.
+        st.audit_self = 1;
+        crowd.upkeep(st);
+        crowd.sent();
+        // (Une région encore souveraine, dont aucun hôte n'a été écarté : celle du menteur,
+        // tirée au hasard, a pu perdre la sienne.)
+        let r2 = *regions
+            .iter()
+            .find(|r| {
+                **r != r0
+                    && **r != r1
+                    && st.rooms[&room].sov.contains_key(*r)
+                    && st.rooms[&room].shards[*r]
+                        .iter()
+                        .all(|s| !st.conns[&s.host].garant_banned)
+            })
+            .expect("une région souveraine intacte");
+        let (p2, _) = hosts_of(st, r2);
+        let author2 = (format!("J{}", garant_of[&p2]), keys[garant_of[&p2]].clone());
+        let b = next_batch(
+            st,
+            room,
+            r2,
+            &keys[garant_of[&p2]],
+            (&author2.0, &author2.1),
+            true,
+        );
+        crowd.ask(
+            st,
+            p2,
+            Request::Archive {
+                region: r2,
+                batches: vec![b],
+            },
+        );
+        assert!(
+            st.conns[&p2].garant_banned,
+            "pris tout de suite par le relais du monde"
+        );
+        let got = audits(&crowd);
+        assert_eq!(got.len(), 1);
+        let (lazy, m) = &got[0];
+        let Response::Audit { id, .. } = m else {
+            unreachable!()
+        };
+        crowd.ask(
+            st,
+            *lazy,
+            Request::Audited {
+                id: *id,
+                fault: None,
+            },
+        );
+        assert!(
+            st.conns[lazy].garant_banned,
+            "« rien à signaler » sur un faux"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Battement du monde (v136) : deux fois par seconde, le relais du monde le dit une fois
+    /// à l'hôte de chaque relais de région (qui le redit à ses joueurs) et directement aux
+    /// seuls joueurs qu'aucun relais de région ne sert ; un changement (pause, reprise)
+    /// part tout de suite à tout le monde.
+    #[test]
+    fn the_world_beat_goes_through_region_relays() {
+        let (h, dir) = crowd_world("battement");
+        h.set_shard_share(50);
+        let mut guard = h.state.lock().unwrap();
+        let st = &mut *guard;
+        let mut crowd = Crowd::new();
+        let (_, room) = host_world(&mut crowd, st);
+        let (players, garant_of, _) = sovereign_crowd(st, &mut crowd, room);
+        // Les joueurs des trois premières régions sont servis par leur relais, ceux de la
+        // quatrième non.
+        let regions: Vec<[i32; 2]> = {
+            let mut r: Vec<[i32; 2]> = st.rooms[&room].sov.keys().copied().collect();
+            r.sort();
+            r
+        };
+        let served = |i: usize| i < 300;
+        for (i, &id) in players.iter().enumerate() {
+            let at = st.rooms[&room].build.positions[&id];
+            let region = proto::region_of(at);
+            let regions = if served(i) { vec![region] } else { Vec::new() };
+            crowd.ask(st, id, Request::Served { regions });
+        }
+        assert_eq!(regions.len(), 4);
+        crowd.sent();
+        let beats = |crowd: &Crowd, id: u64| -> (usize, usize) {
+            let mut n = (0, 0);
+            for m in crowd.got(id).0 {
+                match m {
+                    Response::Paused { .. } => n.0 += 1,
+                    Response::WorldBeat { room: r, .. } if r == room => n.1 += 1,
+                    _ => {}
+                }
+            }
+            n
+        };
+        guards::send_pause(st, room, false, false);
+        for (i, &id) in players.iter().enumerate() {
+            let want = if served(i) { 0 } else { 1 };
+            assert_eq!(beats(&crowd, id), (want, 0), "joueur {i}");
+        }
+        let mut hosts = 0;
+        for &g in garant_of.keys() {
+            let (p, w) = beats(&crowd, g);
+            assert_eq!(p, 0);
+            hosts += w;
+        }
+        assert_eq!(
+            hosts, 8,
+            "une fois à l'hôte de chacun des huit relais de région"
+        );
+        // La pause commence : tout le monde le sait tout de suite.
+        guards::send_pause(st, room, true, true);
+        for &id in &players {
+            assert_eq!(beats(&crowd, id).0, 1);
+        }
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Essai de charge d'un monde souverain, sans réseau : `n` joueurs par groupes de 100
+    /// dans des régions différentes, chacune souveraine avec deux relais de région
+    /// (hébergés par des joueurs d'autres régions) qui servent ses joueurs. L'hôte principal
+    /// de chaque région publie un lot toutes les 40 ms (deux modifications signées), l'autre
+    /// hôte le confirme, un joueur sur quatre change de chunk chaque seconde, et le monde a
+    /// des gardiens. Mesure poste par poste le calcul du relais du monde pour une seconde de
+    /// jeu, et ce qu'il envoie.
+    /// `cargo test --release -p minelib-relay charge_souveraine -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn charge_souveraine() {
+        // (`MINELIB_CHARGE=20000` : une seule taille.)
+        let sizes: Vec<usize> = std::env::var("MINELIB_CHARGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(vec![10_000, 60_000, 120_000], |n| vec![n]);
+        for n in sizes {
+            let (h, dir) = crowd_world("souv");
+            h.set_shard_share(50);
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            let (_, room) = host_world(&mut crowd, st);
+            let side = (n / 100).max(1).isqrt() as i32 + 1;
+            let home = |i: usize| -> [i32; 2] {
+                let g = (i / 100) as i32;
+                let (rx, rz) = (g % side, g / side);
+                [
+                    rx * 64 + 8 + (i % 10) as i32,
+                    rz * 64 + 8 + (i / 10 % 10) as i32,
+                ]
+            };
+            let key = |i: usize| {
+                let mut b = [7u8; 32];
+                b[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                SigningKey::from_bytes(&b)
+            };
+            let t = Instant::now();
+            let mut players = Vec::new();
+            let mut keys = Vec::new();
+            let mut garant_of = HashMap::new();
+            for i in 0..n {
+                let name = format!("J{i}");
+                let k = key(i);
+                let id = crowd.conn(st, &name, false);
+                st.conns.get_mut(&id).unwrap().account = Some(k.verifying_key().to_bytes());
+                crowd.ask(st, id, Request::Join { room });
+                crowd.ask(st, id, Request::Position { chunk: home(i) });
+                players.push(id);
+                if i % 25 == 7 {
+                    let g = crowd.conn(st, &name, true);
+                    st.conns.get_mut(&g).unwrap().account = Some(k.verifying_key().to_bytes());
+                    garant_of.insert(g, i);
+                }
+                keys.push(k);
+            }
+            let join = t.elapsed();
+            crowd.upkeep(st);
+            let tasks: Vec<([i32; 2], u64)> = st.rooms[&room]
+                .shards
+                .iter()
+                .flat_map(|(r, l)| l.iter().map(|s| (*r, s.host)))
+                .collect();
+            for (region, host) in &tasks {
+                crowd.ask(
+                    st,
+                    *host,
+                    Request::ShardReady {
+                        region: *region,
+                        node: [0; 32],
+                        addr: format!("127.0.0.1:{host}"),
+                        key: [1; 32],
+                    },
+                );
+            }
+            crowd.upkeep(st);
+            crowd.upkeep(st);
+            for (i, &id) in players.iter().enumerate() {
+                let regions = vec![proto::region_of(home(i))];
+                crowd.ask(st, id, Request::Served { regions });
+            }
+            let regions: Vec<[i32; 2]> = st.rooms[&room].sov.keys().copied().collect();
+            crowd.sent();
+            // Joueurs de chaque région (leur rang), et certificats.
+            let mut by_region: HashMap<[i32; 2], Vec<usize>> = HashMap::new();
+            for i in 0..n {
+                by_region
+                    .entry(proto::region_of(home(i)))
+                    .or_default()
+                    .push(i);
+            }
+            let expires = now_secs() + 24 * 3600;
+            let certs: Vec<sovereign::Cert> = (0..n)
+                .map(|i| {
+                    sovereign::Cert::issue(
+                        &st.cert_key,
+                        room,
+                        &format!("J{i}"),
+                        keys[i].verifying_key().to_bytes(),
+                        expires,
+                    )
+                })
+                .collect();
+            let mut seed = 99u64;
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let mut stamp = now_ms();
+            let secs = 2;
+            let (mut pos_t, mut arch_t, mut ack_t, mut beat_t, mut up_t) = (
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            let (mut bytes, mut msgs, mut cells, mut batches) = (0, 0, 0, 0usize);
+            let (mut audits, mut audit_t, mut misc_t) = (0usize, Duration::ZERO, Duration::ZERO);
+            let committed0 = h.sov_committed();
+            for _ in 0..secs {
+                // Lots de la seconde, préparés d'abord (pas comptés) : l'hôte principal
+                // les envoie par paquets toutes les 250 ms, l'autre hôte confirme le dernier.
+                let mut work: Vec<(u64, u64, Request, Request)> = Vec::new();
+                let mut made = 0;
+                for region in &regions {
+                    let sv = &st.rooms[&room].sov[region];
+                    let (primary, epoch) = (sv.primary, sv.epoch);
+                    let (mut first, mut prev) = sv
+                        .pending
+                        .back()
+                        .map_or((sv.base, sv.chain), |p| (p.end, p.chain));
+                    let witness = st.rooms[&room].shards[region]
+                        .iter()
+                        .map(|s| s.host)
+                        .find(|&h| h != primary)
+                        .unwrap();
+                    let pkey = &keys[garant_of[&primary]];
+                    let authors = &by_region[region];
+                    for group in [6, 6, 6, 7] {
+                        let mut batches = Vec::new();
+                        for _ in 0..group {
+                            let mut records = Vec::new();
+                            let mut bcerts = Vec::new();
+                            for k in 0..2 {
+                                let i = authors[rnd() as usize % authors.len()];
+                                let c = home(i);
+                                stamp += 1;
+                                let edit = sovereign::Edit::sign(
+                                    &keys[i],
+                                    room,
+                                    &format!("J{i}"),
+                                    [
+                                        c[0] * 16 + (rnd() % 16) as i32,
+                                        60 + (rnd() % 30) as i32,
+                                        c[1] * 16 + (rnd() % 16) as i32,
+                                    ],
+                                    1 + (rnd() % 40) as u16,
+                                    false,
+                                    c,
+                                    stamp,
+                                    false,
+                                );
+                                records.push(sovereign::Record {
+                                    seq: first + k,
+                                    edit,
+                                });
+                                bcerts.push(certs[i].clone());
+                            }
+                            let mut batch = sovereign::Batch {
+                                room,
+                                region: *region,
+                                epoch,
+                                first,
+                                prev,
+                                records,
+                                certs: bcerts,
+                                sig: Vec::new(),
+                            };
+                            batch.sign(pkey);
+                            (first, prev) = (batch.end(), batch.chain());
+                            batches.push(batch);
+                        }
+                        made += batches.len();
+                        let ack = Request::Ack {
+                            region: *region,
+                            epoch,
+                            seq: first,
+                            chain: prev,
+                        };
+                        work.push((
+                            primary,
+                            witness,
+                            Request::Archive {
+                                region: *region,
+                                batches,
+                            },
+                            ack,
+                        ));
+                    }
+                }
+                batches += made;
+                st.last_upkeep = Instant::now();
+                let t = Instant::now();
+                for (i, &id) in players.iter().enumerate() {
+                    if rnd() % 4 == 0 {
+                        let mut chunk = home(i);
+                        chunk[0] += (rnd() % 3) as i32 - 1;
+                        crowd.ask(st, id, Request::Position { chunk });
+                    }
+                }
+                pos_t += t.elapsed();
+                // Un joueur sur dix redit où il est (`Spot`, toutes les 10 s), un sur trente
+                // donne sa clé de voix à 20 voisins (toutes les 30 s ; v135 : à tous ses
+                // voisins toutes les 3 s).
+                let t = Instant::now();
+                for (i, &id) in players.iter().enumerate() {
+                    if rnd() % 10 == 0 {
+                        let c = home(i);
+                        crowd.ask(
+                            st,
+                            id,
+                            Request::Spot {
+                                pos: [c[0] as f32 * 16.0, 70.0, c[1] as f32 * 16.0],
+                                yaw: 0.0,
+                                pitch: 0.0,
+                            },
+                        );
+                    }
+                    if rnd() % 30 == 0 {
+                        let g = i / 100 * 100;
+                        let to: Vec<u64> = (0..20)
+                            .map(|k| players[(g + (i + 1 + k * 4) % 100).min(n - 1)])
+                            .collect();
+                        crowd.ask(
+                            st,
+                            id,
+                            Request::Voice {
+                                to,
+                                data: vec![0; 40],
+                            },
+                        );
+                    }
+                }
+                misc_t += t.elapsed();
+                // Les lots arrivent au fil de la seconde, chacun suivi de sa confirmation.
+                for (primary, witness, archive, ack) in work {
+                    let t = Instant::now();
+                    crowd.ask(st, primary, archive);
+                    arch_t += t.elapsed();
+                    let t = Instant::now();
+                    crowd.ask(st, witness, ack);
+                    ack_t += t.elapsed();
+                }
+                // Vérifications confiées aux hôtes (surveillance mutuelle) : ils répondent
+                // « rien à signaler » (leur calcul à eux n'est pas compté).
+                let mut asked = Vec::new();
+                for &g in garant_of.keys() {
+                    for m in crowd.rx[&g].try_iter() {
+                        if let Inbound::Push(b) | Inbound::Loose(b, _) = m {
+                            if let Ok(Response::Audit { id, .. }) = postcard::from_bytes(&b) {
+                                asked.push((g, id));
+                            }
+                        }
+                    }
+                }
+                audits += asked.len();
+                let t = Instant::now();
+                for (g, id) in asked {
+                    crowd.ask(st, g, Request::Audited { id, fault: None });
+                }
+                audit_t += t.elapsed();
+                // Battements des gardiens : deux fois par seconde (ceux d'entre eux qui
+                // passent encore par ce relais).
+                let t = Instant::now();
+                for _ in 0..2 {
+                    guards::send_pause(st, room, false, false);
+                }
+                beat_t += t.elapsed();
+                let t = Instant::now();
+                crowd.upkeep(st);
+                up_t += t.elapsed();
+                let s = crowd.sent();
+                (bytes, msgs, cells) = (bytes + s.0, msgs + s.1, cells + s.2);
+            }
+            // Sondes d'aller-retour : toutes les 4 s aux garants, toutes les minutes aux
+            // joueurs d'un grand monde.
+            for c in st.conns.values_mut() {
+                c.probed = None;
+                c.probe = None;
+            }
+            let t = Instant::now();
+            probe_links(st);
+            let all = crowd.sent();
+            let garants = garant_of.len();
+            let rate = garants as f64 / 4.0 + (all.1 - garants) as f64 / 60.0;
+            let share = rate / all.1.max(1) as f64;
+            let probe = t.elapsed().mul_f64(share);
+            let probes = (
+                (all.0 as f64 * share) as usize * 4,
+                (all.1 as f64 * share) as usize * 4,
+                0,
+            );
+            let committed = h.sov_committed() - committed0;
+            let per = |d: Duration| d.as_secs_f64() * 1e3 / secs as f64;
+            let total = per(pos_t)
+                + per(misc_t)
+                + per(arch_t)
+                + per(ack_t)
+                + per(audit_t)
+                + per(beat_t)
+                + per(up_t)
+                + probe.as_secs_f64() * 1e3;
+            eprintln!(
+                "SOUVERAIN {n:>6} joueurs, {} régions souveraines, {} lots/s, {} \
+                 modifications archivées/s, {} vérifications confiées/s | arrivée {:.1} µs par \
+                 joueur | une seconde de jeu : {total:.0} ms de calcul = positions {:.0} + \
+                 retours et voix {:.0} + lots {:.0} + confirmations {:.0} + vérifications {:.0} \
+                 + battements {:.0} + sondes {:.0} + entretien {:.0} | envoyé par seconde : {} \
+                 messages ({} sondes), {} blocs, {:.2} Mbit/s",
+                regions.len(),
+                batches / secs,
+                committed / secs,
+                audits / secs,
+                join.as_secs_f64() * 1e6 / n as f64,
+                per(pos_t),
+                per(misc_t),
+                per(arch_t),
+                per(ack_t),
+                per(audit_t),
+                per(beat_t),
+                probe.as_secs_f64() * 1e3,
+                per(up_t),
+                msgs / secs + probes.1 / 4,
+                probes.1 / 4,
+                cells / secs,
+                (bytes / secs + probes.0 / 4) as f64 * 8.0 / 1e6,
             );
             drop(guard);
             drop(h);

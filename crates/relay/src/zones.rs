@@ -225,6 +225,9 @@ pub struct Build {
     /// sans parcourir tout le monde) ; `indexed` : nombre de joueurs rangés.
     by_chunk: HashMap<[i32; 2], Vec<u64>>,
     indexed: usize,
+    /// Les mêmes par zone (4 × 4 chunks), avec leur chunk : pour trouver qui doit recevoir
+    /// une modification, 49 zones à regarder au lieu de 625 chunks.
+    by_zone: HashMap<[i32; 2], Vec<(u64, [i32; 2])>>,
     /// Objets au sol et coffres du monde : ce relais en est l'arbitre.
     pub items: minelib_net::items::ItemStore,
     /// Zones endormies sur le disque (voir `sleep_cold`) : dossier (aucun : elles restent
@@ -290,7 +293,7 @@ pub const LIVE_MAX: usize = 256;
 /// Ce que des joueurs doivent recevoir : (joueur, messages).
 pub type Sends = Vec<(u64, Vec<Vec<u8>>)>;
 
-fn near(a: [i32; 2], b: [i32; 2]) -> bool {
+pub fn near(a: [i32; 2], b: [i32; 2]) -> bool {
     (a[0] - b[0]).abs() <= NEAR && (a[1] - b[1]).abs() <= NEAR
 }
 
@@ -432,10 +435,15 @@ impl Build {
             return;
         }
         self.by_chunk.clear();
+        self.by_zone.clear();
         let mut ids: Vec<(u64, [i32; 2])> = self.positions.iter().map(|(&i, &c)| (i, c)).collect();
         ids.sort_unstable();
         for (id, c) in ids {
             self.by_chunk.entry(c).or_default().push(id);
+            self.by_zone
+                .entry(minelib_net::proto::zone_of(c))
+                .or_default()
+                .push((id, c));
         }
         self.indexed = self.positions.len();
     }
@@ -457,9 +465,20 @@ impl Build {
                     self.by_chunk.remove(&o);
                 }
             }
+            let z = minelib_net::proto::zone_of(o);
+            if let Some(v) = self.by_zone.get_mut(&z) {
+                v.retain(|&(m, _)| m != id);
+                if v.is_empty() {
+                    self.by_zone.remove(&z);
+                }
+            }
         }
         if let Some(c) = chunk {
             self.by_chunk.entry(c).or_default().push(id);
+            self.by_zone
+                .entry(minelib_net::proto::zone_of(c))
+                .or_default()
+                .push((id, c));
         }
         self.indexed = self.positions.len();
     }
@@ -573,11 +592,18 @@ impl Build {
                     .filter(|&id| id != except)
                     .collect();
             }
+            // Par zones (49 au lieu de 625 chunks : essai de charge souverain, v136).
             let mut out = Vec::new();
-            for dx in -NEAR..=NEAR {
-                for dz in -NEAR..=NEAR {
-                    if let Some(m) = self.by_chunk.get(&[chunk[0] + dx, chunk[1] + dz]) {
-                        out.extend(m.iter().copied().filter(|&id| id != except));
+            let lo = minelib_net::proto::zone_of([chunk[0] - NEAR, chunk[1] - NEAR]);
+            let hi = minelib_net::proto::zone_of([chunk[0] + NEAR, chunk[1] + NEAR]);
+            for zx in lo[0]..=hi[0] {
+                for zz in lo[1]..=hi[1] {
+                    if let Some(m) = self.by_zone.get(&[zx, zz]) {
+                        out.extend(
+                            m.iter()
+                                .filter(|&&(id, c)| id != except && near(c, chunk))
+                                .map(|&(id, _)| id),
+                        );
                     }
                 }
             }
@@ -629,6 +655,23 @@ impl Build {
             r.push((zone, seq, data.to_vec()));
         }
         let (kind, before) = (!blocks as usize, before[!blocks as usize]);
+        // Archivée en retard (rang plus petit que le dernier de la zone : passation en fin
+        // d'époque souveraine) : ceux qui ont déjà reçu plus récent de cette zone ne la
+        // recevraient jamais à leur prochain rattrapage (ce qu'on leur envoie part de leur
+        // dernier rang reçu). Leur dernier rang reçu recule juste avant elle ; ils
+        // recevront de nouveau les plus récentes, sans effet (le jeu ignore ce qu'il a déjà).
+        if seq < before {
+            for (id, zones) in self.known.iter_mut() {
+                if listeners.contains(id) {
+                    continue;
+                }
+                if let Some(k) = zones.get_mut(&zone) {
+                    if k[kind] >= seq {
+                        k[kind] = seq.saturating_sub(1);
+                    }
+                }
+            }
+        }
         let mut out = Vec::new();
         // Dans une foule, la modification n'est poussée tout de suite qu'aux `LIVE_MAX`
         // premiers ; les autres la reçoivent à leur prochaine position (20 fois par
@@ -730,18 +773,36 @@ impl Build {
             None => true,
         };
         let known = self.known.get(&id);
+        let due = |w: &[i32; 2], last: &[u64; 2]| {
+            let k = known.and_then(|k| k.get(w)).copied().unwrap_or_default();
+            (last[0] > k[0] && blocks(*w)) || last[1] > k[1]
+        };
         // (Tout le monde pour un nouveau propriétaire : par morceaux, le reste aux
         // entretiens suivants, pour ne pas bloquer le relais.)
-        let wanted: Vec<[i32; 2]> = self
-            .asleep
-            .iter()
-            .filter(|(w, last)| {
-                let k = known.and_then(|k| k.get(*w)).copied().unwrap_or_default();
-                in_reach(w) && ((last[0] > k[0] && blocks(**w)) || last[1] > k[1])
-            })
-            .map(|(w, _)| *w)
-            .take(WAKE_MAX)
-            .collect();
+        let wanted: Vec<[i32; 2]> = match chunk {
+            // Autour d'un joueur : les zones à portée, cherchées par leurs coordonnées (v136 :
+            // pas en parcourant toutes les zones endormies du monde à chaque pas).
+            Some(c) => {
+                let mut v = Vec::new();
+                for zx in (c[0] - NEAR).div_euclid(z)..=(c[0] + NEAR).div_euclid(z) {
+                    for zz in (c[1] - NEAR).div_euclid(z)..=(c[1] + NEAR).div_euclid(z) {
+                        if let Some(last) = self.asleep.get(&[zx, zz]) {
+                            if due(&[zx, zz], last) && v.len() < WAKE_MAX {
+                                v.push([zx, zz]);
+                            }
+                        }
+                    }
+                }
+                v
+            }
+            None => self
+                .asleep
+                .iter()
+                .filter(|(w, last)| in_reach(w) && due(w, last))
+                .map(|(w, _)| *w)
+                .take(WAKE_MAX)
+                .collect(),
+        };
         for w in wanted {
             self.wake(w);
         }
@@ -1010,6 +1071,48 @@ mod tests {
             .collect();
         cells.sort();
         assert_eq!(cells, vec![(a, 5), (other, 3)]);
+    }
+
+    /// Une modification archivée en retard (fin d'une époque souveraine : passation par
+    /// l'autre hôte), plus ancienne que ce qu'un joueur a déjà reçu de sa zone mais seule
+    /// de sa case, lui arrive quand même à son prochain rattrapage (le propriétaire du
+    /// monde, qui reçoit tout ainsi, la ratait : son monde enregistré n'avait pas ce bloc).
+    #[test]
+    fn a_late_archived_edit_still_reaches_those_who_got_newer_ones() {
+        use minelib_net::game::{self, BuildMsg};
+        let set = |pos: [i32; 3], block: u16, seq: u64| {
+            game::encode(&BuildMsg::Set {
+                pos,
+                block,
+                by: "Eve".into(),
+                seq,
+            })
+        };
+        let cells = |logs: Vec<([i32; 2], Vec<Vec<u8>>)>| -> Vec<([i32; 3], u16)> {
+            let mut v: Vec<([i32; 3], u16)> = logs
+                .iter()
+                .flat_map(|(_, l)| l.iter())
+                .filter_map(|d| match game::decode::<BuildMsg>(d) {
+                    Some(BuildMsg::Set { pos, block, .. }) => Some((pos, block)),
+                    _ => None,
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let mut b = super::Build::default();
+        let zone = minelib_net::proto::zone_of([0, 0]);
+        let (a, late, owner) = ([1, 70, 1], [2, 70, 2], 1);
+        b.mirror_at(zone, &set(a, 5, 100), Some(100), &[]);
+        assert_eq!(cells(b.catch_up(owner, None, &|_| true)), vec![(a, 5)]);
+        // Archivée en retard, à un rang plus petit, sans destinataire direct.
+        b.mirror_at(zone, &set(late, 3, 60), Some(60), &[]);
+        assert_eq!(
+            cells(b.catch_up(owner, None, &|_| true)),
+            vec![(a, 5), (late, 3)],
+            "le propriétaire la reçoit (et l'autre, déjà reçue, de nouveau : sans effet)"
+        );
+        assert!(cells(b.catch_up(owner, None, &|_| true)).is_empty());
     }
 
     /// Simulation de foule dans une seule région, avec le vrai code de diffusion

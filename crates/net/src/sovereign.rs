@@ -249,11 +249,31 @@ impl Batch {
 
     /// Signé par cet hôte, et les rangs se suivent ?
     pub fn verify(&self, primary: &VerifyingKey) -> bool {
+        self.numbered()
+            && sig_of(&self.sig).is_some_and(|s| primary.verify(&self.signed_bytes(), &s).is_ok())
+    }
+
+    /// Les rangs se suivent à partir de `first` (sans rien vérifier de signé).
+    pub fn numbered(&self) -> bool {
         self.records
             .iter()
             .enumerate()
             .all(|(i, r)| r.seq == self.first + i as u64)
-            && sig_of(&self.sig).is_some_and(|s| primary.verify(&self.signed_bytes(), &s).is_ok())
+    }
+
+    /// Vérification d'un lot pris seul, par n'importe qui (le relais du monde, ou l'hôte
+    /// d'une autre région à qui il le confie) : signé par l'hôte principal `primary`, et
+    /// chaque modification valable (signature, certificat, case, dates dans le lot).
+    /// Renvoie la faute, ou `None`. Un lot mal signé n'est une faute prouvable que pour
+    /// qui l'a reçu de l'hôte lui-même (le relais du monde) : `judge` l'ignore.
+    pub fn audit(&self, rules: &Rules, epoch: u64, primary: &VerifyingKey) -> Option<String> {
+        if self.room != rules.room || self.region != rules.region || self.epoch != epoch {
+            return Some("lot d'une autre région ou d'une autre époque".into());
+        }
+        if !self.verify(primary) {
+            return Some("lot mal signé par l'hôte principal".into());
+        }
+        judge(rules, epoch, primary, std::slice::from_ref(self))
     }
 }
 

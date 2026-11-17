@@ -2871,6 +2871,7 @@ dependencies = [
  "argon2",
  "ed25519-dalek 2.2.0",
  "env_logger",
+ "libc",
  "log",
  "minelib-net",
  "minelib-p2p",

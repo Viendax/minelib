@@ -550,6 +550,13 @@ impl Accounts {
     }
 
     /// Lit les réponses du relais (à chaque image, quel que soit l'écran).
+    /// Un relais de région a redit le battement du relais du monde : il est en vie (v136 :
+    /// il ne l'envoie plus lui-même aux joueurs servis par un relais de région ; une pause,
+    /// elle, arrive toujours directement de lui).
+    pub fn relayed_beat(&mut self) {
+        self.last_heard = std::time::Instant::now();
+    }
+
     pub fn poll(&mut self) {
         if !self.auto_tried {
             self.auto_tried = true;
@@ -756,11 +763,14 @@ impl Accounts {
                     self.world_paused = p;
                     self.game_events.push(e);
                 }
-                // (Pour les connexions de garant : gardiens des mondes.)
+                // (Pour les connexions de garant : gardiens des mondes, surveillance
+                // mutuelle, relais de région.)
                 Event::Beat { .. }
                 | Event::WitnessTask { .. }
                 | Event::Committee(_)
-                | Event::Released { .. } => {}
+                | Event::Released { .. }
+                | Event::Audit { .. }
+                | Event::WorldBeat { .. } => {}
                 Event::Standby(at) => {
                     self.standby = at;
                     self.last_heard = std::time::Instant::now();

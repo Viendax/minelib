@@ -14,8 +14,10 @@ use minelib_net::proto::Request;
 use minelib_net::transport::{self, Inbound};
 use minelib_net::voice::{self, Identity, VoiceMsg, FRAME, RATE};
 
-/// Clé publique renvoyée aux autres toutes les…
-const HELLO_EVERY: f32 = 3.0;
+/// Clé publique donnée à chaque nouveau voisin tout de suite, puis redonnée toutes les…
+/// (v136 : avant, à tous les voisins toutes les 3 s ; dans une foule, le relais du monde
+/// passait son temps à transmettre ces bonjours.)
+const HELLO_EVERY: f32 = 30.0;
 /// Un joueur « parle » encore tant qu'un paquet est arrivé depuis…
 const SPEAKING_S: f32 = 0.3;
 
@@ -134,7 +136,8 @@ pub struct Voice {
     rekey_wait: f32,
     /// Clés de voix des autres : (époque, clé).
     theirs: HashMap<u64, (u32, [u8; 32])>,
-    hello: f32,
+    /// Bonjour (ma clé publique) déjà donné à chacun : temps avant de le redonner.
+    hello: HashMap<u64, f32>,
     mic: Option<Mic>,
     mic_failed: bool,
     pending: Vec<f32>,
@@ -171,7 +174,7 @@ impl Voice {
             rekey_due: false,
             rekey_wait: 0.0,
             theirs: HashMap::new(),
-            hello: 0.0,
+            hello: HashMap::new(),
             mic: None,
             mic_failed: false,
             pending: Vec::new(),
@@ -201,16 +204,24 @@ impl Voice {
             *t += dt;
         }
         self.speaking.retain(|_, t| *t < SPEAKING_S);
-        self.hello -= dt;
-        if self.hello <= 0.0 {
-            self.hello = HELLO_EVERY;
-            self.send(
-                everyone.to_vec(),
-                &VoiceMsg::Hello {
-                    pubkey: self.id.public,
-                },
-            );
+        // Ma clé publique : à chaque nouveau voisin, puis de temps en temps.
+        let near: HashSet<u64> = everyone.iter().copied().collect();
+        self.hello.retain(|p, _| near.contains(p));
+        let mut due = Vec::new();
+        for &p in everyone {
+            let t = self.hello.entry(p).or_insert(0.0);
+            *t -= dt;
+            if *t <= 0.0 {
+                *t = HELLO_EVERY;
+                due.push(p);
+            }
         }
+        self.send(
+            due,
+            &VoiceMsg::Hello {
+                pubkey: self.id.public,
+            },
+        );
         // Quelqu'un ne doit plus m'entendre : nouvelle clé.
         let set: HashSet<u64> = listeners.iter().copied().collect();
         // (Il ne reçoit déjà plus mes messages ; la clé change presque aussitôt en petit
@@ -298,12 +309,18 @@ impl Voice {
             return;
         };
         match msg {
-            VoiceMsg::Hello { pubkey } => {
-                if self.pubkeys.insert(from, pubkey) != Some(pubkey) {
-                    // Nouvelle clé publique : il faudra lui redonner la mienne.
+            VoiceMsg::Hello { pubkey } => match self.pubkeys.insert(from, pubkey) {
+                // Nouvelle clé publique : il faudra lui (re)donner ma clé de voix.
+                None => {
                     self.given.remove(&from);
                 }
-            }
+                // Changée (son jeu a été relancé) : ma clé publique aussi, tout de suite.
+                Some(old) if old != pubkey => {
+                    self.given.remove(&from);
+                    self.hello.remove(&from);
+                }
+                Some(_) => {}
+            },
             VoiceMsg::Key { epoch, sealed } => {
                 if let Some(k) = self.id.open(&sealed) {
                     self.theirs.insert(from, (epoch, k));
@@ -331,6 +348,57 @@ impl Voice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bonjours envoyés (destinataires de chaque `Hello`).
+    fn hellos(rx: &std::sync::mpsc::Receiver<Inbound>) -> Vec<Vec<u64>> {
+        let mut out = Vec::new();
+        for m in rx.try_iter() {
+            if let Inbound::Push(b) | Inbound::Loose(b, _) = m {
+                if let Some(Request::Voice { to, data }) = minelib_net::game::decode::<Request>(&b)
+                {
+                    if matches!(
+                        minelib_net::game::decode::<VoiceMsg>(&data),
+                        Some(VoiceMsg::Hello { .. })
+                    ) {
+                        out.push(to);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Ma clé publique part à chaque nouveau voisin tout de suite, puis toutes les 30 s
+    /// seulement (avant : à tous toutes les 3 s), et tout de suite à un voisin dont le jeu
+    /// a été relancé.
+    #[test]
+    fn hellos_go_to_new_neighbours_then_rarely() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut v = Voice::new(tx);
+        v.update(0.1, &[1, 2], &[], false);
+        assert_eq!(hellos(&rx), vec![vec![1, 2]]);
+        for _ in 0..50 {
+            v.update(0.1, &[1, 2], &[], false);
+        }
+        assert!(hellos(&rx).is_empty(), "rien de nouveau en 5 s");
+        v.update(0.1, &[1, 2, 3], &[], false);
+        assert_eq!(hellos(&rx), vec![vec![3]], "le nouveau seulement");
+        let pubkey = Identity::new().public;
+        let hello = minelib_net::game::encode(&VoiceMsg::Hello { pubkey });
+        v.receive(2, &hello, 1.0);
+        v.update(0.1, &[1, 2, 3], &[], false);
+        assert!(hellos(&rx).is_empty(), "première clé de 2 : rien à redire");
+        let relaunched = Identity::new().public;
+        let hello = minelib_net::game::encode(&VoiceMsg::Hello { pubkey: relaunched });
+        v.receive(2, &hello, 1.0);
+        v.update(0.1, &[1, 2, 3], &[], false);
+        assert_eq!(hellos(&rx), vec![vec![2]], "son jeu a été relancé");
+        for _ in 0..300 {
+            v.update(0.1, &[1, 2, 3], &[], false);
+        }
+        let all: usize = hellos(&rx).iter().map(|t| t.len()).sum();
+        assert_eq!(all, 3, "chacun une fois en 30 s");
+    }
 
     #[test]
     fn resampling_48k_gives_16k() {

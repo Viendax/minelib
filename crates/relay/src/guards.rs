@@ -432,7 +432,10 @@ fn beat(st: &mut State, rid: u64, now: u64) {
 }
 
 /// Les joueurs du monde savent s'il est en pause : tout de suite quand ça change, et deux
-/// fois par seconde (un jeu qui n'entend plus rien cherche le relais de secours).
+/// fois par seconde (un jeu qui n'entend plus rien cherche le relais de secours). Les deux
+/// fois par seconde passent par les relais de région (v136) : ce relais le dit une fois à
+/// l'hôte de chacun, qui le redit à ses joueurs ; il ne l'envoie lui-même qu'aux joueurs
+/// qu'aucun relais de région ne sert.
 pub(crate) fn refresh_pause(st: &mut State, rid: u64, now: u64) {
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
@@ -457,12 +460,37 @@ pub(crate) fn refresh_pause(st: &mut State, rid: u64, now: u64) {
             );
         }
     }
-    let to: Vec<u64> = room.everyone().collect();
-    let msg = Response::Paused { paused: !serving };
-    for id in to {
-        if let Some(c) = st.conns.get(&id) {
+    send_pause(st, rid, !serving, changed);
+}
+
+/// Le battement aux joueurs du monde (voir `refresh_pause`) : aux hôtes des relais de
+/// région, qui le redisent à leurs joueurs, et directement aux autres joueurs (à tous
+/// quand ça vient de changer).
+pub(crate) fn send_pause(st: &State, rid: u64, paused: bool, changed: bool) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let beat = Response::WorldBeat { room: rid, paused };
+    for s in room.shards.values().flatten().filter(|s| s.info.is_some()) {
+        if let Some(c) = st.conns.get(&s.host) {
+            transport::push(&c.tx, &beat);
+        }
+    }
+    let msg = Response::Paused { paused };
+    let send = |id: &u64| {
+        if let Some(c) = st.conns.get(id) {
             transport::push(&c.tx, &msg);
         }
+    };
+    if changed {
+        room.everyone().for_each(|id| send(&id));
+    } else {
+        // (Le propriétaire, qui n'est pas dans les membres, et les joueurs sans relais de
+        // région.)
+        if !room.garant_hosted && !room.unserved.contains(&room.host) {
+            send(&room.host);
+        }
+        room.unserved.iter().for_each(send);
     }
 }
 

@@ -101,6 +101,7 @@ impl Drop for GarantWorker {
 /// Relais d'une région d'un monde de construction, hébergé par ce jeu pour d'autres
 /// joueurs (voir `minelib_relay::shard`). Il leur transmet ce que publie le relais du monde.
 pub struct ShardHost {
+    pub room: u64,
     pub region: [i32; 2],
     handle: minelib_relay::shard::ShardHandle,
     /// Connexion de garant (au relais du monde) : lots publiés, confirmations,
@@ -108,6 +109,17 @@ pub struct ShardHost {
     link: std::sync::mpsc::Sender<minelib_net::transport::Inbound>,
     /// Nœud iroh propre à ce relais (joignable de partout, sans gêner celui du jeu).
     _node: Option<Arc<minelib_p2p::Node>>,
+}
+
+impl Drop for ShardHost {
+    /// Ce que le relais n'a pas encore dit au relais du monde (lots regroupés, confirmation)
+    /// part avant qu'il s'arrête.
+    fn drop(&mut self) {
+        self.handle.flush_root();
+        for req in self.handle.take_outbox() {
+            minelib_net::transport::push(&self.link, &req);
+        }
+    }
 }
 
 /// Relais de secours d'un monde de construction, tenu par ce jeu pour les joueurs de ce
@@ -560,11 +572,17 @@ impl ShardHost {
             },
         );
         Some(Self {
+            room,
             region,
             handle,
             link,
             _node: node,
         })
+    }
+
+    /// Du relais du monde : le monde est servi (ou en pause), à redire aux joueurs.
+    pub fn world_beat(&self, paused: bool) {
+        self.handle.world_beat(paused);
     }
 
     /// Du relais du monde : l'historique de la région, puis chaque modification publiée.
@@ -632,6 +650,38 @@ impl ShardHost {
             minelib_net::transport::push(&self.link, &req);
         }
     }
+}
+
+/// Surveillance mutuelle : un lot d'une autre région que le relais du monde confie à ce
+/// jeu (`Event::Audit`), vérifié comme il le ferait lui-même ; la réponse à lui renvoyer.
+pub fn audit_reply(e: &Event) -> Option<minelib_net::proto::Request> {
+    let Event::Audit {
+        id,
+        room,
+        region,
+        epoch,
+        key,
+        root,
+        floor_t,
+        batch,
+    } = e
+    else {
+        return None;
+    };
+    let rules = minelib_net::sovereign::Rules {
+        room: *room,
+        region: *region,
+        root: *root,
+        floor_t: *floor_t,
+    };
+    let fault = match minelib_net::ed25519_dalek::VerifyingKey::from_bytes(key) {
+        Ok(k) => batch.audit(&rules, *epoch, &k),
+        Err(_) => Some("clé de l'hôte principal illisible".into()),
+    };
+    if let Some(why) = &fault {
+        log::warn!("garant : lot de la région {region:?} du monde {room} vérifié ici : {why}");
+    }
+    Some(minelib_net::proto::Request::Audited { id: *id, fault })
 }
 
 fn local_dir(
@@ -923,6 +973,20 @@ fn run(
                 Event::RootEdits { region, ref edits } => {
                     if let Some(s) = shard.as_ref().filter(|s| s.region == region) {
                         s.root_edits(edits.clone());
+                    }
+                }
+                // Surveillance mutuelle : un lot d'une autre région, vérifié ici comme le
+                // ferait le relais du monde (il ne revérifie que ce qu'on lui signale).
+                Event::Audit { .. } => {
+                    if let (Some(r), Some(l)) = (audit_reply(&e), &link) {
+                        minelib_net::transport::push(l, &r);
+                    }
+                }
+                // Le monde est servi (ou en pause) : redit aux joueurs du relais de région,
+                // à la place du relais du monde.
+                Event::WorldBeat { room, paused } => {
+                    if let Some(s) = shard.as_ref().filter(|s| s.room == room) {
+                        s.world_beat(paused);
                     }
                 }
                 Event::Identity(ref key) => {
