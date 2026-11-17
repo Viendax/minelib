@@ -96,6 +96,16 @@ impl ZoneLog {
         }
     }
 
+    /// Auteur de la dernière modification de la case `pos`.
+    #[cfg(test)]
+    fn author_at(&self, pos: [i32; 3]) -> Option<String> {
+        let seq = self.by_pos.get(&LogKey::Block(pos))?;
+        match minelib_net::game::decode(&self.entries.get(seq)?.1)? {
+            minelib_net::game::BuildMsg::Set { by, .. } => Some(by),
+            _ => None,
+        }
+    }
+
     /// Dernier numéro d'une sorte.
     pub fn last_of(&self, blocks: bool) -> u64 {
         self.last[!blocks as usize]
@@ -338,16 +348,30 @@ impl Build {
     /// Joueurs à qui envoyer ce qui se passe au chunk `chunk` (tous ceux à portée : une
     /// modification du monde doit arriver à chacun).
     pub fn listeners(&self, chunk: [i32; 2], except: u64) -> Vec<u64> {
-        // Peu de chunks occupés (une foule au même endroit) ou index pas à jour : par les
-        // chunks occupés ; sinon par les chunks voisins.
+        // Peu de chunks occupés (une foule au même endroit) : par les chunks occupés.
+        // Beaucoup (un monde où les joueurs sont étalés) : par les chunks à portée, pour
+        // que le travail ne grandisse pas avec le monde (essai de charge : à 60 000
+        // joueurs, chaque modification coûtait 170 µs, presque tout ici).
         if self.indexed == self.positions.len() {
-            return self
-                .by_chunk
-                .iter()
-                .filter(|(&c, _)| near(c, chunk))
-                .flat_map(|(_, m)| m.iter().copied())
-                .filter(|&id| id != except)
-                .collect();
+            let ring = (2 * NEAR + 1) as usize;
+            if self.by_chunk.len() <= ring * ring {
+                return self
+                    .by_chunk
+                    .iter()
+                    .filter(|(&c, _)| near(c, chunk))
+                    .flat_map(|(_, m)| m.iter().copied())
+                    .filter(|&id| id != except)
+                    .collect();
+            }
+            let mut out = Vec::new();
+            for dx in -NEAR..=NEAR {
+                for dz in -NEAR..=NEAR {
+                    if let Some(m) = self.by_chunk.get(&[chunk[0] + dx, chunk[1] + dz]) {
+                        out.extend(m.iter().copied().filter(|&id| id != except));
+                    }
+                }
+            }
+            return out;
         }
         self.positions
             .iter()
@@ -390,6 +414,13 @@ impl Build {
     pub fn block_at(&self, pos: [i32; 3]) -> Option<u16> {
         let zone = minelib_net::proto::zone_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]);
         self.logs.get(&zone)?.block_at(pos)
+    }
+
+    /// Auteur de la dernière modification de la case `pos`, si elle a déjà été modifiée.
+    #[cfg(test)]
+    pub fn author_at(&self, pos: [i32; 3]) -> Option<String> {
+        let zone = minelib_net::proto::zone_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]);
+        self.logs.get(&zone)?.author_at(pos)
     }
 
     /// Le relais du monde accepte une modification de bloc : elle prend son rang dans
@@ -628,8 +659,59 @@ mod tests {
                 eprintln!("FOULE {layout:<24} {report}");
                 // Construction : chaque joueur pose ou casse un bloc toutes les deux
                 // secondes, là où il est ; chaque modification va à tous les joueurs à
-                // portée (le monde doit rester le même pour tous).
-                let set = postcard::to_allocvec(&Response::FromZone {
+                // portée (le monde doit rester le même pour tous). Les blocs partent
+                // regroupés (`minelib_net::cells`) : 50 paquets par seconde au plus vers
+                // chaque joueur, le premier bloc sans attendre.
+                let mut out = vec![0f64; relays];
+                let mut got = 0f64;
+                for &(_, c, _) in &players {
+                    for (r, b) in builds.iter().enumerate() {
+                        let l = b.listeners(c, u64::MAX).len() as f64 * 0.5;
+                        out[r] += l;
+                        got += l;
+                    }
+                }
+                // Octets par seconde vers une connexion qui reçoit `rate` blocs par
+                // seconde, d'après le vrai codec (blocs pris au hasard à portée de vue) ;
+                // un message par bloc avant la v128.
+                let mut seed = 4242u64;
+                let mut rnd = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                let mut bytes_at = |rate: f64| -> f64 {
+                    if rate <= 0.0 {
+                        return 0.0;
+                    }
+                    let packets = rate.min(50.0);
+                    let per = (rate / packets).round().max(1.0) as usize;
+                    let cells = (0..per)
+                        .map(|i| {
+                            let x = 8000 + (rnd() % 400) as i32;
+                            let z = -5000 + (rnd() % 400) as i32;
+                            (
+                                [x, 50 + (rnd() % 60) as i32, z],
+                                (rnd() % 300) as u16,
+                                5_000_000 + i as u64,
+                            )
+                        })
+                        .collect();
+                    let packet = postcard::to_allocvec(&Response::FromZone {
+                        peer: 0,
+                        chunk: [0, 0],
+                        data: game::encode(&BuildMsg::Cells(
+                            minelib_net::cells::pack_cells(cells).remove(0),
+                        )),
+                    })
+                    .unwrap()
+                    .len()
+                        + 16
+                        + 2;
+                    packets * packet as f64
+                };
+                let old = postcard::to_allocvec(&Response::FromZone {
                     peer: 0,
                     chunk: [17, -3],
                     data: game::encode(&BuildMsg::Set {
@@ -644,28 +726,27 @@ mod tests {
                     + 16
                     + 2
                     + 2;
-                let mut out = vec![0f64; relays];
-                let mut got = 0f64;
-                for &(_, c, _) in &players {
-                    for (r, b) in builds.iter().enumerate() {
-                        let l = b.listeners(c, u64::MAX).len() as f64 * 0.5;
-                        out[r] += l;
-                        got += l;
-                    }
-                }
                 let worst = out.iter().cloned().fold(0.0, f64::max);
+                // Un relais sert ses joueurs (`share`), chacun au débit moyen d'un joueur.
+                let per_player = got / n as f64;
+                let share = n as f64 / relays as f64;
+                let relay_bytes = share * bytes_at(worst / share);
                 // Le relais du monde accepte chaque modification (une demande reçue), la
-                // confirme à son auteur et la remet à chaque relais de la région.
-                let world = n as f64 * 0.5 * (relays as f64 + 1.0);
+                // confirme à son auteur (un bloc seul) et la remet à chaque relais de la
+                // région (regroupée).
+                let asks = n as f64 * 0.5;
+                let world = asks * bytes_at(1.0) + relays as f64 * bytes_at(asks);
                 eprintln!(
-                    "FOULE {layout:<24} {n:>5} joueurs, construction (1 bloc / 2 s chacun, {set} octets) | relais le plus chargé : {:.0} msg/s = {:.1} Mbit/s | joueur : {:.0} modifications reçues/s ({:.0} kbit/s) | relais du monde : {:.0} demandes/s, {:.0} msg/s sortants = {:.1} Mbit/s",
+                    "FOULE {layout:<24} {n:>5} joueurs, construction (1 bloc / 2 s chacun) | relais le plus chargé : {:.0} blocs/s = {:.1} Mbit/s ({:.1} avant les paquets) | joueur : {:.0} blocs reçus/s = {:.0} kbit/s ({:.0} avant) | relais du monde : {:.0} demandes/s, {:.2} Mbit/s sortants ({:.1} avant)",
                     worst,
-                    worst * set as f64 * 8.0 / 1e6,
-                    got / n as f64,
-                    got / n as f64 * set as f64 * 8.0 / 1e3,
-                    n as f64 * 0.5,
-                    world,
-                    world * set as f64 * 8.0 / 1e6,
+                    relay_bytes * 8.0 / 1e6,
+                    worst * old as f64 * 8.0 / 1e6,
+                    per_player,
+                    bytes_at(per_player) * 8.0 / 1e3,
+                    per_player * old as f64 * 8.0 / 1e3,
+                    asks,
+                    world * 8.0 / 1e6,
+                    asks * (relays as f64 + 1.0) * old as f64 * 8.0 / 1e6,
                 );
             }
         }

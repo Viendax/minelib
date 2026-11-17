@@ -536,6 +536,19 @@ pub enum BuildMsg {
     },
     /// Demande `seq` refusée (remise au seul demandeur) : rien n'a changé.
     Denied { seq: u32 },
+    /// Blocs changés, regroupés (voir `crate::cells`) : ce que disent autant de `Set`,
+    /// sans l'auteur, en six à huit octets par bloc au lieu d'une cinquantaine.
+    Cells(Vec<u8>),
+}
+
+/// Le bloc changé que décrit un `Set` (pour l'envoyer regroupé avec d'autres).
+pub fn cell_of(data: &[u8]) -> Option<crate::cells::Cell> {
+    match decode::<BuildMsg>(data)? {
+        BuildMsg::Set {
+            pos, block, seq, ..
+        } => Some((pos, block, seq)),
+        _ => None,
+    }
 }
 
 /// Sortes de `ToPeer::Step`.

@@ -91,14 +91,7 @@ impl State {
         for (m, items) in self.build.mirror_to(proto::zone_of(chunk), set, &to) {
             if let Some(c) = self.conns.get(&m) {
                 for data in items {
-                    transport::push(
-                        &c.tx,
-                        &Response::FromZone {
-                            peer: 0,
-                            chunk,
-                            data,
-                        },
-                    );
+                    crate::push_zone(&c.tx, chunk, data);
                 }
             }
         }
@@ -142,7 +135,24 @@ impl ShardHandle {
     /// Du relais du monde : l'historique de la région (avant l'arrivée des joueurs), puis
     /// chaque modification qu'il publie, dans son ordre.
     pub fn seed(&self, data: &[u8]) {
-        self.state.lock().unwrap().deliver(data);
+        let mut st = self.state.lock().unwrap();
+        match game::decode::<BuildMsg>(data) {
+            // Blocs regroupés : chacun entre dans l'historique comme une modification
+            // (dans un paquet, ceux d'une même case sont rangés du plus ancien au plus
+            // récent).
+            Some(BuildMsg::Cells(packet)) => {
+                let cells = minelib_net::cells::unpack_cells(&packet).unwrap_or_default();
+                for (pos, block, seq) in cells {
+                    st.deliver(&game::encode(&BuildMsg::Set {
+                        pos,
+                        block,
+                        by: String::new(),
+                        seq,
+                    }));
+                }
+            }
+            _ => st.deliver(data),
+        }
     }
 
     /// Joueurs entrés dans ce relais.
@@ -435,14 +445,7 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
                 for (zone, log) in logs {
                     let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
                     for data in log {
-                        transport::push(
-                            &c.tx,
-                            &Response::FromZone {
-                                peer: 0,
-                                chunk,
-                                data,
-                            },
-                        );
+                        crate::push_zone(&c.tx, chunk, data);
                     }
                 }
             }
@@ -485,14 +488,7 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
                     for (zone, log) in logs {
                         let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
                         for data in log {
-                            transport::push(
-                                &c.tx,
-                                &Response::FromZone {
-                                    peer: 0,
-                                    chunk,
-                                    data,
-                                },
-                            );
+                            crate::push_zone(&c.tx, chunk, data);
                         }
                     }
                 }

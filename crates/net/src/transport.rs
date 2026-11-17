@@ -32,6 +32,11 @@ const LOOSE_MAX_AGE: Duration = Duration::from_millis(250);
 /// par seconde vont à chaque joueur ; une par paquet, chacune coûtait 40 octets
 /// d'en-têtes et un appel au système.
 const OUT_MAX: usize = 32 * 1024;
+/// Les blocs changés (`push_cell`) partent regroupés en paquets compacts : le premier tout
+/// de suite, les suivants au plus tôt ce temps après le paquet d'avant. Un joueur au
+/// milieu d'une foule qui construit reçoit ainsi 50 paquets par seconde au plus, quel que
+/// soit le nombre de blocs, et rien n'attend quand il y en a peu.
+const CELL_LINGER: Duration = Duration::from_millis(20);
 
 /// Ce qui arrive sur un canal : message chiffré reçu du réseau, message (en clair) déposé
 /// par un autre fil pour être envoyé, ou fin de connexion.
@@ -40,6 +45,8 @@ pub enum Inbound {
     Push(Vec<u8>),
     /// Message périssable déposé à cet instant (voir `LOOSE_MAX_AGE`).
     Loose(Vec<u8>, Instant),
+    /// Bloc changé, à envoyer regroupé avec les autres (voir `CELL_LINGER`).
+    Cell(crate::cells::Cell),
     Closed,
 }
 
@@ -60,6 +67,15 @@ pub struct Channel {
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Trames chiffrées prêtes à partir, pas encore écrites (voir `OUT_MAX`).
     out: Vec<u8>,
+    /// Blocs changés en attente d'être regroupés, heure à laquelle ils partent, heure du
+    /// dernier paquet parti.
+    cells: Vec<crate::cells::Cell>,
+    cells_due: Instant,
+    cells_sent: Instant,
+    /// Message sorti de la file en ramassant les blocs, à traiter ensuite ; paquets de
+    /// blocs prêts à être remis à l'appelant.
+    held: Option<Inbound>,
+    ready: std::collections::VecDeque<Vec<u8>>,
 }
 
 /// Dépose un message pour qu'il soit envoyé par le fil qui possède le canal.
@@ -78,6 +94,13 @@ pub fn encode<T: Serialize>(msg: &T) -> Option<Vec<u8>> {
 /// Dépose un message déjà sérialisé (`encode`).
 pub fn push_raw(tx: &Sender<Inbound>, bytes: Vec<u8>) -> bool {
     tx.send(Inbound::Push(bytes)).is_ok()
+}
+
+/// Dépose un bloc changé : il part regroupé avec ceux qui le suivent de près, dans un
+/// paquet compact (`BuildMsg::Cells`). L'ordre entre blocs ne compte pas (chacun porte son
+/// rang dans l'ordre du monde).
+pub fn push_cell(tx: &Sender<Inbound>, cell: crate::cells::Cell) -> bool {
+    tx.send(Inbound::Cell(cell)).is_ok()
 }
 
 /// Dépose un message périssable déjà sérialisé : s'il attend trop dans la file (client
@@ -217,6 +240,11 @@ impl Channel {
             tx,
             backlog,
             out: Vec::new(),
+            cells: Vec::new(),
+            cells_due: Instant::now(),
+            cells_sent: Instant::now(),
+            held: None,
+            ready: std::collections::VecDeque::new(),
         })
     }
 
@@ -266,27 +294,74 @@ impl Channel {
         Ok(postcard::from_bytes(&plain[..m])?)
     }
 
+    /// Les blocs en attente deviennent des paquets prêts à partir (avec ceux qui sont déjà
+    /// dans la file).
+    fn pack_waiting_cells(&mut self) {
+        while self.cells.len() < crate::cells::CELLS_MAX && self.held.is_none() {
+            match self.rx.try_recv() {
+                Ok(Inbound::Cell(c)) => self.cells.push(c),
+                Ok(m) => self.held = Some(m),
+                Err(_) => break,
+            }
+        }
+        self.cells_sent = Instant::now();
+        for packet in crate::cells::pack_cells(std::mem::take(&mut self.cells)) {
+            let msg = crate::proto::Response::FromZone {
+                peer: 0,
+                chunk: [0, 0],
+                data: crate::game::encode(&crate::game::BuildMsg::Cells(packet)),
+            };
+            if let Ok(b) = postcard::to_allocvec(&msg) {
+                self.ready.push_back(b);
+            }
+        }
+    }
+
     /// Prochain message reçu ou déposé ; `None` si rien avant `timeout`.
     pub fn recv_any<T: DeserializeOwned>(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<Incoming<T>>> {
+        let end = Instant::now() + timeout;
         loop {
-            // Plus rien dans la file : ce qui attendait dans le tampon d'envoi part
-            // maintenant, d'un seul bloc, avant de se mettre en attente.
-            let next = match self.rx.try_recv() {
-                Ok(m) => m,
-                Err(TryRecvError::Disconnected) => return Err(anyhow!("connexion fermée")),
-                Err(TryRecvError::Empty) => {
-                    self.flush()?;
-                    match self.rx.recv_timeout(timeout) {
-                        Ok(m) => m,
-                        Err(RecvTimeoutError::Timeout) => return Ok(None),
-                        Err(RecvTimeoutError::Disconnected) => {
-                            return Err(anyhow!("connexion fermée"))
+            if let Some(p) = self.ready.pop_front() {
+                return Ok(Some(Incoming::Push(p)));
+            }
+            // Des blocs attendent et leur heure est venue : ils partent, regroupés.
+            if !self.cells.is_empty() && Instant::now() >= self.cells_due {
+                self.pack_waiting_cells();
+                continue;
+            }
+            let next = match self.held.take() {
+                Some(m) => m,
+                None => match self.rx.try_recv() {
+                    Ok(m) => m,
+                    Err(TryRecvError::Disconnected) => return Err(anyhow!("connexion fermée")),
+                    // Plus rien dans la file : ce qui attendait dans le tampon d'envoi
+                    // part maintenant, d'un seul bloc, avant de se mettre en attente (du
+                    // prochain message, ou de l'heure des blocs en attente).
+                    Err(TryRecvError::Empty) => {
+                        self.flush()?;
+                        let now = Instant::now();
+                        let until = if self.cells.is_empty() {
+                            end
+                        } else {
+                            end.min(self.cells_due)
+                        };
+                        match self.rx.recv_timeout(until.saturating_duration_since(now)) {
+                            Ok(m) => m,
+                            // (Délai de l'appelant passé avant l'heure des blocs : ils
+                            // partiront à son prochain appel.)
+                            Err(RecvTimeoutError::Timeout) if Instant::now() >= end => {
+                                return Ok(None)
+                            }
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                return Err(anyhow!("connexion fermée"))
+                            }
                         }
                     }
-                }
+                },
             };
             match next {
                 Inbound::Frame(f) => {
@@ -298,6 +373,15 @@ impl Channel {
                 // Périssable : trop vieux, il est abandonné (le suivant le remplace).
                 Inbound::Loose(_, at) if at.elapsed() > LOOSE_MAX_AGE => {}
                 Inbound::Loose(p, _) => return Ok(Some(Incoming::Push(p))),
+                Inbound::Cell(c) => {
+                    if self.cells.is_empty() {
+                        self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
+                    }
+                    self.cells.push(c);
+                    if self.cells.len() >= crate::cells::CELLS_MAX {
+                        self.pack_waiting_cells();
+                    }
+                }
                 Inbound::Closed => return Err(anyhow!("connexion fermée")),
             }
         }
@@ -335,6 +419,81 @@ impl Drop for Channel {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// Des blocs déposés un par un arrivent regroupés : le premier tout de suite, les
+    /// suivants ensemble, et aucun ne manque.
+    #[test]
+    fn cells_leave_in_a_few_compact_packets_and_none_is_lost() {
+        use crate::game::{self, BuildMsg};
+        use crate::proto::{Request, Response};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (private, _) = generate_static();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut c = Channel::accept(stream, &private, Duration::from_secs(5)).unwrap();
+            let tx = c.pusher();
+            // Un bloc seul, puis une rafale pendant que le canal tourne.
+            push_cell(&tx, ([0, 1, 2], 3, 1));
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                for i in 0..3000u64 {
+                    push_cell(
+                        &tx,
+                        (
+                            [i as i32 % 200, (i % 256) as i32, -7],
+                            (i % 50) as u16,
+                            2 + i,
+                        ),
+                    );
+                    if i % 500 == 0 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                push(&tx, &Response::Pong);
+            });
+            loop {
+                match c.recv_any::<Request>(Duration::from_millis(500)) {
+                    Ok(Some(Incoming::Push(p))) => c.send_raw(&p).unwrap(),
+                    Ok(Some(Incoming::Msg(_))) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        });
+        let (mut c, _) = Channel::connect(&addr, Duration::from_secs(5)).unwrap();
+        let (mut cells, mut packets, mut first, mut pong) = (Vec::new(), 0, None, false);
+        let t = Instant::now();
+        while (cells.len() < 3001 || !pong) && t.elapsed() < Duration::from_secs(10) {
+            match c
+                .recv_timeout::<Response>(Duration::from_millis(200))
+                .unwrap()
+            {
+                Some(Response::FromZone { data, .. }) => {
+                    let Some(BuildMsg::Cells(p)) = game::decode(&data) else {
+                        panic!("un paquet de blocs")
+                    };
+                    let got = crate::cells::unpack_cells(&p).expect("paquet lisible");
+                    first.get_or_insert((got.len(), t.elapsed()));
+                    packets += 1;
+                    cells.extend(got);
+                }
+                Some(Response::Pong) => pong = true,
+                _ => {}
+            }
+        }
+        drop(c);
+        server.join().unwrap();
+        assert_eq!(cells.len(), 3001, "aucun bloc perdu");
+        cells.sort_unstable_by_key(|c| c.2);
+        assert!(cells.iter().enumerate().all(|(i, c)| c.2 == 1 + i as u64));
+        let (n, after) = first.unwrap();
+        assert_eq!(n, 1, "le premier bloc n'attend pas les autres");
+        assert!(after < Duration::from_millis(50), "{after:?}");
+        assert!(
+            packets <= 12,
+            "regroupés : {packets} paquets pour 3001 blocs"
+        );
+    }
 
     #[test]
     fn encrypted_round_trip_and_relay_key() {

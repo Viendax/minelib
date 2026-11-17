@@ -6,6 +6,7 @@
 //! ni le mot de passe ni la clé en clair. Se connecter, c'est récupérer ce coffre, l'ouvrir
 //! sur sa machine et signer un défi du relais. Aucun e-mail, aucun numéro.
 
+pub mod cells;
 pub mod client;
 pub mod crypto;
 pub mod game;

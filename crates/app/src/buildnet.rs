@@ -600,7 +600,7 @@ impl BuildNet {
     pub fn receive(
         &mut self,
         peer: u64,
-        chunk: [i32; 2],
+        _chunk: [i32; 2],
         data: &[u8],
         world: &mut World,
     ) -> Vec<ChunkPos> {
@@ -611,37 +611,21 @@ impl BuildNet {
             // Les demandes ne vont qu'au relais du monde.
             BuildMsg::Edit { .. } => Vec::new(),
             BuildMsg::Set {
-                pos,
-                block,
-                by,
-                seq,
-            } => {
-                // (L'historique envoyé par un relais porte le coin de la zone, d'où la
-                // comparaison par zone.)
-                if proto::zone_of(chunk_of(pos[0], pos[2])) != proto::zone_of(chunk)
-                    || block as usize >= minelib_world::registry::registry().len()
+                pos, block, seq, ..
+            } => self.block_set(pos, block, seq, world),
+            // Blocs regroupés : comme autant de modifications.
+            BuildMsg::Cells(packet) => {
+                let mut dirty = Vec::new();
+                for (pos, block, seq) in
+                    minelib_net::cells::unpack_cells(&packet).unwrap_or_default()
                 {
-                    return Vec::new();
+                    for c in self.block_set(pos, block, seq, world) {
+                        if !dirty.contains(&c) {
+                            dirty.push(c);
+                        }
+                    }
                 }
-                // L'ordre du relais du monde : plus ancienne que ce qu'on a déjà pour
-                // cette case (doublon, même modification arrivée par deux chemins), elle
-                // est sans effet.
-                if self.seen.get(&pos).is_some_and(|s| s.0 >= seq) {
-                    return Vec::new();
-                }
-                if self.seen.len() >= SEEN_MAX {
-                    self.seen.clear();
-                }
-                self.seen.insert(pos, (seq, self.from_shard));
-                log::debug!("construction : bloc {block} en {pos:?} (par {by})");
-                // Ce que publie le relais fait foi (et confirme une modification en attente).
-                self.confirm(pos, BlockId(block));
-                // Le joueur a déjà rechangé cette case (pas encore envoyé) : sa nouvelle
-                // modification reste à l'écran, et part de ce bloc-ci.
-                if rebase_journal(world, pos, BlockId(block)) {
-                    return Vec::new();
-                }
-                world.set_remote(pos[0], pos[1], pos[2], BlockId(block))
+                dirty
             }
             // Objets au sol et coffres : états publiés par le relais du monde (jamais par un
             // joueur, `peer` 0, ni par un relais de région).
@@ -727,6 +711,37 @@ impl BuildNet {
     /// modifications est oublié.
     fn forget_shard(&mut self, region: [i32; 2]) {
         self.seen.retain(|_, v| v.1 != Some(region));
+    }
+
+    /// Le relais du monde a publié `block` en `pos`, au rang `seq` de l'ordre du monde.
+    /// Renvoie les chunks à remailler.
+    fn block_set(
+        &mut self,
+        pos: [i32; 3],
+        block: u16,
+        seq: u64,
+        world: &mut World,
+    ) -> Vec<ChunkPos> {
+        if block as usize >= minelib_world::registry::registry().len() {
+            return Vec::new();
+        }
+        // L'ordre du relais du monde : plus ancienne que ce qu'on a déjà pour cette case
+        // (doublon, même modification arrivée par deux chemins), elle est sans effet.
+        if self.seen.get(&pos).is_some_and(|s| s.0 >= seq) {
+            return Vec::new();
+        }
+        if self.seen.len() >= SEEN_MAX {
+            self.seen.clear();
+        }
+        self.seen.insert(pos, (seq, self.from_shard));
+        // Ce que publie le relais fait foi (et confirme une modification en attente).
+        self.confirm(pos, BlockId(block));
+        // Le joueur a déjà rechangé cette case (pas encore envoyé) : sa nouvelle
+        // modification reste à l'écran, et part de ce bloc-ci.
+        if rebase_journal(world, pos, BlockId(block)) {
+            return Vec::new();
+        }
+        world.set_remote(pos[0], pos[1], pos[2], BlockId(block))
     }
 
     /// Une modification de cette case est confirmée.
