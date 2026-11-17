@@ -106,6 +106,12 @@ const GROUND_BRAKE: f32 = 30.0;
 const AIR_BRAKE: f32 = 9.0;
 const FLY: f32 = 12.0;
 const FLY_SPRINT: f32 = 30.0;
+/// Prise de vitesse en vol (blocs/s²). Sans cette limite, un appui d'un dixième de
+/// seconde en courant faisait déjà un bloc et demi, et deux dixièmes quatre blocs :
+/// impossible de s'avancer un peu vers un mur sans le percuter. Avec elle, un appui bref
+/// fait un tiers de bloc, 0,2 s font 1,2 bloc, et la pleine vitesse vient en une
+/// demi-seconde.
+const FLY_ACCEL: f32 = 60.0;
 /// Journal des arrêts : à pied, seul ce qui dépasse cette hauteur au-dessus des pieds est
 /// compté comme un mur devant le joueur (le reste se monte ou se saute).
 const WALL_FROM: f32 = 1.5;
@@ -399,13 +405,25 @@ impl Player {
         if self.flying {
             let speed = if m.sprint { FLY_SPRINT } else { FLY };
             let target = wish * speed + Vec3::Y * m.up * speed;
-            // On prend de la vitesse en douceur, mais on s'arrête net : touche relâchée,
-            // le vol ne continue pas sur son élan (à 30 blocs/s il glissait 3 blocs).
-            for a in 0..3 {
-                let k = if target[a] == 0.0 { FLY_BRAKE } else { 10.0 };
-                self.vel[a] += (target[a] - self.vel[a]) * (dt * k).min(1.0);
-                if target[a] == 0.0 && self.vel[a].abs() < 0.05 {
-                    self.vel[a] = 0.0;
+            if target == Vec3::ZERO {
+                // Plus aucune touche de déplacement : arrêt sur place, sans distance de
+                // freinage (à 20 blocs/s, le freinage faisait encore un demi-bloc : assez
+                // pour finir dans le mur devant lequel on venait de lâcher les touches).
+                self.vel = Vec3::ZERO;
+            } else {
+                let before = self.vel.length();
+                for a in 0..3 {
+                    let k = if target[a] == 0.0 { FLY_BRAKE } else { 10.0 };
+                    self.vel[a] += (target[a] - self.vel[a]) * (dt * k).min(1.0);
+                    if target[a] == 0.0 && self.vel[a].abs() < 0.05 {
+                        self.vel[a] = 0.0;
+                    }
+                }
+                // La vitesse ne grandit pas plus vite que `FLY_ACCEL` (changer de
+                // direction ou ralentir reste immédiat).
+                let (now, most) = (self.vel.length(), before + FLY_ACCEL * dt);
+                if now > most {
+                    self.vel *= most / now;
                 }
             }
         } else if fps {
@@ -1969,6 +1987,108 @@ mod stop_tests {
                 "vol {flying}, saut {jump} : glisse {slid} blocs, arrêt {stopped:?}"
             );
         }
+    }
+
+    /// Vol : un appui bref avance peu (on peut s'approcher d'un mur sans le percuter),
+    /// lâcher les touches arrête sur place, la pleine vitesse vient vite quand même, et
+    /// rien ne ralentit près des blocs : le long d'un mur on garde toute sa vitesse.
+    #[test]
+    fn flying_taps_move_little_and_releasing_stops_on_the_spot() {
+        let mut w = World::new(0);
+        for x in -2..2 {
+            for z in -8..2 {
+                w.insert_empty(minelib_world::ChunkPos { x, z });
+            }
+        }
+        let dt = crate::session::SIM_TICK;
+        let go = MoveInput {
+            forward: 1.0,
+            sprint: true,
+            ..Default::default()
+        };
+        let start = || {
+            let mut p = Player::new(Vec3::new(0.5, 70.0, 0.5));
+            p.pitch = 0.0;
+            p.flying = true;
+            p
+        };
+        // (durée de l'appui en courant, chemin parcouru au plus, en blocs)
+        for (tap, most) in [(0.1, 0.4), (0.15, 0.8), (0.2, 1.3), (0.3, 2.9)] {
+            let mut p = start();
+            for _ in 0..(tap / dt) as usize {
+                p.update(&w, &go, dt);
+            }
+            let at = p.pos;
+            p.update(&w, &MoveInput::default(), dt);
+            assert_eq!(p.vel, Vec3::ZERO, "arrêt sur place");
+            for _ in 0..64 {
+                p.update(&w, &MoveInput::default(), dt);
+            }
+            assert_eq!(p.pos, at, "plus aucun déplacement après le relâchement");
+            let moved = 0.5 - p.pos.z;
+            assert!(
+                moved > 0.05 && moved < most,
+                "appui de {tap} s : {moved} bloc"
+            );
+        }
+        // Pleine vitesse en moins de 0,7 s.
+        let mut p = start();
+        for _ in 0..(0.7 / dt) as usize {
+            p.update(&w, &go, dt);
+        }
+        assert!(p.vel.length() > 29.0, "{}", p.vel.length());
+        // Sans courir : comme avant (10 blocs/s atteints en un quart de seconde).
+        let mut p = start();
+        let walk = MoveInput {
+            forward: 1.0,
+            ..Default::default()
+        };
+        for _ in 0..(0.25 / dt) as usize {
+            p.update(&w, &walk, dt);
+        }
+        assert!(p.vel.length() > 10.0, "{}", p.vel.length());
+        // Le long d'un mur, en appuyant aussi vers lui : rien ne ralentit.
+        for z in -100..10 {
+            for y in 60..80 {
+                w.set(2, y, z, minelib_world::BlockId::STONE);
+            }
+        }
+        let mut p = Player::new(Vec3::new(1.0, 70.0, 5.5));
+        p.pitch = 0.0;
+        p.flying = true;
+        let along = MoveInput {
+            forward: 1.0,
+            strafe: 1.0,
+            sprint: true,
+            ..Default::default()
+        };
+        for _ in 0..384 {
+            p.update(&w, &along, dt);
+        }
+        assert!((p.pos.x + HALF_WIDTH - 2.0).abs() < 1e-3, "contre le mur");
+        assert!(p.vel.z < -21.0, "vitesse le long du mur : {}", p.vel.z);
+        // Droit vers un mur, touche gardée : pleine vitesse jusqu'au contact.
+        let mut w = World::new(0);
+        for x in -2..2 {
+            for z in -4..2 {
+                w.insert_empty(minelib_world::ChunkPos { x, z });
+            }
+        }
+        for x in -8..8 {
+            for y in 60..80 {
+                w.set(x, y, -30, minelib_world::BlockId::STONE);
+            }
+        }
+        let mut p = start();
+        let mut fastest: f32 = 0.0;
+        for _ in 0..512 {
+            p.update(&w, &go, dt);
+            if p.pos.z - HALF_WIDTH + 29.0 < 1.0 {
+                fastest = fastest.max(-p.vel.z);
+            }
+        }
+        assert!((p.pos.z - HALF_WIDTH + 29.0).abs() < 1e-3, "au contact");
+        assert!(fastest > 29.0, "à un bloc du mur : {fastest} blocs/s");
     }
 
     /// Journal des arrêts : la distance au mur devant le joueur (en vol, tout obstacle ;
