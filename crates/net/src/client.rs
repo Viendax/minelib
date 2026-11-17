@@ -69,6 +69,16 @@ pub enum Cmd {
         mac: [u8; 32],
         cert: Option<crate::sovereign::Cert>,
     },
+    /// Hôte d'un relais de région rattaché à une province (v138) : entre chez le relais de
+    /// la province avec le jeton du relais du monde (voir `proto::province_token`).
+    RegionHost {
+        room: u64,
+        region: [i32; 2],
+        slot: u16,
+        pseudo: String,
+        signer: [u8; 32],
+        token: [u8; 32],
+    },
     TotpBegin,
     TotpConfirm(u32),
     TotpDisable(u32),
@@ -319,7 +329,14 @@ pub enum Event {
         secret: [u8; 32],
         slot: u16,
         root: [u8; 32],
+        province: Option<proto::ProvinceAt>,
     },
+    /// Provinces (v138), à l'hôte d'un relais de province : `Response::ProvinceTask`,
+    /// `ProvinceSeed`, `ProvinceLeased`, `ProvinceArchived`, `ProvinceStop` ; aux joueurs
+    /// d'une province : `ProvinceMark`, `ProvinceConfirmed` (passés tels quels).
+    Province(Response),
+    /// Aux joueurs : provinces confiées à un relais de province, en vue.
+    Provinces(Vec<proto::ProvinceInfo>),
     /// Hôte d'un relais de région : les relais prêts de sa région, et son époque si elle
     /// est souveraine.
     ShardPeers {
@@ -355,6 +372,7 @@ pub enum Event {
     RootEdits {
         region: [i32; 2],
         edits: Vec<crate::sovereign::Edit>,
+        certs: Vec<crate::sovereign::Cert>,
     },
     /// Héberger le relais de secours d'un monde (voir `Response::StandbyTask`).
     StandbyTask {
@@ -774,15 +792,33 @@ impl Worker {
                 secret,
                 slot,
                 root,
+                province,
             } => Event::ShardTask {
                 room,
                 region,
                 secret,
                 slot,
                 root,
+                province,
             },
+            r @ (Response::ProvinceTask { .. }
+            | Response::ProvinceSeed { .. }
+            | Response::ProvinceLeased { .. }
+            | Response::ProvinceArchived { .. }
+            | Response::ProvinceMark { .. }
+            | Response::ProvinceConfirmed { .. }
+            | Response::ProvinceStop { .. }) => Event::Province(r),
+            Response::Provinces { list } => Event::Provinces(list),
             Response::ShardPeers { region, list, sov } => Event::ShardPeers { region, list, sov },
-            Response::RootEdits { region, edits } => Event::RootEdits { region, edits },
+            Response::RootEdits {
+                region,
+                edits,
+                certs,
+            } => Event::RootEdits {
+                region,
+                edits,
+                certs,
+            },
             Response::StandbyTask { room, root, info } => Event::StandbyTask { room, root, info },
             r @ (Response::Replica { .. }
             | Response::ReplicaBag { .. }
@@ -1080,6 +1116,39 @@ impl Worker {
                         });
                         let _ = (map, map_sig);
                         self.emit(Event::TakenOver { room, host });
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
+            }
+            Cmd::RegionHost {
+                room,
+                region,
+                slot,
+                pseudo,
+                signer,
+                token,
+            } => {
+                self.chan = None;
+                self.connect()?;
+                match self.request(&Request::RegionHost {
+                    room,
+                    region,
+                    slot,
+                    pseudo,
+                    signer,
+                    token,
+                })? {
+                    Response::Welcome { pseudo, .. } => {
+                        self.pseudo = pseudo.clone();
+                        if let Some(c) = &self.chan {
+                            self.emit(Event::Link(c.pusher()));
+                        }
+                        self.emit(Event::LoggedIn {
+                            pseudo,
+                            fingerprint: String::new(),
+                            totp: false,
+                        });
                         Ok(())
                     }
                     r => self.unexpected(r),

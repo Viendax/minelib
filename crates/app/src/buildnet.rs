@@ -34,7 +34,7 @@ use std::sync::mpsc::Sender;
 use glam::Vec3;
 use minelib_net::client::{Client, Cmd, Event};
 use minelib_net::game;
-use minelib_net::proto::{self, Request};
+use minelib_net::proto::{self, Request, Response};
 use minelib_net::transport::{self, Inbound};
 use minelib_world::{BlockId, ChunkPos, World};
 
@@ -143,6 +143,46 @@ struct Pending {
     last: (u16, bool),
 }
 
+/// Provinces (v138) : connexion au relais d'une province en vue (il décide des blocs de
+/// ses zones, à la place du relais du monde).
+struct ProvinceConn {
+    info: proto::ProvinceInfo,
+    client: Client,
+    link: Option<Sender<Inbound>>,
+    /// Entré dans la province (certificat accepté).
+    joined: bool,
+    /// Sans bail (le relais du monde va la reprendre, ou le monde est en pause) : les
+    /// modifications de ses zones attendent.
+    paused: bool,
+    sent_chunk: Option<[i32; 2]>,
+    served_sent: Option<Vec<[i32; 2]>>,
+    /// Relais de ses régions (annoncés par elle).
+    shards: Vec<proto::ShardInfo>,
+    /// Numéro de cette connexion (comme pour un relais de région : ce qu'elle remet reste
+    /// en doute jusqu'à ce que le relais du monde l'ait gardé, voir `ProvinceConfirmed`).
+    serial: u64,
+    /// Blocs reçus depuis sa dernière marque, et ceux de chaque envoi marqué pas encore
+    /// confirmé : (case, rang).
+    unmarked: Marked,
+    marked: std::collections::VecDeque<(u64, Marked)>,
+}
+
+/// Blocs remis par un relais de province dans un même envoi : (case, rang).
+type Marked = Vec<([i32; 3], u64)>;
+
+/// Qui décide des blocs d'un chunk.
+enum Authority {
+    /// Le relais du monde.
+    Root,
+    /// Un relais de province prêt (sa connexion).
+    Province(Sender<Inbound>),
+    /// Un relais de province pas encore prêt (connexion en cours, sans bail) : on attend.
+    Waiting,
+}
+
+/// Un relais de province perdu est rappelé au plus toutes les… (s).
+const PROVINCE_RETRY: f32 = 1.0;
+
 pub struct BuildNet {
     link: Sender<Inbound>,
     owner: bool,
@@ -205,6 +245,15 @@ pub struct BuildNet {
     /// Monde en pause (son relais n'entend plus assez de gardiens, voir
     /// `minelib_net::guard`) : les modifications du joueur attendent la reprise.
     paused: bool,
+    /// Provinces (v138) servies par un relais de province, en vue (liste du relais du
+    /// monde), et la connexion à chacune ; relais de région annoncés par le relais du monde
+    /// (hors de ces provinces) ; province dont vient le message en cours (elle ne décide
+    /// que des blocs de ses zones) ; prochain rappel d'une province perdue.
+    province_list: Vec<proto::ProvinceInfo>,
+    provinces: HashMap<[i32; 2], ProvinceConn>,
+    shards_root: Vec<proto::ShardInfo>,
+    from_province: Option<proto::ProvinceInfo>,
+    province_retry: f32,
 }
 
 /// Bloc remis par un relais de région : celui d'avant, celui remis, son rang ; et si
@@ -377,6 +426,11 @@ impl BuildNet {
             bulks: HashMap::new(),
             next_bulk: 0,
             shards: Shards::default(),
+            province_list: Vec::new(),
+            provinces: HashMap::new(),
+            shards_root: Vec::new(),
+            from_province: None,
+            province_retry: 0.0,
         }
     }
 
@@ -385,13 +439,235 @@ impl BuildNet {
         self.shards.node_dir = Some(dir);
     }
 
-    /// Relais des régions du monde (envoyé par le relais du monde).
+    /// Relais des régions du monde (envoyé par le relais du monde ; ceux des provinces
+    /// servies par un relais de province viennent de lui).
     pub fn set_shards(&mut self, list: Vec<proto::ShardInfo>) {
+        self.shards_root = list;
+        self.rebuild_shards();
+    }
+
+    /// Liste des relais de région : chaque région d'après celui qui en décide (relais du
+    /// monde, ou relais de sa province).
+    fn rebuild_shards(&mut self) {
         self.shards.pseudo = self.pseudo.clone();
         self.shards.list.clear();
-        for i in list {
-            self.shards.list.entry(i.region).or_default().push(i);
+        let delegated = |r: [i32; 2]| self.province_list.iter().any(|p| p.has(r));
+        let from_root = self.shards_root.iter().filter(|i| !delegated(i.region));
+        let from_provinces = self
+            .provinces
+            .values()
+            .flat_map(|c| c.shards.iter().filter(|i| c.info.has(i.region)));
+        for i in from_root.chain(from_provinces) {
+            self.shards
+                .list
+                .entry(i.region)
+                .or_default()
+                .push(i.clone());
         }
+    }
+
+    /// Provinces (v138) servies par un relais de province, en vue (liste du relais du
+    /// monde). Une province qui n'y est plus revient au relais du monde : ce qui y attendait
+    /// sa réponse lui repart.
+    pub fn set_provinces(&mut self, list: Vec<proto::ProvinceInfo>) {
+        let gone: Vec<[i32; 2]> = self
+            .provinces
+            .iter()
+            .filter(|(p, c)| {
+                !list
+                    .iter()
+                    .any(|i| i.province == **p && i.same_relay(&c.info))
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        for p in &gone {
+            if let Some(c) = self.provinces.remove(p) {
+                self.forget_shard(c.serial);
+            }
+        }
+        let back: Vec<proto::ProvinceInfo> = self
+            .province_list
+            .iter()
+            .filter(|i| !list.iter().any(|j| j.province == i.province))
+            .cloned()
+            .collect();
+        self.province_list = list;
+        self.province_retry = 0.0;
+        self.rebuild_shards();
+        for i in back {
+            log::info!(
+                "construction : province {:?} reprise par le relais du monde",
+                i.province
+            );
+            self.resend_in(|r| i.has(r));
+        }
+    }
+
+    /// Qui décide des blocs du chunk `chunk`.
+    fn authority(&self, chunk: [i32; 2]) -> Authority {
+        let region = proto::region_of(chunk);
+        let Some(info) = self.province_list.iter().find(|i| i.has(region)) else {
+            return Authority::Root;
+        };
+        match self.provinces.get(&info.province) {
+            Some(c) if c.joined && !c.paused => match &c.link {
+                Some(l) => Authority::Province(l.clone()),
+                None => Authority::Waiting,
+            },
+            _ => Authority::Waiting,
+        }
+    }
+
+    /// Les modifications en attente dans les régions choisies par `keep` repartent (à qui
+    /// en décide maintenant).
+    fn resend_in(&mut self, keep: impl Fn([i32; 2]) -> bool) {
+        let list: Vec<([i32; 3], (u16, bool))> = self
+            .pending
+            .iter()
+            .filter(|(p, _)| keep(proto::region_of(chunk_of(p[0], p[2]))))
+            .map(|(p, v)| (*p, v.last))
+            .collect();
+        for (pos, (block, fluid)) in list {
+            let provisional = self.send_edit(pos, block, fluid);
+            if let Some(p) = self.pending.get_mut(&pos) {
+                p.count = 1;
+                p.age = 0.0;
+                p.signed = provisional.then_some((block, fluid));
+            }
+        }
+    }
+
+    /// Relais de province : connexions (entrée avec le certificat de la clé du compte),
+    /// messages reçus. Renvoie les chunks à remailler.
+    fn pump_provinces(&mut self, world: &mut World, chunk: [i32; 2], dt: f32) -> Vec<ChunkPos> {
+        let mut dirty = Vec::new();
+        // Connexions manquantes (une province perdue est rappelée toutes les
+        // `PROVINCE_RETRY` s).
+        self.province_retry -= dt;
+        let cert = self
+            .shards
+            .ticket
+            .as_ref()
+            .and_then(|t| t.4.clone())
+            .filter(|c| c.pseudo.eq_ignore_ascii_case(&self.pseudo));
+        if self.province_retry <= 0.0 {
+            self.province_retry = PROVINCE_RETRY;
+            if let (Some(key), Some(cert)) = (self.identity.clone(), cert) {
+                for info in &self.province_list {
+                    if self.provinces.contains_key(&info.province) {
+                        continue;
+                    }
+                    let client = crate::province_host::dial(info, self.shards.node_dir.clone());
+                    client.send(Cmd::Takeover {
+                        cert: cert.clone(),
+                        key: key.clone(),
+                        expect: None,
+                    });
+                    self.shards.serial += 1;
+                    self.provinces.insert(
+                        info.province,
+                        ProvinceConn {
+                            info: info.clone(),
+                            client,
+                            link: None,
+                            joined: false,
+                            paused: true,
+                            sent_chunk: None,
+                            served_sent: None,
+                            shards: Vec::new(),
+                            serial: self.shards.serial,
+                            unmarked: Vec::new(),
+                            marked: std::collections::VecDeque::new(),
+                        },
+                    );
+                }
+            }
+        }
+        let mut received = Vec::new();
+        let mut broken = Vec::new();
+        let mut ready = Vec::new();
+        let mut shards_changed = false;
+        let mut confirmed = Vec::new();
+        for (p, c) in &mut self.provinces {
+            while let Some(e) = c.client.poll() {
+                match e {
+                    Event::Link(l) => c.link = Some(l),
+                    // Ce qu'elle a remis jusqu'ici part au relais du monde dans cet envoi ;
+                    // gardé par lui, ce n'est plus en doute.
+                    Event::Province(Response::ProvinceMark { n }) => {
+                        let list = std::mem::take(&mut c.unmarked);
+                        c.marked.push_back((n, list));
+                    }
+                    Event::Province(Response::ProvinceConfirmed { n }) => {
+                        while c.marked.front().is_some_and(|(m, _)| *m <= n) {
+                            let (_, list) = c.marked.pop_front().expect("envoi");
+                            confirmed.push((c.serial, list));
+                        }
+                    }
+                    Event::TakenOver { .. } => {
+                        c.joined = true;
+                        c.sent_chunk = None;
+                        c.served_sent = None;
+                    }
+                    Event::FromZone { chunk, data, .. } => received.push((*p, chunk, data)),
+                    Event::Paused(on) => {
+                        if c.paused && !on && c.joined {
+                            ready.push(c.info.clone());
+                        }
+                        c.paused = on;
+                    }
+                    Event::Shards(list) => {
+                        c.shards = list;
+                        shards_changed = true;
+                    }
+                    Event::RoomClosed | Event::Error(_) | Event::Offline(_) | Event::Lost => {
+                        log::info!("construction : relais de la province {p:?} perdu");
+                        broken.push(*p);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // Il doit savoir où l'on est (ce qu'il nous envoie).
+            if c.joined && c.sent_chunk != Some(chunk) {
+                c.sent_chunk = Some(chunk);
+                if let Some(l) = &c.link {
+                    transport::push(l, &Request::Position { chunk });
+                }
+            }
+        }
+        for (serial, list) in confirmed {
+            if let Some(m) = self.heard.get_mut(&serial) {
+                for (pos, seq) in list {
+                    if m.get(&pos).is_some_and(|h| h.seq <= seq) {
+                        m.remove(&pos);
+                    }
+                }
+            }
+        }
+        for p in broken {
+            if let Some(c) = self.provinces.remove(&p) {
+                shards_changed |= !c.shards.is_empty();
+                // Ce qu'elle a remis sans que le relais du monde l'ait gardé : en doute.
+                self.forget_shard(c.serial);
+            }
+        }
+        if shards_changed {
+            self.rebuild_shards();
+        }
+        for (p, c, data) in received {
+            let Some(info) = self.provinces.get(&p).map(|c| c.info.clone()) else {
+                continue;
+            };
+            self.from_province = Some(info);
+            dirty.extend(self.receive(0, c, &data, world));
+        }
+        self.from_province = None;
+        // Un relais de province qui sert de nouveau (ou enfin) : ce qui attendait part.
+        for info in ready {
+            self.resend_in(|r| info.has(r));
+        }
+        dirty
     }
 
     /// Billet pour les relais de région, et certificat de la clé du compte.
@@ -424,7 +700,11 @@ impl BuildNet {
     pub fn set_link(&mut self, link: Sender<Inbound>) {
         self.link = link;
         self.shards.list.clear();
+        self.shards_root.clear();
         self.shards.ticket = None;
+        // (Le relais repris sert tout lui-même : plus de provinces.)
+        self.province_list.clear();
+        self.provinces.clear();
         self.served_sent.clear();
         let chunk = self.chunk.take();
         self.caps_sent = false;
@@ -458,10 +738,8 @@ impl BuildNet {
         let list: Vec<([i32; 3], (u16, bool))> =
             self.pending.iter().map(|(p, v)| (*p, v.last)).collect();
         for (pos, (block, fluid)) in list {
-            let signed = chunk.is_some_and(|c| self.send_signed(pos, block, fluid, c));
-            if !signed {
-                self.send_edit(pos, block, fluid);
-            }
+            let signed = chunk.is_some_and(|c| self.send_signed(pos, block, fluid, c))
+                || self.send_edit(pos, block, fluid);
             if let Some(p) = self.pending.get_mut(&pos) {
                 p.count = 1;
                 p.age = 0.0;
@@ -514,12 +792,62 @@ impl BuildNet {
         )
     }
 
-    /// Demande au relais du monde.
-    fn send_edit(&self, pos: [i32; 3], block: u16, fluid: bool) {
-        self.send(Request::ToZone {
-            chunk: chunk_of(pos[0], pos[2]),
-            data: game::encode(&BuildMsg::Edit { pos, block, fluid }),
-        });
+    /// Demande à celui qui décide des blocs de cette case : le relais du monde, ou le
+    /// relais de sa province (v138 : signée par la clé du compte, il ne signe jamais à la
+    /// place d'un joueur). Province pas encore prête : elle attend (renvoyée quand elle
+    /// l'est).
+    ///
+    /// Vrai si elle est partie à un relais de province (sa confirmation reste en doute
+    /// comme celle d'un relais de région : voir `Pending::signed`).
+    fn send_edit(&mut self, pos: [i32; 3], block: u16, fluid: bool) -> bool {
+        let chunk = chunk_of(pos[0], pos[2]);
+        match self.authority(chunk) {
+            Authority::Root => {
+                self.send(Request::ToZone {
+                    chunk,
+                    data: game::encode(&BuildMsg::Edit { pos, block, fluid }),
+                });
+                false
+            }
+            Authority::Province(l) => {
+                let at = self.chunk.unwrap_or(chunk);
+                let data = match self.sign_edit(pos, block, fluid, at) {
+                    Some(e) => game::encode(&BuildMsg::Signed(e)),
+                    None => game::encode(&BuildMsg::Edit { pos, block, fluid }),
+                };
+                transport::push(&l, &Request::ToZone { chunk, data });
+                true
+            }
+            Authority::Waiting => false,
+        }
+    }
+
+    /// La modification signée par la clé du compte (avec le billet du monde).
+    fn sign_edit(
+        &mut self,
+        pos: [i32; 3],
+        block: u16,
+        fluid: bool,
+        at: [i32; 2],
+    ) -> Option<minelib_net::sovereign::Edit> {
+        let key = self.identity.as_ref()?;
+        let (room, ..) = self.shards.ticket.as_ref()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        // Dates strictement croissantes (deux modifications dans la même milliseconde).
+        self.sign_t = (self.sign_t + 1).max(now);
+        Some(minelib_net::sovereign::Edit::sign(
+            key,
+            *room,
+            &self.pseudo,
+            pos,
+            block,
+            fluid,
+            at,
+            self.sign_t,
+            false,
+        ))
     }
 
     /// La dernière modification de `pos`, partie signée à un relais de région, est refusée
@@ -703,10 +1031,9 @@ impl BuildNet {
             // principal le fait (voir `minelib_net::sovereign`). Le bloc d'avant est gardé
             // pour un refus.
             let fluid = fluid_edit(old, id);
-            let signed = self.send_signed(pos, id.0, fluid, chunk);
-            if !signed {
-                self.send_edit(pos, id.0, fluid);
-            }
+            // (Relais de région, ou de province : sa confirmation reste en doute.)
+            let signed =
+                self.send_signed(pos, id.0, fluid, chunk) || self.send_edit(pos, id.0, fluid);
             let p = self.pending.entry(pos).or_insert(Pending {
                 old,
                 count: 0,
@@ -719,12 +1046,30 @@ impl BuildNet {
             p.signed = signed.then_some((id.0, fluid));
             p.last = (id.0, fluid);
         }
-        // Sans réponse du relais : la modification n'a pas eu lieu (en pause, on attend).
+        // Sans réponse du relais : la modification n'a pas eu lieu (en pause, on attend ;
+        // de même dans une province dont le relais n'est pas prêt).
         let mut dirty = Vec::new();
         let mut expired = Vec::new();
+        let waiting: Vec<[i32; 2]> = self
+            .province_list
+            .iter()
+            .filter(|i| {
+                self.provinces
+                    .get(&i.province)
+                    .is_none_or(|c| !c.joined || c.paused || c.link.is_none())
+            })
+            .map(|i| i.province)
+            .collect();
+        let size = self.province_list.first().map_or(1, |i| i.size);
         for (pos, p) in &mut self.pending {
             if self.paused {
                 break;
+            }
+            if !waiting.is_empty() {
+                let r = proto::region_of(chunk_of(pos[0], pos[2]));
+                if waiting.contains(&proto::province_of(r, size)) {
+                    continue;
+                }
             }
             p.age += dt;
             if p.age > PENDING_TIMEOUT {
@@ -753,14 +1098,14 @@ impl BuildNet {
             // au relais du monde (rien ne se perd pour un joueur honnête, même quand l'hôte
             // de la région triche ou tombe).
             if let Some(fluid) = h.mine {
-                self.send_edit(pos, h.got.0, fluid);
+                let provisional = self.send_edit(pos, h.got.0, fluid);
                 self.pending.insert(
                     pos,
                     Pending {
                         old: h.pre,
                         count: 1,
                         age: 0.0,
-                        signed: None,
+                        signed: provisional.then_some((h.got.0, fluid)),
                         last: (h.got.0, fluid),
                     },
                 );
@@ -787,6 +1132,8 @@ impl BuildNet {
             log::info!("construction : pas de réponse du relais pour {pos:?}, annulé");
             dirty.extend(world.set_remote(pos[0], pos[1], pos[2], old));
         }
+        // Relais de province en vue (v138) : connexions, messages reçus.
+        dirty.extend(self.pump_provinces(world, chunk, dt));
         // Relais de région en vue : connexions, messages reçus.
         let before: Vec<u64> = self.shards.conns.values().map(|c| c.serial).collect();
         self.shards.keep_near(chunk);
@@ -844,7 +1191,24 @@ impl BuildNet {
         served.sort_unstable();
         if served != self.served_sent {
             self.served_sent = served.clone();
-            self.send(Request::Served { regions: served });
+            self.send(Request::Served {
+                regions: served.clone(),
+            });
+        }
+        // (Et à chaque relais de province, celles de ses régions.)
+        for c in self.provinces.values_mut().filter(|c| c.joined) {
+            let mine: Vec<[i32; 2]> = served.iter().copied().filter(|r| c.info.has(*r)).collect();
+            if c.served_sent.as_ref() != Some(&mine) {
+                if let Some(l) = &c.link {
+                    transport::push(
+                        l,
+                        &Request::Served {
+                            regions: mine.clone(),
+                        },
+                    );
+                    c.served_sent = Some(mine);
+                }
+            }
         }
         for (serial, c, data) in received {
             self.from_shard = Some(serial);
@@ -985,7 +1349,7 @@ impl BuildNet {
             // Objets au sol et coffres : états publiés par le relais du monde (jamais par un
             // joueur, `peer` 0, ni par un relais de région).
             BuildMsg::Item { .. } | BuildMsg::Slot { .. } | BuildMsg::Denied { .. } => {
-                if peer == 0 && self.from_shard.is_none() {
+                if peer == 0 && self.from_shard.is_none() && self.from_province.is_none() {
                     self.item_inbox.push(msg);
                 }
                 Vec::new()
@@ -996,6 +1360,14 @@ impl BuildNet {
             | BuildMsg::ChestPut { .. }
             | BuildMsg::ChestTake { .. } => Vec::new(),
             BuildMsg::Reject { pos, .. } => {
+                // (Un relais de province ne refuse que dans ses zones.)
+                if self
+                    .from_province
+                    .as_ref()
+                    .is_some_and(|i| !i.has(proto::region_of(chunk_of(pos[0], pos[2]))))
+                {
+                    return Vec::new();
+                }
                 // Refusé par le relais d'une région souveraine (son hôte principal vient de
                 // changer, ou il ne l'est plus) : la demande repart au relais du monde.
                 if self.from_shard.is_some() && self.retry_at_root(pos) {
@@ -1179,7 +1551,23 @@ impl BuildNet {
         if block as usize >= minelib_world::registry::registry().len() {
             return Vec::new();
         }
-        if self.from_shard.is_none() {
+        // Un relais de province ne décide que des blocs de ses zones.
+        if self
+            .from_province
+            .as_ref()
+            .is_some_and(|i| !i.has(proto::region_of(chunk_of(pos[0], pos[2]))))
+        {
+            return Vec::new();
+        }
+        // (Un relais de province décide, mais ce qu'il remet reste en doute jusqu'à ce que
+        // le relais du monde l'ait gardé : voir `ProvinceConfirmed`.)
+        let province = self
+            .from_province
+            .as_ref()
+            .and_then(|i| self.provinces.get(&i.province))
+            .map(|c| c.serial);
+        let source = self.from_shard.or(province);
+        if source.is_none() {
             self.settle(pos, seq);
         }
         // L'ordre du relais du monde : plus ancienne que ce qu'on a déjà pour cette case
@@ -1190,9 +1578,16 @@ impl BuildNet {
         if self.seen.len() >= SEEN_MAX {
             self.seen.clear();
         }
-        self.seen.insert(pos, (seq, self.from_shard));
-        if let Some(s) = self.from_shard {
+        self.seen.insert(pos, (seq, source));
+        if let Some(s) = source {
             self.note_heard(s, pos, block, seq, world);
+        }
+        if let Some(c) = self
+            .from_province
+            .as_ref()
+            .and_then(|i| self.provinces.get_mut(&i.province))
+        {
+            c.unmarked.push((pos, seq));
         }
         // Ce que publie le relais fait foi (et confirme une modification en attente).
         self.confirm(pos, BlockId(block));
@@ -1267,6 +1662,10 @@ mod tests {
         audits: u32,
         /// Voix (sans micro : bonjours et clés seulement), acheminée comme dans le jeu.
         voice: Option<crate::voice::Voice>,
+        /// Provinces (v138, connexion de garant) : relais de province tenu par ce joueur,
+        /// et relais de région rattaché au relais de sa province.
+        province: Option<crate::province_host::ProvinceHost>,
+        attach: Option<crate::province_host::RegionAttach>,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -1333,6 +1732,8 @@ mod tests {
                 cert: None,
                 audits: 0,
                 voice: None,
+                province: None,
+                attach: None,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
@@ -1372,6 +1773,8 @@ mod tests {
                 cert: None,
                 audits: 0,
                 voice: None,
+                province: None,
+                attach: None,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b.c.send(Cmd::GarantAvailable(true));
@@ -1449,6 +1852,36 @@ mod tests {
                     self.standby = None;
                 }
             }
+            // Provinces (comme `garant_worker`) : relais de région rattaché, relais de
+            // province tenu ici.
+            let mut closed = false;
+            if let Some(a) = self.attach.as_mut() {
+                while let Some(e) = a.client.poll() {
+                    if crate::province_host::attach_event(
+                        a,
+                        &mut self.shard,
+                        e,
+                        self.identity.as_ref(),
+                        false,
+                    ) {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            if closed {
+                self.attach = None;
+                self.shard = None;
+                self.c.send(Cmd::Leave);
+            }
+            if let (Some(p), Some(l)) = (self.province.as_mut(), &self.link) {
+                for r in p.tick() {
+                    transport::push(l, &r);
+                }
+            }
+            if self.province.as_ref().is_some_and(|p| p.stopped) {
+                self.province = None;
+            }
             let key = self.identity.clone();
             self.witnesses.retain(|_, w| w.pump(key.as_ref()));
             for w in self.witnesses.values().filter(|w| w.voted()) {
@@ -1477,7 +1910,68 @@ mod tests {
                     secret,
                     slot,
                     root,
+                    province: Some(at),
                 } => {
+                    self.shard = None;
+                    let signer = self
+                        .identity
+                        .as_ref()
+                        .map_or([0; 32], |k| k.verifying_key().to_bytes());
+                    self.attach = Some(crate::province_host::RegionAttach::connect(
+                        room, region, secret, slot, root, at, &self.name, signer, None,
+                    ));
+                }
+                Event::Province(Response::ProvinceTask {
+                    room,
+                    province,
+                    size,
+                    epoch,
+                    secret,
+                    root,
+                    info,
+                }) => {
+                    if let Some(l) = &self.link {
+                        if self.province.is_none() {
+                            self.province = crate::province_host::ProvinceHost::start(
+                                room, province, size, epoch, secret, root, info, l, false,
+                            );
+                        }
+                    }
+                }
+                Event::Province(r) => {
+                    if let Response::ProvinceStop {
+                        room, province: p, ..
+                    } = &r
+                    {
+                        if self
+                            .attach
+                            .as_ref()
+                            .is_some_and(|a| a.room == *room && a.province == *p)
+                        {
+                            self.attach = None;
+                            self.shard = None;
+                        }
+                    }
+                    if let (Some(h), Some(l)) = (self.province.as_mut(), &self.link) {
+                        for req in h.event(&r) {
+                            transport::push(l, &req);
+                        }
+                    }
+                }
+                Event::Provinces(list) => {
+                    if let Some(n) = &mut self.net {
+                        n.set_provinces(list);
+                    }
+                }
+                Event::ShardTask {
+                    room,
+                    region,
+                    secret,
+                    slot,
+                    root,
+                    province: None,
+                } => {
+                    self.attach = None;
                     let link = self.link.clone().expect("file d'envoi");
                     self.shard = crate::garant_worker::ShardHost::start(
                         room,
@@ -1490,14 +1984,14 @@ mod tests {
                         self.identity.clone(),
                     );
                 }
-                Event::ShardPeers { list, sov, .. } => {
+                Event::ShardPeers { list, sov, .. } if self.attach.is_none() => {
                     if let Some(s) = &self.shard {
                         s.set_peers(&list, sov);
                     }
                 }
-                Event::RootEdits { edits, .. } => {
+                Event::RootEdits { edits, certs, .. } if self.attach.is_none() => {
                     if let Some(s) = &self.shard {
-                        s.root_edits(edits);
+                        s.root_edits(edits, certs);
                     }
                 }
                 // (Comme `garant_worker` : vérifie les lots d'autres régions qu'on lui
@@ -1509,7 +2003,7 @@ mod tests {
                         self.audits += 1;
                     }
                 }
-                Event::WorldBeat { room, paused } => {
+                Event::WorldBeat { room, paused } if self.attach.is_none() => {
                     if let Some(s) = self.shard.as_ref().filter(|s| s.room == room) {
                         s.world_beat(paused);
                     }
@@ -1556,6 +2050,7 @@ mod tests {
                 }
                 Event::RoomClosed => {
                     self.shard = None;
+                    self.attach = None;
                     if self.standby.as_ref().is_some_and(|s| !s.taken) {
                         self.standby = None;
                     }
@@ -1576,8 +2071,9 @@ mod tests {
                         n.receive(peer, chunk, &data, &mut self.world);
                     }
                     // Hôte d'un relais de région : ce que publie le relais du monde
-                    // part à ses joueurs (comme dans `garant_worker`).
-                    if let Some(s) = &self.shard {
+                    // part à ses joueurs (comme dans `garant_worker`) ; rattaché à sa
+                    // province, c'est d'elle que ça vient.
+                    if let (Some(s), None) = (&self.shard, &self.attach) {
                         s.seed(&data);
                     }
                 }
@@ -2646,6 +3142,310 @@ mod tests {
             voice: true,
             ..Default::default()
         });
+    }
+
+    /// Provinces (v138) : ce qui arrive à l'hôte d'un relais de province pendant l'essai.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum ProvinceFault {
+        None,
+        /// Son jeu tombe (plus rien ne part, plus personne n'est servi).
+        Crash,
+        /// Il s'en va proprement (la province est rendue au relais du monde).
+        Leaves,
+        /// Il est coupé du relais du monde, pas des joueurs : il s'arrête à la fin de son
+        /// bail, sans que le monde se sépare (ce qu'il a publié sans pouvoir l'archiver est
+        /// défait chez ceux qui l'avaient vu, ou renvoyé par son auteur).
+        Cut,
+    }
+
+    /// Terrain plat sur les chunks `xs` × 0..2 (sol en y = 10).
+    fn flat_on(xs: std::ops::Range<i32>) -> World {
+        let mut w = World::new(0);
+        for cx in xs.clone() {
+            for cz in 0..2 {
+                w.insert_empty(ChunkPos { x: cx, z: cz });
+            }
+        }
+        for x in xs.start * 16..xs.end * 16 {
+            for z in 0..32 {
+                w.set(x, 10, z, BlockId::STONE);
+            }
+        }
+        w.journal = Some(Vec::new());
+        w
+    }
+
+    /// Provinces de bout en bout (vrai relais du monde, vrais relais de province et de
+    /// région chez les joueurs d'autres mondes) : une province peuplée est confiée à un
+    /// relais de province ; une de ses régions, assez peuplée pour deux relais, y devient
+    /// souveraine ; on construit des deux côtés de la frontière avec la province voisine,
+    /// et un joueur passe d'une province à l'autre. À la fin, tous les mondes sont
+    /// identiques case par case à celui du propriétaire (qui reçoit tout du relais du
+    /// monde), et rien n'est en attente — quoi qu'il arrive à l'hôte de la province.
+    fn province_world(fault: ProvinceFault) {
+        let dir = std::env::temp_dir().join(format!("minelib-provinces-{}", rand_u32()));
+        let names = ["Garant", "Garant2", "Garant3", "Garant4"];
+        for n in names {
+            minelib_relay::test_seed_games(&dir, n, 5);
+        }
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        // Une région de 2 joueurs a son relais, deux à partir de 4 (souveraine) ; une
+        // province (une région) reçoit son relais à partir de 3 joueurs.
+        h.set_shard_from(2);
+        h.set_shard_share(2);
+        h.set_provinces(1, 3);
+        let addr = h.addr.to_string();
+        // Quatre autres mondes, dont les joueurs prêtent leur connexion de garant.
+        let mut hosts: Vec<(Bot, Bot)> = names
+            .iter()
+            .enumerate()
+            .map(|(k, name)| {
+                let mut w = Bot::new(&addr, h.public, name, false);
+                w.c.send(Cmd::Host {
+                    kind: 1,
+                    name: format!("Ailleurs{k}"),
+                    map: format!("ailleurs{k}"),
+                    map_sig: [20 + k as u8; 32],
+                    max_players: 0,
+                });
+                w.wait(|e| matches!(e, Event::Hosted(_)));
+                let g = Bot::new(&addr, h.public, name, true);
+                g.c.send(Cmd::GarantAvailable(true));
+                (w, g)
+            })
+            .collect();
+        // Le monde : le propriétaire et un joueur à l'ouest de la frontière (x < 512, la
+        // province [0, 0]), quatre joueurs à l'est (province [1, 0]).
+        let mut bots = vec![Bot::new(&addr, h.public, "Proprio", false)];
+        bots[0].c.send(Cmd::Host {
+            kind: 1,
+            name: "Provinces".into(),
+            map: "provinces".into(),
+            map_sig: [9; 32],
+            max_players: 0,
+        });
+        let mut room = None;
+        let t = Instant::now();
+        while room.is_none() {
+            while let Some(e) = bots[0].c.poll() {
+                match e {
+                    Event::Hosted(r) => room = Some(r),
+                    Event::Link(l) => bots[0].link = Some(l),
+                    _ => {}
+                }
+            }
+            assert!(t.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let room = room.unwrap();
+        bots[0].start_net(true);
+        for i in 1..6 {
+            let mut b = Bot::new(&addr, h.public, &format!("Joueur{i}"), false);
+            b.c.send(Cmd::Join(room));
+            b.wait(|e| matches!(e, Event::Joined { .. }));
+            b.start_net(false);
+            bots.push(b);
+        }
+        let west = |x: f32| x.clamp(488.0, 508.0);
+        let east = |x: f32| x.clamp(516.0, 540.0);
+        for (i, b) in bots.iter_mut().enumerate() {
+            b.world = flat_on(29..36);
+            b.pos = Vec3::new(if i < 2 { 498.0 } else { 528.0 }, 11.0, 16.0);
+        }
+        let mut seed = 777u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let dt = 0.02;
+        let mut edited = std::collections::BTreeSet::new();
+        let mut delegated_max = 0;
+        let mut attached_max = 0;
+        let mut ordered = 0u64;
+        let mut fault_at: Option<(Instant, [i32; 2])> = None;
+        let mut taken_back: Option<Duration> = None;
+        // 9 secondes de jeu, la panne au milieu (une fois la province servie).
+        for step in 0..450 {
+            let delegated = h.provinces_delegated();
+            delegated_max = delegated_max.max(delegated);
+            if fault != ProvinceFault::None && fault_at.is_none() && step >= 250 && delegated > 0 {
+                let g = hosts
+                    .iter_mut()
+                    .map(|(_, g)| g)
+                    .find(|g| g.province.is_some())
+                    .expect("hôte de la province");
+                let which = g.province.as_ref().expect("province").province;
+                match fault {
+                    ProvinceFault::Crash => {
+                        if let Some(p) = g.province.take() {
+                            p.kill();
+                        }
+                    }
+                    ProvinceFault::Leaves => {
+                        if let (Some(p), Some(l)) = (g.province.as_mut(), &g.link) {
+                            for r in p.release() {
+                                transport::push(l, &r);
+                            }
+                        }
+                    }
+                    ProvinceFault::Cut => {
+                        // (Plus rien ne part de lui vers le relais du monde.)
+                        let (tx, _) = std::sync::mpsc::channel();
+                        g.link = Some(tx);
+                    }
+                    ProvinceFault::None => {}
+                }
+                fault_at = Some((Instant::now(), which));
+            }
+            if let (Some((t, which)), None) = (fault_at, taken_back) {
+                if !h.delegated_provinces().contains(&which) {
+                    taken_back = Some(t.elapsed());
+                }
+            }
+            for (i, b) in bots.iter_mut().enumerate() {
+                let r = rnd();
+                let x = b.pos.x + (r % 3) as f32 - 1.0;
+                // Joueur2 passe d'une province à l'autre (aller vers l'ouest, puis retour).
+                b.pos.x = if i == 2 {
+                    if (100..300).contains(&step) {
+                        (b.pos.x - 0.2).max(490.0)
+                    } else {
+                        (b.pos.x + 0.2).min(535.0)
+                    }
+                } else if i < 2 {
+                    west(x)
+                } else {
+                    east(x)
+                };
+                b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(1.0, 30.0);
+                // ~3 blocs/s chacun, jusqu'à 12 blocs autour de soi (de l'autre côté de la
+                // frontière aussi).
+                if rnd() % 17 == 0 {
+                    let x = (b.pos.x as i32 - 12 + (rnd() % 25) as i32).clamp(29 * 16, 36 * 16 - 1);
+                    let z = (rnd() % 32) as i32;
+                    let y = 11 + (rnd() % 3) as i32;
+                    let block = if rnd() % 4 == 0 {
+                        BlockId::AIR
+                    } else {
+                        BlockId(1 + rnd() as u16 % 8)
+                    };
+                    b.world.set(x, y, z, block);
+                    edited.insert([x, y, z]);
+                }
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+                ordered = ordered.max(g.shard.as_ref().map_or(0, |s| s.ordered()));
+            }
+            attached_max =
+                attached_max.max(hosts.iter().filter(|(_, g)| g.attach.is_some()).count());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Tout se pose (confirmations, doutes, paquets du propriétaire).
+        for _ in 0..350 {
+            for b in bots.iter_mut() {
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!(
+            "provinces : {fault:?}, déléguées au plus {delegated_max}, relais de région \
+             rattachés {attached_max}, mises en ordre {ordered}, envois archivés {}, reprise \
+             après {taken_back:?}",
+            h.province_archives()
+        );
+        assert!(delegated_max >= 1, "la province peuplée a reçu son relais");
+        assert!(
+            h.province_archives() > 0,
+            "le relais du monde garde ce qu'elle publie"
+        );
+        assert!(
+            attached_max >= 2,
+            "ses relais de région se rattachent à elle"
+        );
+        assert!(
+            ordered > 0,
+            "sa région souveraine met en ordre ses modifications"
+        );
+        assert!(
+            edited.len() > 50,
+            "assez de modifications : {}",
+            edited.len()
+        );
+        if fault != ProvinceFault::None {
+            let t = taken_back.expect("la province revient au relais du monde");
+            assert!(
+                t < Duration::from_secs(3),
+                "reprise par le relais du monde en moins de 3 s : {t:?}"
+            );
+        }
+        for b in &bots {
+            assert_eq!(
+                b.net.as_ref().unwrap().pending(),
+                0,
+                "{} : en attente",
+                b.name
+            );
+        }
+        let mut differ = Vec::new();
+        let owner = &bots[0];
+        for b in &bots[1..] {
+            for p in &edited {
+                for y in 11..14 {
+                    let q = [p[0], y, p[2]];
+                    let (a, o) = (
+                        b.world.get(q[0], q[1], q[2]),
+                        owner.world.get(q[0], q[1], q[2]),
+                    );
+                    if a != o {
+                        differ.push((b.name.clone(), q, a.0, o.0));
+                    }
+                }
+            }
+        }
+        differ.sort();
+        differ.dedup();
+        assert!(
+            differ.is_empty(),
+            "{} cases différentes du monde du propriétaire, par exemple {:?}",
+            differ.len(),
+            &differ[..differ.len().min(5)]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_crowded_province_gets_its_own_relay_and_worlds_stay_identical() {
+        province_world(ProvinceFault::None);
+    }
+
+    #[test]
+    fn a_province_whose_host_falls_comes_back_within_three_seconds() {
+        province_world(ProvinceFault::Crash);
+    }
+
+    #[test]
+    fn a_province_whose_host_leaves_is_handed_back_at_once() {
+        province_world(ProvinceFault::Leaves);
+    }
+
+    #[test]
+    fn a_province_cut_from_the_world_relay_stops_without_splitting_the_world() {
+        province_world(ProvinceFault::Cut);
     }
 
     #[test]

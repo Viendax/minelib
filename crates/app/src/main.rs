@@ -68,6 +68,7 @@ mod multiplayer;
 mod netgame;
 mod player;
 mod player_model;
+mod province_host;
 mod radar;
 mod save;
 mod session;

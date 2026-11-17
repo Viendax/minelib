@@ -2311,6 +2311,7 @@ impl Session {
                 }
                 // Relais des régions peuplées, et billet pour y entrer.
                 Event::Shards(list) => b.set_shards(list.clone()),
+                Event::Provinces(list) => b.set_provinces(list.clone()),
                 Event::ShardTicket {
                     room,
                     pseudo,

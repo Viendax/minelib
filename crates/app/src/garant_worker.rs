@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use minelib_net::client::{Client, Cmd, Event};
 use minelib_net::guard;
+use minelib_net::proto::Response;
 
 use crate::garant::Garant;
 
@@ -500,7 +501,7 @@ fn unix_secs() -> u64 {
 }
 
 /// Adresse de ce PC sur le réseau local (sans rien envoyer), sinon la boucle locale.
-fn lan_ip() -> std::net::IpAddr {
+pub(crate) fn lan_ip() -> std::net::IpAddr {
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| {
             s.connect("192.0.2.1:9")?;
@@ -602,8 +603,12 @@ impl ShardHost {
 
     /// Hôte principal d'une région souveraine : modifications signées par le relais du
     /// monde à la place de leurs auteurs.
-    pub fn root_edits(&self, edits: Vec<minelib_net::sovereign::Edit>) {
-        self.handle.root_edits(edits);
+    pub fn root_edits(
+        &self,
+        edits: Vec<minelib_net::sovereign::Edit>,
+        certs: Vec<minelib_net::sovereign::Cert>,
+    ) {
+        self.handle.root_edits(edits, certs);
     }
 
     /// Clé du compte de l'hôte (arrivée après le lancement du relais).
@@ -753,8 +758,12 @@ fn run(
     // Garant extérieur d'un monde de construction : il valide les modifications de ses
     // zones (sans avoir besoin du monde lui-même).
     let mut build: Option<(crate::buildnet::BuildNet, minelib_world::World)> = None;
-    // Relais d'une région d'un monde de construction.
+    // Relais d'une région d'un monde de construction (rattaché au relais de sa province,
+    // v138 : la connexion à ce relais).
     let mut shard: Option<ShardHost> = None;
+    let mut attach: Option<crate::province_host::RegionAttach> = None;
+    // Relais d'une province d'un monde de construction (v138).
+    let mut province: Option<crate::province_host::ProvinceHost> = None;
     // Relais de secours d'un monde de construction, et témoin de mondes.
     let mut standby: Option<StandbyHost> = None;
     let mut witnesses: HashMap<u64, WitnessRole> = HashMap::new();
@@ -768,6 +777,13 @@ fn run(
     log::info!("garant en jeu : connexion de garant ouverte");
     loop {
         if stop.load(Ordering::Relaxed) {
+            // Province tenue ici : rendue au relais du monde (tout ce qu'elle a publié part
+            // avant).
+            if let (Some(p), Some(l)) = (province.as_mut(), &link) {
+                for r in p.release() {
+                    minelib_net::transport::push(l, &r);
+                }
+            }
             // Monde repris ici : confié à son propre relais de secours, s'il en a un.
             if let Some(s) = &standby {
                 if s.release() > 0 {
@@ -786,7 +802,7 @@ fn run(
                     minelib_net::transport::push(l, &minelib_net::proto::Request::Resign { room });
                 }
             }
-            if garant.is_some() || build.is_some() || shard.is_some() {
+            if garant.is_some() || build.is_some() || shard.is_some() || province.is_some() {
                 client.send(Cmd::Leave);
             }
             client.send(Cmd::GarantAvailable(false));
@@ -953,7 +969,11 @@ fn run(
                 // le reprendra avec les votes des gardiens (plus de battements) ; le relais de
                 // région, lui, n'a plus rien à transmettre.
                 Event::Lost if logged => {
-                    shard = None;
+                    if attach.is_none() {
+                        shard = None;
+                    }
+                    // (Plus de bail possible : le relais du monde la reprendra.)
+                    province = None;
                 }
                 Event::RoomClosed => {
                     // (Le monde fermé par son relais, ou ce relais de secours rendu : plus
@@ -966,19 +986,25 @@ fn run(
                     if let Some(s) = shard.take() {
                         s.pump();
                     }
+                    attach = None;
                 }
+                // (Un relais de région rattaché à sa province ne suit que ce qu'elle dit.)
                 Event::ShardPeers {
                     region,
                     ref list,
                     ref sov,
-                } => {
+                } if attach.is_none() => {
                     if let Some(s) = shard.as_ref().filter(|s| s.region == region) {
                         s.set_peers(list, sov.clone());
                     }
                 }
-                Event::RootEdits { region, ref edits } => {
+                Event::RootEdits {
+                    region,
+                    ref edits,
+                    ref certs,
+                } if attach.is_none() => {
                     if let Some(s) = shard.as_ref().filter(|s| s.region == region) {
-                        s.root_edits(edits.clone());
+                        s.root_edits(edits.clone(), certs.clone());
                     }
                 }
                 // Surveillance mutuelle : un lot d'une autre région, vérifié ici comme le
@@ -990,9 +1016,55 @@ fn run(
                 }
                 // Le monde est servi (ou en pause) : redit aux joueurs du relais de région,
                 // à la place du relais du monde.
-                Event::WorldBeat { room, paused } => {
+                Event::WorldBeat { room, paused } if attach.is_none() => {
                     if let Some(s) = shard.as_ref().filter(|s| s.room == room) {
                         s.world_beat(paused);
+                    }
+                }
+                // Provinces (v138) : tenir le relais d'une province, son historique, ses
+                // baux, son arrêt ; ou l'arrêt de la province d'un relais de région.
+                Event::Province(Response::ProvinceTask {
+                    room,
+                    province: p,
+                    size,
+                    epoch,
+                    secret,
+                    root,
+                    ref info,
+                }) => {
+                    if let Some(l) = &link {
+                        if province.is_none() {
+                            province = crate::province_host::ProvinceHost::start(
+                                room,
+                                p,
+                                size,
+                                epoch,
+                                secret,
+                                root,
+                                info.clone(),
+                                l,
+                                login.node_dir.is_some(),
+                            );
+                        }
+                    }
+                }
+                Event::Province(ref r) => {
+                    if let Response::ProvinceStop {
+                        room, province: p, ..
+                    } = r
+                    {
+                        if attach
+                            .as_ref()
+                            .is_some_and(|a| a.room == *room && a.province == *p)
+                        {
+                            attach = None;
+                            shard = None;
+                        }
+                    }
+                    if let (Some(h), Some(l)) = (province.as_mut(), &link) {
+                        for req in h.event(r) {
+                            minelib_net::transport::push(l, &req);
+                        }
                     }
                 }
                 Event::Identity(ref key) => {
@@ -1001,13 +1073,46 @@ fn run(
                         s.set_signer(key.clone());
                     }
                 }
+                // Région d'une province servie par un relais de province : le relais de région
+                // s'y rattache (il démarre quand la connexion est prête).
                 Event::ShardTask {
                     room,
                     region,
                     secret,
                     slot,
                     root,
+                    province: Some(at),
                 } => {
+                    shard = None;
+                    let signer = identity
+                        .as_ref()
+                        .map_or([0; 32], |k| k.verifying_key().to_bytes());
+                    log::info!(
+                        "garant en jeu : relais de la région {region:?} du monde {room} \
+                         (province {:?})",
+                        at.info.province
+                    );
+                    attach = Some(crate::province_host::RegionAttach::connect(
+                        room,
+                        region,
+                        secret,
+                        slot,
+                        root,
+                        at,
+                        &login.pseudo,
+                        signer,
+                        login.node_dir.clone(),
+                    ));
+                }
+                Event::ShardTask {
+                    room,
+                    region,
+                    secret,
+                    slot,
+                    root,
+                    province: None,
+                } => {
+                    attach = None;
                     if let Some(l) = link.clone() {
                         log::info!(
                             "garant en jeu : relais de la région {region:?} du monde {room}"
@@ -1050,7 +1155,8 @@ fn run(
                     if let Some((b, w)) = &mut build {
                         b.receive(peer, chunk, data, w);
                     }
-                    if let Some(s) = &shard {
+                    // (Rattaché à sa province : c'est d'elle que viennent ses blocs.)
+                    if let (Some(s), None) = (&shard, &attach) {
                         s.seed(data);
                     }
                 }
@@ -1082,6 +1188,38 @@ fn run(
                 *w = minelib_world::World::new(0);
             }
         }
+        // Relais de région rattaché à sa province : ce qu'elle lui dit.
+        let mut closed = false;
+        if let Some(a) = attach.as_mut() {
+            while let Some(e) = a.client.poll() {
+                if crate::province_host::attach_event(
+                    a,
+                    &mut shard,
+                    e,
+                    identity.as_ref(),
+                    login.node_dir.is_some(),
+                ) {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if closed {
+            log::info!("garant en jeu : relais de région rattaché à une province, fermé");
+            attach = None;
+            shard = None;
+            // (Le relais du monde le saura : la région aura un autre relais.)
+            client.send(Cmd::Leave);
+        }
+        // Province tenue ici : bail, copie de ce qu'elle publie.
+        if let (Some(p), Some(l)) = (province.as_mut(), &link) {
+            for r in p.tick() {
+                minelib_net::transport::push(l, &r);
+            }
+        }
+        if province.as_ref().is_some_and(|p| p.stopped) {
+            province = None;
+        }
         if let Some(s) = &shard {
             s.pump();
         }
@@ -1095,7 +1233,7 @@ fn run(
                 garant = None;
             }
         }
-        let busy = garant.is_some() || shard.is_some();
+        let busy = garant.is_some() || shard.is_some() || province.is_some() || attach.is_some();
         std::thread::sleep(Duration::from_millis(if busy { 2 } else { 20 }));
     }
 }

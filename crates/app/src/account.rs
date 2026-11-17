@@ -895,6 +895,8 @@ impl Accounts {
                 | Event::ShardPeers { .. }
                 | Event::RootEdits { .. }
                 | Event::Shards(_)
+                | Event::Province(_)
+                | Event::Provinces(_)
                 | Event::Judge { .. }
                 | Event::Voice { .. }
                 | Event::VoiceFrom { .. }

@@ -410,6 +410,35 @@ impl Build {
         out
     }
 
+    /// Provinces (v138) : les blocs des zones choisies par `keep` publiés après le rang
+    /// `after` (zone, rang, entrée), les zones qui dorment réveillées.
+    pub fn blocks_after(&mut self, keep: impl Fn([i32; 2]) -> bool, after: u64) -> Vec<Entry> {
+        let sleeping: Vec<[i32; 2]> = self.asleep.keys().filter(|z| keep(**z)).copied().collect();
+        for z in sleeping {
+            self.wake(z);
+        }
+        let mut out = Vec::new();
+        for (&zone, log) in self.logs.iter().filter(|(z, _)| keep(**z)) {
+            for (&seq, (block, d)) in log.entries.range(after + 1..) {
+                if *block {
+                    out.push((zone, seq, d.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Dernier rang donné (les suivants viendront après).
+    pub fn last_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Relais de province : il numérote à partir de `base` (plage réservée par le relais du
+    /// monde).
+    pub fn start_at(&mut self, base: u64) {
+        self.next_seq = self.next_seq.max(base.saturating_sub(1));
+    }
+
     /// Avec un relais de secours (ou sans) : chaque nouvelle entrée lui est gardée.
     pub fn set_replicating(&mut self, on: bool) {
         self.replica = on.then(Vec::new);
@@ -614,6 +643,32 @@ impl Build {
             .filter(|(&id, &p)| id != except && near(p, chunk))
             .map(|(&id, _)| id)
             .collect()
+    }
+
+    /// Joueurs placés dans les chunks de `lo` à `hi` (inclus) : par zones (une province
+    /// n'est pas cherchée parmi tous les joueurs du monde).
+    pub fn players_in(&self, lo: [i32; 2], hi: [i32; 2]) -> Vec<u64> {
+        let inside =
+            |c: [i32; 2]| (lo[0]..=hi[0]).contains(&c[0]) && (lo[1]..=hi[1]).contains(&c[1]);
+        if self.indexed != self.positions.len() {
+            return self
+                .positions
+                .iter()
+                .filter(|(_, &c)| inside(c))
+                .map(|(&id, _)| id)
+                .collect();
+        }
+        let zl = minelib_net::proto::zone_of(lo);
+        let zh = minelib_net::proto::zone_of(hi);
+        let mut out = Vec::new();
+        for zx in zl[0]..=zh[0] {
+            for zz in zl[1]..=zh[1] {
+                if let Some(m) = self.by_zone.get(&[zx, zz]) {
+                    out.extend(m.iter().filter(|(_, c)| inside(*c)).map(|&(id, _)| id));
+                }
+            }
+        }
+        out
     }
 
     /// Garde un message (bloc publié, état d'un objet ou d'un coffre) dans l'historique de

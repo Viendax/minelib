@@ -563,8 +563,19 @@ impl ShardHandle {
 
     /// Du relais du monde, à l'hôte principal d'une région souveraine : modifications
     /// signées par lui à la place de leurs auteurs.
-    pub fn root_edits(&self, edits: Vec<Edit>) {
+    pub fn root_edits(&self, edits: Vec<Edit>, certs: Vec<Cert>) {
         let mut st = self.state.lock().unwrap();
+        // (Modifications signées par leurs auteurs, transmises par un relais de province :
+        // leurs certificats viennent avec, vérifiés avec la clé du relais du monde.)
+        let root = ed25519_dalek::VerifyingKey::from_bytes(&st.root).ok();
+        for c in certs {
+            if root.is_some_and(|k| c.valid(&k, st.room)) {
+                if let Some(sv) = st.sovereign.as_mut() {
+                    sv.checker.learn(&c);
+                }
+                st.certs.insert(c.pseudo.to_ascii_lowercase(), c);
+            }
+        }
         for e in edits {
             st.admit(e, None, From::Root);
         }

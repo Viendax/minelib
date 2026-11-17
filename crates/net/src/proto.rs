@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 36;
+pub const PROTOCOL: u32 = 37;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -477,6 +477,60 @@ pub enum Request {
         to: Vec<String>,
         data: Vec<u8>,
     },
+    /// Provinces (v138), de l'hôte d'une province (connexion de garant) au relais du
+    /// monde : son relais de province est prêt (voir `ProvinceInfo`).
+    ProvinceReady {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        node: [u8; 32],
+        addr: String,
+        key: [u8; 32],
+    },
+    /// Renouvellement du bail (toutes les `PROVINCE_RENEW_MS`) ; `t` : son heure à lui
+    /// (ms), rendue dans la réponse (le bail court à partir de l'envoi).
+    ProvinceLease {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        t: u64,
+    },
+    /// Ce que le relais de province vient de publier (zone, rang, message) : le relais du
+    /// monde en garde une copie, pour reprendre la province aussitôt si son hôte tombe.
+    /// Numérotés (`n`) : il confirme chacun (`Response::ProvinceArchived`).
+    ProvinceArchive {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        n: u64,
+        entries: Vec<([i32; 2], u64, Vec<u8>)>,
+    },
+    /// Relais de région prêts dans la province (région, rang), à chaque changement : le
+    /// relais du monde en choisit toujours les hôtes et les remplace.
+    ProvinceShards {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        ready: Vec<([i32; 2], u16)>,
+    },
+    /// Départ propre : tout a été archivé (dernier `ProvinceArchive` juste avant), le
+    /// relais du monde reprend la province tout de suite.
+    ProvinceRelease {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+    },
+    /// Hôte d'un relais de région, au relais de sa province : entrée avec le jeton donné
+    /// par le relais du monde (voir `province_token`).
+    RegionHost {
+        room: u64,
+        region: [i32; 2],
+        slot: u16,
+        pseudo: String,
+        /// Clé de son compte (il signe ses lots d'hôte principal), dans le jeton.
+        signer: [u8; 32],
+        token: [u8; 32],
+    },
 }
 
 impl Request {
@@ -520,6 +574,10 @@ impl Request {
                 | Request::Spot { .. }
                 | Request::VoiceTo { .. }
                 | Request::PeerVoice { .. }
+                | Request::ProvinceLease { .. }
+                | Request::ProvinceArchive { .. }
+                | Request::ProvinceShards { .. }
+                | Request::ProvinceRelease { .. }
         )
     }
 }
@@ -759,6 +817,10 @@ pub enum Response {
         /// Clé du relais du monde (il certifie les clés des joueurs et peut signer à leur
         /// place).
         root: [u8; 32],
+        /// Région d'une province confiée à un relais de province (v138) : le relais de
+        /// région s'y rattache (jeton d'entrée) au lieu du relais du monde, et l'historique
+        /// de la région vient de lui.
+        province: Option<ProvinceAt>,
     },
     /// À l'hôte d'un relais de région : tous les relais prêts de sa région (lui compris).
     /// Ils se relient entre eux : une région très peuplée est servie par plusieurs relais.
@@ -774,6 +836,9 @@ pub enum Response {
     RootEdits {
         region: [i32; 2],
         edits: Vec<crate::sovereign::Edit>,
+        /// Certificats des auteurs des modifications signées par eux (v138 : transmises par
+        /// un relais de province, qui ne signe pas à leur place).
+        certs: Vec<crate::sovereign::Cert>,
     },
     /// Au joueur choisi : héberger le relais de secours du monde `room` (voir
     /// `StandbyInfo`) ; `root` : clé qui signe les certificats des comptes de ce monde.
@@ -848,6 +913,67 @@ pub enum Response {
     /// Aux joueurs d'un monde : relais de ses régions (les autres passent par ce relais).
     Shards {
         list: Vec<ShardInfo>,
+    },
+    /// Provinces (v138), au joueur choisi (connexion de garant) : tenir le relais de la
+    /// province `province` du monde `room` (`size` régions de côté), époque `epoch`.
+    /// L'historique des blocs suit (`ProvinceSeed`).
+    ProvinceTask {
+        room: u64,
+        province: [i32; 2],
+        size: i32,
+        epoch: u64,
+        secret: [u8; 32],
+        root: [u8; 32],
+        info: StandbyInfo,
+    },
+    /// Historique des blocs de la province : (zone, rang, message). `go` (dernier envoi,
+    /// quand l'hôte est prêt) : premier rang de sa plage ; il sert dès son premier bail.
+    ProvinceSeed {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        entries: Vec<([i32; 2], u64, Vec<u8>)>,
+        go: Option<u64>,
+    },
+    /// Réponse au renouvellement du bail (`ok` : faux si le monde est en pause, ou si la
+    /// province n'est plus confiée à cette époque).
+    ProvinceLeased {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        t: u64,
+        ok: bool,
+    },
+    /// Le relais du monde a gardé l'envoi `n` de la province (et tous ceux d'avant).
+    ProvinceArchived {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        n: u64,
+    },
+    /// Relais de province, à ses joueurs : ce qu'il vous a envoyé jusqu'ici part au relais
+    /// du monde dans l'envoi `n` (voir `ProvinceConfirmed`).
+    ProvinceMark {
+        n: u64,
+    },
+    /// Relais de province, à ses joueurs : le relais du monde a gardé tout ce qui précède la
+    /// marque `n`. Ce qui n'est pas confirmé ainsi reste en doute : si la province tombe,
+    /// ce que le relais du monde n'a pas reçu revient comme avant (jamais deux versions du
+    /// monde).
+    ProvinceConfirmed {
+        n: u64,
+    },
+    /// Le relais du monde reprend la province (ou la confie ailleurs) : le relais de
+    /// province s'arrête.
+    ProvinceStop {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+    },
+    /// Aux joueurs d'un monde : les provinces confiées à un relais de province, en vue (les
+    /// blocs de leurs zones viennent de ce relais ; les autres du relais du monde).
+    Provinces {
+        list: Vec<ProvinceInfo>,
     },
     /// Billet pour entrer dans les relais de région de ce monde, et certificat de la clé
     /// du compte (pour signer ses modifications dans une région souveraine).
@@ -1027,6 +1153,14 @@ impl Response {
                 | Response::RootEdits { .. }
                 | Response::Shards { .. }
                 | Response::ShardTicket { .. }
+                | Response::ProvinceTask { .. }
+                | Response::ProvinceSeed { .. }
+                | Response::ProvinceLeased { .. }
+                | Response::ProvinceArchived { .. }
+                | Response::ProvinceMark { .. }
+                | Response::ProvinceConfirmed { .. }
+                | Response::ProvinceStop { .. }
+                | Response::Provinces { .. }
                 // (Relais de secours et gardiens, v133 à v135 : poussés eux aussi ; une
                 // requête en cours ne doit pas les prendre pour sa réponse.)
                 | Response::StandbyTask { .. }
@@ -1099,6 +1233,94 @@ pub struct StandbyAt {
     pub room: u64,
     pub pseudo: String,
     pub root: [u8; 32],
+}
+
+/// Provinces (v138) : régions par côté d'une province. Le relais du monde confie une
+/// province peuplée au relais d'un joueur (hors de cette province), sous bail.
+pub const PROVINCE: i32 = 4;
+/// Bail d'un relais de province : renouvelé toutes les `PROVINCE_RENEW_MS`, valable
+/// `PROVINCE_LEASE_MS` à partir de l'envoi de la demande. Le relais du monde ne reprend
+/// la province que `PROVINCE_MARGIN_MS` après la fin du dernier bail qu'il a donné : les
+/// deux ne la servent jamais en même temps.
+pub const PROVINCE_RENEW_MS: u64 = 300;
+pub const PROVINCE_LEASE_MS: u64 = 1500;
+pub const PROVINCE_MARGIN_MS: u64 = 250;
+
+/// Province d'une région, pour des provinces de `size` régions de côté.
+pub fn province_of(region: [i32; 2], size: i32) -> [i32; 2] {
+    let size = size.max(1);
+    [region[0].div_euclid(size), region[1].div_euclid(size)]
+}
+
+/// Où joindre le relais d'une province (v138).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ProvinceInfo {
+    pub province: [i32; 2],
+    /// Régions par côté.
+    pub size: i32,
+    pub epoch: u64,
+    /// Nœud iroh de son hôte (tunnel), adresse directe (réseau local), clé du canal.
+    pub node: [u8; 32],
+    pub addr: String,
+    pub key: [u8; 32],
+}
+
+impl ProvinceInfo {
+    /// La région `region` en fait partie.
+    pub fn has(&self, region: [i32; 2]) -> bool {
+        province_of(region, self.size) == self.province
+    }
+
+    /// Le même relais de province (même époque).
+    pub fn same_relay(&self, other: &ProvinceInfo) -> bool {
+        (
+            self.province,
+            self.size,
+            self.epoch,
+            self.node,
+            &self.addr,
+            self.key,
+        ) == (
+            other.province,
+            other.size,
+            other.epoch,
+            other.node,
+            &other.addr,
+            other.key,
+        )
+    }
+}
+
+/// Province d'un relais de région (dans `ShardTask`) : où la joindre, et le jeton qui
+/// prouve que le relais du monde a confié la région à cet hôte.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ProvinceAt {
+    pub info: ProvinceInfo,
+    pub token: [u8; 32],
+}
+
+/// Jeton d'entrée de l'hôte d'un relais de région chez le relais de sa province (secret
+/// partagé du monde).
+pub fn province_token(
+    secret: &[u8; 32],
+    room: u64,
+    region: [i32; 2],
+    slot: u16,
+    pseudo: &str,
+    signer: &[u8; 32],
+    epoch: u64,
+) -> [u8; 32] {
+    use hmac::Mac;
+    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("clé");
+    m.update(b"minelib/province/hote");
+    m.update(&room.to_le_bytes());
+    m.update(&region[0].to_le_bytes());
+    m.update(&region[1].to_le_bytes());
+    m.update(&slot.to_le_bytes());
+    m.update(pseudo.to_ascii_lowercase().as_bytes());
+    m.update(signer);
+    m.update(&epoch.to_le_bytes());
+    m.finalize().into_bytes().into()
 }
 
 /// Relais d'une région d'un monde.

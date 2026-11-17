@@ -65,10 +65,11 @@ pub(crate) fn now_ms(st: &State) -> u64 {
 /// s'est arrêté proprement) ? Rien n'y change alors : ni blocs, ni objets, ni réglages.
 pub(crate) fn frozen(st: &State, rid: u64) -> bool {
     let now = now_ms(st);
-    st.rooms
-        .get(&rid)
-        .and_then(|r| r.guards.as_ref())
-        .is_some_and(|g| !g.warden.serving(now))
+    st.rooms.get(&rid).is_some_and(|r| {
+        r.guards.as_ref().is_some_and(|g| !g.warden.serving(now))
+            // (Relais de province, v138 : il ne sert que pendant son bail.)
+            || r.province.as_ref().is_some_and(|p| !p.serving(now))
+    })
 }
 
 /// Essais : le réseau entre ce relais et ce gardien est coupé (ni battement ni bail).
@@ -78,6 +79,10 @@ fn cut(st: &State, pseudo: &str) -> bool {
 
 /// Entretien (toutes les 50 ms) : listes de gardiens, battements, pause.
 pub(crate) fn upkeep(st: &mut State) {
+    // Provinces (v138) : baux finis chez le relais du monde, pause chez le relais de
+    // province.
+    super::provinces::upkeep_leases(st);
+    super::provinces::upkeep_here(st);
     let rooms: Vec<u64> = st
         .rooms
         .iter()
@@ -471,9 +476,18 @@ pub(crate) fn send_pause(st: &State, rid: u64, paused: bool, changed: bool) {
         return;
     };
     let beat = Response::WorldBeat { room: rid, paused };
-    for s in room.shards.values().flatten().filter(|s| s.info.is_some()) {
-        if let Some(c) = st.conns.get(&s.host) {
-            transport::push(&c.tx, &beat);
+    // (Pas aux relais de région d'une province servie par un relais de province, v138 :
+    // c'est lui qui leur dit qu'il sert.)
+    let delegated = super::provinces::delegated_set(st, rid);
+    for (_, list) in room
+        .shards
+        .iter()
+        .filter(|(r, _)| !super::provinces::in_set(&delegated, **r))
+    {
+        for s in list.iter().filter(|s| s.info.is_some()) {
+            if let Some(c) = st.conns.get(&s.host) {
+                transport::push(&c.tx, &beat);
+            }
         }
     }
     let msg = Response::Paused { paused };

@@ -13,6 +13,7 @@ mod guards;
 mod hardware;
 mod limits;
 mod maps;
+mod provinces;
 mod registry;
 mod servers;
 pub mod shard;
@@ -63,6 +64,8 @@ pub struct Handle {
     shard_share: Arc<std::sync::atomic::AtomicUsize>,
     sov_faults: Arc<std::sync::atomic::AtomicUsize>,
     sov_committed: Arc<std::sync::atomic::AtomicUsize>,
+    province_size: Arc<std::sync::atomic::AtomicUsize>,
+    province_from: Arc<std::sync::atomic::AtomicUsize>,
     /// État du relais (relais de secours, essais).
     state: Arc<Mutex<State>>,
     /// Relais arrêté (essais : sa chute).
@@ -126,6 +129,109 @@ impl Handle {
     pub fn set_shard_share(&self, players: usize) {
         self.shard_share
             .store(players, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Provinces (v138) : régions par côté, et joueurs à partir desquels une province
+    /// reçoit son relais (essais à petite échelle).
+    pub fn set_provinces(&self, size: usize, from: usize) {
+        self.province_size
+            .store(size.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.province_from
+            .store(from.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Provinces servies par un relais de province, prêtes (essais).
+    pub fn delegated_provinces(&self) -> Vec<[i32; 2]> {
+        self.state
+            .lock()
+            .unwrap()
+            .rooms
+            .values()
+            .flat_map(|r| {
+                r.provinces
+                    .iter()
+                    .filter(|(_, p)| p.info.is_some())
+                    .map(|(k, _)| *k)
+            })
+            .collect()
+    }
+
+    /// Provinces servies ici par un relais de province, prêtes (essais).
+    pub fn provinces_delegated(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .rooms
+            .values()
+            .map(|r| r.provinces.values().filter(|p| p.info.is_some()).count())
+            .sum()
+    }
+
+    /// Relais de province (hôte, v138) : tient la province `province` du monde `room` d'un
+    /// autre relais (voir `crate::provinces`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn province_begin(
+        &self,
+        room: u64,
+        province: [i32; 2],
+        size: i32,
+        epoch: u64,
+        secret: [u8; 32],
+        root: [u8; 32],
+        info: proto::StandbyInfo,
+    ) -> bool {
+        provinces::begin(
+            &mut self.state.lock().unwrap(),
+            room,
+            province,
+            size,
+            epoch,
+            secret,
+            root,
+            info,
+        )
+    }
+
+    /// Relais de province : historique reçu (et, à la fin, sa plage de rangs : il sert dès
+    /// son premier bail).
+    pub fn province_seed(&self, entries: Vec<([i32; 2], u64, Vec<u8>)>, go: Option<u64>) {
+        provinces::seed(&mut self.state.lock().unwrap(), entries, go);
+    }
+
+    /// Relais de province : ce qu'il faut envoyer maintenant au relais du monde.
+    pub fn province_tick(&self) -> Vec<Request> {
+        provinces::tick(&mut self.state.lock().unwrap())
+    }
+
+    /// Relais de province : le relais du monde a gardé l'envoi `n`.
+    pub fn province_archived(&self, epoch: u64, n: u64) {
+        provinces::archived(&mut self.state.lock().unwrap(), epoch, n);
+    }
+
+    /// Relais du monde : envois de relais de province gardés ici (essais).
+    pub fn province_archives(&self) -> usize {
+        self.state.lock().unwrap().province_archived
+    }
+
+    /// Relais de province : réponse du relais du monde à une demande de bail.
+    pub fn province_leased(&self, epoch: u64, t: u64, ok: bool) {
+        provinces::leased(&mut self.state.lock().unwrap(), epoch, t, ok);
+    }
+
+    /// Relais de province : arrêt ; `release` : départ propre (le relais du monde reprend
+    /// tout de suite). Ce qu'il reste à lui envoyer.
+    pub fn province_stop(&self, release: bool) -> Vec<Request> {
+        provinces::stop_here(&mut self.state.lock().unwrap(), release)
+    }
+
+    /// Relais de province : il sert (bail en cours ; essais).
+    pub fn province_serving(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        let now = guards::now_ms(&st);
+        st.province_room
+            .and_then(|r| st.rooms.get(&r))
+            .and_then(|r| r.province.as_ref())
+            .is_some_and(|p| p.serving(now))
     }
 
     /// Hôtes principaux de régions souveraines écartés pour une faute prouvée.
@@ -842,6 +948,15 @@ struct Room {
     /// Construction : créateur du serveur (OP d'office) et clé de ses OP et bannis.
     creator: String,
     server: String,
+    /// Provinces (v138), relais du monde : celles confiées (ou en train de l'être) à un
+    /// relais de province, et dernière liste envoyée à chaque joueur (empreinte).
+    provinces: HashMap<[i32; 2], provinces::ProvinceRef>,
+    provinces_sent: HashMap<u64, u64>,
+    /// Les mêmes, prêtes (rangées à part : on les teste à chaque position de joueur).
+    delegated: Arc<HashSet<[i32; 2]>>,
+    /// Relais de province : cette salle sert une province du monde de même numéro d'un
+    /// autre relais (le relais du monde).
+    province: Option<provinces::ProvinceRoom>,
 }
 
 impl Room {
@@ -961,6 +1076,15 @@ struct State {
     /// Essais : gardiens coupés de ce relais (pseudos en minuscules), ou tous.
     guard_cut: HashSet<String>,
     guard_isolated: bool,
+    /// Provinces (v138), relais du monde : régions par côté, joueurs à partir desquels une
+    /// province reçoit son relais (essais : réglables).
+    province_size: Arc<std::sync::atomic::AtomicUsize>,
+    province_from: Arc<std::sync::atomic::AtomicUsize>,
+    /// Ce relais tient le relais d'une province d'un monde d'un autre relais (numéro du
+    /// monde, celui de la salle ici).
+    province_room: Option<u64>,
+    /// Envois de relais de province gardés ici (essais).
+    province_archived: usize,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -995,6 +1119,12 @@ pub fn start(cfg: Config) -> Result<Handle> {
     let shard_share = Arc::new(std::sync::atomic::AtomicUsize::new(SHARD_SHARE));
     let sov_faults = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sov_committed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let province_size = Arc::new(std::sync::atomic::AtomicUsize::new(
+        proto::PROVINCE as usize,
+    ));
+    let province_from = Arc::new(std::sync::atomic::AtomicUsize::new(
+        provinces::PROVINCE_FROM,
+    ));
     let state = Arc::new(Mutex::new(State {
         whois: whois.clone(),
         peer_servers: peer_servers.clone(),
@@ -1028,6 +1158,10 @@ pub fn start(cfg: Config) -> Result<Handle> {
         guard_epoch: Instant::now(),
         guard_cut: HashSet::new(),
         guard_isolated: false,
+        province_size: province_size.clone(),
+        province_from: province_from.clone(),
+        province_room: None,
+        province_archived: 0,
     }));
     let state_for_handle = state.clone();
     let state_for_guards = state.clone();
@@ -1112,6 +1246,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
         shard_share,
         sov_faults,
         sov_committed,
+        province_size,
+        province_from,
         state: state_for_handle,
         killed,
     })
@@ -1930,6 +2066,19 @@ fn bulk_edit(
     if cells.len() > BULK_MAX {
         return "Trop de blocs d'un coup.".into();
     }
+    // (Provinces, v138 : une province servie par un relais de province décide de ses
+    // blocs ; WorldEdit n'y passe pas encore.)
+    if cells.iter().any(|(pos, _)| {
+        provinces::delegated(
+            st,
+            rid,
+            proto::region_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]),
+        )
+    }) {
+        return "Cette partie du monde est servie par un relais de province : WorldEdit n'y \
+                passe pas encore."
+            .into();
+    }
     let mut touched = Vec::new();
     for (pos, block) in cells {
         if !(0..256).contains(&pos[1]) {
@@ -2013,6 +2162,8 @@ fn refresh_needs(st: &mut State, rid: u64, id: u64) {
         .get(&id)
         .map(|c| c.served.clone())
         .unwrap_or_default();
+    // (Provinces servies par un relais de province, v138 : leurs blocs viennent de lui.)
+    let delegated = provinces::delegated_set(st, rid);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -2022,7 +2173,7 @@ fn refresh_needs(st: &mut State, rid: u64, id: u64) {
         let hi = proto::region_of([c[0] + zones::NEAR, c[1] + zones::NEAR]);
         for rx in lo[0]..=hi[0] {
             for rz in lo[1]..=hi[1] {
-                if !served.contains(&[rx, rz]) {
+                if !served.contains(&[rx, rz]) && !provinces::in_set(&delegated, [rx, rz]) {
                     want.push([rx, rz]);
                 }
             }
@@ -2035,10 +2186,13 @@ fn refresh_needs(st: &mut State, rid: u64, id: u64) {
 /// régions qu'un relais de région lui sert n'en font pas partie).
 fn send_catch_up(st: &mut State, rid: u64, id: u64, chunk: [i32; 2], moved: bool) {
     let served = served_regions(st, rid, id);
+    let delegated = provinces::delegated_set(st, rid);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
-    let blocks = |zone: [i32; 2]| !served.contains(&zone_region(zone));
+    let blocks = |zone: [i32; 2]| {
+        !served.contains(&zone_region(zone)) && !provinces::in_set(&delegated, zone_region(zone))
+    };
     let logs = if moved {
         room.build.moved(id, chunk, &blocks)
     } else {
@@ -2114,6 +2268,7 @@ fn publish_block(
                 &Response::RootEdits {
                     region,
                     edits: vec![edit],
+                    certs: Vec::new(),
                 },
             );
         }
@@ -2656,6 +2811,10 @@ fn note_block(st: &mut State, rid: u64, by: &str, block: u16) {
 /// Aux hôtes des relais d'une région : la liste des relais prêts (ils se relient entre
 /// eux, et le plus petit rang met les modifications en ordre).
 fn announce_shard_peers(st: &State, rid: u64, region: [i32; 2]) {
+    // (Région d'une province servie par un relais de province, v138 : c'est lui.)
+    if provinces::delegated(st, rid, region) {
+        return;
+    }
     let Some(room) = st.rooms.get(&rid) else {
         return;
     };
@@ -2711,6 +2870,23 @@ fn account_key(st: &State, id: u64) -> Option<[u8; 32]> {
     let c = st.conns.get(&id)?;
     let p = c.pseudo.as_deref()?;
     st.registry.lookup(p).map(|r| r.1).or(c.account)
+}
+
+/// Clé qui certifie les comptes de ce monde et fait les règles de ses régions
+/// souveraines : celle de ce relais, ou, pour un relais de province (v138), celle du relais
+/// du monde.
+fn root_of(st: &State, rid: u64) -> [u8; 32] {
+    st.rooms
+        .get(&rid)
+        .and_then(|r| r.province.as_ref())
+        .map_or(st.cert_key.verifying_key().to_bytes(), |p| {
+            p.root.to_bytes()
+        })
+}
+
+/// Clé du compte `pseudo` au registre de ce relais.
+fn registry_key(st: &State, pseudo: &str) -> Option<[u8; 32]> {
+    st.registry.lookup(pseudo).map(|r| r.1)
 }
 
 /// Billet d'un joueur pour les relais de région de son monde, avec le certificat de la
@@ -3004,11 +3180,20 @@ fn upkeep_sovereignty(st: &mut State, rid: u64) {
     for (host, region, epoch, batches) in waiting {
         take_handover(st, rid, host, region, epoch, batches);
     }
-    let root_key = st.cert_key.verifying_key().to_bytes();
+    let root_key = root_of(st, rid);
+    // (Provinces servies par un relais de province, v138 : c'est lui qui tient leurs
+    // époques.)
+    let delegated = provinces::delegated_set(st, rid);
     let Some(room) = st.rooms.get(&rid) else {
         return;
     };
-    let regions: HashSet<[i32; 2]> = room.shards.keys().chain(room.sov.keys()).copied().collect();
+    let regions: HashSet<[i32; 2]> = room
+        .shards
+        .keys()
+        .chain(room.sov.keys())
+        .filter(|r| !provinces::in_set(&delegated, **r))
+        .copied()
+        .collect();
     for region in regions {
         // (Une confirmation qui tarde : voir `try_commit`.)
         try_commit(st, rid, region);
@@ -3151,7 +3336,7 @@ fn try_commit(st: &mut State, rid: u64, region: [i32; 2]) {
     if guards::frozen(st, rid) {
         return;
     }
-    let root = st.cert_key.verifying_key().to_bytes();
+    let root = root_of(st, rid);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -3247,7 +3432,7 @@ fn sound_prefix(
 /// région du monde, qui le vérifie (`Response::Audit`). Sans un tel hôte (petit monde),
 /// ou une fois sur `AUDIT_SELF`, ce relais le vérifie aussi lui-même.
 fn audit_batch(st: &mut State, rid: u64, region: [i32; 2], batch: sovereign::Batch) {
-    let root = st.cert_key.verifying_key().to_bytes();
+    let root = root_of(st, rid);
     let Some(room) = st.rooms.get(&rid) else {
         return;
     };
@@ -3330,7 +3515,7 @@ fn audit_batch(st: &mut State, rid: u64, region: [i32; 2], batch: sovereign::Bat
 /// vérificateur qui est écarté. Un « rien à signaler » sur un lot où ce relais a trouvé
 /// une faute écarte aussi le vérificateur.
 fn audited(st: &mut State, rid: u64, from: u64, aid: u64, fault: Option<String>) {
-    let root = st.cert_key.verifying_key().to_bytes();
+    let root = root_of(st, rid);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -3469,7 +3654,7 @@ fn take_handover(
     epoch: u64,
     batches: Vec<sovereign::Batch>,
 ) {
-    let root = st.cert_key.verifying_key().to_bytes();
+    let root = root_of(st, rid);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -3593,6 +3778,7 @@ fn resubmit(st: &mut State, rid: u64, region: [i32; 2], mut edit: sovereign::Edi
                 &Response::RootEdits {
                     region,
                     edits: vec![edit],
+                    certs: Vec::new(),
                 },
             );
         }
@@ -3729,15 +3915,26 @@ fn regions_in_view(chunk: [i32; 2]) -> impl Iterator<Item = [i32; 2]> {
 /// (600 relais), 60 Ko à chacun à chaque fois, soit 3,6 Go par changement.
 fn send_shards(st: &mut State, rid: u64, id: u64) {
     use std::hash::{Hash, Hasher};
+    let size = provinces::size(st);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
     let Some(&chunk) = room.build.positions.get(&id) else {
         return;
     };
+    // Provinces (v138) : les relais des régions d'une province servie par un relais de
+    // province sont annoncés par lui ; un relais de province n'annonce que les siens (et
+    // pas de billet : il vient du relais du monde, qui certifie les clés).
+    let delegated = room.delegated.clone();
+    let mine = |r: [i32; 2]| match &room.province {
+        Some(p) => p.has(r),
+        None => !delegated.contains(&proto::province_of(r, size)),
+    };
     let list: Vec<proto::ShardInfo> = regions_in_view(chunk)
+        .filter(|r| mine(*r))
         .flat_map(|r| ready_infos(room, r))
         .collect();
+    let province_here = room.province.is_some();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for i in &list {
         (i.region, i.slot, i.node, &i.addr, i.key, i.epoch).hash(&mut h);
@@ -3752,6 +3949,10 @@ fn send_shards(st: &mut State, rid: u64, id: u64) {
     room.shards_sent.insert(id, print);
     let secret = room.shard_secret;
     let Some(c) = st.conns.get(&id) else { return };
+    if province_here {
+        transport::push(&c.tx, &Response::Shards { list });
+        return;
+    }
     let pseudo = c.pseudo.clone().unwrap_or_default();
     let expires = now_secs() + 24 * 3600;
     // Certificat de la clé du compte : ses modifications signées seront reconnues dans
@@ -3809,6 +4010,18 @@ fn host_leaving(st: &State, index: &PlayersIndex, rid: u64, region: [i32; 2], ho
 /// par joueur pour chaque candidat, et supposait qu'il existe des joueurs ailleurs. Un
 /// monde où tout le monde joue trouve maintenant ses hôtes parmi ses propres joueurs.
 fn pick_shard_host(st: &State, index: &PlayersIndex, rid: u64, region: [i32; 2]) -> Option<u64> {
+    pick_host(st, index, rid, &|chunk| proto::region_of(chunk) != region)
+}
+
+/// Une connexion de garant libre pour servir une partie de ce monde : `outside` dit si un
+/// joueur de ce monde placé dans ce chunk peut la servir (pas celui d'un joueur de la
+/// région, ou de la province, qu'il servirait).
+fn pick_host(
+    st: &State,
+    index: &PlayersIndex,
+    rid: u64,
+    outside: &dyn Fn([i32; 2]) -> bool,
+) -> Option<u64> {
     let room = st.rooms.get(&rid)?;
     let want = st.conns.get(&room.host).map_or(0, |c| c.version);
     st.conns
@@ -3834,7 +4047,7 @@ fn pick_shard_host(st: &State, index: &PlayersIndex, rid: u64, region: [i32; 2])
             let bonus = if own == rid {
                 // Un joueur de ce monde : pas celui d'un joueur de la région elle-même.
                 let at = r.build.positions.get(&player)?;
-                if proto::region_of(*at) == region {
+                if !outside(*at) {
                     return None;
                 }
                 1.0
@@ -3910,11 +4123,21 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
     wanted.sort();
     let secret = room.shard_secret;
     for (region, previous) in wanted {
+        // (Province en train d'être confiée à un relais de province : ses relais de région
+        // se rattacheront à lui.)
+        if provinces::starting(st, rid, region) {
+            continue;
+        }
         // Plus d'hôte libre : la région reste servie par ce relais (ou par les relais
         // qu'elle a déjà) jusqu'à ce qu'il y en ait un.
         let Some(g) = pick_shard_host(st, index, rid, region) else {
             break;
         };
+        let pseudo = st
+            .conns
+            .get(&g)
+            .and_then(|c| c.pseudo.clone())
+            .unwrap_or_default();
         let room = st.rooms.get_mut(&rid).expect("partie");
         room.members.push(g);
         room.hidden.insert(g);
@@ -3926,9 +4149,17 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
             info: None,
             previous,
         });
-        let history: Vec<([i32; 2], Vec<Vec<u8>>)> = room.build.logs_in(|zone| {
-            proto::region_of([zone[0] * proto::ZONE, zone[1] * proto::ZONE]) == region
-        });
+        // Région d'une province servie par un relais de province (v138) : le relais de
+        // région s'y rattache, et c'est lui qui donne l'historique.
+        let province = provinces::shard_at(st, rid, region, slot, &pseudo);
+        let room = st.rooms.get_mut(&rid).expect("partie");
+        let history: Vec<([i32; 2], Vec<Vec<u8>>)> = if province.is_some() {
+            Vec::new()
+        } else {
+            room.build.logs_in(|zone| {
+                proto::region_of([zone[0] * proto::ZONE, zone[1] * proto::ZONE]) == region
+            })
+        };
         if let Some(c) = st.conns.get_mut(&g) {
             c.room = Some(rid);
             transport::push(
@@ -3939,6 +4170,7 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
                     secret,
                     slot,
                     root: st.cert_key.verifying_key().to_bytes(),
+                    province,
                 },
             );
             for (zone, log) in history {
@@ -3994,9 +4226,17 @@ fn upkeep_build(st: &mut State) {
         if let Some(room) = st.rooms.get_mut(&rid) {
             room.build.sleep_cold(zones::COLD_AFTER);
         }
+        // Relais de province (v138) : les époques, lots et vérifications de ses régions ;
+        // le relais du monde en choisit les hôtes et garde le reste.
+        if st.rooms.get(&rid).is_some_and(|r| r.province.is_some()) {
+            upkeep_sovereignty(st, rid);
+            upkeep_audits(st, rid);
+            continue;
+        }
         // Propriétaire à la connexion pourrie : le monde passe au mieux connecté.
         rebalance_host(st, rid);
         upkeep_regions(st, rid, &mut index);
+        provinces::upkeep(st, rid, &mut index);
         upkeep_sovereignty(st, rid);
         upkeep_audits(st, rid);
         upkeep_standby(st, rid);
@@ -4342,6 +4582,10 @@ fn open_room(
             ban_review: None,
             creator: pseudo.to_string(),
             server: servers::key(pseudo, &map),
+            provinces: HashMap::new(),
+            provinces_sent: HashMap::new(),
+            delegated: Arc::default(),
+            province: None,
         },
     );
     if let Some(c) = st.conns.get_mut(&id) {
@@ -5553,8 +5797,10 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             if let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1)) {
                 send_catch_up(st, rid, id, chunk, true);
                 refresh_needs(st, rid, id);
-                // Les relais des régions maintenant en vue, s'ils ont changé pour lui.
+                // Les relais des régions maintenant en vue, s'ils ont changé pour lui, et les
+                // provinces servies par un relais de province (v138).
                 send_shards(st, rid, id);
+                provinces::send_list(st, rid, id);
             }
             return None;
         }
@@ -5580,6 +5826,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         Request::ToZone { chunk, data } => {
             let rid = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1))?;
+            // Relais de province (v138) : les blocs de sa province seulement.
+            if st.rooms.get(&rid).is_some_and(|r| r.province.is_some()) {
+                provinces::to_zone(st, rid, id, pseudo, chunk, game::decode(&data));
+                return None;
+            }
             // Monde en pause (son relais n'entend plus assez de gardiens) : rien n'y change.
             // Une demande d'objet est refusée ; une modification de bloc reste sans
             // réponse (le jeu la garde et la renvoie à la reprise).
@@ -5688,8 +5939,70 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             // Blocs : ce relais décide seul et publie (voir `publish_block`). Tout autre
             // message (un « Set » ou un refus fabriqué par un jeu modifié) est sans effet.
+            // (Province servie par un relais de province, v138 : c'est lui qui décide ; le
+            // jeu y renverra la modification quand il l'apprendra.)
             if let Some(game::BuildMsg::Edit { pos, block, fluid }) = msg {
-                build_edit(st, rid, id, pseudo, chunk, pos, block, fluid);
+                if !provinces::delegated(st, rid, proto::region_of(chunk)) {
+                    build_edit(st, rid, id, pseudo, chunk, pos, block, fluid);
+                }
+            }
+            return None;
+        }
+        // Provinces (v138), de l'hôte d'un relais de province (connexion de garant).
+        Request::ProvinceReady {
+            room,
+            province,
+            epoch,
+            node,
+            addr,
+            key,
+        } => {
+            if my_room == Some(room) {
+                provinces::ready(st, room, id, province, epoch, node, addr, key);
+            }
+            return None;
+        }
+        Request::ProvinceLease {
+            room,
+            province,
+            epoch,
+            t,
+        } => {
+            if my_room == Some(room) {
+                provinces::lease(st, room, id, province, epoch, t);
+            }
+            return None;
+        }
+        Request::ProvinceArchive {
+            room,
+            province,
+            epoch,
+            n,
+            entries,
+        } => {
+            if my_room == Some(room) {
+                provinces::archive(st, room, id, province, epoch, n, entries);
+            }
+            return None;
+        }
+        Request::ProvinceShards {
+            room,
+            province,
+            epoch,
+            ready,
+        } => {
+            if my_room == Some(room) {
+                provinces::shards_ready(st, room, id, province, epoch, ready);
+            }
+            return None;
+        }
+        Request::ProvinceRelease {
+            room,
+            province,
+            epoch,
+        } => {
+            if my_room == Some(room) {
+                provinces::released(st, room, id, province, epoch);
             }
             return None;
         }
@@ -5870,7 +6183,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             let rules = sovereign::Rules {
                 room: rid,
                 region,
-                root: st.cert_key.verifying_key().to_bytes(),
+                root: root_of(st, rid),
                 floor_t,
             };
             match sovereign::judge(&rules, epoch, &key, &evidence) {
@@ -6361,6 +6674,11 @@ fn handle(
             | Request::Voice { .. }
             | Request::ToPeer { .. }
             | Request::Broadcast { .. }
+            | Request::ProvinceReady { .. }
+            | Request::ProvinceLease { .. }
+            | Request::ProvinceArchive { .. }
+            | Request::ProvinceShards { .. }
+            | Request::ProvinceRelease { .. }
     );
     // Témoin entré chez ce relais de secours : sa liste et son vote.
     if let Request::WitnessBeat { committee, vote } = &req {
@@ -6604,6 +6922,24 @@ fn handle_account(
         // Relais de secours, après la chute du relais du monde : un joueur de ce monde
         // entre avec le certificat de la clé de son compte.
         Request::Takeover { cert } => {
+            // Relais de province (v138) : un joueur du monde entre, avec le certificat de
+            // la clé de son compte.
+            if let Some(ok) = provinces::admits(st, &cert) {
+                if !ok {
+                    return err(ErrorCode::WrongCredentials, "certificat");
+                }
+                let mut challenge = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut challenge);
+                *session = Session::TakingOver {
+                    pseudo: cert.pseudo,
+                    key: cert.key,
+                    challenge,
+                };
+                return Response::TakeoverChallenge {
+                    challenge,
+                    proof: None,
+                };
+            }
             let Some(sb) = st.standby.as_ref() else {
                 return err(ErrorCode::Refused, "Pas de relais de secours ici.");
             };
@@ -6644,12 +6980,28 @@ fn handle_account(
                 return err(ErrorCode::WrongCredentials, "signature");
             }
             let (pseudo, key) = (pseudo.clone(), *key);
-            log::info!("relais de secours : « {pseudo} » reprend le monde");
             *session = Session::LoggedIn {
                 pseudo: pseudo.clone(),
             };
+            // Relais de province (v138) : dans la province.
+            if let Some(rid) = st.province_room {
+                if let Some(c) = st.conns.get_mut(&id) {
+                    c.pseudo = Some(pseudo.clone());
+                    c.account = Some(key);
+                }
+                return join_room(st, id, &pseudo, rid);
+            }
+            log::info!("relais de secours : « {pseudo} » reprend le monde");
             take_over_join(st, id, &pseudo, key)
         }
+        Request::RegionHost {
+            room,
+            region,
+            slot,
+            pseudo,
+            signer,
+            token,
+        } => provinces::region_host(st, session, id, room, region, slot, pseudo, signer, token),
         Request::Prove { signature } => {
             let Session::Proving {
                 pseudo,
@@ -9455,7 +9807,8 @@ mod tests {
         }
     }
 
-    /// Un monde de construction ouvert par « Proprio », sur un relais sans réseau.
+    /// Un monde de construction ouvert par « Proprio », sur un relais sans réseau. (Sans
+    /// provinces : les essais qui en veulent le disent, `Handle::set_provinces`.)
     fn crowd_world(tag: &str) -> (Handle, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("minelib-{tag}-{}", rand::random::<u32>()));
         let h = start(Config {
@@ -9465,6 +9818,7 @@ mod tests {
             name: "essai".into(),
         })
         .unwrap();
+        h.set_provinces(proto::PROVINCE as usize, usize::MAX);
         (h, dir)
     }
 
@@ -10458,6 +10812,282 @@ mod tests {
                 per(arch_t),
                 per(ack_t),
                 per(audit_t),
+                per(beat_t),
+                probe.as_secs_f64() * 1e3,
+                per(up_t),
+                msgs / secs + probes.1 / 4,
+                probes.1 / 4,
+                cells / secs,
+                (bytes / secs + probes.0 / 4) as f64 * 8.0 / 1e6,
+            );
+            drop(guard);
+            drop(h);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Essai de charge avec provinces (v138), sans réseau : comme `charge_souveraine`, mais
+    /// chaque province peuplée (4 × 4 régions) est confiée à un relais de province, qui met
+    /// en ordre les lots de ses régions souveraines et n'envoie au relais du monde qu'une
+    /// copie de ce qu'il publie (toutes les 100 ms) et ses baux (toutes les 300 ms). Mesure
+    /// ce qui reste au relais du monde pour une seconde de jeu.
+    /// `cargo test --release -p minelib-relay charge_provinces -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn charge_provinces() {
+        let sizes: Vec<usize> = std::env::var("MINELIB_CHARGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(vec![10_000, 60_000, 120_000], |n| vec![n]);
+        for n in sizes {
+            let (h, dir) = crowd_world("prov");
+            h.set_shard_share(50);
+            h.set_provinces(proto::PROVINCE as usize, 64);
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            let (_, room) = host_world(&mut crowd, st);
+            let side = (n / 100).max(1).isqrt() as i32 + 1;
+            let home = |i: usize| -> [i32; 2] {
+                let g = (i / 100) as i32;
+                let (rx, rz) = (g % side, g / side);
+                [
+                    rx * 64 + 8 + (i % 10) as i32,
+                    rz * 64 + 8 + (i / 10 % 10) as i32,
+                ]
+            };
+            let t = Instant::now();
+            let mut players = Vec::new();
+            let mut garants = 0;
+            for i in 0..n {
+                let name = format!("J{i}");
+                let id = crowd.conn(st, &name, false);
+                crowd.ask(st, id, Request::Join { room });
+                crowd.ask(st, id, Request::Position { chunk: home(i) });
+                players.push(id);
+                if i % 25 == 7 {
+                    crowd.conn(st, &name, true);
+                    garants += 1;
+                }
+            }
+            let join = t.elapsed();
+            // Relais de région, puis provinces confiées ; leurs hôtes sont prêts, leurs
+            // relais de région (rattachés à elles) aussi.
+            crowd.upkeep(st);
+            let provs: Vec<([i32; 2], u64, u64)> = st.rooms[&room]
+                .provinces
+                .iter()
+                .map(|(p, r)| (*p, r.host, r.epoch))
+                .collect();
+            for &(p, host, epoch) in &provs {
+                crowd.ask(
+                    st,
+                    host,
+                    Request::ProvinceReady {
+                        room,
+                        province: p,
+                        epoch,
+                        node: [0; 32],
+                        addr: format!("127.0.0.1:{host}"),
+                        key: [2; 32],
+                    },
+                );
+            }
+            crowd.upkeep(st);
+            let size = proto::PROVINCE;
+            for &(p, host, epoch) in &provs {
+                let ready: Vec<([i32; 2], u16)> = st.rooms[&room]
+                    .shards
+                    .iter()
+                    .filter(|(r, _)| proto::province_of(**r, size) == p)
+                    .flat_map(|(r, l)| l.iter().map(|s| (*r, s.slot)))
+                    .collect();
+                crowd.ask(
+                    st,
+                    host,
+                    Request::ProvinceShards {
+                        room,
+                        province: p,
+                        epoch,
+                        ready,
+                    },
+                );
+            }
+            crowd.upkeep(st);
+            for (i, &id) in players.iter().enumerate() {
+                let regions = vec![proto::region_of(home(i))];
+                crowd.ask(st, id, Request::Served { regions });
+            }
+            crowd.sent();
+            let delegated = st.rooms[&room]
+                .provinces
+                .values()
+                .filter(|p| p.info.is_some())
+                .count();
+            // Joueurs de chaque province.
+            let mut by_prov: HashMap<[i32; 2], Vec<usize>> = HashMap::new();
+            for i in 0..n {
+                by_prov
+                    .entry(proto::province_of(proto::region_of(home(i)), size))
+                    .or_default()
+                    .push(i);
+            }
+            let mut seq = st.rooms[&room].build.last_seq() + 1;
+            let mut seed = 77u64;
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let secs = 2;
+            let (mut pos_t, mut misc_t, mut arch_t, mut lease_t, mut beat_t, mut up_t) = (
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            let (mut bytes, mut msgs, mut cells, mut entries_n) = (0, 0, 0, 0usize);
+            let mut next_n = 1u64;
+            for _ in 0..secs {
+                // Copies de la seconde, préparées d'abord (pas comptées) : un bloc toutes
+                // les 2 s par joueur, envoyés par chaque province toutes les 100 ms.
+                let mut work: Vec<(u64, Request)> = Vec::new();
+                for &(p, host, epoch) in &provs {
+                    let Some(authors) = by_prov.get(&p) else {
+                        continue;
+                    };
+                    let per = authors.len() / 2;
+                    for k in 0..10 {
+                        let mut entries = Vec::new();
+                        for _ in (per * k / 10)..(per * (k + 1) / 10) {
+                            let i = authors[rnd() as usize % authors.len()];
+                            let c = home(i);
+                            let pos = [
+                                c[0] * 16 + (rnd() % 16) as i32,
+                                60 + (rnd() % 30) as i32,
+                                c[1] * 16 + (rnd() % 16) as i32,
+                            ];
+                            seq += 1;
+                            let data = game::encode(&game::BuildMsg::Set {
+                                pos,
+                                block: 1 + (rnd() % 40) as u16,
+                                by: format!("J{i}"),
+                                seq,
+                            });
+                            entries.push((proto::zone_of(c), seq, data));
+                        }
+                        entries_n += entries.len();
+                        work.push((
+                            host,
+                            Request::ProvinceArchive {
+                                room,
+                                province: p,
+                                epoch,
+                                n: next_n,
+                                entries,
+                            },
+                        ));
+                        next_n += 1;
+                    }
+                }
+                st.last_upkeep = Instant::now();
+                let t = Instant::now();
+                for (i, &id) in players.iter().enumerate() {
+                    if rnd() % 4 == 0 {
+                        let mut chunk = home(i);
+                        chunk[0] += (rnd() % 3) as i32 - 1;
+                        crowd.ask(st, id, Request::Position { chunk });
+                    }
+                }
+                pos_t += t.elapsed();
+                let t = Instant::now();
+                for (i, &id) in players.iter().enumerate() {
+                    if rnd() % 10 == 0 {
+                        let c = home(i);
+                        crowd.ask(
+                            st,
+                            id,
+                            Request::Spot {
+                                pos: [c[0] as f32 * 16.0, 70.0, c[1] as f32 * 16.0],
+                                yaw: 0.0,
+                                pitch: 0.0,
+                            },
+                        );
+                    }
+                }
+                misc_t += t.elapsed();
+                let t = Instant::now();
+                for (host, req) in work {
+                    crowd.ask(st, host, req);
+                }
+                arch_t += t.elapsed();
+                // Baux : toutes les 300 ms par province.
+                let t = Instant::now();
+                for _ in 0..3 {
+                    for &(p, host, epoch) in &provs {
+                        crowd.ask(
+                            st,
+                            host,
+                            Request::ProvinceLease {
+                                room,
+                                province: p,
+                                epoch,
+                                t: now_ms(),
+                            },
+                        );
+                    }
+                }
+                lease_t += t.elapsed();
+                let t = Instant::now();
+                for _ in 0..2 {
+                    guards::send_pause(st, room, false, false);
+                }
+                beat_t += t.elapsed();
+                let t = Instant::now();
+                crowd.upkeep(st);
+                up_t += t.elapsed();
+                let s = crowd.sent();
+                (bytes, msgs, cells) = (bytes + s.0, msgs + s.1, cells + s.2);
+            }
+            for c in st.conns.values_mut() {
+                c.probed = None;
+                c.probe = None;
+            }
+            let t = Instant::now();
+            probe_links(st);
+            let all = crowd.sent();
+            let rate = garants as f64 / 4.0 + (all.1 - garants) as f64 / 60.0;
+            let share = rate / all.1.max(1) as f64;
+            let probe = t.elapsed().mul_f64(share);
+            let probes = (
+                (all.0 as f64 * share) as usize * 4,
+                (all.1 as f64 * share) as usize * 4,
+            );
+            let per = |d: Duration| d.as_secs_f64() * 1e3 / secs as f64;
+            let total = per(pos_t)
+                + per(misc_t)
+                + per(arch_t)
+                + per(lease_t)
+                + per(beat_t)
+                + per(up_t)
+                + probe.as_secs_f64() * 1e3;
+            eprintln!(
+                "PROVINCES {n:>6} joueurs, {} provinces confiées sur {}, {} modifications \
+                 gardées/s | arrivée {:.1} µs par joueur | une seconde de jeu : {total:.0} ms de \
+                 calcul = positions {:.0} + retours {:.0} + copies des provinces {:.0} + baux \
+                 {:.0} + battements {:.0} + sondes {:.0} + entretien {:.0} | envoyé par \
+                 seconde : {} messages ({} sondes), {} blocs, {:.2} Mbit/s",
+                delegated,
+                by_prov.len(),
+                entries_n / secs,
+                join.as_secs_f64() * 1e6 / n as f64,
+                per(pos_t),
+                per(misc_t),
+                per(arch_t),
+                per(lease_t),
                 per(beat_t),
                 probe.as_secs_f64() * 1e3,
                 per(up_t),
