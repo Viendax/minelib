@@ -715,7 +715,7 @@ impl Session {
                 && !self.player.on_ladder
                 && self.player.swimming.is_none();
             self.coast = if coasting { self.coast + dt } else { 0.0 };
-            if self.coast > 0.6 && !self.coast_logged {
+            if self.coast > 0.3 && !self.coast_logged {
                 self.coast_logged = true;
                 log::warn!(
                     "le joueur avance sans touche depuis {:.1} s : vitesse {:?}, mode {:?}, \

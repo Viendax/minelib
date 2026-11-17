@@ -294,6 +294,14 @@ fn shade(world: &World, x: i32, feet: i32, z: i32) -> u8 {
 /// Fichier du relevé d'une carte.
 const SURVEY_FILE: &str = "radar.bin";
 
+/// Révision de la méthode de relevé : la changer refait les relevés déjà enregistrés.
+const SURVEY_REV: u64 = 2;
+
+/// Empreinte attendue d'un relevé à jour de la carte `dir`.
+fn survey_stamp(dir: &std::path::Path) -> u64 {
+    crate::fpsmap::stamp(dir) ^ SURVEY_REV.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 /// Relevé d'une carte FPS : toutes les cases où un joueur peut se tenir en partant des
 /// zones de départ (marche, saut, chute, échelle), et les murs qui bornent ces cases. Fait
 /// une fois quand la carte est signée, puis gardé avec elle : la minimap est la même pour
@@ -356,7 +364,7 @@ impl Survey {
     pub fn load(dir: &std::path::Path) -> Option<Self> {
         let s: Self = minelib_net::game::decode(&std::fs::read(dir.join(SURVEY_FILE)).ok()?)?;
         let cols = s.size[0] as usize * s.size[1] as usize;
-        (s.stamp == crate::fpsmap::stamp(dir) && s.floors.len() == cols && s.walls.len() == cols)
+        (s.stamp == survey_stamp(dir) && s.floors.len() == cols && s.walls.len() == cols)
             .then_some(s)
     }
 
@@ -467,25 +475,30 @@ impl Survey {
                 }
             }
             for dir in DIRS {
+                let diag = dir[0] != 0 && dir[1] != 0;
+                // En diagonale, le corps (0,6 bloc de large) ne passe pas entre deux blocs
+                // qui se touchent par un coin, ni en rasant un seul : les deux cases de
+                // côté doivent être libres à chaque pas.
+                let open = |from: Cell| {
+                    !diag
+                        || (room([from[0] + dir[0], from[1], from[2]])
+                            && room([from[0], from[1], from[2] + dir[1]]))
+                };
                 // Marcher (et tomber du bord).
-                let n = [c[0] + dir[0], c[1], c[2] + dir[1]];
-                // En diagonale : pas entre deux coins qui se touchent.
-                let squeezed = dir[0] != 0
-                    && dir[1] != 0
-                    && !room([c[0] + dir[0], c[1], c[2]])
-                    && !room([c[0], c[1], c[2] + dir[1]]);
-                if !squeezed {
-                    go(land(n));
+                if open(c) {
+                    go(land([c[0] + dir[0], c[1], c[2] + dir[1]]));
                 }
                 // Sauter : une case plus haut, jusqu'à 3 cases plus loin (2 pour monter).
                 if !pass(up(c, 2)) {
                     continue;
                 }
+                let mut at = up(c, 1);
                 for dist in 1..=3 {
-                    let p = [c[0] + dir[0] * dist, c[1] + 1, c[2] + dir[1] * dist];
-                    if !room(p) {
+                    let p = [at[0] + dir[0], at[1], at[2] + dir[1]];
+                    if !room(p) || !open(at) {
                         break;
                     }
+                    at = p;
                     match land(p) {
                         Some(l) if l[1] > c[1] && dist == 3 => {}
                         l => go(l),
@@ -559,7 +572,7 @@ pub fn survey_in_background(dir: &std::path::Path) {
         .spawn(move || {
             let dir = job;
             let t = std::time::Instant::now();
-            let stamp = crate::fpsmap::stamp(&dir);
+            let stamp = survey_stamp(&dir);
             let map = crate::fpsmap::load(&dir);
             if let Ok((_, mut world)) = crate::save::load_world(&dir) {
                 // Tous les chunks enregistrés, et ceux autour des zones (monde généré).
@@ -609,6 +622,45 @@ mod tests {
     use super::*;
     use minelib_world::{BlockId, ChunkPos};
 
+    /// Débogage : blocs d'une région d'une vraie carte, et nombre de barrières.
+    #[test]
+    #[ignore]
+    fn dump_region() {
+        let dir = std::path::PathBuf::from(std::env::var("MINELIB_SAVE").unwrap());
+        let (_, mut world) = crate::save::load_world(&dir).unwrap();
+        let all: Vec<_> = world.bases().map(|b| b.0).collect();
+        for c in &all {
+            world.ensure_chunk(*c);
+        }
+        let mut count = std::collections::HashMap::new();
+        for c in &all {
+            for y in 0..256 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let k = world.get(c.x * 16 + x, y, c.z * 16 + z);
+                        let key = &k.def().key;
+                        if key.contains("barrier") || key == "air" {
+                            *count.entry(key.clone()).or_insert(0u64) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!("{count:?}");
+        for y in (150..=157).rev() {
+            println!("y={y}");
+            for z in 117..=124 {
+                let row: Vec<String> = (-4..=5)
+                    .map(|x| {
+                        let k = world.get(x, y, z).def().key.clone();
+                        format!("{:>10.10}", k)
+                    })
+                    .collect();
+                println!("z{z} {}", row.join(" "));
+            }
+        }
+    }
+
     /// Débogage : relevé d'une vraie carte (`MINELIB_SAVE`), écrit en image PGM.
     #[test]
     #[ignore]
@@ -644,6 +696,54 @@ mod tests {
             out.push('\n');
         }
         std::fs::write("/tmp/claude-0/survey.pgm", out).unwrap();
+    }
+
+    #[test]
+    fn the_survey_does_not_squeeze_between_two_blocks_touching_by_a_corner() {
+        use minelib_net::game::Zone;
+        let mut w = World::new(0);
+        for dz in -1..=2 {
+            for dx in -1..=2 {
+                w.insert_empty(ChunkPos { x: dx, z: dz });
+            }
+        }
+        let stone = BlockId::STONE;
+        // Un grand sol, et une salle dont un mur fait une marche : z = 9 pour x ≤ 6,
+        // z = 10 pour x ≥ 7. Les deux pans ne se touchent que par l'arête.
+        for x in -8..=24 {
+            for z in -8..=24 {
+                w.set(x, 10, z, stone);
+            }
+        }
+        for y in 11..17 {
+            for x in 0..=13 {
+                w.set(x, y, 0, stone);
+                w.set(x, y, if x <= 6 { 9 } else { 10 }, stone);
+            }
+            for z in 0..=10 {
+                w.set(0, y, z, stone);
+                w.set(13, y, z, stone);
+            }
+        }
+        let map = FpsMap {
+            ct: Some(Zone::new([2, 11, 2], [4, 12, 4])),
+            ..Default::default()
+        };
+        let s = Survey::of(&w, &map);
+        let floors = |x: i32, z: i32| s.col(x, z).map(|c| s.floors[c].clone()).unwrap_or_default();
+        assert_eq!(
+            floors(7, 9),
+            vec![11],
+            "le renfoncement fait partie de la salle"
+        );
+        assert!(
+            floors(6, 10).is_empty(),
+            "passé en diagonale entre deux blocs"
+        );
+        assert!(
+            floors(6, 14).is_empty() && floors(-4, 4).is_empty(),
+            "dehors"
+        );
     }
 
     #[test]

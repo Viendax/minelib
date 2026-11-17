@@ -96,6 +96,11 @@ pub mod cs {
     /// Pas de temps du serveur de CS (64 ticks/s) : la fatigue au sol s'applique par tick.
     pub const TICK: f32 = 1.0 / 64.0;
 }
+/// Freinage quand aucune touche de déplacement n'est tenue (par seconde) : en vol, au sol
+/// et en l'air (hors mode FPS, qui suit la friction de CS).
+const FLY_BRAKE: f32 = 45.0;
+const GROUND_BRAKE: f32 = 30.0;
+const AIR_BRAKE: f32 = 9.0;
 const FLY: f32 = 12.0;
 const FLY_SPRINT: f32 = 30.0;
 /// Tolérance de contact (erreurs d'arrondi) : en deçà, deux faces se touchent sans se
@@ -388,8 +393,15 @@ impl Player {
         if self.flying {
             let speed = if m.sprint { FLY_SPRINT } else { FLY };
             let target = wish * speed + Vec3::Y * m.up * speed;
-            // Accélération/freinage doux en vol.
-            self.vel = self.vel.lerp(target, (dt * 10.0).min(1.0));
+            // On prend de la vitesse en douceur, mais on s'arrête net : touche relâchée,
+            // le vol ne continue pas sur son élan (à 30 blocs/s il glissait 3 blocs).
+            for a in 0..3 {
+                let k = if target[a] == 0.0 { FLY_BRAKE } else { 10.0 };
+                self.vel[a] += (target[a] - self.vel[a]) * (dt * k).min(1.0);
+                if target[a] == 0.0 && self.vel[a].abs() < 0.05 {
+                    self.vel[a] = 0.0;
+                }
+            }
         } else if fps {
             self.cs_move(m, wish, dt);
         } else {
@@ -401,10 +413,22 @@ impl Player {
                 WALK
             };
             let target = wish * speed;
-            let control = if self.on_ground { 14.0 } else { 3.0 };
+            // Touches relâchées : on s'arrête net (au sol comme en l'air), sans continuer
+            // sur son élan.
+            let idle = wish.length_squared() == 0.0;
+            let control = match (self.on_ground, idle) {
+                (true, false) => 14.0,
+                (true, true) => GROUND_BRAKE,
+                (false, false) => 3.0,
+                (false, true) => AIR_BRAKE,
+            };
             let k = (dt * control).min(1.0);
             self.vel.x += (target.x - self.vel.x) * k;
             self.vel.z += (target.z - self.vel.z) * k;
+            if idle && self.vel.x.hypot(self.vel.z) < 0.05 {
+                self.vel.x = 0.0;
+                self.vel.z = 0.0;
+            }
             self.vel.y -= GRAVITY * dt;
             self.vel.y = self.vel.y.max(-60.0);
             if m.jump && self.on_ground {
@@ -1820,6 +1844,58 @@ mod stop_tests {
     /// Touche d'avance tenue longtemps puis relâchée : le joueur s'arrête tout de suite
     /// (moins d'un demi-bloc de glisse, à l'arrêt en moins de 0,4 s), en FPS comme en
     /// construction.
+    #[test]
+    fn flight_and_build_walking_stop_dead_when_the_keys_are_released() {
+        let mut w = World::new(0);
+        for x in -2..2 {
+            for z in -80..4 {
+                w.insert_empty(minelib_world::ChunkPos { x, z });
+            }
+        }
+        for x in -20..20 {
+            for z in -1200..40 {
+                w.set(x, 60, z, minelib_world::BlockId::STONE);
+            }
+        }
+        let dt = crate::session::SIM_TICK;
+        // (vol, saut tenu, glissade permise en blocs)
+        for (flying, jump, slack) in [(true, false, 1.0), (false, false, 0.3), (false, true, 1.0)] {
+            let mut p = Player::new(Vec3::new(0.5, if flying { 70.0 } else { 61.0 }, 0.5));
+            p.pitch = 0.0;
+            p.flying = flying;
+            let go = MoveInput {
+                forward: 1.0,
+                sprint: true,
+                jump,
+                ..Default::default()
+            };
+            let stop = MoveInput {
+                jump,
+                ..Default::default()
+            };
+            for _ in 0..(256 * 30) {
+                p.update(&w, &go, dt);
+            }
+            let (at, speed) = (p.pos, p.ground_speed());
+            assert!(
+                speed > if flying { 29.0 } else { 6.0 },
+                "pleine vitesse : {speed}"
+            );
+            let mut stopped = None;
+            for i in 0..256 {
+                p.update(&w, &stop, dt);
+                if stopped.is_none() && p.ground_speed() < 0.05 {
+                    stopped = Some(i as f32 * dt);
+                }
+            }
+            let slid = Vec3::new(p.pos.x - at.x, 0.0, p.pos.z - at.z).length();
+            assert!(
+                slid < slack && stopped.is_some_and(|t| t < 0.6),
+                "vol {flying}, saut {jump} : glisse {slid} blocs, arrêt {stopped:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_player_stops_right_after_a_long_run() {
         let mut w = World::new(0);
