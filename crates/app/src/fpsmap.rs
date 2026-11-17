@@ -204,7 +204,7 @@ pub struct SigCache {
     cache: HashMap<PathBuf, (u64, [u8; 32])>,
 }
 
-fn stamp(dir: &Path) -> u64 {
+pub(crate) fn stamp(dir: &Path) -> u64 {
     [
         "level.txt",
         "edits.bin",
@@ -236,6 +236,9 @@ impl SigCache {
             }
         }
         let sig = package(dir).ok()?.signature();
+        // Carte signée : son relevé (où un joueur peut aller depuis les départs, et les
+        // murs qui le bornent) est refait en tâche de fond pour la minimap.
+        crate::radar::survey_in_background(dir);
         self.cache.insert(dir.to_path_buf(), (st, sig));
         Some(sig)
     }

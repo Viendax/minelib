@@ -229,6 +229,8 @@ pub struct Fps {
     blood: Vec<(Vec3, Vec3, f32)>,
     flash: f32,
     kick: f32,
+    /// Dual Berettas : le pistolet de gauche vient de tirer (ils tirent l'un après l'autre).
+    left_fired: bool,
     pub buy_open: bool,
     rng: u32,
     /// En main : arme à feu, couteau ou grenade ; et ce qui était en main avant (touche Q).
@@ -297,6 +299,7 @@ impl Fps {
             blood: Vec::new(),
             flash: 0.0,
             kick: 0.0,
+            left_fired: true,
             buy_open: false,
             rng: 0x9e37_79b9,
             sel: Sel::Secondary,
@@ -966,6 +969,7 @@ impl Fps {
         self.since_shot = 0.0;
         self.flash = 0.05;
         self.kick = 1.0;
+        self.left_fired = !self.left_fired;
         // Recul : la balle suit le motif ; la vue en montre environ la moitié.
         let (up, side) = def.spray(self.spray_n);
         self.spray_n += 1;
@@ -1265,12 +1269,17 @@ impl Fps {
 
     /// Placement de l'arme dans le repère de la vue (droite, bas, devant).
     fn gun_place(&self, def: usize) -> Mat4 {
+        self.gun_place_with(def, self.kick)
+    }
+
+    /// Place de l'arme avec un recul `kick` donné (0 : au repos).
+    fn gun_place_with(&self, def: usize, kick: f32) -> Mat4 {
         let d = &WEAPONS[def];
         let reload = self
             .reload
             .map_or(0.0, |t| (t / d.reload_s).clamp(0.0, 1.0));
         let dip = (reload * std::f32::consts::PI).sin();
-        let k = self.kick;
+        let k = kick;
         let len = d.length;
         let scoped = self.scope_fov().is_some();
         // Arme en bas à droite, l'arrière à ~25 cm de l'œil, le canon vers le centre.
@@ -1352,28 +1361,52 @@ impl Fps {
         if self.scope_fov().is_some() {
             return out;
         }
-        let m = self.gun_place(g.def);
-        let mvp = proj * m;
         let sun = Vec3::new(0.3, 0.9, 0.4).normalize();
-        for t in &weapons::model(g.def).tris {
-            let n = (t.p[1] - t.p[0]).cross(t.p[2] - t.p[0]).normalize_or_zero();
-            let n = m.transform_vector3(n);
-            let shade = 0.45 + 0.55 * n.dot(sun).abs();
-            // Couleurs très sombres du pack (métal noir) : un peu relevées pour rester lisibles.
-            let c = t.color.map(|v| (v * 2.2 + 0.015) * shade);
-            for p in t.p {
-                out.push(VmVertex {
-                    clip: (mvp * p.extend(1.0)).to_array(),
-                    uv: [0.0, 0.0],
-                    layer: NO_TEXTURE,
-                    _pad: 0,
-                    color: [c[0] * light[0], c[1] * light[1], c[2] * light[2], 1.0],
-                });
+        let model = weapons::model(g.def);
+        // Dual Berettas : un pistolet dans chaque main, placés en miroir de part et
+        // d'autre de l'écran ; ils tirent l'un après l'autre (recul et flamme du côté qui
+        // vient de tirer). Le modèle porte les deux pistolets : le premier sert aux deux.
+        let dual = WEAPONS[g.def].name == "Dual Berettas";
+        let mirror = Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0));
+        let kick = |left: bool| {
+            if !dual || left == self.left_fired {
+                self.kick
+            } else {
+                0.0
+            }
+        };
+        let right = self.gun_place_with(g.def, kick(false));
+        let left = mirror * self.gun_place_with(g.def, kick(true)) * mirror;
+        let one = if dual {
+            model.tris.len() / 2
+        } else {
+            model.tris.len()
+        };
+        let places: &[Mat4] = if dual { &[right, left] } else { &[right] };
+        for &m in places {
+            let mvp = proj * m;
+            for t in &model.tris[..one] {
+                let n = (t.p[1] - t.p[0]).cross(t.p[2] - t.p[0]).normalize_or_zero();
+                let n = m.transform_vector3(n);
+                let shade = 0.45 + 0.55 * n.dot(sun).abs();
+                // Couleurs très sombres du pack (métal noir) : un peu relevées pour rester
+                // lisibles.
+                let c = t.color.map(|v| (v * 2.2 + 0.015) * shade);
+                for p in t.p {
+                    out.push(VmVertex {
+                        clip: (mvp * p.extend(1.0)).to_array(),
+                        uv: [0.0, 0.0],
+                        layer: NO_TEXTURE,
+                        _pad: 0,
+                        color: [c[0] * light[0], c[1] * light[1], c[2] * light[2], 1.0],
+                    });
+                }
             }
         }
-        // Flamme du canon, juste après un tir.
+        // Flamme du canon, juste après un tir (du côté qui a tiré).
         if self.flash > 0.0 {
-            let tip = m.transform_point3(weapons::model(g.def).muzzle);
+            let m = if dual && self.left_fired { left } else { right };
+            let tip = m.transform_point3(model.muzzle);
             // Étoile de deux carrés croisés, jaune orangé.
             let s = 0.018 + 0.012 * (self.flash / 0.05);
             let c = [2.4, 1.5, 0.4, 1.0];

@@ -236,7 +236,8 @@ fn draw_file(name: &str) -> &'static str {
 /// Fichier et volume d'un son.
 fn file_of(sfx: Sfx) -> (&'static str, f32) {
     match sfx {
-        Sfx::Shot(i) => (shot_file(WEAPONS[i].name), 0.55),
+        // Les tirs dominent nettement les pas (comme dans CS).
+        Sfx::Shot(i) => (shot_file(WEAPONS[i].name), 1.0),
         Sfx::Reload(i) => {
             let d = &WEAPONS[i];
             let f = if d.category == Category::Pistol {
@@ -282,9 +283,9 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             const STEPS: [&str; 6] = ["step_1", "step_2", "step_3", "step_4", "step_5", "step_6"];
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (STEPS[n % 6], 0.45)
+            (STEPS[n % 6], 0.2)
         }
-        Sfx::Land => ("land", 0.75),
+        Sfx::Land => ("land", 0.5),
         Sfx::Splash => ("splash", 0.8),
         Sfx::Door => ("door", 0.8),
         Sfx::Ladder => ("ladder", 0.7),

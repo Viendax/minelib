@@ -532,6 +532,7 @@ impl Session {
         if self.net.is_some() {
             if !self.radar_map {
                 self.radar.set_map(&crate::fpsmap::load(&self.dir));
+                self.radar.set_dir(&self.dir);
                 self.radar_map = true;
             }
             self.radar.update(&self.world, self.player.pos);
@@ -2746,7 +2747,7 @@ impl Session {
                 true
             }
             // Liste blanche d'un serveur de construction (OP) : comme dans Minecraft.
-            "whitelist" | "withlist" | "wl" | "listeblanche" => {
+            "whitelist" | "withlist" | "whitlist" | "whithlist" | "wl" | "listeblanche" => {
                 use minelib_net::proto;
                 if self.build.is_none() {
                     self.chat.say(

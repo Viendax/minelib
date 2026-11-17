@@ -1812,3 +1812,55 @@ mod tests {
         assert_eq!(p.duck_speed, cs::DUCK_SPEED_MAX);
     }
 }
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// Touche d'avance tenue longtemps puis relâchée : le joueur s'arrête tout de suite
+    /// (moins d'un demi-bloc de glisse, à l'arrêt en moins de 0,4 s), en FPS comme en
+    /// construction.
+    #[test]
+    fn the_player_stops_right_after_a_long_run() {
+        let mut w = World::new(0);
+        // (Le joueur regarde vers −Z.)
+        for x in -2..2 {
+            for z in -40..4 {
+                w.insert_empty(minelib_world::ChunkPos { x, z });
+            }
+        }
+        for x in -20..20 {
+            for z in -600..40 {
+                w.set(x, 60, z, minelib_world::BlockId::STONE);
+            }
+        }
+        for fps in [true, false] {
+            let mut p = Player::new(Vec3::new(0.5, 61.0, 0.5));
+            p.pitch = 0.0;
+            let dt = 1.0 / 128.0;
+            let go = MoveInput {
+                forward: 1.0,
+                fps,
+                ..Default::default()
+            };
+            let stop = MoveInput {
+                fps,
+                ..Default::default()
+            };
+            for _ in 0..(128 * 20) {
+                p.update(&w, &go, dt);
+            }
+            let at = p.pos;
+            let mut stopped = None;
+            for i in 0..(128 * 3) {
+                p.update(&w, &stop, dt);
+                if stopped.is_none() && Vec3::new(p.vel.x, 0.0, p.vel.z).length() < 0.05 {
+                    stopped = Some(i as f32 * dt);
+                }
+            }
+            assert!(p.on_ground && at.z < -40.0, "il a bien couru : {at:?}");
+            assert!(stopped.is_some_and(|t| t < 0.4), "fps {fps} : {stopped:?}");
+            assert!((p.pos - at).length() < 0.5, "fps {fps}");
+        }
+    }
+}

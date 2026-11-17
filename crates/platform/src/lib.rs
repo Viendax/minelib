@@ -33,6 +33,12 @@ pub struct Input {
     raw_down: HashSet<KeyCode>,
     /// Touches relâchées d'après le clavier, à comparer à ce qu'en dit Windows.
     raw_released: Vec<(KeyCode, Instant)>,
+    /// Répétitions automatiques reçues pour chaque touche tenue (nombre, dernière) : au
+    /// relâchement d'une touche tenue longtemps, le journal dit ce que Windows et le
+    /// clavier en disaient (pour trouver d'où vient une touche qui « reste enfoncée »).
+    repeats: std::collections::HashMap<KeyCode, (u32, Instant)>,
+    /// La saisie brute du clavier arrive-t-elle (notée une fois) ?
+    raw_seen: bool,
     /// Touches déjà signalées au journal (une fois chacune).
     #[cfg_attr(not(windows), allow(dead_code))]
     raw_warned: HashSet<KeyCode>,
@@ -68,6 +74,32 @@ impl Input {
 
     pub fn held(&self, k: KeyCode) -> bool {
         self.held.contains(&k)
+    }
+
+    /// Une touche tenue vient d'être relâchée (d'après `source`) : tenue plus de 2 s,
+    /// le journal garde de quoi comprendre une touche restée enfoncée trop longtemps
+    /// (Windows envoyait-il encore des répétitions ? le clavier la disait-il enfoncée ?).
+    fn note_release(&mut self, code: KeyCode, source: &str) {
+        let held = self
+            .pressed_at
+            .get(&code)
+            .map_or(0.0, |t| t.elapsed().as_secs_f32());
+        let reps = self.repeats.remove(&code);
+        if held < 2.0 {
+            return;
+        }
+        let (n, last) = reps.map_or((0, f32::NAN), |r| (r.0, r.1.elapsed().as_secs_f32()));
+        log::info!(
+            "touche {code:?} relâchée après {held:.2} s (vu par : {source}) ; {n} répétitions \
+             de Windows, la dernière il y a {last:.2} s ; clavier brut : {}",
+            if !self.raw_seen {
+                "pas de saisie brute"
+            } else if self.raw_down.contains(&code) {
+                "encore enfoncée"
+            } else {
+                "relâchée"
+            }
+        );
     }
     /// Vrai uniquement sur l'image où la touche a été enfoncée.
     pub fn pressed(&self, k: KeyCode) -> bool {
@@ -252,10 +284,19 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                         // fois d'avant (son relâchement a été avalé par un logiciel), donc
                         // ce nouvel appui lui paraît une répétition ; le clavier, lui, dit
                         // qu'elle vient d'être enfoncée : c'est un vrai appui.
+                        if event.repeat {
+                            let r = self
+                                .input
+                                .repeats
+                                .entry(code)
+                                .or_insert((0, Instant::now()));
+                            *r = (r.0 + 1, Instant::now());
+                        }
                         let fresh = !event.repeat
                             || (self.input.raw_down.contains(&code)
                                 && !self.input.held.contains(&code));
                         if fresh {
+                            self.input.repeats.remove(&code);
                             self.input.pressed.insert(code);
                             self.input.held.insert(code);
                             self.input.pressed_at.insert(code, Instant::now());
@@ -265,7 +306,9 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                         }
                     }
                     ElementState::Released => {
-                        self.input.held.remove(&code);
+                        if self.input.held.remove(&code) {
+                            self.input.note_release(code, "message de Windows");
+                        }
                     }
                 }
             }
@@ -356,11 +399,16 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                 };
                 match raw.state {
                     ElementState::Pressed => {
+                        if !self.input.raw_seen {
+                            self.input.raw_seen = true;
+                            log::info!("clavier : la saisie brute arrive");
+                        }
                         self.input.raw_down.insert(code);
                     }
                     ElementState::Released => {
                         self.input.raw_down.remove(&code);
                         if self.input.held.remove(&code) {
+                            self.input.note_release(code, "clavier (saisie brute)");
                             self.input.raw_released.push((code, Instant::now()));
                         }
                     }
@@ -749,6 +797,7 @@ fn release_stale_keys(input: &mut Input) {
             "touche {code:?} relâchée sans message du système : rattrapée ({since:.2} s après l'appui)"
         );
         input.held.remove(&code);
+        input.note_release(code, "état du système");
     }
 }
 

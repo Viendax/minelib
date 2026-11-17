@@ -38,6 +38,12 @@ pub struct Radar {
     next_row: usize,
     /// Sites de bombe : lettre et centre (x, z).
     sites: Vec<(char, [f32; 2])>,
+    /// Relevé de la carte (où l'on peut aller, murs qui bornent) : la minimap ne montre
+    /// alors que lui. Sans relevé (pas encore fait) : les blocs autour du joueur.
+    survey: Option<Survey>,
+    /// Dossier de la carte, et temps avant de regarder de nouveau si le relevé est prêt.
+    dir: Option<std::path::PathBuf>,
+    poll: f32,
 }
 
 impl Radar {
@@ -59,9 +65,38 @@ impl Radar {
             .collect();
     }
 
+    /// Carte jouée : son relevé est lu (ou lancé en tâche de fond s'il manque).
+    pub fn set_dir(&mut self, dir: &std::path::Path) {
+        self.dir = Some(dir.to_path_buf());
+        self.poll = 0.0;
+    }
+
+    /// Le relevé de la carte est-il arrivé ? (Regardé une fois par seconde.)
+    fn poll_survey(&mut self, dt: f32) {
+        if self.survey.is_some() {
+            return;
+        }
+        self.poll -= dt;
+        let Some(dir) = self.dir.clone().filter(|_| self.poll <= 0.0) else {
+            return;
+        };
+        self.poll = 1.0;
+        match Survey::load(&dir) {
+            // Carte sans zones de départ : rien à relever, on garde les blocs autour.
+            Some(s) if s.size == [0, 0] => self.dir = None,
+            Some(s) => {
+                self.survey = Some(s);
+                // Tout redessiner d'après le relevé.
+                self.center = None;
+            }
+            None => survey_in_background(&dir),
+        }
+    }
+
     /// Suit le joueur : la grille est recentrée (en gardant ce qui est déjà calculé) quand
     /// il s'éloigne du centre, et quelques lignes sont recalculées à chaque image.
     pub fn update(&mut self, world: &World, feet: Vec3) {
+        self.poll_survey(1.0 / 60.0);
         let c = [
             feet.x.floor() as i32,
             feet.y.floor() as i32,
@@ -112,7 +147,10 @@ impl Radar {
         let z = c[2] - GRID + row as i32;
         for dx in 0..SIDE {
             let x = c[0] - GRID + dx as i32;
-            self.cells[row * SIDE + dx] = shade(world, x, c[1], z);
+            self.cells[row * SIDE + dx] = match &self.survey {
+                Some(s) => s.shade(x, c[1], z),
+                None => shade(world, x, c[1], z),
+            };
         }
     }
 
@@ -253,10 +291,446 @@ fn shade(world: &World, x: i32, feet: i32, z: i32) -> u8 {
     0
 }
 
+/// Fichier du relevé d'une carte.
+const SURVEY_FILE: &str = "radar.bin";
+
+/// Relevé d'une carte FPS : toutes les cases où un joueur peut se tenir en partant des
+/// zones de départ (marche, saut, chute, échelle), et les murs qui bornent ces cases. Fait
+/// une fois quand la carte est signée, puis gardé avec elle : la minimap est la même pour
+/// tous et ne montre aucun mur inutile (décor hors d'atteinte, dessous de la carte).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct Survey {
+    /// Empreinte des fichiers de la carte au moment du relevé (refait si elle change).
+    stamp: u64,
+    /// Coin (x, z) et taille (en x, en z) du rectangle relevé.
+    min: [i32; 2],
+    size: [u32; 2],
+    /// Par colonne (z puis x) : hauteurs des cases où l'on peut se tenir, et hauteurs où
+    /// la colonne fait mur pour une case voisine atteignable.
+    floors: Vec<Vec<i16>>,
+    walls: Vec<Vec<i16>>,
+}
+
+/// Plus longue chute qui fait encore partie de la carte (blocs).
+const SURVEY_FALL: i32 = 7;
+
+/// Cases explorées au plus (carte immense ou ouverte sur un terrain sans fin).
+const SURVEY_MAX: usize = 3_000_000;
+
+impl Survey {
+    fn col(&self, x: i32, z: i32) -> Option<usize> {
+        let (dx, dz) = (x - self.min[0], z - self.min[1]);
+        ((0..self.size[0] as i32).contains(&dx) && (0..self.size[1] as i32).contains(&dz))
+            .then(|| dz as usize * self.size[0] as usize + dx as usize)
+    }
+
+    /// Teinte de la colonne (`SHADES`) pour un joueur dont les pieds sont à la hauteur
+    /// `feet` : le sol atteignable le plus proche de sa hauteur, sinon un mur à sa
+    /// hauteur, sinon rien.
+    fn shade(&self, x: i32, feet: i32, z: i32) -> u8 {
+        let Some(c) = self.col(x, z) else { return 0 };
+        let near = self.floors[c]
+            .iter()
+            .map(|&f| feet - f as i32)
+            .filter(|d| (-3..=6).contains(d))
+            .min_by_key(|d| d.abs());
+        if let Some(d) = near {
+            return match d {
+                i32::MIN..=-1 => 4,
+                0 => 3,
+                1..=2 => 2,
+                _ => 1,
+            };
+        }
+        let wall = self.walls[c]
+            .iter()
+            .any(|&w| (-3..=3).contains(&(w as i32 - feet)));
+        if wall {
+            5
+        } else {
+            0
+        }
+    }
+
+    /// Relevé enregistré avec la carte `dir`, s'il est à jour.
+    pub fn load(dir: &std::path::Path) -> Option<Self> {
+        let s: Self = minelib_net::game::decode(&std::fs::read(dir.join(SURVEY_FILE)).ok()?)?;
+        let cols = s.size[0] as usize * s.size[1] as usize;
+        (s.stamp == crate::fpsmap::stamp(dir) && s.floors.len() == cols && s.walls.len() == cols)
+            .then_some(s)
+    }
+
+    /// Fait le relevé du monde `world` (chunks déjà chargés) pour la carte `map`.
+    pub fn of(world: &World, map: &FpsMap) -> Self {
+        use minelib_world::ChunkPos;
+        use std::collections::{HashSet, VecDeque};
+        type Cell = [i32; 3];
+        // Hauteur de collision d'une case (16es de bloc ; 0 : on passe au travers). Les
+        // portes comptent comme ouvertes : un passage.
+        let top = |c: Cell| -> u8 {
+            if c[1] < 0 || c[1] >= minelib_world::CHUNK_HEIGHT as i32 {
+                return 0;
+            }
+            let id = world.get(c[0], c[1], c[2]);
+            let def = id.def();
+            if !def.solid || def.key.starts_with("door_") || def.key.starts_with("ladder") {
+                return 0;
+            }
+            // Clôtures, murets, vitres : des barrières, on ne monte pas dessus.
+            if matches!(def.shape, minelib_world::registry::Shape::Post(_)) {
+                return 24;
+            }
+            def.boxes().iter().map(|b| b.1[1]).max().unwrap_or(16)
+        };
+        let loaded = |c: Cell| world.contains(ChunkPos::containing(c[0], c[2]));
+        let up = |c: Cell, d: i32| [c[0], c[1] + d, c[2]];
+        // On traverse la case (rien, ou un obstacle bas : dalle, tapis) ; elle bloque.
+        let pass = |c: Cell| top(c) <= 9;
+        let full = |c: Cell| top(c) > 9;
+        let ladder = |c: Cell| world.get(c[0], c[1], c[2]).def().key.starts_with("ladder");
+        // Place pour le corps (deux cases de haut).
+        let room = |c: Cell| loaded(c) && pass(c) && pass(up(c, 1));
+        let stand = |c: Cell| room(c) && (full(up(c, -1)) || top(c) > 0 || ladder(c));
+        // Lâché dans la case `c` : où l'on atterrit (ou rien : le vide).
+        let land = |mut c: Cell| -> Option<Cell> {
+            if !room(c) {
+                return None;
+            }
+            let from = c[1];
+            while !stand(c) {
+                c = up(c, -1);
+                // Une chute de plus de `SURVEY_FALL` blocs ne fait pas partie de la carte
+                // (on en meurt, ou c'est le dehors) ; de même le vide.
+                if c[1] < 0 || from - c[1] > SURVEY_FALL || !pass(c) {
+                    return None;
+                }
+            }
+            Some(c)
+        };
+        let mut seen: HashSet<Cell> = HashSet::new();
+        let mut queue: VecDeque<Cell> = VecDeque::new();
+        // Départs : toutes les cases des deux zones où l'on peut se tenir.
+        for zone in [&map.ct, &map.t].into_iter().flatten() {
+            for x in zone.min[0]..=zone.max[0] {
+                for z in zone.min[2]..=zone.max[2] {
+                    for y in zone.min[1] - 1..=zone.max[1] + 1 {
+                        let c = [x, y, z];
+                        if stand(c) && seen.insert(c) {
+                            queue.push_back(c);
+                        }
+                    }
+                }
+            }
+        }
+        const DIRS: [[i32; 2]; 8] = [
+            [1, 0],
+            [-1, 0],
+            [0, 1],
+            [0, -1],
+            [1, 1],
+            [1, -1],
+            [-1, 1],
+            [-1, -1],
+        ];
+        // Débogage (`MINELIB_SURVEY_TRACE=x,z`) : par où l'on arrive dans cette colonne.
+        let trace: Option<[i32; 2]> = std::env::var("MINELIB_SURVEY_TRACE").ok().and_then(|v| {
+            let mut it = v.split(',').filter_map(|t| t.trim().parse().ok());
+            Some([it.next()?, it.next()?])
+        });
+        let mut from: std::collections::HashMap<Cell, Cell> = Default::default();
+        while let Some(c) = queue.pop_front() {
+            if seen.len() > SURVEY_MAX {
+                break;
+            }
+            let mut go = |n: Option<Cell>| {
+                if let Some(n) = n {
+                    if seen.insert(n) {
+                        if trace.is_some() {
+                            from.insert(n, c);
+                        }
+                        queue.push_back(n);
+                    }
+                }
+            };
+            // Échelle : monter et descendre.
+            if ladder(c) {
+                for d in [1, -1] {
+                    let n = up(c, d);
+                    if room(n) && (ladder(n) || stand(n)) {
+                        go(Some(n));
+                    } else if d == 1 && room(n) {
+                        // Haut de l'échelle : on en sort vers le rebord d'à côté.
+                        for dir in &DIRS[..4] {
+                            go(land([n[0] + dir[0], n[1], n[2] + dir[1]]));
+                        }
+                    }
+                }
+            }
+            for dir in DIRS {
+                // Marcher (et tomber du bord).
+                let n = [c[0] + dir[0], c[1], c[2] + dir[1]];
+                // En diagonale : pas entre deux coins qui se touchent.
+                let squeezed = dir[0] != 0
+                    && dir[1] != 0
+                    && !room([c[0] + dir[0], c[1], c[2]])
+                    && !room([c[0], c[1], c[2] + dir[1]]);
+                if !squeezed {
+                    go(land(n));
+                }
+                // Sauter : une case plus haut, jusqu'à 3 cases plus loin (2 pour monter).
+                if !pass(up(c, 2)) {
+                    continue;
+                }
+                for dist in 1..=3 {
+                    let p = [c[0] + dir[0] * dist, c[1] + 1, c[2] + dir[1] * dist];
+                    if !room(p) {
+                        break;
+                    }
+                    match land(p) {
+                        Some(l) if l[1] > c[1] && dist == 3 => {}
+                        l => go(l),
+                    }
+                }
+            }
+        }
+        if let Some(t) = trace {
+            let mut at = seen.iter().copied().find(|c| c[0] == t[0] && c[2] == t[1]);
+            while let Some(c) = at {
+                let key = |c: Cell| world.get(c[0], c[1], c[2]).def().key.clone();
+                eprintln!("TRACE {c:?} dans {} sur {}", key(c), key(up(c, -1)));
+                at = from.get(&c).copied();
+            }
+        }
+        // Rectangle relevé : les cases atteintes, plus une de marge pour leurs murs.
+        if seen.is_empty() {
+            return Self::default();
+        }
+        let lo = |k: usize| seen.iter().map(|c| c[k]).min().unwrap_or(0) - 1;
+        let hi = |k: usize| seen.iter().map(|c| c[k]).max().unwrap_or(0) + 1;
+        let min = [lo(0), lo(2)];
+        let size = [(hi(0) - min[0] + 1) as u32, (hi(2) - min[1] + 1) as u32];
+        let mut s = Self {
+            stamp: 0,
+            min,
+            size,
+            floors: vec![Vec::new(); (size[0] * size[1]) as usize],
+            walls: vec![Vec::new(); (size[0] * size[1]) as usize],
+        };
+        for c in &seen {
+            if let Some(i) = s.col(c[0], c[2]) {
+                s.floors[i].push(c[1] as i16);
+            }
+        }
+        // Murs : la colonne voisine d'une case atteinte, quand elle la bloque vraiment
+        // (pas un bord de vide) et qu'on ne peut pas s'y tenir à cette hauteur.
+        for c in &seen {
+            for dir in &DIRS[..4] {
+                let n = [c[0] + dir[0], c[1], c[2] + dir[1]];
+                let blocked = full(n) || full(up(n, 1));
+                let walkable = (-1..=1).any(|d| seen.contains(&up(n, d)));
+                if blocked && !walkable {
+                    if let Some(i) = s.col(n[0], n[2]) {
+                        s.walls[i].push(c[1] as i16);
+                    }
+                }
+            }
+        }
+        for v in s.floors.iter_mut().chain(s.walls.iter_mut()) {
+            v.sort_unstable();
+            v.dedup();
+        }
+        s
+    }
+}
+
+/// Fait (ou refait) le relevé de la carte `dir` en tâche de fond, s'il manque ou n'est
+/// plus à jour, et l'enregistre avec elle. Un seul à la fois par carte.
+pub fn survey_in_background(dir: &std::path::Path) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static BUSY: OnceLock<Mutex<HashSet<std::path::PathBuf>>> = OnceLock::new();
+    let busy = BUSY.get_or_init(Default::default);
+    if Survey::load(dir).is_some() || !busy.lock().unwrap().insert(dir.to_path_buf()) {
+        return;
+    }
+    let job = dir.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("releve-carte".into())
+        .spawn(move || {
+            let dir = job;
+            let t = std::time::Instant::now();
+            let stamp = crate::fpsmap::stamp(&dir);
+            let map = crate::fpsmap::load(&dir);
+            if let Ok((_, mut world)) = crate::save::load_world(&dir) {
+                // Tous les chunks enregistrés, et ceux autour des zones (monde généré).
+                let mut need: HashSet<minelib_world::ChunkPos> =
+                    world.bases().map(|b| b.0).collect();
+                for z in [&map.ct, &map.t]
+                    .into_iter()
+                    .chain(map.sites.iter())
+                    .flatten()
+                {
+                    let c = |v: i32| v.div_euclid(16);
+                    for x in c(z.min[0]) - 6..=c(z.max[0]) + 6 {
+                        for cz in c(z.min[2]) - 6..=c(z.max[2]) + 6 {
+                            need.insert(minelib_world::ChunkPos { x, z: cz });
+                        }
+                    }
+                }
+                for c in need {
+                    world.ensure_chunk(c);
+                }
+                let mut s = Survey::of(&world, &map);
+                s.stamp = stamp;
+                let cells: usize = s.floors.iter().map(Vec::len).sum();
+                let ok = std::fs::write(dir.join(SURVEY_FILE), minelib_net::game::encode(&s));
+                log::info!(
+                    "relevé de la carte pour la minimap : {cells} cases atteignables depuis \
+                     les départs, {} × {} blocs, en {:.1} s{}",
+                    s.size[0],
+                    s.size[1],
+                    t.elapsed().as_secs_f32(),
+                    if ok.is_ok() { "" } else { " (non enregistré)" }
+                );
+            }
+            // (La carte reste « en cours » si le relevé n'a pas pu être écrit : pas de
+            // nouvel essai en boucle.)
+            if Survey::load(&dir).is_some() {
+                busy.lock().unwrap().remove(&dir);
+            }
+        });
+    if spawned.is_err() {
+        busy.lock().unwrap().remove(dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use minelib_world::{BlockId, ChunkPos};
+
+    /// Débogage : relevé d'une vraie carte (`MINELIB_SAVE`), écrit en image PGM.
+    #[test]
+    #[ignore]
+    fn survey_of_a_real_map() {
+        let dir = std::path::PathBuf::from(std::env::var("MINELIB_SAVE").unwrap());
+        let _ = std::fs::remove_file(dir.join(SURVEY_FILE));
+        let t = std::time::Instant::now();
+        survey_in_background(&dir);
+        let s = loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Some(s) = Survey::load(&dir) {
+                break s;
+            }
+            assert!(t.elapsed().as_secs() < 300);
+        };
+        let cells: usize = s.floors.iter().map(Vec::len).sum();
+        println!(
+            "{} cases, {:?} {:?}, {:.1} s",
+            cells,
+            s.min,
+            s.size,
+            t.elapsed().as_secs_f32()
+        );
+        let feet: i32 = std::env::var("FEET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(150);
+        let mut out = format!("P2\n{} {}\n5\n", s.size[0], s.size[1]);
+        for z in 0..s.size[1] as i32 {
+            for x in 0..s.size[0] as i32 {
+                out += &format!("{} ", s.shade(s.min[0] + x, feet, s.min[1] + z));
+            }
+            out.push('\n');
+        }
+        std::fs::write("/tmp/claude-0/survey.pgm", out).unwrap();
+    }
+
+    #[test]
+    fn the_survey_keeps_only_where_players_can_go_and_the_walls_around() {
+        use minelib_net::game::Zone;
+        let mut w = World::new(0);
+        for dz in -1..=2 {
+            for dx in -1..=2 {
+                w.insert_empty(ChunkPos { x: dx, z: dz });
+            }
+        }
+        let stone = BlockId::STONE;
+        // Une salle de 12 × 8 fermée par des murs de 4 de haut (sol y = 10).
+        for x in 0..=13 {
+            for z in 0..=9 {
+                w.set(x, 10, z, stone);
+                if x == 0 || x == 13 || z == 0 || z == 9 {
+                    for y in 11..15 {
+                        w.set(x, y, z, stone);
+                    }
+                }
+            }
+        }
+        // Une caisse d'un bloc (on saute dessus), une colonne de 2 (on n'y monte pas).
+        w.set(4, 11, 4, stone);
+        w.set(8, 11, 4, stone);
+        w.set(8, 12, 4, stone);
+        // Un décor hors d'atteinte, derrière le mur : il ne doit pas apparaître.
+        for y in 11..14 {
+            w.set(20, y, 4, stone);
+        }
+        w.set(20, 10, 4, stone);
+        let zone = Zone::new([1, 11, 1], [3, 12, 3]);
+        let map = FpsMap {
+            ct: Some(zone),
+            ..Default::default()
+        };
+        let s = Survey::of(&w, &map);
+        let floors = |x: i32, z: i32| s.col(x, z).map(|c| s.floors[c].clone()).unwrap_or_default();
+        let walls = |x: i32, z: i32| s.col(x, z).map(|c| s.walls[c].clone()).unwrap_or_default();
+        // Tout le sol de la salle, le dessus de la caisse, pas celui de la colonne.
+        assert_eq!(floors(6, 6), vec![11]);
+        assert_eq!(floors(12, 8), vec![11]);
+        assert_eq!(floors(4, 4), vec![12]);
+        assert!(floors(8, 4).is_empty());
+        // Les murs de la salle et la colonne sont des murs ; la caisse non (on y monte).
+        assert_eq!(walls(0, 5), vec![11]);
+        assert_eq!(walls(13, 5), vec![11]);
+        assert_eq!(walls(8, 4), vec![11]);
+        assert!(walls(4, 4).is_empty());
+        // Rien hors de la salle : ni le dessus des murs, ni le décor derrière.
+        assert!(floors(0, 5).is_empty());
+        assert!(floors(20, 4).is_empty() && walls(20, 4).is_empty());
+        assert!(s.col(20, 4).is_none());
+        // Teintes de la minimap, pieds au sol de la salle (y = 11).
+        assert_eq!(s.shade(6, 11, 6), 3, "sol");
+        assert_eq!(s.shade(4, 11, 4), 4, "caisse, plus haute");
+        assert_eq!(s.shade(0, 11, 5), 5, "mur");
+        assert_eq!(s.shade(8, 11, 4), 5, "colonne");
+        assert_eq!(s.shade(20, 11, 4), 0, "décor inutile");
+        // Une porte dans le mur (un trou de 2 de haut) : le couloir derrière est relevé,
+        // et une échelle mène à une plateforme haute.
+        w.set(13, 11, 5, BlockId::AIR);
+        w.set(13, 12, 5, BlockId::AIR);
+        for x in 14..=18 {
+            w.set(x, 10, 5, stone);
+        }
+        let ladder = minelib_world::registry::registry()
+            .by_key("ladder:0")
+            .or_else(|| minelib_world::registry::registry().by_key("ladder"));
+        if let Some(l) = ladder {
+            for y in 11..16 {
+                w.set(18, y, 5, l);
+                w.set(19, y, 5, stone);
+            }
+            w.set(19, 10, 5, stone);
+        }
+        let s = Survey::of(&w, &map);
+        let floors = |x: i32, z: i32| s.col(x, z).map(|c| s.floors[c].clone()).unwrap_or_default();
+        assert_eq!(floors(13, 5), vec![11]);
+        assert_eq!(floors(16, 5), vec![11]);
+        if ladder.is_some() {
+            assert!(floors(19, 5).contains(&16), "{:?}", floors(19, 5));
+        }
+        // Sans zone de départ : rien.
+        assert_eq!(Survey::of(&w, &FpsMap::default()), Survey::default());
+    }
 
     #[test]
     fn floor_walls_and_void() {

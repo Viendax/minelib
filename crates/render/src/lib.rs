@@ -2481,6 +2481,56 @@ mod tests {
 
     /// Les shaders se compilent (erreur de WGSL vue avant de lancer le jeu), et les
     /// uniformes du monde ont la taille que le shader attend.
+    /// La direction du ciel (`sky_dir` du shader, refaite ici) reste juste très loin de
+    /// l'origine et sous tous les angles : elle ne dépend ni d'une inversion de matrice ni
+    /// de la position de la caméra (ce qui faisait parfois tourner le ciel).
+    #[test]
+    fn the_sky_direction_is_exact_far_from_the_origin() {
+        use glam::{DVec3, Mat4, Vec3};
+        let sky_dir = |m: Mat4, ndc: [f32; 2]| {
+            let c = m.to_cols_array_2d();
+            let row = |r: usize| Vec3::new(c[0][r], c[1][r], c[2][r]);
+            let (rx, ry, rw) = (row(0), row(1), row(3));
+            let d = (rx - ndc[0] * rw).cross(ry - ndc[1] * rw);
+            (d * if rw.dot(d) >= 0.0 { 1.0 } else { -1.0 }).normalize()
+        };
+        let mut worst = 0.0f64;
+        for (i, pos) in [
+            [0.0, 70.0, 0.0],
+            [-30.7, 151.6, -0.07],
+            [250_000.3, 180.2, -730_111.6],
+        ]
+        .iter()
+        .enumerate()
+        {
+            for k in 0..200 {
+                let yaw = k as f64 * 0.37 + i as f64;
+                let pitch = ((k * 7 % 31) as f64 / 31.0 - 0.5) * 3.0;
+                let fwd = DVec3::new(
+                    yaw.sin() * pitch.cos(),
+                    pitch.sin(),
+                    -yaw.cos() * pitch.cos(),
+                );
+                let eye = DVec3::from_array(*pos);
+                // La projection du jeu : sans plan lointain, profondeur inversée.
+                let vp = Mat4::perspective_infinite_reverse_rh(1.2, 16.0 / 9.0, 0.05)
+                    * Mat4::look_to_rh(eye.as_vec3(), fwd.as_vec3(), Vec3::Y);
+                let right = fwd.cross(DVec3::Y).normalize();
+                let up = right.cross(fwd);
+                let t = (1.2f64 / 2.0).tan();
+                for ndc in [[0.0, 0.0], [0.9, -0.8], [-1.0, 1.0], [0.3, 0.95]] {
+                    let want =
+                        (fwd + right * ndc[0] as f64 * t * 16.0 / 9.0 + up * ndc[1] as f64 * t)
+                            .normalize();
+                    let got = sky_dir(vp, ndc).as_dvec3();
+                    worst = worst.max((got - want).length());
+                }
+            }
+        }
+        // Moins d'un centième de degré d'écart, partout.
+        assert!(worst < 2e-4, "écart {worst}");
+    }
+
     #[test]
     fn shaders_are_valid() {
         use wgpu::naga;

@@ -443,9 +443,19 @@ fn vs_sky(@builtin(vertex_index) vi: u32) -> SkyOut {
     return o;
 }
 
+/// Direction du regard pour ce point de l'écran. Tirée des lignes de la matrice de vue
+/// (la direction `d` telle que sa projection tombe sur `ndc`) : ni inversion de matrice ni
+/// soustraction de la position de la caméra, dont les erreurs d'arrondi faisaient parfois
+/// tourner ou sauter le ciel selon l'endroit et l'angle.
 fn sky_dir(ndc: vec2<f32>) -> vec3<f32> {
-    let far = g.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    return normalize(far.xyz / far.w - g.cam_pos.xyz);
+    let m = g.view_proj;
+    let rx = vec3<f32>(m[0][0], m[1][0], m[2][0]);
+    let ry = vec3<f32>(m[0][1], m[1][1], m[2][1]);
+    let rw = vec3<f32>(m[0][3], m[1][3], m[2][3]);
+    // clip.x = rx·d, clip.y = ry·d, clip.w = rw·d ; on veut clip.xy = ndc × clip.w.
+    let d = cross(rx - ndc.x * rw, ry - ndc.y * rw);
+    // Du bon côté : devant la caméra (clip.w > 0).
+    return normalize(d * select(-1.0, 1.0, dot(rw, d) >= 0.0));
 }
 
 @fragment
