@@ -9,6 +9,7 @@
 mod accounts;
 mod bags;
 mod contacts;
+mod guards;
 mod hardware;
 mod limits;
 mod maps;
@@ -145,10 +146,16 @@ impl Handle {
     }
 
     /// Ce relais devient le relais de secours du monde `room` d'un autre relais (clé de
-    /// ses certificats : `root`) ; il en reçoit la copie (`standby_feed`) jusqu'à
-    /// `take_over`.
-    pub fn standby_begin(&self, room: u64, root: [u8; 32], info: proto::StandbyInfo) {
+    /// ses certificats et de ses listes de gardiens : `root`), tenu par le joueur `me` ;
+    /// il en reçoit la copie (`standby_feed`) jusqu'à la reprise (`standby_tick`,
+    /// `standby_released`).
+    pub fn standby_begin(&self, room: u64, root: [u8; 32], info: proto::StandbyInfo, me: &str) {
         let mut st = self.state.lock().unwrap();
+        let guard =
+            minelib_net::guard::Keeper::new(room, me, root).map(|keeper| guards::StandbyGuard {
+                keeper,
+                votes: HashMap::new(),
+            });
         let Ok(root) = VerifyingKey::from_bytes(&root) else {
             return;
         };
@@ -162,7 +169,107 @@ impl Handle {
             build: Some(build),
             active: false,
             resumed: None,
+            guard,
+            proof: None,
         });
+    }
+
+    /// Relais de secours : battement du relais du monde. Renvoie la version de la liste à
+    /// rappeler dans le bail (aucune : il a voté, il ne soutient plus ce relais).
+    pub fn standby_beat(&self, committee: &minelib_net::guard::Committee) -> Option<u64> {
+        guards::standby_beat(&mut self.state.lock().unwrap(), committee)
+    }
+
+    /// Relais de secours, régulièrement : il vote quand le relais du monde se tait, et
+    /// reprend le monde avec les votes d'une majorité des gardiens. Vrai au moment de la
+    /// reprise.
+    pub fn standby_tick(&self) -> bool {
+        guards::standby_tick(&mut self.state.lock().unwrap())
+    }
+
+    /// Relais de secours : le relais du monde s'arrête proprement et lui confie le monde
+    /// (`sig` : cet arrêt, signé par lui ; c'est la preuve montrée aux joueurs).
+    pub fn standby_released(&self, room: u64, sig: &[u8]) -> bool {
+        let mut st = self.state.lock().unwrap();
+        match st.standby.as_mut() {
+            Some(sb)
+                if sb.room == room
+                    && !sb.active
+                    && minelib_net::guard::release_valid(&sb.root, room, sig) =>
+            {
+                sb.active = true;
+                sb.proof = Some(minelib_net::guard::Proof::Released { sig: sig.to_vec() });
+                log::info!(
+                    "relais de secours : le relais du monde s'arrête proprement, reprise du \
+                     monde « {} »",
+                    sb.info.name
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Relais de secours : une liste plus récente en nomme un autre, et il n'a pas voté
+    /// (il n'a plus rien à faire ; s'il a voté, il reste : la reprise peut encore lui
+    /// revenir).
+    pub fn standby_replaced(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.standby.as_ref().is_some_and(|sb| {
+            !sb.active
+                && sb.guard.as_ref().is_some_and(|g| {
+                    g.keeper.voted().is_none()
+                        && g.keeper
+                            .committee
+                            .as_ref()
+                            .is_some_and(|c| !c.is_standby(&g.keeper.me))
+                })
+        })
+    }
+
+    /// Relais de secours : a-t-il voté pour la reprise ?
+    pub fn standby_voted(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.standby
+            .as_ref()
+            .and_then(|sb| sb.guard.as_ref())
+            .is_some_and(|g| g.keeper.voted().is_some())
+    }
+
+    /// Arrêt propre de ce relais : chaque monde qui a un relais de secours lui est confié
+    /// tout de suite (il est en pause ici pour toujours). Renvoie le nombre de mondes
+    /// confiés. Laisser ensuite partir les messages (quelques centaines de ms).
+    pub fn release(&self) -> usize {
+        guards::release_all(&mut self.state.lock().unwrap())
+    }
+
+    /// Essais : le réseau entre ce relais et ces gardiens est coupé (ni battements, ni
+    /// baux) ; liste vide : rétabli.
+    #[doc(hidden)]
+    pub fn guard_cut(&self, pseudos: &[&str]) {
+        let mut st = self.state.lock().unwrap();
+        st.guard_cut = pseudos.iter().map(|p| p.to_ascii_lowercase()).collect();
+    }
+
+    /// Essais : ce relais est coupé de tous les gardiens (les joueurs le joignent encore).
+    #[doc(hidden)]
+    pub fn guard_isolate(&self, on: bool) {
+        self.state.lock().unwrap().guard_isolated = on;
+    }
+
+    /// Essais : le monde est-il en pause ici (aucun : pas de gardiens) ?
+    #[doc(hidden)]
+    pub fn frozen(&self, room: u64) -> Option<bool> {
+        let st = self.state.lock().unwrap();
+        st.rooms.get(&room)?.guards.as_ref()?;
+        Some(guards::frozen(&st, room))
+    }
+
+    /// Essais : la liste des gardiens d'un monde.
+    #[doc(hidden)]
+    pub fn committee(&self, room: u64) -> Option<minelib_net::guard::Committee> {
+        let st = self.state.lock().unwrap();
+        Some(st.rooms.get(&room)?.guards.as_ref()?.warden.current.clone())
     }
 
     /// Relais de secours : ce que le relais du monde lui envoie (historique, sacs, modes).
@@ -196,9 +303,10 @@ impl Handle {
         }
     }
 
-    /// Le relais du monde est tombé : ce relais de secours reprend le monde. Les joueurs
-    /// y entrent avec le certificat de leur compte (`Request::Takeover`) ; le premier en
-    /// devient le propriétaire.
+    /// Essais seulement : ce relais de secours reprend le monde sans vote (en vrai, voir
+    /// `standby_tick` et `standby_released`). Les joueurs y entrent avec le certificat de
+    /// leur compte (`Request::Takeover`) ; le premier en devient le propriétaire.
+    #[doc(hidden)]
     pub fn take_over(&self) -> bool {
         let mut st = self.state.lock().unwrap();
         match st.standby.as_mut() {
@@ -519,6 +627,10 @@ struct StandbyCopy {
     active: bool,
     /// Le monde repris ici, une fois que le premier joueur y est entré.
     resumed: Option<u64>,
+    /// Ses baux, son vote, et les votes des témoins (voir `guards`).
+    guard: Option<guards::StandbyGuard>,
+    /// Ce qui prouve aux joueurs qu'il a le droit de servir le monde (une fois repris).
+    proof: Option<minelib_net::guard::Proof>,
 }
 
 /// Région d'un monde servie par son propre relais.
@@ -654,6 +766,9 @@ struct Room {
     garant_hosted: bool,
     /// Monde de construction : son relais de secours.
     standby: Option<StandbyRef>,
+    /// Monde de construction : ses gardiens, qui l'empêchent de se séparer en deux (voir
+    /// `guards`).
+    guards: Option<guards::RoomGuards>,
     /// Dernier changement d'hôte pour cause de mauvaise connexion.
     rebalanced: Option<Instant>,
     /// Désaccords : en attente de jugement (n° → joueur jugé, vérificateur), confirmés,
@@ -742,6 +857,11 @@ struct State {
     /// Essais : un relais de secours sur la machine du relais du monde (voir
     /// `Handle::set_standby_local`).
     standby_local: bool,
+    /// Horloge des gardiens (voir `guards::now_ms`).
+    guard_epoch: Instant,
+    /// Essais : gardiens coupés de ce relais (pseudos en minuscules), ou tous.
+    guard_cut: HashSet<String>,
+    guard_isolated: bool,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -802,10 +922,15 @@ pub fn start(cfg: Config) -> Result<Handle> {
         root_t: 0,
         standby: None,
         standby_local: false,
+        guard_epoch: Instant::now(),
+        guard_cut: HashSet::new(),
+        guard_isolated: false,
     }));
     let state_for_handle = state.clone();
+    let state_for_guards = state.clone();
     let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let killed_accept = killed.clone();
+    let killed_guards = killed.clone();
     // Les connexions sont servies par des tâches, sur quelques fils (voir `tasks`).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(tasks::workers())
@@ -817,6 +942,19 @@ pub fn start(cfg: Config) -> Result<Handle> {
         .name("relais : écoute".into())
         .spawn(move || {
             runtime.block_on(async move {
+                // Gardiens des mondes : battements, baux, pause (toutes les 50 ms, même
+                // quand personne n'envoie rien).
+                tokio::spawn(async move {
+                    let mut every = tokio::time::interval(Duration::from_millis(50));
+                    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        every.tick().await;
+                        if killed_guards.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        guards::upkeep(&mut state_for_guards.lock().unwrap());
+                    }
+                });
                 let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
                     log::error!("relais : écoute impossible");
                     return;
@@ -990,6 +1128,15 @@ enum Session {
         pseudo: String,
         key: [u8; 32],
         challenge: [u8; 32],
+    },
+    /// Relais de secours : témoin dont le certificat est vérifié, signature du défi
+    /// attendue ; puis témoin entré (il dit sa liste et son vote, `WitnessBeat`).
+    Witnessing {
+        cert: sovereign::Cert,
+        challenge: [u8; 32],
+    },
+    Witness {
+        cert: sovereign::Cert,
     },
 }
 
@@ -2435,12 +2582,22 @@ fn upkeep_standby(st: &mut State, rid: u64) {
     }
     let host = room.host;
     let local_ok = st.standby_local;
+    // (Gardiens retirés de ce monde : jamais repris, voir `guards::RoomGuards::banned`.)
+    let banned = room.guards.as_ref().map(|g| &g.banned);
+    // (Une connexion de garant d'un jeu, qui sait tenir un relais de secours ; pas celle
+    // d'un joueur au menu.)
     let Some(g) = st
         .conns
         .iter()
         .filter(|(&g, c)| {
             c.garant
+                && c.garant_only
                 && !c.garant_banned
+                && !banned.is_some_and(|b| {
+                    c.pseudo
+                        .as_deref()
+                        .is_some_and(|p| b.contains(&p.to_ascii_lowercase()))
+                })
                 && c.room.is_none()
                 && g != host
                 && (local_ok
@@ -2640,6 +2797,10 @@ fn take_over_join(st: &mut State, id: u64, pseudo: &str, key: [u8; 32]) -> Respo
 /// commence quand l'hôte principal change (parti, écarté, trop lent), et finit quand la
 /// région n'a plus deux relais.
 fn upkeep_sovereignty(st: &mut State, rid: u64) {
+    // Monde en pause : pas de changement d'époque (il archiverait).
+    if guards::frozen(st, rid) {
+        return;
+    }
     let root_key = st.cert_key.verifying_key().to_bytes();
     let Some(room) = st.rooms.get(&rid) else {
         return;
@@ -2780,6 +2941,10 @@ fn upkeep_sovereignty(st: &mut State, rid: u64) {
 /// relais vérifie lui-même ce que la première couvre. Appelé à chaque confirmation, à
 /// chaque lot reçu (les confirmations peuvent le devancer) et régulièrement.
 fn try_commit(st: &mut State, rid: u64, region: [i32; 2]) {
+    // Monde en pause : rien n'est archivé (les lots attendent la reprise).
+    if guards::frozen(st, rid) {
+        return;
+    }
     let root = st.cert_key.verifying_key().to_bytes();
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
@@ -3634,6 +3799,7 @@ fn open_room(
             ready_standby: Vec::new(),
             garant_hosted: false,
             standby: None,
+            guards: None,
             rebalanced: None,
             judges: HashMap::new(),
             confirmed: 0,
@@ -4471,6 +4637,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     "Seulement sur un serveur de construction.",
                 ));
             };
+            if guards::frozen(st, rid) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Monde en pause (son relais ne joint plus ses gardiens) : réessaie dans un instant.",
+                ));
+            }
             let (server, creator) = {
                 let r = &st.rooms[&rid];
                 (r.server.clone(), r.creator.clone())
@@ -4861,6 +5033,19 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         Request::ToZone { chunk, data } => {
             let rid = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1))?;
+            // Monde en pause (son relais n'entend plus assez de gardiens) : rien n'y change.
+            // Une demande d'objet est refusée ; une modification de bloc reste sans
+            // réponse (le jeu la garde et la renvoie à la reprise).
+            if guards::frozen(st, rid) {
+                if let Some(seq) = game::decode::<game::BuildMsg>(&data)
+                    .as_ref()
+                    .filter(|m| minelib_net::items::is_request(m))
+                    .and_then(minelib_net::items::request_seq)
+                {
+                    publish_items(st, rid, id, vec![game::BuildMsg::Denied { seq }]);
+                }
+                return None;
+            }
             let room = st.rooms.get_mut(&rid).expect("partie");
             let msg = game::decode::<game::BuildMsg>(&data);
             // Objets au sol et coffres : ce relais arbitre (une demande après l'autre),
@@ -4961,13 +5146,29 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             return None;
         }
+        // Gardien d'un monde (relais de secours, témoin) : son bail, ou son départ.
+        Request::Lease { room, version, t } => {
+            guards::lease(st, room, id, pseudo, version, t);
+            return None;
+        }
+        Request::Resign { room } => {
+            guards::resign(st, room, id, pseudo);
+            return None;
+        }
         // Hôte du relais de secours d'un monde : son relais est prêt ; les joueurs savent
         // désormais où le trouver.
         Request::StandbyReady { node, addr, key } => {
             let rid = my_room?;
             let room = st.rooms.get_mut(&rid)?;
             let sb = room.standby.as_mut().filter(|s| s.host == id)?;
-            sb.at = Some(proto::StandbyAt { node, addr, key });
+            sb.at = Some(proto::StandbyAt {
+                node,
+                addr,
+                key,
+                room: rid,
+                pseudo: pseudo.to_string(),
+                root: st.cert_key.verifying_key().to_bytes(),
+            });
             log::info!("monde {rid} : relais de secours prêt");
             announce_standby(st, rid);
             return None;
@@ -5141,6 +5342,10 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             batches,
         } => {
             let rid = my_room?;
+            // Monde en pause : rien n'est archivé.
+            if guards::frozen(st, rid) {
+                return None;
+            }
             let room = st.rooms.get_mut(&rid)?;
             let is_host = room
                 .shards
@@ -5471,7 +5676,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             return None;
         }
         Request::BulkEdit { id: bulk, cells } => {
-            let error = bulk_edit(st, my_room, id, pseudo, cells);
+            let error = if my_room.is_some_and(|r| guards::frozen(st, r)) {
+                "Monde en pause (son relais ne joint plus ses gardiens) : réessaie dans un instant."
+                    .to_string()
+            } else {
+                bulk_edit(st, my_room, id, pseudo, cells)
+            };
             if let Some(c) = st.conns.get(&id) {
                 transport::push(&c.tx, &Response::BulkDone { id: bulk, error });
             }
@@ -5586,6 +5796,8 @@ fn handle(
             | Request::BulkEdit { .. }
             | Request::Served { .. }
             | Request::StandbyReady { .. }
+            | Request::Lease { .. }
+            | Request::Resign { .. }
             | Request::GarantAvailable { .. }
             | Request::GarantReady
             | Request::Conflict { .. }
@@ -5594,6 +5806,20 @@ fn handle(
             | Request::ToPeer { .. }
             | Request::Broadcast { .. }
     );
+    // Témoin entré chez ce relais de secours : sa liste et son vote.
+    if let Request::WitnessBeat { committee, vote } = &req {
+        if let Session::Witness { cert } = &*session {
+            let cert = cert.clone();
+            guards::witness_beat(st, id, &cert, committee, vote.as_ref());
+        }
+        return None;
+    }
+    if matches!(
+        req,
+        Request::WitnessLogin { .. } | Request::WitnessProve { .. }
+    ) {
+        return Some(guards::witness_login(st, session, req));
+    }
     if room_request {
         let Session::LoggedIn { pseudo } = &*session else {
             return (!req.is_oneway()).then(|| err(ErrorCode::NotLoggedIn, ""));
@@ -5781,7 +6007,11 @@ fn handle_account(
                 key: cert.key,
                 challenge,
             };
-            Response::TakeoverChallenge { challenge }
+            // (Le joueur vérifie qu'il a le droit de servir le monde avant d'entrer.)
+            Response::TakeoverChallenge {
+                challenge,
+                proof: sb.proof.clone(),
+            }
         }
         Request::TakeoverProve { signature } => {
             let Session::TakingOver {
@@ -6219,7 +6449,7 @@ mod tests {
             server: "createur/monde".into(),
             owner: "Createur".into(),
         };
-        h.standby_begin(42, root.verifying_key().to_bytes(), info);
+        h.standby_begin(42, root.verifying_key().to_bytes(), info, "secours");
         let addr = h.addr.to_string();
         let eve = SigningKey::from_bytes(&[5; 32]);
         let cert = |root: &SigningKey, room: u64, key: &SigningKey| {
@@ -6233,7 +6463,11 @@ mod tests {
         };
         let try_in = |c: sovereign::Cert, key: SigningKey| {
             let cl = Client::spawn(addr.clone(), Some(h.public));
-            cl.send(Cmd::Takeover { cert: c, key });
+            cl.send(Cmd::Takeover {
+                cert: c,
+                key,
+                expect: None,
+            });
             wait(&cl, |e| {
                 matches!(
                     e,
@@ -6269,6 +6503,189 @@ mod tests {
             e => panic!("{e:?}"),
         }
         assert!(h.resumed().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Le relais de secours ne reprend le monde qu'avec les votes signés d'une majorité de
+    /// ses gardiens, et le prouve aux joueurs : un témoin entre avec le certificat de son
+    /// compte (pas avec celui d'un autre monde), un vote signé d'une autre clé ne compte
+    /// pas, et un joueur n'entre que si la preuve tient.
+    #[test]
+    fn a_standby_relay_takes_over_only_with_a_proven_majority() {
+        use minelib_net::guard::{Committee, Vote};
+        let dir = std::env::temp_dir().join(format!("minelib-secours-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "secours".into(),
+        })
+        .unwrap();
+        let root = SigningKey::from_bytes(&[3; 32]);
+        let pk = root.verifying_key().to_bytes();
+        let info = proto::StandbyInfo {
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [1; 32],
+            max_players: 0,
+            creator: "Createur".into(),
+            server: "createur/monde".into(),
+            owner: "Createur".into(),
+        };
+        h.standby_begin(42, pk, info, "Secours");
+        let addr = h.addr.to_string();
+        let (wit, eve) = (
+            SigningKey::from_bytes(&[6; 32]),
+            SigningKey::from_bytes(&[5; 32]),
+        );
+        let cert = |room: u64, who: &str, key: &SigningKey| {
+            sovereign::Cert::issue(
+                &root,
+                room,
+                who,
+                key.verifying_key().to_bytes(),
+                now_secs() + 3600,
+            )
+        };
+        let c = Committee::sign(&root, 42, 1, Some("Secours".into()), vec!["Wit".into()]);
+        // Le relais du monde se fait entendre, puis se tait : le relais de secours vote.
+        assert_eq!(h.standby_beat(&c), Some(1));
+        assert!(!h.standby_tick());
+        // Un témoin d'un autre monde : refusé ; le bon : entré.
+        let login = |cert: sovereign::Cert| {
+            let cl = Client::spawn(addr.clone(), Some(h.public));
+            cl.send(Cmd::WitnessLogin {
+                cert,
+                key: wit.clone(),
+            });
+            let e = wait(&cl, |e| {
+                matches!(e, Event::Link(_) | Event::Error(_) | Event::Offline(_))
+            });
+            (cl, e)
+        };
+        assert!(matches!(login(cert(43, "Wit", &wit)).1, Event::Error(_)));
+        let (w, e) = login(cert(42, "Wit", &wit));
+        let Event::Link(link) = e else {
+            panic!("{e:?}")
+        };
+        std::thread::sleep(Duration::from_millis(minelib_net::guard::VOTE_MS + 100));
+        assert!(
+            !h.standby_tick(),
+            "le relais de secours seul n'est pas une majorité"
+        );
+        assert!(h.standby_voted());
+        // Un vote signé d'une autre clé que celle du certificat : ne compte pas.
+        transport::push(
+            &link,
+            &Request::WitnessBeat {
+                committee: c.clone(),
+                vote: Some(Vote::sign(&eve, 42, 1, "Wit")),
+            },
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!h.standby_tick());
+        // Personne n'entre encore.
+        let at = proto::StandbyAt {
+            node: [0; 32],
+            addr: addr.clone(),
+            key: h.public,
+            room: 42,
+            pseudo: "Secours".into(),
+            root: pk,
+        };
+        let try_in = |expect: Option<proto::StandbyAt>| {
+            let cl = Client::spawn(addr.clone(), Some(h.public));
+            cl.send(Cmd::Takeover {
+                cert: cert(42, "Eve", &eve),
+                key: eve.clone(),
+                expect,
+            });
+            wait(&cl, |e| {
+                matches!(
+                    e,
+                    Event::TakenOver { .. } | Event::Error(_) | Event::Offline(_)
+                )
+            })
+        };
+        assert!(matches!(try_in(Some(at.clone())), Event::Error(_)));
+        // Le vote du témoin, signé de sa clé : majorité, reprise.
+        transport::push(
+            &link,
+            &Request::WitnessBeat {
+                committee: c.clone(),
+                vote: Some(Vote::sign(&wit, 42, 1, "Wit")),
+            },
+        );
+        let t = Instant::now();
+        while !h.standby_tick() {
+            assert!(t.elapsed() < Duration::from_secs(5), "reprise");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Un joueur qui attend un autre relais de secours (ou un autre monde) : il n'entre
+        // pas ; le bon : il entre.
+        let mut wrong = at.clone();
+        wrong.pseudo = "Autre".into();
+        assert!(matches!(try_in(Some(wrong)), Event::Error(_)));
+        match try_in(Some(at)) {
+            Event::TakenOver { host, .. } => assert_eq!(host, "Eve"),
+            e => panic!("{e:?}"),
+        }
+        drop(w);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Un relais de secours qui reprend sans preuve (tricheur) : les joueurs n'y entrent
+    /// pas.
+    #[test]
+    fn players_do_not_follow_a_standby_without_proof() {
+        let dir = std::env::temp_dir().join(format!("minelib-secours-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "secours".into(),
+        })
+        .unwrap();
+        let root = SigningKey::from_bytes(&[3; 32]);
+        let info = proto::StandbyInfo {
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [1; 32],
+            max_players: 0,
+            creator: "Createur".into(),
+            server: "createur/monde".into(),
+            owner: "Createur".into(),
+        };
+        h.standby_begin(42, root.verifying_key().to_bytes(), info, "Secours");
+        assert!(h.take_over());
+        let eve = SigningKey::from_bytes(&[5; 32]);
+        let cl = Client::spawn(h.addr.to_string(), Some(h.public));
+        cl.send(Cmd::Takeover {
+            cert: sovereign::Cert::issue(
+                &root,
+                42,
+                "Eve",
+                eve.verifying_key().to_bytes(),
+                now_secs() + 3600,
+            ),
+            key: eve,
+            expect: Some(proto::StandbyAt {
+                node: [0; 32],
+                addr: h.addr.to_string(),
+                key: h.public,
+                room: 42,
+                pseudo: "Secours".into(),
+                root: root.verifying_key().to_bytes(),
+            }),
+        });
+        let e = wait(&cl, |e| {
+            matches!(
+                e,
+                Event::TakenOver { .. } | Event::Error(_) | Event::Offline(_)
+            )
+        });
+        assert!(matches!(e, Event::Error(_)), "{e:?}");
+        assert_eq!(h.resumed(), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

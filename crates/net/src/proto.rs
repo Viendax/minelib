@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 32;
+pub const PROTOCOL: u32 = 33;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.
@@ -334,6 +334,34 @@ pub enum Request {
         addr: String,
         key: [u8; 32],
     },
+    /// Gardien d'un monde (relais de secours ou témoin), au relais du monde : son bail
+    /// (« je t'entends »), qui rappelle l'heure `t` du battement entendu et la version de
+    /// la liste des gardiens qu'il connaît (voir `crate::guard`).
+    Lease {
+        room: u64,
+        version: u64,
+        t: u64,
+    },
+    /// Gardien d'un monde qui s'en va proprement : il promet de ne jamais voter (il est
+    /// remplacé sans attendre).
+    Resign {
+        room: u64,
+    },
+    /// Témoin d'un monde, au relais de secours : entrée avec son certificat (signé par le
+    /// relais du monde). Réponse : `TakeoverChallenge`, puis `WitnessProve` → `Done`.
+    WitnessLogin {
+        cert: crate::sovereign::Cert,
+    },
+    WitnessProve {
+        signature: Vec<u8>,
+    },
+    /// Témoin, au relais de secours, quatre fois par seconde : la dernière liste des
+    /// gardiens qu'il connaît, et son vote pour la reprise (signé, pour la liste qu'il
+    /// avait en votant), s'il n'entend plus le relais du monde.
+    WitnessBeat {
+        committee: crate::guard::Committee,
+        vote: Option<crate::guard::Vote>,
+    },
     /// Au relais de secours, après la chute du relais du monde : « j'étais dans ce
     /// monde » (certificat de la clé de mon compte, signé par l'ancien relais du monde).
     /// Réponse : `TakeoverChallenge`.
@@ -418,6 +446,9 @@ impl Request {
             self,
             Request::ToHost { .. }
                 | Request::StandbyReady { .. }
+                | Request::Lease { .. }
+                | Request::Resign { .. }
+                | Request::WitnessBeat { .. }
                 | Request::SetBackup { .. }
                 | Request::GarantAvailable { .. }
                 | Request::GarantReady
@@ -723,13 +754,49 @@ pub enum Response {
         pseudo: String,
         mode: String,
     },
+    /// Aux gardiens d'un monde, quatre fois par seconde : battement du relais du monde
+    /// (`t` : son heure, à rappeler dans le bail), la liste des gardiens (signée), et où
+    /// joindre le relais de secours.
+    Beat {
+        t: u64,
+        committee: crate::guard::Committee,
+        standby: Option<StandbyAt>,
+    },
+    /// Au garant choisi : être témoin du monde `room` (clé des listes et des certificats
+    /// de ce relais ; certificat de la clé de son compte, pour entrer chez le relais de
+    /// secours).
+    WitnessTask {
+        room: u64,
+        root: [u8; 32],
+        cert: crate::sovereign::Cert,
+    },
+    /// Relais de secours, au témoin qui a une liste plus ancienne que la sienne.
+    Committee {
+        committee: crate::guard::Committee,
+    },
+    /// Au relais de secours : le relais du monde s'arrête proprement et ne servira plus
+    /// jamais ce monde ; il peut le reprendre tout de suite (`sig` : cet arrêt, signé par
+    /// le relais du monde, que les joueurs vérifient).
+    Released {
+        room: u64,
+        sig: Vec<u8>,
+    },
+    /// Aux joueurs d'un monde qui a des gardiens, deux fois par seconde au moins : le
+    /// monde est en pause (le relais du monde n'entend plus assez de gardiens, rien n'y
+    /// change) ou non.
+    Paused {
+        paused: bool,
+    },
     /// Aux joueurs d'un monde : où est son relais de secours (aucun : pas encore).
     Standby {
         at: Option<StandbyAt>,
     },
-    /// Relais de secours : défi à signer avec la clé du compte.
+    /// Relais de secours : défi à signer avec la clé du compte ; pour un joueur, la preuve
+    /// qu'il a le droit de servir le monde (votes des gardiens, ou arrêt propre du relais du
+    /// monde), à vérifier avant d'y entrer.
     TakeoverChallenge {
         challenge: [u8; 32],
+        proof: Option<crate::guard::Proof>,
     },
     /// Aux joueurs d'un monde : relais de ses régions (les autres passent par ce relais).
     Shards {
@@ -932,6 +999,12 @@ pub struct StandbyAt {
     pub node: [u8; 32],
     pub addr: String,
     pub key: [u8; 32],
+    /// Le monde (son numéro chez le relais du monde), le pseudo de son hôte, et la clé
+    /// des listes de gardiens du relais du monde : de quoi vérifier la preuve qu'il montre
+    /// avant d'y reprendre la partie.
+    pub room: u64,
+    pub pseudo: String,
+    pub root: [u8; 32],
 }
 
 /// Relais d'une région d'un monde.

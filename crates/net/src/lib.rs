@@ -10,6 +10,7 @@ pub mod cells;
 pub mod client;
 pub mod crypto;
 pub mod game;
+pub mod guard;
 pub mod hw;
 pub mod items;
 pub mod lan;

@@ -1040,6 +1040,27 @@ impl Game {
                         self.notify("L'hôte a fermé la partie.".to_string());
                     }
                 }
+                // Monde en pause : son relais n'entend plus assez de gardiens (rien n'y change,
+                // les modifications du joueur attendent) ; ou il repart.
+                Event::Paused(p) => {
+                    let p = *p;
+                    if let Some(s) = &mut self.session {
+                        if let Some(b) = &mut s.build {
+                            if b.set_paused(p) {
+                                let (m, c) = if p {
+                                    (
+                                        "Monde en pause : son relais ne joint plus ses gardiens. \
+                                         Reprise en cours…",
+                                        chat::YELLOW,
+                                    )
+                                } else {
+                                    ("Le monde repart.", chat::YELLOW)
+                                };
+                                s.chat.say(m.to_string(), c);
+                            }
+                        }
+                    }
+                }
                 // Le relais du monde est tombé, son relais de secours a repris le monde : la
                 // partie continue, par la nouvelle connexion.
                 Event::TakenOver { host, .. } => {
@@ -3176,6 +3197,8 @@ impl GameLoop for Game {
                 log::error!("sauvegarde impossible : {e:#}");
             }
         }
+        // Relais intégré : ses mondes passent tout de suite à leur relais de secours.
+        self.accounts.release_relay();
         self.renderer = None; // libère le GPU avant la fermeture de la fenêtre
     }
 }

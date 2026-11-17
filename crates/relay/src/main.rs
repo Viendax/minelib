@@ -77,7 +77,34 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    loop {
-        std::thread::park();
+    // Arrêt (Ctrl+C, ou fenêtre fermée sous Windows) : les mondes qui ont un relais de
+    // secours lui sont confiés tout de suite, sans attendre que leurs gardiens remarquent
+    // le silence du relais.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let on_ctrl_c = tx.clone();
+    rt.spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = on_ctrl_c.send(());
+        }
+    });
+    #[cfg(windows)]
+    rt.spawn(async move {
+        if let Ok(mut close) = tokio::signal::windows::ctrl_close() {
+            close.recv().await;
+            let _ = tx.send(());
+        }
+    });
+    #[cfg(not(windows))]
+    drop(tx);
+    std::thread::spawn(move || rt.block_on(std::future::pending::<()>()));
+    let _ = rx.recv();
+    let n = h.release();
+    if n > 0 {
+        println!("Arrêt : {n} monde(s) confié(s) à leur relais de secours.");
+        std::thread::sleep(std::time::Duration::from_millis(300));
     }
+    Ok(())
 }

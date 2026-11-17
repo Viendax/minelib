@@ -135,6 +135,9 @@ struct Pending {
     /// souveraine (bloc, fluide) : refusée par ce relais ou sans réponse, elle repart une
     /// fois au relais du monde (voir `retry_at_root`).
     signed: Option<(u16, bool)>,
+    /// Dernière modification demandée (bloc, fluide) : elle repart après une pause du
+    /// monde ou sa reprise par le relais de secours.
+    last: (u16, bool),
 }
 
 pub struct BuildNet {
@@ -185,6 +188,9 @@ pub struct BuildNet {
     /// numéro de connexion) : seul le relais du monde arbitre les objets, on n'en accepte
     /// pas d'ailleurs.
     from_shard: Option<u64>,
+    /// Monde en pause (son relais n'entend plus assez de gardiens, voir
+    /// `minelib_net::guard`) : les modifications du joueur attendent la reprise.
+    paused: bool,
 }
 
 /// Bloc remis par un relais de région : celui d'avant, celui remis, son rang ; et si
@@ -345,6 +351,7 @@ impl BuildNet {
             pending: HashMap::new(),
             item_inbox: Vec::new(),
             from_shard: None,
+            paused: false,
             heard: HashMap::new(),
             doubtful: HashMap::new(),
             #[cfg(test)]
@@ -402,8 +409,48 @@ impl BuildNet {
         self.shards.list.clear();
         self.shards.ticket = None;
         self.served_sent.clear();
-        self.chunk = None;
+        let chunk = self.chunk.take();
         self.caps_sent = false;
+        // Ce qui attendait encore sa réponse repart au relais de secours (rien ne se perd :
+        // l'ancien relais du monde n'avait peut-être pas pu le lui transmettre).
+        self.paused = false;
+        self.resend_pending(chunk);
+    }
+
+    /// Monde en pause (son relais n'entend plus assez de gardiens) : les modifications du
+    /// joueur attendent, ni envoyées ni annulées ; à la reprise, celles restées sans
+    /// réponse repartent. Vrai si ça change.
+    pub fn set_paused(&mut self, on: bool) -> bool {
+        if on == self.paused {
+            return false;
+        }
+        self.paused = on;
+        if !on {
+            self.resend_pending(self.chunk);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Les modifications en attente repartent (une seule demande par case : la dernière).
+    fn resend_pending(&mut self, chunk: Option<[i32; 2]>) {
+        let list: Vec<([i32; 3], (u16, bool))> =
+            self.pending.iter().map(|(p, v)| (*p, v.last)).collect();
+        for (pos, (block, fluid)) in list {
+            let signed = chunk.is_some_and(|c| self.send_signed(pos, block, fluid, c));
+            if !signed {
+                self.send_edit(pos, block, fluid);
+            }
+            if let Some(p) = self.pending.get_mut(&pos) {
+                p.count = 1;
+                p.age = 0.0;
+                p.signed = signed.then_some((block, fluid));
+            }
+        }
     }
 
     /// Région souveraine dont on a le relais : la modification y part signée (son hôte
@@ -623,12 +670,16 @@ impl BuildNet {
             self.chunk = Some(chunk);
             self.send(Request::Position { chunk });
         }
-        // Ce que le joueur a changé.
-        let edits = world
-            .journal
-            .as_mut()
-            .map(std::mem::take)
-            .unwrap_or_default();
+        // Ce que le joueur a changé (monde en pause : ça attend dans le journal).
+        let edits = if self.paused {
+            Vec::new()
+        } else {
+            world
+                .journal
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+        };
         for (pos, id, old) in edits {
             // Une demande au relais du monde, qui accepte la modification et lui donne son
             // rang ; dans une région souveraine, signée au relais de la région, dont l'hôte
@@ -644,15 +695,20 @@ impl BuildNet {
                 count: 0,
                 age: 0.0,
                 signed: None,
+                last: (id.0, fluid),
             });
             p.count += 1;
             p.age = 0.0;
             p.signed = signed.then_some((id.0, fluid));
+            p.last = (id.0, fluid);
         }
-        // Sans réponse du relais : la modification n'a pas eu lieu.
+        // Sans réponse du relais : la modification n'a pas eu lieu (en pause, on attend).
         let mut dirty = Vec::new();
         let mut expired = Vec::new();
         for (pos, p) in &mut self.pending {
+            if self.paused {
+                break;
+            }
             p.age += dt;
             if p.age > PENDING_TIMEOUT {
                 expired.push((*pos, p.old));
@@ -688,6 +744,7 @@ impl BuildNet {
                         count: 1,
                         age: 0.0,
                         signed: None,
+                        last: (h.got.0, fluid),
                     },
                 );
                 continue;
@@ -1115,6 +1172,15 @@ mod tests {
         standby_at: Option<minelib_net::proto::StandbyAt>,
         retake: Option<Instant>,
         taken: u32,
+        /// Témoin de mondes (connexion de garant).
+        witnesses: HashMap<u64, crate::garant_worker::WitnessRole>,
+        /// Monde en pause : connexion d'essai au relais de secours (sans quitter le relais
+        /// du monde), prochain essai ; pauses vues.
+        probe: Option<Client>,
+        probe_next: Option<Instant>,
+        pauses: u32,
+        /// Mondes pour lesquels il a voté la reprise (il n'y redevient jamais gardien).
+        voted: HashSet<u64>,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -1172,176 +1238,300 @@ mod tests {
                 standby_at: None,
                 retake: None,
                 taken: 0,
+                witnesses: HashMap::new(),
+                probe: None,
+                probe_next: None,
+                pauses: 0,
+                voted: HashSet::new(),
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
         }
 
+        /// Connexion au relais de secours qui demande à y reprendre la partie.
+        fn takeover_client(&self) -> Option<Client> {
+            let (Some(at), Some(key)) = (self.standby_at.clone(), self.identity.clone()) else {
+                return None;
+            };
+            let cert = self.net.as_ref().and_then(|n| n.cert())?;
+            let c = Client::spawn(at.addr.clone(), Some(at.key));
+            c.send(Cmd::Takeover {
+                cert,
+                key,
+                expect: Some(at),
+            });
+            Some(c)
+        }
+
         /// Le relais du monde est tombé : nouvelle connexion au relais de secours, avec le
         /// certificat de la clé du compte (comme le jeu, voir `Accounts::start_takeover`).
         fn take_over(&mut self) {
-            let (Some(at), Some(key)) = (self.standby_at.clone(), self.identity.clone()) else {
+            let Some(c) = self.takeover_client() else {
                 return;
             };
-            let Some(cert) = self.net.as_ref().and_then(|n| n.cert()) else {
-                return;
-            };
-            self.c = Client::spawn(at.addr.clone(), Some(at.key));
-            self.c.send(Cmd::Takeover { cert, key });
+            self.c = c;
+            self.probe = None;
             self.retake = Some(Instant::now() + Duration::from_millis(1500));
         }
 
         /// Traite les événements reçus ; renvoie vrai si `want` est arrivé.
         fn pump(&mut self, want: &dyn Fn(&Event) -> bool) -> bool {
             let mut hit = false;
+            // Monde en pause : on cherche le relais de secours sans quitter le relais du
+            // monde (comme le jeu, voir `Accounts`) ; dès qu'il a repris, on y passe.
+            let paused = self.net.as_ref().is_some_and(|n| n.is_paused());
+            if !paused || self.retake.is_some() {
+                self.probe = None;
+                self.probe_next = None;
+            } else if self.probe.is_none() && self.probe_next.is_none_or(|t| Instant::now() >= t) {
+                self.probe = self.takeover_client();
+                self.probe_next = Some(Instant::now() + Duration::from_millis(250));
+            }
+            if let Some(p) = &self.probe {
+                let mut got = Vec::new();
+                while let Some(e) = p.poll() {
+                    got.push(e);
+                }
+                if got.iter().any(|e| matches!(e, Event::TakenOver { .. })) {
+                    self.c = self.probe.take().expect("essai");
+                    for e in got {
+                        hit |= want(&e);
+                        self.event(e);
+                    }
+                } else if got.iter().any(|e| {
+                    matches!(
+                        e,
+                        Event::Error(_) | Event::Offline(_) | Event::Lost | Event::LoggedOut
+                    )
+                }) {
+                    self.probe = None;
+                }
+            }
             while let Some(e) = self.c.poll() {
                 hit |= want(&e);
-                match e {
-                    Event::Link(l) => self.link = Some(l),
-                    Event::BuildGarant(_) => {
-                        let link = self.link.clone().expect("file d'envoi");
-                        let mut n = BuildNet::new(link, self.name.clone(), false);
-                        n.set_identity(self.identity.clone());
-                        self.net = Some(n);
-                    }
-                    Event::ShardTask {
-                        room,
-                        region,
-                        secret,
-                        slot,
-                        root,
-                    } => {
-                        let link = self.link.clone().expect("file d'envoi");
-                        self.shard = crate::garant_worker::ShardHost::start(
-                            room,
-                            region,
-                            secret,
-                            link,
-                            false,
-                            slot,
-                            root,
-                            self.identity.clone(),
-                        );
-                    }
-                    Event::ShardPeers { list, sov, .. } => {
-                        if let Some(s) = &self.shard {
-                            s.set_peers(&list, sov);
-                        }
-                    }
-                    Event::RootEdits { edits, .. } => {
-                        if let Some(s) = &self.shard {
-                            s.root_edits(edits);
-                        }
-                    }
-                    Event::Identity(key) => {
-                        if let Some(n) = &mut self.net {
-                            n.set_identity(Some(key.clone()));
-                        }
-                        if let Some(s) = &self.shard {
-                            s.set_signer(key.clone());
-                        }
-                        self.identity = Some(key);
-                    }
-                    Event::Shards(list) => {
-                        if let Some(n) = &mut self.net {
-                            n.set_shards(list);
-                        }
-                    }
-                    Event::ShardTicket {
-                        room,
-                        pseudo,
-                        expires,
-                        mac,
-                        cert,
-                    } => {
-                        if let Some(n) = &mut self.net {
-                            n.set_ticket(room, pseudo, expires, mac, cert);
-                        }
-                    }
-                    Event::RoomClosed => self.shard = None,
-                    Event::Zones { gained, lost } => {
-                        if let Some(n) = &mut self.net {
-                            n.zones_changed(&gained, &lost);
-                        }
-                    }
-                    Event::FromZone { peer, chunk, data } => {
-                        if matches!(
-                            game::decode::<BuildMsg>(&data),
-                            Some(BuildMsg::Reject { .. })
-                        ) {
-                            self.rejects += 1;
-                        }
-                        if let Some(n) = &mut self.net {
-                            n.receive(peer, chunk, &data, &mut self.world);
-                        }
-                        // Hôte d'un relais de région : ce que publie le relais du monde
-                        // part à ses joueurs (comme dans `garant_worker`).
-                        if let Some(s) = &self.shard {
-                            s.seed(&data);
-                        }
-                    }
-                    Event::Promoted { .. } => {
-                        if let Some(n) = &mut self.net {
-                            n.set_owner();
-                        }
-                    }
-                    Event::StandbyTask { room, root, info } => {
-                        let link = self.link.clone().expect("file d'envoi");
-                        self.standby = crate::garant_worker::StandbyHost::start(
-                            room, root, info, &link, false,
-                        );
-                    }
-                    Event::Replica(ref r) => {
-                        if let Some(s) = &self.standby {
-                            s.feed(r);
-                        }
-                    }
-                    Event::Standby(at) => self.standby_at = at,
-                    Event::TakenOver { host, .. } => {
-                        self.retake = None;
-                        self.taken += 1;
-                        if let Some(n) = &mut self.net {
-                            n.set_link(self.link.clone().expect("file d'envoi"));
-                            if host.eq_ignore_ascii_case(&self.name) {
-                                n.set_owner();
-                            } else {
-                                n.clear_owner();
-                            }
-                        }
-                    }
-                    // Relais du monde tombé : son relais de secours le reprendra, et les
-                    // joueurs y reprennent la partie.
-                    Event::Lost if self.standby.is_some() => {
-                        if let Some(s) = &mut self.standby {
-                            s.root_lost();
-                        }
-                    }
-                    Event::Lost if self.standby_at.is_some() && self.net.is_some() => {
-                        if self.retake.is_none() {
-                            self.take_over();
-                        }
-                        break;
-                    }
-                    // (La suite de l'ancienne connexion, ou le relais de secours qui n'a
-                    // pas encore repris le monde : nouvel essai bientôt.)
-                    Event::Error(_) | Event::Offline(_) | Event::LoggedOut
-                        if self.standby.is_some() || self.retake.is_some() =>
-                    {
-                        if self.retake.is_some() {
-                            self.retake = Some(Instant::now() + Duration::from_millis(500));
-                        }
-                    }
-                    Event::Error(m) => panic!("{} : {m}", self.name),
-                    _ => {}
+                if self.event(e) {
+                    break;
                 }
             }
             if let Some(s) = &mut self.standby {
-                s.tick(Duration::from_millis(800));
+                s.tick();
+                if s.replaced() {
+                    self.standby = None;
+                }
             }
+            let key = self.identity.clone();
+            self.witnesses.retain(|_, w| w.pump(key.as_ref()));
+            self.voted
+                .extend(self.standby.iter().filter(|s| s.voted()).map(|s| s.room));
+            self.voted.extend(
+                self.witnesses
+                    .values()
+                    .filter(|w| w.voted())
+                    .map(|w| w.room),
+            );
             if self.retake.is_some_and(|t| Instant::now() >= t) {
                 self.take_over();
             }
             hit
+        }
+
+        /// Un événement ; vrai si la connexion vient d'être remplacée (la suite de
+        /// l'ancienne ne compte plus).
+        fn event(&mut self, e: Event) -> bool {
+            match e {
+                Event::Link(l) => self.link = Some(l),
+                Event::BuildGarant(_) => {
+                    let link = self.link.clone().expect("file d'envoi");
+                    let mut n = BuildNet::new(link, self.name.clone(), false);
+                    n.set_identity(self.identity.clone());
+                    self.net = Some(n);
+                }
+                Event::ShardTask {
+                    room,
+                    region,
+                    secret,
+                    slot,
+                    root,
+                } => {
+                    let link = self.link.clone().expect("file d'envoi");
+                    self.shard = crate::garant_worker::ShardHost::start(
+                        room,
+                        region,
+                        secret,
+                        link,
+                        false,
+                        slot,
+                        root,
+                        self.identity.clone(),
+                    );
+                }
+                Event::ShardPeers { list, sov, .. } => {
+                    if let Some(s) = &self.shard {
+                        s.set_peers(&list, sov);
+                    }
+                }
+                Event::RootEdits { edits, .. } => {
+                    if let Some(s) = &self.shard {
+                        s.root_edits(edits);
+                    }
+                }
+                Event::Identity(key) => {
+                    if let Some(n) = &mut self.net {
+                        n.set_identity(Some(key.clone()));
+                    }
+                    if let Some(s) = &self.shard {
+                        s.set_signer(key.clone());
+                    }
+                    self.identity = Some(key);
+                }
+                Event::Shards(list) => {
+                    if let Some(n) = &mut self.net {
+                        n.set_shards(list);
+                    }
+                }
+                Event::ShardTicket {
+                    room,
+                    pseudo,
+                    expires,
+                    mac,
+                    cert,
+                } => {
+                    if let Some(n) = &mut self.net {
+                        n.set_ticket(room, pseudo, expires, mac, cert);
+                    }
+                }
+                Event::RoomClosed => {
+                    self.shard = None;
+                    if self
+                        .standby
+                        .as_ref()
+                        .is_some_and(|s| !s.taken && !s.voted())
+                    {
+                        self.standby = None;
+                    }
+                }
+                Event::Zones { gained, lost } => {
+                    if let Some(n) = &mut self.net {
+                        n.zones_changed(&gained, &lost);
+                    }
+                }
+                Event::FromZone { peer, chunk, data } => {
+                    if matches!(
+                        game::decode::<BuildMsg>(&data),
+                        Some(BuildMsg::Reject { .. })
+                    ) {
+                        self.rejects += 1;
+                    }
+                    if let Some(n) = &mut self.net {
+                        n.receive(peer, chunk, &data, &mut self.world);
+                    }
+                    // Hôte d'un relais de région : ce que publie le relais du monde
+                    // part à ses joueurs (comme dans `garant_worker`).
+                    if let Some(s) = &self.shard {
+                        s.seed(&data);
+                    }
+                }
+                Event::Promoted { .. } => {
+                    if let Some(n) = &mut self.net {
+                        n.set_owner();
+                    }
+                }
+                // (Comme `garant_worker` : jamais gardien d'un monde où il a voté.)
+                Event::StandbyTask { room, .. }
+                    if self.voted.contains(&room)
+                        || self.standby.as_ref().is_some_and(|s| s.taken || s.voted()) =>
+                {
+                    self.c.send(Cmd::Leave);
+                }
+                Event::StandbyTask { room, root, info } => {
+                    let link = self.link.clone().expect("file d'envoi");
+                    self.standby = crate::garant_worker::StandbyHost::start(
+                        room, root, info, &link, false, &self.name,
+                    );
+                }
+                // Gardien : battement du relais du monde (comme dans `garant_worker`).
+                Event::Beat {
+                    t,
+                    committee,
+                    standby: at,
+                } => {
+                    let room = committee.room;
+                    let mut leases = Vec::new();
+                    if let Some(s) = self.standby.as_ref().filter(|s| s.room == room) {
+                        leases.extend(s.beat(t, &committee));
+                    }
+                    if let Some(w) = self.witnesses.get_mut(&room) {
+                        leases.extend(w.beat(t, &committee, at));
+                    }
+                    if let Some(l) = &self.link {
+                        for r in leases {
+                            transport::push(l, &r);
+                        }
+                    }
+                }
+                Event::WitnessTask { room, .. }
+                    if self.voted.contains(&room) || self.witnesses.contains_key(&room) => {}
+                Event::WitnessTask { room, root, cert } => {
+                    if let Some(w) =
+                        crate::garant_worker::WitnessRole::new(room, &self.name, root, cert, None)
+                    {
+                        self.witnesses.insert(room, w);
+                    }
+                }
+                Event::Released { room, sig } => {
+                    if let Some(s) = &mut self.standby {
+                        s.released(room, &sig);
+                    }
+                }
+                Event::Paused(p) => {
+                    if let Some(n) = &mut self.net {
+                        if n.set_paused(p) && p {
+                            self.pauses += 1;
+                        }
+                    }
+                }
+                Event::Replica(ref r) => {
+                    if let Some(s) = &self.standby {
+                        s.feed(r);
+                    }
+                }
+                Event::Standby(at) => self.standby_at = at,
+                Event::TakenOver { host, .. } => {
+                    self.retake = None;
+                    self.taken += 1;
+                    if let Some(n) = &mut self.net {
+                        n.set_link(self.link.clone().expect("file d'envoi"));
+                        if host.eq_ignore_ascii_case(&self.name) {
+                            n.set_owner();
+                        } else {
+                            n.clear_owner();
+                        }
+                    }
+                }
+                // Relais du monde tombé : son relais de secours le reprendra (avec les votes
+                // des gardiens), et les joueurs y reprennent la partie.
+                Event::Lost if self.standby.is_some() || !self.witnesses.is_empty() => {}
+                Event::Lost if self.standby_at.is_some() && self.net.is_some() => {
+                    if self.retake.is_none() {
+                        self.take_over();
+                    }
+                    return true;
+                }
+                // (La suite de l'ancienne connexion, ou le relais de secours qui n'a
+                // pas encore repris le monde : nouvel essai bientôt.)
+                Event::Error(_) | Event::Offline(_) | Event::LoggedOut
+                    if self.standby.is_some()
+                        || self.retake.is_some()
+                        || !self.witnesses.is_empty() =>
+                {
+                    if self.retake.is_some() {
+                        self.retake = Some(Instant::now() + Duration::from_millis(250));
+                    }
+                }
+                Event::Error(m) => panic!("{} : {m}", self.name),
+                _ => {}
+            }
+            false
         }
 
         fn wait(&mut self, want: impl Fn(&Event) -> bool) {
@@ -1694,16 +1884,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Le relais du monde tombe en pleine partie : son relais de secours (sur le PC d'un
-    /// joueur d'un autre monde) avait une copie du monde, il le reprend ; les joueurs y
-    /// reprennent la partie sans la quitter, le premier arrivé en devient le propriétaire,
-    /// on continue de construire, un joueur arrive après coup sur le relais de secours, et
-    /// tous les mondes finissent identiques, case par case (ce qui a été construit avant la
-    /// chute comme après).
-    #[test]
-    fn a_build_world_survives_its_relay() {
+    /// Ce qui arrive au relais du monde pendant la partie.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Fault {
+        /// Il tombe (connexions coupées, plus rien ne répond).
+        Crash,
+        /// Le réseau entre lui et tous ses gardiens est coupé ; les joueurs le joignent
+        /// encore. Il doit mettre le monde en pause, et le relais de secours le reprendre :
+        /// jamais les deux à la fois.
+        Isolated,
+        /// Seul le relais de secours est coupé de lui : le témoin l'entend encore, il
+        /// continue ; le relais de secours ne reprend pas le monde.
+        StandbyCut,
+        /// Il s'arrête proprement : le relais de secours reprend tout de suite.
+        Release,
+    }
+
+    /// Un monde de construction gardé : son relais du monde, un relais de secours (chez
+    /// le joueur d'un autre monde) et un témoin (chez un troisième), quatre joueurs qui
+    /// construisent sans s'arrêter. Au milieu, `fault` arrive au relais du monde. À aucun
+    /// moment deux relais ne servent le monde ; quand le relais de secours reprend, tous
+    /// les joueurs y reprennent la partie sans la quitter (le premier arrivé en devient le
+    /// propriétaire), un joueur arrive après coup ; à la fin, tous les mondes sont
+    /// identiques case par case (ce qui a été construit avant, pendant et après), et rien
+    /// n'est en attente.
+    fn guarded_world(fault: Fault) {
         let dir = std::env::temp_dir().join(format!("minelib-secours-{}", rand_u32()));
         minelib_relay::test_seed_games(&dir, "Garant", 5);
+        minelib_relay::test_seed_games(&dir, "Garant2", 5);
         let h = minelib_relay::start(minelib_relay::Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -1713,18 +1921,33 @@ mod tests {
         .unwrap();
         h.set_standby_local(true);
         let addr = h.addr.to_string();
-        // Le joueur d'un autre monde, qui prête sa connexion de garant.
-        let mut ailleurs = Bot::new(&addr, h.public, "Garant", false);
-        ailleurs.c.send(Cmd::Host {
-            kind: 1,
-            name: "Autre".into(),
-            map: "autre".into(),
-            map_sig: [8; 32],
-            max_players: 0,
-        });
-        ailleurs.wait(|e| matches!(e, Event::Hosted(_)));
-        let mut garant = Bot::new(&addr, h.public, "Garant", true);
-        garant.c.send(Cmd::GarantAvailable(true));
+        // Les joueurs de deux autres mondes, qui prêtent leur connexion de garant : le
+        // premier tiendra le relais de secours, le second sera témoin.
+        let mut ailleurs = Vec::new();
+        let mut garants = Vec::new();
+        for (name, map) in [("Garant", 8u8), ("Garant2", 9u8)] {
+            let mut a = Bot::new(&addr, h.public, name, false);
+            a.c.send(Cmd::Host {
+                kind: 1,
+                name: format!("Autre {map}"),
+                map: format!("autre{map}"),
+                map_sig: [map; 32],
+                max_players: 0,
+            });
+            a.wait(|e| matches!(e, Event::Hosted(_)));
+            ailleurs.push(a);
+            let g = Bot::new(&addr, h.public, name, true);
+            g.c.send(Cmd::GarantAvailable(true));
+            garants.push(g);
+            // (Le premier garant a le temps de devenir le relais de secours.)
+            if garants.len() == 1 {
+                let t = Instant::now();
+                while t.elapsed() < Duration::from_millis(100) {
+                    garants[0].pump(&|_| false);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
         let mut bots = vec![Bot::new(&addr, h.public, "Proprio", false)];
         bots[0].c.send(Cmd::Host {
             kind: 1,
@@ -1766,21 +1989,54 @@ mod tests {
         let dt = 0.02;
         let mut edited = std::collections::BTreeSet::new();
         let mut after = 0;
-        let mut killed_at = None;
-        for step in 0..600 {
-            // Le relais du monde tombe (une fois le relais de secours prêt, et la copie
-            // faite).
-            if killed_at.is_none() && step >= 150 && bots.iter().all(|b| b.standby_at.is_some()) {
-                h.kill();
-                killed_at = Some(step);
+        let mut fault_at: Option<Instant> = None;
+        let mut fault_step = None;
+        let mut resumed_after = None;
+        let mut frozen_seen = false;
+        for step in 0..650 {
+            // La panne, une fois le relais de secours prêt chez tous, la copie faite, et
+            // les gardiens au complet (relais de secours et témoin).
+            let guarded = h
+                .committee(room)
+                .is_some_and(|c| c.standby.is_some() && !c.witnesses.is_empty());
+            if fault_at.is_none()
+                && step >= 150
+                && guarded
+                && bots.iter().all(|b| b.standby_at.is_some())
+            {
+                match fault {
+                    Fault::Crash => h.kill(),
+                    Fault::Isolated => h.guard_isolate(true),
+                    Fault::StandbyCut => h.guard_cut(&["Garant"]),
+                    Fault::Release => assert_eq!(h.release(), 1, "monde confié"),
+                }
+                fault_at = Some(Instant::now());
+                fault_step = Some(step);
+            }
+            // Jamais deux relais à la fois : le relais de secours ne sert le monde que si
+            // le relais du monde ne le peut plus (tombé, ou en pause pour toujours).
+            let taken = garants[0].standby.as_ref().is_some_and(|s| s.taken);
+            if fault != Fault::Crash && fault_at.is_some() {
+                // (Le monde fermé là-bas, ses joueurs partis : il ne le sert plus.)
+                let state = h.frozen(room);
+                frozen_seen |= state == Some(true);
+                assert!(
+                    !taken || state != Some(false),
+                    "deux relais servent le monde (étape {step}, {fault:?})"
+                );
+            }
+            if taken && resumed_after.is_none() && bots.iter().all(|b| b.taken > 0) {
+                resumed_after = fault_at.map(|t| t.elapsed());
             }
             for b in bots.iter_mut() {
                 let r = rnd();
                 b.pos.x = (b.pos.x + (r % 3) as f32 - 1.0).clamp(33.0, 95.0);
                 b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(1.0, 30.0);
-                // Tant que la partie n'a pas repris (pas de relais), on ne construit pas.
-                let live = killed_at.is_none() || b.taken > 0;
-                if live && step < 500 && rnd() % 9 == 0 {
+                // Relais du monde tombé et partie pas encore reprise : pas de relais du
+                // tout, on ne construit pas. Sinon on construit, même en pause (le jeu
+                // garde les modifications et les envoie à la reprise).
+                let live = fault != Fault::Crash || fault_at.is_none() || b.taken > 0;
+                if live && step < 520 && rnd() % 9 == 0 {
                     let x = (CHUNKS.start * 16 + (rnd() % 64) as i32).min(CHUNKS.end * 16 - 1);
                     let z = (rnd() % 32) as i32;
                     let y = 11 + (rnd() % 3) as i32;
@@ -1791,37 +2047,80 @@ mod tests {
                     };
                     b.world.set(x, y, z, block);
                     edited.insert([x, y, z]);
-                    if killed_at.is_some() {
+                    if fault_at.is_some() {
                         after += 1;
                     }
                 }
                 b.tick(dt);
             }
-            garant.tick(dt);
-            if killed_at.is_none() {
-                ailleurs.pump(&|_| false);
+            for g in garants.iter_mut() {
+                g.tick(dt);
+            }
+            if fault != Fault::Crash || fault_at.is_none() {
+                for a in ailleurs.iter_mut() {
+                    a.pump(&|_| false);
+                }
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(killed_at.is_some(), "relais de secours prêt chez tous");
-        assert!(after > 20, "on a construit après la reprise : {after}");
-        for b in &bots {
-            assert_eq!(b.taken, 1, "{} a repris la partie", b.name);
+        assert!(
+            fault_at.is_some(),
+            "gardiens au complet et relais de secours prêt"
+        );
+        assert!(after > 20, "on a construit après la panne : {after}");
+        let took = garants[0].standby.as_ref().is_some_and(|s| s.taken);
+        if fault == Fault::StandbyCut {
+            // Le témoin entend toujours le relais du monde : il continue, sans pause ;
+            // personne ne passe au relais de secours.
+            assert!(!took, "le relais de secours n'a pas repris le monde");
+            assert!(
+                !frozen_seen,
+                "le relais du monde n'a jamais mis le monde en pause"
+            );
+            for b in &bots {
+                assert_eq!(b.taken, 0, "{} est resté sur le relais du monde", b.name);
+                assert_eq!(b.pauses, 0, "{} n'a pas vu de pause", b.name);
+            }
+        } else {
+            assert!(took, "le relais de secours a repris le monde");
+            for b in &bots {
+                assert_eq!(b.taken, 1, "{} a repris la partie", b.name);
+            }
+            let after = resumed_after.expect("tous repris");
+            eprintln!(
+                "{fault:?} : tous les joueurs sur le relais de secours {} ms après la panne \
+                 (étape {fault_step:?})",
+                after.as_millis()
+            );
+            if fault == Fault::Isolated {
+                assert!(frozen_seen, "le relais du monde a mis le monde en pause");
+                assert!(
+                    bots.iter().all(|b| b.pauses > 0),
+                    "les joueurs ont vu la pause"
+                );
+            }
+            let h2 = garants[0].standby.as_ref().expect("relais de secours");
+            let resumed = h2.resumed().expect("monde repris");
+            // Un joueur arrive après coup, sur le relais de secours.
+            let at = bots[0].standby_at.clone().unwrap();
+            let mut late = Bot::new(&at.addr, at.key, "Retard", false);
+            late.c.send(Cmd::Join(resumed));
+            late.wait(|e| matches!(e, Event::Joined { .. }));
+            late.start_net(false);
+            bots.push(late);
         }
-        let h2 = garant.standby.as_ref().expect("relais de secours");
-        let resumed = h2_resumed(h2).expect("monde repris");
-        // Un joueur arrive après coup, sur le relais de secours.
-        let at = bots[0].standby_at.clone().unwrap();
-        let mut late = Bot::new(&at.addr, at.key, "Retard", false);
-        late.c.send(Cmd::Join(resumed));
-        late.wait(|e| matches!(e, Event::Joined { .. }));
-        late.start_net(false);
-        bots.push(late);
         for _ in 0..250 {
             for b in bots.iter_mut() {
                 b.tick(dt);
             }
-            garant.tick(dt);
+            for g in garants.iter_mut() {
+                g.tick(dt);
+            }
+            if fault != Fault::Crash {
+                for a in ailleurs.iter_mut() {
+                    a.pump(&|_| false);
+                }
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         for b in &bots {
@@ -1854,8 +2153,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn h2_resumed(s: &crate::garant_worker::StandbyHost) -> Option<u64> {
-        s.resumed()
+    #[test]
+    fn a_build_world_survives_its_relay() {
+        guarded_world(Fault::Crash);
+    }
+
+    #[test]
+    fn a_world_relay_cut_from_its_guardians_pauses_and_the_standby_takes_over() {
+        guarded_world(Fault::Isolated);
+    }
+
+    #[test]
+    fn a_standby_cut_from_the_world_relay_alone_does_not_take_over() {
+        guarded_world(Fault::StandbyCut);
+    }
+
+    #[test]
+    fn a_world_relay_that_stops_cleanly_hands_over_at_once() {
+        guarded_world(Fault::Release);
     }
 
     #[test]

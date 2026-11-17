@@ -39,11 +39,20 @@ pub enum Cmd {
         /// Jeton d'appareil de confiance pour ce compte (pas de 2FA).
         device: Option<[u8; 32]>,
     },
+    /// Entre comme témoin chez le relais de secours d'un monde (voir
+    /// `Request::WitnessLogin`).
+    WitnessLogin {
+        cert: crate::sovereign::Cert,
+        key: ed25519_dalek::SigningKey,
+    },
     /// Reprend le monde sur son relais de secours (le relais du monde est tombé) : le
     /// certificat de la clé du compte signé par l'ancien relais du monde, et cette clé.
     Takeover {
         cert: crate::sovereign::Cert,
         key: ed25519_dalek::SigningKey,
+        /// Le relais de secours attendu (voir `StandbyAt`) : il doit prouver qu'il a le
+        /// droit de servir le monde (`crate::guard::Proof`), sinon on n'y entre pas.
+        expect: Option<crate::proto::StandbyAt>,
     },
     /// Entre dans un relais de région avec le billet du relais du monde (et le certificat
     /// de la clé du compte, voir `crate::sovereign`).
@@ -328,6 +337,29 @@ pub enum Event {
     Replica(Response),
     /// Où est le relais de secours du monde (aucun : pas encore).
     Standby(Option<crate::proto::StandbyAt>),
+    /// Gardien d'un monde : battement du relais du monde (voir `Response::Beat`).
+    Beat {
+        t: u64,
+        committee: crate::guard::Committee,
+        standby: Option<crate::proto::StandbyAt>,
+    },
+    /// Être témoin d'un monde (voir `Response::WitnessTask`).
+    WitnessTask {
+        room: u64,
+        root: [u8; 32],
+        cert: crate::sovereign::Cert,
+    },
+    /// Liste des gardiens plus récente, du relais de secours (témoin).
+    Committee(crate::guard::Committee),
+    /// Le relais du monde s'arrête proprement (relais de secours : reprendre ; `sig` : cet
+    /// arrêt signé par lui).
+    Released {
+        room: u64,
+        sig: Vec<u8>,
+    },
+    /// Le monde est en pause (le relais du monde n'entend plus assez de gardiens), ou
+    /// repart.
+    Paused(bool),
     /// La connexion ouverte au relais vient d'être perdue (suivie de `LoggedOut` et d'une
     /// erreur).
     Lost,
@@ -719,6 +751,19 @@ impl Worker {
             | Response::ReplicaBag { .. }
             | Response::ReplicaMode { .. }) => Event::Replica(r),
             Response::Standby { at } => Event::Standby(at),
+            Response::Beat {
+                t,
+                committee,
+                standby,
+            } => Event::Beat {
+                t,
+                committee,
+                standby,
+            },
+            Response::WitnessTask { room, root, cert } => Event::WitnessTask { room, root, cert },
+            Response::Committee { committee } => Event::Committee(committee),
+            Response::Released { room, sig } => Event::Released { room, sig },
+            Response::Paused { paused } => Event::Paused(paused),
             Response::Shards { list } => Event::Shards(list),
             Response::ShardTicket {
                 room,
@@ -888,13 +933,44 @@ impl Worker {
                 }
                 self.login(&pseudo, &keys, None, None)
             }
-            Cmd::Takeover { cert, key } => {
+            Cmd::WitnessLogin { cert, key } => {
                 self.chan = None;
                 self.connect()?;
-                let challenge = match self.request(&Request::Takeover { cert: cert.clone() })? {
-                    Response::TakeoverChallenge { challenge } => challenge,
+                let challenge = match self.request(&Request::WitnessLogin { cert })? {
+                    Response::TakeoverChallenge { challenge, .. } => challenge,
                     r => return self.unexpected(r),
                 };
+                use ed25519_dalek::Signer;
+                let signature = key.sign(&challenge).to_bytes().to_vec();
+                match self.request(&Request::WitnessProve { signature })? {
+                    Response::Done => {
+                        if let Some(c) = &self.chan {
+                            self.emit(Event::Link(c.pusher()));
+                        }
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
+            }
+            Cmd::Takeover { cert, key, expect } => {
+                self.chan = None;
+                self.connect()?;
+                let (challenge, proof) =
+                    match self.request(&Request::Takeover { cert: cert.clone() })? {
+                        Response::TakeoverChallenge { challenge, proof } => (challenge, proof),
+                        r => return self.unexpected(r),
+                    };
+                // Un relais de secours qui ne prouve pas que les gardiens lui ont confié le
+                // monde (ou que le relais du monde s'est arrêté) : on n'y entre pas.
+                if let Some(at) = &expect {
+                    if !proof.is_some_and(|p| p.check(&at.root, at.room, &at.pseudo)) {
+                        self.chan = None;
+                        self.emit(Event::Error(
+                            "Le relais de secours ne prouve pas qu'il a repris le monde.".into(),
+                        ));
+                        return Ok(());
+                    }
+                }
                 use ed25519_dalek::Signer;
                 let signature = key.sign(&challenge).to_bytes().to_vec();
                 match self.request(&Request::TakeoverProve { signature })? {

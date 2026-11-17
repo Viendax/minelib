@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use minelib_net::client::{Client, Cmd, Event};
+use minelib_net::guard;
 use minelib_net::proto::{self, ServerEntry};
 use minelib_net::{crypto, totp};
 use minelib_platform::{Input, KeyCode};
@@ -323,6 +324,13 @@ pub struct Accounts {
     cert: Option<minelib_net::sovereign::Cert>,
     /// Reprise par le relais de secours en cours : depuis quand, prochain essai.
     taking_over: Option<(std::time::Instant, std::time::Instant)>,
+    /// Monde en pause (son relais n'entend plus assez de gardiens), dernier message du
+    /// relais du monde : on cherche alors son relais de secours sans quitter le relais du
+    /// monde (connexion d'essai, prochain essai).
+    world_paused: bool,
+    last_heard: std::time::Instant,
+    probe: Option<Client>,
+    probe_next: Option<std::time::Instant>,
 }
 
 impl Accounts {
@@ -370,6 +378,10 @@ impl Accounts {
             standby: None,
             cert: None,
             taking_over: None,
+            world_paused: false,
+            last_heard: std::time::Instant::now(),
+            probe: None,
+            probe_next: None,
         }
     }
 
@@ -581,10 +593,52 @@ impl Accounts {
                 self.start_takeover();
             }
         }
-        let Some(client) = &self.client else { return };
+        // Monde en pause, ou relais du monde muet : on cherche son relais de secours, sans
+        // quitter le relais du monde (il peut repartir). Dès que le relais de secours a
+        // repris le monde, la partie continue chez lui.
+        let now = std::time::Instant::now();
+        let silent = self.standby.is_some()
+            && self.last_heard.elapsed() > Duration::from_millis(guard::SILENT_MS);
+        let want_probe =
+            (self.world_paused || silent) && self.taking_over.is_none() && self.can_take_over();
+        if !want_probe {
+            self.probe = None;
+            self.probe_next = None;
+        } else if self.probe.is_none() && self.probe_next.is_none_or(|t| now >= t) {
+            self.probe = self.takeover_client();
+            self.probe_next = Some(now + Duration::from_millis(guard::PROBE_MS));
+        }
         let mut events = Vec::new();
-        while let Some(e) = client.poll() {
-            events.push(e);
+        if let Some(p) = &self.probe {
+            let mut got = Vec::new();
+            while let Some(e) = p.poll() {
+                got.push(e);
+            }
+            if got.iter().any(|e| matches!(e, Event::TakenOver { .. })) {
+                log::info!("relais de secours : il a repris le monde, la partie continue chez lui");
+                self.client = self.probe.take();
+                self.world_paused = false;
+                self.probe_next = None;
+                self.last_heard = now;
+                events = got;
+            } else if got.iter().any(|e| {
+                matches!(
+                    e,
+                    Event::Error(_) | Event::Offline(_) | Event::Lost | Event::LoggedOut
+                )
+            }) {
+                // (Il n'a pas encore repris le monde, ou ne répond pas : nouvel essai.)
+                self.probe = None;
+            }
+        }
+        let Some(client) = &self.client else { return };
+        if events.is_empty() {
+            while let Some(e) = client.poll() {
+                events.push(e);
+            }
+            if !events.is_empty() {
+                self.last_heard = now;
+            }
         }
         // L'autre relais (partie d'un relais fédéré) n'a pas voulu de nous : retour au
         // relais d'origine.
@@ -679,22 +733,43 @@ impl Accounts {
                     ));
                     let now = std::time::Instant::now();
                     self.taking_over = Some((now, now));
+                    self.probe = None;
                     break;
                 }
                 // Le relais de secours n'a pas encore repris le monde, ou ne répond pas :
                 // nouvel essai bientôt.
                 Event::Offline(m) | Event::Error(m) if self.taking_over.is_some() => {
-                    log::info!("relais de secours : {m} ; nouvel essai");
+                    log::debug!("relais de secours : {m} ; nouvel essai");
                     let now = std::time::Instant::now();
                     if let Some(t) = &mut self.taking_over {
-                        t.1 = now + Duration::from_secs(2);
+                        t.1 = now + Duration::from_millis(guard::PROBE_MS);
                     }
                 }
                 Event::Lost => {}
-                Event::Standby(at) => self.standby = at,
+                // Monde en pause, ou qui repart (le jeu garde les modifications du joueur
+                // en attendant).
+                Event::Paused(p) => {
+                    self.world_paused = p;
+                    self.game_events.push(e);
+                }
+                // (Pour les connexions de garant : gardiens des mondes.)
+                Event::Beat { .. }
+                | Event::WitnessTask { .. }
+                | Event::Committee(_)
+                | Event::Released { .. } => {}
+                Event::Standby(at) => {
+                    self.standby = at;
+                    self.last_heard = std::time::Instant::now();
+                }
                 Event::StandbyTask { .. } | Event::Replica(_) => {}
+                // Le monde est repris : le relais de secours est désormais le relais du
+                // monde (il n'a pas lui-même de relais de secours : plus rien à chercher).
                 Event::TakenOver { .. } => {
                     self.taking_over = None;
+                    self.standby = None;
+                    self.world_paused = false;
+                    self.probe = None;
+                    self.probe_next = None;
                     self.game_events.push(e);
                 }
                 Event::ShardTicket { ref cert, .. } => {
@@ -841,14 +916,22 @@ impl Accounts {
     /// (directement, sinon par un tunnel iroh vers son hôte), avec le certificat de la clé
     /// du compte.
     fn start_takeover(&mut self) {
+        if let Some(c) = self.takeover_client() {
+            self.client = Some(c);
+        }
+    }
+
+    /// Connexion au relais de secours du monde, qui demande à y reprendre la partie.
+    fn takeover_client(&self) -> Option<Client> {
         let (Some(at), Some(cert), Some(key)) = (
             self.standby.clone(),
             self.cert.clone(),
             self.identity.clone(),
         ) else {
-            return;
+            return None;
         };
         let dir = self.relay_dir();
+        let expect = at.clone();
         let client = Client::spawn_resolved(Box::new(move || {
             if let Ok(a) = at.addr.parse::<SocketAddr>() {
                 if TcpStream::connect_timeout(&a, Duration::from_millis(800)).is_ok() {
@@ -859,14 +942,35 @@ impl Accounts {
                 p2p_node(&dir).ok_or_else(|| anyhow::anyhow!("relais de secours injoignable"))?;
             Ok((n.tunnel(at.node)?.to_string(), Some(at.key)))
         }));
-        client.send(Cmd::Takeover { cert, key });
-        self.client = Some(client);
+        client.send(Cmd::Takeover {
+            cert,
+            key,
+            expect: Some(expect),
+        });
+        Some(client)
     }
 
     /// Quitter un monde : plus de relais de secours à rejoindre.
     pub fn forget_standby(&mut self) {
         self.standby = None;
         self.taking_over = None;
+        self.world_paused = false;
+        self.probe = None;
+        self.probe_next = None;
+    }
+
+    /// Le jeu se ferme : si ce PC tient un relais (relais intégré), les mondes qui ont un
+    /// relais de secours lui sont confiés tout de suite (sans attendre que les gardiens
+    /// remarquent son silence).
+    pub fn release_relay(&self) {
+        if let Some(h) = &self.embedded {
+            let n = h.release();
+            if n > 0 {
+                log::info!("relais intégré : {n} monde(s) confié(s) à leur relais de secours");
+                // Le temps que les messages partent.
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
     }
 
     pub fn relay_dir(&self) -> PathBuf {
