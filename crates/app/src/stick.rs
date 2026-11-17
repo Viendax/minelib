@@ -1,82 +1,129 @@
 //! Touche « avancer » qui remonte mal (clavier de portable : la coupelle sous la touche,
 //! usée et chauffée par la machine, met du temps à se relever). Le clavier la dit encore
-//! enfoncée après qu'on l'a lâchée, d'un dixième de seconde à froid jusqu'à une seconde
-//! et plus à chaud, et le joueur continue d'avancer, dans tous les jeux. Aucun logiciel ne
-//! voit mieux que le clavier ; mais un joueur qui court lâche « avancer » et « courir »
-//! ensemble, et « courir », elle, remonte bien.
+//! enfoncée après qu'on l'a lâchée, de quelques centièmes de seconde à froid jusqu'à une
+//! seconde et plus à chaud ou après un long appui, et le joueur continue d'avancer, dans
+//! tous les jeux. Aucun logiciel ne voit mieux que le clavier ; mais un joueur qui court
+//! lâche « avancer » et « courir » ensemble, et « courir », elle, remonte bien.
 //!
 //! Le jeu mesure donc, à chaque fin de course, le temps entre « courir » relâchée et
-//! « avancer » relâchée. Trois fois de suite nettement après (0,18 s ou plus) : la touche
-//! traîne. Dès lors, lâcher « courir » arrête d'avancer tout de suite, sans attendre
-//! « avancer ». Si elle reste vraiment enfoncée (le joueur voulait continuer en marchant),
-//! la marche reprend après un délai réglé sur ce que la touche a montré de pire. La règle
-//! se retient d'une partie à l'autre ; elle s'éteint si le joueur continue souvent de
-//! marcher après avoir couru. Chez un joueur dont le clavier va bien, elle ne s'active
-//! jamais.
+//! « avancer » relâchée. Trois fois de suite nettement après (0,18 à 1,5 s), sans une
+//! seule fois ensemble entre-temps : la touche traîne. Dès lors, lâcher « courir » arrête
+//! d'avancer tout de suite, et on ne repart que sur un nouvel appui (« avancer » relâchée
+//! puis renfoncée, ou « courir »). Si « avancer » reste annoncée enfoncée plusieurs
+//! secondes (plus longtemps qu'elle n'a jamais traîné), c'est que le joueur la tient
+//! vraiment : la marche reprend.
+//!
+//! La règle se retient d'une partie à l'autre, ne s'active jamais sur un clavier sain,
+//! s'éteint si le joueur continue souvent de marcher après avoir couru, et se règle à la
+//! main (`/touchelente on`, `off`, `auto`). Elle ne vaut pas en mode FPS, où « marcher »
+//! relâchée veut dire courir.
 
 /// Les deux touches tenues ensemble au moins ce temps (s) pour qu'un relâchement compte.
 const HELD_MIN: f32 = 1.5;
-/// « Avancer » relâchée au moins ce temps (s) après « courir » : elle traînait.
+/// « Avancer » relâchée moins de ce temps (s) après « courir » : ensemble (clavier sain).
+const CLEAN: f32 = 0.12;
+/// Entre ces deux temps (s) : elle traînait.
 const LATE_FROM: f32 = 0.18;
-/// Au-delà (s), ce n'est plus une touche qui traîne : le joueur continue en marchant.
-const LATE_TO: f32 = 2.0;
+const LATE_TO: f32 = 1.5;
 /// Relâchements en retard à la suite qui activent la règle.
-const IN_A_ROW: usize = 3;
-/// Relâchements retenus (pour l'éteindre, et pour régler l'attente).
+const IN_A_ROW: u32 = 3;
+/// Fins de course retenues (pour éteindre la règle).
 const HISTORY: usize = 8;
-/// Fichier (dossier du jeu) qui retient que la touche traîne, d'une partie à l'autre.
+/// Fichier (dossier du jeu) qui retient le réglage d'une partie à l'autre : « 1 » (la
+/// touche traîne, appris), « oui » (demandé par le joueur), « non » (refusé).
 const FILE: &str = "touche_avancer_lente";
 
-/// Ce qui a suivi « courir » relâchée.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum After {
-    /// « Avancer » relâchée ce temps (s) après.
-    Stop(f32),
-    /// « Avancer » gardée : le joueur a continué en marchant.
-    Walk,
+/// Réglage du joueur.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum Mode {
+    /// Le jeu apprend tout seul.
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Default)]
 pub struct Guard {
-    /// Temps depuis lequel les deux touches sont tenues ensemble.
+    mode: Mode,
+    /// Temps depuis lequel « avancer » est tenue, et les deux touches ensemble.
+    fwd_time: f32,
     both: f32,
     mod_was: bool,
-    /// « Courir » vient d'être lâchée avec « avancer » encore tenue : temps écoulé depuis.
-    waiting: Option<f32>,
-    history: std::collections::VecDeque<After>,
+    /// « Courir » vient d'être lâchée avec « avancer » encore tenue : temps écoulé depuis,
+    /// et durée de l'appui sur « avancer » à ce moment.
+    waiting: Option<(f32, f32)>,
+    /// Retards à la suite (appris), et dernières fins de course : vrai si le joueur a
+    /// continué en marchant.
+    streak: u32,
+    walked: std::collections::VecDeque<bool>,
     active: bool,
-    /// Avancer est retenue en attendant que la touche remonte.
+    /// Avancer est retenue en attendant un nouvel appui.
     blocked: bool,
     /// La règle vient de s'activer (à dire au joueur, une fois).
     pub just_learned: bool,
     /// Dernier retard mesuré (s), pour le journal.
     pub last_gap: Option<f32>,
     /// Ce qui est noté dans le fichier.
-    saved: bool,
+    saved: Option<(Mode, bool)>,
+}
+
+/// Temps (s) après lequel une touche « avancer » toujours annoncée enfoncée est tenue
+/// pour de bon : bien plus qu'elle n'a jamais traîné (jusqu'à 3 s mesurées après un appui
+/// de près d'une minute), et d'autant plus qu'elle a été tenue longtemps.
+fn resume_after(held: f32) -> f32 {
+    (2.0 + 0.05 * held).clamp(3.0, 6.0)
 }
 
 impl Guard {
-    /// Reprend ce qui a été appris aux parties précédentes.
+    /// Reprend ce qui a été appris ou réglé aux parties précédentes.
     pub fn restored() -> Self {
         let mut g = Self::default();
-        if minelib_assets::data_dir().join(FILE).exists() {
-            g.active = true;
+        match std::fs::read_to_string(minelib_assets::data_dir().join(FILE))
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("non") => g.mode = Mode::Off,
+            Some("oui") => {
+                g.mode = Mode::On;
+                g.active = true;
+            }
+            Some(_) => g.active = true,
+            None => {}
         }
-        g.saved = g.active;
+        g.saved = Some((g.mode, g.active));
         g
     }
 
-    /// Retient (ou oublie) la règle pour les prochaines parties, quand elle change.
+    /// Retient le réglage pour les prochaines parties, quand il change.
     pub fn remember(&mut self) {
-        if self.saved != self.active {
-            self.saved = self.active;
+        let now = (self.mode, self.active);
+        if self.saved.is_some() && self.saved != Some(now) {
+            self.saved = Some(now);
             let path = minelib_assets::data_dir().join(FILE);
-            let _ = if self.active {
-                std::fs::write(path, "1")
-            } else {
-                std::fs::remove_file(path)
+            let _ = match now {
+                (Mode::Off, _) => std::fs::write(path, "non"),
+                (Mode::On, _) => std::fs::write(path, "oui"),
+                (Mode::Auto, true) => std::fs::write(path, "1"),
+                (Mode::Auto, false) => std::fs::remove_file(path),
             };
         }
+    }
+
+    /// Réglage à la main (`/touchelente`).
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        match mode {
+            Mode::On => self.active = true,
+            Mode::Off => {
+                self.active = false;
+                self.blocked = false;
+            }
+            Mode::Auto => {}
+        }
+        self.streak = 0;
+        self.walked.clear();
     }
 
     /// La règle est-elle active pour ce joueur ?
@@ -84,78 +131,71 @@ impl Guard {
         self.active
     }
 
-    /// Temps (s) pendant lequel « avancer » est retenue après « courir » relâchée : un peu
-    /// plus que le pire retard vu récemment (une seconde et demie tant qu'on n'en sait rien).
-    fn patience(&self) -> f32 {
-        let worst = self
-            .history
-            .iter()
-            .filter_map(|a| match a {
-                After::Stop(g) => Some(*g),
-                After::Walk => None,
-            })
-            .fold(None, |m: Option<f32>, g| Some(m.map_or(g, |m| m.max(g))));
-        worst.map_or(1.5, |w| (w * 1.3 + 0.3).clamp(0.6, LATE_TO))
-    }
-
-    fn sample(&mut self, after: After) {
-        self.history.push_back(after);
-        if self.history.len() > HISTORY {
-            self.history.pop_front();
+    /// Fin de course : « avancer » relâchée `gap` secondes après « courir » (`None` : le
+    /// joueur a continué en marchant).
+    fn sample(&mut self, gap: Option<f32>) {
+        self.walked.push_back(gap.is_none());
+        if self.walked.len() > HISTORY {
+            self.walked.pop_front();
         }
-        let late = |a: &After| matches!(a, After::Stop(g) if *g >= LATE_FROM);
-        if !self.active {
-            let n = self.history.len();
-            if n >= IN_A_ROW && self.history.iter().skip(n - IN_A_ROW).all(late) {
-                self.active = true;
-                self.just_learned = true;
-            }
-        } else {
-            // Il continue souvent de marcher après avoir couru : la règle le gênerait.
-            let walks = self.history.iter().filter(|a| **a == After::Walk).count();
-            if walks * 2 >= HISTORY {
-                self.active = false;
-            }
+        if self.mode != Mode::Auto {
+            return;
+        }
+        match gap {
+            Some(g) if (LATE_FROM..=LATE_TO).contains(&g) => self.streak += 1,
+            // Relâchées ensemble : ce clavier va bien.
+            Some(g) if g < CLEAN => self.streak = 0,
+            _ => {}
+        }
+        if !self.active && self.streak >= IN_A_ROW {
+            self.active = true;
+            self.just_learned = true;
+        }
+        // Il continue souvent de marcher après avoir couru : la règle le gênerait.
+        if self.active && self.walked.iter().filter(|w| **w).count() * 2 >= HISTORY {
+            self.active = false;
+            self.streak = 0;
+            self.walked.clear();
         }
     }
 
     /// À chaque image : « avancer » tenue, « avancer » enfoncée à cette image, « courir »
-    /// (ou « marcher » en FPS) tenue. Renvoie vrai s'il ne faut pas avancer.
+    /// tenue. Renvoie vrai s'il ne faut pas avancer.
     pub fn update(&mut self, dt: f32, fwd: bool, fwd_pressed: bool, modifier: bool) -> bool {
         if fwd_pressed {
             // Nouvel appui : c'est voulu.
             self.blocked = false;
             self.waiting = None;
+            self.fwd_time = 0.0;
         }
-        if let Some(t) = &mut self.waiting {
+        if let Some((t, held)) = &mut self.waiting {
             *t += dt;
-            let t = *t;
+            let (t, held) = (*t, *held);
             if !fwd {
-                // Relâchée : tout de suite (clavier sain), ou un instant après (elle traînait).
+                // Relâchée : ensemble (clavier sain), ou après (elle traînait).
                 self.waiting = None;
                 self.blocked = false;
                 self.last_gap = Some(t);
-                self.sample(After::Stop(t));
+                self.sample(Some(t));
             } else if modifier {
-                // Il recourt : on n'en sait pas plus.
+                // Il recourt : il avance, et on n'en sait pas plus.
                 self.waiting = None;
                 self.blocked = false;
-            } else {
-                if t > LATE_TO {
-                    self.waiting = None;
-                    self.sample(After::Walk);
-                }
-                if t > self.patience() {
-                    // Toujours tenue : le joueur voulait continuer en marchant.
-                    self.blocked = false;
-                }
+            } else if t > resume_after(held) {
+                // Toujours tenue, bien après le pire retard : il la tient pour de bon.
+                self.waiting = None;
+                self.blocked = false;
+                self.sample(None);
             }
+        }
+        if fwd {
+            self.fwd_time += dt;
         }
         if fwd && modifier {
             self.both += dt;
         }
         if self.mod_was && !modifier && fwd && self.both >= HELD_MIN {
-            self.waiting = Some(0.0);
+            self.waiting = Some((0.0, self.fwd_time));
             self.blocked = self.active;
         }
         if !fwd || !modifier {
@@ -163,6 +203,7 @@ impl Guard {
         }
         if !fwd {
             self.blocked = false;
+            self.fwd_time = 0.0;
         }
         self.mod_was = modifier;
         self.blocked
@@ -176,7 +217,7 @@ mod tests {
     const DT: f32 = 1.0 / 200.0;
 
     /// Court `run` secondes, lâche « courir », puis « avancer » `gap` secondes après
-    /// (`None` : continue de marcher 4 s). Renvoie le temps passé à avancer après avoir
+    /// (`None` : continue de marcher 8 s). Renvoie le temps passé à avancer après avoir
     /// lâché « courir ».
     fn sprint(g: &mut Guard, run: f32, gap: Option<f32>) -> f32 {
         let mut first = true;
@@ -184,7 +225,7 @@ mod tests {
             g.update(DT, true, std::mem::take(&mut first), true);
         }
         let mut moved = 0.0;
-        let hold = gap.unwrap_or(4.0);
+        let hold = gap.unwrap_or(8.0);
         for _ in 0..(hold / DT).round() as usize {
             if !g.update(DT, true, false, false) {
                 moved += DT;
@@ -199,17 +240,20 @@ mod tests {
     #[test]
     fn a_healthy_keyboard_never_triggers_the_rule() {
         let mut g = Guard::default();
-        for i in 0..40 {
-            // Relâchées presque ensemble (jusqu'à 0,15 s d'écart, des doigts qui ne partent
-            // pas au même instant), ou on continue en marchant.
-            let gap = match i % 4 {
+        for i in 0..60 {
+            // Relâchées ensemble (à quelques centièmes près), parfois « avancer » un peu
+            // après, parfois on continue en marchant : jamais trois retards de suite sans
+            // un relâchement net entre deux.
+            let gap = match i % 5 {
                 0 => None,
-                k => Some(0.05 * k as f32),
+                1 | 3 => Some(0.04),
+                2 => Some(0.6),
+                _ => Some(0.25),
             };
             let moved = sprint(&mut g, 6.0, gap);
-            assert!(!g.active());
+            assert!(!g.active(), "course {i}");
             assert!(
-                (moved - gap.unwrap_or(4.0)).abs() < 0.02,
+                (moved - gap.unwrap_or(8.0)).abs() < 0.02,
                 "rien n'est retenu"
             );
         }
@@ -220,21 +264,21 @@ mod tests {
     #[test]
     fn a_key_that_gets_slower_as_the_laptop_warms_is_learned_then_stopped_at_once() {
         let mut g = Guard::default();
-        let seen = [0.042, 0.117, 0.125, 0.200, 0.338, 0.549];
-        for gap in seen {
+        for gap in [0.042, 0.117, 0.125, 0.200, 0.338, 0.549] {
             assert!(!g.active());
             sprint(&mut g, 17.0, Some(gap));
         }
         assert!(g.active() && g.just_learned, "trois retards de suite");
-        // Ensuite, lâcher « courir » arrête d'avancer tout de suite, même si la touche
-        // traîne de plus en plus.
-        for gap in [0.6, 0.8, 1.0, 1.2, 1.4] {
-            assert!(sprint(&mut g, 17.0, Some(gap)) < 0.02, "retard {gap}");
+        // Ensuite, lâcher « courir » arrête d'avancer tout de suite, même quand la touche
+        // traîne bien plus longtemps qu'on ne l'a jamais vue traîner (jusqu'à 3 s mesurées).
+        for gap in [0.6, 1.1, 1.4, 2.3, 2.75, 3.1] {
+            assert!(sprint(&mut g, 45.0, Some(gap)) < 0.02, "retard {gap}");
         }
-        // Il veut vraiment continuer en marchant : la marche reprend (après le pire retard
-        // vu, plus une marge), et une fois ne suffit pas à oublier la règle.
+        assert!(g.active());
+        // Il la tient pour de bon : la marche finit par reprendre, et une fois ne suffit
+        // pas à oublier la règle.
         let moved = sprint(&mut g, 17.0, None);
-        assert!((1.5..3.5).contains(&moved), "{moved}");
+        assert!((4.0..6.0).contains(&moved), "{moved}");
         assert!(g.active());
         // Un sprint très court n'est jamais retenu.
         assert!((sprint(&mut g, 0.5, Some(0.5)) - 0.5).abs() < 0.02);
@@ -253,17 +297,15 @@ mod tests {
         }
         assert!(!g.active());
         assert!(
-            (sprint(&mut g, 10.0, None) - 4.0).abs() < 0.02,
+            (sprint(&mut g, 10.0, None) - 8.0).abs() < 0.02,
             "plus rien n'est retenu"
         );
     }
 
     #[test]
-    fn pressing_forward_again_always_moves() {
+    fn pressing_forward_or_sprint_again_always_moves() {
         let mut g = Guard::default();
-        for _ in 0..3 {
-            sprint(&mut g, 10.0, Some(0.9));
-        }
+        g.set_mode(Mode::On);
         for _ in 0..1000 {
             g.update(DT, true, false, true);
         }
@@ -271,7 +313,30 @@ mod tests {
             g.update(DT, true, false, false),
             "retenue au relâchement de courir"
         );
+        // Il recourt sans avoir lâché « avancer » : il avance.
+        assert!(!g.update(DT, true, false, true));
+        for _ in 0..1000 {
+            g.update(DT, true, false, true);
+        }
+        assert!(g.update(DT, true, false, false));
+        // « Avancer » relâchée puis renfoncée : il avance.
         g.update(DT, false, false, false);
-        assert!(!g.update(DT, true, true, false), "nouvel appui : on avance");
+        assert!(!g.update(DT, true, true, false));
+    }
+
+    #[test]
+    fn the_player_can_force_or_refuse_the_rule() {
+        let mut g = Guard::default();
+        g.set_mode(Mode::Off);
+        for _ in 0..6 {
+            assert!((sprint(&mut g, 10.0, Some(0.8)) - 0.8).abs() < 0.02);
+        }
+        assert!(!g.active(), "refusée : jamais apprise");
+        g.set_mode(Mode::On);
+        assert!(sprint(&mut g, 10.0, Some(0.8)) < 0.02);
+        for _ in 0..6 {
+            sprint(&mut g, 10.0, None);
+        }
+        assert!(g.active(), "demandée : jamais éteinte");
     }
 }

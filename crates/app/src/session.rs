@@ -689,21 +689,18 @@ impl Session {
             };
             // Touche « avancer » qui remonte mal (voir `stick`) : chez un joueur dont elle
             // traîne après chaque course, lâcher « courir » arrête d'avancer tout de suite.
-            let (fwd, modifier) = if fps_mode {
-                (
-                    Action::FpsForward,
-                    !keys.walk_toggle && keys.held(input, Action::FpsWalk),
-                )
-            } else {
-                (Action::Forward, keys.held(input, Action::Sprint))
-            };
-            let fwd_held = keys.held(input, fwd);
-            if self
-                .stick
-                .update(dt, fwd_held, keys.pressed(input, fwd), modifier)
-                && fwd_held
-            {
-                m.forward -= 1.0;
+            // (Pas en mode FPS : « marcher » relâchée y veut dire courir, pas s'arrêter.)
+            if !fps_mode {
+                let fwd_held = keys.held(input, Action::Forward);
+                if self.stick.update(
+                    dt,
+                    fwd_held,
+                    keys.pressed(input, Action::Forward),
+                    keys.held(input, Action::Sprint),
+                ) && fwd_held
+                {
+                    m.forward -= 1.0;
+                }
             }
             self.stick.remember();
             if let Some(gap) = self.stick.last_gap.take() {
@@ -724,7 +721,7 @@ impl Session {
                 );
                 self.chat.say(
                     "Ta touche avancer se relâche en retard (elle remonte mal). Le jeu s'arrête \
-                     maintenant dès que tu lâches courir."
+                     maintenant dès que tu lâches courir (/touchelente off pour l'enlever)."
                         .to_string(),
                     chat::YELLOW,
                 );
@@ -3282,6 +3279,35 @@ impl Session {
                         },
                         chat::RED,
                     );
+                }
+            }
+            // Touche « avancer » qui remonte mal : règle forcée, refusée ou apprise.
+            "touchelente" | "slowkey" => {
+                use crate::stick::Mode;
+                let mode = match arg {
+                    Some("on" | "oui" | "1") => Some(Mode::On),
+                    Some("off" | "non" | "0") => Some(Mode::Off),
+                    Some("auto") => Some(Mode::Auto),
+                    _ => None,
+                };
+                match mode {
+                    Some(m) => {
+                        self.stick.set_mode(m);
+                        self.stick.remember();
+                        self.chat.say(
+                            match m {
+                                Mode::On => "Lâcher courir arrête d'avancer tout de suite.",
+                                Mode::Off => "Lâcher courir n'arrête plus d'avancer.",
+                                Mode::Auto => {
+                                    "Le jeu décide seul, selon le retard de ta touche avancer."
+                                }
+                            },
+                            chat::YELLOW,
+                        );
+                    }
+                    None => self
+                        .chat
+                        .say("Utilisation : /touchelente <on|off|auto>", chat::RED),
                 }
             }
             "gamemode" | "gm" => match arg.and_then(GameMode::parse) {
