@@ -16,6 +16,7 @@ mod registry;
 mod servers;
 pub mod shard;
 mod stats;
+mod tasks;
 mod zones;
 
 use std::collections::{HashSet, VecDeque};
@@ -27,11 +28,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use minelib_net::proto::{self, ErrorCode, Request, Response};
-use minelib_net::transport::{self, Channel, Inbound, Incoming};
+use minelib_net::transport;
+#[cfg(test)]
+use minelib_net::transport::Inbound;
 use minelib_net::{crypto, game, sovereign, totp};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::mpsc::Sender;
 
 pub use registry::{Body, Registry};
@@ -304,7 +308,7 @@ impl Identity {
 /// Connexion d'un jeu.
 struct Conn {
     /// Dépose un message à envoyer à ce jeu.
-    tx: Sender<Inbound>,
+    tx: tasks::Outbox,
     pseudo: Option<String>,
     /// Partie hébergée ou rejointe.
     room: Option<u64>,
@@ -359,9 +363,9 @@ struct Conn {
 
 impl Conn {
     /// Une connexion qui vient d'arriver (personne n'y est encore connecté à un compte).
-    fn new(tx: Sender<Inbound>) -> Self {
+    fn new(tx: impl Into<tasks::Outbox>) -> Self {
         Self {
-            tx,
+            tx: tx.into(),
             pseudo: None,
             room: None,
             caps: proto::GarantCaps::default(),
@@ -662,39 +666,57 @@ pub fn start(cfg: Config) -> Result<Handle> {
     }));
     #[cfg(test)]
     let state_for_tests = state.clone();
+    // Les connexions sont servies par des tâches, sur quelques fils (voir `tasks`).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tasks::workers())
+        .thread_name("relais : tâches")
+        .enable_all()
+        .build()?;
+    listener.set_nonblocking(true)?;
     std::thread::Builder::new()
         .name("relais : écoute".into())
         .spawn(move || {
-            // Connexions ouvertes par adresse : au-delà de `MAX_PER_PEER`, les suivantes
-            // sont refusées (un seul PC ne peut pas épuiser le relais en connexions).
-            let open: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
-            for conn in listener.incoming() {
-                let Ok(stream) = conn else { continue };
-                let state = state.clone();
-                let open = open.clone();
-                let _ = std::thread::Builder::new()
-                    .name("relais : client".into())
-                    .spawn(move || {
-                        let ip = stream.peer_addr().map(|a| a.ip()).ok();
-                        let mut peer = ip.map(|a| a.to_string()).unwrap_or_default();
-                        let _slot = match PeerSlot::take(&open, &peer, ip) {
+            runtime.block_on(async move {
+                let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+                    log::error!("relais : écoute impossible");
+                    return;
+                };
+                // Connexions ouvertes par adresse : au-delà de `MAX_PER_PEER`, les
+                // suivantes sont refusées (un seul PC ne peut pas épuiser le relais).
+                let open: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+                loop {
+                    let (stream, addr) = match listener.accept().await {
+                        Ok(c) => c,
+                        Err(_) => {
+                            // (Plus de descripteurs, par exemple : on réessaie un peu après.)
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
+                    };
+                    let state = state.clone();
+                    let open = open.clone();
+                    tokio::spawn(async move {
+                        let ip = addr.ip();
+                        let mut peer = ip.to_string();
+                        let _slot = match PeerSlot::take(&open, &peer, Some(ip)) {
                             Some(s) => s,
                             None => return,
                         };
                         // Par le tunnel iroh, le joueur arrive de ce PC : le tunnel dit
                         // d'abord qui il est vraiment.
-                        if ip.is_some_and(|a| a.is_loopback()) {
-                            match tunnel_peer(&stream) {
+                        if ip.is_loopback() {
+                            match tasks::tunnel_peer(&stream).await {
                                 Ok(Some(who)) => peer = who,
                                 Ok(None) => {}
                                 Err(_) => return,
                             }
                         }
-                        if let Err(e) = serve(stream, &state, &peer) {
+                        if let Err(e) = tasks::serve(stream, state, peer.clone()).await {
                             log::debug!("client {peer} : {e:#}");
                         }
                     });
-            }
+                }
+            });
         })?;
     Ok(Handle {
         addr,
@@ -825,77 +847,6 @@ fn err(code: ErrorCode, message: impl Into<String>) -> Response {
     Response::Error {
         code,
         message: message.into(),
-    }
-}
-
-fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
-    let private = state.lock().unwrap().id.noise_private;
-    let mut chan = Channel::accept(stream, &private, Duration::from_secs(10))?;
-    let id = {
-        let mut st = state.lock().unwrap();
-        let id = st.next_id;
-        st.next_id += 1;
-        st.conns.insert(id, Conn::new(chan.pusher()));
-        id
-    };
-    let result = serve_loop(&mut chan, state, peer, id);
-    let mut st = state.lock().unwrap();
-    party_leave(&mut st, id);
-    leave_room(&mut st, id);
-    st.maps.forget(id);
-    st.conns.remove(&id);
-    result
-}
-
-fn serve_loop(chan: &mut Channel, state: &Mutex<State>, peer: &str, id: u64) -> Result<()> {
-    let mut session = Session::Anonymous;
-    let mut hello = false;
-    loop {
-        // Le jeu envoie un ping toutes les 20 s : 60 s sans rien, la connexion est morte.
-        let req: Request = match chan.recv_any(Duration::from_secs(60))? {
-            None => return Ok(()),
-            Some(Incoming::Push(bytes)) => {
-                chan.send_raw(&bytes)?;
-                continue;
-            }
-            Some(Incoming::Msg(r)) => r,
-        };
-        if state
-            .lock()
-            .unwrap()
-            .conns
-            .get(&id)
-            .is_some_and(|c| c.kicked)
-        {
-            chan.send(&err(ErrorCode::Banned, "Compte banni."))?;
-            return Ok(());
-        }
-        let resp = if !hello {
-            match req {
-                Request::Hello { protocol, client } if protocol == proto::PROTOCOL => {
-                    hello = true;
-                    let mut st = state.lock().unwrap();
-                    if let Some(c) = st.conns.get_mut(&id) {
-                        c.garant_only = client.starts_with("minelib-garant");
-                        c.version = proto::client_version(&client);
-                    }
-                    Some(Response::Hello {
-                        protocol: proto::PROTOCOL,
-                        relay: st.cfg.name.clone(),
-                        pow_bits: st.cfg.pow_bits,
-                    })
-                }
-                Request::Hello { .. } => Some(err(ErrorCode::Protocol, "")),
-                _ => Some(err(ErrorCode::Protocol, "bonjour attendu")),
-            }
-        } else if let Some(taken) = taken_elsewhere(&req, state) {
-            Some(taken)
-        } else {
-            handle(req, state, &mut session, peer, id)
-        };
-        if let Some(r) = resp {
-            chan.send(&r)?;
-        }
     }
 }
 
@@ -1582,7 +1533,7 @@ const FLUID_RATE: u32 = 400;
 /// zone. Un bloc changé part regroupé avec ceux qui le suivent de près, dans un paquet
 /// compact (`transport::push_cell`) : dans une foule qui construit, c'est six fois moins
 /// d'octets qu'un message par bloc. Le reste (objets, coffres) part tel quel.
-pub(crate) fn push_zone(tx: &Sender<Inbound>, chunk: [i32; 2], data: Vec<u8>) {
+pub(crate) fn push_zone(tx: &impl transport::Sink, chunk: [i32; 2], data: Vec<u8>) {
     match game::cell_of(&data) {
         Some(cell) => {
             transport::push_cell(tx, cell);
@@ -5510,6 +5461,246 @@ mod tests {
         }
     }
 
+    /// Des centaines de joueurs connectés : le relais du monde les sert sur quelques fils
+    /// (avant la v131 : deux fils par connexion, 600 ici).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn many_connections_are_served_by_a_few_threads() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("minelib-fils-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let threads = || std::fs::read_dir("/proc/self/task").unwrap().count();
+        fn frame(s: &mut std::net::TcpStream, data: &[u8]) {
+            s.write_all(&(data.len() as u16).to_be_bytes()).unwrap();
+            s.write_all(data).unwrap();
+        }
+        fn read(s: &mut std::net::TcpStream) -> Vec<u8> {
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut b = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut b).unwrap();
+            b
+        }
+        // Une connexion : poignée de main, bonjour, réponse (sans fil côté joueur).
+        let open = || {
+            let mut s = std::net::TcpStream::connect(h.addr).unwrap();
+            s.set_nodelay(true).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let (private, _) = transport::generate_static();
+            let mut hs = snow::Builder::new(transport::PATTERN.parse().unwrap())
+                .local_private_key(&private)
+                .build_initiator()
+                .unwrap();
+            let mut msg = vec![0u8; transport::MAX];
+            let n = hs.write_message(&[], &mut msg).unwrap();
+            frame(&mut s, &msg[..n]);
+            let b = read(&mut s);
+            hs.read_message(&b, &mut msg).unwrap();
+            let n = hs.write_message(&[], &mut msg).unwrap();
+            frame(&mut s, &msg[..n]);
+            let mut noise = hs.into_transport_mode().unwrap();
+            let hello = postcard::to_allocvec(&Request::Hello {
+                protocol: proto::PROTOCOL,
+                client: "essai".into(),
+            })
+            .unwrap();
+            let n = noise.write_message(&hello, &mut msg).unwrap();
+            frame(&mut s, &msg[..n]);
+            let b = read(&mut s);
+            let n = noise.read_message(&b, &mut msg).unwrap();
+            let r: Response = postcard::from_bytes(&msg[..n]).unwrap();
+            assert!(matches!(r, Response::Hello { .. }));
+            s
+        };
+        // (Le relais a démarré ses fils.)
+        let first = open();
+        let before = threads();
+        let conns: Vec<std::net::TcpStream> = (0..300).map(|_| open()).collect();
+        let after = threads();
+        eprintln!("fils : {before} avant, {after} avec 300 connexions de plus");
+        assert!(
+            after < before + 10,
+            "300 connexions de plus : {} fils de plus",
+            after - before
+        );
+        drop((first, conns));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Essai à la main d'un relais lancé à part (le relais Windows sous Wine, par exemple) :
+    /// 200 connexions, bonjour et ping de chacune.
+    /// `MINELIB_ADRESSE=127.0.0.1:27999 cargo test -p minelib-relay relais_lance -- --ignored`
+    #[test]
+    #[ignore]
+    fn relais_lance_a_part() {
+        use std::io::{Read, Write};
+        let addr = std::env::var("MINELIB_ADRESSE").expect("MINELIB_ADRESSE");
+        fn frame(s: &mut std::net::TcpStream, data: &[u8]) {
+            let mut b = (data.len() as u16).to_be_bytes().to_vec();
+            b.extend_from_slice(data);
+            s.write_all(&b).unwrap();
+        }
+        fn read(s: &mut std::net::TcpStream) -> Vec<u8> {
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut b = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut b).unwrap();
+            b
+        }
+        let mut msg = vec![0u8; transport::MAX];
+        let mut conns = Vec::new();
+        for _ in 0..200 {
+            let mut s = std::net::TcpStream::connect(&addr).unwrap();
+            s.set_nodelay(true).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let (private, _) = transport::generate_static();
+            let mut hs = snow::Builder::new(transport::PATTERN.parse().unwrap())
+                .local_private_key(&private)
+                .build_initiator()
+                .unwrap();
+            let k = hs.write_message(&[], &mut msg).unwrap();
+            frame(&mut s, &msg[..k]);
+            let b = read(&mut s);
+            hs.read_message(&b, &mut msg).unwrap();
+            let k = hs.write_message(&[], &mut msg).unwrap();
+            frame(&mut s, &msg[..k]);
+            let mut noise = hs.into_transport_mode().unwrap();
+            let hello = postcard::to_allocvec(&Request::Hello {
+                protocol: proto::PROTOCOL,
+                client: "essai".into(),
+            })
+            .unwrap();
+            let k = noise.write_message(&hello, &mut msg).unwrap();
+            frame(&mut s, &msg[..k]);
+            let b = read(&mut s);
+            let k = noise.read_message(&b, &mut msg).unwrap();
+            let r: Response = postcard::from_bytes(&msg[..k]).unwrap();
+            assert!(matches!(r, Response::Hello { .. }), "{r:?}");
+            conns.push((s, noise));
+        }
+        let ping = postcard::to_allocvec(&Request::Ping).unwrap();
+        for (s, noise) in &mut conns {
+            let k = noise.write_message(&ping, &mut msg).unwrap();
+            frame(s, &msg[..k]);
+        }
+        for (s, noise) in &mut conns {
+            let b = read(s);
+            let k = noise.read_message(&b, &mut msg).unwrap();
+            let r: Response = postcard::from_bytes(&msg[..k]).unwrap();
+            assert!(matches!(r, Response::Pong));
+        }
+        eprintln!("200 connexions : bonjour et ping, tout répond");
+    }
+
+    /// Mesure à la main : 8000 joueurs connectés au relais du monde (poignée de main et
+    /// bonjour), puis un ping de chacun. Fils, mémoire, temps.
+    /// `cargo test --release -p minelib-relay connexions -- --ignored --nocapture`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn connexions_du_relais_du_monde() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("minelib-cnx-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let status = |key: &str| {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with(key))
+                .map(|l| l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap())
+                .unwrap()
+        };
+        fn frame(s: &mut std::net::TcpStream, data: &[u8]) {
+            let mut b = (data.len() as u16).to_be_bytes().to_vec();
+            b.extend_from_slice(data);
+            s.write_all(&b).unwrap();
+        }
+        fn read(s: &mut std::net::TcpStream) -> Vec<u8> {
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut b = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut b).unwrap();
+            b
+        }
+        let mut msg = vec![0u8; transport::MAX];
+        let mut open = |n: usize| -> Vec<(std::net::TcpStream, snow::TransportState)> {
+            (0..n)
+                .map(|_| {
+                    let mut s = std::net::TcpStream::connect(h.addr).unwrap();
+                    s.set_nodelay(true).unwrap();
+                    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+                    let (private, _) = transport::generate_static();
+                    let mut hs = snow::Builder::new(transport::PATTERN.parse().unwrap())
+                        .local_private_key(&private)
+                        .build_initiator()
+                        .unwrap();
+                    let k = hs.write_message(&[], &mut msg).unwrap();
+                    frame(&mut s, &msg[..k]);
+                    let b = read(&mut s);
+                    hs.read_message(&b, &mut msg).unwrap();
+                    let k = hs.write_message(&[], &mut msg).unwrap();
+                    frame(&mut s, &msg[..k]);
+                    let mut noise = hs.into_transport_mode().unwrap();
+                    let hello = postcard::to_allocvec(&Request::Hello {
+                        protocol: proto::PROTOCOL,
+                        client: "essai".into(),
+                    })
+                    .unwrap();
+                    let k = noise.write_message(&hello, &mut msg).unwrap();
+                    frame(&mut s, &msg[..k]);
+                    let b = read(&mut s);
+                    noise.read_message(&b, &mut msg).unwrap();
+                    (s, noise)
+                })
+                .collect()
+        };
+        let first = open(1);
+        let (threads0, rss0) = (status("Threads:"), status("VmRSS:"));
+        let t = Instant::now();
+        let n = 8000;
+        let mut conns = open(n);
+        let connect = t.elapsed();
+        let (threads1, rss1) = (status("Threads:"), status("VmRSS:"));
+        // Un ping de chacun, tous envoyés, puis toutes les réponses lues.
+        let ping = postcard::to_allocvec(&Request::Ping).unwrap();
+        let t = Instant::now();
+        for (s, noise) in &mut conns {
+            let k = noise.write_message(&ping, &mut msg).unwrap();
+            frame(s, &msg[..k]);
+        }
+        for (s, noise) in &mut conns {
+            let b = read(s);
+            let k = noise.read_message(&b, &mut msg).unwrap();
+            let r: Response = postcard::from_bytes(&msg[..k]).unwrap();
+            assert!(matches!(r, Response::Pong));
+        }
+        let pings = t.elapsed();
+        eprintln!(
+            "{n} connexions en {:.1} s ; fils {threads0} -> {threads1} ; mémoire {} Mo -> {} Mo \
+             ({:.1} Ko par connexion, joueur et relais compris) ; {n} pings en {:.0} ms",
+            connect.as_secs_f32(),
+            rss0 / 1024,
+            rss1 / 1024,
+            (rss1 - rss0) as f32 / n as f32,
+            pings.as_secs_f32() * 1000.0
+        );
+        assert!(threads1 < threads0 + 10);
+        drop((first, conns));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn register_login_totp_and_registry_survive_a_restart() {
         let dir = std::env::temp_dir().join(format!("minelib-relais-{}", rand::random::<u32>()));
@@ -7689,7 +7880,7 @@ mod tests {
     #[test]
     #[ignore]
     fn charge_du_relais_du_monde() {
-        for n in [2_000usize, 10_000, 30_000, 60_000] {
+        for n in [2_000usize, 10_000, 30_000, 60_000, 120_000] {
             let (h, dir) = crowd_world("charge");
             let mut guard = h.state.lock().unwrap();
             let st = &mut *guard;

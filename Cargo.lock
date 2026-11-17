@@ -2878,6 +2878,8 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "sha2 0.10.9",
+ "snow",
+ "tokio",
 ]
 
 [[package]]

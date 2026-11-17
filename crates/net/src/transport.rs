@@ -13,9 +13,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+/// Motif Noise de la poignée de main.
+pub const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// Taille maximale d'un message Noise.
-const MAX: usize = 65535;
+pub const MAX: usize = 65535;
 
 /// Côté relais : trames reçues d'un client et pas encore traitées au-delà desquelles il
 /// est coupé (il envoie plus vite que le relais ne peut suivre : sa file gonflerait sans
@@ -26,12 +27,12 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Un message périssable (`push_loose` : la position d'un joueur, que la suivante
 /// remplace) resté plus longtemps que cela dans la file n'est plus envoyé : un client lent
 /// ne reçoit pas des positions vieilles de plusieurs secondes, et sa file ne gonfle pas.
-const LOOSE_MAX_AGE: Duration = Duration::from_millis(250);
+pub const LOOSE_MAX_AGE: Duration = Duration::from_millis(250);
 /// Les messages à envoyer sont regroupés : ils partent ensemble dès que la file est vide,
 /// ou dès que le tampon atteint cette taille. Dans une foule, des centaines de positions
 /// par seconde vont à chaque joueur ; une par paquet, chacune coûtait 40 octets
 /// d'en-têtes et un appel au système.
-const OUT_MAX: usize = 32 * 1024;
+pub const OUT_MAX: usize = 32 * 1024;
 /// Les blocs changés (`push_cell`) partent regroupés en paquets compacts : le premier tout
 /// de suite, les suivants au plus tôt ce temps après le paquet d'avant. Un joueur au
 /// milieu d'une foule qui construit reçoit ainsi 50 paquets par seconde au plus, quel que
@@ -84,26 +85,165 @@ pub struct Channel {
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Trames chiffrées prêtes à partir, pas encore écrites (voir `OUT_MAX`).
     out: Vec<u8>,
-    /// Blocs changés en attente d'être regroupés, heure à laquelle ils partent, heure du
-    /// dernier paquet parti.
+    /// Blocs et positions à regrouper.
+    group: Grouper,
+    /// Message sorti de la file en ramassant les blocs, à traiter ensuite.
+    held: Option<Inbound>,
+}
+
+/// Où déposer un message à envoyer sur une connexion : la file d'un canal (`Channel`), ou
+/// celle d'une connexion servie autrement (tâches du relais du monde).
+pub trait Sink {
+    /// Dépose ; faux si la connexion est fermée.
+    fn put(&self, m: Inbound) -> bool;
+}
+
+impl Sink for Sender<Inbound> {
+    fn put(&self, m: Inbound) -> bool {
+        self.send(m).is_ok()
+    }
+}
+
+/// Blocs changés (`push_cell`) et positions de joueurs (`push_pose`) en attente d'être
+/// regroupés en paquets compacts, et paquets prêts à partir. Le premier part tout de
+/// suite, les suivants au plus tôt `CELL_LINGER` après le paquet d'avant.
+pub struct Grouper {
+    /// Blocs en attente, heure à laquelle ils partent, heure du dernier paquet parti.
     cells: Vec<crate::cells::Cell>,
     cells_due: Instant,
     cells_sent: Instant,
-    /// Positions en attente d'être regroupées (la dernière de chaque joueur), et quand le
-    /// pseudo de chaque joueur a été dit sur cette connexion pour la dernière fois.
+    /// Positions en attente (la dernière de chaque joueur), et quand le pseudo de chaque
+    /// joueur a été dit sur cette connexion pour la dernière fois.
     poses: std::collections::HashMap<u64, (std::sync::Arc<PoseOf>, Instant)>,
     named: std::collections::HashMap<u64, Instant>,
-    /// Message sorti de la file en ramassant les blocs, à traiter ensuite ; paquets de
-    /// blocs prêts à être remis à l'appelant.
-    held: Option<Inbound>,
+    /// Paquets prêts (messages sérialisés, à chiffrer et envoyer).
     ready: std::collections::VecDeque<Vec<u8>>,
 }
 
+impl Default for Grouper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Grouper {
+    pub fn new() -> Self {
+        Self {
+            cells: Vec::new(),
+            cells_due: Instant::now(),
+            cells_sent: Instant::now(),
+            poses: std::collections::HashMap::new(),
+            named: std::collections::HashMap::new(),
+            ready: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Des blocs ou des positions attendent-ils d'être regroupés ?
+    pub fn waiting(&self) -> bool {
+        !self.cells.is_empty() || !self.poses.is_empty()
+    }
+
+    /// Heure à laquelle ce qui attend doit partir.
+    pub fn due(&self) -> Option<Instant> {
+        self.waiting().then_some(self.cells_due)
+    }
+
+    /// Prochain paquet prêt.
+    pub fn next_ready(&mut self) -> Option<Vec<u8>> {
+        self.ready.pop_front()
+    }
+
+    /// Un bloc changé. Vrai s'il y en a assez pour un paquet plein (`pack` tout de suite).
+    pub fn add_cell(&mut self, c: crate::cells::Cell) -> bool {
+        if !self.waiting() {
+            self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
+        }
+        self.cells.push(c);
+        self.cells.len() >= crate::cells::CELLS_MAX
+    }
+
+    /// La position d'un joueur, déposée à `at`. Vrai s'il y en a assez pour un paquet
+    /// plein.
+    pub fn add_pose(&mut self, p: std::sync::Arc<PoseOf>, at: Instant) -> bool {
+        if !self.waiting() {
+            self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
+        }
+        self.poses.insert(p.id, (p, at));
+        self.poses.len() >= crate::poses::POSES_MAX
+    }
+
+    /// Ce qui attend devient des paquets prêts. `more` donne les messages encore dans la
+    /// file, pour les regrouper avec : le premier qui n'est ni un bloc ni une position est
+    /// rendu (à traiter ensuite).
+    pub fn pack(&mut self, mut more: impl FnMut() -> Option<Inbound>) -> Option<Inbound> {
+        let mut held = None;
+        while self.cells.len() < crate::cells::CELLS_MAX {
+            match more() {
+                Some(Inbound::Cell(c)) => self.cells.push(c),
+                Some(Inbound::Pose(p, at)) => {
+                    self.poses.insert(p.id, (p, at));
+                }
+                Some(m) => {
+                    held = Some(m);
+                    break;
+                }
+                None => break,
+            }
+        }
+        self.cells_sent = Instant::now();
+        if !self.poses.is_empty() {
+            let now = self.cells_sent;
+            if self.named.len() > 8192 {
+                self.named
+                    .retain(|_, t| now.duration_since(*t) < NAME_EVERY);
+            }
+            let poses = std::mem::take(&mut self.poses);
+            let named = &mut self.named;
+            let mut entries: Vec<(u64, Option<&str>, crate::poses::Pose)> = poses
+                .values()
+                .filter(|(_, at)| now.duration_since(*at) <= LOOSE_MAX_AGE)
+                .map(|(p, _)| {
+                    let known = named
+                        .get(&p.id)
+                        .is_some_and(|t| now.duration_since(*t) < NAME_EVERY);
+                    if !known {
+                        named.insert(p.id, now);
+                    }
+                    (p.id, (!known).then_some(p.name.as_str()), p.pose)
+                })
+                .collect();
+            if !entries.is_empty() {
+                let msg = crate::proto::Response::FromZone {
+                    peer: 0,
+                    chunk: [0, 0],
+                    data: crate::game::encode(&crate::game::BuildMsg::Poses(
+                        crate::poses::pack_poses(&mut entries),
+                    )),
+                };
+                if let Ok(b) = postcard::to_allocvec(&msg) {
+                    self.ready.push_back(b);
+                }
+            }
+        }
+        for packet in crate::cells::pack_cells(std::mem::take(&mut self.cells)) {
+            let msg = crate::proto::Response::FromZone {
+                peer: 0,
+                chunk: [0, 0],
+                data: crate::game::encode(&crate::game::BuildMsg::Cells(packet)),
+            };
+            if let Ok(b) = postcard::to_allocvec(&msg) {
+                self.ready.push_back(b);
+            }
+        }
+        held
+    }
+}
+
 /// Dépose un message pour qu'il soit envoyé par le fil qui possède le canal.
-pub fn push<T: Serialize>(tx: &Sender<Inbound>, msg: &T) -> bool {
+pub fn push<T: Serialize>(tx: &impl Sink, msg: &T) -> bool {
     postcard::to_allocvec(msg)
         .ok()
-        .is_some_and(|b| tx.send(Inbound::Push(b)).is_ok())
+        .is_some_and(|b| tx.put(Inbound::Push(b)))
 }
 
 /// Sérialise un message une fois, pour le déposer ensuite chez plusieurs destinataires
@@ -113,28 +253,28 @@ pub fn encode<T: Serialize>(msg: &T) -> Option<Vec<u8>> {
 }
 
 /// Dépose un message déjà sérialisé (`encode`).
-pub fn push_raw(tx: &Sender<Inbound>, bytes: Vec<u8>) -> bool {
-    tx.send(Inbound::Push(bytes)).is_ok()
+pub fn push_raw(tx: &impl Sink, bytes: Vec<u8>) -> bool {
+    tx.put(Inbound::Push(bytes))
 }
 
 /// Dépose un bloc changé : il part regroupé avec ceux qui le suivent de près, dans un
 /// paquet compact (`BuildMsg::Cells`). L'ordre entre blocs ne compte pas (chacun porte son
 /// rang dans l'ordre du monde).
-pub fn push_cell(tx: &Sender<Inbound>, cell: crate::cells::Cell) -> bool {
-    tx.send(Inbound::Cell(cell)).is_ok()
+pub fn push_cell(tx: &impl Sink, cell: crate::cells::Cell) -> bool {
+    tx.put(Inbound::Cell(cell))
 }
 
 /// Dépose la position d'un joueur : elle part regroupée avec celles des autres, dans un
 /// paquet compact (`BuildMsg::Poses`) ; restée trop longtemps dans la file, ou remplacée
 /// par la suivante du même joueur, elle n'est pas envoyée.
-pub fn push_pose(tx: &Sender<Inbound>, pose: &std::sync::Arc<PoseOf>) -> bool {
-    tx.send(Inbound::Pose(pose.clone(), Instant::now())).is_ok()
+pub fn push_pose(tx: &impl Sink, pose: &std::sync::Arc<PoseOf>) -> bool {
+    tx.put(Inbound::Pose(pose.clone(), Instant::now()))
 }
 
 /// Dépose un message périssable déjà sérialisé : s'il attend trop dans la file (client
 /// lent, relais débordé), il est abandonné au lieu d'être envoyé en retard.
-pub fn push_loose(tx: &Sender<Inbound>, bytes: Vec<u8>) -> bool {
-    tx.send(Inbound::Loose(bytes, Instant::now())).is_ok()
+pub fn push_loose(tx: &impl Sink, bytes: Vec<u8>) -> bool {
+    tx.put(Inbound::Loose(bytes, Instant::now()))
 }
 
 fn write_frame(s: &mut TcpStream, data: &[u8]) -> Result<()> {
@@ -268,13 +408,8 @@ impl Channel {
             tx,
             backlog,
             out: Vec::new(),
-            cells: Vec::new(),
-            cells_due: Instant::now(),
-            cells_sent: Instant::now(),
-            poses: std::collections::HashMap::new(),
-            named: std::collections::HashMap::new(),
+            group: Grouper::new(),
             held: None,
-            ready: std::collections::VecDeque::new(),
         })
     }
 
@@ -327,66 +462,12 @@ impl Channel {
     /// Les blocs et les positions en attente deviennent des paquets prêts à partir (avec
     /// ceux qui sont déjà dans la file).
     fn pack_waiting_cells(&mut self) {
-        while self.cells.len() < crate::cells::CELLS_MAX && self.held.is_none() {
-            match self.rx.try_recv() {
-                Ok(Inbound::Cell(c)) => self.cells.push(c),
-                Ok(Inbound::Pose(p, at)) => {
-                    self.poses.insert(p.id, (p, at));
-                }
-                Ok(m) => self.held = Some(m),
-                Err(_) => break,
-            }
+        if self.held.is_some() {
+            self.group.pack(|| None);
+            return;
         }
-        self.cells_sent = Instant::now();
-        if !self.poses.is_empty() {
-            let now = self.cells_sent;
-            if self.named.len() > 8192 {
-                self.named
-                    .retain(|_, t| now.duration_since(*t) < NAME_EVERY);
-            }
-            let poses = std::mem::take(&mut self.poses);
-            let named = &mut self.named;
-            let mut entries: Vec<(u64, Option<&str>, crate::poses::Pose)> = poses
-                .values()
-                .filter(|(_, at)| now.duration_since(*at) <= LOOSE_MAX_AGE)
-                .map(|(p, _)| {
-                    let known = named
-                        .get(&p.id)
-                        .is_some_and(|t| now.duration_since(*t) < NAME_EVERY);
-                    if !known {
-                        named.insert(p.id, now);
-                    }
-                    (p.id, (!known).then_some(p.name.as_str()), p.pose)
-                })
-                .collect();
-            if !entries.is_empty() {
-                let msg = crate::proto::Response::FromZone {
-                    peer: 0,
-                    chunk: [0, 0],
-                    data: crate::game::encode(&crate::game::BuildMsg::Poses(
-                        crate::poses::pack_poses(&mut entries),
-                    )),
-                };
-                if let Ok(b) = postcard::to_allocvec(&msg) {
-                    self.ready.push_back(b);
-                }
-            }
-        }
-        for packet in crate::cells::pack_cells(std::mem::take(&mut self.cells)) {
-            let msg = crate::proto::Response::FromZone {
-                peer: 0,
-                chunk: [0, 0],
-                data: crate::game::encode(&crate::game::BuildMsg::Cells(packet)),
-            };
-            if let Ok(b) = postcard::to_allocvec(&msg) {
-                self.ready.push_back(b);
-            }
-        }
-    }
-
-    /// Des blocs ou des positions attendent-ils d'être regroupés ?
-    fn waiting(&self) -> bool {
-        !self.cells.is_empty() || !self.poses.is_empty()
+        let rx = &self.rx;
+        self.held = self.group.pack(|| rx.try_recv().ok());
     }
 
     /// Prochain message reçu ou déposé ; `None` si rien avant `timeout`.
@@ -396,12 +477,12 @@ impl Channel {
     ) -> Result<Option<Incoming<T>>> {
         let end = Instant::now() + timeout;
         loop {
-            if let Some(p) = self.ready.pop_front() {
+            if let Some(p) = self.group.next_ready() {
                 return Ok(Some(Incoming::Push(p)));
             }
             // Des blocs ou des positions attendent et leur heure est venue : ils partent,
             // regroupés.
-            if self.waiting() && Instant::now() >= self.cells_due {
+            if self.group.due().is_some_and(|d| Instant::now() >= d) {
                 self.pack_waiting_cells();
                 continue;
             }
@@ -416,10 +497,9 @@ impl Channel {
                     Err(TryRecvError::Empty) => {
                         self.flush()?;
                         let now = Instant::now();
-                        let until = if self.waiting() {
-                            end.min(self.cells_due)
-                        } else {
-                            end
+                        let until = match self.group.due() {
+                            Some(d) => end.min(d),
+                            None => end,
                         };
                         match self.rx.recv_timeout(until.saturating_duration_since(now)) {
                             Ok(m) => m,
@@ -447,20 +527,12 @@ impl Channel {
                 Inbound::Loose(_, at) if at.elapsed() > LOOSE_MAX_AGE => {}
                 Inbound::Loose(p, _) => return Ok(Some(Incoming::Push(p))),
                 Inbound::Cell(c) => {
-                    if !self.waiting() {
-                        self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
-                    }
-                    self.cells.push(c);
-                    if self.cells.len() >= crate::cells::CELLS_MAX {
+                    if self.group.add_cell(c) {
                         self.pack_waiting_cells();
                     }
                 }
                 Inbound::Pose(p, at) => {
-                    if !self.waiting() {
-                        self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
-                    }
-                    self.poses.insert(p.id, (p, at));
-                    if self.poses.len() >= crate::poses::POSES_MAX {
+                    if self.group.add_pose(p, at) {
                         self.pack_waiting_cells();
                     }
                 }
