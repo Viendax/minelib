@@ -7,6 +7,7 @@
 //! (preuve de mot de passe, coffre chiffré, secret 2FA chiffré).
 
 mod accounts;
+mod bags;
 mod contacts;
 mod hardware;
 mod limits;
@@ -459,6 +460,8 @@ struct State {
     maps: maps::Store,
     hardware: hardware::Store,
     servers: servers::Store,
+    /// Inventaires des joueurs en survie (voir `bags`).
+    bags: bags::Store,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -506,6 +509,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         maps,
         hardware: hardware::Store::open(cfg_dir.join("hardware.bin")),
         servers: servers::Store::open(cfg_dir.join("serveurs.bin")),
+        bags: bags::Store::open(cfg_dir.join("sacs.bin")),
     }));
     #[cfg(test)]
     let state_for_tests = state.clone();
@@ -1940,6 +1944,45 @@ fn local_servers(st: &State, kind: u8) -> Vec<proto::ServerEntry> {
     list
 }
 
+/// Ce joueur est-il en survie sur ce serveur, d'après le relais (mode donné par un OP,
+/// sinon mode par défaut du serveur pour qui n'est pas OP) ? Son inventaire est alors tenu
+/// par le relais (`bags`) ; ce que son jeu annonce ne compte pas.
+fn in_survival(st: &State, server: &str, creator: &str, pseudo: &str) -> bool {
+    let mode = st
+        .bags
+        .mode(server, pseudo)
+        .map(str::to_string)
+        .or_else(|| {
+            (!st.servers.is_op(server, creator, pseudo))
+                .then(|| st.servers.default_gamemode(server))
+                .flatten()
+        });
+    mode.is_some_and(|m| {
+        matches!(
+            m.trim().to_lowercase().as_str(),
+            "0" | "s" | "survival" | "survie"
+        )
+    })
+}
+
+/// Un bloc validé vient d'être publié dans ce monde : compté dans le sac de son auteur
+/// s'il est en survie (cassé : un crédit de minage ; posé : sorti du sac).
+fn note_block(st: &mut State, rid: u64, data: &[u8]) {
+    let Some(game::BuildMsg::Set { block, by, .. }) = game::decode(data) else {
+        return;
+    };
+    let Some((server, creator)) = st
+        .rooms
+        .get(&rid)
+        .map(|r| (r.server.clone(), r.creator.clone()))
+    else {
+        return;
+    };
+    if in_survival(st, &server, &creator, &by) {
+        st.bags.block_set(&server, &by, block);
+    }
+}
+
 fn is_shard_host(room: &Room, id: u64) -> bool {
     room.shards
         .values()
@@ -2150,6 +2193,7 @@ fn upkeep_regions(st: &mut State, rid: u64) {
 fn upkeep_build(st: &mut State) {
     // Positions des joueurs sur les serveurs (au plus une écriture par entretien).
     st.servers.save_positions();
+    st.bags.save_if_dirty();
     let rooms: Vec<u64> = st
         .rooms
         .iter()
@@ -3433,6 +3477,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         } else {
                             target.as_str()
                         };
+                        // Le relais s'en souvient : c'est ce mode qui décide si son
+                        // inventaire est tenu ici.
+                        st.bags.set_mode(&server, who, &reason);
                         let to = st.conns.values().find(|c| {
                             c.room == Some(rid)
                                 && c.pseudo
@@ -3772,13 +3819,60 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     c.item_rate.1 += 1;
                     c.item_rate.1 <= ITEM_RATE
                 });
+                // En survie, le relais tient l'inventaire : ce que la demande sort du sac
+                // (lâcher, ranger) doit y être ; ce qu'elle rapporte y entre.
+                let room = st.rooms.get(&rid).expect("partie");
+                let (server, creator) = (room.server.clone(), room.creator.clone());
+                let items = &room.build.items;
+                let fresh = !items.is_duplicate(m, pseudo);
+                let (spend, gain) = match *m {
+                    game::BuildMsg::DropItem { pile, .. }
+                    | game::BuildMsg::ChestPut { pile, .. } => (Some(pile), None),
+                    game::BuildMsg::TakeItem { id: item, .. } => (
+                        None,
+                        items
+                            .live_drops()
+                            .find(|(i, _)| *i == item)
+                            .map(|(_, d)| d.pile),
+                    ),
+                    game::BuildMsg::ChestTake {
+                        pos, slot, count, ..
+                    } => (
+                        None,
+                        items
+                            .chest(pos)
+                            .get(slot as usize)
+                            .copied()
+                            .flatten()
+                            .map(|p| minelib_net::items::Pile {
+                                item: p.item,
+                                count: p.count.min(count),
+                            }),
+                    ),
+                    _ => (None, None),
+                };
+                let survival = fresh && in_survival(st, &server, &creator, pseudo);
+                let broke = survival
+                    && spend.is_some_and(|p| {
+                        !st.bags.can_spend(&server, pseudo, p.item, p.count as u32)
+                    });
                 let room = st.rooms.get_mut(&rid).expect("partie");
-                let out = if !near || !calm {
+                let out = if !near || !calm || broke {
                     let seq = minelib_net::items::request_seq(m).unwrap_or(0);
                     vec![game::BuildMsg::Denied { seq }]
                 } else {
                     match room.build.items.apply(m, pseudo) {
-                        Ok(v) => v,
+                        Ok(v) => {
+                            if survival && !v.is_empty() {
+                                if let Some(p) = spend {
+                                    st.bags.spend(&server, pseudo, p.item, p.count as u32);
+                                }
+                                if let Some(p) = gain {
+                                    st.bags.gain(&server, pseudo, p.item, p.count as u32);
+                                }
+                            }
+                            v
+                        }
                         Err(seq) => vec![game::BuildMsg::Denied { seq }],
                     }
                 };
@@ -3843,6 +3937,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             }
                         }
                     }
+                    note_block(st, rid, &data);
                     spill_chest(st, rid, pos);
                 }
                 // Validé par un ancien garant de la zone (elle vient de changer de mains) :
@@ -3910,11 +4005,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 if proto::region_of(chunk) == region {
                     room.build.mirror(proto::zone_of(chunk), &data);
                     if let Some(game::BuildMsg::Set { pos, .. }) = game::decode(&data) {
-                        changed.push(pos);
+                        changed.push((pos, data));
                     }
                 }
             }
-            for pos in changed {
+            for (pos, data) in changed {
+                note_block(st, rid, &data);
                 spill_chest(st, rid, pos);
             }
             return None;
@@ -5546,6 +5642,129 @@ mod tests {
         for d in [da, db] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// Serveur en survie : le relais tient l'inventaire des joueurs. Un jeu modifié ne
+    /// peut pas lâcher un objet qu'il n'a jamais eu ; ce qu'on ramasse, on peut le lâcher
+    /// (une fois) ; le créateur (OP, en créatif) n'est pas compté.
+    #[test]
+    fn a_survival_player_cannot_drop_what_the_relay_never_saw_him_get() {
+        use minelib_net::items::Pile;
+        let dir = std::env::temp_dir().join(format!("minelib-survie-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        let (alice, alink) = login("Alice");
+        alice.send(Cmd::Host {
+            kind: 1,
+            name: "Survie".into(),
+            map: "survie".into(),
+            map_sig: [3; 32],
+            max_players: 0,
+        });
+        let room = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        alice.send(Cmd::ServerAdmin {
+            action: proto::SERVER_DEFAULT_GAMEMODE,
+            pseudo: String::new(),
+            reason: "survival".into(),
+        });
+        wait(&alice, |e| matches!(e, Event::ServerAdmin(_)));
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        for l in [&alink, &elink] {
+            transport::push(l, &Request::Position { chunk: [0, 0] });
+        }
+        let ask = |l: &std::sync::mpsc::Sender<crate::Inbound>, m: game::BuildMsg| {
+            transport::push(
+                l,
+                &Request::ToZone {
+                    chunk: [0, 0],
+                    data: game::encode(&m),
+                },
+            );
+        };
+        let next = |c: &Client| loop {
+            if let Event::FromZone { data, .. } = wait(c, |e| matches!(e, Event::FromZone { .. })) {
+                match game::decode::<game::BuildMsg>(&data) {
+                    Some(
+                        m @ (game::BuildMsg::Item { .. }
+                        | game::BuildMsg::Slot { .. }
+                        | game::BuildMsg::Denied { .. }),
+                    ) => return m,
+                    _ => continue,
+                }
+            }
+        };
+        let drop = |seq: u32, id: u64, count: u8| game::BuildMsg::DropItem {
+            seq,
+            id,
+            pos: [1.5, 64.0, 1.5],
+            pile: Pile { item: 7, count },
+        };
+        // Eve (en survie) prétend lâcher 64 objets qu'elle n'a jamais eus : refusé.
+        ask(&elink, drop(1, 900, 64));
+        assert_eq!(next(&eve), game::BuildMsg::Denied { seq: 1 });
+        // Alice (créatrice, en créatif) en lâche 5 : accepté, les deux le voient.
+        ask(&alink, drop(1, 100, 5));
+        for c in [&alice, &eve] {
+            assert!(matches!(
+                next(c),
+                game::BuildMsg::Item {
+                    id: 100,
+                    drop: Some(_),
+                    ..
+                }
+            ));
+        }
+        // Eve les ramasse : ils sont dans son sac, elle peut en lâcher 5, pas 6.
+        ask(&elink, game::BuildMsg::TakeItem { seq: 2, id: 100 });
+        assert!(matches!(
+            next(&eve),
+            game::BuildMsg::Item {
+                id: 100,
+                drop: None,
+                ..
+            }
+        ));
+        ask(&elink, drop(3, 901, 6));
+        assert_eq!(next(&eve), game::BuildMsg::Denied { seq: 3 });
+        let lay = drop(4, 902, 5);
+        ask(&elink, lay.clone());
+        assert!(matches!(
+            next(&eve),
+            game::BuildMsg::Item {
+                id: 902,
+                drop: Some(_),
+                ..
+            }
+        ));
+        // La même demande reçue deux fois : ni refus (elle a été faite), ni second objet.
+        ask(&elink, lay);
+        ask(&elink, drop(5, 903, 1));
+        assert_eq!(next(&eve), game::BuildMsg::Denied { seq: 5 });
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Objets au sol et coffres sur un vrai relais : deux joueurs qui prennent la même

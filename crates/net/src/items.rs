@@ -179,6 +179,11 @@ impl ItemStore {
         self.apply_new(req, by)
     }
 
+    /// Cette demande de `by` a-t-elle déjà été traitée (reçue deux fois) ?
+    pub fn is_duplicate(&self, req: &BuildMsg, by: &str) -> bool {
+        request_seq(req).is_some_and(|seq| self.seen.get(by).is_some_and(|s| s.contains(&seq)))
+    }
+
     /// Le joueur `by` repart de zéro (nouvelle connexion) : ses anciens numéros de
     /// demande sont oubliés.
     pub fn forget(&mut self, by: &str) {
