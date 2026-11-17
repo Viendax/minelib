@@ -52,6 +52,8 @@ pub struct Pacer {
     retry: f32,
     /// Durée lissée d'une image sans l'attente du pilote (s).
     frame: f32,
+    /// Depuis combien de temps la carte paraît saturée sans interruption (s).
+    bound_for: f32,
 }
 
 impl Default for Pacer {
@@ -62,6 +64,7 @@ impl Default for Pacer {
             timer: 0.0,
             retry: Self::RETRY_MIN,
             frame: 0.0,
+            bound_for: 0.0,
         }
     }
 }
@@ -78,6 +81,11 @@ impl Pacer {
     const SLOW_FRAME: f32 = 0.004;
     /// Durée d'un essai sans attente avant de le juger réussi.
     const TRIAL: f32 = 0.5;
+    /// La carte doit paraître saturée sans interruption pendant ce temps pour que
+    /// l'attente reprenne : un à-coup isolé (chargement, autre programme) ne suffit pas —
+    /// il faisait reprendre l'attente, et perdre des images par seconde jusqu'à l'essai
+    /// suivant.
+    const SUSTAINED: f32 = 0.3;
 
     /// `dt` : durée de l'image précédente ; `blocked` : temps passé bloqué à attendre la
     /// carte graphique (image de la fenêtre, envoi, présentation). Renvoie vrai si l'état
@@ -98,6 +106,7 @@ impl Pacer {
                 self.timer = 0.0;
                 self.blocked = 0.0;
                 self.frame = 0.0;
+                self.bound_for = 0.0;
                 return true;
             }
             return false;
@@ -110,6 +119,11 @@ impl Pacer {
             self.frame + (dt - self.frame) * k
         };
         if self.blocked > Self::GPU_BOUND && self.frame > Self::SLOW_FRAME {
+            self.bound_for += dt;
+        } else {
+            self.bound_for = 0.0;
+        }
+        if self.bound_for >= Self::SUSTAINED {
             // Carte saturée : l'attente du pilote reprend ; essai suivant plus tard si
             // celui-ci venait de commencer.
             if self.timer < Self::TRIAL * 4.0 {
@@ -510,6 +524,10 @@ mod pacer_tests {
             !p.driver_wait,
             "plus de 250 images par seconde : pas d'attente"
         );
+        // Un à-coup isolé (une image de 60 ms presque toute bloquée) : pas de reprise.
+        p.update(0.06, 0.055);
+        run(&mut p, 1.0, 0.001, 0.0004);
+        assert!(!p.driver_wait, "un à-coup ne remet pas l'attente");
         // La carte sature pour de bon : 5 ms par image dont 4 ms bloquées.
         run(&mut p, 0.5, 0.005, 0.004);
         assert!(p.driver_wait, "attente reprise");

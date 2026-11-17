@@ -37,6 +37,12 @@ pub struct Input {
     /// relâchement d'une touche tenue longtemps, le journal dit ce que Windows et le
     /// clavier en disaient (pour trouver d'où vient une touche qui « reste enfoncée »).
     repeats: std::collections::HashMap<KeyCode, (u32, Instant)>,
+    /// Dernier appui (neuf) d'une touche, quelle qu'elle soit : Windows ne répète que la
+    /// dernière touche enfoncée.
+    last_press: Option<Instant>,
+    /// Touches relâchées parce que leurs répétitions se sont arrêtées (voir
+    /// `release_silent_keys`) : une répétition qui revient les remet.
+    soft: HashSet<KeyCode>,
     /// La saisie brute du clavier arrive-t-elle (notée une fois) ?
     raw_seen: bool,
     /// Touches déjà signalées au journal (une fois chacune).
@@ -76,6 +82,39 @@ impl Input {
         self.held.contains(&k)
     }
 
+    /// Touche tenue longtemps dont Windows a cessé d'envoyer les répétitions : elle est
+    /// relâchée, même si ni le message de relâchement ni l'état du système ne le disent
+    /// (un logiciel qui avale le relâchement laisse Windows croire la touche enfoncée, et
+    /// le joueur continuait d'avancer). Windows répète la dernière touche enfoncée au
+    /// moins 2,5 fois par seconde tant qu'elle l'est : 0,7 s sans répétition, sans autre
+    /// touche enfoncée depuis (qui aurait pris les répétitions pour elle), et c'est fini.
+    /// Une répétition qui revient malgré tout la remet aussitôt.
+    fn release_silent_keys(&mut self) {
+        // Quand le clavier lui-même nous parle (saisie brute), c'est lui qui fait foi :
+        // cette règle ne sert que s'il ne dit rien.
+        if self.raw_seen {
+            return;
+        }
+        let last_press = self.last_press;
+        let silent: Vec<KeyCode> = self
+            .held
+            .iter()
+            .copied()
+            .filter(|code| {
+                self.repeats.get(code).is_some_and(|&(n, last)| {
+                    n >= 3
+                        && last.elapsed().as_secs_f32() > 0.7
+                        && last_press.is_none_or(|p| p <= last)
+                })
+            })
+            .collect();
+        for code in silent {
+            self.held.remove(&code);
+            self.note_release(code, "répétitions de Windows arrêtées");
+            self.soft.insert(code);
+        }
+    }
+
     /// Une touche tenue vient d'être relâchée (d'après `source`) : tenue plus de 2 s,
     /// le journal garde de quoi comprendre une touche restée enfoncée trop longtemps
     /// (Windows envoyait-il encore des répétitions ? le clavier la disait-il enfoncée ?).
@@ -85,7 +124,7 @@ impl Input {
             .get(&code)
             .map_or(0.0, |t| t.elapsed().as_secs_f32());
         let reps = self.repeats.remove(&code);
-        if held < 2.0 {
+        if held < 2.0 && source != "répétitions de Windows arrêtées" {
             return;
         }
         let (n, last) = reps.map_or((0, f32::NAN), |r| (r.0, r.1.elapsed().as_secs_f32()));
@@ -253,6 +292,10 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                 self.set_grab(false);
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // (Même une touche inconnue prend les répétitions pour elle.)
+                if event.state == ElementState::Pressed && !event.repeat {
+                    self.input.last_press = Some(Instant::now());
+                }
                 let PhysicalKey::Code(code) = event.physical_key else {
                     log::info!(
                         "touche sans code reconnu : {:?} ({:?})",
@@ -292,10 +335,17 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                                 .or_insert((0, Instant::now()));
                             *r = (r.0 + 1, Instant::now());
                         }
+                        // Relâchée à tort (les répétitions avaient seulement du retard) :
+                        // elle est toujours enfoncée, on la remet.
+                        if event.repeat && self.input.soft.remove(&code) {
+                            self.input.held.insert(code);
+                        }
                         let fresh = !event.repeat
                             || (self.input.raw_down.contains(&code)
                                 && !self.input.held.contains(&code));
                         if fresh {
+                            self.input.last_press = Some(Instant::now());
+                            self.input.soft.remove(&code);
                             self.input.repeats.remove(&code);
                             self.input.pressed.insert(code);
                             self.input.held.insert(code);
@@ -351,6 +401,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
     /// suite, en boucle, sans attendre de message de Windows (plus de FPS, moins de latence).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         release_stale_keys(&mut self.input);
+        self.input.release_silent_keys();
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
