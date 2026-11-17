@@ -83,7 +83,10 @@ pub struct Options {
     pub resource_pack: String,
     /// Distance de rendu, en chunks.
     pub render_distance: i32,
-    /// NVIDIA Reflex / AMD Anti-Lag 2 (si la carte le propose).
+    /// NVIDIA Reflex / AMD Anti-Lag 2 (si la carte le propose) : le pilote fait attendre
+    /// le jeu à chaque image. Enregistré sous « reflex » depuis la v129 : l'ancien réglage
+    /// (« low_latency ») voulait dire « essayé par le jeu quand il le juge utile », ce qui
+    /// coûtait des images même après ; chacun repart de « désactivé ».
     pub low_latency: bool,
     /// Sensibilité de la souris, valeur Counter-Strike (0,022° par unité de souris × valeur).
     pub sensitivity: f32,
@@ -161,7 +164,7 @@ impl Options {
             {
                 o.render_distance = v.clamp(2, 64);
             }
-            if let Some(v) = kv.get("low_latency") {
+            if let Some(v) = kv.get("reflex") {
                 o.low_latency = v == "true";
             }
             if let Some(v) = kv.get("raytracing") {
@@ -221,7 +224,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nlow_latency={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.fps_max,

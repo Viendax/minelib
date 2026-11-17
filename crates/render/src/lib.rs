@@ -579,8 +579,6 @@ pub struct Renderer {
     overlay: overlay::OverlayRenderer,
     viewmodel: viewmodel::ViewModel,
     entities: entity::Entities,
-    /// Temps passé bloqué sur la carte graphique pendant l'image (s), pour Reflex.
-    blocked: f32,
     /// Fumigènes en volume.
     smokes: smoke::Smokes,
     voxels: rt::Voxels,
@@ -982,7 +980,6 @@ impl Renderer {
             overlay,
             viewmodel,
             entities,
-            blocked: 0.0,
             smokes,
             voxels,
             skin_key: None,
@@ -1206,11 +1203,6 @@ impl Renderer {
         self.latency.as_ref().map(|l| (l.kind(), l.enabled()))
     }
 
-    /// Reflex / Anti-Lag fait-il attendre le jeu en ce moment (carte graphique saturée) ?
-    pub fn low_latency_waiting(&self) -> bool {
-        self.latency.as_ref().is_some_and(|l| l.driver_wait())
-    }
-
     pub fn raytracing(&self) -> bool {
         self.raytracing
     }
@@ -1350,16 +1342,21 @@ impl Renderer {
     }
 
     pub fn set_low_latency(&mut self, on: bool) {
-        if let Some(l) = &mut self.latency {
-            l.set_enabled(on);
+        let Some(l) = &mut self.latency else { return };
+        if l.enabled() == on {
+            return;
         }
+        l.set_enabled(on);
+        // Chaîne d'images neuve : rien de l'état d'avant ne reste chez le pilote (après
+        // une attente coupée, le processeur et la carte ne travaillaient plus en même
+        // temps, voir `latency`).
+        self.surface.configure(&self.device, &self.config);
     }
 
     /// À appeler en début d'image, avant de lire les entrées du joueur.
     pub fn frame_begin(&mut self) {
-        let blocked = std::mem::take(&mut self.blocked);
         if let Some(l) = &mut self.latency {
-            l.frame_begin(blocked);
+            l.frame_begin();
         }
     }
 
@@ -2095,7 +2092,6 @@ impl Renderer {
         // Image de la fenêtre demandée le plus tard possible : tout le travail CPU ci-dessus
         // se fait pendant que le GPU termine les images précédentes.
         let acquire = perf::scope("rendu : attente de l'image (GPU)");
-        let t_acquire = std::time::Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -2110,7 +2106,6 @@ impl Renderer {
             }
         };
         drop(acquire);
-        self.blocked += t_acquire.elapsed().as_secs_f32();
         let encode = perf::scope("rendu : commandes");
         let view = frame.texture.create_view(&Default::default());
         if let Some(t) = &mut self.gpu_timer {
@@ -2236,7 +2231,6 @@ impl Renderer {
             .encode(&self.device, &mut encoder, &frame.texture);
         self.marker(Marker::SimulationEnd);
         self.marker(Marker::RenderSubmitStart);
-        let t_submit = std::time::Instant::now();
         {
             let _s = perf::scope("rendu : envoi au GPU");
             self.queue.submit([encoder.finish()]);
@@ -2247,7 +2241,6 @@ impl Renderer {
             let _s = perf::scope("rendu : présentation");
             frame.present();
         }
-        self.blocked += t_submit.elapsed().as_secs_f32();
         self.marker(Marker::PresentEnd);
         if let Some(t) = &mut self.gpu_timer {
             if let Some(g) = t.after_submit(&self.device) {

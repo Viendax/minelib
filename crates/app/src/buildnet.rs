@@ -87,6 +87,9 @@ const PENDING_TIMEOUT: f32 = 4.0;
 /// oublié : ce rang ne sert qu'à écarter une modification arrivée en retard par un autre
 /// chemin, ce qui se joue en quelques secondes).
 const SEEN_MAX: usize = 1 << 20;
+/// Pseudos retenus au plus (voir `BuildNet::names`) ; au-delà, on repart de zéro : chaque
+/// relais redit un pseudo toutes les cinq secondes.
+const NAMES_MAX: usize = 1 << 16;
 
 pub struct Other {
     pub pseudo: String,
@@ -145,6 +148,9 @@ pub struct BuildNet {
     /// case, et relais de région qui l'a remise (aucun : le relais du monde). Une
     /// modification plus ancienne arrivée après (doublon, autre chemin) est sans effet.
     seen: HashMap<[i32; 3], (u64, Option<[i32; 2]>)>,
+    /// Pseudo de chaque joueur dont un relais envoie les positions par son numéro :
+    /// (relais de région qui le dit, aucun pour le relais du monde ; numéro) → pseudo.
+    names: HashMap<(Option<[i32; 2]>, u64), String>,
     /// Régions annoncées au relais du monde comme servies par un relais de région.
     served_sent: Vec<[i32; 2]>,
     caps_sent: bool,
@@ -269,6 +275,7 @@ impl BuildNet {
             chunk: None,
             pos_timer: 0.0,
             seen: HashMap::new(),
+            names: HashMap::new(),
             served_sent: Vec::new(),
             caps_sent: false,
             pending: HashMap::new(),
@@ -657,52 +664,83 @@ impl BuildNet {
                 crouch,
                 speed,
             } => {
-                // Valeurs d'un autre joueur : rien d'infini ni d'absurde n'entre dans le jeu.
-                let sane = pos.iter().all(|v| v.is_finite() && v.abs() < 4.0e7)
-                    && [yaw, pitch, crouch, speed].iter().all(|v| v.is_finite());
-                if !sane {
-                    return Vec::new();
-                }
-                let target = Vec3::from(pos);
-                let key: String = pseudo.chars().take(16).collect();
+                let pose = minelib_net::poses::Pose {
+                    pos,
+                    yaw,
+                    pitch,
+                    crouch,
+                    speed,
+                };
                 // Numéro sur le relais du monde (le vocal passe par lui).
-                let home = (peer != 0).then_some(peer);
-                match self.others.get_mut(&key) {
-                    Some(o) => {
-                        if home.is_some() {
-                            o.id = home;
+                self.player_seen((peer != 0).then_some(peer), &pseudo, pose);
+                Vec::new()
+            }
+            // Positions regroupées : comme autant de `Player`. Le pseudo n'est dit que de
+            // temps en temps ; entre-temps, le numéro du joueur sur ce relais suffit.
+            BuildMsg::Poses(packet) => {
+                let from = self.from_shard;
+                for (id, name, pose) in
+                    minelib_net::poses::unpack_poses(&packet).unwrap_or_default()
+                {
+                    if let Some(n) = name {
+                        if self.names.len() >= NAMES_MAX {
+                            self.names.clear();
                         }
-                        // Intervalle mesuré (lissé) ; téléportation : on y va d'un coup.
-                        o.interval = o.interval * 0.7 + o.seen.clamp(POS_FASTEST, 4.0) * 0.3;
-                        if (target - o.pos).length() > 8.0 {
-                            o.pos = target;
-                        }
-                        o.target = target;
-                        o.yaw = yaw;
-                        o.pitch = pitch;
-                        o.crouch = crouch;
-                        o.speed = speed;
-                        o.seen = 0.0;
+                        self.names.insert((from, id), n);
                     }
-                    None => {
-                        self.others.insert(
-                            key.clone(),
-                            Other {
-                                pseudo: key,
-                                id: home,
-                                pos: target,
-                                target,
-                                interval: POS_EVERY,
-                                yaw,
-                                pitch,
-                                crouch,
-                                speed,
-                                seen: 0.0,
-                            },
-                        );
-                    }
+                    let Some(pseudo) = self.names.get(&(from, id)).cloned() else {
+                        continue;
+                    };
+                    // (Le numéro n'est celui du relais du monde que s'il vient de lui.)
+                    self.player_seen(from.is_none().then_some(id), &pseudo, pose);
                 }
                 Vec::new()
+            }
+        }
+    }
+
+    /// Un autre joueur est vu à cette position (`home` : son numéro sur le relais du monde,
+    /// si c'est lui qui le dit).
+    fn player_seen(&mut self, home: Option<u64>, pseudo: &str, p: minelib_net::poses::Pose) {
+        // Valeurs d'un autre joueur : rien d'infini ni d'absurde n'entre dans le jeu.
+        if !p.sane() {
+            return;
+        }
+        let target = Vec3::from(p.pos);
+        let key: String = pseudo.chars().take(16).collect();
+        match self.others.get_mut(&key) {
+            Some(o) => {
+                if home.is_some() {
+                    o.id = home;
+                }
+                // Intervalle mesuré (lissé) ; téléportation : on y va d'un coup.
+                o.interval = o.interval * 0.7 + o.seen.clamp(POS_FASTEST, 4.0) * 0.3;
+                if (target - o.pos).length() > 8.0 {
+                    o.pos = target;
+                }
+                o.target = target;
+                o.yaw = p.yaw;
+                o.pitch = p.pitch;
+                o.crouch = p.crouch;
+                o.speed = p.speed;
+                o.seen = 0.0;
+            }
+            None => {
+                self.others.insert(
+                    key.clone(),
+                    Other {
+                        pseudo: key,
+                        id: home,
+                        pos: target,
+                        target,
+                        interval: POS_EVERY,
+                        yaw: p.yaw,
+                        pitch: p.pitch,
+                        crouch: p.crouch,
+                        speed: p.speed,
+                        seen: 0.0,
+                    },
+                );
             }
         }
     }
@@ -711,6 +749,7 @@ impl BuildNet {
     /// modifications est oublié.
     fn forget_shard(&mut self, region: [i32; 2]) {
         self.seen.retain(|_, v| v.1 != Some(region));
+        self.names.retain(|k, _| k.0 != Some(region));
     }
 
     /// Le relais du monde a publié `block` en `pos`, au rang `seq` de l'ordre du monde.

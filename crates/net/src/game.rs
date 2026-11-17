@@ -539,6 +539,34 @@ pub enum BuildMsg {
     /// Blocs changés, regroupés (voir `crate::cells`) : ce que disent autant de `Set`,
     /// sans l'auteur, en six à huit octets par bloc au lieu d'une cinquantaine.
     Cells(Vec<u8>),
+    /// Positions de joueurs, regroupées (voir `crate::poses`) : ce que disent autant de
+    /// `Player`, en une dizaine d'octets par joueur au lieu d'une soixantaine.
+    Poses(Vec<u8>),
+}
+
+/// La position que décrit un `Player` (pour la remettre regroupée avec d'autres), si elle
+/// n'a rien d'absurde.
+pub fn pose_of(data: &[u8]) -> Option<(String, crate::poses::Pose)> {
+    match decode::<BuildMsg>(data)? {
+        BuildMsg::Player {
+            pseudo,
+            pos,
+            yaw,
+            pitch,
+            crouch,
+            speed,
+        } => {
+            let pose = crate::poses::Pose {
+                pos,
+                yaw,
+                pitch,
+                crouch,
+                speed,
+            };
+            pose.sane().then_some((pseudo, pose))
+        }
+        _ => None,
+    }
 }
 
 /// Le bloc changé que décrit un `Set` (pour l'envoyer regroupé avec d'autres).

@@ -36,7 +36,21 @@ const OUT_MAX: usize = 32 * 1024;
 /// de suite, les suivants au plus tôt ce temps après le paquet d'avant. Un joueur au
 /// milieu d'une foule qui construit reçoit ainsi 50 paquets par seconde au plus, quel que
 /// soit le nombre de blocs, et rien n'attend quand il y en a peu.
+///
+/// Les positions de joueurs (`push_pose`) partent de la même façon, avec eux : dans une
+/// foule c'est de loin le plus gros du trafic (500 positions par seconde et par joueur).
 const CELL_LINGER: Duration = Duration::from_millis(20);
+/// Le pseudo d'un joueur est redit avec sa position au plus tôt ce temps après la dernière
+/// fois (le jeu qui reçoit le retient entre-temps ; s'il l'a oublié, il le retrouve vite).
+const NAME_EVERY: Duration = Duration::from_secs(5);
+
+/// Position d'un joueur à remettre aux autres : son numéro sur ce relais, son pseudo
+/// (celui de sa session), où il est.
+pub struct PoseOf {
+    pub id: u64,
+    pub name: String,
+    pub pose: crate::poses::Pose,
+}
 
 /// Ce qui arrive sur un canal : message chiffré reçu du réseau, message (en clair) déposé
 /// par un autre fil pour être envoyé, ou fin de connexion.
@@ -47,6 +61,9 @@ pub enum Inbound {
     Loose(Vec<u8>, Instant),
     /// Bloc changé, à envoyer regroupé avec les autres (voir `CELL_LINGER`).
     Cell(crate::cells::Cell),
+    /// Position d'un joueur déposée à cet instant, à envoyer regroupée avec les autres
+    /// (périssable : la suivante du même joueur la remplace).
+    Pose(std::sync::Arc<PoseOf>, Instant),
     Closed,
 }
 
@@ -72,6 +89,10 @@ pub struct Channel {
     cells: Vec<crate::cells::Cell>,
     cells_due: Instant,
     cells_sent: Instant,
+    /// Positions en attente d'être regroupées (la dernière de chaque joueur), et quand le
+    /// pseudo de chaque joueur a été dit sur cette connexion pour la dernière fois.
+    poses: std::collections::HashMap<u64, (std::sync::Arc<PoseOf>, Instant)>,
+    named: std::collections::HashMap<u64, Instant>,
     /// Message sorti de la file en ramassant les blocs, à traiter ensuite ; paquets de
     /// blocs prêts à être remis à l'appelant.
     held: Option<Inbound>,
@@ -101,6 +122,13 @@ pub fn push_raw(tx: &Sender<Inbound>, bytes: Vec<u8>) -> bool {
 /// rang dans l'ordre du monde).
 pub fn push_cell(tx: &Sender<Inbound>, cell: crate::cells::Cell) -> bool {
     tx.send(Inbound::Cell(cell)).is_ok()
+}
+
+/// Dépose la position d'un joueur : elle part regroupée avec celles des autres, dans un
+/// paquet compact (`BuildMsg::Poses`) ; restée trop longtemps dans la file, ou remplacée
+/// par la suivante du même joueur, elle n'est pas envoyée.
+pub fn push_pose(tx: &Sender<Inbound>, pose: &std::sync::Arc<PoseOf>) -> bool {
+    tx.send(Inbound::Pose(pose.clone(), Instant::now())).is_ok()
 }
 
 /// Dépose un message périssable déjà sérialisé : s'il attend trop dans la file (client
@@ -243,6 +271,8 @@ impl Channel {
             cells: Vec::new(),
             cells_due: Instant::now(),
             cells_sent: Instant::now(),
+            poses: std::collections::HashMap::new(),
+            named: std::collections::HashMap::new(),
             held: None,
             ready: std::collections::VecDeque::new(),
         })
@@ -294,17 +324,54 @@ impl Channel {
         Ok(postcard::from_bytes(&plain[..m])?)
     }
 
-    /// Les blocs en attente deviennent des paquets prêts à partir (avec ceux qui sont déjà
-    /// dans la file).
+    /// Les blocs et les positions en attente deviennent des paquets prêts à partir (avec
+    /// ceux qui sont déjà dans la file).
     fn pack_waiting_cells(&mut self) {
         while self.cells.len() < crate::cells::CELLS_MAX && self.held.is_none() {
             match self.rx.try_recv() {
                 Ok(Inbound::Cell(c)) => self.cells.push(c),
+                Ok(Inbound::Pose(p, at)) => {
+                    self.poses.insert(p.id, (p, at));
+                }
                 Ok(m) => self.held = Some(m),
                 Err(_) => break,
             }
         }
         self.cells_sent = Instant::now();
+        if !self.poses.is_empty() {
+            let now = self.cells_sent;
+            if self.named.len() > 8192 {
+                self.named
+                    .retain(|_, t| now.duration_since(*t) < NAME_EVERY);
+            }
+            let poses = std::mem::take(&mut self.poses);
+            let named = &mut self.named;
+            let mut entries: Vec<(u64, Option<&str>, crate::poses::Pose)> = poses
+                .values()
+                .filter(|(_, at)| now.duration_since(*at) <= LOOSE_MAX_AGE)
+                .map(|(p, _)| {
+                    let known = named
+                        .get(&p.id)
+                        .is_some_and(|t| now.duration_since(*t) < NAME_EVERY);
+                    if !known {
+                        named.insert(p.id, now);
+                    }
+                    (p.id, (!known).then_some(p.name.as_str()), p.pose)
+                })
+                .collect();
+            if !entries.is_empty() {
+                let msg = crate::proto::Response::FromZone {
+                    peer: 0,
+                    chunk: [0, 0],
+                    data: crate::game::encode(&crate::game::BuildMsg::Poses(
+                        crate::poses::pack_poses(&mut entries),
+                    )),
+                };
+                if let Ok(b) = postcard::to_allocvec(&msg) {
+                    self.ready.push_back(b);
+                }
+            }
+        }
         for packet in crate::cells::pack_cells(std::mem::take(&mut self.cells)) {
             let msg = crate::proto::Response::FromZone {
                 peer: 0,
@@ -317,6 +384,11 @@ impl Channel {
         }
     }
 
+    /// Des blocs ou des positions attendent-ils d'être regroupés ?
+    fn waiting(&self) -> bool {
+        !self.cells.is_empty() || !self.poses.is_empty()
+    }
+
     /// Prochain message reçu ou déposé ; `None` si rien avant `timeout`.
     pub fn recv_any<T: DeserializeOwned>(
         &mut self,
@@ -327,8 +399,9 @@ impl Channel {
             if let Some(p) = self.ready.pop_front() {
                 return Ok(Some(Incoming::Push(p)));
             }
-            // Des blocs attendent et leur heure est venue : ils partent, regroupés.
-            if !self.cells.is_empty() && Instant::now() >= self.cells_due {
+            // Des blocs ou des positions attendent et leur heure est venue : ils partent,
+            // regroupés.
+            if self.waiting() && Instant::now() >= self.cells_due {
                 self.pack_waiting_cells();
                 continue;
             }
@@ -343,10 +416,10 @@ impl Channel {
                     Err(TryRecvError::Empty) => {
                         self.flush()?;
                         let now = Instant::now();
-                        let until = if self.cells.is_empty() {
-                            end
-                        } else {
+                        let until = if self.waiting() {
                             end.min(self.cells_due)
+                        } else {
+                            end
                         };
                         match self.rx.recv_timeout(until.saturating_duration_since(now)) {
                             Ok(m) => m,
@@ -374,11 +447,20 @@ impl Channel {
                 Inbound::Loose(_, at) if at.elapsed() > LOOSE_MAX_AGE => {}
                 Inbound::Loose(p, _) => return Ok(Some(Incoming::Push(p))),
                 Inbound::Cell(c) => {
-                    if self.cells.is_empty() {
+                    if !self.waiting() {
                         self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
                     }
                     self.cells.push(c);
                     if self.cells.len() >= crate::cells::CELLS_MAX {
+                        self.pack_waiting_cells();
+                    }
+                }
+                Inbound::Pose(p, at) => {
+                    if !self.waiting() {
+                        self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
+                    }
+                    self.poses.insert(p.id, (p, at));
+                    if self.poses.len() >= crate::poses::POSES_MAX {
                         self.pack_waiting_cells();
                     }
                 }
@@ -419,6 +501,98 @@ impl Drop for Channel {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// Les positions de trente joueurs, soixante fois par seconde chacun, arrivent en une
+    /// cinquantaine de paquets par seconde ; le pseudo de chacun n'est dit qu'une fois, et
+    /// la dernière position de chacun est bien la dernière envoyée.
+    #[test]
+    fn poses_leave_grouped_with_each_name_said_once() {
+        use crate::game::{self, BuildMsg};
+        use crate::poses::Pose;
+        use crate::proto::{Request, Response};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (private, _) = generate_static();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut c = Channel::accept(stream, &private, Duration::from_secs(5)).unwrap();
+            let tx = c.pusher();
+            std::thread::spawn(move || {
+                for step in 0..30u32 {
+                    for id in 1..=30u64 {
+                        let pose = std::sync::Arc::new(PoseOf {
+                            id,
+                            name: format!("Joueur{id}"),
+                            pose: Pose {
+                                pos: [id as f32, 64.0, step as f32],
+                                yaw: 1.0,
+                                pitch: 0.0,
+                                crouch: 0.0,
+                                speed: 4.0,
+                            },
+                        });
+                        push_pose(&tx, &pose);
+                    }
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+                std::thread::sleep(Duration::from_millis(60));
+                push(&tx, &Response::Pong);
+            });
+            loop {
+                match c.recv_any::<Request>(Duration::from_millis(500)) {
+                    Ok(Some(Incoming::Push(p))) => c.send_raw(&p).unwrap(),
+                    Ok(Some(Incoming::Msg(_))) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        });
+        let (mut c, _) = Channel::connect(&addr, Duration::from_secs(5)).unwrap();
+        let (mut packets, mut bytes, mut entries) = (0, 0, 0);
+        let mut names = std::collections::HashMap::new();
+        let mut last = std::collections::HashMap::new();
+        let t = Instant::now();
+        loop {
+            assert!(t.elapsed() < Duration::from_secs(10));
+            match c
+                .recv_timeout::<Response>(Duration::from_millis(200))
+                .unwrap()
+            {
+                Some(Response::FromZone { data, .. }) => {
+                    let Some(BuildMsg::Poses(p)) = game::decode(&data) else {
+                        panic!("un paquet de positions")
+                    };
+                    packets += 1;
+                    bytes += p.len();
+                    for (id, name, pose) in crate::poses::unpack_poses(&p).expect("lisible") {
+                        entries += 1;
+                        if let Some(n) = name {
+                            *names.entry((id, n)).or_insert(0) += 1;
+                        }
+                        last.insert(id, pose.pos[2]);
+                    }
+                }
+                Some(Response::Pong) => break,
+                _ => {}
+            }
+        }
+        drop(c);
+        server.join().unwrap();
+        assert_eq!(last.len(), 30);
+        assert!(last.values().all(|z| *z == 29.0), "la dernière de chacun");
+        assert_eq!(names.len(), 30, "chaque pseudo est dit");
+        assert!(names
+            .iter()
+            .all(|((id, n), k)| *n == format!("Joueur{id}") && *k == 1));
+        assert!((300..=900).contains(&entries), "{entries}");
+        assert!(
+            packets <= 40,
+            "regroupées : {packets} paquets pour {entries} positions"
+        );
+        assert!(
+            bytes < entries * 12 + packets * 12 + 30 * 12,
+            "{bytes} octets pour {entries} positions"
+        );
+    }
 
     /// Des blocs déposés un par un arrivent regroupés : le premier tout de suite, les
     /// suivants ensemble, et aucun ne manque.

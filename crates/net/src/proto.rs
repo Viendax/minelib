@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 29;
+pub const PROTOCOL: u32 = 30;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.

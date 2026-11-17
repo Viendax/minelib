@@ -606,6 +606,9 @@ mod tests {
                     builds[s].moved(id, c, &|_| true);
                 }
                 let mut rate = vec![20.0f32; n];
+                // Joueurs différents dont chacun reçoit des positions (pour le pseudo, redit
+                // toutes les 5 s sur chaque connexion).
+                let mut distinct = vec![0usize; n];
                 let mut report = String::new();
                 // Deux passes : la première sert à savoir combien de joueurs chacun voit
                 // (le jeu règle son rythme d'envoi là-dessus), la seconde mesure.
@@ -637,20 +640,89 @@ mod tests {
                     if pass == 0 {
                         for i in 0..n {
                             rate[i] = hz(seen[i].len());
+                            distinct[i] = seen[i].len();
                         }
                         continue;
                     }
+                    // Depuis la v129, les positions vont aux joueurs regroupées (voir
+                    // `minelib_net::poses`) : 50 paquets par seconde au plus, chacun avec
+                    // ses en-têtes (y compris IP et TCP, 40 octets), mesurés avec le vrai
+                    // codec. Les copies vers les autres relais de la région partent encore
+                    // une par une.
+                    let mut cache = std::collections::HashMap::new();
+                    let mut packet = |k: usize| -> f64 {
+                        *cache.entry(k).or_insert_with(|| {
+                            let mut seed = 77u64 + k as u64;
+                            let mut r = move || {
+                                seed ^= seed << 13;
+                                seed ^= seed >> 7;
+                                seed ^= seed << 17;
+                                seed
+                            };
+                            let span = (side * 16) as u64;
+                            let mut entries: Vec<(u64, Option<&str>, minelib_net::poses::Pose)> =
+                                (0..k)
+                                    .map(|i| {
+                                        let pose = minelib_net::poses::Pose {
+                                            pos: [
+                                                (r() % span) as f32 + 0.37,
+                                                64.0 + (r() % 4) as f32,
+                                                (r() % span) as f32 + 0.81,
+                                            ],
+                                            yaw: (r() % 628) as f32 / 100.0,
+                                            pitch: 0.1,
+                                            crouch: 0.0,
+                                            speed: 4.3,
+                                        };
+                                        ((i as u64) * (n / k.max(1)).max(1) as u64 + 1, None, pose)
+                                    })
+                                    .collect();
+                            let data = minelib_net::poses::pack_poses(&mut entries);
+                            let msg = postcard::to_allocvec(&Response::FromZone {
+                                peer: 0,
+                                chunk: [0, 0],
+                                data: game::encode(&BuildMsg::Poses(data)),
+                            })
+                            .unwrap()
+                            .len();
+                            (msg + 16 + 2 + 40) as f64
+                        })
+                    };
+                    let mut grouped = |got: f64, distinct: usize| -> f64 {
+                        if got <= 0.0 {
+                            return 0.0;
+                        }
+                        let packets = got.min(50.0);
+                        let k = (got / packets).round().max(1.0) as usize;
+                        packets * packet(k) + distinct as f64 * 11.0 / 5.0
+                    };
+                    let mut relay_bytes = vec![0f64; relays];
+                    let mut delivered = vec![0u64; relays];
+                    let mut player_bytes = 0f64;
+                    for (i, &(_, _, s)) in players.iter().enumerate() {
+                        let b = grouped(got[i] as f64, distinct[i]);
+                        relay_bytes[s] += b;
+                        delivered[s] += got[i];
+                        player_bytes += b;
+                    }
+                    for r in 0..relays {
+                        // Le reste de ce qu'envoie ce relais : les copies aux autres relais.
+                        relay_bytes[r] += (out[r] - delivered[r]) as f64 * wire as f64;
+                    }
+                    let worst_bytes = relay_bytes.iter().cloned().fold(0.0, f64::max);
                     let sent: f32 = rate.iter().sum();
                     let worst_out = *out.iter().max().unwrap();
                     let worst_got = *got.iter().max().unwrap();
                     let mean_got = got.iter().sum::<u64>() / n as u64;
                     report = format!(
-                        "{n:>5} joueurs, {relays} relais | envoi moyen {:.0}/s par joueur | relais le plus chargé : {} msg/s sortants = {:.1} Mbit/s, {} entrants | joueur : {} reçus/s en moyenne ({:.0} kbit/s), {} au pire | calcul de la diffusion : {:.2} s de processeur par seconde",
+                        "{n:>5} joueurs, {relays} relais | envoi moyen {:.0}/s par joueur | relais le plus chargé : {:.1} Mbit/s ({} msg/s, {:.1} Mbit/s avant les paquets), {} entrants | joueur : {} reçus/s en moyenne = {:.0} kbit/s ({:.0} avant), {} au pire | calcul de la diffusion : {:.2} s de processeur par seconde",
                         sent / n as f32,
+                        worst_bytes * 8.0 / 1e6,
                         worst_out,
                         worst_out as f32 * wire as f32 * 8.0 / 1e6,
                         inn.iter().max().unwrap(),
                         mean_got,
+                        player_bytes * 8.0 / 1e3 / n as f64,
                         mean_got as f32 * wire as f32 * 8.0 / 1e3,
                         worst_got,
                         cpu,

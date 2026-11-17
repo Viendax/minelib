@@ -13,6 +13,7 @@ pub mod game;
 pub mod hw;
 pub mod items;
 pub mod lan;
+pub mod poses;
 pub mod proto;
 pub mod totp;
 pub mod transport;

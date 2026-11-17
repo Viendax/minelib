@@ -4064,23 +4064,25 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         .set_position(&server, pseudo, [pos[0], pos[1], pos[2], yaw, pitch]);
                 }
             }
-            // Le pseudo montré est celui de la session (pas celui que le joueur annonce).
-            let data = player_as(&data, pseudo)?;
+            // Le pseudo montré est celui de la session (pas celui que le joueur annonce) ;
+            // une position absurde (infinie, hors du monde) n'est pas diffusée.
+            let (_, pose) = game::pose_of(&data)?;
             if let Some(room) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
                 // Plus de positions que le jeu n'en envoie : pas diffusée.
                 if !room.build.pos_due(id) {
                     return None;
                 }
-                // Sérialisée une fois pour tous ; périssable : chez un joueur dont la
-                // connexion ne suit pas, la position suivante la remplace.
-                let msg = transport::encode(&Response::FromZone {
-                    peer: id,
-                    chunk,
-                    data,
-                })?;
+                // Vers chaque voisin, elle part regroupée avec celles des autres (voir
+                // `transport::push_pose`) ; périssable : chez un joueur dont la connexion
+                // ne suit pas, la position suivante la remplace.
+                let pose = Arc::new(transport::PoseOf {
+                    id,
+                    name: pseudo.to_string(),
+                    pose,
+                });
                 for m in room.build.nearby(id, chunk, 1) {
                     if let Some(c) = st.conns.get(&m) {
-                        transport::push_loose(&c.tx, msg.clone());
+                        transport::push_pose(&c.tx, &pose);
                     }
                 }
                 // Modifications pas encore reçues (foule : elles ne sont poussées qu'à une

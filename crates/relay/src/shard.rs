@@ -424,15 +424,16 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             chunk,
             data,
         } if peer => {
-            let msg = transport::encode(&Response::FromZone {
-                peer: from,
-                chunk,
-                data,
-            })?;
+            let (name, pose) = game::pose_of(&data)?;
+            let pose = Arc::new(transport::PoseOf {
+                id: from,
+                name,
+                pose,
+            });
             let relays = st.peers.len() + 1;
             for m in st.build.nearby(from, chunk, relays) {
                 if let Some(c) = st.conns.get(&m) {
-                    transport::push_loose(&c.tx, msg.clone());
+                    transport::push_pose(&c.tx, &pose);
                 }
             }
             None
@@ -458,17 +459,15 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             if !st.build.pos_due(id) {
                 return None;
             }
-            // Sérialisée une fois pour tous ; périssable (la suivante la remplace). Chaque
-            // relais de la région ne sert que sa part des voisins.
+            // Vers chaque voisin, regroupée avec celles des autres ; périssable (la
+            // suivante la remplace). Chaque relais de la région ne sert que sa part des
+            // voisins.
             let relays = st.peers.len() + 1;
-            let msg = transport::encode(&Response::FromZone {
-                peer: id,
-                chunk,
-                data: data.clone(),
-            })?;
+            let (name, pose) = game::pose_of(&data)?;
+            let pose = Arc::new(transport::PoseOf { id, name, pose });
             for m in st.build.nearby(id, chunk, relays) {
                 if let Some(c) = st.conns.get(&m) {
-                    transport::push_loose(&c.tx, msg.clone());
+                    transport::push_pose(&c.tx, &pose);
                 }
             }
             // Une fois à chaque autre relais de la région, pour ses propres joueurs.
