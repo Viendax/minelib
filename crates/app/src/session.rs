@@ -706,10 +706,21 @@ impl Session {
                 m.forward -= 1.0;
             }
             self.stick.remember();
+            if let Some(gap) = self.stick.last_gap.take() {
+                log::info!(
+                    "fin de course : avancer relâchée {:.0} ms après courir{}",
+                    gap * 1000.0,
+                    if self.stick.active() {
+                        " (arrêt fait dès courir relâchée)"
+                    } else {
+                        ""
+                    }
+                );
+            }
             if std::mem::take(&mut self.stick.just_learned) {
                 log::warn!(
-                    "la touche avancer se relâche régulièrement un instant après la touche \
-                     courir : elle remonte mal ; désormais, lâcher courir arrête d'avancer"
+                    "la touche avancer se relâche après la touche courir, trois fois de suite : \
+                     elle remonte mal ; désormais, lâcher courir arrête d'avancer"
                 );
                 self.chat.say(
                     "Ta touche avancer se relâche en retard (elle remonte mal). Le jeu s'arrête \

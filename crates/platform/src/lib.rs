@@ -139,9 +139,10 @@ impl Input {
         }
         let (n, last) = reps.map_or((0, f32::NAN), |r| (r.0, r.1.elapsed().as_secs_f32()));
         log::info!(
-            "touche {code:?} relâchée après {held:.2} s (vu par : {source}, message reçu {} ms \
-             après sa date, clavier n° {}) ; {n} répétitions de Windows, la dernière il y a \
-             {last:.2} s ; clavier brut : {}",
+            "touche {code:?} relâchée à {:.3} s après {held:.2} s (vu par : {source}, message \
+             reçu {} ms après sa date, clavier n° {}) ; {n} répétitions de Windows, la dernière \
+             il y a {last:.2} s ; clavier brut : {}",
+            uptime(),
             self.msg_lag,
             self.last_device,
             if !self.raw_seen {
@@ -279,9 +280,7 @@ pub fn run<G: GameLoop>(title: &str, game: G) -> anyhow::Result<()> {
     };
     // (Réglage du clavier laissé par un plantage : remis d'abord.)
     key_repeat::restore_leftover();
-    let r = event_loop.run_app(&mut app);
-    key_repeat::quiet(false);
-    r?;
+    event_loop.run_app(&mut app)?;
     Ok(())
 }
 
@@ -315,9 +314,6 @@ impl<G: GameLoop> App<G> {
             w.set_cursor_visible(true);
         }
         self.input.grabbed = grab;
-        // En jeu (souris capturée), les répétitions automatiques du clavier ne servent à
-        // rien et peuvent retarder le relâchement des touches : voir `key_repeat`.
-        key_repeat::quiet(grab);
     }
 }
 
@@ -923,6 +919,12 @@ fn release_stale_keys(input: &mut Input) {
 #[cfg(not(windows))]
 fn release_stale_keys(_input: &mut Input) {}
 
+/// Secondes écoulées depuis le lancement (pour dater les touches au millième).
+fn uptime() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
 /// Nom de l'appareil d'un événement brut (`None` : aucun, la frappe vient d'un logiciel).
 #[cfg(windows)]
 fn device_name(id: &DeviceId) -> Option<String> {
@@ -957,111 +959,35 @@ fn message_lag_ms() -> u32 {
     0
 }
 
-/// Répétition automatique du clavier, réduite pendant qu'on joue.
-///
-/// Sur certains portables de jeu, une touche tenue longtemps reste annoncée enfoncée une
-/// seconde ou plus après qu'on l'a lâchée, dans tous les jeux : le clavier envoie jusqu'à
-/// 30 répétitions par seconde de la dernière touche enfoncée, et pendant une partie
-/// (machine chargée) le relâchement des touches arrive après ce flot. Des joueurs l'ont
-/// réglé en baissant la répétition du clavier dans Windows. Le jeu le fait donc lui-même,
-/// seulement pendant qu'on joue (souris capturée) : répétition la plus lente (2,5 par
-/// seconde, après une seconde), puis le réglage du joueur est remis dès qu'on sort du jeu,
-/// qu'on ouvre un menu ou que la fenêtre perd la main. Rien n'est écrit dans les réglages
-/// de Windows ; en cas de plantage, le réglage est remis au lancement suivant.
+/// Répétition automatique du clavier : la version 116 la réduisait pendant le jeu (sans
+/// effet prouvé). Il ne reste que la remise du réglage du joueur si cette version s'était
+/// arrêtée brutalement.
 mod key_repeat {
     #[cfg(windows)]
-    mod imp {
-        use std::sync::Mutex;
+    pub fn restore_leftover() {
         use windows::Win32::UI::WindowsAndMessaging::{
-            SystemParametersInfoW, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
-            SPI_SETKEYBOARDDELAY, SPI_SETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+            SystemParametersInfoW, SPI_SETKEYBOARDDELAY, SPI_SETKEYBOARDSPEED,
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
         };
-
-        /// Réglage du joueur (vitesse 0 à 31, délai 0 à 3) tant que le jeu l'a changé.
-        static SAVED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
-
-        fn file() -> std::path::PathBuf {
-            std::env::temp_dir().join("minelib_repetition_clavier.txt")
-        }
-
-        fn get() -> Option<(u32, u32)> {
-            let (mut speed, mut delay) = (0u32, 0u32);
-            let none = SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0);
-            // SAFETY : lectures de deux réglages dans des entiers de la bonne taille.
-            unsafe {
-                SystemParametersInfoW(
-                    SPI_GETKEYBOARDSPEED,
-                    0,
-                    Some(&mut speed as *mut u32 as *mut _),
-                    none,
-                )
-                .ok()?;
-                SystemParametersInfoW(
-                    SPI_GETKEYBOARDDELAY,
-                    0,
-                    Some(&mut delay as *mut u32 as *mut _),
-                    none,
-                )
-                .ok()?;
-            }
-            Some((speed.min(31), delay.min(3)))
-        }
-
-        fn set(speed: u32, delay: u32) {
+        let file = std::env::temp_dir().join("minelib_repetition_clavier.txt");
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            return;
+        };
+        let mut n = text
+            .split_whitespace()
+            .filter_map(|v| v.parse::<u32>().ok());
+        if let (Some(speed), Some(delay)) = (n.next(), n.next()) {
             let none = SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0);
             // SAFETY : deux réglages passés par valeur, sans écriture dans le profil.
             unsafe {
-                let _ = SystemParametersInfoW(SPI_SETKEYBOARDSPEED, speed, None, none);
-                let _ = SystemParametersInfoW(SPI_SETKEYBOARDDELAY, delay, None, none);
+                let _ = SystemParametersInfoW(SPI_SETKEYBOARDSPEED, speed.min(31), None, none);
+                let _ = SystemParametersInfoW(SPI_SETKEYBOARDDELAY, delay.min(3), None, none);
             }
+            log::info!("clavier : répétition automatique du joueur remise");
         }
-
-        pub fn quiet(on: bool) {
-            let mut saved = SAVED.lock().unwrap();
-            match (on, *saved) {
-                (true, None) => {
-                    let Some(mine) = get() else { return };
-                    let _ = std::fs::write(file(), format!("{} {}", mine.0, mine.1));
-                    *saved = Some(mine);
-                    set(0, 3);
-                    log::info!(
-                        "clavier : répétition automatique réduite pendant le jeu (réglage du \
-                         joueur : vitesse {}, délai {})",
-                        mine.0,
-                        mine.1
-                    );
-                }
-                (false, Some((speed, delay))) => {
-                    set(speed, delay);
-                    *saved = None;
-                    let _ = std::fs::remove_file(file());
-                }
-                _ => {}
-            }
-        }
-
-        pub fn restore_leftover() {
-            let Ok(text) = std::fs::read_to_string(file()) else {
-                return;
-            };
-            let mut n = text
-                .split_whitespace()
-                .filter_map(|v| v.parse::<u32>().ok());
-            if let (Some(speed), Some(delay)) = (n.next(), n.next()) {
-                set(speed.min(31), delay.min(3));
-                log::info!(
-                    "clavier : répétition automatique du joueur remise (après un arrêt brutal)"
-                );
-            }
-            let _ = std::fs::remove_file(file());
-        }
+        let _ = std::fs::remove_file(file);
     }
 
     #[cfg(not(windows))]
-    mod imp {
-        pub fn quiet(_on: bool) {}
-        pub fn restore_leftover() {}
-    }
-
-    pub use imp::{quiet, restore_leftover};
+    pub fn restore_leftover() {}
 }
