@@ -15,9 +15,13 @@ pub mod items;
 pub mod lan;
 pub mod poses;
 pub mod proto;
+pub mod sovereign;
 pub mod totp;
 pub mod transport;
 pub mod voice;
+
+/// Signatures (clés des comptes) : reprise ici pour le jeu et le relais.
+pub use ed25519_dalek;
 
 /// Port par défaut du relais.
 pub const DEFAULT_PORT: u16 = 27650;

@@ -542,6 +542,9 @@ pub enum BuildMsg {
     /// Positions de joueurs, regroupées (voir `crate::poses`) : ce que disent autant de
     /// `Player`, en une dizaine d'octets par joueur au lieu d'une soixantaine.
     Poses(Vec<u8>),
+    /// Région souveraine : demande de modification signée par son auteur, au relais de la
+    /// région (voir `crate::sovereign`).
+    Signed(crate::sovereign::Edit),
 }
 
 /// La position que décrit un `Player` (pour la remettre regroupée avec d'autres), si elle

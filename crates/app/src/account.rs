@@ -281,6 +281,9 @@ pub struct Accounts {
     pub servers: Vec<ServerEntry>,
     /// File pour envoyer des données de jeu au relais sans attendre.
     pub link: Option<std::sync::mpsc::Sender<minelib_net::transport::Inbound>>,
+    /// Clé du compte, une fois connecté : elle signe ses modifications dans une région
+    /// souveraine (voir `minelib_net::sovereign`).
+    pub identity: Option<minelib_net::ed25519_dalek::SigningKey>,
     /// Relais joint (adresse, clé) et identifiants de la session : une deuxième connexion
     /// du compte peut y servir de garant pendant qu'on joue.
     relay_at: Option<(String, [u8; 32])>,
@@ -337,6 +340,7 @@ impl Accounts {
             new_pseudo: None,
             servers: Vec::new(),
             link: None,
+            identity: None,
             relay_at: None,
             login_secret: None,
             game_events: Vec::new(),
@@ -566,6 +570,7 @@ impl Accounts {
                     }
                 }
                 Event::Progress(p) => self.busy = Some(p.into()),
+                Event::Identity(key) => self.identity = Some(key),
                 Event::LoggedIn {
                     pseudo,
                     fingerprint,
@@ -736,6 +741,7 @@ impl Accounts {
                 | Event::BuildGarant(_)
                 | Event::ShardTask { .. }
                 | Event::ShardPeers { .. }
+                | Event::RootEdits { .. }
                 | Event::Shards(_)
                 | Event::ShardTicket { .. }
                 | Event::Judge { .. }
@@ -750,6 +756,7 @@ impl Accounts {
             self.client = None;
             self.account = None;
             self.link = None;
+            self.identity = None;
             self.lan_relay = self.lan_before;
             self.auto_login();
         }

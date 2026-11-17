@@ -62,6 +62,9 @@ impl Drop for GarantWorker {
 pub struct ShardHost {
     pub region: [i32; 2],
     handle: minelib_relay::shard::ShardHandle,
+    /// Connexion de garant (au relais du monde) : lots publiés, confirmations,
+    /// accusations et passations d'une région souveraine.
+    link: std::sync::mpsc::Sender<minelib_net::transport::Inbound>,
     /// Nœud iroh propre à ce relais (joignable de partout, sans gêner celui du jeu).
     _node: Option<Arc<minelib_p2p::Node>>,
 }
@@ -81,6 +84,7 @@ fn lan_ip() -> std::net::IpAddr {
 
 impl ShardHost {
     /// Lance le relais de la région et annonce au relais du monde qu'il est prêt.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         room: u64,
         region: [i32; 2],
@@ -88,10 +92,15 @@ impl ShardHost {
         link: std::sync::mpsc::Sender<minelib_net::transport::Inbound>,
         p2p: bool,
         slot: u16,
+        root: [u8; 32],
+        signer: Option<minelib_net::ed25519_dalek::SigningKey>,
     ) -> Option<Self> {
-        let handle = minelib_relay::shard::start("0.0.0.0:0", room, region, secret, slot)
+        let handle = minelib_relay::shard::start("0.0.0.0:0", room, region, secret, slot, root)
             .map_err(|e| log::warn!("relais de région : {e:#}"))
             .ok()?;
+        if let Some(k) = signer {
+            handle.set_signer(k);
+        }
         let port = handle.addr.port();
         // Hôte anonyme : joignable seulement par les relais d'iroh (pas d'adresse IP
         // donnée aux joueurs de la région, ni directe ni de réseau local).
@@ -135,6 +144,7 @@ impl ShardHost {
         Some(Self {
             region,
             handle,
+            link,
             _node: node,
         })
     }
@@ -144,9 +154,44 @@ impl ShardHost {
         self.handle.seed(data);
     }
 
-    /// Relais prêts de la région (liste du relais du monde).
-    pub fn set_peers(&self, list: &[minelib_net::proto::ShardInfo]) {
-        self.handle.set_peers(list);
+    /// Relais prêts de la région (liste du relais du monde), et son époque si elle est
+    /// souveraine.
+    pub fn set_peers(
+        &self,
+        list: &[minelib_net::proto::ShardInfo],
+        sov: Option<minelib_net::proto::Sov>,
+    ) {
+        self.handle.set_peers(list, sov);
+    }
+
+    /// Hôte principal d'une région souveraine : modifications signées par le relais du
+    /// monde à la place de leurs auteurs.
+    pub fn root_edits(&self, edits: Vec<minelib_net::sovereign::Edit>) {
+        self.handle.root_edits(edits);
+    }
+
+    /// Clé du compte de l'hôte (arrivée après le lancement du relais).
+    pub fn set_signer(&self, key: minelib_net::ed25519_dalek::SigningKey) {
+        self.handle.set_signer(key);
+    }
+
+    /// Région souveraine : ce relais en est l'hôte principal.
+    #[cfg(test)]
+    pub fn is_primary(&self) -> bool {
+        self.handle.is_primary()
+    }
+
+    /// Région souveraine : modifications mises en ordre dans l'époque en cours.
+    #[cfg(test)]
+    pub fn ordered(&self) -> u64 {
+        self.handle.ordered()
+    }
+
+    /// Essais : comme hôte principal, le prochain lot contiendra une modification
+    /// inventée.
+    #[cfg(test)]
+    pub fn forge_once(&self) {
+        self.handle.forge_once();
     }
 
     /// Relié à ce nombre d'autres relais de la région.
@@ -161,9 +206,13 @@ impl ShardHost {
         self.handle.players()
     }
 
-    /// À appeler régulièrement : liens vers les autres relais de la région.
+    /// À appeler régulièrement : liens vers les autres relais de la région, et ce que le
+    /// relais doit dire au relais du monde (par la connexion de garant).
     pub fn pump(&self) {
         self.handle.tick();
+        for req in self.handle.take_outbox() {
+            minelib_net::transport::push(&self.link, &req);
+        }
     }
 }
 
@@ -190,6 +239,8 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
     });
     let mut logged = false;
     let mut link = None;
+    // Clé du compte : signe ce que publie le relais de région quand il est hôte principal.
+    let mut identity: Option<minelib_net::ed25519_dalek::SigningKey> = None;
     let mut garant: Option<Garant> = None;
     // Garant extérieur d'un monde de construction : il valide les modifications de ses
     // zones (sans avoir besoin du monde lui-même).
@@ -283,9 +334,24 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                         s.pump();
                     }
                 }
-                Event::ShardPeers { region, ref list } => {
+                Event::ShardPeers {
+                    region,
+                    ref list,
+                    ref sov,
+                } => {
                     if let Some(s) = shard.as_ref().filter(|s| s.region == region) {
-                        s.set_peers(list);
+                        s.set_peers(list, sov.clone());
+                    }
+                }
+                Event::RootEdits { region, ref edits } => {
+                    if let Some(s) = shard.as_ref().filter(|s| s.region == region) {
+                        s.root_edits(edits.clone());
+                    }
+                }
+                Event::Identity(ref key) => {
+                    identity = Some(key.clone());
+                    if let Some(s) = &shard {
+                        s.set_signer(key.clone());
                     }
                 }
                 Event::ShardTask {
@@ -293,6 +359,7 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                     region,
                     secret,
                     slot,
+                    root,
                 } => {
                     if let Some(l) = link.clone() {
                         log::info!(
@@ -305,6 +372,8 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                             l,
                             login.node_dir.is_some(),
                             slot,
+                            root,
+                            identity.clone(),
                         );
                         if shard.is_none() {
                             client.send(Cmd::Leave);

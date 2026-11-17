@@ -1577,6 +1577,7 @@ impl Game {
             s.voice = Some(voice::Voice::new(link.clone()));
             let mut b = buildnet::BuildNet::new(link, pseudo.clone(), true);
             b.set_node_dir(self.accounts.relay_dir());
+            b.set_identity(self.accounts.identity.clone());
             s.build = Some(b);
         }
         self.accounts.room(minelib_net::client::Cmd::Host {
@@ -1625,6 +1626,7 @@ impl Game {
             s.voice = Some(voice::Voice::new(link.clone()));
             let mut b = buildnet::BuildNet::new(link, pseudo, false);
             b.set_node_dir(self.accounts.relay_dir());
+            b.set_identity(self.accounts.identity.clone());
             s.build = Some(b);
             s.chat
                 .say(format!("Monde de {host} rejoint."), chat::YELLOW);

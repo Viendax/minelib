@@ -3,20 +3,27 @@
 //! de garant, en arrière-plan, comme les garants des parties FPS). Personne dans le monde
 //! n'a intérêt à l'attaquer, et le relais du monde n'a plus à tout transmettre.
 //!
-//! Il fait deux choses, pour sa région seulement :
+//! Il fait trois choses, pour sa région seulement :
 //! - les joueurs y entrent avec le billet du relais du monde (`proto::shard_mac`) ;
-//! - il transmet les positions aux joueurs proches (moins souvent au loin), et les
-//!   modifications de blocs que publie le relais du monde (reçues par la connexion de
-//!   l'hôte, `ShardHandle::seed`), dont il garde l'historique compacté pour ceux qui
-//!   arrivent.
+//! - il transmet les positions aux joueurs proches (moins souvent au loin) ;
+//! - il transmet les modifications de blocs et en garde l'historique compacté pour ceux
+//!   qui arrivent.
 //!
-//! Il ne décide rien : seul le relais du monde accepte une modification, lui donne son rang
-//! et la garde (comme pour les objets). Jusqu'à la v126, ce relais validait lui-même les
-//! modifications de sa région, le premier relais de la région les mettait en ordre et en
-//! rendait compte au relais du monde, qui le croyait : un hôte malveillant pouvait inventer
-//! une modification ou l'attribuer à un autre joueur. Il ne peut plus que tarder à
-//! transmettre, ou montrer à ses propres joueurs des blocs qui n'existent pas (le jeu les
-//! oublie en changeant de relais ; l'histoire du monde, elle, n'en garde rien).
+//! D'où viennent les modifications dépend de la région :
+//! - **Région ordinaire** (un seul relais) : du relais du monde, qui les accepte et les met
+//!   en ordre (reçues par la connexion de l'hôte, `ShardHandle::seed`). Ce relais ne décide
+//!   rien.
+//! - **Région souveraine** (au moins deux relais, depuis la v130 ; voir
+//!   `minelib_net::sovereign`) : l'hôte principal (rang donné par le relais du monde)
+//!   accepte et met en ordre les modifications de la région, que chaque joueur signe avec la
+//!   clé de son compte. Il les publie par lots signés, enchaînés par une empreinte. Les
+//!   autres relais de la région vérifient chaque lot avant de le transmettre à leurs
+//!   joueurs, et le confirment au relais du monde, qui ne l'archive qu'alors. Une faute de
+//!   l'hôte principal se prouve avec ses propres lots (`Request::Accuse`) : il est écarté
+//!   et un autre prend sa place. Il ne peut ni inventer une modification, ni l'attribuer à
+//!   un autre, ni réécrire ce qu'il a publié ; il peut seulement tarder ou refuser (le
+//!   relais du monde le remplace alors), et montrer à ses propres joueurs, pendant ce
+//!   temps, des modifications que personne d'autre ne verra.
 //!
 //! S'il disparaît, les joueurs repassent par le relais du monde ou par un autre hôte, qui
 //! reçoit tout l'historique de la région : chacun reçoit ce qui lui manque.
@@ -24,10 +31,9 @@
 //! Une région très peuplée a plusieurs relais, chacun chez un hôte différent. Chaque
 //! joueur n'entre que dans l'un d'eux (`proto::shard_for`), et les relais se relient entre
 //! eux (`set_peers`) : la position d'un joueur part à ses voisins du même relais, et une
-//! fois à chaque autre relais, qui la transmet à ses propres joueurs proches. Les
-//! modifications, elles, arrivent à chaque relais directement du relais du monde.
+//! fois à chaque autre relais, qui la transmet à ses propres joueurs proches.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -37,6 +43,7 @@ use anyhow::Result;
 use minelib_net::client::{Client, Cmd, Event, Resolver};
 use minelib_net::game::{self, BuildMsg};
 use minelib_net::proto::{self, ErrorCode, Request, Response};
+use minelib_net::sovereign::{self, Batch, Cert, Checker, Edit};
 use minelib_net::transport::{self, Channel, Inbound, Incoming};
 
 use crate::zones;
@@ -44,9 +51,59 @@ use crate::zones;
 struct Conn {
     tx: Sender<Inbound>,
     pseudo: Option<String>,
-    /// Un autre relais de la région (pas un joueur).
+    /// Un autre relais de la région (pas un joueur), et son rang.
     peer: bool,
+    slot: Option<u16>,
 }
+
+/// Lots gardés pour un relais qui arrive et pour la passation en fin d'époque (s).
+const KEEP_BATCHES: Duration = Duration::from_secs(120);
+/// L'hôte principal scelle un lot au plus tard ce temps après la première modification
+/// qu'il contient, ou dès qu'il en a ce nombre.
+const BATCH_WAIT: Duration = Duration::from_millis(40);
+const BATCH_MAX: usize = 256;
+/// Lots arrivés en avance (un lot manquant avant eux) gardés au plus.
+const EARLY_MAX: usize = 256;
+
+/// D'où vient une modification qu'accepte l'hôte principal (à qui dire un refus).
+#[derive(Clone, Copy)]
+enum From {
+    /// Un joueur de ce relais.
+    Local(u64),
+    /// Un joueur d'un autre relais de la région (rang de ce relais).
+    Peer(u16),
+    /// Le relais du monde.
+    Root,
+}
+
+/// Région souveraine : ce que ce relais sait de l'époque en cours.
+struct Sovereign {
+    sov: proto::Sov,
+    /// Ce relais est l'hôte principal.
+    primary: bool,
+    /// Clé de l'hôte principal.
+    primary_key: Option<ed25519_dalek::VerifyingKey>,
+    /// Vérifie ce que publie l'hôte principal (chez lui : admet et scelle).
+    checker: Checker,
+    /// Hôte principal : modifications admises, pas encore scellées en lot, et depuis quand.
+    pending: Vec<Edit>,
+    pending_since: Option<Instant>,
+    /// Lots de l'époque (publiés ou vérifiés), avec leur heure.
+    recent: VecDeque<(Instant, Batch)>,
+    /// Lots arrivés en avance, par premier rang.
+    early: BTreeMap<u64, Batch>,
+    /// Une faute prouvée a été vue chez l'hôte principal : plus rien n'est suivi de lui.
+    faulty: bool,
+    /// Ce relais confirme au relais du monde ce qu'il vérifie (deux relais suffisent).
+    acks: bool,
+    /// Dernière fois que des lots manquants ont été redemandés à l'hôte principal.
+    asked: Option<Instant>,
+}
+
+/// Lots arrivés avant que ce relais connaisse leur époque, gardés au plus.
+const ORPHANS_MAX: usize = 256;
+/// Des lots manquent : redemandés au plus une fois par ce temps.
+const RESEND_EVERY: Duration = Duration::from_millis(500);
 
 /// Comment joindre un autre relais de la région (directement ou par un tunnel).
 pub type Dial = Arc<dyn Fn(&proto::ShardInfo) -> Resolver + Send + Sync>;
@@ -72,27 +129,277 @@ struct State {
     slot: u16,
     peers: HashMap<u16, PeerOut>,
     dial: Option<Dial>,
+    /// Clé du relais du monde, et clé du compte de l'hôte (il signe ce qu'il publie).
+    root: [u8; 32],
+    signer: Option<ed25519_dalek::SigningKey>,
+    /// Certificats des joueurs entrés ici (pseudo en minuscules).
+    certs: HashMap<String, Cert>,
+    sovereign: Option<Sovereign>,
+    /// Lots de l'hôte principal arrivés avant que ce relais connaisse leur époque (le
+    /// lien entre relais peut devancer l'annonce du relais du monde).
+    orphans: Vec<Batch>,
+    /// Rang de la dernière modification transmise pour chaque case : la même, arrivée
+    /// par un autre chemin (relais du monde, hôte principal), n'est transmise qu'une fois.
+    cells: HashMap<[i32; 3], u64>,
+    /// Messages pour le relais du monde (par la connexion de l'hôte, voir `take_outbox`).
+    outbox: Vec<Request>,
+    /// Essais : le prochain lot scellé comme hôte principal contiendra une modification
+    /// inventée (voir `ShardHandle::forge_once`).
+    forge: bool,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 impl State {
     /// Une modification publiée par le relais du monde (dans son ordre) : gardée pour ceux
     /// qui arriveront, et transmise aux joueurs de ce relais proches de là.
     fn deliver(&mut self, set: &[u8]) {
+        if let Some(BuildMsg::Set {
+            pos,
+            block,
+            by,
+            seq,
+        }) = game::decode::<BuildMsg>(set)
+        {
+            self.deliver_set(pos, block, &by, seq);
+        }
+    }
+
+    /// Transmet une modification (si elle est nouvelle pour cette case) aux joueurs de ce
+    /// relais proches de là, et à son auteur s'il est ici (c'est sa confirmation).
+    fn deliver_set(&mut self, pos: [i32; 3], block: u16, by: &str, seq: u64) {
         // Seulement des blocs de cette région (objets et coffres ne passent que par le
         // relais du monde).
-        let Some(BuildMsg::Set { pos, .. }) = game::decode::<BuildMsg>(set) else {
-            return;
-        };
         let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
         if proto::region_of(chunk) != self.region {
             return;
         }
-        let to = self.build.listeners(chunk, u64::MAX);
-        for (m, items) in self.build.mirror_to(proto::zone_of(chunk), set, &to) {
+        if self.cells.get(&pos).is_some_and(|s| *s >= seq) {
+            return;
+        }
+        self.cells.insert(pos, seq);
+        let set = game::encode(&BuildMsg::Set {
+            pos,
+            block,
+            by: by.to_string(),
+            seq,
+        });
+        let mut to = self.build.listeners(chunk, u64::MAX);
+        if !by.is_empty() {
+            let author = self
+                .conns
+                .iter()
+                .find(|(_, c)| {
+                    !c.peer
+                        && c.pseudo
+                            .as_deref()
+                            .is_some_and(|p| p.eq_ignore_ascii_case(by))
+                })
+                .map(|(&id, _)| id);
+            if let Some(a) = author.filter(|a| !to.contains(a)) {
+                to.push(a);
+            }
+        }
+        for (m, items) in self.build.mirror_to(proto::zone_of(chunk), &set, &to) {
             if let Some(c) = self.conns.get(&m) {
                 for data in items {
                     crate::push_zone(&c.tx, chunk, data);
                 }
+            }
+        }
+    }
+
+    /// Refus d'une modification : à son auteur (ici ou chez un autre relais).
+    fn refuse(&self, from: From, pseudo: &str, pos: [i32; 3]) {
+        let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
+        match from {
+            From::Local(id) => {
+                if let Some(c) = self.conns.get(&id) {
+                    transport::push(
+                        &c.tx,
+                        &Response::FromZone {
+                            peer: 0,
+                            chunk,
+                            data: game::encode(&BuildMsg::Reject { pos, peer: id }),
+                        },
+                    );
+                }
+            }
+            From::Peer(slot) => {
+                if let Some(l) = self.peers.get(&slot).and_then(|p| p.link.as_ref()) {
+                    transport::push(
+                        l,
+                        &Request::PeerReject {
+                            pseudo: pseudo.to_string(),
+                            pos,
+                        },
+                    );
+                }
+            }
+            From::Root => {}
+        }
+    }
+
+    /// Hôte principal : une modification signée à accepter (ou à refuser).
+    fn admit(&mut self, edit: Edit, cert: Option<Cert>, from: From) {
+        let Some(sv) = self.sovereign.as_mut().filter(|s| s.primary && !s.faulty) else {
+            self.refuse(from, &edit.pseudo, edit.pos);
+            return;
+        };
+        let cert = cert.or_else(|| self.certs.get(&edit.pseudo.to_ascii_lowercase()).cloned());
+        if let Err(why) = sv.checker.admit(&edit, cert.as_ref(), now_ms()) {
+            log::debug!("relais de région : modification refusée : {why}");
+            self.refuse(from, &edit.pseudo, edit.pos);
+            return;
+        }
+        let seq = sv.checker.next + sv.pending.len() as u64;
+        sv.pending.push(edit.clone());
+        sv.pending_since.get_or_insert_with(Instant::now);
+        self.deliver_set(edit.pos, edit.block, &edit.pseudo, seq);
+    }
+
+    /// Hôte principal : scelle et publie ce qui attend (aux autres relais de la région, et
+    /// au relais du monde pour l'archive).
+    fn flush(&mut self, force: bool) {
+        let Some(signer) = self.signer.clone() else {
+            return;
+        };
+        let region = self.region;
+        let Some(sv) = self
+            .sovereign
+            .as_mut()
+            .filter(|s| s.primary && !s.pending.is_empty())
+        else {
+            return;
+        };
+        let due = sv.pending_since.is_some_and(|t| t.elapsed() >= BATCH_WAIT);
+        if !(force || due || sv.pending.len() >= BATCH_MAX) {
+            return;
+        }
+        let mut edits = std::mem::take(&mut sv.pending);
+        sv.pending_since = None;
+        // (Essais : un hôte malveillant ajoute une modification inventée au nom d'un
+        // joueur, et la montre aux siens.)
+        let mut forged = None;
+        if std::mem::take(&mut self.forge) {
+            let e = &edits[0];
+            let liar = ed25519_dalek::SigningKey::from_bytes(&[0x66; 32]);
+            let pos = [e.pos[0], e.pos[1] + 7, e.pos[2]];
+            let fake = Edit::sign(&liar, self.room, &e.pseudo, pos, 1, false, e.at, e.t, false);
+            forged = Some((pos, e.pseudo.clone(), sv.checker.next + edits.len() as u64));
+            edits.push(fake);
+        }
+        let batch = sv.checker.seal(edits, &signer);
+        if let Some((pos, by, seq)) = forged {
+            self.deliver_set(pos, 1, &by, seq);
+        }
+        let Some(sv) = self.sovereign.as_mut() else {
+            return;
+        };
+        sv.recent.push_back((Instant::now(), batch.clone()));
+        if let Some(msg) = transport::encode(&Request::PeerBatch {
+            batch: batch.clone(),
+        }) {
+            for l in self.peers.values().filter_map(|p| p.link.as_ref()) {
+                transport::push_raw(l, msg.clone());
+            }
+        }
+        self.outbox.push(Request::Archive { region, batch });
+    }
+
+    /// Autre relais d'une région souveraine : un lot de l'hôte principal, à vérifier.
+    fn follow(&mut self, batch: Batch) {
+        let region = self.region;
+        // (Époque pas encore annoncée ici : le lot attend.)
+        let known = self
+            .sovereign
+            .as_ref()
+            .is_some_and(|sv| batch.epoch <= sv.sov.epoch);
+        if !known {
+            if self.orphans.len() < ORPHANS_MAX {
+                self.orphans.push(batch);
+            }
+            return;
+        }
+        let Some(sv) = self.sovereign.as_mut() else {
+            return;
+        };
+        if sv.primary || sv.faulty || batch.epoch != sv.sov.epoch {
+            return;
+        }
+        let Some(key) = sv.primary_key else { return };
+        if batch.first > sv.checker.next {
+            if sv.early.len() < EARLY_MAX {
+                sv.early.insert(batch.first, batch);
+            }
+            // Il en manque avant : redemandés à l'hôte principal.
+            if sv.asked.is_none_or(|t| t.elapsed() >= RESEND_EVERY) {
+                sv.asked = Some(Instant::now());
+                let from = sv.checker.next;
+                let primary = sv.sov.primary;
+                if let Some(l) = self.peers.get(&primary).and_then(|p| p.link.as_ref()) {
+                    transport::push(l, &Request::PeerResend { from });
+                }
+            }
+            return;
+        }
+        let mut queue = vec![batch];
+        while let Some(b) = queue.pop() {
+            let sv = self.sovereign.as_mut().expect("souveraine");
+            match sv.checker.check(b.clone(), &key) {
+                Ok(true) => {
+                    let (epoch, seq, chain) = (sv.sov.epoch, sv.checker.next, sv.checker.chain);
+                    if sv.acks {
+                        self.outbox.push(Request::Ack {
+                            region,
+                            epoch,
+                            seq,
+                            chain,
+                        });
+                    }
+                    let sv = self.sovereign.as_mut().expect("souveraine");
+                    sv.recent.push_back((Instant::now(), b.clone()));
+                    if let Some(next) = sv.early.remove(&sv.checker.next) {
+                        queue.push(next);
+                    }
+                    for r in b.records {
+                        self.deliver_set(r.edit.pos, r.edit.block, &r.edit.pseudo, r.seq);
+                    }
+                }
+                Ok(false) => {}
+                Err(fault) => {
+                    log::warn!(
+                        "relais de région {region:?} : faute de l'hôte principal : {}",
+                        fault.why
+                    );
+                    sv.faulty = true;
+                    let epoch = sv.sov.epoch;
+                    self.outbox.push(Request::Accuse {
+                        region,
+                        epoch,
+                        why: fault.why,
+                        evidence: fault.evidence.iter().map(|b| (**b).clone()).collect(),
+                    });
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Fin d'une époque : les lots vérifiés partent au relais du monde (rien ne se perd).
+    fn hand_over(&mut self) {
+        if let Some(sv) = self.sovereign.take() {
+            let batches: Vec<Batch> = sv.recent.into_iter().map(|(_, b)| b).collect();
+            if !batches.is_empty() && !sv.faulty {
+                self.outbox.push(Request::Handover {
+                    region: self.region,
+                    epoch: sv.sov.epoch,
+                    batches,
+                });
             }
         }
     }
@@ -113,6 +420,7 @@ impl State {
             mac: proto::shard_mac(&self.secret, self.room, &pseudo, expires),
             pseudo,
             expires,
+            cert: None,
         });
         client
     }
@@ -143,16 +451,55 @@ impl ShardHandle {
             Some(BuildMsg::Cells(packet)) => {
                 let cells = minelib_net::cells::unpack_cells(&packet).unwrap_or_default();
                 for (pos, block, seq) in cells {
-                    st.deliver(&game::encode(&BuildMsg::Set {
-                        pos,
-                        block,
-                        by: String::new(),
-                        seq,
-                    }));
+                    st.deliver_set(pos, block, "", seq);
                 }
             }
             _ => st.deliver(data),
         }
+    }
+
+    /// Du relais du monde, à l'hôte principal d'une région souveraine : modifications
+    /// signées par lui à la place de leurs auteurs.
+    pub fn root_edits(&self, edits: Vec<Edit>) {
+        let mut st = self.state.lock().unwrap();
+        for e in edits {
+            st.admit(e, None, From::Root);
+        }
+    }
+
+    /// Messages pour le relais du monde (lots à archiver, confirmations, accusations,
+    /// passations), à envoyer par la connexion de l'hôte.
+    pub fn take_outbox(&self) -> Vec<Request> {
+        std::mem::take(&mut self.state.lock().unwrap().outbox)
+    }
+
+    /// Clé du compte de l'hôte (il signe ce qu'il publie comme hôte principal).
+    pub fn set_signer(&self, key: ed25519_dalek::SigningKey) {
+        self.state.lock().unwrap().signer = Some(key);
+    }
+
+    /// Région souveraine : ce relais en est-il l'hôte principal ?
+    pub fn is_primary(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.sovereign.as_ref().is_some_and(|s| s.primary)
+    }
+
+    /// Région souveraine : modifications mises en ordre dans l'époque en cours (scellées
+    /// comme hôte principal, ou vérifiées).
+    pub fn ordered(&self) -> u64 {
+        let st = self.state.lock().unwrap();
+        st.sovereign
+            .as_ref()
+            .map_or(0, |s| s.checker.next.saturating_sub(s.sov.first))
+    }
+
+    /// Essais seulement : comme hôte principal, le prochain lot contiendra une
+    /// modification inventée au nom d'un joueur (mal signée), montrée aux joueurs de ce
+    /// relais. Les autres relais de la région doivent la voir, l'accuser, et le relais du
+    /// monde écarter cet hôte.
+    #[doc(hidden)]
+    pub fn forge_once(&self) {
+        self.state.lock().unwrap().forge = true;
     }
 
     /// Joueurs entrés dans ce relais.
@@ -176,8 +523,9 @@ impl ShardHandle {
     }
 
     /// Relais prêts de la région (liste du relais du monde, celui-ci compris) : ce relais
-    /// se relie aux autres et quitte ceux qui sont partis.
-    pub fn set_peers(&self, list: &[proto::ShardInfo]) {
+    /// se relie aux autres et quitte ceux qui sont partis. `sov` : l'époque en cours si la
+    /// région est souveraine.
+    pub fn set_peers(&self, list: &[proto::ShardInfo], sov: Option<proto::Sov>) {
         let mut st = self.state.lock().unwrap();
         let (region, slot) = (st.region, st.slot);
         let others: Vec<&proto::ShardInfo> = list
@@ -185,7 +533,7 @@ impl ShardHandle {
             .filter(|i| i.region == region && i.slot != slot)
             .collect();
         st.peers
-            .retain(|s, p| others.iter().any(|i| i.slot == *s && **i == p.info));
+            .retain(|s, p| others.iter().any(|i| i.slot == *s && i.same_relay(&p.info)));
         for info in others {
             if !st.peers.contains_key(&info.slot) {
                 let client = st.connect(info);
@@ -200,16 +548,103 @@ impl ShardHandle {
                 );
             }
         }
+        // Époque : la même continue ; une autre (ou plus de souveraineté) : passation.
+        let same = match (&st.sovereign, &sov) {
+            (Some(cur), Some(new)) => cur.sov.epoch == new.epoch,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        if st.sovereign.is_some() {
+            if st.sovereign.as_ref().is_some_and(|s| s.primary) {
+                st.flush(true);
+            }
+            st.hand_over();
+        }
+        let Some(sov) = sov else { return };
+        let primary_key = list
+            .iter()
+            .find(|i| i.region == region && i.slot == sov.primary)
+            .and_then(|i| ed25519_dalek::VerifyingKey::from_bytes(&i.signer).ok());
+        // Deux relais confirment ce qu'ils vérifient : les deux plus petits rangs après
+        // l'hôte principal.
+        let mut witnesses: Vec<u16> = list
+            .iter()
+            .filter(|i| i.region == region && i.slot != sov.primary)
+            .map(|i| i.slot)
+            .collect();
+        witnesses.sort_unstable();
+        let acks = witnesses.iter().take(2).any(|&s| s == slot);
+        let rules = sovereign::Rules {
+            room: st.room,
+            region,
+            root: st.root,
+            floor_t: sov.floor_t,
+        };
+        let mut checker = Checker::new(rules, sov.epoch, sov.base, sov.chain);
+        for c in st.certs.values() {
+            checker.learn(c);
+        }
+        log::info!(
+            "relais {slot} de la région {region:?} : époque souveraine {} ({})",
+            sov.epoch,
+            if sov.primary == slot {
+                "hôte principal"
+            } else {
+                "vérifie l'hôte principal"
+            }
+        );
+        st.sovereign = Some(Sovereign {
+            primary: sov.primary == slot,
+            sov,
+            primary_key,
+            checker,
+            pending: Vec::new(),
+            pending_since: None,
+            recent: VecDeque::new(),
+            early: BTreeMap::new(),
+            faulty: false,
+            acks,
+            asked: None,
+        });
+        // Les lots de cette époque arrivés avant son annonce.
+        let epoch = st.sovereign.as_ref().map_or(0, |s| s.sov.epoch);
+        let orphans = std::mem::take(&mut st.orphans);
+        let (now, later): (Vec<Batch>, Vec<Batch>) =
+            orphans.into_iter().partition(|b| b.epoch == epoch);
+        st.orphans = later.into_iter().filter(|b| b.epoch > epoch).collect();
+        let mut now = now;
+        now.sort_by_key(|b| b.first);
+        for b in now {
+            st.follow(b);
+        }
     }
 
     /// À appeler régulièrement : liens vers les autres relais (prêts, cassés, retentés).
     pub fn tick(&self) {
         let mut st = self.state.lock().unwrap();
+        st.flush(false);
+        // Lots trop vieux : plus gardés.
+        if let Some(sv) = st.sovereign.as_mut() {
+            while sv
+                .recent
+                .front()
+                .is_some_and(|(t, _)| t.elapsed() > KEEP_BATCHES)
+            {
+                sv.recent.pop_front();
+            }
+        }
         let mut retry = Vec::new();
+        let mut linked = Vec::new();
         for (&slot, p) in &mut st.peers {
             while let Some(e) = p.client.poll() {
                 match e {
-                    Event::Link(l) => p.link = Some(l),
+                    Event::Link(l) => {
+                        p.link = Some(l);
+                        linked.push(slot);
+                    }
                     Event::Error(m) | Event::Offline(m) => {
                         log::info!("relais de région : lien vers le relais {slot} : {m}");
                         p.link = None;
@@ -233,6 +668,21 @@ impl ShardHandle {
                 p.client = client;
                 p.link = None;
                 p.broken = None;
+            }
+        }
+        // Hôte principal : un relais qui vient d'être relié reçoit les lots récents (il
+        // vérifie à partir de ce que le relais du monde a archivé, et ignore le reste).
+        let recent: Vec<Batch> = st
+            .sovereign
+            .as_ref()
+            .filter(|s| s.primary)
+            .map(|s| s.recent.iter().map(|(_, b)| b.clone()).collect())
+            .unwrap_or_default();
+        for slot in linked {
+            if let Some(l) = st.peers.get(&slot).and_then(|p| p.link.clone()) {
+                for b in &recent {
+                    transport::push(&l, &Request::PeerBatch { batch: b.clone() });
+                }
             }
         }
     }
@@ -261,6 +711,7 @@ pub fn start(
     region: [i32; 2],
     secret: [u8; 32],
     slot: u16,
+    root: [u8; 32],
 ) -> Result<ShardHandle> {
     let listener = TcpListener::bind(bind)?;
     let addr = listener.local_addr()?;
@@ -277,6 +728,14 @@ pub fn start(
         slot,
         peers: HashMap::new(),
         dial: None,
+        root,
+        signer: None,
+        certs: HashMap::new(),
+        sovereign: None,
+        orphans: Vec::new(),
+        cells: HashMap::new(),
+        outbox: Vec::new(),
+        forge: false,
     }));
     let st = state.clone();
     std::thread::Builder::new()
@@ -344,6 +803,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>, private: &[u8; 32]) -> Result<
                 tx: chan.pusher(),
                 pseudo: None,
                 peer: false,
+                slot: None,
             },
         );
         id
@@ -395,6 +855,7 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             pseudo,
             expires,
             mac,
+            cert,
         } => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -409,7 +870,21 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
                 // Un autre relais de la région : son nom ne peut pas être celui d'un
                 // joueur, et seul un hôte de ce monde a pu le signer.
                 c.peer = pseudo.starts_with('#');
+                c.slot = pseudo
+                    .strip_prefix("#relais")
+                    .and_then(|n| n.parse::<u16>().ok());
                 c.pseudo = Some(pseudo.clone());
+            }
+            // Certificat de la clé du compte (signé par le relais du monde) : ses
+            // modifications signées seront reconnues.
+            let root = ed25519_dalek::VerifyingKey::from_bytes(&st.root).ok();
+            if let Some(cert) = cert.filter(|c| {
+                c.pseudo.eq_ignore_ascii_case(&pseudo) && root.is_some_and(|k| c.valid(&k, room))
+            }) {
+                if let Some(sv) = st.sovereign.as_mut() {
+                    sv.checker.learn(&cert);
+                }
+                st.certs.insert(pseudo.to_ascii_lowercase(), cert);
             }
             Some(Response::Welcome {
                 pseudo,
@@ -438,7 +913,69 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             }
             None
         }
-        Request::PeerNearby { .. } | Request::PeerToZone { .. } | Request::PeerEdit { .. } => None,
+        // D'un autre relais : la modification signée d'un de ses joueurs (ce relais est
+        // l'hôte principal).
+        Request::PeerAsk { edit, cert } if peer => {
+            let from = st.conns.get(&id).and_then(|c| c.slot);
+            if let Some(slot) = from {
+                st.admit(edit, cert, From::Peer(slot));
+            }
+            None
+        }
+        // De l'hôte principal : un lot à vérifier.
+        Request::PeerBatch { batch } if peer => {
+            st.follow(batch);
+            None
+        }
+        // D'un autre relais : des lots lui manquent (ce relais est l'hôte principal).
+        Request::PeerResend { from } if peer => {
+            let slot = st.conns.get(&id).and_then(|c| c.slot);
+            let batches: Vec<Batch> = st
+                .sovereign
+                .as_ref()
+                .filter(|s| s.primary)
+                .map(|s| {
+                    s.recent
+                        .iter()
+                        .map(|(_, b)| b)
+                        .filter(|b| b.end() > from)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let link = slot
+                .and_then(|s| st.peers.get(&s))
+                .and_then(|p| p.link.clone());
+            if let Some(l) = link {
+                for batch in batches {
+                    transport::push(&l, &Request::PeerBatch { batch });
+                }
+            }
+            None
+        }
+        // De l'hôte principal : la modification d'un joueur d'ici est refusée.
+        Request::PeerReject { pseudo, pos } if peer => {
+            let ids: Vec<u64> = st
+                .conns
+                .iter()
+                .filter(|(_, c)| {
+                    !c.peer
+                        && c.pseudo
+                            .as_deref()
+                            .is_some_and(|p| p.eq_ignore_ascii_case(&pseudo))
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            for i in ids {
+                st.refuse(From::Local(i), &pseudo, pos);
+            }
+            None
+        }
+        Request::PeerNearby { .. }
+        | Request::PeerAsk { .. }
+        | Request::PeerBatch { .. }
+        | Request::PeerReject { .. }
+        | Request::PeerResend { .. } => None,
         _ if peer => None,
         Request::Position { chunk } => {
             let logs = st.build.moved(id, chunk, &|_| true);
@@ -494,20 +1031,37 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             }
             None
         }
-        // Les modifications ne passent pas par ici : seul le relais du monde les accepte.
-        // Une demande arrivée quand même (jeu modifié) est refusée à son auteur.
-        Request::ToZone { chunk, data } => {
-            if let Some(BuildMsg::Edit { pos, .. }) = game::decode::<BuildMsg>(&data) {
-                if let Some(c) = st.conns.get(&id) {
-                    transport::push(
-                        &c.tx,
-                        &Response::FromZone {
-                            peer: 0,
-                            chunk,
-                            data: game::encode(&BuildMsg::Reject { pos, peer: id }),
-                        },
-                    );
+        // Région souveraine : une modification signée par son auteur (l'hôte principal
+        // l'accepte ; un autre relais la lui passe). Région ordinaire : les modifications
+        // vont au relais du monde, une demande arrivée ici quand même est refusée.
+        Request::ToZone { data, .. } => {
+            let me = logged.unwrap_or_default();
+            match game::decode::<BuildMsg>(&data) {
+                Some(BuildMsg::Signed(edit)) if edit.pseudo.eq_ignore_ascii_case(&me) => {
+                    let (primary, faulty, primary_slot) = match &st.sovereign {
+                        Some(sv) => (sv.primary, sv.faulty, Some(sv.sov.primary)),
+                        None => (false, true, None),
+                    };
+                    if faulty {
+                        st.refuse(From::Local(id), &edit.pseudo, edit.pos);
+                    } else if primary {
+                        st.admit(edit, None, From::Local(id));
+                    } else {
+                        let cert = st.certs.get(&me.to_ascii_lowercase()).cloned();
+                        let link = primary_slot
+                            .and_then(|s| st.peers.get(&s))
+                            .and_then(|p| p.link.clone());
+                        match link {
+                            Some(l) => {
+                                transport::push(&l, &Request::PeerAsk { edit, cert });
+                            }
+                            None => st.refuse(From::Local(id), &edit.pseudo, edit.pos),
+                        }
+                    }
                 }
+                Some(BuildMsg::Signed(edit)) => st.refuse(From::Local(id), &me, edit.pos),
+                Some(BuildMsg::Edit { pos, .. }) => st.refuse(From::Local(id), &me, pos),
+                _ => {}
             }
             None
         }

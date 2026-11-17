@@ -39,12 +39,14 @@ pub enum Cmd {
         /// Jeton d'appareil de confiance pour ce compte (pas de 2FA).
         device: Option<[u8; 32]>,
     },
-    /// Entre dans un relais de région avec le billet du relais du monde.
+    /// Entre dans un relais de région avec le billet du relais du monde (et le certificat
+    /// de la clé du compte, voir `crate::sovereign`).
     ShardLogin {
         room: u64,
         pseudo: String,
         expires: u64,
         mac: [u8; 32],
+        cert: Option<crate::sovereign::Cert>,
     },
     TotpBegin,
     TotpConfirm(u32),
@@ -295,12 +297,24 @@ pub enum Event {
         region: [i32; 2],
         secret: [u8; 32],
         slot: u16,
+        root: [u8; 32],
     },
-    /// Hôte d'un relais de région : les relais prêts de sa région.
+    /// Hôte d'un relais de région : les relais prêts de sa région, et son époque si elle
+    /// est souveraine.
     ShardPeers {
         region: [i32; 2],
         list: Vec<proto::ShardInfo>,
+        sov: Option<proto::Sov>,
     },
+    /// Hôte principal d'une région souveraine : modifications signées par le relais du
+    /// monde à la place de leurs auteurs.
+    RootEdits {
+        region: [i32; 2],
+        edits: Vec<crate::sovereign::Edit>,
+    },
+    /// Clé du compte, une fois connecté (pour signer ses modifications dans une région
+    /// souveraine, ou ce qu'on y publie comme hôte principal).
+    Identity(ed25519_dalek::SigningKey),
     /// Relais des régions du monde.
     Shards(Vec<proto::ShardInfo>),
     /// Billet pour les relais de région.
@@ -309,6 +323,7 @@ pub enum Event {
         pseudo: String,
         expires: u64,
         mac: [u8; 32],
+        cert: Option<crate::sovereign::Cert>,
     },
     BackupIs(u64),
     Judge {
@@ -663,24 +678,29 @@ impl Worker {
                 region,
                 secret,
                 slot,
+                root,
             } => Event::ShardTask {
                 room,
                 region,
                 secret,
                 slot,
+                root,
             },
-            Response::ShardPeers { region, list } => Event::ShardPeers { region, list },
+            Response::ShardPeers { region, list, sov } => Event::ShardPeers { region, list, sov },
+            Response::RootEdits { region, edits } => Event::RootEdits { region, edits },
             Response::Shards { list } => Event::Shards(list),
             Response::ShardTicket {
                 room,
                 pseudo,
                 expires,
                 mac,
+                cert,
             } => Event::ShardTicket {
                 room,
                 pseudo,
                 expires,
                 mac,
+                cert,
             },
             Response::FromZone { peer, chunk, data } => Event::FromZone { peer, chunk, data },
             // Banni pendant la session : déconnecté.
@@ -842,6 +862,7 @@ impl Worker {
                 pseudo,
                 expires,
                 mac,
+                cert,
             } => {
                 self.chan = None;
                 self.connect()?;
@@ -850,6 +871,7 @@ impl Worker {
                     pseudo,
                     expires,
                     mac,
+                    cert,
                 })? {
                     Response::Welcome { pseudo, .. } => {
                         self.pseudo = pseudo.clone();
@@ -1316,6 +1338,7 @@ impl Worker {
         match self.request(&Request::Prove { signature })? {
             Response::Welcome { pseudo, totp } => {
                 self.pseudo = pseudo.clone();
+                self.emit(Event::Identity(id.clone()));
                 if let Some(c) = &self.chan {
                     self.emit(Event::Link(c.pusher()));
                 }

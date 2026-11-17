@@ -2312,7 +2312,8 @@ impl Session {
                     pseudo,
                     expires,
                     mac,
-                } => b.set_ticket(*room, pseudo.clone(), *expires, *mac),
+                    cert,
+                } => b.set_ticket(*room, pseudo.clone(), *expires, *mac, cert.clone()),
                 // WorldEdit refusé (pas OP) : les blocs reviennent.
                 // Arrivée sur le serveur : là où l'on était (gardé par le relais).
                 Event::BuildSpawn { pos, yaw, pitch } => {

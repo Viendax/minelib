@@ -131,6 +131,10 @@ struct Pending {
     old: BlockId,
     count: u32,
     age: f32,
+    /// Dernière modification de cette case partie signée au relais d'une région
+    /// souveraine (bloc, fluide) : refusée par ce relais ou sans réponse, elle repart une
+    /// fois au relais du monde (voir `retry_at_root`).
+    signed: Option<(u16, bool)>,
 }
 
 pub struct BuildNet {
@@ -145,14 +149,28 @@ pub struct BuildNet {
     chunk: Option<[i32; 2]>,
     pos_timer: f32,
     /// Rang (ordre du relais du monde) de la dernière modification appliquée à chaque
-    /// case, et relais de région qui l'a remise (aucun : le relais du monde). Une
-    /// modification plus ancienne arrivée après (doublon, autre chemin) est sans effet.
-    seen: HashMap<[i32; 3], (u64, Option<[i32; 2]>)>,
+    /// case, et relais de région qui l'a remise (son numéro de connexion ; aucun : le
+    /// relais du monde). Une modification plus ancienne arrivée après (doublon, autre
+    /// chemin) est sans effet.
+    seen: HashMap<[i32; 3], (u64, Option<u64>)>,
     /// Pseudo de chaque joueur dont un relais envoie les positions par son numéro :
     /// (relais de région qui le dit, aucun pour le relais du monde ; numéro) → pseudo.
-    names: HashMap<(Option<[i32; 2]>, u64), String>,
+    names: HashMap<(Option<u64>, u64), String>,
+    /// Blocs remis par chaque relais de région (numéro de connexion) que le relais du
+    /// monde n'a pas encore confirmés.
+    heard: HashMap<u64, HashMap<[i32; 3], Heard>>,
+    /// Ceux d'un relais quitté, et le temps qu'il leur reste : ce que le relais du monde
+    /// n'a pas confirmé d'ici là revient comme avant (voir `forget_shard`).
+    doubtful: HashMap<[i32; 3], (Heard, f32)>,
+    /// Blocs défaits ainsi (essais).
+    #[cfg(test)]
+    undone: usize,
     /// Régions annoncées au relais du monde comme servies par un relais de région.
     served_sent: Vec<[i32; 2]>,
+    /// Clé du compte (modifications signées dans une région souveraine), et date de la
+    /// dernière signature.
+    identity: Option<minelib_net::ed25519_dalek::SigningKey>,
+    sign_t: u64,
     caps_sent: bool,
     pending: HashMap<[i32; 3], Pending>,
     shards: Shards,
@@ -163,17 +181,35 @@ pub struct BuildNet {
     /// États d'objets (au sol, coffres) et refus reçus du relais du monde, à traiter par
     /// la partie (voir `crate::drops`).
     pub item_inbox: Vec<BuildMsg>,
-    /// Message en cours de traitement venu du relais de cette région (tenu par un
-    /// joueur) : seul le relais du monde arbitre les objets, on n'en accepte pas d'ailleurs.
-    from_shard: Option<[i32; 2]>,
+    /// Message en cours de traitement venu d'un relais de région (tenu par un joueur ; son
+    /// numéro de connexion) : seul le relais du monde arbitre les objets, on n'en accepte
+    /// pas d'ailleurs.
+    from_shard: Option<u64>,
 }
+
+/// Bloc remis par un relais de région : celui d'avant, celui remis, son rang ; et si
+/// c'était la confirmation d'une modification du joueur (fluide ou non).
+#[derive(Clone, Copy, Debug)]
+struct Heard {
+    pre: BlockId,
+    got: BlockId,
+    seq: u64,
+    mine: Option<bool>,
+}
+
+/// Blocs non confirmés gardés par relais de région (au-delà, ils ne pourront pas être
+/// défaits).
+const HEARD_MAX: usize = 1 << 17;
+/// Temps laissé au relais du monde pour confirmer les blocs d'un relais de région quitté
+/// (secondes) : il renvoie alors tout ce qui manque de la région.
+const DOUBT_WAIT: f32 = 3.0;
 
 /// Relais de région (voir `minelib_relay::shard`) : la liste reçue du relais du monde, le
 /// billet pour y entrer, et une connexion à chaque région en vue. Chaque message part au
 /// relais de la région qu'il concerne ; une région sans relais passe par le relais du monde.
 #[derive(Default)]
 struct Shards {
-    ticket: Option<(u64, String, u64, [u8; 32])>,
+    ticket: Option<Ticket>,
     /// Relais de chaque région (plusieurs quand elle est très peuplée : on n'entre que
     /// dans le sien, `proto::shard_for`).
     list: HashMap<[i32; 2], Vec<proto::ShardInfo>>,
@@ -181,9 +217,23 @@ struct Shards {
     conns: HashMap<[i32; 2], ShardConn>,
     /// Dossier du nœud iroh (tunnel vers un relais de région hors du réseau local).
     node_dir: Option<std::path::PathBuf>,
+    /// Dernier numéro de connexion donné.
+    serial: u64,
 }
 
+/// Billet pour les relais de région : monde, pseudo, fin de validité, sceau, et
+/// certificat de la clé du compte.
+type Ticket = (
+    u64,
+    String,
+    u64,
+    [u8; 32],
+    Option<minelib_net::sovereign::Cert>,
+);
+
 struct ShardConn {
+    /// Numéro de cette connexion (un autre relais de la même région en aura un autre).
+    serial: u64,
     info: proto::ShardInfo,
     client: Client,
     link: Option<Sender<Inbound>>,
@@ -204,10 +254,19 @@ impl Shards {
             |r: [i32; 2]| (lo[0]..=hi[0]).contains(&r[0]) && (lo[1]..=hi[1]).contains(&r[1]);
         let me = self.pseudo.clone();
         let mine = |list: &Vec<proto::ShardInfo>| proto::shard_for(list, &me).cloned();
+        // (Le même relais dont seule l'époque a changé : on y reste.)
         self.conns.retain(|r, c| {
-            in_view(*r) && self.list.get(r).and_then(&mine).as_ref() == Some(&c.info)
+            let Some(i) = self.list.get(r).and_then(&mine) else {
+                return false;
+            };
+            if !in_view(*r) || !i.same_relay(&c.info) {
+                return false;
+            }
+            // (Une modification n'y part signée que pendant une époque souveraine.)
+            c.info.epoch = i.epoch;
+            true
         });
-        let Some((room, pseudo, expires, mac)) = self.ticket.clone() else {
+        let Some((room, pseudo, expires, mac, cert)) = self.ticket.clone() else {
             return;
         };
         for (region, list) in &self.list {
@@ -242,10 +301,13 @@ impl Shards {
                 pseudo: pseudo.clone(),
                 expires,
                 mac,
+                cert: cert.clone(),
             });
+            self.serial += 1;
             self.conns.insert(
                 *region,
                 ShardConn {
+                    serial: self.serial,
                     info: info.clone(),
                     client,
                     link: None,
@@ -277,10 +339,16 @@ impl BuildNet {
             seen: HashMap::new(),
             names: HashMap::new(),
             served_sent: Vec::new(),
+            identity: None,
+            sign_t: 0,
             caps_sent: false,
             pending: HashMap::new(),
             item_inbox: Vec::new(),
             from_shard: None,
+            heard: HashMap::new(),
+            doubtful: HashMap::new(),
+            #[cfg(test)]
+            undone: 0,
             bulks: HashMap::new(),
             next_bulk: 0,
             shards: Shards::default(),
@@ -301,10 +369,89 @@ impl BuildNet {
         }
     }
 
-    /// Billet pour les relais de région.
-    pub fn set_ticket(&mut self, room: u64, pseudo: String, expires: u64, mac: [u8; 32]) {
+    /// Billet pour les relais de région, et certificat de la clé du compte.
+    pub fn set_ticket(
+        &mut self,
+        room: u64,
+        pseudo: String,
+        expires: u64,
+        mac: [u8; 32],
+        cert: Option<minelib_net::sovereign::Cert>,
+    ) {
         self.shards.pseudo = pseudo.clone();
-        self.shards.ticket = Some((room, pseudo, expires, mac));
+        self.shards.ticket = Some((room, pseudo, expires, mac, cert));
+    }
+
+    /// Clé du compte : signe ses modifications dans une région souveraine.
+    pub fn set_identity(&mut self, key: Option<minelib_net::ed25519_dalek::SigningKey>) {
+        self.identity = key;
+    }
+
+    /// Région souveraine dont on a le relais : la modification y part signée (son hôte
+    /// principal la met en ordre). Renvoie faux s'il faut passer par le relais du monde.
+    fn send_signed(&mut self, pos: [i32; 3], block: u16, fluid: bool, at: [i32; 2]) -> bool {
+        let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
+        let region = proto::region_of(chunk);
+        let sovereign = self
+            .shards
+            .conns
+            .get(&region)
+            .is_some_and(|c| c.info.epoch > 0 && c.link.is_some());
+        let (Some(key), Some((room, ..))) = (&self.identity, &self.shards.ticket) else {
+            return false;
+        };
+        if !sovereign {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        // Dates strictement croissantes (deux modifications dans la même milliseconde).
+        self.sign_t = (self.sign_t + 1).max(now);
+        let edit = minelib_net::sovereign::Edit::sign(
+            key,
+            *room,
+            &self.pseudo,
+            pos,
+            block,
+            fluid,
+            at,
+            self.sign_t,
+            false,
+        );
+        let Some(l) = self.shards.link(region) else {
+            return false;
+        };
+        transport::push(
+            l,
+            &Request::ToZone {
+                chunk,
+                data: game::encode(&BuildMsg::Signed(edit)),
+            },
+        )
+    }
+
+    /// Demande au relais du monde.
+    fn send_edit(&self, pos: [i32; 3], block: u16, fluid: bool) {
+        self.send(Request::ToZone {
+            chunk: chunk_of(pos[0], pos[2]),
+            data: game::encode(&BuildMsg::Edit { pos, block, fluid }),
+        });
+    }
+
+    /// La dernière modification de `pos`, partie signée à un relais de région, est refusée
+    /// par lui ou reste sans réponse : elle repart une fois au relais du monde, qui
+    /// tranche (et la fait passer par l'hôte principal de la région, qui est remplacé
+    /// s'il ne la met pas en ordre). Faux s'il n'y a rien à redemander.
+    fn retry_at_root(&mut self, pos: [i32; 3]) -> bool {
+        let Some((block, fluid)) = self.pending.get_mut(&pos).and_then(|p| {
+            p.age = 0.0;
+            p.signed.take()
+        }) else {
+            return false;
+        };
+        self.send_edit(pos, block, fluid);
+        true
     }
 
     /// Relais de région rejoints (prêts).
@@ -464,25 +611,24 @@ impl BuildNet {
             .map(std::mem::take)
             .unwrap_or_default();
         for (pos, id, old) in edits {
-            // Toujours une demande au relais du monde, même dans une région servie par un
-            // relais de région : lui seul accepte une modification et lui donne son rang.
-            // Le bloc d'avant est gardé pour un refus.
-            let at = chunk_of(pos[0], pos[2]);
+            // Une demande au relais du monde, qui accepte la modification et lui donne son
+            // rang ; dans une région souveraine, signée au relais de la région, dont l'hôte
+            // principal le fait (voir `minelib_net::sovereign`). Le bloc d'avant est gardé
+            // pour un refus.
+            let fluid = fluid_edit(old, id);
+            let signed = self.send_signed(pos, id.0, fluid, chunk);
+            if !signed {
+                self.send_edit(pos, id.0, fluid);
+            }
             let p = self.pending.entry(pos).or_insert(Pending {
                 old,
                 count: 0,
                 age: 0.0,
+                signed: None,
             });
             p.count += 1;
             p.age = 0.0;
-            self.send(Request::ToZone {
-                chunk: at,
-                data: game::encode(&BuildMsg::Edit {
-                    pos,
-                    block: id.0,
-                    fluid: fluid_edit(old, id),
-                }),
-            });
+            p.signed = signed.then_some((id.0, fluid));
         }
         // Sans réponse du relais : la modification n'a pas eu lieu.
         let mut dirty = Vec::new();
@@ -493,13 +639,63 @@ impl BuildNet {
                 expired.push((*pos, p.old));
             }
         }
+        // Blocs d'un relais de région quitté que le relais du monde n'a pas confirmés : ils
+        // reviennent comme avant (sauf si la case a changé depuis).
+        let mut undone = 0;
+        let late: Vec<[i32; 3]> = self
+            .doubtful
+            .iter_mut()
+            .filter_map(|(p, (_, t))| {
+                *t -= dt;
+                (*t <= 0.0).then_some(*p)
+            })
+            .collect();
+        for pos in late {
+            let Some((h, _)) = self.doubtful.remove(&pos) else {
+                continue;
+            };
+            if self.pending.contains_key(&pos) || world.get(pos[0], pos[1], pos[2]) != h.got {
+                continue;
+            }
+            // Une modification du joueur que ce relais avait confirmée : elle est redemandée
+            // au relais du monde (rien ne se perd pour un joueur honnête, même quand l'hôte
+            // de la région triche ou tombe).
+            if let Some(fluid) = h.mine {
+                self.send_edit(pos, h.got.0, fluid);
+                self.pending.insert(
+                    pos,
+                    Pending {
+                        old: h.pre,
+                        count: 1,
+                        age: 0.0,
+                        signed: None,
+                    },
+                );
+                continue;
+            }
+            undone += 1;
+            dirty.extend(world.set_remote(pos[0], pos[1], pos[2], h.pre));
+        }
+        #[cfg(test)]
+        {
+            self.undone += undone;
+        }
+        if undone > 0 {
+            log::info!(
+                "construction : {undone} blocs d'un relais de région quitté jamais confirmés par le relais du monde, remis comme avant"
+            );
+        }
         for (pos, old) in expired {
+            if self.retry_at_root(pos) {
+                log::info!("construction : pas de réponse du relais de région pour {pos:?}, demandé au relais du monde");
+                continue;
+            }
             self.pending.remove(&pos);
             log::info!("construction : pas de réponse du relais pour {pos:?}, annulé");
             dirty.extend(world.set_remote(pos[0], pos[1], pos[2], old));
         }
         // Relais de région en vue : connexions, messages reçus.
-        let before: Vec<[i32; 2]> = self.shards.conns.keys().copied().collect();
+        let before: Vec<u64> = self.shards.conns.values().map(|c| c.serial).collect();
         self.shards.keep_near(chunk);
         let mut received = Vec::new();
         let mut broken = Vec::new();
@@ -507,7 +703,7 @@ impl BuildNet {
             while let Some(e) = c.client.poll() {
                 match e {
                     Event::Link(l) => c.link = Some(l),
-                    Event::FromZone { chunk, data, .. } => received.push((*region, chunk, data)),
+                    Event::FromZone { chunk, data, .. } => received.push((c.serial, chunk, data)),
                     Event::Error(m) | Event::Offline(m) => {
                         log::info!("relais de la région {region:?} : {m}");
                         broken.push(*region);
@@ -536,9 +732,9 @@ impl BuildNet {
         // Un relais de région quitté : ce qu'il a dit de l'ordre des modifications est
         // oublié (un relais malveillant ne laisse rien derrière lui : la suite, venue
         // d'ailleurs, s'applique normalement).
-        for r in before {
-            if !self.shards.conns.contains_key(&r) {
-                self.forget_shard(r);
+        for s in before {
+            if !self.shards.conns.values().any(|c| c.serial == s) {
+                self.forget_shard(s);
             }
         }
         // Le relais du monde sait quelles régions un relais de région nous sert (il ne
@@ -555,8 +751,8 @@ impl BuildNet {
             self.served_sent = served.clone();
             self.send(Request::Served { regions: served });
         }
-        for (region, c, data) in received {
-            self.from_shard = Some(region);
+        for (serial, c, data) in received {
+            self.from_shard = Some(serial);
             dirty.extend(self.receive(0, c, &data, world));
         }
         self.from_shard = None;
@@ -615,8 +811,8 @@ impl BuildNet {
             return Vec::new();
         };
         match msg {
-            // Les demandes ne vont qu'au relais du monde.
-            BuildMsg::Edit { .. } => Vec::new(),
+            // Les demandes ne vont qu'aux relais.
+            BuildMsg::Edit { .. } | BuildMsg::Signed(_) => Vec::new(),
             BuildMsg::Set {
                 pos, block, seq, ..
             } => self.block_set(pos, block, seq, world),
@@ -648,6 +844,11 @@ impl BuildNet {
             | BuildMsg::ChestPut { .. }
             | BuildMsg::ChestTake { .. } => Vec::new(),
             BuildMsg::Reject { pos, .. } => {
+                // Refusé par le relais d'une région souveraine (son hôte principal vient de
+                // changer, ou il ne l'est plus) : la demande repart au relais du monde.
+                if self.from_shard.is_some() && self.retry_at_root(pos) {
+                    return Vec::new();
+                }
                 // Refusé : le bloc d'avant revient.
                 match self.pending.remove(&pos) {
                     // (Sauf s'il a déjà rechangé la case : voir `rebase_journal`.)
@@ -747,9 +948,71 @@ impl BuildNet {
 
     /// Le relais de cette région n'est plus le nôtre : ce qu'il a dit de l'ordre des
     /// modifications est oublié.
-    fn forget_shard(&mut self, region: [i32; 2]) {
-        self.seen.retain(|_, v| v.1 != Some(region));
-        self.names.retain(|k, _| k.0 != Some(region));
+    fn forget_shard(&mut self, serial: u64) {
+        self.seen.retain(|_, v| v.1 != Some(serial));
+        self.names.retain(|k, _| k.0 != Some(serial));
+        // Ce qu'il a remis sans que le relais du monde le confirme : en doute. Le relais du
+        // monde renvoie tout ce qui manque de la région (`Request::Served`) ; ce qu'il ne
+        // confirme pas (un bloc inventé par un hôte malveillant, montré à ses seuls
+        // joueurs) revient comme avant.
+        for (pos, h) in self.heard.remove(&serial).unwrap_or_default() {
+            self.doubtful.insert(pos, (h, DOUBT_WAIT));
+        }
+    }
+
+    /// Le relais du monde publie `pos` au rang `seq` : ce qu'un relais de région en avait
+    /// remis, à ce rang ou avant, est confirmé (ou dépassé).
+    fn settle(&mut self, pos: [i32; 3], seq: u64) {
+        if self.doubtful.get(&pos).is_some_and(|h| h.0.seq <= seq) {
+            self.doubtful.remove(&pos);
+        }
+        for m in self.heard.values_mut() {
+            if m.get(&pos).is_some_and(|h| h.seq <= seq) {
+                m.remove(&pos);
+            }
+        }
+    }
+
+    /// Un relais de région remet `block` en `pos` : gardé, avec le bloc d'avant, jusqu'à ce
+    /// que le relais du monde le confirme.
+    fn note_heard(&mut self, serial: u64, pos: [i32; 3], block: u16, seq: u64, world: &World) {
+        // (Le bloc d'avant d'origine : celui d'avant une modification en attente du joueur,
+        // ou d'avant un relais déjà quitté.)
+        let pre = match self.doubtful.remove(&pos) {
+            Some((h, _)) => h.pre,
+            None => self
+                .pending
+                .get(&pos)
+                .map_or_else(|| world.get(pos[0], pos[1], pos[2]), |p| p.old),
+        };
+        // (La confirmation de sa propre modification signée.)
+        let mine = self
+            .pending
+            .get(&pos)
+            .and_then(|p| p.signed)
+            .filter(|s| s.0 == block)
+            .map(|s| s.1);
+        let m = self.heard.entry(serial).or_default();
+        let full = m.len() >= HEARD_MAX;
+        match m.get_mut(&pos) {
+            Some(h) => {
+                h.got = BlockId(block);
+                h.seq = seq;
+                h.mine = mine;
+            }
+            None if !full => {
+                m.insert(
+                    pos,
+                    Heard {
+                        pre,
+                        got: BlockId(block),
+                        seq,
+                        mine,
+                    },
+                );
+            }
+            None => {}
+        }
     }
 
     /// Le relais du monde a publié `block` en `pos`, au rang `seq` de l'ordre du monde.
@@ -764,6 +1027,9 @@ impl BuildNet {
         if block as usize >= minelib_world::registry::registry().len() {
             return Vec::new();
         }
+        if self.from_shard.is_none() {
+            self.settle(pos, seq);
+        }
         // L'ordre du relais du monde : plus ancienne que ce qu'on a déjà pour cette case
         // (doublon, même modification arrivée par deux chemins), elle est sans effet.
         if self.seen.get(&pos).is_some_and(|s| s.0 >= seq) {
@@ -773,6 +1039,9 @@ impl BuildNet {
             self.seen.clear();
         }
         self.seen.insert(pos, (seq, self.from_shard));
+        if let Some(s) = self.from_shard {
+            self.note_heard(s, pos, block, seq, world);
+        }
         // Ce que publie le relais fait foi (et confirme une modification en attente).
         self.confirm(pos, BlockId(block));
         // Le joueur a déjà rechangé cette case (pas encore envoyé) : sa nouvelle
@@ -818,6 +1087,8 @@ mod tests {
         shard: Option<crate::garant_worker::ShardHost>,
         /// A rejoint au moins un relais de région.
         used_shard: bool,
+        /// Clé du compte (reçue après la preuve du mot de passe).
+        identity: Option<minelib_net::ed25519_dalek::SigningKey>,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -870,6 +1141,7 @@ mod tests {
                 rejects: 0,
                 shard: None,
                 used_shard: false,
+                identity: None,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
@@ -884,23 +1156,47 @@ mod tests {
                     Event::Link(l) => self.link = Some(l),
                     Event::BuildGarant(_) => {
                         let link = self.link.clone().expect("file d'envoi");
-                        self.net = Some(BuildNet::new(link, self.name.clone(), false));
+                        let mut n = BuildNet::new(link, self.name.clone(), false);
+                        n.set_identity(self.identity.clone());
+                        self.net = Some(n);
                     }
                     Event::ShardTask {
                         room,
                         region,
                         secret,
                         slot,
+                        root,
                     } => {
                         let link = self.link.clone().expect("file d'envoi");
                         self.shard = crate::garant_worker::ShardHost::start(
-                            room, region, secret, link, false, slot,
+                            room,
+                            region,
+                            secret,
+                            link,
+                            false,
+                            slot,
+                            root,
+                            self.identity.clone(),
                         );
                     }
-                    Event::ShardPeers { list, .. } => {
+                    Event::ShardPeers { list, sov, .. } => {
                         if let Some(s) = &self.shard {
-                            s.set_peers(&list);
+                            s.set_peers(&list, sov);
                         }
+                    }
+                    Event::RootEdits { edits, .. } => {
+                        if let Some(s) = &self.shard {
+                            s.root_edits(edits);
+                        }
+                    }
+                    Event::Identity(key) => {
+                        if let Some(n) = &mut self.net {
+                            n.set_identity(Some(key.clone()));
+                        }
+                        if let Some(s) = &self.shard {
+                            s.set_signer(key.clone());
+                        }
+                        self.identity = Some(key);
                     }
                     Event::Shards(list) => {
                         if let Some(n) = &mut self.net {
@@ -912,9 +1208,10 @@ mod tests {
                         pseudo,
                         expires,
                         mac,
+                        cert,
                     } => {
                         if let Some(n) = &mut self.net {
-                            n.set_ticket(room, pseudo, expires, mac);
+                            n.set_ticket(room, pseudo, expires, mac, cert);
                         }
                     }
                     Event::RoomClosed => self.shard = None,
@@ -965,7 +1262,9 @@ mod tests {
 
         fn start_net(&mut self, owner: bool) {
             let link = self.link.clone().expect("file d'envoi");
-            self.net = Some(BuildNet::new(link, self.name.clone(), owner));
+            let mut n = BuildNet::new(link, self.name.clone(), owner);
+            n.set_identity(self.identity.clone());
+            self.net = Some(n);
         }
 
         fn tick(&mut self, dt: f32) {
@@ -992,8 +1291,15 @@ mod tests {
         /// La région est assez peuplée pour avoir son propre relais (hébergé par le joueur
         /// d'un autre monde).
         shards: bool,
-        /// La région a deux relais (chez deux hôtes), reliés entre eux.
+        /// La région a deux relais (chez deux hôtes), reliés entre eux : elle devient
+        /// souveraine (l'un met ses modifications en ordre, l'autre vérifie).
         two_relays: bool,
+        /// Trois relais : deux hôtes confirment ce que publie l'hôte principal.
+        three_relays: bool,
+        /// Son hôte principal triche une fois : il ajoute une modification inventée au
+        /// nom d'un joueur et la montre aux siens. Il doit être pris, écarté et remplacé,
+        /// et les mondes rester identiques (le bloc inventé défait chez ceux qui l'ont vu).
+        forger: bool,
     }
 
     /// Construction en ligne à petite échelle, de bout en bout (vrai relais, vraies
@@ -1006,6 +1312,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("minelib-sync-{}", rand_u32()));
         minelib_relay::test_seed_games(&dir, "Garant", 5);
         minelib_relay::test_seed_games(&dir, "Garant2", 5);
+        minelib_relay::test_seed_games(&dir, "Garant3", 5);
         let h = minelib_relay::start(minelib_relay::Config {
             dir: dir.clone(),
             bind: "127.0.0.1:0".into(),
@@ -1016,9 +1323,16 @@ mod tests {
         if sc.shards {
             h.set_shard_from(2);
         }
-        if sc.two_relays {
+        // Relais de la région : 1 + (joueurs - 2) / part.
+        let relays = if sc.three_relays {
+            h.set_shard_share(3);
+            3
+        } else if sc.two_relays {
             h.set_shard_share(4);
-        }
+            2
+        } else {
+            1
+        };
         let addr = h.addr.to_string();
         // Un autre monde, dont le joueur prête sa connexion de garant.
         let mut ailleurs = Bot::new(&addr, h.public, "Garant", false);
@@ -1032,22 +1346,27 @@ mod tests {
         ailleurs.wait(|e| matches!(e, Event::Hosted(_)));
         let mut garant = Bot::new(&addr, h.public, "Garant", true);
         garant.c.send(Cmd::GarantAvailable(true));
-        // Un deuxième hôte possible (joueur d'un troisième monde).
-        let mut second = sc.two_relays.then(|| {
-            let mut w = Bot::new(&addr, h.public, "Garant2", false);
-            w.c.send(Cmd::Host {
-                kind: 1,
-                name: "Encore".into(),
-                map: "encore".into(),
-                map_sig: [9; 32],
-                max_players: 0,
-            });
-            w.wait(|e| matches!(e, Event::Hosted(_)));
-            let g = Bot::new(&addr, h.public, "Garant2", true);
-            g.c.send(Cmd::GarantAvailable(true));
-            (w, g)
-        });
+        // D'autres hôtes possibles (joueurs d'autres mondes).
+        let mut extra: Vec<(Bot, Bot)> = (2..relays + 1)
+            .map(|k| {
+                let name = format!("Garant{k}");
+                let mut w = Bot::new(&addr, h.public, &name, false);
+                w.c.send(Cmd::Host {
+                    kind: 1,
+                    name: format!("Encore{k}"),
+                    map: format!("encore{k}"),
+                    map_sig: [7 + k as u8; 32],
+                    max_players: 0,
+                });
+                w.wait(|e| matches!(e, Event::Hosted(_)));
+                let g = Bot::new(&addr, h.public, &name, true);
+                g.c.send(Cmd::GarantAvailable(true));
+                (w, g)
+            })
+            .collect();
         let (mut linked, mut both_used) = (false, false);
+        // Modifications mises en ordre par un hôte principal ; triche faite.
+        let (mut ordered, mut forged) = (0u64, false);
         // Des blocs sont arrivés à un joueur par un relais de région.
         let mut via_shard = false;
         // Le monde essayé : un propriétaire et des joueurs.
@@ -1135,12 +1454,24 @@ mod tests {
             via_shard |= bots
                 .iter()
                 .any(|b| b.net.as_ref().is_some_and(|n| n.via_shard() > 0));
-            if let Some((w, g)) = &mut second {
+            for (w, g) in &mut extra {
                 w.pump(&|_| false);
                 g.tick(dt);
-                if let (Some(a), Some(b)) = (&garant.shard, &g.shard) {
-                    linked |= a.linked() == 1 && b.linked() == 1;
-                    both_used |= a.players() > 0 && b.players() > 0;
+            }
+            let hosts: Vec<_> = std::iter::once(garant.shard.as_ref())
+                .chain(extra.iter().map(|(_, g)| g.shard.as_ref()))
+                .collect();
+            if relays > 1 && hosts.iter().all(|s| s.is_some()) {
+                linked |= hosts.iter().flatten().all(|s| s.linked() == relays - 1);
+                both_used |= hosts.iter().flatten().all(|s| s.players() > 0);
+            }
+            for sh in hosts.iter().flatten() {
+                ordered = ordered.max(sh.ordered());
+            }
+            if sc.forger && !forged && step >= 100 {
+                if let Some(sh) = hosts.iter().flatten().find(|s| s.is_primary()) {
+                    sh.forge_once();
+                    forged = true;
                 }
             }
             ailleurs.pump(&|_| false);
@@ -1160,15 +1491,40 @@ mod tests {
                 }
             }
             garant.tick(dt);
-            if let Some((w, g)) = &mut second {
+            for (w, g) in &mut extra {
                 w.pump(&|_| false);
                 g.tick(dt);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        if sc.two_relays {
-            assert!(linked, "les deux relais de la région se sont reliés");
+        if relays > 1 {
+            assert!(linked, "les relais de la région se sont reliés");
             let _ = both_used;
+            assert!(
+                ordered > 0,
+                "région souveraine : ses modifications mises en ordre par son hôte principal"
+            );
+            eprintln!(
+                "mises en ordre (époque en cours) : {ordered}, archivées : {}",
+                h.sov_committed()
+            );
+            if !sc.forger {
+                assert!(
+                    h.sov_committed() as u64 >= ordered,
+                    "tout ce que l'hôte principal a mis en ordre est archivé par le relais du monde"
+                );
+            }
+        }
+        if sc.forger {
+            assert!(forged, "l'hôte principal a triché");
+            assert!(h.sov_faults() >= 1, "la faute est prouvée, l'hôte écarté");
+            let still = std::iter::once(garant.shard.as_ref())
+                .chain(extra.iter().map(|(_, g)| g.shard.as_ref()))
+                .flatten()
+                .count();
+            assert_eq!(still, relays - 1, "l'hôte qui a triché n'héberge plus rien");
+        } else {
+            assert_eq!(h.sov_faults(), 0, "aucun hôte honnête n'est condamné");
         }
         assert!(
             !sc.shards || had_garant,
@@ -1193,6 +1549,10 @@ mod tests {
             .filter(|(i, _)| !gone.contains(i))
             .map(|(_, b)| b)
             .collect();
+        if sc.forger {
+            let undone: usize = live.iter().map(|b| b.net.as_ref().unwrap().undone).sum();
+            eprintln!("blocs inventés défaits : {undone}");
+        }
         for b in &live {
             assert_eq!(
                 b.net.as_ref().unwrap().pending(),
@@ -1201,9 +1561,9 @@ mod tests {
                 b.name
             );
         }
-        // Deux relais : chacun voit quand même tous les autres (les positions passent
+        // Plusieurs relais : chacun voit quand même tous les autres (les positions passent
         // d'un relais à l'autre).
-        if sc.two_relays {
+        if relays > 1 {
             for b in &live {
                 let seen = b.net.as_ref().unwrap().others.len();
                 assert!(
@@ -1220,14 +1580,17 @@ mod tests {
             .find(|b| b.net.as_ref().unwrap().is_owner())
             .expect("un propriétaire");
         let mut differ = Vec::new();
+        // Toutes les cases où l'on construit, et au-dessus (où un hôte principal tricheur
+        // invente sa modification).
         for b in &live {
-            for p in &edited {
-                let (a, o) = (
-                    b.world.get(p[0], p[1], p[2]),
-                    owner.world.get(p[0], p[1], p[2]),
-                );
-                if a != o {
-                    differ.push((b.name.clone(), *p, a, o));
+            for x in CHUNKS.start * 16..CHUNKS.end * 16 {
+                for z in 0..32 {
+                    for y in 11..21 {
+                        let (a, o) = (b.world.get(x, y, z), owner.world.get(x, y, z));
+                        if a != o {
+                            differ.push((b.name.clone(), [x, y, z], a, o));
+                        }
+                    }
                 }
             }
         }
@@ -1275,6 +1638,40 @@ mod tests {
             players: 8,
             shards: true,
             two_relays: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn build_worlds_stay_identical_with_three_relays_in_a_region() {
+        run(Scenario {
+            players: 8,
+            shards: true,
+            two_relays: true,
+            three_relays: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn a_cheating_primary_host_among_three_is_caught_and_replaced() {
+        run(Scenario {
+            players: 8,
+            shards: true,
+            two_relays: true,
+            three_relays: true,
+            forger: true,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn a_cheating_primary_host_is_caught_and_replaced() {
+        run(Scenario {
+            players: 8,
+            shards: true,
+            two_relays: true,
+            forger: true,
             ..Default::default()
         });
     }
@@ -1448,15 +1845,43 @@ mod tests {
         assert_eq!(w.get(1, 100, 1), BlockId(5));
         // Un relais de région (tenu par un joueur) annonce un rang énorme : tant qu'on
         // passe par lui, c'est lui qu'on voit ; quitté, il ne laisse rien derrière lui.
-        b.from_shard = Some([0, 0]);
+        b.from_shard = Some(1);
         b.receive(0, [0, 0], &set(9, u64::MAX), &mut w);
         b.from_shard = None;
         assert_eq!(w.get(1, 100, 1), BlockId(9));
         b.receive(0, [0, 0], &set(6, 15), &mut w);
         assert_eq!(w.get(1, 100, 1), BlockId(9), "encore servi par ce relais");
-        b.forget_shard([0, 0]);
+        b.forget_shard(1);
         b.receive(0, [0, 0], &set(6, 15), &mut w);
         assert_eq!(w.get(1, 100, 1), BlockId(6), "le relais du monde fait foi");
+        // Un relais de région remet deux blocs : le relais du monde confirme le premier
+        // (au même rang), jamais le second (inventé par un hôte malveillant, montré à ses
+        // seuls joueurs). Quitté, le second revient comme avant, pas le premier.
+        let at = |p: [i32; 3], block: u16, seq: u64| {
+            game::encode(&BuildMsg::Set {
+                pos: p,
+                block,
+                by: "Eve".into(),
+                seq,
+            })
+        };
+        let (real, fake) = ([2, 100, 2], [3, 100, 3]);
+        let fake_before = w.get(3, 100, 3);
+        b.from_shard = Some(2);
+        b.receive(0, [0, 0], &at(real, 7, 1 << 40), &mut w);
+        b.receive(0, [0, 0], &at(fake, 8, (1 << 40) + 1), &mut w);
+        b.from_shard = None;
+        assert_eq!(
+            (w.get(2, 100, 2), w.get(3, 100, 3)),
+            (BlockId(7), BlockId(8))
+        );
+        b.forget_shard(2);
+        b.receive(0, [0, 0], &at(real, 7, 1 << 40), &mut w);
+        for _ in 0..80 {
+            let _ = b.update(&mut w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, 0.05);
+        }
+        assert_eq!(w.get(2, 100, 2), BlockId(7), "confirmé : il reste");
+        assert_eq!(w.get(3, 100, 3), fake_before, "jamais confirmé : défait");
     }
 
     #[test]

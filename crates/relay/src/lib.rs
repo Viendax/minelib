@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use minelib_net::proto::{self, ErrorCode, Request, Response};
 use minelib_net::transport::{self, Channel, Inbound, Incoming};
-use minelib_net::{crypto, game, totp};
+use minelib_net::{crypto, game, sovereign, totp};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -56,6 +56,8 @@ pub struct Handle {
     peer_servers: Arc<Mutex<Option<ServersFn>>>,
     shard_from: Arc<std::sync::atomic::AtomicUsize>,
     shard_share: Arc<std::sync::atomic::AtomicUsize>,
+    sov_faults: Arc<std::sync::atomic::AtomicUsize>,
+    sov_committed: Arc<std::sync::atomic::AtomicUsize>,
     /// État du relais (essais seulement).
     #[cfg(test)]
     state: Arc<Mutex<State>>,
@@ -118,6 +120,17 @@ impl Handle {
     pub fn set_shard_share(&self, players: usize) {
         self.shard_share
             .store(players, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Hôtes principaux de régions souveraines écartés pour une faute prouvée.
+    pub fn sov_faults(&self) -> usize {
+        self.sov_faults.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Modifications de régions souveraines archivées ici.
+    pub fn sov_committed(&self) -> usize {
+        self.sov_committed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Les pseudos deviennent uniques avec les autres relais : avant chaque inscription,
@@ -387,6 +400,62 @@ struct RegionShard {
     previous: Option<u64>,
 }
 
+/// Époque d'une région souveraine, vue du relais du monde : l'hôte principal met en ordre
+/// les modifications de la région et les publie par lots signés ; ce relais n'archive un
+/// lot que quand un autre hôte de la région l'a vérifié (`Request::Ack`).
+struct RootSov {
+    epoch: u64,
+    /// Connexion de l'hôte principal, sa clé, son rang.
+    primary: u64,
+    key: ed25519_dalek::VerifyingKey,
+    slot: u16,
+    first: u64,
+    floor_t: u64,
+    /// Archivé : rang suivant et empreinte.
+    base: u64,
+    chain: [u8; 32],
+    /// Lots reçus de l'hôte principal, pas encore confirmés (ils se suivent à partir de
+    /// `base`).
+    pending: VecDeque<sovereign::Batch>,
+    /// Depuis quand quelque chose attend (lot pas confirmé, modification transmise pas
+    /// encore publiée) sans que rien n'avance : au-delà de `SOV_STALL`, l'hôte principal
+    /// est remplacé.
+    waiting: Option<Instant>,
+    /// Modifications arrivées ici (signées par ce relais) transmises à l'hôte principal,
+    /// pas encore revenues dans un lot confirmé : à la fin de l'époque, elles repartent
+    /// (rien ne se perd) ; l'une d'elles qui tarde trop fait remplacer l'hôte principal
+    /// (il ne peut pas en écarter une en silence).
+    sent: VecDeque<(Instant, sovereign::Edit)>,
+    /// Dernière confirmation de chaque autre hôte de la région : rang et empreinte.
+    acks: HashMap<u64, (u64, [u8; 32])>,
+}
+
+/// Époque finie : de quoi archiver les lots qu'un hôte remet en passation.
+struct PastSov {
+    epoch: u64,
+    /// Connexion de l'hôte principal de cette époque (écarté si une faute est prouvée
+    /// après coup).
+    host: u64,
+    key: ed25519_dalek::VerifyingKey,
+    floor_t: u64,
+    base: u64,
+    chain: [u8; 32],
+}
+
+/// Un lot sur `SPOT_CHECK` de l'hôte principal est vérifié aussi par le relais du monde.
+const SPOT_CHECK: u32 = 8;
+/// Une deuxième confirmation qui tarde plus que cela : le relais du monde vérifie lui-même.
+const ACK_WAIT: Duration = Duration::from_secs(2);
+
+/// Une époque souveraine qui n'avance plus pendant ce temps (lots pas confirmés,
+/// modifications transmises pas publiées) : l'hôte principal est remplacé (sans être
+/// puni : il peut être seulement lent ou parti).
+const SOV_STALL: Duration = Duration::from_secs(15);
+/// Plage de rangs réservée à une époque souveraine.
+const SOV_RANGE: u64 = 1 << 32;
+/// Une modification signée dans une époque peut dater d'au plus ce temps avant son début.
+const SOV_FLOOR_MS: u64 = 60_000;
+
 /// Partie annoncée : l'hôte fait tourner le serveur, le relais transmet les données.
 struct Room {
     kind: u8,
@@ -434,6 +503,15 @@ struct Room {
     /// ont en vue), et empreinte de la liste que chaque joueur a reçue.
     shards_dirty: HashSet<[i32; 2]>,
     shards_sent: HashMap<u64, u64>,
+    /// Régions souveraines (voir `RootSov`), époques finies (pour une passation), hôtes
+    /// écartés du rôle d'hôte principal par région (ils restent relais), prochaine époque.
+    sov: HashMap<[i32; 2], RootSov>,
+    sov_past: HashMap<[i32; 2], VecDeque<PastSov>>,
+    sov_skip: HashMap<[i32; 2], HashSet<u64>>,
+    next_epoch: u64,
+    /// Dates (uniques) des modifications signées par ce relais déjà archivées : une même
+    /// modification arrivée par deux chemins (passation, puis renvoi) ne compte qu'une fois.
+    root_done: std::collections::BTreeSet<u64>,
     /// Construction : garants de zones.
     build: zones::Build,
     /// FPS : garant de secours désigné par l'hôte.
@@ -497,6 +575,10 @@ struct State {
     peer_servers: Arc<Mutex<Option<ServersFn>>>,
     shard_from: Arc<std::sync::atomic::AtomicUsize>,
     shard_share: Arc<std::sync::atomic::AtomicUsize>,
+    /// Fautes prouvées d'hôtes principaux, modifications de régions souveraines archivées
+    /// (voir `Handle::sov_faults`).
+    sov_faults: Arc<std::sync::atomic::AtomicUsize>,
+    sov_committed: Arc<std::sync::atomic::AtomicUsize>,
     conns: HashMap<u64, Conn>,
     rooms: HashMap<u64, Room>,
     /// Lobbies : n° → connexions (la première est l'hôte du lobby).
@@ -517,6 +599,11 @@ struct State {
     servers: servers::Store,
     /// Inventaires des joueurs en survie (voir `bags`).
     bags: bags::Store,
+    /// Clé du relais (la même que pour le registre) : certifie les clés des comptes et
+    /// signe à la place d'un joueur dans une région souveraine (voir
+    /// `minelib_net::sovereign`) ; date de la dernière signature (strictement croissante).
+    cert_key: SigningKey,
+    root_t: u64,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -525,6 +612,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         .with_context(|| format!("dossier du relais {}", cfg.dir.display()))?;
     let id = Identity::load_or_create(&cfg.dir)?;
     let signer = SigningKey::from_bytes(&id.sign_seed);
+    let cert_key = signer.clone();
     let registry = Registry::open(&cfg.dir.join("registry.log"), signer)?;
     let accounts = accounts::Store::new(cfg.dir.join("accounts"))?;
     let stats = stats::Store::open(cfg.dir.join("stats"))?;
@@ -544,11 +632,15 @@ pub fn start(cfg: Config) -> Result<Handle> {
     let peer_servers: Arc<Mutex<Option<ServersFn>>> = Arc::default();
     let shard_from = Arc::new(std::sync::atomic::AtomicUsize::new(SHARD_FROM));
     let shard_share = Arc::new(std::sync::atomic::AtomicUsize::new(SHARD_SHARE));
+    let sov_faults = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sov_committed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let state = Arc::new(Mutex::new(State {
         whois: whois.clone(),
         peer_servers: peer_servers.clone(),
         shard_from: shard_from.clone(),
         shard_share: shard_share.clone(),
+        sov_faults: sov_faults.clone(),
+        sov_committed: sov_committed.clone(),
         conns: HashMap::new(),
         rooms: HashMap::new(),
         parties: HashMap::new(),
@@ -565,6 +657,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
         hardware: hardware::Store::open(cfg_dir.join("hardware.bin")),
         servers: servers::Store::open(cfg_dir.join("serveurs.bin")),
         bags: bags::Store::open(cfg_dir.join("sacs.bin")),
+        cert_key,
+        root_t: 0,
     }));
     #[cfg(test)]
     let state_for_tests = state.clone();
@@ -609,6 +703,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
         peer_servers,
         shard_from,
         shard_share,
+        sov_faults,
+        sov_committed,
         #[cfg(test)]
         state: state_for_tests,
     })
@@ -1459,8 +1555,9 @@ fn bulk_edit(
             continue;
         }
         // (Son auteur les a déjà : pas de confirmation, la réponse `BulkDone` suffit.)
-        publish_block(st, rid, id, false, pseudo, pos, block);
-        touched.push(pos);
+        if publish_block(st, rid, id, false, pseudo, pos, block, false) {
+            touched.push(pos);
+        }
     }
     // Un coffre remplacé par WorldEdit : son contenu tombe au sol.
     for pos in touched {
@@ -1561,6 +1658,12 @@ fn send_catch_up(st: &mut State, rid: u64, id: u64, chunk: [i32; 2], moved: bool
 /// sac vidé en survie). Ils ne peuvent plus que tarder à transmettre.
 ///
 /// `confirm` : l'auteur la reçoit aussi (sa confirmation).
+///
+/// Dans une région souveraine, c'est son hôte principal qui met en ordre : la modification
+/// lui est transmise, signée par ce relais au nom de son auteur, et sera archivée (et
+/// comptée dans le sac de son auteur) quand elle reviendra dans un lot confirmé. Renvoie
+/// vrai si elle a été publiée ici.
+#[allow(clippy::too_many_arguments)]
 fn publish_block(
     st: &mut State,
     rid: u64,
@@ -1569,12 +1672,44 @@ fn publish_block(
     pseudo: &str,
     pos: [i32; 3],
     block: u16,
-) {
+    fluid: bool,
+) -> bool {
     let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
     let region = proto::region_of(chunk);
     let Some(room) = st.rooms.get_mut(&rid) else {
-        return;
+        return false;
     };
+    if let Some(sv) = room.sov.get_mut(&region) {
+        st.root_t = (st.root_t + 1).max(now_ms());
+        let edit = sovereign::Edit::sign(
+            &st.cert_key,
+            rid,
+            pseudo,
+            pos,
+            block,
+            fluid,
+            chunk,
+            st.root_t,
+            true,
+        );
+        // (Trop de modifications en attente : l'hôte principal ne suit plus, il va être
+        // remplacé ; celle-ci est refusée.)
+        if sv.sent.len() >= 4096 {
+            return false;
+        }
+        sv.waiting.get_or_insert_with(Instant::now);
+        sv.sent.push_back((Instant::now(), edit.clone()));
+        if let Some(c) = st.conns.get(&sv.primary) {
+            transport::push(
+                &c.tx,
+                &Response::RootEdits {
+                    region,
+                    edits: vec![edit],
+                },
+            );
+        }
+        return false;
+    }
     let sharded = room
         .shards
         .get(&region)
@@ -1613,6 +1748,7 @@ fn publish_block(
             push_zone(&c.tx, chunk, data.clone());
         }
     }
+    true
 }
 
 /// Un joueur demande à changer un bloc. Ce relais vérifie ce qu'il peut vérifier sans
@@ -1665,7 +1801,10 @@ fn build_edit(
     }
     // Ce qui était là d'après l'historique (inconnu si la case n'a jamais été changée).
     let before = st.rooms.get(&rid).and_then(|r| r.build.block_at(pos));
-    publish_block(st, rid, id, true, pseudo, pos, block);
+    if !publish_block(st, rid, id, true, pseudo, pos, block, fluid) {
+        // (Région souveraine : comptée quand elle revient dans un lot confirmé.)
+        return;
+    }
     // Survie : un bloc cassé donne un crédit de minage, un bloc posé sort du sac. Pas pour
     // l'écoulement d'un fluide (de l'eau qui sèche n'est pas du minage), ni pour une case
     // que l'historique dit déjà vide (« casser » dix fois le même vide).
@@ -2084,10 +2223,21 @@ fn note_block(st: &mut State, rid: u64, by: &str, block: u16) {
 /// Aux hôtes des relais d'une région : la liste des relais prêts (ils se relient entre
 /// eux, et le plus petit rang met les modifications en ordre).
 fn announce_shard_peers(st: &State, rid: u64, region: [i32; 2]) {
-    let Some(list) = st.rooms.get(&rid).and_then(|r| r.shards.get(&region)) else {
+    let Some(room) = st.rooms.get(&rid) else {
         return;
     };
-    let ready: Vec<proto::ShardInfo> = list.iter().filter_map(|s| s.info.clone()).collect();
+    let Some(list) = room.shards.get(&region) else {
+        return;
+    };
+    let ready = ready_infos(room, region);
+    let sov = room.sov.get(&region).map(|s| proto::Sov {
+        epoch: s.epoch,
+        primary: s.slot,
+        first: s.first,
+        base: s.base,
+        chain: s.chain,
+        floor_t: s.floor_t,
+    });
     for sh in list {
         if let Some(c) = st.conns.get(&sh.host) {
             transport::push(
@@ -2095,8 +2245,409 @@ fn announce_shard_peers(st: &State, rid: u64, region: [i32; 2]) {
                 &Response::ShardPeers {
                     region,
                     list: ready.clone(),
+                    sov: sov.clone(),
                 },
             );
+        }
+    }
+}
+
+/// Relais prêts d'une région, avec l'époque souveraine en cours (0 : aucune).
+fn ready_infos(room: &Room, region: [i32; 2]) -> Vec<proto::ShardInfo> {
+    let epoch = room.sov.get(&region).map_or(0, |s| s.epoch);
+    room.shards
+        .get(&region)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.info.clone())
+        .map(|mut i| {
+            i.epoch = epoch;
+            i
+        })
+        .collect()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Clé du compte d'un joueur connecté (registre).
+fn account_key(st: &State, id: u64) -> Option<[u8; 32]> {
+    let p = st.conns.get(&id)?.pseudo.as_deref()?;
+    st.registry.lookup(p).map(|r| r.1)
+}
+
+/// Régions d'un monde : une région d'au moins deux relais prêts devient souveraine (son
+/// hôte principal met en ordre ses modifications, les autres vérifient) ; une époque
+/// commence quand l'hôte principal change (parti, écarté, trop lent), et finit quand la
+/// région n'a plus deux relais.
+fn upkeep_sovereignty(st: &mut State, rid: u64) {
+    let root_key = st.cert_key.verifying_key().to_bytes();
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let regions: HashSet<[i32; 2]> = room.shards.keys().chain(room.sov.keys()).copied().collect();
+    for region in regions {
+        // (Une confirmation qui tarde : voir `try_commit`.)
+        try_commit(st, rid, region);
+        let Some(room) = st.rooms.get(&rid) else {
+            return;
+        };
+        let ready: Vec<(u64, u16)> = room
+            .shards
+            .get(&region)
+            .into_iter()
+            .flatten()
+            .filter(|s| s.info.is_some())
+            .map(|s| (s.host, s.slot))
+            .collect();
+        let current = room.sov.get(&region);
+        let gone = current.is_some_and(|s| !ready.iter().any(|r| r.0 == s.primary));
+        let stalled = current.is_some_and(|s| {
+            s.waiting.is_some_and(|t| t.elapsed() > SOV_STALL)
+                || s.sent.front().is_some_and(|(t, _)| t.elapsed() > SOV_STALL)
+        });
+        if current.is_some() && !gone && !stalled && ready.len() >= 2 {
+            continue;
+        }
+        if current.is_none() && ready.len() < 2 {
+            continue;
+        }
+        // Fin de l'époque en cours (gardée pour les passations).
+        let room = st.rooms.get_mut(&rid).expect("partie");
+        let mut ended = None;
+        if let Some(mut old) = room.sov.remove(&region) {
+            if stalled && !gone {
+                log::info!(
+                    "monde {rid} : région {region:?}, l'hôte principal n'avance plus : remplacé"
+                );
+                room.sov_skip.entry(region).or_default().insert(old.primary);
+            }
+            // Les lots reçus de l'hôte principal et pas encore confirmés : ce relais les
+            // vérifie lui-même et les archive (rien ne se perd si les autres hôtes ne les
+            // ont pas eus) ; une faute écarte l'hôte.
+            let rules = sovereign::Rules {
+                room: rid,
+                region,
+                root: root_key,
+                floor_t: old.floor_t,
+            };
+            let pending: Vec<sovereign::Batch> = std::mem::take(&mut old.pending).into();
+            let (done, fault) = sound_prefix(&rules, old.epoch, &old.key, pending);
+            if let Some(last) = done.last() {
+                (old.base, old.chain) = (last.end(), last.chain());
+            }
+            let past = room.sov_past.entry(region).or_default();
+            past.push_back(PastSov {
+                epoch: old.epoch,
+                host: old.primary,
+                key: old.key,
+                floor_t: old.floor_t,
+                base: old.base,
+                chain: old.chain,
+            });
+            while past.len() > 4 {
+                past.pop_front();
+            }
+            let sent: Vec<sovereign::Edit> = old.sent.into_iter().map(|(_, e)| e).collect();
+            ended = Some((old.primary, old.epoch, done, fault, sent));
+        }
+        // Nouvelle époque : l'hôte principal est le plus petit rang pas écarté.
+        if ready.len() >= 2 {
+            let skip = room.sov_skip.entry(region).or_default();
+            if ready.iter().all(|r| skip.contains(&r.0)) {
+                skip.clear();
+            }
+            let (primary, slot) = *ready
+                .iter()
+                .filter(|r| !skip.contains(&r.0))
+                .min_by_key(|r| r.1)
+                .expect("relais");
+            let key = account_key(st, primary)
+                .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok());
+            let room = st.rooms.get_mut(&rid).expect("partie");
+            if let Some(key) = key {
+                let epoch = room.next_epoch;
+                room.next_epoch += 1;
+                let first = room.build.reserve(SOV_RANGE);
+                let chain = sovereign::genesis(rid, region, epoch, first);
+                room.sov.insert(
+                    region,
+                    RootSov {
+                        epoch,
+                        primary,
+                        key,
+                        slot,
+                        first,
+                        floor_t: now_ms().saturating_sub(SOV_FLOOR_MS),
+                        base: first,
+                        chain,
+                        pending: VecDeque::new(),
+                        waiting: None,
+                        sent: VecDeque::new(),
+                        acks: HashMap::new(),
+                    },
+                );
+                log::info!(
+                    "monde {rid} : région {region:?} souveraine, époque {epoch}, hôte \
+                     principal {primary} (rang {slot})"
+                );
+            }
+        }
+        let room = st.rooms.get_mut(&rid).expect("partie");
+        room.shards_dirty.insert(region);
+        announce_shard_peers(st, rid, region);
+        // L'époque finie : ses lots vérifiés ici, archivés ; ce qu'elle n'avait pas encore
+        // publié des modifications arrivées ici repart (vers le nouvel hôte principal, ou
+        // publié ici si la région n'est plus souveraine).
+        if let Some((host, epoch, done, fault, sent)) = ended {
+            commit_batches(st, rid, region, done);
+            if let Some(why) = fault {
+                log::warn!(
+                    "monde {rid} : région {region:?}, faute de l'hôte principal trouvée en \
+                     fin d'époque {epoch} : {why}"
+                );
+                ban_host(st, host);
+            }
+            for e in sent {
+                resubmit(st, rid, region, e);
+            }
+        }
+    }
+}
+
+/// Archive ce que les autres hôtes d'une région souveraine ont confirmé : deux d'entre eux
+/// s'il y en a deux (un complice de l'hôte principal ne suffit pas), sinon le seul autre.
+/// Une deuxième confirmation qui tarde (hôte en retard, ou qui refuse de confirmer) : ce
+/// relais vérifie lui-même ce que la première couvre. Appelé à chaque confirmation, à
+/// chaque lot reçu (les confirmations peuvent le devancer) et régulièrement.
+fn try_commit(st: &mut State, rid: u64, region: [i32; 2]) {
+    let root = st.cert_key.verifying_key().to_bytes();
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let ready: Vec<u64> = room
+        .shards
+        .get(&region)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.info.is_some())
+        .map(|s| s.host)
+        .collect();
+    let Some(sv) = room.sov.get_mut(&region) else {
+        return;
+    };
+    let primary = sv.primary;
+    sv.acks.retain(|h, _| ready.contains(h) && *h != primary);
+    if sv.pending.is_empty() {
+        return;
+    }
+    let need = ready.len().saturating_sub(1).clamp(1, 2);
+    let mut covered: Vec<usize> = sv
+        .acks
+        .values()
+        .filter_map(|(s, c)| {
+            sv.pending
+                .iter()
+                .position(|b| b.end() == *s && b.chain() == *c)
+        })
+        .collect();
+    covered.sort_unstable_by(|a, b| b.cmp(a));
+    let late =
+        need == 2 && covered.len() == 1 && sv.waiting.is_some_and(|t| t.elapsed() > ACK_WAIT);
+    let upto = match covered.get(need - 1) {
+        Some(&i) => i,
+        None if late => {
+            let rules = sovereign::Rules {
+                room: rid,
+                region,
+                root,
+                floor_t: sv.floor_t,
+            };
+            let head: Vec<sovereign::Batch> =
+                sv.pending.iter().take(covered[0] + 1).cloned().collect();
+            let (sound, fault) = sound_prefix(&rules, sv.epoch, &sv.key, head);
+            if let Some(why) = fault {
+                log::warn!(
+                    "monde {rid} : région {region:?}, faute de l'hôte principal vue par ce \
+                     relais : {why}"
+                );
+                ban_host(st, primary);
+                upkeep_sovereignty(st, rid);
+                return;
+            }
+            match sound.len().checked_sub(1) {
+                Some(i) => i,
+                None => return,
+            }
+        }
+        None => return,
+    };
+    let done: Vec<sovereign::Batch> = sv.pending.drain(..=upto).collect();
+    let last = done.last().expect("lot");
+    (sv.base, sv.chain) = (last.end(), last.chain());
+    commit_batches(st, rid, region, done);
+    // Ça avance : ce qui attend encore attend depuis maintenant.
+    if let Some(sv) = st.rooms.get_mut(&rid).and_then(|r| r.sov.get_mut(&region)) {
+        sv.waiting = (!sv.pending.is_empty() || !sv.sent.is_empty()).then(Instant::now);
+    }
+}
+
+/// Ce relais vérifie lui-même des lots de l'hôte principal d'une époque, qui se suivent
+/// (chaque modification, et dates et cadence de chaque auteur sur les 64 derniers lots) :
+/// le plus long début sans faute (au plus 256 lots), et la faute qui l'arrête.
+fn sound_prefix(
+    rules: &sovereign::Rules,
+    epoch: u64,
+    key: &ed25519_dalek::VerifyingKey,
+    batches: Vec<sovereign::Batch>,
+) -> (Vec<sovereign::Batch>, Option<String>) {
+    let mut done: Vec<sovereign::Batch> = Vec::new();
+    for b in batches.into_iter().take(256) {
+        done.push(b);
+        let from = done.len().saturating_sub(64);
+        if let Some(why) = sovereign::judge(rules, epoch, key, &done[from..]) {
+            done.pop();
+            return (done, Some(why));
+        }
+    }
+    (done, None)
+}
+
+/// Faute prouvée d'un hôte principal : écarté de tout rôle de garant, il quitte le monde.
+fn ban_host(st: &mut State, host: u64) {
+    st.sov_faults
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(c) = st.conns.get_mut(&host) {
+        c.garant_banned = true;
+    }
+    leave_room(st, host);
+    if let Some(c) = st.conns.get(&host) {
+        transport::push(&c.tx, &Response::RoomClosed);
+    }
+}
+
+/// Une modification signée par ce relais que l'époque où elle était partie n'a pas
+/// publiée : au nouvel hôte principal, ou publiée ici si la région n'est plus souveraine
+/// (une seule fois en tout, voir `Room::root_done`).
+fn resubmit(st: &mut State, rid: u64, region: [i32; 2], mut edit: sovereign::Edit) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    if room.root_done.contains(&edit.t) {
+        return;
+    }
+    if let Some(sv) = room.sov.get_mut(&region) {
+        // Trop ancienne pour la nouvelle époque : signée de nouveau.
+        if edit.t < sv.floor_t {
+            st.root_t = (st.root_t + 1).max(now_ms());
+            edit = sovereign::Edit::sign(
+                &st.cert_key,
+                rid,
+                &edit.pseudo,
+                edit.pos,
+                edit.block,
+                edit.fluid,
+                edit.at,
+                st.root_t,
+                true,
+            );
+        }
+        sv.waiting.get_or_insert_with(Instant::now);
+        sv.sent.push_back((Instant::now(), edit.clone()));
+        if let Some(c) = st.conns.get(&sv.primary) {
+            transport::push(
+                &c.tx,
+                &Response::RootEdits {
+                    region,
+                    edits: vec![edit],
+                },
+            );
+        }
+        return;
+    }
+    note_root_done(room, edit.t);
+    let before = room.build.block_at(edit.pos);
+    let e = edit;
+    if publish_block(st, rid, 0, false, &e.pseudo, e.pos, e.block, e.fluid) {
+        if !e.fluid && !(e.block == 0 && before == Some(0)) {
+            note_block(st, rid, &e.pseudo, e.block);
+        }
+        spill_chest(st, rid, e.pos);
+    }
+}
+
+/// Retient qu'une modification signée par ce relais est archivée (les plus anciennes
+/// s'oublient au-delà de 65 536).
+fn note_root_done(room: &mut Room, t: u64) -> bool {
+    let new = room.root_done.insert(t);
+    while room.root_done.len() > 1 << 16 {
+        room.root_done.pop_first();
+    }
+    new
+}
+
+/// Archive les lots confirmés d'une région souveraine : chaque modification entre dans
+/// l'historique à son rang, part aux joueurs proches qu'aucun relais de la région ne sert
+/// et aux hôtes de la région pas encore prêts, et compte dans le sac de son auteur en
+/// survie.
+fn commit_batches(st: &mut State, rid: u64, region: [i32; 2], batches: Vec<sovereign::Batch>) {
+    for b in batches {
+        for r in b.records {
+            let e = r.edit;
+            let chunk = [e.pos[0].div_euclid(16), e.pos[2].div_euclid(16)];
+            let Some(room) = st.rooms.get_mut(&rid) else {
+                return;
+            };
+            // Signée par ce relais : plus en attente ; déjà archivée par un autre chemin
+            // (passation d'une époque finie, puis renvoi) : pas une deuxième fois.
+            if e.by_root {
+                if let Some(sv) = room.sov.get_mut(&region) {
+                    sv.sent.retain(|(_, s)| s.t != e.t);
+                }
+                if !note_root_done(room, e.t) {
+                    continue;
+                }
+            }
+            let before = room.build.block_at(e.pos);
+            st.sov_committed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let data = game::encode(&game::BuildMsg::Set {
+                pos: e.pos,
+                block: e.block,
+                by: e.pseudo.clone(),
+                seq: r.seq,
+            });
+            let conns = &st.conns;
+            let to: Vec<u64> = room
+                .build
+                .listeners(chunk, u64::MAX)
+                .into_iter()
+                .filter(|m| !conns.get(m).is_some_and(|c| c.served.contains(&region)))
+                .collect();
+            let sends = room
+                .build
+                .mirror_at(proto::zone_of(chunk), &data, Some(r.seq), &to);
+            for (m, items) in sends {
+                if let Some(c) = st.conns.get(&m) {
+                    for d in items {
+                        push_zone(&c.tx, chunk, d);
+                    }
+                }
+            }
+            for sh in room.shards.get(&region).into_iter().flatten() {
+                if sh.info.is_none() {
+                    if let Some(c) = st.conns.get(&sh.host) {
+                        push_zone(&c.tx, chunk, data.clone());
+                    }
+                }
+            }
+            if !e.fluid && !(e.block == 0 && before == Some(0)) {
+                note_block(st, rid, &e.pseudo, e.block);
+            }
+            spill_chest(st, rid, e.pos);
         }
     }
 }
@@ -2145,13 +2696,11 @@ fn send_shards(st: &mut State, rid: u64, id: u64) {
         return;
     };
     let list: Vec<proto::ShardInfo> = regions_in_view(chunk)
-        .filter_map(|r| room.shards.get(&r))
-        .flatten()
-        .filter_map(|s| s.info.clone())
+        .flat_map(|r| ready_infos(room, r))
         .collect();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for i in &list {
-        (i.region, i.slot, i.node, &i.addr, i.key).hash(&mut h);
+        (i.region, i.slot, i.node, &i.addr, i.key, i.epoch).hash(&mut h);
     }
     // (Jamais zéro : zéro veut dire « rien reçu », et une liste vide ne s'envoie pas à
     // qui n'a jamais rien reçu.)
@@ -2165,6 +2714,12 @@ fn send_shards(st: &mut State, rid: u64, id: u64) {
     let Some(c) = st.conns.get(&id) else { return };
     let pseudo = c.pseudo.clone().unwrap_or_default();
     let expires = now_secs() + 24 * 3600;
+    // Certificat de la clé du compte : ses modifications signées seront reconnues dans
+    // les régions souveraines.
+    let cert = st
+        .registry
+        .lookup(&pseudo)
+        .map(|r| sovereign::Cert::issue(&st.cert_key, rid, &pseudo, r.1, expires));
     transport::push(
         &c.tx,
         &Response::ShardTicket {
@@ -2172,6 +2727,7 @@ fn send_shards(st: &mut State, rid: u64, id: u64) {
             mac: proto::shard_mac(&secret, rid, &pseudo, expires),
             pseudo,
             expires,
+            cert,
         },
     );
     transport::push(&c.tx, &Response::Shards { list });
@@ -2341,6 +2897,7 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
                     region,
                     secret,
                     slot,
+                    root: st.cert_key.verifying_key().to_bytes(),
                 },
             );
             for (zone, log) in history {
@@ -2395,6 +2952,7 @@ fn upkeep_build(st: &mut State) {
         // Propriétaire à la connexion pourrie : le monde passe au mieux connecté.
         rebalance_host(st, rid);
         upkeep_regions(st, rid, &mut index);
+        upkeep_sovereignty(st, rid);
         // Le propriétaire (qui enregistre le monde) reçoit ce qui a changé, par paquets.
         if let Some(room) = st.rooms.get_mut(&rid) {
             let owner = room.host;
@@ -2703,6 +3261,11 @@ fn open_room(
             },
             shards_dirty: HashSet::new(),
             shards_sent: HashMap::new(),
+            sov: HashMap::new(),
+            sov_past: HashMap::new(),
+            sov_skip: HashMap::new(),
+            next_epoch: 1,
+            root_done: std::collections::BTreeSet::new(),
             build: zones::Build::default(),
             backup: None,
             hidden: Vec::new(),
@@ -4020,6 +4583,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             key,
         } => {
             let rid = my_room?;
+            let signer = account_key(st, id).unwrap_or([0; 32]);
             let room = st.rooms.get_mut(&rid)?;
             let sh = room
                 .shards
@@ -4032,6 +4596,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 node,
                 addr,
                 key,
+                signer,
+                epoch: 0,
             });
             let (previous, slot) = (sh.previous.take(), sh.slot);
             room.shards_dirty.insert(region);
@@ -4044,11 +4610,189 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     transport::push(&c.tx, &Response::RoomClosed);
                 }
             }
+            // Deux relais prêts : la région devient souveraine tout de suite.
+            upkeep_sovereignty(st, rid);
             return None;
         }
-        // Sans effet depuis la v127 : ce relais ne croit plus un hôte sur parole (il publie
-        // lui-même chaque modification, les relais de région ne font que transmettre).
-        Request::RegionLog { .. } => return None,
+        // Région souveraine, de l'hôte principal : un lot qu'il vient de publier, à
+        // archiver quand un autre hôte l'aura confirmé.
+        Request::Archive { region, batch } => {
+            let rid = my_room?;
+            let sv = st.rooms.get_mut(&rid)?.sov.get_mut(&region)?;
+            let (end, chain) = sv
+                .pending
+                .back()
+                .map_or((sv.base, sv.chain), |b| (b.end(), b.chain()));
+            let fits = sv.primary == id
+                && batch.epoch == sv.epoch
+                && batch.first == end
+                && batch.prev == chain
+                && batch.verify(&sv.key);
+            if !fits || sv.pending.len() >= 4096 {
+                return None;
+            }
+            // Un lot sur huit, au hasard, vérifié ici aussi : deux hôtes complices (l'hôte
+            // principal et celui qui confirme) finissent par être pris.
+            if rand::random::<u32>().is_multiple_of(SPOT_CHECK) {
+                let rules = sovereign::Rules {
+                    room: rid,
+                    region,
+                    root: st.cert_key.verifying_key().to_bytes(),
+                    floor_t: sv.floor_t,
+                };
+                if let Some(why) =
+                    sovereign::judge(&rules, sv.epoch, &sv.key, std::slice::from_ref(&batch))
+                {
+                    log::warn!(
+                        "monde {rid} : région {region:?}, faute de l'hôte principal vue par \
+                         ce relais : {why}"
+                    );
+                    ban_host(st, id);
+                    upkeep_sovereignty(st, rid);
+                    return None;
+                }
+            }
+            sv.pending.push_back(batch);
+            sv.waiting.get_or_insert_with(Instant::now);
+            // (Les confirmations des autres hôtes ont pu arriver avant le lot.)
+            try_commit(st, rid, region);
+            return None;
+        }
+        // D'un autre hôte de la région : il a vérifié jusqu'au rang `seq`. Les lots
+        // reçus jusque-là, s'ils ont la même empreinte, sont archivés.
+        Request::Ack {
+            region,
+            epoch,
+            seq,
+            chain,
+        } => {
+            let rid = my_room?;
+            let room = st.rooms.get_mut(&rid)?;
+            let ready: Vec<u64> = room
+                .shards
+                .get(&region)
+                .into_iter()
+                .flatten()
+                .filter(|s| s.info.is_some())
+                .map(|s| s.host)
+                .collect();
+            let sv = room.sov.get_mut(&region)?;
+            if !ready.contains(&id) || sv.primary == id || epoch != sv.epoch {
+                return None;
+            }
+            sv.acks.insert(id, (seq, chain));
+            try_commit(st, rid, region);
+            return None;
+        }
+        // D'un autre hôte de la région : une faute de l'hôte principal. Ce relais refait la
+        // vérification avec les seuls lots joints (signés par l'accusé) ; prouvée, l'hôte
+        // est écarté de tout rôle de garant et un autre prend sa place.
+        Request::Accuse {
+            region,
+            epoch,
+            why,
+            evidence,
+        } => {
+            let rid = my_room?;
+            let room = st.rooms.get(&rid)?;
+            let is_host = room
+                .shards
+                .get(&region)
+                .is_some_and(|l| l.iter().any(|s| s.host == id));
+            let (accused, current, key, floor_t) = match room.sov.get(&region) {
+                Some(s) if s.epoch == epoch => (s.primary, true, s.key, s.floor_t),
+                _ => {
+                    let p = room
+                        .sov_past
+                        .get(&region)?
+                        .iter()
+                        .find(|p| p.epoch == epoch)?;
+                    (p.host, false, p.key, p.floor_t)
+                }
+            };
+            if !is_host {
+                return None;
+            }
+            let rules = sovereign::Rules {
+                room: rid,
+                region,
+                root: st.cert_key.verifying_key().to_bytes(),
+                floor_t,
+            };
+            match sovereign::judge(&rules, epoch, &key, &evidence) {
+                Some(fault) => {
+                    log::warn!(
+                        "monde {rid} : région {region:?}, faute prouvée de l'hôte principal \
+                         (époque {epoch}) : {fault}"
+                    );
+                    // (D'une époque finie aussi : il est écarté, où qu'il soit.)
+                    ban_host(st, accused);
+                    if current {
+                        upkeep_sovereignty(st, rid);
+                    }
+                }
+                None => {
+                    log::info!("monde {rid} : région {region:?}, accusation non prouvée ({why})")
+                }
+            }
+            return None;
+        }
+        // D'un hôte de la région en fin d'époque : les lots qu'il avait vérifiés (signés
+        // par l'hôte principal de cette époque), archivés s'ils suivent ce qui l'est déjà.
+        Request::Handover {
+            region,
+            epoch,
+            batches,
+        } => {
+            let rid = my_room?;
+            let room = st.rooms.get_mut(&rid)?;
+            let is_host = room
+                .shards
+                .get(&region)
+                .is_some_and(|l| l.iter().any(|s| s.host == id));
+            let past = room
+                .sov_past
+                .get_mut(&region)?
+                .iter_mut()
+                .find(|p| p.epoch == epoch)?;
+            if !is_host {
+                return None;
+            }
+            let (mut base, mut chain) = (past.base, past.chain);
+            let mut next = Vec::new();
+            for b in batches {
+                if b.end() <= base || b.epoch != epoch || !b.verify(&past.key) {
+                    continue;
+                }
+                if b.first != base || b.prev != chain {
+                    break;
+                }
+                (base, chain) = (b.end(), b.chain());
+                next.push(b);
+            }
+            // Ce relais les vérifie lui-même avant de les archiver (l'hôte principal de
+            // cette époque peut remettre lui-même des lots que personne n'a vus) : ce qui
+            // précède une faute est gardé, l'hôte fautif écarté.
+            let rules = sovereign::Rules {
+                room: rid,
+                region,
+                root: st.cert_key.verifying_key().to_bytes(),
+                floor_t: past.floor_t,
+            };
+            let (done, fault) = sound_prefix(&rules, epoch, &past.key, next);
+            if let Some(last) = done.last() {
+                (past.base, past.chain) = (last.end(), last.chain());
+            }
+            let host = past.host;
+            commit_batches(st, rid, region, done);
+            if let Some(why) = fault {
+                log::warn!(
+                    "monde {rid} : région {region:?}, passation fautive (époque {epoch}) : {why}"
+                );
+                ban_host(st, host);
+            }
+            return None;
+        }
         Request::Nearby { chunk, data } => {
             // Position sur ce serveur, gardée pour son retour.
             if let Some(game::BuildMsg::Player {
@@ -4432,7 +5176,10 @@ fn handle(
             | Request::ToZone { .. }
             | Request::Nearby { .. }
             | Request::ShardReady { .. }
-            | Request::RegionLog { .. }
+            | Request::Archive { .. }
+            | Request::Ack { .. }
+            | Request::Accuse { .. }
+            | Request::Handover { .. }
             | Request::RoomStarted { .. }
             | Request::Join { .. }
             | Request::Leave
@@ -6153,8 +6900,8 @@ mod tests {
             ([1, 64, 1], 1, first)
         );
         // Un jeu modifié fabrique une modification au nom d'un autre, avec un rang énorme,
-        // puis le compte rendu d'un relais de région : personne ne reçoit rien, et la
-        // modification suivante (une vraie) porte le rang suivant.
+        // puis un lot d'hôte principal de région souveraine (sans l'être) : personne ne
+        // reçoit rien, et la modification suivante (une vraie) porte le rang suivant.
         let forged = game::BuildMsg::Set {
             pos: [2, 64, 1],
             block: 9,
@@ -6164,8 +6911,18 @@ mod tests {
         ask(&elink, [0, 0], &forged);
         transport::push(
             &elink,
-            &Request::RegionLog {
-                entries: vec![([0, 0], game::encode(&forged))],
+            &Request::Archive {
+                region: [0, 0],
+                batch: sovereign::Batch {
+                    room,
+                    region: [0, 0],
+                    epoch: 1,
+                    first: 0,
+                    prev: [0; 32],
+                    records: Vec::new(),
+                    certs: Vec::new(),
+                    sig: Vec::new(),
+                },
             },
         );
         ask(&elink, [0, 0], &game::BuildMsg::Reject { pos, peer: 1 });

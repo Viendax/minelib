@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 30;
+pub const PROTOCOL: u32 = 31;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.
@@ -253,12 +253,15 @@ pub enum Request {
         caps: GarantCaps,
     },
     /// Construction : position (le relais n'envoie que ce qui se passe autour).
-    /// Relais de région : entrée avec le billet donné par le relais du monde.
+    /// Relais de région : entrée avec le billet donné par le relais du monde, et le
+    /// certificat de la clé du compte (les modifications signées dans une région
+    /// souveraine ; aucun pour un autre relais de la région).
     ShardLogin {
         room: u64,
         pseudo: String,
         expires: u64,
         mac: [u8; 32],
+        cert: Option<crate::sovereign::Cert>,
     },
     /// Hôte d'une région (connexion de garant) : son relais de région est prêt.
     ShardReady {
@@ -268,10 +271,34 @@ pub enum Request {
         addr: String,
         key: [u8; 32],
     },
-    /// Plus utilisé depuis la v127 (sans effet) : l'hôte d'une région rendait compte des
-    /// modifications que son relais avait publiées, et le relais du monde le croyait.
-    RegionLog {
-        entries: Vec<([i32; 2], Vec<u8>)>,
+    /// Hôte principal d'une région souveraine, au relais du monde : un lot qu'il vient de
+    /// publier (archivé quand un autre hôte de la région l'a confirmé, `Ack`).
+    Archive {
+        region: [i32; 2],
+        batch: crate::sovereign::Batch,
+    },
+    /// Autre hôte d'une région souveraine, au relais du monde : il a vérifié tout ce qu'a
+    /// publié l'hôte principal jusqu'au rang `seq` exclu, d'empreinte `chain`.
+    Ack {
+        region: [i32; 2],
+        epoch: u64,
+        seq: u64,
+        chain: [u8; 32],
+    },
+    /// Autre hôte d'une région souveraine : faute de l'hôte principal, prouvée par ses
+    /// propres lots signés (le relais du monde refait la vérification).
+    Accuse {
+        region: [i32; 2],
+        epoch: u64,
+        why: String,
+        evidence: Vec<crate::sovereign::Batch>,
+    },
+    /// Hôte d'une région souveraine dont l'époque vient de finir (hôte principal parti ou
+    /// remplacé) : les lots qu'il avait vérifiés, pour que rien ne se perde.
+    Handover {
+        region: [i32; 2],
+        epoch: u64,
+        batches: Vec<crate::sovereign::Batch>,
     },
     Position {
         chunk: [i32; 2],
@@ -283,17 +310,27 @@ pub enum Request {
         chunk: [i32; 2],
         data: Vec<u8>,
     },
-    /// Plus utilisé depuis la v127 (sans effet) : entre relais d'une même région, une
-    /// modification à mettre en ordre par le premier relais de la région.
-    PeerToZone {
-        chunk: [i32; 2],
-        data: Vec<u8>,
+    /// Région souveraine, d'un autre relais de la région à l'hôte principal : la
+    /// modification signée d'un de ses joueurs, avec son certificat.
+    PeerAsk {
+        edit: crate::sovereign::Edit,
+        cert: Option<crate::sovereign::Cert>,
     },
-    /// Plus utilisé depuis la v127 (sans effet) : entre relais d'une même région, une
-    /// modification mise en ordre par le premier relais.
-    PeerEdit {
-        chunk: [i32; 2],
-        data: Vec<u8>,
+    /// Région souveraine, de l'hôte principal aux autres relais de la région : un lot
+    /// qu'il publie (ils le vérifient avant de le transmettre à leurs joueurs).
+    PeerBatch {
+        batch: crate::sovereign::Batch,
+    },
+    /// Région souveraine, de l'hôte principal : modification refusée, à dire à son auteur
+    /// (joueur de l'autre relais).
+    PeerReject {
+        pseudo: String,
+        pos: [i32; 3],
+    },
+    /// Région souveraine, d'un autre relais à l'hôte principal : des lots lui manquent,
+    /// à partir du rang `from` (qu'il les renvoie).
+    PeerResend {
+        from: u64,
     },
     /// Construction, au relais du monde : demande sur ce chunk (changer un bloc, lâcher ou
     /// ramasser un objet, ouvrir un coffre). Lui seul décide et publie le résultat.
@@ -374,11 +411,16 @@ impl Request {
                 | Request::Broadcast { .. }
                 | Request::Position { .. }
                 | Request::PeerNearby { .. }
-                | Request::PeerToZone { .. }
-                | Request::PeerEdit { .. }
+                | Request::PeerAsk { .. }
+                | Request::PeerBatch { .. }
+                | Request::PeerReject { .. }
+                | Request::PeerResend { .. }
                 | Request::ToZone { .. }
                 | Request::Nearby { .. }
-                | Request::RegionLog { .. }
+                | Request::Archive { .. }
+                | Request::Ack { .. }
+                | Request::Accuse { .. }
+                | Request::Handover { .. }
                 | Request::ShardReady { .. }
                 | Request::Rtt { .. }
                 | Request::Echo { .. }
@@ -619,26 +661,39 @@ pub enum Response {
         room: u64,
         region: [i32; 2],
         secret: [u8; 32],
-        /// Rang de ce relais dans sa région (le plus petit met les modifications en
-        /// ordre).
+        /// Rang de ce relais dans sa région.
         slot: u16,
+        /// Clé du relais du monde (il certifie les clés des joueurs et peut signer à leur
+        /// place).
+        root: [u8; 32],
     },
     /// À l'hôte d'un relais de région : tous les relais prêts de sa région (lui compris).
     /// Ils se relient entre eux : une région très peuplée est servie par plusieurs relais.
+    /// `sov` : la région est souveraine (voir `crate::sovereign`), son époque en cours.
     ShardPeers {
         region: [i32; 2],
         list: Vec<ShardInfo>,
+        sov: Option<Sov>,
+    },
+    /// À l'hôte principal d'une région souveraine : modifications arrivées au relais du
+    /// monde (joueur pas encore relié au relais de la région, modification en masse d'un
+    /// OP), signées par lui à la place de leurs auteurs.
+    RootEdits {
+        region: [i32; 2],
+        edits: Vec<crate::sovereign::Edit>,
     },
     /// Aux joueurs d'un monde : relais de ses régions (les autres passent par ce relais).
     Shards {
         list: Vec<ShardInfo>,
     },
-    /// Billet pour entrer dans les relais de région de ce monde.
+    /// Billet pour entrer dans les relais de région de ce monde, et certificat de la clé
+    /// du compte (pour signer ses modifications dans une région souveraine).
     ShardTicket {
         room: u64,
         pseudo: String,
         expires: u64,
         mac: [u8; 32],
+        cert: Option<crate::sovereign::Cert>,
     },
     /// Garant extérieur d'un serveur de construction (un joueur d'une autre partie, sans
     /// lien avec celle-ci) : il recevra ses zones (`Zones`) et validera les modifications.
@@ -774,6 +829,7 @@ impl Response {
                 | Response::BuildGarant { .. }
                 | Response::ShardTask { .. }
                 | Response::ShardPeers { .. }
+                | Response::RootEdits { .. }
                 | Response::Shards { .. }
                 | Response::ShardTicket { .. }
         )
@@ -815,6 +871,49 @@ pub struct ShardInfo {
     pub node: [u8; 32],
     pub addr: String,
     pub key: [u8; 32],
+    /// Clé du compte de l'hôte (il signe ce qu'il publie quand il est l'hôte principal
+    /// d'une région souveraine).
+    pub signer: [u8; 32],
+    /// Époque de la région souveraine (0 : pas souveraine, les modifications vont au
+    /// relais du monde).
+    pub epoch: u64,
+}
+
+impl ShardInfo {
+    /// Le même relais (son époque peut avoir changé : pas de quoi s'y reconnecter).
+    pub fn same_relay(&self, other: &ShardInfo) -> bool {
+        (
+            self.region,
+            self.slot,
+            self.node,
+            &self.addr,
+            self.key,
+            self.signer,
+        ) == (
+            other.region,
+            other.slot,
+            other.node,
+            &other.addr,
+            other.key,
+            other.signer,
+        )
+    }
+}
+
+/// Époque d'une région souveraine (voir `crate::sovereign`), dite aux hôtes de la région.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Sov {
+    pub epoch: u64,
+    /// Rang (`ShardInfo::slot`) de l'hôte principal.
+    pub primary: u16,
+    /// Premier rang de l'époque.
+    pub first: u64,
+    /// Ce que le relais du monde a déjà archivé : rang suivant et empreinte. Un hôte qui
+    /// arrive en cours d'époque vérifie à partir de là.
+    pub base: u64,
+    pub chain: [u8; 32],
+    /// Date (ms) en dessous de laquelle une modification est périmée dans l'époque.
+    pub floor_t: u64,
 }
 
 /// Nom sous lequel le relais de rang `slot` entre chez les autres relais de sa région

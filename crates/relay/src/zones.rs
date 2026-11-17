@@ -47,7 +47,10 @@ enum LogKey {
 }
 
 impl ZoneLog {
-    fn push(&mut self, seq: u64, data: &[u8]) {
+    /// Garde une entrée (la dernière de sa case, de son objet, de son emplacement).
+    /// Renvoie si c'est un bloc, et si elle est gardée : plus ancienne que celle déjà là
+    /// (archivée en retard, d'une époque souveraine finie), elle est sans effet.
+    fn push(&mut self, seq: u64, data: &[u8]) -> (bool, bool) {
         use minelib_net::game::BuildMsg;
         // Une seule entrée par case, par objet au sol, par emplacement de coffre : la
         // dernière.
@@ -59,15 +62,22 @@ impl ZoneLog {
         };
         let block = matches!(key, Some(LogKey::Block(_)));
         if let Some(key) = key {
-            if let Some(old) = self.by_pos.insert(key, seq) {
+            if let Some(&old) = self.by_pos.get(&key) {
+                if old > seq {
+                    return (block, false);
+                }
                 if let Some((_, d)) = self.entries.remove(&old) {
                     self.bytes -= d.len();
                 }
             }
+            self.by_pos.insert(key, seq);
         }
         self.bytes += data.len();
         self.entries.insert(seq, (block, data.to_vec()));
-        self.last[!block as usize] = seq;
+        // (Une modification archivée en retard, d'une époque souveraine finie, peut avoir
+        // un rang plus petit que la dernière : le dernier rang ne recule jamais.)
+        let k = !block as usize;
+        self.last[k] = self.last[k].max(seq);
         while self.bytes > LOG_MAX {
             let Some((&k, _)) = self.entries.iter().next() else {
                 break;
@@ -76,6 +86,7 @@ impl ZoneLog {
             self.bytes -= d.len();
             self.by_pos.retain(|_, s| *s != k);
         }
+        (block, true)
     }
 
     /// Entrées d'une sorte (`blocks` : les blocs, sinon le reste) après le numéro `after`.
@@ -385,13 +396,35 @@ impl Build {
     /// message seul s'il avait tout le reste, sinon tout ce qui lui manque de cette sorte
     /// (rien n'est jamais perdu, même s'il s'était éloigné un moment).
     pub fn mirror_to(&mut self, zone: [i32; 2], data: &[u8], listeners: &[u64]) -> Sends {
+        self.mirror_at(zone, data, None, listeners)
+    }
+
+    /// Comme `mirror_to`, au rang `seq` s'il est donné (modification mise en ordre par
+    /// l'hôte principal d'une région souveraine, voir `minelib_net::sovereign`).
+    pub fn mirror_at(
+        &mut self,
+        zone: [i32; 2],
+        data: &[u8],
+        seq: Option<u64>,
+        listeners: &[u64],
+    ) -> Sends {
         let log = self.logs.entry(zone).or_default();
-        self.next_seq = self.next_seq.max(log.last()) + 1;
-        let seq = self.next_seq;
+        let seq = match seq {
+            Some(s) => {
+                self.next_seq = self.next_seq.max(s);
+                s
+            }
+            None => {
+                self.next_seq = self.next_seq.max(log.last()) + 1;
+                self.next_seq
+            }
+        };
         let before = log.last;
-        log.push(seq, data);
-        // Sorte de l'entrée : celle dont le dernier numéro vient de changer.
-        let blocks = log.last[0] != before[0];
+        let (blocks, kept) = log.push(seq, data);
+        // (Plus ancienne que ce qui est gardé pour cette case : personne n'en a besoin.)
+        if !kept {
+            return Vec::new();
+        }
         let (kind, before) = (!blocks as usize, before[!blocks as usize]);
         let mut out = Vec::new();
         // Dans une foule, la modification n'est poussée tout de suite qu'aux `LIVE_MAX`
@@ -404,9 +437,17 @@ impl Build {
             } else {
                 out.push((id, log.since(*known, blocks)));
             }
-            *known = seq;
+            *known = (*known).max(seq);
         }
         out
+    }
+
+    /// Réserve `n` rangs à la suite (une époque souveraine : l'hôte principal de la région
+    /// numérote lui-même dans cette plage). Renvoie le premier.
+    pub fn reserve(&mut self, n: u64) -> u64 {
+        let first = self.next_seq + 1;
+        self.next_seq += n;
+        first
     }
 
     /// Dernier bloc publié en `pos`, si cette case a déjà été modifiée (le relais ne
@@ -532,6 +573,45 @@ impl Build {
 
 #[cfg(test)]
 mod tests {
+    /// Une modification d'une époque souveraine finie, archivée en retard (passation) avec
+    /// un rang plus petit qu'une plus récente de la même case : l'historique garde la plus
+    /// récente. Celle d'une autre case, archivée en retard aussi, est gardée et remise
+    /// comme un bloc.
+    #[test]
+    fn a_late_archived_edit_never_replaces_a_newer_one() {
+        use minelib_net::game::{self, BuildMsg};
+        let set = |pos: [i32; 3], block: u16, seq: u64| {
+            game::encode(&BuildMsg::Set {
+                pos,
+                block,
+                by: "Eve".into(),
+                seq,
+            })
+        };
+        let mut b = super::Build::default();
+        let (a, other) = ([1, 70, 1], [2, 70, 2]);
+        let zone = minelib_net::proto::zone_of([0, 0]);
+        b.mirror_at(zone, &set(a, 5, 100), Some(100), &[7]);
+        let late = b.mirror_at(zone, &set(a, 9, 50), Some(50), &[7]);
+        assert!(late.is_empty(), "plus ancienne : rien à remettre");
+        assert_eq!(b.block_at(a), Some(5));
+        let other_late = b.mirror_at(zone, &set(other, 3, 60), Some(60), &[8]);
+        assert_eq!(other_late.len(), 1);
+        assert_eq!(b.block_at(other), Some(3));
+        // Un joueur qui arrive reçoit les deux cases à leur dernière valeur.
+        let logs = b.all_logs(9);
+        let mut cells: Vec<([i32; 3], u16)> = logs
+            .iter()
+            .flat_map(|(_, l)| l.iter())
+            .filter_map(|d| match game::decode::<BuildMsg>(d) {
+                Some(BuildMsg::Set { pos, block, .. }) => Some((pos, block)),
+                _ => None,
+            })
+            .collect();
+        cells.sort();
+        assert_eq!(cells, vec![(a, 5), (other, 3)]);
+    }
+
     /// Simulation de foule dans une seule région, avec le vrai code de diffusion
     /// (`Build::nearby`, répartition `shard_for`, tailles réelles des messages) : ce que
     /// chaque relais de région doit envoyer et ce que chaque joueur reçoit, par seconde.
@@ -587,6 +667,8 @@ mod tests {
                         node: [i as u8; 32],
                         addr: String::new(),
                         key: [i as u8 + 1; 32],
+                        signer: [0; 32],
+                        epoch: 0,
                     })
                     .collect();
                 let mut builds: Vec<Build> = (0..relays).map(|_| Build::default()).collect();
