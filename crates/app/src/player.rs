@@ -420,8 +420,12 @@ impl Player {
                     }
                 }
                 // La vitesse ne grandit pas plus vite que `FLY_ACCEL` (changer de
-                // direction ou ralentir reste immédiat).
-                let (now, most) = (self.vel.length(), before + FLY_ACCEL * dt);
+                // direction reste immédiat), et ne dépasse jamais celle demandée :
+                // « courir » lâchée, on retombe tout de suite à la vitesse normale (si
+                // « avancer » est lâchée un instant après, c'est autant de chemin en
+                // moins parcouru entre-temps).
+                let most = (before + FLY_ACCEL * dt).min(target.length());
+                let now = self.vel.length();
                 if now > most {
                     self.vel *= most / now;
                 }

@@ -7,13 +7,20 @@
 //!
 //! Le jeu mesure donc, à chaque fin de course, le temps entre « courir » relâchée et
 //! « avancer » relâchée. Trois fois de suite nettement après (0,18 à 1,5 s), sans une
-//! seule fois ensemble entre-temps : la touche traîne. Dès lors, lâcher « courir » arrête
-//! d'avancer tout de suite, après une longue course comme après un petit sprint, et à
-//! chaque fois (la règle est la même partout : le joueur sait à quoi s'attendre). Si
-//! « avancer » reste annoncée enfoncée un peu plus longtemps qu'elle n'a traîné récemment
-//! pour un appui de cette durée (le jeu mesure chaque retard), c'est que le joueur la
-//! tient vraiment, pour continuer en marchant : la marche reprend. Un nouvel appui
-//! (« courir », ou « avancer » relâchée puis renfoncée) repart toujours tout de suite.
+//! seule fois ensemble entre-temps : la touche traîne, la règle s'active.
+//!
+//! Dès lors, lâcher « courir » retient « avancer » juste le temps que la touche a mis à
+//! remonter ces dernières fois (un peu plus, et selon la durée de l'appui : elle traîne
+//! davantage après un long appui). Si « avancer » est toujours annoncée enfoncée après
+//! cela, c'est que le joueur la tient vraiment, pour continuer sans courir : il repart.
+//! Un nouvel appui (« courir », ou « avancer » relâchée puis renfoncée) repart toujours
+//! tout de suite.
+//!
+//! Tant que la touche remonte bien (quelques centièmes de seconde, ce qui est le cas au
+//! début de chaque partie et après les appuis brefs), rien n'est retenu du tout : sinon
+//! le joueur qui lâche « courir » en gardant « avancer » serait arrêté à chaque fois,
+//! pour rien. Les deux cas ne se distinguent pas pendant que la touche traîne : c'est le
+//! retard mesuré, et lui seul, qui dit combien de temps il faut attendre.
 //!
 //! La règle se retient d'une partie à l'autre, ne s'active jamais sur un clavier sain,
 //! s'éteint si le joueur continue souvent de marcher après avoir couru, et se règle à la
@@ -36,14 +43,16 @@ const LATE_TO: f32 = 1.5;
 const IN_A_ROW: u32 = 3;
 /// Fins de course retenues (pour éteindre la règle).
 const HISTORY: usize = 8;
-/// Retards retenus pour régler l'attente : assez pour que quelques petits sprints (où
-/// la touche traîne peu) ne fassent pas oublier ce qu'elle fait après une longue course.
-const LAGS: usize = 16;
-/// Bornes du retard rapporté à `base_lag`. En dessous du plancher, l'attente serait trop
-/// juste dès que la machine chauffe ; au-dessus du plafond, ce n'est plus la touche qui
-/// traîne mais le joueur qui a continué un instant en marchant.
-const SCALE_MIN: f32 = 0.5;
-const SCALE_MAX: f32 = 2.0;
+/// Retards retenus pour régler l'attente, à part pour les appuis brefs et les longs (la
+/// touche traîne peu après un petit sprint, beaucoup après une longue course : les uns
+/// ne doivent pas faire oublier les autres).
+const LAGS: usize = 5;
+/// Durée d'appui sur « avancer » (s) à partir de laquelle l'appui est « long ».
+const LONG_FROM: f32 = 2.0;
+/// Retard (s) en dessous duquel la touche remonte bien. Tant qu'aucun des derniers
+/// retards ne le dépasse, rien n'est retenu : arrêter le joueur pour si peu ne ferait
+/// que saccader celui qui continue sans courir.
+const FINE: f32 = 0.05;
 /// Fichier (dossier du jeu) qui retient le réglage d'une partie à l'autre : « 1 » (la
 /// touche traîne, appris), « oui » (demandé par le joueur), « non » (refusé).
 const FILE: &str = "touche_avancer_lente";
@@ -66,6 +75,8 @@ struct Wait {
     /// Durée de l'appui sur « avancer » à ce moment, et temps passé à courir.
     held: f32,
     ran: f32,
+    /// Attente décidée à ce moment (s).
+    patience: f32,
     /// Le joueur a-t-il été arrêté, et combien de temps la marche a repris ensuite
     /// (attente dépassée) avant que la touche remonte.
     stopped: bool,
@@ -82,8 +93,9 @@ pub struct Stop {
     pub ran: f32,
     /// Attente prévue (s) : au-delà, la marche reprend.
     pub patience: f32,
-    /// Arrêté dès « courir » relâchée ; et temps pendant lequel la marche avait repris
-    /// avant que la touche remonte (0 : l'arrêt a tenu jusqu'au bout).
+    /// Arrêté dès « courir » relâchée (faux : la touche remontait bien ces derniers
+    /// temps, rien n'a été retenu) ; et temps pendant lequel la marche avait repris avant
+    /// que la touche remonte (0 : l'arrêt a tenu jusqu'au bout).
     pub stopped: bool,
     pub resumed: f32,
 }
@@ -102,9 +114,12 @@ pub struct Guard {
     /// continué en marchant.
     streak: u32,
     walked: std::collections::VecDeque<bool>,
-    /// Derniers retards mesurés, rapportés à `base_lag` (la touche traîne plus ou moins
-    /// selon que la machine est chaude) : ils règlent l'attente.
-    scales: std::collections::VecDeque<f32>,
+    /// Derniers retards mesurés (en secondes, et rapportés à `base_lag` : la touche
+    /// traîne plus ou moins selon que la machine est chaude), après un appui bref et
+    /// après un appui long : ils règlent l'attente. Vides au lancement : la touche est
+    /// tenue pour bonne tant qu'elle n'a pas traîné dans cette partie.
+    short: std::collections::VecDeque<(f32, f32)>,
+    long: std::collections::VecDeque<(f32, f32)>,
     active: bool,
     /// Avancer est retenue en attendant un nouvel appui.
     blocked: bool,
@@ -127,6 +142,13 @@ fn base_lag(held: f32) -> f32 {
     } else {
         0.4 + 0.025 * held.min(40.0)
     }
+}
+
+/// Plus long retard (s) qu'on puisse encore attribuer à la touche après un appui de
+/// `held` secondes (une fois et demie ce qu'elle a montré de pire) : « avancer »
+/// relâchée plus tard que cela après « courir », c'est le joueur qui a continué.
+fn plausible(held: f32) -> f32 {
+    (1.5 * base_lag(held)).min(1.5)
 }
 
 impl Guard {
@@ -181,18 +203,22 @@ impl Guard {
     }
 
     /// Temps (s) pendant lequel « avancer » est retenue après « courir » relâchée, pour un
-    /// appui de `held` secondes : un peu plus que le pire retard que la touche a montré
-    /// récemment pour un appui de cette durée. Au-delà, elle est tenue pour de bon (le
-    /// joueur continue en marchant) et la marche reprend.
+    /// appui de `held` secondes : un peu plus que le pire des derniers retards mesurés
+    /// pour un appui de ce genre (bref ou long), rapporté à sa durée. Au-delà, elle est
+    /// tenue pour de bon et le joueur repart. Sans retard mesuré dans cette partie, ou
+    /// avec des retards de quelques centièmes seulement (voir `FINE`) : zéro, rien n'est
+    /// retenu.
     fn patience(&self, held: f32) -> f32 {
-        let scale = self
-            .scales
-            .iter()
-            .copied()
-            .fold(None, |m: Option<f32>, v| Some(m.map_or(v, |m| m.max(v))))
-            .unwrap_or(1.0)
-            .max(SCALE_MIN);
-        (1.2 * scale * base_lag(held) + 0.2).clamp(0.35, 4.0)
+        let lags = if held < LONG_FROM {
+            &self.short
+        } else {
+            &self.long
+        };
+        if lags.iter().all(|l| l.0 < FINE) {
+            return 0.0;
+        }
+        let scale = lags.iter().map(|l| l.1).fold(0.0f32, f32::max);
+        1.3 * scale * base_lag(held) + 0.03
     }
 
     /// La règle est-elle active pour ce joueur ?
@@ -248,33 +274,44 @@ impl Guard {
         }
         if let Some(mut w) = self.waiting {
             w.t += dt;
-            let patience = self.patience(w.held);
             if !fwd {
                 self.waiting = None;
                 self.blocked = false;
-                // Un peu après l'attente, c'est encore la touche (elle traîne plus que
-                // prévu : l'attente s'allongera) ; bien après, il marchait.
-                if w.t <= patience + 0.25 {
+                if w.t <= plausible(w.held).max(w.patience) {
+                    // Relâchée : ensemble (clavier sain), ou après (elle traînait). Ce
+                    // retard règle l'attente des prochaines fois.
                     self.stop = Some(Stop {
                         gap: w.t,
                         held: w.held,
                         ran: w.ran,
-                        patience,
+                        patience: w.patience,
                         stopped: w.stopped,
                         resumed: w.resumed,
                     });
-                    self.scales
-                        .push_back((w.t / base_lag(w.held)).min(SCALE_MAX));
-                    if self.scales.len() > LAGS {
-                        self.scales.pop_front();
+                    let lags = if w.held < LONG_FROM {
+                        &mut self.short
+                    } else {
+                        &mut self.long
+                    };
+                    lags.push_back((w.t, w.t / base_lag(w.held)));
+                    if lags.len() > LAGS {
+                        lags.pop_front();
                     }
                     if w.ran >= HELD_MIN {
                         self.sample(Some(w.t));
                     }
                 } else {
+                    // Bien après : il avait continué sans courir.
                     self.note = Some(format!(
-                        "courir relâchée après {:.2} s de course, avancer gardée {:.2} s de                          plus (retenue {patience:.2} s)",
-                        w.ran, w.t
+                        "courir relâchée après {:.2} s de course, avancer gardée {:.2} s de \
+                         plus ({})",
+                        w.ran,
+                        w.t,
+                        if w.stopped {
+                            format!("retenue {:.2} s", w.patience)
+                        } else {
+                            "rien de retenu".to_string()
+                        }
                     ));
                     if w.ran >= HELD_MIN {
                         self.sample(None);
@@ -282,22 +319,32 @@ impl Guard {
                 }
             } else if modifier {
                 // Il recourt sans avoir lâché « avancer » : il repart tout de suite. Le
-                // prochain relâchement de « courir » l'arrêtera comme les autres.
-                if w.stopped && w.t <= patience {
+                // prochain relâchement de « courir » sera traité comme les autres.
+                if w.stopped && w.t <= w.patience {
                     self.note = Some(format!(
-                        "courir relâchée puis reprise après {:.2} s, avancer toujours tenue                          (retenue jusque-là)",
+                        "courir relâchée puis reprise après {:.2} s, avancer toujours tenue \
+                         (retenue jusque-là)",
                         w.t
                     ));
                 }
                 self.waiting = None;
                 self.blocked = false;
             } else {
-                if w.t > patience {
-                    // Toujours tenue après le pire retard connu : il la tient pour de bon.
+                if w.t > w.patience {
+                    // Toujours tenue après le pire retard récent : il la tient pour de bon.
+                    if self.blocked {
+                        self.note = Some(format!(
+                            "courir relâchée, avancer toujours tenue après {:.2} s : il \
+                             repart (retenu {:.2} s)",
+                            w.t, w.patience
+                        ));
+                    }
                     self.blocked = false;
-                    w.resumed += dt;
+                    if w.stopped {
+                        w.resumed += dt;
+                    }
                 }
-                if w.t > patience + 6.0 {
+                if w.t > plausible(w.held).max(w.patience) + 6.0 {
                     self.waiting = None;
                     if w.ran >= HELD_MIN {
                         self.sample(None);
@@ -314,11 +361,13 @@ impl Guard {
             self.both += dt;
         }
         if self.mod_was && !modifier && fwd && self.both >= TOGETHER_MIN {
-            self.blocked = self.active;
+            let patience = self.patience(self.fwd_time);
+            self.blocked = self.active && patience > 0.0;
             self.waiting = Some(Wait {
                 t: 0.0,
                 held: self.fwd_time,
                 ran: self.both,
+                patience,
                 stopped: self.blocked,
                 resumed: 0.0,
             });
@@ -361,6 +410,17 @@ mod tests {
             g.update(DT, false, false, false);
         }
         moved
+    }
+
+    /// Règle demandée, sur un clavier dont la touche vient de traîner `gap` secondes
+    /// après des courses de `run` secondes.
+    fn lagging(run: f32, gap: f32) -> Guard {
+        let mut g = Guard::default();
+        g.set_mode(Mode::On);
+        for _ in 0..3 {
+            sprint(&mut g, run, Some(gap));
+        }
+        g
     }
 
     #[test]
@@ -417,25 +477,79 @@ mod tests {
         assert!(g.active());
     }
 
-    /// Les petits sprints (une demi-seconde, une seconde) sont arrêtés comme les longues
-    /// courses : c'est là que le joueur voyait encore la touche traîner.
+    /// Le défaut signalé en v122 : la touche remontait bien (quelques millièmes de
+    /// seconde), le joueur gardait « avancer » et lâchait « courir » de temps en temps, et
+    /// le jeu l'arrêtait net près d'une seconde à chaque fois. Tant que la touche remonte
+    /// bien, rien n'est retenu.
     #[test]
-    fn short_sprints_are_stopped_at_once_too() {
+    fn a_key_that_comes_up_fine_never_holds_the_player_who_keeps_walking() {
         let mut g = Guard::default();
         g.set_mode(Mode::On);
+        // Au lancement, sans aucune mesure : rien n'est retenu.
+        assert!((sprint(&mut g, 1.0, None) - 8.0).abs() < 0.02);
+        assert!((sprint(&mut g, 10.0, None) - 8.0).abs() < 0.02);
+        // Fins de course mesurées dans cette partie : 3 à 40 ms, appuis brefs et longs.
         for (run, gap) in [
-            (0.3, 0.05),
+            (0.2, 0.004),
+            (0.6, 0.02),
+            (2.8, 0.024),
+            (7.7, 0.01),
+            (1.0, 0.04),
+        ] {
+            assert!((sprint(&mut g, run, Some(gap)) - gap).abs() < 0.011);
+            assert!(!g.stop.take().expect("mesurée").stopped);
+        }
+        // « Avancer » gardée 34 s, « courir » lâchée puis reprise toutes les deux
+        // secondes : il n'est jamais arrêté.
+        let mut first = true;
+        let mut blocked = 0;
+        for i in 0..(34.0 / DT) as usize {
+            let run = (i as f32 * DT) % 2.2 < 1.2;
+            if g.update(DT, true, std::mem::take(&mut first), run) {
+                blocked += 1;
+            }
+        }
+        assert_eq!(blocked, 0, "jamais retenu");
+    }
+
+    /// Quand la touche traîne, l'attente suit le retard mesuré de près : celui qui garde
+    /// « avancer » repart dès que ce retard est passé, pas une seconde plus tard.
+    #[test]
+    fn the_wait_follows_the_measured_lag_closely() {
+        // Elle traîne 0,15 s après des courses de 3 s : retenue un quart de seconde.
+        let mut g = lagging(3.0, 0.15);
+        assert!(sprint(&mut g, 3.0, Some(0.15)) < 0.02, "arrêt net");
+        let moved = sprint(&mut g, 3.0, None);
+        assert!((7.7..7.8).contains(&moved), "repart vite : {moved}");
+        // Elle se remet à bien remonter (cinq fins de course nettes) : plus rien n'est
+        // retenu.
+        for _ in 0..5 {
+            sprint(&mut g, 3.0, Some(0.01));
+        }
+        assert!((sprint(&mut g, 3.0, None) - 8.0).abs() < 0.02);
+        // Elle traîne de nouveau : le premier retard passe (rien ne l'annonçait), les
+        // suivants sont arrêtés.
+        assert!(sprint(&mut g, 3.0, Some(0.3)) > 0.25);
+        assert!(sprint(&mut g, 3.0, Some(0.3)) < 0.02);
+    }
+
+    /// Les petits sprints (une demi-seconde, une seconde) sont arrêtés comme les longues
+    /// courses quand la touche traîne après eux aussi.
+    #[test]
+    fn short_sprints_are_stopped_at_once_too() {
+        let mut g = lagging(0.6, 0.2);
+        for (run, gap) in [
+            (0.3, 0.15),
             (0.6, 0.14),
             (1.0, 0.2),
-            (0.5, 0.3),
+            (0.5, 0.2),
             (1.2, 0.25),
         ] {
             assert!(sprint(&mut g, run, Some(gap)) < 0.02, "sprint {run} s");
         }
-        // Après un petit sprint, s'il continue en marchant, la marche reprend vite (en
-        // deux tiers de seconde au plus, après les retards ci-dessus).
+        // Après un petit sprint, s'il continue en marchant, la marche reprend vite.
         let moved = sprint(&mut g, 0.6, None);
-        assert!(moved > 7.3, "{moved}");
+        assert!(moved > 7.5, "{moved}");
         // « Courir » seulement frôlée : rien n'est retenu.
         assert!((sprint(&mut g, 0.05, Some(0.5)) - 0.5).abs() < 0.02);
     }
@@ -444,11 +558,10 @@ mod tests {
     /// fait après une longue course.
     #[test]
     fn short_sprints_do_not_shorten_the_wait_after_a_long_run() {
-        let mut g = Guard::default();
-        g.set_mode(Mode::On);
+        let mut g = lagging(20.0, 1.1);
         assert!(sprint(&mut g, 20.0, Some(1.1)) < 0.02);
         for _ in 0..10 {
-            assert!(sprint(&mut g, 0.5, Some(0.05)) < 0.02);
+            sprint(&mut g, 0.5, Some(0.01));
         }
         assert!(sprint(&mut g, 20.0, Some(1.1)) < 0.02);
     }
@@ -472,27 +585,27 @@ mod tests {
     }
 
     /// Un joueur qui continue un instant en marchant puis s'arrête ne fait pas grandir
-    /// l'attente sans fin : au-delà d'un quart de seconde après l'attente, ce n'est plus
-    /// compté comme un retard de la touche.
+    /// l'attente sans fin : au-delà de ce que la touche peut expliquer, ce n'est plus
+    /// compté comme un retard.
     #[test]
     fn walking_on_a_little_does_not_make_the_wait_grow() {
-        let mut g = Guard::default();
-        g.set_mode(Mode::On);
-        for _ in 0..4 {
-            sprint(&mut g, 5.0, Some(0.3));
-        }
+        let mut g = lagging(5.0, 0.3);
         let before = g.patience(5.0);
+        assert!(before < 0.5, "{before}");
         for _ in 0..12 {
-            sprint(&mut g, 5.0, Some(before + 0.6));
+            sprint(&mut g, 5.0, Some(plausible(5.0) + 0.2));
         }
         assert!((g.patience(5.0) - before).abs() < 1e-3);
-        assert!(before < 0.7, "{before}");
+        // Et même en s'arrêtant juste dans la marge, l'attente reste bornée.
+        for _ in 0..12 {
+            sprint(&mut g, 5.0, Some(plausible(5.0) - 0.02));
+        }
+        assert!(g.patience(5.0) < 1.1, "{}", g.patience(5.0));
     }
 
     #[test]
     fn pressing_forward_or_sprint_again_always_moves() {
-        let mut g = Guard::default();
-        g.set_mode(Mode::On);
+        let mut g = lagging(5.0, 0.4);
         let mut first = true;
         for _ in 0..1000 {
             g.update(DT, true, std::mem::take(&mut first), true);
@@ -518,11 +631,10 @@ mod tests {
     /// Arrêt puis redémarrage rapide (les deux touches lâchées un tiers de seconde puis
     /// renfoncées) : la touche qui traîne cache au jeu qu'« avancer » a été lâchée, il ne
     /// voit que « courir » lâchée puis reprise. Chaque arrêt doit pourtant tenir, y
-    /// compris le dernier (avant, seul le premier tenait).
+    /// compris le dernier.
     #[test]
     fn every_stop_holds_even_when_forward_never_seems_released() {
-        let mut g = Guard::default();
-        g.set_mode(Mode::On);
+        let mut g = lagging(5.0, 0.4);
         let mut held = 0;
         let mut step = |g: &mut Guard, modifier: bool, secs: f32| {
             let mut blocked = 0.0;
