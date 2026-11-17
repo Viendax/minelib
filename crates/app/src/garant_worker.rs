@@ -25,11 +25,27 @@ pub struct Login {
     pub device: Option<[u8; 32]>,
     /// Dossier du nœud iroh du jeu (relais de région joignable de partout).
     pub node_dir: Option<PathBuf>,
+    /// Fichier des votes de témoin de ce jeu (voir `VoteBook`).
+    pub votes: Option<PathBuf>,
+    /// Le monde du joueur a été repris par un relais de secours (sans comptes) : la
+    /// connexion de garant y entre avec le certificat de la clé du compte (voir
+    /// `Request::GarantLogin`), à l'adresse du relais repris.
+    pub takeover: Option<CertLogin>,
+}
+
+/// Entrée par certificat chez le relais d'un monde repris.
+#[derive(Clone)]
+pub struct CertLogin {
+    pub at: minelib_net::proto::StandbyAt,
+    pub cert: minelib_net::sovereign::Cert,
+    pub key: minelib_net::ed25519_dalek::SigningKey,
 }
 
 pub struct GarantWorker {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Ce jeu tient le relais d'un monde repris (son relais de secours a repris le monde).
+    hosting: Arc<AtomicBool>,
 }
 
 impl GarantWorker {
@@ -37,17 +53,40 @@ impl GarantWorker {
     /// ranger une carte téléchargée.
     pub fn start(login: Login, maps: Vec<([u8; 32], PathBuf)>, maps_root: PathBuf) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
+        let hosting = Arc::new(AtomicBool::new(false));
+        let (flag, host_flag) = (stop.clone(), hosting.clone());
         let thread = std::thread::Builder::new()
             .name("garant".into())
-            .spawn(move || run(login, maps, maps_root, flag))
+            .spawn(move || run(login, maps, maps_root, flag, host_flag))
             .ok();
-        Self { stop, thread }
+        Self {
+            stop,
+            thread,
+            hosting,
+        }
     }
 
     /// Le fil tourne encore.
     pub fn alive(&self) -> bool {
         self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    /// Ce jeu tient le relais d'un monde repris : arrêter ce fil arrêterait le monde (il
+    /// le confierait d'abord à son relais de secours).
+    pub fn hosting(&self) -> bool {
+        self.hosting.load(Ordering::Relaxed)
+    }
+
+    /// Fermeture du jeu : le fil s'arrête proprement (un monde repris ici est confié à son
+    /// relais de secours) ; on l'attend une seconde au plus.
+    pub fn finish(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let start = Instant::now();
+            while !t.is_finished() && start.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 }
 
@@ -80,13 +119,7 @@ pub struct StandbyHost {
     handle: minelib_relay::Handle,
     _node: Option<Arc<minelib_p2p::Node>>,
     pub taken: bool,
-    /// Depuis quand il a voté sans reprendre le monde (voir `STANDBY_GIVE_UP`).
-    voted_at: Option<Instant>,
 }
-
-/// Un relais de secours qui a voté sans pouvoir reprendre le monde (les autres gardiens
-/// entendaient encore le relais du monde) s'arrête au bout de ce temps.
-const STANDBY_GIVE_UP: Duration = Duration::from_secs(600);
 
 impl StandbyHost {
     /// Lance le relais de secours (tenu par le joueur `me`) et annonce au relais du monde
@@ -114,6 +147,9 @@ impl StandbyHost {
         .map_err(|e| log::warn!("relais de secours : {e:#}"))
         .ok()?;
         handle.standby_begin(room, root, info, me);
+        // (Essais : tout le monde est sur cette machine ; le prochain relais de secours du
+        // monde repris aussi.)
+        handle.set_standby_local(cfg!(test));
         let port = handle.addr.port();
         // Joignable de partout par iroh (sans donner d'adresse IP), sinon sur le réseau
         // local.
@@ -142,7 +178,6 @@ impl StandbyHost {
             handle,
             _node: node,
             taken: false,
-            voted_at: None,
         })
     }
 
@@ -152,8 +187,9 @@ impl StandbyHost {
         &self,
         t: u64,
         committee: &guard::Committee,
+        paused: bool,
     ) -> Option<minelib_net::proto::Request> {
-        let version = self.handle.standby_beat(committee)?;
+        let version = self.handle.standby_beat(committee, paused)?;
         Some(minelib_net::proto::Request::Lease {
             room: self.room,
             version,
@@ -169,28 +205,31 @@ impl StandbyHost {
         self.taken
     }
 
-    /// Une liste plus récente nomme un autre relais de secours (et celui-ci n'a pas voté),
-    /// ou il a voté il y a longtemps sans pouvoir reprendre le monde : il n'a plus rien à
-    /// faire.
+    /// Une liste plus récente nomme un autre relais de secours : il n'a plus rien à faire.
     pub fn replaced(&mut self) -> bool {
-        if !self.taken && self.voted() {
-            let t = *self.voted_at.get_or_insert_with(Instant::now);
-            if t.elapsed() > STANDBY_GIVE_UP {
-                return true;
-            }
-        }
-        self.handle.standby_replaced()
+        !self.taken && self.handle.standby_replaced()
     }
 
-    /// Il a voté pour la reprise : il ne s'en va plus (la reprise peut lui revenir).
-    pub fn voted(&self) -> bool {
-        self.handle.standby_voted()
+    /// Arrêt propre du monde repris ici : confié à son propre relais de secours, s'il en a
+    /// un (voir `minelib_relay::Handle::release`).
+    pub fn release(&self) -> usize {
+        if self.taken {
+            self.handle.release()
+        } else {
+            0
+        }
     }
 
     /// Le monde repris ici (son numéro), une fois qu'un joueur y est entré.
     #[cfg(test)]
     pub fn resumed(&self) -> Option<u64> {
         self.handle.resumed()
+    }
+
+    /// Essais : le relais lui-même (sa chute, ses gardiens).
+    #[cfg(test)]
+    pub fn relay(&self) -> &minelib_relay::Handle {
+        &self.handle
     }
 
     /// Ce que le relais du monde envoie de son monde.
@@ -286,6 +325,11 @@ impl WitnessRole {
         self.keeper.voted().is_some()
     }
 
+    /// Clé des listes du relais du monde de ce monde.
+    pub fn root(&self) -> [u8; 32] {
+        self.keeper.root().to_bytes()
+    }
+
     /// À appeler régulièrement, avec la clé du compte (pour entrer chez le relais de
     /// secours). Faux quand il n'est plus témoin de ce monde.
     pub fn pump(&mut self, key: Option<&minelib_net::ed25519_dalek::SigningKey>) -> bool {
@@ -353,12 +397,14 @@ impl WitnessRole {
         if self.last_report.elapsed() >= Duration::from_millis(guard::PROBE_MS) {
             self.last_report = Instant::now();
             if let (Some(l), Some(c), Some(key)) = (&self.link, &self.keeper.committee, key) {
-                // (Le vote, signé de la clé du compte : le relais de secours le montrera aux
-                // joueurs.)
-                let vote = self
-                    .keeper
-                    .voted()
-                    .map(|v| guard::Vote::sign(key, self.room, v, &self.keeper.me));
+                // (Le vote, signé de la clé du compte, avec la liste pour laquelle il vaut :
+                // le relais de secours le montrera aux joueurs.)
+                let vote = self.keeper.vote_committee().map(|vc| {
+                    (
+                        vc.clone(),
+                        guard::Vote::sign(key, self.room, vc.version, &self.keeper.me),
+                    )
+                });
                 minelib_net::transport::push(
                     l,
                     &minelib_net::proto::Request::WitnessBeat {
@@ -370,6 +416,75 @@ impl WitnessRole {
         }
         true
     }
+}
+
+/// Mondes où ce jeu a voté la reprise comme témoin (clé du relais du monde, numéro du
+/// monde chez lui). Un vote est pour toujours : il ne redevient jamais témoin d'un de ces
+/// mondes, même après un redémarrage (une ligne par vote dans `path`, gardée une semaine).
+pub struct VoteBook {
+    path: Option<PathBuf>,
+    set: std::collections::HashSet<([u8; 32], u64)>,
+}
+
+/// Un vote noté il y a plus longtemps que cela est oublié (secondes) : le relais du monde
+/// a redémarré depuis longtemps (ses numéros de monde aussi).
+const VOTE_KEEP_SECS: u64 = 7 * 24 * 3600;
+
+impl VoteBook {
+    pub fn open(path: Option<PathBuf>) -> Self {
+        let now = unix_secs();
+        let mut set = std::collections::HashSet::new();
+        if let Some(text) = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+            for line in text.lines() {
+                let mut it = line.split_whitespace();
+                let (Some(root), Some(room), Some(t)) = (it.next(), it.next(), it.next()) else {
+                    continue;
+                };
+                let root = minelib_net::crypto::unhex(root).and_then(|v| v.try_into().ok());
+                let (Some(root), Ok(room), Ok(t)) = (root, room.parse(), t.parse::<u64>()) else {
+                    continue;
+                };
+                if now.saturating_sub(t) < VOTE_KEEP_SECS {
+                    set.insert((root, room));
+                }
+            }
+        }
+        Self { path, set }
+    }
+
+    pub fn contains(&self, root: &[u8; 32], room: u64) -> bool {
+        self.set.contains(&(*root, room))
+    }
+
+    /// Note un vote (une fois), sur le disque aussi.
+    pub fn add(&mut self, root: [u8; 32], room: u64) {
+        if !self.set.insert((root, room)) {
+            return;
+        }
+        let Some(p) = &self.path else {
+            return;
+        };
+        use std::io::Write;
+        let line = format!(
+            "{} {room} {}\n",
+            minelib_net::crypto::hex(&root),
+            unix_secs()
+        );
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+        if let Err(e) = written {
+            log::warn!("votes de témoin : {} : {e}", p.display());
+        }
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Adresse de ce PC sur le réseau local (sans rien envoyer), sinon la boucle locale.
@@ -531,15 +646,49 @@ fn local_dir(
     dir.join("level.txt").exists().then_some(dir)
 }
 
-fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<AtomicBool>) {
-    let client = Client::spawn_garant(login.addr.clone(), login.key);
-    client.send(Cmd::Login {
-        pseudo: login.pseudo.clone(),
-        password: login.password.clone(),
-        totp: None,
-        backup: None,
-        device: login.device,
-    });
+fn run(
+    login: Login,
+    maps: Vec<([u8; 32], PathBuf)>,
+    root: PathBuf,
+    stop: Arc<AtomicBool>,
+    hosting: Arc<AtomicBool>,
+) {
+    let client = match &login.takeover {
+        // Chez le relais d'un monde repris : par le certificat (directement, sinon par un
+        // tunnel iroh vers son hôte).
+        Some(t) => {
+            let (at, node) = (t.at.clone(), login.node_dir.clone());
+            let c = Client::spawn_garant_resolved(Box::new(move || {
+                if let Ok(a) = at.addr.parse::<std::net::SocketAddr>() {
+                    if std::net::TcpStream::connect_timeout(&a, Duration::from_millis(800)).is_ok()
+                    {
+                        return Ok((at.addr.clone(), Some(at.key)));
+                    }
+                }
+                let n = node
+                    .as_deref()
+                    .and_then(crate::account::p2p_node)
+                    .ok_or_else(|| anyhow::anyhow!("relais du monde repris injoignable"))?;
+                Ok((n.tunnel(at.node)?.to_string(), Some(at.key)))
+            }));
+            c.send(Cmd::GarantLogin {
+                cert: t.cert.clone(),
+                key: t.key.clone(),
+            });
+            c
+        }
+        None => {
+            let c = Client::spawn_garant(login.addr.clone(), login.key);
+            c.send(Cmd::Login {
+                pseudo: login.pseudo.clone(),
+                password: login.password.clone(),
+                totp: None,
+                backup: None,
+                device: login.device,
+            });
+            c
+        }
+    };
     let mut logged = false;
     let mut link = None;
     // Clé du compte : signe ce que publie le relais de région quand il est hôte principal.
@@ -553,21 +702,28 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
     // Relais de secours d'un monde de construction, et témoin de mondes.
     let mut standby: Option<StandbyHost> = None;
     let mut witnesses: HashMap<u64, WitnessRole> = HashMap::new();
-    // Mondes pour lesquels ce jeu a voté la reprise : un vote est pour toujours, il n'y
-    // redevient jamais gardien (un nouveau rôle l'oublierait).
-    let mut voted: std::collections::HashSet<u64> = Default::default();
+    // Mondes pour lesquels ce jeu a voté la reprise comme témoin : un vote est pour
+    // toujours, il n'y redevient jamais témoin (un nouveau rôle l'oublierait), même après
+    // un redémarrage (gardés sur le disque).
+    let mut voted = VoteBook::open(login.votes.clone());
     let mut last = Instant::now();
     let started = Instant::now();
     let mut wiped = Instant::now();
     log::info!("garant en jeu : connexion de garant ouverte");
     loop {
         if stop.load(Ordering::Relaxed) {
+            // Monde repris ici : confié à son propre relais de secours, s'il en a un.
+            if let Some(s) = &standby {
+                if s.release() > 0 {
+                    log::info!("garant en jeu : monde repris confié à son relais de secours");
+                }
+            }
             // Gardien qui s'en va sans avoir voté : il le promet, il est remplacé tout de
             // suite.
             if let Some(l) = &link {
                 let rooms = standby
                     .iter()
-                    .filter(|s| !s.taken && !s.voted())
+                    .filter(|s| !s.taken)
                     .map(|s| s.room)
                     .chain(witnesses.values().filter(|w| !w.voted()).map(|w| w.room));
                 for room in rooms {
@@ -591,6 +747,7 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                     s.room
                 );
             }
+            hosting.store(s.taken, Ordering::Relaxed);
             if s.replaced() {
                 log::info!(
                     "garant en jeu : relais de secours du monde {} remplacé",
@@ -600,8 +757,9 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
             }
         }
         witnesses.retain(|_, w| w.pump(identity.as_ref()));
-        voted.extend(standby.iter().filter(|s| s.voted()).map(|s| s.room));
-        voted.extend(witnesses.values().filter(|w| w.voted()).map(|w| w.room));
+        for w in witnesses.values().filter(|w| w.voted()) {
+            voted.add(w.root(), w.room);
+        }
         while let Some(e) = client.poll() {
             match e {
                 Event::LoggedIn { .. } => {
@@ -668,10 +826,7 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                 }
                 // (Jamais gardien d'un monde où il a voté ; et un relais de secours qui sert un
                 // monde repris, ou qui a voté, garde sa place.)
-                Event::StandbyTask { room, .. }
-                    if voted.contains(&room)
-                        || standby.as_ref().is_some_and(|s| s.taken || s.voted()) =>
-                {
+                Event::StandbyTask { .. } if standby.as_ref().is_some_and(|s| s.taken) => {
                     client.send(Cmd::Leave);
                 }
                 Event::StandbyTask { room, root, info } => {
@@ -696,11 +851,12 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                     t,
                     ref committee,
                     standby: ref at,
+                    paused,
                 } => {
                     let room = committee.room;
                     let mut leases = Vec::new();
                     if let Some(s) = standby.as_ref().filter(|s| s.room == room) {
-                        leases.extend(s.beat(t, committee));
+                        leases.extend(s.beat(t, committee, paused));
                     }
                     if let Some(w) = witnesses.get_mut(&room) {
                         leases.extend(w.beat(t, committee, at.clone()));
@@ -712,8 +868,8 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                     }
                 }
                 // (Déjà témoin de ce monde, ou il y a voté : on garde ce qu'on a.)
-                Event::WitnessTask { room, .. }
-                    if voted.contains(&room) || witnesses.contains_key(&room) => {}
+                Event::WitnessTask { room, root, .. }
+                    if voted.contains(&root, room) || witnesses.contains_key(&room) => {}
                 Event::WitnessTask { room, root, cert } => {
                     log::info!("garant en jeu : témoin du monde {room}");
                     if let Some(w) =
@@ -746,7 +902,7 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                 Event::RoomClosed => {
                     // (Le monde fermé par son relais, ou ce relais de secours rendu : plus
                     // rien à garder ; repris, ou s'il a voté pour la reprise, il reste.)
-                    if standby.as_ref().is_some_and(|s| !s.taken && !s.voted()) {
+                    if standby.as_ref().is_some_and(|s| !s.taken) {
                         standby = None;
                     }
                     garant = None;
@@ -871,5 +1027,40 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
         }
         let busy = garant.is_some() || shard.is_some();
         std::thread::sleep(Duration::from_millis(if busy { 2 } else { 20 }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VoteBook;
+
+    /// Un témoin qui a voté pour un monde s'en souvient après un redémarrage du jeu (il ne
+    /// redevient pas témoin de ce monde) ; un vote noté il y a plus d'une semaine est
+    /// oublié ; un fichier abîmé ne gêne pas.
+    #[test]
+    fn a_witness_remembers_its_votes_across_restarts() {
+        let path = std::env::temp_dir().join(format!("minelib-votes-{}.txt", rand_u32()));
+        let mut book = VoteBook::open(Some(path.clone()));
+        assert!(!book.contains(&[1; 32], 7));
+        book.add([1; 32], 7);
+        book.add([1; 32], 7);
+        assert!(book.contains(&[1; 32], 7));
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "noté une fois");
+        // Un vieux vote, et une ligne abîmée.
+        text.push_str(&format!("{} 9 1000\n", minelib_net::crypto::hex(&[2; 32])));
+        text.push_str("n'importe quoi\n");
+        std::fs::write(&path, text).unwrap();
+        let book = VoteBook::open(Some(path.clone()));
+        assert!(book.contains(&[1; 32], 7));
+        assert!(!book.contains(&[1; 32], 8));
+        assert!(!book.contains(&[2; 32], 9), "trop vieux");
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn rand_u32() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(7, |d| d.subsec_nanos())
     }
 }

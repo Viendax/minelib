@@ -394,12 +394,6 @@ impl BuildNet {
         self.identity = key;
     }
 
-    /// Certificat de la clé du compte (relais de secours, voir `Request::Takeover`).
-    #[cfg(test)]
-    pub fn cert(&self) -> Option<minelib_net::sovereign::Cert> {
-        self.shards.ticket.as_ref().and_then(|t| t.4.clone())
-    }
-
     /// Le monde est repris par son relais de secours : tout part désormais par cette
     /// connexion ; les relais de région de l'ancien relais du monde sont quittés (ce
     /// qu'ils ont montré sans confirmation sera défait, voir `forget_shard`), le relais
@@ -1180,7 +1174,13 @@ mod tests {
         probe_next: Option<Instant>,
         pauses: u32,
         /// Mondes pour lesquels il a voté la reprise (il n'y redevient jamais gardien).
-        voted: HashSet<u64>,
+        voted: crate::garant_worker::VoteBook,
+        /// Connexion de garant entrée par certificat chez un relais repris : quand ce
+        /// relais tombe, elle n'a rien à faire (pas d'erreur fatale).
+        follower: bool,
+        /// Dernier certificat de la clé du compte reçu (comme `Accounts` : il survit à une
+        /// reprise, le billet des relais de région non).
+        cert: Option<minelib_net::sovereign::Cert>,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -1242,9 +1242,49 @@ mod tests {
                 probe: None,
                 probe_next: None,
                 pauses: 0,
-                voted: HashSet::new(),
+                voted: crate::garant_worker::VoteBook::open(None),
+                follower: false,
+                cert: None,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
+            b
+        }
+
+        /// La connexion de garant d'un joueur suit son monde chez le relais qui l'a repris,
+        /// avec le certificat de la clé de son compte (comme `garant_worker`).
+        fn cert_garant(
+            at: &minelib_net::proto::StandbyAt,
+            name: &str,
+            cert: minelib_net::sovereign::Cert,
+            key: minelib_net::ed25519_dalek::SigningKey,
+        ) -> Self {
+            let c = Client::spawn_garant(at.addr.clone(), at.key);
+            c.send(Cmd::GarantLogin { cert, key });
+            let mut b = Bot {
+                name: name.into(),
+                c,
+                net: None,
+                link: None,
+                world: World::new(0),
+                pos: Vec3::new(64.0, 11.0, 16.0),
+                rejects: 0,
+                shard: None,
+                used_shard: false,
+                identity: None,
+                standby: None,
+                standby_at: None,
+                retake: None,
+                taken: 0,
+                witnesses: HashMap::new(),
+                probe: None,
+                probe_next: None,
+                pauses: 0,
+                voted: crate::garant_worker::VoteBook::open(None),
+                follower: true,
+                cert: None,
+            };
+            b.wait(|e| matches!(e, Event::LoggedIn { .. }));
+            b.c.send(Cmd::GarantAvailable(true));
             b
         }
 
@@ -1253,7 +1293,7 @@ mod tests {
             let (Some(at), Some(key)) = (self.standby_at.clone(), self.identity.clone()) else {
                 return None;
             };
-            let cert = self.net.as_ref().and_then(|n| n.cert())?;
+            let cert = self.cert.clone()?;
             let c = Client::spawn(at.addr.clone(), Some(at.key));
             c.send(Cmd::Takeover {
                 cert,
@@ -1321,14 +1361,9 @@ mod tests {
             }
             let key = self.identity.clone();
             self.witnesses.retain(|_, w| w.pump(key.as_ref()));
-            self.voted
-                .extend(self.standby.iter().filter(|s| s.voted()).map(|s| s.room));
-            self.voted.extend(
-                self.witnesses
-                    .values()
-                    .filter(|w| w.voted())
-                    .map(|w| w.room),
-            );
+            for w in self.witnesses.values().filter(|w| w.voted()) {
+                self.voted.add(w.root(), w.room);
+            }
             if self.retake.is_some_and(|t| Instant::now() >= t) {
                 self.take_over();
             }
@@ -1396,17 +1431,16 @@ mod tests {
                     mac,
                     cert,
                 } => {
+                    if cert.is_some() {
+                        self.cert = cert.clone();
+                    }
                     if let Some(n) = &mut self.net {
                         n.set_ticket(room, pseudo, expires, mac, cert);
                     }
                 }
                 Event::RoomClosed => {
                     self.shard = None;
-                    if self
-                        .standby
-                        .as_ref()
-                        .is_some_and(|s| !s.taken && !s.voted())
-                    {
+                    if self.standby.as_ref().is_some_and(|s| !s.taken) {
                         self.standby = None;
                     }
                 }
@@ -1436,11 +1470,9 @@ mod tests {
                         n.set_owner();
                     }
                 }
-                // (Comme `garant_worker` : jamais gardien d'un monde où il a voté.)
-                Event::StandbyTask { room, .. }
-                    if self.voted.contains(&room)
-                        || self.standby.as_ref().is_some_and(|s| s.taken || s.voted()) =>
-                {
+                // (Comme `garant_worker` : un relais de secours qui sert un monde repris
+                // garde sa place ; jamais témoin d'un monde où il a voté.)
+                Event::StandbyTask { .. } if self.standby.as_ref().is_some_and(|s| s.taken) => {
                     self.c.send(Cmd::Leave);
                 }
                 Event::StandbyTask { room, root, info } => {
@@ -1454,11 +1486,12 @@ mod tests {
                     t,
                     committee,
                     standby: at,
+                    paused,
                 } => {
                     let room = committee.room;
                     let mut leases = Vec::new();
                     if let Some(s) = self.standby.as_ref().filter(|s| s.room == room) {
-                        leases.extend(s.beat(t, &committee));
+                        leases.extend(s.beat(t, &committee, paused));
                     }
                     if let Some(w) = self.witnesses.get_mut(&room) {
                         leases.extend(w.beat(t, &committee, at));
@@ -1469,8 +1502,8 @@ mod tests {
                         }
                     }
                 }
-                Event::WitnessTask { room, .. }
-                    if self.voted.contains(&room) || self.witnesses.contains_key(&room) => {}
+                Event::WitnessTask { room, root, .. }
+                    if self.voted.contains(&root, room) || self.witnesses.contains_key(&room) => {}
                 Event::WitnessTask { room, root, cert } => {
                     if let Some(w) =
                         crate::garant_worker::WitnessRole::new(room, &self.name, root, cert, None)
@@ -1522,6 +1555,7 @@ mod tests {
                 Event::Error(_) | Event::Offline(_) | Event::LoggedOut
                     if self.standby.is_some()
                         || self.retake.is_some()
+                        || self.follower
                         || !self.witnesses.is_empty() =>
                 {
                     if self.retake.is_some() {
@@ -1898,6 +1932,17 @@ mod tests {
         StandbyCut,
         /// Il s'arrête proprement : le relais de secours reprend tout de suite.
         Release,
+        /// Seul le témoin est coupé de lui ; le relais de secours l'entend encore (et ses
+        /// baux ne comptent pas : il pourrait tricher). Il doit mettre le monde en pause, et
+        /// le relais de secours le reprendre avec le vote du témoin.
+        WitnessCut,
+        /// Le témoin s'en va sans prévenir (il a peut-être voté) : pause sans issue, le
+        /// relais du monde confie le monde au relais de secours.
+        WitnessGone,
+        /// Il tombe ; le monde repris se choisit son propre relais de secours et un témoin
+        /// (les connexions de garant des joueurs le suivent), puis le relais repris tombe à
+        /// son tour : le nouveau relais de secours reprend le monde.
+        Chain,
     }
 
     /// Un monde de construction gardé : son relais du monde, un relais de secours (chez
@@ -2005,9 +2050,13 @@ mod tests {
                 && bots.iter().all(|b| b.standby_at.is_some())
             {
                 match fault {
-                    Fault::Crash => h.kill(),
+                    Fault::Crash | Fault::Chain => h.kill(),
                     Fault::Isolated => h.guard_isolate(true),
                     Fault::StandbyCut => h.guard_cut(&["Garant"]),
+                    Fault::WitnessCut => h.guard_cut(&["Garant2"]),
+                    Fault::WitnessGone => {
+                        garants.truncate(1);
+                    }
                     Fault::Release => assert_eq!(h.release(), 1, "monde confié"),
                 }
                 fault_at = Some(Instant::now());
@@ -2016,7 +2065,7 @@ mod tests {
             // Jamais deux relais à la fois : le relais de secours ne sert le monde que si
             // le relais du monde ne le peut plus (tombé, ou en pause pour toujours).
             let taken = garants[0].standby.as_ref().is_some_and(|s| s.taken);
-            if fault != Fault::Crash && fault_at.is_some() {
+            if !matches!(fault, Fault::Crash | Fault::Chain) && fault_at.is_some() {
                 // (Le monde fermé là-bas, ses joueurs partis : il ne le sert plus.)
                 let state = h.frozen(room);
                 frozen_seen |= state == Some(true);
@@ -2035,7 +2084,9 @@ mod tests {
                 // Relais du monde tombé et partie pas encore reprise : pas de relais du
                 // tout, on ne construit pas. Sinon on construit, même en pause (le jeu
                 // garde les modifications et les envoie à la reprise).
-                let live = fault != Fault::Crash || fault_at.is_none() || b.taken > 0;
+                let live = !matches!(fault, Fault::Crash | Fault::Chain)
+                    || fault_at.is_none()
+                    || b.taken > 0;
                 if live && step < 520 && rnd() % 9 == 0 {
                     let x = (CHUNKS.start * 16 + (rnd() % 64) as i32).min(CHUNKS.end * 16 - 1);
                     let z = (rnd() % 32) as i32;
@@ -2056,7 +2107,7 @@ mod tests {
             for g in garants.iter_mut() {
                 g.tick(dt);
             }
-            if fault != Fault::Crash || fault_at.is_none() {
+            if !matches!(fault, Fault::Crash | Fault::Chain) || fault_at.is_none() {
                 for a in ailleurs.iter_mut() {
                     a.pump(&|_| false);
                 }
@@ -2092,7 +2143,10 @@ mod tests {
                  (étape {fault_step:?})",
                 after.as_millis()
             );
-            if fault == Fault::Isolated {
+            if matches!(
+                fault,
+                Fault::Isolated | Fault::WitnessCut | Fault::WitnessGone
+            ) {
                 assert!(frozen_seen, "le relais du monde a mis le monde en pause");
                 assert!(
                     bots.iter().all(|b| b.pauses > 0),
@@ -2109,6 +2163,108 @@ mod tests {
             late.start_net(false);
             bots.push(late);
         }
+        if fault == Fault::Chain {
+            // Les connexions de garant de trois joueurs suivent le monde chez le relais
+            // repris, par le certificat de leur compte : il s'y choisit un relais de
+            // secours et un témoin, et les joueurs apprennent où est le nouveau.
+            let first = bots[0].standby_at.clone().expect("relais repris");
+            let mut followers: Vec<Bot> = bots[1..4]
+                .iter()
+                .map(|b| {
+                    let cert = b.cert.clone().expect("certificat");
+                    let key = b.identity.clone().expect("clé du compte");
+                    Bot::cert_garant(&first, &b.name, cert, key)
+                })
+                .collect();
+            let t = Instant::now();
+            let mut step = 0u32;
+            loop {
+                step += 1;
+                for b in bots.iter_mut() {
+                    // On continue de construire pendant ce temps.
+                    if rnd() % 9 == 0 {
+                        let x = (CHUNKS.start * 16 + (rnd() % 64) as i32).min(CHUNKS.end * 16 - 1);
+                        let (z, y) = ((rnd() % 32) as i32, 11 + (rnd() % 3) as i32);
+                        let block = BlockId(1 + rnd() as u16 % 8);
+                        b.world.set(x, y, z, block);
+                        edited.insert([x, y, z]);
+                    }
+                    b.tick(dt);
+                }
+                for g in garants.iter_mut().chain(followers.iter_mut()) {
+                    g.tick(dt);
+                }
+                let resumed = garants[0]
+                    .standby
+                    .as_ref()
+                    .and_then(|s| s.resumed())
+                    .expect("monde repris");
+                let guarded = garants[0]
+                    .standby
+                    .as_ref()
+                    .and_then(|s| s.relay().committee(resumed))
+                    .is_some_and(|c| c.standby.is_some() && !c.witnesses.is_empty());
+                let moved = bots
+                    .iter()
+                    .all(|b| b.standby_at.as_ref().is_some_and(|a| a.key != first.key));
+                if guarded && moved && step > 50 {
+                    break;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(40),
+                    "le monde repris se choisit un relais de secours"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Le relais repris tombe à son tour (chacun doit reprendre la partie une fois de
+            // plus, le joueur arrivé après coup compris).
+            let before: Vec<u32> = bots.iter().map(|b| b.taken).collect();
+            garants[0]
+                .standby
+                .as_ref()
+                .expect("relais repris")
+                .relay()
+                .kill();
+            let t = Instant::now();
+            while !bots.iter().zip(&before).all(|(b, n)| b.taken == n + 1) {
+                for b in bots.iter_mut() {
+                    b.tick(dt);
+                }
+                for g in followers.iter_mut() {
+                    g.tick(dt);
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(30),
+                    "tous les joueurs passent au relais de secours du monde repris : {:?}",
+                    bots.iter()
+                        .map(|b| (b.name.clone(), b.taken))
+                        .collect::<Vec<_>>()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            eprintln!(
+                "Chain : tous les joueurs sur le deuxième relais de secours {} ms après la \
+                 chute du premier",
+                t.elapsed().as_millis()
+            );
+            for _ in 0..200 {
+                for b in bots.iter_mut() {
+                    if rnd() % 9 == 0 {
+                        let x = (CHUNKS.start * 16 + (rnd() % 64) as i32).min(CHUNKS.end * 16 - 1);
+                        let (z, y) = ((rnd() % 32) as i32, 11 + (rnd() % 3) as i32);
+                        let block = BlockId(1 + rnd() as u16 % 8);
+                        b.world.set(x, y, z, block);
+                        edited.insert([x, y, z]);
+                    }
+                    b.tick(dt);
+                }
+                for g in followers.iter_mut() {
+                    g.tick(dt);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            garants.extend(followers);
+        }
         for _ in 0..250 {
             for b in bots.iter_mut() {
                 b.tick(dt);
@@ -2116,7 +2272,7 @@ mod tests {
             for g in garants.iter_mut() {
                 g.tick(dt);
             }
-            if fault != Fault::Crash {
+            if !matches!(fault, Fault::Crash | Fault::Chain) {
                 for a in ailleurs.iter_mut() {
                     a.pump(&|_| false);
                 }
@@ -2156,6 +2312,21 @@ mod tests {
     #[test]
     fn a_build_world_survives_its_relay() {
         guarded_world(Fault::Crash);
+    }
+
+    #[test]
+    fn a_taken_over_world_gets_its_own_standby() {
+        guarded_world(Fault::Chain);
+    }
+
+    #[test]
+    fn a_witness_cut_from_the_world_relay_pauses_it_whatever_the_standby_says() {
+        guarded_world(Fault::WitnessCut);
+    }
+
+    #[test]
+    fn a_world_relay_stuck_in_pause_hands_over_to_its_standby() {
+        guarded_world(Fault::WitnessGone);
     }
 
     #[test]

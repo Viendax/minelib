@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 33;
+pub const PROTOCOL: u32 = 34;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.
@@ -347,6 +347,15 @@ pub enum Request {
     Resign {
         room: u64,
     },
+    /// Connexion de garant d'un joueur, au relais qui a repris son monde (il n'y a pas de
+    /// compte) : entrée avec le certificat de la clé de son compte. Réponse :
+    /// `TakeoverChallenge`, puis `GarantProve` → `Welcome`.
+    GarantLogin {
+        cert: crate::sovereign::Cert,
+    },
+    GarantProve {
+        signature: Vec<u8>,
+    },
     /// Témoin d'un monde, au relais de secours : entrée avec son certificat (signé par le
     /// relais du monde). Réponse : `TakeoverChallenge`, puis `WitnessProve` → `Done`.
     WitnessLogin {
@@ -356,11 +365,11 @@ pub enum Request {
         signature: Vec<u8>,
     },
     /// Témoin, au relais de secours, quatre fois par seconde : la dernière liste des
-    /// gardiens qu'il connaît, et son vote pour la reprise (signé, pour la liste qu'il
-    /// avait en votant), s'il n'entend plus le relais du monde.
+    /// gardiens qu'il connaît, et son vote pour la reprise s'il n'entend plus le relais du
+    /// monde (la liste qu'il avait en votant, et son vote signé pour elle).
     WitnessBeat {
         committee: crate::guard::Committee,
-        vote: Option<crate::guard::Vote>,
+        vote: Option<(crate::guard::Committee, crate::guard::Vote)>,
     },
     /// Au relais de secours, après la chute du relais du monde : « j'étais dans ce
     /// monde » (certificat de la clé de mon compte, signé par l'ancien relais du monde).
@@ -761,6 +770,9 @@ pub enum Response {
         t: u64,
         committee: crate::guard::Committee,
         standby: Option<StandbyAt>,
+        /// Le monde est en pause chez lui (il n'a plus le quorum des témoins) : le relais de
+        /// secours peut reprendre avec leurs votes même s'il l'entend encore.
+        paused: bool,
     },
     /// Au garant choisi : être témoin du monde `room` (clé des listes et des certificats
     /// de ce relais ; certificat de la clé de son compte, pour entrer chez le relais de

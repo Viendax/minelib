@@ -331,6 +331,9 @@ pub struct Accounts {
     last_heard: std::time::Instant,
     probe: Option<Client>,
     probe_next: Option<std::time::Instant>,
+    /// Le monde a été repris : le relais qui le sert désormais (la connexion de garant y
+    /// entre avec le certificat de la clé du compte).
+    world_at: Option<proto::StandbyAt>,
 }
 
 impl Accounts {
@@ -382,6 +385,7 @@ impl Accounts {
             last_heard: std::time::Instant::now(),
             probe: None,
             probe_next: None,
+            world_at: None,
         }
     }
 
@@ -766,7 +770,7 @@ impl Accounts {
                 // monde (il n'a pas lui-même de relais de secours : plus rien à chercher).
                 Event::TakenOver { .. } => {
                     self.taking_over = None;
-                    self.standby = None;
+                    self.world_at = self.standby.take();
                     self.world_paused = false;
                     self.probe = None;
                     self.probe_next = None;
@@ -953,6 +957,7 @@ impl Accounts {
     /// Quitter un monde : plus de relais de secours à rejoindre.
     pub fn forget_standby(&mut self) {
         self.standby = None;
+        self.world_at = None;
         self.taking_over = None;
         self.world_paused = false;
         self.probe = None;
@@ -980,6 +985,23 @@ impl Accounts {
     /// De quoi ouvrir une deuxième connexion du compte, de garant : relais joint,
     /// identifiants de la session, appareil de confiance (pas de 2FA à redemander).
     pub fn garant_login(&self) -> Option<crate::garant_worker::Login> {
+        let votes = Some(self.relay_dir.with_file_name("votes_temoin.txt"));
+        // Monde repris : chez le relais qui le sert, par le certificat de la clé du compte.
+        if let Some(at) = self.world_at.clone() {
+            let (Some(cert), Some(key)) = (self.cert.clone(), self.identity.clone()) else {
+                return None;
+            };
+            return Some(crate::garant_worker::Login {
+                addr: at.addr.clone(),
+                key: at.key,
+                pseudo: cert.pseudo.clone(),
+                password: String::new(),
+                device: None,
+                node_dir: Some(self.relay_dir.clone()),
+                votes,
+                takeover: Some(crate::garant_worker::CertLogin { at, cert, key }),
+            });
+        }
         let (addr, key) = self.relay_at.clone()?;
         let (pseudo, password) = self.login_secret.clone().or_else(|| self.remembered())?;
         if !self.logged_in() || !pseudo.eq_ignore_ascii_case(&self.pseudo()) {
@@ -993,6 +1015,8 @@ impl Accounts {
             password,
             device,
             node_dir: Some(self.relay_dir.clone()),
+            votes,
+            takeover: None,
         })
     }
 

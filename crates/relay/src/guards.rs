@@ -6,7 +6,7 @@
 //! propre. Côté relais de secours : ses propres baux et son vote, les votes des témoins
 //! (qui y entrent avec leur certificat), et la reprise.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use minelib_net::guard::{self, Keeper, Warden};
 use minelib_net::proto::{ErrorCode, Request, Response};
@@ -19,10 +19,13 @@ pub(crate) struct RoomGuards {
     pub warden: Warden,
     /// Connexion de chaque gardien (pseudo en minuscules).
     pub conns: HashMap<String, u64>,
-    /// Gardiens retirés parce qu'ils ne répondaient plus (pseudos en minuscules) : ils ont
-    /// peut-être voté, et un vote est pour toujours ; ils ne redeviennent jamais gardiens
-    /// de ce monde (un nouveau départ chez eux pourrait leur faire oublier leur vote).
-    pub banned: std::collections::HashSet<String>,
+    /// Gardiens retirés parce qu'ils ne répondaient plus (pseudos en minuscules) : pas
+    /// repris avant cette heure. (Un témoin qui a voté ne redevient pas gardien de ce monde
+    /// de lui-même : son jeu garde ses votes, même d'une session à l'autre.)
+    pub cooldown: HashMap<String, u64>,
+    /// En pause depuis : sans issue au bout de `RELEASE_MS`, le monde est confié au relais
+    /// de secours.
+    pub paused_since: Option<u64>,
     /// Le monde était-il servi au dernier passage (les joueurs savent s'il est en pause) ?
     pub serving: bool,
     pub last_beat: u64,
@@ -34,6 +37,24 @@ pub(crate) struct RoomGuards {
 
 /// Recherche d'un témoin de plus, au plus à ce rythme (ms) par monde.
 const SCAN_MS: u64 = 2000;
+/// Un gardien retiré parce qu'il ne répondait plus n'est pas repris avant ce temps (ms).
+const COOLDOWN_MS: u64 = 60_000;
+
+/// Gardiens retirés de ce monde récemment (pas repris tout de suite).
+pub(crate) fn cooling(st: &State, rid: u64) -> HashSet<String> {
+    let now = now_ms(st);
+    st.rooms
+        .get(&rid)
+        .and_then(|r| r.guards.as_ref())
+        .map(|g| {
+            g.cooldown
+                .iter()
+                .filter(|(_, &until)| until > now)
+                .map(|(p, _)| p.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Heure des gardiens : millisecondes sur l'horloge de ce relais (elle ne recule pas).
 pub(crate) fn now_ms(st: &State) -> u64 {
@@ -89,11 +110,7 @@ fn witness_candidates(st: &State, rid: u64, taken: &[String], keep: &[u64]) -> V
         .get(&rid)
         .and_then(|r| r.standby.as_ref())
         .map(|s| s.host);
-    let banned = st
-        .rooms
-        .get(&rid)
-        .and_then(|r| r.guards.as_ref())
-        .map(|g| &g.banned);
+    let cooling = cooling(st, rid);
     let apart = super::machines_apart(st) && !st.standby_local;
     let others: Vec<&Conn> = standby_host
         .iter()
@@ -109,7 +126,7 @@ fn witness_candidates(st: &State, rid: u64, taken: &[String], keep: &[u64]) -> V
                 && Some(id) != standby_host
                 && c.pseudo.as_deref().is_some_and(|p| {
                     !taken.iter().any(|t| t.eq_ignore_ascii_case(p))
-                        && !banned.is_some_and(|b| b.contains(&p.to_ascii_lowercase()))
+                        && !cooling.contains(&p.to_ascii_lowercase())
                 })
         })
         .map(|(&id, c)| {
@@ -131,13 +148,17 @@ fn witness_candidates(st: &State, rid: u64, taken: &[String], keep: &[u64]) -> V
 fn upkeep_room(st: &mut State, rid: u64) {
     let now = now_ms(st);
     let standby = ready_standby(st, rid);
-    // Relais de secours qui ne donne plus de bail (parti, coupé de ce relais, ou il a voté) :
-    // il est rendu, un autre sera choisi (`upkeep_standby`). Il reste gardien de la liste
-    // en cours jusqu'au changement.
+    // Relais de secours qui ne donne plus de bail (parti, coupé de ce relais) : il est
+    // rendu, un autre sera choisi (`upkeep_standby`). Il reste gardien de la liste en cours
+    // jusqu'au changement. (Pas pendant une pause : c'est peut-être lui qui reprendra.)
     if let (Some((host, p)), Some(g)) =
         (&standby, st.rooms.get(&rid).and_then(|r| r.guards.as_ref()))
     {
-        if !g.warden.released() && g.warden.current.is_standby(p) && g.warden.idle(p, now) {
+        if !g.warden.released()
+            && g.warden.serving(now)
+            && g.warden.current.is_standby(p)
+            && g.warden.idle(p, now)
+        {
             log::info!(
                 "monde {rid} : le relais de secours ne répond plus aux battements, remplacé"
             );
@@ -153,15 +174,9 @@ fn upkeep_room(st: &mut State, rid: u64) {
         let Some((host, p)) = standby else {
             return;
         };
-        let picks: Vec<(u64, String)> = witness_candidates(st, rid, std::slice::from_ref(&p), &[])
-            .into_iter()
-            .take(guard::WITNESSES)
-            .collect();
-        let picks = if picks.len() < guard::WITNESSES {
-            picks.into_iter().take(1).collect()
-        } else {
-            picks
-        };
+        let candidates = witness_candidates(st, rid, std::slice::from_ref(&p), &[]);
+        let target = guard::witness_target(candidates.len());
+        let picks: Vec<(u64, String)> = candidates.into_iter().take(target).collect();
         let witnesses: Vec<String> = picks.iter().map(|(_, p)| p.clone()).collect();
         let warden = Warden::new(&st.cert_key, rid, Some(p.clone()), witnesses, now);
         let mut conns: HashMap<String, u64> = picks
@@ -180,7 +195,8 @@ fn upkeep_room(st: &mut State, rid: u64) {
         room.guards = Some(RoomGuards {
             warden,
             conns,
-            banned: Default::default(),
+            cooldown: HashMap::new(),
+            paused_since: None,
             serving: true,
             last_beat: 0,
             last_heartbeat: 0,
@@ -191,14 +207,54 @@ fn upkeep_room(st: &mut State, rid: u64) {
     }
     beat(st, rid, now);
     refresh_pause(st, rid, now);
+    release_if_stuck(st, rid, now);
+}
+
+/// Pause sans issue : depuis `RELEASE_MS`, ce relais n'entend plus assez de témoins (ceux
+/// qui ont voté ne lui redonneront jamais de bail). S'il entend encore le relais de
+/// secours, il lui confie le monde (arrêt signé) plutôt que de le laisser en pause.
+fn release_if_stuck(st: &mut State, rid: u64, now: u64) {
+    let Some(g) = st.rooms.get_mut(&rid).and_then(|r| r.guards.as_mut()) else {
+        return;
+    };
+    if g.warden.released() || g.warden.serving(now) {
+        g.paused_since = None;
+        return;
+    }
+    let since = *g.paused_since.get_or_insert(now);
+    if now.saturating_sub(since) < guard::RELEASE_MS {
+        return;
+    }
+    let Some(s) = g.warden.releasable() else {
+        return;
+    };
+    if !g.warden.fresh(&s, now) {
+        return;
+    }
+    let Some(conn) = g.conns.get(&s.to_ascii_lowercase()).copied() else {
+        return;
+    };
+    g.warden.release();
+    log::warn!("monde {rid} : en pause sans issue, confié à son relais de secours {s}");
+    if let Some(c) = st.conns.get(&conn) {
+        transport::push(
+            &c.tx,
+            &Response::Released {
+                room: rid,
+                sig: guard::sign_release(&st.cert_key, rid),
+            },
+        );
+    }
+    refresh_pause(st, rid, now);
 }
 
 /// Le relais de secours est rendu : il quitte le monde (un autre sera choisi, voir
 /// `upkeep_standby`), et les joueurs l'apprennent. Il ne sera plus gardien de ce monde.
 fn drop_standby(st: &mut State, rid: u64, host: u64) {
+    let now = now_ms(st);
     if let Some(p) = st.conns.get(&host).and_then(|c| c.pseudo.clone()) {
         if let Some(g) = st.rooms.get_mut(&rid).and_then(|r| r.guards.as_mut()) {
-            g.banned.insert(p.to_ascii_lowercase());
+            g.cooldown.insert(p.to_ascii_lowercase(), now + COOLDOWN_MS);
         }
     }
     super::leave_room(st, host);
@@ -219,12 +275,13 @@ fn drop_standby(st: &mut State, rid: u64, host: u64) {
 
 /// Changement de gardiens : un seul à la fois (voir `Warden::reconfigure`). D'abord le
 /// relais de secours, puis un témoin parti ou muet (remplacé, sinon retiré), puis un
-/// témoin de plus jusqu'à `WITNESSES` (un seul s'il n'y a pas de quoi en avoir trois).
+/// témoin de plus jusqu'à ce que permettent les garants (`guard::witness_target`). Jamais
+/// pendant une pause : le changement ne pourrait pas finir.
 fn reconfigure(st: &mut State, rid: u64, now: u64, standby: Option<(u64, String)>) {
     let Some(g) = st.rooms.get(&rid).and_then(|r| r.guards.as_ref()) else {
         return;
     };
-    if g.warden.changing() || g.warden.released() {
+    if g.warden.changing() || g.warden.released() || !g.warden.serving(now) {
         return;
     }
     let cur = g.warden.current.clone();
@@ -242,7 +299,7 @@ fn reconfigure(st: &mut State, rid: u64, now: u64, standby: Option<(u64, String)
     // Rien à changer (ou seulement un témoin de plus à chercher, pas trop souvent : il
     // faut passer toutes les connexions en revue).
     let scan_due = now.saturating_sub(g.last_scan) >= SCAN_MS;
-    if same_standby && dead.is_empty() && (witnesses.len() >= guard::WITNESSES || !scan_due) {
+    if same_standby && dead.is_empty() && (witnesses.len() >= guard::WITNESSES_MAX || !scan_due) {
         return;
     }
     let keep: Vec<u64> = witnesses
@@ -277,12 +334,7 @@ fn reconfigure(st: &mut State, rid: u64, now: u64, standby: Option<(u64, String)
             }
         }
     } else {
-        let available = witnesses.len() + candidates.len();
-        let target = if available >= guard::WITNESSES {
-            guard::WITNESSES
-        } else {
-            1.min(available)
-        };
+        let target = guard::witness_target(witnesses.len() + candidates.len());
         if witnesses.len() < target {
             if let Some(c) = candidates.first() {
                 witnesses.push(c.1.clone());
@@ -309,7 +361,7 @@ fn reconfigure(st: &mut State, rid: u64, now: u64, standby: Option<(u64, String)
     }
     if same_standby {
         if let Some(d) = dead.first() {
-            g.banned.insert(d.to_ascii_lowercase());
+            g.cooldown.insert(d.to_ascii_lowercase(), now + COOLDOWN_MS);
         }
     }
     log::info!(
@@ -365,6 +417,7 @@ fn beat(st: &mut State, rid: u64, now: u64) {
         t: now,
         committee: g.warden.current.clone(),
         standby: at,
+        paused: !g.warden.serving(now),
     };
     for p in g.warden.targets() {
         if cut(st, &p) {
@@ -485,51 +538,70 @@ pub(crate) fn release_all(st: &mut State) -> usize {
 // ---------------------------------------------------------------------------------------
 // Côté relais de secours.
 
-/// Relais de secours : ses propres baux et son vote (`Keeper`), et les votes signés des
-/// témoins (avec leur certificat, par pseudo en minuscules).
+/// Relais de secours : ses baux (`Keeper` ; il ne vote pas, sa voix ne compterait pas), les
+/// votes signés des témoins (la liste du vote, leur certificat, le vote ; par pseudo en
+/// minuscules), et si le relais du monde se disait en pause à son dernier battement.
 pub(crate) struct StandbyGuard {
     pub keeper: Keeper,
-    pub votes: HashMap<String, (minelib_net::sovereign::Cert, guard::Vote)>,
+    pub votes: HashMap<String, (guard::Committee, minelib_net::sovereign::Cert, guard::Vote)>,
+    pub root_paused: bool,
 }
 
 /// Battement du relais du monde reçu par le relais de secours : version à rappeler dans
 /// son bail (aucune : il a voté).
-pub(crate) fn standby_beat(st: &mut State, c: &guard::Committee) -> Option<u64> {
+pub(crate) fn standby_beat(st: &mut State, c: &guard::Committee, paused: bool) -> Option<u64> {
     let now = guard::clock();
-    let sb = st.standby.as_mut()?;
-    sb.guard.as_mut()?.keeper.beat(c, now)
+    let g = st.standby.as_mut()?.guard.as_mut()?;
+    let v = g.keeper.beat(c, now);
+    if v.is_some() {
+        g.root_paused = paused;
+    }
+    v
 }
 
-/// Relais de secours, régulièrement : son vote, puis la reprise s'il a une majorité.
+/// Relais de secours, régulièrement : reprise dès qu'un quorum de témoins d'une même liste
+/// (qui le nomme) a voté. Le quorum de votes garantit que le relais du monde n'a plus
+/// celui des baux, et ne le retrouvera jamais pour cette liste.
 pub(crate) fn standby_tick(st: &mut State) -> bool {
-    let now = guard::clock();
     let Some(sb) = st.standby.as_mut() else {
         return false;
     };
     let Some(g) = sb.guard.as_mut() else {
         return false;
     };
-    if g.keeper.tick(now) {
-        log::warn!(
-            "relais de secours : le relais du monde se tait depuis {} ms, vote pour la reprise \
-             (liste {})",
-            guard::VOTE_MS,
-            g.keeper.voted().unwrap_or(0)
-        );
-    }
     if sb.active {
         return false;
     }
+    // (Un relais de secours honnête ne reprend pas un monde que le relais du monde sert
+    // sous ses yeux : il faut qu'il ne l'entende plus, ou que celui-ci se dise en pause.
+    // La sûreté n'en dépend pas, c'est le quorum de votes qui la donne ; mais un témoin
+    // menteur seul ne suffit plus alors.)
+    let silent = g
+        .keeper
+        .silent_for(guard::clock())
+        .is_none_or(|t| t >= guard::VOTE_MS);
+    if !silent && !g.root_paused {
+        return false;
+    }
     let votes = &g.votes;
-    if guard::may_take_over(&g.keeper, |w| votes.get(w).map(|(_, v)| v.version)) {
+    let me = g.keeper.me.clone();
+    let lists: Vec<guard::Committee> = votes.values().map(|(c, _, _)| c.clone()).collect();
+    let found = lists.into_iter().find(|c| {
+        guard::enough_votes(c, &me, |w| {
+            votes
+                .get(w)
+                .filter(|(vc, _, _)| vc.version == c.version)
+                .map(|(_, _, v)| v.version)
+        })
+    });
+    if let Some(committee) = found {
         // La preuve montrée aux joueurs : la liste, et les votes signés pour elle.
-        let committee = g.keeper.vote_committee().cloned().expect("vote");
         let proof_votes = committee
             .witnesses
             .iter()
             .filter_map(|w| votes.get(&w.to_ascii_lowercase()))
-            .filter(|(_, v)| v.version == committee.version)
-            .cloned()
+            .filter(|(c, _, v)| c.version == committee.version && v.version == committee.version)
+            .map(|(_, cert, v)| (cert.clone(), v.clone()))
             .collect();
         sb.proof = Some(guard::Proof::Votes {
             committee,
@@ -537,7 +609,7 @@ pub(crate) fn standby_tick(st: &mut State) -> bool {
         });
         sb.active = true;
         log::warn!(
-            "relais de secours : une majorité des gardiens n'entend plus le relais du monde, \
+            "relais de secours : un quorum de témoins n'entend plus le relais du monde, \
              reprise du monde « {} »",
             sb.info.name
         );
@@ -553,20 +625,31 @@ pub(crate) fn witness_beat(
     id: u64,
     cert: &minelib_net::sovereign::Cert,
     committee: &guard::Committee,
-    vote: Option<&guard::Vote>,
+    vote: Option<&(guard::Committee, guard::Vote)>,
 ) {
     let now = guard::clock();
     let Some(sb) = st.standby.as_mut() else {
         return;
     };
     let room = sb.room;
+    let root = sb.root;
     let Some(g) = sb.guard.as_mut() else {
         return;
     };
     g.keeper.learn(committee, now);
-    if let Some(v) = vote.filter(|v| v.valid(&cert.key, room, &cert.pseudo)) {
-        g.votes
-            .insert(cert.pseudo.to_ascii_lowercase(), (cert.clone(), v.clone()));
+    // (Un vote ne compte que pour une liste signée par le relais du monde, qui nomme ce
+    // témoin, et signé de la clé de son certificat.)
+    if let Some((c, v)) = vote.filter(|(c, v)| {
+        c.room == room
+            && v.version == c.version
+            && c.is_witness(&cert.pseudo)
+            && c.valid(&root)
+            && v.valid(&cert.key, room, &cert.pseudo)
+    }) {
+        g.votes.insert(
+            cert.pseudo.to_ascii_lowercase(),
+            (c.clone(), cert.clone(), v.clone()),
+        );
     }
     // Le témoin est en retard d'une liste : il apprend la nôtre.
     if let Some(mine) = g

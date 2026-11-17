@@ -155,6 +155,7 @@ impl Handle {
             minelib_net::guard::Keeper::new(room, me, root).map(|keeper| guards::StandbyGuard {
                 keeper,
                 votes: HashMap::new(),
+                root_paused: false,
             });
         let Ok(root) = VerifyingKey::from_bytes(&root) else {
             return;
@@ -176,8 +177,12 @@ impl Handle {
 
     /// Relais de secours : battement du relais du monde. Renvoie la version de la liste à
     /// rappeler dans le bail (aucune : il a voté, il ne soutient plus ce relais).
-    pub fn standby_beat(&self, committee: &minelib_net::guard::Committee) -> Option<u64> {
-        guards::standby_beat(&mut self.state.lock().unwrap(), committee)
+    pub fn standby_beat(
+        &self,
+        committee: &minelib_net::guard::Committee,
+        paused: bool,
+    ) -> Option<u64> {
+        guards::standby_beat(&mut self.state.lock().unwrap(), committee, paused)
     }
 
     /// Relais de secours, régulièrement : il vote quand le relais du monde se tait, et
@@ -210,30 +215,19 @@ impl Handle {
         }
     }
 
-    /// Relais de secours : une liste plus récente en nomme un autre, et il n'a pas voté
-    /// (il n'a plus rien à faire ; s'il a voté, il reste : la reprise peut encore lui
-    /// revenir).
+    /// Relais de secours : une liste plus récente, entendue du relais du monde, en nomme un
+    /// autre (il n'a plus rien à faire).
     pub fn standby_replaced(&self) -> bool {
         let st = self.state.lock().unwrap();
         st.standby.as_ref().is_some_and(|sb| {
             !sb.active
                 && sb.guard.as_ref().is_some_and(|g| {
-                    g.keeper.voted().is_none()
-                        && g.keeper
-                            .committee
-                            .as_ref()
-                            .is_some_and(|c| !c.is_standby(&g.keeper.me))
+                    g.keeper
+                        .committee
+                        .as_ref()
+                        .is_some_and(|c| !c.is_standby(&g.keeper.me))
                 })
         })
-    }
-
-    /// Relais de secours : a-t-il voté pour la reprise ?
-    pub fn standby_voted(&self) -> bool {
-        let st = self.state.lock().unwrap();
-        st.standby
-            .as_ref()
-            .and_then(|sb| sb.guard.as_ref())
-            .is_some_and(|g| g.keeper.voted().is_some())
     }
 
     /// Arrêt propre de ce relais : chaque monde qui a un relais de secours lui est confié
@@ -1137,6 +1131,13 @@ enum Session {
     },
     Witness {
         cert: sovereign::Cert,
+    },
+    /// Relais d'un monde repris : connexion de garant d'un joueur, certificat vérifié,
+    /// signature du défi attendue.
+    GarantProving {
+        pseudo: String,
+        key: [u8; 32],
+        challenge: [u8; 32],
     },
 }
 
@@ -2582,8 +2583,14 @@ fn upkeep_standby(st: &mut State, rid: u64) {
     }
     let host = room.host;
     let local_ok = st.standby_local;
-    // (Gardiens retirés de ce monde : jamais repris, voir `guards::RoomGuards::banned`.)
-    let banned = room.guards.as_ref().map(|g| &g.banned);
+    // (Gardiens retirés de ce monde à l'instant : pas repris tout de suite. Un témoin du
+    // monde ne devient relais de secours qu'à défaut d'autre garant.)
+    let cooling = guards::cooling(st, rid);
+    let witness = |p: &str| {
+        room.guards
+            .as_ref()
+            .is_some_and(|g| g.warden.current.is_witness(p))
+    };
     // (Une connexion de garant d'un jeu, qui sait tenir un relais de secours ; pas celle
     // d'un joueur au menu.)
     let Some(g) = st
@@ -2593,11 +2600,10 @@ fn upkeep_standby(st: &mut State, rid: u64) {
             c.garant
                 && c.garant_only
                 && !c.garant_banned
-                && !banned.is_some_and(|b| {
-                    c.pseudo
-                        .as_deref()
-                        .is_some_and(|p| b.contains(&p.to_ascii_lowercase()))
-                })
+                && !c
+                    .pseudo
+                    .as_deref()
+                    .is_some_and(|p| cooling.contains(&p.to_ascii_lowercase()))
                 && c.room.is_none()
                 && g != host
                 && (local_ok
@@ -2605,15 +2611,18 @@ fn upkeep_standby(st: &mut State, rid: u64) {
         })
         .max_by(|a, b| {
             let score = |c: &Conn| {
-                zones::aptitude(&zones::Candidate {
+                let w = c.pseudo.as_deref().is_some_and(witness);
+                let s = zones::aptitude(&zones::Candidate {
                     id: 0,
                     caps: c.caps,
                     uptime: c.joined.elapsed(),
                     ratio: c.pseudo.as_deref().map_or(0.0, |p| st.stats.ratio(p)),
                     rtt: link_ms(c),
-                })
+                });
+                (!w, s)
             };
-            score(a.1).total_cmp(&score(b.1))
+            let (x, y) = (score(a.1), score(b.1));
+            x.0.cmp(&y.0).then(x.1.total_cmp(&y.1))
         })
         .map(|(&g, _)| g)
     else {
@@ -5988,6 +5997,63 @@ fn handle_account(
                 device: new_device,
             }
         }
+        // Relais d'un monde repris : la connexion de garant d'un joueur entre avec le
+        // certificat de la clé de son compte (de l'ancien relais du monde, ou de celui-ci).
+        // Elle pourra tenir le prochain relais de secours du monde, ou en être témoin.
+        Request::GarantLogin { cert } => {
+            let Some(sb) = st.standby.as_ref().filter(|sb| sb.active) else {
+                return err(ErrorCode::Refused, "Pas de monde repris ici.");
+            };
+            let mine = st.cert_key.verifying_key();
+            let ok = cert.expires >= now_secs()
+                && (cert.valid(&sb.root, sb.room)
+                    || sb.resumed.is_some_and(|r| cert.valid(&mine, r)));
+            if !ok {
+                return err(ErrorCode::WrongCredentials, "certificat");
+            }
+            let mut challenge = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut challenge);
+            *session = Session::GarantProving {
+                pseudo: cert.pseudo,
+                key: cert.key,
+                challenge,
+            };
+            Response::TakeoverChallenge {
+                challenge,
+                proof: None,
+            }
+        }
+        Request::GarantProve { signature } => {
+            let Session::GarantProving {
+                pseudo,
+                key,
+                challenge,
+            } = &*session
+            else {
+                return err(ErrorCode::NotLoggedIn, "");
+            };
+            let ok = VerifyingKey::from_bytes(key)
+                .ok()
+                .zip(Signature::from_slice(&signature).ok())
+                .is_some_and(|(k, s)| k.verify(challenge, &s).is_ok());
+            if !ok {
+                *session = Session::Anonymous;
+                return err(ErrorCode::WrongCredentials, "signature");
+            }
+            let (pseudo, key) = (pseudo.clone(), *key);
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.pseudo = Some(pseudo.clone());
+                c.account = Some(key);
+            }
+            log::info!("monde repris : connexion de garant de « {pseudo} »");
+            *session = Session::LoggedIn {
+                pseudo: pseudo.clone(),
+            };
+            Response::Welcome {
+                pseudo,
+                totp: false,
+            }
+        }
         // Relais de secours, après la chute du relais du monde : un joueur de ce monde
         // entre avec le certificat de la clé de son compte.
         Request::Takeover { cert } => {
@@ -6548,8 +6614,9 @@ mod tests {
             )
         };
         let c = Committee::sign(&root, 42, 1, Some("Secours".into()), vec!["Wit".into()]);
-        // Le relais du monde se fait entendre, puis se tait : le relais de secours vote.
-        assert_eq!(h.standby_beat(&c), Some(1));
+        // Le relais du monde se fait entendre, puis se tait ; le relais de secours seul ne
+        // peut rien (sa voix ne compte pas).
+        assert_eq!(h.standby_beat(&c, false), Some(1));
         assert!(!h.standby_tick());
         // Un témoin d'un autre monde : refusé ; le bon : entré.
         let login = |cert: sovereign::Cert| {
@@ -6569,19 +6636,28 @@ mod tests {
             panic!("{e:?}")
         };
         std::thread::sleep(Duration::from_millis(minelib_net::guard::VOTE_MS + 100));
-        assert!(
-            !h.standby_tick(),
-            "le relais de secours seul n'est pas une majorité"
+        assert!(!h.standby_tick(), "le relais de secours seul ne peut rien");
+        // Un vote signé d'une autre clé que celle du certificat, ou pour une liste qui n'est
+        // pas signée par le relais du monde : ne compte pas.
+        let forged = Committee::sign(
+            &SigningKey::from_bytes(&[8; 32]),
+            42,
+            1,
+            Some("Secours".into()),
+            vec!["Wit".into()],
         );
-        assert!(h.standby_voted());
-        // Un vote signé d'une autre clé que celle du certificat : ne compte pas.
-        transport::push(
-            &link,
-            &Request::WitnessBeat {
-                committee: c.clone(),
-                vote: Some(Vote::sign(&eve, 42, 1, "Wit")),
-            },
-        );
+        for vote in [
+            (c.clone(), Vote::sign(&eve, 42, 1, "Wit")),
+            (forged, Vote::sign(&wit, 42, 1, "Wit")),
+        ] {
+            transport::push(
+                &link,
+                &Request::WitnessBeat {
+                    committee: c.clone(),
+                    vote: Some(vote),
+                },
+            );
+        }
         std::thread::sleep(Duration::from_millis(200));
         assert!(!h.standby_tick());
         // Personne n'entre encore.
@@ -6608,12 +6684,12 @@ mod tests {
             })
         };
         assert!(matches!(try_in(Some(at.clone())), Event::Error(_)));
-        // Le vote du témoin, signé de sa clé : majorité, reprise.
+        // Le vote du témoin, signé de sa clé, pour la liste signée : quorum, reprise.
         transport::push(
             &link,
             &Request::WitnessBeat {
                 committee: c.clone(),
-                vote: Some(Vote::sign(&wit, 42, 1, "Wit")),
+                vote: Some((c.clone(), Vote::sign(&wit, 42, 1, "Wit"))),
             },
         );
         let t = Instant::now();
@@ -6631,6 +6707,65 @@ mod tests {
             e => panic!("{e:?}"),
         }
         drop(w);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Un témoin menteur vote pour la reprise alors que le relais du monde sert encore
+    /// (le relais de secours l'entend, et il ne se dit pas en pause) : un relais de secours
+    /// honnête ne reprend pas. Dès que le relais du monde se dit en pause, il reprend.
+    #[test]
+    fn an_honest_standby_does_not_take_over_a_world_it_sees_served() {
+        use minelib_net::guard::{Committee, Vote};
+        let dir = std::env::temp_dir().join(format!("minelib-secours-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "secours".into(),
+        })
+        .unwrap();
+        let root = SigningKey::from_bytes(&[3; 32]);
+        let info = proto::StandbyInfo {
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [1; 32],
+            max_players: 0,
+            creator: "Createur".into(),
+            server: "createur/monde".into(),
+            owner: "Createur".into(),
+        };
+        h.standby_begin(42, root.verifying_key().to_bytes(), info, "Secours");
+        let wit = SigningKey::from_bytes(&[6; 32]);
+        let cert = sovereign::Cert::issue(
+            &root,
+            42,
+            "Wit",
+            wit.verifying_key().to_bytes(),
+            now_secs() + 3600,
+        );
+        let c = Committee::sign(&root, 42, 1, Some("Secours".into()), vec!["Wit".into()]);
+        assert_eq!(h.standby_beat(&c, false), Some(1));
+        let cl = Client::spawn(h.addr.to_string(), Some(h.public));
+        cl.send(Cmd::WitnessLogin {
+            cert,
+            key: wit.clone(),
+        });
+        let Event::Link(link) = wait(&cl, |e| matches!(e, Event::Link(_))) else {
+            unreachable!()
+        };
+        transport::push(
+            &link,
+            &Request::WitnessBeat {
+                committee: c.clone(),
+                vote: Some((c.clone(), Vote::sign(&wit, 42, 1, "Wit"))),
+            },
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(h.standby_beat(&c, false), Some(1));
+        assert!(!h.standby_tick(), "le relais du monde sert sous ses yeux");
+        assert_eq!(h.standby_beat(&c, true), Some(1));
+        assert!(h.standby_tick(), "le relais du monde se dit en pause");
+        drop(cl);
         let _ = std::fs::remove_dir_all(dir);
     }
 

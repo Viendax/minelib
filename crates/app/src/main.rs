@@ -1064,6 +1064,12 @@ impl Game {
                 // Le relais du monde est tombé, son relais de secours a repris le monde : la
                 // partie continue, par la nouvelle connexion.
                 Event::TakenOver { host, .. } => {
+                    // La connexion de garant suit le monde chez son nouveau relais (sauf si
+                    // c'est elle qui le tient) : il pourra s'y choisir un relais de secours.
+                    if !self.garant_worker.as_ref().is_some_and(|w| w.hosting()) {
+                        self.garant_worker = None;
+                        self.garant_worker_tried = false;
+                    }
                     let me = self.accounts.pseudo();
                     let link = self.accounts.link.clone();
                     if let (Some(s), Some(link)) = (&mut self.session, link) {
@@ -3197,7 +3203,11 @@ impl GameLoop for Game {
                 log::error!("sauvegarde impossible : {e:#}");
             }
         }
-        // Relais intégré : ses mondes passent tout de suite à leur relais de secours.
+        // Relais intégré, ou monde repris tenu par la connexion de garant : ses mondes
+        // passent tout de suite à leur relais de secours.
+        if let Some(w) = self.garant_worker.take() {
+            w.finish();
+        }
         self.accounts.release_relay();
         self.renderer = None; // libère le GPU avant la fermeture de la fenêtre
     }

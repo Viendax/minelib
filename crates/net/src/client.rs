@@ -39,6 +39,12 @@ pub enum Cmd {
         /// Jeton d'appareil de confiance pour ce compte (pas de 2FA).
         device: Option<[u8; 32]>,
     },
+    /// Connexion de garant au relais qui a repris le monde du joueur, avec le certificat de
+    /// la clé de son compte (voir `Request::GarantLogin`).
+    GarantLogin {
+        cert: crate::sovereign::Cert,
+        key: ed25519_dalek::SigningKey,
+    },
     /// Entre comme témoin chez le relais de secours d'un monde (voir
     /// `Request::WitnessLogin`).
     WitnessLogin {
@@ -342,6 +348,7 @@ pub enum Event {
         t: u64,
         committee: crate::guard::Committee,
         standby: Option<crate::proto::StandbyAt>,
+        paused: bool,
     },
     /// Être témoin d'un monde (voir `Response::WitnessTask`).
     WitnessTask {
@@ -427,6 +434,12 @@ impl Client {
     /// joueur joue sa propre partie (même relais, même clé).
     pub fn spawn_garant(addr: String, pinned: [u8; 32]) -> Self {
         Self::spawn_inner(addr, Some(pinned), None, true)
+    }
+
+    /// Comme `spawn_garant`, l'adresse trouvée par `resolve` (relais d'un monde repris,
+    /// joint par un tunnel iroh).
+    pub fn spawn_garant_resolved(resolve: Resolver) -> Self {
+        Self::spawn_inner(String::new(), None, Some(resolve), true)
     }
 
     fn spawn_with(addr: String, pinned: Option<[u8; 32]>, resolve: Option<Resolver>) -> Self {
@@ -755,10 +768,12 @@ impl Worker {
                 t,
                 committee,
                 standby,
+                paused,
             } => Event::Beat {
                 t,
                 committee,
                 standby,
+                paused,
             },
             Response::WitnessTask { room, root, cert } => Event::WitnessTask { room, root, cert },
             Response::Committee { committee } => Event::Committee(committee),
@@ -932,6 +947,32 @@ impl Worker {
                     r => return Err(anyhow!("réponse inattendue : {r:?}")),
                 }
                 self.login(&pseudo, &keys, None, None)
+            }
+            Cmd::GarantLogin { cert, key } => {
+                self.chan = None;
+                self.connect()?;
+                let challenge = match self.request(&Request::GarantLogin { cert: cert.clone() })? {
+                    Response::TakeoverChallenge { challenge, .. } => challenge,
+                    r => return self.unexpected(r),
+                };
+                use ed25519_dalek::Signer;
+                let signature = key.sign(&challenge).to_bytes().to_vec();
+                match self.request(&Request::GarantProve { signature })? {
+                    Response::Welcome { pseudo, .. } => {
+                        self.pseudo = pseudo.clone();
+                        self.emit(Event::Identity(key));
+                        if let Some(c) = &self.chan {
+                            self.emit(Event::Link(c.pusher()));
+                        }
+                        self.emit(Event::LoggedIn {
+                            pseudo,
+                            fingerprint: String::new(),
+                            totp: false,
+                        });
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
             }
             Cmd::WitnessLogin { cert, key } => {
                 self.chan = None;
