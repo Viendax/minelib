@@ -1,10 +1,13 @@
 //! Construction en ligne sans limite de joueurs : le monde est découpé en zones de
-//! `ZONE × ZONE` chunks ; chaque zone active a un garant (un des joueurs) qui valide les
-//! modifications et les publie. Le relais choisit les garants parmi les joueurs
-//! disponibles, d'abord les plus adaptés (machine, ancienneté, réputation) et les moins
-//! chargés, de sorte que les zones les plus actives aillent à des garants différents ;
-//! le garant d'une zone très active est aussi remplacé de temps en temps (on n'est pas
-//! toujours jugé par le même).
+//! `ZONE × ZONE` chunks. Le relais du monde accepte seul chaque modification de bloc, lui
+//! donne son rang (`Build::publish`) et garde, zone par zone, l'historique compacté de ce
+//! qui a changé ; chaque joueur ne reçoit que ce qui se passe autour de lui, et rattrape
+//! en s'approchant ce qu'il n'a pas encore reçu. Les positions vont aux voisins, moins
+//! souvent au loin (`Build::nearby`).
+//!
+//! Jusqu'à la v126, chaque zone active avait un garant (le jeu d'un joueur) qui validait
+//! les modifications et disait qui les avait faites. Le relais le fait lui-même depuis la
+//! v127 : personne d'autre que lui n'écrit l'histoire d'un monde.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -13,10 +16,6 @@ use minelib_net::proto::GarantCaps;
 
 /// Distance (en chunks) jusqu'à laquelle un joueur reçoit ce qui se passe.
 pub const NEAR: i32 = 12;
-/// Une zone très active change de garant au bout de ce temps.
-const ROTATE: Duration = Duration::from_secs(600);
-/// Une zone sans joueur proche ni activité perd son garant au bout de ce temps.
-const IDLE: Duration = Duration::from_secs(60);
 /// Taille maximale gardée de l'historique d'une zone (pour les arrivants). L'historique est
 /// compacté (la dernière modification de chaque case), cette limite ne sert qu'aux
 /// messages qui ne sont pas des blocs.
@@ -25,11 +24,18 @@ const LOG_MAX: usize = 16 << 20;
 /// Historique d'une zone : chaque modification a un numéro croissant ; une nouvelle
 /// modification d'une case remplace l'ancienne (l'historique ne grossit qu'avec le nombre
 /// de cases changées, pas avec le temps).
+///
+/// Deux sortes d'entrées : les blocs, et le reste (objets au sol, coffres). Un joueur servi
+/// par un relais de région reçoit les blocs de ce relais et le reste du relais du monde :
+/// ce qu'il a déjà reçu se compte donc à part pour chaque sorte.
 #[derive(Default)]
 pub struct ZoneLog {
-    entries: BTreeMap<u64, Vec<u8>>,
+    /// (est un bloc, message).
+    entries: BTreeMap<u64, (bool, Vec<u8>)>,
     by_pos: HashMap<LogKey, u64>,
     bytes: usize,
+    /// Dernier numéro de chaque sorte (blocs, reste).
+    last: [u64; 2],
 }
 
 /// Ce qu'une entrée d'historique décrit (la suivante de même clé la remplace).
@@ -51,31 +57,48 @@ impl ZoneLog {
             Some(BuildMsg::Slot { pos, slot, .. }) => Some(LogKey::Slot(pos, slot)),
             _ => None,
         };
+        let block = matches!(key, Some(LogKey::Block(_)));
         if let Some(key) = key {
             if let Some(old) = self.by_pos.insert(key, seq) {
-                if let Some(d) = self.entries.remove(&old) {
+                if let Some((_, d)) = self.entries.remove(&old) {
                     self.bytes -= d.len();
                 }
             }
         }
         self.bytes += data.len();
-        self.entries.insert(seq, data.to_vec());
+        self.entries.insert(seq, (block, data.to_vec()));
+        self.last[!block as usize] = seq;
         while self.bytes > LOG_MAX {
             let Some((&k, _)) = self.entries.iter().next() else {
                 break;
             };
-            let d = self.entries.remove(&k).expect("entrée");
+            let (_, d) = self.entries.remove(&k).expect("entrée");
             self.bytes -= d.len();
             self.by_pos.retain(|_, s| *s != k);
         }
     }
 
-    /// Modifications après le numéro `after`.
-    pub fn since(&self, after: u64) -> Vec<Vec<u8>> {
+    /// Entrées d'une sorte (`blocks` : les blocs, sinon le reste) après le numéro `after`.
+    pub fn since(&self, after: u64, blocks: bool) -> Vec<Vec<u8>> {
         self.entries
             .range(after + 1..)
-            .map(|(_, d)| d.clone())
+            .filter(|(_, (b, _))| *b == blocks)
+            .map(|(_, (_, d))| d.clone())
             .collect()
+    }
+
+    /// Dernier bloc publié en `pos` (rien si cette case n'a jamais été changée).
+    fn block_at(&self, pos: [i32; 3]) -> Option<u16> {
+        let seq = self.by_pos.get(&LogKey::Block(pos))?;
+        match minelib_net::game::decode(&self.entries.get(seq)?.1)? {
+            minelib_net::game::BuildMsg::Set { block, .. } => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Dernier numéro d'une sorte.
+    pub fn last_of(&self, blocks: bool) -> u64 {
+        self.last[!blocks as usize]
     }
 
     pub fn last(&self) -> u64 {
@@ -87,10 +110,8 @@ impl ZoneLog {
         self.entries.len()
     }
 }
-/// Rééquilibrage au plus toutes les…
-const BALANCE: Duration = Duration::from_secs(5);
 
-/// Un joueur pouvant être garant.
+/// Un joueur pouvant garder le monde (propriétaire) ou héberger un relais de région.
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub id: u64,
@@ -103,7 +124,7 @@ pub struct Candidate {
     pub rtt: Option<f32>,
 }
 
-/// Aptitude d'un joueur à être garant, sans tenir compte de sa charge.
+/// Aptitude d'un joueur à tenir ce rôle, sans tenir compte de sa charge.
 pub fn aptitude(c: &Candidate) -> f64 {
     let cores = c.caps.cores.clamp(1, 32) as f64;
     let fps = c.caps.fps.min(500) as f64;
@@ -116,25 +137,14 @@ pub fn aptitude(c: &Candidate) -> f64 {
     base / (1.0 + 10.0 * c.ratio) / slow
 }
 
-pub struct Zone {
-    pub garant: u64,
-    since: Instant,
-    /// Messages par seconde (moyenne glissante).
-    pub activity: f64,
-    count: u32,
-    last_use: Instant,
-    pub log: ZoneLog,
-}
-
 #[derive(Default)]
 pub struct Build {
-    pub zones: HashMap<[i32; 2], Zone>,
-    /// Logs des zones sans garant (gardés pour les suivants).
-    orphan_logs: HashMap<[i32; 2], ZoneLog>,
+    /// Historique de chaque zone où quelque chose a changé.
+    logs: HashMap<[i32; 2], ZoneLog>,
     pub positions: HashMap<u64, [i32; 2]>,
-    /// Ce que chaque joueur a déjà reçu de chaque zone (dernier numéro).
-    known: HashMap<u64, HashMap<[i32; 2], u64>>,
-    last_balance: Option<Instant>,
+    /// Ce que chaque joueur a déjà reçu de chaque zone : dernier numéro des blocs, et du
+    /// reste (objets, coffres).
+    known: HashMap<u64, HashMap<[i32; 2], [u64; 2]>>,
     /// Numéro de la prochaine modification.
     next_seq: u64,
     /// Positions envoyées par chaque joueur (pour n'en transmettre qu'une partie au loin).
@@ -188,19 +198,11 @@ const POS_BURST: f32 = 8.0;
 /// modification ne dépend plus de la taille de la foule.
 pub const LIVE_MAX: usize = 256;
 
-/// Changements de garants à annoncer : (joueur, zones gagnées, zones perdues).
-pub type Changes = Vec<(u64, Vec<[i32; 2]>, Vec<[i32; 2]>)>;
+/// Ce que des joueurs doivent recevoir : (joueur, messages).
+pub type Sends = Vec<(u64, Vec<Vec<u8>>)>;
 
 fn near(a: [i32; 2], b: [i32; 2]) -> bool {
     (a[0] - b[0]).abs() <= NEAR && (a[1] - b[1]).abs() <= NEAR
-}
-
-/// Le chunk est-il proche d'une zone (bord compris) ?
-fn near_zone(chunk: [i32; 2], zone: [i32; 2]) -> bool {
-    let z = minelib_net::proto::ZONE;
-    let cx = chunk[0].clamp(zone[0] * z, zone[0] * z + z - 1);
-    let cz = chunk[1].clamp(zone[1] * z, zone[1] * z + z - 1);
-    near(chunk, [cx, cz])
 }
 
 impl Build {
@@ -269,6 +271,13 @@ impl Build {
     /// sert que sa part de la limite, puisqu'il ne porte que sa part des joueurs.
     pub fn nearby(&mut self, id: u64, chunk: [i32; 2], relays: usize) -> Vec<u64> {
         self.reindex();
+        // Les joueurs des autres relais de la région ne « partent » jamais d'ici : leurs
+        // compteurs s'accumulaient sans fin. Quand il y en a bien plus que de joueurs
+        // présents, on ne garde que ceux des présents (les autres repartent de zéro).
+        if self.pos_count.len() > 4 * self.positions.len() + 4096 {
+            let here = &self.positions;
+            self.pos_count.retain(|id, _| here.contains_key(id));
+        }
         let n = self.pos_count.entry(id).or_insert(0);
         *n = n.wrapping_add(1);
         let n = *n;
@@ -326,11 +335,6 @@ impl Build {
         self.by_chunk.values().filter(|m| m.len() >= 2)
     }
 
-    /// Zones actives (des messages ces dernières secondes).
-    pub fn active(&self) -> usize {
-        self.zones.values().filter(|z| z.activity > 0.05).count()
-    }
-
     /// Joueurs à qui envoyer ce qui se passe au chunk `chunk` (tous ceux à portée : une
     /// modification du monde doit arriver à chacun).
     pub fn listeners(&self, chunk: [i32; 2], except: u64) -> Vec<u64> {
@@ -352,130 +356,97 @@ impl Build {
             .collect()
     }
 
-    /// Choisit le meilleur garant pour une zone : aptitude moins la charge actuelle.
-    fn best(&self, cands: &[Candidate], skip: Option<u64>) -> Option<u64> {
-        let load = |id: u64| -> f64 {
-            self.zones
-                .values()
-                .filter(|z| z.garant == id)
-                .map(|z| 1.0 + z.activity)
-                .sum()
-        };
-        cands
-            .iter()
-            .filter(|c| Some(c.id) != skip)
-            .map(|c| (c.id, aptitude(c) / (1.0 + load(c.id))))
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(id, _)| id)
-            .or_else(|| cands.first().map(|c| c.id))
-    }
-
-    /// Garant de la zone (en nomme un si besoin). Renvoie le garant et les changements.
-    pub fn garant(&mut self, zone: [i32; 2], cands: &[Candidate]) -> (Option<u64>, Changes) {
-        if let Some(z) = self.zones.get(&zone) {
-            return (Some(z.garant), Vec::new());
-        }
-        let Some(g) = self.best(cands, None) else {
-            return (None, Vec::new());
-        };
-        let log = self.orphan_logs.remove(&zone).unwrap_or_default();
-        let now = Instant::now();
-        self.zones.insert(
-            zone,
-            Zone {
-                garant: g,
-                since: now,
-                activity: 0.0,
-                count: 0,
-                last_use: now,
-                log,
-            },
-        );
-        (Some(g), vec![(g, vec![zone], Vec::new())])
-    }
-
-    /// Un message pour la zone (activité).
-    pub fn touch(&mut self, zone: [i32; 2]) {
-        if let Some(z) = self.zones.get_mut(&zone) {
-            z.count += 1;
-            z.last_use = Instant::now();
-        }
-    }
-
-    /// Le garant publie une modification validée : gardée pour les arrivants. Renvoie, pour
-    /// chaque joueur proche, ce qu'il doit recevoir : la modification seule s'il avait tout
-    /// le reste, sinon tout ce qui lui manque (rien n'est jamais perdu, même s'il s'était
-    /// éloigné un moment).
-    pub fn record(
-        &mut self,
-        zone: [i32; 2],
-        data: &[u8],
-        listeners: &[u64],
-    ) -> Vec<(u64, Vec<Vec<u8>>)> {
-        if !self.zones.contains_key(&zone) {
-            return Vec::new();
-        }
-        self.mirror_to(zone, data, listeners)
-    }
-
-    /// Comme `record`, même pour une zone sans garant (relais de région, copie gardée par
-    /// le relais du monde).
-    pub fn mirror_to(
-        &mut self,
-        zone: [i32; 2],
-        data: &[u8],
-        listeners: &[u64],
-    ) -> Vec<(u64, Vec<Vec<u8>>)> {
-        let log = match self.zones.get_mut(&zone) {
-            Some(z) => &mut z.log,
-            None => self.orphan_logs.entry(zone).or_default(),
-        };
-        let before = log.last();
-        self.next_seq = self.next_seq.max(before) + 1;
+    /// Garde un message (bloc publié, état d'un objet ou d'un coffre) dans l'historique de
+    /// sa zone. Renvoie, pour chaque joueur de `listeners`, ce qu'il doit recevoir : le
+    /// message seul s'il avait tout le reste, sinon tout ce qui lui manque de cette sorte
+    /// (rien n'est jamais perdu, même s'il s'était éloigné un moment).
+    pub fn mirror_to(&mut self, zone: [i32; 2], data: &[u8], listeners: &[u64]) -> Sends {
+        let log = self.logs.entry(zone).or_default();
+        self.next_seq = self.next_seq.max(log.last()) + 1;
         let seq = self.next_seq;
+        let before = log.last;
         log.push(seq, data);
+        // Sorte de l'entrée : celle dont le dernier numéro vient de changer.
+        let blocks = log.last[0] != before[0];
+        let (kind, before) = (!blocks as usize, before[!blocks as usize]);
         let mut out = Vec::new();
         // Dans une foule, la modification n'est poussée tout de suite qu'aux `LIVE_MAX`
         // premiers ; les autres la reçoivent à leur prochaine position (20 fois par
         // seconde), compactée : la dernière valeur de chaque case, pas chaque étape.
         for &id in listeners.iter().take(LIVE_MAX) {
-            let known = self.known.entry(id).or_default().entry(zone).or_insert(0);
+            let known = &mut self.known.entry(id).or_default().entry(zone).or_default()[kind];
             if *known >= before {
                 out.push((id, vec![data.to_vec()]));
             } else {
-                out.push((id, log.since(*known)));
+                out.push((id, log.since(*known, blocks)));
             }
             *known = seq;
         }
         out
     }
 
-    /// Garde une modification venue d'ailleurs (relais de région, historique reçu).
-    pub fn mirror(&mut self, zone: [i32; 2], data: &[u8]) {
-        self.mirror_to(zone, data, &[]);
+    /// Dernier bloc publié en `pos`, si cette case a déjà été modifiée (le relais ne
+    /// connaît pas le terrain d'origine).
+    pub fn block_at(&self, pos: [i32; 3]) -> Option<u16> {
+        let zone = minelib_net::proto::zone_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]);
+        self.logs.get(&zone)?.block_at(pos)
     }
 
-    /// Zones dont on a l'historique (avec ou sans garant).
+    /// Le relais du monde accepte une modification de bloc : elle prend son rang dans
+    /// l'ordre du monde (`seq`, écrit dans le message : le jeu n'applique jamais une
+    /// modification plus ancienne que celle qu'il a déjà pour la même case) et entre dans
+    /// l'historique. Renvoie le message, et ce que chaque joueur de `listeners` doit
+    /// recevoir (voir `mirror_to`).
+    pub fn publish(
+        &mut self,
+        pos: [i32; 3],
+        block: u16,
+        by: &str,
+        listeners: &[u64],
+    ) -> (Vec<u8>, Sends) {
+        let zone = minelib_net::proto::zone_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]);
+        let last = self.logs.get(&zone).map_or(0, ZoneLog::last);
+        let data = minelib_net::game::encode(&minelib_net::game::BuildMsg::Set {
+            pos,
+            block,
+            by: by.to_string(),
+            // (Le numéro que `mirror_to` va donner.)
+            seq: self.next_seq.max(last) + 1,
+        });
+        let out = self.mirror_to(zone, &data, listeners);
+        (data, out)
+    }
+
+    /// Historique des blocs des zones choisies par `keep` (pour un relais de région : les
+    /// objets et les coffres ne passent que par le relais du monde).
     pub fn logs_in(&self, keep: impl Fn([i32; 2]) -> bool) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
-        self.zones
+        self.logs
             .iter()
-            .map(|(&k, z)| (k, &z.log))
-            .chain(self.orphan_logs.iter().map(|(&k, l)| (k, l)))
-            .filter(|(k, l)| keep(*k) && l.last() > 0)
-            .map(|(k, l)| (k, l.since(0)))
+            .filter(|(k, l)| keep(**k) && l.last_of(true) > 0)
+            .map(|(k, l)| (*k, l.since(0, true)))
             .collect()
     }
 
     /// Ce qu'un joueur n'a pas encore reçu : des zones proches de `chunk`, ou de toutes les
-    /// zones (`None` : le propriétaire, qui enregistre le monde).
-    pub fn catch_up(&mut self, id: u64, chunk: Option<[i32; 2]>) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
+    /// zones (`None` : le propriétaire, qui enregistre le monde). `blocks` dit, zone par
+    /// zone, s'il faut aussi les blocs : pas quand un relais de région les sert déjà à ce
+    /// joueur (ils restent dus, pour le jour où ce relais s'en va).
+    pub fn catch_up(
+        &mut self,
+        id: u64,
+        chunk: Option<[i32; 2]>,
+        blocks: &dyn Fn([i32; 2]) -> bool,
+    ) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
         let known = self.known.entry(id).or_default();
         let mut out = Vec::new();
         let mut take = |zone: [i32; 2], log: &ZoneLog| {
-            let k = known.entry(zone).or_insert(0);
-            if log.last() > *k {
-                out.push((zone, log.since(*k)));
-                *k = log.last();
+            let k = known.entry(zone).or_default();
+            for kind in [true, false] {
+                let i = !kind as usize;
+                if log.last_of(kind) > k[i] && (!kind || blocks(zone)) {
+                    out.push((zone, log.since(k[i], kind)));
+                    k[i] = log.last_of(kind);
+                }
             }
         };
         match chunk {
@@ -486,20 +457,14 @@ impl Build {
                 for zx in (c[0] - NEAR).div_euclid(z)..=(c[0] + NEAR).div_euclid(z) {
                     for zz in (c[1] - NEAR).div_euclid(z)..=(c[1] + NEAR).div_euclid(z) {
                         let zone = [zx, zz];
-                        if let Some(zn) = self.zones.get(&zone) {
-                            take(zone, &zn.log);
-                        }
-                        if let Some(l) = self.orphan_logs.get(&zone) {
+                        if let Some(l) = self.logs.get(&zone) {
                             take(zone, l);
                         }
                     }
                 }
             }
             None => {
-                for (&zone, zn) in &self.zones {
-                    take(zone, &zn.log);
-                }
-                for (&zone, l) in &self.orphan_logs {
+                for (&zone, l) in &self.logs {
                     take(zone, l);
                 }
             }
@@ -507,121 +472,30 @@ impl Build {
         out
     }
 
-    /// Le joueur s'est déplacé : ce qui lui manque des zones proches.
-    pub fn moved(&mut self, id: u64, chunk: [i32; 2]) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
+    /// Le joueur s'est déplacé : ce qui lui manque des zones proches (`blocks` : voir
+    /// `catch_up`).
+    pub fn moved(
+        &mut self,
+        id: u64,
+        chunk: [i32; 2],
+        blocks: &dyn Fn([i32; 2]) -> bool,
+    ) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
         self.place(id, Some(chunk));
-        self.catch_up(id, Some(chunk))
+        self.catch_up(id, Some(chunk), blocks)
     }
 
     /// Historique de toutes les zones (nouveau propriétaire du monde), noté comme reçu.
     pub fn all_logs(&mut self, id: u64) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
         self.known.remove(&id);
-        self.catch_up(id, None)
+        self.catch_up(id, None, &|_| true)
     }
 
-    /// Un joueur part : ses zones vont à d'autres.
-    pub fn left(&mut self, id: u64, cands: &[Candidate]) -> Changes {
+    /// Un joueur part.
+    pub fn left(&mut self, id: u64) {
         self.place(id, None);
         self.known.remove(&id);
         self.pos_count.remove(&id);
         self.pos_tokens.remove(&id);
-        let mine: Vec<[i32; 2]> = self
-            .zones
-            .iter()
-            .filter(|(_, z)| z.garant == id)
-            .map(|(&k, _)| k)
-            .collect();
-        let mut changes = Changes::new();
-        for zone in mine {
-            let others: Vec<Candidate> = cands.iter().filter(|c| c.id != id).cloned().collect();
-            match self.best(&others, Some(id)) {
-                Some(g) => {
-                    if let Some(z) = self.zones.get_mut(&zone) {
-                        z.garant = g;
-                        z.since = Instant::now();
-                    }
-                    changes.push((g, vec![zone], Vec::new()));
-                }
-                None => {
-                    if let Some(z) = self.zones.remove(&zone) {
-                        self.orphan_logs.insert(zone, z.log);
-                    }
-                }
-            }
-        }
-        changes
-    }
-
-    /// Rééquilibrage périodique : activité mesurée, zones abandonnées libérées, zones
-    /// actives réparties sur des garants différents et renouvelées au bout de `ROTATE`.
-    pub fn balance(&mut self, cands: &[Candidate]) -> Changes {
-        let now = Instant::now();
-        let dt = match self.last_balance {
-            Some(t) if now - t < BALANCE => return Vec::new(),
-            Some(t) => (now - t).as_secs_f64(),
-            None => BALANCE.as_secs_f64(),
-        };
-        self.last_balance = Some(now);
-        type Lists = (Vec<[i32; 2]>, Vec<[i32; 2]>);
-        let mut changes: HashMap<u64, Lists> = HashMap::new();
-        for z in self.zones.values_mut() {
-            let rate = z.count as f64 / dt;
-            z.activity = z.activity * 0.5 + rate * 0.5;
-            z.count = 0;
-        }
-        // Zones sans personne autour depuis longtemps.
-        let idle: Vec<[i32; 2]> = self
-            .zones
-            .iter()
-            .filter(|(&k, z)| {
-                now - z.last_use > IDLE && !self.positions.values().any(|&p| near_zone(p, k))
-            })
-            .map(|(&k, _)| k)
-            .collect();
-        for k in idle {
-            if let Some(z) = self.zones.remove(&k) {
-                changes.entry(z.garant).or_default().1.push(k);
-                self.orphan_logs.insert(k, z.log);
-            }
-        }
-        // Les zones les plus actives d'abord, chacune au meilleur garant compte tenu
-        // de ce qui a déjà été donné.
-        let mut busy: Vec<([i32; 2], f64)> =
-            self.zones.iter().map(|(&k, z)| (k, z.activity)).collect();
-        busy.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let mut load: HashMap<u64, f64> = HashMap::new();
-        for (zone, activity) in busy {
-            let current = self.zones[&zone].garant;
-            let since = self.zones[&zone].since;
-            let rotate = activity > 1.0 && now - since > ROTATE && cands.len() > 1;
-            let score = |c: &Candidate, load: &HashMap<u64, f64>| {
-                aptitude(c) / (1.0 + load.get(&c.id).copied().unwrap_or(0.0))
-            };
-            let pick = cands
-                .iter()
-                .filter(|c| !(rotate && c.id == current))
-                .max_by(|a, b| score(a, &load).total_cmp(&score(b, &load)));
-            let Some(pick) = pick else { continue };
-            let cur_score = cands
-                .iter()
-                .find(|c| c.id == current)
-                .map(|c| score(c, &load));
-            // On ne change que pour nettement mieux (ou pour renouveler, ou garant parti).
-            let better = match cur_score {
-                None => true,
-                Some(s) => rotate || score(pick, &load) > s * 1.5,
-            };
-            let g = if better { pick.id } else { current };
-            *load.entry(g).or_default() += 1.0 + activity;
-            if g != current {
-                let z = self.zones.get_mut(&zone).expect("zone");
-                z.garant = g;
-                z.since = now;
-                changes.entry(current).or_default().1.push(zone);
-                changes.entry(g).or_default().0.push(zone);
-            }
-        }
-        changes.into_iter().map(|(id, (g, l))| (id, g, l)).collect()
     }
 }
 
@@ -698,7 +572,7 @@ mod tests {
                     })
                     .collect();
                 for &(id, c, s) in &players {
-                    builds[s].moved(id, c);
+                    builds[s].moved(id, c, &|_| true);
                 }
                 let mut rate = vec![20.0f32; n];
                 let mut report = String::new();
@@ -762,6 +636,7 @@ mod tests {
                         pos: [123, 64, -321],
                         block: 37,
                         by: "Joueur1234".into(),
+                        seq: 123_456,
                     }),
                 })
                 .unwrap()
@@ -779,12 +654,18 @@ mod tests {
                     }
                 }
                 let worst = out.iter().cloned().fold(0.0, f64::max);
+                // Le relais du monde accepte chaque modification (une demande reçue), la
+                // confirme à son auteur et la remet à chaque relais de la région.
+                let world = n as f64 * 0.5 * (relays as f64 + 1.0);
                 eprintln!(
-                    "FOULE {layout:<24} {n:>5} joueurs, construction (1 bloc / 2 s chacun, {set} octets) | relais le plus chargé : {:.0} msg/s = {:.1} Mbit/s | joueur : {:.0} modifications reçues/s ({:.0} kbit/s)",
+                    "FOULE {layout:<24} {n:>5} joueurs, construction (1 bloc / 2 s chacun, {set} octets) | relais le plus chargé : {:.0} msg/s = {:.1} Mbit/s | joueur : {:.0} modifications reçues/s ({:.0} kbit/s) | relais du monde : {:.0} demandes/s, {:.0} msg/s sortants = {:.1} Mbit/s",
                     worst,
                     worst * set as f64 * 8.0 / 1e6,
                     got / n as f64,
                     got / n as f64 * set as f64 * 8.0 / 1e3,
+                    n as f64 * 0.5,
+                    world,
+                    world * set as f64 * 8.0 / 1e6,
                 );
             }
         }
@@ -807,66 +688,91 @@ mod tests {
     }
 
     #[test]
-    fn busy_zones_go_to_different_suited_garants() {
-        let cands = vec![cand(1, 16), cand(2, 8), cand(3, 2)];
-        let mut b = Build::default();
-        // La première zone va au plus adapté.
-        assert_eq!(b.garant([0, 0], &cands).0, Some(1));
-        // La suivante, au même s'il n'est pas chargé, sinon à un autre.
-        for _ in 0..50 {
-            b.touch([0, 0]);
-        }
-        b.balance(&cands);
-        let (g, _) = b.garant([5, 5], &cands);
-        assert_ne!(
-            g,
-            Some(1),
-            "zone active déjà chez 1 : une autre va ailleurs"
-        );
+    fn history_is_compacted_and_everyone_gets_exactly_what_is_missing() {
         // Signalé souvent : en dernier.
         let mut bad = cand(4, 32);
         bad.ratio = 2.0;
         assert!(aptitude(&bad) < aptitude(&cand(3, 2)));
-        // Historique compacté : la dernière modification de chaque case.
-        let set = |x: i32, block: u16| {
-            minelib_net::game::encode(&minelib_net::game::BuildMsg::Set {
-                pos: [x, 64, 0],
-                block,
-                by: String::new(),
-            })
+        let mut b = Build::default();
+        // Le relais donne à chaque modification son rang, écrit dans le message.
+        let seq = |data: &[u8]| match minelib_net::game::decode(data) {
+            Some(minelib_net::game::BuildMsg::Set { seq, by, .. }) => (seq, by),
+            m => panic!("{m:?}"),
         };
+        let mut last = 0;
         for i in 0..100 {
-            b.record([0, 0], &set(i % 3, i as u16), &[]);
+            let (data, _) = b.publish([i % 3, 64, 0], i as u16, "Eve", &[]);
+            let (n, by) = seq(&data);
+            assert!(n > last, "rangs croissants");
+            assert_eq!(by, "Eve");
+            last = n;
         }
-        assert_eq!(
-            b.zones[&[0, 0]].log.len(),
-            3,
-            "3 cases changées : 3 entrées"
-        );
+        // Historique compacté : la dernière modification de chaque case.
+        assert_eq!(b.logs[&[0, 0]].len(), 3, "3 cases changées : 3 entrées");
+        assert_eq!(b.block_at([1, 64, 0]), Some(97), "la dernière : 97");
+        assert_eq!(b.block_at([9, 64, 0]), None, "jamais changée : inconnue");
         // Un joueur proche reçoit seulement la nouveauté ; un joueur revenu après s'être
         // éloigné reçoit tout ce qu'il a manqué (compacté).
         b.positions.insert(10, [0, 0]);
-        let first = b.moved(10, [0, 0]);
+        let first = b.moved(10, [0, 0], &|_| true);
         assert_eq!(first.iter().map(|(_, l)| l.len()).sum::<usize>(), 3);
-        let live = b.record([0, 0], &set(5, 1), &[10]);
-        assert_eq!(live, vec![(10, vec![set(5, 1)])]);
-        b.record([0, 0], &set(6, 1), &[]);
-        b.record([0, 0], &set(6, 2), &[]);
-        let back = b.record([0, 0], &set(7, 1), &[10]);
-        assert_eq!(
-            back[0].1,
-            vec![set(6, 2), set(7, 1)],
-            "rien de perdu, rien en double"
-        );
+        let (five, live) = b.publish([5, 64, 0], 1, "Eve", &[10]);
+        assert_eq!(live, vec![(10, vec![five])]);
+        b.publish([6, 64, 0], 1, "Eve", &[]);
+        let (six, _) = b.publish([6, 64, 0], 2, "Eve", &[]);
+        let (seven, back) = b.publish([7, 64, 0], 1, "Eve", &[10]);
+        assert_eq!(back[0].1, vec![six, seven], "rien de perdu, rien en double");
         // Le propriétaire (toutes les zones) rattrape tout, une fois.
         assert_eq!(
-            b.catch_up(99, None)
+            b.catch_up(99, None, &|_| true)
                 .iter()
                 .map(|(_, l)| l.len())
                 .sum::<usize>(),
             6
         );
-        assert!(b.catch_up(99, None).is_empty());
+        assert!(b.catch_up(99, None, &|_| true).is_empty());
+    }
+
+    /// Un joueur servi par un relais de région ne reçoit pas les blocs une deuxième fois
+    /// du relais du monde, mais toujours les objets et les coffres (seul le relais du
+    /// monde les arbitre) ; les blocs lui restent dus : le relais de région parti, il
+    /// reçoit tout ce qui a changé depuis.
+    #[test]
+    fn blocks_served_by_a_region_relay_are_not_sent_twice_but_stay_owed() {
+        use minelib_net::game::{encode, BuildMsg};
+        let mut b = Build::default();
+        b.positions.insert(10, [0, 0]);
+        let item = |id: u64| {
+            encode(&BuildMsg::Item {
+                id,
+                at: [0.5, 64.0, 0.5],
+                drop: None,
+                to: String::new(),
+                seq: 0,
+                got: None,
+            })
+        };
+        let (a, _) = b.publish([1, 64, 1], 5, "Eve", &[]);
+        b.mirror_to([0, 0], &item(1), &[]);
+        let (c, _) = b.publish([2, 64, 1], 6, "Eve", &[]);
+        // Servi par un relais de région : seulement l'objet.
+        let got = b.catch_up(10, Some([0, 0]), &|_| false);
+        assert_eq!(got, vec![([0, 0], vec![item(1)])]);
+        assert!(b.catch_up(10, Some([0, 0]), &|_| false).is_empty());
+        // En direct aussi, chaque sorte se compte à part : un nouvel objet seul.
+        let live = b.mirror_to([0, 0], &item(2), &[10]);
+        assert_eq!(live, vec![(10, vec![item(2)])]);
+        // Le relais de région s'en va : les deux blocs, dans l'ordre.
+        let got = b.catch_up(10, Some([0, 0]), &|_| true);
+        assert_eq!(got, vec![([0, 0], vec![a, c])]);
+        // L'historique remis à un relais de région ne contient que les blocs.
+        assert_eq!(b.logs_in(|_| true)[0].1.len(), 2);
+    }
+
+    #[test]
+    fn positions_go_to_neighbours_and_less_often_far_away() {
+        let mut b = Build::default();
+        b.positions.insert(10, [0, 0]);
         // Positions : tout aux voisins, une sur 4 un peu plus loin, une sur 20 au loin.
         b.positions.insert(20, [1, 0]);
         b.positions.insert(21, [5, 0]);
@@ -886,7 +792,7 @@ mod tests {
         // toujours les mêmes, et chacun est le voisin d'autant de joueurs.
         let mut crowd = Build::default();
         for id in 0..5000u64 {
-            crowd.moved(id, [3, 3]);
+            crowd.moved(id, [3, 3], &|_| true);
         }
         // Les 32 plus proches à chaque fois, puis de plus en plus loin, de moins en
         // moins souvent : tout le monde à portée finit par voir chacun.
@@ -920,20 +826,19 @@ mod tests {
         // Modifications dans une foule : poussées à `LIVE_MAX` joueurs, les autres les
         // reçoivent à leur prochaine position, compactées (la dernière valeur par case).
         let to = crowd.listeners([3, 3], u64::MAX);
+        let mut last = Vec::new();
         for v in 0..10u16 {
-            let live = crowd.mirror_to([0, 0], &set(1, v), &to);
+            let (data, live) = crowd.publish([1, 64, 0], v, "Eve", &to);
             assert_eq!(live.len(), LIVE_MAX);
+            last = data;
         }
         let late = to[LIVE_MAX + 5];
-        let got = crowd.catch_up(late, Some([3, 3]));
-        assert_eq!(got, vec![([0, 0], vec![set(1, 9)])]);
-        assert!(crowd.catch_up(late, Some([3, 3])).is_empty());
+        let got = crowd.catch_up(late, Some([3, 3]), &|_| true);
+        assert_eq!(got, vec![([0, 0], vec![last])]);
+        assert!(crowd.catch_up(late, Some([3, 3]), &|_| true).is_empty());
         // Une modification du monde arrive toujours à tous ceux à portée.
         assert_eq!(crowd.listeners([3, 3], 0).len(), 4999);
-        crowd.left(7, &[]);
+        crowd.left(7);
         assert_eq!(crowd.listeners([3, 3], 0).len(), 4998);
-        // Le garant part : sa zone passe à un autre.
-        let ch = b.left(1, &cands);
-        assert!(ch.iter().any(|(id, g, _)| *id != 1 && g.contains(&[0, 0])));
     }
 }

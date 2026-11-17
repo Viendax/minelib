@@ -461,14 +461,23 @@ pub enum ToHost {
 /// Messages d'un monde de construction en ligne (passent par les zones du relais).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum BuildMsg {
-    /// Demande d'un joueur au garant de la zone.
-    Edit { pos: [i32; 3], block: u16 },
-    /// Modification validée par le garant (gardée par le relais, compactée : la dernière
-    /// par case).
+    /// Demande d'un joueur au relais du monde : mettre `block` en `pos`. `fluid` : c'est
+    /// l'écoulement d'un fluide qui change cette case (budget à part, pas de minage).
+    Edit {
+        pos: [i32; 3],
+        block: u16,
+        fluid: bool,
+    },
+    /// Modification acceptée par le relais du monde (gardée, compactée : la dernière par
+    /// case). `by` : son auteur (le pseudo de sa session) ; `seq` : son rang dans l'ordre
+    /// du monde. Le jeu n'applique jamais une modification plus ancienne que celle qu'il a
+    /// déjà pour la même case : un doublon, ou la même arrivée par deux chemins, est sans
+    /// effet.
     Set {
         pos: [i32; 3],
         block: u16,
         by: String,
+        seq: u64,
     },
     Player {
         pseudo: String,
@@ -478,8 +487,8 @@ pub enum BuildMsg {
         crouch: f32,
         speed: f32,
     },
-    /// Le garant refuse la modification du joueur `peer` en `pos` : le relais ne la remet
-    /// qu'à lui, qui remet le bloc d'avant.
+    /// Le relais du monde refuse la modification du joueur `peer` en `pos` : remise à lui
+    /// seul, qui remet le bloc d'avant.
     Reject { pos: [i32; 3], peer: u64 },
     // ---- Objets au sol et coffres (voir `items`) : demandes à l'arbitre…
     /// Lâcher `pile` (déjà sortie de l'inventaire) en `pos`, sous le numéro neuf `id`.

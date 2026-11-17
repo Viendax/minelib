@@ -3,30 +3,33 @@
 //! de garant, en arrière-plan, comme les garants des parties FPS). Personne dans le monde
 //! n'a intérêt à l'attaquer, et le relais du monde n'a plus à tout transmettre.
 //!
-//! Il fait trois choses, pour sa région seulement :
+//! Il fait deux choses, pour sa région seulement :
 //! - les joueurs y entrent avec le billet du relais du monde (`proto::shard_mac`) ;
-//! - il transmet les positions aux joueurs proches (moins souvent au loin) ;
-//! - il valide lui-même les modifications (bloc connu, dans la région, 20 par seconde au
-//!   plus), les publie aux joueurs proches, garde l'historique compacté de la région, et
-//!   en donne une copie (`published`) que le jeu de l'hôte renvoie au relais du monde.
+//! - il transmet les positions aux joueurs proches (moins souvent au loin), et les
+//!   modifications de blocs que publie le relais du monde (reçues par la connexion de
+//!   l'hôte, `ShardHandle::seed`), dont il garde l'historique compacté pour ceux qui
+//!   arrivent.
 //!
-//! S'il disparaît, le relais du monde reprend la région (il en a la copie) ou la confie à
-//! un autre hôte : chacun reçoit exactement ce qui lui manque.
+//! Il ne décide rien : seul le relais du monde accepte une modification, lui donne son rang
+//! et la garde (comme pour les objets). Jusqu'à la v126, ce relais validait lui-même les
+//! modifications de sa région, le premier relais de la région les mettait en ordre et en
+//! rendait compte au relais du monde, qui le croyait : un hôte malveillant pouvait inventer
+//! une modification ou l'attribuer à un autre joueur. Il ne peut plus que tarder à
+//! transmettre, ou montrer à ses propres joueurs des blocs qui n'existent pas (le jeu les
+//! oublie en changeant de relais ; l'histoire du monde, elle, n'en garde rien).
+//!
+//! S'il disparaît, les joueurs repassent par le relais du monde ou par un autre hôte, qui
+//! reçoit tout l'historique de la région : chacun reçoit ce qui lui manque.
 //!
 //! Une région très peuplée a plusieurs relais, chacun chez un hôte différent. Chaque
 //! joueur n'entre que dans l'un d'eux (`proto::shard_for`), et les relais se relient entre
-//! eux (`set_peers`) :
-//! - la position d'un joueur part à ses voisins du même relais, et une fois à chaque autre
-//!   relais, qui la transmet à ses propres joueurs proches : le travail d'une foule est
-//!   partagé ;
-//! - un seul relais met les modifications en ordre (le plus petit rang) : les autres lui
-//!   envoient celles qu'ils ont vérifiées et transmettent à leurs joueurs ce qu'il publie.
-//!   Tous gardent ainsi le même historique ; si le premier s'en va, le suivant prend sa
-//!   place et republie les dernières secondes (rien n'est perdu).
+//! eux (`set_peers`) : la position d'un joueur part à ses voisins du même relais, et une
+//! fois à chaque autre relais, qui la transmet à ses propres joueurs proches. Les
+//! modifications, elles, arrivent à chaque relais directement du relais du monde.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,14 +40,6 @@ use minelib_net::proto::{self, ErrorCode, Request, Response};
 use minelib_net::transport::{self, Channel, Inbound, Incoming};
 
 use crate::zones;
-
-/// Modifications acceptées par seconde et par joueur.
-const MAX_EDITS_PER_S: u32 = 20;
-/// Hauteur d'un monde (cases).
-const HEIGHT: i32 = 256;
-
-/// Modifications gardées pour un relais qui arrive ou qui prend la première place.
-const RECENT: Duration = Duration::from_secs(60);
 
 struct Conn {
     tx: Sender<Inbound>,
@@ -69,54 +64,30 @@ struct State {
     room: u64,
     region: [i32; 2],
     secret: [u8; 32],
-    /// Nombre de sortes de blocs (un bloc au-delà est refusé).
-    blocks: u16,
     conns: HashMap<u64, Conn>,
     next_id: u64,
     build: zones::Build,
-    rate: HashMap<u64, (Instant, u32)>,
-    published: Sender<([i32; 2], Vec<u8>)>,
     closed: bool,
     /// Rang de ce relais dans sa région, et liens vers les autres (par rang).
     slot: u16,
     peers: HashMap<u16, PeerOut>,
     dial: Option<Dial>,
-    /// Dernières modifications publiées dans la région (moment, chunk, modification).
-    recent: VecDeque<(Instant, [i32; 2], Vec<u8>)>,
-    was_first: bool,
 }
 
 impl State {
-    /// Ce relais met-il les modifications de la région en ordre (le plus petit rang) ?
-    fn first(&self) -> bool {
-        self.peers.keys().all(|&s| s > self.slot)
-    }
-
-    fn remember(&mut self, chunk: [i32; 2], set: &[u8]) {
-        while self
-            .recent
-            .front()
-            .is_some_and(|(t, _, _)| t.elapsed() > RECENT)
-        {
-            self.recent.pop_front();
+    /// Une modification publiée par le relais du monde (dans son ordre) : gardée pour ceux
+    /// qui arriveront, et transmise aux joueurs de ce relais proches de là.
+    fn deliver(&mut self, set: &[u8]) {
+        // Seulement des blocs de cette région (objets et coffres ne passent que par le
+        // relais du monde).
+        let Some(BuildMsg::Set { pos, .. }) = game::decode::<BuildMsg>(set) else {
+            return;
+        };
+        let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
+        if proto::region_of(chunk) != self.region {
+            return;
         }
-        self.recent.push_back((Instant::now(), chunk, set.to_vec()));
-    }
-
-    /// Transmet une modification en ordre aux joueurs de ce relais proches du chunk, et à
-    /// son auteur s'il est ici (c'est sa confirmation).
-    fn deliver(&mut self, chunk: [i32; 2], set: &[u8]) {
-        let mut to = self.build.listeners(chunk, u64::MAX);
-        if let Some(BuildMsg::Set { by, .. }) = game::decode::<BuildMsg>(set) {
-            let author = self
-                .conns
-                .iter()
-                .find(|(_, c)| !c.peer && c.pseudo.as_deref() == Some(by.as_str()))
-                .map(|(&id, _)| id);
-            if let Some(a) = author.filter(|a| !to.contains(a)) {
-                to.push(a);
-            }
-        }
+        let to = self.build.listeners(chunk, u64::MAX);
         for (m, items) in self.build.mirror_to(proto::zone_of(chunk), set, &to) {
             if let Some(c) = self.conns.get(&m) {
                 for data in items {
@@ -131,31 +102,6 @@ impl State {
                 }
             }
         }
-    }
-
-    /// Premier relais : la modification prend sa place dans l'ordre. Copie au relais du
-    /// monde, puis aux autres relais, puis aux joueurs d'ici.
-    fn publish(&mut self, chunk: [i32; 2], set: Vec<u8>) {
-        let _ = self.published.send((chunk, set.clone()));
-        self.remember(chunk, &set);
-        for p in self.peers.values() {
-            if let Some(l) = &p.link {
-                transport::push(
-                    l,
-                    &Request::PeerEdit {
-                        chunk,
-                        data: set.clone(),
-                    },
-                );
-            }
-        }
-        self.deliver(chunk, &set);
-    }
-
-    /// Lien vers le premier relais de la région (si ce n'est pas celui-ci).
-    fn first_link(&self) -> Option<&Sender<Inbound>> {
-        let first = self.peers.keys().min().filter(|&&s| s < self.slot)?;
-        self.peers.get(first)?.link.as_ref()
     }
 
     fn connect(&self, info: &proto::ShardInfo) -> Client {
@@ -189,17 +135,14 @@ pub struct ShardHandle {
     pub addr: SocketAddr,
     /// Clé publique du canal chiffré.
     pub public: [u8; 32],
-    /// Ce que ce relais a publié (à renvoyer au relais du monde).
-    pub published: Receiver<([i32; 2], Vec<u8>)>,
     state: Arc<Mutex<State>>,
 }
 
 impl ShardHandle {
-    /// Historique de la région reçu du relais du monde (avant l'arrivée des joueurs).
-    pub fn seed(&self, chunk: [i32; 2], data: &[u8]) {
-        let mut st = self.state.lock().unwrap();
-        let zone = proto::zone_of(chunk);
-        st.build.mirror(zone, data);
+    /// Du relais du monde : l'historique de la région (avant l'arrivée des joueurs), puis
+    /// chaque modification qu'il publie, dans son ordre.
+    pub fn seed(&self, data: &[u8]) {
+        self.state.lock().unwrap().deliver(data);
     }
 
     /// Joueurs entrés dans ce relais.
@@ -215,11 +158,6 @@ impl ShardHandle {
     pub fn linked(&self) -> usize {
         let st = self.state.lock().unwrap();
         st.peers.values().filter(|p| p.link.is_some()).count()
-    }
-
-    /// Ce relais met-il les modifications de sa région en ordre ?
-    pub fn is_first(&self) -> bool {
-        self.state.lock().unwrap().first()
     }
 
     /// Comment joindre les autres relais (tunnel) ; sans cela, par leur adresse directe.
@@ -252,22 +190,16 @@ impl ShardHandle {
                 );
             }
         }
-        promote(&mut st);
     }
 
     /// À appeler régulièrement : liens vers les autres relais (prêts, cassés, retentés).
     pub fn tick(&self) {
         let mut st = self.state.lock().unwrap();
-        let first = st.first();
-        let mut ready = Vec::new();
         let mut retry = Vec::new();
         for (&slot, p) in &mut st.peers {
             while let Some(e) = p.client.poll() {
                 match e {
-                    Event::Link(l) => {
-                        p.link = Some(l);
-                        ready.push(slot);
-                    }
+                    Event::Link(l) => p.link = Some(l),
                     Event::Error(m) | Event::Offline(m) => {
                         log::info!("relais de région : lien vers le relais {slot} : {m}");
                         p.link = None;
@@ -293,25 +225,6 @@ impl ShardHandle {
                 p.broken = None;
             }
         }
-        // Un relais vient d'être relié : le premier lui donne les dernières modifications
-        // (celles publiées depuis que le relais du monde lui a remis l'historique).
-        if first {
-            for slot in ready {
-                let Some(l) = st.peers.get(&slot).and_then(|p| p.link.clone()) else {
-                    continue;
-                };
-                for (_, chunk, set) in &st.recent {
-                    transport::push(
-                        &l,
-                        &Request::PeerEdit {
-                            chunk: *chunk,
-                            data: set.clone(),
-                        },
-                    );
-                }
-            }
-        }
-        promote(&mut st);
     }
 
     /// Ferme le relais (les joueurs repassent par le relais du monde ou un autre hôte).
@@ -330,30 +243,6 @@ impl Drop for ShardHandle {
     }
 }
 
-/// Ce relais devient le premier de sa région (celui d'avant est parti) : il republie les
-/// dernières modifications, au relais du monde et aux autres relais (déjà reçues : sans
-/// effet ; manquées : rattrapées).
-fn promote(st: &mut State) {
-    let first = st.first();
-    if first && !st.was_first {
-        for (_, chunk, set) in &st.recent {
-            let _ = st.published.send((*chunk, set.clone()));
-            for p in st.peers.values() {
-                if let Some(l) = &p.link {
-                    transport::push(
-                        l,
-                        &Request::PeerEdit {
-                            chunk: *chunk,
-                            data: set.clone(),
-                        },
-                    );
-                }
-            }
-        }
-    }
-    st.was_first = first;
-}
-
 /// Lance le relais de rang `slot` de la région `region` du monde `room` (écoute sur
 /// `bind`).
 pub fn start(
@@ -361,30 +250,23 @@ pub fn start(
     room: u64,
     region: [i32; 2],
     secret: [u8; 32],
-    blocks: u16,
     slot: u16,
 ) -> Result<ShardHandle> {
     let listener = TcpListener::bind(bind)?;
     let addr = listener.local_addr()?;
     let (private, public) = transport::generate_static();
-    let (tx, published) = channel();
     let state = Arc::new(Mutex::new(State {
         room,
         region,
         secret,
-        blocks,
         conns: HashMap::new(),
         // Numéros de joueurs propres à ce relais (uniques dans la région).
         next_id: ((slot as u64) << 40) | 1,
         build: zones::Build::default(),
-        rate: HashMap::new(),
-        published: tx,
         closed: false,
         slot,
         peers: HashMap::new(),
         dial: None,
-        recent: VecDeque::new(),
-        was_first: true,
     }));
     let st = state.clone();
     std::thread::Builder::new()
@@ -429,7 +311,6 @@ pub fn start(
     Ok(ShardHandle {
         addr,
         public,
-        published,
         state,
     })
 }
@@ -460,8 +341,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>, private: &[u8; 32]) -> Result<
     let r = serve_loop(&mut chan, state, id);
     let mut st = state.lock().unwrap();
     st.conns.remove(&id);
-    st.build.left(id, &[]);
-    st.rate.remove(&id);
+    st.build.left(id);
     r
 }
 
@@ -547,25 +427,10 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             }
             None
         }
-        // D'un autre relais : une modification qu'il a vérifiée, à mettre en ordre.
-        Request::PeerToZone { chunk, data } if peer => {
-            if st.first() && proto::region_of(chunk) == st.region {
-                st.publish(chunk, data);
-            }
-            None
-        }
-        // Du premier relais : une modification en ordre.
-        Request::PeerEdit { chunk, data } if peer => {
-            if proto::region_of(chunk) == st.region {
-                st.remember(chunk, &data);
-                st.deliver(chunk, &data);
-            }
-            None
-        }
         Request::PeerNearby { .. } | Request::PeerToZone { .. } | Request::PeerEdit { .. } => None,
         _ if peer => None,
         Request::Position { chunk } => {
-            let logs = st.build.moved(id, chunk);
+            let logs = st.build.moved(id, chunk, &|_| true);
             if let Some(c) = st.conns.get(&id) {
                 for (zone, log) in logs {
                     let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
@@ -615,7 +480,7 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             }
             // Modifications pas encore reçues (foule, voir `zones::LIVE_MAX`).
             if st.build.positions.contains_key(&id) {
-                let logs = st.build.catch_up(id, Some(chunk));
+                let logs = st.build.catch_up(id, Some(chunk), &|_| true);
                 if let Some(c) = st.conns.get(&id) {
                     for (zone, log) in logs {
                         let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
@@ -634,24 +499,10 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             }
             None
         }
+        // Les modifications ne passent pas par ici : seul le relais du monde les accepte.
+        // Une demande arrivée quand même (jeu modifié) est refusée à son auteur.
         Request::ToZone { chunk, data } => {
-            let Some(BuildMsg::Edit { pos, block }) = game::decode::<BuildMsg>(&data) else {
-                return None;
-            };
-            let in_region = proto::region_of(chunk) == st.region;
-            let chunk_ok = [pos[0].div_euclid(16), pos[2].div_euclid(16)] == chunk;
-            let mut ok =
-                in_region && chunk_ok && (0..HEIGHT).contains(&pos[1]) && block < st.blocks;
-            if ok {
-                let now = Instant::now();
-                let e = st.rate.entry(id).or_insert((now, 0));
-                if now.duration_since(e.0).as_secs_f32() >= 1.0 {
-                    *e = (now, 0);
-                }
-                e.1 += 1;
-                ok = e.1 <= MAX_EDITS_PER_S;
-            }
-            if !ok {
+            if let Some(BuildMsg::Edit { pos, .. }) = game::decode::<BuildMsg>(&data) {
                 if let Some(c) = st.conns.get(&id) {
                     transport::push(
                         &c.tx,
@@ -662,30 +513,6 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
                         },
                     );
                 }
-                return None;
-            }
-            let set = game::encode(&BuildMsg::Set {
-                pos,
-                block,
-                by: logged.unwrap_or_default(),
-            });
-            if st.first() {
-                st.publish(chunk, set);
-            } else if let Some(l) = st.first_link() {
-                // Vérifiée ici, mise en ordre par le premier relais de la région (elle
-                // revient par lui, comme pour tous).
-                transport::push(l, &Request::PeerToZone { chunk, data: set });
-            } else if let Some(c) = st.conns.get(&id) {
-                // Pas de lien vers le premier relais pour l'instant : refusée (le jeu la
-                // défait), plutôt que deux ordres différents.
-                transport::push(
-                    &c.tx,
-                    &Response::FromZone {
-                        peer: 0,
-                        chunk,
-                        data: game::encode(&BuildMsg::Reject { pos, peer: id }),
-                    },
-                );
             }
             None
         }

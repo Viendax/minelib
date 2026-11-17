@@ -324,6 +324,13 @@ struct Conn {
     talked: HashMap<u64, Instant>,
     /// Demandes d'objets (au sol, coffres) dans la seconde en cours.
     item_rate: (Instant, u32),
+    /// Modifications de blocs dans la seconde en cours (voir `EDIT_RATE`), et celles
+    /// dues à l'écoulement d'un fluide (`FLUID_RATE`).
+    edit_rate: (Instant, u32),
+    fluid_rate: (Instant, u32),
+    /// Régions dont un relais de région sert les blocs à ce joueur (il le dit lui-même,
+    /// `Request::Served`) : ce relais ne les lui envoie pas une deuxième fois.
+    served: HashSet<[i32; 2]>,
     /// Garant arbitre d'une affaire de cette partie, en ce moment.
     arbitrating: Option<u64>,
     /// Lobby (n°), et lobbies qui l'ont invité.
@@ -718,6 +725,9 @@ fn serve(stream: TcpStream, state: &Mutex<State>, peer: &str) -> Result<()> {
                 probe_dev: 0.0,
                 talked: HashMap::new(),
                 item_rate: (Instant::now(), 0),
+                edit_rate: (Instant::now(), 0),
+                fluid_rate: (Instant::now(), 0),
+                served: HashSet::new(),
                 arbitrating: None,
                 party: None,
                 invited: Vec::new(),
@@ -869,10 +879,8 @@ fn leave_room(st: &mut State, id: u64) {
             for region in changed {
                 announce_shard_peers(st, room_id, region);
             }
-            let cands = zone_candidates(st, room_id);
             let room = st.rooms.get_mut(&room_id).expect("partie");
-            let changes = room.build.left(id, &cands);
-            announce(st, room_id, changes);
+            room.build.left(id);
             return;
         }
         // Plus de vérificateur : le résultat des joueurs peut suffire.
@@ -919,10 +927,8 @@ fn leave_room(st: &mut State, id: u64) {
         };
         switch_host(st, room_id, new, None);
         if kind == 1 {
-            let cands = zone_candidates(st, room_id);
             if let Some(room) = st.rooms.get_mut(&room_id) {
-                let changes = room.build.left(id, &cands);
-                announce(st, room_id, changes);
+                room.build.left(id);
             }
         }
         return;
@@ -944,10 +950,8 @@ fn leave_room(st: &mut State, id: u64) {
             transport::push(&c.tx, &Response::PeerLeft { peer: id });
         }
         if room.kind == 1 {
-            let cands = zone_candidates(st, room_id);
             let room = st.rooms.get_mut(&room_id).expect("partie");
-            let changes = room.build.left(id, &cands);
-            announce(st, room_id, changes);
+            room.build.left(id);
         }
     }
 }
@@ -1450,52 +1454,13 @@ fn bulk_edit(
     if cells.len() > BULK_MAX {
         return "Trop de blocs d'un coup.".into();
     }
-    let room = st.rooms.get_mut(&rid).expect("partie");
     let mut touched = Vec::new();
     for (pos, block) in cells {
         if !(0..256).contains(&pos[1]) {
             continue;
         }
-        let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
-        let zone = proto::zone_of(chunk);
-        let data = game::encode(&game::BuildMsg::Set {
-            pos,
-            block,
-            by: pseudo.to_string(),
-        });
-        let to = room.build.listeners(chunk, id);
-        for (m, items) in room.build.mirror_to(zone, &data, &to) {
-            if let Some(c) = st.conns.get(&m) {
-                for data in items {
-                    transport::push(
-                        &c.tx,
-                        &Response::FromZone {
-                            peer: 0,
-                            chunk,
-                            data,
-                        },
-                    );
-                }
-            }
-        }
-        // Région servie par ses propres relais : ils en gardent aussi la copie.
-        for sh in room
-            .shards
-            .get(&proto::region_of(chunk))
-            .into_iter()
-            .flatten()
-        {
-            if let Some(c) = st.conns.get(&sh.host) {
-                transport::push(
-                    &c.tx,
-                    &Response::FromZone {
-                        peer: 0,
-                        chunk,
-                        data: data.clone(),
-                    },
-                );
-            }
-        }
+        // (Son auteur les a déjà : pas de confirmation, la réponse `BulkDone` suffit.)
+        publish_block(st, rid, id, false, pseudo, pos, block);
         touched.push(pos);
     }
     // Un coffre remplacé par WorldEdit : son contenu tombe au sol.
@@ -1510,6 +1475,196 @@ const VOICE_MAX: usize = 256;
 
 /// Demandes d'objets (au sol, coffres) acceptées par joueur et par seconde.
 const ITEM_RATE: u32 = 40;
+
+/// Modifications de blocs acceptées par joueur et par seconde ; celles que le jeu dit dues
+/// à l'écoulement d'un fluide ont un budget à part, plus large (une inondation change
+/// beaucoup de cases d'un coup).
+const EDIT_RATE: u32 = 20;
+const FLUID_RATE: u32 = 400;
+
+/// Région d'une zone.
+fn zone_region(zone: [i32; 2]) -> [i32; 2] {
+    proto::region_of([zone[0] * proto::ZONE, zone[1] * proto::ZONE])
+}
+
+/// Régions dont un relais de région sert vraiment les blocs à ce joueur : celles qu'il
+/// annonce, si elles ont un relais prêt (un relais parti ne prive personne).
+fn served_regions(st: &State, rid: u64, id: u64) -> HashSet<[i32; 2]> {
+    let (Some(room), Some(c)) = (st.rooms.get(&rid), st.conns.get(&id)) else {
+        return HashSet::new();
+    };
+    c.served
+        .iter()
+        .copied()
+        .filter(|r| {
+            room.shards
+                .get(r)
+                .is_some_and(|l| l.iter().any(|s| s.info.is_some()))
+        })
+        .collect()
+}
+
+/// Envoie à un joueur ce qui lui manque des zones proches de `chunk` (les blocs des
+/// régions qu'un relais de région lui sert n'en font pas partie).
+fn send_catch_up(st: &mut State, rid: u64, id: u64, chunk: [i32; 2], moved: bool) {
+    let served = served_regions(st, rid, id);
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let blocks = |zone: [i32; 2]| !served.contains(&zone_region(zone));
+    let logs = if moved {
+        room.build.moved(id, chunk, &blocks)
+    } else {
+        room.build.catch_up(id, Some(chunk), &blocks)
+    };
+    let Some(c) = st.conns.get(&id) else { return };
+    for (zone, log) in logs {
+        let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
+        for data in log {
+            transport::push(
+                &c.tx,
+                &Response::FromZone {
+                    peer: 0,
+                    chunk,
+                    data,
+                },
+            );
+        }
+    }
+}
+
+/// Ce relais publie le bloc `block` en `pos`, au nom de `pseudo` (joueur `author`). Lui
+/// seul écrit l'histoire des blocs d'un monde, comme celle des objets : il donne à la
+/// modification son rang, la garde, et la remet
+/// - à son auteur (c'est sa confirmation) et aux joueurs à portée qu'aucun relais de
+///   région ne sert ;
+/// - aux hôtes des relais de la région, qui la transmettent à leurs joueurs.
+///
+/// Avant la v127, le jeu d'un joueur décidait : le garant de la zone validait et disait
+/// qui avait posé le bloc, et dans une région peuplée le relais de région (hébergé par un
+/// joueur) mettait les modifications en ordre et en rendait compte. L'un comme l'autre
+/// pouvait inventer une modification ou l'attribuer à quelqu'un d'autre (crédit de minage,
+/// sac vidé en survie). Ils ne peuvent plus que tarder à transmettre.
+///
+/// `confirm` : l'auteur la reçoit aussi (sa confirmation).
+fn publish_block(
+    st: &mut State,
+    rid: u64,
+    author: u64,
+    confirm: bool,
+    pseudo: &str,
+    pos: [i32; 3],
+    block: u16,
+) {
+    let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
+    let region = proto::region_of(chunk);
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let sharded = room
+        .shards
+        .get(&region)
+        .is_some_and(|l| l.iter().any(|s| s.info.is_some()));
+    let conns = &st.conns;
+    let served = |m: &u64| sharded && conns.get(m).is_some_and(|c| c.served.contains(&region));
+    let mut to: Vec<u64> = Vec::new();
+    if confirm && !served(&author) {
+        to.push(author);
+    }
+    to.extend(
+        room.build
+            .listeners(chunk, author)
+            .into_iter()
+            .filter(|m| !served(m)),
+    );
+    let (data, sends) = room.build.publish(pos, block, pseudo, &to);
+    let msg = |data: Vec<u8>| Response::FromZone {
+        peer: 0,
+        chunk,
+        data,
+    };
+    // L'auteur servi par un relais de région : sa confirmation lui arrive quand même
+    // d'ici, tout de suite (le relais de région la lui remettra aussi : sans effet).
+    if confirm && !sends.iter().any(|(m, _)| *m == author) {
+        if let Some(c) = st.conns.get(&author) {
+            transport::push(&c.tx, &msg(data.clone()));
+        }
+    }
+    for (m, items) in sends {
+        if let Some(c) = st.conns.get(&m) {
+            for data in items {
+                transport::push(&c.tx, &msg(data));
+            }
+        }
+    }
+    // Aux relais de la région, prêts ou pas encore (ils ont reçu l'historique à leur
+    // création : la suite leur arrive dans l'ordre, rien ne manque).
+    for sh in room.shards.get(&region).into_iter().flatten() {
+        if let Some(c) = st.conns.get(&sh.host) {
+            transport::push(&c.tx, &msg(data.clone()));
+        }
+    }
+}
+
+/// Un joueur demande à changer un bloc. Ce relais vérifie ce qu'il peut vérifier sans
+/// connaître le terrain : la demande est bien formée, à portée de vue de son auteur, et il
+/// n'en fait pas trop (`EDIT_RATE`, `FLUID_RATE`). Refusée : le jeu remet le bloc d'avant.
+#[allow(clippy::too_many_arguments)]
+fn build_edit(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    pseudo: &str,
+    chunk: [i32; 2],
+    pos: [i32; 3],
+    block: u16,
+    fluid: bool,
+) {
+    let well_formed =
+        [pos[0].div_euclid(16), pos[2].div_euclid(16)] == chunk && (0..256).contains(&pos[1]);
+    let near = st
+        .rooms
+        .get(&rid)
+        .and_then(|r| r.build.positions.get(&id))
+        .is_some_and(|h| {
+            (h[0] - chunk[0]).abs() <= zones::NEAR && (h[1] - chunk[1]).abs() <= zones::NEAR
+        });
+    let calm = st.conns.get_mut(&id).is_some_and(|c| {
+        let (r, max) = if fluid {
+            (&mut c.fluid_rate, FLUID_RATE)
+        } else {
+            (&mut c.edit_rate, EDIT_RATE)
+        };
+        if r.0.elapsed() >= Duration::from_secs(1) {
+            *r = (Instant::now(), 0);
+        }
+        r.1 += 1;
+        r.1 <= max
+    });
+    if !(well_formed && near && calm) {
+        if let Some(c) = st.conns.get(&id) {
+            transport::push(
+                &c.tx,
+                &Response::FromZone {
+                    peer: 0,
+                    chunk,
+                    data: game::encode(&game::BuildMsg::Reject { pos, peer: id }),
+                },
+            );
+        }
+        return;
+    }
+    // Ce qui était là d'après l'historique (inconnu si la case n'a jamais été changée).
+    let before = st.rooms.get(&rid).and_then(|r| r.build.block_at(pos));
+    publish_block(st, rid, id, true, pseudo, pos, block);
+    // Survie : un bloc cassé donne un crédit de minage, un bloc posé sort du sac. Pas pour
+    // l'écoulement d'un fluide (de l'eau qui sèche n'est pas du minage), ni pour une case
+    // que l'historique dit déjà vide (« casser » dix fois le même vide).
+    if !fluid && !(block == 0 && before == Some(0)) {
+        note_block(st, rid, pseudo, block);
+    }
+    spill_chest(st, rid, pos);
+}
 
 /// Publie des états d'objets (voir `minelib_net::items`) : gardés dans l'historique de
 /// leur zone et remis aux joueurs proches, le demandeur `asker` en premier (c'est lui qui
@@ -1844,37 +1999,8 @@ fn candidate(st: &State, id: u64) -> Option<zones::Candidate> {
     })
 }
 
-/// Garants possibles des zones d'un monde : ses garants extérieurs (joueurs d'autres
-/// parties, sans lien avec celle-ci : personne ici n'a intérêt à les attaquer) ; s'il n'y
-/// en a aucun, ses propres joueurs.
-fn zone_candidates(st: &State, room_id: u64) -> Vec<zones::Candidate> {
-    let Some(room) = st.rooms.get(&room_id) else {
-        return Vec::new();
-    };
-    let outside: Vec<zones::Candidate> = room
-        .hidden
-        .iter()
-        .filter(|&&id| !is_shard_host(room, id))
-        .filter_map(|&id| candidate(st, id))
-        .collect();
-    // Garants extérieurs à bonne connexion d'abord ; sinon les joueurs du monde.
-    let outside = good_links(outside);
-    if outside.is_empty() || outside.iter().all(|c| c.rtt.is_some_and(|r| r >= BAD_RTT)) {
-        candidates(st, room_id)
-    } else {
-        outside
-    }
-}
-
-/// Garants extérieurs voulus pour un monde de construction : un, plus un par tranche de
-/// 8 joueurs, et au moins un pour 4 zones actives (au plus 32) : un monde très peuplé
-/// répartit ses zones sur beaucoup de garants.
-fn build_garants_wanted(players: usize, active_zones: usize) -> usize {
-    (1 + players / 8).max(active_zones.div_ceil(4)).clamp(1, 32)
-}
-
-/// Le garant extérieur le plus adapté pour un monde de construction : la connexion de
-/// garant d'un joueur d'un autre serveur de construction d'abord, sinon d'une partie FPS.
+/// L'hôte le plus adapté pour un relais de région d'un monde de construction : la connexion
+/// de garant d'un joueur d'un autre serveur de construction d'abord, sinon d'une partie FPS.
 fn pick_build_garant(st: &State, players: &[String]) -> Option<u64> {
     let want = players_version(st, players);
     st.conns
@@ -1979,12 +2105,9 @@ fn in_survival(st: &State, server: &str, creator: &str, pseudo: &str) -> bool {
     })
 }
 
-/// Un bloc validé vient d'être publié dans ce monde : compté dans le sac de son auteur
-/// s'il est en survie (cassé : un crédit de minage ; posé : sorti du sac).
-fn note_block(st: &mut State, rid: u64, data: &[u8]) {
-    let Some(game::BuildMsg::Set { block, by, .. }) = game::decode(data) else {
-        return;
-    };
+/// Un bloc vient d'être publié dans ce monde : compté dans le sac de son auteur s'il est
+/// en survie (cassé : un crédit de minage ; posé : sorti du sac).
+fn note_block(st: &mut State, rid: u64, by: &str, block: u16) {
     let Some((server, creator)) = st
         .rooms
         .get(&rid)
@@ -1992,16 +2115,9 @@ fn note_block(st: &mut State, rid: u64, data: &[u8]) {
     else {
         return;
     };
-    if in_survival(st, &server, &creator, &by) {
-        st.bags.block_set(&server, &by, block);
+    if in_survival(st, &server, &creator, by) {
+        st.bags.block_set(&server, by, block);
     }
-}
-
-fn is_shard_host(room: &Room, id: u64) -> bool {
-    room.shards
-        .values()
-        .flatten()
-        .any(|r| r.host == id || r.previous == Some(id))
 }
 
 /// Aux hôtes des relais d'une région : la liste des relais prêts (ils se relient entre
@@ -2095,32 +2211,9 @@ fn upkeep_regions(st: &mut State, rid: u64) {
                 room.hidden.push(g);
                 g
             }
-            // Plus de garant libre : un garant de zones de ce monde devient relais de
-            // région (dans sa région, le relais valide lui-même les modifications : il
-            // sert plus là). Ses zones repassent aux autres.
-            None => {
-                let room = st.rooms.get(&rid).expect("partie");
-                let own = room.hidden.iter().copied().find(|&h| {
-                    !is_shard_host(room, h) && st.conns.get(&h).is_some_and(|c| !link_bad(c))
-                });
-                let Some(g) = own else { break };
-                let cands: Vec<zones::Candidate> = zone_candidates(st, rid)
-                    .into_iter()
-                    .filter(|c| c.id != g)
-                    .collect();
-                let room = st.rooms.get_mut(&rid).expect("partie");
-                let lost: Vec<[i32; 2]> = room
-                    .build
-                    .zones
-                    .iter()
-                    .filter(|(_, z)| z.garant == g)
-                    .map(|(&k, _)| k)
-                    .collect();
-                let mut changes = room.build.left(g, &cands);
-                changes.push((g, Vec::new(), lost));
-                announce(st, rid, changes);
-                g
-            }
+            // Plus d'hôte libre : la région reste servie par ce relais (ou par les relais
+            // qu'elle a déjà) jusqu'à ce qu'un joueur d'un autre monde soit disponible.
+            None => break,
         };
         let room = st.rooms.get_mut(&rid).expect("partie");
         let slot = room.shard_slot;
@@ -2221,7 +2314,7 @@ fn upkeep_build(st: &mut State) {
         // Le propriétaire (qui enregistre le monde) reçoit ce qui a changé, par paquets.
         if let Some(room) = st.rooms.get_mut(&rid) {
             let owner = room.host;
-            let items = room.build.catch_up(owner, None);
+            let items = room.build.catch_up(owner, None, &|_| true);
             if let Some(c) = st.conns.get(&owner) {
                 for (zone, log) in items {
                     let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
@@ -2238,56 +2331,6 @@ fn upkeep_build(st: &mut State) {
                 }
             }
         }
-        let Some(room) = st.rooms.get(&rid) else {
-            continue;
-        };
-        let players = room.everyone().filter(|m| !room.hidden.contains(m)).count();
-        let garants = room
-            .hidden
-            .iter()
-            .filter(|&&h| !is_shard_host(room, h))
-            .count();
-        // Un joueur seul dans son monde n'a personne à tromper : pas de garant extérieur
-        // pour lui (ils servent là où il y a du monde).
-        if players < 2 || garants >= build_garants_wanted(players, room.build.active()) {
-            continue;
-        }
-        let names: Vec<String> = room
-            .everyone()
-            .chain(std::iter::once(room.host))
-            .filter_map(|m| st.conns.get(&m).and_then(|c| c.pseudo.clone()))
-            .collect();
-        let Some(g) = pick_build_garant(st, &names) else {
-            continue;
-        };
-        let room = st.rooms.get_mut(&rid).expect("partie");
-        room.members.push(g);
-        room.hidden.push(g);
-        if let Some(c) = st.conns.get_mut(&g) {
-            c.room = Some(rid);
-            transport::push(&c.tx, &Response::BuildGarant { room: rid });
-        }
-        log::info!("monde {rid} : garant extérieur {g}");
-        // Les zones passent au garant extérieur.
-        let cands = zone_candidates(st, rid);
-        let room = st.rooms.get_mut(&rid).expect("partie");
-        let changes = room.build.balance(&cands);
-        announce(st, rid, changes);
-    }
-}
-
-/// Prévient les garants de leurs nouvelles zones (avec leur historique) et des zones
-/// perdues.
-fn announce(st: &State, room_id: u64, changes: zones::Changes) {
-    let Some(room) = st.rooms.get(&room_id) else {
-        return;
-    };
-    // Le garant n'a pas besoin de l'historique de ses zones pour valider (les joueurs
-    // reçoivent le leur en s'approchant).
-    let _ = room;
-    for (id, gained, lost) in changes {
-        let Some(c) = st.conns.get(&id) else { continue };
-        transport::push(&c.tx, &Response::Zones { gained, lost });
     }
 }
 
@@ -3775,42 +3818,22 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         Request::Position { chunk } => {
             if let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1)) {
-                let room = st.rooms.get_mut(&rid).expect("partie");
-                let logs = room.build.moved(id, chunk);
-                if let Some(c) = st.conns.get(&id) {
-                    for (zone, log) in logs {
-                        let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
-                        for data in log {
-                            transport::push(
-                                &c.tx,
-                                &Response::FromZone {
-                                    peer: 0,
-                                    chunk,
-                                    data,
-                                },
-                            );
-                        }
-                    }
-                }
-                let cands = zone_candidates(st, rid);
-                let changes = st
-                    .rooms
-                    .get_mut(&rid)
-                    .expect("partie")
-                    .build
-                    .balance(&cands);
-                announce(st, rid, changes);
+                send_catch_up(st, rid, id, chunk, true);
             }
+            return None;
+        }
+        Request::Served { regions } => {
+            let rid = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1))?;
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.served = regions.into_iter().take(16).collect();
+            }
+            // Une région qu'un relais ne lui sert plus : ce qui lui manque, tout de suite.
+            let at = st.rooms.get(&rid)?.build.positions.get(&id).copied()?;
+            send_catch_up(st, rid, id, at, false);
             return None;
         }
         Request::ToZone { chunk, data } => {
             let rid = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1))?;
-            let zone = proto::zone_of(chunk);
-            let cands = zone_candidates(st, rid);
-            let room = st.rooms.get_mut(&rid).expect("partie");
-            room.build.touch(zone);
-            let (garant, changes) = room.build.garant(zone, &cands);
-            announce(st, rid, changes);
             let room = st.rooms.get_mut(&rid).expect("partie");
             let msg = game::decode::<game::BuildMsg>(&data);
             // Objets au sol et coffres : ce relais arbitre (une demande après l'autre),
@@ -3904,72 +3927,10 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 }
                 return None;
             }
-            match (msg, garant) {
-                // Une demande va au garant de la zone, même si c'est le demandeur lui-même
-                // (il la valide comme les autres).
-                (Some(game::BuildMsg::Edit { .. }), Some(g)) => {
-                    if let Some(c) = st.conns.get(&g) {
-                        transport::push(
-                            &c.tx,
-                            &Response::FromZone {
-                                peer: id,
-                                chunk,
-                                data,
-                            },
-                        );
-                    }
-                }
-                // Refus du garant : au seul joueur concerné (il remet le bloc d'avant).
-                (Some(game::BuildMsg::Reject { peer, .. }), Some(g)) if g == id => {
-                    if let Some(c) = st.conns.get(&peer) {
-                        transport::push(
-                            &c.tx,
-                            &Response::FromZone {
-                                peer: id,
-                                chunk,
-                                data,
-                            },
-                        );
-                    }
-                }
-                // Le garant publie : aux joueurs proches (avec ce qui leur manquerait) et
-                // dans l'historique de la zone. Le propriétaire, qui enregistre le monde,
-                // reçoit tout par paquets (voir `upkeep_build`).
-                (Some(game::BuildMsg::Set { pos, .. }), Some(g)) if g == id => {
-                    let to = room.build.listeners(chunk, id);
-                    for (m, items) in room.build.record(zone, &data, &to) {
-                        if let Some(c) = st.conns.get(&m) {
-                            for data in items {
-                                transport::push(
-                                    &c.tx,
-                                    &Response::FromZone {
-                                        peer: id,
-                                        chunk,
-                                        data,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    note_block(st, rid, &data);
-                    spill_chest(st, rid, pos);
-                }
-                // Validé par un ancien garant de la zone (elle vient de changer de mains) :
-                // le nouveau garant la revalide.
-                (Some(game::BuildMsg::Set { pos, block, .. }), Some(g)) => {
-                    let edit = game::encode(&game::BuildMsg::Edit { pos, block });
-                    if let Some(c) = st.conns.get(&g) {
-                        transport::push(
-                            &c.tx,
-                            &Response::FromZone {
-                                peer: id,
-                                chunk,
-                                data: edit,
-                            },
-                        );
-                    }
-                }
-                _ => {}
+            // Blocs : ce relais décide seul et publie (voir `publish_block`). Tout autre
+            // message (un « Set » ou un refus fabriqué par un jeu modifié) est sans effet.
+            if let Some(game::BuildMsg::Edit { pos, block, fluid }) = msg {
+                build_edit(st, rid, id, pseudo, chunk, pos, block, fluid);
             }
             return None;
         }
@@ -4006,29 +3967,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             return None;
         }
-        Request::RegionLog { entries } => {
-            let rid = my_room?;
-            let room = st.rooms.get_mut(&rid)?;
-            let region = room
-                .shards
-                .iter()
-                .find(|(_, l)| l.iter().any(|s| s.host == id))
-                .map(|(&r, _)| r)?;
-            let mut changed = Vec::new();
-            for (chunk, data) in entries {
-                if proto::region_of(chunk) == region {
-                    room.build.mirror(proto::zone_of(chunk), &data);
-                    if let Some(game::BuildMsg::Set { pos, .. }) = game::decode(&data) {
-                        changed.push((pos, data));
-                    }
-                }
-            }
-            for (pos, data) in changed {
-                note_block(st, rid, &data);
-                spill_chest(st, rid, pos);
-            }
-            return None;
-        }
+        // Sans effet depuis la v127 : ce relais ne croit plus un hôte sur parole (il publie
+        // lui-même chaque modification, les relais de région ne font que transmettre).
+        Request::RegionLog { .. } => return None,
         Request::Nearby { chunk, data } => {
             // Position sur ce serveur, gardée pour son retour.
             if let Some(game::BuildMsg::Player {
@@ -4066,21 +4007,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 // Modifications pas encore reçues (foule : elles ne sont poussées qu'à une
                 // partie des joueurs, voir `zones::LIVE_MAX`).
                 if room.kind == 1 && room.build.positions.contains_key(&id) {
-                    let logs = room.build.catch_up(id, Some(chunk));
-                    if let Some(c) = st.conns.get(&id) {
-                        for (zone, log) in logs {
-                            let chunk = [zone[0] * proto::ZONE, zone[1] * proto::ZONE];
-                            for data in log {
-                                transport::push(
-                                    &c.tx,
-                                    &Response::FromZone {
-                                        peer: 0,
-                                        chunk,
-                                        data,
-                                    },
-                                );
-                            }
-                        }
+                    if let Some(rid) = my_room {
+                        send_catch_up(st, rid, id, chunk, false);
                     }
                 }
             }
@@ -4432,6 +4360,7 @@ fn handle(
             | Request::Rtt { .. }
             | Request::Echo { .. }
             | Request::BulkEdit { .. }
+            | Request::Served { .. }
             | Request::GarantAvailable { .. }
             | Request::GarantReady
             | Request::Conflict { .. }
@@ -6029,15 +5958,13 @@ mod tests {
         assert_eq!(bag_a + bag_b, 20);
     }
 
+    /// Seul le relais du monde écrit l'histoire des blocs : il accepte une demande, lui
+    /// donne son rang et son auteur (le pseudo de la session), et la publie. Ce qu'un jeu
+    /// modifié fabrique (un « Set », le compte rendu d'un relais de région) est sans effet ;
+    /// une demande mal formée, hors de portée ou en rafale est refusée à son auteur.
     #[test]
-    fn build_worlds_take_their_zone_garants_from_other_worlds() {
-        let dir =
-            std::env::temp_dir().join(format!("minelib-garant-monde-{}", rand::random::<u32>()));
-        {
-            let mut st = stats::Store::open(dir.join("stats")).unwrap();
-            st.get_mut("Ailleurs").games = 5;
-            st.save("Ailleurs");
-        }
+    fn only_the_world_relay_writes_the_history_of_blocks() {
+        let dir = std::env::temp_dir().join(format!("minelib-notaire-{}", rand::random::<u32>()));
         // Tous les joueurs simulés sont sur cette machine.
         ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
         let h = start(Config {
@@ -6061,85 +5988,121 @@ mod tests {
             wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
             (c, link)
         };
-        let host = |c: &Client, sig: u8| {
-            c.send(Cmd::Host {
-                kind: 1,
-                name: "Monde".into(),
-                map: "monde".into(),
-                map_sig: [sig; 32],
-                max_players: 0,
-            });
-            match wait(c, |e| matches!(e, Event::Hosted(_))) {
-                Event::Hosted(r) => r,
-                _ => unreachable!(),
-            }
-        };
-        // « Ailleurs » construit sur son propre monde ; sa connexion de garant est libre.
-        let (ailleurs, _) = login("Ailleurs");
-        host(&ailleurs, 3);
-        let g = Client::spawn_garant(addr.clone(), h.public);
-        g.send(Cmd::Login {
-            pseudo: "Ailleurs".into(),
-            password: "motdepasse".into(),
-            totp: None,
-            backup: None,
-            device: None,
-        });
-        let glink = match wait(&g, |e| matches!(e, Event::Link(_))) {
-            Event::Link(l) => l,
-            _ => unreachable!(),
-        };
-        wait(&g, |e| matches!(e, Event::LoggedIn { .. }));
-        g.send(Cmd::GarantAvailable(true));
-        // Un autre monde s'ouvre : il reçoit ce garant extérieur.
         let (createur, clink) = login("Createur");
-        let room = host(&createur, 4);
-        // (Seul dans son monde, il n'en aurait pas : personne à tromper.)
-        let (invite, _) = login("Invite");
-        invite.send(Cmd::Join(room));
-        wait(&invite, |e| matches!(e, Event::Joined { .. }));
-        std::thread::sleep(Duration::from_millis(2100));
-        createur.send(Cmd::Maps);
-        match wait(&g, |e| matches!(e, Event::BuildGarant(_))) {
-            Event::BuildGarant(r) => assert_eq!(r, room),
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [4; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
             _ => unreachable!(),
-        }
-        // Une modification du créateur va au garant extérieur (pas à lui-même), qui la publie.
+        };
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
         transport::push(&clink, &Request::Position { chunk: [0, 0] });
-        let edit = game::encode(&game::BuildMsg::Edit {
-            pos: [1, 64, 1],
-            block: 1,
-        });
+        transport::push(&elink, &Request::Position { chunk: [0, 0] });
+        let ask = |link: &Sender<Inbound>, chunk: [i32; 2], msg: &game::BuildMsg| {
+            transport::push(
+                link,
+                &Request::ToZone {
+                    chunk,
+                    data: game::encode(msg),
+                },
+            );
+        };
+        let edit = |pos: [i32; 3], block: u16| game::BuildMsg::Edit {
+            pos,
+            block,
+            fluid: false,
+        };
+        // Prochain message de blocs reçu par ce joueur.
+        let next = |c: &Client| match wait(c, |e| matches!(e, Event::FromZone { .. })) {
+            Event::FromZone { peer, data, .. } => {
+                assert_eq!(peer, 0, "publié par le relais");
+                game::decode::<game::BuildMsg>(&data).expect("message")
+            }
+            _ => unreachable!(),
+        };
+        let set = |m: game::BuildMsg| match m {
+            game::BuildMsg::Set {
+                pos,
+                block,
+                by,
+                seq,
+            } => (pos, block, by, seq),
+            m => panic!("{m:?}"),
+        };
+        // Eve pose un bloc : elle reçoit sa confirmation, le créateur la modification, la
+        // même, signée du pseudo de sa session.
+        ask(&elink, [0, 0], &edit([1, 64, 1], 1));
+        let (pos, block, by, first) = set(next(&eve));
+        assert_eq!((pos, block, by.as_str()), ([1, 64, 1], 1, "Eve"));
+        assert_eq!(
+            set(next(&createur)),
+            ([1, 64, 1], 1, "Eve".to_string(), first)
+        );
+        // Un jeu modifié fabrique une modification au nom d'un autre, avec un rang énorme,
+        // puis le compte rendu d'un relais de région : personne ne reçoit rien, et la
+        // modification suivante (une vraie) porte le rang suivant.
+        let forged = game::BuildMsg::Set {
+            pos: [2, 64, 1],
+            block: 9,
+            by: "Createur".into(),
+            seq: u64::MAX,
+        };
+        ask(&elink, [0, 0], &forged);
         transport::push(
-            &clink,
-            &Request::ToZone {
-                chunk: [0, 0],
-                data: edit.clone(),
+            &elink,
+            &Request::RegionLog {
+                entries: vec![([0, 0], game::encode(&forged))],
             },
         );
-        wait(
-            &g,
-            |e| matches!(e, Event::Zones { gained, .. } if gained.contains(&[0, 0])),
-        );
-        match wait(&g, |e| matches!(e, Event::FromZone { .. })) {
-            Event::FromZone { data, .. } => assert_eq!(data, edit),
-            _ => unreachable!(),
+        ask(&elink, [0, 0], &game::BuildMsg::Reject { pos, peer: 1 });
+        ask(&clink, [0, 0], &edit([3, 64, 1], 2));
+        let (pos, block, by, second) = set(next(&eve));
+        assert_eq!((pos, block, by.as_str()), ([3, 64, 1], 2, "Createur"));
+        assert_eq!(second, first + 1, "rien ne s'est glissé entre les deux");
+        assert_eq!(set(next(&createur)).3, second);
+        // Mal formée (la case n'est pas dans le chunk annoncé, hauteur hors du monde) ou
+        // hors de portée de son auteur : refusée à elle seule.
+        let refused = |c: &Client, pos: [i32; 3]| match next(c) {
+            game::BuildMsg::Reject { pos: p, .. } => assert_eq!(p, pos),
+            m => panic!("{m:?}"),
+        };
+        ask(&elink, [5, 5], &edit([4, 64, 1], 1));
+        refused(&eve, [4, 64, 1]);
+        ask(&elink, [0, 0], &edit([4, 300, 1], 1));
+        refused(&eve, [4, 300, 1]);
+        ask(&elink, [40, 0], &edit([640, 64, 1], 1));
+        refused(&eve, [640, 64, 1]);
+        // En rafale : 20 par seconde au plus ; l'écoulement d'un fluide a son budget à part.
+        std::thread::sleep(Duration::from_millis(1100));
+        for i in 0..30 {
+            ask(&elink, [0, 0], &edit([i % 16, 70, 2], 1));
         }
-        let set = game::encode(&game::BuildMsg::Set {
-            pos: [1, 64, 1],
-            block: 1,
-            by: String::new(),
-        });
-        transport::push(
-            &glink,
-            &Request::ToZone {
-                chunk: [0, 0],
-                data: set.clone(),
-            },
-        );
-        match wait(&createur, |e| matches!(e, Event::FromZone { .. })) {
-            Event::FromZone { data, .. } => assert_eq!(data, set),
-            _ => unreachable!(),
+        let mut done = (0, 0);
+        while done.0 + done.1 < 30 {
+            match next(&eve) {
+                game::BuildMsg::Set { .. } => done.0 += 1,
+                game::BuildMsg::Reject { .. } => done.1 += 1,
+                m => panic!("{m:?}"),
+            }
+        }
+        assert_eq!(done, (EDIT_RATE, 30 - EDIT_RATE), "20 par seconde au plus");
+        for i in 0..30 {
+            let flow = game::BuildMsg::Edit {
+                pos: [i % 16, 71, 2],
+                block: 1,
+                fluid: true,
+            };
+            ask(&elink, [0, 0], &flow);
+        }
+        for _ in 0..30 {
+            assert!(matches!(next(&eve), game::BuildMsg::Set { .. }));
         }
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6208,7 +6171,7 @@ mod tests {
         }
         match wait(&eve, |e| matches!(e, Event::FromZone { .. })) {
             Event::FromZone { data, .. } => match game::decode::<game::BuildMsg>(&data) {
-                Some(game::BuildMsg::Set { pos, block, by }) => {
+                Some(game::BuildMsg::Set { pos, block, by, .. }) => {
                     assert_eq!((pos, block, by.as_str()), ([1, 70, 2], 3, "Createur"))
                 }
                 m => panic!("{m:?}"),

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 27;
+pub const PROTOCOL: u32 = 28;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.
@@ -268,8 +268,8 @@ pub enum Request {
         addr: String,
         key: [u8; 32],
     },
-    /// Hôte d'une région : les modifications que son relais a publiées (copie gardée par
-    /// le relais du monde, qui la remet au propriétaire et à l'hôte suivant).
+    /// Plus utilisé depuis la v127 (sans effet) : l'hôte d'une région rendait compte des
+    /// modifications que son relais avait publiées, et le relais du monde le croyait.
     RegionLog {
         entries: Vec<([i32; 2], Vec<u8>)>,
     },
@@ -283,20 +283,20 @@ pub enum Request {
         chunk: [i32; 2],
         data: Vec<u8>,
     },
-    /// Entre relais d'une même région : modification vérifiée par un relais, à mettre en
-    /// ordre par le premier relais de la région.
+    /// Plus utilisé depuis la v127 (sans effet) : entre relais d'une même région, une
+    /// modification à mettre en ordre par le premier relais de la région.
     PeerToZone {
         chunk: [i32; 2],
         data: Vec<u8>,
     },
-    /// Entre relais d'une même région : modification mise en ordre par le premier relais,
-    /// à garder et à transmettre à ses joueurs.
+    /// Plus utilisé depuis la v127 (sans effet) : entre relais d'une même région, une
+    /// modification mise en ordre par le premier relais.
     PeerEdit {
         chunk: [i32; 2],
         data: Vec<u8>,
     },
-    /// Construction : données pour le garant de la zone de ce chunk (ou pour tous les
-    /// joueurs proches si l'expéditeur en est le garant).
+    /// Construction, au relais du monde : demande sur ce chunk (changer un bloc, lâcher ou
+    /// ramasser un objet, ouvrir un coffre). Lui seul décide et publie le résultat.
     ToZone {
         chunk: [i32; 2],
         data: Vec<u8>,
@@ -348,6 +348,13 @@ pub enum Request {
         id: u32,
         cells: Vec<([i32; 3], u16)>,
     },
+    /// Construction : régions dont un relais de région sert en ce moment les blocs à ce
+    /// joueur (liste complète à chaque changement). Le relais du monde ne lui envoie pas
+    /// ces blocs une deuxième fois ; une région retirée de la liste : il lui remet aussitôt
+    /// ce qui lui manque.
+    Served {
+        regions: Vec<[i32; 2]>,
+    },
 }
 
 impl Request {
@@ -376,6 +383,7 @@ impl Request {
                 | Request::Rtt { .. }
                 | Request::Echo { .. }
                 | Request::BulkEdit { .. }
+                | Request::Served { .. }
                 | Request::CheatFound { .. }
         )
     }

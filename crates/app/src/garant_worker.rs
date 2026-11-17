@@ -58,11 +58,10 @@ impl Drop for GarantWorker {
 }
 
 /// Relais d'une région d'un monde de construction, hébergé par ce jeu pour d'autres
-/// joueurs (voir `minelib_relay::shard`). Il renvoie au relais du monde ce qu'il publie.
+/// joueurs (voir `minelib_relay::shard`). Il leur transmet ce que publie le relais du monde.
 pub struct ShardHost {
     pub region: [i32; 2],
     handle: minelib_relay::shard::ShardHandle,
-    link: std::sync::mpsc::Sender<minelib_net::transport::Inbound>,
     /// Nœud iroh propre à ce relais (joignable de partout, sans gêner celui du jeu).
     _node: Option<Arc<minelib_p2p::Node>>,
 }
@@ -90,10 +89,7 @@ impl ShardHost {
         p2p: bool,
         slot: u16,
     ) -> Option<Self> {
-        let blocks = minelib_world::registry::registry()
-            .len()
-            .min(u16::MAX as usize) as u16;
-        let handle = minelib_relay::shard::start("0.0.0.0:0", room, region, secret, blocks, slot)
+        let handle = minelib_relay::shard::start("0.0.0.0:0", room, region, secret, slot)
             .map_err(|e| log::warn!("relais de région : {e:#}"))
             .ok()?;
         let port = handle.addr.port();
@@ -139,14 +135,13 @@ impl ShardHost {
         Some(Self {
             region,
             handle,
-            link,
             _node: node,
         })
     }
 
-    /// Historique de la région (reçu du relais du monde).
-    pub fn seed(&self, chunk: [i32; 2], data: &[u8]) {
-        self.handle.seed(chunk, data);
+    /// Du relais du monde : l'historique de la région, puis chaque modification publiée.
+    pub fn seed(&self, data: &[u8]) {
+        self.handle.seed(data);
     }
 
     /// Relais prêts de la région (liste du relais du monde).
@@ -166,16 +161,9 @@ impl ShardHost {
         self.handle.players()
     }
 
-    /// Renvoie au relais du monde ce que le relais de région a publié.
+    /// À appeler régulièrement : liens vers les autres relais de la région.
     pub fn pump(&self) {
         self.handle.tick();
-        let entries: Vec<([i32; 2], Vec<u8>)> = self.handle.published.try_iter().collect();
-        if !entries.is_empty() {
-            minelib_net::transport::push(
-                &self.link,
-                &minelib_net::proto::Request::RegionLog { entries },
-            );
-        }
     }
 }
 
@@ -347,7 +335,7 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                         b.receive(peer, chunk, data, w);
                     }
                     if let Some(s) = &shard {
-                        s.seed(chunk, data);
+                        s.seed(data);
                     }
                 }
                 Event::PeerJoined { .. }

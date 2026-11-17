@@ -30,7 +30,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
-use std::time::Instant;
 
 use glam::Vec3;
 use minelib_net::client::{Client, Cmd, Event};
@@ -38,11 +37,6 @@ use minelib_net::game;
 use minelib_net::proto::{self, Request};
 use minelib_net::transport::{self, Inbound};
 use minelib_world::{BlockId, ChunkPos, World};
-
-/// Modifications acceptées par seconde et par joueur.
-const MAX_EDITS_PER_S: u32 = 20;
-/// Changements dus à l'écoulement de l'eau et de la lave (budget à part, plus large).
-const MAX_FLUID_EDITS_PER_S: u32 = 400;
 
 /// Changement que l'écoulement d'un fluide peut faire : fluide qui avance (dans le vide,
 /// une plante ou un fluide), qui sèche, ou qui se fige (obsidienne, pierre taillée, pierre).
@@ -86,9 +80,13 @@ fn pos_every(others: usize) -> f32 {
 
 pub use minelib_net::game::BuildMsg;
 
-/// Une modification non confirmée par le garant depuis ce temps est annulée (garant parti,
-/// message perdu) : le monde de chacun reste celui du garant.
+/// Une modification non confirmée par le relais du monde depuis ce temps est annulée
+/// (message perdu) : le monde de chacun reste celui du relais.
 const PENDING_TIMEOUT: f32 = 4.0;
+/// Cases dont on retient le rang de la dernière modification, au plus (au-delà, tout est
+/// oublié : ce rang ne sert qu'à écarter une modification arrivée en retard par un autre
+/// chemin, ce qui se joue en quelques secondes).
+const SEEN_MAX: usize = 1 << 20;
 
 pub struct Other {
     pub pseudo: String,
@@ -143,9 +141,12 @@ pub struct BuildNet {
     pub others: HashMap<String, Other>,
     chunk: Option<[i32; 2]>,
     pos_timer: f32,
-    /// Modifications acceptées par joueur dans la seconde en cours.
-    rate: HashMap<u64, (Instant, u32)>,
-    fluid_rate: HashMap<u64, (Instant, u32)>,
+    /// Rang (ordre du relais du monde) de la dernière modification appliquée à chaque
+    /// case, et relais de région qui l'a remise (aucun : le relais du monde). Une
+    /// modification plus ancienne arrivée après (doublon, autre chemin) est sans effet.
+    seen: HashMap<[i32; 3], (u64, Option<[i32; 2]>)>,
+    /// Régions annoncées au relais du monde comme servies par un relais de région.
+    served_sent: Vec<[i32; 2]>,
     caps_sent: bool,
     pending: HashMap<[i32; 3], Pending>,
     shards: Shards,
@@ -156,9 +157,9 @@ pub struct BuildNet {
     /// États d'objets (au sol, coffres) et refus reçus du relais du monde, à traiter par
     /// la partie (voir `crate::drops`).
     pub item_inbox: Vec<BuildMsg>,
-    /// Message en cours de traitement venu d'un relais de région (tenu par un joueur) :
-    /// seul le relais du monde arbitre les objets, on n'en accepte pas d'ailleurs.
-    from_shard: bool,
+    /// Message en cours de traitement venu du relais de cette région (tenu par un
+    /// joueur) : seul le relais du monde arbitre les objets, on n'en accepte pas d'ailleurs.
+    from_shard: Option<[i32; 2]>,
 }
 
 /// Relais de région (voir `minelib_relay::shard`) : la liste reçue du relais du monde, le
@@ -267,12 +268,12 @@ impl BuildNet {
             others: HashMap::new(),
             chunk: None,
             pos_timer: 0.0,
-            rate: HashMap::new(),
-            fluid_rate: HashMap::new(),
+            seen: HashMap::new(),
+            served_sent: Vec::new(),
             caps_sent: false,
             pending: HashMap::new(),
             item_inbox: Vec::new(),
-            from_shard: false,
+            from_shard: None,
             bulks: HashMap::new(),
             next_bulk: 0,
             shards: Shards::default(),
@@ -402,10 +403,6 @@ impl BuildNet {
         dirty
     }
 
-    fn garant_of(&self, chunk: [i32; 2]) -> bool {
-        self.zones.contains(&proto::zone_of(chunk))
-    }
-
     /// Capacités de ce PC pour être garant (annoncées une fois).
     pub fn caps(fps: f32) -> proto::GarantCaps {
         proto::GarantCaps {
@@ -415,10 +412,16 @@ impl BuildNet {
         }
     }
 
-    /// Modifications du joueur pas encore confirmées par leur garant.
+    /// Modifications du joueur pas encore confirmées par le relais du monde.
     #[cfg(test)]
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Cases dont la dernière modification est arrivée par un relais de région.
+    #[cfg(test)]
+    pub fn via_shard(&self) -> usize {
+        self.seen.values().filter(|v| v.1.is_some()).count()
     }
 
     /// À chaque image : modifications du joueur local (journal du monde), position,
@@ -440,6 +443,13 @@ impl BuildNet {
             self.caps_sent = true;
             caps = Some(Self::caps(fps));
         }
+        // Nouveau chunk : le relais du monde le sait avant de recevoir une demande de là
+        // (il refuse une modification hors de portée de son auteur).
+        let chunk = chunk_of(feet.x.floor() as i32, feet.z.floor() as i32);
+        if self.chunk != Some(chunk) {
+            self.chunk = Some(chunk);
+            self.send(Request::Position { chunk });
+        }
         // Ce que le joueur a changé.
         let edits = world
             .journal
@@ -447,10 +457,10 @@ impl BuildNet {
             .map(std::mem::take)
             .unwrap_or_default();
         for (pos, id, old) in edits {
-            // Toujours une demande au garant de la zone, même quand c'est ce jeu (le relais
-            // sait mieux que lui qui l'est à cet instant) ; le bloc d'avant est gardé pour
-            // un refus.
-            let chunk = chunk_of(pos[0], pos[2]);
+            // Toujours une demande au relais du monde, même dans une région servie par un
+            // relais de région : lui seul accepte une modification et lui donne son rang.
+            // Le bloc d'avant est gardé pour un refus.
+            let at = chunk_of(pos[0], pos[2]);
             let p = self.pending.entry(pos).or_insert(Pending {
                 old,
                 count: 0,
@@ -458,15 +468,16 @@ impl BuildNet {
             });
             p.count += 1;
             p.age = 0.0;
-            self.send_at(
-                chunk,
-                Request::ToZone {
-                    chunk,
-                    data: game::encode(&BuildMsg::Edit { pos, block: id.0 }),
-                },
-            );
+            self.send(Request::ToZone {
+                chunk: at,
+                data: game::encode(&BuildMsg::Edit {
+                    pos,
+                    block: id.0,
+                    fluid: fluid_edit(old, id),
+                }),
+            });
         }
-        // Sans réponse du garant : la modification n'a pas eu lieu.
+        // Sans réponse du relais : la modification n'a pas eu lieu.
         let mut dirty = Vec::new();
         let mut expired = Vec::new();
         for (pos, p) in &mut self.pending {
@@ -477,11 +488,11 @@ impl BuildNet {
         }
         for (pos, old) in expired {
             self.pending.remove(&pos);
-            log::info!("construction : pas de réponse du garant pour {pos:?}, annulé");
+            log::info!("construction : pas de réponse du relais pour {pos:?}, annulé");
             dirty.extend(world.set_remote(pos[0], pos[1], pos[2], old));
         }
         // Relais de région en vue : connexions, messages reçus.
-        let chunk = chunk_of(feet.x.floor() as i32, feet.z.floor() as i32);
+        let before: Vec<[i32; 2]> = self.shards.conns.keys().copied().collect();
         self.shards.keep_near(chunk);
         let mut received = Vec::new();
         let mut broken = Vec::new();
@@ -489,7 +500,7 @@ impl BuildNet {
             while let Some(e) = c.client.poll() {
                 match e {
                     Event::Link(l) => c.link = Some(l),
-                    Event::FromZone { chunk, data, .. } => received.push((chunk, data)),
+                    Event::FromZone { chunk, data, .. } => received.push((*region, chunk, data)),
                     Event::Error(m) | Event::Offline(m) => {
                         log::info!("relais de la région {region:?} : {m}");
                         broken.push(*region);
@@ -515,16 +526,33 @@ impl BuildNet {
             }
             self.shards.list.retain(|_, l| !l.is_empty());
         }
-        self.from_shard = true;
-        for (c, data) in received {
+        // Un relais de région quitté : ce qu'il a dit de l'ordre des modifications est
+        // oublié (un relais malveillant ne laisse rien derrière lui : la suite, venue
+        // d'ailleurs, s'applique normalement).
+        for r in before {
+            if !self.shards.conns.contains_key(&r) {
+                self.forget_shard(r);
+            }
+        }
+        // Le relais du monde sait quelles régions un relais de région nous sert (il ne
+        // nous en renvoie pas les blocs) : à chaque changement.
+        let mut served: Vec<[i32; 2]> = self
+            .shards
+            .conns
+            .iter()
+            .filter(|(_, c)| c.link.is_some() && c.sent_chunk.is_some())
+            .map(|(r, _)| *r)
+            .collect();
+        served.sort_unstable();
+        if served != self.served_sent {
+            self.served_sent = served.clone();
+            self.send(Request::Served { regions: served });
+        }
+        for (region, c, data) in received {
+            self.from_shard = Some(region);
             dirty.extend(self.receive(0, c, &data, world));
         }
-        self.from_shard = false;
-        // Position : aux joueurs proches ; nouveau chunk : au relais.
-        if self.chunk != Some(chunk) {
-            self.chunk = Some(chunk);
-            self.send(Request::Position { chunk });
-        }
+        self.from_shard = None;
         self.pos_timer -= dt;
         if self.pos_timer <= 0.0 {
             self.pos_timer = pos_every(self.others.len());
@@ -580,44 +608,33 @@ impl BuildNet {
             return Vec::new();
         };
         match msg {
-            BuildMsg::Edit { pos, block } => {
-                // Seul le garant reçoit les demandes ; un refus revient au seul demandeur.
-                // Eau et lave qui coulent : beaucoup de blocs d'un coup, budget à part.
-                let fluid = fluid_edit(world.get(pos[0], pos[1], pos[2]), BlockId(block));
-                if !self.validate(peer, chunk, pos, block, fluid) {
-                    self.send(Request::ToZone {
-                        chunk,
-                        data: game::encode(&BuildMsg::Reject { pos, peer }),
-                    });
-                    return Vec::new();
-                }
-                let set = BuildMsg::Set {
-                    pos,
-                    block,
-                    by: self
-                        .others
-                        .values()
-                        .find(|o| o.id == Some(peer))
-                        .map_or(String::new(), |o| o.pseudo.clone()),
-                };
-                self.send(Request::ToZone {
-                    chunk,
-                    data: game::encode(&set),
-                });
-                // Sa propre modification (le garant ne reçoit pas ce qu'il publie) : confirmée.
-                self.confirm(pos, BlockId(block));
-                world.set_remote(pos[0], pos[1], pos[2], BlockId(block))
-            }
-            BuildMsg::Set { pos, block, by } => {
-                // Le garant d'une zone ne publie que pour sa zone (l'historique envoyé par le
-                // relais porte le coin de la zone, d'où la comparaison par zone).
+            // Les demandes ne vont qu'au relais du monde.
+            BuildMsg::Edit { .. } => Vec::new(),
+            BuildMsg::Set {
+                pos,
+                block,
+                by,
+                seq,
+            } => {
+                // (L'historique envoyé par un relais porte le coin de la zone, d'où la
+                // comparaison par zone.)
                 if proto::zone_of(chunk_of(pos[0], pos[2])) != proto::zone_of(chunk)
                     || block as usize >= minelib_world::registry::registry().len()
                 {
                     return Vec::new();
                 }
+                // L'ordre du relais du monde : plus ancienne que ce qu'on a déjà pour
+                // cette case (doublon, même modification arrivée par deux chemins), elle
+                // est sans effet.
+                if self.seen.get(&pos).is_some_and(|s| s.0 >= seq) {
+                    return Vec::new();
+                }
+                if self.seen.len() >= SEEN_MAX {
+                    self.seen.clear();
+                }
+                self.seen.insert(pos, (seq, self.from_shard));
                 log::debug!("construction : bloc {block} en {pos:?} (par {by})");
-                // Ce que dit le garant fait foi (et confirme une modification en attente).
+                // Ce que publie le relais fait foi (et confirme une modification en attente).
                 self.confirm(pos, BlockId(block));
                 // Le joueur a déjà rechangé cette case (pas encore envoyé) : sa nouvelle
                 // modification reste à l'écran, et part de ce bloc-ci.
@@ -629,7 +646,7 @@ impl BuildNet {
             // Objets au sol et coffres : états publiés par le relais du monde (jamais par un
             // joueur, `peer` 0, ni par un relais de région).
             BuildMsg::Item { .. } | BuildMsg::Slot { .. } | BuildMsg::Denied { .. } => {
-                if peer == 0 && !self.from_shard {
+                if peer == 0 && self.from_shard.is_none() {
                     self.item_inbox.push(msg);
                 }
                 Vec::new()
@@ -706,8 +723,14 @@ impl BuildNet {
         }
     }
 
+    /// Le relais de cette région n'est plus le nôtre : ce qu'il a dit de l'ordre des
+    /// modifications est oublié.
+    fn forget_shard(&mut self, region: [i32; 2]) {
+        self.seen.retain(|_, v| v.1 != Some(region));
+    }
+
     /// Une modification de cette case est confirmée.
-    /// Le garant vient de publier `block` en `pos` : c'est désormais le bloc qui revient
+    /// Le relais vient de publier `block` en `pos` : c'est désormais le bloc qui revient
     /// si une modification encore en attente à cet endroit est refusée (et non celui
     /// d'avant la première : deux modifications de suite dont la seconde est refusée, ou
     /// celle d'un autre joueur passée entre-temps, laissaient un monde différent).
@@ -720,44 +743,13 @@ impl BuildNet {
             }
         }
     }
-
-    /// Vérification du garant : bloc connu, dans une de ses zones, dans le chunk annoncé,
-    /// hauteur valide, débit raisonnable.
-    fn validate(
-        &mut self,
-        peer: u64,
-        chunk: [i32; 2],
-        pos: [i32; 3],
-        block: u16,
-        fluid: bool,
-    ) -> bool {
-        if !self.garant_of(chunk)
-            || chunk_of(pos[0], pos[2]) != chunk
-            || !(0..minelib_world::CHUNK_HEIGHT as i32).contains(&pos[1])
-            || block as usize >= minelib_world::registry::registry().len()
-        {
-            return false;
-        }
-        let now = Instant::now();
-        let (rate, max) = if fluid {
-            (&mut self.fluid_rate, MAX_FLUID_EDITS_PER_S)
-        } else {
-            (&mut self.rate, MAX_EDITS_PER_S)
-        };
-        let e = rate.entry(peer).or_insert((now, 0));
-        if now.duration_since(e.0).as_secs_f32() >= 1.0 {
-            *e = (now, 0);
-        }
-        e.1 += 1;
-        e.1 <= max
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use minelib_net::client::{Client, Cmd, Event};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Un joueur simulé : sa connexion, son monde, ce qu'il a changé.
     struct Bot {
@@ -887,6 +879,11 @@ mod tests {
                         if let Some(n) = &mut self.net {
                             n.receive(peer, chunk, &data, &mut self.world);
                         }
+                        // Hôte d'un relais de région : ce que publie le relais du monde
+                        // part à ses joueurs (comme dans `garant_worker`).
+                        if let Some(s) = &self.shard {
+                            s.seed(&data);
+                        }
                     }
                     Event::Promoted { .. } => {
                         if let Some(n) = &mut self.net {
@@ -933,7 +930,8 @@ mod tests {
     #[derive(Default)]
     struct Scenario {
         players: usize,
-        /// Le garant extérieur s'en va au milieu (ses zones reviennent aux joueurs).
+        /// L'hôte du relais de région s'en va au milieu (les joueurs repassent par le
+        /// relais du monde, ou par l'autre relais de la région).
         garant_leaves: bool,
         /// Le propriétaire s'en va au milieu (un joueur reprend le monde et l'enregistre).
         owner_leaves: bool,
@@ -946,9 +944,10 @@ mod tests {
 
     /// Construction en ligne à petite échelle, de bout en bout (vrai relais, vraies
     /// connexions) : des joueurs qui se déplacent et construisent à cheval sur deux zones,
-    /// un garant extérieur (joueur d'un autre monde), un joueur qui inonde (refusé au-delà
-    /// de 20 par seconde), un joueur qui arrive après coup. À la fin, tous les mondes sont
-    /// identiques à celui du propriétaire, case par case, et rien n'est en attente.
+    /// le joueur d'un autre monde qui héberge le relais de la région quand elle en a un,
+    /// un joueur qui inonde (refusé au-delà de 20 par seconde), un joueur qui arrive après
+    /// coup. À la fin, tous les mondes sont identiques à celui du propriétaire, case par
+    /// case, et rien n'est en attente.
     fn run(sc: Scenario) {
         let dir = std::env::temp_dir().join(format!("minelib-sync-{}", rand_u32()));
         minelib_relay::test_seed_games(&dir, "Garant", 5);
@@ -995,6 +994,8 @@ mod tests {
             (w, g)
         });
         let (mut linked, mut both_used) = (false, false);
+        // Des blocs sont arrivés à un joueur par un relais de région.
+        let mut via_shard = false;
         // Le monde essayé : un propriétaire et des joueurs.
         let mut bots = vec![Bot::new(&addr, h.public, "Proprio", false)];
         bots[0].c.send(Cmd::Host {
@@ -1076,8 +1077,10 @@ mod tests {
                 b.tick(dt);
             }
             garant.tick(dt);
-            had_garant |=
-                garant.net.as_ref().is_some_and(|n| !n.zones.is_empty()) || garant.shard.is_some();
+            had_garant |= garant.shard.is_some();
+            via_shard |= bots
+                .iter()
+                .any(|b| b.net.as_ref().is_some_and(|n| n.via_shard() > 0));
             if let Some((w, g)) = &mut second {
                 w.pump(&|_| false);
                 g.tick(dt);
@@ -1114,8 +1117,12 @@ mod tests {
             let _ = both_used;
         }
         assert!(
-            had_garant,
-            "le monde a reçu son garant extérieur, et ses zones"
+            !sc.shards || had_garant,
+            "la région a reçu son relais, hébergé par le joueur d'un autre monde"
+        );
+        assert_eq!(
+            via_shard, sc.shards,
+            "les blocs passent par le relais de région quand il y en a un, et seulement là"
         );
         assert!(
             edited.len() > 50,
@@ -1178,15 +1185,6 @@ mod tests {
     fn build_worlds_stay_identical_for_everyone() {
         run(Scenario {
             players: 6,
-            ..Default::default()
-        });
-    }
-
-    #[test]
-    fn build_worlds_stay_identical_when_the_outside_garant_leaves() {
-        run(Scenario {
-            players: 6,
-            garant_leaves: true,
             ..Default::default()
         });
     }
@@ -1286,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_edit_gives_back_what_the_garant_last_published() {
+    fn a_refused_edit_gives_back_what_the_relay_last_published() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut b = BuildNet::new(tx, "Moi".into(), false);
         let mut w = World::new(0);
@@ -1300,12 +1298,18 @@ mod tests {
         let from_garant = |b: &mut BuildNet, w: &mut World, m: BuildMsg| {
             b.receive(9, [0, 0], &game::encode(&m), w);
         };
-        let set = |block: u16| BuildMsg::Set {
-            pos,
-            block,
-            by: String::new(),
+        // (Chaque modification publiée porte un rang plus grand que la précédente.)
+        let rank = std::cell::Cell::new(0u64);
+        let set = |block: u16| {
+            rank.set(rank.get() + 1);
+            BuildMsg::Set {
+                pos,
+                block,
+                by: String::new(),
+                seq: rank.get(),
+            }
         };
-        // Deux modifications de suite au même endroit ; le garant accepte la première et
+        // Deux modifications de suite au même endroit ; le relais accepte la première et
         // refuse la seconde (trop vite) : c'est la première qui reste, pas le bloc d'avant.
         w.set(1, 100, 1, BlockId(1));
         step(&mut b, &mut w);
@@ -1348,33 +1352,61 @@ mod tests {
             .map_or(1, |d| d.subsec_nanos())
     }
 
+    /// L'ordre du relais du monde fait foi : une modification plus ancienne que celle déjà
+    /// appliquée à la même case (doublon, même modification arrivée par le relais de
+    /// région et par le relais du monde) est sans effet, et ne confirme rien deux fois.
+    /// Ce qu'un relais de région a dit est oublié quand on le quitte.
     #[test]
-    fn the_garant_refuses_edits_outside_its_zones_and_floods() {
+    fn an_older_or_repeated_edit_changes_nothing() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut b = BuildNet::new(tx, "G".into(), false);
-        b.zones.insert([0, 0]);
-        assert!(b.validate(7, [1, 1], [20, 64, 20], 1, false));
-        assert!(
-            !b.validate(7, [9, 9], [150, 64, 150], 1, false),
-            "pas sa zone"
-        );
-        assert!(
-            !b.validate(7, [1, 1], [0, 64, 0], 1, false),
-            "pas le chunk annoncé"
-        );
-        assert!(
-            !b.validate(7, [1, 1], [20, 64, 20], 60000, false),
-            "bloc inconnu"
-        );
-        let ok = (0..30)
-            .filter(|_| b.validate(8, [1, 1], [20, 64, 20], 1, false))
-            .count();
-        assert_eq!(ok, MAX_EDITS_PER_S as usize, "20 par seconde au plus");
-        // L'eau qui coule a son propre budget, plus large.
-        let ok = (0..30)
-            .filter(|_| b.validate(8, [1, 1], [20, 64, 20], 1, true))
-            .count();
-        assert_eq!(ok, 30, "écoulement : pas limité à 20/s");
+        let mut b = BuildNet::new(tx, "Moi".into(), false);
+        let mut w = World::new(0);
+        w.ensure_chunk(minelib_world::ChunkPos::containing(1, 1));
+        w.journal = Some(Vec::new());
+        let pos = [1, 100, 1];
+        let set = |block: u16, seq: u64| {
+            game::encode(&BuildMsg::Set {
+                pos,
+                block,
+                by: "Eve".into(),
+                seq,
+            })
+        };
+        b.receive(0, [0, 0], &set(1, 10), &mut w);
+        b.receive(0, [0, 0], &set(2, 12), &mut w);
+        // La plus ancienne arrive après, par un autre chemin ; puis un doublon.
+        b.receive(0, [0, 0], &set(1, 10), &mut w);
+        b.receive(0, [0, 0], &set(3, 11), &mut w);
+        b.receive(0, [0, 0], &set(2, 12), &mut w);
+        assert_eq!(w.get(1, 100, 1), BlockId(2));
+        // Deux modifications à moi en attente sur cette case : la première confirmée,
+        // reçue deux fois (relais du monde, puis relais de région), ne confirme pas la
+        // seconde.
+        w.set(1, 100, 1, BlockId(4));
+        let _ = b.update(&mut w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, 0.05);
+        w.set(1, 100, 1, BlockId(5));
+        let _ = b.update(&mut w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, 0.05);
+        b.receive(0, [0, 0], &set(4, 13), &mut w);
+        b.receive(0, [0, 0], &set(4, 13), &mut w);
+        assert_eq!(b.pending(), 1, "la seconde attend toujours sa réponse");
+        b.receive(0, [0, 0], &set(5, 14), &mut w);
+        assert_eq!(b.pending(), 0);
+        assert_eq!(w.get(1, 100, 1), BlockId(5));
+        // Un relais de région (tenu par un joueur) annonce un rang énorme : tant qu'on
+        // passe par lui, c'est lui qu'on voit ; quitté, il ne laisse rien derrière lui.
+        b.from_shard = Some([0, 0]);
+        b.receive(0, [0, 0], &set(9, u64::MAX), &mut w);
+        b.from_shard = None;
+        assert_eq!(w.get(1, 100, 1), BlockId(9));
+        b.receive(0, [0, 0], &set(6, 15), &mut w);
+        assert_eq!(w.get(1, 100, 1), BlockId(9), "encore servi par ce relais");
+        b.forget_shard([0, 0]);
+        b.receive(0, [0, 0], &set(6, 15), &mut w);
+        assert_eq!(w.get(1, 100, 1), BlockId(6), "le relais du monde fait foi");
+    }
+
+    #[test]
+    fn flowing_fluids_are_told_apart_from_placed_blocks() {
         let water = minelib_world::registry::Fluid::Water;
         assert!(fluid_edit(BlockId::AIR, water.block(7)));
         assert!(fluid_edit(water.block(7), BlockId::AIR));
