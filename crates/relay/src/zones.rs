@@ -410,19 +410,17 @@ impl Build {
         out
     }
 
-    /// Provinces (v138) : les blocs des zones choisies par `keep` publiés après le rang
-    /// `after` (zone, rang, entrée), les zones qui dorment réveillées.
-    pub fn blocks_after(&mut self, keep: impl Fn([i32; 2]) -> bool, after: u64) -> Vec<Entry> {
+    /// Relais du monde (v139) : tout ce qui a été publié dans les zones gardées après le rang
+    /// `after` (blocs, objets au sol et coffres), dans l'ordre de chaque zone.
+    pub fn entries_after(&mut self, keep: impl Fn([i32; 2]) -> bool, after: u64) -> Vec<Entry> {
         let sleeping: Vec<[i32; 2]> = self.asleep.keys().filter(|z| keep(**z)).copied().collect();
         for z in sleeping {
             self.wake(z);
         }
         let mut out = Vec::new();
         for (&zone, log) in self.logs.iter().filter(|(z, _)| keep(**z)) {
-            for (&seq, (block, d)) in log.entries.range(after + 1..) {
-                if *block {
-                    out.push((zone, seq, d.clone()));
-                }
+            for (&seq, (_, d)) in log.entries.range(after + 1..) {
+                out.push((zone, seq, d.clone()));
             }
         }
         out

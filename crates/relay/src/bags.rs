@@ -177,6 +177,15 @@ impl Store {
         self.dirty = true;
     }
 
+    /// Modes donnés par un OP aux joueurs de ce serveur (pseudo, mode).
+    pub fn modes_of(&self, server: &str) -> Vec<(String, String)> {
+        self.data
+            .modes
+            .get(server)
+            .map(|m| m.iter().map(|(p, v)| (p.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
     /// Mode donné par un OP à ce joueur, s'il y en a un.
     pub fn mode(&self, server: &str, pseudo: &str) -> Option<&str> {
         self.data

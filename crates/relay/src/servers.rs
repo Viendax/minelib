@@ -223,6 +223,34 @@ impl Store {
         })
     }
 
+    /// OP nommés de ce serveur (sans le créateur), en minuscules.
+    pub fn ops(&self, server: &str) -> Vec<String> {
+        self.servers
+            .get(server)
+            .map(|a| a.ops.clone())
+            .unwrap_or_default()
+    }
+
+    /// Relais de province (v139) : réglages du serveur tels que les tient le relais du
+    /// monde (OP, bannis, mode par défaut). Rien n'est écrit sur le disque ici.
+    pub fn mirror(&mut self, server: &str, s: &minelib_net::proto::ProvinceSettings) {
+        let a = self.servers.entry(server.to_string()).or_default();
+        a.ops = s.ops.iter().map(|o| o.to_ascii_lowercase()).collect();
+        a.bans = s
+            .bans
+            .iter()
+            .map(|b| (b.to_ascii_lowercase(), String::new()))
+            .collect();
+        match &s.default_mode {
+            Some(m) => {
+                self.defaults.insert(server.to_string(), m.clone());
+            }
+            None => {
+                self.defaults.remove(server);
+            }
+        }
+    }
+
     /// Pseudos bannis de ce serveur.
     pub fn bans(&self, server: &str) -> Vec<String> {
         self.servers

@@ -1031,6 +1031,7 @@ fn run(
                     secret,
                     root,
                     ref info,
+                    ref settings,
                 }) => {
                     if let Some(l) = &link {
                         if province.is_none() {
@@ -1042,6 +1043,7 @@ fn run(
                                 secret,
                                 root,
                                 info.clone(),
+                                settings.clone(),
                                 l,
                                 login.node_dir.is_some(),
                             );

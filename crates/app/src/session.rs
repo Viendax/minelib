@@ -1435,7 +1435,7 @@ impl Session {
             }
         }
         self.items.arbitrate(&me);
-        if let Some(b) = &self.build {
+        if let Some(b) = &mut self.build {
             for (chunk, req) in std::mem::take(&mut self.items.outbox) {
                 b.send_item(chunk, &req);
             }

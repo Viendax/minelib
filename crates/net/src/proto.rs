@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 37;
+pub const PROTOCOL: u32 = 38;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -504,6 +504,31 @@ pub enum Request {
         epoch: u64,
         n: u64,
         entries: Vec<([i32; 2], u64, Vec<u8>)>,
+        /// (v139) Sacs de survie prêtés qui ont changé : (pseudo, objets, crédits de
+        /// minage) ; positions de retour de ses joueurs (pseudo, x, y, z, lacet, tangage).
+        bags: Vec<BagCopy>,
+        spots: Vec<(String, [f32; 5])>,
+        /// (v139) Blocs changés dans la province par des joueurs en survie dont elle n'a
+        /// pas le sac (pseudo, bloc : 0 cassé, sinon posé) : comptés par le relais du monde.
+        loose: Vec<(String, u16)>,
+    },
+    /// (v139) Un joueur en survie est dans la province : son sac, s'il vous plaît (le
+    /// relais du monde le prête à une seule province à la fois).
+    ProvinceBag {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        pseudo: String,
+    },
+    /// (v139) Sac rendu (le joueur est parti, ou le relais du monde l'a redemandé) : son
+    /// état final.
+    ProvinceBagBack {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        pseudo: String,
+        items: Vec<(u32, u32)>,
+        mined: u32,
     },
     /// Relais de région prêts dans la province (région, rang), à chaque changement : le
     /// relais du monde en choisit toujours les hôtes et les remplace.
@@ -578,6 +603,8 @@ impl Request {
                 | Request::ProvinceArchive { .. }
                 | Request::ProvinceShards { .. }
                 | Request::ProvinceRelease { .. }
+                | Request::ProvinceBag { .. }
+                | Request::ProvinceBagBack { .. }
         )
     }
 }
@@ -925,6 +952,42 @@ pub enum Response {
         secret: [u8; 32],
         root: [u8; 32],
         info: StandbyInfo,
+        settings: ProvinceSettings,
+    },
+    /// (v139) Réglages du serveur changés (OP, bannis, mode par défaut) : à chaque relais
+    /// de province du monde.
+    ProvinceSettings {
+        room: u64,
+        settings: ProvinceSettings,
+    },
+    /// (v139) Le sac de survie d'un joueur, prêté à la province (elle seule s'en sert
+    /// jusqu'à ce qu'elle le rende) ; `mode` : son mode de jeu donné par un OP.
+    ProvinceBagLent {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        pseudo: String,
+        items: Vec<(u32, u32)>,
+        mined: u32,
+        mode: Option<String>,
+    },
+    /// (v139) Le relais du monde redemande ce sac (le joueur est ailleurs) : il faut le
+    /// rendre (`ProvinceBagBack`) et ne plus s'en servir.
+    ProvinceBagRecall {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        pseudo: String,
+    },
+    /// (v139) WorldEdit d'un OP dans la province : les cases, chacune signée par le relais
+    /// du monde à la place de l'OP (transmise telle quelle à l'hôte principal d'une région
+    /// souveraine).
+    ProvinceBulk {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        pseudo: String,
+        edits: Vec<crate::sovereign::Edit>,
     },
     /// Historique des blocs de la province : (zone, rang, message). `go` (dernier envoi,
     /// quand l'hôte est prêt) : premier rang de sa plage ; il sert dès son premier bail.
@@ -1161,6 +1224,10 @@ impl Response {
                 | Response::ProvinceConfirmed { .. }
                 | Response::ProvinceStop { .. }
                 | Response::Provinces { .. }
+                | Response::ProvinceSettings { .. }
+                | Response::ProvinceBagLent { .. }
+                | Response::ProvinceBagRecall { .. }
+                | Response::ProvinceBulk { .. }
                 // (Relais de secours et gardiens, v133 à v135 : poussés eux aussi ; une
                 // requête en cours ne doit pas les prendre pour sa réponse.)
                 | Response::StandbyTask { .. }
@@ -1289,6 +1356,20 @@ impl ProvinceInfo {
             other.key,
         )
     }
+}
+
+/// Copie d'un sac de survie (v139) : pseudo, objets (code, nombre), crédits de minage.
+pub type BagCopy = (String, Vec<(u32, u32)>, u32);
+
+/// Réglages d'un serveur de construction qu'un relais de province doit connaître (v139) :
+/// mode de jeu par défaut, OP, bannis, et modes donnés par un OP à des joueurs (pseudo,
+/// mode) : c'est le mode qui décide si l'inventaire d'un joueur est tenu par le relais.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct ProvinceSettings {
+    pub default_mode: Option<String>,
+    pub ops: Vec<String>,
+    pub bans: Vec<String>,
+    pub modes: Vec<(String, String)>,
 }
 
 /// Province d'un relais de région (dans `ShardTask`) : où la joindre, et le jeton qui

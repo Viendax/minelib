@@ -38,6 +38,11 @@ const SEED_CHUNK: usize = 4096;
 /// Relais de province : ce qu'il publie part au relais du monde toutes les… (ms), ou dès
 /// qu'il y en a `SEED_CHUNK`.
 const ARCHIVE_MS: u64 = 100;
+/// Positions de retour des joueurs d'une province : envoyées au relais du monde toutes
+/// les… (ms).
+const SPOT_MS: u64 = 2000;
+/// Sac de survie demandé sans réponse : redemandé après… (ms).
+const BAG_ASK_MS: u64 = 3000;
 
 /// Relais du monde : une province confiée (ou en train de l'être).
 pub(crate) struct ProvinceRef {
@@ -85,6 +90,18 @@ pub(crate) struct ProvinceRoom {
     outbox: Vec<([i32; 2], u64, Vec<u8>)>,
     next_n: u64,
     last_archive: u64,
+    /// (v139) Sacs de survie prêtés par le relais du monde (pseudos en minuscules) ; ceux
+    /// demandés (pas encore reçus) ; ce qu'il faut lui dire (demandes, retours).
+    held: HashSet<String>,
+    asked: HashMap<String, u64>,
+    requests: Vec<Request>,
+    /// Positions de retour de ses joueurs, à transmettre au relais du monde (toutes les
+    /// `SPOT_MS`), et dernier envoi.
+    spots: HashMap<String, [f32; 5]>,
+    last_spots: u64,
+    /// Blocs changés ici par des joueurs en survie dont elle n'a pas le sac : comptés par
+    /// le relais du monde (dans le prochain envoi).
+    loose: Vec<(String, u16)>,
 }
 
 impl ProvinceRoom {
@@ -200,17 +217,10 @@ pub(crate) fn upkeep(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>)
     let Some(room) = st.rooms.get(&rid) else {
         return;
     };
-    // (Une province ne se découpe pas elle-même ; un monde en survie garde tout au relais
-    // du monde : les sacs ne passent pas encore d'un relais à l'autre.)
+    // (Une province ne se découpe pas elle-même.)
     if room.kind != 1 || room.province.is_some() || guards::frozen(st, rid) {
         return;
     }
-    let survival = st.servers.default_gamemode(&room.server).is_some_and(|m| {
-        matches!(
-            m.trim().to_lowercase().as_str(),
-            "0" | "s" | "survival" | "survie"
-        )
-    });
     let mut count: HashMap<[i32; 2], usize> = HashMap::new();
     for (id, chunk) in &room.build.positions {
         if !room.hidden.contains(id) {
@@ -267,9 +277,6 @@ pub(crate) fn upkeep(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>)
     for p in back {
         stop(st, rid, p, "vide ou pas prête");
     }
-    if survival {
-        return;
-    }
     let mut wanted: Vec<[i32; 2]> = count
         .iter()
         .filter(|(p, &n)| n >= from && !st.rooms[&rid].provinces.contains_key(*p))
@@ -305,7 +312,8 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
     room.hidden.insert(g);
     let snap_seq = room.build.last_seq();
     let keep = |zone: [i32; 2]| proto::province_of(zone_region(zone), size) == p;
-    let entries = room.build.blocks_after(keep, 0);
+    // (Blocs, objets et coffres : v139.)
+    let entries = room.build.entries_after(keep, 0);
     let info = proto::StandbyInfo {
         name: room.name.clone(),
         map: room.map.clone(),
@@ -316,6 +324,9 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
         owner: room.host_pseudo.clone(),
     };
     let secret = room.shard_secret;
+    let server = room.server.clone();
+    let settings = settings_of(st, &server);
+    let room = st.rooms.get_mut(&rid).expect("partie");
     room.provinces.insert(
         p,
         ProvinceRef {
@@ -342,6 +353,7 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             secret,
             root,
             info,
+            settings,
         },
     );
     for part in entries.chunks(SEED_CHUNK) {
@@ -387,7 +399,7 @@ pub(crate) fn ready(
     };
     let after = r.snap_seq;
     let keep = |zone: [i32; 2]| proto::province_of(zone_region(zone), size) == p;
-    let delta = room.build.blocks_after(keep, after);
+    let delta = room.build.entries_after(keep, after);
     let base = room.build.reserve(PROVINCE_SEQS);
     let r = room.provinces.get_mut(&p).expect("province");
     r.info = Some(ProvinceInfo {
@@ -486,6 +498,9 @@ pub(crate) fn archive(
     epoch: u64,
     n: u64,
     entries: Vec<([i32; 2], u64, Vec<u8>)>,
+    bags: Vec<proto::BagCopy>,
+    spots: Vec<(String, [f32; 5])>,
+    loose: Vec<(String, u16)>,
 ) {
     let size = size(st);
     let Some(room) = st.rooms.get_mut(&rid) else {
@@ -498,18 +513,61 @@ pub(crate) fn archive(
     {
         return;
     }
-    let mut spilled = Vec::new();
     for (zone, seq, data) in entries {
         if proto::province_of(zone_region(zone), size) != p {
             continue;
         }
         room.build.mirror_at(zone, &data, Some(seq), &[]);
-        if let Some(minelib_net::game::BuildMsg::Set { pos, .. }) =
-            minelib_net::game::decode::<minelib_net::game::BuildMsg>(&data)
-        {
-            if room.build.items.chest(pos).iter().any(Option::is_some) {
-                spilled.push(pos);
-            }
+        // (Objets et coffres : arbitrés par la province depuis la v139 ; ce relais en
+        // garde l'état, pour la reprendre.)
+        if let Some(m) = minelib_net::game::decode::<minelib_net::game::BuildMsg>(&data) {
+            room.build.items.absorb(&m);
+        }
+    }
+    // Sacs de survie qu'elle tient : leur copie ; positions de retour de ses joueurs.
+    let server = room.server.clone();
+    let mine: Vec<proto::BagCopy> = bags
+        .into_iter()
+        .filter(|(who, _, _)| {
+            room.bag_holders
+                .get(&who.to_ascii_lowercase())
+                .is_some_and(|h| *h == (p, epoch))
+        })
+        .collect();
+    for (who, items, mined) in mine {
+        st.bags.put(
+            &server,
+            &who,
+            super::bags::Bag {
+                items: items.into_iter().collect(),
+                mined,
+            },
+        );
+    }
+    // (Une province ne place un joueur que chez elle.)
+    for (who, at) in spots {
+        let chunk = [
+            (at[0].floor() as i32).div_euclid(16),
+            (at[2].floor() as i32).div_euclid(16),
+        ];
+        if at.iter().all(|v| v.is_finite()) && near(chunk, p, size) {
+            st.servers.set_position(&server, &who, at);
+        }
+    }
+    // Blocs changés là-bas par des joueurs en survie dont elle n'avait pas le sac : ceux
+    // de ses joueurs (ou partis depuis), au plus `LOOSE_MAX` chacun par envoi.
+    let mut counted: HashMap<String, usize> = HashMap::new();
+    for (who, block) in loose {
+        let who = who.to_ascii_lowercase();
+        let n = counted.entry(who.clone()).or_default();
+        *n += 1;
+        let ok = *n <= LOOSE_MAX
+            && st
+                .rooms
+                .get(&rid)
+                .is_some_and(|r| player_near(r, &who, p, size).unwrap_or(true));
+        if ok {
+            bag_block(st, rid, &server, &who, block);
         }
     }
     st.province_archived += 1;
@@ -525,9 +583,323 @@ pub(crate) fn archive(
             },
         );
     }
-    for pos in spilled {
-        spill_chest(st, rid, pos);
+}
+
+/// Relais du monde (v139) : une province veut le sac de survie d'un joueur qui s'y trouve.
+/// Prêté s'il est ici ; tenu par une autre province : redemandé à elle, puis prêté.
+pub(crate) fn bag_asked(st: &mut State, rid: u64, id: u64, p: [i32; 2], epoch: u64, pseudo: &str) {
+    let size = size(st);
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    if !room
+        .provinces
+        .get(&p)
+        .is_some_and(|r| r.host == id && r.epoch == epoch && r.info.is_some())
+    {
+        return;
     }
+    let who = pseudo.to_ascii_lowercase();
+    // (Seulement pour un joueur qui s'y trouve, d'après ce relais.)
+    if player_near(room, &who, p, size) != Some(true) {
+        return;
+    }
+    match room.bag_holders.get(&who).copied() {
+        Some(h) if h == (p, epoch) => lend(st, rid, &who),
+        Some((q, e)) => {
+            room.bag_waiting.insert(who.clone(), (p, epoch));
+            recall(st, rid, &who, q, e);
+        }
+        None => {
+            room.bag_holders.insert(who.clone(), (p, epoch));
+            lend(st, rid, &who);
+        }
+    }
+}
+
+/// Relais du monde : un sac rendu par la province qui le tenait.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bag_returned(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    p: [i32; 2],
+    epoch: u64,
+    pseudo: &str,
+    items: Vec<(u32, u32)>,
+    mined: u32,
+) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let who = pseudo.to_ascii_lowercase();
+    let ok = room.bag_holders.get(&who) == Some(&(p, epoch))
+        && room
+            .provinces
+            .get(&p)
+            .is_some_and(|r| r.host == id && r.epoch == epoch);
+    if !ok {
+        return;
+    }
+    room.bag_holders.remove(&who);
+    let server = room.server.clone();
+    let next = room.bag_waiting.remove(&who);
+    st.bags.put(
+        &server,
+        &who,
+        super::bags::Bag {
+            items: items.into_iter().collect(),
+            mined,
+        },
+    );
+    settle(st, rid, &who);
+    // Une autre province l'attendait : à elle, si elle sert encore.
+    if let Some((q, e)) = next {
+        let room = st.rooms.get_mut(&rid).expect("partie");
+        if room
+            .provinces
+            .get(&q)
+            .is_some_and(|r| r.epoch == e && r.info.is_some())
+        {
+            room.bag_holders.insert(who.clone(), (q, e));
+            lend(st, rid, &who);
+        }
+    }
+}
+
+/// Relais du monde : le sac de `who` (tenu ici) part à la province qui le tient désormais.
+fn lend(st: &mut State, rid: u64, who: &str) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let Some(&(p, epoch)) = room.bag_holders.get(who) else {
+        return;
+    };
+    let Some(host) = room.provinces.get(&p).map(|r| r.host) else {
+        return;
+    };
+    let server = room.server.clone();
+    let b = st.bags.get(&server, who);
+    let mode = st.bags.mode(&server, who).map(str::to_string);
+    st.province_lends += 1;
+    if let Some(c) = st.conns.get(&host) {
+        transport::push(
+            &c.tx,
+            &Response::ProvinceBagLent {
+                room: rid,
+                province: p,
+                epoch,
+                pseudo: who.to_string(),
+                items: b.items.into_iter().collect(),
+                mined: b.mined,
+                mode,
+            },
+        );
+    }
+}
+
+/// Relais du monde : la province qui tient le sac de `who` doit le rendre.
+fn recall(st: &State, rid: u64, who: &str, p: [i32; 2], epoch: u64) {
+    let Some(host) = st
+        .rooms
+        .get(&rid)
+        .and_then(|r| r.provinces.get(&p))
+        .map(|r| r.host)
+    else {
+        return;
+    };
+    if let Some(c) = st.conns.get(&host) {
+        transport::push(
+            &c.tx,
+            &Response::ProvinceBagRecall {
+                room: rid,
+                province: p,
+                epoch,
+                pseudo: who.to_string(),
+            },
+        );
+    }
+}
+
+/// Relais du monde : le sac de `pseudo` est-il prêté à une province ? Si oui, il le lui
+/// redemande (le joueur veut s'en servir ici) : il faut attendre son retour.
+pub(crate) fn bag_away(st: &mut State, rid: u64, pseudo: &str) -> bool {
+    let who = pseudo.to_ascii_lowercase();
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return false;
+    };
+    let Some(&(p, e)) = room.bag_holders.get(&who) else {
+        return false;
+    };
+    room.bag_waiting.remove(&who);
+    recall(st, rid, &who, p, e);
+    true
+}
+
+/// Blocs changés hors du sac comptés au plus par joueur et par envoi d'une province.
+const LOOSE_MAX: usize = 64;
+
+/// Le chunk `c` est-il dans la province `p` ou à moins de deux chunks d'elle ?
+fn near(c: [i32; 2], p: [i32; 2], size: i32) -> bool {
+    [[0, 0], [-2, -2], [-2, 2], [2, -2], [2, 2]]
+        .iter()
+        .any(|d| proto::province_of(proto::region_of([c[0] + d[0], c[1] + d[1]]), size) == p)
+}
+
+/// Le joueur `who` (minuscules) est-il dans la province `p` ou tout près, d'après ce
+/// relais ? `None` : il n'est pas (ou plus) dans ce monde.
+fn player_near(room: &super::Room, who: &str, p: [i32; 2], size: i32) -> Option<bool> {
+    let id = room.by_pseudo.get(who)?;
+    Some(
+        room.build
+            .positions
+            .get(id)
+            .is_some_and(|c| near(*c, p, size)),
+    )
+}
+
+/// Un bloc changé par `who` (en survie) : compté dans son sac s'il est ici ; prêté à une
+/// province, compté à son retour.
+fn bag_block(st: &mut State, rid: u64, server: &str, who: &str, block: u16) {
+    let who = who.to_ascii_lowercase();
+    if let Some(room) = st.rooms.get_mut(&rid) {
+        if room.bag_holders.contains_key(&who) {
+            room.bag_deltas.entry(who).or_default().push(block);
+            return;
+        }
+    }
+    st.bags.block_set(server, &who, block);
+}
+
+/// Sac revenu ici : les blocs comptés pendant son absence y entrent.
+fn settle(st: &mut State, rid: u64, who: &str) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let server = room.server.clone();
+    for block in room.bag_deltas.remove(who).unwrap_or_default() {
+        st.bags.block_set(&server, who, block);
+    }
+}
+
+/// Un bloc vient d'être publié par `by`, en survie (voir `note_block`). Vrai s'il ne doit
+/// pas être compté dans le sac tenu ici : relais du monde, sac prêté à une province (compté
+/// à son retour) ; relais de province, sac pas (ou plus) ici (compté par le relais du
+/// monde).
+pub(crate) fn bag_elsewhere(st: &mut State, rid: u64, by: &str, block: u16) -> bool {
+    let who = by.to_ascii_lowercase();
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return false;
+    };
+    match room.province.as_mut() {
+        Some(pr) => {
+            if pr.held.contains(&who) {
+                return false;
+            }
+            pr.loose.push((who, block));
+            true
+        }
+        None => {
+            if !room.bag_holders.contains_key(&who) {
+                return false;
+            }
+            room.bag_deltas.entry(who).or_default().push(block);
+            true
+        }
+    }
+}
+
+/// Réglages d'un serveur qu'un relais de province doit connaître.
+pub(crate) fn settings_of(st: &State, server: &str) -> proto::ProvinceSettings {
+    proto::ProvinceSettings {
+        default_mode: st.servers.default_gamemode(server),
+        ops: st.servers.ops(server),
+        bans: st.servers.bans(server),
+        modes: st.bags.modes_of(server),
+    }
+}
+
+/// Relais du monde : les réglages de ce serveur ont changé ; à chaque relais de province de
+/// ses mondes.
+pub(crate) fn push_settings(st: &State, server: &str) {
+    let settings = settings_of(st, server);
+    for (&rid, room) in st.rooms.iter().filter(|(_, r)| r.server == server) {
+        for r in room.provinces.values() {
+            if let Some(c) = st.conns.get(&r.host) {
+                transport::push(
+                    &c.tx,
+                    &Response::ProvinceSettings {
+                        room: rid,
+                        settings: settings.clone(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Relais du monde : WorldEdit d'un OP dont des cases sont dans des provinces servies par
+/// un relais de province. Chaque case y part signée par ce relais à la place de l'OP ;
+/// renvoie celles qui restent à publier ici.
+pub(crate) fn bulk_split(
+    st: &mut State,
+    rid: u64,
+    pseudo: &str,
+    cells: Vec<([i32; 3], u16)>,
+) -> Vec<([i32; 3], u16)> {
+    let size = size(st);
+    let Some(room) = st.rooms.get(&rid) else {
+        return cells;
+    };
+    if room.delegated.is_empty() {
+        return cells;
+    }
+    let delegated = room.delegated.clone();
+    let mut here = Vec::new();
+    let mut out: HashMap<[i32; 2], Vec<minelib_net::sovereign::Edit>> = HashMap::new();
+    for (pos, block) in cells {
+        let chunk = [pos[0].div_euclid(16), pos[2].div_euclid(16)];
+        let p = proto::province_of(proto::region_of(chunk), size);
+        if !delegated.contains(&p) {
+            here.push((pos, block));
+            continue;
+        }
+        st.root_t = (st.root_t + 1).max(super::now_ms());
+        out.entry(p)
+            .or_default()
+            .push(minelib_net::sovereign::Edit::sign(
+                &st.cert_key,
+                rid,
+                pseudo,
+                pos,
+                block,
+                false,
+                chunk,
+                st.root_t,
+                true,
+            ));
+    }
+    let Some(room) = st.rooms.get(&rid) else {
+        return here;
+    };
+    for (p, edits) in out {
+        let Some(r) = room.provinces.get(&p) else {
+            continue;
+        };
+        if let Some(c) = st.conns.get(&r.host) {
+            transport::push(
+                &c.tx,
+                &Response::ProvinceBulk {
+                    room: rid,
+                    province: p,
+                    epoch: r.epoch,
+                    pseudo: pseudo.to_string(),
+                    edits,
+                },
+            );
+        }
+    }
+    here
 }
 
 /// Relais du monde : relais de région prêts dans la province (il en choisit toujours les
@@ -644,6 +1016,25 @@ fn take_back(st: &mut State, rid: u64, p: [i32; 2], why: &str) {
         return;
     };
     refresh_delegated(room);
+    // Ses sacs de survie reviennent ici (copie de son dernier envoi) ; ceux qu'une autre
+    // province attendait lui partent.
+    let held: Vec<String> = room
+        .bag_holders
+        .iter()
+        .filter(|(_, h)| h.0 == p)
+        .map(|(w, _)| w.clone())
+        .collect();
+    room.bag_waiting.retain(|_, w| w.0 != p);
+    let mut lend_now = Vec::new();
+    for w in &held {
+        room.bag_holders.remove(w);
+    }
+    for w in &held {
+        if let Some(next) = room.bag_waiting.remove(w) {
+            room.bag_holders.insert(w.clone(), next);
+            lend_now.push(w.clone());
+        }
+    }
     let regions: Vec<[i32; 2]> = room
         .shards
         .keys()
@@ -671,6 +1062,13 @@ fn take_back(st: &mut State, rid: u64, p: [i32; 2], why: &str) {
                 transport::push(&c.tx, &Response::RoomClosed);
             }
         }
+    }
+    // (Sa dernière copie fait foi ; ce qui a été compté depuis y entre.)
+    for w in &held {
+        settle(st, rid, w);
+    }
+    for w in lend_now {
+        lend(st, rid, &w);
     }
     log::info!("monde {rid} : province {p:?} reprise par le relais du monde ({why})");
     announce(st, rid, p);
@@ -766,6 +1164,7 @@ pub(crate) fn begin(
     secret: [u8; 32],
     root: [u8; 32],
     info: proto::StandbyInfo,
+    settings: proto::ProvinceSettings,
 ) -> bool {
     let Ok(root) = VerifyingKey::from_bytes(&root) else {
         return false;
@@ -808,7 +1207,20 @@ pub(crate) fn begin(
         outbox: Vec::new(),
         next_n: 1,
         last_archive: 0,
+        held: HashSet::new(),
+        asked: HashMap::new(),
+        requests: Vec::new(),
+        spots: HashMap::new(),
+        last_spots: 0,
+        loose: Vec::new(),
     });
+    // (Réglages du serveur : OP, bannis, mode par défaut ; sacs de survie suivis, pour la
+    // copie envoyée au relais du monde.)
+    st.servers.mirror(&info.server, &settings);
+    for (who, m) in &settings.modes {
+        st.bags.set_mode(&info.server, who, m);
+    }
+    st.bags.watch(&info.server, true);
     st.rooms.insert(rid, room);
     st.province_room = Some(rid);
     log::info!(
@@ -834,6 +1246,10 @@ pub(crate) fn seed(st: &mut State, entries: Vec<([i32; 2], u64, Vec<u8>)>, go: O
     for (zone, seq, data) in entries {
         if proto::province_of(zone_region(zone), size) == prov {
             room.build.mirror_at(zone, &data, Some(seq), &[]);
+            // (Objets au sol et coffres : retrouvés à partir des états publiés.)
+            if let Some(m) = minelib_net::game::decode::<minelib_net::game::BuildMsg>(&data) {
+                room.build.items.absorb(&m);
+            }
         }
     }
     if let Some(base) = go {
@@ -872,6 +1288,7 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
         .filter(|m| !room.hidden.contains(m))
         .copied()
         .collect();
+    let server = room.server.clone();
     let Some(pr) = room.province.as_mut() else {
         return Vec::new();
     };
@@ -881,10 +1298,34 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
     }
     let (p, epoch) = (pr.province, pr.epoch);
     pr.outbox.extend(entries);
-    if !pr.outbox.is_empty()
-        && (now.saturating_sub(pr.last_archive) >= ARCHIVE_MS || pr.outbox.len() >= SEED_CHUNK)
+    // (Sacs de survie prêtés qui ont changé : leur copie part avec ce qu'elle publie.)
+    let (changed, _) = st.bags.take_changed(&server);
+    let pr = st
+        .rooms
+        .get_mut(&rid)
+        .and_then(|r| r.province.as_mut())
+        .expect("province");
+    let bags: Vec<proto::BagCopy> = changed
+        .into_iter()
+        .filter(|(who, _)| pr.held.contains(who))
+        .map(|(who, b)| (who, b.items.into_iter().collect(), b.mined))
+        .collect();
+    let due = now.saturating_sub(pr.last_archive) >= ARCHIVE_MS;
+    let spots_due = !pr.spots.is_empty() && now.saturating_sub(pr.last_spots) >= SPOT_MS;
+    // (Un sac changé part tout de suite, avec ce qui a été publié jusque-là : la copie du
+    // relais du monde reste cohérente à chaque envoi.)
+    if (!pr.outbox.is_empty() || !pr.loose.is_empty()) && due
+        || pr.outbox.len() >= SEED_CHUNK
+        || !bags.is_empty()
+        || spots_due
     {
         pr.last_archive = now;
+        let spots = if spots_due {
+            pr.last_spots = now;
+            std::mem::take(&mut pr.spots).into_iter().collect()
+        } else {
+            Vec::new()
+        };
         let n = pr.next_n;
         pr.next_n += 1;
         out.push(Request::ProvinceArchive {
@@ -893,6 +1334,9 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
             epoch,
             n,
             entries: std::mem::take(&mut pr.outbox),
+            bags,
+            spots,
+            loose: std::mem::take(&mut pr.loose),
         });
         // Ses joueurs : ce qu'ils ont reçu jusqu'ici fait partie de cet envoi.
         for m in players {
@@ -904,6 +1348,8 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
     let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) else {
         return out;
     };
+    // Sacs demandés ou rendus (après la copie : un sac rendu part après ce qu'il a changé).
+    out.append(&mut pr.requests);
     if now.saturating_sub(pr.last_ask) >= proto::PROVINCE_RENEW_MS {
         pr.last_ask = now;
         out.push(Request::ProvinceLease {
@@ -968,6 +1414,7 @@ pub(crate) fn stop_here(st: &mut State, release: bool) -> Vec<Request> {
         return Vec::new();
     };
     let entries = room.build.take_replica();
+    let server = room.server.clone();
     let Some(pr) = room.province.as_mut() else {
         return Vec::new();
     };
@@ -977,9 +1424,24 @@ pub(crate) fn stop_here(st: &mut State, release: bool) -> Vec<Request> {
     pr.stopped = true;
     let (p, epoch) = (pr.province, pr.epoch);
     pr.outbox.extend(entries);
+    // (Les sacs prêtés repartent tels qu'ils sont, avec le reste.)
+    let held: Vec<String> = pr.held.drain().collect();
+    let bags: Vec<proto::BagCopy> = held
+        .into_iter()
+        .map(|who| {
+            let b = st.bags.get(&server, &who);
+            (who, b.items.into_iter().collect(), b.mined)
+        })
+        .collect();
+    let pr = st
+        .rooms
+        .get_mut(&rid)
+        .and_then(|r| r.province.as_mut())
+        .expect("province");
     let mut out = Vec::new();
     if release {
-        if !pr.outbox.is_empty() {
+        if !pr.outbox.is_empty() || !bags.is_empty() || !pr.spots.is_empty() || !pr.loose.is_empty()
+        {
             let n = pr.next_n;
             pr.next_n += 1;
             out.push(Request::ProvinceArchive {
@@ -988,6 +1450,9 @@ pub(crate) fn stop_here(st: &mut State, release: bool) -> Vec<Request> {
                 epoch,
                 n,
                 entries: std::mem::take(&mut pr.outbox),
+                bags,
+                spots: std::mem::take(&mut pr.spots).into_iter().collect(),
+                loose: std::mem::take(&mut pr.loose),
             });
         }
         out.push(Request::ProvinceRelease {
@@ -997,7 +1462,11 @@ pub(crate) fn stop_here(st: &mut State, release: bool) -> Vec<Request> {
         });
     }
     // Joueurs et relais de région : la province est fermée ici.
-    let members: Vec<u64> = room.members.clone();
+    let members: Vec<u64> = st
+        .rooms
+        .get(&rid)
+        .map(|r| r.members.clone())
+        .unwrap_or_default();
     guards::send_pause(st, rid, true, true);
     for m in members {
         if let Some(c) = st.conns.get(&m) {
@@ -1028,6 +1497,7 @@ pub(crate) fn upkeep_here(st: &mut State) {
         return;
     }
     pr.last_beat = now;
+    bags_upkeep(st, rid);
     if changed {
         log::info!(
             "relais de province : {}",
@@ -1069,7 +1539,15 @@ pub(crate) fn to_zone(
     msg: Option<minelib_net::game::BuildMsg>,
 ) {
     use minelib_net::game::BuildMsg;
+    // (Sans bail : une demande d'objet est refusée, une modification de bloc attend.)
     if guards::frozen(st, rid) {
+        if let Some(seq) = msg
+            .as_ref()
+            .filter(|m| minelib_net::items::is_request(m))
+            .and_then(minelib_net::items::request_seq)
+        {
+            super::publish_items(st, rid, id, vec![BuildMsg::Denied { seq }]);
+        }
         return;
     }
     let region = proto::region_of(chunk);
@@ -1080,6 +1558,24 @@ pub(crate) fn to_zone(
         return;
     };
     let sovereign = room.sov.get(&region).map(|sv| sv.primary);
+    // Objets et coffres de la province (v139) : ce relais arbitre ; un joueur en survie
+    // attend son sac (prêté par le relais du monde).
+    if let Some(m) = msg.as_ref().filter(|m| minelib_net::items::is_request(m)) {
+        let mine = room
+            .build
+            .items
+            .target_chunk(m)
+            .is_some_and(|c| pr.has(proto::region_of(c)));
+        // (Hors de ses zones, ou objet qu'elle ne connaît pas : refusée, le jeu la refera
+        // auprès de qui en décide.)
+        if !mine || !bag_needed(st, rid, id, pseudo) {
+            let seq = minelib_net::items::request_seq(m).unwrap_or(0);
+            super::publish_items(st, rid, id, vec![BuildMsg::Denied { seq }]);
+            return;
+        }
+        super::item_request(st, rid, id, pseudo, m);
+        return;
+    }
     match msg {
         Some(BuildMsg::Edit { pos, block, fluid }) if sovereign.is_none() => {
             super::build_edit(st, rid, id, pseudo, chunk, pos, block, fluid);
@@ -1114,6 +1610,262 @@ pub(crate) fn to_zone(
             }
         }
         _ => {}
+    }
+}
+
+/// Relais de province (v139) : un joueur en survie se trouve dans la province ; son sac,
+/// s'il ne l'a pas déjà (ou ne l'a pas déjà demandé), est demandé au relais du monde.
+/// Vrai si ce relais a son sac (il peut arbitrer ses objets).
+pub(crate) fn bag_needed(st: &mut State, rid: u64, id: u64, pseudo: &str) -> bool {
+    let Some(room) = st.rooms.get(&rid) else {
+        return false;
+    };
+    let Some(pr) = room.province.as_ref() else {
+        return false;
+    };
+    let (server, creator) = (room.server.clone(), room.creator.clone());
+    if !super::in_survival(st, &server, &creator, pseudo) {
+        return true;
+    }
+    let who = pseudo.to_ascii_lowercase();
+    if pr.held.contains(&who) {
+        return true;
+    }
+    let inside = room
+        .build
+        .positions
+        .get(&id)
+        .is_some_and(|c| pr.has(proto::region_of(*c)));
+    let now = guards::now_ms(st);
+    let pr = st
+        .rooms
+        .get_mut(&rid)
+        .and_then(|r| r.province.as_mut())
+        .expect("province");
+    // (Demandé sans réponse depuis longtemps : redemandé.)
+    let fresh = pr
+        .asked
+        .get(&who)
+        .is_none_or(|t| now.saturating_sub(*t) >= BAG_ASK_MS);
+    if inside && !pr.stopped && fresh {
+        pr.asked.insert(who, now);
+        let (p, epoch) = (pr.province, pr.epoch);
+        pr.requests.push(Request::ProvinceBag {
+            room: rid,
+            province: p,
+            epoch,
+            pseudo: pseudo.to_string(),
+        });
+    }
+    false
+}
+
+/// Relais de province : un sac prêté par le relais du monde (lui seul s'en sert ici).
+pub(crate) fn bag_lent(
+    st: &mut State,
+    epoch: u64,
+    pseudo: &str,
+    items: Vec<(u32, u32)>,
+    mined: u32,
+    mode: Option<String>,
+) {
+    let Some(rid) = st.province_room else {
+        return;
+    };
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let server = room.server.clone();
+    let Some(pr) = room
+        .province
+        .as_mut()
+        .filter(|p| p.epoch == epoch && !p.stopped)
+    else {
+        return;
+    };
+    let who = pseudo.to_ascii_lowercase();
+    pr.asked.remove(&who);
+    // (Déjà ici : ce prêt est un doublon en retard, plus ancien que ce qu'elle en a fait.)
+    if !pr.held.insert(who) {
+        return;
+    }
+    st.bags.put(
+        &server,
+        pseudo,
+        super::bags::Bag {
+            items: items.into_iter().collect(),
+            mined,
+        },
+    );
+    if let Some(m) = mode {
+        st.bags.set_mode(&server, pseudo, &m);
+    }
+}
+
+/// Relais de province : un sac à rendre (redemandé par le relais du monde, ou son joueur
+/// n'est plus dans la province). Il n'en est plus fait usage ici.
+pub(crate) fn bag_back(st: &mut State, pseudo: &str) {
+    let Some(rid) = st.province_room else {
+        return;
+    };
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let server = room.server.clone();
+    let who = pseudo.to_ascii_lowercase();
+    let b = st.bags.get(&server, &who);
+    let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) else {
+        return;
+    };
+    pr.asked.remove(&who);
+    if pr.held.remove(&who) {
+        let (p, epoch) = (pr.province, pr.epoch);
+        pr.requests.push(Request::ProvinceBagBack {
+            room: rid,
+            province: p,
+            epoch,
+            pseudo: who,
+            items: b.items.into_iter().collect(),
+            mined: b.mined,
+        });
+    }
+}
+
+/// Relais de province (avec le battement) : les sacs dont le joueur n'est plus connecté ici,
+/// ou plus dans la province, sont rendus.
+fn bags_upkeep(st: &mut State, rid: u64) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let Some(pr) = room.province.as_ref() else {
+        return;
+    };
+    let gone: Vec<String> = pr
+        .held
+        .iter()
+        .filter(|who| {
+            room.by_pseudo.get(*who).is_none_or(|id| {
+                room.build
+                    .positions
+                    .get(id)
+                    .is_none_or(|c| !pr.has(proto::region_of(*c)))
+            })
+        })
+        .cloned()
+        .collect();
+    for who in gone {
+        bag_back(st, &who);
+    }
+    // Les joueurs en survie dans la province : leur sac est demandé avant qu'ils n'en aient
+    // besoin.
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let here: Vec<(u64, String)> = room
+        .members
+        .iter()
+        .filter(|m| !room.hidden.contains(m))
+        .filter_map(|m| Some((*m, st.conns.get(m)?.pseudo.clone()?)))
+        .collect();
+    for (id, pseudo) in here {
+        bag_needed(st, rid, id, &pseudo);
+    }
+}
+
+/// Relais de province : un joueur redit où il est (gardé pour son retour, transmis au
+/// relais du monde).
+pub(crate) fn spot(st: &mut State, rid: u64, pseudo: &str, at: [f32; 5]) {
+    if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+        pr.spots.insert(pseudo.to_ascii_lowercase(), at);
+    }
+}
+
+/// Relais de province : WorldEdit d'un OP, transmis par le relais du monde (chaque case
+/// signée par lui à la place de l'OP) : à l'hôte principal d'une région souveraine, sinon
+/// publié ici.
+pub(crate) fn bulk(
+    st: &mut State,
+    epoch: u64,
+    pseudo: &str,
+    edits: Vec<minelib_net::sovereign::Edit>,
+) {
+    let Some(rid) = st.province_room else {
+        return;
+    };
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let Some(pr) = room.province.as_ref().filter(|p| p.epoch == epoch) else {
+        return;
+    };
+    let mut sov: HashMap<[i32; 2], Vec<minelib_net::sovereign::Edit>> = HashMap::new();
+    let mut plain = Vec::new();
+    for e in edits {
+        let region = proto::region_of([e.pos[0].div_euclid(16), e.pos[2].div_euclid(16)]);
+        if !pr.has(region) || !e.by_root || !(0..256).contains(&e.pos[1]) {
+            continue;
+        }
+        if room.sov.contains_key(&region) {
+            sov.entry(region).or_default().push(e);
+        } else {
+            plain.push(e);
+        }
+    }
+    for (region, edits) in sov {
+        let primary = st
+            .rooms
+            .get(&rid)
+            .and_then(|r| r.sov.get(&region))
+            .map(|sv| sv.primary);
+        if let Some(c) = primary.and_then(|h| st.conns.get(&h)) {
+            transport::push(
+                &c.tx,
+                &Response::RootEdits {
+                    region,
+                    edits,
+                    certs: Vec::new(),
+                },
+            );
+        }
+    }
+    for e in plain {
+        if super::publish_block(st, rid, 0, false, pseudo, e.pos, e.block, false) {
+            spill_chest(st, rid, e.pos);
+        }
+    }
+}
+
+/// Relais de province : réglages du serveur changés (OP, bannis, mode par défaut). Un
+/// joueur banni est mis dehors.
+pub(crate) fn settings(st: &mut State, settings: proto::ProvinceSettings) {
+    let Some(rid) = st.province_room else {
+        return;
+    };
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let server = room.server.clone();
+    let banned: Vec<u64> = room
+        .members
+        .iter()
+        .filter(|m| !room.hidden.contains(m))
+        .filter(|m| {
+            st.conns
+                .get(m)
+                .and_then(|c| c.pseudo.as_deref())
+                .is_some_and(|p| settings.bans.iter().any(|b| b.eq_ignore_ascii_case(p)))
+        })
+        .copied()
+        .collect();
+    st.servers.mirror(&server, &settings);
+    for (who, m) in &settings.modes {
+        st.bags.set_mode(&server, who, m);
+    }
+    for id in banned {
+        leave_room(st, id);
+        if let Some(c) = st.conns.get(&id) {
+            transport::push(&c.tx, &Response::RoomClosed);
+        }
     }
 }
 

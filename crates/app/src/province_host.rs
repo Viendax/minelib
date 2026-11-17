@@ -42,6 +42,7 @@ impl ProvinceHost {
         secret: [u8; 32],
         root: [u8; 32],
         info: proto::StandbyInfo,
+        settings: proto::ProvinceSettings,
         link: &Sender<Inbound>,
         p2p: bool,
     ) -> Option<Self> {
@@ -59,7 +60,7 @@ impl ProvinceHost {
         })
         .map_err(|e| log::warn!("relais de province : {e:#}"))
         .ok()?;
-        if !handle.province_begin(room, province, size, epoch, secret, root, info) {
+        if !handle.province_begin(room, province, size, epoch, secret, root, info, settings) {
             return None;
         }
         let port = handle.addr.port();
@@ -100,8 +101,9 @@ impl ProvinceHost {
         })
     }
 
-    /// Du relais du monde : `ProvinceSeed`, `ProvinceLeased`, `ProvinceStop` (à renvoyer à
-    /// la connexion de garant : ce qu'il faut lui dire).
+    /// Du relais du monde : `ProvinceSeed`, `ProvinceLeased`, `ProvinceStop`, et (v139) les
+    /// sacs de survie, les réglages, les WorldEdit (à renvoyer à la connexion de garant : ce
+    /// qu'il faut lui dire).
     pub fn event(&mut self, r: &Response) -> Vec<Request> {
         match r {
             Response::ProvinceSeed {
@@ -140,6 +142,34 @@ impl ProvinceHost {
             } if (*room, *province, *epoch) == (self.room, self.province, self.epoch) => {
                 self.stopped = true;
                 self.handle.province_stop(true)
+            }
+            // (v139) Sacs de survie prêtés ou rappelés, WorldEdit d'un OP : pour cette
+            // province, à cette époque.
+            Response::ProvinceBagLent {
+                room,
+                province,
+                epoch,
+                ..
+            }
+            | Response::ProvinceBagRecall {
+                room,
+                province,
+                epoch,
+                ..
+            }
+            | Response::ProvinceBulk {
+                room,
+                province,
+                epoch,
+                ..
+            } if (*room, *province, *epoch) == (self.room, self.province, self.epoch) => {
+                self.handle.province_event(r);
+                Vec::new()
+            }
+            // Réglages du serveur (OP, bannis, modes).
+            Response::ProvinceSettings { room, .. } if *room == self.room => {
+                self.handle.province_event(r);
+                Vec::new()
             }
             _ => Vec::new(),
         }

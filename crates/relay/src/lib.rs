@@ -179,6 +179,7 @@ impl Handle {
         secret: [u8; 32],
         root: [u8; 32],
         info: proto::StandbyInfo,
+        settings: proto::ProvinceSettings,
     ) -> bool {
         provinces::begin(
             &mut self.state.lock().unwrap(),
@@ -189,7 +190,35 @@ impl Handle {
             secret,
             root,
             info,
+            settings,
         )
+    }
+
+    /// Relais de province (v139) : du relais du monde, un sac de survie prêté ou rappelé,
+    /// les réglages du serveur, un WorldEdit d'un OP.
+    pub fn province_event(&self, r: &Response) {
+        let mut st = self.state.lock().unwrap();
+        match r {
+            Response::ProvinceBagLent {
+                epoch,
+                pseudo,
+                items,
+                mined,
+                mode,
+                ..
+            } => provinces::bag_lent(&mut st, *epoch, pseudo, items.clone(), *mined, mode.clone()),
+            Response::ProvinceBagRecall { pseudo, .. } => provinces::bag_back(&mut st, pseudo),
+            Response::ProvinceSettings { settings, .. } => {
+                provinces::settings(&mut st, settings.clone())
+            }
+            Response::ProvinceBulk {
+                epoch,
+                pseudo,
+                edits,
+                ..
+            } => provinces::bulk(&mut st, *epoch, pseudo, edits.clone()),
+            _ => {}
+        }
     }
 
     /// Relais de province : historique reçu (et, à la fin, sa plage de rangs : il sert dès
@@ -206,6 +235,57 @@ impl Handle {
     /// Relais de province : le relais du monde a gardé l'envoi `n`.
     pub fn province_archived(&self, epoch: u64, n: u64) {
         provinces::archived(&mut self.state.lock().unwrap(), epoch, n);
+    }
+
+    /// Objets du monde `room` tels que les garde ce relais : au sol et dans les coffres
+    /// (nombre total ; essais).
+    pub fn world_items(&self, room: u64) -> u64 {
+        let st = self.state.lock().unwrap();
+        let Some(r) = st.rooms.get(&room) else {
+            return 0;
+        };
+        let ground: u64 = r
+            .build
+            .items
+            .live_drops()
+            .map(|(_, d)| d.pile.count as u64)
+            .sum();
+        let chests: u64 = r
+            .build
+            .items
+            .chests
+            .values()
+            .flat_map(|c| c.iter().flatten())
+            .map(|p| p.count as u64)
+            .sum();
+        ground + chests
+    }
+
+    /// Sac de survie de `pseudo` dans le monde `room` tel que le compte ce relais : objets
+    /// et crédits de minage, avec les blocs cassés comptés pendant qu'il est prêté à une
+    /// province (essais).
+    pub fn bag_total(&self, room: u64, pseudo: &str) -> u64 {
+        let st = self.state.lock().unwrap();
+        let Some(r) = st.rooms.get(&room) else {
+            return 0;
+        };
+        let b = st.bags.get(&r.server, pseudo);
+        let later = r
+            .bag_deltas
+            .get(&pseudo.to_ascii_lowercase())
+            .map_or(0, |d| d.iter().filter(|b| **b == 0).count() as u64);
+        b.items.values().map(|n| *n as u64).sum::<u64>() + b.mined as u64 + later
+    }
+
+    /// Sacs de survie prêtés à des provinces depuis le début (essais).
+    pub fn province_lends(&self) -> usize {
+        self.state.lock().unwrap().province_lends
+    }
+
+    /// Sacs de survie prêtés à une province en ce moment (essais).
+    pub fn bags_lent(&self, room: u64) -> usize {
+        let st = self.state.lock().unwrap();
+        st.rooms.get(&room).map_or(0, |r| r.bag_holders.len())
     }
 
     /// Relais du monde : envois de relais de province gardés ici (essais).
@@ -954,6 +1034,12 @@ struct Room {
     provinces_sent: HashMap<u64, u64>,
     /// Les mêmes, prêtes (rangées à part : on les teste à chaque position de joueur).
     delegated: Arc<HashSet<[i32; 2]>>,
+    /// Sacs de survie (v139), relais du monde : prêtés à une province (pseudo en minuscules
+    /// → province, époque), et ceux qu'une autre province attend (rendus d'abord).
+    bag_holders: HashMap<String, ([i32; 2], u64)>,
+    bag_waiting: HashMap<String, ([i32; 2], u64)>,
+    /// Blocs changés par des joueurs en survie dont le sac est prêté : comptés à son retour.
+    bag_deltas: HashMap<String, Vec<u16>>,
     /// Relais de province : cette salle sert une province du monde de même numéro d'un
     /// autre relais (le relais du monde).
     province: Option<provinces::ProvinceRoom>,
@@ -1085,6 +1171,8 @@ struct State {
     province_room: Option<u64>,
     /// Envois de relais de province gardés ici (essais).
     province_archived: usize,
+    /// Sacs de survie prêtés à des provinces (essais).
+    province_lends: usize,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -1162,6 +1250,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         province_from: province_from.clone(),
         province_room: None,
         province_archived: 0,
+        province_lends: 0,
     }));
     let state_for_handle = state.clone();
     let state_for_guards = state.clone();
@@ -2066,19 +2155,9 @@ fn bulk_edit(
     if cells.len() > BULK_MAX {
         return "Trop de blocs d'un coup.".into();
     }
-    // (Provinces, v138 : une province servie par un relais de province décide de ses
-    // blocs ; WorldEdit n'y passe pas encore.)
-    if cells.iter().any(|(pos, _)| {
-        provinces::delegated(
-            st,
-            rid,
-            proto::region_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]),
-        )
-    }) {
-        return "Cette partie du monde est servie par un relais de province : WorldEdit n'y \
-                passe pas encore."
-            .into();
-    }
+    // (Provinces, v139 : les cases d'une province servie par un relais de province lui
+    // partent, signées ici à la place de l'OP ; elle les publie.)
+    let cells = provinces::bulk_split(st, rid, pseudo, cells);
     let mut touched = Vec::new();
     for (pos, block) in cells {
         if !(0..256).contains(&pos[1]) {
@@ -2376,6 +2455,88 @@ fn build_edit(
         note_block(st, rid, pseudo, block);
     }
     spill_chest(st, rid, pos);
+}
+
+/// Demande d'objet d'un joueur (lâcher, ramasser, ranger, prendre) : ce relais arbitre
+/// (une demande après l'autre), publie le résultat aux joueurs proches, ou refuse au seul
+/// demandeur. (Relais du monde, ou relais de province pour les objets de sa province.)
+fn item_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &game::BuildMsg) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    // Seulement près de soi (2 chunks) : on ne lâche, ne ramasse ni ne fouille
+    // à l'autre bout du monde ; et pas plus de 40 demandes par seconde.
+    let near = match (
+        room.build.positions.get(&id),
+        room.build.items.target_chunk(m),
+    ) {
+        (Some(h), Some(t)) => (h[0] - t[0]).abs() <= 2 && (h[1] - t[1]).abs() <= 2,
+        (_, None) => true,
+        (None, _) => false,
+    };
+    let calm = st.conns.get_mut(&id).is_some_and(|c| {
+        if c.item_rate.0.elapsed() >= Duration::from_secs(1) {
+            c.item_rate = (Instant::now(), 0);
+        }
+        c.item_rate.1 += 1;
+        c.item_rate.1 <= ITEM_RATE
+    });
+    // En survie, le relais tient l'inventaire : ce que la demande sort du sac
+    // (lâcher, ranger) doit y être ; ce qu'elle rapporte y entre.
+    let (server, creator) = (room.server.clone(), room.creator.clone());
+    let items = &room.build.items;
+    let fresh = !items.is_duplicate(m, pseudo);
+    let (spend, gain) = match *m {
+        game::BuildMsg::DropItem { pile, .. } | game::BuildMsg::ChestPut { pile, .. } => {
+            (Some(pile), None)
+        }
+        game::BuildMsg::TakeItem { id: item, .. } => (
+            None,
+            items
+                .live_drops()
+                .find(|(i, _)| *i == item)
+                .map(|(_, d)| d.pile),
+        ),
+        game::BuildMsg::ChestTake {
+            pos, slot, count, ..
+        } => (
+            None,
+            items
+                .chest(pos)
+                .get(slot as usize)
+                .copied()
+                .flatten()
+                .map(|p| minelib_net::items::Pile {
+                    item: p.item,
+                    count: p.count.min(count),
+                }),
+        ),
+        _ => (None, None),
+    };
+    let survival = fresh && in_survival(st, &server, &creator, pseudo);
+    let broke = survival
+        && spend.is_some_and(|p| !st.bags.can_spend(&server, pseudo, p.item, p.count as u32));
+    let room = st.rooms.get_mut(&rid).expect("partie");
+    let out = if !near || !calm || broke {
+        let seq = minelib_net::items::request_seq(m).unwrap_or(0);
+        vec![game::BuildMsg::Denied { seq }]
+    } else {
+        match room.build.items.apply(m, pseudo) {
+            Ok(v) => {
+                if survival && !v.is_empty() {
+                    if let Some(p) = spend {
+                        st.bags.spend(&server, pseudo, p.item, p.count as u32);
+                    }
+                    if let Some(p) = gain {
+                        st.bags.gain(&server, pseudo, p.item, p.count as u32);
+                    }
+                }
+                v
+            }
+            Err(seq) => vec![game::BuildMsg::Denied { seq }],
+        }
+    };
+    publish_items(st, rid, id, out);
 }
 
 /// Publie des états d'objets (voir `minelib_net::items`) : gardés dans l'historique de
@@ -2803,7 +2964,8 @@ fn note_block(st: &mut State, rid: u64, by: &str, block: u16) {
     else {
         return;
     };
-    if in_survival(st, &server, &creator, by) {
+    // (Provinces, v139 : le sac n'est compté que là où il est.)
+    if in_survival(st, &server, &creator, by) && !provinces::bag_elsewhere(st, rid, by, block) {
         st.bags.block_set(&server, by, block);
     }
 }
@@ -4585,6 +4747,9 @@ fn open_room(
             provinces: HashMap::new(),
             provinces_sent: HashMap::new(),
             delegated: Arc::default(),
+            bag_holders: HashMap::new(),
+            bag_waiting: HashMap::new(),
+            bag_deltas: HashMap::new(),
             province: None,
         },
     );
@@ -5491,6 +5656,17 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 .act(&server, &creator, pseudo, act, &target, &reason)
             {
                 Ok(text) => {
+                    // Provinces (v139) : leurs relais appliquent les mêmes réglages.
+                    if matches!(
+                        act,
+                        servers::Action::Ban
+                            | servers::Action::Unban
+                            | servers::Action::Op
+                            | servers::Action::Deop
+                            | servers::Action::DefaultGamemode
+                    ) {
+                        provinces::push_settings(st, &server);
+                    }
                     // Heure changée : à tous les joueurs du serveur.
                     if matches!(act, servers::Action::TimeSet | servers::Action::TimeFix) {
                         let (hours, fixed) = st.servers.time(&server);
@@ -5514,6 +5690,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         // Le relais s'en souvient : c'est ce mode qui décide si son
                         // inventaire est tenu ici.
                         st.bags.set_mode(&server, who, &reason);
+                        provinces::push_settings(st, &server);
                         let to = st.conns.values().find(|c| {
                             c.room == Some(rid)
                                 && c.pseudo
@@ -5849,81 +6026,20 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // Objets au sol et coffres : ce relais arbitre (une demande après l'autre),
             // publie le résultat aux joueurs proches, ou refuse au seul demandeur.
             if let Some(m) = msg.as_ref().filter(|m| minelib_net::items::is_request(m)) {
-                // Seulement près de soi (2 chunks) : on ne lâche, ne ramasse ni ne fouille
-                // à l'autre bout du monde ; et pas plus de 40 demandes par seconde.
-                let near = match (
-                    room.build.positions.get(&id),
-                    room.build.items.target_chunk(m),
-                ) {
-                    (Some(h), Some(t)) => (h[0] - t[0]).abs() <= 2 && (h[1] - t[1]).abs() <= 2,
-                    (_, None) => true,
-                    (None, _) => false,
-                };
-                let calm = st.conns.get_mut(&id).is_some_and(|c| {
-                    if c.item_rate.0.elapsed() >= Duration::from_secs(1) {
-                        c.item_rate = (Instant::now(), 0);
-                    }
-                    c.item_rate.1 += 1;
-                    c.item_rate.1 <= ITEM_RATE
-                });
-                // En survie, le relais tient l'inventaire : ce que la demande sort du sac
-                // (lâcher, ranger) doit y être ; ce qu'elle rapporte y entre.
-                let room = st.rooms.get(&rid).expect("partie");
-                let (server, creator) = (room.server.clone(), room.creator.clone());
-                let items = &room.build.items;
-                let fresh = !items.is_duplicate(m, pseudo);
-                let (spend, gain) = match *m {
-                    game::BuildMsg::DropItem { pile, .. }
-                    | game::BuildMsg::ChestPut { pile, .. } => (Some(pile), None),
-                    game::BuildMsg::TakeItem { id: item, .. } => (
-                        None,
-                        items
-                            .live_drops()
-                            .find(|(i, _)| *i == item)
-                            .map(|(_, d)| d.pile),
-                    ),
-                    game::BuildMsg::ChestTake {
-                        pos, slot, count, ..
-                    } => (
-                        None,
-                        items
-                            .chest(pos)
-                            .get(slot as usize)
-                            .copied()
-                            .flatten()
-                            .map(|p| minelib_net::items::Pile {
-                                item: p.item,
-                                count: p.count.min(count),
-                            }),
-                    ),
-                    _ => (None, None),
-                };
-                let survival = fresh && in_survival(st, &server, &creator, pseudo);
-                let broke = survival
-                    && spend.is_some_and(|p| {
-                        !st.bags.can_spend(&server, pseudo, p.item, p.count as u32)
-                    });
-                let room = st.rooms.get_mut(&rid).expect("partie");
-                let out = if !near || !calm || broke {
+                // (Province servie par un relais de province, v139 : c'est lui qui arbitre ;
+                // le jeu y envoie la demande.)
+                // Refusée ici (le jeu la renvoie à qui en décide quand il l'apprend) ; de
+                // même pour un joueur dont le sac de survie est prêté à une province : il
+                // lui est redemandé.
+                let target = room.build.items.target_chunk(m);
+                if target.is_some_and(|c| provinces::delegated(st, rid, proto::region_of(c)))
+                    || provinces::bag_away(st, rid, pseudo)
+                {
                     let seq = minelib_net::items::request_seq(m).unwrap_or(0);
-                    vec![game::BuildMsg::Denied { seq }]
-                } else {
-                    match room.build.items.apply(m, pseudo) {
-                        Ok(v) => {
-                            if survival && !v.is_empty() {
-                                if let Some(p) = spend {
-                                    st.bags.spend(&server, pseudo, p.item, p.count as u32);
-                                }
-                                if let Some(p) = gain {
-                                    st.bags.gain(&server, pseudo, p.item, p.count as u32);
-                                }
-                            }
-                            v
-                        }
-                        Err(seq) => vec![game::BuildMsg::Denied { seq }],
-                    }
-                };
-                publish_items(st, rid, id, out);
+                    publish_items(st, rid, id, vec![game::BuildMsg::Denied { seq }]);
+                    return None;
+                }
+                item_request(st, rid, id, pseudo, m);
                 return None;
             }
             // Le propriétaire remet les objets de sa sauvegarde (à l'ouverture du monde).
@@ -5979,9 +6095,38 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             epoch,
             n,
             entries,
+            bags,
+            spots,
+            loose,
         } => {
             if my_room == Some(room) {
-                provinces::archive(st, room, id, province, epoch, n, entries);
+                provinces::archive(
+                    st, room, id, province, epoch, n, entries, bags, spots, loose,
+                );
+            }
+            return None;
+        }
+        Request::ProvinceBag {
+            room,
+            province,
+            epoch,
+            pseudo: who,
+        } => {
+            if my_room == Some(room) {
+                provinces::bag_asked(st, room, id, province, epoch, &who);
+            }
+            return None;
+        }
+        Request::ProvinceBagBack {
+            room,
+            province,
+            epoch,
+            pseudo: who,
+            items,
+            mined,
+        } => {
+            if my_room == Some(room) {
+                provinces::bag_returned(st, room, id, province, epoch, &who, items, mined);
             }
             return None;
         }
@@ -6227,12 +6372,16 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         // Position d'un joueur servi par un relais de région (ses positions ne passent plus
         // par ici), gardée pour son retour.
         Request::Spot { pos, yaw, pitch } => {
-            let server = my_room
-                .and_then(|r| st.rooms.get(&r))
+            let rid = my_room?;
+            let server = st
+                .rooms
+                .get(&rid)
                 .filter(|r| r.kind == 1)
                 .map(|r| r.server.clone())?;
-            st.servers
-                .set_position(&server, pseudo, [pos[0], pos[1], pos[2], yaw, pitch]);
+            let at = [pos[0], pos[1], pos[2], yaw, pitch];
+            st.servers.set_position(&server, pseudo, at);
+            // (Relais de province, v139 : transmise au relais du monde.)
+            provinces::spot(st, rid, pseudo, at);
             return None;
         }
         Request::Nearby { chunk, data } => {
@@ -6241,13 +6390,16 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 pos, yaw, pitch, ..
             }) = game::decode::<game::BuildMsg>(&data)
             {
-                if let Some(server) = my_room
-                    .and_then(|r| st.rooms.get(&r))
-                    .filter(|r| r.kind == 1)
-                    .map(|r| r.server.clone())
-                {
-                    st.servers
-                        .set_position(&server, pseudo, [pos[0], pos[1], pos[2], yaw, pitch]);
+                if let Some((rid, server)) = my_room.and_then(|rid| {
+                    st.rooms
+                        .get(&rid)
+                        .filter(|r| r.kind == 1)
+                        .map(|r| (rid, r.server.clone()))
+                }) {
+                    let at = [pos[0], pos[1], pos[2], yaw, pitch];
+                    st.servers.set_position(&server, pseudo, at);
+                    // (Relais de province, v139 : transmise au relais du monde.)
+                    provinces::spot(st, rid, pseudo, at);
                 }
             }
             // Le pseudo montré est celui de la session (pas celui que le joueur annonce) ;
@@ -6679,6 +6831,8 @@ fn handle(
             | Request::ProvinceArchive { .. }
             | Request::ProvinceShards { .. }
             | Request::ProvinceRelease { .. }
+            | Request::ProvinceBag { .. }
+            | Request::ProvinceBagBack { .. }
     );
     // Témoin entré chez ce relais de secours : sa liste et son vote.
     if let Request::WitnessBeat { committee, vote } = &req {
@@ -10988,6 +11142,9 @@ mod tests {
                                 epoch,
                                 n: next_n,
                                 entries,
+                                bags: Vec::new(),
+                                spots: Vec::new(),
+                                loose: Vec::new(),
                             },
                         ));
                         next_n += 1;

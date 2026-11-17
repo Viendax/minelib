@@ -807,7 +807,11 @@ impl Worker {
             | Response::ProvinceArchived { .. }
             | Response::ProvinceMark { .. }
             | Response::ProvinceConfirmed { .. }
-            | Response::ProvinceStop { .. }) => Event::Province(r),
+            | Response::ProvinceStop { .. }
+            | Response::ProvinceSettings { .. }
+            | Response::ProvinceBagLent { .. }
+            | Response::ProvinceBagRecall { .. }
+            | Response::ProvinceBulk { .. }) => Event::Province(r),
             Response::Provinces { list } => Event::Provinces(list),
             Response::ShardPeers { region, list, sov } => Event::ShardPeers { region, list, sov },
             Response::RootEdits {
