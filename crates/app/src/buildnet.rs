@@ -102,6 +102,22 @@ pub struct Other {
     seen: f32,
 }
 
+/// Le bloc qui fait foi en `pos` vient de changer (`truth` : publié par le garant, ou
+/// revenu après un refus) alors que le joueur a déjà rechangé cette case sans que ce soit
+/// encore envoyé : ces modifications partent désormais de `truth` (c'est lui qui reviendra
+/// si elles sont refusées), et restent à l'écran. Vrai s'il y en avait.
+fn rebase_journal(world: &mut World, pos: [i32; 3], truth: BlockId) -> bool {
+    let Some(journal) = world.journal.as_mut() else {
+        return false;
+    };
+    let mut found = false;
+    for e in journal.iter_mut().filter(|e| e.0 == pos) {
+        e.2 = truth;
+        found = true;
+    }
+    found
+}
+
 /// Modification du joueur en attente de la confirmation du garant : bloc d'avant,
 /// modifications de cette case pas encore confirmées, âge.
 struct Pending {
@@ -566,7 +582,7 @@ impl BuildNet {
                     data: game::encode(&set),
                 });
                 // Sa propre modification (le garant ne reçoit pas ce qu'il publie) : confirmée.
-                self.confirm(pos);
+                self.confirm(pos, BlockId(block));
                 world.set_remote(pos[0], pos[1], pos[2], BlockId(block))
             }
             BuildMsg::Set { pos, block, by } => {
@@ -579,7 +595,12 @@ impl BuildNet {
                 }
                 log::debug!("construction : bloc {block} en {pos:?} (par {by})");
                 // Ce que dit le garant fait foi (et confirme une modification en attente).
-                self.confirm(pos);
+                self.confirm(pos, BlockId(block));
+                // Le joueur a déjà rechangé cette case (pas encore envoyé) : sa nouvelle
+                // modification reste à l'écran, et part de ce bloc-ci.
+                if rebase_journal(world, pos, BlockId(block)) {
+                    return Vec::new();
+                }
                 world.set_remote(pos[0], pos[1], pos[2], BlockId(block))
             }
             // Objets au sol et coffres : états publiés par le relais du monde (jamais par un
@@ -598,6 +619,8 @@ impl BuildNet {
             BuildMsg::Reject { pos, .. } => {
                 // Refusé : le bloc d'avant revient.
                 match self.pending.remove(&pos) {
+                    // (Sauf s'il a déjà rechangé la case : voir `rebase_journal`.)
+                    Some(p) if rebase_journal(world, pos, p.old) => Vec::new(),
                     Some(p) => world.set_remote(pos[0], pos[1], pos[2], p.old),
                     None => Vec::new(),
                 }
@@ -661,8 +684,13 @@ impl BuildNet {
     }
 
     /// Une modification de cette case est confirmée.
-    fn confirm(&mut self, pos: [i32; 3]) {
+    /// Le garant vient de publier `block` en `pos` : c'est désormais le bloc qui revient
+    /// si une modification encore en attente à cet endroit est refusée (et non celui
+    /// d'avant la première : deux modifications de suite dont la seconde est refusée, ou
+    /// celle d'un autre joueur passée entre-temps, laissaient un monde différent).
+    fn confirm(&mut self, pos: [i32; 3], block: BlockId) {
         if let Some(p) = self.pending.get_mut(&pos) {
+            p.old = block;
             p.count = p.count.saturating_sub(1);
             if p.count == 0 {
                 self.pending.remove(&pos);
@@ -1154,6 +1182,63 @@ mod tests {
             .fold(0.0, f32::max);
         assert!(jumps < 0.5, "bond de {jumps}");
         assert!(shown[119] > 15.0, "il avance : {}", shown[119]);
+    }
+
+    #[test]
+    fn a_refused_edit_gives_back_what_the_garant_last_published() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut b = BuildNet::new(tx, "Moi".into(), false);
+        let mut w = World::new(0);
+        w.ensure_chunk(minelib_world::ChunkPos::containing(1, 1));
+        w.journal = Some(Vec::new());
+        let pos = [1, 100, 1];
+        let before = w.get(1, 100, 1);
+        let step = |b: &mut BuildNet, w: &mut World| {
+            let _ = b.update(w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, 0.05);
+        };
+        let from_garant = |b: &mut BuildNet, w: &mut World, m: BuildMsg| {
+            b.receive(9, [0, 0], &game::encode(&m), w);
+        };
+        let set = |block: u16| BuildMsg::Set {
+            pos,
+            block,
+            by: String::new(),
+        };
+        // Deux modifications de suite au même endroit ; le garant accepte la première et
+        // refuse la seconde (trop vite) : c'est la première qui reste, pas le bloc d'avant.
+        w.set(1, 100, 1, BlockId(1));
+        step(&mut b, &mut w);
+        w.set(1, 100, 1, BlockId(2));
+        step(&mut b, &mut w);
+        assert_eq!(b.pending(), 1);
+        from_garant(&mut b, &mut w, set(1));
+        from_garant(&mut b, &mut w, BuildMsg::Reject { pos, peer: 0 });
+        assert_eq!(w.get(1, 100, 1), BlockId(1));
+        assert_eq!(b.pending(), 0);
+        // Ma modification attend ; celle d'un autre passe avant, puis la mienne est
+        // refusée : je vois celle de l'autre.
+        w.set(1, 100, 1, BlockId(3));
+        step(&mut b, &mut w);
+        from_garant(&mut b, &mut w, set(5));
+        from_garant(&mut b, &mut w, BuildMsg::Reject { pos, peer: 0 });
+        assert_eq!(w.get(1, 100, 1), BlockId(5));
+        // Refus reçu alors que j'ai déjà rechangé la case (pas encore envoyé) : ma
+        // nouvelle modification reste, et si elle est refusée aussi, c'est le bloc qui
+        // fait foi qui revient, pas celui de ma première tentative.
+        w.set(1, 100, 1, BlockId(6));
+        step(&mut b, &mut w);
+        w.set(1, 100, 1, BlockId(7));
+        from_garant(&mut b, &mut w, BuildMsg::Reject { pos, peer: 0 });
+        assert_eq!(w.get(1, 100, 1), BlockId(7));
+        step(&mut b, &mut w);
+        from_garant(&mut b, &mut w, BuildMsg::Reject { pos, peer: 0 });
+        assert_eq!(w.get(1, 100, 1), BlockId(5));
+        // Refusée sans rien d'autre entre-temps : le bloc d'avant revient.
+        w.set(1, 100, 1, BlockId(4));
+        step(&mut b, &mut w);
+        from_garant(&mut b, &mut w, BuildMsg::Reject { pos, peer: 0 });
+        assert_eq!(w.get(1, 100, 1), BlockId(5));
+        assert_ne!(before, BlockId(5));
     }
 
     fn rand_u32() -> u32 {

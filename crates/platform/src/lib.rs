@@ -27,6 +27,15 @@ pub struct Input {
     /// Moment de l'appui de chaque touche tenue (journal des touches rattrapées).
     pressed_at: std::collections::HashMap<KeyCode, Instant>,
     pressed: HashSet<KeyCode>,
+    /// Touches physiquement enfoncées d'après le clavier lui-même (saisie brute), qui
+    /// arrive même quand un logiciel (macro, superposition, pilote) intercepte ou avale
+    /// les messages de Windows.
+    raw_down: HashSet<KeyCode>,
+    /// Touches relâchées d'après le clavier, à comparer à ce qu'en dit Windows.
+    raw_released: Vec<(KeyCode, Instant)>,
+    /// Touches déjà signalées au journal (une fois chacune).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    raw_warned: HashSet<KeyCode>,
     mouse_held: [bool; 3],
     mouse_pressed: [bool; 3],
     /// Déplacement souris brut accumulé depuis l'image précédente (seulement si capturée).
@@ -206,6 +215,8 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
             WindowEvent::Resized(size) => self.game.on_resize(size.width, size.height),
             WindowEvent::Focused(false) => {
                 self.input.held.clear();
+                self.input.raw_down.clear();
+                self.input.raw_released.clear();
                 self.input.mouse_held = [false; 3];
                 self.set_grab(false);
             }
@@ -237,7 +248,15 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                         // Les répétitions automatiques (touche gardée longtemps) ne
                         // remettent pas une touche que le système dit relâchée : en
                         // retard dans la file, elles faisaient continuer d'avancer.
-                        if !event.repeat {
+                        // Exception : Windows croit la touche encore enfoncée depuis la
+                        // fois d'avant (son relâchement a été avalé par un logiciel), donc
+                        // ce nouvel appui lui paraît une répétition ; le clavier, lui, dit
+                        // qu'elle vient d'être enfoncée : c'est un vrai appui.
+                        let fresh = !event.repeat
+                            || (self.input.raw_down.contains(&code)
+                                && !self.input.held.contains(&code));
+                        if fresh {
+                            self.input.pressed.insert(code);
                             self.input.held.insert(code);
                             self.input.pressed_at.insert(code, Instant::now());
                         }
@@ -321,11 +340,33 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if let DeviceEvent::MouseMotion { delta } = event {
-            if self.input.grabbed {
-                self.input.mouse_delta.0 += delta.0;
-                self.input.mouse_delta.1 += delta.1;
+        match event {
+            DeviceEvent::MouseMotion { delta } => {
+                if self.input.grabbed {
+                    self.input.mouse_delta.0 += delta.0;
+                    self.input.mouse_delta.1 += delta.1;
+                }
             }
+            // Le clavier lui-même : son relâchement fait foi, même si le message de
+            // Windows n'arrive jamais (touche qui « reste enfoncée » et fait continuer
+            // d'avancer).
+            DeviceEvent::Key(raw) => {
+                let PhysicalKey::Code(code) = raw.physical_key else {
+                    return;
+                };
+                match raw.state {
+                    ElementState::Pressed => {
+                        self.input.raw_down.insert(code);
+                    }
+                    ElementState::Released => {
+                        self.input.raw_down.remove(&code);
+                        if self.input.held.remove(&code) {
+                            self.input.raw_released.push((code, Instant::now()));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -660,6 +701,32 @@ fn release_stale_keys(input: &mut Input) {
         GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX,
     };
     use winit::platform::scancode::PhysicalKeyExtScancode;
+    let down = |code: KeyCode| {
+        let Some(sc) = PhysicalKey::Code(code).to_scancode() else {
+            return false;
+        };
+        // SAFETY : simples lectures de l'état du clavier.
+        let vk = unsafe { MapVirtualKeyW(sc, MAPVK_VSC_TO_VK_EX) };
+        vk != 0 && unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0
+    };
+    // Touche relâchée d'après le clavier il y a plus d'un dixième de seconde, et que
+    // Windows voit toujours enfoncée : un logiciel a avalé son relâchement. Le jeu l'a
+    // déjà relâchée ; on le note une fois (c'est la cause du « ça continue d'avancer »).
+    let mut waiting = std::mem::take(&mut input.raw_released);
+    waiting.retain(|&(code, at)| {
+        if at.elapsed().as_secs_f32() < 0.1 {
+            return true;
+        }
+        if down(code) && !input.raw_down.contains(&code) && input.raw_warned.insert(code) {
+            log::warn!(
+                "touche {code:?} : le clavier l'a relâchée mais Windows la voit encore \
+                 enfoncée (un logiciel intercepte le clavier : macro, superposition, \
+                 pilote) ; le jeu suit le clavier"
+            );
+        }
+        false
+    });
+    input.raw_released = waiting;
     let stale: Vec<KeyCode> = input
         .held
         .iter()
