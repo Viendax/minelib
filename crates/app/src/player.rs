@@ -106,6 +106,9 @@ const GROUND_BRAKE: f32 = 30.0;
 const AIR_BRAKE: f32 = 9.0;
 const FLY: f32 = 12.0;
 const FLY_SPRINT: f32 = 30.0;
+/// Journal des arrêts : à pied, seul ce qui dépasse cette hauteur au-dessus des pieds est
+/// compté comme un mur devant le joueur (le reste se monte ou se saute).
+const WALL_FROM: f32 = 1.5;
 /// Tolérance de contact (erreurs d'arrondi) : en deçà, deux faces se touchent sans se
 /// recouvrir.
 const TOUCH: f32 = 1e-4;
@@ -797,6 +800,67 @@ impl Player {
     /// Y a-t-il un appui sous les pieds (à moins de 0,6 bloc) ?
     fn supported(&mut self, world: &World) -> bool {
         self.support_within(world, 0.6)
+    }
+
+    /// Obstacle droit devant (là où le joueur regarde, à l'horizontale), à moins de
+    /// `look` blocs : sa distance. Pour le journal des arrêts.
+    pub fn obstacle_ahead(&self, world: &World, look: f32) -> Option<f32> {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (axis, positive) = if sy.abs() > cy.abs() {
+            (0, sy > 0.0)
+        } else {
+            (2, cy < 0.0)
+        };
+        let from = if self.flying { 0.0 } else { WALL_FROM };
+        let d = self.free_ahead(world, axis, positive, look, from);
+        (d < look).then_some(d)
+    }
+
+    /// Distance libre devant le joueur sur un axe (dans le sens positif ou non), jusqu'à
+    /// `look` blocs : jusqu'au premier bloc solide que sa boîte rencontrerait. La boîte
+    /// est prise à partir de `from` au-dessus des pieds.
+    fn free_ahead(&self, world: &World, axis: usize, positive: bool, look: f32, from: f32) -> f32 {
+        let (mut min, max) = self.bounds();
+        min.y += from;
+        let face = if positive { max[axis] } else { min[axis] };
+        // Volume balayé par la face avant.
+        let (mut smin, mut smax) = (min, max);
+        if positive {
+            smin[axis] = face;
+            smax[axis] = face + look;
+        } else {
+            smax[axis] = face;
+            smin[axis] = face - look;
+        }
+        let mut lo = (smin - Vec3::splat(TOUCH)).floor().as_ivec3();
+        let hi = (smax - Vec3::splat(TOUCH)).floor().as_ivec3();
+        // Une case plus bas : certaines formes dépassent leur case (clôture : 1,5 bloc).
+        lo.y -= 1;
+        let mut free = look;
+        for y in lo.y..=hi.y {
+            for z in lo.z..=hi.z {
+                for x in lo.x..=hi.x {
+                    for (bmin, bmax) in collision_boxes(world, x, y, z) {
+                        let side = (0..3).all(|k| {
+                            k == axis || (min[k] < bmax[k] - TOUCH && max[k] > bmin[k] + TOUCH)
+                        });
+                        if !side {
+                            continue;
+                        }
+                        let d = if positive {
+                            bmin[axis] - face
+                        } else {
+                            face - bmax[axis]
+                        };
+                        // (Un bloc déjà dépassé, ou dans lequel on est, n'est pas devant.)
+                        if d >= -TOUCH && d < free {
+                            free = d.max(0.0);
+                        }
+                    }
+                }
+            }
+        }
+        free
     }
 
     /// Sol à moins de `d` sous les pieds.
@@ -1905,6 +1969,37 @@ mod stop_tests {
                 "vol {flying}, saut {jump} : glisse {slid} blocs, arrêt {stopped:?}"
             );
         }
+    }
+
+    /// Journal des arrêts : la distance au mur devant le joueur (en vol, tout obstacle ;
+    /// à pied, seulement ce qu'on ne peut pas sauter).
+    #[test]
+    fn the_stop_log_knows_how_far_the_wall_ahead_is() {
+        use minelib_world::BlockId;
+        let mut w = World::new(0);
+        w.insert_empty(minelib_world::ChunkPos { x: 0, z: 0 });
+        for z in 0..16 {
+            for x in 0..16 {
+                w.set(x, 10, z, BlockId::STONE);
+            }
+        }
+        // Mur de trois blocs en z = 2 (face en z = 3), bloc isolé d'un de haut en z = 6.
+        for y in 11..14 {
+            w.set(8, y, 2, BlockId::STONE);
+        }
+        w.set(8, 11, 6, BlockId::STONE);
+        // (Le joueur regarde vers −Z.)
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 9.5));
+        p.pitch = 0.0;
+        let d = p.obstacle_ahead(&w, 8.0).expect("mur devant");
+        assert!((d - (9.5 - HALF_WIDTH - 3.0)).abs() < 1e-3, "à pied : {d}");
+        p.flying = true;
+        let d = p.obstacle_ahead(&w, 8.0).expect("bloc devant");
+        assert!((d - (9.5 - HALF_WIDTH - 7.0)).abs() < 1e-3, "en vol : {d}");
+        assert!(
+            p.obstacle_ahead(&w, 1.0).is_none(),
+            "rien à moins d'un bloc"
+        );
     }
 
     #[test]

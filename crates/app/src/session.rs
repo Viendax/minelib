@@ -66,6 +66,22 @@ struct SimState {
     shown_crouch: f32,
 }
 
+/// Arrêt en cours de mesure (journal) : où et à quelle vitesse était le joueur quand la
+/// première touche de la course a été lâchée, depuis combien de temps, longueur de la
+/// course, et quelle touche.
+#[derive(Clone, Copy)]
+struct StopMeas {
+    at: Vec3,
+    /// Sens de la course (à l'horizontale).
+    dir: Vec3,
+    speed: f32,
+    t: f32,
+    run: f32,
+    first: &'static str,
+    /// « Avancer » a-t-elle été vue relâchée depuis le début de la mesure ?
+    fwd_up: bool,
+}
+
 pub struct Session {
     /// Essais : temps avant la prochaine fumigène de MINELIB_SMOKE.
     test_smoke_timer: f32,
@@ -185,6 +201,11 @@ pub struct Session {
     /// Touche « avancer » qui remonte mal : règle apprise pour ce joueur.
     stick: crate::stick::Guard,
     fwd_was: bool,
+    run_was: bool,
+    /// Mesure des arrêts, pour le journal : d'où la course est partie, et l'arrêt en
+    /// cours de mesure (depuis la première des deux touches lâchée).
+    run_from: Option<Vec3>,
+    stop_meas: Option<StopMeas>,
     coast_air: f32,
     /// Ligne de l'écran de débogage : touches tenues et déplacement demandé.
     move_debug: String,
@@ -396,6 +417,9 @@ impl Session {
             coast_logged: false,
             stick: crate::stick::Guard::restored(),
             fwd_was: false,
+            run_was: false,
+            run_from: None,
+            stop_meas: None,
             coast_air: 0.0,
             move_debug: String::new(),
             injected_warned: false,
@@ -694,46 +718,71 @@ impl Session {
             // (Pas en mode FPS : « marcher » relâchée y veut dire courir, pas s'arrêter.)
             if !fps_mode {
                 let fwd_held = keys.held(input, Action::Forward);
-                // Avancer relâchée sans que « courir » soit tenue : rien ne protège ce cas
-                // (la touche a pu traîner) ; le journal note à quelle vitesse on allait.
-                if self.fwd_was
-                    && !fwd_held
-                    && !keys.held(input, Action::Sprint)
-                    && self.stick.active()
-                {
-                    let v = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
-                    if v > 1.0 {
-                        log::info!(
-                            "touche avancer : relâchée seule à {v:.1} blocs/s (vol : {})",
-                            self.player.flying
-                        );
-                    }
-                }
-                self.fwd_was = fwd_held;
-                if self.stick.update(
-                    dt,
-                    fwd_held,
-                    keys.pressed(input, Action::Forward),
-                    keys.held(input, Action::Sprint),
-                ) && fwd_held
+                let run_held = keys.held(input, Action::Sprint);
+                // Pour le journal : ce qu'il en était juste avant cette image.
+                let (held_for, since_run) = (self.stick.forward_held(), self.stick.since_sprint());
+                if self
+                    .stick
+                    .update(dt, fwd_held, keys.pressed(input, Action::Forward), run_held)
+                    && fwd_held
                 {
                     m.forward -= 1.0;
                 }
+                let released = self.fwd_was && !fwd_held;
+                self.fwd_was = fwd_held;
+                // (Texte du journal : seulement quand une ligne est écrite.)
+                let hot = || {
+                    minelib_render::thermal::gpu_temp()
+                        .map(|t| format!(", carte graphique à {t:.0} °C"))
+                        .unwrap_or_default()
+                };
+                if let Some(s) = self.stick.stop.take() {
+                    let hot = hot();
+                    log::info!(
+                        "fin de course : avancer relâchée {:.0} ms après courir (course de \
+                         {:.1} s, avancer tenue {:.1} s{hot}){}",
+                        s.gap * 1000.0,
+                        s.ran,
+                        s.held,
+                        if !s.stopped {
+                            String::new()
+                        } else if s.resumed > 0.0 {
+                            format!(
+                                " ; arrêté dès courir relâchée, mais la touche a traîné plus \
+                                 que prévu ({:.2} s) : la marche avait repris {:.0} ms",
+                                s.patience,
+                                s.resumed * 1000.0
+                            )
+                        } else {
+                            " ; arrêt fait dès courir relâchée".to_string()
+                        }
+                    );
+                } else if released && self.stick.active() && held_for > 0.25 && !run_held {
+                    // Avancer relâchée sans « courir » : rien ne protège ce cas (la
+                    // touche a pu traîner) ; le journal note dans quelles conditions.
+                    let v = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
+                    let hot = hot();
+                    log::info!(
+                        "touche avancer : relâchée seule après {held_for:.2} s d'appui, à \
+                         {v:.1} blocs/s ({}, courir relâchée depuis {}{hot}) : aucun moyen \
+                         de savoir quand le doigt s'est levé",
+                        if self.player.flying {
+                            "en vol"
+                        } else {
+                            "au sol"
+                        },
+                        if since_run > 30.0 {
+                            "longtemps".to_string()
+                        } else {
+                            format!("{since_run:.2} s")
+                        }
+                    );
+                }
+                self.measure_stop(dt, fwd_held, run_held, released);
             }
             self.stick.remember();
             if let Some(note) = self.stick.note.take() {
                 log::info!("touche avancer : {note}");
-            }
-            if let Some(gap) = self.stick.last_gap.take() {
-                log::info!(
-                    "fin de course : avancer relâchée {:.0} ms après courir{}",
-                    gap * 1000.0,
-                    if self.stick.active() {
-                        " (arrêt fait dès courir relâchée)"
-                    } else {
-                        ""
-                    }
-                );
             }
             if std::mem::take(&mut self.stick.just_learned) {
                 log::warn!(
@@ -1904,6 +1953,78 @@ impl Session {
     }
 
     /// Dégâts de chute (survie) : un demi-cœur par bloc au-delà de 3.
+    /// Journal des arrêts : à chaque fin de course (« courir » ou « avancer » lâchée),
+    /// mesure le chemin encore parcouru dans le sens de la course jusqu'à l'arrêt, et dit
+    /// s'il y a un mur devant. C'est ce que le joueur voit (« ça continue d'avancer ») ;
+    /// les touches seules ne le disent pas.
+    fn measure_stop(&mut self, dt: f32, fwd: bool, run: bool, fwd_released: bool) {
+        let pos = self.player.pos;
+        let flat = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z);
+        let both = fwd && run;
+        if both && self.run_from.is_none() {
+            // Nouvelle course : la mesure d'avant n'a plus de sens.
+            self.run_from = Some(pos);
+            self.stop_meas = None;
+        }
+        let run_released = self.run_was && !run && fwd;
+        self.run_was = run;
+        if let Some(from) = self.run_from.filter(|_| !both) {
+            self.run_from = None;
+            if (run_released || fwd_released) && flat.length() > 2.0 {
+                self.stop_meas = Some(StopMeas {
+                    at: pos,
+                    dir: flat.normalize(),
+                    speed: flat.length(),
+                    t: 0.0,
+                    run: (pos - from).length(),
+                    first: if run_released { "courir" } else { "avancer" },
+                    fwd_up: !fwd,
+                });
+            }
+        }
+        let Some(mut s) = self.stop_meas.take() else {
+            return;
+        };
+        s.t += dt;
+        // « Avancer » lâchée puis renfoncée : il repart, ce n'est plus un arrêt.
+        let again = s.fwd_up && fwd;
+        s.fwd_up |= !fwd;
+        let along = flat.dot(s.dir);
+        let stopped = along < 0.05;
+        if !stopped && !again && s.t < 1.5 {
+            self.stop_meas = Some(s);
+            return;
+        }
+        let wall = match self.player.obstacle_ahead(&self.world, 8.0) {
+            Some(d) if d < 0.01 => " ; contre un mur".to_string(),
+            Some(d) => format!(" ; mur devant à {d:.2} bloc"),
+            None => String::new(),
+        };
+        log::info!(
+            "arrêt {} : {:.2} bloc parcouru après « {} » lâchée{}, parti de {:.1} blocs/s \
+             après une course de {:.1} blocs{wall}",
+            if self.player.flying {
+                "en vol"
+            } else {
+                "au sol"
+            },
+            (pos - s.at).dot(s.dir),
+            s.first,
+            if stopped {
+                format!(", arrêté en {:.2} s", s.t)
+            } else if again {
+                format!(", avancer renfoncée après {:.2} s", s.t)
+            } else {
+                format!(
+                    ", encore à {along:.1} blocs/s après {:.1} s (il a continué)",
+                    s.t
+                )
+            },
+            s.speed,
+            s.run,
+        );
+    }
+
     /// Avance la simulation du joueur par pas fixes de `SIM_TICK`, puis montre une
     /// position interpolée entre les deux derniers pas (mouvement fluide à toute cadence).
     fn simulate(&mut self, m: &MoveInput, dt: f32) {

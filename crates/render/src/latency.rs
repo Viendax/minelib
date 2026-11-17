@@ -74,11 +74,17 @@ impl Pacer {
     const RETRY_MAX: f32 = 60.0;
     /// Au-delà de cette part de l'image passée bloquée, la carte graphique est le frein.
     const GPU_BOUND: f32 = 0.6;
-    /// En dessous de cette durée d'image (plus de 250 images par seconde), l'attente du
+    /// En dessous de cette durée d'image (plus de 144 images par seconde), l'attente du
     /// pilote ne sert plus : même avec la carte saturée, les images en file ne coûtent que
-    /// 2 à 4 ms de retard, alors que l'attente retire un tiers des images par seconde
-    /// (mesuré : 2,1 ms par image sans elle, 3,2 ms avec).
-    const SLOW_FRAME: f32 = 0.004;
+    /// quelques millisecondes de retard, alors que l'attente retire des images par seconde
+    /// et les rend irrégulières. Mesuré sur un portable (RTX 4050 à sa limite de
+    /// température, 230 à 380 images par seconde), sur 85 bilans de 10 s : sans l'attente,
+    /// 340 images par seconde en moyenne, 1 % bas à 233, 3 chutes par bilan ; avec, 275,
+    /// 1 % bas à 133 (une image sur cent durait 8,5 ms), 15 chutes par bilan. L'ancien
+    /// seuil (250 images par seconde) tombait en plein dans la plage de jeu : l'attente
+    /// s'enclenchait et se déclenchait toutes les dix à soixante secondes, et le joueur
+    /// voyait ses images par seconde chuter d'un quart sans raison.
+    const SLOW_FRAME: f32 = 1.0 / 144.0;
     /// Durée d'un essai sans attente avant de le juger réussi.
     const TRIAL: f32 = 0.5;
     /// La carte doit paraître saturée sans interruption pendant ce temps pour que
@@ -221,7 +227,7 @@ impl LowLatency {
                 "{} : attente du pilote {} — image {:.2} ms, part bloquée sur la carte {:.0} %",
                 self.kind.label(),
                 if self.pacer.driver_wait {
-                    "reprise (carte graphique saturée, moins de 250 images par seconde)"
+                    "reprise (carte graphique saturée, moins de 144 images par seconde)"
                 } else {
                     "suspendue (essai)"
                 },
@@ -522,21 +528,26 @@ mod pacer_tests {
         run(&mut p, 2.0, 0.002, 0.0015);
         assert!(
             !p.driver_wait,
-            "plus de 250 images par seconde : pas d'attente"
+            "plus de 144 images par seconde : pas d'attente"
         );
+        // Pareil à 230 images par seconde (4,3 ms dont 3 bloquées) : c'est là que
+        // l'attente s'enclenchait par intermittence et faisait chuter les images.
+        run(&mut p, 5.0, 0.0043, 0.003);
+        assert!(!p.driver_wait, "230 images par seconde : pas d'attente");
         // Un à-coup isolé (une image de 60 ms presque toute bloquée) : pas de reprise.
         p.update(0.06, 0.055);
         run(&mut p, 1.0, 0.001, 0.0004);
         assert!(!p.driver_wait, "un à-coup ne remet pas l'attente");
-        // La carte sature pour de bon : 5 ms par image dont 4 ms bloquées.
-        run(&mut p, 0.5, 0.005, 0.004);
+        // La carte sature pour de bon, à 100 images par seconde : 10 ms par image dont
+        // 8 ms bloquées. Là, trois images en file font 30 ms de retard : l'attente reprend.
+        run(&mut p, 0.5, 0.010, 0.008);
         assert!(p.driver_wait, "attente reprise");
         // Tant qu'elle sature, les essais échouent vite et s'espacent.
         let mut free = 0.0;
-        for _ in 0..(60.0f32 / 0.005) as usize {
-            p.update(0.005, 0.004);
+        for _ in 0..(60.0f32 / 0.010) as usize {
+            p.update(0.010, 0.008);
             if !p.driver_wait {
-                free += 0.005;
+                free += 0.010;
             }
         }
         assert!(free < 3.0, "sans attente {free} s sur 60");

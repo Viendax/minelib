@@ -2955,6 +2955,9 @@ impl GameLoop for Game {
         if let Some((mon, last, pressure)) = &mut self.vram {
             if last.elapsed().as_secs_f32() >= 1.0 {
                 *last = std::time::Instant::now();
+                if let Some(t) = minelib_render::thermal::gpu_temp() {
+                    minelib_render::perf::gauge("carte graphique (°C)", t);
+                }
                 if let Some((used, budget)) = mon.query() {
                     let mb = |b: u64| (b / (1024 * 1024)) as f32;
                     minelib_render::perf::gauge("mémoire vidéo utilisée (Mo)", mb(used));

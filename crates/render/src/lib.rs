@@ -24,6 +24,7 @@ pub mod perf;
 pub mod rt;
 mod taa;
 pub mod textures;
+pub mod thermal;
 pub mod viewmodel;
 
 pub use capture::Screenshot;
