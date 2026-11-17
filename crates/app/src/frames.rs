@@ -122,6 +122,11 @@ impl Frames {
         best.map(|b| b.0)
     }
 
+    /// Bloc que montre le cadre `i` (`None` : cadre vide).
+    pub fn block(&self, i: usize) -> Option<minelib_world::BlockId> {
+        self.list.get(i)?.block
+    }
+
     /// Boîte du cadre `i` (pour montrer qu'il est visé).
     pub fn bounds(&self, i: usize) -> Option<([f32; 3], [f32; 3])> {
         let (mn, mx) = boxes(self.list.get(i)?);

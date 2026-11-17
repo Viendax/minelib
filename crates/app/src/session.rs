@@ -1376,6 +1376,14 @@ impl Session {
                 return;
             }
         }
+        // « Copier le bloc » sur un cadre : le bloc qu'il montre vient en main.
+        if pick && self.inventory.selected_item() != Some(Item::Wand) {
+            let framed = self.frame_aim.and_then(|i| self.frames.as_ref()?.block(i));
+            if let Some(b) = framed {
+                self.give_picked(Item::Block(b));
+                return;
+            }
+        }
         // Baguette : clic molette (touche « Copier le bloc ») efface la sélection, même
         // sans bloc visé.
         if self.inventory.selected_item() == Some(Item::Wand) && pick {
@@ -1656,23 +1664,29 @@ impl Session {
             } else {
                 Item::Block(hit.id)
             };
-            if let Some(i) = self.inventory.slots[..inventory::HOTBAR]
+            self.give_picked(wanted);
+        }
+    }
+
+    /// « Copier le bloc » : l'objet visé vient en main (déjà dans la barre : on le
+    /// choisit ; sinon, en créatif, une pile neuve).
+    fn give_picked(&mut self, wanted: Item) {
+        if let Some(i) = self.inventory.slots[..inventory::HOTBAR]
+            .iter()
+            .position(|s| s.is_some_and(|s| s.item == wanted))
+        {
+            self.inventory.select(i);
+        } else if self.game.mode == GameMode::Creative {
+            // Emplacement vide de la barre s'il y en a un, sinon celui en main.
+            let slot = self.inventory.slots[..inventory::HOTBAR]
                 .iter()
-                .position(|s| s.is_some_and(|s| s.item == wanted))
-            {
-                self.inventory.select(i);
-            } else if self.game.mode == GameMode::Creative {
-                // Emplacement vide de la barre s'il y en a un, sinon celui en main.
-                let slot = self.inventory.slots[..inventory::HOTBAR]
-                    .iter()
-                    .position(|s| s.is_none())
-                    .unwrap_or(self.inventory.selected);
-                self.inventory.slots[slot] = Some(inventory::Stack {
-                    item: wanted,
-                    count: 64,
-                });
-                self.inventory.select(slot);
-            }
+                .position(|s| s.is_none())
+                .unwrap_or(self.inventory.selected);
+            self.inventory.slots[slot] = Some(inventory::Stack {
+                item: wanted,
+                count: 64,
+            });
+            self.inventory.select(slot);
         }
     }
 
