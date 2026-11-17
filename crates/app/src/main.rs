@@ -72,6 +72,7 @@ mod radar;
 mod save;
 mod session;
 mod skin;
+mod stick;
 mod streaming;
 mod update;
 mod voice;

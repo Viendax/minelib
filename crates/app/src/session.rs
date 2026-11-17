@@ -182,6 +182,8 @@ pub struct Session {
     /// Temps passé à avancer sans touche tenue (diagnostic), et déjà noté au journal.
     coast: f32,
     coast_logged: bool,
+    /// Touche « avancer » qui remonte mal : règle apprise pour ce joueur.
+    stick: crate::stick::Guard,
     coast_air: f32,
     /// Ligne de l'écran de débogage : touches tenues et déplacement demandé.
     move_debug: String,
@@ -391,6 +393,7 @@ impl Session {
             frames: None,
             coast: 0.0,
             coast_logged: false,
+            stick: crate::stick::Guard::restored(),
             coast_air: 0.0,
             move_debug: String::new(),
             injected_warned: false,
@@ -684,6 +687,37 @@ impl Session {
                     fps: false,
                 }
             };
+            // Touche « avancer » qui remonte mal (voir `stick`) : chez un joueur dont elle
+            // traîne après chaque course, lâcher « courir » arrête d'avancer tout de suite.
+            let (fwd, modifier) = if fps_mode {
+                (
+                    Action::FpsForward,
+                    !keys.walk_toggle && keys.held(input, Action::FpsWalk),
+                )
+            } else {
+                (Action::Forward, keys.held(input, Action::Sprint))
+            };
+            let fwd_held = keys.held(input, fwd);
+            if self
+                .stick
+                .update(dt, fwd_held, keys.pressed(input, fwd), modifier)
+                && fwd_held
+            {
+                m.forward -= 1.0;
+            }
+            self.stick.remember();
+            if std::mem::take(&mut self.stick.just_learned) {
+                log::warn!(
+                    "la touche avancer se relâche régulièrement un instant après la touche \
+                     courir : elle remonte mal ; désormais, lâcher courir arrête d'avancer"
+                );
+                self.chat.say(
+                    "Ta touche avancer se relâche en retard (elle remonte mal). Le jeu s'arrête \
+                     maintenant dès que tu lâches courir."
+                        .to_string(),
+                    chat::YELLOW,
+                );
+            }
             if self.inventory.open || typing {
                 m = MoveInput::default();
             }
@@ -701,6 +735,8 @@ impl Session {
                 m.strafe,
                 if idle && flat > 0.3 {
                     "   (avance sans touche)"
+                } else if self.stick.active() {
+                    "   (touche avancer lente : arrêt dès que courir est lâchée)"
                 } else if input.injected_keys() {
                     "   (touches tapées par un logiciel)"
                 } else {
