@@ -16,11 +16,15 @@
 //! Un nouvel appui (« courir », ou « avancer » relâchée puis renfoncée) repart toujours
 //! tout de suite.
 //!
-//! Tant que la touche remonte bien (quelques centièmes de seconde, ce qui est le cas au
-//! début de chaque partie et après les appuis brefs), rien n'est retenu du tout : sinon
-//! le joueur qui lâche « courir » en gardant « avancer » serait arrêté à chaque fois,
-//! pour rien. Les deux cas ne se distinguent pas pendant que la touche traîne : c'est le
-//! retard mesuré, et lui seul, qui dit combien de temps il faut attendre.
+//! Tant que la touche remonte bien (quelques centièmes de seconde, ce qui est le cas
+//! après les appuis brefs et quand la machine est froide), rien n'est retenu du tout :
+//! sinon le joueur qui lâche « courir » en gardant « avancer » serait arrêté à chaque
+//! fois, pour rien. Les deux cas ne se distinguent pas pendant que la touche traîne :
+//! c'est le retard mesuré, et lui seul, qui dit combien de temps il faut attendre.
+//!
+//! Ces retards se retiennent un quart d'heure d'une partie à l'autre : une touche qui
+//! traînait à la fin d'une partie traîne encore si l'on relance aussitôt, et sans cela
+//! le premier arrêt de la nouvelle partie n'était pas protégé (3,4 blocs de trop, mesuré).
 //!
 //! La règle se retient d'une partie à l'autre, ne s'active jamais sur un clavier sain,
 //! s'éteint si le joueur continue souvent de marcher après avoir couru, et se règle à la
@@ -56,6 +60,11 @@ const FINE: f32 = 0.05;
 /// Fichier (dossier du jeu) qui retient le réglage d'une partie à l'autre : « 1 » (la
 /// touche traîne, appris), « oui » (demandé par le joueur), « non » (refusé).
 const FILE: &str = "touche_avancer_lente";
+/// Fichier qui retient les derniers retards mesurés (date, puis un retard par ligne), et
+/// temps (s) pendant lequel ils valent encore : la touche traîne plus ou moins selon
+/// l'état de la machine, qui change en quelques minutes.
+const LAGS_FILE: &str = "touche_avancer_retards";
+const LAGS_KEEP: u64 = 15 * 60;
 
 /// Réglage du joueur.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -120,6 +129,8 @@ pub struct Guard {
     /// tenue pour bonne tant qu'elle n'a pas traîné dans cette partie.
     short: std::collections::VecDeque<(f32, f32)>,
     long: std::collections::VecDeque<(f32, f32)>,
+    /// Un retard a été mesuré depuis la dernière écriture du fichier des retards.
+    lags_dirty: bool,
     active: bool,
     /// Avancer est retenue en attendant un nouvel appui.
     blocked: bool,
@@ -169,11 +180,90 @@ impl Guard {
             None => {}
         }
         g.saved = Some((g.mode, g.active));
+        if let Ok(text) = std::fs::read_to_string(minelib_assets::data_dir().join(LAGS_FILE)) {
+            let kept = g.decode_lags(&text, unix_now());
+            if kept > 0 {
+                log::info!(
+                    "touche avancer : {kept} retards de la partie précédente repris (le \
+                     pire : {:.0} ms)",
+                    g.short
+                        .iter()
+                        .chain(&g.long)
+                        .map(|l| l.0)
+                        .fold(0.0f32, f32::max)
+                        * 1000.0
+                );
+            }
+        }
         g
     }
 
-    /// Retient le réglage pour les prochaines parties, quand il change.
+    /// Les derniers retards mesurés, datés (texte du fichier des retards).
+    fn encode_lags(&self, now: u64) -> String {
+        let mut out = format!("{now}\n");
+        for (name, lags) in [("bref", &self.short), ("long", &self.long)] {
+            for (gap, scale) in lags {
+                out += &format!("{name} {gap} {scale}\n");
+            }
+        }
+        out
+    }
+
+    /// Reprend les retards d'un fichier s'ils datent de moins d'un quart d'heure.
+    /// Renvoie combien ont été repris.
+    fn decode_lags(&mut self, text: &str, now: u64) -> usize {
+        let mut lines = text.lines();
+        let fresh = lines
+            .next()
+            .and_then(|l| l.trim().parse::<u64>().ok())
+            .is_some_and(|at| at <= now + 60 && now.saturating_sub(at) <= LAGS_KEEP);
+        if !fresh {
+            return 0;
+        }
+        let mut kept = 0;
+        for line in lines {
+            let mut w = line.split_whitespace();
+            let lags = match w.next() {
+                Some("bref") => &mut self.short,
+                Some("long") => &mut self.long,
+                _ => continue,
+            };
+            let (Some(gap), Some(scale)) = (
+                w.next().and_then(|v| v.parse::<f32>().ok()),
+                w.next().and_then(|v| v.parse::<f32>().ok()),
+            ) else {
+                continue;
+            };
+            // (Un fichier abîmé ne doit pas faire retenir le joueur sans fin.)
+            if !(0.0..=1.5).contains(&gap) || !(0.0..=1.5).contains(&scale) {
+                continue;
+            }
+            lags.push_back((gap, scale));
+            if lags.len() > LAGS {
+                lags.pop_front();
+            }
+            kept += 1;
+        }
+        kept
+    }
+
+    /// Écrit les retards au fichier (seulement pour la règle du joueur, pas en essai).
+    fn save_lags(&mut self) {
+        self.lags_dirty = false;
+        if self.saved.is_some() && !(self.short.is_empty() && self.long.is_empty()) {
+            let _ = std::fs::write(
+                minelib_assets::data_dir().join(LAGS_FILE),
+                self.encode_lags(unix_now()),
+            );
+        }
+    }
+
+    /// Retient le réglage pour les prochaines parties, quand il change, et les retards
+    /// quand un nouveau vient d'être mesuré.
     pub fn remember(&mut self) {
+        if self.lags_dirty {
+            self.save_lags();
+        }
         let now = (self.mode, self.active);
         if self.saved.is_some() && self.saved != Some(now) {
             self.saved = Some(now);
@@ -297,6 +387,7 @@ impl Guard {
                     if lags.len() > LAGS {
                         lags.pop_front();
                     }
+                    self.lags_dirty = true;
                     if w.ran >= HELD_MIN {
                         self.sample(Some(w.t));
                     }
@@ -383,6 +474,21 @@ impl Guard {
         self.mod_was = modifier;
         self.blocked
     }
+}
+
+/// En quittant la partie : les retards sont réécrits avec l'heure du moment (le quart
+/// d'heure se compte depuis la fin de la partie, pas depuis le dernier arrêt).
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.save_lags();
+    }
+}
+
+/// Secondes écoulées depuis 1970 (pour dater le fichier des retards).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -654,6 +760,41 @@ mod tests {
         // Dernier arrêt, pour de bon : tenu aussi.
         assert_eq!(step(&mut g, true, 1.0), 0.0);
         assert!(step(&mut g, false, 0.35) > 0.34);
+    }
+
+    /// Le cas mesuré : à la fin d'une partie la touche traînait 286 ms après 8,4 s de
+    /// course ; relancé aussitôt, le premier arrêt de la partie suivante n'était pas
+    /// retenu (3,4 blocs de trop). Les retards se reprennent pendant un quart d'heure.
+    #[test]
+    fn lags_are_remembered_for_a_quarter_of_an_hour() {
+        let mut before = Guard::default();
+        before.set_mode(Mode::On);
+        sprint(&mut before, 8.4, Some(0.286));
+        sprint(&mut before, 0.3, Some(0.006));
+        let text = before.encode_lags(1_000_000);
+        // Dix minutes après : le premier arrêt de la nouvelle partie est tenu.
+        let mut g = Guard::default();
+        g.set_mode(Mode::On);
+        assert_eq!(g.decode_lags(&text, 1_000_600), 2);
+        assert!(sprint(&mut g, 8.4, Some(0.286)) < 0.02, "arrêt tenu");
+        // Et après un appui bref, où la touche remontait bien : rien n'est retenu.
+        assert!((sprint(&mut g, 0.3, None) - 8.0).abs() < 0.02);
+        // Vingt minutes après : la machine a refroidi, rien n'est repris.
+        let mut g = Guard::default();
+        g.set_mode(Mode::On);
+        assert_eq!(g.decode_lags(&text, 1_001_200), 0);
+        assert!((sprint(&mut g, 8.4, Some(0.286)) - 0.286).abs() < 0.02);
+        // Un fichier abîmé, ou daté du futur, ne fait rien retenir.
+        for bad in [
+            "",
+            "n'importe quoi",
+            "1000000\nlong 99 99\nlong x y\n",
+            "9999999999\nlong 1 1\n",
+        ] {
+            let mut g = Guard::default();
+            g.set_mode(Mode::On);
+            assert_eq!(g.decode_lags(bad, 1_000_100), 0, "{bad:?}");
+        }
     }
 
     #[test]
