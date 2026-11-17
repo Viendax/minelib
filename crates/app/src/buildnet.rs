@@ -60,19 +60,25 @@ fn fluid_edit(old: BlockId, new: BlockId) -> bool {
     };
     (fluid(new).is_some() && open(old)) || (fluid(old).is_some() && set(new))
 }
-/// Position envoyée au moins 20 fois par seconde (foule), au plus 256 (peu de joueurs).
-const POS_EVERY: f32 = 0.05;
-const POS_FASTEST: f32 = 1.0 / 256.0;
+/// Position envoyée au moins 10 fois par seconde (foule), au plus 60 (peu de joueurs) ; le
+/// jeu fait avancer chacun en douceur entre deux positions reçues.
+///
+/// Avant : de 20 à 256 fois par seconde, pour 4096 positions reçues par joueur. La
+/// simulation de foule a montré ce que ça coûte au relais : 250 Mbit/s à envoyer pour
+/// 100 joueurs au même endroit, et déjà 55 Mbit/s pour 16. C'est la connexion de celui
+/// qui héberge le relais qui cassait en premier, bien avant le nombre de joueurs.
+const POS_EVERY: f32 = 0.1;
+const POS_FASTEST: f32 = 1.0 / 60.0;
 /// Positions reçues par seconde qu'on vise au plus (tous les voisins proches réunis) : le
 /// rythme d'envoi de chacun baisse quand il y a du monde autour.
-const POS_BUDGET: f32 = 4096.0;
+const POS_BUDGET: f32 = 960.0;
 /// Un joueur dont on n'a plus de nouvelles depuis ce temps (ou trois de ses intervalles,
 /// pour un joueur lointain rafraîchi rarement) n'est plus montré.
 const STALE_S: f32 = 3.0;
 
-/// Intervalle entre deux envois de sa position, selon le nombre de joueurs autour : 256
-/// fois par seconde jusqu'à 16 voisins, puis de moins en moins (64 à 64 voisins), jamais
-/// moins de 20.
+/// Intervalle entre deux envois de sa position, selon le nombre de joueurs autour : 60
+/// fois par seconde jusqu'à 16 voisins, puis de moins en moins (30 à 32 voisins), jamais
+/// moins de 10.
 fn pos_every(others: usize) -> f32 {
     let hz = (POS_BUDGET / others.max(1) as f32).clamp(1.0 / POS_EVERY, 1.0 / POS_FASTEST);
     1.0 / hz

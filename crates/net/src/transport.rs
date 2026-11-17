@@ -6,8 +6,8 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -23,12 +23,23 @@ const MAX: usize = 65535;
 pub const FLOOD_BACKLOG: u32 = 20_000;
 /// Côté relais : un client qui ne lit plus rien pendant ce temps est coupé.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Un message périssable (`push_loose` : la position d'un joueur, que la suivante
+/// remplace) resté plus longtemps que cela dans la file n'est plus envoyé : un client lent
+/// ne reçoit pas des positions vieilles de plusieurs secondes, et sa file ne gonfle pas.
+const LOOSE_MAX_AGE: Duration = Duration::from_millis(250);
+/// Les messages à envoyer sont regroupés : ils partent ensemble dès que la file est vide,
+/// ou dès que le tampon atteint cette taille. Dans une foule, des centaines de positions
+/// par seconde vont à chaque joueur ; une par paquet, chacune coûtait 40 octets
+/// d'en-têtes et un appel au système.
+const OUT_MAX: usize = 32 * 1024;
 
 /// Ce qui arrive sur un canal : message chiffré reçu du réseau, message (en clair) déposé
 /// par un autre fil pour être envoyé, ou fin de connexion.
 pub enum Inbound {
     Frame(Vec<u8>),
     Push(Vec<u8>),
+    /// Message périssable déposé à cet instant (voir `LOOSE_MAX_AGE`).
+    Loose(Vec<u8>, Instant),
     Closed,
 }
 
@@ -47,6 +58,8 @@ pub struct Channel {
     tx: Sender<Inbound>,
     /// Trames lues du réseau pas encore traitées.
     backlog: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Trames chiffrées prêtes à partir, pas encore écrites (voir `OUT_MAX`).
+    out: Vec<u8>,
 }
 
 /// Dépose un message pour qu'il soit envoyé par le fil qui possède le canal.
@@ -56,6 +69,23 @@ pub fn push<T: Serialize>(tx: &Sender<Inbound>, msg: &T) -> bool {
         .is_some_and(|b| tx.send(Inbound::Push(b)).is_ok())
 }
 
+/// Sérialise un message une fois, pour le déposer ensuite chez plusieurs destinataires
+/// (`push_raw`, `push_loose`) sans le resérialiser pour chacun.
+pub fn encode<T: Serialize>(msg: &T) -> Option<Vec<u8>> {
+    postcard::to_allocvec(msg).ok()
+}
+
+/// Dépose un message déjà sérialisé (`encode`).
+pub fn push_raw(tx: &Sender<Inbound>, bytes: Vec<u8>) -> bool {
+    tx.send(Inbound::Push(bytes)).is_ok()
+}
+
+/// Dépose un message périssable déjà sérialisé : s'il attend trop dans la file (client
+/// lent, relais débordé), il est abandonné au lieu d'être envoyé en retard.
+pub fn push_loose(tx: &Sender<Inbound>, bytes: Vec<u8>) -> bool {
+    tx.send(Inbound::Loose(bytes, Instant::now())).is_ok()
+}
+
 fn write_frame(s: &mut TcpStream, data: &[u8]) -> Result<()> {
     let len = u16::try_from(data.len()).map_err(|_| anyhow!("message trop long"))?;
     s.write_all(&len.to_be_bytes())?;
@@ -63,7 +93,7 @@ fn write_frame(s: &mut TcpStream, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_frame(s: &mut TcpStream, buf: &mut Vec<u8>) -> Result<usize> {
+fn read_frame<R: Read>(s: &mut R, buf: &mut Vec<u8>) -> Result<usize> {
     let mut len = [0u8; 2];
     s.read_exact(&mut len)?;
     let n = u16::from_be_bytes(len) as usize;
@@ -149,7 +179,8 @@ impl Channel {
     /// `flood` : trames en attente au-delà desquelles la connexion est coupée.
     fn finish(stream: TcpStream, noise: snow::TransportState, flood: Option<u32>) -> Result<Self> {
         stream.set_read_timeout(None)?;
-        let mut reader = stream.try_clone()?;
+        // (Lecture par blocs : dans une foule, des centaines de petites trames par seconde.)
+        let mut reader = std::io::BufReader::with_capacity(32 * 1024, stream.try_clone()?);
         let (tx, rx) = channel();
         let out = tx.clone();
         let backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -165,7 +196,7 @@ impl Channel {
                             let waiting = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if flood.is_some_and(|max| waiting > max as usize) {
                                 let _ = out.send(Inbound::Closed);
-                                let _ = reader.shutdown(std::net::Shutdown::Both);
+                                let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
                                 return;
                             }
                             if out.send(Inbound::Frame(buf[..n].to_vec())).is_err() {
@@ -185,6 +216,7 @@ impl Channel {
             rx,
             tx,
             backlog,
+            out: Vec::new(),
         })
     }
 
@@ -193,19 +225,39 @@ impl Channel {
         self.tx.clone()
     }
 
+    /// Envoie un message tout de suite (avec ceux qui attendaient, dans l'ordre).
     pub fn send<T: Serialize>(&mut self, msg: &T) -> Result<()> {
         let plain = postcard::to_allocvec(msg)?;
-        self.send_raw(&plain)
+        self.send_raw(&plain)?;
+        self.flush()
     }
 
-    /// Envoie un message déjà sérialisé (déposé par `push`).
+    /// Prépare l'envoi d'un message déjà sérialisé (déposé par `push`) : il part avec les
+    /// suivants, dès que la file est vide (au prochain `recv_any`) ou que le tampon est
+    /// plein.
     pub fn send_raw(&mut self, plain: &[u8]) -> Result<()> {
         if plain.len() + 16 > MAX {
             return Err(anyhow!("message trop long"));
         }
-        let mut out = vec![0u8; plain.len() + 16];
-        let n = self.noise.write_message(plain, &mut out)?;
-        write_frame(&mut self.stream, &out[..n])
+        let mut frame = vec![0u8; plain.len() + 16];
+        let n = self.noise.write_message(plain, &mut frame)?;
+        let len = u16::try_from(n).map_err(|_| anyhow!("message trop long"))?;
+        self.out.extend_from_slice(&len.to_be_bytes());
+        self.out.extend_from_slice(&frame[..n]);
+        if self.out.len() >= OUT_MAX {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Écrit sur le réseau ce qui attendait dans le tampon d'envoi.
+    pub fn flush(&mut self) -> Result<()> {
+        if !self.out.is_empty() {
+            let r = self.stream.write_all(&self.out);
+            self.out.clear();
+            r?;
+        }
+        Ok(())
     }
 
     fn decode<T: DeserializeOwned>(&mut self, frame: &[u8]) -> Result<T> {
@@ -219,17 +271,35 @@ impl Channel {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<Incoming<T>>> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(Inbound::Frame(f)) => {
-                self.backlog
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(Some(Incoming::Msg(self.decode(&f)?)))
+        loop {
+            // Plus rien dans la file : ce qui attendait dans le tampon d'envoi part
+            // maintenant, d'un seul bloc, avant de se mettre en attente.
+            let next = match self.rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Disconnected) => return Err(anyhow!("connexion fermée")),
+                Err(TryRecvError::Empty) => {
+                    self.flush()?;
+                    match self.rx.recv_timeout(timeout) {
+                        Ok(m) => m,
+                        Err(RecvTimeoutError::Timeout) => return Ok(None),
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(anyhow!("connexion fermée"))
+                        }
+                    }
+                }
+            };
+            match next {
+                Inbound::Frame(f) => {
+                    self.backlog
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Some(Incoming::Msg(self.decode(&f)?)));
+                }
+                Inbound::Push(p) => return Ok(Some(Incoming::Push(p))),
+                // Périssable : trop vieux, il est abandonné (le suivant le remplace).
+                Inbound::Loose(_, at) if at.elapsed() > LOOSE_MAX_AGE => {}
+                Inbound::Loose(p, _) => return Ok(Some(Incoming::Push(p))),
+                Inbound::Closed => return Err(anyhow!("connexion fermée")),
             }
-            Ok(Inbound::Push(p)) => Ok(Some(Incoming::Push(p))),
-            Ok(Inbound::Closed) | Err(RecvTimeoutError::Disconnected) => {
-                Err(anyhow!("connexion fermée"))
-            }
-            Err(RecvTimeoutError::Timeout) => Ok(None),
         }
     }
 
@@ -250,6 +320,14 @@ impl Channel {
     pub fn recv<T: DeserializeOwned>(&mut self) -> Result<T> {
         self.recv_timeout(Duration::from_secs(10))?
             .ok_or_else(|| anyhow!("pas de réponse"))
+    }
+}
+
+/// À la fermeture : ce qui attendait encore dans le tampon d'envoi part (un dernier
+/// message d'erreur, par exemple).
+impl Drop for Channel {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -274,6 +352,51 @@ mod tests {
         c.send(&"bonjour".to_string()).unwrap();
         let r: String = c.recv().unwrap();
         assert_eq!(r, "bonjour !");
+        t.join().unwrap();
+    }
+
+    /// Les messages déposés partent regroupés, dans l'ordre, et arrivent un par un ; un
+    /// message périssable resté trop longtemps dans la file n'est pas envoyé.
+    #[test]
+    fn pushed_messages_leave_together_in_order_and_stale_loose_ones_are_dropped() {
+        let (private, _) = generate_static();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let t = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut c = Channel::accept(s, &private, Duration::from_secs(5)).unwrap();
+            let tx = c.pusher();
+            // Un périssable déjà vieux, puis 500 messages, dont des périssables frais.
+            tx.send(Inbound::Loose(
+                encode(&u32::MAX).unwrap(),
+                Instant::now() - Duration::from_secs(1),
+            ))
+            .unwrap();
+            for i in 0..500u32 {
+                if i % 2 == 0 {
+                    assert!(push(&tx, &i));
+                } else {
+                    assert!(push_loose(&tx, encode(&i).unwrap()));
+                }
+            }
+            // Le fil du canal : envoie ce qui est déposé, jusqu'au mot de la fin.
+            loop {
+                match c.recv_any::<String>(Duration::from_secs(5)).unwrap() {
+                    Some(Incoming::Push(b)) => c.send_raw(&b).unwrap(),
+                    Some(Incoming::Msg(m)) => {
+                        assert_eq!(m, "fini");
+                        break;
+                    }
+                    None => panic!("rien reçu"),
+                }
+            }
+        });
+        let (mut c, _) = Channel::connect(&addr, Duration::from_secs(5)).unwrap();
+        for i in 0..500u32 {
+            let v: u32 = c.recv().unwrap();
+            assert_eq!(v, i, "dans l'ordre, sans le périssable trop vieux");
+        }
+        c.send(&"fini".to_string()).unwrap();
         t.join().unwrap();
     }
 }

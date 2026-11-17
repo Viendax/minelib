@@ -139,6 +139,8 @@ pub struct Build {
     next_seq: u64,
     /// Positions envoyées par chaque joueur (pour n'en transmettre qu'une partie au loin).
     pos_count: HashMap<u64, u32>,
+    /// Droit d'envoyer de chaque joueur : (dernier compte, positions encore permises).
+    pos_tokens: HashMap<u64, (Instant, f32)>,
     /// Joueurs par chunk (même contenu que `positions`, rangé pour trouver les voisins
     /// sans parcourir tout le monde) ; `indexed` : nombre de joueurs rangés.
     by_chunk: HashMap<[i32; 2], Vec<u64>>,
@@ -149,25 +151,37 @@ pub struct Build {
 
 /// Positions dans une foule : chaque joueur est vu de tous ceux à portée (jusqu'à
 /// `FANOUT`), mais plus un voisin est loin dans le rang, moins sa position est rafraîchie :
-/// les `FANOUT_FULL` plus proches reçoivent chaque position, puis une sur 4 jusqu'à 256,
-/// une sur 16 jusqu'à 1024, une sur 64 jusqu'à `FANOUT` (le jeu fait avancer chacun en
-/// douceur entre deux). Le travail moyen par position reste borné (≈ 200 envois) quelle
+/// les `FANOUT_FULL` plus proches reçoivent chaque position, puis une sur 4 jusqu'à 128,
+/// une sur 16 jusqu'à 512, une sur 64 jusqu'à `FANOUT` (le jeu fait avancer chacun en
+/// douceur entre deux). Le travail moyen par position reste borné (≈ 100 envois) quelle
 /// que soit la taille de la foule.
-pub const FANOUT: usize = 4096;
-pub const FANOUT_FULL: usize = 64;
+///
+/// Ces nombres valent pour toute la région : quand elle a plusieurs relais, chacun n'en
+/// sert que sa part (voir `nearby`). Avant, chaque relais appliquait la limite entière de
+/// son côté, et une région à 8 relais envoyait 8 fois plus qu'une région à un seul
+/// (simulation : 1 million de messages par seconde et par relais pour 700 joueurs
+/// serrés, soit 855 Mbit/s à sortir de la connexion du joueur qui héberge le relais).
+pub const FANOUT: usize = 2048;
+pub const FANOUT_FULL: usize = 32;
 
 /// À combien de voisins part la `n`-ième position d'un joueur (voir `FANOUT`).
 pub fn reach(n: u32) -> usize {
     if n.is_multiple_of(64) {
         FANOUT
     } else if n.is_multiple_of(16) {
-        1024
+        512
     } else if n.is_multiple_of(4) {
-        256
+        128
     } else {
         FANOUT_FULL
     }
 }
+
+/// Positions par seconde acceptées d'un joueur (le jeu en envoie 60 au plus) : au-delà,
+/// elles ne sont pas diffusées (ancienne version du jeu, qui en envoyait jusqu'à 256, ou
+/// jeu modifié). De quoi absorber une rafale (réseau qui regroupe les envois).
+pub const POS_MAX_HZ: f32 = 66.0;
+const POS_BURST: f32 = 8.0;
 
 /// Une modification du monde est poussée tout de suite à ce nombre de joueurs au plus ;
 /// au-delà (foule), chacun la reçoit avec sa prochaine position, compactée. Le travail par
@@ -228,17 +242,37 @@ impl Build {
         self.indexed = self.positions.len();
     }
 
+    /// Ce joueur peut-il encore envoyer une position maintenant (`POS_MAX_HZ` par
+    /// seconde, lissé) ? Sinon elle n'est pas diffusée.
+    pub fn pos_due(&mut self, id: u64) -> bool {
+        self.pos_due_at(id, Instant::now())
+    }
+
+    fn pos_due_at(&mut self, id: u64, now: Instant) -> bool {
+        let t = self.pos_tokens.entry(id).or_insert((now, POS_BURST));
+        let gained = now.saturating_duration_since(t.0).as_secs_f32() * POS_MAX_HZ;
+        *t = (now, (t.1 + gained).min(POS_BURST));
+        if t.1 < 1.0 {
+            return false;
+        }
+        t.1 -= 1.0;
+        true
+    }
+
     /// À qui transmettre la position d'un joueur : à chaque fois aux joueurs tout proches
     /// (2 chunks), une fois sur 4 jusqu'à 6 chunks, une fois sur 20 au-delà (12 chunks au
     /// plus), les plus proches d'abord, et à `reach(n)` joueurs au plus. Dans une foule,
     /// chacun voit bien ses voisins (toujours les mêmes : ceux rangés après lui dans son
     /// chunk), et le relais ne parcourt ni n'envoie jamais à toute la foule.
-    pub fn nearby(&mut self, id: u64, chunk: [i32; 2]) -> Vec<u64> {
+    ///
+    /// `relays` : nombre de relais de la région (1 pour le relais du monde). Chacun ne
+    /// sert que sa part de la limite, puisqu'il ne porte que sa part des joueurs.
+    pub fn nearby(&mut self, id: u64, chunk: [i32; 2], relays: usize) -> Vec<u64> {
         self.reindex();
         let n = self.pos_count.entry(id).or_insert(0);
         *n = n.wrapping_add(1);
         let n = *n;
-        let limit = reach(n);
+        let limit = reach(n).div_ceil(relays.max(1));
         let mut out = Vec::new();
         for d in 0..=NEAR {
             let every = match d {
@@ -263,8 +297,14 @@ impl Build {
                         out.extend(members.iter().copied().filter(|&m| m != id));
                     } else {
                         // Plus de monde que de place : les voisins de rang (ceux qui
-                        // suivent ce joueur dans le chunk, ou le début pour un autre chunk).
-                        let start = members.iter().position(|&m| m == id).map_or(0, |i| i + 1);
+                        // suivent ce joueur dans son chunk). Pour un autre chunk, un rang
+                        // de départ propre à chaque joueur : en partant toujours du début,
+                        // les premiers du chunk recevaient les positions de toute la foule
+                        // voisine (16 fois la moyenne à 3000 joueurs, en simulation).
+                        let start = members
+                            .iter()
+                            .position(|&m| m == id)
+                            .map_or(id as usize % members.len(), |i| i + 1);
                         out.extend(
                             (0..members.len())
                                 .map(|k| members[(start + k) % members.len()])
@@ -484,6 +524,7 @@ impl Build {
         self.place(id, None);
         self.known.remove(&id);
         self.pos_count.remove(&id);
+        self.pos_tokens.remove(&id);
         let mine: Vec<[i32; 2]> = self
             .zones
             .iter()
@@ -598,8 +639,10 @@ mod tests {
         // Règle d'envoi du jeu (crates/app/src/buildnet.rs, `pos_every`).
         let hz = |others: usize| crate::tests_support::pos_hz(others);
         // Taille réelle d'une position sur le fil : message chiffré (étiquette de 16
-        // octets, longueur sur 2) ; chaque message part seul (TCP sans regroupement) :
-        // 40 octets d'en-têtes IP et TCP de plus.
+        // octets, longueur sur 2). Les messages partent regroupés (voir
+        // `transport::OUT_MAX`) : les 40 octets d'en-têtes IP et TCP se partagent entre
+        // une vingtaine de positions, comptés 2 chacune. (Avant le regroupement, chaque
+        // position partait seule : 105 octets.)
         let data = game::encode(&BuildMsg::Player {
             pseudo: "Joueur1234".into(),
             pos: [123.456, 78.9, -321.5],
@@ -615,7 +658,7 @@ mod tests {
         })
         .unwrap()
         .len();
-        let wire = payload + 16 + 2 + 40;
+        let wire = payload + 16 + 2 + 2;
         eprintln!("FOULE une position : {payload} octets utiles, {wire} sur le fil");
         let mut seed = 0x1234_5678u32;
         let mut rnd = move || {
@@ -630,7 +673,7 @@ mod tests {
             ("village (8 chunks)", 8),
             ("étalés (région entière)", 32),
         ] {
-            for n in [100usize, 300, 700, 1500, 3000] {
+            for n in [100usize, 300, 700, 1500, 3000, 6000] {
                 let relays = crate::shards_wanted(n, crate::SHARD_FROM, crate::SHARD_SHARE).max(1);
                 let list: Vec<ShardInfo> = (0..relays)
                     .map(|i| ShardInfo {
@@ -675,7 +718,7 @@ mod tests {
                                     out[s] += 1; // au relais voisin
                                     inn[r] += 1;
                                 }
-                                for m in b.nearby(id, c) {
+                                for m in b.nearby(id, c, relays) {
                                     out[r] += 1;
                                     got[m as usize - 1] += 1;
                                     if pass == 0 {
@@ -709,6 +752,40 @@ mod tests {
                     );
                 }
                 eprintln!("FOULE {layout:<24} {report}");
+                // Construction : chaque joueur pose ou casse un bloc toutes les deux
+                // secondes, là où il est ; chaque modification va à tous les joueurs à
+                // portée (le monde doit rester le même pour tous).
+                let set = postcard::to_allocvec(&Response::FromZone {
+                    peer: 0,
+                    chunk: [17, -3],
+                    data: game::encode(&BuildMsg::Set {
+                        pos: [123, 64, -321],
+                        block: 37,
+                        by: "Joueur1234".into(),
+                    }),
+                })
+                .unwrap()
+                .len()
+                    + 16
+                    + 2
+                    + 2;
+                let mut out = vec![0f64; relays];
+                let mut got = 0f64;
+                for &(_, c, _) in &players {
+                    for (r, b) in builds.iter().enumerate() {
+                        let l = b.listeners(c, u64::MAX).len() as f64 * 0.5;
+                        out[r] += l;
+                        got += l;
+                    }
+                }
+                let worst = out.iter().cloned().fold(0.0, f64::max);
+                eprintln!(
+                    "FOULE {layout:<24} {n:>5} joueurs, construction (1 bloc / 2 s chacun, {set} octets) | relais le plus chargé : {:.0} msg/s = {:.1} Mbit/s | joueur : {:.0} modifications reçues/s ({:.0} kbit/s)",
+                    worst,
+                    worst * set as f64 * 8.0 / 1e6,
+                    got / n as f64,
+                    got / n as f64 * set as f64 * 8.0 / 1e3,
+                );
             }
         }
     }
@@ -797,7 +874,7 @@ mod tests {
         b.positions.insert(23, [30, 0]);
         let mut got: HashMap<u64, u32> = HashMap::new();
         for _ in 0..80 {
-            for id in b.nearby(10, [0, 0]) {
+            for id in b.nearby(10, [0, 0], 1) {
                 *got.entry(id).or_default() += 1;
             }
         }
@@ -811,12 +888,12 @@ mod tests {
         for id in 0..5000u64 {
             crowd.moved(id, [3, 3]);
         }
-        // Les 64 plus proches à chaque fois, puis de plus en plus loin, de moins en
+        // Les 32 plus proches à chaque fois, puis de plus en plus loin, de moins en
         // moins souvent : tout le monde à portée finit par voir chacun.
         let mut sizes = Vec::new();
         let mut first = Vec::new();
         for k in 0..64 {
-            let a = crowd.nearby(100, [3, 3]);
+            let a = crowd.nearby(100, [3, 3], 1);
             assert!(!a.contains(&100));
             if k == 0 {
                 first = a.clone();
@@ -826,18 +903,18 @@ mod tests {
         }
         let count = |n: usize| sizes.iter().filter(|&&s| s == n).count();
         assert_eq!(
-            (count(FANOUT_FULL), count(256), count(1024), count(FANOUT)),
+            (count(FANOUT_FULL), count(128), count(512), count(FANOUT)),
             (48, 12, 3, 1)
         );
         let mut seen: HashMap<u64, usize> = HashMap::new();
         for id in 0..5000u64 {
             for _ in 0..64 {
-                for m in crowd.nearby(id, [3, 3]) {
+                for m in crowd.nearby(id, [3, 3], 1) {
                     *seen.entry(m).or_default() += 1;
                 }
             }
         }
-        let each = 48 * FANOUT_FULL + 12 * 256 + 3 * 1024 + FANOUT;
+        let each = 48 * FANOUT_FULL + 12 * 128 + 3 * 512 + FANOUT;
         assert!(seen.values().all(|&n| n == each), "chacun reçoit autant");
         assert_eq!(seen.len(), 5000);
         // Modifications dans une foule : poussées à `LIVE_MAX` joueurs, les autres les

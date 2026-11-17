@@ -298,7 +298,22 @@ impl Guard {
     /// tenue pour de bon et le joueur repart. Sans retard mesuré dans cette partie, ou
     /// avec des retards de quelques centièmes seulement (voir `FINE`) : zéro, rien n'est
     /// retenu.
+    ///
+    /// Appui long alors qu'aucun retard n'a encore été mesuré après un appui long : la
+    /// touche ne remonte pas plus vite après un long appui qu'après un bref, on retient
+    /// donc au moins le temps qu'elle a mis après les derniers appuis brefs. (Mesuré :
+    /// premier arrêt après 86 s d'appui, 469 ms de retard, rien de retenu et 2,4 blocs
+    /// de trop, alors que les appuis brefs venaient de traîner 94 et 174 ms.) L'inverse
+    /// ne vaut pas : un retard d'appui long ne dit rien d'un appui bref.
     fn patience(&self, held: f32) -> f32 {
+        if held >= LONG_FROM && self.long.is_empty() {
+            let worst = self.short.iter().map(|l| l.0).fold(0.0f32, f32::max);
+            return if worst < FINE {
+                0.0
+            } else {
+                1.3 * worst + 0.03
+            };
+        }
         let lags = if held < LONG_FROM {
             &self.short
         } else {
@@ -795,6 +810,35 @@ mod tests {
             g.set_mode(Mode::On);
             assert_eq!(g.decode_lags(bad, 1_000_100), 0, "{bad:?}");
         }
+    }
+
+    /// Le cas mesuré : en début de partie, deux appuis brefs traînent (94 et 174 ms),
+    /// puis le premier arrêt après un long appui (86 s) traîne 469 ms. Aucun retard
+    /// d'appui long n'était connu : rien n'était retenu. Les appuis brefs servent de
+    /// plancher ; dès le deuxième, la mesure de l'appui long fait foi.
+    #[test]
+    fn the_first_long_hold_is_held_as_long_as_the_short_ones_lagged() {
+        let mut g = Guard::default();
+        g.set_mode(Mode::On);
+        sprint(&mut g, 1.0, Some(0.094));
+        sprint(&mut g, 0.2, Some(0.174));
+        // Retenu 1,3 × 174 ms + 30 ms = 256 ms : il ne marche plus que 213 ms au lieu
+        // de 469.
+        let moved = sprint(&mut g, 86.4, Some(0.469));
+        assert!((moved - 0.213).abs() < 0.02, "{moved}");
+        // Le suivant est tenu en entier (retard d'appui long connu).
+        assert!(sprint(&mut g, 86.4, Some(0.469)) < 0.02);
+        // Des appuis brefs qui remontent bien ne font rien retenir après un long appui.
+        let mut g = Guard::default();
+        g.set_mode(Mode::On);
+        sprint(&mut g, 1.0, Some(0.02));
+        sprint(&mut g, 0.3, Some(0.04));
+        assert!((sprint(&mut g, 30.0, None) - 8.0).abs() < 0.02);
+        // Et un retard d'appui long ne fait rien retenir après un appui bref.
+        let mut g = Guard::default();
+        g.set_mode(Mode::On);
+        sprint(&mut g, 30.0, Some(0.5));
+        assert!((sprint(&mut g, 0.5, None) - 8.0).abs() < 0.02);
     }
 
     #[test]

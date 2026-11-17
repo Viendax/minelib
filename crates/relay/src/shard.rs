@@ -534,14 +534,15 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             chunk,
             data,
         } if peer => {
-            let msg = Response::FromZone {
+            let msg = transport::encode(&Response::FromZone {
                 peer: from,
                 chunk,
                 data,
-            };
-            for m in st.build.nearby(from, chunk) {
+            })?;
+            let relays = st.peers.len() + 1;
+            for m in st.build.nearby(from, chunk, relays) {
                 if let Some(c) = st.conns.get(&m) {
-                    transport::push(&c.tx, &msg);
+                    transport::push_loose(&c.tx, msg.clone());
                 }
             }
             None
@@ -585,27 +586,31 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
         Request::Nearby { chunk, data } => {
             // Le pseudo montré est celui du billet (pas celui que le joueur annonce).
             let data = crate::player_as(&data, logged.as_deref().unwrap_or_default())?;
-            let msg = Response::FromZone {
+            // Plus de positions que le jeu n'en envoie : pas diffusée.
+            if !st.build.pos_due(id) {
+                return None;
+            }
+            // Sérialisée une fois pour tous ; périssable (la suivante la remplace). Chaque
+            // relais de la région ne sert que sa part des voisins.
+            let relays = st.peers.len() + 1;
+            let msg = transport::encode(&Response::FromZone {
                 peer: id,
                 chunk,
-                data,
-            };
-            for m in st.build.nearby(id, chunk) {
+                data: data.clone(),
+            })?;
+            for m in st.build.nearby(id, chunk, relays) {
                 if let Some(c) = st.conns.get(&m) {
-                    transport::push(&c.tx, &msg);
+                    transport::push_loose(&c.tx, msg.clone());
                 }
             }
             // Une fois à chaque autre relais de la région, pour ses propres joueurs.
-            if let Response::FromZone { data, .. } = msg {
+            if let Some(fwd) = transport::encode(&Request::PeerNearby {
+                peer: id,
+                chunk,
+                data,
+            }) {
                 for l in st.peers.values().filter_map(|p| p.link.as_ref()) {
-                    transport::push(
-                        l,
-                        &Request::PeerNearby {
-                            peer: id,
-                            chunk,
-                            data: data.clone(),
-                        },
-                    );
+                    transport::push_loose(l, fwd.clone());
                 }
             }
             // Modifications pas encore reçues (foule, voir `zones::LIVE_MAX`).

@@ -47,6 +47,13 @@ pub enum Marker {
 /// gardée que si, mesure faite, elle ne coûte ni images par seconde ni à-coups ; sinon
 /// elle est abandonnée, et réessayée bien plus tard. Tout se juge sur des moyennes d'une
 /// demi-seconde : un à-coup isolé (chargement, autre programme) ne décide de rien.
+///
+/// Quand l'attente n'est pas en service, le pilote est remis hors du mode basse latence
+/// (`LowLatency::frame_begin`). Avant, il y restait, sans que le jeu lui donne la main à
+/// chaque image : mesuré sur la même RTX 4050, une fois l'attente essayée puis arrêtée,
+/// les images restaient bloquées vers 3,7 ms (250 à 300 par seconde) quelle que soit la
+/// charge de la carte (2,3 à 3,3 ms), avec 2,5 ms perdues dans la présentation ; à charge
+/// égale, 385 images par seconde avant tout essai et 355 avec l'attente.
 #[derive(Clone, Debug, Default)]
 pub struct Pacer {
     /// Attente du pilote en service.
@@ -225,8 +232,13 @@ impl LowLatency {
             return;
         }
         self.enabled = on;
+        // Le pilote ne passe en mode basse latence que pendant que son attente sert
+        // (voir `Pacer`) ; éteint, on repart de zéro.
+        if !on {
+            self.pacer = Pacer::default();
+        }
         #[cfg(windows)]
-        self.imp.set_mode(on);
+        self.imp.set_mode(on && self.pacer.driver_wait);
         log::info!(
             "{} : {}",
             self.kind.label(),
@@ -248,6 +260,10 @@ impl LowLatency {
                 self.kind.label(),
                 self.pacer.why
             );
+            // Le mode basse latence du pilote suit l'attente : sans elle, il est coupé
+            // pour de bon (sinon le pilote bride les images, voir `Pacer`).
+            #[cfg(windows)]
+            self.imp.set_mode(self.pacer.driver_wait);
         }
         #[cfg(windows)]
         if self.enabled {

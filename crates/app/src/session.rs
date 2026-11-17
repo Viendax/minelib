@@ -80,6 +80,11 @@ struct StopMeas {
     first: &'static str,
     /// « Avancer » a-t-elle été vue relâchée depuis le début de la mesure ?
     fwd_up: bool,
+    /// Pendant l'arrêt : une autre touche de déplacement tenue (le joueur continue de
+    /// côté, la distance ne dit rien de l'arrêt), ou les pieds en l'air (saut, rebord :
+    /// le freinage y est plus doux).
+    other: bool,
+    air: bool,
 }
 
 pub struct Session {
@@ -778,7 +783,9 @@ impl Session {
                         }
                     );
                 }
-                self.measure_stop(dt, fwd_held, run_held, released);
+                // (Autre touche de déplacement : de côté, en arrière, monter ou descendre.)
+                let other = m.strafe != 0.0 || m.up != 0.0 || m.forward < 0.0;
+                self.measure_stop(dt, fwd_held, run_held, released, other);
             }
             self.stick.remember();
             if let Some(note) = self.stick.note.take() {
@@ -1957,7 +1964,7 @@ impl Session {
     /// mesure le chemin encore parcouru dans le sens de la course jusqu'à l'arrêt, et dit
     /// s'il y a un mur devant. C'est ce que le joueur voit (« ça continue d'avancer ») ;
     /// les touches seules ne le disent pas.
-    fn measure_stop(&mut self, dt: f32, fwd: bool, run: bool, fwd_released: bool) {
+    fn measure_stop(&mut self, dt: f32, fwd: bool, run: bool, fwd_released: bool, other: bool) {
         let pos = self.player.pos;
         let flat = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z);
         let both = fwd && run;
@@ -1979,6 +1986,8 @@ impl Session {
                     run: (pos - from).length(),
                     first: if run_released { "courir" } else { "avancer" },
                     fwd_up: !fwd,
+                    other: false,
+                    air: false,
                 });
             }
         }
@@ -1986,6 +1995,8 @@ impl Session {
             return;
         };
         s.t += dt;
+        s.other |= other;
+        s.air |= !self.player.flying && !self.player.on_ground;
         // « Avancer » lâchée puis renfoncée : il repart, ce n'est plus un arrêt.
         let again = s.fwd_up && fwd;
         s.fwd_up |= !fwd;
@@ -2000,9 +2011,16 @@ impl Session {
             Some(d) => format!(" ; mur devant à {d:.2} bloc"),
             None => String::new(),
         };
+        // Ce qui allonge un arrêt sans que les touches y soient pour rien.
+        let why = match (s.other, s.air) {
+            (true, true) => " (autre touche de déplacement tenue, et en l'air)",
+            (true, false) => " (autre touche de déplacement tenue)",
+            (false, true) => " (en l'air pendant l'arrêt)",
+            (false, false) => "",
+        };
         log::info!(
             "arrêt {} : {:.2} bloc parcouru après « {} » lâchée{}, parti de {:.1} blocs/s \
-             après une course de {:.1} blocs{wall}",
+             après une course de {:.1} blocs{wall}{why}",
             if self.player.flying {
                 "en vol"
             } else {

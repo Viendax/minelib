@@ -78,15 +78,19 @@ pub(crate) mod tests_support {
     /// Positions envoyées par seconde par un joueur qui en voit `others` autour de lui
     /// (même règle que `pos_every` dans crates/app/src/buildnet.rs).
     pub fn pos_hz(others: usize) -> f32 {
-        (4096.0 / others.max(1) as f32).clamp(20.0, 256.0)
+        (960.0 / others.max(1) as f32).clamp(10.0, 60.0)
     }
 }
 
 /// Joueurs de plus dans la région pour chaque relais de plus (chez un autre hôte), et
 /// relais au plus par région : une foule est partagée entre plusieurs connexions de
 /// joueurs, aucune ne porte toute la région.
+///
+/// 32 relais au plus (8 avant) : jusqu'à 3000 joueurs dans la région, aucun relais n'en
+/// porte plus d'une centaine. À 8, la simulation donnait 375 joueurs et 160 Mbit/s à
+/// envoyer par relais pour 3000 joueurs serrés.
 pub const SHARD_SHARE: usize = 96;
-pub const SHARD_MAX: usize = 8;
+pub const SHARD_MAX: usize = 32;
 
 /// Relais voulus pour une région de `players` joueurs.
 fn shards_wanted(players: usize, from: usize, share: usize) -> usize {
@@ -4043,14 +4047,20 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // Le pseudo montré est celui de la session (pas celui que le joueur annonce).
             let data = player_as(&data, pseudo)?;
             if let Some(room) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
-                let msg = Response::FromZone {
+                // Plus de positions que le jeu n'en envoie : pas diffusée.
+                if !room.build.pos_due(id) {
+                    return None;
+                }
+                // Sérialisée une fois pour tous ; périssable : chez un joueur dont la
+                // connexion ne suit pas, la position suivante la remplace.
+                let msg = transport::encode(&Response::FromZone {
                     peer: id,
                     chunk,
                     data,
-                };
-                for m in room.build.nearby(id, chunk) {
+                })?;
+                for m in room.build.nearby(id, chunk, 1) {
                     if let Some(c) = st.conns.get(&m) {
-                        transport::push(&c.tx, &msg);
+                        transport::push_loose(&c.tx, msg.clone());
                     }
                 }
                 // Modifications pas encore reçues (foule : elles ne sont poussées qu'à une
