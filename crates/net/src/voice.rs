@@ -29,6 +29,60 @@ pub enum VoiceMsg {
     Key { epoch: u32, sealed: Vec<u8> },
     /// Un paquet de voix chiffré.
     Frame { epoch: u32, seq: u32, ct: Vec<u8> },
+    /// Construction (v137) : ma clé publique de session, signée par la clé de mon compte,
+    /// avec le certificat de cette clé (signé par le relais du monde). Un relais qui
+    /// transmet (relais de région, tenu par un joueur) ne peut pas y mettre la sienne pour
+    /// écouter.
+    Signed {
+        pubkey: [u8; 32],
+        cert: crate::sovereign::Cert,
+        sig: Vec<u8>,
+    },
+    /// (v137) Redonne-moi ton bonjour, et ta clé de voix si tu parles : un message s'est
+    /// perdu en route (je reçois tes paquets sans pouvoir les lire, ou je dois te parler sans
+    /// avoir ta clé publique).
+    Ask,
+}
+
+fn hello_bytes(room: u64, pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut m = b"minelib/voix/bonjour/v1".to_vec();
+    m.extend(room.to_le_bytes());
+    m.extend(pubkey);
+    m
+}
+
+/// Bonjour signé par la clé du compte `key`, dont `cert` est le certificat dans le monde
+/// `room`.
+pub fn signed_hello(
+    key: &ed25519_dalek::SigningKey,
+    cert: crate::sovereign::Cert,
+    room: u64,
+    pubkey: [u8; 32],
+) -> VoiceMsg {
+    use ed25519_dalek::Signer;
+    let sig = key.sign(&hello_bytes(room, &pubkey)).to_bytes().to_vec();
+    VoiceMsg::Signed { pubkey, cert, sig }
+}
+
+/// Clé publique de session annoncée par `who` dans un bonjour signé, si le certificat est
+/// celui de `who` dans le monde `room` (signé par le relais du monde `root`, pas périmé) et
+/// la signature celle de sa clé ; sinon `None` (un bonjour non signé aussi).
+pub fn check_hello(msg: &VoiceMsg, who: &str, root: &[u8; 32], room: u64) -> Option<[u8; 32]> {
+    use ed25519_dalek::Verifier;
+    let VoiceMsg::Signed { pubkey, cert, sig } = msg else {
+        return None;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let root = ed25519_dalek::VerifyingKey::from_bytes(root).ok()?;
+    if !cert.pseudo.eq_ignore_ascii_case(who) || cert.expires < now || !cert.valid(&root, room) {
+        return None;
+    }
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&cert.key).ok()?;
+    let sig = ed25519_dalek::Signature::from_slice(sig).ok()?;
+    key.verify(&hello_bytes(room, pubkey), &sig).ok()?;
+    Some(*pubkey)
 }
 
 /// Clés de session d'un joueur.

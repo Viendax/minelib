@@ -20,6 +20,15 @@ use minelib_net::voice::{self, Identity, VoiceMsg, FRAME, RATE};
 const HELLO_EVERY: f32 = 30.0;
 /// Un joueur « parle » encore tant qu'un paquet est arrivé depuis…
 const SPEAKING_S: f32 = 0.3;
+/// Construction (v137) : un message peut se perdre en route (un joueur pas encore relié au
+/// relais de région de celui qui parle). Paquets reçus sans la clé pour les lire, ou
+/// auditeur dont on n'a pas la clé publique : on le lui demande (`VoiceMsg::Ask`), au plus
+/// toutes les…
+const ASK_EVERY: f32 = 2.0;
+/// On répond à une demande (bonjour, et clé de voix si l'on a parlé depuis moins de
+/// `TALK_RECENT`) au plus toutes les…
+const ANSWER_EVERY: f32 = 1.0;
+const TALK_RECENT: f32 = 5.0;
 
 /// Micro ouvert (échantillons mono, à la fréquence du périphérique).
 struct Mic {
@@ -121,8 +130,35 @@ fn resample(input: &[f32], from: u32, phase: &mut f64) -> Vec<f32> {
     out
 }
 
+/// Construction : numéro de voix d'un joueur, tiré de son pseudo (le même partout : par le
+/// relais du monde comme par n'importe quel relais de région).
+pub fn key_of(pseudo: &str) -> u64 {
+    // FNV-1a.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in pseudo.to_ascii_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Construction : de quoi signer mon bonjour (clé du compte, son certificat, monde), et
+/// vérifier ceux des autres (clé du relais du monde, monde).
+pub struct Signer {
+    pub key: minelib_net::ed25519_dalek::SigningKey,
+    pub cert: minelib_net::sovereign::Cert,
+    pub room: u64,
+}
+
 pub struct Voice {
     link: Sender<Inbound>,
+    /// Construction (v137) : les messages ne partent pas d'ici, ils attendent que la partie
+    /// les achemine (par pseudo, par le relais de région ou le relais du monde).
+    out: Option<Vec<(Vec<u64>, Vec<u8>)>>,
+    signer: Option<Signer>,
+    /// Clé du relais du monde et monde : un bonjour qui arrive par un relais de région doit
+    /// être signé par la clé du compte de celui qui le dit.
+    verify: Option<([u8; 32], u64)>,
     id: Identity,
     /// Clés publiques des autres.
     pubkeys: HashMap<u64, [u8; 32]>,
@@ -138,6 +174,14 @@ pub struct Voice {
     theirs: HashMap<u64, (u32, [u8; 32])>,
     /// Bonjour (ma clé publique) déjà donné à chacun : temps avant de le redonner.
     hello: HashMap<u64, f32>,
+    /// À qui demander bonjour et clé (paquets reçus sans pouvoir les lire, auditeur sans
+    /// clé publique), temps avant de pouvoir redemander à chacun, et avant de répondre
+    /// encore à chacun.
+    missing: HashSet<u64>,
+    asked: HashMap<u64, f32>,
+    answered: HashMap<u64, f32>,
+    /// Temps depuis mon dernier paquet de voix.
+    since_talk: f32,
     mic: Option<Mic>,
     mic_failed: bool,
     pending: Vec<f32>,
@@ -146,6 +190,9 @@ pub struct Voice {
     pub talking: bool,
     /// Qui parle (temps depuis le dernier paquet).
     pub speaking: HashMap<u64, f32>,
+    /// Essais : paquets de voix reçus et déchiffrés.
+    #[cfg(test)]
+    pub frames: usize,
 }
 
 /// Temps minimal entre deux changements de clé (s), selon le nombre d'auditeurs. Quand un
@@ -165,6 +212,9 @@ impl Voice {
     pub fn new(link: Sender<Inbound>) -> Self {
         Self {
             link,
+            out: None,
+            signer: None,
+            verify: None,
             id: Identity::new(),
             pubkeys: HashMap::new(),
             my_key: voice::new_voice_key(),
@@ -175,26 +225,89 @@ impl Voice {
             rekey_wait: 0.0,
             theirs: HashMap::new(),
             hello: HashMap::new(),
+            missing: HashSet::new(),
+            asked: HashMap::new(),
+            answered: HashMap::new(),
+            since_talk: f32::MAX,
             mic: None,
             mic_failed: false,
             pending: Vec::new(),
             phase: 0.0,
             talking: false,
             speaking: HashMap::new(),
+            #[cfg(test)]
+            frames: 0,
         }
     }
 
-    fn send(&self, to: Vec<u64>, msg: &VoiceMsg) {
+    /// Essais : un paquet de voix (du silence) à ceux qui ont ma clé, comme si je parlais.
+    #[cfg(test)]
+    pub fn talk_once(&mut self) {
+        let to: Vec<u64> = self.given.iter().copied().collect();
+        let plain = voice::encode(&[0i16; FRAME]);
+        self.seq += 1;
+        self.since_talk = 0.0;
+        let ct = voice::encrypt(&self.my_key, self.epoch, self.seq, &plain);
+        self.send(
+            to,
+            &VoiceMsg::Frame {
+                epoch: self.epoch,
+                seq: self.seq,
+                ct,
+            },
+        );
+    }
+
+    /// Clés publiques connues des autres, clés de voix reçues d'eux.
+    #[cfg(test)]
+    pub fn known(&self) -> (usize, usize) {
+        (self.pubkeys.len(), self.theirs.len())
+    }
+
+    /// Construction : les messages attendent d'être acheminés par la partie (`take_out`).
+    pub fn route_by_pseudo(&mut self) {
+        self.out.get_or_insert_with(Vec::new);
+    }
+
+    /// Construction : ce qui attend d'être acheminé (numéros de voix, message).
+    pub fn take_out(&mut self) -> Vec<(Vec<u64>, Vec<u8>)> {
+        self.out.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Construction : mon bonjour signé avec la clé de mon compte.
+    pub fn set_signer(&mut self, signer: Signer) {
+        if self.signer.as_ref().is_none_or(|s| s.cert != signer.cert) {
+            // (Nouveau certificat : ma clé publique repart signée.)
+            self.hello.clear();
+        }
+        self.signer = Some(signer);
+    }
+
+    /// Construction : vérifier les bonjours avec la clé du relais du monde `root`.
+    pub fn set_verify(&mut self, root: [u8; 32], room: u64) {
+        self.verify = Some((root, room));
+    }
+
+    fn send(&mut self, to: Vec<u64>, msg: &VoiceMsg) {
         if to.is_empty() {
             return;
         }
-        transport::push(
-            &self.link,
-            &Request::Voice {
-                to,
-                data: minelib_net::game::encode(msg),
+        let data = minelib_net::game::encode(msg);
+        if let Some(out) = &mut self.out {
+            out.push((to, data));
+            return;
+        }
+        transport::push(&self.link, &Request::Voice { to, data });
+    }
+
+    /// Mon bonjour : signé si je peux (construction), sinon ma seule clé publique.
+    fn hello_msg(&self) -> VoiceMsg {
+        match &self.signer {
+            Some(s) => voice::signed_hello(&s.key, s.cert.clone(), s.room, self.id.public),
+            None => VoiceMsg::Hello {
+                pubkey: self.id.public,
             },
-        );
+        }
     }
 
     /// À chaque image. `everyone` : tous les joueurs de la partie (clé publique) ;
@@ -216,12 +329,30 @@ impl Voice {
                 due.push(p);
             }
         }
-        self.send(
-            due,
-            &VoiceMsg::Hello {
-                pubkey: self.id.public,
-            },
-        );
+        // Un message perdu en route : je redemande (voir `ASK_EVERY`).
+        self.since_talk = (self.since_talk + dt).min(f32::MAX / 2.0);
+        for t in self.asked.values_mut().chain(self.answered.values_mut()) {
+            *t -= dt;
+        }
+        self.asked.retain(|p, t| *t > 0.0 && near.contains(p));
+        self.answered.retain(|_, t| *t > 0.0);
+        if self.since_talk < TALK_RECENT {
+            for l in listeners {
+                if !self.pubkeys.contains_key(l) {
+                    self.missing.insert(*l);
+                }
+            }
+        }
+        let mut ask = Vec::new();
+        for p in std::mem::take(&mut self.missing) {
+            if near.contains(&p) && !self.asked.contains_key(&p) {
+                self.asked.insert(p, ASK_EVERY);
+                ask.push(p);
+            }
+        }
+        self.send(ask, &VoiceMsg::Ask);
+        let hello = self.hello_msg();
+        self.send(due, &hello);
         // Quelqu'un ne doit plus m'entendre : nouvelle clé.
         let set: HashSet<u64> = listeners.iter().copied().collect();
         // (Il ne reçoit déjà plus mes messages ; la clé change presque aussitôt en petit
@@ -291,6 +422,7 @@ impl Voice {
                 .collect();
             let plain = voice::encode(&frame);
             self.seq += 1;
+            self.since_talk = 0.0;
             let ct = voice::encrypt(&self.my_key, self.epoch, self.seq, &plain);
             self.send(
                 to.clone(),
@@ -303,11 +435,32 @@ impl Voice {
         }
     }
 
-    /// Message vocal reçu de `from`, joué au volume `gain` (0 : coupé).
-    pub fn receive(&mut self, from: u64, data: &[u8], gain: f32) {
-        let Some(msg) = minelib_net::game::decode::<VoiceMsg>(data) else {
+    /// Message vocal reçu de `from`, joué au volume `gain` (0 : coupé). `who` : son pseudo
+    /// (construction), et si le message est passé par un relais de région (il peut mentir :
+    /// un bonjour n'y vaut que signé par la clé du compte de `who`).
+    pub fn receive(&mut self, from: u64, who: Option<(&str, bool)>, data: &[u8], gain: f32) {
+        let Some(mut msg) = minelib_net::game::decode::<VoiceMsg>(data) else {
             return;
         };
+        // Un bonjour arrivé par un relais de région ne vaut que signé par la clé du compte de
+        // celui qui le dit (vérifié avec la clé du relais du monde). Par le relais du monde
+        // (de confiance, comme en FPS), signé ou non, il compte ; signé, il est vérifié si
+        // l'on peut.
+        let relayed = who.is_some_and(|w| w.1);
+        if let VoiceMsg::Signed { pubkey, .. } = &msg {
+            let checked = match (who, self.verify) {
+                (Some((who, _)), Some((root, room))) => voice::check_hello(&msg, who, &root, room),
+                (_, None) if !relayed => Some(*pubkey),
+                _ => None,
+            };
+            match checked {
+                Some(pubkey) => msg = VoiceMsg::Hello { pubkey },
+                None => return,
+            }
+        } else if matches!(msg, VoiceMsg::Hello { .. }) && relayed {
+            // Bonjour non signé passé par un relais de région : refusé.
+            return;
+        }
         match msg {
             VoiceMsg::Hello { pubkey } => match self.pubkeys.insert(from, pubkey) {
                 // Nouvelle clé publique : il faudra lui (re)donner ma clé de voix.
@@ -321,22 +474,46 @@ impl Voice {
                 }
                 Some(_) => {}
             },
+            // Il lui manque mon bonjour ou ma clé (perdus en route) : mon bonjour à la
+            // prochaine image, ma clé aussi si je parle (au plus une fois par
+            // `ANSWER_EVERY` : la demande n'est pas signée, un relais pourrait en inventer).
+            VoiceMsg::Ask => {
+                if self.answered.contains_key(&from) {
+                    return;
+                }
+                self.answered.insert(from, ANSWER_EVERY);
+                self.hello.remove(&from);
+                if self.since_talk < TALK_RECENT {
+                    self.given.remove(&from);
+                }
+            }
+            // (Déjà vérifié et changé en bonjour plus haut.)
+            VoiceMsg::Signed { .. } => {}
             VoiceMsg::Key { epoch, sealed } => {
                 if let Some(k) = self.id.open(&sealed) {
                     self.theirs.insert(from, (epoch, k));
                 }
             }
             VoiceMsg::Frame { epoch, seq, ct } => {
+                // (Pas sa clé, ou plus la bonne : je la lui redemande.)
                 let Some((e, k)) = self.theirs.get(&from) else {
+                    self.missing.insert(from);
                     return;
                 };
                 if *e != epoch {
+                    if epoch > *e {
+                        self.missing.insert(from);
+                    }
                     return;
                 }
                 let Some(plain) = voice::decrypt(k, epoch, seq, &ct) else {
                     return;
                 };
                 self.speaking.insert(from, 0.0);
+                #[cfg(test)]
+                {
+                    self.frames += 1;
+                }
                 if gain > 0.0 {
                     crate::audio::voice(from, voice::decode(&plain, FRAME), gain.min(2.0));
                 }
@@ -385,12 +562,12 @@ mod tests {
         assert_eq!(hellos(&rx), vec![vec![3]], "le nouveau seulement");
         let pubkey = Identity::new().public;
         let hello = minelib_net::game::encode(&VoiceMsg::Hello { pubkey });
-        v.receive(2, &hello, 1.0);
+        v.receive(2, None, &hello, 1.0);
         v.update(0.1, &[1, 2, 3], &[], false);
         assert!(hellos(&rx).is_empty(), "première clé de 2 : rien à redire");
         let relaunched = Identity::new().public;
         let hello = minelib_net::game::encode(&VoiceMsg::Hello { pubkey: relaunched });
-        v.receive(2, &hello, 1.0);
+        v.receive(2, None, &hello, 1.0);
         v.update(0.1, &[1, 2, 3], &[], false);
         assert_eq!(hellos(&rx), vec![vec![2]], "son jeu a été relancé");
         for _ in 0..300 {
@@ -398,6 +575,132 @@ mod tests {
         }
         let all: usize = hellos(&rx).iter().map(|t| t.len()).sum();
         assert_eq!(all, 3, "chacun une fois en 30 s");
+    }
+
+    /// Construction (v137) : les messages perdus en route (un joueur pas encore relié au
+    /// relais de région de l'autre) se rattrapent. Bonjours perdus des deux côtés : celui qui
+    /// parle demande la clé publique de son auditeur ; clé de voix perdue : l'auditeur reçoit
+    /// des paquets illisibles et la redemande.
+    #[test]
+    fn lost_hellos_and_keys_are_asked_again() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut a = Voice::new(tx.clone());
+        let mut b = Voice::new(tx);
+        a.route_by_pseudo();
+        b.route_by_pseudo();
+        let (ka, kb) = (1u64, 2u64);
+        // (Achemine ce que `from` a à envoyer vers `to`, ou le perd.)
+        fn pass(from: &mut Voice, key: u64, to: &mut Voice, lose: bool) -> usize {
+            let out = from.take_out();
+            let n = out.len();
+            if !lose {
+                for (_, d) in out {
+                    to.receive(key, None, &d, 0.0);
+                }
+            }
+            n
+        }
+        // Les deux bonjours se perdent.
+        a.update(0.1, &[kb], &[kb], false);
+        b.update(0.1, &[ka], &[ka], false);
+        pass(&mut a, ka, &mut b, true);
+        pass(&mut b, kb, &mut a, true);
+        // A parle : il n'a pas la clé publique de B, il la lui demande ; B redonne son
+        // bonjour ; A lui donne sa clé de voix, mais elle se perd.
+        a.talk_once();
+        a.update(0.1, &[kb], &[kb], false);
+        assert!(pass(&mut a, ka, &mut b, false) > 0, "demande de A");
+        b.update(0.1, &[ka], &[ka], false);
+        pass(&mut b, kb, &mut a, false);
+        assert_eq!(a.known().0, 1, "A a la clé publique de B");
+        a.update(0.1, &[kb], &[kb], false);
+        pass(&mut a, ka, &mut b, true);
+        // A parle encore : B reçoit des paquets illisibles et redemande la clé ; A la redonne.
+        a.talk_once();
+        pass(&mut a, ka, &mut b, false);
+        assert_eq!(b.frames, 0);
+        b.update(0.1, &[ka], &[ka], false);
+        pass(&mut b, kb, &mut a, false);
+        a.update(0.1, &[kb], &[kb], false);
+        pass(&mut a, ka, &mut b, false);
+        a.talk_once();
+        pass(&mut a, ka, &mut b, false);
+        assert_eq!(b.frames, 1, "B entend A");
+        // Une demande par `ASK_EVERY` au plus, une réponse par `ANSWER_EVERY` au plus.
+        for _ in 0..5 {
+            b.receive(ka, None, &minelib_net::game::encode(&VoiceMsg::Ask), 0.0);
+        }
+        b.update(0.1, &[ka], &[ka], false);
+        let answers = b.take_out();
+        assert_eq!(answers.len(), 1, "un seul bonjour en réponse");
+    }
+
+    /// Construction (v137) : un bonjour arrivé par un relais de région ne vaut que signé par
+    /// la clé du compte de celui qui le dit (certificat du relais du monde) ; un relais qui
+    /// mettrait sa propre clé, ou attribuerait le bonjour d'un joueur à un autre, est ignoré.
+    #[test]
+    fn hellos_through_a_region_relay_must_be_signed_by_the_account() {
+        use minelib_net::ed25519_dalek::SigningKey;
+        let root = SigningKey::from_bytes(&[3; 32]);
+        let room = 42;
+        let account = |name: &str, seed: u8| {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            let cert = minelib_net::sovereign::Cert::issue(
+                &root,
+                room,
+                name,
+                key.verifying_key().to_bytes(),
+                u64::MAX / 2,
+            );
+            Signer { key, cert, room }
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut alice = Voice::new(tx.clone());
+        alice.route_by_pseudo();
+        alice.set_signer(account("Alice", 1));
+        alice.set_verify(root.verifying_key().to_bytes(), room);
+        let mut bob = Voice::new(tx);
+        bob.route_by_pseudo();
+        bob.set_signer(account("Bob", 2));
+        bob.set_verify(root.verifying_key().to_bytes(), room);
+        let (ka, kb) = (key_of("Alice"), key_of("Bob"));
+        alice.update(0.1, &[kb], &[kb], false);
+        let out = alice.take_out();
+        assert_eq!(out.len(), 1);
+        let hello = &out[0].1;
+        // Attribué à un autre par le relais : ignoré.
+        bob.receive(key_of("Carol"), Some(("Carol", true)), hello, 1.0);
+        assert!(!bob.pubkeys.contains_key(&key_of("Carol")));
+        // Le vrai : accepté.
+        bob.receive(ka, Some(("Alice", true)), hello, 1.0);
+        assert!(bob.pubkeys.contains_key(&ka));
+        // Un relais qui met sa propre clé publique dans un bonjour non signé : refusé ;
+        // le même par le relais du monde (de confiance, comme en FPS) : accepté.
+        let fake = minelib_net::game::encode(&VoiceMsg::Hello {
+            pubkey: Identity::new().public,
+        });
+        let before = bob.pubkeys[&ka];
+        bob.receive(ka, Some(("Alice", true)), &fake, 1.0);
+        assert_eq!(bob.pubkeys[&ka], before, "par un relais de région : refusé");
+        bob.receive(ka, Some(("Alice", false)), &fake, 1.0);
+        assert_ne!(bob.pubkeys[&ka], before, "par le relais du monde : accepté");
+        // Signé par une autre clé que celle du certificat (relais qui garde le certificat
+        // d'Alice et signe lui-même sa clé) : refusé.
+        let liar = SigningKey::from_bytes(&[9; 32]);
+        let forged = match minelib_net::game::decode::<VoiceMsg>(hello) {
+            Some(VoiceMsg::Signed { cert, .. }) => {
+                minelib_net::voice::signed_hello(&liar, cert, room, Identity::new().public)
+            }
+            _ => unreachable!(),
+        };
+        let now = bob.pubkeys[&ka];
+        bob.receive(
+            ka,
+            Some(("Alice", true)),
+            &minelib_net::game::encode(&forged),
+            1.0,
+        );
+        assert_eq!(bob.pubkeys[&ka], now);
     }
 
     #[test]

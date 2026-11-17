@@ -133,6 +133,11 @@ impl Handle {
         self.sov_faults.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Messages de voix transmis par ce relais (essais).
+    pub fn voice_relayed(&self) -> usize {
+        self.state.lock().unwrap().voice_relayed
+    }
+
     /// Modifications de régions souveraines archivées ici.
     pub fn sov_committed(&self) -> usize {
         self.sov_committed
@@ -798,6 +803,10 @@ struct Room {
     /// Passations arrivées pendant une pause (hôte, région, époque, lots) : archivées à la
     /// reprise.
     handovers: Vec<(u64, [i32; 2], u64, Vec<sovereign::Batch>)>,
+    /// Construction : joueurs par pseudo (en minuscules), pour la voix adressée par pseudo
+    /// (v137), et le pseudo de chacun.
+    by_pseudo: HashMap<String, u64>,
+    pseudo_of: HashMap<u64, String>,
     /// Construction : garants de zones.
     build: zones::Build,
     /// FPS : garant de secours désigné par l'hôte.
@@ -861,6 +870,18 @@ impl Room {
         self.shards_sent.remove(&id);
         self.set_needs(id, Vec::new());
         self.unserved.remove(&id);
+        if let Some(p) = self.pseudo_of.remove(&id) {
+            if self.by_pseudo.get(&p) == Some(&id) {
+                self.by_pseudo.remove(&p);
+            }
+        }
+    }
+
+    /// Construction : ce joueur porte ce pseudo (voix adressée par pseudo).
+    fn name_player(&mut self, id: u64, pseudo: &str) {
+        let p = pseudo.to_ascii_lowercase();
+        self.by_pseudo.insert(p.clone(), id);
+        self.pseudo_of.insert(id, p);
     }
 
     /// Joueurs de la partie (l'hôte s'il joue, les membres ; pas les garants).
@@ -927,6 +948,9 @@ struct State {
     /// essais en changent).
     audit_every: u32,
     audit_self: u32,
+    /// Messages de voix transmis par ce relais (essais : la voix doit passer par les relais
+    /// de région).
+    voice_relayed: usize,
     /// Ce relais tient le relais de secours d'un monde d'un autre relais.
     standby: Option<StandbyCopy>,
     /// Essais : un relais de secours sur la machine du relais du monde (voir
@@ -998,6 +1022,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         root_t: 0,
         audit_every: AUDIT_EVERY,
         audit_self: AUDIT_SELF,
+        voice_relayed: 0,
         standby: None,
         standby_local: false,
         guard_epoch: Instant::now(),
@@ -1924,6 +1949,8 @@ fn bulk_edit(
 
 /// Auditeurs d'un message vocal, au plus.
 const VOICE_MAX: usize = 256;
+/// Taille au plus d'un message de voix (v137 : par pseudo).
+const VOICE_BYTES: usize = 4096;
 
 /// Demandes d'objets (au sol, coffres) acceptées par joueur et par seconde.
 const ITEM_RATE: u32 = 40;
@@ -2701,6 +2728,7 @@ fn ticket_for(st: &State, rid: u64, id: u64) -> Option<Response> {
         pseudo,
         expires,
         cert,
+        root: st.cert_key.verifying_key().to_bytes(),
     })
 }
 
@@ -3492,6 +3520,31 @@ fn take_handover(
     }
 }
 
+/// Fréquentation : parler à quelqu'un compte, au plus une fois par 30 s et par auditeur.
+fn note_talk(st: &mut State, id: u64, pseudo: &str, heard: Vec<u64>) {
+    let now = Instant::now();
+    let mut fresh = Vec::new();
+    if let Some(c) = st.conns.get_mut(&id) {
+        c.talked
+            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(120));
+        for t in heard {
+            let due = c
+                .talked
+                .get(&t)
+                .is_none_or(|l| now.duration_since(*l) >= Duration::from_secs(30));
+            if due && c.talked.len() < 1024 {
+                c.talked.insert(t, now);
+                fresh.push(t);
+            }
+        }
+    }
+    for t in fresh {
+        if let Some(q) = st.conns.get(&t).and_then(|c| c.pseudo.clone()) {
+            st.contacts.add(pseudo, &q, contacts::VOICE);
+        }
+    }
+}
+
 /// Faute prouvée d'un hôte (hôte principal, hôte qui avait confirmé un lot fautif,
 /// vérificateur qui a menti) : écarté de tout rôle de garant, il quitte le monde.
 fn ban_host(st: &mut State, host: u64) {
@@ -3715,6 +3768,7 @@ fn send_shards(st: &mut State, rid: u64, id: u64) {
             pseudo,
             expires,
             cert,
+            root: st.cert_key.verifying_key().to_bytes(),
         },
     );
     transport::push(&c.tx, &Response::Shards { list });
@@ -4268,6 +4322,8 @@ fn open_room(
             needs_of: HashMap::new(),
             unserved: HashSet::new(),
             handovers: Vec::new(),
+            by_pseudo: HashMap::new(),
+            pseudo_of: HashMap::new(),
             build: zones::Build::default(),
             backup: None,
             hidden: std::collections::BTreeSet::new(),
@@ -4297,6 +4353,7 @@ fn open_room(
         let dir = st.cfg.dir.join("zones").join(rid.to_string());
         if let Some(room) = st.rooms.get_mut(&rid) {
             room.build.set_page_dir(dir);
+            room.name_player(id, pseudo);
         }
     }
     log::info!("partie {rid} ouverte par « {pseudo} »");
@@ -4431,6 +4488,7 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
     r.members.push(id);
     if r.kind == 1 {
         r.unserved.insert(id);
+        r.name_player(id, pseudo);
     }
     // FPS : pas de nom tant que la partie n'a pas commencé (on ne choisit pas ses
     // adversaires en quittant la recherche).
@@ -6045,29 +6103,46 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     heard.push(t);
                 }
             }
-            // Fréquentation : parler à quelqu'un compte, au plus une fois par 30 s et par
-            // auditeur.
-            let now = Instant::now();
-            let mut fresh = Vec::new();
-            if let Some(c) = st.conns.get_mut(&id) {
-                c.talked
-                    .retain(|_, t| now.duration_since(*t) < Duration::from_secs(120));
-                for t in heard {
-                    let due = c
-                        .talked
-                        .get(&t)
-                        .is_none_or(|l| now.duration_since(*l) >= Duration::from_secs(30));
-                    if due && c.talked.len() < 1024 {
-                        c.talked.insert(t, now);
-                        fresh.push(t);
-                    }
+            st.voice_relayed += heard.len();
+            note_talk(st, id, pseudo, heard);
+            return None;
+        }
+        // Construction (v137) : voix adressée par pseudo, hors des régions servies par un
+        // relais de région (le jeu ne connaît pas toujours le numéro ici d'un joueur qu'il
+        // voit par un relais de région).
+        Request::VoiceTo { to, data } => {
+            let rid = my_room?;
+            let room = st.rooms.get(&rid).filter(|r| r.kind == 1)?;
+            if data.len() > VOICE_BYTES {
+                return None;
+            }
+            let msg = transport::encode(&Response::VoiceFrom {
+                from: pseudo.to_string(),
+                data,
+            })?;
+            // (Une fois à chacun, même nommé deux fois.)
+            let mut names: Vec<String> = to
+                .into_iter()
+                .take(VOICE_MAX)
+                .map(|p| p.to_ascii_lowercase())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            let mut heard = Vec::new();
+            for p in names {
+                let Some(&t) = room.by_pseudo.get(&p) else {
+                    continue;
+                };
+                if t == id {
+                    continue;
+                }
+                if let Some(c) = st.conns.get(&t) {
+                    transport::push_raw(&c.tx, msg.clone());
+                    heard.push(t);
                 }
             }
-            for t in fresh {
-                if let Some(q) = st.conns.get(&t).and_then(|c| c.pseudo.clone()) {
-                    st.contacts.add(pseudo, &q, contacts::VOICE);
-                }
-            }
+            st.voice_relayed += heard.len();
+            note_talk(st, id, pseudo, heard);
             return None;
         }
         Request::GarantAvailable { on } => {
@@ -6265,6 +6340,7 @@ fn handle(
             | Request::Accuse { .. }
             | Request::Audited { .. }
             | Request::Spot { .. }
+            | Request::VoiceTo { .. }
             | Request::Handover { .. }
             | Request::RoomStarted { .. }
             | Request::Join { .. }
@@ -8840,6 +8916,28 @@ mod tests {
                 .as_deref(),
             Some("Createur")
         );
+        // Voix par pseudo (v137, hors des régions servies par un relais de région) : une
+        // fois à chacun, même nommé deux fois ; ni à soi-même, ni à un inconnu.
+        transport::push(
+            &clink,
+            &Request::VoiceTo {
+                to: vec![
+                    "eve".into(),
+                    "EVE".into(),
+                    "Inconnu".into(),
+                    "Createur".into(),
+                ],
+                data: vec![1, 2, 3],
+            },
+        );
+        match wait(&eve, |e| matches!(e, Event::VoiceFrom { .. })) {
+            Event::VoiceFrom { from, data } => {
+                assert_eq!((from.as_str(), data), ("Createur", vec![1, 2, 3]))
+            }
+            _ => unreachable!(),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(h.voice_relayed(), 1);
         // Position d'Eve gardée par le relais : elle la retrouve en revenant.
         transport::push(
             &elink,
@@ -10257,9 +10355,8 @@ mod tests {
                     }
                 }
                 pos_t += t.elapsed();
-                // Un joueur sur dix redit où il est (`Spot`, toutes les 10 s), un sur trente
-                // donne sa clé de voix à 20 voisins (toutes les 30 s ; v135 : à tous ses
-                // voisins toutes les 3 s).
+                // Un joueur sur dix redit où il est (`Spot`, toutes les 10 s). (La voix — v137 :
+                // bonjours, clés et paquets — passe par les relais de région : plus rien ici.)
                 let t = Instant::now();
                 for (i, &id) in players.iter().enumerate() {
                     if rnd() % 10 == 0 {
@@ -10271,20 +10368,6 @@ mod tests {
                                 pos: [c[0] as f32 * 16.0, 70.0, c[1] as f32 * 16.0],
                                 yaw: 0.0,
                                 pitch: 0.0,
-                            },
-                        );
-                    }
-                    if rnd() % 30 == 0 {
-                        let g = i / 100 * 100;
-                        let to: Vec<u64> = (0..20)
-                            .map(|k| players[(g + (i + 1 + k * 4) % 100).min(n - 1)])
-                            .collect();
-                        crowd.ask(
-                            st,
-                            id,
-                            Request::Voice {
-                                to,
-                                data: vec![0; 40],
                             },
                         );
                     }

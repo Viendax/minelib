@@ -104,6 +104,11 @@ struct Sovereign {
 const ORPHANS_MAX: usize = 256;
 /// Des lots manquent : redemandés au plus une fois par ce temps.
 const RESEND_EVERY: Duration = Duration::from_millis(500);
+/// Voix (v137) : destinataires au plus par message, taille au plus, messages au plus par
+/// seconde et par joueur (50 paquets de voix, plus les clés et les bonjours).
+const VOICE_TO: usize = 256;
+const VOICE_BYTES: usize = 4096;
+const VOICE_RATE: u32 = 120;
 
 /// Comment joindre un autre relais de la région (directement ou par un tunnel).
 pub type Dial = Arc<dyn Fn(&proto::ShardInfo) -> Resolver + Send + Sync>;
@@ -153,6 +158,24 @@ struct State {
     /// Essais : le prochain lot scellé comme hôte principal contiendra une modification
     /// inventée (voir `ShardHandle::forge_once`).
     forge: bool,
+    /// Voix envoyée par chaque joueur dans la seconde en cours (début, nombre).
+    voice_rate: HashMap<u64, (Instant, u32)>,
+    /// Joueurs entrés (pseudo en minuscules → connexions) : à qui remettre la voix.
+    players: HashMap<String, Vec<u64>>,
+    /// Messages de voix remis par ce relais (essais).
+    voice_sent: usize,
+}
+
+/// Destinataires d'un message de voix : au plus `VOICE_TO`, en minuscules, sans doublon.
+fn voice_names(to: Vec<String>) -> Vec<String> {
+    let mut to: Vec<String> = to
+        .into_iter()
+        .take(VOICE_TO)
+        .map(|p| p.to_ascii_lowercase())
+        .collect();
+    to.sort_unstable();
+    to.dedup();
+    to
 }
 
 fn now_ms() -> u64 {
@@ -267,6 +290,56 @@ impl State {
         sv.pending.push(edit.clone());
         sv.pending_since.get_or_insert_with(Instant::now);
         self.deliver_set(edit.pos, edit.block, &edit.pseudo, seq);
+    }
+
+    /// Voix : ce joueur peut-il encore en envoyer dans cette seconde ?
+    fn voice_due(&mut self, id: u64) -> bool {
+        let r = self.voice_rate.entry(id).or_insert((Instant::now(), 0));
+        if r.0.elapsed() >= Duration::from_secs(1) {
+            *r = (Instant::now(), 0);
+        }
+        r.1 += 1;
+        r.1 <= VOICE_RATE
+    }
+
+    /// Voix de `from` à ceux de ses destinataires (pseudos en minuscules, sans doublon)
+    /// entrés dans ce relais.
+    fn deliver_voice(&mut self, from: &str, to: &[String], data: &[u8]) {
+        let Some(msg) = transport::encode(&Response::VoiceFrom {
+            from: from.to_string(),
+            data: data.to_vec(),
+        }) else {
+            return;
+        };
+        let me = from.to_ascii_lowercase();
+        let mut sent = 0;
+        for name in to.iter().filter(|n| **n != me) {
+            for id in self.players.get(name).into_iter().flatten() {
+                if let Some(c) = self.conns.get(id) {
+                    transport::push_raw(&c.tx, msg.clone());
+                    sent += 1;
+                }
+            }
+        }
+        self.voice_sent += sent;
+    }
+
+    /// Une connexion fermée : plus de voix pour elle.
+    fn forget(&mut self, id: u64) {
+        if let Some(name) = self
+            .conns
+            .remove(&id)
+            .and_then(|c| c.pseudo)
+            .map(|p| p.to_ascii_lowercase())
+        {
+            if let Some(ids) = self.players.get_mut(&name) {
+                ids.retain(|i| *i != id);
+                if ids.is_empty() {
+                    self.players.remove(&name);
+                }
+            }
+        }
+        self.voice_rate.remove(&id);
     }
 
     /// Hôte principal : scelle et publie ce qui attend (aux autres relais de la région, et
@@ -553,6 +626,11 @@ impl ShardHandle {
         self.state.lock().unwrap().forge = true;
     }
 
+    /// Messages de voix remis par ce relais (essais).
+    pub fn voice_sent(&self) -> usize {
+        self.state.lock().unwrap().voice_sent
+    }
+
     /// Joueurs entrés dans ce relais.
     pub fn players(&self) -> usize {
         let st = self.state.lock().unwrap();
@@ -793,6 +871,9 @@ pub fn start(
         ack: None,
         ack_since: None,
         forge: false,
+        voice_rate: HashMap::new(),
+        players: HashMap::new(),
+        voice_sent: 0,
     }));
     let st = state.clone();
     std::thread::Builder::new()
@@ -867,7 +948,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>, private: &[u8; 32]) -> Result<
     };
     let r = serve_loop(&mut chan, state, id);
     let mut st = state.lock().unwrap();
-    st.conns.remove(&id);
+    st.forget(id);
     st.build.left(id);
     r
 }
@@ -923,6 +1004,7 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             if !ok {
                 return Some(err(ErrorCode::WrongCredentials, "billet refusé"));
             }
+            let mut was = None;
             if let Some(c) = st.conns.get_mut(&id) {
                 // Un autre relais de la région : son nom ne peut pas être celui d'un
                 // joueur, et seul un hôte de ce monde a pu le signer.
@@ -930,7 +1012,20 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
                 c.slot = pseudo
                     .strip_prefix("#relais")
                     .and_then(|n| n.parse::<u16>().ok());
-                c.pseudo = Some(pseudo.clone());
+                was = c.pseudo.replace(pseudo.clone());
+            }
+            // (Index de la voix : un joueur, pas un autre relais.)
+            if let Some(old) = was.map(|p| p.to_ascii_lowercase()) {
+                if let Some(ids) = st.players.get_mut(&old) {
+                    ids.retain(|i| *i != id);
+                }
+                st.players.retain(|_, ids| !ids.is_empty());
+            }
+            if !pseudo.starts_with('#') {
+                st.players
+                    .entry(pseudo.to_ascii_lowercase())
+                    .or_default()
+                    .push(id);
             }
             // Certificat de la clé du compte (signé par le relais du monde) : ses
             // modifications signées seront reconnues.
@@ -1028,12 +1123,38 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             }
             None
         }
+        // D'un autre relais de la région : la voix d'un de ses joueurs, pour les nôtres.
+        Request::PeerVoice { from, to, data } if peer => {
+            if data.len() <= VOICE_BYTES {
+                st.deliver_voice(&from, &voice_names(to), &data);
+            }
+            None
+        }
         Request::PeerNearby { .. }
         | Request::PeerAsk { .. }
         | Request::PeerBatch { .. }
         | Request::PeerReject { .. }
-        | Request::PeerResend { .. } => None,
+        | Request::PeerResend { .. }
+        | Request::PeerVoice { .. } => None,
         _ if peer => None,
+        // Voix d'un joueur d'ici (v137) : à ceux de ses destinataires entrés dans ce relais,
+        // et une fois à chaque autre relais de la région (pour les siens). Le nom de celui
+        // qui parle est celui de son billet ; le contenu, chiffré de bout en bout, reste
+        // illisible ici.
+        Request::VoiceTo { to, data } => {
+            let from = logged.clone()?;
+            if data.len() > VOICE_BYTES || !st.voice_due(id) {
+                return None;
+            }
+            let to = voice_names(to);
+            st.deliver_voice(&from, &to, &data);
+            if let Some(fwd) = transport::encode(&Request::PeerVoice { from, to, data }) {
+                for l in st.peers.values().filter_map(|p| p.link.as_ref()) {
+                    transport::push_raw(l, fwd.clone());
+                }
+            }
+            None
+        }
         Request::Position { chunk } => {
             let logs = st.build.moved(id, chunk, &|_| true);
             if let Some(c) = st.conns.get(&id) {

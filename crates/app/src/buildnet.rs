@@ -179,6 +179,11 @@ pub struct BuildNet {
     relayed_beat: bool,
     /// Prochain envoi au relais du monde de là où l'on est (`Request::Spot`).
     spot_timer: f32,
+    /// Voix arrivée par les relais de région depuis la dernière lecture (qui parle,
+    /// message).
+    voice_in: Vec<(String, Vec<u8>)>,
+    /// Clé du relais du monde (dans le billet) : vérifie les bonjours de la voix.
+    root: Option<[u8; 32]>,
     /// Clé du compte (modifications signées dans une région souveraine), et date de la
     /// dernière signature.
     identity: Option<minelib_net::ed25519_dalek::SigningKey>,
@@ -356,6 +361,8 @@ impl BuildNet {
             served_sent: Vec::new(),
             relayed_beat: false,
             spot_timer: 0.0,
+            voice_in: Vec::new(),
+            root: None,
             identity: None,
             sign_t: 0,
             caps_sent: false,
@@ -398,6 +405,11 @@ impl BuildNet {
     ) {
         self.shards.pseudo = pseudo.clone();
         self.shards.ticket = Some((room, pseudo, expires, mac, cert));
+    }
+
+    /// Clé du relais du monde (dans le billet) : vérifie les bonjours de la voix.
+    pub fn set_root(&mut self, root: [u8; 32]) {
+        self.root = Some(root);
     }
 
     /// Clé du compte : signe ses modifications dans une région souveraine.
@@ -786,6 +798,7 @@ impl BuildNet {
                     Event::Link(l) => c.link = Some(l),
                     Event::FromZone { chunk, data, .. } => received.push((c.serial, chunk, data)),
                     Event::Paused(_) => self.relayed_beat = true,
+                    Event::VoiceFrom { from, data } => self.voice_in.push((from, data)),
                     Event::Error(m) | Event::Offline(m) => {
                         log::info!("relais de la région {region:?} : {m}");
                         broken.push(*region);
@@ -878,6 +891,46 @@ impl BuildNet {
         self.others
             .retain(|_, o| o.seen < STALE_S.max(o.interval * 3.0));
         (caps, dirty)
+    }
+
+    /// Voix (v137) : par le relais de région de là où l'on est, s'il est relié (il la
+    /// remet à ceux de ses joueurs qui doivent l'entendre, et aux autres relais de la
+    /// région pour les leurs) ; sinon par le relais du monde.
+    pub fn send_voice(&self, to: Vec<String>, data: Vec<u8>) {
+        if to.is_empty() {
+            return;
+        }
+        let req = Request::VoiceTo { to, data };
+        match self
+            .chunk
+            .and_then(|c| self.shards.link(proto::region_of(c)))
+        {
+            Some(l) => {
+                transport::push(l, &req);
+            }
+            None => self.send(req),
+        }
+    }
+
+    /// Voix arrivée par les relais de région depuis le dernier appel : (qui parle,
+    /// message).
+    pub fn take_voice(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.voice_in)
+    }
+
+    /// De quoi signer et vérifier les bonjours de la voix : clé du compte, certificat et
+    /// monde (du billet), clé du relais du monde.
+    pub fn voice_keys(
+        &self,
+    ) -> Option<(
+        minelib_net::ed25519_dalek::SigningKey,
+        minelib_net::sovereign::Cert,
+        u64,
+        [u8; 32],
+    )> {
+        let key = self.identity.clone()?;
+        let (room, _, _, _, cert) = self.shards.ticket.as_ref()?;
+        Some((key, cert.clone()?, *room, self.root?))
     }
 
     /// Un relais de région a redit le battement du relais du monde depuis le dernier appel
@@ -1212,6 +1265,8 @@ mod tests {
         cert: Option<minelib_net::sovereign::Cert>,
         /// Lots d'autres régions vérifiés pour le relais du monde.
         audits: u32,
+        /// Voix (sans micro : bonjours et clés seulement), acheminée comme dans le jeu.
+        voice: Option<crate::voice::Voice>,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -1277,6 +1332,7 @@ mod tests {
                 follower: false,
                 cert: None,
                 audits: 0,
+                voice: None,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
@@ -1315,6 +1371,7 @@ mod tests {
                 follower: true,
                 cert: None,
                 audits: 0,
+                voice: None,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b.c.send(Cmd::GarantAvailable(true));
@@ -1457,6 +1514,16 @@ mod tests {
                         s.world_beat(paused);
                     }
                 }
+                Event::VoiceFrom { from, data } => {
+                    if let Some(v) = &mut self.voice {
+                        v.receive(
+                            crate::voice::key_of(&from),
+                            Some((&from, false)),
+                            &data,
+                            0.0,
+                        );
+                    }
+                }
                 Event::Identity(key) => {
                     if let Some(n) = &mut self.net {
                         n.set_identity(Some(key.clone()));
@@ -1477,12 +1544,14 @@ mod tests {
                     expires,
                     mac,
                     cert,
+                    root,
                 } => {
                     if cert.is_some() {
                         self.cert = cert.clone();
                     }
                     if let Some(n) = &mut self.net {
                         n.set_ticket(room, pseudo, expires, mac, cert);
+                        n.set_root(root);
                     }
                 }
                 Event::RoomClosed => {
@@ -1643,6 +1712,33 @@ mod tests {
                 let _ = n.update(&mut self.world, self.pos, (0.0, 0.0), 0.0, 4.0, 144.0, dt);
                 self.used_shard |= n.shard_links() > 0;
             }
+            self.voice_tick(dt);
+        }
+
+        /// Voix, comme `Session::route_voice` : tous les joueurs vus sont voisins.
+        fn voice_tick(&mut self, dt: f32) {
+            let (Some(v), Some(n)) = (&mut self.voice, &mut self.net) else {
+                return;
+            };
+            if let Some((key, cert, room, root)) = n.voice_keys() {
+                v.set_verify(root, room);
+                v.set_signer(crate::voice::Signer { key, cert, room });
+            }
+            let names: HashMap<u64, String> = n
+                .others
+                .values()
+                .map(|o| (crate::voice::key_of(&o.pseudo), o.pseudo.clone()))
+                .collect();
+            let near: Vec<u64> = names.keys().copied().collect();
+            v.route_by_pseudo();
+            v.update(dt, &near, &near, false);
+            for (keys, data) in v.take_out() {
+                let to: Vec<String> = keys.iter().filter_map(|k| names.get(k).cloned()).collect();
+                n.send_voice(to, data);
+            }
+            for (from, data) in n.take_voice() {
+                v.receive(crate::voice::key_of(&from), Some((&from, true)), &data, 0.0);
+            }
         }
     }
 
@@ -1667,6 +1763,9 @@ mod tests {
         /// nom d'un joueur et la montre aux siens. Il doit être pris, écarté et remplacé,
         /// et les mondes rester identiques (le bloc inventé défait chez ceux qui l'ont vu).
         forger: bool,
+        /// Les joueurs ont la voix (bonjours signés, clés) : elle doit passer par les relais
+        /// de la région, presque plus par le relais du monde.
+        voice: bool,
     }
 
     /// Construction en ligne à petite échelle, de bout en bout (vrai relais, vraies
@@ -1778,6 +1877,9 @@ mod tests {
         let mut edited = std::collections::BTreeSet::new();
         let mut had_garant = false;
         let mut gone: Vec<usize> = Vec::new();
+        // (Voix : étape où tous sont reliés au relais de leur région, et ce qu'avaient alors
+        // remis les relais de région et le relais du monde.)
+        let mut voice_from: Option<(usize, usize, usize)> = None;
         // 6 secondes de jeu : on bouge, on construit des deux côtés de la frontière.
         for step in 0..300 {
             // (Une fois les relais de la région reliés : sur une machine chargée, ils
@@ -1787,6 +1889,38 @@ mod tests {
                 garant.c.send(Cmd::Leave);
                 garant.net = None;
                 garant.shard = None;
+            }
+            // La voix (tant qu'un joueur n'est pas relié au relais de sa région, la sienne
+            // passe par le relais du monde) ; puis on parle (un paquet de voix de temps en
+            // temps). Compté à partir du moment où tous sont reliés.
+            if sc.voice && step == 100 {
+                for b in &mut bots {
+                    let link = b.link.clone().expect("file d'envoi");
+                    b.voice = Some(crate::voice::Voice::new(link));
+                }
+            }
+            if sc.voice
+                && step >= 100
+                && voice_from.is_none()
+                && bots.iter().all(|b| {
+                    let n = b.net.as_ref().unwrap();
+                    n.chunk
+                        .is_some_and(|c| n.shards.link(proto::region_of(c)).is_some())
+                })
+            {
+                let by_relays: usize = std::iter::once(garant.shard.as_ref())
+                    .chain(extra.iter().map(|(_, g)| g.shard.as_ref()))
+                    .flatten()
+                    .map(|s| s.voice_sent())
+                    .sum();
+                voice_from = Some((step, by_relays, h.voice_relayed()));
+            }
+            if sc.voice && step >= 150 && step % 10 == 0 {
+                for b in &mut bots {
+                    if let Some(v) = &mut b.voice {
+                        v.talk_once();
+                    }
+                }
             }
             if step == 150 && sc.owner_leaves {
                 bots[0].c.send(Cmd::Leave);
@@ -1943,6 +2077,45 @@ mod tests {
                     live.len() - 1
                 );
             }
+        }
+        if sc.voice {
+            // Chacun a reçu, par les relais de la région, la clé publique (signée par la
+            // clé de son compte) et la clé de voix d'au moins la moitié des autres ; le
+            // relais du monde n'a presque rien transmis.
+            let talkers: Vec<&&Bot> = live.iter().filter(|b| b.voice.is_some()).collect();
+            for b in &talkers {
+                let (keys, voices) = b.voice.as_ref().unwrap().known();
+                let frames = b.voice.as_ref().unwrap().frames;
+                assert!(frames > 0, "{} n'a rien entendu", b.name);
+                assert!(
+                    keys * 2 >= talkers.len() - 1,
+                    "{} : {keys} clés publiques sur {}",
+                    b.name,
+                    talkers.len() - 1
+                );
+                assert!(
+                    voices * 2 >= talkers.len() - 1,
+                    "{} : {voices} clés de voix sur {}",
+                    b.name,
+                    talkers.len() - 1
+                );
+            }
+            let by_relays: usize = std::iter::once(garant.shard.as_ref())
+                .chain(extra.iter().map(|(_, g)| g.shard.as_ref()))
+                .flatten()
+                .map(|s| s.voice_sent())
+                .sum();
+            let by_root = h.voice_relayed();
+            let (step, relays0, root0) = voice_from.expect("tous reliés au relais de leur région");
+            let (by_relays, by_root) = (by_relays - relays0, by_root - root0);
+            eprintln!(
+                "voix (depuis l'étape {step}) : {by_relays} messages remis par les relais de \
+                 région, {by_root} par le relais du monde"
+            );
+            assert!(
+                by_relays > 20 * by_root.max(1),
+                "la voix passe par les relais de région ({by_relays} contre {by_root})"
+            );
         }
         // La référence : le propriétaire du moment (celui qui enregistre le monde).
         let owner = live
@@ -2457,6 +2630,20 @@ mod tests {
             two_relays: true,
             three_relays: true,
             forger: true,
+            ..Default::default()
+        });
+    }
+
+    /// Voix dans une région souveraine (v137) : les joueurs s'entendent par les relais de
+    /// la région (bonjours signés par la clé de leur compte, clés de voix), et la voix ne
+    /// passe presque plus par le relais du monde.
+    #[test]
+    fn voice_goes_through_region_relays() {
+        run(Scenario {
+            players: 8,
+            shards: true,
+            two_relays: true,
+            voice: true,
             ..Default::default()
         });
     }

@@ -897,6 +897,7 @@ impl Accounts {
                 | Event::Shards(_)
                 | Event::Judge { .. }
                 | Event::Voice { .. }
+                | Event::VoiceFrom { .. }
                 | Event::HostChanged(_)
                 | Event::FromPeer { .. }
                 | Event::Witness { .. }

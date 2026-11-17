@@ -345,6 +345,11 @@ pub enum Event {
         room: u64,
         paused: bool,
     },
+    /// Construction (v137) : voix d'un joueur, nommé par le relais qui la transmet.
+    VoiceFrom {
+        from: String,
+        data: Vec<u8>,
+    },
     /// Hôte principal d'une région souveraine : modifications signées par le relais du
     /// monde à la place de leurs auteurs.
     RootEdits {
@@ -406,6 +411,7 @@ pub enum Event {
         expires: u64,
         mac: [u8; 32],
         cert: Option<crate::sovereign::Cert>,
+        root: [u8; 32],
     },
     BackupIs(u64),
     Judge {
@@ -817,6 +823,7 @@ impl Worker {
                 batch,
             },
             Response::WorldBeat { room, paused } => Event::WorldBeat { room, paused },
+            Response::VoiceFrom { from, data } => Event::VoiceFrom { from, data },
             Response::Shards { list } => Event::Shards(list),
             Response::ShardTicket {
                 room,
@@ -824,12 +831,14 @@ impl Worker {
                 expires,
                 mac,
                 cert,
+                root,
             } => Event::ShardTicket {
                 room,
                 pseudo,
                 expires,
                 mac,
                 cert,
+                root,
             },
             Response::FromZone { peer, chunk, data } => Event::FromZone { peer, chunk, data },
             // Banni pendant la session : déconnecté.

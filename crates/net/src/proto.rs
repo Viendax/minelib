@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 35;
+pub const PROTOCOL: u32 = 36;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -464,6 +464,19 @@ pub enum Request {
         yaw: f32,
         pitch: f32,
     },
+    /// Construction (v137) : voix adressée par pseudo, au relais de région de là où l'on
+    /// est (qui la remet à ses joueurs et aux autres relais de la région), ou au relais du
+    /// monde. Réponse aux destinataires : `Response::VoiceFrom`.
+    VoiceTo {
+        to: Vec<String>,
+        data: Vec<u8>,
+    },
+    /// Entre relais d'une même région : la voix d'un de ses joueurs, pour les siens.
+    PeerVoice {
+        from: String,
+        to: Vec<String>,
+        data: Vec<u8>,
+    },
 }
 
 impl Request {
@@ -505,6 +518,8 @@ impl Request {
                 | Request::CheatFound { .. }
                 | Request::Audited { .. }
                 | Request::Spot { .. }
+                | Request::VoiceTo { .. }
+                | Request::PeerVoice { .. }
         )
     }
 }
@@ -842,6 +857,9 @@ pub enum Response {
         expires: u64,
         mac: [u8; 32],
         cert: Option<crate::sovereign::Cert>,
+        /// Clé du relais du monde (celle des certificats) : le jeu vérifie avec elle les
+        /// bonjours signés de la voix (v137).
+        root: [u8; 32],
     },
     /// Garant extérieur d'un serveur de construction (un joueur d'une autre partie, sans
     /// lien avec celle-ci) : il recevra ses zones (`Zones`) et validera les modifications.
@@ -963,6 +981,12 @@ pub enum Response {
         room: u64,
         paused: bool,
     },
+    /// Construction (v137) : voix d'un joueur, nommé par le relais qui la transmet (celui de
+    /// sa session, pas celui qu'il annonce).
+    VoiceFrom {
+        from: String,
+        data: Vec<u8>,
+    },
 }
 
 impl Response {
@@ -1017,6 +1041,7 @@ impl Response {
                 | Response::Standby { .. }
                 | Response::Audit { .. }
                 | Response::WorldBeat { .. }
+                | Response::VoiceFrom { .. }
         )
     }
 }

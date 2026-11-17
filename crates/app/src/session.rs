@@ -2277,6 +2277,10 @@ impl Session {
     /// Événement du relais pour la partie en ligne.
     pub fn net_event(&mut self, e: &minelib_net::client::Event) {
         use minelib_net::client::Event;
+        if let Event::VoiceFrom { from, data } = e {
+            self.voice_from(from, data, false);
+            return;
+        }
         if let Event::Voice { from, data } = e {
             let (name, dist) = self.speaker(*from);
             let mut gain = self.volume.max(0.05) * 1.6;
@@ -2290,7 +2294,7 @@ impl Session {
                 gain *= (1.0 - d / VOICE_RANGE).clamp(0.0, 1.0);
             }
             if let Some(v) = &mut self.voice {
-                v.receive(*from, data, gain);
+                v.receive(*from, None, data, gain);
             }
             return;
         }
@@ -2313,7 +2317,11 @@ impl Session {
                     expires,
                     mac,
                     cert,
-                } => b.set_ticket(*room, pseudo.clone(), *expires, *mac, cert.clone()),
+                    root,
+                } => {
+                    b.set_ticket(*room, pseudo.clone(), *expires, *mac, cert.clone());
+                    b.set_root(*root);
+                }
                 // WorldEdit refusé (pas OP) : les blocs reviennent.
                 // Arrivée sur le serveur : là où l'on était (gardé par le relais).
                 Event::BuildSpawn { pos, yaw, pitch } => {
@@ -4164,7 +4172,7 @@ impl Session {
             return b
                 .others
                 .values()
-                .find(|o| o.id == Some(id))
+                .find(|o| crate::voice::key_of(&o.pseudo) == id)
                 .map_or((String::new(), Some(VOICE_RANGE)), |o| {
                     (o.pseudo.clone(), Some((o.pos - self.player.pos).length()))
                 });
@@ -4175,6 +4183,59 @@ impl Session {
             .and_then(|n| n.rows().into_iter().find(|r| r.id == id))
             .map_or_else(String::new, |r| r.pseudo);
         (name, None)
+    }
+
+    /// Construction (v137) : voix reçue (par le relais du monde, ou par un relais de région
+    /// : `relayed`), jouée au volume choisi pour ce joueur, plus bas avec la distance.
+    fn voice_from(&mut self, from: &str, data: &[u8], relayed: bool) {
+        let key = crate::voice::key_of(from);
+        let dist = self.build.as_ref().and_then(|b| {
+            b.others
+                .values()
+                .find(|o| o.pseudo.eq_ignore_ascii_case(from))
+                .map(|o| (o.pos - self.player.pos).length())
+        });
+        let mut gain = self.volume.max(0.05) * 1.6;
+        gain *= self
+            .voice_volumes
+            .get(&from.to_lowercase())
+            .copied()
+            .unwrap_or(1.0);
+        gain *= (1.0 - dist.unwrap_or(VOICE_RANGE) / VOICE_RANGE).clamp(0.0, 1.0);
+        if let Some(v) = &mut self.voice {
+            v.receive(key, Some((from, relayed)), data, gain);
+        }
+    }
+
+    /// Construction (v137) : ce que la voix a à envoyer part par pseudo (par le relais de
+    /// région de là où l'on est, sinon par le relais du monde) ; ce qu'ont apporté les
+    /// relais de région est joué. Clés de signature et de vérification des bonjours tenues
+    /// à jour.
+    fn route_voice(&mut self) {
+        let Some(b) = &mut self.build else { return };
+        let incoming = b.take_voice();
+        if let (Some(v), Some((key, cert, room, root))) = (&mut self.voice, b.voice_keys()) {
+            v.set_verify(root, room);
+            v.set_signer(crate::voice::Signer { key, cert, room });
+        }
+        if let Some(v) = &mut self.voice {
+            let out = v.take_out();
+            if !out.is_empty() {
+                let names: HashMap<u64, String> = b
+                    .others
+                    .values()
+                    .map(|o| (crate::voice::key_of(&o.pseudo), o.pseudo.clone()))
+                    .collect();
+                for (keys, data) in out {
+                    let to: Vec<String> =
+                        keys.iter().filter_map(|k| names.get(k).cloned()).collect();
+                    b.send_voice(to, data);
+                }
+            }
+        }
+        for (from, data) in incoming {
+            self.voice_from(&from, &data, true);
+        }
     }
 
     /// Joueurs de la partie (pour le vocal) : tous, et ceux qui doivent m'entendre.
@@ -4199,7 +4260,7 @@ impl Session {
             let mut by_dist: Vec<(f32, u64)> = b
                 .others
                 .values()
-                .filter_map(|o| Some(((o.pos - me).length(), o.id?)))
+                .map(|o| ((o.pos - me).length(), crate::voice::key_of(&o.pseudo)))
                 .filter(|(d, _)| *d < VOICE_RANGE * 1.5)
                 .collect();
             by_dist.sort_by(|x, y| x.0.total_cmp(&y.0));
@@ -4222,9 +4283,15 @@ impl Session {
         }
         let ptt = !typing && self.keys.held(input, Action::FpsVoice);
         let (all, listen) = self.voice_peers();
+        let build = self.build.is_some();
         if let Some(v) = &mut self.voice {
+            // Construction : la voix part par pseudo (voir `route_voice`).
+            if build {
+                v.route_by_pseudo();
+            }
             v.update(dt, &all, &listen, ptt);
         }
+        self.route_voice();
         // Tab maintenu : clic droit libère la souris ; Tab lâché : on rejoue.
         let tab = !self.chat.open && input.held(KeyCode::Tab);
         if tab && input.mouse_pressed(minelib_platform::Mouse::Right) {

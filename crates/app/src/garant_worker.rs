@@ -611,6 +611,12 @@ impl ShardHost {
         self.handle.set_signer(key);
     }
 
+    /// Messages de voix remis par ce relais.
+    #[cfg(test)]
+    pub fn voice_sent(&self) -> usize {
+        self.handle.voice_sent()
+    }
+
     /// Région souveraine : ce relais en est l'hôte principal.
     #[cfg(test)]
     pub fn is_primary(&self) -> bool {
