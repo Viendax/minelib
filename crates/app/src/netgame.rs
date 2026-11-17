@@ -261,6 +261,26 @@ pub enum Rule {
     SelfHurt(u32),
 }
 
+/// Activité d'un joueur lue dans le journal (chez l'hôte comme chez le vérificateur, au
+/// même endroit) : des entrées qui changent, ou n'importe quelle demande. Sert à sortir de
+/// la partie un joueur en vie qui ne touche plus à rien (`Match::tick_afk`).
+fn note_activity(m: &mut Match, who: u64, mv: &Move) {
+    let sig = |i: &NetInput| {
+        (i.forward as u8 as u64)
+            | (i.strafe as u8 as u64) << 8
+            | (i.jump as u64) << 16
+            | (i.jump_pressed as u64) << 17
+            | (i.walk as u64) << 18
+            | (i.duck as u64) << 19
+            | ((i.yaw.to_bits() ^ i.pitch.to_bits().rotate_left(13)) as u64) << 24
+    };
+    match mv {
+        Move::Input(_, i) | Move::Own(i, _) => m.input_seen(who, sig(i)),
+        Move::Rule(Rule::Msg(_)) => m.touch(who),
+        _ => {}
+    }
+}
+
 /// Demandes d'un joueur que le relais montre aussi au vérificateur (il sait ainsi que
 /// l'hôte ne les invente pas et ne les oublie pas).
 pub fn witnessed(m: &ToHost) -> bool {
@@ -770,6 +790,7 @@ impl Auditor {
         for (t, who, mv) in &new.log {
             let (t, who) = (*t, *who);
             dbg_alive("verif", t as u64, who, "(avant)", &m);
+            note_activity(&mut m, who, mv);
             match mv {
                 Move::Input(seq, input) => {
                     let others = solid(&m, &players, &ready, who);
@@ -2635,6 +2656,7 @@ impl Host {
     /// Note un coup au journal et à la chaîne.
     fn record(&mut self, who: u64, mv: Move) {
         dbg_alive("hote", self.tick as u64, who, "(avant)", &self.m);
+        note_activity(&mut self.m, who, &mv);
         self.chain = chain_step(&self.chain, self.tick, who, &mv);
         self.log.push((self.tick, who, mv));
         if self.log.len() > 100_000 {
@@ -2841,6 +2863,18 @@ impl Host {
                     }
                 }
                 Ev::Paused(on) => out.push(Local::Paused(on)),
+                Ev::AfkKick(id) => {
+                    // Il quitte la partie de lui-même à la réception (le relais compte
+                    // alors son absence comme une déconnexion) et peut la rejoindre.
+                    let reason = "Sorti de la partie pour inactivité (2 minutes en vie sans \
+                                  jouer). Tu peux la rejoindre."
+                        .to_string();
+                    if id == 0 {
+                        out.push(Local::Kicked(reason));
+                    } else {
+                        self.send_to(id, &ToPeer::Kicked { reason });
+                    }
+                }
                 Ev::TeamKillKick(id) => {
                     let reason = format!(
                         "Exclu de la partie : {} coéquipiers tués.",

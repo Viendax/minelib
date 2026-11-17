@@ -1424,11 +1424,13 @@ fn mesh_block(
                                 id,
                                 light_at(b),
                                 def.key.ends_with(":hanging"),
-                                // Chaîne seulement si quelque chose la retient au-dessus
-                                // (bloc, barrière, chaîne…).
+                                // Chaîne seulement si quelque chose de visible la retient
+                                // au-dessus (bloc, clôture, chaîne… ; pas un bloc
+                                // invisible comme la barrière des cartes).
                                 {
                                     let up = pad.get(x, y + 1, z).def();
-                                    up.target && !matches!(up.shape, Shape::Cross)
+                                    up.target
+                                        && !matches!(up.shape, Shape::Cross | Shape::Invisible)
                                 },
                             );
                             return;

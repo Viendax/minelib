@@ -24,7 +24,7 @@ use glam::Vec3;
 use minelib_net::game::{
     bomb, phase, reason, GroundGun, MatchHud, MatchSummary, ScoreRow, SummaryPlayer, VoteHud, Zone,
     CT, DROP_BOMB, ITEM_HELMET, ITEM_KEVLAR, ITEM_KIT, ITEM_NADE, PAUSE_TACTICAL, PAUSE_TECHNICAL,
-    T, VOTE_KICK, VOTE_PAUSE,
+    T, VOTE_KICK, VOTE_PAUSE, VOTE_SURRENDER,
 };
 
 use crate::weapons::WEAPONS;
@@ -46,6 +46,13 @@ const WARMUP_RESPAWN_S: f32 = 2.0;
 pub const START_MONEY: u32 = 800;
 const OT_MONEY: u32 = 12_500;
 pub const MAX_MONEY: u32 = 16_000;
+/// En vie dans une manche en cours sans toucher une commande pendant ce temps : sorti de
+/// la partie.
+pub const AFK_S: f32 = 120.0;
+/// Manches jouées sans un coéquipier avant que le reste de l'équipe soit compensé.
+pub const ABSENT_ROUNDS: u8 = 2;
+/// Compensation par joueur absent et par manche, partagée entre les coéquipiers présents.
+pub const ABSENT_COMP: u32 = 2_500;
 const WIN_ELIM: u32 = 3_250;
 const WIN_BOMB: u32 = 3_500;
 const LOSS_BASE: u32 = 1_400;
@@ -155,6 +162,15 @@ pub struct MPlayer {
     shots_tick: u32,
     /// Il faudra repartir avec le pistolet de départ (mort pendant la manche).
     pub reset: bool,
+    /// Temps passé en vie dans une manche en cours sans toucher une seule commande (s),
+    /// et empreinte de ses dernières entrées (pour voir qu'elles changent).
+    #[serde(default)]
+    pub idle: f32,
+    #[serde(default)]
+    last_input: u64,
+    /// Manches commencées sans lui depuis qu'il est parti.
+    #[serde(default)]
+    pub missed: u8,
 }
 
 impl MPlayer {
@@ -203,6 +219,9 @@ pub enum Ev {
     TeamKillKick(u64),
     /// Exclu par un vote de son équipe.
     VoteKick(u64),
+    /// Sorti de la partie pour inactivité (2 minutes en vie sans rien toucher) : il peut
+    /// revenir, et il est puni comme pour une déconnexion.
+    AfkKick(u64),
     /// Pause commencée (true) ou finie : le relais ne compte pas ce temps dans les
     /// absences.
     Paused(bool),
@@ -281,6 +300,14 @@ pub struct Match {
     /// Un joueur s'est déconnecté : pause technique au prochain départ.
     #[serde(default)]
     pub tech_pending: bool,
+    /// Compensations versées au départ de cette manche : (joueur absent, son équipe, part
+    /// de chaque coéquipier). S'il revient avant la fin du temps de départ, elles sont
+    /// reprises.
+    #[serde(default)]
+    comp: Vec<(u64, u8, u32)>,
+    /// Équipe (de départ : 0 a commencé CT) qui a abandonné.
+    #[serde(default)]
+    pub surrendered: Option<u8>,
     #[serde(default)]
     pub pause: Option<Pause>,
 }
@@ -390,6 +417,8 @@ impl Match {
             timeouts: [0, 0],
             pending_timeouts: Vec::new(),
             tech_pending: false,
+            comp: Vec::new(),
+            surrendered: None,
             pause: None,
         }
     }
@@ -648,9 +677,28 @@ impl Match {
             p.present = true;
             p.alive = false;
             p.reset = true;
+            p.idle = 0.0;
+            p.missed = 0;
             let name = p.pseudo.clone();
+            let team = p.team;
             self.players.insert(id, p);
-            return vec![Ev::Say(format!("{name} est de retour."))];
+            let mut ev = vec![Ev::Say(format!("{name} est de retour."))];
+            // Revenu pendant le temps de départ : la compensation versée pour son absence
+            // à cette manche est reprise tout de suite (ce qu'il en reste). Revenu en
+            // pleine manche : elle reste, et il n'y en aura plus à la suivante.
+            let mine: u32 = self.comp.iter().filter(|c| c.0 == old).map(|c| c.2).sum();
+            self.comp.retain(|c| c.0 != old);
+            if self.phase == phase::FREEZE && mine > 0 {
+                for q in self.players.values_mut() {
+                    if q.present && q.team == team && q.pseudo != name {
+                        q.money = q.money.saturating_sub(mine);
+                    }
+                }
+                ev.push(Ev::Say(format!(
+                    "Compensation de la manche reprise (-${mine} par coéquipier)."
+                )));
+            }
+            return ev;
         }
         let (ct, t) = (self.count(CT), self.count(T));
         let max = self.team_max();
@@ -722,6 +770,9 @@ impl Match {
                 shots_left: BURST,
                 shots_tick: 0,
                 reset: true,
+                idle: 0.0,
+                last_input: 0,
+                missed: 0,
             },
         );
         self.assign_colors(team);
@@ -1117,6 +1168,7 @@ impl Match {
             }
             phase::LIVE | phase::PLANTED => {
                 self.live_for += dt;
+                self.tick_afk(dt, places, &mut ev);
                 self.tick_bomb(dt, places, &mut ev);
                 self.check_round(&mut ev, places);
             }
@@ -1252,6 +1304,111 @@ impl Match {
         self.ground.clear();
         ev.push(Ev::NewRound);
         ev.push(Ev::Say(format!("Manche {}.", self.played + 1)));
+        self.compensate(ev);
+    }
+
+    /// Départ d'une manche : une équipe à qui il manque un joueur depuis au moins
+    /// `ABSENT_ROUNDS` manches (déconnecté, sorti pour inactivité, exclu pour avoir tué
+    /// ses coéquipiers — pas exclu par un vote de l'équipe, qui en profiterait) reçoit
+    /// `ABSENT_COMP` par absent, partagé entre les présents.
+    fn compensate(&mut self, ev: &mut Vec<Ev>) {
+        self.comp.clear();
+        for team in [CT, T] {
+            let absent: Vec<u64> = self
+                .players
+                .iter()
+                .filter(|(_, p)| {
+                    !p.present && p.team == team && !p.kicked && p.missed >= ABSENT_ROUNDS
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            let here = self.count_present(team) as u32;
+            if absent.is_empty() || here == 0 {
+                continue;
+            }
+            // Part de chacun pour un absent, arrondie à 50 $.
+            let part = (ABSENT_COMP / here).div_ceil(50) * 50;
+            let each = part * absent.len() as u32;
+            for p in self.players.values_mut() {
+                if p.present && p.team == team {
+                    p.money = (p.money + each).min(MAX_MONEY);
+                }
+            }
+            for &a in &absent {
+                self.comp.push((a, team, part));
+            }
+            let side = if team == CT {
+                "antiterroristes"
+            } else {
+                "terroristes"
+            };
+            let who = if absent.len() == 1 {
+                "1 joueur absent".to_string()
+            } else {
+                format!("{} joueurs absents", absent.len())
+            };
+            ev.push(Ev::Say(format!(
+                "Compensation ({side}, {who}) : +${each} par joueur présent."
+            )));
+        }
+        for p in self.players.values_mut() {
+            if !p.present {
+                p.missed = p.missed.saturating_add(1);
+            }
+        }
+    }
+
+    fn count_present(&self, team: u8) -> usize {
+        self.players
+            .values()
+            .filter(|p| p.present && p.team == team)
+            .count()
+    }
+
+    /// Les entrées d'un pas de `id` (leur empreinte) : si elles ont changé, il joue.
+    pub fn input_seen(&mut self, id: u64, sig: u64) {
+        if let Some(p) = self.players.get_mut(&id) {
+            if p.last_input != sig {
+                p.last_input = sig;
+                p.idle = 0.0;
+            }
+        }
+    }
+
+    /// `id` vient de faire quelque chose (tir, achat, vote, message) : il joue.
+    pub fn touch(&mut self, id: u64) {
+        if let Some(p) = self.players.get_mut(&id) {
+            p.idle = 0.0;
+        }
+    }
+
+    /// Inactivité : le temps passé en vie dans une manche en cours sans rien toucher
+    /// s'ajoute d'une manche à l'autre ; à `AFK_S`, le joueur sort de la partie comme s'il
+    /// s'était déconnecté (il peut revenir).
+    fn tick_afk(&mut self, dt: f32, places: &BTreeMap<u64, Place>, ev: &mut Vec<Ev>) {
+        let mut out = Vec::new();
+        for (&id, p) in self.players.iter_mut() {
+            if p.present && p.alive {
+                p.idle += dt;
+                if p.idle >= AFK_S {
+                    out.push(id);
+                }
+            }
+        }
+        for id in out {
+            let pending = self.tech_pending;
+            let name = self.players[&id].pseudo.clone();
+            self.leave(id, places.get(&id).map(|pl| pl.feet));
+            // Pas de pause technique pour un joueur inactif.
+            self.tech_pending = pending;
+            if let Some(p) = self.players.get_mut(&id) {
+                p.idle = 0.0;
+            }
+            ev.push(Ev::Say(format!(
+                "{name} est sorti de la partie pour inactivité (il peut revenir)."
+            )));
+            ev.push(Ev::AfkKick(id));
+        }
     }
 
     fn tick_bomb(&mut self, dt: f32, places: &BTreeMap<u64, Place>, ev: &mut Vec<Ev>) {
@@ -1549,9 +1706,15 @@ impl Match {
             })
             .collect();
         players.sort_by(|a, b| a.pseudo.cmp(&b.pseudo));
+        // Abandon : l'autre équipe gagne (au moins 13 manches, et plus que la perdante).
+        let mut score = self.wins;
+        if let Some(loser) = self.surrendered {
+            let (l, w) = (loser as usize & 1, 1 - (loser as usize & 1));
+            score[w] = score[w].max(WIN).max(score[l].saturating_add(1));
+        }
         MatchSummary {
             map_sig: self.map_sig,
-            score: self.wins,
+            score,
             rounds: self.played.min(255) as u8,
             players,
         }
@@ -1685,10 +1848,10 @@ impl Match {
             .collect()
     }
 
-    /// Oui nécessaires : tous les votants (exclusion), la majorité (pause).
+    /// Oui nécessaires : tous les votants (exclusion, abandon), la majorité (pause).
     fn needed(&self, v: &Vote) -> usize {
         let n = self.voters(v).len();
-        if v.kind == VOTE_KICK {
+        if v.kind == VOTE_KICK || v.kind == VOTE_SURRENDER {
             n
         } else {
             n / 2 + 1
@@ -1731,6 +1894,12 @@ impl Match {
                     return Err(format!("Ton équipe a déjà pris ses {TIMEOUTS} pauses."));
                 }
                 "une pause tactique".to_string()
+            }
+            VOTE_SURRENDER => {
+                if !self.started() {
+                    return Err("Pas d'abandon pendant l'échauffement.".into());
+                }
+                "d'abandonner la partie".to_string()
             }
             _ => return Err("Vote inconnu.".into()),
         };
@@ -1808,6 +1977,26 @@ impl Match {
                         ev.push(Ev::Say(format!("{} est exclu par son équipe.", t.pseudo)));
                     }
                     ev.push(Ev::VoteKick(v.target));
+                }
+                VOTE_SURRENDER => {
+                    // L'équipe abandonne : la partie s'arrête, gagnée par l'autre.
+                    let loser = self.start_of(v.team);
+                    self.surrendered = Some(loser);
+                    self.votes.clear();
+                    self.pause = None;
+                    self.phase = phase::GAME_OVER;
+                    self.time = 0.0;
+                    let side = if v.team == CT {
+                        "antiterroristes"
+                    } else {
+                        "terroristes"
+                    };
+                    ev.push(Ev::Say(format!("Les {side} abandonnent la partie.")));
+                    let summary = self.summary();
+                    let (a, b) = (summary.score[0], summary.score[1]);
+                    ev.push(Ev::Say(format!("Fin de la partie : {a} - {b}.")));
+                    ev.push(Ev::GameOver(summary));
+                    return;
                 }
                 _ => {
                     let side = self.start_side(v.team) as u8;
@@ -1991,6 +2180,202 @@ mod tests {
         m.call_vote(ct[0], VOTE_KICK, ct[1]).unwrap();
         m.ballot(ct[2], false);
         assert!(m.votes.is_empty());
+    }
+
+    /// Avance de `secs` pendant que tous les joueurs jouent (bougent).
+    fn play(m: &mut Match, secs: f32) -> Vec<Ev> {
+        let ids: Vec<u64> = m.players.keys().copied().collect();
+        let mut ev = Vec::new();
+        for s in 0..secs.ceil() as u64 {
+            for &id in &ids {
+                m.input_seen(id, 1 + s % 2);
+            }
+            ev.extend(run(m, 1.0));
+        }
+        ev
+    }
+
+    fn says(ev: &[Ev], part: &str) -> bool {
+        ev.iter()
+            .any(|e| matches!(e, Ev::Say(t) if t.contains(part)))
+    }
+
+    #[test]
+    fn an_idle_living_player_leaves_after_two_minutes_and_may_come_back() {
+        let mut m = full_match();
+        run(&mut m, FREEZE_S + 0.1);
+        assert_eq!(m.phase, phase::LIVE);
+        let afk = *m.players.iter().find(|(_, p)| p.team == CT).unwrap().0;
+        let name = m.players[&afk].pseudo.clone();
+        // Tous jouent sauf lui, pendant 100 s de manche : rien encore.
+        let ids: Vec<u64> = m.players.keys().copied().filter(|&i| i != afk).collect();
+        let mut ev = Vec::new();
+        let mut live = 0.0;
+        let step = |m: &mut Match, ev: &mut Vec<Ev>| {
+            for &id in &ids {
+                m.touch(id);
+            }
+            let before = m.phase;
+            ev.extend(run(m, 1.0));
+            matches!(before, phase::LIVE | phase::PLANTED) as u32 as f32
+        };
+        while live < 100.0 {
+            live += step(&mut m, &mut ev);
+        }
+        assert!(!ev.iter().any(|e| matches!(e, Ev::AfkKick(_))));
+        assert!(m.players[&afk].present);
+        // Le temps s'ajoute d'une manche à l'autre (pas pendant le départ, ni mort) :
+        // à 2 minutes en vie sans rien toucher, il sort.
+        while live < 125.0 && !ev.contains(&Ev::AfkKick(afk)) {
+            live += step(&mut m, &mut ev);
+        }
+        assert!(ev.contains(&Ev::AfkKick(afk)), "sorti après {live} s");
+        assert!(live >= 115.0, "pas avant deux minutes : {live} s");
+        assert!(says(&ev, "inactivité"));
+        let p = &m.players[&afk];
+        assert!(!p.present && !p.alive && !p.excluded());
+        // Pas de pause technique pour ça.
+        assert!(!m.tech_pending);
+        // Personne d'autre n'est sorti.
+        assert_eq!(ev.iter().filter(|e| matches!(e, Ev::AfkKick(_))).count(), 1);
+        // Il revient (même pseudo, nouvelle connexion) : il retrouve sa place.
+        let back = m.join(500, &name);
+        assert!(says(&back, "de retour"));
+        assert!(m.players[&500].present && m.players[&500].idle == 0.0);
+        // Un joueur qui bouge la souris ou tire n'est jamais sorti.
+        let mut m = full_match();
+        let ev = play(&mut m, FREEZE_S + 300.0);
+        assert!(!ev.iter().any(|e| matches!(e, Ev::AfkKick(_))));
+    }
+
+    #[test]
+    fn a_team_short_of_players_for_two_rounds_is_compensated_until_they_return() {
+        let mut m = full_match();
+        let cts: Vec<u64> = m
+            .players
+            .iter()
+            .filter(|(_, p)| p.team == CT)
+            .map(|(&i, _)| i)
+            .collect();
+        let (gone, gone2) = (cts[0], cts[1]);
+        let names = [
+            m.players[&gone].pseudo.clone(),
+            m.players[&gone2].pseudo.clone(),
+        ];
+        let mate = cts[4];
+        // Fin de manche rapide : les T sont tués, puis départ de la suivante.
+        let next_round = |m: &mut Match| {
+            let mut ev = play(m, FREEZE_S + 0.5);
+            kill_team(m, T);
+            let n = m.played;
+            while m.played == n || m.phase != phase::FREEZE {
+                ev.extend(play(m, 1.0));
+            }
+            ev
+        };
+        play(&mut m, FREEZE_S + 1.0);
+        m.leave(gone, None);
+        kill_team(&mut m, T);
+        // Deux manches sans lui : pas encore de compensation.
+        let mut ev = Vec::new();
+        while m.phase != phase::FREEZE {
+            ev.extend(play(&mut m, 1.0));
+        }
+        ev.extend(next_round(&mut m));
+        assert!(!says(&ev, "Compensation"), "{ev:?}");
+        assert_eq!(m.players[&gone].missed, 2);
+        // Troisième départ sans lui : 2500 $ partagés entre les 4 présents (650 chacun),
+        // annoncé dans le tchat ; rien pour l'autre équipe.
+        let before = m.players[&mate].money;
+        let t_before: u32 = m
+            .players
+            .values()
+            .filter(|p| p.team == T)
+            .map(|p| p.money)
+            .sum();
+        let ev = next_round(&mut m);
+        assert!(says(&ev, "+$650"), "{ev:?}");
+        assert!(says(&ev, "1 joueur absent"));
+        let _ = (before, t_before);
+        // Un second joueur part : après ses deux manches, la compensation s'adapte
+        // (2 absents, 3 présents : 850 par absent, 1700 chacun).
+        m.leave(gone2, None);
+        next_round(&mut m);
+        next_round(&mut m);
+        let ev = next_round(&mut m);
+        assert!(
+            says(&ev, "2 joueurs absents") && says(&ev, "+$1700"),
+            "{ev:?}"
+        );
+        // Le premier revient pendant le temps de départ : sa part de cette manche est
+        // reprise tout de suite, celle de l'autre absent reste.
+        assert_eq!(m.phase, phase::FREEZE);
+        let money = m.players[&mate].money;
+        let ev = m.join(600, &names[0]);
+        assert!(says(&ev, "-$850"), "{ev:?}");
+        assert_eq!(m.players[&mate].money, money - 850);
+        // Manche suivante : compensation pour un seul absent (2500 / 4 présents).
+        let ev = next_round(&mut m);
+        assert!(says(&ev, "1 joueur absent") && says(&ev, "+$650"), "{ev:?}");
+        // Le second revient en pleine manche : rien n'est repris, et plus de
+        // compensation à la manche suivante.
+        play(&mut m, FREEZE_S + 1.0);
+        assert_eq!(m.phase, phase::LIVE);
+        let money = m.players[&mate].money;
+        let ev = m.join(601, &names[1]);
+        assert!(!says(&ev, "Compensation"));
+        assert_eq!(m.players[&mate].money, money);
+        kill_team(&mut m, T);
+        let mut ev = Vec::new();
+        while m.phase != phase::FREEZE {
+            ev.extend(play(&mut m, 1.0));
+        }
+        assert!(!says(&ev, "Compensation"), "{ev:?}");
+        // Exclu par un vote de son équipe : pas de compensation (l'équipe l'a voulu).
+        m.players.get_mut(&cts[2]).unwrap().kicked = true;
+        m.leave(cts[2], None);
+        let mut ev = next_round(&mut m);
+        ev.extend(next_round(&mut m));
+        ev.extend(next_round(&mut m));
+        assert!(!says(&ev, "Compensation"), "{ev:?}");
+    }
+
+    #[test]
+    fn a_whole_team_can_surrender_and_the_other_wins() {
+        let mut m = full_match();
+        play(&mut m, FREEZE_S + 1.0);
+        let ts: Vec<u64> = m
+            .players
+            .iter()
+            .filter(|(_, p)| p.team == T)
+            .map(|(&i, _)| i)
+            .collect();
+        // Proposé : il faut le oui de toute l'équipe ; un non suffit à refuser.
+        m.call_vote(ts[0], VOTE_SURRENDER, u64::MAX).unwrap();
+        for &t in &ts[1..4] {
+            assert!(m.ballot(t, true).is_empty());
+        }
+        assert!(says(&m.ballot(ts[4], false), "refusé"));
+        assert_eq!(m.surrendered, None);
+        // Tous d'accord : la partie s'arrête, l'autre équipe gagne 13 à 0.
+        m.call_vote(ts[1], VOTE_SURRENDER, u64::MAX).unwrap();
+        let mut ev = Vec::new();
+        for &t in &ts {
+            ev.extend(m.ballot(t, true));
+        }
+        assert!(says(&ev, "abandonnent"));
+        assert_eq!(m.phase, phase::GAME_OVER);
+        let over = ev.iter().find_map(|e| match e {
+            Ev::GameOver(s) => Some(s.clone()),
+            _ => None,
+        });
+        let s = over.expect("fin de partie");
+        // Les T ont commencé T (indice 1) : ils perdent.
+        assert_eq!(s.score, [WIN, 0]);
+        // Pas d'abandon pendant l'échauffement.
+        let mut w = Match::new(FpsMap::default(), [0; 32], 7);
+        w.join(1, "A");
+        assert!(w.call_vote(1, VOTE_SURRENDER, u64::MAX).is_err());
     }
 
     fn full_match() -> Match {

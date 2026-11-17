@@ -1604,14 +1604,16 @@ impl Session {
             }
             match self.inventory.selected_item() {
                 Some(Item::Block(b)) if free && !self.player.overlaps_block([x, y, z]) => {
-                    // Lanterne posée sous un bloc (clic sur son dessous), ou sans rien
-                    // dessous mais avec un bloc au-dessus : suspendue.
+                    // Lanterne posée sous un bloc visible (clic sur son dessous), ou sans
+                    // rien dessous mais avec un bloc au-dessus : suspendue.
                     let b = {
                         let key = &b.def().key;
                         let lantern = key == "lantern" || key == "soul_lantern";
                         let held = |dy: i32| {
                             let d = self.world.get(x, y + dy, z).def();
-                            d.target && !matches!(d.shape, minelib_world::registry::Shape::Cross)
+                            use minelib_world::registry::Shape;
+                            // (Un bloc invisible ne retient rien.)
+                            d.target && !matches!(d.shape, Shape::Cross | Shape::Invisible)
                         };
                         if lantern && held(1) && (hit.normal == [0, -1, 0] || !held(-1)) {
                             minelib_world::registry::registry()
@@ -3655,6 +3657,8 @@ impl Session {
             };
             let title = if v.kind == minelib_net::game::VOTE_KICK {
                 format!("Exclure {} ?", name(v.target))
+            } else if v.kind == minelib_net::game::VOTE_SURRENDER {
+                "Abandonner la partie ?".to_string()
             } else {
                 "Pause tactique ?".to_string()
             };

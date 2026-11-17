@@ -187,6 +187,8 @@ pub struct MatchHud {
 /// Sortes de votes (comme dans CS) : exclure un coéquipier, pause tactique.
 pub const VOTE_KICK: u8 = 1;
 pub const VOTE_PAUSE: u8 = 2;
+/// Abandonner la partie (toute l'équipe doit être d'accord) : l'autre équipe gagne.
+pub const VOTE_SURRENDER: u8 = 3;
 
 /// Sortes de pauses : tactique (30 s, demandée par une équipe), technique (joueur
 /// déconnecté : jusqu'à son retour, 5 minutes au plus).

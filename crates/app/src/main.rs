@@ -2033,6 +2033,11 @@ impl Game {
                     }
                 }
             }
+            // Abandon : toute l'équipe doit dire oui (l'autre équipe gagne).
+            y += 24.0 * s;
+            if c.button("Proposer d'abandonner la partie", cx, y, 240.0, *can_pause) {
+                vote = Some((minelib_net::game::VOTE_SURRENDER, u64::MAX));
+            }
         }
         let online = self
             .session
