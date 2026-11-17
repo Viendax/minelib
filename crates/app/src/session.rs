@@ -184,6 +184,7 @@ pub struct Session {
     coast_logged: bool,
     /// Touche « avancer » qui remonte mal : règle apprise pour ce joueur.
     stick: crate::stick::Guard,
+    fwd_was: bool,
     coast_air: f32,
     /// Ligne de l'écran de débogage : touches tenues et déplacement demandé.
     move_debug: String,
@@ -394,6 +395,7 @@ impl Session {
             coast: 0.0,
             coast_logged: false,
             stick: crate::stick::Guard::restored(),
+            fwd_was: false,
             coast_air: 0.0,
             move_debug: String::new(),
             injected_warned: false,
@@ -692,6 +694,22 @@ impl Session {
             // (Pas en mode FPS : « marcher » relâchée y veut dire courir, pas s'arrêter.)
             if !fps_mode {
                 let fwd_held = keys.held(input, Action::Forward);
+                // Avancer relâchée sans que « courir » soit tenue : rien ne protège ce cas
+                // (la touche a pu traîner) ; le journal note à quelle vitesse on allait.
+                if self.fwd_was
+                    && !fwd_held
+                    && !keys.held(input, Action::Sprint)
+                    && self.stick.active()
+                {
+                    let v = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
+                    if v > 1.0 {
+                        log::info!(
+                            "touche avancer : relâchée seule à {v:.1} blocs/s (vol : {})",
+                            self.player.flying
+                        );
+                    }
+                }
+                self.fwd_was = fwd_held;
                 if self.stick.update(
                     dt,
                     fwd_held,
@@ -703,6 +721,9 @@ impl Session {
                 }
             }
             self.stick.remember();
+            if let Some(note) = self.stick.note.take() {
+                log::info!("touche avancer : {note}");
+            }
             if let Some(gap) = self.stick.last_gap.take() {
                 log::info!(
                     "fin de course : avancer relâchée {:.0} ms après courir{}",
