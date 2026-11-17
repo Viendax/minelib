@@ -17,6 +17,9 @@ use minelib_render::Ui;
 
 use crate::menu::{self, Ctx, GOLD, GREY, RED, WHITE};
 
+/// Le relais de secours n'a pas repris le monde après ce temps : abandon.
+const TAKEOVER_GIVE_UP: Duration = Duration::from_secs(60);
+
 /// Nœud iroh du jeu (un seul, gardé pour la durée du jeu). Son identité est gardée à côté
 /// du dossier du relais (`noeud.key`) : la même à chaque lancement.
 fn node(dir: &std::path::Path) -> Option<&'static minelib_p2p::Node> {
@@ -314,6 +317,12 @@ pub struct Accounts {
     auto_pending: bool,
     auto_fails: u8,
     auto_next: Option<std::time::Instant>,
+    /// Monde de construction en ligne : où est son relais de secours, et le certificat de
+    /// la clé du compte pour y entrer si le relais du monde tombe.
+    standby: Option<proto::StandbyAt>,
+    cert: Option<minelib_net::sovereign::Cert>,
+    /// Reprise par le relais de secours en cours : depuis quand, prochain essai.
+    taking_over: Option<(std::time::Instant, std::time::Instant)>,
 }
 
 impl Accounts {
@@ -358,6 +367,9 @@ impl Accounts {
             auto_pending: false,
             auto_fails: 0,
             auto_next: None,
+            standby: None,
+            cert: None,
+            taking_over: None,
         }
     }
 
@@ -553,6 +565,22 @@ impl Accounts {
                 self.auto_login();
             }
         }
+        // Reprise par le relais de secours : il n'a pas encore repris le monde (il attend
+        // d'être sûr que le relais du monde est tombé) ; nouvel essai.
+        if let Some((since, next)) = self.taking_over {
+            let now = std::time::Instant::now();
+            if since.elapsed() > TAKEOVER_GIVE_UP {
+                self.taking_over = None;
+                self.standby = None;
+                let m = "Le relais du monde ne répond plus, et son relais de secours non plus."
+                    .to_string();
+                self.error = Some(m.clone());
+                self.game_events.push(Event::Error(m));
+            } else if now >= next {
+                self.taking_over = Some((since, now + Duration::from_secs(60)));
+                self.start_takeover();
+            }
+        }
         let Some(client) = &self.client else { return };
         let mut events = Vec::new();
         while let Some(e) = client.poll() {
@@ -639,6 +667,41 @@ impl Accounts {
                     self.account = None;
                     self.party = (0, Vec::new());
                     self.invites.clear();
+                }
+                // Le relais du monde est tombé pendant qu'on joue dans un monde qui a un
+                // relais de secours : on y reprend la partie, sans la quitter (la suite de
+                // ce que dit l'ancienne connexion ne compte plus).
+                Event::Lost if self.can_take_over() && self.taking_over.is_none() => {
+                    log::info!("relais du monde perdu : reprise par le relais de secours");
+                    self.game_events.push(Event::Error(
+                        "Le relais du monde ne répond plus : reprise par son relais de secours…"
+                            .into(),
+                    ));
+                    let now = std::time::Instant::now();
+                    self.taking_over = Some((now, now));
+                    break;
+                }
+                // Le relais de secours n'a pas encore repris le monde, ou ne répond pas :
+                // nouvel essai bientôt.
+                Event::Offline(m) | Event::Error(m) if self.taking_over.is_some() => {
+                    log::info!("relais de secours : {m} ; nouvel essai");
+                    let now = std::time::Instant::now();
+                    if let Some(t) = &mut self.taking_over {
+                        t.1 = now + Duration::from_secs(2);
+                    }
+                }
+                Event::Lost => {}
+                Event::Standby(at) => self.standby = at,
+                Event::StandbyTask { .. } | Event::Replica(_) => {}
+                Event::TakenOver { .. } => {
+                    self.taking_over = None;
+                    self.game_events.push(e);
+                }
+                Event::ShardTicket { ref cert, .. } => {
+                    if cert.is_some() {
+                        self.cert = cert.clone();
+                    }
+                    self.game_events.push(e);
                 }
                 Event::Error(m) => {
                     go_home |= self.join_after_login.take().is_some();
@@ -743,7 +806,6 @@ impl Accounts {
                 | Event::ShardPeers { .. }
                 | Event::RootEdits { .. }
                 | Event::Shards(_)
-                | Event::ShardTicket { .. }
                 | Event::Judge { .. }
                 | Event::Voice { .. }
                 | Event::HostChanged(_)
@@ -770,6 +832,43 @@ impl Accounts {
     }
 
     /// Dossier du relais (le nœud iroh du jeu est gardé à côté).
+    /// Peut-on reprendre la partie sur le relais de secours de son monde ?
+    fn can_take_over(&self) -> bool {
+        self.standby.is_some() && self.cert.is_some() && self.identity.is_some()
+    }
+
+    /// Le relais du monde est tombé : nouvelle connexion, au relais de secours du monde
+    /// (directement, sinon par un tunnel iroh vers son hôte), avec le certificat de la clé
+    /// du compte.
+    fn start_takeover(&mut self) {
+        let (Some(at), Some(cert), Some(key)) = (
+            self.standby.clone(),
+            self.cert.clone(),
+            self.identity.clone(),
+        ) else {
+            return;
+        };
+        let dir = self.relay_dir();
+        let client = Client::spawn_resolved(Box::new(move || {
+            if let Ok(a) = at.addr.parse::<SocketAddr>() {
+                if TcpStream::connect_timeout(&a, Duration::from_millis(800)).is_ok() {
+                    return Ok((at.addr.clone(), Some(at.key)));
+                }
+            }
+            let n =
+                p2p_node(&dir).ok_or_else(|| anyhow::anyhow!("relais de secours injoignable"))?;
+            Ok((n.tunnel(at.node)?.to_string(), Some(at.key)))
+        }));
+        client.send(Cmd::Takeover { cert, key });
+        self.client = Some(client);
+    }
+
+    /// Quitter un monde : plus de relais de secours à rejoindre.
+    pub fn forget_standby(&mut self) {
+        self.standby = None;
+        self.taking_over = None;
+    }
+
     pub fn relay_dir(&self) -> PathBuf {
         self.relay_dir.clone()
     }

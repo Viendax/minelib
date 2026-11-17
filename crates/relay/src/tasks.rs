@@ -318,7 +318,12 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<Mutex<State>>, peer: Str
         let mut st = state.lock().unwrap();
         let id = st.next_id;
         st.next_id += 1;
-        st.conns.insert(id, Conn::new(Outbox::Task(tx)));
+        let mut c = Conn::new(Outbox::Task(tx));
+        // (Venue de cette machine, pas par le tunnel : voir `upkeep_standby`.)
+        c.local = peer
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|a| a.is_loopback());
+        st.conns.insert(id, c);
         id
     };
     let mut link = Link {

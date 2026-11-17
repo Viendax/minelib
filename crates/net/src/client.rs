@@ -39,6 +39,12 @@ pub enum Cmd {
         /// Jeton d'appareil de confiance pour ce compte (pas de 2FA).
         device: Option<[u8; 32]>,
     },
+    /// Reprend le monde sur son relais de secours (le relais du monde est tombé) : le
+    /// certificat de la clé du compte signé par l'ancien relais du monde, et cette clé.
+    Takeover {
+        cert: crate::sovereign::Cert,
+        key: ed25519_dalek::SigningKey,
+    },
     /// Entre dans un relais de région avec le billet du relais du monde (et le certificat
     /// de la clé du compte, voir `crate::sovereign`).
     ShardLogin {
@@ -311,6 +317,25 @@ pub enum Event {
     RootEdits {
         region: [i32; 2],
         edits: Vec<crate::sovereign::Edit>,
+    },
+    /// Héberger le relais de secours d'un monde (voir `Response::StandbyTask`).
+    StandbyTask {
+        room: u64,
+        root: [u8; 32],
+        info: crate::proto::StandbyInfo,
+    },
+    /// Hôte du relais de secours : ce qui change dans le monde (voir `Response::Replica`).
+    Replica(Response),
+    /// Où est le relais de secours du monde (aucun : pas encore).
+    Standby(Option<crate::proto::StandbyAt>),
+    /// La connexion ouverte au relais vient d'être perdue (suivie de `LoggedOut` et d'une
+    /// erreur).
+    Lost,
+    /// Le monde est repris par son relais de secours (le relais du monde est tombé) : la
+    /// partie continue là, `host` en est le propriétaire.
+    TakenOver {
+        room: u64,
+        host: String,
     },
     /// Clé du compte, une fois connecté (pour signer ses modifications dans une région
     /// souveraine, ou ce qu'on y publie comme hôte principal).
@@ -590,6 +615,7 @@ impl Worker {
                 Ok(None) => {}
                 Err(_) => {
                     self.chan = None;
+                    self.emit(Event::Lost);
                     self.emit(Event::LoggedOut);
                     self.emit(Event::Error("Connexion au relais perdue.".into()));
                 }
@@ -688,6 +714,11 @@ impl Worker {
             },
             Response::ShardPeers { region, list, sov } => Event::ShardPeers { region, list, sov },
             Response::RootEdits { region, edits } => Event::RootEdits { region, edits },
+            Response::StandbyTask { room, root, info } => Event::StandbyTask { room, root, info },
+            r @ (Response::Replica { .. }
+            | Response::ReplicaBag { .. }
+            | Response::ReplicaMode { .. }) => Event::Replica(r),
+            Response::Standby { at } => Event::Standby(at),
             Response::Shards { list } => Event::Shards(list),
             Response::ShardTicket {
                 room,
@@ -856,6 +887,39 @@ impl Worker {
                     r => return Err(anyhow!("réponse inattendue : {r:?}")),
                 }
                 self.login(&pseudo, &keys, None, None)
+            }
+            Cmd::Takeover { cert, key } => {
+                self.chan = None;
+                self.connect()?;
+                let challenge = match self.request(&Request::Takeover { cert: cert.clone() })? {
+                    Response::TakeoverChallenge { challenge } => challenge,
+                    r => return self.unexpected(r),
+                };
+                use ed25519_dalek::Signer;
+                let signature = key.sign(&challenge).to_bytes().to_vec();
+                match self.request(&Request::TakeoverProve { signature })? {
+                    Response::Joined {
+                        room,
+                        host,
+                        map,
+                        map_sig,
+                    } => {
+                        self.pseudo = cert.pseudo.clone();
+                        self.emit(Event::Identity(key));
+                        if let Some(c) = &self.chan {
+                            self.emit(Event::Link(c.pusher()));
+                        }
+                        self.emit(Event::LoggedIn {
+                            pseudo: cert.pseudo,
+                            fingerprint: String::new(),
+                            totp: false,
+                        });
+                        let _ = (map, map_sig);
+                        self.emit(Event::TakenOver { room, host });
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
             }
             Cmd::ShardLogin {
                 room,

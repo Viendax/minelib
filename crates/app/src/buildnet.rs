@@ -387,6 +387,25 @@ impl BuildNet {
         self.identity = key;
     }
 
+    /// Certificat de la clé du compte (relais de secours, voir `Request::Takeover`).
+    #[cfg(test)]
+    pub fn cert(&self) -> Option<minelib_net::sovereign::Cert> {
+        self.shards.ticket.as_ref().and_then(|t| t.4.clone())
+    }
+
+    /// Le monde est repris par son relais de secours : tout part désormais par cette
+    /// connexion ; les relais de région de l'ancien relais du monde sont quittés (ce
+    /// qu'ils ont montré sans confirmation sera défait, voir `forget_shard`), le relais
+    /// de secours renvoie ce qui manque.
+    pub fn set_link(&mut self, link: Sender<Inbound>) {
+        self.link = link;
+        self.shards.list.clear();
+        self.shards.ticket = None;
+        self.served_sent.clear();
+        self.chunk = None;
+        self.caps_sent = false;
+    }
+
     /// Région souveraine dont on a le relais : la modification y part signée (son hôte
     /// principal la met en ordre). Renvoie faux s'il faut passer par le relais du monde.
     fn send_signed(&mut self, pos: [i32; 3], block: u16, fluid: bool, at: [i32; 2]) -> bool {
@@ -1089,6 +1108,13 @@ mod tests {
         used_shard: bool,
         /// Clé du compte (reçue après la preuve du mot de passe).
         identity: Option<minelib_net::ed25519_dalek::SigningKey>,
+        /// Relais de secours tenu par ce joueur (connexion de garant).
+        standby: Option<crate::garant_worker::StandbyHost>,
+        /// Où est le relais de secours de son monde ; reprise en cours (prochain essai) ;
+        /// reprises réussies.
+        standby_at: Option<minelib_net::proto::StandbyAt>,
+        retake: Option<Instant>,
+        taken: u32,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -1142,9 +1168,27 @@ mod tests {
                 shard: None,
                 used_shard: false,
                 identity: None,
+                standby: None,
+                standby_at: None,
+                retake: None,
+                taken: 0,
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
+        }
+
+        /// Le relais du monde est tombé : nouvelle connexion au relais de secours, avec le
+        /// certificat de la clé du compte (comme le jeu, voir `Accounts::start_takeover`).
+        fn take_over(&mut self) {
+            let (Some(at), Some(key)) = (self.standby_at.clone(), self.identity.clone()) else {
+                return;
+            };
+            let Some(cert) = self.net.as_ref().and_then(|n| n.cert()) else {
+                return;
+            };
+            self.c = Client::spawn(at.addr.clone(), Some(at.key));
+            self.c.send(Cmd::Takeover { cert, key });
+            self.retake = Some(Instant::now() + Duration::from_millis(1500));
         }
 
         /// Traite les événements reçus ; renvoie vrai si `want` est arrivé.
@@ -1241,9 +1285,61 @@ mod tests {
                             n.set_owner();
                         }
                     }
+                    Event::StandbyTask { room, root, info } => {
+                        let link = self.link.clone().expect("file d'envoi");
+                        self.standby = crate::garant_worker::StandbyHost::start(
+                            room, root, info, &link, false,
+                        );
+                    }
+                    Event::Replica(ref r) => {
+                        if let Some(s) = &self.standby {
+                            s.feed(r);
+                        }
+                    }
+                    Event::Standby(at) => self.standby_at = at,
+                    Event::TakenOver { host, .. } => {
+                        self.retake = None;
+                        self.taken += 1;
+                        if let Some(n) = &mut self.net {
+                            n.set_link(self.link.clone().expect("file d'envoi"));
+                            if host.eq_ignore_ascii_case(&self.name) {
+                                n.set_owner();
+                            } else {
+                                n.clear_owner();
+                            }
+                        }
+                    }
+                    // Relais du monde tombé : son relais de secours le reprendra, et les
+                    // joueurs y reprennent la partie.
+                    Event::Lost if self.standby.is_some() => {
+                        if let Some(s) = &mut self.standby {
+                            s.root_lost();
+                        }
+                    }
+                    Event::Lost if self.standby_at.is_some() && self.net.is_some() => {
+                        if self.retake.is_none() {
+                            self.take_over();
+                        }
+                        break;
+                    }
+                    // (La suite de l'ancienne connexion, ou le relais de secours qui n'a
+                    // pas encore repris le monde : nouvel essai bientôt.)
+                    Event::Error(_) | Event::Offline(_) | Event::LoggedOut
+                        if self.standby.is_some() || self.retake.is_some() =>
+                    {
+                        if self.retake.is_some() {
+                            self.retake = Some(Instant::now() + Duration::from_millis(500));
+                        }
+                    }
                     Event::Error(m) => panic!("{} : {m}", self.name),
                     _ => {}
                 }
+            }
+            if let Some(s) = &mut self.standby {
+                s.tick(Duration::from_millis(800));
+            }
+            if self.retake.is_some_and(|t| Instant::now() >= t) {
+                self.take_over();
             }
             hit
         }
@@ -1596,6 +1692,170 @@ mod tests {
         }
         assert!(differ.is_empty(), "mondes différents : {differ:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Le relais du monde tombe en pleine partie : son relais de secours (sur le PC d'un
+    /// joueur d'un autre monde) avait une copie du monde, il le reprend ; les joueurs y
+    /// reprennent la partie sans la quitter, le premier arrivé en devient le propriétaire,
+    /// on continue de construire, un joueur arrive après coup sur le relais de secours, et
+    /// tous les mondes finissent identiques, case par case (ce qui a été construit avant la
+    /// chute comme après).
+    #[test]
+    fn a_build_world_survives_its_relay() {
+        let dir = std::env::temp_dir().join(format!("minelib-secours-{}", rand_u32()));
+        minelib_relay::test_seed_games(&dir, "Garant", 5);
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        h.set_standby_local(true);
+        let addr = h.addr.to_string();
+        // Le joueur d'un autre monde, qui prête sa connexion de garant.
+        let mut ailleurs = Bot::new(&addr, h.public, "Garant", false);
+        ailleurs.c.send(Cmd::Host {
+            kind: 1,
+            name: "Autre".into(),
+            map: "autre".into(),
+            map_sig: [8; 32],
+            max_players: 0,
+        });
+        ailleurs.wait(|e| matches!(e, Event::Hosted(_)));
+        let mut garant = Bot::new(&addr, h.public, "Garant", true);
+        garant.c.send(Cmd::GarantAvailable(true));
+        let mut bots = vec![Bot::new(&addr, h.public, "Proprio", false)];
+        bots[0].c.send(Cmd::Host {
+            kind: 1,
+            name: "Essai".into(),
+            map: "essai".into(),
+            map_sig: [7; 32],
+            max_players: 0,
+        });
+        let mut room = None;
+        let t = Instant::now();
+        while room.is_none() {
+            while let Some(e) = bots[0].c.poll() {
+                match e {
+                    Event::Hosted(r) => room = Some(r),
+                    Event::Link(l) => bots[0].link = Some(l),
+                    Event::Identity(k) => bots[0].identity = Some(k),
+                    _ => {}
+                }
+            }
+            assert!(t.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let room = room.unwrap();
+        bots[0].start_net(true);
+        for i in 1..4 {
+            let mut b = Bot::new(&addr, h.public, &format!("Joueur{i}"), false);
+            b.c.send(Cmd::Join(room));
+            b.wait(|e| matches!(e, Event::Joined { .. }));
+            b.start_net(false);
+            bots.push(b);
+        }
+        let mut seed = 777u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let dt = 0.02;
+        let mut edited = std::collections::BTreeSet::new();
+        let mut after = 0;
+        let mut killed_at = None;
+        for step in 0..600 {
+            // Le relais du monde tombe (une fois le relais de secours prêt, et la copie
+            // faite).
+            if killed_at.is_none() && step >= 150 && bots.iter().all(|b| b.standby_at.is_some()) {
+                h.kill();
+                killed_at = Some(step);
+            }
+            for b in bots.iter_mut() {
+                let r = rnd();
+                b.pos.x = (b.pos.x + (r % 3) as f32 - 1.0).clamp(33.0, 95.0);
+                b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(1.0, 30.0);
+                // Tant que la partie n'a pas repris (pas de relais), on ne construit pas.
+                let live = killed_at.is_none() || b.taken > 0;
+                if live && step < 500 && rnd() % 9 == 0 {
+                    let x = (CHUNKS.start * 16 + (rnd() % 64) as i32).min(CHUNKS.end * 16 - 1);
+                    let z = (rnd() % 32) as i32;
+                    let y = 11 + (rnd() % 3) as i32;
+                    let block = if rnd() % 4 == 0 {
+                        BlockId::AIR
+                    } else {
+                        BlockId(1 + rnd() as u16 % 8)
+                    };
+                    b.world.set(x, y, z, block);
+                    edited.insert([x, y, z]);
+                    if killed_at.is_some() {
+                        after += 1;
+                    }
+                }
+                b.tick(dt);
+            }
+            garant.tick(dt);
+            if killed_at.is_none() {
+                ailleurs.pump(&|_| false);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(killed_at.is_some(), "relais de secours prêt chez tous");
+        assert!(after > 20, "on a construit après la reprise : {after}");
+        for b in &bots {
+            assert_eq!(b.taken, 1, "{} a repris la partie", b.name);
+        }
+        let h2 = garant.standby.as_ref().expect("relais de secours");
+        let resumed = h2_resumed(h2).expect("monde repris");
+        // Un joueur arrive après coup, sur le relais de secours.
+        let at = bots[0].standby_at.clone().unwrap();
+        let mut late = Bot::new(&at.addr, at.key, "Retard", false);
+        late.c.send(Cmd::Join(resumed));
+        late.wait(|e| matches!(e, Event::Joined { .. }));
+        late.start_net(false);
+        bots.push(late);
+        for _ in 0..250 {
+            for b in bots.iter_mut() {
+                b.tick(dt);
+            }
+            garant.tick(dt);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for b in &bots {
+            assert_eq!(
+                b.net.as_ref().unwrap().pending(),
+                0,
+                "{} : en attente",
+                b.name
+            );
+        }
+        let owners: Vec<&Bot> = bots
+            .iter()
+            .filter(|b| b.net.as_ref().unwrap().is_owner())
+            .collect();
+        assert_eq!(owners.len(), 1, "un seul propriétaire");
+        let owner = owners[0];
+        let mut differ = Vec::new();
+        for b in &bots {
+            for p in &edited {
+                let (a, o) = (
+                    b.world.get(p[0], p[1], p[2]),
+                    owner.world.get(p[0], p[1], p[2]),
+                );
+                if a != o {
+                    differ.push((b.name.clone(), *p, a, o));
+                }
+            }
+        }
+        assert!(differ.is_empty(), "mondes différents : {differ:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn h2_resumed(s: &crate::garant_worker::StandbyHost) -> Option<u64> {
+        s.resumed()
     }
 
     #[test]

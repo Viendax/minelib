@@ -62,9 +62,10 @@ pub struct Handle {
     shard_share: Arc<std::sync::atomic::AtomicUsize>,
     sov_faults: Arc<std::sync::atomic::AtomicUsize>,
     sov_committed: Arc<std::sync::atomic::AtomicUsize>,
-    /// État du relais (essais seulement).
-    #[cfg(test)]
+    /// État du relais (relais de secours, essais).
     state: Arc<Mutex<State>>,
+    /// Relais arrêté (essais : sa chute).
+    killed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Interroge les autres relais : clés des comptes qui y portent ce pseudo.
@@ -135,6 +136,104 @@ impl Handle {
     pub fn sov_committed(&self) -> usize {
         self.sov_committed
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Essais : le relais de secours peut être sur la même machine que le relais du monde
+    /// (tous les joueurs simulés y sont).
+    pub fn set_standby_local(&self, ok: bool) {
+        self.state.lock().unwrap().standby_local = ok;
+    }
+
+    /// Ce relais devient le relais de secours du monde `room` d'un autre relais (clé de
+    /// ses certificats : `root`) ; il en reçoit la copie (`standby_feed`) jusqu'à
+    /// `take_over`.
+    pub fn standby_begin(&self, room: u64, root: [u8; 32], info: proto::StandbyInfo) {
+        let mut st = self.state.lock().unwrap();
+        let Ok(root) = VerifyingKey::from_bytes(&root) else {
+            return;
+        };
+        let mut build = zones::Build::default();
+        build.set_page_dir(st.cfg.dir.join("zones").join("secours"));
+        st.bags.watch(&info.server, false);
+        st.standby = Some(StandbyCopy {
+            room,
+            root,
+            info,
+            build: Some(build),
+            active: false,
+            resumed: None,
+        });
+    }
+
+    /// Relais de secours : ce que le relais du monde lui envoie (historique, sacs, modes).
+    pub fn standby_feed(&self, msg: &Response) {
+        let mut st = self.state.lock().unwrap();
+        let st = &mut *st;
+        let Some(sb) = st.standby.as_mut() else {
+            return;
+        };
+        match msg {
+            Response::Replica { zone, seq, data } => {
+                if let Some(b) = sb.build.as_mut() {
+                    b.mirror_at(*zone, data, Some(*seq), &[]);
+                }
+            }
+            Response::ReplicaBag {
+                pseudo,
+                items,
+                mined,
+            } => {
+                let bag = bags::Bag {
+                    items: items.iter().copied().collect(),
+                    mined: *mined,
+                };
+                st.bags.put(&sb.info.server, pseudo, bag);
+            }
+            Response::ReplicaMode { pseudo, mode } => {
+                st.bags.set_mode(&sb.info.server, pseudo, mode);
+            }
+            _ => {}
+        }
+    }
+
+    /// Le relais du monde est tombé : ce relais de secours reprend le monde. Les joueurs
+    /// y entrent avec le certificat de leur compte (`Request::Takeover`) ; le premier en
+    /// devient le propriétaire.
+    pub fn take_over(&self) -> bool {
+        let mut st = self.state.lock().unwrap();
+        match st.standby.as_mut() {
+            Some(sb) if !sb.active => {
+                sb.active = true;
+                log::info!(
+                    "relais de secours : le relais du monde est tombé, reprise du monde « {} »",
+                    sb.info.name
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Relais de secours : le monde repris (son numéro ici), une fois qu'un joueur y est.
+    pub fn resumed(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .standby
+            .as_ref()
+            .and_then(|s| s.resumed)
+    }
+
+    /// Essais seulement : le relais tombe (connexions coupées, plus rien n'est accepté).
+    #[doc(hidden)]
+    pub fn kill(&self) {
+        self.killed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let st = self.state.lock().unwrap();
+        for c in st.conns.values() {
+            use transport::Sink;
+            c.tx.put(transport::Inbound::Closed);
+        }
     }
 
     /// Les pseudos deviennent uniques avec les autres relais : avant chaque inscription,
@@ -359,6 +458,11 @@ struct Conn {
     /// Empreinte de la machine (connexion au compte) : une seule partie FPS à la fois par
     /// machine.
     hw: Vec<[u8; 32]>,
+    /// Connexion venue de la machine de ce relais (pas par un tunnel).
+    local: bool,
+    /// Clé du compte connue par son certificat (joueur entré par un relais de secours,
+    /// inconnu du registre d'ici).
+    account: Option<[u8; 32]>,
 }
 
 impl Conn {
@@ -390,8 +494,31 @@ impl Conn {
             invited: Vec::new(),
             version: 0,
             hw: Vec::new(),
+            local: false,
+            account: None,
         }
     }
+}
+
+/// Relais de secours d'un monde, vu du relais du monde : l'hôte qui le tient (connexion
+/// de garant d'un joueur), et où le joindre une fois prêt.
+struct StandbyRef {
+    host: u64,
+    at: Option<proto::StandbyAt>,
+}
+
+/// Ce relais est le relais de secours du monde `room` d'un autre relais.
+struct StandbyCopy {
+    room: u64,
+    /// Clé des certificats de comptes de l'ancien relais du monde.
+    root: VerifyingKey,
+    info: proto::StandbyInfo,
+    /// Copie de l'historique (prise par le monde repris).
+    build: Option<zones::Build>,
+    /// Le relais du monde est tombé : les joueurs peuvent entrer.
+    active: bool,
+    /// Le monde repris ici, une fois que le premier joueur y est entré.
+    resumed: Option<u64>,
 }
 
 /// Région d'un monde servie par son propre relais.
@@ -525,6 +652,8 @@ struct Room {
     ready_standby: Vec<u64>,
     /// La partie est servie par un garant indépendant (pas par un joueur).
     garant_hosted: bool,
+    /// Monde de construction : son relais de secours.
+    standby: Option<StandbyRef>,
     /// Dernier changement d'hôte pour cause de mauvaise connexion.
     rebalanced: Option<Instant>,
     /// Désaccords : en attente de jugement (n° → joueur jugé, vérificateur), confirmés,
@@ -608,6 +737,11 @@ struct State {
     /// `minelib_net::sovereign`) ; date de la dernière signature (strictement croissante).
     cert_key: SigningKey,
     root_t: u64,
+    /// Ce relais tient le relais de secours d'un monde d'un autre relais.
+    standby: Option<StandbyCopy>,
+    /// Essais : un relais de secours sur la machine du relais du monde (voir
+    /// `Handle::set_standby_local`).
+    standby_local: bool,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -666,9 +800,12 @@ pub fn start(cfg: Config) -> Result<Handle> {
         bags: bags::Store::open(cfg_dir.join("sacs.bin")),
         cert_key,
         root_t: 0,
+        standby: None,
+        standby_local: false,
     }));
-    #[cfg(test)]
-    let state_for_tests = state.clone();
+    let state_for_handle = state.clone();
+    let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let killed_accept = killed.clone();
     // Les connexions sont servies par des tâches, sur quelques fils (voir `tasks`).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(tasks::workers())
@@ -696,6 +833,10 @@ pub fn start(cfg: Config) -> Result<Handle> {
                             continue;
                         }
                     };
+                    // (Relais tombé, essais : plus rien n'est accepté.)
+                    if killed_accept.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
                     let state = state.clone();
                     let open = open.clone();
                     tokio::spawn(async move {
@@ -730,8 +871,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
         shard_share,
         sov_faults,
         sov_committed,
-        #[cfg(test)]
-        state: state_for_tests,
+        state: state_for_handle,
+        killed,
     })
 }
 
@@ -843,6 +984,12 @@ enum Session {
     },
     LoggedIn {
         pseudo: String,
+    },
+    /// Relais de secours : certificat vérifié, signature du défi attendue.
+    TakingOver {
+        pseudo: String,
+        key: [u8; 32],
+        challenge: [u8; 32],
     },
 }
 
@@ -2229,8 +2376,263 @@ fn now_ms() -> u64 {
 
 /// Clé du compte d'un joueur connecté (registre).
 fn account_key(st: &State, id: u64) -> Option<[u8; 32]> {
-    let p = st.conns.get(&id)?.pseudo.as_deref()?;
-    st.registry.lookup(p).map(|r| r.1)
+    let c = st.conns.get(&id)?;
+    let p = c.pseudo.as_deref()?;
+    st.registry.lookup(p).map(|r| r.1).or(c.account)
+}
+
+/// Billet d'un joueur pour les relais de région de son monde, avec le certificat de la
+/// clé de son compte (régions souveraines, relais de secours).
+fn ticket_for(st: &State, rid: u64, id: u64) -> Option<Response> {
+    let room = st.rooms.get(&rid)?;
+    let c = st.conns.get(&id)?;
+    let pseudo = c.pseudo.clone()?;
+    let expires = now_secs() + 24 * 3600;
+    let cert =
+        account_key(st, id).map(|k| sovereign::Cert::issue(&st.cert_key, rid, &pseudo, k, expires));
+    Some(Response::ShardTicket {
+        room: rid,
+        mac: proto::shard_mac(&room.shard_secret, rid, &pseudo, expires),
+        pseudo,
+        expires,
+        cert,
+    })
+}
+
+/// Monde de construction : un relais de secours, sur le PC d'un autre joueur (connexion
+/// de garant), qui garde une copie du monde et le reprend si ce relais tombe. Choisi dès
+/// que le monde a deux joueurs ; remplacé s'il s'en va.
+fn upkeep_standby(st: &mut State, rid: u64) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    if room.kind != 1 {
+        return;
+    }
+    // Son hôte parti : plus de relais de secours (un autre sera choisi).
+    if let Some(sb) = &room.standby {
+        if !room.members.contains(&sb.host) || !st.conns.contains_key(&sb.host) {
+            let server = room.server.clone();
+            let room = st.rooms.get_mut(&rid).expect("partie");
+            room.standby = None;
+            room.build.set_replicating(false);
+            st.bags.watch(&server, false);
+            announce_standby(st, rid);
+        }
+        return;
+    }
+    let mut players: Vec<u64> = room
+        .members
+        .iter()
+        .filter(|m| !room.hidden.contains(m))
+        .copied()
+        .collect();
+    if !players.contains(&room.host) {
+        players.push(room.host);
+    }
+    if players.len() < 2 {
+        return;
+    }
+    let host = room.host;
+    let local_ok = st.standby_local;
+    let Some(g) = st
+        .conns
+        .iter()
+        .filter(|(&g, c)| {
+            c.garant
+                && !c.garant_banned
+                && c.room.is_none()
+                && g != host
+                && (local_ok
+                    || (!c.local && !st.conns.get(&host).is_some_and(|h| same_machine(c, h))))
+        })
+        .max_by(|a, b| {
+            let score = |c: &Conn| {
+                zones::aptitude(&zones::Candidate {
+                    id: 0,
+                    caps: c.caps,
+                    uptime: c.joined.elapsed(),
+                    ratio: c.pseudo.as_deref().map_or(0.0, |p| st.stats.ratio(p)),
+                    rtt: link_ms(c),
+                })
+            };
+            score(a.1).total_cmp(&score(b.1))
+        })
+        .map(|(&g, _)| g)
+    else {
+        return;
+    };
+    let root = st.cert_key.verifying_key().to_bytes();
+    let room = st.rooms.get_mut(&rid).expect("partie");
+    let owner = st
+        .conns
+        .get(&room.host)
+        .and_then(|c| c.pseudo.clone())
+        .unwrap_or_else(|| room.host_pseudo.clone());
+    let info = proto::StandbyInfo {
+        name: room.name.clone(),
+        map: room.map.clone(),
+        map_sig: room.map_sig,
+        max_players: room.max_players,
+        creator: room.creator.clone(),
+        server: room.server.clone(),
+        owner,
+    };
+    room.members.push(g);
+    room.hidden.push(g);
+    room.standby = Some(StandbyRef { host: g, at: None });
+    room.build.set_replicating(true);
+    let entries = room.build.export_entries();
+    let server = room.server.clone();
+    st.bags.watch(&server, true);
+    let (bags, modes) = st.bags.all_of(&server);
+    let Some(c) = st.conns.get_mut(&g) else {
+        return;
+    };
+    c.room = Some(rid);
+    transport::push(
+        &c.tx,
+        &Response::StandbyTask {
+            room: rid,
+            root,
+            info,
+        },
+    );
+    // La copie : tout l'historique, les sacs et les modes ; la suite au fil de l'eau.
+    for (zone, seq, data) in entries {
+        transport::push(&c.tx, &Response::Replica { zone, seq, data });
+    }
+    for (pseudo, bag) in bags {
+        transport::push(
+            &c.tx,
+            &Response::ReplicaBag {
+                pseudo,
+                items: bag.items.into_iter().collect(),
+                mined: bag.mined,
+            },
+        );
+    }
+    for (pseudo, mode) in modes {
+        transport::push(&c.tx, &Response::ReplicaMode { pseudo, mode });
+    }
+    log::info!("monde {rid} : relais de secours confié à {g}");
+}
+
+/// Ce qui vient de changer dans un monde part à son relais de secours.
+fn flush_replica(st: &mut State, rid: u64) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let Some(host) = room.standby.as_ref().map(|s| s.host) else {
+        return;
+    };
+    let entries = room.build.take_replica();
+    let server = room.server.clone();
+    let (bags, modes) = st.bags.take_changed(&server);
+    let Some(c) = st.conns.get(&host) else {
+        return;
+    };
+    for (zone, seq, data) in entries {
+        transport::push(&c.tx, &Response::Replica { zone, seq, data });
+    }
+    for (pseudo, bag) in bags {
+        transport::push(
+            &c.tx,
+            &Response::ReplicaBag {
+                pseudo,
+                items: bag.items.into_iter().collect(),
+                mined: bag.mined,
+            },
+        );
+    }
+    for (pseudo, mode) in modes {
+        transport::push(&c.tx, &Response::ReplicaMode { pseudo, mode });
+    }
+}
+
+/// Aux joueurs d'un monde : où est son relais de secours, et le certificat de la clé de
+/// leur compte (pour y entrer si ce relais tombe).
+fn announce_standby(st: &State, rid: u64) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let at = room.standby.as_ref().and_then(|s| s.at.clone());
+    // (L'hôte n'est pas compté dans les membres.)
+    let mut to: Vec<u64> = room
+        .members
+        .iter()
+        .filter(|m| !room.hidden.contains(m))
+        .copied()
+        .collect();
+    if !to.contains(&room.host) {
+        to.push(room.host);
+    }
+    for m in to {
+        send_standby(st, rid, m, at.clone());
+    }
+}
+
+fn send_standby(st: &State, rid: u64, id: u64, at: Option<proto::StandbyAt>) {
+    let Some(c) = st.conns.get(&id) else {
+        return;
+    };
+    if at.is_some() {
+        if let Some(t) = ticket_for(st, rid, id) {
+            transport::push(&c.tx, &t);
+        }
+    }
+    transport::push(&c.tx, &Response::Standby { at });
+}
+
+/// Relais de secours : un joueur du monde repris entre (le premier en devient le
+/// propriétaire, avec la copie du monde).
+fn take_over_join(st: &mut State, id: u64, pseudo: &str, key: [u8; 32]) -> Response {
+    let Some(sb) = st.standby.as_ref() else {
+        return err(ErrorCode::Refused, "Pas de relais de secours ici.");
+    };
+    if let Some(c) = st.conns.get_mut(&id) {
+        c.pseudo = Some(pseudo.to_string());
+        c.account = Some(key);
+    }
+    if let Some(rid) = sb.resumed.filter(|r| st.rooms.contains_key(r)) {
+        return join_room(st, id, pseudo, rid);
+    }
+    let info = sb.info.clone();
+    let rid = open_room(
+        st,
+        id,
+        pseudo,
+        1,
+        info.name.clone(),
+        info.map.clone(),
+        info.map_sig,
+        u16::try_from(info.max_players).unwrap_or(u16::MAX),
+    );
+    let sb = st.standby.as_mut().expect("relais de secours");
+    sb.resumed = Some(rid);
+    let build = sb.build.take();
+    let room = st.rooms.get_mut(&rid).expect("partie");
+    room.creator = info.creator.clone();
+    room.server = info.server.clone();
+    if let Some(mut b) = build {
+        // Objets au sol et coffres : retrouvés à partir des états publiés.
+        for (_, _, data) in b.export_entries() {
+            if let Some(m) = game::decode::<game::BuildMsg>(&data) {
+                b.items.absorb(&m);
+            }
+        }
+        room.build = b;
+    }
+    log::info!(
+        "relais de secours : monde « {} » repris (partie {rid})",
+        info.name
+    );
+    Response::Joined {
+        room: rid,
+        host: pseudo.to_string(),
+        map: info.map,
+        map_sig: info.map_sig,
+    }
 }
 
 /// Régions d'un monde : une région d'au moins deux relais prêts devient souveraine (son
@@ -2911,6 +3313,8 @@ fn upkeep_build(st: &mut State) {
         rebalance_host(st, rid);
         upkeep_regions(st, rid, &mut index);
         upkeep_sovereignty(st, rid);
+        upkeep_standby(st, rid);
+        flush_replica(st, rid);
         // Le propriétaire (qui enregistre le monde) reçoit ce qui a changé, par paquets.
         if let Some(room) = st.rooms.get_mut(&rid) {
             let owner = room.host;
@@ -3229,6 +3633,7 @@ fn open_room(
             hidden: Vec::new(),
             ready_standby: Vec::new(),
             garant_hosted: false,
+            standby: None,
             rebalanced: None,
             judges: HashMap::new(),
             confirmed: 0,
@@ -3405,6 +3810,21 @@ fn join_room(st: &mut State, id: u64, pseudo: &str, room: u64) -> Response {
                 party,
             },
         );
+    }
+    // Monde avec un relais de secours prêt : il le saura (après la réponse).
+    if let Some(at) = st
+        .rooms
+        .get(&room)
+        .and_then(|r| r.standby.as_ref())
+        .and_then(|s| s.at.clone())
+    {
+        let (st2, id2) = (&*st, id);
+        let pending = st2.conns.get(&id2).map(|c| c.tx.clone());
+        if let (Some(tx), Some(t)) = (pending, ticket_for(st2, room, id2)) {
+            // (Déposés dans la file : ils partent après la réponse.)
+            transport::push(&tx, &t);
+            transport::push(&tx, &Response::Standby { at: Some(at) });
+        }
     }
     Response::Joined {
         room,
@@ -4541,6 +4961,17 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             return None;
         }
+        // Hôte du relais de secours d'un monde : son relais est prêt ; les joueurs savent
+        // désormais où le trouver.
+        Request::StandbyReady { node, addr, key } => {
+            let rid = my_room?;
+            let room = st.rooms.get_mut(&rid)?;
+            let sb = room.standby.as_mut().filter(|s| s.host == id)?;
+            sb.at = Some(proto::StandbyAt { node, addr, key });
+            log::info!("monde {rid} : relais de secours prêt");
+            announce_standby(st, rid);
+            return None;
+        }
         Request::ShardReady {
             region,
             node,
@@ -5154,6 +5585,7 @@ fn handle(
             | Request::Echo { .. }
             | Request::BulkEdit { .. }
             | Request::Served { .. }
+            | Request::StandbyReady { .. }
             | Request::GarantAvailable { .. }
             | Request::GarantReady
             | Request::Conflict { .. }
@@ -5167,7 +5599,12 @@ fn handle(
             return (!req.is_oneway()).then(|| err(ErrorCode::NotLoggedIn, ""));
         };
         let pseudo = pseudo.clone();
-        return handle_room(req, st, id, &pseudo);
+        let resp = handle_room(req, st, id, &pseudo);
+        // Ce qui a changé dans son monde part aussi à son relais de secours.
+        if let Some(rid) = st.conns.get(&id).and_then(|c| c.room) {
+            flush_replica(st, rid);
+        }
+        return resp;
     }
     Some(handle_account(req, st, session, peer, id))
 }
@@ -5324,6 +5761,51 @@ fn handle_account(
                 challenge,
                 device: new_device,
             }
+        }
+        // Relais de secours, après la chute du relais du monde : un joueur de ce monde
+        // entre avec le certificat de la clé de son compte.
+        Request::Takeover { cert } => {
+            let Some(sb) = st.standby.as_ref() else {
+                return err(ErrorCode::Refused, "Pas de relais de secours ici.");
+            };
+            if !sb.active {
+                return err(ErrorCode::Refused, "Le relais du monde répond encore.");
+            }
+            if !cert.valid(&sb.root, sb.room) || cert.expires < now_secs() {
+                return err(ErrorCode::WrongCredentials, "certificat");
+            }
+            let mut challenge = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut challenge);
+            *session = Session::TakingOver {
+                pseudo: cert.pseudo,
+                key: cert.key,
+                challenge,
+            };
+            Response::TakeoverChallenge { challenge }
+        }
+        Request::TakeoverProve { signature } => {
+            let Session::TakingOver {
+                pseudo,
+                key,
+                challenge,
+            } = &*session
+            else {
+                return err(ErrorCode::NotLoggedIn, "");
+            };
+            let ok = VerifyingKey::from_bytes(key)
+                .ok()
+                .zip(Signature::from_slice(&signature).ok())
+                .is_some_and(|(k, s)| k.verify(challenge, &s).is_ok());
+            if !ok {
+                *session = Session::Anonymous;
+                return err(ErrorCode::WrongCredentials, "signature");
+            }
+            let (pseudo, key) = (pseudo.clone(), *key);
+            log::info!("relais de secours : « {pseudo} » reprend le monde");
+            *session = Session::LoggedIn {
+                pseudo: pseudo.clone(),
+            };
+            take_over_join(st, id, &pseudo, key)
         }
         Request::Prove { signature } => {
             let Session::Proving {
@@ -5712,6 +6194,81 @@ mod tests {
         );
         assert!(threads1 < threads0 + 10);
         drop((first, conns));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Relais de secours : on n'y entre qu'après la chute du relais du monde, avec un
+    /// certificat de ce monde-là signé par ce relais-là, et la clé du compte qu'il nomme.
+    #[test]
+    fn a_standby_relay_only_lets_in_the_players_of_its_world() {
+        let dir = std::env::temp_dir().join(format!("minelib-secours-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "secours".into(),
+        })
+        .unwrap();
+        let root = SigningKey::from_bytes(&[3; 32]);
+        let info = proto::StandbyInfo {
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [1; 32],
+            max_players: 0,
+            creator: "Createur".into(),
+            server: "createur/monde".into(),
+            owner: "Createur".into(),
+        };
+        h.standby_begin(42, root.verifying_key().to_bytes(), info);
+        let addr = h.addr.to_string();
+        let eve = SigningKey::from_bytes(&[5; 32]);
+        let cert = |root: &SigningKey, room: u64, key: &SigningKey| {
+            sovereign::Cert::issue(
+                root,
+                room,
+                "Eve",
+                key.verifying_key().to_bytes(),
+                now_secs() + 3600,
+            )
+        };
+        let try_in = |c: sovereign::Cert, key: SigningKey| {
+            let cl = Client::spawn(addr.clone(), Some(h.public));
+            cl.send(Cmd::Takeover { cert: c, key });
+            wait(&cl, |e| {
+                matches!(
+                    e,
+                    Event::TakenOver { .. } | Event::Error(_) | Event::Offline(_)
+                )
+            })
+        };
+        // Le relais du monde répond encore : personne n'entre.
+        assert!(matches!(
+            try_in(cert(&root, 42, &eve), eve.clone()),
+            Event::Error(_)
+        ));
+        assert!(h.take_over());
+        // Autre monde, autre relais, ou clé qui n'est pas celle du certificat : refusé.
+        let other = SigningKey::from_bytes(&[4; 32]);
+        assert!(matches!(
+            try_in(cert(&root, 43, &eve), eve.clone()),
+            Event::Error(_)
+        ));
+        assert!(matches!(
+            try_in(cert(&other, 42, &eve), eve.clone()),
+            Event::Error(_)
+        ));
+        assert!(matches!(
+            try_in(cert(&root, 42, &eve), other.clone()),
+            Event::Error(_)
+        ));
+        assert_eq!(h.resumed(), None);
+        // Le bon certificat et la bonne clé : le monde est repris, Eve en est la
+        // propriétaire.
+        match try_in(cert(&root, 42, &eve), eve.clone()) {
+            Event::TakenOver { host, .. } => assert_eq!(host, "Eve"),
+            e => panic!("{e:?}"),
+        }
+        assert!(h.resumed().is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 

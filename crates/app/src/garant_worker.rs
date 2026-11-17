@@ -69,6 +69,101 @@ pub struct ShardHost {
     _node: Option<Arc<minelib_p2p::Node>>,
 }
 
+/// Relais de secours d'un monde de construction, tenu par ce jeu pour les joueurs de ce
+/// monde : il en garde une copie (historique, sacs de survie) et le reprend si le relais
+/// du monde tombe (voir `minelib_relay::Handle::standby_begin`). Il reste lancé tant que ce
+/// jeu tourne.
+pub struct StandbyHost {
+    pub room: u64,
+    handle: minelib_relay::Handle,
+    _node: Option<Arc<minelib_p2p::Node>>,
+    /// Depuis quand le relais du monde ne répond plus.
+    lost: Option<Instant>,
+    taken: bool,
+}
+
+/// Le relais du monde ne répond plus depuis ce temps : le relais de secours reprend.
+pub const TAKEOVER_AFTER: Duration = Duration::from_secs(5);
+
+impl StandbyHost {
+    /// Lance le relais de secours et annonce au relais du monde où le joindre.
+    pub fn start(
+        room: u64,
+        root: [u8; 32],
+        info: minelib_net::proto::StandbyInfo,
+        link: &std::sync::mpsc::Sender<minelib_net::transport::Inbound>,
+        p2p: bool,
+    ) -> Option<Self> {
+        let dir =
+            std::env::temp_dir().join(format!("minelib-secours-{}-{room}", std::process::id()));
+        let handle = minelib_relay::start(minelib_relay::Config {
+            dir,
+            bind: "0.0.0.0:0".into(),
+            pow_bits: 20,
+            name: "Relais de secours".into(),
+        })
+        .map_err(|e| log::warn!("relais de secours : {e:#}"))
+        .ok()?;
+        handle.standby_begin(room, root, info);
+        let port = handle.addr.port();
+        // Joignable de partout par iroh (sans donner d'adresse IP), sinon sur le réseau
+        // local.
+        let node = if p2p {
+            minelib_p2p::Node::start_private().ok().map(Arc::new)
+        } else {
+            None
+        };
+        if let Some(n) = &node {
+            n.serve(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        }
+        minelib_net::transport::push(
+            link,
+            &minelib_net::proto::Request::StandbyReady {
+                node: node.as_ref().map_or([0; 32], |n| n.id()),
+                addr: if node.is_some() {
+                    String::new()
+                } else {
+                    format!("{}:{port}", lan_ip())
+                },
+                key: handle.public,
+            },
+        );
+        Some(Self {
+            room,
+            handle,
+            _node: node,
+            lost: None,
+            taken: false,
+        })
+    }
+
+    /// Le monde repris ici (son numéro), une fois qu'un joueur y est entré.
+    #[cfg(test)]
+    pub fn resumed(&self) -> Option<u64> {
+        self.handle.resumed()
+    }
+
+    /// Ce que le relais du monde envoie de son monde.
+    pub fn feed(&self, msg: &minelib_net::proto::Response) {
+        self.handle.standby_feed(msg);
+    }
+
+    /// Le relais du monde ne répond plus.
+    pub fn root_lost(&mut self) {
+        self.lost.get_or_insert_with(Instant::now);
+    }
+
+    /// À appeler régulièrement : reprend le monde quand le relais du monde est perdu
+    /// depuis `after`. Vrai au moment de la reprise.
+    pub fn tick(&mut self, after: Duration) -> bool {
+        if self.taken || !self.lost.is_some_and(|t| t.elapsed() >= after) {
+            return false;
+        }
+        self.taken = self.handle.take_over();
+        self.taken
+    }
+}
+
 /// Adresse de ce PC sur le réseau local (sans rien envoyer), sinon la boucle locale.
 fn lan_ip() -> std::net::IpAddr {
     std::net::UdpSocket::bind("0.0.0.0:0")
@@ -247,6 +342,8 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
     let mut build: Option<(crate::buildnet::BuildNet, minelib_world::World)> = None;
     // Relais d'une région d'un monde de construction.
     let mut shard: Option<ShardHost> = None;
+    // Relais de secours d'un monde de construction.
+    let mut standby: Option<StandbyHost> = None;
     let mut last = Instant::now();
     let started = Instant::now();
     let mut wiped = Instant::now();
@@ -262,6 +359,14 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
             std::thread::sleep(Duration::from_millis(300));
             log::info!("garant en jeu : connexion de garant fermée");
             return;
+        }
+        if let Some(s) = &mut standby {
+            if s.tick(TAKEOVER_AFTER) {
+                log::info!(
+                    "garant en jeu : le relais de secours reprend le monde {}",
+                    s.room
+                );
+            }
         }
         while let Some(e) = client.poll() {
             match e {
@@ -327,7 +432,35 @@ fn run(login: Login, maps: Vec<([u8; 32], PathBuf)>, root: PathBuf, stop: Arc<At
                         }
                     }
                 }
+                Event::StandbyTask { room, root, info } => {
+                    if let Some(l) = &link {
+                        log::info!("garant en jeu : relais de secours du monde {room}");
+                        standby = StandbyHost::start(room, root, info, l, login.node_dir.is_some());
+                        if standby.is_none() {
+                            client.send(Cmd::Leave);
+                        }
+                    }
+                }
+                Event::Replica(ref r) => {
+                    if let Some(s) = &standby {
+                        s.feed(r);
+                    }
+                }
+                // Le relais du monde ne répond plus : le relais de secours (s'il y en a un)
+                // reprendra le monde si ça dure ; le relais de région, lui, n'a plus rien à
+                // transmettre.
+                Event::Lost if logged => {
+                    if let Some(s) = &mut standby {
+                        s.root_lost();
+                    }
+                    shard = None;
+                }
                 Event::RoomClosed => {
+                    // (Le monde fermé par son relais : plus rien à garder ; repris, le relais
+                    // de secours sert désormais ce monde, il reste.)
+                    if standby.as_ref().is_some_and(|s| !s.taken) {
+                        standby = None;
+                    }
                     garant = None;
                     build = None;
                     if let Some(s) = shard.take() {

@@ -28,6 +28,9 @@ pub const COLD_AFTER: Duration = Duration::from_secs(600);
 /// pendant `SLEEP_BUDGET` à chaque fois (le relais ne traite rien d'autre pendant).
 const SLEEP_EVERY: Duration = Duration::from_secs(30);
 const SLEEP_BUDGET: Duration = Duration::from_millis(20);
+/// Entrée d'historique d'une zone : (zone, rang, message).
+pub type Entry = ([i32; 2], u64, Vec<u8>);
+
 /// Format d'une zone endormie.
 const PAGE_VERSION: u8 = 1;
 /// Zones endormies réveillées au plus pour un seul rattrapage de tout le monde.
@@ -231,6 +234,9 @@ pub struct Build {
     asleep: HashMap<[i32; 2], [u64; 2]>,
     touched: HashMap<[i32; 2], Instant>,
     last_sleep: Option<Instant>,
+    /// Monde qui a un relais de secours : chaque nouvelle entrée lui part aussi (voir
+    /// `take_replica`).
+    replica: Option<Vec<Entry>>,
 }
 
 /// Le monde fermé, ses zones endormies partent avec lui.
@@ -378,6 +384,40 @@ impl Build {
                 return total;
             }
         }
+    }
+
+    /// Tout l'historique, pour un relais de secours qui commence : (zone, rang, entrée),
+    /// les zones qui dorment lues sur le disque sans les réveiller.
+    pub fn export_entries(&self) -> Vec<Entry> {
+        let mut out = Vec::new();
+        for (&zone, log) in &self.logs {
+            for (&seq, (_, d)) in &log.entries {
+                out.push((zone, seq, d.clone()));
+            }
+        }
+        for &zone in self.asleep.keys() {
+            let log = self
+                .page_path(zone)
+                .and_then(|p| std::fs::read(p).ok())
+                .and_then(|b| ZoneLog::from_bytes(&b));
+            for (seq, (_, d)) in log.map(|l| l.entries).unwrap_or_default() {
+                out.push((zone, seq, d));
+            }
+        }
+        out
+    }
+
+    /// Avec un relais de secours (ou sans) : chaque nouvelle entrée lui est gardée.
+    pub fn set_replicating(&mut self, on: bool) {
+        self.replica = on.then(Vec::new);
+    }
+
+    /// Nouvelles entrées pour le relais de secours.
+    pub fn take_replica(&mut self) -> Vec<Entry> {
+        self.replica
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Zones en mémoire, et endormies sur le disque.
@@ -584,6 +624,9 @@ impl Build {
         // (Plus ancienne que ce qui est gardé pour cette case : personne n'en a besoin.)
         if !kept {
             return Vec::new();
+        }
+        if let Some(r) = &mut self.replica {
+            r.push((zone, seq, data.to_vec()));
         }
         let (kind, before) = (!blocks as usize, before[!blocks as usize]);
         let mut out = Vec::new();

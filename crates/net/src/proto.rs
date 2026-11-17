@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 31;
+pub const PROTOCOL: u32 = 32;
 
 /// Version du jeu annoncée dans le bonjour (`client` : « minelib 0.1.0 v95 ») ; 0 si
 /// absente.
@@ -327,6 +327,23 @@ pub enum Request {
         pseudo: String,
         pos: [i32; 3],
     },
+    /// Hôte du relais de secours d'un monde, au relais du monde : son relais est prêt
+    /// (nœud iroh, adresse directe, clé du canal chiffré).
+    StandbyReady {
+        node: [u8; 32],
+        addr: String,
+        key: [u8; 32],
+    },
+    /// Au relais de secours, après la chute du relais du monde : « j'étais dans ce
+    /// monde » (certificat de la clé de mon compte, signé par l'ancien relais du monde).
+    /// Réponse : `TakeoverChallenge`.
+    Takeover {
+        cert: crate::sovereign::Cert,
+    },
+    /// Signature du défi avec la clé du compte. Réponse : `Joined` (le monde repris).
+    TakeoverProve {
+        signature: Vec<u8>,
+    },
     /// Région souveraine, d'un autre relais à l'hôte principal : des lots lui manquent,
     /// à partir du rang `from` (qu'il les renvoie).
     PeerResend {
@@ -400,6 +417,7 @@ impl Request {
         matches!(
             self,
             Request::ToHost { .. }
+                | Request::StandbyReady { .. }
                 | Request::SetBackup { .. }
                 | Request::GarantAvailable { .. }
                 | Request::GarantReady
@@ -682,6 +700,37 @@ pub enum Response {
         region: [i32; 2],
         edits: Vec<crate::sovereign::Edit>,
     },
+    /// Au joueur choisi : héberger le relais de secours du monde `room` (voir
+    /// `StandbyInfo`) ; `root` : clé qui signe les certificats des comptes de ce monde.
+    StandbyTask {
+        room: u64,
+        root: [u8; 32],
+        info: StandbyInfo,
+    },
+    /// À l'hôte du relais de secours : une entrée de l'historique du monde, à son rang.
+    Replica {
+        zone: [i32; 2],
+        seq: u64,
+        data: Vec<u8>,
+    },
+    /// À l'hôte du relais de secours : sac d'un joueur en survie, et mode donné par un OP.
+    ReplicaBag {
+        pseudo: String,
+        items: Vec<(u32, u32)>,
+        mined: u32,
+    },
+    ReplicaMode {
+        pseudo: String,
+        mode: String,
+    },
+    /// Aux joueurs d'un monde : où est son relais de secours (aucun : pas encore).
+    Standby {
+        at: Option<StandbyAt>,
+    },
+    /// Relais de secours : défi à signer avec la clé du compte.
+    TakeoverChallenge {
+        challenge: [u8; 32],
+    },
     /// Aux joueurs d'un monde : relais de ses régions (les autres passent par ce relais).
     Shards {
         list: Vec<ShardInfo>,
@@ -860,6 +909,29 @@ pub const REGION: i32 = 32;
 
 pub fn region_of(chunk: [i32; 2]) -> [i32; 2] {
     [chunk[0].div_euclid(REGION), chunk[1].div_euclid(REGION)]
+}
+
+/// Ce que le relais de secours d'un monde doit savoir pour le reprendre.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct StandbyInfo {
+    pub name: String,
+    pub map: String,
+    pub map_sig: [u8; 32],
+    pub max_players: u32,
+    /// Qui a créé le monde, et sa clé de serveur (sacs de survie, modes).
+    pub creator: String,
+    pub server: String,
+    /// Pseudo du propriétaire du moment (celui qui enregistre le monde).
+    pub owner: String,
+}
+
+/// Où joindre le relais de secours d'un monde.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct StandbyAt {
+    /// Nœud iroh de son hôte (tunnel), adresse directe, clé du canal chiffré.
+    pub node: [u8; 32],
+    pub addr: String,
+    pub key: [u8; 32],
 }
 
 /// Relais d'une région d'un monde.

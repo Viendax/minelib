@@ -492,6 +492,7 @@ impl Game {
             if online || s.build.is_some() {
                 self.accounts.room(minelib_net::client::Cmd::Leave);
             }
+            self.accounts.forget_standby();
             if !online && !guest_build {
                 if let Err(e) = s.save() {
                     log::error!("sauvegarde impossible : {e:#}");
@@ -1037,6 +1038,28 @@ impl Game {
                     if online {
                         self.leave_world();
                         self.notify("L'hôte a fermé la partie.".to_string());
+                    }
+                }
+                // Le relais du monde est tombé, son relais de secours a repris le monde : la
+                // partie continue, par la nouvelle connexion.
+                Event::TakenOver { host, .. } => {
+                    let me = self.accounts.pseudo();
+                    let link = self.accounts.link.clone();
+                    if let (Some(s), Some(link)) = (&mut self.session, link) {
+                        if let Some(b) = &mut s.build {
+                            b.set_link(link.clone());
+                            if host.eq_ignore_ascii_case(&me) {
+                                b.set_owner();
+                            } else {
+                                b.clear_owner();
+                            }
+                            s.voice = Some(voice::Voice::new(link));
+                            s.chat.say(
+                                "Monde repris par son relais de secours : la partie continue."
+                                    .to_string(),
+                                chat::YELLOW,
+                            );
+                        }
                     }
                 }
                 Event::Error(m) => {

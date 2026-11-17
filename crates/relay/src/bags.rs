@@ -57,6 +57,9 @@ impl Bag {
     }
 }
 
+/// Sacs (pseudo, sac) et modes (pseudo, mode) d'un serveur, pour un relais de secours.
+pub type Snapshot = (Vec<(String, Bag)>, Vec<(String, String)>);
+
 #[derive(Serialize, Deserialize, Default)]
 struct Data {
     /// Serveur → pseudo (minuscules) → sac.
@@ -69,6 +72,11 @@ pub struct Store {
     path: PathBuf,
     data: Data,
     dirty: bool,
+    /// Serveurs dont un relais de secours garde une copie : sacs et modes changés depuis
+    /// la dernière fois (voir `take_changed`).
+    watched: std::collections::HashSet<String>,
+    changed: std::collections::HashSet<(String, String)>,
+    modes_changed: std::collections::HashSet<(String, String)>,
 }
 
 impl Store {
@@ -81,6 +89,9 @@ impl Store {
             path,
             data,
             dirty: false,
+            watched: Default::default(),
+            changed: Default::default(),
+            modes_changed: Default::default(),
         }
     }
 
@@ -93,8 +104,71 @@ impl Store {
         }
     }
 
+    /// Un relais de secours garde (ou ne garde plus) une copie des sacs de ce serveur.
+    pub fn watch(&mut self, server: &str, on: bool) {
+        if on {
+            self.watched.insert(server.to_string());
+        } else {
+            self.watched.remove(server);
+            self.changed.retain(|(s, _)| s != server);
+            self.modes_changed.retain(|(s, _)| s != server);
+        }
+    }
+
+    /// Sacs et modes de ce serveur changés depuis la dernière fois.
+    pub fn take_changed(&mut self, server: &str) -> Snapshot {
+        let bags: Vec<String> = self
+            .changed
+            .iter()
+            .filter(|(s, _)| s == server)
+            .map(|(_, p)| p.clone())
+            .collect();
+        let modes: Vec<String> = self
+            .modes_changed
+            .iter()
+            .filter(|(s, _)| s == server)
+            .map(|(_, p)| p.clone())
+            .collect();
+        self.changed.retain(|(s, _)| s != server);
+        self.modes_changed.retain(|(s, _)| s != server);
+        (
+            bags.into_iter()
+                .map(|p| (p.clone(), self.get(server, &p)))
+                .collect(),
+            modes
+                .into_iter()
+                .filter_map(|p| Some((p.clone(), self.mode(server, &p)?.to_string())))
+                .collect(),
+        )
+    }
+
+    /// Tous les sacs et modes d'un serveur (un relais de secours qui commence).
+    pub fn all_of(&self, server: &str) -> Snapshot {
+        (
+            self.data
+                .bags
+                .get(server)
+                .map(|m| m.iter().map(|(p, b)| (p.clone(), b.clone())).collect())
+                .unwrap_or_default(),
+            self.data
+                .modes
+                .get(server)
+                .map(|m| m.iter().map(|(p, b)| (p.clone(), b.clone())).collect())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Relais de secours : le sac d'un joueur, tel que l'a le relais du monde.
+    pub fn put(&mut self, server: &str, pseudo: &str, bag: Bag) {
+        *self.bag(server, pseudo) = bag;
+    }
+
     /// Un OP a donné ce mode à ce joueur sur ce serveur.
     pub fn set_mode(&mut self, server: &str, pseudo: &str, mode: &str) {
+        if self.watched.contains(server) {
+            self.modes_changed
+                .insert((server.to_string(), pseudo.to_ascii_lowercase()));
+        }
         self.data
             .modes
             .entry(server.to_string())
@@ -114,6 +188,10 @@ impl Store {
 
     fn bag(&mut self, server: &str, pseudo: &str) -> &mut Bag {
         self.dirty = true;
+        if self.watched.contains(server) {
+            self.changed
+                .insert((server.to_string(), pseudo.to_ascii_lowercase()));
+        }
         self.data
             .bags
             .entry(server.to_string())
