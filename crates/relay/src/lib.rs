@@ -72,6 +72,16 @@ pub type ServersFn = Arc<dyn Fn(u8) -> Vec<proto::ServerEntry> + Send + Sync>;
 /// relais (hébergé par un joueur sans lien avec ce monde).
 pub const SHARD_FROM: usize = 24;
 
+/// Règles du jeu reprises pour les simulations (le jeu n'est pas visible d'ici).
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// Positions envoyées par seconde par un joueur qui en voit `others` autour de lui
+    /// (même règle que `pos_every` dans crates/app/src/buildnet.rs).
+    pub fn pos_hz(others: usize) -> f32 {
+        (4096.0 / others.max(1) as f32).clamp(20.0, 256.0)
+    }
+}
+
 /// Joueurs de plus dans la région pour chaque relais de plus (chez un autre hôte), et
 /// relais au plus par région : une foule est partagée entre plusieurs connexions de
 /// joueurs, aucune ne porte toute la région.

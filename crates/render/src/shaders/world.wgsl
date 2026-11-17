@@ -1038,7 +1038,7 @@ struct RayHit {
 const REFLECT_RANGE: f32 = 64.0;
 /// Portée des reflets réduite quand le GPU est à la peine (`screen.w`, 0 = pleine portée).
 fn refl_range() -> f32 {
-    return select(REFLECT_RANGE, clamp(g.screen.w, 8.0, REFLECT_RANGE), g.screen.w > 0.0);
+    return select(REFLECT_RANGE, clamp(g.screen.w, 4.0, REFLECT_RANGE), g.screen.w > 0.0);
 }
 /// Reflets des métaux : rien au-delà de 4 blocs, flou et fondu à partir de 3.
 const METAL_RANGE: f32 = 4.0;

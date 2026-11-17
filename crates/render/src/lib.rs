@@ -2253,6 +2253,9 @@ impl Renderer {
             if let Some(g) = t.after_submit(&self.device) {
                 if self.raytracing {
                     self.rt_quality.update(g.scene);
+                    // (Au journal : la portée des reflets dit à quel point la qualité a
+                    // dû baisser pour tenir les images par seconde.)
+                    perf::gauge("reflets : portée (blocs)", self.rt_quality.uniforms()[1]);
                 } else {
                     self.rt_quality = rt::RtQuality::default();
                 }

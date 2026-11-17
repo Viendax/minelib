@@ -241,15 +241,21 @@ pub fn solid(def: &minelib_world::registry::BlockDef) -> bool {
 }
 
 /// Qualité adaptative du raytracing : baisse dès que la scène coûte trop au GPU (miroirs
-/// face à face, grande étendue d'eau…), remonte doucement quand il y a de la marge.
-/// 1 = pleine qualité (64 rebonds, 64 blocs), `MIN_QUALITY` = 2 rebonds, 16 blocs.
+/// face à face, grande étendue d'eau, chute d'eau entourée de lampes…), remonte
+/// doucement quand il y a de la marge. 1 = pleine qualité (64 rebonds, 64 blocs) ;
+/// 0 = un seul rebond et seulement les surfaces à moins de 6 blocs.
+///
+/// Les seuils visent plus de 200 images par seconde. Avant (seuil haut à 6 ms, plancher à
+/// 2 rebonds et 16 blocs), un joueur à 250–380 images par seconde tombait à 116 devant
+/// une chute d'eau éclairée (scène à 7 ms, mesuré), sans que la qualité puisse descendre
+/// davantage.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RtQuality(pub f32);
 
-pub const MIN_QUALITY: f32 = 0.15;
+pub const MIN_QUALITY: f32 = 0.0;
 /// Temps de scène visé (ms) : au-dessus on baisse, bien en dessous on remonte.
-const SCENE_HIGH_MS: f32 = 6.0;
-const SCENE_LOW_MS: f32 = 3.5;
+const SCENE_HIGH_MS: f32 = 4.0;
+const SCENE_LOW_MS: f32 = 2.8;
 
 impl Default for RtQuality {
     fn default() -> Self {
@@ -262,9 +268,9 @@ impl RtQuality {
     pub fn update(&mut self, scene_ms: f32) {
         let q = self.0;
         self.0 = if scene_ms > SCENE_HIGH_MS * 3.0 {
-            q * 0.5 // gros pic : on coupe fort tout de suite
+            q * 0.5 - 0.004 // gros pic : on coupe fort tout de suite
         } else if scene_ms > SCENE_HIGH_MS {
-            q * 0.9
+            q * 0.9 - 0.004
         } else if scene_ms < SCENE_LOW_MS {
             q + 0.01
         } else {
@@ -275,9 +281,9 @@ impl RtQuality {
 
     /// (rebonds, portée en blocs) pour les uniformes (`screen.zw`).
     pub fn uniforms(self) -> [f32; 2] {
-        let t = ((self.0 - MIN_QUALITY) / (1.0 - MIN_QUALITY)).clamp(0.0, 1.0);
-        let bounces = (2.0 + 62.0 * t * t).round();
-        let range = 16.0 + 48.0 * t;
+        let t = self.0.clamp(0.0, 1.0);
+        let bounces = (1.0 + 63.0 * t * t).round();
+        let range = 6.0 + 58.0 * t;
         [bounces, range]
     }
 }
@@ -290,17 +296,24 @@ mod tests {
         assert_eq!(q.uniforms(), [64.0, 64.0]);
         q.update(270.0);
         assert!(q.0 <= 0.5);
-        for _ in 0..30 {
-            q.update(9.0);
+        // Scène à 7 ms (la chute d'eau éclairée du joueur) : la qualité descend jusqu'au
+        // plancher, un rebond et 6 blocs de portée, bien en dessous de l'ancien plancher
+        // (2 rebonds, 16 blocs) qui laissait la scène à 7 ms.
+        for _ in 0..60 {
+            q.update(7.0);
         }
         assert_eq!(q.0, super::MIN_QUALITY);
-        assert_eq!(q.uniforms(), [2.0, 16.0]);
-        q.update(4.5);
+        assert_eq!(q.uniforms(), [1.0, 6.0]);
+        // Entre les deux seuils : on ne touche à rien.
+        q.update(3.4);
         assert_eq!(q.0, super::MIN_QUALITY);
         for _ in 0..200 {
             q.update(2.0);
         }
         assert_eq!(q.0, 1.0);
+        // 5 ms suffisent maintenant à faire baisser (avant : seulement au-delà de 6 ms).
+        q.update(5.0);
+        assert!(q.0 < 1.0);
     }
 
     use super::*;

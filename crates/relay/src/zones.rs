@@ -586,6 +586,133 @@ impl Build {
 
 #[cfg(test)]
 mod tests {
+    /// Simulation de foule dans une seule région, avec le vrai code de diffusion
+    /// (`Build::nearby`, répartition `shard_for`, tailles réelles des messages) : ce que
+    /// chaque relais de région doit envoyer et ce que chaque joueur reçoit, par seconde.
+    /// Lancée à la main : `cargo test -p minelib-relay foule -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn foule_dans_une_region() {
+        use minelib_net::game::{self, BuildMsg};
+        use minelib_net::proto::{self, Response, ShardInfo};
+        // Règle d'envoi du jeu (crates/app/src/buildnet.rs, `pos_every`).
+        let hz = |others: usize| crate::tests_support::pos_hz(others);
+        // Taille réelle d'une position sur le fil : message chiffré (étiquette de 16
+        // octets, longueur sur 2) ; chaque message part seul (TCP sans regroupement) :
+        // 40 octets d'en-têtes IP et TCP de plus.
+        let data = game::encode(&BuildMsg::Player {
+            pseudo: "Joueur1234".into(),
+            pos: [123.456, 78.9, -321.5],
+            yaw: 1.234,
+            pitch: -0.2,
+            crouch: 0.0,
+            speed: 5.5,
+        });
+        let payload = postcard::to_allocvec(&Response::FromZone {
+            peer: 123_456,
+            chunk: [17, -3],
+            data,
+        })
+        .unwrap()
+        .len();
+        let wire = payload + 16 + 2 + 40;
+        eprintln!("FOULE une position : {payload} octets utiles, {wire} sur le fil");
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        // (nom, côté en chunks de la zone où se tiennent les joueurs)
+        for (layout, side) in [
+            ("serrés (2 chunks)", 2),
+            ("village (8 chunks)", 8),
+            ("étalés (région entière)", 32),
+        ] {
+            for n in [100usize, 300, 700, 1500, 3000] {
+                let relays = crate::shards_wanted(n, crate::SHARD_FROM, crate::SHARD_SHARE).max(1);
+                let list: Vec<ShardInfo> = (0..relays)
+                    .map(|i| ShardInfo {
+                        region: [0, 0],
+                        slot: i as u16,
+                        node: [i as u8; 32],
+                        addr: String::new(),
+                        key: [i as u8 + 1; 32],
+                    })
+                    .collect();
+                let mut builds: Vec<Build> = (0..relays).map(|_| Build::default()).collect();
+                // Joueurs : numéro, chunk, relais.
+                let players: Vec<(u64, [i32; 2], usize)> = (0..n)
+                    .map(|i| {
+                        let c = [
+                            16 - side / 2 + (rnd() % side as u32) as i32,
+                            16 - side / 2 + (rnd() % side as u32) as i32,
+                        ];
+                        let s =
+                            proto::shard_for(&list, &format!("Joueur{i}")).unwrap().slot as usize;
+                        (i as u64 + 1, c, s)
+                    })
+                    .collect();
+                for &(id, c, s) in &players {
+                    builds[s].moved(id, c);
+                }
+                let mut rate = vec![20.0f32; n];
+                let mut report = String::new();
+                // Deux passes : la première sert à savoir combien de joueurs chacun voit
+                // (le jeu règle son rythme d'envoi là-dessus), la seconde mesure.
+                for pass in 0..2 {
+                    let mut seen: Vec<std::collections::HashSet<u64>> = vec![Default::default(); n];
+                    let mut got = vec![0u64; n]; // positions reçues par joueur
+                    let mut out = vec![0u64; relays]; // messages envoyés par relais (joueurs + relais)
+                    let mut inn = vec![0u64; relays]; // messages reçus par relais
+                    let t0 = std::time::Instant::now();
+                    for (i, &(id, c, s)) in players.iter().enumerate() {
+                        for _ in 0..rate[i].round() as usize {
+                            inn[s] += 1;
+                            for (r, b) in builds.iter_mut().enumerate() {
+                                if r != s {
+                                    out[s] += 1; // au relais voisin
+                                    inn[r] += 1;
+                                }
+                                for m in b.nearby(id, c) {
+                                    out[r] += 1;
+                                    got[m as usize - 1] += 1;
+                                    if pass == 0 {
+                                        seen[m as usize - 1].insert(id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let cpu = t0.elapsed().as_secs_f32();
+                    if pass == 0 {
+                        for i in 0..n {
+                            rate[i] = hz(seen[i].len());
+                        }
+                        continue;
+                    }
+                    let sent: f32 = rate.iter().sum();
+                    let worst_out = *out.iter().max().unwrap();
+                    let worst_got = *got.iter().max().unwrap();
+                    let mean_got = got.iter().sum::<u64>() / n as u64;
+                    report = format!(
+                        "{n:>5} joueurs, {relays} relais | envoi moyen {:.0}/s par joueur | relais le plus chargé : {} msg/s sortants = {:.1} Mbit/s, {} entrants | joueur : {} reçus/s en moyenne ({:.0} kbit/s), {} au pire | calcul de la diffusion : {:.2} s de processeur par seconde",
+                        sent / n as f32,
+                        worst_out,
+                        worst_out as f32 * wire as f32 * 8.0 / 1e6,
+                        inn.iter().max().unwrap(),
+                        mean_got,
+                        mean_got as f32 * wire as f32 * 8.0 / 1e3,
+                        worst_got,
+                        cpu,
+                    );
+                }
+                eprintln!("FOULE {layout:<24} {report}");
+            }
+        }
+    }
+
     use super::*;
 
     fn cand(id: u64, cores: u16) -> Candidate {
