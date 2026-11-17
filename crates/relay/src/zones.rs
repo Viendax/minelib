@@ -10,6 +10,7 @@
 //! v127 : personne d'autre que lui n'écrit l'histoire d'un monde.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use minelib_net::proto::GarantCaps;
@@ -20,6 +21,17 @@ pub const NEAR: i32 = 12;
 /// compacté (la dernière modification de chaque case), cette limite ne sert qu'aux
 /// messages qui ne sont pas des blocs.
 const LOG_MAX: usize = 16 << 20;
+/// Une zone dont l'historique n'a servi à rien pendant ce temps s'endort sur le disque du
+/// relais du monde (`Build::sleep_cold`) ; elle se réveille dès qu'on en a besoin.
+pub const COLD_AFTER: Duration = Duration::from_secs(600);
+/// Les zones froides sont cherchées au plus une fois par ce temps, et endormies au plus
+/// pendant `SLEEP_BUDGET` à chaque fois (le relais ne traite rien d'autre pendant).
+const SLEEP_EVERY: Duration = Duration::from_secs(30);
+const SLEEP_BUDGET: Duration = Duration::from_millis(20);
+/// Format d'une zone endormie.
+const PAGE_VERSION: u8 = 1;
+/// Zones endormies réveillées au plus pour un seul rattrapage de tout le monde.
+const WAKE_MAX: usize = 256;
 
 /// Historique d'une zone : chaque modification a un numéro croissant ; une nouvelle
 /// modification d'une case remplace l'ancienne (l'historique ne grossit qu'avec le nombre
@@ -46,20 +58,54 @@ enum LogKey {
     Slot([i32; 3], u8),
 }
 
+/// Ce que décrit une entrée (la suivante de même clé la remplace).
+fn key_of(data: &[u8]) -> Option<LogKey> {
+    use minelib_net::game::BuildMsg;
+    match minelib_net::game::decode::<BuildMsg>(data) {
+        Some(BuildMsg::Set { pos, .. }) => Some(LogKey::Block(pos)),
+        Some(BuildMsg::Item { id, .. }) => Some(LogKey::Item(id)),
+        Some(BuildMsg::Slot { pos, slot, .. }) => Some(LogKey::Slot(pos, slot)),
+        _ => None,
+    }
+}
+
 impl ZoneLog {
+    /// Pour le disque : entrées et derniers numéros.
+    fn to_bytes(&self) -> Option<Vec<u8>> {
+        let entries: Vec<(u64, bool, &[u8])> = self
+            .entries
+            .iter()
+            .map(|(s, (b, d))| (*s, *b, d.as_slice()))
+            .collect();
+        postcard::to_allocvec(&(PAGE_VERSION, entries, self.last)).ok()
+    }
+
+    /// Relue du disque (`None` si le fichier est abîmé).
+    fn from_bytes(b: &[u8]) -> Option<Self> {
+        type Page = (u8, Vec<(u64, bool, Vec<u8>)>, [u64; 2]);
+        let (version, entries, last): Page = postcard::from_bytes(b).ok()?;
+        if version != PAGE_VERSION {
+            return None;
+        }
+        let mut log = ZoneLog::default();
+        for (seq, block, data) in entries {
+            if let Some(k) = key_of(&data) {
+                log.by_pos.insert(k, seq);
+            }
+            log.bytes += data.len();
+            log.entries.insert(seq, (block, data));
+        }
+        log.last = last;
+        Some(log)
+    }
+
     /// Garde une entrée (la dernière de sa case, de son objet, de son emplacement).
     /// Renvoie si c'est un bloc, et si elle est gardée : plus ancienne que celle déjà là
     /// (archivée en retard, d'une époque souveraine finie), elle est sans effet.
     fn push(&mut self, seq: u64, data: &[u8]) -> (bool, bool) {
-        use minelib_net::game::BuildMsg;
         // Une seule entrée par case, par objet au sol, par emplacement de coffre : la
         // dernière.
-        let key = match minelib_net::game::decode::<BuildMsg>(data) {
-            Some(BuildMsg::Set { pos, .. }) => Some(LogKey::Block(pos)),
-            Some(BuildMsg::Item { id, .. }) => Some(LogKey::Item(id)),
-            Some(BuildMsg::Slot { pos, slot, .. }) => Some(LogKey::Slot(pos, slot)),
-            _ => None,
-        };
+        let key = key_of(data);
         let block = matches!(key, Some(LogKey::Block(_)));
         if let Some(key) = key {
             if let Some(&old) = self.by_pos.get(&key) {
@@ -178,6 +224,22 @@ pub struct Build {
     indexed: usize,
     /// Objets au sol et coffres du monde : ce relais en est l'arbitre.
     pub items: minelib_net::items::ItemStore,
+    /// Zones endormies sur le disque (voir `sleep_cold`) : dossier (aucun : elles restent
+    /// toutes en mémoire), zones qui y dorment (avec leurs derniers numéros, pour savoir
+    /// sans les réveiller si un joueur en a besoin), dernière fois que chaque zone a servi.
+    page_dir: Option<PathBuf>,
+    asleep: HashMap<[i32; 2], [u64; 2]>,
+    touched: HashMap<[i32; 2], Instant>,
+    last_sleep: Option<Instant>,
+}
+
+/// Le monde fermé, ses zones endormies partent avec lui.
+impl Drop for Build {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.page_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 /// Positions dans une foule : chaque joueur est vu de tous ceux à portée (jusqu'à
@@ -227,6 +289,103 @@ fn near(a: [i32; 2], b: [i32; 2]) -> bool {
 }
 
 impl Build {
+    /// Les zones froides de ce monde dormiront dans `dir` (voir `sleep_cold`).
+    pub fn set_page_dir(&mut self, dir: PathBuf) {
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            self.page_dir = Some(dir);
+        }
+    }
+
+    fn page_path(&self, zone: [i32; 2]) -> Option<PathBuf> {
+        Some(
+            self.page_dir
+                .as_ref()?
+                .join(format!("{}_{}.zone", zone[0], zone[1])),
+        )
+    }
+
+    /// Réveille une zone si elle dort sur le disque, et note qu'elle sert. À faire avant
+    /// de lire ou d'écrire son historique.
+    fn wake(&mut self, zone: [i32; 2]) {
+        if self.page_dir.is_none() {
+            return;
+        }
+        if self.asleep.remove(&zone).is_some() {
+            if let Some(p) = self.page_path(zone) {
+                match std::fs::read(&p).ok().and_then(|b| ZoneLog::from_bytes(&b)) {
+                    Some(log) => {
+                        self.logs.insert(zone, log);
+                    }
+                    None => log::warn!("zone {zone:?} : historique illisible sur le disque"),
+                }
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        self.touched.insert(zone, Instant::now());
+    }
+
+    /// Endort sur le disque l'historique des zones qui n'ont pas servi depuis `idle` (au
+    /// plus une fois toutes les 30 s, et 20 ms de travail au plus) : la mémoire du relais
+    /// du monde ne grandit qu'avec les zones où il se passe quelque chose, pas avec tout
+    /// ce qui a été construit. Renvoie combien de zones se sont endormies.
+    pub fn sleep_cold(&mut self, idle: Duration) -> usize {
+        let Some(dir) = self.page_dir.clone() else {
+            return 0;
+        };
+        if self.last_sleep.is_some_and(|t| t.elapsed() < SLEEP_EVERY) {
+            return 0;
+        }
+        let start = Instant::now();
+        self.last_sleep = Some(start);
+        let cold: Vec<[i32; 2]> = self
+            .logs
+            .keys()
+            .filter(|z| self.touched.get(*z).is_none_or(|t| t.elapsed() >= idle))
+            .copied()
+            .collect();
+        let mut n = 0;
+        for zone in cold {
+            if start.elapsed() > SLEEP_BUDGET {
+                break;
+            }
+            let Some(log) = self.logs.get(&zone) else {
+                continue;
+            };
+            let (Some(bytes), last) = (log.to_bytes(), log.last) else {
+                continue;
+            };
+            let path = dir.join(format!("{}_{}.zone", zone[0], zone[1]));
+            if std::fs::write(&path, bytes).is_ok() {
+                self.logs.remove(&zone);
+                self.touched.remove(&zone);
+                self.asleep.insert(zone, last);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Endort tout ce qui dort pas encore (essais : sans attendre ni compter le temps).
+    #[cfg(test)]
+    pub fn sleep_all(&mut self) -> usize {
+        let mut total = 0;
+        loop {
+            self.last_sleep = None;
+            let n = self.sleep_cold(Duration::ZERO);
+            total += n;
+            if n == 0 {
+                return total;
+            }
+        }
+    }
+
+    /// Zones en mémoire, et endormies sur le disque.
+    #[cfg(test)]
+    pub fn zones_awake_asleep(&self) -> (usize, usize) {
+        (self.logs.len(), self.asleep.len())
+    }
+
     /// Range les joueurs par chunk si ce n'est pas fait (positions changées en direct).
     fn reindex(&mut self) {
         if self.indexed == self.positions.len() {
@@ -408,6 +567,7 @@ impl Build {
         seq: Option<u64>,
         listeners: &[u64],
     ) -> Sends {
+        self.wake(zone);
         let log = self.logs.entry(zone).or_default();
         let seq = match seq {
             Some(s) => {
@@ -452,15 +612,17 @@ impl Build {
 
     /// Dernier bloc publié en `pos`, si cette case a déjà été modifiée (le relais ne
     /// connaît pas le terrain d'origine).
-    pub fn block_at(&self, pos: [i32; 3]) -> Option<u16> {
+    pub fn block_at(&mut self, pos: [i32; 3]) -> Option<u16> {
         let zone = minelib_net::proto::zone_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]);
+        self.wake(zone);
         self.logs.get(&zone)?.block_at(pos)
     }
 
     /// Auteur de la dernière modification de la case `pos`, si elle a déjà été modifiée.
     #[cfg(test)]
-    pub fn author_at(&self, pos: [i32; 3]) -> Option<String> {
+    pub fn author_at(&mut self, pos: [i32; 3]) -> Option<String> {
         let zone = minelib_net::proto::zone_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]);
+        self.wake(zone);
         self.logs.get(&zone)?.author_at(pos)
     }
 
@@ -477,6 +639,7 @@ impl Build {
         listeners: &[u64],
     ) -> (Vec<u8>, Sends) {
         let zone = minelib_net::proto::zone_of([pos[0].div_euclid(16), pos[2].div_euclid(16)]);
+        self.wake(zone);
         let last = self.logs.get(&zone).map_or(0, ZoneLog::last);
         let data = minelib_net::game::encode(&minelib_net::game::BuildMsg::Set {
             pos,
@@ -491,7 +654,11 @@ impl Build {
 
     /// Historique des blocs des zones choisies par `keep` (pour un relais de région : les
     /// objets et les coffres ne passent que par le relais du monde).
-    pub fn logs_in(&self, keep: impl Fn([i32; 2]) -> bool) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
+    pub fn logs_in(&mut self, keep: impl Fn([i32; 2]) -> bool) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
+        let sleeping: Vec<[i32; 2]> = self.asleep.keys().filter(|z| keep(**z)).copied().collect();
+        for z in sleeping {
+            self.wake(z);
+        }
         self.logs
             .iter()
             .filter(|(k, l)| keep(**k) && l.last_of(true) > 0)
@@ -509,6 +676,32 @@ impl Build {
         chunk: Option<[i32; 2]>,
         blocks: &dyn Fn([i32; 2]) -> bool,
     ) -> Vec<([i32; 2], Vec<Vec<u8>>)> {
+        // Les zones visées qui dorment se réveillent, seulement si ce joueur n'en a pas
+        // tout reçu (le propriétaire, qui reçoit tout, ne les réveille pas toutes).
+        let z = minelib_net::proto::ZONE;
+        let in_reach = |w: &[i32; 2]| match chunk {
+            Some(c) => {
+                ((c[0] - NEAR).div_euclid(z)..=(c[0] + NEAR).div_euclid(z)).contains(&w[0])
+                    && ((c[1] - NEAR).div_euclid(z)..=(c[1] + NEAR).div_euclid(z)).contains(&w[1])
+            }
+            None => true,
+        };
+        let known = self.known.get(&id);
+        // (Tout le monde pour un nouveau propriétaire : par morceaux, le reste aux
+        // entretiens suivants, pour ne pas bloquer le relais.)
+        let wanted: Vec<[i32; 2]> = self
+            .asleep
+            .iter()
+            .filter(|(w, last)| {
+                let k = known.and_then(|k| k.get(*w)).copied().unwrap_or_default();
+                in_reach(w) && ((last[0] > k[0] && blocks(**w)) || last[1] > k[1])
+            })
+            .map(|(w, _)| *w)
+            .take(WAKE_MAX)
+            .collect();
+        for w in wanted {
+            self.wake(w);
+        }
         let known = self.known.entry(id).or_default();
         let mut out = Vec::new();
         let mut take = |zone: [i32; 2], log: &ZoneLog| {
@@ -573,6 +766,170 @@ impl Build {
 
 #[cfg(test)]
 mod tests {
+    /// Mesure à la main : un monde où un million de cases ont été changées, réparties sur
+    /// 2000 zones, avec et sans zones endormies (chaque cas dans son propre processus).
+    /// Mémoire prise, place sur le disque.
+    /// `cargo test --release -p minelib-relay memoire -- --ignored --nocapture`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn memoire_de_l_historique() {
+        let rss = || {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .unwrap()
+        };
+        let z = minelib_net::proto::ZONE * 16;
+        let fill = |b: &mut super::Build, paged: bool| {
+            for k in 0..2000i32 {
+                let (zx, zz) = (k % 50, k / 50);
+                for i in 0..500i32 {
+                    let pos = [zx * z + i % z, 40 + i / z, zz * z + (i * 7) % z];
+                    b.publish(pos, (i % 50) as u16 + 1, "Constructeur", &[]);
+                }
+                if paged && k % 100 == 99 {
+                    b.sleep_all();
+                }
+            }
+        };
+        match std::env::var("MINELIB_MESURE").as_deref() {
+            Ok("memoire") => {
+                let r0 = rss();
+                let mut b = super::Build::default();
+                fill(&mut b, false);
+                eprintln!("MESURE {}", rss() - r0);
+                return;
+            }
+            Ok("disque") => {
+                let dir =
+                    std::env::temp_dir().join(format!("minelib-mem-{}", rand::random::<u32>()));
+                let r0 = rss();
+                let mut b = super::Build::default();
+                b.set_page_dir(dir.clone());
+                fill(&mut b, true);
+                b.sleep_all();
+                let disk: u64 = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().metadata().unwrap().len())
+                    .sum();
+                let asleep = rss() - r0;
+                // Un nouveau propriétaire reçoit tout, par morceaux : le plus long.
+                let (mut calls, mut longest) = (0, Duration::ZERO);
+                loop {
+                    let t = Instant::now();
+                    let n = b.catch_up(1, None, &|_| true).len();
+                    longest = longest.max(t.elapsed());
+                    if n == 0 {
+                        break;
+                    }
+                    calls += 1;
+                    b.sleep_all();
+                }
+                eprintln!(
+                    "MESURE {} {} {} {:.0}",
+                    asleep,
+                    disk / 1024,
+                    calls,
+                    longest.as_secs_f32() * 1000.0
+                );
+                return;
+            }
+            _ => {}
+        }
+        let run = |mode: &str| -> Vec<String> {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "zones::tests::memoire_de_l_historique",
+                ])
+                .args(["--nocapture", "--test-threads=1"])
+                .env("MINELIB_MESURE", mode)
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            err.lines()
+                .find_map(|l| l.strip_prefix("MESURE "))
+                .unwrap_or_else(|| panic!("{err}"))
+                .split(' ')
+                .map(str::to_string)
+                .collect()
+        };
+        let mem = run("memoire");
+        let disk = run("disque");
+        eprintln!(
+            "1 million de cases changées sur 2000 zones : toutes en mémoire {} Mo ; \
+             endormies {} Mo en mémoire et {} Mo sur le disque ; tout remettre à un \
+             nouveau propriétaire : {} fois, {} ms au plus chaque fois",
+            mem[0].parse::<u64>().unwrap() / 1024,
+            disk[0].parse::<u64>().unwrap() / 1024,
+            disk[1].parse::<u64>().unwrap() / 1024,
+            disk[2],
+            disk[3]
+        );
+    }
+
+    /// Les zones froides s'endorment sur le disque et se réveillent quand on en a besoin :
+    /// à la fin, tout est comme si elles étaient restées en mémoire (ce qu'un joueur qui
+    /// arrive reçoit, les cases, les numéros), et le propriétaire, qui a déjà tout reçu,
+    /// ne les réveille pas.
+    #[test]
+    fn cold_zones_sleep_on_disk_and_wake_unchanged() {
+        use minelib_net::game::{self, BuildMsg};
+        let dir = std::env::temp_dir().join(format!("minelib-zones-{}", rand::random::<u32>()));
+        let mut paged = super::Build::default();
+        paged.set_page_dir(dir.clone());
+        let mut plain = super::Build::default();
+        let z = minelib_net::proto::ZONE * 16;
+        // Trois zones, quelques cases chacune (dont une changée deux fois).
+        let edits: Vec<([i32; 3], u16)> = (0..3)
+            .flat_map(|k| (0..4).map(move |i| ([k * z + i, 64, 1], (k * 10 + i) as u16 + 1)))
+            .chain([([1, 64, 1], 77)])
+            .collect();
+        for (pos, block) in &edits {
+            paged.publish(*pos, *block, "Eve", &[]);
+            plain.publish(*pos, *block, "Eve", &[]);
+        }
+        // Le propriétaire (joueur 1) a tout reçu.
+        let _ = paged.catch_up(1, None, &|_| true);
+        assert_eq!(paged.sleep_cold(Duration::ZERO), 3);
+        assert_eq!(paged.zones_awake_asleep(), (0, 3));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+        // Rien de nouveau pour le propriétaire : rien ne se réveille.
+        assert!(paged.catch_up(1, None, &|_| true).is_empty());
+        assert_eq!(paged.zones_awake_asleep(), (0, 3));
+        // Une case lue : sa zone seule se réveille.
+        assert_eq!(paged.block_at([1, 64, 1]), Some(77));
+        assert_eq!(paged.zones_awake_asleep(), (1, 2));
+        // Une modification dans une zone endormie : elle se réveille, les numéros suivent.
+        let (a, _) = paged.publish([2 * z + 1, 64, 1], 99, "Eve", &[]);
+        let (b, _) = plain.publish([2 * z + 1, 64, 1], 99, "Eve", &[]);
+        assert_eq!(a, b, "même numéro");
+        // Un joueur qui arrive reçoit exactement la même chose.
+        let got = |b: &mut super::Build| {
+            let mut v: Vec<([i32; 3], u16, u64)> = b
+                .catch_up(9, None, &|_| true)
+                .into_iter()
+                .flat_map(|(_, l)| l)
+                .filter_map(|d| match game::decode::<BuildMsg>(&d) {
+                    Some(BuildMsg::Set {
+                        pos, block, seq, ..
+                    }) => Some((pos, block, seq)),
+                    _ => None,
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(got(&mut paged), got(&mut plain));
+        // Le monde fermé, ses zones endormies partent avec lui.
+        drop(paged);
+        assert!(!dir.exists());
+    }
+
     /// Une modification d'une époque souveraine finie, archivée en retard (passation) avec
     /// un rang plus petit qu'une plus récente de la même case : l'historique garde la plus
     /// récente. Celle d'une autre case, archivée en retard aussi, est gardée et remise

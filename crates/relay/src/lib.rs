@@ -621,6 +621,9 @@ pub fn start(cfg: Config) -> Result<Handle> {
     let accounts = accounts::Store::new(cfg.dir.join("accounts"))?;
     let stats = stats::Store::open(cfg.dir.join("stats"))?;
     let cfg_dir = cfg.dir.clone();
+    // Zones endormies d'une session précédente (le relais a été arrêté) : les mondes
+    // ouverts alors n'existent plus.
+    let _ = std::fs::remove_dir_all(cfg.dir.join("zones"));
     let maps = maps::Store::open(cfg.dir.join("maps"))?;
     let listener =
         TcpListener::bind(&cfg.bind).with_context(|| format!("écoute sur {}", cfg.bind))?;
@@ -1751,7 +1754,7 @@ fn build_edit(
         return;
     }
     // Ce qui était là d'après l'historique (inconnu si la case n'a jamais été changée).
-    let before = st.rooms.get(&rid).and_then(|r| r.build.block_at(pos));
+    let before = st.rooms.get_mut(&rid).and_then(|r| r.build.block_at(pos));
     if !publish_block(st, rid, id, true, pseudo, pos, block, fluid) {
         // (Région souveraine : comptée quand elle revient dans un lot confirmé.)
         return;
@@ -2900,6 +2903,10 @@ fn upkeep_build(st: &mut State) {
         .collect();
     let mut index = None;
     for rid in rooms {
+        // Zones restées sans servir : leur historique s'endort sur le disque.
+        if let Some(room) = st.rooms.get_mut(&rid) {
+            room.build.sleep_cold(zones::COLD_AFTER);
+        }
         // Propriétaire à la connexion pourrie : le monde passe au mieux connecté.
         rebalance_host(st, rid);
         upkeep_regions(st, rid, &mut index);
@@ -3238,6 +3245,13 @@ fn open_room(
     if let Some(c) = st.conns.get_mut(&id) {
         c.room = Some(rid);
         c.joined = Instant::now();
+    }
+    // Monde de construction : ses zones froides dormiront sur le disque du relais.
+    if kind == 1 {
+        let dir = st.cfg.dir.join("zones").join(rid.to_string());
+        if let Some(room) = st.rooms.get_mut(&rid) {
+            room.build.set_page_dir(dir);
+        }
     }
     log::info!("partie {rid} ouverte par « {pseudo} »");
     rid
@@ -7072,8 +7086,8 @@ mod tests {
         };
         // Auteur de la dernière modification d'une case, d'après l'historique du relais.
         let author = |pos: [i32; 3]| {
-            let st = h.state.lock().unwrap();
-            st.rooms[&room].build.author_at(pos)
+            let mut st = h.state.lock().unwrap();
+            st.rooms.get_mut(&room).unwrap().build.author_at(pos)
         };
         let (mut eq, mut cq) = (VecDeque::new(), VecDeque::new());
         let block = |g: Got| match g {
@@ -7235,7 +7249,12 @@ mod tests {
             Got::Reject(pos) => panic!("refusé en {pos:?}"),
         }
         assert_eq!(
-            h.state.lock().unwrap().rooms[&room]
+            h.state
+                .lock()
+                .unwrap()
+                .rooms
+                .get_mut(&room)
+                .unwrap()
                 .build
                 .author_at([1, 70, 2])
                 .as_deref(),
