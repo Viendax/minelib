@@ -26,6 +26,24 @@ use crate::save::{self, GameMode, GameState, PlayerState, SaveData, WorldMeta, M
 use crate::streaming::Streamer;
 
 pub const REACH: f32 = 6.0;
+/// Taille d'écran nommée dans `/give` : `ecran` (normal), `petit_ecran`, `grand_ecran`,
+/// `ecran_geant` (aussi en anglais et avec accents, tirets ou espaces).
+fn screen_size(want: &str) -> Option<u8> {
+    let w: String = want
+        .to_lowercase()
+        .replace('é', "e")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    match w.as_str() {
+        "screen" | "ecran" | "ecranvideo" => Some(crate::screen::NORMAL),
+        "petitecran" | "smallscreen" | "ecranpetit" => Some(0),
+        "grandecran" | "largescreen" | "bigscreen" | "ecrangrand" => Some(2),
+        "ecrangeant" | "geantecran" | "giantscreen" | "hugescreen" => Some(3),
+        _ => None,
+    }
+}
+
 /// Écran regardé de si loin au plus (pour lui donner le plus d'images par seconde). On
 /// n'agit sur un écran (toucher, molette, clavier, casser) qu'à portée de main (`REACH`).
 const SCREEN_LOOK: f32 = 64.0;
@@ -1498,7 +1516,8 @@ impl Session {
                 }
                 self.screen_broke = true;
             } else if near && self.keys.pressed(input, Action::Pick) {
-                self.give_picked(Item::Screen);
+                let size = self.shown.get(i).map_or(crate::screen::NORMAL, |s| s.0.size);
+                self.give_picked(Item::Screen(size));
             } else if self.keys.pressed(input, use_key)
                 && (fps || !self.keys.held(input, Action::Sneak))
                 // En mode FPS, « utiliser » est une lettre : elle va dans le champ de texte.
@@ -1694,10 +1713,11 @@ impl Session {
         best
     }
 
-    /// Pose l'écran vidéo tenu sur la face visée `hit` (clic droit). Refusé s'il serait
-    /// dans le joueur ou s'il y en a déjà un (le sien ou celui d'un autre).
-    fn place_screen(&mut self, hit: minelib_world::raycast::Hit) {
-        let s = crate::screen::Placed::new(hit.block, hit.normal, self.player.eye());
+    /// Pose l'écran vidéo tenu, de taille `size`, sur la face visée `hit` (clic droit).
+    /// Refusé s'il serait dans le joueur ou s'il y en a déjà un (le sien ou celui d'un
+    /// autre).
+    fn place_screen(&mut self, hit: minelib_world::raycast::Hit, size: u8) {
+        let s = crate::screen::Placed::new(hit.block, hit.normal, self.player.eye(), size);
         let (min, max) = s.hitbox();
         let (pmin, pmax) = self.player.bounds();
         let inside = (0..3).all(|k| pmin[k] < max[k] && pmax[k] > min[k]);
@@ -1719,10 +1739,10 @@ impl Session {
         if i >= self.screens.len() {
             return;
         }
-        self.screens.remove(i);
+        let size = self.screens.remove(i).size;
         self.screen_aim = None;
         if self.game.mode != GameMode::Creative {
-            self.inventory.add(Item::Screen, 1);
+            self.inventory.add(Item::Screen(size), 1);
         }
         self.screens_changed(true);
     }
@@ -2020,9 +2040,9 @@ impl Session {
         let Some(hit) = hit else { return };
 
         // Écran vidéo tenu : clic droit le pose sur la face visée (aucun bloc posé).
-        if self.inventory.selected_item() == Some(Item::Screen) {
+        if let Some(Item::Screen(size)) = self.inventory.selected_item() {
             if keys.pressed(input, Action::Use) {
-                self.place_screen(hit);
+                self.place_screen(hit, size);
                 self.place_cooldown = 0.22;
                 return;
             }
@@ -4127,10 +4147,12 @@ impl Session {
                         .find(|b| b.def().name.to_lowercase() == want)
                 });
                 match found {
-                    _ if matches!(want.as_str(), "screen" | "ecran" | "écran") => {
-                        self.inventory.add(Item::Screen, count);
+                    _ if screen_size(&want).is_some() => {
+                        let size = screen_size(&want).unwrap_or(crate::screen::NORMAL);
+                        self.inventory.add(Item::Screen(size), count);
+                        let name = crate::screen::size_name(size).to_lowercase();
                         self.chat
-                            .say(format!("{count} écran(s) vidéo donné(s)."), chat::YELLOW);
+                            .say(format!("{count} × {name} donné(s)."), chat::YELLOW);
                     }
                     _ if want == "torch" || want == "torche" => {
                         self.inventory.add(Item::Torch(None), count);
@@ -4299,6 +4321,7 @@ impl Session {
                     "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
                     "/timefix true|false : arrête ou relance le temps",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
+                    "/give petit_ecran | grand_ecran | ecran_geant : les autres tailles d'écran",
                     "/yt [recherche | adresse] : YouTube sur les écrans vidéo",
                     "/lumieres : éditeur de lumières (touche L) ; /lumieres effacer : les retire",
                     "Vol : deux appuis rapides sur Espace",
@@ -5467,7 +5490,7 @@ impl Session {
                         .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb),
                 )),
                 Some(Item::Wand) => Some(Held::Wand([70, 60, 90])),
-                Some(Item::Screen) => Some(Held::Wand([30, 30, 36])),
+                Some(Item::Screen(_)) => Some(Held::Wand([30, 30, 36])),
                 None => None,
             }
         } else {

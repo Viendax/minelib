@@ -22,9 +22,10 @@ pub enum Item {
     Torch(Option<usize>),
     /// Baguette de sélection (WorldEdit) : clic gauche coin 1, clic droit coin 2.
     Wand,
-    /// Écran vidéo : « utiliser » le pose ; posé, « utiliser » le touche (tactile) et
+    /// Écran vidéo de taille `n` (indice dans `crate::screen::SIZES` : petit, normal,
+    /// grand, géant) : « utiliser » le pose ; posé, « utiliser » le touche (tactile) et
     /// « casser » le casse.
-    Screen,
+    Screen(u8),
 }
 
 impl Item {
@@ -35,7 +36,10 @@ impl Item {
             Item::Torch(None) => 0x1_0000,
             Item::Torch(Some(i)) => 0x1_0001 + i as u32,
             Item::Wand => 0x2_0000,
-            Item::Screen => 0x3_0000,
+            // (Normal : le code d'avant les tailles ; les autres à la suite.)
+            Item::Screen(1) => 0x3_0000,
+            Item::Screen(0) => 0x3_0001,
+            Item::Screen(n) => 0x3_0000 + u32::from(n.min(3)),
         }
     }
 
@@ -43,7 +47,10 @@ impl Item {
     pub fn from_code(code: u32) -> Option<Self> {
         match code {
             0x2_0000 => Some(Item::Wand),
-            0x3_0000 => Some(Item::Screen),
+            0x3_0000 => Some(Item::Screen(crate::screen::NORMAL)),
+            0x3_0001 => Some(Item::Screen(0)),
+            0x3_0002 => Some(Item::Screen(2)),
+            0x3_0003 => Some(Item::Screen(3)),
             0x1_0000 => Some(Item::Torch(None)),
             c if c > 0x1_0000 && c < 0x2_0000 => {
                 let i = (c - 0x1_0001) as usize;
@@ -58,7 +65,7 @@ impl Item {
         match self {
             Item::Block(b) => capitalize(b.name()),
             Item::Wand => "Baguette de sélection".into(),
-            Item::Screen => "Écran vidéo".into(),
+            Item::Screen(n) => crate::screen::size_name(n).into(),
             Item::Torch(None) => "Torche".into(),
             Item::Torch(Some(i)) => {
                 let c = &CHEMICALS[i];
@@ -78,7 +85,7 @@ impl Item {
         match self {
             Item::Torch(None) => Some(WOOD_FLAME),
             Item::Torch(Some(i)) => Some(CHEMICALS[i].rgb),
-            Item::Block(_) | Item::Wand | Item::Screen => None,
+            Item::Block(_) | Item::Wand | Item::Screen(_) => None,
         }
     }
 
@@ -94,7 +101,14 @@ impl Item {
                 lines.push(("Clic molette : effacer la sélection".into(), WHITE));
                 lines.push(("Commandes //set, //copy, //paste… (//help)".into(), GREY));
             }
-            Item::Screen => {
+            Item::Screen(n) => {
+                let (w, h) = crate::screen::dims(n);
+                // (« 2,25 », pas « 2,250 ».)
+                let num = |v: f32| {
+                    let t = format!("{v:.3}");
+                    t.trim_end_matches('0').trim_end_matches('.').replace('.', ",")
+                };
+                lines.push((format!("{} × {} blocs", num(w), num(h)), GREY));
                 lines.push(("Clic droit : le poser sur un mur ou un sol".into(), WHITE));
                 lines.push(("Clic droit dessus : le toucher (tactile)".into(), WHITE));
                 lines.push(("Clic gauche dessus : le casser".into(), WHITE));
@@ -417,7 +431,7 @@ pub fn catalogue() -> &'static [(Item, usize)] {
         blocks.sort_by_key(|b| (b.0, b.1));
         let mut items: Vec<(Item, usize)> = blocks.into_iter().map(|(t, _, it)| (it, t)).collect();
         items.push((Item::Wand, 6));
-        items.push((Item::Screen, 6));
+        items.extend((0..crate::screen::SIZES.len() as u8).map(|n| (Item::Screen(n), 6)));
         items.push((Item::Torch(None), 6));
         items.extend((0..CHEMICALS.len()).map(|i| (Item::Torch(Some(i)), 6)));
         items
@@ -694,7 +708,9 @@ impl Inventory {
                         Item::Block(b) => fold(&b.def().key).contains(&q),
                         Item::Torch(_) => "torche".contains(&q),
                         Item::Wand => "baguette wand worldedit".contains(&q),
-                        Item::Screen => "ecran video tele television youtube".contains(&q),
+                        Item::Screen(_) => {
+                            "ecran video tele television youtube petit grand geant".contains(&q)
+                        }
                     }
                 }
             })
@@ -1396,7 +1412,7 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
         // Baguette : image en pixels.
         Item::Wand => crate::wand::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s),
         // Écran vidéo : petite télé en pixels.
-        Item::Screen => crate::screen::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s),
+        Item::Screen(n) => crate::screen::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s, n),
         // Barrières (invisibles) : un panneau « interdit », rouge (bleu : à fluides).
         Item::Block(b) if matches!(b.def().shape, minelib_world::registry::Shape::Invisible) => {
             let c = if b.def().key == "fluid_barrier" {

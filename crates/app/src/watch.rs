@@ -27,8 +27,10 @@ use serde::{Deserialize, Serialize};
 use crate::screen::Placed;
 
 /// Début des messages de cette partie dans le canal de la voix. Lu comme un message de la
-/// voix, `0xFF` puis `M` est un numéro de variante que la voix n'a pas : ignoré.
-pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'V'];
+/// voix, `0xFF` puis `M` est un numéro de variante que la voix n'a pas : ignoré. `2` : avec
+/// la taille des écrans (v160) ; un jeu plus ancien (`V`) ignore ces messages, et
+/// inversement.
+pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'2'];
 /// Un écran est montré aux joueurs à moins de tant de blocs de lui.
 pub const RANGE: f32 = 64.0;
 /// Un écran annoncé plus loin que ça de celui qui l'annonce est refusé.
@@ -98,6 +100,8 @@ struct Shared {
     block: [i32; 3],
     normal: [i32; 3],
     facing: [i32; 3],
+    /// Taille (indice dans `crate::screen::SIZES`).
+    size: u8,
     video: Option<Video>,
 }
 
@@ -364,6 +368,7 @@ impl Party {
                         block: s.block,
                         normal: s.normal,
                         facing: s.facing,
+                        size: s.size,
                     };
                     if !valid_place(&p)
                         || (center(&p) - pos).length() > ACCEPT_RANGE
@@ -574,6 +579,7 @@ impl Party {
                     block: s.block,
                     normal: s.normal,
                     facing: s.facing,
+                    size: s.size,
                     video: self.tracks.get(&s.id()).map(Track::at_now),
                 })
                 .collect();
@@ -616,10 +622,12 @@ fn center(s: &Placed) -> Vec3 {
     Vec3::from(s.anchor().center)
 }
 
-/// Un écran possible : posé sur une face (un axe), tourné à l'horizontale, dans le monde.
+/// Un écran possible : posé sur une face (un axe), tourné à l'horizontale, d'une taille
+/// connue, dans le monde.
 fn valid_place(p: &Placed) -> bool {
     let unit = |v: [i32; 3]| v.iter().map(|c| c.abs()).sum::<i32>() == 1;
-    unit(p.normal)
+    usize::from(p.size) < crate::screen::SIZES.len()
+        && unit(p.normal)
         && unit(p.facing)
         && p.facing[1] == 0
         && (p.normal[1] != 0 || p.facing == p.normal)
@@ -936,7 +944,7 @@ mod tests {
     }
 
     fn screen_at(x: i32) -> Placed {
-        Placed::new([x, 64, 0], [0, 0, 1], Vec3::new(x as f32, 65.0, 6.0))
+        Placed::new([x, 64, 0], [0, 0, 1], Vec3::new(x as f32, 65.0, 6.0), crate::screen::NORMAL)
     }
 
     fn close(a: f32, b: f32, tol: f32) -> bool {
@@ -1094,6 +1102,7 @@ mod tests {
             block: s.block,
             normal: s.normal,
             facing: s.facing,
+            size: s.size,
             video,
         };
         // Pas pour nous (voix) : rendu à la voix.
@@ -1108,6 +1117,7 @@ mod tests {
             block: [0, 64, 0],
             normal: [1, 1, 0],
             facing: [1, 0, 0],
+            size: 1,
         };
         let m = msg(&Msg::Screens(vec![shared(&bent, None)]));
         p.receive(A, &m, Some(Vec3::new(0.0, 65.0, 5.0)), &[]);
@@ -1159,6 +1169,33 @@ mod tests {
         });
         p.receive(B, &m, None, &[]);
         assert!(!p.tracks.contains_key(&12345));
+    }
+
+    #[test]
+    fn la_taille_de_l_ecran_arrive_chez_les_autres() {
+        let giant = Placed::new([0, 64, 0], [0, 0, 1], Vec3::new(0.0, 65.0, 6.0), 3);
+        let mut ps = vec![
+            Player::new(A, Vec3::new(0.0, 65.0, 6.0)),
+            Player::new(B, Vec3::new(3.0, 65.0, 8.0)),
+        ];
+        ps[0].local.push(giant);
+        run(&mut ps, 1.0);
+        assert_eq!(ps[1].party.screens(&[]), vec![(giant, A.to_string())]);
+        // Taille inconnue : refusée.
+        let mut p = Party::new();
+        let mut d = MAGIC.to_vec();
+        let odd = Shared {
+            block: [0, 64, 0],
+            normal: [0, 0, 1],
+            facing: [0, 0, 1],
+            size: 9,
+            video: None,
+        };
+        d.extend(minelib_net::game::encode(&Msg::Screens(vec![odd])));
+        p.receive(A, &d, Some(Vec3::new(0.0, 65.0, 5.0)), &[]);
+        assert!(p.screens(&[]).is_empty());
+        // Ancien format (sans taille) : pas pour nous, rendu à la voix.
+        assert!(!p.receive(A, &[0xFF, b'M', b'T', b'V', 0], Some(Vec3::ZERO), &[]));
     }
 
     #[test]

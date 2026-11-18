@@ -262,7 +262,7 @@ fn icon_kind(item: Item) -> RayBoxKind {
             RayBoxKind::Flat(rgb)
         }
         Item::Wand => RayBoxKind::Flat([120, 80, 200]),
-        Item::Screen => RayBoxKind::Flat([30, 30, 36]),
+        Item::Screen(_) => RayBoxKind::Flat([30, 30, 36]),
     }
 }
 

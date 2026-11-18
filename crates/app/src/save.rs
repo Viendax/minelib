@@ -283,7 +283,9 @@ fn item_code(item: Item) -> String {
     match item {
         Item::Block(b) => format!("block;{}", b.0),
         Item::Wand => "wand;-".into(),
-        Item::Screen => "screen;-".into(),
+        // (Normal : comme avant les tailles.)
+        Item::Screen(1) => "screen;-".into(),
+        Item::Screen(n) => format!("screen;{n}"),
         Item::Torch(None) => "torch;-".into(),
         Item::Torch(Some(i)) => format!("torch;{i}"),
     }
@@ -294,7 +296,9 @@ fn parse_item(kind: &str, arg: &str) -> Option<Item> {
         "block" => Some(Item::Block(BlockId(arg.parse().ok()?))),
         "torch" => Some(Item::Torch(arg.parse().ok())),
         "wand" => Some(Item::Wand),
-        "screen" => Some(Item::Screen),
+        "screen" => Some(Item::Screen(
+            arg.parse::<u8>().map_or(crate::screen::NORMAL, |n| n.min(3)),
+        )),
         _ => None,
     }
 }

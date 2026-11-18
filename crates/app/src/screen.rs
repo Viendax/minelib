@@ -19,9 +19,30 @@ use std::path::Path;
 use glam::{Mat4, Vec3};
 use minelib_render::{ScreenAnchor, Ui, VmVertex};
 
-/// Taille d'un écran : 16:9, 4 blocs de large.
+/// Taille d'un écran normal : 16:9, 4 blocs de large.
 const WIDTH: f32 = 4.0;
 const HEIGHT: f32 = 2.25;
+/// Tailles d'écran (un objet chacune), en fois la taille normale : petit (2 × 1,125
+/// blocs), normal (4 × 2,25), grand (8 × 4,5), géant (32 × 18).
+pub const SIZES: [f32; 4] = [0.5, 1.0, 2.0, 8.0];
+/// Indice de la taille normale dans `SIZES`.
+pub const NORMAL: u8 = 1;
+
+/// Nom de l'objet écran de taille `size` (indice dans `SIZES`).
+pub fn size_name(size: u8) -> &'static str {
+    match size {
+        0 => "Petit écran vidéo",
+        2 => "Grand écran vidéo",
+        3 => "Écran vidéo géant",
+        _ => "Écran vidéo",
+    }
+}
+
+/// Largeur et hauteur (blocs) d'un écran de taille `size`.
+pub fn dims(size: u8) -> (f32, f32) {
+    let k = SIZES[usize::from(size.min(3))];
+    (WIDTH * k, HEIGHT * k)
+}
 /// Décollé de sa face (pas de scintillement avec le bloc) et épaisseur de sa hitbox.
 const GAP: f32 = 0.02;
 const THICK: f32 = 0.06;
@@ -30,20 +51,21 @@ pub const MAX_SCREENS: usize = 64;
 /// Fichier des écrans, dans le dossier du monde.
 const FILE: &str = "screens.txt";
 
-/// Un écran posé : le bloc qui le porte, la face où il est posé (normale) et la direction
-/// vers laquelle il regarde (horizontale, sur un axe).
+/// Un écran posé : le bloc qui le porte, la face où il est posé (normale), la direction
+/// vers laquelle il regarde (horizontale, sur un axe) et sa taille (indice dans `SIZES`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Placed {
     pub block: [i32; 3],
     pub normal: [i32; 3],
     pub facing: [i32; 3],
+    pub size: u8,
 }
 
 impl Placed {
-    /// Écran posé sur la face `normal` du bloc `block`. Sur un mur il regarde hors du mur ;
-    /// sur un sol ou un plafond il se dresse, tourné vers le joueur (`eye`), sur l'axe le
-    /// plus proche (comme les panneaux).
-    pub fn new(block: [i32; 3], normal: [i32; 3], eye: Vec3) -> Self {
+    /// Écran de taille `size` posé sur la face `normal` du bloc `block`. Sur un mur il
+    /// regarde hors du mur ; sur un sol ou un plafond il se dresse, tourné vers le joueur
+    /// (`eye`), sur l'axe le plus proche (comme les panneaux).
+    pub fn new(block: [i32; 3], normal: [i32; 3], eye: Vec3, size: u8) -> Self {
         let facing = if normal[1] == 0 {
             normal
         } else {
@@ -59,18 +81,22 @@ impl Placed {
             block,
             normal,
             facing,
+            size: size.min(3),
         }
     }
 
-    /// Où dessiner l'écran.
+    /// Où dessiner l'écran. Le bas de l'écran est au point posé : sur un mur, au bas du
+    /// bloc visé (centré sur lui en largeur) ; sur un sol, sur le sol. Sous un plafond,
+    /// il pend (son haut au plafond).
     pub fn anchor(&self) -> ScreenAnchor {
+        let (width, height) = dims(self.size);
         let n = ivec(self.normal);
         let f = ivec(self.facing);
         let face = center_of(self.block) + n * 0.5;
         let center = if self.normal[1] == 0 {
-            face + n * GAP
+            face + n * GAP + Vec3::Y * (height * 0.5 - 0.5)
         } else {
-            face + Vec3::Y * n.y * (HEIGHT * 0.5 + GAP)
+            face + Vec3::Y * n.y * (height * 0.5 + GAP)
         };
         let up = Vec3::Y;
         let right = (-f).cross(up);
@@ -78,7 +104,7 @@ impl Placed {
             center: center.into(),
             right: right.into(),
             up: up.into(),
-            size: [WIDTH, HEIGHT],
+            size: [width, height],
         }
     }
 
@@ -97,10 +123,11 @@ impl Placed {
     /// Hitbox : coins min et max (monde). Collée à sa face, `THICK` d'épaisseur.
     pub fn hitbox(&self) -> (Vec3, Vec3) {
         let a = self.anchor();
+        let (width, height) = (a.size[0], a.size[1]);
         let c = Vec3::from(a.center);
         let f = ivec(self.facing);
         let half =
-            (Vec3::from(a.right) * WIDTH * 0.5).abs() + (Vec3::from(a.up) * HEIGHT * 0.5).abs();
+            (Vec3::from(a.right) * width * 0.5).abs() + (Vec3::from(a.up) * height * 0.5).abs();
         // Sur un mur, de la face du bloc jusqu'à un peu devant l'écran ; debout, centrée.
         let (back, front) = if self.normal[1] == 0 {
             (GAP, THICK - GAP)
@@ -121,7 +148,8 @@ fn center_of(b: [i32; 3]) -> Vec3 {
     Vec3::new(b[0] as f32 + 0.5, b[1] as f32 + 0.5, b[2] as f32 + 0.5)
 }
 
-/// Écrans enregistrés dans le dossier du monde (aucun si le fichier manque).
+/// Écrans enregistrés dans le dossier du monde (aucun si le fichier manque). Une ligne
+/// par écran : bloc, face, direction, taille (absente avant la v160 : normale).
 pub fn load(dir: &Path) -> Vec<Placed> {
     let Ok(text) = std::fs::read_to_string(dir.join(FILE)) else {
         return Vec::new();
@@ -133,10 +161,11 @@ pub fn load(dir: &Path) -> Vec<Placed> {
                 .map(str::parse)
                 .collect::<Result<_, _>>()
                 .ok()?;
-            (n.len() == 9).then(|| Placed {
+            (n.len() == 9 || n.len() == 10).then(|| Placed {
                 block: [n[0], n[1], n[2]],
                 normal: [n[3], n[4], n[5]],
                 facing: [n[6], n[7], n[8]],
+                size: n.get(9).map_or(NORMAL, |&k| k.clamp(0, 3) as u8),
             })
         })
         .take(MAX_SCREENS)
@@ -145,12 +174,13 @@ pub fn load(dir: &Path) -> Vec<Placed> {
 
 /// Enregistre les écrans dans le dossier du monde.
 pub fn save(dir: &Path, screens: &[Placed]) {
-    let mut text = String::from("# Écrans vidéo : bloc (x y z), face (normale), direction\n");
+    let mut text =
+        String::from("# Écrans vidéo : bloc (x y z), face (normale), direction, taille\n");
     for s in screens {
         let [b, n, f] = [s.block, s.normal, s.facing];
         text += &format!(
-            "{} {} {} {} {} {} {} {} {}\n",
-            b[0], b[1], b[2], n[0], n[1], n[2], f[0], f[1], f[2]
+            "{} {} {} {} {} {} {} {} {} {}\n",
+            b[0], b[1], b[2], n[0], n[1], n[2], f[0], f[1], f[2], s.size
         );
     }
     if let Err(e) = std::fs::write(dir.join(FILE), text) {
@@ -222,8 +252,10 @@ fn pixels() -> impl Iterator<Item = (usize, usize, [f32; 3])> {
 }
 
 /// Icône dans un emplacement d'inventaire : `size` pixels de côté, centrée.
-pub fn icon(ui: &mut Ui, cx: f32, cy: f32, size: f32) {
-    crate::wand::pixel_icon(ui, cx, cy, size, pixels());
+/// Icône de l'objet écran de taille `screen` : la télé, plus ou moins grande dans la case.
+pub fn icon(ui: &mut Ui, cx: f32, cy: f32, size: f32, screen: u8) {
+    let k = [0.55, 0.75, 0.9, 1.0][usize::from(screen.min(3))];
+    crate::wand::pixel_icon(ui, cx, cy, size * k, pixels());
 }
 
 /// Écran tenu en main (objet plat en relief, comme la baguette).
@@ -1302,7 +1334,7 @@ mod tests {
 
     /// Écran sur la face +Z du bloc (0, 1, 0) : regarde vers +Z.
     fn wall() -> Placed {
-        Placed::new([0, 1, 0], [0, 0, 1], Vec3::new(0.5, 1.5, 6.0))
+        Placed::new([0, 1, 0], [0, 0, 1], Vec3::new(0.5, 1.5, 6.0), NORMAL)
     }
 
     #[test]
@@ -1337,9 +1369,31 @@ mod tests {
     }
 
     #[test]
+    fn quatre_tailles_le_bas_au_point_pose() {
+        for (size, k) in SIZES.iter().enumerate() {
+            let size = size as u8;
+            // Mur : face +Z du bloc (0, 5, 0). Bas de l'écran au bas du bloc (y = 5),
+            // centré sur le bloc en largeur.
+            let w = Placed::new([0, 5, 0], [0, 0, 1], Vec3::new(0.5, 6.0, 9.0), size);
+            let (mn, mx) = w.hitbox();
+            assert!((mn.y - 5.0).abs() < 1e-4, "taille {size} : bas {mn:?}");
+            assert!((mx.y - mn.y - HEIGHT * k).abs() < 1e-4);
+            assert!((mx.x - mn.x - WIDTH * k).abs() < 1e-4);
+            assert!(((mn.x + mx.x) * 0.5 - 0.5).abs() < 1e-4);
+            // Sol : face +Y du bloc (0, 0, 0). Bas de l'écran sur le sol (y = 1).
+            let f = Placed::new([0, 0, 0], [0, 1, 0], Vec3::new(0.5, 2.0, 9.0), size);
+            let (mn, mx) = f.hitbox();
+            assert!((mn.y - 1.0).abs() < 0.05, "taille {size} : sol {mn:?}");
+            assert!((mx.y - mn.y - HEIGHT * k).abs() < 1e-4);
+        }
+        assert_eq!(dims(0), (2.0, 1.125));
+        assert_eq!(dims(3), (32.0, 18.0));
+    }
+
+    #[test]
     fn debout_sur_un_sol_face_au_joueur_sur_un_axe() {
         // Sol (face +Y du bloc (0,0,0)), joueur surtout vers -X : l'écran regarde -X.
-        let s = Placed::new([0, 0, 0], [0, 1, 0], Vec3::new(-6.0, 2.0, 1.0));
+        let s = Placed::new([0, 0, 0], [0, 1, 0], Vec3::new(-6.0, 2.0, 1.0), NORMAL);
         assert_eq!(s.facing, [-1, 0, 0]);
         let (mn, _) = s.hitbox();
         assert!((mn.y - 1.0).abs() < 0.05, "posé sur le sol : {mn:?}");
@@ -1351,10 +1405,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let list = vec![
             wall(),
-            Placed::new([3, 0, 2], [0, 1, 0], Vec3::new(3.5, 2.0, 9.0)),
+            Placed::new([3, 0, 2], [0, 1, 0], Vec3::new(3.5, 2.0, 9.0), 3),
+            Placed::new([5, 0, 2], [1, 0, 0], Vec3::new(9.0, 2.0, 2.0), 0),
         ];
         save(&dir, &list);
         assert_eq!(load(&dir), list);
+        // Fichier d'avant les tailles (9 nombres) : écrans normaux.
+        std::fs::write(dir.join(FILE), "0 1 0 0 0 1 0 0 1\n").unwrap();
+        assert_eq!(load(&dir), vec![wall()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1393,9 +1451,9 @@ mod tests {
     #[test]
     fn numero_stable_et_distinct() {
         let a = wall();
-        assert_eq!(a.id(), Placed::new([0, 1, 0], [0, 0, 1], Vec3::ZERO).id());
-        assert_ne!(a.id(), Placed::new([0, 1, 0], [1, 0, 0], Vec3::ZERO).id());
-        assert_ne!(a.id(), Placed::new([1, 1, 0], [0, 0, 1], Vec3::ZERO).id());
+        assert_eq!(a.id(), Placed::new([0, 1, 0], [0, 0, 1], Vec3::ZERO, NORMAL).id());
+        assert_ne!(a.id(), Placed::new([0, 1, 0], [1, 0, 0], Vec3::ZERO, NORMAL).id());
+        assert_ne!(a.id(), Placed::new([1, 1, 0], [0, 0, 1], Vec3::ZERO, NORMAL).id());
     }
 
     #[test]
