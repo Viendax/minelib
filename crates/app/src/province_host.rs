@@ -207,6 +207,12 @@ impl ProvinceHost {
     pub fn kill(&self) {
         self.handle.kill();
     }
+
+    /// Essais : messages de voix remis par ce relais de province.
+    #[cfg(test)]
+    pub fn voice_relayed(&self) -> usize {
+        self.handle.voice_relayed()
+    }
 }
 
 /// Relais d'une région rattaché au relais de sa province : la connexion à ce relais (qui

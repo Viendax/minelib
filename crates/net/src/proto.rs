@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 38;
+pub const PROTOCOL: u32 = 39;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -494,6 +494,11 @@ pub enum Request {
         province: [i32; 2],
         epoch: u64,
         t: u64,
+        /// (v140) Joueurs de chaque région peuplée de la province (le relais du monde ne
+        /// reçoit plus leurs positions), et relais de région dont l'hôte joue dans la
+        /// région qu'il sert (région, rang : il doit être relevé).
+        counts: Vec<([i32; 2], u32)>,
+        inside: Vec<([i32; 2], u16)>,
     },
     /// Ce que le relais de province vient de publier (zone, rang, message) : le relais du
     /// monde en garde une copie, pour reprendre la province aussitôt si son hôte tombe.

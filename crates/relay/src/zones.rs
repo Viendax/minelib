@@ -228,6 +228,9 @@ pub struct Build {
     /// Les mêmes par zone (4 × 4 chunks), avec leur chunk : pour trouver qui doit recevoir
     /// une modification, 49 zones à regarder au lieu de 625 chunks.
     by_zone: HashMap<[i32; 2], Vec<(u64, [i32; 2])>>,
+    /// Nombre de joueurs par région (v140 : compté à chaque déplacement, plus en parcourant
+    /// tous les joueurs à chaque entretien).
+    by_region: HashMap<[i32; 2], u32>,
     /// Objets au sol et coffres du monde : ce relais en est l'arbitre.
     pub items: minelib_net::items::ItemStore,
     /// Zones endormies sur le disque (voir `sleep_cold`) : dossier (aucun : elles restent
@@ -463,9 +466,14 @@ impl Build {
         }
         self.by_chunk.clear();
         self.by_zone.clear();
+        self.by_region.clear();
         let mut ids: Vec<(u64, [i32; 2])> = self.positions.iter().map(|(&i, &c)| (i, c)).collect();
         ids.sort_unstable();
         for (id, c) in ids {
+            *self
+                .by_region
+                .entry(minelib_net::proto::region_of(c))
+                .or_default() += 1;
             self.by_chunk.entry(c).or_default().push(id);
             self.by_zone
                 .entry(minelib_net::proto::zone_of(c))
@@ -499,8 +507,19 @@ impl Build {
                     self.by_zone.remove(&z);
                 }
             }
+            let r = minelib_net::proto::region_of(o);
+            if let Some(n) = self.by_region.get_mut(&r) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.by_region.remove(&r);
+                }
+            }
         }
         if let Some(c) = chunk {
+            *self
+                .by_region
+                .entry(minelib_net::proto::region_of(c))
+                .or_default() += 1;
             self.by_chunk.entry(c).or_default().push(id);
             self.by_zone
                 .entry(minelib_net::proto::zone_of(c))
@@ -597,8 +616,18 @@ impl Build {
     }
 
     /// Chunks où se trouvent au moins deux joueurs (pour la fréquentation).
-    pub fn crowded_chunks(&self) -> impl Iterator<Item = &Vec<u64>> {
-        self.by_chunk.values().filter(|m| m.len() >= 2)
+    /// Joueurs de chaque région occupée.
+    pub fn region_counts(&mut self) -> &HashMap<[i32; 2], u32> {
+        self.reindex();
+        &self.by_region
+    }
+
+    /// Chunks où se trouvent au moins deux joueurs, avec eux.
+    pub fn crowded(&self) -> impl Iterator<Item = ([i32; 2], &Vec<u64>)> {
+        self.by_chunk
+            .iter()
+            .filter(|(_, m)| m.len() >= 2)
+            .map(|(c, m)| (*c, m))
     }
 
     /// Joueurs à qui envoyer ce qui se passe au chunk `chunk` (tous ceux à portée : une

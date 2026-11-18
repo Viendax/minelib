@@ -189,6 +189,9 @@ enum Authority {
 const PROVINCE_RETRY: f32 = 1.0;
 /// Demandes d'objets parties à des relais de province dont on garde la trace, au plus.
 const ITEM_ASKED_MAX: usize = 4096;
+/// Chunks autour de soi dont le relais du monde annonce les relais (comme `SHARD_VIEW` du
+/// relais).
+const ROOT_VIEW: i32 = 16;
 
 pub struct BuildNet {
     link: Sender<Inbound>,
@@ -264,6 +267,11 @@ pub struct BuildNet {
     /// Demandes d'objets parties à un relais de province (numéro → province) : lui seul
     /// peut les refuser.
     item_asked: HashMap<u32, [i32; 2]>,
+    /// (v140) Tout ce qu'on avait en vue au dernier passage était servi par des relais de
+    /// province où l'on est entré ; province dite au relais du monde avec la dernière
+    /// position qu'il a reçue.
+    was_deep: bool,
+    root_province: Option<[i32; 2]>,
 }
 
 /// Bloc remis par un relais de région : celui d'avant, celui remis, son rang ; et si
@@ -442,6 +450,8 @@ impl BuildNet {
             from_province: None,
             province_retry: 0.0,
             item_asked: HashMap::new(),
+            was_deep: false,
+            root_province: None,
         }
     }
 
@@ -602,6 +612,7 @@ impl BuildNet {
         let mut shards_changed = false;
         let mut confirmed = Vec::new();
         let mut items_ok = Vec::new();
+        let mut voice = Vec::new();
         for (p, c) in &mut self.provinces {
             while let Some(e) = c.client.poll() {
                 match e {
@@ -642,6 +653,8 @@ impl BuildNet {
                         c.shards = list;
                         shards_changed = true;
                     }
+                    // (v140) La voix de ceux qui parlent dans cette province.
+                    Event::VoiceFrom { from, data } => voice.push((from, data)),
                     Event::RoomClosed | Event::Error(_) | Event::Offline(_) | Event::Lost => {
                         log::info!("construction : relais de la province {p:?} perdu");
                         broken.push(*p);
@@ -660,6 +673,7 @@ impl BuildNet {
         }
         // Objets gardés par le relais du monde : ils entrent dans la partie.
         self.item_inbox.extend(items_ok);
+        self.voice_in.extend(voice);
         for (serial, list) in confirmed {
             if let Some(m) = self.heard.get_mut(&serial) {
                 for (pos, seq) in list {
@@ -729,6 +743,8 @@ impl BuildNet {
         // (Le relais repris sert tout lui-même : plus de provinces.)
         self.province_list.clear();
         self.provinces.clear();
+        self.was_deep = false;
+        self.root_province = None;
         self.served_sent.clear();
         let chunk = self.chunk.take();
         self.caps_sent = false;
@@ -915,6 +931,25 @@ impl BuildNet {
         }
     }
 
+    /// (v140) Tout ce qu'on a en vue de ce chunk est servi par des relais de province où
+    /// l'on est entré.
+    fn deep(&self, chunk: [i32; 2]) -> bool {
+        if self.province_list.is_empty() {
+            return false;
+        }
+        let lo = proto::region_of([chunk[0] - ROOT_VIEW, chunk[1] - ROOT_VIEW]);
+        let hi = proto::region_of([chunk[0] + ROOT_VIEW, chunk[1] + ROOT_VIEW]);
+        (lo[0]..=hi[0]).all(|x| {
+            (lo[1]..=hi[1]).all(|z| {
+                self.province_list
+                    .iter()
+                    .find(|i| i.has([x, z]))
+                    .and_then(|i| self.provinces.get(&i.province))
+                    .is_some_and(|c| c.joined && c.link.is_some())
+            })
+        })
+    }
+
     /// Relais de la province de ce chunk, s'il est entré (v139 : positions, positions de
     /// retour).
     fn province_link(&self, chunk: [i32; 2]) -> Option<&Sender<Inbound>> {
@@ -1068,11 +1103,23 @@ impl BuildNet {
             caps = Some(Self::caps(fps));
         }
         // Nouveau chunk : le relais du monde le sait avant de recevoir une demande de là
-        // (il refuse une modification hors de portée de son auteur).
+        // (il refuse une modification hors de portée de son auteur). (v140) Au fond des
+        // provinces servies par un relais de province (tout ce qu'on a en vue), seulement
+        // quand on change de province : c'est à leurs relais qu'on le dit.
         let chunk = chunk_of(feet.x.floor() as i32, feet.z.floor() as i32);
-        if self.chunk != Some(chunk) {
+        let deep = self.deep(chunk);
+        if self.chunk != Some(chunk) || deep != self.was_deep {
             self.chunk = Some(chunk);
-            self.send(Request::Position { chunk });
+            let province = self
+                .province_list
+                .iter()
+                .find(|i| i.has(proto::region_of(chunk)))
+                .map(|i| i.province);
+            if !deep || !self.was_deep || province != self.root_province {
+                self.send(Request::Position { chunk });
+                self.root_province = province;
+            }
+            self.was_deep = deep;
         }
         // Ce que le joueur a changé (monde en pause : ça attend dans le journal).
         let edits = if self.paused {
@@ -1325,16 +1372,18 @@ impl BuildNet {
 
     /// Voix (v137) : par le relais de région de là où l'on est, s'il est relié (il la
     /// remet à ceux de ses joueurs qui doivent l'entendre, et aux autres relais de la
-    /// région pour les leurs) ; sinon par le relais du monde.
+    /// région pour les leurs) ; sinon (v140) par le relais de sa province, où entrent tous
+    /// ceux qui l'ont en vue ; sinon par le relais du monde.
     pub fn send_voice(&self, to: Vec<String>, data: Vec<u8>) {
         if to.is_empty() {
             return;
         }
         let req = Request::VoiceTo { to, data };
-        match self
-            .chunk
-            .and_then(|c| self.shards.link(proto::region_of(c)))
-        {
+        match self.chunk.and_then(|c| {
+            self.shards
+                .link(proto::region_of(c))
+                .or_else(|| self.province_link(c))
+        }) {
             Some(l) => {
                 transport::push(l, &req);
             }
@@ -3292,6 +3341,23 @@ mod tests {
         Vec<Bot>,
         u64,
     ) {
+        province_setup_with(survival, 1, 2)
+    }
+
+    /// Comme `province_setup`, avec des provinces de `size` × `size` régions, et des relais
+    /// de région à partir de `shard_from` joueurs.
+    #[allow(clippy::type_complexity)]
+    fn province_setup_with(
+        survival: bool,
+        size: usize,
+        shard_from: usize,
+    ) -> (
+        std::path::PathBuf,
+        minelib_relay::Handle,
+        Vec<(Bot, Bot)>,
+        Vec<Bot>,
+        u64,
+    ) {
         let dir = std::env::temp_dir().join(format!("minelib-provinces-{}", rand_u32()));
         let names = ["Garant", "Garant2", "Garant3", "Garant4"];
         for n in names {
@@ -3306,9 +3372,9 @@ mod tests {
         .unwrap();
         // Une région de 2 joueurs a son relais, deux à partir de 4 (souveraine) ; une
         // province (une région) reçoit son relais à partir de 3 joueurs.
-        h.set_shard_from(2);
+        h.set_shard_from(shard_from);
         h.set_shard_share(2);
-        h.set_provinces(1, 3);
+        h.set_provinces(size, 3);
         let addr = h.addr.to_string();
         // Quatre autres mondes, dont les joueurs prêtent leur connexion de garant.
         let hosts: Vec<(Bot, Bot)> = names
@@ -3832,6 +3898,197 @@ mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Terrain plat sur les chunks `xs` × `zs` (sol en y = 10).
+    fn flat_at(xs: std::ops::Range<i32>, zs: std::ops::Range<i32>) -> World {
+        let mut w = World::new(0);
+        for cx in xs.clone() {
+            for cz in zs.clone() {
+                w.insert_empty(ChunkPos { x: cx, z: cz });
+            }
+        }
+        for x in xs.start * 16..xs.end * 16 {
+            for z in zs.start * 16..zs.end * 16 {
+                w.set(x, 10, z, BlockId::STONE);
+            }
+        }
+        w.journal = Some(Vec::new());
+        w
+    }
+
+    /// Au fond d'une province (v140) : des provinces de 2 × 2 régions, cinq joueurs au
+    /// milieu de l'une d'elles (tout ce qu'ils ont en vue est servi par son relais), sans
+    /// relais de région. Ils construisent et se parlent ; l'un d'eux va jusqu'au bord de la
+    /// province et revient. Le relais du monde ne reçoit plus leurs positions (sauf celles
+    /// de celui qui s'approche du bord), la voix passe par le relais de la province, et à
+    /// la fin les mondes sont identiques à celui du propriétaire (loin de là).
+    #[test]
+    fn deep_in_a_province_players_no_longer_talk_to_the_world_relay() {
+        let (dir, h, mut hosts, mut bots, _room) = province_setup_with(false, 2, 1000);
+        for (i, b) in bots.iter_mut().enumerate() {
+            b.world = flat_at(5..40, 30..34);
+            b.pos = if i == 0 {
+                Vec3::new(2100.0, 11.0, 520.0)
+            } else {
+                Vec3::new(480.0 + 15.0 * i as f32, 11.0, 515.0)
+            };
+        }
+        let mut seed = 99u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let dt = 0.02;
+        let mut edited = std::collections::BTreeSet::new();
+        let mut deep_from: Option<(usize, usize)> = None;
+        let mut deep_until: Option<usize> = None;
+        let mut voice_from: Option<(usize, usize)> = None;
+        for step in 0..450 {
+            if step == 60 {
+                for b in bots.iter_mut().skip(1) {
+                    let link = b.link.clone().expect("file d'envoi");
+                    b.voice = Some(crate::voice::Voice::new(link));
+                }
+            }
+            let all_deep = bots
+                .iter()
+                .skip(1)
+                .all(|b| b.net.as_ref().is_some_and(|n| n.was_deep));
+            if all_deep && deep_from.is_none() && step < 150 {
+                deep_from = Some((step, h.positions_seen()));
+                let by_prov: usize = hosts
+                    .iter()
+                    .filter_map(|(_, g)| g.province.as_ref())
+                    .map(|p| p.voice_relayed())
+                    .sum();
+                voice_from = Some((by_prov, h.voice_relayed()));
+            }
+            if step == 150 {
+                deep_until = Some(h.positions_seen());
+            }
+            if step >= 100 && step % 10 == 0 {
+                for b in bots.iter_mut().skip(1) {
+                    if let Some(v) = &mut b.voice {
+                        v.talk_once();
+                    }
+                }
+            }
+            for (i, b) in bots.iter_mut().enumerate() {
+                if i == 0 {
+                    b.tick(dt);
+                    continue;
+                }
+                let r = rnd();
+                // Joueur5 va jusqu'au bord ouest de la province, puis revient.
+                b.pos.x = if i == 5 {
+                    if (150..300).contains(&step) {
+                        (b.pos.x - 3.0).max(100.0)
+                    } else {
+                        (b.pos.x + 3.0).min(555.0)
+                    }
+                } else {
+                    (b.pos.x + (r % 3) as f32 - 1.0).clamp(470.0, 560.0)
+                };
+                b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(500.0, 530.0);
+                if rnd() % 17 == 0 {
+                    let x = (b.pos.x as i32 - 10 + (rnd() % 21) as i32).clamp(5 * 16, 40 * 16 - 1);
+                    let z = (b.pos.z as i32 - 10 + (rnd() % 21) as i32).clamp(30 * 16, 34 * 16 - 1);
+                    let y = 11 + (rnd() % 3) as i32;
+                    let block = if rnd() % 4 == 0 {
+                        BlockId::AIR
+                    } else {
+                        BlockId(1 + rnd() as u16 % 8)
+                    };
+                    b.world.set(x, y, z, block);
+                    edited.insert([x, y, z]);
+                }
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for _ in 0..300 {
+            for b in bots.iter_mut() {
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (from_step, seen0) = deep_from.expect("tous au fond de la province");
+        let seen1 = deep_until.expect("étape 150");
+        let by_prov: usize = hosts
+            .iter()
+            .filter_map(|(_, g)| g.province.as_ref())
+            .map(|p| p.voice_relayed())
+            .sum();
+        let (prov0, root0) = voice_from.expect("voix");
+        let (by_prov, by_root) = (by_prov - prov0, h.voice_relayed() - root0);
+        eprintln!(
+            "au fond d'une province : tous depuis l'étape {from_step}, positions reçues par le \
+             relais du monde ensuite {} (jusqu'à l'étape 150), {} en tout ; voix : {by_prov} \
+             messages par le relais de la province, {by_root} par le relais du monde",
+            seen1 - seen0,
+            h.positions_seen()
+        );
+        assert!(h.provinces_delegated() >= 1, "la province est servie");
+        assert!(
+            seen1 - seen0 <= 2,
+            "au fond de la province, plus de positions au relais du monde : {}",
+            seen1 - seen0
+        );
+        assert!(
+            h.positions_seen() > seen1,
+            "celui qui s'approche du bord les redonne"
+        );
+        assert!(
+            by_prov > 20 * by_root.max(1),
+            "la voix passe par le relais de la province ({by_prov} contre {by_root})"
+        );
+        for b in &bots {
+            assert_eq!(
+                b.net.as_ref().unwrap().pending(),
+                0,
+                "{} : en attente",
+                b.name
+            );
+        }
+        // (Chacun a ce qui est en vue de là où il est : le reste lui arrivera en s'en
+        // approchant.)
+        let owner = &bots[0];
+        let mut differ = Vec::new();
+        let mut compared = 0;
+        for b in &bots[1..] {
+            for p in edited
+                .iter()
+                .filter(|p| (p[0] as f32 - b.pos.x).abs() < 128.0)
+            {
+                compared += 1;
+                let (a, o) = (
+                    b.world.get(p[0], p[1], p[2]),
+                    owner.world.get(p[0], p[1], p[2]),
+                );
+                if a != o {
+                    differ.push((b.name.clone(), *p, a.0, o.0));
+                }
+            }
+        }
+        assert!(compared > 100, "assez de cases comparées : {compared}");
+        assert!(
+            differ.is_empty(),
+            "{} cases différentes du monde du propriétaire, par exemple {:?}",
+            differ.len(),
+            &differ[..differ.len().min(5)]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

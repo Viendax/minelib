@@ -36,12 +36,16 @@ pub struct Store {
     /// serveur → pseudo (minuscules) → [x, y, z, lacet, tangage]. Le relais en est le
     /// gardien : on revient là où on était, quoi qu'on ait fait ailleurs entre-temps.
     positions: HashMap<String, HashMap<String, [f32; 5]>>,
-    /// Positions changées depuis le dernier enregistrement.
+    /// Positions changées depuis le dernier enregistrement, et ce dernier enregistrement.
     positions_dirty: bool,
+    positions_saved: std::time::Instant,
     /// Heure de chaque serveur (fichier `….times`) : (heure à l'instant `since` en
     /// secondes Unix, arrêtée). Elle avance comme dans Minecraft (24 h en 20 minutes).
     times: HashMap<String, (f32, u64, bool)>,
 }
+
+/// Positions des joueurs écrites sur le disque au plus toutes les…
+const POSITIONS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Heure d'un monde neuf, et durée d'une journée (s).
 pub const START_HOUR: f32 = 8.0;
@@ -85,6 +89,13 @@ pub enum Action {
     TimeFix,
 }
 
+/// Le relais s'arrête : les dernières positions sont écrites.
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.save_positions_now();
+    }
+}
+
 impl Store {
     pub fn open(path: PathBuf) -> Self {
         let servers = std::fs::read(&path)
@@ -114,6 +125,9 @@ impl Store {
             defaults,
             positions,
             positions_dirty: false,
+            positions_saved: std::time::Instant::now()
+                .checked_sub(POSITIONS_EVERY)
+                .unwrap_or_else(std::time::Instant::now),
             times,
         }
     }
@@ -166,11 +180,23 @@ impl Store {
         }
     }
 
-    /// Écrit les positions si elles ont changé.
+    /// Écrit les positions tout de suite si elles ont changé (le relais s'arrête).
+    pub fn save_positions_now(&mut self) {
+        if std::mem::take(&mut self.positions_dirty) {
+            if let Ok(b) = postcard::to_allocvec(&self.positions) {
+                let _ = crate::accounts::write_atomic(&self.path.with_extension("positions"), &b);
+            }
+        }
+    }
+
+    /// Écrit les positions si elles ont changé, au plus toutes les `POSITIONS_EVERY` (v140 :
+    /// dans un monde de 100 000 joueurs, tout le fichier était réécrit toutes les 2 s).
     pub fn save_positions(&mut self) {
-        if !std::mem::take(&mut self.positions_dirty) {
+        if !self.positions_dirty || self.positions_saved.elapsed() < POSITIONS_EVERY {
             return;
         }
+        self.positions_dirty = false;
+        self.positions_saved = std::time::Instant::now();
         if let Ok(b) = postcard::to_allocvec(&self.positions) {
             let _ = crate::accounts::write_atomic(&self.path.with_extension("positions"), &b);
         }

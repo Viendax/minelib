@@ -61,6 +61,11 @@ pub(crate) struct ProvinceRef {
     snap_seq: u64,
     /// Plus aucun joueur dans la province depuis.
     empty_since: Option<Instant>,
+    /// (v140) Ce qu'elle dit à chaque bail : joueurs de ses régions peuplées (rien avant
+    /// son premier bail : on compte alors ceux que ce relais voit), relais de région dont
+    /// l'hôte joue dans la région qu'il sert.
+    pub counts: Option<Vec<([i32; 2], u32)>>,
+    pub inside: Vec<([i32; 2], u16)>,
 }
 
 /// Relais de province : la province servie par cette salle.
@@ -128,6 +133,16 @@ pub(crate) fn size(st: &State) -> i32 {
 }
 
 // ───────────────────────── relais du monde ─────────────────────────
+
+/// Relais du monde (v140) : provinces servies qui comptent elles-mêmes leurs joueurs (leurs
+/// positions ne passent plus par ici).
+pub(crate) fn counted_provinces(room: &super::Room) -> HashSet<[i32; 2]> {
+    room.provinces
+        .iter()
+        .filter(|(p, r)| room.delegated.contains(*p) && r.counts.is_some())
+        .map(|(p, _)| *p)
+        .collect()
+}
 
 /// Relais du monde : la région `region` est servie par un relais de province (prêt).
 pub(crate) fn delegated(st: &State, rid: u64, region: [i32; 2]) -> bool {
@@ -221,39 +236,48 @@ pub(crate) fn upkeep(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>)
     if room.kind != 1 || room.province.is_some() || guards::frozen(st, rid) {
         return;
     }
+    // Joueurs par province : ceux que ce relais voit (comptés par région à chaque
+    // déplacement), et (v140) ceux que compte chaque province servie (leurs positions ne
+    // passent plus par ici).
+    let room = st.rooms.get_mut(&rid).expect("partie");
+    let counted = counted_provinces(room);
     let mut count: HashMap<[i32; 2], usize> = HashMap::new();
-    for (id, chunk) in &room.build.positions {
-        if !room.hidden.contains(id) {
-            *count
-                .entry(proto::province_of(proto::region_of(*chunk), size))
-                .or_default() += 1;
+    for (r, n) in room.build.region_counts() {
+        let p = proto::province_of(*r, size);
+        if !counted.contains(&p) {
+            *count.entry(p).or_default() += *n as usize;
         }
     }
+    for p in &counted {
+        let n = room.provinces[p]
+            .counts
+            .iter()
+            .flatten()
+            .map(|(_, n)| *n as usize)
+            .sum::<usize>();
+        *count.entry(*p).or_default() += n;
+    }
+    let room = st.rooms.get(&rid).expect("partie");
     if room.provinces.is_empty() && count.values().all(|&n| n < from) {
         return;
     }
     // Provinces vides depuis longtemps, hôtes qui ne sont pas prêts à temps, hôtes dont le
     // joueur est entré dans la province qu'il sert (il ne décide pas pour lui-même).
-    if !room.provinces.is_empty() && index.is_none() {
-        *index = Some(super::players_index(st));
-    }
-    let inside: Vec<[i32; 2]> = match index.as_ref() {
-        Some(index) => room
-            .provinces
-            .iter()
-            .filter(|(p, r)| {
-                st.conns
-                    .get(&r.host)
-                    .and_then(|c| c.pseudo.as_deref())
-                    .and_then(|name| index.get(&name.to_lowercase()))
-                    .filter(|(_, own)| *own == Some(rid))
-                    .and_then(|(player, _)| room.build.positions.get(player))
-                    .is_some_and(|c| proto::province_of(proto::region_of(*c), size) == **p)
-            })
-            .map(|(p, _)| *p)
-            .collect(),
-        None => Vec::new(),
-    };
+    // (Son joueur cherché parmi ceux de ce monde : sa position d'ici suffit, il la redit à
+    // chaque changement de province.)
+    let inside: Vec<[i32; 2]> = room
+        .provinces
+        .iter()
+        .filter(|(p, r)| {
+            st.conns
+                .get(&r.host)
+                .and_then(|c| c.pseudo.as_deref())
+                .and_then(|name| room.by_pseudo.get(&name.to_ascii_lowercase()))
+                .and_then(|player| room.build.positions.get(player))
+                .is_some_and(|c| proto::province_of(proto::region_of(*c), size) == **p)
+        })
+        .map(|(p, _)| *p)
+        .collect();
     let mut back = Vec::new();
     let room = st.rooms.get_mut(&rid).expect("partie");
     for (p, r) in room.provinces.iter_mut() {
@@ -283,7 +307,11 @@ pub(crate) fn upkeep(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>)
         .map(|(p, _)| *p)
         .collect();
     wanted.sort();
-    if wanted.is_empty() {
+    if wanted.is_empty()
+        || st
+            .hosts_wait
+            .is_some_and(|t| t.elapsed() < super::HOSTS_WAIT)
+    {
         return;
     }
     if index.is_none() {
@@ -293,6 +321,7 @@ pub(crate) fn upkeep(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>)
     for p in wanted {
         let outside = move |chunk: [i32; 2]| proto::province_of(proto::region_of(chunk), size) != p;
         let Some(g) = super::pick_host(st, index, rid, &outside) else {
+            st.hosts_wait = Some(Instant::now());
             break;
         };
         delegate(st, rid, p, size, g);
@@ -337,6 +366,8 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             renewed: Instant::now(),
             snap_seq,
             empty_since: None,
+            counts: None,
+            inside: Vec::new(),
         },
     );
     let Some(c) = st.conns.get_mut(&g) else {
@@ -457,8 +488,19 @@ pub(crate) fn ready(
 }
 
 /// Relais du monde : renouvellement du bail d'une province.
-pub(crate) fn lease(st: &mut State, rid: u64, id: u64, p: [i32; 2], epoch: u64, t: u64) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lease(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    p: [i32; 2],
+    epoch: u64,
+    t: u64,
+    counts: Vec<([i32; 2], u32)>,
+    inside: Vec<([i32; 2], u16)>,
+) {
     let paused = guards::frozen(st, rid);
+    let size = size(st);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -467,9 +509,25 @@ pub(crate) fn lease(st: &mut State, rid: u64, id: u64, p: [i32; 2], epoch: u64, 
         .get_mut(&p)
         .filter(|r| r.host == id && r.epoch == epoch && r.info.is_some())
     {
-        Some(r) if !paused => {
-            r.renewed = Instant::now();
-            true
+        Some(r) => {
+            // (Seulement ses propres régions, une fois chacune.)
+            let mine = |reg: &[i32; 2]| proto::province_of(*reg, size) == p;
+            r.counts = Some(
+                counts
+                    .into_iter()
+                    .filter(|(reg, _)| mine(reg))
+                    .take(4096)
+                    .collect(),
+            );
+            r.inside = inside
+                .into_iter()
+                .filter(|(reg, _)| mine(reg))
+                .take(4096)
+                .collect();
+            if !paused {
+                r.renewed = Instant::now();
+            }
+            !paused
         }
         _ => false,
     };
@@ -1352,13 +1410,21 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
     out.append(&mut pr.requests);
     if now.saturating_sub(pr.last_ask) >= proto::PROVINCE_RENEW_MS {
         pr.last_ask = now;
+        // (v140) Ses joueurs par région, et les hôtes de ses relais de région entrés dans
+        // la région qu'ils servent : le relais du monde ne voit plus leurs positions.
+        let (counts, inside) = census(st, rid);
         out.push(Request::ProvinceLease {
             room: rid,
             province: p,
             epoch,
             t: now,
+            counts,
+            inside,
         });
     }
+    let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) else {
+        return out;
+    };
     if ready != pr.ready_sent {
         pr.ready_sent = ready.clone();
         out.push(Request::ProvinceShards {
@@ -1369,6 +1435,39 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
         });
     }
     out
+}
+
+/// Relais de province (v140) : joueurs de chaque région peuplée de la province, et relais
+/// de région dont l'hôte joue dans la région qu'il sert (région, rang).
+type Census = (Vec<([i32; 2], u32)>, Vec<([i32; 2], u16)>);
+
+fn census(st: &mut State, rid: u64) -> Census {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(pr) = room.province.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let (prov, size) = (pr.province, pr.size);
+    let mut counts: Vec<([i32; 2], u32)> = room
+        .build
+        .region_counts()
+        .iter()
+        .filter(|(r, _)| proto::province_of(**r, size) == prov)
+        .map(|(r, n)| (*r, *n))
+        .collect();
+    counts.sort_unstable();
+    let room = st.rooms.get(&rid).expect("province");
+    let mut inside = Vec::new();
+    for (r, list) in &room.shards {
+        for sh in list {
+            if super::host_in_region(st, room, *r, sh.host) {
+                inside.push((*r, sh.slot));
+            }
+        }
+    }
+    inside.sort_unstable();
+    (counts, inside)
 }
 
 /// Relais de province : le relais du monde a gardé l'envoi `n` ; ses joueurs l'apprennent

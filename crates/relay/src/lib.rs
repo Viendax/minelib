@@ -277,6 +277,11 @@ impl Handle {
         b.items.values().map(|n| *n as u64).sum::<u64>() + b.mined as u64 + later
     }
 
+    /// Positions (changements de chunk) reçues de joueurs de mondes de construction (essais).
+    pub fn positions_seen(&self) -> usize {
+        self.state.lock().unwrap().positions_seen
+    }
+
     /// Sacs de survie prêtés à des provinces depuis le début (essais).
     pub fn province_lends(&self) -> usize {
         self.state.lock().unwrap().province_lends
@@ -1173,6 +1178,15 @@ struct State {
     province_archived: usize,
     /// Sacs de survie prêtés à des provinces (essais).
     province_lends: usize,
+    /// Dernières vérifications lentes des hôtes de région (voir `SLOW_CHECK`).
+    slow_check: Instant,
+    /// Positions (changements de chunk) reçues de joueurs de mondes de construction
+    /// (essais : au fond d'une province, elles ne passent plus par ici).
+    positions_seen: usize,
+    /// Dernier index des joueurs (voir `players_index`).
+    index_cache: std::cell::RefCell<Option<(Instant, PlayersIndex)>>,
+    /// Dernière recherche d'hôte sans hôte libre (voir `HOSTS_WAIT`).
+    hosts_wait: Option<Instant>,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -1251,6 +1265,10 @@ pub fn start(cfg: Config) -> Result<Handle> {
         province_room: None,
         province_archived: 0,
         province_lends: 0,
+        slow_check: Instant::now(),
+        positions_seen: 0,
+        index_cache: std::cell::RefCell::new(None),
+        hosts_wait: None,
     }));
     let state_for_handle = state.clone();
     let state_for_guards = state.clone();
@@ -2714,6 +2732,11 @@ fn rebalance_host(st: &mut State, rid: u64) -> bool {
         .filter(|&(_, r)| r <= GOOD_RTT && r * 2.0 <= h)
         .min_by(|a, b| a.1.total_cmp(&b.1));
     let Some((best, r)) = best else {
+        // (Personne de mieux : on ne regarde de nouveau qu'au bout du même délai ; v140 :
+        // dans un monde de 100 000 joueurs, il les passait tous en revue à chaque entretien.)
+        if let Some(room) = st.rooms.get_mut(&rid) {
+            room.rebalanced = Some(Instant::now());
+        }
         return false;
     };
     if room.kind == 0 && room.backup != Some(best) {
@@ -2750,7 +2773,18 @@ fn upkeep_contacts(st: &mut State) {
                 }
             }
         } else {
-            for members in r.build.crowded_chunks() {
+            // (v140 : pas dans les provinces servies par un relais de province : leurs
+            // joueurs ne disent plus ici où ils sont.)
+            let size = st
+                .province_size
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1) as i32;
+            for (chunk, members) in r.build.crowded() {
+                if r.delegated
+                    .contains(&proto::province_of(proto::region_of(chunk), size))
+                {
+                    continue;
+                }
                 for (i, &a) in members.iter().enumerate() {
                     for k in 1..=8.min(members.len() - 1) {
                         let b = members[(i + k) % members.len()];
@@ -4050,15 +4084,38 @@ fn now_secs() -> u64 {
 /// Calculé une fois par entretien : sans lui, chaque question « le joueur de ce garant
 /// est-il encore en jeu ? » parcourait toutes les connexions (des dizaines de millions de
 /// comparaisons par entretien dans un monde de 60 000 joueurs).
-type PlayersIndex = HashMap<String, (u64, Option<u64>)>;
+type PlayersIndex = Arc<HashMap<String, (u64, Option<u64>)>>;
 
+/// Index des joueurs connectés (pseudo → connexion, partie), pour choisir les hôtes : refait
+/// au plus toutes les `INDEX_FRESH` (v140 : dans un monde de 100 000 joueurs, le refaire
+/// coûtait 60 ms à chaque entretien où une région attendait un hôte).
 fn players_index(st: &State) -> PlayersIndex {
-    st.conns
-        .iter()
-        .filter(|(_, c)| !c.garant_only)
-        .filter_map(|(&id, c)| Some((c.pseudo.as_deref()?.to_lowercase(), (id, c.room))))
-        .collect()
+    if let Some((t, i)) = st.index_cache.borrow().as_ref() {
+        if t.elapsed() < INDEX_FRESH {
+            return i.clone();
+        }
+    }
+    players_index_fresh(st)
 }
+
+/// Le même, refait maintenant.
+fn players_index_fresh(st: &State) -> PlayersIndex {
+    let i: PlayersIndex = Arc::new(
+        st.conns
+            .iter()
+            .filter(|(_, c)| !c.garant_only)
+            .filter_map(|(&id, c)| Some((c.pseudo.as_deref()?.to_lowercase(), (id, c.room))))
+            .collect(),
+    );
+    *st.index_cache.borrow_mut() = Some((Instant::now(), i.clone()));
+    i
+}
+
+/// Durée de vie de l'index des joueurs.
+const INDEX_FRESH: Duration = Duration::from_secs(3);
+
+/// Plus d'hôte libre pour une région ou une province : on cherche de nouveau au bout de…
+const HOSTS_WAIT: Duration = Duration::from_secs(5);
 
 /// Chunks autour d'un joueur dont les relais de région lui sont annoncés (le jeu rejoint
 /// ceux à moins de 12 chunks ; la liste est refaite à chaque changement de chunk).
@@ -4142,6 +4199,20 @@ fn send_shards(st: &mut State, rid: u64, id: u64) {
 /// (Avant la v128 la question était celle des garants FPS : un hôte qui jouait dans un
 /// monde de construction était toujours « sur le départ », et remplacé à chaque entretien
 /// dès qu'un autre hôte était libre.)
+/// Vérifications qui passent en revue toutes les connexions (hôtes dont le joueur est parti
+/// du jeu, ou joue depuis longtemps ailleurs) : au plus toutes les…
+const SLOW_CHECK: Duration = Duration::from_secs(20);
+
+/// Le joueur de cet hôte joue-t-il dans la région qu'il sert (d'après ce relais) ?
+fn host_in_region(st: &State, room: &Room, region: [i32; 2], host: u64) -> bool {
+    st.conns
+        .get(&host)
+        .and_then(|c| c.pseudo.as_deref())
+        .and_then(|p| room.by_pseudo.get(&p.to_ascii_lowercase()))
+        .and_then(|id| room.build.positions.get(id))
+        .is_some_and(|c| proto::region_of(*c) == region)
+}
+
 fn host_leaving(st: &State, index: &PlayersIndex, rid: u64, region: [i32; 2], host: u64) -> bool {
     let Some(p) = st.conns.get(&host).and_then(|c| c.pseudo.as_deref()) else {
         return true;
@@ -4231,18 +4302,34 @@ fn pick_host(
 /// joueurs reçoivent les relais des régions qu'ils ont en vue et leur billet ; l'historique
 /// de la région part chez l'hôte.
 fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
-    let Some(room) = st.rooms.get(&rid) else {
-        return;
-    };
+    let size = provinces::size(st);
     let from = st
         .shard_from
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(1);
-    // Joueurs par région (positions annoncées).
-    let mut count: HashMap<[i32; 2], usize> = HashMap::new();
-    for chunk in room.build.positions.values() {
-        *count.entry(proto::region_of(*chunk)).or_default() += 1;
+    // Joueurs par région : ceux que ce relais voit (comptés à chaque déplacement) hors des
+    // provinces servies par un relais de province, et (v140) ceux que compte chaque
+    // province servie : leurs positions ne passent plus par ici.
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let delegated = room.delegated.clone();
+    let counted = provinces::counted_provinces(room);
+    let in_province = |r: [i32; 2]| delegated.contains(&proto::province_of(r, size));
+    let mut count: HashMap<[i32; 2], usize> = room
+        .build
+        .region_counts()
+        .iter()
+        .filter(|(r, _)| !counted.contains(&proto::province_of(**r, size)))
+        .map(|(r, n)| (*r, *n as usize))
+        .collect();
+    let mut inside: HashSet<([i32; 2], u16)> = HashSet::new();
+    for p in &counted {
+        let pr = &room.provinces[p];
+        count.extend(pr.counts.iter().flatten().map(|(r, n)| (*r, *n as usize)));
+        inside.extend(pr.inside.iter().copied());
     }
+    let room = st.rooms.get(&rid).expect("partie");
     // (La plupart des mondes : aucune région peuplée, aucun relais, rien à faire.)
     if room.shards.is_empty() && room.shards_dirty.is_empty() && count.values().all(|&n| n < from) {
         return;
@@ -4251,10 +4338,14 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
         .shard_share
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(1);
-    if index.is_none() {
-        *index = Some(players_index(st));
+    // Hôtes à relever : celui dont le joueur est entré dans la région qu'il sert (vu ici,
+    // ou dit par sa province), à chaque entretien ; celui dont le joueur est parti du jeu
+    // ou joue depuis longtemps une partie FPS, toutes les `SLOW_CHECK` (v140 : il faut
+    // pour cela passer en revue toutes les connexions).
+    let slow = st.slow_check.elapsed() >= SLOW_CHECK;
+    if slow {
+        *index = Some(players_index_fresh(st));
     }
-    let index = index.as_ref().expect("index");
     // Relais à ajouter : régions peuplées qui n'en ont pas assez pour leur foule, et hôtes
     // qui doivent passer la main (remplacés, ou seulement relevés si la région en a
     // assez sans eux).
@@ -4271,7 +4362,19 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
         let mut ready = list.iter().filter(|s| s.info.is_some()).count();
         for sh in list {
             let replaced = list.iter().any(|o| o.previous == Some(sh.host));
-            if sh.info.is_none() || replaced || !host_leaving(st, index, rid, r, sh.host) {
+            if sh.info.is_none() || replaced {
+                continue;
+            }
+            let entered = if in_province(r) {
+                inside.contains(&(r, sh.slot))
+            } else {
+                host_in_region(st, room, r, sh.host)
+            };
+            let leaving = entered
+                || index
+                    .as_ref()
+                    .is_some_and(|idx| host_leaving(st, idx, rid, r, sh.host));
+            if !leaving {
                 continue;
             }
             if ready > need {
@@ -4284,6 +4387,19 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
     }
     wanted.sort();
     let secret = room.shard_secret;
+    if slow {
+        st.slow_check = Instant::now();
+    }
+    // (Plus d'hôte libre au dernier essai : on attend un peu avant de chercher de nouveau,
+    // v140 ; chercher demande l'index de tous les joueurs.)
+    if st.hosts_wait.is_some_and(|t| t.elapsed() < HOSTS_WAIT) {
+        wanted.clear();
+    }
+    if !wanted.is_empty() && index.is_none() {
+        *index = Some(players_index(st));
+    }
+    let empty = PlayersIndex::default();
+    let index = index.as_ref().unwrap_or(&empty);
     for (region, previous) in wanted {
         // (Province en train d'être confiée à un relais de province : ses relais de région
         // se rattacheront à lui.)
@@ -4293,6 +4409,7 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
         // Plus d'hôte libre : la région reste servie par ce relais (ou par les relais
         // qu'elle a déjà) jusqu'à ce qu'il y en ait un.
         let Some(g) = pick_shard_host(st, index, rid, region) else {
+            st.hosts_wait = Some(Instant::now());
             break;
         };
         let pseudo = st
@@ -4359,13 +4476,21 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
     if dirty.is_empty() {
         return;
     }
-    let players: Vec<u64> = room
-        .build
-        .positions
-        .iter()
-        .filter(|(_, c)| regions_in_view(**c).any(|r| dirty.contains(&r)))
-        .map(|(&m, _)| m)
-        .collect();
+    // (Cherchés autour de chaque région changée, plus parmi tous les joueurs.)
+    let mut players: HashSet<u64> = HashSet::new();
+    for r in &dirty {
+        let lo = [
+            r[0] * proto::REGION - SHARD_VIEW,
+            r[1] * proto::REGION - SHARD_VIEW,
+        ];
+        let hi = [
+            (r[0] + 1) * proto::REGION - 1 + SHARD_VIEW,
+            (r[1] + 1) * proto::REGION - 1 + SHARD_VIEW,
+        ];
+        players.extend(room.build.players_in(lo, hi));
+    }
+    let mut players: Vec<u64> = players.into_iter().collect();
+    players.sort_unstable();
     for m in players {
         send_shards(st, rid, m);
     }
@@ -5972,6 +6097,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         Request::Position { chunk } => {
             if let Some(rid) = my_room.filter(|r| st.rooms.get(r).is_some_and(|r| r.kind == 1)) {
+                st.positions_seen += 1;
                 send_catch_up(st, rid, id, chunk, true);
                 refresh_needs(st, rid, id);
                 // Les relais des régions maintenant en vue, s'ils ont changé pour lui, et les
@@ -6083,9 +6209,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             province,
             epoch,
             t,
+            counts,
+            inside,
         } => {
             if my_room == Some(room) {
-                provinces::lease(st, room, id, province, epoch, t);
+                provinces::lease(st, room, id, province, epoch, t, counts, inside);
             }
             return None;
         }
@@ -9919,6 +10047,8 @@ mod tests {
         /// L'entretien périodique, tout de suite.
         fn upkeep(&self, st: &mut State) {
             st.last_upkeep = Instant::now() - Duration::from_secs(3);
+            // (Le temps de l'essai passe plus vite que celui des horloges.)
+            st.hosts_wait = None;
             upkeep(st);
         }
 
@@ -11105,7 +11235,17 @@ mod tests {
             );
             let (mut bytes, mut msgs, mut cells, mut entries_n) = (0, 0, 0, 0usize);
             let mut next_n = 1u64;
-            for _ in 0..secs {
+            // (v140) Joueurs de chaque région, comme les provinces les comptent dans leurs
+            // baux.
+            let mut census: HashMap<[i32; 2], Vec<([i32; 2], u32)>> = HashMap::new();
+            for (p, list) in &by_prov {
+                let mut per: HashMap<[i32; 2], u32> = HashMap::new();
+                for &i in list {
+                    *per.entry(proto::region_of(home(i))).or_default() += 1;
+                }
+                census.insert(*p, per.into_iter().collect());
+            }
+            for sec in 0..secs {
                 // Copies de la seconde, préparées d'abord (pas comptées) : un bloc toutes
                 // les 2 s par joueur, envoyés par chaque province toutes les 100 ms.
                 let mut work: Vec<(u64, Request)> = Vec::new();
@@ -11134,6 +11274,22 @@ mod tests {
                             entries.push((proto::zone_of(c), seq, data));
                         }
                         entries_n += entries.len();
+                        // (v140) Positions de retour de ses joueurs, toutes les 2 s, avec
+                        // ce qu'elle publie.
+                        let spots: Vec<(String, [f32; 5])> = if k == 0 && sec % 2 == 0 {
+                            authors
+                                .iter()
+                                .map(|&i| {
+                                    let c = home(i);
+                                    (
+                                        format!("J{i}"),
+                                        [c[0] as f32 * 16.0, 70.0, c[1] as f32 * 16.0, 0.0, 0.0],
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         work.push((
                             host,
                             Request::ProvinceArchive {
@@ -11143,7 +11299,7 @@ mod tests {
                                 n: next_n,
                                 entries,
                                 bags: Vec::new(),
-                                spots: Vec::new(),
+                                spots,
                                 loose: Vec::new(),
                             },
                         ));
@@ -11151,9 +11307,15 @@ mod tests {
                     }
                 }
                 st.last_upkeep = Instant::now();
+                // (v140) Au fond de leur province, les joueurs ne redisent plus ici où ils
+                // sont (seulement en changeant de province : jamais dans cet essai), ni leur
+                // position de retour (elle vient avec ce que publie leur province).
                 let t = Instant::now();
                 for (i, &id) in players.iter().enumerate() {
-                    if rnd() % 4 == 0 {
+                    let deep = st.rooms[&room]
+                        .delegated
+                        .contains(&proto::province_of(proto::region_of(home(i)), size));
+                    if rnd() % 4 == 0 && !deep {
                         let mut chunk = home(i);
                         chunk[0] += (rnd() % 3) as i32 - 1;
                         crowd.ask(st, id, Request::Position { chunk });
@@ -11161,20 +11323,6 @@ mod tests {
                 }
                 pos_t += t.elapsed();
                 let t = Instant::now();
-                for (i, &id) in players.iter().enumerate() {
-                    if rnd() % 10 == 0 {
-                        let c = home(i);
-                        crowd.ask(
-                            st,
-                            id,
-                            Request::Spot {
-                                pos: [c[0] as f32 * 16.0, 70.0, c[1] as f32 * 16.0],
-                                yaw: 0.0,
-                                pitch: 0.0,
-                            },
-                        );
-                    }
-                }
                 misc_t += t.elapsed();
                 let t = Instant::now();
                 for (host, req) in work {
@@ -11193,6 +11341,8 @@ mod tests {
                                 province: p,
                                 epoch,
                                 t: now_ms(),
+                                counts: census.get(&p).cloned().unwrap_or_default(),
+                                inside: Vec::new(),
                             },
                         );
                     }
