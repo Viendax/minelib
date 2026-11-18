@@ -119,6 +119,31 @@ fn skin(part: Part, face: Face, u: usize, v: usize, n: usize) -> u32 {
     }
 }
 
+/// Ombrage d'une face selon son orientation dans le monde (normale `n` unitaire).
+pub fn face_shade(n: Vec3) -> f32 {
+    (0.78 + 0.22 * n.y + 0.06 * n.x).clamp(0.45, 1.0)
+}
+
+/// Couleur (linéaire, grain compris, sans l'ombrage de la face) du pixel (`u`, `v`) de la
+/// face `k` (ordre de `emit_box` : devant, derrière, côtés, dessus, dessous) du bras droit,
+/// telle que le modèle du joueur la dessine (skin, sinon couleurs par défaut).
+pub fn right_arm_pixel(skin: Option<&crate::skin::Skin>, k: usize, u: usize, v: usize) -> [f32; 3] {
+    const RIGHT_ARM: usize = 4;
+    let face = [
+        Face::Front,
+        Face::Back,
+        Face::Side,
+        Face::Side,
+        Face::Top,
+        Face::Bottom,
+    ][k.min(5)];
+    let rgb = skin
+        .and_then(|t| t.color(RIGHT_ARM, k, u as u32, v as u32, [4, 12, 4]))
+        .unwrap_or_else(|| self::skin(Part::Arm, face, u, v, 4));
+    let g = grain(k * 4096 + v * 64 + u + Part::Arm as usize * 977);
+    srgb(rgb).map(|c| c * g)
+}
+
 /// Petite variation par pixel (texture) : ±3 %.
 fn grain(seed: usize) -> f32 {
     let h = (seed as u32).wrapping_mul(2654435761) >> 24;
@@ -226,7 +251,7 @@ fn emit_box_layer(
         let p = |u: f32, v: f32| xf.transform_point3(o + du * u + dv * v);
         // Ombrage selon l'orientation de la face dans le monde.
         let n = xf.transform_vector3(du.cross(dv)).normalize_or_zero();
-        let shade = (0.78 + 0.22 * n.y + 0.06 * n.x).clamp(0.45, 1.0);
+        let shade = face_shade(n);
         let lod = lod.max(1);
         for v in (0..nv).step_by(lod) {
             for u in (0..nu).step_by(lod) {
@@ -782,14 +807,20 @@ mod tests {
             "{eye_z:?}"
         );
     }
-    /// Même essai que `dl_box_shadow` (dynlights.wgsl) : le segment `p` → `light`
-    /// traverse-t-il une boîte (hors boîtes qui contiennent `p`) ?
+    /// Même essai que `dl_box_shadow` (dynlights.wgsl), pour un point du joueur : le
+    /// segment `p` → `light` traverse-t-il une boîte (hors boîtes qui contiennent `p`) ?
     fn shadowed(boxes: &[ShadowBox], p: Vec3, light: Vec3) -> bool {
+        shadowed_on(boxes, p, light, true)
+    }
+
+    /// `entity` : `p` est sur le joueur (sinon sur le monde : une boîte qui le contient le
+    /// cache aussi).
+    fn shadowed_on(boxes: &[ShadowBox], p: Vec3, light: Vec3, entity: bool) -> bool {
         boxes.iter().any(|b| {
             let row = |i: usize, q: Vec3| Vec4::from(b.to_unit[i]).dot(q.extend(1.0));
             let a = Vec3::new(row(0, p), row(1, p), row(2, p));
             let d = Vec3::new(row(0, light), row(1, light), row(2, light)) - a;
-            let inside = a.cmpgt(Vec3::ZERO).all() && a.cmplt(Vec3::ONE).all();
+            let inside = entity && a.cmpgt(Vec3::ZERO).all() && a.cmplt(Vec3::ONE).all();
             let inv = Vec3::select(
                 d.abs().cmplt(Vec3::splat(1e-6)),
                 Vec3::splat(1e6),
@@ -855,6 +886,33 @@ mod tests {
                 "épaule, {yaw_deg}°"
             );
         }
+        // Pieds posés : le sol sous eux (dans la boîte des jambes, décollé de 0,02 bloc
+        // comme dans le shader) reste dans l'ombre des jambes, comme le sol autour ; pas de
+        // trou clair à leur place.
+        let pose = Pose {
+            feet: Vec3::new(10.0, 64.0, 5.0),
+            yaw: 0.4,
+            pitch: 0.0,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: None,
+            skin: None,
+        };
+        let boxes = shadow_boxes(&pose);
+        let lamp = pose.feet + Vec3::new(1.5, 3.0, 2.0);
+        for (dx, dz) in [(0.0, 0.0), (0.06, 0.04), (-0.06, -0.03)] {
+            let ground = pose.feet + Vec3::new(dx, 0.02, dz);
+            assert!(shadowed_on(&boxes, ground, lamp, false), "sol ({dx}, {dz})");
+        }
+        // Le sol à côté, que l'ombre n'atteint pas : éclairé.
+        assert!(!shadowed_on(
+            &boxes,
+            pose.feet + Vec3::new(1.5, 0.02, -1.0),
+            lamp,
+            false
+        ));
         // En marchant, les jambes ne sont plus parallèles : une boîte chacune.
         let walking = Pose {
             feet: Vec3::ZERO,

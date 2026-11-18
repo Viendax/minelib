@@ -26,19 +26,17 @@ struct Globals {
 @group(1) @binding(0) var scene_depth: texture_depth_2d;
 @group(1) @binding(1) var gb_albedo: texture_2d<f32>;
 @group(1) @binding(2) var gb_surf: texture_2d<f32>;
+// Cases d'écran éclairées (rectangles en NDC) : la passe ne dessine que là.
+@group(1) @binding(3) var<storage, read> lit_rects: array<vec4<f32>>;
 
 @vertex
-fn vs_full(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-    let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
-    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+fn vs_tiles(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
+    return dl_rect_corner(vi, lit_rects[ii]);
 }
 
 @fragment
 fn fs_deferred(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    // Aucune lumière dans la tuile (la plus grande partie de l'écran, souvent) : rien à lire.
-    if !dl_tile_any(frag.xy, g.screen.xy) {
-        return vec4<f32>(0.0);
-    }
+    // (Seulement dans les cases éclairées : `vs_tiles` ne dessine que leurs rectangles.)
     let px = vec2<i32>(frag.xy);
     let s = textureLoad(gb_surf, px, 0);
     let spec = gb_unpack_spec(s.a);

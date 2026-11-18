@@ -2,7 +2,7 @@
 //! pendant la marche, geste quand on casse ou pose, objet qui remonte quand on en change.
 
 use glam::{Mat4, Vec3, Vec4};
-use minelib_render::{VmVertex, FLAME, NO_TEXTURE};
+use minelib_render::{ArmVertex, VmVertex, FLAME, NO_TEXTURE};
 use minelib_world::registry::Shape;
 use minelib_world::BlockId;
 
@@ -10,6 +10,11 @@ use crate::inventory::Item;
 
 /// Champ de vision fixe de la main (indépendant du zoom).
 const HAND_FOV: f32 = 70.0;
+/// Bras à la première personne : milieu du poing (par rapport aux yeux : x à droite, y en
+/// haut, −z devant ; là où les objets tenus sont placés) et longueur jusqu'à l'épaule, hors
+/// de l'écran. Épaisseur : le tiers, comme sur le modèle (4 × 12 × 4 pixels).
+const ARM_FIST: Vec3 = Vec3::new(0.474, -0.472, -0.938);
+const ARM_LEN: f32 = 0.6;
 
 #[derive(Default)]
 pub struct Hand {
@@ -93,10 +98,6 @@ fn push_lantern(out: &mut Vec<VmVertex>, m: Mat4, block: BlockId, light: [f32; 3
         );
     }
     true
-}
-
-fn lin(c: [u8; 3]) -> [f32; 3] {
-    c.map(|v| (v as f32 / 255.0).powf(2.2))
 }
 
 /// Une boîte (coordonnées 0..1 du modèle) transformée vers l'écran ; textures par face
@@ -217,123 +218,6 @@ fn push_box(
                 _pad: 0,
                 color: c,
             });
-        }
-    }
-}
-
-/// Bras droit avec le skin du joueur : la boîte 0..1 (long selon z, l'épaule en z = 1,
-/// la main en z = 0, le dessus du bras vers +y) découpée en pixels du skin, colorés comme
-/// le bras du modèle (`skin::Skin::color`, partie 4, 4 × 12 × 4 pixels).
-fn push_skin_arm(
-    out: &mut Vec<VmVertex>,
-    mvp: Mat4,
-    skin: &crate::skin::Skin,
-    fallback: [f32; 3],
-    light: [f32; 3],
-) {
-    let (mn, mx) = (Vec3::ZERO, Vec3::ONE);
-    // Mêmes faces (et sens) que `push_box` : 0 +x, 1 −x, 2 +y, 3 −y, 4 +z, 5 −z.
-    let faces: [(usize, [Vec3; 4]); 6] = [
-        (
-            0,
-            [
-                Vec3::new(mx.x, mn.y, mx.z),
-                Vec3::new(mx.x, mn.y, mn.z),
-                Vec3::new(mx.x, mx.y, mn.z),
-                Vec3::new(mx.x, mx.y, mx.z),
-            ],
-        ),
-        (
-            1,
-            [
-                Vec3::new(mn.x, mn.y, mn.z),
-                Vec3::new(mn.x, mn.y, mx.z),
-                Vec3::new(mn.x, mx.y, mx.z),
-                Vec3::new(mn.x, mx.y, mn.z),
-            ],
-        ),
-        (
-            2,
-            [
-                Vec3::new(mn.x, mx.y, mx.z),
-                Vec3::new(mx.x, mx.y, mx.z),
-                Vec3::new(mx.x, mx.y, mn.z),
-                Vec3::new(mn.x, mx.y, mn.z),
-            ],
-        ),
-        (
-            3,
-            [
-                Vec3::new(mn.x, mn.y, mn.z),
-                Vec3::new(mx.x, mn.y, mn.z),
-                Vec3::new(mx.x, mn.y, mx.z),
-                Vec3::new(mn.x, mn.y, mx.z),
-            ],
-        ),
-        (
-            4,
-            [
-                Vec3::new(mn.x, mn.y, mx.z),
-                Vec3::new(mx.x, mn.y, mx.z),
-                Vec3::new(mx.x, mx.y, mx.z),
-                Vec3::new(mn.x, mx.y, mx.z),
-            ],
-        ),
-        (
-            5,
-            [
-                Vec3::new(mx.x, mn.y, mn.z),
-                Vec3::new(mn.x, mn.y, mn.z),
-                Vec3::new(mn.x, mx.y, mn.z),
-                Vec3::new(mx.x, mx.y, mn.z),
-            ],
-        ),
-    ];
-    let cells = |a: Vec3, b: Vec3| if (b - a).z.abs() > 0.5 { 12 } else { 4 };
-    for (face, q) in faces {
-        let shade = match face {
-            2 => 1.0,
-            3 => 0.5,
-            0 | 1 => 0.62,
-            _ => 0.8,
-        };
-        let (ns, nt) = (cells(q[0], q[1]), cells(q[0], q[3]));
-        let at = |s: f32, t: f32| q[0] + (q[1] - q[0]) * s + (q[3] - q[0]) * t;
-        for j in 0..nt {
-            for i in 0..ns {
-                let (s0, s1) = (i as f32 / ns as f32, (i + 1) as f32 / ns as f32);
-                let (t0, t1) = (j as f32 / nt as f32, (j + 1) as f32 / nt as f32);
-                let c = at((s0 + s1) * 0.5, (t0 + t1) * 0.5);
-                let px = |x: f32, n: f32| ((x * n).floor() as u32).min(n as u32 - 1);
-                let along = px(1.0 - c.z, 12.0);
-                let (sf, u, v) = match face {
-                    2 => (0, px(1.0 - c.x, 4.0), along),
-                    3 => (1, px(c.x, 4.0), along),
-                    0 => (2, px(c.y, 4.0), along),
-                    1 => (3, px(1.0 - c.y, 4.0), along),
-                    4 => (4, px(c.x, 4.0), px(c.y, 4.0)),
-                    _ => (5, px(c.x, 4.0), px(c.y, 4.0)),
-                };
-                let rgb = skin.color(4, sf, u, v, [4, 12, 4]).map_or(fallback, |h| {
-                    lin([(h >> 16) as u8, (h >> 8) as u8, h as u8])
-                });
-                let col = [
-                    rgb[0] * shade * light[0],
-                    rgb[1] * shade * light[1],
-                    rgb[2] * shade * light[2],
-                    1.0,
-                ];
-                let quad = [at(s0, t0), at(s1, t0), at(s1, t1), at(s0, t1)];
-                for k in [0usize, 1, 2, 2, 3, 0] {
-                    out.push(VmVertex {
-                        clip: (mvp * quad[k].extend(1.0)).to_array(),
-                        uv: [0.0, 0.0],
-                        layer: NO_TEXTURE,
-                        _pad: 0,
-                        color: col,
-                    });
-                }
-            }
         }
     }
 }
@@ -535,49 +419,146 @@ impl Hand {
         self.equip = (self.equip - dt / 0.2).max(0.0);
     }
 
-    /// Triangles de la main et de l'objet, pour un écran de rapport `aspect`.
-    pub fn build(
-        &self,
-        item: Option<Item>,
-        aspect: f32,
-        light: [f32; 3],
-        show_arm: bool,
-        skin_tex: Option<&crate::skin::Skin>,
-    ) -> Vec<VmVertex> {
-        let proj = Mat4::perspective_infinite_reverse_rh(HAND_FOV.to_radians(), aspect, 0.01);
-        let mut out = Vec::new();
-        // Geste : arc vers l'avant et le bas ; balancement en huit pendant la marche.
+    /// Geste (arc vers l'avant et le bas) et balancement en huit pendant la marche : repère
+    /// de la main par rapport aux yeux.
+    fn base(&self) -> Mat4 {
         let s = (std::f32::consts::PI * (1.0 - self.swing)).sin() * (self.swing > 0.0) as u8 as f32;
         let bob =
             Vec3::new(self.bob.sin() * 0.025, -(self.bob.cos().abs()) * 0.03, 0.0) * self.bob_amp;
-        let base =
-            Mat4::from_translation(bob + Vec3::new(0.0, -0.35 * self.equip - 0.12 * s, -0.12 * s))
-                * Mat4::from_rotation_x(-0.6 * s);
+        Mat4::from_translation(bob + Vec3::new(0.0, -0.35 * self.equip - 0.12 * s, -0.12 * s))
+            * Mat4::from_rotation_x(-0.6 * s)
+    }
 
-        if show_arm {
-            // Bras : sort du bas à droite de l'écran, tendu vers le centre.
-            let skin = lin([214, 160, 128]);
-            // Épaule en bas à droite, bras tendu vers l'avant, légèrement relevé et rentré.
-            let arm = base
-                * Mat4::from_translation(Vec3::new(0.62, -0.74, -0.22))
-                * Mat4::from_rotation_y(0.2)
-                * Mat4::from_rotation_x(0.35)
-                * Mat4::from_scale(Vec3::new(0.16, 0.16, 0.78))
-                * Mat4::from_translation(Vec3::new(-0.5, -0.5, -1.0));
-            match skin_tex {
-                Some(t) => push_skin_arm(&mut out, proj * arm, t, skin, light),
-                None => push_box(
-                    &mut out,
-                    proj * arm,
-                    Vec3::ZERO,
-                    Vec3::ONE,
-                    None,
-                    skin,
-                    light,
-                    false,
-                ),
+    /// Bras droit à la première personne, tel que le modèle du joueur le montre en F5 :
+    /// mêmes pixels du skin (4 × 12 × 4), mêmes couleurs, même ombrage selon l'orientation
+    /// de chaque face dans le monde. Tendu droit devant (parallèle au regard), sorti du bas
+    /// à droite de l'écran, le poing là où l'objet tenu se place. Chaque sommet a sa place
+    /// dans le monde (devant les yeux : `to_world`, repère de la caméra → monde) et sa
+    /// normale : les lumières dynamiques l'éclairent comme le modèle.
+    pub fn arm(
+        &self,
+        aspect: f32,
+        light: [f32; 3],
+        skin: Option<&crate::skin::Skin>,
+        to_world: Mat4,
+    ) -> Vec<ArmVertex> {
+        let proj = Mat4::perspective_infinite_reverse_rh(HAND_FOV.to_radians(), aspect, 0.01);
+        // Boîte 0..1 : x vers la droite, y vers le haut, z = 1 à l'épaule, 0 au poing.
+        let arm = self.base()
+            * Mat4::from_translation(ARM_FIST)
+            * Mat4::from_scale(Vec3::new(ARM_LEN / 3.0, ARM_LEN / 3.0, ARM_LEN))
+            * Mat4::from_translation(Vec3::new(-0.5, -0.5, 0.0));
+        let world = to_world * arm;
+        let center = world.transform_point3(Vec3::splat(0.5));
+        // Faces : 0 +x, 1 −x, 2 +y, 3 −y, 4 +z (épaule), 5 −z (poing) ; coins dans l'ordre
+        // (origine, +s, +s +t, +t).
+        let faces: [(usize, [Vec3; 4]); 6] = [
+            (
+                0,
+                [
+                    Vec3::new(1.0, 0.0, 1.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Vec3::new(1.0, 1.0, 0.0),
+                    Vec3::new(1.0, 1.0, 1.0),
+                ],
+            ),
+            (
+                1,
+                [
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                    Vec3::new(0.0, 1.0, 1.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                ],
+            ),
+            (
+                2,
+                [
+                    Vec3::new(0.0, 1.0, 1.0),
+                    Vec3::new(1.0, 1.0, 1.0),
+                    Vec3::new(1.0, 1.0, 0.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                ],
+            ),
+            (
+                3,
+                [
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.0, 1.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                ],
+            ),
+            (
+                4,
+                [
+                    Vec3::new(0.0, 0.0, 1.0),
+                    Vec3::new(1.0, 0.0, 1.0),
+                    Vec3::new(1.0, 1.0, 1.0),
+                    Vec3::new(0.0, 1.0, 1.0),
+                ],
+            ),
+            (
+                5,
+                [
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(1.0, 1.0, 0.0),
+                ],
+            ),
+        ];
+        let cells = |a: Vec3, b: Vec3| if (b - a).z.abs() > 0.5 { 12 } else { 4 };
+        let mut out = Vec::with_capacity(224 * 6);
+        for (face, q) in faces {
+            // Normale dans le monde, vers l'extérieur de la boîte.
+            let w = q.map(|p| world.transform_point3(p));
+            let mut n = (w[1] - w[0]).cross(w[3] - w[0]).normalize_or_zero();
+            if n.dot((w[0] + w[2]) * 0.5 - center) < 0.0 {
+                n = -n;
+            }
+            let shade = crate::player_model::face_shade(n);
+            let (ns, nt) = (cells(q[0], q[1]), cells(q[0], q[3]));
+            let at = |s: f32, t: f32| q[0] + (q[1] - q[0]) * s + (q[3] - q[0]) * t;
+            for j in 0..nt {
+                for i in 0..ns {
+                    let (s0, s1) = (i as f32 / ns as f32, (i + 1) as f32 / ns as f32);
+                    let (t0, t1) = (j as f32 / nt as f32, (j + 1) as f32 / nt as f32);
+                    let c = at((s0 + s1) * 0.5, (t0 + t1) * 0.5);
+                    let px = |x: f32, n: usize| ((x * n as f32).floor() as usize).min(n - 1);
+                    // Pixel du skin : la longueur du bras de l'épaule (v = 0) au poing.
+                    let along = px(1.0 - c.z, 12);
+                    let (k, u, v) = match face {
+                        2 => (0, px(1.0 - c.x, 4), along),
+                        3 => (1, px(c.x, 4), along),
+                        0 => (2, px(c.y, 4), along),
+                        1 => (3, px(1.0 - c.y, 4), along),
+                        4 => (4, px(c.x, 4), px(c.y, 4)),
+                        _ => (5, px(c.x, 4), px(1.0 - c.y, 4)),
+                    };
+                    let albedo =
+                        crate::player_model::right_arm_pixel(skin, k, u, v).map(|c| c * shade);
+                    let quad = [at(s0, t0), at(s1, t0), at(s1, t1), at(s0, t1)];
+                    for k in [0usize, 1, 2, 2, 3, 0] {
+                        out.push(ArmVertex {
+                            clip: (proj * arm * quad[k].extend(1.0)).to_array(),
+                            world: world.transform_point3(quad[k]).to_array(),
+                            normal: n.to_array(),
+                            albedo,
+                            light,
+                        });
+                    }
+                }
             }
         }
+        out
+    }
+
+    /// Triangles de l'objet tenu, pour un écran de rapport `aspect` (le bras : `arm`).
+    pub fn build(&self, item: Option<Item>, aspect: f32, light: [f32; 3]) -> Vec<VmVertex> {
+        let proj = Mat4::perspective_infinite_reverse_rh(HAND_FOV.to_radians(), aspect, 0.01);
+        let mut out = Vec::new();
+        let base = self.base();
 
         let Some(item) = item else { return out };
         match item {
@@ -680,11 +661,10 @@ mod tests {
         let mut h = Hand::default();
         h.update(0.5, 0.0, false, Some(Item::Block(BlockId::STONE)));
         for item in [
-            None,
             Some(Item::Block(BlockId::STONE)),
             Some(Item::Torch(Some(2))),
         ] {
-            let v = h.build(item, 16.0 / 9.0, [1.0; 3], true, None);
+            let v = h.build(item, 16.0 / 9.0, [1.0; 3]);
             assert!(!v.is_empty());
             for p in &v {
                 let [x, y, _z, w] = p.clip;
@@ -693,5 +673,60 @@ mod tests {
                 assert!(x / w > -0.3 && y / w < 0.5, "{:?}", p.clip);
             }
         }
+    }
+
+    #[test]
+    fn arm_points_straight_ahead_like_the_model_arm() {
+        let h = Hand::default();
+        // Caméra en (10, 70, 5) tournée de 0,7 rad : le bras suit, dans le monde.
+        let eye = Vec3::new(10.0, 70.0, 5.0);
+        let to_world = Mat4::from_translation(eye) * Mat4::from_rotation_y(0.7);
+        let v = h.arm(16.0 / 9.0, [0.5; 3], None, to_world);
+        // 4 × 12 pixels sur quatre faces, 4 × 4 aux deux bouts, deux triangles chacun.
+        assert_eq!(v.len(), (4 * 12 * 4 + 4 * 4 * 2) * 6);
+        let fwd = to_world.transform_vector3(-Vec3::Z);
+        let mut on_screen = 0;
+        for p in &v {
+            let [x, y, _z, w] = p.clip;
+            assert!(w > 0.0, "derrière la caméra {:?}", p.clip);
+            if (x / w).abs() <= 1.0 && (y / w).abs() <= 1.0 {
+                on_screen += 1;
+                // Visible en bas à droite seulement.
+                assert!(x / w > 0.0 && y / w < 0.0, "{:?}", p.clip);
+            }
+            // Devant les yeux, à portée de main ; normale unitaire.
+            let at = Vec3::from(p.world) - eye;
+            assert!(at.length() < 1.3 && at.dot(fwd) > 0.2, "{at:?}");
+            assert!((Vec3::from(p.normal).length() - 1.0).abs() < 1e-4);
+            // Couleurs du modèle (ombrage de la face compris), lumière du lieu.
+            assert!(p.albedo.iter().all(|c| (0.0..=1.0).contains(c)));
+            assert_eq!(p.light, [0.5; 3]);
+        }
+        assert!(on_screen > 0, "bras hors de l'écran");
+        // Tendu droit devant : les arêtes du bras sont parallèles au regard.
+        let side: Vec<Vec3> = v
+            .iter()
+            .filter(|p| {
+                (Vec3::from(p.normal).dot(to_world.transform_vector3(Vec3::X)) - 1.0).abs() < 1e-4
+            })
+            .map(|p| Vec3::from(p.world))
+            .collect();
+        assert!(!side.is_empty());
+        for p in &side {
+            let d = *p - side[0];
+            let across = d - fwd * d.dot(fwd);
+            // Face de droite : tous ses points sur un plan qui contient le regard.
+            assert!(
+                across.dot(to_world.transform_vector3(Vec3::X)).abs() < 1e-4,
+                "{d:?}"
+            );
+        }
+        // Le poing est là où les objets tenus se placent.
+        let fist = to_world.transform_point3(ARM_FIST);
+        let closest = v
+            .iter()
+            .map(|p| (Vec3::from(p.world) - fist).length())
+            .fold(f32::MAX, f32::min);
+        assert!(closest < 0.2, "{closest}");
     }
 }

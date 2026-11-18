@@ -40,7 +40,7 @@ pub use lights::{
 pub use overlay::{set_translator, tr, Line, Overlay, Ui};
 pub use screen::ScreenAnchor;
 pub use smoke::{SmokeQuality, SmokeVolume};
-pub use viewmodel::{VmVertex, FLAME, NO_TEXTURE};
+pub use viewmodel::{ArmVertex, VmVertex, FLAME, NO_TEXTURE};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -189,6 +189,8 @@ struct LitPipes {
     deferred: wgpu::RenderPipeline,
     bake: wgpu::RenderPipeline,
     vl: lights::VlPipes,
+    /// Bras à la première personne éclairé par les lumières.
+    arm: wgpu::RenderPipeline,
 }
 
 #[repr(C)]
@@ -458,6 +460,9 @@ pub struct FrameParams<'a> {
     pub ui: Option<&'a Ui>,
     /// Main et objet tenu (triangles déjà projetés).
     pub viewmodel: &'a [VmVertex],
+    /// Bras à la première personne (dessiné avant la main), éclairé comme le modèle du
+    /// joueur, lumières dynamiques comprises.
+    pub arm: &'a [ArmVertex],
     /// Entités dans le monde (modèle du joueur à la 3e personne), coordonnées monde.
     pub entities: &'a [EntityVertex],
     /// Les premiers sommets d'`entities` suivent la caméra (modèle du joueur local) ; les
@@ -1451,6 +1456,7 @@ impl Renderer {
     fn spawn_lit(&self) -> lazy::Lazy<Result<LitPipes, String>> {
         let device = self.device.clone();
         let bgl = self.bgl.clone();
+        let surface = self.config.format;
         let (bake_bgl, vl_bgl, comp_bgl, def_bgl) = (
             self.dyn_gpu.bake_bgl.clone(),
             self.dyn_gpu.vl_bgl.clone(),
@@ -1468,8 +1474,9 @@ impl Renderer {
             }
             device.push_error_scope(wgpu::ErrorFilter::Validation);
             device.push_error_scope(wgpu::ErrorFilter::Internal);
-            let (bake, vl, deferred) =
-                lights::light_pipes(&device, &bgl, &bake_bgl, &vl_bgl, &comp_bgl, &def_bgl);
+            let (bake, vl, deferred, arm) = lights::light_pipes(
+                &device, &bgl, &bake_bgl, &vl_bgl, &comp_bgl, &def_bgl, surface,
+            );
             let internal = pollster::block_on(device.pop_error_scope());
             let validation = pollster::block_on(device.pop_error_scope());
             if let Some(e) = internal.or(validation) {
@@ -1480,7 +1487,12 @@ impl Renderer {
                 "shaders des lumières compilés en {:.1} s (en tâche de fond)",
                 t0.elapsed().as_secs_f32()
             );
-            Ok(LitPipes { deferred, bake, vl })
+            Ok(LitPipes {
+                deferred,
+                bake,
+                vl,
+                arm,
+            })
         })
     }
 
@@ -1785,10 +1797,11 @@ impl Renderer {
         let view = frame.texture.create_view(&Default::default());
         self.overlay
             .prepare(&self.device, &self.queue, None, Some(ui), self.size());
-        // Objets 3D des menus (logos, icônes de blocs) : sans main.
+        // Objets 3D des menus (logos, icônes de blocs) : sans main ni bras.
         let hand = self
             .viewmodel
             .prepare_with(&self.queue, &[], &self.overlay.models);
+        self.viewmodel.prepare_arm(&self.queue, &[]);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1823,6 +1836,7 @@ impl Renderer {
                 &self.overlay,
                 self.world_group(),
                 hand,
+                None,
             );
         }
         self.capture
@@ -2160,6 +2174,7 @@ impl Renderer {
         let hand = self
             .viewmodel
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
+        self.viewmodel.prepare_arm(&self.queue, p.arm);
         self.entities
             .prepare(&self.queue, p.entities, p.entities_follow);
         self.entities
@@ -2233,6 +2248,7 @@ impl Renderer {
                 &self.overlay,
                 self.world_group(),
                 hand,
+                None,
             );
         }
         self.capture
@@ -2345,6 +2361,7 @@ impl Renderer {
         let hand = self
             .viewmodel
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
+        self.viewmodel.prepare_arm(&self.queue, p.arm);
         self.entities
             .prepare(&self.queue, p.entities, p.entities_follow);
         self.entities
@@ -2455,8 +2472,10 @@ impl Renderer {
             }
             self.draw_reflective(&mut pass);
         }
-        // Lumières de l'éditeur : actives cette image, et leurs pipelines prêts.
-        let lights_on = self.dyn_gpu.active() && self.lit_pipes().is_some();
+        // Lumières de l'éditeur : actives cette image, leurs pipelines prêts, et au moins
+        // une case de l'écran éclairée (sinon leurs passes n'ont rien à faire).
+        let lights_on =
+            self.dyn_gpu.active() && self.lit_pipes().is_some() && self.dyn_gpu.lit_rects() > 0;
         if let Some(t) = &taa.targets {
             // 1. Opaques : couleur, mouvement, et albédo et surface pour l'éclairage différé.
             let color = |view, load| {
@@ -2578,7 +2597,7 @@ impl Renderer {
             .and_then(|r| r.as_ref().ok())
             .map(|l| &l.vl);
         if let (Some(t), Some(vl)) = (&taa.targets, vl) {
-            if self.dyn_gpu.volumetric_active() {
+            if self.dyn_gpu.volumetric_active() && lights_on {
                 let wg = self.world_group().clone();
                 let timer = self.gpu_timer.as_ref();
                 self.dyn_gpu.encode_volumetric(
@@ -2629,12 +2648,20 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             taa.present(&mut pass);
+            // Bras avec les lumières dynamiques dès qu'il y en a et que leurs shaders sont
+            // prêts (sinon comme sans lumières).
+            let arm_lit = if self.dyn_gpu.active() {
+                self.lit_pipes().map(|l| &l.arm)
+            } else {
+                None
+            };
             draw_hud(
                 &mut pass,
                 &self.viewmodel,
                 &self.overlay,
                 self.world_group(),
                 hand,
+                arm_lit,
             );
         }
         if let Some(t) = &self.gpu_timer {
@@ -2708,7 +2735,9 @@ fn draw_hud<'a>(
     overlay: &'a overlay::OverlayRenderer,
     group: &'a wgpu::BindGroup,
     hand: u32,
+    arm_lit: Option<&'a wgpu::RenderPipeline>,
 ) {
+    vm.draw_arm(pass, group, arm_lit);
     vm.draw_range(pass, group, 0..hand);
     let mut done = 0;
     for (mark, range) in &overlay.splits {
@@ -2984,6 +3013,18 @@ mod tests {
             (
                 "viewmodel",
                 include_str!("shaders/viewmodel.wgsl").to_string(),
+            ),
+            (
+                "bras (sans lumières)",
+                include_str!("shaders/viewmodel_arm.wgsl").to_string(),
+            ),
+            (
+                "bras (lumières)",
+                lights::with_dynlights(&format!(
+                    "{}\n{}",
+                    include_str!("shaders/viewmodel_arm.wgsl"),
+                    include_str!("shaders/viewmodel_arm_lit.wgsl")
+                )),
             ),
             ("smoke", include_str!("shaders/smoke.wgsl").to_string()),
             (

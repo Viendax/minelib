@@ -5822,13 +5822,8 @@ impl Session {
         } else {
             // À la 3e personne : pas de main à l'écran (le modèle est dans le monde).
             let mut v = if third == 0 {
-                self.hand.build(
-                    self.held_item(),
-                    renderer.aspect(),
-                    self.hand_light,
-                    self.game.mode != GameMode::Spectator,
-                    skin.as_deref(),
-                )
+                self.hand
+                    .build(self.held_item(), renderer.aspect(), self.hand_light)
             } else {
                 Vec::new()
             };
@@ -5844,6 +5839,22 @@ impl Session {
                 v.extend(selection_lines(&self.we, proj * view, cam));
             }
             v
+        };
+        // Bras à la première personne (pas en mode FPS, qui a ses armes, ni en spectateur) :
+        // éclairé comme le modèle du joueur en F5.
+        let arm = if third == 0
+            && !fps_mode
+            && self.spectating.is_none()
+            && self.game.mode != GameMode::Spectator
+        {
+            self.hand.arm(
+                renderer.aspect(),
+                self.hand_light,
+                skin.as_deref(),
+                view.inverse(),
+            )
+        } else {
+            Vec::new()
         };
         let smokes = self.fps.smoke_volumes();
         // Têtes (par zone) et cadres des cartes importées.
@@ -5873,6 +5884,7 @@ impl Session {
             ray_light: self.hand_light,
             shadow_boxes: &shadow_boxes,
             viewmodel: &hand,
+            arm: &arm,
             entities: &model,
             entities_follow: follow,
             static_entities: &statics,

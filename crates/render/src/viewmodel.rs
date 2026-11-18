@@ -25,13 +25,136 @@ pub struct VmVertex {
     pub color: [f32; 4],
 }
 
+/// Bras à la première personne : éclairé comme le modèle du joueur en F5, lumières
+/// dynamiques comprises (viewmodel_arm.wgsl).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+pub struct ArmVertex {
+    /// Position écran (clip space, Z inversé), comme `VmVertex`.
+    pub clip: [f32; 4],
+    /// Position dans le monde (devant les yeux) et normale de la face (unitaire).
+    pub world: [f32; 3],
+    pub normal: [f32; 3],
+    /// Couleur (linéaire, ombrage de la face compris) et lumière du lieu.
+    pub albedo: [f32; 3],
+    pub light: [f32; 3],
+}
+
 /// Main, effets du monde et icônes 3D de l'interface (menu d'achat : toutes les armes).
 const MAX_VERTICES: usize = 524_288;
+/// Bras : 4 × 12 × 4 pixels de skin, deux triangles chacun.
+const MAX_ARM_VERTICES: usize = 4096;
 
 pub struct ViewModel {
     pipeline: wgpu::RenderPipeline,
     buffer: wgpu::Buffer,
     count: u32,
+    /// Bras sans les lumières dynamiques (celui avec est prêt plus tard, voir
+    /// `arm_lit_pipeline`).
+    arm_pipeline: wgpu::RenderPipeline,
+    arm_buffer: wgpu::Buffer,
+    arm_count: u32,
+}
+
+/// Pipeline du bras : `fs_arm` (sans lumières) ou `fs_arm_lit` (module avec
+/// dynlights.wgsl), même profondeur que la main.
+fn arm_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    fs: &str,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    // clip (0), monde (16), normale (28), couleur (40), lumière (52)
+    const ATTRS: [wgpu::VertexAttribute; 5] = [
+        wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: 16,
+            shader_location: 1,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: 28,
+            shader_location: 2,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: 40,
+            shader_location: 3,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: 52,
+            shader_location: 4,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+    ];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("bras (première personne)"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_arm"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<ArmVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &ATTRS,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Greater,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// Bras éclairé par les lumières dynamiques (compilé avec leurs autres shaders, en tâche
+/// de fond : le code des lumières est long à compiler sous DirectX).
+pub(crate) fn arm_lit_pipeline(
+    device: &wgpu::Device,
+    world_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let src = crate::lights::with_dynlights(&format!(
+        "{}\n{}",
+        include_str!("shaders/viewmodel_arm.wgsl"),
+        include_str!("shaders/viewmodel_arm_lit.wgsl")
+    ));
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bras (lumières)"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bras (lumières)"),
+        bind_group_layouts: &[world_bgl],
+        push_constant_ranges: &[],
+    });
+    arm_pipeline(device, &layout, &shader, "fs_arm_lit", format)
 }
 
 impl ViewModel {
@@ -113,11 +236,48 @@ impl ViewModel {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let arm_shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/viewmodel_arm.wgsl"));
+        let arm_pipeline = arm_pipeline(device, &layout, &arm_shader, "fs_arm", format);
+        let arm_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bras (sommets)"),
+            size: (MAX_ARM_VERTICES * std::mem::size_of::<ArmVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             pipeline,
             buffer,
             count: 0,
+            arm_pipeline,
+            arm_buffer,
+            arm_count: 0,
         }
+    }
+
+    pub fn prepare_arm(&mut self, queue: &wgpu::Queue, arm: &[ArmVertex]) {
+        let n = arm.len().min(MAX_ARM_VERTICES);
+        self.arm_count = n as u32;
+        if n > 0 {
+            queue.write_buffer(&self.arm_buffer, 0, bytemuck::cast_slice(&arm[..n]));
+        }
+    }
+
+    /// Le bras, avant la main et l'objet tenu (même profondeur) ; `lit` : son pipeline avec
+    /// les lumières dynamiques, quand il y en a.
+    pub fn draw_arm<'p>(
+        &'p self,
+        pass: &mut wgpu::RenderPass<'p>,
+        world_group: &'p wgpu::BindGroup,
+        lit: Option<&'p wgpu::RenderPipeline>,
+    ) {
+        if self.arm_count == 0 {
+            return;
+        }
+        pass.set_pipeline(lit.unwrap_or(&self.arm_pipeline));
+        pass.set_bind_group(0, world_group, &[]);
+        pass.set_vertex_buffer(0, self.arm_buffer.slice(..));
+        pass.draw(0..self.arm_count, 0..1);
     }
 
     pub fn prepare(&mut self, queue: &wgpu::Queue, vertices: &[VmVertex]) {

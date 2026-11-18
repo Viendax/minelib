@@ -25,13 +25,19 @@ struct Globals {
 @group(1) @binding(0) var scene_depth: texture_depth_2d;
 @group(1) @binding(1) var vnoise: texture_3d<f32>;
 @group(1) @binding(2) var vnoise_s: sampler;
+// Cases d'écran éclairées (rectangles en NDC) : la passe ne dessine que là.
+@group(1) @binding(3) var<storage, read> lit_rects: array<vec4<f32>>;
 
 const VL_PI: f32 = 3.14159265;
 
+/// Cases éclairées, élargies d'un pixel de la demi-résolution : la recomposition lit aussi
+/// les voisins (dont la profondeur, en alpha) ; une même valeur écrite deux fois là où
+/// deux rectangles se recouvrent ne change rien.
 @vertex
-fn vs_full(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-    let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
-    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+fn vs_tiles(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
+    let e = vec2<f32>(4.0 / max(g.screen.x, 1.0), 4.0 / max(g.screen.y, 1.0));
+    let r = lit_rects[ii];
+    return dl_rect_corner(vi, vec4<f32>(r.x - e.x, r.y + e.y, r.z + e.x, r.w - e.y));
 }
 
 /// Diffusion de Henyey-Greenstein (g > 0 : vers l'avant), normalisée à 1/4π.
@@ -146,6 +152,9 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec
     let sh_stride = i32(clamp(dh.vl_c.y, 1u, 8u));
     let nz_stride = i32(clamp(dh.vl_c.z, 1u, 8u));
     let tip_r2 = max(dh.vl_a.w * dh.vl_a.w, 1e-4);
+    // force × exp(−x) < 2⁻²⁴ dès que x ≥ 17 + ln(force) (e⁻¹⁷ ≈ 4,1·10⁻⁸ < 2⁻²⁴ ≈ 6·10⁻⁸) ;
+    // force nulle : jamais de lueur.
+    let tip_cut = select(0.0, tip_r2 * (17.0 + log(max(dh.vl_a.z, 1.0))), dh.vl_a.z != 0.0);
     // Métamorphose : deux tirages du même bruit à des décalages qui changent, mélangés.
     let morph = dh.vl_b.w * dh.misc.y;
     let morph_k = floor(morph);
@@ -230,7 +239,14 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec
                             let su = dl_shadow_uv(L, fr, -l);
                             vis = select(1.0, textureSampleCompareLevel(shadow_atlas, shadow_cmp, su.xy, dist / range - 0.002), su.z > 0.5);
                         }
-                        let tip = 1.0 + dh.vl_a.z * exp(-(dist * dist) / tip_r2);
+                        // Lueur à la source : au-delà de `tip_cut`, force × exp(−d²/r²) reste
+                        // sous le demi-écart entre 1,0 et le f32 suivant (2⁻²⁴) : la somme
+                        // vaudrait 1,0 exactement. Même valeur, une exponentielle de moins.
+                        var tip = 1.0;
+                        let tq = dist * dist;
+                        if tq < tip_cut {
+                            tip = 1.0 + dh.vl_a.z * exp(-tq / tip_r2);
+                        }
                         var ins = att * vis * phase * exp(-ext * dist) * tip;
                         if noise_on && ins > 1e-5 {
                             if s % nz_stride == 0 {

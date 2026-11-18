@@ -27,6 +27,14 @@ struct DynLight {
     shadow: vec4<f32>,
     // x, y = boîtes des joueurs à portée (bits 0..63) : leurs ombres.
     boxes: vec4<u32>,
+    // Calculés une fois pour toutes par le jeu (pas à chaque pixel) : repère du projecteur
+    // (xyz : droite, haut ; right.w = 1 / tan du demi-angle, up.w et rect.w = cos et sin de
+    // la rotation du gobo), case de sa carte d'ombre (rect.xyz : coin et taille en uv),
+    // sphère qui contient les boîtes des joueurs (rayon < 0 : aucune).
+    right: vec4<f32>,
+    up: vec4<f32>,
+    rect: vec4<f32>,
+    box_sphere: vec4<f32>,
 };
 
 struct DynHeader {
@@ -95,6 +103,15 @@ fn dl_tile_any(frag: vec2<f32>, size: vec2<f32>) -> bool {
     return any != 0u;
 }
 
+/// Coin `vi` (0..6 : deux triangles) du rectangle `r` (NDC : x0, y0, x1, y1) : les passes des
+/// lumières ne dessinent que les cases d'écran éclairées.
+fn dl_rect_corner(vi: u32, r: vec4<f32>) -> vec4<f32> {
+    // Coins (0,0) (1,0) (0,1) (0,1) (1,0) (1,1) : bits de x = 110010, de y = 101100.
+    let cx = f32((50u >> vi) & 1u);
+    let cy = f32((44u >> vi) & 1u);
+    return vec4<f32>(mix(r.x, r.z, cx), mix(r.y, r.w, cy), 0.0, 1.0);
+}
+
 /// Bruit par pixel (interleaved gradient noise), décalé à chaque image : le TAA lisse.
 fn dl_ign(frag: vec2<f32>) -> f32 {
     let f = frag + vec2<f32>(5.588238, 5.588238) * (dh.misc.x % 64.0);
@@ -148,9 +165,8 @@ fn dl_tile_rect(tile: f32) -> vec3<f32> {
     return vec3<f32>(col * size, row * size, size);
 }
 
-/// Ce qu'il faut d'une lumière pour ses ombres et son gobo, calculé une fois par pixel
-/// (et pas à chaque échantillon) : repère du projecteur, case de sa carte, 1 / tan du
-/// demi-angle, rotation du gobo.
+/// Ce qu'il faut d'une lumière pour ses ombres et son gobo (calculé par le jeu) : repère du
+/// projecteur, case de sa carte, 1 / tan du demi-angle, rotation du gobo.
 struct DlFrame {
     b: mat3x3<f32>,
     rect: vec3<f32>,
@@ -160,11 +176,10 @@ struct DlFrame {
 
 fn dl_frame(L: DynLight) -> DlFrame {
     var f: DlFrame;
-    f.b = dl_spot_basis(normalize(L.dir_type.xyz));
-    f.rect = dl_tile_rect(L.vol.w);
-    let c = clamp(L.cone.x, -1.0, 1.0);
-    f.fy = min(c * inverseSqrt(max(1.0 - c * c, 1e-12)), 114.58865);
-    f.rot = vec2<f32>(cos(L.cookie.y), sin(L.cookie.y));
+    f.b = mat3x3<f32>(L.right.xyz, L.up.xyz, L.dir_type.xyz);
+    f.rect = L.rect.xyz;
+    f.fy = L.right.w;
+    f.rot = vec2<f32>(L.up.w, L.rect.w);
     return f;
 }
 
@@ -292,8 +307,15 @@ fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, s
 }
 
 /// Ombre d'un joueur (boîtes à portée de la lumière) sur le trajet `p` → lumière : 1 si
-/// caché, 0 sinon.
-fn dl_box_shadow(L: DynLight, p: vec3<f32>) -> f32 {
+/// caché, 0 sinon. `entity` : `p` est sur un joueur (sa propre boîte ne le cache pas).
+fn dl_box_shadow(L: DynLight, p: vec3<f32>, entity: bool) -> f32 {
+    // Le trajet passe loin de tous les joueurs (presque toujours) : rien à essayer.
+    let seg = L.pos_range.xyz - p;
+    let t = clamp(dot(L.box_sphere.xyz - p, seg) / max(dot(seg, seg), 1e-8), 0.0, 1.0);
+    let off = p + seg * t - L.box_sphere.xyz;
+    if L.box_sphere.w < 0.0 || dot(off, off) > L.box_sphere.w * L.box_sphere.w {
+        return 0.0;
+    }
     let p4 = vec4<f32>(p, 1.0);
     let l4 = vec4<f32>(L.pos_range.xyz, 1.0);
     var hit = 0.0;
@@ -315,8 +337,9 @@ fn dl_box_shadow(L: DynLight, p: vec3<f32>) -> f32 {
             let a = vec3<f32>(dot(rx, p4), dot(ry, p4), dot(rz, p4));
             let d = vec3<f32>(dot(rx, l4), dot(ry, l4), dot(rz, l4)) - a;
             let inv = 1.0 / select(d, vec3<f32>(1e-6), abs(d) < vec3<f32>(1e-6));
-            // Point dans la boîte (pieds du joueur) : pas d'ombre sur lui-même.
-            let inside = all(a > vec3<f32>(0.0)) && all(a < vec3<f32>(1.0));
+            // Point dans la boîte : sur le joueur lui-même, pas d'ombre de sa propre boîte ;
+            // sur le monde (le sol sous les pieds posés), dans l'ombre comme autour.
+            let inside = entity && all(a > vec3<f32>(0.0)) && all(a < vec3<f32>(1.0));
             let t0 = -a * inv;
             let t1 = (vec3<f32>(1.0) - a) * inv;
             let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
@@ -348,6 +371,71 @@ fn dyn_active() -> bool {
     return dh.counts.x > 0u;
 }
 
+/// Une lumière `L` en `p` (normale `n`, `v` : vers la caméra) : diffus et reflets, sans
+/// l'intensité générale. `boxes` : avec les ombres des joueurs.
+fn dl_one(
+    L: DynLight,
+    p: vec3<f32>,
+    n: vec3<f32>,
+    v: vec3<f32>,
+    gloss: f32,
+    entity: bool,
+    noise: f32,
+    boxes: bool,
+) -> DynOut {
+    var o = DynOut(vec3<f32>(0.0), vec3<f32>(0.0));
+    let flags = dh.vl_c.w;
+    let shadows_on = (flags & DL_SHADOWS) != 0u;
+    let boxes_on = boxes && (flags & DL_BOX_SHADOWS) != 0u;
+    let toon = (flags & DL_TOON) != 0u;
+    let spec_k = select(0.0, dh.surf.y, (flags & DL_SPECULAR) != 0u);
+    let to_l = L.pos_range.xyz - p;
+    let d2 = dot(to_l, to_l);
+    let r = L.pos_range.w;
+    let mask = u32(L.cone.z + 0.5);
+    let skip = (mask == 1u && !entity) || (mask == 2u && entity);
+    if d2 < r * r && d2 > 1e-8 && !skip {
+        let d = sqrt(d2);
+        let l = to_l / d;
+        let ndl = max(dot(n, l), 0.0);
+        // Fenêtre radiale de Frostbite : (1 − (d/r)⁴)².
+        let dr = d / r;
+        let dr2 = dr * dr;
+        let fall = max(1.0 - dr2 * dr2, 0.0);
+        var att = fall * fall;
+        let fr = dl_frame(L);
+        if L.dir_type.w > 0.5 {
+            let theta = dot(-l, L.dir_type.xyz);
+            att *= clamp((theta - L.cone.x) / max(L.cone.y - L.cone.x, 1e-6), 0.0, 1.0);
+            if att > 0.0 {
+                att *= dl_cookie(p, L, fr);
+            }
+        }
+        if att > 0.0 && ndl > 0.0 {
+            if shadows_on && L.shadow.x > 0.5 {
+                att *= dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003);
+            }
+            if boxes_on && att > 0.0 && (L.boxes.x | L.boxes.y) != 0u {
+                att *= 1.0 - dl_box_shadow(L, p + n * 0.02, entity);
+            }
+            var diff = att * ndl;
+            if toon {
+                diff = dl_toon(diff, dh.surf.z, dh.surf.w);
+            }
+            o.diffuse = L.color.rgb * diff;
+            if spec_k > 0.0 {
+                // Blinn-Phong normalisé : tache nette sur un miroir, large et faible
+                // sur un bloc mat.
+                let h = normalize(l + v);
+                let shin = mix(24.0, 1024.0, gloss * gloss);
+                let s = pow(max(dot(n, h), 0.0), shin) * (shin + 8.0) / 25.1327;
+                o.specular = L.color.rgb * (att * ndl * s * mix(0.02, 1.0, gloss) * spec_k);
+            }
+        }
+    }
+    return o;
+}
+
 /// Lumière reçue en `p` (normale `n`) des lumières dynamiques, vue depuis `cam`.
 /// `gloss` : 0 mat … 1 miroir ; `entity` : surface d'une entité (masques « entités
 /// seulement » / « blocs seulement ») ; `frag`, `size` : pixel et taille de l'image.
@@ -367,11 +455,6 @@ fn dyn_light(
     }
     let base = dl_tile_base(frag, size);
     let words = min(dh.counts.w, 8u);
-    let flags = dh.vl_c.w;
-    let shadows_on = (flags & DL_SHADOWS) != 0u;
-    let boxes_on = (flags & DL_BOX_SHADOWS) != 0u;
-    let toon = (flags & DL_TOON) != 0u;
-    let spec_k = select(0.0, dh.surf.y, (flags & DL_SPECULAR) != 0u);
     let v = normalize(cam - p);
     let noise = dl_ign(frag);
     for (var w = 0u; w < words; w++) {
@@ -382,52 +465,28 @@ fn dyn_light(
             }
             let b = firstTrailingBit(bits);
             bits = bits & (bits - 1u);
-            let L = dlights[min(w * 32u + b, count - 1u)];
-            let to_l = L.pos_range.xyz - p;
-            let d2 = dot(to_l, to_l);
-            let r = L.pos_range.w;
-            let mask = u32(L.cone.z + 0.5);
-            let skip = (mask == 1u && !entity) || (mask == 2u && entity);
-            if d2 < r * r && d2 > 1e-8 && !skip {
-                let d = sqrt(d2);
-                let l = to_l / d;
-                let ndl = max(dot(n, l), 0.0);
-                // Fenêtre radiale de Frostbite : (1 − (d/r)⁴)².
-                let dr = d / r;
-                let dr2 = dr * dr;
-                let fall = max(1.0 - dr2 * dr2, 0.0);
-                var att = fall * fall;
-                let fr = dl_frame(L);
-                if L.dir_type.w > 0.5 {
-                    let theta = dot(-l, L.dir_type.xyz);
-                    att *= clamp((theta - L.cone.x) / max(L.cone.y - L.cone.x, 1e-6), 0.0, 1.0);
-                    if att > 0.0 {
-                        att *= dl_cookie(p, L, fr);
-                    }
-                }
-                if att > 0.0 && ndl > 0.0 {
-                    if shadows_on && L.shadow.x > 0.5 {
-                        att *= dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003);
-                    }
-                    if boxes_on && att > 0.0 && (L.boxes.x | L.boxes.y) != 0u {
-                        att *= 1.0 - dl_box_shadow(L, p + n * 0.02);
-                    }
-                    var diff = att * ndl;
-                    if toon {
-                        diff = dl_toon(diff, dh.surf.z, dh.surf.w);
-                    }
-                    o.diffuse += L.color.rgb * diff;
-                    if spec_k > 0.0 {
-                        // Blinn-Phong normalisé : tache nette sur un miroir, large et faible
-                        // sur un bloc mat.
-                        let h = normalize(l + v);
-                        let shin = mix(24.0, 1024.0, gloss * gloss);
-                        let s = pow(max(dot(n, h), 0.0), shin) * (shin + 8.0) / 25.1327;
-                        o.specular += L.color.rgb * (att * ndl * s * mix(0.02, 1.0, gloss) * spec_k);
-                    }
-                }
-            }
+            let c = dl_one(dlights[min(w * 32u + b, count - 1u)], p, n, v, gloss, entity, noise, true);
+            o.diffuse += c.diffuse;
+            o.specular += c.specular;
         }
+    }
+    o.diffuse *= dh.surf.x;
+    o.specular *= dh.surf.x;
+    return o;
+}
+
+/// Comme `dyn_light`, avec toutes les lumières (pas seulement celles d'une tuile de
+/// l'écran) et sans les ombres des joueurs : pour le bras à la première personne, dessiné
+/// à part, qui n'est pas à sa place dans l'image du monde.
+fn dyn_light_all(p: vec3<f32>, n: vec3<f32>, cam: vec3<f32>, gloss: f32, entity: bool, frag: vec2<f32>) -> DynOut {
+    var o = DynOut(vec3<f32>(0.0), vec3<f32>(0.0));
+    let count = dh.counts.x;
+    let v = normalize(cam - p);
+    let noise = dl_ign(frag);
+    for (var i = 0u; i < count; i++) {
+        let c = dl_one(dlights[i], p, n, v, gloss, entity, noise, false);
+        o.diffuse += c.diffuse;
+        o.specular += c.specular;
     }
     o.diffuse *= dh.surf.x;
     o.specular *= dh.surf.x;
