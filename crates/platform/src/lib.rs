@@ -294,6 +294,21 @@ impl Input {
         self.pressed.contains(&k)
     }
     /// Touches tenues en ce moment (diagnostic).
+    /// Les mêmes entrées sans aucune touche ni clic (la souris tourne toujours la vue) :
+    /// pour le jeu pendant un test des touches, où le joueur tient des touches qui ne
+    /// doivent rien faire.
+    pub fn silenced(&self) -> Input {
+        Input {
+            mouse_delta: self.mouse_delta,
+            grabbed: self.grabbed,
+            cursor: self.cursor,
+            focused: self.focused,
+            raw_seen: self.raw_seen,
+            key_labels: self.key_labels.clone(),
+            ..Input::default()
+        }
+    }
+
     pub fn held_keys(&self) -> Vec<KeyCode> {
         self.held.iter().copied().collect()
     }

@@ -253,6 +253,8 @@ pub struct Session {
     filter_keys_in: Option<f32>,
     /// Bilan des retards de la touche avancer (journal toutes les 5 minutes).
     lag_book: crate::keylag::LagBook,
+    /// Test des touches en cours (`/testtouche`) : le jeu ne reçoit ni touches ni clics.
+    key_test: Option<crate::keytest::KeyTest>,
     autosave: f32,
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
@@ -522,6 +524,7 @@ impl Session {
             injected_warned: false,
             filter_keys_in: Some(3.0),
             lag_book: Default::default(),
+            key_test: None,
             autosave: AUTOSAVE_S,
             hit: None,
             frame_aim: None,
@@ -576,6 +579,40 @@ impl Session {
             lights_marked: false,
             lights_failed_said: false,
         })
+    }
+
+    /// Une image du test des touches (`/testtouche`) : messages au tchat et au journal ;
+    /// Échap, la pause ou une minute sans rien le terminent, avec le bilan.
+    fn run_key_test(&mut self, input: &Input, dt: f32, active: bool) {
+        use crate::keytest::Tone;
+        let Some(test) = self.key_test.as_mut() else {
+            return;
+        };
+        let label = |k: KeyCode| {
+            input
+                .key_labels
+                .get(&k)
+                .cloned()
+                .or_else(|| minelib_platform::layout_label(k))
+                .unwrap_or_else(|| format!("{k:?}"))
+        };
+        let mouse = [Mouse::Left, Mouse::Right, Mouse::Middle]
+            .iter()
+            .any(|&b| input.mouse_held(b));
+        let mut said = test.step(&input.held_keys(), mouse, std::time::Instant::now(), dt, &label);
+        if !active || input.pressed(KeyCode::Escape) || test.finished {
+            said.extend(test.summary(&label));
+            self.key_test = None;
+        }
+        for (text, tone) in said {
+            log::info!("test des touches : {text}");
+            let color = match tone {
+                Tone::Info => chat::YELLOW,
+                Tone::Good => [0.45, 1.0, 0.5, 1.0],
+                Tone::Bad => chat::RED,
+            };
+            self.chat.say(text, color);
+        }
     }
 
     /// Fin de partie : les bilans en cours vont au journal.
@@ -690,6 +727,15 @@ impl Session {
             self.keys.mouse_muted = false;
         }
         crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
+        // Test des touches : il lit le clavier et la souris, le jeu ne reçoit rien.
+        let quiet;
+        let input = if self.key_test.is_some() {
+            self.run_key_test(input, dt, active);
+            quiet = input.silenced();
+            &quiet
+        } else {
+            input
+        };
         // (v172) Mode FPS dans un monde solo : partie contre des bots.
         if self.bots_auto
             && self.net.is_none()
@@ -4570,6 +4616,20 @@ impl Session {
                 }
                 _ => self.chat.say("Utilisation : /foule <on|off>", chat::RED),
             },
+            // Test des touches : une touche annonce-t-elle son relâchement en retard ?
+            "testtouche" | "testtouches" | "keytest" => {
+                self.key_test = Some(crate::keytest::KeyTest::new());
+                log::info!("test des touches : commencé");
+                for line in [
+                    "Test des touches : tiens UNE touche (avancer, par exemple) et le clic \
+                     gauche en même temps pendant 10 secondes.",
+                    "Quand le jeu te le dit, lâche les deux d'un seul coup. Fais-le 3 fois, \
+                     puis avec d'autres touches pour comparer.",
+                    "Pendant le test tu ne bouges pas. Échap : fin du test et bilan.",
+                ] {
+                    self.chat.say(line.to_string(), chat::YELLOW);
+                }
+            }
             // Touche « avancer » qui remonte mal : règle forcée, refusée ou apprise.
             "touchelente" | "slowkey" => {
                 use crate::stick::Mode;

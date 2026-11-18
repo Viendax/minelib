@@ -68,6 +68,7 @@ mod i18n;
 mod inventory;
 mod jobs;
 mod keylag;
+mod keytest;
 mod keys;
 mod light_editor;
 mod lights;

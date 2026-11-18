@@ -1,3 +1,10 @@
+//! (v178) Cette règle ne s'active plus jamais toute seule : seulement avec `/touchelente
+//! on`. Ce qui suit décrit l'hypothèse de départ (une touche qui remonte mal) ; les journaux
+//! du 18 novembre montrent que l'écart entre « courir » et « avancer » relâchées ne dépend
+//! pas de la température et ressemble autant au geste d'un joueur qui ralentit avant de
+//! s'arrêter : il ne prouve pas un défaut de la touche. La preuve se fait avec
+//! `/testtouche` (voir `keytest`), contre un bouton de la souris.
+//!
 //! Touche « avancer » qui remonte mal (clavier de portable : la coupelle sous la touche,
 //! usée et chauffée par la machine, met du temps à se relever). Le clavier la dit encore
 //! enfoncée après qu'on l'a lâchée, de quelques centièmes de seconde à froid jusqu'à une
@@ -43,8 +50,6 @@ const CLEAN: f32 = 0.12;
 /// Entre ces deux temps (s) : elle traînait.
 const LATE_FROM: f32 = 0.18;
 const LATE_TO: f32 = 1.5;
-/// Relâchements en retard à la suite qui activent la règle.
-const IN_A_ROW: u32 = 3;
 /// Fins de course retenues (pour éteindre la règle).
 const HISTORY: usize = 8;
 /// Retards retenus pour régler l'attente, à part pour les appuis brefs et les longs (la
@@ -186,8 +191,9 @@ impl Guard {
                 g.mode = Mode::On;
                 g.active = true;
             }
-            Some(_) => g.active = true,
-            None => {}
+            // (v178) « 1 » : appris tout seul par une ancienne version. Plus repris : le jeu
+            // n'active plus jamais la règle de lui-même (voir `sample`).
+            Some(_) | None => {}
         }
         g.saved = Some((g.mode, g.active));
         if let Ok(text) = std::fs::read_to_string(minelib_assets::data_dir().join(LAGS_FILE)) {
@@ -366,16 +372,13 @@ impl Guard {
             Some(g) if g < CLEAN => self.streak = 0,
             _ => {}
         }
-        if !self.active && self.streak >= IN_A_ROW {
-            self.active = true;
-            self.just_learned = true;
-        }
-        // Il continue souvent de marcher après avoir couru : la règle le gênerait.
-        if self.active && self.walked.iter().filter(|w| **w).count() * 2 >= HISTORY {
-            self.active = false;
-            self.streak = 0;
-            self.walked.clear();
-        }
+        // (v178) Le jeu n'active plus la règle de lui-même : seul `/touchelente on` le fait.
+        // « Avancer » relâchée quelques dixièmes de seconde après « courir », c'est aussi le
+        // geste normal d'un joueur qui ralentit avant de s'arrêter (les journaux ne
+        // distinguent pas les deux : écarts de 0,4 à 3 s après les longues courses, sans
+        // lien avec la température) ; la règle arrêtait alors un joueur qui tenait
+        // « avancer » (22 fois de suite dans une partie). La série reste comptée pour le
+        // journal ; la touche se vérifie avec `/testtouche`.
     }
 
     /// À chaque image : « avancer » tenue, « avancer » enfoncée à cette image, « courir »
@@ -604,7 +607,9 @@ mod tests {
             assert!(!g.active());
             sprint(&mut g, 17.0, Some(gap));
         }
-        assert!(g.active() && g.just_learned, "trois retards de suite");
+        // (v178) Le jeu n'active plus la règle de lui-même : il faut la demander.
+        assert!(!g.active() && !g.just_learned, "jamais activée toute seule");
+        g.set_mode(Mode::On);
         // Ensuite, lâcher « courir » arrête d'avancer tout de suite, même quand la touche
         // traîne de plus en plus (les retards mesurés ensuite sur ce portable, à chaud).
         for (run, gap) in [(20.0, 0.746), (36.0, 1.357), (50.0, 1.205), (12.0, 0.515)] {
@@ -716,10 +721,10 @@ mod tests {
         for _ in 0..3 {
             sprint(&mut g, 10.0, Some(0.5));
         }
-        assert!(g.active());
-        // Il continue de marcher la plupart du temps : la règle s'éteint.
+        // (v178) Trois écarts de suite n'activent plus rien : ce peut être son geste.
+        assert!(!g.active());
         for _ in 0..4 {
-            sprint(&mut g, 10.0, None);
+            assert!((sprint(&mut g, 10.0, None) - 8.0).abs() < 0.02);
         }
         assert!(!g.active());
         assert!(
