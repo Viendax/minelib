@@ -34,6 +34,7 @@
 //!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
 //!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
 //!   MINELIB_UI=lumieres         éditeur de lumières ouvert en entrant dans le monde (essais)
+//!   MINELIB_LUMIERES_LENTES=<s> shaders des lumières prêts <s> secondes plus tard (essais)
 //!   MINELIB_SMOKE=<x>,<y>,<z>   mode FPS : fumigène posée là toutes les 18 s (essais)
 //!   MINELIB_SMOKE_Q=<n>,<pas>   qualité des fumigènes : pas max et longueur (essais)
 
@@ -76,7 +77,6 @@ mod province_host;
 mod radar;
 mod save;
 mod screen;
-mod watch;
 mod session;
 mod skin;
 mod stick;
@@ -84,6 +84,7 @@ mod streaming;
 mod update;
 mod voice;
 mod wand;
+mod watch;
 mod weapons;
 mod worldedit;
 
@@ -259,6 +260,9 @@ struct Game {
     message: Option<(String, f32)>,
     /// Écran branché sur une autre carte que celle qui dessine (Optimus) : son nom.
     optimus: Option<String>,
+    /// Shaders des lumières à lancer dès que possible (lumières utilisées ces derniers
+    /// jours).
+    warm_lights: bool,
     /// Mémoire vidéo utilisée et budget Windows, relus chaque seconde.
     vram: Option<(minelib_platform::VramMonitor, std::time::Instant, bool)>,
     auto_world: Option<String>,
@@ -380,6 +384,7 @@ impl Game {
             clear_meshes: false,
             quit: false,
             optimus: None,
+            warm_lights: false,
             vram: None,
         })
         .map(|mut g| {
@@ -996,7 +1001,11 @@ impl Game {
                 }
                 Event::ServerAdmin(text) => {
                     if let Some(s) = self.session.as_mut().filter(|_| !text.is_empty()) {
-                        s.chat.say(text, chat::YELLOW);
+                        // Liste des OP demandée pour ouvrir l'éditeur de lumières : elle
+                        // n'arrive qu'aux OP, on ne l'affiche pas.
+                        if !(text.starts_with("OP :") && s.light_op_answer(true)) {
+                            s.chat.say(text, chat::YELLOW);
+                        }
                     }
                 }
                 Event::Kicked(reason) => {
@@ -1148,7 +1157,10 @@ impl Game {
                         self.fps_status = Some(m.clone());
                     }
                     if let Some(s) = &mut self.session {
-                        if s.net.is_some() || s.build.is_some() {
+                        // Refus de la liste des OP demandée pour l'éditeur de lumières : son
+                        // propre message à la place.
+                        let editor = m.contains("Réservé aux OP") && s.light_op_answer(false);
+                        if !editor && (s.net.is_some() || s.build.is_some()) {
                             s.chat.say(m.clone(), chat::RED);
                         }
                     }
@@ -2920,6 +2932,9 @@ impl GameLoop for Game {
                 gpu_plan::apply(&mut r, &mut self.options, first_launch);
                 // Anticrénelage temporel : toujours actif (MINELIB_TAA=0 seulement pour les tests).
                 r.set_antialiasing(std::env::var("MINELIB_TAA").map_or(true, |v| v != "0"));
+                // Lumières utilisées ces derniers jours : leurs shaders (25 s de compilation
+                // sous DirectX) commencent dès que possible, pendant les menus.
+                self.warm_lights = lights::used_recently(&self.paths.root) && !r.warm_dyn_lights();
                 // Essais : MINELIB_SMOKE_Q=<pas max>,<longueur d'un pas> (qualité des fumigènes).
                 if let Ok(q) = std::env::var("MINELIB_SMOKE_Q") {
                     let v: Vec<f32> = q.split(',').filter_map(|s| s.trim().parse().ok()).collect();
@@ -3064,6 +3079,10 @@ impl GameLoop for Game {
         let Some(mut renderer) = self.renderer.take() else {
             return false;
         };
+        // Voir `on_ready` : la compilation des lumières attendait les shaders du monde.
+        if self.warm_lights {
+            self.warm_lights = !renderer.warm_dyn_lights();
+        }
         // Reflex / Anti-Lag 2 : attente pilotée par le pilote avant la simulation.
         {
             let _r = minelib_render::perf::scope("Reflex / Anti-Lag (attente du pilote)");

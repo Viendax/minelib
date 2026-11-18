@@ -233,9 +233,47 @@ struct Globals {
 /// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre.
 pub const MAX_SHADOW_BOXES: usize = 48;
 
+/// Morceau de joueur qui fait de l'ombre : sa boîte exacte (tournée avec lui), et la
+/// boîte alignée sur les axes du monde qui la contient.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowBox {
+    /// Boîte englobante dans le monde : ombres du soleil et des torches, lumières
+    /// dynamiques qui l'atteignent.
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    /// Les trois lignes de la matrice qui ramène le monde au cube unité de la boîte exacte
+    /// (0 à 1 sur chaque axe) : ombres exactes des lumières dynamiques.
+    pub to_unit: [[f32; 4]; 3],
+}
+
+impl ShadowBox {
+    /// Boîte `lo..hi` d'un repère local placé dans le monde par `xf` (local → monde).
+    pub fn oriented(xf: Mat4, lo: Vec3, hi: Vec3) -> Self {
+        let size = (hi - lo).max(Vec3::splat(1e-6));
+        let to_unit = Mat4::from_scale(size.recip()) * Mat4::from_translation(-lo) * xf.inverse();
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        for k in 0..8 {
+            let c = Vec3::new(
+                if k & 1 == 0 { lo.x } else { hi.x },
+                if k & 2 == 0 { lo.y } else { hi.y },
+                if k & 4 == 0 { lo.z } else { hi.z },
+            );
+            let w = xf.transform_point3(c);
+            min = min.min(w);
+            max = max.max(w);
+        }
+        Self {
+            min: min.into(),
+            max: max.into(),
+            to_unit: [0, 1, 2].map(|i| to_unit.row(i).to_array()),
+        }
+    }
+}
+
 /// Uniformes des ombres des joueurs : (nombre, coins min, coins max).
 fn shadow_globals(
-    boxes: &[([f32; 3], [f32; 3])],
+    boxes: &[ShadowBox],
     lights: &[[f32; 4]],
 ) -> (
     [f32; 4],
@@ -245,7 +283,7 @@ fn shadow_globals(
     let n = boxes.len().min(MAX_SHADOW_BOXES);
     let mut mn = [[0.0; 4]; MAX_SHADOW_BOXES];
     let mut mx = [[0.0; 4]; MAX_SHADOW_BOXES];
-    for (i, (a, b)) in boxes.iter().take(n).enumerate() {
+    for (i, ShadowBox { min: a, max: b, .. }) in boxes.iter().take(n).enumerate() {
         // Source de lumière la plus proche (à moins de 10 blocs) : la seule dont ce
         // morceau de joueur projette l'ombre (−1 : aucune). Le shader n'a ainsi qu'un
         // essai par boîte.
@@ -439,9 +477,8 @@ pub struct FrameParams<'a> {
     /// Fumigènes à dessiner en volume.
     pub smokes: &'a [SmokeVolume<'a>],
     pub ray_light: [f32; 3],
-    /// Boîtes (coins min, max, monde) des joueurs qui font de l'ombre au soleil et aux
-    /// torches.
-    pub shadow_boxes: &'a [([f32; 3], [f32; 3])],
+    /// Morceaux des joueurs qui font de l'ombre (soleil, torches, lumières dynamiques).
+    pub shadow_boxes: &'a [ShadowBox],
     /// Écran de debug (F3) à afficher par-dessus la scène.
     pub overlay: Option<&'a Overlay>,
 }
@@ -606,6 +643,9 @@ pub struct Renderer {
     /// Leurs shaders, compilés à la première lumière posée (`Err` : refusés par la carte ou
     /// son pilote ; le jeu continue sans elles).
     lit: Option<lazy::Lazy<Result<LitPipes, String>>>,
+    /// Images restantes pendant lesquelles l'anticrénelage considère que les lumières ont
+    /// changé (déplacées, réglées) : comme `mesh_changes`.
+    dyn_changes: u32,
     /// Skin des reflets envoyé à la carte (voir `set_skin`).
     skin_key: Option<usize>,
     gpu_timer: Option<gpu_timer::GpuTimer>,
@@ -1027,6 +1067,7 @@ impl Renderer {
             voxels,
             dyn_gpu,
             lit: None,
+            dyn_changes: 0,
             skin_key: None,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
             lights_col: [[0.0; 4]; MAX_LIGHTS],
@@ -1363,14 +1404,28 @@ impl Renderer {
 
     /// Lumières dynamiques (éditeur de lumières) de la prochaine image, et leurs réglages.
     pub fn set_dyn_lights(&mut self, lights: &[DynLight], settings: &DynSettings) {
-        // Leurs shaders : compilés la première fois qu'il y en a une, après ceux du monde
-        // (pas deux compilations lourdes à la fois). D'ici là, et s'ils sont refusés, le
-        // monde s'affiche sans elles.
-        if !lights.is_empty() && self.lit.is_none() && self.world_ready() {
-            self.lit = Some(self.spawn_lit());
+        // Leurs shaders : compilés la première fois qu'il y en a une. D'ici là, et s'ils
+        // sont refusés, le monde s'affiche sans elles.
+        if !lights.is_empty() {
+            let _ = self.warm_dyn_lights();
         }
         let ready = self.lit_pipes().is_some();
-        self.dyn_gpu.set(if ready { lights } else { &[] }, settings);
+        if self.dyn_gpu.set(if ready { lights } else { &[] }, settings) {
+            self.dyn_changes = 8;
+        }
+    }
+
+    /// Lance la compilation des shaders des lumières (sur des fils à part), sans attendre
+    /// qu'une lumière soit posée : au lancement du jeu chez qui s'en sert, elles sont
+    /// prêtes plus tôt. Avec peu de cœurs, seulement après les shaders du monde (pas deux
+    /// compilations lourdes à la fois : le monde s'afficherait plus tard). Vrai si elle est
+    /// lancée (ou déjà faite) ; sinon, à redemander plus tard.
+    pub fn warm_dyn_lights(&mut self) -> bool {
+        let many_cores = std::thread::available_parallelism().is_ok_and(|n| n.get() >= 8);
+        if self.lit.is_none() && (many_cores || self.world_ready()) {
+            self.lit = Some(self.spawn_lit());
+        }
+        self.lit.is_some()
     }
 
     /// Variantes éclairées, si elles sont prêtes.
@@ -1392,6 +1447,13 @@ impl Renderer {
         );
         lazy::Lazy::spawn("shaders des lumières", move || {
             let t0 = std::time::Instant::now();
+            // Essais : compilation lente comme sous DirectX (MINELIB_LUMIERES_LENTES=<s>).
+            if let Some(s) = std::env::var("MINELIB_LUMIERES_LENTES")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_secs_f32(s.clamp(0.0, 120.0)));
+            }
             device.push_error_scope(wgpu::ErrorFilter::Validation);
             device.push_error_scope(wgpu::ErrorFilter::Internal);
             let world = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1400,9 +1462,19 @@ impl Renderer {
                     lights::with_dynlights(include_str!("shaders/world.wgsl")).into(),
                 ),
             });
-            let heavy = taa::build_heavy(&device, &layout, &world);
-            let entities = entity::EntityPipes::new(&device, &bgl, format, true);
-            let (bake, vl) = lights::light_pipes(&device, &bgl, &bake_bgl, &vl_bgl, &comp_bgl);
+            // Tous les pipelines en même temps, chacun sur son fil : sous DirectX, chacun
+            // compte plusieurs secondes de compilation ; à la suite, il fallait 25 s.
+            let (heavy, entities, (bake, vl)) = std::thread::scope(|sc| {
+                let heavy = sc.spawn(|| taa::build_heavy(&device, &layout, &world));
+                let entities = sc.spawn(|| entity::EntityPipes::new(&device, &bgl, format, true));
+                let lights =
+                    sc.spawn(|| lights::light_pipes(&device, &bgl, &bake_bgl, &vl_bgl, &comp_bgl));
+                (
+                    heavy.join().expect("shaders du monde (lumières)"),
+                    entities.join().expect("shaders des entités (lumières)"),
+                    lights.join().expect("shaders des lumières"),
+                )
+            });
             let internal = pollster::block_on(device.pop_error_scope());
             let validation = pollster::block_on(device.pop_error_scope());
             if let Some(e) = internal.or(validation) {
@@ -1445,6 +1517,7 @@ impl Renderer {
     pub fn set_gobos(&mut self, images: &[GoboImage]) {
         self.dyn_gpu.set_gobos(&self.device, &self.queue, images);
         self.rebuild_world_groups();
+        self.dyn_changes = 8;
     }
 
     /// Prépare les lumières dynamiques de l'image (cartes d'ombre à calculer, tuiles).
@@ -2234,6 +2307,15 @@ impl Renderer {
         {
             let _l = perf::scope("rendu : lumières dynamiques");
             self.prepare_dyn(view_proj, p);
+        }
+        // Lumière déplacée ou réglée, carte d'ombre recalculée : l'image change alors que la
+        // caméra ne bouge pas. Sans cela, l'anticrénelage garde l'ancienne image (caméra
+        // immobile : moyenne jusqu'à 1/64, historique accepté tant que la géométrie ne
+        // change pas) et la lumière semble ne pas suivre.
+        if self.dyn_changes > 0 || self.dyn_gpu.stats.baked > 0 {
+            self.dyn_changes = self.dyn_changes.saturating_sub(1);
+            taa.scene_changed = true;
+            taa.still_frames = 0;
         }
         // Reflets : recalculés à leur rythme, seulement s'il y a des surfaces qui reflètent
         // à l'écran (raytracing activé).

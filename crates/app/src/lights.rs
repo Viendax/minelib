@@ -23,6 +23,32 @@ use serde::{Deserialize, Serialize};
 pub const SCENE_FILE: &str = "lumieres.json";
 /// Réglages généraux (dans `.minelib`).
 const SETTINGS_FILE: &str = "lumieres.txt";
+/// Date (secondes Unix) de la dernière partie avec des lumières (dans `.minelib`) : leurs
+/// shaders sont alors compilés dès le lancement du jeu.
+const USED_FILE: &str = "lumieres_utilisees.txt";
+/// Au-delà, on ne les prépare plus au lancement.
+const USED_FOR_S: u64 = 7 * 24 * 3600;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Note qu'une partie s'est servie des lumières (voir [`used_recently`]).
+pub fn mark_used(root: &Path) {
+    if let Err(e) = std::fs::write(root.join(USED_FILE), format!("{}\n", unix_now())) {
+        log::warn!("{USED_FILE} : {e}");
+    }
+}
+
+/// Les lumières ont-elles servi ces sept derniers jours ?
+pub fn used_recently(root: &Path) -> bool {
+    std::fs::read_to_string(root.join(USED_FILE))
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .is_some_and(|t| unix_now().saturating_sub(t) < USED_FOR_S)
+}
 /// Dossier des images de gobos du joueur (dans `.minelib`).
 pub const GOBO_DIR: &str = "gobos";
 /// Lumières placées au plus dans un monde.

@@ -386,13 +386,6 @@ impl Editor {
         (size.0 - w - pad * 2.0, pad * 2.0, w, size.1 - pad * 4.0)
     }
 
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
-        if !self.open {
-            self.close();
-        }
-    }
-
     pub fn close(&mut self) {
         self.open = false;
         self.free_cam = None;

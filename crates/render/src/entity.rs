@@ -42,7 +42,9 @@ const MAX_VERTICES: usize = 1_048_576;
 
 /// Rendu direct (une cible) et rendu avec anticrénelage temporel (couleur + mouvement).
 pub(crate) struct EntityPipes {
-    plain: wgpu::RenderPipeline,
+    /// Sans anticrénelage (pas dans la variante éclairée : les lumières ne servent
+    /// qu'avec lui).
+    plain: Option<wgpu::RenderPipeline>,
     taa: wgpu::RenderPipeline,
     taa_world: wgpu::RenderPipeline,
 }
@@ -120,19 +122,21 @@ impl EntityPipes {
                 write_mask: wgpu::ColorWrites::ALL,
             })
         };
-        Self {
-            plain: pipeline("entités", "fs_main", &[target(surface)]),
-            taa: pipeline(
-                "entités (TAA)",
-                "fs_taa",
-                &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
-            ),
-            taa_world: pipeline(
-                "entités fixes (TAA)",
-                "fs_taa_world",
-                &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
-            ),
-        }
+        let taa_targets = [target(COLOR_FORMAT), target(MOTION_FORMAT)];
+        // Chacun sur son fil (plusieurs secondes de compilation chacun sous DirectX avec
+        // les lumières).
+        std::thread::scope(|sc| {
+            let plain =
+                (!lit).then(|| sc.spawn(|| pipeline("entités", "fs_main", &[target(surface)])));
+            let taa = sc.spawn(|| pipeline("entités (TAA)", "fs_taa", &taa_targets));
+            let taa_world =
+                sc.spawn(|| pipeline("entités fixes (TAA)", "fs_taa_world", &taa_targets));
+            Self {
+                plain: plain.map(|h| h.join().expect("pipeline des entités")),
+                taa: taa.join().expect("pipeline des entités (TAA)"),
+                taa_world: taa_world.join().expect("pipeline des entités fixes (TAA)"),
+            }
+        })
     }
 }
 
@@ -232,9 +236,11 @@ impl Entities {
         lit: Option<&'a EntityPipes>,
     ) {
         let p = lit.unwrap_or(&self.pipes);
+        // Sans anticrénelage : toujours la variante de tous les jours.
+        let plain = self.pipes.plain.as_ref().expect("pipeline des entités");
         pass.set_bind_group(0, group, &[]);
         if !self.static_draw.is_empty() {
-            pass.set_pipeline(if taa { &p.taa_world } else { &p.plain });
+            pass.set_pipeline(if taa { &p.taa_world } else { plain });
             for key in &self.static_draw {
                 if let Some((b, n, _)) = self.statics.get(key) {
                     pass.set_vertex_buffer(0, b.slice(..));
@@ -247,7 +253,7 @@ impl Entities {
         }
         pass.set_vertex_buffer(0, self.buffer.slice(..));
         if !taa {
-            pass.set_pipeline(&p.plain);
+            pass.set_pipeline(plain);
             pass.draw(0..self.count, 0..1);
             return;
         }

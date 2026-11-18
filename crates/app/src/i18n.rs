@@ -1938,6 +1938,15 @@ const TABLE: &[[&str; 7]] = &[
         "Lichten worden voorbereid…",
     ],
     [
+        "Lumières indisponibles sur cette carte graphique (voir le journal).",
+        "Lights are unavailable on this graphics card (see the log).",
+        "Luces no disponibles en esta tarjeta gráfica (ver el registro).",
+        "Lichter auf dieser Grafikkarte nicht verfügbar (siehe Protokoll).",
+        "Luci non disponibili su questa scheda grafica (vedi il registro).",
+        "Luzes indisponíveis nesta placa de vídeo (veja o registro).",
+        "Lichten niet beschikbaar op deze videokaart (zie het logboek).",
+    ],
+    [
         "Lumières indisponibles",
         "Lights unavailable",
         "Luces no disponibles",
@@ -1954,6 +1963,15 @@ const TABLE: &[[&str; 7]] = &[
         "Scheda grafica: vedi il registro",
         "Placa gráfica: ver o registo",
         "Grafische kaart: zie het logboek",
+    ],
+    [
+        "Éditeur de lumières : réservé aux OP de ce serveur.",
+        "Light editor: reserved for this server's OPs.",
+        "Editor de luces: reservado a los OP de este servidor.",
+        "Lichteditor: nur für die OPs dieses Servers.",
+        "Editor delle luci: riservato agli OP di questo server.",
+        "Editor de luzes: reservado aos OP deste servidor.",
+        "Lichteditor: alleen voor de OP's van deze server.",
     ],
 ];
 

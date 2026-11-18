@@ -7,10 +7,7 @@ use anyhow::Result;
 use glam::{Mat4, Vec3};
 use minelib_platform::{Input, KeyCode, Mouse};
 
-use minelib_render::{FrameParams, FrameStats, Overlay, Renderer, Ui};
-
-/// Boîte (coins min, max, monde) d'un joueur qui fait de l'ombre.
-type ShadowBox = ([f32; 3], [f32; 3]);
+use minelib_render::{FrameParams, FrameStats, Overlay, Renderer, ShadowBox, Ui};
 
 /// Menu Échap d'une partie FPS : coéquipiers (identifiant, pseudo), pauses tactiques qui
 /// restent, vote possible maintenant.
@@ -297,6 +294,16 @@ pub struct Session {
     /// Lumières placées dans ce monde (éditeur de lumières, touche L) et leurs réglages.
     pub lights: crate::lights::Lights,
     pub light_editor: crate::light_editor::Editor,
+    /// Construction en ligne : l'éditeur de lumières est réservé aux OP du serveur. Demande
+    /// envoyée au relais (la liste des OP ne répond qu'à eux), en attente de sa réponse.
+    light_op_probe: Option<std::time::Instant>,
+    /// Lumières à afficher cette image, et état de leurs shaders (« Préparation des
+    /// lumières… » tant qu'ils compilent).
+    lights_wanted: bool,
+    lights_state: minelib_render::DynState,
+    /// Déjà fait dans cette partie : lumières notées comme utilisées, refus dit au joueur.
+    lights_marked: bool,
+    lights_failed_said: bool,
 }
 
 /// Distance de rendu maximale réglable (chunks).
@@ -501,6 +508,11 @@ impl Session {
             mirror_planes: Vec::new(),
             lights: crate::lights::Lights::load(&minelib_assets::data_dir(), &dir_for_lights),
             light_editor: Default::default(),
+            light_op_probe: None,
+            lights_wanted: false,
+            lights_state: minelib_render::DynState::Off,
+            lights_marked: false,
+            lights_failed_said: false,
         })
     }
 
@@ -661,9 +673,10 @@ impl Session {
             }
             let naming = self.light_editor.editing_name;
             if !typing && !fps_now && !naming && self.keys.pressed(input, Action::LightEditor) {
-                self.light_editor.toggle();
                 if self.light_editor.open {
-                    self.inventory.close();
+                    self.light_editor.close();
+                } else {
+                    self.open_light_editor();
                 }
             }
             if self.light_editor.open
@@ -1293,6 +1306,22 @@ impl Session {
                 self.lights.frame_lights()
             };
             renderer.set_dyn_lights(&list, &self.lights.settings.render);
+            self.lights_wanted = !list.is_empty();
+            self.lights_state = renderer.dyn_stats().state;
+            if self.lights_wanted && !self.lights_marked {
+                self.lights_marked = true;
+                crate::lights::mark_used(&minelib_assets::data_dir());
+            }
+            if self.lights_wanted
+                && self.lights_state == minelib_render::DynState::Failed
+                && !self.lights_failed_said
+            {
+                self.lights_failed_said = true;
+                self.chat.say(
+                    "Lumières indisponibles sur cette carte graphique (voir le journal).",
+                    chat::RED,
+                );
+            }
         }
         {
             let _s = perf::scope("grille raytracing");
@@ -2388,6 +2417,56 @@ impl Session {
         self.vox_origin = Some(origin);
         self.vox_dirty = false;
         self.vox_timer = 0.25;
+    }
+
+    /// Ouvre l'éditeur de lumières (touche L, `/lumieres`). Pas en mode FPS. En
+    /// construction en ligne, il est réservé aux OP du serveur : on demande d'abord la liste
+    /// des OP au relais, qui ne la donne qu'à eux, et l'éditeur s'ouvre à sa réponse (voir
+    /// `light_op_answer`). La caméra libre de l'éditeur ne sert donc pas à espionner.
+    fn open_light_editor(&mut self) {
+        if self.game.mode == GameMode::Fps {
+            self.chat.say("Pas de lumières en mode FPS.", chat::RED);
+            return;
+        }
+        if self.build.is_some() {
+            // Déjà demandé (réponse en route) : pas une deuxième fois.
+            if self
+                .light_op_probe
+                .is_some_and(|t| t.elapsed().as_secs_f32() < 5.0)
+            {
+                return;
+            }
+            self.light_op_probe = Some(std::time::Instant::now());
+            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                action: minelib_net::proto::SERVER_LIST,
+                pseudo: String::new(),
+                reason: String::new(),
+            });
+            return;
+        }
+        self.light_editor.open = true;
+        self.inventory.close();
+    }
+
+    /// Réponse du relais à la demande de `open_light_editor` (`op` : on est OP du serveur).
+    /// Renvoie vrai si c'était bien elle (son texte n'est alors pas affiché tel quel).
+    pub fn light_op_answer(&mut self, op: bool) -> bool {
+        let Some(asked) = self.light_op_probe.take() else {
+            return false;
+        };
+        if asked.elapsed().as_secs_f32() > 10.0 {
+            return false;
+        }
+        if !op {
+            self.chat.say(
+                "Éditeur de lumières : réservé aux OP de ce serveur.",
+                chat::RED,
+            );
+        } else if self.build.is_some() && self.game.mode != GameMode::Fps {
+            self.light_editor.open = true;
+            self.inventory.close();
+        }
+        true
     }
 
     /// Position de la caméra libre de l'éditeur de lumières, sinon les yeux du joueur.
@@ -4200,13 +4279,7 @@ impl Session {
                         chat::YELLOW,
                     );
                 }
-                _ if self.game.mode == GameMode::Fps => {
-                    self.chat.say("Pas de lumières en mode FPS.", chat::RED);
-                }
-                _ => {
-                    self.light_editor.open = true;
-                    self.inventory.close();
-                }
+                _ => self.open_light_editor(),
             },
             "help" | "aide" | "?" => {
                 for l in [
@@ -5221,6 +5294,24 @@ impl Session {
             self.inventory.draw(ui, size, input.cursor);
         }
         self.draw_pings(ui, size);
+        // Shaders des lumières en cours de compilation (au lancement du jeu) : les
+        // lumières arrivent dans quelques secondes. L'éditeur le dit lui-même.
+        if self.lights_wanted
+            && self.lights_state == minelib_render::DynState::Compiling
+            && !self.light_editor.open
+        {
+            let t = minelib_render::tr("Préparation des lumières…");
+            let tw = Ui::text_width(&t, s);
+            let (x, y) = ((size.0 - tw) / 2.0, 6.0 * s);
+            ui.rect(
+                x - 3.0 * s,
+                y - 2.0 * s,
+                tw + 6.0 * s,
+                12.0 * s,
+                [0.0, 0.0, 0.0, 0.45],
+            );
+            ui.text(x, y, s, [1.0, 0.85, 0.35, 1.0], t);
+        }
         self.chat.draw(ui, size);
     }
 
@@ -5536,7 +5627,7 @@ impl Session {
             a.0.distance_squared(cam)
                 .total_cmp(&b.0.distance_squared(cam))
         });
-        let shadow_boxes: Vec<([f32; 3], [f32; 3])> = shadows
+        let shadow_boxes: Vec<ShadowBox> = shadows
             .into_iter()
             .flat_map(|s| s.1)
             .take(minelib_render::MAX_SHADOW_BOXES)
@@ -5601,8 +5692,11 @@ impl Session {
             let (v, gen) = f.current();
             statics.push((u64::MAX, v, gen));
         }
-        let screens: Vec<(u32, minelib_render::ScreenAnchor)> =
-            self.shown.iter().map(|s| (s.0.id(), s.0.anchor())).collect();
+        let screens: Vec<(u32, minelib_render::ScreenAnchor)> = self
+            .shown
+            .iter()
+            .map(|s| (s.0.id(), s.0.anchor()))
+            .collect();
         renderer.set_screens(&screens);
         for (id, _) in &screens {
             if let Some((version, w, h, pixels)) = self.displays.frame(*id) {

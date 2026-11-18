@@ -269,8 +269,10 @@ pub(crate) struct GpuHeader {
     sh: [f32; 4],
     surf: [f32; 4],
     misc: [f32; 4],
-    box_min: [[f32; 4]; MAX_BOXES],
-    box_max: [[f32; 4]; MAX_BOXES],
+    /// Boîtes exactes des joueurs : lignes de la matrice monde → cube unité.
+    box_x: [[f32; 4]; MAX_BOXES],
+    box_y: [[f32; 4]; MAX_BOXES],
+    box_z: [[f32; 4]; MAX_BOXES],
 }
 
 #[repr(C)]
@@ -988,33 +990,6 @@ pub(crate) fn light_pipes(
         push_constant_ranges: &[],
     });
     let bake_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/shadow_bake.wgsl"));
-    let bake = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("ombres des lumières : calcul"),
-        layout: Some(&bake_layout),
-        vertex: wgpu::VertexState {
-            module: &bake_shader,
-            entry_point: Some("vs_bake"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        primitive: Default::default(),
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: ATLAS_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Always,
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: Default::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: &bake_shader,
-            entry_point: Some("fs_bake"),
-            compilation_options: Default::default(),
-            targets: &[],
-        }),
-        multiview: None,
-        cache: None,
-    });
     // Volumétrique : la marche lit la scène (groupe 1) et les lumières (groupe 0 du monde) ;
     // la recomposition a son propre groupe.
     let src = with_dynlights(include_str!("shaders/volumetric.wgsl"));
@@ -1027,15 +1002,6 @@ pub(crate) fn light_pipes(
         bind_group_layouts: &[world_bgl, vl_bgl],
         push_constant_ranges: &[],
     });
-    let march = fullscreen_pipeline(
-        device,
-        "volumétrique",
-        &layout,
-        &shader,
-        "fs_vl",
-        VL_FORMAT,
-        None,
-    );
     let comp_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/vl_composite.wgsl"));
     let comp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("volumétrique : recomposition"),
@@ -1047,23 +1013,75 @@ pub(crate) fn light_pipes(
         dst_factor: wgpu::BlendFactor::One,
         operation: wgpu::BlendOperation::Add,
     };
-    let composite = fullscreen_pipeline(
-        device,
-        "volumétrique : recomposition",
-        &comp_layout,
-        &comp_shader,
-        "fs_composite",
-        COLOR_FORMAT,
-        Some(wgpu::BlendState {
-            color: add,
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::Zero,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
+    // Les trois pipelines en même temps, chacun sur son fil (compilation lente sous
+    // DirectX).
+    std::thread::scope(|sc| {
+        let bake = sc.spawn(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ombres des lumières : calcul"),
+                layout: Some(&bake_layout),
+                vertex: wgpu::VertexState {
+                    module: &bake_shader,
+                    entry_point: Some("vs_bake"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: ATLAS_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &bake_shader,
+                    entry_point: Some("fs_bake"),
+                    compilation_options: Default::default(),
+                    targets: &[],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        });
+        let march = sc.spawn(|| {
+            fullscreen_pipeline(
+                device,
+                "volumétrique",
+                &layout,
+                &shader,
+                "fs_vl",
+                VL_FORMAT,
+                None,
+            )
+        });
+        let composite = sc.spawn(|| {
+            fullscreen_pipeline(
+                device,
+                "volumétrique : recomposition",
+                &comp_layout,
+                &comp_shader,
+                "fs_composite",
+                COLOR_FORMAT,
+                Some(wgpu::BlendState {
+                    color: add,
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Zero,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+            )
+        });
+        (
+            bake.join().expect("pipeline des ombres des lumières"),
+            VlPipes {
+                march: march.join().expect("pipeline volumétrique"),
+                composite: composite.join().expect("pipeline de recomposition"),
             },
-        }),
-    );
-    (bake, VlPipes { march, composite })
+        )
+    })
 }
 
 fn fullscreen_pipeline(
@@ -1481,12 +1499,17 @@ impl DynGpu {
         ]
     }
 
-    /// Lumières et réglages de la prochaine image.
-    pub fn set(&mut self, lights: &[DynLight], settings: &DynSettings) {
-        self.lights.clear();
-        self.lights
-            .extend(lights.iter().take(MAX_DYN_LIGHTS).copied());
-        self.settings = *settings;
+    /// Lumières et réglages de la prochaine image. Renvoie vrai si quelque chose a changé
+    /// depuis l'image précédente (lumière déplacée, réglée, ajoutée ou retirée).
+    pub fn set(&mut self, lights: &[DynLight], settings: &DynSettings) -> bool {
+        let lights = &lights[..lights.len().min(MAX_DYN_LIGHTS)];
+        let changed = self.lights.as_slice() != lights || self.settings != *settings;
+        if changed {
+            self.lights.clear();
+            self.lights.extend_from_slice(lights);
+            self.settings = *settings;
+        }
+        changed
     }
 
     /// Des lumières à dessiner cette image ?
@@ -1530,7 +1553,7 @@ impl DynGpu {
         queue: &wgpu::Queue,
         view_proj: Mat4,
         eye: Vec3,
-        boxes: &[([f32; 3], [f32; 3])],
+        boxes: &[crate::ShadowBox],
         time: f32,
         voxels: Option<[i32; 3]>,
     ) -> u32 {
@@ -1637,8 +1660,8 @@ impl DynGpu {
             let mut mask = 0u64;
             if box_shadows && l.shadows {
                 let (c, r) = (Vec3::from(l.pos), l.range);
-                for (k, (a, b)) in boxes.iter().take(nboxes).enumerate() {
-                    if box_touches_sphere(*a, *b, c, r) {
+                for (k, b) in boxes.iter().take(nboxes).enumerate() {
+                    if box_touches_sphere(b.min, b.max, c, r) {
                         mask |= 1 << k;
                     }
                 }
@@ -1678,11 +1701,11 @@ impl DynGpu {
         if box_shadows {
             flags |= F_BOX_SHADOWS;
         }
-        let mut box_min = [[0.0; 4]; MAX_BOXES];
-        let mut box_max = [[0.0; 4]; MAX_BOXES];
-        for (k, (a, b)) in boxes.iter().take(nboxes).enumerate() {
-            box_min[k] = [a[0], a[1], a[2], 0.0];
-            box_max[k] = [b[0], b[1], b[2], 0.0];
+        let mut box_x = [[0.0; 4]; MAX_BOXES];
+        let mut box_y = [[0.0; 4]; MAX_BOXES];
+        let mut box_z = [[0.0; 4]; MAX_BOXES];
+        for (k, b) in boxes.iter().take(nboxes).enumerate() {
+            [box_x[k], box_y[k], box_z[k]] = b.to_unit;
         }
         // Vitesses arrondies au quart : le bruit reprend sa place quand le temps repart à 0
         // (toutes les heures).
@@ -1725,8 +1748,9 @@ impl DynGpu {
                 nboxes as f32,
                 0.0,
             ],
-            box_min,
-            box_max,
+            box_x,
+            box_y,
+            box_z,
         };
         queue.write_buffer(&self.header, 0, bytemuck::bytes_of(&header));
         if !self.gpu_lights.is_empty() {

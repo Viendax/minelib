@@ -3,8 +3,8 @@
 //! original dessiné pixel par pixel. Les bras et les jambes se balancent en marchant, la
 //! tête suit le regard, le corps se penche quand on s'accroupit.
 
-use glam::{Mat4, Vec3};
-use minelib_render::{EntityVertex, RayBox, RayBoxKind};
+use glam::{Mat4, Vec3, Vec4};
+use minelib_render::{EntityVertex, RayBox, RayBoxKind, ShadowBox};
 use minelib_world::BlockId;
 
 /// Taille d'un pixel du skin, en blocs (32 pixels = hauteur du joueur).
@@ -353,31 +353,34 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     out
 }
 
-/// Boîtes (coins min, max, monde) qui font l'ombre du joueur : jambes, corps, bras,
-/// tête.
-pub fn shadow_boxes(pose: &Pose) -> Vec<([f32; 3], [f32; 3])> {
-    let mut out: Vec<([f32; 3], [f32; 3])> = Vec::with_capacity(5);
-    for (i, (xf, mn, mx, _)) in parts(pose).into_iter().enumerate() {
-        let mut lo = Vec3::splat(f32::MAX);
-        let mut hi = Vec3::splat(f32::MIN);
-        for k in 0..8 {
-            let c = Vec3::new(
-                if k & 1 == 0 { mn[0] } else { mx[0] },
-                if k & 2 == 0 { mn[1] } else { mx[1] },
-                if k & 4 == 0 { mn[2] } else { mx[2] },
-            );
-            let w = xf.transform_point3(c);
-            lo = lo.min(w);
-            hi = hi.max(w);
+/// Morceaux qui font l'ombre du joueur : jambes, corps, bras, tête, chacun avec sa boîte
+/// exacte (tournée avec lui). Les deux jambes ne font qu'une boîte quand elles sont
+/// parallèles (joueur immobile).
+pub fn shadow_boxes(pose: &Pose) -> Vec<ShadowBox> {
+    let parts = parts(pose);
+    let mut out: Vec<ShadowBox> = Vec::with_capacity(parts.len());
+    let mut i = 0;
+    while i < parts.len() {
+        let (xf, mn, mx, part) = parts[i];
+        let (mut lo, mut hi) = (Vec3::from(mn), Vec3::from(mx));
+        if part == Part::Leg {
+            if let Some(&(xf2, mn2, mx2, Part::Leg)) = parts.get(i + 1) {
+                // L'autre jambe vue du repère de la première : une simple translation
+                // quand elles sont parallèles.
+                let rel = xf.inverse() * xf2;
+                let parallel = [rel.x_axis, rel.y_axis, rel.z_axis]
+                    .into_iter()
+                    .zip([Vec4::X, Vec4::Y, Vec4::Z])
+                    .all(|(a, b)| a.abs_diff_eq(b, 1e-4));
+                if parallel {
+                    lo = lo.min(rel.transform_point3(Vec3::from(mn2)));
+                    hi = hi.max(rel.transform_point3(Vec3::from(mx2)));
+                    i += 1;
+                }
+            }
         }
-        // Les deux jambes ensemble (une seule boîte).
-        if i == 1 {
-            let l = &mut out[0];
-            l.0 = Vec3::from(l.0).min(lo).into();
-            l.1 = Vec3::from(l.1).max(hi).into();
-        } else {
-            out.push((lo.into(), hi.into()));
-        }
+        out.push(ShadowBox::oriented(xf, lo, hi));
+        i += 1;
     }
     out
 }
@@ -775,6 +778,93 @@ mod tests {
             !eye_z.is_empty() && eye_z.iter().all(|&z| z < 5.0),
             "{eye_z:?}"
         );
+    }
+    /// Même essai que `dl_box_shadow` (dynlights.wgsl) : le segment `p` → `light`
+    /// traverse-t-il une boîte (hors boîtes qui contiennent `p`) ?
+    fn shadowed(boxes: &[ShadowBox], p: Vec3, light: Vec3) -> bool {
+        boxes.iter().any(|b| {
+            let row = |i: usize, q: Vec3| Vec4::from(b.to_unit[i]).dot(q.extend(1.0));
+            let a = Vec3::new(row(0, p), row(1, p), row(2, p));
+            let d = Vec3::new(row(0, light), row(1, light), row(2, light)) - a;
+            let inside = a.cmpgt(Vec3::ZERO).all() && a.cmplt(Vec3::ONE).all();
+            let inv = Vec3::select(
+                d.abs().cmplt(Vec3::splat(1e-6)),
+                Vec3::splat(1e6),
+                d.recip(),
+            );
+            let (t0, t1) = (-a * inv, (Vec3::ONE - a) * inv);
+            let near = t0.min(t1).max_element();
+            let far = t0.max(t1).min_element();
+            !inside && far >= near.max(0.0) && near < 1.0
+        })
+    }
+
+    #[test]
+    fn the_head_shadows_the_shoulders_exactly_whatever_the_yaw() {
+        for yaw_deg in [0.0f32, 30.0, 45.0, 135.0] {
+            let yaw = yaw_deg.to_radians();
+            let pose = Pose {
+                feet: Vec3::new(10.0, 64.0, 5.0),
+                yaw,
+                pitch: 0.0,
+                walk: 0.0,
+                swing: 0.0,
+                crouch: 0.0,
+                light: [1.0; 3],
+                held: None,
+                skin: None,
+            };
+            let boxes = shadow_boxes(&pose);
+            // Immobile : les deux jambes ne font qu'une boîte.
+            assert_eq!(boxes.len(), 5);
+            // Repère du modèle (pixels) → monde ; l'avant est −z.
+            let base = Mat4::from_translation(pose.feet)
+                * Mat4::from_rotation_y(-yaw)
+                * Mat4::from_scale(Vec3::splat(PX));
+            let at = |x: f32, y: f32, z: f32| base.transform_point3(Vec3::new(x, y, z));
+            // Lumière devant et au-dessus (45°), à 3 blocs.
+            let light = at(0.0, 24.0, -2.0)
+                + (at(0.0, 24.0, -10.0) - at(0.0, 24.0, -2.0)).normalize() * 2.1
+                + Vec3::Y * 2.1;
+            // Devant du torse (z = −2), décollé comme dans le shader (0,02 bloc).
+            let off = (at(0.0, 0.0, -1.0) - at(0.0, 0.0, 0.0)).normalize() * 0.02;
+            // Juste sous le menton : la tête dépasse de 2 pixels, l'ombre y tombe.
+            assert!(
+                shadowed(&boxes, at(0.0, 23.0, -2.0) + off, light),
+                "menton, {yaw_deg}°"
+            );
+            // Plus bas sur le torse et sur les côtés : rien (avant : un triangle).
+            for (x, y) in [(0.0, 18.0), (-3.0, 21.0), (3.0, 21.0), (0.0, 14.0)] {
+                assert!(
+                    !shadowed(&boxes, at(x, y, -2.0) + off, light),
+                    "torse ({x}, {y}), {yaw_deg}°"
+                );
+            }
+            // Le dessus de l'épaule gauche, lumière au-dessus de l'épaule droite : la tête
+            // lui fait de l'ombre ; lumière juste au-dessus d'elle : non.
+            let shoulder = at(-6.0, 24.0, 0.0) + Vec3::Y * 0.02;
+            assert!(
+                shadowed(&boxes, shoulder, at(10.0, 40.0, 0.0)),
+                "épaule, {yaw_deg}°"
+            );
+            assert!(
+                !shadowed(&boxes, shoulder, at(-6.0, 60.0, 0.0)),
+                "épaule, {yaw_deg}°"
+            );
+        }
+        // En marchant, les jambes ne sont plus parallèles : une boîte chacune.
+        let walking = Pose {
+            feet: Vec3::ZERO,
+            yaw: 0.3,
+            pitch: 0.0,
+            walk: 1.2,
+            swing: 1.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: None,
+            skin: None,
+        };
+        assert_eq!(shadow_boxes(&walking).len(), 6);
     }
 }
 

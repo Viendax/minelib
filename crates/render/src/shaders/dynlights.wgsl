@@ -47,8 +47,11 @@ struct DynHeader {
     surf: vec4<f32>,
     // x = numéro de l'image (tramage), y = métamorphose du bruit, z = nombre de boîtes.
     misc: vec4<f32>,
-    box_min: array<vec4<f32>, 48>,
-    box_max: array<vec4<f32>, 48>,
+    // Boîtes exactes des joueurs (tournées avec eux) : lignes de la matrice qui ramène le
+    // monde au cube unité de chaque boîte.
+    box_x: array<vec4<f32>, 48>,
+    box_y: array<vec4<f32>, 48>,
+    box_z: array<vec4<f32>, 48>,
 };
 
 @group(0) @binding(7) var<uniform> dh: DynHeader;
@@ -259,8 +262,8 @@ fn dl_shadow(L: DynLight, p: vec3<f32>, n: vec3<f32>, noise: f32, soft: bool) ->
 /// Ombre d'un joueur (boîtes à portée de la lumière) sur le trajet `p` → lumière : 1 si
 /// caché, 0 sinon.
 fn dl_box_shadow(L: DynLight, p: vec3<f32>) -> f32 {
-    let to_l = L.pos_range.xyz - p;
-    let inv = 1.0 / select(to_l, vec3<f32>(1e-6), abs(to_l) < vec3<f32>(1e-6));
+    let p4 = vec4<f32>(p, 1.0);
+    let l4 = vec4<f32>(L.pos_range.xyz, 1.0);
     var hit = 0.0;
     for (var w = 0u; w < 2u; w++) {
         var bits = select(L.boxes.y, L.boxes.x, w == 0u);
@@ -271,12 +274,19 @@ fn dl_box_shadow(L: DynLight, p: vec3<f32>) -> f32 {
             let b = firstTrailingBit(bits);
             bits = bits & (bits - 1u);
             let k = w * 32u + b;
-            let mn = dh.box_min[k].xyz;
-            let mx = dh.box_max[k].xyz;
+            // Segment point → lumière dans le cube unité de la boîte (même paramètre t :
+            // la matrice est affine). La boîte tourne avec le morceau de joueur : l'ombre
+            // de la tête tombe juste sur les épaules, pas en triangle sur le torse.
+            let rx = dh.box_x[k];
+            let ry = dh.box_y[k];
+            let rz = dh.box_z[k];
+            let a = vec3<f32>(dot(rx, p4), dot(ry, p4), dot(rz, p4));
+            let d = vec3<f32>(dot(rx, l4), dot(ry, l4), dot(rz, l4)) - a;
+            let inv = 1.0 / select(d, vec3<f32>(1e-6), abs(d) < vec3<f32>(1e-6));
             // Point dans la boîte (pieds du joueur) : pas d'ombre sur lui-même.
-            let inside = all(p > mn) && all(p < mx);
-            let t0 = (mn - p) * inv;
-            let t1 = (mx - p) * inv;
+            let inside = all(a > vec3<f32>(0.0)) && all(a < vec3<f32>(1.0));
+            let t0 = -a * inv;
+            let t1 = (vec3<f32>(1.0) - a) * inv;
             let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
             let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
             if !inside && far >= max(near, 0.0) && near < 1.0 {
