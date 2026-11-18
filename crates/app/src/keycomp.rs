@@ -17,6 +17,25 @@
 //! Le retard compensé est le bas de ce qui a été mesuré (voir `estimate`) : le joueur n'est
 //! presque jamais ramené plus loin que là où il a lâché, et il reste en moyenne quelques
 //! centièmes de seconde d'avance, comme le freinage normal.
+//!
+//! (v182) « Courir » sert de repère. Cette touche-là remonte bien : quand le joueur lâche
+//! tout d'un coup, son relâchement dit à quel instant les doigts se sont levés. C'était la
+//! bonne idée de la règle « touche lente » (qui arrêtait le joueur à cet instant, et lui
+//! faisait dire qu'il ne sentait plus la différence avec un clavier normal) ; son défaut
+//! était d'arrêter aussi celui qui gardait « avancer ». Ici :
+//! - « avancer » relâchée dans la fenêtre du retard après « courir » : il est ramené là où
+//!   il était quand « courir » a été lâchée, quel qu'ait été le retard cette fois-là. La
+//!   fenêtre grandit avec la durée de l'appui (`window`) : en jeu, après une longue course,
+//!   la touche traîne bien plus que dans le test (421 ms après 12 s, 976 ms après 17 s le
+//!   18 novembre en v181, où seuls 122 ms étaient repris : « horrible sur les appuis
+//!   longs ») ;
+//! - pendant cette fenêtre il n'est jamais arrêté, seulement ralenti (au plus jusqu'à
+//!   `MIN_FACTOR` de sa vitesse), pour qu'il reste peu à lui reprendre ; et d'autant moins
+//!   ralenti qu'il a l'habitude de continuer en marchant (ses 8 dernières fois, les
+//!   courses longues comptées à part), pas du tout après un appui de moins d'une seconde
+//!   ni quand il tapote « courir » ;
+//! - passé la fenêtre, tout redevient normal (et le retard fixe vaut pour un relâchement
+//!   plus tardif, ou sans « courir »).
 
 use std::collections::VecDeque;
 
@@ -33,8 +52,30 @@ const HOLD_FROM: f32 = 1.0;
 const HOLD_FULL: f32 = 1.5;
 /// Le retour se fait en ce temps (s).
 const SMOOTH_S: f32 = 0.1;
+/// … plus ce temps par bloc à rendre (5 blocs : 0,2 s).
+const SMOOTH_PER_BLOCK: f32 = 0.02;
+/// Fenêtre après « courir » relâchée (« avancer » relâchée dedans, c'est tout lâché
+/// ensemble), en multiple du retard réglé : `WINDOW_X` fois, plus `WINDOW_PER_S` par seconde
+/// d'appui, `WINDOW_MAX` secondes au plus. Avec 0,122 s : 0,31 s après 1,5 s d'appui,
+/// 0,47 s après 5 s, 0,79 s après 12 s, 1 s après 17 s, 1,5 s à partir de 28 s (les écarts
+/// des parties du joueur : 9 sur 10 sous 0,2 s après 1 à 3 s d'appui, sous 0,5 s après 3 à
+/// 8 s, sous 0,95 s après 8 à 30 s). Appui bref : `WINDOW_SHORT` s, sans ralentir.
+const WINDOW_X: f32 = 2.0;
+const WINDOW_PER_S: f32 = 0.37;
+const WINDOW_MAX: f32 = 1.5;
+const WINDOW_SHORT: f32 = 0.1;
+/// Dans cette fenêtre, la vitesse vers l'avant ne descend jamais sous cette part.
+pub const MIN_FACTOR: f32 = 0.15;
+/// Appui (s) à partir duquel une course est « longue » (habitudes comptées à part).
+const LONG_RUN: f32 = 3.0;
+/// « Courir » reprise moins de ce temps (s) après avoir été lâchée : le joueur la tapote,
+/// il n'est plus ralenti pendant `TAPPING_S` secondes (comme dans `stick`).
+const TAP_MAX: f32 = 0.28;
+const TAPPING_S: f32 = 20.0;
+/// Fins de course retenues pour savoir s'il s'arrête ou continue d'habitude.
+const HISTORY: usize = 8;
 /// Chemin gardé en mémoire (s), et retard compensé au plus (s).
-const KEEP_S: f32 = 0.6;
+const KEEP_S: f32 = 1.7;
 pub const MAX_LAG: f32 = 0.5;
 /// Écart normal (ms) entre une touche saine et le clic lâchés « ensemble », quand le test
 /// n'a pas assez d'appuis brefs pour le mesurer.
@@ -123,12 +164,40 @@ pub struct Nudge {
     pub lift: f32,
 }
 
+/// Depuis « courir » lâchée avec « avancer » encore annoncée tenue.
+#[derive(Clone, Copy)]
+struct Since {
+    /// Temps écoulé (s) et pas faits depuis.
+    t: f32,
+    steps: usize,
+    /// Part de l'appui qui compte (0 : appui bref, la touche remonte bien : pas ralenti).
+    ramp: f32,
+    /// Fenêtre (s), et course longue (pour les habitudes).
+    window: f32,
+    long: bool,
+}
+
+/// Fenêtre (s) après « courir » relâchée, pour un retard réglé `lag` et un appui de `held` s.
+fn window(lag: f32, held: f32) -> f32 {
+    let ramp = ((held - HOLD_FROM) / (HOLD_FULL - HOLD_FROM)).clamp(0.0, 1.0);
+    let full = (lag * (WINDOW_X + WINDOW_PER_S * held)).min(WINDOW_MAX);
+    WINDOW_SHORT + (full - WINDOW_SHORT).max(0.0) * ramp
+}
+
 /// Compensation en cours de partie.
 #[derive(Default)]
 pub struct Comp {
     steps: VecDeque<Step>,
     held: f32,
     was: bool,
+    run_was: bool,
+    /// « Courir » lâchée, « avancer » encore annoncée tenue.
+    since_run: Option<Since>,
+    /// Il tapote « courir » : plus ralenti pendant ce temps (s).
+    tapping: f32,
+    /// Dernières fois où « courir » a été lâchée avant « avancer » : arrêté (vrai) ou a
+    /// continué en marchant.
+    outcomes: [VecDeque<bool>; 2],
     /// Retour en cours : ce qu'il reste à rendre, et la part de chaque pas.
     left: Vec3,
     rate: Vec3,
@@ -143,8 +212,36 @@ impl Comp {
         lag * ((held - HOLD_FROM) / (HOLD_FULL - HOLD_FROM)).clamp(0.0, 1.0)
     }
 
+    /// Part de fois où le joueur s'arrête après avoir lâché « courir » (ses dernières
+    /// fois ; une sur deux tant qu'on n'en sait rien).
+    fn stops(&self, long: bool) -> f32 {
+        let o = &self.outcomes[long as usize];
+        let n = o.iter().filter(|s| **s).count() as f32;
+        (n + 1.0) / (o.len() as f32 + 2.0)
+    }
+
+    fn note(&mut self, long: bool, stopped: bool) {
+        let o = &mut self.outcomes[long as usize];
+        o.push_back(stopped);
+        if o.len() > HISTORY {
+            o.pop_front();
+        }
+    }
+
+    /// Part de la vitesse vers l'avant à garder au prochain pas (1 : toute). Moins de 1
+    /// seulement dans la fenêtre qui suit « courir » relâchée après un appui long, jamais
+    /// sous `MIN_FACTOR`.
+    pub fn factor(&self) -> f32 {
+        match self.since_run {
+            Some(s) if self.tapping <= 0.0 => {
+                1.0 - (1.0 - MIN_FACTOR) * self.stops(s.long) * s.ramp
+            }
+            _ => 1.0,
+        }
+    }
+
     /// Un pas de simulation (`dt` secondes) vient d'être fait : « avancer » tenue (`fwd`),
-    /// direction du regard, déplacement du joueur pendant ce pas, hauteur de ses pieds et
+    /// « courir » tenue (`run`), direction du regard, déplacement du joueur pendant ce pas, hauteur de ses pieds et
     /// appui au sol, chute en cours. `lag` : retard de la touche (0 : aucune compensation).
     /// Renvoie ce qu'il faut rendre au joueur maintenant.
     #[allow(clippy::too_many_arguments)]
@@ -153,6 +250,7 @@ impl Comp {
         dt: f32,
         lag: f32,
         fwd: bool,
+        run: bool,
         yaw: f32,
         moved: Vec3,
         feet_y: f32,
@@ -160,12 +258,33 @@ impl Comp {
         falling: bool,
     ) -> Nudge {
         let mut out = Nudge::default();
+        self.tapping = (self.tapping - dt).max(0.0);
         if fwd {
             if !self.was {
                 // Nouvel appui : c'est voulu, plus rien à rendre.
                 self.held = 0.0;
                 self.left = Vec3::ZERO;
                 self.steps.clear();
+                self.since_run = None;
+            }
+            if lag > 0.0 && self.run_was && !run {
+                // « Courir » lâchée : si « avancer » suit dans la fenêtre, tout a été
+                // lâché ici.
+                let ramp = ((self.held - HOLD_FROM) / (HOLD_FULL - HOLD_FROM)).clamp(0.0, 1.0);
+                self.since_run = Some(Since {
+                    t: 0.0,
+                    steps: 0,
+                    ramp,
+                    window: window(lag, self.held),
+                    long: self.held >= LONG_RUN,
+                });
+            } else if run && !self.run_was {
+                if let Some(s) = self.since_run.take() {
+                    if s.t < TAP_MAX {
+                        self.tapping = TAPPING_S;
+                    }
+                    self.note(s.long, false);
+                }
             }
             self.held += dt;
             let (s, c) = yaw.sin_cos();
@@ -179,15 +298,33 @@ impl Comp {
             while self.steps.len() as f32 * dt > KEEP_S {
                 self.steps.pop_front();
             }
+            if let Some(s) = self.since_run.as_mut() {
+                s.t += dt;
+                s.steps += 1;
+                if s.t > s.window {
+                    // Toujours tenue passé la fenêtre : il continue en marchant.
+                    let long = s.long;
+                    self.since_run = None;
+                    self.note(long, false);
+                }
+            }
         } else if self.was {
-            // Relâchement annoncé : le doigt s'est levé `lag` plus tôt.
-            let lag = Self::lag_for(lag, self.held);
-            let n = ((lag / dt).round() as usize).min(self.steps.len());
+            // Relâchement annoncé. Dans la fenêtre après « courir » : tout a été lâché à
+            // ce moment-là, c'est là qu'il revient. Sinon le doigt s'est levé `lag` plus tôt.
+            let n = match self.since_run.take() {
+                Some(s) => {
+                    self.note(s.long, true);
+                    s.steps
+                }
+                None => (Self::lag_for(lag, self.held) / dt).round() as usize,
+            }
+            .min(self.steps.len());
             if n > 0 {
                 let from = self.steps.len() - n;
                 let back: Vec3 = self.steps.iter().skip(from).map(|s| s.forward).sum();
                 self.left = -back;
-                self.rate = self.left * (dt / SMOOTH_S).min(1.0);
+                let smooth = SMOOTH_S + SMOOTH_PER_BLOCK * back.length();
+                self.rate = self.left * (dt / smooth).min(1.0);
                 // Au sol quand le doigt s'est levé, en chute maintenant : il est tombé d'un
                 // bord pendant le retard, on l'y remonte.
                 // (État à la fin du pas d'avant : le moment où le doigt s'est levé.)
@@ -202,7 +339,11 @@ impl Comp {
             }
             self.steps.clear();
         }
+        if !fwd {
+            self.since_run = None;
+        }
         self.was = fwd;
+        self.run_was = run;
         if self.left != Vec3::ZERO {
             let step = if self.rate.length_squared() >= self.left.length_squared() {
                 self.left
@@ -236,7 +377,7 @@ mod tests {
             if fwd {
                 *x += speed * DT;
             }
-            let n = c.tick(DT, setting, fwd, 0.0, moved, 10.0, true, false);
+            let n = c.tick(DT, setting, fwd, false, 0.0, moved, 10.0, true, false);
             // (Avancer : vers -z ; `back.z` positif ramène en arrière.)
             *x -= n.back.z;
             assert_eq!(n.lift, 0.0);
@@ -256,8 +397,9 @@ mod tests {
 
     #[test]
     fn the_player_comes_back_to_where_the_finger_lifted() {
-        // Touche qui traîne de 0,2 s après un appui de 5 s, réglage 0,122 s : il reste
-        // 0,08 s de marche (0,34 bloc) au lieu de 0,2 s (0,86 bloc).
+        // « Avancer » lâchée seule (sans « courir »). Touche qui traîne de 0,2 s après un
+        // appui de 5 s, réglage 0,122 s : il reste 0,08 s de marche (0,34 bloc) au lieu de
+        // 0,2 s (0,86 bloc).
         let mut c = Comp::default();
         let (end, lifted) = run(&mut c, 0.122, 4.3, 5.0, 0.2);
         let over = end - lifted;
@@ -280,20 +422,108 @@ mod tests {
         let step = Vec3::new(0.0, 0.0, -0.1);
         // Tant que la touche est tenue : jamais rien.
         for _ in 0..640 {
-            assert_eq!(c.tick(DT, 0.3, true, 0.0, step, 10.0, true, false), Nudge::default());
+            assert_eq!(c.tick(DT, 0.3, true, false, 0.0, step, 10.0, true, false), Nudge::default());
         }
         // Relâchée : le retour commence ; rappuyée aussitôt : il s'arrête net.
-        let n = c.tick(DT, 0.3, false, 0.0, Vec3::ZERO, 10.0, true, false);
+        let n = c.tick(DT, 0.3, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
         assert!(n.back.z > 0.0, "{n:?}");
-        assert_eq!(c.tick(DT, 0.3, true, 0.0, step, 10.0, true, false), Nudge::default());
+        assert_eq!(c.tick(DT, 0.3, true, false, 0.0, step, 10.0, true, false), Nudge::default());
         // Seul le chemin vers l'avant est repris (pas le déplacement de côté ni en arrière).
         let mut c = Comp::default();
         let side = Vec3::new(0.1, 0.0, 0.0);
         for _ in 0..640 {
-            c.tick(DT, 0.3, true, 0.0, side, 10.0, true, false);
+            c.tick(DT, 0.3, true, false, 0.0, side, 10.0, true, false);
         }
-        let n = c.tick(DT, 0.3, false, 0.0, Vec3::ZERO, 10.0, true, false);
+        let n = c.tick(DT, 0.3, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
         assert_eq!(n, Nudge::default());
+    }
+
+    /// Course (`run_s` s, « courir » tenue), puis « courir » lâchée et « avancer » encore
+    /// annoncée tenue `gap` s (le jeu ralentit comme il le décide), puis relâchée. Renvoie
+    /// le chemin fait après « courir » lâchée, une fois tout rendu, et la plus petite part
+    /// de vitesse appliquée.
+    fn sprint_then(c: &mut Comp, lag: f32, run_s: f32, gap: f32) -> (f32, f32) {
+        let speed = 4.3;
+        let mut x = 0.0f32;
+        let mut least = 1.0f32;
+        let mut go = |c: &mut Comp, fwd: bool, run: bool, x: &mut f32| {
+            let f = if fwd { c.factor() } else { 0.0 };
+            if fwd {
+                least = least.min(f);
+            }
+            let d = speed * DT * f;
+            *x += d;
+            let n = c.tick(DT, lag, fwd, run, 0.0, Vec3::new(0.0, 0.0, -d), 10.0, true, false);
+            *x -= n.back.z;
+        };
+        for _ in 0..(run_s / DT).round() as usize {
+            go(c, true, true, &mut x);
+        }
+        let at = x;
+        for _ in 0..(gap / DT).round() as usize {
+            go(c, true, false, &mut x);
+        }
+        for _ in 0..32 {
+            go(c, false, false, &mut x);
+        }
+        (x - at, least)
+    }
+
+    #[test]
+    fn everything_released_together_stops_where_sprint_was_released() {
+        // « Avancer » annoncée relâchée 100, 200 ou 260 ms après « courir » (retard de la
+        // touche) : le joueur finit là où il était quand « courir » a été lâchée, quel que
+        // soit le retard, et n'a jamais été arrêté entre-temps.
+        // (Après une longue course la touche traîne plus : 421 ms après 12 s, 976 ms après
+        // 17 s dans une partie du joueur.)
+        for (run, gap) in [(5.0, 0.1), (5.0, 0.2), (5.0, 0.4), (12.0, 0.42), (17.0, 0.976)] {
+            let mut c = Comp::default();
+            let (over, least) = sprint_then(&mut c, 0.122, run, gap);
+            assert!(over.abs() < 0.03, "course {run}, retard {gap} : {over} bloc");
+            assert!((MIN_FACTOR..1.0).contains(&least), "{least}");
+        }
+        assert!((window(0.122, 12.0) - 0.79).abs() < 0.01 && window(0.122, 60.0) == 1.5);
+        assert!(window(0.122, 0.5) == WINDOW_SHORT);
+        // Appui de moins d'une seconde : la touche remonte bien, aucun ralentissement.
+        let mut c = Comp::default();
+        let (over, least) = sprint_then(&mut c, 0.122, 0.6, 0.03);
+        assert!(over.abs() < 0.03 && least == 1.0, "{over} {least}");
+        // Sans réglage : rien du tout.
+        let mut c = Comp::default();
+        let (over, least) = sprint_then(&mut c, 0.0, 5.0, 0.2);
+        assert!((over - 0.86).abs() < 0.08 && least == 1.0, "{over} {least}");
+    }
+
+    #[test]
+    fn a_player_who_keeps_walking_is_never_stopped_and_soon_not_even_slowed() {
+        let mut c = Comp::default();
+        // Il lâche « courir » et continue 2 s en marchant : ralenti un quart de seconde au
+        // plus (jamais arrêté), puis toute sa vitesse ; rien ne lui est repris ensuite
+        // au-delà du retard fixe.
+        let (walked, least) = sprint_then(&mut c, 0.122, 5.0, 2.0);
+        assert!(least >= MIN_FACTOR && least < 1.0, "{least}");
+        assert!(walked > 4.3 * (2.0 - 0.48 * (1.0 - least) - 0.14), "{walked}");
+        // À force de continuer, il n'est presque plus ralenti.
+        let mut last = least;
+        for _ in 0..8 {
+            last = sprint_then(&mut c, 0.122, 5.0, 2.0).1;
+        }
+        assert!(last > 0.9, "{last}");
+        // S'il se remet à tout lâcher d'un coup, le ralentissement revient.
+        for _ in 0..8 {
+            last = sprint_then(&mut c, 0.122, 5.0, 0.2).1;
+        }
+        assert!(last < 0.5, "{last}");
+        // Il tapote « courir » (reprise en 0,1 s) : plus aucun ralentissement ensuite.
+        let mut c = Comp::default();
+        let step = Vec3::new(0.0, 0.0, -0.07);
+        for i in 0..640 {
+            // Tenue 5 s, lâchée 0,1 s, reprise…
+            let run = !(320..326).contains(&i);
+            c.tick(DT, 0.122, true, run, 0.0, step, 10.0, true, false);
+        }
+        c.tick(DT, 0.122, true, false, 0.0, step, 10.0, true, false);
+        assert_eq!(c.factor(), 1.0);
     }
 
     #[test]
@@ -301,13 +531,13 @@ mod tests {
         let mut c = Comp::default();
         let step = Vec3::new(0.0, 0.0, -0.07);
         for _ in 0..640 {
-            c.tick(DT, 0.2, true, 0.0, step, 10.0, true, false);
+            c.tick(DT, 0.2, true, false, 0.0, step, 10.0, true, false);
         }
         // Pendant le retard : il quitte le bord et tombe.
         for i in 0..13 {
-            c.tick(DT, 0.2, true, 0.0, step, 10.0 - 0.02 * i as f32, false, true);
+            c.tick(DT, 0.2, true, false, 0.0, step, 10.0 - 0.02 * i as f32, false, true);
         }
-        let n = c.tick(DT, 0.2, false, 0.0, Vec3::ZERO, 9.7, false, true);
+        let n = c.tick(DT, 0.2, false, false, 0.0, Vec3::ZERO, 9.7, false, true);
         // Remonté, et ramené d'un seul coup de tout le chemin du retard (13 pas).
         assert!((n.lift - 0.3).abs() < 0.05, "{n:?}");
         assert!((n.back.z - 13.0 * 0.07).abs() < 0.01, "{n:?}");

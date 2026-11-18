@@ -258,8 +258,9 @@ pub struct Session {
     /// Retard mesuré de la touche « avancer » (`/testtouche`) et sa compensation.
     key_lag: Option<crate::keycomp::Setting>,
     key_comp: crate::keycomp::Comp,
-    /// « Avancer » tenue d'après le clavier (à la dernière image).
+    /// « Avancer » et « courir » tenues d'après le clavier (à la dernière image).
     fwd_key: bool,
+    run_key: bool,
     autosave: f32,
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
@@ -533,6 +534,7 @@ impl Session {
             key_lag: crate::keycomp::load(),
             key_comp: Default::default(),
             fwd_key: false,
+            run_key: false,
             autosave: AUTOSAVE_S,
             hit: None,
             frame_aim: None,
@@ -974,6 +976,7 @@ impl Session {
             }
             let tap_sprint = self.tap_sprint;
             self.fwd_key = self.keys.held(input, Action::Forward);
+            self.run_key = self.keys.held(input, Action::Sprint);
             let keys = &self.keys;
             let axis = |pos: Action, neg: Action| {
                 keys.held(input, pos) as i32 as f32 - keys.held(input, neg) as i32 as f32
@@ -3134,6 +3137,11 @@ impl Session {
             };
             // En ligne (FPS) : les autres joueurs sont solides.
             self.player.others = self.net.as_ref().map_or_else(Vec::new, |n| n.obstacles());
+            // « Courir » vient d'être lâchée après un long appui sur « avancer » : ralenti
+            // (jamais arrêté) le temps de savoir si « avancer » suit (voir `keycomp`).
+            if key_lag > 0.0 && mt.forward > 0.0 {
+                mt.forward *= self.key_comp.factor();
+            }
             let before = self.player.pos;
             self.player.update(&self.world, &mt, SIM_TICK);
             // Touche « avancer » annoncée relâchée en retard : ce qui a été avancé pendant
@@ -3142,6 +3150,7 @@ impl Session {
                 SIM_TICK,
                 key_lag,
                 self.fwd_key && mt.forward > 0.0,
+                self.run_key,
                 self.player.yaw,
                 self.player.pos - before,
                 self.player.pos.y,
