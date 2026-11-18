@@ -261,6 +261,8 @@ pub struct Session {
     /// « Avancer » et « courir » tenues d'après le clavier (à la dernière image).
     fwd_key: bool,
     run_key: bool,
+    /// Mode FPS : il tire ou vise (le chemin dû n'est alors pas rendu, voir `keycomp`).
+    fps_aiming: bool,
     autosave: f32,
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
@@ -535,6 +537,7 @@ impl Session {
             key_comp: Default::default(),
             fwd_key: false,
             run_key: false,
+            fps_aiming: false,
             autosave: AUTOSAVE_S,
             hit: None,
             frame_aim: None,
@@ -975,8 +978,20 @@ impl Session {
                 }
             }
             let tap_sprint = self.tap_sprint;
-            self.fwd_key = self.keys.held(input, Action::Forward);
-            self.run_key = self.keys.held(input, Action::Sprint);
+            self.fwd_key = self.keys.held(
+                input,
+                if fps_mode {
+                    Action::FpsForward
+                } else {
+                    Action::Forward
+                },
+            );
+            // (Mode FPS : « courir » n'y est pas tenue — on ne court pas avec Maj —, elle ne
+            // sert donc pas de repère ; et le ralenti ne passerait pas le réseau.)
+            self.run_key = !fps_mode && self.keys.held(input, Action::Sprint);
+            self.fps_aiming = fps_mode
+                && (self.keys.held(input, Action::FpsFire)
+                    || self.keys.held(input, Action::FpsScope));
             let keys = &self.keys;
             let axis = |pos: Action, neg: Action| {
                 keys.held(input, pos) as i32 as f32 - keys.held(input, neg) as i32 as f32
@@ -3150,16 +3165,23 @@ impl Session {
         };
         self.pending_jump |= m.jump_pressed;
         self.tick_acc = (self.tick_acc + dt).min(SIM_TICK * MAX_TICKS as f32);
-        // Retard mesuré de la touche « avancer » (0 : rien à compenser). Pas en mode FPS ni
-        // dans une partie simulée aussi par un hôte.
+        // Retard mesuré de la touche « avancer » (0 : rien à compenser).
+        let fps_mode = self.game.mode == GameMode::Fps;
+        // (v185) Mode FPS, en ligne ou contre des bots : l'hôte simule le joueur à partir des
+        // entrées, le chemin dû est donc rendu par les entrées (voir `keycomp`), et il n'y a
+        // pas de ralenti d'avance (il ne passerait pas le réseau).
+        let by_input = fps_mode || self.net.is_some();
+        let fwd_action = if fps_mode {
+            Action::FpsForward
+        } else {
+            Action::Forward
+        };
         let key_lag = self
             .key_lag
-            .filter(|s| {
-                s.on && self.game.mode != GameMode::Fps
-                    && self.net.is_none()
-                    && self.keys.get(Action::Forward) == Some(crate::keys::Bind::Key(s.key))
-            })
+            .filter(|s| s.on && self.keys.get(fwd_action) == Some(crate::keys::Bind::Key(s.key)))
             .map_or(0.0, |s| s.lag);
+        // Le joueur peut-il bouger (ni mort, ni figé au départ d'une manche) ?
+        let can_move = !self.net_dead && !self.net.as_ref().is_some_and(|n| n.frozen());
         while self.tick_acc >= SIM_TICK {
             self.prev_pos = self.player.pos;
             self.prev_crouch = self.player.crouch;
@@ -3175,7 +3197,7 @@ impl Session {
             self.player.others = self.net.as_ref().map_or_else(Vec::new, |n| n.obstacles());
             // « Courir » vient d'être lâchée après un long appui sur « avancer » : ralenti
             // (jamais arrêté) le temps de savoir si « avancer » suit (voir `keycomp`).
-            if key_lag > 0.0 && mt.forward > 0.0 {
+            if key_lag > 0.0 && !by_input && mt.forward > 0.0 {
                 let f = self.key_comp.factor();
                 if f < 1.0 {
                     mt.forward *= f;
@@ -3185,6 +3207,16 @@ impl Session {
                     }
                 }
             }
+            // Mode FPS : le chemin dû après le relâchement annoncé en retard est rendu en
+            // demandant « reculer », comme si le joueur l'avait fait — l'hôte reçoit la même
+            // entrée et arrive au même endroit. Sa visée et ses touches passent devant.
+            if key_lag > 0.0 && by_input && self.key_comp.back_input() {
+                if can_move && mt.forward == 0.0 && !self.fps_aiming {
+                    mt.forward = -1.0;
+                } else {
+                    self.key_comp.drop_owed();
+                }
+            }
             let before = self.player.pos;
             self.player.update(&self.world, &mt, SIM_TICK);
             // Touche « avancer » annoncée relâchée en retard : ce qui a été avancé pendant
@@ -3192,7 +3224,12 @@ impl Session {
             let nudge = self.key_comp.tick(
                 SIM_TICK,
                 key_lag,
-                self.fwd_key && mt.forward > 0.0,
+                by_input,
+                // (v185) La touche elle-même, pas l'entrée : en FPS on s'arrête net en
+                // appuyant sur « reculer » sans lâcher « avancer » (contre-strafe), et le
+                // chemin dû ne doit pas être rendu une deuxième fois. Seul le chemin fait
+                // vers l'avant compte de toute façon.
+                self.fwd_key,
                 self.run_key,
                 self.player.yaw,
                 self.player.pos - before,
