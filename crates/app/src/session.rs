@@ -1577,11 +1577,6 @@ impl Session {
                     mark(&o.pseudo, o.pos, o.yaw, o.pitch, o.crouch);
                 }
             }
-            if let Some(c) = &self.crowd {
-                for n in &c.npcs {
-                    mark(&n.name, n.pos, n.yaw, n.pitch, 0.0);
-                }
-            }
             drop(mark);
             self.walks.retain(|_, w| w.stamp == stamp);
             let target = (speed / 4.3).min(1.0);
@@ -6545,6 +6540,7 @@ impl Session {
                 yaw: o.yaw,
                 pitch: o.pitch,
                 crouch: o.crouch,
+                walk: None,
                 covered: None,
             }));
         }
@@ -6555,6 +6551,7 @@ impl Session {
                 yaw: n.yaw,
                 pitch: n.pitch,
                 crouch: 0.0,
+                walk: Some(&n.walk),
                 covered: Some(n.covered),
             }));
         }
@@ -6576,7 +6573,7 @@ impl Session {
             for (rank, &(d2, i)) in order.iter().enumerate() {
                 let o = &others[i as usize];
                 let shadow = rank < 24 && d2 < 48.0 * 48.0;
-                let w = self.walks.get(o.pseudo);
+                let w = o.walk.or_else(|| self.walks.get(o.pseudo));
                 let other = crate::player_model::Pose {
                     feet: o.pos,
                     yaw: o.yaw,
@@ -7361,6 +7358,9 @@ struct Other<'a> {
     yaw: f32,
     pitch: f32,
     crouch: f32,
+    /// (v194) Sa marche quand il la porte lui-même (la foule), sinon cherchée par son
+    /// pseudo.
+    walk: Option<&'a Walk>,
     /// (v191) Abri déjà connu (la foule le garde en mémoire), sinon cherché ici : voir
     /// `sky_light`.
     covered: Option<bool>,
@@ -7381,7 +7381,7 @@ pub struct Walk {
 }
 
 impl Walk {
-    fn new(pos: Vec3) -> Self {
+    pub fn new(pos: Vec3) -> Self {
         Walk {
             prev: crate::player_model::Prev {
                 feet: pos,
@@ -7400,7 +7400,7 @@ impl Walk {
             .unwrap_or_else(|| crate::player_model::Prev::still(pose))
     }
 
-    fn update(&mut self, pos: Vec3, yaw: f32, pitch: f32, crouch: f32, dt: f32) {
+    pub fn update(&mut self, pos: Vec3, yaw: f32, pitch: f32, crouch: f32, dt: f32) {
         let d = pos - self.last;
         self.prev = crate::player_model::Prev {
             feet: self.last,

@@ -34,6 +34,10 @@ pub struct Npc {
     /// Case (x, z) dont la hauteur du sol est connue : on ne la recherche qu'en changeant
     /// de case (des milliers de joueurs : pas de recherche à chaque image).
     cell: (i32, i32),
+    /// (v194) Sa marche (balancement des bras et des jambes, pose de l'image d'avant) :
+    /// portée par lui, et non cherchée par son pseudo dans une table — à 4 000 joueurs
+    /// c'était 8 000 recherches par image, deux fois le hachage de chaque pseudo.
+    pub walk: crate::session::Walk,
     /// (v191) Le ciel est-il bouché au-dessus de lui ? Sa lumière en découle. Cherché en
     /// changeant de case, et repris pour quelques-uns à chaque image (un toit peut être
     /// construit au-dessus d'eux) : parcourir la colonne de blocs de 4 000 joueurs à
@@ -98,6 +102,11 @@ impl Crowd {
         for i in 0..self.npcs.len() {
             self.step(world, center, i, dt);
         }
+        // Leur marche, dans la foulée (voir `Npc::walk`).
+        for n in &mut self.npcs {
+            let (pos, yaw, pitch) = (n.pos, n.yaw, n.pitch);
+            n.walk.update(pos, yaw, pitch, 0.0, dt);
+        }
         // Abri repris pour quelques joueurs par image : tous en une minute environ.
         for _ in 0..RECHECK_PER_FRAME.min(self.npcs.len()) {
             self.recheck = (self.recheck + 1) % self.npcs.len();
@@ -129,6 +138,7 @@ impl Crowd {
         let pos = Vec3::new(x, y, z);
         Some(Npc {
             name,
+            walk: crate::session::Walk::new(pos),
             pos,
             yaw,
             pitch: 0.0,
@@ -167,6 +177,8 @@ impl Crowd {
             if let Some(m) = self.spawn(world, center) {
                 let name = std::mem::take(&mut self.npcs[i].name);
                 self.npcs[i] = Npc { name, ..m };
+                // (v194) Il repart d'ailleurs : sa marche aussi, sinon il arriverait en
+                // courant (et laisserait une traînée d'anticrénelage sur tout le chemin).
                 // (Le pseudo pris par `spawn` n'est pas utilisé.)
                 self.next -= 1;
             }
