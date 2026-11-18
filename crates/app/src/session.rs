@@ -261,8 +261,6 @@ pub struct Session {
     /// « Avancer » et « courir » tenues d'après le clavier (à la dernière image).
     fwd_key: bool,
     run_key: bool,
-    /// Mode FPS : il tire ou vise (le chemin dû n'est alors pas rendu, voir `keycomp`).
-    fps_aiming: bool,
     autosave: f32,
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
@@ -330,7 +328,7 @@ pub struct Session {
     /// tenus à jour pendant le dessin de l'image.
     skin_layers: std::cell::RefCell<crate::player_model::SkinLayers>,
     /// (v165, essai temporaire) Joueurs simulés autour de soi en solo (voir `crowd`), et
-    /// essai voulu (`/foule on|off`).
+    /// essai voulu (v185 : `/npc stresstest true|false`, éteint par défaut).
     crowd: Option<crate::crowd::Crowd>,
     crowd_on: bool,
     /// (v172) Pseudo du joueur (compte connecté ; vide sinon), et partie contre des bots
@@ -537,7 +535,6 @@ impl Session {
             key_comp: Default::default(),
             fwd_key: false,
             run_key: false,
-            fps_aiming: false,
             autosave: AUTOSAVE_S,
             hit: None,
             frame_aim: None,
@@ -573,7 +570,7 @@ impl Session {
             walks: HashMap::new(),
             skin_layers: Default::default(),
             crowd: None,
-            crowd_on: true,
+            crowd_on: false,
             pseudo: String::new(),
             bots_auto: true,
             walk_amp: 0.0,
@@ -978,20 +975,8 @@ impl Session {
                 }
             }
             let tap_sprint = self.tap_sprint;
-            self.fwd_key = self.keys.held(
-                input,
-                if fps_mode {
-                    Action::FpsForward
-                } else {
-                    Action::Forward
-                },
-            );
-            // (Mode FPS : « courir » n'y est pas tenue — on ne court pas avec Maj —, elle ne
-            // sert donc pas de repère ; et le ralenti ne passerait pas le réseau.)
-            self.run_key = !fps_mode && self.keys.held(input, Action::Sprint);
-            self.fps_aiming = fps_mode
-                && (self.keys.held(input, Action::FpsFire)
-                    || self.keys.held(input, Action::FpsScope));
+            self.fwd_key = self.keys.held(input, Action::Forward);
+            self.run_key = self.keys.held(input, Action::Sprint);
             let keys = &self.keys;
             let axis = |pos: Action, neg: Action| {
                 keys.held(input, pos) as i32 as f32 - keys.held(input, neg) as i32 as f32
@@ -1255,6 +1240,27 @@ impl Session {
                 if self.world.touched.is_none() {
                     self.world.touched = Some(Vec::new());
                 }
+                // (v185) En solo, dans chaque chunk qui arrive (et la première fois dans
+                // ceux déjà là), ce que le joueur a changé (fluide posé ou qui a coulé, bloc
+                // retiré) réveille les fluides : rechargée pendant que l'eau séchait, une
+                // partie ne la garde plus pour toujours. En ligne, chacun ne fait couler que
+                // ce qu'il a changé lui-même.
+                if self.build.is_none() {
+                    let fresh = match self.world.fresh.take() {
+                        Some(f) => f,
+                        None => self.world.loaded().collect(),
+                    };
+                    self.world.fresh = Some(Vec::new());
+                    for pos in fresh {
+                        for (p, id) in self.world.edits_in(pos) {
+                            if id == BlockId::AIR || minelib_world::registry::fluid(id).is_some() {
+                                self.fluids.notify(&self.world, p);
+                            }
+                        }
+                    }
+                } else {
+                    self.world.fresh = None;
+                }
                 let touched = self
                     .world
                     .touched
@@ -1266,8 +1272,32 @@ impl Session {
                 }
                 let dirty = self.fluids.update(&mut self.world, dt);
                 self.dirty.extend(dirty);
+                // (v185) Ce que l'eau emporte (torche, redstone, fleur) tombe en objet, en
+                // solo ; en ligne, le bloc part seulement (chacun ferait tomber le sien).
+                for (p, old) in std::mem::take(&mut self.fluids.washed) {
+                    let Some(item) = crate::fluids::washed_item(old) else {
+                        continue;
+                    };
+                    if !self.items.is_local() {
+                        continue;
+                    }
+                    let from = Vec3::new(p[0] as f32 + 0.5, p[1] as f32 + 0.5, p[2] as f32 + 0.5);
+                    let mut y = p[1];
+                    while y > 0 && !self.world.get(p[0], y - 1, p[2]).is_solid() {
+                        y -= 1;
+                    }
+                    let to = Vec3::new(from.x, y as f32, from.z);
+                    let pile = minelib_net::items::Pile {
+                        item: item.code(),
+                        count: 1,
+                    };
+                    self.items.drop_item(from, to, pile);
+                }
+                // (v185) En solo, les objets dans l'eau flottent et suivent le courant.
+                self.items.drift(&self.world, dt);
             } else {
                 self.world.touched = None;
+                self.world.fresh = None;
             }
             // Construction en ligne : blocs changés envoyés au garant, position aux voisins.
             if dt > 0.0 {
@@ -1494,19 +1524,10 @@ impl Session {
             self.hand.update(dt, speed, swung, held);
             // Balancement des bras et des jambes du modèle (vue F5), et des autres joueurs.
             self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
-            // (v165, essai) Foule simulée en solo, hors mode FPS.
+            // (v165, essai) Foule simulée en solo, hors mode FPS. (v185) Seulement si on l'a
+            // demandée (`/npc stresstest true`), et sans message à l'arrivée.
             let solo = self.build.is_none() && self.net.is_none();
             if self.crowd_on && solo && self.game.mode != GameMode::Fps {
-                if self.crowd.is_none() {
-                    self.chat.say(
-                        format!(
-                            "Essai de foule : jusqu'à {} joueurs simulés autour de toi en 2 \
-                             minutes. Dis-moi comment ça tourne ! (/foule off pour l'arrêter)",
-                            crate::crowd::MAX
-                        ),
-                        chat::YELLOW,
-                    );
-                }
                 let c = self.crowd.get_or_insert_with(crate::crowd::Crowd::new);
                 c.update(&self.world, self.player.pos, dt);
             } else {
@@ -3129,23 +3150,16 @@ impl Session {
         };
         self.pending_jump |= m.jump_pressed;
         self.tick_acc = (self.tick_acc + dt).min(SIM_TICK * MAX_TICKS as f32);
-        // Retard mesuré de la touche « avancer » (0 : rien à compenser).
-        let fps_mode = self.game.mode == GameMode::Fps;
-        // (v185) Mode FPS, en ligne ou contre des bots : l'hôte simule le joueur à partir des
-        // entrées, le chemin dû est donc rendu par les entrées (voir `keycomp`), et il n'y a
-        // pas de ralenti d'avance (il ne passerait pas le réseau).
-        let by_input = fps_mode || self.net.is_some();
-        let fwd_action = if fps_mode {
-            Action::FpsForward
-        } else {
-            Action::Forward
-        };
+        // Retard mesuré de la touche « avancer » (0 : rien à compenser). Pas en mode FPS ni
+        // dans une partie simulée aussi par un hôte.
         let key_lag = self
             .key_lag
-            .filter(|s| s.on && self.keys.get(fwd_action) == Some(crate::keys::Bind::Key(s.key)))
+            .filter(|s| {
+                s.on && self.game.mode != GameMode::Fps
+                    && self.net.is_none()
+                    && self.keys.get(Action::Forward) == Some(crate::keys::Bind::Key(s.key))
+            })
             .map_or(0.0, |s| s.lag);
-        // Le joueur peut-il bouger (ni mort, ni figé au départ d'une manche) ?
-        let can_move = !self.net_dead && !self.net.as_ref().is_some_and(|n| n.frozen());
         while self.tick_acc >= SIM_TICK {
             self.prev_pos = self.player.pos;
             self.prev_crouch = self.player.crouch;
@@ -3161,7 +3175,7 @@ impl Session {
             self.player.others = self.net.as_ref().map_or_else(Vec::new, |n| n.obstacles());
             // « Courir » vient d'être lâchée après un long appui sur « avancer » : ralenti
             // (jamais arrêté) le temps de savoir si « avancer » suit (voir `keycomp`).
-            if key_lag > 0.0 && !by_input && mt.forward > 0.0 {
+            if key_lag > 0.0 && mt.forward > 0.0 {
                 let f = self.key_comp.factor();
                 if f < 1.0 {
                     mt.forward *= f;
@@ -3171,16 +3185,6 @@ impl Session {
                     }
                 }
             }
-            // Mode FPS : le chemin dû après le relâchement annoncé en retard est rendu en
-            // demandant « reculer », comme si le joueur l'avait fait — l'hôte reçoit la même
-            // entrée et arrive au même endroit. Sa visée et ses touches passent devant.
-            if key_lag > 0.0 && by_input && self.key_comp.back_input() {
-                if can_move && mt.forward == 0.0 && !self.fps_aiming {
-                    mt.forward = -1.0;
-                } else {
-                    self.key_comp.drop_owed();
-                }
-            }
             let before = self.player.pos;
             self.player.update(&self.world, &mt, SIM_TICK);
             // Touche « avancer » annoncée relâchée en retard : ce qui a été avancé pendant
@@ -3188,12 +3192,7 @@ impl Session {
             let nudge = self.key_comp.tick(
                 SIM_TICK,
                 key_lag,
-                by_input,
-                // (v185) La touche elle-même, pas l'entrée : en FPS on s'arrête net en
-                // appuyant sur « reculer » sans lâcher « avancer » (contre-strafe), et le
-                // chemin dû ne doit pas être rendu une deuxième fois. Seul le chemin fait
-                // vers l'avant compte de toute façon.
-                self.fwd_key,
+                self.fwd_key && mt.forward > 0.0,
                 self.run_key,
                 self.player.yaw,
                 self.player.pos - before,
@@ -4740,19 +4739,34 @@ impl Session {
                     );
                 }
             }
-            // (v165, essai) Foule simulée en solo : arrêtée ou relancée.
-            "foule" | "crowd" => match arg {
-                Some("off" | "non" | "0") => {
-                    self.crowd_on = false;
-                    self.crowd = None;
-                    self.chat.say("Essai de foule arrêté.", chat::YELLOW);
+            // (v165, essai) Foule simulée en solo : (v185) `/npc stresstest true|false`,
+            // éteinte par défaut.
+            "npc" => {
+                let sub = arg.map(str::to_lowercase);
+                let value = parts.next().map(str::to_lowercase);
+                match (sub.as_deref(), value.as_deref()) {
+                    (Some("stresstest"), Some("false" | "off" | "0")) => {
+                        self.crowd_on = false;
+                        self.crowd = None;
+                        self.chat.say("Essai de foule arrêté.", chat::YELLOW);
+                    }
+                    (Some("stresstest"), Some("true" | "on" | "1")) => {
+                        self.crowd_on = true;
+                        self.crowd = None;
+                        self.chat.say(
+                            format!(
+                                "Essai de foule : jusqu'à {} joueurs simulés autour de toi en \
+                                 2 minutes, en solo hors mode FPS.",
+                                crate::crowd::MAX
+                            ),
+                            chat::YELLOW,
+                        );
+                    }
+                    _ => self
+                        .chat
+                        .say("Utilisation : /npc stresstest <true|false>", chat::RED),
                 }
-                Some("on" | "oui" | "1") => {
-                    self.crowd_on = true;
-                    self.crowd = None;
-                }
-                _ => self.chat.say("Utilisation : /foule <on|off>", chat::RED),
-            },
+            }
             // Compensation du retard mesuré de la touche « avancer » (voir `keycomp`).
             "compense" | "compensation" => {
                 let want = match arg {
@@ -6507,10 +6521,12 @@ impl Session {
             }
         }
         drop(layers);
-        // Objets au sol : ils flottent et tournent.
+        // Objets au sol : ils flottent et tournent. (v185) Leur vrai modèle, éclairés comme
+        // les joueurs (lumière du ciel à leur place).
         if self.game.mode != GameMode::Fps {
-            let l = 0.35 + 0.65 * self.daylight;
-            self.items.build(cam, [l; 3], &mut model);
+            let (world, daylight) = (&self.world, self.daylight);
+            self.items
+                .build(cam, &|p| sky_light(world, p, daylight), &mut model);
         }
         // Ombres des joueurs : les plus proches de la caméra (place limitée).
         shadows.sort_by(|a, b| {

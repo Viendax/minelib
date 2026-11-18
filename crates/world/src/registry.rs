@@ -1937,6 +1937,58 @@ pub fn fluid(id: BlockId) -> Option<(Fluid, u8)> {
     m.get(id.0 as usize).copied().flatten()
 }
 
+/// (v185) Hauteur de la surface d'un fluide dans sa case (0..1), comme dans Minecraft :
+/// pleine si le même fluide est juste au-dessus (`above`), sinon son niveau sur 9 (source
+/// et chute : 8/9, le niveau 7 qui la suit : 7/9…). `None` : pas un fluide.
+pub fn fluid_height(id: BlockId, above: BlockId) -> Option<(Fluid, f32)> {
+    let (f, level) = fluid(id)?;
+    if fluid(above).is_some_and(|(g, _)| g == f) {
+        return Some((f, 1.0));
+    }
+    let amount = match level {
+        FLUID_SOURCE | FLUID_FALLING => 8,
+        l => l,
+    };
+    Some((f, amount as f32 / 9.0))
+}
+
+/// (v185) Bloc que l'eau ou la lave emporte en coulant dessus, comme dans Minecraft :
+/// plantes (pas celles qui vivent sous l'eau : coraux, algues), torches, poudre et
+/// composants de redstone (répéteur, comparateur, levier, boutons, crochet, plaques de
+/// pression), fleurs et feuilles posées à plat. Les panneaux, échelles, portes, bannières
+/// et tapis, eux, arrêtent l'eau.
+pub fn washed_by_fluid(id: BlockId) -> bool {
+    static M: OnceLock<Vec<bool>> = OnceLock::new();
+    let m = M.get_or_init(|| {
+        registry()
+            .defs
+            .iter()
+            .map(|d| {
+                let aquatic = ["coral", "seagrass", "kelp"]
+                    .iter()
+                    .any(|k| d.key.contains(k));
+                (matches!(d.shape, Shape::Cross) && !aquatic)
+                    || matches!(d.shape, Shape::Torch | Shape::WallTorch(_))
+                    || [
+                        "redstone_wire",
+                        "repeater",
+                        "comparator",
+                        "lever",
+                        "button_",
+                        "tripwire_hook",
+                        "pressure_plate_",
+                        "leaf_litter",
+                        "pink_petals",
+                        "wildflowers",
+                    ]
+                    .iter()
+                    .any(|k| d.key.starts_with(k))
+            })
+            .collect()
+    });
+    m.get(id.0 as usize).copied().unwrap_or(false)
+}
+
 fn fluids_and_heads(b: &mut Builder) {
     for fluid in ["water", "lava"] {
         let src = b.r.defs[b.r.keys[fluid] as usize].clone();

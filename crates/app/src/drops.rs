@@ -207,9 +207,12 @@ impl Items {
         }
     }
 
-    /// Triangles des objets au sol proches de `cam` : un petit cube (deux pour une pile)
-    /// qui flotte et tourne sur lui-même ; juste lâché, il vole de la main au sol.
-    pub fn build(&self, cam: Vec3, light: [f32; 3], out: &mut Vec<EntityVertex>) {
+    /// Triangles des objets au sol proches de `cam` : (v185) le vrai modèle de l'objet,
+    /// comme tenu en main (bloc avec sa forme et ses textures, plante en croix, torche avec
+    /// sa flamme ; deux pour une pile), qui flotte et tourne sur lui-même, éclairé comme les
+    /// joueurs par `light` (lumière du ciel à sa place : abrité ou non, jour ou nuit) ; juste
+    /// lâché, il vole de la main au sol.
+    pub fn build(&self, cam: Vec3, light: &dyn Fn(Vec3) -> [f32; 3], out: &mut Vec<EntityVertex>) {
         let t = self.start.elapsed().as_secs_f32();
         for (id, d) in self.view.live_drops() {
             let rest = Vec3::from(d.pos);
@@ -228,24 +231,133 @@ impl Items {
                     at = from.lerp(at, k) + Vec3::Y * 1.2 * k * (1.0 - k);
                 }
             }
-            let kind = icon_kind(item);
+            let l = light(at + Vec3::Y * 0.15);
             let spin = Mat4::from_translation(at) * Mat4::from_rotation_y(t * 1.2 + phase);
-            let h = 0.14;
-            crate::player_model::emit_item(out, spin, [-h, 0.0, -h], [h, 2.0 * h, h], kind, light);
+            emit_ground_item(out, spin, item, l);
             if d.pile.count > 1 {
                 let side = spin * Mat4::from_translation(Vec3::new(0.09, 0.07, 0.07));
-                crate::player_model::emit_item(
-                    out,
-                    side,
-                    [-h, 0.0, -h],
-                    [h, 2.0 * h, h],
-                    kind,
-                    light,
-                );
+                emit_ground_item(out, side, item, l);
             }
         }
     }
+
+    /// (v185) Solo : un objet dans l'eau remonte à sa surface et suit le courant (arrêté par
+    /// les murs), descend les chutes d'eau ; sorti de l'eau (elle a séché, il est arrivé au
+    /// bout), il retombe au sol. En ligne, l'arbitre ne fait pas couler l'eau : les objets
+    /// restent où ils sont tombés.
+    pub fn drift(&mut self, world: &World, dt: f32) {
+        use minelib_world::registry::{fluid, Fluid, FLUID_FALLING};
+        if !self.local || dt <= 0.0 {
+            return;
+        }
+        let solid = |x: i32, y: i32, z: i32| world.get(x, y, z).is_solid();
+        let mut moved = false;
+        for d in self.view.drops.values_mut().flatten() {
+            let p = Vec3::from(d.pos);
+            let (x, z) = (p.x.floor() as i32, p.z.floor() as i32);
+            if !world.contains(minelib_world::ChunkPos::containing(x, z)) {
+                continue;
+            }
+            let wet = |y: i32| crate::fluids::surface(world, [x, y, z]);
+            let falling =
+                |y: i32| fluid(world.get(x, y, z)).is_some_and(|(_, l)| l == FLUID_FALLING);
+            // Case où il baigne (posé au fond, son bas touche la case du dessous).
+            let mut y = (p.y + 0.05).floor() as i32;
+            if wet(y).is_none() && wet(y - 1).is_some_and(|(_, h)| (y - 1) as f32 + h > p.y) {
+                y -= 1;
+            }
+            let mut next = p;
+            if wet(y).is_some() && (falling(y - 1) || (falling(y) && wet(y - 1).is_some())) {
+                // Dans une chute d'eau : il descend avec elle.
+                next.y = p.y - FALL * dt;
+            } else if wet(y).is_some() {
+                // Jusqu'en haut de l'eau (pas en remontant une chute), à fleur de surface.
+                while wet(y + 1).is_some() && !falling(y + 1) && y < 255 {
+                    y += 1;
+                }
+                let (f, h) = wet(y).unwrap_or((Fluid::Water, 1.0));
+                let float = y as f32 + h - FLOAT;
+                next.y = if float > p.y {
+                    (p.y + RISE * dt).min(float)
+                } else {
+                    float
+                };
+                let speed = if f == Fluid::Water { ITEM_CURRENT } else { 0.0 };
+                let push = crate::fluids::flow(world, [x, y, z]) * speed * dt;
+                for axis in [0, 2] {
+                    if push[axis] == 0.0 {
+                        continue;
+                    }
+                    let mut q = next;
+                    q[axis] += push[axis];
+                    // Le bord de l'objet ne rentre pas dans un mur.
+                    let mut edge = q;
+                    edge[axis] += push[axis].signum() * 0.15;
+                    let c = |v: f32| v.floor() as i32;
+                    if !solid(c(edge.x), c(q.y + 0.05), c(edge.z)) {
+                        next = q;
+                    }
+                }
+            } else {
+                // Hors de l'eau : il retombe jusqu'au premier sol.
+                let mut ground = y;
+                while ground > 0 && !solid(x, ground - 1, z) {
+                    ground -= 1;
+                }
+                if p.y > ground as f32 + 1e-3 {
+                    next.y = (p.y - FALL * dt).max(ground as f32);
+                }
+            }
+            if next != p {
+                d.pos = next.to_array();
+                moved = true;
+            }
+        }
+        if moved {
+            self.dirty = true;
+        }
+    }
 }
+
+/// (v185) Objet au sol, comme en main : un bloc à sa forme (côté de 0,28 bloc), une
+/// torche avec sa flamme ; le reste (baguette, écran, tête) en petit pavé de sa couleur.
+fn emit_ground_item(out: &mut Vec<EntityVertex>, xf: Mat4, item: Item, light: [f32; 3]) {
+    let center = |size: f32| {
+        xf * Mat4::from_scale(Vec3::splat(size))
+            * Mat4::from_translation(Vec3::new(-0.5, 0.0, -0.5))
+    };
+    match item {
+        Item::Block(b) => crate::player_model::emit_block_item(out, center(BLOCK_SIZE), b, light),
+        Item::Torch(chem) => {
+            let rgb = chem
+                .and_then(|i| minelib_world::flame::CHEMICALS.get(i))
+                .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb);
+            crate::player_model::emit_torch_item(out, center(TORCH_SIZE), rgb, light);
+        }
+        _ => {
+            let h = BLOCK_SIZE / 2.0;
+            crate::player_model::emit_item(
+                out,
+                xf,
+                [-h, 0.0, -h],
+                [h, 2.0 * h, h],
+                icon_kind(item),
+                light,
+            );
+        }
+    }
+}
+
+/// Côté d'un bloc posé au sol comme objet (blocs) ; taille de la torche (sa vraie taille
+/// fois ce facteur).
+const BLOCK_SIZE: f32 = 0.28;
+const TORCH_SIZE: f32 = 0.6;
+/// Dans l'eau : vitesse de l'objet porté par le courant, de sa remontée, de sa chute une
+/// fois sorti (blocs/s), et de combien il s'enfonce sous la surface.
+const ITEM_CURRENT: f32 = 2.0;
+const RISE: f32 = 1.2;
+const FALL: f32 = 8.0;
+const FLOAT: f32 = 0.12;
 
 /// Aspect d'un objet au sol : la texture de son bloc, ou une couleur.
 fn icon_kind(item: Item) -> RayBoxKind {
@@ -379,5 +491,128 @@ mod tests {
         assert_eq!(back.view.totals(), it.view.totals());
         assert_eq!(back.view.totals()[&1], 73);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v185) Au sol, un objet a le modèle qu'il a en main : un bloc avec ses textures de
+    /// dessus, de côté et de dessous ; une dalle à sa hauteur ; une plante en croix ; une
+    /// torche avec sa flamme.
+    #[test]
+    fn ground_items_have_their_real_shape_and_textures() {
+        use minelib_world::BlockId;
+        let reg = minelib_world::registry::registry();
+        let grass = reg.by_key("grass").unwrap();
+        let mut out = Vec::new();
+        crate::player_model::emit_block_item(&mut out, Mat4::IDENTITY, grass, [1.0; 3]);
+        assert_eq!(out.len(), 36);
+        let t = grass.def().tex;
+        let layers = |pred: &dyn Fn(&EntityVertex) -> bool| -> Vec<i32> {
+            let mut l: Vec<i32> = out.iter().filter(|v| pred(v)).map(|v| v.layer).collect();
+            l.dedup();
+            l
+        };
+        // Dessus (tous les sommets à y = 1), dessous (y = 0).
+        let top: Vec<i32> = out
+            .chunks_exact(6)
+            .filter(|f| f.iter().all(|v| v.pos[1] == 1.0))
+            .map(|f| f[0].layer)
+            .collect();
+        let bottom: Vec<i32> = out
+            .chunks_exact(6)
+            .filter(|f| f.iter().all(|v| v.pos[1] == 0.0))
+            .map(|f| f[0].layer)
+            .collect();
+        assert_eq!(top, vec![t[0] as i32]);
+        assert_eq!(bottom, vec![t[2] as i32]);
+        assert!(layers(&|v| v.pos[1] > 0.0 && v.pos[1] < 1.0).is_empty());
+        // Dalle du bas : moitié de haut, la moitié basse de l'image des côtés.
+        let slab = reg
+            .defs
+            .iter()
+            .position(|d| d.key.starts_with("slab:") && d.key.ends_with(":bottom"))
+            .map(|i| BlockId(i as u16))
+            .unwrap();
+        let mut out = Vec::new();
+        crate::player_model::emit_block_item(&mut out, Mat4::IDENTITY, slab, [1.0; 3]);
+        assert!(out.iter().all(|v| v.pos[1] <= 0.5 + 1e-6));
+        assert!(out.iter().any(|v| v.uv[1] == 0.5));
+        // Plante : deux plans en croix.
+        let plant = reg
+            .defs
+            .iter()
+            .position(|d| matches!(d.shape, minelib_world::registry::Shape::Cross))
+            .map(|i| BlockId(i as u16))
+            .unwrap();
+        let mut out = Vec::new();
+        crate::player_model::emit_block_item(&mut out, Mat4::IDENTITY, plant, [1.0; 3]);
+        assert_eq!(out.len(), 12);
+        // Torche : bâton texturé et flamme.
+        let mut out = Vec::new();
+        emit_ground_item(&mut out, Mat4::IDENTITY, Item::Torch(None), [1.0; 3]);
+        assert!(out.iter().any(|v| v.layer == minelib_render::ENTITY_FLAME));
+        assert!(out
+            .iter()
+            .any(|v| v.layer == BlockId::TORCH.def().tex[1] as i32));
+    }
+
+    /// (v185) En solo, un objet tombé dans un ruisseau remonte à la surface, descend le
+    /// courant et s'arrête contre le mur du bout ; l'eau partie, il retombe au sol.
+    #[test]
+    fn solo_items_float_down_a_stream_and_fall_when_it_dries() {
+        use minelib_world::{BlockId, ChunkPos};
+        let reg = minelib_world::registry::registry();
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        for x in 0..16 {
+            for z in 0..16 {
+                w.set(x, 9, z, BlockId::STONE);
+            }
+            w.set(x, 10, 7, BlockId::STONE);
+            w.set(x, 10, 9, BlockId::STONE);
+        }
+        // Rigole le long de +X : source en x = 2, puis 7, 6… ; mur en x = 8.
+        w.set(2, 10, 8, BlockId::WATER);
+        for (i, x) in (3..8).enumerate() {
+            w.set(
+                x,
+                10,
+                8,
+                reg.by_key(&format!("water_flow:{}", 7 - i)).unwrap(),
+            );
+        }
+        w.set(8, 10, 8, BlockId::STONE);
+        let mut it = Items::new(true);
+        it.drop_item(Vec3::ZERO, Vec3::new(3.5, 10.0, 8.5), stone(1));
+        it.arbitrate(ME);
+        let pos = |it: &Items| Vec3::from(it.view.live_drops().next().unwrap().1.pos);
+        for _ in 0..60 {
+            it.drift(&w, 1.0 / 60.0);
+        }
+        let p = pos(&it);
+        assert!(p.x > 4.5, "emporté : {p}");
+        assert!(p.y > 10.2, "à la surface : {p}");
+        for _ in 0..600 {
+            it.drift(&w, 1.0 / 60.0);
+        }
+        let p = pos(&it);
+        assert!(p.x < 8.0 - 0.1 && p.x > 7.5, "arrêté par le mur : {p}");
+        // L'eau sèche : il retombe sur le fond.
+        for x in 2..8 {
+            w.set(x, 10, 8, BlockId::AIR);
+        }
+        for _ in 0..120 {
+            it.drift(&w, 1.0 / 60.0);
+        }
+        assert_eq!(pos(&it).y, 10.0);
+        // En ligne : rien ne bouge.
+        let mut it = Items::new(false);
+        it.view.drops.insert(
+            7,
+            Some(minelib_net::items::Dropped {
+                pos: [3.5, 12.0, 8.5],
+                pile: stone(1),
+            }),
+        );
+        it.drift(&w, 0.5);
+        assert_eq!(pos(&it), Vec3::new(3.5, 12.0, 8.5));
     }
 }

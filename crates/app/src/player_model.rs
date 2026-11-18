@@ -876,6 +876,214 @@ pub(crate) fn emit_item(
     }
 }
 
+/// (v185) Bloc devenu objet (posé au sol) : sa vraie forme, comme tenu en main (pavés du
+/// bloc, quatre au plus ; plante en croix ; torche : bâton et flamme ; lanterne : corps et
+/// chapeau), chaque face avec sa texture (dessus, côtés, dessous) et la partie de l'image
+/// que couvre le pavé. `xf` place le cube 0..1 du bloc dans le monde ; `light` : éclairage
+/// du lieu (un bloc lumineux brille par lui-même).
+pub fn emit_block_item(out: &mut Vec<EntityVertex>, xf: Mat4, block: BlockId, light: [f32; 3]) {
+    use minelib_world::registry::Shape;
+    let def = block.def();
+    let glow = def.light.is_some();
+    match def.shape {
+        Shape::Torch | Shape::WallTorch(_) => {
+            emit_torch_item(out, xf, minelib_world::flame::WOOD_FLAME, light);
+            return;
+        }
+        Shape::Cross => {
+            // Deux plans en diagonale, la texture des côtés (découpée : `entity.wgsl`).
+            let vl = if glow {
+                EntityVertex::light([0.5; 3], false)
+            } else {
+                EntityVertex::light(light, true)
+            };
+            for (a, b) in [
+                (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 1.0)),
+                (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
+            ] {
+                for (u, v) in [
+                    (0.0, 0.0),
+                    (1.0, 0.0),
+                    (1.0, 1.0),
+                    (1.0, 1.0),
+                    (0.0, 1.0),
+                    (0.0, 0.0),
+                ] {
+                    let p = a.lerp(b, u) + Vec3::Y * (1.0 - v);
+                    out.push(EntityVertex {
+                        pos: xf.transform_point3(p).to_array(),
+                        color: [0.92; 3],
+                        uv: [u, v],
+                        layer: def.tex[1] as i32,
+                        light: vl,
+                    });
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+    if def.key.starts_with("lantern") || def.key.starts_with("soul_lantern") {
+        // Comme tenue : corps et chapeau, taillés dans sa texture (sans chaîne).
+        for (a, b, uv) in [
+            ([5.0, 0.0, 5.0], [11.0, 7.0, 11.0], [0.0, 2.0, 6.0, 9.0]),
+            ([6.0, 7.0, 6.0], [10.0, 9.0, 10.0], [1.0, 0.0, 5.0, 2.0]),
+        ] {
+            emit_item(
+                out,
+                xf * Mat4::from_scale(Vec3::splat(1.0 / 16.0)),
+                a,
+                b,
+                RayBoxKind::Block {
+                    layer: def.tex[1] as u32,
+                    uv: uv.map(|v: f32| v / 16.0),
+                    glow: true,
+                },
+                light,
+            );
+        }
+        return;
+    }
+    let boxes = if def.full {
+        vec![([0u8; 3], [16u8; 3])]
+    } else {
+        def.boxes()
+    };
+    let boxes = if boxes.is_empty() {
+        vec![([0u8; 3], [16u8; 3])]
+    } else {
+        boxes
+    };
+    for (a, b) in boxes.into_iter().take(4) {
+        emit_textured_box(out, xf, a, b, def.tex, glow, light);
+    }
+}
+
+/// (v185) Torche posée au sol comme objet : le même modèle que tenue en main (bâton
+/// texturé de 2 × 8 seizièmes, flamme de 3 × 5 qui brille de sa couleur `flame`, sRGB),
+/// debout au milieu du cube 0..1 que place `xf`.
+pub fn emit_torch_item(out: &mut Vec<EntityVertex>, xf: Mat4, flame: [u8; 3], light: [f32; 3]) {
+    let top = flame.iter().copied().max().unwrap_or(1).max(1) as u32;
+    let bright = flame.map(|c| (c as u32 * 255 / top) as u8);
+    let px = xf
+        * Mat4::from_translation(Vec3::new(0.5, 0.0, 0.5))
+        * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+    emit_item(
+        out,
+        px,
+        [-1.0, 0.0, -1.0],
+        [1.0, 8.0, 1.0],
+        RayBoxKind::Block {
+            layer: BlockId::TORCH.def().tex[1] as u32,
+            uv: [0.4375, 0.5, 0.5625, 1.0],
+            glow: true,
+        },
+        light,
+    );
+    emit_item(
+        out,
+        px,
+        [-1.5, 8.0, -1.5],
+        [1.5, 13.0, 1.5],
+        RayBoxKind::Flame(bright),
+        light,
+    );
+}
+
+/// (v185) Pavé `a`..`b` (seizièmes) d'un bloc, ses faces texturées comme posé : dessus
+/// `tex[0]`, côtés `tex[1]`, dessous `tex[2]`, chaque face prenant la partie de l'image
+/// qu'elle couvre ; ombrée selon son orientation dans le monde.
+fn emit_textured_box(
+    out: &mut Vec<EntityVertex>,
+    xf: Mat4,
+    a: [u8; 3],
+    b: [u8; 3],
+    tex: [u16; 3],
+    glow: bool,
+    light: [f32; 3],
+) {
+    let mn = Vec3::from(a.map(|v| v as f32 / 16.0));
+    let mx = Vec3::from(b.map(|v| v as f32 / 16.0));
+    let vl = if glow {
+        EntityVertex::light([0.5; 3], false)
+    } else {
+        EntityVertex::light(light, true)
+    };
+    // (coin d'origine, axe u, axe v : fractions du pavé ; normale ; couche ; [u0, v0, u1, v1]).
+    #[allow(clippy::type_complexity)]
+    let faces: [([f32; 3], [f32; 3], [f32; 3], Vec3, u16, [f32; 4]); 6] = [
+        (
+            [1.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            Vec3::NEG_Z,
+            tex[1],
+            [1.0 - mx.x, 1.0 - mx.y, 1.0 - mn.x, 1.0 - mn.y],
+        ),
+        (
+            [0.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            Vec3::Z,
+            tex[1],
+            [mn.x, 1.0 - mx.y, mx.x, 1.0 - mn.y],
+        ),
+        (
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, -1.0, 0.0],
+            Vec3::X,
+            tex[1],
+            [1.0 - mx.z, 1.0 - mx.y, 1.0 - mn.z, 1.0 - mn.y],
+        ),
+        (
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0],
+            Vec3::NEG_X,
+            tex[1],
+            [mn.z, 1.0 - mx.y, mx.z, 1.0 - mn.y],
+        ),
+        (
+            [0.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            Vec3::Y,
+            tex[0],
+            [mn.x, mx.z, mx.x, mn.z],
+        ),
+        (
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            Vec3::NEG_Y,
+            tex[2],
+            [mn.x, mn.z, mx.x, mx.z],
+        ),
+    ];
+    for (o, du, dv, n, layer, r) in faces {
+        let (o, du, dv) = (Vec3::from(o), Vec3::from(du), Vec3::from(dv));
+        let shade = face_shade(xf.transform_vector3(n).normalize_or_zero());
+        for (u, v) in [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (0.0, 0.0),
+        ] {
+            let f = o + du * u + dv * v;
+            out.push(EntityVertex {
+                pos: xf.transform_point3(mn + (mx - mn) * f).to_array(),
+                color: [shade; 3],
+                uv: [r[0] + (r[2] - r[0]) * u, r[1] + (r[3] - r[1]) * v],
+                layer: layer as i32,
+                light: vl,
+            });
+        }
+    }
+}
+
 /// Tête seule (bloc « tête » à skin d'une carte importée) : `xf` va des pixels du modèle
 /// (tête de -4..4 × 0..8 × -4..4, visage vers −z) au monde.
 pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3], lod: usize) -> Vec<EntityVertex> {

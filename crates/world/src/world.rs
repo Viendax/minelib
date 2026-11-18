@@ -51,6 +51,10 @@ pub struct World {
     pub touched: Option<Vec<[i32; 3]>>,
     /// Points de mesure de la lumière par chunk (voir `set_probes`).
     probes: HashMap<ChunkPos, Arc<Vec<[i32; 3]>>>,
+    /// (v185) Chunks arrivés (chargés ou générés) depuis le dernier relevé ; `None` : pas
+    /// relevés. En solo, l'eau et la lave changées par le joueur s'y remettent à couler :
+    /// une partie enregistrée pendant que l'eau séchait ne la garde plus pour toujours.
+    pub fresh: Option<Vec<ChunkPos>>,
 }
 
 impl World {
@@ -66,6 +70,7 @@ impl World {
             journal: None,
             touched: None,
             probes: HashMap::new(),
+            fresh: None,
         }
     }
 
@@ -305,6 +310,9 @@ impl World {
             chunk = generate(self.generator, self.seed, chunk.pos);
         }
         self.apply_edits(&mut chunk);
+        if let Some(f) = &mut self.fresh {
+            f.push(chunk.pos);
+        }
         self.chunks.insert(chunk.pos, Arc::new(chunk));
     }
 
@@ -322,6 +330,19 @@ impl World {
         self.edits
             .iter()
             .flat_map(|(c, m)| m.iter().map(move |(i, b)| (*c, *i, *b)))
+    }
+
+    /// (v185) Modifications du joueur dans le chunk `pos` : (position monde, bloc).
+    pub fn edits_in(&self, pos: ChunkPos) -> Vec<([i32; 3], BlockId)> {
+        let (ox, oz) = pos.origin();
+        self.edits.get(&pos).map_or_else(Vec::new, |m| {
+            m.iter()
+                .map(|(&i, &b)| {
+                    let (x, z, y) = (i % 16, (i / 16) % 16, i / 256);
+                    ([ox + x as i32, y as i32, oz + z as i32], b)
+                })
+                .collect()
+        })
     }
 
     /// Recharge des modifications (sauvegarde) avant que les chunks soient générés.
@@ -383,6 +404,9 @@ impl World {
         if !self.chunks.contains_key(&pos) {
             let mut c = self.base_or_generate(pos);
             self.apply_edits(&mut c);
+            if let Some(f) = &mut self.fresh {
+                f.push(pos);
+            }
             self.chunks.insert(pos, Arc::new(c));
         }
     }
@@ -464,10 +488,14 @@ impl World {
             self.torches.remove(&[x, y, z]);
         }
         // Une source de lumière à portée : la lumière change sur toute sa zone d'influence.
+        // (v185) Sauf si ni l'ancien ni le nouveau bloc n'arrête la lumière (eau qui coule,
+        // air, plantes) : elle passe pareil, seul le chunk (et ses bords) change. L'eau qui
+        // coulait près d'une torche faisait remailler une dizaine de chunks à chaque pas.
+        let open = |b: BlockId| crate::registry::light_cover(b) == [0; 6];
         if old.is_torch()
             || old.def().light.is_some()
             || id.def().light.is_some()
-            || self.torch_nearby(x, y, z)
+            || (!(open(old) && open(id)) && self.torch_nearby(x, y, z))
         {
             return Self::chunks_in_light_radius(x, z);
         }
@@ -534,6 +562,31 @@ mod tests {
         let d = w.set(0, 200, 15, BlockId::STONE);
         assert_eq!(d.len(), 4);
         assert!(d.contains(&ChunkPos { x: -1, z: 1 }));
+    }
+
+    /// (v185) Près d'une torche, un bloc qui arrête la lumière fait remailler toute sa
+    /// zone ; de l'eau qui coule (ni l'ancien ni le nouveau bloc n'arrête la lumière),
+    /// seulement son chunk.
+    #[test]
+    fn flowing_water_near_a_torch_remeshes_only_its_chunk() {
+        let mut w = World::new(0);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                w.ensure_chunk(ChunkPos { x: dx, z: dz });
+            }
+        }
+        w.place_torch(8, 200, 8, None);
+        assert_eq!(
+            w.set(6, 200, 8, BlockId::WATER),
+            vec![ChunkPos { x: 0, z: 0 }]
+        );
+        let flow = crate::registry::registry().by_key("water_flow:3").unwrap();
+        assert_eq!(w.set(6, 200, 8, flow), vec![ChunkPos { x: 0, z: 0 }]);
+        assert_eq!(
+            w.set(6, 200, 8, BlockId::AIR),
+            vec![ChunkPos { x: 0, z: 0 }]
+        );
+        assert!(w.set(6, 200, 8, BlockId::STONE).len() > 1);
     }
 
     #[test]

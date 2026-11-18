@@ -1798,35 +1798,88 @@ fn mesh_block(
                         return;
                     }
                 }
-                // Eau, lave : hauteur du dessus (plein si le même fluide est au-dessus) ;
-                // faces cachées contre le même fluide au moins aussi haut.
+                // Eau, lave : (v185) surface comme dans Minecraft. Chaque case du fluide a
+                // sa hauteur (pleine sous le même fluide, sinon son niveau sur 9 : source
+                // 8/9) ; chaque coin du dessus prend la moyenne des cases qui l'entourent
+                // (celles d'au moins 0,8 comptent dix fois, une case libre compte pour 0,
+                // un bloc solide pas du tout) : la surface descend en pente douce le long
+                // du courant et vers les bords. Deux cases voisines ont les mêmes coins :
+                // pas de face entre elles. (Lave source : pleine, c'est un bloc plein qui
+                // cache les faces de ses voisins.)
                 let fluid_here = crate::registry::fluid(id).map(|(f, _)| f);
-                let fluid_top = |p: [i32; 3], f: crate::registry::Fluid| -> Option<f32> {
-                    let here = pad.get(p[0], p[1], p[2]);
-                    if crate::registry::fluid(here).map(|(g, _)| g) != Some(f) {
-                        return None;
-                    }
-                    let above = pad.get(p[0], p[1] + 1, p[2]);
-                    if crate::registry::fluid(above).map(|(g, _)| g) == Some(f) {
-                        return Some(1.0);
-                    }
-                    Some(match here.def().shape {
-                        Shape::Fluid(h) => h as f32 / 16.0,
-                        _ => 1.0,
-                    })
+                let same = |p: [i32; 3], f: crate::registry::Fluid| {
+                    crate::registry::fluid(pad.get(p[0], p[1], p[2])).map(|(g, _)| g) == Some(f)
                 };
-                let top = fluid_here.and_then(|f| fluid_top(b, f)).unwrap_or(1.0);
+                let cell_h = |p: [i32; 3], f: crate::registry::Fluid| -> Option<f32> {
+                    let here = pad.get(p[0], p[1], p[2]);
+                    let above = pad.get(p[0], p[1] + 1, p[2]);
+                    match crate::registry::fluid_height(here, above) {
+                        Some((g, _)) if g == f && here.is_opaque() => Some(1.0),
+                        Some((g, h)) if g == f => Some(h),
+                        _ if here.def().solid => None,
+                        _ => Some(0.0),
+                    }
+                };
+                // Hauteur des quatre coins du dessus, `[x][z]` (0 : côté −, 1 : côté +).
+                let tops: Option<[[f32; 2]; 2]> = fluid_here.map(|f| {
+                    let own = cell_h(b, f).unwrap_or(1.0);
+                    let corner = |sx: i32, sz: i32| -> f32 {
+                        if own >= 1.0 {
+                            return 1.0;
+                        }
+                        let h1 = cell_h(add(b, [sx, 0, 0]), f);
+                        let h2 = cell_h(add(b, [0, 0, sz]), f);
+                        if h1.is_some_and(|h| h >= 1.0) || h2.is_some_and(|h| h >= 1.0) {
+                            return 1.0;
+                        }
+                        let (mut sum, mut weight) = (0.0, 0.0);
+                        let mut add_h = |h: Option<f32>| match h {
+                            Some(h) if h >= 0.8 => {
+                                sum += h * 10.0;
+                                weight += 10.0;
+                            }
+                            Some(h) => {
+                                sum += h;
+                                weight += 1.0;
+                            }
+                            None => {}
+                        };
+                        if h1.is_some_and(|h| h > 0.0) || h2.is_some_and(|h| h > 0.0) {
+                            let d = cell_h(add(b, [sx, 0, sz]), f);
+                            if d.is_some_and(|h| h >= 1.0) {
+                                return 1.0;
+                            }
+                            add_h(d);
+                        }
+                        add_h(Some(own));
+                        add_h(h2);
+                        add_h(h1);
+                        sum / weight
+                    };
+                    [
+                        [corner(-1, -1), corner(-1, 1)],
+                        [corner(1, -1), corner(1, 1)],
+                    ]
+                });
+                let lowest = tops.map_or(1.0, |t| t[0][0].min(t[0][1]).min(t[1][0]).min(t[1][1]));
                 for (face, &(n, u, v)) in FACES.iter().enumerate() {
                     let front = add(b, n);
                     let facing = pad.get(front[0], front[1], front[2]);
+                    // Dessus d'un fluide sous un bloc plein (ou une dalle) : gardé tant que
+                    // la surface est plus basse que lui (on la voit par le côté), éclairé
+                    // par sa case.
+                    let mut roofed = false;
                     if let Some(f) = fluid_here {
-                        let hidden = match face {
-                            2 => fluid_top(front, f).is_some(),
-                            3 => fluid_top(front, f).is_some(),
-                            _ => fluid_top(front, f).is_some_and(|h| h >= top),
-                        };
-                        if hidden {
+                        if same(front, f) {
                             continue;
+                        }
+                        let lid =
+                            opaque(front) || crate::registry::light_faces(facing) & (1 << 3) != 0;
+                        if face == 2 && lid {
+                            if lowest >= 1.0 {
+                                continue;
+                            }
+                            roofed = true;
                         }
                     }
                     // Cachée par un bloc plein, par le même bloc (verre, eau), ou par la
@@ -1841,10 +1894,10 @@ fn mesh_block(
                     let glass = |d: &crate::registry::BlockDef| {
                         d.key.starts_with("glass") && matches!(d.shape, Shape::Cube)
                     };
-                    if opaque(front)
+                    if (opaque(front) && !roofed)
                         || (glass(def) && glass(facing.def()))
                         || (def.cull_same && facing == id)
-                        || (covered && !def.translucent)
+                        || (covered && !def.translucent && !roofed)
                     {
                         continue;
                     }
@@ -1905,7 +1958,7 @@ fn mesh_block(
                     } else {
                         0.0
                     };
-                    if covered {
+                    if covered || roofed {
                         ao = [3; 4];
                         lights = [light_at(b); 4];
                     }
@@ -1946,11 +1999,12 @@ fn mesh_block(
                             base[1] + a * u[1] + c * v[1],
                             base[2] + a * u[2] + c * v[2],
                         ];
-                        // Fluide plus bas qu'un bloc : coins du haut abaissés.
-                        let py = if top < 1.0 && p[1] > y {
-                            y as f32 + top
-                        } else {
-                            p[1] as f32
+                        // Fluide : coins du haut à la hauteur de la surface.
+                        let py = match &tops {
+                            Some(t) if p[1] > y => {
+                                y as f32 + t[(p[0] - x) as usize][(p[2] - z) as usize]
+                            }
+                            _ => p[1] as f32,
                         };
                         out.vertices.push(Vertex {
                             pos: [
@@ -2017,31 +2071,74 @@ mod tests {
         assert_eq!(tops, 1);
     }
 
+    /// (v185) Surface comme dans Minecraft : un ruisseau (source, puis niveaux 7, 6, 5)
+    /// descend en pente douce, d'un seul tenant (les coins communs de deux cases sont à la
+    /// même hauteur), sans face entre deux cases d'eau ; la source est à 8/9 de bloc.
     #[test]
-    fn flowing_water_is_lower_and_hides_faces_against_itself() {
+    fn flowing_water_slopes_smoothly_without_faces_against_itself() {
         let reg = crate::registry::registry();
         let mut w = empty_world_with_block(3, 40, 3);
-        w.set(4, 40, 3, BlockId::STONE);
-        w.set(3, 41, 3, reg.by_key("water_flow:3").unwrap());
-        w.set(4, 41, 3, reg.by_key("water_flow:2").unwrap());
+        for x in 0..8 {
+            for z in 0..8 {
+                w.set(x, 40, z, BlockId::STONE);
+            }
+        }
+        w.set(1, 41, 3, BlockId::WATER);
+        for (x, l) in [(2, 7), (3, 6), (4, 5)] {
+            w.set(x, 41, 3, reg.by_key(&format!("water_flow:{l}")).unwrap());
+        }
         let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
         let quads: Vec<_> = m.vertices.chunks_exact(4).collect();
-        let top = |h: f32| {
-            quads
-                .iter()
-                .filter(|q| {
-                    q[0].face() == 2 && q.iter().all(|v| (v.pos[1] - (41.0 + h)).abs() < 1e-4)
-                })
-                .count()
-        };
-        assert_eq!(top(6.0 / 16.0), 1, "niveau 3 : 6/16 de haut");
-        assert_eq!(top(4.0 / 16.0), 1, "niveau 2 : 4/16 de haut");
-        // Entre les deux : seule la face du plus haut (vers le plus bas) reste.
+        // Hauteur du dessus à chaque coin (x, z), vue par toutes les cases qui le touchent.
+        let mut at: std::collections::HashMap<(i32, i32), Vec<f32>> = Default::default();
+        for q in quads
+            .iter()
+            .filter(|q| q[0].face() == 2 && q[0].pos[1] > 41.0)
+        {
+            for v in q.iter() {
+                let key = (v.pos[0].round() as i32, v.pos[2].round() as i32);
+                at.entry(key).or_default().push(v.pos[1] - 41.0);
+            }
+        }
+        for (k, hs) in &at {
+            assert!(
+                hs.iter().all(|h| (h - hs[0]).abs() < 1e-5),
+                "coin {k:?} : {hs:?}"
+            );
+        }
+        let h = |x: i32, z: i32| at[&(x, z)][0];
+        assert!(
+            h(2, 3) > h(3, 3) && h(3, 3) > h(4, 3) && h(4, 3) > h(5, 3),
+            "pente"
+        );
+        assert!(h(2, 3) < 8.0 / 9.0 && h(5, 3) > 0.0);
+        // Coin entre la source et le niveau 7, avec de l'air à côté (moyenne pondérée).
+        assert!((h(2, 3) - (80.0 / 9.0 + 7.0 / 9.0) / 13.0).abs() < 1e-5);
+        // Aucune face entre deux cases d'eau.
         let between = quads
             .iter()
-            .filter(|q| q[0].face() < 2 && q.iter().all(|v| (v.pos[0] - 4.0).abs() < 0.01))
+            .filter(|q| q[0].face() < 2)
+            .filter(|q| {
+                [2.0, 3.0, 4.0]
+                    .iter()
+                    .any(|x| q.iter().all(|v| (v.pos[0] - x).abs() < 0.01))
+            })
             .count();
-        assert_eq!(between, 1);
+        assert_eq!(between, 0);
+        // Sous un bloc plein, le dessus reste (plus bas que le bloc).
+        w.set(3, 42, 3, BlockId::STONE);
+        let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        let under = m
+            .vertices
+            .chunks_exact(4)
+            .filter(|q| {
+                q[0].face() == 2
+                    && q.iter()
+                        .all(|v| (3.0..=4.0).contains(&v.pos[0]) && (3.0..=4.0).contains(&v.pos[2]))
+                    && q.iter().all(|v| v.pos[1] > 41.0 && v.pos[1] < 42.0)
+            })
+            .count();
+        assert_eq!(under, 1);
     }
 
     #[test]

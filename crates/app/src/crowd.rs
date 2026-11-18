@@ -2,9 +2,8 @@
 //! joueur, de 0 à 4 000 en 2 minutes de jeu, et se promènent. Ils sont dessinés exactement
 //! comme les joueurs d'un serveur de construction (mêmes modèles, mêmes paliers de détail,
 //! mêmes pseudos au-dessus de la tête), pour mesurer la fluidité qu'aurait une vraie foule
-//! autour de soi. `/foule off` les retire, `/foule on` relance l'essai.
-//!
-//! À retirer du jeu quand le joueur aura donné son avis.
+//! autour de soi. (v185) Éteint par défaut : `/npc stresstest true` le lance,
+//! `/npc stresstest false` les retire.
 
 use glam::Vec3;
 use minelib_world::World;

@@ -2,7 +2,7 @@
 //! boîte englobante / voxels (résolues axe par axe).
 
 use glam::{Mat4, Vec3};
-use minelib_world::registry::{fluid, post_arms, post_connects, Fluid, Shape};
+use minelib_world::registry::{post_arms, post_connects, Fluid, Shape};
 use minelib_world::World;
 
 pub const HALF_WIDTH: f32 = 0.3;
@@ -15,27 +15,85 @@ pub fn in_water(world: &World, feet: Vec3) -> bool {
 
 /// Fluide (eau ou lave, source ou qui coule) où baigne le joueur (pieds ou corps).
 pub fn in_fluid(world: &World, feet: Vec3) -> Option<Fluid> {
-    let (x, z) = (feet.x.floor() as i32, feet.z.floor() as i32);
-    [0.05, 0.9].iter().find_map(|dy| {
-        let y = feet.y + dy;
-        let id = world.get(x, y.floor() as i32, z);
-        let (f, _) = fluid(id)?;
-        // Fluide bas (qui coule) : seulement sous sa surface.
-        let h = match id.def().shape {
-            Shape::Fluid(h) => h as f32 / 16.0,
-            _ => 1.0,
-        };
-        (y - y.floor() <= h).then_some(f)
+    bath(world, feet, HEIGHT).map(|b| b.fluid)
+}
+
+/// (v185) Ce que le joueur a autour de lui dans un fluide (`updateFluidHeightAndDoFluidPushing`
+/// de Minecraft) : le fluide (l'eau d'abord s'il y a les deux), sa profondeur au-dessus des
+/// pieds, et la poussée du courant (moyenne des cases touchées ; affaiblie sous 0,4 bloc
+/// de fond).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bath {
+    pub fluid: Fluid,
+    pub depth: f32,
+    pub current: Vec3,
+}
+
+/// Fluide qui touche la boîte du joueur (pieds en `feet`, `height` de haut) sous sa surface
+/// (hauteur de Minecraft : source 8/9, niveau n : n/9, pleine sous le même fluide).
+pub fn bath(world: &World, feet: Vec3, height: f32) -> Option<Bath> {
+    let e = 0.001;
+    let min = Vec3::new(feet.x - HALF_WIDTH + e, feet.y + e, feet.z - HALF_WIDTH + e);
+    let max = Vec3::new(
+        feet.x + HALF_WIDTH - e,
+        feet.y + height - e,
+        feet.z + HALF_WIDTH - e,
+    );
+    let mut found: [Option<(f32, Vec3, u32)>; 2] = [None, None];
+    for y in min.y.floor() as i32..=max.y.floor() as i32 {
+        for z in min.z.floor() as i32..=max.z.floor() as i32 {
+            for x in min.x.floor() as i32..=max.x.floor() as i32 {
+                let Some((f, h)) = crate::fluids::surface(world, [x, y, z]) else {
+                    continue;
+                };
+                let top = y as f32 + h;
+                if top < min.y {
+                    continue;
+                }
+                let slot = &mut found[(f == Fluid::Lava) as usize];
+                let (depth, mut push, n) = slot.unwrap_or((0.0, Vec3::ZERO, 0));
+                let depth = depth.max(top - min.y);
+                let mut flow = crate::fluids::flow(world, [x, y, z]);
+                if depth < 0.4 {
+                    flow *= depth;
+                }
+                push += flow;
+                *slot = Some((depth, push, n + 1));
+            }
+        }
+    }
+    let (i, (depth, push, n)) = found
+        .iter()
+        .enumerate()
+        .find_map(|(i, s)| s.map(|s| (i, s)))?;
+    Some(Bath {
+        fluid: if i == 0 { Fluid::Water } else { Fluid::Lava },
+        depth,
+        current: push / n as f32,
     })
 }
 
-/// Nage (comme dans Minecraft) : lent dans l'eau, très lent dans la lave ; on coule
-/// doucement, Saut fait remonter.
-const SWIM_WATER: f32 = 2.2;
-const SWIM_LAVA: f32 = 1.0;
-const SWIM_UP: f32 = 2.4;
-const SINK_WATER: f32 = -1.2;
-const SINK_LAVA: f32 = -0.6;
+/// Nage (comme dans Minecraft, vitesses mesurées sur ses formules : vitesse × 0,8 par tick
+/// dans l'eau, × 0,5 dans la lave) : 2 blocs/s dans l'eau (3,9 en courant : la nage
+/// rapide), 0,8 dans la lave ; on y coule à 0,5 et 0,8 bloc/s ; Saut fait remonter
+/// (3,5 dans l'eau, 0,8 dans la lave), Accroupi fait plonger (4,5 dans l'eau).
+const SWIM_WATER: f32 = 2.0;
+const SWIM_WATER_SPRINT: f32 = 3.9;
+const SWIM_LAVA: f32 = 0.8;
+const SWIM_UP_WATER: f32 = 3.5;
+const SWIM_UP_LAVA: f32 = 0.8;
+const DIVE_WATER: f32 = -4.5;
+const SINK_WATER: f32 = -0.5;
+const SINK_LAVA: f32 = -0.8;
+/// Courant : ce qu'il ajoute à la vitesse (blocs/s), dans l'eau et dans la lave (0,014 et
+/// 0,0023 bloc/tick² de Minecraft, avec leur freinage).
+const CURRENT_WATER: f32 = 1.4;
+const CURRENT_LAVA: f32 = 0.09;
+/// Sous cette profondeur (blocs) et au sol, Saut est un vrai saut (on sort d'une flaque).
+const SHALLOW: f32 = 0.4;
+/// Contre un bord en nageant, si la place 0,6 bloc plus haut est libre (ni bloc ni
+/// fluide) : élan vers le haut (0,3 bloc/tick de Minecraft) pour sortir de l'eau.
+const LEDGE_BOOST: f32 = 6.0;
 pub const HEIGHT: f32 = 1.8;
 pub const EYE: f32 = 1.62;
 
@@ -185,6 +243,8 @@ pub struct Player {
     released: [Option<(Vec3, f32)>; 2],
     /// Avancer et côté demandés au pas d'avant.
     last_axes: (f32, f32),
+    /// (v185) Arrêté par un mur à l'horizontale pendant ce pas.
+    bumped: bool,
 }
 
 /// Un autre joueur, vu comme un obstacle.
@@ -254,6 +314,7 @@ impl Player {
             carry: 250,
             released: [None, None],
             last_axes: (0.0, 0.0),
+            bumped: false,
         }
     }
 
@@ -610,12 +671,14 @@ impl Player {
         }
         // Dans l'eau ou la lave : on nage.
         self.swimming = None;
+        let mut swims = false;
         if !self.flying && !self.noclip {
-            if let Some(f) = in_fluid(world, self.pos) {
+            if let Some(b) = bath(world, self.pos, self.height()) {
+                let f = b.fluid;
                 self.swimming = Some(f);
-                let (cap, sink) = match f {
-                    Fluid::Water => (SWIM_WATER * if m.sprint { 1.4 } else { 1.0 }, SINK_WATER),
-                    Fluid::Lava => (SWIM_LAVA, SINK_LAVA),
+                let sink = match f {
+                    Fluid::Water => SINK_WATER,
+                    Fluid::Lava => SINK_LAVA,
                 };
                 if fps {
                     // Mode FPS : l'eau ne ralentit pas et l'on n'y nage pas (on y marche et
@@ -626,7 +689,8 @@ impl Player {
                         self.vel.y = vy0 + (sink - vy0) * k;
                     }
                 } else {
-                    self.swim(wish, cap, sink, v0, vy0, m.jump, dt);
+                    swims = true;
+                    self.swim(&b, wish, m, v0, vy0, dt);
                 }
             }
         }
@@ -753,6 +817,7 @@ impl Player {
         let step = delta / steps as f32;
         let was_on_ground = self.on_ground;
         self.on_ground = false;
+        self.bumped = false;
         for _ in 0..steps {
             for axis in [1, 0, 2] {
                 let before = self.pos;
@@ -768,6 +833,11 @@ impl Player {
                     self.vel[axis] = 0.0;
                 }
             }
+        }
+        // (v185) En nageant contre un bord, la tête presque hors de l'eau : on s'en hisse,
+        // comme dans Minecraft.
+        if swims && self.bumped && wish != Vec3::ZERO && self.free_above(world) {
+            self.vel.y = self.vel.y.max(LEDGE_BOOST);
         }
         // Mode FPS : en descendant d'une dalle (une marche d'au plus STEP_HEIGHT), on reste
         // collé au sol, sans chute ni atterrissage (sauf si on vient de sauter).
@@ -788,20 +858,72 @@ impl Player {
         }
     }
 
-    /// Nage (hors mode FPS) : vitesse plafonnée à `cap` dans le fluide, on y coule à
-    /// `sink`, Saut fait remonter. Depuis la vitesse d'avant ce pas (`v0`, `vy0`) : ni
-    /// l'accélération de la marche ni la gravité ne comptent dans un fluide.
-    #[allow(clippy::too_many_arguments)]
-    fn swim(&mut self, wish: Vec3, cap: f32, sink: f32, v0: Vec3, vy0: f32, jump: bool, dt: f32) {
-        let k = (dt * 6.0).min(1.0);
-        let target = wish * cap;
+    /// Nage (hors mode FPS) dans le fluide `b` : vitesse voulue plafonnée selon le fluide,
+    /// plus le courant ; on y coule doucement, Saut fait remonter, Accroupi plonger. Depuis
+    /// la vitesse d'avant ce pas (`v0`, `vy0`) : ni l'accélération de la marche ni la
+    /// gravité ne comptent dans un fluide. (v185) Au sol dans moins de 0,4 bloc de fluide,
+    /// Saut est un vrai saut, comme dans Minecraft.
+    fn swim(&mut self, b: &Bath, wish: Vec3, m: &MoveInput, v0: Vec3, vy0: f32, dt: f32) {
+        let water = b.fluid == Fluid::Water;
+        let (cap, sink, up, current, grip) = if water {
+            let cap = if m.sprint {
+                SWIM_WATER_SPRINT
+            } else {
+                SWIM_WATER
+            };
+            (cap, SINK_WATER, SWIM_UP_WATER, CURRENT_WATER, 4.5)
+        } else {
+            (SWIM_LAVA, SINK_LAVA, SWIM_UP_LAVA, CURRENT_LAVA, 14.0)
+        };
+        let k = (dt * grip).min(1.0);
+        let target = wish * cap + b.current * current;
         self.vel.x = v0.x + (target.x - v0.x) * k;
         self.vel.z = v0.z + (target.z - v0.z) * k;
-        let up = if jump { SWIM_UP } else { sink };
+        if m.jump && self.on_ground && b.depth <= SHALLOW {
+            self.vel.y = JUMP_SPEED;
+            return;
+        }
+        let up = if m.jump {
+            up
+        } else if m.sneak && water {
+            DIVE_WATER
+        } else {
+            sink
+        };
         // On garde l'élan d'un saut hors de l'eau quelques instants, mais une chute est
         // freinée aussitôt.
         let k = (dt * if vy0 < up { 8.0 } else { 3.0 }).min(1.0);
         self.vel.y = vy0 + (up - vy0) * k;
+    }
+
+    /// (v185) La boîte du joueur montée de 0,6 bloc ne touche ni bloc ni fluide : en nageant
+    /// contre un bord, on peut s'en hisser (voir `LEDGE_BOOST`).
+    fn free_above(&self, world: &World) -> bool {
+        let h = Vec3::new(HALF_WIDTH, 0.0, HALF_WIDTH);
+        let lift = Vec3::Y * 0.6;
+        let (pmin, pmax) = (
+            self.pos - h + lift,
+            self.pos + h + lift + Vec3::Y * self.height(),
+        );
+        let lo = pmin.floor().as_ivec3();
+        let hi = (pmax - Vec3::splat(TOUCH)).floor().as_ivec3();
+        for y in lo.y..=hi.y {
+            for z in lo.z..=hi.z {
+                for x in lo.x..=hi.x {
+                    if crate::fluids::surface(world, [x, y, z])
+                        .is_some_and(|(_, s)| y as f32 + s > pmin.y)
+                    {
+                        return false;
+                    }
+                    for (bmin, bmax) in collision_boxes(world, x, y, z) {
+                        if (0..3).all(|k| pmin[k] < bmax[k] - TOUCH && pmax[k] > bmin[k] + TOUCH) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Vitesse horizontale (blocs/s).
@@ -978,6 +1100,7 @@ impl Player {
             self.pos = blocked;
         }
         self.vel[axis] = 0.0;
+        self.bumped = true;
     }
 
     /// Y a-t-il un appui sous les pieds (à moins de 0,6 bloc) ?
@@ -1297,6 +1420,177 @@ mod tests {
         let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
         p.update(&w, &none, dt);
         assert_eq!(p.swimming, Some(Fluid::Lava));
+    }
+
+    /// (v185) Les vitesses de Minecraft : dans l'eau on coule à 0,5 bloc/s, Saut fait
+    /// remonter à 3,5, Accroupi plonger à 4,5, on nage à 2 (3,9 en courant) ; dans la lave,
+    /// tout va à 0,8.
+    #[test]
+    fn sinks_rises_dives_and_swims_at_minecraft_speeds() {
+        let mut w = flat_world();
+        for y in 11..30 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    w.set(x, y, z, BlockId::WATER);
+                }
+            }
+        }
+        let dt = 1.0 / 64.0;
+        let run = |p: &mut Player, w: &World, m: MoveInput, s: f32| {
+            for _ in 0..(s / dt) as usize {
+                p.update(w, &m, dt);
+            }
+        };
+        let flat = |p: &Player| Vec3::new(p.vel.x, 0.0, p.vel.z).length();
+        let mut p = Player::new(Vec3::new(2.5, 20.0, 8.5));
+        p.yaw = std::f32::consts::FRAC_PI_2;
+        run(&mut p, &w, MoveInput::default(), 2.0);
+        assert!((p.vel.y + 0.5).abs() < 0.05, "coule : {}", p.vel.y);
+        let jump = MoveInput {
+            jump: true,
+            ..Default::default()
+        };
+        run(&mut p, &w, jump, 1.5);
+        assert!((p.vel.y - 3.5).abs() < 0.1, "remonte : {}", p.vel.y);
+        let sneak = MoveInput {
+            sneak: true,
+            ..Default::default()
+        };
+        run(&mut p, &w, sneak, 1.5);
+        assert!((p.vel.y + 4.5).abs() < 0.1, "plonge : {}", p.vel.y);
+        let fwd = MoveInput {
+            forward: 1.0,
+            ..Default::default()
+        };
+        run(&mut p, &w, fwd, 1.5);
+        assert!((flat(&p) - 2.0).abs() < 0.05, "nage : {}", flat(&p));
+        let sprint = MoveInput {
+            forward: 1.0,
+            sprint: true,
+            ..Default::default()
+        };
+        run(&mut p, &w, sprint, 1.5);
+        assert!((flat(&p) - 3.9).abs() < 0.1, "nage rapide : {}", flat(&p));
+        // Lave.
+        let lava = minelib_world::registry::registry().by_key("lava").unwrap();
+        let mut w = flat_world();
+        for y in 11..25 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    w.set(x, y, z, lava);
+                }
+            }
+        }
+        let mut p = Player::new(Vec3::new(8.5, 18.0, 8.5));
+        run(&mut p, &w, MoveInput::default(), 1.0);
+        assert!(
+            (p.vel.y + 0.8).abs() < 0.05,
+            "coule dans la lave : {}",
+            p.vel.y
+        );
+        run(&mut p, &w, jump, 1.0);
+        assert!(
+            (p.vel.y - 0.8).abs() < 0.05,
+            "remonte de la lave : {}",
+            p.vel.y
+        );
+    }
+
+    /// (v185) Le courant pousse : immobile dans un ruisseau, on descend avec lui (jusqu'à
+    /// 1,4 bloc/s, comme dans Minecraft) ; dans un lac (que des sources), rien.
+    #[test]
+    fn the_current_carries_the_player_downstream() {
+        let reg = minelib_world::registry::registry();
+        let mut w = flat_world();
+        for x in 0..16 {
+            w.set(x, 11, 7, BlockId::STONE);
+            w.set(x, 11, 9, BlockId::STONE);
+        }
+        w.set(2, 11, 8, BlockId::WATER);
+        for (i, x) in (3..10).enumerate() {
+            let flow = reg.by_key(&format!("water_flow:{}", 7 - i)).unwrap();
+            w.set(x, 11, 8, flow);
+        }
+        let dt = 1.0 / 64.0;
+        let mut p = Player::new(Vec3::new(3.5, 11.0, 8.5));
+        for _ in 0..64 {
+            p.update(&w, &MoveInput::default(), dt);
+        }
+        assert!(p.pos.x > 4.3, "emporté : {}", p.pos.x);
+        assert!(p.vel.x > 0.8 && p.vel.x < 1.45, "{}", p.vel.x);
+        assert!(p.vel.z.abs() < 0.01);
+        // Lac : immobile.
+        let mut w = flat_world();
+        for z in 0..16 {
+            for x in 0..16 {
+                w.set(x, 11, z, BlockId::WATER);
+            }
+        }
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        for _ in 0..64 {
+            p.update(&w, &MoveInput::default(), dt);
+        }
+        assert!(Vec3::new(p.vel.x, 0.0, p.vel.z).length() < 1e-4);
+    }
+
+    /// (v185) Sortir de l'eau comme dans Minecraft : on se hisse sur le bord en nageant
+    /// contre lui (Saut tenu), et dans une flaque (moins de 0,4 bloc) Saut est un vrai saut.
+    #[test]
+    fn climbs_out_of_a_pool_and_jumps_out_of_a_puddle() {
+        let mut w = flat_world();
+        // Bassin de deux blocs de fond (x < 10) ; au-delà, le bord (dessus à y = 13).
+        for z in 0..16 {
+            for x in 0..16 {
+                let b = if x < 10 {
+                    BlockId::WATER
+                } else {
+                    BlockId::STONE
+                };
+                w.set(x, 11, z, b);
+                w.set(x, 12, z, b);
+            }
+        }
+        let dt = 1.0 / 64.0;
+        let mut p = Player::new(Vec3::new(6.5, 11.2, 8.5));
+        p.yaw = std::f32::consts::FRAC_PI_2;
+        let out = MoveInput {
+            forward: 1.0,
+            jump: true,
+            ..Default::default()
+        };
+        let mut t = 0.0;
+        while p.pos.x < 11.0 && t < 4.0 {
+            p.update(&w, &out, dt);
+            t += dt;
+        }
+        assert!(
+            p.pos.x >= 11.0 && p.pos.y > 13.0 - 1e-3,
+            "{:?} après {t} s",
+            p.pos
+        );
+        // Flaque : niveau 2 (2/9 de bloc) sur le sol.
+        let puddle = minelib_world::registry::registry()
+            .by_key("water_flow:2")
+            .unwrap();
+        let mut w = flat_world();
+        for z in 0..16 {
+            for x in 0..16 {
+                w.set(x, 11, z, puddle);
+            }
+        }
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+        p.update(&w, &MoveInput::default(), dt);
+        assert!(p.on_ground && p.swimming == Some(Fluid::Water));
+        let jump = MoveInput {
+            jump: true,
+            ..Default::default()
+        };
+        let mut top: f32 = 0.0;
+        for _ in 0..40 {
+            p.update(&w, &jump, dt);
+            top = top.max(p.pos.y);
+        }
+        assert!(top > 12.1, "saut hors de la flaque : {top}");
     }
 
     #[test]

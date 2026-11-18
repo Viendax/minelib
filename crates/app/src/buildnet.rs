@@ -39,12 +39,11 @@ use minelib_net::transport::{self, Inbound};
 use minelib_world::{BlockId, ChunkPos, World};
 
 /// Changement que l'écoulement d'un fluide peut faire : fluide qui avance (dans le vide,
-/// une plante ou un fluide), qui sèche, ou qui se fige (obsidienne, pierre taillée, pierre).
+/// une plante, (v185) une torche ou de la redstone qu'il emporte, ou un fluide), qui sèche,
+/// ou qui se fige (obsidienne, pierre taillée, pierre).
 fn fluid_edit(old: BlockId, new: BlockId) -> bool {
-    use minelib_world::registry::{fluid, Shape};
-    let open = |b: BlockId| {
-        b == BlockId::AIR || fluid(b).is_some() || matches!(b.def().shape, Shape::Cross)
-    };
+    use minelib_world::registry::{fluid, washed_by_fluid};
+    let open = |b: BlockId| b == BlockId::AIR || fluid(b).is_some() || washed_by_fluid(b);
     let set = |b: BlockId| {
         b == BlockId::AIR
             || fluid(b).is_some()
