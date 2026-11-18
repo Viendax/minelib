@@ -188,6 +188,15 @@ pub struct Place {
     pub speed: f32,
 }
 
+/// (v174) Retour d'un joueur sorti de la partie (mode spectateur contre les bots).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resume {
+    /// Dans la même manche, comme il l'avait laissée (vie, armes).
+    AsBefore,
+    /// Comme à un départ de manche (`reset` : armes de départ).
+    Fresh { reset: bool },
+}
+
 /// Ce que l'hôte doit faire après un pas des règles.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ev {
@@ -808,6 +817,46 @@ impl Match {
             v.no.retain(|&i| i != id);
         }
         self.votes.retain(|v| v.caller != id && v.target != id);
+    }
+
+    /// (v174) Un joueur sort de la partie sans la quitter (mode spectateur contre les
+    /// bots) : comme `leave` (il lâche la bombe, les autres continuent), sans la pause
+    /// technique d'un joueur déconnecté. Il revient par `step_in`.
+    pub fn step_out(&mut self, id: u64, at: Option<Vec3>) {
+        let pending = self.tech_pending;
+        self.leave(id, at);
+        self.tech_pending = pending;
+    }
+
+    /// (v174) Retour d'un joueur sorti par `step_out` : de nouveau en jeu tout de suite
+    /// (là où il se trouve) si la manche se joue, sinon au départ de la suivante. Dans la
+    /// même manche, s'il était en vie, il reprend comme il l'avait laissée (vie, armes) ;
+    /// sinon comme à un départ de manche (vie pleine, armes de départ s'il était mort).
+    /// `None` : il attend la manche suivante, ou n'est plus dans la partie.
+    pub fn step_in(&mut self, id: u64, same_round: bool, was_alive: bool) -> Option<Resume> {
+        let live = matches!(self.phase, phase::FREEZE | phase::LIVE | phase::PLANTED);
+        let p = self.players.get_mut(&id)?;
+        if p.excluded() {
+            return None;
+        }
+        p.present = true;
+        let keep = same_round && was_alive;
+        if !live {
+            // Fin de manche, mi-temps : en vie s'il l'était (il garde ses armes à la
+            // suivante).
+            p.alive = keep;
+            return None;
+        }
+        p.alive = true;
+        p.dead_for = 0.0;
+        if keep {
+            return Some(Resume::AsBefore);
+        }
+        let reset = p.reset || !was_alive;
+        p.hp = 100;
+        p.reset = false;
+        let _ = self.spawn(id, reset);
+        Some(Resume::Fresh { reset })
     }
 
     /// Changer d'équipe : refusé. Les équipes sont faites à l'entrée (matchmaking, lobby
@@ -2395,6 +2444,50 @@ mod tests {
         let mut w = Match::new(FpsMap::default(), [0; 32], 7);
         w.join(1, "A");
         assert!(w.call_vote(1, VOTE_SURRENDER, u64::MAX).is_err());
+    }
+
+    /// (v174) Partie regardée en spectateur : on en sort sans pause technique (la bombe
+    /// tombe), on revient tout de suite : comme on l'avait laissée dans la même manche,
+    /// comme à un départ de manche sinon ; en fin de manche, à la suivante.
+    #[test]
+    fn a_player_steps_out_and_back_in_at_any_moment() {
+        let mut m = full_match();
+        while m.phase == phase::FREEZE {
+            m.tick(1.0 / 128.0, &BTreeMap::new());
+        }
+        let t = m.carrier.expect("un T a la bombe");
+        m.players.get_mut(&t).unwrap().hp = 63;
+        let at = Vec3::new(3.0, 10.0, 4.0);
+        m.step_out(t, Some(at));
+        assert!(!m.tech_pending, "pas de pause technique");
+        assert_eq!(m.bomb, bomb::DROPPED);
+        assert_eq!(m.bomb_pos, at);
+        assert!(!m.players[&t].alive && !m.players[&t].present);
+        // Retour dans la même manche, sorti en vie : comme il l'avait laissée.
+        assert_eq!(m.step_in(t, true, true), Some(Resume::AsBefore));
+        let p = &m.players[&t];
+        assert!(p.present && p.alive && p.hp == 63);
+        // Sorti mort, revenu dans la même manche : comme à un départ, armes de départ.
+        m.step_out(t, None);
+        assert_eq!(
+            m.step_in(t, true, false),
+            Some(Resume::Fresh { reset: true })
+        );
+        let p = &m.players[&t];
+        assert!(p.alive && p.hp == 100 && p.guns == (255, starter(T)));
+        // Sorti en vie, revenu à une autre manche : vie pleine, armes gardées.
+        m.players.get_mut(&t).unwrap().guns = (7, starter(T));
+        m.step_out(t, None);
+        assert_eq!(
+            m.step_in(t, false, true),
+            Some(Resume::Fresh { reset: false })
+        );
+        assert_eq!(m.players[&t].guns.0, 7);
+        // En fin de manche : à la suivante (en vie s'il l'était).
+        m.step_out(t, None);
+        m.phase = phase::ROUND_END;
+        assert_eq!(m.step_in(t, true, true), None);
+        assert!(m.players[&t].present && m.players[&t].alive);
     }
 
     fn full_match() -> Match {

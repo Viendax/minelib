@@ -39,6 +39,35 @@ use crate::weapons::{Category, WEAPONS};
 /// Identifiants des bots (bien au-delà de ceux que donne le relais).
 pub const BOT_BASE: u64 = 0x0B07_0000_0000_0000;
 
+/// (v174) Niveaux des bots, du plus facile au plus fort (`/bots facile|normal|difficile`).
+pub const LEVELS: [&str; 3] = ["facile", "normal", "difficile"];
+
+/// Niveau choisi (gardé dans `.minelib/bots_niveau`) ; facile par défaut.
+pub fn saved_level() -> u8 {
+    std::fs::read_to_string(minelib_assets::data_dir().join("bots_niveau"))
+        .ok()
+        .and_then(|s| level_named(s.trim()))
+        .unwrap_or(0)
+}
+
+/// Garde le niveau choisi pour les parties suivantes.
+pub fn save_level(level: u8) {
+    let name = LEVELS[level.min(2) as usize];
+    if let Err(e) = std::fs::write(minelib_assets::data_dir().join("bots_niveau"), name) {
+        log::warn!("niveau des bots non enregistré : {e}");
+    }
+}
+
+/// Niveau d'après son nom (français ou anglais).
+pub fn level_named(s: &str) -> Option<u8> {
+    match s.to_lowercase().as_str() {
+        "facile" | "easy" | "0" => Some(0),
+        "normal" | "moyen" | "1" => Some(1),
+        "difficile" | "dur" | "hard" | "2" => Some(2),
+        _ => None,
+    }
+}
+
 /// Prénoms des bots (pseudos « BOT <prénom> » : l'espace les distingue des vrais
 /// joueurs, dont le pseudo n'en a jamais).
 const NAMES: [&str; 20] = [
@@ -642,6 +671,8 @@ fn team_index(team: u8) -> usize {
 }
 
 pub struct Bots {
+    /// (v174) Niveau des bots (0 facile, 1 normal, 2 difficile).
+    level: u8,
     nav: Option<Arc<Nav>>,
     building: Option<Receiver<Nav>>,
     brains: Vec<Brain>,
@@ -687,8 +718,10 @@ fn xorshift(s: &mut u32) -> u32 {
 }
 
 impl Bots {
-    pub fn new(seed: u32) -> Self {
+    /// `level` : adresse des bots (`LEVELS` : 0 facile, 1 normal, 2 difficile).
+    pub fn new(seed: u32, level: u8) -> Self {
         Self {
+            level: level.min(2),
             nav: None,
             building: None,
             brains: Vec::new(),
@@ -764,8 +797,10 @@ impl Bots {
     /// Un bot de plus (identifiant donné par l'hôte).
     pub fn add(&mut self, id: u64) {
         let seed = xorshift(&mut self.rng);
-        // De bons joueurs, pas tous égaux.
-        let skill = 0.72 + (seed % 1000) as f32 / 1000.0 * 0.23;
+        // (v174) Adresse selon le niveau choisi, pas tous égaux : facile 0,20 à 0,42,
+        // normal 0,45 à 0,68, difficile 0,72 à 0,95 (les bots d'avant).
+        let (low, span) = [(0.20, 0.22), (0.45, 0.23), (0.72, 0.23)][self.level as usize];
+        let skill = low + (seed % 1000) as f32 / 1000.0 * span;
         self.brains.push(Brain::new(id, skill, seed));
     }
 
@@ -1172,8 +1207,9 @@ impl Brain {
     }
 
     fn reaction(&self, cx: &mut Ctx) -> f32 {
-        // Entre 0,17 et 0,32 s environ selon l'adresse, avec un peu de hasard.
-        0.34 - 0.2 * self.skill + cx.unit() * 0.08
+        // (v174) De 0,36 à 0,47 s pour un bot facile, de 0,17 à 0,27 s pour un difficile,
+        // avec un peu de hasard.
+        0.42 - 0.27 * self.skill + cx.unit() * 0.1
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1474,17 +1510,21 @@ impl Brain {
                     let base = self.reaction(cx);
                     self.react = if expected { base * 0.7 } else { base };
                     self.target = Some(b.id);
-                    self.head_aim = cx.unit() < 0.35 + 0.45 * self.skill;
+                    self.head_aim = cx.unit() < 0.1 + 0.7 * self.skill;
                     self.duck_fight = cx.unit() < 0.25;
                     self.burst = 0;
-                    // Premier coup d'œil un peu à côté (plus ou moins selon l'adresse).
+                    // Premier coup d'œil un peu à côté (plus ou moins selon l'adresse), même
+                    // quand l'ennemi est déjà devant.
                     let (ty, tp) = angles(b.head() - me.eye());
                     let dy = wrap(ty - self.yaw);
                     let dp = tp - self.pitch;
-                    let k = (1.0 - self.skill) * 0.35;
+                    let k = (1.0 - self.skill) * 0.5;
+                    let off = (1.0 - self.skill) * 0.08;
                     self.aim_err = (
-                        dy * k * (cx.unit() * 2.0 - 1.0),
-                        dp * k * (cx.unit() * 2.0 - 1.0) + 0.01 * (cx.unit() - 0.5),
+                        dy * k * (cx.unit() * 2.0 - 1.0) + off * (cx.unit() * 2.0 - 1.0),
+                        dp * k * (cx.unit() * 2.0 - 1.0)
+                            + off * 0.6 * (cx.unit() * 2.0 - 1.0)
+                            + 0.01 * (cx.unit() - 0.5),
                     );
                 }
                 Some(b)
@@ -2213,11 +2253,11 @@ impl Brain {
             // Erreur du premier coup d'œil, qui se corrige.
             ty += self.aim_err.0;
             tp += self.aim_err.1;
-            let decay = (dt * (3.0 + 4.0 * self.skill)).min(1.0);
+            let decay = (dt * (1.5 + 5.5 * self.skill)).min(1.0);
             self.aim_err.0 -= self.aim_err.0 * decay;
             self.aim_err.1 -= self.aim_err.1 * decay;
-            // Léger tremblement de la main.
-            let w = (1.0 - self.skill) * 0.004;
+            // Tremblement de la main (bien visible chez un bot facile).
+            let w = (1.0 - self.skill) * 0.015;
             let t = now * 2.3 + self.seed as f32 * 1e-6;
             ty += w * t.sin();
             tp += w * (t * 1.7).cos();
@@ -2228,7 +2268,7 @@ impl Brain {
         }
         // Vitesse de rotation humaine : rapide en combat, tranquille sinon.
         let (rate, max) = if combat {
-            (10.0 + 8.0 * self.skill, 9.0 + 6.0 * self.skill)
+            (6.0 + 14.0 * self.skill, 5.0 + 11.0 * self.skill)
         } else {
             (5.0, 4.5)
         };
@@ -2264,7 +2304,7 @@ impl Brain {
         let look = look_dir(self.yaw, self.pitch);
         let err = look.angle_between(to / dist.max(1e-3));
         let half = if self.head_aim { 0.11 } else { 0.2 };
-        let tol = (half / dist.max(0.5)).atan() + 0.004 * (1.0 - self.skill);
+        let tol = (half / dist.max(0.5)).atan() + 0.012 * (1.0 - self.skill);
         if err > tol {
             return;
         }
@@ -2305,7 +2345,7 @@ impl Brain {
                     30
                 };
             }
-        } else if self.since_shot < def.interval() + 0.05 + (1.0 - self.skill) * 0.15 {
+        } else if self.since_shot < def.interval() + 0.05 + (1.0 - self.skill) * 0.25 {
             return;
         }
         let snipe = def.scope.len() > 1;
@@ -2319,7 +2359,7 @@ impl Brain {
         let spread = crate::fps::spread_deg(def, speed, me.on_ground, self.scoped, settled);
         let (up, side) = def.spray(self.spray_n);
         // Recul : contrôlé en bonne partie (on tire la souris vers le bas).
-        let comp = 0.55 + 0.4 * self.skill;
+        let comp = 0.3 + 0.65 * self.skill;
         let up = up * (1.0 - comp);
         let side = side * (1.0 - comp);
         let mut dirs = Vec::new();

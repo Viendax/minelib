@@ -1285,6 +1285,11 @@ impl Session {
                         if input.grabbed && self.keys.pressed(input, Action::FpsFire) {
                             self.spectate_idx += 1;
                         }
+                        // (v174) Clic droit (lunette) : le précédent.
+                        if input.grabbed && self.keys.pressed(input, Action::FpsScope) {
+                            let n = mates.len();
+                            self.spectate_idx = (self.spectate_idx % n + n - 1) % n;
+                        }
                         let v = &mates[self.spectate_idx % mates.len()];
                         self.player.pos = v.pos;
                         self.player.yaw = v.yaw;
@@ -3027,9 +3032,30 @@ impl Session {
     /// Change le mode de jeu du joueur.
     pub fn set_mode(&mut self, mode: GameMode) {
         // (v172) Mode FPS en solo : partie contre des bots (lancée à l'image suivante) ;
-        // on la quitte en changeant de mode.
+        // on la quitte en changeant de mode. (v174) Sauf en spectateur : on la regarde,
+        // les bots continuent entre eux, et on y revient en repassant en mode FPS (à la
+        // manche suivante).
+        let solo = self.net.as_ref().is_some_and(|n| n.is_solo());
         if mode == GameMode::Fps {
             self.bots_auto = true;
+            if let Some(n) = self.net.as_mut().filter(|_| solo) {
+                if !n.set_away(false) && !self.net_dead {
+                    // Revenu en pleine manche : mort jusqu'à la suivante.
+                    self.net_dead = true;
+                    self.fps.hp = 0;
+                    self.fps.buy_open = false;
+                }
+            }
+        } else if mode == GameMode::Spectator && solo {
+            if let Some(n) = self.net.as_mut() {
+                n.set_away(true);
+            }
+            self.spectating = None;
+            self.fps.buy_open = false;
+            self.chat.say(
+                "Les bots continuent la partie. (gm fps : la reprendre là où tu es.)",
+                chat::YELLOW,
+            );
         } else {
             self.stop_bots();
         }
@@ -3075,14 +3101,24 @@ impl Session {
             log::warn!("bots : sauvegarde avant le relevé de la carte impossible : {e:#}");
         }
         let nav = crate::bots::nav_in_background(self.dir.clone(), map.clone(), vec![spawn]);
-        self.net = Some(crate::netgame::NetGame::solo(pseudo, map, spawn, Some(nav)));
+        let level = crate::bots::saved_level();
+        self.net = Some(crate::netgame::NetGame::solo(
+            pseudo,
+            map,
+            spawn,
+            Some(nav),
+            level,
+        ));
         self.net_dead = false;
         self.player.flying = false;
         self.radar_map = false;
         self.game_over = None;
         self.chat.say(
-            "Partie contre des bots : elle commence. (/bots off pour les retirer, /bots \
-             pour en refaire une.)",
+            format!(
+                "Partie contre des bots ({}) : elle commence. (/bots off pour les retirer, \
+                 /bots pour en refaire une, /bots facile|normal|difficile pour leur niveau.)",
+                crate::bots::LEVELS[level as usize]
+            ),
             chat::YELLOW,
         );
     }
@@ -3474,6 +3510,16 @@ impl Session {
                     self.fps.new_round(reset, team, !warmup);
                     self.net_dead = false;
                 }
+                // (v174) Retour dans la partie solo après le mode spectateur, là où l'on
+                // est (rien n'est effacé dans le monde : fumées, grenades en vol).
+                Local::Resume { fresh, reset, team } => {
+                    if fresh {
+                        self.fps.new_round(reset, team, false);
+                    }
+                    self.net_dead = false;
+                    self.spectating = None;
+                    self.chat.say("Tu reprends la partie.", chat::YELLOW);
+                }
                 Local::Chat(t) => self.chat.say(t, chat::WHITE),
                 Local::Notice(t) => self.chat.say(t, chat::YELLOW),
                 Local::Hit { head } => self.fps.hit_marker = (0.25, head),
@@ -3678,7 +3724,12 @@ impl Session {
             }
         }
         // Éditeur de lumières ouvert (FPS solo) : ni tir, ni arme, même en tournant la vue.
-        let free = input.grabbed && !typing && !self.fps.buy_open && !self.light_editor.open;
+        // (v174) Mort (en partie) : plus de tir ni d'arme ; le clic change de joueur suivi.
+        let free = input.grabbed
+            && !typing
+            && !self.fps.buy_open
+            && !self.light_editor.open
+            && !self.net_dead;
         let k = &self.keys;
         let c = crate::fps::Controls {
             trigger_pressed: free && k.pressed(input, Action::FpsFire),
@@ -4521,6 +4572,23 @@ impl Session {
                             .say("Bots retirés : tu es seul sur la carte.", chat::YELLOW);
                     }
                 }
+                // (v174) Niveau des bots, gardé pour les parties suivantes ; la partie
+                // reprend du début avec eux.
+                Some(l) if crate::bots::level_named(l).is_some() => {
+                    let level = crate::bots::level_named(l).unwrap_or(0);
+                    crate::bots::save_level(level);
+                    self.chat.say(
+                        format!("Bots : niveau {}.", crate::bots::LEVELS[level as usize]),
+                        chat::YELLOW,
+                    );
+                    if self.game.mode == GameMode::Fps && self.online_match() {
+                        return;
+                    }
+                    if self.game.mode == GameMode::Fps {
+                        self.stop_bots();
+                        self.bots_auto = true;
+                    }
+                }
                 _ => {
                     if self.game.mode != GameMode::Fps {
                         self.chat
@@ -5072,7 +5140,7 @@ impl Session {
         }
         // Mort : qui on suit.
         if let Some(name) = &self.spectating {
-            let t = format!("Tu regardes {name} (clic : suivant)");
+            let t = format!("Tu regardes {name} (clic : suivant, clic droit : précédent)");
             ui.text(
                 cx - Ui::text_width(&t, s) / 2.0,
                 size.1 * 0.8,
@@ -6020,6 +6088,14 @@ impl Session {
         let mut layers = self.skin_layers.borrow_mut();
         layers.begin(renderer);
         let mut players: Vec<minelib_render::PlayerInstance> = Vec::new();
+        // (v174) Mort en FPS : on regarde par les yeux d'un coéquipier ; son corps (et ce
+        // qu'il tient, la bombe sur son dos) n'est pas dessiné autour de la caméra. Son
+        // ombre reste, comme la sienne.
+        let inside = if free {
+            None
+        } else {
+            self.spectating.as_deref()
+        };
         // Partie en ligne : les autres joueurs.
         if let Some(n) = &self.net {
             for v in n.views().iter().filter(|v| v.alive) {
@@ -6037,12 +6113,19 @@ impl Session {
                     skin: self.skins.of(&v.pseudo),
                 };
                 shadows.push((v.pos, crate::player_model::shadow_boxes(&other)));
+                if inside == Some(v.pseudo.as_str()) {
+                    continue;
+                }
                 let layer = layers.layer(other.skin.as_ref(), renderer);
                 players.push(crate::player_model::instance(&other, layer));
                 model.extend(crate::player_model::held_model(&other));
             }
             // Bombe sur le dos de celui qui la porte.
-            for v in n.views().iter().filter(|v| v.alive) {
+            for v in n
+                .views()
+                .iter()
+                .filter(|v| v.alive && inside != Some(v.pseudo.as_str()))
+            {
                 if v.flags & minelib_net::game::FLAG_BOMB != 0 {
                     let back = Vec3::new(-v.yaw.sin(), 0.0, v.yaw.cos()) * 0.3;
                     model.extend(crate::player_model::bomb(

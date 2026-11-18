@@ -122,6 +122,14 @@ pub enum Local {
         reset: bool,
         team: u8,
     },
+    /// (v174) Le joueur local reprend la partie solo (après le mode spectateur), là où il
+    /// se trouve : comme il l'avait laissée, ou comme à un départ de manche (`fresh` ;
+    /// `reset` : pistolet de départ).
+    Resume {
+        fresh: bool,
+        reset: bool,
+        team: u8,
+    },
     Chat(String),
     /// Ligne en couleur (annonces des règles).
     Notice(String),
@@ -1366,6 +1374,9 @@ pub struct Host {
     /// qui jouent comme des invités.
     solo: bool,
     bots: Option<Box<crate::bots::Bots>>,
+    /// (v174) Partie solo regardée en spectateur : le joueur local en est sorti (manches
+    /// jouées à ce moment, et s'il était en vie), les bots continuent entre eux.
+    away: Option<(u32, bool)>,
 }
 
 pub struct Guest {
@@ -1557,6 +1568,7 @@ impl NetGame {
             shown: HashMap::new(),
             solo: false,
             bots: None,
+            away: None,
         };
         h.events(ev, &mut out);
         h.out = out;
@@ -1572,6 +1584,7 @@ impl NetGame {
         map: FpsMap,
         spawn: Vec3,
         nav: Option<std::sync::mpsc::Receiver<crate::bots::Nav>>,
+        level: u8,
     ) -> Self {
         // Personne au bout du fil : les messages pour les autres ne partent nulle part.
         let (link, _) = std::sync::mpsc::channel();
@@ -1581,7 +1594,7 @@ impl NetGame {
             h.solo = true;
             h.auto_backup = false;
             let seed = h.rand();
-            let mut bots = crate::bots::Bots::new(seed);
+            let mut bots = crate::bots::Bots::new(seed, level);
             if let Some(rx) = nav {
                 bots.set_building(rx);
             }
@@ -1600,6 +1613,52 @@ impl NetGame {
             h.out.extend(out);
         }
         g
+    }
+
+    /// (v174) Partie solo contre des bots : le joueur local la regarde en spectateur
+    /// (`away` : il en sort, la bombe tombe s'il l'avait, les bots continuent entre eux)
+    /// ou y revient tout de suite, là où il se trouve (`Match::step_in`). Rend s'il est en
+    /// vie dans la partie.
+    pub fn set_away(&mut self, away: bool) -> bool {
+        let NetGame::Host(h) = self else {
+            return true;
+        };
+        if h.solo {
+            if away && h.away.is_none() {
+                let alive = h.m.players.get(&0).is_some_and(|p| p.alive);
+                h.away = Some((h.m.played, alive));
+                let at = h.local_pos;
+                h.m.step_out(0, Some(at));
+            } else if !away {
+                if let Some((played, was_alive)) = h.away.take() {
+                    let team = h.m.players.get(&0).map_or(game::T, |p| p.team);
+                    match h.m.step_in(0, played == h.m.played, was_alive) {
+                        Some(crate::cs::Resume::AsBefore) => h.out.push(Local::Resume {
+                            fresh: false,
+                            reset: false,
+                            team,
+                        }),
+                        Some(crate::cs::Resume::Fresh { reset }) => {
+                            h.out.push(Local::Resume {
+                                fresh: true,
+                                reset,
+                                team,
+                            });
+                        }
+                        None if !h.m.players.contains_key(&0) => {
+                            // Plus dans la partie : il la rejoint comme un nouveau joueur.
+                            let pseudo = h.pseudo.clone();
+                            let ev = h.m.join_party(0, &pseudo, 0);
+                            let mut out = Vec::new();
+                            h.events(ev, &mut out);
+                            h.out.extend(out);
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        h.m.players.get(&0).is_some_and(|p| p.alive)
     }
 
     /// (v172) Partie solo contre des bots.
@@ -2285,6 +2344,7 @@ impl NetGame {
             shown: HashMap::new(),
             solo: false,
             bots: None,
+            away: None,
         }));
         if let NetGame::Host(h) = self {
             h.playing = h.m.players.contains_key(&0);
@@ -5037,7 +5097,7 @@ mod tests {
             h.spawns.clear();
             h.solo = true;
             h.auto_backup = false;
-            let mut bots = crate::bots::Bots::new(11);
+            let mut bots = crate::bots::Bots::new(11, 2);
             bots.set_nav(crate::bots::Nav::build(world, &map, &[spawn]));
             bots.set_calm(calm);
             for (i, name) in crate::bots::Bots::names(players, 3).into_iter().enumerate() {
@@ -5086,6 +5146,44 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// (v174) Partie solo : en spectateur, on en sort et elle continue sans nous ; de
+    /// retour, on y est tout de suite.
+    #[test]
+    fn a_solo_match_goes_on_while_the_player_watches() {
+        let (world, map, spawn) = obstacle_course();
+        let mut g = NetGame::solo("Moi".into(), map, spawn, None, 0);
+        let me = Player::new(spawn);
+        let input = MoveInput {
+            fps: true,
+            ..Default::default()
+        };
+        let dt = 1.0 / 256.0;
+        let step = |g: &mut NetGame, secs: f32| -> Vec<Local> {
+            let mut all = Vec::new();
+            for _ in 0..(secs / dt) as u32 {
+                g.on_tick(&world, &me, &input, dt);
+                all.extend(g.end_frame(&world, Vec::new(), 255, NadeOut::default(), dt));
+            }
+            all
+        };
+        step(&mut g, 1.0);
+        assert!(g.set_away(false), "en jeu : rien ne change");
+        assert!(!g.set_away(true), "sorti de la partie");
+        let before = host_of(&mut g).m.time;
+        step(&mut g, 2.0);
+        assert!(host_of(&mut g).m.time < before - 1.5, "elle continue sans lui");
+        assert!(g.set_away(false), "de retour tout de suite");
+        let out = step(&mut g, 0.1);
+        assert!(out.iter().any(|l| matches!(
+            l,
+            Local::Resume {
+                fresh: false,
+                reset: false,
+                ..
+            }
+        )));
     }
 
     /// Parcours d'obstacles : départ des T, une marche, un trou à sauter, une échelle qui

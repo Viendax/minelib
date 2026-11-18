@@ -23,7 +23,7 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 | | |
 |---|---|
 | 🧱 **Crée sans limite** | Un monde infini à façonner : continents, montagnes, grottes, forêts. Mode créatif, survie, et un **WorldEdit intégré** pour bâtir des villes entières en quelques commandes. |
-| 🔫 **Joue en compétitif** | Ta carte devient une arène **5 contre 5 aux règles de CS2** : 34 armes, 5 grenades, économie, bombe, classement Elo. Une carte se prépare en 4 commandes. |
+| 🔫 **Joue en compétitif** | Ta carte devient une arène **5 contre 5 en compétitif** : 34 armes, 5 grenades, économie, bombe, classement Elo. Une carte se prépare en 4 commandes. |
 | 💡 **Une image qui claque** | Raytracing en temps réel : miroirs, reflets sur l'eau, la glace et les métaux, lumière colorée des torches, fumigènes en volume qui contournent les murs. |
 | 🛡️ **Du fair-play, vraiment** | Les parties sont servies par des joueurs neutres, **rejouées et vérifiées au bit près**, avec un arbitre indépendant en cas de doute. Un facteur de confiance range les tricheurs ensemble. |
 | 🌍 **Joueurs illimités** | Un seul monde peut accueillir la planète entière : il se découpe tout seul en régions, servies par les jeux des joueurs. Tu ne vois que les 2 048 joueurs les plus proches de toi, et tu entends au vocal ceux qui sont à côté, où que tu sois. |
@@ -37,21 +37,22 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 **La sensation d'un FPS tactique de référence, dans un monde que tu as construit.**
 
 - **Déplacements au poil** : *air strafe*, **bunny hop**, saut accroupi pour monter à 1,5 bloc, et une vitesse qui dépend de l'arme en main (couteau rapide, AWP lourde).
-- **Des dégâts qui ne pardonnent pas** : valeurs de CS2 pour chaque arme, perte avec la distance, tête ×4, gilet et casque. Les balles traversent un mur fin.
+- **Des dégâts qui ne pardonnent pas** : des valeurs propres à chaque arme, perte avec la distance, tête ×4, gilet et casque. Les balles traversent un mur fin.
 - **34 armes et 5 grenades** : pistolets, mitraillettes, fusils à pompe, fusils d'assaut, fusils de précision ; HE, flash, fumigène, molotov et leurre (qui imite *ton* arme principale).
 - **Tout ce qu'on attend d'un compétitif** : menu d'achat par camp, économie, bombe et kit, prolongations, tableau des scores, fil des éliminations avec tirs en tête, à travers un mur ou une fumée, armes et grenades qu'on lâche et qu'on ramasse.
 - **Ton équipe, d'un coup d'œil** : un triangle à la couleur de chaque coéquipier, visible à travers les murs, et son nom quand tu le vois ; en haut, le bandeau des joueurs des deux camps (les morts s'assombrissent), et ta couleur préférée parmi vert, jaune, orange, bleu et violet.
-- **Votes et pauses comme dans CS** (Échap pendant une partie) : proposer d'exclure un coéquipier (tous les autres doivent être d'accord) ou une pause tactique (la majorité ; 3 par équipe, 30 s, au départ de la manche suivante). Le vote s'affiche à gauche : F1 oui, F2 non. Un joueur qui se déconnecte déclenche une pause technique jusqu'à son retour (5 minutes au plus) ; le temps de pause ne compte pas dans les absences.
+- **Votes et pauses** (Échap pendant une partie) : proposer d'exclure un coéquipier (tous les autres doivent être d'accord) ou une pause tactique (la majorité ; 3 par équipe, 30 s, au départ de la manche suivante). Le vote s'affiche à gauche : F1 oui, F2 non. Un joueur qui se déconnecte déclenche une pause technique jusqu'à son retour (5 minutes au plus) ; le temps de pause ne compte pas dans les absences.
 - **Ciel** analytique : dégradé selon l'heure, horizon doré au lever et au coucher, soleil avec halo, lune, étoiles qui scintillent et nuages qui dérivent, sans texture.
 - **Ombres des joueurs** au soleil et devant la lumière la plus proche (torche, lanterne).
-- **Minimap** en haut à droite, avec les règles de CS : tes coéquipiers toujours, les adversaires seulement quand ils sont repérés, les sites de bombe et la bombe quand ton équipe la connaît.
+- **Minimap** en haut à droite : tes coéquipiers toujours, les adversaires seulement quand ils sont repérés, les sites de bombe et la bombe quand ton équipe la connaît.
 - **Réseau à 256 Hz** : positions envoyées 256 fois par seconde, prédiction et rembobinage des tirs. À 10 joueurs, l'hôte envoie moins de 1 Mo par seconde.
+- **Entraîne-toi contre des bots** : en mode FPS dans un monde solo, la carte se remplit de bots qui achètent, se battent en équipe, posent et désamorcent la bombe. Trois niveaux : `/bots facile` (par défaut), `/bots normal`, `/bots difficile` ; `/bots off` pour jouer seul. En spectateur (`/gm 3`), la partie continue sans toi, et `/gm fps` t'y remet tout de suite.
 
 ### Jouer en ligne
 
 Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 
-- **Échelles comme dans CS** (en construction, les lianes se grimpent pareil) : posées contre le mur visé ; un saut te projette en arrière avec la force du saut ; contre l'échelle, on monte en avançant (on descend en regardant vers le bas), avec une demi-seconde pour prendre de la vitesse. À pleine vitesse, ses barreaux s'entendent ; accroupi, on grimpe plus lentement et sans bruit.
+- **Échelles** (en construction, les lianes se grimpent pareil) : posées contre le mur visé ; un saut te projette en arrière avec la force du saut ; contre l'échelle, on monte en avançant (on descend en regardant vers le bas), avec une demi-seconde pour prendre de la vitesse. À pleine vitesse, ses barreaux s'entendent ; accroupi, on grimpe plus lentement et sans bruit.
 - **Couleurs des coéquipiers** : bleu vif, orange vif, vert vif, jaune vif, violet foncé, puis rouge vif, rose flamant rose, blanc, gris clair, marron foncé. À N contre N, seules les N premières servent (les 5 premières en 5 contre 5). Teintes vérifiées pour les daltoniens (protanopie, deutéranopie, tritanopie).
 - **Une version, une partie** : on ne joue en ligne qu'avec la dernière version (bouton *Mettre à jour* en bas à gauche de l'accueil) et seulement avec des joueurs de la même version ; une partie commencée se finit dans sa version (ni le jeu ni le lanceur ne se mettent à jour avant la fin, l'accueil l'indique en vert). Une seule partie FPS à la fois par ordinateur.
 - **Ceux qui servent restent anonymes** : un garant ou l'hôte d'une région n'est jamais nommé aux joueurs, et les régions passent par les relais d'iroh (son adresse IP n'est pas donnée).
@@ -63,7 +64,7 @@ Ouvre **Multijoueur → FPS**, choisis une carte et appuie sur **Jouer**.
 - **Les cartes de la communauté** : toute carte déjà lancée en partie FPS en ligne apparaît dans la liste de tout le monde et se télécharge toute seule. Elle reste disponible tant qu'un joueur qui y a joué l'a encore (son jeu la renvoie au relais si besoin). Tes autres mondes restent privés.
 - Pendant l'échauffement, **les autres joueurs restent anonymes** (« Joueur 3 ») : on ne quitte pas la recherche parce qu'on a vu un nom. Les pseudos s'affichent quand la partie commence au complet.
 - **Matchmaking équitable** : d'abord un niveau Elo proche de l'équipe déjà formée (moyenne du lobby), puis les nouveaux avec les nouveaux, puis un facteur de confiance proche (le plus bas du lobby). Jamais avec quelqu'un que tu as signalé.
-- **Classement** : tes amis d'abord, le **Top mondial** à côté. Elo calculé comme aux échecs sur les parties 5 contre 5 des 10 cartes les plus jouées, avec les statistiques de CS (K/D, % de tirs à la tête, ADR, MVP).
+- **Classement** : tes amis d'abord, le **Top mondial** à côté. Elo calculé comme aux échecs sur les parties 5 contre 5 des 10 cartes les plus jouées, avec les statistiques habituelles (K/D, % de tirs à la tête, ADR, MVP).
 
 ### Le facteur de confiance
 
@@ -131,8 +132,8 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 - **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts.
 - **Survie, créatif, spectateur** (`/gm 0`, `1`, `3`), et **FPS** (`/gm 2`) pour essayer sa carte, même sur un serveur de construction.
 - **WorldEdit intégré** : plus de 40 commandes `//` (remplir, copier, coller, tourner, sphères, cylindres, annuler…). Sur un serveur de construction en ligne, réservé à ses OP : le relais vérifie et envoie les blocs à tous.
-- **L'eau et la lave coulent comme dans Minecraft** : sources infinies, chutes, écoulement vers le trou le plus proche, obsidienne et pierre taillée quand elles se rencontrent ; on y nage (lentement dans la lave, qui brûle). La **barrière à fluides** (`/give fluid_barrier`) est invisible comme la barrière, mais on la traverse : seuls l'eau et la lave s'y arrêtent.
-- **Des blocs qui se posent comme on s'y attend** : escaliers face à toi (à l'envers au plafond), dalles, portes (une double porte s'ouvre en miroir, battant droit à la texture retournée), trappes (elles se relèvent du côté choisi à la pose, comme dans Minecraft), vitres qui se raccordent, bannières et portes de deux blocs de haut, bûches couchées contre un mur, pots de fleurs où l'on met (clic droit avec une plante) et enlève (clic droit à nouveau) ses fleurs et plantes.
+- **L'eau et la lave coulent** : une source ne s'épuise pas, l'eau s'étale sur 7 blocs et la lave sur 3 en allant vers le trou le plus proche, elles tombent en chute ; deux sources d'eau côte à côte en font une troisième ; obsidienne et pierre taillée quand elles se rencontrent ; on y nage (lentement dans la lave, qui brûle). La **barrière à fluides** (`/give fluid_barrier`) est invisible comme la barrière, mais on la traverse : seuls l'eau et la lave s'y arrêtent.
+- **Des blocs qui se posent comme on s'y attend** : escaliers face à toi (à l'envers au plafond), dalles, portes (une double porte s'ouvre en miroir, battant droit à la texture retournée), trappes (elles se relèvent du côté choisi à la pose), vitres qui se raccordent, bannières et portes de deux blocs de haut, bûches couchées contre un mur, pots de fleurs où l'on met (clic droit avec une plante) et enlève (clic droit à nouveau) ses fleurs et plantes.
 - **Objets au sol et coffres** : la touche *Lâcher l'objet* (A sur un clavier AZERTY ; avec Ctrl, toute la pile) lance l'objet en main devant soi ; il flotte en tournant et se ramasse en passant dessus. Un clic droit ouvre un **coffre de 3 lignes de 10** : clic gauche pour prendre ou poser une pile, clic droit pour un seul objet ; cassé, il laisse tomber son contenu. En ligne, le relais arbitre chaque geste dans l'ordre (un objet quitte l'inventaire avant de partir et n'y entre qu'à la réponse) : deux joueurs qui prennent la même chose n'en obtiennent qu'un, et des essais automatiques (réseau qui perd, rejoue et mélange les messages) vérifient qu'aucun objet n'est jamais doublé.
 - **Éditeur de lumières** (touche **L**), d'après le mod *IRLights* : place des **lumières ponctuelles** et des **projecteurs** où tu veux, règle leur couleur, leur intensité, leur portée et leur cône, ajoute des **rayons volumétriques** (poussière, fumée), des **ombres douces** calculées sur les blocs (et les joueurs) et des **gobos** (motifs projetés : fenêtre, feuillage, vitrail… ou tes propres PNG du dossier `gobos`). Les flèches et les guides se tirent à la souris dans le monde, la **caméra libre** (F) se promène sans bouger ton personnage. Les lumières sont gardées avec le monde (`lumieres.json`) ; en option, des **lumières automatiques** s'allument sur les torches et blocs lumineux proches (expérimental). Pas en mode FPS ; en construction en ligne, réservé aux OP du serveur.
 - **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`).
@@ -185,7 +186,7 @@ Les touches sont **physiques** (même place en AZERTY et en QWERTY) et se règle
 | 1 / 2 / 3 / 4 | Principale / pistolet / couteau / grenades | | F4 | Racheter |
 | G | Lâcher l'arme ou la grenade | | E | Ramasser, poser, désamorcer |
 | Tab | Scores | | K (maintenu) | Micro |
-| F5 | Capture d'écran (comme CS) | | F1 / F2 | Voter oui / non |
+| F5 | Capture d'écran | | F1 / F2 | Voter oui / non |
 
 </details>
 

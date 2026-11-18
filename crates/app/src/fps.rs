@@ -2266,7 +2266,7 @@ impl Fps {
                 )
             }
             Some(BuyItem::Nade(n)) => format!(
-                "{} : {} au plus, 4 grenades en tout (règles de CS)",
+                "{} : {} au plus, 4 grenades en tout",
                 n.name(),
                 n.max()
             ),
