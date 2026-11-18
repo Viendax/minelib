@@ -140,6 +140,41 @@ impl Handle {
             .store(from.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// (v143) Les provinces confiées par ce relais sont des pays, qui confient eux-mêmes
+    /// leurs provinces de `size` régions de côté peuplées d'au moins `from` joueurs (`size`
+    /// 0 : pas de pays). La taille des pays est celle des provinces (`set_provinces`).
+    pub fn set_nest(&self, size: usize, from: usize) {
+        self.state.lock().unwrap().nest = (size > 0).then_some(proto::Nest {
+            size: size as i32,
+            from: from.max(1) as u32,
+        });
+    }
+
+    /// (v143) Provinces de pays servies, telles que les pays les disent ici (essais).
+    pub fn pays_children(&self) -> Vec<proto::ProvinceInfo> {
+        self.state
+            .lock()
+            .unwrap()
+            .rooms
+            .values()
+            .flat_map(|r| {
+                r.provinces
+                    .values()
+                    .flat_map(|p| p.children.iter().cloned())
+            })
+            .collect()
+    }
+
+    /// (v143) Relais de province : il s'arrête (un pays attend d'abord que ses provinces lui
+    /// aient tout rendu).
+    pub fn province_stopped(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.province_room
+            .and_then(|r| st.rooms.get(&r))
+            .and_then(|r| r.province.as_ref())
+            .is_none_or(|p| p.is_stopped())
+    }
+
     /// Provinces servies par un relais de province, prêtes (essais).
     pub fn delegated_provinces(&self) -> Vec<[i32; 2]> {
         self.state
@@ -181,6 +216,7 @@ impl Handle {
         info: proto::StandbyInfo,
         settings: proto::ProvinceSettings,
         standby: bool,
+        nest: Option<proto::Nest>,
     ) -> bool {
         provinces::begin(
             &mut self.state.lock().unwrap(),
@@ -193,6 +229,7 @@ impl Handle {
             info,
             settings,
             standby,
+            nest,
         )
     }
 
@@ -369,8 +406,16 @@ impl Handle {
     }
 
     /// Relais de province : réponse du relais du monde à une demande de bail.
-    pub fn province_leased(&self, epoch: u64, t: u64, ok: bool, copies: bool, dump: u64) {
-        provinces::leased(&mut self.state.lock().unwrap(), epoch, t, ok, copies, dump);
+    pub fn province_leased(&self, epoch: u64, t: u64, ok: bool, copies: bool, dump: u64, ms: u32) {
+        provinces::leased(
+            &mut self.state.lock().unwrap(),
+            epoch,
+            t,
+            ok,
+            copies,
+            dump,
+            ms,
+        );
     }
 
     /// Relais de province : arrêt ; `release` : départ propre (le relais du monde reprend
@@ -1262,6 +1307,27 @@ struct State {
     /// (v142) Joueurs d'un monde à partir desquels la copie de ce que publie une province
     /// est gardée par son relais de secours plutôt qu'ici (essais : réglable).
     copies_until: usize,
+    /// (v143) Les provinces confiées par ce relais sont des pays, qui confient eux-mêmes
+    /// leurs provinces peuplées (aucun : pas de pays) ; hôtes déjà donnés aux pays (salle,
+    /// province, époque, relais de secours).
+    nest: Option<proto::Nest>,
+    wants_served: HashMap<(u64, [i32; 2], u64, bool), Instant>,
+}
+
+/// (v143) `MINELIB_PAYS=taille,joueurs` : les provinces confiées par ce relais sont des pays
+/// qui confient eux-mêmes leurs provinces de `taille` régions de côté, peuplées d'au moins
+/// `joueurs`.
+fn parse_nest(v: &str) -> Option<proto::Nest> {
+    let mut it = v.split(',').map(|x| x.trim().parse::<i64>().ok());
+    let size = it.next()??;
+    let from = it
+        .next()
+        .flatten()
+        .unwrap_or(provinces::PROVINCE_FROM as i64);
+    (size >= 1 && from >= 1).then_some(proto::Nest {
+        size: size as i32,
+        from: from as u32,
+    })
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -1346,6 +1412,10 @@ pub fn start(cfg: Config) -> Result<Handle> {
         hosts_wait: None,
         province_promotions: 0,
         copies_until: COPIES_UNTIL,
+        nest: std::env::var("MINELIB_PAYS")
+            .ok()
+            .and_then(|v| parse_nest(&v)),
+        wants_served: HashMap::new(),
     }));
     let state_for_handle = state.clone();
     let state_for_guards = state.clone();
@@ -4598,8 +4668,10 @@ fn upkeep_build(st: &mut State) {
             room.build.sleep_cold(zones::COLD_AFTER);
         }
         // Relais de province (v138) : les époques, lots et vérifications de ses régions ;
-        // le relais du monde en choisit les hôtes et garde le reste.
+        // le relais du monde en choisit les hôtes et garde le reste. (v143) Un pays confie
+        // lui-même ses provinces peuplées.
         if st.rooms.get(&rid).is_some_and(|r| r.province.is_some()) {
+            provinces::upkeep(st, rid, &mut index);
             upkeep_sovereignty(st, rid);
             upkeep_audits(st, rid);
             continue;
@@ -6308,9 +6380,13 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             counts,
             inside,
             followed,
+            wants,
+            children,
         } => {
             if my_room == Some(room) {
-                provinces::lease(st, room, id, province, epoch, t, counts, inside, followed);
+                provinces::lease(
+                    st, room, id, province, epoch, t, counts, inside, followed, wants, children,
+                );
             }
             return None;
         }
@@ -7405,6 +7481,18 @@ fn handle_account(
             token,
         } => provinces::follow(
             st, session, id, room, province, epoch, pseudo, signer, token,
+        ),
+        Request::ProvinceChild {
+            room,
+            province,
+            size,
+            epoch,
+            pseudo,
+            signer,
+            token,
+            standby,
+        } => provinces::child_hello(
+            st, session, id, room, province, size, epoch, pseudo, signer, token, standby,
         ),
         Request::Prove { signature } => {
             let Session::Proving {
@@ -10248,6 +10336,7 @@ mod tests {
                 info.clone(),
                 Default::default(),
                 false,
+                None,
             ));
             // Un bloc déjà publié par la province.
             let data = game::encode(&game::BuildMsg::Set {
@@ -10329,6 +10418,7 @@ mod tests {
                 info,
                 Default::default(),
                 true,
+                None,
             ));
             let cert = minelib_net::sovereign::Cert::issue(
                 &root_key,
@@ -11606,6 +11696,8 @@ mod tests {
                                 counts: census.get(&p).cloned().unwrap_or_default(),
                                 inside: Vec::new(),
                                 followed: false,
+                                wants: Vec::new(),
+                                children: None,
                             },
                         );
                     }

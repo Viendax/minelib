@@ -170,6 +170,15 @@ struct ProvinceConn {
     /// rien donné, rien pris : le relais du monde la reprend telle qu'il l'a gardée).
     unmarked_items: Vec<BuildMsg>,
     marked_items: std::collections::VecDeque<(u64, Vec<BuildMsg>)>,
+    /// (v143) Relais de pays : les provinces qu'il confie lui-même, en vue (sa liste).
+    children: Vec<proto::ProvinceInfo>,
+}
+
+/// (v143) Une province (ou un pays) : ses coordonnées et sa taille (régions par côté).
+type PKey = ([i32; 2], i32);
+
+fn pkey(i: &proto::ProvinceInfo) -> PKey {
+    (i.province, i.size)
 }
 
 /// Blocs remis par un relais de province dans un même envoi : (case, rang).
@@ -260,18 +269,21 @@ pub struct BuildNet {
     /// (hors de ces provinces) ; province dont vient le message en cours (elle ne décide
     /// que des blocs de ses zones) ; prochain rappel d'une province perdue.
     province_list: Vec<proto::ProvinceInfo>,
-    provinces: HashMap<[i32; 2], ProvinceConn>,
+    provinces: HashMap<PKey, ProvinceConn>,
+    /// (v143) Liste du relais du monde (provinces ou pays) ; `province_list` y ajoute celles
+    /// des relais de pays où l'on est entré.
+    root_list: Vec<proto::ProvinceInfo>,
     shards_root: Vec<proto::ShardInfo>,
     from_province: Option<proto::ProvinceInfo>,
     province_retry: f32,
     /// Demandes d'objets parties à un relais de province (numéro → province) : lui seul
     /// peut les refuser.
-    item_asked: HashMap<u32, [i32; 2]>,
+    item_asked: HashMap<u32, PKey>,
     /// (v140) Tout ce qu'on avait en vue au dernier passage était servi par des relais de
     /// province où l'on est entré ; province dite au relais du monde avec la dernière
     /// position qu'il a reçue.
     was_deep: bool,
-    root_province: Option<[i32; 2]>,
+    root_province: Option<PKey>,
 }
 
 /// Bloc remis par un relais de région : celui d'avant, celui remis, son rang ; et si
@@ -446,6 +458,7 @@ impl BuildNet {
             shards: Shards::default(),
             province_list: Vec::new(),
             provinces: HashMap::new(),
+            root_list: Vec::new(),
             shards_root: Vec::new(),
             from_province: None,
             province_retry: 0.0,
@@ -474,16 +487,16 @@ impl BuildNet {
         self.shards.list.clear();
         let delegated = |r: [i32; 2]| self.province_list.iter().any(|p| p.has(r));
         let from_root = self.shards_root.iter().filter(|i| !delegated(i.region));
-        let from_provinces = self
-            .provinces
-            .values()
-            .flat_map(|c| c.shards.iter().filter(|i| c.info.has(i.region)));
-        for i in from_root.chain(from_provinces) {
-            self.shards
-                .list
-                .entry(i.region)
-                .or_default()
-                .push(i.clone());
+        // (Chaque région d'après le relais qui en décide : le plus petit qui la contient.)
+        let from_provinces = self.provinces.values().flat_map(|c| {
+            c.shards.iter().filter(|i| {
+                self.best(i.region)
+                    .is_some_and(|b| pkey(b) == pkey(&c.info))
+            })
+        });
+        let all: Vec<proto::ShardInfo> = from_root.chain(from_provinces).cloned().collect();
+        for i in all {
+            self.shards.list.entry(i.region).or_default().push(i);
         }
     }
 
@@ -491,46 +504,89 @@ impl BuildNet {
     /// monde). Une province qui n'y est plus revient au relais du monde : ce qui y attendait
     /// sa réponse lui repart.
     pub fn set_provinces(&mut self, list: Vec<proto::ProvinceInfo>) {
-        let gone: Vec<[i32; 2]> = self
+        self.root_list = list;
+        self.merge_provinces();
+    }
+
+    /// (v143) Liste complète : celle du relais du monde, et les provinces que confient les
+    /// relais de pays où l'on est entré (dans leur pays). Une connexion dont la province
+    /// n'y est plus (ou plus au même relais) est quittée ; ce qui attendait la réponse d'une
+    /// province qui n'y est plus repart à qui en décide maintenant.
+    fn merge_provinces(&mut self) {
+        let mut list = self.root_list.clone();
+        for c in self.provinces.values().filter(|c| c.joined) {
+            if list.iter().any(|i| pkey(i) == pkey(&c.info)) {
+                list.extend(c.children.iter().filter(|k| c.info.contains(k)).cloned());
+            }
+        }
+        list.sort_by_key(|i| (i.size, i.province));
+        list.dedup_by_key(|i| pkey(i));
+        let gone: Vec<PKey> = self
             .provinces
             .iter()
-            .filter(|(p, c)| {
-                !list
-                    .iter()
-                    .any(|i| i.province == **p && i.same_relay(&c.info))
-            })
-            .map(|(p, _)| *p)
+            .filter(|(k, c)| !list.iter().any(|i| pkey(i) == **k && i.same_relay(&c.info)))
+            .map(|(k, _)| *k)
             .collect();
-        for p in &gone {
-            if let Some(c) = self.provinces.remove(p) {
+        for k in &gone {
+            if let Some(c) = self.provinces.remove(k) {
                 self.forget_shard(c.serial);
             }
         }
         let back: Vec<proto::ProvinceInfo> = self
             .province_list
             .iter()
-            .filter(|i| !list.iter().any(|j| j.province == i.province))
+            .filter(|i| !list.iter().any(|j| pkey(j) == pkey(i)))
             .cloned()
             .collect();
+        let changed = list != self.province_list;
+        if changed {
+            log::debug!(
+                "construction ({}) : provinces {:?}",
+                self.pseudo,
+                list.iter()
+                    .map(|i| (i.province, i.size, i.epoch))
+                    .collect::<Vec<_>>()
+            );
+        }
         self.province_list = list;
-        self.province_retry = 0.0;
+        if changed {
+            self.province_retry = 0.0;
+        }
         self.rebuild_shards();
         for i in back {
             log::info!(
-                "construction : province {:?} reprise par le relais du monde",
-                i.province
+                "construction : province {:?} (taille {}) plus servie par son relais",
+                i.province,
+                i.size
             );
             self.resend_in(|r| i.has(r));
         }
     }
 
+    /// (v143) Le relais de province dont vient ce qu'on traite décide-t-il de ce chunk (la
+    /// plus petite province qui le contient) ? Un pays ne parle pas pour ses provinces.
+    fn sender_decides(&self, chunk: [i32; 2]) -> bool {
+        self.from_province
+            .as_ref()
+            .is_none_or(|i| self.best(proto::region_of(chunk)).map(pkey) == Some(pkey(i)))
+    }
+
+    /// (v143) Ce qui décide de la région `region` : la plus petite province (ou le plus
+    /// petit pays) qui la contient.
+    fn best(&self, region: [i32; 2]) -> Option<&proto::ProvinceInfo> {
+        self.province_list
+            .iter()
+            .filter(|i| i.has(region))
+            .min_by_key(|i| i.size)
+    }
+
     /// Qui décide des blocs du chunk `chunk`.
     fn authority(&self, chunk: [i32; 2]) -> Authority {
         let region = proto::region_of(chunk);
-        let Some(info) = self.province_list.iter().find(|i| i.has(region)) else {
+        let Some(info) = self.best(region) else {
             return Authority::Root;
         };
-        match self.provinces.get(&info.province) {
+        match self.provinces.get(&pkey(info)) {
             Some(c) if c.joined && !c.paused => match &c.link {
                 Some(l) => Authority::Province(l.clone()),
                 None => Authority::Waiting,
@@ -575,7 +631,7 @@ impl BuildNet {
             self.province_retry = PROVINCE_RETRY;
             if let (Some(key), Some(cert)) = (self.identity.clone(), cert) {
                 for info in &self.province_list {
-                    if self.provinces.contains_key(&info.province) {
+                    if self.provinces.contains_key(&pkey(info)) {
                         continue;
                     }
                     let client = crate::province_host::dial(info, self.shards.node_dir.clone());
@@ -586,7 +642,7 @@ impl BuildNet {
                     });
                     self.shards.serial += 1;
                     self.provinces.insert(
-                        info.province,
+                        pkey(info),
                         ProvinceConn {
                             info: info.clone(),
                             client,
@@ -601,6 +657,7 @@ impl BuildNet {
                             marked: std::collections::VecDeque::new(),
                             unmarked_items: Vec::new(),
                             marked_items: std::collections::VecDeque::new(),
+                            children: Vec::new(),
                         },
                     );
                 }
@@ -613,6 +670,7 @@ impl BuildNet {
         let mut confirmed = Vec::new();
         let mut items_ok = Vec::new();
         let mut voice = Vec::new();
+        let mut lists_changed = false;
         for (p, c) in &mut self.provinces {
             while let Some(e) = c.client.poll() {
                 match e {
@@ -638,9 +696,21 @@ impl BuildNet {
                         }
                     }
                     Event::TakenOver { .. } => {
+                        log::debug!(
+                            "construction ({}) : entré dans la province {:?} (taille {})",
+                            self.pseudo,
+                            c.info.province,
+                            c.info.size
+                        );
                         c.joined = true;
                         c.sent_chunk = None;
                         c.served_sent = None;
+                        lists_changed = true;
+                    }
+                    // (v143) Relais de pays : les provinces qu'il confie, en vue.
+                    Event::Provinces(list) => {
+                        c.children = list;
+                        lists_changed = true;
                     }
                     Event::FromZone { chunk, data, .. } => received.push((*p, chunk, data)),
                     Event::Paused(on) => {
@@ -656,7 +726,7 @@ impl BuildNet {
                     // (v140) La voix de ceux qui parlent dans cette province.
                     Event::VoiceFrom { from, data } => voice.push((from, data)),
                     Event::RoomClosed | Event::Error(_) | Event::Offline(_) | Event::Lost => {
-                        log::info!("construction : relais de la province {p:?} perdu");
+                        log::info!("construction : relais de la province {:?} perdu", p.0);
                         broken.push(*p);
                         break;
                     }
@@ -686,11 +756,14 @@ impl BuildNet {
         for p in broken {
             if let Some(c) = self.provinces.remove(&p) {
                 shards_changed |= !c.shards.is_empty();
+                lists_changed |= !c.children.is_empty();
                 // Ce qu'elle a remis sans que le relais du monde l'ait gardé : en doute.
                 self.forget_shard(c.serial);
             }
         }
-        if shards_changed {
+        if lists_changed {
+            self.merge_provinces();
+        } else if shards_changed {
             self.rebuild_shards();
         }
         for (p, c, data) in received {
@@ -742,6 +815,7 @@ impl BuildNet {
         self.shards.ticket = None;
         // (Le relais repris sert tout lui-même : plus de provinces.)
         self.province_list.clear();
+        self.root_list.clear();
         self.provinces.clear();
         self.was_deep = false;
         self.root_province = None;
@@ -941,10 +1015,8 @@ impl BuildNet {
         let hi = proto::region_of([chunk[0] + ROOT_VIEW, chunk[1] + ROOT_VIEW]);
         (lo[0]..=hi[0]).all(|x| {
             (lo[1]..=hi[1]).all(|z| {
-                self.province_list
-                    .iter()
-                    .find(|i| i.has([x, z]))
-                    .and_then(|i| self.provinces.get(&i.province))
+                self.best([x, z])
+                    .and_then(|i| self.provinces.get(&pkey(i)))
                     .is_some_and(|c| c.joined && c.link.is_some())
             })
         })
@@ -954,8 +1026,8 @@ impl BuildNet {
     /// retour).
     fn province_link(&self, chunk: [i32; 2]) -> Option<&Sender<Inbound>> {
         let region = proto::region_of(chunk);
-        let info = self.province_list.iter().find(|i| i.has(region))?;
-        let c = self.provinces.get(&info.province)?;
+        let info = self.best(region)?;
+        let c = self.provinces.get(&pkey(info))?;
         c.link.as_ref().filter(|_| c.joined)
     }
 
@@ -994,11 +1066,9 @@ impl BuildNet {
                     if self.item_asked.len() >= ITEM_ASKED_MAX {
                         self.item_asked.clear();
                     }
-                    let p = proto::province_of(
-                        proto::region_of(chunk),
-                        self.province_list.first().map_or(1, |i| i.size),
-                    );
-                    self.item_asked.insert(seq, p);
+                    if let Some(p) = self.best(proto::region_of(chunk)).map(pkey) {
+                        self.item_asked.insert(seq, p);
+                    }
                 }
                 transport::push(&l, &Request::ToZone { chunk, data });
             }
@@ -1077,6 +1147,25 @@ impl BuildNet {
         self.pending.len()
     }
 
+    /// (v143) Provinces connues (coordonnées, taille, époque, entrée) : essais.
+    #[cfg(test)]
+    pub fn province_view(&self) -> Vec<([i32; 2], i32, u64, bool)> {
+        let mut v: Vec<_> = self
+            .province_list
+            .iter()
+            .map(|i| {
+                (
+                    i.province,
+                    i.size,
+                    i.epoch,
+                    self.provinces.get(&pkey(i)).is_some_and(|c| c.joined),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
     /// Cases dont la dernière modification est arrivée par un relais de région.
     #[cfg(test)]
     pub fn via_shard(&self) -> usize {
@@ -1110,11 +1199,12 @@ impl BuildNet {
         let deep = self.deep(chunk);
         if self.chunk != Some(chunk) || deep != self.was_deep {
             self.chunk = Some(chunk);
+            // (v143) La province (ou le pays) du relais du monde : c'est elle qu'il connaît.
             let province = self
-                .province_list
+                .root_list
                 .iter()
                 .find(|i| i.has(proto::region_of(chunk)))
-                .map(|i| i.province);
+                .map(pkey);
             if !deep || !self.was_deep || province != self.root_province {
                 self.send(Request::Position { chunk });
                 self.root_province = province;
@@ -1156,24 +1246,30 @@ impl BuildNet {
         // de même dans une province dont le relais n'est pas prêt).
         let mut dirty = Vec::new();
         let mut expired = Vec::new();
-        let waiting: Vec<[i32; 2]> = self
+        let waiting: Vec<PKey> = self
             .province_list
             .iter()
             .filter(|i| {
                 self.provinces
-                    .get(&i.province)
+                    .get(&pkey(i))
                     .is_none_or(|c| !c.joined || c.paused || c.link.is_none())
             })
-            .map(|i| i.province)
+            .map(pkey)
             .collect();
-        let size = self.province_list.first().map_or(1, |i| i.size);
         for (pos, p) in &mut self.pending {
             if self.paused {
                 break;
             }
             if !waiting.is_empty() {
+                // (v143) La plus petite province qui la contient décide.
                 let r = proto::region_of(chunk_of(pos[0], pos[2]));
-                if waiting.contains(&proto::province_of(r, size)) {
+                let best = self
+                    .province_list
+                    .iter()
+                    .filter(|i| i.has(r))
+                    .min_by_key(|i| i.size)
+                    .map(pkey);
+                if best.is_some_and(|b| waiting.contains(&b)) {
                     continue;
                 }
             }
@@ -1474,7 +1570,7 @@ impl BuildNet {
                 };
                 // Un refus, seulement d'une demande qui lui a été faite : tout de suite.
                 if let BuildMsg::Denied { seq } = msg {
-                    if self.item_asked.get(&seq) == Some(&info.province) {
+                    if self.item_asked.get(&seq) == Some(&pkey(&info)) {
                         self.item_asked.remove(&seq);
                         self.item_inbox.push(msg);
                     }
@@ -1482,9 +1578,9 @@ impl BuildNet {
                 }
                 // Un état de ses zones : quand le relais du monde l'aura gardé.
                 if minelib_net::items::chunk_of_msg(&msg)
-                    .is_some_and(|c| info.has(proto::region_of(c)))
+                    .is_some_and(|c| info.has(proto::region_of(c)) && self.sender_decides(c))
                 {
-                    if let Some(c) = self.provinces.get_mut(&info.province) {
+                    if let Some(c) = self.provinces.get_mut(&pkey(&info)) {
                         c.unmarked_items.push(msg);
                     }
                 }
@@ -1497,11 +1593,7 @@ impl BuildNet {
             | BuildMsg::ChestTake { .. } => Vec::new(),
             BuildMsg::Reject { pos, .. } => {
                 // (Un relais de province ne refuse que dans ses zones.)
-                if self
-                    .from_province
-                    .as_ref()
-                    .is_some_and(|i| !i.has(proto::region_of(chunk_of(pos[0], pos[2]))))
-                {
+                if !self.sender_decides(chunk_of(pos[0], pos[2])) {
                     return Vec::new();
                 }
                 // Refusé par le relais d'une région souveraine (son hôte principal vient de
@@ -1543,7 +1635,7 @@ impl BuildNet {
                 let from = self.from_shard.or_else(|| {
                     self.from_province
                         .as_ref()
-                        .and_then(|i| self.provinces.get(&i.province))
+                        .and_then(|i| self.provinces.get(&pkey(i)))
                         .map(|c| c.serial)
                 });
                 for (id, name, pose) in
@@ -1693,12 +1785,9 @@ impl BuildNet {
         if block as usize >= minelib_world::registry::registry().len() {
             return Vec::new();
         }
-        // Un relais de province ne décide que des blocs de ses zones.
-        if self
-            .from_province
-            .as_ref()
-            .is_some_and(|i| !i.has(proto::region_of(chunk_of(pos[0], pos[2]))))
-        {
+        // Un relais de province ne décide que des blocs de ses zones (v143 : celles que
+        // ne décide pas une de ses provinces).
+        if !self.sender_decides(chunk_of(pos[0], pos[2])) {
             return Vec::new();
         }
         // (Un relais de province décide, mais ce qu'il remet reste en doute jusqu'à ce que
@@ -1706,7 +1795,7 @@ impl BuildNet {
         let province = self
             .from_province
             .as_ref()
-            .and_then(|i| self.provinces.get(&i.province))
+            .and_then(|i| self.provinces.get(&pkey(i)))
             .map(|c| c.serial);
         let source = self.from_shard.or(province);
         if source.is_none() {
@@ -1715,6 +1804,13 @@ impl BuildNet {
         // L'ordre du relais du monde : plus ancienne que ce qu'on a déjà pour cette case
         // (doublon, même modification arrivée par deux chemins), elle est sans effet.
         if self.seen.get(&pos).is_some_and(|s| s.0 >= seq) {
+            if self.pending.contains_key(&pos) {
+                log::debug!(
+                    "construction ({}) : {pos:?} au rang {seq} déjà vu au rang {:?}",
+                    self.pseudo,
+                    self.seen.get(&pos)
+                );
+            }
             return Vec::new();
         }
         if self.seen.len() >= SEEN_MAX {
@@ -1727,7 +1823,7 @@ impl BuildNet {
         if let Some(c) = self
             .from_province
             .as_ref()
-            .and_then(|i| self.provinces.get_mut(&i.province))
+            .and_then(|i| self.provinces.get_mut(&pkey(i)))
         {
             c.unmarked.push((pos, seq));
         }
@@ -2022,6 +2118,11 @@ mod tests {
                 }
             }
             if self.province.as_ref().is_some_and(|p| p.stopped) {
+                // (v143) Province d'un pays : le garant redevient libre (comme
+                // `garant_worker`).
+                if self.province.as_ref().is_some_and(|p| p.is_child()) {
+                    self.c.send(Cmd::Leave);
+                }
                 self.province = None;
             }
             let key = self.identity.clone();
@@ -2073,9 +2174,16 @@ mod tests {
                     info,
                     settings,
                     follow,
+                    parent,
+                    nest,
                 }) => {
                     if let Some(l) = &self.link {
                         if self.province.is_none() {
+                            let signer = self
+                                .identity
+                                .as_ref()
+                                .map_or([0; 32], |k| k.verifying_key().to_bytes());
+                            let child = parent.is_some();
                             self.province = match follow {
                                 Some(at) => crate::province_host::ProvinceHost::standby(
                                     room,
@@ -2088,17 +2196,35 @@ mod tests {
                                     settings,
                                     *at,
                                     &self.name,
-                                    self.identity
-                                        .as_ref()
-                                        .map_or([0; 32], |k| k.verifying_key().to_bytes()),
+                                    signer,
                                     None,
                                     false,
+                                    parent.map(|p| *p),
+                                    nest,
                                 ),
                                 None => crate::province_host::ProvinceHost::start(
-                                    room, province, size, epoch, secret, root, info, settings, l,
+                                    room,
+                                    province,
+                                    size,
+                                    epoch,
+                                    secret,
+                                    root,
+                                    info,
+                                    settings,
+                                    l,
                                     false,
+                                    nest,
+                                    parent.map(|at| crate::province_host::Up {
+                                        at: *at,
+                                        pseudo: self.name.clone(),
+                                        signer,
+                                        node_dir: None,
+                                    }),
                                 ),
                             };
+                            if self.province.is_none() && child {
+                                self.c.send(Cmd::Leave);
+                            }
                         }
                     }
                 }
@@ -3379,9 +3505,37 @@ mod tests {
         Vec<Bot>,
         u64,
     ) {
+        province_setup_full(survival, size, shard_from, 5, None)
+    }
+
+    /// Comme `province_setup_with`, avec `garants` joueurs d'autres mondes qui prêtent leur
+    /// connexion de garant, et (v143) des pays : les provinces sont des pays qui confient
+    /// eux-mêmes leurs provinces de `nest.0` régions de côté à partir de `nest.1` joueurs.
+    #[allow(clippy::type_complexity)]
+    fn province_setup_full(
+        survival: bool,
+        size: usize,
+        shard_from: usize,
+        garants: usize,
+        nest: Option<(usize, usize)>,
+    ) -> (
+        std::path::PathBuf,
+        minelib_relay::Handle,
+        Vec<(Bot, Bot)>,
+        Vec<Bot>,
+        u64,
+    ) {
         let dir = std::env::temp_dir().join(format!("minelib-provinces-{}", rand_u32()));
-        let names = ["Garant", "Garant2", "Garant3", "Garant4", "Garant5"];
-        for n in names {
+        let names: Vec<String> = (0..garants)
+            .map(|k| {
+                if k == 0 {
+                    "Garant".to_string()
+                } else {
+                    format!("Garant{}", k + 1)
+                }
+            })
+            .collect();
+        for n in &names {
             minelib_relay::test_seed_games(&dir, n, 5);
         }
         let h = minelib_relay::start(minelib_relay::Config {
@@ -3396,6 +3550,9 @@ mod tests {
         h.set_shard_from(shard_from);
         h.set_shard_share(2);
         h.set_provinces(size, 3);
+        if let Some((n, from)) = nest {
+            h.set_nest(n, from);
+        }
         let addr = h.addr.to_string();
         // Quatre autres mondes, dont les joueurs prêtent leur connexion de garant.
         let hosts: Vec<(Bot, Bot)> = names
@@ -3681,6 +3838,251 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// (v143) Ce qui arrive pendant l'essai des pays.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum PaysFault {
+        None,
+        /// L'hôte de la province du pays tombe : le pays donne sa place à son relais de
+        /// secours.
+        ChildCrash,
+        /// L'hôte du pays tombe : le relais du monde donne sa place au relais de secours du
+        /// pays ; les provinces du pays s'arrêtent à la fin de leur bail, et il les confie de
+        /// nouveau.
+        PaysCrash,
+    }
+
+    /// Pays de bout en bout (v143) : le relais du monde confie un pays (2 × 2 régions) au
+    /// relais d'un joueur, qui confie lui-même sa région peuplée de l'est (une province d'une
+    /// région) au relais d'un autre ; le relais du monde ne voit que le pays. On construit
+    /// des deux côtés de la frontière entre la province et le reste du pays, un joueur passe
+    /// de l'une à l'autre. À la fin, les mondes sont identiques case par case à celui du
+    /// propriétaire (qui reçoit tout du relais du monde), rien n'est en attente, quoi qu'il
+    /// arrive à l'hôte de la province ou du pays ; et le relais est remplacé en moins de 3 s.
+    fn pays_world(fault: PaysFault, regions: bool) {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (dir, h, mut hosts, mut bots, _room) =
+            province_setup_full(false, 2, if regions { 3 } else { 100 }, 8, Some((1, 3)));
+        let west = |x: f32| x.clamp(488.0, 508.0);
+        let east = |x: f32| x.clamp(516.0, 540.0);
+        let mut seed = 991u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let dt = 0.02;
+        let mut edited = std::collections::BTreeSet::new();
+        let mut kids_max = 0;
+        let mut attached_max = 0;
+        let mut fault_at: Option<(Instant, u64)> = None;
+        let mut served_again: Option<Duration> = None;
+        let mut pays_back: Option<Duration> = None;
+        // 10 secondes de jeu, la panne au milieu (une fois la province du pays servie).
+        for step in 0..500 {
+            let kids = h.pays_children();
+            kids_max = kids_max.max(kids.len());
+            // (La province du pays tombe une fois son relais de secours prêt.)
+            let standby_ready = hosts.iter().any(|(_, g)| {
+                g.province
+                    .as_ref()
+                    .is_some_and(|p| p.is_child() && p.standby_ready() && p.province == [1, 0])
+            });
+            let due = match fault {
+                PaysFault::ChildCrash => standby_ready && kids.iter().any(|i| i.province == [1, 0]),
+                _ => !kids.is_empty(),
+            };
+            if fault != PaysFault::None && fault_at.is_none() && step >= 250 && due {
+                let child = fault == PaysFault::ChildCrash;
+                let g = hosts
+                    .iter_mut()
+                    .map(|(_, g)| g)
+                    .find(|g| {
+                        g.province.as_ref().is_some_and(|p| {
+                            !p.standby && p.is_child() == child && (!child || p.province == [1, 0])
+                        })
+                    })
+                    .expect("hôte");
+                if let Some(p) = g.province.take() {
+                    p.kill();
+                }
+                let mark = if child {
+                    kids.iter()
+                        .find(|i| i.province == [1, 0])
+                        .map_or(0, |i| i.epoch)
+                } else {
+                    h.province_promotions() as u64
+                };
+                fault_at = Some((Instant::now(), mark));
+            }
+            if let (Some((t, mark)), None) = (fault_at, served_again) {
+                let again = match fault {
+                    PaysFault::ChildCrash => {
+                        kids.iter().any(|i| i.province == [1, 0] && i.epoch != mark)
+                    }
+                    _ => {
+                        h.province_promotions() as u64 > mark
+                            && h.delegated_provinces().contains(&[0, 0])
+                    }
+                };
+                if again {
+                    served_again = Some(t.elapsed());
+                }
+            }
+            // (Le pays repris confie de nouveau sa province peuplée.)
+            if let (Some((t, _)), Some(_), None, PaysFault::PaysCrash) =
+                (fault_at, served_again, pays_back, fault)
+            {
+                if !kids.is_empty() {
+                    pays_back = Some(t.elapsed());
+                }
+            }
+            for (i, b) in bots.iter_mut().enumerate() {
+                let r = rnd();
+                let x = b.pos.x + (r % 3) as f32 - 1.0;
+                // Joueur2 passe de la province du pays au reste du pays, puis revient.
+                b.pos.x = if i == 2 {
+                    if (100..300).contains(&step) {
+                        (b.pos.x - 0.2).max(490.0)
+                    } else {
+                        (b.pos.x + 0.2).min(535.0)
+                    }
+                } else if i < 2 {
+                    west(x)
+                } else {
+                    east(x)
+                };
+                b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(1.0, 30.0);
+                if rnd() % 17 == 0 {
+                    let x = (b.pos.x as i32 - 12 + (rnd() % 25) as i32).clamp(29 * 16, 36 * 16 - 1);
+                    let z = (rnd() % 32) as i32;
+                    let y = 11 + (rnd() % 3) as i32;
+                    let block = if rnd() % 4 == 0 {
+                        BlockId::AIR
+                    } else {
+                        BlockId(1 + rnd() as u16 % 8)
+                    };
+                    b.world.set(x, y, z, block);
+                    edited.insert([x, y, z]);
+                }
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            attached_max =
+                attached_max.max(hosts.iter().filter(|(_, g)| g.attach.is_some()).count());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Tout se pose (confirmations, doutes, paquets du propriétaire).
+        for _ in 0..400 {
+            for b in bots.iter_mut() {
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for b in &bots {
+            eprintln!(
+                "{} : provinces {:?}",
+                b.name,
+                b.net.as_ref().unwrap().province_view()
+            );
+        }
+        eprintln!(
+            "pays : {fault:?}, relais de région {regions}, provinces du pays au plus {kids_max}, \
+             relais de région rattachés {attached_max}, servi de nouveau après \
+             {served_again:?}, province du pays de nouveau confiée après {pays_back:?}, \
+             promotions {}, envois archivés {}",
+            h.province_promotions(),
+            h.province_archives()
+        );
+        assert!(kids_max >= 1, "le pays a confié sa province peuplée");
+        assert!(
+            edited.len() > 50,
+            "assez de modifications : {}",
+            edited.len()
+        );
+        if regions {
+            assert!(attached_max >= 1, "des relais de région rattachés");
+        }
+        if fault != PaysFault::None {
+            let t = served_again.expect("de nouveau servi par un relais de secours");
+            assert!(
+                t < Duration::from_secs(3),
+                "de nouveau servi en moins de 3 s : {t:?}"
+            );
+        }
+        for b in &bots {
+            assert_eq!(
+                b.net.as_ref().unwrap().pending(),
+                0,
+                "{} : en attente",
+                b.name
+            );
+        }
+        let mut differ = Vec::new();
+        let owner = &bots[0];
+        for b in &bots[1..] {
+            for p in &edited {
+                for y in 11..14 {
+                    let q = [p[0], y, p[2]];
+                    let (a, o) = (
+                        b.world.get(q[0], q[1], q[2]),
+                        owner.world.get(q[0], q[1], q[2]),
+                    );
+                    if a != o {
+                        differ.push((b.name.clone(), q, a.0, o.0));
+                    }
+                }
+            }
+        }
+        differ.sort();
+        differ.dedup();
+        for b in &bots[1..] {
+            let mine: Vec<_> = differ.iter().filter(|d| d.0 == b.name).collect();
+            let east = mine.iter().filter(|d| d.1[0] >= 512).count();
+            let zero_me = mine.iter().filter(|d| d.2 == 0).count();
+            let zero_owner = mine.iter().filter(|d| d.3 == 0).count();
+            eprintln!(
+                "{} : {} différences, {east} à l'est, {zero_me} vides chez lui, {zero_owner} vides chez le propriétaire",
+                b.name,
+                mine.len()
+            );
+        }
+        assert!(
+            differ.is_empty(),
+            "{} cases différentes du monde du propriétaire, par exemple {:?}",
+            differ.len(),
+            &differ[..differ.len().min(5)]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_crowded_region_of_a_pays_gets_its_own_relay_from_the_pays() {
+        pays_world(PaysFault::None, false);
+    }
+
+    #[test]
+    fn region_relays_inside_a_pays_province_attach_to_it() {
+        pays_world(PaysFault::None, true);
+    }
+
+    #[test]
+    fn a_pays_province_whose_host_falls_is_served_again_by_its_standby() {
+        pays_world(PaysFault::ChildCrash, false);
+    }
+
+    #[test]
+    fn a_pays_whose_host_falls_is_served_again_by_its_standby() {
+        pays_world(PaysFault::PaysCrash, false);
+    }
+
     /// Objets et sacs de survie dans les provinces (v139), de bout en bout : la province
     /// peuplée arbitre les objets de ses zones (lâchés, ramassés), ce qu'elle publie n'entre
     /// chez les joueurs qu'une fois gardé par le relais du monde ; en survie, le sac de
@@ -3690,8 +4092,19 @@ mod tests {
     /// perdre, jamais se doubler) ; en survie, chaque sac du relais du monde est l'inventaire
     /// de son joueur.
     fn province_items(fault: ProvinceFault, survival: bool) {
+        province_items_in(fault, survival, false);
+    }
+
+    /// Comme `province_items` ; `pays` (v143) : la province de l'est est une province du pays
+    /// (2 × 2 régions) que sert un relais de pays, qui prête lui-même les sacs à ses
+    /// provinces (le relais du monde les lui prête).
+    fn province_items_in(fault: ProvinceFault, survival: bool, pays: bool) {
         use minelib_net::items::Pile;
-        let (dir, h, mut hosts, mut bots, room) = province_setup(survival);
+        let (dir, h, mut hosts, mut bots, room) = if pays {
+            province_setup_full(survival, 2, 100, 8, Some((1, 3)))
+        } else {
+            province_setup(survival)
+        };
         let mut items: Vec<crate::drops::Items> = bots
             .iter()
             .map(|_| crate::drops::Items::new(false))
@@ -3795,6 +4208,12 @@ mod tests {
             h.provinces_delegated() >= 1,
             "la province de l'est est servie"
         );
+        if pays {
+            assert!(
+                h.pays_children().iter().any(|i| i.province == [1, 0]),
+                "la province de l'est est servie par une province du pays"
+            );
+        }
         // En survie, l'inventaire d'un joueur est son sac (ses crédits de minage).
         if survival {
             for (i, b) in bots.iter().enumerate().skip(1) {
@@ -4157,6 +4576,16 @@ mod tests {
     #[test]
     fn survival_bags_lose_nothing_when_a_province_host_falls() {
         province_items(ProvinceFault::Crash, true);
+    }
+
+    #[test]
+    fn items_in_a_pays_province_are_arbitrated_there_and_nothing_is_created() {
+        province_items_in(ProvinceFault::None, false, true);
+    }
+
+    #[test]
+    fn survival_bags_go_through_the_pays_to_its_provinces() {
+        province_items_in(ProvinceFault::None, true, true);
     }
 
     /// (v142) Grand monde : la copie de ce que publie la province est gardée par son relais

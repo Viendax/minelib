@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 41;
+pub const PROTOCOL: u32 = 42;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -500,6 +500,19 @@ pub enum Request {
         signer: [u8; 32],
         token: [u8; 32],
     },
+    /// (v143) Hôte d'une province d'un pays (ou de son relais de secours) → relais du pays :
+    /// il entre, avec le jeton que le relais du monde lui a donné avec sa tâche (voir
+    /// `child_token`) ; tout ce qui concerne la province passe ensuite par cette connexion.
+    ProvinceChild {
+        room: u64,
+        province: [i32; 2],
+        size: i32,
+        epoch: u64,
+        pseudo: String,
+        signer: [u8; 32],
+        token: [u8; 32],
+        standby: bool,
+    },
     /// (v141) Hôte d'un relais de secours de province → relais du monde : la copie est à
     /// jour jusqu'au rang `have` ; il peut prendre la place du relais de la province.
     ProvinceStandbyReady {
@@ -522,6 +535,12 @@ pub enum Request {
         inside: Vec<([i32; 2], u16)>,
         /// (v142) Son relais de secours la suit (connecté).
         followed: bool,
+        /// (v143) Relais de pays : hôtes qu'il lui faut pour ses provinces (le relais du
+        /// monde les choisit parmi les connexions de garant et leur donne la tâche), et ses
+        /// provinces servies quand elles ont changé (le relais du monde y rattache les relais
+        /// de leurs régions).
+        wants: Vec<Want>,
+        children: Option<Vec<ProvinceInfo>>,
     },
     /// Ce que le relais de province vient de publier (zone, rang, message) : le relais du
     /// monde en garde une copie, pour reprendre la province aussitôt si son hôte tombe.
@@ -998,6 +1017,11 @@ pub enum Response {
         /// qui lui prouve que le relais du monde l'a choisi) ; on en tient une copie, prête
         /// à prendre sa place (`ProvincePromote`).
         follow: Option<Box<ProvinceAt>>,
+        /// (v143) Province d'un pays : tout passe par le relais de ce pays (on y entre avec
+        /// ce jeton, `Request::ProvinceChild`), pas par le relais du monde.
+        parent: Option<Box<ProvinceAt>>,
+        /// (v143) Pays : il confie lui-même ses provinces peuplées (de cette taille).
+        nest: Option<Nest>,
     },
     /// (v141) Relais de province → son relais de secours : un envoi `n` gardé par le relais
     /// du monde (zone, rang, message), et les sacs de survie qu'elle tient.
@@ -1077,6 +1101,9 @@ pub enum Response {
         /// (v142) Sa copie n'est plus à jour : tout ce qu'elle a doit lui partir (numéro de
         /// la demande ; 0 : aucune).
         dump: u64,
+        /// (v143) Durée du bail (ms, à partir de `t`) : celui d'une province d'un pays finit
+        /// avant celui du pays.
+        ms: u32,
     },
     /// Le relais du monde a gardé l'envoi `n` de la province (et tous ceux d'avant).
     ProvinceArchived {
@@ -1411,6 +1438,19 @@ impl ProvinceInfo {
         province_of(region, self.size) == self.province
     }
 
+    /// (v143) Sa première région (coin nord-ouest).
+    pub fn first_region(&self) -> [i32; 2] {
+        let s = self.size.max(1);
+        [self.province[0] * s, self.province[1] * s]
+    }
+
+    /// (v143) Toute la province `inner` (plus petite) en fait partie.
+    pub fn contains(&self, inner: &ProvinceInfo) -> bool {
+        inner.size < self.size
+            && self.size % inner.size.max(1) == 0
+            && self.has(inner.first_region())
+    }
+
     /// Le même relais de province (même époque).
     pub fn same_relay(&self, other: &ProvinceInfo) -> bool {
         (
@@ -1429,6 +1469,25 @@ impl ProvinceInfo {
             other.key,
         )
     }
+}
+
+/// (v143) Pays : un relais de province qui confie lui-même ses provinces peuplées (de `size`
+/// régions de côté, à partir de `from` joueurs).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct Nest {
+    pub size: i32,
+    pub from: u32,
+}
+
+/// (v143) Relais de pays → relais du monde : il lui faut un hôte pour sa province `province`
+/// (`size` régions de côté) à l'époque `epoch` ; `follow` : pour son relais de secours (la
+/// province servie, à suivre).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Want {
+    pub province: [i32; 2],
+    pub size: i32,
+    pub epoch: u64,
+    pub follow: Option<ProvinceInfo>,
 }
 
 /// Copie d'un sac de survie (v139) : pseudo, objets (code, nombre), crédits de minage.
@@ -1497,6 +1556,34 @@ pub fn follow_token(
     m.update(pseudo.to_ascii_lowercase().as_bytes());
     m.update(signer);
     m.update(&epoch.to_le_bytes());
+    m.finalize().into_bytes().into()
+}
+
+/// (v143) Jeton du relais du monde qui fait d'un joueur (pseudo, clé de son compte) l'hôte de
+/// la province `province` d'un pays (`size` régions de côté, époque `epoch`), ou de son
+/// relais de secours (vérifié par le relais du pays, qui a le secret du monde).
+#[allow(clippy::too_many_arguments)]
+pub fn child_token(
+    secret: &[u8; 32],
+    room: u64,
+    province: [i32; 2],
+    size: i32,
+    pseudo: &str,
+    signer: &[u8; 32],
+    epoch: u64,
+    standby: bool,
+) -> [u8; 32] {
+    use hmac::Mac;
+    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("clé");
+    m.update(b"minelib/province/pays");
+    m.update(&room.to_le_bytes());
+    m.update(&province[0].to_le_bytes());
+    m.update(&province[1].to_le_bytes());
+    m.update(&size.to_le_bytes());
+    m.update(pseudo.to_ascii_lowercase().as_bytes());
+    m.update(signer);
+    m.update(&epoch.to_le_bytes());
+    m.update(&[standby as u8]);
     m.finalize().into_bytes().into()
 }
 

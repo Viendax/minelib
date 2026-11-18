@@ -3,7 +3,9 @@
 //! le relais d'une région rattaché au relais de sa province (`RegionAttach`).
 //!
 //! Tout passe par la connexion de garant du jeu au relais du monde : la tâche, l'historique,
-//! les baux, et la copie de ce que publie la province.
+//! les baux, et la copie de ce que publie la province. (v143) Pour une province d'un pays,
+//! seule la tâche vient du relais du monde : tout le reste passe par une connexion au relais
+//! du pays (`Up`).
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -17,6 +19,24 @@ use minelib_net::transport::{self, Inbound};
 /// Une province sans bail depuis ce temps (relais du monde injoignable) : son relais
 /// s'arrête (le relais du monde l'a reprise).
 const LOST_AFTER: Duration = Duration::from_secs(10);
+
+/// (v143) Province d'un pays : où joindre le relais du pays (avec le jeton du relais du
+/// monde), qui l'on est (pseudo, clé du compte), d'où passer par iroh.
+pub struct Up {
+    pub at: proto::ProvinceAt,
+    pub pseudo: String,
+    pub signer: [u8; 32],
+    pub node_dir: Option<PathBuf>,
+}
+
+/// (v143) Connexion au relais du pays : ce qui attend qu'elle soit prête, et si elle est
+/// perdue (le pays est tombé : la province s'arrête à la fin de son bail).
+struct UpLink {
+    client: Client,
+    link: Option<Sender<Inbound>>,
+    queue: Vec<Request>,
+    lost: bool,
+}
 
 /// Relais d'une province tenu par ce jeu (ou, v141, son relais de secours).
 pub struct ProvinceHost {
@@ -37,6 +57,8 @@ pub struct ProvinceHost {
     standby_said: bool,
     /// Où le joindre (nœud iroh, adresse, clé du relais).
     at: ([u8; 32], String, [u8; 32]),
+    /// (v143) Province d'un pays : la connexion au relais du pays.
+    up: Option<UpLink>,
 }
 
 /// Relais embarqué d'une province, lancé : sa poignée, son nœud iroh, où le joindre.
@@ -61,22 +83,28 @@ impl ProvinceHost {
         settings: proto::ProvinceSettings,
         link: &Sender<Inbound>,
         p2p: bool,
+        nest: Option<proto::Nest>,
+        parent: Option<Up>,
     ) -> Option<Self> {
         let (handle, node, at) = Self::launch(
-            room, province, size, epoch, secret, root, info, settings, p2p, false,
+            room, province, size, epoch, secret, root, info, settings, p2p, false, nest,
         )?;
-        transport::push(
-            link,
-            &Request::ProvinceReady {
-                room,
-                province,
-                epoch,
-                node: at.0,
-                addr: at.1.clone(),
-                key: at.2,
-                have: 0,
-            },
-        );
+        let ready = Request::ProvinceReady {
+            room,
+            province,
+            epoch,
+            node: at.0,
+            addr: at.1.clone(),
+            key: at.2,
+            have: 0,
+        };
+        // (v143) Province d'un pays : au relais du pays (il lui envoie son historique dès
+        // qu'elle entre).
+        let up = parent
+            .map(|u| Self::dial_up(room, province, size, epoch, u, false, Some(ready.clone())));
+        if up.is_none() {
+            transport::push(link, &ready);
+        }
         log::info!("relais de province : province {province:?} du monde {room}");
         Some(Self {
             room,
@@ -91,7 +119,48 @@ impl ProvinceHost {
             follow_link: None,
             standby_said: false,
             at,
+            up,
         })
+    }
+
+    /// (v143) Connexion au relais du pays, avec le jeton du relais du monde ; `first` part
+    /// dès qu'elle est prête.
+    #[allow(clippy::too_many_arguments)]
+    fn dial_up(
+        room: u64,
+        province: [i32; 2],
+        size: i32,
+        epoch: u64,
+        u: Up,
+        standby: bool,
+        first: Option<Request>,
+    ) -> UpLink {
+        let client = dial(&u.at.info, u.node_dir.clone());
+        client.send(Cmd::ProvinceChild {
+            room,
+            province,
+            size,
+            epoch,
+            pseudo: u.pseudo.clone(),
+            signer: u.signer,
+            token: u.at.token,
+            standby,
+        });
+        log::info!(
+            "province {province:?} : relais du pays {:?} (époque {epoch})",
+            u.at.info.province
+        );
+        UpLink {
+            client,
+            link: None,
+            queue: first.into_iter().collect(),
+            lost: false,
+        }
+    }
+
+    /// (v143) Province d'un pays (ou son relais de secours).
+    pub fn is_child(&self) -> bool {
+        self.up.is_some()
     }
 
     /// (v141) Relais de secours de la province : un relais embarqué qui suit celui de la
@@ -112,10 +181,30 @@ impl ProvinceHost {
         signer: [u8; 32],
         node_dir: Option<PathBuf>,
         p2p: bool,
+        parent: Option<proto::ProvinceAt>,
+        nest: Option<proto::Nest>,
     ) -> Option<Self> {
         let (handle, node, at) = Self::launch(
-            room, province, size, epoch, secret, root, info, settings, p2p, true,
+            room, province, size, epoch, secret, root, info, settings, p2p, true, nest,
         )?;
+        // (v143) Relais de secours d'une province d'un pays : il se signale au relais du pays
+        // (qui le promouvra), et suit la province comme les autres.
+        let up = parent.map(|at| {
+            Self::dial_up(
+                room,
+                province,
+                size,
+                epoch,
+                Up {
+                    at,
+                    pseudo: pseudo.to_string(),
+                    signer,
+                    node_dir: node_dir.clone(),
+                },
+                true,
+                None,
+            )
+        });
         let client = dial(&follow.info, node_dir);
         client.send(Cmd::ProvinceFollow {
             room,
@@ -139,6 +228,7 @@ impl ProvinceHost {
             follow_link: None,
             standby_said: false,
             at,
+            up,
         })
     }
 
@@ -155,6 +245,7 @@ impl ProvinceHost {
         settings: proto::ProvinceSettings,
         p2p: bool,
         standby: bool,
+        nest: Option<proto::Nest>,
     ) -> Option<Launched> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -171,7 +262,7 @@ impl ProvinceHost {
         .map_err(|e| log::warn!("relais de province : {e:#}"))
         .ok()?;
         if !handle.province_begin(
-            room, province, size, epoch, secret, root, info, settings, standby,
+            room, province, size, epoch, secret, root, info, settings, standby, nest,
         ) {
             return None;
         }
@@ -221,8 +312,10 @@ impl ProvinceHost {
                 ok,
                 copies,
                 dump,
+                ms,
             } if (*room, *province) == (self.room, self.province) => {
-                self.handle.province_leased(*epoch, *t, *ok, *copies, *dump);
+                self.handle
+                    .province_leased(*epoch, *t, *ok, *copies, *dump, *ms);
                 Vec::new()
             }
             Response::ProvinceArchived {
@@ -239,8 +332,10 @@ impl ProvinceHost {
                 province,
                 epoch,
             } if (*room, *province, *epoch) == (self.room, self.province, self.epoch) => {
-                self.stopped = true;
-                self.handle.province_stop(true)
+                // (v143) Un pays attend d'abord que ses provinces lui aient tout rendu.
+                let out = self.handle.province_stop(true);
+                self.stopped = self.handle.province_stopped();
+                out
             }
             // (v139) Sacs de survie prêtés ou rappelés, WorldEdit d'un OP : pour cette
             // province, à cette époque.
@@ -306,6 +401,66 @@ impl ProvinceHost {
     /// a été publié, relais de région prêts). Une province sans bail depuis `LOST_AFTER`
     /// s'arrête (`stopped`).
     pub fn tick(&mut self) -> Vec<Request> {
+        if self.stopped {
+            return Vec::new();
+        }
+        // (v143) Province d'un pays : tout passe par le relais du pays.
+        if self.up.is_some() {
+            let mut events = Vec::new();
+            if let Some(u) = self.up.as_mut() {
+                while let Some(e) = u.client.poll() {
+                    match e {
+                        Event::Link(l) => {
+                            for r in u.queue.drain(..) {
+                                transport::push(&l, &r);
+                            }
+                            u.link = Some(l);
+                        }
+                        Event::Province(r) => events.push(r),
+                        Event::RoomClosed | Event::Error(_) | Event::Offline(_) | Event::Lost => {
+                            if !u.lost {
+                                log::info!("province : plus de nouvelles du relais du pays");
+                            }
+                            u.lost = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            for r in events {
+                out.extend(self.event(&r));
+            }
+            out.extend(self.tick_own());
+            // (Le pays est tombé : plus de bail possible ; à la fin du sien, elle s'arrête.)
+            if self.up.as_ref().is_some_and(|u| u.lost)
+                && (self.standby || !self.handle.province_serving())
+                && !self.stopped
+            {
+                log::info!("province : relais du pays perdu, arrêt");
+                self.stopped = true;
+                self.handle.province_stop(false);
+                out.clear();
+            }
+            if let Some(u) = self.up.as_mut() {
+                match &u.link {
+                    Some(l) => {
+                        for r in &out {
+                            transport::push(l, r);
+                        }
+                    }
+                    None => u.queue.extend(out),
+                }
+            }
+            return Vec::new();
+        }
+        self.tick_own()
+    }
+
+    /// Bail, copie de ce qui a été publié, relais de région prêts (ou, relais de secours, sa
+    /// copie) : ce qu'il faut envoyer plus haut.
+    fn tick_own(&mut self) -> Vec<Request> {
         if self.stopped {
             return Vec::new();
         }
@@ -375,7 +530,12 @@ impl ProvinceHost {
             self.stopped = true;
             return self.handle.province_stop(false);
         }
-        self.handle.province_tick()
+        let out = self.handle.province_tick();
+        // (v143) Un pays qui s'arrêtait : ses provinces lui ont tout rendu, il a rendu tout.
+        if self.handle.province_stopped() {
+            self.stopped = true;
+        }
+        out
     }
 
     /// Départ propre (le jeu se ferme) : tout part au relais du monde, qui reprend la
@@ -392,6 +552,12 @@ impl ProvinceHost {
     #[cfg(test)]
     pub fn kill(&self) {
         self.handle.kill();
+    }
+
+    /// Essais : relais de secours dont la copie est à jour.
+    #[cfg(test)]
+    pub fn standby_ready(&self) -> bool {
+        self.standby && self.standby_said
     }
 
     /// Essais : messages de voix remis par ce relais de province.

@@ -1033,9 +1033,14 @@ fn run(
                     ref info,
                     ref settings,
                     ref follow,
+                    ref parent,
+                    nest,
                 }) => {
                     if let Some(l) = &link {
                         if province.is_none() {
+                            let signer = identity
+                                .as_ref()
+                                .map_or([0; 32], |k| k.verifying_key().to_bytes());
                             province = match follow {
                                 // (v141) Relais de secours de la province.
                                 Some(at) => crate::province_host::ProvinceHost::standby(
@@ -1049,11 +1054,11 @@ fn run(
                                     settings.clone(),
                                     (**at).clone(),
                                     &login.pseudo,
-                                    identity
-                                        .as_ref()
-                                        .map_or([0; 32], |k| k.verifying_key().to_bytes()),
+                                    signer,
                                     login.node_dir.clone(),
                                     login.node_dir.is_some(),
+                                    parent.as_deref().cloned(),
+                                    nest,
                                 ),
                                 None => crate::province_host::ProvinceHost::start(
                                     room,
@@ -1066,8 +1071,20 @@ fn run(
                                     settings.clone(),
                                     l,
                                     login.node_dir.is_some(),
+                                    nest,
+                                    parent.as_deref().map(|at| crate::province_host::Up {
+                                        at: at.clone(),
+                                        pseudo: login.pseudo.clone(),
+                                        signer,
+                                        node_dir: login.node_dir.clone(),
+                                    }),
                                 ),
                             };
+                            // (v143) Province d'un pays qui n'a pas démarré : le garant est
+                            // libre (le relais du monde ne l'apprendrait pas autrement).
+                            if province.is_none() && parent.is_some() {
+                                client.send(Cmd::Leave);
+                            }
                         }
                     }
                 }
@@ -1241,6 +1258,11 @@ fn run(
             }
         }
         if province.as_ref().is_some_and(|p| p.stopped) {
+            // (v143) Province d'un pays : arrêtée par le pays, le relais du monde ne le sait
+            // pas ; le garant redevient libre.
+            if province.as_ref().is_some_and(|p| p.is_child()) {
+                client.send(Cmd::Leave);
+            }
             province = None;
         }
         if let Some(s) = &shard {

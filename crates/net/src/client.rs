@@ -89,6 +89,18 @@ pub enum Cmd {
         signer: [u8; 32],
         token: [u8; 32],
     },
+    /// (v143) Hôte d'une province d'un pays (ou de son relais de secours) : entre chez le
+    /// relais du pays avec le jeton du relais du monde (voir `proto::child_token`).
+    ProvinceChild {
+        room: u64,
+        province: [i32; 2],
+        size: i32,
+        epoch: u64,
+        pseudo: String,
+        signer: [u8; 32],
+        token: [u8; 32],
+        standby: bool,
+    },
     TotpBegin,
     TotpConfirm(u32),
     TotpDisable(u32),
@@ -1187,6 +1199,38 @@ impl Worker {
                     pseudo,
                     signer,
                     token,
+                })? {
+                    Response::Welcome { pseudo, .. } => {
+                        self.pseudo = pseudo;
+                        if let Some(c) = &self.chan {
+                            self.emit(Event::Link(c.pusher()));
+                        }
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
+            }
+            Cmd::ProvinceChild {
+                room,
+                province,
+                size,
+                epoch,
+                pseudo,
+                signer,
+                token,
+                standby,
+            } => {
+                self.chan = None;
+                self.connect()?;
+                match self.request(&Request::ProvinceChild {
+                    room,
+                    province,
+                    size,
+                    epoch,
+                    pseudo,
+                    signer,
+                    token,
+                    standby,
                 })? {
                     Response::Welcome { pseudo, .. } => {
                         self.pseudo = pseudo;
