@@ -64,6 +64,15 @@ enum UiCmd {
         h: f32,
         color: [f32; 4],
     },
+    /// Trait de (x0, y0) à (x1, y1), d'épaisseur `width` pixels.
+    Line {
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        width: f32,
+        color: [f32; 4],
+    },
     Text {
         x: f32,
         y: f32,
@@ -113,6 +122,20 @@ impl Ui {
 
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
         self.cmds.push(UiCmd::Rect { x, y, w, h, color });
+    }
+
+    /// Trait (guides de l'éditeur de lumières), en pixels.
+    pub fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: [f32; 4]) {
+        if [x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
+            self.cmds.push(UiCmd::Line {
+                x0,
+                y0,
+                x1,
+                y1,
+                width,
+                color,
+            });
+        }
     }
 
     /// Texte en police 8×8 agrandie `scale` fois, avec ombre portée (traduit dans la langue
@@ -374,6 +397,35 @@ impl Builder {
             CELL as f32,
         ];
         self.quad(x, y, x + size, y + size, uv, color);
+    }
+
+    /// Trait : quad tourné le long du segment (la case pleine de la police).
+    fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: [f32; 4]) {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-3 {
+            return;
+        }
+        let (nx, ny) = (-dy / len * width * 0.5, dx / len * width * 0.5);
+        let to_ndc = |x: f32, y: f32| [x / self.w * 2.0 - 1.0, 1.0 - y / self.h * 2.0];
+        let a = ATLAS_SIZE as f32;
+        let uv = [
+            ((SOLID % 16 * CELL) as f32 + 4.0) / a,
+            ((SOLID / 16 * CELL) as f32 + 4.0) / a,
+        ];
+        let p = [
+            to_ndc(x0 + nx, y0 + ny),
+            to_ndc(x1 + nx, y1 + ny),
+            to_ndc(x1 - nx, y1 - ny),
+            to_ndc(x0 - nx, y0 - ny),
+        ];
+        let v = |k: usize| TextVertex {
+            pos: p[k],
+            uv,
+            color,
+        };
+        self.verts
+            .extend_from_slice(&[v(0), v(1), v(2), v(2), v(3), v(0)]);
     }
 
     fn solid(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 4]) {
@@ -646,6 +698,14 @@ impl OverlayRenderer {
             for cmd in &ui.cmds {
                 match cmd {
                     UiCmd::Rect { x, y, w, h, color } => b.solid(*x, *y, x + w, y + h, *color),
+                    UiCmd::Line {
+                        x0,
+                        y0,
+                        x1,
+                        y1,
+                        width,
+                        color,
+                    } => b.line(*x0, *y0, *x1, *y1, *width, *color),
                     UiCmd::Model(verts) => {
                         let start = self.models.len() as u32;
                         self.models.extend(verts.iter().map(|v| {

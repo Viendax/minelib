@@ -156,6 +156,7 @@ fn emit_box_layer(
 ) {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
+    let lit = EntityVertex::light(light, true);
     // Nombre de pixels du skin par côté (une boîte agrandie garde 8 pixels : chacun un
     // peu plus grand).
     let (w, h, d) = (
@@ -270,7 +271,7 @@ fn emit_box_layer(
                 };
                 let c = srgb(rgb);
                 let g = if lod > 1 { 1.0 } else { g };
-                let col = [0, 1, 2].map(|i| c[i] * shade * g * light[i]);
+                let col = [0, 1, 2].map(|i| c[i] * shade * g);
                 let (u1, v1) = ((u + lod).min(nu) as f32, (v + lod).min(nv) as f32);
                 let (a, b, cc, dd) = (
                     p(u as f32, v as f32),
@@ -284,6 +285,7 @@ fn emit_box_layer(
                         color: col,
                         uv: [0.0; 2],
                         layer: -1,
+                        light: lit,
                     });
                 }
             }
@@ -584,7 +586,13 @@ pub(crate) fn emit_item(
         };
         let n = xf.transform_vector3(du.cross(dv)).normalize_or_zero();
         let shade = (0.78 + 0.22 * n.y + 0.06 * n.x).clamp(0.45, 1.0);
-        let col = [0, 1, 2].map(|i| color[i] * shade * if lit { light[i] } else { 1.0 });
+        let col = [0, 1, 2].map(|i| color[i] * shade);
+        // Lumineux par lui-même (flamme) : ni l'éclairage du lieu, ni les lumières.
+        let vl = if lit {
+            EntityVertex::light(light, true)
+        } else {
+            EntityVertex::light([0.5; 3], false)
+        };
         for (u, v) in [
             (0.0, 0.0),
             (1.0, 0.0),
@@ -601,6 +609,7 @@ pub(crate) fn emit_item(
                     rect[1] + (rect[3] - rect[1]) * v,
                 ],
                 layer,
+                light: vl,
             });
         }
     }
@@ -838,13 +847,15 @@ pub fn tris_in_world(
         let n = (t.p[1] - t.p[0]).cross(t.p[2] - t.p[0]).normalize_or_zero();
         let n = xf.transform_vector3(n).normalize_or_zero();
         let shade = 0.45 + 0.55 * n.dot(sun).abs();
-        let c = [0, 1, 2].map(|i| (t.color[i] * 2.2 + 0.015) * shade * light[i]);
+        let c = [0, 1, 2].map(|i| (t.color[i] * 2.2 + 0.015) * shade);
+        let vl = EntityVertex::light(light, true);
         for p in t.p {
             out.push(EntityVertex {
                 pos: xf.transform_point3(p).to_array(),
                 color: c,
                 uv: [0.0, 0.0],
                 layer: -1,
+                light: vl,
             });
         }
     }

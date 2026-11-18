@@ -133,6 +133,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 - **L'eau et la lave coulent comme dans Minecraft** : sources infinies, chutes, écoulement vers le trou le plus proche, obsidienne et pierre taillée quand elles se rencontrent ; on y nage (lentement dans la lave, qui brûle). La **barrière à fluides** (`/give fluid_barrier`) est invisible comme la barrière, mais on la traverse : seuls l'eau et la lave s'y arrêtent.
 - **Des blocs qui se posent comme on s'y attend** : escaliers face à toi (à l'envers au plafond), dalles, portes (une double porte s'ouvre en miroir, battant droit à la texture retournée), trappes (elles se relèvent du côté choisi à la pose, comme dans Minecraft), vitres qui se raccordent, bannières et portes de deux blocs de haut, bûches couchées contre un mur, pots de fleurs où l'on met (clic droit avec une plante) et enlève (clic droit à nouveau) ses fleurs et plantes.
 - **Objets au sol et coffres** : la touche *Lâcher l'objet* (A sur un clavier AZERTY ; avec Ctrl, toute la pile) lance l'objet en main devant soi ; il flotte en tournant et se ramasse en passant dessus. Un clic droit ouvre un **coffre de 3 lignes de 10** : clic gauche pour prendre ou poser une pile, clic droit pour un seul objet ; cassé, il laisse tomber son contenu. En ligne, le relais arbitre chaque geste dans l'ordre (un objet quitte l'inventaire avant de partir et n'y entre qu'à la réponse) : deux joueurs qui prennent la même chose n'en obtiennent qu'un, et des essais automatiques (réseau qui perd, rejoue et mélange les messages) vérifient qu'aucun objet n'est jamais doublé.
+- **Éditeur de lumières** (touche **L**), d'après le mod *IRLights* : place des **lumières ponctuelles** et des **projecteurs** où tu veux, règle leur couleur, leur intensité, leur portée et leur cône, ajoute des **rayons volumétriques** (poussière, fumée), des **ombres douces** calculées sur les blocs (et les joueurs) et des **gobos** (motifs projetés : fenêtre, feuillage, vitrail… ou tes propres PNG du dossier `gobos`). Les flèches et les guides se tirent à la souris dans le monde, la **caméra libre** (F) se promène sans bouger ton personnage. Les lumières sont gardées avec le monde (`lumieres.json`) ; en option, des **lumières automatiques** s'allument sur les torches et blocs lumineux proches (expérimental). Pas en mode FPS.
 - **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`).
 - **Importe tes mondes Java** (format Anvil, toutes versions) et tes **packs de textures** : les fichiers d'origine ne sont jamais modifiés. Les décors faits d'**entités d'affichage** (blocs et objets posés, souvent dans des barrières) deviennent de vrais blocs, les **têtes à skin** gardent leur texture (téléchargée une fois depuis les serveurs de textures de Minecraft, puis gardée sur ton PC, calque du dessus compris), les **cadres** accrochés aux murs montrent le bloc qu'ils tiennent (et se cassent). Les blocs récents (coraux, lanternes, bougies, échafaudages, lichens…) ont leur équivalent.
 
@@ -167,6 +168,7 @@ Les touches sont **physiques** (même place en AZERTY et en QWERTY) et se règle
 | E | Inventaire | | T / `/` | Tchat / commande |
 | C (maintenu) | Zoom | | F5 | Vue 1re / 3e personne |
 | F2 | Capture d'écran | | F3 | Écran de debug |
+| L | Éditeur de lumières | | F (éditeur ouvert) | Caméra libre |
 
 </details>
 
@@ -203,6 +205,7 @@ Le tchat se navigue avec ← → (Début, Fin, Suppr).
 | `/timeset <heure\|default>` · `/timefix true\|false` | Régler / arrêter l'heure (`11`, `11.20`, `11:20`, `11h20` ; `default` : soleil de Dust2, immobile ; OP en ligne) |
 | `/fps set time [heure\|default]` | Heure fixe d'une carte FPS (par défaut le soleil de Dust2) |
 | `/worldname <nom>` | Renommer le monde |
+| `/lumieres` · `/lumieres effacer` | Ouvrir l'éditeur de lumières, ou retirer toutes les lumières du monde |
 | `//…` | WorldEdit (créatif ; en ligne, OP du serveur seulement) |
 
 </details>
@@ -274,6 +277,7 @@ Le relais met les joueurs en relation, transmet les données des parties, garde 
 
 - **Code** : [GNU AGPL v3](LICENSE).
 - **Textures (VoxelArt Libre)** : *Pixel Perfection* de XSSheep et la communauté (CC BY-SA 4.0), Mineclonia (CC BY-SA 4.0 / CC0), *Minecraft-Textures* d'Auseawesome (CC0), verre d'après le *Voxel Pack* de Kenney (CC0). Détail : `assets/CREDITS_VoxelArt_Libre.txt`.
+- **Éditeur de lumières** : d'après *IRLights* de qualet (MIT). Détail : `assets/CREDITS_IRLights.txt`.
 - **Modèles d'armes** : *Ultimate Gun Pack* de [Quaternius](https://quaternius.com) (CC0).
 - **Sons** : bibliothèques libres (CC0). Détail : `crates/app/assets/sounds/CREDITS.txt`.
 - **Bibliothèques** : wgpu, winit, rodio, mainline, iroh et d'autres, sous licences MIT / Apache-2.0.

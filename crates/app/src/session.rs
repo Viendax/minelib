@@ -287,6 +287,9 @@ pub struct Session {
     lights_timer: f32,
     /// Faces visibles des miroirs autour du joueur (raytracing).
     mirror_planes: Vec<MirrorPlane>,
+    /// Lumières placées dans ce monde (éditeur de lumières, touche L) et leurs réglages.
+    pub lights: crate::lights::Lights,
+    pub light_editor: crate::light_editor::Editor,
 }
 
 /// Distance de rendu maximale réglable (chunks).
@@ -311,6 +314,7 @@ impl Session {
     /// Ouvre un monde enregistré.
     pub fn open(dir: PathBuf, cfg: SessionConfig) -> Result<Self> {
         let (data, mut world) = save::load_world(&dir)?;
+        let dir_for_lights = dir.clone();
         let (mut player, fresh) = match data.player {
             Some(p) => {
                 let mut pl = Player::new(Vec3::from(p.pos));
@@ -486,6 +490,8 @@ impl Session {
             vox_job: None,
             lights_timer: 0.0,
             mirror_planes: Vec::new(),
+            lights: crate::lights::Lights::load(&minelib_assets::data_dir(), &dir_for_lights),
+            light_editor: Default::default(),
         })
     }
 
@@ -513,6 +519,8 @@ impl Session {
         if self.items_ready && self.build.as_ref().is_none_or(|b| b.is_owner()) {
             self.items.save(&self.dir);
         }
+        // Lumières de l'éditeur : avec la copie du monde de ce joueur (même en ligne).
+        self.lights.save_now();
         save::save_world(&self.dir, &data, &self.world)
     }
 
@@ -619,7 +627,7 @@ impl Session {
             let screen_keys = self.keyboard_on_screen();
             let was_open = self.chat.open;
             let mut sent = self.chat.update(input, dt);
-            if !was_open && !self.inventory.open && !screen_keys {
+            if !was_open && !self.inventory.open && !screen_keys && !self.light_editor.open {
                 let by_chat = if self.game.mode == GameMode::Fps {
                     self.keys.pressed(input, Action::FpsChat)
                         || self.keys.pressed(input, Action::FpsTeamChat)
@@ -636,6 +644,31 @@ impl Session {
             if let Some(text) = sent {
                 self.submit(&text);
             }
+            // Éditeur de lumières (touche L) et sa caméra libre (F) ; pas en mode FPS (rien
+            // ne doit éclairer un coin sombre pour un seul joueur).
+            let fps_now = self.game.mode == GameMode::Fps;
+            if fps_now && self.light_editor.open {
+                self.light_editor.close();
+            }
+            let naming = self.light_editor.editing_name;
+            if !typing && !fps_now && !naming && self.keys.pressed(input, Action::LightEditor) {
+                self.light_editor.toggle();
+                if self.light_editor.open {
+                    self.inventory.close();
+                }
+            }
+            if self.light_editor.open
+                && !typing
+                && !naming
+                && self.keys.pressed(input, Action::FreeCamera)
+            {
+                self.light_editor.toggle_free_cam(
+                    self.player.eye(),
+                    self.player.yaw,
+                    self.player.pitch,
+                );
+            }
+            let editing = self.light_editor.open;
             self.hurt = (self.hurt - dt).max(0.0);
             for p in &mut self.pings {
                 p.1 += dt;
@@ -660,11 +693,12 @@ impl Session {
                         input.scroll,
                     );
                 }
-            } else if !typing && self.game.mode != GameMode::Fps {
+            } else if !typing && !editing && self.game.mode != GameMode::Fps {
                 self.handle_keys(input);
                 self.handle_hotbar(input);
             }
-            self.update_screens(input, dt, chat_typing);
+            // Éditeur de lumières ouvert : les écrans ne se touchent pas.
+            self.update_screens(input, dt, chat_typing || editing);
             self.inventory.update(dt);
             self.tick_torches(dt);
             self.update_sun(dt);
@@ -686,6 +720,7 @@ impl Session {
             };
             self.fov += (target_fov - self.fov) * (dt * 14.0).min(1.0);
 
+            let mut free_turn = (0.0, 0.0);
             if input.grabbed {
                 let (dx, dy) = input.mouse_delta;
                 // Lunette : sensibilité réduite comme le champ de vision (CS :
@@ -701,7 +736,16 @@ impl Session {
                     self.sensitivity
                 };
                 let k = (CS_DEGREES_PER_COUNT * sens).to_radians() * (fov / FOV);
-                self.player.rotate(dx as f32 * k, dy as f32 * k);
+                // Éditeur de lumières avec la caméra libre : c'est elle qui tourne.
+                if editing && self.light_editor.free_cam.is_some() {
+                    free_turn = (dx as f32 * k, dy as f32 * k);
+                } else {
+                    self.player.rotate(dx as f32 * k, dy as f32 * k);
+                }
+            }
+            if editing {
+                self.light_editor
+                    .move_free_cam(input, &self.keys, dt, free_turn);
             }
             // Mode FPS : touches de l'onglet FPS ; marcher et s'accroupir peuvent basculer.
             if fps_mode && !typing && !self.inventory.open {
@@ -834,7 +878,9 @@ impl Session {
                     chat::YELLOW,
                 );
             }
-            if self.inventory.open || typing {
+            // Inventaire, tchat, éditeur de lumières : le joueur ne bouge pas (la caméra
+            // libre de l'éditeur, si); il ne casse ni ne pose rien.
+            if self.inventory.open || typing || editing {
                 m = MoveInput::default();
             }
             // Diagnostic : le joueur avance encore alors qu'aucune touche de déplacement
@@ -1151,6 +1197,7 @@ impl Session {
             let swung = input.grabbed
                 && !fps_mode
                 && !typing
+                && !editing
                 && !self.inventory.open
                 && (self.keys.pressed(input, Action::Attack)
                     || self.keys.pressed(input, Action::Use));
@@ -1174,8 +1221,10 @@ impl Session {
             let target = (speed / 4.3).min(1.0);
             self.walk_amp += (target - self.walk_amp) * (dt * 10.0).min(1.0);
             self.hand_light = self.light_at_player(held);
-            self.handle_blocks(input, dt);
-            self.update_items(input, typing);
+            if !editing {
+                self.handle_blocks(input, dt);
+                self.update_items(input, typing);
+            }
             if self.inventory.open {
                 let (w, h) = renderer.size();
                 if self.inventory.chest.is_none() {
@@ -1216,6 +1265,25 @@ impl Session {
         for pos in std::mem::take(&mut self.dirty) {
             self.streamer
                 .remesh_now(&self.world, &mut self.workers, pos);
+        }
+        // Lumières de l'éditeur : lumières automatiques, enregistrement, envoi au rendu
+        // (avant la grille de blocs : leurs ombres en ont besoin).
+        {
+            let _s = perf::scope("lumières de l'éditeur");
+            let cam = self.camera_pos();
+            let fps = self.game.mode == GameMode::Fps;
+            self.lights.update(dt, &self.world, cam, !fps);
+            if std::mem::take(&mut self.lights.gobos_dirty) {
+                let imgs: Vec<minelib_render::GoboImage> =
+                    self.lights.gobos.iter().map(|g| g.image.clone()).collect();
+                renderer.set_gobos(&imgs);
+            }
+            let list = if self.game.mode == GameMode::Fps {
+                Vec::new()
+            } else {
+                self.lights.frame_lights()
+            };
+            renderer.set_dyn_lights(&list, &self.lights.settings.render);
         }
         {
             let _s = perf::scope("grille raytracing");
@@ -2127,7 +2195,7 @@ impl Session {
             return;
         }
         self.lights_timer = 0.1;
-        let lights = collect_lights(&self.world, self.player.eye());
+        let lights = collect_lights(&self.world, self.camera_pos());
         let planes: &[MirrorPlane] = if renderer.raytracing() {
             &self.mirror_planes
         } else {
@@ -2141,7 +2209,8 @@ impl Session {
     /// s'est déplacé de 8 blocs ou qu'un bloc a changé (au plus 4 fois par seconde).
     fn update_voxels(&mut self, renderer: &mut Renderer, dt: f32) {
         use minelib_render::rt::VOX;
-        if !renderer.raytracing() {
+        // La grille sert aux reflets et aux ombres des lumières de l'éditeur.
+        if !renderer.raytracing() && !renderer.dyn_lights_want_voxels() {
             self.vox_origin = None;
             self.vox_job = None;
             self.mirror_planes.clear();
@@ -2168,7 +2237,8 @@ impl Session {
             }
         }
         self.vox_timer -= dt;
-        let e = self.player.eye();
+        // Autour de la caméra (la caméra libre de l'éditeur peut être loin du joueur).
+        let e = self.camera_pos();
         let snap = |v: f32, half: i32| ((v.floor() as i32 - half).div_euclid(8)) * 8;
         let origin = [
             snap(e.x, VOX[0] as i32 / 2),
@@ -2211,6 +2281,70 @@ impl Session {
         self.vox_origin = Some(origin);
         self.vox_dirty = false;
         self.vox_timer = 0.25;
+    }
+
+    /// Position de la caméra libre de l'éditeur de lumières, sinon les yeux du joueur.
+    fn camera_pos(&self) -> Vec3 {
+        self.light_editor
+            .free_cam
+            .map_or_else(|| self.player.eye(), |c| c.pos)
+    }
+
+    /// Caméra de l'image : (position, vue, direction du regard). Caméra libre de l'éditeur,
+    /// sinon les yeux du joueur, ou derrière lui (F5).
+    fn view_camera(&self) -> (Vec3, Mat4, Vec3) {
+        if let Some(c) = self.light_editor.free_cam {
+            return (c.pos, c.view(), c.look());
+        }
+        let fps_mode = self.game.mode == GameMode::Fps;
+        let third = if fps_mode { 0 } else { self.perspective };
+        if third == 0 {
+            (
+                self.player.eye(),
+                self.view_with_punch(),
+                self.player.look_dir(),
+            )
+        } else {
+            let eye = self.player.eye();
+            let look = self.player.look_dir();
+            let back = if third == 1 { -look } else { look };
+            let dist = raycast(&self.world, eye.into(), back.into(), THIRD_PERSON_DIST)
+                .map_or(THIRD_PERSON_DIST, |h| (h.distance - 0.25).max(0.3));
+            let cam = eye + back * dist;
+            (cam, Mat4::look_to_rh(cam, -back, Vec3::Y), -back)
+        }
+    }
+
+    /// Éditeur de lumières (s'il est ouvert) : guides et poignées dans le monde, puis son
+    /// panneau, par-dessus le HUD.
+    pub fn light_editor_ui(
+        &mut self,
+        ui: &mut Ui,
+        size: (f32, f32),
+        input: &Input,
+        stats: minelib_render::DynStats,
+    ) {
+        if !self.light_editor.open {
+            return;
+        }
+        let (pos, view, look) = self.view_camera();
+        let proj = Mat4::perspective_infinite_reverse_rh(
+            self.fov.to_radians(),
+            size.0 / size.1.max(1.0),
+            0.05,
+        );
+        let cam = crate::light_editor::Cam {
+            pos,
+            look,
+            view_proj: proj * view,
+            size,
+        };
+        let hint = self
+            .keys
+            .get(Action::LightEditor)
+            .map_or_else(|| "L".to_string(), |b| b.name(input));
+        self.light_editor
+            .ui(ui, input, &mut self.lights, &cam, stats, &hint);
     }
 
     /// Objet en main (aucun en mode FPS : pas d'inventaire).
@@ -3947,6 +4081,26 @@ impl Session {
                 self.game.health = MAX_HEALTH;
                 self.chat.say("Vous êtes soigné.", chat::YELLOW);
             }
+            // Éditeur de lumières (touche L) ; `/lumieres effacer` les retire toutes.
+            "lumieres" | "lumières" | "lights" => match arg.map(|a| a.to_lowercase()) {
+                Some(a) if a == "effacer" || a == "clear" => {
+                    let n = self.lights.scene.len();
+                    self.lights.scene.clear();
+                    self.light_editor.selected = None;
+                    self.lights.touch_scene();
+                    self.chat.say(
+                        format!("{n} lumière(s) retirée(s) de ce monde."),
+                        chat::YELLOW,
+                    );
+                }
+                _ if self.game.mode == GameMode::Fps => {
+                    self.chat.say("Pas de lumières en mode FPS.", chat::RED);
+                }
+                _ => {
+                    self.light_editor.open = true;
+                    self.inventory.close();
+                }
+            },
             "help" | "aide" | "?" => {
                 for l in [
                     "/gm (ou /gamemode) <0|1|2|3> : survie, créatif, fps, spectateur",
@@ -3957,6 +4111,7 @@ impl Session {
                     "/timefix true|false : arrête ou relance le temps",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
                     "/yt [recherche | adresse] : YouTube sur les écrans vidéo",
+                    "/lumieres : éditeur de lumières (touche L) ; /lumieres effacer : les retire",
                     "Vol : deux appuis rapides sur Espace",
                     "Mode FPS : clic molette = ping (pas d'inventaire ni de blocs)",
                     "Spectateur (/gm 3) : vol forcé, on traverse les blocs",
@@ -4898,8 +5053,9 @@ impl Session {
         }
         if !self.inventory.open {
             let c = 15.0 * s;
-            // Mode FPS : viseur façon CS dessiné par le HUD FPS.
-            if self.game.mode != GameMode::Fps {
+            // Mode FPS : viseur façon CS dessiné par le HUD FPS. Éditeur de lumières : la
+            // souris est libre, pas de viseur.
+            if self.game.mode != GameMode::Fps && !self.light_editor.open {
                 ui.image(
                     "gui/crosshair",
                     (size.0 - c) / 2.0,
@@ -5071,19 +5227,17 @@ impl Session {
             self.fov
         };
         // Vue F5 : caméra à 4 blocs derrière (ou devant) les yeux, comme dans Minecraft,
-        // rapprochée si un bloc est sur le chemin. Pas en mode FPS.
-        let third = if fps_mode { 0 } else { self.perspective };
-        let (cam, view) = if third == 0 {
-            (self.player.eye(), self.view_with_punch())
+        // rapprochée si un bloc est sur le chemin. Pas en mode FPS. Caméra libre de
+        // l'éditeur de lumières : le joueur reste où il est, et se voit.
+        let free = self.light_editor.free_cam.is_some();
+        let third = if fps_mode {
+            0
+        } else if free {
+            1
         } else {
-            let eye = self.player.eye();
-            let look = self.player.look_dir();
-            let back = if third == 1 { -look } else { look };
-            let dist = raycast(&self.world, eye.into(), back.into(), THIRD_PERSON_DIST)
-                .map_or(THIRD_PERSON_DIST, |h| (h.distance - 0.25).max(0.3));
-            let cam = eye + back * dist;
-            (cam, Mat4::look_to_rh(cam, -back, Vec3::Y))
+            self.perspective
         };
+        let (cam, view, _) = self.view_camera();
         use crate::player_model::Held;
         let held = if fps_mode {
             Some(Held::Stick([38, 38, 42]))
@@ -5119,8 +5273,9 @@ impl Session {
             Vec::new()
         };
         // Jusqu'ici, le modèle du joueur local (il suit la caméra) ; le reste est fixé
-        // dans le monde (vecteurs de mouvement de l'anticrénelage).
-        let follow = model.len();
+        // dans le monde (vecteurs de mouvement de l'anticrénelage). Avec la caméra libre,
+        // le joueur ne la suit pas.
+        let follow = if free { 0 } else { model.len() };
         let mut shadows: Vec<(Vec3, Vec<ShadowBox>)> = Vec::new();
         if visible && self.spectating.is_none() {
             shadows.push((self.player.pos, crate::player_model::shadow_boxes(&pose)));
@@ -5361,8 +5516,8 @@ impl Session {
                 }
                 _ => None,
             },
-            // Pas de contour du bloc visé en mode FPS.
-            selected: if grabbed && self.game.mode != GameMode::Fps {
+            // Pas de contour du bloc visé en mode FPS (ni dans l'éditeur de lumières).
+            selected: if grabbed && self.game.mode != GameMode::Fps && !self.light_editor.open {
                 // Hitbox de l'écran visé (à portée de main), sinon cadre, sinon bloc.
                 self.screen_aim
                     .filter(|a| a.1 <= REACH)
@@ -6002,7 +6157,8 @@ fn build_demo(world: &mut World) {
 const LIGHTS_RANGE: f32 = 40.0;
 
 /// Centre de la flamme d'une torche (droite ou murale) posée en `p`.
-fn flame_center(id: BlockId, p: [i32; 3]) -> [f32; 3] {
+/// Centre de la flamme d'une torche (droite ou murale) en `p`.
+pub(crate) fn flame_center(id: BlockId, p: [i32; 3]) -> [f32; 3] {
     let local = match id.def().shape {
         minelib_world::registry::Shape::WallTorch(d) => {
             minelib_world::mesh::wall_torch_xf(d, [0.5, 0.656, 0.5])
