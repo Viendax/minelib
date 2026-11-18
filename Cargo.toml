@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/platform", "crates/render", "crates/world", "crates/assets", "crates/net", "crates/relay", "crates/p2p", "crates/app", "crates/launcher"]
+# Navigateur des écrans vidéo (Chromium/CEF, ≈ 300 Mo) : programme à part, hors des builds
+# et de la CI du jeu.
+exclude = ["crates/browser"]
 
 [workspace.package]
 version = "0.1.0"

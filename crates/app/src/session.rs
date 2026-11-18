@@ -261,8 +261,11 @@ pub struct Session {
     screen_content: crate::screen::ScreenContent,
     /// Écran visé par le réticule : indice, distance et point visé dessus (0..1).
     screen_aim: Option<(usize, f32, [f32; 2])>,
-    /// Appui en cours sur un écran (bouton pas encore relâché).
-    screen_down: bool,
+    /// Appui en cours sur un écran (touche « utiliser » pas encore relâchée).
+    screen_touch: bool,
+    /// Un écran vient d'être cassé : rien d'autre n'est cassé avant que la touche
+    /// « casser » soit relâchée.
+    screen_broke: bool,
     /// Marche du modèle du joueur : phase (radians) et ampleur 0..1.
     walk_phase: f32,
     /// Marche des autres joueurs (par pseudo) : comme la sienne en F5, calculée sur leur
@@ -465,7 +468,8 @@ impl Session {
             screens_loaded: false,
             screen_content: crate::screen::ScreenContent::new(),
             screen_aim: None,
-            screen_down: false,
+            screen_touch: false,
+            screen_broke: false,
             walk_phase: 0.0,
             walks: HashMap::new(),
             walk_amp: 0.0,
@@ -1279,14 +1283,40 @@ impl Session {
             }
         }
         // En mode FPS la molette sert à sauter.
-        if !self.inventory.open && input.scroll.abs() >= 1.0 && self.game.mode != GameMode::Fps {
+        if !self.inventory.open
+            && input.scroll.abs() >= 1.0
+            && self.game.mode != GameMode::Fps
+            && self.screen_aim.is_none()
+        {
             self.inventory.scroll(-input.scroll.signum() as i32);
         }
     }
 
-    /// Écrans vidéo : chargement (première image), point visé par le réticule, appui
-    /// (clic gauche, ou tir en mode FPS) pour toucher l'écran, accroupi + clic gauche pour
-    /// le casser, puis image suivante du contenu.
+    /// `/yt` : ouvre YouTube (accueil, recherche ou adresse) sur les écrans vidéo.
+    fn youtube(&mut self, query: &str) {
+        if self.screens.is_empty() {
+            self.chat.say(
+                "Pose d'abord un écran vidéo (objet « Écran vidéo », /give ecran).",
+                chat::RED,
+            );
+            return;
+        }
+        let url = crate::screen::youtube_url(query);
+        if self.screen_content.open(&url) {
+            self.chat.say(format!("Écrans : {url}"), chat::YELLOW);
+        } else {
+            self.chat.say(
+                "Navigateur absent : il faut le dossier « cef » (minelib-browser) dans .minelib.",
+                chat::RED,
+            );
+        }
+    }
+
+    /// Écrans vidéo : chargement (première image) et point visé par le réticule. Sur un
+    /// écran, « utiliser » le touche (tactile), « casser » le casse (l'objet revient, hors
+    /// créatif) et « copier le bloc » met l'objet en main ; accroupi, « utiliser » l'ignore
+    /// et pose le bloc tenu devant (voir `handle_blocks`). En mode FPS, la touche
+    /// « utiliser » le touche ; on ne le casse pas.
     fn update_screens(&mut self, input: &Input, dt: f32, typing: bool) {
         if !self.screens_loaded {
             self.screens = crate::screen::load(&self.dir);
@@ -1296,8 +1326,14 @@ impl Session {
         if self.player.solids.len() != self.screens.len() {
             self.screens_changed(false);
         }
+        // Navigateur (YouTube) : lancé avec le premier écran, arrêté avec le dernier.
+        if self.screens.is_empty() {
+            self.screen_content.stop_browser();
+        } else {
+            self.screen_content.start_browser();
+        }
         let fps = self.game.mode == GameMode::Fps;
-        let click = if fps { Action::FpsFire } else { Action::Attack };
+        let use_key = if fps { Action::FpsUse } else { Action::Use };
         self.screen_aim = None;
         if !self.screens.is_empty()
             && input.grabbed
@@ -1308,23 +1344,32 @@ impl Session {
             self.screen_aim = self.aimed_screen();
         }
         if let Some((i, t, uv)) = self.screen_aim {
-            if self.keys.pressed(input, click) {
-                // Le clic est pour l'écran : ni bloc cassé derrière, ni tir, jusqu'au
-                // relâchement (voir `handle_blocks` et `update_fps`).
-                self.screen_down = true;
-                if !fps && self.keys.held(input, Action::Sneak) {
-                    if t <= REACH {
-                        self.break_screen(i);
-                    }
-                } else {
-                    self.screen_content.press(uv);
-                }
+            let near = !fps && t <= REACH;
+            if near && self.keys.pressed(input, Action::Attack) {
+                self.break_screen(i);
+                self.screen_broke = true;
+            } else if near && self.keys.pressed(input, Action::Pick) {
+                self.give_picked(Item::Screen);
+            } else if self.keys.pressed(input, use_key)
+                && (fps || !self.keys.held(input, Action::Sneak))
+            {
+                self.screen_content.press(uv);
+                self.screen_touch = true;
+            }
+        }
+        // Molette sur un écran : fait défiler la page (pas la barre d'objets).
+        if let Some((_, _, uv)) = self.screen_aim {
+            if input.scroll.abs() >= 1.0 {
+                self.screen_content.wheel(uv, (input.scroll * 120.0) as i32);
             }
         }
         let uv = self.screen_aim.map(|a| a.2);
-        if self.screen_down && !self.keys.held(input, click) {
+        if self.screen_touch && !self.keys.held(input, use_key) {
             self.screen_content.release(uv);
-            self.screen_down = false;
+            self.screen_touch = false;
+        }
+        if self.screen_broke && !self.keys.held(input, Action::Attack) {
+            self.screen_broke = false;
         }
         self.screen_content.hover(uv);
         if !self.screens.is_empty() {
@@ -1589,10 +1634,20 @@ impl Session {
         if !input.grabbed || self.inventory.open {
             return;
         }
-        // Le réticule est sur un écran vidéo : le clic est pour lui, rien n'est cassé ni
-        // posé derrière.
-        if self.screen_aim.is_some() || self.screen_down {
+        // Écran vidéo visé à portée (ou touche encore tenue après l'avoir touché ou cassé) :
+        // ses touches sont pour lui (voir `update_screens`), rien n'est cassé ni posé
+        // derrière. Accroupi, « utiliser » l'ignore : le bloc tenu est posé devant, comme
+        // contre une porte ou un coffre.
+        if self.screen_touch || self.screen_broke {
             return;
+        }
+        if self.screen_aim.is_some_and(|a| a.1 <= REACH) {
+            let place_through = self.game.mode != GameMode::Fps
+                && self.keys.held(input, Action::Sneak)
+                && !self.keys.held(input, Action::Attack);
+            if !place_through {
+                return;
+            }
         }
         let keys = &self.keys;
         let pick = if self.game.mode == GameMode::Fps {
@@ -2814,12 +2869,10 @@ impl Session {
             }
         }
         let free = input.grabbed && !typing && !self.fps.buy_open;
-        // Sur un écran vidéo, la gâchette sert à le toucher : pas de tir.
-        let on_screen = self.screen_aim.is_some() || self.screen_down;
         let k = &self.keys;
         let c = crate::fps::Controls {
-            trigger_pressed: free && !on_screen && k.pressed(input, Action::FpsFire),
-            trigger_held: free && !on_screen && k.held(input, Action::FpsFire),
+            trigger_pressed: free && k.pressed(input, Action::FpsFire),
+            trigger_held: free && k.held(input, Action::FpsFire),
             trigger_down: k.held(input, Action::FpsFire),
             reload: free && k.pressed(input, Action::FpsReload),
             scope: free && k.pressed(input, Action::FpsScope),
@@ -3521,6 +3574,12 @@ impl Session {
             self.chat.say(format!("<Joueur> {text}"), chat::WHITE);
             return;
         };
+        // `/yt [recherche | adresse]` : YouTube sur les écrans vidéo (navigateur local,
+        // permis aussi en ligne).
+        if cmd == "yt" || cmd.starts_with("yt ") {
+            self.youtube(&cmd[2..]);
+            return;
+        }
         if self.online_command(cmd) {
             return;
         }
@@ -3808,6 +3867,7 @@ impl Session {
                     "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
                     "/timefix true|false : arrête ou relance le temps",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
+                    "/yt [recherche | adresse] : YouTube sur les écrans vidéo",
                     "Vol : deux appuis rapides sur Espace",
                     "Mode FPS : clic molette = ping (pas d'inventaire ni de blocs)",
                     "Spectateur (/gm 3) : vol forcé, on traverse les blocs",

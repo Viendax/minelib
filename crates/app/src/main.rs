@@ -71,6 +71,7 @@ mod player_model;
 mod province_host;
 mod radar;
 mod save;
+mod screen;
 mod session;
 mod skin;
 mod stick;

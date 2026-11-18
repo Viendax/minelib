@@ -1,6 +1,7 @@
-//! Écrans vidéo : l'objet « Écran vidéo » qu'on pose sur un mur ou un sol (clic droit),
-//! qu'on touche en le visant (clic gauche : écran tactile) et qu'on casse comme un objet
-//! du monde (accroupi + clic gauche ; l'objet revient, hors créatif).
+//! Écrans vidéo : l'objet « Écran vidéo » qu'on pose sur un mur ou un sol (« utiliser »,
+//! clic droit), qu'on touche en le visant (« utiliser » : écran tactile) et qu'on casse
+//! comme un bloc (« casser », clic gauche ; l'objet revient, hors créatif). Accroupi,
+//! « utiliser » l'ignore et pose le bloc tenu devant.
 //!
 //! Chaque écran posé a une hitbox : une boîte fine collée à son mur, qu'on vise (contour
 //! comme un bloc), qui arrête le joueur et qu'on casse. Les écrans sont enregistrés avec
@@ -218,27 +219,74 @@ pub fn model(out: &mut Vec<VmVertex>, mvp: Mat4, light: [f32; 3]) {
 }
 
 // ----------------------------------------------------------------------------
-// Ce qu'affichent les écrans.
+// Ce qu'affichent les écrans : la page du navigateur (YouTube), sinon une mire.
 // ----------------------------------------------------------------------------
 
-/// Résolution de l'image (16:9).
+/// Résolution de la mire (16:9).
 const W: u32 = 640;
 const H: u32 = 360;
+/// Taille de la page du navigateur (16:9).
+const PAGE_W: u32 = 1280;
+const PAGE_H: u32 = 720;
+/// Page ouverte au lancement du navigateur.
+pub const HOME_URL: &str = "https://www.youtube.com/";
 /// Durée de l'onde qui montre un appui (secondes).
 const RIPPLE_S: f32 = 0.35;
-/// Durée d'un tour de la barre de progression (secondes).
+/// Durée d'un tour de la barre de progression de la mire (secondes).
 const LOOP_S: f32 = 20.0;
 
-/// Contenu de test des écrans : mire animée, tactile.
+/// Adresse à ouvrir pour `/yt <texte>` : rien → l'accueil de YouTube ; une adresse web →
+/// elle-même ; sinon une recherche YouTube.
+pub fn youtube_url(query: &str) -> String {
+    let q = query.trim();
+    if q.is_empty() {
+        return HOME_URL.to_string();
+    }
+    if q.starts_with("https://") || q.starts_with("http://") {
+        return q.to_string();
+    }
+    let mut enc = String::new();
+    for b in q.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                enc.push(b as char)
+            }
+            b' ' => enc.push('+'),
+            _ => enc.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("https://www.youtube.com/results?search_query={enc}")
+}
+
+/// Point de la page (pixels) sous le point `uv` de l'écran.
+fn page_point(uv: [f32; 2]) -> (i32, i32) {
+    let x = (uv[0].clamp(0.0, 1.0) * PAGE_W as f32) as i32;
+    let y = (uv[1].clamp(0.0, 1.0) * PAGE_H as f32) as i32;
+    (x.min(PAGE_W as i32 - 1), y.min(PAGE_H as i32 - 1))
+}
+
+/// Ce qu'affichent les écrans : la page du navigateur (programme `minelib-browser`,
+/// Chromium) s'il est installé, sinon une mire animée. Tactile dans les deux cas.
 pub struct ScreenContent {
+    /// Image affichée (BGRA), de taille `size`.
     pixels: Vec<u8>,
-    /// Temps de « lecture » (n'avance pas en pause).
+    size: (u32, u32),
+    /// Navigateur lancé ; `browser_tried` : lancement déjà tenté (pas de relance en boucle).
+    browser: Option<Browser>,
+    browser_tried: bool,
+    /// Dernière image de la page (BGRA) et sa taille ; vide tant qu'il n'y en a pas.
+    page: Vec<u8>,
+    page_size: (u32, u32),
+    /// Mire : temps de « lecture » (n'avance pas en pause) et pause.
     time: f32,
     paused: bool,
-    /// Point visé (curseur), s'il y en a un.
+    /// Point visé (curseur), s'il y en a un, et dernier point envoyé au navigateur.
     cursor: Option<[f32; 2]>,
+    sent: Option<(i32, i32)>,
     /// Dernier appui : point et âge (secondes).
     ripple: Option<([f32; 2], f32)>,
+    /// À redessiner (nouvelle image de la page, curseur déplacé…).
+    dirty: bool,
     /// Change à chaque nouvelle image (le rendu ne renvoie que les nouvelles).
     version: u64,
 }
@@ -246,11 +294,18 @@ pub struct ScreenContent {
 impl ScreenContent {
     pub fn new() -> Self {
         let mut s = Self {
-            pixels: vec![0; (W * H * 4) as usize],
+            pixels: Vec::new(),
+            size: (W, H),
+            browser: None,
+            browser_tried: false,
+            page: Vec::new(),
+            page_size: (0, 0),
             time: 0.0,
             paused: false,
             cursor: None,
+            sent: None,
             ripple: None,
+            dirty: true,
             version: 0,
         };
         s.draw();
@@ -258,7 +313,7 @@ impl ScreenContent {
     }
 
     pub fn size(&self) -> (u32, u32) {
-        (W, H)
+        self.size
     }
 
     pub fn pixels(&self) -> &[u8] {
@@ -269,40 +324,160 @@ impl ScreenContent {
         self.version
     }
 
-    /// Le réticule survole ce point de l'écran (`None` : il n'est pas sur un écran).
-    pub fn hover(&mut self, uv: Option<[f32; 2]>) {
-        self.cursor = uv;
+    /// Lance le navigateur sur l'accueil de YouTube (une seule tentative) : appelé quand
+    /// un écran est posé.
+    pub fn start_browser(&mut self) {
+        if !self.browser_tried {
+            self.launch(HOME_URL);
+        }
     }
 
-    /// Appui sur l'écran : pause / lecture, comme un clic sur un lecteur vidéo.
+    /// Arrête le navigateur (plus aucun écran) ; il sera relancé au prochain écran.
+    pub fn stop_browser(&mut self) {
+        if self.browser.take().is_some() {
+            self.page.clear();
+            self.page_size = (0, 0);
+            self.dirty = true;
+        }
+        self.browser_tried = false;
+    }
+
+    /// Ouvre `url` dans le navigateur (le lance si besoin). `false` : navigateur absent.
+    pub fn open(&mut self, url: &str) -> bool {
+        match self.browser.as_mut() {
+            Some(b) => b.send(&format!("url {url}")),
+            None => {
+                self.launch(url);
+                self.browser.is_some()
+            }
+        }
+    }
+
+    fn launch(&mut self, url: &str) {
+        self.browser_tried = true;
+        self.browser = Browser::start(url);
+        if self.browser.is_none() {
+            log::info!("écrans vidéo : navigateur absent (dossier « cef »), mire affichée");
+        }
+    }
+
+    /// Le réticule survole ce point de l'écran (`None` : il n'est pas sur un écran).
+    pub fn hover(&mut self, uv: Option<[f32; 2]>) {
+        if uv != self.cursor {
+            self.cursor = uv;
+            self.dirty = true;
+        }
+        let Some(p) = uv.map(page_point) else { return };
+        if self.sent == Some(p) {
+            return;
+        }
+        if let Some(b) = self.browser.as_mut() {
+            b.send(&format!("move {} {}", p.0, p.1));
+            self.sent = Some(p);
+        }
+    }
+
+    /// Appui sur l'écran : clic dans la page ; sur la mire, pause / lecture.
     pub fn press(&mut self, uv: [f32; 2]) {
-        self.paused = !self.paused;
         self.ripple = Some((uv, 0.0));
+        self.dirty = true;
+        let p = page_point(uv);
+        match self.browser.as_mut() {
+            Some(b) => {
+                b.send(&format!("move {} {}", p.0, p.1));
+                b.send(&format!("down {} {}", p.0, p.1));
+                self.sent = Some(p);
+            }
+            None => self.paused = !self.paused,
+        }
     }
 
     /// Fin de l'appui (`uv` : `None` si le réticule a quitté l'écran entre-temps).
-    pub fn release(&mut self, _uv: Option<[f32; 2]>) {}
-
-    /// Avance d'une image et redessine.
-    pub fn update(&mut self, dt: f32) {
-        if !self.paused {
-            self.time += dt;
+    pub fn release(&mut self, uv: Option<[f32; 2]>) {
+        let Some(p) = uv.map(page_point).or(self.sent) else {
+            return;
+        };
+        if let Some(b) = self.browser.as_mut() {
+            b.send(&format!("up {} {}", p.0, p.1));
         }
+    }
+
+    /// Molette sur l'écran : fait défiler la page (`dy` : crans × 120, positif vers le haut).
+    pub fn wheel(&mut self, uv: [f32; 2], dy: i32) {
+        let p = page_point(uv);
+        if let Some(b) = self.browser.as_mut() {
+            b.send(&format!("wheel {} {} {dy}", p.0, p.1));
+        }
+    }
+
+    /// Avance d'une image : reçoit la page du navigateur et redessine si besoin.
+    pub fn update(&mut self, dt: f32) {
         if let Some((_, age)) = &mut self.ripple {
             *age += dt;
+            self.dirty = true;
         }
         if self.ripple.is_some_and(|r| r.1 > RIPPLE_S) {
             self.ripple = None;
         }
-        self.draw();
+        if let Some(b) = self.browser.as_mut() {
+            if !b.alive() {
+                log::warn!("écrans vidéo : le navigateur s'est arrêté (voir logs/navigateur*.log)");
+                // `browser_tried` reste vrai : pas de relance en boucle.
+                self.browser = None;
+                self.page.clear();
+                self.page_size = (0, 0);
+                self.dirty = true;
+            } else if let Some((w, h, px)) = b.take_frame() {
+                self.page = px;
+                self.page_size = (w, h);
+                self.dirty = true;
+            }
+        }
+        if self.page.is_empty() {
+            // Mire (aussi le temps que la première page arrive).
+            if !self.paused {
+                self.time += dt;
+            }
+            self.dirty = true;
+        }
+        if self.dirty {
+            self.draw();
+        }
     }
 
     fn draw(&mut self) {
+        if self.page.is_empty() {
+            self.draw_mire();
+        } else {
+            self.size = self.page_size;
+            self.pixels.clear();
+            self.pixels.extend_from_slice(&self.page);
+        }
+        // Les anneaux gardent la même taille à l'écran quelle que soit la résolution.
+        let k = self.size.0 as f32 / W as f32;
+        // Onde de l'appui : cercle qui s'agrandit et s'efface.
+        if let Some((uv, age)) = self.ripple {
+            let t = age / RIPPLE_S;
+            let shade = (255.0 * (1.0 - t)) as u8;
+            self.ring(uv, (8.0 + 40.0 * t) * k, 3.0 * k, [shade, shade, shade]);
+        }
+        // Curseur : petit anneau là où vise le réticule.
+        if let Some(uv) = self.cursor {
+            self.ring(uv, 7.0 * k, 2.0 * k, [255, 255, 255]);
+        }
+        self.dirty = false;
+        self.version += 1;
+    }
+
+    /// Mire de test : dégradé animé (figé et assombri en pause), barre de progression, et
+    /// en pause un grand triangle « lecture ».
+    fn draw_mire(&mut self) {
+        self.size = (W, H);
+        self.pixels.resize((W * H * 4) as usize, 0);
         let (w, h) = (W as i32, H as i32);
         let scroll = (self.time * 60.0) as i32;
         let bar = ((self.time / LOOP_S).fract() * w as f32) as i32;
         let dim: u8 = if self.paused { 2 } else { 1 };
-        // Fond : dégradé animé (figé et assombri en pause), barre de progression en haut.
         for y in 0..h {
             for x in 0..w {
                 let (mut b, mut g, mut r) =
@@ -317,7 +492,6 @@ impl ScreenContent {
                 self.put(x, y, [b / dim, g / dim, r / dim]);
             }
         }
-        // En pause : grand triangle « lecture » au centre.
         if self.paused {
             let (cx, cy) = (w / 2, h / 2);
             let tri = h / 5;
@@ -330,23 +504,11 @@ impl ScreenContent {
                 }
             }
         }
-        // Onde de l'appui : cercle qui s'agrandit et s'efface.
-        if let Some((uv, age)) = self.ripple {
-            let k = age / RIPPLE_S;
-            let radius = 8.0 + 40.0 * k;
-            let shade = (255.0 * (1.0 - k)) as u8;
-            self.ring(uv, radius, 3.0, [shade, shade, shade]);
-        }
-        // Curseur : petit anneau là où vise le réticule.
-        if let Some(uv) = self.cursor {
-            self.ring(uv, 7.0, 2.0, [255, 255, 255]);
-        }
-        self.version += 1;
     }
 
     /// Anneau de rayon `radius` (pixels) et d'épaisseur `width` centré en `uv`.
     fn ring(&mut self, uv: [f32; 2], radius: f32, width: f32, bgr: [u8; 3]) {
-        let (cx, cy) = (uv[0] * W as f32, uv[1] * H as f32);
+        let (cx, cy) = (uv[0] * self.size.0 as f32, uv[1] * self.size.1 as f32);
         let reach = (radius + width) as i32 + 1;
         for y in cy as i32 - reach..=cy as i32 + reach {
             for x in cx as i32 - reach..=cx as i32 + reach {
@@ -360,11 +522,184 @@ impl ScreenContent {
 
     /// Écrit un pixel (BGR, opaque) ; ignoré hors de l'image.
     fn put(&mut self, x: i32, y: i32, bgr: [u8; 3]) {
-        if x < 0 || y < 0 || x >= W as i32 || y >= H as i32 {
+        let (w, h) = (self.size.0 as i32, self.size.1 as i32);
+        if x < 0 || y < 0 || x >= w || y >= h {
             return;
         }
-        let i = ((y as u32 * W + x as u32) * 4) as usize;
-        self.pixels[i..i + 4].copy_from_slice(&[bgr[0], bgr[1], bgr[2], 255]);
+        let i = ((y * w + x) * 4) as usize;
+        if let Some(px) = self.pixels.get_mut(i..i + 4) {
+            px.copy_from_slice(&[bgr[0], bgr[1], bgr[2], 255]);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Le navigateur : programme `minelib-browser` (Chromium, CEF), lancé à part.
+// ----------------------------------------------------------------------------
+
+/// Dernière image reçue du navigateur : largeur, hauteur, pixels BGRA.
+type Frame = (u32, u32, Vec<u8>);
+
+/// Navigateur lancé à part : le jeu ne dépend jamais de CEF (sans le programme, les
+/// écrans montrent leur mire) et un plantage de Chromium ne fait pas tomber le jeu.
+/// On lui écrit des commandes (une par ligne) et il renvoie les images de la page.
+struct Browser {
+    child: Option<std::process::Child>,
+    stdin: Option<std::process::ChildStdin>,
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+}
+
+impl Browser {
+    /// Programme du navigateur : dossier `cef` à côté du jeu, sinon dans ses données.
+    fn find() -> Option<std::path::PathBuf> {
+        let name = if cfg!(windows) {
+            "minelib-browser.exe"
+        } else {
+            "minelib-browser"
+        };
+        let near_exe = std::env::current_exe()
+            .ok()
+            .and_then(|e| Some(e.parent()?.join("cef").join(name)));
+        let in_data = Some(minelib_assets::data_dir().join("cef").join(name));
+        [near_exe, in_data]
+            .into_iter()
+            .flatten()
+            .find(|p| p.is_file())
+    }
+
+    fn start(url: &str) -> Option<Self> {
+        use std::process::{Command, Stdio};
+        let exe = Self::find()?;
+        let data = minelib_assets::data_dir();
+        let logs = data.join("logs");
+        let _ = std::fs::create_dir_all(&logs);
+        let stderr = std::fs::File::create(logs.join("navigateur-sortie.log"))
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        let mut cmd = Command::new(&exe);
+        cmd.arg("--width")
+            .arg(PAGE_W.to_string())
+            .arg("--height")
+            .arg(PAGE_H.to_string())
+            .arg("--url")
+            .arg(url)
+            // Session du navigateur (connexion à YouTube, cookies) : la sienne, ici.
+            .arg("--cache")
+            .arg(data.join("cef-cache"))
+            .arg("--log")
+            .arg(logs.join("navigateur.log"))
+            .current_dir(exe.parent()?)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // Pas de fenêtre de console.
+            cmd.creation_flags(0x0800_0000);
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(
+                    "écrans vidéo : navigateur non lancé ({}) : {e}",
+                    exe.display()
+                );
+                return None;
+            }
+        };
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take()?;
+        let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = frame.clone();
+        let reader = std::thread::Builder::new()
+            .name("navigateur".into())
+            .spawn(move || read_frames(stdout, slot));
+        if reader.is_err() {
+            let _ = child.kill();
+            return None;
+        }
+        log::info!("écrans vidéo : navigateur lancé ({})", exe.display());
+        Some(Self {
+            child: Some(child),
+            stdin,
+            frame,
+        })
+    }
+
+    /// Envoie une commande ; `false` si le navigateur ne l'a pas reçue.
+    fn send(&mut self, line: &str) -> bool {
+        use std::io::Write;
+        let Some(stdin) = self.stdin.as_mut() else {
+            return false;
+        };
+        writeln!(stdin, "{line}")
+            .and_then(|_| stdin.flush())
+            .is_ok()
+    }
+
+    /// Dernière image reçue depuis l'appel précédent.
+    fn take_frame(&self) -> Option<Frame> {
+        self.frame.lock().ok()?.take()
+    }
+
+    fn alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+}
+
+impl Drop for Browser {
+    /// Fermeture sans bloquer le jeu : on demande au navigateur de quitter, puis on
+    /// l'arrête s'il traîne.
+    fn drop(&mut self) {
+        let _ = self.send("quit");
+        let stdin = self.stdin.take();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("navigateur (fin)".into())
+            .spawn(move || {
+                drop(stdin);
+                for _ in 0..40 {
+                    if !matches!(child.try_wait(), Ok(None)) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+    }
+}
+
+/// Lit les images du navigateur : `MLBF`, largeur, hauteur (u32 petit-boutistes), puis
+/// les pixels BGRA. S'arrête à la fin du flux (navigateur fermé).
+fn read_frames(mut out: impl std::io::Read, slot: std::sync::Arc<std::sync::Mutex<Option<Frame>>>) {
+    let mut head = [0u8; 12];
+    loop {
+        if out.read_exact(&mut head).is_err() {
+            return;
+        }
+        if &head[..4] != b"MLBF" {
+            log::warn!("écrans vidéo : flux d'images du navigateur invalide");
+            return;
+        }
+        let w = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        let h = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
+        if w == 0 || h == 0 || w > 4096 || h > 4096 {
+            log::warn!("écrans vidéo : image du navigateur de taille invalide ({w} × {h})");
+            return;
+        }
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        if out.read_exact(&mut px).is_err() {
+            return;
+        }
+        if let Ok(mut s) = slot.lock() {
+            *s = Some((w, h, px));
+        }
     }
 }
 
@@ -443,6 +778,41 @@ mod tests {
         s.press([0.2, 0.2]);
         s.update(0.1);
         assert!(!s.paused && s.time > t);
+    }
+
+    #[test]
+    fn adresse_youtube() {
+        assert_eq!(youtube_url(""), HOME_URL);
+        assert_eq!(youtube_url("  https://youtu.be/x "), "https://youtu.be/x");
+        assert_eq!(
+            youtube_url("chat piano"),
+            "https://www.youtube.com/results?search_query=chat+piano"
+        );
+        assert_eq!(
+            youtube_url("été & co"),
+            "https://www.youtube.com/results?search_query=%C3%A9t%C3%A9+%26+co"
+        );
+    }
+
+    #[test]
+    fn point_de_la_page() {
+        assert_eq!(page_point([0.0, 0.0]), (0, 0));
+        assert_eq!(page_point([0.5, 0.5]), (640, 360));
+        assert_eq!(page_point([1.0, 1.0]), (1279, 719));
+    }
+
+    #[test]
+    fn lit_les_images_du_navigateur() {
+        let mut data = b"MLBF".to_vec();
+        data.extend(2u32.to_le_bytes());
+        data.extend(1u32.to_le_bytes());
+        data.extend([1, 2, 3, 4, 5, 6, 7, 8]);
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        read_frames(&data[..], slot.clone());
+        assert_eq!(
+            slot.lock().unwrap().take(),
+            Some((2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]))
+        );
     }
 
     #[test]

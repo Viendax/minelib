@@ -22,8 +22,8 @@ pub enum Item {
     Torch(Option<usize>),
     /// Baguette de sélection (WorldEdit) : clic gauche coin 1, clic droit coin 2.
     Wand,
-    /// Écran vidéo : clic droit le pose, clic gauche dessus le touche (tactile),
-    /// accroupi + clic gauche le casse.
+    /// Écran vidéo : « utiliser » le pose ; posé, « utiliser » le touche (tactile) et
+    /// « casser » le casse.
     Screen,
 }
 
@@ -96,11 +96,9 @@ impl Item {
             }
             Item::Screen => {
                 lines.push(("Clic droit : le poser sur un mur ou un sol".into(), WHITE));
-                lines.push((
-                    "Clic gauche dessus : le toucher (écran tactile)".into(),
-                    WHITE,
-                ));
-                lines.push(("Accroupi + clic gauche : le casser".into(), GREY));
+                lines.push(("Clic droit dessus : le toucher (tactile)".into(), WHITE));
+                lines.push(("Clic gauche dessus : le casser".into(), WHITE));
+                lines.push(("Accroupi + clic droit : poser un bloc devant".into(), GREY));
             }
             Item::Torch(None) => {
                 lines.push(("Flamme orange (bois)".into(), WHITE));

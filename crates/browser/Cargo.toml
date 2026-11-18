@@ -1,0 +1,22 @@
+[package]
+name = "minelib-browser"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Navigateur Chromium (CEF) hors écran pour les écrans vidéo de Minelib"
+
+[[bin]]
+name = "minelib-browser"
+path = "src/main.rs"
+
+[dependencies]
+# Chromium Embedded Framework (bindings Rust de tauri-apps). Sans bac à sable : il demande
+# une bibliothèque statique propre à MSVC.
+cef = { version = "150", default-features = false }
+
+[profile.release]
+codegen-units = 16
+
+# Hors du workspace du jeu (voir `exclude` dans le Cargo.toml racine) : le jeu ne dépend
+# jamais de CEF, ses builds et sa CI restent inchangés.
+[workspace]
