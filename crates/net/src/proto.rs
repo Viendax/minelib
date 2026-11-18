@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 46;
+pub const PROTOCOL: u32 = 47;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -1048,6 +1048,9 @@ pub enum Response {
         parent: Option<Box<ProvinceAt>>,
         /// (v143) Pays : il confie lui-même ses provinces peuplées (de cette taille).
         nest: Option<Nest>,
+        /// (v148) Étages d'en dessous : ses provinces seront à leur tour des pays (le premier
+        /// est le leur), et ainsi de suite.
+        deeper: Vec<Nest>,
     },
     /// (v141) Relais de province → son relais de secours : un envoi `n` gardé par le relais
     /// du monde (zone, rang, message), et les sacs de survie qu'elle tient.

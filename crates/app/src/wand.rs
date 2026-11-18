@@ -49,9 +49,20 @@ fn pixels() -> impl Iterator<Item = (usize, usize, [f32; 3])> {
 
 /// Icône dans un emplacement d'inventaire : `size` pixels de côté, centrée.
 pub fn icon(ui: &mut Ui, cx: f32, cy: f32, size: f32) {
+    pixel_icon(ui, cx, cy, size, pixels());
+}
+
+/// Icône d'une image 16 × 16 donnée pixel par pixel (colonne, ligne, couleur linéaire).
+pub fn pixel_icon(
+    ui: &mut Ui,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    px: impl Iterator<Item = (usize, usize, [f32; 3])>,
+) {
     let p = size / 16.0;
     let (x0, y0) = (cx - size / 2.0, cy - size / 2.0);
-    for (x, y, c) in pixels() {
+    for (x, y, c) in px {
         ui.rect(
             x0 + x as f32 * p,
             y0 + y as f32 * p,
@@ -65,9 +76,20 @@ pub fn icon(ui: &mut Ui, cx: f32, cy: f32, size: f32) {
 /// Baguette tenue en main : chaque pixel est un petit pavé (objet « en relief » comme les
 /// objets plats de Minecraft). `mvp` place l'image 0..1 × 0..1 (y vers le haut).
 pub fn model(out: &mut Vec<VmVertex>, mvp: Mat4, light: [f32; 3]) {
+    pixel_model(out, mvp, light, pixels());
+}
+
+/// Objet plat en relief d'une image 16 × 16 donnée pixel par pixel : chaque pixel est un
+/// petit pavé. `mvp` place l'image 0..1 × 0..1 (y vers le haut).
+pub fn pixel_model(
+    out: &mut Vec<VmVertex>,
+    mvp: Mat4,
+    light: [f32; 3],
+    pixels: impl Iterator<Item = (usize, usize, [f32; 3])>,
+) {
     let px = 1.0 / 16.0;
     let depth = px;
-    for (x, y, c) in pixels() {
+    for (x, y, c) in pixels {
         let x0 = x as f32 * px;
         let y0 = 1.0 - (y + 1) as f32 * px;
         let a = Vec3::new(x0, y0, -depth / 2.0);

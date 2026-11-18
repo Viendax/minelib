@@ -181,6 +181,8 @@ struct Game {
     /// prochain essai.
     garant_pays: bool,
     garant_retry: Option<std::time::Instant>,
+    /// (v148) Le pays à qui elle est prêtée (province, taille, époque).
+    garant_target: Option<([i32; 2], i32, u64)>,
     /// Disponibilité de garant annoncée au relais.
     garant_announced: Option<bool>,
     /// Un monde a été ouvert depuis le lancement (plus de mise à jour automatique sans
@@ -318,6 +320,7 @@ impl Game {
             garant_worker_tried: false,
             garant_pays: false,
             garant_retry: None,
+            garant_target: None,
             garant_announced: None,
             played: false,
             renderer: None,
@@ -1198,14 +1201,30 @@ impl Game {
                 self.garant_retry = Some(std::time::Instant::now() + Duration::from_secs(30));
             }
             let now = std::time::Instant::now();
-            if self.garant_worker.is_none() && self.garant_retry.is_none_or(|t| now >= t) {
-                let me = self.accounts.pseudo();
-                let call = self
-                    .session
+            let me = self.accounts.pseudo();
+            let call = self
+                .session
+                .as_ref()
+                .and_then(|s| s.build.as_ref())
+                .and_then(|b| b.garant_call().cloned())
+                .filter(|c| c.picks(&me));
+            let target = call
+                .as_ref()
+                .map(|c| (c.at.province, c.at.size, c.at.epoch));
+            // (v148) Appelé par un autre pays (plus bas, ou repris par son relais de secours) :
+            // la connexion de garant y va, si elle ne tient rien.
+            if self.garant_pays
+                && target.is_some()
+                && target != self.garant_target
+                && self
+                    .garant_worker
                     .as_ref()
-                    .and_then(|s| s.build.as_ref())
-                    .and_then(|b| b.garant_call().cloned())
-                    .filter(|c| c.picks(&me));
+                    .is_some_and(|w| !w.busy() && !w.hosting())
+            {
+                self.garant_worker = None;
+                self.garant_pays = false;
+            }
+            if self.garant_worker.is_none() && self.garant_retry.is_none_or(|t| now >= t) {
                 if let Some(login) = call.and_then(|c| self.accounts.pays_garant_login(&c)) {
                     let maps = self
                         .map_rows
@@ -1219,6 +1238,7 @@ impl Game {
                         self.paths.root.join("maps"),
                     ));
                     self.garant_pays = true;
+                    self.garant_target = target;
                 }
             }
             self.garant_worker_tried = false;

@@ -283,6 +283,7 @@ fn item_code(item: Item) -> String {
     match item {
         Item::Block(b) => format!("block;{}", b.0),
         Item::Wand => "wand;-".into(),
+        Item::Screen => "screen;-".into(),
         Item::Torch(None) => "torch;-".into(),
         Item::Torch(Some(i)) => format!("torch;{i}"),
     }
@@ -293,6 +294,7 @@ fn parse_item(kind: &str, arg: &str) -> Option<Item> {
         "block" => Some(Item::Block(BlockId(arg.parse().ok()?))),
         "torch" => Some(Item::Torch(arg.parse().ok())),
         "wand" => Some(Item::Wand),
+        "screen" => Some(Item::Screen),
         _ => None,
     }
 }

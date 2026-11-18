@@ -64,6 +64,9 @@ const REFILL_EVERY: Duration = Duration::from_secs(2);
 /// au moins `CHILD_LEASE_MS + CHILD_GUARD_MS` ; il finit donc toujours avant lui.
 const CHILD_LEASE_MS: u64 = 1000;
 const CHILD_GUARD_MS: u64 = 100;
+/// (v148) Bail le plus court qu'un pays donne (ms) : en dessous, il n'en donne pas (ses
+/// provinces s'arrêtent à la fin du leur).
+const CHILD_LEASE_MIN: u64 = 400;
 /// (v143) Hôtes donnés au plus pour un même bail de pays.
 const WANTS_MAX: usize = 4;
 /// (v144) Relais de secours d'un pays qui prend sa place : ses provinces ont ce temps pour
@@ -127,8 +130,10 @@ pub(crate) struct ProvinceRef {
     /// rattacher ici avec la province qu'il sert déjà.
     expect: Option<String>,
     /// (v147) Pays : fin de la plage de rangs qu'il a d'ici ; dernière nouvelle plage donnée.
+    /// (v148) Taille de ses plages.
     range_end: u64,
     refilled: Option<Instant>,
+    span: u64,
 }
 
 /// (v141) Relais de secours d'une province, choisi par le relais du monde.
@@ -210,6 +215,9 @@ pub(crate) struct ProvinceRoom {
     /// attend que ses provinces lui aient tout rendu ; dernière liste de ses provinces
     /// servies dite au relais du monde.
     pub nest: Option<proto::Nest>,
+    /// (v148) Étages d'en dessous : ses provinces seront à leur tour des pays (le premier est
+    /// le leur), et ainsi de suite.
+    pub deeper: Vec<proto::Nest>,
     child_acks: VecDeque<(u64, [i32; 2], u64, u64)>,
     confirmed: u64,
     stopping: bool,
@@ -239,6 +247,9 @@ pub(crate) struct ProvinceRoom {
     call: Option<proto::GarantCall>,
     call_said: Option<proto::GarantCall>,
     local_served: HashMap<([i32; 2], u64, bool), Instant>,
+    /// (v148) Hôtes qu'attendent les provinces de ses provinces (des pays) et que personne
+    /// n'a trouvés en dessous : demandés plus haut au prochain bail.
+    wants_up: Vec<proto::Want>,
 }
 
 impl ProvinceRoom {
@@ -265,21 +276,54 @@ fn zone_region(zone: [i32; 2]) -> [i32; 2] {
 /// (v143) Ce relais tient un pays qui peut donner des baux à ses provinces : il sert, avec
 /// assez de bail devant lui, et ne s'arrête pas.
 fn parent_ok(st: &State, rid: u64) -> bool {
+    child_ms(st, rid) > 0
+}
+
+/// (v148) Bail qu'un pays peut donner à ses provinces (ms) : ce qui reste du sien moins une
+/// marge (il finit toujours avant le sien), au plus `CHILD_LEASE_MS` ; 0 s'il ne lui en
+/// reste pas assez. Le bail se transmet ainsi d'étage en étage (un pays de pays donne des
+/// baux plus courts que le sien).
+fn child_ms(st: &State, rid: u64) -> u64 {
+    if st.province_room != Some(rid) {
+        return 0;
+    }
     let now = guards::now_ms(st);
-    st.province_room == Some(rid)
-        && st
+    let Some(p) = st.rooms.get(&rid).and_then(|r| r.province.as_ref()) else {
+        return 0;
+    };
+    if p.nest.is_none() || !p.go || p.stopped || p.standby || p.stopping {
+        return 0;
+    }
+    let left = p.lease_until.saturating_sub(now + CHILD_GUARD_MS);
+    if left < CHILD_LEASE_MIN {
+        0
+    } else {
+        left.min(CHILD_LEASE_MS)
+    }
+}
+
+/// (v148) Ce que ce relais (relais du monde, ou pays) donne à ses provinces : leur étage
+/// (`Some` : elles seront des pays) et ceux d'en dessous.
+fn levels_below(st: &State, rid: u64) -> (Option<proto::Nest>, Vec<proto::Nest>) {
+    if st.province_room == Some(rid) {
+        let deeper = st
             .rooms
             .get(&rid)
             .and_then(|r| r.province.as_ref())
-            .is_some_and(|p| {
-                p.nest.is_some()
-                    && p.go
-                    && !p.stopped
-                    && !p.standby
-                    && !p.stopping
-                    && p.lease_until >= now + CHILD_LEASE_MS + CHILD_GUARD_MS
-            })
+            .map(|pr| pr.deeper.clone())
+            .unwrap_or_default();
+        (
+            deeper.first().copied(),
+            deeper.get(1..).map(<[_]>::to_vec).unwrap_or_default(),
+        )
+    } else {
+        (st.nest, st.deeper.clone())
+    }
 }
+
+/// (v148) Plage de rangs d'une province d'un pays qui est elle-même un pays (elle en donne
+/// à son tour une part à chaque époque de ses provinces, et en redemande).
+const SUB_PAYS_SEQS: u64 = 1 << 41;
 
 /// (v143) Ce relais tient un pays (et `rid` en est la salle).
 fn pays_here(st: &State, rid: u64) -> bool {
@@ -522,8 +566,8 @@ pub(crate) fn upkeep(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>)
 /// de ses zones.
 fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
     let root = st.cert_key.verifying_key().to_bytes();
-    // (v143) Un pays, si ce relais en confie.
-    let nest = st.nest;
+    // (v143) Un pays, si ce relais en confie ; (v148) et les étages d'en dessous.
+    let (nest, deeper) = levels_below(st, rid);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -573,6 +617,7 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             unfollowed_since: None,
             range_end: 0,
             refilled: None,
+            span: 0,
             nest: nest.is_some(),
             children: Vec::new(),
             expect: None,
@@ -596,6 +641,7 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             follow: None,
             parent: None,
             nest,
+            deeper,
         },
     );
     for part in entries.chunks(SEED_CHUNK) {
@@ -617,6 +663,8 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
 /// hôte (demandé avec le prochain bail) et lui donnera sa tâche ; l'historique lui partira
 /// quand il entrera ici (`child_hello`).
 fn delegate_pending(st: &mut State, rid: u64, p: [i32; 2]) {
+    // (v148) Avec un étage de plus, ses provinces sont à leur tour des pays.
+    let sub_pays = levels_below(st, rid).0.is_some();
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -648,7 +696,8 @@ fn delegate_pending(st: &mut State, rid: u64, p: [i32; 2]) {
             unfollowed_since: None,
             range_end: 0,
             refilled: None,
-            nest: false,
+            span: 0,
+            nest: sub_pays,
             children: Vec::new(),
             expect: None,
         },
@@ -700,23 +749,43 @@ fn serve_wants(st: &mut State, rid: u64, p: [i32; 2], wants: Vec<proto::Want>) {
     let Some(nest) = st.nest else {
         return;
     };
-    let Some(pays) = st
+    let Some((pays, kids)) = st
         .rooms
         .get(&rid)
         .and_then(|room| room.provinces.get(&p))
         .filter(|r| r.nest)
-        .and_then(|r| r.info.clone())
+        .and_then(|r| Some((r.info.clone()?, r.children.clone())))
     else {
         return;
     };
+    let below = st.deeper.first().map(|n| n.size);
     st.wants_served
         .retain(|_, t| t.elapsed() < START_WAIT + Duration::from_secs(5));
     let mut todo = Vec::new();
     for w in wants.into_iter().take(64) {
         let first = [w.province[0] * w.size, w.province[1] * w.size];
-        if w.size != nest.size || proto::province_of(first, size) != p {
+        if proto::province_of(first, size) != p {
             continue;
         }
+        // Une province du pays ; (v148) ou d'une de ses provinces qui est un pays (qui n'a
+        // trouvé d'hôte ni chez elle ni chez lui) : c'est chez elle que l'hôte entrera.
+        let parent = if w.size == nest.size {
+            Some((pays.clone(), 0))
+        } else if Some(w.size) == below {
+            let inner = ProvinceInfo {
+                province: w.province,
+                size: w.size,
+                ..pays.clone()
+            };
+            kids.iter()
+                .find(|k| k.size == nest.size && k.contains(&inner))
+                .map(|k| (k.clone(), 1))
+        } else {
+            None
+        };
+        let Some(parent) = parent else {
+            continue;
+        };
         if w.follow.as_ref().is_some_and(|i| i.province != w.province) {
             continue;
         }
@@ -724,7 +793,7 @@ fn serve_wants(st: &mut State, rid: u64, p: [i32; 2], wants: Vec<proto::Want>) {
         if st.wants_served.contains_key(&key) {
             continue;
         }
-        todo.push((key, w));
+        todo.push((key, w, parent));
         if todo.len() >= WANTS_MAX {
             break;
         }
@@ -737,7 +806,7 @@ fn serve_wants(st: &mut State, rid: u64, p: [i32; 2], wants: Vec<proto::Want>) {
         return;
     }
     let index = super::players_index(st);
-    for (key, w) in todo {
+    for (key, w, (parent, depth)) in todo {
         let (cp, cs) = (w.province, w.size);
         let outside = move |chunk: [i32; 2]| proto::province_of(proto::region_of(chunk), cs) != cp;
         let Some(g) = super::pick_host(st, &index, rid, &outside) else {
@@ -745,14 +814,29 @@ fn serve_wants(st: &mut State, rid: u64, p: [i32; 2], wants: Vec<proto::Want>) {
             break;
         };
         st.wants_served.insert(key, Instant::now());
-        give_child_task(st, rid, &pays, w, g);
+        give_child_task(st, rid, &parent, depth, w, g);
     }
 }
 
 /// (v143) Relais du monde : la connexion de garant `g` tiendra la province d'un pays (ou son
 /// relais de secours) ; tout passera ensuite par le relais du pays.
-fn give_child_task(st: &mut State, rid: u64, pays: &ProvinceInfo, w: proto::Want, g: u64) {
+fn give_child_task(
+    st: &mut State,
+    rid: u64,
+    pays: &ProvinceInfo,
+    depth: usize,
+    w: proto::Want,
+    g: u64,
+) {
     let root = st.cert_key.verifying_key().to_bytes();
+    // (v148) Les provinces d'un pays sont à leur tour des pays s'il y a un étage de plus
+    // (`depth` : 0 pour une province d'un pays d'ici, 1 pour celle d'un pays de pays).
+    let st_nest = st.deeper.get(depth).copied();
+    let st_deeper = st
+        .deeper
+        .get(depth + 1..)
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
     let pseudo = st
         .conns
         .get(&g)
@@ -799,7 +883,8 @@ fn give_child_task(st: &mut State, rid: u64, pays: &ProvinceInfo, w: proto::Want
             settings,
             follow,
             parent,
-            nest: None,
+            nest: st_nest,
+            deeper: st_deeper,
         },
     );
     log::info!(
@@ -845,12 +930,12 @@ pub(crate) fn ready(
     };
     // (v143) Plage de rangs : plus grande pour un pays (il en donne à ses provinces), plus
     // petite pour une province d'un pays (prise dans celle du pays).
-    let span = if pays {
-        CHILD_SEQS
-    } else if r.nest {
-        pays_seqs
-    } else {
-        PROVINCE_SEQS
+    let span = match (pays, r.nest) {
+        // (v148) Une province d'un pays qui est elle-même un pays.
+        (true, true) => SUB_PAYS_SEQS,
+        (true, false) => CHILD_SEQS,
+        (false, true) => pays_seqs,
+        (false, false) => PROVINCE_SEQS,
     };
     let after = r.snap_seq;
     let carry = r.carry.take();
@@ -871,6 +956,7 @@ pub(crate) fn ready(
     let base = room.build.reserve(span);
     let r = room.provinces.get_mut(&p).expect("province");
     r.range_end = base + span;
+    r.span = span;
     r.info = Some(ProvinceInfo {
         province: p,
         size,
@@ -947,6 +1033,12 @@ pub(crate) fn lease(
     // province finit avant le sien), et toujours avec la copie chez lui.
     let pays = st.province_room == Some(rid);
     let pays_seqs = st.pays_seqs;
+    // (v148) Ce qu'une de ses provinces (un pays) donne à chaque époque des siennes.
+    let unit = if levels_below(st, rid).1.is_empty() {
+        CHILD_SEQS
+    } else {
+        SUB_PAYS_SEQS
+    };
     // (v147) Un pays appelle des garants parmi ses joueurs : il le dit à ses provinces.
     let call = if pays {
         st.rooms
@@ -977,13 +1069,14 @@ pub(crate) fn lease(
             }
         }
     }
+    let child = child_ms(st, rid);
     let paused = if pays {
-        !parent_ok(st, rid)
+        child == 0
     } else {
         guards::frozen(st, rid)
     };
     let ms = if pays {
-        CHILD_LEASE_MS
+        child.max(1)
     } else {
         proto::PROVINCE_LEASE_MS
     } as u32;
@@ -1061,9 +1154,10 @@ pub(crate) fn lease(
                 r.renewed = Instant::now();
             }
             // (v147) Un pays dont la plage de rangs s'épuise : une nouvelle (assez tôt pour
-            // qu'il n'en manque jamais).
-            if r.nest && !pays && seq > 0 && r.range_end > 0 {
-                let low = (2 * CHILD_SEQS).max(pays_seqs / 64);
+            // qu'il n'en manque jamais). (v148) À chaque étage : de quoi donner encore deux
+            // époques à ses provinces.
+            if r.nest && seq > 0 && r.range_end > 0 {
+                let low = (2 * unit).max(r.span / 64);
                 if r.range_end.saturating_sub(seq) < low
                     && r.refilled.is_none_or(|t| t.elapsed() > REFILL_EVERY)
                 {
@@ -1077,9 +1171,10 @@ pub(crate) fn lease(
     };
     let more = match more_for {
         Some(p) => {
-            let base = room.build.reserve(pays_seqs);
+            let span = room.provinces.get(&p).map_or(pays_seqs, |r| r.span);
+            let base = room.build.reserve(span);
             if let Some(r) = room.provinces.get_mut(&p) {
-                r.range_end = base + pays_seqs;
+                r.range_end = base + span;
             }
             st.pays_refills += 1;
             log::info!(
@@ -1106,9 +1201,12 @@ pub(crate) fn lease(
             },
         );
     }
-    // (v143) Un pays attend des hôtes pour ses provinces.
+    // (v143) Un pays attend des hôtes pour ses provinces. (v148) Chez un pays : une de ses
+    // provinces, elle-même un pays, attend des hôtes qu'elle ne trouve pas chez elle.
     if ok && !pays && !wants.is_empty() {
         serve_wants(st, rid, p, wants);
+    } else if ok && pays && !wants.is_empty() {
+        serve_below(st, rid, p, wants);
     }
 }
 
@@ -2043,7 +2141,11 @@ fn assign_standby(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
     };
     let epoch = r.epoch;
     // (v143) Le relais de secours d'un pays en sera un aussi s'il prend sa place.
-    let nest = if r.nest { st.nest } else { None };
+    let (nest, deeper) = if r.nest {
+        levels_below(st, rid)
+    } else {
+        (None, Vec::new())
+    };
     let secret = room.shard_secret;
     let token = proto::follow_token(&secret, rid, p, &pseudo, &signer, epoch);
     let task = task_info(room);
@@ -2078,6 +2180,7 @@ fn assign_standby(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             follow: Some(Box::new(proto::ProvinceAt { info, token })),
             parent: None,
             nest,
+            deeper,
         },
     );
     log::info!("monde {rid} : relais de secours de la province {p:?} confié à {g}");
@@ -2189,6 +2292,7 @@ fn promote(st: &mut State, rid: u64, p: [i32; 2], why: &str) -> bool {
         unfollowed_since: None,
         range_end: 0,
         refilled: None,
+        span: 0,
         nest,
         children: Vec::new(),
         expect: None,
@@ -2443,6 +2547,7 @@ pub(crate) fn begin(
     settings: proto::ProvinceSettings,
     standby: bool,
     nest: Option<proto::Nest>,
+    deeper: Vec<proto::Nest>,
 ) -> bool {
     let Ok(root) = VerifyingKey::from_bytes(&root) else {
         return false;
@@ -2513,6 +2618,7 @@ pub(crate) fn begin(
         dump_archive: 0,
         covered: 0,
         nest,
+        deeper: if nest.is_some() { deeper } else { Vec::new() },
         child_acks: VecDeque::new(),
         confirmed: 0,
         stopping: false,
@@ -2529,6 +2635,7 @@ pub(crate) fn begin(
         call: None,
         call_said: None,
         local_served: HashMap::new(),
+        wants_up: Vec::new(),
     });
     // (Réglages du serveur : OP, bannis, mode par défaut ; sacs de survie suivis, pour la
     // copie envoyée au relais du monde.)
@@ -2810,7 +2917,11 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
             }
             say_call(st, rid);
             let wants = wants(st, rid);
-            (serve_local(st, rid, wants), children)
+            let mut wants = serve_local(st, rid, wants);
+            if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+                wants.append(&mut pr.wants_up);
+            }
+            (wants, children)
         } else {
             (Vec::new(), None)
         };
@@ -2860,7 +2971,7 @@ fn presence(st: &mut State, rid: u64) -> (Vec<String>, Vec<String>) {
     let Some(pr) = room.province.as_ref() else {
         return (Vec::new(), Vec::new());
     };
-    let now: HashSet<String> = room
+    let mut now: HashSet<String> = room
         .members
         .iter()
         .filter(|m| !room.hidden.contains(m))
@@ -2872,6 +2983,8 @@ fn presence(st: &mut State, rid: u64) -> (Vec<String>, Vec<String>) {
         })
         .filter_map(|m| Some(st.conns.get(m)?.pseudo.as_deref()?.to_ascii_lowercase()))
         .collect();
+    // (v148) Un pays de pays : aussi ceux qui sont chez ses provinces.
+    now.extend(pr.kids_present.keys().cloned());
     let arrived: Vec<String> = now
         .difference(&pr.present_sent)
         .take(4096)
@@ -3419,6 +3532,7 @@ pub(crate) fn promote_here(st: &mut State, old: u64, epoch: u64) -> Option<u64> 
                 unfollowed_since: None,
                 range_end: 0,
                 refilled: None,
+                span: 0,
                 nest: false,
                 children: Vec::new(),
                 expect: Some(c.host),
@@ -3607,6 +3721,8 @@ pub(crate) fn admits_garant(st: &State, cert: &minelib_net::sovereign::Cert) -> 
 /// connexions de garant de ses joueurs, entrées ici), jamais un joueur de la province qu'il
 /// servira. Ceux qu'il ne trouve pas chez lui sont demandés au relais du monde.
 fn serve_local(st: &mut State, rid: u64, wants: Vec<proto::Want>) -> Vec<proto::Want> {
+    let me = own_info(st, rid);
+    let levels = levels_below(st, rid);
     let served = match st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
         Some(pr) => {
             pr.local_served
@@ -3620,12 +3736,84 @@ fn serve_local(st: &mut State, rid: u64, wants: Vec<proto::Want>) -> Vec<proto::
         if served.contains_key(&(w.province, w.epoch, w.follow.is_some())) {
             continue;
         }
-        match pick_local(st, rid, w.province) {
-            Some(g) => give_local_task(st, rid, w, g),
-            None => up.push(w),
+        match (pick_local(st, rid, w.province), &me) {
+            (Some(g), Some(me)) => give_task(st, rid, me.clone(), levels.clone(), w, g),
+            _ => up.push(w),
         }
     }
     up
+}
+
+/// (v148) Pays : ce qu'il dit de lui-même à ses garants (où le joindre).
+fn own_info(st: &State, rid: u64) -> Option<ProvinceInfo> {
+    let pr = st.rooms.get(&rid)?.province.as_ref()?;
+    let me = pr.me.clone()?;
+    Some(ProvinceInfo {
+        province: pr.province,
+        size: pr.size,
+        epoch: pr.epoch,
+        node: me.0,
+        addr: me.1,
+        key: me.2,
+    })
+}
+
+/// (v148) Pays : une de ses provinces `p`, elle-même un pays, attend des hôtes qu'elle ne
+/// trouve pas chez elle ; choisis parmi les garants d'ici (pas un joueur de cette province).
+fn serve_below(st: &mut State, rid: u64, p: [i32; 2], wants: Vec<proto::Want>) {
+    let Some(parent) = st
+        .rooms
+        .get(&rid)
+        .and_then(|r| r.provinces.get(&p))
+        .filter(|r| r.nest)
+        .and_then(|r| r.info.clone())
+    else {
+        return;
+    };
+    let below = levels_below(st, rid).1;
+    let levels = (
+        below.first().copied(),
+        below.get(1..).map(<[_]>::to_vec).unwrap_or_default(),
+    );
+    let served = match st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+        Some(pr) => {
+            pr.local_served
+                .retain(|_, t| t.elapsed() < START_WAIT + Duration::from_secs(5));
+            pr.local_served.clone()
+        }
+        None => return,
+    };
+    let mut up = Vec::new();
+    for w in wants.into_iter().take(WANTS_MAX) {
+        // (Seulement des provinces à elle.)
+        let inner = ProvinceInfo {
+            province: w.province,
+            size: w.size,
+            ..parent.clone()
+        };
+        if !parent.contains(&inner) || w.follow.as_ref().is_some_and(|i| i.province != w.province) {
+            continue;
+        }
+        if served.contains_key(&(w.province, w.epoch, w.follow.is_some())) {
+            continue;
+        }
+        match pick_local(st, rid, p) {
+            Some(g) => give_task(st, rid, parent.clone(), levels.clone(), w, g),
+            // (Pas de garant ici non plus : demandé plus haut, avec les siens.)
+            None => up.push(w),
+        }
+    }
+    if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+        for w in up {
+            let same = |x: &proto::Want| {
+                (x.province, x.size, x.epoch, x.follow.is_some())
+                    == (w.province, w.size, w.epoch, w.follow.is_some())
+            };
+            if !pr.wants_up.iter().any(same) && pr.wants_up.len() < 4 * WANTS_MAX {
+                pr.wants_up.push(w);
+            }
+        }
+    }
 }
 
 /// (v147) Pays : une de ses connexions de garant libre, pas celle d'un joueur de la province
@@ -3666,23 +3854,21 @@ fn pick_local(st: &State, rid: u64, p: [i32; 2]) -> Option<u64> {
 
 /// (v147) Pays : la connexion de garant `g` (un de ses joueurs) tiendra une de ses provinces
 /// (ou son relais de secours) ; même tâche, même jeton que s'il venait du relais du monde.
-fn give_local_task(st: &mut State, rid: u64, w: proto::Want, g: u64) {
+/// (v148) `at` : le pays de cette province (lui, ou une de ses provinces qui est un pays) ;
+/// `levels` : l'étage de la province et ceux d'en dessous.
+fn give_task(
+    st: &mut State,
+    rid: u64,
+    at: ProvinceInfo,
+    levels: (Option<proto::Nest>, Vec<proto::Nest>),
+    w: proto::Want,
+    g: u64,
+) {
     let Some(room) = st.rooms.get(&rid) else {
         return;
     };
     let Some(pr) = room.province.as_ref() else {
         return;
-    };
-    let Some(me) = pr.me.clone() else {
-        return;
-    };
-    let at = ProvinceInfo {
-        province: pr.province,
-        size: pr.size,
-        epoch: pr.epoch,
-        node: me.0,
-        addr: me.1,
-        key: me.2,
     };
     let root = pr.root.to_bytes();
     let pseudo = st
@@ -3707,6 +3893,7 @@ fn give_local_task(st: &mut State, rid: u64, w: proto::Want, g: u64) {
             &secret, rid, w.province, w.size, &pseudo, &signer, w.epoch, standby,
         ),
     }));
+    let (nest, deeper) = levels;
     let room = st.rooms.get_mut(&rid).expect("pays");
     room.members.push(g);
     room.hidden.insert(g);
@@ -3732,7 +3919,8 @@ fn give_local_task(st: &mut State, rid: u64, w: proto::Want, g: u64) {
             settings,
             follow,
             parent,
-            nest: None,
+            nest,
+            deeper,
         },
     );
     log::info!(

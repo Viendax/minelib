@@ -29,6 +29,8 @@ use crate::save::{self, GameMode, GameState, PlayerState, SaveData, WorldMeta, M
 use crate::streaming::Streamer;
 
 pub const REACH: f32 = 6.0;
+/// Portée de la visée des écrans vidéo : on les touche de loin, on les casse à `REACH`.
+const SCREEN_REACH: f32 = 32.0;
 /// Rotation par unité de souris pour une sensibilité de 1 : 0,022°, comme Counter-Strike
 /// (« m_yaw » / « m_pitch »).
 const CS_DEGREES_PER_COUNT: f32 = 0.022;
@@ -251,6 +253,16 @@ pub struct Session {
     hand_light: [f32; 3],
     /// Vue (F5) : 0 première personne, 1 troisième personne de dos, 2 de face.
     perspective: u8,
+    /// Écrans vidéo posés dans le monde (objet « Écran vidéo »), chargés à la première
+    /// image depuis le dossier du monde.
+    screens: Vec<crate::screen::Placed>,
+    screens_loaded: bool,
+    /// Ce qu'affichent les écrans (tactiles).
+    screen_content: crate::screen::ScreenContent,
+    /// Écran visé par le réticule : indice, distance et point visé dessus (0..1).
+    screen_aim: Option<(usize, f32, [f32; 2])>,
+    /// Appui en cours sur un écran (bouton pas encore relâché).
+    screen_down: bool,
     /// Marche du modèle du joueur : phase (radians) et ampleur 0..1.
     walk_phase: f32,
     /// Marche des autres joueurs (par pseudo) : comme la sienne en F5, calculée sur leur
@@ -449,6 +461,11 @@ impl Session {
             hand: Hand::default(),
             hand_light: [1.0; 3],
             perspective: 0,
+            screens: Vec::new(),
+            screens_loaded: false,
+            screen_content: crate::screen::ScreenContent::new(),
+            screen_aim: None,
+            screen_down: false,
             walk_phase: 0.0,
             walks: HashMap::new(),
             walk_amp: 0.0,
@@ -634,6 +651,7 @@ impl Session {
                 self.handle_keys(input);
                 self.handle_hotbar(input);
             }
+            self.update_screens(input, dt, typing);
             self.inventory.update(dt);
             self.tick_torches(dt);
             self.update_sun(dt);
@@ -1266,6 +1284,112 @@ impl Session {
         }
     }
 
+    /// Écrans vidéo : chargement (première image), point visé par le réticule, appui
+    /// (clic gauche, ou tir en mode FPS) pour toucher l'écran, accroupi + clic gauche pour
+    /// le casser, puis image suivante du contenu.
+    fn update_screens(&mut self, input: &Input, dt: f32, typing: bool) {
+        if !self.screens_loaded {
+            self.screens = crate::screen::load(&self.dir);
+            self.screens_loaded = true;
+        }
+        // Hitbox pour la physique (aussi après une réapparition du joueur).
+        if self.player.solids.len() != self.screens.len() {
+            self.screens_changed(false);
+        }
+        let fps = self.game.mode == GameMode::Fps;
+        let click = if fps { Action::FpsFire } else { Action::Attack };
+        self.screen_aim = None;
+        if !self.screens.is_empty()
+            && input.grabbed
+            && !typing
+            && !self.inventory.open
+            && self.game.mode != GameMode::Spectator
+        {
+            self.screen_aim = self.aimed_screen();
+        }
+        if let Some((i, t, uv)) = self.screen_aim {
+            if self.keys.pressed(input, click) {
+                // Le clic est pour l'écran : ni bloc cassé derrière, ni tir, jusqu'au
+                // relâchement (voir `handle_blocks` et `update_fps`).
+                self.screen_down = true;
+                if !fps && self.keys.held(input, Action::Sneak) {
+                    if t <= REACH {
+                        self.break_screen(i);
+                    }
+                } else {
+                    self.screen_content.press(uv);
+                }
+            }
+        }
+        let uv = self.screen_aim.map(|a| a.2);
+        if self.screen_down && !self.keys.held(input, click) {
+            self.screen_content.release(uv);
+            self.screen_down = false;
+        }
+        self.screen_content.hover(uv);
+        if !self.screens.is_empty() {
+            self.screen_content.update(dt);
+        }
+    }
+
+    /// Écran visé par le réticule (le plus proche, s'il n'est pas caché par un bloc) :
+    /// indice, distance et point visé dessus (0..1).
+    fn aimed_screen(&self) -> Option<(usize, f32, [f32; 2])> {
+        let eye = self.player.eye();
+        let dir = self.player.look_dir();
+        // Jusqu'au premier bloc visé, un rien au-delà : l'écran est collé à son mur.
+        let seen =
+            minelib_world::raycast::raycast(&self.world, eye.into(), dir.into(), SCREEN_REACH);
+        let limit = seen.map_or(SCREEN_REACH, |h| h.distance + 0.1);
+        let mut best: Option<(usize, f32, [f32; 2])> = None;
+        for (i, s) in self.screens.iter().enumerate() {
+            if let Some((t, uv)) = crate::screen::aim(&s.anchor(), eye, dir, limit) {
+                if best.is_none_or(|b| t < b.1) {
+                    best = Some((i, t, uv));
+                }
+            }
+        }
+        best
+    }
+
+    /// Pose l'écran vidéo tenu sur la face visée `hit` (clic droit). Refusé s'il serait
+    /// dans le joueur ou s'il y est déjà.
+    fn place_screen(&mut self, hit: minelib_world::raycast::Hit) {
+        let s = crate::screen::Placed::new(hit.block, hit.normal, self.player.eye());
+        let (min, max) = s.hitbox();
+        let (pmin, pmax) = self.player.bounds();
+        let inside = (0..3).all(|k| pmin[k] < max[k] && pmax[k] > min[k]);
+        if inside || self.screens.contains(&s) || self.screens.len() >= crate::screen::MAX_SCREENS {
+            return;
+        }
+        if self.game.mode != GameMode::Creative {
+            self.inventory.take_selected();
+        }
+        self.screens.push(s);
+        self.screens_changed(true);
+    }
+
+    /// Casse l'écran `i` : l'objet revient dans l'inventaire (hors créatif).
+    fn break_screen(&mut self, i: usize) {
+        if i >= self.screens.len() {
+            return;
+        }
+        self.screens.remove(i);
+        self.screen_aim = None;
+        if self.game.mode != GameMode::Creative {
+            self.inventory.add(Item::Screen, 1);
+        }
+        self.screens_changed(true);
+    }
+
+    /// Les écrans ont changé : hitbox pour la physique du joueur, et enregistrement.
+    fn screens_changed(&mut self, save: bool) {
+        self.player.solids = self.screens.iter().map(|s| s.hitbox()).collect();
+        if save {
+            crate::screen::save(&self.dir, &self.screens);
+        }
+    }
+
     /// Cadre (carte importée) que le joueur vise, devant tout bloc visible.
     fn aimed_frame(&self) -> Option<usize> {
         let frames = self.frames.as_ref().filter(|f| !f.is_empty())?;
@@ -1465,6 +1589,11 @@ impl Session {
         if !input.grabbed || self.inventory.open {
             return;
         }
+        // Le réticule est sur un écran vidéo : le clic est pour lui, rien n'est cassé ni
+        // posé derrière.
+        if self.screen_aim.is_some() || self.screen_down {
+            return;
+        }
         let keys = &self.keys;
         let pick = if self.game.mode == GameMode::Fps {
             keys.pressed(input, Action::FpsPing)
@@ -1532,6 +1661,18 @@ impl Session {
             return;
         }
         let Some(hit) = hit else { return };
+
+        // Écran vidéo tenu : clic droit le pose sur la face visée (aucun bloc posé).
+        if self.inventory.selected_item() == Some(Item::Screen) {
+            if keys.pressed(input, Action::Use) {
+                self.place_screen(hit);
+                self.place_cooldown = 0.22;
+                return;
+            }
+            if !breaking {
+                return;
+            }
+        }
 
         // Baguette de sélection : clic gauche coin 1, clic droit coin 2 (rien n'est cassé
         // ni posé).
@@ -2673,10 +2814,12 @@ impl Session {
             }
         }
         let free = input.grabbed && !typing && !self.fps.buy_open;
+        // Sur un écran vidéo, la gâchette sert à le toucher : pas de tir.
+        let on_screen = self.screen_aim.is_some() || self.screen_down;
         let k = &self.keys;
         let c = crate::fps::Controls {
-            trigger_pressed: free && k.pressed(input, Action::FpsFire),
-            trigger_held: free && k.held(input, Action::FpsFire),
+            trigger_pressed: free && !on_screen && k.pressed(input, Action::FpsFire),
+            trigger_held: free && !on_screen && k.held(input, Action::FpsFire),
             trigger_down: k.held(input, Action::FpsFire),
             reload: free && k.pressed(input, Action::FpsReload),
             scope: free && k.pressed(input, Action::FpsScope),
@@ -3507,6 +3650,11 @@ impl Session {
                         .find(|b| b.def().name.to_lowercase() == want)
                 });
                 match found {
+                    _ if matches!(want.as_str(), "screen" | "ecran" | "écran") => {
+                        self.inventory.add(Item::Screen, count);
+                        self.chat
+                            .say(format!("{count} écran(s) vidéo donné(s)."), chat::YELLOW);
+                    }
                     _ if want == "torch" || want == "torche" => {
                         self.inventory.add(Item::Torch(None), count);
                         self.chat
@@ -3659,7 +3807,7 @@ impl Session {
                     "/worldname <nom> : renomme le monde",
                     "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
                     "/timefix true|false : arrête ou relance le temps",
-                    "/give <bloc> [nombre] : ex. /give mirror, /give iron_block",
+                    "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
                     "Vol : deux appuis rapides sur Espace",
                     "Mode FPS : clic molette = ping (pas d'inventaire ni de blocs)",
                     "Spectateur (/gm 3) : vol forcé, on traverse les blocs",
@@ -4798,6 +4946,7 @@ impl Session {
                         .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb),
                 )),
                 Some(Item::Wand) => Some(Held::Wand([70, 60, 90])),
+                Some(Item::Screen) => Some(Held::Wand([30, 30, 36])),
                 None => None,
             }
         } else {
@@ -5030,6 +5179,18 @@ impl Session {
             let (v, gen) = f.current();
             statics.push((u64::MAX, v, gen));
         }
+        let screens: Vec<minelib_render::ScreenAnchor> =
+            self.screens.iter().map(|s| s.anchor()).collect();
+        renderer.set_screens(&screens);
+        if !screens.is_empty() {
+            let (w, h) = self.screen_content.size();
+            renderer.set_screen_frame(
+                self.screen_content.version(),
+                w,
+                h,
+                self.screen_content.pixels(),
+            );
+        }
         let params = FrameParams {
             ray_boxes: &ray_boxes,
             smokes: &smokes,
@@ -5057,8 +5218,15 @@ impl Session {
             },
             // Pas de contour du bloc visé en mode FPS.
             selected: if grabbed && self.game.mode != GameMode::Fps {
-                self.frame_aim
-                    .and_then(|i| self.frames.as_ref()?.bounds(i))
+                // Hitbox de l'écran visé (à portée de main), sinon cadre, sinon bloc.
+                self.screen_aim
+                    .filter(|a| a.1 <= REACH)
+                    .and_then(|a| self.screens.get(a.0))
+                    .map(|s| {
+                        let (a, b) = s.hitbox();
+                        (a.to_array(), b.to_array())
+                    })
+                    .or_else(|| self.frame_aim.and_then(|i| self.frames.as_ref()?.bounds(i)))
                     .or_else(|| {
                         self.hit
                             .map(|h| minelib_world::raycast::selection_box(&self.world, h.block))

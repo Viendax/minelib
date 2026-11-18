@@ -22,17 +22,18 @@ mod lazy;
 mod overlay;
 pub mod perf;
 pub mod rt;
+mod screen;
 mod taa;
 pub mod textures;
 pub mod thermal;
 pub mod viewmodel;
-mod screen;
 
 pub use capture::Screenshot;
 
 pub use entity::EntityVertex;
 pub use latency::{LowLatencyKind, Marker};
 pub use overlay::{set_translator, tr, Line, Overlay, Ui};
+pub use screen::ScreenAnchor;
 pub use smoke::{SmokeQuality, SmokeVolume};
 pub use viewmodel::{VmVertex, FLAME, NO_TEXTURE};
 
@@ -1820,16 +1821,7 @@ impl Renderer {
 
         let proj = Mat4::perspective_infinite_reverse_rh(p.fov_y, self.aspect(), 0.05);
         let view_proj = proj * p.view;
-        {
-            let inv = p.view.inverse();
-            self.screen.update(
-                &self.queue,
-                p.time,
-                p.eye,
-                inv.transform_vector3(Vec3::NEG_Z).normalize_or_zero(),
-                inv.transform_vector3(Vec3::Y).normalize_or_zero(),
-            );
-        }
+        self.screen.update(&self.queue);
         let (sel_min, sel_max) = selection(p.selected);
         self.outline = p.selected.is_some();
         let rg = ray_globals(p.ray_boxes, p.ray_light);
@@ -1994,16 +1986,7 @@ impl Renderer {
 
         let proj = Mat4::perspective_infinite_reverse_rh(p.fov_y, self.aspect(), 0.05);
         let view_proj = proj * p.view;
-        {
-            let inv = p.view.inverse();
-            self.screen.update(
-                &self.queue,
-                p.time,
-                p.eye,
-                inv.transform_vector3(Vec3::NEG_Z).normalize_or_zero(),
-                inv.transform_vector3(Vec3::Y).normalize_or_zero(),
-            );
-        }
+        self.screen.update(&self.queue);
         let (jx, jy) = taa.jitter();
         let shift = Mat4::from_translation(Vec3::new(
             2.0 * jx / world_size.0 as f32,
@@ -2603,5 +2586,18 @@ mod tests {
             Vec3::new(100.0, -1.0, -11.0),
             Vec3::new(102.0, 1.0, -9.0)
         ));
+    }
+}
+
+impl Renderer {
+    /// Écrans vidéo posés dans le monde (aucun : liste vide).
+    pub fn set_screens(&mut self, anchors: &[ScreenAnchor]) {
+        self.screen.set_anchors(anchors);
+    }
+
+    /// Image de l'écran (BGRA 8 bits), envoyée à la carte seulement si `version` change.
+    pub fn set_screen_frame(&mut self, version: u64, width: u32, height: u32, pixels: &[u8]) {
+        self.screen
+            .set_frame(&self.device, &self.queue, version, width, height, pixels);
     }
 }

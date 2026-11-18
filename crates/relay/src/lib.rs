@@ -150,6 +150,20 @@ impl Handle {
         });
     }
 
+    /// (v148) Étages de pays sous ceux de ce relais (essais) : leurs provinces de cette
+    /// taille, peuplées d'au moins tant de joueurs, sont à leur tour des pays, et ainsi de
+    /// suite.
+    pub fn set_deeper(&self, levels: &[(usize, usize)]) {
+        self.state.lock().unwrap().deeper = levels
+            .iter()
+            .filter(|(size, _)| *size > 0)
+            .map(|&(size, from)| proto::Nest {
+                size: size as i32,
+                from: from.max(1) as u32,
+            })
+            .collect();
+    }
+
     /// (v146) Joueurs connectés ici dans cette partie, par pseudo (essais : ceux qui sont en
     /// veille au fond d'un pays n'y sont plus).
     pub fn players_here(&self, room: u64) -> Vec<String> {
@@ -229,6 +243,7 @@ impl Handle {
         settings: proto::ProvinceSettings,
         standby: bool,
         nest: Option<proto::Nest>,
+        deeper: Vec<proto::Nest>,
     ) -> bool {
         provinces::begin(
             &mut self.state.lock().unwrap(),
@@ -242,6 +257,7 @@ impl Handle {
             settings,
             standby,
             nest,
+            deeper,
         )
     }
 
@@ -1396,11 +1412,20 @@ struct State {
     /// province, époque, relais de secours).
     nest: Option<proto::Nest>,
     wants_served: HashMap<(u64, [i32; 2], u64, bool), Instant>,
+    /// (v148) Étages sous les pays : leurs provinces sont à leur tour des pays (le premier
+    /// étage est le leur), et ainsi de suite.
+    deeper: Vec<proto::Nest>,
 }
 
 /// (v143) `MINELIB_PAYS=taille,joueurs` : les provinces confiées par ce relais sont des pays
 /// qui confient eux-mêmes leurs provinces de `taille` régions de côté, peuplées d'au moins
 /// `joueurs`.
+/// (v148) `MINELIB_PAYS=taille,joueurs;taille,joueurs;…` : plusieurs étages de pays (le
+/// premier est celui des provinces confiées par ce relais).
+fn parse_nests(v: &str) -> Vec<proto::Nest> {
+    v.split(';').map_while(parse_nest).collect()
+}
+
 fn parse_nest(v: &str) -> Option<proto::Nest> {
     let mut it = v.split(',').map(|x| x.trim().parse::<i64>().ok());
     let size = it.next()??;
@@ -1501,8 +1526,12 @@ pub fn start(cfg: Config) -> Result<Handle> {
         local_tasks: 0,
         nest: std::env::var("MINELIB_PAYS")
             .ok()
-            .and_then(|v| parse_nest(&v)),
+            .and_then(|v| parse_nests(&v).first().copied()),
         wants_served: HashMap::new(),
+        deeper: std::env::var("MINELIB_PAYS")
+            .ok()
+            .map(|v| parse_nests(&v).into_iter().skip(1).collect())
+            .unwrap_or_default(),
     }));
     let state_for_handle = state.clone();
     let state_for_guards = state.clone();
@@ -10555,6 +10584,7 @@ mod tests {
                 Default::default(),
                 false,
                 None,
+                Vec::new(),
             ));
             // Un bloc déjà publié par la province.
             let data = game::encode(&game::BuildMsg::Set {
@@ -10638,6 +10668,7 @@ mod tests {
                 Default::default(),
                 true,
                 None,
+                Vec::new(),
             ));
             let cert = minelib_net::sovereign::Cert::issue(
                 &root_key,

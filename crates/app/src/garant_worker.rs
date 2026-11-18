@@ -47,6 +47,9 @@ pub struct GarantWorker {
     thread: Option<std::thread::JoinHandle<()>>,
     /// Ce jeu tient le relais d'un monde repris (son relais de secours a repris le monde).
     hosting: Arc<AtomicBool>,
+    /// (v148) Il tient quelque chose (relais de province, de région, de secours, partie
+    /// arbitrée…) : on ne le déplace pas.
+    busy: Arc<AtomicBool>,
 }
 
 impl GarantWorker {
@@ -55,16 +58,23 @@ impl GarantWorker {
     pub fn start(login: Login, maps: Vec<([u8; 32], PathBuf)>, maps_root: PathBuf) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let hosting = Arc::new(AtomicBool::new(false));
-        let (flag, host_flag) = (stop.clone(), hosting.clone());
+        let busy = Arc::new(AtomicBool::new(false));
+        let (flag, host_flag, busy_flag) = (stop.clone(), hosting.clone(), busy.clone());
         let thread = std::thread::Builder::new()
             .name("garant".into())
-            .spawn(move || run(login, maps, maps_root, flag, host_flag))
+            .spawn(move || run(login, maps, maps_root, flag, host_flag, busy_flag))
             .ok();
         Self {
             stop,
             thread,
             hosting,
+            busy,
         }
+    }
+
+    /// (v148) Il tient quelque chose : on ne le déplace pas d'un pays à l'autre.
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
     }
 
     /// Le fil tourne encore.
@@ -713,6 +723,7 @@ fn run(
     root: PathBuf,
     stop: Arc<AtomicBool>,
     hosting: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
 ) {
     let client = match &login.takeover {
         // Chez le relais d'un monde repris : par le certificat (directement, sinon par un
@@ -776,6 +787,16 @@ fn run(
     let mut wiped = Instant::now();
     log::info!("garant en jeu : connexion de garant ouverte");
     loop {
+        busy.store(
+            province.is_some()
+                || shard.is_some()
+                || attach.is_some()
+                || standby.is_some()
+                || garant.is_some()
+                || build.is_some()
+                || !witnesses.is_empty(),
+            Ordering::Relaxed,
+        );
         if stop.load(Ordering::Relaxed) {
             // Province tenue ici : rendue au relais du monde (tout ce qu'elle a publié part
             // avant).
@@ -1035,6 +1056,7 @@ fn run(
                     ref follow,
                     ref parent,
                     nest,
+                    ref deeper,
                 }) => {
                     if let Some(l) = &link {
                         if province.is_none() {
@@ -1058,7 +1080,7 @@ fn run(
                                     login.node_dir.clone(),
                                     login.node_dir.is_some(),
                                     parent.as_deref().cloned(),
-                                    nest,
+                                    (nest, deeper.clone()),
                                 ),
                                 None => crate::province_host::ProvinceHost::start(
                                     room,
@@ -1071,7 +1093,7 @@ fn run(
                                     settings.clone(),
                                     l,
                                     login.node_dir.is_some(),
-                                    nest,
+                                    (nest, deeper.clone()),
                                     parent.as_deref().map(|at| crate::province_host::Up {
                                         at: at.clone(),
                                         pseudo: login.pseudo.clone(),

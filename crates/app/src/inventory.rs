@@ -22,6 +22,9 @@ pub enum Item {
     Torch(Option<usize>),
     /// Baguette de sélection (WorldEdit) : clic gauche coin 1, clic droit coin 2.
     Wand,
+    /// Écran vidéo : clic droit le pose, clic gauche dessus le touche (tactile),
+    /// accroupi + clic gauche le casse.
+    Screen,
 }
 
 impl Item {
@@ -32,6 +35,7 @@ impl Item {
             Item::Torch(None) => 0x1_0000,
             Item::Torch(Some(i)) => 0x1_0001 + i as u32,
             Item::Wand => 0x2_0000,
+            Item::Screen => 0x3_0000,
         }
     }
 
@@ -39,6 +43,7 @@ impl Item {
     pub fn from_code(code: u32) -> Option<Self> {
         match code {
             0x2_0000 => Some(Item::Wand),
+            0x3_0000 => Some(Item::Screen),
             0x1_0000 => Some(Item::Torch(None)),
             c if c > 0x1_0000 && c < 0x2_0000 => {
                 let i = (c - 0x1_0001) as usize;
@@ -53,6 +58,7 @@ impl Item {
         match self {
             Item::Block(b) => capitalize(b.name()),
             Item::Wand => "Baguette de sélection".into(),
+            Item::Screen => "Écran vidéo".into(),
             Item::Torch(None) => "Torche".into(),
             Item::Torch(Some(i)) => {
                 let c = &CHEMICALS[i];
@@ -72,7 +78,7 @@ impl Item {
         match self {
             Item::Torch(None) => Some(WOOD_FLAME),
             Item::Torch(Some(i)) => Some(CHEMICALS[i].rgb),
-            Item::Block(_) | Item::Wand => None,
+            Item::Block(_) | Item::Wand | Item::Screen => None,
         }
     }
 
@@ -87,6 +93,14 @@ impl Item {
                 lines.push(("Clic gauche : coin 1, clic droit : coin 2".into(), WHITE));
                 lines.push(("Clic molette : effacer la sélection".into(), WHITE));
                 lines.push(("Commandes //set, //copy, //paste… (//help)".into(), GREY));
+            }
+            Item::Screen => {
+                lines.push(("Clic droit : le poser sur un mur ou un sol".into(), WHITE));
+                lines.push((
+                    "Clic gauche dessus : le toucher (écran tactile)".into(),
+                    WHITE,
+                ));
+                lines.push(("Accroupi + clic gauche : le casser".into(), GREY));
             }
             Item::Torch(None) => {
                 lines.push(("Flamme orange (bois)".into(), WHITE));
@@ -405,6 +419,7 @@ pub fn catalogue() -> &'static [(Item, usize)] {
         blocks.sort_by_key(|b| (b.0, b.1));
         let mut items: Vec<(Item, usize)> = blocks.into_iter().map(|(t, _, it)| (it, t)).collect();
         items.push((Item::Wand, 6));
+        items.push((Item::Screen, 6));
         items.push((Item::Torch(None), 6));
         items.extend((0..CHEMICALS.len()).map(|i| (Item::Torch(Some(i)), 6)));
         items
@@ -681,6 +696,7 @@ impl Inventory {
                         Item::Block(b) => fold(&b.def().key).contains(&q),
                         Item::Torch(_) => "torche".contains(&q),
                         Item::Wand => "baguette wand worldedit".contains(&q),
+                        Item::Screen => "ecran video tele television youtube".contains(&q),
                     }
                 }
             })
@@ -1381,6 +1397,8 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
         )),
         // Baguette : image en pixels.
         Item::Wand => crate::wand::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s),
+        // Écran vidéo : petite télé en pixels.
+        Item::Screen => crate::screen::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s),
         // Barrières (invisibles) : un panneau « interdit », rouge (bleu : à fluides).
         Item::Block(b) if matches!(b.def().shape, minelib_world::registry::Shape::Invisible) => {
             let c = if b.def().key == "fluid_barrier" {

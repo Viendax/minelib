@@ -162,6 +162,8 @@ pub struct Player {
     /// Les autres joueurs, solides : on ne les traverse pas, on peut monter sur une tête.
     /// À remplir avant chaque pas (vide : personne).
     pub others: Vec<Other>,
+    /// Boîtes solides en plus des blocs (hitbox des écrans vidéo) : coins min et max.
+    pub solids: Vec<(Vec3, Vec3)>,
     /// Atterri sur un joueur déjà perché sur un autre : on glisse de sa tête (son centre).
     slide: Option<Vec3>,
     /// Accroché à une échelle (pas de chute : on y monte et descend).
@@ -230,6 +232,7 @@ impl Player {
             jump_buffer: 0.0,
             sneak_was_held: false,
             others: Vec::new(),
+            solids: Vec::new(),
             slide: None,
             on_ladder: false,
             swimming: None,
@@ -298,7 +301,7 @@ impl Player {
             && max.z > bmin.z
     }
 
-    fn bounds(&self) -> (Vec3, Vec3) {
+    pub fn bounds(&self) -> (Vec3, Vec3) {
         let h = Vec3::new(HALF_WIDTH, 0.0, HALF_WIDTH);
         (self.pos - h, self.pos + h + Vec3::Y * HEIGHT)
     }
@@ -942,6 +945,25 @@ impl Player {
                 if axis == 1 && on_player.is_none_or(|(top, _)| bmax.y > top) {
                     on_player = Some((bmax.y, o));
                 }
+            }
+        }
+        // Boîtes solides (écrans vidéo) : mêmes règles que les blocs.
+        for i in 0..self.solids.len() {
+            let (bmin, bmax) = self.solids[i];
+            let (pmin, pmax) = self.bounds();
+            let side = (0..3)
+                .all(|k| k == axis || (pmin[k] < bmax[k] - TOUCH && pmax[k] > bmin[k] + TOUCH));
+            if !side {
+                continue;
+            }
+            if d > 0.0 {
+                if bmin[axis] >= bmax0[axis] - TOUCH && pmax[axis] > bmin[axis] {
+                    self.pos[axis] = self.pos[axis].min(bmin[axis] - above);
+                    hit = true;
+                }
+            } else if bmax[axis] <= bmin0[axis] + TOUCH && pmin[axis] < bmax[axis] {
+                self.pos[axis] = self.pos[axis].max(bmax[axis] + below);
+                hit = true;
             }
         }
         for y in lo.y..=hi.y {

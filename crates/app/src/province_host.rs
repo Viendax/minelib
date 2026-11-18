@@ -78,6 +78,10 @@ pub struct ProvinceHost {
     next_try: Instant,
 }
 
+/// (v143, v148) Étage d'une province (`Some` : un pays, et la taille de ses provinces) et ceux
+/// d'en dessous.
+pub type Levels = (Option<proto::Nest>, Vec<proto::Nest>);
+
 /// Relais embarqué d'une province, lancé : sa poignée, son nœud iroh, où le joindre.
 type Launched = (
     minelib_relay::Handle,
@@ -100,7 +104,7 @@ impl ProvinceHost {
         settings: proto::ProvinceSettings,
         link: &Sender<Inbound>,
         p2p: bool,
-        nest: Option<proto::Nest>,
+        nest: Levels,
         parent: Option<Up>,
     ) -> Option<Self> {
         let (handle, node, at) = Self::launch(
@@ -206,7 +210,7 @@ impl ProvinceHost {
         node_dir: Option<PathBuf>,
         p2p: bool,
         parent: Option<proto::ProvinceAt>,
-        nest: Option<proto::Nest>,
+        nest: Levels,
     ) -> Option<Self> {
         let (handle, node, at) = Self::launch(
             room, province, size, epoch, secret, root, info, settings, p2p, true, nest,
@@ -273,7 +277,7 @@ impl ProvinceHost {
         settings: proto::ProvinceSettings,
         p2p: bool,
         standby: bool,
-        nest: Option<proto::Nest>,
+        nest: Levels,
     ) -> Option<Launched> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -290,7 +294,7 @@ impl ProvinceHost {
         .map_err(|e| log::warn!("relais de province : {e:#}"))
         .ok()?;
         if !handle.province_begin(
-            room, province, size, epoch, secret, root, info, settings, standby, nest,
+            room, province, size, epoch, secret, root, info, settings, standby, nest.0, nest.1,
         ) {
             return None;
         }
@@ -693,6 +697,12 @@ impl ProvinceHost {
     #[cfg(test)]
     pub fn local_tasks(&self) -> usize {
         self.handle.local_tasks()
+    }
+
+    /// Essais (v148) : régions par côté de sa province.
+    #[cfg(test)]
+    pub fn size_of(&self) -> i32 {
+        self.size
     }
 
     /// Essais : il sert (bail en cours).

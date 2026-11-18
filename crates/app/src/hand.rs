@@ -597,6 +597,14 @@ impl Hand {
                     * Mat4::from_scale(Vec3::splat(0.34));
                 crate::wand::model(&mut out, proj * m, light);
             }
+            Item::Screen => {
+                // Tenu droit comme la baguette.
+                let m = base
+                    * Mat4::from_translation(Vec3::new(0.36, -0.58, -0.92))
+                    * wand_rotation()
+                    * Mat4::from_scale(Vec3::splat(0.34));
+                crate::screen::model(&mut out, proj * m, light);
+            }
             Item::Block(b) => {
                 let def = b.def();
                 let t = def.tex;

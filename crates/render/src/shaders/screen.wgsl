@@ -1,5 +1,5 @@
-// Minelib — écran vidéo dans le monde : quad texturé par une image dynamique.
-// group 0 : uniformes du monde (on n'utilise que view_proj). group 1 : la vidéo.
+// Minelib — écran vidéo dans le monde : quad texturé par une image dynamique, fixé dans
+// le monde. group 0 : uniformes du monde. group 1 : la vidéo.
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -28,6 +28,7 @@ struct VIn {
 struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) world: vec3<f32>,
 };
 
 @vertex
@@ -35,12 +36,17 @@ fn vs_main(v: VIn) -> VOut {
     var o: VOut;
     o.clip = g.view_proj * vec4<f32>(v.pos, 1.0);
     o.uv = v.uv;
+    o.world = v.pos;
     return o;
+}
+
+fn texel(i: VOut) -> vec4<f32> {
+    return vec4<f32>(textureSampleLevel(vid, vid_s, i.uv, 0.0).rgb, 1.0);
 }
 
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSampleLevel(vid, vid_s, i.uv, 0.0).rgb, 1.0);
+    return texel(i);
 }
 
 struct TaaOut {
@@ -48,12 +54,16 @@ struct TaaOut {
     @location(1) motion: vec2<f32>,
 };
 
-// L'écran suit la caméra (billboard) : pas de vecteur de mouvement, comme le
-// modèle tenu en main — évite les traînées de l'anticrénelage.
+// Fixé dans le monde : il bouge à l'écran comme les blocs (même calcul que les entités
+// fixes), sinon l'anticrénelage le fait traîner.
 @fragment
-fn fs_taa(i: VOut) -> TaaOut {
+fn fs_taa_world(i: VOut) -> TaaOut {
     var o: TaaOut;
-    o.color = vec4<f32>(textureSampleLevel(vid, vid_s, i.uv, 0.0).rgb, 1.0);
-    o.motion = vec2<f32>(0.0);
+    o.color = texel(i);
+    let p = vec4<f32>(i.world, 1.0);
+    let cur = g.cur_view_proj * p;
+    let prev = g.prev_view_proj * p;
+    let d = prev.xy / prev.w - cur.xy / cur.w;
+    o.motion = d * vec2<f32>(0.5, -0.5) * g.screen.xy;
     return o;
 }
