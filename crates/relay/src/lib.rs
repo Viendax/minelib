@@ -350,6 +350,10 @@ impl Handle {
                 edits,
                 ..
             } => provinces::bulk(&mut st, *epoch, pseudo, edits.clone()),
+            // (v145) Ses voisines, dites par son pays.
+            Response::ProvinceNeighbours { epoch, list, .. } => {
+                provinces::neighbours(&mut st, *epoch, list.clone())
+            }
             _ => {}
         }
     }
@@ -6408,10 +6412,13 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             followed,
             wants,
             children,
+            arrived,
+            left,
         } => {
             if my_room == Some(room) {
                 provinces::lease(
                     st, room, id, province, epoch, t, counts, inside, followed, wants, children,
+                    arrived, left,
                 );
             }
             return None;
@@ -11737,6 +11744,8 @@ mod tests {
                                 followed: false,
                                 wants: Vec::new(),
                                 children: None,
+                                arrived: Vec::new(),
+                                left: Vec::new(),
                             },
                         );
                     }

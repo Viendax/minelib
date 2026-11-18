@@ -388,6 +388,16 @@ impl ProvinceHost {
                 self.handle.province_event(r);
                 Vec::new()
             }
+            // (v145) Ses voisines, dites par son pays (annoncées à ses joueurs).
+            Response::ProvinceNeighbours {
+                room,
+                province,
+                epoch,
+                ..
+            } if (*room, *province, *epoch) == (self.room, self.province, self.epoch) => {
+                self.handle.province_event(r);
+                Vec::new()
+            }
             // (v144) Où est le relais de secours de son pays (pour s'y rattacher s'il prend la
             // place du pays).
             Response::ProvinceParent {
@@ -656,6 +666,13 @@ impl ProvinceHost {
     #[cfg(test)]
     pub fn kill(&self) {
         self.handle.kill();
+    }
+
+    /// Essais : changements de chunk reçus de joueurs (v145 : un pays n'en reçoit plus de
+    /// ceux qui sont au fond de ses provinces).
+    #[cfg(test)]
+    pub fn positions_seen(&self) -> usize {
+        self.handle.positions_seen()
     }
 
     /// Essais : il sert (bail en cours).

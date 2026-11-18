@@ -841,7 +841,8 @@ impl Worker {
             | Response::ProvinceBagRecall { .. }
             | Response::ProvinceBulk { .. }
             | Response::ProvinceChildren { .. }
-            | Response::ProvinceParent { .. }) => Event::Province(r),
+            | Response::ProvinceParent { .. }
+            | Response::ProvinceNeighbours { .. }) => Event::Province(r),
             Response::Provinces { list } => Event::Provinces(list),
             Response::ShardPeers { region, list, sov } => Event::ShardPeers { region, list, sov },
             Response::RootEdits {

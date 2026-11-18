@@ -43,6 +43,9 @@ const ARCHIVE_MS: u64 = 100;
 const SPOT_MS: u64 = 2000;
 /// Sac de survie demandé sans réponse : redemandé après… (ms).
 const BAG_ASK_MS: u64 = 3000;
+/// (v145) Pays : sac que plus personne ne réclame chez lui, rendu au relais du monde
+/// après… (ms).
+const BAG_HOLD_MS: u64 = 5000;
 /// (v141) Envois d'une province gardés ici pour son relais de secours, au plus (nombre,
 /// octets) ; et envois pas encore gardés qu'elle garde pour lui.
 const RECENT_MAX: usize = 128;
@@ -211,6 +214,16 @@ pub(crate) struct ProvinceRoom {
     follower_at: Option<ProvinceInfo>,
     children_said: Option<Vec<proto::ChildCopy>>,
     children_copy: Vec<proto::ChildCopy>,
+    /// (v145) Province d'un pays : ses voisines (dites par le pays, annoncées à ses
+    /// joueurs) ; ses joueurs dits au pays au dernier bail. Pays : où est chacun de ses
+    /// joueurs (pseudo → province, époque), d'après ses provinces ; voisines dites à
+    /// chacune.
+    neighbours: Vec<ProvinceInfo>,
+    present_sent: HashSet<String>,
+    kids_present: HashMap<String, ([i32; 2], u64)>,
+    neighbours_said: HashMap<[i32; 2], Vec<ProvinceInfo>>,
+    /// (v145) Pays : sacs que plus personne ne réclame chez lui, depuis (ms).
+    held_free: HashMap<String, u64>,
 }
 
 impl ProvinceRoom {
@@ -905,10 +918,33 @@ pub(crate) fn lease(
     followed: bool,
     wants: Vec<proto::Want>,
     children: Option<Vec<ProvinceInfo>>,
+    arrived: Vec<String>,
+    left: Vec<String>,
 ) {
     // (v143) Chez un pays : bail donné seulement s'il en a assez lui-même (celui de sa
     // province finit avant le sien), et toujours avec la copie chez lui.
     let pays = st.province_room == Some(rid);
+    // (v145) Chez un pays : où sont ses joueurs, d'après ses provinces.
+    if pays {
+        if let Some(room) = st.rooms.get_mut(&rid) {
+            let ok = room
+                .provinces
+                .get(&p)
+                .is_some_and(|r| r.host == id && r.epoch == epoch && r.info.is_some());
+            if let (true, Some(pr)) = (ok, room.province.as_mut()) {
+                for w in left {
+                    if pr.kids_present.get(&w) == Some(&(p, epoch)) {
+                        pr.kids_present.remove(&w);
+                    }
+                }
+                for w in arrived {
+                    if pr.kids_present.len() < 1 << 20 {
+                        pr.kids_present.insert(w, (p, epoch));
+                    }
+                }
+            }
+        }
+    }
     let paused = if pays {
         !parent_ok(st, rid)
     } else {
@@ -1173,8 +1209,17 @@ pub(crate) fn bag_asked(st: &mut State, rid: u64, id: u64, p: [i32; 2], epoch: u
         return;
     }
     let who = pseudo.to_ascii_lowercase();
-    // (Seulement pour un joueur qui s'y trouve, d'après ce relais.)
-    if player_near(room, &who, p, size) != Some(true) {
+    // (Seulement pour un joueur qui s'y trouve, d'après ce relais ; v145 : un pays, qui ne
+    // voit plus ses joueurs au fond de ses provinces, croit la province, sauf s'il sait le
+    // joueur ailleurs.)
+    let near = match room.province.as_ref() {
+        Some(pr) => match pr.kids_present.get(&who) {
+            Some(h) => h.0 == p,
+            None => player_near(room, &who, p, size) != Some(false),
+        },
+        None => player_near(room, &who, p, size) == Some(true),
+    };
+    if !near {
         return;
     }
     // (v143) Un pays qui ne l'a pas encore : demandé au relais du monde ; il partira à la
@@ -1673,6 +1718,11 @@ fn take_back(st: &mut State, rid: u64, p: [i32; 2], why: &str) {
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
+    // (v145) Ses joueurs : le pays ne sait plus où ils sont (ils lui reviennent).
+    if let Some(pr) = room.province.as_mut() {
+        pr.kids_present.retain(|_, h| h.0 != p);
+        pr.neighbours_said.remove(&p);
+    }
     let Some(r) = room.provinces.remove(&p) else {
         return;
     };
@@ -1967,6 +2017,11 @@ fn promote(st: &mut State, rid: u64, p: [i32; 2], why: &str) -> bool {
     let (old, old_host) = (r.epoch, r.host);
     let epoch = room.next_epoch;
     room.next_epoch += 1;
+    // (v145) Ses joueurs : redits par le relais de secours promu.
+    if let Some(pr) = room.province.as_mut() {
+        pr.kids_present.retain(|_, h| h.0 != p);
+        pr.neighbours_said.remove(&p);
+    }
     let snap_seq = room.build.last_seq();
     let r = room.provinces.get_mut(&p).expect("province");
     let recent = std::mem::take(&mut r.recent);
@@ -2175,7 +2230,11 @@ pub(crate) fn send_list(st: &mut State, rid: u64, id: u64) {
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
-    if room.provinces.is_empty() && !room.provinces_sent.contains_key(&id) {
+    let no_neighbours = room
+        .province
+        .as_ref()
+        .is_none_or(|p| p.neighbours.is_empty());
+    if room.provinces.is_empty() && no_neighbours && !room.provinces_sent.contains_key(&id) {
         return;
     }
     let Some(&chunk) = room.build.positions.get(&id) else {
@@ -2191,7 +2250,15 @@ pub(crate) fn send_list(st: &mut State, rid: u64, id: u64) {
             }
         }
     }
-    list.sort_by_key(|i| i.province);
+    // (v145) Province d'un pays : ses voisines en vue (elle comprise).
+    if let Some(pr) = room.province.as_ref() {
+        for n in &pr.neighbours {
+            if regions_in_view(chunk).any(|r| n.has(r)) {
+                list.push(n.clone());
+            }
+        }
+    }
+    list.sort_by_key(|i| (i.size, i.province));
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for i in &list {
         (i.province, i.epoch, &i.addr, i.key, i.node).hash(&mut h);
@@ -2310,6 +2377,11 @@ pub(crate) fn begin(
         follower_at: None,
         children_said: None,
         children_copy: Vec::new(),
+        neighbours: Vec::new(),
+        present_sent: HashSet::new(),
+        kids_present: HashMap::new(),
+        neighbours_said: HashMap::new(),
+        held_free: HashMap::new(),
     });
     // (Réglages du serveur : OP, bannis, mode par défaut ; sacs de survie suivis, pour la
     // copie envoyée au relais du monde.)
@@ -2411,7 +2483,11 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
     let all = dump.map(|_| room.build.entries_after(|_| true, 0));
     // (v144) Joueurs connectés ici (grand monde : seules les positions de retour de ceux qui
     // sont partis remontent).
-    let here: HashSet<String> = room.by_pseudo.keys().cloned().collect();
+    let mut here: HashSet<String> = room.by_pseudo.keys().cloned().collect();
+    // (v145) Un pays : ses joueurs au fond de ses provinces aussi.
+    if let Some(pr) = room.province.as_ref() {
+        here.extend(pr.kids_present.keys().cloned());
+    }
     let Some(pr) = room.province.as_mut() else {
         return Vec::new();
     };
@@ -2583,6 +2659,8 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
         } else {
             (Vec::new(), None)
         };
+        // (v145) Ses joueurs arrivés et partis depuis le dernier bail (pour son pays).
+        let (arrived, left) = presence(st, rid);
         out.push(Request::ProvinceLease {
             room: rid,
             province: p,
@@ -2593,7 +2671,13 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
             followed,
             wants,
             children,
+            arrived,
+            left,
         });
+        // (v145) Un pays : à chacune de ses provinces, ses voisines.
+        if pays_here(st, rid) {
+            tell_neighbours(st, rid);
+        }
     }
     let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) else {
         return out;
@@ -2610,6 +2694,133 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
     out
 }
 
+/// (v145) Relais de province : ses joueurs (dans la province) arrivés et partis depuis le
+/// dernier bail.
+fn presence(st: &mut State, rid: u64) -> (Vec<String>, Vec<String>) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(pr) = room.province.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let now: HashSet<String> = room
+        .members
+        .iter()
+        .filter(|m| !room.hidden.contains(m))
+        .filter(|m| {
+            room.build
+                .positions
+                .get(m)
+                .is_some_and(|c| pr.has(proto::region_of(*c)))
+        })
+        .filter_map(|m| Some(st.conns.get(m)?.pseudo.as_deref()?.to_ascii_lowercase()))
+        .collect();
+    let arrived: Vec<String> = now
+        .difference(&pr.present_sent)
+        .take(4096)
+        .cloned()
+        .collect();
+    let left: Vec<String> = pr
+        .present_sent
+        .difference(&now)
+        .take(4096)
+        .cloned()
+        .collect();
+    if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+        for w in &arrived {
+            pr.present_sent.insert(w.clone());
+        }
+        for w in &left {
+            pr.present_sent.remove(w);
+        }
+    }
+    (arrived, left)
+}
+
+/// (v145) Relais d'un pays : le joueur `who` est-il chez lui (dans une de ses provinces,
+/// d'après elles, ou connecté ici dans le pays) ?
+fn present_anywhere(room: &super::Room, who: &str) -> bool {
+    let Some(pr) = room.province.as_ref() else {
+        return false;
+    };
+    pr.kids_present.contains_key(who)
+        || room.by_pseudo.get(who).is_some_and(|id| {
+            room.build
+                .positions
+                .get(id)
+                .is_some_and(|c| pr.has(proto::region_of(*c)))
+        })
+}
+
+/// (v145) Relais d'un pays : à chacune de ses provinces servies, ses voisines (elle comprise),
+/// quand elles ont changé.
+fn tell_neighbours(st: &mut State, rid: u64) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let mut out = Vec::new();
+    for (p, r) in &room.provinces {
+        if r.info.is_none() || r.host == 0 {
+            continue;
+        }
+        let mut list: Vec<ProvinceInfo> = (-1..=1)
+            .flat_map(|dx| (-1..=1).map(move |dz| [p[0] + dx, p[1] + dz]))
+            .filter_map(|q| room.provinces.get(&q).and_then(|x| x.info.clone()))
+            .collect();
+        list.sort_by_key(|i| i.province);
+        let said = room
+            .province
+            .as_ref()
+            .and_then(|pr| pr.neighbours_said.get(p));
+        if said != Some(&list) {
+            out.push((*p, r.epoch, r.host, list));
+        }
+    }
+    for (p, epoch, host, list) in out {
+        if let Some(c) = st.conns.get(&host) {
+            transport::push(
+                &c.tx,
+                &Response::ProvinceNeighbours {
+                    room: rid,
+                    province: p,
+                    epoch,
+                    list: list.clone(),
+                },
+            );
+        }
+        if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+            pr.neighbours_said.insert(p, list);
+        }
+    }
+}
+
+/// (v145) Province d'un pays : ses voisines, dites par le pays ; ses joueurs les apprennent.
+pub(crate) fn neighbours(st: &mut State, epoch: u64, list: Vec<ProvinceInfo>) {
+    let Some(rid) = st.province_room else {
+        return;
+    };
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let Some(pr) = room
+        .province
+        .as_mut()
+        .filter(|p| p.epoch == epoch && !p.standby)
+    else {
+        return;
+    };
+    pr.neighbours = list.into_iter().take(64).collect();
+    let players: Vec<u64> = room
+        .members
+        .iter()
+        .filter(|m| !room.hidden.contains(m))
+        .copied()
+        .collect();
+    for id in players {
+        send_list(st, rid, id);
+    }
+}
+
 /// Relais de province (v140) : joueurs de chaque région peuplée de la province, et relais
 /// de région dont l'hôte joue dans la région qu'il sert (région, rang).
 type Census = (Vec<([i32; 2], u32)>, Vec<([i32; 2], u16)>);
@@ -2622,13 +2833,25 @@ fn census(st: &mut State, rid: u64) -> Census {
         return (Vec::new(), Vec::new());
     };
     let (prov, size) = (pr.province, pr.size);
+    // (v145) Un pays : ses joueurs au fond de ses provinces n'entrent plus chez lui ; ce
+    // sont elles qui les comptent.
+    let counted = counted_provinces(room);
+    let child_size = st
+        .province_size
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1) as i32;
+    let room = st.rooms.get_mut(&rid).expect("province");
     let mut counts: Vec<([i32; 2], u32)> = room
         .build
         .region_counts()
         .iter()
         .filter(|(r, _)| proto::province_of(**r, size) == prov)
+        .filter(|(r, _)| !counted.contains(&proto::province_of(**r, child_size)))
         .map(|(r, n)| (*r, *n))
         .collect();
+    for p in &counted {
+        counts.extend(room.provinces[p].counts.iter().flatten().copied());
+    }
     counts.sort_unstable();
     let room = st.rooms.get(&rid).expect("province");
     let mut inside = Vec::new();
@@ -3551,20 +3774,46 @@ fn bags_upkeep(st: &mut State, rid: u64) {
     let Some(pr) = room.province.as_ref() else {
         return;
     };
+    // (v145) Un pays garde les sacs prêtés à ses provinces et ceux des joueurs qu'il sait
+    // chez lui ; un sac que plus personne ne réclame chez lui y reste un moment (le joueur
+    // passe peut-être d'une de ses provinces à l'autre) avant de remonter.
+    let now = guards::now_ms(st);
+    let mut free = Vec::new();
     let gone: Vec<String> = pr
         .held
         .iter()
-        .filter(|who| {
-            room.by_pseudo.get(*who).is_none_or(|id| {
-                room.build
-                    .positions
-                    .get(id)
-                    .is_none_or(|c| !pr.has(proto::region_of(*c)))
-            })
-        })
+        .filter(|who| !room.bag_holders.contains_key(*who) && !present_anywhere(room, who))
         .cloned()
         .collect();
+    let gone: Vec<String> = if pr.nest.is_some() {
+        let mut out = Vec::new();
+        for who in gone {
+            match pr.held_free.get(&who) {
+                Some(t) if now.saturating_sub(*t) >= BAG_HOLD_MS => out.push(who),
+                Some(_) => {}
+                None => free.push(who),
+            }
+        }
+        out
+    } else {
+        gone
+    };
+    if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+        let keep: HashSet<String> = pr
+            .held_free
+            .keys()
+            .filter(|w| pr.held.contains(*w))
+            .cloned()
+            .collect();
+        pr.held_free.retain(|w, _| keep.contains(w));
+        for w in free {
+            pr.held_free.insert(w, now);
+        }
+    }
     for who in gone {
+        if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+            pr.held_free.remove(&who);
+        }
         bag_back(st, &who);
     }
     // Les joueurs en survie dans la province : leur sac est demandé avant qu'ils n'en aient

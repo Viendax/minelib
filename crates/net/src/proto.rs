@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 43;
+pub const PROTOCOL: u32 = 44;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -546,6 +546,11 @@ pub enum Request {
         /// de leurs régions).
         wants: Vec<Want>,
         children: Option<Vec<ProvinceInfo>>,
+        /// (v145) Province d'un pays : joueurs arrivés chez elle et partis depuis le dernier
+        /// bail (pseudos) ; le pays sait ainsi où sont ses joueurs sans recevoir leurs
+        /// positions.
+        arrived: Vec<String>,
+        left: Vec<String>,
     },
     /// Ce que le relais de province vient de publier (zone, rang, message) : le relais du
     /// monde en garde une copie, pour reprendre la province aussitôt si son hôte tombe.
@@ -1049,6 +1054,15 @@ pub enum Response {
         epoch: u64,
         children: Vec<ChildCopy>,
     },
+    /// (v145) Relais d'un pays → une de ses provinces : ses voisines (les provinces du pays
+    /// proches d'elle, elle comprise) ; elle les annonce à ses joueurs, qui n'ont plus besoin
+    /// d'entrer chez le pays pour les connaître.
+    ProvinceNeighbours {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        list: Vec<ProvinceInfo>,
+    },
     /// (v144) Relais d'un pays → hôte d'une de ses provinces (ou de son relais de secours) :
     /// où est le relais de secours du pays ; s'il prend la place du pays, la province s'y
     /// rattache (même jeton) au lieu de s'arrêter.
@@ -1354,6 +1368,7 @@ impl Response {
                 | Response::ProvinceBulk { .. }
                 | Response::ProvinceChildren { .. }
                 | Response::ProvinceParent { .. }
+                | Response::ProvinceNeighbours { .. }
                 // (Relais de secours et gardiens, v133 à v135 : poussés eux aussi ; une
                 // requête en cours ne doit pas les prendre pour sa réponse.)
                 | Response::StandbyTask { .. }

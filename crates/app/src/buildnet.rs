@@ -170,7 +170,15 @@ struct ProvinceConn {
     /// rien donné, rien pris : le relais du monde la reprend telle qu'il l'a gardée).
     unmarked_items: Vec<BuildMsg>,
     marked_items: std::collections::VecDeque<(u64, Vec<BuildMsg>)>,
+    /// (v145) Depuis combien de temps elle ne décide de rien en vue (au-delà de
+    /// `LEAVE_AFTER`, on la quitte).
+    idle: f32,
 }
+
+/// (v145) Relais de province (ou pays) qui ne décide plus de rien en vue depuis… (s) :
+/// quitté (un pays n'a plus à recevoir les positions de ceux qui sont au fond de ses
+/// provinces).
+const LEAVE_AFTER: f32 = 5.0;
 
 /// (v143) Une province (ou un pays) : ses coordonnées et sa taille (régions par côté).
 type PKey = ([i32; 2], i32);
@@ -515,18 +523,34 @@ impl BuildNet {
     /// n'y est plus (ou plus au même relais) est quittée ; ce qui attendait la réponse d'une
     /// province qui n'y est plus repart à qui en décide maintenant.
     fn merge_provinces(&mut self) {
-        let mut list = self.root_list.clone();
-        // (v144) Les provinces de chaque pays du relais du monde, d'après sa dernière liste
-        // (même si son relais vient de tomber).
-        let root: Vec<PKey> = self.root_list.iter().map(pkey).collect();
-        self.children_of.retain(|k, _| root.contains(k));
-        for i in &self.root_list {
-            if let Some(kids) = self.children_of.get(&pkey(i)) {
-                list.extend(kids.iter().filter(|k| i.contains(k)).cloned());
+        // (v144, v145) Les provinces des pays du relais du monde, d'après les listes reçues
+        // (celle de chaque pays, gardée même si son relais vient de tomber, et celles de
+        // ses provinces, qui annoncent leurs voisines) ; la plus récente époque l'emporte.
+        let mut best: HashMap<PKey, proto::ProvinceInfo> = self
+            .root_list
+            .iter()
+            .map(|i| (pkey(i), i.clone()))
+            .collect();
+        let root = self.root_list.clone();
+        self.children_of.retain(|sender, _| {
+            root.iter().any(|r| {
+                pkey(r) == *sender
+                    || (r.size > sender.1
+                        && r.has([sender.0[0] * sender.1, sender.0[1] * sender.1]))
+            })
+        });
+        for kids in self.children_of.values() {
+            for k in kids {
+                if !root.iter().any(|r| r.contains(k)) {
+                    continue;
+                }
+                if best.get(&pkey(k)).is_none_or(|old| old.epoch < k.epoch) {
+                    best.insert(pkey(k), k.clone());
+                }
             }
         }
+        let mut list: Vec<proto::ProvinceInfo> = best.into_values().collect();
         list.sort_by_key(|i| (i.size, i.province));
-        list.dedup_by_key(|i| pkey(i));
         let gone: Vec<PKey> = self
             .provinces
             .iter()
@@ -575,6 +599,16 @@ impl BuildNet {
         self.from_province
             .as_ref()
             .is_none_or(|i| self.best(proto::region_of(chunk)).map(pkey) == Some(pkey(i)))
+    }
+
+    /// (v145) Les provinces (et pays) qui décident d'une région en vue de ce chunk.
+    fn needed(&self, chunk: [i32; 2]) -> HashSet<PKey> {
+        let lo = proto::region_of([chunk[0] - ROOT_VIEW, chunk[1] - ROOT_VIEW]);
+        let hi = proto::region_of([chunk[0] + ROOT_VIEW, chunk[1] + ROOT_VIEW]);
+        (lo[0]..=hi[0])
+            .flat_map(|x| (lo[1]..=hi[1]).map(move |z| [x, z]))
+            .filter_map(|r| self.best(r).map(pkey))
+            .collect()
     }
 
     /// (v143) Ce qui décide de la région `region` : la plus petite province (ou le plus
@@ -633,11 +667,14 @@ impl BuildNet {
             .as_ref()
             .and_then(|t| t.4.clone())
             .filter(|c| c.pseudo.eq_ignore_ascii_case(&self.pseudo));
+        // (v145) Seulement les relais qui décident de quelque chose en vue (un pays dont les
+        // provinces servent tout ce qu'on voit n'est pas joint).
+        let needed = self.needed(chunk);
         if self.province_retry <= 0.0 {
             self.province_retry = PROVINCE_RETRY;
             if let (Some(key), Some(cert)) = (self.identity.clone(), cert) {
                 for info in &self.province_list {
-                    if self.provinces.contains_key(&pkey(info)) {
+                    if self.provinces.contains_key(&pkey(info)) || !needed.contains(&pkey(info)) {
                         continue;
                     }
                     let client = crate::province_host::dial(info, self.shards.node_dir.clone());
@@ -663,6 +700,7 @@ impl BuildNet {
                             marked: std::collections::VecDeque::new(),
                             unmarked_items: Vec::new(),
                             marked_items: std::collections::VecDeque::new(),
+                            idle: 0.0,
                         },
                     );
                 }
@@ -762,7 +800,55 @@ impl BuildNet {
         for (p, list) in kids_lists {
             self.children_of.insert(p, list);
         }
+        // (v145) Ceux qui ne décident plus de rien en vue depuis un moment : quittés, s'il
+        // en reste des nouvelles par d'autres (la liste qu'ils donnaient est dite aussi par
+        // les provinces où l'on est entré).
+        for (k, c) in self.provinces.iter_mut() {
+            if needed.contains(k) {
+                c.idle = 0.0;
+            } else {
+                c.idle += dt;
+            }
+        }
+        let idle: Vec<PKey> = self
+            .provinces
+            .iter()
+            .filter(|(_, c)| c.idle > LEAVE_AFTER)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in idle {
+            let alone = self.children_of.get(&k).is_some_and(|list| {
+                list.iter().any(|e| {
+                    needed.contains(&pkey(e))
+                        && !self
+                            .children_of
+                            .iter()
+                            .any(|(s, l)| *s != k && l.iter().any(|x| pkey(x) == pkey(e)))
+                })
+            });
+            if alone {
+                continue;
+            }
+            if let Some(c) = self.provinces.remove(&k) {
+                log::debug!(
+                    "construction ({}) : province {:?} (taille {}) quittée, plus rien en vue",
+                    self.pseudo,
+                    k.0,
+                    k.1
+                );
+                shards_changed |= !c.shards.is_empty();
+                self.forget_shard(c.serial);
+                self.children_of.remove(&k);
+                lists_changed = true;
+            }
+        }
+        let root: Vec<PKey> = self.root_list.iter().map(pkey).collect();
         for p in broken {
+            // (v145) La liste d'une province tombée ne vaut plus rien (celle d'un pays reste
+            // jusqu'à ce que son relais de secours en redonne une, v144).
+            if !root.contains(&p) && self.children_of.remove(&p).is_some() {
+                lists_changed = true;
+            }
             if let Some(c) = self.provinces.remove(&p) {
                 shards_changed |= !c.shards.is_empty();
                 // Ce qu'elle a remis sans que le relais du monde l'ait gardé : en doute.
@@ -3906,12 +3992,19 @@ mod tests {
         // secours la sert (promu par le nouveau pays).
         let mut both: Option<u64> = None;
         let mut pays_copy: Vec<usize> = Vec::new();
+        let mut pays_positions: Vec<(usize, usize)> = Vec::new();
         // 10 secondes de jeu (12 en grand monde), la panne au milieu (une fois la province du
         // pays servie).
         let steps = match (big, fault) {
             (true, PaysFault::BothCrash) => 750,
             (true, _) => 600,
             _ => 500,
+        };
+        // (v145 : sans panne, un peu plus, pour voir les joueurs quitter le pays.)
+        let steps = if fault == PaysFault::None && !big {
+            560
+        } else {
+            steps
         };
         for step in 0..steps {
             let kids = h.pays_children();
@@ -3929,6 +4022,29 @@ mod tests {
                 _ => !kids.is_empty(),
             };
             // (Grand monde : une fois la province du pays passée chez son relais de secours.)
+            // (v145) Changements de chunk reçus par le pays, une fois ses deux régions confiées
+            // (au fond de ses provinces, les joueurs n'entrent plus chez lui).
+            // (Tous entrés dans les deux provinces du pays, et sortis du pays.)
+            let all_left = kids.len() == 2
+                && bots.iter().all(|b| {
+                    b.net.as_ref().is_some_and(|n| {
+                        let v = n.province_view();
+                        v.iter().filter(|v| v.1 == 1 && v.3).count() == 2
+                            && v.iter().any(|v| v.1 == 2 && !v.3)
+                    })
+                });
+            if fault == PaysFault::None
+                && ((all_left && pays_positions.is_empty()) || step + 1 == steps)
+            {
+                if let Some(n) = hosts.iter().find_map(|(_, g)| {
+                    g.province
+                        .as_ref()
+                        .filter(|p| !p.standby && !p.is_child())
+                        .map(|p| p.positions_seen())
+                }) {
+                    pays_positions.push((n, step));
+                }
+            }
             if big && (step == 300 || step == 400) {
                 if let Some(n) = hosts.iter().find_map(|(_, g)| {
                     g.province
@@ -4095,7 +4211,8 @@ mod tests {
              plus {kids_max}, relais de région rattachés {attached_max}, servi de nouveau \
              après {served_again:?}, province du pays de nouveau servie après {pays_back:?} \
              (rattachée et servie après {child_again:?}), copie du pays pour sa province \
-             {pays_copy:?}, promotions {}, envois archivés {}",
+             {pays_copy:?}, changements de chunk reçus par le pays {pays_positions:?}, \
+             promotions {}, envois archivés {}",
             h.province_promotions(),
             h.province_archives()
         );
@@ -4148,6 +4265,13 @@ mod tests {
                 t < Duration::from_secs(6),
                 "province de nouveau servie en moins de 6 s : {t:?}"
             );
+        }
+        // (v145) Ses deux régions confiées : le pays ne reçoit plus les changements de chunk
+        // de personne (tous au fond de ses provinces).
+        if let ([(a, s1), (b, s2)], 2) = (&pays_positions[..], kids_max) {
+            if s2 - s1 >= 30 {
+                assert_eq!(a, b, "le pays reçoit encore des changements de chunk");
+            }
         }
         // (v144) Grand monde : ce qui se construit dans la province du pays ne passe plus
         // par le pays (sa copie de la province ne grandit pas).
@@ -4771,7 +4895,13 @@ mod tests {
         let mut before_fault: Option<usize> = None;
         let mut fault_at: Option<Instant> = None;
         let mut edits_big = 0;
-        for step in 0..650 {
+        // (Jusqu'à un peu après la panne, même sur une machine chargée : la copie gardée
+        // ailleurs peut mettre plus ou moins longtemps à arriver.)
+        let mut fault_step: Option<usize> = None;
+        for step in 0..3000 {
+            if fault_step.is_some_and(|f| step >= f + 320) {
+                break;
+            }
             if big_at.is_none() && h.provinces_big() > 0 {
                 big_at = Some(step);
             }
@@ -4794,13 +4924,14 @@ mod tests {
                     p.kill();
                 }
                 fault_at = Some(Instant::now());
+                fault_step = Some(step);
             }
             for (i, b) in bots.iter_mut().enumerate() {
                 let r = rnd();
                 let x = b.pos.x + (r % 3) as f32 - 1.0;
                 b.pos.x = if i < 2 { west(x) } else { eastx(x) };
                 b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(1.0, 30.0);
-                if rnd() % 17 == 0 && step < 550 {
+                if rnd() % 17 == 0 && fault_step.is_none_or(|f| step < f + 220) {
                     let x = (b.pos.x as i32 - 12 + (rnd() % 25) as i32).clamp(29 * 16, 36 * 16 - 1);
                     let z = (rnd() % 32) as i32;
                     let y = 11 + (rnd() % 3) as i32;
