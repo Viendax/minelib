@@ -215,7 +215,8 @@ fn dl_rt_shadow(L: DynLight, p: vec3<f32>, n: vec3<f32>, noise: f32, frag: vec2<
     let t1 = normalize(cross(dir, up));
     let t2 = cross(dir, t1);
     let n2 = fract(52.9829189 * fract(0.00583715 * frag.x + 0.06711056 * frag.y) + noise * 0.618034);
-    let r = bulb * sqrt(noise);
+    // (Arrêt net seulement : vers le centre de l'ampoule, sans pénombre.)
+    let r = select(bulb * sqrt(noise), 0.0, L.shadow.z > 0.5);
     let a = 6.2831853 * n2;
     let aim = lp + (t1 * cos(a) + t2 * sin(a)) * r;
     let tv = aim - q;

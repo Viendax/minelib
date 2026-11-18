@@ -479,7 +479,7 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
                     t,
                     [-1.5 * k, -3.0 + 8.0 * k, -1.5 * k],
                     [1.5 * k, -3.0 + 13.0 * k, 1.5 * k],
-                    RayBoxKind::Glow(bright),
+                    RayBoxKind::Flame(bright),
                 ),
             ]
         }
@@ -594,6 +594,13 @@ pub(crate) fn emit_item(
             -1,
             false,
         ),
+        // Flamme animée (voir entity.wgsl) : `uv.y` = hauteur dans le bloc de la torche,
+        // comme celle de la première personne (de 8 à 13 seizièmes).
+        RayBoxKind::Flame(c) => (
+            srgb((c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32),
+            minelib_render::ENTITY_FLAME,
+            false,
+        ),
         _ => ([1.0; 3], -1, true),
     };
     let (a, b) = (Vec3::from(min), Vec3::from(max));
@@ -613,11 +620,16 @@ pub(crate) fn emit_item(
             xf.transform_point3(a + (b - a) * f)
         };
         let n = xf.transform_vector3(du.cross(dv)).normalize_or_zero();
-        let shade = (0.78 + 0.22 * n.y + 0.06 * n.x).clamp(0.45, 1.0);
+        let flame = layer == minelib_render::ENTITY_FLAME;
+        // Flamme : sans ombrage de face, comme à la première personne.
+        let shade = if flame { 1.0 } else { face_shade(n) };
         let col = [0, 1, 2].map(|i| color[i] * shade);
-        // Lumineux par lui-même (flamme) : ni l'éclairage du lieu, ni les lumières.
+        // Lumineux par lui-même (flamme) : ni l'éclairage du lieu, ni les lumières. La
+        // flamme animée garde sa pleine couleur (×1, comme à la première personne).
         let vl = if lit {
             EntityVertex::light(light, true)
+        } else if flame {
+            EntityVertex::light([1.0; 3], false)
         } else {
             EntityVertex::light([0.5; 3], false)
         };
@@ -629,13 +641,19 @@ pub(crate) fn emit_item(
             (0.0, 1.0),
             (0.0, 0.0),
         ] {
+            let uv = if flame {
+                let f = o + du * u + dv * v;
+                [f.x, 0.5 + 0.3125 * f.y]
+            } else {
+                [
+                    rect[0] + (rect[2] - rect[0]) * u,
+                    rect[1] + (rect[3] - rect[1]) * v,
+                ]
+            };
             out.push(EntityVertex {
                 pos: p(u, v).to_array(),
                 color: col,
-                uv: [
-                    rect[0] + (rect[2] - rect[0]) * u,
-                    rect[1] + (rect[3] - rect[1]) * v,
-                ],
+                uv,
                 layer,
                 light: vl,
             });

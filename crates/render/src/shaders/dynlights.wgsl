@@ -23,7 +23,8 @@ struct DynLight {
     // x = couche du gobo (-1 : aucun), y = rotation (rad), z = échelle, w = 1 si inversé.
     cookie: vec4<f32>,
     // x = carte d'ombre (0 aucune, 1 projecteur, 2 cube de 6 cases), y = tangente du
-    // demi-angle de la carte (1 pour un cube).
+    // demi-angle de la carte (1 pour un cube), z = 1 : arrêt net par les murs seulement
+    // (ombres douces décochées).
     shadow: vec4<f32>,
     // x, y = boîtes des joueurs à portée (bits 0..63) : leurs ombres.
     boxes: vec4<u32>,
@@ -260,7 +261,7 @@ fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, s
     }
     let eps = 2e-4;
     let bulb = select(dh.sh.x, L.cone.w, L.cone.w > 0.0);
-    if bulb < 0.01 || !soft {
+    if bulb < 0.01 || !soft || L.shadow.z > 0.5 {
         return textureSampleCompareLevel(shadow_atlas, shadow_cmp, center.xy, dist / range - eps);
     }
     // Repère autour de la direction centrale (échantillons en angle autour d'elle).

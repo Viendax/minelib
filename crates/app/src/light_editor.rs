@@ -2205,6 +2205,10 @@ impl Editor {
                     DIM,
                 );
                 self.check(p, "Ombres des blocs", &mut r.block_shadows);
+                p.note(
+                    "Les murs arrêtent toujours la lumière ; décochées, les ombres des blocs sont nettes et bien moins coûteuses.",
+                    DIM,
+                );
                 self.check(p, "Ombres des joueurs", &mut r.entity_shadows);
                 self.check(p, "Cache des ombres", &mut r.shadow_cache);
                 self.check(p, "Ombres par lancer de rayons (essai)", &mut r.rt_shadows);
@@ -2212,12 +2216,7 @@ impl Editor {
                     "Un rayon par pixel dans la grille de blocs au lieu des cartes d'ombre ; comparer les FPS dans le journal.",
                     DIM,
                 );
-                if r.rt_shadows && !r.block_shadows {
-                    p.note(
-                        "Les rayons ne changent que les ombres des blocs : coche aussi « Ombres des blocs ».",
-                        FILL,
-                    );
-                }
+
                 if let Some(v) = self.slider(
                     p,
                     220,

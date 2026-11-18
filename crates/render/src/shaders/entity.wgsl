@@ -44,6 +44,15 @@ struct VOut {
 /// Couleur du pixel sans l'éclairage : couleur du sommet, texturée pour un bloc tenu
 /// (pixels transparents jetés).
 fn texel(i: VOut) -> vec3<f32> {
+    // Flamme d'une torche tenue (couche −2) : la même animation que la torche à la
+    // première personne (viewmodel.wgsl) ; uv.y = hauteur dans le bloc de la torche.
+    if i.layer == -2 {
+        let y = i.uv.y;
+        let c = i.color;
+        let wobble = 0.85 + 0.15 * sin(g.cam_pos.w * 11.0 + y * 20.0);
+        let core = clamp(1.0 - (y - 0.5) * 3.2, 0.0, 1.0);
+        return c * 1.3 * wobble + c * core * 0.5 + vec3<f32>(0.25, 0.22, 0.18) * core;
+    }
     if i.layer < 0 {
         return i.color;
     }

@@ -1385,9 +1385,10 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
         if dot(c - o, c - o) > 576.0 {
             continue;
         }
-        // Le point est dans la boîte (pieds du joueur) : pas d'ombre sur lui-même. Des
-        // blocs cachent la boîte du soleil : elle n'en fait pas d'ombre.
-        if (all(o > mn) && all(o < mx)) || fract(g.shadow_min[k].w) > 0.25 {
+        // Des blocs cachent la boîte du soleil : elle n'en fait pas d'ombre. (Un point du
+        // monde dans la boîte, le sol sous les pieds posés, est dans son ombre : pas de trou
+        // clair à la place des pieds.)
+        if fract(g.shadow_min[k].w) > 0.25 {
             continue;
         }
         let t0 = (mn - o) * inv;
@@ -1418,7 +1419,9 @@ fn torch_shadow(p: vec3<f32>) -> vec4<f32> {
         let mn = g.shadow_min[k].xyz;
         let mx = g.shadow_max[k].xyz;
         let m = (mn + mx) * 0.5 - p;
-        if j == -1 || dot(m, m) > 36.0 || (all(p > mn) && all(p < mx)) {
+        // (Un point du monde dans la boîte, le sol sous les pieds posés, est dans son
+        // ombre : pas de trou clair à la place des pieds.)
+        if j == -1 || dot(m, m) > 36.0 {
             continue;
         }
         let held = j == -2;

@@ -17,11 +17,17 @@ pub struct EntityVertex {
     pub pos: [f32; 3],
     pub color: [f32; 3],
     pub uv: [f32; 2],
+    /// Couche du tableau de textures des blocs ; −1 : couleur unie ; `FLAME` : flamme animée
+    /// (`uv.y` = hauteur dans le bloc de la torche, couleur = celle de la flamme).
     pub layer: i32,
     /// Éclairage du lieu (rgb, 0..2 ramené à 0..255, voir `EntityVertex::light`) ; a = 255 :
     /// éclairé aussi par les lumières dynamiques, 0 : lumineux par lui-même (flamme).
     pub light: [u8; 4],
 }
+
+/// Couche « flamme » d'un sommet d'entité (torche tenue, vue en F5) : animée comme la
+/// flamme de la torche à la première personne (viewmodel.wgsl) et des torches posées.
+pub const FLAME: i32 = -2;
 
 impl EntityVertex {
     /// Éclairage du lieu (0..2 par canal) au format du sommet ; `dynamic` : reçoit aussi la

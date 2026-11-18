@@ -31,7 +31,7 @@ pub mod viewmodel;
 
 pub use capture::Screenshot;
 
-pub use entity::EntityVertex;
+pub use entity::{EntityVertex, FLAME as ENTITY_FLAME};
 pub use latency::{LowLatencyKind, Marker};
 pub use lights::{
     bounding_sphere, DynKind, DynLight, DynSettings, DynState, DynStats, GoboImage, GOBO_SIZE,
@@ -351,6 +351,9 @@ pub enum RayBoxKind {
     /// Lumineux (flamme d'une torche, bâton éclairé par elle) : couleur finale, sans
     /// l'éclairage du lieu.
     Glow([u8; 3]),
+    /// Flamme d'une torche tenue (couleur de la flamme, sRGB) : comme `Glow` dans les
+    /// reflets ; sur le modèle, animée comme la torche à la première personne.
+    Flame([u8; 3]),
 }
 
 /// Pavé du modèle du joueur pour les reflets : `world_to_local` ramène un point du monde
@@ -400,7 +403,7 @@ fn ray_globals(boxes: &[RayBox], light: [f32; 3]) -> RayGlobals {
                 5.0,
                 (c[0] as u32 * 65536 + c[1] as u32 * 256 + c[2] as u32) as f32,
             ),
-            RayBoxKind::Glow(c) => (
+            RayBoxKind::Glow(c) | RayBoxKind::Flame(c) => (
                 6.0,
                 (c[0] as u32 * 65536 + c[1] as u32 * 256 + c[2] as u32) as f32,
             ),

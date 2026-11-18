@@ -507,6 +507,7 @@ fn pack_light(
     boxes: u64,
     rect: [f32; 3],
     box_sphere: [f32; 4],
+    soft: bool,
 ) -> GpuLight {
     let spot = l.kind == DynKind::Spot;
     let outer = l.outer_deg.clamp(1.0, 179.0);
@@ -554,7 +555,7 @@ fn pack_light(
             ],
             _ => [-1.0, 0.0, 1.0, 0.0],
         },
-        shadow: [sk, tan_half, 0.0, 0.0],
+        shadow: [sk, tan_half, if soft { 0.0 } else { 1.0 }, 0.0],
         boxes: [boxes as u32, (boxes >> 32) as u32, 0, 0],
         right: {
             let (r, _, _) = spot_basis(d);
@@ -1801,9 +1802,8 @@ impl DynGpu {
 
     /// Une lumière demande-t-elle des ombres des blocs (il faut alors la grille de blocs) ?
     pub fn wants_voxels(&self) -> bool {
-        self.settings.shadows
-            && self.settings.block_shadows
-            && self.lights.iter().any(|l| l.shadows)
+        // Les murs arrêtent toujours la lumière (cartes calculées dans la grille).
+        !self.lights.is_empty()
     }
 
     /// Nouvelle grille de blocs : les cartes des lumières près des blocs qui ont changé sont
@@ -1842,8 +1842,11 @@ impl DynGpu {
         self.frame += 1;
         let frame = self.frame;
         let st = self.settings;
-        let block_maps = st.shadows && st.block_shadows && voxels.is_some();
-        if block_maps && self.lights.iter().any(|l| l.shadows) {
+        // Comme pour les torches du jeu, les murs arrêtent toujours la lumière : une carte
+        // pour chaque lumière dès que la grille de blocs est là. Les réglages d'ombre ne
+        // décident que de leur douceur (ombres douces, ou simple arrêt net, bien moins cher).
+        let block_maps = voxels.is_some();
+        if block_maps && !self.lights.is_empty() {
             self.ensure_atlas(device, st.shadow_quality);
         }
         let block_maps = block_maps && self.quality != u8::MAX;
@@ -1857,9 +1860,6 @@ impl DynGpu {
                 self.cache.invalidate_all();
             }
             for (i, l) in self.lights.iter().enumerate() {
-                if !l.shadows {
-                    continue;
-                }
                 match self.cache.request(l, frame) {
                     Some(s) => {
                         if !s.baked {
@@ -1925,7 +1925,7 @@ impl DynGpu {
         // calculée à cette image).
         let mut shadowed = 0;
         for (i, l) in self.lights.iter().enumerate() {
-            if !block_maps || !l.shadows {
+            if !block_maps {
                 continue;
             }
             if let Some(s) = self.cache.slots.get(&l.id) {
@@ -1956,8 +1956,11 @@ impl DynGpu {
                 [col as f32 * tile_uv, row as f32 * tile_uv, tile_uv]
             });
             let sphere = boxes_sphere(&boxes[..nboxes], mask);
+            // Ombres douces des blocs : réglage général, ombres des blocs, et celles de la
+            // lumière ; sinon arrêt net par les murs.
+            let soft = st.shadows && st.block_shadows && l.shadows;
             self.gpu_lights
-                .push(pack_light(l, tiles_of[i], mask, rect, sphere));
+                .push(pack_light(l, tiles_of[i], mask, rect, sphere, soft));
         }
         bin_tiles(&self.lights, view_proj, eye, &mut self.tiles);
         lit_rects(&self.tiles, &mut self.rects);
@@ -1969,7 +1972,8 @@ impl DynGpu {
                 .iter()
                 .any(|l| l.beam > 0.0 && l.intensity > 0.0);
         let mut flags = 0;
-        if st.vl_shadows {
+        // Les rayons s'arrêtent aussi aux murs (tous les `vl_shadow_stride` pas).
+        if block_maps || st.vl_shadows {
             flags |= F_VL_SHADOWS;
         }
         if st.vl_noise {
@@ -1978,7 +1982,7 @@ impl DynGpu {
         if st.vl_dither_temporal {
             flags |= F_DITHER;
         }
-        if st.shadows {
+        if block_maps || st.shadows {
             flags |= F_SHADOWS;
         }
         if st.toon {
@@ -1993,8 +1997,8 @@ impl DynGpu {
         if box_shadows {
             flags |= F_BOX_SHADOWS;
         }
-        // Les rayons remplacent les cartes pour les ombres des blocs : sans elles, rien.
-        self.rt_on = st.shadows && st.block_shadows && st.rt_shadows && voxels.is_some();
+        // Les rayons remplacent les cartes pour l'arrêt par les blocs.
+        self.rt_on = st.rt_shadows && voxels.is_some();
         if self.rt_on {
             flags |= F_RT_SHADOWS;
         }
@@ -2665,7 +2669,10 @@ mod tests {
             0b101,
             [0.25, 0.5, 0.0625],
             [1.0, 2.0, 3.0, 4.0],
+            false,
         );
+        // Ombres douces décochées : arrêt net par les murs.
+        assert_eq!(g.shadow[2], 1.0);
         assert_eq!(g.dir_type, [0.0, 0.0, -1.0, 1.0]);
         assert!((g.cone[0] - 30f32.to_radians().cos()).abs() < 1e-6);
         assert!((g.cone[1] - g.cone[0]).abs() < 1e-6);
@@ -2693,8 +2700,10 @@ mod tests {
             0,
             [0.0; 3],
             [0.0, 0.0, 0.0, -1.0],
+            true,
         );
         assert_eq!(p.cookie[0], -1.0);
+        assert_eq!(p.shadow[2], 0.0);
         assert_eq!((p.shadow[0], p.vol[3]), (0.0, -1.0));
         assert_eq!(p.dir_type[3], 0.0);
     }
