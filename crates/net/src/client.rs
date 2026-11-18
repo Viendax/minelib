@@ -88,6 +88,10 @@ pub enum Cmd {
         pseudo: String,
         signer: [u8; 32],
         token: [u8; 32],
+        /// (v144) Où joindre le relais de secours lui-même.
+        node: [u8; 32],
+        addr: String,
+        key: [u8; 32],
     },
     /// (v143) Hôte d'une province d'un pays (ou de son relais de secours) : entre chez le
     /// relais du pays avec le jeton du relais du monde (voir `proto::child_token`).
@@ -835,7 +839,9 @@ impl Worker {
             | Response::ProvinceSettings { .. }
             | Response::ProvinceBagLent { .. }
             | Response::ProvinceBagRecall { .. }
-            | Response::ProvinceBulk { .. }) => Event::Province(r),
+            | Response::ProvinceBulk { .. }
+            | Response::ProvinceChildren { .. }
+            | Response::ProvinceParent { .. }) => Event::Province(r),
             Response::Provinces { list } => Event::Provinces(list),
             Response::ShardPeers { region, list, sov } => Event::ShardPeers { region, list, sov },
             Response::RootEdits {
@@ -1189,6 +1195,9 @@ impl Worker {
                 pseudo,
                 signer,
                 token,
+                node,
+                addr,
+                key,
             } => {
                 self.chan = None;
                 self.connect()?;
@@ -1199,6 +1208,9 @@ impl Worker {
                     pseudo,
                     signer,
                     token,
+                    node,
+                    addr,
+                    key,
                 })? {
                     Response::Welcome { pseudo, .. } => {
                         self.pseudo = pseudo;

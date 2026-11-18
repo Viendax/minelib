@@ -170,8 +170,6 @@ struct ProvinceConn {
     /// rien donné, rien pris : le relais du monde la reprend telle qu'il l'a gardée).
     unmarked_items: Vec<BuildMsg>,
     marked_items: std::collections::VecDeque<(u64, Vec<BuildMsg>)>,
-    /// (v143) Relais de pays : les provinces qu'il confie lui-même, en vue (sa liste).
-    children: Vec<proto::ProvinceInfo>,
 }
 
 /// (v143) Une province (ou un pays) : ses coordonnées et sa taille (régions par côté).
@@ -273,6 +271,9 @@ pub struct BuildNet {
     /// (v143) Liste du relais du monde (provinces ou pays) ; `province_list` y ajoute celles
     /// des relais de pays où l'on est entré.
     root_list: Vec<proto::ProvinceInfo>,
+    /// (v144) Dernière liste de chaque pays (gardée quand son relais tombe : ses provinces
+    /// continuent, rattachées au relais de secours du pays).
+    children_of: HashMap<PKey, Vec<proto::ProvinceInfo>>,
     shards_root: Vec<proto::ShardInfo>,
     from_province: Option<proto::ProvinceInfo>,
     province_retry: f32,
@@ -459,6 +460,7 @@ impl BuildNet {
             province_list: Vec::new(),
             provinces: HashMap::new(),
             root_list: Vec::new(),
+            children_of: HashMap::new(),
             shards_root: Vec::new(),
             from_province: None,
             province_retry: 0.0,
@@ -514,9 +516,13 @@ impl BuildNet {
     /// province qui n'y est plus repart à qui en décide maintenant.
     fn merge_provinces(&mut self) {
         let mut list = self.root_list.clone();
-        for c in self.provinces.values().filter(|c| c.joined) {
-            if list.iter().any(|i| pkey(i) == pkey(&c.info)) {
-                list.extend(c.children.iter().filter(|k| c.info.contains(k)).cloned());
+        // (v144) Les provinces de chaque pays du relais du monde, d'après sa dernière liste
+        // (même si son relais vient de tomber).
+        let root: Vec<PKey> = self.root_list.iter().map(pkey).collect();
+        self.children_of.retain(|k, _| root.contains(k));
+        for i in &self.root_list {
+            if let Some(kids) = self.children_of.get(&pkey(i)) {
+                list.extend(kids.iter().filter(|k| i.contains(k)).cloned());
             }
         }
         list.sort_by_key(|i| (i.size, i.province));
@@ -657,7 +663,6 @@ impl BuildNet {
                             marked: std::collections::VecDeque::new(),
                             unmarked_items: Vec::new(),
                             marked_items: std::collections::VecDeque::new(),
-                            children: Vec::new(),
                         },
                     );
                 }
@@ -671,6 +676,7 @@ impl BuildNet {
         let mut items_ok = Vec::new();
         let mut voice = Vec::new();
         let mut lists_changed = false;
+        let mut kids_lists = Vec::new();
         for (p, c) in &mut self.provinces {
             while let Some(e) = c.client.poll() {
                 match e {
@@ -709,7 +715,7 @@ impl BuildNet {
                     }
                     // (v143) Relais de pays : les provinces qu'il confie, en vue.
                     Event::Provinces(list) => {
-                        c.children = list;
+                        kids_lists.push((*p, list));
                         lists_changed = true;
                     }
                     Event::FromZone { chunk, data, .. } => received.push((*p, chunk, data)),
@@ -753,10 +759,12 @@ impl BuildNet {
                 }
             }
         }
+        for (p, list) in kids_lists {
+            self.children_of.insert(p, list);
+        }
         for p in broken {
             if let Some(c) = self.provinces.remove(&p) {
                 shards_changed |= !c.shards.is_empty();
-                lists_changed |= !c.children.is_empty();
                 // Ce qu'elle a remis sans que le relais du monde l'ait gardé : en doute.
                 self.forget_shard(c.serial);
             }
@@ -816,6 +824,7 @@ impl BuildNet {
         // (Le relais repris sert tout lui-même : plus de provinces.)
         self.province_list.clear();
         self.root_list.clear();
+        self.children_of.clear();
         self.provinces.clear();
         self.was_deep = false;
         self.root_province = None;
@@ -3846,9 +3855,12 @@ mod tests {
         /// secours.
         ChildCrash,
         /// L'hôte du pays tombe : le relais du monde donne sa place au relais de secours du
-        /// pays ; les provinces du pays s'arrêtent à la fin de leur bail, et il les confie de
-        /// nouveau.
+        /// pays ; (v144) les provinces du pays s'arrêtent de servir à la fin de leur bail, puis
+        /// se rattachent à lui.
         PaysCrash,
+        /// (v144) L'hôte du pays et celui de sa province de l'est tombent ensemble : le relais
+        /// de secours de la province se rattache au nouveau pays, qui lui donne sa place.
+        BothCrash,
     }
 
     /// Pays de bout en bout (v143) : le relais du monde confie un pays (2 × 2 régions) au
@@ -3858,10 +3870,16 @@ mod tests {
     /// de l'une à l'autre. À la fin, les mondes sont identiques case par case à celui du
     /// propriétaire (qui reçoit tout du relais du monde), rien n'est en attente, quoi qu'il
     /// arrive à l'hôte de la province ou du pays ; et le relais est remplacé en moins de 3 s.
-    fn pays_world(fault: PaysFault, regions: bool) {
+    /// `big` (v144) : grand monde (la règle est abaissée à 0 joueur) : le pays garde sa copie
+    /// chez son relais de secours, et ses provinces chez les leurs ; le relais du monde n'a
+    /// plus tout, on compare alors les mondes des joueurs entre eux.
+    fn pays_world(fault: PaysFault, regions: bool, big: bool) {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (dir, h, mut hosts, mut bots, _room) =
+        let (dir, h, mut hosts, mut bots, room) =
             province_setup_full(false, 2, if regions { 3 } else { 100 }, 8, Some((1, 3)));
+        if big {
+            h.set_copies_until(0);
+        }
         let west = |x: f32| x.clamp(488.0, 508.0);
         let east = |x: f32| x.clamp(516.0, 540.0);
         let mut seed = 991u32;
@@ -3878,8 +3896,24 @@ mod tests {
         let mut fault_at: Option<(Instant, u64)> = None;
         let mut served_again: Option<Duration> = None;
         let mut pays_back: Option<Duration> = None;
-        // 10 secondes de jeu, la panne au milieu (une fois la province du pays servie).
-        for step in 0..500 {
+        // (v144) Le pays tombe : l'hôte de sa province de l'est (qui doit rester le même, et
+        // servir de nouveau), son époque ; ce que le pays garde de cette province pendant
+        // qu'on y construit (grand monde : rien de plus).
+        let mut kept: Option<(String, u64)> = None;
+        let mut child_paused = false;
+        let mut child_again: Option<Duration> = None;
+        // (v144) Les deux ensemble : époque de la province tombée, et quand son relais de
+        // secours la sert (promu par le nouveau pays).
+        let mut both: Option<u64> = None;
+        let mut pays_copy: Vec<usize> = Vec::new();
+        // 10 secondes de jeu (12 en grand monde), la panne au milieu (une fois la province du
+        // pays servie).
+        let steps = match (big, fault) {
+            (true, PaysFault::BothCrash) => 750,
+            (true, _) => 600,
+            _ => 500,
+        };
+        for step in 0..steps {
             let kids = h.pays_children();
             kids_max = kids_max.max(kids.len());
             // (La province du pays tombe une fois son relais de secours prêt.)
@@ -3889,11 +3923,48 @@ mod tests {
                     .is_some_and(|p| p.is_child() && p.standby_ready() && p.province == [1, 0])
             });
             let due = match fault {
-                PaysFault::ChildCrash => standby_ready && kids.iter().any(|i| i.province == [1, 0]),
+                PaysFault::ChildCrash | PaysFault::BothCrash => {
+                    standby_ready && kids.iter().any(|i| i.province == [1, 0])
+                }
                 _ => !kids.is_empty(),
             };
-            if fault != PaysFault::None && fault_at.is_none() && step >= 250 && due {
+            // (Grand monde : une fois la province du pays passée chez son relais de secours.)
+            if big && (step == 300 || step == 400) {
+                if let Some(n) = hosts.iter().find_map(|(_, g)| {
+                    g.province
+                        .as_ref()
+                        .filter(|p| !p.standby && !p.is_child())
+                        .map(|p| p.entries_of([1, 0]))
+                }) {
+                    pays_copy.push(n);
+                }
+            }
+            let fault_step = if big { 410 } else { 250 };
+            if fault != PaysFault::None && fault_at.is_none() && step >= fault_step && due {
                 let child = fault == PaysFault::ChildCrash;
+                if fault == PaysFault::PaysCrash {
+                    kept = hosts.iter().find_map(|(_, g)| {
+                        g.province
+                            .as_ref()
+                            .filter(|p| !p.standby && p.is_child() && p.province == [1, 0])
+                            .map(|p| (g.name.clone(), p.epoch))
+                    });
+                }
+                // (Les deux ensemble : d'abord l'hôte de la province.)
+                if fault == PaysFault::BothCrash {
+                    if let Some(p) = hosts
+                        .iter_mut()
+                        .map(|(_, g)| g)
+                        .find(|g| {
+                            g.province
+                                .as_ref()
+                                .is_some_and(|p| !p.standby && p.is_child() && p.province == [1, 0])
+                        })
+                        .and_then(|g| g.province.take())
+                    {
+                        p.kill();
+                    }
+                }
                 let g = hosts
                     .iter_mut()
                     .map(|(_, g)| g)
@@ -3913,6 +3984,9 @@ mod tests {
                 } else {
                     h.province_promotions() as u64
                 };
+                if fault == PaysFault::BothCrash {
+                    both = kids.iter().find(|i| i.province == [1, 0]).map(|i| i.epoch);
+                }
                 fault_at = Some((Instant::now(), mark));
             }
             if let (Some((t, mark)), None) = (fault_at, served_again) {
@@ -3929,12 +4003,35 @@ mod tests {
                     served_again = Some(t.elapsed());
                 }
             }
-            // (Le pays repris confie de nouveau sa province peuplée.)
+            // (Le pays repris : sa province peuplée de nouveau servie.)
             if let (Some((t, _)), Some(_), None, PaysFault::PaysCrash) =
                 (fault_at, served_again, pays_back, fault)
             {
                 if !kids.is_empty() {
                     pays_back = Some(t.elapsed());
+                }
+            }
+            if let (Some((t, _)), Some(old), None) = (fault_at, both, child_again) {
+                if h.province_promotions() > 0
+                    && kids.iter().any(|i| i.province == [1, 0] && i.epoch != old)
+                {
+                    child_again = Some(t.elapsed());
+                }
+            }
+            // (v144) La province du pays tombé, rattachée au relais de secours du pays, sert
+            // de nouveau (sans avoir changé d'hôte).
+            if let (Some((t, _)), Some((name, _)), None) = (fault_at, &kept, child_again) {
+                let serving = hosts.iter().any(|(_, g)| {
+                    &g.name == name
+                        && g.province
+                            .as_ref()
+                            .is_some_and(|p| p.province == [1, 0] && p.serving())
+                });
+                // (Son bail finit avant celui du pays : elle s'arrête d'abord de servir.)
+                if !serving {
+                    child_paused = true;
+                } else if child_paused {
+                    child_again = Some(t.elapsed());
                 }
             }
             for (i, b) in bots.iter_mut().enumerate() {
@@ -3994,13 +4091,22 @@ mod tests {
             );
         }
         eprintln!(
-            "pays : {fault:?}, relais de région {regions}, provinces du pays au plus {kids_max}, \
-             relais de région rattachés {attached_max}, servi de nouveau après \
-             {served_again:?}, province du pays de nouveau confiée après {pays_back:?}, \
-             promotions {}, envois archivés {}",
+            "pays : {fault:?}, relais de région {regions}, grand {big}, provinces du pays au \
+             plus {kids_max}, relais de région rattachés {attached_max}, servi de nouveau \
+             après {served_again:?}, province du pays de nouveau servie après {pays_back:?} \
+             (rattachée et servie après {child_again:?}), copie du pays pour sa province \
+             {pays_copy:?}, promotions {}, envois archivés {}",
             h.province_promotions(),
             h.province_archives()
         );
+        eprintln!(
+            "provinces des pays (relais du monde) : {:?}",
+            h.pays_children()
+                .iter()
+                .map(|i| (i.province, i.epoch))
+                .collect::<Vec<_>>()
+        );
+        let _ = room;
         assert!(kids_max >= 1, "le pays a confié sa province peuplée");
         assert!(
             edited.len() > 50,
@@ -4017,6 +4123,40 @@ mod tests {
                 "de nouveau servi en moins de 3 s : {t:?}"
             );
         }
+        // (v144) Le pays tombé : sa province ne s'est pas arrêtée, elle s'est rattachée au
+        // relais de secours du pays (même hôte, même époque), et sert de nouveau à temps.
+        if let Some((name, epoch)) = &kept {
+            let t = child_again.expect("la province du pays sert de nouveau");
+            assert!(
+                t < Duration::from_secs(3),
+                "province du pays de nouveau servie en moins de 3 s : {t:?}"
+            );
+            let g = hosts.iter().find(|(_, g)| &g.name == name).expect("hôte");
+            assert!(
+                g.1.province
+                    .as_ref()
+                    .is_some_and(|p| p.epoch == *epoch && !p.stopped),
+                "la province du pays a gardé son hôte et son époque"
+            );
+        }
+        // (v144) Le pays et sa province tombés ensemble : le relais de secours de la province
+        // s'est rattaché au nouveau pays, qui lui a donné sa place (plus de 3 s : deux relais
+        // sont tombés, mais rien n'est perdu).
+        if fault == PaysFault::BothCrash {
+            let t = child_again.expect("la province du pays servie par son relais de secours");
+            assert!(
+                t < Duration::from_secs(6),
+                "province de nouveau servie en moins de 6 s : {t:?}"
+            );
+        }
+        // (v144) Grand monde : ce qui se construit dans la province du pays ne passe plus
+        // par le pays (sa copie de la province ne grandit pas).
+        if big && pays_copy.len() == 2 {
+            assert_eq!(
+                pays_copy[0], pays_copy[1],
+                "la copie du pays pour sa province ne grandit pas"
+            );
+        }
         for b in &bots {
             assert_eq!(
                 b.net.as_ref().unwrap().pending(),
@@ -4026,8 +4166,10 @@ mod tests {
             );
         }
         let mut differ = Vec::new();
-        let owner = &bots[0];
-        for b in &bots[1..] {
+        // (Grand monde : le relais du monde n'a pas tout, le propriétaire non plus.)
+        let reference = if big { 1 } else { 0 };
+        let owner = &bots[reference];
+        for b in bots.iter().skip(1).filter(|b| b.name != owner.name) {
             for p in &edited {
                 for y in 11..14 {
                     let q = [p[0], y, p[2]];
@@ -4065,22 +4207,37 @@ mod tests {
 
     #[test]
     fn a_crowded_region_of_a_pays_gets_its_own_relay_from_the_pays() {
-        pays_world(PaysFault::None, false);
+        pays_world(PaysFault::None, false, false);
     }
 
     #[test]
     fn region_relays_inside_a_pays_province_attach_to_it() {
-        pays_world(PaysFault::None, true);
+        pays_world(PaysFault::None, true, false);
     }
 
     #[test]
     fn a_pays_province_whose_host_falls_is_served_again_by_its_standby() {
-        pays_world(PaysFault::ChildCrash, false);
+        pays_world(PaysFault::ChildCrash, false, false);
     }
 
     #[test]
-    fn a_pays_whose_host_falls_is_served_again_by_its_standby() {
-        pays_world(PaysFault::PaysCrash, false);
+    fn a_pays_whose_host_falls_keeps_its_provinces() {
+        pays_world(PaysFault::PaysCrash, false, false);
+    }
+
+    #[test]
+    fn a_big_pays_keeps_province_copies_at_their_standbys() {
+        pays_world(PaysFault::None, false, true);
+    }
+
+    #[test]
+    fn a_big_pays_whose_host_falls_loses_nothing() {
+        pays_world(PaysFault::PaysCrash, false, true);
+    }
+
+    #[test]
+    fn a_big_pays_and_its_province_falling_together_lose_nothing() {
+        pays_world(PaysFault::BothCrash, false, true);
     }
 
     /// Objets et sacs de survie dans les provinces (v139), de bout en bout : la province

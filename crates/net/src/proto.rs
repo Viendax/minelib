@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 42;
+pub const PROTOCOL: u32 = 43;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -499,6 +499,11 @@ pub enum Request {
         pseudo: String,
         signer: [u8; 32],
         token: [u8; 32],
+        /// (v144) Où joindre son propre relais (les provinces d'un pays s'y rattacheront s'il
+        /// prend la place du pays).
+        node: [u8; 32],
+        addr: String,
+        key: [u8; 32],
     },
     /// (v143) Hôte d'une province d'un pays (ou de son relais de secours) → relais du pays :
     /// il entre, avec le jeton que le relais du monde lui a donné avec sa tâche (voir
@@ -1033,6 +1038,25 @@ pub enum Response {
         entries: Vec<([i32; 2], u64, Vec<u8>)>,
         bags: Vec<BagCopy>,
         held: Vec<String>,
+        /// (v144) Positions de retour de ses joueurs (toutes, de temps en temps).
+        spots: Vec<(String, [f32; 5])>,
+    },
+    /// (v144) Relais d'un pays → son relais de secours : ses provinces (pour qu'elles se
+    /// rattachent à lui s'il prend la place du pays).
+    ProvinceChildren {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        children: Vec<ChildCopy>,
+    },
+    /// (v144) Relais d'un pays → hôte d'une de ses provinces (ou de son relais de secours) :
+    /// où est le relais de secours du pays ; s'il prend la place du pays, la province s'y
+    /// rattache (même jeton) au lieu de s'arrêter.
+    ProvinceParent {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        standby: Option<ProvinceInfo>,
     },
     /// (v141) Relais du monde → hôte du relais de secours d'une province (époque `old`) :
     /// le relais de la province ne répond plus ; ce relais prend sa place (époque `epoch`).
@@ -1328,6 +1352,8 @@ impl Response {
                 | Response::ProvinceBagLent { .. }
                 | Response::ProvinceBagRecall { .. }
                 | Response::ProvinceBulk { .. }
+                | Response::ProvinceChildren { .. }
+                | Response::ProvinceParent { .. }
                 // (Relais de secours et gardiens, v133 à v135 : poussés eux aussi ; une
                 // requête en cours ne doit pas les prendre pour sa réponse.)
                 | Response::StandbyTask { .. }
@@ -1477,6 +1503,22 @@ impl ProvinceInfo {
 pub struct Nest {
     pub size: i32,
     pub from: u32,
+}
+
+/// (v144) Ce que le relais de secours d'un pays doit savoir de chacune de ses provinces pour
+/// la reprendre avec son hôte : où la joindre (servie) et à quelle époque, qui la tient, qui
+/// tient son relais de secours, si sa copie est chez lui, quels sacs de survie elle tient.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ChildCopy {
+    pub province: [i32; 2],
+    pub epoch: u64,
+    pub info: Option<ProvinceInfo>,
+    pub host: String,
+    pub standby: Option<String>,
+    pub big: bool,
+    pub bags: Vec<String>,
+    /// Dernière demande de tout renvoyer qu'elle a reçue (la suivante sera plus grande).
+    pub dump_n: u64,
 }
 
 /// (v143) Relais de pays → relais du monde : il lui faut un hôte pour sa province `province`

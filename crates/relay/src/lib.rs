@@ -235,6 +235,7 @@ impl Handle {
 
     /// Relais de secours d'une province (v141) : un envoi gardé par le relais du monde ;
     /// renvoie jusqu'où la copie est à jour.
+    #[allow(clippy::too_many_arguments)]
     pub fn province_copy(
         &self,
         epoch: u64,
@@ -242,6 +243,7 @@ impl Handle {
         entries: Vec<([i32; 2], u64, Vec<u8>)>,
         bags: Vec<proto::BagCopy>,
         held: Vec<String>,
+        spots: Vec<(String, [f32; 5])>,
     ) -> Option<u64> {
         provinces::copy(
             &mut self.state.lock().unwrap(),
@@ -250,7 +252,31 @@ impl Handle {
             entries,
             bags,
             held,
+            spots,
         )
+    }
+
+    /// (v144) Relais de secours d'un pays : ce que le pays sait de ses provinces.
+    pub fn province_children(&self, epoch: u64, list: Vec<proto::ChildCopy>) {
+        provinces::children_here(&mut self.state.lock().unwrap(), epoch, list);
+    }
+
+    /// (v144) Relais d'un pays : ses provinces servies (coordonnées, époque) ; essais.
+    pub fn province_kids(&self) -> Vec<([i32; 2], u64, bool)> {
+        let st = self.state.lock().unwrap();
+        let mut v: Vec<([i32; 2], u64, bool)> = st
+            .province_room
+            .and_then(|r| st.rooms.get(&r))
+            .map(|r| {
+                r.provinces
+                    .iter()
+                    .filter(|(_, p)| p.info.is_some())
+                    .map(|(k, p)| (*k, p.epoch, p.big))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
     }
 
     /// Relais de secours : il prend la place du relais de la province ; jusqu'où il a la
@@ -7479,8 +7505,20 @@ fn handle_account(
             pseudo,
             signer,
             token,
+            node,
+            addr,
+            key,
         } => provinces::follow(
-            st, session, id, room, province, epoch, pseudo, signer, token,
+            st,
+            session,
+            id,
+            room,
+            province,
+            epoch,
+            pseudo,
+            signer,
+            token,
+            (node, addr, key),
         ),
         Request::ProvinceChild {
             room,
@@ -10365,6 +10403,7 @@ mod tests {
                     "Suiveur".into(),
                     signer,
                     token,
+                    ([0; 32], String::new(), [0; 32]),
                 )
             };
             // Jeton inventé, ou d'une autre époque, ou d'un autre joueur : refusé.

@@ -20,8 +20,14 @@ use minelib_net::transport::{self, Inbound};
 /// s'arrête (le relais du monde l'a reprise).
 const LOST_AFTER: Duration = Duration::from_secs(10);
 
+/// (v144) Province d'un pays dont le relais est tombé : elle essaie de se rattacher au
+/// relais de secours du pays (toutes les `REATTACH_EVERY`) pendant au plus ce temps.
+const REATTACH_MAX: Duration = Duration::from_secs(9);
+const REATTACH_EVERY: Duration = Duration::from_millis(400);
+
 /// (v143) Province d'un pays : où joindre le relais du pays (avec le jeton du relais du
 /// monde), qui l'on est (pseudo, clé du compte), d'où passer par iroh.
+#[derive(Clone)]
 pub struct Up {
     pub at: proto::ProvinceAt,
     pub pseudo: String,
@@ -55,10 +61,21 @@ pub struct ProvinceHost {
     follow: Option<Client>,
     follow_link: Option<Sender<Inbound>>,
     standby_said: bool,
+    /// (v144) Relais de secours : jusqu'où sa copie est à jour (redit au relais de secours du
+    /// pays s'il s'y rattache : il peut prendre la place même si la province est tombée avec
+    /// le pays).
+    last_have: Option<u64>,
     /// Où le joindre (nœud iroh, adresse, clé du relais).
     at: ([u8; 32], String, [u8; 32]),
-    /// (v143) Province d'un pays : la connexion au relais du pays.
+    /// (v143) Province d'un pays : la connexion au relais du pays ; (v144) de quoi s'y
+    /// rattacher de nouveau (taille, jeton, qui l'on est), où est le relais de secours du
+    /// pays, depuis quand on essaie de s'y rattacher, prochain essai.
     up: Option<UpLink>,
+    size: i32,
+    parent: Option<Up>,
+    parent_standby: Option<proto::ProvinceInfo>,
+    reattach: Option<Instant>,
+    next_try: Instant,
 }
 
 /// Relais embarqué d'une province, lancé : sa poignée, son nœud iroh, où le joindre.
@@ -101,6 +118,7 @@ impl ProvinceHost {
         // (v143) Province d'un pays : au relais du pays (il lui envoie son historique dès
         // qu'elle entre).
         let up = parent
+            .clone()
             .map(|u| Self::dial_up(room, province, size, epoch, u, false, Some(ready.clone())));
         if up.is_none() {
             transport::push(link, &ready);
@@ -118,8 +136,14 @@ impl ProvinceHost {
             follow: None,
             follow_link: None,
             standby_said: false,
+            last_have: None,
             at,
             up,
+            size,
+            parent,
+            parent_standby: None,
+            reattach: None,
+            next_try: Instant::now(),
         })
     }
 
@@ -189,23 +213,18 @@ impl ProvinceHost {
         )?;
         // (v143) Relais de secours d'une province d'un pays : il se signale au relais du pays
         // (qui le promouvra), et suit la province comme les autres.
-        let up = parent.map(|at| {
-            Self::dial_up(
-                room,
-                province,
-                size,
-                epoch,
-                Up {
-                    at,
-                    pseudo: pseudo.to_string(),
-                    signer,
-                    node_dir: node_dir.clone(),
-                },
-                true,
-                None,
-            )
+        let parent = parent.map(|at| Up {
+            at,
+            pseudo: pseudo.to_string(),
+            signer,
+            node_dir: node_dir.clone(),
         });
+        let up = parent
+            .clone()
+            .map(|u| Self::dial_up(room, province, size, epoch, u, true, None));
         let client = dial(&follow.info, node_dir);
+        // (v144) Avec l'adresse de son propre relais : les provinces d'un pays s'y
+        // rattacheront s'il prend la place du pays.
         client.send(Cmd::ProvinceFollow {
             room,
             province,
@@ -213,6 +232,9 @@ impl ProvinceHost {
             pseudo: pseudo.to_string(),
             signer,
             token: follow.token,
+            node: at.0,
+            addr: at.1.clone(),
+            key: at.2,
         });
         log::info!("relais de secours : province {province:?} du monde {room}");
         Some(Self {
@@ -227,8 +249,14 @@ impl ProvinceHost {
             follow: Some(client),
             follow_link: None,
             standby_said: false,
+            last_have: None,
             at,
             up,
+            size,
+            parent,
+            parent_standby: None,
+            reattach: None,
+            next_try: Instant::now(),
         })
     }
 
@@ -360,6 +388,17 @@ impl ProvinceHost {
                 self.handle.province_event(r);
                 Vec::new()
             }
+            // (v144) Où est le relais de secours de son pays (pour s'y rattacher s'il prend la
+            // place du pays).
+            Response::ProvinceParent {
+                room,
+                province,
+                epoch,
+                standby,
+            } if (*room, *province, *epoch) == (self.room, self.province, self.epoch) => {
+                self.parent_standby = standby.clone();
+                Vec::new()
+            }
             // Réglages du serveur (OP, bannis, modes).
             Response::ProvinceSettings { room, .. } if *room == self.room => {
                 self.handle.province_event(r);
@@ -407,6 +446,8 @@ impl ProvinceHost {
         // (v143) Province d'un pays : tout passe par le relais du pays.
         if self.up.is_some() {
             let mut events = Vec::new();
+            let mut linked = false;
+            let reattaching = self.reattach.is_some();
             if let Some(u) = self.up.as_mut() {
                 while let Some(e) = u.client.poll() {
                     match e {
@@ -415,33 +456,84 @@ impl ProvinceHost {
                                 transport::push(&l, &r);
                             }
                             u.link = Some(l);
+                            linked = true;
                         }
                         Event::Province(r) => events.push(r),
                         Event::RoomClosed | Event::Error(_) | Event::Offline(_) | Event::Lost => {
-                            if !u.lost {
+                            if !u.lost && !reattaching {
                                 log::info!("province : plus de nouvelles du relais du pays");
                             }
                             u.lost = true;
+                            u.link = None;
                             break;
                         }
                         _ => {}
                     }
                 }
             }
+            // (v144) Rattachée au relais de secours du pays, qui a pris sa place.
             let mut out = Vec::new();
+            if linked && self.reattach.take().is_some() {
+                log::info!(
+                    "province {:?} : rattachée au relais de secours de son pays",
+                    self.province
+                );
+                // (Relais de secours : il redit tout de suite au nouveau pays jusqu'où sa copie
+                // est à jour — la province a pu tomber avec l'ancien.)
+                if let (true, Some(have)) = (self.standby, self.last_have) {
+                    out.push(Request::ProvinceStandbyReady {
+                        room: self.room,
+                        province: self.province,
+                        epoch: self.epoch,
+                        have,
+                    });
+                }
+            }
             for r in events {
                 out.extend(self.event(&r));
             }
             out.extend(self.tick_own());
-            // (Le pays est tombé : plus de bail possible ; à la fin du sien, elle s'arrête.)
-            if self.up.as_ref().is_some_and(|u| u.lost)
-                && (self.standby || !self.handle.province_serving())
-                && !self.stopped
-            {
-                log::info!("province : relais du pays perdu, arrêt");
-                self.stopped = true;
-                self.handle.province_stop(false);
-                out.clear();
+            // (v144) Le pays est tombé : elle se rattache au relais de secours du pays dès
+            // qu'il a pris sa place (même jeton) ; sans lui, ou trop tard, plus de bail
+            // possible : à la fin du sien, elle s'arrête.
+            if self.up.as_ref().is_some_and(|u| u.lost) && !self.stopped {
+                let since = *self.reattach.get_or_insert_with(Instant::now);
+                let target = self
+                    .parent_standby
+                    .clone()
+                    .filter(|_| since.elapsed() < REATTACH_MAX);
+                match (target, self.parent.clone()) {
+                    (Some(info), Some(p)) => {
+                        if Instant::now() >= self.next_try {
+                            self.next_try = Instant::now() + REATTACH_EVERY;
+                            let queue = self.up.take().map(|u| u.queue).unwrap_or_default();
+                            let mut u = Self::dial_up(
+                                self.room,
+                                self.province,
+                                self.size,
+                                self.epoch,
+                                Up {
+                                    at: proto::ProvinceAt {
+                                        info,
+                                        token: p.at.token,
+                                    },
+                                    ..p
+                                },
+                                self.standby,
+                                None,
+                            );
+                            u.queue = queue;
+                            self.up = Some(u);
+                        }
+                    }
+                    _ if self.standby || !self.handle.province_serving() => {
+                        log::info!("province : relais du pays perdu, arrêt");
+                        self.stopped = true;
+                        self.handle.province_stop(false);
+                        out.clear();
+                    }
+                    _ => {}
+                }
             }
             if let Some(u) = self.up.as_mut() {
                 match &u.link {
@@ -475,15 +567,24 @@ impl ProvinceHost {
                         Event::Province(Response::ProvinceSeed { entries, .. }) => {
                             self.handle.province_seed(entries, None);
                         }
+                        // (v144) Un pays : ses provinces (pour les reprendre avec leurs hôtes).
+                        Event::Province(Response::ProvinceChildren {
+                            epoch, children, ..
+                        }) => {
+                            self.handle.province_children(epoch, children);
+                        }
                         Event::Province(Response::ProvinceCopy {
                             epoch,
                             n,
                             entries,
                             bags,
                             held,
+                            spots,
                             ..
                         }) => {
-                            let have = self.handle.province_copy(epoch, n, entries, bags, held);
+                            let have = self
+                                .handle
+                                .province_copy(epoch, n, entries, bags, held, spots);
                             // (v142) Copié : son relais peut le confirmer à ses joueurs quand
                             // c'est ce relais de secours qui garde la copie.
                             if let (Some(_), Some(l)) = (have, &self.follow_link) {
@@ -496,6 +597,9 @@ impl ProvinceHost {
                                         n,
                                     },
                                 );
+                            }
+                            if have.is_some() {
+                                self.last_have = have;
                             }
                             if let (Some(have), false) = (have, self.standby_said) {
                                 self.standby_said = true;
@@ -552,6 +656,19 @@ impl ProvinceHost {
     #[cfg(test)]
     pub fn kill(&self) {
         self.handle.kill();
+    }
+
+    /// Essais : il sert (bail en cours).
+    #[cfg(test)]
+    pub fn serving(&self) -> bool {
+        !self.stopped && self.handle.province_serving()
+    }
+
+    /// Essais : entrées gardées ici pour les zones de la province `p` (de la taille de ses
+    /// provinces, pour un pays).
+    #[cfg(test)]
+    pub fn entries_of(&self, p: [i32; 2]) -> usize {
+        self.handle.province_entries(self.room, p)
     }
 
     /// Essais : relais de secours dont la copie est à jour.
