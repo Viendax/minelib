@@ -43,6 +43,20 @@
 //! - après la queue, tout redevient normal (et le retard fixe vaut pour un relâchement
 //!   plus tardif, ou sans « courir »).
 //!
+//! (v185) Mode FPS (en ligne, ou contre des bots). L'hôte y simule le joueur à partir des
+//! entrées qu'il reçoit, et un invité qui s'écarte de plus de 0,01 bloc reprend la position
+//! de l'hôte (`netgame::CORRECT`) : déplacer le joueur sur place serait défait à l'instant.
+//! Les entrées, elles, ne portent qu'un entier (−1, 0, 1) par axe : un ralenti fractionné ne
+//! passerait pas non plus. Le retour s'y fait donc par les entrées : le jeu demande
+//! « reculer » pendant quelques pas, juste le temps de rendre le chemin dû. L'hôte reçoit la
+//! même chose et arrive au même endroit, en ligne comme contre des bots.
+//!
+//! Deux conséquences assumées : il n'y a pas de ralenti d'avance en FPS (« courir » n'y est
+//! pas tenue, et le ralenti ne passerait pas le réseau), donc seul le retard mesuré est
+//! rendu ; et le retour est un vrai déplacement, qui gâche la précision du tir dans CS. Il
+//! est donc sauté tant que le joueur tire ou vise, et dès qu'il demande lui-même d'avancer
+//! ou de reculer.
+//!
 //! (v183) Retour moins visible : dans la fenêtre l'élan de la course est freiné comme au
 //! sol (`Player::brake_forward` ; sans cela il faisait à lui seul 0,4 bloc à rendre), le
 //! ralentissement part plus fort tant qu'on ne connaît pas les habitudes du joueur, et le
@@ -89,6 +103,9 @@ const TAPPING_S: f32 = 20.0;
 const HISTORY: usize = 8;
 /// Chemin gardé en mémoire (s), et retard compensé au plus (s).
 const KEEP_S: f32 = 3.2;
+/// Mode FPS : le retour par les entrées est abandonné au-delà de ce temps (s) — contre un
+/// mur, le chemin dû ne se rendrait jamais.
+const GIVE_UP_S: f32 = 0.6;
 pub const MAX_LAG: f32 = 0.5;
 /// Écart normal (ms) entre une touche saine et le clic lâchés « ensemble », quand le test
 /// n'a pas assez d'appuis brefs pour le mesurer.
@@ -214,6 +231,11 @@ pub struct Comp {
     /// Retour en cours : ce qu'il reste à rendre (d'un coup si `instant`).
     left: Vec3,
     instant: bool,
+    /// Mode FPS : chemin encore dû (blocs), sens où le rendre et temps depuis (voir
+    /// `back_input`).
+    owed: f32,
+    owed_dir: Vec3,
+    owed_t: f32,
     /// Dernier retour décidé (s compensées, blocs), pour le journal.
     pub last: Option<(f32, f32)>,
 }
@@ -258,6 +280,18 @@ impl Comp {
         }
     }
 
+    /// Mode FPS : faut-il demander « reculer » à ce pas (le chemin dû est rendu par les
+    /// entrées, pour que l'hôte arrive au même endroit) ?
+    pub fn back_input(&self) -> bool {
+        self.owed > 0.0
+    }
+
+    /// Mode FPS : le joueur tire, vise, ou demande lui-même d'avancer ou de reculer : le
+    /// chemin dû est oublié (sa visée et ses touches passent devant).
+    pub fn drop_owed(&mut self) {
+        self.owed = 0.0;
+    }
+
     /// Un pas de simulation (`dt` secondes) vient d'être fait : « avancer » tenue (`fwd`),
     /// « courir » tenue (`run`), direction du regard, déplacement du joueur pendant ce pas, hauteur de ses pieds et
     /// appui au sol, chute en cours. `lag` : retard de la touche (0 : aucune compensation).
@@ -267,6 +301,9 @@ impl Comp {
         &mut self,
         dt: f32,
         lag: f32,
+        // `by_input` : rendre le chemin par les entrées (mode FPS) plutôt qu'en replaçant le
+        // joueur.
+        by_input: bool,
         fwd: bool,
         run: bool,
         yaw: f32,
@@ -277,11 +314,20 @@ impl Comp {
     ) -> Nudge {
         let mut out = Nudge::default();
         self.tapping = (self.tapping - dt).max(0.0);
+        // Chemin rendu par les entrées : ce qui vient d'être reculé est décompté.
+        if self.owed > 0.0 {
+            self.owed -= moved.dot(self.owed_dir).max(0.0);
+            self.owed_t += dt;
+            if self.owed <= 0.001 || self.owed_t > GIVE_UP_S {
+                self.owed = 0.0;
+            }
+        }
         if fwd {
             if !self.was {
                 // Nouvel appui : c'est voulu, plus rien à rendre.
                 self.held = 0.0;
                 self.left = Vec3::ZERO;
+                self.owed = 0.0;
                 self.steps.clear();
                 self.since_run = None;
             }
@@ -344,13 +390,24 @@ impl Comp {
             if n > 0 {
                 let from = self.steps.len() - n;
                 let back: Vec3 = self.steps.iter().skip(from).map(|s| s.forward).sum();
-                self.left = -back;
-                self.instant = false;
+                if by_input {
+                    self.owed = back.length();
+                    self.owed_dir = -back.normalize_or_zero();
+                    self.owed_t = 0.0;
+                } else {
+                    self.left = -back;
+                    self.instant = false;
+                }
                 // Au sol quand le doigt s'est levé, en chute maintenant : il est tombé d'un
                 // bord pendant le retard, on l'y remonte.
                 // (État à la fin du pas d'avant : le moment où le doigt s'est levé.)
                 let then = self.steps[from.saturating_sub(1)];
-                if then.on_ground && falling && then.y > feet_y && then.y - feet_y < 2.0 {
+                if !by_input
+                    && then.on_ground
+                    && falling
+                    && then.y > feet_y
+                    && then.y - feet_y < 2.0
+                {
                     // Remonté et ramené d'un coup : un retour en douceur le laisserait
                     // retomber contre le flanc du bloc.
                     out.lift = then.y - feet_y;
@@ -400,7 +457,7 @@ mod tests {
             if fwd {
                 *x += speed * DT;
             }
-            let n = c.tick(DT, setting, fwd, false, 0.0, moved, 10.0, true, false);
+            let n = c.tick(DT, setting, false, fwd, false, 0.0, moved, 10.0, true, false);
             // (Avancer : vers -z ; `back.z` positif ramène en arrière.)
             *x -= n.back.z;
             assert_eq!(n.lift, 0.0);
@@ -445,19 +502,19 @@ mod tests {
         let step = Vec3::new(0.0, 0.0, -0.1);
         // Tant que la touche est tenue : jamais rien.
         for _ in 0..640 {
-            assert_eq!(c.tick(DT, 0.3, true, false, 0.0, step, 10.0, true, false), Nudge::default());
+            assert_eq!(c.tick(DT, 0.3, false, true, false, 0.0, step, 10.0, true, false), Nudge::default());
         }
         // Relâchée : le retour commence ; rappuyée aussitôt : il s'arrête net.
-        let n = c.tick(DT, 0.3, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
+        let n = c.tick(DT, 0.3, false, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
         assert!(n.back.z > 0.0, "{n:?}");
-        assert_eq!(c.tick(DT, 0.3, true, false, 0.0, step, 10.0, true, false), Nudge::default());
+        assert_eq!(c.tick(DT, 0.3, false, true, false, 0.0, step, 10.0, true, false), Nudge::default());
         // Seul le chemin vers l'avant est repris (pas le déplacement de côté ni en arrière).
         let mut c = Comp::default();
         let side = Vec3::new(0.1, 0.0, 0.0);
         for _ in 0..640 {
-            c.tick(DT, 0.3, true, false, 0.0, side, 10.0, true, false);
+            c.tick(DT, 0.3, false, true, false, 0.0, side, 10.0, true, false);
         }
-        let n = c.tick(DT, 0.3, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
+        let n = c.tick(DT, 0.3, false, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
         assert_eq!(n, Nudge::default());
     }
 
@@ -476,7 +533,7 @@ mod tests {
             }
             let d = speed * DT * f;
             *x += d;
-            let n = c.tick(DT, lag, fwd, run, 0.0, Vec3::new(0.0, 0.0, -d), 10.0, true, false);
+            let n = c.tick(DT, lag, false, fwd, run, 0.0, Vec3::new(0.0, 0.0, -d), 10.0, true, false);
             *x -= n.back.z;
         };
         for _ in 0..(run_s / DT).round() as usize {
@@ -543,9 +600,9 @@ mod tests {
         for i in 0..640 {
             // Tenue 5 s, lâchée 0,1 s, reprise…
             let run = !(320..326).contains(&i);
-            c.tick(DT, 0.122, true, run, 0.0, step, 10.0, true, false);
+            c.tick(DT, 0.122, false, true, run, 0.0, step, 10.0, true, false);
         }
-        c.tick(DT, 0.122, true, false, 0.0, step, 10.0, true, false);
+        c.tick(DT, 0.122, false, true, false, 0.0, step, 10.0, true, false);
         assert_eq!(c.factor(), 1.0);
     }
 
@@ -565,15 +622,65 @@ mod tests {
         let mut c = Comp::default();
         let step = Vec3::new(0.0, 0.0, -0.05);
         for _ in 0..128 {
-            c.tick(DT, 0.122, true, true, 0.0, step, 10.0, true, false);
+            c.tick(DT, 0.122, false, true, true, 0.0, step, 10.0, true, false);
         }
         let mut seen = Vec::new();
         for _ in 0..70 {
-            c.tick(DT, 0.122, true, false, 0.0, step, 10.0, true, false);
+            c.tick(DT, 0.122, false, true, false, 0.0, step, 10.0, true, false);
             seen.push(c.factor());
         }
         assert!(seen.windows(2).all(|p| p[1] - p[0] < 0.06), "saut de vitesse : {seen:?}");
         assert!(seen[20] < 0.5 && seen[45] > seen[20] && *seen.last().unwrap() == 1.0, "{seen:?}");
+    }
+
+    /// (v185) Mode FPS : le chemin dû est rendu par les entrées (« reculer » quelques pas),
+    /// jamais en replaçant le joueur — l'hôte simule les mêmes entrées et arrive au même
+    /// endroit.
+    #[test]
+    fn in_fps_the_path_is_given_back_through_the_inputs() {
+        let speed = 4.95;
+        let step = Vec3::new(0.0, 0.0, -speed * DT);
+        // Course de 5 s, « avancer » tenue : jamais rien.
+        let run5 = || {
+            let mut c = Comp::default();
+            for _ in 0..(5.0 / DT) as usize {
+                let n = c.tick(DT, 0.122, true, true, false, 0.0, step, 10.0, true, false);
+                assert_eq!(n, Nudge::default(), "jamais replacé");
+                assert!(!c.back_input());
+            }
+            c
+        };
+        let mut c = run5();
+        let n = c.tick(DT, 0.122, true, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
+        assert_eq!(n, Nudge::default(), "jamais replacé en FPS");
+        // Le jeu demande « reculer » jusqu'à avoir rendu les 122 ms de course (0,6 bloc).
+        assert!(c.back_input());
+        let mut back = 0.0;
+        for _ in 0..64 {
+            if !c.back_input() {
+                break;
+            }
+            back += speed * DT;
+            c.tick(DT, 0.122, true, false, false, 0.0, -step, 10.0, true, false);
+        }
+        assert!(!c.back_input(), "le retour finit");
+        assert!((back - speed * 0.122).abs() < 0.1, "{back} bloc rendu");
+        // Contre un mur (rien ne recule) : abandonné au bout de 0,6 s.
+        let mut c = run5();
+        for _ in 0..(GIVE_UP_S / DT) as usize + 3 {
+            c.tick(DT, 0.122, true, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
+        }
+        assert!(!c.back_input(), "pas de retour sans fin contre un mur");
+        // Il tire, vise, ou redemande d'avancer : le chemin dû est oublié.
+        let mut c = run5();
+        c.tick(DT, 0.122, true, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
+        assert!(c.back_input());
+        c.drop_owed();
+        assert!(!c.back_input());
+        let mut c = run5();
+        c.tick(DT, 0.122, true, false, false, 0.0, Vec3::ZERO, 10.0, true, false);
+        c.tick(DT, 0.122, true, true, false, 0.0, step, 10.0, true, false);
+        assert!(!c.back_input());
     }
 
     #[test]
@@ -581,13 +688,13 @@ mod tests {
         let mut c = Comp::default();
         let step = Vec3::new(0.0, 0.0, -0.07);
         for _ in 0..640 {
-            c.tick(DT, 0.2, true, false, 0.0, step, 10.0, true, false);
+            c.tick(DT, 0.2, false, true, false, 0.0, step, 10.0, true, false);
         }
         // Pendant le retard : il quitte le bord et tombe.
         for i in 0..13 {
-            c.tick(DT, 0.2, true, false, 0.0, step, 10.0 - 0.02 * i as f32, false, true);
+            c.tick(DT, 0.2, false, true, false, 0.0, step, 10.0 - 0.02 * i as f32, false, true);
         }
-        let n = c.tick(DT, 0.2, false, false, 0.0, Vec3::ZERO, 9.7, false, true);
+        let n = c.tick(DT, 0.2, false, false, false, 0.0, Vec3::ZERO, 9.7, false, true);
         // Remonté, et ramené d'un seul coup de tout le chemin du retard (13 pas).
         assert!((n.lift - 0.3).abs() < 0.05, "{n:?}");
         assert!((n.back.z - 13.0 * 0.07).abs() < 0.01, "{n:?}");
