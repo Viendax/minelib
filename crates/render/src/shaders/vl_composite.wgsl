@@ -17,7 +17,9 @@ fn fs_composite(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let fd = vec2<i32>(textureDimensions(full_depth));
     let d = textureLoad(full_depth, clamp(vec2<i32>(floor(frag.xy)), vec2<i32>(0), fd - 1), 0);
     let hd = vec2<i32>(textureDimensions(vl_tex));
-    let f = frag.xy * 0.5 - 0.5;
+    // Demi- ou quart de résolution : rapport des tailles des deux images.
+    let ratio = vec2<f32>(fd) / vec2<f32>(hd);
+    let f = frag.xy / ratio - 0.5;
     let i0 = vec2<i32>(floor(f));
     let fw = f - floor(f);
     var acc = vec3<f32>(0.0);

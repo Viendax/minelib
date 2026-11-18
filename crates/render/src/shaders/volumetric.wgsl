@@ -30,12 +30,20 @@ struct Globals {
 
 const VL_PI: f32 = 3.14159265;
 
-/// Cases éclairées, élargies d'un pixel de la demi-résolution : la recomposition lit aussi
+/// Pixels de l'image du monde par pixel de la lumière volumétrique (2 : demi-résolution,
+/// 4 : quart).
+fn vl_scale() -> i32 {
+    return i32(clamp(dh.misc.w, 1.0, 8.0));
+}
+
+/// Cases éclairées, élargies de 4 pixels de l'image du monde (un pixel de l'image
+/// volumétrique au quart de la résolution, deux à la moitié) : la recomposition lit aussi
 /// les voisins (dont la profondeur, en alpha) ; une même valeur écrite deux fois là où
-/// deux rectangles se recouvrent ne change rien.
+/// deux rectangles se recouvrent ne change rien. (L'en-tête des lumières n'est pas lisible
+/// ici : il n'est lié qu'aux pixels.)
 @vertex
 fn vs_tiles(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
-    let e = vec2<f32>(4.0 / max(g.screen.x, 1.0), 4.0 / max(g.screen.y, 1.0));
+    let e = vec2<f32>(8.0 / max(g.screen.x, 1.0), 8.0 / max(g.screen.y, 1.0));
     let r = lit_rects[ii];
     return dl_rect_corner(vi, vec4<f32>(r.x - e.x, r.y + e.y, r.z + e.x, r.w - e.y));
 }
@@ -273,31 +281,35 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec
 @fragment
 fn fs_vl(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let dims = vec2<i32>(textureDimensions(scene_depth));
-    let base = vec2<i32>(floor(frag.xy)) * 2;
-    // Surface la plus proche des quatre pixels : le faisceau s'arrête au premier obstacle
+    let sc = vl_scale();
+    let base = vec2<i32>(floor(frag.xy)) * sc;
+    // Surface la plus proche des pixels couverts : le faisceau s'arrête au premier obstacle
     // (la recomposition choisit ensuite selon la profondeur de chaque pixel).
     var depth = 0.0;
-    for (var k = 0; k < 4; k++) {
-        let q = clamp(base + vec2<i32>(k & 1, k >> 1), vec2<i32>(0), dims - 1);
-        depth = max(depth, textureLoad(scene_depth, q, 0));
+    for (var y = 0; y < sc; y++) {
+        for (var x = 0; x < sc; x++) {
+            let q = clamp(base + vec2<i32>(x, y), vec2<i32>(0), dims - 1);
+            depth = max(depth, textureLoad(scene_depth, q, 0));
+        }
     }
     let full = vec2<f32>(dims);
-    let uv = (vec2<f32>(base) + 1.0) / full;
+    let mid = vec2<f32>(base) + 0.5 * f32(sc);
+    let uv = mid / full;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let cam = g.cam_pos.xyz;
-    // Direction du regard : un point sur le plan proche (profondeur 1, Z inversé).
-    let pn = g.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    let dir = normalize(pn.xyz / pn.w - cam);
+    // Direction du regard tirée des lignes de la matrice (pas d'inverse : voir
+    // `dl_view_ray`), et distance de la surface : proche / profondeur unités de vue.
+    let ray = dl_view_ray(g.view_proj, ndc);
+    let dir = normalize(ray);
     var scene = 1e9;
     if depth > 0.0 {
-        let pw = g.inv_view_proj * vec4<f32>(ndc, depth, 1.0);
-        scene = length(pw.xyz / pw.w - cam);
+        scene = length(ray) * (g.view_proj[3][2] / depth);
     }
     let max_t = min(scene, dh.vl_a.y);
     var dither = fract(52.9829189 * fract(0.06711056 * frag.x + 0.00583715 * frag.y));
     if (dh.vl_c.w & DL_DITHER) != 0u {
         dither = fract(dither + dh.misc.x * 0.61803398);
     }
-    let c = dyn_volumetric(cam, dir, max_t, dither, vec2<f32>(base) + 1.0, full);
+    let c = dyn_volumetric(cam, dir, max_t, dither, mid, full);
     return vec4<f32>(c, depth);
 }

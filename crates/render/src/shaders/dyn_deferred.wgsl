@@ -45,11 +45,11 @@ fn fs_deferred(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let a = textureLoad(gb_albedo, px, 0);
     // Position du pixel : sa profondeur, à travers la même matrice (avec le décalage du
-    // TAA) que celle qui l'a dessiné.
+    // TAA) que celle qui l'a dessiné, comptée depuis la caméra (pas d'inverse : voir
+    // `dl_view_ray`).
     let depth = textureLoad(scene_depth, px, 0);
     let ndc = vec2<f32>(frag.x / g.screen.x * 2.0 - 1.0, 1.0 - frag.y / g.screen.y * 2.0);
-    let w = g.inv_view_proj * vec4<f32>(ndc, depth, 1.0);
-    let p = w.xyz / w.w;
+    let p = g.cam_pos.xyz + dl_view_offset(g.view_proj, ndc, max(depth, 1e-30));
     let n = gb_oct_decode(s.rg);
     let entity = a.a > 0.995;
     let gloss = select(a.a / 0.99, 0.15, entity);

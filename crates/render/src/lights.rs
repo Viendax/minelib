@@ -148,10 +148,6 @@ pub struct DynSettings {
     pub shadow_quality: u8,
     /// Cartes gardées tant que rien ne change (sinon recalculées à chaque image).
     pub shadow_cache: bool,
-    /// Essai : ombres des surfaces par un rayon dans la grille de blocs (pénombre lissée
-    /// par l'anticrénelage) au lieu des cartes d'ombre ; les cartes restent pour les rayons
-    /// volumétriques, les translucides et hors de la grille.
-    pub rt_shadows: bool,
     /// Douceur des ombres par défaut (taille de la source, blocs).
     pub softness: f32,
     /// Cases d'ombre recalculées au plus par image (les premiers calculs passent avant).
@@ -161,6 +157,9 @@ pub struct DynSettings {
     pub vl_intensity: f32,
     pub vl_steps: u32,
     pub vl_max_dist: f32,
+    /// Résolution des rayons : pixels de l'image par pixel calculé, de côté (2 : moitié,
+    /// 4 : quart, quatre fois moins de calcul ; la recomposition suit la profondeur).
+    pub vl_scale: u32,
     /// Lueur autour de la source : force et rayon (blocs).
     pub vl_tip_boost: f32,
     pub vl_tip_radius: f32,
@@ -191,12 +190,12 @@ impl Default for DynSettings {
             entity_shadows: true,
             shadow_quality: 1,
             shadow_cache: true,
-            rt_shadows: false,
             softness: 0.1,
             bake_budget: 12,
             volumetric: true,
             vl_intensity: 1.0,
             vl_steps: 48,
+            vl_scale: 4,
             vl_max_dist: 96.0,
             vl_tip_boost: 1.5,
             vl_tip_radius: 1.5,
@@ -281,8 +280,6 @@ pub(crate) struct GpuHeader {
     sh: [f32; 4],
     surf: [f32; 4],
     misc: [f32; 4],
-    /// Grille de blocs : coin bas (monde), w = 1 si elle est envoyée (ombres par rayons).
-    vox: [i32; 4],
     /// Boîtes exactes des joueurs : lignes de la matrice monde → cube unité.
     box_x: [[f32; 4]; MAX_BOXES],
     box_y: [[f32; 4]; MAX_BOXES],
@@ -313,7 +310,6 @@ const F_TOON: u32 = 16;
 const F_SPECULAR: u32 = 32;
 const F_VOLUMETRIC: u32 = 64;
 const F_BOX_SHADOWS: u32 = 128;
-const F_RT_SHADOWS: u32 = 256;
 
 /// Repère d'un projecteur dirigé selon `d` : (droite, haut, avant) — le même que
 /// `dl_spot_basis` dans dynlights.wgsl.
@@ -404,6 +400,8 @@ pub fn screen_rect(view_proj: Mat4, eye: Vec3, center: Vec3, radius: f32) -> Opt
     if (center - eye).length() < radius * 1.74 + 0.1 {
         return Some([0.0, 0.0, 1.0, 1.0]);
     }
+    // Depuis la caméra : précis même loin de l'origine (voir `view_ray`).
+    let rel = crate::eye_relative(view_proj);
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     let mut behind = 0;
     for k in 0..8 {
@@ -412,7 +410,7 @@ pub fn screen_rect(view_proj: Mat4, eye: Vec3, center: Vec3, radius: f32) -> Opt
             if k & 2 == 0 { -radius } else { radius },
             if k & 4 == 0 { -radius } else { radius },
         );
-        let c = view_proj * Vec4::from((center + o, 1.0));
+        let c = rel * Vec4::from((center + o - eye, 1.0));
         if c.w <= 1e-4 {
             behind += 1;
             continue;
@@ -965,8 +963,6 @@ pub(crate) struct DynGpu {
     // État de l'image.
     lights: Vec<DynLight>,
     settings: DynSettings,
-    /// Ombres par lancer de rayons demandées et possibles cette image (voir `prepare`).
-    rt_on: bool,
     cache: ShadowCache,
     bricks: HashMap<[i32; 3], u64>,
     frame: u64,
@@ -1067,21 +1063,9 @@ fn tex_entry(
 /// Source WGSL complète d'un shader qui utilise les lumières dynamiques.
 pub(crate) fn with_dynlights(src: &str) -> String {
     format!(
-        "{src}\n{}\n{}\n{}",
+        "{src}\n{}\n{}",
         include_str!("shaders/gbuffer.wgsl"),
-        include_str!("shaders/dynlights.wgsl"),
-        include_str!("shaders/dl_rt_off.wgsl")
-    )
-}
-
-/// Comme `with_dynlights`, avec les ombres par lancer de rayons dans la grille de blocs
-/// (essai, éclairage différé seulement : il déclare les liaisons 1 à 4 du monde).
-pub(crate) fn with_dynlights_rt(src: &str) -> String {
-    format!(
-        "{src}\n{}\n{}\n{}",
-        include_str!("shaders/gbuffer.wgsl"),
-        include_str!("shaders/dynlights.wgsl"),
-        include_str!("shaders/dl_rt.wgsl")
+        include_str!("shaders/dynlights.wgsl")
     )
 }
 
@@ -1092,49 +1076,6 @@ pub(crate) fn without_dynlights(src: &str) -> String {
         "{src}\n{}\n{}",
         include_str!("shaders/gbuffer.wgsl"),
         include_str!("shaders/dynlights_off.wgsl")
-    )
-}
-
-/// Éclairage différé avec les ombres par lancer de rayons (essai) : compilé à part, et
-/// seulement quand le réglage est coché (le code de la marche dans la grille allonge la
-/// compilation sous DirectX).
-pub(crate) fn deferred_rt_pipeline(
-    device: &wgpu::Device,
-    world_bgl: &wgpu::BindGroupLayout,
-    def_bgl: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
-    let src = with_dynlights_rt(include_str!("shaders/dyn_deferred.wgsl"));
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("éclairage différé (rayons)"),
-        source: wgpu::ShaderSource::Wgsl(src.into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("éclairage différé (rayons)"),
-        bind_group_layouts: &[world_bgl, def_bgl],
-        push_constant_ranges: &[],
-    });
-    let add = wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::One,
-        dst_factor: wgpu::BlendFactor::One,
-        operation: wgpu::BlendOperation::Add,
-    };
-    let keep_alpha = wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::Zero,
-        dst_factor: wgpu::BlendFactor::One,
-        operation: wgpu::BlendOperation::Add,
-    };
-    fullscreen_pipeline(
-        device,
-        "éclairage différé (rayons)",
-        &layout,
-        &shader,
-        "vs_tiles",
-        "fs_deferred",
-        COLOR_FORMAT,
-        Some(wgpu::BlendState {
-            color: add,
-            alpha: keep_alpha,
-        }),
     )
 }
 
@@ -1595,7 +1536,6 @@ impl DynGpu {
             def_targets: None,
             lights: Vec::new(),
             settings: DynSettings::default(),
-            rt_on: false,
             cache: ShadowCache::default(),
             bricks: HashMap::new(),
             frame: 0,
@@ -1774,15 +1714,6 @@ impl DynGpu {
 
     /// Lumières et réglages de la prochaine image. Renvoie vrai si quelque chose a changé
     /// depuis l'image précédente (lumière déplacée, réglée, ajoutée ou retirée).
-    /// Réglages en cours.
-    pub fn settings(&self) -> &DynSettings {
-        &self.settings
-    }
-
-    /// Ombres par lancer de rayons cette image (réglage, ombres des blocs, grille envoyée).
-    pub fn rt_shadows_on(&self) -> bool {
-        self.rt_on && self.active()
-    }
 
     pub fn set(&mut self, lights: &[DynLight], settings: &DynSettings) -> bool {
         let lights = &lights[..lights.len().min(MAX_DYN_LIGHTS)];
@@ -1997,11 +1928,6 @@ impl DynGpu {
         if box_shadows {
             flags |= F_BOX_SHADOWS;
         }
-        // Les rayons remplacent les cartes pour l'arrêt par les blocs.
-        self.rt_on = st.rt_shadows && voxels.is_some();
-        if self.rt_on {
-            flags |= F_RT_SHADOWS;
-        }
         let mut box_x = [[0.0; 4]; MAX_BOXES];
         let mut box_y = [[0.0; 4]; MAX_BOXES];
         let mut box_z = [[0.0; 4]; MAX_BOXES];
@@ -2047,9 +1973,8 @@ impl DynGpu {
                 (frame % 1024) as f32,
                 q4(st.vl_noise_morph),
                 nboxes as f32,
-                0.0,
+                st.vl_scale.clamp(2, 4) as f32,
             ],
-            vox: voxels.map_or([0; 4], |o| [o[0], o[1], o[2], 1]),
             box_x,
             box_y,
             box_z,
@@ -2280,7 +2205,8 @@ impl DynGpu {
         if !self.volumetric_active() {
             return;
         }
-        let half = (size.0.div_ceil(2), size.1.div_ceil(2));
+        let k = self.settings.vl_scale.clamp(2, 4);
+        let half = (size.0.div_ceil(k), size.1.div_ceil(k));
         let key = (half.0, half.1, generation);
         if self.vl_targets.as_ref().is_none_or(|t| t.key != key) {
             let tex = device.create_texture(&wgpu::TextureDescriptor {

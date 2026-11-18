@@ -386,12 +386,16 @@ impl LightSettings {
         r.entity_shadows = b("ombres_joueurs", d.entity_shadows);
         r.shadow_quality = u("ombres_qualite", d.shadow_quality as u32, 0, 3) as u8;
         r.shadow_cache = b("ombres_cache", d.shadow_cache);
-        r.rt_shadows = b("ombres_lancer_rayons", d.rt_shadows);
         r.softness = f("ombres_douceur", d.softness, 0.0, 0.8);
         r.bake_budget = u("ombres_budget", d.bake_budget, 1, 64);
         r.volumetric = b("rayons", d.volumetric);
         r.vl_intensity = f("rayons_intensite", d.vl_intensity, 0.0, 5.0);
         r.vl_steps = u("rayons_pas", d.vl_steps, 8, 96);
+        r.vl_scale = if u("rayons_resolution", d.vl_scale, 2, 4) >= 3 {
+            4
+        } else {
+            2
+        };
         r.vl_max_dist = f("rayons_distance", d.vl_max_dist, 8.0, 256.0);
         r.vl_tip_boost = f("rayons_lueur", d.vl_tip_boost, 0.0, 4.0);
         r.vl_tip_radius = f("rayons_lueur_rayon", d.vl_tip_radius, 0.1, 4.0);
@@ -439,12 +443,12 @@ impl LightSettings {
         kv("ombres_joueurs", r.entity_shadows.to_string());
         kv("ombres_qualite", r.shadow_quality.to_string());
         kv("ombres_cache", r.shadow_cache.to_string());
-        kv("ombres_lancer_rayons", r.rt_shadows.to_string());
         kv("ombres_douceur", r.softness.to_string());
         kv("ombres_budget", r.bake_budget.to_string());
         kv("rayons", r.volumetric.to_string());
         kv("rayons_intensite", r.vl_intensity.to_string());
         kv("rayons_pas", r.vl_steps.to_string());
+        kv("rayons_resolution", r.vl_scale.to_string());
         kv("rayons_distance", r.vl_max_dist.to_string());
         kv("rayons_lueur", r.vl_tip_boost.to_string());
         kv("rayons_lueur_rayon", r.vl_tip_radius.to_string());

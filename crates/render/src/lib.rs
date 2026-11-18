@@ -201,6 +201,9 @@ struct LitPipes {
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Globals {
     view_proj: [[f32; 4]; 4],
+    /// Gardée pour la disposition des uniformes, mais à ne pas lire : retrouver une
+    /// direction ou une position avec l'inverse fait tourner ou sauter l'image (voir
+    /// [`view_ray`]).
     inv_view_proj: [[f32; 4]; 4],
     cam_pos: [f32; 4],
     fog: [f32; 4],
@@ -234,6 +237,41 @@ struct Globals {
     shadow_info: [f32; 4],
     shadow_min: [[f32; 4]; MAX_SHADOW_BOXES],
     shadow_max: [[f32; 4]; MAX_SHADOW_BOXES],
+}
+
+/// Rayon de la caméra qui passe par le point `ndc` de l'écran, à l'échelle d'une unité de
+/// profondeur de vue (composante vers l'avant = 1), tiré des lignes de `view_proj`.
+///
+/// PIÈGE (ciel en v108, projecteurs en v175) : ne jamais retrouver une direction ou une
+/// position avec l'inverse de `view_proj` (un point « proche » ou « lointain » dé-projeté,
+/// moins la caméra). La projection du jeu n'a pas de plan lointain (Z inversé, à l'infini)
+/// et les coordonnées du monde sont grandes : les arrondis de l'inversion et de la
+/// soustraction faussent la direction, et l'image tourne ou saute quand on bouge la vue.
+/// Même calcul côté carte graphique : `sky_dir` (world.wgsl), `dl_view_ray` (dynlights.wgsl).
+/// Le test `nothing_rebuilds_the_view_with_the_inverse_matrix` refuse tout retour en arrière.
+pub fn view_ray(view_proj: Mat4, ndc: [f32; 2]) -> Vec3 {
+    let row = |r: usize| {
+        Vec3::new(
+            view_proj.x_axis[r],
+            view_proj.y_axis[r],
+            view_proj.z_axis[r],
+        )
+    };
+    let (rx, ry, rw) = (row(0), row(1), row(3));
+    let d = (rx - ndc[0] * rw).cross(ry - ndc[1] * rw);
+    d / rw.dot(d)
+}
+
+/// `view_proj` comptée depuis la caméra : `eye_relative(m) * (p - œil, 1)` donne le même
+/// point de l'écran que `m * (p, 1)`, sans la perte de précision des grandes coordonnées
+/// (la projection du jeu, sans plan lointain, envoie l'œil en (0, 0, proche, 0)).
+pub fn eye_relative(view_proj: Mat4) -> Mat4 {
+    Mat4::from_cols(
+        view_proj.x_axis,
+        view_proj.y_axis,
+        view_proj.z_axis,
+        Vec4::new(0.0, 0.0, view_proj.w_axis.z, 0.0),
+    )
 }
 
 /// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre.
@@ -668,9 +706,6 @@ pub struct Renderer {
     /// leur code, compilé ensuite (le plus long) ; d'ici là, les translucides ne prennent
     /// pas leur lumière (l'opaque derrière, si).
     lit_translucent: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
-    /// Éclairage différé avec les ombres par lancer de rayons (essai), compilé quand le
-    /// réglage est coché, après les autres.
-    lit_rt: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
     /// Images restantes pendant lesquelles l'anticrénelage considère que les lumières ont
     /// changé (déplacées, réglées) : comme `mesh_changes`.
     dyn_changes: u32,
@@ -1096,7 +1131,6 @@ impl Renderer {
             dyn_gpu,
             lit: None,
             lit_translucent: None,
-            lit_rt: None,
             dyn_changes: 0,
             skin_key: None,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
@@ -1476,15 +1510,6 @@ impl Renderer {
         if self.lit_pipes().is_some() && self.lit_translucent.is_none() {
             self.lit_translucent = Some(self.spawn_lit_translucent());
         }
-        // Puis, si le réglage est coché, l'éclairage différé avec les ombres par rayons
-        // (jamais deux compilations à la fois : elles partagent la pile d'erreurs).
-        let translucent_done = self
-            .lit_translucent
-            .as_ref()
-            .is_some_and(|l| l.try_get().is_some());
-        if translucent_done && self.lit_rt.is_none() && self.dyn_gpu.settings().rt_shadows {
-            self.lit_rt = Some(self.spawn_lit_rt());
-        }
         let failed = self
             .lit
             .as_ref()
@@ -1575,30 +1600,6 @@ impl Renderer {
     /// Translucides éclairés, s'ils sont prêts.
     fn lit_translucent(&self) -> Option<&wgpu::RenderPipeline> {
         self.lit_translucent.as_ref()?.try_get()?.as_ref().ok()
-    }
-
-    /// Éclairage différé avec les ombres par rayons (voir `lit_rt`).
-    fn spawn_lit_rt(&self) -> lazy::Lazy<Result<wgpu::RenderPipeline, String>> {
-        let device = self.device.clone();
-        let bgl = self.bgl.clone();
-        let def_bgl = self.dyn_gpu.def_bgl.clone();
-        lazy::Lazy::spawn("ombres par rayons", move || {
-            let t0 = std::time::Instant::now();
-            device.push_error_scope(wgpu::ErrorFilter::Validation);
-            device.push_error_scope(wgpu::ErrorFilter::Internal);
-            let pipeline = lights::deferred_rt_pipeline(&device, &bgl, &def_bgl);
-            let internal = pollster::block_on(device.pop_error_scope());
-            let validation = pollster::block_on(device.pop_error_scope());
-            if let Some(e) = internal.or(validation) {
-                log::warn!("ombres par rayons refusées : les cartes d'ombre restent ({e})");
-                return Err(e.to_string());
-            }
-            log::info!(
-                "ombres par rayons compilées en {:.1} s (en tâche de fond)",
-                t0.elapsed().as_secs_f32()
-            );
-            Ok(pipeline)
-        })
     }
 
     /// Les lumières dynamiques ont-elles besoin de la grille de blocs (ombres) ?
@@ -2556,21 +2557,6 @@ impl Renderer {
         // une case de l'écran éclairée (sinon leurs passes n'ont rien à faire).
         let lights_on =
             self.dyn_gpu.active() && self.lit_pipes().is_some() && self.dyn_gpu.lit_rects() > 0;
-        // Ombres par lancer de rayons : réglage coché, ombres des blocs, et leur pipeline
-        // prêt (sinon les cartes, en attendant).
-        let rt_pipe = if self.dyn_gpu.rt_shadows_on() {
-            self.lit_rt
-                .as_ref()
-                .and_then(|l| l.try_get())
-                .and_then(|r| r.as_ref().ok())
-        } else {
-            None
-        };
-        if lights_on {
-            // (Au journal : quelles ombres des lumières, pour comparer les temps.)
-            let rt = rt_pipe.is_some();
-            perf::gauge("ombres des lumières par rayons", if rt { 1.0 } else { 0.0 });
-        }
         if let Some(t) = &taa.targets {
             // 1. Opaques : couleur, mouvement, et albédo et surface pour l'éclairage différé.
             let color = |view, load| {
@@ -2641,7 +2627,7 @@ impl Renderer {
                         &t.gbuf_views,
                         t.generation,
                         &t.color_view,
-                        rt_pipe.unwrap_or(&l.deferred),
+                        &l.deferred,
                         ts,
                     );
                 }
@@ -3076,6 +3062,135 @@ mod tests {
         assert!(worst < 2e-4, "écart {worst}");
     }
 
+    /// Les lumières retrouvent la position et la direction de chaque pixel depuis la
+    /// caméra, sans inverser la matrice : exactes sous tous les angles, avec le décalage du
+    /// TAA, même à 730 000 blocs de l'origine (le bug du ciel de la v108, revenu sur les
+    /// projecteurs jusqu'en v174).
+    #[test]
+    fn the_light_pixels_are_exact_far_from_the_origin() {
+        use glam::{DVec3, Mat4, Vec3, Vec4};
+        let (fov, aspect, near) = (1.2f64, 16.0f64 / 9.0, 0.05f32);
+        let (mut worst_dir, mut worst_pos, mut worst_ndc) = (0.0f64, 0.0f64, 0.0f64);
+        for (i, pos) in [
+            [0.0, 70.0, 0.0],
+            [-30.7, 151.6, -0.07],
+            [3_141.6, 64.2, -2_718.3],
+            [250_000.3, 180.2, -730_111.6],
+        ]
+        .iter()
+        .enumerate()
+        {
+            for k in 0..120 {
+                let yaw = k as f64 * 0.37 + i as f64;
+                let pitch = ((k * 7 % 31) as f64 / 31.0 - 0.5) * 3.0;
+                let fwd = DVec3::new(
+                    yaw.sin() * pitch.cos(),
+                    pitch.sin(),
+                    -yaw.cos() * pitch.cos(),
+                );
+                let eye = DVec3::from_array(*pos);
+                // Comme `render_taa` : décalage du TAA appliqué après la projection.
+                let (jx, jy) = ((k % 5) as f32 * 0.2 - 0.4, (k % 3) as f32 * 0.3 - 0.3);
+                let shift =
+                    Mat4::from_translation(Vec3::new(jx * 2.0 / 1600.0, -jy * 2.0 / 900.0, 0.0));
+                let vp = shift
+                    * Mat4::perspective_infinite_reverse_rh(fov as f32, aspect as f32, near)
+                    * Mat4::look_to_rh(eye.as_vec3(), fwd.as_vec3(), Vec3::Y);
+                let eye = eye.as_vec3().as_dvec3();
+                let right = fwd.cross(DVec3::Y).normalize();
+                let up = right.cross(fwd);
+                let t = (fov / 2.0).tan();
+                for ndc in [[0.0, 0.0], [0.9, -0.8], [-1.0, 1.0], [0.3, 0.95]] {
+                    let ray = fwd + right * (ndc[0] * t * aspect) + up * (ndc[1] * t);
+                    // Le pixel qui le montre, dans l'image décalée.
+                    let ndc_j = [
+                        ndc[0] as f32 + jx * 2.0 / 1600.0,
+                        ndc[1] as f32 - jy * 2.0 / 900.0,
+                    ];
+                    let got = view_ray(vp, ndc_j).as_dvec3();
+                    worst_dir = worst_dir.max((got.normalize() - ray.normalize()).length());
+                    for dist in [0.3f64, 6.0, 90.0] {
+                        // Profondeur enregistrée (Z inversé : proche / distance de vue).
+                        let depth = (near as f64 / dist) as f32;
+                        let off = view_ray(vp, ndc_j) * (vp.w_axis.z / depth);
+                        let want = ray * dist;
+                        worst_pos = worst_pos.max((off.as_dvec3() - want).length() / dist);
+                        // Et dans l'autre sens : le point projeté depuis la caméra.
+                        let c = eye_relative(vp) * Vec4::from((want.as_vec3(), 1.0));
+                        let e = ((c.x / c.w) as f64 - ndc_j[0] as f64)
+                            .abs()
+                            .max(((c.y / c.w) as f64 - ndc_j[1] as f64).abs());
+                        worst_ndc = worst_ndc.max(e);
+                    }
+                }
+            }
+        }
+        // Moins d'un centième de degré, d'un dix-millième de la distance, d'un dixième de
+        // pixel.
+        assert!(worst_dir < 2e-4, "direction : écart {worst_dir}");
+        assert!(worst_pos < 1e-4, "position : écart relatif {worst_pos}");
+        assert!(worst_ndc < 1e-4, "écran : écart {worst_ndc}");
+    }
+
+    /// Note pour la suite : retrouver une direction ou une position avec l'inverse de la
+    /// vue-projection fait tourner ou sauter l'image (projection sans plan lointain et
+    /// grandes coordonnées). C'est arrivé au ciel (v108) puis aux projecteurs (v175) : ce
+    /// test refuse que ça revienne, dans les shaders comme dans le code du jeu.
+    #[test]
+    fn nothing_rebuilds_the_view_with_the_inverse_matrix() {
+        // Morceaux recollés : ce test ne doit pas se trouver lui-même.
+        let inv_field = ["inv_", "view_proj"].concat();
+        let inverse = [".inv", "erse()"].concat();
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut bad = Vec::new();
+        let mut dirs = vec![crates];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.is_dir() {
+                    if name != "target" && !name.starts_with('.') {
+                        dirs.push(path);
+                    }
+                    continue;
+                }
+                let wgsl = name.ends_with(".wgsl");
+                if !wgsl && !name.ends_with(".rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    let l = line.trim_start();
+                    // Commentaires, et le champ des uniformes (déclaré et rempli pour leur
+                    // disposition).
+                    if l.starts_with("//") || l.starts_with(&format!("{inv_field}:")) {
+                        continue;
+                    }
+                    let wrong = if wgsl {
+                        l.contains(&inv_field)
+                    } else {
+                        l.contains(&inverse)
+                            && ["view_proj", "jittered", "proj", "vp"]
+                                .iter()
+                                .any(|m| l.contains(m))
+                    };
+                    if wrong {
+                        bad.push(format!("{}:{}: {l}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "Ne retrouve pas une direction ou une position avec l'inverse de la \
+             vue-projection : la projection n'a pas de plan lointain et les coordonnées sont \
+             grandes, les arrondis font tourner ou sauter l'image (ciel v108, projecteurs \
+             v175). Pars des lignes de la matrice : `view_ray` / `eye_relative` (Rust), \
+             `dl_view_ray` / `dl_view_offset` (dynlights.wgsl), `sky_dir` (world.wgsl).\n{}",
+            bad.join("\n")
+        );
+    }
+
     #[test]
     fn shaders_are_valid() {
         use wgpu::naga;
@@ -3114,10 +3229,6 @@ mod tests {
                 lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
             ),
             (
-                "dyn_deferred (rayons)",
-                lights::with_dynlights_rt(include_str!("shaders/dyn_deferred.wgsl")),
-            ),
-            (
                 "viewmodel",
                 include_str!("shaders/viewmodel.wgsl").to_string(),
             ),
@@ -3152,6 +3263,27 @@ mod tests {
             )
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            // Les liaisons des lumières (7 à 13 du groupe 0) ne sont visibles que des pixels :
+            // un sommet qui les lit fait refuser le pipeline à l'exécution.
+            for (i, ep) in module.entry_points.iter().enumerate() {
+                if ep.stage != naga::ShaderStage::Vertex {
+                    continue;
+                }
+                let fi = info.get_entry_point(i);
+                for (h, var) in module.global_variables.iter() {
+                    if fi[h].is_empty() {
+                        continue;
+                    }
+                    if let Some(b) = &var.binding {
+                        assert!(
+                            !(b.group == 0 && (7..=13).contains(&b.binding)),
+                            "{name} : le sommet {} lit la liaison {} des lumières",
+                            ep.name,
+                            b.binding
+                        );
+                    }
+                }
+            }
             drop(info);
             if name.starts_with("world") {
                 let g = module

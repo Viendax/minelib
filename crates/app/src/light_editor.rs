@@ -45,7 +45,8 @@ pub struct Cam {
 impl Cam {
     /// Point de l'écran (pixels) où se trouve `p`, s'il est devant la caméra.
     pub fn project(&self, p: Vec3) -> Option<(f32, f32)> {
-        let c = self.view_proj * Vec4::from((p, 1.0));
+        // Depuis la caméra : les guides ne tremblent pas loin de l'origine.
+        let c = minelib_render::eye_relative(self.view_proj) * Vec4::from((p - self.pos, 1.0));
         if c.w < 0.05 {
             return None;
         }
@@ -61,10 +62,8 @@ impl Cam {
             px.0 / self.size.0.max(1.0) * 2.0 - 1.0,
             1.0 - px.1 / self.size.1.max(1.0) * 2.0,
         );
-        // Point du plan proche (profondeur 1 en Z inversé).
-        let w = self.view_proj.inverse() * Vec4::new(ndc.0, ndc.1, 1.0, 1.0);
-        let p = w.truncate() / w.w;
-        (p - self.pos).normalize_or(self.look)
+        // Tirée des lignes de la matrice, sans l'inverser (voir `minelib_render::view_ray`).
+        minelib_render::view_ray(self.view_proj, [ndc.0, ndc.1]).normalize_or(self.look)
     }
 }
 
@@ -2069,6 +2068,15 @@ impl Editor {
                 ) {
                     r.vl_steps = v.round() as u32;
                 }
+                p.section("Résolution des rayons");
+                if let Some(k) = p.buttons(&["Moitié", "Quart"], Some((r.vl_scale >= 4) as usize))
+                {
+                    r.vl_scale = if k == 1 { 4 } else { 2 };
+                }
+                p.note(
+                    "Au quart, quatre fois moins de calcul pour une image presque identique (les rayons sont flous par nature).",
+                    DIM,
+                );
                 if let Some(v) = self.slider(
                     p,
                     202,
@@ -2211,11 +2219,6 @@ impl Editor {
                 );
                 self.check(p, "Ombres des joueurs", &mut r.entity_shadows);
                 self.check(p, "Cache des ombres", &mut r.shadow_cache);
-                self.check(p, "Ombres par lancer de rayons (essai)", &mut r.rt_shadows);
-                p.note(
-                    "Un rayon par pixel dans la grille de blocs au lieu des cartes d'ombre ; comparer les FPS dans le journal.",
-                    DIM,
-                );
 
                 if let Some(v) = self.slider(
                     p,

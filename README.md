@@ -259,6 +259,18 @@ crates/
 └── app/        le jeu : menus, modes, FPS, WorldEdit, réseau de partie
 ```
 
+### Pièges connus
+
+- **Ne jamais retrouver une direction ou une position du monde avec l'inverse de la
+  vue-projection** (`inv_view_proj`, `view_proj.inverse()`). La projection n'a pas de plan
+  lointain (Z inversé, à l'infini) et les coordonnées du monde sont grandes : les arrondis
+  de l'inversion et de la soustraction faussent la direction, et l'image tourne ou saute
+  quand on bouge la vue. C'est arrivé au ciel (v108), puis aux faisceaux des projecteurs
+  (v175 : 0,25° d'erreur à 1 000 blocs de l'origine, 2,4° à 10 000). Il faut partir des
+  lignes de la matrice : `view_ray` et `eye_relative` (crate `render`), `dl_view_ray` et
+  `dl_view_offset` (`dynlights.wgsl`), `sky_dir` (`world.wgsl`). Le test
+  `nothing_rebuilds_the_view_with_the_inverse_matrix` refuse tout retour en arrière.
+
 ### Relais
 
 Le relais met les joueurs en relation, transmet les données des parties, garde les comptes, le classement et les cartes. Le jeu le trouve tout seul (réseau local, puis DHT de BitTorrent, sinon ce PC devient le relais, joignable sans ouvrir de port grâce à iroh). `minelib-relay.exe` est le même relais sans le jeu ; les administrateurs (`admins.txt`) peuvent bannir un tricheur avec `/bantriche <pseudo> <preuve>`.

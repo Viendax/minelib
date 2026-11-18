@@ -54,10 +54,9 @@ struct DynHeader {
     sh: vec4<f32>,
     // x = intensité générale, y = force des reflets, z = nombre de bandes, w = douceur.
     surf: vec4<f32>,
-    // x = numéro de l'image (tramage), y = métamorphose du bruit, z = nombre de boîtes.
+    // x = numéro de l'image (tramage), y = métamorphose du bruit, z = nombre de boîtes,
+    // w = pixels de l'image par pixel des rayons, de côté (2 ou 4).
     misc: vec4<f32>,
-    // Grille de blocs (ombres par lancer de rayons) : coin bas (monde), w = 1 si envoyée.
-    vox: vec4<i32>,
     // Boîtes exactes des joueurs (tournées avec eux) : lignes de la matrice qui ramène le
     // monde au cube unité de chaque boîte.
     box_x: array<vec4<f32>, 48>,
@@ -81,7 +80,6 @@ const DL_TOON: u32 = 16u;
 const DL_SPECULAR: u32 = 32u;
 const DL_VOLUMETRIC: u32 = 64u;
 const DL_BOX_SHADOWS: u32 = 128u;
-const DL_RT_SHADOWS: u32 = 256u;
 
 /// Premier mot du masque des lumières de la tuile qui contient le pixel `frag` (pixels,
 /// origine en haut à gauche) d'une image de `size` pixels.
@@ -114,6 +112,35 @@ fn dl_rect_corner(vi: u32, r: vec4<f32>) -> vec4<f32> {
     let cx = f32((50u >> vi) & 1u);
     let cy = f32((44u >> vi) & 1u);
     return vec4<f32>(mix(r.x, r.z, cx), mix(r.y, r.w, cy), 0.0, 1.0);
+}
+
+// PIÈGE (ciel en v108, projecteurs en v175) : ne jamais retrouver une direction ou une
+// position du monde avec `inv_view_proj` (un point « proche » ou « lointain » dé-projeté,
+// moins la caméra). La projection n'a pas de plan lointain (Z inversé, à l'infini) et les
+// coordonnées du monde sont grandes : les arrondis de l'inversion et de la soustraction
+// faussent la direction, et l'image tourne ou saute quand on bouge la vue. Ces deux
+// fonctions partent des lignes de `view_proj`, sans inversion ni soustraction (même calcul
+// que `sky_dir` du ciel) ; le test `nothing_rebuilds_the_view_with_the_inverse_matrix`
+// refuse tout retour de `inv_view_proj`.
+
+/// Rayon de la caméra qui passe par le point `ndc` de l'écran, à l'échelle d'une unité de
+/// profondeur de vue (sa composante vers l'avant vaut 1). `m` : la matrice qui a dessiné
+/// l'image (avec le décalage du TAA).
+fn dl_view_ray(m: mat4x4<f32>, ndc: vec2<f32>) -> vec3<f32> {
+    let rx = vec3<f32>(m[0][0], m[1][0], m[2][0]);
+    let ry = vec3<f32>(m[0][1], m[1][1], m[2][1]);
+    let rw = vec3<f32>(m[0][3], m[1][3], m[2][3]);
+    // clip.x = rx·d, clip.y = ry·d, clip.w = rw·d (la caméra se projette en (0, 0, proche,
+    // 0)) ; on veut clip.xy = ndc × clip.w, puis clip.w = 1 (devant la caméra).
+    let d = cross(rx - ndc.x * rw, ry - ndc.y * rw);
+    return d / dot(rw, d);
+}
+
+/// Écart entre la caméra et le point de l'écran `ndc` à la profondeur `depth` (> 0) :
+/// Z inversé sans plan lointain, profondeur = proche / distance de vue, avec
+/// proche = m[3][2]. Pour la position du monde : caméra + cet écart.
+fn dl_view_offset(m: mat4x4<f32>, ndc: vec2<f32>, depth: f32) -> vec3<f32> {
+    return dl_view_ray(m, ndc) * (m[3][2] / depth);
 }
 
 /// Bruit par pixel (interleaved gradient noise), décalé à chaque image : le TAA lisse.
@@ -386,7 +413,6 @@ fn dl_one(
     entity: bool,
     noise: f32,
     boxes: bool,
-    frag: vec2<f32>,
 ) -> DynOut {
     var o = DynOut(vec3<f32>(0.0), vec3<f32>(0.0));
     let flags = dh.vl_c.w;
@@ -418,16 +444,7 @@ fn dl_one(
         }
         if att > 0.0 && ndl > 0.0 {
             if shadows_on && L.shadow.x > 0.5 {
-                // Essai : un rayon dans la grille de blocs au lieu de la carte d'ombre (hors de
-                // la grille, la carte reprend).
-                var vis = -1.0;
-                if (flags & DL_RT_SHADOWS) != 0u {
-                    vis = dl_rt_shadow(L, p, n, noise, frag);
-                }
-                if vis < 0.0 {
-                    vis = dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003);
-                }
-                att *= vis;
+                att *= dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003);
             }
             if boxes_on && att > 0.0 && (L.boxes.x | L.boxes.y) != 0u {
                 att *= 1.0 - dl_box_shadow(L, p + n * 0.02, entity);
@@ -479,7 +496,7 @@ fn dyn_light(
             }
             let b = firstTrailingBit(bits);
             bits = bits & (bits - 1u);
-            let c = dl_one(dlights[min(w * 32u + b, count - 1u)], p, n, v, gloss, entity, noise, true, frag);
+            let c = dl_one(dlights[min(w * 32u + b, count - 1u)], p, n, v, gloss, entity, noise, true);
             o.diffuse += c.diffuse;
             o.specular += c.specular;
         }
@@ -498,7 +515,7 @@ fn dyn_light_all(p: vec3<f32>, n: vec3<f32>, cam: vec3<f32>, gloss: f32, entity:
     let v = normalize(cam - p);
     let noise = dl_ign(frag);
     for (var i = 0u; i < count; i++) {
-        let c = dl_one(dlights[i], p, n, v, gloss, entity, noise, false, frag);
+        let c = dl_one(dlights[i], p, n, v, gloss, entity, noise, false);
         o.diffuse += c.diffuse;
         o.specular += c.specular;
     }
