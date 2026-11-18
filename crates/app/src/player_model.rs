@@ -357,6 +357,9 @@ fn aims(pose: &Pose) -> bool {
 const AIM_TURN_RIGHT: f32 = 0.15;
 const AIM_TURN_LEFT: f32 = -0.5;
 
+/// Hauteur d'une jambe (pixels) : la hanche est à cette hauteur quand on est debout.
+const LEG: f32 = 12.0;
+
 /// Pavés des six parties, dans l'ordre de `parts` et de `Skin::color` (jambe gauche, jambe
 /// droite, corps, bras gauche, bras droit, tête) : coins (pixels, repère de la partie) et
 /// sorte.
@@ -380,11 +383,16 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     let crouch = pose.crouch.clamp(0.0, 1.0);
     let lean = 0.45 * crouch;
     let drop = 0.3 / PX * crouch * 0.6;
-    // Jambes : pivot à la hanche (y = 12), balancement opposé.
+    // Jambes : pivot à la hanche (y = 12 ; elle descend de `drop` accroupi), balancement
+    // opposé. (v189) La jambe reste un seul pavé : elle se tasse de `drop` au lieu de se
+    // faire recouvrir au quart par le bas du corps, qui laissait voir un pli à la hanche.
+    // Les pieds restent au sol.
+    let shrink = (LEG - drop) / LEG;
     for (side, sign) in [(-2.0f32, 1.0f32), (2.0, -1.0)] {
         let xf = base
-            * Mat4::from_translation(Vec3::new(side, 12.0, 0.0))
-            * Mat4::from_rotation_x(swing * sign);
+            * Mat4::from_translation(Vec3::new(side, LEG - drop, 0.0))
+            * Mat4::from_rotation_x(swing * sign)
+            * Mat4::from_scale(Vec3::new(1.0, shrink, 1.0));
         let (min, max, part) = PARTS[out.len()];
         out.push((xf, min, max, part));
     }
@@ -1234,10 +1242,35 @@ pub fn bake_skin(tex: Option<&crate::skin::Skin>) -> Vec<[f32; 3]> {
     out
 }
 
+/// (v189) Pose d'un joueur à l'image d'avant : l'anticrénelage temporel en a besoin pour
+/// retrouver l'historique du bon pixel (voir `PlayerInstance`). Sa pose d'aujourd'hui s'il
+/// vient d'apparaître : il n'a pas d'historique à retrouver.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Prev {
+    pub feet: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub walk: f32,
+    pub swing: f32,
+    pub crouch: f32,
+}
+
+impl Prev {
+    /// La même pose qu'aujourd'hui (aucun mouvement à l'écran).
+    pub fn still(pose: &Pose) -> Self {
+        Prev {
+            feet: pose.feet,
+            yaw: pose.yaw,
+            pitch: pose.pitch,
+            walk: pose.walk,
+            swing: pose.swing,
+            crouch: pose.crouch,
+        }
+    }
+}
+
 /// Instance d'un autre joueur pour la carte : sa pose, sa lumière et la couche de son skin.
-/// `prev_feet` : ses pieds à l'image d'avant (anticrénelage temporel ; ses pieds d'
-/// aujourd'hui s'il vient d'apparaître).
-pub fn instance(pose: &Pose, layer: u32, prev_feet: Vec3) -> PlayerInstance {
+pub fn instance(pose: &Pose, layer: u32, prev: &Prev) -> PlayerInstance {
     let held = if aims(pose) {
         // (v177) Arme à feu : les deux bras tendus.
         PlayerInstance::HOLDS | PlayerInstance::AIMS
@@ -1255,7 +1288,12 @@ pub fn instance(pose: &Pose, layer: u32, prev_feet: Vec3) -> PlayerInstance {
         crouch: pose.crouch,
         light: pose.light.map(|c| c.clamp(0.0, 2.0)),
         skin: (layer & 0xffff) | held,
-        prev_feet: prev_feet.to_array(),
+        prev_feet: prev.feet.to_array(),
+        prev_yaw: prev.yaw,
+        prev_pitch: prev.pitch,
+        prev_walk: prev.walk,
+        prev_swing: prev.swing,
+        prev_crouch: prev.crouch,
     }
 }
 
@@ -1405,11 +1443,12 @@ mod tests {
         let lean = 0.45 * crouch;
         let drop = 0.3 / px * crouch * 0.6;
         let pitch = p.pitch.clamp(-1.4, 1.4);
+        let shrink = Mat4::from_scale(Vec3::new(1.0, (12.0 - drop) / 12.0, 1.0));
         if part == 0 {
-            return base * t(-2.0, 12.0, 0.0) * Mat4::from_rotation_x(swing);
+            return base * t(-2.0, 12.0 - drop, 0.0) * Mat4::from_rotation_x(swing) * shrink;
         }
         if part == 1 {
-            return base * t(2.0, 12.0, 0.0) * Mat4::from_rotation_x(-swing);
+            return base * t(2.0, 12.0 - drop, 0.0) * Mat4::from_rotation_x(-swing) * shrink;
         }
         let upper = base * t(0.0, 12.0 - drop, 0.0) * Mat4::from_rotation_x(-lean);
         if part == 2 {
@@ -1495,7 +1534,7 @@ mod tests {
         assert_eq!(mesh.len(), 216);
         for pose in test_poses() {
             let baked = bake_skin(pose.skin.as_deref());
-            let inst = instance(&pose, 7, pose.feet);
+            let inst = instance(&pose, 7, &Prev::still(&pose));
             assert_eq!(inst.skin & 0xffff, 7);
             assert_eq!(inst.skin & PlayerInstance::HOLDS != 0, pose.held.is_some());
             let cpu = build(&pose);
@@ -1557,7 +1596,7 @@ mod tests {
             let body = build(&pose);
             let body = &body[..body.len() - held_model(&pose, true).len()];
             let skins = vec![(3, bake_skin(pose.skin.as_deref()))];
-            let players = [instance(&pose, 3, pose.feet)];
+            let players = [instance(&pose, 3, &Prev::still(&pose))];
             for view in 0..3 {
                 let a = pose.yaw + [0.4, 2.8, -1.7][view] + n as f32;
                 let target = pose.feet + Vec3::Y * 1.0;

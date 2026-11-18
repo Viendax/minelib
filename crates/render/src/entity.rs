@@ -80,9 +80,17 @@ pub struct PlayerInstance {
     /// caméra immobile n'a aucun mouvement à l'écran, et l'anticrénelage mélange plusieurs
     /// images de lui : il traîne (vu dans l'essai de foule).
     ///
-    /// (Dernier champ : `vertex_attr_array!` place les attributs dans l'ordre déclaré, qui
-    /// doit suivre l'ordre des champs.)
+    /// (Ces champs à la fin : `vertex_attr_array!` place les attributs dans l'ordre
+    /// déclaré, qui doit suivre l'ordre des champs.)
     pub prev_feet: [f32; 3],
+    /// (v189) Le reste de sa pose à l'image d'avant : son regard, puis sa marche et son
+    /// accroupissement. Sans eux, un joueur qui tourne ou balance les bras sans se déplacer
+    /// n'a toujours aucun mouvement à l'écran, et ses membres traînent.
+    pub prev_yaw: f32,
+    pub prev_pitch: f32,
+    pub prev_walk: f32,
+    pub prev_swing: f32,
+    pub prev_crouch: f32,
 }
 
 impl PlayerInstance {
@@ -116,13 +124,15 @@ fn half(x: f32) -> u16 {
 /// l'ordre déclaré : cet ordre doit donc suivre celui des champs de la structure (essai
 /// `instance_attributes_follow_the_struct_fields`). Les emplacements 0 à 3 et 9 sont pris
 /// par le modèle (`MESH`).
-const PLAYER_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+const PLAYER_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
     4 => Float32x3,
     5 => Float32x2,
     6 => Float32x3,
     7 => Float32x3,
     8 => Uint32,
-    10 => Float32x3
+    10 => Float32x3,
+    11 => Float32x2,
+    12 => Float32x3
 ];
 
 /// Joueurs dessinés au plus par image, et skins différents gardés sur la carte graphique.
@@ -232,7 +242,7 @@ impl Players {
             3 => Float32x3,
             9 => Float32x4
         ];
-        const INSTANCE: [wgpu::VertexAttribute; 6] = PLAYER_ATTRS;
+        const INSTANCE: [wgpu::VertexAttribute; 8] = PLAYER_ATTRS;
         let pipeline = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -834,6 +844,8 @@ mod tests {
             (7, std::mem::offset_of!(PlayerInstance, light)),
             (8, std::mem::offset_of!(PlayerInstance, skin)),
             (10, std::mem::offset_of!(PlayerInstance, prev_feet)),
+            (11, std::mem::offset_of!(PlayerInstance, prev_yaw)),
+            (12, std::mem::offset_of!(PlayerInstance, prev_walk)),
         ];
         assert_eq!(PLAYER_ATTRS.len(), want.len());
         for (a, (location, offset)) in PLAYER_ATTRS.iter().zip(want) {
@@ -843,6 +855,9 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PlayerInstance, pitch), 16);
         assert_eq!(std::mem::offset_of!(PlayerInstance, swing), 24);
         assert_eq!(std::mem::offset_of!(PlayerInstance, crouch), 28);
+        assert_eq!(std::mem::offset_of!(PlayerInstance, prev_pitch), 64);
+        assert_eq!(std::mem::offset_of!(PlayerInstance, prev_swing), 72);
+        assert_eq!(std::mem::offset_of!(PlayerInstance, prev_crouch), 76);
     }
 
     #[test]
@@ -875,7 +890,7 @@ mod tests {
     #[test]
     fn player_buffers_match_the_shader_layout() {
         assert_eq!(std::mem::size_of::<PlayerVertex>(), 52);
-        // (v187 : 48 + les pieds de l'image d'avant.)
-        assert_eq!(std::mem::size_of::<PlayerInstance>(), 60);
+        // (48, plus la pose de l'image d'avant : pieds, regard, marche.)
+        assert_eq!(std::mem::size_of::<PlayerInstance>(), 80);
     }
 }

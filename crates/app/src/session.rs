@@ -1548,15 +1548,29 @@ impl Session {
             } else {
                 self.crowd = None;
             }
-            let mut seen: Vec<(String, Vec3)> = Vec::new();
+            // (Avec leur pose : l'anticrénelage temporel a besoin de celle de l'image
+            // d'avant, voir `Walk`.)
+            let mut seen: Vec<(String, Vec3, f32, f32, f32)> = Vec::new();
             if let Some(n) = &self.net {
-                seen.extend(n.views().iter().map(|v| (v.pseudo.clone(), v.pos)));
+                seen.extend(
+                    n.views()
+                        .iter()
+                        .map(|v| (v.pseudo.clone(), v.pos, v.yaw, v.pitch, v.crouch)),
+                );
             }
             if let Some(b) = &self.build {
-                seen.extend(b.others.values().map(|o| (o.pseudo.clone(), o.pos)));
+                seen.extend(
+                    b.others
+                        .values()
+                        .map(|o| (o.pseudo.clone(), o.pos, o.yaw, o.pitch, o.crouch)),
+                );
             }
             if let Some(c) = &self.crowd {
-                seen.extend(c.npcs.iter().map(|n| (n.name.clone(), n.pos)));
+                seen.extend(
+                    c.npcs
+                        .iter()
+                        .map(|n| (n.name.clone(), n.pos, n.yaw, n.pitch, 0.0)),
+                );
             }
             // (Des milliers de joueurs : un ensemble, pas une recherche dans la liste pour
             // chacun.)
@@ -1565,11 +1579,11 @@ impl Session {
                     seen.iter().map(|s| s.0.as_str()).collect();
                 self.walks.retain(|k, _| names.contains(k.as_str()));
             }
-            for (name, pos) in seen {
+            for (name, pos, yaw, pitch, crouch) in seen {
                 self.walks
                     .entry(name)
                     .or_insert_with(|| Walk::new(pos))
-                    .update(pos, dt);
+                    .update(pos, yaw, pitch, crouch, dt);
             }
             let target = (speed / 4.3).min(1.0);
             self.walk_amp += (target - self.walk_amp) * (dt * 10.0).min(1.0);
@@ -5968,7 +5982,7 @@ impl Session {
         );
         let vp = proj * self.view_with_punch();
         let cam = self.camera_pos();
-        // (v188) Les plus loin d'abord : les pseudos proches passent devant.
+        // (v189) Les plus loin d'abord : les pseudos proches passent devant.
         let mut labels: Vec<(f32, &str, Vec3)> = near
             .into_iter()
             .map(|(pseudo, pos)| {
@@ -6441,11 +6455,7 @@ impl Session {
                 // (v177) Ce qu'il a en main, avec son vrai modèle : arme, couteau (255),
                 // grenade ou bombe.
                 let held = Some(Held::Gear(v.weapon));
-                let w = self
-                    .walks
-                    .get(&v.pseudo)
-                    .copied()
-                    .unwrap_or_else(|| Walk::new(v.pos));
+                let w = self.walks.get(&v.pseudo).copied().unwrap_or_default();
                 let other = crate::player_model::Pose {
                     feet: v.pos,
                     yaw: v.yaw,
@@ -6463,7 +6473,8 @@ impl Session {
                     continue;
                 }
                 let layer = layers.layer(other.skin.as_ref(), renderer);
-                players.push(crate::player_model::instance(&other, layer, w.prev));
+                let prev = Walk::prev_of(&self.walks, &v.pseudo, &other);
+                players.push(crate::player_model::instance(&other, layer, &prev));
                 // (v177) Le modèle de son arme de près, sa silhouette de loin.
                 let near = v.pos.distance_squared(cam) < GEAR_DETAIL * GEAR_DETAIL;
                 model.extend(crate::player_model::held_model(&other, near));
@@ -6550,7 +6561,7 @@ impl Session {
                     .total_cmp(&c.1.distance_squared(cam))
             });
             for (rank, &(pseudo, pos, yaw, pitch, crouch)) in others.iter().enumerate() {
-                let w = self.walks.get(pseudo).copied().unwrap_or_else(|| Walk::new(pos));
+                let w = self.walks.get(pseudo).copied().unwrap_or_default();
                 let other = crate::player_model::Pose {
                     feet: pos,
                     yaw,
@@ -6567,7 +6578,8 @@ impl Session {
                 }
                 if players.len() < minelib_render::MAX_PLAYERS {
                     let layer = layers.layer(other.skin.as_ref(), renderer);
-                    players.push(crate::player_model::instance(&other, layer, w.prev));
+                    let prev = Walk::prev_of(&self.walks, pseudo, &other);
+                    players.push(crate::player_model::instance(&other, layer, &prev));
                 } else {
                     model.extend(crate::player_model::build_tiny(&other));
                 }
@@ -6831,16 +6843,16 @@ fn same_family(a: BlockId, b: BlockId) -> bool {
 }
 
 /// (v172) Distance (blocs) où les pseudos des autres joueurs ont leur taille normale.
-/// (v188) 8 au lieu de 6,5 : un peu plus grands à toute distance.
+/// (v189) 8 au lieu de 6,5 : un peu plus grands à toute distance.
 const NAME_SIZE_AT: f32 = 8.0;
 
-/// (v188) Pseudos des autres joueurs (et des NPC) affichés jusqu'à cette distance (blocs),
+/// (v189) Pseudos des autres joueurs (et des NPC) affichés jusqu'à cette distance (blocs),
 /// effacés peu à peu sur les [`NAME_FADE`] derniers blocs. Avant : jusqu'à ce que le texte
 /// passe sous 7 pixels de haut, 15 à 22 blocs selon la taille de l'écran.
 const NAME_RANGE: f32 = 32.0;
 const NAME_FADE: f32 = 4.0;
 
-/// (v188) Pseudo à `d` blocs de la caméra (`s` : échelle de l'interface) : taille du texte
+/// (v189) Pseudo à `d` blocs de la caméra (`s` : échelle de l'interface) : taille du texte
 /// et opacité, `None` s'il n'est pas affiché. Taille comme celle d'un objet du monde (v172),
 /// plus petite plus loin, plus grande plus près (4 fois au plus), mais jamais sous celle de
 /// la police (8 pixels de haut) : lisible jusqu'au bout.
@@ -7313,8 +7325,8 @@ fn stairs_placement(hit: &Hit, item: BlockId, look: Vec3, point: Vec3) -> Option
 pub struct Walk {
     pub phase: f32,
     pub amp: f32,
-    /// Sa position à l'image d'avant (anticrénelage temporel : voir `PlayerInstance`).
-    prev: Vec3,
+    /// (v189) Sa pose à l'image d'avant (anticrénelage temporel : voir `PlayerInstance`).
+    prev: crate::player_model::Prev,
     last: Vec3,
     speed: f32,
 }
@@ -7322,15 +7334,33 @@ pub struct Walk {
 impl Walk {
     fn new(pos: Vec3) -> Self {
         Walk {
-            prev: pos,
+            prev: crate::player_model::Prev {
+                feet: pos,
+                ..Default::default()
+            },
             last: pos,
             ..Default::default()
         }
     }
 
-    fn update(&mut self, pos: Vec3, dt: f32) {
+    /// Sa pose à l'image d'avant, ou celle d'aujourd'hui s'il vient d'apparaître.
+    fn prev_of(walks: &HashMap<String, Walk>, pseudo: &str, pose: &crate::player_model::Pose) -> crate::player_model::Prev {
+        walks
+            .get(pseudo)
+            .map(|w| w.prev)
+            .unwrap_or_else(|| crate::player_model::Prev::still(pose))
+    }
+
+    fn update(&mut self, pos: Vec3, yaw: f32, pitch: f32, crouch: f32, dt: f32) {
         let d = pos - self.last;
-        self.prev = self.last;
+        self.prev = crate::player_model::Prev {
+            feet: self.last,
+            yaw,
+            pitch,
+            walk: self.phase,
+            swing: self.amp,
+            crouch,
+        };
         self.last = pos;
         let v = if dt > 0.0 {
             Vec3::new(d.x, 0.0, d.z).length() / dt
@@ -7933,7 +7963,7 @@ fn side_of_start(start: u8, i: u32) -> u8 {
 mod name_tests {
     use super::*;
 
-    /// (v188) Pseudos des NPC et des joueurs : un peu plus grands à toute distance, et
+    /// (v189) Pseudos des NPC et des joueurs : un peu plus grands à toute distance, et
     /// lisibles bien plus loin (avant, ils disparaissaient sous 7 pixels de haut).
     #[test]
     fn names_are_a_bit_bigger_and_seen_from_further() {

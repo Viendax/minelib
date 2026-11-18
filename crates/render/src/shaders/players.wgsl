@@ -23,8 +23,10 @@ struct PlayerIn {
     @location(4) feet: vec3<f32>,
     @location(5) look: vec2<f32>,
     @location(6) motion: vec3<f32>,
-    /// (v187) Ses pieds à l'image d'avant (anticrénelage temporel).
+    /// (v187) Sa pose à l'image d'avant (anticrénelage temporel) : pieds, regard, marche.
     @location(10) prev_feet: vec3<f32>,
+    @location(11) prev_look: vec2<f32>,
+    @location(12) prev_motion: vec3<f32>,
     @location(7) light: vec3<f32>,
     @location(8) skin: u32,
     // Rectangle de la face dans l'image du skin (0..1 : u0, v0, u1, v1) : la lecture y
@@ -50,6 +52,16 @@ fn m_trans(t: vec3<f32>) -> mat4x4<f32> {
         vec4<f32>(0.0, 1.0, 0.0, 0.0),
         vec4<f32>(0.0, 0.0, 1.0, 0.0),
         vec4<f32>(t, 1.0),
+    );
+}
+
+/// Tassement d'une jambe accroupie (voir `part_matrix`).
+fn m_scale_y(k: f32) -> mat4x4<f32> {
+    return mat4x4<f32>(
+        vec4<f32>(1.0, 0.0, 0.0, 0.0),
+        vec4<f32>(0.0, k, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, 1.0, 0.0),
+        vec4<f32>(0.0, 0.0, 0.0, 1.0),
     );
 }
 
@@ -95,11 +107,14 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     let lean = 0.45 * crouch;
     let drop = 0.3 / px * crouch * 0.6;
     let pitch = clamp(v.look.y, -1.4, 1.4);
+    // (v189) Jambe d'un seul morceau : accroupi, elle se tasse de `drop` au lieu de se
+    // faire recouvrir au quart par le bas du corps (pli visible à la hanche). Pieds au sol.
+    let shrink = m_scale_y((12.0 - drop) / 12.0);
     if part == 0u {
-        return base * m_trans(vec3<f32>(-2.0, 12.0, 0.0)) * m_rot_x(swing);
+        return base * m_trans(vec3<f32>(-2.0, 12.0 - drop, 0.0)) * m_rot_x(swing) * shrink;
     }
     if part == 1u {
-        return base * m_trans(vec3<f32>(2.0, 12.0, 0.0)) * m_rot_x(-swing);
+        return base * m_trans(vec3<f32>(2.0, 12.0 - drop, 0.0)) * m_rot_x(-swing) * shrink;
     }
     let upper = base * m_trans(vec3<f32>(0.0, 12.0 - drop, 0.0)) * m_rot_x(-lean);
     if part == 2u {
@@ -143,9 +158,13 @@ fn vs_player(v: PlayerIn) -> PlayerOut {
     let n = normalize((xf * vec4<f32>(v.normal, 0.0)).xyz);
     var o: PlayerOut;
     o.clip = g.view_proj * vec4<f32>(world, 1.0);
-    // (v187) Où ce point était à l'image d'avant : le joueur s'est déplacé de
-    // `prev_feet - feet` (le balancement des membres, lui, est négligé).
-    o.prev_world = world + (v.prev_feet - v.feet);
+    // (v187) Où ce point était à l'image d'avant : la même partie du corps, dans la pose
+    // de l'image d'avant (déplacement, demi-tour et balancement des membres compris).
+    var p = v;
+    p.feet = v.prev_feet;
+    p.look = v.prev_look;
+    p.motion = v.prev_motion;
+    o.prev_world = (part_matrix(v.part, p) * vec4<f32>(v.pos, 1.0)).xyz;
     o.uv = v.uv;
     o.layer = i32(v.skin & 0xffffu);
     o.world = world;
