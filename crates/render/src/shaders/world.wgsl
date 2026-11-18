@@ -43,7 +43,9 @@ struct Globals {
     ray_max: array<vec4<f32>, 8>,
     // Rectangle de texture (u0, v0, u1, v1) d'un morceau de bloc tenu (sortes 4 et 7).
     ray_uv: array<vec4<f32>, 8>,
-    // Ombres des joueurs : x = nombre de boîtes, coins min et max (monde).
+    // Ombres des joueurs : x = nombre de boîtes, coins min et max (monde). min.w : source de
+    // lumière dont la boîte fait l'ombre (partie entière : −1 aucune, −2 la torche tenue),
+    // plus 0,5 si le soleil n'atteint pas la boîte (pas d'ombre du soleil).
     shadow_info: vec4<f32>,
     shadow_min: array<vec4<f32>, 48>,
     shadow_max: array<vec4<f32>, 48>,
@@ -378,18 +380,24 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
     let t = g.cam_pos.w;
     let flicker = 0.93 + 0.07 * sin(t * 9.0 + hash3(cell / vec3<i32>(4)) * 6.28);
     var torch = pow(i.light, vec3<f32>(2.0)) * g.light.y * flicker * mix(0.55, 1.0, i.ao);
-    if shadows && max(i.light.x, max(i.light.y, i.light.z)) > 0.05 {
-        torch = max(torch - torch_shadow(shadow_from) * flicker, torch * 0.35);
+    let lit = max(i.light.x, max(i.light.y, i.light.z)) > 0.05;
+    var ts = vec4<f32>(0.0);
+    if shadows && (lit || g.held_pos.w > 0.0) {
+        ts = torch_shadow(shadow_from);
     }
-    // Lumière de la torche tenue en main (dynamique, sans ombres) : décroît avec la distance,
-    // plus forte sur les faces tournées vers le joueur.
+    if lit {
+        torch = max(torch - ts.rgb * flicker, torch * 0.35);
+    }
+    // Lumière de la torche tenue en main (dynamique) : décroît avec la distance, plus forte
+    // sur les faces tournées vers le joueur ; un joueur entre elle et la face y fait son
+    // ombre, comme pour les torches posées.
     if g.held_pos.w > 0.0 {
         let to_l = g.held_pos.xyz - i.world;
         let d = length(to_l);
         let f = clamp(1.0 - d / g.held_pos.w, 0.0, 1.0);
         let facing = max(dot(n, to_l / max(d, 1e-3)), 0.0) * 0.6 + 0.4;
         let held = g.held_color.rgb * f * f * facing * flicker * mix(0.6, 1.0, i.ao);
-        torch = max(torch, held);
+        torch = max(torch, held * select(1.0, 0.35, ts.a > 0.5));
     }
     // Lumière des torches renvoyée par les miroirs (raytracing).
     if g.rt.x > 0.5 && g.light.w > 0.0 {
@@ -1377,8 +1385,9 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
         if dot(c - o, c - o) > 576.0 {
             continue;
         }
-        // Le point est dans la boîte (pieds du joueur) : pas d'ombre sur lui-même.
-        if all(o > mn) && all(o < mx) {
+        // Le point est dans la boîte (pieds du joueur) : pas d'ombre sur lui-même. Des
+        // blocs cachent la boîte du soleil : elle n'en fait pas d'ombre.
+        if (all(o > mn) && all(o < mx)) || fract(g.shadow_min[k].w) > 0.25 {
             continue;
         }
         let t0 = (mn - o) * inv;
@@ -1393,9 +1402,10 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
 }
 
 /// Lumière d'une source cachée par un joueur : chaque boîte ne fait de l'ombre que pour
-/// sa source la plus proche (choisie par le jeu), un seul essai par boîte voisine.
-fn torch_shadow(p: vec3<f32>) -> vec3<f32> {
-    var c = vec3<f32>(0.0);
+/// sa source la plus proche (choisie par le jeu), un seul essai par boîte voisine. rgb :
+/// lumière des torches posées retirée ; a = 1 : la torche tenue en main est cachée.
+fn torch_shadow(p: vec3<f32>) -> vec4<f32> {
+    var c = vec4<f32>(0.0);
     let n = u32(g.shadow_info.x);
     // Trop loin de toutes les boîtes (boule qui les contient) : aucune ombre possible.
     let bm = g.shadow_info.yzw - p;
@@ -1404,14 +1414,20 @@ fn torch_shadow(p: vec3<f32>) -> vec3<f32> {
         return c;
     }
     for (var k = 0u; k < n; k++) {
-        let j = i32(g.shadow_min[k].w);
+        let j = i32(floor(g.shadow_min[k].w));
         let mn = g.shadow_min[k].xyz;
         let mx = g.shadow_max[k].xyz;
         let m = (mn + mx) * 0.5 - p;
-        if j < 0 || dot(m, m) > 36.0 || (all(p > mn) && all(p < mx)) {
+        if j == -1 || dot(m, m) > 36.0 || (all(p > mn) && all(p < mx)) {
             continue;
         }
-        let to_l = g.lights_pos[j].xyz - p;
+        let held = j == -2;
+        let lp = select(g.lights_pos[max(j, 0)].xyz, g.held_pos.xyz, held);
+        // Torche tenue dans la boîte (la main qui la tient) : pas d'ombre de celle-ci.
+        if held && (g.held_pos.w <= 0.0 || (all(lp > mn) && all(lp < mx))) {
+            continue;
+        }
+        let to_l = lp - p;
         let d = length(to_l);
         if d < 0.3 || d > 14.0 {
             continue;
@@ -1423,7 +1439,11 @@ fn torch_shadow(p: vec3<f32>) -> vec3<f32> {
         let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
         let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
         if far >= max(near, 0.0) && near < d {
-            c = max(c, g.lights_col[j].rgb * torch_falloff(d));
+            if held {
+                c.a = 1.0;
+            } else {
+                c = vec4<f32>(max(c.rgb, g.lights_col[j].rgb * torch_falloff(d)), c.a);
+            }
         }
     }
     return c;

@@ -148,6 +148,10 @@ pub struct DynSettings {
     pub shadow_quality: u8,
     /// Cartes gardées tant que rien ne change (sinon recalculées à chaque image).
     pub shadow_cache: bool,
+    /// Essai : ombres des surfaces par un rayon dans la grille de blocs (pénombre lissée
+    /// par l'anticrénelage) au lieu des cartes d'ombre ; les cartes restent pour les rayons
+    /// volumétriques, les translucides et hors de la grille.
+    pub rt_shadows: bool,
     /// Douceur des ombres par défaut (taille de la source, blocs).
     pub softness: f32,
     /// Cases d'ombre recalculées au plus par image (les premiers calculs passent avant).
@@ -187,6 +191,7 @@ impl Default for DynSettings {
             entity_shadows: true,
             shadow_quality: 1,
             shadow_cache: true,
+            rt_shadows: false,
             softness: 0.1,
             bake_budget: 12,
             volumetric: true,
@@ -276,6 +281,8 @@ pub(crate) struct GpuHeader {
     sh: [f32; 4],
     surf: [f32; 4],
     misc: [f32; 4],
+    /// Grille de blocs : coin bas (monde), w = 1 si elle est envoyée (ombres par rayons).
+    vox: [i32; 4],
     /// Boîtes exactes des joueurs : lignes de la matrice monde → cube unité.
     box_x: [[f32; 4]; MAX_BOXES],
     box_y: [[f32; 4]; MAX_BOXES],
@@ -306,6 +313,7 @@ const F_TOON: u32 = 16;
 const F_SPECULAR: u32 = 32;
 const F_VOLUMETRIC: u32 = 64;
 const F_BOX_SHADOWS: u32 = 128;
+const F_RT_SHADOWS: u32 = 256;
 
 /// Repère d'un projecteur dirigé selon `d` : (droite, haut, avant) — le même que
 /// `dl_spot_basis` dans dynlights.wgsl.
@@ -1056,9 +1064,21 @@ fn tex_entry(
 /// Source WGSL complète d'un shader qui utilise les lumières dynamiques.
 pub(crate) fn with_dynlights(src: &str) -> String {
     format!(
-        "{src}\n{}\n{}",
+        "{src}\n{}\n{}\n{}",
         include_str!("shaders/gbuffer.wgsl"),
-        include_str!("shaders/dynlights.wgsl")
+        include_str!("shaders/dynlights.wgsl"),
+        include_str!("shaders/dl_rt_off.wgsl")
+    )
+}
+
+/// Comme `with_dynlights`, avec les ombres par lancer de rayons dans la grille de blocs
+/// (essai, éclairage différé seulement : il déclare les liaisons 1 à 4 du monde).
+pub(crate) fn with_dynlights_rt(src: &str) -> String {
+    format!(
+        "{src}\n{}\n{}\n{}",
+        include_str!("shaders/gbuffer.wgsl"),
+        include_str!("shaders/dynlights.wgsl"),
+        include_str!("shaders/dl_rt.wgsl")
     )
 }
 
@@ -1122,7 +1142,7 @@ pub(crate) fn light_pipes(
     });
     // Éclairage différé : lit le monde (groupe 0, lumières comprises) et ce que les
     // opaques ont laissé (groupe 1).
-    let def_src = with_dynlights(include_str!("shaders/dyn_deferred.wgsl"));
+    let def_src = with_dynlights_rt(include_str!("shaders/dyn_deferred.wgsl"));
     let def_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("éclairage différé"),
         source: wgpu::ShaderSource::Wgsl(def_src.into()),
@@ -1707,6 +1727,11 @@ impl DynGpu {
 
     /// Lumières et réglages de la prochaine image. Renvoie vrai si quelque chose a changé
     /// depuis l'image précédente (lumière déplacée, réglée, ajoutée ou retirée).
+    /// Réglages en cours.
+    pub fn settings(&self) -> &DynSettings {
+        &self.settings
+    }
+
     pub fn set(&mut self, lights: &[DynLight], settings: &DynSettings) -> bool {
         let lights = &lights[..lights.len().min(MAX_DYN_LIGHTS)];
         let changed = self.lights.as_slice() != lights || self.settings != *settings;
@@ -1917,6 +1942,9 @@ impl DynGpu {
         if box_shadows {
             flags |= F_BOX_SHADOWS;
         }
+        if st.shadows && st.rt_shadows && voxels.is_some() {
+            flags |= F_RT_SHADOWS;
+        }
         let mut box_x = [[0.0; 4]; MAX_BOXES];
         let mut box_y = [[0.0; 4]; MAX_BOXES];
         let mut box_z = [[0.0; 4]; MAX_BOXES];
@@ -1964,6 +1992,7 @@ impl DynGpu {
                 nboxes as f32,
                 0.0,
             ],
+            vox: voxels.map_or([0; 4], |o| [o[0], o[1], o[2], 1]),
             box_x,
             box_y,
             box_z,
@@ -2623,6 +2652,7 @@ mod tests {
             min: a,
             max: c,
             to_unit: [[0.0; 4]; 3],
+            sunlit: true,
         };
         let boxes = [
             b([0.0, 0.0, 0.0], [1.0, 2.0, 1.0]),

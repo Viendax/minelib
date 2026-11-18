@@ -55,6 +55,8 @@ struct DynHeader {
     surf: vec4<f32>,
     // x = numéro de l'image (tramage), y = métamorphose du bruit, z = nombre de boîtes.
     misc: vec4<f32>,
+    // Grille de blocs (ombres par lancer de rayons) : coin bas (monde), w = 1 si envoyée.
+    vox: vec4<i32>,
     // Boîtes exactes des joueurs (tournées avec eux) : lignes de la matrice qui ramène le
     // monde au cube unité de chaque boîte.
     box_x: array<vec4<f32>, 48>,
@@ -78,6 +80,7 @@ const DL_TOON: u32 = 16u;
 const DL_SPECULAR: u32 = 32u;
 const DL_VOLUMETRIC: u32 = 64u;
 const DL_BOX_SHADOWS: u32 = 128u;
+const DL_RT_SHADOWS: u32 = 256u;
 
 /// Premier mot du masque des lumières de la tuile qui contient le pixel `frag` (pixels,
 /// origine en haut à gauche) d'une image de `size` pixels.
@@ -382,6 +385,7 @@ fn dl_one(
     entity: bool,
     noise: f32,
     boxes: bool,
+    frag: vec2<f32>,
 ) -> DynOut {
     var o = DynOut(vec3<f32>(0.0), vec3<f32>(0.0));
     let flags = dh.vl_c.w;
@@ -413,7 +417,16 @@ fn dl_one(
         }
         if att > 0.0 && ndl > 0.0 {
             if shadows_on && L.shadow.x > 0.5 {
-                att *= dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003);
+                // Essai : un rayon dans la grille de blocs au lieu de la carte d'ombre (hors de
+                // la grille, la carte reprend).
+                var vis = -1.0;
+                if (flags & DL_RT_SHADOWS) != 0u {
+                    vis = dl_rt_shadow(L, p, n, noise, frag);
+                }
+                if vis < 0.0 {
+                    vis = dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003);
+                }
+                att *= vis;
             }
             if boxes_on && att > 0.0 && (L.boxes.x | L.boxes.y) != 0u {
                 att *= 1.0 - dl_box_shadow(L, p + n * 0.02, entity);
@@ -465,7 +478,7 @@ fn dyn_light(
             }
             let b = firstTrailingBit(bits);
             bits = bits & (bits - 1u);
-            let c = dl_one(dlights[min(w * 32u + b, count - 1u)], p, n, v, gloss, entity, noise, true);
+            let c = dl_one(dlights[min(w * 32u + b, count - 1u)], p, n, v, gloss, entity, noise, true, frag);
             o.diffuse += c.diffuse;
             o.specular += c.specular;
         }
@@ -484,7 +497,7 @@ fn dyn_light_all(p: vec3<f32>, n: vec3<f32>, cam: vec3<f32>, gloss: f32, entity:
     let v = normalize(cam - p);
     let noise = dl_ign(frag);
     for (var i = 0u; i < count; i++) {
-        let c = dl_one(dlights[i], p, n, v, gloss, entity, noise, false);
+        let c = dl_one(dlights[i], p, n, v, gloss, entity, noise, false, frag);
         o.diffuse += c.diffuse;
         o.specular += c.specular;
     }

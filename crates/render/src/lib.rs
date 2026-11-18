@@ -246,6 +246,8 @@ pub struct ShadowBox {
     /// Les trois lignes de la matrice qui ramène le monde au cube unité de la boîte exacte
     /// (0 à 1 sur chaque axe) : ombres exactes des lumières dynamiques.
     pub to_unit: [[f32; 4]; 3],
+    /// Le soleil l'atteint (aucun bloc entre elle et lui) : sinon, pas d'ombre du soleil.
+    pub sunlit: bool,
 }
 
 impl ShadowBox {
@@ -269,6 +271,7 @@ impl ShadowBox {
             min: min.into(),
             max: max.into(),
             to_unit: [0, 1, 2].map(|i| to_unit.row(i).to_array()),
+            sunlit: true,
         }
     }
 }
@@ -277,6 +280,7 @@ impl ShadowBox {
 fn shadow_globals(
     boxes: &[ShadowBox],
     lights: &[[f32; 4]],
+    held: Option<[f32; 3]>,
 ) -> (
     [f32; 4],
     [[f32; 4]; MAX_SHADOW_BOXES],
@@ -285,22 +289,24 @@ fn shadow_globals(
     let n = boxes.len().min(MAX_SHADOW_BOXES);
     let mut mn = [[0.0; 4]; MAX_SHADOW_BOXES];
     let mut mx = [[0.0; 4]; MAX_SHADOW_BOXES];
-    for (i, ShadowBox { min: a, max: b, .. }) in boxes.iter().take(n).enumerate() {
+    for (i, b) in boxes.iter().take(n).enumerate() {
+        let (a, bb) = (b.min, b.max);
         // Source de lumière la plus proche (à moins de 10 blocs) : la seule dont ce
-        // morceau de joueur projette l'ombre (−1 : aucune). Le shader n'a ainsi qu'un
-        // essai par boîte.
-        let c = [0, 1, 2].map(|k| (a[k] + b[k]) / 2.0);
+        // morceau de joueur projette l'ombre (−1 : aucune, −2 : la torche tenue en main).
+        // Le shader n'a ainsi qu'un essai par boîte.
+        let c = [0, 1, 2].map(|k| (a[k] + bb[k]) / 2.0);
+        let d2 = |l: &[f32]| -> f32 { (0..3).map(|k| (l[k] - c[k]).powi(2)).sum() };
         let near = lights
             .iter()
             .enumerate()
-            .map(|(j, l)| {
-                let d2: f32 = (0..3).map(|k| (l[k] - c[k]).powi(2)).sum();
-                (j, d2)
-            })
+            .map(|(j, l)| (j as f32, d2(l)))
+            .chain(held.map(|h| (-2.0, d2(&h))))
             .filter(|(_, d2)| *d2 < 100.0)
             .min_by(|x, y| x.1.total_cmp(&y.1));
-        mn[i] = [a[0], a[1], a[2], near.map_or(-1.0, |(j, _)| j as f32)];
-        mx[i] = [b[0], b[1], b[2], 0.0];
+        // Partie fractionnaire 0,5 : le soleil n'atteint pas la boîte (pas son ombre).
+        let shade = if b.sunlit { 0.0 } else { 0.5 };
+        mn[i] = [a[0], a[1], a[2], near.map_or(-1.0, |(j, _)| j) + shade];
+        mx[i] = [bb[0], bb[1], bb[2], 0.0];
     }
     // Boule qui contient toutes les boîtes (centre dans `info.yzw`, rayon dans
     // `max[0].w`) : le shader écarte d'un seul essai les points qu'aucune ombre ne peut
@@ -2124,6 +2130,10 @@ impl Renderer {
         let sg = shadow_globals(
             p.shadow_boxes,
             &self.lights_pos[..self.light_count.min(MAX_LIGHTS)],
+            p.held_light.map(|_| {
+                let h = held_light(p).0;
+                [h[0], h[1], h[2]]
+            }),
         );
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
@@ -2314,6 +2324,10 @@ impl Renderer {
         let sg = shadow_globals(
             p.shadow_boxes,
             &self.lights_pos[..self.light_count.min(MAX_LIGHTS)],
+            p.held_light.map(|_| {
+                let h = held_light(p).0;
+                [h[0], h[1], h[2]]
+            }),
         );
         let globals = Globals {
             view_proj: jittered.to_cols_array_2d(),
@@ -2476,6 +2490,11 @@ impl Renderer {
         // une case de l'écran éclairée (sinon leurs passes n'ont rien à faire).
         let lights_on =
             self.dyn_gpu.active() && self.lit_pipes().is_some() && self.dyn_gpu.lit_rects() > 0;
+        if lights_on {
+            // (Au journal : quelles ombres des lumières, pour comparer les temps.)
+            let rt = self.dyn_gpu.settings().shadows && self.dyn_gpu.settings().rt_shadows;
+            perf::gauge("ombres des lumières par rayons", if rt { 1.0 } else { 0.0 });
+        }
         if let Some(t) = &taa.targets {
             // 1. Opaques : couleur, mouvement, et albédo et surface pour l'éclairage différé.
             let color = |view, load| {
@@ -3008,7 +3027,7 @@ mod tests {
             ),
             (
                 "dyn_deferred",
-                lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
+                lights::with_dynlights_rt(include_str!("shaders/dyn_deferred.wgsl")),
             ),
             (
                 "viewmodel",

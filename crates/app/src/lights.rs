@@ -386,6 +386,7 @@ impl LightSettings {
         r.entity_shadows = b("ombres_joueurs", d.entity_shadows);
         r.shadow_quality = u("ombres_qualite", d.shadow_quality as u32, 0, 3) as u8;
         r.shadow_cache = b("ombres_cache", d.shadow_cache);
+        r.rt_shadows = b("ombres_lancer_rayons", d.rt_shadows);
         r.softness = f("ombres_douceur", d.softness, 0.0, 0.8);
         r.bake_budget = u("ombres_budget", d.bake_budget, 1, 64);
         r.volumetric = b("rayons", d.volumetric);
@@ -438,6 +439,7 @@ impl LightSettings {
         kv("ombres_joueurs", r.entity_shadows.to_string());
         kv("ombres_qualite", r.shadow_quality.to_string());
         kv("ombres_cache", r.shadow_cache.to_string());
+        kv("ombres_lancer_rayons", r.rt_shadows.to_string());
         kv("ombres_douceur", r.softness.to_string());
         kv("ombres_budget", r.bake_budget.to_string());
         kv("rayons", r.volumetric.to_string());

@@ -5974,11 +5974,16 @@ impl Session {
             a.0.distance_squared(cam)
                 .total_cmp(&b.0.distance_squared(cam))
         });
-        let shadow_boxes: Vec<ShadowBox> = shadows
+        let mut shadow_boxes: Vec<ShadowBox> = shadows
             .into_iter()
             .flat_map(|s| s.1)
             .take(minelib_render::MAX_SHADOW_BOXES)
             .collect();
+        // Morceau de joueur que des blocs cachent du soleil : pas d'ombre du soleil (on ne
+        // voit pas son ombre à l'abri d'un toit, d'un arbre…).
+        for b in &mut shadow_boxes {
+            b.sunlit = sun_reaches(&self.world, b, self.sun);
+        }
         // Le joueur se voit dans les miroirs (et l'eau, le métal), même à la 1re personne.
         // Avec son vrai skin (envoyé à la carte quand il change).
         let skin = self.skins.mine();
@@ -6703,6 +6708,20 @@ impl Walk {
     }
 }
 
+/// Le soleil (direction `sun`) atteint-il le milieu de la boîte ? Non si un bloc plein et
+/// opaque est sur le chemin, à moins de 64 blocs (comme l'ombre du joueur dans le shader).
+fn sun_reaches(world: &World, b: &ShadowBox, sun: [f32; 3]) -> bool {
+    if sun[1] <= 0.0 {
+        return false;
+    }
+    let c = [0, 1, 2].map(|k| (b.min[k] + b.max[k]) * 0.5);
+    minelib_world::raycast::raycast_with(world, c, sun, 64.0, |id| {
+        let d = id.def();
+        d.full && !d.translucent
+    })
+    .is_none()
+}
+
 /// Recul de la caméra à la 3e personne (F5), en blocs, comme dans Minecraft.
 const THIRD_PERSON_DIST: f32 = 4.0;
 
@@ -7334,6 +7353,47 @@ mod slab_tests {
 
     fn key(id: BlockId) -> &'static str {
         &id.def().key
+    }
+
+    #[test]
+    fn no_sun_shadow_from_a_player_under_a_roof() {
+        let reg = minelib_world::registry::registry();
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        let stone = reg.by_key("stone").unwrap();
+        let glass = reg.by_key("glass").unwrap();
+        let pose = crate::player_model::Pose {
+            feet: Vec3::new(8.5, 10.0, 8.5),
+            yaw: 0.3,
+            pitch: 0.0,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: None,
+            skin: None,
+        };
+        let boxes = crate::player_model::shadow_boxes(&pose);
+        let sun = Vec3::new(0.3, 0.9, 0.2).normalize().to_array();
+        // En plein air : le soleil atteint chaque morceau du joueur.
+        assert!(boxes.iter().all(|b| sun_reaches(&w, b, sun)));
+        // Sous un toit de verre : toujours.
+        for x in 0..16 {
+            for z in 0..16 {
+                w.set(x, 14, z, glass);
+            }
+        }
+        assert!(boxes.iter().all(|b| sun_reaches(&w, b, sun)));
+        // Sous un toit de pierre : plus de soleil, plus d'ombre du soleil.
+        for x in 0..16 {
+            for z in 0..16 {
+                w.set(x, 14, z, stone);
+            }
+        }
+        assert!(boxes.iter().all(|b| !sun_reaches(&w, b, sun)));
+        // La nuit (soleil sous l'horizon) : rien non plus.
+        let w2 = World::new(0);
+        assert!(!sun_reaches(&w2, &boxes[0], [0.0, -1.0, 0.0]));
     }
 
     #[test]

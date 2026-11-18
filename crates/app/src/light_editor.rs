@@ -2207,6 +2207,11 @@ impl Editor {
                 self.check(p, "Ombres des blocs", &mut r.block_shadows);
                 self.check(p, "Ombres des joueurs", &mut r.entity_shadows);
                 self.check(p, "Cache des ombres", &mut r.shadow_cache);
+                self.check(p, "Ombres par lancer de rayons (essai)", &mut r.rt_shadows);
+                p.note(
+                    "Un rayon par pixel dans la grille de blocs au lieu des cartes d'ombre ; comparer les FPS dans le journal.",
+                    DIM,
+                );
                 if let Some(v) = self.slider(
                     p,
                     220,
