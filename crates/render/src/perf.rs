@@ -19,9 +19,16 @@ pub struct GpuTimes {
     pub lights: f32,
     pub after: f32,
     pub volumetric: f32,
+    /// Recomposition des rayons (pleine résolution), à part de leur marche (`volumetric`).
+    pub vl_composite: f32,
     pub bake: f32,
     /// Du début de la scène à la fin de l'affichage, temps morts entre passes compris.
     pub span: f32,
+    /// Entre la fin de l'image précédente et le début de celle-ci, pour la carte graphique
+    /// (attente, ou travail d'un autre : bureau de Windows, navigateur des écrans) ; compté
+    /// seulement quand les deux images ont été mesurées (`gap_n`).
+    pub gap: f32,
+    pub gap_n: u32,
 }
 
 impl GpuTimes {
@@ -32,6 +39,7 @@ impl GpuTimes {
             + self.lights
             + self.after
             + self.volumetric
+            + self.vl_composite
             + self.bake
     }
 
@@ -41,6 +49,7 @@ impl GpuTimes {
             ("translucides", self.after),
             ("lumières", self.lights),
             ("rayons", self.volumetric),
+            ("recomposition des rayons", self.vl_composite),
             ("cartes d'ombre", self.bake),
         ]
         .iter()
@@ -196,7 +205,7 @@ pub fn gpu(t: GpuTimes) {
         let mut p = p.borrow_mut();
         p.gpu_last = Some(t);
         // La scène entière : opaques, translucides (passe à part) et lumières.
-        let scene = t.scene + t.after + t.lights + t.volumetric + t.bake;
+        let scene = t.scene + t.after + t.lights + t.volumetric + t.vl_composite + t.bake;
         p.gpu_smooth = Some(match p.gpu_smooth {
             Some(v) => v + (scene - v) * 0.02,
             None => scene,
@@ -207,8 +216,11 @@ pub fn gpu(t: GpuTimes) {
         p.window_gpu.0.lights += t.lights;
         p.window_gpu.0.after += t.after;
         p.window_gpu.0.volumetric += t.volumetric;
+        p.window_gpu.0.vl_composite += t.vl_composite;
         p.window_gpu.0.bake += t.bake;
         p.window_gpu.0.span += t.span;
+        p.window_gpu.0.gap += t.gap;
+        p.window_gpu.0.gap_n += t.gap_n;
         p.window_gpu.1 += 1;
     });
 }
@@ -295,7 +307,12 @@ pub fn frame_end() {
             let gpu = if p.window_gpu.1 > 0 {
                 let k = p.window_gpu.1 as f32;
                 let g = p.window_gpu.0;
-                format!(" | GPU moyen : scène {:.2}{}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2})", g.scene / k, g.extra(k), g.taa / k, g.present / k, g.span / k)
+                let gap = if g.gap_n > 0 {
+                    format!(", entre deux images : {:.2}", g.gap / g.gap_n as f32)
+                } else {
+                    String::new()
+                };
+                format!(" | GPU moyen : scène {:.2}{}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2}{gap})", g.scene / k, g.extra(k), g.taa / k, g.present / k, g.span / k)
             } else {
                 " | GPU : mesure indisponible".to_string()
             };

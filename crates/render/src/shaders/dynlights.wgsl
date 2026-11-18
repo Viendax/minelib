@@ -26,12 +26,14 @@ struct DynLight {
     // demi-angle de la carte (1 pour un cube), z = 1 : arrêt net par les murs seulement
     // (ombres douces décochées).
     shadow: vec4<f32>,
-    // x, y = boîtes des joueurs à portée (bits 0..63) : leurs ombres.
+    // x, y = boîtes des joueurs à portée (bits 0..63) : leurs ombres ; z = distance (bits
+    // d'un f32) en deçà de laquelle aucune ne peut cacher la lumière (voir `box_sphere`).
     boxes: vec4<u32>,
     // Calculés une fois pour toutes par le jeu (pas à chaque pixel) : repère du projecteur
     // (xyz : droite, haut ; right.w = 1 / tan du demi-angle, up.w et rect.w = cos et sin de
     // la rotation du gobo), case de sa carte d'ombre (rect.xyz : coin et taille en uv),
-    // sphère qui contient les boîtes des joueurs (rayon < 0 : aucune).
+    // cône depuis la lumière qui contient les boîtes des joueurs (box_sphere : axe xyz,
+    // cosinus du demi-angle en w ; −2 si la lumière est dans leur sphère).
     right: vec4<f32>,
     up: vec4<f32>,
     rect: vec4<f32>,
@@ -62,6 +64,8 @@ struct DynHeader {
     box_x: array<vec4<f32>, 48>,
     box_y: array<vec4<f32>, 48>,
     box_z: array<vec4<f32>, 48>,
+    // Sphère de chaque boîte (centre, rayon), élargie de quelques centièmes : premier tri.
+    box_s: array<vec4<f32>, 48>,
 };
 
 @group(0) @binding(7) var<uniform> dh: DynHeader;
@@ -81,6 +85,17 @@ const DL_SPECULAR: u32 = 32u;
 const DL_VOLUMETRIC: u32 = 64u;
 const DL_BOX_SHADOWS: u32 = 128u;
 
+// Variante compilée à part : sans ombres douces (aucune lumière n'en a), tout le code des
+// pénombres disparaît du shader, qui tient alors dans moins de registres (plus de pixels
+// traités en même temps par la carte). Même image.
+override DL_SOFT_SHADOWS: bool = true;
+
+/// Mots du masque des lumières à lire par tuile : seulement ceux qui peuvent en contenir
+/// (`count` lumières, 32 par mot), pas les 8 à chaque pixel.
+fn dl_tile_words(count: u32) -> u32 {
+    return min(min(dh.counts.w, 8u), (count + 31u) / 32u);
+}
+
 /// Premier mot du masque des lumières de la tuile qui contient le pixel `frag` (pixels,
 /// origine en haut à gauche) d'une image de `size` pixels.
 fn dl_tile_base(frag: vec2<f32>, size: vec2<f32>) -> u32 {
@@ -97,7 +112,7 @@ fn dl_tile_any(frag: vec2<f32>, size: vec2<f32>) -> bool {
         return false;
     }
     let base = dl_tile_base(frag, size);
-    let words = min(dh.counts.w, 8u);
+    let words = dl_tile_words(dh.counts.x);
     var any = 0u;
     for (var w = 0u; w < words; w++) {
         any = any | dtiles[base + w];
@@ -271,10 +286,9 @@ const DL_GOLDEN = vec2<f32>(-0.73736887, 0.67549029);
 /// faux pour un apport trop faible pour que la pénombre se voie (un seul échantillon).
 /// Les points du disque de Vogel (rayon √((k + ½) / n), angle k × angle d'or + rotation)
 /// sont obtenus en tournant le précédent : ni sinus ni cosinus par échantillon.
-fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, soft: bool) -> f32 {
+fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, soft: bool, d0: f32) -> f32 {
     let range = max(L.pos_range.w, 0.01);
     let lp = L.pos_range.xyz;
-    let d0 = length(p - lp);
     // Taille d'un texel de la carte à cette distance (blocs).
     let texel = 2.0 * L.shadow.y * d0 / max(dh.sh.z, 1.0);
     let q = p + n * (0.01 + 1.2 * texel);
@@ -288,7 +302,7 @@ fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, s
     }
     let eps = 2e-4;
     let bulb = select(dh.sh.x, L.cone.w, L.cone.w > 0.0);
-    if bulb < 0.01 || !soft || L.shadow.z > 0.5 {
+    if !DL_SOFT_SHADOWS || bulb < 0.01 || !soft || L.shadow.z > 0.5 {
         return textureSampleCompareLevel(shadow_atlas, shadow_cmp, center.xy, dist / range - eps);
     }
     // Repère autour de la direction centrale (échantillons en angle autour d'elle).
@@ -339,14 +353,17 @@ fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, s
 
 /// Ombre d'un joueur (boîtes à portée de la lumière) sur le trajet `p` → lumière : 1 si
 /// caché, 0 sinon. `entity` : `p` est sur un joueur (sa propre boîte ne le cache pas).
-fn dl_box_shadow(L: DynLight, p: vec3<f32>, entity: bool) -> f32 {
-    // Le trajet passe loin de tous les joueurs (presque toujours) : rien à essayer.
-    let seg = L.pos_range.xyz - p;
-    let t = clamp(dot(L.box_sphere.xyz - p, seg) / max(dot(seg, seg), 1e-8), 0.0, 1.0);
-    let off = p + seg * t - L.box_sphere.xyz;
-    if L.box_sphere.w < 0.0 || dot(off, off) > L.box_sphere.w * L.box_sphere.w {
+/// `l`, `d` : direction (unitaire) et distance de la lumière vues du point de la surface,
+/// à quelques centièmes de `p` (les sphères des tris sont élargies d'autant).
+fn dl_box_shadow(L: DynLight, p: vec3<f32>, entity: bool, l: vec3<f32>, d: f32) -> f32 {
+    // Le trajet passe loin de tous les joueurs (presque toujours) : rien à essayer. Il
+    // sort du cône (vu de la lumière) qui contient leur sphère, ou s'arrête avant elle.
+    // (Deux produits, avec ce que `dl_one` a déjà calculé.)
+    if dot(-l, L.box_sphere.xyz) < L.box_sphere.w || d < bitcast<f32>(L.boxes.z) {
         return 0.0;
     }
+    let seg = L.pos_range.xyz - p;
+    let inv_seg2 = 1.0 / max(dot(seg, seg), 1e-8);
     let p4 = vec4<f32>(p, 1.0);
     let l4 = vec4<f32>(L.pos_range.xyz, 1.0);
     var hit = 0.0;
@@ -359,6 +376,13 @@ fn dl_box_shadow(L: DynLight, p: vec3<f32>, entity: bool) -> f32 {
             let b = firstTrailingBit(bits);
             bits = bits & (bits - 1u);
             let k = w * 32u + b;
+            // Premier tri : le trajet passe loin de la sphère de cette boîte.
+            let sp = dh.box_s[k];
+            let v = sp.xyz - p;
+            let off = seg * clamp(dot(v, seg) * inv_seg2, 0.0, 1.0) - v;
+            if dot(off, off) > sp.w * sp.w {
+                continue;
+            }
             // Segment point → lumière dans le cube unité de la boîte (même paramètre t :
             // la matrice est affine). La boîte tourne avec le morceau de joueur : l'ombre
             // de la tête tombe juste sur les épaules, pas en triangle sur le torse.
@@ -444,10 +468,10 @@ fn dl_one(
         }
         if att > 0.0 && ndl > 0.0 {
             if shadows_on && L.shadow.x > 0.5 {
-                att *= dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003);
+                att *= dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003, d);
             }
             if boxes_on && att > 0.0 && (L.boxes.x | L.boxes.y) != 0u {
-                att *= 1.0 - dl_box_shadow(L, p + n * 0.02, entity);
+                att *= 1.0 - dl_box_shadow(L, p + n * 0.02, entity, l, d);
             }
             var diff = att * ndl;
             if toon {
@@ -485,7 +509,7 @@ fn dyn_light(
         return o;
     }
     let base = dl_tile_base(frag, size);
-    let words = min(dh.counts.w, 8u);
+    let words = dl_tile_words(count);
     let v = normalize(cam - p);
     let noise = dl_ign(frag);
     for (var w = 0u; w < words; w++) {

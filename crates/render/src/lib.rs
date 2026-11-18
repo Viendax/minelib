@@ -190,7 +190,7 @@ pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth3
 /// Compilés sur des fils à part la première fois qu'il y a une lumière. Petits : le shader
 /// du monde n'en a plus besoin (il laisse albédo et surface à l'éclairage différé).
 struct LitPipes {
-    deferred: wgpu::RenderPipeline,
+    deferred: lights::DeferredPipes,
     bake: wgpu::RenderPipeline,
     vl: lights::VlPipes,
     /// Bras à la première personne éclairé par les lumières.
@@ -2619,6 +2619,12 @@ impl Renderer {
                         .gpu_timer
                         .as_ref()
                         .and_then(|t| t.pass(gpu_timer::LIGHTS));
+                    // Sans ombre douce à l'écran : la variante sans leur code (plus légère).
+                    let pipe = if self.dyn_gpu.any_soft() {
+                        &l.deferred.general
+                    } else {
+                        &l.deferred.hard
+                    };
                     self.dyn_gpu.encode_deferred(
                         &self.device,
                         &mut encoder,
@@ -2628,7 +2634,7 @@ impl Renderer {
                         &t.gbuf_views,
                         t.generation,
                         &t.color_view,
-                        &l.deferred,
+                        pipe,
                         ts,
                     );
                 }
@@ -2693,8 +2699,8 @@ impl Renderer {
                     &t.color_view,
                     vl,
                     (
-                        timer.and_then(|t| t.pass_begin(gpu_timer::VOLUMETRIC)),
-                        timer.and_then(|t| t.pass_end(gpu_timer::VOLUMETRIC)),
+                        timer.and_then(|t| t.pass(gpu_timer::VOLUMETRIC)),
+                        timer.and_then(|t| t.pass(gpu_timer::VL_COMPOSITE)),
                     ),
                 );
             }
@@ -3097,7 +3103,6 @@ mod tests {
                 let vp = shift
                     * Mat4::perspective_infinite_reverse_rh(fov as f32, aspect as f32, near)
                     * Mat4::look_to_rh(eye.as_vec3(), fwd.as_vec3(), Vec3::Y);
-                let eye = eye.as_vec3().as_dvec3();
                 let right = fwd.cross(DVec3::Y).normalize();
                 let up = right.cross(fwd);
                 let t = (fov / 2.0).tan();
@@ -3190,6 +3195,70 @@ mod tests {
              `dl_view_ray` / `dl_view_offset` (dynlights.wgsl), `sky_dir` (world.wgsl).\n{}",
             bad.join("\n")
         );
+    }
+
+    /// Les variantes plus légères des shaders des lumières (constantes `override` fixées à
+    /// la compilation) passent la traduction en HLSL de DirectX 12, comme sur le PC de
+    /// Viendax : refusées, ce sont toutes les lumières qui seraient perdues.
+    #[test]
+    fn light_shader_variants_translate_to_hlsl() {
+        use wgpu::naga;
+        // Nom, source, constantes fixées.
+        type Variant = (&'static str, String, &'static [(&'static str, f64)]);
+        let cases: [Variant; 5] = [
+            (
+                "éclairage différé",
+                lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
+                &[],
+            ),
+            (
+                "éclairage différé (ombres nettes)",
+                lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
+                &[("DL_SOFT_SHADOWS", 0.0)],
+            ),
+            (
+                "volumétrique",
+                lights::with_dynlights(include_str!("shaders/volumetric.wgsl")),
+                &[],
+            ),
+            (
+                "volumétrique (sans bruit)",
+                lights::with_dynlights(include_str!("shaders/volumetric.wgsl")),
+                &[("VL_NOISE", 0.0)],
+            ),
+            (
+                "monde éclairé",
+                lights::with_dynlights(include_str!("shaders/world.wgsl")),
+                &[],
+            ),
+        ];
+        for (name, src, constants) in cases {
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("{name} : {}", e.emit_to_string(&src)));
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name} : {e:?}"));
+            let mut pc = naga::back::PipelineConstants::default();
+            for (k, v) in constants {
+                pc.insert(k.to_string(), *v);
+            }
+            let (module, info) =
+                naga::back::pipeline_constants::process_overrides(&module, &info, &pc)
+                    .unwrap_or_else(|e| panic!("{name} : {e:?}"));
+            let options = naga::back::hlsl::Options {
+                shader_model: naga::back::hlsl::ShaderModel::V5_1,
+                fake_missing_bindings: true,
+                ..Default::default()
+            };
+            let mut out = String::new();
+            naga::back::hlsl::Writer::new(&mut out, &options)
+                .write(&module, &info, None)
+                .unwrap_or_else(|e| panic!("{name} : {e:?}"));
+            assert!(out.len() > 1000, "{name}");
+        }
     }
 
     #[test]

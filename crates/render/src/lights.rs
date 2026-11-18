@@ -284,6 +284,8 @@ pub(crate) struct GpuHeader {
     box_x: [[f32; 4]; MAX_BOXES],
     box_y: [[f32; 4]; MAX_BOXES],
     box_z: [[f32; 4]; MAX_BOXES],
+    /// Sphère (centre, rayon) de chaque boîte, élargie : premier tri dans le shader.
+    box_s: [[f32; 4]; MAX_BOXES],
 }
 
 #[repr(C)]
@@ -554,7 +556,12 @@ fn pack_light(
             _ => [-1.0, 0.0, 1.0, 0.0],
         },
         shadow: [sk, tan_half, if soft { 0.0 } else { 1.0 }, 0.0],
-        boxes: [boxes as u32, (boxes >> 32) as u32, 0, 0],
+        boxes: [
+            boxes as u32,
+            (boxes >> 32) as u32,
+            box_cone(Vec3::from(l.pos), box_sphere).1.to_bits(),
+            0,
+        ],
         right: {
             let (r, _, _) = spot_basis(d);
             // 1 / tan du demi-angle extérieur (le bord du cône tombe au bord du gobo).
@@ -567,8 +574,41 @@ fn pack_light(
             [u.x, u.y, u.z, l.gobo_rotation.cos()]
         },
         rect: [rect[0], rect[1], rect[2], l.gobo_rotation.sin()],
-        box_sphere,
+        box_sphere: box_cone(Vec3::from(l.pos), box_sphere).0,
     }
+}
+
+/// Le cône, vu de la lumière `lp`, qui contient la sphère `s` (centre, rayon ; rayon < 0 :
+/// aucune boîte) : axe et cosinus du demi-angle (−2 : la lumière est dans la sphère), et la
+/// distance en deçà de laquelle aucun point ne peut être caché. Le shader n'essaie les
+/// boîtes que pour un point dans ce cône et au-delà de cette distance (deux produits, avec
+/// la direction et la distance de la lumière qu'il a déjà). Élargi pour le point essayé, à
+/// 2 centièmes de la surface, et pour les arrondis (plus loin de l'origine, plus large) :
+/// jamais une ombre écartée par erreur.
+fn box_cone(lp: Vec3, s: [f32; 4]) -> ([f32; 4], f32) {
+    if s[3] < 0.0 {
+        // Aucune boîte : aucune direction n'a un cosinus de 2.
+        return ([0.0, 0.0, 0.0, 2.0], f32::MAX);
+    }
+    let c = Vec3::new(s[0], s[1], s[2]);
+    let r = s[3] + 0.05 + 2e-6 * (lp.abs().max_element() + c.abs().max_element());
+    let to = c - lp;
+    let dc = to.length();
+    if dc <= r * 1.01 {
+        return ([0.0, 0.0, 0.0, -2.0], -1.0);
+    }
+    let axis = to / dc;
+    let cos = (1.0 - (r / dc) * (r / dc)).max(0.0).sqrt();
+    ([axis.x, axis.y, axis.z, cos - 1e-5], dc - r)
+}
+
+/// Sphère (centre, rayon) d'une boîte de joueur pour le premier tri du shader : celle de sa
+/// boîte englobante, élargie comme `box_cone`.
+fn box_bound(b: &crate::ShadowBox) -> [f32; 4] {
+    let (lo, hi) = (Vec3::from(b.min), Vec3::from(b.max));
+    let c = (lo + hi) * 0.5;
+    let r = (hi - lo).length() * 0.5 + 0.05 + 2e-6 * c.abs().max_element();
+    [c.x, c.y, c.z, r]
 }
 
 /// Sphère (centre, rayon) qui contient les boîtes de `mask` ; rayon −1 sans boîte.
@@ -917,7 +957,16 @@ struct VlTargets {
 
 pub(crate) struct VlPipes {
     march: wgpu::RenderPipeline,
+    /// La même marche sans le code du bruit (bruit décoché, le cas habituel).
+    march_plain: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
+}
+
+/// Éclairage différé : le shader complet, et sa variante sans ombres douces (aucune lumière
+/// à l'écran n'en a : préréglage Rapide, « Ombres des blocs » décochée).
+pub(crate) struct DeferredPipes {
+    pub(crate) general: wgpu::RenderPipeline,
+    pub(crate) hard: wgpu::RenderPipeline,
 }
 
 /// Liaisons de l'éclairage différé (profondeur lue, albédo, surface), refaites quand les
@@ -970,6 +1019,10 @@ pub(crate) struct DynGpu {
     /// Les liaisons du monde sont à refaire (atlas ou gobos recréés).
     pub rebind: bool,
     vl_active: bool,
+    /// Bruit des rayons coché (sinon : la marche sans son code).
+    vl_noise: bool,
+    /// Une lumière au moins a des ombres douces (sinon : l'éclairage différé sans leur code).
+    any_soft: bool,
     gpu_lights: Vec<GpuLight>,
     tiles: Vec<u32>,
 }
@@ -1100,7 +1153,7 @@ pub(crate) fn light_pipes(
 ) -> (
     wgpu::RenderPipeline,
     VlPipes,
-    wgpu::RenderPipeline,
+    DeferredPipes,
     wgpu::RenderPipeline,
 ) {
     let bake_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1174,6 +1227,21 @@ pub(crate) fn light_pipes(
                 )
             })
         });
+        let deferred_hard = sc.spawn(|| {
+            timed("éclairage différé (ombres nettes)", || {
+                fullscreen_variant(
+                    device,
+                    "éclairage différé (ombres nettes)",
+                    &def_layout,
+                    &def_shader,
+                    "vs_tiles",
+                    "fs_deferred",
+                    COLOR_FORMAT,
+                    additive,
+                    &[("DL_SOFT_SHADOWS", 0.0)],
+                )
+            })
+        });
         let bake = sc.spawn(|| {
             timed("cartes d'ombre", || {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1219,6 +1287,21 @@ pub(crate) fn light_pipes(
                 )
             })
         });
+        let march_plain = sc.spawn(|| {
+            timed("rayons volumétriques (sans bruit)", || {
+                fullscreen_variant(
+                    device,
+                    "volumétrique (sans bruit)",
+                    &layout,
+                    &shader,
+                    "vs_tiles",
+                    "fs_vl",
+                    VL_FORMAT,
+                    None,
+                    &[("VL_NOISE", 0.0)],
+                )
+            })
+        });
         let composite = sc.spawn(|| {
             timed("recomposition des rayons", || {
                 fullscreen_pipeline(
@@ -1226,7 +1309,7 @@ pub(crate) fn light_pipes(
                     "volumétrique : recomposition",
                     &comp_layout,
                     &comp_shader,
-                    "vs_full",
+                    "vs_tiles",
                     "fs_composite",
                     COLOR_FORMAT,
                     additive,
@@ -1237,9 +1320,17 @@ pub(crate) fn light_pipes(
             bake.join().expect("pipeline des ombres des lumières"),
             VlPipes {
                 march: march.join().expect("pipeline volumétrique"),
+                march_plain: march_plain
+                    .join()
+                    .expect("pipeline volumétrique (sans bruit)"),
                 composite: composite.join().expect("pipeline de recomposition"),
             },
-            deferred.join().expect("pipeline de l'éclairage différé"),
+            DeferredPipes {
+                general: deferred.join().expect("pipeline de l'éclairage différé"),
+                hard: deferred_hard
+                    .join()
+                    .expect("éclairage différé (ombres nettes)"),
+            },
             arm.join().expect("pipeline du bras éclairé"),
         )
     })
@@ -1256,6 +1347,23 @@ fn fullscreen_pipeline(
     format: wgpu::TextureFormat,
     blend: Option<wgpu::BlendState>,
 ) -> wgpu::RenderPipeline {
+    fullscreen_variant(device, label, layout, shader, vs, fs, format, blend, &[])
+}
+
+/// Comme `fullscreen_pipeline`, avec des constantes du shader de pixels fixées à la
+/// compilation (`override` en WGSL) : le code qu'elles coupent disparaît du shader.
+#[allow(clippy::too_many_arguments)]
+fn fullscreen_variant(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    vs: &str,
+    fs: &str,
+    format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+    constants: &[(&str, f64)],
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -1271,7 +1379,10 @@ fn fullscreen_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some(fs),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend,
@@ -1475,6 +1586,17 @@ impl DynGpu {
                     wgpu::TextureSampleType::Depth,
                     wgpu::TextureViewDimension::D2,
                 ),
+                // Cases éclairées : seulement là que la recomposition dessine.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let def_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1542,6 +1664,8 @@ impl DynGpu {
             stats: DynStats::default(),
             rebind: false,
             vl_active: false,
+            vl_noise: true,
+            any_soft: true,
             gpu_lights: Vec::new(),
             tiles: vec![0; (TILES_X * TILES_Y * WORDS) as usize],
         };
@@ -1714,7 +1838,6 @@ impl DynGpu {
 
     /// Lumières et réglages de la prochaine image. Renvoie vrai si quelque chose a changé
     /// depuis l'image précédente (lumière déplacée, réglée, ajoutée ou retirée).
-
     pub fn set(&mut self, lights: &[DynLight], settings: &DynSettings) -> bool {
         let lights = &lights[..lights.len().min(MAX_DYN_LIGHTS)];
         let changed = self.lights.as_slice() != lights || self.settings != *settings;
@@ -1869,6 +1992,7 @@ impl DynGpu {
         let nboxes = boxes.len().min(MAX_BOXES);
         let box_shadows = st.shadows && st.entity_shadows && nboxes > 0;
         self.gpu_lights.clear();
+        self.any_soft = false;
         let atlas_px = self.atlas_size.max(1) as f32;
         let tile_uv = self.tile_size as f32 / atlas_px;
         for (i, l) in self.lights.iter().enumerate() {
@@ -1890,6 +2014,8 @@ impl DynGpu {
             // Ombres douces des blocs : réglage général, ombres des blocs, et celles de la
             // lumière ; sinon arrêt net par les murs.
             let soft = st.shadows && st.block_shadows && l.shadows;
+            // (Une lumière sans carte prête n'a pas d'ombre des blocs, douce ou non.)
+            self.any_soft |= soft && tiles_of[i].is_some();
             self.gpu_lights
                 .push(pack_light(l, tiles_of[i], mask, rect, sphere, soft));
         }
@@ -1910,6 +2036,7 @@ impl DynGpu {
         if st.vl_noise {
             flags |= F_VL_NOISE;
         }
+        self.vl_noise = st.vl_noise;
         if st.vl_dither_temporal {
             flags |= F_DITHER;
         }
@@ -1931,8 +2058,10 @@ impl DynGpu {
         let mut box_x = [[0.0; 4]; MAX_BOXES];
         let mut box_y = [[0.0; 4]; MAX_BOXES];
         let mut box_z = [[0.0; 4]; MAX_BOXES];
+        let mut box_s = [[0.0; 4]; MAX_BOXES];
         for (k, b) in boxes.iter().take(nboxes).enumerate() {
             [box_x[k], box_y[k], box_z[k]] = b.to_unit;
+            box_s[k] = box_bound(b);
         }
         // Vitesses arrondies au quart : le bruit reprend sa place quand le temps repart à 0
         // (toutes les heures).
@@ -1978,6 +2107,7 @@ impl DynGpu {
             box_x,
             box_y,
             box_z,
+            box_s,
         };
         queue.write_buffer(&self.header, 0, bytemuck::bytes_of(&header));
         if !self.gpu_lights.is_empty() {
@@ -2097,6 +2227,12 @@ impl DynGpu {
     /// Lumière volumétrique à ajouter à cette image ?
     pub fn volumetric_active(&self) -> bool {
         self.vl_active
+    }
+
+    /// Une lumière au moins demande des ombres douces à cette image : l'éclairage différé
+    /// complet ; sinon sa variante sans pénombre, plus légère (même image).
+    pub fn any_soft(&self) -> bool {
+        self.any_soft
     }
 
     /// Des cartes d'ombre à calculer à cette image ?
@@ -2262,6 +2398,10 @@ impl DynGpu {
                             binding: 1,
                             resource: wgpu::BindingResource::TextureView(&depths[i]),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.rects_buf.as_entire_binding(),
+                        },
                     ],
                 })
             });
@@ -2290,7 +2430,11 @@ impl DynGpu {
                 timestamp_writes: timestamps.0,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&pipes.march);
+            pass.set_pipeline(if self.vl_noise {
+                &pipes.march
+            } else {
+                &pipes.march_plain
+            });
             pass.set_bind_group(0, world_group, &[]);
             pass.set_bind_group(1, &t.vl_groups[depth_index], &[]);
             pass.draw(0..6, 0..self.rects.len() as u32);
@@ -2311,7 +2455,7 @@ impl DynGpu {
         });
         pass.set_pipeline(&pipes.composite);
         pass.set_bind_group(0, &t.comp_groups[depth_index], &[]);
-        pass.draw(0..3, 0..1);
+        pass.draw(0..6, 0..self.rects.len() as u32);
     }
 
     /// Mémoire vidéo des lumières (atlas des ombres surtout), en octets.
@@ -2615,7 +2759,9 @@ mod tests {
         assert!((g.right[3] - 1.0 / 30f32.to_radians().tan()).abs() < 1e-4);
         assert_eq!((g.up[3], g.rect[3]), (1.0, 0.0));
         assert_eq!(&g.rect[..3], &[0.25, 0.5, 0.0625]);
-        assert_eq!(g.box_sphere, [1.0, 2.0, 3.0, 4.0]);
+        // La lumière est dans la sphère des boîtes : elles sont toujours essayées.
+        assert_eq!(g.box_sphere, [0.0, 0.0, 0.0, -2.0]);
+        assert_eq!(f32::from_bits(g.boxes[2]), -1.0);
         // Une lumière ponctuelle n'a ni cône ni gobo ; sans carte prête : pas d'ombre.
         let p = pack_light(
             &DynLight {
@@ -2632,6 +2778,92 @@ mod tests {
         assert_eq!(p.shadow[2], 0.0);
         assert_eq!((p.shadow[0], p.vol[3]), (0.0, -1.0));
         assert_eq!(p.dir_type[3], 0.0);
+    }
+
+    /// Les tris des ombres des joueurs (cône vu de la lumière, sphère de chaque boîte)
+    /// n'écartent jamais un trajet que l'essai exact trouve caché : même image, moins de
+    /// calcul. Les essais du shader refaits ici sur des milliers de trajets au hasard, près de
+    /// l'origine et loin d'elle.
+    #[test]
+    fn the_box_shadow_culling_never_drops_a_shadow() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        // L'essai exact du shader (`dl_box_shadow`), point hors des boîtes.
+        let exact = |b: &crate::ShadowBox, p: Vec3, lp: Vec3| {
+            let row = |i: usize, q: Vec3| glam::Vec4::from(b.to_unit[i]).dot(q.extend(1.0));
+            let a = Vec3::new(row(0, p), row(1, p), row(2, p));
+            let d = Vec3::new(row(0, lp), row(1, lp), row(2, lp)) - a;
+            let inv = Vec3::select(
+                d.abs().cmplt(Vec3::splat(1e-6)),
+                Vec3::splat(1e6),
+                d.recip(),
+            );
+            let (t0, t1) = (-a * inv, (Vec3::ONE - a) * inv);
+            let near = t0.min(t1).max_element();
+            let far = t0.max(t1).min_element();
+            far >= near.max(0.0) && near < 1.0
+        };
+        let mut hidden = 0;
+        for origin in [
+            Vec3::new(0.0, 64.0, 0.0),
+            Vec3::new(30_000.5, 90.0, -20_000.25),
+        ] {
+            for _ in 0..60 {
+                // Un joueur : jambes, corps, tête, tournés avec lui.
+                let feet = origin + Vec3::new(rnd() * 4.0 - 2.0, 0.0, rnd() * 4.0 - 2.0);
+                let xf = Mat4::from_translation(feet)
+                    * Mat4::from_rotation_y(rnd() * std::f32::consts::TAU);
+                let boxes: Vec<crate::ShadowBox> = [
+                    ([-0.25, 0.0, -0.12], [0.25, 0.75, 0.12]),
+                    ([-0.25, 0.75, -0.12], [0.25, 1.5, 0.12]),
+                    ([-0.25, 1.5, -0.25], [0.25, 2.0, 0.25]),
+                ]
+                .iter()
+                .map(|(lo, hi)| crate::ShadowBox::oriented(xf, Vec3::from(*lo), Vec3::from(*hi)))
+                .collect();
+                let lp =
+                    feet + Vec3::new(rnd() * 24.0 - 12.0, rnd() * 10.0 + 0.3, rnd() * 24.0 - 12.0);
+                let (cone, near) = box_cone(lp, boxes_sphere(&boxes, 0b111));
+                let axis = Vec3::new(cone[0], cone[1], cone[2]);
+                let spheres: Vec<[f32; 4]> = boxes.iter().map(box_bound).collect();
+                for _ in 0..400 {
+                    // Un point de la surface autour du joueur (sol, murs proches), et le point
+                    // essayé à 2 centièmes de lui, comme dans `dl_one`.
+                    let n = [Vec3::Y, Vec3::X, Vec3::NEG_Z][(rnd() * 2.99) as usize];
+                    let p =
+                        feet + Vec3::new(rnd() * 8.0 - 4.0, rnd() * 3.0 - 0.6, rnd() * 8.0 - 4.0);
+                    let q = p + n * 0.02;
+                    if !boxes.iter().any(|b| exact(b, q, lp)) {
+                        continue;
+                    }
+                    hidden += 1;
+                    let to_l = lp - p;
+                    let d = to_l.length();
+                    let l = to_l / d;
+                    assert!(
+                        (-l).dot(axis) >= cone[3] && d >= near,
+                        "cône : {p:?} → {lp:?}"
+                    );
+                    let seg = lp - q;
+                    let inv = 1.0 / seg.length_squared().max(1e-8);
+                    let kept = boxes.iter().zip(&spheres).any(|(b, s)| {
+                        let v = Vec3::new(s[0], s[1], s[2]) - q;
+                        let off = seg * (v.dot(seg) * inv).clamp(0.0, 1.0) - v;
+                        off.length_squared() <= s[3] * s[3] && exact(b, q, lp)
+                    });
+                    assert!(kept, "sphères : {p:?} → {lp:?}");
+                }
+            }
+        }
+        assert!(
+            hidden > 500,
+            "trop peu de trajets cachés essayés : {hidden}"
+        );
     }
 
     #[test]

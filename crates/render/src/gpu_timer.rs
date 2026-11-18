@@ -8,7 +8,8 @@ use std::sync::Arc;
 use crate::perf::GpuTimes;
 
 /// Passes mesurées : 0 scène (opaques), 1 TAA, 2 affichage, 3 éclairage différé,
-/// 4 translucides, 5 rayons volumétriques, 6 cartes d'ombre.
+/// 4 translucides, 5 rayons volumétriques (la marche), 6 cartes d'ombre, 7 recomposition des
+/// rayons.
 pub const SCENE: u32 = 0;
 pub const TAA: u32 = 1;
 pub const PRESENT: u32 = 2;
@@ -16,7 +17,8 @@ pub const LIGHTS: u32 = 3;
 pub const AFTER: u32 = 4;
 pub const VOLUMETRIC: u32 = 5;
 pub const BAKE: u32 = 6;
-const PASSES: u32 = 7;
+pub const VL_COMPOSITE: u32 = 7;
+const PASSES: u32 = 8;
 /// Chaque passe × (début, fin).
 const QUERIES: u32 = PASSES * 2;
 /// Tampons de relecture en rotation (le GPU a quelques images d'avance).
@@ -38,6 +40,11 @@ pub struct GpuTimer {
     /// passe qui n'a pas eu lieu (pas de lumière) ne compte pas.
     marks: AtomicU32,
     slot_marks: Vec<u32>,
+    /// Numéro de l'image en cours, celui de l'image de chaque tampon, et la fin (horodatage)
+    /// de la dernière image relue : l'écart entre deux images qui se suivent.
+    frame: u64,
+    slot_frame: Vec<u64>,
+    prev_end: Option<(u64, u64)>,
 }
 
 impl GpuTimer {
@@ -77,15 +84,20 @@ impl GpuTimer {
             slot: None,
             marks: AtomicU32::new(0),
             slot_marks: vec![0; RING],
+            frame: 0,
+            slot_frame: vec![0; RING],
+            prev_end: None,
         })
     }
 
     /// Début d'image : choisit un tampon libre pour cette image.
     pub fn begin(&mut self) {
         self.marks.store(0, Ordering::Relaxed);
+        self.frame += 1;
         let i = self.next;
         self.slot = (self.readback[i].1.load(Ordering::Acquire) == FREE).then_some(i);
-        if self.slot.is_some() {
+        if let Some(i) = self.slot {
+            self.slot_frame[i] = self.frame;
             self.next = (self.next + 1) % RING;
         }
     }
@@ -97,27 +109,6 @@ impl GpuTimer {
         Some(wgpu::RenderPassTimestampWrites {
             query_set: &self.set,
             beginning_of_pass_write_index: Some(index * 2),
-            end_of_pass_write_index: Some(index * 2 + 1),
-        })
-    }
-
-    /// Mesure à cheval sur plusieurs passes : son début (au début de la première)…
-    pub fn pass_begin(&self, index: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
-        self.slot?;
-        self.marks.fetch_or(1 << index, Ordering::Relaxed);
-        Some(wgpu::RenderPassTimestampWrites {
-            query_set: &self.set,
-            beginning_of_pass_write_index: Some(index * 2),
-            end_of_pass_write_index: None,
-        })
-    }
-
-    /// … et sa fin (à la fin de la dernière).
-    pub fn pass_end(&self, index: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
-        self.slot?;
-        Some(wgpu::RenderPassTimestampWrites {
-            query_set: &self.set,
-            beginning_of_pass_write_index: None,
             end_of_pass_write_index: Some(index * 2 + 1),
         })
     }
@@ -144,7 +135,11 @@ impl GpuTimer {
         }
         let _ = device.poll(wgpu::PollType::Poll);
         let mut out = None;
-        for (k, (buf, state)) in self.readback.iter().enumerate() {
+        // Dans l'ordre des images (l'écart entre deux images se calcule de l'une à l'autre).
+        let mut order: Vec<usize> = (0..RING).collect();
+        order.sort_by_key(|&k| self.slot_frame[k]);
+        for k in order {
+            let (buf, state) = &self.readback[k];
             if state.load(Ordering::Acquire) != READY {
                 continue;
             }
@@ -161,6 +156,22 @@ impl GpuTimer {
                     }
                 };
                 let (first, last) = (t[SCENE as usize * 2], t[PRESENT as usize * 2 + 1]);
+                // Début du travail de l'image : les cartes d'ombre si elles ont été calculées.
+                let start = if marks & (1 << BAKE) != 0 && t[BAKE as usize * 2] != 0 {
+                    t[BAKE as usize * 2].min(first)
+                } else {
+                    first
+                };
+                let frame = self.slot_frame[k];
+                let gap = match self.prev_end {
+                    Some((f, end)) if f + 1 == frame && start > end && end != 0 => {
+                        Some((start - end) as f32 * self.period_ns / 1e6)
+                    }
+                    _ => None,
+                };
+                if last > first && first != 0 {
+                    self.prev_end = Some((frame, last));
+                }
                 out = Some(GpuTimes {
                     scene: ms(SCENE),
                     taa: ms(TAA),
@@ -168,12 +179,16 @@ impl GpuTimer {
                     lights: ms(LIGHTS),
                     after: ms(AFTER),
                     volumetric: ms(VOLUMETRIC),
+                    vl_composite: ms(VL_COMPOSITE),
                     bake: ms(BAKE),
                     span: if last > first && first != 0 {
                         (last - first) as f32 * self.period_ns / 1e6
                     } else {
                         0.0
                     },
+                    // (Plus d'une demi-seconde : la fenêtre était cachée, pas une attente.)
+                    gap: gap.filter(|g| *g < 500.0).unwrap_or(0.0),
+                    gap_n: gap.filter(|g| *g < 500.0).map_or(0, |_| 1),
                 });
             }
             buf.unmap();

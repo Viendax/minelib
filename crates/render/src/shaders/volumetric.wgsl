@@ -30,6 +30,10 @@ struct Globals {
 
 const VL_PI: f32 = 3.14159265;
 
+// Variante compilée à part sans le bruit des rayons (décoché) : la marche tient dans moins de
+// registres. Même image.
+override VL_NOISE: bool = true;
+
 /// Pixels de l'image du monde par pixel de la lumière volumétrique (2 : demi-résolution,
 /// 4 : quart).
 fn vl_scale() -> i32 {
@@ -152,10 +156,10 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec
         return result;
     }
     let base = dl_tile_base(frag, size);
-    let words = min(dh.counts.w, 8u);
+    let words = dl_tile_words(count);
     let flags = dh.vl_c.w;
     let shadows_on = (flags & DL_VL_SHADOWS) != 0u && (flags & DL_SHADOWS) != 0u;
-    let noise_on = (flags & DL_VL_NOISE) != 0u && dh.vl_b.x > 0.0;
+    let noise_on = VL_NOISE && (flags & DL_VL_NOISE) != 0u && dh.vl_b.x > 0.0;
     let step_max = i32(clamp(dh.vl_c.x, 1u, 96u));
     let sh_stride = i32(clamp(dh.vl_c.y, 1u, 8u));
     let nz_stride = i32(clamp(dh.vl_c.z, 1u, 8u));
