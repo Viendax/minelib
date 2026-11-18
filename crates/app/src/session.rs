@@ -1565,12 +1565,13 @@ impl Session {
                 self.inventory.select(i);
             }
         }
-        // En mode FPS la molette sert à sauter. Sur un écran dont la page peut défiler
-        // dans ce sens, elle va à la page (voir `update_screens`).
+        // En mode FPS la molette sert à sauter. Face à un écran vidéo, sa hitbox à portée,
+        // elle ne change jamais l'objet tenu (v176) : elle fait défiler la page si celle-ci
+        // peut défiler, sinon rien (voir `update_screens`).
         if !self.inventory.open
             && input.scroll.abs() >= 1.0
             && self.game.mode != GameMode::Fps
-            && !self.screen_takes_wheel(input.scroll)
+            && self.screen_aim.is_none()
         {
             self.inventory.scroll(-input.scroll.signum() as i32);
         }
@@ -1678,7 +1679,8 @@ impl Session {
             }
         }
         // Molette sur un écran dont la page peut défiler dans ce sens sous le réticule :
-        // elle fait défiler la page (pas la barre d'objets). Sinon elle reste au jeu.
+        // elle fait défiler la page. (Face à l'écran, elle ne va jamais à la barre
+        // d'objets, que la page défile ou non : voir `handle_hotbar`.)
         if let Some((id, uv)) = aimed {
             if input.scroll.abs() >= 1.0 && self.displays.page_scrolls(id, input.scroll > 0.0) {
                 self.displays.wheel(id, uv, (input.scroll * 120.0) as i32);
@@ -1779,14 +1781,6 @@ impl Session {
                 }
             }
         }
-    }
-
-    /// La molette (`scroll` > 0 : vers le haut) va-t-elle à la page de l'écran visé (elle
-    /// peut défiler dans ce sens sous le réticule) ?
-    fn screen_takes_wheel(&self, scroll: f32) -> bool {
-        self.screen_aim
-            .and_then(|a| self.shown.get(a.0))
-            .is_some_and(|s| self.displays.page_scrolls(s.0.id(), scroll > 0.0))
     }
 
     /// Menu pause ouvert (Échap) : en solo, les vidéos des écrans se mettent en pause
