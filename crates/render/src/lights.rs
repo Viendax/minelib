@@ -964,6 +964,8 @@ pub(crate) struct DynGpu {
     // État de l'image.
     lights: Vec<DynLight>,
     settings: DynSettings,
+    /// Ombres par lancer de rayons demandées et possibles cette image (voir `prepare`).
+    rt_on: bool,
     cache: ShadowCache,
     bricks: HashMap<[i32; 3], u64>,
     frame: u64,
@@ -1092,6 +1094,49 @@ pub(crate) fn without_dynlights(src: &str) -> String {
     )
 }
 
+/// Éclairage différé avec les ombres par lancer de rayons (essai) : compilé à part, et
+/// seulement quand le réglage est coché (le code de la marche dans la grille allonge la
+/// compilation sous DirectX).
+pub(crate) fn deferred_rt_pipeline(
+    device: &wgpu::Device,
+    world_bgl: &wgpu::BindGroupLayout,
+    def_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let src = with_dynlights_rt(include_str!("shaders/dyn_deferred.wgsl"));
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("éclairage différé (rayons)"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("éclairage différé (rayons)"),
+        bind_group_layouts: &[world_bgl, def_bgl],
+        push_constant_ranges: &[],
+    });
+    let add = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    };
+    let keep_alpha = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    };
+    fullscreen_pipeline(
+        device,
+        "éclairage différé (rayons)",
+        &layout,
+        &shader,
+        "vs_tiles",
+        "fs_deferred",
+        COLOR_FORMAT,
+        Some(wgpu::BlendState {
+            color: add,
+            alpha: keep_alpha,
+        }),
+    )
+}
+
 /// Compile `f` et note son temps dans le journal (`label`).
 fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
     let t0 = std::time::Instant::now();
@@ -1142,7 +1187,7 @@ pub(crate) fn light_pipes(
     });
     // Éclairage différé : lit le monde (groupe 0, lumières comprises) et ce que les
     // opaques ont laissé (groupe 1).
-    let def_src = with_dynlights_rt(include_str!("shaders/dyn_deferred.wgsl"));
+    let def_src = with_dynlights(include_str!("shaders/dyn_deferred.wgsl"));
     let def_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("éclairage différé"),
         source: wgpu::ShaderSource::Wgsl(def_src.into()),
@@ -1549,6 +1594,7 @@ impl DynGpu {
             def_targets: None,
             lights: Vec::new(),
             settings: DynSettings::default(),
+            rt_on: false,
             cache: ShadowCache::default(),
             bricks: HashMap::new(),
             frame: 0,
@@ -1730,6 +1776,11 @@ impl DynGpu {
     /// Réglages en cours.
     pub fn settings(&self) -> &DynSettings {
         &self.settings
+    }
+
+    /// Ombres par lancer de rayons cette image (réglage, ombres des blocs, grille envoyée).
+    pub fn rt_shadows_on(&self) -> bool {
+        self.rt_on && self.active()
     }
 
     pub fn set(&mut self, lights: &[DynLight], settings: &DynSettings) -> bool {
@@ -1942,7 +1993,9 @@ impl DynGpu {
         if box_shadows {
             flags |= F_BOX_SHADOWS;
         }
-        if st.shadows && st.rt_shadows && voxels.is_some() {
+        // Les rayons remplacent les cartes pour les ombres des blocs : sans elles, rien.
+        self.rt_on = st.shadows && st.block_shadows && st.rt_shadows && voxels.is_some();
+        if self.rt_on {
             flags |= F_RT_SHADOWS;
         }
         let mut box_x = [[0.0; 4]; MAX_BOXES];

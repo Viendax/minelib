@@ -658,6 +658,9 @@ pub struct Renderer {
     /// leur code, compilé ensuite (le plus long) ; d'ici là, les translucides ne prennent
     /// pas leur lumière (l'opaque derrière, si).
     lit_translucent: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
+    /// Éclairage différé avec les ombres par lancer de rayons (essai), compilé quand le
+    /// réglage est coché, après les autres.
+    lit_rt: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
     /// Images restantes pendant lesquelles l'anticrénelage considère que les lumières ont
     /// changé (déplacées, réglées) : comme `mesh_changes`.
     dyn_changes: u32,
@@ -1083,6 +1086,7 @@ impl Renderer {
             dyn_gpu,
             lit: None,
             lit_translucent: None,
+            lit_rt: None,
             dyn_changes: 0,
             skin_key: None,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
@@ -1445,6 +1449,15 @@ impl Renderer {
         if self.lit_pipes().is_some() && self.lit_translucent.is_none() {
             self.lit_translucent = Some(self.spawn_lit_translucent());
         }
+        // Puis, si le réglage est coché, l'éclairage différé avec les ombres par rayons
+        // (jamais deux compilations à la fois : elles partagent la pile d'erreurs).
+        let translucent_done = self
+            .lit_translucent
+            .as_ref()
+            .is_some_and(|l| l.try_get().is_some());
+        if translucent_done && self.lit_rt.is_none() && self.dyn_gpu.settings().rt_shadows {
+            self.lit_rt = Some(self.spawn_lit_rt());
+        }
         let failed = self
             .lit
             .as_ref()
@@ -1535,6 +1548,30 @@ impl Renderer {
     /// Translucides éclairés, s'ils sont prêts.
     fn lit_translucent(&self) -> Option<&wgpu::RenderPipeline> {
         self.lit_translucent.as_ref()?.try_get()?.as_ref().ok()
+    }
+
+    /// Éclairage différé avec les ombres par rayons (voir `lit_rt`).
+    fn spawn_lit_rt(&self) -> lazy::Lazy<Result<wgpu::RenderPipeline, String>> {
+        let device = self.device.clone();
+        let bgl = self.bgl.clone();
+        let def_bgl = self.dyn_gpu.def_bgl.clone();
+        lazy::Lazy::spawn("ombres par rayons", move || {
+            let t0 = std::time::Instant::now();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let pipeline = lights::deferred_rt_pipeline(&device, &bgl, &def_bgl);
+            let internal = pollster::block_on(device.pop_error_scope());
+            let validation = pollster::block_on(device.pop_error_scope());
+            if let Some(e) = internal.or(validation) {
+                log::warn!("ombres par rayons refusées : les cartes d'ombre restent ({e})");
+                return Err(e.to_string());
+            }
+            log::info!(
+                "ombres par rayons compilées en {:.1} s (en tâche de fond)",
+                t0.elapsed().as_secs_f32()
+            );
+            Ok(pipeline)
+        })
     }
 
     /// Les lumières dynamiques ont-elles besoin de la grille de blocs (ombres) ?
@@ -2490,9 +2527,19 @@ impl Renderer {
         // une case de l'écran éclairée (sinon leurs passes n'ont rien à faire).
         let lights_on =
             self.dyn_gpu.active() && self.lit_pipes().is_some() && self.dyn_gpu.lit_rects() > 0;
+        // Ombres par lancer de rayons : réglage coché, ombres des blocs, et leur pipeline
+        // prêt (sinon les cartes, en attendant).
+        let rt_pipe = if self.dyn_gpu.rt_shadows_on() {
+            self.lit_rt
+                .as_ref()
+                .and_then(|l| l.try_get())
+                .and_then(|r| r.as_ref().ok())
+        } else {
+            None
+        };
         if lights_on {
             // (Au journal : quelles ombres des lumières, pour comparer les temps.)
-            let rt = self.dyn_gpu.settings().shadows && self.dyn_gpu.settings().rt_shadows;
+            let rt = rt_pipe.is_some();
             perf::gauge("ombres des lumières par rayons", if rt { 1.0 } else { 0.0 });
         }
         if let Some(t) = &taa.targets {
@@ -2565,7 +2612,7 @@ impl Renderer {
                         &t.gbuf_views,
                         t.generation,
                         &t.color_view,
-                        &l.deferred,
+                        rt_pipe.unwrap_or(&l.deferred),
                         ts,
                     );
                 }
@@ -3027,6 +3074,10 @@ mod tests {
             ),
             (
                 "dyn_deferred",
+                lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
+            ),
+            (
+                "dyn_deferred (rayons)",
                 lights::with_dynlights_rt(include_str!("shaders/dyn_deferred.wgsl")),
             ),
             (

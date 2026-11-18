@@ -1596,6 +1596,15 @@ const TABLE: &[[&str; 7]] = &[
         "Eén straal per pixel door het blokkenraster in plaats van schaduwkaarten; vergelijk de FPS in het logboek.",
     ],
     [
+        "Les rayons ne changent que les ombres des blocs : coche aussi « Ombres des blocs ».",
+        "Rays only change block shadows: also tick “Block shadows”.",
+        "Los rayos solo cambian las sombras de los bloques: marca también «Sombras de los bloques».",
+        "Strahlen ändern nur die Blockschatten: aktiviere auch „Blockschatten“.",
+        "I raggi cambiano solo le ombre dei blocchi: spunta anche «Ombre dei blocchi».",
+        "Os raios só mudam as sombras dos blocos: marca também «Sombras dos blocos».",
+        "Stralen veranderen alleen de blokschaduwen: vink ook „Blokschaduwen” aan.",
+    ],
+    [
         "Douceur (défaut)",
         "Softness (default)",
         "Suavidad (por defecto)",

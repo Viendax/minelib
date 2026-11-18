@@ -706,14 +706,14 @@ impl Session {
             if let Some(text) = sent {
                 self.submit(&text);
             }
-            // Éditeur de lumières (touche L) et sa caméra libre (F) ; pas en mode FPS (rien
-            // ne doit éclairer un coin sombre pour un seul joueur).
-            let fps_now = self.game.mode == GameMode::Fps;
-            if fps_now && self.light_editor.open {
+            // Éditeur de lumières (touche L) et sa caméra libre (F) ; pas en partie FPS en
+            // ligne (rien ne doit éclairer un coin sombre pour un seul joueur). En FPS solo, si.
+            let fps_online = !self.lights_allowed();
+            if fps_online && self.light_editor.open {
                 self.light_editor.close();
             }
             let naming = self.light_editor.editing_name;
-            if !typing && !fps_now && !naming && self.keys.pressed(input, Action::LightEditor) {
+            if !typing && !fps_online && !naming && self.keys.pressed(input, Action::LightEditor) {
                 if self.light_editor.open {
                     self.light_editor.close();
                 } else {
@@ -1390,17 +1390,17 @@ impl Session {
         {
             let _s = perf::scope("lumières de l'éditeur");
             let cam = self.camera_pos();
-            let fps = self.game.mode == GameMode::Fps;
-            self.lights.update(dt, &self.world, cam, !fps);
+            let allowed = self.lights_allowed();
+            self.lights.update(dt, &self.world, cam, allowed);
             if std::mem::take(&mut self.lights.gobos_dirty) {
                 let imgs: Vec<minelib_render::GoboImage> =
                     self.lights.gobos.iter().map(|g| g.image.clone()).collect();
                 renderer.set_gobos(&imgs);
             }
-            let list = if self.game.mode == GameMode::Fps {
-                Vec::new()
-            } else {
+            let list = if allowed {
                 self.lights.frame_lights()
+            } else {
+                Vec::new()
             };
             renderer.set_dyn_lights(&list, &self.lights.settings.render);
             self.lights_wanted = !list.is_empty();
@@ -2667,9 +2667,17 @@ impl Session {
     /// construction en ligne, il est réservé aux OP du serveur : on demande d'abord la liste
     /// des OP au relais, qui ne la donne qu'à eux, et l'éditeur s'ouvre à sa réponse (voir
     /// `light_op_answer`). La caméra libre de l'éditeur ne sert donc pas à espionner.
+    /// Lumières de l'éditeur (projecteurs…) : partout sauf en partie FPS en ligne (elles ne
+    /// sont pas envoyées aux autres joueurs : un coin sombre éclairé pour un seul). En FPS
+    /// solo, si.
+    fn lights_allowed(&self) -> bool {
+        !(self.game.mode == GameMode::Fps && self.net.is_some())
+    }
+
     fn open_light_editor(&mut self) {
-        if self.game.mode == GameMode::Fps {
-            self.chat.say("Pas de lumières en mode FPS.", chat::RED);
+        if !self.lights_allowed() {
+            self.chat
+                .say("Pas de lumières en partie FPS en ligne.", chat::RED);
             return;
         }
         if self.build.is_some() {
@@ -3545,7 +3553,8 @@ impl Session {
                 self.apply_net(locals);
             }
         }
-        let free = input.grabbed && !typing && !self.fps.buy_open;
+        // Éditeur de lumières ouvert (FPS solo) : ni tir, ni arme, même en tournant la vue.
+        let free = input.grabbed && !typing && !self.fps.buy_open && !self.light_editor.open;
         let k = &self.keys;
         let c = crate::fps::Controls {
             trigger_pressed: free && k.pressed(input, Action::FpsFire),
@@ -5585,10 +5594,13 @@ impl Session {
                     [1.0, 1.0, 1.0, 0.9],
                 );
             }
-            // Mode FPS : vie sur 100, munitions, solde, menu d'achat.
+            // Mode FPS : vie sur 100, munitions, solde, menu d'achat (pas sous l'éditeur de
+            // lumières, en FPS solo : son panneau prend la place).
             if self.game.mode == GameMode::Fps {
                 self.fps.screen_fx(ui, size, self.player.eye());
-                self.fps.hud(ui, size, input.cursor, debug);
+                if !self.light_editor.open {
+                    self.fps.hud(ui, size, input.cursor, debug);
+                }
             }
             // Cœurs (survie) : au-dessus de la barre d'objets, à gauche, images du pack.
             if self.game.mode == GameMode::Survival {
