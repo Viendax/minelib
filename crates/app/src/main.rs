@@ -67,6 +67,7 @@ mod heads;
 mod i18n;
 mod inventory;
 mod jobs;
+mod keycomp;
 mod keylag;
 mod keytest;
 mod keys;

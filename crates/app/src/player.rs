@@ -257,6 +257,22 @@ impl Player {
         }
     }
 
+    /// (v181) Rend au joueur un déplacement qu'il n'a pas voulu (voir `crate::keycomp`) :
+    /// `lift` vers le haut d'abord (il est tombé d'un bord), puis `back` à l'horizontale,
+    /// avec les collisions.
+    pub fn nudge(&mut self, world: &World, back: Vec3, lift: f32) {
+        if self.noclip {
+            self.pos += Vec3::new(back.x, lift, back.z);
+            return;
+        }
+        if lift > 0.0 {
+            self.move_axis(world, 1, lift);
+            self.vel.y = self.vel.y.max(0.0);
+        }
+        self.move_axis(world, 0, back.x);
+        self.move_axis(world, 2, back.z);
+    }
+
     /// Note les directions qui viennent d'être lâchées (voir `released`), et oublie celles
     /// dont la touche est de nouveau tenue.
     fn note_released(&mut self, m: &MoveInput, fwd: Vec3, right: Vec3) {

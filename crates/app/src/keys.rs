@@ -36,7 +36,7 @@ impl Bind {
         }
     }
 
-    fn from_name(name: &str) -> Option<Self> {
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "Mouse0" => Some(Bind::Mouse(Mouse::Left)),
             "Mouse1" => Some(Bind::Mouse(Mouse::Right)),

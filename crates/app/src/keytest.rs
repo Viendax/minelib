@@ -84,7 +84,6 @@ impl KeyTest {
         }
     }
 
-    #[cfg(test)]
     pub fn trials(&self) -> &[Trial] {
         &self.trials
     }

@@ -255,6 +255,11 @@ pub struct Session {
     lag_book: crate::keylag::LagBook,
     /// Test des touches en cours (`/testtouche`) : le jeu ne reçoit ni touches ni clics.
     key_test: Option<crate::keytest::KeyTest>,
+    /// Retard mesuré de la touche « avancer » (`/testtouche`) et sa compensation.
+    key_lag: Option<crate::keycomp::Setting>,
+    key_comp: crate::keycomp::Comp,
+    /// « Avancer » tenue d'après le clavier (à la dernière image).
+    fwd_key: bool,
     autosave: f32,
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
@@ -525,6 +530,9 @@ impl Session {
             filter_keys_in: Some(3.0),
             lag_book: Default::default(),
             key_test: None,
+            key_lag: crate::keycomp::load(),
+            key_comp: Default::default(),
+            fwd_key: false,
             autosave: AUTOSAVE_S,
             hit: None,
             frame_aim: None,
@@ -602,6 +610,41 @@ impl Session {
         let mut said = test.step(&input.held_keys(), mouse, std::time::Instant::now(), dt, &label);
         if !active || input.pressed(KeyCode::Escape) || test.finished {
             said.extend(test.summary(&label));
+            // La touche « avancer » testée : son retard mesuré est compensé (ou ne l'est
+            // plus, si elle remonte maintenant normalement).
+            if let Some(crate::keys::Bind::Key(k)) = self.keys.get(Action::Forward) {
+                let long = test.trials().iter().filter(|t| t.key == k && t.held >= 1.5).count();
+                match crate::keycomp::estimate(test.trials(), k) {
+                    Some(lag) => {
+                        let s = crate::keycomp::Setting { key: k, lag, on: true };
+                        crate::keycomp::save(&s);
+                        self.key_lag = Some(s);
+                        said.push((
+                            format!(
+                                "Le jeu compense maintenant ce retard ({:.0} ms) : quand la \
+                                 touche est enfin relâchée, tu reviens là où tu as lâché. \
+                                 (/compense off pour l'enlever.)",
+                                lag * 1000.0
+                            ),
+                            Tone::Good,
+                        ));
+                    }
+                    None if long >= 3 && self.key_lag.is_some_and(|s| s.key == k && s.on) => {
+                        let s = crate::keycomp::Setting {
+                            on: false,
+                            ..self.key_lag.unwrap()
+                        };
+                        crate::keycomp::save(&s);
+                        self.key_lag = Some(s);
+                        said.push((
+                            "La touche remonte normalement : le jeu ne compense plus rien."
+                                .to_string(),
+                            Tone::Good,
+                        ));
+                    }
+                    None => {}
+                }
+            }
             self.key_test = None;
         }
         for (text, tone) in said {
@@ -930,6 +973,7 @@ impl Session {
                 }
             }
             let tap_sprint = self.tap_sprint;
+            self.fwd_key = self.keys.held(input, Action::Forward);
             let keys = &self.keys;
             let axis = |pos: Action, neg: Action| {
                 keys.held(input, pos) as i32 as f32 - keys.held(input, neg) as i32 as f32
@@ -3067,6 +3111,16 @@ impl Session {
         };
         self.pending_jump |= m.jump_pressed;
         self.tick_acc = (self.tick_acc + dt).min(SIM_TICK * MAX_TICKS as f32);
+        // Retard mesuré de la touche « avancer » (0 : rien à compenser). Pas en mode FPS ni
+        // dans une partie simulée aussi par un hôte.
+        let key_lag = self
+            .key_lag
+            .filter(|s| {
+                s.on && self.game.mode != GameMode::Fps
+                    && self.net.is_none()
+                    && self.keys.get(Action::Forward) == Some(crate::keys::Bind::Key(s.key))
+            })
+            .map_or(0.0, |s| s.lag);
         while self.tick_acc >= SIM_TICK {
             self.prev_pos = self.player.pos;
             self.prev_crouch = self.player.crouch;
@@ -3080,7 +3134,30 @@ impl Session {
             };
             // En ligne (FPS) : les autres joueurs sont solides.
             self.player.others = self.net.as_ref().map_or_else(Vec::new, |n| n.obstacles());
+            let before = self.player.pos;
             self.player.update(&self.world, &mt, SIM_TICK);
+            // Touche « avancer » annoncée relâchée en retard : ce qui a été avancé pendant
+            // le retard est rendu (voir `crate::keycomp`).
+            let nudge = self.key_comp.tick(
+                SIM_TICK,
+                key_lag,
+                self.fwd_key && mt.forward > 0.0,
+                self.player.yaw,
+                self.player.pos - before,
+                self.player.pos.y,
+                self.player.on_ground,
+                !self.player.flying && !self.player.on_ground && self.player.vel.y < 0.0,
+            );
+            if nudge != crate::keycomp::Nudge::default() {
+                self.player.nudge(&self.world, nudge.back, nudge.lift);
+            }
+            if let Some((secs, blocks)) = self.key_comp.last.take() {
+                log::info!(
+                    "touche avancer : relâchement annoncé en retard, {:.0} ms repris \
+                     ({blocks:.2} bloc)",
+                    secs * 1000.0
+                );
+            }
             if let Some(n) = &mut self.net {
                 n.on_tick(&self.world, &self.player, &mt, SIM_TICK);
             }
@@ -4623,6 +4700,39 @@ impl Session {
                 }
                 _ => self.chat.say("Utilisation : /foule <on|off>", chat::RED),
             },
+            // Compensation du retard mesuré de la touche « avancer » (voir `keycomp`).
+            "compense" | "compensation" => {
+                let want = match arg {
+                    Some("on" | "oui" | "1") => Some(true),
+                    Some("off" | "non" | "0") => Some(false),
+                    _ => None,
+                };
+                let text = match (self.key_lag, want) {
+                    (None, _) => "Aucun retard mesuré : fais d'abord /testtouche avec ta touche \
+                                  avancer."
+                        .to_string(),
+                    (Some(s), Some(on)) => {
+                        let s = crate::keycomp::Setting { on, ..s };
+                        crate::keycomp::save(&s);
+                        self.key_lag = Some(s);
+                        if on {
+                            format!(
+                                "Retard de la touche avancer compensé ({:.0} ms).",
+                                s.lag * 1000.0
+                            )
+                        } else {
+                            "Retard de la touche avancer plus compensé.".to_string()
+                        }
+                    }
+                    (Some(s), None) => format!(
+                        "Retard mesuré de la touche avancer : {:.0} ms, {}. Utilisation : \
+                         /compense <on|off>",
+                        s.lag * 1000.0,
+                        if s.on { "compensé" } else { "pas compensé" }
+                    ),
+                };
+                self.chat.say(text, chat::YELLOW);
+            }
             // Test des touches : une touche annonce-t-elle son relâchement en retard ?
             "testtouche" | "testtouches" | "keytest" => {
                 self.key_test = Some(crate::keytest::KeyTest::new());
