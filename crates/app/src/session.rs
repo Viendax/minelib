@@ -331,6 +331,14 @@ pub struct Session {
     /// (v172) Skins des autres joueurs envoyés à la carte (ils sont dessinés par elle) ;
     /// tenus à jour pendant le dessin de l'image.
     skin_layers: std::cell::RefCell<crate::player_model::SkinLayers>,
+    /// (v197) Tableaux réutilisés d'une image à l'autre : avec 4 000 joueurs, les allouer
+    /// et les libérer à chaque image, c'était près d'un mégaoctet recopié 230 fois par
+    /// seconde pour rien.
+    scratch: std::cell::RefCell<Scratch>,
+    /// (v197) « Le soleil atteint-il ce point ? », gardé par demi-bloc : un rayon de
+    /// 64 blocs par pavé d'ombre et par image (jusqu'à 48) revenait à refaire le même
+    /// calcul des dizaines de fois de suite pour un joueur qui marche.
+    sun_seen: std::cell::RefCell<SunSeen>,
     /// (v165, essai temporaire) Joueurs simulés autour de soi en solo (voir `crowd`), et
     /// essai voulu (v185 : `/npc stresstest true|false`, éteint par défaut).
     crowd: Option<crate::crowd::Crowd>,
@@ -575,6 +583,8 @@ impl Session {
             walks: HashMap::new(),
             walk_stamp: 0,
             skin_layers: Default::default(),
+            scratch: Default::default(),
+            sun_seen: Default::default(),
             crowd: None,
             crowd_on: false,
             pseudo: String::new(),
@@ -1547,7 +1557,7 @@ impl Session {
             let solo = self.build.is_none() && self.net.is_none();
             if self.crowd_on && solo && self.game.mode != GameMode::Fps {
                 let c = self.crowd.get_or_insert_with(crate::crowd::Crowd::new);
-                c.update(&self.world, self.player.pos, dt);
+                c.update(&self.world, &self.skins, self.player.pos, dt);
             } else {
                 self.crowd = None;
             }
@@ -4326,7 +4336,7 @@ impl Session {
                     return true;
                 }
                 let sub = words.get(1).map(|w| w.to_lowercase()).unwrap_or_default();
-                // (v195) on/off, true/false, 1/0, oui/non (`chat::switch`).
+                // (v197) on/off, true/false, 1/0, oui/non (`chat::switch`).
                 let action = match (sub.as_str(), chat::switch(&sub)) {
                     ("activer", _) | (_, Some(true)) => proto::SERVER_WL_ON,
                     ("desactiver" | "désactiver", _) | (_, Some(false)) => proto::SERVER_WL_OFF,
@@ -4728,7 +4738,7 @@ impl Session {
         let name = parts.next().unwrap_or("").to_lowercase();
         let arg = parts.next();
         match name.as_str() {
-            // Vol en survie : (v195) /fly on|off, ou /fly seul pour basculer.
+            // Vol en survie : (v197) /fly on|off, ou /fly seul pour basculer.
             "fly" => {
                 let want = arg.map(chat::switch);
                 if self.game.mode == GameMode::Creative {
@@ -4783,7 +4793,7 @@ impl Session {
                 }
             }
             // (v165, essai) Foule simulée en solo : (v185) `/npc stresstest true|false`,
-            // éteinte par défaut ; (v195) aussi on/off, 1/0, oui/non.
+            // éteinte par défaut ; (v197) aussi on/off, 1/0, oui/non.
             "npc" => {
                 let sub = arg.map(str::to_lowercase);
                 let value = parts.next().and_then(chat::switch);
@@ -4881,7 +4891,7 @@ impl Session {
                         .say("Utilisation : /touchelente <on|off|auto>", chat::RED),
                 }
             }
-            // (v172) Partie contre des bots (mode FPS en solo) : retirer, refaire. (v195) Arrêt :
+            // (v172) Partie contre des bots (mode FPS en solo) : retirer, refaire. (v197) Arrêt :
             // off, false, 0, non ou stop ; lancement : rien, on, true, 1 ou oui. Les niveaux
             // se donnent par leur nom (0 et 1 veulent dire arrêt et lancement).
             "bots" | "bot" => match arg.map(str::to_lowercase).as_deref() {
@@ -6420,7 +6430,10 @@ impl Session {
         // dans le monde (vecteurs de mouvement de l'anticrénelage). Avec la caméra libre,
         // le joueur ne la suit pas.
         let follow = if free { 0 } else { model.len() };
-        let mut shadows: Vec<(Vec3, Vec<ShadowBox>)> = Vec::new();
+        // (v197) Tableaux de l'image repris à l'image d'avant (voir `Scratch`).
+        let mut scratch = std::mem::take(&mut *self.scratch.borrow_mut());
+        let mut shadows = std::mem::take(&mut scratch.shadows);
+        shadows.clear();
         if visible && self.spectating.is_none() {
             shadows.push((self.player.pos, crate::player_model::shadow_boxes(&pose)));
         }
@@ -6430,7 +6443,8 @@ impl Session {
         // reste fait ici.
         let mut layers = self.skin_layers.borrow_mut();
         layers.begin(renderer);
-        let mut players: Vec<minelib_render::PlayerInstance> = Vec::new();
+        let mut players = std::mem::take(&mut scratch.players);
+        players.clear();
         // (v174) Mort en FPS : on regarde par les yeux d'un coéquipier ; son corps (et ce
         // qu'il tient, la bombe sur son dos) n'est pas dessiné autour de la caméra. Son
         // ombre reste, comme la sienne.
@@ -6528,7 +6542,12 @@ impl Session {
             }
         }
         // Construction en ligne (et, en solo, la foule d'essai : dessinée pareil).
-        let mut others: Vec<Other> = Vec::new();
+        // (v197) Sa place d'un coup : 4 000 joueurs, c'était une douzaine
+        // d'agrandissements et autant de recopies par image.
+        let mut others: Vec<Other> = Vec::with_capacity(
+            self.build.as_ref().map_or(0, |b| b.others.len())
+                + self.crowd.as_ref().map_or(0, |c| c.npcs.len()),
+        );
         if let Some(b) = &self.build {
             others.extend(b.others.values().map(|o| Other {
                 pseudo: &o.pseudo,
@@ -6537,6 +6556,7 @@ impl Session {
                 pitch: o.pitch,
                 crouch: o.crouch,
                 walk: None,
+                skin: self.skins.of(&o.pseudo),
                 covered: None,
             }));
         }
@@ -6548,6 +6568,10 @@ impl Session {
                 pitch: n.pitch,
                 crouch: 0.0,
                 walk: Some(&n.walk),
+                // (v197) Son skin est gardé par lui (repris de temps en temps) : 4 000
+                // recherches par pseudo et par image pour une réponse qui ne change
+                // jamais.
+                skin: n.skin.clone(),
                 covered: Some(n.covered),
             }));
         }
@@ -6560,11 +6584,14 @@ impl Session {
             // (v192) Et ils sont **tous** préparés, où que regarde la caméra : la v191
             // écartait ceux qui n'étaient pas dans son cône, on les voyait apparaître en
             // tournant la tête. Jamais de joueur qui attend qu'on le regarde.
-            let mut order: Vec<(f32, u32)> = others
-                .iter()
-                .enumerate()
-                .map(|(i, o)| (o.pos.distance_squared(cam), i as u32))
-                .collect();
+            let mut order = std::mem::take(&mut scratch.order);
+            order.clear();
+            order.extend(
+                others
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| (o.pos.distance_squared(cam), i as u32)),
+            );
             order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             for (rank, &(d2, i)) in order.iter().enumerate() {
                 let o = &others[i as usize];
@@ -6582,7 +6609,7 @@ impl Session {
                         None => sky_light(&self.world, eye_of(o.pos, o.crouch), self.daylight),
                     },
                     held: None,
-                    skin: self.skins.of(o.pseudo),
+                    skin: o.skin.clone(),
                 };
                 if shadow {
                     shadows.push((o.pos, crate::player_model::shadow_boxes(&other)));
@@ -6598,6 +6625,7 @@ impl Session {
                     model.extend(crate::player_model::build_tiny(&other));
                 }
             }
+            scratch.order = order;
         }
         // (v190) À la première personne, seuls les miroirs montrent le joueur : son modèle
         // (avec son skin) et ce qu'il tient. (En F5, il est déjà dans la scène.)
@@ -6624,15 +6652,21 @@ impl Session {
             a.0.distance_squared(cam)
                 .total_cmp(&b.0.distance_squared(cam))
         });
-        let mut shadow_boxes: Vec<ShadowBox> = shadows
-            .into_iter()
-            .flat_map(|s| s.1)
-            .take(minelib_render::MAX_SHADOW_BOXES)
-            .collect();
+        let mut shadow_boxes = std::mem::take(&mut scratch.boxes);
+        shadow_boxes.clear();
+        shadow_boxes.extend(
+            shadows
+                .iter()
+                .flat_map(|s| s.1.iter().copied())
+                .take(minelib_render::MAX_SHADOW_BOXES),
+        );
         // Morceau de joueur que des blocs cachent du soleil : pas d'ombre du soleil (on ne
         // voit pas son ombre à l'abri d'un toit, d'un arbre…).
-        for b in &mut shadow_boxes {
-            b.sunlit = sun_reaches(&self.world, b, self.sun);
+        {
+            let seen = &mut *self.sun_seen.borrow_mut();
+            for b in &mut shadow_boxes {
+                b.sunlit = sun_reaches_seen(seen, &self.world, b, self.sun);
+            }
         }
         // Le joueur se voit dans les miroirs (et l'eau, le métal), même à la 1re personne.
         // Avec son vrai skin (envoyé à la carte quand il change).
@@ -6772,7 +6806,15 @@ impl Session {
             mirror_self,
             mirror_held: &mirror_held,
         };
-        renderer.render(&params)
+        let stats = renderer.render(&params);
+        // (v197) Les tableaux retournent au tas de l'image suivante, avec leur place déjà
+        // réservée (voir `Scratch`).
+        drop(params);
+        scratch.players = players;
+        scratch.shadows = shadows;
+        scratch.boxes = shadow_boxes;
+        *self.scratch.borrow_mut() = scratch;
+        stats
     }
 }
 
@@ -6871,7 +6913,7 @@ fn same_family(a: BlockId, b: BlockId) -> bool {
     }
 }
 
-/// (v195) Un réglage oui/non tel que les commandes l'écrivent.
+/// (v197) Un réglage oui/non tel que les commandes l'écrivent.
 fn on_off(b: bool) -> &'static str {
     if b {
         "on"
@@ -7357,6 +7399,53 @@ fn stairs_placement(hit: &Hit, item: BlockId, look: Vec3, point: Vec3) -> Option
     minelib_world::registry::registry().by_key(&format!("stairs:{mat}:{dir}:{half}"))
 }
 
+/// (v197) Tableaux de l'image, réutilisés (voir `Session::scratch`).
+#[derive(Default)]
+struct Scratch {
+    players: Vec<minelib_render::PlayerInstance>,
+    order: Vec<(f32, u32)>,
+    shadows: Vec<(Vec3, Vec<ShadowBox>)>,
+    boxes: Vec<ShadowBox>,
+}
+
+/// (v197) Réponses de `sun_reaches` gardées par demi-bloc (voir `Session::sun_seen`).
+struct SunSeen {
+    sun: [f32; 3],
+    since: std::time::Instant,
+    seen: HashMap<[i32; 3], bool>,
+}
+
+impl Default for SunSeen {
+    fn default() -> Self {
+        SunSeen {
+            sun: [0.0; 3],
+            since: std::time::Instant::now(),
+            seen: HashMap::new(),
+        }
+    }
+}
+
+/// Le soleil (direction `sun`) atteint-il le milieu de la boîte ? La réponse de
+/// `sun_reaches`, gardée par demi-bloc : oubliée quand le soleil a tourné ou au bout de
+/// deux secondes (un bloc a pu être posé au-dessus).
+fn sun_reaches_seen(seen: &mut SunSeen, world: &World, b: &ShadowBox, sun: [f32; 3]) -> bool {
+    let moved = [0, 1, 2].iter().any(|&k| (seen.sun[k] - sun[k]).abs() > 1e-4);
+    if moved || seen.since.elapsed().as_secs_f32() > 2.0 || seen.seen.len() > 8192 {
+        seen.sun = sun;
+        seen.since = std::time::Instant::now();
+        seen.seen.clear();
+    }
+    let key = [0, 1, 2].map(|k| ((b.min[k] + b.max[k]) * 1.0).round() as i32);
+    match seen.seen.get(&key) {
+        Some(&v) => v,
+        None => {
+            let v = sun_reaches(world, b, sun);
+            seen.seen.insert(key, v);
+            v
+        }
+    }
+}
+
 /// Un autre joueur à dessiner : la construction en ligne, ou la foule d'essai.
 struct Other<'a> {
     pseudo: &'a str,
@@ -7367,6 +7456,8 @@ struct Other<'a> {
     /// (v194) Sa marche quand il la porte lui-même (la foule), sinon cherchée par son
     /// pseudo.
     walk: Option<&'a Walk>,
+    /// (v197) Son skin, déjà trouvé (voir `Skins::of`).
+    skin: Option<std::sync::Arc<crate::skin::Skin>>,
     /// (v191) Abri déjà connu (la foule le garde en mémoire), sinon cherché ici : voir
     /// `sky_light`.
     covered: Option<bool>,

@@ -1589,6 +1589,70 @@ mod tests {
         }
     }
 
+    /// (v197) Les faces arrière des joueurs peuvent-elles être écartées par la carte
+    /// graphique, comme celles du monde ? Il faut que les deux maillages tournent leurs
+    /// triangles dans le même sens. Le monde est la référence : son pipeline écarte déjà
+    /// les faces arrière (`cull_mode: Back`, `front_face: Ccw` dans `render/lib.rs`) et
+    /// s'affiche bien. L'essai n'a pas besoin de carte graphique.
+    #[test]
+    fn players_wind_their_triangles_like_the_world() {
+        use minelib_world::{BlockId, ChunkPos, World};
+        let face_normal = |f: u32| match f {
+            0 => Vec3::X,
+            1 => -Vec3::X,
+            2 => Vec3::Y,
+            3 => -Vec3::Y,
+            4 => Vec3::Z,
+            _ => -Vec3::Z,
+        };
+        // Le sens du monde : un bloc posé, toutes ses faces.
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        for z in 2..6 {
+            for x in 2..6 {
+                w.set(x, 20, z, BlockId::STONE);
+            }
+        }
+        w.set(4, 22, 4, BlockId::STONE);
+        let m = minelib_world::mesh::mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        let mut n = 0;
+        for t in m.indices.chunks(3) {
+            let v = [0, 1, 2].map(|k| m.vertices[t[k] as usize]);
+            let f = v[0].face();
+            if f > 5 {
+                continue; // plantes en croix, torches penchées : pas une face de cube
+            }
+            let p = v.map(|x| Vec3::from(x.pos));
+            let wind = (p[1] - p[0]).cross(p[2] - p[0]);
+            if wind.length_squared() < 1e-9 {
+                continue;
+            }
+            assert!(
+                wind.normalize().dot(face_normal(f)) > 0.9,
+                "le monde tourne ce triangle dans l'autre sens : face {f}"
+            );
+            n += 1;
+        }
+        assert!(n > 20, "l'essai n'a regardé que {n} triangles du monde");
+        // Le même sens pour les joueurs, avec la matrice du shader.
+        let mesh = player_mesh();
+        for pose in test_poses() {
+            let inst = instance(&pose, 0, &Prev::still(&pose));
+            for t in mesh.chunks(3) {
+                let xf = shader_part_matrix(t[0].part, &inst);
+                let p = [0, 1, 2].map(|k| xf.transform_point3(Vec3::from(t[k].pos)));
+                let wind = (p[1] - p[0]).cross(p[2] - p[0]);
+                let out = xf.transform_vector3(Vec3::from(t[0].normal));
+                assert!(wind.length_squared() > 1e-12, "triangle plat du joueur");
+                assert!(
+                    wind.normalize().dot(out.normalize()) > 0.9,
+                    "joueur : triangle tourné dans l'autre sens (partie {})",
+                    t[0].part
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_graphics_card_draws_players_like_the_model() {
         let mesh = player_mesh();

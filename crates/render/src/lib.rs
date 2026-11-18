@@ -712,6 +712,14 @@ pub struct Renderer {
     /// Images restantes pendant lesquelles l'anticrénelage considère la scène modifiée.
     mesh_changes: u32,
     draw_list: Vec<(f32, MeshKey)>,
+    /// (v197) Dessins des chunks qui reflètent et des translucides, préparés par `cull`
+    /// (page, premier indice, nombre d'indices, premier sommet) : les passes parcouraient
+    /// les ~1 000 chunks visibles et cherchaient chacun dans la table, trois fois par
+    /// image, pour n'en dessiner que quelques-uns.
+    reflect_draws: Vec<(usize, u32, u32, i32)>,
+    translucent_draws: Vec<(usize, u32, u32, i32)>,
+    /// Triangles des deux listes ci-dessus (pour le bilan).
+    extra_triangles: usize,
     overlay: overlay::OverlayRenderer,
     viewmodel: viewmodel::ViewModel,
     /// (v194) Rendu bleuté sous la ligne de l'eau.
@@ -1231,6 +1239,9 @@ impl Renderer {
             multi_draw,
             mesh_changes: 0,
             draw_list: Vec::new(),
+            reflect_draws: Vec::new(),
+            translucent_draws: Vec::new(),
+            extra_triangles: 0,
             adapter_name,
             device_type: info.device_type,
         };
@@ -2080,6 +2091,27 @@ impl Renderer {
         perf::gauge("chunks entièrement cachés (grottes)", hidden as f32);
         // De l'avant vers l'arrière : le test de profondeur rejette tôt ce qui est caché.
         self.draw_list.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        // (v197) Les chunks qui reflètent et les translucides, repérés une fois ici.
+        self.reflect_draws.clear();
+        self.translucent_draws.clear();
+        self.extra_triangles = 0;
+        for (_, key) in &self.draw_list {
+            let c = &self.meshes[key];
+            self.extra_triangles += (c.reflective + c.translucent) as usize / 3;
+            let first = c.slot.istart as u32 + c.count;
+            if c.reflective > 0 {
+                self.reflect_draws
+                    .push((c.slot.page, first, c.reflective, c.slot.vstart as i32));
+            }
+            if c.translucent > 0 {
+                self.translucent_draws.push((
+                    c.slot.page,
+                    first + c.reflective,
+                    c.translucent,
+                    c.slot.vstart as i32,
+                ));
+            }
+        }
 
         // Commandes de dessin indirect, groupées par page (l'ordre avant → arrière est gardé
         // dans chaque page) : une page = un appel.
@@ -2170,19 +2202,14 @@ impl Renderer {
     /// Triangles qui reflètent des chunks visibles (pipeline déjà choisi).
     fn draw_reflective<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>) {
         let mut bound = usize::MAX;
-        for (_, key) in &self.draw_list {
-            let c = &self.meshes[key];
-            if c.reflective == 0 {
-                continue;
-            }
-            if bound != c.slot.page {
-                bound = c.slot.page;
+        for &(page, first, count, vstart) in &self.reflect_draws {
+            if bound != page {
+                bound = page;
                 let pg = &self.arena.pages[bound];
                 pass.set_vertex_buffer(0, pg.vertices.slice(..));
                 pass.set_index_buffer(pg.indices.slice(..), wgpu::IndexFormat::Uint32);
             }
-            let first = c.slot.istart as u32 + c.count;
-            pass.draw_indexed(first..first + c.reflective, c.slot.vstart as i32, 0..1);
+            pass.draw_indexed(first..first + count, vstart, 0..1);
         }
     }
 
@@ -2234,11 +2261,8 @@ impl Renderer {
                 }
             }
         }
-        for (_, key) in &self.draw_list {
-            let c = &self.meshes[key];
-            stats.triangles += (c.reflective + c.translucent) as usize / 3;
-            stats.chunks_drawn += 1;
-        }
+        stats.triangles += self.extra_triangles;
+        stats.chunks_drawn += self.draw_list.len();
 
         // Miroirs et métaux : seulement les chunks qui en ont, avec le shader des reflets.
         pass.set_pipeline(&heavy.reflective);
@@ -2521,19 +2545,14 @@ impl Renderer {
         pass.set_bind_group(0, self.world_group(), &[]);
         pass.set_pipeline(pipes.translucent.unwrap_or(&heavy.translucent));
         let mut bound = usize::MAX;
-        for (_, key) in self.draw_list.iter().rev() {
-            let c = &self.meshes[key];
-            if c.translucent == 0 {
-                continue;
-            }
-            if bound != c.slot.page {
-                bound = c.slot.page;
+        for &(page, first, count, vstart) in self.translucent_draws.iter().rev() {
+            if bound != page {
+                bound = page;
                 let pg = &self.arena.pages[bound];
                 pass.set_vertex_buffer(0, pg.vertices.slice(..));
                 pass.set_index_buffer(pg.indices.slice(..), wgpu::IndexFormat::Uint32);
             }
-            let first = c.slot.istart as u32 + c.count + c.reflective;
-            pass.draw_indexed(first..first + c.translucent, c.slot.vstart as i32, 0..1);
+            pass.draw_indexed(first..first + count, vstart, 0..1);
         }
     }
 

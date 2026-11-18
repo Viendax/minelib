@@ -1019,7 +1019,10 @@ const LIGHT_STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
 const HALF_BLOCK: u32 = 32;
 const HALF_BLOCKS: u32 = 8;
 const HALF_SKIP: u32 = 6;
-const HALF_RETRY: u32 = 4000;
+/// (v197) Ressayé toutes les ~20 000 images (une minute et demie à 230 images/s, contre
+/// 17 s avant) : chaque essai passe 256 images en mode alterné, dont une partie dans le
+/// mode le plus lent. L'image est la même dans les deux modes.
+const HALF_RETRY: u32 = 20_000;
 
 /// Éclairage en demi-résolution : essayé contre le calcul exact par blocs d'images, et
 /// gardé seulement s'il est plus rapide sur cette carte graphique (même image dans les deux

@@ -38,6 +38,9 @@ pub struct Npc {
     /// portée par lui, et non cherchée par son pseudo dans une table — à 4 000 joueurs
     /// c'était 8 000 recherches par image, deux fois le hachage de chaque pseudo.
     pub walk: crate::session::Walk,
+    /// (v197) Son skin (presque toujours aucun : le modèle par défaut), repris de temps en
+    /// temps comme `covered` — et non cherché par son pseudo à chaque image.
+    pub skin: Option<std::sync::Arc<crate::skin::Skin>>,
     /// (v191) Le ciel est-il bouché au-dessus de lui ? Sa lumière en découle. Cherché en
     /// changeant de case, et repris pour quelques-uns à chaque image (un toit peut être
     /// construit au-dessus d'eux) : parcourir la colonne de blocs de 4 000 joueurs à
@@ -88,7 +91,13 @@ impl Crowd {
 
     /// Une image : de nouveaux joueurs autour de `center` (jusqu'au nombre voulu), et
     /// chacun avance.
-    pub fn update(&mut self, world: &World, center: Vec3, dt: f32) {
+    pub fn update(
+        &mut self,
+        world: &World,
+        skins: &crate::skin::Skins,
+        center: Vec3,
+        dt: f32,
+    ) {
         self.t += dt;
         let want = Self::wanted(self.t);
         // Quelques apparitions par image au plus (la recherche du sol coûte).
@@ -110,8 +119,11 @@ impl Crowd {
         // Abri repris pour quelques joueurs par image : tous en une minute environ.
         for _ in 0..RECHECK_PER_FRAME.min(self.npcs.len()) {
             self.recheck = (self.recheck + 1) % self.npcs.len();
-            let n = &mut self.npcs[self.recheck];
+            let i = self.recheck;
+            let skin = skins.of(&self.npcs[i].name);
+            let n = &mut self.npcs[i];
             n.covered = covered(world, n.pos);
+            n.skin = skin;
         }
         self.log_in -= dt;
         if self.log_in <= 0.0 {
@@ -139,6 +151,7 @@ impl Crowd {
         Some(Npc {
             name,
             walk: crate::session::Walk::new(pos),
+            skin: None,
             pos,
             yaw,
             pitch: 0.0,
@@ -272,9 +285,10 @@ mod tests {
             }
         }
         let mut c = Crowd::new();
+        let skins = crate::skin::Skins::default();
         let center = Vec3::new(0.0, 11.0, 0.0);
         for _ in 0..(30.0 / 0.05) as usize {
-            c.update(&w, center, 0.05);
+            c.update(&w, &skins, center, 0.05);
         }
         assert!(
             (Crowd::wanted(30.0) as i64 - c.npcs.len() as i64).abs() <= 64,

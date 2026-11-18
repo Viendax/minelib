@@ -267,7 +267,15 @@ impl Players {
                     ],
                 },
                 primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
+                    // (v197) Faces arrière écartées : les six pavés d'un joueur sont
+                    // fermés, on n'en voit jamais l'intérieur, et la foule faisait
+                    // travailler la carte sur 864 000 sommets par image à 4 000 joueurs,
+                    // la moitié pour rien. Le modèle tourne ses triangles dans le même sens
+                    // que le monde (essai `players_wind_their_triangles_like_the_world`),
+                    // dont les pipelines écartent déjà les faces arrière, y compris dans les
+                    // passes de miroir (le retournement gauche-droite de `FLIP_X * vp * M`
+                    // rétablit le sens, voir `planar`).
+                    cull_mode: Some(wgpu::Face::Back),
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
