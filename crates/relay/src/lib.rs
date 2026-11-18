@@ -180,6 +180,7 @@ impl Handle {
         root: [u8; 32],
         info: proto::StandbyInfo,
         settings: proto::ProvinceSettings,
+        standby: bool,
     ) -> bool {
         provinces::begin(
             &mut self.state.lock().unwrap(),
@@ -191,7 +192,39 @@ impl Handle {
             root,
             info,
             settings,
+            standby,
         )
+    }
+
+    /// Relais de secours d'une province (v141) : un envoi gardé par le relais du monde ;
+    /// renvoie jusqu'où la copie est à jour.
+    pub fn province_copy(
+        &self,
+        epoch: u64,
+        n: u64,
+        entries: Vec<([i32; 2], u64, Vec<u8>)>,
+        bags: Vec<proto::BagCopy>,
+        held: Vec<String>,
+    ) -> Option<u64> {
+        provinces::copy(
+            &mut self.state.lock().unwrap(),
+            epoch,
+            n,
+            entries,
+            bags,
+            held,
+        )
+    }
+
+    /// Relais de secours : il prend la place du relais de la province ; jusqu'où il a la
+    /// copie.
+    pub fn province_promote(&self, old: u64, epoch: u64) -> Option<u64> {
+        provinces::promote_here(&mut self.state.lock().unwrap(), old, epoch)
+    }
+
+    /// Provinces confiées à leur relais de secours (essais).
+    pub fn province_promotions(&self) -> usize {
+        self.state.lock().unwrap().province_promotions
     }
 
     /// Relais de province (v139) : du relais du monde, un sac de survie prêté ou rappelé,
@@ -1187,6 +1220,8 @@ struct State {
     index_cache: std::cell::RefCell<Option<(Instant, PlayersIndex)>>,
     /// Dernière recherche d'hôte sans hôte libre (voir `HOSTS_WAIT`).
     hosts_wait: Option<Instant>,
+    /// Provinces confiées à leur relais de secours (essais).
+    province_promotions: usize,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -1269,6 +1304,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         positions_seen: 0,
         index_cache: std::cell::RefCell::new(None),
         hosts_wait: None,
+        province_promotions: 0,
     }));
     let state_for_handle = state.clone();
     let state_for_guards = state.clone();
@@ -1552,6 +1588,8 @@ fn leave_room(st: &mut State, id: u64) {
     let Some(room_id) = st.conns.get_mut(&id).and_then(|c| c.room.take()) else {
         return;
     };
+    // (v141 : relais de secours d'une province, ou copie qui la suit.)
+    provinces::left(st, room_id, id);
     let me = st.conns.get(&id).and_then(|c| c.pseudo.clone());
     let Some(room) = st.rooms.get_mut(&room_id) else {
         return;
@@ -6198,9 +6236,21 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             node,
             addr,
             key,
+            have,
         } => {
             if my_room == Some(room) {
-                provinces::ready(st, room, id, province, epoch, node, addr, key);
+                provinces::ready(st, room, id, province, epoch, node, addr, key, have);
+            }
+            return None;
+        }
+        Request::ProvinceStandbyReady {
+            room,
+            province,
+            epoch,
+            have: _,
+        } => {
+            if my_room == Some(room) {
+                provinces::standby_ready(st, room, id, province, epoch);
             }
             return None;
         }
@@ -6955,6 +7005,7 @@ fn handle(
             | Request::ToPeer { .. }
             | Request::Broadcast { .. }
             | Request::ProvinceReady { .. }
+            | Request::ProvinceStandbyReady { .. }
             | Request::ProvinceLease { .. }
             | Request::ProvinceArchive { .. }
             | Request::ProvinceShards { .. }
@@ -7284,6 +7335,16 @@ fn handle_account(
             signer,
             token,
         } => provinces::region_host(st, session, id, room, region, slot, pseudo, signer, token),
+        Request::ProvinceFollow {
+            room,
+            province,
+            epoch,
+            pseudo,
+            signer,
+            token,
+        } => provinces::follow(
+            st, session, id, room, province, epoch, pseudo, signer, token,
+        ),
         Request::Prove { signature } => {
             let Session::Proving {
                 pseudo,
@@ -10093,6 +10154,139 @@ mod tests {
 
     /// Un monde de construction ouvert par « Proprio », sur un relais sans réseau. (Sans
     /// provinces : les essais qui en veulent le disent, `Handle::set_provinces`.)
+    /// Relais de province (v141) : un relais de secours n'y entre qu'avec le jeton du
+    /// relais du monde (pour cette province, cette époque, ce pseudo et cette clé) ; il
+    /// reçoit tout ce qu'elle a, puis seulement ce que le relais du monde a gardé. Un relais
+    /// de secours ne fait entrer aucun joueur tant qu'il n'a pas pris la place du relais.
+    #[test]
+    fn a_province_standby_needs_the_world_relay_token() {
+        let root_key = SigningKey::from_bytes(&[3u8; 32]);
+        let root = root_key.verifying_key().to_bytes();
+        let secret = [7u8; 32];
+        let info = proto::StandbyInfo {
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+            creator: "Createur".into(),
+            server: servers::key("Createur", "monde"),
+            owner: "Createur".into(),
+        };
+        let (h, dir) = crowd_world("secours");
+        {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            assert!(provinces::begin(
+                st,
+                42,
+                [0, 0],
+                1,
+                5,
+                secret,
+                root,
+                info.clone(),
+                Default::default(),
+                false,
+            ));
+            // Un bloc déjà publié par la province.
+            let data = game::encode(&game::BuildMsg::Set {
+                pos: [3, 70, 3],
+                block: 4,
+                by: "J".into(),
+                seq: 9,
+            });
+            st.rooms
+                .get_mut(&42)
+                .unwrap()
+                .build
+                .mirror_at([0, 0], &data, Some(9), &[]);
+            let mut crowd = Crowd::new();
+            let f = crowd.conn(st, "Suiveur", true);
+            let signer = [9u8; 32];
+            let mut session = Session::Anonymous;
+            let follow = |st: &mut State, session: &mut Session, epoch: u64, token: [u8; 32]| {
+                provinces::follow(
+                    st,
+                    session,
+                    f,
+                    42,
+                    [0, 0],
+                    epoch,
+                    "Suiveur".into(),
+                    signer,
+                    token,
+                )
+            };
+            // Jeton inventé, ou d'une autre époque, ou d'un autre joueur : refusé.
+            assert!(matches!(
+                follow(st, &mut session, 5, [0; 32]),
+                Response::Error { .. }
+            ));
+            let other_epoch = proto::follow_token(&secret, 42, [0, 0], "Suiveur", &signer, 6);
+            assert!(matches!(
+                follow(st, &mut session, 6, other_epoch),
+                Response::Error { .. }
+            ));
+            let other_player = proto::follow_token(&secret, 42, [0, 0], "Autre", &signer, 5);
+            assert!(matches!(
+                follow(st, &mut session, 5, other_player),
+                Response::Error { .. }
+            ));
+            assert!(crowd.got(f).0.is_empty(), "rien n'est parti à un refusé");
+            // Le bon : il reçoit ce qu'elle a.
+            let token = proto::follow_token(&secret, 42, [0, 0], "Suiveur", &signer, 5);
+            assert!(matches!(
+                follow(st, &mut session, 5, token),
+                Response::Welcome { .. }
+            ));
+            let got = crowd.got(f).0;
+            assert!(
+                got.iter()
+                    .any(|r| matches!(r, Response::ProvinceSeed { entries, .. }
+                    if entries.iter().any(|e| e.1 == 9))),
+                "historique reçu : {got:?}"
+            );
+            assert!(got
+                .iter()
+                .any(|r| matches!(r, Response::ProvinceCopy { n: 0, .. })));
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+        // Un relais de secours ne fait entrer personne, même avec un certificat valable.
+        let (h, dir) = crowd_world("secours2");
+        {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            assert!(provinces::begin(
+                st,
+                42,
+                [0, 0],
+                1,
+                5,
+                secret,
+                root,
+                info,
+                Default::default(),
+                true,
+            ));
+            let cert = minelib_net::sovereign::Cert::issue(
+                &root_key,
+                42,
+                "Joueur",
+                [1; 32],
+                now_secs() + 3600,
+            );
+            assert_eq!(provinces::admits(st, &cert), Some(false));
+            // Promu : il fait entrer.
+            assert_eq!(provinces::promote_here(st, 5, 8), Some(0));
+            assert_eq!(provinces::admits(st, &cert), Some(true));
+            // (Une seconde promotion de la même époque ne fait rien.)
+            assert_eq!(provinces::promote_here(st, 5, 9), None);
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn crowd_world(tag: &str) -> (Handle, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("minelib-{tag}-{}", rand::random::<u32>()));
         let h = start(Config {
@@ -11174,6 +11368,7 @@ mod tests {
                         node: [0; 32],
                         addr: format!("127.0.0.1:{host}"),
                         key: [2; 32],
+                        have: 0,
                     },
                 );
             }

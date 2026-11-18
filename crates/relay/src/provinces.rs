@@ -11,7 +11,7 @@
 //! la demande), et le relais du monde ne la reprend que `PROVINCE_MARGIN_MS` après la fin
 //! du dernier bail qu'il a pu donner. Un monde en pause ne renouvelle aucun bail.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
@@ -43,6 +43,11 @@ const ARCHIVE_MS: u64 = 100;
 const SPOT_MS: u64 = 2000;
 /// Sac de survie demandé sans réponse : redemandé après… (ms).
 const BAG_ASK_MS: u64 = 3000;
+/// (v141) Envois d'une province gardés ici pour son relais de secours, au plus (nombre,
+/// octets) ; et envois pas encore gardés qu'elle garde pour lui.
+const RECENT_MAX: usize = 128;
+const RECENT_BYTES: usize = 16 << 20;
+const COPIES_MAX: usize = 256;
 
 /// Relais du monde : une province confiée (ou en train de l'être).
 pub(crate) struct ProvinceRef {
@@ -66,6 +71,25 @@ pub(crate) struct ProvinceRef {
     /// l'hôte joue dans la région qu'il sert.
     pub counts: Option<Vec<([i32; 2], u32)>>,
     pub inside: Vec<([i32; 2], u16)>,
+    /// (v141) Son relais de secours ; ses derniers envois gardés ici (numéro, entrées : ce
+    /// que le relais de secours n'aurait pas encore s'il doit prendre sa place) ; après une
+    /// promotion, ceux de l'époque d'avant.
+    pub standby: Option<Standby>,
+    recent: VecDeque<(u64, Vec<super::zones::Entry>)>,
+    recent_bytes: usize,
+    carry: Option<VecDeque<(u64, Vec<super::zones::Entry>)>>,
+    /// Arrêt demandé pour de bon (province vide, pas prête) : elle revient ici, son relais
+    /// de secours ne prend pas sa place.
+    winding: bool,
+}
+
+/// (v141) Relais de secours d'une province, choisi par le relais du monde.
+pub(crate) struct Standby {
+    /// Connexion de garant de son hôte.
+    pub host: u64,
+    /// Sa copie est à jour : il peut prendre la place du relais de la province.
+    pub ready: bool,
+    since: Instant,
 }
 
 /// Relais de province : la province servie par cette salle.
@@ -107,6 +131,15 @@ pub(crate) struct ProvinceRoom {
     /// Blocs changés ici par des joueurs en survie dont elle n'a pas le sac : comptés par
     /// le relais du monde (dans le prochain envoi).
     loose: Vec<(String, u16)>,
+    /// (v141) Relais de secours : on suit la province sans la servir (jusqu'à la
+    /// promotion) ; dernier envoi copié ici.
+    standby: bool,
+    have: u64,
+    /// Relais de province : ses relais de secours (connexions), dernier envoi gardé par le
+    /// relais du monde, et les envois pas encore gardés (ils leur partiront ensuite).
+    followers: Vec<u64>,
+    acked: u64,
+    copies: VecDeque<(u64, Vec<super::zones::Entry>, Vec<proto::BagCopy>)>,
 }
 
 impl ProvinceRoom {
@@ -278,29 +311,32 @@ pub(crate) fn upkeep(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>)
         })
         .map(|(p, _)| *p)
         .collect();
+    // (Hôte entré dans sa province : son relais de secours prend sa place, s'il en a un.)
     let mut back = Vec::new();
     let room = st.rooms.get_mut(&rid).expect("partie");
     for (p, r) in room.provinces.iter_mut() {
         if inside.contains(p) {
-            back.push(*p);
+            back.push((*p, true));
             continue;
         }
         if r.info.is_none() && r.since.elapsed() > START_WAIT {
-            back.push(*p);
+            back.push((*p, false));
             continue;
         }
         if count.get(p).copied().unwrap_or(0) == 0 {
             let since = *r.empty_since.get_or_insert_with(Instant::now);
             if since.elapsed() > EMPTY_FOR {
-                back.push(*p);
+                back.push((*p, false));
             }
         } else {
             r.empty_since = None;
         }
     }
-    for p in back {
-        stop(st, rid, p, "vide ou pas prête");
+    for (p, keep) in back {
+        stop(st, rid, p, "vide, pas prête, ou hôte dedans", keep);
     }
+    // (v141) Un relais de secours pour chaque province servie.
+    standbys(st, rid, index);
     let mut wanted: Vec<[i32; 2]> = count
         .iter()
         .filter(|(p, &n)| n >= from && !st.rooms[&rid].provinces.contains_key(*p))
@@ -368,6 +404,11 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             empty_since: None,
             counts: None,
             inside: Vec::new(),
+            standby: None,
+            recent: VecDeque::new(),
+            recent_bytes: 0,
+            carry: None,
+            winding: false,
         },
     );
     let Some(c) = st.conns.get_mut(&g) else {
@@ -385,6 +426,7 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             root,
             info,
             settings,
+            follow: None,
         },
     );
     for part in entries.chunks(SEED_CHUNK) {
@@ -416,6 +458,7 @@ pub(crate) fn ready(
     node: [u8; 32],
     addr: String,
     key: [u8; 32],
+    have: u64,
 ) {
     let size = size(st);
     let Some(room) = st.rooms.get_mut(&rid) else {
@@ -429,8 +472,21 @@ pub(crate) fn ready(
         return;
     };
     let after = r.snap_seq;
+    let carry = r.carry.take();
     let keep = |zone: [i32; 2]| proto::province_of(zone_region(zone), size) == p;
-    let delta = room.build.entries_after(keep, after);
+    // (v141) Relais de secours qui prend la place du relais tombé : les envois gardés ici
+    // qu'il n'a pas encore (tout, s'il a trop de retard), puis ce que ce relais a publié
+    // dans la province depuis.
+    let mut delta = match carry {
+        Some(recent) if recent.front().is_none_or(|(n, _)| *n <= have + 1) => recent
+            .into_iter()
+            .filter(|(n, _)| *n > have)
+            .flat_map(|(_, e)| e)
+            .collect(),
+        Some(_) => room.build.entries_after(keep, 0),
+        None => Vec::new(),
+    };
+    delta.extend(room.build.entries_after(keep, after));
     let base = room.build.reserve(PROVINCE_SEQS);
     let r = room.provinces.get_mut(&p).expect("province");
     r.info = Some(ProvinceInfo {
@@ -570,6 +626,18 @@ pub(crate) fn archive(
         .is_some_and(|r| r.host == id && r.epoch == epoch && r.info.is_some())
     {
         return;
+    }
+    // (v141) Gardés aussi un moment pour son relais de secours.
+    if let Some(r) = room.provinces.get_mut(&p).filter(|r| r.standby.is_some()) {
+        let bytes: usize = entries.iter().map(|e| e.2.len() + 24).sum();
+        r.recent.push_back((n, entries.clone()));
+        r.recent_bytes += bytes;
+        while r.recent.len() > RECENT_MAX || r.recent_bytes > RECENT_BYTES {
+            let Some((_, old)) = r.recent.pop_front() else {
+                break;
+            };
+            r.recent_bytes -= old.iter().map(|e| e.2.len() + 24).sum::<usize>();
+        }
     }
     for (zone, seq, data) in entries {
         if proto::province_of(zone_region(zone), size) != p {
@@ -1012,7 +1080,7 @@ pub(crate) fn released(st: &mut State, rid: u64, id: u64, p: [i32; 2], epoch: u6
             .get(&p)
             .is_some_and(|r| r.host == id && r.epoch == epoch)
     });
-    if ok {
+    if ok && !promote(st, rid, p, "rendue") {
         take_back(st, rid, p, "rendue");
     }
 }
@@ -1033,17 +1101,25 @@ pub(crate) fn upkeep_leases(st: &mut State) {
         })
         .collect();
     for (rid, p) in due {
-        take_back(st, rid, p, "bail fini");
+        if !promote(st, rid, p, "bail fini") {
+            take_back(st, rid, p, "bail fini");
+        }
     }
 }
 
 /// Relais du monde : arrêt demandé à l'hôte d'une province. Pas encore prête : reprise
 /// tout de suite ; prête : elle s'arrête et rend tout (`ProvinceRelease`), sinon reprise à
 /// la fin du bail.
-fn stop(st: &mut State, rid: u64, p: [i32; 2], why: &str) {
-    let Some(r) = st.rooms.get(&rid).and_then(|room| room.provinces.get(&p)) else {
+fn stop(st: &mut State, rid: u64, p: [i32; 2], why: &str, keep: bool) {
+    let Some(r) = st
+        .rooms
+        .get_mut(&rid)
+        .and_then(|room| room.provinces.get_mut(&p))
+    else {
         return;
     };
+    // (Pour de bon : son relais de secours ne prendra pas sa place.)
+    r.winding = !keep;
     let (host, epoch, ready) = (r.host, r.epoch, r.info.is_some());
     if let Some(c) = st.conns.get(&host) {
         transport::push(
@@ -1067,6 +1143,7 @@ fn stop(st: &mut State, rid: u64, p: [i32; 2], why: &str) {
 /// hôte est libéré, les joueurs qui l'ont en vue l'apprennent.
 fn take_back(st: &mut State, rid: u64, p: [i32; 2], why: &str) {
     let size = size(st);
+    drop_standby(st, rid, p);
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -1130,6 +1207,285 @@ fn take_back(st: &mut State, rid: u64, p: [i32; 2], why: &str) {
     }
     log::info!("monde {rid} : province {p:?} reprise par le relais du monde ({why})");
     announce(st, rid, p);
+}
+
+/// Ce qu'un relais de province (ou son relais de secours) doit savoir du monde.
+fn task_info(room: &super::Room) -> proto::StandbyInfo {
+    proto::StandbyInfo {
+        name: room.name.clone(),
+        map: room.map.clone(),
+        map_sig: room.map_sig,
+        max_players: room.max_players,
+        creator: room.creator.clone(),
+        server: room.server.clone(),
+        owner: room.host_pseudo.clone(),
+    }
+}
+
+/// Relais du monde (v141, à chaque entretien) : chaque province servie reçoit un relais de
+/// secours (la connexion de garant d'un joueur hors de la province), qui en tient une
+/// copie et prendra sa place si elle tombe ; celui qui n'est pas prêt à temps est remplacé.
+fn standbys(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
+    let size = size(st);
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let late: Vec<[i32; 2]> = room
+        .provinces
+        .iter()
+        .filter(|(_, r)| {
+            r.standby
+                .as_ref()
+                .is_some_and(|s| !s.ready && s.since.elapsed() > START_WAIT)
+        })
+        .map(|(p, _)| *p)
+        .collect();
+    for p in late {
+        drop_standby(st, rid, p);
+    }
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let mut wanted: Vec<[i32; 2]> = room
+        .provinces
+        .iter()
+        .filter(|(_, r)| r.info.is_some() && r.standby.is_none() && !r.winding)
+        .map(|(p, _)| *p)
+        .collect();
+    wanted.sort();
+    if wanted.is_empty()
+        || st
+            .hosts_wait
+            .is_some_and(|t| t.elapsed() < super::HOSTS_WAIT)
+    {
+        return;
+    }
+    if index.is_none() {
+        *index = Some(super::players_index(st));
+    }
+    let index = index.as_ref().expect("index");
+    for p in wanted {
+        let outside = move |chunk: [i32; 2]| proto::province_of(proto::region_of(chunk), size) != p;
+        let Some(g) = super::pick_host(st, index, rid, &outside) else {
+            st.hosts_wait = Some(Instant::now());
+            break;
+        };
+        assign_standby(st, rid, p, size, g);
+    }
+}
+
+/// Relais du monde : la connexion de garant `g` tiendra le relais de secours de `p`.
+fn assign_standby(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
+    let root = st.cert_key.verifying_key().to_bytes();
+    let pseudo = st
+        .conns
+        .get(&g)
+        .and_then(|c| c.pseudo.clone())
+        .unwrap_or_default();
+    let signer = super::account_key(st, g).unwrap_or([0; 32]);
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let Some(r) = room.provinces.get(&p) else {
+        return;
+    };
+    let Some(info) = r.info.clone() else {
+        return;
+    };
+    let epoch = r.epoch;
+    let secret = room.shard_secret;
+    let token = proto::follow_token(&secret, rid, p, &pseudo, &signer, epoch);
+    let task = task_info(room);
+    let server = room.server.clone();
+    let settings = settings_of(st, &server);
+    let room = st.rooms.get_mut(&rid).expect("partie");
+    room.members.push(g);
+    room.hidden.insert(g);
+    if let Some(r) = room.provinces.get_mut(&p) {
+        r.standby = Some(Standby {
+            host: g,
+            ready: false,
+            since: Instant::now(),
+        });
+    }
+    let Some(c) = st.conns.get_mut(&g) else {
+        return;
+    };
+    c.room = Some(rid);
+    transport::push(
+        &c.tx,
+        &Response::ProvinceTask {
+            room: rid,
+            province: p,
+            size,
+            epoch,
+            secret,
+            root,
+            info: task,
+            settings,
+            follow: Some(Box::new(proto::ProvinceAt { info, token })),
+        },
+    );
+    log::info!("monde {rid} : relais de secours de la province {p:?} confié à {g}");
+}
+
+/// Relais du monde : le relais de secours de `p` est relevé.
+fn drop_standby(st: &mut State, rid: u64, p: [i32; 2]) {
+    let Some(r) = st
+        .rooms
+        .get_mut(&rid)
+        .and_then(|room| room.provinces.get_mut(&p))
+    else {
+        return;
+    };
+    let epoch = r.epoch;
+    let Some(sb) = r.standby.take() else {
+        return;
+    };
+    r.recent.clear();
+    r.recent_bytes = 0;
+    leave_room(st, sb.host);
+    if let Some(c) = st.conns.get(&sb.host) {
+        transport::push(
+            &c.tx,
+            &Response::ProvinceStop {
+                room: rid,
+                province: p,
+                epoch,
+            },
+        );
+    }
+}
+
+/// Relais du monde : la copie du relais de secours de `p` est à jour.
+pub(crate) fn standby_ready(st: &mut State, rid: u64, id: u64, p: [i32; 2], epoch: u64) {
+    if let Some(sb) = st
+        .rooms
+        .get_mut(&rid)
+        .and_then(|room| room.provinces.get_mut(&p))
+        .filter(|r| r.epoch == epoch)
+        .and_then(|r| r.standby.as_mut())
+        .filter(|s| s.host == id)
+    {
+        if !sb.ready {
+            log::info!("monde {rid} : relais de secours de la province {p:?} prêt");
+        }
+        sb.ready = true;
+    }
+}
+
+/// Relais du monde (v141) : le relais de la province `p` ne répond plus (ou s'en va) :
+/// son relais de secours prend sa place, sous une nouvelle époque, sans que ce relais ait à
+/// la servir (seulement le temps qu'il soit prêt). Faux s'il n'y en a pas de prêt (ou si
+/// elle doit revenir ici pour de bon).
+fn promote(st: &mut State, rid: u64, p: [i32; 2], why: &str) -> bool {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return false;
+    };
+    let Some(r) = room.provinces.get(&p) else {
+        return false;
+    };
+    let Some(sb) = r
+        .standby
+        .as_ref()
+        .filter(|s| s.ready && !r.winding)
+        .map(|s| s.host)
+    else {
+        return false;
+    };
+    if !st.conns.contains_key(&sb) {
+        return false;
+    }
+    let (old, old_host) = (r.epoch, r.host);
+    let epoch = room.next_epoch;
+    room.next_epoch += 1;
+    let snap_seq = room.build.last_seq();
+    let r = room.provinces.get_mut(&p).expect("province");
+    let recent = std::mem::take(&mut r.recent);
+    *r = ProvinceRef {
+        host: sb,
+        epoch,
+        info: None,
+        since: Instant::now(),
+        renewed: Instant::now(),
+        snap_seq,
+        empty_since: None,
+        counts: None,
+        inside: Vec::new(),
+        standby: None,
+        recent: VecDeque::new(),
+        recent_bytes: 0,
+        carry: Some(recent),
+        winding: false,
+    };
+    refresh_delegated(room);
+    // Ses sacs de survie restent prêtés, à la nouvelle époque : prêtés de nouveau (la copie
+    // d'ici est la plus récente ; celle du relais de secours peut avoir du retard).
+    let mut lend_again = Vec::new();
+    for (who, h) in room.bag_holders.iter_mut() {
+        if *h == (p, old) {
+            *h = (p, epoch);
+            lend_again.push(who.clone());
+        }
+    }
+    for h in room.bag_waiting.values_mut() {
+        if *h == (p, old) {
+            *h = (p, epoch);
+        }
+    }
+    // L'ancien hôte (tombé, coupé, ou parti) : arrêté pour de bon.
+    leave_room(st, old_host);
+    if let Some(c) = st.conns.get(&old_host) {
+        transport::push(
+            &c.tx,
+            &Response::ProvinceStop {
+                room: rid,
+                province: p,
+                epoch: old,
+            },
+        );
+    }
+    if let Some(c) = st.conns.get(&sb) {
+        transport::push(
+            &c.tx,
+            &Response::ProvincePromote {
+                room: rid,
+                province: p,
+                old,
+                epoch,
+            },
+        );
+    }
+    for who in lend_again {
+        lend(st, rid, &who);
+    }
+    st.province_promotions += 1;
+    log::info!(
+        "monde {rid} : province {p:?} confiée à son relais de secours ({why}, époque {epoch})"
+    );
+    announce(st, rid, p);
+    true
+}
+
+/// Une connexion quitte la salle `rid` : relais de secours (relais du monde) ou copie qui
+/// suit la province (relais de province).
+pub(crate) fn left(st: &mut State, rid: u64, id: u64) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    for r in room.provinces.values_mut() {
+        if r.standby.as_ref().is_some_and(|s| s.host == id) {
+            r.standby = None;
+            r.recent.clear();
+            r.recent_bytes = 0;
+        }
+    }
+    if let Some(pr) = room.province.as_mut() {
+        pr.followers.retain(|f| *f != id);
+        if pr.followers.is_empty() {
+            pr.copies.clear();
+        }
+    }
 }
 
 /// Relais du monde : la liste des provinces a changé pour `p` : à chaque joueur qui l'a
@@ -1223,6 +1579,7 @@ pub(crate) fn begin(
     root: [u8; 32],
     info: proto::StandbyInfo,
     settings: proto::ProvinceSettings,
+    standby: bool,
 ) -> bool {
     let Ok(root) = VerifyingKey::from_bytes(&root) else {
         return false;
@@ -1271,6 +1628,11 @@ pub(crate) fn begin(
         spots: HashMap::new(),
         last_spots: 0,
         loose: Vec::new(),
+        standby,
+        have: 0,
+        followers: Vec::new(),
+        acked: 0,
+        copies: VecDeque::new(),
     });
     // (Réglages du serveur : OP, bannis, mode par défaut ; sacs de survie suivis, pour la
     // copie envoyée au relais du monde.)
@@ -1351,7 +1713,8 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if !pr.go || pr.stopped {
+    // (Relais de secours : il suit, ne sert pas.)
+    if !pr.go || pr.stopped || pr.standby {
         return out;
     }
     let (p, epoch) = (pr.province, pr.epoch);
@@ -1386,12 +1749,21 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
         };
         let n = pr.next_n;
         pr.next_n += 1;
+        let entries = std::mem::take(&mut pr.outbox);
+        // (v141) Gardé pour ses relais de secours : il leur partira une fois gardé par le
+        // relais du monde.
+        if !pr.followers.is_empty() {
+            pr.copies.push_back((n, entries.clone(), bags.clone()));
+            while pr.copies.len() > COPIES_MAX {
+                pr.copies.pop_front();
+            }
+        }
         out.push(Request::ProvinceArchive {
             room: rid,
             province: p,
             epoch,
             n,
-            entries: std::mem::take(&mut pr.outbox),
+            entries,
             bags,
             spots,
             loose: std::mem::take(&mut pr.loose),
@@ -1487,6 +1859,195 @@ pub(crate) fn archived(st: &mut State, epoch: u64, n: u64) {
             transport::push(&c.tx, &Response::ProvinceConfirmed { n });
         }
     }
+    // (v141) Ses relais de secours reçoivent ce que le relais du monde a gardé (jamais
+    // plus : leur copie reste en deçà de la sienne).
+    let room = st.rooms.get_mut(&rid).expect("province");
+    let Some(pr) = room.province.as_mut() else {
+        return;
+    };
+    pr.acked = pr.acked.max(n);
+    let p = pr.province;
+    let held: Vec<String> = pr.held.iter().cloned().collect();
+    let mut out = Vec::new();
+    while pr.copies.front().is_some_and(|(m, _, _)| *m <= n) {
+        out.push(pr.copies.pop_front().expect("envoi"));
+    }
+    let followers = pr.followers.clone();
+    for (m, entries, bags) in out {
+        let msg = Response::ProvinceCopy {
+            room: rid,
+            province: p,
+            epoch,
+            n: m,
+            entries,
+            bags,
+            held: held.clone(),
+        };
+        for f in &followers {
+            if let Some(c) = st.conns.get(f) {
+                transport::push(&c.tx, &msg);
+            }
+        }
+    }
+}
+
+/// Relais de province (v141) : un relais de secours entre (jeton du relais du monde) ; il
+/// reçoit tout ce qu'elle a, puis chaque envoi gardé par le relais du monde.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn follow(
+    st: &mut State,
+    session: &mut Session,
+    id: u64,
+    room: u64,
+    p: [i32; 2],
+    epoch: u64,
+    pseudo: String,
+    signer: [u8; 32],
+    token: [u8; 32],
+) -> Response {
+    let ok = st.province_room == Some(room)
+        && st.rooms.get(&room).is_some_and(|r| {
+            r.province.as_ref().is_some_and(|pr| {
+                pr.province == p
+                    && pr.epoch == epoch
+                    && !pr.standby
+                    && !pr.stopped
+                    && proto::follow_token(&r.shard_secret, room, p, &pseudo, &signer, epoch)
+                        == token
+            })
+        });
+    if !ok || pseudo.starts_with('#') {
+        return err(
+            ErrorCode::WrongCredentials,
+            "jeton de relais de secours refusé",
+        );
+    }
+    if let Some(c) = st.conns.get_mut(&id) {
+        c.pseudo = Some(pseudo.clone());
+        c.room = Some(room);
+        c.garant_only = true;
+        c.account = Some(signer);
+    }
+    *session = Session::LoggedIn {
+        pseudo: pseudo.clone(),
+    };
+    let r = st.rooms.get_mut(&room).expect("province");
+    r.members.push(id);
+    r.hidden.insert(id);
+    // Tout ce qu'elle a (ce qui part ensuite au relais du monde lui reviendra aussi).
+    let entries = r.build.entries_after(|_| true, 0);
+    let server = r.server.clone();
+    let pr = r.province.as_mut().expect("province");
+    pr.followers.push(id);
+    let (acked, held): (u64, Vec<String>) = (pr.acked, pr.held.iter().cloned().collect());
+    let bags: Vec<proto::BagCopy> = held
+        .iter()
+        .map(|who| {
+            let b = st.bags.get(&server, who);
+            (who.clone(), b.items.into_iter().collect(), b.mined)
+        })
+        .collect();
+    if let Some(c) = st.conns.get(&id) {
+        for part in entries.chunks(SEED_CHUNK) {
+            transport::push(
+                &c.tx,
+                &Response::ProvinceSeed {
+                    room,
+                    province: p,
+                    epoch,
+                    entries: part.to_vec(),
+                    go: None,
+                },
+            );
+        }
+        transport::push(
+            &c.tx,
+            &Response::ProvinceCopy {
+                room,
+                province: p,
+                epoch,
+                n: acked,
+                entries: Vec::new(),
+                bags,
+                held,
+            },
+        );
+    }
+    log::info!("relais de province : relais de secours de {pseudo} entré");
+    Response::Welcome {
+        pseudo,
+        totp: false,
+    }
+}
+
+/// Relais de secours (v141) : un envoi gardé par le relais du monde, copié ici.
+pub(crate) fn copy(
+    st: &mut State,
+    epoch: u64,
+    n: u64,
+    entries: Vec<super::zones::Entry>,
+    bags: Vec<proto::BagCopy>,
+    held: Vec<String>,
+) -> Option<u64> {
+    let rid = st.province_room?;
+    let room = st.rooms.get_mut(&rid)?;
+    let server = room.server.clone();
+    let pr = room.province.as_ref()?;
+    if !pr.standby || pr.epoch != epoch {
+        return None;
+    }
+    let (prov, size) = (pr.province, pr.size);
+    for (zone, seq, data) in entries {
+        if proto::province_of(zone_region(zone), size) == prov {
+            room.build.mirror_at(zone, &data, Some(seq), &[]);
+            if let Some(m) = minelib_net::game::decode::<minelib_net::game::BuildMsg>(&data) {
+                room.build.items.absorb(&m);
+            }
+        }
+    }
+    let pr = room.province.as_mut()?;
+    pr.have = pr.have.max(n);
+    pr.held = held.into_iter().collect();
+    let have = pr.have;
+    for (who, items, mined) in bags {
+        st.bags.put(
+            &server,
+            &who,
+            super::bags::Bag {
+                items: items.into_iter().collect(),
+                mined,
+            },
+        );
+    }
+    Some(have)
+}
+
+/// Relais de secours (v141) : il prend la place du relais de la province (époque
+/// `epoch`) ; renvoie jusqu'où il a la copie (le relais du monde lui enverra le reste).
+pub(crate) fn promote_here(st: &mut State, old: u64, epoch: u64) -> Option<u64> {
+    let rid = st.province_room?;
+    let room = st.rooms.get_mut(&rid)?;
+    let pr = room.province.as_mut()?;
+    if !pr.standby || pr.epoch != old || pr.stopped {
+        return None;
+    }
+    pr.standby = false;
+    pr.epoch = epoch;
+    pr.go = false;
+    pr.lease_until = 0;
+    pr.last_ask = 0;
+    pr.serving = false;
+    pr.ready_sent.clear();
+    pr.next_n = 1;
+    pr.asked.clear();
+    // (Les sacs qu'elle tenait lui sont prêtés de nouveau par le relais du monde, qui en a
+    // la copie la plus récente.)
+    pr.held.clear();
+    log::info!(
+        "relais de secours : il prend la place du relais de la province {:?} (époque {epoch})",
+        pr.province
+    );
+    Some(pr.have)
 }
 
 /// Relais de province : réponse du relais du monde à une demande de bail faite à `t`.
@@ -1521,6 +2082,11 @@ pub(crate) fn stop_here(st: &mut State, release: bool) -> Vec<Request> {
         return Vec::new();
     }
     pr.stopped = true;
+    // (Relais de secours : rien à rendre, il ne servait pas.)
+    if pr.standby {
+        log::info!("relais de secours de la province {:?} arrêté", pr.province);
+        return Vec::new();
+    }
     let (p, epoch) = (pr.province, pr.epoch);
     pr.outbox.extend(entries);
     // (Les sacs prêtés repartent tels qu'ils sont, avec le reste.)
@@ -1586,7 +2152,7 @@ pub(crate) fn upkeep_here(st: &mut State) {
     let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) else {
         return;
     };
-    if pr.stopped {
+    if pr.stopped || pr.standby {
         return;
     }
     let serving = pr.serving(now);
@@ -1616,7 +2182,10 @@ pub(crate) fn upkeep_here(st: &mut State) {
 pub(crate) fn admits(st: &mut State, cert: &minelib_net::sovereign::Cert) -> Option<bool> {
     let rid = st.province_room?;
     let pr = st.rooms.get_mut(&rid)?.province.as_mut()?;
-    let ok = cert.valid(&pr.root, rid) && cert.expires >= super::now_secs() && !pr.stopped;
+    let ok = cert.valid(&pr.root, rid)
+        && cert.expires >= super::now_secs()
+        && !pr.stopped
+        && !pr.standby;
     if ok {
         pr.certs
             .insert(cert.pseudo.to_ascii_lowercase(), cert.clone());

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 39;
+pub const PROTOCOL: u32 = 40;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -486,6 +486,27 @@ pub enum Request {
         node: [u8; 32],
         addr: String,
         key: [u8; 32],
+        /// (v141) Rang jusqu'où il a l'historique de la province (relais de secours qui
+        /// prend la place du relais tombé : ce qui manque lui part ; 0 sinon).
+        have: u64,
+    },
+    /// (v141) Relais de secours d'une province → son relais : il en tient la copie (jeton du
+    /// relais du monde, pseudo et clé du compte de son hôte).
+    ProvinceFollow {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        pseudo: String,
+        signer: [u8; 32],
+        token: [u8; 32],
+    },
+    /// (v141) Hôte d'un relais de secours de province → relais du monde : la copie est à
+    /// jour jusqu'au rang `have` ; il peut prendre la place du relais de la province.
+    ProvinceStandbyReady {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        have: u64,
     },
     /// Renouvellement du bail (toutes les `PROVINCE_RENEW_MS`) ; `t` : son heure à lui
     /// (ms), rendue dans la réponse (le bail court à partir de l'envoi).
@@ -610,6 +631,7 @@ impl Request {
                 | Request::ProvinceRelease { .. }
                 | Request::ProvinceBag { .. }
                 | Request::ProvinceBagBack { .. }
+                | Request::ProvinceStandbyReady { .. }
         )
     }
 }
@@ -958,6 +980,29 @@ pub enum Response {
         root: [u8; 32],
         info: StandbyInfo,
         settings: ProvinceSettings,
+        /// (v141) Relais de secours : la province est servie par ce relais (avec le jeton
+        /// qui lui prouve que le relais du monde l'a choisi) ; on en tient une copie, prête
+        /// à prendre sa place (`ProvincePromote`).
+        follow: Option<Box<ProvinceAt>>,
+    },
+    /// (v141) Relais de province → son relais de secours : un envoi `n` gardé par le relais
+    /// du monde (zone, rang, message), et les sacs de survie qu'elle tient.
+    ProvinceCopy {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        n: u64,
+        entries: Vec<([i32; 2], u64, Vec<u8>)>,
+        bags: Vec<BagCopy>,
+        held: Vec<String>,
+    },
+    /// (v141) Relais du monde → hôte du relais de secours d'une province (époque `old`) :
+    /// le relais de la province ne répond plus ; ce relais prend sa place (époque `epoch`).
+    ProvincePromote {
+        room: u64,
+        province: [i32; 2],
+        old: u64,
+        epoch: u64,
     },
     /// (v139) Réglages du serveur changés (OP, bannis, mode par défaut) : à chaque relais
     /// de province du monde.
@@ -1222,6 +1267,8 @@ impl Response {
                 | Response::Shards { .. }
                 | Response::ShardTicket { .. }
                 | Response::ProvinceTask { .. }
+                | Response::ProvinceCopy { .. }
+                | Response::ProvincePromote { .. }
                 | Response::ProvinceSeed { .. }
                 | Response::ProvinceLeased { .. }
                 | Response::ProvinceArchived { .. }
@@ -1403,6 +1450,29 @@ pub fn province_token(
     m.update(&region[0].to_le_bytes());
     m.update(&region[1].to_le_bytes());
     m.update(&slot.to_le_bytes());
+    m.update(pseudo.to_ascii_lowercase().as_bytes());
+    m.update(signer);
+    m.update(&epoch.to_le_bytes());
+    m.finalize().into_bytes().into()
+}
+
+/// (v141) Jeton du relais du monde qui fait d'un joueur (pseudo, clé de son compte) le
+/// relais de secours de la province `province` à l'époque `epoch` (vérifié par le relais
+/// de la province, qui a le secret du monde).
+pub fn follow_token(
+    secret: &[u8; 32],
+    room: u64,
+    province: [i32; 2],
+    pseudo: &str,
+    signer: &[u8; 32],
+    epoch: u64,
+) -> [u8; 32] {
+    use hmac::Mac;
+    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("clé");
+    m.update(b"minelib/province/secours");
+    m.update(&room.to_le_bytes());
+    m.update(&province[0].to_le_bytes());
+    m.update(&province[1].to_le_bytes());
     m.update(pseudo.to_ascii_lowercase().as_bytes());
     m.update(signer);
     m.update(&epoch.to_le_bytes());

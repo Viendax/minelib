@@ -79,6 +79,16 @@ pub enum Cmd {
         signer: [u8; 32],
         token: [u8; 32],
     },
+    /// Relais de secours d'une province (v141) : suit le relais de la province avec le
+    /// jeton du relais du monde (voir `proto::follow_token`).
+    ProvinceFollow {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        pseudo: String,
+        signer: [u8; 32],
+        token: [u8; 32],
+    },
     TotpBegin,
     TotpConfirm(u32),
     TotpDisable(u32),
@@ -802,6 +812,8 @@ impl Worker {
                 province,
             },
             r @ (Response::ProvinceTask { .. }
+            | Response::ProvinceCopy { .. }
+            | Response::ProvincePromote { .. }
             | Response::ProvinceSeed { .. }
             | Response::ProvinceLeased { .. }
             | Response::ProvinceArchived { .. }
@@ -1153,6 +1165,34 @@ impl Worker {
                             fingerprint: String::new(),
                             totp: false,
                         });
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
+            }
+            Cmd::ProvinceFollow {
+                room,
+                province,
+                epoch,
+                pseudo,
+                signer,
+                token,
+            } => {
+                self.chan = None;
+                self.connect()?;
+                match self.request(&Request::ProvinceFollow {
+                    room,
+                    province,
+                    epoch,
+                    pseudo,
+                    signer,
+                    token,
+                })? {
+                    Response::Welcome { pseudo, .. } => {
+                        self.pseudo = pseudo;
+                        if let Some(c) = &self.chan {
+                            self.emit(Event::Link(c.pusher()));
+                        }
                         Ok(())
                     }
                     r => self.unexpected(r),

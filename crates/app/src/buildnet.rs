@@ -2072,12 +2072,33 @@ mod tests {
                     root,
                     info,
                     settings,
+                    follow,
                 }) => {
                     if let Some(l) = &self.link {
                         if self.province.is_none() {
-                            self.province = crate::province_host::ProvinceHost::start(
-                                room, province, size, epoch, secret, root, info, settings, l, false,
-                            );
+                            self.province = match follow {
+                                Some(at) => crate::province_host::ProvinceHost::standby(
+                                    room,
+                                    province,
+                                    size,
+                                    epoch,
+                                    secret,
+                                    root,
+                                    info,
+                                    settings,
+                                    *at,
+                                    &self.name,
+                                    self.identity
+                                        .as_ref()
+                                        .map_or([0; 32], |k| k.verifying_key().to_bytes()),
+                                    None,
+                                    false,
+                                ),
+                                None => crate::province_host::ProvinceHost::start(
+                                    room, province, size, epoch, secret, root, info, settings, l,
+                                    false,
+                                ),
+                            };
                         }
                     }
                 }
@@ -3359,7 +3380,7 @@ mod tests {
         u64,
     ) {
         let dir = std::env::temp_dir().join(format!("minelib-provinces-{}", rand_u32()));
-        let names = ["Garant", "Garant2", "Garant3", "Garant4"];
+        let names = ["Garant", "Garant2", "Garant3", "Garant4", "Garant5"];
         for n in names {
             minelib_relay::test_seed_games(&dir, n, 5);
         }
@@ -3460,6 +3481,7 @@ mod tests {
         let mut ordered = 0u64;
         let mut fault_at: Option<(Instant, [i32; 2])> = None;
         let mut taken_back: Option<Duration> = None;
+        let mut served_again: Option<Duration> = None;
         let mut bulk_sent = false;
         // 9 secondes de jeu, la panne au milieu (une fois la province servie).
         for step in 0..450 {
@@ -3469,7 +3491,7 @@ mod tests {
                 let g = hosts
                     .iter_mut()
                     .map(|(_, g)| g)
-                    .find(|g| g.province.is_some())
+                    .find(|g| g.province.as_ref().is_some_and(|p| !p.standby))
                     .expect("hôte de la province");
                 let which = g.province.as_ref().expect("province").province;
                 match fault {
@@ -3497,6 +3519,12 @@ mod tests {
             if let (Some((t, which)), None) = (fault_at, taken_back) {
                 if !h.delegated_provinces().contains(&which) {
                     taken_back = Some(t.elapsed());
+                }
+            }
+            // (v141) Son relais de secours a pris sa place.
+            if let (Some((t, which)), Some(_), None) = (fault_at, taken_back, served_again) {
+                if h.delegated_provinces().contains(&which) {
+                    served_again = Some(t.elapsed());
                 }
             }
             // WorldEdit du propriétaire (OP, à l'ouest) dans la province de l'est (v139 : ses
@@ -3571,8 +3599,10 @@ mod tests {
         eprintln!(
             "provinces : {fault:?}, déléguées au plus {delegated_max}, relais de région \
              rattachés {attached_max}, mises en ordre {ordered}, envois archivés {}, reprise \
-             après {taken_back:?}",
-            h.province_archives()
+             après {taken_back:?}, servie de nouveau (relais de secours) après \
+             {served_again:?}, promotions {}",
+            h.province_archives(),
+            h.province_promotions()
         );
         assert!(delegated_max >= 1, "la province peuplée a reçu son relais");
         assert!(bulk_sent, "WorldEdit dans la province");
@@ -3594,10 +3624,20 @@ mod tests {
             edited.len()
         );
         if fault != ProvinceFault::None {
-            let t = taken_back.expect("la province revient au relais du monde");
+            let t = taken_back.expect("la province quitte son relais");
             assert!(
                 t < Duration::from_secs(3),
-                "reprise par le relais du monde en moins de 3 s : {t:?}"
+                "relais tombé remplacé en moins de 3 s : {t:?}"
+            );
+            // (v141) Par son relais de secours, pas par le relais du monde.
+            assert!(
+                h.province_promotions() >= 1,
+                "son relais de secours a pris sa place"
+            );
+            let t = served_again.expect("la province est de nouveau servie par un relais");
+            assert!(
+                t < Duration::from_secs(3),
+                "servie de nouveau par son relais de secours en moins de 3 s : {t:?}"
             );
         }
         for b in &bots {
@@ -3767,7 +3807,7 @@ mod tests {
                 let g = hosts
                     .iter_mut()
                     .map(|(_, g)| g)
-                    .find(|g| g.province.is_some())
+                    .find(|g| g.province.as_ref().is_some_and(|p| !p.standby))
                     .expect("hôte de la province");
                 let which = g.province.as_ref().expect("province").province;
                 match fault {

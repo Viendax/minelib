@@ -1032,21 +1032,42 @@ fn run(
                     root,
                     ref info,
                     ref settings,
+                    ref follow,
                 }) => {
                     if let Some(l) = &link {
                         if province.is_none() {
-                            province = crate::province_host::ProvinceHost::start(
-                                room,
-                                p,
-                                size,
-                                epoch,
-                                secret,
-                                root,
-                                info.clone(),
-                                settings.clone(),
-                                l,
-                                login.node_dir.is_some(),
-                            );
+                            province = match follow {
+                                // (v141) Relais de secours de la province.
+                                Some(at) => crate::province_host::ProvinceHost::standby(
+                                    room,
+                                    p,
+                                    size,
+                                    epoch,
+                                    secret,
+                                    root,
+                                    info.clone(),
+                                    settings.clone(),
+                                    (**at).clone(),
+                                    &login.pseudo,
+                                    identity
+                                        .as_ref()
+                                        .map_or([0; 32], |k| k.verifying_key().to_bytes()),
+                                    login.node_dir.clone(),
+                                    login.node_dir.is_some(),
+                                ),
+                                None => crate::province_host::ProvinceHost::start(
+                                    room,
+                                    p,
+                                    size,
+                                    epoch,
+                                    secret,
+                                    root,
+                                    info.clone(),
+                                    settings.clone(),
+                                    l,
+                                    login.node_dir.is_some(),
+                                ),
+                            };
                         }
                     }
                 }
