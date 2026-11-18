@@ -1,6 +1,5 @@
 //! Écrans vidéo dans le monde : des quads fixés sur un mur (ou dressés sur un sol) là où
-//! le joueur les a posés, texturés par les images que le jeu leur donne (`set_frame`) ;
-//! tous montrent la même image.
+//! le joueur les a posés, chacun texturé par ses propres images (`set_frame`).
 //!
 //! Le contenu (mire de test aujourd'hui, navigateur CEF qui lit YouTube demain) vit côté
 //! jeu ; ici on ne fait que l'afficher. Dessiné dans la passe du monde, après les entités,
@@ -41,14 +40,12 @@ pub struct Screen {
     vbuf: wgpu::Buffer,
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// Texture de l'image et son groupe de liaison (recréés si la taille change).
-    texture: Option<(wgpu::Texture, wgpu::BindGroup)>,
-    /// Version de la dernière image envoyée.
-    frame_version: Option<u64>,
-    /// Écrans posés.
-    anchors: Vec<ScreenAnchor>,
+    /// Image de chaque écran (par numéro) : texture, groupe de liaison et version.
+    textures: std::collections::HashMap<u32, (wgpu::Texture, wgpu::BindGroup, u64)>,
+    /// Écrans posés : numéro et emplacement.
+    anchors: Vec<(u32, ScreenAnchor)>,
     /// Écrans dont les sommets ont été envoyés (`None` : rien d'envoyé).
-    uploaded: Option<Vec<ScreenAnchor>>,
+    uploaded: Option<Vec<(u32, ScreenAnchor)>>,
 }
 
 impl Screen {
@@ -164,37 +161,42 @@ impl Screen {
             vbuf,
             bgl,
             sampler,
-            texture: None,
-            frame_version: None,
+            textures: std::collections::HashMap::new(),
             anchors: Vec::new(),
             uploaded: None,
         }
     }
 
-    /// Écrans posés (les suivants au-delà de `MAX_SCREENS` sont ignorés).
-    pub fn set_anchors(&mut self, anchors: &[ScreenAnchor]) {
+    /// Écrans posés : numéro et emplacement (les suivants au-delà de `MAX_SCREENS` sont
+    /// ignorés). L'image d'un écran retiré est oubliée.
+    pub fn set_anchors(&mut self, anchors: &[(u32, ScreenAnchor)]) {
         if self.anchors != anchors {
             self.anchors.clear();
             self.anchors
                 .extend_from_slice(&anchors[..anchors.len().min(MAX_SCREENS)]);
+            let ids: std::collections::HashSet<u32> = self.anchors.iter().map(|a| a.0).collect();
+            self.textures.retain(|id, _| ids.contains(id));
         }
     }
 
-    /// Nouvelle image (BGRA 8 bits, `width * height * 4` octets), envoyée seulement si sa
-    /// `version` a changé.
+    /// Nouvelle image de l'écran `id` (BGRA 8 bits, `width * height * 4` octets), envoyée
+    /// seulement si sa `version` a changé.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_frame(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        id: u32,
         version: u64,
         width: u32,
         height: u32,
         pixels: &[u8],
     ) {
-        if self.frame_version == Some(version)
+        if self.textures.get(&id).is_some_and(|t| t.2 == version)
             || width == 0
             || height == 0
             || pixels.len() < (width * height * 4) as usize
+            || !self.anchors.iter().any(|a| a.0 == id)
         {
             return;
         }
@@ -203,7 +205,7 @@ impl Screen {
             height,
             depth_or_array_layers: 1,
         };
-        if self.texture.as_ref().is_none_or(|(t, _)| t.size() != size) {
+        if self.textures.get(&id).is_none_or(|t| t.0.size() != size) {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("écran (vidéo)"),
                 size,
@@ -229,12 +231,14 @@ impl Screen {
                     },
                 ],
             });
-            self.texture = Some((texture, group));
+            self.textures.insert(id, (texture, group, version));
         }
-        let (texture, _) = self.texture.as_ref().expect("texture créée juste avant");
+        let Some(entry) = self.textures.get_mut(&id) else {
+            return;
+        };
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture,
+                texture: &entry.0,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -247,7 +251,7 @@ impl Screen {
             },
             size,
         );
-        self.frame_version = Some(version);
+        entry.2 = version;
     }
 
     /// Image suivante : renvoie les sommets si des écrans ont été posés ou retirés.
@@ -256,7 +260,7 @@ impl Screen {
             return;
         }
         let mut verts = Vec::with_capacity(self.anchors.len() * 6);
-        for a in &self.anchors {
+        for (_, a) in &self.anchors {
             let c = Vec3::from(a.center);
             let r = Vec3::from(a.right) * (a.size[0] * 0.5);
             let u = Vec3::from(a.up) * (a.size[1] * 0.5);
@@ -284,18 +288,20 @@ impl Screen {
         self.uploaded = Some(self.anchors.clone());
     }
 
-    /// Dessine les écrans dans la passe du monde (le group 0 est déjà lié).
+    /// Dessine les écrans dans la passe du monde (le group 0 est déjà lié), chacun avec son
+    /// image (un écran sans image encore reçue n'est pas dessiné).
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, taa: bool) {
-        let Some((_, group)) = &self.texture else {
-            return;
-        };
-        let n = self.anchors.len() as u32;
-        if n == 0 || self.uploaded.as_deref() != Some(&self.anchors[..]) {
+        if self.anchors.is_empty() || self.uploaded.as_deref() != Some(&self.anchors[..]) {
             return;
         }
         pass.set_pipeline(if taa { &self.taa } else { &self.plain });
-        pass.set_bind_group(1, group, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
-        pass.draw(0..6 * n, 0..1);
+        for (k, (id, _)) in self.anchors.iter().enumerate() {
+            if let Some((_, group, _)) = self.textures.get(id) {
+                pass.set_bind_group(1, group, &[]);
+                let first = 6 * k as u32;
+                pass.draw(first..first + 6, 0..1);
+            }
+        }
     }
 }

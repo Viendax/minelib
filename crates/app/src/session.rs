@@ -257,12 +257,16 @@ pub struct Session {
     /// image depuis le dossier du monde.
     screens: Vec<crate::screen::Placed>,
     screens_loaded: bool,
-    /// Ce qu'affichent les écrans (tactiles).
-    screen_content: crate::screen::ScreenContent,
+    /// Ce qu'affichent les écrans (une page chacun).
+    displays: crate::screen::Displays,
+    /// Dernier écran regardé ou touché (cible de `/yt`).
+    screen_last: Option<u32>,
+    /// Touche répétée dans le champ de texte d'un écran (effacer, flèches…).
+    screen_repeat: Option<(KeyCode, f32)>,
     /// Écran visé par le réticule : indice, distance et point visé dessus (0..1).
     screen_aim: Option<(usize, f32, [f32; 2])>,
-    /// Appui en cours sur un écran (touche « utiliser » pas encore relâchée).
-    screen_touch: bool,
+    /// Écran touché dont la touche « utiliser » n'est pas encore relâchée.
+    screen_touch: Option<u32>,
     /// Un écran vient d'être cassé : rien d'autre n'est cassé avant que la touche
     /// « casser » soit relâchée.
     screen_broke: bool,
@@ -466,9 +470,11 @@ impl Session {
             perspective: 0,
             screens: Vec::new(),
             screens_loaded: false,
-            screen_content: crate::screen::ScreenContent::new(),
+            displays: crate::screen::Displays::new(),
+            screen_last: None,
+            screen_repeat: None,
             screen_aim: None,
-            screen_touch: false,
+            screen_touch: None,
             screen_broke: false,
             walk_phase: 0.0,
             walks: HashMap::new(),
@@ -609,9 +615,11 @@ impl Session {
         }
         if active {
             // Tchat : saisie, puis ouverture par `t` ou `/` (jamais par-dessus l'inventaire).
+            // Clavier dans la page d'un écran (champ de texte visé) : ni tchat ni commandes.
+            let screen_keys = self.keyboard_on_screen();
             let was_open = self.chat.open;
             let mut sent = self.chat.update(input, dt);
-            if !was_open && !self.inventory.open {
+            if !was_open && !self.inventory.open && !screen_keys {
                 let by_chat = if self.game.mode == GameMode::Fps {
                     self.keys.pressed(input, Action::FpsChat)
                         || self.keys.pressed(input, Action::FpsTeamChat)
@@ -623,7 +631,8 @@ impl Session {
             }
             // Image où le tchat était ouvert, s'est ouvert ou a été envoyé : les touches
             // tapées sont du texte, pas des commandes de jeu.
-            let typing = was_open || self.chat.open || sent.is_some();
+            let chat_typing = was_open || self.chat.open || sent.is_some();
+            let typing = chat_typing || screen_keys;
             if let Some(text) = sent {
                 self.submit(&text);
             }
@@ -655,7 +664,7 @@ impl Session {
                 self.handle_keys(input);
                 self.handle_hotbar(input);
             }
-            self.update_screens(input, dt, typing);
+            self.update_screens(input, dt, chat_typing);
             self.inventory.update(dt);
             self.tick_torches(dt);
             self.update_sun(dt);
@@ -1301,9 +1310,14 @@ impl Session {
             );
             return;
         }
+        // L'écran regardé en dernier, sinon le premier.
+        let id = self
+            .screen_last
+            .filter(|l| self.screens.iter().any(|s| s.id() == *l))
+            .unwrap_or_else(|| self.screens[0].id());
         let url = crate::screen::youtube_url(query);
-        if self.screen_content.open(&url) {
-            self.chat.say(format!("Écrans : {url}"), chat::YELLOW);
+        if self.displays.open(id, &url) {
+            self.chat.say(format!("Écran : {url}"), chat::YELLOW);
         } else {
             self.chat.say(
                 "Navigateur absent : il faut le dossier « cef » (minelib-browser) dans .minelib.",
@@ -1312,11 +1326,12 @@ impl Session {
         }
     }
 
-    /// Écrans vidéo : chargement (première image) et point visé par le réticule. Sur un
-    /// écran, « utiliser » le touche (tactile), « casser » le casse (l'objet revient, hors
-    /// créatif) et « copier le bloc » met l'objet en main ; accroupi, « utiliser » l'ignore
-    /// et pose le bloc tenu devant (voir `handle_blocks`). En mode FPS, la touche
-    /// « utiliser » le touche ; on ne le casse pas.
+    /// Écrans vidéo : chargement (première image), une page par écran et point visé par le
+    /// réticule. Sur un écran, « utiliser » le touche (tactile), « casser » le casse
+    /// (l'objet revient, hors créatif) et « copier le bloc » met l'objet en main ; accroupi,
+    /// « utiliser » l'ignore et pose le bloc tenu devant (voir `handle_blocks`). En mode
+    /// FPS, la touche « utiliser » le touche ; on ne le casse pas. Un clic dans un champ de
+    /// texte de la page y envoie le clavier tant que le réticule reste sur l'écran.
     fn update_screens(&mut self, input: &Input, dt: f32, typing: bool) {
         if !self.screens_loaded {
             self.screens = crate::screen::load(&self.dir);
@@ -1326,12 +1341,9 @@ impl Session {
         if self.player.solids.len() != self.screens.len() {
             self.screens_changed(false);
         }
-        // Navigateur (YouTube) : lancé avec le premier écran, arrêté avec le dernier.
-        if self.screens.is_empty() {
-            self.screen_content.stop_browser();
-        } else {
-            self.screen_content.start_browser();
-        }
+        // Une page par écran : onglets ouverts et fermés avec les écrans.
+        let ids: Vec<u32> = self.screens.iter().map(|s| s.id()).collect();
+        self.displays.sync(&ids);
         let fps = self.game.mode == GameMode::Fps;
         let use_key = if fps { Action::FpsUse } else { Action::Use };
         self.screen_aim = None;
@@ -1343,6 +1355,11 @@ impl Session {
         {
             self.screen_aim = self.aimed_screen();
         }
+        let aimed = self.screen_aim.map(|(i, _, uv)| (ids[i], uv));
+        let editing = aimed.is_some_and(|a| self.displays.editing(a.0));
+        if let Some((id, _)) = aimed {
+            self.screen_last = Some(id);
+        }
         if let Some((i, t, uv)) = self.screen_aim {
             let near = !fps && t <= REACH;
             if near && self.keys.pressed(input, Action::Attack) {
@@ -1352,28 +1369,100 @@ impl Session {
                 self.give_picked(Item::Screen);
             } else if self.keys.pressed(input, use_key)
                 && (fps || !self.keys.held(input, Action::Sneak))
+                // En mode FPS, « utiliser » est une lettre : elle va dans le champ de texte.
+                && !(fps && editing)
             {
-                self.screen_content.press(uv);
-                self.screen_touch = true;
+                self.displays.press(ids[i], uv);
+                self.screen_touch = Some(ids[i]);
             }
         }
         // Molette sur un écran : fait défiler la page (pas la barre d'objets).
-        if let Some((_, _, uv)) = self.screen_aim {
+        if let Some((id, uv)) = aimed {
             if input.scroll.abs() >= 1.0 {
-                self.screen_content.wheel(uv, (input.scroll * 120.0) as i32);
+                self.displays.wheel(id, uv, (input.scroll * 120.0) as i32);
             }
         }
-        let uv = self.screen_aim.map(|a| a.2);
-        if self.screen_touch && !self.keys.held(input, use_key) {
-            self.screen_content.release(uv);
-            self.screen_touch = false;
+        // Clavier dans le champ de texte de l'écran visé.
+        if let Some((id, _)) = aimed.filter(|_| editing) {
+            self.screen_keyboard(input, dt, id);
+        }
+        if let Some(id) = self.screen_touch {
+            if !self.keys.held(input, use_key) {
+                let uv = aimed.filter(|a| a.0 == id).map(|a| a.1);
+                self.displays.release(id, uv);
+                self.screen_touch = None;
+            }
         }
         if self.screen_broke && !self.keys.held(input, Action::Attack) {
             self.screen_broke = false;
         }
-        self.screen_content.hover(uv);
-        if !self.screens.is_empty() {
-            self.screen_content.update(dt);
+        self.displays.hover(aimed);
+        self.displays.update(dt);
+    }
+
+    /// Clavier dans le champ de texte de l'écran `id` : texte tapé et touches spéciales
+    /// (effacer, flèches… répétées si elles restent tenues ; Ctrl+A/C/V/X/Y/Z).
+    fn screen_keyboard(&mut self, input: &Input, dt: f32, id: u32) {
+        let text: String = input.text.chars().filter(|c| !c.is_control()).collect();
+        if !text.is_empty() {
+            self.displays.text(id, &text);
+        }
+        for (k, name) in [
+            (KeyCode::Enter, "enter"),
+            (KeyCode::NumpadEnter, "enter"),
+            (KeyCode::Tab, "tab"),
+            (KeyCode::Home, "home"),
+            (KeyCode::End, "end"),
+        ] {
+            if input.pressed(k) {
+                self.displays.key(id, name);
+            }
+        }
+        for (k, name) in [
+            (KeyCode::Backspace, "back"),
+            (KeyCode::Delete, "delete"),
+            (KeyCode::ArrowLeft, "left"),
+            (KeyCode::ArrowRight, "right"),
+            (KeyCode::ArrowUp, "up"),
+            (KeyCode::ArrowDown, "down"),
+        ] {
+            if crate::screen::key_repeat(&mut self.screen_repeat, input, k, dt) {
+                self.displays.key(id, name);
+            }
+        }
+        // Ctrl + lettre (Alt Gr, qui tape « @ », « € »…, n'est pas un raccourci).
+        let ctrl = (input.held(KeyCode::ControlLeft) || input.held(KeyCode::ControlRight))
+            && !input.held(KeyCode::AltRight);
+        if ctrl {
+            for k in input.pressed_keys() {
+                let Some(label) = input.key_labels.get(&k) else {
+                    continue;
+                };
+                let l = label.to_lowercase();
+                if matches!(l.as_str(), "a" | "c" | "v" | "x" | "y" | "z") {
+                    self.displays.key(id, &format!("ctrl+{l}"));
+                }
+            }
+        }
+    }
+
+    /// Le clavier va-t-il dans la page d'un écran (un champ de texte de l'écran visé a le
+    /// focus) ? Le jeu ne lit alors plus ses touches.
+    pub fn keyboard_on_screen(&self) -> bool {
+        self.screen_aim
+            .and_then(|a| self.screens.get(a.0))
+            .is_some_and(|s| self.displays.editing(s.id()))
+    }
+
+    /// Échap pendant qu'on écrit dans la page d'un écran : le champ de texte perd le focus
+    /// et le clavier revient au jeu.
+    pub fn screen_escape(&mut self) {
+        let id = self
+            .screen_aim
+            .and_then(|a| self.screens.get(a.0))
+            .map(|s| s.id());
+        if let Some(id) = id {
+            self.displays.blur(id);
         }
     }
 
@@ -1638,7 +1727,7 @@ impl Session {
         // ses touches sont pour lui (voir `update_screens`), rien n'est cassé ni posé
         // derrière. Accroupi, « utiliser » l'ignore : le bloc tenu est posé devant, comme
         // contre une porte ou un coffre.
-        if self.screen_touch || self.screen_broke {
+        if self.screen_touch.is_some() || self.screen_broke {
             return;
         }
         if self.screen_aim.is_some_and(|a| a.1 <= REACH) {
@@ -5239,17 +5328,13 @@ impl Session {
             let (v, gen) = f.current();
             statics.push((u64::MAX, v, gen));
         }
-        let screens: Vec<minelib_render::ScreenAnchor> =
-            self.screens.iter().map(|s| s.anchor()).collect();
+        let screens: Vec<(u32, minelib_render::ScreenAnchor)> =
+            self.screens.iter().map(|s| (s.id(), s.anchor())).collect();
         renderer.set_screens(&screens);
-        if !screens.is_empty() {
-            let (w, h) = self.screen_content.size();
-            renderer.set_screen_frame(
-                self.screen_content.version(),
-                w,
-                h,
-                self.screen_content.pixels(),
-            );
+        for (id, _) in &screens {
+            if let Some((version, w, h, pixels)) = self.displays.frame(*id) {
+                renderer.set_screen_frame(*id, version, w, h, pixels);
+            }
         }
         let params = FrameParams {
             ray_boxes: &ray_boxes,

@@ -3138,6 +3138,8 @@ impl GameLoop for Game {
                     Some(s) if s.chat.open => s.chat.close(),
                     Some(s) if s.inventory.open => s.inventory.close(),
                     Some(s) if s.fps.buy_open => s.fps.buy_open = false,
+                    // On écrit dans la page d'un écran : Échap rend le clavier au jeu.
+                    Some(s) if s.keyboard_on_screen() => s.screen_escape(),
                     _ => self.screen = Screen::Paused,
                 },
                 Screen::Paused => self.screen = Screen::Playing,

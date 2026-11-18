@@ -2590,14 +2590,29 @@ mod tests {
 }
 
 impl Renderer {
-    /// Écrans vidéo posés dans le monde (aucun : liste vide).
-    pub fn set_screens(&mut self, anchors: &[ScreenAnchor]) {
+    /// Écrans vidéo posés dans le monde : numéro et emplacement (aucun : liste vide).
+    pub fn set_screens(&mut self, anchors: &[(u32, ScreenAnchor)]) {
         self.screen.set_anchors(anchors);
     }
 
-    /// Image de l'écran (BGRA 8 bits), envoyée à la carte seulement si `version` change.
-    pub fn set_screen_frame(&mut self, version: u64, width: u32, height: u32, pixels: &[u8]) {
-        self.screen
-            .set_frame(&self.device, &self.queue, version, width, height, pixels);
+    /// Image de l'écran `id` (BGRA 8 bits), envoyée à la carte seulement si `version`
+    /// change.
+    pub fn set_screen_frame(
+        &mut self,
+        id: u32,
+        version: u64,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) {
+        self.screen.set_frame(
+            &self.device,
+            &self.queue,
+            id,
+            version,
+            width,
+            height,
+            pixels,
+        );
     }
 }
