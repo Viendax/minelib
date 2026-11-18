@@ -46,7 +46,7 @@ const SPRINT: f32 = 6.6;
 /// Accroupi : marche lente, on ne tombe pas des bords.
 const SNEAK: f32 = 1.3;
 /// Les yeux descendent de 30 cm accroupi.
-const CROUCH_DROP: f32 = 0.3;
+pub const CROUCH_DROP: f32 = 0.3;
 /// Mode FPS : marche (touche « Marcher ») à 62,5 % de la marche du mode Build (réduite de
 /// 50 % puis augmentée de 25 %), course à 75 % du sprint.
 pub const FPS_WALK: f32 = WALK * 0.5 * 1.25;

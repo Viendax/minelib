@@ -667,6 +667,30 @@ fn up(c: Cell, d: i32) -> Cell {
     [c[0], c[1] + d, c[2]]
 }
 
+/// Monde enregistré de la carte `dir` (pour un relevé) : tous ses chunks enregistrés, et
+/// ceux autour de ses zones (monde généré).
+pub fn load_map_world(dir: &std::path::Path, map: &FpsMap) -> Option<World> {
+    let (_, mut world) = crate::save::load_world(dir).ok()?;
+    let mut need: std::collections::HashSet<minelib_world::ChunkPos> =
+        world.bases().map(|b| b.0).collect();
+    for z in [&map.ct, &map.t]
+        .into_iter()
+        .chain(map.sites.iter())
+        .flatten()
+    {
+        let c = |v: i32| v.div_euclid(16);
+        for x in c(z.min[0]) - 6..=c(z.max[0]) + 6 {
+            for cz in c(z.min[2]) - 6..=c(z.max[2]) + 6 {
+                need.insert(minelib_world::ChunkPos { x, z: cz });
+            }
+        }
+    }
+    for c in need {
+        world.ensure_chunk(c);
+    }
+    Some(world)
+}
+
 /// Fait (ou refait) le relevé de la carte `dir` en tâche de fond, s'il manque ou n'est
 /// plus à jour, et l'enregistre avec elle. Un seul à la fois par carte.
 pub fn survey_in_background(dir: &std::path::Path) {
@@ -685,25 +709,7 @@ pub fn survey_in_background(dir: &std::path::Path) {
             let t = std::time::Instant::now();
             let stamp = survey_stamp(&dir);
             let map = crate::fpsmap::load(&dir);
-            if let Ok((_, mut world)) = crate::save::load_world(&dir) {
-                // Tous les chunks enregistrés, et ceux autour des zones (monde généré).
-                let mut need: HashSet<minelib_world::ChunkPos> =
-                    world.bases().map(|b| b.0).collect();
-                for z in [&map.ct, &map.t]
-                    .into_iter()
-                    .chain(map.sites.iter())
-                    .flatten()
-                {
-                    let c = |v: i32| v.div_euclid(16);
-                    for x in c(z.min[0]) - 6..=c(z.max[0]) + 6 {
-                        for cz in c(z.min[2]) - 6..=c(z.max[2]) + 6 {
-                            need.insert(minelib_world::ChunkPos { x, z: cz });
-                        }
-                    }
-                }
-                for c in need {
-                    world.ensure_chunk(c);
-                }
+            if let Some(world) = load_map_world(&dir, &map) {
                 let mut s = Survey::of(&world, &map);
                 s.stamp = stamp;
                 let cells: usize = s.floors.iter().map(Vec::len).sum();

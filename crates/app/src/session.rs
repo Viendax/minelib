@@ -313,10 +313,17 @@ pub struct Session {
     /// Marche des autres joueurs (par pseudo) : comme la sienne en F5, calculée sur leur
     /// déplacement affiché (fluide, quel que soit le rythme des messages).
     walks: HashMap<String, Walk>,
+    /// (v172) Skins des autres joueurs envoyés à la carte (ils sont dessinés par elle) ;
+    /// tenus à jour pendant le dessin de l'image.
+    skin_layers: std::cell::RefCell<crate::player_model::SkinLayers>,
     /// (v165, essai temporaire) Joueurs simulés autour de soi en solo (voir `crowd`), et
     /// essai voulu (`/foule on|off`).
     crowd: Option<crate::crowd::Crowd>,
     crowd_on: bool,
+    /// (v172) Pseudo du joueur (compte connecté ; vide sinon), et partie contre des bots
+    /// voulue en mode FPS dans un monde solo (`/bots off` l'arrête).
+    pub pseudo: String,
+    bots_auto: bool,
     walk_amp: f32,
     /// Portes et trappes ouvertes pendant la partie : bloc fermé d'origine (pour refermer).
     opened: HashMap<[i32; 3], BlockId>,
@@ -543,8 +550,11 @@ impl Session {
             screen_broke: false,
             walk_phase: 0.0,
             walks: HashMap::new(),
+            skin_layers: Default::default(),
             crowd: None,
             crowd_on: true,
+            pseudo: String::new(),
+            bots_auto: true,
             walk_amp: 0.0,
             opened: HashMap::new(),
             vox_origin: None,
@@ -675,6 +685,14 @@ impl Session {
             self.keys.mouse_muted = false;
         }
         crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
+        // (v172) Mode FPS dans un monde solo : partie contre des bots.
+        if self.bots_auto
+            && self.net.is_none()
+            && self.build.is_none()
+            && self.game.mode == GameMode::Fps
+        {
+            self.start_bots();
+        }
         // Minimap : grille autour du joueur, sites de la carte.
         if self.net.is_some() {
             if !self.radar_map {
@@ -1770,7 +1788,7 @@ impl Session {
     /// (elles ne repartent pas toutes seules à la reprise). En ligne, le monde continue :
     /// rien ne change (une pause partirait chez les autres, voir `crate::watch`).
     pub fn pause_videos(&mut self) {
-        if self.build.is_none() && self.net.is_none() {
+        if self.build.is_none() && !self.online_match() {
             self.displays.pause_all();
         }
     }
@@ -2705,7 +2723,8 @@ impl Session {
     /// sont pas envoyées aux autres joueurs : un coin sombre éclairé pour un seul). En FPS
     /// solo, si.
     fn lights_allowed(&self) -> bool {
-        !(self.game.mode == GameMode::Fps && self.net.is_some())
+        // (v172) Contre les bots (partie solo), aussi.
+        !(self.game.mode == GameMode::Fps && self.online_match())
     }
 
     fn open_light_editor(&mut self) {
@@ -2830,13 +2849,7 @@ impl Session {
 
     /// Éclairage approximatif de la main : ciel (abrité ou non), jour/nuit, torche tenue.
     fn light_at_player(&self, held: Option<Item>) -> [f32; 3] {
-        let e = self.player.eye();
-        let covered = self
-            .world
-            .top_solid(e.x.floor() as i32, e.z.floor() as i32)
-            .is_some_and(|t| t as f32 > e.y);
-        let sky = if covered { 0.35 } else { 1.0 } * (0.18 + 0.82 * self.daylight);
-        let mut l = [sky; 3];
+        let mut l = sky_light(&self.world, self.player.eye(), self.daylight);
         if let Some(Item::Torch(_)) = held {
             for (c, w) in l.iter_mut().zip([1.0, 0.78, 0.5]) {
                 *c = c.max(w);
@@ -3013,6 +3026,13 @@ impl Session {
 
     /// Change le mode de jeu du joueur.
     pub fn set_mode(&mut self, mode: GameMode) {
+        // (v172) Mode FPS en solo : partie contre des bots (lancée à l'image suivante) ;
+        // on la quitte en changeant de mode.
+        if mode == GameMode::Fps {
+            self.bots_auto = true;
+        } else {
+            self.stop_bots();
+        }
         self.game.mode = mode;
         if mode.mortal() && !self.game.can_fly {
             self.player.flying = false;
@@ -3033,6 +3053,53 @@ impl Session {
         self.fall_from = None;
         self.chat
             .say(format!("Mode de jeu : {}", mode.label()), chat::YELLOW);
+    }
+
+    /// Partie FPS en ligne (pas la partie solo contre des bots).
+    pub fn online_match(&self) -> bool {
+        self.net.as_ref().is_some_and(|n| !n.is_solo())
+    }
+
+    /// (v172) Partie contre des bots (mode FPS dans un monde solo) : la carte se remplit de
+    /// bots, la partie démarre, chacun est placé à son départ.
+    fn start_bots(&mut self) {
+        let map = crate::fpsmap::load(&self.dir);
+        let pseudo = if self.pseudo.is_empty() {
+            "Joueur".to_string()
+        } else {
+            self.pseudo.clone()
+        };
+        let spawn = self.spawn_pos();
+        // Les bots relèvent la carte enregistrée : elle doit être à jour.
+        if let Err(e) = self.save() {
+            log::warn!("bots : sauvegarde avant le relevé de la carte impossible : {e:#}");
+        }
+        let nav = crate::bots::nav_in_background(self.dir.clone(), map.clone(), vec![spawn]);
+        self.net = Some(crate::netgame::NetGame::solo(pseudo, map, spawn, Some(nav)));
+        self.net_dead = false;
+        self.player.flying = false;
+        self.radar_map = false;
+        self.game_over = None;
+        self.chat.say(
+            "Partie contre des bots : elle commence. (/bots off pour les retirer, /bots \
+             pour en refaire une.)",
+            chat::YELLOW,
+        );
+    }
+
+    /// (v172) Fin de la partie contre des bots : seul sur la carte, en mode FPS.
+    fn stop_bots(&mut self) {
+        if !self.net.as_ref().is_some_and(|n| n.is_solo()) {
+            return;
+        }
+        self.net = None;
+        self.net_dead = false;
+        self.fps.online = None;
+        self.fps.hp = 100;
+        self.feed.clear();
+        self.banner = None;
+        self.game_over = None;
+        self.spectating = None;
     }
 
     /// Mode FPS : ouvre ou ferme la porte / trappe visée (l'hôte en décide en ligne).
@@ -3378,6 +3445,8 @@ impl Session {
     fn apply_net(&mut self, locals: Vec<crate::netgame::Local>) {
         use crate::netgame::Local;
         use minelib_net::game::{reason, CT};
+        // (Partie solo contre des bots : rien à dire au relais.)
+        let online = self.online_match();
         for l in locals {
             match l {
                 Local::SetHp(hp) => {
@@ -3410,9 +3479,20 @@ impl Session {
                 Local::Hit { head } => self.fps.hit_marker = (0.25, head),
                 Local::Give(item) => self.fps.give(item),
                 Local::Kicked(reason) => {
-                    self.kicked = Some(reason);
+                    if online {
+                        self.kicked = Some(reason);
+                    } else {
+                        // Partie solo contre des bots : elle s'arrête, on reste sur la carte.
+                        self.stop_bots();
+                        self.bots_auto = false;
+                        self.chat.say(reason, chat::RED);
+                    }
                 }
-                Local::Paused(on) => self.room_paused = Some(on),
+                Local::Paused(on) => {
+                    if online {
+                        self.room_paused = Some(on);
+                    }
+                }
                 Local::Kill(k) => {
                     self.feed.push((k, 0.0));
                     if self.feed.len() > 6 {
@@ -3474,7 +3554,15 @@ impl Session {
                     self.banner = Some((format!("{side}{how}"), col, 5.0));
                 }
                 Local::GameOver(summary) => {
-                    self.match_result = Some(summary.clone());
+                    if online {
+                        self.match_result = Some(summary.clone());
+                    } else {
+                        self.chat.say(
+                            "Partie finie. /bots pour en refaire une, /bots off pour rester \
+                             seul sur la carte.",
+                            chat::YELLOW,
+                        );
+                    }
                     self.game_over = Some((summary, 0.0));
                 }
                 Local::Thrown {
@@ -3484,7 +3572,9 @@ impl Session {
                     vel,
                 } => self.fps.add_thrown(owner, nade, pos, vel),
                 Local::Started => {
-                    self.room_started = Some(true);
+                    if online {
+                        self.room_started = Some(true);
+                    }
                     self.game_over = None;
                 }
             }
@@ -4020,10 +4110,12 @@ impl Session {
                              (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door true|false, /fps set doorsync true|false, /fps clear …, \
                              /fps info";
         if self.net.is_some() {
-            self.chat.say(
-                "Les réglages de carte se font hors partie en ligne.",
-                chat::RED,
-            );
+            let msg = if self.online_match() {
+                "Les réglages de carte se font hors partie en ligne."
+            } else {
+                "Les réglages de carte se font sans les bots : /bots off d'abord."
+            };
+            self.chat.say(msg, chat::RED);
             return;
         }
         let mut map = crate::fpsmap::load(&self.dir);
@@ -4309,8 +4401,8 @@ impl Session {
         }
         // Partie FPS en ligne : aucune autre commande (pas de triche : mode de jeu, vol,
         // objets, santé, WorldEdit…). Construction en ligne : pas de WorldEdit (les blocs
-        // passent un par un par le garant).
-        if self.net.is_some() {
+        // passent un par un par le garant). (Contre des bots en solo : tout est permis.)
+        if self.online_match() {
             self.chat.say(
                 "Commande interdite en partie en ligne. Permises : /report, /unreport, /ami, \
                  /equipe.",
@@ -4419,6 +4511,27 @@ impl Session {
                         .say("Utilisation : /touchelente <on|off|auto>", chat::RED),
                 }
             }
+            // (v172) Partie contre des bots (mode FPS en solo) : retirer, refaire.
+            "bots" | "bot" => match arg.map(str::to_lowercase).as_deref() {
+                Some("off" | "stop" | "non") => {
+                    self.bots_auto = false;
+                    if self.net.as_ref().is_some_and(|n| n.is_solo()) {
+                        self.stop_bots();
+                        self.chat
+                            .say("Bots retirés : tu es seul sur la carte.", chat::YELLOW);
+                    }
+                }
+                _ => {
+                    if self.game.mode != GameMode::Fps {
+                        self.chat
+                            .say("Les bots jouent en mode FPS : /gm fps.", chat::RED);
+                        return;
+                    }
+                    // Nouvelle partie (commencée à l'image suivante).
+                    self.stop_bots();
+                    self.bots_auto = true;
+                }
+            },
             "gamemode" | "gm" => match arg.and_then(GameMode::parse) {
                 Some(mode) => self.set_mode(mode),
                 None => self.chat.say(
@@ -4602,7 +4715,7 @@ impl Session {
                     });
                 }
                 let guest = self.build.as_ref().is_some_and(|b| !b.is_owner());
-                if self.net.is_none() && !guest {
+                if !self.online_match() && !guest {
                     self.meta.name = new_name.clone();
                     match self.save() {
                         Ok(()) => self
@@ -5324,9 +5437,10 @@ impl Session {
             }
         } else if let Some(b) = &self.build {
             for (i, (pseudo, _, _)) in self.build_list(b).into_iter().enumerate() {
+                // (Sous sa propre ligne, la première.)
                 let (x, y) = (
                     size.0 / 2.0 + 40.0 * s,
-                    size.1 * 0.18 + 12.0 * s * (i as f32 + 1.5),
+                    size.1 * 0.18 + 12.0 * s * (i as f32 + 2.5),
                 );
                 out.push((pseudo, x, y, 60.0 * s, 8.0 * s));
             }
@@ -5368,32 +5482,42 @@ impl Session {
         if let Some(b) = &self.build {
             let list = self.build_list(b);
             let (x, y0) = (size.0 / 2.0 - 120.0 * s, size.1 * 0.18);
-            let h = 12.0 * s * (list.len() as f32 + 2.0);
+            let h = 12.0 * s * (list.len() as f32 + 3.0);
             ui.rect(x, y0, 240.0 * s, h, [0.0, 0.0, 0.0, 0.7]);
-            let mine = match b.ping() {
-                0 => String::new(),
-                ms => format!("   (ton ping : {ms} ms)"),
-            };
             ui.text(
                 x + 6.0 * s,
                 y0 + 4.0 * s,
                 s,
                 [1.0, 0.9, 0.35, 1.0],
-                format!("Joueurs proches{mine}"),
+                "Joueurs proches",
             );
-            // (v165) Ping de chacun à gauche de son pseudo.
+            // (v165) Ping de chacun à gauche de son pseudo ; (v172) soi en premier, avec
+            // son ping comme les autres.
             let ping_w = Ui::text_width("9999 ms", s) + 6.0 * s;
-            for (i, (name, d, ping)) in list.iter().enumerate() {
+            let me = if self.pseudo.is_empty() {
+                "Toi".to_string()
+            } else {
+                self.pseudo.clone()
+            };
+            let mine = (b.ping() > 0).then(|| b.ping());
+            let rows = std::iter::once((me, None, mine, true)).chain(
+                list.iter()
+                    .map(|(name, d, ping)| (name.clone(), Some(*d), *ping, false)),
+            );
+            for (i, (name, d, ping, own)) in rows.enumerate() {
                 let ry = y0 + 12.0 * s * (i as f32 + 1.5);
-                let (text, color) = ping_label(*ping);
+                let (text, color) = ping_label(ping);
                 ui.text(x + 6.0 * s, ry, s, color, text);
-                ui.text(
-                    x + 6.0 * s + ping_w,
-                    ry,
-                    s,
-                    [1.0, 1.0, 1.0, 1.0],
-                    format!("{name}  {d:.0} m"),
-                );
+                let line = match d {
+                    Some(d) => format!("{name}  {d:.0} m"),
+                    None => name,
+                };
+                let c = if own {
+                    [1.0, 0.95, 0.6, 1.0]
+                } else {
+                    [1.0, 1.0, 1.0, 1.0]
+                };
+                ui.text(x + 6.0 * s + ping_w, ry, s, c, line);
             }
         }
         for (name, x, y, w, h) in self.volume_sliders(size) {
@@ -5450,24 +5574,40 @@ impl Session {
             1000.0,
         );
         let vp = proj * self.view_with_punch();
+        let cam = self.camera_pos();
         for (pseudo, pos) in near {
-            let c = vp * (pos + Vec3::Y * 2.1).extend(1.0);
-            if c.w <= 0.0 || (pos - self.player.pos).length() > 64.0 {
+            let top = pos + Vec3::Y * 2.1;
+            let c = vp * top.extend(1.0);
+            if c.w <= 0.0 {
+                continue;
+            }
+            // (v172) Taille comme celle d'un objet du monde : celle d'avant à 6,5 blocs, plus
+            // petite plus loin, plus grande plus près ; illisible (moins de 7 pixels de
+            // haut) : pas affiché.
+            let k = (NAME_SIZE_AT / (top - cam).length().max(0.1)).min(4.0);
+            let ts = s * k;
+            if ts * 8.0 < 7.0 {
                 continue;
             }
             let (x, y) = (
                 (c.x / c.w * 0.5 + 0.5) * size.0,
                 (0.5 - c.y / c.w * 0.5) * size.1,
             );
-            let tw = Ui::text_width(pseudo, s);
+            let tw = Ui::text_width(pseudo, ts);
             ui.rect(
-                x - tw / 2.0 - s,
-                y - s,
-                tw + 2.0 * s,
-                10.0 * s,
+                x - tw / 2.0 - ts,
+                y - ts,
+                tw + 2.0 * ts,
+                10.0 * ts,
                 [0.0, 0.0, 0.0, 0.45],
             );
-            ui.text(x - tw / 2.0, y, s, [1.0, 1.0, 1.0, 1.0], pseudo.to_string());
+            ui.text(
+                x - tw / 2.0,
+                y,
+                ts,
+                [1.0, 1.0, 1.0, 1.0],
+                pseudo.to_string(),
+            );
         }
     }
 
@@ -5570,8 +5710,13 @@ impl Session {
                 if r.id == me {
                     ui.rect(x + 2.0 * s, y - s, w - 4.0 * s, row, [1.0, 1.0, 1.0, 0.08]);
                 }
-                // (v165) Ping à gauche du pseudo (l'hôte de la partie : 0).
-                let (ping, pc) = ping_label((r.ping > 0).then_some(r.ping));
+                // (v172) Ping à gauche du pseudo (l'hôte de la partie : 0) ; les bots de la
+                // partie solo : « BOT » à sa place.
+                let (ping, pc) = if r.pseudo.starts_with("BOT ") {
+                    ("BOT".to_string(), [0.6, 0.6, 0.65, 1.0])
+                } else {
+                    ping_label((r.ping > 0).then_some(r.ping))
+                };
                 ui.text(x + 6.0 * s, y, s, pc, ping);
                 ui.text(x + 6.0 * s + ping_w, y, s, c, r.pseudo.clone());
                 let hs = if r.kills > 0 {
@@ -5868,6 +6013,13 @@ impl Session {
         if visible && self.spectating.is_none() {
             shadows.push((self.player.pos, crate::player_model::shadow_boxes(&pose)));
         }
+        // (v172) Les autres joueurs : dessinés par la carte graphique, tous d'un coup (un
+        // modèle commun, une instance chacun), comme soi en F5 : leur skin pixel par pixel,
+        // la lumière de là où ils sont (lumières dynamiques comprises). Seul l'objet tenu
+        // reste fait ici.
+        let mut layers = self.skin_layers.borrow_mut();
+        layers.begin(renderer);
+        let mut players: Vec<minelib_render::PlayerInstance> = Vec::new();
         // Partie en ligne : les autres joueurs.
         if let Some(n) = &self.net {
             for v in n.views().iter().filter(|v| v.alive) {
@@ -5880,12 +6032,14 @@ impl Session {
                     walk: w.phase,
                     swing: w.amp,
                     crouch: v.crouch,
-                    light: self.hand_light,
+                    light: sky_light(&self.world, eye_of(v.pos, v.crouch), self.daylight),
                     held,
                     skin: self.skins.of(&v.pseudo),
                 };
                 shadows.push((v.pos, crate::player_model::shadow_boxes(&other)));
-                model.extend(crate::player_model::build(&other));
+                let layer = layers.layer(other.skin.as_ref(), renderer);
+                players.push(crate::player_model::instance(&other, layer));
+                model.extend(crate::player_model::held_model(&other));
             }
             // Bombe sur le dos de celui qui la porte.
             for v in n.views().iter().filter(|v| v.alive) {
@@ -5894,7 +6048,7 @@ impl Session {
                     model.extend(crate::player_model::bomb(
                         v.pos + back + Vec3::Y * 1.1,
                         false,
-                        self.hand_light,
+                        sky_light(&self.world, eye_of(v.pos, v.crouch), self.daylight),
                     ));
                 }
             }
@@ -5913,26 +6067,17 @@ impl Session {
                     continue;
                 }
                 let nade = crate::cs::nade_code(g.weapon);
+                // (v172) Éclairés là où ils sont, comme les joueurs.
+                let light = sky_light(&self.world, pos, self.daylight);
                 if far > 24.0 && fly.is_none() {
                     let len = crate::weapons::WEAPONS
                         .get(g.weapon as usize)
                         .map_or(0.18, |w| w.length);
-                    model.extend(crate::player_model::gun_on_ground(
-                        pos,
-                        len,
-                        turn,
-                        self.hand_light,
-                    ));
+                    model.extend(crate::player_model::gun_on_ground(pos, len, turn, light));
                 } else if let Some(k) = nade {
                     let tris = crate::equip::nade_model(crate::equip::Nade::ALL[k]);
                     crate::player_model::item_on_ground(
-                        &mut model,
-                        &tris,
-                        pos,
-                        turn,
-                        true,
-                        spin,
-                        self.hand_light,
+                        &mut model, &tris, pos, turn, true, spin, light,
                     );
                 } else if (g.weapon as usize) < crate::weapons::WEAPONS.len() {
                     crate::player_model::item_on_ground(
@@ -5942,7 +6087,7 @@ impl Session {
                         turn,
                         true,
                         spin,
-                        self.hand_light,
+                        light,
                     );
                 }
             }
@@ -5960,7 +6105,8 @@ impl Session {
                     Some((from, to, t)) if hud.bomb == bomb::DROPPED => toss_arc(from, to, t),
                     _ => Vec3::from(hud.bomb_pos),
                 };
-                model.extend(crate::player_model::bomb(at, blink, self.hand_light));
+                let light = sky_light(&self.world, at, self.daylight);
+                model.extend(crate::player_model::bomb(at, blink, light));
             }
         }
         // Construction en ligne (et, en solo, la foule d'essai : dessinée pareil).
@@ -5980,9 +6126,8 @@ impl Session {
             );
         }
         if !others.is_empty() {
-            // Foule : les plus proches en détail, les suivants en modèle simplifié, les
-            // plus lointains en trois pavés (des milliers de joueurs visibles sans
-            // effondrer les images par seconde).
+            // Les plus proches d'abord (ombres, et place limitée sur la carte : au-delà de
+            // `MAX_PLAYERS`, les plus lointains en trois pavés).
             others.sort_by(|a, c| {
                 a.1.distance_squared(cam)
                     .total_cmp(&c.1.distance_squared(cam))
@@ -5996,20 +6141,22 @@ impl Session {
                     walk: w.phase,
                     swing: w.amp,
                     crouch,
-                    light: self.hand_light,
+                    light: sky_light(&self.world, eye_of(pos, crouch), self.daylight),
                     held: None,
                     skin: self.skins.of(pseudo),
                 };
                 if rank < 24 && pos.distance_squared(cam) < 48.0 * 48.0 {
                     shadows.push((pos, crate::player_model::shadow_boxes(&other)));
-                    model.extend(crate::player_model::build(&other));
-                } else if rank < 256 {
-                    model.extend(crate::player_model::build_far(&other));
+                }
+                if players.len() < minelib_render::MAX_PLAYERS {
+                    let layer = layers.layer(other.skin.as_ref(), renderer);
+                    players.push(crate::player_model::instance(&other, layer));
                 } else {
                     model.extend(crate::player_model::build_tiny(&other));
                 }
             }
         }
+        drop(layers);
         // Objets au sol : ils flottent et tournent.
         if self.game.mode != GameMode::Fps {
             let l = 0.35 + 0.65 * self.daylight;
@@ -6123,6 +6270,7 @@ impl Session {
             entities: &model,
             entities_follow: follow,
             static_entities: &statics,
+            players: &players,
             eye: cam,
             player_eye: self.player.eye(),
             view,
@@ -6261,6 +6409,9 @@ fn same_family(a: BlockId, b: BlockId) -> bool {
         _ => false,
     }
 }
+
+/// (v172) Distance (blocs) où les pseudos des autres joueurs ont leur taille normale.
+const NAME_SIZE_AT: f32 = 6.5;
 
 /// (v165) Ping montré dans la liste des joueurs : texte et couleur (vert, jaune, rouge
 /// selon sa valeur ; gris s'il n'est pas connu).
@@ -7646,4 +7797,26 @@ fn toss_arc(from: Vec3, to: Vec3, t: f32) -> Vec3 {
     let k = (t / TOSS_FLIGHT).clamp(0.0, 1.0);
     let lift = 0.9 + (from.y - to.y).max(0.0) * 0.1;
     from.lerp(to, k) + Vec3::Y * lift * 4.0 * k * (1.0 - k)
+}
+
+/// Yeux d'un joueur aux pieds `feet` (accroupi 0..1), comme `Player::eye`.
+fn eye_of(feet: Vec3, crouch: f32) -> Vec3 {
+    feet + Vec3::Y * (crate::player::EYE - crate::player::CROUCH_DROP * crouch.clamp(0.0, 1.0))
+}
+
+/// Lumière du ciel reçue aux yeux `e` (linéaire) : abrité par un bloc plein au-dessus ou
+/// non, jour ou nuit. La même pour soi (`light_at_player`) et pour les autres joueurs.
+fn sky_light(world: &World, e: Vec3, daylight: f32) -> [f32; 3] {
+    let (x, z) = (e.x.floor() as i32, e.z.floor() as i32);
+    // Un bloc plein plus haut que les yeux (au-dessus de la couche la plus haute du chunk,
+    // que de l'air).
+    let from = (e.y.floor() as i32 + 1).max(0) as usize;
+    let covered = world.chunk(ChunkPos::containing(x, z)).is_some_and(|c| {
+        let (lx, lz) = (
+            x.rem_euclid(CHUNK_SIZE as i32) as usize,
+            z.rem_euclid(CHUNK_SIZE as i32) as usize,
+        );
+        (from..c.top()).any(|y| c.get(lx, y, lz).is_solid())
+    });
+    [if covered { 0.35 } else { 1.0 } * (0.18 + 0.82 * daylight); 3]
 }

@@ -1362,6 +1362,10 @@ pub struct Host {
     /// Position montrée de chaque joueur distant : elle suit sa position simulée en douceur
     /// (ses entrées arrivent par paquets : sans cela, il avance par sauts à l'écran).
     shown: HashMap<u64, Vec3>,
+    /// (v172) Partie solo contre des bots : pas de relais (rien n'est envoyé), et les bots
+    /// qui jouent comme des invités.
+    solo: bool,
+    bots: Option<Box<crate::bots::Bots>>,
 }
 
 pub struct Guest {
@@ -1551,10 +1555,56 @@ impl NetGame {
             chain: [0; 32],
             last_shot: HashMap::new(),
             shown: HashMap::new(),
+            solo: false,
+            bots: None,
         };
         h.events(ev, &mut out);
         h.out = out;
         NetGame::Host(Box::new(h))
+    }
+
+    /// (v172) Partie solo contre des bots (mode FPS dans un monde solo) : ce jeu en est
+    /// l'hôte, sans relais ; la carte se remplit de bots (`map.players()` joueurs en tout),
+    /// la partie démarre et chacun est placé à son départ. `nav` : relevé de la carte en
+    /// préparation (voir `bots::nav_in_background`).
+    pub fn solo(
+        pseudo: String,
+        map: FpsMap,
+        spawn: Vec3,
+        nav: Option<std::sync::mpsc::Receiver<crate::bots::Nav>>,
+    ) -> Self {
+        // Personne au bout du fil : les messages pour les autres ne partent nulle part.
+        let (link, _) = std::sync::mpsc::channel();
+        let players = map.players() as usize;
+        let mut g = NetGame::host(link, pseudo, map, [0; 32], spawn);
+        if let NetGame::Host(h) = &mut g {
+            h.solo = true;
+            h.auto_backup = false;
+            let seed = h.rand();
+            let mut bots = crate::bots::Bots::new(seed);
+            if let Some(rx) = nav {
+                bots.set_building(rx);
+            }
+            let names = crate::bots::Bots::names(players.saturating_sub(1), seed);
+            for (i, name) in names.into_iter().enumerate() {
+                let id = crate::bots::BOT_BASE + i as u64 + 1;
+                bots.add(id);
+                h.add_bot(id, name);
+            }
+            h.bots = Some(Box::new(bots));
+            // Tout le monde est là : la partie commence tout de suite, chacun à son départ.
+            h.spawns.clear();
+            let ev = h.m.start_now();
+            let mut out = Vec::new();
+            h.events(ev, &mut out);
+            h.out.extend(out);
+        }
+        g
+    }
+
+    /// (v172) Partie solo contre des bots.
+    pub fn is_solo(&self) -> bool {
+        matches!(self, NetGame::Host(h) if h.solo)
     }
 
     /// Garant indépendant : serveur de la partie sans personnage (il ne joue pas).
@@ -2233,6 +2283,8 @@ impl NetGame {
             chain: b.chain,
             last_shot: HashMap::new(),
             shown: HashMap::new(),
+            solo: false,
+            bots: None,
         }));
         if let NetGame::Host(h) = self {
             h.playing = h.m.players.contains_key(&0);
@@ -2388,6 +2440,146 @@ impl NetGame {
 }
 
 impl Host {
+    /// (v172) Un bot rejoint la partie solo (prêt tout de suite, comme un invité qui a la
+    /// bonne carte).
+    fn add_bot(&mut self, id: u64, pseudo: String) {
+        self.peers.insert(
+            id,
+            Remote {
+                party: 0,
+                pseudo: pseudo.clone(),
+                player: Player::new(self.spawn),
+                queue: VecDeque::new(),
+                ack: 0,
+                weapon: 255,
+                ready: true,
+                fall_from: None,
+                budget: INPUT_BURST / 4,
+            },
+        );
+        // (Sans les annonces « … rejoint les CT » : neuf lignes d'un coup en solo.)
+        let ev: Vec<Ev> = self
+            .m
+            .join_party(id, &pseudo, 0)
+            .into_iter()
+            .filter(|e| !matches!(e, Ev::Say(_)))
+            .collect();
+        let mut out = Vec::new();
+        self.events(ev, &mut out);
+        self.out.extend(out);
+    }
+
+    /// (v172) La partie telle que les bots la voient à ce pas.
+    fn scene(&self) -> crate::bots::Scene<'_> {
+        use crate::bots::Body;
+        let mut bodies = Vec::new();
+        for (&id, p) in &self.m.players {
+            if !p.present {
+                continue;
+            }
+            let b = if id == 0 {
+                if !self.playing {
+                    continue;
+                }
+                let s = &self.local_state;
+                Body {
+                    id,
+                    team: p.team,
+                    alive: p.alive,
+                    feet: Vec3::from(s.pos),
+                    vel: Vec3::from(s.vel),
+                    crouch: s.crouch,
+                    on_ground: s.on_ground,
+                    on_ladder: self.local_ladder,
+                    yaw: 0.0,
+                    carry: self.local_carry,
+                }
+            } else {
+                let Some(r) = self.peers.get(&id).filter(|r| r.ready) else {
+                    continue;
+                };
+                Body {
+                    id,
+                    team: p.team,
+                    alive: p.alive,
+                    feet: r.player.pos,
+                    vel: r.player.vel,
+                    crouch: r.player.crouch,
+                    on_ground: r.player.on_ground,
+                    on_ladder: r.player.on_ladder,
+                    yaw: r.player.yaw,
+                    carry: r.player.carry,
+                }
+            };
+            bodies.push(b);
+        }
+        crate::bots::Scene {
+            tick: self.tick,
+            m: &self.m,
+            bodies,
+            smokes: &self.smokes,
+            last_shot: &self.last_shot,
+        }
+    }
+
+    /// (v172) Un pas des bots : leurs entrées vont dans leur file comme celles d'un invité,
+    /// leurs tirs et leurs achats passent par les mêmes règles.
+    fn drive_bots(&mut self, world: &World, dt: f32) {
+        use crate::bots::Act;
+        let Some(mut bots) = self.bots.take() else {
+            return;
+        };
+        let acts = {
+            let scene = self.scene();
+            bots.think(&scene, world, dt)
+        };
+        let mut out = Vec::new();
+        for a in acts {
+            match a {
+                Act::Input(id, n) => {
+                    if let Some(r) = self.peers.get_mut(&id) {
+                        let seq = r.ack + r.queue.len() as u32 + 1;
+                        r.queue.push_back((seq, n));
+                    }
+                }
+                Act::Fire {
+                    bot,
+                    weapon,
+                    origin,
+                    dirs,
+                } => {
+                    let msg = ToHost::Fire {
+                        weapon,
+                        origin: origin.to_array(),
+                        dirs: dirs.iter().map(|d| d.to_array()).collect(),
+                        view_tick: self.tick,
+                        blind: false,
+                    };
+                    self.m.touch(bot);
+                    out.extend(self.request(bot, msg, world));
+                }
+                Act::Keys { bot, plant, defuse } => self.m.keys(bot, plant, defuse),
+                Act::Buy { bot, item } => {
+                    let at = self.feet_of(bot);
+                    let _ = self.m.buy(bot, item, at);
+                }
+                Act::Hold { bot, weapon } => {
+                    if let Some(r) = self.peers.get_mut(&bot) {
+                        r.weapon = weapon;
+                    }
+                }
+                Act::Door { bot, pos, side } => {
+                    let alive = self.m.players.get(&bot).is_some_and(|p| p.alive);
+                    let feet = self.feet_of(bot);
+                    let cells = use_door(&mut self.m, world, feet, alive, pos, side);
+                    self.doors_changed(cells, &mut out);
+                }
+            }
+        }
+        self.out.extend(out);
+        self.bots = Some(bots);
+    }
+
     /// Tableau des scores, avec le ping de chacun (gardé par l'hôte, hors des règles).
     fn rows(&self) -> Vec<ScoreRow> {
         let mut rows = self.m.rows();
@@ -2405,6 +2597,9 @@ impl Host {
     }
 
     fn send_to(&self, peer: u64, msg: &ToPeer) {
+        if self.solo {
+            return;
+        }
         send(
             &self.link,
             &Request::ToPeer {
@@ -2526,6 +2721,9 @@ impl Host {
     }
 
     fn broadcast(&self, msg: &ToPeer) {
+        if self.solo {
+            return;
+        }
         send(
             &self.link,
             &Request::Broadcast {
@@ -2704,6 +2902,10 @@ impl Host {
     fn record(&mut self, who: u64, mv: Move) {
         dbg_alive("hote", self.tick as u64, who, "(avant)", &self.m);
         note_activity(&mut self.m, who, &mv);
+        // Partie solo : pas de vérificateur, rien à garder.
+        if self.solo {
+            return;
+        }
         self.chain = chain_step(&self.chain, self.tick, who, &mv);
         self.log.push((self.tick, who, mv));
         if self.log.len() > 100_000 {
@@ -3199,6 +3401,9 @@ impl Host {
         self.local_ladder = local.on_ladder;
         self.local_state = local.net_state();
         self.local_carry = local.carry;
+        // (v172) Les bots jouent leur pas (leurs entrées passent ensuite comme celles des
+        // invités).
+        self.drive_bots(world, dt);
         let frozen = self.m.frozen();
         let mut falls: Vec<(u64, u32)> = Vec::new();
         let mut moves: Vec<(u64, Move)> = Vec::new();
@@ -3303,7 +3508,7 @@ impl Host {
         if self.history.len() > HISTORY {
             self.history.pop_front();
         }
-        if self.tick.is_multiple_of(MOVES_EVERY) {
+        if self.tick.is_multiple_of(MOVES_EVERY) && !self.solo {
             self.snapshots(local, world, self.tick.is_multiple_of(SNAPSHOT_EVERY));
         }
         let due = self.tick.is_multiple_of(BACKUP_EVERY) || std::mem::take(&mut self.backup_now);
@@ -4815,5 +5020,372 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .subsec_nanos()
+    }
+
+    // --- (v172) Bots de la partie solo --------------------------------------------------
+
+    /// Partie de bots seuls (l'hôte ne joue pas), relevé de la carte fait d'avance.
+    fn bots_only(world: &World, map: FpsMap, spawn: Vec3, calm: bool) -> NetGame {
+        let (link, _) = std::sync::mpsc::channel();
+        let players = map.players() as usize;
+        let mut g = NetGame::host(link, "Hote".into(), map.clone(), [0; 32], spawn);
+        if let NetGame::Host(h) = &mut g {
+            h.m = Match::new(map.clone(), [0; 32], 7);
+            h.m.fallback_spawns = Some([spawn - Vec3::X * 10.0, spawn + Vec3::X * 10.0]);
+            h.playing = false;
+            h.out.clear();
+            h.spawns.clear();
+            h.solo = true;
+            h.auto_backup = false;
+            let mut bots = crate::bots::Bots::new(11);
+            bots.set_nav(crate::bots::Nav::build(world, &map, &[spawn]));
+            bots.set_calm(calm);
+            for (i, name) in crate::bots::Bots::names(players, 3).into_iter().enumerate() {
+                let id = crate::bots::BOT_BASE + i as u64 + 1;
+                bots.add(id);
+                h.add_bot(id, name);
+            }
+            h.bots = Some(Box::new(bots));
+        }
+        g
+    }
+
+    fn host_of(g: &mut NetGame) -> &mut Host {
+        match g {
+            NetGame::Host(h) => h,
+            NetGame::Guest(_) => panic!("hôte attendu"),
+        }
+    }
+
+    /// Fait jouer la partie de bots `g` au plus `seconds` secondes de jeu (temps d'achat et
+    /// échauffement écourtés), en appelant `watch` à chaque pas (vrai : on arrête).
+    fn run_bots(
+        g: &mut NetGame,
+        world: &World,
+        seconds: f32,
+        mut watch: impl FnMut(&Host, &[Local]) -> bool,
+    ) {
+        let dt = 1.0 / 256.0;
+        let nobody = Player::new(Vec3::new(0.5, -100.0, 0.5));
+        let input = MoveInput {
+            fps: true,
+            ..Default::default()
+        };
+        for _ in 0..(seconds / dt) as u32 {
+            {
+                let h = host_of(g);
+                // Échauffement et départ de manche écourtés (les achats se font quand même).
+                let wait = matches!(h.m.phase, game::phase::WARMUP | game::phase::FREEZE);
+                if wait && h.m.time > 3.6 {
+                    h.m.time = 3.6;
+                }
+            }
+            g.on_tick(world, &nobody, &input, dt);
+            let out = g.end_frame(world, Vec::new(), 255, NadeOut::default(), dt);
+            if watch(host_of(g), &out) {
+                return;
+            }
+        }
+    }
+
+    /// Parcours d'obstacles : départ des T, une marche, un trou à sauter, une échelle qui
+    /// monte sur une plate-forme où sont le site et le départ des CT.
+    fn obstacle_course() -> (World, FpsMap, Vec3) {
+        let mut w = World::new(0);
+        for cx in -1..=3 {
+            for cz in -1..=1 {
+                w.insert_empty(ChunkPos { x: cx, z: cz });
+            }
+        }
+        let reg = minelib_world::registry::registry();
+        let ladder = reg.by_key("ladder:0").expect("échelle");
+        for z in 0..=4 {
+            // Sol (pieds à 11), marche (pieds à 12) à partir de x = 8.
+            for x in 0..=13 {
+                w.set(x, 10, z, BlockId::STONE);
+                if x >= 8 {
+                    w.set(x, 11, z, BlockId::STONE);
+                }
+            }
+            // Trou en x = 14 et 15 (le vide), puis la suite (pieds à 12).
+            for x in 16..=21 {
+                w.set(x, 10, z, BlockId::STONE);
+                w.set(x, 11, z, BlockId::STONE);
+            }
+            // Plate-forme (pieds à 16), mur de 4 blocs en x = 22, échelle devant.
+            for x in 22..=34 {
+                for y in 10..=15 {
+                    w.set(x, y, z, BlockId::STONE);
+                }
+            }
+            for y in 12..=15 {
+                w.set(21, y, z, ladder);
+            }
+        }
+        let map = FpsMap {
+            ct: Some(game::Zone::new([31, 16, 1], [33, 16, 3])),
+            t: Some(game::Zone::new([1, 11, 1], [3, 11, 3])),
+            sites: [Some(game::Zone::new([26, 16, 0], [29, 16, 4])), None, None],
+            max_players: 2,
+        };
+        (w, map, Vec3::new(2.5, 11.0, 2.5))
+    }
+
+    /// Le relevé des bots passe la marche, le trou (en sautant) et l'échelle.
+    #[test]
+    fn the_bots_nav_crosses_a_step_a_gap_and_a_ladder() {
+        let (w, map, spawn) = obstacle_course();
+        let nav = crate::bots::Nav::build(&w, &map, &[spawn]);
+        let site = nav.near(Vec3::new(27.5, 16.0, 2.5)).expect("site relevé");
+        let start = nav.near(spawn).expect("départ relevé");
+        assert!(nav.len() > 100, "{} cases", nav.len());
+        assert!(nav.path_steps(start, site).is_some(), "pas de chemin");
+        let steps = nav.path_steps(start, site).unwrap();
+        use crate::radar::Step;
+        assert!(steps.contains(&Step::Jump), "{steps:?}");
+        assert!(steps.contains(&Step::Ladder), "{steps:?}");
+    }
+
+    /// Un T (bot) mène la bombe par le parcours jusqu'au site et la pose ; le CT (bot)
+    /// vient la désamorcer. (Bots « calmes » : ils ne se battent pas.)
+    #[test]
+    fn a_bot_carries_the_bomb_over_the_course_plants_and_a_bot_defuses() {
+        let (w, map, spawn) = obstacle_course();
+        let mut g = bots_only(&w, map, spawn, true);
+        let mut planted = false;
+        let mut end = None;
+        let trace = std::env::var("BOT_TRACE").is_ok();
+        let mut ticks = 0u32;
+        run_bots(&mut g, &w, 200.0, |h, out| {
+            ticks += 1;
+            if trace && ticks.is_multiple_of(256) {
+                if let Some(b) = &h.bots {
+                    for line in b.debug() {
+                        let id = u64::from_str_radix(line.split(' ').next().unwrap_or("0"), 16)
+                            .unwrap_or(0)
+                            + crate::bots::BOT_BASE;
+                        let p = h.peers.get(&id).map(|r| r.player.pos);
+                        println!("{} s phase {} : {line} {p:.2?}", ticks / 256, h.m.phase);
+                    }
+                }
+            }
+            planted |= h.m.bomb == game::bomb::PLANTED;
+            for l in out {
+                if let Local::RoundEnd { winner, reason } = l {
+                    end = Some((*winner, *reason, h.m.bomb));
+                    return true;
+                }
+            }
+            false
+        });
+        assert!(planted, "bombe jamais posée (fin : {end:?})");
+        assert_eq!(
+            end.map(|e| (e.0, e.1)),
+            Some((game::CT, game::reason::DEFUSED)),
+            "fin de manche"
+        );
+    }
+
+    /// Bots sur de vraies cartes (`BOT_MAPS` : dossiers de mondes séparés par des `;`,
+    /// `BOT_MINUTES` : minutes de jeu, 3 par défaut) : relevé, puis une partie de bots
+    /// seuls, avec ce qui s'y passe (éliminations, poses, désamorçages, bots coincés).
+    #[test]
+    #[ignore]
+    fn bots_on_real_maps() {
+        let maps = std::env::var("BOT_MAPS").expect("BOT_MAPS");
+        let minutes: f32 = std::env::var("BOT_MINUTES")
+            .ok()
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(3.0);
+        for dir in maps.split(';').filter(|d| !d.is_empty()) {
+            let dir = std::path::PathBuf::from(dir);
+            let map = crate::fpsmap::load(&dir);
+            let t = Instant::now();
+            let (data, _) = crate::save::load_world(&dir).expect("monde");
+            let spawn = data
+                .player
+                .map(|p| Vec3::from(p.pos))
+                .unwrap_or(Vec3::new(0.5, 80.0, 0.5));
+            let world = crate::radar::load_map_world(&dir, &map).expect("monde");
+            let loaded = t.elapsed().as_secs_f32();
+            let t = Instant::now();
+            let nav = crate::bots::Nav::build(&world, &map, &[spawn]);
+            println!(
+                "{} : monde lu en {loaded:.1} s, relevé {} cases en {:.1} s",
+                dir.display(),
+                nav.len(),
+                t.elapsed().as_secs_f32()
+            );
+            print!("{}", nav.report(&map));
+            if std::env::var("BOT_NAV_ONLY").is_ok() {
+                continue;
+            }
+            let mut g = bots_only(&world, map, spawn, false);
+            if let Some(b) = host_of(&mut g).bots.as_deref_mut() {
+                b.set_nav(nav);
+            }
+            let (mut kills, mut rounds, mut plants, mut defused, mut exploded) = (0, 0, 0, 0, 0);
+            let mut was_planted = false;
+            let mut ends: Vec<String> = Vec::new();
+            let t = Instant::now();
+            let trace = std::env::var("BOT_TRACE").is_ok();
+            let mut ticks = 0u32;
+            run_bots(&mut g, &world, minutes * 60.0, |h, out| {
+                ticks += 1;
+                if trace && ticks.is_multiple_of(256 * 3) {
+                    println!(
+                        "  t {} s, phase {}, temps {:.0}, bombe {} porteur {:?}",
+                        ticks / 256,
+                        h.m.phase,
+                        h.m.time,
+                        h.m.bomb,
+                        h.m.carrier.map(|c| c & 0xff)
+                    );
+                    if let Some(b) = &h.bots {
+                        for (line, (id, r)) in b.debug().iter().zip(h.peers.iter().take(0)) {
+                            let _ = (line, id, r);
+                        }
+                        for line in b.debug() {
+                            let id = u64::from_str_radix(line.split(' ').next().unwrap_or("0"), 16)
+                                .unwrap_or(0)
+                                + crate::bots::BOT_BASE;
+                            let p = h.peers.get(&id).map(|r| r.player.pos);
+                            let mp = h.m.players.get(&id);
+                            if h.m.carrier == Some(id) {
+                                if let Some(r) = h.peers.get(&id) {
+                                    let f = r.player.pos;
+                                    let inside: Vec<bool> =
+                                        h.m.map
+                                            .sites
+                                            .iter()
+                                            .flatten()
+                                            .map(|z| z.contains(f.to_array()))
+                                            .collect();
+                                    println!(
+                                        "      porteur : pieds {:.2?}, sol {}, vitesse {:.2}, dans les sites {inside:?}, touche {}",
+                                        f,
+                                        r.player.on_ground,
+                                        Vec3::new(r.player.vel.x, 0.0, r.player.vel.z).length(),
+                                        h.m.players.get(&id).is_some_and(|p| p.plant_key)
+                                    );
+                                }
+                            }
+                            println!(
+                                "    {} {} {} {:?}",
+                                if mp.is_some_and(|p| p.team == game::T) {
+                                    "T "
+                                } else {
+                                    "CT"
+                                },
+                                if mp.is_some_and(|p| p.alive) {
+                                    "vivant"
+                                } else {
+                                    "mort  "
+                                },
+                                line,
+                                p.map(|p| [p.x as i32, p.y as i32, p.z as i32])
+                            );
+                        }
+                    }
+                }
+                let planted = h.m.bomb == game::bomb::PLANTED;
+                if planted && !was_planted {
+                    plants += 1;
+                }
+                was_planted = planted;
+                for l in out {
+                    match l {
+                        Local::Kill(_) => kills += 1,
+                        Local::RoundEnd { winner, reason } => {
+                            rounds += 1;
+                            ends.push(format!(
+                                "{}:{}",
+                                if *winner == game::CT { "CT" } else { "T" },
+                                match *reason {
+                                    game::reason::T_ELIMINATED => "élim",
+                                    game::reason::CT_ELIMINATED => "élim",
+                                    game::reason::TIME => "temps",
+                                    game::reason::EXPLODED => "boum",
+                                    game::reason::DEFUSED => "désamorcée",
+                                    _ => "?",
+                                }
+                            ));
+                            if *reason == game::reason::DEFUSED {
+                                defused += 1;
+                            }
+                            if *reason == game::reason::EXPLODED {
+                                exploded += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            });
+            let stuck = host_of(&mut g)
+                .bots
+                .as_ref()
+                .map_or(0, |b| b.stuck_events());
+            println!("  manches : {}", ends.join(" "));
+            println!(
+                "  {minutes} min de jeu en {:.0} s : {rounds} manches, {kills} éliminations, \
+                 {plants} poses, {defused} désamorcées, {exploded} explosions, {stuck} fois \
+                 coincés",
+                t.elapsed().as_secs_f32()
+            );
+        }
+    }
+
+    /// Dix bots dans une arène : ils se trouvent, se tirent dessus, les manches se jouent.
+    #[test]
+    fn ten_bots_fight_and_rounds_end() {
+        let mut w = World::new(0);
+        for cx in -2..=1 {
+            for cz in -2..=1 {
+                w.insert_empty(ChunkPos { x: cx, z: cz });
+            }
+        }
+        for z in -24..=24 {
+            for x in -24..=24 {
+                w.set(x, 10, z, BlockId::STONE);
+            }
+        }
+        // Quelques piliers (de quoi se cacher).
+        for (px, pz) in [(-6, 0), (6, 0), (0, -6), (0, 6), (-12, 10), (12, 10)] {
+            for y in 11..=13 {
+                for dz in 0..2 {
+                    for dx in 0..2 {
+                        w.set(px + dx, y, pz + dz, BlockId::STONE);
+                    }
+                }
+            }
+        }
+        let map = FpsMap {
+            ct: Some(game::Zone::new([-2, 11, -22], [2, 11, -19])),
+            t: Some(game::Zone::new([-2, 11, 19], [2, 11, 22])),
+            sites: [
+                Some(game::Zone::new([-14, 11, -12], [-9, 11, -7])),
+                Some(game::Zone::new([9, 11, -12], [14, 11, -7])),
+                None,
+            ],
+            max_players: 10,
+        };
+        let spawn = Vec3::new(0.5, 11.0, 0.5);
+        let mut g = bots_only(&w, map, spawn, false);
+        let (mut kills, mut rounds, mut shots) = (0, 0, 0);
+        run_bots(&mut g, &w, 240.0, |_, out| {
+            for l in out {
+                match l {
+                    Local::Kill(_) => kills += 1,
+                    Local::RoundEnd { .. } => rounds += 1,
+                    Local::Shot { .. } => shots += 1,
+                    _ => {}
+                }
+            }
+            rounds >= 2
+        });
+        assert!(shots > 20, "{shots} tirs");
+        assert!(kills >= 4, "{kills} éliminations");
+        assert!(rounds >= 2, "{rounds} manches finies");
     }
 }

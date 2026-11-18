@@ -284,6 +284,18 @@ impl Zone {
         (0..3).all(|i| p[i] >= self.min[i] as f32 && p[i] < self.max[i] as f32 + 1.0)
     }
 
+    /// (v172) Un joueur dont les pieds sont en `p` s'y tient : dans la boîte, ou debout sur
+    /// sa couche du dessus (une zone sélectionnée au sol à la baguette, ce sont les blocs du
+    /// sol : on se tient un bloc plus haut).
+    pub fn holds(&self, p: [f32; 3]) -> bool {
+        p[0] >= self.min[0] as f32
+            && p[0] < self.max[0] as f32 + 1.0
+            && p[2] >= self.min[2] as f32
+            && p[2] < self.max[2] as f32 + 1.0
+            && p[1] >= self.min[1] as f32
+            && p[1] < self.max[1] as f32 + 2.0
+    }
+
     pub fn center(&self) -> [f32; 3] {
         [
             (self.min[0] + self.max[0] + 1) as f32 / 2.0,

@@ -4,7 +4,7 @@
 //! tête suit le regard, le corps se penche quand on s'accroupit.
 
 use glam::{Mat4, Vec3, Vec4};
-use minelib_render::{EntityVertex, RayBox, RayBoxKind, ShadowBox};
+use minelib_render::{EntityVertex, PlayerInstance, PlayerVertex, RayBox, RayBoxKind, ShadowBox};
 use minelib_world::BlockId;
 
 /// Taille d'un pixel du skin, en blocs (32 pixels = hauteur du joueur).
@@ -150,52 +150,18 @@ fn grain(seed: usize) -> f32 {
     0.97 + (h as f32 / 255.0) * 0.06
 }
 
-/// Pavé `[min, max]` (pixels, repère du modèle : x droite, y haut, z arrière) transformé
-/// par `xf` (pixels → monde), découpé en pixels colorés.
-fn emit_box(
-    out: &mut Vec<EntityVertex>,
-    xf: Mat4,
+/// Faces d'un pavé `[min, max]` de `w` × `h` × `d` pixels du skin, dans l'ordre de
+/// `Skin::color` (devant, derrière, côtés, dessus, dessous) : (face, origine en haut à gauche
+/// vue de face, axe u, axe v (un pixel chacun pour un pavé non agrandi), largeur, hauteur).
+#[allow(clippy::type_complexity)]
+fn box_faces(
     min: [f32; 3],
     max: [f32; 3],
-    part: Part,
-    light: [f32; 3],
-    tex: Option<(&crate::skin::Skin, usize)>,
-) {
-    emit_box_layer(out, xf, min, max, part, light, tex, None, 1);
-}
-
-/// Comme `emit_box` ; `layer` : pixels transparents laissés vides (têtes des cartes :
-/// buissons…), avec les deux calques du skin (`false`) ou seulement celui du dessus
-/// (`true`).
-#[allow(clippy::too_many_arguments)]
-fn emit_box_layer(
-    out: &mut Vec<EntityVertex>,
-    xf: Mat4,
-    min: [f32; 3],
-    max: [f32; 3],
-    part: Part,
-    light: [f32; 3],
-    tex: Option<(&crate::skin::Skin, usize)>,
-    layer: Option<bool>,
-    lod: usize,
-) {
+    [w, h, d]: [usize; 3],
+) -> [(Face, [f32; 3], [f32; 3], [f32; 3], usize, usize); 6] {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
-    let lit = EntityVertex::light(light, true);
-    // Nombre de pixels du skin par côté (une boîte agrandie garde 8 pixels : chacun un
-    // peu plus grand).
-    let (w, h, d) = (
-        (x1 - x0).round() as usize,
-        (y1 - y0).round() as usize,
-        (z1 - z0).round() as usize,
-    );
-    let k = [
-        (x1 - x0) / w.max(1) as f32,
-        (y1 - y0) / h.max(1) as f32,
-        (z1 - z0) / d.max(1) as f32,
-    ];
-    // (face, origine en haut à gauche vue de face, axe u, axe v, largeur, hauteur)
-    let faces = [
+    [
         (
             Face::Front,
             [x1, y1, z0],
@@ -244,7 +210,54 @@ fn emit_box_layer(
             w,
             d,
         ),
+    ]
+}
+
+/// Pavé `[min, max]` (pixels, repère du modèle : x droite, y haut, z arrière) transformé
+/// par `xf` (pixels → monde), découpé en pixels colorés.
+fn emit_box(
+    out: &mut Vec<EntityVertex>,
+    xf: Mat4,
+    min: [f32; 3],
+    max: [f32; 3],
+    part: Part,
+    light: [f32; 3],
+    tex: Option<(&crate::skin::Skin, usize)>,
+) {
+    emit_box_layer(out, xf, min, max, part, light, tex, None, 1);
+}
+
+/// Comme `emit_box` ; `layer` : pixels transparents laissés vides (têtes des cartes :
+/// buissons…), avec les deux calques du skin (`false`) ou seulement celui du dessus
+/// (`true`).
+#[allow(clippy::too_many_arguments)]
+fn emit_box_layer(
+    out: &mut Vec<EntityVertex>,
+    xf: Mat4,
+    min: [f32; 3],
+    max: [f32; 3],
+    part: Part,
+    light: [f32; 3],
+    tex: Option<(&crate::skin::Skin, usize)>,
+    layer: Option<bool>,
+    lod: usize,
+) {
+    let [x0, y0, z0] = min;
+    let [x1, y1, z1] = max;
+    let lit = EntityVertex::light(light, true);
+    // Nombre de pixels du skin par côté (une boîte agrandie garde 8 pixels : chacun un
+    // peu plus grand).
+    let (w, h, d) = (
+        (x1 - x0).round() as usize,
+        (y1 - y0).round() as usize,
+        (z1 - z0).round() as usize,
+    );
+    let k = [
+        (x1 - x0) / w.max(1) as f32,
+        (y1 - y0) / h.max(1) as f32,
+        (z1 - z0) / d.max(1) as f32,
     ];
+    let faces = box_faces(min, max, [w, h, d]);
     let step = Vec3::from(k);
     for (k, (face, o, du, dv, nu, nv)) in faces.into_iter().enumerate() {
         let (o, du, dv) = (Vec3::from(o), Vec3::from(du) * step, Vec3::from(dv) * step);
@@ -331,6 +344,18 @@ pub enum Held {
     Torch([u8; 3]),
 }
 
+/// Pavés des six parties, dans l'ordre de `parts` et de `Skin::color` (jambe gauche, jambe
+/// droite, corps, bras gauche, bras droit, tête) : coins (pixels, repère de la partie) et
+/// sorte.
+const PARTS: [([f32; 3], [f32; 3], Part); 6] = [
+    ([-2.0, -12.0, -2.0], [2.0, 0.0, 2.0], Part::Leg),
+    ([-2.0, -12.0, -2.0], [2.0, 0.0, 2.0], Part::Leg),
+    ([-4.0, 0.0, -2.0], [4.0, 12.0, 2.0], Part::Body),
+    ([-2.0, -10.0, -2.0], [2.0, 2.0, 2.0], Part::Arm),
+    ([-2.0, -10.0, -2.0], [2.0, 2.0, 2.0], Part::Arm),
+    ([-4.0, 0.0, -4.0], [4.0, 8.0, 4.0], Part::Head),
+];
+
 /// Pavés du modèle dans cette pose : repère (pixels → monde), coins (pixels), partie.
 fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     let mut out = Vec::with_capacity(6);
@@ -347,13 +372,15 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         let xf = base
             * Mat4::from_translation(Vec3::new(side, 12.0, 0.0))
             * Mat4::from_rotation_x(swing * sign);
-        out.push((xf, [-2.0, -12.0, -2.0], [2.0, 0.0, 2.0], Part::Leg));
+        let (min, max, part) = PARTS[out.len()];
+        out.push((xf, min, max, part));
     }
     // Haut du corps : penché vers l'avant quand on s'accroupit (pivot à la hanche).
     let upper = base
         * Mat4::from_translation(Vec3::new(0.0, 12.0 - drop, 0.0))
         * Mat4::from_rotation_x(-lean);
-    out.push((upper, [-4.0, 0.0, -2.0], [4.0, 12.0, 2.0], Part::Body));
+    let (min, max, part) = PARTS[2];
+    out.push((upper, min, max, part));
     // Bras : pivot à l'épaule (y = 22 depuis la hanche : 10), balancement inverse des
     // jambes ; le bras droit (x +6) tient l'objet un peu levé devant lui.
     for (side, sign) in [(-6.0f32, -1.0f32), (6.0, 1.0)] {
@@ -368,13 +395,15 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         let xf = upper
             * Mat4::from_translation(Vec3::new(side, 10.0, 0.0))
             * Mat4::from_rotation_x(swing * sign * swing_k + lean * 0.6 + raise);
-        out.push((xf, [-2.0, -10.0, -2.0], [2.0, 2.0, 2.0], Part::Arm));
+        let (min, max, part) = PARTS[out.len()];
+        out.push((xf, min, max, part));
     }
     // Tête : pivot au cou, suit le regard (tangage), sans suivre la penche du corps.
     let head = base
         * Mat4::from_translation(Vec3::new(0.0, 24.0 - drop * 1.6, -lean * 4.0))
         * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4));
-    out.push((head, [-4.0, 0.0, -4.0], [4.0, 8.0, 4.0], Part::Head));
+    let (min, max, part) = PARTS[5];
+    out.push((head, min, max, part));
     out
 }
 
@@ -700,24 +729,8 @@ pub fn default_head(xf: Mat4, light: [f32; 3], lod: usize) -> Vec<EntityVertex> 
     out
 }
 
-/// Modèle simplifié pour les joueurs lointains d'une foule : chaque partie d'une couleur
-/// unie (216 sommets au lieu de milliers), même pose.
-pub fn build_far(pose: &Pose) -> Vec<EntityVertex> {
-    let mut out = Vec::with_capacity(216);
-    for (xf, min, max, part) in parts(pose) {
-        let c = match part {
-            Part::Head => SKIN,
-            Part::Body => SHIRT,
-            Part::Arm => SKIN_DARK,
-            Part::Leg => PANTS,
-        };
-        let rgb = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
-        emit_item(&mut out, xf, min, max, RayBoxKind::Flat(rgb), pose.light);
-    }
-    out
-}
-
-/// Joueur très loin dans une foule : trois pavés (jambes, corps avec les bras, tête).
+/// Joueur au-delà de ceux que la carte dessine (`MAX_PLAYERS`) : trois pavés (jambes, corps
+/// avec les bras, tête).
 pub fn build_tiny(pose: &Pose) -> Vec<EntityVertex> {
     let mut out = Vec::with_capacity(108);
     let base = Mat4::from_translation(pose.feet)
@@ -743,6 +756,187 @@ pub fn build(pose: &Pose) -> Vec<EntityVertex> {
         let tex = pose.skin.as_deref().map(|s| (s, i));
         emit_box(&mut out, xf, min, max, part, pose.light, tex);
     }
+    for (xf, min, max, kind) in held_parts(pose) {
+        emit_item(&mut out, xf, min, max, kind, pose.light);
+    }
+    out
+}
+
+// (v172) Les autres joueurs sont dessinés par la carte graphique, tous d'un coup : un seul
+// modèle (les six pavés, une face = deux triangles), posé par instance (`instance`) comme
+// `parts` le fait, avec l'image de leur skin cuite par `bake_skin`. Le résultat est celui de
+// `build` (les mêmes pixels, le même ombrage des faces, la même lumière).
+
+/// Taille d'un pavé en pixels du skin.
+fn box_size(min: [f32; 3], max: [f32; 3]) -> [usize; 3] {
+    [0, 1, 2].map(|i| (max[i] - min[i]).round() as usize)
+}
+
+/// Coin en haut à gauche (pixels) de la face `k` de la partie `i` dans l'image cuite d'un
+/// skin (la disposition des skins : chaque partie a sa zone, sans recouvrement).
+fn atlas(i: usize, k: usize, [w, _, d]: [usize; 3]) -> (usize, usize) {
+    let (bx, by) = [(16, 48), (0, 16), (16, 16), (32, 48), (40, 16), (0, 0)][i];
+    match k {
+        0 => (bx + d, by + d),
+        1 => (bx + 2 * d + w, by + d),
+        2 => (bx, by + d),
+        3 => (bx + d + w, by + d),
+        4 => (bx + d, by),
+        _ => (bx + d + w, by),
+    }
+}
+
+/// Modèle commun des autres joueurs (216 sommets), à envoyer une fois à la carte.
+pub fn player_mesh() -> Vec<PlayerVertex> {
+    let mut out = Vec::with_capacity(216);
+    for (i, &(min, max, _)) in PARTS.iter().enumerate() {
+        let size = box_size(min, max);
+        for (k, (_, o, du, dv, nu, nv)) in box_faces(min, max, size).into_iter().enumerate() {
+            let (o, du, dv) = (Vec3::from(o), Vec3::from(du), Vec3::from(dv));
+            let (fx, fy) = atlas(i, k, size);
+            let rect = [
+                fx as f32 / 64.0,
+                fy as f32 / 64.0,
+                (fx + nu) as f32 / 64.0,
+                (fy + nv) as f32 / 64.0,
+            ];
+            let normal = du.cross(dv).normalize().to_array();
+            let corner = |u: usize, v: usize| PlayerVertex {
+                pos: (o + du * u as f32 + dv * v as f32).to_array(),
+                uv: [(fx + u) as f32 / 64.0, (fy + v) as f32 / 64.0],
+                part: i as u32,
+                normal,
+                rect,
+            };
+            let (a, b, c, d) = (corner(0, 0), corner(nu, 0), corner(nu, nv), corner(0, nv));
+            out.extend([a, b, c, c, d, a]);
+        }
+    }
+    out
+}
+
+/// Image d'un skin pour la carte (64 × 64 couleurs linéaires) : chaque pixel de chaque face
+/// à sa couleur dans `build` (le skin, sinon le modèle par défaut ; grain compris, sans
+/// l'ombrage de la face ni la lumière), à sa place dans `player_mesh`.
+pub fn bake_skin(tex: Option<&crate::skin::Skin>) -> Vec<[f32; 3]> {
+    let mut out = vec![[0.0; 3]; 64 * 64];
+    for (i, &(min, max, part)) in PARTS.iter().enumerate() {
+        let size = box_size(min, max);
+        let s = size.map(|n| n as u32);
+        for (k, (face, _, _, _, nu, nv)) in box_faces(min, max, size).into_iter().enumerate() {
+            let (fx, fy) = atlas(i, k, size);
+            for v in 0..nv {
+                for u in 0..nu {
+                    let rgb = tex
+                        .and_then(|t| t.color(i, k, u as u32, v as u32, s))
+                        .unwrap_or_else(|| skin(part, face, u, v, nu));
+                    let g = grain(k * 4096 + v * 64 + u + part as usize * 977);
+                    out[(fy + v) * 64 + fx + u] = srgb(rgb).map(|c| c * g);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Instance d'un autre joueur pour la carte : sa pose, sa lumière et la couche de son skin.
+pub fn instance(pose: &Pose, layer: u32) -> PlayerInstance {
+    let held = if pose.held.is_some() {
+        PlayerInstance::HOLDS
+    } else {
+        0
+    };
+    PlayerInstance {
+        feet: pose.feet.to_array(),
+        yaw: pose.yaw,
+        pitch: pose.pitch,
+        walk: pose.walk,
+        swing: pose.swing,
+        crouch: pose.crouch,
+        light: pose.light.map(|c| c.clamp(0.0, 2.0)),
+        skin: (layer & 0xffff) | held,
+    }
+}
+
+/// Couches de skins des autres joueurs sur la carte : 0 pour le modèle par défaut, les
+/// autres données aux skins vus (le moins récemment vu cède sa place).
+pub struct SkinLayers {
+    /// Couche 1 + i : skin (gardé : son adresse ne peut pas resservir) et dernière image où
+    /// il a servi.
+    slots: Vec<Option<(std::sync::Arc<crate::skin::Skin>, u64)>>,
+    /// Adresse du skin → place dans `slots`.
+    index: std::collections::HashMap<usize, usize>,
+    frame: u64,
+}
+
+impl Default for SkinLayers {
+    fn default() -> Self {
+        Self {
+            slots: vec![None; minelib_render::PLAYER_SKINS as usize - 1],
+            index: Default::default(),
+            frame: 0,
+        }
+    }
+}
+
+impl SkinLayers {
+    /// À chaque image, avant `layer` : le modèle commun et le skin par défaut sont envoyés
+    /// à la carte (la première fois, et à un nouveau renderer, qui n'a encore rien).
+    pub fn begin(&mut self, renderer: &mut minelib_render::Renderer) {
+        self.frame += 1;
+        if !renderer.has_player_mesh() {
+            *self = Self {
+                frame: self.frame,
+                ..Self::default()
+            };
+            renderer.set_player_skin(0, &bake_skin(None));
+            renderer.set_player_mesh(&player_mesh());
+        }
+    }
+
+    /// Couche du skin d'un joueur (cuit et envoyé à la carte la première fois) ; 0 (modèle
+    /// par défaut) sans skin, ou si toutes les couches servent déjà dans cette image.
+    pub fn layer(
+        &mut self,
+        skin: Option<&std::sync::Arc<crate::skin::Skin>>,
+        renderer: &mut minelib_render::Renderer,
+    ) -> u32 {
+        let Some(skin) = skin else {
+            return 0;
+        };
+        let key = std::sync::Arc::as_ptr(skin) as usize;
+        if let Some(&i) = self.index.get(&key) {
+            if let Some(slot) = &mut self.slots[i] {
+                slot.1 = self.frame;
+            }
+            return i as u32 + 1;
+        }
+        let frame = self.frame;
+        let free = self.slots.iter().position(Option::is_none).or_else(|| {
+            self.slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.as_ref().map(|s| (i, s.1)))
+                .filter(|&(_, last)| last != frame)
+                .min_by_key(|&(_, last)| last)
+                .map(|(i, _)| i)
+        });
+        let Some(i) = free else {
+            return 0;
+        };
+        if let Some((old, _)) = self.slots[i].take() {
+            self.index.remove(&(std::sync::Arc::as_ptr(&old) as usize));
+        }
+        renderer.set_player_skin(i as u32 + 1, &bake_skin(Some(skin)));
+        self.slots[i] = Some((skin.clone(), frame));
+        self.index.insert(key, i);
+        i as u32 + 1
+    }
+}
+
+/// Objet tenu seul (le corps est dessiné par la carte : `instance`).
+pub fn held_model(pose: &Pose) -> Vec<EntityVertex> {
+    let mut out = Vec::new();
     for (xf, min, max, kind) in held_parts(pose) {
         emit_item(&mut out, xf, min, max, kind, pose.light);
     }
@@ -783,6 +977,193 @@ pub fn ray_boxes(pose: &Pose) -> Vec<RayBox> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec2;
+
+    /// Repère d'une partie dans la pose d'une instance : `part_matrix` de players.wgsl,
+    /// ligne pour ligne.
+    fn shader_part_matrix(part: u32, p: &PlayerInstance) -> Mat4 {
+        let px = 1.8 / 32.0;
+        let t = |x: f32, y: f32, z: f32| Mat4::from_translation(Vec3::new(x, y, z));
+        let base = Mat4::from_translation(Vec3::from(p.feet))
+            * Mat4::from_rotation_y(-p.yaw)
+            * Mat4::from_scale(Vec3::splat(px));
+        let swing = p.walk.sin() * 0.75 * p.swing;
+        let crouch = p.crouch.clamp(0.0, 1.0);
+        let lean = 0.45 * crouch;
+        let drop = 0.3 / px * crouch * 0.6;
+        let pitch = p.pitch.clamp(-1.4, 1.4);
+        if part == 0 {
+            return base * t(-2.0, 12.0, 0.0) * Mat4::from_rotation_x(swing);
+        }
+        if part == 1 {
+            return base * t(2.0, 12.0, 0.0) * Mat4::from_rotation_x(-swing);
+        }
+        let upper = base * t(0.0, 12.0 - drop, 0.0) * Mat4::from_rotation_x(-lean);
+        if part == 2 {
+            return upper;
+        }
+        if part == 3 {
+            return upper * t(-6.0, 10.0, 0.0) * Mat4::from_rotation_x(-swing + lean * 0.6);
+        }
+        if part == 4 {
+            let (mut raise, mut k) = (0.0, 1.0);
+            if p.skin & 0x10000 != 0 {
+                raise = (0.65 + 0.6 * pitch).clamp(0.0, 2.0);
+                if raise != 0.0 {
+                    k = 0.3;
+                }
+            }
+            return upper
+                * t(6.0, 10.0, 0.0)
+                * Mat4::from_rotation_x(swing * k + lean * 0.6 + raise);
+        }
+        base * t(0.0, 24.0 - drop * 1.6, -lean * 4.0) * Mat4::from_rotation_x(pitch)
+    }
+
+    /// Skin aux pixels pris au hasard, dont des transparents (le modèle par défaut se voit
+    /// dessous), au format récent (les deux calques).
+    fn test_skin() -> std::sync::Arc<crate::skin::Skin> {
+        let mut img = image::RgbaImage::new(64, 64);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let h = (x * 7919 + y * 104_729 + 17).wrapping_mul(2_654_435_761);
+            let a = if h >> 30 == 0 { 0 } else { 255 };
+            *p = image::Rgba([(h >> 4) as u8, (h >> 12) as u8, (h >> 20) as u8, a]);
+        }
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        crate::skin::Skin::from_png(&png).unwrap()
+    }
+
+    /// Poses d'essai : immobile au skin par défaut, en marche avec un skin et une arme, et
+    /// accroupi regardant vers le haut avec un bloc en main.
+    fn test_poses() -> Vec<Pose> {
+        let skin = test_skin();
+        (0..3)
+            .map(|n| Pose {
+                feet: Vec3::new(3.0 + n as f32, 70.0, -5.0),
+                yaw: 0.7 + n as f32 * 2.1,
+                pitch: [-0.5, 0.3, 1.2][n],
+                walk: 1.3 + n as f32,
+                swing: [0.0, 0.8, 0.5][n],
+                crouch: [0.0, 0.6, 1.0][n],
+                // Exactement représentable au format des sommets (k / 127,5).
+                light: [0.8, 0.4, 1.2],
+                held: [
+                    None,
+                    Some(Held::Stick([38, 38, 42])),
+                    Some(Held::Block(BlockId::STONE)),
+                ][n],
+                skin: (n > 0).then(|| skin.clone()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_shared_model_draws_what_build_draws() {
+        let mesh = player_mesh();
+        assert_eq!(mesh.len(), 216);
+        for pose in test_poses() {
+            let baked = bake_skin(pose.skin.as_deref());
+            let inst = instance(&pose, 7);
+            assert_eq!(inst.skin & 0xffff, 7);
+            assert_eq!(inst.skin & PlayerInstance::HOLDS != 0, pose.held.is_some());
+            let cpu = build(&pose);
+            let mut at = 0;
+            for face in mesh.chunks(6) {
+                let [a, b, c, _, d, _] = [0, 1, 2, 3, 4, 5].map(|i| face[i]);
+                let xf = shader_part_matrix(a.part, &inst);
+                let n = xf.transform_vector3(Vec3::from(a.normal)).normalize();
+                let shade = face_shade(n);
+                let (pa, pb, pd) = (Vec3::from(a.pos), Vec3::from(b.pos), Vec3::from(d.pos));
+                let (ua, ub, ud) = (Vec2::from(a.uv), Vec2::from(b.uv), Vec2::from(d.uv));
+                assert_eq!(Vec3::from(c.pos), pb + pd - pa);
+                // Pixels de la face : (b - a) et (d - a) font un pixel de long chacun.
+                let nu = (pb - pa).length().round() as usize;
+                let nv = (pd - pa).length().round() as usize;
+                for v in 0..nv {
+                    for u in 0..nu {
+                        let quad = &cpu[at..at + 6];
+                        at += 6;
+                        let point = |u: f32, v: f32| {
+                            xf.transform_point3(
+                                pa + (pb - pa) * (u / nu as f32) + (pd - pa) * (v / nv as f32),
+                            )
+                        };
+                        for (q, (du, dv)) in [(0, (0.0, 0.0)), (2, (1.0, 1.0))] {
+                            let want = point(u as f32 + du, v as f32 + dv);
+                            let got = Vec3::from(quad[q].pos);
+                            assert!(got.distance(want) < 1e-4, "{got} {want}");
+                        }
+                        // Pixel du skin lu au centre du pixel (et resté dans sa face).
+                        let uv = ua
+                            + (ub - ua) * ((u as f32 + 0.5) / nu as f32)
+                            + (ud - ua) * ((v as f32 + 0.5) / nv as f32);
+                        let r = a.rect;
+                        assert!(uv.x > r[0] && uv.x < r[2] && uv.y > r[1] && uv.y < r[3]);
+                        let texel = baked[(uv.y * 64.0) as usize * 64 + (uv.x * 64.0) as usize];
+                        let want = texel.map(|t| t * shade);
+                        for ch in 0..3 {
+                            assert!(
+                                (quad[0].color[ch] - want[ch]).abs() < 1e-5,
+                                "{:?} {want:?}",
+                                quad[0].color
+                            );
+                            let l = quad[0].light[ch] as f32 / 255.0 * 2.0;
+                            assert!((l - inst.light[ch]).abs() < 1e-6);
+                        }
+                    }
+                }
+            }
+            // Ensuite, l'objet tenu (seul dans `held_model`).
+            assert_eq!(cpu.len() - at, held_model(&pose).len());
+        }
+    }
+
+    #[test]
+    fn the_graphics_card_draws_players_like_the_model() {
+        let mesh = player_mesh();
+        for (n, pose) in test_poses().into_iter().enumerate() {
+            let body = build(&pose);
+            let body = &body[..body.len() - held_model(&pose).len()];
+            let skins = vec![(3, bake_skin(pose.skin.as_deref()))];
+            let players = [instance(&pose, 3)];
+            for view in 0..3 {
+                let a = pose.yaw + [0.4, 2.8, -1.7][view] + n as f32;
+                let target = pose.feet + Vec3::Y * 1.0;
+                let eye = target + Vec3::new(a.sin(), [0.3, 0.6, -0.2][view], a.cos()) * 3.2;
+                let size = 256;
+                let proj = Mat4::perspective_infinite_reverse_rh(60f32.to_radians(), 1.0, 0.05);
+                let vp = proj * Mat4::look_at_rh(eye, target, Vec3::Y);
+                let Some([cpu, gpu]) =
+                    minelib_render::draw_offscreen(vp, size, body, &mesh, &players, &skins)
+                else {
+                    eprintln!("pas de carte graphique : essai sauté");
+                    return;
+                };
+                let (mut covered, mut alone, mut both, mut off) = (0, 0, 0, 0);
+                for (p, q) in cpu.iter().zip(&gpu) {
+                    let (cp, cq) = (p[3] > 0.5, q[3] > 0.5);
+                    covered += usize::from(cp);
+                    alone += usize::from(cp != cq);
+                    if cp && cq {
+                        both += 1;
+                        let d = (0..3).map(|i| (p[i] - q[i]).abs()).fold(0.0, f32::max);
+                        off += usize::from(d > 0.01);
+                    }
+                }
+                eprintln!(
+                    "pose {n}, vue {view} : {covered} pixels, {alone} d'un seul côté, \
+                     {off} de couleur différente"
+                );
+                assert!(covered > 2000, "joueur trop petit à l'écran : {covered}");
+                // Les écarts restants sont aux frontières des pixels du skin (le pixel de
+                // l'écran à cheval prend l'un ou l'autre), et sur les contours.
+                assert!(alone * 100 <= covered, "contours : {alone} sur {covered}");
+                assert!(off * 100 <= both * 4, "couleurs : {off} sur {both}");
+            }
+        }
+    }
 
     #[test]
     fn model_is_player_sized_and_faces_the_look_direction() {

@@ -44,6 +44,7 @@
 mod account;
 mod anticheat;
 mod audio;
+mod bots;
 mod buildnet;
 mod chat;
 mod crowd;
@@ -509,6 +510,7 @@ impl Game {
                 s.sensitivity_fps = self.options.sensitivity_fps;
                 s.fps_color = self.options.fps_color;
                 s.skins.set_mine(self.my_skin.clone());
+                s.pseudo = self.accounts.pseudo();
                 s.volume = self.options.volume;
                 s.voice_volume = self.options.volume_voice;
                 s.set_screens_volume(self.options.volume_screens);
@@ -530,7 +532,8 @@ impl Game {
         if let Some(mut s) = self.session.take() {
             // Partie en ligne : on la quitte ; un invité n'enregistre pas la carte de l'hôte.
             // Partie FPS en ligne : la carte ne change pas (sa signature non plus).
-            let online = s.net.is_some();
+            // (La partie solo contre des bots n'est pas en ligne : le monde s'enregistre.)
+            let online = s.online_match();
             let guest_build = s.build.as_ref().is_some_and(|b| !b.is_owner());
             if online || s.build.is_some() {
                 self.accounts.room(minelib_net::client::Cmd::Leave);
@@ -1088,7 +1091,7 @@ impl Game {
                     let online = self
                         .session
                         .as_ref()
-                        .is_some_and(|s| s.net.is_some() || s.build.is_some());
+                        .is_some_and(|s| s.online_match() || s.build.is_some());
                     if online {
                         self.leave_world();
                         self.notify("L'hôte a fermé la partie.".to_string());
@@ -1236,7 +1239,7 @@ impl Game {
         let playing = self.options.garant
             && self.accounts.logged_in()
             && self.session.as_ref().is_some_and(|s| {
-                (s.net.is_some() && s.game.mode == save::GameMode::Fps) || s.build.is_some()
+                (s.online_match() && s.game.mode == save::GameMode::Fps) || s.build.is_some()
             });
         // (v146) En veille, pas de connexion de garant au relais du monde (elle a été fermée
         // avec la nôtre, sauf si elle tenait un relais). (v147) Si son pays appelle ce joueur,
@@ -2290,7 +2293,7 @@ impl Game {
         let online = self
             .session
             .as_ref()
-            .is_some_and(|s| s.net.is_some() || s.build.as_ref().is_some_and(|b| !b.is_owner()));
+            .is_some_and(|s| s.online_match() || s.build.as_ref().is_some_and(|b| !b.is_owner()));
         let label = if online {
             "Quitter la partie"
         } else {
@@ -3351,7 +3354,8 @@ impl GameLoop for Game {
         self.updater.poll(!self.played);
         // Partie FPS en ligne commencée : notée (pas de mise à jour, ni par le jeu ni par
         // le lanceur, avant sa fin) ; finie : oubliée.
-        if let Some(n) = self.session.as_ref().and_then(|s| s.net.as_ref()) {
+        let net = self.session.as_ref().and_then(|s| s.net.as_ref());
+        if let Some(n) = net.filter(|n| !n.is_solo()) {
             if n.in_progress() && self.updater.hold.is_none() {
                 update::write_match_lock(&self.paths.root);
                 self.updater.hold = Some(update::VERSION);

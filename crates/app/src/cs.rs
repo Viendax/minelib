@@ -1229,6 +1229,17 @@ impl Match {
         }
     }
 
+    /// (v172) Partie solo contre des bots : tout le monde est là, elle commence tout de
+    /// suite (sans les 10 s d'attente de l'échauffement).
+    pub fn start_now(&mut self) -> Vec<Ev> {
+        let mut ev = Vec::new();
+        if self.phase == phase::WARMUP {
+            self.countdown = false;
+            self.start(&mut ev);
+        }
+        ev
+    }
+
     /// Début de la partie : statistiques à zéro, 800 $, manche 1.
     fn start(&mut self, ev: &mut Vec<Ev>) {
         for p in self.players.values_mut() {
@@ -1423,7 +1434,7 @@ impl Match {
                     self.map
                         .sites
                         .iter()
-                        .position(|s| s.is_some_and(|z| z.contains(pl.feet.to_array())))
+                        .position(|s| s.is_some_and(|z| z.holds(pl.feet.to_array())))
                         .filter(|_| pl.on_ground && pl.speed < 0.6)
                 });
                 // Sans site défini, on pose n'importe où.
@@ -2073,6 +2084,11 @@ impl Match {
             self.phase,
             phase::FREEZE | phase::HALFTIME | phase::GAME_OVER
         )
+    }
+
+    /// (v172) Désamorçage en cours : par qui, et depuis combien de temps (s).
+    pub fn defusing(&self) -> Option<(u64, f32)> {
+        self.defuser.map(|d| (d, self.defuse_progress))
     }
 
     /// En train de poser ou de désamorcer : immobile aussi (comme CS).

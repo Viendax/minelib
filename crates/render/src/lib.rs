@@ -31,7 +31,11 @@ pub mod viewmodel;
 
 pub use capture::Screenshot;
 
-pub use entity::{EntityVertex, FLAME as ENTITY_FLAME};
+#[doc(hidden)]
+pub use entity::draw_offscreen;
+pub use entity::{
+    EntityVertex, PlayerInstance, PlayerVertex, FLAME as ENTITY_FLAME, MAX_PLAYERS, PLAYER_SKINS,
+};
 pub use latency::{LowLatencyKind, Marker};
 pub use lights::{
     bounding_sphere, DynKind, DynLight, DynSettings, DynState, DynStats, GoboImage, GOBO_SIZE,
@@ -481,6 +485,9 @@ pub struct FrameParams<'a> {
     /// triangles, version) ; chaque lot n'est renvoyé à la carte graphique que quand sa
     /// version change.
     pub static_entities: &'a [(u64, &'a [EntityVertex], u64)],
+    /// (v172) Les autres joueurs : un modèle commun (`Renderer::set_player_mesh`) posé et
+    /// éclairé par instance, avec leur skin (`Renderer::set_player_skin`).
+    pub players: &'a [PlayerInstance],
     /// Torche tenue en main : couleur (sRGB) et portée en blocs.
     pub held_light: Option<([u8; 3], f32)>,
     /// Flamme de la torche tenue (bout de la torche dans la main du modèle du joueur) ;
@@ -1360,6 +1367,23 @@ impl Renderer {
         }
     }
 
+    /// (v172) Modèle commun des autres joueurs (une fois au départ).
+    pub fn set_player_mesh(&mut self, vertices: &[PlayerVertex]) {
+        self.entities.set_player_mesh(&self.queue, vertices);
+    }
+
+    /// (v172) Le modèle commun des autres joueurs a été envoyé (à ce renderer : un nouveau
+    /// n'a encore ni modèle ni skins).
+    pub fn has_player_mesh(&self) -> bool {
+        self.entities.has_player_mesh()
+    }
+
+    /// (v172) Skin (64 × 64 couleurs linéaires, cuit par le jeu) de la couche `layer` des
+    /// autres joueurs (`PLAYER_SKINS` couches).
+    pub fn set_player_skin(&mut self, layer: u32, rgb: &[[f32; 3]]) {
+        self.entities.set_player_skin(&self.queue, layer, rgb);
+    }
+
     fn world_group(&self) -> &wgpu::BindGroup {
         &self.bind_groups[self.refl.latest]
     }
@@ -2227,6 +2251,7 @@ impl Renderer {
         self.viewmodel.prepare_arm(&self.queue, p.arm);
         self.entities
             .prepare(&self.queue, p.entities, p.entities_follow);
+        self.entities.prepare_players(&self.queue, p.players);
         self.entities
             .prepare_static(&self.device, &self.queue, p.static_entities);
         self.smokes
@@ -2418,6 +2443,7 @@ impl Renderer {
         self.viewmodel.prepare_arm(&self.queue, p.arm);
         self.entities
             .prepare(&self.queue, p.entities, p.entities_follow);
+        self.entities.prepare_players(&self.queue, p.players);
         self.entities
             .prepare_static(&self.device, &self.queue, p.static_entities);
         self.smokes
@@ -3070,6 +3096,14 @@ mod tests {
             (
                 "entity (sans lumières)",
                 lights::without_dynlights(include_str!("shaders/entity.wgsl")),
+            ),
+            (
+                "joueurs",
+                lights::without_dynlights(&format!(
+                    "{}\n{}",
+                    include_str!("shaders/entity.wgsl"),
+                    include_str!("shaders/players.wgsl")
+                )),
             ),
             (
                 "volumetric",
