@@ -54,16 +54,23 @@ struct TaaOut {
     @location(1) motion: vec2<f32>,
 };
 
-// Fixé dans le monde : il bouge à l'écran comme les blocs (même calcul que les entités
-// fixes), sinon l'anticrénelage le fait traîner.
+// L'image d'un écran change sans que l'écran bouge : l'anticrénelage temporel, qui garde
+// longtemps l'historique d'un pixel immobile, laisserait des images rémanentes. Un
+// mouvement « hors de l'écran » lui fait prendre l'image courante seule (aucun autre
+// passage ne lit les mouvements). Le décalage sous-pixel de l'anticrénelage (différence
+// entre `view_proj` et `cur_view_proj`) est annulé en lisant la vidéo : sans historique
+// pour le moyenner, elle tremblerait.
+const NO_HISTORY = vec2<f32>(30000.0, 30000.0);
+
 @fragment
 fn fs_taa_world(i: VOut) -> TaaOut {
     var o: TaaOut;
-    o.color = texel(i);
     let p = vec4<f32>(i.world, 1.0);
+    let jit = g.view_proj * p;
     let cur = g.cur_view_proj * p;
-    let prev = g.prev_view_proj * p;
-    let d = prev.xy / prev.w - cur.xy / cur.w;
-    o.motion = d * vec2<f32>(0.5, -0.5) * g.screen.xy;
+    let off = (jit.xy / jit.w - cur.xy / cur.w) * vec2<f32>(0.5, -0.5) * g.screen.xy;
+    let uv = i.uv + dpdx(i.uv) * off.x + dpdy(i.uv) * off.y;
+    o.color = vec4<f32>(textureSampleLevel(vid, vid_s, uv, 0.0).rgb, 1.0);
+    o.motion = NO_HISTORY;
     return o;
 }
