@@ -49,7 +49,7 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 - **Ombres des joueurs** au soleil et devant la lumière la plus proche (torche, lanterne).
 - **Minimap** en haut à droite : tes coéquipiers toujours, les adversaires seulement quand ils sont repérés, les sites de bombe et la bombe quand ton équipe la connaît.
 - **Réseau à 256 Hz** : positions envoyées 256 fois par seconde, prédiction et rembobinage des tirs. À 10 joueurs, l'hôte envoie moins de 1 Mo par seconde.
-- **Entraîne-toi contre des bots** : en mode FPS dans un monde solo, la carte se remplit de bots qui achètent, se battent en équipe, posent et désamorcent la bombe. Trois niveaux : `/bots facile` (par défaut), `/bots normal`, `/bots difficile` ; `/bots off` pour jouer seul. En spectateur (`/gm 3`), la partie continue sans toi, et `/gm fps` t'y remet tout de suite. Chaque bot a son skin, dessiné pour lui aux couleurs de son équipe (tenues de terrain côté T, tenue d'intervention côté CT).
+- **Entraîne-toi contre des bots** : en mode FPS dans un monde solo, la carte se remplit de bots qui achètent, se battent en équipe, posent et désamorcent la bombe. Trois niveaux : `/bots facile` (par défaut), `/bots normal`, `/bots difficile` ; `/bots off` pour jouer seul, `/bots on` pour les rappeler. En spectateur (`/gm 3`), la partie continue sans toi, et `/gm fps` t'y remet tout de suite. Chaque bot a son skin, dessiné pour lui aux couleurs de son équipe (tenues de terrain côté T, tenue d'intervention côté CT).
 
 ### Jouer en ligne
 
@@ -122,8 +122,8 @@ Dans ton monde en créatif, sélectionne une zone avec la baguette (`//wand`), p
 | `/fps set spawn ct` · `/fps set spawn t` | Zone de départ des CT / des T |
 | `/fps set site a` · `b` · `c` | Site de bombe |
 | `/fps set maxplayer <n>` | Nombre de joueurs, toujours pair (2 à 20 ; 10 = classé) |
-| `/fps set door true\|false` | Portes et trappes utilisables en partie (touche *Utiliser*, avec leur bruit) |
-| `/fps set doorsync true\|false` | Double porte : ouvrir un battant ouvre aussi l'autre |
+| `/fps set door on\|off` | Portes et trappes utilisables en partie (touche *Utiliser*, avec leur bruit) |
+| `/fps set doorsync on\|off` | Double porte : ouvrir un battant ouvre aussi l'autre |
 | `/fps info` · `/fps clear …` | Voir ou effacer les réglages |
 
 Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aussi). Ta carte est partagée avec tout le monde dès que tu lances une partie dessus.
@@ -197,7 +197,7 @@ Les touches sont **physiques** (même place en AZERTY et en QWERTY) et se règle
 <details>
 <summary><b>Commandes du tchat</b></summary>
 
-Le tchat se navigue avec ← → (Début, Fin, Suppr).
+Le tchat se navigue avec ← → (Début, Fin, Suppr). Partout où une commande attend oui ou non, au choix : `on`/`off`, `true`/`false`, `1`/`0` ou `oui`/`non`.
 
 | Commande | Effet |
 |----------|-------|
@@ -208,7 +208,7 @@ Le tchat se navigue avec ← → (Début, Fin, Suppr).
 | `/ami <pseudo>` · `/ami retirer <pseudo>` · `/amis` | Amis (aussi `/friend add <pseudo>`) |
 | `/equipe ct` · `/equipe t` | Changer d'équipe pendant l'échauffement (aussi `/team`) |
 | `/op` · `/deop` · `/ban` · `/unban` | Gérer son serveur de construction |
-| `/timeset <heure\|default>` · `/timefix true\|false` | Régler / arrêter l'heure (`11`, `11.20`, `11:20`, `11h20` ; `default` : soleil de Dust2, immobile ; OP en ligne) |
+| `/timeset <heure\|default>` · `/timefix on\|off` | Régler / arrêter l'heure (`11`, `11.20`, `11:20`, `11h20` ; `default` : soleil de Dust2, immobile ; OP en ligne) |
 | `/fps set time [heure\|default]` | Heure fixe d'une carte FPS (par défaut le soleil de Dust2) |
 | `/worldname <nom>` | Renommer le monde |
 | `/lumieres` · `/lumieres effacer` | Ouvrir l'éditeur de lumières, ou retirer toutes les lumières du monde |

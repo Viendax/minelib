@@ -4326,12 +4326,13 @@ impl Session {
                     return true;
                 }
                 let sub = words.get(1).map(|w| w.to_lowercase()).unwrap_or_default();
-                let action = match sub.as_str() {
-                    "on" | "activer" => proto::SERVER_WL_ON,
-                    "off" | "desactiver" | "désactiver" => proto::SERVER_WL_OFF,
-                    "add" | "ajouter" => proto::SERVER_WL_ADD,
-                    "remove" | "retirer" | "del" => proto::SERVER_WL_REMOVE,
-                    "list" | "liste" | "" => proto::SERVER_WL_LIST,
+                // (v195) on/off, true/false, 1/0, oui/non (`chat::switch`).
+                let action = match (sub.as_str(), chat::switch(&sub)) {
+                    ("activer", _) | (_, Some(true)) => proto::SERVER_WL_ON,
+                    ("desactiver" | "désactiver", _) | (_, Some(false)) => proto::SERVER_WL_OFF,
+                    ("add" | "ajouter", _) => proto::SERVER_WL_ADD,
+                    ("remove" | "retirer" | "del", _) => proto::SERVER_WL_REMOVE,
+                    ("list" | "liste" | "", _) => proto::SERVER_WL_LIST,
                     _ => {
                         self.chat.say(
                             "Usage : /whitelist on | off | add <pseudo> | remove <pseudo> | list",
@@ -4422,7 +4423,7 @@ impl Session {
     fn fps_command(&mut self, args: &[&str]) {
         use minelib_net::game::Zone;
         const USAGE: &str = "Usage : /fps set spawn ct | spawn t | site a | site b | site c \
-                             (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door true|false, /fps set doorsync true|false, /fps clear …, \
+                             (sélection à la baguette), /fps set maxplayer 2-20 (pair), /fps set door on|off, /fps set doorsync on|off, /fps clear …, \
                              /fps info";
         if self.net.is_some() {
             let msg = if self.online_match() {
@@ -4549,19 +4550,15 @@ impl Session {
                 Some("doorsync" | "doublesdoors" | "doubledoor" | "portesdoubles")
             )
         {
-            let on = match lower.get(2).map(String::as_str) {
-                Some("true" | "on" | "oui" | "1") => true,
-                Some("false" | "off" | "non" | "0") => false,
-                _ => {
-                    self.chat.say(
-                        format!(
-                            "Usage : /fps set doorsync true|false (actuellement : {}).",
-                            map.door_sync()
-                        ),
-                        chat::GREY,
-                    );
-                    return;
-                }
+            let Some(on) = lower.get(2).map(String::as_str).and_then(chat::switch) else {
+                self.chat.say(
+                    format!(
+                        "Usage : /fps set doorsync on|off (actuellement : {}).",
+                        on_off(map.door_sync())
+                    ),
+                    chat::GREY,
+                );
+                return;
             };
             map.set_door_sync(on);
             match crate::fpsmap::save(&self.dir, &map) {
@@ -4586,19 +4583,15 @@ impl Session {
                 Some("door" | "doors" | "porte" | "portes")
             )
         {
-            let on = match lower.get(2).map(String::as_str) {
-                Some("true" | "on" | "oui" | "1") => true,
-                Some("false" | "off" | "non" | "0") => false,
-                _ => {
-                    self.chat.say(
-                        format!(
-                            "Usage : /fps set door true|false (actuellement : {}).",
-                            map.doors()
-                        ),
-                        chat::GREY,
-                    );
-                    return;
-                }
+            let Some(on) = lower.get(2).map(String::as_str).and_then(chat::switch) else {
+                self.chat.say(
+                    format!(
+                        "Usage : /fps set door on|off (actuellement : {}).",
+                        on_off(map.doors())
+                    ),
+                    chat::GREY,
+                );
+                return;
             };
             map.set_doors(on);
             match crate::fpsmap::save(&self.dir, &map) {
@@ -4735,14 +4728,19 @@ impl Session {
         let name = parts.next().unwrap_or("").to_lowercase();
         let arg = parts.next();
         match name.as_str() {
+            // Vol en survie : (v195) /fly on|off, ou /fly seul pour basculer.
             "fly" => {
+                let want = arg.map(chat::switch);
                 if self.game.mode == GameMode::Creative {
                     self.chat.say(
                         "En créatif le vol est toujours permis : appuyez deux fois sur Espace.",
                         chat::GREY,
                     );
+                } else if want == Some(None) {
+                    self.chat
+                        .say("Utilisation : /fly [on|off] (seul : bascule).", chat::RED);
                 } else {
-                    self.game.can_fly = !self.game.can_fly;
+                    self.game.can_fly = want.flatten().unwrap_or(!self.game.can_fly);
                     if !self.game.can_fly && self.player.flying {
                         self.player.flying = false;
                     }
@@ -4785,17 +4783,17 @@ impl Session {
                 }
             }
             // (v165, essai) Foule simulée en solo : (v185) `/npc stresstest true|false`,
-            // éteinte par défaut.
+            // éteinte par défaut ; (v195) aussi on/off, 1/0, oui/non.
             "npc" => {
                 let sub = arg.map(str::to_lowercase);
-                let value = parts.next().map(str::to_lowercase);
-                match (sub.as_deref(), value.as_deref()) {
-                    (Some("stresstest"), Some("false" | "off" | "0")) => {
+                let value = parts.next().and_then(chat::switch);
+                match (sub.as_deref(), value) {
+                    (Some("stresstest"), Some(false)) => {
                         self.crowd_on = false;
                         self.crowd = None;
                         self.chat.say("Essai de foule arrêté.", chat::YELLOW);
                     }
-                    (Some("stresstest"), Some("true" | "on" | "1")) => {
+                    (Some("stresstest"), Some(true)) => {
                         self.crowd_on = true;
                         self.crowd = None;
                         self.chat.say(
@@ -4809,16 +4807,12 @@ impl Session {
                     }
                     _ => self
                         .chat
-                        .say("Utilisation : /npc stresstest <true|false>", chat::RED),
+                        .say("Utilisation : /npc stresstest <on|off>", chat::RED),
                 }
             }
             // Compensation du retard mesuré de la touche « avancer » (voir `keycomp`).
             "compense" | "compensation" => {
-                let want = match arg {
-                    Some("on" | "oui" | "1") => Some(true),
-                    Some("off" | "non" | "0") => Some(false),
-                    _ => None,
-                };
+                let want = arg.and_then(chat::switch);
                 let text = match (self.key_lag, want) {
                     (None, _) => "Aucun retard mesuré : fais d'abord /testtouche avec ta touche \
                                   avancer."
@@ -4862,11 +4856,10 @@ impl Session {
             // Touche « avancer » qui remonte mal : règle forcée, refusée ou apprise.
             "touchelente" | "slowkey" => {
                 use crate::stick::Mode;
-                let mode = match arg {
-                    Some("on" | "oui" | "1") => Some(Mode::On),
-                    Some("off" | "non" | "0") => Some(Mode::Off),
+                let mode = match arg.map(str::to_lowercase).as_deref() {
                     Some("auto") => Some(Mode::Auto),
-                    _ => None,
+                    Some(w) => chat::switch(w).map(|on| if on { Mode::On } else { Mode::Off }),
+                    None => None,
                 };
                 match mode {
                     Some(m) => {
@@ -4888,9 +4881,11 @@ impl Session {
                         .say("Utilisation : /touchelente <on|off|auto>", chat::RED),
                 }
             }
-            // (v172) Partie contre des bots (mode FPS en solo) : retirer, refaire.
+            // (v172) Partie contre des bots (mode FPS en solo) : retirer, refaire. (v195) Arrêt :
+            // off, false, 0, non ou stop ; lancement : rien, on, true, 1 ou oui. Les niveaux
+            // se donnent par leur nom (0 et 1 veulent dire arrêt et lancement).
             "bots" | "bot" => match arg.map(str::to_lowercase).as_deref() {
-                Some("off" | "stop" | "non") => {
+                Some(w) if w == "stop" || chat::switch(w) == Some(false) => {
                     self.bots_auto = false;
                     if self.net.as_ref().is_some_and(|n| n.is_solo()) {
                         self.stop_bots();
@@ -4915,6 +4910,10 @@ impl Session {
                         self.bots_auto = true;
                     }
                 }
+                Some(w) if chat::switch(w) != Some(true) => self.chat.say(
+                    "Utilisation : /bots [on|off|facile|normal|difficile]",
+                    chat::RED,
+                ),
                 _ => {
                     if self.game.mode != GameMode::Fps {
                         self.chat
@@ -5049,19 +5048,15 @@ impl Session {
             }
             // Arrête ou relance le temps qui passe.
             "timefix" => {
-                let fixed = match arg.map(str::to_lowercase).as_deref() {
-                    Some("true" | "on" | "oui" | "1") => true,
-                    Some("false" | "off" | "non" | "0") => false,
-                    _ => {
-                        self.chat.say(
-                            format!(
-                                "Utilisation : /timefix true|false (actuellement : {}).",
-                                self.time_fixed
-                            ),
-                            chat::RED,
-                        );
-                        return;
-                    }
+                let Some(fixed) = arg.and_then(chat::switch) else {
+                    self.chat.say(
+                        format!(
+                            "Utilisation : /timefix on|off (actuellement : {}).",
+                            on_off(self.time_fixed)
+                        ),
+                        chat::RED,
+                    );
+                    return;
                 };
                 if self.build.is_some() {
                     self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
@@ -5140,11 +5135,11 @@ impl Session {
             "help" | "aide" | "?" => {
                 for l in [
                     "/gm (ou /gamemode) <0|1|2|3> : survie, créatif, fps, spectateur",
-                    "/fly : autorise ou interdit le vol en survie",
+                    "/fly [on|off] : autorise ou interdit le vol en survie",
                     "/heal : rend tous les coeurs",
                     "/worldname <nom> : renomme le monde",
                     "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
-                    "/timefix true|false : arrête ou relance le temps",
+                    "/timefix on|off : arrête ou relance le temps",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
                     "/give petit_ecran | grand_ecran | ecran_geant : les autres tailles d'écran",
                     "/give tête <pseudo> [nombre] : la tête d'un joueur, avec son skin",
@@ -5153,6 +5148,7 @@ impl Session {
                     "Vol : deux appuis rapides sur Espace",
                     "Mode FPS : clic molette = ping (pas d'inventaire ni de blocs)",
                     "Spectateur (/gm 3) : vol forcé, on traverse les blocs",
+                    "Oui ou non dans une commande : on/off, true/false, 1/0 ou oui/non, au choix",
                 ] {
                     self.chat.say(l, chat::GREY);
                 }
@@ -6871,6 +6867,15 @@ fn same_family(a: BlockId, b: BlockId) -> bool {
             k1 == k2
         }
         _ => false,
+    }
+}
+
+/// (v195) Un réglage oui/non tel que les commandes l'écrivent.
+fn on_off(b: bool) -> &'static str {
+    if b {
+        "on"
+    } else {
+        "off"
     }
 }
 

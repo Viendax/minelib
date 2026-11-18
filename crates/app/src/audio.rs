@@ -504,6 +504,36 @@ pub fn voice(who: u64, samples: Vec<i16>, volume: f32) {
 mod tests {
     use super::*;
 
+    /// (v195) Le plongeon part dès qu'on touche l'eau : au-dessus du dixième de sa crête
+    /// (−20 dB) dans les 20 premières millisecondes, son gros (−12 dB) dans les 60. Avant,
+    /// le gros du plouf n'arrivait qu'à 0,19 s : entendu 0,2 s trop tard.
+    #[test]
+    fn the_splash_starts_at_once() {
+        let bytes = FILES.iter().find(|x| x.0 == "splash").unwrap().1;
+        let dec = Decoder::new(Cursor::new(bytes)).unwrap();
+        let per_ms = dec.sample_rate() as usize * dec.channels() as usize / 1000;
+        let s: Vec<f32> = dec.map(f32::from).collect();
+        let peak = s.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let first_ms = |db: f32| {
+            let level = peak * 10f32.powf(db / 20.0);
+            s.chunks(per_ms * 5)
+                .position(|c| {
+                    (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32).sqrt() > level
+                })
+                .map(|k| k * 5)
+        };
+        assert!(
+            first_ms(-20.0).is_some_and(|t| t <= 20),
+            "{:?}",
+            first_ms(-20.0)
+        );
+        assert!(
+            first_ms(-12.0).is_some_and(|t| t <= 60),
+            "{:?}",
+            first_ms(-12.0)
+        );
+    }
+
     #[test]
     fn every_weapon_has_its_sounds() {
         for (i, d) in WEAPONS.iter().enumerate() {

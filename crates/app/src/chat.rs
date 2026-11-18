@@ -17,6 +17,16 @@ const MAX_INPUT: usize = 256;
 /// Zone cliquable : (x, y, largeur, hauteur, lien).
 type Hit = (f32, f32, f32, f32, PathBuf);
 
+/// (v195) Oui ou non dans une commande, au choix : `on`/`off`, `true`/`false`, `1`/`0` ou
+/// `oui`/`non`, en majuscules ou non. `None` : autre chose.
+pub fn switch(word: &str) -> Option<bool> {
+    match word.to_lowercase().as_str() {
+        "on" | "true" | "1" | "oui" => Some(true),
+        "off" | "false" | "0" | "non" => Some(false),
+        _ => None,
+    }
+}
+
 pub struct Chat {
     pub open: bool,
     input: String,
@@ -384,6 +394,23 @@ fn wrap(text: &str, s: f32, max_w: f32) -> Vec<String> {
         out.push(line);
     }
     out
+}
+
+#[cfg(test)]
+mod switch_tests {
+    /// (v195) Toutes les façons d'écrire oui ou non, et rien d'autre.
+    #[test]
+    fn on_off_true_false_one_zero() {
+        for w in ["on", "ON", "true", "True", "1", "oui"] {
+            assert_eq!(super::switch(w), Some(true), "{w}");
+        }
+        for w in ["off", "Off", "false", "FALSE", "0", "non"] {
+            assert_eq!(super::switch(w), Some(false), "{w}");
+        }
+        for w in ["", "2", "auto", "stop", "facile", "onn"] {
+            assert_eq!(super::switch(w), None, "{w}");
+        }
+    }
 }
 
 #[cfg(test)]

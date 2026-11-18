@@ -36,7 +36,8 @@ Grenades et couteau :
     (DoorOpen08 et DoorClose09, raccourcis et égalisés).
   splash.ogg (plongeon dans l'eau) — « water splash and sand footsteps » (Peludo), CC0
     https://opengameart.org/content/water-splash-and-sand-footsteps
-    (splash1 et splash2 mêlés, baissés d'environ une quarte pour un corps entier, compressés).
+    (splash1 et splash2 mêlés, baissés d'environ une quarte pour un corps entier, compressés ;
+    v195 : les 0,175 premières secondes retirées, le plouf part dès qu'on touche l'eau).
   knife_swing.ogg, knife_swing2.ogg (tube-plastic-whoosh), knife_hit.ogg (apple-cut et
     sword-knife-clash), draw_nade.ogg (cloth-pouch-shake) — « Fantasy Sound Effects
     (Tinysized SFX) » et « Fantasy Weapons and Apparel SFX Library » (Jan Schupke /

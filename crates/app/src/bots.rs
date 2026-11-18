@@ -58,12 +58,13 @@ pub fn save_level(level: u8) {
     }
 }
 
-/// Niveau d'après son nom (français ou anglais).
+/// Niveau d'après son nom (français ou anglais). (v195) Plus par un chiffre : `/bots 0` et
+/// `/bots 1` arrêtent et lancent les bots, comme off et on.
 pub fn level_named(s: &str) -> Option<u8> {
     match s.to_lowercase().as_str() {
-        "facile" | "easy" | "0" => Some(0),
-        "normal" | "moyen" | "1" => Some(1),
-        "difficile" | "dur" | "hard" | "2" => Some(2),
+        "facile" | "easy" => Some(0),
+        "normal" | "moyen" => Some(1),
+        "difficile" | "dur" | "hard" => Some(2),
         _ => None,
     }
 }
