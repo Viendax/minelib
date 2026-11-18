@@ -10688,6 +10688,260 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// (v148) Mesure à la main : ce que coûte un pays au PC de son hôte. Ses provinces (une
+    /// région chacune, cent joueurs) renouvellent leur bail toutes les 300 ms en disant leurs
+    /// joueurs ; un joueur sur deux cents change de province chaque seconde ; son entretien
+    /// (`tick`) passe à chaque bail. Calcul pour une seconde de jeu.
+    /// `cargo test --release -p minelib-relay charge_pays -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn charge_pays() {
+        let sizes: Vec<usize> = std::env::var("MINELIB_CHARGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(vec![1024, 4096], |n| vec![n]);
+        for kids in sizes {
+            let (h, dir) = crowd_world("pays");
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            let side = (kids as f64).sqrt().ceil() as i32;
+            let root = SigningKey::from_bytes(&[3; 32]).verifying_key().to_bytes();
+            let info = proto::StandbyInfo {
+                name: "Monde".into(),
+                map: "monde".into(),
+                map_sig: [6; 32],
+                max_players: 0,
+                creator: "Createur".into(),
+                server: servers::key("Createur", "monde"),
+                owner: "Createur".into(),
+            };
+            assert!(provinces::begin(
+                st,
+                42,
+                [0, 0],
+                side,
+                5,
+                [7; 32],
+                root,
+                info,
+                Default::default(),
+                false,
+                Some(proto::Nest { size: 1, from: 3 }),
+                Vec::new(),
+            ));
+            provinces::test_serving(st, 42);
+            let mut hosts = Vec::new();
+            for k in 0..kids {
+                let p = [k as i32 % side, k as i32 / side];
+                let id = crowd.conn(st, &format!("Hote{k}"), true);
+                st.conns.get_mut(&id).unwrap().room = Some(42);
+                let epoch = provinces::test_child(st, 42, p, id);
+                hosts.push((p, id, epoch));
+            }
+            // (v149) Cent joueurs dans chaque province, dits au pays à leur premier bail : il
+            // sait où est chacun.
+            let mut names: Vec<Vec<String>> = (0..kids)
+                .map(|i| (0..100).map(|k| format!("j{i}-{k}")).collect())
+                .collect();
+            for (i, &(p, id, epoch)) in hosts.iter().enumerate() {
+                crowd.ask(
+                    st,
+                    id,
+                    Request::ProvinceLease {
+                        room: 42,
+                        province: p,
+                        epoch,
+                        t: now_ms(),
+                        counts: vec![(p, 100)],
+                        inside: Vec::new(),
+                        followed: true,
+                        wants: Vec::new(),
+                        children: None,
+                        arrived: names[i].clone(),
+                        left: Vec::new(),
+                        seq: 0,
+                    },
+                );
+                let _ = crowd.got(id);
+            }
+            let known = provinces::test_known(st, 42);
+            let rounds = 20;
+            let (mut lease_t, mut tick_t) = (Duration::ZERO, Duration::ZERO);
+            for round in 0..rounds {
+                // (Un joueur sur deux cents passe chaque seconde dans la province voisine :
+                // 0,15 par province et par bail.)
+                let mut moves: Vec<(Vec<String>, Vec<String>)> = vec![Default::default(); kids];
+                for i in 0..kids {
+                    if (i + round) % 7 == 0 {
+                        let j = (i + 1) % kids;
+                        if let Some(w) = names[i].pop() {
+                            moves[i].1.push(w.clone());
+                            moves[j].0.push(w.clone());
+                            names[j].push(w);
+                        }
+                    }
+                }
+                let t = Instant::now();
+                for (i, &(p, id, epoch)) in hosts.iter().enumerate() {
+                    let (arrived, left) = std::mem::take(&mut moves[i]);
+                    crowd.ask(
+                        st,
+                        id,
+                        Request::ProvinceLease {
+                            room: 42,
+                            province: p,
+                            epoch,
+                            t: now_ms(),
+                            counts: vec![(p, 100)],
+                            inside: Vec::new(),
+                            followed: true,
+                            wants: Vec::new(),
+                            children: None,
+                            arrived,
+                            left,
+                            seq: 0,
+                        },
+                    );
+                }
+                lease_t += t.elapsed();
+                let t = Instant::now();
+                let _ = provinces::tick(st);
+                tick_t += t.elapsed();
+                for &(_, id, _) in &hosts {
+                    let _ = crowd.got(id);
+                }
+            }
+            let per_lease = lease_t / (rounds * kids) as u32;
+            let per_s = (lease_t + tick_t).as_secs_f64() / (rounds as f64 * 0.3);
+            // Taille d'un bail et de sa réponse (sans le chiffrement : 16 octets de plus).
+            let (p, id, epoch) = hosts[0];
+            let ask = postcard::to_allocvec(&Request::ProvinceLease {
+                room: 42,
+                province: p,
+                epoch,
+                t: now_ms(),
+                counts: vec![(p, 100)],
+                inside: Vec::new(),
+                followed: true,
+                wants: Vec::new(),
+                children: None,
+                arrived: Vec::new(),
+                left: Vec::new(),
+                seq: 1 << 40,
+            })
+            .unwrap()
+            .len();
+            crowd.ask(
+                st,
+                id,
+                Request::ProvinceLease {
+                    room: 42,
+                    province: p,
+                    epoch,
+                    t: now_ms(),
+                    counts: vec![(p, 100)],
+                    inside: Vec::new(),
+                    followed: true,
+                    wants: Vec::new(),
+                    children: None,
+                    arrived: Vec::new(),
+                    left: Vec::new(),
+                    seq: 0,
+                },
+            );
+            let answer = crowd
+                .got(id)
+                .0
+                .iter()
+                .find(|r| matches!(r, Response::ProvinceLeased { .. }))
+                .map_or(0, |r| postcard::to_allocvec(r).unwrap().len());
+            let mbit = |bytes: usize| (bytes + 20) as f64 * kids as f64 / 0.3 * 8.0 / 1e6;
+            eprintln!(
+                "  bail {ask} octets, réponse {answer} octets : {:.1} Mbit/s reçus, {:.1} Mbit/s \
+                 envoyés",
+                mbit(ask),
+                mbit(answer)
+            );
+            eprintln!(
+                "pays de {kids} provinces ({} joueurs, {known} connus du pays) : {per_lease:?} \
+                 par bail, entretien {:?}, {per_s:.3} s de calcul par seconde de jeu",
+                kids * 100,
+                tick_t / rounds as u32
+            );
+            drop(guard);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// (v149) Mesure à la main : ce que coûte au relais central un lancement du jeu. Un
+    /// joueur entre dans le monde, dit où il est (au fond d'un pays), puis passe en veille ;
+    /// avant, la connexion de son compte vérifie son mot de passe (Argon2). Sans la poignée de
+    /// main chiffrée de la connexion.
+    /// `cargo test --release -p minelib-relay charge_entrees -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn charge_entrees() {
+        use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+        let salt = SaltString::encode_b64(&[7; 16]).unwrap();
+        let hash = argon2::Argon2::default()
+            .hash_password(b"preuve de mot de passe", &salt)
+            .unwrap()
+            .to_string();
+        let parsed = PasswordHash::new(&hash).unwrap();
+        let t = Instant::now();
+        for _ in 0..10 {
+            assert!(argon2::Argon2::default()
+                .verify_password(b"preuve de mot de passe", &parsed)
+                .is_ok());
+        }
+        let argon = t.elapsed() / 10;
+        let (h, dir) = crowd_world("entrees");
+        let mut guard = h.state.lock().unwrap();
+        let st = &mut *guard;
+        let mut crowd = Crowd::new();
+        let (_, room) = host_world(&mut crowd, st);
+        // Le monde a confié la région où entrent les joueurs.
+        let host = crowd.conn(st, "Hote", true);
+        let _ = provinces::test_child(st, room, [0, 0], host);
+        let n = 2000;
+        let t = Instant::now();
+        for i in 0..n {
+            let id = crowd.conn(st, &format!("Joueur{i}"), false);
+            assert!(matches!(
+                crowd.ask(st, id, Request::Join { room }),
+                Some(Response::Joined { .. })
+            ));
+            crowd.ask(
+                st,
+                id,
+                Request::Position {
+                    chunk: [4 + i as i32 % 8, 4 + i as i32 / 300],
+                },
+            );
+            assert!(matches!(
+                crowd.ask(st, id, Request::Doze { room }),
+                Some(Response::Dozed { .. })
+            ));
+            st.conns.remove(&id);
+        }
+        let entry = t.elapsed() / n;
+        eprintln!(
+            "lancement du jeu au relais central : mot de passe vérifié en {argon:?}, entrée dans \
+             le monde puis veille en {entry:?} (sans la poignée de main de la connexion)"
+        );
+        for lancements in [100_000f64, 1_100_000.0] {
+            eprintln!(
+                "  {lancements} lancements par seconde : {:.0} cœurs pour les mots de passe, \
+                 {:.1} pour les entrées",
+                lancements * argon.as_secs_f64(),
+                lancements * entry.as_secs_f64()
+            );
+        }
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn crowd_world(tag: &str) -> (Handle, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("minelib-{tag}-{}", rand::random::<u32>()));
         let h = start(Config {

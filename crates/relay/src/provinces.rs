@@ -134,6 +134,9 @@ pub(crate) struct ProvinceRef {
     range_end: u64,
     refilled: Option<Instant>,
     span: u64,
+    /// (v148) Pays : dernier appel de garants qu'il lui a dit (numéro) : redit seulement
+    /// quand il change.
+    call_n: u64,
 }
 
 /// (v141) Relais de secours d'une province, choisi par le relais du monde.
@@ -246,6 +249,7 @@ pub(crate) struct ProvinceRoom {
     /// époque, relais de secours ou non → quand).
     call: Option<proto::GarantCall>,
     call_said: Option<proto::GarantCall>,
+    call_n: u64,
     local_served: HashMap<([i32; 2], u64, bool), Instant>,
     /// (v148) Hôtes qu'attendent les provinces de ses provinces (des pays) et que personne
     /// n'a trouvés en dessous : demandés plus haut au prochain bail.
@@ -618,6 +622,7 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             range_end: 0,
             refilled: None,
             span: 0,
+            call_n: 0,
             nest: nest.is_some(),
             children: Vec::new(),
             expect: None,
@@ -697,6 +702,7 @@ fn delegate_pending(st: &mut State, rid: u64, p: [i32; 2]) {
             range_end: 0,
             refilled: None,
             span: 0,
+            call_n: 0,
             nest: sub_pays,
             children: Vec::new(),
             expect: None,
@@ -1039,12 +1045,18 @@ pub(crate) fn lease(
     } else {
         SUB_PAYS_SEQS
     };
-    // (v147) Un pays appelle des garants parmi ses joueurs : il le dit à ses provinces.
+    // (v147) Un pays appelle des garants parmi ses joueurs : il le dit à ses provinces
+    // (v148 : seulement quand il change).
     let call = if pays {
-        st.rooms
-            .get(&rid)
-            .and_then(|r| r.province.as_ref())
-            .and_then(|pr| pr.call.clone())
+        st.rooms.get_mut(&rid).and_then(|room| {
+            let (n, call) = room
+                .province
+                .as_ref()
+                .map(|pr| (pr.call_n, pr.call.clone()))?;
+            let r = room.provinces.get_mut(&p).filter(|r| r.call_n != n)?;
+            r.call_n = n;
+            call
+        })
     } else {
         None
     };
@@ -2293,6 +2305,7 @@ fn promote(st: &mut State, rid: u64, p: [i32; 2], why: &str) -> bool {
         range_end: 0,
         refilled: None,
         span: 0,
+        call_n: 0,
         nest,
         children: Vec::new(),
         expect: None,
@@ -2634,6 +2647,7 @@ pub(crate) fn begin(
         me: None,
         call: None,
         call_said: None,
+        call_n: 1,
         local_served: HashMap::new(),
         wants_up: Vec::new(),
     });
@@ -2735,13 +2749,6 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
         .filter(|p| p.to_root && p.dump_asked > p.dump_done && kids_fresh)
         .map(|p| p.dump_asked);
     let all = dump.map(|_| room.build.entries_after(|_| true, 0));
-    // (v144) Joueurs connectés ici (grand monde : seules les positions de retour de ceux qui
-    // sont partis remontent).
-    let mut here: HashSet<String> = room.by_pseudo.keys().cloned().collect();
-    // (v145) Un pays : ses joueurs au fond de ses provinces aussi.
-    if let Some(pr) = room.province.as_ref() {
-        here.extend(pr.kids_present.keys().cloned());
-    }
     let Some(pr) = room.province.as_mut() else {
         return Vec::new();
     };
@@ -2754,11 +2761,9 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
     pr.outbox.extend(entries);
     // (Sacs de survie prêtés qui ont changé : leur copie part avec ce qu'elle publie.)
     let (changed, _) = st.bags.take_changed(&server);
-    let pr = st
-        .rooms
-        .get_mut(&rid)
-        .and_then(|r| r.province.as_mut())
-        .expect("province");
+    let room = st.rooms.get_mut(&rid).expect("province");
+    let by_pseudo = &room.by_pseudo;
+    let pr = room.province.as_mut().expect("province");
     let bags: Vec<proto::BagCopy> = changed
         .into_iter()
         .filter(|(who, _)| pr.held.contains(who))
@@ -2785,10 +2790,13 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
             (Vec::new(), Vec::new())
         } else if big {
             pr.last_spots = now;
+            // (v144) Joueurs connectés ici, ou (v145) au fond de ses provinces : seules les
+            // positions de retour de ceux qui sont partis remontent. (v149 : regardé
+            // seulement quand elles partent, sans recopier tous ses joueurs à chaque tour.)
             let gone: Vec<String> = pr
                 .spots
                 .keys()
-                .filter(|w| !here.contains(*w))
+                .filter(|w| !by_pseudo.contains_key(*w) && !pr.kids_present.contains_key(*w))
                 .cloned()
                 .collect();
             let up = gone
@@ -2913,7 +2921,10 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
             // joueurs) ; les hôtes qu'il trouve chez lui.
             let call = make_call(st, rid);
             if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
-                pr.call = call;
+                if pr.call != call {
+                    pr.call = call;
+                    pr.call_n += 1;
+                }
             }
             say_call(st, rid);
             let wants = wants(st, rid);
@@ -2971,7 +2982,7 @@ fn presence(st: &mut State, rid: u64) -> (Vec<String>, Vec<String>) {
     let Some(pr) = room.province.as_ref() else {
         return (Vec::new(), Vec::new());
     };
-    let mut now: HashSet<String> = room
+    let now: HashSet<String> = room
         .members
         .iter()
         .filter(|m| !room.hidden.contains(m))
@@ -2983,8 +2994,8 @@ fn presence(st: &mut State, rid: u64) -> (Vec<String>, Vec<String>) {
         })
         .filter_map(|m| Some(st.conns.get(m)?.pseudo.as_deref()?.to_ascii_lowercase()))
         .collect();
-    // (v148) Un pays de pays : aussi ceux qui sont chez ses provinces.
-    now.extend(pr.kids_present.keys().cloned());
+    // (v149) Seulement ceux qui sont chez lui-même : ceux de ses provinces restent chez lui
+    // (un pays au-dessus ne garde rien par joueur pour ceux qui sont au fond de ses pays).
     let arrived: Vec<String> = now
         .difference(&pr.present_sent)
         .take(4096)
@@ -3533,6 +3544,7 @@ pub(crate) fn promote_here(st: &mut State, old: u64, epoch: u64) -> Option<u64> 
                 range_end: 0,
                 refilled: None,
                 span: 0,
+                call_n: 0,
                 nest: false,
                 children: Vec::new(),
                 expect: Some(c.host),
@@ -3575,8 +3587,8 @@ pub(crate) fn leased(
             room.build.start_at(base);
             log::info!("pays : nouvelle plage de rangs à partir de {base}");
         }
-        if pr.nest.is_none() && ok {
-            pr.call = call;
+        if let (None, true, Some(call)) = (pr.nest, ok, call) {
+            pr.call = Some(call);
         }
     }
     let Some(pr) = room.province.as_mut() else {
@@ -4811,4 +4823,72 @@ pub(crate) fn region_host(
         pseudo,
         totp: false,
     }
+}
+
+/// Essais (v148) : ce pays sert, avec un long bail.
+#[cfg(test)]
+pub(crate) fn test_serving(st: &mut State, rid: u64) {
+    if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+        pr.go = true;
+        pr.lease_until = u64::MAX / 4;
+    }
+}
+
+/// Essais (v149) : joueurs que ce pays sait chez ses provinces.
+#[cfg(test)]
+pub(crate) fn test_known(st: &State, rid: u64) -> usize {
+    st.rooms
+        .get(&rid)
+        .and_then(|r| r.province.as_ref())
+        .map_or(0, |p| p.kids_present.len())
+}
+
+/// Essais (v148) : une province de ce pays, servie par la connexion `host` ; son époque.
+#[cfg(test)]
+pub(crate) fn test_child(st: &mut State, rid: u64, p: [i32; 2], host: u64) -> u64 {
+    let size = size(st);
+    let room = st.rooms.get_mut(&rid).expect("pays");
+    let epoch = room.next_epoch;
+    room.next_epoch += 1;
+    let now = Instant::now();
+    room.provinces.insert(
+        p,
+        ProvinceRef {
+            host,
+            epoch,
+            info: Some(ProvinceInfo {
+                province: p,
+                size,
+                epoch,
+                node: [0; 32],
+                addr: String::new(),
+                key: [0; 32],
+            }),
+            since: now,
+            renewed: now,
+            snap_seq: 0,
+            empty_since: None,
+            counts: None,
+            inside: Vec::new(),
+            standby: None,
+            recent: VecDeque::new(),
+            recent_bytes: 0,
+            carry: None,
+            winding: false,
+            big: false,
+            followed: false,
+            stale: false,
+            dump_n: 0,
+            stop_after_dump: false,
+            unfollowed_since: None,
+            range_end: 0,
+            refilled: None,
+            span: 0,
+            call_n: 0,
+            nest: false,
+            children: Vec::new(),
+            expect: None,
+        },
+    );
+    epoch
 }
