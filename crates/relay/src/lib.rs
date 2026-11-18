@@ -285,8 +285,14 @@ impl Handle {
     }
 
     /// (v144) Relais de secours d'un pays : ce que le pays sait de ses provinces.
-    pub fn province_children(&self, epoch: u64, list: Vec<proto::ChildCopy>) {
-        provinces::children_here(&mut self.state.lock().unwrap(), epoch, list);
+    pub fn province_children(
+        &self,
+        epoch: u64,
+        list: Vec<proto::ChildCopy>,
+        gone: Vec<[i32; 2]>,
+        full: bool,
+    ) {
+        provinces::children_here(&mut self.state.lock().unwrap(), epoch, list, gone, full);
     }
 
     /// (v144) Relais d'un pays : ses provinces servies (coordonnées, époque) ; essais.
@@ -498,6 +504,8 @@ impl Handle {
         ms: u32,
         call: Option<proto::GarantCall>,
         more: Option<u64>,
+        dense: u32,
+        kids: bool,
     ) {
         provinces::leased(
             &mut self.state.lock().unwrap(),
@@ -509,6 +517,8 @@ impl Handle {
             ms,
             call,
             more,
+            dense,
+            kids,
         );
     }
 
@@ -6518,11 +6528,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             arrived,
             left,
             seq,
+            total,
         } => {
             if my_room == Some(room) {
                 provinces::lease(
                     st, room, id, province, epoch, t, counts, inside, followed, wants, children,
-                    arrived, left, seq,
+                    arrived, left, seq, total,
                 );
             }
             return None;
@@ -10689,9 +10700,11 @@ mod tests {
     }
 
     /// (v148) Mesure à la main : ce que coûte un pays au PC de son hôte. Ses provinces (une
-    /// région chacune, cent joueurs) renouvellent leur bail toutes les 300 ms en disant leurs
-    /// joueurs ; un joueur sur deux cents change de province chaque seconde ; son entretien
-    /// (`tick`) passe à chaque bail. Calcul pour une seconde de jeu.
+    /// région chacune) renouvellent leur bail toutes les 300 ms en disant leurs joueurs ; un
+    /// joueur sur deux cents change de province chaque seconde ; son entretien (`tick`) passe
+    /// à chaque bail. Calcul pour une seconde de jeu. (v149) Tous les joueurs connus du pays ;
+    /// (v150) avec vingt joueurs par région (la Terre) et cent (une foule partout), et la
+    /// taille de son propre bail à son pays.
     /// `cargo test --release -p minelib-relay charge_pays -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -10700,138 +10713,83 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .map_or(vec![1024, 4096], |n| vec![n]);
-        for kids in sizes {
-            let (h, dir) = crowd_world("pays");
-            let mut guard = h.state.lock().unwrap();
-            let st = &mut *guard;
-            let mut crowd = Crowd::new();
-            let side = (kids as f64).sqrt().ceil() as i32;
-            let root = SigningKey::from_bytes(&[3; 32]).verifying_key().to_bytes();
-            let info = proto::StandbyInfo {
-                name: "Monde".into(),
-                map: "monde".into(),
-                map_sig: [6; 32],
-                max_players: 0,
-                creator: "Createur".into(),
-                server: servers::key("Createur", "monde"),
-                owner: "Createur".into(),
-            };
-            assert!(provinces::begin(
-                st,
-                42,
-                [0, 0],
-                side,
-                5,
-                [7; 32],
-                root,
-                info,
-                Default::default(),
-                false,
-                Some(proto::Nest { size: 1, from: 3 }),
-                Vec::new(),
-            ));
-            provinces::test_serving(st, 42);
-            let mut hosts = Vec::new();
-            for k in 0..kids {
-                let p = [k as i32 % side, k as i32 / side];
-                let id = crowd.conn(st, &format!("Hote{k}"), true);
-                st.conns.get_mut(&id).unwrap().room = Some(42);
-                let epoch = provinces::test_child(st, 42, p, id);
-                hosts.push((p, id, epoch));
+        for per in [20usize, 100] {
+            for &kids in &sizes {
+                charge_pays_once(kids, per);
             }
-            // (v149) Cent joueurs dans chaque province, dits au pays à leur premier bail : il
-            // sait où est chacun.
-            let mut names: Vec<Vec<String>> = (0..kids)
-                .map(|i| (0..100).map(|k| format!("j{i}-{k}")).collect())
-                .collect();
-            for (i, &(p, id, epoch)) in hosts.iter().enumerate() {
-                crowd.ask(
-                    st,
-                    id,
-                    Request::ProvinceLease {
-                        room: 42,
-                        province: p,
-                        epoch,
-                        t: now_ms(),
-                        counts: vec![(p, 100)],
-                        inside: Vec::new(),
-                        followed: true,
-                        wants: Vec::new(),
-                        children: None,
-                        arrived: names[i].clone(),
-                        left: Vec::new(),
-                        seq: 0,
-                    },
-                );
-                let _ = crowd.got(id);
+        }
+    }
+
+    fn charge_pays_once(kids: usize, per: usize) {
+        let (h, dir) = crowd_world("pays");
+        let mut guard = h.state.lock().unwrap();
+        let st = &mut *guard;
+        let mut crowd = Crowd::new();
+        let side = (kids as f64).sqrt().ceil() as i32;
+        let root = SigningKey::from_bytes(&[3; 32]).verifying_key().to_bytes();
+        let info = proto::StandbyInfo {
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+            creator: "Createur".into(),
+            server: servers::key("Createur", "monde"),
+            owner: "Createur".into(),
+        };
+        assert!(provinces::begin(
+            st,
+            42,
+            [0, 0],
+            side,
+            5,
+            [7; 32],
+            root,
+            info,
+            Default::default(),
+            false,
+            Some(proto::Nest { size: 1, from: 3 }),
+            Vec::new(),
+        ));
+        provinces::test_serving(st, 42);
+        // (Son pays au-dessus : un pays, qui veut les régions à partir de 24 joueurs et pas
+        // la liste de ses provinces.)
+        let pays_epoch = provinces::test_epoch(st, 42);
+        provinces::leased(
+            st,
+            pays_epoch,
+            now_ms(),
+            true,
+            false,
+            0,
+            0,
+            None,
+            None,
+            SHARD_FROM as u32,
+            false,
+        );
+        let mut hosts = Vec::new();
+        for k in 0..kids {
+            let p = [k as i32 % side, k as i32 / side];
+            let id = crowd.conn(st, &format!("Hote{k}"), true);
+            st.conns.get_mut(&id).unwrap().room = Some(42);
+            let epoch = provinces::test_child(st, 42, p, id);
+            hosts.push((p, id, epoch));
+        }
+        // Une province dit ses régions peuplées une par une seulement à partir de 24 joueurs
+        // (v150), et tous ses joueurs.
+        let counts = |p: [i32; 2]| -> Vec<([i32; 2], u32)> {
+            if per >= SHARD_FROM {
+                vec![(p, per as u32)]
+            } else {
+                Vec::new()
             }
-            let known = provinces::test_known(st, 42);
-            let rounds = 20;
-            let (mut lease_t, mut tick_t) = (Duration::ZERO, Duration::ZERO);
-            for round in 0..rounds {
-                // (Un joueur sur deux cents passe chaque seconde dans la province voisine :
-                // 0,15 par province et par bail.)
-                let mut moves: Vec<(Vec<String>, Vec<String>)> = vec![Default::default(); kids];
-                for i in 0..kids {
-                    if (i + round) % 7 == 0 {
-                        let j = (i + 1) % kids;
-                        if let Some(w) = names[i].pop() {
-                            moves[i].1.push(w.clone());
-                            moves[j].0.push(w.clone());
-                            names[j].push(w);
-                        }
-                    }
-                }
-                let t = Instant::now();
-                for (i, &(p, id, epoch)) in hosts.iter().enumerate() {
-                    let (arrived, left) = std::mem::take(&mut moves[i]);
-                    crowd.ask(
-                        st,
-                        id,
-                        Request::ProvinceLease {
-                            room: 42,
-                            province: p,
-                            epoch,
-                            t: now_ms(),
-                            counts: vec![(p, 100)],
-                            inside: Vec::new(),
-                            followed: true,
-                            wants: Vec::new(),
-                            children: None,
-                            arrived,
-                            left,
-                            seq: 0,
-                        },
-                    );
-                }
-                lease_t += t.elapsed();
-                let t = Instant::now();
-                let _ = provinces::tick(st);
-                tick_t += t.elapsed();
-                for &(_, id, _) in &hosts {
-                    let _ = crowd.got(id);
-                }
-            }
-            let per_lease = lease_t / (rounds * kids) as u32;
-            let per_s = (lease_t + tick_t).as_secs_f64() / (rounds as f64 * 0.3);
-            // Taille d'un bail et de sa réponse (sans le chiffrement : 16 octets de plus).
-            let (p, id, epoch) = hosts[0];
-            let ask = postcard::to_allocvec(&Request::ProvinceLease {
-                room: 42,
-                province: p,
-                epoch,
-                t: now_ms(),
-                counts: vec![(p, 100)],
-                inside: Vec::new(),
-                followed: true,
-                wants: Vec::new(),
-                children: None,
-                arrived: Vec::new(),
-                left: Vec::new(),
-                seq: 1 << 40,
-            })
-            .unwrap()
-            .len();
+        };
+        // (v149) Les joueurs de chaque province, dits au pays à leur premier bail : il sait
+        // où est chacun.
+        let mut names: Vec<Vec<String>> = (0..kids)
+            .map(|i| (0..per).map(|k| format!("j{i}-{k}")).collect())
+            .collect();
+        for (i, &(p, id, epoch)) in hosts.iter().enumerate() {
             crowd.ask(
                 st,
                 id,
@@ -10840,38 +10798,148 @@ mod tests {
                     province: p,
                     epoch,
                     t: now_ms(),
-                    counts: vec![(p, 100)],
+                    counts: counts(p),
                     inside: Vec::new(),
                     followed: true,
                     wants: Vec::new(),
                     children: None,
-                    arrived: Vec::new(),
+                    arrived: names[i].clone(),
                     left: Vec::new(),
                     seq: 0,
+                    total: per as u32,
                 },
             );
-            let answer = crowd
-                .got(id)
-                .0
-                .iter()
-                .find(|r| matches!(r, Response::ProvinceLeased { .. }))
-                .map_or(0, |r| postcard::to_allocvec(r).unwrap().len());
-            let mbit = |bytes: usize| (bytes + 20) as f64 * kids as f64 / 0.3 * 8.0 / 1e6;
-            eprintln!(
-                "  bail {ask} octets, réponse {answer} octets : {:.1} Mbit/s reçus, {:.1} Mbit/s \
-                 envoyés",
-                mbit(ask),
-                mbit(answer)
-            );
-            eprintln!(
-                "pays de {kids} provinces ({} joueurs, {known} connus du pays) : {per_lease:?} \
-                 par bail, entretien {:?}, {per_s:.3} s de calcul par seconde de jeu",
-                kids * 100,
-                tick_t / rounds as u32
-            );
-            drop(guard);
-            let _ = std::fs::remove_dir_all(dir);
+            let _ = crowd.got(id);
         }
+        let known = provinces::test_known(st, 42);
+        let rounds = 20;
+        let (mut lease_t, mut tick_t) = (Duration::ZERO, Duration::ZERO);
+        for round in 0..rounds {
+            // (Un joueur sur deux cents passe chaque seconde dans la province voisine.)
+            let mut moves: Vec<(Vec<String>, Vec<String>)> = vec![Default::default(); kids];
+            for i in 0..kids {
+                if (i * 100 / per + round) % 7 == 0 && i.is_multiple_of(100 / per) {
+                    let j = (i + 1) % kids;
+                    if let Some(w) = names[i].pop() {
+                        moves[i].1.push(w.clone());
+                        moves[j].0.push(w.clone());
+                        names[j].push(w);
+                    }
+                }
+            }
+            let t = Instant::now();
+            for (i, &(p, id, epoch)) in hosts.iter().enumerate() {
+                let (arrived, left) = std::mem::take(&mut moves[i]);
+                crowd.ask(
+                    st,
+                    id,
+                    Request::ProvinceLease {
+                        room: 42,
+                        province: p,
+                        epoch,
+                        t: now_ms(),
+                        counts: counts(p),
+                        inside: Vec::new(),
+                        followed: true,
+                        wants: Vec::new(),
+                        children: None,
+                        arrived,
+                        left,
+                        seq: 0,
+                        total: names[i].len() as u32,
+                    },
+                );
+            }
+            lease_t += t.elapsed();
+            let t = Instant::now();
+            let _ = provinces::tick(st);
+            tick_t += t.elapsed();
+            for &(_, id, _) in &hosts {
+                let _ = crowd.got(id);
+            }
+        }
+        // Son propre bail, à son pays : ce qui remonte, et ce que coûte ce tour-là (le
+        // deuxième : au premier, il dit leurs voisines à toutes ses provinces).
+        provinces::test_lease_due(st, 42);
+        let up = provinces::tick(st)
+            .iter()
+            .find(|r| matches!(r, Request::ProvinceLease { .. }))
+            .map_or(0, |r| postcard::to_allocvec(r).unwrap().len());
+        provinces::test_lease_due(st, 42);
+        let t = Instant::now();
+        let _ = provinces::tick(st);
+        let lease_tick = t.elapsed();
+        // Un tour sans bail (la boucle de l'hôte tourne jusqu'à 500 fois par seconde).
+        let t = Instant::now();
+        for _ in 0..100 {
+            let _ = provinces::tick(st);
+        }
+        let plain_tick = t.elapsed() / 100;
+        let per_lease = lease_t / (rounds * kids) as u32;
+        // Une seconde : les baux de ses provinces, trois tours avec son propre bail, 500
+        // tours sans.
+        let per_s = (lease_t / rounds as u32).as_secs_f64() / 0.3
+            + lease_tick.as_secs_f64() / 0.3
+            + plain_tick.as_secs_f64() * 500.0;
+        // Taille d'un bail et de sa réponse (sans le chiffrement : 16 octets de plus).
+        let (p, id, epoch) = hosts[0];
+        let ask = postcard::to_allocvec(&Request::ProvinceLease {
+            room: 42,
+            province: p,
+            epoch,
+            t: now_ms(),
+            counts: counts(p),
+            inside: Vec::new(),
+            followed: true,
+            wants: Vec::new(),
+            children: None,
+            arrived: Vec::new(),
+            left: Vec::new(),
+            seq: 1 << 40,
+            total: per as u32,
+        })
+        .unwrap()
+        .len();
+        crowd.ask(
+            st,
+            id,
+            Request::ProvinceLease {
+                room: 42,
+                province: p,
+                epoch,
+                t: now_ms(),
+                counts: counts(p),
+                inside: Vec::new(),
+                followed: true,
+                wants: Vec::new(),
+                children: None,
+                arrived: Vec::new(),
+                left: Vec::new(),
+                seq: 0,
+                total: per as u32,
+            },
+        );
+        let answer = crowd
+            .got(id)
+            .0
+            .iter()
+            .find(|r| matches!(r, Response::ProvinceLeased { .. }))
+            .map_or(0, |r| postcard::to_allocvec(r).unwrap().len());
+        let mbit = |bytes: usize| (bytes + 20) as f64 * kids as f64 / 0.3 * 8.0 / 1e6;
+        eprintln!(
+            "pays de {kids} provinces de {per} joueurs ({known} connus du pays) : {per_lease:?} \
+             par bail reçu, tour avec son bail {lease_tick:?}, tour sans {plain_tick:?} : \
+             {per_s:.3} s de calcul par seconde de jeu (tours pendant les baux : {:?})",
+            tick_t / rounds as u32
+        );
+        eprintln!(
+            "  bail d'une province {ask} octets, réponse {answer} octets : {:.1} Mbit/s reçus, \
+             {:.1} Mbit/s envoyés ; son propre bail à son pays : {up} octets",
+            mbit(ask),
+            mbit(answer)
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// (v149) Mesure à la main : ce que coûte au relais central un lancement du jeu. Un
@@ -12205,6 +12273,7 @@ mod tests {
                                 arrived: Vec::new(),
                                 left: Vec::new(),
                                 seq: 0,
+                                total: 100,
                             },
                         );
                     }

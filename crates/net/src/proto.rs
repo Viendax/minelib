@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 48;
+pub const PROTOCOL: u32 = 49;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -567,6 +567,9 @@ pub enum Request {
         /// (v147) Dernier rang qu'elle a donné : un pays dont la plage s'épuise (il en donne
         /// une à chaque époque de ses provinces) en reçoit une nouvelle (`more`).
         seq: u64,
+        /// (v150) Joueurs de toute la province (avec ceux de ses provinces) : `counts` ne dit
+        /// plus que les régions assez peuplées pour avoir leurs propres relais (`dense`).
+        total: u32,
     },
     /// Ce que le relais de province vient de publier (zone, rang, message) : le relais du
     /// monde en garde une copie, pour reprendre la province aussitôt si son hôte tombe.
@@ -1066,12 +1069,16 @@ pub enum Response {
         spots: Vec<(String, [f32; 5])>,
     },
     /// (v144) Relais d'un pays → son relais de secours : ses provinces (pour qu'elles se
-    /// rattachent à lui s'il prend la place du pays).
+    /// rattachent à lui s'il prend la place du pays). (v150) Seulement celles qui ont changé,
+    /// et celles qui ne sont plus servies (`gone`) ; toutes d'un coup (`full`) quand il
+    /// arrive.
     ProvinceChildren {
         room: u64,
         province: [i32; 2],
         epoch: u64,
         children: Vec<ChildCopy>,
+        gone: Vec<[i32; 2]>,
+        full: bool,
     },
     /// (v145) Relais d'un pays → une de ses provinces : ses voisines (les provinces du pays
     /// proches d'elle, elle comprise) ; elle les annonce à ses joueurs, qui n'ont plus besoin
@@ -1166,6 +1173,12 @@ pub enum Response {
         call: Option<GarantCall>,
         /// (v147) Relais du monde → pays : nouvelle plage de rangs (son début ; `low`).
         more: Option<u64>,
+        /// (v150) Régions à dire une par une dans `counts` : celles qui ont au moins ce
+        /// nombre de joueurs (les relais de région du relais du monde commencent là). Ses
+        /// provinces servies (`children`) : seulement si c'est le relais du monde qui les
+        /// demande (un pays n'en a pas besoin).
+        dense: u32,
+        kids: bool,
     },
     /// (v147) Relais d'un pays (ou d'une de ses provinces) → ses joueurs : le pays appelle des
     /// garants parmi eux ; chacun en est s'il tire moins que `share` (d'après son pseudo,

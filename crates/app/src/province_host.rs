@@ -349,6 +349,8 @@ impl ProvinceHost {
                 ms,
                 call,
                 more,
+                dense,
+                kids,
             } if (*room, *province) == (self.room, self.province) => {
                 self.handle.province_leased(
                     *epoch,
@@ -359,6 +361,8 @@ impl ProvinceHost {
                     *ms,
                     call.clone(),
                     *more,
+                    *dense,
+                    *kids,
                 );
                 Vec::new()
             }
@@ -597,9 +601,13 @@ impl ProvinceHost {
                         }
                         // (v144) Un pays : ses provinces (pour les reprendre avec leurs hôtes).
                         Event::Province(Response::ProvinceChildren {
-                            epoch, children, ..
+                            epoch,
+                            children,
+                            gone,
+                            full,
+                            ..
                         }) => {
-                            self.handle.province_children(epoch, children);
+                            self.handle.province_children(epoch, children, gone, full);
                         }
                         Event::Province(Response::ProvinceCopy {
                             epoch,
