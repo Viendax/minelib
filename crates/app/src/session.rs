@@ -3140,7 +3140,14 @@ impl Session {
             // « Courir » vient d'être lâchée après un long appui sur « avancer » : ralenti
             // (jamais arrêté) le temps de savoir si « avancer » suit (voir `keycomp`).
             if key_lag > 0.0 && mt.forward > 0.0 {
-                mt.forward *= self.key_comp.factor();
+                let f = self.key_comp.factor();
+                if f < 1.0 {
+                    mt.forward *= f;
+                    // (Sauf s'il court encore, par un double appui sur « avancer ».)
+                    if !mt.sprint {
+                        self.player.brake_forward(f, SIM_TICK);
+                    }
+                }
             }
             let before = self.player.pos;
             self.player.update(&self.world, &mt, SIM_TICK);

@@ -257,6 +257,25 @@ impl Player {
         }
     }
 
+    /// (v183) Freine comme au sol ce qui dépasse, vers l'avant, `factor` fois la vitesse de
+    /// marche (voir `crate::keycomp` : « courir » vient d'être lâchée, la touche « avancer »
+    /// traîne peut-être). Sans cela l'élan de la course se perdait doucement et faisait à lui
+    /// seul 0,4 bloc de trop. Pas en vol (la vitesse n'y dépasse jamais celle demandée).
+    pub fn brake_forward(&mut self, factor: f32, dt: f32) {
+        if self.flying || self.noclip {
+            return;
+        }
+        let nominal = if self.crouch > 0.5 { SNEAK } else { WALK };
+        let (sy, cy) = self.yaw.sin_cos();
+        let along = self.vel.x * sy - self.vel.z * cy;
+        let over = along - nominal * factor;
+        if over > 0.0 {
+            let cut = over * (dt * GROUND_BRAKE).min(1.0);
+            self.vel.x -= sy * cut;
+            self.vel.z += cy * cut;
+        }
+    }
+
     /// (v181) Rend au joueur un déplacement qu'il n'a pas voulu (voir `crate::keycomp`) :
     /// `lift` vers le haut d'abord (il est tombé d'un bord), puis `back` à l'horizontale,
     /// avec les collisions.
