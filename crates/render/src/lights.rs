@@ -838,6 +838,13 @@ pub(crate) struct VlPipes {
     composite: wgpu::RenderPipeline,
 }
 
+/// Liaisons de l'éclairage différé (profondeur lue, albédo, surface), refaites quand les
+/// images du TAA sont recréées.
+struct DeferredTargets {
+    generation: u64,
+    groups: [wgpu::BindGroup; 2],
+}
+
 /// Ressources GPU des lumières dynamiques.
 pub(crate) struct DynGpu {
     header: wgpu::Buffer,
@@ -864,6 +871,9 @@ pub(crate) struct DynGpu {
     noise_view: wgpu::TextureView,
     noise_sampler: wgpu::Sampler,
     vl_targets: Option<VlTargets>,
+    // Éclairage différé.
+    pub(crate) def_bgl: wgpu::BindGroupLayout,
+    def_targets: Option<DeferredTargets>,
     // État de l'image.
     lights: Vec<DynLight>,
     settings: DynSettings,
@@ -966,24 +976,41 @@ fn tex_entry(
 
 /// Source WGSL complète d'un shader qui utilise les lumières dynamiques.
 pub(crate) fn with_dynlights(src: &str) -> String {
-    format!("{src}\n{}", include_str!("shaders/dynlights.wgsl"))
+    format!(
+        "{src}\n{}\n{}",
+        include_str!("shaders/gbuffer.wgsl"),
+        include_str!("shaders/dynlights.wgsl")
+    )
 }
 
 /// Le même shader sans le code des lumières (`dyn_active()` toujours faux) : celui de tous
 /// les jours, tant qu'aucune lumière n'est posée.
 pub(crate) fn without_dynlights(src: &str) -> String {
-    format!("{src}\n{}", include_str!("shaders/dynlights_off.wgsl"))
+    format!(
+        "{src}\n{}\n{}",
+        include_str!("shaders/gbuffer.wgsl"),
+        include_str!("shaders/dynlights_off.wgsl")
+    )
 }
 
-/// Pipelines propres aux lumières : calcul des cartes d'ombre et rayons volumétriques.
-/// Compilés avec les variantes éclairées du monde et des entités (`Renderer::spawn_lit`).
+/// Compile `f` et note son temps dans le journal (`label`).
+fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    let t0 = std::time::Instant::now();
+    let out = f();
+    log::info!("  {label} : {:.1} s", t0.elapsed().as_secs_f32());
+    out
+}
+
+/// Pipelines des lumières : éclairage différé, calcul des cartes d'ombre, rayons
+/// volumétriques et leur recomposition, chacun sur son fil (`Renderer::spawn_lit`).
 pub(crate) fn light_pipes(
     device: &wgpu::Device,
     world_bgl: &wgpu::BindGroupLayout,
     bake_bgl: &wgpu::BindGroupLayout,
     vl_bgl: &wgpu::BindGroupLayout,
     comp_bgl: &wgpu::BindGroupLayout,
-) -> (wgpu::RenderPipeline, VlPipes) {
+    def_bgl: &wgpu::BindGroupLayout,
+) -> (wgpu::RenderPipeline, VlPipes, wgpu::RenderPipeline) {
     let bake_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("ombres : calcul"),
         bind_group_layouts: &[bake_bgl],
@@ -1008,71 +1035,103 @@ pub(crate) fn light_pipes(
         bind_group_layouts: &[comp_bgl],
         push_constant_ranges: &[],
     });
+    // Éclairage différé : lit le monde (groupe 0, lumières comprises) et ce que les
+    // opaques ont laissé (groupe 1).
+    let def_src = with_dynlights(include_str!("shaders/dyn_deferred.wgsl"));
+    let def_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("éclairage différé"),
+        source: wgpu::ShaderSource::Wgsl(def_src.into()),
+    });
+    let def_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("éclairage différé"),
+        bind_group_layouts: &[world_bgl, def_bgl],
+        push_constant_ranges: &[],
+    });
     let add = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
         dst_factor: wgpu::BlendFactor::One,
         operation: wgpu::BlendOperation::Add,
     };
-    // Les trois pipelines en même temps, chacun sur son fil (compilation lente sous
-    // DirectX).
+    let keep_alpha = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    };
+    let additive = Some(wgpu::BlendState {
+        color: add,
+        alpha: keep_alpha,
+    });
+    // Tous en même temps, chacun sur son fil (compilation lente sous DirectX).
     std::thread::scope(|sc| {
+        let deferred = sc.spawn(|| {
+            timed("éclairage différé", || {
+                fullscreen_pipeline(
+                    device,
+                    "éclairage différé",
+                    &def_layout,
+                    &def_shader,
+                    "fs_deferred",
+                    COLOR_FORMAT,
+                    additive,
+                )
+            })
+        });
         let bake = sc.spawn(|| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("ombres des lumières : calcul"),
-                layout: Some(&bake_layout),
-                vertex: wgpu::VertexState {
-                    module: &bake_shader,
-                    entry_point: Some("vs_bake"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: ATLAS_FORMAT,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Always,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &bake_shader,
-                    entry_point: Some("fs_bake"),
-                    compilation_options: Default::default(),
-                    targets: &[],
-                }),
-                multiview: None,
-                cache: None,
+            timed("cartes d'ombre", || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("ombres des lumières : calcul"),
+                    layout: Some(&bake_layout),
+                    vertex: wgpu::VertexState {
+                        module: &bake_shader,
+                        entry_point: Some("vs_bake"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: Default::default(),
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: ATLAS_FORMAT,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Always,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &bake_shader,
+                        entry_point: Some("fs_bake"),
+                        compilation_options: Default::default(),
+                        targets: &[],
+                    }),
+                    multiview: None,
+                    cache: None,
+                })
             })
         });
         let march = sc.spawn(|| {
-            fullscreen_pipeline(
-                device,
-                "volumétrique",
-                &layout,
-                &shader,
-                "fs_vl",
-                VL_FORMAT,
-                None,
-            )
+            timed("rayons volumétriques", || {
+                fullscreen_pipeline(
+                    device,
+                    "volumétrique",
+                    &layout,
+                    &shader,
+                    "fs_vl",
+                    VL_FORMAT,
+                    None,
+                )
+            })
         });
         let composite = sc.spawn(|| {
-            fullscreen_pipeline(
-                device,
-                "volumétrique : recomposition",
-                &comp_layout,
-                &comp_shader,
-                "fs_composite",
-                COLOR_FORMAT,
-                Some(wgpu::BlendState {
-                    color: add,
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::Zero,
-                        dst_factor: wgpu::BlendFactor::One,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                }),
-            )
+            timed("recomposition des rayons", || {
+                fullscreen_pipeline(
+                    device,
+                    "volumétrique : recomposition",
+                    &comp_layout,
+                    &comp_shader,
+                    "fs_composite",
+                    COLOR_FORMAT,
+                    additive,
+                )
+            })
         });
         (
             bake.join().expect("pipeline des ombres des lumières"),
@@ -1080,6 +1139,7 @@ pub(crate) fn light_pipes(
                 march: march.join().expect("pipeline volumétrique"),
                 composite: composite.join().expect("pipeline de recomposition"),
             },
+            deferred.join().expect("pipeline de l'éclairage différé"),
         )
     })
 }
@@ -1298,6 +1358,26 @@ impl DynGpu {
                 ),
             ],
         });
+        let def_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("éclairage différé"),
+            entries: &[
+                tex_entry(
+                    0,
+                    wgpu::TextureSampleType::Depth,
+                    wgpu::TextureViewDimension::D2,
+                ),
+                tex_entry(
+                    1,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureViewDimension::D2,
+                ),
+                tex_entry(
+                    2,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureViewDimension::D2,
+                ),
+            ],
+        });
         let max_texture = device.limits().max_texture_dimension_2d;
         let mut g = Self {
             header,
@@ -1321,6 +1401,8 @@ impl DynGpu {
             noise_view,
             noise_sampler,
             vl_targets: None,
+            def_bgl,
+            def_targets: None,
             lights: Vec::new(),
             settings: DynSettings::default(),
             cache: ShadowCache::default(),
@@ -1826,7 +1908,12 @@ impl DynGpu {
     }
 
     /// Calcule les cases d'ombre préparées par `prepare` (`pipeline` : voir `light_pipes`).
-    pub fn encode_bake(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::RenderPipeline) {
+    pub fn encode_bake(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
         let (Some(group), Some((_, atlas))) = (&self.bake_group, &self.atlas) else {
             return;
         };
@@ -1844,7 +1931,7 @@ impl DynGpu {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: timestamps,
             occlusion_query_set: None,
         });
         pass.set_pipeline(pipeline);
@@ -1864,6 +1951,78 @@ impl DynGpu {
         self.vl_active
     }
 
+    /// Des cartes d'ombre à calculer à cette image ?
+    pub fn bake_pending(&self) -> bool {
+        !self.jobs.is_empty() && self.bake_group.is_some() && self.atlas.is_some()
+    }
+
+    /// Éclairage différé : ajoute la lumière des lumières dynamiques à `color` (image du
+    /// monde opaque), d'après la profondeur de cette image et ce que les opaques ont laissé
+    /// (`gbuf` : albédo, surface). `generation` change quand ces images sont recréées.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_deferred(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        world_group: &wgpu::BindGroup,
+        depths: &[wgpu::TextureView; 2],
+        depth_index: usize,
+        gbuf: &[wgpu::TextureView; 2],
+        generation: u64,
+        color: &wgpu::TextureView,
+        pipeline: &wgpu::RenderPipeline,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        if self
+            .def_targets
+            .as_ref()
+            .is_none_or(|t| t.generation != generation)
+        {
+            let groups = std::array::from_fn(|i| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("éclairage différé"),
+                    layout: &self.def_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&depths[i]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&gbuf[0]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&gbuf[1]),
+                        },
+                    ],
+                })
+            });
+            self.def_targets = Some(DeferredTargets { generation, groups });
+        }
+        let Some(t) = &self.def_targets else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("lumières (éclairage différé)"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: timestamps,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, world_group, &[]);
+        pass.set_bind_group(1, &t.groups[depth_index], &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     /// Passe volumétrique (demi-résolution) puis recomposition dans `color` (image du monde).
     /// `depths` : les deux profondeurs du TAA (celle de cette image : `depth_index`) ;
     /// `generation` change quand elles sont recréées.
@@ -1879,6 +2038,10 @@ impl DynGpu {
         size: (u32, u32),
         color: &wgpu::TextureView,
         pipes: &VlPipes,
+        timestamps: (
+            Option<wgpu::RenderPassTimestampWrites<'_>>,
+            Option<wgpu::RenderPassTimestampWrites<'_>>,
+        ),
     ) {
         if !self.volumetric_active() {
             return;
@@ -1960,7 +2123,7 @@ impl DynGpu {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: timestamps.0,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&pipes.march);
@@ -1979,7 +2142,7 @@ impl DynGpu {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: timestamps.1,
             occlusion_query_set: None,
         });
         pass.set_pipeline(&pipes.composite);

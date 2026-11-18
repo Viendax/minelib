@@ -81,17 +81,24 @@ fn dl_tile_base(frag: vec2<f32>, size: vec2<f32>) -> u32 {
     return (ty * gx + tx) * dh.counts.w;
 }
 
+/// Une lumière au moins dans la tuile du pixel `frag` ?
+fn dl_tile_any(frag: vec2<f32>, size: vec2<f32>) -> bool {
+    if dh.counts.x == 0u {
+        return false;
+    }
+    let base = dl_tile_base(frag, size);
+    let words = min(dh.counts.w, 8u);
+    var any = 0u;
+    for (var w = 0u; w < words; w++) {
+        any = any | dtiles[base + w];
+    }
+    return any != 0u;
+}
+
 /// Bruit par pixel (interleaved gradient noise), décalé à chaque image : le TAA lisse.
 fn dl_ign(frag: vec2<f32>) -> f32 {
     let f = frag + vec2<f32>(5.588238, 5.588238) * (dh.misc.x % 64.0);
     return fract(52.9829189 * fract(0.06711056 * f.x + 0.00583715 * f.y));
-}
-
-/// Point `i` sur `n` d'un disque de Vogel (rayon 1), tourné de `phi`.
-fn dl_vogel(i: u32, n: u32, phi: f32) -> vec2<f32> {
-    let r = sqrt((f32(i) + 0.5) / f32(n));
-    let t = f32(i) * 2.39996323 + phi;
-    return vec2<f32>(cos(t), sin(t)) * r;
 }
 
 /// Repère d'un projecteur dirigé selon `d` : (droite, haut, avant). Le même pour l'ombre,
@@ -115,44 +122,20 @@ fn dl_cube_face(d: vec3<f32>) -> u32 {
     return select(5u, 4u, d.z > 0.0);
 }
 
-/// Repère d'une face du cube : (droite, haut, avant).
-fn dl_face_basis(f: u32) -> mat3x3<f32> {
-    switch f {
-        case 0u: { return mat3x3<f32>(vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0)); }
-        case 1u: { return mat3x3<f32>(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0)); }
-        case 2u: { return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 1.0, 0.0)); }
-        case 3u: { return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, -1.0, 0.0)); }
-        case 4u: { return mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0)); }
-        default: { return mat3x3<f32>(vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, -1.0)); }
+/// Direction `d` dans le repère (droite, haut, avant) de la face `f` du cube, le même que
+/// celui du calcul des cartes (shadow_bake.wgsl) : +X (−z, y, x), +Y (x, −z, y),
+/// +Z (x, y, z) ; une face négative retourne l'avant et un des deux autres axes.
+fn dl_face_coords(f: u32, d: vec3<f32>) -> vec3<f32> {
+    let ax = f / 2u;
+    var c = select(
+        select(d, vec3<f32>(d.x, -d.z, d.y), ax == 1u),
+        vec3<f32>(-d.z, d.y, d.x),
+        ax == 0u,
+    );
+    if (f & 1u) == 1u {
+        c = select(vec3<f32>(-c.x, c.y, -c.z), vec3<f32>(c.x, -c.y, -c.z), ax == 1u);
     }
-}
-
-/// Gobo : part de la lumière qui passe le motif projeté (1 sans gobo). Le motif occupe le
-/// cône du projecteur (échelle 1), haut de l'image vers le haut du repère ; hors de l'image :
-/// noir (blanc s'il est inversé).
-fn dl_cookie(p: vec3<f32>, L: DynLight) -> f32 {
-    let layer = L.cookie.x;
-    if layer < 0.0 {
-        return 1.0;
-    }
-    let b = dl_spot_basis(normalize(L.dir_type.xyz));
-    let to = p - L.pos_range.xyz;
-    let z = dot(b[2], to);
-    if z < 0.001 {
-        return 1.0;
-    }
-    // 1 / tan(demi-angle) : le bord du cône tombe au bord de l'image.
-    let c = clamp(L.cone.x, -1.0, 1.0);
-    let fy = min(c * inverseSqrt(max(1.0 - c * c, 1e-12)), 114.58865);
-    var q = vec2<f32>(dot(b[0], to), dot(b[1], to)) * (fy / z) / max(L.cookie.z, 1e-3);
-    let cr = cos(L.cookie.y);
-    let sr = sin(L.cookie.y);
-    q = vec2<f32>(cr * q.x - sr * q.y, sr * q.x + cr * q.y);
-    let uv = vec2<f32>(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
-    let inside = all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
-    var m = textureSampleLevel(gobos, gobo_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), i32(layer), 0.0).r;
-    m = select(0.0, m, inside);
-    return select(m, 1.0 - m, L.cookie.w > 0.5);
+    return c;
 }
 
 /// Coin (xy) et taille (z) en uv d'une case de l'atlas des ombres.
@@ -165,22 +148,62 @@ fn dl_tile_rect(tile: f32) -> vec3<f32> {
     return vec3<f32>(col * size, row * size, size);
 }
 
+/// Ce qu'il faut d'une lumière pour ses ombres et son gobo, calculé une fois par pixel
+/// (et pas à chaque échantillon) : repère du projecteur, case de sa carte, 1 / tan du
+/// demi-angle, rotation du gobo.
+struct DlFrame {
+    b: mat3x3<f32>,
+    rect: vec3<f32>,
+    fy: f32,
+    rot: vec2<f32>,
+};
+
+fn dl_frame(L: DynLight) -> DlFrame {
+    var f: DlFrame;
+    f.b = dl_spot_basis(normalize(L.dir_type.xyz));
+    f.rect = dl_tile_rect(L.vol.w);
+    let c = clamp(L.cone.x, -1.0, 1.0);
+    f.fy = min(c * inverseSqrt(max(1.0 - c * c, 1e-12)), 114.58865);
+    f.rot = vec2<f32>(cos(L.cookie.y), sin(L.cookie.y));
+    return f;
+}
+
+/// Gobo : part de la lumière qui passe le motif projeté (1 sans gobo). Le motif occupe le
+/// cône du projecteur (échelle 1), haut de l'image vers le haut du repère ; hors de l'image :
+/// noir (blanc s'il est inversé).
+fn dl_cookie(p: vec3<f32>, L: DynLight, fr: DlFrame) -> f32 {
+    let layer = L.cookie.x;
+    if layer < 0.0 {
+        return 1.0;
+    }
+    let to = p - L.pos_range.xyz;
+    let z = dot(fr.b[2], to);
+    if z < 0.001 {
+        return 1.0;
+    }
+    var q = vec2<f32>(dot(fr.b[0], to), dot(fr.b[1], to)) * (fr.fy / z) / max(L.cookie.z, 1e-3);
+    q = vec2<f32>(fr.rot.x * q.x - fr.rot.y * q.y, fr.rot.y * q.x + fr.rot.x * q.y);
+    let uv = vec2<f32>(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+    let inside = all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
+    var m = textureSampleLevel(gobos, gobo_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), i32(layer), 0.0).r;
+    m = select(0.0, m, inside);
+    return select(m, 1.0 - m, L.cookie.w > 0.5);
+}
+
 /// Position dans l'atlas (uv) du texel qui voit la direction `d` depuis la lumière ;
 /// z = 1 si la direction est dans la carte (un projecteur ne voit que son cône).
-fn dl_shadow_uv(L: DynLight, d: vec3<f32>) -> vec3<f32> {
-    var b: mat3x3<f32>;
-    var tile = L.vol.w;
+fn dl_shadow_uv(L: DynLight, fr: DlFrame, d: vec3<f32>) -> vec3<f32> {
+    var c: vec3<f32>;
+    var rect = fr.rect;
     if L.shadow.x > 1.5 {
         let f = dl_cube_face(d);
-        b = dl_face_basis(f);
-        tile = tile + f32(f);
+        c = dl_face_coords(f, d);
+        rect = dl_tile_rect(L.vol.w + f32(f));
     } else {
-        b = dl_spot_basis(normalize(L.dir_type.xyz));
+        c = vec3<f32>(dot(fr.b[0], d), dot(fr.b[1], d), dot(fr.b[2], d));
     }
-    let fz = dot(b[2], d);
-    let ndc = vec2<f32>(dot(b[0], d), dot(b[1], d)) / max(fz * L.shadow.y, 1e-6);
-    let ok = fz > 1e-5 && all(abs(ndc) <= vec2<f32>(1.0));
-    let rect = dl_tile_rect(tile);
+    let ndc = c.xy / max(c.z * L.shadow.y, 1e-6);
+    let ok = c.z > 1e-5 && all(abs(ndc) <= vec2<f32>(1.0));
     // Un demi-texel à l'intérieur de la case : le filtrage ne lit jamais la case voisine.
     let px = 1.0 / max(dh.sh.y, 1.0);
     let local = clamp(
@@ -191,13 +214,18 @@ fn dl_shadow_uv(L: DynLight, d: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(rect.xy + local, select(0.0, 1.0, ok));
 }
 
+/// Rotation du disque de Vogel d'un échantillon au suivant (angle d'or).
+const DL_GOLDEN = vec2<f32>(-0.73736887, 0.67549029);
+
 /// Visibilité (0 dans l'ombre … 1 éclairé) de la lumière `L` en `p`, face de normale `n`
 /// tournée vers elle. Ombres douces (PCSS) : recherche des bloqueurs, puis filtrage dont la
 /// largeur grandit avec la taille de la source et la distance au bloqueur. Chaque échantillon
 /// est comparé à la distance du plan de la face dans sa direction (pas d'acné sur les faces
 /// des blocs, même rasantes). `noise` : rotation du disque (lissée par le TAA) ; `soft` :
 /// faux pour un apport trop faible pour que la pénombre se voie (un seul échantillon).
-fn dl_shadow(L: DynLight, p: vec3<f32>, n: vec3<f32>, noise: f32, soft: bool) -> f32 {
+/// Les points du disque de Vogel (rayon √((k + ½) / n), angle k × angle d'or + rotation)
+/// sont obtenus en tournant le précédent : ni sinus ni cosinus par échantillon.
+fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, soft: bool) -> f32 {
     let range = max(L.pos_range.w, 0.01);
     let lp = L.pos_range.xyz;
     let d0 = length(p - lp);
@@ -208,7 +236,7 @@ fn dl_shadow(L: DynLight, p: vec3<f32>, n: vec3<f32>, noise: f32, soft: bool) ->
     let dist = max(length(to), 1e-4);
     let dir = to / dist;
     let ndt = dot(n, to);
-    let center = dl_shadow_uv(L, dir);
+    let center = dl_shadow_uv(L, fr, dir);
     if center.z < 0.5 {
         return 1.0;
     }
@@ -228,10 +256,12 @@ fn dl_shadow(L: DynLight, p: vec3<f32>, n: vec3<f32>, noise: f32, soft: bool) ->
     let search = clamp(bulb / max(dist, 0.25), 1.5 * ang_texel, 0.45);
     var sum = 0.0;
     var cnt = 0.0;
+    var a = vec2<f32>(cos(phi), sin(phi));
     for (var k = 0u; k < 8u; k++) {
-        let o = dl_vogel(k, 8u, phi) * search;
+        let o = a * (sqrt((f32(k) + 0.5) / 8.0) * search);
+        a = vec2<f32>(a.x * DL_GOLDEN.x - a.y * DL_GOLDEN.y, a.x * DL_GOLDEN.y + a.y * DL_GOLDEN.x);
         let dk = normalize(dir + t1 * o.x + t2 * o.y);
-        let s = dl_shadow_uv(L, dk);
+        let s = dl_shadow_uv(L, fr, dk);
         let nd = dot(n, dk);
         let tk = select(dist, clamp(ndt / nd, 0.0, range * 2.0), nd < -1e-3);
         let z = textureLoad(shadow_atlas, vec2<i32>(s.xy * dh.sh.y), 0);
@@ -247,10 +277,12 @@ fn dl_shadow(L: DynLight, p: vec3<f32>, n: vec3<f32>, noise: f32, soft: bool) ->
     let pen = bulb * max(dist - db, 0.0) / db;
     let filt = clamp(0.5 * pen / dist, ang_texel, 0.45);
     var vis = 0.0;
+    a = vec2<f32>(cos(phi + 1.7), sin(phi + 1.7));
     for (var k = 0u; k < 12u; k++) {
-        let o = dl_vogel(k, 12u, phi + 1.7) * filt;
+        let o = a * (sqrt((f32(k) + 0.5) / 12.0) * filt);
+        a = vec2<f32>(a.x * DL_GOLDEN.x - a.y * DL_GOLDEN.y, a.x * DL_GOLDEN.y + a.y * DL_GOLDEN.x);
         let dk = normalize(dir + t1 * o.x + t2 * o.y);
-        let s = dl_shadow_uv(L, dk);
+        let s = dl_shadow_uv(L, fr, dk);
         let nd = dot(n, dk);
         let tk = select(dist, clamp(ndt / nd, 0.0, range * 2.0), nd < -1e-3);
         let c = textureSampleCompareLevel(shadow_atlas, shadow_cmp, s.xy, tk / range - eps);
@@ -365,16 +397,17 @@ fn dyn_light(
                 let dr2 = dr * dr;
                 let fall = max(1.0 - dr2 * dr2, 0.0);
                 var att = fall * fall;
+                let fr = dl_frame(L);
                 if L.dir_type.w > 0.5 {
                     let theta = dot(-l, L.dir_type.xyz);
                     att *= clamp((theta - L.cone.x) / max(L.cone.y - L.cone.x, 1e-6), 0.0, 1.0);
                     if att > 0.0 {
-                        att *= dl_cookie(p, L);
+                        att *= dl_cookie(p, L, fr);
                     }
                 }
                 if att > 0.0 && ndl > 0.0 {
                     if shadows_on && L.shadow.x > 0.5 {
-                        att *= dl_shadow(L, p, n, noise, att * L.color.w > 0.003);
+                        att *= dl_shadow(L, fr, p, n, noise, att * L.color.w > 0.003);
                     }
                     if boxes_on && att > 0.0 && (L.boxes.x | L.boxes.y) != 0u {
                         att *= 1.0 - dl_box_shadow(L, p + n * 0.02);

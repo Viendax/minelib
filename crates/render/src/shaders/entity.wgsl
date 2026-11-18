@@ -1,7 +1,8 @@
 // Minelib — entités dans le monde (modèle du joueur) : position monde, couleur unie, et
-// l'éclairage du lieu donné par le jeu ; plus la lumière des lumières dynamiques (normale
-// de la face tirée des dérivées de la position : les modèles sont faits de faces planes).
-// dynlights.wgsl est ajouté à la suite.
+// l'éclairage du lieu donné par le jeu. Avec l'anticrénelage, elles laissent aussi albédo et
+// normale (tirée des dérivées de la position : les modèles sont faits de faces planes) :
+// les lumières dynamiques leur sont ajoutées après coup (dyn_deferred.wgsl). gbuffer.wgsl
+// et dynlights_off.wgsl sont ajoutés à la suite.
 
 // Début des uniformes du monde : la caméra (avec le tremblement du TAA), puis les
 // matrices sans tremblement (image courante et précédente) pour les vecteurs de mouvement.
@@ -53,15 +54,9 @@ fn texel(i: VOut) -> vec3<f32> {
     return i.color * t.rgb;
 }
 
-/// Couleur éclairée : lumière du lieu, plus les lumières dynamiques (face de normale `n`).
-fn shade(i: VOut, n: vec3<f32>) -> vec3<f32> {
-    let base = texel(i);
-    var c = base * i.light.rgb * 2.0;
-    if i.light.a > 0.5 && dyn_active() {
-        let d = dyn_light(i.world, n, g.cam_pos.xyz, 0.15, true, i.clip.xy, g.screen.xy);
-        c += base * d.diffuse + d.specular * 0.5;
-    }
-    return c;
+/// Couleur éclairée par la lumière du lieu.
+fn shade(i: VOut) -> vec3<f32> {
+    return texel(i) * i.light.rgb * 2.0;
 }
 
 /// Normale de la face (vers la caméra), d'après les dérivées de la position : à calculer
@@ -87,24 +82,36 @@ fn vs_main(v: VIn) -> VOut {
 
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
-    let n = face_normal(i.world);
-    return vec4<f32>(shade(i, n), 1.0);
+    return vec4<f32>(shade(i), 1.0);
 }
 
+/// Avec l'anticrénelage : couleur, mouvement, et de quoi y ajouter les lumières dynamiques
+/// (voir gbuffer.wgsl ; albédo.a = 1 : entité).
 struct TaaOut {
     @location(0) color: vec4<f32>,
     @location(1) motion: vec2<f32>,
+    @location(2) albedo: vec4<f32>,
+    @location(3) surf: vec4<f32>,
 };
+
+fn taa_out(i: VOut, n: vec3<f32>, motion: vec2<f32>) -> TaaOut {
+    let base = texel(i);
+    // `light.a` à 0 : pas de lumières dynamiques sur cette entité.
+    let lit = select(0.0, 1.0, i.light.a > 0.5);
+    var o: TaaOut;
+    o.color = vec4<f32>(base * i.light.rgb * 2.0, 1.0);
+    o.motion = motion;
+    o.albedo = vec4<f32>(base, 1.0);
+    o.surf = vec4<f32>(gb_oct_encode(n), lit, gb_pack_spec(0.5 * lit, false));
+    return o;
+}
 
 // Avec l'anticrénelage temporel, le modèle du joueur local (il suit la caméra) : pas de
 // vecteur de mouvement.
 @fragment
 fn fs_taa(i: VOut) -> TaaOut {
     let n = face_normal(i.world);
-    var o: TaaOut;
-    o.color = vec4<f32>(shade(i, n), 1.0);
-    o.motion = vec2<f32>(0.0);
-    return o;
+    return taa_out(i, n, vec2<f32>(0.0));
 }
 
 // Le reste (têtes des cartes, autres joueurs, bombe, armes au sol) : fixé dans le monde,
@@ -112,12 +119,9 @@ fn fs_taa(i: VOut) -> TaaOut {
 @fragment
 fn fs_taa_world(i: VOut) -> TaaOut {
     let n = face_normal(i.world);
-    var o: TaaOut;
-    o.color = vec4<f32>(shade(i, n), 1.0);
     let p = vec4<f32>(i.world, 1.0);
     let cur = g.cur_view_proj * p;
     let prev = g.prev_view_proj * p;
     let d = prev.xy / prev.w - cur.xy / cur.w;
-    o.motion = d * vec2<f32>(0.5, -0.5) * g.screen.xy;
-    return o;
+    return taa_out(i, n, d * vec2<f32>(0.5, -0.5) * g.screen.xy);
 }

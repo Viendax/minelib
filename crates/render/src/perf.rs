@@ -8,19 +8,50 @@
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-/// Temps GPU d'une image (ms) : scène, anticrénelage, affichage + interface.
+/// Temps GPU d'une image (ms) : scène (opaques), anticrénelage, affichage + interface ; et
+/// avec les lumières dynamiques : éclairage différé, translucides (passe à part), rayons
+/// volumétriques, cartes d'ombre.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuTimes {
     pub scene: f32,
     pub taa: f32,
     pub present: f32,
+    pub lights: f32,
+    pub after: f32,
+    pub volumetric: f32,
+    pub bake: f32,
     /// Du début de la scène à la fin de l'affichage, temps morts entre passes compris.
     pub span: f32,
 }
 
 impl GpuTimes {
     pub fn total(&self) -> f32 {
-        self.scene + self.taa + self.present
+        self.scene
+            + self.taa
+            + self.present
+            + self.lights
+            + self.after
+            + self.volumetric
+            + self.bake
+    }
+
+    /// Passes des lumières dynamiques et translucides, pour le journal (vide sans elles).
+    fn extra(&self, k: f32) -> String {
+        let parts: Vec<String> = [
+            ("translucides", self.after),
+            ("lumières", self.lights),
+            ("rayons", self.volumetric),
+            ("cartes d'ombre", self.bake),
+        ]
+        .iter()
+        .filter(|(_, v)| *v > 0.0)
+        .map(|(n, v)| format!("{n} {:.2}", v / k))
+        .collect();
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", parts.join(", "))
+        }
     }
 }
 
@@ -164,13 +195,19 @@ pub fn gpu(t: GpuTimes) {
     PERF.with(|p| {
         let mut p = p.borrow_mut();
         p.gpu_last = Some(t);
+        // La scène entière : opaques, translucides (passe à part) et lumières.
+        let scene = t.scene + t.after + t.lights + t.volumetric + t.bake;
         p.gpu_smooth = Some(match p.gpu_smooth {
-            Some(v) => v + (t.scene - v) * 0.02,
-            None => t.scene,
+            Some(v) => v + (scene - v) * 0.02,
+            None => scene,
         });
         p.window_gpu.0.scene += t.scene;
         p.window_gpu.0.taa += t.taa;
         p.window_gpu.0.present += t.present;
+        p.window_gpu.0.lights += t.lights;
+        p.window_gpu.0.after += t.after;
+        p.window_gpu.0.volumetric += t.volumetric;
+        p.window_gpu.0.bake += t.bake;
         p.window_gpu.0.span += t.span;
         p.window_gpu.1 += 1;
     });
@@ -226,7 +263,7 @@ pub fn frame_end() {
             if p.slow_logged.1 < 2 {
                 p.slow_logged.1 += 1;
                 let gpu = p.gpu_last.map_or(String::new(), |g| {
-                    format!(" | GPU (dernière mesure) : scène {:.2}, TAA {:.2}, affichage {:.2} ms", g.scene, g.taa, g.present)
+                    format!(" | GPU (dernière mesure) : scène {:.2}{}, TAA {:.2}, affichage {:.2} ms", g.scene, g.extra(1.0), g.taa, g.present)
                 });
                 let ev = if frame.events.is_empty() { "aucun".to_string() } else { frame.events.join(" ; ") };
                 log::warn!(
@@ -258,7 +295,7 @@ pub fn frame_end() {
             let gpu = if p.window_gpu.1 > 0 {
                 let k = p.window_gpu.1 as f32;
                 let g = p.window_gpu.0;
-                format!(" | GPU moyen : scène {:.2}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2})", g.scene / k, g.taa / k, g.present / k, g.span / k)
+                format!(" | GPU moyen : scène {:.2}{}, TAA {:.2}, affichage {:.2} ms (du début à la fin : {:.2})", g.scene / k, g.extra(k), g.taa / k, g.present / k, g.span / k)
             } else {
                 " | GPU : mesure indisponible".to_string()
             };

@@ -174,19 +174,19 @@ struct ScenePipes<'p> {
     sky: &'p wgpu::RenderPipeline,
     outline: &'p wgpu::RenderPipeline,
     heavy: Option<&'p taa::Heavy>,
-    /// Entités éclairées par les lumières de l'éditeur (sinon : pipelines habituels).
-    entities: Option<&'p entity::EntityPipes>,
-    /// Passe à deux cibles (anticrénelage temporel).
+    /// Translucides éclairés par les lumières de l'éditeur (sinon : ceux de `heavy`).
+    translucent: Option<&'p wgpu::RenderPipeline>,
+    /// Anticrénelage temporel (passes à plusieurs cibles).
     taa: bool,
 }
 
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Variantes éclairées par les lumières de l'éditeur : monde, entités, cartes d'ombre,
-/// rayons. Compilées sur un fil à part la première fois qu'une lumière est posée.
+/// Pipelines des lumières de l'éditeur : éclairage différé, cartes d'ombre, rayons.
+/// Compilés sur des fils à part la première fois qu'il y a une lumière. Petits : le shader
+/// du monde n'en a plus besoin (il laisse albédo et surface à l'éclairage différé).
 struct LitPipes {
-    heavy: taa::Heavy,
-    entities: entity::EntityPipes,
+    deferred: wgpu::RenderPipeline,
     bake: wgpu::RenderPipeline,
     vl: lights::VlPipes,
 }
@@ -643,6 +643,10 @@ pub struct Renderer {
     /// Leurs shaders, compilés à la première lumière posée (`Err` : refusés par la carte ou
     /// son pilote ; le jeu continue sans elles).
     lit: Option<lazy::Lazy<Result<LitPipes, String>>>,
+    /// Translucides (eau, glace, verre) éclairés par les lumières : le shader du monde avec
+    /// leur code, compilé ensuite (le plus long) ; d'ici là, les translucides ne prennent
+    /// pas leur lumière (l'opaque derrière, si).
+    lit_translucent: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
     /// Images restantes pendant lesquelles l'anticrénelage considère que les lumières ont
     /// changé (déplacées, réglées) : comme `mesh_changes`.
     dyn_changes: u32,
@@ -1067,6 +1071,7 @@ impl Renderer {
             voxels,
             dyn_gpu,
             lit: None,
+            lit_translucent: None,
             dyn_changes: 0,
             skin_key: None,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
@@ -1418,14 +1423,22 @@ impl Renderer {
     /// Lance la compilation des shaders des lumières (sur des fils à part), sans attendre
     /// qu'une lumière soit posée : au lancement du jeu chez qui s'en sert, elles sont
     /// prêtes plus tôt. Avec peu de cœurs, seulement après les shaders du monde (pas deux
-    /// compilations lourdes à la fois : le monde s'afficherait plus tard). Vrai si elle est
-    /// lancée (ou déjà faite) ; sinon, à redemander plus tard.
+    /// compilations lourdes à la fois : le monde s'afficherait plus tard). Vrai quand tout est
+    /// lancé (ou refusé) ; sinon, à redemander aux images suivantes.
     pub fn warm_dyn_lights(&mut self) -> bool {
         let many_cores = std::thread::available_parallelism().is_ok_and(|n| n.get() >= 8);
         if self.lit.is_none() && (many_cores || self.world_ready()) {
             self.lit = Some(self.spawn_lit());
         }
-        self.lit.is_some()
+        // Puis les translucides éclairés (le plus long), une fois les autres prêts.
+        if self.lit_pipes().is_some() && self.lit_translucent.is_none() {
+            self.lit_translucent = Some(self.spawn_lit_translucent());
+        }
+        let failed = self
+            .lit
+            .as_ref()
+            .is_some_and(|l| matches!(l.try_get(), Some(Err(_))));
+        self.lit_translucent.is_some() || failed
     }
 
     /// Variantes éclairées, si elles sont prêtes.
@@ -1437,13 +1450,12 @@ impl Renderer {
     /// DirectX, pilote) sont récupérées ici : elles coûtent les lumières, pas le jeu.
     fn spawn_lit(&self) -> lazy::Lazy<Result<LitPipes, String>> {
         let device = self.device.clone();
-        let layout = self.world_layout.clone();
         let bgl = self.bgl.clone();
-        let format = self.config.format;
-        let (bake_bgl, vl_bgl, comp_bgl) = (
+        let (bake_bgl, vl_bgl, comp_bgl, def_bgl) = (
             self.dyn_gpu.bake_bgl.clone(),
             self.dyn_gpu.vl_bgl.clone(),
             self.dyn_gpu.comp_bgl.clone(),
+            self.dyn_gpu.def_bgl.clone(),
         );
         lazy::Lazy::spawn("shaders des lumières", move || {
             let t0 = std::time::Instant::now();
@@ -1456,25 +1468,8 @@ impl Renderer {
             }
             device.push_error_scope(wgpu::ErrorFilter::Validation);
             device.push_error_scope(wgpu::ErrorFilter::Internal);
-            let world = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("monde (lumières)"),
-                source: wgpu::ShaderSource::Wgsl(
-                    lights::with_dynlights(include_str!("shaders/world.wgsl")).into(),
-                ),
-            });
-            // Tous les pipelines en même temps, chacun sur son fil : sous DirectX, chacun
-            // compte plusieurs secondes de compilation ; à la suite, il fallait 25 s.
-            let (heavy, entities, (bake, vl)) = std::thread::scope(|sc| {
-                let heavy = sc.spawn(|| taa::build_heavy(&device, &layout, &world));
-                let entities = sc.spawn(|| entity::EntityPipes::new(&device, &bgl, format, true));
-                let lights =
-                    sc.spawn(|| lights::light_pipes(&device, &bgl, &bake_bgl, &vl_bgl, &comp_bgl));
-                (
-                    heavy.join().expect("shaders du monde (lumières)"),
-                    entities.join().expect("shaders des entités (lumières)"),
-                    lights.join().expect("shaders des lumières"),
-                )
-            });
+            let (bake, vl, deferred) =
+                lights::light_pipes(&device, &bgl, &bake_bgl, &vl_bgl, &comp_bgl, &def_bgl);
             let internal = pollster::block_on(device.pop_error_scope());
             let validation = pollster::block_on(device.pop_error_scope());
             if let Some(e) = internal.or(validation) {
@@ -1485,13 +1480,43 @@ impl Renderer {
                 "shaders des lumières compilés en {:.1} s (en tâche de fond)",
                 t0.elapsed().as_secs_f32()
             );
-            Ok(LitPipes {
-                heavy,
-                entities,
-                bake,
-                vl,
-            })
+            Ok(LitPipes { deferred, bake, vl })
         })
+    }
+
+    /// Translucides éclairés par les lumières, après les autres pipelines des lumières
+    /// (jamais deux `push_error_scope` à la fois : la pile est commune à tout le device).
+    fn spawn_lit_translucent(&self) -> lazy::Lazy<Result<wgpu::RenderPipeline, String>> {
+        let device = self.device.clone();
+        let layout = self.world_layout.clone();
+        lazy::Lazy::spawn("translucides éclairés", move || {
+            let t0 = std::time::Instant::now();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let world = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("monde (lumières)"),
+                source: wgpu::ShaderSource::Wgsl(
+                    lights::with_dynlights(include_str!("shaders/world.wgsl")).into(),
+                ),
+            });
+            let pipeline = taa::translucent_pipeline(&device, &layout, &world);
+            let internal = pollster::block_on(device.pop_error_scope());
+            let validation = pollster::block_on(device.pop_error_scope());
+            if let Some(e) = internal.or(validation) {
+                log::warn!("translucides éclairés refusés : sans les lumières ({e})");
+                return Err(e.to_string());
+            }
+            log::info!(
+                "translucides éclairés par les lumières compilés en {:.1} s (en tâche de fond)",
+                t0.elapsed().as_secs_f32()
+            );
+            Ok(pipeline)
+        })
+    }
+
+    /// Translucides éclairés, s'ils sont prêts.
+    fn lit_translucent(&self) -> Option<&wgpu::RenderPipeline> {
+        self.lit_translucent.as_ref()?.try_get()?.as_ref().ok()
     }
 
     /// Les lumières dynamiques ont-elles besoin de la grille de blocs (ombres) ?
@@ -1959,19 +1984,35 @@ impl Renderer {
 
     /// Ciel, blocs opaques, blocs qui reflètent, contour du bloc visé, translucides
     /// (pipelines : [ciel, blocs, translucides, contour, reflets]).
+    /// Ciel, blocs, miroirs, entités, puis contour, écrans vidéo et translucides, dans la
+    /// même passe (sans l'anticrénelage).
     fn draw_scene<'p>(
         &'p self,
         pass: &mut wgpu::RenderPass<'p>,
         pipes: ScenePipes<'p>,
         stats: &mut FrameStats,
     ) {
+        if self.draw_opaque(pass, &pipes, stats) {
+            self.draw_after(pass, &pipes);
+        }
+    }
+
+    /// Passe des opaques : ciel, blocs, miroirs, entités. Avec l'anticrénelage, elle laisse
+    /// aussi albédo et surface pour l'éclairage différé des lumières dynamiques. Faux si les
+    /// shaders lourds ne sont pas encore prêts (le ciel seulement).
+    fn draw_opaque<'p>(
+        &'p self,
+        pass: &mut wgpu::RenderPass<'p>,
+        pipes: &ScenePipes<'p>,
+        stats: &mut FrameStats,
+    ) -> bool {
         pass.set_bind_group(0, self.world_group(), &[]);
 
         pass.set_pipeline(pipes.sky);
         pass.draw(0..3, 0..1);
         // Shaders lourds pas encore compilés (tout début du jeu) : le ciel seulement.
         let Some(heavy) = pipes.heavy else {
-            return;
+            return false;
         };
 
         // Blocs opaques : une page entière par appel (dessin indirect multiple), sinon un
@@ -2005,17 +2046,27 @@ impl Renderer {
             "milliers de triangles par image",
             self.drawn_triangles as f32 / 1000.0,
         );
+        // Entités (joueurs, têtes, cadres) avant le verre et l'eau : elles se voient à
+        // travers, teintées, au lieu de passer devant.
+        self.entities.draw(pass, self.world_group(), pipes.taa);
+        true
+    }
+
+    /// Après les opaques (et l'éclairage différé) : contour du bloc visé, écrans vidéo,
+    /// translucides de l'arrière vers l'avant.
+    fn draw_after<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, pipes: &ScenePipes<'p>) {
+        let Some(heavy) = pipes.heavy else {
+            return;
+        };
+        pass.set_bind_group(0, self.world_group(), &[]);
         if self.outline {
             pass.set_pipeline(pipes.outline);
             pass.draw(0..24, 0..1);
         }
-        // Entités (joueurs, têtes, cadres) avant le verre et l'eau : elles se voient à
-        // travers, teintées, au lieu de passer devant.
-        self.entities
-            .draw(pass, self.world_group(), pipes.taa, pipes.entities);
         self.screen.draw(pass, pipes.taa);
         // Translucides de l'arrière vers l'avant, par-dessus la scène opaque.
-        pass.set_pipeline(&heavy.translucent);
+        pass.set_bind_group(0, self.world_group(), &[]);
+        pass.set_pipeline(pipes.translucent.unwrap_or(&heavy.translucent));
         let mut bound = usize::MAX;
         for (_, key) in self.draw_list.iter().rev() {
             let c = &self.meshes[key];
@@ -2146,7 +2197,7 @@ impl Renderer {
                     sky: &self.sky_pipeline,
                     outline: &self.outline_pipeline,
                     heavy: Some(self.plain_pipes()),
-                    entities: None,
+                    translucent: None,
                     taa: false,
                 },
                 &mut stats,
@@ -2366,8 +2417,12 @@ impl Renderer {
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // Cartes d'ombre des lumières dynamiques (seulement celles qui ont changé).
-        if let Some(l) = self.lit_pipes() {
-            self.dyn_gpu.encode_bake(&mut encoder, &l.bake);
+        if let Some(l) = self.lit_pipes().filter(|_| self.dyn_gpu.bake_pending()) {
+            let ts = self
+                .gpu_timer
+                .as_ref()
+                .and_then(|t| t.pass(gpu_timer::BAKE));
+            self.dyn_gpu.encode_bake(&mut encoder, &l.bake, ts);
         }
         if do_refl {
             // Écrit l'image `latest` (déjà avancée par `ran`) en lisant l'autre.
@@ -2400,55 +2455,118 @@ impl Renderer {
             }
             self.draw_reflective(&mut pass);
         }
+        // Lumières de l'éditeur : actives cette image, et leurs pipelines prêts.
+        let lights_on = self.dyn_gpu.active() && self.lit_pipes().is_some();
         if let Some(t) = &taa.targets {
+            // 1. Opaques : couleur, mouvement, et albédo et surface pour l'éclairage différé.
+            let color = |view, load| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })
+            };
+            let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("monde (TAA)"),
+                    color_attachments: &[
+                        color(&t.color_view, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
+                        color(&t.motion_view, clear),
+                        color(&t.gbuf_views[0], clear),
+                        color(&t.gbuf_views[1], clear),
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &t.depth_views[taa.depth_index()],
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: self
+                        .gpu_timer
+                        .as_ref()
+                        .and_then(|t| t.pass(gpu_timer::SCENE)),
+                    occlusion_query_set: None,
+                });
+                self.draw_opaque(
+                    &mut pass,
+                    &ScenePipes {
+                        sky: &taa.sky,
+                        outline: &taa.outline,
+                        heavy: taa.heavy.try_get(),
+                        translucent: None,
+                        taa: true,
+                    },
+                    &mut stats,
+                );
+            }
+            // 2. Lumières de l'éditeur ajoutées une fois par pixel visible.
+            if lights_on {
+                if let Some(l) = self
+                    .lit
+                    .as_ref()
+                    .and_then(|l| l.try_get())
+                    .and_then(|r| r.as_ref().ok())
+                {
+                    let wg = self.world_group().clone();
+                    let ts = self
+                        .gpu_timer
+                        .as_ref()
+                        .and_then(|t| t.pass(gpu_timer::LIGHTS));
+                    self.dyn_gpu.encode_deferred(
+                        &self.device,
+                        &mut encoder,
+                        &wg,
+                        &t.depth_views,
+                        taa.depth_index(),
+                        &t.gbuf_views,
+                        t.generation,
+                        &t.color_view,
+                        &l.deferred,
+                        ts,
+                    );
+                }
+            }
+            // 3. Contour, écrans vidéo, translucides (éclairés par les lumières si leur
+            // variante est prête), fumigènes.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("monde (TAA)"),
+                label: Some("translucides (TAA)"),
                 color_attachments: &[
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &t.color_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &t.motion_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
+                    color(&t.color_view, wgpu::LoadOp::Load),
+                    color(&t.motion_view, wgpu::LoadOp::Load),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_views[taa.depth_index()],
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.0),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass(0)),
+                timestamp_writes: self
+                    .gpu_timer
+                    .as_ref()
+                    .and_then(|t| t.pass(gpu_timer::AFTER)),
                 occlusion_query_set: None,
             });
-            let lit = if self.dyn_gpu.active() {
-                self.lit_pipes()
-            } else {
-                None
-            };
-            self.draw_scene(
+            self.draw_after(
                 &mut pass,
-                ScenePipes {
+                &ScenePipes {
                     sky: &taa.sky,
                     outline: &taa.outline,
-                    // Variantes éclairées seulement quand il y a des lumières : sans elles,
-                    // les shaders de tous les jours (plus légers).
-                    heavy: lit.map(|l| &l.heavy).or(taa.heavy.try_get()),
-                    entities: lit.map(|l| &l.entities),
+                    heavy: taa.heavy.try_get(),
+                    translucent: if lights_on {
+                        self.lit_translucent()
+                    } else {
+                        None
+                    },
                     taa: true,
                 },
-                &mut stats,
             );
             self.smokes.draw(&mut pass, self.world_group(), true);
         }
@@ -2462,6 +2580,7 @@ impl Renderer {
         if let (Some(t), Some(vl)) = (&taa.targets, vl) {
             if self.dyn_gpu.volumetric_active() {
                 let wg = self.world_group().clone();
+                let timer = self.gpu_timer.as_ref();
                 self.dyn_gpu.encode_volumetric(
                     &self.device,
                     &mut encoder,
@@ -2472,13 +2591,17 @@ impl Renderer {
                     t.internal,
                     &t.color_view,
                     vl,
+                    (
+                        timer.and_then(|t| t.pass_begin(gpu_timer::VOLUMETRIC)),
+                        timer.and_then(|t| t.pass_end(gpu_timer::VOLUMETRIC)),
+                    ),
                 );
             }
         }
         taa.resolve(
             &self.queue,
             &mut encoder,
-            self.gpu_timer.as_ref().and_then(|t| t.pass(1)),
+            self.gpu_timer.as_ref().and_then(|t| t.pass(gpu_timer::TAA)),
         );
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2499,7 +2622,10 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass(2)),
+                timestamp_writes: self
+                    .gpu_timer
+                    .as_ref()
+                    .and_then(|t| t.pass(gpu_timer::PRESENT)),
                 occlusion_query_set: None,
             });
             taa.present(&mut pass);
@@ -2850,6 +2976,10 @@ mod tests {
             (
                 "volumetric",
                 lights::with_dynlights(include_str!("shaders/volumetric.wgsl")),
+            ),
+            (
+                "dyn_deferred",
+                lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
             ),
             (
                 "viewmodel",

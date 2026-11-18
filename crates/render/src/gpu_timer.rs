@@ -1,13 +1,24 @@
-//! Temps GPU de chaque passe (scène, anticrénelage, affichage + interface), mesurés par
-//! des horodatages GPU et relus quelques images plus tard, sans jamais attendre le GPU.
+//! Temps GPU de chaque passe (scène, anticrénelage, affichage + interface, et celles des
+//! lumières dynamiques), mesurés par des horodatages GPU et relus quelques images plus tard,
+//! sans jamais attendre le GPU.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::perf::GpuTimes;
 
-/// 3 passes × (début, fin).
-const QUERIES: u32 = 6;
+/// Passes mesurées : 0 scène (opaques), 1 TAA, 2 affichage, 3 éclairage différé,
+/// 4 translucides, 5 rayons volumétriques, 6 cartes d'ombre.
+pub const SCENE: u32 = 0;
+pub const TAA: u32 = 1;
+pub const PRESENT: u32 = 2;
+pub const LIGHTS: u32 = 3;
+pub const AFTER: u32 = 4;
+pub const VOLUMETRIC: u32 = 5;
+pub const BAKE: u32 = 6;
+const PASSES: u32 = 7;
+/// Chaque passe × (début, fin).
+const QUERIES: u32 = PASSES * 2;
 /// Tampons de relecture en rotation (le GPU a quelques images d'avance).
 const RING: usize = 4;
 
@@ -23,6 +34,10 @@ pub struct GpuTimer {
     period_ns: f32,
     /// Écrit ce frame-ci dans `readback[slot]` (None : tous occupés, pas de mesure).
     slot: Option<usize>,
+    /// Passes mesurées dans cette image (bits), puis dans l'image de chaque tampon : une
+    /// passe qui n'a pas eu lieu (pas de lumière) ne compte pas.
+    marks: AtomicU32,
+    slot_marks: Vec<u32>,
 }
 
 impl GpuTimer {
@@ -60,11 +75,14 @@ impl GpuTimer {
             next: 0,
             period_ns: queue.get_timestamp_period(),
             slot: None,
+            marks: AtomicU32::new(0),
+            slot_marks: vec![0; RING],
         })
     }
 
     /// Début d'image : choisit un tampon libre pour cette image.
     pub fn begin(&mut self) {
+        self.marks.store(0, Ordering::Relaxed);
         let i = self.next;
         self.slot = (self.readback[i].1.load(Ordering::Acquire) == FREE).then_some(i);
         if self.slot.is_some() {
@@ -72,12 +90,34 @@ impl GpuTimer {
         }
     }
 
-    /// Horodatages d'une passe (0 scène, 1 TAA, 2 affichage).
+    /// Horodatages d'une passe (voir les constantes).
     pub fn pass(&self, index: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
         self.slot?;
+        self.marks.fetch_or(1 << index, Ordering::Relaxed);
         Some(wgpu::RenderPassTimestampWrites {
             query_set: &self.set,
             beginning_of_pass_write_index: Some(index * 2),
+            end_of_pass_write_index: Some(index * 2 + 1),
+        })
+    }
+
+    /// Mesure à cheval sur plusieurs passes : son début (au début de la première)…
+    pub fn pass_begin(&self, index: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.slot?;
+        self.marks.fetch_or(1 << index, Ordering::Relaxed);
+        Some(wgpu::RenderPassTimestampWrites {
+            query_set: &self.set,
+            beginning_of_pass_write_index: Some(index * 2),
+            end_of_pass_write_index: None,
+        })
+    }
+
+    /// … et sa fin (à la fin de la dernière).
+    pub fn pass_end(&self, index: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.slot?;
+        Some(wgpu::RenderPassTimestampWrites {
+            query_set: &self.set,
+            beginning_of_pass_write_index: None,
             end_of_pass_write_index: Some(index * 2 + 1),
         })
     }
@@ -92,6 +132,7 @@ impl GpuTimer {
     /// Après `submit` : demande la relecture, et récupère les mesures déjà prêtes.
     pub fn after_submit(&mut self, device: &wgpu::Device) -> Option<GpuTimes> {
         if let Some(i) = self.slot.take() {
+            self.slot_marks[i] = self.marks.swap(0, Ordering::Relaxed);
             let state = self.readback[i].1.clone();
             state.store(MAPPING, Ordering::Release);
             self.readback[i]
@@ -103,27 +144,33 @@ impl GpuTimer {
         }
         let _ = device.poll(wgpu::PollType::Poll);
         let mut out = None;
-        for (buf, state) in &self.readback {
+        for (k, (buf, state)) in self.readback.iter().enumerate() {
             if state.load(Ordering::Acquire) != READY {
                 continue;
             }
             {
                 let data = buf.slice(..).get_mapped_range();
                 let t: &[u64] = bytemuck::cast_slice(&data);
-                let ms = |a: usize| {
-                    let (b, e) = (t[a * 2], t[a * 2 + 1]);
-                    if e > b && b != 0 {
+                let marks = self.slot_marks[k];
+                let ms = |a: u32| {
+                    let (b, e) = (t[a as usize * 2], t[a as usize * 2 + 1]);
+                    if marks & (1 << a) != 0 && e > b && b != 0 {
                         (e - b) as f32 * self.period_ns / 1e6
                     } else {
                         0.0
                     }
                 };
+                let (first, last) = (t[SCENE as usize * 2], t[PRESENT as usize * 2 + 1]);
                 out = Some(GpuTimes {
-                    scene: ms(0),
-                    taa: ms(1),
-                    present: ms(2),
-                    span: if t[5] > t[0] && t[0] != 0 {
-                        (t[5] - t[0]) as f32 * self.period_ns / 1e6
+                    scene: ms(SCENE),
+                    taa: ms(TAA),
+                    present: ms(PRESENT),
+                    lights: ms(LIGHTS),
+                    after: ms(AFTER),
+                    volumetric: ms(VOLUMETRIC),
+                    bake: ms(BAKE),
+                    span: if last > first && first != 0 {
+                        (last - first) as f32 * self.period_ns / 1e6
                     } else {
                         0.0
                     },

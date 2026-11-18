@@ -187,6 +187,8 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec
             }
             let seg = tf - tn;
             if seg > 0.0 {
+                // Repère, case de la carte d'ombre et gobo : une fois pour tout le rayon.
+                let fr = dl_frame(L);
                 let g_hg = clamp(L.vol.x, -0.95, 0.95);
                 let ext = max(L.vol.y, 1e-4);
                 let axis = normalize(L.dir_type.xyz);
@@ -217,7 +219,7 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec
                         let cone = clamp((dot(-l, axis) - L.cone.x) / max(L.cone.y - L.cone.x, 1e-6), 0.0, 1.0);
                         att = fall * cone;
                         if att > 0.0 {
-                            att *= dl_cookie(p, L);
+                            att *= dl_cookie(p, L, fr);
                         }
                     } else {
                         att = fall * fall;
@@ -225,7 +227,7 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec
                     }
                     if att > 0.0 {
                         if shadows_on && L.shadow.x > 0.5 && att > 0.01 && s % sh_stride == 0 {
-                            let su = dl_shadow_uv(L, -l);
+                            let su = dl_shadow_uv(L, fr, -l);
                             vis = select(1.0, textureSampleCompareLevel(shadow_atlas, shadow_cmp, su.xy, dist / range - 0.002), su.z > 0.5);
                         }
                         let tip = 1.0 + dh.vl_a.z * exp(-(dist * dist) / tip_r2);

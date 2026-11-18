@@ -5,7 +5,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::taa::{COLOR_FORMAT, MOTION_FORMAT};
+use crate::taa::{COLOR_FORMAT, GB_ALBEDO_FORMAT, GB_SURF_FORMAT, MOTION_FORMAT};
 use crate::DEPTH_FORMAT;
 
 /// Sommet d'entité : position monde et couleur linéaire (sans l'éclairage du lieu),
@@ -42,27 +42,20 @@ const MAX_VERTICES: usize = 1_048_576;
 
 /// Rendu direct (une cible) et rendu avec anticrénelage temporel (couleur + mouvement).
 pub(crate) struct EntityPipes {
-    /// Sans anticrénelage (pas dans la variante éclairée : les lumières ne servent
-    /// qu'avec lui).
-    plain: Option<wgpu::RenderPipeline>,
+    /// Sans anticrénelage.
+    plain: wgpu::RenderPipeline,
+    /// Avec : dans la passe des opaques (albédo et surface pour l'éclairage différé).
     taa: wgpu::RenderPipeline,
     taa_world: wgpu::RenderPipeline,
 }
 
 impl EntityPipes {
-    /// `lit` : variante éclairée par les lumières de l'éditeur (compilée à la demande).
     pub(crate) fn new(
         device: &wgpu::Device,
         bgl: &wgpu::BindGroupLayout,
         surface: wgpu::TextureFormat,
-        lit: bool,
     ) -> Self {
-        let src = include_str!("shaders/entity.wgsl");
-        let src = if lit {
-            crate::lights::with_dynlights(src)
-        } else {
-            crate::lights::without_dynlights(src)
-        };
+        let src = crate::lights::without_dynlights(include_str!("shaders/entity.wgsl"));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("entités"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -122,21 +115,17 @@ impl EntityPipes {
                 write_mask: wgpu::ColorWrites::ALL,
             })
         };
-        let taa_targets = [target(COLOR_FORMAT), target(MOTION_FORMAT)];
-        // Chacun sur son fil (plusieurs secondes de compilation chacun sous DirectX avec
-        // les lumières).
-        std::thread::scope(|sc| {
-            let plain =
-                (!lit).then(|| sc.spawn(|| pipeline("entités", "fs_main", &[target(surface)])));
-            let taa = sc.spawn(|| pipeline("entités (TAA)", "fs_taa", &taa_targets));
-            let taa_world =
-                sc.spawn(|| pipeline("entités fixes (TAA)", "fs_taa_world", &taa_targets));
-            Self {
-                plain: plain.map(|h| h.join().expect("pipeline des entités")),
-                taa: taa.join().expect("pipeline des entités (TAA)"),
-                taa_world: taa_world.join().expect("pipeline des entités fixes (TAA)"),
-            }
-        })
+        let taa_targets = [
+            target(COLOR_FORMAT),
+            target(MOTION_FORMAT),
+            target(GB_ALBEDO_FORMAT),
+            target(GB_SURF_FORMAT),
+        ];
+        Self {
+            plain: pipeline("entités", "fs_main", &[target(surface)]),
+            taa: pipeline("entités (TAA)", "fs_taa", &taa_targets),
+            taa_world: pipeline("entités fixes (TAA)", "fs_taa_world", &taa_targets),
+        }
     }
 }
 
@@ -160,7 +149,7 @@ impl Entities {
         bgl: &wgpu::BindGroupLayout,
         surface: wgpu::TextureFormat,
     ) -> Self {
-        let pipes = EntityPipes::new(device, bgl, surface, false);
+        let pipes = EntityPipes::new(device, bgl, surface);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("entités (sommets)"),
             size: (MAX_VERTICES * std::mem::size_of::<EntityVertex>()) as u64,
@@ -233,11 +222,9 @@ impl Entities {
         pass: &mut wgpu::RenderPass<'a>,
         group: &'a wgpu::BindGroup,
         taa: bool,
-        lit: Option<&'a EntityPipes>,
     ) {
-        let p = lit.unwrap_or(&self.pipes);
-        // Sans anticrénelage : toujours la variante de tous les jours.
-        let plain = self.pipes.plain.as_ref().expect("pipeline des entités");
+        let p = &self.pipes;
+        let plain = &p.plain;
         pass.set_bind_group(0, group, &[]);
         if !self.static_draw.is_empty() {
             pass.set_pipeline(if taa { &p.taa_world } else { plain });

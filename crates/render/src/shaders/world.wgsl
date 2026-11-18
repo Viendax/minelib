@@ -217,23 +217,45 @@ fn motion_of(p: vec4<f32>) -> vec2<f32> {
     return d * vec2<f32>(0.5, -0.5) * g.screen.xy;
 }
 
-@fragment
-fn fs_block_fast_mv(i: VOut) -> MvOut {
-    let c = shade_with(i, false, false, false);
-    if c.a < 0.3 || from_behind(i) {
-        discard;
-    }
-    return MvOut(vec4<f32>(c.rgb, 1.0), motion_of(vec4<f32>(i.world, 1.0)));
+/// Monde opaque avec l'anticrénelage : couleur, mouvement, et ce qu'il faut pour ajouter
+/// les lumières dynamiques après coup (éclairage différé, voir gbuffer.wgsl).
+struct GbOut {
+    @location(0) color: vec4<f32>,
+    @location(1) motion: vec2<f32>,
+    @location(2) albedo: vec4<f32>,
+    @location(3) surf: vec4<f32>,
+};
+
+fn gb_out(i: VOut, s: Shaded) -> GbOut {
+    var o: GbOut;
+    o.color = vec4<f32>(s.color.rgb, 1.0);
+    o.motion = motion_of(vec4<f32>(i.world, 1.0));
+    o.albedo = vec4<f32>(s.albedo, clamp(i.reflect, 0.0, 1.0) * 0.99);
+    o.surf = vec4<f32>(
+        gb_oct_encode(face_normal(i.face)),
+        clamp(s.wd, 0.0, 1.0),
+        gb_pack_spec(s.ws, i.short != 0u),
+    );
+    return o;
 }
 
 @fragment
-fn fs_block_mv(i: VOut) -> MvOut {
-    // Reflets lus dans l'image des reflets (calculée à part, à son propre rythme).
-    let c = shade_with(i, true, true, false);
-    if c.a < 0.3 || from_behind(i) {
+fn fs_block_fast_mv(i: VOut) -> GbOut {
+    let s = shade_full(i, false, false, false);
+    if s.color.a < 0.3 || from_behind(i) {
         discard;
     }
-    return MvOut(vec4<f32>(c.rgb, 1.0), motion_of(vec4<f32>(i.world, 1.0)));
+    return gb_out(i, s);
+}
+
+@fragment
+fn fs_block_mv(i: VOut) -> GbOut {
+    // Reflets lus dans l'image des reflets (calculée à part, à son propre rythme).
+    let s = shade_full(i, true, true, false);
+    if s.color.a < 0.3 || from_behind(i) {
+        discard;
+    }
+    return gb_out(i, s);
 }
 
 @fragment
@@ -277,9 +299,23 @@ fn fs_reflect(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(env, dist);
 }
 
+/// Couleur d'un pixel du monde, et de quoi y ajouter les lumières dynamiques après coup :
+/// albédo, poids de leur lumière diffuse (`wd` : occlusion, bloc visé, reflets, brouillard)
+/// et de leurs reflets (`ws` : brouillard). Zéro : pas de lumière (flamme).
+struct Shaded {
+    color: vec4<f32>,
+    albedo: vec3<f32>,
+    wd: f32,
+    ws: f32,
+};
+
+fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32> {
+    return shade_full(i, reflections, cached, cheap).color;
+}
+
 /// `reflections` = false : blocs sans reflet (la grande majorité) ; le compilateur retire
 /// tout le code des reflets, le shader est bien plus léger et la carte va plus vite.
-fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32> {
+fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
     let n = face_normal(i.face);
     let p = i.world - n * 0.001;            // légèrement à l'intérieur du bloc
     let cell = vec3<i32>(floor(p));
@@ -315,7 +351,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
         if fog > 0.0 {
             fc = mix(flame, sky_color(to_frag / dist), fog * 0.6);
         }
-        return vec4<f32>(fc, 1.0);
+        return Shaded(vec4<f32>(fc, 1.0), vec3<f32>(0.0), 0.0, 0.0);
     }
     let alpha = tex.a;
     let albedo = tex.rgb;
@@ -359,10 +395,12 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
     var color = albedo * (sky_light * ao + torch);
     // Lumières dynamiques (éditeur de lumières, voir dynlights.wgsl) : lumière diffuse,
     // et leurs reflets ajoutés après ceux du raytracing (un métal les prend à sa couleur).
+    // Éclairage différé (opaques) : la même chose, ajoutée après coup avec ces poids.
     var dyn_spec = vec3<f32>(0.0);
+    var wd = mix(0.6, 1.0, ao);
     if dyn_active() {
         let dl = dyn_light(i.world, n, g.cam_pos.xyz, i.reflect, false, i.clip.xy, g.screen.xy);
-        color += albedo * dl.diffuse * mix(0.6, 1.0, ao);
+        color += albedo * dl.diffuse * wd;
         dyn_spec = select(dl.specular, dl.specular * albedo * 1.6, i.short != 0u);
     }
 
@@ -372,6 +410,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
     let eps = vec3<f32>(0.0005);
     if g.sel_min.w > 0.5 && all(p >= g.sel_min.xyz - eps) && all(p <= g.sel_max.xyz + eps) {
         color = color * 1.25 + 0.02;
+        wd *= 1.25;
     }
 
     // Reflets : miroir, métal, glace, eau. Avec le raytracing, un rayon traverse la grille de
@@ -419,6 +458,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
         // lieu de la remplacer : le bloc garde sa teinte et ne paraît pas transparent.
         let tinted = select(env, env * albedo * 1.6, i.short != 0u);
         color = mix(color, tinted, k);
+        wd *= 1.0 - k;
         // Points lumineux : chaque source proche se reflète (couleur de sa flamme), net
         // sur un miroir, plus étalé sur le métal ; avec ou sans raytracing.
         if g.rt.x < 0.5 || i.reflect < 0.99 {
@@ -433,7 +473,7 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
     if fog > 0.0 {
         color = mix(color, sky_color(to_frag / dist), fog);
     }
-    return vec4<f32>(color, alpha);
+    return Shaded(vec4<f32>(color, alpha), albedo, wd * (1.0 - fog), 1.0 - fog);
 }
 
 // ---------------------------------------------------------------- ciel

@@ -10,6 +10,10 @@ use crate::DEPTH_FORMAT;
 
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
+/// Ce que le monde opaque laisse pour l'éclairage différé des lumières dynamiques (voir
+/// `shaders/gbuffer.wgsl`) : albédo et brillance, normale et poids.
+pub const GB_ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub const GB_SURF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Part de l'image courante dans le mélange (le reste vient de l'historique).
 const BLEND: f32 = 0.1;
 /// Longueur de la séquence de décalages.
@@ -34,6 +38,8 @@ pub struct Targets {
     pub generation: u64,
     pub color_view: wgpu::TextureView,
     pub motion_view: wgpu::TextureView,
+    /// Albédo et surface (éclairage différé des lumières dynamiques).
+    pub gbuf_views: [wgpu::TextureView; 2],
     /// Profondeurs en alternance : la scène écrit `depth_views[i]` pendant que l'image
     /// précédente reste lisible dans l'autre (plus de copie de la profondeur à chaque image).
     pub depth_views: [wgpu::TextureView; 2],
@@ -149,7 +155,8 @@ pub struct Heavy {
     pub translucent: wgpu::RenderPipeline,
 }
 
-/// Un pipeline du monde qui écrit la couleur et le mouvement (TAA).
+/// Un pipeline du monde qui écrit la couleur et le mouvement (TAA), et, dans la passe des
+/// opaques, l'albédo et la surface (`gbuffer` : ce qu'il en écrit).
 #[allow(clippy::too_many_arguments)]
 fn world_pipeline(
     device: &wgpu::Device,
@@ -164,7 +171,29 @@ fn world_pipeline(
     compare: wgpu::CompareFunction,
     blend: Option<wgpu::BlendState>,
     motion_writes: wgpu::ColorWrites,
+    gbuffer: Option<wgpu::ColorWrites>,
 ) -> wgpu::RenderPipeline {
+    let mut targets = vec![
+        Some(wgpu::ColorTargetState {
+            format: COLOR_FORMAT,
+            blend,
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: MOTION_FORMAT,
+            blend: None,
+            write_mask: motion_writes,
+        }),
+    ];
+    if let Some(mask) = gbuffer {
+        for format in [GB_ALBEDO_FORMAT, GB_SURF_FORMAT] {
+            targets.push(Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: mask,
+            }));
+        }
+    }
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(world_layout),
@@ -195,72 +224,99 @@ fn world_pipeline(
             module: world_shader,
             entry_point: Some(fs),
             compilation_options: Default::default(),
-            targets: &[
-                Some(wgpu::ColorTargetState {
-                    format: COLOR_FORMAT,
-                    blend,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: MOTION_FORMAT,
-                    blend: None,
-                    write_mask: motion_writes,
-                }),
-            ],
+            targets: &targets,
         }),
         multiview: None,
         cache: None,
     })
 }
 
-/// Blocs, miroirs, translucides (passe à deux cibles), compilés en parallèle. Sert aux
-/// shaders de tous les jours et à leur variante éclairée par les lumières de l'éditeur.
+/// Blocs, miroirs (passe des opaques : ils laissent aussi albédo et surface pour
+/// l'éclairage différé), translucides (passe suivante, à deux cibles), compilés en parallèle.
 pub(crate) fn build_heavy(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
 ) -> Heavy {
-    let vertex_layout = crate::world_vertex_layout();
-    let vl = std::slice::from_ref(&vertex_layout);
-    let greater = wgpu::CompareFunction::Greater; // Z inversé
-    let mk = |label: &str, fs: &str, cull, depth_write, blend, motion_writes| {
-        world_pipeline(
+    let all = wgpu::ColorWrites::ALL;
+    let back = Some(wgpu::Face::Back);
+    let mk = |label: &str, fs: &str| {
+        block_pipeline(
             device,
             layout,
             shader,
             label,
-            "vs_block",
             fs,
-            vl,
-            cull,
-            depth_write,
-            greater,
-            blend,
-            motion_writes,
+            back,
+            true,
+            None,
+            all,
+            Some(all),
         )
     };
-    let all = wgpu::ColorWrites::ALL;
-    let back = Some(wgpu::Face::Back);
     std::thread::scope(|sc| {
-        let block = sc.spawn(|| mk("blocs (TAA)", "fs_block_fast_mv", back, true, None, all));
-        let reflective = sc.spawn(|| mk("reflets (TAA)", "fs_block_mv", back, true, None, all));
-        // Translucides : couleur mélangée, on garde le mouvement de ce qui est derrière.
-        let translucent = sc.spawn(|| {
-            mk(
-                "translucide (TAA)",
-                "fs_block_translucent_mv",
-                None,
-                false,
-                Some(wgpu::BlendState::ALPHA_BLENDING),
-                wgpu::ColorWrites::empty(),
-            )
-        });
+        let block = sc.spawn(|| mk("blocs (TAA)", "fs_block_fast_mv"));
+        let reflective = sc.spawn(|| mk("reflets (TAA)", "fs_block_mv"));
+        let translucent = sc.spawn(|| translucent_pipeline(device, layout, shader));
         Heavy {
             block: block.join().expect("pipeline des blocs (TAA)"),
             reflective: reflective.join().expect("pipeline réfléchissant (TAA)"),
             translucent: translucent.join().expect("pipeline translucide (TAA)"),
         }
     })
+}
+
+/// Translucides (eau, glace, verre teinté) : couleur mélangée, on garde le mouvement de ce
+/// qui est derrière. Sert aussi à la variante éclairée par les lumières dynamiques (elles
+/// ne passent pas par l'éclairage différé : il ne voit que l'opaque derrière).
+pub(crate) fn translucent_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    block_pipeline(
+        device,
+        layout,
+        shader,
+        "translucide (TAA)",
+        "fs_block_translucent_mv",
+        None,
+        false,
+        Some(wgpu::BlendState::ALPHA_BLENDING),
+        wgpu::ColorWrites::empty(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn block_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    label: &str,
+    fs: &str,
+    cull: Option<wgpu::Face>,
+    depth_write: bool,
+    blend: Option<wgpu::BlendState>,
+    motion_writes: wgpu::ColorWrites,
+    gbuffer: Option<wgpu::ColorWrites>,
+) -> wgpu::RenderPipeline {
+    let vertex_layout = crate::world_vertex_layout();
+    world_pipeline(
+        device,
+        layout,
+        shader,
+        label,
+        "vs_block",
+        fs,
+        std::slice::from_ref(&vertex_layout),
+        cull,
+        depth_write,
+        wgpu::CompareFunction::Greater, // Z inversé
+        blend,
+        motion_writes,
+        gbuffer,
+    )
 }
 
 impl Taa {
@@ -299,6 +355,8 @@ impl Taa {
             wgpu::CompareFunction::Always,
             None,
             wgpu::ColorWrites::ALL,
+            // Dans la passe des opaques : rien pour l'éclairage différé (le ciel n'en prend pas).
+            Some(wgpu::ColorWrites::empty()),
         );
         let outline = world_pipeline(
             device,
@@ -313,6 +371,7 @@ impl Taa {
             wgpu::CompareFunction::GreaterEqual,
             Some(wgpu::BlendState::ALPHA_BLENDING),
             wgpu::ColorWrites::empty(),
+            None,
         );
         let float = wgpu::TextureSampleType::Float { filterable: true };
         let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -450,6 +509,10 @@ impl Taa {
         let tex = |label: &str, format, usage| tex_at(label, format, usage, internal);
         let color_view = tex("couleur (TAA)", COLOR_FORMAT, rt);
         let motion_view = tex("mouvement", MOTION_FORMAT, rt);
+        let gbuf_views = [
+            tex("albédo (éclairage différé)", GB_ALBEDO_FORMAT, rt),
+            tex("surface (éclairage différé)", GB_SURF_FORMAT, rt),
+        ];
         let depth_views = [
             raw("profondeur (TAA) 0", DEPTH_FORMAT, rt).create_view(&Default::default()),
             raw("profondeur (TAA) 1", DEPTH_FORMAT, rt).create_view(&Default::default()),
@@ -516,6 +579,7 @@ impl Taa {
             generation: GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             color_view,
             motion_view,
+            gbuf_views,
             depth_views,
             history_views,
             resolve_groups,
