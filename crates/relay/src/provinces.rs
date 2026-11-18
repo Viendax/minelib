@@ -55,8 +55,11 @@ const COPIES_MAX: usize = 256;
 const UNFOLLOWED_FOR: Duration = Duration::from_secs(5);
 /// (v143) Plage de rangs d'un pays (il en donne une à chaque époque de ses provinces), et
 /// d'une province d'un pays.
-const PAYS_SEQS: u64 = 1 << 48;
+pub(crate) const PAYS_SEQS: u64 = 1 << 48;
 const CHILD_SEQS: u64 = 1 << 34;
+/// (v147) Une nouvelle plage de rangs pour un pays au plus toutes les… (le temps qu'il
+/// l'apprenne).
+const REFILL_EVERY: Duration = Duration::from_secs(2);
 /// (v143) Bail d'une province d'un pays (ms) : donné seulement si celui du pays court encore
 /// au moins `CHILD_LEASE_MS + CHILD_GUARD_MS` ; il finit donc toujours avant lui.
 const CHILD_LEASE_MS: u64 = 1000;
@@ -123,6 +126,9 @@ pub(crate) struct ProvinceRef {
     /// (v144) Relais de secours d'un pays qui a pris sa place : l'hôte (pseudo) qui doit se
     /// rattacher ici avec la province qu'il sert déjà.
     expect: Option<String>,
+    /// (v147) Pays : fin de la plage de rangs qu'il a d'ici ; dernière nouvelle plage donnée.
+    range_end: u64,
+    refilled: Option<Instant>,
 }
 
 /// (v141) Relais de secours d'une province, choisi par le relais du monde.
@@ -224,6 +230,15 @@ pub(crate) struct ProvinceRoom {
     neighbours_said: HashMap<[i32; 2], Vec<ProvinceInfo>>,
     /// (v145) Pays : sacs que plus personne ne réclame chez lui, depuis (ms).
     held_free: HashMap<String, u64>,
+    /// (v147) Où le joindre (nœud iroh, adresse, clé), dit par le jeu qui le tient : un pays
+    /// le donne à ses garants et à ses provinces.
+    me: Option<([u8; 32], String, [u8; 32])>,
+    /// (v147) Pays : son appel de garants (dit à ses provinces et à ses joueurs). Province
+    /// d'un pays : l'appel reçu de lui. Dernier dit à ses joueurs. Hôtes donnés ici (province,
+    /// époque, relais de secours ou non → quand).
+    call: Option<proto::GarantCall>,
+    call_said: Option<proto::GarantCall>,
+    local_served: HashMap<([i32; 2], u64, bool), Instant>,
 }
 
 impl ProvinceRoom {
@@ -556,6 +571,8 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
             dump_n: 0,
             stop_after_dump: false,
             unfollowed_since: None,
+            range_end: 0,
+            refilled: None,
             nest: nest.is_some(),
             children: Vec::new(),
             expect: None,
@@ -629,6 +646,8 @@ fn delegate_pending(st: &mut State, rid: u64, p: [i32; 2]) {
             dump_n: 0,
             stop_after_dump: false,
             unfollowed_since: None,
+            range_end: 0,
+            refilled: None,
             nest: false,
             children: Vec::new(),
             expect: None,
@@ -813,6 +832,7 @@ pub(crate) fn ready(
 ) {
     let size = size(st);
     let pays = st.province_room == Some(rid);
+    let pays_seqs = st.pays_seqs;
     let Some(room) = st.rooms.get_mut(&rid) else {
         return;
     };
@@ -828,7 +848,7 @@ pub(crate) fn ready(
     let span = if pays {
         CHILD_SEQS
     } else if r.nest {
-        PAYS_SEQS
+        pays_seqs
     } else {
         PROVINCE_SEQS
     };
@@ -850,6 +870,7 @@ pub(crate) fn ready(
     delta.extend(room.build.entries_after(keep, after));
     let base = room.build.reserve(span);
     let r = room.provinces.get_mut(&p).expect("province");
+    r.range_end = base + span;
     r.info = Some(ProvinceInfo {
         province: p,
         size,
@@ -920,10 +941,21 @@ pub(crate) fn lease(
     children: Option<Vec<ProvinceInfo>>,
     arrived: Vec<String>,
     left: Vec<String>,
+    seq: u64,
 ) {
     // (v143) Chez un pays : bail donné seulement s'il en a assez lui-même (celui de sa
     // province finit avant le sien), et toujours avec la copie chez lui.
     let pays = st.province_room == Some(rid);
+    let pays_seqs = st.pays_seqs;
+    // (v147) Un pays appelle des garants parmi ses joueurs : il le dit à ses provinces.
+    let call = if pays {
+        st.rooms
+            .get(&rid)
+            .and_then(|r| r.province.as_ref())
+            .and_then(|pr| pr.call.clone())
+    } else {
+        None
+    };
     // (v145) Chez un pays : où sont ses joueurs, d'après ses provinces.
     if pays {
         if let Some(room) = st.rooms.get_mut(&rid) {
@@ -971,6 +1003,7 @@ pub(crate) fn lease(
         world_players(room) >= copies_until
     };
     let (mut copies, mut dump) = (true, 0);
+    let mut more_for = None;
     let ok = match room
         .provinces
         .get_mut(&p)
@@ -1027,9 +1060,34 @@ pub(crate) fn lease(
             if !paused {
                 r.renewed = Instant::now();
             }
+            // (v147) Un pays dont la plage de rangs s'épuise : une nouvelle (assez tôt pour
+            // qu'il n'en manque jamais).
+            if r.nest && !pays && seq > 0 && r.range_end > 0 {
+                let low = (2 * CHILD_SEQS).max(pays_seqs / 64);
+                if r.range_end.saturating_sub(seq) < low
+                    && r.refilled.is_none_or(|t| t.elapsed() > REFILL_EVERY)
+                {
+                    r.refilled = Some(Instant::now());
+                    more_for = Some(p);
+                }
+            }
             !paused
         }
         _ => false,
+    };
+    let more = match more_for {
+        Some(p) => {
+            let base = room.build.reserve(pays_seqs);
+            if let Some(r) = room.provinces.get_mut(&p) {
+                r.range_end = base + pays_seqs;
+            }
+            st.pays_refills += 1;
+            log::info!(
+                "monde {rid} : nouvelle plage de rangs pour le pays {p:?} (à partir de {base})"
+            );
+            Some(base)
+        }
+        None => None,
     };
     if let Some(c) = st.conns.get(&id) {
         transport::push(
@@ -1043,6 +1101,8 @@ pub(crate) fn lease(
                 copies,
                 dump,
                 ms,
+                call,
+                more,
             },
         );
     }
@@ -2127,6 +2187,8 @@ fn promote(st: &mut State, rid: u64, p: [i32; 2], why: &str) -> bool {
         dump_n: stale as u64,
         stop_after_dump: false,
         unfollowed_since: None,
+        range_end: 0,
+        refilled: None,
         nest,
         children: Vec::new(),
         expect: None,
@@ -2463,6 +2525,10 @@ pub(crate) fn begin(
         kids_present: HashMap::new(),
         neighbours_said: HashMap::new(),
         held_free: HashMap::new(),
+        me: None,
+        call: None,
+        call_said: None,
+        local_served: HashMap::new(),
     });
     // (Réglages du serveur : OP, bannis, mode par défaut ; sacs de survie suivis, pour la
     // copie envoyée au relais du monde.)
@@ -2736,10 +2802,19 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
                     }
                 }
             }
-            (wants(st, rid), children)
+            // (v147) Son appel de garants (dit à ses provinces avec leur bail, et à ses
+            // joueurs) ; les hôtes qu'il trouve chez lui.
+            let call = make_call(st, rid);
+            if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+                pr.call = call;
+            }
+            say_call(st, rid);
+            let wants = wants(st, rid);
+            (serve_local(st, rid, wants), children)
         } else {
             (Vec::new(), None)
         };
+        let seq = st.rooms.get(&rid).map_or(0, |r| r.build.last_seq());
         // (v145) Ses joueurs arrivés et partis depuis le dernier bail (pour son pays).
         let (arrived, left) = presence(st, rid);
         out.push(Request::ProvinceLease {
@@ -2754,6 +2829,7 @@ pub(crate) fn tick(st: &mut State) -> Vec<Request> {
             children,
             arrived,
             left,
+            seq,
         });
         // (v145) Un pays : à chacune de ses provinces, ses voisines.
         if pays_here(st, rid) {
@@ -3341,6 +3417,8 @@ pub(crate) fn promote_here(st: &mut State, old: u64, epoch: u64) -> Option<u64> 
                 dump_n: c.dump_n + 1,
                 stop_after_dump: false,
                 unfollowed_since: None,
+                range_end: 0,
+                refilled: None,
                 nest: false,
                 children: Vec::new(),
                 expect: Some(c.host),
@@ -3364,11 +3442,30 @@ pub(crate) fn leased(
     copies: bool,
     dump: u64,
     ms: u32,
+    call: Option<proto::GarantCall>,
+    more: Option<u64>,
 ) {
     let Some(rid) = st.province_room else {
         return;
     };
-    let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) else {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let Some(pr) = room.province.as_mut() else {
+        return;
+    };
+    if epoch == pr.epoch && !pr.stopped {
+        // (v147) Pays : nouvelle plage de rangs (il ne revient jamais en arrière) ; province
+        // d'un pays : l'appel de garants de son pays, dit à ses joueurs.
+        if let (Some(base), Some(_)) = (more, pr.nest) {
+            room.build.start_at(base);
+            log::info!("pays : nouvelle plage de rangs à partir de {base}");
+        }
+        if pr.nest.is_none() && ok {
+            pr.call = call;
+        }
+    }
+    let Some(pr) = room.province.as_mut() else {
         return;
     };
     if ok && epoch == pr.epoch && !pr.stopped {
@@ -3394,6 +3491,259 @@ pub(crate) fn leased(
             pr.to_root = true;
         }
     }
+    say_call(st, rid);
+}
+
+/// (v147) Garants qu'un pays veut libres en plus de deux par province confiée.
+const GARANTS_EXTRA: usize = 4;
+
+/// (v147) Pays : son appel de garants. Il en veut deux libres par province confiée (un hôte,
+/// un relais de secours) et quelques-uns de plus ; chacun de ses joueurs en est s'il tire
+/// moins que la part demandée (arrondie à une puissance de deux : elle change rarement).
+fn make_call(st: &State, rid: u64) -> Option<proto::GarantCall> {
+    let room = st.rooms.get(&rid)?;
+    let pr = room.province.as_ref()?;
+    pr.nest?;
+    if pr.stopped || pr.standby {
+        return None;
+    }
+    let me = pr.me.as_ref()?;
+    let want = 2 * room.provinces.len() + GARANTS_EXTRA;
+    let players = (pr.kids_present.len() + room.player_count()).max(1);
+    let raw = (want as f32 / players as f32).min(1.0);
+    let share = 2f32.powi(raw.log2().ceil() as i32).min(1.0);
+    Some(proto::GarantCall {
+        at: ProvinceInfo {
+            province: pr.province,
+            size: pr.size,
+            epoch: pr.epoch,
+            node: me.0,
+            addr: me.1.clone(),
+            key: me.2,
+        },
+        share,
+    })
+}
+
+/// (v147) L'appel de garants valable ici (le sien pour un pays, celui de son pays pour une
+/// de ses provinces), dit à ses joueurs quand il change.
+fn say_call(st: &mut State, rid: u64) {
+    let Some(room) = st.rooms.get_mut(&rid) else {
+        return;
+    };
+    let Some(pr) = room.province.as_mut() else {
+        return;
+    };
+    if pr.call == pr.call_said {
+        return;
+    }
+    pr.call_said = pr.call.clone();
+    let msg = Response::GarantCall {
+        room: rid,
+        call: pr.call.clone(),
+    };
+    let room = st.rooms.get(&rid).expect("province");
+    for m in room.members.iter().filter(|m| !room.hidden.contains(m)) {
+        if let Some(c) = st.conns.get(m) {
+            transport::push(&c.tx, &msg);
+        }
+    }
+}
+
+/// (v147) Relais de province : un joueur vient d'entrer ; l'appel de garants valable ici.
+pub(crate) fn greet(st: &State, rid: u64, id: u64) {
+    let Some(call) = st
+        .rooms
+        .get(&rid)
+        .and_then(|r| r.province.as_ref())
+        .and_then(|pr| pr.call.clone())
+    else {
+        return;
+    };
+    if let Some(c) = st.conns.get(&id) {
+        transport::push(
+            &c.tx,
+            &Response::GarantCall {
+                room: rid,
+                call: Some(call),
+            },
+        );
+    }
+}
+
+/// (v147) Relais de province : où le joindre (le jeu qui le tient le dit).
+pub(crate) fn set_me(st: &mut State, node: [u8; 32], addr: String, key: [u8; 32]) {
+    let Some(rid) = st.province_room else {
+        return;
+    };
+    if let Some(pr) = st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+        pr.me = Some((node, addr, key));
+    }
+}
+
+/// (v147) Relais d'un pays : un de ses joueurs veut lui prêter sa connexion de garant (avec
+/// le certificat de ce monde) ; refusé s'il en a déjà assez. `None` : pas un pays.
+pub(crate) fn admits_garant(st: &State, cert: &minelib_net::sovereign::Cert) -> Option<bool> {
+    let rid = st.province_room?;
+    let room = st.rooms.get(&rid)?;
+    let pr = room.province.as_ref()?;
+    pr.nest?;
+    let free = st
+        .conns
+        .values()
+        .filter(|c| c.garant_only && c.room.is_none() && c.pseudo.is_some())
+        .count();
+    let cap = 4 * room.provinces.len() + 4 * GARANTS_EXTRA;
+    Some(
+        cert.valid(&pr.root, rid)
+            && cert.expires >= super::now_secs()
+            && !pr.stopped
+            && !pr.standby
+            && free < cap,
+    )
+}
+
+/// (v147) Pays : les hôtes qu'il attend pour ses provinces, choisis parmi ses garants (les
+/// connexions de garant de ses joueurs, entrées ici), jamais un joueur de la province qu'il
+/// servira. Ceux qu'il ne trouve pas chez lui sont demandés au relais du monde.
+fn serve_local(st: &mut State, rid: u64, wants: Vec<proto::Want>) -> Vec<proto::Want> {
+    let served = match st.rooms.get_mut(&rid).and_then(|r| r.province.as_mut()) {
+        Some(pr) => {
+            pr.local_served
+                .retain(|_, t| t.elapsed() < START_WAIT + Duration::from_secs(5));
+            pr.local_served.clone()
+        }
+        None => return wants,
+    };
+    let mut up = Vec::new();
+    for w in wants {
+        if served.contains_key(&(w.province, w.epoch, w.follow.is_some())) {
+            continue;
+        }
+        match pick_local(st, rid, w.province) {
+            Some(g) => give_local_task(st, rid, w, g),
+            None => up.push(w),
+        }
+    }
+    up
+}
+
+/// (v147) Pays : une de ses connexions de garant libre, pas celle d'un joueur de la province
+/// `p` (il ne décide pas pour lui-même).
+fn pick_local(st: &State, rid: u64, p: [i32; 2]) -> Option<u64> {
+    let room = st.rooms.get(&rid)?;
+    let pr = room.province.as_ref()?;
+    let size = size(st);
+    st.conns
+        .iter()
+        .filter(|(_, c)| {
+            c.garant_only
+                && c.garant
+                && !c.garant_banned
+                && !c.kicked
+                && c.room.is_none()
+                && c.arbitrating.is_none()
+                && !super::link_bad(c)
+        })
+        .filter_map(|(&g, c)| {
+            let who = c.pseudo.as_deref()?.to_ascii_lowercase();
+            if pr.kids_present.get(&who).is_some_and(|(at, _)| *at == p) {
+                return None;
+            }
+            let here = room
+                .by_pseudo
+                .get(&who)
+                .and_then(|id| room.build.positions.get(id));
+            if here.is_some_and(|ch| proto::province_of(proto::region_of(*ch), size) == p) {
+                return None;
+            }
+            let score: f64 = super::candidate(st, g).map_or(0.0, |c| super::zones::aptitude(&c));
+            Some((g, score))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(g, _)| g)
+}
+
+/// (v147) Pays : la connexion de garant `g` (un de ses joueurs) tiendra une de ses provinces
+/// (ou son relais de secours) ; même tâche, même jeton que s'il venait du relais du monde.
+fn give_local_task(st: &mut State, rid: u64, w: proto::Want, g: u64) {
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let Some(pr) = room.province.as_ref() else {
+        return;
+    };
+    let Some(me) = pr.me.clone() else {
+        return;
+    };
+    let at = ProvinceInfo {
+        province: pr.province,
+        size: pr.size,
+        epoch: pr.epoch,
+        node: me.0,
+        addr: me.1,
+        key: me.2,
+    };
+    let root = pr.root.to_bytes();
+    let pseudo = st
+        .conns
+        .get(&g)
+        .and_then(|c| c.pseudo.clone())
+        .unwrap_or_default();
+    let signer = super::account_key(st, g).unwrap_or([0; 32]);
+    let secret = room.shard_secret;
+    let info = task_info(room);
+    let settings = settings_of(st, &room.server);
+    let standby = w.follow.is_some();
+    let follow = w.follow.map(|i| {
+        Box::new(proto::ProvinceAt {
+            token: proto::follow_token(&secret, rid, w.province, &pseudo, &signer, w.epoch),
+            info: i,
+        })
+    });
+    let parent = Some(Box::new(proto::ProvinceAt {
+        info: at,
+        token: proto::child_token(
+            &secret, rid, w.province, w.size, &pseudo, &signer, w.epoch, standby,
+        ),
+    }));
+    let room = st.rooms.get_mut(&rid).expect("pays");
+    room.members.push(g);
+    room.hidden.insert(g);
+    if let Some(pr) = room.province.as_mut() {
+        pr.local_served
+            .insert((w.province, w.epoch, standby), Instant::now());
+    }
+    st.local_tasks += 1;
+    let Some(c) = st.conns.get_mut(&g) else {
+        return;
+    };
+    c.room = Some(rid);
+    transport::push(
+        &c.tx,
+        &Response::ProvinceTask {
+            room: rid,
+            province: w.province,
+            size: w.size,
+            epoch: w.epoch,
+            secret,
+            root,
+            info,
+            settings,
+            follow,
+            parent,
+            nest: None,
+        },
+    );
+    log::info!(
+        "pays : {} de sa province {:?} confié à « {pseudo} » (un de ses joueurs)",
+        if standby {
+            "relais de secours"
+        } else {
+            "relais"
+        },
+        w.province
+    );
 }
 
 /// Relais de province : arrêt (reprise par le relais du monde, ou départ de son hôte).

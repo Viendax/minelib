@@ -173,6 +173,8 @@ struct ProvinceConn {
     /// (v145) Depuis combien de temps elle ne décide de rien en vue (au-delà de
     /// `LEAVE_AFTER`, on la quitte).
     idle: f32,
+    /// (v147) L'appel de garants valable chez elle (celui de son pays).
+    call: Option<proto::GarantCall>,
 }
 
 /// (v145) Relais de province (ou pays) qui ne décide plus de rien en vue depuis… (s) :
@@ -751,6 +753,7 @@ impl BuildNet {
                             unmarked_items: Vec::new(),
                             marked_items: std::collections::VecDeque::new(),
                             idle: 0.0,
+                            call: None,
                         },
                     );
                 }
@@ -813,6 +816,8 @@ impl BuildNet {
                         }
                     }
                     Event::Skin { pseudo, png } if !png.is_empty() => skins.push((pseudo, png)),
+                    // (v147) Le pays appelle des garants parmi ses joueurs.
+                    Event::Province(Response::GarantCall { call, .. }) => c.call = call,
                     Event::SetGamemode { .. } | Event::Slain(_) | Event::SetTime { .. }
                         if dozing && here == Some(*p) =>
                     {
@@ -1232,6 +1237,14 @@ impl BuildNet {
             return;
         }
         transport::push(&self.link, &req);
+    }
+
+    /// (v147) L'appel de garants valable là où l'on est (celui de son pays) : si ce joueur en
+    /// est (`GarantCall::picks`), sa connexion de garant va chez ce pays.
+    pub fn garant_call(&self) -> Option<&proto::GarantCall> {
+        let chunk = self.chunk?;
+        let info = self.best(proto::region_of(chunk))?;
+        self.provinces.get(&pkey(info))?.call.as_ref()
     }
 
     /// (v146) La veille est possible : le jeu peut fermer sa connexion au relais du monde.
@@ -4642,6 +4655,179 @@ mod tests {
     #[test]
     fn a_big_pays_and_its_province_falling_together_lose_nothing() {
         pays_world(PaysFault::BothCrash, false, true);
+    }
+
+    /// (v147) Un pays trouve les hôtes de ses provinces parmi ses propres joueurs : le relais
+    /// du monde n'a que trois garants (pour le pays et son relais de secours) ; le pays appelle
+    /// des garants parmi ses joueurs, ceux qui sont appelés lui prêtent leur connexion de
+    /// garant, et il leur confie ses deux provinces et leurs relais de secours (jamais à un
+    /// joueur de la province qu'il servira). Sa plage de rangs, petite exprès, est
+    /// renouvelée par le relais du monde. On construit pendant ce temps ; à la fin, les
+    /// mondes sont identiques à celui du propriétaire.
+    #[test]
+    fn a_pays_finds_hosts_for_its_provinces_among_its_players() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (dir, h, mut hosts, mut bots, room) =
+            province_setup_full(false, 2, 100, 3, Some((1, 3)));
+        h.set_pays_seqs(3 << 34);
+        for (i, b) in bots.iter_mut().enumerate() {
+            b.world = flat_at(29..36, 29..32);
+            b.pos = Vec3::new(if i < 3 { 498.0 } else { 528.0 }, 11.0, 490.0);
+        }
+        let west = |x: f32| x.clamp(488.0, 508.0);
+        let east = |x: f32| x.clamp(516.0, 540.0);
+        let mut seed = 5150u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let dt = 0.02;
+        let mut edited = std::collections::BTreeSet::new();
+        // Connexions de garant prêtées au pays par ses joueurs appelés (comme le jeu).
+        let mut lent: Vec<Bot> = Vec::new();
+        let mut kids_max = 0;
+        for step in 0..700 {
+            kids_max = kids_max.max(h.pays_children().len());
+            for b in bots.iter_mut() {
+                let call = b.net.as_ref().and_then(|n| n.garant_call().cloned());
+                if let (Some(call), Some(cert), Some(key)) =
+                    (call, b.cert.clone(), b.identity.clone())
+                {
+                    if call.picks(&b.name) && !lent.iter().any(|g| g.name == b.name) {
+                        let at = proto::StandbyAt {
+                            node: call.at.node,
+                            addr: call.at.addr.clone(),
+                            key: call.at.key,
+                            room,
+                            pseudo: String::new(),
+                            root: [0; 32],
+                        };
+                        lent.push(Bot::cert_garant(&at, &b.name, cert, key));
+                    }
+                }
+            }
+            for (i, b) in bots.iter_mut().enumerate() {
+                let r = rnd();
+                let x = b.pos.x + (r % 3) as f32 - 1.0;
+                b.pos.x = if i < 3 { west(x) } else { east(x) };
+                b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(475.0, 505.0);
+                if rnd() % 17 == 0 && step < 600 {
+                    let x = (b.pos.x as i32 - 12 + (rnd() % 25) as i32).clamp(29 * 16, 36 * 16 - 1);
+                    let z = 470 + (rnd() % 36) as i32;
+                    let y = 11 + (rnd() % 3) as i32;
+                    let block = if rnd() % 4 == 0 {
+                        BlockId::AIR
+                    } else {
+                        BlockId(1 + rnd() as u16 % 8)
+                    };
+                    b.world.set(x, y, z, block);
+                    edited.insert([x, y, z]);
+                }
+                b.tick(dt);
+            }
+            for g in lent.iter_mut() {
+                g.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for _ in 0..400 {
+            for b in bots.iter_mut() {
+                b.tick(dt);
+            }
+            for g in lent.iter_mut() {
+                g.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Qui tient quoi : provinces du pays tenues par ses joueurs, jamais par un joueur de
+        // la province servie.
+        let held: Vec<(String, [i32; 2], bool)> = lent
+            .iter()
+            .filter_map(|g| {
+                g.province
+                    .as_ref()
+                    .filter(|p| !p.stopped)
+                    .map(|p| (g.name.clone(), p.province, p.standby))
+            })
+            .collect();
+        let chosen: usize = hosts
+            .iter()
+            .filter_map(|(_, g)| g.province.as_ref())
+            .filter(|p| !p.is_child() && !p.standby)
+            .map(|p| p.local_tasks())
+            .sum();
+        let outside = hosts.iter().any(|(_, g)| {
+            g.province
+                .as_ref()
+                .is_some_and(|p| p.is_child() && !p.stopped)
+        });
+        eprintln!(
+            "pays : provinces au plus {kids_max}, tenues par ses joueurs {held:?}, par un garant \
+             d'ailleurs {outside}, hôtes choisis par le pays {chosen}, nouvelles plages de rangs \
+             {}",
+            h.pays_refills()
+        );
+        assert!(
+            chosen >= 4,
+            "le pays a choisi lui-même au moins quatre hôtes : {chosen}"
+        );
+        assert_eq!(kids_max, 2, "le pays a confié ses deux régions");
+        assert!(
+            !outside,
+            "aucune province du pays tenue par un garant d'ailleurs"
+        );
+        assert!(
+            held.iter().filter(|h| !h.2).count() == 2 && held.iter().filter(|h| h.2).count() == 2,
+            "ses deux provinces et leurs relais de secours tenus par ses joueurs : {held:?}"
+        );
+        // (Joueurs 0 à 2 à l'ouest, province [0, 0] ; 3 à 5 à l'est, [1, 0].)
+        for (name, p, _) in &held {
+            let west_player = ["Proprio", "Joueur1", "Joueur2"].contains(&name.as_str());
+            assert_ne!(
+                *p == [0, 0],
+                west_player,
+                "{name} ne tient pas la province où il joue"
+            );
+        }
+        assert!(h.pays_refills() >= 1, "plage de rangs du pays renouvelée");
+        for b in &bots {
+            assert_eq!(
+                b.net.as_ref().unwrap().pending(),
+                0,
+                "{} : en attente",
+                b.name
+            );
+        }
+        let owner = &bots[0];
+        let mut differ = Vec::new();
+        for b in &bots[1..] {
+            for p in &edited {
+                let (a, o) = (
+                    b.world.get(p[0], p[1], p[2]),
+                    owner.world.get(p[0], p[1], p[2]),
+                );
+                if a != o {
+                    differ.push((b.name.clone(), *p, a.0, o.0));
+                }
+            }
+        }
+        assert!(
+            differ.is_empty(),
+            "{} cases différentes du monde du propriétaire, par exemple {:?}",
+            differ.len(),
+            &differ[..differ.len().min(5)]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// (v146) Veille : au fond d'un pays (ses deux régions confiées à leurs provinces, tout ce

@@ -177,6 +177,10 @@ struct Game {
     /// et s'il a déjà été tenté pour cette partie.
     garant_worker: Option<garant_worker::GarantWorker>,
     garant_worker_tried: bool,
+    /// (v147) La connexion de garant est prêtée à son pays (pas au relais du monde) ; tombée :
+    /// prochain essai.
+    garant_pays: bool,
+    garant_retry: Option<std::time::Instant>,
     /// Disponibilité de garant annoncée au relais.
     garant_announced: Option<bool>,
     /// Un monde a été ouvert depuis le lancement (plus de mise à jour automatique sans
@@ -312,6 +316,8 @@ impl Game {
             garant: None,
             garant_worker: None,
             garant_worker_tried: false,
+            garant_pays: false,
+            garant_retry: None,
             garant_announced: None,
             played: false,
             renderer: None,
@@ -1068,7 +1074,10 @@ impl Game {
                     if let Some(b) = self.session.as_mut().and_then(|s| s.build.as_mut()) {
                         b.set_dozing();
                     }
-                    if !self.garant_worker.as_ref().is_some_and(|w| w.hosting()) {
+                    // (Celle prêtée à son pays reste : elle ne passe pas par le relais du monde.)
+                    if !self.garant_pays
+                        && !self.garant_worker.as_ref().is_some_and(|w| w.hosting())
+                    {
                         self.garant_worker = None;
                         self.garant_worker_tried = false;
                     }
@@ -1093,8 +1102,11 @@ impl Game {
                 // partie continue, par la nouvelle connexion.
                 Event::TakenOver { host, .. } => {
                     // La connexion de garant suit le monde chez son nouveau relais (sauf si
-                    // c'est elle qui le tient) : il pourra s'y choisir un relais de secours.
-                    if !self.garant_worker.as_ref().is_some_and(|w| w.hosting()) {
+                    // c'est elle qui le tient, ou si elle est prêtée à son pays) : il pourra s'y
+                    // choisir un relais de secours.
+                    if !self.garant_pays
+                        && !self.garant_worker.as_ref().is_some_and(|w| w.hosting())
+                    {
                         self.garant_worker = None;
                         self.garant_worker_tried = false;
                     }
@@ -1176,17 +1188,40 @@ impl Game {
             && self.session.as_ref().is_some_and(|s| {
                 (s.net.is_some() && s.game.mode == save::GameMode::Fps) || s.build.is_some()
             });
-        // (v146) En veille, pas de connexion de garant au relais du monde non plus (sauf
-        // celle qui tient un relais) : elle reviendra avec nous.
+        // (v146) En veille, pas de connexion de garant au relais du monde (elle a été fermée
+        // avec la nôtre, sauf si elle tenait un relais). (v147) Si son pays appelle ce joueur,
+        // elle va chez lui : il choisit lui-même les hôtes de ses provinces.
         if playing && self.accounts.dozing() {
-            if !self
-                .garant_worker
-                .as_ref()
-                .is_some_and(|w| w.hosting() && w.alive())
-            {
+            if self.garant_worker.as_ref().is_some_and(|w| !w.alive()) {
                 self.garant_worker = None;
-                self.garant_worker_tried = false;
+                self.garant_pays = false;
+                self.garant_retry = Some(std::time::Instant::now() + Duration::from_secs(30));
             }
+            let now = std::time::Instant::now();
+            if self.garant_worker.is_none() && self.garant_retry.is_none_or(|t| now >= t) {
+                let me = self.accounts.pseudo();
+                let call = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.build.as_ref())
+                    .and_then(|b| b.garant_call().cloned())
+                    .filter(|c| c.picks(&me));
+                if let Some(login) = call.and_then(|c| self.accounts.pays_garant_login(&c)) {
+                    let maps = self
+                        .map_rows
+                        .iter()
+                        .filter_map(|m| Some((m.sig, m.local.clone()?)))
+                        .collect();
+                    log::info!("garant en jeu : appelé par son pays, on lui prête notre connexion");
+                    self.garant_worker = Some(garant_worker::GarantWorker::start(
+                        login,
+                        maps,
+                        self.paths.root.join("maps"),
+                    ));
+                    self.garant_pays = true;
+                }
+            }
+            self.garant_worker_tried = false;
             return;
         }
         if playing {
@@ -1203,15 +1238,18 @@ impl Game {
                         maps,
                         self.paths.root.join("maps"),
                     ));
+                    self.garant_pays = false;
                 }
             }
             if self.garant_worker.as_ref().is_some_and(|w| !w.alive()) {
                 self.garant_worker = None;
+                self.garant_pays = false;
             }
         } else {
             // Partie finie (ou quittée) : la partie servie passe au garant en attente.
             self.garant_worker = None;
             self.garant_worker_tried = false;
+            self.garant_pays = false;
         }
         if self.session.is_some() {
             return;

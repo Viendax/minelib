@@ -860,7 +860,8 @@ impl Worker {
             | Response::ProvinceChildren { .. }
             | Response::ProvinceParent { .. }
             | Response::ProvinceNeighbours { .. }
-            | Response::ProvinceSlay { .. }) => Event::Province(r),
+            | Response::ProvinceSlay { .. }
+            | Response::GarantCall { .. }) => Event::Province(r),
             Response::Provinces { list } => Event::Provinces(list),
             Response::ShardPeers { region, list, sov } => Event::ShardPeers { region, list, sov },
             Response::RootEdits {

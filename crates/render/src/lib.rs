@@ -26,6 +26,7 @@ mod taa;
 pub mod textures;
 pub mod thermal;
 pub mod viewmodel;
+mod screen;
 
 pub use capture::Screenshot;
 
@@ -579,6 +580,7 @@ pub struct Renderer {
     overlay: overlay::OverlayRenderer,
     viewmodel: viewmodel::ViewModel,
     entities: entity::Entities,
+    screen: screen::Screen,
     /// Fumigènes en volume.
     smokes: smoke::Smokes,
     voxels: rt::Voxels,
@@ -930,6 +932,7 @@ impl Renderer {
 
         let viewmodel = viewmodel::ViewModel::new(&device, &bgl, config.format);
         let entities = entity::Entities::new(&device, &bgl, config.format);
+        let screen = screen::Screen::new(&device, &bgl, config.format);
         let smokes = smoke::Smokes::new(&device, &queue, &bgl, config.format);
         let indirect = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dessins indirects"),
@@ -980,6 +983,7 @@ impl Renderer {
             overlay,
             viewmodel,
             entities,
+            screen,
             smokes,
             voxels,
             skin_key: None,
@@ -1777,6 +1781,7 @@ impl Renderer {
         // Entités (joueurs, têtes, cadres) avant le verre et l'eau : elles se voient à
         // travers, teintées, au lieu de passer devant.
         self.entities.draw(pass, self.world_group(), pipes.taa);
+        self.screen.draw(pass, pipes.taa);
         // Translucides de l'arrière vers l'avant, par-dessus la scène opaque.
         pass.set_pipeline(&heavy.translucent);
         let mut bound = usize::MAX;
@@ -1815,6 +1820,16 @@ impl Renderer {
 
         let proj = Mat4::perspective_infinite_reverse_rh(p.fov_y, self.aspect(), 0.05);
         let view_proj = proj * p.view;
+        {
+            let inv = p.view.inverse();
+            self.screen.update(
+                &self.queue,
+                p.time,
+                p.eye,
+                inv.transform_vector3(Vec3::NEG_Z).normalize_or_zero(),
+                inv.transform_vector3(Vec3::Y).normalize_or_zero(),
+            );
+        }
         let (sel_min, sel_max) = selection(p.selected);
         self.outline = p.selected.is_some();
         let rg = ray_globals(p.ray_boxes, p.ray_light);
@@ -1979,6 +1994,16 @@ impl Renderer {
 
         let proj = Mat4::perspective_infinite_reverse_rh(p.fov_y, self.aspect(), 0.05);
         let view_proj = proj * p.view;
+        {
+            let inv = p.view.inverse();
+            self.screen.update(
+                &self.queue,
+                p.time,
+                p.eye,
+                inv.transform_vector3(Vec3::NEG_Z).normalize_or_zero(),
+                inv.transform_vector3(Vec3::Y).normalize_or_zero(),
+            );
+        }
         let (jx, jy) = taa.jitter();
         let shift = Mat4::from_translation(Vec3::new(
             2.0 * jx / world_size.0 as f32,

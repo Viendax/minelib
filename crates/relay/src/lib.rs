@@ -308,6 +308,27 @@ impl Handle {
         self.state.lock().unwrap().copies_until = players;
     }
 
+    /// (v147) Plage de rangs donnée à un pays (essais : petite, pour qu'il en redemande).
+    pub fn set_pays_seqs(&self, n: u64) {
+        self.state.lock().unwrap().pays_seqs = n;
+    }
+
+    /// (v147) Nouvelles plages de rangs données à des pays (essais).
+    pub fn pays_refills(&self) -> usize {
+        self.state.lock().unwrap().pays_refills
+    }
+
+    /// (v147) Hôtes de provinces qu'un pays a choisis lui-même parmi ses joueurs (essais).
+    pub fn local_tasks(&self) -> usize {
+        self.state.lock().unwrap().local_tasks
+    }
+
+    /// (v147) Relais de province : où le joindre (le jeu qui le tient le dit) ; un pays le
+    /// donne à ses garants et à ses provinces.
+    pub fn province_self(&self, node: [u8; 32], addr: String, key: [u8; 32]) {
+        provinces::set_me(&mut self.state.lock().unwrap(), node, addr, key);
+    }
+
     /// Provinces dont la copie est gardée par leur relais de secours (essais).
     pub fn provinces_big(&self) -> usize {
         self.state
@@ -450,7 +471,18 @@ impl Handle {
     }
 
     /// Relais de province : réponse du relais du monde à une demande de bail.
-    pub fn province_leased(&self, epoch: u64, t: u64, ok: bool, copies: bool, dump: u64, ms: u32) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn province_leased(
+        &self,
+        epoch: u64,
+        t: u64,
+        ok: bool,
+        copies: bool,
+        dump: u64,
+        ms: u32,
+        call: Option<proto::GarantCall>,
+        more: Option<u64>,
+    ) {
         provinces::leased(
             &mut self.state.lock().unwrap(),
             epoch,
@@ -459,6 +491,8 @@ impl Handle {
             copies,
             dump,
             ms,
+            call,
+            more,
         );
     }
 
@@ -1351,6 +1385,12 @@ struct State {
     /// (v142) Joueurs d'un monde à partir desquels la copie de ce que publie une province
     /// est gardée par son relais de secours plutôt qu'ici (essais : réglable).
     copies_until: usize,
+    /// (v147) Plage de rangs donnée à un pays à chaque fois (réglable pour les essais) ;
+    /// nouvelles plages données ; hôtes que des pays ont choisis eux-mêmes parmi leurs
+    /// joueurs (essais).
+    pays_seqs: u64,
+    pays_refills: usize,
+    local_tasks: usize,
     /// (v143) Les provinces confiées par ce relais sont des pays, qui confient eux-mêmes
     /// leurs provinces peuplées (aucun : pas de pays) ; hôtes déjà donnés aux pays (salle,
     /// province, époque, relais de secours).
@@ -1456,6 +1496,9 @@ pub fn start(cfg: Config) -> Result<Handle> {
         hosts_wait: None,
         province_promotions: 0,
         copies_until: COPIES_UNTIL,
+        pays_seqs: provinces::PAYS_SEQS,
+        pays_refills: 0,
+        local_tasks: 0,
         nest: std::env::var("MINELIB_PAYS")
             .ok()
             .and_then(|v| parse_nest(&v)),
@@ -6445,11 +6488,12 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             children,
             arrived,
             left,
+            seq,
         } => {
             if my_room == Some(room) {
                 provinces::lease(
                     st, room, id, province, epoch, t, counts, inside, followed, wants, children,
-                    arrived, left,
+                    arrived, left, seq,
                 );
             }
             return None;
@@ -7420,6 +7464,24 @@ fn handle_account(
         // certificat de la clé de son compte (de l'ancien relais du monde, ou de celui-ci).
         // Elle pourra tenir le prochain relais de secours du monde, ou en être témoin.
         Request::GarantLogin { cert } => {
+            // (v147) Relais d'un pays : un de ses joueurs lui prête sa connexion de garant (le
+            // pays choisit lui-même les hôtes de ses provinces).
+            if let Some(ok) = provinces::admits_garant(st, &cert) {
+                if !ok {
+                    return err(ErrorCode::Refused, "garant refusé par le pays");
+                }
+                let mut challenge = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut challenge);
+                *session = Session::GarantProving {
+                    pseudo: cert.pseudo,
+                    key: cert.key,
+                    challenge,
+                };
+                return Response::TakeoverChallenge {
+                    challenge,
+                    proof: None,
+                };
+            }
             let Some(sb) = st.standby.as_ref().filter(|sb| sb.active) else {
                 return err(ErrorCode::Refused, "Pas de monde repris ici.");
             };
@@ -7592,13 +7654,18 @@ fn handle_account(
             *session = Session::LoggedIn {
                 pseudo: pseudo.clone(),
             };
-            // Relais de province (v138) : dans la province.
+            // Relais de province (v138) : dans la province ; (v147) l'appel de garants valable
+            // ici.
             if let Some(rid) = st.province_room {
                 if let Some(c) = st.conns.get_mut(&id) {
                     c.pseudo = Some(pseudo.clone());
                     c.account = Some(key);
                 }
-                return join_room(st, id, &pseudo, rid);
+                let r = join_room(st, id, &pseudo, rid);
+                if matches!(r, Response::Joined { .. }) {
+                    provinces::greet(st, rid, id);
+                }
+                return r;
             }
             log::info!("relais de secours : « {pseudo} » reprend le monde");
             take_over_join(st, id, &pseudo, key)
@@ -11852,6 +11919,7 @@ mod tests {
                                 children: None,
                                 arrived: Vec::new(),
                                 left: Vec::new(),
+                                seq: 0,
                             },
                         );
                     }

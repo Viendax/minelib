@@ -1198,6 +1198,36 @@ impl Accounts {
         })
     }
 
+    /// (v147) De quoi prêter sa connexion de garant à son pays, qui l'appelle (il choisit
+    /// lui-même les hôtes de ses provinces) : par le certificat de la clé du compte, à
+    /// l'adresse du relais du pays.
+    pub fn pays_garant_login(
+        &self,
+        call: &proto::GarantCall,
+    ) -> Option<crate::garant_worker::Login> {
+        let (Some(cert), Some(key)) = (self.cert.clone(), self.identity.clone()) else {
+            return None;
+        };
+        let at = proto::StandbyAt {
+            node: call.at.node,
+            addr: call.at.addr.clone(),
+            key: call.at.key,
+            room: 0,
+            pseudo: String::new(),
+            root: [0; 32],
+        };
+        Some(crate::garant_worker::Login {
+            addr: call.at.addr.clone(),
+            key: call.at.key,
+            pseudo: cert.pseudo.clone(),
+            password: String::new(),
+            device: None,
+            node_dir: Some(self.relay_dir.clone()),
+            votes: Some(self.relay_dir.with_file_name("votes_temoin.txt")),
+            takeover: Some(crate::garant_worker::CertLogin { at, cert, key }),
+        })
+    }
+
     pub fn pseudo(&self) -> String {
         self.account
             .as_ref()

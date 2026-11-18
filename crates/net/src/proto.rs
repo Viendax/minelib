@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 45;
+pub const PROTOCOL: u32 = 46;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -564,6 +564,9 @@ pub enum Request {
         /// positions.
         arrived: Vec<String>,
         left: Vec<String>,
+        /// (v147) Dernier rang qu'elle a donné : un pays dont la plage s'épuise (il en donne
+        /// une à chaque époque de ses provinces) en reçoit une nouvelle (`more`).
+        seq: u64,
     },
     /// Ce que le relais de province vient de publier (zone, rang, message) : le relais du
     /// monde en garde une copie, pour reprendre la province aussitôt si son hôte tombe.
@@ -1155,6 +1158,18 @@ pub enum Response {
         /// (v143) Durée du bail (ms, à partir de `t`) : celui d'une province d'un pays finit
         /// avant celui du pays.
         ms: u32,
+        /// (v147) Pays → ses provinces : il appelle des garants parmi ses joueurs (elles le
+        /// disent aux leurs, `GarantCall`).
+        call: Option<GarantCall>,
+        /// (v147) Relais du monde → pays : nouvelle plage de rangs (son début ; `low`).
+        more: Option<u64>,
+    },
+    /// (v147) Relais d'un pays (ou d'une de ses provinces) → ses joueurs : le pays appelle des
+    /// garants parmi eux ; chacun en est s'il tire moins que `share` (d'après son pseudo,
+    /// `GarantCall::picks`), et prête alors sa connexion de garant au pays (`at`).
+    GarantCall {
+        room: u64,
+        call: Option<GarantCall>,
     },
     /// Le relais du monde a gardé l'envoi `n` de la province (et tous ceux d'avant).
     ProvinceArchived {
@@ -1395,6 +1410,7 @@ impl Response {
                 | Response::ProvinceParent { .. }
                 | Response::ProvinceNeighbours { .. }
                 | Response::ProvinceSlay { .. }
+                | Response::GarantCall { .. }
                 // (Relais de secours et gardiens, v133 à v135 : poussés eux aussi ; une
                 // requête en cours ne doit pas les prendre pour sa réponse.)
                 | Response::StandbyTask { .. }
@@ -1484,6 +1500,27 @@ pub const PROVINCE_MARGIN_MS: u64 = 250;
 pub fn province_of(region: [i32; 2], size: i32) -> [i32; 2] {
     let size = size.max(1);
     [region[0].div_euclid(size), region[1].div_euclid(size)]
+}
+
+/// (v147) Un pays appelle des garants parmi ses joueurs : où le joindre, et la part de ses
+/// joueurs appelés.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct GarantCall {
+    pub at: ProvinceInfo,
+    pub share: f32,
+}
+
+impl GarantCall {
+    /// Ce joueur est-il appelé ? Tirage fixe d'après son pseudo (les mêmes joueurs d'un
+    /// appel à l'autre).
+    pub fn picks(&self, pseudo: &str) -> bool {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in pseudo.to_ascii_lowercase().bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        (h as f64 / u32::MAX as f64) < self.share as f64
+    }
 }
 
 /// Où joindre le relais d'une province (v138).

@@ -314,6 +314,8 @@ impl ProvinceHost {
             },
             handle.public,
         );
+        // (v147) Le relais sait où on le joint (un pays le donne à ses garants).
+        handle.province_self(at.0, at.1.clone(), at.2);
         Some((handle, node, at))
     }
 
@@ -341,9 +343,19 @@ impl ProvinceHost {
                 copies,
                 dump,
                 ms,
+                call,
+                more,
             } if (*room, *province) == (self.room, self.province) => {
-                self.handle
-                    .province_leased(*epoch, *t, *ok, *copies, *dump, *ms);
+                self.handle.province_leased(
+                    *epoch,
+                    *t,
+                    *ok,
+                    *copies,
+                    *dump,
+                    *ms,
+                    call.clone(),
+                    *more,
+                );
                 Vec::new()
             }
             Response::ProvinceArchived {
@@ -675,6 +687,12 @@ impl ProvinceHost {
     #[cfg(test)]
     pub fn positions_seen(&self) -> usize {
         self.handle.positions_seen()
+    }
+
+    /// Essais (v147) : hôtes de ses provinces qu'un pays a choisis parmi ses joueurs.
+    #[cfg(test)]
+    pub fn local_tasks(&self) -> usize {
+        self.handle.local_tasks()
     }
 
     /// Essais : il sert (bail en cours).
