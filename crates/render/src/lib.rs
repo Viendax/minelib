@@ -738,6 +738,8 @@ pub struct Renderer {
     /// leur code, compilé ensuite (le plus long) ; d'ici là, les translucides ne prennent
     /// pas leur lumière (l'opaque derrière, si).
     lit_translucent: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
+    /// (v198) Blocs vus dans les miroirs, éclairés par les lumières de l'éditeur.
+    planar_lit: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
     /// Images restantes pendant lesquelles l'anticrénelage considère que les lumières ont
     /// changé (déplacées, réglées) : comme `mesh_changes`.
     dyn_changes: u32,
@@ -1202,6 +1204,7 @@ impl Renderer {
             dyn_gpu,
             lit: None,
             lit_translucent: None,
+            planar_lit: None,
             dyn_changes: 0,
             skin_key: None,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
@@ -1630,11 +1633,20 @@ impl Renderer {
         if self.lit_pipes().is_some() && self.lit_translucent.is_none() {
             self.lit_translucent = Some(self.spawn_lit_translucent());
         }
+        // (v198) Puis les blocs vus dans les miroirs, une fois les translucides finis
+        // (réussis ou non : jamais deux compilations surveillées à la fois).
+        let translucent_done = self
+            .lit_translucent
+            .as_ref()
+            .is_some_and(|l| l.try_get().is_some());
+        if translucent_done && self.planar_lit.is_none() {
+            self.planar_lit = Some(self.spawn_planar_lit());
+        }
         let failed = self
             .lit
             .as_ref()
             .is_some_and(|l| matches!(l.try_get(), Some(Err(_))));
-        self.lit_translucent.is_some() || failed
+        self.planar_lit.is_some() || failed
     }
 
     /// Variantes éclairées, si elles sont prêtes.
@@ -1728,6 +1740,42 @@ impl Renderer {
     /// Translucides éclairés, s'ils sont prêts.
     fn lit_translucent(&self) -> Option<&wgpu::RenderPipeline> {
         self.lit_translucent.as_ref()?.try_get()?.as_ref().ok()
+    }
+
+    /// (v198) Blocs vus dans les miroirs, éclairés par les lumières de l'éditeur : compilés
+    /// sur un fil à part, après les autres pipelines des lumières.
+    fn spawn_planar_lit(&self) -> lazy::Lazy<Result<wgpu::RenderPipeline, String>> {
+        let device = self.device.clone();
+        let layout = self.world_layout.clone();
+        let format = planar::format(self.config.format);
+        lazy::Lazy::spawn("miroirs éclairés", move || {
+            let t0 = std::time::Instant::now();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let world = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("monde (lumières, miroirs)"),
+                source: wgpu::ShaderSource::Wgsl(
+                    lights::with_dynlights(include_str!("shaders/world.wgsl")).into(),
+                ),
+            });
+            let pipeline = planar::lit_block_pipeline(&device, &layout, &world, format);
+            let internal = pollster::block_on(device.pop_error_scope());
+            let validation = pollster::block_on(device.pop_error_scope());
+            if let Some(e) = internal.or(validation) {
+                log::warn!("miroirs éclairés refusés : sans les lumières dans les miroirs ({e})");
+                return Err(e.to_string());
+            }
+            log::info!(
+                "miroirs éclairés par les lumières compilés en {:.1} s (en tâche de fond)",
+                t0.elapsed().as_secs_f32()
+            );
+            Ok(pipeline)
+        })
+    }
+
+    /// (v198) Blocs vus dans les miroirs, éclairés, s'ils sont prêts.
+    fn planar_lit(&self) -> Option<&wgpu::RenderPipeline> {
+        self.planar_lit.as_ref()?.try_get()?.as_ref().ok()
     }
 
     /// Les lumières dynamiques ont-elles besoin de la grille de blocs (ombres) ?
@@ -2471,7 +2519,12 @@ impl Renderer {
             pass.set_bind_group(0, group, &[]);
             pass.set_pipeline(&self.sky_pipeline);
             pass.draw(0..3, 0..1);
-            pass.set_pipeline(&pipes.block);
+            // (v198) Lumières de l'éditeur : leurs taches de lumière aussi dans le reflet.
+            let block = self
+                .planar_lit()
+                .filter(|_| self.dyn_gpu.active())
+                .unwrap_or(&pipes.block);
+            pass.set_pipeline(block);
             for &(page, first, count) in &d.groups {
                 let pg = &self.arena.pages[page];
                 pass.set_vertex_buffer(0, pg.vertices.slice(..));

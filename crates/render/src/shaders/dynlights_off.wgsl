@@ -24,3 +24,7 @@ fn dyn_light(
 ) -> DynOut {
     return DynOut(vec3<f32>(0.0), vec3<f32>(0.0));
 }
+
+fn dyn_light_all(p: vec3<f32>, n: vec3<f32>, cam: vec3<f32>, gloss: f32, entity: bool, frag: vec2<f32>) -> DynOut {
+    return DynOut(vec3<f32>(0.0), vec3<f32>(0.0));
+}

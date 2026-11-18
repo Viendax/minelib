@@ -407,6 +407,9 @@ impl Session {
             }
             None => (Player::new(Vec3::new(8.5, 0.0, 8.5)), true),
         };
+        // (v198) Position de départ donnée (essais) : gardée aussi dans un monde neuf.
+        let mut start_given = false;
+        let mut demo: Option<f64> = None;
         if let Ok(start) = std::env::var("MINELIB_START") {
             let v: Vec<f32> = start
                 .split(',')
@@ -415,6 +418,7 @@ impl Session {
             if v.len() >= 3 {
                 player.pos = Vec3::new(v[0], v[1], v[2]);
                 player.flying = true;
+                start_given = true;
             }
             if v.len() >= 5 {
                 player.yaw = v[3].to_radians();
@@ -432,13 +436,21 @@ impl Session {
             }
         }
         if fresh {
+            // (v198) MINELIB_START garde la main, même dans un monde neuf et la démo (essais :
+            // se placer où l'on veut).
             let ground = world.top_solid(8, 8).unwrap_or(64);
-            player.pos.y = ground as f32 + 1.0;
+            if !start_given {
+                player.pos.y = ground as f32 + 1.0;
+            }
             if std::env::var("MINELIB_DEMO").is_ok_and(|v| v.trim() == "1") {
                 build_demo(&mut world);
-                player.pos = Vec3::new(8.5, world.top_solid(8, 6).unwrap_or(64) as f32 + 1.0, 6.5);
-                player.yaw = std::f32::consts::PI;
-                player.pitch = -0.12;
+                demo = Some(world.top_solid(8, 6).unwrap_or(64) as f64);
+                if !start_given {
+                    player.pos =
+                        Vec3::new(8.5, world.top_solid(8, 6).unwrap_or(64) as f32 + 1.0, 6.5);
+                    player.yaw = std::f32::consts::PI;
+                    player.pitch = -0.12;
+                }
             }
         }
         let game = data.game;
@@ -597,7 +609,14 @@ impl Session {
             vox_job: None,
             lights_timer: 0.0,
             mirror_planes: Vec::new(),
-            lights: crate::lights::Lights::load(&minelib_assets::data_dir(), &dir_for_lights),
+            lights: {
+                let mut l =
+                    crate::lights::Lights::load(&minelib_assets::data_dir(), &dir_for_lights);
+                if let Some(ground) = demo {
+                    demo_lights(&mut l, ground);
+                }
+                l
+            },
             light_editor: Default::default(),
             light_op_probe: None,
             lights_wanted: false,
@@ -7540,6 +7559,25 @@ fn sun_reaches(world: &World, b: &ShadowBox, sun: [f32; 3]) -> bool {
 const THIRD_PERSON_DIST: f32 = 4.0;
 
 /// Scène de démonstration : un mur de briques et toutes les torches colorées devant.
+/// (v198) Démo : un projecteur au-dessus du sol (`ground`) devant le miroir d'en face
+/// (lumières de l'éditeur : sa tache se voit au sol et dans les miroirs).
+fn demo_lights(lights: &mut crate::lights::Lights, ground: f64) {
+    let id = lights.new_id();
+    lights.scene.push(crate::lights::PlacedLight {
+        id,
+        name: "Démo".into(),
+        kind: crate::lights::Kind::Spot,
+        position: [8.5, ground + 5.5, 8.5],
+        direction: [0.0, -1.0, 0.3],
+        color: [1.0, 0.85, 0.6],
+        intensity: 6.0,
+        range: 14.0,
+        angle: 30.0,
+        volumetric: false,
+        ..Default::default()
+    });
+}
+
 fn build_demo(world: &mut World) {
     let z_wall = 14;
     let n = minelib_world::flame::CHEMICALS.len() as i32 + 1;

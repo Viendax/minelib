@@ -29,7 +29,8 @@
 //!   MINELIB_DEBUG=1             F3 ouvert au démarrage
 //!   MINELIB_NIGHT=1             commencer de nuit
 //!   MINELIB_DEMO=1              nouveau monde : mur + toutes les torches colorées
-//!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé)
+//!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé ; aussi
+//!                               dans un monde neuf et dans la démo)
 //!   MINELIB_EXIT_AFTER=<s>      quitter automatiquement (tests)
 //!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
 //!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)

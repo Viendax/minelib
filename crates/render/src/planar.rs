@@ -543,6 +543,58 @@ pub(crate) struct Pipes {
 /// raytracing) : pas le coût de 64 rebonds.
 pub const MIRROR_BOUNCES: f32 = 8.0;
 
+/// Pipeline d'une passe de miroir (blocs du monde, coupés au plan du miroir).
+#[allow(clippy::too_many_arguments)]
+fn mirror_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    label: &str,
+    fs: &str,
+    cull: Option<wgpu::Face>,
+    depth_write: bool,
+    blend: Option<wgpu::BlendState>,
+) -> wgpu::RenderPipeline {
+    let vertex_layout = crate::world_vertex_layout();
+    crate::surface_pipeline(
+        device,
+        layout,
+        shader,
+        format,
+        label,
+        "vs_block",
+        fs,
+        std::slice::from_ref(&vertex_layout),
+        cull,
+        depth_write,
+        wgpu::CompareFunction::Greater,
+        blend,
+    )
+}
+
+/// (v198) Blocs opaques vus dans un miroir, éclairés par les lumières de l'éditeur
+/// (`shader` : celui du monde avec leur code, compilé à part la première fois qu'il y a une
+/// lumière).
+pub fn lit_block_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    mirror_pipeline(
+        device,
+        layout,
+        shader,
+        format,
+        "miroir : blocs (lumières)",
+        "fs_block_mirror",
+        Some(wgpu::Face::Back),
+        true,
+        None,
+    )
+}
+
 impl Pipes {
     pub fn new(
         device: &wgpu::Device,
@@ -550,22 +602,16 @@ impl Pipes {
         shader: &wgpu::ShaderModule,
         format: wgpu::TextureFormat,
     ) -> Self {
-        let vertex_layout = crate::world_vertex_layout();
-        let vl = std::slice::from_ref(&vertex_layout);
-        let greater = wgpu::CompareFunction::Greater;
         let mk = |label: &str, fs: &str, cull, depth_write, blend| {
-            crate::surface_pipeline(
+            mirror_pipeline(
                 device,
                 layout,
                 shader,
                 format,
                 label,
-                "vs_block",
                 fs,
-                vl,
                 cull,
                 depth_write,
-                greater,
                 blend,
             )
         };

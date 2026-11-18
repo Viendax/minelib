@@ -501,7 +501,14 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
     var dyn_spec = vec3<f32>(0.0);
     var wd = mix(0.6, 1.0, ao);
     if dyn_active() {
-        let dl = dyn_light(i.world, n, g.cam_pos.xyz, i.reflect, false, i.clip.xy, g.screen.xy);
+        // (v198) Dans l'image d'un miroir (passe coupée à son plan), les tuiles de l'écran
+        // ne disent rien : toutes les lumières, vues de l'œil reflété.
+        var dl: DynOut;
+        if any(g.clip.xyz != vec3<f32>(0.0)) {
+            dl = dyn_light_all(i.world, n, g.cam_pos.xyz, i.reflect, false, i.clip.xy);
+        } else {
+            dl = dyn_light(i.world, n, g.cam_pos.xyz, i.reflect, false, i.clip.xy, g.screen.xy);
+        }
         color += albedo * dl.diffuse * wd;
         dyn_spec = select(dl.specular, dl.specular * albedo * 1.6, i.short != 0u);
     }

@@ -185,7 +185,8 @@ fn player_albedo(i: PlayerOut) -> vec3<f32> {
 @fragment
 fn fs_player(i: PlayerOut) -> @location(0) vec4<f32> {
     // (v190) Dans un miroir : rien de ce qui est derrière lui.
-    if dot(g.clip.xyz, i.world) + g.clip.w < 0.0 {
+    // (v198) Moins d'un bloc derrière : un joueur collé au miroir, gardé entier.
+    if dot(g.clip.xyz, i.world) + g.clip.w < -MIRROR_SLACK {
         discard;
     }
     return vec4<f32>(player_albedo(i) * i.light, 1.0);

@@ -23,6 +23,11 @@ struct Globals {
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
+
+/// (v198) Ce qui dépasse derrière un miroir de moins que ça (blocs) reste dans son reflet :
+/// c'est dans le bloc miroir lui-même (plein), donc forcément un joueur ou un objet qui s'y
+/// enfonce un peu. Plus loin, c'est de l'autre côté du bloc : coupé.
+const MIRROR_SLACK: f32 = 0.9;
 @group(0) @binding(1) var blocks: texture_2d_array<f32>;
 @group(0) @binding(2) var block_sampler: sampler;
 
@@ -94,7 +99,10 @@ fn vs_main(v: VIn) -> VOut {
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     // (v190) Dans un miroir : rien de ce qui est derrière lui (zéro ailleurs : tout passe).
-    if dot(g.clip.xyz, i.world) + g.clip.w < 0.0 {
+    // (v198) Sauf à moins d'un bloc : c'est encore dans le bloc miroir, donc un joueur
+    // collé au miroir (sa tête, son bras, ce qu'il tient) ; coupé, son reflet avait des
+    // trous.
+    if dot(g.clip.xyz, i.world) + g.clip.w < -MIRROR_SLACK {
         discard;
     }
     return vec4<f32>(shade(i), 1.0);
