@@ -1549,6 +1549,8 @@ impl Game {
             if let Some(b) = s.build.as_mut().filter(|b| !b.has_skin()) {
                 b.set_skin(std::fs::read(self.paths.root.join("skin.png")).unwrap_or_default());
             }
+            // (v157) Têtes de joueurs : leur skin, tenu à jour.
+            s.update_head_skins(&self.accounts.pseudo());
             let dozing = self.accounts.dozing();
             for p in s.skins.take_wanted() {
                 match s.build.as_ref().filter(|_| dozing) {

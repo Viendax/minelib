@@ -2020,8 +2020,10 @@ fn fluids_and_heads(b: &mut Builder) {
         ],
         DECOR,
     );
-    // Têtes à skin des cartes importées : le bloc garde sa forme (on s'y cogne), mais
-    // c'est la tête texturée qui est dessinée (`heads` du jeu).
+    // Têtes : le bloc garde sa forme (on s'y cogne, on le vise), mais c'est la tête
+    // dessinée pixel par pixel avec son skin qui se voit (`heads` du jeu), toutes les
+    // têtes (celle du skin par défaut du jeu comprise). `…:tex` : têtes des cartes
+    // converties avant la v157 (leur rotation est dans `tetes.txt`).
     for key in [
         "skull",
         "skull:wall:0",
@@ -2029,7 +2031,9 @@ fn fluids_and_heads(b: &mut Builder) {
         "skull:wall:4",
         "skull:wall:5",
     ] {
-        let base = b.r.defs[b.r.keys[key] as usize].clone();
+        let i = b.r.keys[key] as usize;
+        b.r.defs[i].hidden = true;
+        let base = b.r.defs[i].clone();
         let k = format!("{key}:tex");
         let id = b.r.defs.len() as u16;
         b.r.defs.push(BlockDef {
@@ -2107,6 +2111,47 @@ fn fluids_and_heads(b: &mut Builder) {
         });
         b.r.keys.insert(k, id);
     }
+    // (v157) Têtes au sol tournées comme dans Minecraft : `skull:r1` … `skull:r15` (16e de
+    // tour ; `skull` = 0, le visage vers le nord, 4 vers l'est). Ajoutées en dernier.
+    let skull = b.r.defs[b.r.keys["skull"] as usize].clone();
+    for r in 1..16u8 {
+        let k = format!("skull:r{r}");
+        let id = b.r.defs.len() as u16;
+        b.r.defs.push(BlockDef {
+            key: k.clone(),
+            ..skull.clone()
+        });
+        b.r.keys.insert(k, id);
+    }
+}
+
+/// Pose d'un bloc « tête » : `Some((false, r))` au sol, tournée de `r` seizièmes de tour
+/// (0 : visage vers le nord, 4 vers l'est, comme Minecraft) ; `Some((true, côté))` contre un
+/// mur (côté du mur : 0 +X, 1 −X, 4 +Z, 5 −Z). `None` : pas une tête.
+pub fn skull_pose(id: BlockId) -> Option<(bool, u8)> {
+    let key = id.def().key.as_str();
+    let rest = key.strip_prefix("skull")?;
+    let rest = rest.strip_suffix(":tex").unwrap_or(rest);
+    if rest.is_empty() {
+        return Some((false, 0));
+    }
+    if let Some(r) = rest.strip_prefix(":r") {
+        return r.parse::<u8>().ok().filter(|r| *r < 16).map(|r| (false, r));
+    }
+    rest.strip_prefix(":wall:")
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|s| matches!(s, 0 | 1 | 4 | 5))
+        .map(|s| (true, s))
+}
+
+/// Bloc « tête » de cette pose (voir `skull_pose`).
+pub fn skull_block(wall: bool, n: u8) -> BlockId {
+    let key = match (wall, n & 15) {
+        (true, s) => format!("skull:wall:{s}"),
+        (false, 0) => "skull".to_string(),
+        (false, r) => format!("skull:r{r}"),
+    };
+    registry().by_key(&key).unwrap_or(BlockId::AIR)
 }
 
 /// Plante qu'on peut mettre dans un pot (pas les plantes de deux blocs, ni le blé, la
@@ -2280,6 +2325,19 @@ fn legacy_table(b: &mut Builder) {
     for &(id, key) in simple {
         let v = k(b, key);
         b.legacy_all(id, v);
+    }
+    // Têtes (avant 1.13) : méta & 7 = 1 au sol (sa rotation est dans l'entité de bloc,
+    // `Rot`), 2..5 contre un mur, tournée vers le nord, le sud, l'ouest, l'est.
+    for meta in 0u8..16 {
+        let key = match meta & 7 {
+            2 => "skull:wall:4",
+            3 => "skull:wall:5",
+            4 => "skull:wall:0",
+            5 => "skull:wall:1",
+            _ => "skull",
+        };
+        let v = k(b, key);
+        b.legacy(144, meta, v);
     }
     // Sans équivalent : fil, feu, portails, redstone… → rien.
     for id in [

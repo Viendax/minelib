@@ -2866,8 +2866,8 @@ impl Host {
                 Ev::AfkKick(id) => {
                     // Il quitte la partie de lui-même à la réception (le relais compte
                     // alors son absence comme une déconnexion) et peut la rejoindre.
-                    let reason = "Sorti de la partie pour inactivité (2 minutes en vie sans \
-                                  jouer). Tu peux la rejoindre."
+                    let reason = "Sorti de la partie pour inactivité (3 minutes en vie sans \
+                                  jouer, comme dans Counter-Strike). Tu peux la rejoindre."
                         .to_string();
                     if id == 0 {
                         out.push(Local::Kicked(reason));

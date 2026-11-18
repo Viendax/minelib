@@ -214,8 +214,11 @@ pub struct Session {
     fluids: crate::fluids::Fluids,
     /// Temps avant la prochaine brûlure dans la lave.
     lava_burn: f32,
-    /// Têtes à skin d'une carte importée (chargées au premier pas), et leurs triangles.
+    /// Têtes (blocs « tête », têtes des entités des cartes ; chargées au premier pas), et
+    /// leurs triangles.
     heads: Option<crate::heads::Heads>,
+    /// Dernière fois que les skins des têtes de joueurs ont été redemandés au relais.
+    head_skins_at: Option<std::time::Instant>,
     /// Cadres des murs (cartes importées).
     frames: Option<crate::frames::Frames>,
     /// Temps passé à avancer sans touche tenue (diagnostic), et déjà noté au journal.
@@ -472,6 +475,7 @@ impl Session {
             fluids: Default::default(),
             lava_burn: 0.0,
             heads: None,
+            head_skins_at: None,
             frames: None,
             coast: 0.0,
             coast_logged: false,
@@ -1017,17 +1021,26 @@ impl Session {
             let shots = std::mem::take(&mut self.fps.shots);
             let mut net_locals = Vec::new();
             self.fps.hit_marker.0 = (self.fps.hit_marker.0 - dt).max(0.0);
-            // Têtes à skin (cartes importées) : textures téléchargées, têtes proches.
-            let heads = self.heads.get_or_insert_with(|| {
-                crate::heads::Heads::load(&self.dir, minelib_assets::data_dir().join("tetes"))
-            });
+            // Têtes (blocs « tête », têtes des entités des cartes) : textures téléchargées,
+            // têtes proches.
+            if self.heads.is_none() {
+                let h =
+                    crate::heads::Heads::load(&self.dir, minelib_assets::data_dir().join("tetes"));
+                // Lumière des têtes d'entités : mesurée par le maillage de leurs chunks.
+                for (pos, points) in h.probes() {
+                    self.world.set_probes(pos, points);
+                    self.streamer
+                        .remesh_now(&self.world, &mut self.workers, pos);
+                }
+                self.heads = Some(h);
+            }
             // Têtes et cadres : triangles gardés sur la carte graphique, refaits (une zone
-            // à la fois) seulement quand ils changent.
+            // à la fois) seulement quand ils changent ; éclairés comme les blocs.
             let l = 0.3 + 0.7 * self.daylight;
-            if !heads.is_empty() {
+            if let Some(heads) = self.heads.as_mut() {
                 let eye = self.player.eye();
                 heads.update(eye);
-                heads.refresh(eye, [l; 3]);
+                heads.refresh(eye, self.daylight);
             }
             self.frames
                 .get_or_insert_with(|| crate::frames::Frames::load(&self.dir))
@@ -1356,6 +1369,12 @@ impl Session {
             self.player.pos.x,
             self.player.pos.z,
         );
+        // Têtes des chunks maillés : blocs « tête » et lumière reçue.
+        if let Some(h) = self.heads.as_mut() {
+            for (pos, spots, probes) in self.streamer.take_heads() {
+                h.chunk_meshed(pos, spots, probes);
+            }
+        }
         let _s = perf::scope("visée");
         self.hit = raycast(
             &self.world,
@@ -2019,6 +2038,20 @@ impl Session {
                 return;
             }
         }
+        // « Copier le bloc » sur une tête portée par une entité de la carte (porte-armure,
+        // affichage, cadre) devant le bloc visé : la tête, avec son skin, vient en main.
+        if pick && self.inventory.selected_item() != Some(Item::Wand) {
+            let eye = self.player.eye();
+            let aimed = self
+                .heads
+                .as_ref()
+                .and_then(|h| h.aimed(eye, self.player.look_dir(), REACH))
+                .filter(|(t, _)| hit.as_ref().is_none_or(|b| *t <= b.distance + 0.01));
+            if let Some((_, skin)) = aimed {
+                self.give_picked(head_item(skin));
+                return;
+            }
+        }
         // « Copier le bloc » sur un cadre : le bloc qu'il montre vient en main.
         if pick && self.inventory.selected_item() != Some(Item::Wand) {
             let framed = self.frame_aim.and_then(|i| self.frames.as_ref()?.block(i));
@@ -2143,9 +2176,11 @@ impl Session {
                 }
             }
             let [x, y, z] = hit.block;
-            // Tête d'une carte importée : sa tête texturée part avec le bloc.
-            if hit.id.def().key.starts_with("skull") {
+            // Tête : elle part avec le bloc (et rend une tête avec son skin).
+            let mut head = None;
+            if minelib_world::registry::skull_pose(hit.id).is_some() {
                 if let Some(h) = self.heads.as_mut() {
+                    head = Some(head_item(h.skin_at(hit.block)));
                     h.remove_at(hit.block, &self.dir);
                 }
             }
@@ -2153,7 +2188,7 @@ impl Session {
             let item = if hit.id.is_torch() {
                 Item::Torch(None)
             } else {
-                Item::Block(hit.id)
+                head.unwrap_or(Item::Block(hit.id))
             };
             self.dirty.extend(self.world.set(x, y, z, BlockId::AIR));
             // En créatif, comme dans Minecraft : le bloc cassé ne s'ajoute pas à l'inventaire.
@@ -2164,6 +2199,42 @@ impl Session {
         }
 
         if placing {
+            // Tête : au sol tournée vers soi (16 directions, comme Minecraft), ou contre le
+            // mur visé ; pas au plafond. Son skin est gardé avec elle.
+            if let Some(skin) = self.inventory.selected_item().and_then(Item::head_skin) {
+                let [x, y, z] = hit.adjacent();
+                let free = !self.world.get(x, y, z).is_targetable()
+                    && !self.player.overlaps_block([x, y, z]);
+                let look = self.player.look_dir();
+                let pose = match hit.normal {
+                    [1, 0, 0] => Some(crate::heads::Pose::Wall(1)),
+                    [-1, 0, 0] => Some(crate::heads::Pose::Wall(0)),
+                    [0, 0, 1] => Some(crate::heads::Pose::Wall(5)),
+                    [0, 0, -1] => Some(crate::heads::Pose::Wall(4)),
+                    [0, 1, 0] => Some(crate::heads::Pose::Floor(floor_rotation(look))),
+                    _ => None,
+                };
+                if let (Some(pose), true) = (pose, free) {
+                    let block = match pose {
+                        crate::heads::Pose::Wall(s) => {
+                            minelib_world::registry::skull_block(true, s)
+                        }
+                        crate::heads::Pose::Floor(r) => {
+                            minelib_world::registry::skull_block(false, r)
+                        }
+                        _ => BlockId::AIR,
+                    };
+                    if block != BlockId::AIR {
+                        self.dirty.extend(self.world.set(x, y, z, block));
+                        if let Some(h) = self.heads.as_mut() {
+                            h.place([x, y, z], pose, skin, &self.dir);
+                        }
+                        self.use_selected();
+                    }
+                }
+                self.place_cooldown = 0.22;
+                return;
+            }
             // Portes (2 blocs, au bord le plus proche du joueur) et trappes (en haut ou en
             // bas de la case selon l'endroit visé).
             if let Some(Item::Block(b)) = self.inventory.selected_item() {
@@ -2316,10 +2387,46 @@ impl Session {
         if pick {
             let wanted = if hit.id.is_torch() {
                 Item::Torch(self.world.torch(hit.block).and_then(|t| t.chemical))
+            } else if minelib_world::registry::skull_pose(hit.id).is_some() {
+                // Tête : avec son skin (texture de Minecraft, joueur), à reposer ailleurs.
+                head_item(
+                    self.heads
+                        .as_ref()
+                        .map_or(crate::heads::HeadSkin::Default, |h| h.skin_at(hit.block)),
+                )
             } else {
                 Item::Block(hit.id)
             };
             self.give_picked(wanted);
+        }
+    }
+
+    /// Skins des têtes de joueurs (posées, ou dans l'inventaire) : demandés au relais, et
+    /// redemandés toutes les deux minutes (un joueur a pu changer de skin) ; celui du joueur
+    /// `me` (le compte) est connu ici.
+    pub fn update_head_skins(&mut self, me: &str) {
+        let Some(h) = self.heads.as_mut() else {
+            return;
+        };
+        let again = self
+            .head_skins_at
+            .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(120));
+        if again {
+            self.head_skins_at = Some(std::time::Instant::now());
+        }
+        let pseudos: Vec<String> = h.players().map(str::to_string).collect();
+        for p in pseudos {
+            let skin = if !me.is_empty() && p.eq_ignore_ascii_case(me) {
+                self.skins.mine()
+            } else {
+                if again {
+                    self.skins.refresh(&p);
+                }
+                self.skins.of(&p)
+            };
+            if let Some(s) = skin {
+                h.set_player(&p, s);
+            }
         }
     }
 
@@ -4135,11 +4242,30 @@ impl Session {
                 }
                 let reg = minelib_world::registry::registry();
                 let want = arg.unwrap_or("").to_lowercase();
-                let count: u32 = parts
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(64)
-                    .clamp(1, 64);
+                let mut next = parts.next();
+                // Tête d'un joueur du jeu : /give tête <pseudo> [nombre] (son skin, tenu à
+                // jour, posée comme dans Minecraft).
+                if matches!(
+                    want.as_str(),
+                    "skull" | "tete" | "tête" | "head" | "player_head"
+                ) {
+                    if let Some(who) = next.filter(|w| w.parse::<u32>().is_err()) {
+                        next = parts.next();
+                        let count: u32 =
+                            next.and_then(|n| n.parse().ok()).unwrap_or(64).clamp(1, 64);
+                        if !minelib_net::proto::valid_pseudo(who) {
+                            self.chat.say(format!("Pseudo invalide : {who}"), chat::RED);
+                            return;
+                        }
+                        let skin = crate::heads::HeadSkin::Player(who.to_string());
+                        self.inventory
+                            .add(Item::Head(crate::heads::intern(&skin)), count);
+                        self.chat
+                            .say(format!("{count} tête(s) de {who} donnée(s)."), chat::YELLOW);
+                        return;
+                    }
+                }
+                let count: u32 = next.and_then(|n| n.parse().ok()).unwrap_or(64).clamp(1, 64);
                 let found = reg.by_key(&want).or_else(|| {
                     // Sinon par le nom affiché (« miroir », « bloc de fer »…).
                     (1..reg.len())
@@ -4322,6 +4448,7 @@ impl Session {
                     "/timefix true|false : arrête ou relance le temps",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
                     "/give petit_ecran | grand_ecran | ecran_geant : les autres tailles d'écran",
+                    "/give tête <pseudo> [nombre] : la tête d'un joueur, avec son skin",
                     "/yt [recherche | adresse] : YouTube sur les écrans vidéo",
                     "/lumieres : éditeur de lumières (touche L) ; /lumieres effacer : les retire",
                     "Vol : deux appuis rapides sur Espace",
@@ -5491,6 +5618,10 @@ impl Session {
                 )),
                 Some(Item::Wand) => Some(Held::Wand([70, 60, 90])),
                 Some(Item::Screen(_)) => Some(Held::Wand([30, 30, 36])),
+                // Tête tenue (vue en 3e personne) : comme le bloc « tête ».
+                Some(Item::Head(_)) => {
+                    Some(Held::Block(minelib_world::registry::skull_block(false, 0)))
+                }
                 None => None,
             }
         } else {
@@ -5869,6 +6000,27 @@ fn same_family(a: BlockId, b: BlockId) -> bool {
         }
         _ => false,
     }
+}
+
+/// Objet d'une tête : simple (skin par défaut du jeu) ou avec son skin.
+fn head_item(skin: crate::heads::HeadSkin) -> Item {
+    match skin {
+        crate::heads::HeadSkin::Default => {
+            Item::Block(minelib_world::registry::skull_block(false, 0))
+        }
+        s => Item::Head(crate::heads::intern(&s)),
+    }
+}
+
+/// Rotation (seizièmes de tour, comme Minecraft : 0 visage au nord, 4 à l'est) d'une tête
+/// posée au sol par un joueur qui regarde dans la direction `look` : elle le regarde.
+fn floor_rotation(look: Vec3) -> u8 {
+    let face = -Vec3::new(look.x, 0.0, look.z);
+    if face.length_squared() < 1e-8 {
+        return 0;
+    }
+    let t = face.x.atan2(-face.z);
+    ((t / (std::f32::consts::TAU / 16.0)).round() as i32).rem_euclid(16) as u8
 }
 
 /// Côté vertical (0 +X, 1 −X, 4 +Z, 5 −Z) dans la direction horizontale dominante de `v`.

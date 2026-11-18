@@ -605,6 +605,20 @@ impl Hand {
                     * Mat4::from_scale(Vec3::splat(0.34));
                 crate::screen::model(&mut out, proj * m, light);
             }
+            // Tête (simple ou à skin) : tenue comme un bloc, avec son skin, le visage vers soi.
+            Item::Head(_) | Item::Block(_) if item.head_skin().is_some() => {
+                let skin = item.head_skin().unwrap_or(crate::heads::HeadSkin::Default);
+                let m = base
+                    * Mat4::from_translation(Vec3::new(0.5, -0.36, -1.02))
+                    * block_rotation()
+                    * Mat4::from_scale(Vec3::splat(0.26))
+                    * Mat4::from_rotation_y(std::f32::consts::PI)
+                    * Mat4::from_scale(Vec3::splat(1.0 / 8.0))
+                    * Mat4::from_translation(Vec3::new(0.0, -4.0, 0.0));
+                let s = crate::heads::loaded(&skin);
+                out.extend(crate::heads::head_vm(s.as_deref(), proj * m, light));
+            }
+            Item::Head(_) => {}
             Item::Block(b) => {
                 let def = b.def();
                 let t = def.tex;

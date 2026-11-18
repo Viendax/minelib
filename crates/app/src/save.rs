@@ -288,6 +288,7 @@ fn item_code(item: Item) -> String {
         Item::Screen(n) => format!("screen;{n}"),
         Item::Torch(None) => "torch;-".into(),
         Item::Torch(Some(i)) => format!("torch;{i}"),
+        Item::Head(n) => format!("head;{}", crate::heads::skin_of(n).field()),
     }
 }
 
@@ -299,6 +300,9 @@ fn parse_item(kind: &str, arg: &str) -> Option<Item> {
         "screen" => Some(Item::Screen(
             arg.parse::<u8>().map_or(crate::screen::NORMAL, |n| n.min(3)),
         )),
+        "head" => Some(Item::Head(crate::heads::intern(
+            &crate::heads::HeadSkin::parse(arg)?,
+        ))),
         _ => None,
     }
 }

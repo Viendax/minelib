@@ -263,6 +263,8 @@ fn icon_kind(item: Item) -> RayBoxKind {
         }
         Item::Wand => RayBoxKind::Flat([120, 80, 200]),
         Item::Screen(_) => RayBoxKind::Flat([30, 30, 36]),
+        // Tête à skin (au sol, elle devient une tête simple : voir `Item::code`).
+        Item::Head(_) => RayBoxKind::Flat([214, 166, 132]),
     }
 }
 

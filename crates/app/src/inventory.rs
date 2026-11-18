@@ -26,10 +26,14 @@ pub enum Item {
     /// grand, géant) : « utiliser » le pose ; posé, « utiliser » le touche (tactile) et
     /// « casser » le casse.
     Screen(u8),
+    /// Tête avec un skin (`heads::skin_of`) : texture d'une tête de Minecraft, ou skin d'un
+    /// joueur du jeu ; posée, elle le garde.
+    Head(u32),
 }
 
 impl Item {
-    /// Code de l'objet sur le réseau et dans les sauvegardes (objets au sol, coffres).
+    /// Code de l'objet sur le réseau et dans les sauvegardes (objets au sol, coffres). Une
+    /// tête à skin y devient une tête simple (le skin ne voyage pas).
     pub fn code(self) -> u32 {
         match self {
             Item::Block(b) => b.0 as u32,
@@ -40,6 +44,18 @@ impl Item {
             Item::Screen(1) => 0x3_0000,
             Item::Screen(0) => 0x3_0001,
             Item::Screen(n) => 0x3_0000 + u32::from(n.min(3)),
+            Item::Head(_) => minelib_world::registry::skull_block(false, 0).0 as u32,
+        }
+    }
+
+    /// Tête (simple ou à skin) : son skin.
+    pub fn head_skin(self) -> Option<crate::heads::HeadSkin> {
+        match self {
+            Item::Head(n) => Some(crate::heads::skin_of(n)),
+            Item::Block(b) if minelib_world::registry::skull_pose(b).is_some() => {
+                Some(crate::heads::HeadSkin::Default)
+            }
+            _ => None,
         }
     }
 
@@ -66,6 +82,7 @@ impl Item {
             Item::Block(b) => capitalize(b.name()),
             Item::Wand => "Baguette de sélection".into(),
             Item::Screen(n) => crate::screen::size_name(n).into(),
+            Item::Head(n) => crate::heads::skin_of(n).item_name(),
             Item::Torch(None) => "Torche".into(),
             Item::Torch(Some(i)) => {
                 let c = &CHEMICALS[i];
@@ -85,7 +102,7 @@ impl Item {
         match self {
             Item::Torch(None) => Some(WOOD_FLAME),
             Item::Torch(Some(i)) => Some(CHEMICALS[i].rgb),
-            Item::Block(_) | Item::Wand | Item::Screen(_) => None,
+            Item::Block(_) | Item::Wand | Item::Screen(_) | Item::Head(_) => None,
         }
     }
 
@@ -113,6 +130,18 @@ impl Item {
                 lines.push(("Clic droit dessus : le toucher (tactile)".into(), WHITE));
                 lines.push(("Clic gauche dessus : le casser".into(), WHITE));
                 lines.push(("Accroupi + clic droit : poser un bloc devant".into(), GREY));
+            }
+            Item::Head(n) => {
+                let skin = match crate::heads::skin_of(n) {
+                    crate::heads::HeadSkin::Player(p) => format!("Skin de {p}, tenu à jour"),
+                    crate::heads::HeadSkin::Mc(_) => "Skin d'une tête de Minecraft".into(),
+                    crate::heads::HeadSkin::Default => "Skin par défaut".into(),
+                };
+                lines.push((skin, WHITE));
+                lines.push((
+                    "Clic droit : la poser au sol (tournée vers soi) ou contre un mur".into(),
+                    GREY,
+                ));
             }
             Item::Torch(None) => {
                 lines.push(("Flamme orange (bois)".into(), WHITE));
@@ -711,6 +740,7 @@ impl Inventory {
                         Item::Screen(_) => {
                             "ecran video tele television youtube petit grand geant".contains(&q)
                         }
+                        Item::Head(_) => "tete skull head".contains(&q),
                     }
                 }
             })
@@ -983,8 +1013,10 @@ impl Inventory {
             .hotbar_at(x, y)
             .or_else(|| c.storage_at(x, y).map(|i| HOTBAR + i));
         if let Some(i) = slot {
+            // Maj + clic sur une case de son inventaire (rien en main) : l'objet est
+            // supprimé, comme dans l'inventaire créatif de Minecraft.
             if shift && self.held.is_none() {
-                self.quick_move(i);
+                self.slots[i] = None;
             } else {
                 self.click_slot(i, right);
             }
@@ -1430,6 +1462,20 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
                 ui.rect(cx - r + t, cy - r + t, 2.0 * s, 2.0 * s, c);
             }
         }
+        // Tête (simple ou à skin) : la tête en 3D avec son skin.
+        Item::Head(_) | Item::Block(_) if st.item.head_skin().is_some() => {
+            let skin = st
+                .item
+                .head_skin()
+                .unwrap_or(crate::heads::HeadSkin::Default);
+            ui.model(crate::heads::icon(
+                x + slot / 2.0,
+                y + slot / 2.0,
+                16.0 * s,
+                &skin,
+            ))
+        }
+        Item::Head(_) => {}
         // Bloc : vrai modèle 3D, net à toutes les résolutions.
         Item::Block(b) => ui.model(crate::hand::block_icon(
             x + slot / 2.0,
@@ -1609,6 +1655,15 @@ mod tests {
         assert_eq!(inv.scroll_row, rows - CAT_ROWS);
         inv.pointer(size, Some((0.0, 0.0)), false, false);
         assert!(!inv.dragging);
+        // Maj + clic sur une case de la barre : l'objet est supprimé (les autres restent).
+        inv.click(size, mid(c.cell_pos(0)), false, true);
+        inv.click(size, mid(c.cell_pos(1)), false, true);
+        let before = inv.slots.iter().filter(|s| s.is_some()).count();
+        assert_eq!(before, 2);
+        let first = (0..HOTBAR).find(|&i| inv.slots[i].is_some()).unwrap();
+        inv.click(size, mid(c.hotbar_pos(first)), false, true);
+        assert!(inv.slots[first].is_none() && inv.held.is_none());
+        assert_eq!(inv.slots.iter().filter(|s| s.is_some()).count(), 1);
         // Maj + clic sur la poubelle : tout vider.
         inv.click(size, mid(c.cell_pos(1)), false, true);
         assert!(inv.slots.iter().any(|s| s.is_some()));

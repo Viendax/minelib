@@ -47,8 +47,8 @@ pub const START_MONEY: u32 = 800;
 const OT_MONEY: u32 = 12_500;
 pub const MAX_MONEY: u32 = 16_000;
 /// En vie dans une manche en cours sans toucher une commande pendant ce temps : sorti de
-/// la partie.
-pub const AFK_S: f32 = 120.0;
+/// la partie. Trois minutes, comme Counter-Strike (`mp_idlemaxtime`, en minutes).
+pub const AFK_S: f32 = 180.0;
 /// Manches jouées sans un coéquipier avant que le reste de l'équipe soit compensé.
 pub const ABSENT_ROUNDS: u8 = 2;
 /// Compensation par joueur absent et par manche, partagée entre les coéquipiers présents.
@@ -219,7 +219,7 @@ pub enum Ev {
     TeamKillKick(u64),
     /// Exclu par un vote de son équipe.
     VoteKick(u64),
-    /// Sorti de la partie pour inactivité (2 minutes en vie sans rien toucher) : il peut
+    /// Sorti de la partie pour inactivité (3 minutes en vie sans rien toucher) : il peut
     /// revenir, et il est puni comme pour une déconnexion.
     AfkKick(u64),
     /// Pause commencée (true) ou finie : le relais ne compte pas ce temps dans les
@@ -2201,7 +2201,7 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_living_player_leaves_after_two_minutes_and_may_come_back() {
+    fn an_idle_living_player_leaves_after_three_minutes_and_may_come_back() {
         let mut m = full_match();
         run(&mut m, FREEZE_S + 0.1);
         assert_eq!(m.phase, phase::LIVE);
@@ -2225,12 +2225,12 @@ mod tests {
         assert!(!ev.iter().any(|e| matches!(e, Ev::AfkKick(_))));
         assert!(m.players[&afk].present);
         // Le temps s'ajoute d'une manche à l'autre (pas pendant le départ, ni mort) :
-        // à 2 minutes en vie sans rien toucher, il sort.
-        while live < 125.0 && !ev.contains(&Ev::AfkKick(afk)) {
+        // à 3 minutes en vie sans rien toucher, il sort (comme dans Counter-Strike).
+        while live < 185.0 && !ev.contains(&Ev::AfkKick(afk)) {
             live += step(&mut m, &mut ev);
         }
         assert!(ev.contains(&Ev::AfkKick(afk)), "sorti après {live} s");
-        assert!(live >= 115.0, "pas avant deux minutes : {live} s");
+        assert!(live >= 175.0, "pas avant trois minutes : {live} s");
         assert!(says(&ev, "inactivité"));
         let p = &m.players[&afk];
         assert!(!p.present && !p.alive && !p.excluded());

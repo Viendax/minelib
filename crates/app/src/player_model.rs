@@ -639,10 +639,11 @@ pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3], lod: usize) -> 
     out
 }
 
-/// Tête par défaut de Minelib (texture de la tête pas encore là).
-pub fn default_head(xf: Mat4, light: [f32; 3]) -> Vec<EntityVertex> {
-    let mut out = Vec::with_capacity(2400);
-    emit_box(
+/// Tête au skin par défaut de Minelib (bloc « tête », ou texture de la tête pas encore
+/// là) ; `lod` comme `head`.
+pub fn default_head(xf: Mat4, light: [f32; 3], lod: usize) -> Vec<EntityVertex> {
+    let mut out = Vec::with_capacity(2400 / (lod * lod).max(1));
+    emit_box_layer(
         &mut out,
         xf,
         [-4.0, 0.0, -4.0],
@@ -650,6 +651,8 @@ pub fn default_head(xf: Mat4, light: [f32; 3]) -> Vec<EntityVertex> {
         Part::Head,
         light,
         None,
+        None,
+        lod,
     );
     out
 }

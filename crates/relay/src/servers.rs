@@ -224,6 +224,11 @@ impl Store {
         }
     }
 
+    /// Liste blanche active sur ce serveur.
+    pub fn whitelist_on(&self, server: &str) -> bool {
+        self.whitelists.get(server).is_some_and(|w| w.on)
+    }
+
     /// Liste blanche active et `who` n'y est pas (ni créateur, ni OP) : entrée refusée.
     pub fn whitelisted_out(&self, server: &str, creator: &str, who: &str) -> bool {
         self.whitelists.get(server).is_some_and(|w| {

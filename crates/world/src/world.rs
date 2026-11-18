@@ -49,6 +49,8 @@ pub struct World {
     /// Cases changées ici (pas celles venues d'autres joueurs), pour l'écoulement de l'eau
     /// et de la lave ; `None` : pas relevées.
     pub touched: Option<Vec<[i32; 3]>>,
+    /// Points de mesure de la lumière par chunk (voir `set_probes`).
+    probes: HashMap<ChunkPos, Arc<Vec<[i32; 3]>>>,
 }
 
 impl World {
@@ -63,6 +65,7 @@ impl World {
             generator: Generator::Procedural,
             journal: None,
             touched: None,
+            probes: HashMap::new(),
         }
     }
 
@@ -269,6 +272,21 @@ impl World {
     /// Référence partagée vers un chunk (envoyable à un thread de maillage).
     pub fn chunk_arc(&self, pos: ChunkPos) -> Option<Arc<Chunk>> {
         self.chunks.get(&pos).cloned()
+    }
+
+    /// Points du chunk `pos` où le maillage mesure la lumière reçue (`MeshData::probes`) :
+    /// ce qui est dessiné à part (têtes portées par des entités des cartes) est éclairé
+    /// comme les blocs. Vide : plus de mesure.
+    pub fn set_probes(&mut self, pos: ChunkPos, points: Vec<[i32; 3]>) {
+        if points.is_empty() {
+            self.probes.remove(&pos);
+        } else {
+            self.probes.insert(pos, Arc::new(points));
+        }
+    }
+
+    pub fn probes(&self, pos: ChunkPos) -> Option<Arc<Vec<[i32; 3]>>> {
+        self.probes.get(&pos).cloned()
     }
 
     /// Ajoute un chunk généré ailleurs (thread de travail). Ignoré s'il existe déjà.

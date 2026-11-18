@@ -15,6 +15,7 @@ pub const MAX_BYTES: usize = 24 * 1024;
 
 /// Skin décodé : 64 × 64 pixels RGBA (un 64 × 32 est complété comme le font les jeux de
 /// blocs : bras et jambe gauches copiés des droits).
+#[derive(PartialEq)]
 pub struct Skin {
     px: Vec<[u8; 4]>,
     /// Format récent (64 × 64) : calques du bras et de la jambe gauches, et du corps.
@@ -315,6 +316,18 @@ impl Skins {
                 }
                 None
             }
+        }
+    }
+
+    /// Redemande ce skin au relais (il a pu changer), en gardant celui connu d'ici là.
+    pub fn refresh(&self, pseudo: &str) {
+        if pseudo.is_empty() || pseudo.contains(' ') {
+            return;
+        }
+        let key = pseudo.to_lowercase();
+        let mut w = self.wanted.borrow_mut();
+        if !w.contains(&key) && w.len() < 64 {
+            w.push(key);
         }
     }
 

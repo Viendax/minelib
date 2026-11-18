@@ -40,7 +40,16 @@ pub struct Streamer {
     /// Résultats reçus pas encore envoyés au GPU (envois étalés sur plusieurs images).
     backlog: std::collections::VecDeque<Done>,
     pub stats: StreamStats,
+    /// Chunks maillés (et affichés) depuis le dernier relevé : leurs blocs « tête » avec la
+    /// lumière reçue, et la lumière à leurs points de mesure (voir `take_heads`).
+    heads: HashMap<ChunkPos, (ChunkHeads, Vec<[u8; 4]>)>,
 }
+
+type ChunkHeads = Vec<([i32; 3], minelib_world::BlockId, [u8; 4])>;
+
+/// Têtes d'un chunk qui vient d'être maillé : (chunk, blocs « tête » avec leur lumière,
+/// lumière aux points de mesure du chunk).
+pub type HeadsOfChunk = (ChunkPos, ChunkHeads, Vec<[u8; 4]>);
 
 /// Chunks dans le cercle de `radius` chunks autour de (`px`, `pz`), du plus proche au plus
 /// lointain.
@@ -85,7 +94,16 @@ impl Streamer {
             sched_from: 0,
             backlog: std::collections::VecDeque::new(),
             stats: StreamStats::default(),
+            heads: HashMap::new(),
         }
+    }
+
+    /// Têtes des chunks maillés depuis le dernier appel (voir `HeadsOfChunk`).
+    pub fn take_heads(&mut self) -> Vec<HeadsOfChunk> {
+        self.heads
+            .drain()
+            .map(|(pos, (heads, probes))| (pos, heads, probes))
+            .collect()
     }
 
     /// Nouvelle distance de rendu : la sélection sera refaite à l'image suivante.
@@ -174,13 +192,25 @@ impl Streamer {
                         world.insert(chunk);
                     }
                 }
-                Done::Meshed { pos, version, mesh } => {
+                Done::Meshed {
+                    pos,
+                    version,
+                    mut mesh,
+                } => {
                     self.mesh_pending.remove(&pos);
                     let current = self.versions.get(&pos).copied().unwrap_or(0);
                     if version == current && self.needed_chunks.contains(&pos) {
                         renderer.upload_chunk(pos, &mesh);
                         self.meshed.insert(pos);
                         self.changed = true;
+                        // Le dernier maillage d'un chunk remplace celui pas encore relevé.
+                        self.heads.insert(
+                            pos,
+                            (
+                                std::mem::take(&mut mesh.heads),
+                                std::mem::take(&mut mesh.probes),
+                            ),
+                        );
                     }
                 }
             }

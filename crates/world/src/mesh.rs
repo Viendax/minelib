@@ -137,6 +137,12 @@ pub struct MeshData {
     /// Passages par l'air de chaque tranche (voir `section_connectivity`) ; `None` : pas de
     /// découpage, tout est toujours dessiné.
     pub connectivity: Option<[u64; SECTIONS]>,
+    /// Blocs pas dessinés ici mais à part (têtes, voir `BlockDef::hidden`) : position
+    /// (monde), bloc, et la lumière qu'ils reçoivent (RVB des torches 0..255, ciel 0..15),
+    /// la même que celle des faces du maillage.
+    pub heads: Vec<([i32; 3], BlockId, [u8; 4])>,
+    /// Lumière reçue aux points de mesure du chunk (`World::set_probes`), dans leur ordre.
+    pub probes: Vec<[u8; 4]>,
 }
 
 /// Tranches de 16 blocs de haut dans une colonne de chunk.
@@ -325,6 +331,8 @@ pub struct Neighborhood {
     chunks: [Option<Arc<Chunk>>; 9],
     /// Sources de lumière qui peuvent atteindre le chunk central.
     pub lights: Vec<Light>,
+    /// Points où mesurer la lumière reçue (voir `MeshData::probes`).
+    probes: Option<Arc<Vec<[i32; 3]>>>,
 }
 
 impl Neighborhood {
@@ -342,6 +350,7 @@ impl Neighborhood {
             center: pos,
             chunks,
             lights: world.lights_near(pos),
+            probes: world.probes(pos),
         })
     }
 
@@ -1268,9 +1277,46 @@ pub fn mesh_neighborhood(n: &Neighborhood) -> MeshData {
             }
         }
     }
+    if let Some(points) = &n.probes {
+        out.probes = points
+            .iter()
+            .map(|p| {
+                let l = [p[0] - ox, p[1], p[2] - oz];
+                if !pad.get(l[0], l[1], l[2]).is_opaque() {
+                    return light_at(l);
+                }
+                // Dans un bloc (tête à moitié dans un mur) : la case voisine la plus éclairée.
+                [
+                    [1, 0, 0],
+                    [-1, 0, 0],
+                    [0, 1, 0],
+                    [0, -1, 0],
+                    [0, 0, 1],
+                    [0, 0, -1],
+                ]
+                .iter()
+                .map(|d| light_at(add(l, *d)))
+                .fold([0u8; 4], |a, b| std::array::from_fn(|i| a[i].max(b[i])))
+            })
+            .collect();
+    }
     out.connectivity = Some(section_connectivity(chunk));
     out.sort_by_face();
     out
+}
+
+/// Lumière reçue en ces points (monde), comme celle des faces du maillage (voir
+/// `MeshData::probes`) : pour les essais et ce qui est dessiné à part.
+pub fn light_samples(n: &Neighborhood, points: &[[i32; 3]]) -> Vec<[u8; 4]> {
+    let light = LightGrid::build(n);
+    let sky = SkyGrid::build(n);
+    points
+        .iter()
+        .map(|&[x, y, z]| {
+            let [r, g, b] = light.as_ref().map_or([0; 3], |l| l.get(x, y, z));
+            [r, g, b, sky.get(x, y, z)]
+        })
+        .collect()
 }
 
 /// Faces d'un bloc (coordonnées locales au chunk `b`).
@@ -1307,6 +1353,7 @@ fn mesh_block(
             {
                 let def = id.def();
                 if def.hidden {
+                    out.heads.push(([ox + x, y, oz + z], id, light_at(b)));
                     return;
                 }
                 let (wx, wy, wz) = ((ox + x) as f32, y as f32, (oz + z) as f32);

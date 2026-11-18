@@ -325,7 +325,6 @@ fn recent_block(full: &str) -> Option<BlockId> {
         "torchflower" | "cactus_flower" | "torchflower_crop" => "plant:tulip_orange",
         "muddy_mangrove_roots" | "mangrove_roots" => "coarse_dirt",
         _ if n.ends_with("_bars") => "iron_bars",
-        "player_head" => "skull",
         "moss_carpet" => "carpet_green",
         "pale_moss_carpet" => "carpet_silver",
         "bush" | "short_dry_grass" | "tall_dry_grass" => "plant:tallgrass",
@@ -475,6 +474,20 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
     // Tête contre un mur : posée du côté opposé à son regard.
     if n.ends_with("_wall_head") || n.ends_with("_wall_skull") {
         return key(&format!("skull:wall:{}", wall_side(prop("facing"))));
+    }
+    // Tête au sol : tournée de `rotation` seizièmes de tour, comme dans Minecraft.
+    if matches!(
+        n,
+        "skeleton_skull"
+            | "player_head"
+            | "zombie_head"
+            | "creeper_head"
+            | "dragon_head"
+            | "piglin_head"
+            | "wither_skeleton_skull"
+    ) {
+        let r: u8 = prop("rotation").and_then(|r| r.parse().ok()).unwrap_or(0);
+        return Some(registry::skull_block(false, r & 15));
     }
 
     // Torche murale : `facing` = côté vers lequel elle penche ; le mur est à l'opposé.
@@ -855,8 +868,9 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 /// Version du convertisseur : un monde converti par une version plus ancienne l'est de
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
 /// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales ; 5 : décors en entités
-/// d'affichage).
-pub const IMPORT_VERSION: u32 = 10;
+/// d'affichage ; 11 : têtes au sol dans leurs 16 directions, têtes des porte-armures, des
+/// entités d'affichage et des cadres, têtes d'avant 1.13).
+pub const IMPORT_VERSION: u32 = 11;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {
@@ -1132,7 +1146,8 @@ pub struct Converted {
 
 /// Fichier des têtes à skin d'un monde importé : une ligne `x,y,z,pose,empreinte` par
 /// tête (pose : rotation 0..15 au sol, `w0`/`w1`/`w4`/`w5` contre un mur ; empreinte de la
-/// texture sur textures.minecraft.net). Aussi les cadres des murs (`read_frames`).
+/// texture sur textures.minecraft.net ; voir `heads::parse`). Aussi les cadres des murs
+/// (`frame_line`).
 pub const HEADS_FILE: &str = "tetes.txt";
 
 pub fn write_heads(dir: &Path, heads: &[String]) {
@@ -1143,11 +1158,49 @@ pub fn write_heads(dir: &Path, heads: &[String]) {
     let _ = fs::write(dir.join(HEADS_FILE), t);
 }
 
-/// Empreinte de la texture d'une tête (`profile` 1.20.5+, ou `SkullOwner` avant).
+/// Empreinte de la texture d'une tête (`profile` 1.20.5+, `SkullOwner` avant, `Owner` avant
+/// 1.13).
 fn head_texture(te: &Nbt) -> Option<String> {
     let props = te
         .path(&["profile", "properties"])
-        .or_else(|| te.path(&["SkullOwner", "Properties", "textures"]))?;
+        .or_else(|| te.path(&["SkullOwner", "Properties", "textures"]))
+        .or_else(|| te.path(&["Owner", "Properties", "textures"]))?;
+    textures_hash(props)
+}
+
+/// Objet « tête » (porté par une entité) : son skin (`None` : ce n'est pas une tête). Les
+/// têtes de monstres et celles sans texture ont le skin par défaut du jeu.
+fn item_head(it: &Nbt) -> Option<crate::heads::HeadSkin> {
+    use crate::heads::HeadSkin;
+    let id = it.get("id").and_then(Nbt::as_str)?;
+    let n = id.strip_prefix("minecraft:").unwrap_or(id);
+    let head = matches!(
+        n,
+        "player_head"
+            | "skeleton_skull"
+            | "wither_skeleton_skull"
+            | "zombie_head"
+            | "creeper_head"
+            | "dragon_head"
+            | "piglin_head"
+            // Avant 1.13 : `skull` (le type dans `Damage`).
+            | "skull"
+    );
+    if !head {
+        return None;
+    }
+    let hash = it
+        .path(&["components", "minecraft:profile", "properties"])
+        .or_else(|| it.path(&["tag", "SkullOwner", "Properties", "textures"]))
+        .and_then(textures_hash);
+    Some(
+        hash.and_then(|h| HeadSkin::parse(&h))
+            .unwrap_or(HeadSkin::Default),
+    )
+}
+
+/// Empreinte de la texture dans une liste de propriétés d'un profil de joueur.
+fn textures_hash(props: &Nbt) -> Option<String> {
     let value = props.as_list().iter().find_map(|p| {
         p.get("value")
             .or_else(|| p.get("Value"))
@@ -1192,55 +1245,9 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Propriétés d'état du bloc (format à palette) à la position `x`, `y`, `z` (Minecraft,
-/// dans le chunk).
-fn state_props(
-    level: &Nbt,
-    lx: usize,
-    y: i32,
-    lz: usize,
-    spanning: bool,
-) -> HashMap<String, String> {
-    let sections = level
-        .get("sections")
-        .or_else(|| level.get("Sections"))
-        .map(Nbt::as_list)
-        .unwrap_or(&[]);
-    let sy = y.div_euclid(16);
-    let Some(sec) = sections
-        .iter()
-        .find(|s| s.get("Y").and_then(Nbt::as_i64) == Some(sy as i64))
-    else {
-        return HashMap::new();
-    };
-    let (palette, states) = match sec.get("block_states") {
-        Some(bs) => (bs.get("palette"), bs.get("data")),
-        None => (sec.get("Palette"), sec.get("BlockStates")),
-    };
-    let pal = palette.map(Nbt::as_list).unwrap_or(&[]);
-    let i = y.rem_euclid(16) as usize * 256 + lz * 16 + lx;
-    let k = match states {
-        Some(Nbt::LongArray(d)) if pal.len() > 1 => packed(d, i, bits_for(pal.len()), spanning),
-        _ => 0,
-    };
-    match pal.get(k).and_then(|p| p.get("Properties")) {
-        Some(Nbt::Compound(m)) => m
-            .iter()
-            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
-            .collect(),
-        _ => HashMap::new(),
-    }
-}
-
-/// Têtes à skin du chunk (voir `HEADS_FILE`).
-fn read_heads(
-    level: &Nbt,
-    chunk: &mut Chunk,
-    cx: i32,
-    cz: i32,
-    y_offset: i32,
-    spanning: bool,
-) -> Vec<String> {
+/// Têtes à skin du chunk (voir `HEADS_FILE`). Le bloc porte la pose de la tête (au sol :
+/// sa rotation ; avant 1.13, elle est dans l'entité de bloc, `Rot`).
+fn read_heads(level: &Nbt, chunk: &mut Chunk, cx: i32, cz: i32, y_offset: i32) -> Vec<String> {
     let list = level
         .get("block_entities")
         .or_else(|| level.get("TileEntities"))
@@ -1249,12 +1256,10 @@ fn read_heads(
     let mut out = Vec::new();
     for te in list {
         let id = te.get("id").and_then(Nbt::as_str).unwrap_or("");
+        let id = id.to_ascii_lowercase();
         if !id.contains("skull") && !id.contains("head") {
             continue;
         }
-        let Some(hash) = head_texture(te) else {
-            continue;
-        };
         let (Some(x), Some(y), Some(z)) = (
             te.get("x").and_then(Nbt::as_i64),
             te.get("y").and_then(Nbt::as_i64),
@@ -1270,23 +1275,18 @@ fn read_heads(
         {
             continue;
         }
-        let key = &chunk.get(lx as usize, wy as usize, lz as usize).def().key;
-        let key = key.strip_suffix(":tex").unwrap_or(key);
-        // Dessinée avec son skin : le bloc uni dessous n'est plus dessiné.
-        if let Some(t) = registry::registry().by_key(&format!("{key}:tex")) {
-            chunk.set(lx as usize, wy as usize, lz as usize, t);
-        }
-        let pose = if let Some(side) = key.strip_prefix("skull:wall:") {
-            format!("w{side}")
-        } else if key == "skull" {
-            state_props(level, lx as usize, y as i32, lz as usize, spanning)
-                .get("rotation")
-                .and_then(|r| r.parse::<u8>().ok())
-                .unwrap_or(0)
-                .to_string()
-        } else {
+        let (ux, uy, uz) = (lx as usize, wy as usize, lz as usize);
+        let Some((wall, mut n)) = registry::skull_pose(chunk.get(ux, uy, uz)) else {
             continue;
         };
+        if let Some(rot) = te.get("Rot").and_then(Nbt::as_i64).filter(|_| !wall) {
+            n = (rot & 15) as u8;
+            chunk.set(ux, uy, uz, registry::skull_block(false, n));
+        }
+        let Some(hash) = head_texture(te) else {
+            continue;
+        };
+        let pose = if wall { format!("w{n}") } else { n.to_string() };
         out.push(format!("{x},{wy},{z},{pose},{hash}"));
     }
     out
@@ -1429,7 +1429,7 @@ pub fn convert_chunk(root: &Nbt, y_offset: i32) -> Result<Converted> {
     }
     fix_upper_halves(&mut chunk);
     color_banners(&mut chunk, level, x, z, y_offset);
-    let heads = read_heads(level, &mut chunk, x, z, y_offset, data_version < 2529);
+    let heads = read_heads(level, &mut chunk, x, z, y_offset);
     Ok(Converted {
         chunk,
         torches,
@@ -1584,10 +1584,10 @@ fn import_displays(dir: &Path, y_offset: i32, chunks: &mut HashMap<ChunkPos, Chu
     n
 }
 
-/// Cadres des murs (`item_frame`) : lignes `x,y,z,f<côté>,bloc:<clé>` de `HEADS_FILE`
-/// (côté vers lequel le cadre regarde, comme Minecraft : 0 bas, 1 haut, 2 nord, 3 sud,
-/// 4 ouest, 5 est ; `bloc:` vide : cadre vide visible).
-fn read_frames(dir: &Path, y_offset: i32) -> Vec<String> {
+/// Entités des cartes dessinées à part (lignes de `HEADS_FILE`) : cadres des murs
+/// (`item_frame`, voir `frame_line`), et têtes portées par des porte-armures (avec leur
+/// bâti s'il est visible), des entités d'affichage ou des cadres (voir `entity_heads`).
+fn read_entities(dir: &Path, y_offset: i32) -> Vec<String> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1598,9 +1598,7 @@ fn read_frames(dir: &Path, y_offset: i32) -> Vec<String> {
         };
         for root in read_region(&bytes) {
             for e in root.get("Entities").map(Nbt::as_list).unwrap_or(&[]) {
-                if let Some(l) = frame_line(e, y_offset) {
-                    out.push(l);
-                }
+                entity_lines(e, None, y_offset, &mut out);
             }
         }
     }
@@ -1608,6 +1606,187 @@ fn read_frames(dir: &Path, y_offset: i32) -> Vec<String> {
     out
 }
 
+/// Lignes d'une entité et de ses passagers (`vehicle` : position de celle qui les porte).
+fn entity_lines(e: &Nbt, vehicle: Option<[f64; 3]>, y_offset: i32, out: &mut Vec<String>) {
+    let pos = match e.get("Pos").map(Nbt::as_list) {
+        Some([x, y, z]) => match (x.as_f64(), y.as_f64(), z.as_f64()) {
+            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+            _ => vehicle,
+        },
+        _ => vehicle,
+    };
+    for p in e.get("Passengers").map(Nbt::as_list).unwrap_or(&[]) {
+        entity_lines(p, pos, y_offset, out);
+    }
+    if let Some(l) = frame_line(e, y_offset) {
+        out.push(l);
+    }
+    if let Some(pos) = pos {
+        entity_heads(e, pos, y_offset, out);
+    }
+}
+
+/// Têtes portées par une entité en `pos` (pieds, monde de Minecraft) : lignes `Free` de
+/// `heads` (et `Stand` pour le bâti d'un porte-armure visible).
+fn entity_heads(e: &Nbt, pos: [f64; 3], y_offset: i32, out: &mut Vec<String>) {
+    use crate::heads::{self, Head, Pose};
+    use glam::Vec3;
+    let id = e.get("id").and_then(Nbt::as_str).unwrap_or("");
+    let floats = |k: &str| -> Vec<f32> {
+        e.get(k)
+            .map(Nbt::as_list)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect()
+    };
+    let rot = floats("Rotation");
+    let (yaw, pitch) = (
+        rot.first().copied().unwrap_or(0.0),
+        rot.get(1).copied().unwrap_or(0.0),
+    );
+    let origin = Vec3::new(
+        pos[0] as f32,
+        pos[1] as f32 + y_offset as f32,
+        pos[2] as f32,
+    );
+    let flag = |k: &str| e.get(k).and_then(Nbt::as_i64).unwrap_or(0) != 0;
+    fn push(out: &mut Vec<String>, m: glam::Mat4, skin: crate::heads::HeadSkin) {
+        // Garde-fou : une entité mal lue ne fait pas une tête géante ou perdue.
+        let ok = m.to_cols_array().iter().all(|f| f.is_finite())
+            && m.transform_vector3(glam::Vec3::X).length() < 2.0;
+        if ok {
+            out.push(crate::heads::line(&crate::heads::Head {
+                pos: crate::heads::cell_of(m),
+                pose: crate::heads::Pose::Free(crate::heads::pack(m)),
+                skin,
+            }));
+        }
+    }
+    match id {
+        "minecraft:armor_stand" => {
+            let small = flag("Small");
+            // 1.20.5+ : `equipment.head` ; avant : `ArmorItems` (pieds … tête).
+            let head = e
+                .path(&["equipment", "head"])
+                .or_else(|| e.get("ArmorItems").and_then(|l| l.as_list().get(3)));
+            if !flag("Invisible") && !flag("Marker") {
+                let m = heads::armor_stand_body(origin, yaw, small);
+                let flags = u8::from(flag("NoBasePlate")) | u8::from(flag("ShowArms")) << 1;
+                let skin = heads::HeadSkin::Default;
+                // La case du bâti : celle des pieds.
+                out.push(heads::line(&Head {
+                    pos: [
+                        origin.x.floor() as i32,
+                        origin.y.floor() as i32,
+                        origin.z.floor() as i32,
+                    ],
+                    pose: Pose::Stand(heads::pack(m), flags),
+                    skin,
+                }));
+            }
+            if let Some(skin) = head.and_then(item_head) {
+                let p: Vec<f32> = e
+                    .path(&["Pose", "Head"])
+                    .map(Nbt::as_list)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect();
+                let angles = match p.as_slice() {
+                    [x, y, z] => [*x, *y, *z],
+                    _ => [0.0; 3],
+                };
+                let m = heads::armor_stand_head(origin, yaw, angles, small);
+                push(out, m, skin);
+            }
+        }
+        "minecraft:item_display" => {
+            let Some(skin) = e.get("item").and_then(item_head) else {
+                return;
+            };
+            let frame = heads::display_frame(origin, yaw, pitch, display_transformation(e));
+            let m = heads::display_head(frame);
+            push(out, m, skin);
+        }
+        "minecraft:item_frame" | "minecraft:glow_item_frame" => {
+            let Some(skin) = e.get("Item").or_else(|| e.get("item")).and_then(item_head) else {
+                return;
+            };
+            let Some((cell, facing)) = frame_cell(e, y_offset) else {
+                return;
+            };
+            let turn = e.get("ItemRotation").and_then(Nbt::as_i64).unwrap_or(0);
+            let m = heads::frame_head(cell, facing, (turn & 7) as u8, flag("Invisible"));
+            push(out, m, skin);
+        }
+        _ => {}
+    }
+}
+
+/// `transformation` d'une entité d'affichage : décomposée (translation, rotation gauche,
+/// échelle, rotation droite ; rotations en quaternion ou angle + axe) ou en matrice 4 × 4
+/// (par lignes).
+fn display_transformation(e: &Nbt) -> glam::Mat4 {
+    use glam::{Mat4, Quat, Vec3};
+    let Some(t) = e.get("transformation") else {
+        return Mat4::IDENTITY;
+    };
+    let nums = |n: &Nbt| -> Vec<f32> {
+        n.as_list()
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect()
+    };
+    if let Ok(a) = <[f32; 16]>::try_from(nums(t).as_slice()) {
+        return Mat4::from_cols_array(&a).transpose();
+    }
+    let v3 = |k: &str, d: f32| match t.get(k).map(nums).as_deref() {
+        Some([x, y, z]) => Vec3::new(*x, *y, *z),
+        _ => Vec3::splat(d),
+    };
+    let quat = |k: &str| -> Quat {
+        let Some(q) = t.get(k) else {
+            return Quat::IDENTITY;
+        };
+        match nums(q).as_slice() {
+            [x, y, z, w] => Quat::from_xyzw(*x, *y, *z, *w).normalize(),
+            _ => {
+                let angle = q.get("angle").and_then(Nbt::as_f64).unwrap_or(0.0) as f32;
+                match q.get("axis").map(nums).as_deref() {
+                    Some([x, y, z]) => {
+                        let axis = Vec3::new(*x, *y, *z).normalize_or_zero();
+                        if axis == Vec3::ZERO {
+                            Quat::IDENTITY
+                        } else {
+                            Quat::from_axis_angle(axis, angle)
+                        }
+                    }
+                    _ => Quat::IDENTITY,
+                }
+            }
+        }
+    };
+    Mat4::from_translation(v3("translation", 0.0))
+        * Mat4::from_quat(quat("left_rotation"))
+        * Mat4::from_scale(v3("scale", 1.0))
+        * Mat4::from_quat(quat("right_rotation"))
+}
+
+/// Case d'un cadre (devant le mur) et le côté vers lequel il regarde.
+fn frame_cell(e: &Nbt, y_offset: i32) -> Option<([i32; 3], u8)> {
+    let facing = e.get("Facing").and_then(Nbt::as_i64)?.clamp(0, 5) as u8;
+    let tile = |k: &str| e.get(k).and_then(Nbt::as_i64);
+    let (x, y, z) = match e.get("block_pos") {
+        Some(Nbt::IntArray(a)) if a.len() == 3 => (a[0] as i64, a[1] as i64, a[2] as i64),
+        _ => (tile("TileX")?, tile("TileY")?, tile("TileZ")?),
+    };
+    Some(([x as i32, y as i32 + y_offset, z as i32], facing))
+}
+
+/// Cadre (`item_frame`) : ligne `x,y,z,f<côté>,bloc:<clé>` de `HEADS_FILE` (côté vers
+/// lequel le cadre regarde, comme Minecraft : 0 bas, 1 haut, 2 nord, 3 sud, 4 ouest, 5 est ;
+/// `bloc:` vide : cadre vide visible). Une tête qu'il tient est une ligne de `heads`.
 fn frame_line(e: &Nbt, y_offset: i32) -> Option<String> {
     let id = e.get("id").and_then(Nbt::as_str)?;
     if id != "minecraft:item_frame" && id != "minecraft:glow_item_frame" {
@@ -1697,6 +1876,10 @@ fn display_cells(
             (map_block_state(name, &props), false)
         }
         "minecraft:item_display" => {
+            // Une tête est dessinée à part, à sa place exacte (`entity_heads`).
+            if e.get("item").and_then(item_head).is_some() {
+                return;
+            }
             let item = e.path(&["item", "id"]).and_then(Nbt::as_str).unwrap_or("");
             let b = map_block_state(item, &HashMap::new());
             // Objet qui n'est pas un bloc (casque, épée…) : le repli « pierre » de la table.
@@ -1874,7 +2057,7 @@ pub fn import_world(dir: &Path) -> Result<Import> {
     // Décors faits d'entités d'affichage (1.19.4+) : blocs et objets posés dans le vide ou
     // dans des barrières (qui en font la collision).
     // Cadres (objets accrochés aux murs) : dessinés à part, comme les têtes.
-    heads.extend(read_frames(&dir.join("entities"), y_offset));
+    heads.extend(read_entities(&dir.join("entities"), y_offset));
     let shown = import_displays(&dir.join("entities"), y_offset, &mut built);
     if shown > 0 {
         log::info!("{shown} blocs d'entités d'affichage ajoutés");
@@ -2441,7 +2624,7 @@ mod dump_displays {
         for (k, n) in v {
             eprintln!("{n:6} {k}");
         }
-        let frames = read_frames(Path::new(&dir), 64);
+        let frames = read_entities(Path::new(&dir), 64);
         eprintln!(
             "{} cadres, ex. {:?}",
             frames.len(),
@@ -2597,6 +2780,120 @@ mod dump_area {
         v.sort_by_key(|x| std::cmp::Reverse(x.1));
         for (k, n) in v.iter().take(60) {
             eprintln!("{n:6} {k}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod real_heads {
+    use super::*;
+
+    /// Têtes d'une vraie carte (`MC_WORLD` : dossier du monde Minecraft) : combien de
+    /// chaque sorte, et les têtes d'entités près de leur entité.
+    #[test]
+    #[ignore]
+    fn real_world_heads() {
+        let Some(dir) = std::env::var_os("MC_WORLD") else {
+            return;
+        };
+        let imp = import_world(Path::new(&dir)).expect("conversion");
+        let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut skins: std::collections::BTreeMap<String, usize> = Default::default();
+        for l in &imp.heads {
+            let pose = l.split(',').nth(3).unwrap_or("");
+            let k = match pose.chars().next() {
+                Some('f') => "cadre".to_string(),
+                Some('w') => "mur".to_string(),
+                Some('m') => "entité".to_string(),
+                Some('a') => "porte-armure".to_string(),
+                _ => format!("sol {pose}"),
+            };
+            *kinds.entry(k).or_default() += 1;
+            if let Some(h) = crate::heads::parse(l) {
+                let s = match h.skin {
+                    crate::heads::HeadSkin::Default => "défaut",
+                    crate::heads::HeadSkin::Mc(_) => "minecraft",
+                    crate::heads::HeadSkin::Player(_) => "joueur",
+                };
+                *skins.entry(s.into()).or_default() += 1;
+                // Tête d'entité : un demi-bloc à peu près, dans sa case.
+                if let crate::heads::Pose::Free(_) = h.pose {
+                    let m = crate::heads::transform(&h);
+                    let c = m.transform_point3(glam::Vec3::new(0.0, 4.0, 0.0));
+                    let cell = [c.x.floor() as i32, c.y.floor() as i32, c.z.floor() as i32];
+                    assert_eq!(cell, h.pos, "{l}");
+                }
+            } else if !l.split(',').nth(3).unwrap_or("").starts_with('f') {
+                panic!("ligne illisible : {l}");
+            }
+        }
+        // Blocs « tête » des chunks : leur pose.
+        let mut blocks: std::collections::BTreeMap<String, usize> = Default::default();
+        for rle in imp.chunks.values() {
+            let c = Chunk::from_rle(ChunkPos { x: 0, z: 0 }, rle).expect("chunk");
+            for y in c.bottom()..c.top() {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let id = c.get(x, y, z);
+                        if let Some((wall, n)) = registry::skull_pose(id) {
+                            let k = if wall {
+                                format!("mur {n}")
+                            } else {
+                                format!("sol {n}")
+                            };
+                            *blocks.entry(k).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("lignes : {kinds:?}\nskins : {skins:?}\nblocs « tête » : {blocks:?}");
+        for l in imp
+            .heads
+            .iter()
+            .filter(|l| {
+                l.split(',')
+                    .nth(3)
+                    .is_some_and(|p| p.starts_with(['m', 'a']))
+            })
+            .take(6)
+        {
+            eprintln!("  {l}");
+        }
+    }
+    /// Lignes des entités d'un dossier `entities/` (`MC_ENTITIES`) : porte-armures et
+    /// têtes d'entités.
+    #[test]
+    #[ignore]
+    fn real_entity_heads() {
+        let Some(dir) = std::env::var_os("MC_ENTITIES") else {
+            return;
+        };
+        let lines = read_entities(Path::new(&dir), 64);
+        for l in lines.iter().filter(|l| {
+            l.split(',')
+                .nth(3)
+                .is_some_and(|p| p.starts_with(['m', 'a']))
+        }) {
+            let h = crate::heads::parse(l).expect("ligne");
+            let m = crate::heads::transform(&h);
+            let c = m.transform_point3(glam::Vec3::new(0.0, 4.0, 0.0));
+            let f = m.transform_vector3(-glam::Vec3::Z).normalize();
+            eprintln!(
+                "{} centre ({:.2}, {:.2}, {:.2}) visage ({:.2}, {:.2}, {:.2})",
+                l.split(',')
+                    .nth(3)
+                    .unwrap_or("")
+                    .chars()
+                    .next()
+                    .unwrap_or('?'),
+                c.x,
+                c.y,
+                c.z,
+                f.x,
+                f.y,
+                f.z
+            );
         }
     }
 }

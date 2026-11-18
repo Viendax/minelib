@@ -3222,11 +3222,21 @@ pub(crate) fn player_as(data: &[u8], pseudo: &str) -> Option<Vec<u8>> {
 }
 
 /// Parties ouvertes sur ce relais (liste des serveurs).
-fn local_servers(st: &State, kind: u8) -> Vec<proto::ServerEntry> {
+/// Parties ouvertes ici. Un serveur de construction sous liste blanche n'y figure que pour
+/// qui peut y entrer (sur la liste, OP ou créateur) ; jamais pour un autre relais (`who`
+/// absent), qui ne dit pas qui regarde.
+fn local_servers(st: &State, kind: u8, who: Option<&str>) -> Vec<proto::ServerEntry> {
     let mut list: Vec<proto::ServerEntry> = st
         .rooms
         .iter()
         .filter(|(_, r)| r.kind == kind && !(kind == 0 && r.started))
+        .filter(|(_, r)| {
+            r.kind != 1
+                || match who {
+                    Some(w) => !st.servers.whitelisted_out(&r.server, &r.creator, w),
+                    None => !st.servers.whitelist_on(&r.server),
+                }
+        })
         .map(|(&rid, r)| proto::ServerEntry {
             id: rid,
             // Garant : jamais nommé aux joueurs.
@@ -5713,7 +5723,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
     let my_room = st.conns.get(&id).and_then(|c| c.room);
     Some(match req {
         Request::Servers { kind } => {
-            let mut list = local_servers(st, kind);
+            let mut list = local_servers(st, kind, Some(pseudo));
             // Relais fédérés : les parties des autres relais connus, après celles d'ici
             // (le jeu s'y connecte avec le même compte pour les rejoindre).
             let peers = st.peer_servers.lock().unwrap().clone();
@@ -7385,7 +7395,7 @@ fn handle_account(
             pubkey: st.registry.lookup(&pseudo).map(|r| r.1),
         },
         Request::PeerServers { kind } => Response::Servers {
-            list: local_servers(st, kind),
+            list: local_servers(st, kind, None),
         },
         Request::Register {
             pseudo,
@@ -10578,6 +10588,75 @@ mod tests {
     /// relais du monde (pour cette province, cette époque, ce pseudo et cette clé) ; il
     /// reçoit tout ce qu'elle a, puis seulement ce que le relais du monde a gardé. Un relais
     /// de secours ne fait entrer aucun joueur tant qu'il n'a pas pris la place du relais.
+    /// Un serveur de construction sous liste blanche ne paraît dans la liste que pour qui
+    /// peut y entrer (son créateur, ses OP, ceux de la liste), jamais pour un autre relais.
+    #[test]
+    fn whitelisted_servers_are_listed_only_for_those_who_may_enter() {
+        let (h, dir) = crowd_world("liste_blanche");
+        {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            let (owner, room) = host_world(&mut crowd, st);
+            let other = crowd.conn(st, "Joueur", false);
+            let listed = |crowd: &Crowd, st: &mut State, id: u64| -> bool {
+                match crowd.ask(st, id, Request::Servers { kind: 1 }) {
+                    Some(Response::Servers { list }) => list.iter().any(|e| e.id == room),
+                    r => panic!("{r:?}"),
+                }
+            };
+            let admin = |crowd: &Crowd, st: &mut State, action: u8, who: &str| {
+                crowd.ask(
+                    st,
+                    owner,
+                    Request::ServerAdmin {
+                        action,
+                        pseudo: who.into(),
+                        reason: String::new(),
+                    },
+                );
+            };
+            assert!(listed(&crowd, st, other), "sans liste blanche : visible");
+            admin(&crowd, st, proto::SERVER_WL_ON, "");
+            assert!(
+                !listed(&crowd, st, other),
+                "liste blanche : caché aux autres"
+            );
+            assert!(
+                listed(&crowd, st, owner),
+                "toujours visible pour son créateur"
+            );
+            let mut session = Session::Anonymous;
+            let far = handle_account(
+                Request::PeerServers { kind: 1 },
+                st,
+                &mut session,
+                "1.2.3.4",
+                other,
+            );
+            assert!(
+                matches!(&far, Response::Servers { list } if list.iter().all(|e| e.id != room)),
+                "jamais donné aux autres relais"
+            );
+            admin(&crowd, st, proto::SERVER_WL_ADD, "Joueur");
+            assert!(listed(&crowd, st, other), "sur la liste : visible");
+            admin(&crowd, st, proto::SERVER_WL_OFF, "");
+            let far = handle_account(
+                Request::PeerServers { kind: 1 },
+                st,
+                &mut session,
+                "1.2.3.4",
+                other,
+            );
+            assert!(
+                matches!(&far, Response::Servers { list } if list.iter().any(|e| e.id == room)),
+                "liste blanche retirée : de nouveau pour tous"
+            );
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// (v155) Les billets des relais de région sont signés par le relais du monde : ils se
     /// vérifient avec sa clé publique, et un hôte (qui n'a pas sa clé privée) ne sait pas en
     /// faire, ni pour un autre joueur ni pour plus longtemps.
