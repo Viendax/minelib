@@ -33,6 +33,7 @@ pub struct ProvinceHost {
     /// copie est à jour.
     pub standby: bool,
     follow: Option<Client>,
+    follow_link: Option<Sender<Inbound>>,
     standby_said: bool,
     /// Où le joindre (nœud iroh, adresse, clé du relais).
     at: ([u8; 32], String, [u8; 32]),
@@ -87,6 +88,7 @@ impl ProvinceHost {
             stopped: false,
             standby: false,
             follow: None,
+            follow_link: None,
             standby_said: false,
             at,
         })
@@ -134,6 +136,7 @@ impl ProvinceHost {
             stopped: false,
             standby: true,
             follow: Some(client),
+            follow_link: None,
             standby_said: false,
             at,
         })
@@ -216,8 +219,10 @@ impl ProvinceHost {
                 epoch,
                 t,
                 ok,
+                copies,
+                dump,
             } if (*room, *province) == (self.room, self.province) => {
-                self.handle.province_leased(*epoch, *t, *ok);
+                self.handle.province_leased(*epoch, *t, *ok, *copies, *dump);
                 Vec::new()
             }
             Response::ProvinceArchived {
@@ -281,6 +286,7 @@ impl ProvinceHost {
                 self.epoch = *epoch;
                 self.standby = false;
                 self.follow = None;
+                self.follow_link = None;
                 self.lost_since = None;
                 vec![Request::ProvinceReady {
                     room: self.room,
@@ -310,6 +316,7 @@ impl ProvinceHost {
             if let Some(f) = &self.follow {
                 while let Some(e) = f.poll() {
                     match e {
+                        Event::Link(l) => self.follow_link = Some(l),
                         Event::Province(Response::ProvinceSeed { entries, .. }) => {
                             self.handle.province_seed(entries, None);
                         }
@@ -322,6 +329,19 @@ impl ProvinceHost {
                             ..
                         }) => {
                             let have = self.handle.province_copy(epoch, n, entries, bags, held);
+                            // (v142) Copié : son relais peut le confirmer à ses joueurs quand
+                            // c'est ce relais de secours qui garde la copie.
+                            if let (Some(_), Some(l)) = (have, &self.follow_link) {
+                                transport::push(
+                                    l,
+                                    &Request::ProvinceCopied {
+                                        room: self.room,
+                                        province: self.province,
+                                        epoch,
+                                        n,
+                                    },
+                                );
+                            }
                             if let (Some(have), false) = (have, self.standby_said) {
                                 self.standby_said = true;
                                 out.push(Request::ProvinceStandbyReady {
@@ -344,6 +364,7 @@ impl ProvinceHost {
             if lost {
                 log::info!("relais de secours : plus de nouvelles du relais de la province");
                 self.follow = None;
+                self.follow_link = None;
             }
             return out;
         }

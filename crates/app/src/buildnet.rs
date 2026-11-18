@@ -3480,6 +3480,7 @@ mod tests {
         let mut attached_max = 0;
         let mut ordered = 0u64;
         let mut fault_at: Option<(Instant, [i32; 2])> = None;
+        let mut promos_at_fault = 0;
         let mut taken_back: Option<Duration> = None;
         let mut served_again: Option<Duration> = None;
         let mut bulk_sent = false;
@@ -3515,9 +3516,14 @@ mod tests {
                     ProvinceFault::None => {}
                 }
                 fault_at = Some((Instant::now(), which));
+                promos_at_fault = h.province_promotions();
             }
+            // (Relevée : reprise par le relais du monde, ou confiée à son relais de secours,
+            // parfois trop vite pour la voir quitter la liste.)
             if let (Some((t, which)), None) = (fault_at, taken_back) {
-                if !h.delegated_provinces().contains(&which) {
+                if !h.delegated_provinces().contains(&which)
+                    || h.province_promotions() > promos_at_fault
+                {
                     taken_back = Some(t.elapsed());
                 }
             }
@@ -3798,6 +3804,7 @@ mod tests {
         }
         let before: i64 = inv.iter().sum::<i64>() + h.world_items(room) as i64;
         let mut fault_at: Option<(Instant, [i32; 2])> = None;
+        let mut promos_at_fault = 0;
         let mut taken_back: Option<Duration> = None;
         // On lâche, on ramasse, on se déplace (Joueur2 passe d'une province à l'autre) ;
         // la panne au milieu.
@@ -3830,9 +3837,14 @@ mod tests {
                     ProvinceFault::None => {}
                 }
                 fault_at = Some((Instant::now(), which));
+                promos_at_fault = h.province_promotions();
             }
+            // (Relevée : reprise par le relais du monde, ou confiée à son relais de secours,
+            // parfois trop vite pour la voir quitter la liste.)
             if let (Some((t, which)), None) = (fault_at, taken_back) {
-                if !h.delegated_provinces().contains(&which) {
+                if !h.delegated_provinces().contains(&which)
+                    || h.province_promotions() > promos_at_fault
+                {
                     taken_back = Some(t.elapsed());
                 }
             }
@@ -4145,6 +4157,158 @@ mod tests {
     #[test]
     fn survival_bags_lose_nothing_when_a_province_host_falls() {
         province_items(ProvinceFault::Crash, true);
+    }
+
+    /// (v142) Grand monde : la copie de ce que publie la province est gardée par son relais
+    /// de secours, plus par le relais du monde (sa copie ne grandit plus pendant qu'on
+    /// construit). Puis `crash_primary` : le relais de la province tombe (son relais de
+    /// secours prend sa place avec tout) ; sinon c'est le relais de secours qui tombe (tout
+    /// repart au relais du monde). Dans les deux cas, tout revient au relais du monde, et à
+    /// la fin les mondes sont identiques case par case à celui du propriétaire.
+    fn province_big(crash_primary: bool) {
+        let (dir, h, mut hosts, mut bots, room) = province_setup(false);
+        h.set_copies_until(0);
+        let east = [1, 0];
+        let west = |x: f32| x.clamp(488.0, 508.0);
+        let eastx = |x: f32| x.clamp(516.0, 540.0);
+        let mut seed = 4711u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let dt = 0.02;
+        let mut edited = std::collections::BTreeSet::new();
+        let mut big_at: Option<usize> = None;
+        let mut big_entries: Option<usize> = None;
+        let mut before_fault: Option<usize> = None;
+        let mut fault_at: Option<Instant> = None;
+        let mut edits_big = 0;
+        for step in 0..650 {
+            if big_at.is_none() && h.provinces_big() > 0 {
+                big_at = Some(step);
+            }
+            // (La copie du relais du monde, une fois le changement arrivé partout.)
+            if big_at.is_some_and(|b| step == b + 25) {
+                big_entries = Some(h.province_entries(room, east));
+            }
+            if big_at.is_some_and(|b| step == b + 200) {
+                before_fault = Some(h.province_entries(room, east));
+                let g = hosts
+                    .iter_mut()
+                    .map(|(_, g)| g)
+                    .find(|g| {
+                        g.province
+                            .as_ref()
+                            .is_some_and(|p| p.standby != crash_primary)
+                    })
+                    .expect("relais à faire tomber");
+                if let Some(p) = g.province.take() {
+                    p.kill();
+                }
+                fault_at = Some(Instant::now());
+            }
+            for (i, b) in bots.iter_mut().enumerate() {
+                let r = rnd();
+                let x = b.pos.x + (r % 3) as f32 - 1.0;
+                b.pos.x = if i < 2 { west(x) } else { eastx(x) };
+                b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(1.0, 30.0);
+                if rnd() % 17 == 0 && step < 550 {
+                    let x = (b.pos.x as i32 - 12 + (rnd() % 25) as i32).clamp(29 * 16, 36 * 16 - 1);
+                    let z = (rnd() % 32) as i32;
+                    let y = 11 + (rnd() % 3) as i32;
+                    let block = if rnd() % 4 == 0 {
+                        BlockId::AIR
+                    } else {
+                        BlockId(1 + rnd() as u16 % 8)
+                    };
+                    b.world.set(x, y, z, block);
+                    edited.insert([x, y, z]);
+                    if x >= 512 && big_at.is_some_and(|b| step > b + 25) && fault_at.is_none() {
+                        edits_big += 1;
+                    }
+                }
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for _ in 0..400 {
+            for b in bots.iter_mut() {
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (b0, b1) = (
+            big_entries.expect("copie gardée par le relais de secours"),
+            before_fault.expect("panne"),
+        );
+        eprintln!(
+            "grand monde : copie chez le relais de secours dès l'étape {big_at:?} ; copie du \
+             relais du monde {b0} puis {b1} entrées malgré {edits_big} modifications dans la \
+             province ; à la fin {} entrées, promotions {}",
+            h.province_entries(room, east),
+            h.province_promotions()
+        );
+        assert!(edits_big > 20, "assez de modifications : {edits_big}");
+        assert!(
+            b1 <= b0 + 2,
+            "la copie du relais du monde ne grandit plus ({b0} puis {b1})"
+        );
+        if crash_primary {
+            assert!(
+                h.province_promotions() >= 1,
+                "le relais de secours a pris sa place"
+            );
+        }
+        for b in &bots {
+            assert_eq!(
+                b.net.as_ref().unwrap().pending(),
+                0,
+                "{} : en attente",
+                b.name
+            );
+        }
+        // Tout est revenu au relais du monde : le propriétaire (qui reçoit tout de lui pour
+        // enregistrer le monde) a ce que tout le monde a.
+        let owner = &bots[0];
+        let mut differ = Vec::new();
+        for b in &bots[1..] {
+            for p in &edited {
+                let (a, o) = (
+                    b.world.get(p[0], p[1], p[2]),
+                    owner.world.get(p[0], p[1], p[2]),
+                );
+                if a != o {
+                    differ.push((b.name.clone(), *p, a.0, o.0));
+                }
+            }
+        }
+        assert!(
+            differ.is_empty(),
+            "{} cases différentes du monde du propriétaire, par exemple {:?}",
+            differ.len(),
+            &differ[..differ.len().min(5)]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_big_world_province_copy_is_kept_by_its_standby_then_returns() {
+        province_big(false);
+    }
+
+    #[test]
+    fn a_big_world_province_whose_host_falls_loses_nothing() {
+        province_big(true);
     }
 
     #[test]

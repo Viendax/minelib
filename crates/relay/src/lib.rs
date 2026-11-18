@@ -227,6 +227,43 @@ impl Handle {
         self.state.lock().unwrap().province_promotions
     }
 
+    /// (v142) Joueurs d'un monde à partir desquels la copie de ce que publient ses provinces
+    /// est gardée par leurs relais de secours (essais).
+    pub fn set_copies_until(&self, players: usize) {
+        self.state.lock().unwrap().copies_until = players;
+    }
+
+    /// Provinces dont la copie est gardée par leur relais de secours (essais).
+    pub fn provinces_big(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .rooms
+            .values()
+            .map(|r| r.provinces.values().filter(|p| p.big).count())
+            .sum()
+    }
+
+    /// Entrées gardées ici pour les zones de la province `p` du monde `room` (essais).
+    pub fn province_entries(&self, room: u64, p: [i32; 2]) -> usize {
+        let mut st = self.state.lock().unwrap();
+        let size = provinces::size(&st);
+        let Some(r) = st.rooms.get_mut(&room) else {
+            return 0;
+        };
+        r.build
+            .entries_after(
+                |z| {
+                    proto::province_of(
+                        proto::region_of([z[0] * proto::ZONE, z[1] * proto::ZONE]),
+                        size,
+                    ) == p
+                },
+                0,
+            )
+            .len()
+    }
+
     /// Relais de province (v139) : du relais du monde, un sac de survie prêté ou rappelé,
     /// les réglages du serveur, un WorldEdit d'un OP.
     pub fn province_event(&self, r: &Response) {
@@ -332,8 +369,8 @@ impl Handle {
     }
 
     /// Relais de province : réponse du relais du monde à une demande de bail.
-    pub fn province_leased(&self, epoch: u64, t: u64, ok: bool) {
-        provinces::leased(&mut self.state.lock().unwrap(), epoch, t, ok);
+    pub fn province_leased(&self, epoch: u64, t: u64, ok: bool, copies: bool, dump: u64) {
+        provinces::leased(&mut self.state.lock().unwrap(), epoch, t, ok, copies, dump);
     }
 
     /// Relais de province : arrêt ; `release` : départ propre (le relais du monde reprend
@@ -1222,6 +1259,9 @@ struct State {
     hosts_wait: Option<Instant>,
     /// Provinces confiées à leur relais de secours (essais).
     province_promotions: usize,
+    /// (v142) Joueurs d'un monde à partir desquels la copie de ce que publie une province
+    /// est gardée par son relais de secours plutôt qu'ici (essais : réglable).
+    copies_until: usize,
 }
 
 /// Démarre le relais (fil d'écoute en arrière-plan).
@@ -1305,6 +1345,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         index_cache: std::cell::RefCell::new(None),
         hosts_wait: None,
         province_promotions: 0,
+        copies_until: COPIES_UNTIL,
     }));
     let state_for_handle = state.clone();
     let state_for_guards = state.clone();
@@ -4149,6 +4190,11 @@ fn players_index_fresh(st: &State) -> PlayersIndex {
     i
 }
 
+/// (v142) Joueurs d'un monde à partir desquels la copie de ce que publient ses provinces
+/// est gardée par leurs relais de secours (en dessous, ici : c'est elle qui sert à
+/// l'enregistrement du monde chez son propriétaire).
+const COPIES_UNTIL: usize = 20_000;
+
 /// Durée de vie de l'index des joueurs.
 const INDEX_FRESH: Duration = Duration::from_secs(3);
 
@@ -6261,9 +6307,22 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             t,
             counts,
             inside,
+            followed,
         } => {
             if my_room == Some(room) {
-                provinces::lease(st, room, id, province, epoch, t, counts, inside);
+                provinces::lease(st, room, id, province, epoch, t, counts, inside, followed);
+            }
+            return None;
+        }
+        // (v142) Relais de secours d'une province (chez son relais) : envoi copié.
+        Request::ProvinceCopied {
+            room,
+            province: _,
+            epoch,
+            n,
+        } => {
+            if my_room == Some(room) {
+                provinces::copied(st, id, room, epoch, n);
             }
             return None;
         }
@@ -6276,10 +6335,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             bags,
             spots,
             loose,
+            dump,
         } => {
             if my_room == Some(room) {
                 provinces::archive(
-                    st, room, id, province, epoch, n, entries, bags, spots, loose,
+                    st, room, id, province, epoch, n, entries, bags, spots, loose, dump,
                 );
             }
             return None;
@@ -7006,6 +7066,7 @@ fn handle(
             | Request::Broadcast { .. }
             | Request::ProvinceReady { .. }
             | Request::ProvinceStandbyReady { .. }
+            | Request::ProvinceCopied { .. }
             | Request::ProvinceLease { .. }
             | Request::ProvinceArchive { .. }
             | Request::ProvinceShards { .. }
@@ -11469,6 +11530,11 @@ mod tests {
                             entries.push((proto::zone_of(c), seq, data));
                         }
                         entries_n += entries.len();
+                        // (v142) Grand monde : la copie est gardée par le relais de secours de
+                        // la province ; il ne vient ici que les sacs et les retours.
+                        if std::env::var("MINELIB_GRAND").is_ok() {
+                            entries.clear();
+                        }
                         // (v140) Positions de retour de ses joueurs, toutes les 2 s, avec
                         // ce qu'elle publie.
                         let spots: Vec<(String, [f32; 5])> = if k == 0 && sec % 2 == 0 {
@@ -11496,6 +11562,7 @@ mod tests {
                                 bags: Vec::new(),
                                 spots,
                                 loose: Vec::new(),
+                                dump: 0,
                             },
                         ));
                         next_n += 1;
@@ -11538,6 +11605,7 @@ mod tests {
                                 t: now_ms(),
                                 counts: census.get(&p).cloned().unwrap_or_default(),
                                 inside: Vec::new(),
+                                followed: false,
                             },
                         );
                     }

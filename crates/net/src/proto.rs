@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 40;
+pub const PROTOCOL: u32 = 41;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -520,6 +520,8 @@ pub enum Request {
         /// région qu'il sert (région, rang : il doit être relevé).
         counts: Vec<([i32; 2], u32)>,
         inside: Vec<([i32; 2], u16)>,
+        /// (v142) Son relais de secours la suit (connecté).
+        followed: bool,
     },
     /// Ce que le relais de province vient de publier (zone, rang, message) : le relais du
     /// monde en garde une copie, pour reprendre la province aussitôt si son hôte tombe.
@@ -537,6 +539,17 @@ pub enum Request {
         /// (v139) Blocs changés dans la province par des joueurs en survie dont elle n'a
         /// pas le sac (pseudo, bloc : 0 cassé, sinon posé) : comptés par le relais du monde.
         loose: Vec<(String, u16)>,
+        /// (v142) `entries` est tout ce qu'elle a, en réponse à la demande `dump` du relais du
+        /// monde (0 : un envoi ordinaire).
+        dump: u64,
+    },
+    /// (v142) Relais de secours d'une province → son relais : il a copié l'envoi `n` (et
+    /// ceux d'avant).
+    ProvinceCopied {
+        room: u64,
+        province: [i32; 2],
+        epoch: u64,
+        n: u64,
     },
     /// (v139) Un joueur en survie est dans la province : son sac, s'il vous plaît (le
     /// relais du monde le prête à une seule province à la fois).
@@ -632,6 +645,7 @@ impl Request {
                 | Request::ProvinceBag { .. }
                 | Request::ProvinceBagBack { .. }
                 | Request::ProvinceStandbyReady { .. }
+                | Request::ProvinceCopied { .. }
         )
     }
 }
@@ -1056,6 +1070,13 @@ pub enum Response {
         epoch: u64,
         t: u64,
         ok: bool,
+        /// (v142) Vrai : ce qu'elle publie part au relais du monde (il en garde la copie) ;
+        /// faux : seulement à son relais de secours, qui la garde (le relais du monde n'en a
+        /// plus que les sacs et les positions de retour).
+        copies: bool,
+        /// (v142) Sa copie n'est plus à jour : tout ce qu'elle a doit lui partir (numéro de
+        /// la demande ; 0 : aucune).
+        dump: u64,
     },
     /// Le relais du monde a gardé l'envoi `n` de la province (et tous ceux d'avant).
     ProvinceArchived {
