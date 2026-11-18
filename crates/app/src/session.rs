@@ -5968,37 +5968,49 @@ impl Session {
         );
         let vp = proj * self.view_with_punch();
         let cam = self.camera_pos();
-        for (pseudo, pos) in near {
-            let top = pos + Vec3::Y * 2.1;
+        // (v188) Les plus loin d'abord : les pseudos proches passent devant.
+        let mut labels: Vec<(f32, &str, Vec3)> = near
+            .into_iter()
+            .map(|(pseudo, pos)| {
+                let top = pos + Vec3::Y * 2.1;
+                ((top - cam).length(), pseudo, top)
+            })
+            .filter(|&(d, _, _)| d < NAME_RANGE)
+            .collect();
+        labels.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (d, pseudo, top) in labels {
             let c = vp * top.extend(1.0);
             if c.w <= 0.0 {
                 continue;
             }
-            // (v172) Taille comme celle d'un objet du monde : celle d'avant à 6,5 blocs, plus
-            // petite plus loin, plus grande plus près ; illisible (moins de 7 pixels de
-            // haut) : pas affiché.
-            let k = (NAME_SIZE_AT / (top - cam).length().max(0.1)).min(4.0);
-            let ts = s * k;
-            if ts * 8.0 < 7.0 {
+            let Some((ts, alpha)) = name_label(d, s) else {
                 continue;
-            }
+            };
             let (x, y) = (
                 (c.x / c.w * 0.5 + 0.5) * size.0,
                 (0.5 - c.y / c.w * 0.5) * size.1,
             );
             let tw = Ui::text_width(pseudo, ts);
+            // Hors de l'écran : rien à dessiner.
+            if x + tw / 2.0 + ts < 0.0
+                || x - tw / 2.0 - ts > size.0
+                || y + 9.0 * ts < 0.0
+                || y - ts > size.1
+            {
+                continue;
+            }
             ui.rect(
                 x - tw / 2.0 - ts,
                 y - ts,
                 tw + 2.0 * ts,
                 10.0 * ts,
-                [0.0, 0.0, 0.0, 0.45],
+                [0.0, 0.0, 0.0, 0.45 * alpha],
             );
             ui.text(
                 x - tw / 2.0,
                 y,
                 ts,
-                [1.0, 1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, alpha],
                 pseudo.to_string(),
             );
         }
@@ -6819,7 +6831,24 @@ fn same_family(a: BlockId, b: BlockId) -> bool {
 }
 
 /// (v172) Distance (blocs) où les pseudos des autres joueurs ont leur taille normale.
-const NAME_SIZE_AT: f32 = 6.5;
+/// (v188) 8 au lieu de 6,5 : un peu plus grands à toute distance.
+const NAME_SIZE_AT: f32 = 8.0;
+
+/// (v188) Pseudos des autres joueurs (et des NPC) affichés jusqu'à cette distance (blocs),
+/// effacés peu à peu sur les [`NAME_FADE`] derniers blocs. Avant : jusqu'à ce que le texte
+/// passe sous 7 pixels de haut, 15 à 22 blocs selon la taille de l'écran.
+const NAME_RANGE: f32 = 32.0;
+const NAME_FADE: f32 = 4.0;
+
+/// (v188) Pseudo à `d` blocs de la caméra (`s` : échelle de l'interface) : taille du texte
+/// et opacité, `None` s'il n'est pas affiché. Taille comme celle d'un objet du monde (v172),
+/// plus petite plus loin, plus grande plus près (4 fois au plus), mais jamais sous celle de
+/// la police (8 pixels de haut) : lisible jusqu'au bout.
+fn name_label(d: f32, s: f32) -> Option<(f32, f32)> {
+    let alpha = ((NAME_RANGE - d) / NAME_FADE).clamp(0.0, 1.0);
+    let ts = (s * (NAME_SIZE_AT / d.max(0.1)).min(4.0)).max(1.0);
+    (alpha > 0.0).then_some((ts, alpha))
+}
 
 /// (v165) Ping montré dans la liste des joueurs : texte et couleur (vert, jaune, rouge
 /// selon sa valeur ; gris s'il n'est pas connu).
@@ -7897,6 +7926,44 @@ fn side_of_start(start: u8, i: u32) -> u8 {
         start
     } else {
         1 - start
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    /// (v188) Pseudos des NPC et des joueurs : un peu plus grands à toute distance, et
+    /// lisibles bien plus loin (avant, ils disparaissaient sous 7 pixels de haut).
+    #[test]
+    fn names_are_a_bit_bigger_and_seen_from_further() {
+        let s = 3.0; // écran de 1080 pixels de haut
+        let before = |d: f32| s * (6.5 / d).min(4.0);
+        for d in [2.0, 6.5, 10.0, 18.0] {
+            let (ts, a) = name_label(d, s).unwrap();
+            assert!(
+                ts > before(d) * 1.2,
+                "{d} blocs : {ts} contre {}",
+                before(d)
+            );
+            assert_eq!(a, 1.0);
+        }
+        // Avant : rien au-delà de 22 blocs (15 sur un écran de 720 pixels).
+        assert!(before(23.0) * 8.0 < 7.0);
+        for (d, s) in [(23.0, 3.0), (27.0, 3.0), (27.0, 2.0), (27.0, 1.0)] {
+            let (ts, a) = name_label(d, s).unwrap();
+            assert!(
+                ts * 8.0 >= 8.0 && a == 1.0,
+                "{d} blocs, échelle {s} : {ts} {a}"
+            );
+        }
+        // Effacé sur les 4 derniers blocs, plus rien à 32.
+        let (_, a) = name_label(30.0, s).unwrap();
+        assert!(a > 0.0 && a < 1.0, "{a}");
+        assert!(name_label(32.0, s).is_none());
+        assert!(name_label(40.0, s).is_none());
+        // Tout près : pas plus de 4 fois la taille normale.
+        assert_eq!(name_label(0.5, s).unwrap().0, s * 4.0);
     }
 }
 
