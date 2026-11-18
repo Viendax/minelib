@@ -1235,7 +1235,9 @@ pub fn bake_skin(tex: Option<&crate::skin::Skin>) -> Vec<[f32; 3]> {
 }
 
 /// Instance d'un autre joueur pour la carte : sa pose, sa lumière et la couche de son skin.
-pub fn instance(pose: &Pose, layer: u32) -> PlayerInstance {
+/// `prev_feet` : ses pieds à l'image d'avant (anticrénelage temporel ; ses pieds d'
+/// aujourd'hui s'il vient d'apparaître).
+pub fn instance(pose: &Pose, layer: u32, prev_feet: Vec3) -> PlayerInstance {
     let held = if aims(pose) {
         // (v177) Arme à feu : les deux bras tendus.
         PlayerInstance::HOLDS | PlayerInstance::AIMS
@@ -1253,6 +1255,7 @@ pub fn instance(pose: &Pose, layer: u32) -> PlayerInstance {
         crouch: pose.crouch,
         light: pose.light.map(|c| c.clamp(0.0, 2.0)),
         skin: (layer & 0xffff) | held,
+        prev_feet: prev_feet.to_array(),
     }
 }
 
@@ -1492,7 +1495,7 @@ mod tests {
         assert_eq!(mesh.len(), 216);
         for pose in test_poses() {
             let baked = bake_skin(pose.skin.as_deref());
-            let inst = instance(&pose, 7);
+            let inst = instance(&pose, 7, pose.feet);
             assert_eq!(inst.skin & 0xffff, 7);
             assert_eq!(inst.skin & PlayerInstance::HOLDS != 0, pose.held.is_some());
             let cpu = build(&pose);
@@ -1554,7 +1557,7 @@ mod tests {
             let body = build(&pose);
             let body = &body[..body.len() - held_model(&pose, true).len()];
             let skins = vec![(3, bake_skin(pose.skin.as_deref()))];
-            let players = [instance(&pose, 3)];
+            let players = [instance(&pose, 3, pose.feet)];
             for view in 0..3 {
                 let a = pose.yaw + [0.4, 2.8, -1.7][view] + n as f32;
                 let target = pose.feet + Vec3::Y * 1.0;

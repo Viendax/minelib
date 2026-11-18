@@ -23,6 +23,8 @@ struct PlayerIn {
     @location(4) feet: vec3<f32>,
     @location(5) look: vec2<f32>,
     @location(6) motion: vec3<f32>,
+    /// (v187) Ses pieds à l'image d'avant (anticrénelage temporel).
+    @location(10) prev_feet: vec3<f32>,
     @location(7) light: vec3<f32>,
     @location(8) skin: u32,
     // Rectangle de la face dans l'image du skin (0..1 : u0, v0, u1, v1) : la lecture y
@@ -38,6 +40,8 @@ struct PlayerOut {
     @location(3) light: vec3<f32>,
     @location(4) shade: f32,
     @location(5) @interpolate(flat) rect: vec4<f32>,
+    /// Le même point à l'image d'avant (le joueur a bougé entre les deux).
+    @location(6) prev_world: vec3<f32>,
 };
 
 fn m_trans(t: vec3<f32>) -> mat4x4<f32> {
@@ -139,6 +143,9 @@ fn vs_player(v: PlayerIn) -> PlayerOut {
     let n = normalize((xf * vec4<f32>(v.normal, 0.0)).xyz);
     var o: PlayerOut;
     o.clip = g.view_proj * vec4<f32>(world, 1.0);
+    // (v187) Où ce point était à l'image d'avant : le joueur s'est déplacé de
+    // `prev_feet - feet` (le balancement des membres, lui, est négligé).
+    o.prev_world = world + (v.prev_feet - v.feet);
     o.uv = v.uv;
     o.layer = i32(v.skin & 0xffffu);
     o.world = world;
@@ -165,9 +172,11 @@ fn fs_player(i: PlayerOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_player_taa(i: PlayerOut) -> TaaOut {
     let n = face_normal(i.world);
-    let p = vec4<f32>(i.world, 1.0);
-    let cur = g.cur_view_proj * p;
-    let prev = g.prev_view_proj * p;
+    let cur = g.cur_view_proj * vec4<f32>(i.world, 1.0);
+    // (v187) Depuis où il était à l'image d'avant, et pas depuis le même point du monde :
+    // sinon un joueur qui marche devant une caméra immobile n'aurait aucun mouvement, et
+    // l'anticrénelage le ferait traîner.
+    let prev = g.prev_view_proj * vec4<f32>(i.prev_world, 1.0);
     let d = prev.xy / prev.w - cur.xy / cur.w;
     let base = player_albedo(i);
     var o: TaaOut;

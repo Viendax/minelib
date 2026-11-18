@@ -75,6 +75,14 @@ pub struct PlayerInstance {
     pub crouch: f32,
     pub light: [f32; 3],
     pub skin: u32,
+    /// (v187) Ses pieds à l'image d'avant : l'anticrénelage temporel a besoin de savoir où
+    /// il était pour retrouver son historique. Sans cela, un joueur qui marche devant une
+    /// caméra immobile n'a aucun mouvement à l'écran, et l'anticrénelage mélange plusieurs
+    /// images de lui : il traîne (vu dans l'essai de foule).
+    ///
+    /// (Dernier champ : `vertex_attr_array!` place les attributs dans l'ordre déclaré, qui
+    /// doit suivre l'ordre des champs.)
+    pub prev_feet: [f32; 3],
 }
 
 impl PlayerInstance {
@@ -103,6 +111,19 @@ fn half(x: f32) -> u16 {
     let r = m & 0x1fff;
     (h + u32::from(r > 0x1000 || (r == 0x1000 && h & 1 == 1))) as u16
 }
+
+/// Ce que la carte lit dans chaque `PlayerInstance`. Les décalages sont calculés dans
+/// l'ordre déclaré : cet ordre doit donc suivre celui des champs de la structure (essai
+/// `instance_attributes_follow_the_struct_fields`). Les emplacements 0 à 3 et 9 sont pris
+/// par le modèle (`MESH`).
+const PLAYER_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    4 => Float32x3,
+    5 => Float32x2,
+    6 => Float32x3,
+    7 => Float32x3,
+    8 => Uint32,
+    10 => Float32x3
+];
 
 /// Joueurs dessinés au plus par image, et skins différents gardés sur la carte graphique.
 pub const MAX_PLAYERS: usize = 8192;
@@ -211,13 +232,7 @@ impl Players {
             3 => Float32x3,
             9 => Float32x4
         ];
-        const INSTANCE: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-            4 => Float32x3,
-            5 => Float32x2,
-            6 => Float32x3,
-            7 => Float32x3,
-            8 => Uint32
-        ];
+        const INSTANCE: [wgpu::VertexAttribute; 6] = PLAYER_ATTRS;
         let pipeline = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -807,6 +822,29 @@ pub fn draw_offscreen(
 mod tests {
     use super::*;
 
+    /// Les attributs d'instance lus par la carte tombent bien sur les champs de
+    /// `PlayerInstance` : `vertex_attr_array!` enchaîne les décalages dans l'ordre déclaré,
+    /// donc un champ ajouté ailleurs qu'à la fin décalerait tout (joueurs déformés).
+    #[test]
+    fn instance_attributes_follow_the_struct_fields() {
+        let want = [
+            (4, std::mem::offset_of!(PlayerInstance, feet)),
+            (5, std::mem::offset_of!(PlayerInstance, yaw)),
+            (6, std::mem::offset_of!(PlayerInstance, walk)),
+            (7, std::mem::offset_of!(PlayerInstance, light)),
+            (8, std::mem::offset_of!(PlayerInstance, skin)),
+            (10, std::mem::offset_of!(PlayerInstance, prev_feet)),
+        ];
+        assert_eq!(PLAYER_ATTRS.len(), want.len());
+        for (a, (location, offset)) in PLAYER_ATTRS.iter().zip(want) {
+            assert_eq!((a.shader_location, a.offset), (location, offset as u64));
+        }
+        // Les champs lus deux par deux ou trois par trois se suivent vraiment.
+        assert_eq!(std::mem::offset_of!(PlayerInstance, pitch), 16);
+        assert_eq!(std::mem::offset_of!(PlayerInstance, swing), 24);
+        assert_eq!(std::mem::offset_of!(PlayerInstance, crouch), 28);
+    }
+
     #[test]
     fn half_floats_round_to_nearest() {
         assert_eq!(half(0.0), 0);
@@ -837,6 +875,7 @@ mod tests {
     #[test]
     fn player_buffers_match_the_shader_layout() {
         assert_eq!(std::mem::size_of::<PlayerVertex>(), 52);
-        assert_eq!(std::mem::size_of::<PlayerInstance>(), 48);
+        // (v187 : 48 + les pieds de l'image d'avant.)
+        assert_eq!(std::mem::size_of::<PlayerInstance>(), 60);
     }
 }

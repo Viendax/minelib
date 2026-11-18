@@ -6429,7 +6429,11 @@ impl Session {
                 // (v177) Ce qu'il a en main, avec son vrai modèle : arme, couteau (255),
                 // grenade ou bombe.
                 let held = Some(Held::Gear(v.weapon));
-                let w = self.walks.get(&v.pseudo).copied().unwrap_or_default();
+                let w = self
+                    .walks
+                    .get(&v.pseudo)
+                    .copied()
+                    .unwrap_or_else(|| Walk::new(v.pos));
                 let other = crate::player_model::Pose {
                     feet: v.pos,
                     yaw: v.yaw,
@@ -6447,7 +6451,7 @@ impl Session {
                     continue;
                 }
                 let layer = layers.layer(other.skin.as_ref(), renderer);
-                players.push(crate::player_model::instance(&other, layer));
+                players.push(crate::player_model::instance(&other, layer, w.prev));
                 // (v177) Le modèle de son arme de près, sa silhouette de loin.
                 let near = v.pos.distance_squared(cam) < GEAR_DETAIL * GEAR_DETAIL;
                 model.extend(crate::player_model::held_model(&other, near));
@@ -6534,7 +6538,7 @@ impl Session {
                     .total_cmp(&c.1.distance_squared(cam))
             });
             for (rank, &(pseudo, pos, yaw, pitch, crouch)) in others.iter().enumerate() {
-                let w = self.walks.get(pseudo).copied().unwrap_or_default();
+                let w = self.walks.get(pseudo).copied().unwrap_or_else(|| Walk::new(pos));
                 let other = crate::player_model::Pose {
                     feet: pos,
                     yaw,
@@ -6551,7 +6555,7 @@ impl Session {
                 }
                 if players.len() < minelib_render::MAX_PLAYERS {
                     let layer = layers.layer(other.skin.as_ref(), renderer);
-                    players.push(crate::player_model::instance(&other, layer));
+                    players.push(crate::player_model::instance(&other, layer, w.prev));
                 } else {
                     model.extend(crate::player_model::build_tiny(&other));
                 }
@@ -7280,6 +7284,8 @@ fn stairs_placement(hit: &Hit, item: BlockId, look: Vec3, point: Vec3) -> Option
 pub struct Walk {
     pub phase: f32,
     pub amp: f32,
+    /// Sa position à l'image d'avant (anticrénelage temporel : voir `PlayerInstance`).
+    prev: Vec3,
     last: Vec3,
     speed: f32,
 }
@@ -7287,6 +7293,7 @@ pub struct Walk {
 impl Walk {
     fn new(pos: Vec3) -> Self {
         Walk {
+            prev: pos,
             last: pos,
             ..Default::default()
         }
@@ -7294,6 +7301,7 @@ impl Walk {
 
     fn update(&mut self, pos: Vec3, dt: f32) {
         let d = pos - self.last;
+        self.prev = self.last;
         self.last = pos;
         let v = if dt > 0.0 {
             Vec3::new(d.x, 0.0, d.z).length() / dt
