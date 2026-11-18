@@ -90,6 +90,10 @@ pub enum Action {
     Zoom,
     /// Vue à la 1re / 3e personne (F5), hors mode FPS.
     Perspective,
+    /// Éditeur de lumières (lumières ponctuelles, projecteurs).
+    LightEditor,
+    /// Caméra libre, dans l'éditeur de lumières.
+    FreeCamera,
     Command,
     Debug,
     Screenshot,
@@ -139,7 +143,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 59] = [
+    pub const ALL: [Action; 61] = [
         Action::Attack,
         Action::Use,
         Action::Pick,
@@ -155,6 +159,8 @@ impl Action {
         Action::Chat,
         Action::Zoom,
         Action::Perspective,
+        Action::LightEditor,
+        Action::FreeCamera,
         Action::Command,
         Action::Debug,
         Action::Screenshot,
@@ -217,7 +223,9 @@ impl Action {
             | Action::Inventory
             | Action::Chat
             | Action::Zoom
-            | Action::Perspective => Group::Build,
+            | Action::Perspective
+            | Action::LightEditor
+            | Action::FreeCamera => Group::Build,
             Action::Command | Action::Debug | Action::Screenshot => Group::Shared,
             Action::FpsForward
             | Action::FpsBack
@@ -305,6 +313,8 @@ impl Action {
             Action::Chat => "Tchat",
             Action::Zoom => "Zoom",
             Action::Perspective => "Vue (1re / 3e personne)",
+            Action::LightEditor => "Éditeur de lumières",
+            Action::FreeCamera => "Caméra libre (éditeur)",
             Action::Command => "Commande",
             Action::Debug => "Debug (F3)",
             Action::Screenshot => "Capture d'écran",
@@ -369,6 +379,8 @@ impl Action {
             Action::Chat => "chat",
             Action::Zoom => "zoom",
             Action::Perspective => "perspective",
+            Action::LightEditor => "light_editor",
+            Action::FreeCamera => "free_camera",
             Action::Command => "command",
             Action::Debug => "debug",
             Action::Screenshot => "screenshot",
@@ -436,6 +448,9 @@ impl Action {
             Action::Chat => Some(Bind::Key(KeyCode::KeyT)),
             Action::Zoom => Some(Bind::Key(KeyCode::KeyC)),
             Action::Perspective => Some(Bind::Key(KeyCode::F5)),
+            // Comme IRLights : L ouvre l'éditeur, F y bascule la caméra libre.
+            Action::LightEditor => Some(Bind::Key(KeyCode::KeyL)),
+            Action::FreeCamera => Some(Bind::Key(KeyCode::KeyF)),
             Action::Command => Some(Bind::Key(KeyCode::Slash)),
             Action::Debug => Some(Bind::Key(KeyCode::F3)),
             Action::Screenshot => Some(Bind::Key(KeyCode::F2)),

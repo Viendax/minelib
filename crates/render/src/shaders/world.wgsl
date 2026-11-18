@@ -1,5 +1,6 @@
 // Minelib — shaders du monde (blocs), du ciel et du réticule.
 // Les couleurs sont écrites en sRGB puis converties en linéaire ; la surface est sRGB.
+// dynlights.wgsl (lumières dynamiques) est ajouté à la suite.
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -356,6 +357,14 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
         torch = max(torch, mirror_light(i.world + n * 0.01, n) * flicker * mix(0.55, 1.0, i.ao));
     }
     var color = albedo * (sky_light * ao + torch);
+    // Lumières dynamiques (éditeur de lumières, voir dynlights.wgsl) : lumière diffuse,
+    // et leurs reflets ajoutés après ceux du raytracing (un métal les prend à sa couleur).
+    var dyn_spec = vec3<f32>(0.0);
+    if dyn_active() {
+        let dl = dyn_light(i.world, n, g.cam_pos.xyz, i.reflect, false, i.clip.xy, g.screen.xy);
+        color += albedo * dl.diffuse * mix(0.6, 1.0, ao);
+        dyn_spec = select(dl.specular, dl.specular * albedo * 1.6, i.short != 0u);
+    }
 
     // Bloc visé légèrement éclairci (le contour est dessiné à part, en lignes).
     // Seulement ses propres faces (point pris juste derrière la face), pas celles des
@@ -416,6 +425,8 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
             color += specular(i.world, r, i.reflect, i.light) * flicker * reflect_fade;
         }
     }
+
+    color += dyn_spec;
 
     // Brouillard vers la couleur du ciel dans la direction du regard (calculée seulement là
     // où il y a du brouillard : les pixels proches n'en ont pas).

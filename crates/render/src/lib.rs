@@ -19,6 +19,7 @@ mod smoke;
 pub use wgpu;
 mod latency;
 mod lazy;
+mod lights;
 mod overlay;
 pub mod perf;
 pub mod rt;
@@ -32,6 +33,10 @@ pub use capture::Screenshot;
 
 pub use entity::EntityVertex;
 pub use latency::{LowLatencyKind, Marker};
+pub use lights::{
+    bounding_sphere, DynKind, DynLight, DynSettings, DynState, DynStats, GoboImage, GOBO_SIZE,
+    MAX_DYN_LIGHTS, MAX_GOBOS, SHADOW_QUALITY, SHADOW_QUALITY_NAMES,
+};
 pub use overlay::{set_translator, tr, Line, Overlay, Ui};
 pub use smoke::{SmokeQuality, SmokeVolume};
 pub use viewmodel::{VmVertex, FLAME, NO_TEXTURE};
@@ -168,11 +173,22 @@ struct ScenePipes<'p> {
     sky: &'p wgpu::RenderPipeline,
     outline: &'p wgpu::RenderPipeline,
     heavy: Option<&'p taa::Heavy>,
+    /// Entités éclairées par les lumières de l'éditeur (sinon : pipelines habituels).
+    entities: Option<&'p entity::EntityPipes>,
     /// Passe à deux cibles (anticrénelage temporel).
     taa: bool,
 }
 
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Variantes éclairées par les lumières de l'éditeur : monde, entités, cartes d'ombre,
+/// rayons. Compilées sur un fil à part la première fois qu'une lumière est posée.
+struct LitPipes {
+    heavy: taa::Heavy,
+    entities: entity::EntityPipes,
+    bake: wgpu::RenderPipeline,
+    vl: lights::VlPipes,
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -584,6 +600,11 @@ pub struct Renderer {
     /// Fumigènes en volume.
     smokes: smoke::Smokes,
     voxels: rt::Voxels,
+    /// Lumières dynamiques (éditeur de lumières) : ombres, volumétrique, gobos.
+    dyn_gpu: lights::DynGpu,
+    /// Leurs shaders, compilés à la première lumière posée (`Err` : refusés par la carte ou
+    /// son pilote ; le jeu continue sans elles).
+    lit: Option<lazy::Lazy<Result<LitPipes, String>>>,
     /// Skin des reflets envoyé à la carte (voir `set_skin`).
     skin_key: Option<usize>,
     gpu_timer: Option<gpu_timer::GpuTimer>,
@@ -776,6 +797,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let dyn_entries = lights::world_layout_entries();
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("monde"),
             entries: &[
@@ -848,6 +870,14 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Lumières dynamiques (voir `lights`) : 7 à 13.
+                dyn_entries[0],
+                dyn_entries[1],
+                dyn_entries[2],
+                dyn_entries[3],
+                dyn_entries[4],
+                dyn_entries[5],
+                dyn_entries[6],
             ],
         });
         // Pixel art : agrandissement net, réduction lissée entre les mipmaps.
@@ -864,6 +894,8 @@ impl Renderer {
         voxels.upload_palette(&queue, &block_tex);
         let block_view = upload_block_texture(&device, &queue, &block_tex);
         let refl = reflections::Reflections::new(&device, (1, 1));
+        let mut dyn_gpu = lights::DynGpu::new(&device, &queue);
+        dyn_gpu.bind_bake(&device, &voxels, &block_view, &block_sampler);
         let bind_groups = world_groups(
             &device,
             &bgl,
@@ -872,13 +904,19 @@ impl Renderer {
             &block_view,
             &voxels,
             &refl,
+            &dyn_gpu,
         );
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("main"),
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/world.wgsl"));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("monde"),
+            source: wgpu::ShaderSource::Wgsl(
+                lights::without_dynlights(include_str!("shaders/world.wgsl")).into(),
+            ),
+        });
 
         // Reflets (raytracing à son propre rythme) : shader lourd, compilé sur un fil à part
         // sans retarder l'ouverture du jeu. Les pipelines du monde sans anticrénelage ne
@@ -986,6 +1024,8 @@ impl Renderer {
             screen,
             smokes,
             voxels,
+            dyn_gpu,
+            lit: None,
             skin_key: None,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
             lights_col: [[0.0; 4]; MAX_LIGHTS],
@@ -1195,7 +1235,11 @@ impl Renderer {
     pub fn engine_gpu_bytes(&self) -> u64 {
         let chunks: u64 = self.arena.bytes();
         let depth = self.config.width as u64 * self.config.height as u64 * 4;
-        chunks + depth + self.overlay.gpu_bytes + std::mem::size_of::<Globals>() as u64
+        chunks
+            + depth
+            + self.overlay.gpu_bytes
+            + std::mem::size_of::<Globals>() as u64
+            + self.dyn_gpu.gpu_bytes()
     }
 
     /// Mémoire GPU des maillages de chunks, en octets.
@@ -1264,7 +1308,9 @@ impl Renderer {
             &self.block_view,
             &self.voxels,
             &self.refl,
+            &self.dyn_gpu,
         );
+        self.dyn_gpu.rebind = false;
     }
 
     /// Reflets du raytracing recalculés au plus `hz` fois par seconde (rendu principal
@@ -1307,9 +1353,114 @@ impl Renderer {
         self.raytracing = on;
     }
 
-    /// Grille de blocs autour du joueur pour le raytracing (voir `rt::VOX`).
+    /// Grille de blocs autour du joueur pour le raytracing (voir `rt::VOX`), et pour les
+    /// ombres des lumières dynamiques.
     pub fn set_voxels(&mut self, origin: [i32; 3], ids: &[u16]) {
         self.voxels.upload(&self.queue, origin, ids);
+        self.dyn_gpu.on_voxels(origin, ids);
+    }
+
+    /// Lumières dynamiques (éditeur de lumières) de la prochaine image, et leurs réglages.
+    pub fn set_dyn_lights(&mut self, lights: &[DynLight], settings: &DynSettings) {
+        // Leurs shaders : compilés la première fois qu'il y en a une, après ceux du monde
+        // (pas deux compilations lourdes à la fois). D'ici là, et s'ils sont refusés, le
+        // monde s'affiche sans elles.
+        if !lights.is_empty() && self.lit.is_none() && self.world_ready() {
+            self.lit = Some(self.spawn_lit());
+        }
+        let ready = self.lit_pipes().is_some();
+        self.dyn_gpu.set(if ready { lights } else { &[] }, settings);
+    }
+
+    /// Variantes éclairées, si elles sont prêtes.
+    fn lit_pipes(&self) -> Option<&LitPipes> {
+        self.lit.as_ref()?.try_get()?.as_ref().ok()
+    }
+
+    /// Compile les shaders des lumières sur un fil à part. Les erreurs (compilateur de
+    /// DirectX, pilote) sont récupérées ici : elles coûtent les lumières, pas le jeu.
+    fn spawn_lit(&self) -> lazy::Lazy<Result<LitPipes, String>> {
+        let device = self.device.clone();
+        let layout = self.world_layout.clone();
+        let bgl = self.bgl.clone();
+        let format = self.config.format;
+        let (bake_bgl, vl_bgl, comp_bgl) = (
+            self.dyn_gpu.bake_bgl.clone(),
+            self.dyn_gpu.vl_bgl.clone(),
+            self.dyn_gpu.comp_bgl.clone(),
+        );
+        lazy::Lazy::spawn("shaders des lumières", move || {
+            let t0 = std::time::Instant::now();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let world = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("monde (lumières)"),
+                source: wgpu::ShaderSource::Wgsl(
+                    lights::with_dynlights(include_str!("shaders/world.wgsl")).into(),
+                ),
+            });
+            let heavy = taa::build_heavy(&device, &layout, &world);
+            let entities = entity::EntityPipes::new(&device, &bgl, format, true);
+            let (bake, vl) = lights::light_pipes(&device, &bgl, &bake_bgl, &vl_bgl, &comp_bgl);
+            let internal = pollster::block_on(device.pop_error_scope());
+            let validation = pollster::block_on(device.pop_error_scope());
+            if let Some(e) = internal.or(validation) {
+                log::error!("shaders des lumières refusés : lumières désactivées ({e})");
+                return Err(e.to_string());
+            }
+            log::info!(
+                "shaders des lumières compilés en {:.1} s (en tâche de fond)",
+                t0.elapsed().as_secs_f32()
+            );
+            Ok(LitPipes {
+                heavy,
+                entities,
+                bake,
+                vl,
+            })
+        })
+    }
+
+    /// Les lumières dynamiques ont-elles besoin de la grille de blocs (ombres) ?
+    pub fn dyn_lights_want_voxels(&self) -> bool {
+        self.dyn_gpu.wants_voxels()
+    }
+
+    /// État des lumières dynamiques à la dernière image.
+    pub fn dyn_stats(&self) -> DynStats {
+        let mut s = self.dyn_gpu.stats;
+        s.state = match &self.lit {
+            None => DynState::Off,
+            Some(l) => match l.try_get() {
+                None => DynState::Compiling,
+                Some(Ok(_)) => DynState::Ready,
+                Some(Err(_)) => DynState::Failed,
+            },
+        };
+        s
+    }
+
+    /// Motifs des gobos (une couche chacun, dans l'ordre ; voir `DynLight::gobo`).
+    pub fn set_gobos(&mut self, images: &[GoboImage]) {
+        self.dyn_gpu.set_gobos(&self.device, &self.queue, images);
+        self.rebuild_world_groups();
+    }
+
+    /// Prépare les lumières dynamiques de l'image (cartes d'ombre à calculer, tuiles).
+    fn prepare_dyn(&mut self, view_proj: Mat4, p: &FrameParams) {
+        let voxels = self.voxels.uploaded.then_some(self.voxels.origin);
+        self.dyn_gpu.prepare(
+            &self.device,
+            &self.queue,
+            view_proj,
+            p.eye,
+            p.shadow_boxes,
+            p.time,
+            voxels,
+        );
+        if self.dyn_gpu.rebind {
+            self.rebuild_world_groups();
+        }
     }
 
     /// Sources de lumière proches du joueur (au plus `MAX_LIGHTS`, les premières gardées).
@@ -1374,6 +1525,12 @@ impl Renderer {
     pub fn load_pack(&mut self, pack: &ResourcePack) {
         let block_tex = textures::load_block_textures(pack);
         self.block_view = upload_block_texture(&self.device, &self.queue, &block_tex);
+        self.dyn_gpu.bind_bake(
+            &self.device,
+            &self.voxels,
+            &self.block_view,
+            &self.block_sampler,
+        );
         self.rebuild_world_groups();
         self.voxels.upload_palette(&self.queue, &block_tex);
         let atlas = textures::build_gui_atlas(pack, &overlay::font_bitmap());
@@ -1780,7 +1937,8 @@ impl Renderer {
         }
         // Entités (joueurs, têtes, cadres) avant le verre et l'eau : elles se voient à
         // travers, teintées, au lieu de passer devant.
-        self.entities.draw(pass, self.world_group(), pipes.taa);
+        self.entities
+            .draw(pass, self.world_group(), pipes.taa, pipes.entities);
         self.screen.draw(pass, pipes.taa);
         // Translucides de l'arrière vers l'avant, par-dessus la scène opaque.
         pass.set_pipeline(&heavy.translucent);
@@ -1923,6 +2081,7 @@ impl Renderer {
                     sky: &self.sky_pipeline,
                     outline: &self.outline_pipeline,
                     heavy: Some(self.plain_pipes()),
+                    entities: None,
                     taa: false,
                 },
                 &mut stats,
@@ -2089,6 +2248,10 @@ impl Renderer {
             let _c = perf::scope("rendu : tri des chunks");
             self.cull(view_proj, p.eye, p.fog_end)
         };
+        {
+            let _l = perf::scope("rendu : lumières dynamiques");
+            self.prepare_dyn(view_proj, p);
+        }
         // Reflets : recalculés à leur rythme, seulement s'il y a des surfaces qui reflètent
         // à l'écran (raytracing activé).
         self.refl.tick();
@@ -2137,6 +2300,10 @@ impl Renderer {
             t.begin();
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        // Cartes d'ombre des lumières dynamiques (seulement celles qui ont changé).
+        if let Some(l) = self.lit_pipes() {
+            self.dyn_gpu.encode_bake(&mut encoder, &l.bake);
+        }
         if do_refl {
             // Écrit l'image `latest` (déjà avancée par `ran`) en lisant l'autre.
             let write = self.refl.latest;
@@ -2200,17 +2367,48 @@ impl Renderer {
                 timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass(0)),
                 occlusion_query_set: None,
             });
+            let lit = if self.dyn_gpu.active() {
+                self.lit_pipes()
+            } else {
+                None
+            };
             self.draw_scene(
                 &mut pass,
                 ScenePipes {
                     sky: &taa.sky,
                     outline: &taa.outline,
-                    heavy: taa.heavy.try_get(),
+                    // Variantes éclairées seulement quand il y a des lumières : sans elles,
+                    // les shaders de tous les jours (plus légers).
+                    heavy: lit.map(|l| &l.heavy).or(taa.heavy.try_get()),
+                    entities: lit.map(|l| &l.entities),
                     taa: true,
                 },
                 &mut stats,
             );
             self.smokes.draw(&mut pass, self.world_group(), true);
+        }
+        // Lumière volumétrique des lumières dynamiques, ajoutée à l'image du monde.
+        let vl = self
+            .lit
+            .as_ref()
+            .and_then(|l| l.try_get())
+            .and_then(|r| r.as_ref().ok())
+            .map(|l| &l.vl);
+        if let (Some(t), Some(vl)) = (&taa.targets, vl) {
+            if self.dyn_gpu.volumetric_active() {
+                let wg = self.world_group().clone();
+                self.dyn_gpu.encode_volumetric(
+                    &self.device,
+                    &mut encoder,
+                    &wg,
+                    &t.depth_views,
+                    taa.depth_index(),
+                    t.generation,
+                    t.internal,
+                    &t.color_view,
+                    vl,
+                );
+            }
         }
         taa.resolve(
             &self.queue,
@@ -2412,6 +2610,7 @@ fn upload_block_texture(
 }
 
 /// Les deux groupes de liaison du monde (un par image de reflets lue).
+#[allow(clippy::too_many_arguments)]
 fn world_groups(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
@@ -2420,8 +2619,10 @@ fn world_groups(
     blocks: &wgpu::TextureView,
     voxels: &rt::Voxels,
     refl: &reflections::Reflections,
+    dyn_gpu: &lights::DynGpu,
 ) -> [wgpu::BindGroup; 2] {
     std::array::from_fn(|i| {
+        let [d7, d8, d9, d10, d11, d12, d13] = dyn_gpu.bind_entries();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("monde"),
             layout: bgl,
@@ -2454,6 +2655,13 @@ fn world_groups(
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&voxels.skin_view),
                 },
+                d7,
+                d8,
+                d9,
+                d10,
+                d11,
+                d12,
+                d13,
             ],
         })
     })
@@ -2557,11 +2765,42 @@ mod tests {
     fn shaders_are_valid() {
         use wgpu::naga;
         for (name, src) in [
-            ("world", include_str!("shaders/world.wgsl")),
-            ("entity", include_str!("shaders/entity.wgsl")),
-            ("viewmodel", include_str!("shaders/viewmodel.wgsl")),
-            ("smoke", include_str!("shaders/smoke.wgsl")),
+            (
+                "world",
+                lights::with_dynlights(include_str!("shaders/world.wgsl")),
+            ),
+            (
+                "entity",
+                lights::with_dynlights(include_str!("shaders/entity.wgsl")),
+            ),
+            // Shaders de tous les jours (sans le code des lumières de l'éditeur).
+            (
+                "world (sans lumières)",
+                lights::without_dynlights(include_str!("shaders/world.wgsl")),
+            ),
+            (
+                "entity (sans lumières)",
+                lights::without_dynlights(include_str!("shaders/entity.wgsl")),
+            ),
+            (
+                "volumetric",
+                lights::with_dynlights(include_str!("shaders/volumetric.wgsl")),
+            ),
+            (
+                "viewmodel",
+                include_str!("shaders/viewmodel.wgsl").to_string(),
+            ),
+            ("smoke", include_str!("shaders/smoke.wgsl").to_string()),
+            (
+                "shadow_bake",
+                include_str!("shaders/shadow_bake.wgsl").to_string(),
+            ),
+            (
+                "vl_composite",
+                include_str!("shaders/vl_composite.wgsl").to_string(),
+            ),
         ] {
+            let src = src.as_str();
             let module = naga::front::wgsl::parse_str(src)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             let info = naga::valid::Validator::new(
@@ -2571,7 +2810,7 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
             drop(info);
-            if name == "world" {
+            if name.starts_with("world") {
                 let g = module
                     .types
                     .iter()
@@ -2579,6 +2818,15 @@ mod tests {
                     .unwrap();
                 let size = g.1.inner.size(module.to_ctx());
                 assert_eq!(size as usize, std::mem::size_of::<Globals>());
+            }
+            if name.ends_with("(sans lumières)") {
+                for (_, v) in module.global_variables.iter() {
+                    let b = v.binding.as_ref().map_or(0, |b| b.binding);
+                    assert!(
+                        !(7..=13).contains(&b),
+                        "{name} : liaison {b} des lumières utilisée"
+                    );
+                }
             }
         }
     }

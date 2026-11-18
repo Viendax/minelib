@@ -24,6 +24,8 @@ pub struct Voxels {
     pub skin_view: wgpu::TextureView,
     /// Coin bas de la grille (coordonnées monde), envoyé au shader.
     pub origin: [i32; 3],
+    /// Une grille a été envoyée (sinon elle est vide).
+    pub uploaded: bool,
 }
 
 impl Voxels {
@@ -78,6 +80,7 @@ impl Voxels {
             palette,
             skin,
             origin: [0; 3],
+            uploaded: false,
         }
     }
 
@@ -159,6 +162,7 @@ impl Voxels {
             return;
         }
         self.origin = origin;
+        self.uploaded = true;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -183,7 +187,7 @@ impl Voxels {
 
 /// Forme d'un bloc non plein pour le shader, sur 64 bits (4 × u16) :
 /// bits 0..24 boîte 0, 24..48 boîte 1, 48..50 genre (0 cube ou rien, 1 boîtes, 2 poteau),
-/// 50..52 sorte de poteau (0 clôture, 1 muret, 2 vitre).
+/// 50..52 sorte de poteau (0 clôture, 1 muret, 2 vitre), 52 cube à trous (feuillage).
 /// Boîte : min x, y, z puis max − 1 x, y, z, en seizièmes (4 bits chacun).
 /// Poteau : boîte 0 = poteau, boîte 1 = bras vers +X (le shader le tourne vers chaque
 /// voisin auquel le poteau se relie ; la clôture a une 2e traverse 6/16 plus haut).
@@ -207,7 +211,10 @@ pub fn shape_texel(def: &BlockDef) -> [u16; 4] {
         }
         _ => (0, 0, Vec::new()),
     };
-    let mut w = kind << 48 | post << 50;
+    // Bit 52 : cube aux trous dans sa texture (feuillage, verre clair) : les ombres des
+    // lumières dynamiques passent par ses trous (voir shadow_bake.wgsl).
+    let cutout = (matches!(def.shape, Shape::Cube) && !def.full) as u64;
+    let mut w = kind << 48 | post << 50 | cutout << 52;
     for (k, b) in boxes.into_iter().take(2).enumerate() {
         w |= pack(b) << (24 * k);
     }

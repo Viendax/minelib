@@ -17,6 +17,7 @@
 //!   C (maintenu)   zoom                         V            VSync on/off
 //!   Page ↑ / ↓     distance de rendu
 //!   F3             écran de debug
+//!   L              éditeur de lumières (F : caméra libre ; Suppr : effacer la lumière)
 //!
 //! Variables d'environnement :
 //!   MINELIB_HOME=<dossier>      remplace le dossier .minelib
@@ -32,6 +33,7 @@
 //!   MINELIB_EXIT_AFTER=<s>      quitter automatiquement (tests)
 //!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
 //!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
+//!   MINELIB_UI=lumieres         éditeur de lumières ouvert en entrant dans le monde (essais)
 //!   MINELIB_SMOKE=<x>,<y>,<z>   mode FPS : fumigène posée là toutes les 18 s (essais)
 //!   MINELIB_SMOKE_Q=<n>,<pas>   qualité des fumigènes : pas max et longueur (essais)
 
@@ -62,6 +64,8 @@ mod i18n;
 mod inventory;
 mod jobs;
 mod keys;
+mod light_editor;
+mod lights;
 mod mcimport;
 mod menu;
 mod multiplayer;
@@ -482,6 +486,11 @@ impl Game {
                 s.skins.set_mine(self.my_skin.clone());
                 s.volume = self.options.volume;
                 s.keys = self.keys.clone();
+                // Essais de l'interface : éditeur de lumières ouvert, première lumière choisie.
+                if std::env::var("MINELIB_UI").is_ok_and(|v| v == "lumieres") {
+                    s.light_editor.open = true;
+                    s.light_editor.selected = (!s.lights.scene.is_empty()).then_some(0);
+                }
                 self.session = Some(s);
                 self.screen = Screen::Playing;
             }
@@ -3116,6 +3125,7 @@ impl GameLoop for Game {
                 Screen::Playing => match &mut self.session {
                     Some(s) if s.chat.open => s.chat.close(),
                     Some(s) if s.inventory.open => s.inventory.close(),
+                    Some(s) if s.light_editor.open => s.light_editor.escape(),
                     Some(s) if s.fps.buy_open => s.fps.buy_open = false,
                     _ => self.screen = Screen::Paused,
                 },
@@ -3196,6 +3206,7 @@ impl GameLoop for Game {
                 }
                 if active {
                     s.draw_hud(&mut self.ui, sizef, input, self.show_debug);
+                    s.light_editor_ui(&mut self.ui, sizef, input, renderer.dyn_stats());
                 }
             }
             match self.screen {
@@ -3312,7 +3323,12 @@ impl GameLoop for Game {
     fn ui_open(&self) -> bool {
         match self.screen {
             Screen::Playing => self.session.as_ref().is_some_and(|s| {
-                s.inventory.open || s.chat.open || s.fps.buy_open || s.cursor_free
+                s.inventory.open
+                    || s.chat.open
+                    || s.fps.buy_open
+                    || s.cursor_free
+                    // Éditeur de lumières : souris libre, sauf pendant qu'elle tourne la vue.
+                    || (s.light_editor.open && !s.light_editor.looking)
             }),
             _ => true,
         }

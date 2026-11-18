@@ -8,8 +8,9 @@ use bytemuck::{Pod, Zeroable};
 use crate::taa::{COLOR_FORMAT, MOTION_FORMAT};
 use crate::DEPTH_FORMAT;
 
-/// Sommet d'entité : position monde et couleur linéaire, multipliée par la texture de
-/// bloc `layer` aux coordonnées `uv` si `layer` ≥ 0 (objet tenu).
+/// Sommet d'entité : position monde et couleur linéaire (sans l'éclairage du lieu),
+/// multipliée par la texture de bloc `layer` aux coordonnées `uv` si `layer` ≥ 0 (objet
+/// tenu), puis par `light`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct EntityVertex {
@@ -17,47 +18,64 @@ pub struct EntityVertex {
     pub color: [f32; 3],
     pub uv: [f32; 2],
     pub layer: i32,
+    /// Éclairage du lieu (rgb, 0..2 ramené à 0..255, voir `EntityVertex::light`) ; a = 255 :
+    /// éclairé aussi par les lumières dynamiques, 0 : lumineux par lui-même (flamme).
+    pub light: [u8; 4],
+}
+
+impl EntityVertex {
+    /// Éclairage du lieu (0..2 par canal) au format du sommet ; `dynamic` : reçoit aussi la
+    /// lumière des lumières dynamiques.
+    pub fn light(rgb: [f32; 3], dynamic: bool) -> [u8; 4] {
+        let c = |v: f32| (v.clamp(0.0, 2.0) * 127.5).round() as u8;
+        [
+            c(rgb[0]),
+            c(rgb[1]),
+            c(rgb[2]),
+            if dynamic { 255 } else { 0 },
+        ]
+    }
 }
 
 /// Au plus tant de sommets d'entités par image.
 const MAX_VERTICES: usize = 1_048_576;
 
-pub struct Entities {
-    /// Rendu direct (une cible) et rendu avec anticrénelage temporel (couleur + mouvement).
+/// Rendu direct (une cible) et rendu avec anticrénelage temporel (couleur + mouvement).
+pub(crate) struct EntityPipes {
     plain: wgpu::RenderPipeline,
     taa: wgpu::RenderPipeline,
     taa_world: wgpu::RenderPipeline,
-    buffer: wgpu::Buffer,
-    count: u32,
-    /// Premiers sommets qui suivent la caméra (modèle du joueur local).
-    follow: u32,
-    /// Entités fixes qui changent rarement (têtes et cadres des cartes) : gardées sur la
-    /// carte graphique, renvoyées seulement quand leur version change.
-    statics: std::collections::HashMap<u64, (wgpu::Buffer, u32, u64)>,
-    /// Lots à dessiner cette image.
-    static_draw: Vec<u64>,
 }
 
-impl Entities {
-    pub fn new(
+impl EntityPipes {
+    /// `lit` : variante éclairée par les lumières de l'éditeur (compilée à la demande).
+    pub(crate) fn new(
         device: &wgpu::Device,
         bgl: &wgpu::BindGroupLayout,
         surface: wgpu::TextureFormat,
+        lit: bool,
     ) -> Self {
+        let src = include_str!("shaders/entity.wgsl");
+        let src = if lit {
+            crate::lights::with_dynlights(src)
+        } else {
+            crate::lights::without_dynlights(src)
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("entités"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/entity.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("entités"),
             bind_group_layouts: &[bgl],
             push_constant_ranges: &[],
         });
-        const ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+        const ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
             0 => Float32x3,
             1 => Float32x3,
             2 => Float32x2,
-            3 => Sint32
+            3 => Sint32,
+            4 => Unorm8x4
         ];
         let pipeline = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -102,17 +120,43 @@ impl Entities {
                 write_mask: wgpu::ColorWrites::ALL,
             })
         };
-        let plain = pipeline("entités", "fs_main", &[target(surface)]);
-        let taa = pipeline(
-            "entités (TAA)",
-            "fs_taa",
-            &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
-        );
-        let taa_world = pipeline(
-            "entités fixes (TAA)",
-            "fs_taa_world",
-            &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
-        );
+        Self {
+            plain: pipeline("entités", "fs_main", &[target(surface)]),
+            taa: pipeline(
+                "entités (TAA)",
+                "fs_taa",
+                &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
+            ),
+            taa_world: pipeline(
+                "entités fixes (TAA)",
+                "fs_taa_world",
+                &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
+            ),
+        }
+    }
+}
+
+pub struct Entities {
+    /// Pipelines de tous les jours (sans les lumières de l'éditeur).
+    pipes: EntityPipes,
+    buffer: wgpu::Buffer,
+    count: u32,
+    /// Premiers sommets qui suivent la caméra (modèle du joueur local).
+    follow: u32,
+    /// Entités fixes qui changent rarement (têtes et cadres des cartes) : gardées sur la
+    /// carte graphique, renvoyées seulement quand leur version change.
+    statics: std::collections::HashMap<u64, (wgpu::Buffer, u32, u64)>,
+    /// Lots à dessiner cette image.
+    static_draw: Vec<u64>,
+}
+
+impl Entities {
+    pub fn new(
+        device: &wgpu::Device,
+        bgl: &wgpu::BindGroupLayout,
+        surface: wgpu::TextureFormat,
+    ) -> Self {
+        let pipes = EntityPipes::new(device, bgl, surface, false);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("entités (sommets)"),
             size: (MAX_VERTICES * std::mem::size_of::<EntityVertex>()) as u64,
@@ -120,9 +164,7 @@ impl Entities {
             mapped_at_creation: false,
         });
         Self {
-            plain,
-            taa,
-            taa_world,
+            pipes,
             buffer,
             count: 0,
             follow: 0,
@@ -180,16 +222,19 @@ impl Entities {
         }
     }
 
-    /// Dessine les entités dans la passe du monde (`taa` : passe à deux cibles).
-    pub fn draw<'a>(
+    /// Dessine les entités dans la passe du monde (`taa` : passe à deux cibles ; `lit` :
+    /// pipelines éclairés par les lumières de l'éditeur, s'il y en a).
+    pub(crate) fn draw<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         group: &'a wgpu::BindGroup,
         taa: bool,
+        lit: Option<&'a EntityPipes>,
     ) {
+        let p = lit.unwrap_or(&self.pipes);
         pass.set_bind_group(0, group, &[]);
         if !self.static_draw.is_empty() {
-            pass.set_pipeline(if taa { &self.taa_world } else { &self.plain });
+            pass.set_pipeline(if taa { &p.taa_world } else { &p.plain });
             for key in &self.static_draw {
                 if let Some((b, n, _)) = self.statics.get(key) {
                     pass.set_vertex_buffer(0, b.slice(..));
@@ -202,16 +247,16 @@ impl Entities {
         }
         pass.set_vertex_buffer(0, self.buffer.slice(..));
         if !taa {
-            pass.set_pipeline(&self.plain);
+            pass.set_pipeline(&p.plain);
             pass.draw(0..self.count, 0..1);
             return;
         }
         if self.follow > 0 {
-            pass.set_pipeline(&self.taa);
+            pass.set_pipeline(&p.taa);
             pass.draw(0..self.follow, 0..1);
         }
         if self.count > self.follow {
-            pass.set_pipeline(&self.taa_world);
+            pass.set_pipeline(&p.taa_world);
             pass.draw(self.follow..self.count, 0..1);
         }
     }

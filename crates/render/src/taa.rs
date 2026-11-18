@@ -30,6 +30,8 @@ pub struct Targets {
     /// Taille de l'écran (historique) ; `internal` : celle du monde dessiné.
     pub size: (u32, u32),
     pub internal: (u32, u32),
+    /// Change à chaque fois que les images sont recréées (liaisons qui les lisent à refaire).
+    pub generation: u64,
     pub color_view: wgpu::TextureView,
     pub motion_view: wgpu::TextureView,
     /// Profondeurs en alternance : la scène écrit `depth_views[i]` pendant que l'image
@@ -211,6 +213,56 @@ fn world_pipeline(
     })
 }
 
+/// Blocs, miroirs, translucides (passe à deux cibles), compilés en parallèle. Sert aux
+/// shaders de tous les jours et à leur variante éclairée par les lumières de l'éditeur.
+pub(crate) fn build_heavy(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> Heavy {
+    let vertex_layout = crate::world_vertex_layout();
+    let vl = std::slice::from_ref(&vertex_layout);
+    let greater = wgpu::CompareFunction::Greater; // Z inversé
+    let mk = |label: &str, fs: &str, cull, depth_write, blend, motion_writes| {
+        world_pipeline(
+            device,
+            layout,
+            shader,
+            label,
+            "vs_block",
+            fs,
+            vl,
+            cull,
+            depth_write,
+            greater,
+            blend,
+            motion_writes,
+        )
+    };
+    let all = wgpu::ColorWrites::ALL;
+    let back = Some(wgpu::Face::Back);
+    std::thread::scope(|sc| {
+        let block = sc.spawn(|| mk("blocs (TAA)", "fs_block_fast_mv", back, true, None, all));
+        let reflective = sc.spawn(|| mk("reflets (TAA)", "fs_block_mv", back, true, None, all));
+        // Translucides : couleur mélangée, on garde le mouvement de ce qui est derrière.
+        let translucent = sc.spawn(|| {
+            mk(
+                "translucide (TAA)",
+                "fs_block_translucent_mv",
+                None,
+                false,
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                wgpu::ColorWrites::empty(),
+            )
+        });
+        Heavy {
+            block: block.join().expect("pipeline des blocs (TAA)"),
+            reflective: reflective.join().expect("pipeline réfléchissant (TAA)"),
+            translucent: translucent.join().expect("pipeline translucide (TAA)"),
+        }
+    })
+}
+
 impl Taa {
     pub fn new(
         device: &wgpu::Device,
@@ -225,51 +277,8 @@ impl Taa {
             let (device, layout, shader) =
                 (device.clone(), world_layout.clone(), world_shader.clone());
             crate::lazy::Lazy::spawn("shaders du monde (TAA)", move || {
-                let vertex_layout = crate::world_vertex_layout();
-                let vl = std::slice::from_ref(&vertex_layout);
-                let greater = wgpu::CompareFunction::Greater; // Z inversé
                 let t0 = std::time::Instant::now();
-                let mk = |label: &str, fs: &str, cull, depth_write, blend, motion_writes| {
-                    world_pipeline(
-                        &device,
-                        &layout,
-                        &shader,
-                        label,
-                        "vs_block",
-                        fs,
-                        vl,
-                        cull,
-                        depth_write,
-                        greater,
-                        blend,
-                        motion_writes,
-                    )
-                };
-                let all = wgpu::ColorWrites::ALL;
-                let back = Some(wgpu::Face::Back);
-                let out = std::thread::scope(|sc| {
-                    let block =
-                        sc.spawn(|| mk("blocs (TAA)", "fs_block_fast_mv", back, true, None, all));
-                    let reflective =
-                        sc.spawn(|| mk("reflets (TAA)", "fs_block_mv", back, true, None, all));
-                    // Translucides : couleur mélangée, on garde le mouvement de ce qui est
-                    // derrière.
-                    let translucent = sc.spawn(|| {
-                        mk(
-                            "translucide (TAA)",
-                            "fs_block_translucent_mv",
-                            None,
-                            false,
-                            Some(wgpu::BlendState::ALPHA_BLENDING),
-                            wgpu::ColorWrites::empty(),
-                        )
-                    });
-                    Heavy {
-                        block: block.join().expect("pipeline des blocs (TAA)"),
-                        reflective: reflective.join().expect("pipeline réfléchissant (TAA)"),
-                        translucent: translucent.join().expect("pipeline translucide (TAA)"),
-                    }
-                });
+                let out = build_heavy(&device, &layout, &shader);
                 log::info!(
                     "shaders du monde (TAA) compilés en {:.1} s (en tâche de fond)",
                     t0.elapsed().as_secs_f32()
@@ -500,9 +509,11 @@ impl Taa {
             })
         };
         let present_groups = [present_group(0), present_group(1)];
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.targets = Some(Targets {
             size,
             internal,
+            generation: GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             color_view,
             motion_view,
             depth_views,
