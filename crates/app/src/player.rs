@@ -96,14 +96,21 @@ pub mod cs {
     /// Pas de temps du serveur de CS (64 ticks/s) : la fatigue au sol s'applique par tick.
     pub const TICK: f32 = 1.0 / 64.0;
 }
-/// Freinage quand aucune touche de déplacement n'est tenue (par seconde) : en vol, au sol
-/// et en l'air (hors mode FPS, qui suit la friction de CS).
-const FLY_BRAKE: f32 = 45.0;
 /// Mode FPS, au sol, sans touche de direction : vitesse retirée par seconde en plus de la
 /// friction (arrêt en un dixième de seconde au lieu d'un tiers).
 const FPS_IDLE_BRAKE: f32 = 40.0;
+/// Vol : freinage d'un axe du monde que la cible n'utilise plus (par seconde).
+const FLY_BRAKE: f32 = 45.0;
 const GROUND_BRAKE: f32 = 30.0;
+/// En l'air, sans touche : l'élan qu'on n'a pas demandé au clavier (saut depuis une
+/// échelle, poussée) se garde un peu.
 const AIR_BRAKE: f32 = 9.0;
+/// (v172) Une direction qu'on vient de lâcher (avancer, ou de côté), qu'une autre touche
+/// reste tenue ou non, s'arrête comme au sol, même en plein saut, pendant au plus
+/// `RELEASED_S` secondes. Avant, en l'air, on continuait 0,6 à 0,7 bloc après avoir lâché
+/// (« j'avançais alors que j'avais arrêté »).
+const RELEASED_BRAKE: f32 = GROUND_BRAKE;
+const RELEASED_S: f32 = 1.0;
 const FLY: f32 = 12.0;
 const FLY_SPRINT: f32 = 30.0;
 /// Prise de vitesse en vol (blocs/s²). Sans cette limite, un appui d'un dixième de
@@ -170,6 +177,14 @@ pub struct Player {
     pub on_ladder: bool,
     /// Fluide où l'on nage (eau, lave).
     pub swimming: Option<Fluid>,
+    /// (v172) Directions lâchées (avancer/reculer, puis de côté) pendant qu'une autre
+    /// touche de déplacement reste tenue : direction (horizontale, dans le monde, au moment
+    /// du relâchement) et temps restant. La vitesse dans cette direction s'arrête comme si
+    /// tout était lâché : avant, elle s'éteignait au rythme de la conduite (en l'air, 0,7
+    /// bloc de plus ; en vol, jusqu'à 4,5 blocs).
+    released: [Option<(Vec3, f32)>; 2],
+    /// Avancer et côté demandés au pas d'avant.
+    last_axes: (f32, f32),
 }
 
 /// Un autre joueur, vu comme un obstacle.
@@ -237,6 +252,42 @@ impl Player {
             on_ladder: false,
             swimming: None,
             carry: 250,
+            released: [None, None],
+            last_axes: (0.0, 0.0),
+        }
+    }
+
+    /// Note les directions qui viennent d'être lâchées (voir `released`), et oublie celles
+    /// dont la touche est de nouveau tenue.
+    fn note_released(&mut self, m: &MoveInput, fwd: Vec3, right: Vec3) {
+        let axes = [(m.forward, self.last_axes.0, fwd), (m.strafe, self.last_axes.1, right)];
+        for (i, (now, was, dir)) in axes.into_iter().enumerate() {
+            if now != 0.0 {
+                self.released[i] = None;
+            } else if was != 0.0 {
+                self.released[i] = Some((dir * was.signum(), RELEASED_S));
+            }
+        }
+        self.last_axes = (m.forward, m.strafe);
+    }
+
+    /// Arrête, au rythme `brake` (par seconde), la vitesse horizontale dans les directions
+    /// lâchées, au-delà de ce que demande encore `target`.
+    fn brake_released(&mut self, target: Vec3, brake: f32, dt: f32) {
+        let k = (dt * brake).min(1.0);
+        for slot in &mut self.released {
+            let Some((d, left)) = slot.as_mut() else {
+                continue;
+            };
+            let excess = self.vel.x * d.x + self.vel.z * d.z - (target.x * d.x + target.z * d.z);
+            if excess > 0.0 {
+                self.vel.x -= d.x * excess * k;
+                self.vel.z -= d.z * excess * k;
+            }
+            *left -= dt;
+            if *left <= 0.0 || excess <= 0.05 {
+                *slot = None;
+            }
         }
     }
 
@@ -389,6 +440,7 @@ impl Player {
         if wish.length_squared() > 1.0 {
             wish = wish.normalize();
         }
+        self.note_released(m, fwd, right);
 
         let crouching = m.sneak && !self.flying;
         let fps = m.fps && !self.flying && !self.noclip;
@@ -422,6 +474,11 @@ impl Player {
                         self.vel[a] = 0.0;
                     }
                 }
+                // (v172) Une direction lâchée pendant qu'une autre touche reste tenue
+                // s'arrête net, comme quand tout est lâché. Avant, chaque axe du monde
+                // suivait sa cible à 10 par seconde : « avancer » lâchée en gardant « de
+                // côté », on continuait jusqu'à 4,5 blocs.
+                self.brake_released(target, f32::INFINITY, dt);
                 // La vitesse ne grandit pas plus vite que `FLY_ACCEL` (changer de
                 // direction reste immédiat), et ne dépasse jamais celle demandée :
                 // « courir » lâchée, on retombe tout de suite à la vitesse normale (si
@@ -456,6 +513,9 @@ impl Player {
             let k = (dt * control).min(1.0);
             self.vel.x += (target.x - self.vel.x) * k;
             self.vel.z += (target.z - self.vel.z) * k;
+            // Une direction qu'on vient de lâcher s'arrête comme au sol, même en l'air et
+            // même si une autre touche reste tenue.
+            self.brake_released(target, RELEASED_BRAKE, dt);
             if idle && self.vel.x.hypot(self.vel.z) < 0.05 {
                 self.vel.x = 0.0;
                 self.vel.z = 0.0;
@@ -2176,6 +2236,90 @@ mod stop_tests {
         }
         assert!((p.pos.z - HALF_WIDTH + 29.0).abs() < 1e-3, "au contact");
         assert!(fastest > 29.0, "à un bloc du mur : {fastest} blocs/s");
+    }
+
+    /// (v172) « Avancer » lâchée pendant qu'une autre touche de déplacement reste tenue
+    /// (de côté) : le joueur cesse d'avancer comme si tout était lâché, en vol, au sol et
+    /// en plein saut. Mesuré avant dans les parties du joueur : jusqu'à 4,5 blocs en vol,
+    /// 0,7 bloc en sautant ; et 0,6 bloc en lâchant tout en plein saut.
+    #[test]
+    fn a_released_direction_stops_even_with_another_key_held() {
+        let mut w = World::new(0);
+        for x in -4..4 {
+            for z in -80..4 {
+                w.insert_empty(minelib_world::ChunkPos { x, z });
+            }
+        }
+        for x in -60..60 {
+            for z in -1200..40 {
+                w.set(x, 60, z, minelib_world::BlockId::STONE);
+            }
+        }
+        let dt = crate::session::SIM_TICK;
+        // (vol, saut tenu, chemin permis vers l'avant après le relâchement, en blocs)
+        for (flying, jump, most) in [(true, false, 0.1), (false, false, 0.3), (false, true, 0.3)] {
+            let mut p = Player::new(Vec3::new(0.5, if flying { 70.0 } else { 61.0 }, 0.5));
+            p.pitch = 0.0;
+            p.flying = flying;
+            let go = MoveInput {
+                forward: 1.0,
+                strafe: 1.0,
+                sprint: true,
+                jump,
+                ..Default::default()
+            };
+            let side = MoveInput {
+                strafe: 1.0,
+                sprint: true,
+                jump,
+                ..Default::default()
+            };
+            for _ in 0..(64 * 3) {
+                p.update(&w, &go, dt);
+            }
+            // En plein saut au moment du relâchement (le cas mesuré).
+            if jump {
+                for _ in 0..64 {
+                    if !p.on_ground && p.vel.y > 0.0 {
+                        break;
+                    }
+                    p.update(&w, &go, dt);
+                }
+                assert!(!p.on_ground, "en l'air");
+            }
+            let at = p.pos.z;
+            for _ in 0..64 {
+                p.update(&w, &side, dt);
+            }
+            // Avancer = vers les z négatifs (regard vers -z).
+            let fwd = at - p.pos.z;
+            assert!(fwd < most, "vol {flying}, saut {jump} : {fwd} bloc vers l'avant");
+            // Et l'on continue bien de côté.
+            assert!(p.vel.x > 3.0, "vol {flying}, saut {jump} : de côté {}", p.vel.x);
+        }
+        // Tout lâché en plein saut : arrêt comme au sol.
+        let mut p = Player::new(Vec3::new(0.5, 61.0, 0.5));
+        p.pitch = 0.0;
+        let go = MoveInput {
+            forward: 1.0,
+            sprint: true,
+            jump: true,
+            ..Default::default()
+        };
+        for _ in 0..(64 * 3) {
+            p.update(&w, &go, dt);
+        }
+        for _ in 0..64 {
+            if !p.on_ground && p.vel.y > 0.0 {
+                break;
+            }
+            p.update(&w, &go, dt);
+        }
+        let at = p.pos.z;
+        for _ in 0..64 {
+            p.update(&w, &MoveInput::default(), dt);
+        }
+        assert!(at - p.pos.z < 0.3, "saut lâché : {} bloc", at - p.pos.z);
     }
 
     /// Journal des arrêts : la distance au mur devant le joueur (en vol, tout obstacle ;
