@@ -336,13 +336,26 @@ fn emit_box_layer(
 pub enum Held {
     /// Bloc, avec sa forme (dalle, bannière de deux blocs…).
     Block(BlockId),
-    /// Arme : longue pièce de couleur unie (sRGB), pointée vers le regard.
-    Stick([u8; 3]),
     /// Baguette de WorldEdit (couleur sRGB), tenue droite.
     Wand([u8; 3]),
     /// Torche (couleur de sa flamme, sRGB) : bâton levé devant la main, flamme au bout.
     Torch([u8; 3]),
+    /// (v177) Équipement du mode FPS, avec son vrai modèle (celui de la vue à la 1re
+    /// personne) : arme (indice dans `WEAPONS`, tenue à deux mains, pointée où l'on
+    /// regarde), grenade (`ITEM_NADE` + type), bombe (`cs::W_BOMB`) ou couteau (le reste).
+    Gear(u8),
 }
+
+/// (v177) Arme à feu en main : les deux bras se tendent vers le regard (`aims`).
+fn aims(pose: &Pose) -> bool {
+    matches!(pose.held, Some(Held::Gear(c)) if (c as usize) < crate::weapons::WEAPONS.len())
+}
+
+/// (v177) Bras tendus d'une arme à feu : rotation autour de la verticale (radians) qui
+/// ramène la main vers le milieu du corps, pour le bras droit et pour le gauche (qui vient
+/// tenir l'arme devant). Les mêmes que `AIM_TURN_*` de players.wgsl.
+const AIM_TURN_RIGHT: f32 = 0.15;
+const AIM_TURN_LEFT: f32 = -0.5;
 
 /// Pavés des six parties, dans l'ordre de `parts` et de `Skin::color` (jambe gauche, jambe
 /// droite, corps, bras gauche, bras droit, tête) : coins (pixels, repère de la partie) et
@@ -383,7 +396,30 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     out.push((upper, min, max, part));
     // Bras : pivot à l'épaule (y = 22 depuis la hanche : 10), balancement inverse des
     // jambes ; le bras droit (x +6) tient l'objet un peu levé devant lui.
+    let aim = aims(pose);
     for (side, sign) in [(-6.0f32, -1.0f32), (6.0, 1.0)] {
+        if aim {
+            // (v177) Arme à feu : les deux bras tendus là où l'on regarde (le haut du corps
+            // penché compris), un peu tournés vers l'arme, qui est tenue devant, entre les
+            // deux mains ; ils ne se balancent presque plus en marchant.
+            let turn = if side > 0.0 {
+                AIM_TURN_RIGHT
+            } else {
+                AIM_TURN_LEFT
+            };
+            let xf = upper
+                * Mat4::from_translation(Vec3::new(side, 10.0, 0.0))
+                * Mat4::from_rotation_y(turn)
+                * Mat4::from_rotation_x(
+                    std::f32::consts::FRAC_PI_2
+                        + pose.pitch.clamp(-1.4, 1.4)
+                        + lean
+                        + swing * sign * 0.1,
+                );
+            let (min, max, part) = PARTS[out.len()];
+            out.push((xf, min, max, part));
+            continue;
+        }
         // Bras tendu vers l'avant (rotation positive : la main part vers −z), qui suit
         // un peu le regard (l'objet tenu est tourné comme à la 1re personne).
         let raise = if side > 0.0 && pose.held.is_some() {
@@ -462,6 +498,160 @@ fn item_frame(pose: &Pose, hand: Mat4, rot: Mat4, fwd: f32) -> Mat4 {
 /// Repère d'une torche tenue : un peu devant le poing, bâton sur +y.
 fn torch_frame(pose: &Pose, hand: Mat4) -> Mat4 {
     item_frame(pose, hand, crate::hand::torch_rotation(), 3.0)
+}
+
+/// (v177) Équipement du mode FPS (`Held::Gear`) : son modèle en triangles (mètres, canon
+/// ou lame vers −z), le point qu'on tient (là où est la main) et sa boîte englobante (de
+/// loin, et dans les reflets).
+struct Gear {
+    tris: std::borrow::Cow<'static, [crate::weapons::Tri]>,
+    grip: Vec3,
+    min: Vec3,
+    max: Vec3,
+    /// Agrandissement : les petits objets (couteau, grenade, bombe) seraient cachés dans le
+    /// poing, plus gros que nature.
+    scale: f32,
+}
+
+impl Gear {
+    /// `grip` : point tenu, en fractions de la boîte (0 : le bas, l'arrière… 1 : le haut,
+    /// l'avant ; z de l'avant, le bout du canon, vers l'arrière).
+    fn new(
+        tris: std::borrow::Cow<'static, [crate::weapons::Tri]>,
+        grip: [f32; 3],
+        scale: f32,
+    ) -> Self {
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        for p in tris.iter().flat_map(|t| t.p) {
+            min = min.min(p);
+            max = max.max(p);
+        }
+        if tris.is_empty() {
+            (min, max) = (Vec3::ZERO, Vec3::ZERO);
+        }
+        Gear {
+            grip: min + (max - min) * Vec3::from(grip),
+            tris,
+            min,
+            max,
+            scale,
+        }
+    }
+}
+
+/// (v177) L'équipement de code `code` (voir `Held::Gear`), préparé une fois.
+fn gear(code: u8) -> &'static Gear {
+    use crate::weapons::{self, WEAPONS};
+    use std::borrow::Cow;
+    static ALL: std::sync::OnceLock<Vec<Gear>> = std::sync::OnceLock::new();
+    let all = ALL.get_or_init(|| {
+        let mut all = Vec::new();
+        for (i, d) in WEAPONS.iter().enumerate() {
+            let m = weapons::model(i);
+            // Dual Berettas : le modèle porte les deux pistolets ; un seul, tenu à deux mains.
+            let tris = if d.name == "Dual Berettas" {
+                &m.tris[..m.tris.len() / 2]
+            } else {
+                &m.tris[..]
+            };
+            // Poignée : vers l'arrière et le bas (plus en arrière sur un pistolet, un peu
+            // plus gros que nature pour se voir entre les poings).
+            let (back, scale) = if d.length > 0.4 {
+                (0.68, 1.0)
+            } else {
+                (0.8, 1.25)
+            };
+            all.push(Gear::new(Cow::Borrowed(tris), [0.5, 0.4, back], scale));
+        }
+        // Grenade, bombe, couteau : tenus par l'arrière, le reste sort du poing.
+        for n in crate::equip::Nade::ALL {
+            all.push(Gear::new(
+                Cow::Owned(crate::equip::nade_model(n)),
+                [0.5, 0.4, 0.8],
+                2.0,
+            ));
+        }
+        all.push(Gear::new(
+            Cow::Owned(crate::equip::bomb_model()),
+            [0.5, 0.4, 0.85],
+            1.5,
+        ));
+        // Couteau : le manche (la lame est vers l'avant).
+        all.push(Gear::new(
+            Cow::Borrowed(&weapons::knife_model().tris[..]),
+            [0.5, 0.5, 0.85],
+            1.4,
+        ));
+        all
+    });
+    let n = WEAPONS.len();
+    let i = if (code as usize) < n {
+        code as usize
+    } else if let Some(k) = crate::cs::nade_code(code) {
+        n + k
+    } else if code == crate::cs::W_BOMB {
+        n + crate::equip::Nade::ALL.len()
+    } else {
+        all.len() - 1
+    };
+    &all[i]
+}
+
+/// (v177) Repère (mètres → monde) de l'équipement tenu : tourné vers où l'on regarde, son
+/// point de prise posé sur les poings (entre les deux pour une arme à feu, tenue à deux
+/// mains), comme à la 1re personne.
+fn gear_frame(pose: &Pose) -> Option<(Mat4, &'static Gear)> {
+    let Some(Held::Gear(code)) = pose.held else {
+        return None;
+    };
+    let g = gear(code);
+    let arms: Vec<Mat4> = parts(pose)
+        .into_iter()
+        .filter(|p| p.3 == Part::Arm)
+        .map(|p| p.0)
+        .collect();
+    let look =
+        Mat4::from_rotation_y(-pose.yaw) * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4));
+    let at = if aims(pose) {
+        // Arme à feu : entre les deux poings (leur milieu, à 2 pixels du bout des bras),
+        // posée dessus.
+        let fist = |arm: &Mat4| arm.transform_point3(Vec3::new(0.0, -8.0, 0.0));
+        (fist(arms.get(1)?) + fist(&arms[0])) * 0.5 + look.transform_vector3(Vec3::Y) * (2.0 * PX)
+    } else {
+        // Le reste : tenu au bout du poing droit.
+        arms.get(1)?.transform_point3(Vec3::new(0.0, -9.5, 0.0))
+    };
+    Some((
+        Mat4::from_translation(at)
+            * look
+            * Mat4::from_scale(Vec3::splat(g.scale))
+            * Mat4::from_translation(-g.grip),
+        g,
+    ))
+}
+
+/// Couleur de la silhouette d'un équipement (de loin, et dans les reflets).
+const GEAR_FAR: [u8; 3] = [40, 40, 44];
+
+/// (v177) Équipement du mode FPS tenu en main : son modèle (`detail`), sinon sa silhouette
+/// (une boîte sombre de sa taille, de loin).
+fn emit_gear(out: &mut Vec<EntityVertex>, pose: &Pose, detail: bool) {
+    let Some((xf, g)) = gear_frame(pose) else {
+        return;
+    };
+    if detail {
+        tris_in_world(out, xf, &g.tris, pose.light);
+    } else {
+        emit_item(
+            out,
+            xf,
+            g.min.to_array(),
+            g.max.to_array(),
+            RayBoxKind::Flat(GEAR_FAR),
+            pose.light,
+        );
+    }
 }
 
 /// Pavés de l'objet tenu : repère, coins (pixels), sorte.
@@ -573,18 +763,14 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
                     .collect()
             }
         }
-        Held::Stick(c) => vec![(
-            item_frame(pose, hand, Mat4::IDENTITY, 0.0),
-            [-0.75, -1.0, -10.0],
-            [0.75, 0.5, 0.0],
-            RayBoxKind::Flat(c),
-        )],
         Held::Wand(c) => vec![(
             item_frame(pose, hand, crate::hand::wand_rotation(), 2.0),
             [-0.75, -2.0, -0.75],
             [0.75, 9.0, 0.75],
             RayBoxKind::Flat(c),
         )],
+        // (v177) En triangles : `emit_gear`.
+        Held::Gear(_) => Vec::new(),
     }
 }
 
@@ -759,6 +945,7 @@ pub fn build(pose: &Pose) -> Vec<EntityVertex> {
     for (xf, min, max, kind) in held_parts(pose) {
         emit_item(&mut out, xf, min, max, kind, pose.light);
     }
+    emit_gear(&mut out, pose, true);
     out
 }
 
@@ -841,7 +1028,10 @@ pub fn bake_skin(tex: Option<&crate::skin::Skin>) -> Vec<[f32; 3]> {
 
 /// Instance d'un autre joueur pour la carte : sa pose, sa lumière et la couche de son skin.
 pub fn instance(pose: &Pose, layer: u32) -> PlayerInstance {
-    let held = if pose.held.is_some() {
+    let held = if aims(pose) {
+        // (v177) Arme à feu : les deux bras tendus.
+        PlayerInstance::HOLDS | PlayerInstance::AIMS
+    } else if pose.held.is_some() {
         PlayerInstance::HOLDS
     } else {
         0
@@ -934,12 +1124,14 @@ impl SkinLayers {
     }
 }
 
-/// Objet tenu seul (le corps est dessiné par la carte : `instance`).
-pub fn held_model(pose: &Pose) -> Vec<EntityVertex> {
+/// Objet tenu seul (le corps est dessiné par la carte : `instance`). (v177) `detail` :
+/// l'équipement du mode FPS avec son vrai modèle (sinon sa silhouette, de loin).
+pub fn held_model(pose: &Pose, detail: bool) -> Vec<EntityVertex> {
     let mut out = Vec::new();
     for (xf, min, max, kind) in held_parts(pose) {
         emit_item(&mut out, xf, min, max, kind, pose.light);
     }
+    emit_gear(&mut out, pose, detail);
     out
 }
 
@@ -959,9 +1151,19 @@ pub fn ray_boxes(pose: &Pose) -> Vec<RayBox> {
             };
             (xf, min, max, kind, if skinned { i as u8 + 1 } else { 0 })
         });
+    // (v177) Équipement du mode FPS : sa boîte, sombre.
+    let gear = gear_frame(pose).map(|(xf, g)| {
+        (
+            xf,
+            g.min.to_array(),
+            g.max.to_array(),
+            RayBoxKind::Flat(GEAR_FAR),
+        )
+    });
     body.chain(
         held_parts(pose)
             .into_iter()
+            .chain(gear)
             .map(|(xf, min, max, kind)| (xf, min, max, kind, 0)),
     )
     .map(|(xf, min, max, kind, part)| RayBox {
@@ -1002,6 +1204,17 @@ mod tests {
         if part == 2 {
             return upper;
         }
+        if (part == 3 || part == 4) && p.skin & 0x20000 != 0 {
+            let (side, turn, sign) = if part == 4 {
+                (6.0, 0.15, 1.0)
+            } else {
+                (-6.0, -0.5, -1.0)
+            };
+            return upper
+                * t(side, 10.0, 0.0)
+                * Mat4::from_rotation_y(turn)
+                * Mat4::from_rotation_x(1.570_796_4 + pitch + lean + swing * sign * 0.1);
+        }
         if part == 3 {
             return upper * t(-6.0, 10.0, 0.0) * Mat4::from_rotation_x(-swing + lean * 0.6);
         }
@@ -1035,24 +1248,30 @@ mod tests {
         crate::skin::Skin::from_png(&png).unwrap()
     }
 
-    /// Poses d'essai : immobile au skin par défaut, en marche avec un skin et une arme, et
-    /// accroupi regardant vers le haut avec un bloc en main.
+    /// Poses d'essai : immobile au skin par défaut, en marche avec un skin et une arme à feu
+    /// (les deux bras tendus), accroupi regardant vers le haut avec un bloc en main, et
+    /// couteau en main (le bras droit seul).
     fn test_poses() -> Vec<Pose> {
         let skin = test_skin();
-        (0..3)
+        let ak = crate::weapons::WEAPONS
+            .iter()
+            .position(|w| w.name == "AK-47")
+            .unwrap() as u8;
+        (0..4)
             .map(|n| Pose {
                 feet: Vec3::new(3.0 + n as f32, 70.0, -5.0),
                 yaw: 0.7 + n as f32 * 2.1,
-                pitch: [-0.5, 0.3, 1.2][n],
+                pitch: [-0.5, 0.3, 1.2, -0.2][n],
                 walk: 1.3 + n as f32,
-                swing: [0.0, 0.8, 0.5][n],
-                crouch: [0.0, 0.6, 1.0][n],
+                swing: [0.0, 0.8, 0.5, 0.6][n],
+                crouch: [0.0, 0.6, 1.0, 0.0][n],
                 // Exactement représentable au format des sommets (k / 127,5).
                 light: [0.8, 0.4, 1.2],
                 held: [
                     None,
-                    Some(Held::Stick([38, 38, 42])),
+                    Some(Held::Gear(ak)),
                     Some(Held::Block(BlockId::STONE)),
+                    Some(Held::Gear(crate::cs::W_KNIFE)),
                 ][n],
                 skin: (n > 0).then(|| skin.clone()),
             })
@@ -1116,7 +1335,7 @@ mod tests {
                 }
             }
             // Ensuite, l'objet tenu (seul dans `held_model`).
-            assert_eq!(cpu.len() - at, held_model(&pose).len());
+            assert_eq!(cpu.len() - at, held_model(&pose, true).len());
         }
     }
 
@@ -1125,7 +1344,7 @@ mod tests {
         let mesh = player_mesh();
         for (n, pose) in test_poses().into_iter().enumerate() {
             let body = build(&pose);
-            let body = &body[..body.len() - held_model(&pose).len()];
+            let body = &body[..body.len() - held_model(&pose, true).len()];
             let skins = vec![(3, bake_skin(pose.skin.as_deref()))];
             let players = [instance(&pose, 3)];
             for view in 0..3 {

@@ -114,6 +114,17 @@ impl Hurt {
     }
 }
 
+/// (v177) Achat de cette manche, revendable tant qu'on peut acheter : son prix payé, et ce
+/// qu'il a remplacé (arme du même emplacement, gilet, casque).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Bought {
+    pub item: u16,
+    pub price: u32,
+    pub prev_gun: u8,
+    pub prev_armor: u8,
+    pub prev_helmet: bool,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MPlayer {
     /// Lobby (0 : seul) : les joueurs d'un même lobby sont dans la même équipe.
@@ -156,6 +167,9 @@ pub struct MPlayer {
     /// l'hôte qui fait foi : on ne tire qu'avec une arme qu'on porte.
     pub guns: (u8, u8),
     pub nades: [u8; 5],
+    /// (v177) Achats de cette manche (revendables).
+    #[serde(default)]
+    pub bought: Vec<Bought>,
     /// Cadence de tir : tirs encore permis (se recharge à la cadence de l'arme) et pas
     /// de la dernière recharge.
     shots_left: f32,
@@ -448,6 +462,14 @@ impl Match {
         Ev::Spawn { id, reset }
     }
 
+    /// (v177) Personne ne joue : départ d'une manche (pauses comprises), mi-temps, fin.
+    pub fn still(&self) -> bool {
+        matches!(
+            self.phase,
+            phase::FREEZE | phase::HALFTIME | phase::GAME_OVER
+        )
+    }
+
     pub fn has_gun(&self, id: u64, weapon: u8) -> bool {
         weapon != 255
             && self
@@ -460,6 +482,11 @@ impl Match {
     /// porte l'arme, qu'elle tire autant de plombs, et à sa cadence (avec un peu d'avance,
     /// les messages arrivant parfois groupés). Le tir est alors compté.
     pub fn shoot(&mut self, id: u64, weapon: u8, rays: usize) -> bool {
+        // (v177) Pas de tir pendant le départ d'une manche (pauses comprises), la mi-temps
+        // et après la fin de la partie.
+        if self.still() {
+            return false;
+        }
         let knife = weapon >= 254;
         let (rpm, pellets) = if knife {
             (150.0, 1)
@@ -489,6 +516,9 @@ impl Match {
     /// Lancer d'une grenade (code réseau : type, ou leurre qui imite une arme) : il faut
     /// en porter une de ce type (elle est retirée).
     pub fn throw(&mut self, id: u64, nade: u8) -> bool {
+        if self.still() {
+            return false;
+        }
         let Some((kind, _)) = crate::equip::nade_from_net(nade) else {
             return false;
         };
@@ -776,6 +806,7 @@ impl Match {
                 defuse_key: false,
                 guns: (255, starter(team)),
                 nades: [0; 5],
+                bought: Vec::new(),
                 shots_left: BURST,
                 shots_tick: 0,
                 reset: true,
@@ -1010,6 +1041,14 @@ impl Match {
         if !warmup {
             p.money -= price;
         }
+        let slot = (item as usize) < WEAPONS.len() && WEAPONS[item as usize].primary();
+        p.bought.push(Bought {
+            item,
+            price: if warmup { 0 } else { price },
+            prev_gun: if slot { p.guns.0 } else { p.guns.1 },
+            prev_armor: p.armor,
+            prev_helmet: p.helmet,
+        });
         match item {
             ITEM_KIT => p.kit = true,
             ITEM_KEVLAR => p.armor = 100,
@@ -1026,6 +1065,48 @@ impl Match {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// (v177) Revend un achat de cette manche (tant qu'on peut acheter, et qu'on l'a encore) :
+    /// remboursé en entier, et ce qu'il avait remplacé revient (l'arme d'avant, le gilet).
+    pub fn sell(&mut self, id: u64, item: u16, at: Option<Vec3>) -> Result<(), String> {
+        if !self.can_buy(id, at) {
+            return Err("Revente impossible ici ou maintenant.".into());
+        }
+        let p = self.players.get_mut(&id).expect("joueur");
+        let Some(i) = p.bought.iter().rposition(|b| b.item == item) else {
+            return Err("Seuls les achats de cette manche se revendent.".into());
+        };
+        let nade = (ITEM_NADE..ITEM_NADE + 5).contains(&item);
+        let has = match item {
+            ITEM_KIT => p.kit,
+            ITEM_KEVLAR => p.armor == 100,
+            ITEM_HELMET => p.armor == 100 && p.helmet,
+            _ if nade => p.nades[(item - ITEM_NADE) as usize] > 0,
+            w => p.guns.0 as u16 == w || p.guns.1 as u16 == w,
+        };
+        if !has {
+            return Err("Tu ne l'as plus (abîmé, lâché ou lancé).".into());
+        }
+        let b = p.bought.remove(i);
+        match item {
+            ITEM_KIT => p.kit = false,
+            ITEM_KEVLAR => p.armor = b.prev_armor,
+            ITEM_HELMET => {
+                p.armor = b.prev_armor;
+                p.helmet = b.prev_helmet;
+            }
+            _ if nade => p.nades[(item - ITEM_NADE) as usize] -= 1,
+            w => {
+                if WEAPONS[w as usize].primary() {
+                    p.guns.0 = b.prev_gun;
+                } else {
+                    p.guns.1 = b.prev_gun;
+                }
+            }
+        }
+        p.money = (p.money + b.price).min(MAX_MONEY);
         Ok(())
     }
 
@@ -1292,6 +1373,7 @@ impl Match {
     /// Début de la partie : statistiques à zéro, 800 $, manche 1.
     fn start(&mut self, ev: &mut Vec<Ev>) {
         for p in self.players.values_mut() {
+            p.bought.clear();
             p.start_team = p.team;
             p.money = START_MONEY;
             p.kills = 0;
@@ -1344,6 +1426,7 @@ impl Match {
             p.alive = true;
             p.hp = 100;
             p.round_kills = 0;
+            p.bought.clear();
             p.round_damage = 0;
             p.dealt.clear();
             p.dead_for = 0.0;
@@ -2488,6 +2571,64 @@ mod tests {
         m.phase = phase::ROUND_END;
         assert_eq!(m.step_in(t, true, true), None);
         assert!(m.players[&t].present && m.players[&t].alive);
+    }
+
+    /// (v177) Revente d'un achat de cette manche : remboursé en entier, l'arme d'avant
+    /// revient ; pas d'un achat d'une autre manche, ni hors du temps d'achat.
+    #[test]
+    fn a_purchase_of_this_round_sells_back_for_its_full_price() {
+        let mut m = full_match();
+        let ct = m
+            .players
+            .iter()
+            .find(|(_, p)| p.team == CT)
+            .map(|(&i, _)| i)
+            .unwrap();
+        let (_, prev) = m.players[&ct].guns;
+        let deagle = WEAPONS
+            .iter()
+            .position(|w| w.name == "Desert Eagle")
+            .unwrap() as u16;
+        m.players.get_mut(&ct).unwrap().money = 5000;
+        let money = m.players[&ct].money;
+        m.buy(ct, deagle, None).unwrap();
+        assert_eq!(m.players[&ct].guns.1, deagle as u8);
+        assert!(m.players[&ct].money < money);
+        m.buy(ct, ITEM_KEVLAR, None).unwrap();
+        // Revendus : argent et arme d'avant reviennent, le gilet aussi.
+        m.sell(ct, deagle, None).unwrap();
+        assert_eq!(m.players[&ct].guns.1, prev);
+        m.sell(ct, ITEM_KEVLAR, None).unwrap();
+        assert_eq!(m.players[&ct].armor, 0);
+        assert_eq!(m.players[&ct].money, money);
+        assert!(m.sell(ct, deagle, None).is_err(), "déjà revendu");
+        // Acheté, puis la manche passe : plus revendable.
+        m.buy(ct, deagle, None).unwrap();
+        while m.phase == phase::FREEZE {
+            m.tick(1.0 / 128.0, &BTreeMap::new());
+        }
+        m.live_for = BUY_S + 1.0;
+        assert!(m.sell(ct, deagle, None).is_err(), "temps d'achat fini");
+        m.players.get_mut(&ct).unwrap().bought.clear();
+        m.live_for = 0.0;
+        assert!(
+            m.sell(ct, deagle, None).is_err(),
+            "acheté à une autre manche"
+        );
+    }
+
+    /// (v177) Personne ne tire pendant le départ d'une manche (ni pendant une pause).
+    #[test]
+    fn nobody_shoots_while_the_round_waits_to_start() {
+        let mut m = full_match();
+        let id = *m.players.keys().next().unwrap();
+        let pistol = m.players[&id].guns.1;
+        assert_eq!(m.phase, phase::FREEZE);
+        assert!(!m.shoot(id, pistol, 1), "figé au départ");
+        while m.phase == phase::FREEZE {
+            m.tick(1.0 / 128.0, &BTreeMap::new());
+        }
+        assert!(m.shoot(id, pistol, 1), "manche en cours");
     }
 
     fn full_match() -> Match {

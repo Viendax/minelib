@@ -257,6 +257,11 @@ pub struct Fps {
     pub online: Option<Online>,
     /// Achats demandés à l'hôte (partie en ligne).
     pub requests: Vec<u16>,
+    /// (v177) Reventes demandées à l'hôte (codes d'article).
+    pub sells: Vec<u16>,
+    /// (v177) Achats de cette manche (revendables par clic droit dans le menu) et, en solo,
+    /// l'arme qu'ils ont remplacée.
+    bought: Vec<(u16, Option<Gun>)>,
     /// Grenades lancées à cette image : (type, position, vitesse), pour les autres joueurs.
     pub throws: Vec<(u8, Vec3, Vec3)>,
     /// Explosions de HE à cette image : (position, lanceur).
@@ -316,6 +321,8 @@ impl Fps {
             damage_acc: 0.0,
             online: None,
             requests: Vec::new(),
+            sells: Vec::new(),
+            bought: Vec::new(),
             throws: Vec::new(),
             blasts: Vec::new(),
             dropped: Vec::new(),
@@ -326,6 +333,8 @@ impl Fps {
     /// avec le pistolet de départ de son camp (Glock-18 pour les T, USP-S pour les CT).
     /// `clear` : vraie nouvelle manche, les grenades et fumées en cours disparaissent.
     pub fn new_round(&mut self, reset: bool, team: u8, clear: bool) {
+        // (v177) Les achats de la manche d'avant ne se revendent plus.
+        self.bought.clear();
         // Ce qui est dans le monde (grenades en vol, fumées, feu) ne dépend pas de soi :
         // gardé quand on réapparaît seul (échauffement), effacé à une nouvelle manche.
         let world = (
@@ -418,9 +427,17 @@ impl Fps {
             .collect()
     }
 
-    /// Arme en main (indice dans `WEAPONS`), 255 pour le couteau, les grenades ou rien.
+    /// Ce qu'on a en main, pour les autres joueurs : arme (indice dans `WEAPONS`), (v177)
+    /// grenade (`ITEM_NADE` + type), bombe (`cs::W_BOMB`), sinon 255 (le couteau).
     pub fn held_weapon(&self) -> u8 {
-        self.active().map_or(255, |g| g.def as u8)
+        match self.sel {
+            Sel::Nade(n) => Nade::ALL
+                .iter()
+                .position(|&k| k == n)
+                .map_or(255, |k| minelib_net::game::ITEM_NADE as u8 + k as u8),
+            Sel::Bomb => crate::cs::W_BOMB,
+            _ => self.active().map_or(255, |g| g.def as u8),
+        }
     }
 
     /// Vitesse permise par ce qu'on tient (unités de CS : couteau 250, grenade 245,
@@ -1024,6 +1041,24 @@ impl Fps {
             }
         }
         self.shots.push((gun.def as u8, eye, dirs));
+    }
+
+    /// (v177) Explosion de la bombe en `pos` : une grosse boule de feu (plusieurs qui
+    /// s'enchaînent) et son bruit, fort et entendu de loin.
+    pub fn bomb_blast(&mut self, pos: Vec3, eye: Vec3) {
+        for (dx, dy, dz, age) in [
+            (0.0, 0.2, 0.0, 0.0),
+            (1.1, 0.7, 0.3, -0.06),
+            (-0.9, 1.0, -0.6, -0.12),
+            (0.3, 1.7, 0.9, -0.18),
+            (-0.4, 0.4, 1.2, -0.09),
+        ] {
+            self.effects
+                .push(Effect::Blast(pos + Vec3::new(dx, dy, dz), age));
+        }
+        let d = (pos - eye).length();
+        self.sounds
+            .push((Sfx::BombBlast, 0.0, 1.0 / (1.0 + d / 40.0)));
     }
 
     /// Son venant de `pos` : plus faible avec la distance.
@@ -2117,9 +2152,8 @@ impl Fps {
             if let Some(item) = self.buy_at(size, cursor.0, cursor.1) {
                 if self.buy_state(item).2 {
                     self.requests.push(Self::item_code(item));
-                    if matches!(item, BuyItem::Weapon(_)) {
-                        self.buy_open = false;
-                    }
+                    // (v177) Revendable dans cette manche (l'hôte en décide).
+                    self.bought.push((Self::item_code(item), None));
                 }
                 self.hold_fire = true;
             }
@@ -2127,14 +2161,22 @@ impl Fps {
         }
         match self.buy_at(size, cursor.0, cursor.1) {
             // Solo : prix affiché, mais rien n'est débité (le solde reste à 0).
+            // (v177) Le menu reste ouvert après un achat.
             Some(BuyItem::Weapon(i)) => {
+                let prev = if WEAPONS[i].primary() {
+                    self.primary
+                } else {
+                    self.secondary
+                };
+                self.bought.push((i as u16, prev));
                 self.buy(i);
-                self.buy_open = false;
                 self.hold_fire = true;
             }
             // Les grenades s'ajoutent (le menu reste ouvert), dans les limites de CS.
             Some(BuyItem::Nade(n)) => {
-                self.buy_nade(n);
+                if self.buy_nade(n) {
+                    self.bought.push((Self::item_code(BuyItem::Nade(n)), None));
+                }
                 self.hold_fire = true;
             }
             Some(BuyItem::Gear(_)) | None => {}
@@ -2243,7 +2285,12 @@ impl Fps {
                 col(tc, 1.0),
                 name,
             );
-            let p = format!("{price} $");
+            // (v177) Achat de cette manche : revendable (clic droit).
+            let p = if self.can_sell(item) {
+                format!("{price} $  ↺")
+            } else {
+                format!("{price} $")
+            };
             let pw = Ui::text_width(&p, s);
             ui.text(
                 x + cwi - 4.0 * s - pw,
@@ -2265,11 +2312,9 @@ impl Fps {
                     if d.auto { ", automatique" } else { "" }
                 )
             }
-            Some(BuyItem::Nade(n)) => format!(
-                "{} : {} au plus, 4 grenades en tout",
-                n.name(),
-                n.max()
-            ),
+            Some(BuyItem::Nade(n)) => {
+                format!("{} : {} au plus, 4 grenades en tout", n.name(), n.max())
+            }
             Some(BuyItem::Gear(minelib_net::game::ITEM_KIT)) => {
                 "Kit de désamorçage (CT) : désamorce en 5 s au lieu de 10.".to_string()
             }
@@ -2278,6 +2323,16 @@ impl Fps {
             }
             Some(BuyItem::Gear(_)) => "Gilet : protège le corps (pas la tête).".to_string(),
             None => String::new(),
+        };
+        // (v177) Revente : clic droit sur un achat de cette manche (remboursé en entier).
+        let info = match hover {
+            Some(item) if self.can_sell(item) => {
+                format!("{info}   —   clic droit : revendre (remboursé)")
+            }
+            _ if !self.bought.is_empty() => {
+                format!("{info}   (clic droit sur un achat de cette manche : le revendre)")
+            }
+            _ => info,
         };
         ui.text(
             px + 8.0 * s,
@@ -2297,6 +2352,57 @@ impl Fps {
             if let Some(c) = input.cursor {
                 self.buy_click(size, c);
             }
+        }
+        if input.mouse_pressed(minelib_platform::Mouse::Right) {
+            if let Some(c) = input.cursor {
+                self.sell_click(size, c);
+            }
+        }
+    }
+
+    /// (v177) Achat de cette manche revendable (clic droit dans le menu) ?
+    pub fn can_sell(&self, item: BuyItem) -> bool {
+        let code = Self::item_code(item);
+        self.bought.iter().any(|b| b.0 == code) && self.online.is_none_or(|o| o.can_buy || o.warmup)
+    }
+
+    /// (v177) Clic droit dans le menu d'achat : revend un achat de cette manche (remboursé
+    /// en entier par l'hôte, qui redit ce qu'on porte ; en solo, l'arme d'avant revient).
+    pub fn sell_click(&mut self, size: (f32, f32), cursor: (f32, f32)) {
+        let Some(item) = self.buy_at(size, cursor.0, cursor.1) else {
+            return;
+        };
+        if !self.can_sell(item) {
+            return;
+        }
+        let code = Self::item_code(item);
+        let Some(i) = self.bought.iter().rposition(|b| b.0 == code) else {
+            return;
+        };
+        let (_, prev) = self.bought.remove(i);
+        self.hold_fire = true;
+        if self.online.is_some() {
+            self.sells.push(code);
+            return;
+        }
+        match item {
+            BuyItem::Weapon(w) => {
+                if WEAPONS[w].primary() {
+                    self.primary = prev;
+                    if self.primary.is_none() && self.sel == Sel::Primary {
+                        self.select(Sel::Secondary);
+                    }
+                } else {
+                    self.secondary = prev;
+                }
+                self.reload = None;
+                self.scoped = 0;
+            }
+            BuyItem::Nade(n) => {
+                let k = &mut self.nades[n.index()];
+                *k = k.saturating_sub(1);
+            }
+            BuyItem::Gear(_) => {}
         }
     }
 }

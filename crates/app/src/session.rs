@@ -115,6 +115,9 @@ pub struct Session {
     /// (état, position du porteur).
     bomb_fly: Option<(Vec3, Vec3, f32)>,
     bomb_last: (u8, Option<Vec3>),
+    /// (v177) Bombe posée : temps avant le prochain bip, et voyant allumé (s).
+    bomb_beep: f32,
+    bomb_flash: f32,
     /// Caméra adoucie sur les marches (montée ou descente d'une dalle) : décalage de la vue
     /// qui revient à 0 en un dixième de seconde, et hauteur au sol de l'image d'avant.
     step_offset: f32,
@@ -443,6 +446,8 @@ impl Session {
             ground_seen: std::collections::HashSet::new(),
             bomb_fly: None,
             bomb_last: (0, None),
+            bomb_beep: 0.0,
+            bomb_flash: 0.0,
             tick_acc: 0.0,
             prev_pos: Vec3::ZERO,
             prev_crouch: 0.0,
@@ -1195,6 +1200,10 @@ impl Session {
                 for item in std::mem::take(&mut self.fps.requests) {
                     locals.extend(n.buy(item));
                 }
+                // (v177) Reventes (clic droit dans le menu d'achat).
+                for item in std::mem::take(&mut self.fps.sells) {
+                    locals.extend(n.sell(item));
+                }
                 // Armes : lâchées (G), ramassées (E près d'une arme au sol). Ce que chacun
                 // porte, c'est l'hôte qui le sait (achats, ramassages).
                 // Lancé en cloche devant soi : il retombe à environ 4 blocs.
@@ -1265,6 +1274,30 @@ impl Session {
                         if f.2 >= TOSS_FLIGHT || hud.bomb != bomb::DROPPED {
                             self.bomb_fly = None;
                         }
+                    }
+                    // (v177) Bombe posée : un bip de plus en plus rapproché (une fois par
+                    // seconde au début, moins de sept à la fin, pas plus), le voyant
+                    // s'allume à chaque bip ; puis l'explosion, qu'on entend de loin.
+                    let at = Vec3::from(hud.bomb_pos);
+                    let eye = self.player.eye();
+                    if hud.bomb == bomb::PLANTED {
+                        self.bomb_beep -= dt;
+                        if self.bomb_beep <= 0.0 {
+                            self.bomb_beep = bomb_beep_gap(hud.time);
+                            self.bomb_flash = 0.12;
+                            let d = (at - eye).length();
+                            self.fps.sounds.push((
+                                crate::audio::Sfx::BombBeep,
+                                0.0,
+                                1.0 / (1.0 + d / 12.0),
+                            ));
+                        }
+                    } else {
+                        self.bomb_beep = 0.0;
+                    }
+                    self.bomb_flash = (self.bomb_flash - dt).max(0.0);
+                    if hud.bomb == bomb::EXPLODED && self.bomb_last.0 == bomb::PLANTED {
+                        self.fps.bomb_blast(at, eye);
                     }
                     self.bomb_last = (
                         hud.bomb,
@@ -3724,10 +3757,20 @@ impl Session {
             && !self.fps.buy_open
             && !self.light_editor.open
             && !self.net_dead;
+        // (v177) Figé au départ d'une manche (pauses comprises), à la mi-temps, après la
+        // fin : on ne joue pas, on ne tire pas (ni grenade). Acheter, changer d'arme : oui.
+        let still = self.net.as_ref().is_some_and(|n| {
+            use minelib_net::game::phase;
+            matches!(
+                n.hud().phase,
+                phase::FREEZE | phase::HALFTIME | phase::GAME_OVER
+            )
+        });
+        let fire = free && !still;
         let k = &self.keys;
         let c = crate::fps::Controls {
-            trigger_pressed: free && k.pressed(input, Action::FpsFire),
-            trigger_held: free && k.held(input, Action::FpsFire),
+            trigger_pressed: fire && k.pressed(input, Action::FpsFire),
+            trigger_held: fire && k.held(input, Action::FpsFire),
             trigger_down: k.held(input, Action::FpsFire),
             reload: free && k.pressed(input, Action::FpsReload),
             scope: free && k.pressed(input, Action::FpsScope),
@@ -4997,7 +5040,8 @@ impl Session {
                 } else if r.pseudo.starts_with("Joueur ") {
                     None
                 } else {
-                    self.skins.of(&r.pseudo)
+                    // (v177) Les bots ont leur skin (leur visage, ici).
+                    self.skins.in_match(&r.pseudo, r.team)
                 };
                 if let Some(sk) = skin {
                     let inner = head - 4.0 * s;
@@ -5013,8 +5057,14 @@ impl Session {
                         ch,
                     );
                 }
-                // Bande du bas : couleur de l'équipe.
-                ui.rect(x + s, top + head, head - 2.0 * s, 3.0 * s, team_color(side));
+                // (v177) Bande du bas : la couleur du joueur pour ses coéquipiers (bots
+                // compris), celle de l'équipe pour les adversaires.
+                let band = if side == my_team {
+                    mate_color(r.color as usize)
+                } else {
+                    team_color(side)
+                };
+                ui.rect(x + s, top + head, head - 2.0 * s, 3.0 * s, band);
                 if !r.alive {
                     ui.rect(
                         x + 2.0 * s,
@@ -6031,7 +6081,9 @@ impl Session {
         let (cam, view, _) = self.view_camera();
         use crate::player_model::Held;
         let held = if fps_mode {
-            Some(Held::Stick([38, 38, 42]))
+            // (v177) Ce qu'on a en main, avec son vrai modèle (reflets, ombre : les deux bras
+            // tendus avec une arme à feu, comme les autres nous voient).
+            Some(Held::Gear(self.fps.held_weapon()))
         } else if self.game.mode.has_inventory() {
             match self.held_item() {
                 Some(Item::Block(b)) => Some(Held::Block(b)),
@@ -6093,7 +6145,9 @@ impl Session {
         // Partie en ligne : les autres joueurs.
         if let Some(n) = &self.net {
             for v in n.views().iter().filter(|v| v.alive) {
-                let held = (v.weapon != 255).then_some(Held::Stick([38, 38, 42]));
+                // (v177) Ce qu'il a en main, avec son vrai modèle : arme, couteau (255),
+                // grenade ou bombe.
+                let held = Some(Held::Gear(v.weapon));
                 let w = self.walks.get(&v.pseudo).copied().unwrap_or_default();
                 let other = crate::player_model::Pose {
                     feet: v.pos,
@@ -6104,7 +6158,8 @@ impl Session {
                     crouch: v.crouch,
                     light: sky_light(&self.world, eye_of(v.pos, v.crouch), self.daylight),
                     held,
-                    skin: self.skins.of(&v.pseudo),
+                    // (v177) Les bots aussi ont un skin, dessiné pour eux.
+                    skin: self.skins.in_match(&v.pseudo, v.team),
                 };
                 shadows.push((v.pos, crate::player_model::shadow_boxes(&other)));
                 if inside == Some(v.pseudo.as_str()) {
@@ -6112,7 +6167,9 @@ impl Session {
                 }
                 let layer = layers.layer(other.skin.as_ref(), renderer);
                 players.push(crate::player_model::instance(&other, layer));
-                model.extend(crate::player_model::held_model(&other));
+                // (v177) Le modèle de son arme de près, sa silhouette de loin.
+                let near = v.pos.distance_squared(cam) < GEAR_DETAIL * GEAR_DETAIL;
+                model.extend(crate::player_model::held_model(&other, near));
             }
             // Bombe sur le dos de celui qui la porte.
             for v in n
@@ -6120,7 +6177,8 @@ impl Session {
                 .iter()
                 .filter(|v| v.alive && inside != Some(v.pseudo.as_str()))
             {
-                if v.flags & minelib_net::game::FLAG_BOMB != 0 {
+                // (v177) Pas si elle est dans ses mains.
+                if v.flags & minelib_net::game::FLAG_BOMB != 0 && v.weapon != crate::cs::W_BOMB {
                     let back = Vec3::new(-v.yaw.sin(), 0.0, v.yaw.cos()) * 0.3;
                     model.extend(crate::player_model::bomb(
                         v.pos + back + Vec3::Y * 1.1,
@@ -6172,12 +6230,8 @@ impl Session {
             let hud = n.hud();
             use minelib_net::game::bomb;
             if matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED) {
-                let rate = if hud.bomb == bomb::PLANTED {
-                    1.0 + (40.0 - hud.time).max(0.0) / 8.0
-                } else {
-                    0.0
-                };
-                let blink = rate > 0.0 && (time * rate).fract() < 0.3;
+                // (v177) Le voyant s'allume à chaque bip.
+                let blink = hud.bomb == bomb::PLANTED && self.bomb_flash > 0.0;
                 let at = match self.bomb_fly {
                     Some((from, to, t)) if hud.bomb == bomb::DROPPED => toss_arc(from, to, t),
                     _ => Vec3::from(hud.bomb_pos),
@@ -7874,6 +7928,16 @@ fn toss_arc(from: Vec3, to: Vec3, t: f32) -> Vec3 {
     let k = (t / TOSS_FLIGHT).clamp(0.0, 1.0);
     let lift = 0.9 + (from.y - to.y).max(0.0) * 0.1;
     from.lerp(to, k) + Vec3::Y * lift * 4.0 * k * (1.0 - k)
+}
+
+/// (v177) Distance (blocs) jusqu'à laquelle l'arme des autres joueurs est dessinée avec son
+/// modèle (au-delà, sa silhouette).
+const GEAR_DETAIL: f32 = 40.0;
+
+/// (v177) Temps entre deux bips de la bombe posée, selon le temps qui lui reste (40 s au
+/// départ) : 1 s au début, 0,39 s à 5 s de la fin, 0,15 s tout à la fin.
+fn bomb_beep_gap(left: f32) -> f32 {
+    0.15 + 0.85 * (left / 40.0).clamp(0.0, 1.0).powf(0.6)
 }
 
 /// Yeux d'un joueur aux pieds `feet` (accroupi 0..1), comme `Player::eye`.

@@ -69,6 +69,12 @@ impl Skin {
         Ok(Arc::new(Skin { px, wide }))
     }
 
+    /// (v177) Skin dessiné par le jeu (64 × 64 pixels RGBA, format récent) : les bots.
+    pub fn from_pixels(px: Vec<[u8; 4]>) -> Arc<Skin> {
+        assert_eq!(px.len(), 64 * 64);
+        Arc::new(Skin { px, wide: true })
+    }
+
     /// Pixels RGBA (64 × 64, ligne par ligne), pour la carte graphique.
     pub fn rgba(&self) -> Vec<u8> {
         self.px.iter().flatten().copied().collect()
@@ -289,6 +295,8 @@ pub struct Skins {
     others: std::collections::HashMap<String, Option<Arc<Skin>>>,
     /// Pseudos à demander au relais (vus sans skin connu).
     wanted: std::cell::RefCell<Vec<String>>,
+    /// (v177) Skins des bots (nom, équipe), dessinés une fois.
+    bots: std::cell::RefCell<std::collections::HashMap<(String, u8), Arc<Skin>>>,
 }
 
 impl Skins {
@@ -317,6 +325,20 @@ impl Skins {
                 None
             }
         }
+    }
+
+    /// (v177) Skin d'un joueur d'une partie FPS : un bot a le sien (dessiné pour lui, selon
+    /// son équipe : `bot_skin`), les autres comme `of`.
+    pub fn in_match(&self, pseudo: &str, team: u8) -> Option<Arc<Skin>> {
+        if !pseudo.starts_with("BOT ") {
+            return self.of(pseudo);
+        }
+        let mut bots = self.bots.borrow_mut();
+        Some(
+            bots.entry((pseudo.to_string(), team))
+                .or_insert_with(|| crate::bot_skin::bot_skin(pseudo, team))
+                .clone(),
+        )
     }
 
     /// Redemande ce skin au relais (il a pu changer), en gardant celui connu d'ici là.

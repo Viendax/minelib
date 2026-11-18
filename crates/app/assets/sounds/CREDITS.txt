@@ -28,6 +28,9 @@ Grenades et couteau :
     licence du projet.
   ladder.ogg (barreaux d'échelle) — créé pour Minelib (chocs de bois synthétisés), sous la
     licence du projet.
+  bomb_beep.ogg (bip de la bombe posée), bomb_explode.ogg (son explosion) — créés pour
+    Minelib (sons de synthèse : notes pures et bruit filtré par ffmpeg), sous la licence du
+    projet.
   door_open.ogg, door_close.ogg (porte, trappe qu'on ouvre, qu'on ferme) — « Door Open,
     Door Close Set » (qubodup), CC0 — https://opengameart.org/content/door-open-door-close-set
     (DoorOpen08 et DoorClose09, raccourcis et égalisés).

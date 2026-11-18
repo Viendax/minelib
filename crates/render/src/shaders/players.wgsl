@@ -101,6 +101,20 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     if part == 2u {
         return upper;
     }
+    // (v177) Arme à feu (bit 17) : les deux bras tendus vers le regard, un peu tournés
+    // vers l'arme (`AIM_TURN_RIGHT`, `AIM_TURN_LEFT` de player_model.rs).
+    if (part == 3u || part == 4u) && (v.skin & 0x20000u) != 0u {
+        var side = -6.0;
+        var turn = -0.5;
+        var sign = -1.0;
+        if part == 4u {
+            side = 6.0;
+            turn = 0.15;
+            sign = 1.0;
+        }
+        return upper * m_trans(vec3<f32>(side, 10.0, 0.0)) * m_rot_y(turn)
+            * m_rot_x(1.5707964 + pitch + lean + swing * sign * 0.1);
+    }
     if part == 3u {
         return upper * m_trans(vec3<f32>(-6.0, 10.0, 0.0)) * m_rot_x(-swing + lean * 0.6);
     }

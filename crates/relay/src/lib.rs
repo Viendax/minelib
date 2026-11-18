@@ -7019,6 +7019,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                         game::ToHost::Fire { .. }
                             | game::ToHost::Throw { .. }
                             | game::ToHost::Buy(_)
+                            | game::ToHost::Sell(_)
                             | game::ToHost::Action { .. }
                             | game::ToHost::Team(_)
                             | game::ToHost::Drop { .. }

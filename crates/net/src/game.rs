@@ -87,7 +87,8 @@ pub struct NetPlayer {
     pub speed: f32,
     pub hp: u8,
     pub alive: bool,
-    /// Arme en main (indice dans la liste des armes, 255 = couteau ou rien).
+    /// Arme en main (indice dans la liste des armes, 255 = couteau ou rien ; (v177)
+    /// grenade : `ITEM_NADE` + type, bombe : 252).
     pub weapon: u8,
     pub kills: u16,
     pub deaths: u16,
@@ -473,6 +474,8 @@ pub enum ToHost {
     /// (v165) Son ping avec l'hôte (ms), mesuré par ses entrées confirmées : montré à tous
     /// dans le tableau des scores.
     Ping(u16),
+    /// (v177) Revente d'un achat de cette manche (code d'article comme `Buy`).
+    Sell(u16),
 }
 
 /// Messages d'un monde de construction en ligne (passent par les zones du relais).

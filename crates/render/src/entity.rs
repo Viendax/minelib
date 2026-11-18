@@ -80,6 +80,8 @@ pub struct PlayerInstance {
 impl PlayerInstance {
     /// Bit de `skin` : bras droit levé (objet tenu).
     pub const HOLDS: u32 = 1 << 16;
+    /// (v177) Bit de `skin` : arme à feu en main, les deux bras tendus vers le regard.
+    pub const AIMS: u32 = 1 << 17;
 }
 
 /// Demi-flottant (IEEE 754 binaire16) le plus proche d'un nombre positif (couleurs).

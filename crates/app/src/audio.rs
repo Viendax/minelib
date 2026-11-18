@@ -66,6 +66,9 @@ pub enum Sfx {
     Door(bool),
     /// Barreaux d'une échelle qu'on grimpe ou descend à pleine vitesse.
     Ladder,
+    /// (v177) Bip de la bombe posée (de plus en plus rapproché), et son explosion.
+    BombBeep,
+    BombBlast,
 }
 
 macro_rules! sounds {
@@ -75,6 +78,8 @@ macro_rules! sounds {
 }
 
 static FILES: &[(&str, &[u8])] = sounds!(
+    "bomb_beep",
+    "bomb_explode",
     "step_1",
     "step_2",
     "step_3",
@@ -291,6 +296,8 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
         Sfx::Door(true) => ("door_open", 0.8),
         Sfx::Door(false) => ("door_close", 0.8),
         Sfx::Ladder => ("ladder", 0.7),
+        Sfx::BombBeep => ("bomb_beep", 0.35),
+        Sfx::BombBlast => ("bomb_explode", 1.0),
         Sfx::Pain => {
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             const PAINS: [&str; 4] = ["pain_1", "pain_2", "pain_3", "pain_4"];
@@ -538,6 +545,8 @@ mod tests {
             Sfx::DrawNade,
             Sfx::ReloadEnd,
             Sfx::Hammer,
+            Sfx::BombBeep,
+            Sfx::BombBlast,
         ] {
             let (f, _) = file_of(s);
             assert!(FILES.iter().any(|x| x.0 == f));

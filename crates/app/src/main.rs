@@ -44,6 +44,7 @@
 mod account;
 mod anticheat;
 mod audio;
+mod bot_skin;
 mod bots;
 mod buildnet;
 mod chat;

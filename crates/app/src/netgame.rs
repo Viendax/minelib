@@ -297,6 +297,7 @@ pub fn witnessed(m: &ToHost) -> bool {
         ToHost::Fire { .. }
             | ToHost::Throw { .. }
             | ToHost::Buy(_)
+            | ToHost::Sell(_)
             | ToHost::Action { .. }
             | ToHost::Team(_)
             | ToHost::Drop { .. }
@@ -1010,6 +1011,10 @@ impl Auditor {
                             ToHost::Buy(item) => {
                                 let at = me.map(|p| p.pos);
                                 let _ = m.buy(who, *item, at);
+                            }
+                            ToHost::Sell(item) => {
+                                let at = me.map(|p| p.pos);
+                                let _ = m.sell(who, *item, at);
                             }
                             ToHost::Action { plant, defuse } => m.keys(who, *plant, *defuse),
                             ToHost::Team(team) => {
@@ -2225,6 +2230,29 @@ impl NetGame {
         out
     }
 
+    /// (v177) Revente d'un achat de cette manche (le code d'article de `game::ITEM_…`).
+    pub fn sell(&mut self, item: u16) -> Vec<Local> {
+        let mut out = Vec::new();
+        match self {
+            NetGame::Host(h) => {
+                h.record(0, Move::Rule(Rule::Msg(ToHost::Sell(item))));
+                match h.m.sell(0, item, Some(h.local_pos)) {
+                    Ok(()) => {
+                        if let Some(p) = h.m.players.get(&0) {
+                            out.push(Local::Guns {
+                                guns: p.guns,
+                                nades: p.nades,
+                            });
+                        }
+                    }
+                    Err(e) => out.push(Local::Notice(e)),
+                }
+            }
+            NetGame::Guest(g) => g.to_host(&ToHost::Sell(item)),
+        }
+        out
+    }
+
     /// Touches maintenues : poser la bombe, désamorcer.
     pub fn keys(&mut self, plant: bool, defuse: bool) {
         match self {
@@ -3344,6 +3372,29 @@ impl Host {
                 let at = self.feet_of(peer);
                 match self.m.buy(peer, item, at) {
                     Ok(()) => self.send_to(peer, &ToPeer::Give { item }),
+                    Err(e) => self.send_to(
+                        peer,
+                        &ToPeer::Chat {
+                            from: String::new(),
+                            text: e,
+                        },
+                    ),
+                }
+            }
+            // (v177) Revente : ce qu'il porte vraiment lui est redit (l'arme d'avant revient).
+            ToHost::Sell(item) => {
+                let at = self.feet_of(peer);
+                match self.m.sell(peer, item, at) {
+                    Ok(()) => {
+                        if let Some(p) = self.m.players.get(&peer) {
+                            let msg = ToPeer::Guns {
+                                primary: p.guns.0,
+                                secondary: p.guns.1,
+                                nades: p.nades,
+                            };
+                            self.send_to(peer, &msg);
+                        }
+                    }
                     Err(e) => self.send_to(
                         peer,
                         &ToPeer::Chat {
@@ -5173,7 +5224,10 @@ mod tests {
         assert!(!g.set_away(true), "sorti de la partie");
         let before = host_of(&mut g).m.time;
         step(&mut g, 2.0);
-        assert!(host_of(&mut g).m.time < before - 1.5, "elle continue sans lui");
+        assert!(
+            host_of(&mut g).m.time < before - 1.5,
+            "elle continue sans lui"
+        );
         assert!(g.set_away(false), "de retour tout de suite");
         let out = step(&mut g, 0.1);
         assert!(out.iter().any(|l| matches!(
