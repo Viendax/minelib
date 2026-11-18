@@ -6563,34 +6563,19 @@ impl Session {
             // Les plus proches d'abord (ombres, et place limitée sur la carte : au-delà de
             // `MAX_PLAYERS`, les plus lointains en trois pavés).
             // (v191) Des milliers de joueurs : la distance de chacun est calculée une fois
-            // (le tri la reprenait à chaque comparaison, des dizaines de milliers de fois),
-            // et celui qu'on ne peut pas voir — derrière la caméra, à côté de l'écran, ou
-            // au-delà du brouillard — ne coûte plus que ce test. Les ombres gardent les
-            // plus proches dans tous les sens : on voit l'ombre de celui qui est derrière.
+            // (le tri la reprenait à chaque comparaison, des dizaines de milliers de fois).
+            // (v192) Et ils sont **tous** préparés, où que regarde la caméra : la v191
+            // écartait ceux qui n'étaient pas dans son cône, on les voyait apparaître en
+            // tournant la tête. Jamais de joueur qui attend qu'on le regarde.
             let mut order: Vec<(f32, u32)> = others
                 .iter()
                 .enumerate()
                 .map(|(i, o)| (o.pos.distance_squared(cam), i as u32))
                 .collect();
             order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            let fog2 = (fog_end + 16.0) * (fog_end + 16.0);
-            // Cône de la caméra, large comme la diagonale de l'écran plus 15°.
-            let fwd = -Vec3::new(view.x_axis.z, view.y_axis.z, view.z_axis.z);
-            let aspect = (self.screen_size.0 / self.screen_size.1.max(1.0)).clamp(0.1, 10.0);
-            let cos_lim = view_cone_cos(fov, aspect);
             for (rank, &(d2, i)) in order.iter().enumerate() {
                 let o = &others[i as usize];
-                // Son ombre peut tomber dans l'écran : on le prépare quoi qu'il arrive.
                 let shadow = rank < 24 && d2 < 48.0 * 48.0;
-                if !shadow && d2 > 16.0 {
-                    if d2 > fog2 {
-                        continue;
-                    }
-                    let v = o.pos + Vec3::Y - cam;
-                    if v.dot(fwd) < cos_lim * v.length() {
-                        continue;
-                    }
-                }
                 let w = self.walks.get(o.pseudo);
                 let other = crate::player_model::Pose {
                     feet: o.pos,
@@ -7369,14 +7354,6 @@ fn stairs_placement(hit: &Hit, item: BlockId, look: Vec3, point: Vec3) -> Option
     minelib_world::registry::registry().by_key(&format!("stairs:{mat}:{dir}:{half}"))
 }
 
-/// (v191) Cosinus du demi-angle du cône de la caméra, pris large comme la diagonale de
-/// l'écran plus 15° : au-delà, un joueur ne peut pas être à l'écran, même un bras tendu
-/// ou son pseudo. Sert à ne pas préparer les milliers de joueurs qu'on ne voit pas.
-fn view_cone_cos(fov_y: f32, aspect: f32) -> f32 {
-    let half = ((fov_y * 0.5).tan() * (1.0 + aspect * aspect).sqrt()).atan() + 0.26;
-    half.min(1.5).cos()
-}
-
 /// Un autre joueur à dessiner : la construction en ligne, ou la foule d'essai.
 struct Other<'a> {
     pseudo: &'a str,
@@ -8028,54 +8005,6 @@ fn side_of_start(start: u8, i: u32) -> u8 {
         start
     } else {
         1 - start
-    }
-}
-
-#[cfg(test)]
-mod crowd_tests {
-    use super::*;
-
-    /// (v191) Les milliers de joueurs hors de l'écran ne sont plus préparés : le cône de
-    /// la caméra doit rester plus large que l'écran, sinon ils disparaîtraient au bord.
-    #[test]
-    fn nobody_visible_on_screen_is_left_out_of_the_cone() {
-        for (fov, aspect) in [(1.2f32, 16.0 / 9.0f32), (1.9, 21.0 / 9.0), (0.7, 1.0)] {
-            let cos_lim = view_cone_cos(fov, aspect);
-            let proj = glam::Mat4::perspective_infinite_reverse_rh(fov, aspect, 0.05);
-            // Caméra à l'origine, regardant vers -Z.
-            let fwd = -Vec3::Z;
-            let mut on_screen = 0;
-            for i in 0..40 {
-                for j in 0..40 {
-                    // Points tout autour de la caméra, à 30 blocs.
-                    let yaw = i as f32 / 40.0 * std::f32::consts::TAU;
-                    let pitch = (j as f32 / 40.0 - 0.5) * std::f32::consts::PI;
-                    let (sy, cy) = yaw.sin_cos();
-                    let v = Vec3::new(sy * pitch.cos(), pitch.sin(), -cy * pitch.cos()) * 30.0;
-                    let c = proj * v.extend(1.0);
-                    let inside = c.w > 0.0
-                        && c.x.abs() <= c.w
-                        && c.y.abs() <= c.w
-                        && v.dot(fwd) > 0.0;
-                    if inside {
-                        on_screen += 1;
-                        assert!(
-                            v.dot(fwd) >= cos_lim * v.length(),
-                            "joueur à l'écran écarté : fov {fov}, {yaw} / {pitch}"
-                        );
-                    }
-                }
-            }
-            assert!(on_screen > 20, "l'essai ne regarde personne à l'écran");
-        }
-    }
-
-    /// Et le cône écarte bien quelqu'un derrière soi (sinon il ne servirait à rien).
-    #[test]
-    fn someone_behind_the_camera_costs_nothing() {
-        let cos_lim = view_cone_cos(1.2, 16.0 / 9.0);
-        let behind = Vec3::new(0.0, 0.0, 30.0);
-        assert!(behind.dot(-Vec3::Z) < cos_lim * behind.length());
     }
 }
 
