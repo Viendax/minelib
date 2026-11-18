@@ -51,6 +51,18 @@ pub enum Cmd {
         cert: crate::sovereign::Cert,
         key: ed25519_dalek::SigningKey,
     },
+    /// (v146) Au fond d'un pays : quitte la partie au relais du monde sans quitter le monde
+    /// (ses provinces le servent), puis ferme la connexion (`Event::Dozed`).
+    Doze {
+        room: u64,
+    },
+    /// (v146) Revient au relais du monde (connexion neuve) après `Doze` : certificat de la
+    /// clé du compte signé par ce relais, et cette clé. Comme une reprise : `TakenOver`.
+    Wake {
+        room: u64,
+        cert: crate::sovereign::Cert,
+        key: ed25519_dalek::SigningKey,
+    },
     /// Reprend le monde sur son relais de secours (le relais du monde est tombé) : le
     /// certificat de la clé du compte signé par l'ancien relais du monde, et cette clé.
     Takeover {
@@ -437,6 +449,11 @@ pub enum Event {
     /// La connexion ouverte au relais vient d'être perdue (suivie de `LoggedOut` et d'une
     /// erreur).
     Lost,
+    /// (v146) `Doze` accepté : la connexion au relais du monde est fermée, la partie continue
+    /// par les relais des provinces.
+    Dozed {
+        room: u64,
+    },
     /// Le monde est repris par son relais de secours (le relais du monde est tombé) : la
     /// partie continue là, `host` en est le propriétaire.
     TakenOver {
@@ -842,7 +859,8 @@ impl Worker {
             | Response::ProvinceBulk { .. }
             | Response::ProvinceChildren { .. }
             | Response::ProvinceParent { .. }
-            | Response::ProvinceNeighbours { .. }) => Event::Province(r),
+            | Response::ProvinceNeighbours { .. }
+            | Response::ProvinceSlay { .. }) => Event::Province(r),
             Response::Provinces { list } => Event::Provinces(list),
             Response::ShardPeers { region, list, sov } => Event::ShardPeers { region, list, sov },
             Response::RootEdits {
@@ -1111,6 +1129,27 @@ impl Worker {
                     r => self.unexpected(r),
                 }
             }
+            Cmd::Doze { room } => match self.request(&Request::Doze { room })? {
+                Response::Dozed { room } => {
+                    // Plus rien à se dire : la connexion se ferme (sans `Lost`).
+                    self.chan = None;
+                    self.emit(Event::Dozed { room });
+                    Ok(())
+                }
+                r => self.unexpected(r),
+            },
+            Cmd::Wake { room, cert, key } => {
+                self.chan = None;
+                self.connect()?;
+                let challenge = match self.request(&Request::Wake {
+                    room,
+                    cert: cert.clone(),
+                })? {
+                    Response::TakeoverChallenge { challenge, .. } => challenge,
+                    r => return self.unexpected(r),
+                };
+                self.prove_takeover(cert, key, challenge)
+            }
             Cmd::Takeover { cert, key, expect } => {
                 self.chan = None;
                 self.connect()?;
@@ -1130,31 +1169,7 @@ impl Worker {
                         return Ok(());
                     }
                 }
-                use ed25519_dalek::Signer;
-                let signature = key.sign(&challenge).to_bytes().to_vec();
-                match self.request(&Request::TakeoverProve { signature })? {
-                    Response::Joined {
-                        room,
-                        host,
-                        map,
-                        map_sig,
-                    } => {
-                        self.pseudo = cert.pseudo.clone();
-                        self.emit(Event::Identity(key));
-                        if let Some(c) = &self.chan {
-                            self.emit(Event::Link(c.pusher()));
-                        }
-                        self.emit(Event::LoggedIn {
-                            pseudo: cert.pseudo,
-                            fingerprint: String::new(),
-                            totp: false,
-                        });
-                        let _ = (map, map_sig);
-                        self.emit(Event::TakenOver { room, host });
-                        Ok(())
-                    }
-                    r => self.unexpected(r),
-                }
+                self.prove_takeover(cert, key, challenge)
             }
             Cmd::RegionHost {
                 room,
@@ -1683,6 +1698,41 @@ impl Worker {
             .as_mut()
             .ok_or_else(|| anyhow!("pas connecté"))?
             .send(req)
+    }
+
+    /// Reprise (ou retour après `Doze`) : signe le défi avec la clé du compte ; entré, la
+    /// partie continue par cette connexion (`TakenOver`).
+    fn prove_takeover(
+        &mut self,
+        cert: crate::sovereign::Cert,
+        key: ed25519_dalek::SigningKey,
+        challenge: [u8; 32],
+    ) -> Result<()> {
+        use ed25519_dalek::Signer;
+        let signature = key.sign(&challenge).to_bytes().to_vec();
+        match self.request(&Request::TakeoverProve { signature })? {
+            Response::Joined {
+                room,
+                host,
+                map,
+                map_sig,
+            } => {
+                self.pseudo = cert.pseudo.clone();
+                self.emit(Event::Identity(key));
+                if let Some(c) = &self.chan {
+                    self.emit(Event::Link(c.pusher()));
+                }
+                self.emit(Event::LoggedIn {
+                    pseudo: cert.pseudo,
+                    fingerprint: String::new(),
+                    totp: false,
+                });
+                let _ = (map, map_sig);
+                self.emit(Event::TakenOver { room, host });
+                Ok(())
+            }
+            r => self.unexpected(r),
+        }
     }
 
     fn unexpected(&self, r: Response) -> Result<()> {

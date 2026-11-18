@@ -150,6 +150,18 @@ impl Handle {
         });
     }
 
+    /// (v146) Joueurs connectés ici dans cette partie, par pseudo (essais : ceux qui sont en
+    /// veille au fond d'un pays n'y sont plus).
+    pub fn players_here(&self, room: u64) -> Vec<String> {
+        let st = self.state.lock().unwrap();
+        let Some(r) = st.rooms.get(&room) else {
+            return Vec::new();
+        };
+        r.everyone()
+            .filter_map(|m| st.conns.get(&m)?.pseudo.clone())
+            .collect()
+    }
+
     /// (v143) Provinces de pays servies, telles que les pays les disent ici (essais).
     pub fn pays_children(&self) -> Vec<proto::ProvinceInfo> {
         self.state
@@ -354,6 +366,8 @@ impl Handle {
             Response::ProvinceNeighbours { epoch, list, .. } => {
                 provinces::neighbours(&mut st, *epoch, list.clone())
             }
+            // (v146) Un OP a tué un joueur qui n'est plus connecté au relais du monde.
+            Response::ProvinceSlay { pseudo, by, .. } => provinces::slay(&mut st, pseudo, by),
             _ => {}
         }
     }
@@ -1677,6 +1691,14 @@ enum Session {
         pseudo: String,
         key: [u8; 32],
         challenge: [u8; 32],
+    },
+    /// (v146) Relais du monde : un joueur revient du fond d'un pays (`Doze`), certificat
+    /// vérifié, signature du défi attendue ; il rentre dans la partie `room`.
+    Waking {
+        pseudo: String,
+        key: [u8; 32],
+        challenge: [u8; 32],
+        room: u64,
     },
     /// Relais de secours : témoin dont le certificat est vérifié, signature du défi
     /// attendue ; puis témoin entré (il dit sa liste et son vote, `WitnessBeat`).
@@ -3133,7 +3155,9 @@ fn local_servers(st: &State, kind: u8) -> Vec<proto::ServerEntry> {
             },
             name: r.name.clone(),
             map: r.map.clone(),
-            players: r.player_count() as u32,
+            // (v146) Au fond d'un pays, les joueurs ne sont plus connectés ici : comptés par
+            // les provinces.
+            players: provinces::world_players(r) as u32,
             max_players: r.max_players,
             region: st.cfg.name.clone(),
             relay_node: [0; 32],
@@ -5978,12 +6002,14 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     ) {
                         provinces::push_settings(st, &server);
                     }
-                    // Heure changée : à tous les joueurs du serveur.
+                    // Heure changée : à tous les joueurs du serveur (v146 : et par les
+                    // provinces, à ceux qui ne sont plus connectés ici).
                     if matches!(act, servers::Action::TimeSet | servers::Action::TimeFix) {
                         let (hours, fixed) = st.servers.time(&server);
                         for c in st.conns.values().filter(|c| c.room == Some(rid)) {
                             transport::push(&c.tx, &Response::SetTime { hours, fixed });
                         }
+                        provinces::push_time(st, &server, (hours, fixed));
                     }
                     // Nom affiché dans la liste des serveurs.
                     if act == servers::Action::Rename {
@@ -6018,6 +6044,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                                     },
                                 );
                             }
+                            // (v146) Au fond d'un pays, il n'est plus connecté ici : sa
+                            // province le lui dit (les modes partent à toutes).
+                            None if provinces::has_provinces(st, rid) => {}
                             None => {
                                 return Some(err(
                                     ErrorCode::Refused,
@@ -6042,6 +6071,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                                     },
                                 );
                             }
+                            // (v146) Au fond d'un pays : par les provinces.
+                            None if provinces::slay_down(st, rid, &target, pseudo) => {}
                             None => {
                                 return Some(err(
                                     ErrorCode::Refused,
@@ -6826,6 +6857,25 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             leave_room(st, id);
             Response::Left
         }
+        // (v146) Au fond d'un pays : le joueur quitte la partie ici sans quitter le monde
+        // (ses provinces le servent ; son sac de survie et sa position de retour sont chez
+        // elles). Il ferme ensuite sa connexion ; il reviendra avec son certificat (`Wake`).
+        Request::Doze { room } => {
+            let ok = my_room == Some(room)
+                && st
+                    .rooms
+                    .get(&room)
+                    .is_some_and(|r| r.kind == 1 && r.host != id && !r.provinces.is_empty());
+            if !ok {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Pas de veille ici (seulement au fond d'un pays).",
+                ));
+            }
+            leave_room(st, id);
+            log::debug!("monde {room} : « {pseudo} » en veille (au fond d'un pays)");
+            Response::Dozed { room }
+        }
         Request::ToHost { data } => {
             let rid = my_room?;
             // Fréquentation : écrire dans le tchat d'une partie, c'est parler à ses joueurs.
@@ -7157,6 +7207,7 @@ fn handle(
             | Request::RoomStarted { .. }
             | Request::Join { .. }
             | Request::Leave
+            | Request::Doze { .. }
             | Request::ToHost { .. }
             | Request::SetBackup { .. }
             | Request::Rtt { .. }
@@ -7464,6 +7515,61 @@ fn handle_account(
                 challenge,
                 proof: sb.proof.clone(),
             }
+        }
+        Request::Wake { room, cert } => {
+            // (v146) Relais du monde : un joueur qui l'avait quitté au fond d'un pays revient,
+            // avec le certificat de la clé de son compte signé ici pour ce monde.
+            let ok = st.province_room.is_none()
+                && st
+                    .rooms
+                    .get(&room)
+                    .is_some_and(|r| r.kind == 1 && !r.provinces.is_empty())
+                && cert.valid(&st.cert_key.verifying_key(), room)
+                && cert.expires >= now_secs();
+            if !ok {
+                return err(ErrorCode::WrongCredentials, "certificat");
+            }
+            let mut challenge = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut challenge);
+            *session = Session::Waking {
+                pseudo: cert.pseudo,
+                key: cert.key,
+                challenge,
+                room,
+            };
+            Response::TakeoverChallenge {
+                challenge,
+                proof: None,
+            }
+        }
+        Request::TakeoverProve { signature } if matches!(&*session, Session::Waking { .. }) => {
+            let Session::Waking {
+                pseudo,
+                key,
+                challenge,
+                room,
+            } = &*session
+            else {
+                return err(ErrorCode::NotLoggedIn, "");
+            };
+            let ok = VerifyingKey::from_bytes(key)
+                .ok()
+                .zip(Signature::from_slice(&signature).ok())
+                .is_some_and(|(k, s)| k.verify(challenge, &s).is_ok());
+            if !ok {
+                *session = Session::Anonymous;
+                return err(ErrorCode::WrongCredentials, "signature");
+            }
+            let (pseudo, key, room) = (pseudo.clone(), *key, *room);
+            *session = Session::LoggedIn {
+                pseudo: pseudo.clone(),
+            };
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.pseudo = Some(pseudo.clone());
+                c.account = Some(key);
+            }
+            log::info!("monde {room} : « {pseudo} » revient du fond d'un pays");
+            join_room(st, id, &pseudo, room)
         }
         Request::TakeoverProve { signature } => {
             let Session::TakingOver {

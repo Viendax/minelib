@@ -1062,6 +1062,33 @@ impl Game {
                         }
                     }
                 }
+                // (v146) Veille : la connexion au relais du monde est fermée ; la connexion de
+                // garant aussi (sauf si elle tient un relais), elle reviendra avec nous.
+                Event::Dozed { .. } => {
+                    if let Some(b) = self.session.as_mut().and_then(|s| s.build.as_mut()) {
+                        b.set_dozing();
+                    }
+                    if !self.garant_worker.as_ref().is_some_and(|w| w.hosting()) {
+                        self.garant_worker = None;
+                        self.garant_worker_tried = false;
+                    }
+                }
+                // (v146) De retour au relais du monde (le même) : la partie continue telle
+                // quelle, par la nouvelle connexion.
+                Event::TakenOver { .. }
+                    if self
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.build.as_ref())
+                        .is_some_and(|b| b.is_dozing()) =>
+                {
+                    if let (Some(b), Some(link)) = (
+                        self.session.as_mut().and_then(|s| s.build.as_mut()),
+                        self.accounts.link.clone(),
+                    ) {
+                        b.woke(link);
+                    }
+                }
                 // Le relais du monde est tombé, son relais de secours a repris le monde : la
                 // partie continue, par la nouvelle connexion.
                 Event::TakenOver { host, .. } => {
@@ -1149,6 +1176,19 @@ impl Game {
             && self.session.as_ref().is_some_and(|s| {
                 (s.net.is_some() && s.game.mode == save::GameMode::Fps) || s.build.is_some()
             });
+        // (v146) En veille, pas de connexion de garant au relais du monde non plus (sauf
+        // celle qui tient un relais) : elle reviendra avec nous.
+        if playing && self.accounts.dozing() {
+            if !self
+                .garant_worker
+                .as_ref()
+                .is_some_and(|w| w.hosting() && w.alive())
+            {
+                self.garant_worker = None;
+                self.garant_worker_tried = false;
+            }
+            return;
+        }
         if playing {
             if self.garant_worker.is_none() && !self.garant_worker_tried {
                 self.garant_worker_tried = true;
@@ -1423,10 +1463,44 @@ impl Game {
             }
         }
         if let Some(s) = &mut self.session {
+            // (v146) Son skin, déposé chez chaque province où l'on entre ; en veille, ceux des
+            // autres sont demandés aux provinces (le relais du monde n'est plus joint).
+            if let Some(b) = s.build.as_mut().filter(|b| !b.has_skin()) {
+                b.set_skin(std::fs::read(self.paths.root.join("skin.png")).unwrap_or_default());
+            }
+            let dozing = self.accounts.dozing();
             for p in s.skins.take_wanted() {
-                self.accounts.room(Cmd::SkinGet(p));
+                match s.build.as_ref().filter(|_| dozing) {
+                    Some(b) => b.ask_skin(&p),
+                    None => self.accounts.room(Cmd::SkinGet(p)),
+                }
+            }
+            if let Some(b) = s.build.as_mut() {
+                for (p, png) in b.take_skins() {
+                    s.skins.received(&p, &png);
+                }
             }
         }
+    }
+
+    /// (v146) Au fond d'un pays : la connexion au relais du monde se ferme (veille), et se
+    /// rouvre quand il le faut ; les messages des OP arrivés pendant ce temps par les
+    /// provinces sont traités comme ceux du relais du monde.
+    fn doze_upkeep(&mut self) {
+        let Some(b) = self.session.as_mut().and_then(|s| s.build.as_mut()) else {
+            return;
+        };
+        if self.accounts.dozing() {
+            if b.wake_needed() {
+                self.accounts.wake();
+            }
+        } else if b.doze_ready() {
+            if let Some(room) = b.room() {
+                self.accounts.doze(room);
+            }
+        }
+        let notices = b.take_notices();
+        self.accounts.game_events.extend(notices);
     }
 
     /// Carte jouée en partie FPS en ligne : on la gardera disponible pour les autres.
@@ -2978,6 +3052,7 @@ impl GameLoop for Game {
 
         // Relais : réponses, partie en ligne.
         self.poll_accounts();
+        self.doze_upkeep();
         self.handle_game_events();
         self.skin_upkeep();
         self.maps_upkeep();

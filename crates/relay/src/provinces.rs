@@ -968,7 +968,7 @@ pub(crate) fn lease(
     let big_world = if pays {
         room.province.as_ref().is_some_and(|p| !p.to_root)
     } else {
-        room.members.len().saturating_sub(room.hidden.len()) >= copies_until
+        world_players(room) >= copies_until
     };
     let (mut copies, mut dump) = (true, 0);
     let ok = match room
@@ -1465,13 +1465,94 @@ pub(crate) fn settings_of(st: &State, server: &str) -> proto::ProvinceSettings {
         ops: st.servers.ops(server),
         bans: st.servers.bans(server),
         modes: st.bags.modes_of(server),
+        time: None,
     }
 }
 
 /// Relais du monde : les réglages de ce serveur ont changé ; à chaque relais de province de
 /// ses mondes.
 pub(crate) fn push_settings(st: &State, server: &str) {
-    let settings = settings_of(st, server);
+    push_these(st, server, settings_of(st, server));
+}
+
+/// (v146) Relais du monde : un OP a changé l'heure ; les provinces la disent à leurs joueurs
+/// (ceux qui, au fond d'un pays, ne sont plus connectés ici).
+pub(crate) fn push_time(st: &State, server: &str, time: (f32, bool)) {
+    let mut settings = settings_of(st, server);
+    settings.time = Some(time);
+    push_these(st, server, settings);
+}
+
+/// (v146) Joueurs d'un monde : ceux qui sont connectés ici, ou ceux que comptent ses
+/// provinces s'ils sont plus nombreux (au fond d'un pays, un joueur n'est plus connecté ici ;
+/// ailleurs, il l'est encore, et sa province le compte aussi).
+pub(crate) fn world_players(room: &super::Room) -> usize {
+    let here = room.player_count();
+    let below: usize = room
+        .provinces
+        .values()
+        .filter_map(|r| r.counts.as_ref())
+        .flatten()
+        .map(|(_, n)| *n as usize)
+        .sum();
+    here.max(below)
+}
+
+/// (v146) Ce monde a-t-il des provinces confiées (des joueurs peuvent y être sans être
+/// connectés ici) ?
+pub(crate) fn has_provinces(st: &State, rid: u64) -> bool {
+    st.rooms
+        .get(&rid)
+        .is_some_and(|r| r.provinces.values().any(|p| p.info.is_some()))
+}
+
+/// (v146) Relais du monde (ou d'un pays) : un OP a tué ce joueur, qui n'est pas connecté ici
+/// (au fond d'un pays) : à chaque province servie, qui le lui dit s'il est chez elle (un pays
+/// le redit aux siennes). Faux : aucune province.
+pub(crate) fn slay_down(st: &State, rid: u64, pseudo: &str, by: &str) -> bool {
+    let Some(room) = st.rooms.get(&rid) else {
+        return false;
+    };
+    let mut sent = false;
+    for r in room.provinces.values().filter(|r| r.info.is_some()) {
+        if let Some(c) = st.conns.get(&r.host) {
+            transport::push(
+                &c.tx,
+                &Response::ProvinceSlay {
+                    room: rid,
+                    pseudo: pseudo.chars().take(32).collect(),
+                    by: by.chars().take(32).collect(),
+                },
+            );
+            sent = true;
+        }
+    }
+    sent
+}
+
+/// (v146) Relais de province : `ProvinceSlay` reçu de plus haut ; au joueur s'il est ici, et
+/// (pays) à ses provinces.
+pub(crate) fn slay(st: &mut State, pseudo: &str, by: &str) {
+    let Some(rid) = st.province_room else {
+        return;
+    };
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    for m in room.members.iter().filter(|m| !room.hidden.contains(m)) {
+        if let Some(c) = st.conns.get(m).filter(|c| {
+            c.pseudo
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(pseudo))
+        }) {
+            transport::push(&c.tx, &Response::Slain { by: by.to_string() });
+        }
+    }
+    slay_down(st, rid, pseudo, by);
+}
+
+/// Réglages `settings` à chaque relais de province des mondes de ce serveur.
+fn push_these(st: &State, server: &str, settings: proto::ProvinceSettings) {
     for (&rid, room) in st.rooms.iter().filter(|(_, r)| r.server == server) {
         for r in room.provinces.values() {
             if let Some(c) = st.conns.get(&r.host) {
@@ -3952,9 +4033,41 @@ pub(crate) fn settings(st: &mut State, settings: proto::ProvinceSettings) {
         })
         .copied()
         .collect();
+    // (v146) Mode de chacun de ses joueurs avant : celui qu'un OP vient de changer le lui
+    // dit (au fond d'un pays, il n'est plus connecté au relais du monde).
+    let before: Vec<(u64, String, Option<String>)> = room
+        .members
+        .iter()
+        .filter(|m| !room.hidden.contains(m))
+        .filter_map(|m| {
+            let p = st.conns.get(m)?.pseudo.clone()?;
+            let mode = st.bags.mode(&server, &p).map(str::to_string);
+            Some((*m, p, mode))
+        })
+        .collect();
     st.servers.mirror(&server, &settings);
     for (who, m) in &settings.modes {
         st.bags.set_mode(&server, who, m);
+    }
+    for (m, p, old) in before {
+        let now = st.bags.mode(&server, &p).map(str::to_string);
+        if let (Some(mode), Some(c)) = (now.filter(|n| Some(n) != old.as_ref()), st.conns.get(&m)) {
+            transport::push(
+                &c.tx,
+                &Response::SetGamemode {
+                    mode: mode.chars().take(16).collect(),
+                    by: String::new(),
+                },
+            );
+        }
+    }
+    // (v146) L'heure, qu'un OP vient de changer.
+    if let (Some((hours, fixed)), Some(room)) = (settings.time, st.rooms.get(&rid)) {
+        for m in room.members.iter().filter(|m| !room.hidden.contains(m)) {
+            if let Some(c) = st.conns.get(m) {
+                transport::push(&c.tx, &Response::SetTime { hours, fixed });
+            }
+        }
     }
     for id in banned {
         leave_room(st, id);
@@ -3962,8 +4075,10 @@ pub(crate) fn settings(st: &mut State, settings: proto::ProvinceSettings) {
             transport::push(&c.tx, &Response::RoomClosed);
         }
     }
-    // (v143) Un pays : à ses provinces aussi.
-    push_settings(st, &server);
+    // (v143) Un pays : à ses provinces aussi (v146 : avec l'heure, si elle vient de changer).
+    let mut down = settings_of(st, &server);
+    down.time = settings.time;
+    push_these(st, &server, down);
 }
 
 /// (v143) Relais de pays : l'hôte d'une de ses provinces (ou de son relais de secours) entre,

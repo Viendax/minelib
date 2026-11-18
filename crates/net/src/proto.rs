@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 44;
+pub const PROTOCOL: u32 = 45;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -504,6 +504,19 @@ pub enum Request {
         node: [u8; 32],
         addr: String,
         key: [u8; 32],
+    },
+    /// (v146) Au fond d'un pays (tout ce qu'on a en vue est servi par ses provinces) : le
+    /// joueur quitte la partie au relais du monde sans quitter le monde, puis ferme sa
+    /// connexion. Réponse : `Dozed`.
+    Doze {
+        room: u64,
+    },
+    /// (v146) Retour au relais du monde d'un joueur qui l'avait quitté ainsi : certificat
+    /// de la clé de son compte, signé par ce relais pour ce monde. Réponse :
+    /// `TakeoverChallenge`, puis (`TakeoverProve`) `Joined`.
+    Wake {
+        room: u64,
+        cert: crate::sovereign::Cert,
     },
     /// (v143) Hôte d'une province d'un pays (ou de son relais de secours) → relais du pays :
     /// il entre, avec le jeton que le relais du monde lui a donné avec sa tâche (voir
@@ -1235,6 +1248,18 @@ pub enum Response {
     Slain {
         by: String,
     },
+    /// (v146) Réponse à `Doze` : plus rien à se dire (la connexion se ferme).
+    Dozed {
+        room: u64,
+    },
+    /// (v146) Relais du monde → relais de ses provinces (et d'un pays → ses provinces) : un
+    /// OP a tué ce joueur, qui n'est pas connecté au relais du monde (au fond d'un pays) ;
+    /// la province où il se trouve le lui dit.
+    ProvinceSlay {
+        room: u64,
+        pseudo: String,
+        by: String,
+    },
     /// L'hôte est parti : `host` reprend la partie.
     HostChanged {
         host: String,
@@ -1369,6 +1394,7 @@ impl Response {
                 | Response::ProvinceChildren { .. }
                 | Response::ProvinceParent { .. }
                 | Response::ProvinceNeighbours { .. }
+                | Response::ProvinceSlay { .. }
                 // (Relais de secours et gardiens, v133 à v135 : poussés eux aussi ; une
                 // requête en cours ne doit pas les prendre pour sa réponse.)
                 | Response::StandbyTask { .. }
@@ -1559,6 +1585,9 @@ pub struct ProvinceSettings {
     pub ops: Vec<String>,
     pub bans: Vec<String>,
     pub modes: Vec<(String, String)>,
+    /// (v146) Heure du serveur (heures, figée), quand un OP vient de la changer : la
+    /// province la dit à ses joueurs (ceux qui ne sont plus connectés au relais du monde).
+    pub time: Option<(f32, bool)>,
 }
 
 /// Province d'un relais de région (dans `ShardTask`) : où la joindre, et le jeton qui

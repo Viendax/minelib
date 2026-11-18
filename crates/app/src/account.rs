@@ -334,7 +334,21 @@ pub struct Accounts {
     /// Le monde a été repris : le relais qui le sert désormais (la connexion de garant y
     /// entre avec le certificat de la clé du compte).
     world_at: Option<proto::StandbyAt>,
+    /// (v146) Veille : au fond d'un pays, la connexion au relais du monde est fermée (monde
+    /// `room`) ; les commandes pour lui attendent qu'on y revienne. Demande envoyée ; retour
+    /// en cours (depuis quand) et retours ratés.
+    dozing: Option<u64>,
+    doze_sent: bool,
+    doze_queue: Vec<Cmd>,
+    waking: Option<std::time::Instant>,
+    wake_next: Option<std::time::Instant>,
+    wake_fails: u8,
 }
+
+/// (v146) Retour au relais du monde après la veille : nouvel essai au bout de… ; au-delà de
+/// tant d'essais ratés, on quitte le monde.
+const WAKE_RETRY: Duration = Duration::from_secs(3);
+const WAKE_GIVE_UP: u8 = 4;
 
 impl Accounts {
     pub fn new(relay_addr: String, relay_key: &str, relay_dir: PathBuf, pseudo: String) -> Self {
@@ -386,6 +400,12 @@ impl Accounts {
             probe: None,
             probe_next: None,
             world_at: None,
+            dozing: None,
+            doze_sent: false,
+            doze_queue: Vec::new(),
+            waking: None,
+            wake_next: None,
+            wake_fails: 0,
         }
     }
 
@@ -610,8 +630,11 @@ impl Accounts {
         let now = std::time::Instant::now();
         let silent = self.standby.is_some()
             && self.last_heard.elapsed() > Duration::from_millis(guard::SILENT_MS);
-        let want_probe =
-            (self.world_paused || silent) && self.taking_over.is_none() && self.can_take_over();
+        // (En veille, le relais du monde ne nous dit plus rien : ce n'est pas un silence.)
+        let want_probe = (self.world_paused || silent)
+            && self.taking_over.is_none()
+            && self.can_take_over()
+            && self.dozing.is_none();
         if !want_probe {
             self.probe = None;
             self.probe_next = None;
@@ -656,6 +679,46 @@ impl Accounts {
         let mut go_home = false;
         for e in events {
             match e {
+                // (v146) Veille : la connexion au relais du monde est fermée, la partie
+                // continue par les provinces.
+                Event::Dozed { room } => {
+                    log::info!("monde {room} : veille (au fond d'un pays)");
+                    self.dozing = Some(room);
+                    self.doze_sent = false;
+                    self.client = None;
+                    self.link = None;
+                    self.probe = None;
+                    self.probe_next = None;
+                    self.game_events.push(Event::Dozed { room });
+                    break;
+                }
+                // (v146) De retour au relais du monde (le même) : ce qui attendait part.
+                Event::TakenOver { .. } if self.waking.is_some() => {
+                    log::info!("veille finie : de retour au relais du monde");
+                    self.waking = None;
+                    self.wake_next = None;
+                    self.wake_fails = 0;
+                    self.dozing = None;
+                    self.last_heard = now;
+                    if let Some(c) = &self.client {
+                        for cmd in self.doze_queue.drain(..) {
+                            c.send(cmd);
+                        }
+                    }
+                    self.game_events.push(e);
+                }
+                Event::Error(m) | Event::Offline(m) if self.waking.is_some() => {
+                    self.wake_failed(&m);
+                    break;
+                }
+                Event::Lost | Event::LoggedOut if self.waking.is_some() => {
+                    self.wake_failed("connexion perdue");
+                    break;
+                }
+                // (Veille refusée par le relais du monde : on n'insiste pas dans ce monde.)
+                Event::Error(m) if self.doze_sent && self.dozing.is_none() => {
+                    log::info!("veille refusée : {m}");
+                }
                 Event::Pinned(k) => {
                     if !self.lan_relay {
                         self.relay_key = Some(k);
@@ -918,8 +981,108 @@ impl Accounts {
 
     /// Commande de partie (héberger, rejoindre, quitter).
     pub fn room(&mut self, cmd: Cmd) {
+        // (v146) En veille : quitter le monde n'a rien à dire au relais du monde ; le reste
+        // attend qu'on y revienne.
+        if self.dozing.is_some() {
+            if matches!(cmd, Cmd::Leave) {
+                self.end_doze();
+            } else {
+                if self.doze_queue.len() < 64 {
+                    self.doze_queue.push(cmd);
+                }
+                self.wake();
+            }
+            return;
+        }
         if self.logged_in() {
             self.client().send(cmd);
+        }
+    }
+
+    /// (v146) Peut-on se mettre en veille (et revenir) : connecté au relais du monde, avec
+    /// le certificat et la clé du compte, sans reprise ni pause en cours.
+    pub fn can_doze(&self) -> bool {
+        self.dozing.is_none()
+            && !self.doze_sent
+            && self.client.is_some()
+            && self.logged_in()
+            && self.cert.is_some()
+            && self.identity.is_some()
+            && self.relay_at.is_some()
+            && self.taking_over.is_none()
+            && self.probe.is_none()
+            && !self.world_paused
+    }
+
+    /// (v146) Au fond d'un pays : veille (le relais du monde n'a plus rien à nous dire).
+    pub fn doze(&mut self, room: u64) {
+        if !self.can_doze() {
+            return;
+        }
+        self.doze_sent = true;
+        if let Some(c) = &self.client {
+            c.send(Cmd::Doze { room });
+        }
+    }
+
+    pub fn dozing(&self) -> bool {
+        self.dozing.is_some()
+    }
+
+    /// (v146) Retour au relais du monde après la veille : connexion neuve, avec le
+    /// certificat de la clé du compte (ni mot de passe ni code à redemander).
+    pub fn wake(&mut self) {
+        let Some(room) = self.dozing else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if self.waking.is_some() || self.wake_next.is_some_and(|t| now < t) {
+            return;
+        }
+        let (Some(cert), Some(key), Some((addr, rkey))) = (
+            self.cert.clone(),
+            self.identity.clone(),
+            self.relay_at.clone(),
+        ) else {
+            return;
+        };
+        let client = Client::spawn(addr, Some(rkey));
+        client.send(Cmd::Wake { room, cert, key });
+        self.client = Some(client);
+        self.waking = Some(now);
+    }
+
+    /// Retour raté : nouvel essai bientôt ; au bout de quelques-uns, on quitte le monde.
+    fn wake_failed(&mut self, why: &str) {
+        log::warn!("retour au relais du monde raté : {why}");
+        self.client = None;
+        self.link = None;
+        self.waking = None;
+        self.wake_fails += 1;
+        if self.wake_fails >= WAKE_GIVE_UP {
+            self.end_doze();
+            self.game_events.push(Event::RoomClosed);
+            return;
+        }
+        self.wake_next = Some(std::time::Instant::now() + WAKE_RETRY);
+    }
+
+    /// (v146) Fin de la veille sans revenir dans le monde (on le quitte) : la session du
+    /// compte se rouvre.
+    fn end_doze(&mut self) {
+        if self.dozing.take().is_none() {
+            return;
+        }
+        self.doze_queue.clear();
+        self.waking = None;
+        self.wake_next = None;
+        self.wake_fails = 0;
+        self.client = None;
+        self.link = None;
+        if self.remembered().is_some() {
+            self.auto_login();
+        } else {
+            self.account = None;
         }
     }
 
@@ -969,6 +1132,8 @@ impl Accounts {
 
     /// Quitter un monde : plus de relais de secours à rejoindre.
     pub fn forget_standby(&mut self) {
+        self.doze_sent = false;
+        self.end_doze();
         self.standby = None;
         self.world_at = None;
         self.taking_over = None;

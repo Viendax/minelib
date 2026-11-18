@@ -409,8 +409,10 @@ impl ProvinceHost {
                 self.parent_standby = standby.clone();
                 Vec::new()
             }
-            // Réglages du serveur (OP, bannis, modes).
-            Response::ProvinceSettings { room, .. } if *room == self.room => {
+            // Réglages du serveur (OP, bannis, modes) ; (v146) joueur tué par un OP.
+            Response::ProvinceSettings { room, .. } | Response::ProvinceSlay { room, .. }
+                if *room == self.room =>
+            {
                 self.handle.province_event(r);
                 Vec::new()
             }

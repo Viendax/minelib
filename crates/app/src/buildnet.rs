@@ -202,6 +202,34 @@ enum Authority {
 
 /// Un relais de province perdu est rappelé au plus toutes les… (s).
 const PROVINCE_RETRY: f32 = 1.0;
+/// (v146) Au fond d'un pays depuis ce temps (s) : veille (le jeu ferme sa connexion au
+/// relais du monde, qui n'a plus rien à lui dire).
+const DOZE_AFTER: f32 = 5.0;
+/// En veille, ce qu'on voit n'est plus tout servi par des provinces où l'on est entré
+/// depuis ce temps (s) : retour au relais du monde.
+const WAKE_AFTER: f32 = 4.0;
+/// Pas de veille avec un certificat qui expire dans moins de… (s) : on ne pourrait pas
+/// revenir.
+const DOZE_CERT_MIN: u64 = 3600;
+/// Demandes au relais du monde gardées pendant la veille, au plus.
+const DOZE_QUEUE_MAX: usize = 256;
+
+/// (v146) Un skin que les relais acceptent : PNG de 64 × 64 (ou 64 × 32), 24 Ko au plus.
+fn skin_ok(png: &[u8]) -> bool {
+    const MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if png.len() > 24 * 1024 || png.len() < 33 || png[..8] != MAGIC || &png[12..16] != b"IHDR" {
+        return false;
+    }
+    let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+    let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+    w == 64 && (h == 64 || h == 32)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 /// Demandes d'objets parties à des relais de province dont on garde la trace, au plus.
 const ITEM_ASKED_MAX: usize = 4096;
 /// Chunks autour de soi dont le relais du monde annonce les relais (comme `SHARD_VIEW` du
@@ -293,6 +321,20 @@ pub struct BuildNet {
     /// position qu'il a reçue.
     was_deep: bool,
     root_province: Option<PKey>,
+    /// (v146) Veille : au fond d'un pays, plus de connexion au relais du monde. Ce qui devait
+    /// lui partir attend qu'on y revienne (`woke`) ; on y revient quand il le faut.
+    dozing: bool,
+    doze_queue: std::cell::RefCell<Vec<Request>>,
+    wake_wanted: std::cell::Cell<bool>,
+    /// Depuis combien de temps la veille est possible ; en veille, depuis combien de temps
+    /// ce qu'on voit n'est plus tout servi par des provinces où l'on est entré.
+    doze_t: f32,
+    wake_t: f32,
+    /// (v146) Son skin, déposé chez chaque province où l'on entre ; skins reçus des provinces
+    /// (en veille) ; messages des OP arrivés par elles (mode, mort, heure), en veille.
+    skin_png: Option<Vec<u8>>,
+    skins_in: Vec<(String, Vec<u8>)>,
+    notices: Vec<Event>,
 }
 
 /// Bloc remis par un relais de région : celui d'avant, celui remis, son rang ; et si
@@ -475,6 +517,14 @@ impl BuildNet {
             item_asked: HashMap::new(),
             was_deep: false,
             root_province: None,
+            dozing: false,
+            doze_queue: std::cell::RefCell::new(Vec::new()),
+            wake_wanted: std::cell::Cell::new(false),
+            doze_t: 0.0,
+            wake_t: 0.0,
+            skin_png: None,
+            skins_in: Vec::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -715,6 +765,14 @@ impl BuildNet {
         let mut voice = Vec::new();
         let mut lists_changed = false;
         let mut kids_lists = Vec::new();
+        // (v146) Son skin, déposé chez chaque province où l'on entre ; skins et messages
+        // des OP qu'elles nous font passer (en veille : seulement ceux de la province où l'on
+        // est, chacune de celles où l'on est entré les redit).
+        let skin = self.skin_png.clone().filter(|p| skin_ok(p));
+        let dozing = self.dozing;
+        let here = self.best(proto::region_of(chunk)).map(pkey);
+        let mut skins = Vec::new();
+        let mut notices = Vec::new();
         for (p, c) in &mut self.provinces {
             while let Some(e) = c.client.poll() {
                 match e {
@@ -750,6 +808,15 @@ impl BuildNet {
                         c.sent_chunk = None;
                         c.served_sent = None;
                         lists_changed = true;
+                        if let Some(png) = &skin {
+                            c.client.send(Cmd::SkinPut(png.clone()));
+                        }
+                    }
+                    Event::Skin { pseudo, png } if !png.is_empty() => skins.push((pseudo, png)),
+                    Event::SetGamemode { .. } | Event::Slain(_) | Event::SetTime { .. }
+                        if dozing && here == Some(*p) =>
+                    {
+                        notices.push(e)
                     }
                     // (v143) Relais de pays : les provinces qu'il confie, en vue.
                     Event::Provinces(list) => {
@@ -788,6 +855,8 @@ impl BuildNet {
         // Objets gardés par le relais du monde : ils entrent dans la partie.
         self.item_inbox.extend(items_ok);
         self.voice_in.extend(voice);
+        self.skins_in.extend(skins);
+        self.notices.extend(notices);
         for (serial, list) in confirmed {
             if let Some(m) = self.heard.get_mut(&serial) {
                 for (pos, seq) in list {
@@ -1143,7 +1212,136 @@ impl BuildNet {
     }
 
     fn send(&self, req: Request) {
+        if self.dozing {
+            // (v146) En veille : le relais du monde ne nous suit plus (positions, voix,
+            // régions servies, retours : rien à lui dire) ; le reste attend qu'on y revienne.
+            if !matches!(
+                req,
+                Request::Position { .. }
+                    | Request::Served { .. }
+                    | Request::Spot { .. }
+                    | Request::Nearby { .. }
+                    | Request::VoiceTo { .. }
+            ) {
+                let mut q = self.doze_queue.borrow_mut();
+                if q.len() < DOZE_QUEUE_MAX {
+                    q.push(req);
+                }
+                self.wake_wanted.set(true);
+            }
+            return;
+        }
         transport::push(&self.link, &req);
+    }
+
+    /// (v146) La veille est possible : le jeu peut fermer sa connexion au relais du monde.
+    pub fn doze_ready(&self) -> bool {
+        !self.dozing && self.doze_t >= DOZE_AFTER
+    }
+
+    /// (v146) En veille, il faut revenir au relais du monde.
+    pub fn wake_needed(&self) -> bool {
+        self.dozing && self.wake_wanted.get()
+    }
+
+    pub fn is_dozing(&self) -> bool {
+        self.dozing
+    }
+
+    /// Le monde (du billet).
+    pub fn room(&self) -> Option<u64> {
+        self.shards.ticket.as_ref().map(|t| t.0)
+    }
+
+    /// (v146) Veille commencée : la connexion au relais du monde est fermée.
+    pub fn set_dozing(&mut self) {
+        self.dozing = true;
+        self.doze_t = 0.0;
+        self.wake_t = 0.0;
+        self.wake_wanted.set(false);
+    }
+
+    /// (v146) De retour au relais du monde, par cette connexion neuve (le même monde : les
+    /// provinces restent). Il réapprend où l'on est et quelles régions nous servent ; ce qui
+    /// attendait part.
+    pub fn woke(&mut self, link: Sender<Inbound>) {
+        self.link = link;
+        self.dozing = false;
+        self.doze_t = 0.0;
+        self.wake_t = 0.0;
+        self.wake_wanted.set(false);
+        self.chunk = None;
+        self.was_deep = false;
+        self.root_province = None;
+        self.served_sent = vec![[i32::MIN; 2]];
+        self.caps_sent = false;
+        for r in self.doze_queue.borrow_mut().drain(..) {
+            transport::push(&self.link, &r);
+        }
+    }
+
+    /// (v146) Veille possible ici : tout ce qu'on voit décidé par des provinces où l'on est
+    /// entré, la sienne étant celle d'un pays ; un certificat pour revenir ; rien qui attende
+    /// une réponse du relais du monde. En veille : retour quand une région en vue n'a plus
+    /// de province, quand elles ne nous servent plus depuis un moment, ou avant que le
+    /// certificat n'expire.
+    fn doze_tick(&mut self, chunk: [i32; 2], deep: bool, dt: f32) {
+        let cert_ok = self
+            .shards
+            .ticket
+            .as_ref()
+            .and_then(|t| t.4.as_ref())
+            .is_some_and(|c| c.expires > now_secs() + DOZE_CERT_MIN);
+        if !self.dozing {
+            let in_pays = self.best(proto::region_of(chunk)).is_some_and(|i| {
+                self.children_of
+                    .values()
+                    .any(|l| l.iter().any(|k| pkey(k) == pkey(i)))
+            });
+            let at_root = self
+                .pending
+                .keys()
+                .any(|p| self.best(proto::region_of(chunk_of(p[0], p[2]))).is_none());
+            let ok = deep && in_pays && cert_ok && !self.owner && !self.paused && !at_root;
+            self.doze_t = if ok { self.doze_t + dt } else { 0.0 };
+            return;
+        }
+        let lo = proto::region_of([chunk[0] - ROOT_VIEW, chunk[1] - ROOT_VIEW]);
+        let hi = proto::region_of([chunk[0] + ROOT_VIEW, chunk[1] + ROOT_VIEW]);
+        let root_needed =
+            (lo[0]..=hi[0]).any(|x| (lo[1]..=hi[1]).any(|z| self.best([x, z]).is_none()));
+        self.wake_t = if deep { 0.0 } else { self.wake_t + dt };
+        if root_needed || !cert_ok || self.wake_t > WAKE_AFTER {
+            self.wake_wanted.set(true);
+        }
+    }
+
+    /// (v146) Son skin : déposé chez chaque province où l'on entre (les joueurs en veille l'y
+    /// trouvent).
+    pub fn set_skin(&mut self, png: Vec<u8>) {
+        self.skin_png = Some(png);
+    }
+
+    pub fn has_skin(&self) -> bool {
+        self.skin_png.is_some()
+    }
+
+    /// (v146) En veille : le skin d'un joueur, demandé aux provinces où l'on est entré.
+    pub fn ask_skin(&self, pseudo: &str) {
+        for c in self.provinces.values().filter(|c| c.joined) {
+            c.client.send(Cmd::SkinGet(pseudo.to_string()));
+        }
+    }
+
+    /// Skins reçus des provinces depuis le dernier appel : (pseudo, PNG).
+    pub fn take_skins(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.skins_in)
+    }
+
+    /// (v146) Messages des OP arrivés par les provinces pendant la veille (mode de jeu, mort,
+    /// heure) : à traiter comme ceux du relais du monde.
+    pub fn take_notices(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.notices)
     }
 
     /// Demande d'objet (lâcher, ramasser, coffre) : à l'arbitre des objets de ce chunk, le
@@ -1306,6 +1504,7 @@ impl BuildNet {
             }
             self.was_deep = deep;
         }
+        self.doze_tick(chunk, deep, dt);
         // Ce que le joueur a changé (monde en pause : ça attend dans le journal).
         let edits = if self.paused {
             Vec::new()
@@ -1999,6 +2198,18 @@ mod tests {
         /// et relais de région rattaché au relais de sa province.
         province: Option<crate::province_host::ProvinceHost>,
         attach: Option<crate::province_host::RegionAttach>,
+        /// (v146) Veille permise (comme `Accounts`) ; relais du monde où revenir ; demande
+        /// partie, retour en cours ; veilles et retours faits ; messages des OP arrivés par
+        /// les provinces (modes, morts).
+        doze: bool,
+        relay: (String, [u8; 32]),
+        doze_sent: bool,
+        waking: bool,
+        dozed: u32,
+        woken: u32,
+        modes_seen: Vec<String>,
+        slain: u32,
+        times_seen: Vec<f32>,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -2067,6 +2278,15 @@ mod tests {
                 voice: None,
                 province: None,
                 attach: None,
+                doze: false,
+                relay: (addr.to_string(), key),
+                doze_sent: false,
+                waking: false,
+                dozed: 0,
+                woken: 0,
+                modes_seen: Vec::new(),
+                slain: 0,
+                times_seen: Vec::new(),
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
@@ -2108,6 +2328,15 @@ mod tests {
                 voice: None,
                 province: None,
                 attach: None,
+                doze: false,
+                relay: (at.addr.clone(), at.key),
+                doze_sent: false,
+                waking: false,
+                dozed: 0,
+                woken: 0,
+                modes_seen: Vec::new(),
+                slain: 0,
+                times_seen: Vec::new(),
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b.c.send(Cmd::GarantAvailable(true));
@@ -2526,6 +2755,22 @@ mod tests {
                     }
                 }
                 Event::Standby(at) => self.standby_at = at,
+                // (v146) Veille : la connexion au relais du monde est fermée.
+                Event::Dozed { .. } => {
+                    self.doze_sent = false;
+                    self.dozed += 1;
+                    if let Some(n) = &mut self.net {
+                        n.set_dozing();
+                    }
+                }
+                // (v146) De retour au relais du monde après la veille (le même monde).
+                Event::TakenOver { .. } if self.waking => {
+                    self.waking = false;
+                    self.woken += 1;
+                    if let (Some(n), Some(l)) = (&mut self.net, &self.link) {
+                        n.woke(l.clone());
+                    }
+                }
                 Event::TakenOver { host, .. } => {
                     self.retake = None;
                     self.taken += 1;
@@ -2592,8 +2837,43 @@ mod tests {
             if let Some(n) = &mut self.net {
                 let _ = n.update(&mut self.world, self.pos, (0.0, 0.0), 0.0, 4.0, 144.0, dt);
                 self.used_shard |= n.shard_links() > 0;
+                for e in n.take_notices() {
+                    match e {
+                        Event::SetGamemode { mode, .. } => self.modes_seen.push(mode),
+                        Event::Slain(_) => self.slain += 1,
+                        Event::SetTime { hours, .. } => self.times_seen.push(hours),
+                        _ => {}
+                    }
+                }
             }
+            self.doze_tick();
             self.voice_tick(dt);
+        }
+
+        /// (v146) Veille, comme `Accounts` et le jeu : au fond d'un pays, la connexion au
+        /// relais du monde se ferme ; elle se rouvre (connexion neuve, certificat) quand il
+        /// le faut.
+        fn doze_tick(&mut self) {
+            let Some(n) = &self.net else {
+                return;
+            };
+            if !self.doze || self.waking || self.doze_sent {
+                return;
+            }
+            if n.doze_ready() {
+                if let Some(room) = n.room() {
+                    self.c.send(Cmd::Doze { room });
+                    self.doze_sent = true;
+                }
+            } else if n.wake_needed() {
+                if let (Some(cert), Some(key), Some(room)) =
+                    (self.cert.clone(), self.identity.clone(), n.room())
+                {
+                    self.c = Client::spawn(self.relay.0.clone(), Some(self.relay.1));
+                    self.c.send(Cmd::Wake { room, cert, key });
+                    self.waking = true;
+                }
+            }
         }
 
         /// Voix, comme `Session::route_voice` : tous les joueurs vus sont voisins.
@@ -4362,6 +4642,216 @@ mod tests {
     #[test]
     fn a_big_pays_and_its_province_falling_together_lose_nothing() {
         pays_world(PaysFault::BothCrash, false, true);
+    }
+
+    /// (v146) Veille : au fond d'un pays (ses deux régions confiées à leurs provinces, tout ce
+    /// qu'on voit dans le pays), les joueurs ferment leur connexion au relais du monde et
+    /// continuent par les provinces ; on construit sans s'arrêter. Un OP change le mode d'un
+    /// joueur en veille et en tue un autre : leurs provinces le leur disent. Puis un joueur
+    /// s'approche de là où décide le relais du monde : il y revient tout seul (connexion
+    /// neuve, certificat), puis retourne au fond du pays. À la fin, les mondes sont
+    /// identiques à celui du propriétaire, rien en attente.
+    #[test]
+    fn players_deep_in_a_pays_doze_and_come_back() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (dir, h, mut hosts, mut bots, room) =
+            province_setup_full(false, 2, 100, 8, Some((1, 3)));
+        // Trois joueurs de chaque côté (les deux régions du pays assez peuplées pour leurs
+        // provinces), au milieu du pays (tout ce qu'ils voient en fait partie).
+        for (i, b) in bots.iter_mut().enumerate() {
+            b.world = flat_at(29..36, 29..32);
+            b.pos = Vec3::new(if i < 3 { 498.0 } else { 528.0 }, 11.0, 490.0);
+            b.doze = i > 0;
+        }
+        // (Le skin de Joueur1, déposé chez chaque province où il entre : en veille, les
+        // autres l'y trouvent.)
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+        png.extend(b"IHDR");
+        png.extend(64u32.to_be_bytes());
+        png.extend(64u32.to_be_bytes());
+        png.extend([8, 6, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        bots[1].net.as_mut().unwrap().set_skin(png.clone());
+        let mut skin_seen = false;
+        let west = |x: f32| x.clamp(488.0, 508.0);
+        let east = |x: f32| x.clamp(516.0, 540.0);
+        let mut seed = 4242u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let dt = 0.02;
+        let mut edited = std::collections::BTreeSet::new();
+        // Étape où le relais du monde n'a plus que le propriétaire ; où Joueur3 part vers le
+        // relais du monde ; s'il y est revenu (connecté de nouveau là-bas).
+        let mut all_dozing: Option<usize> = None;
+        let mut walk_from: Option<usize> = None;
+        let mut back_seen = false;
+        let mut edits_dozing = 0;
+        let mut step = 0;
+        while step < 1600 {
+            let here = h.players_here(room);
+            if all_dozing.is_none() && here.len() == 1 && bots[1..].iter().all(|b| b.dozed > 0) {
+                all_dozing = Some(step);
+            }
+            if let Some(a) = all_dozing {
+                // Un OP change le mode d'un joueur en veille, en tue un autre.
+                if step == a + 30 {
+                    bots[0].c.send(Cmd::ServerAdmin {
+                        action: proto::SERVER_TIMESET,
+                        pseudo: String::new(),
+                        reason: "6".into(),
+                    });
+                    bots[0].c.send(Cmd::ServerAdmin {
+                        action: proto::SERVER_GAMEMODE,
+                        pseudo: "Joueur4".into(),
+                        reason: "survival".into(),
+                    });
+                    bots[0].c.send(Cmd::ServerAdmin {
+                        action: proto::SERVER_KILL,
+                        pseudo: "Joueur5".into(),
+                        reason: String::new(),
+                    });
+                }
+                if step == a + 80 {
+                    walk_from = Some(step);
+                }
+                // Le skin de Joueur1, demandé par Joueur4 en veille (à ses provinces).
+                if step == a + 40 {
+                    bots[4].net.as_ref().unwrap().ask_skin("Joueur1");
+                }
+                if let Some(n) = bots[4].net.as_mut() {
+                    skin_seen |= n
+                        .take_skins()
+                        .iter()
+                        .any(|(p, s)| p.eq_ignore_ascii_case("Joueur1") && *s == png);
+                }
+            }
+            back_seen |= walk_from.is_some() && here.iter().any(|p| p == "Joueur3");
+            // Joueur3 va jusqu'à voir là où décide le relais du monde (x ≥ 1024), y reste un
+            // peu, puis revient.
+            let walk = walk_from.map(|w| step - w);
+            for (i, b) in bots.iter_mut().enumerate() {
+                let r = rnd();
+                let x = b.pos.x + (r % 3) as f32 - 1.0;
+                b.pos.x = match (i, walk) {
+                    (3, Some(t)) if t < 140 => (b.pos.x + 2.0).min(800.0),
+                    (3, Some(t)) if t < 260 => b.pos.x,
+                    (3, Some(_)) => (b.pos.x - 2.0).max(530.0),
+                    _ if i < 3 => west(x),
+                    _ => east(x),
+                };
+                b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(475.0, 505.0);
+                if rnd() % 17 == 0 {
+                    let x = (b.pos.x as i32 - 12 + (rnd() % 25) as i32).clamp(29 * 16, 36 * 16 - 1);
+                    let z = 470 + (rnd() % 36) as i32;
+                    let y = 11 + (rnd() % 3) as i32;
+                    let block = if rnd() % 4 == 0 {
+                        BlockId::AIR
+                    } else {
+                        BlockId(1 + rnd() as u16 % 8)
+                    };
+                    b.world.set(x, y, z, block);
+                    edited.insert([x, y, z]);
+                    if b.net.as_ref().is_some_and(|n| n.is_dozing()) {
+                        edits_dozing += 1;
+                    }
+                }
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            step += 1;
+            // (Jusqu'à un peu après le retour de Joueur3 au fond du pays.)
+            if walk_from.is_some_and(|w| step > w + 480) {
+                break;
+            }
+        }
+        // Tout se pose (confirmations, doutes, paquets du propriétaire).
+        for _ in 0..400 {
+            for b in bots.iter_mut() {
+                b.tick(dt);
+            }
+            for (w, g) in &mut hosts {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for b in &bots {
+            eprintln!(
+                "{} : veilles {}, retours {}, modes {:?}, morts {}, en veille {}, provinces {:?}",
+                b.name,
+                b.dozed,
+                b.woken,
+                b.modes_seen,
+                b.slain,
+                b.net.as_ref().unwrap().is_dozing(),
+                b.net.as_ref().unwrap().province_view()
+            );
+        }
+        eprintln!(
+            "veille : tous en veille à l'étape {all_dozing:?}, départ de Joueur3 à {walk_from:?}, \
+             revenu au relais du monde {back_seen}, {edits_dozing} modifications faites en \
+             veille, {} en tout ; au relais du monde à la fin : {:?}",
+            edited.len(),
+            h.players_here(room)
+        );
+        assert!(all_dozing.is_some(), "tous en veille au fond du pays");
+        assert!(
+            skin_seen,
+            "le skin d'un joueur trouvé chez les provinces, en veille"
+        );
+        assert!(
+            bots[1..].iter().all(|b| b.times_seen.contains(&6.0)),
+            "l'heure donnée par l'OP arrive par les provinces à ceux qui sont en veille"
+        );
+        assert!(edits_dozing > 30, "on construit en veille : {edits_dozing}");
+        assert_eq!(
+            bots[4].modes_seen,
+            vec!["survival".to_string()],
+            "le mode donné par l'OP arrive par la province (une fois)"
+        );
+        assert_eq!(
+            bots[5].slain, 1,
+            "la mort donnée par l'OP arrive par la province (une fois)"
+        );
+        assert!(
+            bots[3].woken > 0 && back_seen,
+            "Joueur3 est revenu au relais du monde"
+        );
+        for b in &bots {
+            assert_eq!(
+                b.net.as_ref().unwrap().pending(),
+                0,
+                "{} : en attente",
+                b.name
+            );
+        }
+        let owner = &bots[0];
+        let mut differ = Vec::new();
+        for b in &bots[1..] {
+            for p in &edited {
+                let (a, o) = (
+                    b.world.get(p[0], p[1], p[2]),
+                    owner.world.get(p[0], p[1], p[2]),
+                );
+                if a != o {
+                    differ.push((b.name.clone(), *p, a.0, o.0));
+                }
+            }
+        }
+        assert!(
+            differ.is_empty(),
+            "{} cases différentes du monde du propriétaire, par exemple {:?}",
+            differ.len(),
+            &differ[..differ.len().min(5)]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Objets et sacs de survie dans les provinces (v139), de bout en bout : la province
