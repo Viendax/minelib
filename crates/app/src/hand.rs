@@ -434,10 +434,12 @@ impl Hand {
     /// de chaque face dans le monde. Tendu droit devant (parallèle au regard), sorti du bas
     /// à droite de l'écran, le poing là où l'objet tenu se place. Chaque sommet a sa place
     /// dans le monde (devant les yeux : `to_world`, repère de la caméra → monde) et sa
-    /// normale : les lumières dynamiques l'éclairent comme le modèle.
+    /// normale : les lumières dynamiques l'éclairent comme le modèle. `fov_deg` : angle de
+    /// vue du monde à cette image (75°, plus en courant, moins au zoom).
     pub fn arm(
         &self,
         aspect: f32,
+        fov_deg: f32,
         light: [f32; 3],
         skin: Option<&crate::skin::Skin>,
         to_world: Mat4,
@@ -448,7 +450,13 @@ impl Hand {
             * Mat4::from_translation(ARM_FIST)
             * Mat4::from_scale(Vec3::new(ARM_LEN / 3.0, ARM_LEN / 3.0, ARM_LEN))
             * Mat4::from_translation(Vec3::new(-0.5, -0.5, 0.0));
-        let world = to_world * arm;
+        // Le bras est dessiné avec l'angle de vue de la main (70°), le monde avec le sien.
+        // Pour l'éclairer, il est placé là où il paraît être dans l'image du monde, à la même
+        // distance des yeux : x et y du repère de la caméra multipliés par le rapport des
+        // tangentes des demi-angles. Sinon la lumière le touche ailleurs que le monde juste
+        // derrière lui (un bord de faisceau décalé d'environ 10 %, 25 % en courant).
+        let k = (fov_deg.to_radians() * 0.5).tan() / (HAND_FOV.to_radians() * 0.5).tan();
+        let world = to_world * Mat4::from_scale(Vec3::new(k, k, 1.0)) * arm;
         let center = world.transform_point3(Vec3::splat(0.5));
         // Faces : 0 +x, 1 −x, 2 +y, 3 −y, 4 +z (épaule), 5 −z (poing) ; coins dans l'ordre
         // (origine, +s, +s +t, +t).
@@ -675,13 +683,44 @@ mod tests {
         }
     }
 
+    /// Les lumières touchent le bras là où on le voit : chaque sommet, placé dans le monde
+    /// pour l'éclairage, tombe au même endroit de l'écran par la vue du monde que par celle
+    /// de la main qui le dessine, quel que soit l'angle de vue du monde (zoom, normal, course).
+    #[test]
+    fn the_arm_is_lit_where_it_is_seen() {
+        let h = Hand::default();
+        let aspect = 16.0 / 9.0;
+        let eye = Vec3::new(-92.0, 131.6, -62.2);
+        let to_world =
+            Mat4::from_translation(eye) * Mat4::from_rotation_y(2.9) * Mat4::from_rotation_x(-0.45);
+        let view = to_world.inverse();
+        for fov in [18.0, crate::session::FOV, crate::session::FOV * 1.1] {
+            let world_vp =
+                Mat4::perspective_infinite_reverse_rh(f32::to_radians(fov), aspect, 0.05) * view;
+            for p in h.arm(aspect, fov, [1.0; 3], None, to_world) {
+                let [x, y, _, w] = p.clip;
+                let c = world_vp * Vec3::from(p.world).extend(1.0);
+                assert!(
+                    (c.x / c.w - x / w).abs() < 1e-3 && (c.y / c.w - y / w).abs() < 1e-3,
+                    "angle {fov} : main ({}, {}), monde ({}, {})",
+                    x / w,
+                    y / w,
+                    c.x / c.w,
+                    c.y / c.w
+                );
+                // Et à la même distance des yeux, devant eux.
+                assert!(c.w > 0.2 && (c.w - w).abs() < 1e-3, "{} {}", c.w, w);
+            }
+        }
+    }
+
     #[test]
     fn arm_points_straight_ahead_like_the_model_arm() {
         let h = Hand::default();
         // Caméra en (10, 70, 5) tournée de 0,7 rad : le bras suit, dans le monde.
         let eye = Vec3::new(10.0, 70.0, 5.0);
         let to_world = Mat4::from_translation(eye) * Mat4::from_rotation_y(0.7);
-        let v = h.arm(16.0 / 9.0, [0.5; 3], None, to_world);
+        let v = h.arm(16.0 / 9.0, crate::session::FOV, [0.5; 3], None, to_world);
         // 4 × 12 pixels sur quatre faces, 4 × 4 aux deux bouts, deux triangles chacun.
         assert_eq!(v.len(), (4 * 12 * 4 + 4 * 4 * 2) * 6);
         let fwd = to_world.transform_vector3(-Vec3::Z);

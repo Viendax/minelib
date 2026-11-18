@@ -74,12 +74,19 @@ fn sample_history(uv: vec2<f32>) -> vec3<f32> {
     let wr = w3.x * w12.y;
     let wt = w12.x * w0.y;
     let wb = w12.x * w3.y;
-    var c = textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t12.y), 0.0).rgb * wc;
-    c += textureSampleLevel(history, lin_sampler, vec2<f32>(t0.x, t12.y), 0.0).rgb * wl;
-    c += textureSampleLevel(history, lin_sampler, vec2<f32>(t3.x, t12.y), 0.0).rgb * wr;
-    c += textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t0.y), 0.0).rgb * wt;
-    c += textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t3.y), 0.0).rgb * wb;
-    return max(c / (wc + wl + wr + wt + wb), vec3<f32>(0.0));
+    let sc = textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t12.y), 0.0).rgb;
+    let sl = textureSampleLevel(history, lin_sampler, vec2<f32>(t0.x, t12.y), 0.0).rgb;
+    let sr = textureSampleLevel(history, lin_sampler, vec2<f32>(t3.x, t12.y), 0.0).rgb;
+    let st = textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t0.y), 0.0).rgb;
+    let sb = textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t3.y), 0.0).rgb;
+    let c = (sc * wc + sl * wl + sr * wr + st * wt + sb * wb) / (wc + wl + wr + wt + wb);
+    // Sans rebond : les lobes négatifs de Catmull-Rom dépassent de part et d'autre d'un bord
+    // net. Repris à chaque image tant que la vue bouge un peu, ce dépassement s'accumulait en
+    // liserés sombres autour des blocs, des étoiles et des trous du feuillage. Borné aux
+    // lectures elles-mêmes (des moyennes des pixels voisins), il reste net sans liseré.
+    let lo = min(min(min(sc, sl), min(sr, st)), sb);
+    let hi = max(max(max(sc, sl), max(sr, st)), sb);
+    return clamp(c, lo, hi);
 }
 
 /// Rapproche `c` de `center` jusqu'à ce qu'il entre dans la boîte [lo, hi].

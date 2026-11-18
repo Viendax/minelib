@@ -6544,6 +6544,7 @@ impl Session {
         {
             self.hand.arm(
                 renderer.aspect(),
+                fov,
                 self.hand_light,
                 skin.as_deref(),
                 view.inverse(),

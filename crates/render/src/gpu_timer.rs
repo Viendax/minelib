@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use crate::perf::GpuTimes;
 
-/// Passes mesurées : 0 scène (opaques), 1 TAA, 2 affichage, 3 éclairage différé,
-/// 4 translucides, 5 rayons volumétriques (la marche), 6 cartes d'ombre, 7 recomposition des
-/// rayons.
+/// Passes mesurées : 0 scène (opaques), 1 TAA, 2 affichage, 3 éclairage différé (moyenne
+/// des voisins et calcul exact), 4 translucides, 5 rayons volumétriques (la marche), 6 cartes
+/// d'ombre, 7 recomposition des rayons, 8 éclairage différé d'un pixel sur quatre.
 pub const SCENE: u32 = 0;
 pub const TAA: u32 = 1;
 pub const PRESENT: u32 = 2;
@@ -18,7 +18,8 @@ pub const AFTER: u32 = 4;
 pub const VOLUMETRIC: u32 = 5;
 pub const BAKE: u32 = 6;
 pub const VL_COMPOSITE: u32 = 7;
-const PASSES: u32 = 8;
+pub const LIGHTS_HALF: u32 = 8;
+const PASSES: u32 = 9;
 /// Chaque passe × (début, fin).
 const QUERIES: u32 = PASSES * 2;
 /// Tampons de relecture en rotation (le GPU a quelques images d'avance).
@@ -180,6 +181,7 @@ impl GpuTimer {
                     after: ms(AFTER),
                     volumetric: ms(VOLUMETRIC),
                     vl_composite: ms(VL_COMPOSITE),
+                    lights_half: ms(LIGHTS_HALF),
                     bake: ms(BAKE),
                     span: if last > first && first != 0 {
                         (last - first) as f32 * self.period_ns / 1e6

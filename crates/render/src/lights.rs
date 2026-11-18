@@ -175,6 +175,9 @@ pub struct DynSettings {
     pub vl_noise_stride: u32,
     /// Tramage qui tourne à chaque image (lissé par le TAA).
     pub vl_dither_temporal: bool,
+    /// Éclairage différé en demi-résolution, exact aux bords (`dyn_deferred.wgsl`) :
+    /// décoché, chaque pixel est calculé exactement.
+    pub half_lighting: bool,
 }
 
 impl Default for DynSettings {
@@ -208,6 +211,7 @@ impl Default for DynSettings {
             vl_noise_morph: 0.0,
             vl_noise_stride: 2,
             vl_dither_temporal: true,
+            half_lighting: true,
         }
     }
 }
@@ -312,6 +316,8 @@ const F_TOON: u32 = 16;
 const F_SPECULAR: u32 = 32;
 const F_VOLUMETRIC: u32 = 64;
 const F_BOX_SHADOWS: u32 = 128;
+/// Éclairage différé en demi-résolution, exact aux bords.
+const F_HALF_LIGHT: u32 = 256;
 
 /// Repère d'un projecteur dirigé selon `d` : (droite, haut, avant) — le même que
 /// `dl_spot_basis` dans dynlights.wgsl.
@@ -962,11 +968,16 @@ pub(crate) struct VlPipes {
     composite: wgpu::RenderPipeline,
 }
 
-/// Éclairage différé : le shader complet, et sa variante sans ombres douces (aucune lumière
-/// à l'écran n'en a : préréglage Rapide, « Ombres des blocs » décochée).
+/// Éclairage différé (voir `dyn_deferred.wgsl`) : un pixel sur quatre (`half`), la moyenne
+/// des voisins (`interp`), le calcul exact des autres (`exact`). Ceux qui calculent la
+/// lumière ont leur variante sans ombres douces (aucune lumière à l'écran n'en a :
+/// préréglage Rapide, « Ombres des blocs » décochée).
 pub(crate) struct DeferredPipes {
-    pub(crate) general: wgpu::RenderPipeline,
-    pub(crate) hard: wgpu::RenderPipeline,
+    half: wgpu::RenderPipeline,
+    half_hard: wgpu::RenderPipeline,
+    interp: wgpu::RenderPipeline,
+    exact: wgpu::RenderPipeline,
+    exact_hard: wgpu::RenderPipeline,
 }
 
 /// Liaisons de l'éclairage différé (profondeur lue, albédo, surface), refaites quand les
@@ -974,6 +985,86 @@ pub(crate) struct DeferredPipes {
 struct DeferredTargets {
     generation: u64,
     groups: [wgpu::BindGroup; 2],
+    /// Lumière d'un pixel sur quatre (demi-résolution, `fs_half`), pochoir des pixels
+    /// laissés au calcul exact, et les liaisons de `fs_interp` (qui lit la première).
+    half_view: wgpu::TextureView,
+    stencil_view: wgpu::TextureView,
+    interp_groups: [wgpu::BindGroup; 2],
+}
+
+/// Lumière d'un pixel sur quatre : diffus et reflets en demi-flottants, clé de la surface.
+const HALF_LIGHT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
+/// Pochoir de l'éclairage différé : 1 là où la moyenne des voisins a suffi.
+const LIGHT_STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
+
+/// Images par bloc d'essai de l'éclairage en demi-résolution, blocs par essai (la moitié
+/// dans chaque mode, en alternance), images ignorées au début d'un bloc (les temps GPU
+/// arrivent avec quelques images de retard), images avant un nouvel essai.
+const HALF_BLOCK: u32 = 32;
+const HALF_BLOCKS: u32 = 8;
+const HALF_SKIP: u32 = 6;
+const HALF_RETRY: u32 = 4000;
+
+/// Éclairage en demi-résolution : essayé contre le calcul exact par blocs d'images, et
+/// gardé seulement s'il est plus rapide sur cette carte graphique (même image dans les deux
+/// cas). Ressayé de temps en temps : la scène change.
+#[derive(Default)]
+struct HalfTrial {
+    /// Images depuis le début de l'essai (ou de la décision).
+    frames: u32,
+    /// Temps GPU des lumières (ms) : somme et nombre, calcul exact (0) et demi (1).
+    sum: [f64; 2],
+    n: [u32; 2],
+    /// Décision de l'essai (vrai : demi-résolution), et celle d'avant (journal).
+    decided: Option<bool>,
+    last: Option<bool>,
+}
+
+impl HalfTrial {
+    /// Mode de l'image en cours (vrai : demi-résolution).
+    fn mode(&self) -> bool {
+        self.decided
+            .unwrap_or((self.frames / HALF_BLOCK).is_multiple_of(2))
+    }
+
+    /// Une image de plus où les lumières sont dessinées.
+    fn tick(&mut self) {
+        self.frames += 1;
+        match self.decided {
+            None if self.frames >= HALF_BLOCK * HALF_BLOCKS => {
+                let mean = |k: usize| self.sum[k] / self.n[k].max(1) as f64;
+                let half = self.n[0] > 0 && self.n[1] > 0 && mean(1) < mean(0) * 0.97;
+                if self.last != Some(half) {
+                    log::info!(
+                        "éclairage en demi-résolution : {:.2} ms, calcul exact : {:.2} ms → {}",
+                        mean(1),
+                        mean(0),
+                        if half { "gardé" } else { "pas gardé" }
+                    );
+                }
+                self.decided = Some(half);
+                self.last = Some(half);
+                self.frames = 0;
+            }
+            Some(_) if self.frames >= HALF_RETRY => {
+                *self = Self {
+                    last: self.last,
+                    ..Self::default()
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// Temps GPU des lumières d'une image (quelques images plus tôt, dans le même bloc).
+    fn note(&mut self, ms: f32) {
+        if self.decided.is_some() || self.frames % HALF_BLOCK < HALF_SKIP {
+            return;
+        }
+        let k = self.mode() as usize;
+        self.sum[k] += ms as f64;
+        self.n[k] += 1;
+    }
 }
 
 /// Ressources GPU des lumières dynamiques.
@@ -1008,6 +1099,8 @@ pub(crate) struct DynGpu {
     vl_targets: Option<VlTargets>,
     // Éclairage différé.
     pub(crate) def_bgl: wgpu::BindGroupLayout,
+    /// Celles de `fs_interp` : les mêmes, plus la lumière d'un pixel sur quatre.
+    pub(crate) interp_bgl: wgpu::BindGroupLayout,
     def_targets: Option<DeferredTargets>,
     // État de l'image.
     lights: Vec<DynLight>,
@@ -1023,6 +1116,9 @@ pub(crate) struct DynGpu {
     vl_noise: bool,
     /// Une lumière au moins a des ombres douces (sinon : l'éclairage différé sans leur code).
     any_soft: bool,
+    /// Éclairage en demi-résolution à cette image (réglage coché et plus rapide ici).
+    half_now: bool,
+    half_trial: HalfTrial,
     gpu_lights: Vec<GpuLight>,
     tiles: Vec<u32>,
 }
@@ -1142,6 +1238,7 @@ fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
 
 /// Pipelines des lumières : éclairage différé, calcul des cartes d'ombre, rayons
 /// volumétriques et leur recomposition, chacun sur son fil (`Renderer::spawn_lit`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn light_pipes(
     device: &wgpu::Device,
     world_bgl: &wgpu::BindGroupLayout,
@@ -1149,6 +1246,7 @@ pub(crate) fn light_pipes(
     vl_bgl: &wgpu::BindGroupLayout,
     comp_bgl: &wgpu::BindGroupLayout,
     def_bgl: &wgpu::BindGroupLayout,
+    interp_bgl: &wgpu::BindGroupLayout,
     surface: wgpu::TextureFormat,
 ) -> (
     wgpu::RenderPipeline,
@@ -1192,6 +1290,11 @@ pub(crate) fn light_pipes(
         bind_group_layouts: &[world_bgl, def_bgl],
         push_constant_ranges: &[],
     });
+    let interp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("éclairage différé : moyenne des voisins"),
+        bind_group_layouts: &[world_bgl, interp_bgl],
+        push_constant_ranges: &[],
+    });
     let add = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
         dst_factor: wgpu::BlendFactor::One,
@@ -1213,32 +1316,77 @@ pub(crate) fn light_pipes(
                 crate::viewmodel::arm_lit_pipeline(device, world_bgl, surface)
             })
         });
-        let deferred = sc.spawn(|| {
-            timed("éclairage différé", || {
-                fullscreen_pipeline(
+        // Éclairage différé : un pixel sur quatre, la moyenne des voisins, le calcul exact des
+        // autres (avec et sans le code des ombres douces), chacun sur son fil.
+        let (def_layout, def_shader) = (&def_layout, &def_shader);
+        let def =
+            |label: &'static str, vs: &'static str, fs: &'static str, hard: bool, half: bool| {
+                sc.spawn(move || {
+                    timed(label, || {
+                        stencil_variant(
+                            device,
+                            label,
+                            def_layout,
+                            def_shader,
+                            vs,
+                            fs,
+                            if half {
+                                HALF_LIGHT_FORMAT
+                            } else {
+                                COLOR_FORMAT
+                            },
+                            if half { None } else { additive },
+                            if hard {
+                                &[("DL_SOFT_SHADOWS", 0.0)]
+                            } else {
+                                &[]
+                            },
+                            (!half).then(|| light_stencil(false)),
+                        )
+                    })
+                })
+            };
+        let half = def(
+            "éclairage différé : un pixel sur quatre",
+            "vs_tiles_half",
+            "fs_half",
+            false,
+            true,
+        );
+        let half_hard = def(
+            "éclairage différé : un pixel sur quatre (ombres nettes)",
+            "vs_tiles_half",
+            "fs_half",
+            true,
+            true,
+        );
+        let exact = def(
+            "éclairage différé : calcul exact",
+            "vs_tiles",
+            "fs_deferred",
+            false,
+            false,
+        );
+        let exact_hard = def(
+            "éclairage différé : calcul exact (ombres nettes)",
+            "vs_tiles",
+            "fs_deferred",
+            true,
+            false,
+        );
+        let interp = sc.spawn(|| {
+            timed("éclairage différé : moyenne des voisins", || {
+                stencil_variant(
                     device,
-                    "éclairage différé",
-                    &def_layout,
-                    &def_shader,
+                    "éclairage différé : moyenne des voisins",
+                    &interp_layout,
+                    def_shader,
                     "vs_tiles",
-                    "fs_deferred",
+                    "fs_interp",
                     COLOR_FORMAT,
                     additive,
-                )
-            })
-        });
-        let deferred_hard = sc.spawn(|| {
-            timed("éclairage différé (ombres nettes)", || {
-                fullscreen_variant(
-                    device,
-                    "éclairage différé (ombres nettes)",
-                    &def_layout,
-                    &def_shader,
-                    "vs_tiles",
-                    "fs_deferred",
-                    COLOR_FORMAT,
-                    additive,
-                    &[("DL_SOFT_SHADOWS", 0.0)],
+                    &[],
+                    Some(light_stencil(true)),
                 )
             })
         });
@@ -1326,10 +1474,15 @@ pub(crate) fn light_pipes(
                 composite: composite.join().expect("pipeline de recomposition"),
             },
             DeferredPipes {
-                general: deferred.join().expect("pipeline de l'éclairage différé"),
-                hard: deferred_hard
+                half: half
                     .join()
-                    .expect("éclairage différé (ombres nettes)"),
+                    .expect("éclairage différé : un pixel sur quatre"),
+                half_hard: half_hard
+                    .join()
+                    .expect("éclairage différé : un pixel sur quatre"),
+                interp: interp.join().expect("éclairage différé : moyenne"),
+                exact: exact.join().expect("éclairage différé : calcul exact"),
+                exact_hard: exact_hard.join().expect("éclairage différé : calcul exact"),
             },
             arm.join().expect("pipeline du bras éclairé"),
         )
@@ -1364,6 +1517,56 @@ fn fullscreen_variant(
     blend: Option<wgpu::BlendState>,
     constants: &[(&str, f64)],
 ) -> wgpu::RenderPipeline {
+    stencil_variant(
+        device, label, layout, shader, vs, fs, format, blend, constants, None,
+    )
+}
+
+/// Pochoir de l'éclairage différé : `fs_interp` met 1 là où la moyenne a suffi
+/// (`write`), le calcul exact ne passe que là où il vaut 0.
+fn light_stencil(write: bool) -> wgpu::DepthStencilState {
+    let face = wgpu::StencilFaceState {
+        compare: if write {
+            wgpu::CompareFunction::Always
+        } else {
+            wgpu::CompareFunction::Equal
+        },
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: if write {
+            wgpu::StencilOperation::Replace
+        } else {
+            wgpu::StencilOperation::Keep
+        },
+    };
+    wgpu::DepthStencilState {
+        format: LIGHT_STENCIL_FORMAT,
+        depth_write_enabled: false,
+        depth_compare: wgpu::CompareFunction::Always,
+        stencil: wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xff,
+            write_mask: if write { 0xff } else { 0 },
+        },
+        bias: Default::default(),
+    }
+}
+
+/// Comme `fullscreen_variant`, avec le pochoir de l'éclairage différé (`light_stencil`).
+#[allow(clippy::too_many_arguments)]
+fn stencil_variant(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    vs: &str,
+    fs: &str,
+    format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+    constants: &[(&str, f64)],
+    stencil: Option<wgpu::DepthStencilState>,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -1374,7 +1577,7 @@ fn fullscreen_variant(
             buffers: &[],
         },
         primitive: Default::default(),
-        depth_stencil: None,
+        depth_stencil: stencil,
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
@@ -1386,7 +1589,11 @@ fn fullscreen_variant(
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend,
-                write_mask: wgpu::ColorWrites::COLOR,
+                write_mask: if format == HALF_LIGHT_FORMAT {
+                    wgpu::ColorWrites::ALL
+                } else {
+                    wgpu::ColorWrites::COLOR
+                },
             })],
         }),
         multiview: None,
@@ -1629,6 +1836,41 @@ impl DynGpu {
                 },
             ],
         });
+        let interp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("éclairage différé : moyenne des voisins"),
+            entries: &[
+                tex_entry(
+                    0,
+                    wgpu::TextureSampleType::Depth,
+                    wgpu::TextureViewDimension::D2,
+                ),
+                tex_entry(
+                    1,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureViewDimension::D2,
+                ),
+                tex_entry(
+                    2,
+                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureViewDimension::D2,
+                ),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                tex_entry(
+                    4,
+                    wgpu::TextureSampleType::Uint,
+                    wgpu::TextureViewDimension::D2,
+                ),
+            ],
+        });
         let max_texture = device.limits().max_texture_dimension_2d;
         let mut g = Self {
             header,
@@ -1655,6 +1897,7 @@ impl DynGpu {
             noise_sampler,
             vl_targets: None,
             def_bgl,
+            interp_bgl,
             def_targets: None,
             lights: Vec::new(),
             settings: DynSettings::default(),
@@ -1666,6 +1909,8 @@ impl DynGpu {
             vl_active: false,
             vl_noise: true,
             any_soft: true,
+            half_now: false,
+            half_trial: HalfTrial::default(),
             gpu_lights: Vec::new(),
             tiles: vec![0; (TILES_X * TILES_Y * WORDS) as usize],
         };
@@ -2055,6 +2300,16 @@ impl DynGpu {
         if box_shadows {
             flags |= F_BOX_SHADOWS;
         }
+        // Demi-résolution : seulement quand elle est plus rapide que le calcul exact ici.
+        if !st.half_lighting {
+            self.half_trial = HalfTrial::default();
+        } else if !self.rects.is_empty() && !self.gpu_lights.is_empty() {
+            self.half_trial.tick();
+        }
+        self.half_now = st.half_lighting && self.half_trial.mode();
+        if self.half_now {
+            flags |= F_HALF_LIGHT;
+        }
         let mut box_x = [[0.0; 4]; MAX_BOXES];
         let mut box_y = [[0.0; 4]; MAX_BOXES];
         let mut box_z = [[0.0; 4]; MAX_BOXES];
@@ -2229,10 +2484,10 @@ impl DynGpu {
         self.vl_active
     }
 
-    /// Une lumière au moins demande des ombres douces à cette image : l'éclairage différé
-    /// complet ; sinon sa variante sans pénombre, plus légère (même image).
-    pub fn any_soft(&self) -> bool {
-        self.any_soft
+    /// Temps GPU de l'éclairage différé d'une image passée (ms) : pour l'essai de la
+    /// demi-résolution.
+    pub fn note_light_gpu(&mut self, ms: f32) {
+        self.half_trial.note(ms);
     }
 
     /// Des cartes d'ombre à calculer à cette image ?
@@ -2242,7 +2497,10 @@ impl DynGpu {
 
     /// Éclairage différé : ajoute la lumière des lumières dynamiques à `color` (image du
     /// monde opaque), d'après la profondeur de cette image et ce que les opaques ont laissé
-    /// (`gbuf` : albédo, surface). `generation` change quand ces images sont recréées.
+    /// (`gbuf` : albédo, surface). `generation` change quand ces images sont recréées ;
+    /// `size` : leur taille. Deux passes (voir `dyn_deferred.wgsl`) : la lumière d'un pixel
+    /// sur quatre, puis la moyenne des voisins là où elle vaut le calcul exact, et le calcul
+    /// exact ailleurs. `timestamps` : temps GPU de la première, puis de la seconde.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_deferred(
         &mut self,
@@ -2253,44 +2511,127 @@ impl DynGpu {
         depth_index: usize,
         gbuf: &[wgpu::TextureView; 2],
         generation: u64,
+        size: (u32, u32),
         color: &wgpu::TextureView,
-        pipeline: &wgpu::RenderPipeline,
-        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+        pipes: &DeferredPipes,
+        timestamps: (
+            Option<wgpu::RenderPassTimestampWrites<'_>>,
+            Option<wgpu::RenderPassTimestampWrites<'_>>,
+        ),
     ) {
         if self
             .def_targets
             .as_ref()
             .is_none_or(|t| t.generation != generation)
         {
+            let texture = |label: &str, size: (u32, u32), format, usage| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width: size.0.max(1),
+                            height: size.1.max(1),
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default())
+            };
+            let half_view = texture(
+                "éclairage différé : un pixel sur quatre",
+                (size.0.div_ceil(2), size.1.div_ceil(2)),
+                HALF_LIGHT_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            );
+            let stencil_view = texture(
+                "éclairage différé : pochoir",
+                size,
+                LIGHT_STENCIL_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            );
+            let entries = |i: usize| {
+                [
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&depths[i]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&gbuf[0]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&gbuf[1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.rects_buf.as_entire_binding(),
+                    },
+                ]
+            };
             let groups = std::array::from_fn(|i| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("éclairage différé"),
                     layout: &self.def_bgl,
+                    entries: &entries(i),
+                })
+            });
+            let interp_groups = std::array::from_fn(|i| {
+                let [e0, e1, e2, e3] = entries(i);
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("éclairage différé : moyenne des voisins"),
+                    layout: &self.interp_bgl,
                     entries: &[
+                        e0,
+                        e1,
+                        e2,
+                        e3,
                         wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&depths[i]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&gbuf[0]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&gbuf[1]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: self.rects_buf.as_entire_binding(),
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&half_view),
                         },
                     ],
                 })
             });
-            self.def_targets = Some(DeferredTargets { generation, groups });
+            self.def_targets = Some(DeferredTargets {
+                generation,
+                groups,
+                half_view,
+                stencil_view,
+                interp_groups,
+            });
         }
         let Some(t) = &self.def_targets else {
             return;
         };
+        let soft = self.any_soft;
+        // 1. Un pixel sur quatre (rien d'autre n'est écrit : 0, aucune lumière calculée).
+        if self.half_now {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lumières : un pixel sur quatre"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.half_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: timestamps.0,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(if soft { &pipes.half } else { &pipes.half_hard });
+            pass.set_bind_group(0, world_group, &[]);
+            pass.set_bind_group(1, &t.groups[depth_index], &[]);
+            pass.draw(0..6, 0..self.rects.len() as u32);
+        }
+        // 2. La moyenne des voisins là où elle suffit (pochoir à 1), le calcul exact ailleurs.
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("lumières (éclairage différé)"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2301,14 +2642,31 @@ impl DynGpu {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: None,
-            timestamp_writes: timestamps,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &t.stencil_view,
+                depth_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+            }),
+            timestamp_writes: timestamps.1,
             occlusion_query_set: None,
         });
-        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, world_group, &[]);
+        if self.half_now {
+            pass.set_stencil_reference(1);
+            pass.set_pipeline(&pipes.interp);
+            pass.set_bind_group(1, &t.interp_groups[depth_index], &[]);
+            pass.draw(0..6, 0..self.rects.len() as u32);
+        }
+        pass.set_stencil_reference(0);
+        pass.set_pipeline(if soft {
+            &pipes.exact
+        } else {
+            &pipes.exact_hard
+        });
         pass.set_bind_group(1, &t.groups[depth_index], &[]);
-        // Seulement les cases éclairées (deux triangles chacune).
         pass.draw(0..6, 0..self.rects.len() as u32);
     }
 

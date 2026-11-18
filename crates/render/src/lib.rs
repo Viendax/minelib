@@ -1528,11 +1528,12 @@ impl Renderer {
         let device = self.device.clone();
         let bgl = self.bgl.clone();
         let surface = self.config.format;
-        let (bake_bgl, vl_bgl, comp_bgl, def_bgl) = (
+        let (bake_bgl, vl_bgl, comp_bgl, def_bgl, interp_bgl) = (
             self.dyn_gpu.bake_bgl.clone(),
             self.dyn_gpu.vl_bgl.clone(),
             self.dyn_gpu.comp_bgl.clone(),
             self.dyn_gpu.def_bgl.clone(),
+            self.dyn_gpu.interp_bgl.clone(),
         );
         lazy::Lazy::spawn("shaders des lumières", move || {
             let t0 = std::time::Instant::now();
@@ -1546,7 +1547,14 @@ impl Renderer {
             device.push_error_scope(wgpu::ErrorFilter::Validation);
             device.push_error_scope(wgpu::ErrorFilter::Internal);
             let (bake, vl, deferred, arm) = lights::light_pipes(
-                &device, &bgl, &bake_bgl, &vl_bgl, &comp_bgl, &def_bgl, surface,
+                &device,
+                &bgl,
+                &bake_bgl,
+                &vl_bgl,
+                &comp_bgl,
+                &def_bgl,
+                &interp_bgl,
+                surface,
             );
             let internal = pollster::block_on(device.pop_error_scope());
             let validation = pollster::block_on(device.pop_error_scope());
@@ -2615,16 +2623,7 @@ impl Renderer {
                     .and_then(|r| r.as_ref().ok())
                 {
                     let wg = self.world_group().clone();
-                    let ts = self
-                        .gpu_timer
-                        .as_ref()
-                        .and_then(|t| t.pass(gpu_timer::LIGHTS));
-                    // Sans ombre douce à l'écran : la variante sans leur code (plus légère).
-                    let pipe = if self.dyn_gpu.any_soft() {
-                        &l.deferred.general
-                    } else {
-                        &l.deferred.hard
-                    };
+                    let timer = self.gpu_timer.as_ref();
                     self.dyn_gpu.encode_deferred(
                         &self.device,
                         &mut encoder,
@@ -2633,9 +2632,13 @@ impl Renderer {
                         taa.depth_index(),
                         &t.gbuf_views,
                         t.generation,
+                        t.internal,
                         &t.color_view,
-                        pipe,
-                        ts,
+                        &l.deferred,
+                        (
+                            timer.and_then(|t| t.pass(gpu_timer::LIGHTS_HALF)),
+                            timer.and_then(|t| t.pass(gpu_timer::LIGHTS)),
+                        ),
                     );
                 }
             }
@@ -2780,6 +2783,9 @@ impl Renderer {
                     perf::gauge("reflets : portée (blocs)", self.rt_quality.uniforms()[1]);
                 } else {
                     self.rt_quality = rt::RtQuality::default();
+                }
+                if g.lights > 0.0 {
+                    self.dyn_gpu.note_light_gpu(g.lights + g.lights_half);
                 }
                 perf::gpu(g);
             }

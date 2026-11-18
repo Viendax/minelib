@@ -396,6 +396,7 @@ impl LightSettings {
         } else {
             2
         };
+        r.half_lighting = b("eclairage_demi", d.half_lighting);
         r.vl_max_dist = f("rayons_distance", d.vl_max_dist, 8.0, 256.0);
         r.vl_tip_boost = f("rayons_lueur", d.vl_tip_boost, 0.0, 4.0);
         r.vl_tip_radius = f("rayons_lueur_rayon", d.vl_tip_radius, 0.1, 4.0);
@@ -449,6 +450,7 @@ impl LightSettings {
         kv("rayons_intensite", r.vl_intensity.to_string());
         kv("rayons_pas", r.vl_steps.to_string());
         kv("rayons_resolution", r.vl_scale.to_string());
+        kv("eclairage_demi", r.half_lighting.to_string());
         kv("rayons_distance", r.vl_max_dist.to_string());
         kv("rayons_lueur", r.vl_tip_boost.to_string());
         kv("rayons_lueur_rayon", r.vl_tip_radius.to_string());

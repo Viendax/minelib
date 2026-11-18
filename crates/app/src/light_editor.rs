@@ -2274,6 +2274,11 @@ impl Editor {
                 ) {
                     r.specular = v;
                 }
+                self.check(p, "Éclairage en demi-résolution", &mut r.half_lighting);
+                p.note(
+                    "Un pixel sur quatre calculé, les autres repris de leurs voisins sauf aux bords des objets, des ombres et des reflets (calculés exactement) : même image, moins de calcul.",
+                    DIM,
+                );
                 self.check(p, "Éclairage en bandes", &mut r.toon);
                 if r.toon {
                     if let Some(v) = self.slider(

@@ -49,7 +49,7 @@ struct DynHeader {
     vl_b: vec4<f32>,
     // x = pas max, y = pas entre deux tests d'ombre, z = pas entre deux bruits, w = drapeaux
     // (1 ombres des rayons, 2 bruit, 4 tramage tournant, 8 ombres des surfaces, 16 bandes,
-    // 32 reflets, 64 rayons, 128 ombres des joueurs).
+    // 32 reflets, 64 rayons, 128 ombres des joueurs, 256 éclairage en demi-résolution).
     vl_c: vec4<u32>,
     // x = douceur des ombres par défaut, y = taille de l'atlas (px), z = taille d'une case,
     // w = cases par ligne.
@@ -84,6 +84,8 @@ const DL_TOON: u32 = 16u;
 const DL_SPECULAR: u32 = 32u;
 const DL_VOLUMETRIC: u32 = 64u;
 const DL_BOX_SHADOWS: u32 = 128u;
+// Éclairage différé en demi-résolution, exact aux bords (dyn_deferred.wgsl).
+const DL_HALF_LIGHT: u32 = 256u;
 
 // Variante compilée à part : sans ombres douces (aucune lumière n'en a), tout le code des
 // pénombres disparaît du shader, qui tient alors dans moins de registres (plus de pixels
