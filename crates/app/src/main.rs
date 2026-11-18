@@ -584,8 +584,7 @@ impl Game {
         // Hors du jeu, les menus n'ont pas besoin de plus de 120 images/s. En partie, la
         // garde thermique peut limiter plus bas (carte graphique trop chaude).
         let max = if self.session.is_some() {
-            let dt = self.frame_start.elapsed().as_secs_f32();
-            self.heat.update(dt, self.fps_limit());
+            self.heat.update(self.fps_limit());
             match (self.fps_limit(), self.heat.cap()) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -3554,6 +3553,15 @@ impl GameLoop for Game {
         }
         self.renderer = Some(renderer);
         self.frames_drawn = self.frames_drawn.saturating_add(1);
+        // Garde thermique : jamais sous la fréquence de l'écran (relue avant chaque décision).
+        if self.heat.wants_hz() {
+            self.heat.set_hz(
+                window
+                    .current_monitor()
+                    .and_then(|m| m.refresh_rate_millihertz())
+                    .map(|mhz| mhz as f32 / 1000.0),
+            );
+        }
         self.limit_fps();
         minelib_render::perf::frame_end();
         !self.quit

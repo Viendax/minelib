@@ -8,8 +8,10 @@
 //! au-delà ; journaux du 18 novembre). Moins d'images inutiles, c'est moins de chaleur.
 //!
 //! Toutes les 5 s (le rythme de la sonde), au-dessus de la cible la limite baisse de 10 %
-//! (20 % à 6 °C et plus au-dessus), jamais sous `MIN_FPS` ; 3 °C sous la cible, elle remonte
-//! de 10 %, et disparaît quand elle dépasse la limite choisie par le joueur (ou 1000).
+//! (20 % à 6 °C et plus au-dessus), jamais sous la fréquence de l'écran (v170 : on ne voit
+//! donc aucune différence ; avant, elle descendait jusqu'à 60 et y restait, la carte ne
+//! passant que de 89 à 80 °C) ; 3 °C sous la cible, elle remonte de 10 %, et disparaît
+//! quand elle dépasse la limite choisie par le joueur (ou 1000).
 //! Réglage : `/temperature <°C|off>`, retenu dans le fichier `garde_thermique`.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,8 +19,10 @@ use std::time::{Duration, Instant};
 
 /// Cible par défaut (°C).
 pub const DEFAULT_TARGET: u32 = 75;
-/// La limite ne descend jamais sous ce nombre d'images par seconde.
+/// La limite ne descend jamais sous la fréquence de l'écran, ni sous ce nombre d'images par
+/// seconde (écran inconnu : `DEFAULT_HZ`).
 pub const MIN_FPS: f32 = 60.0;
+const DEFAULT_HZ: f32 = 144.0;
 /// Fichier du réglage (dans le dossier du jeu).
 const FILE: &str = "garde_thermique";
 /// Rythme des décisions (celui de la sonde).
@@ -59,8 +63,11 @@ pub fn set_target(t: Option<u32>) {
 pub struct Guard {
     cap: Option<f32>,
     next: Instant,
-    /// Images par seconde mesurées (moyenne glissante).
-    fps: f32,
+    /// Images comptées depuis la dernière décision (images par seconde réelles).
+    frames: u32,
+    since: Instant,
+    /// Fréquence de l'écran (images par seconde), relue à chaque décision.
+    hz: Option<f32>,
     /// Dernière limite écrite au journal.
     logged: Option<f32>,
 }
@@ -70,9 +77,26 @@ impl Guard {
         Self {
             cap: None,
             next: Instant::now() + PERIOD,
-            fps: 0.0,
+            frames: 0,
+            since: Instant::now(),
+            hz: None,
             logged: None,
         }
+    }
+
+    /// Faut-il relire la fréquence de l'écran (juste avant une décision) ?
+    pub fn wants_hz(&self) -> bool {
+        Instant::now() >= self.next
+    }
+
+    /// Fréquence de l'écran (Hz), si connue.
+    pub fn set_hz(&mut self, hz: Option<f32>) {
+        self.hz = hz.filter(|h| *h >= 30.0);
+    }
+
+    /// Plancher de la limite : la fréquence de l'écran.
+    fn floor(&self) -> f32 {
+        self.hz.unwrap_or(DEFAULT_HZ).max(MIN_FPS)
     }
 
     /// Limite d'images voulue par la garde.
@@ -82,17 +106,17 @@ impl Guard {
 
     /// Une image de partie vient de passer (`dt` secondes) ; `user` : la limite choisie par
     /// le joueur. Toutes les 5 s, la limite suit la température.
-    pub fn update(&mut self, dt: f32, user: Option<f32>) {
-        if dt > 0.0 {
-            let f = 1.0 / dt;
-            self.fps = if self.fps == 0.0 { f } else { self.fps + (f - self.fps) * 0.05 };
-        }
+    pub fn update(&mut self, user: Option<f32>) {
+        self.frames += 1;
         if Instant::now() < self.next {
             return;
         }
+        let fps = self.frames as f32 / self.since.elapsed().as_secs_f32().max(0.001);
+        self.frames = 0;
+        self.since = Instant::now();
         self.next = Instant::now() + PERIOD;
         let temp = minelib_render::thermal::gpu_temp();
-        self.cap = step(self.cap, temp, target(), self.fps, user);
+        self.cap = step(self.cap, temp, target(), fps, user, self.floor());
         self.note(temp);
     }
 
@@ -111,7 +135,8 @@ impl Guard {
         match (self.cap, target()) {
             (Some(c), Some(goal)) => log::info!(
                 "garde thermique : carte graphique à {t} °C (cible {goal} °C), images limitées \
-                 à {c:.0} par seconde"
+                 à {c:.0} par seconde (écran : {:.0} Hz)",
+                self.floor()
             ),
             _ => log::info!("garde thermique : carte graphique à {t} °C, plus de limite"),
         }
@@ -119,18 +144,30 @@ impl Guard {
 }
 
 /// Nouvelle limite d'images, d'après l'ancienne, la température, la cible, les images par
-/// seconde mesurées et la limite du joueur.
-fn step(cap: Option<f32>, temp: Option<f32>, goal: Option<u32>, fps: f32, user: Option<f32>) -> Option<f32> {
+/// seconde mesurées, la limite du joueur et le plancher (fréquence de l'écran).
+fn step(
+    cap: Option<f32>,
+    temp: Option<f32>,
+    goal: Option<u32>,
+    fps: f32,
+    user: Option<f32>,
+    floor: f32,
+) -> Option<f32> {
     let (Some(t), Some(goal)) = (temp, goal) else {
         return None;
     };
     let goal = goal as f32;
     let top = user.unwrap_or(1000.0);
+    // Le joueur limite déjà sous l'écran : rien à faire de plus.
+    if top <= floor {
+        return None;
+    }
     if t > goal + 0.5 {
-        // Limite sous ce qui tourne vraiment (la carte peut déjà tourner moins vite).
-        let base = cap.unwrap_or(top).min(fps.max(MIN_FPS)).min(top);
+        // Limite sous ce qui tourne vraiment (la carte peut déjà tourner moins vite ; une
+        // mesure faite pendant un chargement ne descend pas sous le plancher).
+        let base = cap.unwrap_or(top).min(fps.max(floor)).min(top);
         let k = if t >= goal + 6.0 { 0.8 } else { 0.9 };
-        Some((base * k).max(MIN_FPS))
+        Some((base * k).max(floor))
     } else if t < goal - 3.0 {
         cap.map(|c| c * 1.1).filter(|c| *c < top)
     } else {
@@ -217,26 +254,32 @@ mod tests {
 
     #[test]
     fn la_limite_suit_la_temperature() {
+        const HZ: f32 = 144.0;
         // Pas de sonde, ou garde coupée : aucune limite.
-        assert_eq!(step(None, None, Some(75), 300.0, None), None);
-        assert_eq!(step(Some(120.0), Some(88.0), None, 300.0, None), None);
+        assert_eq!(step(None, None, Some(75), 300.0, None, HZ), None);
+        assert_eq!(step(Some(200.0), Some(88.0), None, 300.0, None, HZ), None);
         // Chaud (88 °C pour 75) : 20 % sous ce qui tourne.
-        let c = step(None, Some(88.0), Some(75), 300.0, None).unwrap();
+        let c = step(None, Some(88.0), Some(75), 300.0, None, HZ).unwrap();
         assert!((c - 240.0).abs() < 0.1, "{c}");
-        // Encore chaud : la limite baisse encore, jamais sous 60.
+        // Encore chaud : la limite baisse encore, jamais sous la fréquence de l'écran.
         let mut cap = Some(c);
         for _ in 0..30 {
-            cap = step(cap, Some(80.0), Some(75), cap.unwrap(), None);
+            cap = step(cap, Some(80.0), Some(75), cap.unwrap(), None, HZ);
         }
-        assert_eq!(cap, Some(MIN_FPS));
+        assert_eq!(cap, Some(HZ));
+        // Mesure faite pendant un chargement (12 images par seconde) : pas sous l'écran
+        // (la v169 tombait à 60 et y restait).
+        assert_eq!(step(None, Some(82.0), Some(75), 12.0, None, HZ), Some(HZ));
         // Près de la cible : on ne bouge pas.
-        assert_eq!(step(Some(100.0), Some(74.0), Some(75), 100.0, None), Some(100.0));
+        assert_eq!(step(Some(200.0), Some(74.0), Some(75), 200.0, None, HZ), Some(200.0));
         // Bien refroidie : la limite remonte, puis disparaît au-delà de celle du joueur.
-        assert!((step(Some(100.0), Some(70.0), Some(75), 100.0, None).unwrap() - 110.0).abs() < 0.1);
-        assert_eq!(step(Some(140.0), Some(70.0), Some(75), 140.0, Some(144.0)), None);
-        // Chaud avec une limite du joueur plus basse : on part de la sienne.
-        let c = step(None, Some(80.0), Some(75), 300.0, Some(144.0)).unwrap();
-        assert!((c - 129.6).abs() < 0.1, "{c}");
+        assert!((step(Some(200.0), Some(70.0), Some(75), 200.0, None, HZ).unwrap() - 220.0).abs() < 0.1);
+        assert_eq!(step(Some(230.0), Some(70.0), Some(75), 230.0, Some(240.0), HZ), None);
+        // Le joueur limite déjà à la fréquence de l'écran ou dessous : rien.
+        assert_eq!(step(None, Some(88.0), Some(75), 300.0, Some(144.0), HZ), None);
+        // Chaud avec une limite du joueur plus haute que l'écran : on part de la sienne.
+        let c = step(None, Some(80.0), Some(75), 300.0, Some(200.0), HZ).unwrap();
+        assert!((c - 180.0).abs() < 0.1, "{c}");
     }
 
     #[test]
