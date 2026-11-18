@@ -46,6 +46,12 @@ pub fn resolve(pack: &ResourcePack, src: &TexSrc) -> Rgba {
             }
             img
         }
+        // Objet montré dans un cadre : transparent s'il manque (rien n'est dessiné).
+        TexSrc::Item(n) => pack.item_image(n).unwrap_or_else(|| {
+            let mut img = Rgba::missing(16);
+            img.data.fill(0);
+            img
+        }),
     }
 }
 

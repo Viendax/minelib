@@ -46,6 +46,7 @@ mod anticheat;
 mod audio;
 mod buildnet;
 mod chat;
+mod crowd;
 mod cs;
 mod daytime;
 mod debug;
@@ -110,6 +111,8 @@ enum Screen {
     Settings,
     Graphics,
     Controls,
+    /// Paramètres → Son : sortie et micro, volumes.
+    Sound,
     /// Conversion d'un monde Minecraft en cours (une image affichée avant de bloquer).
     Loading,
     Playing,
@@ -207,6 +210,11 @@ struct Game {
     settings_return: Screen,
     /// Curseur de réglage tenu à la souris.
     slider_drag: Option<u32>,
+    /// Écran Son : sorties et micros du système (lus en l'ouvrant), défilement et barre
+    /// tenue de chaque liste.
+    sound_devices: (Vec<String>, Vec<String>),
+    sound_scroll: [usize; 2],
+    sound_drag: [bool; 2],
     /// Distance de rendu permise par la mémoire vive (mesurée au lancement).
     ram_view_limit: i32,
     /// Plein écran réellement appliqué à la fenêtre.
@@ -278,6 +286,9 @@ impl Game {
         let keys = keys::Bindings::load(&paths.root.join("keys.txt"));
         let options = Options::load(&paths.options);
         jobs::set_uniform_sharing(options.cpu_uniform);
+        crate::audio::set_output(&options.audio_out);
+        crate::voice::set_input(&options.audio_in);
+        crate::voice::set_mic_gain(options.volume_mic);
         let packs = list_packs(&paths.resourcepacks);
         let pack = packs
             .iter()
@@ -342,6 +353,9 @@ impl Game {
             packs_return: Screen::Title,
             settings_return: Screen::Title,
             slider_drag: None,
+            sound_devices: (Vec::new(), Vec::new()),
+            sound_scroll: [0; 2],
+            sound_drag: [false; 2],
             ram_view_limit: session::ram_view_limit(),
             applied_fullscreen: None,
             direct_display: (None, None),
@@ -495,6 +509,8 @@ impl Game {
                 s.fps_color = self.options.fps_color;
                 s.skins.set_mine(self.my_skin.clone());
                 s.volume = self.options.volume;
+                s.voice_volume = self.options.volume_voice;
+                s.set_screens_volume(self.options.volume_screens);
                 s.keys = self.keys.clone();
                 // Essais de l'interface : éditeur de lumières ouvert, première lumière choisie.
                 if std::env::var("MINELIB_UI").is_ok_and(|v| v == "lumieres") {
@@ -915,6 +931,12 @@ impl Game {
                 Event::Skin { pseudo, png } => {
                     if let Some(s) = &mut self.session {
                         s.skins.received(pseudo, png);
+                    }
+                }
+                // (v165) Ping avec le relais du monde (construction : montré aux autres).
+                Event::Rtt(ms) => {
+                    if let Some(b) = self.session.as_mut().and_then(|s| s.build.as_mut()) {
+                        b.set_world_ping(*ms);
                     }
                 }
                 Event::SkinChanged(pseudo) => {
@@ -1410,6 +1432,8 @@ impl Game {
                 }),
             }
         }
+        // Anciennes versions d'une carte jamais jouées jusqu'au bout en ligne : retirées.
+        multiplayer::hide_old_versions(&mut rows);
         rows.sort_by(|a, b| {
             b.waiting
                 .cmp(&a.waiting)
@@ -2345,19 +2369,8 @@ impl Game {
             picked = Some(i18n::LANGS[k].0);
         }
         y += 24.0 * s;
-        // Volume des sons (tirs, rechargements, lunette).
-        let vol = self.options.volume;
-        let label = format!("Volume : {} %", (vol * 100.0).round());
-        if let Some(f) = c.slider(7, &mut self.slider_drag, &label, vol, cx, y, 200.0) {
-            let v = (f * 20.0).round() / 20.0;
-            if v != self.options.volume {
-                self.options.volume = v;
-                if let Some(sess) = &mut self.session {
-                    sess.volume = v;
-                }
-                crate::audio::play(crate::audio::Sfx::Dry, 0.0, v);
-            }
-        }
+        // Son : sortie, micro et volumes.
+        let sound = c.button("Son", cx, y, 200.0, true);
         y += 30.0 * s;
         let done = c.button("Terminé", cx, (c.h * 0.72).max(y), 200.0, true);
         // Skin : aperçu en 3D qui tourne, à droite, et le bouton pour en changer.
@@ -2412,6 +2425,14 @@ impl Game {
         if graphics {
             self.screen = Screen::Graphics;
         }
+        if sound {
+            self.sound_devices = (
+                crate::audio::output_devices(),
+                crate::voice::input_devices(),
+            );
+            self.sound_scroll = [0; 2];
+            self.screen = Screen::Sound;
+        }
         if controls {
             self.sens_text = format_sens(if self.keys_tab_fps {
                 self.options.sensitivity_fps
@@ -2432,6 +2453,185 @@ impl Game {
                 log::error!("options : {e:#}");
             }
             self.screen = self.settings_return;
+        }
+    }
+
+    /// Paramètres → Son. En haut, deux listes : la sortie son et le micro (« Périphérique
+    /// par défaut » d'abord, puis ceux du système). Sous la sortie, le volume du jeu ; sous
+    /// le micro, son volume. En dessous, le volume des écrans vidéo et, à sa droite, celui
+    /// du tchat vocal entrant.
+    fn sound_screen(&mut self, input: &Input, size: (u32, u32), over_game: bool) {
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        if over_game {
+            c.dim(0.7);
+        } else {
+            c.background();
+        }
+        let s = c.s;
+        c.text_center("Son", c.h * 0.08, s * 2.0, WHITE);
+        let cx = c.w / 2.0;
+        // Deux colonnes de 200 (pixels de texture), 10 d'écart.
+        let col = [cx - 105.0 * s, cx + 105.0 * s];
+        let list_w = 200.0 * s;
+        let row_h = 13.0 * s;
+        let rows_shown = 5;
+        let top = c.h * 0.08 + 30.0 * s;
+        let list_h = row_h * rows_shown as f32 + 4.0 * s;
+        let mut chosen: [Option<String>; 2] = [None, None];
+        for k in 0..2 {
+            let (title, devices, current) = if k == 0 {
+                (
+                    "Sortie (haut-parleurs, casque)",
+                    &self.sound_devices.0,
+                    &self.options.audio_out,
+                )
+            } else {
+                (
+                    "Entrée (micro)",
+                    &self.sound_devices.1,
+                    &self.options.audio_in,
+                )
+            };
+            let x = col[k] - list_w / 2.0;
+            c.ui.text(x, top - 11.0 * s, s, GREY, title);
+            c.frame(x, top, list_w, list_h);
+            // « Périphérique par défaut » (nom vide), puis ceux du système.
+            let names: Vec<&str> = std::iter::once("")
+                .chain(devices.iter().map(String::as_str))
+                .collect();
+            let inner_w = list_w - c.bar_w() - 6.0 * s;
+            let over = c.hovered(x, top, list_w, list_h);
+            Ctx::wheel(
+                input,
+                over,
+                names.len(),
+                rows_shown,
+                &mut self.sound_scroll[k],
+            );
+            for (i, name) in names
+                .iter()
+                .enumerate()
+                .skip(self.sound_scroll[k])
+                .take(rows_shown)
+            {
+                let ry = top + 2.0 * s + (i - self.sound_scroll[k]) as f32 * row_h;
+                let rx = x + 2.0 * s;
+                let selected = *name == current.as_str();
+                let hover = c.hovered(rx, ry, inner_w, row_h);
+                if selected {
+                    c.ui.rect(rx, ry, inner_w, row_h, [0.85, 0.85, 0.9, 0.25]);
+                } else if hover {
+                    c.ui.rect(rx, ry, inner_w, row_h, [1.0, 1.0, 1.0, 0.08]);
+                }
+                let label = if name.is_empty() {
+                    "Périphérique par défaut".to_string()
+                } else {
+                    name.to_string()
+                };
+                let color = if selected { GOLD } else { WHITE };
+                let text = crate::menu::fit(&label, inner_w - 6.0 * s, s);
+                c.ui.text(rx + 3.0 * s, ry + (row_h - 8.0 * s) / 2.0, s, color, text);
+                if hover && c.click && !selected {
+                    chosen[k] = Some(name.to_string());
+                }
+            }
+            let bx = x + list_w - c.bar_w() - 2.0 * s;
+            let mut drag = self.sound_drag[k];
+            c.scrollbar(
+                bx,
+                top + 2.0 * s,
+                list_h - 4.0 * s,
+                names.len(),
+                rows_shown,
+                &mut self.sound_scroll[k],
+                &mut drag,
+            );
+            self.sound_drag[k] = drag;
+        }
+        // Sous la sortie : le volume du jeu ; sous l'entrée : celui du micro.
+        let y = top + list_h + 10.0 * s;
+        let vol = self.options.volume;
+        let label = format!("Volume du jeu : {} %", (vol * 100.0).round());
+        let game_vol = c.slider(7, &mut self.slider_drag, &label, vol, col[0], y, 200.0);
+        let mic = self.options.volume_mic;
+        let label = format!("Volume du micro : {} %", (mic * 100.0).round());
+        let mic_vol = c.slider(
+            20,
+            &mut self.slider_drag,
+            &label,
+            mic / 2.0,
+            col[1],
+            y,
+            200.0,
+        );
+        // En dessous : les écrans vidéo, et à droite le tchat vocal entrant.
+        let y2 = y + 30.0 * s;
+        let scr = self.options.volume_screens;
+        let label = format!("Volume des écrans : {} %", (scr * 100.0).round());
+        let screens_vol = c.slider(21, &mut self.slider_drag, &label, scr, col[0], y2, 200.0);
+        let vc = self.options.volume_voice;
+        let label = format!("Tchat vocal entrant : {} %", (vc * 100.0).round());
+        let voice_vol = c.slider(
+            22,
+            &mut self.slider_drag,
+            &label,
+            vc / 2.0,
+            col[1],
+            y2,
+            200.0,
+        );
+        let done = c.button("Terminé", cx, (y2 + 34.0 * s).max(c.h * 0.84), 200.0, true);
+        if let Some(name) = chosen[0].take() {
+            crate::audio::set_output(&name);
+            self.options.audio_out = name;
+            crate::audio::play(crate::audio::Sfx::Dry, 0.0, self.options.volume);
+        }
+        if let Some(name) = chosen[1].take() {
+            crate::voice::set_input(&name);
+            self.options.audio_in = name;
+        }
+        if let Some(f) = game_vol {
+            let v = (f * 20.0).round() / 20.0;
+            if v != self.options.volume {
+                self.options.volume = v;
+                if let Some(sess) = &mut self.session {
+                    sess.volume = v;
+                }
+                crate::audio::play(crate::audio::Sfx::Dry, 0.0, v);
+            }
+        }
+        if let Some(f) = mic_vol {
+            let v = (f * 2.0 * 20.0).round() / 20.0;
+            if v != self.options.volume_mic {
+                self.options.volume_mic = v;
+                crate::voice::set_mic_gain(v);
+            }
+        }
+        if let Some(f) = screens_vol {
+            let v = (f * 20.0).round() / 20.0;
+            if v != self.options.volume_screens {
+                self.options.volume_screens = v;
+                if let Some(sess) = &mut self.session {
+                    sess.set_screens_volume(v);
+                }
+            }
+        }
+        if let Some(f) = voice_vol {
+            let v = (f * 2.0 * 20.0).round() / 20.0;
+            if v != self.options.volume_voice {
+                self.options.volume_voice = v;
+                if let Some(sess) = &mut self.session {
+                    sess.voice_volume = v;
+                }
+            }
+        }
+        if done || input.pressed(KeyCode::Escape) {
+            self.slider_drag = None;
+            self.sound_drag = [false; 2];
+            if let Err(e) = self.options.save(&self.paths.options) {
+                log::error!("options : {e:#}");
+            }
+            self.screen = Screen::Settings;
         }
     }
 
@@ -3241,6 +3441,7 @@ impl GameLoop for Game {
                     | Screen::Settings
                     | Screen::Graphics
                     | Screen::Controls
+                    | Screen::Sound
             );
         if in_world {
             let active = self.screen == Screen::Playing;
@@ -3265,6 +3466,7 @@ impl GameLoop for Game {
                 Screen::Settings => self.settings_screen(input, size, true),
                 Screen::Graphics => self.graphics_screen(input, size, true, &mut renderer),
                 Screen::Controls => self.controls_screen(input, size, true),
+                Screen::Sound => self.sound_screen(input, size, true),
                 _ => {}
             }
             // Monde ouvert dans les toutes premières secondes du jeu : les shaders lourds
@@ -3305,6 +3507,7 @@ impl GameLoop for Game {
                 Screen::Settings => self.settings_screen(input, size, false),
                 Screen::Graphics => self.graphics_screen(input, size, false, &mut renderer),
                 Screen::Controls => self.controls_screen(input, size, false),
+                Screen::Sound => self.sound_screen(input, size, false),
                 Screen::Loading => self.loading_screen(input, size),
                 Screen::Multiplayer => self.multiplayer_screen(input, size),
                 Screen::Servers(kind) => self.servers_screen(input, size, kind),

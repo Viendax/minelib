@@ -1,5 +1,6 @@
 //! Minimap (radar) du mode FPS, en haut à droite, avec les règles de CS : vue de dessus
-//! autour du joueur (le nord en haut), murs clairs et sol sombre selon la hauteur, sites de
+//! autour du joueur, qui tourne avec lui (son regard toujours en haut, le nord marqué d'un
+//! « N »), murs clairs et sol sombre selon la hauteur, sites de
 //! bombe, coéquipiers toujours (à leur couleur), adversaires seulement quand ils sont
 //! repérés (ceux que l'hôte nous envoie, c'est-à-dire vus), bombe posée ou lâchée.
 
@@ -44,6 +45,8 @@ pub struct Radar {
     /// Dossier de la carte, et temps avant de regarder de nouveau si le relevé est prêt.
     dir: Option<std::path::PathBuf>,
     poll: f32,
+    /// Case des pieds du joueur (hauteur) : les teintes du relevé en dépendent.
+    feet: i32,
 }
 
 impl Radar {
@@ -102,6 +105,13 @@ impl Radar {
             feet.y.floor() as i32,
             feet.z.floor() as i32,
         ];
+        self.feet = c[1];
+        // (v165) Relevé de la carte (fait d'avance) : lu directement au dessin, tout de
+        // suite et partout (plus de morceaux qui manquent le temps d'être recalculés).
+        if self.survey.is_some() {
+            self.center = Some(c);
+            return;
+        }
         match self.center {
             None => {
                 self.center = Some(c);
@@ -154,8 +164,23 @@ impl Radar {
         }
     }
 
+    /// Teinte (`SHADES`) de la colonne (`wx`, `wz`) : d'après le relevé de la carte, sinon
+    /// d'après la grille des blocs autour du joueur.
+    fn shade_at(&self, c: [i32; 3], wx: i32, wz: i32) -> u8 {
+        if let Some(s) = &self.survey {
+            return s.shade(wx, self.feet, wz);
+        }
+        let (col, row) = (wx - (c[0] - GRID), wz - (c[2] - GRID));
+        if (0..SIDE as i32).contains(&col) && (0..SIDE as i32).contains(&row) {
+            self.cells[row as usize * SIDE + col as usize]
+        } else {
+            0
+        }
+    }
+
     /// Dessine le radar (carré de `size` pixels en `x`, `y`), centré exactement sur le
-    /// joueur (il glisse avec lui, sans à-coup). `me` : position, regard et couleur ; `mates` :
+    /// joueur (il glisse avec lui, sans à-coup) et tourné avec lui : la direction de son
+    /// regard est toujours en haut. `me` : position, regard et couleur ; `mates` :
     /// coéquipiers en vie (position, couleur) ; `enemies` : adversaires repérés ; `bomb` :
     /// bombe connue.
     #[allow(clippy::too_many_arguments)]
@@ -179,46 +204,72 @@ impl Radar {
             size + 2.0 * s,
             [0.0, 0.0, 0.0, 0.6],
         );
-        let cell = size / (RADIUS * 2) as f32;
+        let n = (RADIUS * 2) as usize;
+        let cell = size / n as f32;
         let (cx, cy) = (x + size / 2.0, y + size / 2.0);
-        // Coin haut gauche de la case (wx, wz) à l'écran.
-        let sx = |wx: f32| cx + (wx - me.0.x) * cell;
-        let sy = |wz: f32| cy + (wz - me.0.z) * cell;
+        // Haut de la minimap : la direction du regard ; à droite : la droite du joueur.
+        let look = glam::Vec2::new(me.1.x, me.1.z);
+        let d = if look.length_squared() > 1e-8 {
+            look.normalize()
+        } else {
+            glam::Vec2::new(0.0, -1.0)
+        };
+        let r = glam::Vec2::new(-d.y, d.x);
         let (x1, y1) = (x + size, y + size);
-        // Cases visibles, par bandes de même teinte, coupées au bord du cadre.
-        for row in 0..SIDE {
-            let wz = (c[2] - GRID + row as i32) as f32;
-            let (top, bottom) = (sy(wz).max(y), sy(wz + 1.0).min(y1));
-            if bottom <= top {
-                continue;
-            }
-            let mut start = 0;
-            while start < SIDE {
-                let v = self.cells[row * SIDE + start];
-                let mut end = start + 1;
-                while end < SIDE && self.cells[row * SIDE + end] == v {
-                    end += 1;
-                }
-                if v != 0 {
-                    let wx0 = (c[0] - GRID + start as i32) as f32;
-                    let wx1 = (c[0] - GRID + end as i32) as f32;
-                    let (left, right) = (sx(wx0).max(x), sx(wx1).min(x1));
-                    if right > left {
-                        // Un demi-pixel de plus : pas de fente entre les bandes.
-                        ui.rect(
-                            left,
-                            top,
-                            (right - left + 0.5).min(x1 - left),
-                            (bottom - top + 0.5).min(y1 - top),
-                            SHADES[v as usize],
-                        );
+        // Cases : chaque carré de l'écran prend la teinte de la colonne du monde qui s'y
+        // trouve (carte tournée), par bandes de même teinte.
+        for j in 0..n {
+            let b = -((j as f32 + 0.5) * cell - size / 2.0) / cell;
+            let mut run: Option<(usize, u8)> = None;
+            for i in 0..=n {
+                let v = if i < n {
+                    let a = ((i as f32 + 0.5) * cell - size / 2.0) / cell;
+                    let w = r * a + d * b;
+                    let wx = (me.0.x + w.x).floor() as i32;
+                    let wz = (me.0.z + w.y).floor() as i32;
+                    self.shade_at(c, wx, wz)
+                } else {
+                    u8::MAX
+                };
+                match run {
+                    Some((_, v0)) if v0 == v => {}
+                    Some((i0, v0)) => {
+                        if v0 != 0 {
+                            let left = x + i0 as f32 * cell;
+                            let top = y + j as f32 * cell;
+                            // Un demi-pixel de plus : pas de fente entre les bandes.
+                            ui.rect(
+                                left,
+                                top,
+                                ((i - i0) as f32 * cell + 0.5).min(x1 - left),
+                                (cell + 0.5).min(y1 - top),
+                                SHADES[v0 as usize],
+                            );
+                        }
+                        run = Some((i, v));
                     }
+                    None => run = Some((i, v)),
                 }
-                start = end;
             }
         }
-        // Position monde → radar (le nord, -z, en haut). Hors du cadre : collé au bord.
-        let to = |p: Vec3| -> (f32, f32) { (sx(p.x).clamp(x, x1), sy(p.z).clamp(y, y1)) };
+        // Position monde → radar. Hors du cadre : collé au bord.
+        let screen = |p: Vec3| -> (f32, f32) {
+            let w = glam::Vec2::new(p.x - me.0.x, p.z - me.0.z);
+            (cx + w.dot(r) * cell, cy - w.dot(d) * cell)
+        };
+        let to = |p: Vec3| -> (f32, f32) {
+            let (px, py) = screen(p);
+            (px.clamp(x, x1), py.clamp(y, y1))
+        };
+        // Le nord, au bord du cadre dans sa direction.
+        {
+            let north = glam::Vec2::new(0.0, -1.0);
+            let (dx, dy) = (north.dot(r), -north.dot(d));
+            let k = (size / 2.0 - 5.0 * s) / dx.abs().max(dy.abs()).max(1e-3);
+            let (px, py) = (cx + dx * k, cy + dy * k);
+            let tw = Ui::text_width("N", s);
+            ui.text(px - tw / 2.0, py - 4.0 * s, s, [0.95, 0.95, 0.9, 0.85], "N");
+        }
         for (letter, at) in &self.sites {
             let (px, py) = to(Vec3::new(at[0], 0.0, at[1]));
             let t = letter.to_string();
@@ -245,18 +296,11 @@ impl Radar {
         for (p, col) in mates {
             dot(ui, *p, *col, 1.5 * s);
         }
-        // Soi : point à sa couleur (cerclé de blanc) au centre, trait dans la direction du
-        // regard.
-        let dir = Vec3::new(me.1.x, 0.0, me.1.z).normalize_or_zero();
+        // Soi : point à sa couleur (cerclé de blanc) au centre, trait vers le haut (le
+        // regard).
         for k in 1..=4 {
             let f = k as f32 * 1.6 * s;
-            ui.rect(
-                cx + dir.x * f - s / 2.0,
-                cy + dir.z * f - s / 2.0,
-                s,
-                s,
-                [1.0, 1.0, 1.0, 0.9],
-            );
+            ui.rect(cx - s / 2.0, cy - f - s / 2.0, s, s, [1.0, 1.0, 1.0, 0.9]);
         }
         let r = 2.0 * s;
         ui.rect(
@@ -370,51 +414,8 @@ impl Survey {
 
     /// Fait le relevé du monde `world` (chunks déjà chargés) pour la carte `map`.
     pub fn of(world: &World, map: &FpsMap) -> Self {
-        use minelib_world::ChunkPos;
         use std::collections::{HashSet, VecDeque};
-        type Cell = [i32; 3];
-        // Hauteur de collision d'une case (16es de bloc ; 0 : on passe au travers). Les
-        // portes comptent comme ouvertes : un passage.
-        let top = |c: Cell| -> u8 {
-            if c[1] < 0 || c[1] >= minelib_world::CHUNK_HEIGHT as i32 {
-                return 0;
-            }
-            let id = world.get(c[0], c[1], c[2]);
-            let def = id.def();
-            if !def.solid || def.key.starts_with("door_") || def.key.starts_with("ladder") {
-                return 0;
-            }
-            // Clôtures, murets, vitres : des barrières, on ne monte pas dessus.
-            if matches!(def.shape, minelib_world::registry::Shape::Post(_)) {
-                return 24;
-            }
-            def.boxes().iter().map(|b| b.1[1]).max().unwrap_or(16)
-        };
-        let loaded = |c: Cell| world.contains(ChunkPos::containing(c[0], c[2]));
-        let up = |c: Cell, d: i32| [c[0], c[1] + d, c[2]];
-        // On traverse la case (rien, ou un obstacle bas : dalle, tapis) ; elle bloque.
-        let pass = |c: Cell| top(c) <= 9;
-        let full = |c: Cell| top(c) > 9;
-        let ladder = |c: Cell| world.get(c[0], c[1], c[2]).def().key.starts_with("ladder");
-        // Place pour le corps (deux cases de haut).
-        let room = |c: Cell| loaded(c) && pass(c) && pass(up(c, 1));
-        let stand = |c: Cell| room(c) && (full(up(c, -1)) || top(c) > 0 || ladder(c));
-        // Lâché dans la case `c` : où l'on atterrit (ou rien : le vide).
-        let land = |mut c: Cell| -> Option<Cell> {
-            if !room(c) {
-                return None;
-            }
-            let from = c[1];
-            while !stand(c) {
-                c = up(c, -1);
-                // Une chute de plus de `SURVEY_FALL` blocs ne fait pas partie de la carte
-                // (on en meurt, ou c'est le dehors) ; de même le vide.
-                if c[1] < 0 || from - c[1] > SURVEY_FALL || !pass(c) {
-                    return None;
-                }
-            }
-            Some(c)
-        };
+        let r = Reach::new(world);
         let mut seen: HashSet<Cell> = HashSet::new();
         let mut queue: VecDeque<Cell> = VecDeque::new();
         // Départs : toutes les cases des deux zones où l'on peut se tenir.
@@ -423,23 +424,13 @@ impl Survey {
                 for z in zone.min[2]..=zone.max[2] {
                     for y in zone.min[1] - 1..=zone.max[1] + 1 {
                         let c = [x, y, z];
-                        if stand(c) && seen.insert(c) {
+                        if r.stand(c) && seen.insert(c) {
                             queue.push_back(c);
                         }
                     }
                 }
             }
         }
-        const DIRS: [[i32; 2]; 8] = [
-            [1, 0],
-            [-1, 0],
-            [0, 1],
-            [0, -1],
-            [1, 1],
-            [1, -1],
-            [-1, 1],
-            [-1, -1],
-        ];
         // Débogage (`MINELIB_SURVEY_TRACE=x,z`) : par où l'on arrive dans cette colonne.
         let trace: Option<[i32; 2]> = std::env::var("MINELIB_SURVEY_TRACE").ok().and_then(|v| {
             let mut it = v.split(',').filter_map(|t| t.trim().parse().ok());
@@ -450,62 +441,17 @@ impl Survey {
             if seen.len() > SURVEY_MAX {
                 break;
             }
-            let mut go = |n: Option<Cell>| {
-                if let Some(n) = n {
-                    if seen.insert(n) {
-                        if trace.is_some() {
-                            from.insert(n, c);
-                        }
-                        queue.push_back(n);
+            r.neighbors(c, |n, _| {
+                if seen.insert(n) {
+                    if trace.is_some() {
+                        from.insert(n, c);
                     }
+                    queue.push_back(n);
                 }
-            };
-            // Échelle : monter et descendre.
-            if ladder(c) {
-                for d in [1, -1] {
-                    let n = up(c, d);
-                    if room(n) && (ladder(n) || stand(n)) {
-                        go(Some(n));
-                    } else if d == 1 && room(n) {
-                        // Haut de l'échelle : on en sort vers le rebord d'à côté.
-                        for dir in &DIRS[..4] {
-                            go(land([n[0] + dir[0], n[1], n[2] + dir[1]]));
-                        }
-                    }
-                }
-            }
-            for dir in DIRS {
-                let diag = dir[0] != 0 && dir[1] != 0;
-                // En diagonale, le corps (0,6 bloc de large) ne passe pas entre deux blocs
-                // qui se touchent par un coin, ni en rasant un seul : les deux cases de
-                // côté doivent être libres à chaque pas.
-                let open = |from: Cell| {
-                    !diag
-                        || (room([from[0] + dir[0], from[1], from[2]])
-                            && room([from[0], from[1], from[2] + dir[1]]))
-                };
-                // Marcher (et tomber du bord).
-                if open(c) {
-                    go(land([c[0] + dir[0], c[1], c[2] + dir[1]]));
-                }
-                // Sauter : une case plus haut, jusqu'à 3 cases plus loin (2 pour monter).
-                if !pass(up(c, 2)) {
-                    continue;
-                }
-                let mut at = up(c, 1);
-                for dist in 1..=3 {
-                    let p = [at[0] + dir[0], at[1], at[2] + dir[1]];
-                    if !room(p) || !open(at) {
-                        break;
-                    }
-                    at = p;
-                    match land(p) {
-                        Some(l) if l[1] > c[1] && dist == 3 => {}
-                        l => go(l),
-                    }
-                }
-            }
+            });
         }
+        let full = |c: Cell| r.full(c);
+        let up = |c: Cell, d: i32| [c[0], c[1] + d, c[2]];
         if let Some(t) = trace {
             let mut at = seen.iter().copied().find(|c| c[0] == t[0] && c[2] == t[1]);
             while let Some(c) = at {
@@ -554,6 +500,171 @@ impl Survey {
         }
         s
     }
+}
+
+/// Une case du monde (x, y, z) : celle où sont les pieds.
+pub type Cell = [i32; 3];
+
+/// Façon de passer d'une case à une voisine (voir `Reach::neighbors`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Marcher (et tomber d'un bord).
+    Walk,
+    /// Sauter (monter d'une case, ou franchir un trou).
+    Jump,
+    /// Monter ou descendre une échelle (ou en sortir par le haut).
+    Ladder,
+}
+
+/// Directions horizontales : les quatre côtés, puis les diagonales.
+pub const DIRS: [[i32; 2]; 8] = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+    [1, 1],
+    [1, -1],
+    [-1, 1],
+    [-1, -1],
+];
+
+/// Où l'on peut aller dans un monde, et comment (marche, saut, chute, échelle) : les
+/// règles du relevé de la minimap, et celles que suivent les bots du mode FPS pour trouver
+/// leur chemin.
+pub struct Reach<'a> {
+    world: &'a World,
+}
+
+impl<'a> Reach<'a> {
+    pub fn new(world: &'a World) -> Self {
+        Self { world }
+    }
+
+    /// Hauteur de collision d'une case (16es de bloc ; 0 : on passe au travers). Les
+    /// portes comptent comme ouvertes : un passage.
+    fn top(&self, c: Cell) -> u8 {
+        if c[1] < 0 || c[1] >= minelib_world::CHUNK_HEIGHT as i32 {
+            return 0;
+        }
+        let def = self.world.get(c[0], c[1], c[2]).def();
+        if !def.solid || def.key.starts_with("door_") || def.key.starts_with("ladder") {
+            return 0;
+        }
+        // Clôtures, murets, vitres : des barrières, on ne monte pas dessus.
+        if matches!(def.shape, minelib_world::registry::Shape::Post(_)) {
+            return 24;
+        }
+        def.boxes().iter().map(|b| b.1[1]).max().unwrap_or(16)
+    }
+
+    fn loaded(&self, c: Cell) -> bool {
+        self.world
+            .contains(minelib_world::ChunkPos::containing(c[0], c[2]))
+    }
+
+    /// On traverse la case (rien, ou un obstacle bas : dalle, tapis).
+    pub fn pass(&self, c: Cell) -> bool {
+        self.top(c) <= 9
+    }
+
+    /// La case bloque.
+    pub fn full(&self, c: Cell) -> bool {
+        self.top(c) > 9
+    }
+
+    pub fn ladder(&self, c: Cell) -> bool {
+        self.world
+            .get(c[0], c[1], c[2])
+            .def()
+            .key
+            .starts_with("ladder")
+    }
+
+    /// Place pour le corps (deux cases de haut).
+    pub fn room(&self, c: Cell) -> bool {
+        self.loaded(c) && self.pass(c) && self.pass(up(c, 1))
+    }
+
+    /// On peut s'y tenir.
+    pub fn stand(&self, c: Cell) -> bool {
+        self.room(c) && (self.full(up(c, -1)) || self.top(c) > 0 || self.ladder(c))
+    }
+
+    /// Lâché dans la case `c` : où l'on atterrit (ou rien : le vide, une trop longue
+    /// chute).
+    pub fn land(&self, mut c: Cell) -> Option<Cell> {
+        if !self.room(c) {
+            return None;
+        }
+        let from = c[1];
+        while !self.stand(c) {
+            c = up(c, -1);
+            // Une chute de plus de `SURVEY_FALL` blocs ne fait pas partie de la carte
+            // (on en meurt, ou c'est le dehors) ; de même le vide.
+            if c[1] < 0 || from - c[1] > SURVEY_FALL || !self.pass(c) {
+                return None;
+            }
+        }
+        Some(c)
+    }
+
+    /// Les cases où l'on peut aller depuis `c` (où l'on se tient), et comment.
+    pub fn neighbors(&self, c: Cell, mut go: impl FnMut(Cell, Step)) {
+        // Échelle : monter et descendre.
+        if self.ladder(c) {
+            for d in [1, -1] {
+                let n = up(c, d);
+                if self.room(n) && (self.ladder(n) || self.stand(n)) {
+                    go(n, Step::Ladder);
+                } else if d == 1 && self.room(n) {
+                    // Haut de l'échelle : on en sort vers le rebord d'à côté.
+                    for dir in &DIRS[..4] {
+                        if let Some(l) = self.land([n[0] + dir[0], n[1], n[2] + dir[1]]) {
+                            go(l, Step::Ladder);
+                        }
+                    }
+                }
+            }
+        }
+        for dir in DIRS {
+            let diag = dir[0] != 0 && dir[1] != 0;
+            // En diagonale, le corps (0,6 bloc de large) ne passe pas entre deux blocs
+            // qui se touchent par un coin, ni en rasant un seul : les deux cases de
+            // côté doivent être libres à chaque pas.
+            let open = |from: Cell| {
+                !diag
+                    || (self.room([from[0] + dir[0], from[1], from[2]])
+                        && self.room([from[0], from[1], from[2] + dir[1]]))
+            };
+            // Marcher (et tomber du bord).
+            if open(c) {
+                if let Some(l) = self.land([c[0] + dir[0], c[1], c[2] + dir[1]]) {
+                    go(l, Step::Walk);
+                }
+            }
+            // Sauter : une case plus haut, jusqu'à 3 cases plus loin (2 pour monter).
+            if !self.pass(up(c, 2)) {
+                continue;
+            }
+            let mut at = up(c, 1);
+            for dist in 1..=3 {
+                let p = [at[0] + dir[0], at[1], at[2] + dir[1]];
+                if !self.room(p) || !open(at) {
+                    break;
+                }
+                at = p;
+                match self.land(p) {
+                    Some(l) if l[1] > c[1] && dist == 3 => {}
+                    Some(l) => go(l, Step::Jump),
+                    None => {}
+                }
+            }
+        }
+    }
+}
+
+fn up(c: Cell, d: i32) -> Cell {
+    [c[0], c[1] + d, c[2]]
 }
 
 /// Fait (ou refait) le relevé de la carte `dir` en tâche de fond, s'il manque ou n'est

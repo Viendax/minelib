@@ -208,6 +208,8 @@ pub struct Session {
     color_sent: Option<u8>,
     /// Volume général des sons (0..1).
     pub volume: f32,
+    /// Volume du tchat vocal entrant (Paramètres → Son ; 1 : tel quel).
+    pub voice_volume: f32,
     /// Touches choisies dans « Régler les touches ».
     pub keys: Bindings,
     /// Écoulement de l'eau et de la lave.
@@ -219,6 +221,9 @@ pub struct Session {
     heads: Option<crate::heads::Heads>,
     /// Dernière fois que les skins des têtes de joueurs ont été redemandés au relais.
     head_skins_at: Option<std::time::Instant>,
+    /// Points de mesure de la lumière de chaque chunk : combien sont aux têtes d'entités
+    /// (les suivants sont aux cadres).
+    probe_split: HashMap<ChunkPos, usize>,
     /// Cadres des murs (cartes importées).
     frames: Option<crate::frames::Frames>,
     /// Temps passé à avancer sans touche tenue (diagnostic), et déjà noté au journal.
@@ -228,6 +233,10 @@ pub struct Session {
     stick: crate::stick::Guard,
     fwd_was: bool,
     run_was: bool,
+    /// Double appui sur « avancer » (comme dans Minecraft) : temps restant pour le second
+    /// appui, et course lancée ainsi (jusqu'à ce qu'« avancer » soit lâchée).
+    fwd_tap: f32,
+    tap_sprint: bool,
     /// Mesure des arrêts, pour le journal : d'où la course est partie, et l'arrêt en
     /// cours de mesure (depuis la première des deux touches lâchée).
     run_from: Option<Vec3>,
@@ -300,6 +309,10 @@ pub struct Session {
     /// Marche des autres joueurs (par pseudo) : comme la sienne en F5, calculée sur leur
     /// déplacement affiché (fluide, quel que soit le rythme des messages).
     walks: HashMap<String, Walk>,
+    /// (v165, essai temporaire) Joueurs simulés autour de soi en solo (voir `crowd`), et
+    /// essai voulu (`/foule on|off`).
+    crowd: Option<crate::crowd::Crowd>,
+    crowd_on: bool,
     walk_amp: f32,
     /// Portes et trappes ouvertes pendant la partie : bloc fermé d'origine (pour refermer).
     opened: HashMap<[i32; 3], BlockId>,
@@ -471,17 +484,21 @@ impl Session {
             skins: crate::skin::Skins::default(),
             radar_map: false,
             volume: 0.6,
+            voice_volume: 1.0,
             keys: Bindings::default(),
             fluids: Default::default(),
             lava_burn: 0.0,
             heads: None,
             head_skins_at: None,
+            probe_split: HashMap::new(),
             frames: None,
             coast: 0.0,
             coast_logged: false,
             stick: crate::stick::Guard::restored(),
             fwd_was: false,
             run_was: false,
+            fwd_tap: 0.0,
+            tap_sprint: false,
             run_from: None,
             stop_meas: None,
             coast_air: 0.0,
@@ -520,6 +537,8 @@ impl Session {
             screen_broke: false,
             walk_phase: 0.0,
             walks: HashMap::new(),
+            crowd: None,
+            crowd_on: true,
             walk_amp: 0.0,
             opened: HashMap::new(),
             vox_origin: None,
@@ -808,6 +827,27 @@ impl Session {
                     self.fps_duck_on = self.keys.held(input, Action::FpsDuck);
                 }
             }
+            // Double appui sur « avancer » : on court tant qu'« avancer » reste tenue (mode
+            // construction, comme dans Minecraft ; en FPS, on court déjà par défaut).
+            if fps_mode || typing || self.inventory.open {
+                self.tap_sprint = false;
+                self.fwd_tap = 0.0;
+            } else {
+                if self.keys.pressed(input, Action::Forward) {
+                    if self.fwd_tap > 0.0 {
+                        self.tap_sprint = true;
+                        self.fwd_tap = 0.0;
+                    } else {
+                        self.fwd_tap = SPRINT_TAP_S;
+                    }
+                } else {
+                    self.fwd_tap = (self.fwd_tap - dt).max(0.0);
+                }
+                if !self.keys.held(input, Action::Forward) {
+                    self.tap_sprint = false;
+                }
+            }
+            let tap_sprint = self.tap_sprint;
             let keys = &self.keys;
             let axis = |pos: Action, neg: Action| {
                 keys.held(input, pos) as i32 as f32 - keys.held(input, neg) as i32 as f32
@@ -831,7 +871,7 @@ impl Session {
                     strafe: axis(Action::Right, Action::Left),
                     up: axis(Action::Jump, Action::Sneak),
                     jump: keys.held(input, Action::Jump),
-                    sprint: keys.held(input, Action::Sprint),
+                    sprint: keys.held(input, Action::Sprint) || tap_sprint,
                     sneak: keys.held(input, Action::Sneak),
                     jump_pressed: keys.pressed(input, Action::Jump),
                     fps: false,
@@ -1011,6 +1051,7 @@ impl Session {
                 self.update_fps(input, dt, renderer, typing);
             } else {
                 self.fps.buy_open = false;
+                self.build_splash();
                 // Sons des autres modes (portes…) : joués tout de suite (sinon ils
                 // s'accumulaient et partaient tous d'un coup en passant en mode FPS).
                 for (sfx, delay, gain) in self.fps.sounds.drain(..) {
@@ -1024,27 +1065,25 @@ impl Session {
             // Têtes (blocs « tête », têtes des entités des cartes) : textures téléchargées,
             // têtes proches.
             if self.heads.is_none() {
-                let h =
-                    crate::heads::Heads::load(&self.dir, minelib_assets::data_dir().join("tetes"));
-                // Lumière des têtes d'entités : mesurée par le maillage de leurs chunks.
-                for (pos, points) in h.probes() {
-                    self.world.set_probes(pos, points);
-                    self.streamer
-                        .remesh_now(&self.world, &mut self.workers, pos);
-                }
-                self.heads = Some(h);
+                self.heads = Some(crate::heads::Heads::load(
+                    &self.dir,
+                    minelib_assets::data_dir().join("tetes"),
+                ));
+                self.frames = Some(crate::frames::Frames::load(&self.dir));
+                // Lumière des têtes d'entités et des cadres : mesurée par le maillage de
+                // leurs chunks.
+                self.set_probes(None);
             }
             // Têtes et cadres : triangles gardés sur la carte graphique, refaits (une zone
             // à la fois) seulement quand ils changent ; éclairés comme les blocs.
-            let l = 0.3 + 0.7 * self.daylight;
             if let Some(heads) = self.heads.as_mut() {
                 let eye = self.player.eye();
                 heads.update(eye);
                 heads.refresh(eye, self.daylight);
             }
-            self.frames
-                .get_or_insert_with(|| crate::frames::Frames::load(&self.dir))
-                .refresh([l; 3]);
+            if let Some(f) = self.frames.as_mut() {
+                f.refresh(self.daylight);
+            }
             // Eau et lave qui coulent (hors parties FPS en ligne : la carte y est figée).
             let fluids_on = self.net.is_none() && self.game.mode != GameMode::Fps;
             if fluids_on {
@@ -1257,6 +1296,24 @@ impl Session {
             self.hand.update(dt, speed, swung, held);
             // Balancement des bras et des jambes du modèle (vue F5), et des autres joueurs.
             self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
+            // (v165, essai) Foule simulée en solo, hors mode FPS.
+            let solo = self.build.is_none() && self.net.is_none();
+            if self.crowd_on && solo && self.game.mode != GameMode::Fps {
+                if self.crowd.is_none() {
+                    self.chat.say(
+                        format!(
+                            "Essai de foule : jusqu'à {} joueurs simulés autour de toi en 2 \
+                             minutes. Dis-moi comment ça tourne ! (/foule off pour l'arrêter)",
+                            crate::crowd::MAX
+                        ),
+                        chat::YELLOW,
+                    );
+                }
+                let c = self.crowd.get_or_insert_with(crate::crowd::Crowd::new);
+                c.update(&self.world, self.player.pos, dt);
+            } else {
+                self.crowd = None;
+            }
             let mut seen: Vec<(String, Vec3)> = Vec::new();
             if let Some(n) = &self.net {
                 seen.extend(n.views().iter().map(|v| (v.pseudo.clone(), v.pos)));
@@ -1264,7 +1321,16 @@ impl Session {
             if let Some(b) = &self.build {
                 seen.extend(b.others.values().map(|o| (o.pseudo.clone(), o.pos)));
             }
-            self.walks.retain(|k, _| seen.iter().any(|s| &s.0 == k));
+            if let Some(c) = &self.crowd {
+                seen.extend(c.npcs.iter().map(|n| (n.name.clone(), n.pos)));
+            }
+            // (Des milliers de joueurs : un ensemble, pas une recherche dans la liste pour
+            // chacun.)
+            {
+                let names: std::collections::HashSet<&str> =
+                    seen.iter().map(|s| s.0.as_str()).collect();
+                self.walks.retain(|k, _| names.contains(k.as_str()));
+            }
             for (name, pos) in seen {
                 self.walks
                     .entry(name)
@@ -1369,10 +1435,18 @@ impl Session {
             self.player.pos.x,
             self.player.pos.z,
         );
-        // Têtes des chunks maillés : blocs « tête » et lumière reçue.
-        if let Some(h) = self.heads.as_mut() {
+        // Têtes des chunks maillés : blocs « tête » et lumière reçue (têtes d'entités, puis
+        // cadres : voir `set_probes`).
+        if self.heads.is_some() {
             for (pos, spots, probes) in self.streamer.take_heads() {
-                h.chunk_meshed(pos, spots, probes);
+                let n = self.probe_split.get(&pos).copied().unwrap_or(0);
+                let (hp, fp) = probes.split_at(n.min(probes.len()));
+                if let Some(h) = self.heads.as_mut() {
+                    h.chunk_meshed(pos, spots, hp.to_vec());
+                }
+                if let Some(f) = self.frames.as_mut().filter(|_| !fp.is_empty()) {
+                    f.set_light(pos, fp);
+                }
             }
         }
         let _s = perf::scope("visée");
@@ -2033,7 +2107,11 @@ impl Session {
         self.frame_aim = self.aimed_frame();
         if breaking {
             if let (Some(i), Some(frames)) = (self.frame_aim.take(), self.frames.as_mut()) {
+                let at = frames.pos(i);
                 frames.remove(i, &self.dir);
+                if let Some(p) = at {
+                    self.set_probes(Some(ChunkPos::containing(p[0], p[2])));
+                }
                 self.break_cooldown = 0.22;
                 return;
             }
@@ -2106,7 +2184,8 @@ impl Session {
             let look = self.player.look_dir();
             let changes = toggle_hinged(&self.world, &mut self.opened, hit.block, look);
             if !changes.is_empty() {
-                self.fps.sounds.push((crate::audio::Sfx::Door, 0.0, 0.9));
+                let sfx = crate::audio::Sfx::Door(door_opened(&changes));
+                self.fps.sounds.push((sfx, 0.0, 0.9));
             }
             for (p, b) in changes {
                 self.dirty.extend(self.world.set(p[0], p[1], p[2], b));
@@ -2398,6 +2477,35 @@ impl Session {
                 Item::Block(hit.id)
             };
             self.give_picked(wanted);
+        }
+    }
+
+    /// Points de mesure de la lumière (têtes d'entités, puis cadres) donnés au monde, chunk
+    /// par chunk ; `only` : ce chunk seulement (un cadre cassé). Les chunks concernés sont
+    /// remaillés : leur maillage mesure la lumière à ces points.
+    fn set_probes(&mut self, only: Option<ChunkPos>) {
+        let mut by: HashMap<ChunkPos, (Vec<[i32; 3]>, usize)> = HashMap::new();
+        if let Some(h) = &self.heads {
+            for (pos, pts) in h.probes() {
+                let e = by.entry(pos).or_default();
+                e.1 = pts.len();
+                e.0.extend(pts);
+            }
+        }
+        if let Some(f) = &self.frames {
+            for (pos, pts) in f.probes() {
+                by.entry(pos).or_default().0.extend(pts);
+            }
+        }
+        if let Some(o) = only {
+            by.retain(|p, _| *p == o);
+            by.entry(o).or_default();
+        }
+        for (pos, (pts, n)) in by {
+            self.probe_split.insert(pos, n);
+            self.world.set_probes(pos, pts);
+            self.streamer
+                .remesh_now(&self.world, &mut self.workers, pos);
         }
     }
 
@@ -2919,7 +3027,8 @@ impl Session {
             map.door_sync(),
         );
         if !changes.is_empty() {
-            self.fps.sounds.push((crate::audio::Sfx::Door, 0.0, 0.9));
+            let sfx = crate::audio::Sfx::Door(door_opened(&changes));
+            self.fps.sounds.push((sfx, 0.0, 0.9));
         }
         for (p, b) in changes {
             self.dirty.extend(self.world.set(p[0], p[1], p[2], b));
@@ -3024,7 +3133,7 @@ impl Session {
         }
         if let Event::Voice { from, data } = e {
             let (name, dist) = self.speaker(*from);
-            let mut gain = self.volume.max(0.05) * 1.6;
+            let mut gain = self.volume.max(0.05) * 1.6 * self.voice_volume;
             gain *= self
                 .voice_volumes
                 .get(&name.to_lowercase())
@@ -3288,15 +3397,15 @@ impl Session {
                     self.fps.heard_step(pos, eye, kind);
                 }
                 Local::Doors { cells, at } => {
-                    for (c, b) in cells {
-                        let b = BlockId(b);
+                    let changes: Vec<([i32; 3], BlockId)> =
+                        cells.into_iter().map(|(c, b)| (c, BlockId(b))).collect();
+                    for &(c, b) in &changes {
                         self.dirty.extend(self.world.set(c[0], c[1], c[2], b));
                     }
                     if let Some(at) = at {
                         let d = (at - self.player.eye()).length();
-                        self.fps
-                            .sounds
-                            .push((crate::audio::Sfx::Door, 0.0, 0.9 / (1.0 + d / 8.0)));
+                        let sfx = crate::audio::Sfx::Door(door_opened(&changes));
+                        self.fps.sounds.push((sfx, 0.0, 0.9 / (1.0 + d / 8.0)));
                     }
                 }
                 Local::Guns { guns, nades } => self.fps.set_guns(guns, nades),
@@ -3390,6 +3499,29 @@ impl Session {
         self.step_offset *= (-dt * 14.0).exp();
         if self.step_offset.abs() < 1e-3 {
             self.step_offset = 0.0;
+        }
+    }
+
+    /// Volume du son des écrans vidéo (Paramètres → Son).
+    pub fn set_screens_volume(&mut self, v: f32) {
+        self.displays.set_volume(v);
+    }
+
+    /// Mode Build : plongeon dans l'eau après une chute d'au moins `SPLASH_HEIGHT` (le même
+    /// bruit qu'en mode FPS). Pas en volant : on entre alors doucement dans l'eau.
+    fn build_splash(&mut self) {
+        if crate::player::in_water(&self.world, self.player.pos) {
+            if let Some(top) = self.fall_top.take() {
+                if top - self.player.pos.y >= crate::netgame::SPLASH_HEIGHT {
+                    self.fps.sounds.push((crate::audio::Sfx::Splash, 0.0, 0.9));
+                }
+            }
+        } else if self.player.on_ladder || self.player.on_ground || self.player.flying {
+            self.fall_top = None;
+        } else {
+            // Plus haut point atteint en l'air.
+            let y = self.player.pos.y;
+            self.fall_top = Some(self.fall_top.map_or(y, |t| t.max(y)));
         }
     }
 
@@ -3527,9 +3659,13 @@ impl Session {
             let y = self.player.pos.y;
             self.fall_top = Some(self.fall_top.map_or(y, |t| t.max(y)));
         }
-        if alive && self.player.on_ground && !self.player.flying && speed > 0.6 {
+        // Course : ses pas ne s'entendent (pour lui comme pour les autres) qu'à partir de
+        // 80 % de sa vitesse de course ; en marchant ou accroupi, il entend les siens, plus
+        // doux.
+        let run = speed > crate::netgame::step_speed(self.player.carry);
+        let quiet = self.fps_walk_on || self.fps_duck_on;
+        if alive && self.player.on_ground && !self.player.flying && speed > 0.6 && (run || quiet) {
             self.stride += speed * dt;
-            let run = speed > crate::netgame::STEP_SPEED;
             let every = if run {
                 crate::netgame::STRIDE
             } else {
@@ -4198,6 +4334,19 @@ impl Session {
                     );
                 }
             }
+            // (v165, essai) Foule simulée en solo : arrêtée ou relancée.
+            "foule" | "crowd" => match arg {
+                Some("off" | "non" | "0") => {
+                    self.crowd_on = false;
+                    self.crowd = None;
+                    self.chat.say("Essai de foule arrêté.", chat::YELLOW);
+                }
+                Some("on" | "oui" | "1") => {
+                    self.crowd_on = true;
+                    self.crowd = None;
+                }
+                _ => self.chat.say("Utilisation : /foule <on|off>", chat::RED),
+            },
             // Touche « avancer » qui remonte mal : règle forcée, refusée ou apprise.
             "touchelente" | "slowkey" => {
                 use crate::stick::Mode;
@@ -4998,7 +5147,7 @@ impl Session {
                 .find(|o| o.pseudo.eq_ignore_ascii_case(from))
                 .map(|o| (o.pos - self.player.pos).length())
         });
-        let mut gain = self.volume.max(0.05) * 1.6;
+        let mut gain = self.volume.max(0.05) * 1.6 * self.voice_volume;
         gain *= self
             .voice_volumes
             .get(&from.to_lowercase())
@@ -5131,7 +5280,7 @@ impl Session {
                 }
             }
         } else if let Some(b) = &self.build {
-            for (i, (pseudo, _)) in self.build_list(b).into_iter().enumerate() {
+            for (i, (pseudo, _, _)) in self.build_list(b).into_iter().enumerate() {
                 let (x, y) = (
                     size.0 / 2.0 + 40.0 * s,
                     size.1 * 0.18 + 12.0 * s * (i as f32 + 1.5),
@@ -5142,12 +5291,12 @@ impl Session {
         out
     }
 
-    /// Joueurs proches en construction, du plus près au plus loin.
-    fn build_list(&self, b: &crate::buildnet::BuildNet) -> Vec<(String, f32)> {
-        let mut v: Vec<(String, f32)> = b
+    /// Joueurs proches en construction, du plus près au plus loin : pseudo, distance, ping.
+    fn build_list(&self, b: &crate::buildnet::BuildNet) -> Vec<(String, f32, Option<u16>)> {
+        let mut v: Vec<(String, f32, Option<u16>)> = b
             .others
             .values()
-            .map(|o| (o.pseudo.clone(), (o.pos - self.player.pos).length()))
+            .map(|o| (o.pseudo.clone(), (o.pos - self.player.pos).length(), o.ping))
             .collect();
         v.sort_by(|a, b| a.1.total_cmp(&b.1));
         v.truncate(20);
@@ -5178,17 +5327,25 @@ impl Session {
             let (x, y0) = (size.0 / 2.0 - 120.0 * s, size.1 * 0.18);
             let h = 12.0 * s * (list.len() as f32 + 2.0);
             ui.rect(x, y0, 240.0 * s, h, [0.0, 0.0, 0.0, 0.7]);
+            let mine = match b.ping() {
+                0 => String::new(),
+                ms => format!("   (ton ping : {ms} ms)"),
+            };
             ui.text(
                 x + 6.0 * s,
                 y0 + 4.0 * s,
                 s,
                 [1.0, 0.9, 0.35, 1.0],
-                "Joueurs proches",
+                format!("Joueurs proches{mine}"),
             );
-            for (i, (name, d)) in list.iter().enumerate() {
+            // (v165) Ping de chacun à gauche de son pseudo.
+            let ping_w = Ui::text_width("9999 ms", s) + 6.0 * s;
+            for (i, (name, d, ping)) in list.iter().enumerate() {
                 let ry = y0 + 12.0 * s * (i as f32 + 1.5);
+                let (text, color) = ping_label(*ping);
+                ui.text(x + 6.0 * s, ry, s, color, text);
                 ui.text(
-                    x + 6.0 * s,
+                    x + 6.0 * s + ping_w,
                     ry,
                     s,
                     [1.0, 1.0, 1.0, 1.0],
@@ -5233,7 +5390,16 @@ impl Session {
 
     /// Construction en ligne : pseudos des joueurs proches.
     fn draw_build_names(&self, ui: &mut Ui, size: (f32, f32), s: f32) {
-        let Some(b) = &self.build else { return };
+        let mut near: Vec<(&str, Vec3)> = Vec::new();
+        if let Some(b) = &self.build {
+            near.extend(b.others.values().map(|o| (o.pseudo.as_str(), o.pos)));
+        }
+        if let Some(c) = &self.crowd {
+            near.extend(c.npcs.iter().map(|n| (n.name.as_str(), n.pos)));
+        }
+        if near.is_empty() {
+            return;
+        }
         let proj = Mat4::perspective_rh(
             self.fov.to_radians(),
             size.0 / size.1.max(1.0),
@@ -5241,16 +5407,16 @@ impl Session {
             1000.0,
         );
         let vp = proj * self.view_with_punch();
-        for o in b.others.values() {
-            let c = vp * (o.pos + Vec3::Y * 2.1).extend(1.0);
-            if c.w <= 0.0 || (o.pos - self.player.pos).length() > 64.0 {
+        for (pseudo, pos) in near {
+            let c = vp * (pos + Vec3::Y * 2.1).extend(1.0);
+            if c.w <= 0.0 || (pos - self.player.pos).length() > 64.0 {
                 continue;
             }
             let (x, y) = (
                 (c.x / c.w * 0.5 + 0.5) * size.0,
                 (0.5 - c.y / c.w * 0.5) * size.1,
             );
-            let tw = Ui::text_width(&o.pseudo, s);
+            let tw = Ui::text_width(pseudo, s);
             ui.rect(
                 x - tw / 2.0 - s,
                 y - s,
@@ -5258,7 +5424,7 @@ impl Session {
                 10.0 * s,
                 [0.0, 0.0, 0.0, 0.45],
             );
-            ui.text(x - tw / 2.0, y, s, [1.0, 1.0, 1.0, 1.0], o.pseudo.clone());
+            ui.text(x - tw / 2.0, y, s, [1.0, 1.0, 1.0, 1.0], pseudo.to_string());
         }
     }
 
@@ -5327,6 +5493,7 @@ impl Session {
             ui.rect(rx, y + 18.0 * s, sq, sq, team_color(side));
         }
         y += header;
+        let ping_w = Ui::text_width("9999 ms", s) + 6.0 * s;
         let cols: [(&str, f32); 8] = [
             ("$", 0.36),
             ("K", 0.47),
@@ -5360,7 +5527,10 @@ impl Session {
                 if r.id == me {
                     ui.rect(x + 2.0 * s, y - s, w - 4.0 * s, row, [1.0, 1.0, 1.0, 0.08]);
                 }
-                ui.text(x + 6.0 * s, y, s, c, r.pseudo.clone());
+                // (v165) Ping à gauche du pseudo (l'hôte de la partie : 0).
+                let (ping, pc) = ping_label((r.ping > 0).then_some(r.ping));
+                ui.text(x + 6.0 * s, y, s, pc, ping);
+                ui.text(x + 6.0 * s + ping_w, y, s, c, r.pseudo.clone());
                 let hs = if r.kills > 0 {
                     r.headshots as f32 * 100.0 / r.kills as f32
                 } else {
@@ -5747,31 +5917,45 @@ impl Session {
                 model.extend(crate::player_model::bomb(at, blink, self.hand_light));
             }
         }
+        // Construction en ligne (et, en solo, la foule d'essai : dessinée pareil).
+        let mut others: Vec<(&str, Vec3, f32, f32, f32)> = Vec::new();
         if let Some(b) = &self.build {
+            others.extend(
+                b.others
+                    .values()
+                    .map(|o| (o.pseudo.as_str(), o.pos, o.yaw, o.pitch, o.crouch)),
+            );
+        }
+        if let Some(c) = &self.crowd {
+            others.extend(
+                c.npcs
+                    .iter()
+                    .map(|n| (n.name.as_str(), n.pos, n.yaw, n.pitch, 0.0)),
+            );
+        }
+        if !others.is_empty() {
             // Foule : les plus proches en détail, les suivants en modèle simplifié, les
             // plus lointains en trois pavés (des milliers de joueurs visibles sans
             // effondrer les images par seconde).
-            let mut others: Vec<_> = b.others.values().collect();
             others.sort_by(|a, c| {
-                a.pos
-                    .distance_squared(cam)
-                    .total_cmp(&c.pos.distance_squared(cam))
+                a.1.distance_squared(cam)
+                    .total_cmp(&c.1.distance_squared(cam))
             });
-            for (rank, o) in others.into_iter().enumerate() {
-                let w = self.walks.get(&o.pseudo).copied().unwrap_or_default();
+            for (rank, &(pseudo, pos, yaw, pitch, crouch)) in others.iter().enumerate() {
+                let w = self.walks.get(pseudo).copied().unwrap_or_default();
                 let other = crate::player_model::Pose {
-                    feet: o.pos,
-                    yaw: o.yaw,
-                    pitch: o.pitch,
+                    feet: pos,
+                    yaw,
+                    pitch,
                     walk: w.phase,
                     swing: w.amp,
-                    crouch: o.crouch,
+                    crouch,
                     light: self.hand_light,
                     held: None,
-                    skin: self.skins.of(&o.pseudo),
+                    skin: self.skins.of(pseudo),
                 };
-                if rank < 24 && o.pos.distance_squared(cam) < 48.0 * 48.0 {
-                    shadows.push((o.pos, crate::player_model::shadow_boxes(&other)));
+                if rank < 24 && pos.distance_squared(cam) < 48.0 * 48.0 {
+                    shadows.push((pos, crate::player_model::shadow_boxes(&other)));
                     model.extend(crate::player_model::build(&other));
                 } else if rank < 256 {
                     model.extend(crate::player_model::build_far(&other));
@@ -5932,6 +6116,19 @@ impl Session {
     }
 }
 
+/// Une porte ou une trappe vient de s'ouvrir (sinon, de se fermer) : `changes`, les blocs
+/// qu'elle devient.
+fn door_opened(changes: &[([i32; 3], BlockId)]) -> bool {
+    changes.iter().any(|(_, b)| match hinged(*b) {
+        Some(Hinged::Door { .. }) => {
+            let k = &b.def().key;
+            k.ends_with(":o") || k.ends_with(":m")
+        }
+        Some(Hinged::Trapdoor { side, .. }) => side != 2 && side != 3,
+        None => false,
+    })
+}
+
 /// Porte ou trappe.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Hinged {
@@ -6011,6 +6208,22 @@ fn same_family(a: BlockId, b: BlockId) -> bool {
             k1 == k2
         }
         _ => false,
+    }
+}
+
+/// (v165) Ping montré dans la liste des joueurs : texte et couleur (vert, jaune, rouge
+/// selon sa valeur ; gris s'il n'est pas connu).
+fn ping_label(ms: Option<u16>) -> (String, [f32; 4]) {
+    match ms {
+        None => ("-".into(), [0.55, 0.55, 0.6, 1.0]),
+        Some(ms) => {
+            let c = match ms {
+                0..=59 => [0.55, 0.95, 0.55, 1.0],
+                60..=129 => [1.0, 0.85, 0.35, 1.0],
+                _ => [1.0, 0.45, 0.4, 1.0],
+            };
+            (format!("{ms} ms"), c)
+        }
     }
 }
 
@@ -6369,9 +6582,10 @@ fn side_dir(side: u8) -> [i32; 3] {
 /// touché) : `None` si `item` n'est pas une dalle.
 /// - sur la moitié libre d'une dalle du même matériau, ou dans une case qui en contient
 ///   une : bloc complet ;
-/// - sur le dessus d'un bloc : dalle du bas ; au plafond : dalle du haut ;
-/// - contre un mur : dalle verticale collée au mur ; accroupi : du haut ou du bas selon la
-///   hauteur visée.
+/// - debout, comme dans Minecraft : sur le dessus d'un bloc, dalle du bas ; au plafond,
+///   dalle du haut ; contre un mur, du haut ou du bas selon la hauteur visée ;
+/// - accroupi, toujours verticale (quatre positions) : contre un mur, collée au mur ; au
+///   sol ou au plafond, du côté du bord le plus proche de l'endroit visé.
 fn slab_placement(
     world: &World,
     hit: &Hit,
@@ -6401,21 +6615,29 @@ fn slab_placement(
     if there.is_targetable() {
         return Some((p, there)); // case occupée : rien ne change
     }
-    let side = match hit.normal {
-        [0, 1, 0] => 3,
-        [0, -1, 0] => 2,
-        _ if sneaking => {
-            if point.y - point.y.floor() > 0.5 {
-                2
-            } else {
-                3
+    let side = if sneaking {
+        match hit.normal {
+            // Contre un mur : collée à la face visée (le mur est du côté −normale).
+            [1, 0, 0] => 1,
+            [-1, 0, 0] => 0,
+            [0, 0, 1] => 5,
+            [0, 0, -1] => 4,
+            // Au sol ou au plafond : du côté du bord le plus proche du point visé.
+            _ => {
+                let (fx, fz) = (point.x - point.x.floor(), point.z - point.z.floor());
+                [(1.0 - fx, 0u8), (fx, 1), (1.0 - fz, 4), (fz, 5)]
+                    .into_iter()
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map_or(4, |e| e.1)
             }
         }
-        // Contre un mur : la dalle est collée à la face visée (le mur est du côté −normale).
-        [1, 0, 0] => 1,
-        [-1, 0, 0] => 0,
-        [0, 0, 1] => 5,
-        _ => 4,
+    } else {
+        match hit.normal {
+            [0, 1, 0] => 3,
+            [0, -1, 0] => 2,
+            _ if point.y - point.y.floor() > 0.5 => 2,
+            _ => 3,
+        }
     };
     Some((p, slab_of(mat, side).unwrap_or(item)))
 }
@@ -6954,6 +7176,9 @@ fn selection_lines(
 
 /// Portée du chat vocal de proximité (construction), en blocs.
 const VOICE_RANGE: f32 = 48.0;
+/// Deux appuis sur « avancer » à moins de ce temps (s) l'un de l'autre font courir (sept
+/// ticks de Minecraft).
+const SPRINT_TAP_S: f32 = 0.35;
 /// Auditeurs d'un message vocal en construction, au plus (les plus proches).
 const VOICE_LISTENERS: usize = 256;
 
@@ -7134,19 +7359,41 @@ mod slab_tests {
         // Sur sa moitié libre : bloc complet.
         let (p, id) = slab_placement(&w, &hit([4, 11, 4], [0, 1, 0], id), slab, pt, false).unwrap();
         assert_eq!((p, key(id)), ([4, 11, 4], "stone"));
-        // Contre un mur (face +X du bloc) : dalle verticale collée au mur (côté −X).
+        // Accroupi contre un mur (face +X du bloc) : dalle verticale collée au mur (côté −X).
         let (p, id) =
-            slab_placement(&w, &hit([4, 10, 4], [1, 0, 0], stone), slab, pt, false).unwrap();
+            slab_placement(&w, &hit([4, 10, 4], [1, 0, 0], stone), slab, pt, true).unwrap();
         assert_eq!((p, key(id)), ([5, 10, 4], "slab:stone:1"));
         w.set(5, 10, 4, id);
         // Deuxième dalle contre la première : le bloc se remplit.
         let (p, id) = slab_placement(&w, &hit([5, 10, 4], [1, 0, 0], id), slab, pt, false).unwrap();
         assert_eq!((p, key(id)), ([5, 10, 4], "stone"));
-        // Accroupi contre un mur, en visant le haut : dalle du haut.
-        let up = Vec3::new(5.0, 10.8, 4.5);
+        // Debout contre un mur, en visant le haut puis le bas : dalle du haut, du bas.
+        let up = Vec3::new(4.5, 10.8, 5.0);
         let (_, id) =
-            slab_placement(&w, &hit([4, 10, 4], [0, 0, 1], stone), slab, up, true).unwrap();
+            slab_placement(&w, &hit([4, 10, 4], [0, 0, 1], stone), slab, up, false).unwrap();
         assert_eq!(key(id), "slab:stone:top");
+        let low = Vec3::new(4.5, 10.3, 5.0);
+        let (_, id) =
+            slab_placement(&w, &hit([4, 10, 4], [0, 0, 1], stone), slab, low, false).unwrap();
+        assert_eq!(key(id), "slab:stone:bottom");
+        // Accroupi au sol : verticale, du côté du bord visé (quatre positions).
+        w.set(4, 11, 4, BlockId::AIR);
+        for (x, z, want) in [
+            (4.9, 4.5, "slab:stone:0"),
+            (4.1, 4.5, "slab:stone:1"),
+            (4.5, 4.9, "slab:stone:4"),
+            (4.5, 4.1, "slab:stone:5"),
+        ] {
+            let at = Vec3::new(x, 11.0, z);
+            let (p, id) =
+                slab_placement(&w, &hit([4, 10, 4], [0, 1, 0], stone), slab, at, true).unwrap();
+            assert_eq!((p, key(id)), ([4, 11, 4], want));
+        }
+        // Accroupi au plafond : verticale aussi.
+        let at = Vec3::new(4.2, 10.0, 4.5);
+        let (p, id) =
+            slab_placement(&w, &hit([4, 10, 4], [0, -1, 0], stone), slab, at, true).unwrap();
+        assert_eq!((p, key(id)), ([4, 9, 4], "slab:stone:1"));
         // Pas une dalle : rien de spécial.
         assert!(slab_placement(&w, &hit([4, 10, 4], [0, 1, 0], stone), stone, pt, false).is_none());
     }

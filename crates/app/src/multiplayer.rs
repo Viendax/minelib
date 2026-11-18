@@ -370,6 +370,80 @@ pub struct MapRow {
     pub stored: bool,
 }
 
+/// Nom d'une carte sans sa version : (famille, version). « Overpass CS2 v.0.3.2 Quality »
+/// donne (« overpass », [0, 3, 2]) ; « Aztec v_0_1 », (« aztec », [0, 1]). Les mots
+/// d'édition (« CS2 », « NEW », « Quality »…) et une version de Minecraft (« 1.12.2 »)
+/// ne comptent pas dans la famille.
+pub fn map_family(name: &str) -> (String, Vec<u32>) {
+    let mut version: Vec<u32> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    for w in name.split_whitespace() {
+        let l = w.to_lowercase();
+        // Version : « v.0.3 », « v_0_1 », « v1.2 », « v4 ».
+        if version.is_empty() {
+            if let Some(rest) = l.strip_prefix('v') {
+                let rest = rest.trim_start_matches(['.', '_']);
+                let nums: Option<Vec<u32>> =
+                    rest.split(['.', '_']).map(|p| p.parse().ok()).collect();
+                if let Some(nums) = nums.filter(|n| !rest.is_empty() && !n.is_empty()) {
+                    version = nums;
+                    continue;
+                }
+            }
+        }
+        let edition = matches!(
+            l.as_str(),
+            "cs2" | "csgo" | "cs:go" | "new" | "quality" | "hd" | "remake" | "remastered"
+        );
+        let minecraft = l.contains('.') && l.chars().all(|c| c.is_ascii_digit() || c == '.');
+        if !edition && !minecraft {
+            words.push(l);
+        }
+    }
+    (words.join(" "), version)
+}
+
+/// Anciennes versions d'une carte (même auteur, même nom à la version près) qui n'ont
+/// jamais fini une partie en ligne : retirées de la liste. On garde de chaque carte sa
+/// version la plus récente (à version égale : celle de ce PC, puis la plus jouée), toute
+/// version qui a fini au moins une partie, et celles où des joueurs attendent une partie.
+pub fn hide_old_versions(rows: &mut Vec<MapRow>) {
+    let keys: Vec<(String, String, Vec<u32>)> = rows
+        .iter()
+        .map(|r| {
+            let (family, version) = map_family(&r.name);
+            (r.author.to_lowercase(), family, version)
+        })
+        .collect();
+    let rank = |i: usize| {
+        (
+            keys[i].2.clone(),
+            rows[i].local.is_some(),
+            rows[i].plays,
+            rows[i].stored,
+        )
+    };
+    let mut best: std::collections::HashMap<(&str, &str), usize> = std::collections::HashMap::new();
+    for (i, key) in keys.iter().enumerate() {
+        let k = (key.0.as_str(), key.1.as_str());
+        match best.get(&k) {
+            Some(&j) if rank(j) >= rank(i) => {}
+            _ => {
+                best.insert(k, i);
+            }
+        }
+    }
+    let keep: Vec<bool> = (0..rows.len())
+        .map(|i| {
+            best.get(&(keys[i].0.as_str(), keys[i].1.as_str())) == Some(&i)
+                || rows[i].plays > 0
+                || rows[i].waiting > 0
+        })
+        .collect();
+    let mut it = keep.into_iter();
+    rows.retain(|_| it.next().unwrap_or(true));
+}
+
 pub enum FpsAction {
     None,
     Back,
@@ -1112,4 +1186,104 @@ fn lobby_panel(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &str, author: &str, local: bool, plays: u32) -> MapRow {
+        MapRow {
+            sig: [name.len() as u8; 32],
+            name: name.to_string(),
+            author: author.to_string(),
+            local: local.then(|| std::path::PathBuf::from(name)),
+            waiting: 0,
+            plays,
+            configured: true,
+            players: 10,
+            stored: true,
+        }
+    }
+
+    #[test]
+    fn map_names_split_into_family_and_version() {
+        assert_eq!(
+            map_family("Overpass CS2 v.0.3.2 Quality"),
+            ("overpass".to_string(), vec![0, 3, 2])
+        );
+        assert_eq!(
+            map_family("Overpass v.0.1"),
+            ("overpass".to_string(), vec![0, 1])
+        );
+        assert_eq!(map_family("Aztec v_0_1"), ("aztec".to_string(), vec![0, 1]));
+        assert_eq!(
+            map_family("CACHE NEW CS2 v.0.5 Quality"),
+            ("cache".to_string(), vec![0, 5])
+        );
+        assert_eq!(
+            map_family("Dust II v.0.3 1.12.2"),
+            ("dust ii".to_string(), vec![0, 3])
+        );
+        assert_eq!(
+            map_family("Vertigo R v.4.0"),
+            ("vertigo r".to_string(), vec![4, 0])
+        );
+        // Un monde numéroté n'est pas une version.
+        assert_eq!(
+            map_family("Nouveau monde 18"),
+            ("nouveau monde 18".to_string(), vec![])
+        );
+    }
+
+    #[test]
+    fn old_versions_never_played_online_leave_the_list() {
+        let mut rows = vec![
+            row("Overpass v.0.1", "viendax", true, 0),
+            row("Overpass CS2 v.0.3.2 Quality", "viendax", true, 0),
+            row("Cache CS2 v.0.2.1", "viendax", true, 3),
+            row("CACHE NEW CS2 v.0.5 Quality", "viendax", true, 0),
+            // La même carte qu'une autre personne a faite : pas une version de la mienne.
+            row("Overpass v.0.1", "Fox", false, 0),
+            row("Nouveau monde 1", "viendax", true, 0),
+            row("Nouveau monde 2", "viendax", true, 0),
+        ];
+        // Ancienne signature du même monde (sur le relais), jamais finie en ligne.
+        let mut stale = row("Overpass CS2 v.0.3.2 Quality", "viendax", false, 0);
+        stale.sig = [99; 32];
+        rows.push(stale);
+        // Ancienne version où des joueurs attendent une partie : gardée.
+        let mut waited = row("Overpass v.0.0.9", "viendax", false, 0);
+        waited.waiting = 2;
+        rows.push(waited);
+        hide_old_versions(&mut rows);
+        let names: Vec<(String, String, bool)> = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.author.clone(), r.local.is_some()))
+            .collect();
+        let has = |n: &str, a: &str, local: bool| {
+            names.iter().any(|x| x.0 == n && x.1 == a && x.2 == local)
+        };
+        assert!(
+            has("Overpass CS2 v.0.3.2 Quality", "viendax", true),
+            "{names:?}"
+        );
+        assert!(!has("Overpass v.0.1", "viendax", true), "{names:?}");
+        assert!(
+            !has("Overpass CS2 v.0.3.2 Quality", "viendax", false),
+            "{names:?}"
+        );
+        assert!(has("Overpass v.0.0.9", "viendax", false), "{names:?}");
+        assert!(
+            has("Cache CS2 v.0.2.1", "viendax", true),
+            "jouée en ligne : {names:?}"
+        );
+        assert!(
+            has("CACHE NEW CS2 v.0.5 Quality", "viendax", true),
+            "{names:?}"
+        );
+        assert!(has("Overpass v.0.1", "Fox", false), "{names:?}");
+        assert!(has("Nouveau monde 1", "viendax", true) && has("Nouveau monde 2", "viendax", true));
+        assert_eq!(rows.len(), 7, "{names:?}");
+    }
 }

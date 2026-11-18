@@ -16,7 +16,13 @@ pub struct Pose {
     pub pitch: f32,
     pub crouch: f32,
     pub speed: f32,
+    /// (v165) Son ping avec son relais (ms), pour la liste des joueurs (Tab) : il ne part
+    /// qu'avec une position sur huit environ (à 4 ms près, au plus 1020).
+    pub ping: Option<u16>,
 }
+
+/// Paquets écrits jusqu'ici : le ping de chaque joueur part à tour de rôle.
+static ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Positions au plus par paquet.
 pub const POSES_MAX: usize = 2048;
@@ -79,17 +85,23 @@ pub fn pack_poses(entries: &mut Vec<(u64, Option<&str>, Pose)>) -> Vec<u8> {
         put_signed(&mut out, b);
     }
     let mut last = 0u64;
+    let round = ROUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     for (id, name, p) in entries.iter() {
         put(&mut out, id - last);
         last = *id;
-        // Accroupi sur 3 bits, vitesse sur 4 (par pas de 2 blocs/s), pseudo présent ou non.
-        let crouch = (p.crouch.clamp(0.0, 1.0) * 7.0).round() as u8;
+        // Pseudo présent ou non, accroupi sur 2 bits, ping présent ou non (une position sur
+        // huit, à tour de rôle), vitesse sur 4 (par pas de 2 blocs/s).
+        let crouch = (p.crouch.clamp(0.0, 1.0) * 3.0).round() as u8;
         let speed = (p.speed.clamp(0.0, 30.0) / 2.0).round() as u8;
+        let ping = p.ping.filter(|_| id.wrapping_add(round) % 8 == 0);
         let name = name.map(|n| &n.as_bytes()[..n.len().min(255)]);
-        out.push(name.is_some() as u8 | crouch << 1 | speed << 4);
+        out.push(name.is_some() as u8 | crouch << 1 | (ping.is_some() as u8) << 3 | speed << 4);
         if let Some(n) = name {
             out.push(n.len() as u8);
             out.extend_from_slice(n);
+        }
+        if let Some(ms) = ping {
+            out.push((ms / 4).min(255) as u8);
         }
         for (v, b) in p.pos.iter().zip(base) {
             put_signed(&mut out, fixed(*v) - b);
@@ -126,6 +138,13 @@ pub fn unpack_poses(data: &[u8]) -> Option<Vec<(u64, Option<String>, Pose)>> {
         } else {
             None
         };
+        let ping = if flags & 8 != 0 {
+            let v = *data.get(at)? as u16 * 4;
+            at += 1;
+            Some(v)
+        } else {
+            None
+        };
         let mut pos = [0f32; 3];
         for (a, p) in pos.iter_mut().enumerate() {
             *p = base[a].checked_add(get_signed(data, &mut at)?)? as f32 / STEP;
@@ -138,8 +157,9 @@ pub fn unpack_poses(data: &[u8]) -> Option<Vec<(u64, Option<String>, Pose)>> {
             pos,
             yaw,
             pitch,
-            crouch: (flags >> 1 & 7) as f32 / 7.0,
+            crouch: (flags >> 1 & 3) as f32 / 3.0,
             speed: (flags >> 4) as f32 * 2.0,
+            ping,
         };
         if !pose.sane() {
             return None;
@@ -188,6 +208,7 @@ mod tests {
                         pitch: (unit(&mut seed) - 0.5) * 3.1,
                         crouch: unit(&mut seed),
                         speed: unit(&mut seed) * 30.0,
+                        ping: Some((rnd(&mut seed) % 900) as u16),
                     };
                     (id, p)
                 })
@@ -212,8 +233,11 @@ mod tests {
                 assert!(d.min(turn - d) < 0.03, "{} {}", p.yaw, b.yaw);
                 let half = std::f32::consts::FRAC_PI_2;
                 assert!((p.pitch.clamp(-half, half) - b.pitch).abs() < 0.02);
-                assert!((p.crouch - b.crouch).abs() < 0.08);
+                assert!((p.crouch - b.crouch).abs() < 0.17);
                 assert!((p.speed - b.speed).abs() <= 1.01);
+                if let Some(ms) = b.ping {
+                    assert!(p.ping.is_some_and(|q| q.abs_diff(ms) < 4), "{p:?} {b:?}");
+                }
             }
         }
     }
@@ -235,18 +259,44 @@ mod tests {
                     pitch: unit(&mut seed) - 0.5,
                     crouch: 0.0,
                     speed: 4.0,
+                    ping: Some(40),
                 };
                 ((3u64 << 40) + 17 + i * 5, None, p)
             })
             .collect();
         let packed = pack_poses(&mut entries);
         eprintln!("10 positions : {} octets", packed.len());
-        assert!(packed.len() <= 10 * 11 + 16, "{}", packed.len());
+        // (Plus un octet de ping pour une position sur huit.)
+        assert!(packed.len() <= 10 * 11 + 16 + 3, "{}", packed.len());
         // La première fois, avec le pseudo.
         let mut one = vec![(42u64, Some("Viendax"), entries[0].2)];
         let first = pack_poses(&mut one);
         eprintln!("1 position avec pseudo : {} octets", first.len());
         assert!(first.len() <= 32);
+    }
+
+    /// (v165) Le ping de chacun part avec une de ses positions sur huit, à tour de rôle.
+    #[test]
+    fn every_player_ping_goes_out_now_and_then() {
+        let p = Pose {
+            pos: [1.0, 64.0, 3.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            crouch: 0.0,
+            speed: 0.0,
+            ping: Some(123),
+        };
+        let mut heard = [false; 20];
+        for _ in 0..8 {
+            let mut e: Vec<(u64, Option<&str>, Pose)> = (0..20u64).map(|i| (i, None, p)).collect();
+            for (id, _, b) in unpack_poses(&pack_poses(&mut e)).unwrap() {
+                if let Some(ms) = b.ping {
+                    assert_eq!(ms, 120);
+                    heard[id as usize] = true;
+                }
+            }
+        }
+        assert!(heard.iter().all(|h| *h), "{heard:?}");
     }
 
     #[test]
@@ -257,6 +307,7 @@ mod tests {
             pitch: 0.0,
             crouch: 0.0,
             speed: 0.0,
+            ping: None,
         };
         let mut e = vec![
             (1u64, None, good),

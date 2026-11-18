@@ -359,11 +359,14 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
     // Éclairage : soleil diffus + ambiant (selon l'heure), modulé par l'occlusion ambiante.
     let sun = normalize(g.sun.xyz);
     var diffuse = max(dot(n, sun), 0.0);
-    // Ombres des joueurs : soleil caché par un joueur, torches cachées (plus bas).
+    // Ombres des joueurs : soleil caché par un joueur, torches cachées (plus bas). Le
+    // soleil ne fait d'ombre que là où il arrive : sous le ciel ouvert (lumière du ciel
+    // pleine, 15). Sous des blocs (toit, surplomb, grotte), il n'y a pas d'ombre du joueur.
     let shadow_from = i.world + n * 0.02;
     let shadows = g.shadow_info.x > 0.5;
-    if shadows && diffuse > 0.0 && i.sky > 0.05 {
-        diffuse *= 1.0 - 0.85 * player_shadow(shadow_from, sun, 64.0);
+    let open_sky = smoothstep(0.94, 0.995, i.sky);
+    if shadows && diffuse > 0.0 && open_sky > 0.0 {
+        diffuse *= 1.0 - 0.85 * open_sky * player_shadow(shadow_from, sun, 64.0);
     }
     let ao = mix(0.42, 1.0, i.ao * i.ao);
     let day = g.light.x;
@@ -631,6 +634,11 @@ fn specular(p: vec3<f32>, r: vec3<f32>, k: f32, face_light: vec3<f32>) -> vec3<f
     let shin = exp2(mix(5.0, 13.0, k));
     let gain = mix(0.6, 6.0, k * k);
     var c = vec3<f32>(0.0);
+    // (v165) Le point le plus fort, vérifié dans la grille de blocs (raytracing) : une
+    // lampe derrière un mur ne s'y reflète plus. Les autres gardent l'estimation par la
+    // lumière reçue (un seul rayon par pixel : le compilateur de DirectX).
+    var best = vec3<f32>(0.0);
+    var best_at = vec3<f32>(0.0);
     let count = u32(g.light.z);
     for (var j = 0u; j < count; j++) {
         let lp = g.lights_pos[j];
@@ -650,7 +658,15 @@ fn specular(p: vec3<f32>, r: vec3<f32>, k: f32, face_light: vec3<f32>) -> vec3<f
         // ici) ; bien moins : elle contourne un mur, la source est cachée.
         let direct = pow(0.75, 3.5 * (d + 0.7));
         let seen = smoothstep(0.15, 0.6, lit2 / max(direct, 1e-6));
-        c += g.lights_col[j].rgb * s * f * f * gain * seen;
+        let add = g.lights_col[j].rgb * s * f * f * gain * seen;
+        c += add;
+        if dot(add, vec3<f32>(1.0)) > dot(best, vec3<f32>(1.0)) {
+            best = add;
+            best_at = lp.xyz;
+        }
+    }
+    if g.rt.x > 0.5 && dot(best, vec3<f32>(1.0)) > 0.003 && !light_clear(p, best_at) {
+        c = max(c - best, vec3<f32>(0.0));
     }
     if g.held_pos.w > 0.0 {
         let to_l = g.held_pos.xyz - p;
@@ -664,16 +680,66 @@ fn specular(p: vec3<f32>, r: vec3<f32>, k: f32, face_light: vec3<f32>) -> vec3<f
 }
 
 /// Lumière colorée reçue en `p` (normale `n`) des sources proches, sans ombres, plus celle
-/// que les miroirs renvoient.
+/// que les miroirs renvoient. (v165) Une source derrière la face (de l'autre côté de son
+/// plan : derrière le mur dont c'est la face) ne l'éclaire pas : dans les reflets, les
+/// murs ne s'allument plus des lampes qui sont de l'autre côté.
 fn point_light(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     var c = vec3<f32>(0.0);
     let count = u32(g.light.z);
     for (var j = 0u; j < count; j++) {
         let to_l = g.lights_pos[j].xyz - p;
         let d = length(to_l);
-        c = max(c, g.lights_col[j].rgb * torch_falloff(d) * (max(dot(n, to_l / max(d, 1e-3)), 0.0) * 0.25 + 0.75));
+        let facing = dot(n, to_l / max(d, 1e-3));
+        let front = select(0.0, 1.0, facing > -0.05);
+        c = max(c, g.lights_col[j].rgb * torch_falloff(d) * (max(facing, 0.0) * 0.25 + 0.75) * front);
     }
     return max(c, mirror_light(p, n));
+}
+
+/// (v165) Rien de plein entre `p` et la source en `l` (grille de blocs du raytracing) :
+/// seulement les cubes opaques arrêtent la lumière (pas les dalles, plantes, vitres,
+/// feuillages ni torches). Hors de la grille : visible.
+fn light_clear(p: vec3<f32>, l: vec3<f32>) -> bool {
+    let to_l = l - p;
+    let dist = length(to_l);
+    let d = to_l / max(dist, 1e-4);
+    var cell = vec3<i32>(floor(p));
+    let goal = vec3<i32>(floor(l));
+    let step = vec3<i32>(sign(d));
+    let inv = 1.0 / max(abs(d), vec3<f32>(1e-6));
+    var t_max = (select(vec3<f32>(cell), vec3<f32>(cell) + 1.0, d > vec3<f32>(0.0)) - p) * sign(d) * inv;
+    t_max = select(t_max, vec3<f32>(1e9), abs(d) < vec3<f32>(1e-6));
+    var clear = true;
+    // Borne qui dépend de la distance : le compilateur ne déroule pas la boucle.
+    let steps = i32(min(dist * 1.8, 48.0)) + 2;
+    for (var i = 0; i < steps; i++) {
+        if t_max.x < t_max.y && t_max.x < t_max.z {
+            cell.x += step.x;
+            t_max.x += inv.x;
+        } else if t_max.y < t_max.z {
+            cell.y += step.y;
+            t_max.y += inv.y;
+        } else {
+            cell.z += step.z;
+            t_max.z += inv.z;
+        }
+        if all(cell == goal) || min(t_max.x, min(t_max.y, t_max.z)) > dist + 1.0 {
+            break;
+        }
+        let raw = voxel(cell);
+        let id = raw & 4095u;
+        if raw != 0xffffu && id != 0u {
+            let shp = textureLoad(palette, i32(id) + 4096, 0);
+            let pal = textureLoad(palette, i32(id), 0);
+            // Cube (forme 0), sans trous dans sa texture (bit 4), pas une torche.
+            let cube = (shp.w & 3u) == 0u && (shp.w & 16u) == 0u && ((pal.w >> 8u) & 7u) == 0u;
+            if cube {
+                clear = false;
+                break;
+            }
+        }
+    }
+    return clear;
 }
 
 /// Lumière de la torche tenue en main en `p` (même formule que sur les faces du monde) ;

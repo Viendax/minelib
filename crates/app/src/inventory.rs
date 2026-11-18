@@ -48,6 +48,25 @@ impl Item {
         }
     }
 
+    /// (v165) Identifiant montré en gris à droite du nom : celui que prend `/give` (clé du
+    /// bloc et son numéro).
+    pub fn id_text(self) -> String {
+        match self {
+            Item::Block(b) => format!("{} #{}", b.def().key, b.0),
+            Item::Torch(None) => "torch".into(),
+            Item::Torch(Some(i)) => format!("torch #{i}"),
+            Item::Wand => "wand".into(),
+            Item::Screen(n) => ["petit_ecran", "ecran", "grand_ecran", "ecran_geant"]
+                .get(n as usize)
+                .unwrap_or(&"ecran")
+                .to_string(),
+            Item::Head(n) => match crate::heads::skin_of(n) {
+                crate::heads::HeadSkin::Player(p) => format!("skull {p}"),
+                _ => "skull".into(),
+            },
+        }
+    }
+
     /// Tête (simple ou à skin) : son skin.
     pub fn head_skin(self) -> Option<crate::heads::HeadSkin> {
         match self {
@@ -1402,9 +1421,14 @@ impl Inventory {
         let ts = (s / 2.0).floor().max(1.0);
         let line_h = 10.0 * ts;
         let pad = 4.0 * ts;
+        // (v165) Identifiant à droite du nom, en gris (celui de /give).
+        let id = item.id_text();
+        let id_w = Ui::text_width(&id, ts);
+        let gap = 6.0 * ts;
         let w = lines
             .iter()
-            .map(|(t, _)| Ui::text_width(t, ts))
+            .enumerate()
+            .map(|(k, (t, _))| Ui::text_width(t, ts) + if k == 0 { gap + id_w } else { 0.0 })
             .fold(0.0, f32::max)
             + 2.0 * pad;
         let h = lines.len() as f32 * line_h + 2.0 * pad;
@@ -1426,6 +1450,15 @@ impl Inventory {
                 ts,
                 col(*c, 1.0),
                 t.clone(),
+            );
+        }
+        if let Some((name, _)) = lines.first() {
+            ui.text(
+                x + pad + Ui::text_width(name, ts) + gap,
+                y + pad,
+                ts,
+                col([120, 124, 132], 1.0),
+                id,
             );
         }
     }

@@ -403,6 +403,10 @@ pub struct Displays {
     tabs: std::collections::HashMap<u32, Tab>,
     /// États rapportés par les pages depuis le dernier `take_states` (regarder ensemble).
     states: Vec<(u32, String)>,
+    /// Volume du son des écrans (Paramètres → Son), et temps avant de le redonner aux pages
+    /// (une vidéo qui commence repart au volume de la page).
+    volume: f32,
+    volume_in: f32,
 }
 
 impl Displays {
@@ -416,6 +420,34 @@ impl Displays {
             idle: 0.0,
             tabs: std::collections::HashMap::new(),
             states: Vec::new(),
+            volume: 1.0,
+            volume_in: 0.0,
+        }
+    }
+
+    /// Volume du son de tous les écrans (0 à 1).
+    pub fn set_volume(&mut self, v: f32) {
+        let v = v.clamp(0.0, 1.0);
+        if (v - self.volume).abs() > 1e-4 {
+            self.volume = v;
+            self.volume_in = 0.0;
+        }
+    }
+
+    /// Donne le volume choisi aux vidéos et aux sons des pages ouvertes.
+    fn apply_volume(&mut self) {
+        let js = format!(
+            "(()=>{{const v={:.3};document.querySelectorAll('video,audio').forEach(m=>{{if(Math.abs(m.volume-v)>0.001)m.volume=v;}});}})()",
+            self.volume
+        );
+        let ids: Vec<u32> = self
+            .tabs
+            .iter()
+            .filter(|(_, t)| t.opened)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.eval(id, &js);
         }
     }
 
@@ -715,6 +747,13 @@ impl Displays {
     /// le navigateur après `IDLE_STOP_S` sans écran, le relance s'il s'est arrêté.
     pub fn update(&mut self, dt: f32) {
         self.retry_in = (self.retry_in - dt).max(0.0);
+        // Volume des écrans : redonné aux pages toutes les deux secondes (une nouvelle vidéo
+        // repart au volume de sa page).
+        self.volume_in -= dt;
+        if self.volume_in <= 0.0 {
+            self.volume_in = 2.0;
+            self.apply_volume();
+        }
         if self.tabs.is_empty() {
             self.idle += dt;
             if self.idle >= IDLE_STOP_S && self.browser.is_some() {

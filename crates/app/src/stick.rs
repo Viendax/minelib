@@ -57,6 +57,14 @@ const LONG_FROM: f32 = 2.0;
 /// retards ne le dépasse, rien n'est retenu : arrêter le joueur pour si peu ne ferait
 /// que saccader celui qui continue sans courir.
 const FINE: f32 = 0.05;
+/// (v165) « Courir » reprise moins de ce temps (s) après avoir été lâchée, « avancer »
+/// toujours tenue : c'était un petit appui sur « courir » (mesuré dans les parties du
+/// joueur : repris après 0,05 à 0,25 s, ce qui l'arrêtait à chaque fois). Un arrêt suivi
+/// d'un redémarrage, que la touche qui traîne déguise de la même façon, dure plus.
+const TAP_MAX: f32 = 0.28;
+/// Après un tel appui, lâcher « courir » ne retient plus « avancer » pendant… (s) : le
+/// joueur appuie sur « courir » à petits coups réguliers, il ne veut pas s'arrêter.
+const TAPPING_S: f32 = 20.0;
 /// Fichier (dossier du jeu) qui retient le réglage d'une partie à l'autre : « 1 » (la
 /// touche traîne, appris), « oui » (demandé par le joueur), « non » (refusé).
 const FILE: &str = "touche_avancer_lente";
@@ -134,6 +142,8 @@ pub struct Guard {
     active: bool,
     /// Avancer est retenue en attendant un nouvel appui.
     blocked: bool,
+    /// (v165) Temps depuis le dernier petit appui sur « courir » (voir `TAP_MAX`).
+    since_tap: Option<f32>,
     /// La règle vient de s'activer (à dire au joueur, une fois).
     pub just_learned: bool,
     /// Fin de course qui vient d'être mesurée (pour le journal).
@@ -424,13 +434,22 @@ impl Guard {
                     }
                 }
             } else if modifier {
-                // Il recourt sans avoir lâché « avancer » : il repart tout de suite. Le
-                // prochain relâchement de « courir » sera traité comme les autres.
+                // Il recourt sans avoir lâché « avancer » : il repart tout de suite. (v165)
+                // Repris aussitôt : c'était un petit appui sur « courir », les prochains
+                // relâchements ne le retiennent plus (voir `TAPPING_S`).
+                if w.t <= TAP_MAX {
+                    self.since_tap = Some(0.0);
+                }
                 if w.stopped && w.t <= w.patience {
                     self.note = Some(format!(
                         "courir relâchée puis reprise après {:.2} s, avancer toujours tenue \
-                         (retenue jusque-là)",
-                        w.t
+                         (retenue jusque-là{})",
+                        w.t,
+                        if w.t <= TAP_MAX {
+                            " ; petits appuis sur courir : plus retenu pendant 20 s"
+                        } else {
+                            ""
+                        }
                     ));
                 }
                 self.waiting = None;
@@ -466,9 +485,13 @@ impl Guard {
         if fwd && modifier {
             self.both += dt;
         }
+        if let Some(t) = &mut self.since_tap {
+            *t += dt;
+        }
+        let tapping = self.since_tap.is_some_and(|t| t < TAPPING_S);
         if self.mod_was && !modifier && fwd && self.both >= TOGETHER_MIN {
             let patience = self.patience(self.fwd_time);
-            self.blocked = self.active && patience > 0.0;
+            self.blocked = self.active && patience > 0.0 && !tapping;
             self.waiting = Some(Wait {
                 t: 0.0,
                 held: self.fwd_time,
@@ -735,6 +758,10 @@ mod tests {
             g.update(DT, true, false, false),
             "retenue au relâchement de courir"
         );
+        // (Retenue jusqu'à ce qu'il recoure, un moment après : pas un petit appui.)
+        for _ in 0..(0.35 / DT) as usize {
+            assert!(g.update(DT, true, false, false));
+        }
         // Il recourt sans avoir lâché « avancer » : il avance.
         assert!(!g.update(DT, true, false, true));
         // « Avancer » relâchée, puis une nouvelle course : retenue de nouveau à la fin.
@@ -747,6 +774,43 @@ mod tests {
         // « Avancer » relâchée puis renfoncée : il avance.
         g.update(DT, false, false, false);
         assert!(!g.update(DT, true, true, false));
+    }
+
+    /// (v165) Le joueur appuie sur « courir » à petits coups réguliers en gardant
+    /// « avancer » : seul le premier relâchement le retient (jusqu'à ce qu'il réappuie),
+    /// les suivants ne l'arrêtent plus. Après 20 s sans petit appui, les arrêts sont de
+    /// nouveau tenus.
+    #[test]
+    fn tapping_sprint_regularly_does_not_stop_the_player() {
+        let mut g = lagging(5.0, 0.4);
+        let mut held = 0;
+        let mut step = |g: &mut Guard, modifier: bool, secs: f32| {
+            let mut blocked = 0.0;
+            for _ in 0..(secs / DT).round() as usize {
+                held += 1;
+                if g.update(DT, true, held == 1, modifier) {
+                    blocked += DT;
+                }
+            }
+            blocked
+        };
+        assert_eq!(step(&mut g, true, 3.0), 0.0, "il court");
+        assert!(step(&mut g, false, 0.15) > 0.14, "le premier retient");
+        for _ in 0..8 {
+            assert_eq!(step(&mut g, true, 0.8), 0.0);
+            assert_eq!(
+                step(&mut g, false, 0.2),
+                0.0,
+                "les suivants n'arrêtent plus"
+            );
+        }
+        // Il marche un moment sans courir (plus de 20 s), puis court et s'arrête : tenu.
+        assert_eq!(step(&mut g, false, 21.0), 0.0);
+        assert_eq!(step(&mut g, true, 3.0), 0.0);
+        assert!(
+            step(&mut g, false, 0.35) > 0.34,
+            "un vrai arrêt est tenu de nouveau"
+        );
     }
 
     /// Arrêt puis redémarrage rapide (les deux touches lâchées un tiers de seconde puis

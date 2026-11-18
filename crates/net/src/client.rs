@@ -450,6 +450,9 @@ pub enum Event {
     /// La connexion ouverte au relais vient d'être perdue (suivie de `LoggedOut` et d'une
     /// erreur).
     Lost,
+    /// (v165) Aller-retour mesuré avec ce relais (ms) : le ping montré dans la liste des
+    /// joueurs (Tab).
+    Rtt(u16),
     /// (v146) `Doze` accepté : la connexion au relais du monde est fermée, la partie continue
     /// par les relais des provinces.
     Dozed {
@@ -716,11 +719,13 @@ impl Worker {
                 Ok(None) => Ok(None),
                 Err(e) => Err(e),
             };
+            let mut measured = None;
             let got = got.and_then(|r| {
-                // Pong : aller-retour mesuré, dit au relais.
+                // Pong : aller-retour mesuré, dit au relais (et au jeu).
                 if matches!(r, Some(Response::Pong)) {
                     if let Some(t) = ping_sent.take() {
                         let ms = t.elapsed().as_millis().min(u16::MAX as u128) as u16;
+                        measured = Some(ms);
                         chan.send(&Request::Rtt { ms })?;
                     }
                     return Ok(None);
@@ -741,6 +746,9 @@ impl Worker {
                 }
                 Ok(r)
             });
+            if let Some(ms) = measured {
+                self.emit(Event::Rtt(ms));
+            }
             match got {
                 Ok(Some(r)) => self.on_push(r),
                 Ok(None) => {}

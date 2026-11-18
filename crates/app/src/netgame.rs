@@ -1265,6 +1265,18 @@ type Frame = Vec<(u64, Vec3, f32)>;
 /// Bruits de pas : au-dessus de cette vitesse au sol (blocs/s), on court et les autres
 /// l'entendent (135 unités de CS sur 250).
 pub const STEP_SPEED: f32 = crate::player::FPS_SPRINT * 135.0 / 250.0;
+
+/// Part de sa propre vitesse de course (selon l'arme en main) à atteindre pour que ses
+/// pas s'entendent : en prenant de la vitesse, la course reste silencieuse jusque-là.
+pub const STEP_SHARE: f32 = 0.8;
+
+/// Vitesse au sol (blocs/s) à partir de laquelle les pas d'un joueur qui tient une arme
+/// de vitesse `carry` (unités de CS, 0 : 250) s'entendent : `STEP_SHARE` de sa vitesse de
+/// course, et jamais sous `STEP_SPEED` (marcher reste silencieux, comme dans CS).
+pub fn step_speed(carry: u8) -> f32 {
+    let carry = if carry == 0 { 250.0 } else { carry as f32 } / 250.0;
+    (crate::player::FPS_SPRINT * carry * STEP_SHARE).max(STEP_SPEED)
+}
 pub use minelib_net::game::{STEP_LADDER, STEP_LAND, STEP_PAIN, STEP_RUN, STEP_SPLASH};
 
 /// Hauteur de chute dans l'eau à partir de laquelle on entend le plongeon (blocs).
@@ -1320,6 +1332,9 @@ pub struct Host {
     local_blind: bool,
     /// Vitesse permise par ce que tient le joueur de l'hôte (unités de CS).
     local_carry: u8,
+    /// (v165) Ping de chaque joueur (ms), qu'il mesure et envoie : montré dans le tableau
+    /// des scores, hors des règles (le vérificateur n'a pas à le rejouer).
+    pings: HashMap<u64, u16>,
     /// Bruits de pas et de réception, par joueur.
     strides: HashMap<u64, Stride>,
     /// Blessés par une chute à cette image (cri de douleur, entendu de tous).
@@ -1392,6 +1407,11 @@ pub struct Guest {
     hello_timer: f32,
     /// Positions prédites par numéro d'entrée (pour juger un désaccord sur soi).
     predicted: VecDeque<(u32, [f32; 3])>,
+    /// (v165) Envois d'entrées (dernier numéro, quand) pas encore confirmés : leur
+    /// confirmation donne le ping avec l'hôte (lissé, ms), dit à l'hôte chaque seconde.
+    sent: VecDeque<(u32, std::time::Instant)>,
+    ping: Option<f32>,
+    ping_timer: f32,
 }
 
 pub enum NetGame {
@@ -1515,6 +1535,7 @@ impl NetGame {
             smokes: Vec::new(),
             local_blind: false,
             local_carry: 250,
+            pings: HashMap::new(),
             strides: HashMap::new(),
             pains: Vec::new(),
             kill_flags: 0,
@@ -1599,6 +1620,9 @@ impl NetGame {
             audit: Auditor::default(),
             conflicts: Vec::new(),
             hello_timer: 1.0,
+            sent: VecDeque::new(),
+            ping: None,
+            ping_timer: 1.0,
             predicted: VecDeque::new(),
         }))
     }
@@ -1958,12 +1982,25 @@ impl NetGame {
                 }
                 if !g.outbox.is_empty() {
                     let inputs = std::mem::take(&mut g.outbox);
+                    let last = g.outbox_first + inputs.len() as u32 - 1;
                     let msg = ToHost::Inputs {
                         first_seq: g.outbox_first,
                         inputs,
                         weapon,
                     };
                     g.to_host(&msg);
+                    g.sent.push_back((last, std::time::Instant::now()));
+                    if g.sent.len() > 512 {
+                        g.sent.pop_front();
+                    }
+                }
+                // (v165) Son ping, dit à l'hôte chaque seconde (tableau des scores).
+                g.ping_timer -= dt;
+                if g.ping_timer <= 0.0 {
+                    g.ping_timer = 1.0;
+                    if let Some(ms) = g.ping {
+                        g.to_host(&ToHost::Ping(ms.round().clamp(1.0, 9999.0) as u16));
+                    }
                 }
                 let view_tick = (g.clock - g.delay).max(0.0) as u32;
                 for (w, origin, dirs) in shots {
@@ -2016,7 +2053,7 @@ impl NetGame {
     /// Tableau des scores.
     pub fn rows(&self) -> Vec<ScoreRow> {
         match self {
-            NetGame::Host(h) => h.m.rows(),
+            NetGame::Host(h) => h.rows(),
             NetGame::Guest(g) => g.rows.clone(),
         }
     }
@@ -2180,6 +2217,7 @@ impl NetGame {
             smokes: Vec::new(),
             local_blind: false,
             local_carry: 250,
+            pings: HashMap::new(),
             strides: HashMap::new(),
             pains: Vec::new(),
             kill_flags: 0,
@@ -2350,6 +2388,15 @@ impl NetGame {
 }
 
 impl Host {
+    /// Tableau des scores, avec le ping de chacun (gardé par l'hôte, hors des règles).
+    fn rows(&self) -> Vec<ScoreRow> {
+        let mut rows = self.m.rows();
+        for r in &mut rows {
+            r.ping = self.pings.get(&r.id).copied().unwrap_or(0);
+        }
+        rows
+    }
+
     fn rand(&mut self) -> u32 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 17;
@@ -2371,10 +2418,10 @@ impl Host {
     /// un pas tous les `STRIDE` blocs, entendu par les joueurs à moins de `HEARD_STEPS`
     /// blocs (comme dans CS : marcher ou s'accroupir est silencieux pour les autres).
     fn footsteps(&mut self, world: &World, local_ground: bool, dt: f32, out: &mut Vec<Local>) {
-        let mut walkers: Vec<(u64, Vec3, bool)> = Vec::new();
+        let mut walkers: Vec<(u64, Vec3, bool, u8)> = Vec::new();
         let mut on_ladder: Vec<u64> = Vec::new();
         if self.playing {
-            walkers.push((0, self.local_pos, local_ground));
+            walkers.push((0, self.local_pos, local_ground, self.local_carry));
             if self.local_ladder {
                 on_ladder.push(0);
             }
@@ -2383,7 +2430,7 @@ impl Host {
             self.peers
                 .iter()
                 .filter(|(_, r)| r.ready)
-                .map(|(&id, r)| (id, r.player.pos, r.player.on_ground)),
+                .map(|(&id, r)| (id, r.player.pos, r.player.on_ground, r.player.carry)),
         );
         on_ladder.extend(
             self.peers
@@ -2394,7 +2441,7 @@ impl Host {
         walkers.sort_by_key(|w| w.0);
         let alive = |m: &Match, id: u64| m.players.get(&id).is_some_and(|p| p.alive);
         let mut steps = Vec::new();
-        for &(id, pos, ground) in &walkers {
+        for &(id, pos, ground, carry) in &walkers {
             let e = self.strides.entry(id).or_insert(Stride {
                 last: pos,
                 dist: 0.0,
@@ -2439,7 +2486,7 @@ impl Host {
                 // Plus haut point atteint en l'air (un saut normal monte à ~1,45 bloc).
                 e.top = Some(e.top.map_or(before.y.max(pos.y), |t| t.max(pos.y)));
             }
-            let running = d / dt.max(1e-4) > STEP_SPEED && d < 2.0;
+            let running = d / dt.max(1e-4) > step_speed(carry) && d < 2.0;
             if ground && running && living {
                 e.dist += d;
                 if e.dist >= STRIDE {
@@ -2465,7 +2512,7 @@ impl Host {
                 pos: pos.to_array(),
                 kind,
             };
-            for &(id, at, _) in &walkers {
+            for &(id, at, _, _) in &walkers {
                 let me = id == who && kind == STEP_PAIN;
                 if (id != who || me) && (at - pos).length() < HEARD_STEPS {
                     if id == 0 {
@@ -2845,7 +2892,7 @@ impl Host {
                         summary: summary.clone(),
                     });
                     self.broadcast(&ToPeer::Scoreboard {
-                        rows: self.m.rows(),
+                        rows: self.rows(),
                         history: self.m.history.clone(),
                     });
                     out.push(Local::GameOver(summary));
@@ -3079,6 +3126,11 @@ impl Host {
                 let ev = self.m.ballot(peer, yes);
                 self.events(ev, &mut out);
             }
+            // (v165) Son ping, montré dans le tableau des scores.
+            // (Hors des règles : rien que le vérificateur ait à rejouer.)
+            ToHost::Ping(ms) => {
+                self.pings.insert(peer, ms);
+            }
             ToHost::Throw { nade, pos, vel } => {
                 let alive = self.m.players.get(&peer).is_some_and(|p| p.alive);
                 let near = self
@@ -3266,7 +3318,7 @@ impl Host {
         }
         if self.tick.is_multiple_of(SCOREBOARD_EVERY) {
             self.broadcast(&ToPeer::Scoreboard {
-                rows: self.m.rows(),
+                rows: self.rows(),
                 history: self.m.history.clone(),
             });
         }
@@ -3535,6 +3587,25 @@ impl Host {
 }
 
 impl Guest {
+    /// (v165) L'hôte a pris en compte les entrées jusqu'au numéro `ack` : le temps depuis
+    /// leur envoi donne le ping (lissé).
+    fn acked(&mut self, ack: u32) {
+        let mut rtt = None;
+        while let Some(&(seq, t)) = self.sent.front() {
+            if seq > ack {
+                break;
+            }
+            self.sent.pop_front();
+            rtt = Some(t.elapsed().as_secs_f32() * 1000.0);
+        }
+        if let Some(ms) = rtt {
+            self.ping = Some(match self.ping {
+                Some(p) => p * 0.8 + ms * 0.2,
+                None => ms,
+            });
+        }
+    }
+
     fn to_host(&self, msg: &ToHost) {
         send(
             &self.link,
@@ -3587,6 +3658,7 @@ impl Guest {
                 self.hud = hud;
                 let prev_hp = self.latest.map(|l| l.2);
                 self.latest = Some((ack, you, hp, alive));
+                self.acked(ack);
                 if prev_hp != Some(hp) {
                     out.push(Local::SetHp(hp as u32));
                 }
@@ -3617,6 +3689,7 @@ impl Guest {
                 if let Some(l) = self.latest {
                     self.latest = Some((ack, you, l.2, l.3));
                 }
+                self.acked(ack);
             }
             ToPeer::Hit { head, .. } => out.push(Local::Hit { head }),
             ToPeer::Kill {
@@ -3780,6 +3853,22 @@ mod tests {
     use minelib_net::game::FpsMap;
     use minelib_world::{BlockId, ChunkPos};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn steps_are_heard_from_80_percent_of_ones_own_running_speed() {
+        use crate::player::{FPS_SPRINT, FPS_WALK};
+        // Couteau : 80 % de la pleine course.
+        assert!((step_speed(250) - 0.8 * FPS_SPRINT).abs() < 1e-4);
+        assert_eq!(step_speed(0), step_speed(250));
+        // AK-47 (215) : 80 % de sa propre course, plus lente.
+        assert!((step_speed(215) - 0.8 * FPS_SPRINT * 215.0 / 250.0).abs() < 1e-4);
+        // AWP à la lunette (100) : on ne descend jamais sous le seuil de CS.
+        assert_eq!(step_speed(100), STEP_SPEED);
+        // Marcher reste silencieux, quelle que soit l'arme.
+        for carry in [100, 200, 215, 250] {
+            assert!(FPS_WALK * carry as f32 / 250.0 < step_speed(carry));
+        }
+    }
 
     #[test]
     fn doors_open_only_if_the_map_allows_it_and_within_reach() {

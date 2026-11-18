@@ -28,10 +28,12 @@ Grenades et couteau :
     licence du projet.
   ladder.ogg (barreaux d'échelle) — créé pour Minelib (chocs de bois synthétisés), sous la
     licence du projet.
-  door.ogg (porte, trappe) — créé pour Minelib (loquet et choc de bois synthétisés, sans grincement), sous la
-    licence du projet.
-  splash.ogg (plongeon dans l'eau) — créé pour Minelib (bruit filtré, gouttelettes et
-    « plouf » synthétisés), sous la licence du projet.
+  door_open.ogg, door_close.ogg (porte, trappe qu'on ouvre, qu'on ferme) — « Door Open,
+    Door Close Set » (qubodup), CC0 — https://opengameart.org/content/door-open-door-close-set
+    (DoorOpen08 et DoorClose09, raccourcis et égalisés).
+  splash.ogg (plongeon dans l'eau) — « water splash and sand footsteps » (Peludo), CC0
+    https://opengameart.org/content/water-splash-and-sand-footsteps
+    (splash1 et splash2 mêlés, baissés d'environ une quarte pour un corps entier, compressés).
   knife_swing.ogg, knife_swing2.ogg (tube-plastic-whoosh), knife_hit.ogg (apple-cut et
     sword-knife-clash), draw_nade.ogg (cloth-pouch-shake) — « Fantasy Sound Effects
     (Tinysized SFX) » et « Fantasy Weapons and Apparel SFX Library » (Jan Schupke /

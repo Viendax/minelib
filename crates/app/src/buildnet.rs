@@ -110,6 +110,8 @@ pub struct Other {
     #[allow(dead_code)]
     pub speed: f32,
     seen: f32,
+    /// (v165) Son ping avec son relais (ms), s'il est connu.
+    pub ping: Option<u16>,
 }
 
 /// Le bloc qui fait foi en `pos` vient de changer (`truth` : publié par le garant, ou
@@ -277,6 +279,9 @@ pub struct BuildNet {
     /// Voix arrivée par les relais de région depuis la dernière lecture (qui parle,
     /// message).
     voice_in: Vec<(String, Vec<u8>)>,
+    /// (v165) Son ping (ms) avec le relais qui sert l'endroit où l'on est (0 : pas encore
+    /// mesuré) : il part avec ses positions, montré aux autres dans leur liste (Tab).
+    ping: u16,
     /// Clé du relais du monde (dans le billet) : vérifie les bonjours de la voix.
     root: Option<[u8; 32]>,
     /// Clé du compte (modifications signées dans une région souveraine), et date de la
@@ -494,6 +499,7 @@ impl BuildNet {
             relayed_beat: false,
             spot_timer: 0.0,
             voice_in: Vec::new(),
+            ping: 0,
             root: None,
             identity: None,
             sign_t: 0,
@@ -841,6 +847,8 @@ impl BuildNet {
                     }
                     // (v140) La voix de ceux qui parlent dans cette province.
                     Event::VoiceFrom { from, data } => voice.push((from, data)),
+                    // (v165) Ping avec la province de là où l'on est.
+                    Event::Rtt(ms) if here.is_some_and(|h| h == *p) => self.ping = ms,
                     Event::RoomClosed | Event::Error(_) | Event::Offline(_) | Event::Lost => {
                         log::info!("construction : relais de la province {:?} perdu", p.0);
                         broken.push(*p);
@@ -1403,6 +1411,22 @@ impl BuildNet {
     }
 
     /// Mon pseudo sur ce serveur (celui que le relais met dans ses réponses).
+    /// (v165) Ping mesuré avec le relais du monde (s'il sert l'endroit où l'on est, pas de
+    /// relais de province ou de région qui le mesure).
+    pub fn set_world_ping(&mut self, ms: u16) {
+        let served = self.chunk.is_some_and(|c| {
+            self.shards.link(proto::region_of(c)).is_some() || self.province_link(c).is_some()
+        });
+        if !served {
+            self.ping = ms;
+        }
+    }
+
+    /// Son ping (ms ; 0 : pas encore mesuré).
+    pub fn ping(&self) -> u16 {
+        self.ping
+    }
+
     pub fn pseudo(&self) -> &str {
         &self.pseudo
     }
@@ -1655,6 +1679,8 @@ impl BuildNet {
                     Event::FromZone { chunk, data, .. } => received.push((c.serial, chunk, data)),
                     Event::Paused(_) => self.relayed_beat = true,
                     Event::VoiceFrom { from, data } => self.voice_in.push((from, data)),
+                    // (v165) Ping avec le relais de la région de là où l'on est.
+                    Event::Rtt(ms) if *region == proto::region_of(chunk) => self.ping = ms,
                     Event::Error(m) | Event::Offline(m) => {
                         log::info!("relais de la région {region:?} : {m}");
                         broken.push(*region);
@@ -1735,6 +1761,7 @@ impl BuildNet {
                 pitch: look.1,
                 crouch,
                 speed,
+                ping: self.ping,
             };
             self.send_at(
                 chunk,
@@ -1777,21 +1804,51 @@ impl BuildNet {
     /// remet à ceux de ses joueurs qui doivent l'entendre, et aux autres relais de la
     /// région pour les leurs) ; sinon (v140) par le relais de sa province, où entrent tous
     /// ceux qui l'ont en vue ; sinon par le relais du monde.
+    ///
+    /// (v165) En veille (plus de connexion au relais du monde), si la province de là où l'on
+    /// est change d'hôte (quelques secondes sans relais) : par le relais de la province la
+    /// plus proche où l'on est entré, que les joueurs d'à côté ont rejoint aussi (chacun
+    /// rejoint toutes celles en vue). Sans cela, la voix se perdait le temps de la reprise.
     pub fn send_voice(&self, to: Vec<String>, data: Vec<u8>) {
         if to.is_empty() {
             return;
         }
         let req = Request::VoiceTo { to, data };
-        match self.chunk.and_then(|c| {
+        let here = self.chunk.and_then(|c| {
             self.shards
                 .link(proto::region_of(c))
                 .or_else(|| self.province_link(c))
-        }) {
+        });
+        match here {
             Some(l) => {
                 transport::push(l, &req);
             }
+            None if self.dozing => {
+                if let Some(l) = self.chunk.and_then(|c| self.nearest_province_link(c)) {
+                    transport::push(l, &req);
+                }
+            }
             None => self.send(req),
         }
+    }
+
+    /// (v165) Relais de la province la plus proche du chunk `chunk` où l'on est entré (la
+    /// plus petite à distance égale).
+    fn nearest_province_link(&self, chunk: [i32; 2]) -> Option<&Sender<Inbound>> {
+        let region = proto::region_of(chunk);
+        self.provinces
+            .values()
+            .filter(|c| c.joined)
+            .filter_map(|c| c.link.as_ref().map(|l| (c, l)))
+            .min_by_key(|(c, _)| {
+                let s = c.info.size.max(1);
+                let lo = c.info.first_region();
+                let hi = [lo[0] + s - 1, lo[1] + s - 1];
+                let dx = (lo[0] - region[0]).max(region[0] - hi[0]).max(0);
+                let dz = (lo[1] - region[1]).max(region[1] - hi[1]).max(0);
+                (dx.max(dz), c.info.size)
+            })
+            .map(|(_, l)| l)
     }
 
     /// Voix arrivée par les relais de région depuis le dernier appel : (qui parle,
@@ -1923,6 +1980,7 @@ impl BuildNet {
                 pitch,
                 crouch,
                 speed,
+                ping,
             } => {
                 let pose = minelib_net::poses::Pose {
                     pos,
@@ -1930,6 +1988,7 @@ impl BuildNet {
                     pitch,
                     crouch,
                     speed,
+                    ping: (ping > 0).then_some(ping),
                 };
                 // Numéro sur le relais du monde (le vocal passe par lui).
                 self.player_seen((peer != 0).then_some(peer), &pseudo, pose);
@@ -1990,6 +2049,9 @@ impl BuildNet {
                 o.crouch = p.crouch;
                 o.speed = p.speed;
                 o.seen = 0.0;
+                if p.ping.is_some() {
+                    o.ping = p.ping;
+                }
             }
             None => {
                 self.others.insert(
@@ -2005,6 +2067,7 @@ impl BuildNet {
                         crouch: p.crouch,
                         speed: p.speed,
                         seen: 0.0,
+                        ping: p.ping,
                     },
                 );
             }
@@ -4042,10 +4105,26 @@ mod tests {
         let mut taken_back: Option<Duration> = None;
         let mut served_again: Option<Duration> = None;
         let mut bulk_sent = false;
+        // (v165) Tous parlent tout du long, de part et d'autre de la frontière des deux
+        // provinces : après la panne aussi, chacun doit entendre tous les autres.
+        let mut heard_cleared = false;
         // 9 secondes de jeu, la panne au milieu (une fois la province servie).
         for step in 0..450 {
             let delegated = h.provinces_delegated();
             delegated_max = delegated_max.max(delegated);
+            if step == 60 {
+                for b in bots.iter_mut() {
+                    let link = b.link.clone().expect("file d'envoi");
+                    b.voice = Some(crate::voice::Voice::new(link));
+                }
+            }
+            if step >= 100 && step % 10 == 0 {
+                for b in bots.iter_mut() {
+                    if let Some(v) = &mut b.voice {
+                        v.talk_once();
+                    }
+                }
+            }
             if fault != ProvinceFault::None && fault_at.is_none() && step >= 250 && delegated > 0 {
                 let g = hosts
                     .iter_mut()
@@ -4075,6 +4154,17 @@ mod tests {
                 }
                 fault_at = Some((Instant::now(), which));
                 promos_at_fault = h.province_promotions();
+            }
+            // Ce qui compte : ce qu'on entend une fois la province de nouveau servie.
+            if !heard_cleared
+                && (served_again.is_some() || (fault == ProvinceFault::None && step == 250))
+            {
+                heard_cleared = true;
+                for b in bots.iter_mut() {
+                    if let Some(v) = &mut b.voice {
+                        v.heard.clear();
+                    }
+                }
             }
             // (Relevée : reprise par le relais du monde, ou confiée à son relais de secours,
             // parfois trop vite pour la voir quitter la liste.)
@@ -4149,9 +4239,15 @@ mod tests {
                 attached_max.max(hosts.iter().filter(|(_, g)| g.attach.is_some()).count());
             std::thread::sleep(Duration::from_millis(20));
         }
-        // Tout se pose (confirmations, doutes, paquets du propriétaire).
-        for _ in 0..350 {
+        // Tout se pose (confirmations, doutes, paquets du propriétaire) ; on parle encore
+        // un peu.
+        for step in 0..350 {
             for b in bots.iter_mut() {
+                if step < 150 && step % 10 == 0 {
+                    if let Some(v) = &mut b.voice {
+                        v.talk_once();
+                    }
+                }
                 b.tick(dt);
             }
             for (w, g) in &mut hosts {
@@ -4160,6 +4256,21 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let mut deaf = Vec::new();
+        for b in &bots {
+            let v = b.voice.as_ref().expect("voix");
+            for o in &bots {
+                if o.name != b.name && !v.heard.contains(&crate::voice::key_of(&o.name)) {
+                    deaf.push(format!("{} n'entend pas {}", b.name, o.name));
+                }
+            }
+        }
+        eprintln!("voix après la panne : {} sans voix {deaf:?}", deaf.len());
+        assert!(heard_cleared, "la province est de nouveau servie");
+        assert!(
+            deaf.is_empty(),
+            "après la panne, chacun entend les autres : {deaf:?}"
+        );
         eprintln!(
             "provinces : {fault:?}, déléguées au plus {delegated_max}, relais de région \
              rattachés {attached_max}, mises en ordre {ordered}, envois archivés {}, reprise \
@@ -4734,7 +4845,9 @@ mod tests {
             .filter_map(|g| g.province.as_ref())
     }
 
-    fn deep_world(crash_middle: bool) {
+    /// `voice` : (v165) les joueurs se parlent de part et d'autre de la frontière des deux
+    /// provinces ; chacun doit entendre tous les autres, par les relais des provinces.
+    fn deep_world(crash_middle: bool, voice: bool) {
         let _ = env_logger::builder().is_test(true).try_init();
         let (dir, h, mut hosts, mut bots, room) =
             province_setup_full(false, 4, 100, 8, Some((2, 3)), &[(1, 3)]);
@@ -4763,7 +4876,27 @@ mod tests {
         let mut leaves_back: Option<Duration> = None;
         let mut leaves_paused = false;
         let steps = if crash_middle { 800 } else { 600 };
+        // Voix : relayée par les relais de province et par le relais du monde depuis que
+        // tous parlent.
+        let mut voice_from: Option<(usize, usize)> = None;
         for step in 0..steps {
+            if voice && step == 60 {
+                for b in bots.iter_mut() {
+                    let link = b.link.clone().expect("file d'envoi");
+                    b.voice = Some(crate::voice::Voice::new(link));
+                }
+            }
+            if voice && step >= 250 && step % 10 == 0 {
+                if voice_from.is_none() {
+                    let by_prov: usize = held_by(&hosts, &lent).map(|p| p.voice_relayed()).sum();
+                    voice_from = Some((by_prov, h.voice_relayed()));
+                }
+                for b in bots.iter_mut() {
+                    if let Some(v) = &mut b.voice {
+                        v.talk_once();
+                    }
+                }
+            }
             for b in bots.iter_mut() {
                 if let Some(n) = &b.net {
                     for v in n.province_view() {
@@ -4892,6 +5025,32 @@ mod tests {
                 "ses provinces servent en moins de 3 s : {t:?}"
             );
         }
+        if voice {
+            // Chacun a entendu tous les autres, de son côté de la frontière et de l'autre.
+            let mut deaf = Vec::new();
+            for b in &bots {
+                let v = b.voice.as_ref().expect("voix");
+                for o in &bots {
+                    let key = crate::voice::key_of(&o.name);
+                    if o.name != b.name && !v.heard.contains(&key) {
+                        deaf.push(format!("{} n'entend pas {}", b.name, o.name));
+                    }
+                }
+            }
+            let by_prov: usize = held_by(&hosts, &lent).map(|p| p.voice_relayed()).sum();
+            let (prov0, root0) = voice_from.expect("voix");
+            let (by_prov, by_root) = (by_prov - prov0, h.voice_relayed() - root0);
+            eprintln!(
+                "voix au fond du monde : {by_prov} messages par les relais des provinces, \
+                 {by_root} par le relais du monde ; {} sans voix",
+                deaf.len()
+            );
+            assert!(deaf.is_empty(), "{deaf:?}");
+            assert!(
+                by_prov > 10 * by_root.max(1),
+                "la voix passe par les relais des provinces ({by_prov} contre {by_root})"
+            );
+        }
         for b in &bots {
             assert_eq!(
                 b.net.as_ref().unwrap().pending(),
@@ -4924,12 +5083,20 @@ mod tests {
 
     #[test]
     fn a_pays_of_pays_serves_three_levels_deep() {
-        deep_world(false);
+        deep_world(false, false);
     }
 
     #[test]
     fn a_middle_pays_whose_host_falls_keeps_its_provinces() {
-        deep_world(true);
+        deep_world(true, false);
+    }
+
+    /// (v165) Toute la planète a la voix de proximité : au fond d'un monde de pays de pays,
+    /// les joueurs de deux provinces voisines (de part et d'autre de leur frontière) se
+    /// parlent et s'entendent tous, par les relais des provinces.
+    #[test]
+    fn players_hear_each_other_across_province_borders_deep_in_the_world() {
+        deep_world(false, true);
     }
 
     /// (v147) Un pays trouve les hôtes de ses provinces parmi ses propres joueurs : le relais
@@ -6056,6 +6223,7 @@ mod tests {
                 pitch: 0.0,
                 crouch: 0.0,
                 speed: 4.0,
+                ping: 30,
             })
         };
         let dt = 0.05;

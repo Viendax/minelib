@@ -62,8 +62,8 @@ pub enum Sfx {
     Pain,
     /// Plongeon dans l'eau.
     Splash,
-    /// Porte ou trappe ouverte / fermée.
-    Door,
+    /// Porte ou trappe ouverte (`true`) ou fermée.
+    Door(bool),
     /// Barreaux d'une échelle qu'on grimpe ou descend à pleine vitesse.
     Ladder,
 }
@@ -83,7 +83,8 @@ static FILES: &[(&str, &[u8])] = sounds!(
     "step_6",
     "land",
     "splash",
-    "door",
+    "door_open",
+    "door_close",
     "ladder",
     "pain_1",
     "pain_2",
@@ -287,7 +288,8 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
         }
         Sfx::Land => ("land", 0.5),
         Sfx::Splash => ("splash", 0.8),
-        Sfx::Door => ("door", 0.8),
+        Sfx::Door(true) => ("door_open", 0.8),
+        Sfx::Door(false) => ("door_close", 0.8),
         Sfx::Ladder => ("ladder", 0.7),
         Sfx::Pain => {
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -309,6 +311,76 @@ struct Cmd {
     delay: f32,
     /// Chat vocal : (joueur, échantillons 16 kHz mono) au lieu d'un son du jeu.
     voice: Option<(u64, Vec<i16>)>,
+    /// La sortie son choisie a changé : elle est rouverte.
+    reopen: bool,
+}
+
+/// Sortie son choisie (nom du périphérique ; vide : celle par défaut du système).
+static OUTPUT: Mutex<String> = Mutex::new(String::new());
+
+/// Sorties son du système (noms des périphériques), dans l'ordre où il les donne.
+pub fn output_devices() -> Vec<String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    rodio::cpal::default_host()
+        .output_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Choisit la sortie son (vide : celle par défaut du système) : les sons y partent dès
+/// maintenant.
+pub fn set_output(name: &str) {
+    let changed = OUTPUT
+        .lock()
+        .map(|mut o| {
+            let changed = *o != name;
+            *o = name.to_string();
+            changed
+        })
+        .unwrap_or(false);
+    if !changed {
+        return;
+    }
+    if let Some(tx) = sender() {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(Cmd {
+                file: "",
+                volume: 0.0,
+                delay: 0.0,
+                voice: None,
+                reopen: true,
+            });
+        }
+    }
+}
+
+/// Ouvre la sortie choisie, sinon celle par défaut.
+fn open_output() -> Option<(OutputStream, rodio::OutputStreamHandle)> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let name = OUTPUT.lock().map(|o| o.clone()).unwrap_or_default();
+    if !name.is_empty() {
+        let dev = rodio::cpal::default_host()
+            .output_devices()
+            .ok()
+            .and_then(|mut it| it.find(|d| d.name().ok().as_deref() == Some(name.as_str())));
+        match dev.map(|d| OutputStream::try_from_device(&d)) {
+            Some(Ok(out)) => {
+                log::info!("audio : sortie « {name} »");
+                return Some(out);
+            }
+            Some(Err(e)) => {
+                log::warn!("audio : sortie « {name} » impossible à ouvrir ({e}), celle par défaut")
+            }
+            None => log::warn!("audio : sortie « {name} » introuvable, celle par défaut"),
+        }
+    }
+    match OutputStream::try_default() {
+        Ok(out) => Some(out),
+        Err(_) => {
+            log::warn!("audio : aucune sortie son, jeu sans son");
+            None
+        }
+    }
 }
 
 fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
@@ -318,10 +390,7 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
         let spawned = std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
-                let Ok((_stream, handle)) = OutputStream::try_default() else {
-                    log::warn!("audio : aucune sortie son, jeu sans son");
-                    return;
-                };
+                let mut out = open_output();
                 let mut cache: HashMap<
                     &'static str,
                     rodio::source::Buffered<Decoder<Cursor<&'static [u8]>>>,
@@ -330,11 +399,29 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                 // Une file par joueur qui parle.
                 let mut voices: HashMap<u64, Sink> = HashMap::new();
                 while let Ok(cmd) = rx.recv() {
+                    if cmd.reopen {
+                        // Les sons en cours étaient liés à l'ancienne sortie.
+                        sinks.clear();
+                        voices.clear();
+                        // (L'ancienne fermée d'abord : un périphérique peut ne s'ouvrir
+                        // qu'une fois.)
+                        drop(out.take());
+                        out = open_output();
+                        continue;
+                    }
+                    let Some((_, handle)) = &out else {
+                        continue;
+                    };
                     sinks.retain(|s| !s.empty());
                     if let Some((who, samples)) = cmd.voice {
-                        let sink = voices
-                            .entry(who)
-                            .or_insert_with(|| Sink::try_new(&handle).expect("sortie son"));
+                        let Some(sink) = (match voices.entry(who) {
+                            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                Sink::try_new(handle).ok().map(|s| e.insert(s))
+                            }
+                        }) else {
+                            continue;
+                        };
                         sink.set_volume(cmd.volume);
                         // Trop de retard accumulé : on repart au présent.
                         if sink.len() > 8 {
@@ -360,7 +447,7 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                     if sinks.len() >= 48 {
                         sinks.remove(0);
                     }
-                    if let Ok(sink) = Sink::try_new(&handle) {
+                    if let Ok(sink) = Sink::try_new(handle) {
                         sink.set_volume(cmd.volume);
                         sink.append(src.delay(Duration::from_secs_f32(cmd.delay.max(0.0))));
                         sinks.push(sink);
@@ -385,6 +472,7 @@ pub fn play(sfx: Sfx, delay: f32, master: f32) {
                 volume: volume * master,
                 delay,
                 voice: None,
+                reopen: false,
             });
         }
     }
@@ -399,6 +487,7 @@ pub fn voice(who: u64, samples: Vec<i16>, volume: f32) {
                 volume,
                 delay: 0.0,
                 voice: Some((who, samples)),
+                reopen: false,
             });
         }
     }

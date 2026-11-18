@@ -29,7 +29,103 @@ pub enum TexSrc {
     /// par le masque pour se raccorder aux voisins (1 haut, 2 droite, 4 bas, 8 gauche, dans
     /// le repère de la texture).
     Glass([u8; 3], u8),
+    /// (v165) Image d'un objet (pas un bloc) du pack : `textures/items/<nom>.png` ou
+    /// `textures/item/<nom>.png` (objets montrés dans les cadres des cartes). Absente :
+    /// transparente (rien n'est dessiné).
+    Item(&'static str),
 }
+
+/// (v165) Objets (pas des blocs) que les cadres des cartes peuvent montrer avec l'image du
+/// pack (nom de Minecraft).
+pub const FRAME_ITEMS: &[&str] = &[
+    "stick",
+    "glass_bottle",
+    "potion",
+    "honey_bottle",
+    "experience_bottle",
+    "bread",
+    "apple",
+    "carrot",
+    "potato",
+    "baked_potato",
+    "beetroot",
+    "melon_slice",
+    "cookie",
+    "pumpkin_pie",
+    "cake",
+    "egg",
+    "sugar",
+    "wheat",
+    "dried_kelp",
+    "cocoa_beans",
+    "sweet_berries",
+    "glow_berries",
+    "bone",
+    "bowl",
+    "paper",
+    "book",
+    "writable_book",
+    "written_book",
+    "enchanted_book",
+    "map",
+    "filled_map",
+    "clock",
+    "compass",
+    "arrow",
+    "bow",
+    "feather",
+    "string",
+    "leather",
+    "flint",
+    "coal",
+    "charcoal",
+    "iron_ingot",
+    "gold_ingot",
+    "copper_ingot",
+    "diamond",
+    "emerald",
+    "redstone",
+    "gunpowder",
+    "blaze_rod",
+    "breeze_rod",
+    "ender_pearl",
+    "bucket",
+    "water_bucket",
+    "lava_bucket",
+    "milk_bucket",
+    "shears",
+    "flint_and_steel",
+    "fishing_rod",
+    "spyglass",
+    "name_tag",
+    "lead",
+    "saddle",
+    "mace",
+    "wooden_sword",
+    "stone_sword",
+    "iron_sword",
+    "golden_sword",
+    "diamond_sword",
+    "iron_axe",
+    "iron_pickaxe",
+    "iron_shovel",
+    "iron_hoe",
+    "iron_helmet",
+    "iron_chestplate",
+    "leather_helmet",
+    "golden_apple",
+    "nautilus_shell",
+    "heart_of_the_sea",
+    "skull_banner_pattern",
+    "globe_banner_pattern",
+    "item_frame",
+    "glow_item_frame",
+    "painting",
+    "brush",
+    "firework_rocket",
+    "music_disc_cat",
+    "totem_of_undying",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostKind {
@@ -282,9 +378,16 @@ pub struct Registry {
     pub textures: Vec<TexSrc>,
     keys: HashMap<String, u16>,
     legacy: HashMap<(u16, u8), u16>,
+    /// (v165) Couche de texture de chaque objet de `FRAME_ITEMS`.
+    items: HashMap<&'static str, u16>,
 }
 
 impl Registry {
+    /// (v165) Couche de texture de l'image d'un objet de `FRAME_ITEMS` (nom de Minecraft).
+    pub fn item_texture(&self, name: &str) -> Option<u16> {
+        self.items.get(name).copied()
+    }
+
     pub fn get(&self, id: BlockId) -> &BlockDef {
         self.defs.get(id.0 as usize).unwrap_or(&self.defs[0])
     }
@@ -659,6 +762,7 @@ fn build() -> Registry {
             textures: Vec::new(),
             keys: HashMap::new(),
             legacy: HashMap::new(),
+            items: HashMap::new(),
         },
         tex_index: HashMap::new(),
     };
@@ -1740,6 +1844,11 @@ fn build() -> Registry {
     // fluides, têtes murales.
     fluids_and_heads(&mut b);
     legacy_table(&mut b);
+    // (v165) Images des objets des cadres, à la suite des textures des blocs.
+    for name in FRAME_ITEMS {
+        let i = b.tex(&TexSrc::Item(name));
+        b.r.items.insert(name, i);
+    }
     b.r
 }
 

@@ -955,6 +955,110 @@ fn emit_hole_walls(
     }
 }
 
+/// (v165) Bords des trous d'une porte (fenêtres de sa texture), comme `emit_hole_walls`
+/// pour les trappes : à l'intérieur d'un trou, on voit son bord sur toute l'épaisseur de la
+/// porte (la couleur du pixel du bord), pas le vide. La texture va des gonds au bout libre
+/// le long de `width` (retournée si `hinge_high`), de haut en bas.
+#[allow(clippy::too_many_arguments)]
+fn emit_door_hole_walls(
+    out: &mut MeshData,
+    min: [f32; 3],
+    max: [f32; 3],
+    id: BlockId,
+    light: [u8; 4],
+    width: usize,
+    hinge_high: bool,
+) {
+    let k = 2 - width;
+    let layer = face_tex(id, [0u32, 2, 4][k]) as usize;
+    let mask = match CUTOUTS.read() {
+        Ok(c) => match c.get(layer) {
+            Some(m) => *m,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    if mask.iter().all(|&r| r == u16::MAX) {
+        return;
+    }
+    let solid = |u: i32, v: i32| {
+        (0..16).contains(&u) && (0..16).contains(&v) && mask[v as usize] >> u & 1 == 1
+    };
+    let cell = min.map(|v| v.floor());
+    // Point du bloc pour (u, v) de la texture (0..1) et t le long de l'épaisseur.
+    let at = |u: f32, v: f32, t: f32| -> [f32; 3] {
+        let mut l = [0.0f32; 3];
+        l[width] = if hinge_high { 1.0 - u } else { u };
+        l[1] = 1.0 - v;
+        l[k] = t;
+        std::array::from_fn(|i| cell[i] + l[i])
+    };
+    // Faces du bloc qui vont vers +u (vers le bout libre) et +v (vers le bas).
+    let plus = [0usize, 2, 4][width];
+    let face_u = if hinge_high { plus ^ 1 } else { plus };
+    let face_v = 3usize;
+    let (t0, t1) = (min[k] - cell[k], max[k] - cell[k]);
+    let tex = layer as u32 | TEX_SHARP | TEX_LOCAL_UV;
+    let px = 1.0 / 16.0;
+    for v in 0..16i32 {
+        for u in 0..16i32 {
+            if !solid(u, v) {
+                continue;
+            }
+            let q = [(u * 8 + 4) as u32, (v * 8 + 4) as u32];
+            let tex = tex | q[0] << 16 | q[1] << 24;
+            for (du, dv) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (nu, nv) = (u + du, v + dv);
+                if !(0..16).contains(&nu) || !(0..16).contains(&nv) || solid(nu, nv) {
+                    continue;
+                }
+                let face = match (du, dv) {
+                    (1, _) => face_u,
+                    (-1, _) => face_u ^ 1,
+                    (_, 1) => face_v,
+                    _ => face_v ^ 1,
+                };
+                let (u0, u1, v0, v1) = if du != 0 {
+                    let e = (u + du.max(0)) as f32 * px;
+                    (e, e, v as f32 * px, (v + 1) as f32 * px)
+                } else {
+                    let e = (v + dv.max(0)) as f32 * px;
+                    (u as f32 * px, (u + 1) as f32 * px, e, e)
+                };
+                let corners = [
+                    at(u0, v0, t0),
+                    at(u1, v1, t0),
+                    at(u1, v1, t1),
+                    at(u0, v0, t1),
+                ];
+                let (nrm, _, _) = FACES[face];
+                let e1: [f32; 3] = std::array::from_fn(|i| corners[1][i] - corners[0][i]);
+                let e2: [f32; 3] = std::array::from_fn(|i| corners[3][i] - corners[0][i]);
+                let c = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let dot: f32 = (0..3).map(|i| c[i] * nrm[i] as f32).sum();
+                let start = out.vertices.len() as u32;
+                for p in corners {
+                    out.vertices.push(Vertex {
+                        pos: p,
+                        data: Vertex::block_data(face as u32, 3, light) | reflect_bits(id),
+                        tex,
+                    });
+                }
+                let order = if dot > 0.0 {
+                    [0, 1, 2, 2, 3, 0]
+                } else {
+                    [0, 3, 2, 2, 1, 0]
+                };
+                out.indices.extend_from_slice(&order.map(|i| start + i));
+            }
+        }
+    }
+}
+
 /// Repère d'une torche murale : penchée de 22,5° en s'écartant du mur, pied contre le mur,
 /// puis tournée vers le mur `d` (0 +X, 1 −X, 4 +Z, 5 −Z). Coordonnées locales 0..1.
 pub fn wall_torch_xf(d: u8, p: [f32; 3]) -> [f32; 3] {
@@ -1579,6 +1683,16 @@ fn mesh_block(
                                     width,
                                     high,
                                 );
+                                // (v165) Ses trous (fenêtres) bordés comme ceux des trappes.
+                                emit_door_hole_walls(
+                                    out,
+                                    [wx + lo[0], wy + lo[1], wz + lo[2]],
+                                    [wx + hi[0], wy + hi[1], wz + hi[2]],
+                                    id,
+                                    lit,
+                                    width,
+                                    high,
+                                );
                                 continue;
                             }
                             emit_box_t(
@@ -2028,6 +2142,61 @@ mod tests {
             assert!(
                 dot > 0.0,
                 "face {f} au centre {c:?} pas tournée vers le trou"
+            );
+        }
+    }
+
+    /// (v165) Comme les trappes : le trou d'une fenêtre de porte est bordé, chaque bord
+    /// tourné vers le trou.
+    #[test]
+    fn door_holes_have_walls_facing_into_the_hole() {
+        let reg = crate::registry::registry();
+        let id = (0..reg.len())
+            .map(|i| BlockId(i as u16))
+            .find(|b| {
+                let k = &b.def().key;
+                k.starts_with("door_")
+                    && k.contains(":lower:")
+                    && !k.ends_with(":o")
+                    && !k.ends_with(":m")
+            })
+            .expect("porte");
+        let box_ = id.def().boxes()[0];
+        let k = (0..3).find(|&i| box_.0[i] != 0 || box_.1[i] != 16).unwrap();
+        let layer = face_tex(id, [0u32, 2, 4][k]) as usize;
+        let _guard = CUTOUT_TEST.lock().unwrap();
+        let mut masks = vec![[u16::MAX; 16]; layer + 1];
+        masks[layer][6] &= !(1 << 5);
+        set_cutouts(masks);
+        let mut w = World::new(0);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                w.insert_empty(ChunkPos { x: dx, z: dz });
+            }
+        }
+        w.set(3, 40, 3, id);
+        let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        set_cutouts(Vec::new());
+        let walls: Vec<_> = m
+            .vertices
+            .chunks_exact(4)
+            .filter(|q| q[0].tex & TEX_SHARP != 0 && q[0].tex & TEX_LOCAL_UV != 0)
+            .collect();
+        assert_eq!(walls.len(), 4, "un bord par côté du trou");
+        let center = |q: &[Vertex]| -> [f32; 3] {
+            std::array::from_fn(|i| q.iter().map(|v| v.pos[i]).sum::<f32>() / 4.0)
+        };
+        // Le trou : au milieu des quatre bords.
+        let hole: [f32; 3] = std::array::from_fn(|i| {
+            walls.iter().map(|q| center(q)[i]).sum::<f32>() / walls.len() as f32
+        });
+        for q in &walls {
+            let c = center(q);
+            let (n, _, _) = FACES[q[0].face() as usize];
+            let dot: f32 = (0..3).map(|i| (hole[i] - c[i]) * n[i] as f32).sum();
+            assert!(
+                dot > 0.0,
+                "bord au centre {c:?} pas tourné vers le trou {hole:?}"
             );
         }
     }

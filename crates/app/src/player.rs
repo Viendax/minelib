@@ -475,17 +475,17 @@ impl Player {
                     Fluid::Water => (SWIM_WATER * if m.sprint { 1.4 } else { 1.0 }, SINK_WATER),
                     Fluid::Lava => (SWIM_LAVA, SINK_LAVA),
                 };
-                let k = (dt * 6.0).min(1.0);
-                let target = wish * cap;
-                // Depuis la vitesse d'avant ce pas (sans l'accélération de la marche).
-                self.vel.x = v0.x + (target.x - v0.x) * k;
-                self.vel.z = v0.z + (target.z - v0.z) * k;
-                let up = if m.jump { SWIM_UP } else { sink };
-                // On garde l'élan d'un saut hors de l'eau quelques instants, mais une chute
-                // est freinée aussitôt.
-                // La gravité ne compte pas dans un fluide : on part de la vitesse d'avant.
-                let k = (dt * if vy0 < up { 8.0 } else { 3.0 }).min(1.0);
-                self.vel.y = vy0 + (up - vy0) * k;
+                if fps {
+                    // Mode FPS : l'eau ne ralentit pas et l'on n'y nage pas (on y marche et
+                    // l'on y saute comme ailleurs), mais elle arrête toujours une chute : on
+                    // n'y descend pas plus vite qu'on y coule.
+                    if vy0 < sink {
+                        let k = (dt * 8.0).min(1.0);
+                        self.vel.y = vy0 + (sink - vy0) * k;
+                    }
+                } else {
+                    self.swim(wish, cap, sink, v0, vy0, m.jump, dt);
+                }
             }
         }
         // Échelle (comme dans CS) : vers l'avant on monte, ou on descend en regardant vers
@@ -644,6 +644,22 @@ impl Player {
             self.stamina =
                 (self.stamina + cs::STAMINA_LAND_COST * fall_speed / cs::UNIT).min(cs::STAMINA_MAX);
         }
+    }
+
+    /// Nage (hors mode FPS) : vitesse plafonnée à `cap` dans le fluide, on y coule à
+    /// `sink`, Saut fait remonter. Depuis la vitesse d'avant ce pas (`v0`, `vy0`) : ni
+    /// l'accélération de la marche ni la gravité ne comptent dans un fluide.
+    #[allow(clippy::too_many_arguments)]
+    fn swim(&mut self, wish: Vec3, cap: f32, sink: f32, v0: Vec3, vy0: f32, jump: bool, dt: f32) {
+        let k = (dt * 6.0).min(1.0);
+        let target = wish * cap;
+        self.vel.x = v0.x + (target.x - v0.x) * k;
+        self.vel.z = v0.z + (target.z - v0.z) * k;
+        let up = if jump { SWIM_UP } else { sink };
+        // On garde l'élan d'un saut hors de l'eau quelques instants, mais une chute est
+        // freinée aussitôt.
+        let k = (dt * if vy0 < up { 8.0 } else { 3.0 }).min(1.0);
+        self.vel.y = vy0 + (up - vy0) * k;
     }
 
     /// Vitesse horizontale (blocs/s).
@@ -1139,6 +1155,51 @@ mod tests {
         let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
         p.update(&w, &none, dt);
         assert_eq!(p.swimming, Some(Fluid::Lava));
+    }
+
+    #[test]
+    fn in_fps_mode_water_stops_falls_but_neither_slows_nor_lets_swim() {
+        let mut w = flat_world();
+        for y in 11..15 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    w.set(x, y, z, BlockId::WATER);
+                }
+            }
+        }
+        let dt = 1.0 / 64.0;
+        let fps = |forward: f32, jump: bool| MoveInput {
+            forward,
+            jump,
+            jump_pressed: jump,
+            sprint: true,
+            fps: true,
+            ..Default::default()
+        };
+        // On tombe dedans : la chute est arrêtée.
+        let mut p = Player::new(Vec3::new(8.5, 16.0, 8.5));
+        p.vel.y = -15.0;
+        for _ in 0..24 {
+            p.update(&w, &fps(0.0, false), dt);
+        }
+        assert_eq!(p.swimming, Some(Fluid::Water));
+        assert!(p.vel.y > -4.0, "chute arrêtée : {}", p.vel.y);
+        // Saut tenu en pleine eau : on ne nage pas, on ne remonte pas.
+        let y = p.pos.y;
+        for _ in 0..32 {
+            p.update(&w, &fps(0.0, true), dt);
+        }
+        assert!(p.pos.y < y, "pas de nage : {} → {}", y, p.pos.y);
+        // Au fond, on court aussi vite qu'ailleurs.
+        for _ in 0..400 {
+            p.update(&w, &fps(0.0, false), dt);
+        }
+        assert!(p.on_ground);
+        for _ in 0..128 {
+            p.update(&w, &fps(1.0, false), dt);
+        }
+        let flat = Vec3::new(p.vel.x, 0.0, p.vel.z).length();
+        assert!(flat > FPS_SPRINT * 0.95, "pas ralenti : {flat}");
     }
 
     #[test]

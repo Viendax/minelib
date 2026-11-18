@@ -595,7 +595,7 @@ impl Heads {
                 l.starts_with(&prefix)
                     && l.split(',')
                         .nth(3)
-                        .is_some_and(|p| !p.starts_with(['f', 'm', 'a']))
+                        .is_some_and(|p| !p.starts_with(['f', 'i', 'm', 'a']))
             };
             if text.lines().any(mine) {
                 write_lines(&path, text.lines().filter(|l| !mine(l)));

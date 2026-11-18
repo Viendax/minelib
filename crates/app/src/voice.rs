@@ -6,6 +6,7 @@
 //! les garants ne peuvent écouter.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -37,9 +38,56 @@ struct Mic {
     rate: u32,
 }
 
+/// Micro choisi (nom du périphérique ; vide : celui par défaut du système), changements
+/// (le micro ouvert est rouvert), et volume du micro (gain, en bits d'un `f32`).
+static INPUT: Mutex<String> = Mutex::new(String::new());
+static INPUT_GEN: AtomicU32 = AtomicU32::new(0);
+static MIC_GAIN: AtomicU32 = AtomicU32::new(0x3f80_0000);
+
+/// Micros du système (noms des périphériques), dans l'ordre où il les donne.
+pub fn input_devices() -> Vec<String> {
+    cpal::default_host()
+        .input_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Choisit le micro (vide : celui par défaut du système) : rouvert au prochain appui.
+pub fn set_input(name: &str) {
+    if let Ok(mut i) = INPUT.lock() {
+        if *i != name {
+            *i = name.to_string();
+            INPUT_GEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Volume du micro : gain appliqué à ce qu'on envoie (1 : tel quel, 0 à 2).
+pub fn set_mic_gain(gain: f32) {
+    MIC_GAIN.store(gain.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
+}
+
+fn mic_gain() -> f32 {
+    f32::from_bits(MIC_GAIN.load(Ordering::Relaxed))
+}
+
 fn open_mic() -> Option<Mic> {
     let host = cpal::default_host();
-    let dev = host.default_input_device()?;
+    let name = INPUT.lock().map(|i| i.clone()).unwrap_or_default();
+    let chosen = (!name.is_empty())
+        .then(|| {
+            host.input_devices()
+                .ok()?
+                .find(|d| d.name().ok().as_deref() == Some(name.as_str()))
+        })
+        .flatten();
+    if !name.is_empty() && chosen.is_none() {
+        log::warn!("micro « {name} » introuvable : celui par défaut");
+    }
+    let dev = match chosen {
+        Some(d) => d,
+        None => host.default_input_device()?,
+    };
     let cfg = dev.default_input_config().ok()?;
     let channels = cfg.channels() as usize;
     let rate = cfg.sample_rate().0;
@@ -184,15 +232,19 @@ pub struct Voice {
     since_talk: f32,
     mic: Option<Mic>,
     mic_failed: bool,
+    /// Choix du micro pour lequel `mic` a été ouvert (voir `set_input`).
+    mic_gen: u32,
     pending: Vec<f32>,
     phase: f64,
     /// Ce jeu émet en ce moment.
     pub talking: bool,
     /// Qui parle (temps depuis le dernier paquet).
     pub speaking: HashMap<u64, f32>,
-    /// Essais : paquets de voix reçus et déchiffrés.
+    /// Essais : paquets de voix reçus et déchiffrés, et de qui (depuis le début).
     #[cfg(test)]
     pub frames: usize,
+    #[cfg(test)]
+    pub heard: HashSet<u64>,
 }
 
 /// Temps minimal entre deux changements de clé (s), selon le nombre d'auditeurs. Quand un
@@ -231,12 +283,15 @@ impl Voice {
             since_talk: f32::MAX,
             mic: None,
             mic_failed: false,
+            mic_gen: INPUT_GEN.load(Ordering::Relaxed),
             pending: Vec::new(),
             phase: 0.0,
             talking: false,
             speaking: HashMap::new(),
             #[cfg(test)]
             frames: 0,
+            #[cfg(test)]
+            heard: HashSet::new(),
         }
     }
 
@@ -386,6 +441,13 @@ impl Voice {
                 self.given.insert(l);
             }
         }
+        // Un autre micro choisi : rouvert au prochain appui.
+        let gen = INPUT_GEN.load(Ordering::Relaxed);
+        if gen != self.mic_gen {
+            self.mic_gen = gen;
+            self.mic = None;
+            self.mic_failed = false;
+        }
         // Micro : ouvert au premier appui.
         if ptt && self.mic.is_none() && !self.mic_failed {
             self.mic = open_mic();
@@ -414,11 +476,12 @@ impl Voice {
         self.phase = phase;
         self.pending.extend(resampled);
         let to: Vec<u64> = self.given.iter().copied().collect();
+        let gain = mic_gain();
         while self.pending.len() >= FRAME {
             let frame: Vec<i16> = self
                 .pending
                 .drain(..FRAME)
-                .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                .map(|s| ((s * gain).clamp(-1.0, 1.0) * 32767.0) as i16)
                 .collect();
             let plain = voice::encode(&frame);
             self.seq += 1;
@@ -513,6 +576,7 @@ impl Voice {
                 #[cfg(test)]
                 {
                     self.frames += 1;
+                    self.heard.insert(from);
                 }
                 if gain > 0.0 {
                     crate::audio::voice(from, voice::decode(&plain, FRAME), gain.min(2.0));

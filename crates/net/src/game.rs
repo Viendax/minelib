@@ -230,6 +230,8 @@ pub struct ScoreRow {
     pub elo: i32,
     /// Couleur du joueur dans son équipe (0 à 4).
     pub color: u8,
+    /// (v165) Ping du joueur avec l'hôte de la partie (ms ; 0 : l'hôte lui-même).
+    pub ping: u16,
 }
 
 /// Résultat d'une partie, envoyé au relais par l'hôte et confirmé par les joueurs.
@@ -456,6 +458,9 @@ pub enum ToHost {
     },
     /// Réponse au vote de son équipe (F1 oui, F2 non).
     Ballot(bool),
+    /// (v165) Son ping avec l'hôte (ms), mesuré par ses entrées confirmées : montré à tous
+    /// dans le tableau des scores.
+    Ping(u16),
 }
 
 /// Messages d'un monde de construction en ligne (passent par les zones du relais).
@@ -486,6 +491,8 @@ pub enum BuildMsg {
         pitch: f32,
         crouch: f32,
         speed: f32,
+        /// (v165) Son ping avec son relais (ms), montré dans la liste des joueurs (Tab).
+        ping: u16,
     },
     /// Le relais du monde refuse la modification du joueur `peer` en `pos` : remise à lui
     /// seul, qui remet le bloc d'avant.
@@ -558,6 +565,7 @@ pub fn pose_of(data: &[u8]) -> Option<(String, crate::poses::Pose)> {
             pitch,
             crouch,
             speed,
+            ping,
         } => {
             let pose = crate::poses::Pose {
                 pos,
@@ -565,6 +573,7 @@ pub fn pose_of(data: &[u8]) -> Option<(String, crate::poses::Pose)> {
                 pitch,
                 crouch,
                 speed,
+                ping: (ping > 0).then_some(ping),
             };
             pose.sane().then_some((pseudo, pose))
         }

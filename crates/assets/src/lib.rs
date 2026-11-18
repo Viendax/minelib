@@ -107,6 +107,16 @@ pub struct Options {
     pub fullscreen: bool,
     /// Volume général des sons (0..1).
     pub volume: f32,
+    /// Sortie son choisie (nom du périphérique ; vide : celle par défaut du système).
+    pub audio_out: String,
+    /// Micro choisi (nom du périphérique ; vide : celui par défaut du système).
+    pub audio_in: String,
+    /// Volume du micro (gain appliqué à ce qu'on envoie : 0..2, 1 = tel quel).
+    pub volume_mic: f32,
+    /// Volume du son des écrans vidéo (0..1).
+    pub volume_screens: f32,
+    /// Volume du tchat vocal entrant (0..2, 1 = tel quel).
+    pub volume_voice: f32,
     /// Adresse du relais (comptes, liste des parties).
     pub relay: String,
     /// Au menu, ce jeu peut servir de garant indépendant pour les parties des autres.
@@ -142,6 +152,11 @@ impl Default for Options {
             cpu_uniform: true,
             fullscreen: false,
             volume: 0.6,
+            audio_out: String::new(),
+            audio_in: String::new(),
+            volume_mic: 1.0,
+            volume_screens: 1.0,
+            volume_voice: 1.0,
             relay: "auto".into(),
             garant: true,
             relay_key: String::new(),
@@ -197,6 +212,21 @@ impl Options {
             if let Some(v) = kv.get("volume").and_then(|v| v.parse::<f32>().ok()) {
                 o.volume = v.clamp(0.0, 1.0);
             }
+            if let Some(v) = kv.get("audio_out") {
+                o.audio_out = v.trim().to_string();
+            }
+            if let Some(v) = kv.get("audio_in") {
+                o.audio_in = v.trim().to_string();
+            }
+            if let Some(v) = kv.get("volume_mic").and_then(|v| v.parse::<f32>().ok()) {
+                o.volume_mic = v.clamp(0.0, 2.0);
+            }
+            if let Some(v) = kv.get("volume_screens").and_then(|v| v.parse::<f32>().ok()) {
+                o.volume_screens = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = kv.get("volume_voice").and_then(|v| v.parse::<f32>().ok()) {
+                o.volume_voice = v.clamp(0.0, 2.0);
+            }
             if let Some(v) = kv.get("sensitivity").and_then(|v| v.parse::<f32>().ok()) {
                 o.sensitivity = v.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
                 o.sensitivity_fps = o.sensitivity;
@@ -224,9 +254,14 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_screens={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
+                self.audio_out.replace('\n', " "),
+                self.audio_in.replace('\n', " "),
+                self.volume_mic,
+                self.volume_screens,
+                self.volume_voice,
                 self.fps_max,
                 self.relay,
                 self.relay_key,
@@ -461,6 +496,20 @@ impl ResourcePack {
             return default_pack()?.block_image(name);
         }
         None
+    }
+
+    /// (v165) Image d'un objet (pas un bloc) par son nom de Minecraft : `textures/items/<nom>`
+    /// (packs à l'ancienne), puis `textures/item/<nom>` (1.13+) ; à défaut, le pack par
+    /// défaut.
+    pub fn item_image(&self, name: &str) -> Option<Rgba> {
+        let own = self
+            .image_own(&format!("textures/items/{name}.png"))
+            .or_else(|| self.image_own(&format!("textures/item/{name}.png")));
+        match own {
+            Some(img) => Some(img),
+            None if self.fallback => default_pack()?.item_image(name),
+            None => None,
+        }
     }
 
     fn modern_block(&self, name: &str, modern: &str) -> Option<Rgba> {

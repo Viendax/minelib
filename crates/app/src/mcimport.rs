@@ -1792,41 +1792,41 @@ fn frame_line(e: &Nbt, y_offset: i32) -> Option<String> {
     if id != "minecraft:item_frame" && id != "minecraft:glow_item_frame" {
         return None;
     }
-    let facing = e.get("Facing").and_then(Nbt::as_i64)?.clamp(0, 5);
-    let tile = |k: &str| e.get(k).and_then(Nbt::as_i64);
-    let (x, y, z) = match e.get("block_pos") {
-        Some(Nbt::IntArray(a)) if a.len() == 3 => (a[0] as i64, a[1] as i64, a[2] as i64),
-        _ => (tile("TileX")?, tile("TileY")?, tile("TileZ")?),
-    };
+    let ([x, y, z], facing) = frame_cell(e, y_offset)?;
     let invisible = e.get("Invisible").and_then(Nbt::as_i64).unwrap_or(0) != 0;
-    let item = e
-        .path(&["Item", "id"])
-        .or_else(|| e.path(&["item", "id"]))
+    let it = e.get("Item").or_else(|| e.get("item"));
+    let item = it
+        .and_then(|i| i.get("id"))
         .and_then(Nbt::as_str)
         .unwrap_or("");
-    let key = if item.is_empty() {
-        if invisible {
-            return None;
-        }
-        String::new()
+    let n = item.strip_prefix("minecraft:").unwrap_or(item);
+    let reg = registry::registry();
+    let content = if item.is_empty() || it.and_then(item_head).is_some() {
+        // Vide, ou une tête (dessinée avec les têtes).
+        "bloc:".to_string()
+    } else if reg.item_texture(n).is_some() {
+        // Un objet (bâton, bouteille, pain…) : son image du pack.
+        format!("objet:{n}")
     } else {
-        let n = item.strip_prefix("minecraft:").unwrap_or(item);
         let b = map_block_state(item, &HashMap::new());
         let d = b.def();
-        // Un bloc plein (béton, laine…), ou un tapis : on le voit dans le cadre ; les
-        // autres objets (épée, pain…) ne sont pas dessinés.
-        if b == BlockId::AIR || (b == BlockId::STONE && !n.contains("stone")) {
-            return None;
+        // Un bloc : en volume (plein, tapis, verre) ou à plat (vitre, fleur, rail…).
+        if b == BlockId::AIR
+            || (b == BlockId::STONE && !n.contains("stone"))
+            || d.hidden
+            || matches!(d.shape, registry::Shape::Invisible)
+        {
+            "bloc:".to_string()
+        } else {
+            format!("bloc:{}", d.key)
         }
-        if !(d.full || d.key.starts_with("carpet") || d.key.starts_with("glass")) {
-            return None;
-        }
-        d.key.clone()
     };
-    Some(format!(
-        "{x},{},{z},f{facing},bloc:{key}",
-        y as i32 + y_offset
-    ))
+    // Invisible et sans rien à montrer : il n'y a rien à voir.
+    if invisible && content == "bloc:" {
+        return None;
+    }
+    let kind = if invisible { 'i' } else { 'f' };
+    Some(format!("{x},{y},{z},{kind}{facing},{content}"))
 }
 
 /// Cases couvertes par une entité d'affichage (et ses passagers).
@@ -2780,6 +2780,144 @@ mod dump_area {
         v.sort_by_key(|x| std::cmp::Reverse(x.1));
         for (k, n) in v.iter().take(60) {
             eprintln!("{n:6} {k}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod block_audit {
+    use super::*;
+
+    /// (v165) Revue des blocs d'une vraie carte, un par un (`MC_WORLDS` : dossiers de
+    /// mondes Minecraft séparés par `;`) : chaque état de bloc employé, combien de fois,
+    /// et ce qu'il devient. Ceux qui passent par le repli par nom (`map_block_name`) sont
+    /// devinés : à vérifier. Écrit le rapport dans `MC_AUDIT` (sinon à l'écran).
+    #[test]
+    #[ignore]
+    fn audit_real_world_blocks() {
+        let Some(dirs) = std::env::var_os("MC_WORLDS") else {
+            return;
+        };
+        let dirs = dirs.to_string_lossy().to_string();
+        // (nom, propriétés triées) → (nombre, cartes)
+        let mut seen: std::collections::BTreeMap<
+            (String, String),
+            (u64, std::collections::BTreeSet<String>),
+        > = Default::default();
+        for dir in dirs.split(';').filter(|d| !d.is_empty()) {
+            let map = Path::new(dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let Ok(rd) = std::fs::read_dir(Path::new(dir).join("region")) else {
+                continue;
+            };
+            for f in rd.flatten() {
+                let Ok(bytes) = std::fs::read(f.path()) else {
+                    continue;
+                };
+                for root in read_region(&bytes) {
+                    let level = root.get("Level").unwrap_or(&root);
+                    let sections = level
+                        .get("sections")
+                        .or_else(|| level.get("Sections"))
+                        .map(Nbt::as_list)
+                        .unwrap_or(&[]);
+                    for sec in sections {
+                        let (palette, states) = match sec.get("block_states") {
+                            Some(bs) => (bs.get("palette"), bs.get("data")),
+                            None => (sec.get("Palette"), sec.get("BlockStates")),
+                        };
+                        let Some(palette) = palette else { continue };
+                        let list = palette.as_list();
+                        // Nombre de cases de chaque entrée de la palette.
+                        let mut counts = vec![0u64; list.len()];
+                        match states {
+                            Some(Nbt::LongArray(data)) if list.len() > 1 => {
+                                let bits = bits_for(list.len());
+                                let dv = root.get("DataVersion").and_then(Nbt::as_i64).unwrap_or(0);
+                                for i in 0..4096 {
+                                    let k = packed(data, i, bits, dv < 2529);
+                                    if let Some(c) = counts.get_mut(k) {
+                                        *c += 1;
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some(c) = counts.first_mut() {
+                                    *c += 4096;
+                                }
+                            }
+                        }
+                        for (p, n) in list.iter().zip(counts) {
+                            if n == 0 {
+                                continue;
+                            }
+                            let name = p.get("Name").and_then(Nbt::as_str).unwrap_or("?");
+                            let mut props: Vec<(String, String)> = match p.get("Properties") {
+                                Some(Nbt::Compound(m)) => m
+                                    .iter()
+                                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                            props.sort();
+                            let key = props
+                                .iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let e = seen.entry((name.to_string(), key)).or_default();
+                            e.0 += n;
+                            e.1.insert(map.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // Par nom de bloc : total, comment il est converti, et les états qui donnent un
+        // autre bloc que le premier.
+        let mut by_name: std::collections::BTreeMap<String, Vec<(String, u64, String, String)>> =
+            Default::default();
+        for ((name, key), (n, maps)) in &seen {
+            let props: HashMap<String, String> = key
+                .split(',')
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let how = if recent_block(name).is_some() {
+                "proche"
+            } else if modern_block(name, &props).is_some() {
+                "exact"
+            } else {
+                "DEVINÉ"
+            };
+            let id = map_block_state(name, &props);
+            let to = format!("{} ({how})", id.def().key);
+            let maps = maps.iter().cloned().collect::<Vec<_>>().join(" | ");
+            by_name
+                .entry(name.clone())
+                .or_default()
+                .push((key.clone(), *n, to, maps));
+        }
+        let mut out = String::new();
+        let mut rows: Vec<_> = by_name.iter().collect();
+        // Les devinés d'abord, puis les plus employés.
+        rows.sort_by_key(|(_, v)| {
+            let guessed = v.iter().any(|x| x.2.contains("DEVINÉ"));
+            let total: u64 = v.iter().map(|x| x.1).sum();
+            (!guessed, std::cmp::Reverse(total))
+        });
+        for (name, states) in rows {
+            let total: u64 = states.iter().map(|x| x.1).sum();
+            out += &format!("{name}  ×{total}\n");
+            for (key, n, to, maps) in states {
+                out += &format!("    [{key}] ×{n} → {to}   ({maps})\n");
+            }
+        }
+        match std::env::var_os("MC_AUDIT") {
+            Some(p) => std::fs::write(p, out).expect("rapport"),
+            None => println!("{out}"),
         }
     }
 }

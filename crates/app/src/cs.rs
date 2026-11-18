@@ -1806,6 +1806,9 @@ impl Match {
                 money: p.money,
                 elo: 0,
                 color: p.color,
+                // (Les pings ne font pas partie des règles : l'hôte les ajoute, voir
+                // `Host::rows`.)
+                ping: 0,
             })
             .collect();
         v.sort_by(|a, b| b.score.cmp(&a.score).then(b.kills.cmp(&a.kills)));
