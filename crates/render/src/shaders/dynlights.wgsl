@@ -280,6 +280,56 @@ fn dl_shadow_uv(L: DynLight, fr: DlFrame, d: vec3<f32>) -> vec3<f32> {
 /// Rotation du disque de Vogel d'un échantillon au suivant (angle d'or).
 const DL_GOLDEN = vec2<f32>(-0.73736887, 0.67549029);
 
+/// Ombre nette lissée : filtre en tente sur trois texels de côté (quatre lectures bilinéaires
+/// comparées, aux places et poids du filtre de The Witness), chaque lecture comparée à la
+/// distance du plan de la face dans sa propre direction (pas d'acné sur une face rasante),
+/// puis bord resserré. Bords arrondis et nets, sans marches d'escalier, stables (pas de
+/// bruit). `dir` : direction lumière → point, `ndt` : n · (point − lumière), `dist` :
+/// distance, `eps` : marge.
+fn dl_shadow_tent(L: DynLight, fr: DlFrame, dir: vec3<f32>, n: vec3<f32>, ndt: f32, dist: f32, range: f32, eps: f32) -> f32 {
+    var rect = fr.rect;
+    var c: vec3<f32>;
+    var nb: vec3<f32>;
+    if L.shadow.x > 1.5 {
+        let f = dl_cube_face(dir);
+        c = dl_face_coords(f, dir);
+        nb = dl_face_coords(f, n);
+        rect = dl_tile_rect(L.vol.w + f32(f));
+    } else {
+        c = vec3<f32>(dot(fr.b[0], dir), dot(fr.b[1], dir), dot(fr.b[2], dir));
+        nb = vec3<f32>(dot(fr.b[0], n), dot(fr.b[1], n), dot(fr.b[2], n));
+    }
+    let th = L.shadow.y;
+    let tile = max(dh.sh.z, 1.0);
+    let atlas = max(dh.sh.y, 1.0);
+    let ndc = c.xy / max(c.z * th, 1e-6);
+    // Place dans la case, en texels ; coin de texel le plus proche et part au-delà.
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * tile;
+    let corner = floor(uv + 0.5);
+    let st = uv + 0.5 - corner;
+    let base = corner - 0.5;
+    let w0 = 3.0 - 2.0 * st;
+    let w1 = 1.0 + 2.0 * st;
+    let o0 = (2.0 - st) / w0 - 1.0;
+    let o1 = st / w1 + 1.0;
+    var sum = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        let hx = (k & 1u) == 1u;
+        let hy = k >= 2u;
+        let w = select(w0.x, w1.x, hx) * select(w0.y, w1.y, hy);
+        let pt = clamp(base + vec2<f32>(select(o0.x, o1.x, hx), select(o0.y, o1.y, hy)), vec2<f32>(0.5), vec2<f32>(tile - 0.5));
+        // Direction de cette lecture dans le repère de la carte (même longueur dans le monde) :
+        // n · direction = nb · ck / |ck|.
+        let ck = vec3<f32>(vec2<f32>(pt.x / tile * 2.0 - 1.0, 1.0 - pt.y / tile * 2.0) * th, 1.0);
+        let nd = dot(nb, ck) / length(ck);
+        let tk = select(dist, clamp(ndt / nd, 0.0, range * 2.0), nd < -1e-3);
+        sum += w * textureSampleCompareLevel(shadow_atlas, shadow_cmp, rect.xy + pt / atlas, tk / range - eps);
+    }
+    // Bord resserré autour de la moitié : la courbe à mi-ombre de la tente est lisse (pas de
+    // marches), le bord reste net au lieu d'un flou de trois texels.
+    return smoothstep(0.35, 0.65, sum * (1.0 / 16.0));
+}
+
 /// Visibilité (0 dans l'ombre … 1 éclairé) de la lumière `L` en `p`, face de normale `n`
 /// tournée vers elle. Ombres douces (PCSS) : recherche des bloqueurs, puis filtrage dont la
 /// largeur grandit avec la taille de la source et la distance au bloqueur. Chaque échantillon
@@ -303,9 +353,14 @@ fn dl_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, n: vec3<f32>, noise: f32, s
         return 1.0;
     }
     let eps = 2e-4;
-    let bulb = select(dh.sh.x, L.cone.w, L.cone.w > 0.0);
-    if !DL_SOFT_SHADOWS || bulb < 0.01 || !soft || L.shadow.z > 0.5 {
+    // Apport trop faible pour qu'un bord se voie : une lecture.
+    if !soft {
         return textureSampleCompareLevel(shadow_atlas, shadow_cmp, center.xy, dist / range - eps);
+    }
+    // Ombre nette (réglage, ou source sans taille) : bords lissés.
+    let bulb = select(dh.sh.x, L.cone.w, L.cone.w > 0.0);
+    if !DL_SOFT_SHADOWS || bulb < 0.01 || L.shadow.z > 0.5 {
+        return dl_shadow_tent(L, fr, dir, n, ndt, dist, range, eps);
     }
     // Repère autour de la direction centrale (échantillons en angle autour d'elle).
     let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(dir.y) > 0.9);

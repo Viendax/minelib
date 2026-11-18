@@ -274,6 +274,16 @@ crates/
   lignes de la matrice : `view_ray` et `eye_relative` (crate `render`), `dl_view_ray` et
   `dl_view_offset` (`dynlights.wgsl`), `sky_dir` (`world.wgsl`). Le test
   `nothing_rebuilds_the_view_with_the_inverse_matrix` refuse tout retour en arrière.
+- **Une image à part s'écrit en entier** (`ColorWrites::ALL`). Seule l'image du monde, où
+  l'on ajoute la lumière, garde son alpha. De la v151 à la v186, les rayons n'écrivaient
+  pas leur alpha, qui portait la profondeur : la recomposition ne savait plus séparer un
+  bloc du ciel, d'où des bords sombres en escalier et des feuillages en taches noires
+  (corrigé en v193 ; test `side_images_are_written_whole`).
+- **Un bloc qui sort de la grille du raytracing n'a pas changé.** Les cartes d'ombre des
+  lumières sont calculées dans cette grille autour de la caméra : refaites quand le joueur
+  s'éloigne, elles ne voient plus les murs et la lumière passe à travers (v193 : on garde
+  la carte d'avant tant que la grille ne voit pas toute la lumière ; tests
+  `moving_the_grid_redoes_only_what_enters_it` et `a_far_grid_does_not_cover_the_light`).
 
 ### Relais
 

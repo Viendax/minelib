@@ -1,8 +1,12 @@
 // Minelib — lumière volumétrique des lumières dynamiques (rayons dans la brume, la fumée, la
-// poussière). Calculée en demi-résolution : pour chaque pixel, marche le long du regard dans
-// le volume de chaque lumière de sa tuile (sphère ou cône), diffusion de Henyey-Greenstein,
-// absorption de Beer-Lambert, ombres (atlas) et gobo dans le faisceau, bruit qui dérive.
-// Recomposée en pleine résolution par vl_composite.wgsl. dynlights.wgsl est ajouté à la suite.
+// poussière). Calculée en demi- ou quart de résolution : pour chaque pixel, marche le long du
+// regard dans le volume de chaque lumière de sa tuile (sphère ou cône), diffusion de
+// Henyey-Greenstein, absorption de Beer-Lambert, ombres (atlas) et gobo dans le faisceau, bruit
+// qui dérive. Deux couches par pixel quand ceux de l'image du monde qu'il couvre sont à des
+// distances très différentes (bord d'un objet, trous d'un feuillage) : la lumière jusqu'à la
+// surface la plus proche, et jusqu'à la plus lointaine. Recomposée en pleine résolution par
+// vl_composite.wgsl, chaque pixel prenant la couche de sa propre profondeur. dynlights.wgsl est
+// ajouté à la suite.
 // D'après la marche volumétrique d'IRLights (MIT, qualet), réécrite pour Minelib.
 
 // Début des uniformes du monde.
@@ -147,13 +151,31 @@ fn vl_noise(p: vec3<f32>, w2: f32) -> f32 {
     return mix(a, b, w2);
 }
 
-/// Lumière diffusée vers la caméra `o`, direction `d`, jusqu'à `max_t` (surface ou distance
-/// maximale) par les lumières de la tuile du pixel `frag` (pleine résolution, image `size`).
-fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec2<f32>, size: vec2<f32>) -> vec3<f32> {
+/// Visibilité (1 éclairé, 0 dans l'ombre des murs) de la lumière `L` au point `q` du faisceau.
+fn vl_shadow_at(L: DynLight, fr: DlFrame, q: vec3<f32>, range: f32) -> f32 {
+    let to = q - L.pos_range.xyz;
+    let dist = max(length(to), 1e-4);
+    let su = dl_shadow_uv(L, fr, to / dist);
+    return select(1.0, textureSampleCompareLevel(shadow_atlas, shadow_cmp, su.xy, dist / range - 0.002), su.z > 0.5);
+}
+
+/// Lumière diffusée le long d'un rayon : jusqu'à la surface la plus proche (`near`) et jusqu'à
+/// la plus lointaine (`far`) des pixels couverts (égales quand ils sont à la même distance).
+struct VlLayers {
+    near: vec3<f32>,
+    far: vec3<f32>,
+};
+
+/// Lumière diffusée vers la caméra `o`, direction `d`, par les lumières de la tuile du pixel
+/// `frag` (pleine résolution, image `size`) : jusqu'à `cut_t` (surface la plus proche) et
+/// jusqu'à `max_t` (la plus lointaine, ou distance maximale). `cut_t` ≥ `max_t` : une seule
+/// couche, la marche d'avant.
+fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f32, frag: vec2<f32>, size: vec2<f32>) -> VlLayers {
     var result = vec3<f32>(0.0);
+    var result_near = vec3<f32>(0.0);
     let count = dh.counts.x;
     if count == 0u || max_t < 0.01 {
-        return result;
+        return VlLayers(result, result);
     }
     let base = dl_tile_base(frag, size);
     let words = dl_tile_words(count);
@@ -215,85 +237,147 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, max_t: f32, dither: f32, frag: vec
                 let axis = normalize(L.dir_type.xyz);
                 // Pas : plus fins sur un court segment (au moins 16, jusqu'au maximum dès 24 blocs).
                 let steps = clamp(i32(ceil(seg * f32(step_max) / 24.0)), min(16, step_max), step_max);
-                let step_len = seg / f32(steps);
-                let absorb = exp(-ext * step_len);
+                // Deux parties quand la surface proche coupe le faisceau : devant elle (`n1`
+                // pas, au moins la moitié : la couche proche reste aussi fine), puis derrière
+                // jusqu'à la surface lointaine. Même nombre de pas en tout ; une seule partie
+                // (la marche d'avant) quand tout est à la même distance.
+                let cut = clamp(cut_t, tn, tf);
+                var n1 = steps;
+                if cut <= tn {
+                    n1 = 0;
+                } else if cut < tf {
+                    n1 = clamp(i32(ceil(f32(steps) * (cut - tn) / seg)), steps / 2, steps - 1);
+                }
                 let phase_spot = vl_phase(dot(d, -axis), g_hg);
-                // Octave fine du bruit effacée quand le pas ne la voit plus (scintillement).
-                let w2 = 0.35 * clamp(dh.vl_b.y / (2.53 * step_len), 0.0, 1.0);
+                // Ombres des murs : un échantillon tous les `sh_stride` pas depuis le début de
+                // chaque partie, aux mêmes pas pour tous les pixels ; un pas qui éclaire prend
+                // l'interpolation des deux qui l'encadrent, lus à la demande (aucun là où le
+                // faisceau est trop faible pour compter). Le faisceau s'arrête au mur, sans
+                // traîner derrière ni passer avant le premier échantillon.
+                let sh_on = shadows_on && L.shadow.x > 0.5;
                 var trans = 1.0;
                 var acc = vec3<f32>(0.0);
-                var vis = 1.0;
+                var acc_n = vec3<f32>(0.0);
+                // Avant le premier échantillon, un pas trop faible pour en lire un ne compte pas
+                // (au plus 1 % du faisceau, à son bord) : rien ne passe sans avoir été vu.
+                var vis = select(1.0, 0.0, sh_on);
                 var nz = 0.5;
-                var t = tn + step_len * dither;
-                for (var s = 0; s < 96; s++) {
-                    if s >= steps || trans < 0.02 {
-                        break;
-                    }
-                    let p = o + d * t;
-                    let to_l = lp - p;
-                    let dist = length(to_l);
-                    let l = to_l / max(dist, 1e-6);
-                    let fall = max(1.0 - dist / range, 0.0);
-                    var att = 0.0;
-                    var phase = phase_spot;
-                    if spot {
-                        let cone = clamp((dot(-l, axis) - L.cone.x) / max(L.cone.y - L.cone.x, 1e-6), 0.0, 1.0);
-                        att = fall * cone;
-                        if att > 0.0 {
-                            att *= dl_cookie(p, L, fr);
-                        }
-                    } else {
-                        att = fall * fall;
-                        phase = vl_phase(dot(d, -l), g_hg);
-                    }
-                    if att > 0.0 {
-                        if shadows_on && L.shadow.x > 0.5 && att > 0.01 && s % sh_stride == 0 {
-                            let su = dl_shadow_uv(L, fr, -l);
-                            vis = select(1.0, textureSampleCompareLevel(shadow_atlas, shadow_cmp, su.xy, dist / range - 0.002), su.z > 0.5);
-                        }
-                        // Lueur à la source : au-delà de `tip_cut`, force × exp(−d²/r²) reste
-                        // sous le demi-écart entre 1,0 et le f32 suivant (2⁻²⁴) : la somme
-                        // vaudrait 1,0 exactement. Même valeur, une exponentielle de moins.
-                        var tip = 1.0;
-                        let tq = dist * dist;
-                        if tq < tip_cut {
-                            tip = 1.0 + dh.vl_a.z * exp(-tq / tip_r2);
-                        }
-                        var ins = att * vis * phase * exp(-ext * dist) * tip;
-                        if noise_on && ins > 1e-5 {
-                            if s % nz_stride == 0 {
-                                if morph_on {
-                                    nz = mix(vl_noise(p + off0, w2), vl_noise(p + off1, w2), morph_f);
-                                } else {
-                                    nz = vl_noise(p, w2);
-                                }
+                for (var part = 0; part < 2; part++) {
+                    let n = select(steps - n1, n1, part == 0);
+                    if n > 0 && trans >= 0.02 {
+                        let step_len = select((tf - cut) / f32(n), (cut - tn) / f32(n), part == 0);
+                        let absorb = exp(-ext * step_len);
+                        // Octave fine du bruit effacée quand le pas ne la voit plus (scintillement).
+                        let w2 = 0.35 * clamp(dh.vl_b.y / (2.53 * step_len), 0.0, 1.0);
+                        let last = n - 1;
+                        // Intervalle d'ombre [sh_a, sh_b] du pas, 1 / sa longueur, échantillons
+                        // lus (`loaded`), et celui du bout du précédent resservi (`b_ok`).
+                        // (Dernier bout plus court qu'un intervalle : sa valeur de départ.)
+                        var sh_a = 0;
+                        var sh_b = select(0, sh_stride, sh_stride <= last);
+                        var inv = 1.0 / f32(max(sh_b, 1));
+                        var loaded = false;
+                        var b_ok = false;
+                        var vis_a = 1.0;
+                        var vis_b = 1.0;
+                        var t = select(cut, tn, part == 0) + step_len * dither;
+                        for (var s = 0; s < 96; s++) {
+                            if s >= n || trans < 0.02 {
+                                break;
                             }
-                            ins *= mix(1.0, 2.0 * nz, dh.vl_b.x);
+                            if s == sh_b && s > sh_a {
+                                sh_a = sh_b;
+                                sh_b = select(sh_a, sh_a + sh_stride, sh_a + sh_stride <= last);
+                                inv = 1.0 / f32(max(sh_b - sh_a, 1));
+                                b_ok = loaded;
+                                loaded = false;
+                            }
+                            let p = o + d * t;
+                            let to_l = lp - p;
+                            let dist = length(to_l);
+                            let l = to_l / max(dist, 1e-6);
+                            let fall = max(1.0 - dist / range, 0.0);
+                            var att = 0.0;
+                            var phase = phase_spot;
+                            if spot {
+                                let cone = clamp((dot(-l, axis) - L.cone.x) / max(L.cone.y - L.cone.x, 1e-6), 0.0, 1.0);
+                                att = fall * cone;
+                                if att > 0.0 {
+                                    att *= dl_cookie(p, L, fr);
+                                }
+                            } else {
+                                att = fall * fall;
+                                phase = vl_phase(dot(d, -l), g_hg);
+                            }
+                            if att > 0.0 {
+                                if sh_on && att > 0.01 {
+                                    if !loaded {
+                                        if b_ok {
+                                            vis_a = vis_b;
+                                        } else {
+                                            vis_a = vl_shadow_at(L, fr, p - d * (f32(s - sh_a) * step_len), range);
+                                        }
+                                        vis_b = vis_a;
+                                        if sh_b > sh_a {
+                                            vis_b = vl_shadow_at(L, fr, p + d * (f32(sh_b - s) * step_len), range);
+                                        }
+                                        loaded = true;
+                                    }
+                                    vis = mix(vis_a, vis_b, f32(s - sh_a) * inv);
+                                }
+                                // Lueur à la source : au-delà de `tip_cut`, force × exp(−d²/r²) reste
+                                // sous le demi-écart entre 1,0 et le f32 suivant (2⁻²⁴) : la somme
+                                // vaudrait 1,0 exactement. Même valeur, une exponentielle de moins.
+                                var tip = 1.0;
+                                let tq = dist * dist;
+                                if tq < tip_cut {
+                                    tip = 1.0 + dh.vl_a.z * exp(-tq / tip_r2);
+                                }
+                                var ins = att * vis * phase * exp(-ext * dist) * tip;
+                                if noise_on && ins > 1e-5 {
+                                    if s % nz_stride == 0 {
+                                        if morph_on {
+                                            nz = mix(vl_noise(p + off0, w2), vl_noise(p + off1, w2), morph_f);
+                                        } else {
+                                            nz = vl_noise(p, w2);
+                                        }
+                                    }
+                                    ins *= mix(1.0, 2.0 * nz, dh.vl_b.x);
+                                }
+                                acc += col * ins * (1.0 - absorb) * trans;
+                                trans *= absorb;
+                            }
+                            t += step_len;
                         }
-                        acc += col * ins * (1.0 - absorb) * trans;
-                        trans *= absorb;
                     }
-                    t += step_len;
+                    if part == 0 {
+                        acc_n = acc;
+                    }
                 }
                 result += acc;
+                result_near += acc_n;
             }
         }
     }
-    return result * dh.vl_a.x * dh.surf.x;
+    let k = dh.vl_a.x * dh.surf.x;
+    return VlLayers(result_near * k, result * k);
 }
 
 @fragment
-fn fs_vl(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_vl(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<u32> {
     let dims = vec2<i32>(textureDimensions(scene_depth));
     let sc = vl_scale();
     let base = vec2<i32>(floor(frag.xy)) * sc;
-    // Surface la plus proche des pixels couverts : le faisceau s'arrête au premier obstacle
-    // (la recomposition choisit ensuite selon la profondeur de chaque pixel).
-    var depth = 0.0;
+    // Surfaces la plus proche et la plus lointaine des pixels couverts (Z inversé : la plus
+    // proche a la plus grande profondeur, le ciel vaut 0).
+    var dn = 0.0;
+    var df = 1.0;
     for (var y = 0; y < sc; y++) {
         for (var x = 0; x < sc; x++) {
             let q = clamp(base + vec2<i32>(x, y), vec2<i32>(0), dims - 1);
-            depth = max(depth, textureLoad(scene_depth, q, 0));
+            let z = textureLoad(scene_depth, q, 0);
+            dn = max(dn, z);
+            df = min(df, z);
         }
     }
     let full = vec2<f32>(dims);
@@ -302,18 +386,29 @@ fn fs_vl(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let cam = g.cam_pos.xyz;
     // Direction du regard tirée des lignes de la matrice (pas d'inverse : voir
-    // `dl_view_ray`), et distance de la surface : proche / profondeur unités de vue.
+    // `dl_view_ray`), et distances des surfaces : proche / profondeur unités de vue.
     let ray = dl_view_ray(g.view_proj, ndc);
     let dir = normalize(ray);
-    var scene = 1e9;
-    if depth > 0.0 {
-        scene = length(ray) * (g.view_proj[3][2] / depth);
-    }
-    let max_t = min(scene, dh.vl_a.y);
+    let unit = length(ray) * g.view_proj[3][2];
+    let t_near = select(1e9, unit / dn, dn > 0.0);
+    let t_far = select(1e9, unit / df, df > 0.0);
+    let reach = dh.vl_a.y;
+    // Deux couches seulement au bord d'un objet (surface lointaine plus loin d'un quart au
+    // moins : pas sur un sol vu de biais) quand la proche est encore dans la portée des
+    // rayons ; sinon la marche s'arrête à la proche, comme avant.
+    let cut = min(t_near, reach);
+    let max_t = select(cut, min(t_far, reach), t_near < reach && t_far > t_near * 1.25);
     var dither = fract(52.9829189 * fract(0.06711056 * frag.x + 0.00583715 * frag.y));
     if (dh.vl_c.w & DL_DITHER) != 0u {
         dither = fract(dither + dh.misc.x * 0.61803398);
     }
-    let c = dyn_volumetric(cam, dir, max_t, dither, mid, full);
-    return vec4<f32>(c, depth);
+    let c = dyn_volumetric(cam, dir, cut, max_t, dither, mid, full);
+    // Chaque couche avec sa profondeur (demi-flottants) : la recomposition prend, pour chaque
+    // pixel, celle qui est à sa distance.
+    return vec4<u32>(
+        pack2x16float(c.near.rg),
+        pack2x16float(vec2<f32>(c.near.b, dn)),
+        pack2x16float(c.far.rg),
+        pack2x16float(vec2<f32>(c.far.b, df)),
+    );
 }

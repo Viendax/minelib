@@ -1,9 +1,11 @@
 // Minelib — lumière volumétrique (demi- ou quart de résolution) ajoutée à l'image du monde
-// en pleine résolution. Chaque pixel mélange les quatre échantillons voisins, pondérés par
-// leur position et par la ressemblance de leur profondeur avec la sienne : les rayons ne
-// bavent pas d'un objet proche sur le fond (ni l'inverse).
+// en pleine résolution. Chaque pixel de l'image volumétrique a deux couches (jusqu'à la surface
+// la plus proche et jusqu'à la plus lointaine des pixels qu'il couvre, avec leurs profondeurs).
+// Chaque pixel du monde prend, chez les quatre voisins, la couche qui est à sa propre distance,
+// pondérée par la place du voisin et par l'accord des profondeurs : les rayons ne bavent pas
+// d'un objet proche sur le fond (ni l'inverse), et passent par les trous d'un feuillage.
 
-@group(0) @binding(0) var vl_tex: texture_2d<f32>;
+@group(0) @binding(0) var vl_tex: texture_2d<u32>;
 @group(0) @binding(1) var full_depth: texture_depth_2d;
 // Cases d'écran éclairées (rectangles en NDC) : seulement là qu'il peut y avoir des rayons
 // (ailleurs, la recomposition n'ajoutait que des zéros). La marche a rempli ces cases,
@@ -19,12 +21,45 @@ fn vs_tiles(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     return vec4<f32>(mix(r.x, r.z, cx), mix(r.y, r.w, cy), 0.0, 1.0);
 }
 
-/// Poids d'un des quatre voisins : sa place (bilinéaire) et la ressemblance de sa profondeur
-/// avec celle du pixel. Profondeurs en Z inversé (∝ 1 / distance) : écart relatif ≈ écart
-/// relatif des distances.
-fn vl_weight(s: vec4<f32>, d: f32, b: f32) -> f32 {
-    let dz = abs(s.a - d) / max(max(s.a, d), 1e-6);
-    return b * exp(-dz * 24.0) + 1e-5 * b;
+/// Un voisin : lumière jusqu'à sa surface la plus proche (`n`, profondeur `dn`) et jusqu'à la
+/// plus lointaine (`f`, profondeur `df`). Profondeurs en Z inversé (∝ 1 / distance, 0 : ciel).
+struct VlTap {
+    n: vec3<f32>,
+    dn: f32,
+    f: vec3<f32>,
+    df: f32,
+};
+
+fn vl_tap(i: vec2<i32>) -> VlTap {
+    let v = textureLoad(vl_tex, i, 0);
+    let a = unpack2x16float(v.x);
+    let b = unpack2x16float(v.y);
+    let c = unpack2x16float(v.z);
+    let e = unpack2x16float(v.w);
+    return VlTap(vec3<f32>(a, b.x), b.y, vec3<f32>(c, e.x), e.y);
+}
+
+/// Lumière d'un voisin pour un pixel de profondeur `d`, pondérée (rgb × poids, poids) : sa
+/// couche proche si le pixel est devant sa surface la plus proche (ou dessus), la lointaine
+/// s'il est derrière la plus lointaine (ou dessus), entre les deux selon la distance. Poids :
+/// place (bilinéaire `b`) et écart relatif de la distance hors de l'intervalle du voisin.
+fn vl_pick(s: VlTap, d: f32, b: f32) -> vec4<f32> {
+    var e: vec3<f32>;
+    var dz = 0.0;
+    if d >= s.dn {
+        e = s.n;
+        dz = (d - s.dn) / max(d, 1e-6);
+    } else if d <= s.df {
+        e = s.f;
+        dz = (s.df - d) / max(s.df, 1e-6);
+    } else {
+        // Entre les deux surfaces : part de la distance (1 / profondeur) parcourue de la
+        // proche à la lointaine.
+        let k = (s.dn - d) * s.df / max(d * (s.dn - s.df), 1e-12);
+        e = mix(s.n, s.f, clamp(k, 0.0, 1.0));
+    }
+    let w = b * exp(-dz * 24.0) + 1e-5 * b;
+    return vec4<f32>(e * w, w);
 }
 
 @fragment
@@ -37,21 +72,20 @@ fn fs_composite(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let i0 = vec2<i32>(floor(f));
     let fw = f - floor(f);
     let hi = hd - 1;
-    let s00 = textureLoad(vl_tex, clamp(i0, vec2<i32>(0), hi), 0);
-    let s10 = textureLoad(vl_tex, clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), hi), 0);
-    let s01 = textureLoad(vl_tex, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi), 0);
-    let s11 = textureLoad(vl_tex, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi), 0);
+    let s00 = vl_tap(clamp(i0, vec2<i32>(0), hi));
+    let s10 = vl_tap(clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), hi));
+    let s01 = vl_tap(clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi));
+    let s11 = vl_tap(clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi));
     // Aucun rayon chez les quatre voisins (hors des faisceaux) : rien à ajouter, quels que
     // soient les poids. Ni profondeur à lire, ni exponentielles.
-    let m = max(max(s00.rgb, s10.rgb), max(s01.rgb, s11.rgb));
+    let m = max(max(max(s00.n, s10.n), max(s01.n, s11.n)), max(max(s00.f, s10.f), max(s01.f, s11.f)));
     if max(m.x, max(m.y, m.z)) <= 0.0 {
         return vec4<f32>(0.0);
     }
     let d = textureLoad(full_depth, clamp(vec2<i32>(floor(frag.xy)), vec2<i32>(0), fd - 1), 0);
-    let w00 = vl_weight(s00, d, (1.0 - fw.x) * (1.0 - fw.y));
-    let w10 = vl_weight(s10, d, fw.x * (1.0 - fw.y));
-    let w01 = vl_weight(s01, d, (1.0 - fw.x) * fw.y);
-    let w11 = vl_weight(s11, d, fw.x * fw.y);
-    let acc = s00.rgb * w00 + s10.rgb * w10 + s01.rgb * w01 + s11.rgb * w11;
-    return vec4<f32>(acc / max(w00 + w10 + w01 + w11, 1e-6), 0.0);
+    let acc = vl_pick(s00, d, (1.0 - fw.x) * (1.0 - fw.y))
+        + vl_pick(s10, d, fw.x * (1.0 - fw.y))
+        + vl_pick(s01, d, (1.0 - fw.x) * fw.y)
+        + vl_pick(s11, d, fw.x * fw.y);
+    return vec4<f32>(acc.rgb / max(acc.w, 1e-6), 0.0);
 }

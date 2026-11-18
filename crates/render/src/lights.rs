@@ -49,7 +49,10 @@ pub const SHADOW_QUALITY: [(u32, u32); 4] = [(2048, 128), (4096, 256), (8192, 51
 pub const SHADOW_QUALITY_NAMES: [&str; 4] = ["Basse", "Moyenne", "Haute", "Ultra"];
 
 const NOISE_SIZE: u32 = 32;
-const VL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Lumière volumétrique en demi- ou quart de résolution : deux couches (jusqu'à la surface la
+/// plus proche et jusqu'à la plus lointaine des pixels couverts), chacune trois demi-flottants
+/// de lumière et un de profondeur.
+const VL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
 const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Sorte de lumière.
@@ -851,8 +854,11 @@ fn brick_hashes(origin: [i32; 3], ids: &[u16]) -> HashMap<[i32; 3], u64> {
     out
 }
 
-/// Cubes de 8 blocs qui diffèrent entre deux grilles (y compris ceux qui entrent ou sortent
-/// de la grille) : boîtes monde (coin bas, coin haut).
+/// Cubes de 8 blocs à refaire dans les cartes, en boîtes monde (coin bas, coin haut) : ceux
+/// dont les blocs ont changé, et ceux qui entrent dans la grille (on ne les voyait pas). Ceux
+/// qui en sortent n'ont pas changé : on ne les voit plus, c'est tout ; les cartes calculées
+/// quand on les voyait restent justes (sinon, de loin, une carte refaite sans eux laisserait
+/// passer la lumière à travers les murs).
 fn changed_bricks(
     old: &HashMap<[i32; 3], u64>,
     new: &HashMap<[i32; 3], u64>,
@@ -863,12 +869,22 @@ fn changed_bricks(
             out.push((*c, [c[0] + 8, c[1] + 8, c[2] + 8]));
         }
     }
-    for c in old.keys() {
-        if !new.contains_key(c) {
-            out.push((*c, [c[0] + 8, c[1] + 8, c[2] + 8]));
-        }
-    }
     out
+}
+
+/// La grille de blocs (coin `origin`) voit-elle tout le volume de la lumière (sa sphère, ou
+/// celle de son cône) ? Sur un axe où le volume est plus grand que la grille, il suffit
+/// qu'elle en couvre presque toute la largeur. Sinon une carte calculée maintenant laisserait
+/// passer la lumière là où la grille ne voit pas les blocs.
+fn grid_covers(origin: [i32; 3], l: &DynLight) -> bool {
+    use crate::rt::VOX;
+    let (c, r) = bounding_sphere(l);
+    (0..3).all(|a| {
+        let (g0, g1) = (origin[a] as f32, (origin[a] + VOX[a] as i32) as f32);
+        let need = (2.0 * r).min(VOX[a] as f32 - 8.0);
+        let got = (c[a] + r).min(g1) - (c[a] - r).max(g0);
+        got >= need - 0.5
+    })
 }
 
 /// Bruit de valeur 3D qui se répète (`n`³ octets).
@@ -1522,6 +1538,19 @@ fn fullscreen_variant(
     )
 }
 
+/// Canaux écrits : l'image du monde garde son alpha (on y ajoute la lumière) ; les images à
+/// part (éclairage en demi-résolution, rayons et leurs profondeurs) sont écrites en entier.
+/// (De la v151 à la v186, les rayons n'écrivaient pas leur alpha, la profondeur de leurs
+/// pixels : la recomposition ne savait plus séparer un objet du fond, d'où des bords sombres
+/// en escalier autour des blocs.)
+fn write_mask(format: wgpu::TextureFormat) -> wgpu::ColorWrites {
+    if format == COLOR_FORMAT {
+        wgpu::ColorWrites::COLOR
+    } else {
+        wgpu::ColorWrites::ALL
+    }
+}
+
 /// Pochoir de l'éclairage différé : `fs_interp` met 1 là où la moyenne a suffi
 /// (`write`), le calcul exact ne passe que là où il vaut 0.
 fn light_stencil(write: bool) -> wgpu::DepthStencilState {
@@ -1589,11 +1618,7 @@ fn stencil_variant(
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend,
-                write_mask: if format == HALF_LIGHT_FORMAT {
-                    wgpu::ColorWrites::ALL
-                } else {
-                    wgpu::ColorWrites::COLOR
-                },
+                write_mask: write_mask(format),
             })],
         }),
         multiview: None,
@@ -1785,7 +1810,7 @@ impl DynGpu {
             entries: &[
                 tex_entry(
                     0,
-                    wgpu::TextureSampleType::Float { filterable: false },
+                    wgpu::TextureSampleType::Uint,
                     wgpu::TextureViewDimension::D2,
                 ),
                 tex_entry(
@@ -2184,6 +2209,12 @@ impl DynGpu {
                 let Some(s) = self.cache.slots.get_mut(&l.id) else {
                     continue;
                 };
+                // Carte à refaire, mais la grille ne voit pas toute la lumière (joueur loin) :
+                // on garde celle d'avant, refaite quand la grille la verra. (Une première
+                // carte se calcule quand même : mieux qu'aucune.)
+                if s.baked && voxels.is_some_and(|o| !grid_covers(o, &l)) {
+                    continue;
+                }
                 let n = s.count as usize;
                 if used > 0 && used + n > limit {
                     if !s.baked {
@@ -3076,10 +3107,77 @@ mod tests {
             (0..3).all(|k| lo[k] <= w[k] && w[k] < hi[k]),
             "{lo:?} {hi:?} {w:?}"
         );
-        // La grille avance de 8 blocs : les cubes qui entrent et ceux qui sortent changent.
-        let c = brick_hashes([origin[0] + 8, origin[1], origin[2]], &ids);
-        let moved = changed_bricks(&b, &c);
-        assert!(moved.len() >= (VOX[1] / 8 * VOX[2] / 8 * 2) as usize);
+    }
+
+    #[test]
+    fn side_images_are_written_whole() {
+        // Rayons (lumière et profondeur de chaque couche), éclairage en demi-résolution :
+        // tous les canaux. L'image du monde : sans son alpha.
+        assert_eq!(write_mask(VL_FORMAT), wgpu::ColorWrites::ALL);
+        assert_eq!(write_mask(HALF_LIGHT_FORMAT), wgpu::ColorWrites::ALL);
+        assert_eq!(write_mask(COLOR_FORMAT), wgpu::ColorWrites::COLOR);
+    }
+
+    #[test]
+    fn moving_the_grid_redoes_only_what_enters_it() {
+        use crate::rt::VOX;
+        let [vx, vy, vz] = VOX.map(|v| v as i32);
+        // Le même monde vu par deux grilles : la seconde a avancé de 8 blocs en x.
+        let world = |x: i32, y: i32, z: i32| ((x * 7 + y * 13 + z * 3).rem_euclid(5) as u16) * 2;
+        let grid = |o: [i32; 3]| {
+            let mut ids = Vec::with_capacity((vx * vy * vz) as usize);
+            for z in 0..vz {
+                for y in 0..vy {
+                    for x in 0..vx {
+                        ids.push(world(o[0] + x, o[1] + y, o[2] + z));
+                    }
+                }
+            }
+            ids
+        };
+        let o = [-40, 64, 24];
+        let o2 = [o[0] + 8, o[1], o[2]];
+        let a = brick_hashes(o, &grid(o));
+        let b = brick_hashes(o2, &grid(o2));
+        let ch = changed_bricks(&a, &b);
+        // Seulement la tranche qui entre (aucun bloc n'a changé, rien de ce qui sort).
+        assert_eq!(ch.len(), (vy / 8 * vz / 8) as usize);
+        assert!(ch.iter().all(|(lo, _)| lo[0] == o[0] + vx), "{ch:?}");
+    }
+
+    #[test]
+    fn a_far_grid_does_not_cover_the_light() {
+        use crate::rt::VOX;
+        let o = [0, 64, 0];
+        let mid = [
+            VOX[0] as f32 * 0.5,
+            64.0 + VOX[1] as f32 * 0.5,
+            VOX[2] as f32 * 0.5,
+        ];
+        // Projecteur vers le bas au milieu de la grille : vu en entier.
+        let s = spot(
+            1,
+            [mid[0], mid[1] + 12.0, mid[2]],
+            [0.0, -1.0, 0.0],
+            26.0,
+            58.0,
+        );
+        assert!(grid_covers(o, &s));
+        // Le même, 100 blocs plus loin, ou 30 blocs plus haut : la grille ne le voit pas.
+        let mut far = s;
+        far.pos[0] += 100.0;
+        assert!(!grid_covers(o, &far));
+        let mut high = s;
+        high.pos[1] += 30.0;
+        assert!(!grid_covers(o, &high));
+        // Lumière plus grande que la grille : couverte quand la grille est centrée sur elle.
+        let mut big = s;
+        big.kind = DynKind::Point;
+        big.range = 60.0;
+        big.pos = mid;
+        assert!(grid_covers(o, &big));
+        big.pos[2] += 20.0;
+        assert!(!grid_covers(o, &big));
     }
 
     #[test]

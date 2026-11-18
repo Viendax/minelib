@@ -3669,10 +3669,15 @@ mod tests {
         use wgpu::naga;
         // Nom, source, constantes fixées.
         type Variant = (&'static str, String, &'static [(&'static str, f64)]);
-        let cases: [Variant; 5] = [
+        let cases: [Variant; 6] = [
             (
                 "éclairage différé",
                 lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
+                &[],
+            ),
+            (
+                "recomposition des rayons",
+                include_str!("shaders/vl_composite.wgsl").to_string(),
                 &[],
             ),
             (
