@@ -186,7 +186,8 @@ impl Voxels {
 }
 
 /// Forme d'un bloc non plein pour le shader, sur 64 bits (4 × u16) :
-/// bits 0..24 boîte 0, 24..48 boîte 1, 48..50 genre (0 cube ou rien, 1 boîtes, 2 poteau),
+/// bits 0..24 boîte 0, 24..48 boîte 1, 48..50 genre (0 cube ou rien, 1 boîtes, 2 poteau,
+/// 3 plante en croix : deux plans en diagonale, seulement pour les cartes d'ombre),
 /// 50..52 sorte de poteau (0 clôture, 1 muret, 2 vitre), 52 cube à trous (feuillage).
 /// Boîte : min x, y, z puis max − 1 x, y, z, en seizièmes (4 bits chacun).
 /// Poteau : boîte 0 = poteau, boîte 1 = bras vers +X (le shader le tourne vers chaque
@@ -209,6 +210,7 @@ pub fn shape_texel(def: &BlockDef) -> [u16; 4] {
             };
             (2, pk, vec![def.boxes()[0], arm])
         }
+        Shape::Cross => (3, 0, Vec::new()),
         _ => (0, 0, Vec::new()),
     };
     // Bit 52 : cube aux trous dans sa texture (feuillage, verre clair) : les ombres des
@@ -228,8 +230,8 @@ pub fn shape_texel(def: &BlockDef) -> [u16; 4] {
 
 /// Bloc retenu dans la grille : cubes opaques (et feuillages), blocs non pleins opaques
 /// (dalles, escaliers, clôtures, murets, panneaux, boîtes : leurs boîtes sont retracées
-/// dans le shader, voir `shape_texel`) et torches ; pas les plantes ni les blocs
-/// translucides.
+/// dans le shader, voir `shape_texel`), torches et plantes en croix (elles font de l'ombre
+/// aux lumières de l'éditeur ; les reflets les traversent) ; pas les blocs translucides.
 pub fn traced(def: &minelib_world::registry::BlockDef) -> bool {
     (matches!(
         def.shape,
@@ -238,6 +240,7 @@ pub fn traced(def: &minelib_world::registry::BlockDef) -> bool {
             | Shape::Stairs { .. }
             | Shape::Post(_)
             | Shape::Box { .. }
+            | Shape::Cross
     ) && !def.translucent)
         || matches!(def.shape, Shape::Torch | Shape::WallTorch(_))
 }
@@ -348,5 +351,22 @@ mod tests {
         assert!(traced(stairs));
         let cube = reg.defs.iter().find(|d| d.key == "stone").unwrap();
         assert_eq!(shape_texel(cube)[3] & 3, 0);
+    }
+
+    #[test]
+    fn plants_are_in_the_grid_as_crosses() {
+        // Les plantes en croix entrent dans la grille (ombres des projecteurs), avec le
+        // genre 3 que les cartes d'ombre savent couper et que les reflets traversent.
+        let reg = registry();
+        let plants: Vec<_> = reg
+            .defs
+            .iter()
+            .filter(|d| matches!(d.shape, Shape::Cross) && !d.translucent)
+            .collect();
+        assert!(!plants.is_empty());
+        for p in plants {
+            assert!(traced(p), "{}", p.key);
+            assert_eq!(shape_texel(p)[3] & 3, 3, "{}", p.key);
+        }
     }
 }

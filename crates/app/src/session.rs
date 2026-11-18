@@ -6730,6 +6730,7 @@ impl Session {
             static_entities: &statics,
             players: &players,
             eye: cam,
+            water_level: crate::underwater::eye_water_level(&self.world, cam),
             player_eye: self.player.eye(),
             view,
             fov_y: fov.to_radians(),

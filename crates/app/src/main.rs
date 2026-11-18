@@ -87,6 +87,7 @@ mod session;
 mod skin;
 mod stick;
 mod streaming;
+mod underwater;
 mod update;
 mod voice;
 mod wand;

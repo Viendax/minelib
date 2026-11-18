@@ -143,6 +143,35 @@ fn shape_hit(o: vec3<f32>, d: vec3<f32>, cell: vec3<i32>, shp: vec4<u32>, t_in: 
     return best;
 }
 
+/// Plante en croix (deux plans en diagonale de la case, de 0,1 à 0,9, sur toute sa
+/// hauteur, comme `emit_cross_at`) : distance du premier point opaque de sa texture sur le
+/// trajet (< 0 : la lumière passe). Mêmes coordonnées de texture que ses faces dans le
+/// monde (x et −y du point, couche des côtés).
+fn cross_hit(o: vec3<f32>, d: vec3<f32>, cell: vec3<i32>, t_in: f32, layer: u32) -> f32 {
+    let lo = o - vec3<f32>(cell);
+    // Plan x = z, puis plan x + z = 1 (coordonnées de la case).
+    let ta = select(-1.0, -(lo.x - lo.z) / (d.x - d.z), abs(d.x - d.z) > 1e-6);
+    let tb = select(-1.0, (1.0 - lo.x - lo.z) / (d.x + d.z), abs(d.x + d.z) > 1e-6);
+    var best = -1.0;
+    for (var k = 0; k < 2; k++) {
+        // Le plus proche d'abord ; l'autre si le premier est transparent à cet endroit.
+        let first = select(tb, ta, ta <= tb);
+        let second = select(ta, tb, ta <= tb);
+        let t = select(second, first, k == 0);
+        if t >= t_in - 1e-4 && best < 0.0 {
+            let q = lo + d * t;
+            if q.x >= 0.1 && q.x <= 0.9 && q.y >= 0.0 && q.y <= 1.0 {
+                let p = o + d * t;
+                let a = textureSampleLevel(blocks, block_sampler, fract(vec2<f32>(p.x, -p.y)), i32(layer), 0.0).a;
+                if a >= 0.5 {
+                    best = t;
+                }
+            }
+        }
+    }
+    return best;
+}
+
 /// Distance du premier bloc qui arrête la lumière partie de `o` vers `d` (au plus `max_t`).
 fn shadow_march(o: vec3<f32>, d: vec3<f32>, max_t: f32, skip_start: bool) -> f32 {
     var cell = vec3<i32>(floor(o));
@@ -191,18 +220,24 @@ fn shadow_march(o: vec3<f32>, d: vec3<f32>, max_t: f32, skip_start: bool) -> f32
             let pal = textureLoad(palette, i32(id), 0);
             let torch = (pal.w >> 8u) & 7u;
             let shp = textureLoad(palette, i32(id) + 4096, 0);
-            let partial = (shp.w & 3u) != 0u;
+            let kind = shp.w & 3u;
+            let partial = kind != 0u && kind != 3u;
             var ht = t;
             var hax = axis;
             var hit = torch == 0u;
-            if hit && partial {
+            if hit && kind == 3u {
+                // Plante : ses deux plans, trous de la texture compris.
+                ht = cross_hit(o, d, cell, t, pal.y);
+                hit = ht >= 0.0;
+            } else if hit && partial {
                 let sh = shape_hit(o, d, cell, shp, t);
                 hit = sh.x >= 0.0;
                 ht = sh.x;
                 hax = i32(sh.y);
             }
             // Trous de la texture (feuillage, verre, rail, échelle) : la lumière passe.
-            let cutout = partial || ((shp.w >> 4u) & 1u) != 0u;
+            // (Plante : déjà fait par `cross_hit`.)
+            let cutout = partial || (kind == 0u && ((shp.w >> 4u) & 1u) != 0u);
             if hit && cutout {
                 let p = o + d * ht;
                 var uv = vec2<f32>(p.x, p.z);

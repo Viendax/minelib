@@ -28,6 +28,7 @@ mod screen;
 mod taa;
 pub mod textures;
 pub mod thermal;
+mod underwater;
 pub mod viewmodel;
 
 pub use capture::Screenshot;
@@ -500,6 +501,9 @@ pub struct PointLight {
 pub struct FrameParams<'a> {
     /// Position de la caméra (les yeux, ou derrière le joueur à la 3e personne).
     pub eye: Vec3,
+    /// (v194) Surface de l'eau au-dessus de la caméra, quand elle est sous l'eau ou tout
+    /// près : ce qu'elle voit sous la ligne de l'eau est bleuté.
+    pub water_level: Option<f32>,
     /// Yeux du joueur (torche tenue en main), même à la 3e personne.
     pub player_eye: Vec3,
     pub view: Mat4,
@@ -710,6 +714,8 @@ pub struct Renderer {
     draw_list: Vec<(f32, MeshKey)>,
     overlay: overlay::OverlayRenderer,
     viewmodel: viewmodel::ViewModel,
+    /// (v194) Rendu bleuté sous la ligne de l'eau.
+    underwater: underwater::Underwater,
     entities: entity::Entities,
     screen: screen::Screen,
     /// Fumigènes en volume.
@@ -1128,6 +1134,7 @@ impl Renderer {
             overlay::OverlayRenderer::new(&device, &queue, config.format, DEPTH_FORMAT, &atlas);
 
         let viewmodel = viewmodel::ViewModel::new(&device, &bgl, config.format);
+        let underwater = underwater::Underwater::new(&device, config.format);
         let entities = entity::Entities::new(&device, &bgl, config.format);
         let screen = screen::Screen::new(&device, &bgl, config.format);
         let smokes = smoke::Smokes::new(&device, &queue, &bgl, config.format);
@@ -1179,6 +1186,7 @@ impl Renderer {
             world_shader: shader,
             overlay,
             viewmodel,
+            underwater,
             entities,
             screen,
             smokes,
@@ -2018,6 +2026,7 @@ impl Renderer {
                 self.world_group(),
                 hand,
                 None,
+                None,
             );
         }
         self.capture
@@ -2694,6 +2703,7 @@ impl Renderer {
                 self.world_group(),
                 hand,
                 None,
+                None,
             );
         }
         self.capture
@@ -3086,6 +3096,19 @@ impl Renderer {
             &mut encoder,
             self.gpu_timer.as_ref().and_then(|t| t.pass(gpu_timer::TAA)),
         );
+        // (v194) Sous l'eau : la profondeur du monde de cette image donne la distance.
+        if let Some(t) = &taa.targets {
+            self.underwater.prepare(
+                &self.device,
+                &self.queue,
+                view_proj,
+                p.eye,
+                p.water_level,
+                p.daylight,
+                &t.depth_views[taa.depth_index()],
+                (self.config.width, self.config.height),
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("écran (TAA)"),
@@ -3126,6 +3149,7 @@ impl Renderer {
                 self.world_group(),
                 hand,
                 arm_lit,
+                Some(&self.underwater),
             );
         }
         if let Some(t) = &self.gpu_timer {
@@ -3205,9 +3229,14 @@ fn draw_hud<'a>(
     group: &'a wgpu::BindGroup,
     hand: u32,
     arm_lit: Option<&'a wgpu::RenderPipeline>,
+    water: Option<&'a underwater::Underwater>,
 ) {
     vm.draw_arm(pass, group, arm_lit);
     vm.draw_range(pass, group, 0..hand);
+    // (v194) Sous la ligne de l'eau : le monde, la main et le bras bleutés, pas l'interface.
+    if let Some(w) = water {
+        w.draw(pass);
+    }
     let mut done = 0;
     for (mark, range) in &overlay.splits {
         overlay.draw_range(pass, done..*mark);
@@ -3791,6 +3820,10 @@ mod tests {
             (
                 "vl_composite",
                 include_str!("shaders/vl_composite.wgsl").to_string(),
+            ),
+            (
+                "sous l'eau",
+                include_str!("shaders/underwater.wgsl").to_string(),
             ),
         ] {
             let src = src.as_str();

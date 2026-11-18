@@ -1205,7 +1205,9 @@ fn shape_hit(o: vec3<f32>, d: vec3<f32>, cell: vec3<i32>, shp: vec4<u32>, t_in: 
     for (var k = 0; k < 10; k++) {
         var mn = box_lo(b0);
         var mx = box_hi(b0);
-        var used = k == 0;
+        // (Genre 3 : plante en croix, dans la grille pour les ombres des lumières ; les
+        // reflets la traversent.)
+        var used = k == 0 && kind != 3u;
         if k == 1 {
             mn = box_lo(b1);
             mx = box_hi(b1);
