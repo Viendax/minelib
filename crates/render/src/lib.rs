@@ -22,6 +22,7 @@ mod lazy;
 mod lights;
 mod overlay;
 pub mod perf;
+mod planar;
 pub mod rt;
 mod screen;
 mod taa;
@@ -214,6 +215,8 @@ struct Globals {
     cur_view_proj: [[f32; 4]; 4],
     prev_view_proj: [[f32; 4]; 4],
     screen: [f32; 4],
+    /// (v190) Passe d'un miroir : plan qui coupe la scène (voir `planar`) ; zéro ailleurs.
+    clip: [f32; 4],
     held_pos: [f32; 4],
     held_color: [f32; 4],
     /// Raytracing : x = activé, yzw = coin bas de la grille de blocs.
@@ -237,6 +240,11 @@ struct Globals {
     shadow_info: [f32; 4],
     shadow_min: [[f32; 4]; MAX_SHADOW_BOXES],
     shadow_max: [[f32; 4]; MAX_SHADOW_BOXES],
+    /// (v190) Miroirs redessinés à part (voir `planar`) : vue-projection de leur image, plan
+    /// (axe, coordonnée, côté, couche), et leur nombre (x).
+    mirror_vp: [[[f32; 4]; 4]; planar::MAX_PLANAR],
+    mirror_info: [[f32; 4]; planar::MAX_PLANAR],
+    mirror_count: [f32; 4],
 }
 
 /// Rayon de la caméra qui passe par le point `ndc` de l'écran, à l'échelle d'une unité de
@@ -540,6 +548,10 @@ pub struct FrameParams<'a> {
     pub shadow_boxes: &'a [ShadowBox],
     /// Écran de debug (F3) à afficher par-dessus la scène.
     pub overlay: Option<&'a Overlay>,
+    /// (v190) Ce que seuls les miroirs montrent (à la première personne) : le modèle du
+    /// joueur local (avec son skin) et l'objet qu'il tient (triangles, monde).
+    pub mirror_self: Option<PlayerInstance>,
+    pub mirror_held: &'a [EntityVertex],
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -569,6 +581,8 @@ struct ChunkGpu {
     bytes: u64,
     min: Vec3,
     max: Vec3,
+    /// (v190) Miroirs du chunk (voir `MirrorRect`, `planar`).
+    mirrors: Vec<minelib_world::mesh::MirrorRect>,
 }
 
 /// Commandes de dessin indirect d'un chunk (faces tournées vers la caméra, tranches
@@ -674,6 +688,10 @@ pub struct Renderer {
     plain: std::sync::OnceLock<taa::Heavy>,
     /// Passe des reflets : prête un peu après le lancement.
     reflect_pipeline: lazy::Lazy<wgpu::RenderPipeline>,
+    /// (v190) Miroirs redessinés sans raytracing (voir `planar`), et leurs pipelines
+    /// (prêts un peu après le lancement).
+    planar: planar::Planar,
+    planar_pipes: lazy::Lazy<planar::Pipes>,
     sky_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     /// Le contour du bloc visé est-il à dessiner ?
@@ -982,6 +1000,17 @@ impl Renderer {
                 dyn_entries[4],
                 dyn_entries[5],
                 dyn_entries[6],
+                // (v190) Images des miroirs redessinés (voir `planar`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // Pixel art : agrandissement net, réduction lissée entre les mipmaps.
@@ -1000,10 +1029,22 @@ impl Renderer {
         let refl = reflections::Reflections::new(&device, (1, 1));
         let mut dyn_gpu = lights::DynGpu::new(&device, &queue);
         dyn_gpu.bind_bake(&device, &voxels, &block_view, &block_sampler);
+        let mut planar = planar::Planar::new(&device, config.format, (1, 1));
         let bind_groups = world_groups(
             &device,
             &bgl,
             &globals,
+            &block_sampler,
+            &block_view,
+            &voxels,
+            &refl,
+            &dyn_gpu,
+            &planar.images[0].view,
+        );
+        planar.groups = planar_groups(
+            &device,
+            &bgl,
+            &planar,
             &block_sampler,
             &block_view,
             &voxels,
@@ -1032,6 +1073,20 @@ impl Renderer {
                 let p = reflect_pipeline(&device, &layout, &shader);
                 log::info!(
                     "shader des reflets compilé en {:.1} s (en tâche de fond)",
+                    t0.elapsed().as_secs_f32()
+                );
+                p
+            })
+        };
+        // (v190) Miroirs redessinés : leurs pipelines aussi, en tâche de fond.
+        let planar_pipes = {
+            let (device, layout, shader) = (device.clone(), layout.clone(), shader.clone());
+            let format = planar::format(config.format);
+            lazy::Lazy::spawn("shaders des miroirs", move || {
+                let t0 = std::time::Instant::now();
+                let p = planar::Pipes::new(&device, &layout, &shader, format);
+                log::info!(
+                    "shaders des miroirs compilés en {:.1} s (en tâche de fond)",
                     t0.elapsed().as_secs_f32()
                 );
                 p
@@ -1155,6 +1210,8 @@ impl Renderer {
             pack_name: pack.name.clone(),
             plain: std::sync::OnceLock::new(),
             reflect_pipeline,
+            planar,
+            planar_pipes,
             sky_pipeline,
             outline_pipeline,
             outline: false,
@@ -1333,6 +1390,7 @@ impl Renderer {
                 bytes,
                 min,
                 max,
+                mirrors: mesh.mirrors.clone(),
             },
         );
     }
@@ -1427,6 +1485,17 @@ impl Renderer {
             &self.device,
             &self.bgl,
             &self.globals,
+            &self.block_sampler,
+            &self.block_view,
+            &self.voxels,
+            &self.refl,
+            &self.dyn_gpu,
+            &self.planar.images[0].view,
+        );
+        self.planar.groups = planar_groups(
+            &self.device,
+            &self.bgl,
+            &self.planar,
             &self.block_sampler,
             &self.block_view,
             &self.voxels,
@@ -2146,6 +2215,255 @@ impl Renderer {
         true
     }
 
+    /// (v190) Miroirs redessinés à cette image (voir `planar`) : choisit les images (miroirs
+    /// des chunks dessinés vus de face, dans le champ, à portée des reflets ; puis
+    /// les miroirs vus dans leurs images, et ainsi de suite), prépare pour chacune ce
+    /// qu'elle montre (chunks dans son cône, commandes de dessin, uniformes vus d'elle, et
+    /// les images des miroirs qu'on y voit), et remplit `g` (uniformes de l'image) pour que
+    /// les faces de miroir y lisent leur reflet. `vp` : vue-projection sans tremblement ;
+    /// `size` : taille de l'image du monde.
+    fn prepare_mirrors(
+        &mut self,
+        vp: Mat4,
+        eye: Vec3,
+        size: (u32, u32),
+        fog_end: f32,
+        g: &mut Globals,
+    ) {
+        self.planar.draws.clear();
+        g.mirror_count = [0.0; 4];
+        if self.planar_pipes.try_get().is_none() {
+            return;
+        }
+        let frustum = frustum_planes(vp);
+        let roots = {
+            // (v190) Seulement les miroirs des tranches qu'on peut voir (pas ceux de la
+            // surface depuis une grotte fermée).
+            let vis = &self.vis;
+            let rects = self
+                .draw_list
+                .iter()
+                .filter_map(|(_, k)| self.meshes.get(k).map(|c| (k, c)))
+                .flat_map(|(k, c)| {
+                    let MeshKey::Chunk(p) = k;
+                    let mask = vis.get(p).copied().unwrap_or(occlusion::ALL);
+                    c.mirrors
+                        .iter()
+                        .filter(move |r| planar::in_sections(r, mask))
+                });
+            planar::candidates(rects, eye, &frustum, planar::RANGE)
+        };
+        if roots.is_empty() {
+            return;
+        }
+        // Images à la taille du monde, faites au premier miroir vu (pas de mémoire prise
+        // dans les mondes sans miroir).
+        if self.planar.size != size {
+            self.planar.resize(&self.device, size);
+            self.rebuild_world_groups();
+        }
+        if self
+            .planar
+            .groups
+            .iter()
+            .any(|g| g.len() != planar::MAX_PLANAR)
+        {
+            return;
+        }
+        let _s = perf::scope("rendu : miroirs (préparation)");
+        // Chunks dans le cône d'une image, à portée du brouillard depuis le reflet de l'œil,
+        // de l'avant vers l'arrière.
+        let meshes = &self.meshes;
+        let seen_by = |n: &planar::Node| -> Vec<(f32, MeshKey)> {
+            let mut list: Vec<(f32, MeshKey)> = meshes
+                .iter()
+                .filter_map(|(key, c)| {
+                    let dx = (c.min.x - n.eye.x).max(0.0).max(n.eye.x - c.max.x);
+                    let dz = (c.min.z - n.eye.z).max(0.0).max(n.eye.z - c.max.z);
+                    let d = (dx * dx + dz * dz).sqrt();
+                    (d <= fog_end && planar::aabb_inside(&n.portal, c.min, c.max))
+                        .then_some((d, *key))
+                })
+                .collect();
+            list.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            list
+        };
+        let nodes = planar::plan(roots, (vp, eye), size, |n| {
+            let list = seen_by(n);
+            let rects = list.iter().flat_map(|(_, k)| meshes[k].mirrors.iter());
+            planar::candidates(rects, n.eye, &n.portal, planar::RANGE)
+        });
+        let mut cmds = std::mem::take(&mut self.planar.cmds);
+        cmds.clear();
+        let mut draws = Vec::with_capacity(nodes.len());
+        for n in &nodes {
+            let list = seen_by(n);
+            let mut by_page: Vec<&(f32, MeshKey)> = list.iter().collect();
+            by_page.sort_by_key(|(_, k)| self.meshes[k].slot.page);
+            let mut groups = Vec::new();
+            for (_, key) in by_page {
+                let c = &self.meshes[key];
+                if c.count > 0 {
+                    chunk_commands(c, occlusion::ALL, n.eye, &mut cmds, &mut groups);
+                }
+            }
+            let chunks = list
+                .iter()
+                .filter(|(_, k)| {
+                    let c = &self.meshes[k];
+                    c.reflective > 0 || c.translucent > 0
+                })
+                .map(|&(_, k)| k)
+                .collect();
+            // Uniformes vus de l'image : sa caméra, rien derrière son plan, pas de bloc visé,
+            // les images des miroirs qu'on y voit ; l'eau y renvoie ses rayons à peu de
+            // rebonds ; pas de lumière des torches renvoyée par les miroirs (un rayon par
+            // pixel).
+            let mut mg = *g;
+            mg.view_proj = n.vp.to_cols_array_2d();
+            mg.cur_view_proj = mg.view_proj;
+            mg.prev_view_proj = mg.view_proj;
+            mg.cam_pos = [n.eye.x, n.eye.y, n.eye.z, g.cam_pos[3]];
+            mg.screen = [
+                size.0 as f32,
+                size.1 as f32,
+                g.screen[2].min(planar::MIRROR_BOUNCES),
+                g.screen[3],
+            ];
+            mg.clip = n.plane.clip();
+            mg.sel_min[3] = 0.0;
+            mg.light[3] = 0.0;
+            mg.refl_cam[3] = 0.0;
+            mirror_uniforms(&mut mg, n.children.iter().map(|&c| &nodes[c]));
+            self.queue.write_buffer(
+                &self.planar.globals[n.array][n.layer],
+                0,
+                bytemuck::bytes_of(&mg),
+            );
+            draws.push((
+                n.level,
+                planar::MirrorDraw {
+                    array: n.array,
+                    layer: n.layer,
+                    scissor: n.scissor,
+                    groups,
+                    chunks,
+                },
+            ));
+        }
+        mirror_uniforms(g, nodes.iter().filter(|n| n.parent.is_none()));
+        // Les images des miroirs vus dans un miroir avant celle où on les voit.
+        draws.sort_by_key(|d| std::cmp::Reverse(d.0));
+        let n = (cmds.len() / 20) as u64;
+        if n > self.planar.indirect_cap {
+            self.planar.indirect_cap = n.next_power_of_two();
+            self.planar.indirect = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dessins indirects des miroirs"),
+                size: 20 * self.planar.indirect_cap,
+                usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !cmds.is_empty() {
+            self.queue.write_buffer(&self.planar.indirect, 0, &cmds);
+        }
+        self.planar.cmds = cmds;
+        self.planar.draws = draws.into_iter().map(|d| d.1).collect();
+    }
+
+    /// (v190) Dessine les images des miroirs préparées par `prepare_mirrors` : ciel, blocs,
+    /// blocs qui reflètent (sans leur reflet), entités et joueurs (et soi-même), puis l'eau
+    /// et le verre, seulement dans le rectangle du miroir.
+    fn encode_mirrors(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(pipes) = self.planar_pipes.try_get() else {
+            return;
+        };
+        for d in &self.planar.draws {
+            let group = &self.planar.groups[d.array][d.layer];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("miroir"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.planar.images[d.array].layers[d.layer],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.planar.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let [x, y, w, h] = d.scissor;
+            pass.set_scissor_rect(x, y, w, h);
+            pass.set_bind_group(0, group, &[]);
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.draw(0..3, 0..1);
+            pass.set_pipeline(&pipes.block);
+            for &(page, first, count) in &d.groups {
+                let pg = &self.arena.pages[page];
+                pass.set_vertex_buffer(0, pg.vertices.slice(..));
+                pass.set_index_buffer(pg.indices.slice(..), wgpu::IndexFormat::Uint32);
+                if self.multi_draw {
+                    pass.multi_draw_indexed_indirect(
+                        &self.planar.indirect,
+                        first as u64 * 20,
+                        count,
+                    );
+                } else {
+                    for k in 0..count {
+                        pass.draw_indexed_indirect(&self.planar.indirect, (first + k) as u64 * 20);
+                    }
+                }
+            }
+            pass.set_pipeline(&pipes.reflective);
+            let mut bound = usize::MAX;
+            for key in &d.chunks {
+                let Some(c) = self.meshes.get(key) else {
+                    continue;
+                };
+                if c.reflective == 0 {
+                    continue;
+                }
+                if bound != c.slot.page {
+                    bound = c.slot.page;
+                    let pg = &self.arena.pages[bound];
+                    pass.set_vertex_buffer(0, pg.vertices.slice(..));
+                    pass.set_index_buffer(pg.indices.slice(..), wgpu::IndexFormat::Uint32);
+                }
+                let first = c.slot.istart as u32 + c.count;
+                pass.draw_indexed(first..first + c.reflective, c.slot.vstart as i32, 0..1);
+            }
+            self.entities.draw_mirror(&mut pass, group);
+            pass.set_bind_group(0, group, &[]);
+            pass.set_pipeline(&pipes.translucent);
+            let mut bound = usize::MAX;
+            for key in d.chunks.iter().rev() {
+                let Some(c) = self.meshes.get(key) else {
+                    continue;
+                };
+                if c.translucent == 0 {
+                    continue;
+                }
+                if bound != c.slot.page {
+                    bound = c.slot.page;
+                    let pg = &self.arena.pages[bound];
+                    pass.set_vertex_buffer(0, pg.vertices.slice(..));
+                    pass.set_index_buffer(pg.indices.slice(..), wgpu::IndexFormat::Uint32);
+                }
+                let first = c.slot.istart as u32 + c.count + c.reflective;
+                pass.draw_indexed(first..first + c.translucent, c.slot.vstart as i32, 0..1);
+            }
+        }
+    }
+
     /// Après les opaques (et l'éclairage différé) : contour du bloc visé, écrans vidéo,
     /// translucides de l'arrière vers l'avant.
     fn draw_after<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, pipes: &ScenePipes<'p>) {
@@ -2249,9 +2567,12 @@ impl Renderer {
             shadow_info: sg.0,
             shadow_min: sg.1,
             shadow_max: sg.2,
+            clip: [0.0; 4],
+            mirror_vp: [[[0.0; 4]; 4]; planar::MAX_PLANAR],
+            mirror_info: [[0.0; 4]; planar::MAX_PLANAR],
+            mirror_count: [0.0; 4],
         };
-        self.queue
-            .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+        let mut globals = globals;
 
         self.overlay
             .prepare(&self.device, &self.queue, p.overlay, p.ui, self.size());
@@ -2267,8 +2588,15 @@ impl Renderer {
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
+        // (v190) Miroirs redessinés (voir `planar`), puis les uniformes de l'image.
+        self.entities
+            .prepare_mirror(&self.queue, p.mirror_self, p.mirror_held);
+        self.prepare_mirrors(view_proj, p.eye, self.size(), p.fog_end, &mut globals);
+        self.queue
+            .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_mirrors(&mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("monde"),
@@ -2444,6 +2772,10 @@ impl Renderer {
             shadow_info: sg.0,
             shadow_min: sg.1,
             shadow_max: sg.2,
+            clip: [0.0; 4],
+            mirror_vp: [[[0.0; 4]; 4]; planar::MAX_PLANAR],
+            mirror_info: [[0.0; 4]; planar::MAX_PLANAR],
+            mirror_count: [0.0; 4],
         };
         self.overlay
             .prepare(&self.device, &self.queue, p.overlay, p.ui, size);
@@ -2496,6 +2828,10 @@ impl Renderer {
             globals.refl_vp = vp;
             globals.refl_cam = cam;
         }
+        // (v190) Miroirs redessinés (voir `planar`).
+        self.entities
+            .prepare_mirror(&self.queue, p.mirror_self, p.mirror_held);
+        self.prepare_mirrors(view_proj, p.eye, world_size, p.fog_end, &mut globals);
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         drop(prep);
@@ -2556,12 +2892,15 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.bind_groups[1 - write], &[]);
+            // (v190) Une seule fois (les mêmes faces étaient dessinées une deuxième fois,
+            // pour rien : refusées par le test de profondeur).
             if let Some(p) = self.reflect_pipeline.try_get() {
                 pass.set_pipeline(p);
                 self.draw_reflective(&mut pass);
             }
-            self.draw_reflective(&mut pass);
         }
+        // (v190) Images des miroirs, avant la scène qui les lit.
+        self.encode_mirrors(&mut encoder);
         // Lumières de l'éditeur : actives cette image, leurs pipelines prêts, et au moins
         // une case de l'écran éclairée (sinon leurs passes n'ont rien à faire).
         let lights_on =
@@ -2934,50 +3273,133 @@ fn world_groups(
     voxels: &rt::Voxels,
     refl: &reflections::Reflections,
     dyn_gpu: &lights::DynGpu,
+    mirrors: &wgpu::TextureView,
 ) -> [wgpu::BindGroup; 2] {
     std::array::from_fn(|i| {
-        let [d7, d8, d9, d10, d11, d12, d13] = dyn_gpu.bind_entries();
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("monde"),
-            layout: bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(blocks),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&voxels.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&voxels.palette_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&refl.views[i]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&voxels.skin_view),
-                },
-                d7,
-                d8,
-                d9,
-                d10,
-                d11,
-                d12,
-                d13,
-            ],
-        })
+        world_group(
+            device,
+            bgl,
+            globals,
+            sampler,
+            blocks,
+            voxels,
+            &refl.views[i],
+            dyn_gpu,
+            mirrors,
+        )
+    })
+}
+
+/// (v190) Groupes de liaison du monde vus de chaque image de miroir (`planar`) : leurs
+/// propres uniformes, et l'autre image des miroirs à la place de la première, pour
+/// les miroirs qu'on y voit (une passe ne peut lire l'image où elle dessine).
+#[allow(clippy::too_many_arguments)]
+fn planar_groups(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    planar: &planar::Planar,
+    sampler: &wgpu::Sampler,
+    blocks: &wgpu::TextureView,
+    voxels: &rt::Voxels,
+    refl: &reflections::Reflections,
+    dyn_gpu: &lights::DynGpu,
+) -> [Vec<wgpu::BindGroup>; 2] {
+    std::array::from_fn(|array| {
+        planar.globals[array]
+            .iter()
+            .map(|g| {
+                world_group(
+                    device,
+                    bgl,
+                    g,
+                    sampler,
+                    blocks,
+                    voxels,
+                    &refl.views[0],
+                    dyn_gpu,
+                    &planar.images[1 - array].view,
+                )
+            })
+            .collect()
+    })
+}
+
+/// (v190) Images de miroir que lit une passe (vue de la caméra, ou image d'un miroir) :
+/// vue-projection et plan de chacune, et leur nombre.
+fn mirror_uniforms<'a>(g: &mut Globals, seen: impl Iterator<Item = &'a planar::Node>) {
+    let mut count = 0;
+    for (k, n) in seen.take(planar::MAX_PLANAR).enumerate() {
+        g.mirror_vp[k] = n.vp.to_cols_array_2d();
+        g.mirror_info[k] = [
+            n.plane.axis as f32,
+            n.plane.coord,
+            n.plane.side,
+            n.layer as f32,
+        ];
+        count = k + 1;
+    }
+    g.mirror_count = [count as f32, 0.0, 0.0, 0.0];
+}
+
+/// Un groupe de liaison du monde : uniformes, textures des blocs, grille du raytracing,
+/// image des reflets `refl`, skin, lumières dynamiques, images des miroirs.
+#[allow(clippy::too_many_arguments)]
+fn world_group(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    globals: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+    blocks: &wgpu::TextureView,
+    voxels: &rt::Voxels,
+    refl: &wgpu::TextureView,
+    dyn_gpu: &lights::DynGpu,
+    mirrors: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    let [d7, d8, d9, d10, d11, d12, d13] = dyn_gpu.bind_entries();
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("monde"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(blocks),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&voxels.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&voxels.palette_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(refl),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&voxels.skin_view),
+            },
+            d7,
+            d8,
+            d9,
+            d10,
+            d11,
+            d12,
+            d13,
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: wgpu::BindingResource::TextureView(mirrors),
+            },
+        ],
     })
 }
 

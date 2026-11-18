@@ -24,7 +24,7 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 |---|---|
 | 🧱 **Crée sans limite** | Un monde infini à façonner : continents, montagnes, grottes, forêts. Mode créatif, survie, et un **WorldEdit intégré** pour bâtir des villes entières en quelques commandes. |
 | 🔫 **Joue en compétitif** | Ta carte devient une arène **5 contre 5 en compétitif** : 34 armes, 5 grenades, économie, bombe, classement Elo. Une carte se prépare en 4 commandes. |
-| 💡 **Une image qui claque** | Raytracing en temps réel : miroirs, reflets sur l'eau, la glace et les métaux, lumière colorée des torches, fumigènes en volume qui contournent les murs. |
+| 💡 **Une image qui claque** | Miroirs qui montrent tout, toi compris (même à la première personne), et deux miroirs face à face qui se renvoient leurs reflets en couloir, sans raytracing ; raytracing en temps réel pour les reflets sur l'eau, la glace et les métaux ; lumière colorée des torches, fumigènes en volume qui contournent les murs. |
 | 🛡️ **Du fair-play, vraiment** | Les parties sont servies par des joueurs neutres, **rejouées et vérifiées au bit près**, avec un arbitre indépendant en cas de doute. Un facteur de confiance range les tricheurs ensemble. |
 | 🌍 **Joueurs illimités** | Un seul monde peut accueillir la planète entière : il se découpe tout seul en régions, servies par les jeux des joueurs. Tu ne vois que les 2 048 joueurs les plus proches de toi, et tu entends au vocal ceux qui sont à côté, où que tu sois. |
 | 🔒 **Ta vie privée respectée** | Un pseudo et un mot de passe, c'est tout. Pas d'e-mail, pas de téléphone, personne ne voit ton adresse IP, chat vocal chiffré de bout en bout. |
@@ -254,7 +254,7 @@ Il faut Rust 1.85 ou plus récent.
 ```text
 crates/
 ├── platform/   fenêtre, entrées, temps (winit)
-├── render/     rendu wgpu : chunks, ciel, interface, raytracing, armes
+├── render/     rendu wgpu : chunks, ciel, interface, miroirs, raytracing, armes
 ├── world/      blocs, génération, lumière, maillage
 ├── assets/     dossier .minelib, options, packs de textures
 ├── net/        protocole, chiffrement (Noise), client du relais

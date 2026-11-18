@@ -6585,6 +6585,18 @@ impl Session {
                 }
             }
         }
+        // (v190) À la première personne, seuls les miroirs montrent le joueur : son modèle
+        // (avec son skin) et ce qu'il tient. (En F5, il est déjà dans la scène.)
+        let mirror_me = third == 0 && visible && self.spectating.is_none();
+        let mirror_self = mirror_me.then(|| {
+            let layer = layers.layer(pose.skin.as_ref(), renderer);
+            crate::player_model::instance(&pose, layer, &crate::player_model::Prev::still(&pose))
+        });
+        let mirror_held = if mirror_me {
+            crate::player_model::held_model(&pose, true)
+        } else {
+            Vec::new()
+        };
         drop(layers);
         // Objets au sol : ils flottent et tournent. (v185) Leur vrai modèle, éclairés comme
         // les joueurs (lumière du ciel à leur place).
@@ -6742,6 +6754,8 @@ impl Session {
             sun: self.sun,
             ui: Some(ui),
             overlay: show_debug.then_some(&self.overlay),
+            mirror_self,
+            mirror_held: &mirror_held,
         };
         renderer.render(&params)
     }

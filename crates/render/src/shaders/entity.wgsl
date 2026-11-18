@@ -18,6 +18,8 @@ struct Globals {
     cur_view_proj: mat4x4<f32>,
     prev_view_proj: mat4x4<f32>,
     screen: vec4<f32>,
+    // (v190) Passe d'un miroir : seulement ce qui est devant son plan (voir world.wgsl).
+    clip: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -91,6 +93,10 @@ fn vs_main(v: VIn) -> VOut {
 
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
+    // (v190) Dans un miroir : rien de ce qui est derrière lui (zéro ailleurs : tout passe).
+    if dot(g.clip.xyz, i.world) + g.clip.w < 0.0 {
+        discard;
+    }
     return vec4<f32>(shade(i), 1.0);
 }
 

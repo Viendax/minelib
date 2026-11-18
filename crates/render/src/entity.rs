@@ -150,6 +150,8 @@ struct Players {
     mesh_count: u32,
     instances: wgpu::Buffer,
     count: u32,
+    /// (v190) Instances après `count` dessinées seulement dans les miroirs (soi-même).
+    extra: u32,
     skins: wgpu::Texture,
     group: wgpu::BindGroup,
 }
@@ -318,6 +320,7 @@ impl Players {
             mesh_count: 0,
             instances,
             count: 0,
+            extra: 0,
             skins,
             group,
         }
@@ -366,13 +369,37 @@ impl Players {
     fn set_instances(&mut self, queue: &wgpu::Queue, players: &[PlayerInstance]) {
         let n = players.len().min(MAX_PLAYERS);
         self.count = n as u32;
+        self.extra = 0;
         if n > 0 {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&players[..n]));
         }
     }
 
+    /// (v190) Le joueur local, vu seulement dans les miroirs : après les autres.
+    fn set_mirror_self(&mut self, queue: &wgpu::Queue, me: Option<PlayerInstance>) {
+        self.extra = 0;
+        if let Some(me) = me {
+            if (self.count as usize) < MAX_PLAYERS {
+                let at = self.count as u64 * std::mem::size_of::<PlayerInstance>() as u64;
+                queue.write_buffer(&self.instances, at, bytemuck::bytes_of(&me));
+                self.extra = 1;
+            }
+        }
+    }
+
     fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, world: &'a wgpu::BindGroup, taa: bool) {
-        if self.count == 0 || self.mesh_count == 0 {
+        self.draw_n(pass, world, taa, self.count);
+    }
+
+    /// `n` premières instances (les autres joueurs ; plus soi-même dans un miroir).
+    fn draw_n<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        world: &'a wgpu::BindGroup,
+        taa: bool,
+        n: u32,
+    ) {
+        if n == 0 || self.mesh_count == 0 {
             return;
         }
         pass.set_pipeline(if taa { &self.taa } else { &self.plain });
@@ -380,7 +407,7 @@ impl Players {
         pass.set_bind_group(1, &self.group, &[]);
         pass.set_vertex_buffer(0, self.mesh.slice(..));
         pass.set_vertex_buffer(1, self.instances.slice(..));
-        pass.draw(0..self.mesh_count, 0..self.count);
+        pass.draw(0..self.mesh_count, 0..n);
     }
 }
 
@@ -480,6 +507,9 @@ pub struct Entities {
     players: Players,
     buffer: wgpu::Buffer,
     count: u32,
+    /// (v190) Sommets après `count` dessinés seulement dans les miroirs (ce que tient le
+    /// joueur local à la première personne).
+    mirror_extra: u32,
     /// Premiers sommets qui suivent la caméra (modèle du joueur local).
     follow: u32,
     /// Entités fixes qui changent rarement (têtes et cadres des cartes) : gardées sur la
@@ -508,6 +538,7 @@ impl Entities {
             players,
             buffer,
             count: 0,
+            mirror_extra: 0,
             follow: 0,
             statics: std::collections::HashMap::new(),
             static_draw: Vec::new(),
@@ -580,6 +611,50 @@ impl Entities {
         self.follow = (follow.min(n) / 3 * 3) as u32;
         if n > 0 {
             queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&vertices[..n]));
+        }
+    }
+
+    /// (v190) Ce que seuls les miroirs montrent, à la première personne : le joueur local
+    /// (`me`, après les autres joueurs) et ce qu'il tient (`held`, après les entités de
+    /// l'image). À appeler après `prepare` et `prepare_players`.
+    pub fn prepare_mirror(
+        &mut self,
+        queue: &wgpu::Queue,
+        me: Option<PlayerInstance>,
+        held: &[EntityVertex],
+    ) {
+        self.players.set_mirror_self(queue, me);
+        let room = MAX_VERTICES.saturating_sub(self.count as usize);
+        let n = held.len().min(room) / 3 * 3;
+        self.mirror_extra = n as u32;
+        if n > 0 {
+            let at = self.count as u64 * std::mem::size_of::<EntityVertex>() as u64;
+            queue.write_buffer(&self.buffer, at, bytemuck::cast_slice(&held[..n]));
+        }
+    }
+
+    /// (v190) Les entités dans la passe d'un miroir (pipelines sans anticrénelage) : les
+    /// autres joueurs et soi-même, les entités fixes, celles de l'image et ce qu'on tient.
+    pub(crate) fn draw_mirror<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        group: &'a wgpu::BindGroup,
+    ) {
+        let p = &self.pipes;
+        self.players
+            .draw_n(pass, group, false, self.players.count + self.players.extra);
+        pass.set_bind_group(0, group, &[]);
+        pass.set_pipeline(&p.plain);
+        for key in &self.static_draw {
+            if let Some((b, n, _)) = self.statics.get(key) {
+                pass.set_vertex_buffer(0, b.slice(..));
+                pass.draw(0..*n, 0..1);
+            }
+        }
+        let n = self.count + self.mirror_extra;
+        if n > 0 {
+            pass.set_vertex_buffer(0, self.buffer.slice(..));
+            pass.draw(0..n, 0..1);
         }
     }
 

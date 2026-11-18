@@ -16,6 +16,9 @@ struct Globals {
     cur_view_proj: mat4x4<f32>,
     prev_view_proj: mat4x4<f32>,
     screen: vec4<f32>,    // xy = taille de l'image (px)
+    // (v190) Passe d'un miroir (voir planar.rs) : on ne garde que ce qui est devant son
+    // plan, dot(xyz, p) + w >= 0. Zéro hors de ces passes.
+    clip: vec4<f32>,
     // Torche tenue en main : xyz = position, w = portée (0 = aucune) ; couleur (linéaire).
     held_pos: vec4<f32>,
     held_color: vec4<f32>,
@@ -49,6 +52,12 @@ struct Globals {
     shadow_info: vec4<f32>,
     shadow_min: array<vec4<f32>, 48>,
     shadow_max: array<vec4<f32>, 48>,
+    // (v190) Miroirs redessinés à part (voir planar.rs), nombre dans mirror_count.x : pour
+    // chacun, la vue-projection de son image et son plan (x = axe, y = coordonnée, z = côté
+    // vers lequel il regarde ±1, w = couche de `mirror_tex`).
+    mirror_vp: array<mat4x4<f32>, 4>,
+    mirror_info: array<vec4<f32>, 4>,
+    mirror_count: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -60,6 +69,8 @@ struct Globals {
 @group(0) @binding(5) var refl_tex: texture_2d<f32>;
 /// Skin du joueur (64 × 64), pour les reflets.
 @group(0) @binding(6) var skin_tex: texture_2d<f32>;
+// (v190) Images des miroirs redessinés (une couche par plan, voir planar.rs).
+@group(0) @binding(14) var mirror_tex: texture_2d_array<f32>;
 
 const HORIZON: vec3<f32> = vec3<f32>(0.62, 0.78, 0.95);
 const ZENITH: vec3<f32> = vec3<f32>(0.25, 0.47, 0.85);
@@ -203,6 +214,82 @@ fn fs_block_translucent(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(c.rgb, max(c.a, 0.25));
 }
 
+/// (v190) Passe d'un miroir : ce qui est derrière son plan (le mur qui le porte, l'autre
+/// côté) n'apparaît pas dans son reflet.
+fn behind_mirror(p: vec3<f32>) -> bool {
+    return dot(g.clip.xyz, p) + g.clip.w < 0.0;
+}
+
+/// (v190) Blocs vus dans un miroir (opaques et ceux qui reflètent, sans leurs reflets).
+@fragment
+fn fs_block_mirror(i: VOut) -> @location(0) vec4<f32> {
+    let c = shade_with(i, false, false, false);
+    if c.a < 0.3 || from_behind(i) || behind_mirror(i.world) {
+        discard;
+    }
+    return vec4<f32>(c.rgb, 1.0);
+}
+
+/// (v190) Miroirs et métaux vus dans un miroir : un miroir y montre son image s'il
+/// en a une (miroir dans le miroir), sinon il est sombre ; un métal, son reflet par rayon
+/// si le raytracing est activé.
+@fragment
+fn fs_block_mirror_reflect(i: VOut) -> @location(0) vec4<f32> {
+    let c = shade_with(i, true, false, false);
+    if c.a < 0.3 || from_behind(i) || behind_mirror(i.world) {
+        discard;
+    }
+    return vec4<f32>(c.rgb, 1.0);
+}
+
+/// (v190) Eau, glace, verre vus dans un miroir.
+@fragment
+fn fs_block_translucent_mirror(i: VOut) -> @location(0) vec4<f32> {
+    let c = shade_with(i, true, true, true);
+    if c.a < 0.02 || from_behind(i) || behind_mirror(i.world) {
+        discard;
+    }
+    return vec4<f32>(c.rgb, max(c.a, 0.25));
+}
+
+/// (v190) Reflet d'une face de miroir redessiné à part (voir planar.rs) : si la face en `p`
+/// (normale `n`) est sur l'un des plans redessinés à cette image, la scène vue de l'autre
+/// côté, lue dans son image (a = 1) ; sinon a = 0 (raytracing ou ciel, comme avant).
+fn planar_mirror(p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+    let count = u32(g.mirror_count.x);
+    for (var k = 0u; k < count; k = k + 1u) {
+        let m = g.mirror_info[k];
+        let axis = u32(m.x);
+        // Même plan : même orientation, et la face dessus (à un quart de bloc près : deux
+        // plans parallèles sont au moins à un bloc l'un de l'autre).
+        if n[axis] * m.z < 0.5 || abs(p[axis] - m.y) > 0.25 {
+            continue;
+        }
+        let clip = g.mirror_vp[k] * vec4<f32>(p, 1.0);
+        if clip.w <= 0.0 {
+            continue;
+        }
+        let uv = clip.xy / clip.w * vec2<f32>(0.5, -0.5) + 0.5;
+        let dims = vec2<i32>(textureDimensions(mirror_tex).xy);
+        let px = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - 1);
+        return vec4<f32>(textureLoad(mirror_tex, px, i32(m.w), 0).rgb, 1.0);
+    }
+    return vec4<f32>(0.0);
+}
+
+/// (v190) La face en `p` (normale `n`) est-elle sur un des plans redessinés à cette image ?
+fn has_planar(p: vec3<f32>, n: vec3<f32>) -> bool {
+    let count = u32(g.mirror_count.x);
+    for (var k = 0u; k < count; k = k + 1u) {
+        let m = g.mirror_info[k];
+        let axis = u32(m.x);
+        if n[axis] * m.z >= 0.5 && abs(p[axis] - m.y) <= 0.25 {
+            return true;
+        }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------- vecteurs de mouvement (TAA)
 
 struct MvOut {
@@ -294,6 +381,10 @@ fn cached_reflection(p: vec3<f32>) -> vec4<f32> {
 @fragment
 fn fs_reflect(i: VOut) -> @location(0) vec4<f32> {
     let n = face_normal(i.face);
+    // (v190) Miroir redessiné à part : son image sert, pas de rayon.
+    if i.reflect > 0.99 && i.short == 0u && has_planar(i.world, n) {
+        return vec4<f32>(0.0);
+    }
     let to_frag = i.world - g.cam_pos.xyz;
     let dist = length(to_frag);
     let r = reflect(to_frag / max(dist, 1e-4), n);
@@ -429,15 +520,37 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
     // Au loin, le reflet s'efface doucement, comme le brouillard de fin de vue : de 60 % à
     // 100 % de 4 chunks (≈ 38 → 64 blocs) ; au-delà la surface est opaque (et aucun rayon
     // n'est lancé : plus de FPS).
-    let reflect_fade = 1.0 - smoothstep(refl_range() * 0.6, refl_range(), dist);
-    if reflections && i.reflect > 0.0 && reflect_fade > 0.0 {
+    let rt_fade = 1.0 - smoothstep(refl_range() * 0.6, refl_range(), dist);
+    // (v190) Miroir redessiné à part (sans rayon) : jusqu'à la pleine portée, quelle que
+    // soit la qualité du raytracing.
+    let mirror_fade = 1.0 - smoothstep(REFLECT_RANGE * 0.6, REFLECT_RANGE, dist);
+    // (v190) Dans l'image d'un miroir (passe coupée à son plan), un miroir sans image à lui
+    // (au fond d'un couloir de miroirs) est sombre, sans rayon.
+    let in_mirror = any(g.clip.xyz != vec3<f32>(0.0));
+    let mirror_drawn = i.reflect > 0.99 && i.short == 0u && (g.mirror_count.x > 0.5 || in_mirror);
+    if reflections && i.reflect > 0.0 && max(rt_fade, select(0.0, mirror_fade, mirror_drawn)) > 0.0 {
         let v = to_frag / max(dist, 1e-4);
         let r = reflect(v, n);
         var env: vec3<f32>;
         var cover = 1.0;
         // Métal (`short`) : seulement les objets proches, pas le ciel ni le lointain.
         let short = i.short != 0u;
-        if g.rt.x > 0.5 {
+        // (v190) Miroir redessiné à part : son image, sans lancer de rayon.
+        var planar = vec4<f32>(0.0);
+        if i.reflect > 0.99 && !short {
+            planar = planar_mirror(i.world, n);
+        }
+        let deepest = in_mirror && i.reflect > 0.99 && !short && planar.a < 0.5;
+        let reflect_fade = select(rt_fade, mirror_fade, planar.a > 0.5 || deepest);
+        if planar.a > 0.5 {
+            env = planar.rgb;
+        } else if deepest {
+            env = vec3<f32>(0.0);
+        } else if rt_fade <= 0.0 {
+            // Miroir pas redessiné, trop loin pour un rayon : opaque.
+            env = vec3<f32>(0.0);
+            cover = 0.0;
+        } else if g.rt.x > 0.5 {
             // Un seul appel à `trace` (le compilateur de DirectX recopie tout à chaque appel).
             var found = false;
             if cached && !short {
@@ -471,8 +584,9 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
         color = mix(color, tinted, k);
         wd *= 1.0 - k;
         // Points lumineux : chaque source proche se reflète (couleur de sa flamme), net
-        // sur un miroir, plus étalé sur le métal ; avec ou sans raytracing.
-        if g.rt.x < 0.5 || i.reflect < 0.99 {
+        // sur un miroir, plus étalé sur le métal ; avec ou sans raytracing. (Pas sur un
+        // miroir redessiné : les flammes sont déjà dans son image.)
+        if (g.rt.x < 0.5 || i.reflect < 0.99) && planar.a < 0.5 && !deepest {
             color += specular(i.world, r, i.reflect, i.light) * flicker * reflect_fade;
         }
     }

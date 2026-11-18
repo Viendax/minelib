@@ -143,6 +143,60 @@ pub struct MeshData {
     pub heads: Vec<([i32; 3], BlockId, [u8; 4])>,
     /// Lumière reçue aux points de mesure du chunk (`World::set_probes`), dans leur ordre.
     pub probes: Vec<[u8; 4]>,
+    /// (v190) Miroirs du chunk : faces de miroir dessinées, un rectangle par miroir d'un
+    /// seul tenant (voir `MirrorRect`).
+    pub mirrors: Vec<MirrorRect>,
+}
+
+/// (v190) Un miroir d'un chunk : faces de miroir d'un même plan qui se touchent. Axe (0 x,
+/// 1 y, 2 z), côté vers lequel elles regardent (+1 ou −1), coordonnée du plan et étendue
+/// sur les deux autres axes (dans l'ordre (axe + 1) % 3 puis (axe + 2) % 3), en blocs du
+/// monde. Le rendu redessine la scène vue de l'autre côté des plus visibles (miroirs sans
+/// raytracing). Deux miroirs séparés du même plan restent deux rectangles : le rendu ne
+/// prend que ceux qu'il peut voir.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MirrorRect {
+    pub axis: u8,
+    pub side: i8,
+    pub coord: i32,
+    pub lo: [i32; 2],
+    pub hi: [i32; 2],
+}
+
+impl MirrorRect {
+    /// Ajoute la face de normale `n` du bloc `w` (monde) au rectangle de `list` qu'elle
+    /// touche (ceux qu'elle relie n'en font plus qu'un), sinon en fait un nouveau.
+    pub fn add(list: &mut Vec<MirrorRect>, w: [i32; 3], n: [i32; 3]) {
+        let axis = (0..3).find(|&k| n[k] != 0).unwrap_or(1);
+        let side = n[axis].signum() as i8;
+        let coord = w[axis] + (side > 0) as i32;
+        let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+        let (u, v) = (w[a], w[b]);
+        let mut r = MirrorRect {
+            axis: axis as u8,
+            side,
+            coord,
+            lo: [u, v],
+            hi: [u + 1, v + 1],
+        };
+        while let Some(k) = list.iter().position(|o| o.joins(&r)) {
+            let o = list.swap_remove(k);
+            r.lo = [r.lo[0].min(o.lo[0]), r.lo[1].min(o.lo[1])];
+            r.hi = [r.hi[0].max(o.hi[0]), r.hi[1].max(o.hi[1])];
+        }
+        list.push(r);
+    }
+
+    /// Même plan, et les deux rectangles se touchent (bord ou coin) ou se chevauchent.
+    pub fn joins(&self, o: &MirrorRect) -> bool {
+        self.axis == o.axis
+            && self.side == o.side
+            && self.coord == o.coord
+            && self.lo[0] <= o.hi[0]
+            && o.lo[0] <= self.hi[0]
+            && self.lo[1] <= o.hi[1]
+            && o.lo[1] <= self.hi[1]
+    }
 }
 
 /// Tranches de 16 blocs de haut dans une colonne de chunk.
@@ -2024,6 +2078,10 @@ fn mesh_block(
                         out.indices
                             .extend_from_slice(&[1, 2, 3, 3, 0, 1].map(|i| start + i));
                     }
+                    // (v190) Face de miroir parfait : son plan, pour le rendu en miroir.
+                    if def.reflect >= 15 && !def.metal && !def.translucent {
+                        MirrorRect::add(&mut out.mirrors, [ox + x, y, oz + z], n);
+                    }
                 }
             }
         }
@@ -2894,5 +2952,38 @@ mod cover_tests {
             "éclairée par la case du verre"
         );
         assert_eq!(count(reg.by_key("slab:stone:bottom").unwrap()), 4);
+    }
+
+    /// (v190) Faces de miroir : un rectangle par miroir d'un seul tenant. Deux miroirs
+    /// séparés du même plan restent deux rectangles ; une face qui les relie les réunit ;
+    /// l'autre côté d'un mur est un autre plan.
+    #[test]
+    fn mirror_faces_make_one_rect_per_mirror() {
+        let mut list = Vec::new();
+        let up = [0, 0, 1];
+        // Deux bandes en z = 11 (faces vers +z, blocs en z = 10) : x = 2 et x = 12.
+        for y in 51..55 {
+            MirrorRect::add(&mut list, [2, y, 10], up);
+            MirrorRect::add(&mut list, [12, y, 10], up);
+        }
+        assert_eq!(list.len(), 2, "{list:?}");
+        assert!(list
+            .iter()
+            .all(|r| r.axis == 2 && r.side == 1 && r.coord == 11));
+        let mut spans: Vec<_> = list.iter().map(|r| (r.lo, r.hi)).collect();
+        spans.sort();
+        assert_eq!(spans, vec![([2, 51], [3, 55]), ([12, 51], [13, 55])]);
+        // Le miroir d'en face (faces vers −z, en z = 11) : un autre plan.
+        for x in 5..11 {
+            MirrorRect::add(&mut list, [x, 52, 11], [0, 0, -1]);
+        }
+        assert_eq!(list.len(), 3);
+        // Une rangée qui relie les deux bandes : un seul miroir.
+        for x in 3..12 {
+            MirrorRect::add(&mut list, [x, 55, 10], up);
+        }
+        assert_eq!(list.len(), 2, "{list:?}");
+        let joined = list.iter().find(|r| r.side == 1).unwrap();
+        assert_eq!((joined.lo, joined.hi), ([2, 51], [13, 56]));
     }
 }
