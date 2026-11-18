@@ -1864,6 +1864,24 @@ impl Fps {
         if !nades.is_empty() {
             rows.push(("4".into(), nades));
         }
+        // (v179) La bombe, quand on la porte : une arme de plus (touche 5), avec son icône
+        // (couchée dans la longueur, le clavier et le voyant vers nous).
+        if self.has_bomb() {
+            let turn = Mat4::from_cols(
+                glam::Vec4::NEG_Z,
+                glam::Vec4::X,
+                glam::Vec4::NEG_Y,
+                glam::Vec4::W,
+            );
+            let bomb = equip::bomb_model()
+                .into_iter()
+                .map(|t| weapons::Tri {
+                    p: t.p.map(|p| turn.transform_point3(p)),
+                    ..t
+                })
+                .collect();
+            rows.push(("5".into(), vec![(Sel::Bomb, bomb)]));
+        }
         let mut y = bottom - rows.len() as f32 * (h + gap);
         for (num, items) in rows {
             let active = items.iter().any(|(sel, _)| *sel == self.sel);

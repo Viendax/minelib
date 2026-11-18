@@ -33,6 +33,9 @@ pub enum TexSrc {
     /// `textures/item/<nom>.png` (objets montrés dans les cadres des cartes). Absente :
     /// transparente (rien n'est dessiné).
     Item(&'static str),
+    /// (v179) Texture d'un bloc récent : `<nom>` du pack (ou du pack par défaut) s'il l'a,
+    /// sinon la source de repli (texture proche teintée, couleur…).
+    Or(&'static str, Box<TexSrc>),
 }
 
 /// (v165) Objets (pas des blocs) que les cadres des cartes peuvent montrer avec l'image du
@@ -1849,6 +1852,8 @@ fn build() -> Registry {
         let i = b.tex(&TexSrc::Item(name));
         b.r.items.insert(name, i);
     }
+    // (v179) Blocs récents des cartes : à la fin (blocs et textures d'avant inchangés).
+    recent_blocks(&mut b);
     b.r
 }
 
@@ -2830,6 +2835,946 @@ pub fn log_key(i: usize) -> &'static str {
 
 pub fn door_key(i: usize) -> &'static str {
     DOORS[i.min(6)]
+}
+
+/// (v179) Essences de bois récentes qui ont leurs planches, escaliers, dalles et clôture
+/// (et, sauf le bambou, leurs bûches et leurs feuilles) : nom de Minecraft.
+pub const NEW_WOODS: [&str; 6] = [
+    "mangrove", "cherry", "bamboo", "crimson", "warped", "pale_oak",
+];
+
+/// (v179) Texture du pack `n` si le pack l'a, sinon `fallback`.
+fn or(n: &'static str, fallback: TexSrc) -> TexSrc {
+    TexSrc::Or(n, Box::new(fallback))
+}
+
+/// Nom de texture fait à l'exécution, gardé pour toujours (registre construit une fois).
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// (v179) Blocs récents des cartes importées (Minecraft 1.17 et après) qui n'avaient pas
+/// d'équivalent et devenaient un bloc approché (ardoise des abîmes en andésite claire, mousse
+/// en herbe, cuivre en béton orange…) : ardoise des abîmes, tuf, roche noire, boue, cuivre,
+/// basalte, mousse, calcite, coraux, champignons géants, bambou, grenouillères, ateliers,
+/// feu de camp, lichen, nouvelles essences de bois, lumières invisibles, et les murets des
+/// pierres qui n'en avaient pas. Chacun prend la texture du pack s'il l'a, sinon une texture
+/// proche teintée ou une couleur. Ajoutés à la fin : les numéros d'avant ne bougent pas.
+fn recent_blocks(b: &mut Builder) {
+    let tint = |n: &'static str, c: [u8; 3]| TexSrc::Tint(n, c);
+    // Bloc plein, avec ses dalles et escaliers (`shapes`) et son muret (`wall`).
+    let material = |b: &mut Builder, m: &Mat, shapes: bool, wall: bool| {
+        b.cube(m, SOLID);
+        if shapes {
+            b.shapes(m);
+        }
+        if wall {
+            b.add(
+                format!("wall_{}", m.key),
+                format!("muret de {}", m.name),
+                Shape::Post(PostKind::Wall),
+                &m.tex,
+                PART,
+            );
+        }
+    };
+    let lit = |props: Props, c: [u8; 3]| Props {
+        light: Some(c),
+        ..props
+    };
+
+    // Ardoise des abîmes.
+    let deep = [100, 100, 108];
+    material(
+        b,
+        &mat(
+            "deepslate",
+            "ardoise des abîmes",
+            or("deepslate_top", tint("stone", deep)),
+            or("deepslate", tint("stone", deep)),
+            or("deepslate_top", tint("stone", deep)),
+        ),
+        false,
+        false,
+    );
+    for (k, n, fallback, shapes) in [
+        (
+            "cobbled_deepslate",
+            "pierre d'ardoise des abîmes",
+            tint("cobblestone", [110, 110, 118]),
+            true,
+        ),
+        (
+            "polished_deepslate",
+            "ardoise des abîmes polie",
+            tint("stone_andesite_smooth", [96, 96, 104]),
+            true,
+        ),
+        (
+            "deepslate_bricks",
+            "briques d'ardoise des abîmes",
+            tint("stonebrick", [104, 104, 112]),
+            true,
+        ),
+        (
+            "deepslate_tiles",
+            "carreaux d'ardoise des abîmes",
+            tint("stonebrick", [88, 88, 94]),
+            true,
+        ),
+        (
+            "cracked_deepslate_bricks",
+            "briques d'ardoise des abîmes fissurées",
+            tint("stonebrick_cracked", [104, 104, 112]),
+            false,
+        ),
+        (
+            "cracked_deepslate_tiles",
+            "carreaux d'ardoise des abîmes fissurés",
+            tint("stonebrick_cracked", [88, 88, 94]),
+            false,
+        ),
+        (
+            "chiseled_deepslate",
+            "ardoise des abîmes sculptée",
+            tint("stonebrick_carved", [96, 96, 104]),
+            false,
+        ),
+    ] {
+        material(b, &mat1(k, n, or(k, fallback)), shapes, shapes);
+    }
+    let reinforced = tint("stonebrick_carved", [80, 86, 84]);
+    material(
+        b,
+        &mat(
+            "reinforced_deepslate",
+            "ardoise des abîmes renforcée",
+            or("reinforced_deepslate_top", reinforced.clone()),
+            or("reinforced_deepslate_side", reinforced.clone()),
+            or("reinforced_deepslate_bottom", reinforced),
+        ),
+        false,
+        false,
+    );
+
+    // Tuf.
+    let tuff = [205, 206, 192];
+    for (k, n, fallback, shapes) in [
+        ("tuff", "tuf", tint("stone_andesite", tuff), true),
+        (
+            "polished_tuff",
+            "tuf poli",
+            tint("stone_andesite_smooth", tuff),
+            true,
+        ),
+        (
+            "tuff_bricks",
+            "briques de tuf",
+            tint("stonebrick", [175, 176, 162]),
+            true,
+        ),
+    ] {
+        material(b, &mat1(k, n, or(k, fallback)), shapes, shapes);
+    }
+    for (k, n, top) in [
+        ("chiseled_tuff", "tuf sculpté", "chiseled_tuff_top"),
+        (
+            "chiseled_tuff_bricks",
+            "briques de tuf sculptées",
+            "chiseled_tuff_bricks_top",
+        ),
+    ] {
+        let fallback = tint("stonebrick_carved", [175, 176, 162]);
+        let top = or(top, tint("stone_andesite_smooth", tuff));
+        material(
+            b,
+            &mat(k, n, top.clone(), or(k, fallback), top),
+            false,
+            false,
+        );
+    }
+
+    // Roche noire.
+    let black = [64, 58, 70];
+    let blackstone = or("blackstone", tint("cobblestone", black));
+    material(
+        b,
+        &mat(
+            "blackstone",
+            "roche noire",
+            or("blackstone_top", blackstone.clone()),
+            blackstone.clone(),
+            or("blackstone_top", blackstone),
+        ),
+        true,
+        true,
+    );
+    for (k, n, fallback, shapes) in [
+        (
+            "polished_blackstone",
+            "roche noire polie",
+            tint("stone_andesite_smooth", [70, 64, 76]),
+            true,
+        ),
+        (
+            "polished_blackstone_bricks",
+            "briques de roche noire polie",
+            tint("stonebrick", [76, 70, 82]),
+            true,
+        ),
+        (
+            "cracked_polished_blackstone_bricks",
+            "briques de roche noire polie fissurées",
+            tint("stonebrick_cracked", [76, 70, 82]),
+            false,
+        ),
+        (
+            "chiseled_polished_blackstone",
+            "roche noire polie sculptée",
+            tint("stonebrick_carved", [76, 70, 82]),
+            false,
+        ),
+        (
+            "gilded_blackstone",
+            "roche noire dorée",
+            tint("cobblestone", [96, 76, 52]),
+            false,
+        ),
+    ] {
+        material(b, &mat1(k, n, or(k, fallback)), shapes, shapes);
+    }
+
+    // Boue.
+    material(
+        b,
+        &mat1("mud", "boue", or("mud", tint("gravel", [120, 112, 116]))),
+        false,
+        false,
+    );
+    material(
+        b,
+        &mat1(
+            "packed_mud",
+            "boue compactée",
+            or("packed_mud", TexSrc::Flat([142, 107, 80])),
+        ),
+        false,
+        false,
+    );
+    material(
+        b,
+        &mat1(
+            "mud_bricks",
+            "briques de boue",
+            or("mud_bricks", tint("stonebrick", [230, 176, 134])),
+        ),
+        true,
+        true,
+    );
+
+    // Cuivre : quatre états (neuf, exposé, érodé, oxydé) ; le cuivre ciré est le même à
+    // l'œil.
+    for (prefix, fr, c) in [
+        ("", "", [192u8, 108, 80]),
+        ("exposed_", " exposé", [161, 125, 103]),
+        ("weathered_", " érodé", [109, 145, 107]),
+        ("oxidized_", " oxydé", [82, 162, 132]),
+    ] {
+        let bright = c.map(|v| (v as u32 * 115 / 100).min(255) as u8);
+        let block: &'static str = if prefix.is_empty() {
+            "copper_block"
+        } else {
+            leak(format!("{prefix}copper"))
+        };
+        material(
+            b,
+            &mat1(
+                block,
+                &format!("bloc de cuivre{fr}"),
+                or(block, tint("iron_block", bright)),
+            ),
+            false,
+            false,
+        );
+        let cut = leak(format!("{prefix}cut_copper"));
+        material(
+            b,
+            &mat1(
+                cut,
+                &format!("cuivre taillé{fr}"),
+                or(cut, tint("iron_block", bright)),
+            ),
+            true,
+            false,
+        );
+        let chiseled = leak(format!("{prefix}chiseled_copper"));
+        material(
+            b,
+            &mat1(
+                chiseled,
+                &format!("cuivre sculpté{fr}"),
+                or(chiseled, tint("stonebrick_carved", c)),
+            ),
+            false,
+            false,
+        );
+        // Grille : on voit à travers (comme le feuillage).
+        let grate = leak(format!("{prefix}copper_grate"));
+        b.cube(
+            &mat1(
+                grate,
+                &format!("grille de cuivre{fr}"),
+                or(grate, tint("iron_bars", bright)),
+            ),
+            FOLIAGE,
+        );
+    }
+    for (k, n, fallback) in [
+        (
+            "raw_copper_block",
+            "bloc de cuivre brut",
+            tint("iron_block", [210, 130, 100]),
+        ),
+        (
+            "raw_iron_block",
+            "bloc de fer brut",
+            TexSrc::Pack("iron_block"),
+        ),
+        (
+            "raw_gold_block",
+            "bloc d'or brut",
+            TexSrc::Pack("gold_block"),
+        ),
+    ] {
+        material(b, &mat1(k, n, or(k, fallback)), false, false);
+    }
+
+    // Basalte.
+    let basalt = tint("stone", [80, 80, 86]);
+    let (basalt_top, basalt_side) = (
+        or("basalt_top", basalt.clone()),
+        or("basalt_side", basalt.clone()),
+    );
+    material(
+        b,
+        &mat(
+            "basalt",
+            "basalte",
+            basalt_top.clone(),
+            basalt_side.clone(),
+            basalt_top.clone(),
+        ),
+        false,
+        false,
+    );
+    material(
+        b,
+        &mat(
+            "polished_basalt",
+            "basalte poli",
+            or("polished_basalt_top", basalt_top.clone()),
+            or("polished_basalt_side", basalt_side),
+            or("polished_basalt_top", basalt_top),
+        ),
+        false,
+        false,
+    );
+    material(
+        b,
+        &mat1(
+            "smooth_basalt",
+            "basalte lisse",
+            or("smooth_basalt", tint("stone", [84, 84, 90])),
+        ),
+        false,
+        false,
+    );
+
+    // Mousse (blocs et tapis).
+    let moss = or("moss_block", TexSrc::Flat([89, 109, 45]));
+    let pale_moss = or("pale_moss_block", TexSrc::Flat([107, 114, 104]));
+    material(
+        b,
+        &mat1("moss_block", "bloc de mousse", moss.clone()),
+        false,
+        false,
+    );
+    material(
+        b,
+        &mat1("pale_moss_block", "bloc de mousse pâle", pale_moss.clone()),
+        false,
+        false,
+    );
+    for (k, n, t) in [
+        ("moss_carpet", "tapis de mousse", moss),
+        ("pale_moss_carpet", "tapis de mousse pâle", pale_moss),
+    ] {
+        b.add(
+            k.into(),
+            n.into(),
+            Shape::Panel {
+                side: 3,
+                thick: 1,
+                y0: 0,
+                y1: 16,
+            },
+            &t3(t),
+            DECOR,
+        );
+    }
+
+    // Pierres et minéraux.
+    let amethyst = or("amethyst_block", TexSrc::Flat([133, 97, 191]));
+    for (k, n, t) in [
+        (
+            "calcite",
+            "calcite",
+            or("calcite", TexSrc::Pack("stone_diorite_smooth")),
+        ),
+        (
+            "dripstone_block",
+            "bloc de spéléothème",
+            or("dripstone_block", TexSrc::Flat([134, 107, 92])),
+        ),
+        ("amethyst_block", "bloc d'améthyste", amethyst.clone()),
+        (
+            "budding_amethyst",
+            "améthyste bourgeonnante",
+            or("budding_amethyst", amethyst),
+        ),
+        (
+            "quartz_bricks",
+            "briques de quartz",
+            or("quartz_bricks", TexSrc::Pack("quartz_block_side")),
+        ),
+        (
+            "netherite_block",
+            "bloc de netherite",
+            or("netherite_block", tint("iron_block", [80, 72, 72])),
+        ),
+    ] {
+        material(b, &mat1(k, n, t), false, false);
+    }
+    let debris = tint("hellrock", [130, 110, 100]);
+    material(
+        b,
+        &mat(
+            "ancient_debris",
+            "débris antiques",
+            or("ancient_debris_top", debris.clone()),
+            or("ancient_debris_side", debris.clone()),
+            or("ancient_debris_top", debris),
+        ),
+        false,
+        false,
+    );
+    let lode = TexSrc::Pack("stonebrick_carved");
+    material(
+        b,
+        &mat(
+            "lodestone",
+            "magnétite",
+            or("lodestone_top", lode.clone()),
+            or("lodestone_side", lode.clone()),
+            or("lodestone_top", lode),
+        ),
+        false,
+        false,
+    );
+    b.add(
+        "tinted_glass".into(),
+        "verre teinté".into(),
+        Shape::Cube,
+        &t3(or("tinted_glass", TexSrc::Glass([44, 38, 52], 0))),
+        Props {
+            full: false,
+            cull_same: true,
+            translucent: true,
+            ..PART
+        },
+    );
+
+    // Blocs de corail (vivants et morts).
+    for (c, fr, rgb) in [
+        ("tube", "tubulaire", [49u8, 87, 206]),
+        ("brain", "cerveau", [207, 91, 159]),
+        ("bubble", "bulles", [165, 26, 162]),
+        ("fire", "de feu", [163, 35, 46]),
+        ("horn", "corné", [216, 199, 66]),
+    ] {
+        let alive = leak(format!("{c}_coral_block"));
+        let dead = leak(format!("dead_{c}_coral_block"));
+        let grey = [
+            (130 + rgb[0] as u32 / 16) as u8,
+            (123 + rgb[1] as u32 / 16) as u8,
+            (119 + rgb[2] as u32 / 16) as u8,
+        ];
+        material(
+            b,
+            &mat1(
+                alive,
+                &format!("bloc de corail {fr}"),
+                or(alive, TexSrc::Flat(rgb)),
+            ),
+            false,
+            false,
+        );
+        material(
+            b,
+            &mat1(
+                dead,
+                &format!("bloc de corail {fr} mort"),
+                or(dead, TexSrc::Flat(grey)),
+            ),
+            false,
+            false,
+        );
+    }
+
+    // Champignons géants.
+    for (k, n, rgb) in [
+        (
+            "brown_mushroom_block",
+            "bloc de champignon brun",
+            [149u8, 111, 81],
+        ),
+        (
+            "red_mushroom_block",
+            "bloc de champignon rouge",
+            [200, 46, 45],
+        ),
+        ("mushroom_stem", "pied de champignon", [203, 196, 185]),
+    ] {
+        material(b, &mat1(k, n, or(k, TexSrc::Flat(rgb))), false, false);
+    }
+
+    // Bambou.
+    let bamboo = tint("hay_block_side", [170, 200, 110]);
+    material(
+        b,
+        &mat(
+            "bamboo_block",
+            "bloc de bambou",
+            or("bamboo_block_top", TexSrc::Pack("hay_block_top")),
+            or("bamboo_block", bamboo.clone()),
+            or("bamboo_block_top", TexSrc::Pack("hay_block_top")),
+        ),
+        false,
+        false,
+    );
+    material(
+        b,
+        &mat(
+            "stripped_bamboo_block",
+            "bloc de bambou écorcé",
+            or("stripped_bamboo_block_top", TexSrc::Pack("hay_block_top")),
+            or("stripped_bamboo_block", TexSrc::Pack("hay_block_side")),
+            or("stripped_bamboo_block_top", TexSrc::Pack("hay_block_top")),
+        ),
+        false,
+        false,
+    );
+    material(
+        b,
+        &mat1(
+            "bamboo_mosaic",
+            "mosaïque de bambou",
+            or("bamboo_mosaic", tint("planks_birch", [252, 247, 166])),
+        ),
+        true,
+        false,
+    );
+
+    // Grenouillères (lumière).
+    for (k, n, rgb, light) in [
+        (
+            "ochre_froglight",
+            "grenouillère ocre",
+            [251u8, 245, 207],
+            [255u8, 236, 170],
+        ),
+        (
+            "verdant_froglight",
+            "grenouillère verdoyante",
+            [229, 244, 228],
+            [200, 255, 200],
+        ),
+        (
+            "pearlescent_froglight",
+            "grenouillère perlée",
+            [246, 232, 240],
+            [255, 214, 240],
+        ),
+    ] {
+        let top = or(leak(format!("{k}_top")), TexSrc::Flat(rgb));
+        let side = or(leak(format!("{k}_side")), TexSrc::Flat(rgb));
+        b.cube(&mat(k, n, top.clone(), side, top), lit(SOLID, light));
+    }
+
+    // Ateliers et ruches.
+    for (k, n, top, side, bottom, wood) in [
+        (
+            "loom",
+            "métier à tisser",
+            "loom_top",
+            "loom_front",
+            "loom_bottom",
+            "planks_oak",
+        ),
+        (
+            "composter",
+            "composteur",
+            "composter_top",
+            "composter_side",
+            "composter_bottom",
+            "planks_oak",
+        ),
+        (
+            "fletching_table",
+            "table d'archerie",
+            "fletching_table_top",
+            "fletching_table_front",
+            "planks_birch",
+            "planks_birch",
+        ),
+        (
+            "cartography_table",
+            "table de cartographie",
+            "cartography_table_top",
+            "cartography_table_side1",
+            "planks_big_oak",
+            "planks_big_oak",
+        ),
+        (
+            "smithing_table",
+            "table de forgeron",
+            "smithing_table_top",
+            "smithing_table_front",
+            "smithing_table_bottom",
+            "planks_big_oak",
+        ),
+        (
+            "beehive",
+            "ruche",
+            "beehive_end",
+            "beehive_front",
+            "beehive_end",
+            "planks_birch",
+        ),
+        (
+            "bee_nest",
+            "nid d'abeilles",
+            "bee_nest_top",
+            "bee_nest_front",
+            "bee_nest_bottom",
+            "planks_birch",
+        ),
+        (
+            "target",
+            "cible",
+            "target_top",
+            "target_side",
+            "target_top",
+            "hay_block_side",
+        ),
+    ] {
+        let w = TexSrc::Pack(wood);
+        let bottom = if bottom.starts_with("planks") {
+            w.clone()
+        } else {
+            or(bottom, w.clone())
+        };
+        b.cube(&mat(k, n, or(top, w.clone()), or(side, w), bottom), SOLID);
+    }
+
+    // Feu de camp : bûches basses (7 seizièmes), qui éclairent quand il brûle.
+    let camp = [
+        or("campfire_log_lit", TexSrc::Pack("log_oak")),
+        or("campfire_log", TexSrc::Pack("log_oak")),
+        TexSrc::Pack("log_oak_top"),
+    ];
+    let low = Shape::Panel {
+        side: 3,
+        thick: 7,
+        y0: 0,
+        y1: 16,
+    };
+    b.add(
+        "campfire".into(),
+        "feu de camp".into(),
+        low,
+        &camp,
+        lit(PART, [255, 170, 80]),
+    );
+    b.add(
+        "campfire:off".into(),
+        "feu de camp éteint".into(),
+        low,
+        &[
+            or("campfire_log", TexSrc::Pack("log_oak")),
+            or("campfire_log", TexSrc::Pack("log_oak")),
+            TexSrc::Pack("log_oak_top"),
+        ],
+        PART,
+    );
+
+    // Nouvelles essences : planches (escaliers, dalles, clôture), bûches debout et
+    // couchées (écorcées aussi), bois (écorce sur toutes les faces), feuilles.
+    for (w, fr, planks) in [
+        (
+            "mangrove",
+            "palétuvier",
+            tint("planks_oak", [184, 105, 157]),
+        ),
+        ("cherry", "cerisier", TexSrc::Flat([226, 178, 172])),
+        ("bamboo", "bambou", tint("planks_birch", [252, 247, 166])),
+        ("crimson", "carmin", tint("planks_oak", [159, 93, 229])),
+        ("warped", "biscornu", tint("planks_oak", [68, 203, 255])),
+        ("pale_oak", "chêne pâle", TexSrc::Flat([228, 217, 213])),
+    ] {
+        let planks = or(leak(format!("{w}_planks")), planks);
+        let m = mat1(
+            leak(format!("planks_{w}")),
+            &format!("planches de {fr}"),
+            planks.clone(),
+        );
+        material(b, &m, true, false);
+        b.add(
+            format!("fence_{w}"),
+            format!("clôture de {fr}"),
+            Shape::Post(PostKind::Fence),
+            &t3(planks.clone()),
+            PART,
+        );
+        if w == "bamboo" {
+            continue;
+        }
+        // Tiges (carmin, biscornu) au lieu de bûches, hyphes au lieu de bois.
+        let log = if matches!(w, "crimson" | "warped") {
+            "stem"
+        } else {
+            "log"
+        };
+        let (bark_tint, top_tint) = match w {
+            "mangrove" => ([150, 120, 110], [200, 120, 110]),
+            "cherry" => ([110, 80, 100], [230, 170, 170]),
+            "crimson" => ([200, 80, 110], [200, 90, 120]),
+            "warped" => ([110, 170, 170], [90, 190, 190]),
+            _ => ([200, 190, 190], [235, 225, 220]),
+        };
+        let bark = or(leak(format!("{w}_{log}")), tint("log_oak", bark_tint));
+        let top = or(
+            leak(format!("{w}_{log}_top")),
+            tint("log_oak_top", top_tint),
+        );
+        let stripped_bark = or(leak(format!("stripped_{w}_{log}")), planks.clone());
+        let stripped_top = or(leak(format!("stripped_{w}_{log}_top")), planks.clone());
+        for (key, side, end) in [
+            (format!("log_{w}"), &bark, &top),
+            (format!("log_stripped_{w}"), &stripped_bark, &stripped_top),
+        ] {
+            let name = if key.contains("stripped") {
+                format!("bûche de {fr} écorcée")
+            } else {
+                format!("bûche de {fr}")
+            };
+            for axis in ["", ":x", ":z"] {
+                b.add(
+                    format!("{key}{axis}"),
+                    name.clone(),
+                    Shape::Cube,
+                    &[end.clone(), side.clone(), end.clone()],
+                    SOLID,
+                );
+            }
+        }
+        b.add(
+            format!("wood_{w}"),
+            format!("bois de {fr}"),
+            Shape::Cube,
+            &t3(bark),
+            SOLID,
+        );
+        b.add(
+            format!("wood_stripped_{w}"),
+            format!("bois de {fr} écorcé"),
+            Shape::Cube,
+            &t3(stripped_bark),
+            SOLID,
+        );
+    }
+    for (k, n, t) in [
+        (
+            "leaves_mangrove",
+            "feuilles de palétuvier",
+            or("mangrove_leaves", TexSrc::Pack("leaves_oak")),
+        ),
+        (
+            "leaves_cherry",
+            "feuilles de cerisier",
+            or("cherry_leaves", TexSrc::Flat([234, 173, 197])),
+        ),
+        (
+            "leaves_pale_oak",
+            "feuilles de chêne pâle",
+            or("pale_oak_leaves", TexSrc::Flat([106, 117, 105])),
+        ),
+        (
+            "leaves_azalea",
+            "feuilles d'azalée",
+            or("azalea_leaves", TexSrc::Pack("leaves_oak")),
+        ),
+        (
+            "leaves_flowering_azalea",
+            "feuilles d'azalée fleurie",
+            or("flowering_azalea_leaves", TexSrc::Pack("leaves_oak")),
+        ),
+    ] {
+        b.cube(&mat1(k, n, t), FOLIAGE);
+    }
+
+    // Lichen lumineux et résine : plaques fines contre une face (6 côtés : 0 +X, 1 −X,
+    // 2 plafond, 3 sol, 4 +Z, 5 −Z), comme les lianes.
+    for (k, n, t, light) in [
+        (
+            "glow_lichen",
+            "lichen lumineux",
+            or("glow_lichen", tint("vine", [200, 230, 210])),
+            Some([26u8, 32, 30]),
+        ),
+        (
+            "resin_clump",
+            "amas de résine",
+            or("resin_clump", tint("web", [255, 150, 60])),
+            None,
+        ),
+    ] {
+        for side in 0u8..6 {
+            b.add(
+                format!("{k}:{side}"),
+                n.into(),
+                Shape::Panel {
+                    side,
+                    thick: 1,
+                    y0: 0,
+                    y1: 16,
+                },
+                &t3(t.clone()),
+                Props { light, ..DECOR },
+            );
+        }
+    }
+    // Plantes en croix.
+    for (k, fallback) in [
+        ("pale_hanging_moss", tint("vine", [150, 160, 150])),
+        ("hanging_roots", TexSrc::Pack("deadbush")),
+        ("firefly_bush", TexSrc::Pack("deadbush")),
+    ] {
+        b.add(
+            format!("plant:{k}"),
+            "plante".into(),
+            Shape::Cross,
+            &t3(or(k, fallback)),
+            DECOR,
+        );
+    }
+    // Tapis de feuilles et de fleurs, à plat sur le sol.
+    for (k, n, fallback) in [
+        (
+            "leaf_litter",
+            "litière de feuilles",
+            TexSrc::Pack("deadbush"),
+        ),
+        (
+            "pink_petals",
+            "pétales roses",
+            TexSrc::Pack("flower_tulip_pink"),
+        ),
+        (
+            "wildflowers",
+            "fleurs sauvages",
+            TexSrc::Pack("flower_dandelion"),
+        ),
+    ] {
+        b.add(
+            k.into(),
+            n.into(),
+            Shape::Panel {
+                side: 3,
+                thick: 1,
+                y0: 0,
+                y1: 16,
+            },
+            &t3(or(k, fallback)),
+            DECOR,
+        );
+    }
+    // Paratonnerre : tige fine debout, ou couchée le long de X ou de Z.
+    let rod = or("lightning_rod", tint("iron_block", [210, 125, 95]));
+    for (k, min, max) in [
+        ("lightning_rod", [7u8, 0, 7], [9u8, 16, 9]),
+        ("lightning_rod:x", [0, 7, 7], [16, 9, 9]),
+        ("lightning_rod:z", [7, 7, 0], [9, 9, 16]),
+    ] {
+        b.add(
+            k.into(),
+            "paratonnerre".into(),
+            Shape::Box { min, max },
+            &t3(rod.clone()),
+            PART,
+        );
+    }
+    // Lumière invisible des cartes (niveau de Minecraft regroupé en 4, 8, 12, 15) : on la
+    // traverse et on ne la vise pas.
+    // Pas de texture, comme la barrière.
+    let air = TexSrc::Flat([0, 0, 0]);
+    for level in [4u8, 8, 12, 15] {
+        let v = (4.0 * (4.0f32 / 3.0).powi(level as i32)).min(255.0);
+        let rgb = [v as u8, (v * 0.96) as u8, (v * 0.9) as u8];
+        b.add(
+            format!("light:{level}"),
+            "lumière".into(),
+            Shape::Invisible,
+            &t3(air.clone()),
+            Props {
+                full: false,
+                solid: false,
+                target: false,
+                cull_same: false,
+                light: Some(rgb),
+                translucent: false,
+            },
+        );
+    }
+
+    // Murets des pierres qui n'en avaient pas (les cartes les mettaient en muret de pierre).
+    for m in [
+        "stone_granite",
+        "stone_diorite",
+        "stone_andesite",
+        "stonebrick",
+        "stonebrick_mossy",
+        "brick",
+        "sandstone",
+        "red_sandstone",
+        "nether_brick",
+        "red_nether_brick",
+        "end_bricks",
+        "prismarine",
+    ] {
+        let Some(&i) = b.r.keys.get(m) else {
+            continue;
+        };
+        let d = b.r.defs[i as usize].clone();
+        let tex = d.tex.map(|t| b.r.textures[t as usize].clone());
+        b.add(
+            format!("wall_{m}"),
+            format!("muret de {}", d.name),
+            Shape::Post(PostKind::Wall),
+            &tex,
+            PART,
+        );
+    }
 }
 
 #[cfg(test)]

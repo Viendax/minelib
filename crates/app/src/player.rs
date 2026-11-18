@@ -354,7 +354,46 @@ impl Player {
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
         let h = Vec3::new(HALF_WIDTH, 0.0, HALF_WIDTH);
-        (self.pos - h, self.pos + h + Vec3::Y * HEIGHT)
+        (self.pos - h, self.pos + h + Vec3::Y * self.height())
+    }
+
+    /// (v179) Hauteur de la boîte du joueur : 1,8 bloc debout, 1,5 accroupi (la tête
+    /// descend avec les yeux), dans tous les modes : accroupi, on passe sous 1,5 bloc.
+    pub fn height(&self) -> f32 {
+        HEIGHT - CROUCH_DROP * self.crouch.clamp(0.0, 1.0)
+    }
+
+    /// (v179) Place libre au-dessus des pieds (au plus `HEIGHT`) : jusqu'au premier bloc ou
+    /// écran au-dessus d'eux, dans l'emprise du joueur. Sous un plafond bas, on reste
+    /// accroupi tant qu'elle manque pour se relever.
+    fn headroom(&self, world: &World) -> f32 {
+        let h = Vec3::new(HALF_WIDTH, 0.0, HALF_WIDTH);
+        let (pmin, pmax) = (self.pos - h, self.pos + h + Vec3::Y * HEIGHT);
+        let mut top = pmax.y;
+        let mut consider = |bmin: Vec3, bmax: Vec3| {
+            let side = [0, 2]
+                .into_iter()
+                .all(|k| pmin[k] < bmax[k] - TOUCH && pmax[k] > bmin[k] + TOUCH);
+            // Au-dessus des pieds : pas le sol, ni ce sur quoi l'on se tient.
+            if side && bmin.y > self.pos.y + TOUCH && bmin.y < top {
+                top = bmin.y;
+            }
+        };
+        let lo = pmin.floor().as_ivec3();
+        let hi = (pmax - Vec3::splat(TOUCH)).floor().as_ivec3();
+        for y in lo.y..=hi.y {
+            for z in lo.z..=hi.z {
+                for x in lo.x..=hi.x {
+                    for (bmin, bmax) in collision_boxes(world, x, y, z) {
+                        consider(bmin, bmax);
+                    }
+                }
+            }
+        }
+        for &(bmin, bmax) in &self.solids {
+            consider(bmin, bmax);
+        }
+        top - self.pos.y
     }
 
     /// Échelle (ou liane, même physique) touchée (côté du mur où elle est accrochée : 0 +X, 1 −X, 4 +Z, 5 −Z) : il
@@ -448,6 +487,14 @@ impl Player {
         let target = if crouching { 1.0 } else { 0.0 };
         let crouch_before = self.crouch;
         self.crouch += (target - self.crouch) * (dt * duck_rate).min(1.0);
+        // (v179) Se relever sous un plafond bas : on reste accroupi tant que la place
+        // manque (accroupi, la boîte fait 1,5 bloc). En l'air en mode FPS, ce sont les
+        // jambes qui se déplient (plus bas).
+        if self.crouch < crouch_before && !self.noclip && (self.on_ground || !fps) {
+            let room = self.headroom(world);
+            let need = ((HEIGHT - room) / CROUCH_DROP).clamp(0.0, 1.0);
+            self.crouch = self.crouch.max(need.min(crouch_before));
+        }
         // Saut accroupi (mode FPS) : s'accroupir en l'air replie les jambes, les pieds
         // montent d'autant que la vue descend (la vue ne bouge pas) ; se relever en l'air
         // les redescend. Saut (1,45 bloc) + jambes repliées : on atteint 1,5 bloc.
@@ -991,7 +1038,7 @@ impl Player {
         let lo = min.min(bmin0).floor().as_ivec3();
         let hi = (max.max(bmax0) - Vec3::splat(TOUCH)).floor().as_ivec3();
         let (below, above) = if axis == 1 {
-            (0.0, HEIGHT)
+            (0.0, self.height())
         } else {
             (HALF_WIDTH, HALF_WIDTH)
         };
@@ -2012,6 +2059,86 @@ mod tests {
             p.pos.z = 8.5;
         }
         assert!(p.ground_speed() < hopped * 0.5);
+    }
+
+    /// (v179) Accroupi, on passe sous 1,5 bloc (dans tous les modes) ; debout, non ; et
+    /// dessous, on ne se relève pas tant que la place manque.
+    #[test]
+    fn crouching_passes_under_one_and_a_half_blocks() {
+        let mut w = flat_world();
+        let top_slab = minelib_world::registry::registry()
+            .by_key("slab:stone:top")
+            .unwrap();
+        // Plafond à 12,5 (dalles du haut en y = 12) au-dessus de z = 0..6 : 1,5 bloc de
+        // place au-dessus du sol (11).
+        for z in 0..6 {
+            for x in 0..16 {
+                w.set(x, 12, z, top_slab);
+            }
+        }
+        for fps in [false, true] {
+            // Regard vers −z (lacet nul) : vers le passage.
+            let mut p = Player::new(Vec3::new(8.5, 11.0, 7.5));
+            p.yaw = 0.0;
+            let walk = MoveInput {
+                forward: 1.0,
+                fps,
+                ..Default::default()
+            };
+            for _ in 0..ticks(256) {
+                p.update(&w, &walk, TICK);
+            }
+            assert!(
+                p.pos.z >= 6.0 + HALF_WIDTH - 1e-3,
+                "debout, on passe ({fps}) : {}",
+                p.pos.z
+            );
+            let duck = MoveInput {
+                sneak: true,
+                ..walk
+            };
+            for _ in 0..ticks(512) {
+                p.update(&w, &duck, TICK);
+            }
+            assert!(
+                p.pos.z < 5.0,
+                "accroupi, on ne passe pas ({fps}) : {}",
+                p.pos.z
+            );
+            assert!(p.pos.y + p.height() <= 12.5 + 1e-3);
+            // Sous le plafond, sans s'accroupir : on reste accroupi.
+            let stand = MoveInput {
+                fps,
+                ..Default::default()
+            };
+            for _ in 0..ticks(128) {
+                p.update(&w, &stand, TICK);
+            }
+            assert!(
+                p.crouch > 0.99,
+                "relevé sous le plafond ({fps}) : {}",
+                p.crouch
+            );
+            assert!(p.pos.y + p.height() <= 12.5 + 1e-3);
+            // Ressorti du passage (en reculant), on se relève.
+            let back = MoveInput {
+                forward: -1.0,
+                fps,
+                ..Default::default()
+            };
+            for _ in 0..ticks(1024) {
+                p.update(&w, &back, TICK);
+            }
+            assert!(p.pos.z > 6.3, "ressorti ({fps}) : {}", p.pos.z);
+            for _ in 0..ticks(128) {
+                p.update(&w, &stand, TICK);
+            }
+            assert!(
+                p.crouch < 0.01,
+                "toujours accroupi dehors ({fps}) : {}",
+                p.crouch
+            );
+        }
     }
 
     #[test]

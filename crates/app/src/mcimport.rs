@@ -277,9 +277,207 @@ pub fn read_level(dir: &Path) -> Result<McLevel> {
 
 /// Bloc Minelib pour un état de bloc moderne (1.13+) : nom + propriétés.
 pub fn map_block_state(full: &str, props: &HashMap<String, String>) -> BlockId {
-    recent_block(full)
+    added_block(full, props)
+        .or_else(|| recent_block(full))
         .or_else(|| modern_block(full, props))
         .unwrap_or_else(|| map_block_name(full))
+}
+
+/// (v179) Blocs récents qui ont maintenant leur bloc dans Minelib (`recent_blocks` du
+/// registre) ; avant, `recent_block` les approchait (ardoise des abîmes en andésite claire,
+/// mousse en herbe, cuivre en béton orange, lumières des cartes en vide…).
+fn added_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> {
+    let reg = registry::registry();
+    let n = full.strip_prefix("minecraft:").unwrap_or(full);
+    // Cuivre ciré : le même à l'œil.
+    let n = n.strip_prefix("waxed_").unwrap_or(n);
+    let prop = |k: &str| props.get(k).map(String::as_str);
+    let key = |k: &str| reg.by_key(k);
+    // Escaliers, dalles et murets : formes de `modern_block`, qui connaît les nouveaux
+    // matériaux (`modern_material`) ; le cuivre n'y passait pas (`recent_block` le prenait
+    // avant).
+    if n.ends_with("_stairs") || n.ends_with("_slab") || n.ends_with("_wall") {
+        return modern_block(&format!("minecraft:{n}"), props);
+    }
+    // Côté d'un bloc posé contre une face (lichen, résine) : la première face occupée.
+    let face = || {
+        [
+            ("east", 0u8),
+            ("west", 1),
+            ("up", 2),
+            ("down", 3),
+            ("south", 4),
+            ("north", 5),
+        ]
+        .into_iter()
+        .find(|(k, _)| prop(k) == Some("true"))
+        .map_or(3, |(_, s)| s)
+    };
+    let axis = || match prop("axis") {
+        Some("x") => ":x",
+        Some("z") => ":z",
+        _ => "",
+    };
+    match n {
+        "deepslate"
+        | "infested_deepslate"
+        | "cobbled_deepslate"
+        | "polished_deepslate"
+        | "deepslate_bricks"
+        | "deepslate_tiles"
+        | "cracked_deepslate_bricks"
+        | "cracked_deepslate_tiles"
+        | "chiseled_deepslate"
+        | "reinforced_deepslate" => {
+            return key(n.strip_prefix("infested_").unwrap_or(n));
+        }
+        "tuff"
+        | "polished_tuff"
+        | "tuff_bricks"
+        | "chiseled_tuff"
+        | "chiseled_tuff_bricks"
+        | "blackstone"
+        | "polished_blackstone"
+        | "polished_blackstone_bricks"
+        | "cracked_polished_blackstone_bricks"
+        | "chiseled_polished_blackstone"
+        | "gilded_blackstone"
+        | "mud"
+        | "packed_mud"
+        | "mud_bricks"
+        | "raw_copper_block"
+        | "raw_iron_block"
+        | "raw_gold_block"
+        | "basalt"
+        | "polished_basalt"
+        | "smooth_basalt"
+        | "moss_block"
+        | "pale_moss_block"
+        | "moss_carpet"
+        | "pale_moss_carpet"
+        | "calcite"
+        | "dripstone_block"
+        | "amethyst_block"
+        | "budding_amethyst"
+        | "quartz_bricks"
+        | "netherite_block"
+        | "ancient_debris"
+        | "lodestone"
+        | "tinted_glass"
+        | "brown_mushroom_block"
+        | "red_mushroom_block"
+        | "mushroom_stem"
+        | "bamboo_block"
+        | "stripped_bamboo_block"
+        | "bamboo_mosaic"
+        | "ochre_froglight"
+        | "verdant_froglight"
+        | "pearlescent_froglight"
+        | "loom"
+        | "composter"
+        | "fletching_table"
+        | "cartography_table"
+        | "smithing_table"
+        | "beehive"
+        | "bee_nest"
+        | "target"
+        | "leaf_litter"
+        | "pink_petals"
+        | "wildflowers" => {
+            return key(n);
+        }
+        "campfire" | "soul_campfire" => {
+            return key(if prop("lit") == Some("false") {
+                "campfire:off"
+            } else {
+                "campfire"
+            });
+        }
+        "glow_lichen" | "resin_clump" => return key(&format!("{n}:{}", face())),
+        // Blocs de corail, vivants et morts.
+        _ if n.ends_with("_coral_block") => return key(n),
+        // Chaîne de cuivre : comme la chaîne de fer (debout, ou en barreaux couchée).
+        _ if n.ends_with("copper_chain") => return modern_block("minecraft:iron_chain", props),
+        "pale_hanging_moss" | "pale_hanging_moss_tip" | "hanging_roots" | "firefly_bush" => {
+            return key(&format!("plant:{}", n.strip_suffix("_tip").unwrap_or(n)));
+        }
+        // Azalée (buisson) : ses feuilles.
+        "azalea" | "azalea_leaves" => return key("leaves_azalea"),
+        "flowering_azalea" | "flowering_azalea_leaves" => return key("leaves_flowering_azalea"),
+        // Cœur de grinceur : une bûche de chêne pâle.
+        "creaking_heart" => return key(&format!("log_pale_oak{}", axis())),
+        // Feu : rien (il ne se garde pas dans le monde), pas de la pierre.
+        "fire" | "soul_fire" => return Some(BlockId::AIR),
+        // Cornichons de mer : l'eau (ou le vide) où ils sont posés.
+        "sea_pickle" => {
+            return Some(if prop("waterlogged") == Some("true") {
+                registry::Fluid::Water.block(registry::FLUID_SOURCE)
+            } else {
+                BlockId::AIR
+            });
+        }
+        // Lumière invisible des cartes : niveau de Minecraft regroupé en 4, 8, 12, 15.
+        "light" => {
+            let level: u8 = prop("level").and_then(|l| l.parse().ok()).unwrap_or(15);
+            return match level {
+                0 => Some(BlockId::AIR),
+                1..=5 => key("light:4"),
+                6..=9 => key("light:8"),
+                10..=13 => key("light:12"),
+                _ => key("light:15"),
+            };
+        }
+        _ => {}
+    }
+    // Cuivre : bloc, taillé, sculpté, grille, pour ses quatre états.
+    for stage in ["", "exposed_", "weathered_", "oxidized_"] {
+        let Some(rest) = n.strip_prefix(stage) else {
+            continue;
+        };
+        let k = match rest {
+            "copper_block" if stage.is_empty() => "copper_block".to_string(),
+            "copper" if !stage.is_empty() => format!("{stage}copper"),
+            "cut_copper" | "chiseled_copper" | "copper_grate" => format!("{stage}{rest}"),
+            "lightning_rod" => {
+                let k = match prop("facing") {
+                    Some("east" | "west") => "lightning_rod:x",
+                    Some("north" | "south") => "lightning_rod:z",
+                    _ => "lightning_rod",
+                };
+                return key(k);
+            }
+            _ => continue,
+        };
+        return key(&k);
+    }
+    // Nouvelles essences : planches, clôtures, bûches (tiges), bois (hyphes), feuilles.
+    for w in registry::NEW_WOODS {
+        let Some(rest) = n
+            .strip_prefix("stripped_")
+            .unwrap_or(n)
+            .strip_prefix(w)
+            .and_then(|r| r.strip_prefix('_'))
+        else {
+            continue;
+        };
+        let stripped = if n.starts_with("stripped_") {
+            "stripped_"
+        } else {
+            ""
+        };
+        let k = match rest {
+            "planks" => format!("planks_{w}"),
+            "fence" | "fence_gate" => format!("fence_{w}"),
+            "log" | "stem" => format!("log_{stripped}{w}{}", axis()),
+            "wood" | "hyphae" => format!("wood_{stripped}{w}"),
+            "leaves" => format!("leaves_{w}"),
+            _ => continue,
+        };
+        if let Some(b) = key(&k) {
+            return Some(b);
+        }
+    }
+    None
 }
 
 /// Blocs récents de Minecraft (1.17 et après) sans équivalent exact : le bloc de Minelib
@@ -395,17 +593,40 @@ const MODERN_DYES: [&str; 16] = [
 /// Matériau Minelib pour un préfixe moderne (`stone_brick` dans `stone_brick_stairs`).
 fn modern_material(m: &str) -> &'static str {
     match m {
-        "oak" | "spruce" | "birch" | "jungle" | "acacia" | "dark_oak" | "mangrove" | "cherry"
-        | "bamboo" | "crimson" | "warped" | "pale_oak" | "petrified_oak" => {
+        // (v179) Nouvelles essences : leurs propres planches.
+        "mangrove" => "planks_mangrove",
+        "cherry" => "planks_cherry",
+        "bamboo" => "planks_bamboo",
+        "crimson" => "planks_crimson",
+        "warped" => "planks_warped",
+        "pale_oak" => "planks_pale_oak",
+        "oak" | "spruce" | "birch" | "jungle" | "acacia" | "dark_oak" | "petrified_oak" => {
             registry::planks_key(registry::wood_index(m))
         }
         "stone" => "stone",
         "smooth_stone" => "smooth_stone",
-        "cobblestone" | "cobbled_deepslate" => "cobblestone",
+        "cobblestone" => "cobblestone",
+        // (v179) Ardoise des abîmes, tuf, roche noire, boue, cuivre, bambou : leurs blocs.
+        "cobbled_deepslate" => "cobbled_deepslate",
+        "polished_deepslate" => "polished_deepslate",
+        "deepslate_brick" => "deepslate_bricks",
+        "deepslate_tile" => "deepslate_tiles",
+        "tuff" => "tuff",
+        "polished_tuff" => "polished_tuff",
+        "tuff_brick" => "tuff_bricks",
+        "blackstone" => "blackstone",
+        "polished_blackstone" => "polished_blackstone",
+        "polished_blackstone_brick" => "polished_blackstone_bricks",
+        "mud_brick" => "mud_bricks",
+        "cut_copper" => "cut_copper",
+        "exposed_cut_copper" => "exposed_cut_copper",
+        "weathered_cut_copper" => "weathered_cut_copper",
+        "oxidized_cut_copper" => "oxidized_cut_copper",
+        "bamboo_mosaic" => "bamboo_mosaic",
         "mossy_cobblestone" => "cobblestone_mossy",
-        "stone_brick" | "deepslate_brick" | "deepslate_tile" | "tuff_brick" => "stonebrick",
+        "stone_brick" => "stonebrick",
         "mossy_stone_brick" => "stonebrick_mossy",
-        "brick" | "mud_brick" => "brick",
+        "brick" => "brick",
         "sandstone" => "sandstone",
         "smooth_sandstone" | "cut_sandstone" => "sandstone_smooth",
         "red_sandstone" => "red_sandstone",
@@ -421,10 +642,9 @@ fn modern_material(m: &str) -> &'static str {
         "polished_granite" => "stone_granite_smooth",
         "diorite" => "stone_diorite",
         "polished_diorite" => "stone_diorite_smooth",
-        "andesite" | "tuff" | "polished_tuff" => "stone_andesite",
-        "polished_andesite" | "polished_deepslate" => "stone_andesite_smooth",
+        "andesite" => "stone_andesite",
+        "polished_andesite" => "stone_andesite_smooth",
         "end_stone_brick" => "end_bricks",
-        "blackstone" | "polished_blackstone" | "polished_blackstone_brick" => "coal_block",
         _ => "stone",
     }
 }
@@ -573,10 +793,16 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
         && !n.contains("head")
         && !n.contains("skull")
     {
-        return key(if n.contains("mossy") {
-            "wall_cobblestone_mossy"
-        } else {
-            "wall_cobblestone"
+        // (v179) Le muret de sa pierre quand il existe, sinon celui de pierre (moussu).
+        let own = n
+            .strip_suffix("_wall")
+            .and_then(|m| key(&format!("wall_{}", modern_material(m))));
+        return own.or_else(|| {
+            key(if n.contains("mossy") {
+                "wall_cobblestone_mossy"
+            } else {
+                "wall_cobblestone"
+            })
         });
     }
     if let Some(w) = n.strip_suffix("_door") {
@@ -869,8 +1095,9 @@ fn modern_block(full: &str, props: &HashMap<String, String>) -> Option<BlockId> 
 /// nouveau à son ouverture (2 : escaliers en coin intérieur → bloc plein ; 3 : blocs
 /// récents, au lieu de pierre ou de vide ; 4 : eau et lave qui coulent, têtes murales ; 5 : décors en entités
 /// d'affichage ; 11 : têtes au sol dans leurs 16 directions, têtes des porte-armures, des
-/// entités d'affichage et des cadres, têtes d'avant 1.13).
-pub const IMPORT_VERSION: u32 = 11;
+/// entités d'affichage et des cadres, têtes d'avant 1.13 ; 12 : blocs récents qui ont
+/// maintenant leur bloc, murets de chaque pierre, lumières invisibles des cartes).
+pub const IMPORT_VERSION: u32 = 12;
 
 /// Correspondance nom de bloc Minecraft → bloc Minelib (repli pour les noms inconnus).
 pub fn map_block_name(full: &str) -> BlockId {
@@ -2314,7 +2541,11 @@ pub mod tests {
     fn modern_chunk_converts_with_offset() {
         let c = convert_chunk(&modern_chunk(2, -1), 64).unwrap();
         assert_eq!(c.chunk.pos, ChunkPos { x: 2, z: -1 });
-        assert_eq!(c.chunk.get(0, 0, 0), BlockId::STONE); // deepslate à Y = −64
+        // Ardoise des abîmes à Y = −64 : (v179) son propre bloc.
+        assert_eq!(
+            c.chunk.get(0, 0, 0),
+            registry::registry().by_key("deepslate").unwrap()
+        );
         assert_eq!(c.chunk.get(5, 128, 9), BlockId::GRASS); // Y 64 → 128
         assert_eq!(c.chunk.get(3, 129, 4), BlockId::TORCH);
         assert_eq!(c.chunk.get(3, 130, 4), BlockId::AIR);
@@ -2885,7 +3116,9 @@ mod block_audit {
                 .filter_map(|kv| kv.split_once('='))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            let how = if recent_block(name).is_some() {
+            let how = if added_block(name, &props).is_some() {
+                "ajouté"
+            } else if recent_block(name).is_some() {
                 "proche"
             } else if modern_block(name, &props).is_some() {
                 "exact"

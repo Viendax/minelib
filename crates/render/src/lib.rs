@@ -1724,7 +1724,8 @@ impl Renderer {
             .filter_map(|t| match t {
                 minelib_world::registry::TexSrc::Pack(n)
                 | minelib_world::registry::TexSrc::Tint(n, _)
-                | minelib_world::registry::TexSrc::Banner(n, _) => Some(*n),
+                | minelib_world::registry::TexSrc::Banner(n, _)
+                | minelib_world::registry::TexSrc::Or(n, _) => Some(*n),
                 minelib_world::registry::TexSrc::Glass(_, _) => Some("glass"),
                 _ => None,
             })

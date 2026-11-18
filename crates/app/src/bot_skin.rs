@@ -762,7 +762,8 @@ mod tests {
     }
 
     /// Aperçu (lancé à la main) : `BOT_SKIN_PNG=fichier.png cargo test preview_bots --
-    /// --ignored` dessine six bots (trois T, trois CT) avec ce qu'ils peuvent tenir.
+    /// --ignored` dessine six bots (trois T, trois CT) avec ce qu'ils peuvent tenir, le
+    /// premier avec la bombe sur le dos.
     #[test]
     #[ignore]
     fn preview_bots() {
@@ -813,6 +814,10 @@ mod tests {
                 skin: Some(bot_skin(name, team)),
             };
             verts.extend(build(&pose));
+            // Le premier porte la bombe sur le dos.
+            if i == 0 {
+                verts.extend(crate::player_model::bomb_on_back(&pose));
+            }
         }
         let size = 1024;
         let cam: Vec<f32> = std::env::var("BOT_SKIN_CAM")

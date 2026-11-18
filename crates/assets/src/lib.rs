@@ -115,6 +115,10 @@ pub struct Options {
     pub volume_mic: f32,
     /// Volume du son des écrans vidéo (0..1).
     pub volume_screens: f32,
+    /// (v179) Menu du jeu ouvert : en solo, les vidéos des écrans se mettent en pause ; en
+    /// ligne, leur son est coupé tant que le menu est ouvert. Non par défaut : elles
+    /// continuent comme si de rien n'était.
+    pub mute_screens_menu: bool,
     /// Volume du tchat vocal entrant (0..2, 1 = tel quel).
     pub volume_voice: f32,
     /// Adresse du relais (comptes, liste des parties).
@@ -156,6 +160,7 @@ impl Default for Options {
             audio_in: String::new(),
             volume_mic: 1.0,
             volume_screens: 1.0,
+            mute_screens_menu: false,
             volume_voice: 1.0,
             relay: "auto".into(),
             garant: true,
@@ -224,6 +229,9 @@ impl Options {
             if let Some(v) = kv.get("volume_screens").and_then(|v| v.parse::<f32>().ok()) {
                 o.volume_screens = v.clamp(0.0, 1.0);
             }
+            if let Some(v) = kv.get("mute_screens_menu") {
+                o.mute_screens_menu = v == "true";
+            }
             if let Some(v) = kv.get("volume_voice").and_then(|v| v.parse::<f32>().ok()) {
                 o.volume_voice = v.clamp(0.0, 2.0);
             }
@@ -254,7 +262,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_screens={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_screens={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -269,7 +277,8 @@ impl Options {
                 self.garant,
                 self.sensitivity_fps,
                 self.fps_color,
-                self.language
+                self.language,
+                self.mute_screens_menu
             ),
         )?;
         Ok(())
@@ -602,6 +611,8 @@ fn biome_tint(name: &str) -> Option<[u8; 3]> {
         "leaves_spruce" | "leaves_spruce_opaque" => [97, 153, 97],
         "leaves_birch" | "leaves_birch_opaque" => [128, 167, 85],
         "water_still" | "water_flow" => WATER_TINT,
+        // (v179) Feuilles de palétuvier : grises dans les packs, teintées par le jeu.
+        "mangrove_leaves" => [141, 177, 39],
         n if n.starts_with("leaves_") || n == "vine" || n == "waterlily" => FOLIAGE_TINT,
         _ => return None,
     })

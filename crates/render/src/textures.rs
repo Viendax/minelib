@@ -52,6 +52,10 @@ pub fn resolve(pack: &ResourcePack, src: &TexSrc) -> Rgba {
             img.data.fill(0);
             img
         }),
+        // (v179) Bloc récent : sa texture si le pack l'a, sinon le repli (sans avertir).
+        TexSrc::Or(n, fallback) => pack
+            .block_image(n)
+            .unwrap_or_else(|| resolve(pack, fallback)),
     }
 }
 
@@ -421,7 +425,7 @@ pub fn build_gui_atlas(pack: &ResourcePack, font: &[u8]) -> GuiAtlas {
         |name: String, img: &Rgba, image: &mut Rgba, sprites: &mut HashMap<String, [u32; 4]>| {
             let Some((px, py)) = packer.place(img.width, img.height) else {
                 log::warn!("atlas d'interface plein, {name} ignoré");
-                return;
+                return false;
             };
             for y in 0..img.height {
                 let src = ((y * img.width) * 4) as usize;
@@ -430,37 +434,15 @@ pub fn build_gui_atlas(pack: &ResourcePack, font: &[u8]) -> GuiAtlas {
                     .copy_from_slice(&img.data[src..src + (img.width * 4) as usize]);
             }
             sprites.insert(name, [px, py, img.width, img.height]);
+            true
         };
 
     for name in GUI_SPRITES {
         let img = pack.gui_image(name).unwrap_or_else(|| Rgba::missing(16));
         add(format!("gui/{name}"), &img, &mut image, &mut sprites);
     }
-    // Icônes 3D (vue isométrique) de tous les blocs, peintes depuis leurs vraies faces et
-    // leur forme (dalles, escaliers, clôtures…) ; plantes : image plate.
-    let layers: Vec<Rgba> = registry()
-        .textures
-        .iter()
-        .map(|t| {
-            let img = resolve(pack, t);
-            if img.height > img.width {
-                crop(&img, img.width)
-            } else {
-                img
-            }
-        })
-        .collect();
-    for i in 1..registry().len() {
-        let block = BlockId(i as u16);
-        let icon = block_icon(block, &layers);
-        add(
-            format!("icon/block/{}", block.0),
-            &icon,
-            &mut image,
-            &mut sprites,
-        );
-    }
-    // Torches : la flamme du pack recolorée selon le sel.
+    // Torches : la flamme du pack recolorée selon le sel. (v179) Avant les icônes des
+    // blocs, qui ne tiennent plus toutes dans l'atlas.
     let torch = pack
         .block_image("torch_on")
         .unwrap_or_else(|| Rgba::missing(16));
@@ -487,6 +469,33 @@ pub fn build_gui_atlas(pack: &ResourcePack, font: &[u8]) -> GuiAtlas {
             &mut image,
             &mut sprites,
         );
+    }
+    // Icônes 3D (vue isométrique) de tous les blocs, peintes depuis leurs vraies faces et
+    // leur forme (dalles, escaliers, clôtures…) ; plantes : image plate.
+    let layers: Vec<Rgba> = registry()
+        .textures
+        .iter()
+        .map(|t| {
+            let img = resolve(pack, t);
+            if img.height > img.width {
+                crop(&img, img.width)
+            } else {
+                img
+            }
+        })
+        .collect();
+    // (v179) Tant qu'il y a de la place (l'inventaire dessine ses icônes en 3D).
+    for i in 1..registry().len() {
+        let block = BlockId(i as u16);
+        let icon = block_icon(block, &layers);
+        if !add(
+            format!("icon/block/{}", block.0),
+            &icon,
+            &mut image,
+            &mut sprites,
+        ) {
+            break;
+        }
     }
     GuiAtlas { image, sprites }
 }
@@ -644,6 +653,12 @@ mod tests {
     fn builtin_pack_has_every_registry_texture() {
         let pack = ResourcePack::builtin().unwrap();
         for t in &registry().textures {
+            // (v179) Bloc récent : son repli doit exister (le pack par défaut n'a pas
+            // forcément la texture elle-même).
+            let mut t = t;
+            while let TexSrc::Or(_, fallback) = t {
+                t = fallback;
+            }
             if let TexSrc::Pack(n) | TexSrc::Tint(n, _) = t {
                 // « missing » : damier dessiné par le jeu si le pack n'en a pas.
                 assert!(
@@ -674,7 +689,7 @@ mod tests {
         let mut missing = Vec::new();
         let mut names = Vec::new();
         for t in &registry().textures {
-            if let TexSrc::Pack(n) | TexSrc::Tint(n, _) = t {
+            if let TexSrc::Pack(n) | TexSrc::Tint(n, _) | TexSrc::Or(n, _) = t {
                 names.push(*n);
                 if pack.own_block_textures(&[n]) == 0 {
                     missing.push(*n);
@@ -690,6 +705,63 @@ mod tests {
         let t = load_block_textures(&pack);
         println!("taille {}", t.size);
         assert!(missing.len() < names.len() / 4);
+    }
+
+    /// (v179) Planche des blocs ajoutés depuis `MINELIB_SHEET_FROM` (clé du premier bloc,
+    /// `deepslate` par défaut), dessus et côté de chacun, avec le pack par défaut ou
+    /// `MINELIB_PACK` : `MINELIB_SHEET=planche.ppm cargo test -p minelib-render block_sheet
+    /// -- --ignored --nocapture` (image PPM ; l'ordre des blocs est écrit à l'écran).
+    #[test]
+    #[ignore]
+    fn block_sheet() {
+        let Ok(out) = std::env::var("MINELIB_SHEET") else {
+            return;
+        };
+        let pack = match std::env::var("MINELIB_PACK") {
+            Ok(path) => ResourcePack::open(&minelib_assets::PackInfo {
+                name: "planche".into(),
+                path: path.into(),
+            })
+            .unwrap(),
+            Err(_) => ResourcePack::builtin().unwrap(),
+        };
+        let from = std::env::var("MINELIB_SHEET_FROM").unwrap_or_else(|_| "deepslate".into());
+        let reg = registry();
+        let first = reg.by_key(&from).expect("bloc de départ").0 as usize;
+        let t = load_block_textures(&pack);
+        let tile = 32u32;
+        // Un bloc par famille (pas les escaliers, dalles et orientations).
+        let defs: Vec<_> = reg.defs[first..]
+            .iter()
+            .filter(|d| !d.key.starts_with("stairs:") && !d.key.starts_with("slab:"))
+            .filter(|d| !d.key.ends_with(":x") && !d.key.ends_with(":z"))
+            .collect();
+        let cols = 16u32;
+        let rows = (defs.len() as u32).div_ceil(cols);
+        let (w, h) = (cols * tile * 2 + cols * 4, rows * (tile + 4));
+        let mut img = vec![[40u8, 44, 52]; (w * h) as usize];
+        for (i, d) in defs.iter().enumerate() {
+            println!("{i:>3} {}", d.key);
+            let (cx, cy) = (
+                (i as u32 % cols) * (tile * 2 + 4),
+                (i as u32 / cols) * (tile + 4),
+            );
+            for (k, layer) in [d.tex[0], d.tex[1]].into_iter().enumerate() {
+                let l = &t.layers[layer as usize].resize_nearest(tile, tile);
+                for y in 0..tile {
+                    for x in 0..tile {
+                        let p = l.pixel(x, y);
+                        if p[3] > 0 {
+                            let at = (cy + y) * w + cx + k as u32 * tile + x;
+                            img[at as usize] = [p[0], p[1], p[2]];
+                        }
+                    }
+                }
+            }
+        }
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        ppm.extend(img.iter().flatten());
+        std::fs::write(out, ppm).unwrap();
     }
 
     #[test]

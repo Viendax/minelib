@@ -1864,11 +1864,18 @@ impl Session {
 
     /// Menu pause ouvert (Échap) : en solo, les vidéos des écrans se mettent en pause
     /// (elles ne repartent pas toutes seules à la reprise). En ligne, le monde continue :
-    /// rien ne change (une pause partirait chez les autres, voir `crate::watch`).
+    /// rien ne change (une pause partirait chez les autres, voir `crate::watch`). (v179)
+    /// Seulement si l'option « Couper le son des écrans dans le menu » est choisie.
     pub fn pause_videos(&mut self) {
-        if self.build.is_none() && !self.online_match() {
+        if !self.online() {
             self.displays.pause_all();
         }
+    }
+
+    /// (v179) Partie partagée avec d'autres (construction ou FPS en ligne) : le monde
+    /// continue pendant le menu.
+    pub fn online(&self) -> bool {
+        self.build.is_some() || self.online_match()
     }
 
     /// Le clavier va-t-il dans la page d'un écran (un champ de texte de l'écran visé a le
@@ -6230,21 +6237,10 @@ impl Session {
                 // (v177) Le modèle de son arme de près, sa silhouette de loin.
                 let near = v.pos.distance_squared(cam) < GEAR_DETAIL * GEAR_DETAIL;
                 model.extend(crate::player_model::held_model(&other, near));
-            }
-            // Bombe sur le dos de celui qui la porte.
-            for v in n
-                .views()
-                .iter()
-                .filter(|v| v.alive && inside != Some(v.pseudo.as_str()))
-            {
-                // (v177) Pas si elle est dans ses mains.
+                // (v179) La bombe sur le dos de celui qui la porte (pas dans ses mains),
+                // debout contre son dos.
                 if v.flags & minelib_net::game::FLAG_BOMB != 0 && v.weapon != crate::cs::W_BOMB {
-                    let back = Vec3::new(-v.yaw.sin(), 0.0, v.yaw.cos()) * 0.3;
-                    model.extend(crate::player_model::bomb(
-                        v.pos + back + Vec3::Y * 1.1,
-                        false,
-                        sky_light(&self.world, eye_of(v.pos, v.crouch), self.daylight),
-                    ));
+                    model.extend(crate::player_model::bomb_on_back(&other));
                 }
             }
             // Armes et grenades au sol, avec le modèle tenu en main (plus simple au loin) ;

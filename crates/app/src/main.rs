@@ -2587,7 +2587,27 @@ impl Game {
             y2,
             200.0,
         );
-        let done = c.button("Terminé", cx, (y2 + 34.0 * s).max(c.h * 0.84), 200.0, true);
+        // (v179) En dessous : couper le son des écrans quand on ouvre le menu du jeu.
+        let y3 = y2 + 30.0 * s;
+        let mute_label = format!(
+            "Couper le son des écrans dans le menu : {}",
+            if self.options.mute_screens_menu {
+                "oui"
+            } else {
+                "non"
+            }
+        );
+        let mute_click = c.button(&mute_label, cx, y3, 410.0, true);
+        c.text_center(
+            "Oui : en solo, les vidéos se mettent en pause ; en ligne, le son est coupé tant que le menu est ouvert.",
+            y3 + 24.0 * s,
+            (s / 2.0).floor().max(1.0),
+            GREY,
+        );
+        let done = c.button("Terminé", cx, (y3 + 40.0 * s).max(c.h * 0.84), 200.0, true);
+        if mute_click {
+            self.options.mute_screens_menu = !self.options.mute_screens_menu;
+        }
         if let Some(name) = chosen[0].take() {
             crate::audio::set_output(&name);
             self.options.audio_out = name;
@@ -3370,8 +3390,9 @@ impl GameLoop for Game {
         }
         self.garant_update(dt);
 
-        // Échap : pause / reprise / fermeture de l'inventaire. En solo, la pause met aussi
-        // en pause les vidéos des écrans (elles ne repartent pas à la reprise).
+        // Échap : pause / reprise / fermeture de l'inventaire. (v179) Avec « Couper le son
+        // des écrans dans le menu » (Paramètres → Son), en solo, la pause met aussi en pause
+        // les vidéos des écrans (elles ne repartent pas à la reprise).
         if input.pressed(KeyCode::Escape) {
             match self.screen {
                 Screen::Playing => match &mut self.session {
@@ -3382,7 +3403,9 @@ impl GameLoop for Game {
                     // On écrit dans la page d'un écran : Échap rend le clavier au jeu.
                     Some(s) if s.keyboard_on_screen() => s.screen_escape(),
                     Some(s) => {
-                        s.pause_videos();
+                        if self.options.mute_screens_menu {
+                            s.pause_videos();
+                        }
                         self.screen = Screen::Paused;
                     }
                     None => self.screen = Screen::Paused,
@@ -3390,6 +3413,17 @@ impl GameLoop for Game {
                 Screen::Paused => self.screen = Screen::Playing,
                 _ => {}
             }
+        }
+        // (v179) En ligne, avec la même option : le son des écrans est coupé tant qu'un menu
+        // est ouvert par-dessus la partie (pause, paramètres…), et revient ensuite.
+        if let Some(s) = &mut self.session {
+            let mute =
+                self.options.mute_screens_menu && self.screen != Screen::Playing && s.online();
+            s.set_screens_volume(if mute {
+                0.0
+            } else {
+                self.options.volume_screens
+            });
         }
 
         // Mémoire vidéo : relevé chaque seconde (bilan des 10 s), et plus de nouvelles pages

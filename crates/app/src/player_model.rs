@@ -1603,6 +1603,27 @@ pub fn bomb(pos: Vec3, blink: bool, light: [f32; 3]) -> Vec<EntityVertex> {
     out
 }
 
+/// (v179) Bombe portée sur le dos : debout (sa longueur le long du dos), son dessous contre
+/// le dos du joueur, le clavier vers l'arrière. Le modèle est celui de la main, à la même
+/// taille ; elle suit le corps (accroupi, penché).
+pub fn bomb_on_back(pose: &Pose) -> Vec<EntityVertex> {
+    let mut out = Vec::new();
+    let Some(body) = parts(pose).into_iter().find(|p| p.3 == Part::Body) else {
+        return out;
+    };
+    let g = gear(crate::cs::W_BOMB);
+    // Repère du corps en pixels (y de la hanche aux épaules, z = 2 : le dos).
+    let half = -g.min.y * g.scale / PX;
+    // Longueur (x du modèle) debout, dessus (y) vers l'arrière, largeur (z) en travers.
+    let turn = Mat4::from_cols(Vec4::Y, Vec4::Z, Vec4::X, Vec4::W);
+    let xf = body.0
+        * Mat4::from_translation(Vec3::new(0.0, 6.5, 2.0 + half))
+        * Mat4::from_scale(Vec3::splat(g.scale / PX))
+        * turn;
+    tris_in_world(&mut out, xf, &g.tris, pose.light);
+    out
+}
+
 /// Modèle en triangles (le même qu'en main) placé dans le monde par `xf`, éclairé comme
 /// la vue à la première personne.
 pub fn tris_in_world(
