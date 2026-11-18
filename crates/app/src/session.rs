@@ -326,6 +326,8 @@ pub struct Session {
     /// Marche des autres joueurs (par pseudo) : comme la sienne en F5, calculée sur leur
     /// déplacement affiché (fluide, quel que soit le rythme des messages).
     walks: HashMap<String, Walk>,
+    /// (v191) Numéro de l'image en cours, pour oublier les joueurs partis (voir `Walk`).
+    walk_stamp: u32,
     /// (v172) Skins des autres joueurs envoyés à la carte (ils sont dessinés par elle) ;
     /// tenus à jour pendant le dessin de l'image.
     skin_layers: std::cell::RefCell<crate::player_model::SkinLayers>,
@@ -571,6 +573,7 @@ impl Session {
             screen_broke: false,
             walk_phase: 0.0,
             walks: HashMap::new(),
+            walk_stamp: 0,
             skin_layers: Default::default(),
             crowd: None,
             crowd_on: false,
@@ -1550,41 +1553,37 @@ impl Session {
             }
             // (Avec leur pose : l'anticrénelage temporel a besoin de celle de l'image
             // d'avant, voir `Walk`.)
-            let mut seen: Vec<(String, Vec3, f32, f32, f32)> = Vec::new();
+            // (v191) Des milliers de joueurs : leur pseudo n'est plus recopié à chaque
+            // image, et chaque marche porte le numéro de l'image où on l'a vue — celles
+            // qui ne l'ont pas sont parties. Avant, 4 000 chaînes allouées et un ensemble
+            // de tous les pseudos, par image.
+            self.walk_stamp = self.walk_stamp.wrapping_add(1);
+            let (stamp, walks) = (self.walk_stamp, &mut self.walks);
+            let mut mark = |pseudo: &str, pos: Vec3, yaw: f32, pitch: f32, crouch: f32| {
+                let w = match walks.get_mut(pseudo) {
+                    Some(w) => w,
+                    None => walks.entry(pseudo.to_string()).or_insert(Walk::new(pos)),
+                };
+                w.update(pos, yaw, pitch, crouch, dt);
+                w.stamp = stamp;
+            };
             if let Some(n) = &self.net {
-                seen.extend(
-                    n.views()
-                        .iter()
-                        .map(|v| (v.pseudo.clone(), v.pos, v.yaw, v.pitch, v.crouch)),
-                );
+                for v in n.views() {
+                    mark(&v.pseudo, v.pos, v.yaw, v.pitch, v.crouch);
+                }
             }
             if let Some(b) = &self.build {
-                seen.extend(
-                    b.others
-                        .values()
-                        .map(|o| (o.pseudo.clone(), o.pos, o.yaw, o.pitch, o.crouch)),
-                );
+                for o in b.others.values() {
+                    mark(&o.pseudo, o.pos, o.yaw, o.pitch, o.crouch);
+                }
             }
             if let Some(c) = &self.crowd {
-                seen.extend(
-                    c.npcs
-                        .iter()
-                        .map(|n| (n.name.clone(), n.pos, n.yaw, n.pitch, 0.0)),
-                );
+                for n in &c.npcs {
+                    mark(&n.name, n.pos, n.yaw, n.pitch, 0.0);
+                }
             }
-            // (Des milliers de joueurs : un ensemble, pas une recherche dans la liste pour
-            // chacun.)
-            {
-                let names: std::collections::HashSet<&str> =
-                    seen.iter().map(|s| s.0.as_str()).collect();
-                self.walks.retain(|k, _| names.contains(k.as_str()));
-            }
-            for (name, pos, yaw, pitch, crouch) in seen {
-                self.walks
-                    .entry(name)
-                    .or_insert_with(|| Walk::new(pos))
-                    .update(pos, yaw, pitch, crouch, dt);
-            }
+            drop(mark);
+            self.walks.retain(|_, w| w.stamp == stamp);
             let target = (speed / 4.3).min(1.0);
             self.walk_amp += (target - self.walk_amp) * (dt * 10.0).min(1.0);
             self.hand_light = self.light_at_player(held);
@@ -6538,47 +6537,84 @@ impl Session {
             }
         }
         // Construction en ligne (et, en solo, la foule d'essai : dessinée pareil).
-        let mut others: Vec<(&str, Vec3, f32, f32, f32)> = Vec::new();
+        let mut others: Vec<Other> = Vec::new();
         if let Some(b) = &self.build {
-            others.extend(
-                b.others
-                    .values()
-                    .map(|o| (o.pseudo.as_str(), o.pos, o.yaw, o.pitch, o.crouch)),
-            );
+            others.extend(b.others.values().map(|o| Other {
+                pseudo: &o.pseudo,
+                pos: o.pos,
+                yaw: o.yaw,
+                pitch: o.pitch,
+                crouch: o.crouch,
+                covered: None,
+            }));
         }
         if let Some(c) = &self.crowd {
-            others.extend(
-                c.npcs
-                    .iter()
-                    .map(|n| (n.name.as_str(), n.pos, n.yaw, n.pitch, 0.0)),
-            );
+            others.extend(c.npcs.iter().map(|n| Other {
+                pseudo: &n.name,
+                pos: n.pos,
+                yaw: n.yaw,
+                pitch: n.pitch,
+                crouch: 0.0,
+                covered: Some(n.covered),
+            }));
         }
         if !others.is_empty() {
+            let _p = minelib_render::perf::scope("joueurs : poses");
             // Les plus proches d'abord (ombres, et place limitée sur la carte : au-delà de
             // `MAX_PLAYERS`, les plus lointains en trois pavés).
-            others.sort_by(|a, c| {
-                a.1.distance_squared(cam)
-                    .total_cmp(&c.1.distance_squared(cam))
-            });
-            for (rank, &(pseudo, pos, yaw, pitch, crouch)) in others.iter().enumerate() {
-                let w = self.walks.get(pseudo).copied().unwrap_or_default();
+            // (v191) Des milliers de joueurs : la distance de chacun est calculée une fois
+            // (le tri la reprenait à chaque comparaison, des dizaines de milliers de fois),
+            // et celui qu'on ne peut pas voir — derrière la caméra, à côté de l'écran, ou
+            // au-delà du brouillard — ne coûte plus que ce test. Les ombres gardent les
+            // plus proches dans tous les sens : on voit l'ombre de celui qui est derrière.
+            let mut order: Vec<(f32, u32)> = others
+                .iter()
+                .enumerate()
+                .map(|(i, o)| (o.pos.distance_squared(cam), i as u32))
+                .collect();
+            order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            let fog2 = (fog_end + 16.0) * (fog_end + 16.0);
+            // Cône de la caméra, large comme la diagonale de l'écran plus 15°.
+            let fwd = -Vec3::new(view.x_axis.z, view.y_axis.z, view.z_axis.z);
+            let aspect = (self.screen_size.0 / self.screen_size.1.max(1.0)).clamp(0.1, 10.0);
+            let cos_lim = view_cone_cos(fov, aspect);
+            for (rank, &(d2, i)) in order.iter().enumerate() {
+                let o = &others[i as usize];
+                // Son ombre peut tomber dans l'écran : on le prépare quoi qu'il arrive.
+                let shadow = rank < 24 && d2 < 48.0 * 48.0;
+                if !shadow && d2 > 16.0 {
+                    if d2 > fog2 {
+                        continue;
+                    }
+                    let v = o.pos + Vec3::Y - cam;
+                    if v.dot(fwd) < cos_lim * v.length() {
+                        continue;
+                    }
+                }
+                let w = self.walks.get(o.pseudo);
                 let other = crate::player_model::Pose {
-                    feet: pos,
-                    yaw,
-                    pitch,
-                    walk: w.phase,
-                    swing: w.amp,
-                    crouch,
-                    light: sky_light(&self.world, eye_of(pos, crouch), self.daylight),
+                    feet: o.pos,
+                    yaw: o.yaw,
+                    pitch: o.pitch,
+                    walk: w.map_or(0.0, |w| w.phase),
+                    swing: w.map_or(0.0, |w| w.amp),
+                    crouch: o.crouch,
+                    light: match o.covered {
+                        Some(c) => sky_light_covered(c, self.daylight),
+                        None => sky_light(&self.world, eye_of(o.pos, o.crouch), self.daylight),
+                    },
                     held: None,
-                    skin: self.skins.of(pseudo),
+                    skin: self.skins.of(o.pseudo),
                 };
-                if rank < 24 && pos.distance_squared(cam) < 48.0 * 48.0 {
-                    shadows.push((pos, crate::player_model::shadow_boxes(&other)));
+                if shadow {
+                    shadows.push((o.pos, crate::player_model::shadow_boxes(&other)));
                 }
                 if players.len() < minelib_render::MAX_PLAYERS {
                     let layer = layers.layer(other.skin.as_ref(), renderer);
-                    let prev = Walk::prev_of(&self.walks, pseudo, &other);
+                    let prev = w.map_or_else(
+                        || crate::player_model::Prev::still(&other),
+                        |w| w.prev,
+                    );
                     players.push(crate::player_model::instance(&other, layer, &prev));
                 } else {
                     model.extend(crate::player_model::build_tiny(&other));
@@ -7333,12 +7369,34 @@ fn stairs_placement(hit: &Hit, item: BlockId, look: Vec3, point: Vec3) -> Option
     minelib_world::registry::registry().by_key(&format!("stairs:{mat}:{dir}:{half}"))
 }
 
+/// (v191) Cosinus du demi-angle du cône de la caméra, pris large comme la diagonale de
+/// l'écran plus 15° : au-delà, un joueur ne peut pas être à l'écran, même un bras tendu
+/// ou son pseudo. Sert à ne pas préparer les milliers de joueurs qu'on ne voit pas.
+fn view_cone_cos(fov_y: f32, aspect: f32) -> f32 {
+    let half = ((fov_y * 0.5).tan() * (1.0 + aspect * aspect).sqrt()).atan() + 0.26;
+    half.min(1.5).cos()
+}
+
+/// Un autre joueur à dessiner : la construction en ligne, ou la foule d'essai.
+struct Other<'a> {
+    pseudo: &'a str,
+    pos: Vec3,
+    yaw: f32,
+    pitch: f32,
+    crouch: f32,
+    /// (v191) Abri déjà connu (la foule le garde en mémoire), sinon cherché ici : voir
+    /// `sky_light`.
+    covered: Option<bool>,
+}
+
 /// Marche d'un autre joueur : même balancement que le sien en F5, d'après la vitesse
 /// de son déplacement à l'écran (lissée : pas d'à-coups).
 #[derive(Clone, Copy, Default)]
 pub struct Walk {
     pub phase: f32,
     pub amp: f32,
+    /// (v191) Image où on l'a vu pour la dernière fois (voir `walk_stamp`).
+    stamp: u32,
     /// (v189) Sa pose à l'image d'avant (anticrénelage temporel : voir `PlayerInstance`).
     prev: crate::player_model::Prev,
     last: Vec3,
@@ -7974,6 +8032,54 @@ fn side_of_start(start: u8, i: u32) -> u8 {
 }
 
 #[cfg(test)]
+mod crowd_tests {
+    use super::*;
+
+    /// (v191) Les milliers de joueurs hors de l'écran ne sont plus préparés : le cône de
+    /// la caméra doit rester plus large que l'écran, sinon ils disparaîtraient au bord.
+    #[test]
+    fn nobody_visible_on_screen_is_left_out_of_the_cone() {
+        for (fov, aspect) in [(1.2f32, 16.0 / 9.0f32), (1.9, 21.0 / 9.0), (0.7, 1.0)] {
+            let cos_lim = view_cone_cos(fov, aspect);
+            let proj = glam::Mat4::perspective_infinite_reverse_rh(fov, aspect, 0.05);
+            // Caméra à l'origine, regardant vers -Z.
+            let fwd = -Vec3::Z;
+            let mut on_screen = 0;
+            for i in 0..40 {
+                for j in 0..40 {
+                    // Points tout autour de la caméra, à 30 blocs.
+                    let yaw = i as f32 / 40.0 * std::f32::consts::TAU;
+                    let pitch = (j as f32 / 40.0 - 0.5) * std::f32::consts::PI;
+                    let (sy, cy) = yaw.sin_cos();
+                    let v = Vec3::new(sy * pitch.cos(), pitch.sin(), -cy * pitch.cos()) * 30.0;
+                    let c = proj * v.extend(1.0);
+                    let inside = c.w > 0.0
+                        && c.x.abs() <= c.w
+                        && c.y.abs() <= c.w
+                        && v.dot(fwd) > 0.0;
+                    if inside {
+                        on_screen += 1;
+                        assert!(
+                            v.dot(fwd) >= cos_lim * v.length(),
+                            "joueur à l'écran écarté : fov {fov}, {yaw} / {pitch}"
+                        );
+                    }
+                }
+            }
+            assert!(on_screen > 20, "l'essai ne regarde personne à l'écran");
+        }
+    }
+
+    /// Et le cône écarte bien quelqu'un derrière soi (sinon il ne servirait à rien).
+    #[test]
+    fn someone_behind_the_camera_costs_nothing() {
+        let cos_lim = view_cone_cos(1.2, 16.0 / 9.0);
+        let behind = Vec3::new(0.0, 0.0, 30.0);
+        assert!(behind.dot(-Vec3::Z) < cos_lim * behind.length());
+    }
+}
+
+#[cfg(test)]
 mod name_tests {
     use super::*;
 
@@ -8333,23 +8439,34 @@ fn bomb_beep_gap(left: f32) -> f32 {
 }
 
 /// Yeux d'un joueur aux pieds `feet` (accroupi 0..1), comme `Player::eye`.
-fn eye_of(feet: Vec3, crouch: f32) -> Vec3 {
+pub fn eye_of(feet: Vec3, crouch: f32) -> Vec3 {
     feet + Vec3::Y * (crate::player::EYE - crate::player::CROUCH_DROP * crouch.clamp(0.0, 1.0))
 }
 
 /// Lumière du ciel reçue aux yeux `e` (linéaire) : abrité par un bloc plein au-dessus ou
 /// non, jour ou nuit. La même pour soi (`light_at_player`) et pour les autres joueurs.
 fn sky_light(world: &World, e: Vec3, daylight: f32) -> [f32; 3] {
+    sky_light_covered(covered_above(world, e), daylight)
+}
+
+/// La même lumière quand on sait déjà si le ciel est bouché : la foule d'essai garde
+/// l'abri de chacun en mémoire (voir `crowd`), c'est la partie qui coûte.
+fn sky_light_covered(covered: bool, daylight: f32) -> [f32; 3] {
+    [if covered { 0.35 } else { 1.0 } * (0.18 + 0.82 * daylight); 3]
+}
+
+/// Un bloc plein au-dessus de `e` : la colonne de blocs à parcourir, la partie chère de
+/// `sky_light`.
+pub fn covered_above(world: &World, e: Vec3) -> bool {
     let (x, z) = (e.x.floor() as i32, e.z.floor() as i32);
     // Un bloc plein plus haut que les yeux (au-dessus de la couche la plus haute du chunk,
     // que de l'air).
     let from = (e.y.floor() as i32 + 1).max(0) as usize;
-    let covered = world.chunk(ChunkPos::containing(x, z)).is_some_and(|c| {
+    world.chunk(ChunkPos::containing(x, z)).is_some_and(|c| {
         let (lx, lz) = (
             x.rem_euclid(CHUNK_SIZE as i32) as usize,
             z.rem_euclid(CHUNK_SIZE as i32) as usize,
         );
         (from..c.top()).any(|y| c.get(lx, y, lz).is_solid())
-    });
-    [if covered { 0.35 } else { 1.0 } * (0.18 + 0.82 * daylight); 3]
+    })
 }

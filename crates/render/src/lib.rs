@@ -1438,6 +1438,38 @@ impl Renderer {
         shot
     }
 
+    /// (v191) Image restée bloquée plus de `STALL_MS` dans un appel au système : une note
+    /// au journal, avec de quoi reconnaître la cause d'une session à l'autre. Ces blocages
+    /// (une fois toutes les quelques minutes, 150 à 500 ms) ne viennent pas du travail du
+    /// jeu : tout son calcul, CPU comme GPU, tient en quelques millisecondes.
+    fn note_stall(&self, what: &str, started: std::time::Instant) {
+        const STALL_MS: f32 = 50.0;
+        let ms = started.elapsed().as_secs_f32() * 1000.0;
+        if ms < STALL_MS {
+            return;
+        }
+        let (n, since, frames) = perf::stall(ms);
+        let temp = thermal::gpu_temp()
+            .or_else(|| perf::gauge_now("carte graphique (°C)"))
+            .map_or_else(|| "inconnue".into(), |t| format!("{t:.0} °C"));
+        let vram = match (
+            perf::gauge_now("mémoire vidéo utilisée (Mo)"),
+            perf::gauge_now("budget mémoire vidéo de Windows (Mo)"),
+        ) {
+            (Some(u), Some(b)) => format!("{u:.0} / {b:.0} Mo"),
+            _ => "inconnue".into(),
+        };
+        let ago = if since.is_nan() {
+            "la première de la session".to_string()
+        } else {
+            format!("la précédente il y a {since:.0} s et {frames} images")
+        };
+        log::warn!(
+            "image bloquée {ms:.0} ms dans {what} : ni le jeu ni ses shaders n'y travaillent              (Windows ou le pilote n'a pas rendu la main). Blocage n° {n}, {ago} ;              affichage {:?} ; carte graphique {temp} ; mémoire vidéo {vram}",
+            self.config.present_mode,
+        );
+    }
+
     pub fn set_vram_pressure(&mut self, on: bool) {
         self.arena.pressure = on;
     }
@@ -2839,6 +2871,7 @@ impl Renderer {
         // Image de la fenêtre demandée le plus tard possible : tout le travail CPU ci-dessus
         // se fait pendant que le GPU termine les images précédentes.
         let acquire = perf::scope("rendu : attente de l'image (GPU)");
+        let waited = std::time::Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -2853,6 +2886,7 @@ impl Renderer {
             }
         };
         drop(acquire);
+        self.note_stall("l'attente de l'image de la fenêtre", waited);
         let encode = perf::scope("rendu : commandes");
         let view = frame.texture.create_view(&Default::default());
         if let Some(t) = &mut self.gpu_timer {
@@ -3108,10 +3142,12 @@ impl Renderer {
         }
         self.marker(Marker::RenderSubmitEnd);
         self.marker(Marker::PresentStart);
+        let presented = std::time::Instant::now();
         {
             let _s = perf::scope("rendu : présentation");
             frame.present();
         }
+        self.note_stall("la présentation de l'image", presented);
         self.marker(Marker::PresentEnd);
         if let Some(t) = &mut self.gpu_timer {
             if let Some(g) = t.after_submit(&self.device) {

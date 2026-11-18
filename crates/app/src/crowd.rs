@@ -18,6 +18,8 @@ const FAR: f32 = 150.0;
 const GONE: f32 = 200.0;
 /// Le journal note leur nombre toutes les… (s), à côté des bilans d'images par seconde.
 const LOG_EVERY: f32 = 10.0;
+/// Joueurs dont on reprend l'abri par image (voir `Npc::covered`).
+const RECHECK_PER_FRAME: usize = 64;
 
 /// Un joueur simulé.
 pub struct Npc {
@@ -32,6 +34,11 @@ pub struct Npc {
     /// Case (x, z) dont la hauteur du sol est connue : on ne la recherche qu'en changeant
     /// de case (des milliers de joueurs : pas de recherche à chaque image).
     cell: (i32, i32),
+    /// (v191) Le ciel est-il bouché au-dessus de lui ? Sa lumière en découle. Cherché en
+    /// changeant de case, et repris pour quelques-uns à chaque image (un toit peut être
+    /// construit au-dessus d'eux) : parcourir la colonne de blocs de 4 000 joueurs à
+    /// chaque image coûtait près d'une demi-milliseconde.
+    pub covered: bool,
 }
 
 pub struct Crowd {
@@ -41,6 +48,8 @@ pub struct Crowd {
     log_in: f32,
     /// Numéro du prochain pseudo.
     next: usize,
+    /// Prochain joueur dont on reprendra l'abri (voir `Npc::covered`).
+    recheck: usize,
 }
 
 impl Default for Crowd {
@@ -57,6 +66,7 @@ impl Crowd {
             seed: 0x9e37_79b9,
             log_in: LOG_EVERY,
             next: 1,
+            recheck: 0,
         }
     }
 
@@ -88,6 +98,12 @@ impl Crowd {
         for i in 0..self.npcs.len() {
             self.step(world, center, i, dt);
         }
+        // Abri repris pour quelques joueurs par image : tous en une minute environ.
+        for _ in 0..RECHECK_PER_FRAME.min(self.npcs.len()) {
+            self.recheck = (self.recheck + 1) % self.npcs.len();
+            let n = &mut self.npcs[self.recheck];
+            n.covered = covered(world, n.pos);
+        }
         self.log_in -= dt;
         if self.log_in <= 0.0 {
             self.log_in = LOG_EVERY;
@@ -110,14 +126,16 @@ impl Crowd {
         let yaw = self.rnd() * std::f32::consts::TAU;
         let speed = self.pick_speed();
         let turn_in = 1.0 + self.rnd() * 6.0;
+        let pos = Vec3::new(x, y, z);
         Some(Npc {
             name,
-            pos: Vec3::new(x, y, z),
+            pos,
             yaw,
             pitch: 0.0,
             speed,
             turn_in,
             cell: (x.floor() as i32, z.floor() as i32),
+            covered: covered(world, pos),
         })
     }
 
@@ -174,12 +192,18 @@ impl Crowd {
             Some(y) => {
                 n.pos = Vec3::new(next.x, y, next.z);
                 n.cell = cell;
+                n.covered = covered(world, n.pos);
             }
             None => {
                 n.yaw = (n.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
             }
         }
     }
+}
+
+/// Le ciel est-il bouché au-dessus de ses yeux ? (La même lumière que pour les joueurs.)
+fn covered(world: &World, pos: Vec3) -> bool {
+    crate::session::covered_above(world, crate::session::eye_of(pos, 0.0))
 }
 
 /// Sol de la colonne (`x`, `z`) le plus haut entre 40 blocs sous `near_y` et 40 au-dessus :

@@ -314,13 +314,25 @@ impl Skins {
         if pseudo.is_empty() || pseudo.contains(' ') {
             return None;
         }
-        let key = pseudo.to_lowercase();
-        match self.others.get(&key) {
+        // (v191) Des milliers de joueurs autour de soi : la clé en minuscules tient sur
+        // la pile, et non une chaîne allouée par joueur et par image.
+        let mut buf = [0u8; 48];
+        let owned;
+        let key: &str = if pseudo.len() <= buf.len() && pseudo.is_ascii() {
+            let b = &mut buf[..pseudo.len()];
+            b.copy_from_slice(pseudo.as_bytes());
+            b.make_ascii_lowercase();
+            std::str::from_utf8(b).unwrap_or(pseudo)
+        } else {
+            owned = pseudo.to_lowercase();
+            &owned
+        };
+        match self.others.get(key) {
             Some(s) => s.clone(),
             None => {
                 let mut w = self.wanted.borrow_mut();
-                if !w.contains(&key) && w.len() < 64 {
-                    w.push(key);
+                if w.len() < 64 && !w.iter().any(|k| k == key) {
+                    w.push(key.to_string());
                 }
                 None
             }

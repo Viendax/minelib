@@ -97,6 +97,10 @@ struct Perf {
     window_counts: Vec<(&'static str, u64)>,
     /// Moyennes du bilan (somme, nombre).
     window_gauges: Vec<(&'static str, f64, u32)>,
+    /// (v191) Images depuis le lancement, et le blocage précédent (voir `stall`).
+    frames: u64,
+    last_stall: Option<(Instant, u64)>,
+    stalls: u32,
 }
 
 impl Default for Perf {
@@ -117,6 +121,9 @@ impl Default for Perf {
             last_end: Instant::now(),
             window_counts: Vec::new(),
             window_gauges: Vec::new(),
+            frames: 0,
+            last_stall: None,
+            stalls: 0,
         }
     }
 }
@@ -246,10 +253,40 @@ fn fmt_phases(phases: &[(&'static str, Duration)], div: f32) -> String {
 
 /// Fin d'image : mesure le temps réel depuis la fin de la précédente, journalise les
 /// chutes et le bilan.
+/// (v191) Une image bloquée longtemps dans un appel au système (demande de l'image de la
+/// fenêtre, présentation) : ce n'est pas du travail du jeu, c'est Windows ou le pilote qui
+/// n'a pas rendu la main. Le journal garde de quoi reconnaître le coupable d'une session à
+/// l'autre : depuis quand, combien d'images, et l'état de la carte.
+/// Rend (numéro du blocage, secondes depuis le précédent, images depuis le précédent).
+pub fn stall(ms: f32) -> (u32, f32, u64) {
+    PERF.with(|p| {
+        let mut p = p.borrow_mut();
+        p.stalls += 1;
+        let (since, frames) = match p.last_stall {
+            Some((t, f)) => (t.elapsed().as_secs_f32(), p.frames - f),
+            None => (f32::NAN, p.frames),
+        };
+        p.last_stall = Some((Instant::now() - Duration::from_secs_f32(ms / 1000.0), p.frames));
+        (p.stalls, since, frames)
+    })
+}
+
+/// Moyenne d'une mesure du bilan en cours (température, mémoire vidéo…).
+pub fn gauge_now(name: &str) -> Option<f32> {
+    PERF.with(|p| {
+        p.borrow()
+            .window_gauges
+            .iter()
+            .find(|(k, _, _)| *k == name)
+            .map(|(_, s, n)| (s / (*n).max(1) as f64) as f32)
+    })
+}
+
 pub fn frame_end() {
     PERF.with(|p| {
         let mut p = p.borrow_mut();
         let p = &mut *p;
+        p.frames += 1;
         let now = Instant::now();
         let dt = now.duration_since(p.last_end).as_secs_f32();
         p.last_end = now;
