@@ -1620,6 +1620,15 @@ impl Session {
             .is_some_and(|s| self.displays.page_scrolls(s.0.id(), scroll > 0.0))
     }
 
+    /// Menu pause ouvert (Échap) : en solo, les vidéos des écrans se mettent en pause
+    /// (elles ne repartent pas toutes seules à la reprise). En ligne, le monde continue :
+    /// rien ne change (une pause partirait chez les autres, voir `crate::watch`).
+    pub fn pause_videos(&mut self) {
+        if self.build.is_none() && self.net.is_none() {
+            self.displays.pause_all();
+        }
+    }
+
     /// Le clavier va-t-il dans la page d'un écran (un champ de texte de l'écran visé a le
     /// focus) ? Le jeu ne lit alors plus ses touches.
     pub fn keyboard_on_screen(&self) -> bool {

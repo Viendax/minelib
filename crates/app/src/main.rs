@@ -3160,7 +3160,8 @@ impl GameLoop for Game {
         }
         self.garant_update(dt);
 
-        // Échap : pause / reprise / fermeture de l'inventaire.
+        // Échap : pause / reprise / fermeture de l'inventaire. En solo, la pause met aussi
+        // en pause les vidéos des écrans (elles ne repartent pas à la reprise).
         if input.pressed(KeyCode::Escape) {
             match self.screen {
                 Screen::Playing => match &mut self.session {
@@ -3170,7 +3171,11 @@ impl GameLoop for Game {
                     Some(s) if s.fps.buy_open => s.fps.buy_open = false,
                     // On écrit dans la page d'un écran : Échap rend le clavier au jeu.
                     Some(s) if s.keyboard_on_screen() => s.screen_escape(),
-                    _ => self.screen = Screen::Paused,
+                    Some(s) => {
+                        s.pause_videos();
+                        self.screen = Screen::Paused;
+                    }
+                    None => self.screen = Screen::Paused,
                 },
                 Screen::Paused => self.screen = Screen::Playing,
                 _ => {}

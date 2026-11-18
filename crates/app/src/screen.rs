@@ -243,6 +243,9 @@ const PAGE_W: u32 = 1280;
 const PAGE_H: u32 = 720;
 /// Page ouverte sur un nouvel écran.
 pub const HOME_URL: &str = "https://www.youtube.com/";
+/// Script qui met en pause les vidéos et les sons d'une page.
+const PAUSE_JS: &str =
+    "(()=>{document.querySelectorAll('video,audio').forEach(m=>{if(!m.paused)m.pause();});})()";
 /// Durée de l'onde qui montre un appui (secondes).
 const RIPPLE_S: f32 = 0.35;
 /// Durée d'un tour de la barre de progression de la mire (secondes).
@@ -647,6 +650,20 @@ impl Displays {
         }
         if let Some(b) = self.browser.as_mut() {
             b.send(&format!("eval {id} {js}"));
+        }
+    }
+
+    /// Met en pause les vidéos et les sons en cours sur tous les écrans (sans rien
+    /// relancer ensuite).
+    pub fn pause_all(&mut self) {
+        let ids: Vec<u32> = self
+            .tabs
+            .iter()
+            .filter(|(_, t)| t.opened)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.eval(id, PAUSE_JS);
         }
     }
 
