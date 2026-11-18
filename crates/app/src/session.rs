@@ -246,6 +246,10 @@ pub struct Session {
     move_debug: String,
     /// Le joueur a été prévenu qu'un logiciel tape ses touches.
     injected_warned: bool,
+    /// Touches filtrées de Windows : regardées une fois par partie, dans ce temps (s).
+    filter_keys_in: Option<f32>,
+    /// Bilan des retards de la touche avancer (journal toutes les 5 minutes).
+    lag_book: crate::heat::LagBook,
     autosave: f32,
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
@@ -504,6 +508,8 @@ impl Session {
             coast_air: 0.0,
             move_debug: String::new(),
             injected_warned: false,
+            filter_keys_in: Some(3.0),
+            lag_book: Default::default(),
             autosave: AUTOSAVE_S,
             hit: None,
             frame_aim: None,
@@ -555,6 +561,13 @@ impl Session {
             lights_marked: false,
             lights_failed_said: false,
         })
+    }
+
+    /// Fin de partie : les bilans en cours vont au journal.
+    pub fn flush_reports(&mut self) {
+        if let Some(line) = self.lag_book.report(true) {
+            log::info!("{line}");
+        }
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -901,6 +914,7 @@ impl Session {
                         .unwrap_or_default()
                 };
                 if let Some(s) = self.stick.stop.take() {
+                    self.lag_book.add(s.gap, s.held, minelib_render::thermal::gpu_temp());
                     let hot = hot();
                     log::info!(
                         "fin de course : avancer relâchée {:.0} ms après courir (course de \
@@ -947,6 +961,9 @@ impl Session {
                 self.measure_stop(dt, fwd_held, run_held, released, other);
             }
             self.stick.remember();
+            if let Some(line) = self.lag_book.report(false) {
+                log::info!("{line}");
+            }
             if let Some(note) = self.stick.note.take() {
                 log::info!("touche avancer : {note}");
             }
@@ -991,6 +1008,23 @@ impl Session {
             );
             // Un logiciel tape les touches à la place du clavier (macro, script) : c'est lui
             // qui les relâche, parfois en retard. Le joueur est prévenu une fois.
+            // Touches filtrées de Windows (accessibilité, aussi activées en tenant Maj
+            // droite 8 s) : Windows retarde ou ignore des appuis. Dit une fois au joueur.
+            if let Some(t) = self.filter_keys_in.as_mut() {
+                *t -= dt;
+            }
+            if self.filter_keys_in.is_some_and(|t| t <= 0.0) {
+                self.filter_keys_in = None;
+                if let Some(f) = minelib_platform::filter_keys() {
+                    log::warn!("clavier : {f}");
+                    self.chat.say(
+                        "Les « touches filtrées » de Windows sont actives : Windows retarde ou \
+                         ignore des appuis. Coupe-les dans Paramètres > Accessibilité > Clavier."
+                            .to_string(),
+                        chat::YELLOW,
+                    );
+                }
+            }
             if input.injected_keys() && !self.injected_warned {
                 self.injected_warned = true;
                 self.chat.say(
@@ -4356,6 +4390,49 @@ impl Session {
                 }
                 _ => self.chat.say("Utilisation : /foule <on|off>", chat::RED),
             },
+            // Garde thermique : température cible de la carte graphique (moins d'images
+            // inutiles, moins de chaleur sous le clavier).
+            "temperature" | "température" | "temp" => {
+                let goal = match arg {
+                    Some("off" | "non" | "0") => Some(None),
+                    Some(v) => v
+                        .trim_end_matches("°C")
+                        .trim_end_matches('°')
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|t| (50..=95).contains(t))
+                        .map(Some),
+                    None => None,
+                };
+                match goal {
+                    Some(t) => {
+                        crate::heat::set_target(t);
+                        self.chat.say(
+                            match t {
+                                Some(t) => format!(
+                                    "Garde thermique : le jeu limite ses images pour garder la \
+                                     carte graphique sous {t} °C."
+                                ),
+                                None => "Garde thermique coupée.".to_string(),
+                            },
+                            chat::YELLOW,
+                        );
+                    }
+                    None => {
+                        let now = minelib_render::thermal::gpu_temp()
+                            .map_or("inconnue".into(), |t| format!("{t:.0} °C"));
+                        let goal = crate::heat::target()
+                            .map_or("coupée".into(), |t| format!("cible {t} °C"));
+                        self.chat.say(
+                            format!(
+                                "Carte graphique : {now} ; garde thermique : {goal}. \
+                                 Utilisation : /temperature <50..95|off>"
+                            ),
+                            chat::YELLOW,
+                        );
+                    }
+                }
+            }
             // Touche « avancer » qui remonte mal : règle forcée, refusée ou apprise.
             "touchelente" | "slowkey" => {
                 use crate::stick::Mode;

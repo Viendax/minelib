@@ -61,6 +61,7 @@ mod garant_worker;
 mod gpu_plan;
 mod gpu_report;
 mod hand;
+mod heat;
 mod heads;
 mod i18n;
 mod inventory;
@@ -250,6 +251,8 @@ struct Game {
     shot_at: Option<f32>,
     show_debug: bool,
     fps_max: Option<f32>,
+    /// Garde thermique : limite d'images pour garder la carte graphique sous sa cible.
+    heat: heat::Guard,
     frame_start: Instant,
     // Écran Solo
     worlds: Vec<WorldSummary>,
@@ -380,6 +383,7 @@ impl Game {
             started: std::time::Instant::now(),
             show_debug: env_parse::<u8>("MINELIB_DEBUG").is_some_and(|v| v != 0),
             fps_max: env_parse::<f32>("MINELIB_FPS_MAX").filter(|&f| f > 0.0),
+            heat: heat::Guard::new(),
             frame_start: Instant::now(),
             selected_world: None,
             world_scroll: 0,
@@ -535,6 +539,7 @@ impl Game {
                 self.accounts.room(minelib_net::client::Cmd::Leave);
             }
             self.accounts.forget_standby();
+            s.flush_reports();
             if !online && !guest_build {
                 if let Err(e) = s.save() {
                     log::error!("sauvegarde impossible : {e:#}");
@@ -576,9 +581,15 @@ impl Game {
     }
 
     fn limit_fps(&mut self) {
-        // Hors du jeu, les menus n'ont pas besoin de plus de 120 images/s.
+        // Hors du jeu, les menus n'ont pas besoin de plus de 120 images/s. En partie, la
+        // garde thermique peut limiter plus bas (carte graphique trop chaude).
         let max = if self.session.is_some() {
-            self.fps_limit()
+            let dt = self.frame_start.elapsed().as_secs_f32();
+            self.heat.update(dt, self.fps_limit());
+            match (self.fps_limit(), self.heat.cap()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
         } else {
             Some(self.fps_limit().unwrap_or(120.0).min(120.0))
         };
@@ -3590,6 +3601,7 @@ impl GameLoop for Game {
     fn on_exit(&mut self) {
         // Fermeture de la fenêtre en pleine partie : on enregistre quand même.
         if let Some(mut s) = self.session.take() {
+            s.flush_reports();
             if let Err(e) = s.save() {
                 log::error!("sauvegarde impossible : {e:#}");
             }

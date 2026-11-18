@@ -55,6 +55,17 @@ pub struct Input {
     injected: bool,
     /// La saisie brute du clavier arrive-t-elle (notée une fois) ?
     raw_seen: bool,
+    /// La fenêtre a le clavier (les appuis ne sont pris que dans ce cas).
+    focused: bool,
+    /// Touches enfoncées puis relâchées dans la même image : gardées tenues jusqu'à la fin
+    /// de l'image, pour que le jeu les voie au moins une fois (un appui très bref, ou un
+    /// appui pendant une image longue, n'est jamais perdu).
+    release_after_frame: Vec<KeyCode>,
+    /// Appuis vus par le clavier lui-même (saisie brute) ou par l'état du système avant le
+    /// message de Windows : quand, et par qui (pour mesurer le retard du message).
+    early_press: std::collections::HashMap<KeyCode, (Instant, &'static str)>,
+    /// Bilan des appuis (journal toutes les 5 minutes).
+    press_stats: PressStats,
     /// Touches déjà signalées au journal (une fois chacune).
     #[cfg_attr(not(windows), allow(dead_code))]
     raw_warned: HashSet<KeyCode>,
@@ -75,6 +86,28 @@ pub struct Input {
     pub key_labels: std::collections::HashMap<KeyCode, String>,
 }
 
+/// Bilan des appuis de touches : qui les a vus en premier, et le retard du message de
+/// Windows sur le clavier lui-même.
+#[derive(Default)]
+struct PressStats {
+    total: u32,
+    /// Vus d'abord par la saisie brute, ou par l'état du système.
+    by_raw: u32,
+    by_state: u32,
+    /// Message de Windows arrivé après coup : nombre, retard cumulé et pire (ms).
+    late: u32,
+    late_sum: f32,
+    late_max: f32,
+    /// Message d'appui de Windows qui n'est jamais arrivé (touche relâchée avant).
+    missing: u32,
+    /// Appuis que Windows donnait pour des répétitions (sa touche lui paraissait encore
+    /// enfoncée) : pris comme de vrais appuis.
+    as_repeat: u32,
+    /// Touches enfoncées et relâchées dans la même image (gardées une image).
+    taps: u32,
+    since: Option<Instant>,
+}
+
 impl Input {
     /// Essais : appuie sur une touche pour cette image (et la tient).
     pub fn press(&mut self, k: KeyCode) {
@@ -90,6 +123,108 @@ impl Input {
 
     pub fn held(&self, k: KeyCode) -> bool {
         self.held.contains(&k)
+    }
+
+    /// Une touche vient d'être enfoncée d'après `source` : tenue et « pressée » pour cette
+    /// image, quel que soit le chemin qui l'a vue en premier (le clavier lui-même, l'état du
+    /// système, ou le message de Windows).
+    fn press_now(&mut self, code: KeyCode, source: &'static str) {
+        let now = Instant::now();
+        self.last_press = Some(now);
+        self.soft.remove(&code);
+        self.repeats.remove(&code);
+        self.pressed.insert(code);
+        self.held.insert(code);
+        self.pressed_at.insert(code, now);
+        self.release_after_frame.retain(|k| *k != code);
+        self.press_stats.total += 1;
+        match source {
+            "message de Windows" => {}
+            "clavier (saisie brute)" => {
+                self.press_stats.by_raw += 1;
+                self.early_press.insert(code, (now, source));
+            }
+            _ => {
+                self.press_stats.by_state += 1;
+                self.early_press.insert(code, (now, source));
+            }
+        }
+    }
+
+    /// Le message de Windows d'un appui déjà vu ailleurs arrive : son retard est noté.
+    fn confirm_press(&mut self, code: KeyCode) {
+        if let Some((at, source)) = self.early_press.remove(&code) {
+            let ms = at.elapsed().as_secs_f32() * 1000.0;
+            let st = &mut self.press_stats;
+            st.late += 1;
+            st.late_sum += ms;
+            if ms > st.late_max {
+                st.late_max = ms;
+            }
+            if ms >= 30.0 {
+                log::info!(
+                    "touche {code:?} : appui vu par {source} {ms:.0} ms avant le message de \
+                     Windows (pris dès le premier)"
+                );
+            }
+        }
+    }
+
+    /// Une touche tenue vient d'être relâchée : enlevée tout de suite, sauf si elle a été
+    /// enfoncée dans cette même image (gardée jusqu'à la fin de l'image : le jeu la voit
+    /// au moins une fois). `false` : elle n'était pas tenue.
+    fn release_now(&mut self, code: KeyCode) -> bool {
+        if !self.held.contains(&code) {
+            return false;
+        }
+        if let Some((_, source)) = self.early_press.remove(&code) {
+            self.press_stats.missing += 1;
+            log::info!(
+                "touche {code:?} : appui vu par {source}, relâchée sans que Windows ait envoyé \
+                 son appui (pris quand même)"
+            );
+        }
+        if self.pressed.contains(&code) {
+            if !self.release_after_frame.contains(&code) {
+                self.release_after_frame.push(code);
+                self.press_stats.taps += 1;
+            }
+        } else {
+            self.held.remove(&code);
+        }
+        true
+    }
+
+    /// Bilan des appuis, au journal toutes les 5 minutes (et à la fermeture : `force`).
+    fn report_presses(&mut self, force: bool) {
+        let st = &mut self.press_stats;
+        let since = *st.since.get_or_insert_with(Instant::now);
+        if st.total == 0 || (!force && since.elapsed().as_secs() < 300) {
+            return;
+        }
+        if let Some(f) = filter_keys() {
+            log::warn!("clavier : {f}");
+        }
+        log::info!(
+            "clavier : {} appuis en {:.0} s ; vus d'abord par le clavier lui-même {} fois, par \
+             l'état du système {} fois ; message de Windows en retard {} fois (moyenne {:.1} \
+             ms, pire {:.0} ms), jamais arrivé {} fois ; donnés pour des répétitions par \
+             Windows {} fois ; appuis plus brefs qu'une image {} (gardés une image)",
+            st.total,
+            since.elapsed().as_secs_f32(),
+            st.by_raw,
+            st.by_state,
+            st.late,
+            if st.late > 0 { st.late_sum / st.late as f32 } else { 0.0 },
+            st.late_max,
+            st.missing,
+            st.as_repeat,
+            st.taps
+        );
+        *st = PressStats {
+            since: Some(Instant::now()),
+            ..PressStats::default()
+        };
     }
 
     /// Touche tenue longtemps dont Windows a cessé d'envoyer les répétitions : elle est
@@ -225,6 +360,9 @@ impl Input {
     }
 
     fn end_frame(&mut self) {
+        for code in std::mem::take(&mut self.release_after_frame) {
+            self.held.remove(&code);
+        }
         self.pressed.clear();
         self.mouse_pressed = [false; 3];
         self.mouse_delta = (0.0, 0.0);
@@ -331,6 +469,9 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                 .create_window(attrs)
                 .expect("création de la fenêtre"),
         );
+        if let Some(f) = filter_keys() {
+            log::warn!("clavier : {f}");
+        }
         self.game.on_ready(window.clone());
         window.request_redraw();
         self.window = Some(window);
@@ -341,14 +482,19 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                self.input.report_presses(true);
                 self.game.on_exit();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => self.game.on_resize(size.width, size.height),
+            WindowEvent::Focused(true) => self.input.focused = true,
             WindowEvent::Focused(false) => {
+                self.input.focused = false;
                 self.input.held.clear();
                 self.input.raw_down.clear();
                 self.input.raw_released.clear();
+                self.input.release_after_frame.clear();
+                self.input.early_press.clear();
                 self.input.mouse_held = [false; 3];
                 self.set_grab(false);
             }
@@ -373,7 +519,10 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                                 .text
                                 .extend(t.chars().filter(|c| !c.is_control()));
                         }
-                        if !event.repeat {
+                        // Un appui déjà annoncé par le clavier lui-même ou par l'état du
+                        // système n'est pas annoncé une deuxième fois (une touche qui ouvre
+                        // et ferme un menu ne doit pas basculer deux fois).
+                        if !event.repeat && !self.input.early_press.contains_key(&code) {
                             self.input.pressed.insert(code);
                         }
                         if let winit::keyboard::Key::Character(c) = &event.logical_key {
@@ -402,23 +551,37 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                         if event.repeat && self.input.soft.remove(&code) {
                             self.input.held.insert(code);
                         }
-                        let fresh = !event.repeat
-                            || (self.input.raw_down.contains(&code)
-                                && !self.input.held.contains(&code));
+                        // Déjà vue par le clavier lui-même ou par l'état du système : ce
+                        // message confirme l'appui (son retard est noté).
+                        let held = self.input.held.contains(&code);
+                        if held && !event.repeat {
+                            self.input.confirm_press(code);
+                        } else if held {
+                            // Windows l'a vue, mais en répétition : pas de retard à noter.
+                            self.input.early_press.remove(&code);
+                        }
+                        // Un appui que Windows donne pour une répétition (il croyait la
+                        // touche encore enfoncée) est un vrai appui si la touche l'est
+                        // vraiment : d'après le clavier, ou d'après l'état du système. Une
+                        // répétition en retard d'une touche déjà relâchée, elle, ne remet
+                        // rien (elle faisait continuer d'avancer).
+                        let fresh = !held
+                            && (!event.repeat
+                                || self.input.raw_down.contains(&code)
+                                || key_down_now(code));
                         if fresh {
-                            self.input.last_press = Some(Instant::now());
-                            self.input.soft.remove(&code);
-                            self.input.repeats.remove(&code);
-                            self.input.pressed.insert(code);
-                            self.input.held.insert(code);
-                            self.input.pressed_at.insert(code, Instant::now());
+                            if event.repeat {
+                                self.input.press_stats.as_repeat += 1;
+                            }
+                            self.input.press_now(code, "message de Windows");
                         }
                         if code == KeyCode::Escape {
                             self.set_grab(false);
                         }
                     }
                     ElementState::Released => {
-                        if self.input.held.remove(&code) {
+                        self.input.early_press.remove(&code);
+                        if self.input.release_now(code) {
                             self.input.note_release(code, "message de Windows");
                         }
                     }
@@ -464,6 +627,13 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         release_stale_keys(&mut self.input);
         self.input.release_silent_keys();
+        // La fenêtre a-t-elle le clavier ? (aussi lu ici : le message de prise du clavier
+        // peut manquer au premier affichage de la fenêtre).
+        if let Some(w) = &self.window {
+            self.input.focused = w.has_focus();
+        }
+        catch_missed_presses(&mut self.input);
+        self.input.report_presses(false);
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
@@ -490,6 +660,7 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
         }
         self.ui_was_open = open;
         if !keep_running {
+            self.input.report_presses(true);
             self.game.on_exit();
             event_loop.exit();
         }
@@ -519,10 +690,21 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                             log::info!("clavier : la saisie brute arrive");
                         }
                         self.input.raw_down.insert(code);
+                        // Le clavier lui-même dit la touche enfoncée, et Windows aussi (son
+                        // état des touches) : appui pris tout de suite, sans attendre son
+                        // message (qui peut arriver en retard, ou pas du tout). Sans l'accord
+                        // de Windows, rien : un logiciel qui change les touches (remappage)
+                        // a pu avaler celle-ci, son message dira la bonne.
+                        if self.input.focused
+                            && !self.input.held.contains(&code)
+                            && key_down_now(code)
+                        {
+                            self.input.press_now(code, "clavier (saisie brute)");
+                        }
                     }
                     ElementState::Released => {
                         self.input.raw_down.remove(&code);
-                        if self.input.held.remove(&code) {
+                        if self.input.release_now(code) {
                             self.input.note_release(code, "clavier (saisie brute)");
                             self.input.raw_released.push((code, Instant::now()));
                         }
@@ -911,8 +1093,112 @@ fn release_stale_keys(input: &mut Input) {
         log::info!(
             "touche {code:?} relâchée sans message du système : rattrapée ({since:.2} s après l'appui)"
         );
-        input.held.remove(&code);
+        input.release_now(code);
         input.note_release(code, "état du système");
+    }
+}
+
+/// Touches filtrées de Windows (accessibilité) : quand elles sont actives, Windows attend
+/// avant d'accepter un appui, ou ignore les appuis rapprochés. `None` : inactives.
+/// (Elles s'activent aussi en tenant Maj droite 8 s, ce qui arrive en courant.)
+#[cfg(windows)]
+pub fn filter_keys() -> Option<String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETFILTERKEYS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    #[repr(C)]
+    #[derive(Default)]
+    struct FilterKeys {
+        size: u32,
+        flags: u32,
+        wait_ms: u32,
+        delay_ms: u32,
+        repeat_ms: u32,
+        bounce_ms: u32,
+    }
+    let mut fk = FilterKeys {
+        size: std::mem::size_of::<FilterKeys>() as u32,
+        ..FilterKeys::default()
+    };
+    // SAFETY : lecture d'un réglage dans une structure de la taille annoncée.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETFILTERKEYS,
+            fk.size,
+            Some(&mut fk as *mut FilterKeys as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    (ok.is_ok() && fk.flags & 1 != 0).then(|| {
+        format!(
+            "touches filtrées de Windows ACTIVES : appui accepté après {} ms, appuis \
+             rapprochés ignorés pendant {} ms (Paramètres > Accessibilité > Clavier)",
+            fk.wait_ms, fk.bounce_ms
+        )
+    })
+}
+
+#[cfg(not(windows))]
+pub fn filter_keys() -> Option<String> {
+    None
+}
+
+/// La touche `code` est-elle enfoncée en ce moment d'après l'état du système (mis à jour
+/// avant que le message de Windows n'arrive dans la file du jeu) ?
+#[cfg(windows)]
+fn key_down_now(code: KeyCode) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX,
+    };
+    use winit::platform::scancode::PhysicalKeyExtScancode;
+    let Some(sc) = PhysicalKey::Code(code).to_scancode() else {
+        return false;
+    };
+    // SAFETY : simples lectures de l'état du clavier.
+    let vk = unsafe { MapVirtualKeyW(sc, MAPVK_VSC_TO_VK_EX) };
+    vk != 0 && unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0
+}
+
+#[cfg(not(windows))]
+fn key_down_now(_code: KeyCode) -> bool {
+    false
+}
+
+/// Touches de jeu regardées à chaque image (lettres, chiffres, espace, modificateurs,
+/// flèches) : un appui sans message de Windows est quand même vu.
+const WATCHED: &[KeyCode] = &[
+    KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE,
+    KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ,
+    KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO,
+    KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR, KeyCode::KeyS, KeyCode::KeyT,
+    KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY,
+    KeyCode::KeyZ, KeyCode::Digit0, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3,
+    KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8,
+    KeyCode::Digit9, KeyCode::Space, KeyCode::ShiftLeft, KeyCode::ShiftRight,
+    KeyCode::ControlLeft, KeyCode::ControlRight, KeyCode::AltLeft, KeyCode::Tab,
+    KeyCode::ArrowUp, KeyCode::ArrowDown, KeyCode::ArrowLeft, KeyCode::ArrowRight,
+];
+
+/// Appui qu'aucun message n'a annoncé : la touche est enfoncée d'après l'état du système,
+/// pas encore pour le jeu. Avec la saisie brute, seulement si le clavier lui-même la dit
+/// enfoncée aussi (l'état du système peut garder enfoncée une touche dont un logiciel a
+/// avalé le relâchement) ; sans elle, parmi les touches de jeu courantes. Jamais une touche
+/// relâchée faute de répétitions (`soft`), pour la même raison.
+fn catch_missed_presses(input: &mut Input) {
+    if !input.focused {
+        return;
+    }
+    let candidates: Vec<KeyCode> = if input.raw_seen {
+        input.raw_down.iter().copied().collect()
+    } else {
+        WATCHED.to_vec()
+    };
+    let missed: Vec<KeyCode> = candidates
+        .into_iter()
+        .filter(|k| !input.held.contains(k) && !input.soft.contains(k) && key_down_now(*k))
+        .collect();
+    for code in missed {
+        input.press_now(code, "état du système");
     }
 }
 
@@ -990,4 +1276,65 @@ mod key_repeat {
 
     #[cfg(not(windows))]
     pub fn restore_leftover() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn un_appui_plus_bref_qu_une_image_est_vu_une_image() {
+        let mut i = Input {
+            focused: true,
+            ..Input::default()
+        };
+        i.press_now(KeyCode::KeyW, "message de Windows");
+        assert!(i.release_now(KeyCode::KeyW));
+        // Relâchée dans la même image : encore tenue pour cette image.
+        assert!(i.held(KeyCode::KeyW) && i.pressed(KeyCode::KeyW));
+        i.end_frame();
+        assert!(!i.held(KeyCode::KeyW));
+        assert_eq!(i.press_stats.taps, 1);
+        // Tenue sur deux images : relâchée tout de suite.
+        i.press_now(KeyCode::KeyW, "message de Windows");
+        i.end_frame();
+        assert!(i.release_now(KeyCode::KeyW));
+        assert!(!i.held(KeyCode::KeyW));
+        assert!(!i.release_now(KeyCode::KeyW));
+    }
+
+    #[test]
+    fn appui_vu_par_le_clavier_puis_confirme_par_windows() {
+        let mut i = Input {
+            focused: true,
+            ..Input::default()
+        };
+        i.press_now(KeyCode::KeyW, "clavier (saisie brute)");
+        assert!(i.held(KeyCode::KeyW) && i.pressed(KeyCode::KeyW));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        i.confirm_press(KeyCode::KeyW);
+        assert_eq!((i.press_stats.by_raw, i.press_stats.late), (1, 1));
+        assert!(i.press_stats.late_max >= 4.0);
+        // Un appui jamais confirmé par Windows (relâché avant) est compté.
+        i.end_frame();
+        i.press_now(KeyCode::KeyA, "clavier (saisie brute)");
+        i.end_frame();
+        assert!(i.release_now(KeyCode::KeyA));
+        assert_eq!(i.press_stats.missing, 1);
+        assert_eq!(i.press_stats.total, 2);
+    }
+
+    #[test]
+    fn un_appui_annonce_par_le_clavier_ne_l_est_pas_deux_fois() {
+        let mut i = Input {
+            focused: true,
+            ..Input::default()
+        };
+        // Vu par le clavier à l'image 1, message de Windows à l'image 2.
+        i.press_now(KeyCode::KeyE, "clavier (saisie brute)");
+        assert!(i.pressed(KeyCode::KeyE));
+        i.end_frame();
+        assert!(i.early_press.contains_key(&KeyCode::KeyE));
+        assert!(i.held(KeyCode::KeyE) && !i.pressed(KeyCode::KeyE));
+    }
 }
