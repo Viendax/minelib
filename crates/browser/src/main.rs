@@ -38,15 +38,18 @@ use cef::*;
 
 /// Script injecté dans chaque page : signale quand un champ de texte prend ou perd le
 /// focus (`__minelib_focus__0/1`), et l'adresse et l'état de la vidéo
-/// (`__minelib_state__{…}`), par des messages de la console que ce programme intercepte.
+/// (`__minelib_state__{…}` : temps, pause, pub YouTube en cours, vidéo du lecteur), par des
+/// messages de la console que ce programme intercepte.
 const PAGE_JS: &str = r#"(()=>{if(window.__minelib)return;window.__minelib=1;
 const ed=e=>!!e&&(e.isContentEditable||e.tagName==='TEXTAREA'||(e.tagName==='INPUT'&&!/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/i.test(e.type||'')));
 const deep=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a;};
 let f=null;const focus=()=>{const v=ed(deep())?1:0;if(v!==f){f=v;console.log('__minelib_focus__'+v);}};
 document.addEventListener('focusin',focus,true);
 document.addEventListener('focusout',()=>setTimeout(focus,0),true);
-let s='';setInterval(()=>{focus();const v=document.querySelector('video');
-const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true});
+let s='';setInterval(()=>{focus();const mp=document.getElementById('movie_player');
+const v=(mp&&mp.querySelector('video'))||document.querySelector('video');
+let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
+const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing'),i:i});
 if(st!==s){s=st;console.log('__minelib_state__'+st);}},500);})();"#;
 
 /// Le champ de texte qui a le focus le perd.

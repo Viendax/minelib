@@ -312,6 +312,8 @@ pub struct Displays {
     browser_tried: bool,
     /// Un onglet par écran, par numéro d'écran.
     tabs: std::collections::HashMap<u32, Tab>,
+    /// États rapportés par les pages depuis le dernier `take_states` (regarder ensemble).
+    states: Vec<(u32, String)>,
 }
 
 impl Displays {
@@ -320,6 +322,7 @@ impl Displays {
             browser: None,
             browser_tried: false,
             tabs: std::collections::HashMap::new(),
+            states: Vec::new(),
         }
     }
 
@@ -469,11 +472,21 @@ impl Displays {
         }
     }
 
-    /// Dernier état connu de la page de l'écran `id` (adresse, temps de la vidéo, pause),
-    /// tel que la page l'écrit (`{"u":…,"t":…,"p":…}`).
-    #[allow(dead_code)] // lu par la watch-party
-    pub fn state(&self, id: u32) -> Option<&str> {
-        self.tabs.get(&id)?.state.as_deref()
+    /// Lance le script `js` dans la page de l'écran `id` (regarder ensemble : temps et
+    /// pause de la vidéo).
+    pub fn eval(&mut self, id: u32, js: &str) {
+        if !self.tabs.contains_key(&id) {
+            return;
+        }
+        if let Some(b) = self.browser.as_mut() {
+            b.send(&format!("eval {id} {js}"));
+        }
+    }
+
+    /// États rapportés par les pages depuis le dernier appel (adresse, temps de la vidéo,
+    /// pause, pub ; `{"u":…,"t":…,"p":…,"a":…,"i":…}`), dans l'ordre.
+    pub fn take_states(&mut self) -> Vec<(u32, String)> {
+        std::mem::take(&mut self.states)
     }
 
     /// Image actuelle de l'écran `id` : version, largeur, hauteur, pixels BGRA.
@@ -509,7 +522,7 @@ impl Displays {
                     };
                     match ev {
                         Event::Editing(on) => tab.editing = on,
-                        Event::State(s) => tab.state = Some(s),
+                        Event::State(s) => self.states.push((id, s)),
                     }
                 }
             }
@@ -540,8 +553,6 @@ struct Tab {
     ripple: Option<([f32; 2], f32)>,
     /// Un champ de texte de la page a le focus.
     editing: bool,
-    /// Dernier état de la page (adresse, temps de la vidéo, pause).
-    state: Option<String>,
     /// À redessiner (nouvelle image de la page, curseur déplacé…).
     dirty: bool,
     /// Change à chaque nouvelle image (le rendu ne renvoie que les nouvelles).
@@ -562,7 +573,6 @@ impl Tab {
             sent: None,
             ripple: None,
             editing: false,
-            state: None,
             dirty: true,
             version: 0,
         };

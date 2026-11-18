@@ -257,13 +257,19 @@ pub struct Session {
     /// image depuis le dossier du monde.
     screens: Vec<crate::screen::Placed>,
     screens_loaded: bool,
+    /// Écrans montrés : les siens (`screens`), puis ceux des joueurs proches avec leur
+    /// propriétaire (regarder ensemble, en construction en ligne). Refaits à chaque image.
+    shown: Vec<(crate::screen::Placed, Option<String>)>,
+    /// Regarder ensemble : écrans des autres et vidéos partagées.
+    party: crate::watch::Party,
     /// Ce qu'affichent les écrans (une page chacun).
     displays: crate::screen::Displays,
     /// Dernier écran regardé ou touché (cible de `/yt`).
     screen_last: Option<u32>,
     /// Touche répétée dans le champ de texte d'un écran (effacer, flèches…).
     screen_repeat: Option<(KeyCode, f32)>,
-    /// Écran visé par le réticule : indice, distance et point visé dessus (0..1).
+    /// Écran visé par le réticule : indice (dans `shown`), distance et point visé dessus
+    /// (0..1).
     screen_aim: Option<(usize, f32, [f32; 2])>,
     /// Écran touché dont la touche « utiliser » n'est pas encore relâchée.
     screen_touch: Option<u32>,
@@ -474,6 +480,8 @@ impl Session {
             perspective: 0,
             screens: Vec::new(),
             screens_loaded: false,
+            shown: Vec::new(),
+            party: crate::watch::Party::new(),
             displays: crate::screen::Displays::new(),
             screen_last: None,
             screen_repeat: None,
@@ -1371,7 +1379,7 @@ impl Session {
 
     /// `/yt` : ouvre YouTube (accueil, recherche ou adresse) sur les écrans vidéo.
     fn youtube(&mut self, query: &str) {
-        if self.screens.is_empty() {
+        if self.shown.is_empty() {
             self.chat.say(
                 "Pose d'abord un écran vidéo (objet « Écran vidéo », /give ecran).",
                 chat::RED,
@@ -1381,8 +1389,8 @@ impl Session {
         // L'écran regardé en dernier, sinon le premier.
         let id = self
             .screen_last
-            .filter(|l| self.screens.iter().any(|s| s.id() == *l))
-            .unwrap_or_else(|| self.screens[0].id());
+            .filter(|l| self.shown.iter().any(|s| s.0.id() == *l))
+            .unwrap_or_else(|| self.shown[0].0.id());
         let url = crate::screen::youtube_url(query);
         if self.displays.open(id, &url) {
             self.chat.say(format!("Écran : {url}"), chat::YELLOW);
@@ -1400,22 +1408,33 @@ impl Session {
     /// « utiliser » l'ignore et pose le bloc tenu devant (voir `handle_blocks`). En mode
     /// FPS, la touche « utiliser » le touche ; on ne le casse pas. Un clic dans un champ de
     /// texte de la page y envoie le clavier tant que le réticule reste sur l'écran.
+    ///
+    /// En construction en ligne, les écrans des joueurs proches sont montrés aussi, et les
+    /// vidéos YouTube partagées (voir `crate::watch`) ; seul leur propriétaire les casse.
     fn update_screens(&mut self, input: &Input, dt: f32, typing: bool) {
         if !self.screens_loaded {
             self.screens = crate::screen::load(&self.dir);
             self.screens_loaded = true;
         }
-        // Hitbox pour la physique (aussi après une réapparition du joueur).
-        if self.player.solids.len() != self.screens.len() {
-            self.screens_changed(false);
+        if self.build.is_none() {
+            self.party.clear();
         }
+        self.shown = self.screens.iter().map(|s| (*s, None)).collect();
+        self.shown.extend(
+            self.party
+                .screens(&self.screens)
+                .into_iter()
+                .map(|(s, owner)| (s, Some(owner))),
+        );
+        // Hitbox pour la physique.
+        self.player.solids = self.shown.iter().map(|s| s.0.hitbox()).collect();
         // Une page par écran : onglets ouverts et fermés avec les écrans.
-        let ids: Vec<u32> = self.screens.iter().map(|s| s.id()).collect();
+        let ids: Vec<u32> = self.shown.iter().map(|s| s.0.id()).collect();
         self.displays.sync(&ids);
         let fps = self.game.mode == GameMode::Fps;
         let use_key = if fps { Action::FpsUse } else { Action::Use };
         self.screen_aim = None;
-        if !self.screens.is_empty()
+        if !self.shown.is_empty()
             && input.grabbed
             && !typing
             && !self.inventory.open
@@ -1431,7 +1450,13 @@ impl Session {
         if let Some((i, t, uv)) = self.screen_aim {
             let near = !fps && t <= REACH;
             if near && self.keys.pressed(input, Action::Attack) {
-                self.break_screen(i);
+                match self.shown.get(i).and_then(|s| s.1.clone()) {
+                    Some(owner) => self.chat.say(
+                        format!("Cet écran est à {owner} : lui seul peut le retirer."),
+                        chat::YELLOW,
+                    ),
+                    None => self.break_screen(i),
+                }
                 self.screen_broke = true;
             } else if near && self.keys.pressed(input, Action::Pick) {
                 self.give_picked(Item::Screen);
@@ -1466,6 +1491,39 @@ impl Session {
         }
         self.displays.hover(aimed);
         self.displays.update(dt);
+        self.watch_together(dt);
+    }
+
+    /// Regarder ensemble (construction en ligne) : ce que rapportent les pages, messages
+    /// aux joueurs proches (par le canal de la voix), pages amenées à la vidéo partagée.
+    fn watch_together(&mut self, dt: f32) {
+        let states = self.displays.take_states();
+        let Some(b) = &self.build else {
+            return;
+        };
+        let me = b.pseudo().to_string();
+        let players: Vec<(String, Vec3)> = b
+            .others
+            .values()
+            .map(|o| (o.pseudo.clone(), o.pos))
+            .collect();
+        for (id, json) in states {
+            self.party.observe(id, &json, &me);
+        }
+        for act in self.party.update(dt, &self.screens, &players) {
+            match act {
+                crate::watch::Act::Open(id, url) => {
+                    self.displays.open(id, &url);
+                }
+                crate::watch::Act::Eval(id, js) => self.displays.eval(id, &js),
+            }
+        }
+        let out = self.party.take_out();
+        if let Some(b) = &self.build {
+            for (to, data) in out {
+                b.send_voice(to, data);
+            }
+        }
     }
 
     /// Clavier dans le champ de texte de l'écran `id` : texte tapé et touches spéciales
@@ -1518,8 +1576,8 @@ impl Session {
     /// focus) ? Le jeu ne lit alors plus ses touches.
     pub fn keyboard_on_screen(&self) -> bool {
         self.screen_aim
-            .and_then(|a| self.screens.get(a.0))
-            .is_some_and(|s| self.displays.editing(s.id()))
+            .and_then(|a| self.shown.get(a.0))
+            .is_some_and(|s| self.displays.editing(s.0.id()))
     }
 
     /// Échap pendant qu'on écrit dans la page d'un écran : le champ de texte perd le focus
@@ -1527,8 +1585,8 @@ impl Session {
     pub fn screen_escape(&mut self) {
         let id = self
             .screen_aim
-            .and_then(|a| self.screens.get(a.0))
-            .map(|s| s.id());
+            .and_then(|a| self.shown.get(a.0))
+            .map(|s| s.0.id());
         if let Some(id) = id {
             self.displays.blur(id);
         }
@@ -1544,7 +1602,7 @@ impl Session {
             minelib_world::raycast::raycast(&self.world, eye.into(), dir.into(), SCREEN_REACH);
         let limit = seen.map_or(SCREEN_REACH, |h| h.distance + 0.1);
         let mut best: Option<(usize, f32, [f32; 2])> = None;
-        for (i, s) in self.screens.iter().enumerate() {
+        for (i, (s, _)) in self.shown.iter().enumerate() {
             if let Some((t, uv)) = crate::screen::aim(&s.anchor(), eye, dir, limit) {
                 if best.is_none_or(|b| t < b.1) {
                     best = Some((i, t, uv));
@@ -1555,13 +1613,15 @@ impl Session {
     }
 
     /// Pose l'écran vidéo tenu sur la face visée `hit` (clic droit). Refusé s'il serait
-    /// dans le joueur ou s'il y est déjà.
+    /// dans le joueur ou s'il y en a déjà un (le sien ou celui d'un autre).
     fn place_screen(&mut self, hit: minelib_world::raycast::Hit) {
         let s = crate::screen::Placed::new(hit.block, hit.normal, self.player.eye());
         let (min, max) = s.hitbox();
         let (pmin, pmax) = self.player.bounds();
         let inside = (0..3).all(|k| pmin[k] < max[k] && pmax[k] > min[k]);
-        if inside || self.screens.contains(&s) || self.screens.len() >= crate::screen::MAX_SCREENS {
+        // (Ni sur un des siens, ni sur celui d'un autre joueur.)
+        let taken = self.shown.iter().any(|x| x.0.id() == s.id());
+        if inside || taken || self.screens.len() >= crate::screen::MAX_SCREENS {
             return;
         }
         if self.game.mode != GameMode::Creative {
@@ -1571,7 +1631,8 @@ impl Session {
         self.screens_changed(true);
     }
 
-    /// Casse l'écran `i` : l'objet revient dans l'inventaire (hors créatif).
+    /// Casse l'écran `i` (un des siens, les premiers de `shown`) : l'objet revient dans
+    /// l'inventaire (hors créatif).
     fn break_screen(&mut self, i: usize) {
         if i >= self.screens.len() {
             return;
@@ -1584,12 +1645,14 @@ impl Session {
         self.screens_changed(true);
     }
 
-    /// Les écrans ont changé : hitbox pour la physique du joueur, et enregistrement.
+    /// Ses écrans ont changé : hitbox pour la physique du joueur (refaite aussi à chaque
+    /// image), enregistrement, et les joueurs proches le savent tout de suite.
     fn screens_changed(&mut self, save: bool) {
         self.player.solids = self.screens.iter().map(|s| s.hitbox()).collect();
         if save {
             crate::screen::save(&self.dir, &self.screens);
         }
+        self.party.screens_changed();
     }
 
     /// Cadre (carte importée) que le joueur vise, devant tout bloc visible.
@@ -4641,6 +4704,17 @@ impl Session {
     /// Construction (v137) : voix reçue (par le relais du monde, ou par un relais de région
     /// : `relayed`), jouée au volume choisi pour ce joueur, plus bas avec la distance.
     fn voice_from(&mut self, from: &str, data: &[u8], relayed: bool) {
+        // Regarder ensemble : ses messages passent par le canal de la voix.
+        if data.starts_with(&crate::watch::MAGIC) {
+            let pos = self.build.as_ref().and_then(|b| {
+                b.others
+                    .values()
+                    .find(|o| o.pseudo.eq_ignore_ascii_case(from))
+                    .map(|o| o.pos)
+            });
+            self.party.receive(from, data, pos, &self.screens);
+            return;
+        }
         let key = crate::voice::key_of(from);
         let dist = self.build.as_ref().and_then(|b| {
             b.others
@@ -5484,7 +5558,7 @@ impl Session {
             statics.push((u64::MAX, v, gen));
         }
         let screens: Vec<(u32, minelib_render::ScreenAnchor)> =
-            self.screens.iter().map(|s| (s.id(), s.anchor())).collect();
+            self.shown.iter().map(|s| (s.0.id(), s.0.anchor())).collect();
         renderer.set_screens(&screens);
         for (id, _) in &screens {
             if let Some((version, w, h, pixels)) = self.displays.frame(*id) {
@@ -5521,9 +5595,9 @@ impl Session {
                 // Hitbox de l'écran visé (à portée de main), sinon cadre, sinon bloc.
                 self.screen_aim
                     .filter(|a| a.1 <= REACH)
-                    .and_then(|a| self.screens.get(a.0))
+                    .and_then(|a| self.shown.get(a.0))
                     .map(|s| {
-                        let (a, b) = s.hitbox();
+                        let (a, b) = s.0.hitbox();
                         (a.to_array(), b.to_array())
                     })
                     .or_else(|| self.frame_aim.and_then(|i| self.frames.as_ref()?.bounds(i)))

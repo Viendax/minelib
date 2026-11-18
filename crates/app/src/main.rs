@@ -76,6 +76,7 @@ mod province_host;
 mod radar;
 mod save;
 mod screen;
+mod watch;
 mod session;
 mod skin;
 mod stick;
