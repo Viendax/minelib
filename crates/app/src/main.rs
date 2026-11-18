@@ -61,11 +61,11 @@ mod garant_worker;
 mod gpu_plan;
 mod gpu_report;
 mod hand;
-mod heat;
 mod heads;
 mod i18n;
 mod inventory;
 mod jobs;
+mod keylag;
 mod keys;
 mod light_editor;
 mod lights;
@@ -251,8 +251,6 @@ struct Game {
     shot_at: Option<f32>,
     show_debug: bool,
     fps_max: Option<f32>,
-    /// Garde thermique : limite d'images pour garder la carte graphique sous sa cible.
-    heat: heat::Guard,
     frame_start: Instant,
     // Écran Solo
     worlds: Vec<WorldSummary>,
@@ -383,7 +381,6 @@ impl Game {
             started: std::time::Instant::now(),
             show_debug: env_parse::<u8>("MINELIB_DEBUG").is_some_and(|v| v != 0),
             fps_max: env_parse::<f32>("MINELIB_FPS_MAX").filter(|&f| f > 0.0),
-            heat: heat::Guard::new(),
             frame_start: Instant::now(),
             selected_world: None,
             world_scroll: 0,
@@ -581,14 +578,9 @@ impl Game {
     }
 
     fn limit_fps(&mut self) {
-        // Hors du jeu, les menus n'ont pas besoin de plus de 120 images/s. En partie, la
-        // garde thermique peut limiter plus bas (carte graphique trop chaude).
+        // Hors du jeu, les menus n'ont pas besoin de plus de 120 images/s.
         let max = if self.session.is_some() {
-            self.heat.update(self.fps_limit());
-            match (self.fps_limit(), self.heat.cap()) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            }
+            self.fps_limit()
         } else {
             Some(self.fps_limit().unwrap_or(120.0).min(120.0))
         };
@@ -3553,15 +3545,6 @@ impl GameLoop for Game {
         }
         self.renderer = Some(renderer);
         self.frames_drawn = self.frames_drawn.saturating_add(1);
-        // Garde thermique : jamais sous la fréquence de l'écran (relue avant chaque décision).
-        if self.heat.wants_hz() {
-            self.heat.set_hz(
-                window
-                    .current_monitor()
-                    .and_then(|m| m.refresh_rate_millihertz())
-                    .map(|mhz| mhz as f32 / 1000.0),
-            );
-        }
         self.limit_fps();
         minelib_render::perf::frame_end();
         !self.quit

@@ -249,7 +249,7 @@ pub struct Session {
     /// Touches filtrées de Windows : regardées une fois par partie, dans ce temps (s).
     filter_keys_in: Option<f32>,
     /// Bilan des retards de la touche avancer (journal toutes les 5 minutes).
-    lag_book: crate::heat::LagBook,
+    lag_book: crate::keylag::LagBook,
     autosave: f32,
     hit: Option<Hit>,
     /// Cadre visé (son rang dans `frames`).
@@ -4390,49 +4390,6 @@ impl Session {
                 }
                 _ => self.chat.say("Utilisation : /foule <on|off>", chat::RED),
             },
-            // Garde thermique : température cible de la carte graphique (moins d'images
-            // inutiles, moins de chaleur sous le clavier).
-            "temperature" | "température" | "temp" => {
-                let goal = match arg {
-                    Some("off" | "non" | "0") => Some(None),
-                    Some(v) => v
-                        .trim_end_matches("°C")
-                        .trim_end_matches('°')
-                        .parse::<u32>()
-                        .ok()
-                        .filter(|t| (50..=95).contains(t))
-                        .map(Some),
-                    None => None,
-                };
-                match goal {
-                    Some(t) => {
-                        crate::heat::set_target(t);
-                        self.chat.say(
-                            match t {
-                                Some(t) => format!(
-                                    "Garde thermique : le jeu limite ses images pour garder la \
-                                     carte graphique sous {t} °C."
-                                ),
-                                None => "Garde thermique coupée.".to_string(),
-                            },
-                            chat::YELLOW,
-                        );
-                    }
-                    None => {
-                        let now = minelib_render::thermal::gpu_temp()
-                            .map_or("inconnue".into(), |t| format!("{t:.0} °C"));
-                        let goal = crate::heat::target()
-                            .map_or("coupée".into(), |t| format!("cible {t} °C"));
-                        self.chat.say(
-                            format!(
-                                "Carte graphique : {now} ; garde thermique : {goal}. \
-                                 Utilisation : /temperature <50..95|off>"
-                            ),
-                            chat::YELLOW,
-                        );
-                    }
-                }
-            }
             // Touche « avancer » qui remonte mal : règle forcée, refusée ou apprise.
             "touchelente" | "slowkey" => {
                 use crate::stick::Mode;
