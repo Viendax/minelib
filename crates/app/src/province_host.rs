@@ -746,7 +746,8 @@ pub struct RegionAttach {
     pub room: u64,
     pub region: [i32; 2],
     pub province: [i32; 2],
-    pub secret: [u8; 32],
+    /// (v155) Son billet pour les autres relais de la région (signé par le relais du monde).
+    pub peer: (Vec<u8>, u64),
     pub slot: u16,
     pub root: [u8; 32],
     pub client: Client,
@@ -761,7 +762,7 @@ impl RegionAttach {
     pub fn connect(
         room: u64,
         region: [i32; 2],
-        secret: [u8; 32],
+        peer: (Vec<u8>, u64),
         slot: u16,
         root: [u8; 32],
         at: proto::ProvinceAt,
@@ -782,7 +783,7 @@ impl RegionAttach {
             room,
             region,
             province: at.info.province,
-            secret,
+            peer,
             slot,
             root,
             client,
@@ -825,7 +826,7 @@ pub fn attach_event(
             *shard = crate::garant_worker::ShardHost::start(
                 a.room,
                 a.region,
-                a.secret,
+                a.peer.clone(),
                 l,
                 p2p,
                 a.slot,

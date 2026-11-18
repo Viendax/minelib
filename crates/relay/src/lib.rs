@@ -3373,7 +3373,7 @@ fn registry_key(st: &State, pseudo: &str) -> Option<[u8; 32]> {
 /// Billet d'un joueur pour les relais de région de son monde, avec le certificat de la
 /// clé de son compte (régions souveraines, relais de secours).
 fn ticket_for(st: &State, rid: u64, id: u64) -> Option<Response> {
-    let room = st.rooms.get(&rid)?;
+    st.rooms.get(&rid)?;
     let c = st.conns.get(&id)?;
     let pseudo = c.pseudo.clone()?;
     let expires = now_secs() + 24 * 3600;
@@ -3381,12 +3381,22 @@ fn ticket_for(st: &State, rid: u64, id: u64) -> Option<Response> {
         account_key(st, id).map(|k| sovereign::Cert::issue(&st.cert_key, rid, &pseudo, k, expires));
     Some(Response::ShardTicket {
         room: rid,
-        mac: proto::shard_mac(&room.shard_secret, rid, &pseudo, expires),
+        sig: sign_ticket(st, rid, &pseudo, expires),
         pseudo,
         expires,
         cert,
         root: st.cert_key.verifying_key().to_bytes(),
     })
+}
+
+/// (v155) Billet pour les relais de région de ce monde, signé par sa clé des certificats :
+/// les hôtes des régions le vérifient sans pouvoir en faire.
+fn sign_ticket(st: &State, rid: u64, pseudo: &str, expires: u64) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    st.cert_key
+        .sign(&proto::ticket_msg(rid, pseudo, expires))
+        .to_bytes()
+        .to_vec()
 }
 
 /// Monde de construction : un relais de secours, sur le PC d'un autre joueur (connexion
@@ -4456,7 +4466,6 @@ fn send_shards(st: &mut State, rid: u64, id: u64) {
         return;
     }
     room.shards_sent.insert(id, print);
-    let secret = room.shard_secret;
     let Some(c) = st.conns.get(&id) else { return };
     if province_here {
         transport::push(&c.tx, &Response::Shards { list });
@@ -4474,7 +4483,7 @@ fn send_shards(st: &mut State, rid: u64, id: u64) {
         &c.tx,
         &Response::ShardTicket {
             room: rid,
-            mac: proto::shard_mac(&secret, rid, &pseudo, expires),
+            sig: sign_ticket(st, rid, &pseudo, expires),
             pseudo,
             expires,
             cert,
@@ -4676,7 +4685,6 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
         }
     }
     wanted.sort();
-    let secret = room.shard_secret;
     if slow {
         st.slow_check = Instant::now();
     }
@@ -4729,6 +4737,10 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
                 proto::region_of([zone[0] * proto::ZONE, zone[1] * proto::ZONE]) == region
             })
         };
+        // (v155) Son billet pour les autres relais de la région (une semaine), à la place
+        // du secret du monde.
+        let peer_expires = now_secs() + 7 * 24 * 3600;
+        let peer = sign_ticket(st, rid, &proto::shard_peer_name(slot), peer_expires);
         if let Some(c) = st.conns.get_mut(&g) {
             c.room = Some(rid);
             transport::push(
@@ -4736,7 +4748,8 @@ fn upkeep_regions(st: &mut State, rid: u64, index: &mut Option<PlayersIndex>) {
                 &Response::ShardTask {
                     room: rid,
                     region,
-                    secret,
+                    peer,
+                    peer_expires,
                     slot,
                     root: st.cert_key.verifying_key().to_bytes(),
                     province,
@@ -10565,11 +10578,54 @@ mod tests {
     /// relais du monde (pour cette province, cette époque, ce pseudo et cette clé) ; il
     /// reçoit tout ce qu'elle a, puis seulement ce que le relais du monde a gardé. Un relais
     /// de secours ne fait entrer aucun joueur tant qu'il n'a pas pris la place du relais.
+    /// (v155) Les billets des relais de région sont signés par le relais du monde : ils se
+    /// vérifient avec sa clé publique, et un hôte (qui n'a pas sa clé privée) ne sait pas en
+    /// faire, ni pour un autre joueur ni pour plus longtemps.
+    #[test]
+    fn region_tickets_are_signed_by_the_world_relay() {
+        use ed25519_dalek::Signer;
+        let world = SigningKey::from_bytes(&[3u8; 32]);
+        let host = SigningKey::from_bytes(&[4u8; 32]);
+        let root = world.verifying_key().to_bytes();
+        let sign = |k: &SigningKey, pseudo: &str, expires: u64| {
+            k.sign(&proto::ticket_msg(42, pseudo, expires))
+                .to_bytes()
+                .to_vec()
+        };
+        let good = sign(&world, "Joueur", 1000);
+        assert!(proto::ticket_ok(&root, 42, "Joueur", 1000, &good));
+        assert!(
+            proto::ticket_ok(&root, 42, "joueur", 1000, &good),
+            "pseudo sans casse"
+        );
+        assert!(!proto::ticket_ok(&root, 42, "Autre", 1000, &good));
+        assert!(!proto::ticket_ok(&root, 42, "Joueur", 9000, &good));
+        assert!(!proto::ticket_ok(&root, 43, "Joueur", 1000, &good));
+        assert!(!proto::ticket_ok(
+            &root,
+            42,
+            "Joueur",
+            1000,
+            &sign(&host, "Joueur", 1000)
+        ));
+        assert!(!proto::ticket_ok(&root, 42, "Joueur", 1000, &[0; 64]));
+        assert!(!proto::ticket_ok(&root, 42, "Joueur", 1000, &[]));
+        // Clés des provinces : chacune la sienne, dérivée de celle de son pays.
+        let s = [7u8; 32];
+        let a = proto::province_key(&s, 42, [0, 0], 4);
+        assert_ne!(a, proto::province_key(&s, 42, [1, 0], 4));
+        assert_ne!(a, proto::province_key(&s, 42, [0, 0], 2));
+        assert_ne!(proto::province_key(&a, 42, [0, 0], 1), a);
+    }
+
     #[test]
     fn a_province_standby_needs_the_world_relay_token() {
         let root_key = SigningKey::from_bytes(&[3u8; 32]);
         let root = root_key.verifying_key().to_bytes();
-        let secret = [7u8; 32];
+        // (v155) La province n'a que sa clé, dérivée du secret du monde.
+        let world = [7u8; 32];
+        let secret = proto::province_key(&world, 42, [0, 0], 1);
+        let neighbour = proto::province_key(&world, 42, [1, 0], 1);
         let info = proto::StandbyInfo {
             name: "Monde".into(),
             map: "monde".into(),
@@ -10642,6 +10698,15 @@ mod tests {
                 follow(st, &mut session, 5, other_player),
                 Response::Error { .. }
             ));
+            // (v155) Fait par l'hôte d'une autre province (avec sa clé à elle), ou avec le
+            // secret du monde, qu'aucun hôte n'a plus : refusé.
+            for key in [neighbour, world] {
+                let forged = proto::follow_token(&key, 42, [0, 0], "Suiveur", &signer, 5);
+                assert!(matches!(
+                    follow(st, &mut session, 5, forged),
+                    Response::Error { .. }
+                ));
+            }
             assert!(crowd.got(f).0.is_empty(), "rien n'est parti à un refusé");
             // Le bon : il reçoit ce qu'elle a.
             let token = proto::follow_token(&secret, 42, [0, 0], "Suiveur", &signer, 5);
@@ -10818,7 +10883,7 @@ mod tests {
             // (Un joueur sur deux cents passe chaque seconde dans la province voisine.)
             let mut moves: Vec<(Vec<String>, Vec<String>)> = vec![Default::default(); kids];
             for i in 0..kids {
-                if (i * 100 / per + round) % 7 == 0 && i.is_multiple_of(100 / per) {
+                if (i * 100 / per + round).is_multiple_of(7) && i.is_multiple_of(100 / per) {
                     let j = (i + 1) % kids;
                     if let Some(w) = names[i].pop() {
                         moves[i].1.push(w.clone());

@@ -379,7 +379,7 @@ type Ticket = (
     u64,
     String,
     u64,
-    [u8; 32],
+    Vec<u8>,
     Option<minelib_net::sovereign::Cert>,
 );
 
@@ -418,7 +418,7 @@ impl Shards {
             c.info.epoch = i.epoch;
             true
         });
-        let Some((room, pseudo, expires, mac, cert)) = self.ticket.clone() else {
+        let Some((room, pseudo, expires, sig, cert)) = self.ticket.clone() else {
             return;
         };
         for (region, list) in &self.list {
@@ -452,7 +452,7 @@ impl Shards {
                 room,
                 pseudo: pseudo.clone(),
                 expires,
-                mac,
+                sig: sig.clone(),
                 cert: cert.clone(),
             });
             self.serial += 1;
@@ -955,11 +955,11 @@ impl BuildNet {
         room: u64,
         pseudo: String,
         expires: u64,
-        mac: [u8; 32],
+        sig: Vec<u8>,
         cert: Option<minelib_net::sovereign::Cert>,
     ) {
         self.shards.pseudo = pseudo.clone();
-        self.shards.ticket = Some((room, pseudo, expires, mac, cert));
+        self.shards.ticket = Some((room, pseudo, expires, sig, cert));
     }
 
     /// Clé du relais du monde (dans le billet) : vérifie les bonjours de la voix.
@@ -2487,7 +2487,8 @@ mod tests {
                 Event::ShardTask {
                     room,
                     region,
-                    secret,
+                    peer,
+                    peer_expires,
                     slot,
                     root,
                     province: Some(at),
@@ -2498,7 +2499,15 @@ mod tests {
                         .as_ref()
                         .map_or([0; 32], |k| k.verifying_key().to_bytes());
                     self.attach = Some(crate::province_host::RegionAttach::connect(
-                        room, region, secret, slot, root, at, &self.name, signer, None,
+                        room,
+                        region,
+                        (peer, peer_expires),
+                        slot,
+                        root,
+                        at,
+                        &self.name,
+                        signer,
+                        None,
                     ));
                 }
                 Event::Province(Response::ProvinceTask {
@@ -2594,7 +2603,8 @@ mod tests {
                 Event::ShardTask {
                     room,
                     region,
-                    secret,
+                    peer,
+                    peer_expires,
                     slot,
                     root,
                     province: None,
@@ -2604,7 +2614,7 @@ mod tests {
                     self.shard = crate::garant_worker::ShardHost::start(
                         room,
                         region,
-                        secret,
+                        (peer, peer_expires),
                         link,
                         false,
                         slot,
@@ -2664,7 +2674,7 @@ mod tests {
                     room,
                     pseudo,
                     expires,
-                    mac,
+                    sig,
                     cert,
                     root,
                 } => {
@@ -2672,7 +2682,7 @@ mod tests {
                         self.cert = cert.clone();
                     }
                     if let Some(n) = &mut self.net {
-                        n.set_ticket(room, pseudo, expires, mac, cert);
+                        n.set_ticket(room, pseudo, expires, sig, cert);
                         n.set_root(root);
                     }
                 }

@@ -78,7 +78,7 @@ pub enum Cmd {
         room: u64,
         pseudo: String,
         expires: u64,
-        mac: [u8; 32],
+        sig: Vec<u8>,
         cert: Option<crate::sovereign::Cert>,
     },
     /// Hôte d'un relais de région rattaché à une province (v138) : entre chez le relais de
@@ -364,7 +364,8 @@ pub enum Event {
     ShardTask {
         room: u64,
         region: [i32; 2],
-        secret: [u8; 32],
+        peer: Vec<u8>,
+        peer_expires: u64,
         slot: u16,
         root: [u8; 32],
         province: Option<proto::ProvinceAt>,
@@ -470,7 +471,7 @@ pub enum Event {
         room: u64,
         pseudo: String,
         expires: u64,
-        mac: [u8; 32],
+        sig: Vec<u8>,
         cert: Option<crate::sovereign::Cert>,
         root: [u8; 32],
     },
@@ -832,14 +833,16 @@ impl Worker {
             Response::ShardTask {
                 room,
                 region,
-                secret,
+                peer,
+                peer_expires,
                 slot,
                 root,
                 province,
             } => Event::ShardTask {
                 room,
                 region,
-                secret,
+                peer,
+                peer_expires,
                 slot,
                 root,
                 province,
@@ -919,14 +922,14 @@ impl Worker {
                 room,
                 pseudo,
                 expires,
-                mac,
+                sig,
                 cert,
                 root,
             } => Event::ShardTicket {
                 room,
                 pseudo,
                 expires,
-                mac,
+                sig,
                 cert,
                 root,
             },
@@ -1275,7 +1278,7 @@ impl Worker {
                 room,
                 pseudo,
                 expires,
-                mac,
+                sig,
                 cert,
             } => {
                 self.chan = None;
@@ -1284,7 +1287,7 @@ impl Worker {
                     room,
                     pseudo,
                     expires,
-                    mac,
+                    sig,
                     cert,
                 })? {
                     Response::Welcome { pseudo, .. } => {

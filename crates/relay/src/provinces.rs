@@ -430,27 +430,46 @@ pub(crate) fn shard_at(
 ) -> Option<proto::ProvinceAt> {
     let room = st.rooms.get(&rid)?;
     let p = room.provinces.get(&proto::province_of(region, size(st)))?;
+    let parent = p.info.clone()?;
     // (v143) Région d'une province d'un pays : elle s'y rattache (la plus petite qui la
     // contient décide de ses blocs).
-    let info = p
-        .children
-        .iter()
-        .find(|c| c.has(region))
-        .cloned()
-        .or_else(|| p.info.clone())?;
+    let child = p.children.iter().find(|c| c.has(region)).cloned();
+    // (v155) Jeton fait avec la clé de la province où il entre (sa province, ou celle de son
+    // pays), pas avec le secret du monde.
+    let key = key_of(&room.shard_secret, rid, &parent);
+    let (key, info) = match child {
+        Some(c) => (key_of(&key, rid, &c), c),
+        None => (key, parent),
+    };
     let signer = super::registry_key(st, pseudo).unwrap_or([0; 32]);
     Some(proto::ProvinceAt {
-        token: proto::province_token(
-            &room.shard_secret,
-            rid,
-            region,
-            slot,
-            pseudo,
-            &signer,
-            info.epoch,
-        ),
+        token: proto::province_token(&key, rid, region, slot, pseudo, &signer, info.epoch),
         info,
     })
+}
+
+/// (v155) Clé d'une province (ou d'un pays) d'ici, d'après la clé de ce relais (le secret du
+/// monde au relais du monde, sa propre clé chez un pays).
+fn key_of(mine: &[u8; 32], rid: u64, info: &ProvinceInfo) -> [u8; 32] {
+    proto::province_key(mine, rid, info.province, info.size)
+}
+
+/// (v155) Relais du monde : la clé d'une de ses provinces (un pays), ou d'une province d'un
+/// de ses pays (qu'il connaît par la liste de ce pays).
+fn key_from_root(st: &State, rid: u64, info: &ProvinceInfo) -> Option<[u8; 32]> {
+    let room = st.rooms.get(&rid)?;
+    let p = room
+        .provinces
+        .get(&proto::province_of(info.first_region(), size(st)))?;
+    let top = p.info.as_ref()?;
+    let k = key_of(&room.shard_secret, rid, top);
+    if (top.province, top.size) == (info.province, info.size) {
+        return Some(k);
+    }
+    p.children
+        .iter()
+        .find(|c| (c.province, c.size) == (info.province, info.size))
+        .map(|c| key_of(&k, rid, c))
 }
 
 /// Relais du monde, entretien (toutes les 2 s) : les provinces assez peuplées sont
@@ -599,7 +618,8 @@ fn delegate(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
         server: room.server.clone(),
         owner: room.host_pseudo.clone(),
     };
-    let secret = room.shard_secret;
+    // (v155) Sa clé à elle, dérivée de celle d'ici : plus le secret du monde.
+    let secret = proto::province_key(&room.shard_secret, rid, p, size);
     let server = room.server.clone();
     let settings = settings_of(st, &server);
     let room = st.rooms.get_mut(&rid).expect("partie");
@@ -858,10 +878,15 @@ fn give_child_task(
         .and_then(|c| c.pseudo.clone())
         .unwrap_or_default();
     let signer = super::account_key(st, g).unwrap_or([0; 32]);
+    // (v155) Le jeton qui le fait entrer chez son pays est fait avec la clé de ce pays ; sa
+    // propre clé (dans la tâche) est dérivée de celle-là.
+    let Some(parent_key) = key_from_root(st, rid, pays) else {
+        return;
+    };
     let Some(room) = st.rooms.get(&rid) else {
         return;
     };
-    let secret = room.shard_secret;
+    let secret = proto::province_key(&parent_key, rid, w.province, w.size);
     let info = task_info(room);
     let server = room.server.clone();
     let settings = settings_of(st, &server);
@@ -875,7 +900,14 @@ fn give_child_task(
     let parent = Some(Box::new(proto::ProvinceAt {
         info: pays.clone(),
         token: proto::child_token(
-            &secret, rid, w.province, w.size, &pseudo, &signer, w.epoch, standby,
+            &parent_key,
+            rid,
+            w.province,
+            w.size,
+            &pseudo,
+            &signer,
+            w.epoch,
+            standby,
         ),
     }));
     let room = st.rooms.get_mut(&rid).expect("partie");
@@ -2183,7 +2215,9 @@ fn assign_standby(st: &mut State, rid: u64, p: [i32; 2], size: i32, g: u64) {
     } else {
         (None, Vec::new())
     };
-    let secret = room.shard_secret;
+    // (v155) La clé de la province (son relais de secours en aura besoin s'il prend sa
+    // place), et le jeton qu'elle vérifie avec.
+    let secret = proto::province_key(&room.shard_secret, rid, p, size);
     let token = proto::follow_token(&secret, rid, p, &pseudo, &signer, epoch);
     let task = task_info(room);
     let server = room.server.clone();
@@ -4041,7 +4075,15 @@ fn give_task(
         .and_then(|c| c.pseudo.clone())
         .unwrap_or_default();
     let signer = super::account_key(st, g).unwrap_or([0; 32]);
-    let secret = room.shard_secret;
+    // (v155) Il entre chez `at` (ce pays, ou une de ses provinces qui est un pays) : jeton
+    // fait avec la clé de `at` ; sa propre clé est dérivée de celle-là.
+    let own = room.shard_secret;
+    let parent_key = if (at.province, at.size) == (pr.province, pr.size) {
+        own
+    } else {
+        key_of(&own, rid, &at)
+    };
+    let secret = proto::province_key(&parent_key, rid, w.province, w.size);
     let info = task_info(room);
     let settings = settings_of(st, &room.server);
     let standby = w.follow.is_some();
@@ -4054,7 +4096,14 @@ fn give_task(
     let parent = Some(Box::new(proto::ProvinceAt {
         info: at,
         token: proto::child_token(
-            &secret, rid, w.province, w.size, &pseudo, &signer, w.epoch, standby,
+            &parent_key,
+            rid,
+            w.province,
+            w.size,
+            &pseudo,
+            &signer,
+            w.epoch,
+            standby,
         ),
     }));
     let (nest, deeper) = levels;

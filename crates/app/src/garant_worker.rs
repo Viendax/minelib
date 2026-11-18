@@ -529,14 +529,14 @@ impl ShardHost {
     pub fn start(
         room: u64,
         region: [i32; 2],
-        secret: [u8; 32],
+        peer: (Vec<u8>, u64),
         link: std::sync::mpsc::Sender<minelib_net::transport::Inbound>,
         p2p: bool,
         slot: u16,
         root: [u8; 32],
         signer: Option<minelib_net::ed25519_dalek::SigningKey>,
     ) -> Option<Self> {
-        let handle = minelib_relay::shard::start("0.0.0.0:0", room, region, secret, slot, root)
+        let handle = minelib_relay::shard::start("0.0.0.0:0", room, region, peer, slot, root)
             .map_err(|e| log::warn!("relais de région : {e:#}"))
             .ok()?;
         if let Some(k) = signer {
@@ -1140,7 +1140,8 @@ fn run(
                 Event::ShardTask {
                     room,
                     region,
-                    secret,
+                    peer,
+                    peer_expires,
                     slot,
                     root,
                     province: Some(at),
@@ -1157,7 +1158,7 @@ fn run(
                     attach = Some(crate::province_host::RegionAttach::connect(
                         room,
                         region,
-                        secret,
+                        (peer, peer_expires),
                         slot,
                         root,
                         at,
@@ -1169,7 +1170,8 @@ fn run(
                 Event::ShardTask {
                     room,
                     region,
-                    secret,
+                    peer,
+                    peer_expires,
                     slot,
                     root,
                     province: None,
@@ -1182,7 +1184,7 @@ fn run(
                         shard = ShardHost::start(
                             room,
                             region,
-                            secret,
+                            (peer, peer_expires),
                             l,
                             login.node_dir.is_some(),
                             slot,

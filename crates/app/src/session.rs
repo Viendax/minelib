@@ -2808,11 +2808,11 @@ impl Session {
                     room,
                     pseudo,
                     expires,
-                    mac,
+                    sig,
                     cert,
                     root,
                 } => {
-                    b.set_ticket(*room, pseudo.clone(), *expires, *mac, cert.clone());
+                    b.set_ticket(*room, pseudo.clone(), *expires, sig.clone(), cert.clone());
                     b.set_root(*root);
                 }
                 // WorldEdit refusé (pas OP) : les blocs reviennent.

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 49;
+pub const PROTOCOL: u32 = 50;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -264,7 +264,9 @@ pub enum Request {
         room: u64,
         pseudo: String,
         expires: u64,
-        mac: [u8; 32],
+        /// (v155) Signé par le relais du monde (`ticket_msg`) : avant, un code fait avec le
+        /// secret du monde, que tout hôte de région connaissait.
+        sig: Vec<u8>,
         cert: Option<crate::sovereign::Cert>,
     },
     /// Hôte d'une région (connexion de garant) : son relais de région est prêt.
@@ -927,7 +929,10 @@ pub enum Response {
     ShardTask {
         room: u64,
         region: [i32; 2],
-        secret: [u8; 32],
+        /// (v155) Son propre billet (au nom `#relaisN`, signé par le relais du monde) pour
+        /// entrer chez les autres relais de sa région : il ne reçoit plus le secret du monde.
+        peer: Vec<u8>,
+        peer_expires: u64,
         /// Rang de ce relais dans sa région.
         slot: u16,
         /// Clé du relais du monde (il certifie les clés des joueurs et peut signer à leur
@@ -1224,7 +1229,7 @@ pub enum Response {
         room: u64,
         pseudo: String,
         expires: u64,
-        mac: [u8; 32],
+        sig: Vec<u8>,
         cert: Option<crate::sovereign::Cert>,
         /// Clé du relais du monde (celle des certificats) : le jeu vérifie avec elle les
         /// bonjours signés de la voix (v137).
@@ -1801,14 +1806,43 @@ pub fn shard_for<'a>(list: &'a [ShardInfo], pseudo: &str) -> Option<&'a ShardInf
     })
 }
 
-/// Signature d'un billet de relais de région (secret partagé par le relais du monde et
-/// les hôtes de ses régions).
-pub fn shard_mac(secret: &[u8; 32], room: u64, pseudo: &str, expires: u64) -> [u8; 32] {
+/// (v155) Ce que signe le relais du monde (avec sa clé des certificats) dans un billet pour
+/// les relais de région : le monde, le pseudo, la fin de validité. Les hôtes des régions le
+/// vérifient avec la clé publique du relais du monde ; ils ne savent pas en faire.
+pub fn ticket_msg(room: u64, pseudo: &str, expires: u64) -> Vec<u8> {
+    let mut m = b"minelib/billet".to_vec();
+    m.extend_from_slice(&room.to_le_bytes());
+    m.extend_from_slice(pseudo.to_ascii_lowercase().as_bytes());
+    m.push(0);
+    m.extend_from_slice(&expires.to_le_bytes());
+    m
+}
+
+/// (v155) Un billet signé par le relais du monde dont la clé publique est `root`.
+pub fn ticket_ok(root: &[u8; 32], room: u64, pseudo: &str, expires: u64, sig: &[u8]) -> bool {
+    use ed25519_dalek::Verifier;
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(root) else {
+        return false;
+    };
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(sig) else {
+        return false;
+    };
+    key.verify(&ticket_msg(room, pseudo, expires), &sig).is_ok()
+}
+
+/// (v155) Clé d'une province (ou d'un pays) : dérivée de celle de son pays, ou du secret du
+/// monde pour celles du relais du monde. Elle sert à vérifier les jetons de ceux qui y
+/// entrent (son relais de secours, ses provinces, les relais de ses régions) ; seuls elle,
+/// son pays (et ceux au-dessus) et le relais du monde savent en faire. Avant, chaque hôte
+/// recevait le secret du monde, et pouvait faire les jetons de n'importe quelle province.
+pub fn province_key(parent: &[u8; 32], room: u64, province: [i32; 2], size: i32) -> [u8; 32] {
     use hmac::Mac;
-    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("clé");
+    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(parent).expect("clé");
+    m.update(b"minelib/province/cle");
     m.update(&room.to_le_bytes());
-    m.update(pseudo.to_ascii_lowercase().as_bytes());
-    m.update(&expires.to_le_bytes());
+    m.update(&province[0].to_le_bytes());
+    m.update(&province[1].to_le_bytes());
+    m.update(&size.to_le_bytes());
     m.finalize().into_bytes().into()
 }
 

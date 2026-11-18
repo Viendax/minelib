@@ -4,7 +4,8 @@
 //! n'a intérêt à l'attaquer, et le relais du monde n'a plus à tout transmettre.
 //!
 //! Il fait trois choses, pour sa région seulement :
-//! - les joueurs y entrent avec le billet du relais du monde (`proto::shard_mac`) ;
+//! - les joueurs y entrent avec le billet signé par le relais du monde (`proto::ticket_ok` ;
+//!   v155 : avant, un code fait avec le secret du monde, que l'hôte connaissait) ;
 //! - il transmet les positions aux joueurs proches (moins souvent au loin) ;
 //! - il transmet les modifications de blocs et en garde l'historique compacté pour ceux
 //!   qui arrivent.
@@ -125,7 +126,9 @@ struct PeerOut {
 struct State {
     room: u64,
     region: [i32; 2],
-    secret: [u8; 32],
+    /// (v155) Son billet (au nom `#relaisN`, signé par le relais du monde) pour entrer chez
+    /// les autres relais de la région.
+    peer: (Vec<u8>, u64),
     conns: HashMap<u64, Conn>,
     next_id: u64,
     build: zones::Build,
@@ -517,22 +520,15 @@ impl State {
         };
         let client = Client::spawn_resolved(resolve);
         let pseudo = proto::shard_peer_name(self.slot);
-        let expires = now_secs() + 24 * 3600;
         client.send(Cmd::ShardLogin {
             room: self.room,
-            mac: proto::shard_mac(&self.secret, self.room, &pseudo, expires),
+            sig: self.peer.0.clone(),
             pseudo,
-            expires,
+            expires: self.peer.1,
             cert: None,
         });
         client
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 pub struct ShardHandle {
@@ -851,7 +847,7 @@ pub fn start(
     bind: &str,
     room: u64,
     region: [i32; 2],
-    secret: [u8; 32],
+    peer: (Vec<u8>, u64),
     slot: u16,
     root: [u8; 32],
 ) -> Result<ShardHandle> {
@@ -861,7 +857,7 @@ pub fn start(
     let state = Arc::new(Mutex::new(State {
         room,
         region,
-        secret,
+        peer,
         conns: HashMap::new(),
         // Numéros de joueurs propres à ce relais (uniques dans la région).
         next_id: ((slot as u64) << 40) | 1,
@@ -1003,7 +999,7 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             room,
             pseudo,
             expires,
-            mac,
+            sig,
             cert,
         } => {
             let now = std::time::SystemTime::now()
@@ -1011,7 +1007,7 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
                 .map_or(0, |d| d.as_secs());
             let ok = room == st.room
                 && expires > now
-                && proto::shard_mac(&st.secret, room, &pseudo, expires) == mac;
+                && proto::ticket_ok(&st.root, room, &pseudo, expires, &sig);
             if !ok {
                 return Some(err(ErrorCode::WrongCredentials, "billet refusé"));
             }
