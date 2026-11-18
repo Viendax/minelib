@@ -187,6 +187,20 @@ impl Default for Editor {
     }
 }
 
+/// Couleur donnée par les curseurs Teinte, Saturation et Valeur. Une couleur blanche ou
+/// grise n'a pas de teinte visible : bouger la teinte la rend pleine (saturation 100 %),
+/// sans passer d'abord par une couleur proposée ; une couleur noire repart à pleine valeur
+/// quand on bouge sa teinte ou sa saturation.
+fn color_from_sliders(h: f32, s: f32, v: f32, hue_moved: bool, sat_moved: bool) -> [f32; 3] {
+    let s = if hue_moved && s < 0.1 { 1.0 } else { s };
+    let v = if (hue_moved || sat_moved) && v < 0.05 {
+        1.0
+    } else {
+        v
+    };
+    hsv_to_rgb(h, s, v)
+}
+
 /// RVB (0..1) → teinte (0..1), saturation, valeur.
 pub fn rgb_to_hsv(c: [f32; 3]) -> (f32, f32, f32) {
     let (r, g, b) = (c[0], c[1], c[2]);
@@ -1624,7 +1638,7 @@ impl Editor {
                     self.hue = h0;
                 }
                 let (mut h, mut s, mut v) = (self.hue, s0, v0);
-                let mut col_changed = false;
+                let (mut hue_moved, mut sat_moved, mut val_moved) = (false, false, false);
                 // Teinte : la barre montre l'arc-en-ciel (dessiné par-dessus le curseur), et
                 // un trait blanc marque la teinte choisie.
                 {
@@ -1633,7 +1647,7 @@ impl Editor {
                     if let Some(nh) = self.slider(p, 120, "Teinte", h, 0.0, 1.0, 1.0, "") {
                         h = nh;
                         self.hue = nh;
-                        col_changed = true;
+                        hue_moved = true;
                     }
                     if shown {
                         let lw = p.w * LABEL;
@@ -1665,16 +1679,16 @@ impl Editor {
                     &fmt(s * 100.0, 0, " %"),
                 ) {
                     s = ns;
-                    col_changed = true;
+                    sat_moved = true;
                 }
                 if let Some(nv) =
                     self.slider(p, 122, "Valeur", v, 0.0, 1.0, 1.0, &fmt(v * 100.0, 0, " %"))
                 {
                     v = nv;
-                    col_changed = true;
+                    val_moved = true;
                 }
-                if col_changed {
-                    l.color = hsv_to_rgb(h, s, v);
+                if hue_moved || sat_moved || val_moved {
+                    l.color = color_from_sliders(h, s, v, hue_moved, sat_moved);
                     changed = true;
                 }
                 if let Some(v) = self.slider(
@@ -2421,6 +2435,21 @@ mod tests {
             view_proj: vp,
             size,
         }
+    }
+
+    #[test]
+    fn moving_the_hue_of_a_white_light_colors_it() {
+        // Lumière neuve : blanche. La teinte seule la colore, en plein.
+        let (_, s, v) = rgb_to_hsv([1.0, 1.0, 1.0]);
+        let c = color_from_sliders(0.6, s, v, true, false);
+        let (h, s, v) = rgb_to_hsv(c);
+        assert!((h - 0.6).abs() < 1e-3 && s > 0.99 && v > 0.99, "{c:?}");
+        // Une couleur pâle choisie exprès garde sa saturation.
+        let c = color_from_sliders(0.3, 0.4, 1.0, true, false);
+        assert!((rgb_to_hsv(c).1 - 0.4).abs() < 1e-3, "{c:?}");
+        // Noire : la teinte ou la saturation la rallument ; la valeur seule, non.
+        assert!(rgb_to_hsv(color_from_sliders(0.1, 0.5, 0.0, false, true)).2 > 0.99);
+        assert_eq!(color_from_sliders(0.1, 0.5, 0.0, false, false), [0.0; 3]);
     }
 
     #[test]
