@@ -304,12 +304,38 @@ pub fn key_repeat(
     }
 }
 
+/// Le navigateur reste lancé tant de secondes sans écran (des écrans qui disparaissent
+/// puis reviennent, comme ceux des autres joueurs, ne le relancent pas).
+const IDLE_STOP_S: f32 = 120.0;
+/// Attente avant de relancer un navigateur arrêté, et lancements ratés de suite au plus.
+const RETRY_S: f32 = 2.0;
+const MAX_FAILURES: u32 = 4;
+/// Sessions du navigateur essayées au plus (`cef-cache`, `cef-cache-2`…) : une session
+/// ne sert qu'à un navigateur à la fois, et un autre jeu ouvert peut tenir la première.
+const MAX_CACHES: u32 = 4;
+
+/// Navigateurs arrêtés qui se ferment encore. Un nouveau n'est lancé qu'après eux : il
+/// prendrait leur session (`cef-cache`), encore tenue, et ne démarrerait pas.
+static CLOSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Ce qu'affichent les écrans : chacun a son onglet dans le navigateur (programme
 /// `minelib-browser`, Chromium) s'il est installé, sinon sa mire animée. Tactiles.
+///
+/// Le navigateur est lancé avec le premier écran et reste lancé 2 minutes après le
+/// dernier. Un navigateur arrêté (plantage, flux abîmé) est relancé ; ses pages sont
+/// rouvertes. Pendant le chargement, les écrans montrent qu'ils chargent.
 pub struct Displays {
-    /// Navigateur lancé ; `browser_tried` : lancement déjà tenté (pas de relance en boucle).
+    /// Navigateur lancé.
     browser: Option<Browser>,
-    browser_tried: bool,
+    /// Pas de navigateur installé (dossier « cef ») : mires, sans le chercher de nouveau.
+    absent: bool,
+    /// Lancements ratés de suite, et attente avant le prochain essai (secondes).
+    failures: u32,
+    retry_in: f32,
+    /// Session du navigateur : 0 pour `cef-cache`, n pour `cef-cache-<n+1>`.
+    cache: u32,
+    /// Depuis combien de temps il n'y a plus d'écran (secondes).
+    idle: f32,
     /// Un onglet par écran, par numéro d'écran.
     tabs: std::collections::HashMap<u32, Tab>,
     /// États rapportés par les pages depuis le dernier `take_states` (regarder ensemble).
@@ -320,35 +346,22 @@ impl Displays {
     pub fn new() -> Self {
         Self {
             browser: None,
-            browser_tried: false,
+            absent: false,
+            failures: 0,
+            retry_in: 0.0,
+            cache: 0,
+            idle: 0.0,
             tabs: std::collections::HashMap::new(),
             states: Vec::new(),
         }
     }
 
-    /// Les écrans posés (leurs numéros) : un onglet pour chaque nouveau, fermé pour chaque
-    /// écran retiré. Le navigateur est lancé avec le premier écran, arrêté avec le dernier.
+    /// Les écrans montrés (leurs numéros) : un onglet pour chaque nouveau, fermé pour
+    /// chaque écran retiré. Le navigateur est lancé s'il y a des écrans.
     pub fn sync(&mut self, ids: &[u32]) {
-        if ids.is_empty() {
-            if !self.tabs.is_empty() || self.browser.is_some() {
-                self.tabs.clear();
-                self.browser = None;
-            }
-            self.browser_tried = false;
-            return;
-        }
-        if !self.browser_tried {
-            self.browser_tried = true;
-            self.browser = Browser::start();
-            if self.browser.is_none() {
-                log::info!("écrans vidéo : navigateur absent (dossier « cef »), mires affichées");
-            }
-            // Les onglets déjà là (navigateur relancé) rouvrent leur page.
-            for (id, tab) in &self.tabs {
-                if let Some(b) = self.browser.as_mut() {
-                    b.send(&format!("open {id} {}", tab.url));
-                }
-            }
+        if !ids.is_empty() {
+            self.idle = 0.0;
+            self.launch();
         }
         let gone: Vec<u32> = self
             .tabs
@@ -372,15 +385,63 @@ impl Displays {
         }
     }
 
-    /// Ouvre `url` sur l'écran `id`. `false` : navigateur absent.
+    /// Lance le navigateur s'il ne l'est pas (après la fermeture de celui d'avant, et pas
+    /// tout de suite après un lancement raté). Les pages des écrans y sont ouvertes.
+    fn launch(&mut self) {
+        if self.browser.is_some()
+            || !self.available()
+            || self.retry_in > 0.0
+            || CLOSING.load(std::sync::atomic::Ordering::Acquire) > 0
+        {
+            return;
+        }
+        match Browser::start(self.cache) {
+            Err(Launch::Absent) => {
+                log::info!("écrans vidéo : navigateur absent (dossier « cef »), mires affichées");
+                self.absent = true;
+            }
+            Err(Launch::Failed) => self.failed(),
+            Ok(mut b) => {
+                for (id, tab) in self.tabs.iter_mut() {
+                    b.send(&format!("open {id} {}", tab.url));
+                    tab.sent = None;
+                }
+                self.browser = Some(b);
+            }
+        }
+    }
+
+    /// Un navigateur ne s'est pas lancé, ou s'est arrêté trop vite : nouvel essai dans
+    /// `RETRY_S`, abandon après `MAX_FAILURES`.
+    fn failed(&mut self) {
+        self.failures += 1;
+        self.retry_in = RETRY_S;
+        if self.failures >= MAX_FAILURES {
+            log::warn!(
+                "écrans vidéo : le navigateur ne démarre pas ({} essais), mires affichées \
+                 (voir logs/navigateur*.log)",
+                self.failures
+            );
+        }
+    }
+
+    /// Un navigateur est lancé, ou le sera.
+    fn available(&self) -> bool {
+        !self.absent && self.failures < MAX_FAILURES
+    }
+
+    /// Ouvre `url` sur l'écran `id` (tout de suite, ou dès que le navigateur est lancé).
+    /// `false` : pas de navigateur.
     pub fn open(&mut self, id: u32, url: &str) -> bool {
         if let Some(tab) = self.tabs.get_mut(&id) {
             tab.url = url.to_string();
+            // (La nouvelle page dira elle-même si elle défile.)
+            tab.scroll = 0;
         }
-        match self.browser.as_mut() {
-            Some(b) => b.send(&format!("open {id} {url}")),
-            None => false,
+        if let Some(b) = self.browser.as_mut() {
+            b.send(&format!("open {id} {url}"));
         }
+        self.available()
     }
 
     /// Le réticule survole le point `uv` de l'écran `id` (`None` : d'aucun écran).
@@ -443,6 +504,13 @@ impl Displays {
         }
     }
 
+    /// La page de l'écran `id` peut-elle défiler sous le curseur, vers le haut (`up`) ou
+    /// vers le bas ? Sinon la molette reste au jeu (barre d'objets).
+    pub fn page_scrolls(&self, id: u32, up: bool) -> bool {
+        let bit = if up { 1 } else { 2 };
+        self.browser.is_some() && self.tabs.get(&id).is_some_and(|t| t.scroll & bit != 0)
+    }
+
     /// Un champ de texte de la page de l'écran `id` a-t-il le focus (le clavier y va) ?
     pub fn editing(&self, id: u32) -> bool {
         self.browser.is_some() && self.tabs.get(&id).is_some_and(|t| t.editing)
@@ -495,20 +563,48 @@ impl Displays {
         Some((t.version, t.size.0, t.size.1, &t.pixels))
     }
 
-    /// Avance d'une image : reçoit pages et évènements du navigateur, redessine.
+    /// Avance d'une image : reçoit pages et évènements du navigateur, redessine ; arrête
+    /// le navigateur après `IDLE_STOP_S` sans écran, le relance s'il s'est arrêté.
     pub fn update(&mut self, dt: f32) {
+        self.retry_in = (self.retry_in - dt).max(0.0);
+        if self.tabs.is_empty() {
+            self.idle += dt;
+            if self.idle >= IDLE_STOP_S && self.browser.is_some() {
+                log::info!("écrans vidéo : plus d'écran, navigateur arrêté");
+                self.browser = None;
+            }
+        }
         if let Some(b) = self.browser.as_mut() {
-            if !b.alive() {
-                log::warn!("écrans vidéo : le navigateur s'est arrêté (voir logs/navigateur*.log)");
-                // `browser_tried` reste vrai : pas de relance en boucle.
+            if let Some((code, ran)) = b.ended() {
                 self.browser = None;
                 for tab in self.tabs.values_mut() {
                     tab.page.clear();
                     tab.editing = false;
+                    tab.scroll = 0;
                     tab.dirty = true;
+                }
+                if code == Some(2) && ran < 10.0 && self.cache + 1 < MAX_CACHES {
+                    // Sa session est tenue par un autre navigateur (un autre jeu ouvert) :
+                    // on en prend une autre, tout de suite.
+                    self.cache += 1;
+                    log::warn!(
+                        "écrans vidéo : session du navigateur déjà prise (un autre jeu \
+                         ouvert ?), essai avec cef-cache-{}",
+                        self.cache + 1
+                    );
+                } else {
+                    log::warn!(
+                        "écrans vidéo : le navigateur s'est arrêté après {ran:.1} s \
+                         (code {code:?}), relancé (voir logs/navigateur*.log)"
+                    );
+                    self.failed();
                 }
             } else {
                 let (frames, events) = b.take();
+                // Une page est arrivée : ce navigateur marche, les ratés sont oubliés.
+                if !frames.is_empty() {
+                    self.failures = 0;
+                }
                 for (id, (w, h, px)) in frames {
                     if let Some(tab) = self.tabs.get_mut(&id) {
                         tab.page = px;
@@ -523,11 +619,20 @@ impl Displays {
                     match ev {
                         Event::Editing(on) => tab.editing = on,
                         Event::State(s) => self.states.push((id, s)),
+                        Event::Scroll(f) => tab.scroll = f,
                     }
                 }
             }
         }
+        if !self.tabs.is_empty() {
+            self.launch();
+        }
+        let loading = self.available();
         for tab in self.tabs.values_mut() {
+            if tab.loading != loading {
+                tab.loading = loading;
+                tab.dirty = true;
+            }
             tab.update(dt);
         }
     }
@@ -553,6 +658,11 @@ struct Tab {
     ripple: Option<([f32; 2], f32)>,
     /// Un champ de texte de la page a le focus.
     editing: bool,
+    /// Un navigateur est lancé ou va l'être : sans page, l'écran montre qu'il charge
+    /// (sinon, sa mire).
+    loading: bool,
+    /// La page peut défiler sous le curseur : vers le haut (1), vers le bas (2).
+    scroll: u8,
     /// À redessiner (nouvelle image de la page, curseur déplacé…).
     dirty: bool,
     /// Change à chaque nouvelle image (le rendu ne renvoie que les nouvelles).
@@ -573,6 +683,8 @@ impl Tab {
             sent: None,
             ripple: None,
             editing: false,
+            loading: false,
+            scroll: 0,
             dirty: true,
             version: 0,
         };
@@ -601,7 +713,9 @@ impl Tab {
     }
 
     fn draw(&mut self) {
-        if self.page.is_empty() {
+        if self.page.is_empty() && self.loading {
+            self.draw_loading();
+        } else if self.page.is_empty() {
             self.draw_mire();
         } else {
             self.size = self.page_size;
@@ -628,6 +742,35 @@ impl Tab {
         }
         self.dirty = false;
         self.version += 1;
+    }
+
+    /// Page en cours de chargement : fond sombre et arc qui tourne.
+    fn draw_loading(&mut self) {
+        self.size = (W, H);
+        let n = (W * H * 4) as usize;
+        self.pixels.resize(n, 0);
+        for px in self.pixels.chunks_exact_mut(4) {
+            px.copy_from_slice(&[26, 22, 20, 255]);
+        }
+        let (cx, cy) = (W as f32 / 2.0, H as f32 / 2.0);
+        let (radius, width) = (H as f32 / 9.0, H as f32 / 45.0);
+        let start = self.time * 5.0;
+        let reach = (radius + width) as i32 + 1;
+        let tau = std::f32::consts::TAU;
+        for y in cy as i32 - reach..=cy as i32 + reach {
+            for x in cx as i32 - reach..=cx as i32 + reach {
+                let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                if ((dx * dx + dy * dy).sqrt() - radius).abs() > width * 0.5 {
+                    continue;
+                }
+                // Trois quarts de tour, plus clair vers la tête de l'arc.
+                let a = (dy.atan2(dx) - start).rem_euclid(tau) / tau;
+                if a < 0.75 {
+                    let v = (90.0 + 165.0 * a / 0.75) as u8;
+                    self.put(x, y, [v, v, v]);
+                }
+            }
+        }
     }
 
     /// Mire de test : dégradé animé (figé et assombri en pause), barre de progression, et
@@ -706,8 +849,10 @@ type Frame = (u32, u32, Vec<u8>);
 enum Event {
     /// Un champ de texte a le focus (vrai) ou ne l'a plus (faux).
     Editing(bool),
-    /// État de la page : `{"u":adresse,"t":temps,"p":pause}`.
+    /// État de la page : `{"u":adresse,"t":temps,"p":pause,"a":pub,"i":vidéo}`.
     State(String),
+    /// La page peut défiler sous la souris : vers le haut (1), vers le bas (2).
+    Scroll(u8),
 }
 
 /// Ce que le navigateur a envoyé depuis la dernière lecture : la dernière image de chaque
@@ -716,6 +861,8 @@ enum Event {
 struct Inbox {
     frames: std::collections::HashMap<u32, Frame>,
     events: Vec<(u32, Event)>,
+    /// Le flux du navigateur est fini (fermé, ou abîmé : on n'y lit plus rien).
+    closed: bool,
 }
 
 /// Navigateur lancé à part : le jeu ne dépend jamais de CEF (sans le programme, les
@@ -725,6 +872,16 @@ struct Browser {
     child: Option<std::process::Child>,
     stdin: Option<std::process::ChildStdin>,
     inbox: std::sync::Arc<std::sync::Mutex<Inbox>>,
+    /// Lancé à cet instant.
+    started: std::time::Instant,
+}
+
+/// Pourquoi le navigateur n'est pas lancé.
+enum Launch {
+    /// Pas installé.
+    Absent,
+    /// Le programme n'a pas pu être lancé.
+    Failed,
 }
 
 impl Browser {
@@ -745,14 +902,31 @@ impl Browser {
             .find(|p| p.is_file())
     }
 
-    fn start() -> Option<Self> {
+    /// Lance le navigateur avec la session `cache` (0 : `cef-cache`, n : `cef-cache-<n+1>`).
+    fn start(cache: u32) -> Result<Self, Launch> {
+        use std::io::Write;
         use std::process::{Command, Stdio};
-        let exe = Self::find()?;
+        let exe = Self::find().ok_or(Launch::Absent)?;
         let data = minelib_assets::data_dir();
         let logs = data.join("logs");
         let _ = std::fs::create_dir_all(&logs);
-        let stderr = std::fs::File::create(logs.join("navigateur-sortie.log"))
-            .map(Stdio::from)
+        let session = match cache {
+            0 => "cef-cache".to_string(),
+            n => format!("cef-cache-{}", n + 1),
+        };
+        // Sa sortie d'erreur, ajoutée au journal (vidé au-delà de 256 Ko).
+        let path = logs.join("navigateur-sortie.log");
+        let big = std::fs::metadata(&path).is_ok_and(|m| m.len() > 256 * 1024);
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(!big)
+            .truncate(big)
+            .open(&path)
+            .map(|mut f| {
+                let _ = writeln!(f, "=== lancement du navigateur (session {session}) ===");
+                Stdio::from(f)
+            })
             .unwrap_or_else(|_| Stdio::null());
         let mut cmd = Command::new(&exe);
         cmd.arg("--width")
@@ -761,10 +935,12 @@ impl Browser {
             .arg(PAGE_H.to_string())
             // Session du navigateur (connexion à YouTube, cookies) : la sienne, ici.
             .arg("--cache")
-            .arg(data.join("cef-cache"))
+            .arg(data.join(&session))
             .arg("--log")
             .arg(logs.join("navigateur.log"))
-            .current_dir(exe.parent()?)
+            // Qu'il dise où la page peut défiler (la molette n'y va que si elle y sert).
+            .arg("--scroll")
+            .current_dir(exe.parent().ok_or(Launch::Absent)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr);
@@ -781,25 +957,39 @@ impl Browser {
                     "écrans vidéo : navigateur non lancé ({}) : {e}",
                     exe.display()
                 );
-                return None;
+                return Err(Launch::Failed);
             }
         };
         let stdin = child.stdin.take();
-        let stdout = child.stdout.take()?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Launch::Failed);
+        };
         let inbox = std::sync::Arc::new(std::sync::Mutex::new(Inbox::default()));
         let slot = inbox.clone();
         let reader = std::thread::Builder::new()
             .name("navigateur".into())
-            .spawn(move || read_records(stdout, slot));
+            .spawn(move || {
+                read_records(stdout, slot.clone());
+                if let Ok(mut i) = slot.lock() {
+                    i.closed = true;
+                }
+            });
         if reader.is_err() {
             let _ = child.kill();
-            return None;
+            let _ = child.wait();
+            return Err(Launch::Failed);
         }
-        log::info!("écrans vidéo : navigateur lancé ({})", exe.display());
-        Some(Self {
+        log::info!(
+            "écrans vidéo : navigateur lancé ({}, session {session})",
+            exe.display()
+        );
+        Ok(Self {
             child: Some(child),
             stdin,
             inbox,
+            started: std::time::Instant::now(),
         })
     }
 
@@ -822,35 +1012,72 @@ impl Browser {
         }
     }
 
-    fn alive(&mut self) -> bool {
-        self.child
-            .as_mut()
-            .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    /// Le navigateur s'est-il arrêté (ou son flux est-il fini, abîmé) ? Son code de sortie
+    /// (2 : CEF n'a pas démarré, sa session est sans doute tenue par un autre) et depuis
+    /// combien de temps il tournait (secondes). Un navigateur dont le flux est abîmé est
+    /// arrêté.
+    fn ended(&mut self) -> Option<(Option<i32>, f32)> {
+        let ran = self.started.elapsed().as_secs_f32();
+        let child = self.child.as_mut()?;
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some((status.code(), ran));
+        }
+        let closed = self.inbox.lock().map_or(true, |i| i.closed);
+        if !closed {
+            return None;
+        }
+        // Flux fini mais programme vivant : on attend un peu qu'il sorte, puis on l'arrête.
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Ok(Some(status)) = child.try_wait() {
+                return Some((status.code(), ran));
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Some((None, ran))
     }
 }
 
 impl Drop for Browser {
     /// Fermeture sans bloquer le jeu : on demande au navigateur de quitter, puis on
     /// l'arrête s'il traîne.
+    ///
+    /// Tant qu'il se ferme, `CLOSING` le compte : aucun autre n'est lancé avant (il
+    /// prendrait sa session, encore tenue).
     fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
         let _ = self.send("quit");
         let stdin = self.stdin.take();
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let _ = std::thread::Builder::new()
-            .name("navigateur (fin)".into())
-            .spawn(move || {
-                drop(stdin);
-                for _ in 0..40 {
-                    if !matches!(child.try_wait(), Ok(None)) {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+        let close = move || {
+            drop(stdin);
+            let mut gone = false;
+            for _ in 0..60 {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    gone = true;
+                    break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !gone {
                 let _ = child.kill();
                 let _ = child.wait();
-            });
+            }
+            // Ses sous-processus lâchent la session juste après lui.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            CLOSING.fetch_sub(1, Ordering::AcqRel);
+        };
+        CLOSING.fetch_add(1, Ordering::AcqRel);
+        let spawned = std::thread::Builder::new()
+            .name("navigateur (fin)".into())
+            .spawn(close);
+        if spawned.is_err() {
+            // (Fil impossible : on n'attend pas, il est compté fermé.)
+            CLOSING.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -883,6 +1110,11 @@ fn read_records(mut out: impl std::io::Read, inbox: std::sync::Arc<std::sync::Mu
             b"MLBK" => {
                 if let Ok(mut i) = inbox.lock() {
                     i.events.push((id, Event::Editing(a != 0)));
+                }
+            }
+            b"MLBW" => {
+                if let Ok(mut i) = inbox.lock() {
+                    i.events.push((id, Event::Scroll((a & 3) as u8)));
                 }
             }
             b"MLBS" => {
@@ -1043,13 +1275,18 @@ mod tests {
         let mut data = rec(b"MLBF", 7, 2, 1, &[1, 2, 3, 4, 5, 6, 7, 8]);
         data.extend(rec(b"MLBK", 7, 1, 0, &[]));
         data.extend(rec(b"MLBS", 7, 2, 0, b"{}"));
+        data.extend(rec(b"MLBW", 7, 2, 0, &[]));
         let inbox = std::sync::Arc::new(std::sync::Mutex::new(Inbox::default()));
         read_records(&data[..], inbox.clone());
         let i = inbox.lock().unwrap();
         assert_eq!(i.frames[&7], (2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]));
         assert_eq!(
             i.events,
-            vec![(7, Event::Editing(true)), (7, Event::State("{}".into()))]
+            vec![
+                (7, Event::Editing(true)),
+                (7, Event::State("{}".into())),
+                (7, Event::Scroll(2))
+            ]
         );
     }
 

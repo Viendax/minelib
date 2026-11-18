@@ -18,7 +18,13 @@
 //! `b` : u32 petit-boutistes) suivi éventuellement de données :
 //! - `MLBF` : image de l'onglet, `a` × `b` pixels BGRA (`a * b * 4` octets) ;
 //! - `MLBK` : un champ de texte a le focus (`a` = 1) ou ne l'a plus (`a` = 0) ;
-//! - `MLBS` : état de la page, `a` octets UTF-8 (`{"u":adresse,"t":temps,"p":pause}`).
+//! - `MLBS` : état de la page, `a` octets UTF-8 (`{"u":adresse,"t":temps,"p":pause,
+//!   "a":pub,"i":vidéo du lecteur}`) ;
+//! - `MLBW` (seulement avec `--scroll`) : la page peut défiler sous la souris vers le haut
+//!   (`a` & 1) et vers le bas (`a` & 2).
+//!
+//! Ce qu'il écrit sur sa sortie d'erreur (onglets ouverts, première image de chaque onglet,
+//! chargements ratés) va dans `logs/navigateur-sortie.log`.
 //!
 //! Le jeu ne dépend jamais de CEF : sans ce programme et ses fichiers (`libcef.dll`…), ses
 //! écrans montrent leur mire. Chromium relance aussi ce programme pour ses sous-processus
@@ -31,6 +37,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +59,26 @@ let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
 const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing'),i:i});
 if(st!==s){s=st;console.log('__minelib_state__'+st);}},500);})();"#;
 
+/// Script injecté si le jeu le demande (`--scroll`) : signale si la page peut défiler
+/// sous la souris, vers le haut (1) et vers le bas (2) (`__minelib_scroll__<0..3>`), pour
+/// que la molette n'aille à l'écran que si elle y sert.
+const SCROLL_JS: &str = r#"(()=>{if(window.__minelib_scroll)return;window.__minelib_scroll=1;
+let mx=-1,my=-1,w=-1;
+const sf=()=>{let f=0;const d=document.scrollingElement||document.documentElement;
+if(d){if(d.scrollTop>0)f|=1;if(d.scrollTop+window.innerHeight<d.scrollHeight-1)f|=2;}
+let e=mx<0?null:document.elementFromPoint(mx,my);
+while(e&&e.shadowRoot){const i=e.shadowRoot.elementFromPoint(mx,my);if(!i||i===e)break;e=i;}
+for(;e&&e!==d;e=e.parentElement||(e.getRootNode&&e.getRootNode().host)||null){
+if(e.tagName==='IFRAME'){f|=3;break;}
+const o=getComputedStyle(e).overflowY;
+if((o==='auto'||o==='scroll'||o==='overlay')&&e.scrollHeight>e.clientHeight+1){
+if(e.scrollTop>0)f|=1;if(e.scrollTop+e.clientHeight<e.scrollHeight-1)f|=2;}}
+return f;};
+const sr=()=>{const v=sf();if(v!==w){w=v;console.log('__minelib_scroll__'+v);}};
+document.addEventListener('mousemove',ev=>{mx=ev.clientX;my=ev.clientY;sr();},true);
+document.addEventListener('scroll',()=>setTimeout(sr,0),true);
+setInterval(sr,500);sr();})();"#;
+
 /// Le champ de texte qui a le focus le perd.
 const BLUR_JS: &str = "(()=>{let a=document.activeElement;\
 while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;\
@@ -65,6 +92,8 @@ struct Options {
     cache: Option<String>,
     /// Journal de Chromium.
     log: Option<String>,
+    /// Le jeu veut savoir où la page peut défiler (`MLBW`).
+    scroll: bool,
 }
 
 impl Options {
@@ -74,6 +103,7 @@ impl Options {
             height: 720,
             cache: None,
             log: None,
+            scroll: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -83,6 +113,7 @@ impl Options {
                 "--height" => o.height = value().parse().unwrap_or(o.height).clamp(64, 2160),
                 "--cache" => o.cache = Some(value()),
                 "--log" => o.log = Some(value()),
+                "--scroll" => o.scroll = true,
                 _ => {}
             }
         }
@@ -183,6 +214,8 @@ wrap_render_handler! {
         id: u32,
         size: (i32, i32),
         out: Shared,
+        // Première image déjà signalée (journal).
+        painted: Arc<AtomicBool>,
     }
 
     impl RenderHandler {
@@ -209,6 +242,9 @@ wrap_render_handler! {
             // Les menus déroulants (popups) ne sont pas encore dessinés.
             if type_ != PaintElementType::VIEW || buffer.is_null() || width <= 0 || height <= 0 {
                 return;
+            }
+            if !self.painted.swap(true, Ordering::Relaxed) {
+                eprintln!("onglet {} : première image ({width} × {height})", self.id);
             }
             let n = width as usize * height as usize * 4;
             // SAFETY : CEF fournit `width * height` pixels BGRA, valides pendant l'appel.
@@ -242,6 +278,10 @@ wrap_display_handler! {
             if let Some(v) = text.strip_prefix("__minelib_focus__") {
                 push_event(&self.out, *b"MLBK", self.id, u32::from(v == "1"), Vec::new());
                 1
+            } else if let Some(v) = text.strip_prefix("__minelib_scroll__") {
+                let flags = v.trim().parse::<u32>().unwrap_or(0) & 3;
+                push_event(&self.out, *b"MLBW", self.id, flags, Vec::new());
+                1
             } else if let Some(state) = text.strip_prefix("__minelib_state__") {
                 let data = state.as_bytes().to_vec();
                 push_event(&self.out, *b"MLBS", self.id, data.len() as u32, data);
@@ -254,9 +294,34 @@ wrap_display_handler! {
 }
 
 wrap_load_handler! {
-    struct Loader;
+    struct Loader {
+        id: u32,
+        scroll: bool,
+    }
 
     impl LoadHandler {
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            error_code: Errorcode,
+            error_text: Option<&CefString>,
+            failed_url: Option<&CefString>,
+        ) {
+            // (Une navigation interrompue par une autre n'est pas une erreur.)
+            let main = frame.is_some_and(|f| f.is_main() != 0);
+            let aborted = *error_code.as_ref() == sys::cef_errorcode_t::ERR_ABORTED;
+            if main && !aborted {
+                eprintln!(
+                    "onglet {} : chargement raté ({:?}, {}) : {}",
+                    self.id,
+                    error_code,
+                    error_text.map(|t| t.to_string()).unwrap_or_default(),
+                    failed_url.map(|u| u.to_string()).unwrap_or_default()
+                );
+            }
+        }
+
         fn on_load_end(
             &self,
             _browser: Option<&mut Browser>,
@@ -266,6 +331,9 @@ wrap_load_handler! {
             if let Some(frame) = frame {
                 if frame.is_main() != 0 {
                     frame.execute_java_script(Some(&CefString::from(PAGE_JS)), None, 0);
+                    if self.scroll {
+                        frame.execute_java_script(Some(&CefString::from(SCROLL_JS)), None, 0);
+                    }
                 }
             }
         }
@@ -323,9 +391,10 @@ struct Tab {
 
 impl Tab {
     fn open(id: u32, url: &str, opts: &Options, out: &Shared) -> Option<Self> {
-        let painter = Painter::new(id, (opts.width, opts.height), out.clone());
+        let painted = Arc::new(AtomicBool::new(false));
+        let painter = Painter::new(id, (opts.width, opts.height), out.clone(), painted);
         let console = Console::new(id, out.clone());
-        let mut client = TabClient::new(painter, console, Loader::new());
+        let mut client = TabClient::new(painter, console, Loader::new(id, opts.scroll));
         let window_info = WindowInfo::default().set_as_windowless(sys::HWND::default());
         let settings = BrowserSettings {
             windowless_frame_rate: 30,
@@ -333,15 +402,19 @@ impl Tab {
             background_color: 0xff00_0000,
             ..Default::default()
         };
-        let browser = browser_host_create_browser_sync(
+        let Some(browser) = browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
             Some(&CefString::from(url)),
             Some(&settings),
             None,
             None,
-        )?;
+        ) else {
+            eprintln!("onglet {id} : création impossible");
+            return None;
+        };
         let host = browser.host()?;
+        eprintln!("onglet {id} : ouvert ({url})");
         host.set_focus(1);
         Some(Tab {
             browser,
@@ -476,9 +549,13 @@ fn main() {
         std::ptr::null_mut(),
     ) != 1
     {
-        eprintln!("minelib-browser : initialisation de CEF impossible");
+        eprintln!(
+            "minelib-browser : initialisation de CEF impossible (session déjà prise par un \
+             autre navigateur ?)"
+        );
         std::process::exit(2);
     }
+    eprintln!("minelib-browser : prêt");
 
     let out: Shared = Arc::new((Mutex::new(Outbox::default()), Condvar::new()));
     let writer = {
