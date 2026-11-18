@@ -11,8 +11,16 @@
 //! - `text <id> <texte>` (caractères tapés), `key <id> <nom>` (`back`, `delete`,
 //!   `enter`, `tab`, `left`, `right`, `up`, `down`, `home`, `end`, `ctrl+a`, `ctrl+c`,
 //!   `ctrl+v`, `ctrl+x`, `ctrl+y`, `ctrl+z`), `blur <id>` (le champ de texte perd le
-//!   focus), `eval <id> <javascript>` ;
+//!   focus), `eval <id> <javascript>`, `fps <id> <1..60>` (images par seconde de l'onglet) ;
 //! - `quit`.
+//!
+//! **Options** : `--width`, `--height`, `--cache <dossier de session>`, `--log <journal>`,
+//! `--fps <images par seconde d'un nouvel onglet, 30 par défaut>`, `--scroll`.
+//!
+//! Aucune fenêtre ne s'ouvre jamais : les liens « nouvel onglet » cliqués s'ouvrent dans
+//! l'écran, les fenêtres ouvertes par un script sont bloquées, `alert`/`confirm`/`prompt`
+//! et le choix de fichier n'affichent rien, les autorisations (caméra, micro,
+//! notifications…) sont refusées.
 //!
 //! **Sortie** : des enregistrements, chacun un en-tête de 16 octets (étiquette, `id`, `a`,
 //! `b` : u32 petit-boutistes) suivi éventuellement de données :
@@ -84,6 +92,9 @@ const BLUR_JS: &str = "(()=>{let a=document.activeElement;\
 while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;\
 if(a&&a.blur)a.blur();})()";
 
+/// Images par seconde au plus (rendu hors écran de Chromium).
+const MAX_FPS: i32 = 60;
+
 /// Réglages passés par le jeu en ligne de commande.
 struct Options {
     width: i32,
@@ -94,6 +105,8 @@ struct Options {
     log: Option<String>,
     /// Le jeu veut savoir où la page peut défiler (`MLBW`).
     scroll: bool,
+    /// Images par seconde d'un nouvel onglet (le jeu les règle ensuite par onglet).
+    fps: i32,
 }
 
 impl Options {
@@ -104,6 +117,7 @@ impl Options {
             cache: None,
             log: None,
             scroll: false,
+            fps: 30,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -114,6 +128,7 @@ impl Options {
                 "--cache" => o.cache = Some(value()),
                 "--log" => o.log = Some(value()),
                 "--scroll" => o.scroll = true,
+                "--fps" => o.fps = value().parse().unwrap_or(o.fps).clamp(1, MAX_FPS),
                 _ => {}
             }
         }
@@ -134,6 +149,8 @@ enum Cmd {
     Key(u32, String),
     Blur(u32),
     Eval(u32, String),
+    /// Images par seconde de l'onglet (1 à 60).
+    Fps(u32, i32),
     Quit,
 }
 
@@ -161,6 +178,7 @@ fn parse_cmd(line: &str) -> Option<Cmd> {
         "key" => Cmd::Key(id, rest.trim().to_string()),
         "blur" => Cmd::Blur(id),
         "eval" => Cmd::Eval(id, rest.to_string()),
+        "fps" => Cmd::Fps(id, num()?),
         _ => return None,
     })
 }
@@ -197,6 +215,9 @@ struct Outbox {
     frames: HashMap<u32, (u32, u32, Vec<u8>)>,
     events: VecDeque<([u8; 4], u32, u32, Vec<u8>)>,
     closed: bool,
+    /// Images par seconde envoyées au plus, par onglet (Chromium en peint souvent plus :
+    /// deux fois la fréquence demandée).
+    fps: HashMap<u32, i32>,
 }
 
 type Shared = Arc<(Mutex<Outbox>, Condvar)>;
@@ -340,14 +361,172 @@ wrap_load_handler! {
     }
 }
 
+wrap_life_span_handler! {
+    struct Popups {
+        id: u32,
+    }
+
+    impl LifeSpanHandler {
+        /// Jamais de nouvelle fenêtre. Un lien qu'on clique pour l'ouvrir dans un nouvel
+        /// onglet s'ouvre dans cet écran ; le reste (fenêtres ouvertes par un script, pubs)
+        /// est bloqué.
+        fn on_before_popup(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let url = target_url.map(|u| u.to_string()).unwrap_or_default();
+            let web = url.starts_with("https://") || url.starts_with("http://");
+            let link =
+                user_gesture != 0 && web && target_disposition != WindowOpenDisposition::NEW_POPUP;
+            if link {
+                if let Some(frame) = browser.and_then(|b| b.main_frame()) {
+                    frame.load_url(Some(&CefString::from(url.as_str())));
+                }
+            }
+            let what = if link { "ouverte dans l'écran" } else { "bloquée" };
+            eprintln!("onglet {} : fenêtre {what} ({url})", self.id);
+            1
+        }
+    }
+}
+
+wrap_jsdialog_handler! {
+    struct Dialogs;
+
+    impl JsdialogHandler {
+        /// `alert`, `confirm`, `prompt` : aucune boîte (comme si on l'avait fermée).
+        fn on_jsdialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            _origin_url: Option<&CefString>,
+            _dialog_type: JsdialogType,
+            _message_text: Option<&CefString>,
+            _default_prompt_text: Option<&CefString>,
+            _callback: Option<&mut JsdialogCallback>,
+            suppress_message: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(s) = suppress_message {
+                *s = 1;
+            }
+            0
+        }
+
+        /// « Quitter la page ? » : oui, sans boîte.
+        fn on_before_unload_dialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            _message_text: Option<&CefString>,
+            _is_reload: ::std::os::raw::c_int,
+            callback: Option<&mut JsdialogCallback>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(c) = callback {
+                c.cont(1, None);
+            }
+            1
+        }
+    }
+}
+
+wrap_dialog_handler! {
+    struct Files;
+
+    impl DialogHandler {
+        /// Choix d'un fichier : jamais (pas de fenêtre, rien du disque).
+        fn on_file_dialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            _mode: FileDialogMode,
+            _title: Option<&CefString>,
+            _default_file_path: Option<&CefString>,
+            _accept_filters: Option<&mut CefStringList>,
+            _accept_extensions: Option<&mut CefStringList>,
+            _accept_descriptions: Option<&mut CefStringList>,
+            callback: Option<&mut FileDialogCallback>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(c) = callback {
+                c.cancel();
+            }
+            1
+        }
+    }
+}
+
+wrap_permission_handler! {
+    struct Permissions;
+
+    impl PermissionHandler {
+        /// Caméra, micro, partage d'écran : refusés, sans demander.
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _requesting_origin: Option<&CefString>,
+            _requested_permissions: u32,
+            callback: Option<&mut MediaAccessCallback>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(c) = callback {
+                c.cancel();
+            }
+            1
+        }
+
+        /// Notifications, position… : refusées, sans demander.
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            _prompt_id: u64,
+            _requesting_origin: Option<&CefString>,
+            _requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(c) = callback {
+                c.cont(PermissionRequestResult::DENY);
+            }
+            1
+        }
+    }
+}
+
 wrap_client! {
     struct TabClient {
         painter: RenderHandler,
         console: DisplayHandler,
         loader: LoadHandler,
+        popups: LifeSpanHandler,
+        dialogs: JsdialogHandler,
+        files: DialogHandler,
+        permissions: PermissionHandler,
     }
 
     impl Client {
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(self.popups.clone())
+        }
+
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(self.dialogs.clone())
+        }
+
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(self.files.clone())
+        }
+
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(self.permissions.clone())
+        }
+
         fn render_handler(&self) -> Option<RenderHandler> {
             Some(self.painter.clone())
         }
@@ -394,10 +573,18 @@ impl Tab {
         let painted = Arc::new(AtomicBool::new(false));
         let painter = Painter::new(id, (opts.width, opts.height), out.clone(), painted);
         let console = Console::new(id, out.clone());
-        let mut client = TabClient::new(painter, console, Loader::new(id, opts.scroll));
+        let mut client = TabClient::new(
+            painter,
+            console,
+            Loader::new(id, opts.scroll),
+            Popups::new(id),
+            Dialogs::new(),
+            Files::new(),
+            Permissions::new(),
+        );
         let window_info = WindowInfo::default().set_as_windowless(sys::HWND::default());
         let settings = BrowserSettings {
-            windowless_frame_rate: 30,
+            windowless_frame_rate: opts.fps,
             // Fond opaque : pas de transparence à gérer côté jeu.
             background_color: 0xff00_0000,
             ..Default::default()
@@ -479,20 +666,61 @@ fn send_out(out: Shared) {
         w.write_all(&a.to_le_bytes())?;
         w.write_all(&b.to_le_bytes())
     };
+    // Dernier envoi d'une image de chaque onglet.
+    let mut last: HashMap<u32, Instant> = HashMap::new();
     loop {
         let (events, frames) = {
             let Ok(mut o) = lock.lock() else { return };
-            while o.frames.is_empty() && o.events.is_empty() && !o.closed {
-                o = match cv.wait(o) {
-                    Ok(o) => o,
-                    Err(_) => return,
+            // Images à envoyer : celles des onglets dont la dernière est assez ancienne
+            // (les autres attendent, remplacées par les suivantes).
+            let due = |o: &Outbox, last: &HashMap<u32, Instant>| -> (Vec<u32>, Option<Duration>) {
+                let now = Instant::now();
+                let mut ids = Vec::new();
+                let mut wait: Option<Duration> = None;
+                for id in o.frames.keys() {
+                    let fps = o.fps.get(id).copied().unwrap_or(MAX_FPS).clamp(1, MAX_FPS);
+                    let gap = Duration::from_secs_f64(1.0 / f64::from(fps))
+                        .saturating_sub(Duration::from_micros(1500));
+                    match last.get(id).map(|t| *t + gap) {
+                        Some(next) if next > now => {
+                            let w = next - now;
+                            wait = Some(wait.map_or(w, |x| x.min(w)));
+                        }
+                        _ => ids.push(*id),
+                    }
+                }
+                (ids, wait)
+            };
+            let ids = loop {
+                if o.closed {
+                    return;
+                }
+                let (ids, wait) = due(&o, &last);
+                if !ids.is_empty() || !o.events.is_empty() {
+                    break ids;
+                }
+                o = match wait {
+                    Some(w) => match cv.wait_timeout(o, w) {
+                        Ok((o, _)) => o,
+                        Err(_) => return,
+                    },
+                    None => match cv.wait(o) {
+                        Ok(o) => o,
+                        Err(_) => return,
+                    },
                 };
-            }
-            if o.closed {
-                return;
-            }
-            (std::mem::take(&mut o.events), std::mem::take(&mut o.frames))
+            };
+            let frames: Vec<(u32, (u32, u32, Vec<u8>))> = ids
+                .into_iter()
+                .filter_map(|id| o.frames.remove(&id).map(|f| (id, f)))
+                .collect();
+            (std::mem::take(&mut o.events), frames)
         };
+        let now = Instant::now();
+        for (id, _) in &frames {
+            last.insert(*id, now);
+        }
+        last.retain(|_, t| now.duration_since(*t) < Duration::from_secs(10));
         let mut sent: std::io::Result<()> = Ok(());
         for (tag, id, a, data) in events {
             sent = sent
@@ -591,6 +819,9 @@ fn main() {
                         }
                     }
                     None => {
+                        if let Ok(mut o) = out.0.lock() {
+                            o.fps.insert(id, opts.fps);
+                        }
                         if let Some(t) = Tab::open(id, &url, &opts, &out) {
                             tabs.insert(id, t);
                         }
@@ -602,6 +833,7 @@ fn main() {
                     }
                     if let Ok(mut o) = out.0.lock() {
                         o.frames.remove(&id);
+                        o.fps.remove(&id);
                     }
                 }
                 Cmd::Move(id, x, y) => {
@@ -639,6 +871,15 @@ fn main() {
                 Cmd::Blur(id) => {
                     if let Some(t) = tabs.get(&id) {
                         t.js(BLUR_JS);
+                    }
+                }
+                Cmd::Fps(id, fps) => {
+                    let fps = fps.clamp(1, MAX_FPS);
+                    if let Some(t) = tabs.get(&id) {
+                        t.host.set_windowless_frame_rate(fps);
+                    }
+                    if let Ok(mut o) = out.0.lock() {
+                        o.fps.insert(id, fps);
                     }
                 }
                 Cmd::Eval(id, code) => {
@@ -684,6 +925,8 @@ mod tests {
             parse_cmd("wheel 3 5 6 -120"),
             Some(Cmd::Wheel(3, 5, 6, -120))
         );
+        assert_eq!(parse_cmd("fps 3 60"), Some(Cmd::Fps(3, 60)));
+        assert_eq!(parse_cmd("fps 3"), None);
         assert_eq!(
             parse_cmd("open 7 https://www.youtube.com/watch?v=x"),
             Some(Cmd::Open(7, "https://www.youtube.com/watch?v=x".into()))

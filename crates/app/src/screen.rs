@@ -314,6 +314,34 @@ const MAX_FAILURES: u32 = 4;
 /// ne sert qu'à un navigateur à la fois, et un autre jeu ouvert peut tenir la première.
 const MAX_CACHES: u32 = 4;
 
+/// Pages ouvertes en même temps au plus (les écrans les plus en vue) : chaque page est un
+/// onglet de Chromium (une centaine de Mo de mémoire, du calcul). Les autres écrans
+/// gardent leur dernière image, assombrie (en veille), sans son.
+pub const MAX_PAGES: usize = 8;
+/// Images par seconde des pages, selon ce que voit le joueur (voir `Displays::schedule`) :
+/// l'écran regardé (ou, sans écran regardé, le plus proche à moins de `NEAR_60` blocs) ;
+/// jusqu'à `MAX_30` autres écrans en vue à moins de `NEAR_30` blocs ; les autres en vue ;
+/// ceux qu'on ne voit pas (derrière soi, de dos), qui gardent leur son.
+pub const FPS_LOOKED: i32 = 60;
+pub const FPS_NEAR: i32 = 30;
+pub const FPS_SEEN: i32 = 10;
+pub const FPS_HIDDEN: i32 = 2;
+const NEAR_60: f32 = 16.0;
+const NEAR_30: f32 = 32.0;
+const MAX_30: usize = 3;
+/// Images par seconde d'un onglet tant que `schedule` ne l'a pas réglé.
+const FPS_DEFAULT: i32 = 30;
+
+/// Un écran tel que le voit le joueur (pour `Displays::schedule`).
+#[derive(Clone, Copy, Debug)]
+pub struct Seen {
+    pub id: u32,
+    /// Distance de l'œil au centre de l'écran (blocs).
+    pub dist: f32,
+    /// Devant le joueur et vu de face.
+    pub visible: bool,
+}
+
 /// Navigateurs arrêtés qui se ferment encore. Un nouveau n'est lancé qu'après eux : il
 /// prendrait leur session (`cef-cache`), encore tenue, et ne démarrerait pas.
 static CLOSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -370,17 +398,87 @@ impl Displays {
             .filter(|id| !ids.contains(id))
             .collect();
         for id in gone {
-            self.tabs.remove(&id);
-            if let Some(b) = self.browser.as_mut() {
-                b.send(&format!("close {id}"));
+            if let Some(tab) = self.tabs.remove(&id) {
+                if let (true, Some(b)) = (tab.opened, self.browser.as_mut()) {
+                    b.send(&format!("close {id}"));
+                }
             }
         }
         for &id in ids {
             if !self.tabs.contains_key(&id) {
-                self.tabs.insert(id, Tab::new(HOME_URL));
-                if let Some(b) = self.browser.as_mut() {
-                    b.send(&format!("open {id} {HOME_URL}"));
+                // Sa page s'ouvre au prochain `update` (si l'écran est assez en vue).
+                let awake = self.tabs.values().filter(|t| t.want_awake).count() < MAX_PAGES;
+                let mut tab = Tab::new(HOME_URL);
+                tab.want_awake = awake;
+                self.tabs.insert(id, tab);
+            }
+        }
+    }
+
+    /// Ce que voit le joueur : chaque écran montré (`seen`) et celui sous le réticule
+    /// (`looked`). Les `MAX_PAGES` écrans les plus en vue (le regardé, puis ceux en vue,
+    /// puis les autres, du plus proche au plus loin) gardent leur page ouverte ; les autres
+    /// passent en veille. Images par seconde : `FPS_LOOKED` pour l'écran regardé à moins
+    /// de 48 blocs (sans écran regardé, le plus proche en vue à moins de `NEAR_60`), puis
+    /// `FPS_NEAR` pour `MAX_30` écrans en vue à moins de `NEAR_30`, `FPS_SEEN` pour les
+    /// autres en vue, `FPS_HIDDEN` pour ceux qu'on ne voit pas.
+    pub fn schedule(&mut self, seen: &[Seen], looked: Option<u32>) {
+        let mut order: Vec<&Seen> = seen.iter().filter(|s| self.tabs.contains_key(&s.id)).collect();
+        order.sort_by(|a, b| {
+            let key = |s: &Seen| (Some(s.id) != looked, !s.visible);
+            key(a).cmp(&key(b)).then(a.dist.total_cmp(&b.dist))
+        });
+        let mut top = looked.filter(|l| order.iter().any(|s| s.id == *l && s.dist <= 48.0));
+        if top.is_none() {
+            top = order
+                .iter()
+                .find(|s| s.visible && s.dist <= NEAR_60)
+                .map(|s| s.id);
+        }
+        let mut near = 0;
+        for (rank, s) in order.iter().enumerate() {
+            let fps = if Some(s.id) == top {
+                FPS_LOOKED
+            } else if s.visible && s.dist <= NEAR_30 && near < MAX_30 {
+                near += 1;
+                FPS_NEAR
+            } else if s.visible {
+                FPS_SEEN
+            } else {
+                FPS_HIDDEN
+            };
+            if let Some(tab) = self.tabs.get_mut(&s.id) {
+                let awake = rank < MAX_PAGES;
+                if tab.want_awake != awake {
+                    tab.want_awake = awake;
+                    tab.dirty = true;
                 }
+                tab.want_fps = fps;
+            }
+        }
+    }
+
+    /// Amène le navigateur à ce que veulent les onglets : pages ouvertes ou fermées
+    /// (veille), images par seconde.
+    fn apply(&mut self) {
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
+        for (id, tab) in self.tabs.iter_mut() {
+            if tab.want_awake && !tab.opened {
+                b.send(&format!("open {id} {}", tab.url));
+                tab.opened = true;
+                tab.fps_sent = FPS_DEFAULT;
+                tab.sent = None;
+            } else if !tab.want_awake && tab.opened {
+                b.send(&format!("close {id}"));
+                tab.opened = false;
+                tab.editing = false;
+                tab.scroll = 0;
+            }
+            if tab.opened && tab.want_fps != tab.fps_sent {
+                b.send(&format!("fps {id} {}", tab.want_fps));
+                tab.fps_sent = tab.want_fps;
             }
         }
     }
@@ -401,10 +499,10 @@ impl Displays {
                 self.absent = true;
             }
             Err(Launch::Failed) => self.failed(),
-            Ok(mut b) => {
-                for (id, tab) in self.tabs.iter_mut() {
-                    b.send(&format!("open {id} {}", tab.url));
-                    tab.sent = None;
+            Ok(b) => {
+                // Ses pages s'ouvrent dans `apply`.
+                for tab in self.tabs.values_mut() {
+                    tab.opened = false;
                 }
                 self.browser = Some(b);
             }
@@ -437,9 +535,10 @@ impl Displays {
             tab.url = url.to_string();
             // (La nouvelle page dira elle-même si elle défile.)
             tab.scroll = 0;
-        }
-        if let Some(b) = self.browser.as_mut() {
-            b.send(&format!("open {id} {url}"));
+            // Page en veille : l'adresse est ouverte à son réveil.
+            if let (true, Some(b)) = (tab.opened, self.browser.as_mut()) {
+                b.send(&format!("open {id} {url}"));
+            }
         }
         self.available()
     }
@@ -513,7 +612,7 @@ impl Displays {
 
     /// Un champ de texte de la page de l'écran `id` a-t-il le focus (le clavier y va) ?
     pub fn editing(&self, id: u32) -> bool {
-        self.browser.is_some() && self.tabs.get(&id).is_some_and(|t| t.editing)
+        self.browser.is_some() && self.tabs.get(&id).is_some_and(|t| t.opened && t.editing)
     }
 
     /// Texte tapé dans le champ de texte de l'écran `id`.
@@ -543,7 +642,7 @@ impl Displays {
     /// Lance le script `js` dans la page de l'écran `id` (regarder ensemble : temps et
     /// pause de la vidéo).
     pub fn eval(&mut self, id: u32, js: &str) {
-        if !self.tabs.contains_key(&id) {
+        if !self.tabs.get(&id).is_some_and(|t| t.opened) {
             return;
         }
         if let Some(b) = self.browser.as_mut() {
@@ -581,6 +680,7 @@ impl Displays {
                     tab.page.clear();
                     tab.editing = false;
                     tab.scroll = 0;
+                    tab.opened = false;
                     tab.dirty = true;
                 }
                 if code == Some(2) && ran < 10.0 && self.cache + 1 < MAX_CACHES {
@@ -627,6 +727,7 @@ impl Displays {
         if !self.tabs.is_empty() {
             self.launch();
         }
+        self.apply();
         let loading = self.available();
         for tab in self.tabs.values_mut() {
             if tab.loading != loading {
@@ -663,6 +764,13 @@ struct Tab {
     loading: bool,
     /// La page peut défiler sous le curseur : vers le haut (1), vers le bas (2).
     scroll: u8,
+    /// Page voulue ouverte (sinon en veille : dernière image assombrie) et images par
+    /// seconde voulues (voir `Displays::schedule`) ; page ouverte dans le navigateur et
+    /// images par seconde qui lui ont été demandées.
+    want_awake: bool,
+    want_fps: i32,
+    opened: bool,
+    fps_sent: i32,
     /// À redessiner (nouvelle image de la page, curseur déplacé…).
     dirty: bool,
     /// Change à chaque nouvelle image (le rendu ne renvoie que les nouvelles).
@@ -685,6 +793,10 @@ impl Tab {
             editing: false,
             loading: false,
             scroll: 0,
+            want_awake: true,
+            want_fps: FPS_DEFAULT,
+            opened: false,
+            fps_sent: 0,
             dirty: true,
             version: 0,
         };
@@ -700,8 +812,8 @@ impl Tab {
         if self.ripple.is_some_and(|r| r.1 > RIPPLE_S) {
             self.ripple = None;
         }
-        if self.page.is_empty() {
-            // Mire (aussi le temps que la première page arrive).
+        // Mire ou chargement animés (pas la veille, qui ne bouge pas).
+        if self.page.is_empty() && !(self.loading && !self.want_awake) {
             if !self.paused {
                 self.time += dt;
             }
@@ -713,7 +825,10 @@ impl Tab {
     }
 
     fn draw(&mut self) {
-        if self.page.is_empty() && self.loading {
+        let asleep = !self.want_awake && self.loading;
+        if self.page.is_empty() && asleep {
+            self.draw_asleep();
+        } else if self.page.is_empty() && self.loading {
             self.draw_loading();
         } else if self.page.is_empty() {
             self.draw_mire();
@@ -721,6 +836,14 @@ impl Tab {
             self.size = self.page_size;
             self.pixels.clear();
             self.pixels.extend_from_slice(&self.page);
+            if asleep {
+                // En veille : sa dernière image, assombrie.
+                for px in self.pixels.chunks_exact_mut(4) {
+                    px[0] /= 3;
+                    px[1] /= 3;
+                    px[2] /= 3;
+                }
+            }
         }
         // Les anneaux gardent la même taille à l'écran quelle que soit la résolution.
         let k = self.size.0 as f32 / W as f32;
@@ -742,6 +865,21 @@ impl Tab {
         }
         self.dirty = false;
         self.version += 1;
+    }
+
+    /// Écran en veille sans image : fond sombre et deux barres « pause ».
+    fn draw_asleep(&mut self) {
+        self.size = (W, H);
+        self.pixels.resize((W * H * 4) as usize, 0);
+        for px in self.pixels.chunks_exact_mut(4) {
+            px.copy_from_slice(&[26, 22, 20, 255]);
+        }
+        let (cx, cy, h) = (W as i32 / 2, H as i32 / 2, H as i32 / 8);
+        for y in cy - h / 2..cy + h / 2 {
+            for x in (cx - h / 3..cx - h / 8).chain(cx + h / 8..cx + h / 3) {
+                self.put(x, y, [110, 110, 110]);
+            }
+        }
     }
 
     /// Page en cours de chargement : fond sombre et arc qui tourne.
@@ -1206,6 +1344,8 @@ mod tests {
     #[test]
     fn un_appui_met_la_mire_en_pause_et_la_relance() {
         let mut d = Displays::new();
+        // (Pas de navigateur : la mire.)
+        d.absent = true;
         d.tabs.insert(1, Tab::new(HOME_URL));
         let v = d.frame(1).unwrap().0;
         d.press(1, [0.5, 0.5]);

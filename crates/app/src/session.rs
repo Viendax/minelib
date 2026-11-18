@@ -29,8 +29,9 @@ use crate::save::{self, GameMode, GameState, PlayerState, SaveData, WorldMeta, M
 use crate::streaming::Streamer;
 
 pub const REACH: f32 = 6.0;
-/// Portée de la visée des écrans vidéo : on les touche de loin, on les casse à `REACH`.
-const SCREEN_REACH: f32 = 32.0;
+/// Écran regardé de si loin au plus (pour lui donner le plus d'images par seconde). On
+/// n'agit sur un écran (toucher, molette, clavier, casser) qu'à portée de main (`REACH`).
+const SCREEN_LOOK: f32 = 64.0;
 /// Rotation par unité de souris pour une sensibilité de 1 : 0,022°, comme Counter-Strike
 /// (« m_yaw » / « m_pitch »).
 const CS_DEGREES_PER_COUNT: f32 = 0.022;
@@ -1404,7 +1405,8 @@ impl Session {
     }
 
     /// Écrans vidéo : chargement (première image), une page par écran et point visé par le
-    /// réticule. Sur un écran, « utiliser » le touche (tactile), « casser » le casse
+    /// réticule. On n'agit sur un écran qu'en le visant, sa hitbox à portée de main
+    /// (`REACH`). Sur un écran, « utiliser » le touche (tactile), « casser » le casse
     /// (l'objet revient, hors créatif) et « copier le bloc » met l'objet en main ; accroupi,
     /// « utiliser » l'ignore et pose le bloc tenu devant (voir `handle_blocks`). En mode
     /// FPS, la touche « utiliser » le touche ; on ne le casse pas. Un clic dans un champ de
@@ -1434,22 +1436,29 @@ impl Session {
         self.displays.sync(&ids);
         let fps = self.game.mode == GameMode::Fps;
         let use_key = if fps { Action::FpsUse } else { Action::Use };
+        // Écran regardé (même de loin : il a le plus d'images par seconde) ; on n'agit
+        // dessus que si sa hitbox est à portée de main.
+        let look = if self.shown.is_empty() {
+            None
+        } else {
+            self.aimed_screen(SCREEN_LOOK)
+        };
         self.screen_aim = None;
-        if !self.shown.is_empty()
-            && input.grabbed
+        if input.grabbed
             && !typing
             && !self.inventory.open
             && self.game.mode != GameMode::Spectator
         {
-            self.screen_aim = self.aimed_screen();
+            self.screen_aim = look.filter(|a| a.1 <= REACH);
         }
+        self.schedule_screens(look.map(|a| ids[a.0]));
         let aimed = self.screen_aim.map(|(i, _, uv)| (ids[i], uv));
         let editing = aimed.is_some_and(|a| self.displays.editing(a.0));
         if let Some((id, _)) = aimed {
             self.screen_last = Some(id);
         }
-        if let Some((i, t, uv)) = self.screen_aim {
-            let near = !fps && t <= REACH;
+        if let Some((i, _, uv)) = self.screen_aim {
+            let near = !fps;
             if near && self.keys.pressed(input, Action::Attack) {
                 match self.shown.get(i).and_then(|s| s.1.clone()) {
                     Some(owner) => self.chat.say(
@@ -1602,15 +1611,40 @@ impl Session {
         }
     }
 
-    /// Écran visé par le réticule (le plus proche, s'il n'est pas caché par un bloc) :
-    /// indice, distance et point visé dessus (0..1).
-    fn aimed_screen(&self) -> Option<(usize, f32, [f32; 2])> {
+    /// Images par seconde et pages ouvertes des écrans selon ce que voit le joueur (voir
+    /// `Displays::schedule`) : `looked`, l'écran sous le réticule.
+    fn schedule_screens(&mut self, looked: Option<u32>) {
+        let eye = self.player.eye();
+        let dir = self.player.look_dir();
+        let seen: Vec<crate::screen::Seen> = self
+            .shown
+            .iter()
+            .map(|(s, _)| {
+                let a = s.anchor();
+                let to = Vec3::from(a.center) - eye;
+                let dist = to.length();
+                let facing = Vec3::from(a.right).cross(Vec3::from(a.up));
+                // Devant soi (champ de vision large) et vu de face.
+                let visible = dist < 1.5
+                    || (to.dot(dir) > dist * 0.5 && facing.dot(-to) > 0.0);
+                crate::screen::Seen {
+                    id: s.id(),
+                    dist,
+                    visible,
+                }
+            })
+            .collect();
+        self.displays.schedule(&seen, looked);
+    }
+
+    /// Écran visé par le réticule jusqu'à `range` (le plus proche, s'il n'est pas caché
+    /// par un bloc) : indice, distance et point visé dessus (0..1).
+    fn aimed_screen(&self, range: f32) -> Option<(usize, f32, [f32; 2])> {
         let eye = self.player.eye();
         let dir = self.player.look_dir();
         // Jusqu'au premier bloc visé, un rien au-delà : l'écran est collé à son mur.
-        let seen =
-            minelib_world::raycast::raycast(&self.world, eye.into(), dir.into(), SCREEN_REACH);
-        let limit = seen.map_or(SCREEN_REACH, |h| h.distance + 0.1);
+        let seen = minelib_world::raycast::raycast(&self.world, eye.into(), dir.into(), range);
+        let limit = seen.map_or(range, |h| h.distance + 0.1);
         let mut best: Option<(usize, f32, [f32; 2])> = None;
         for (i, (s, _)) in self.shown.iter().enumerate() {
             if let Some((t, uv)) = crate::screen::aim(&s.anchor(), eye, dir, limit) {
