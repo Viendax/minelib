@@ -155,12 +155,32 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
 /// blocs plus loin n'y sont pas, ils ne cacheraient pas un joueur derrière eux.
 const WATER_MIRROR_RANGE: f32 = 64.0;
 
+/// (v202) Le joueur (pieds en `feet`) est-il tout entier hors de l'image de cette passe ?
+/// Test prudent sur une sphère autour de son corps, en coordonnées de découpe : déplacer un
+/// point de `r` dans le monde change x, y et w d'au plus `r` fois la longueur de leur ligne
+/// de la matrice. Dans une foule, la plupart sont derrière ou à côté de la caméra : leurs
+/// 216 sommets n'ont plus à calculer deux poses chacun.
+fn player_off_view(feet: vec3<f32>) -> bool {
+    let m = g.view_proj;
+    let c = m * vec4<f32>(feet + vec3<f32>(0.0, 0.9, 0.0), 1.0);
+    let r = 1.8;
+    let lx = length(vec3<f32>(m[0][0], m[1][0], m[2][0]));
+    let ly = length(vec3<f32>(m[0][1], m[1][1], m[2][1]));
+    let lw = length(vec3<f32>(m[0][3], m[1][3], m[2][3]));
+    let ex = r * (lx + lw);
+    let ey = r * (ly + lw);
+    return c.w + r * lw < 0.0 || c.x + c.w < -ex || c.x - c.w > ex || c.y + c.w < -ey
+        || c.y - c.w > ey;
+}
+
 @vertex
 fn vs_player(v: PlayerIn) -> PlayerOut {
     // (v200) Image des reflets dans l'eau (sa coupe au plan est multipliée par 1 000, celle
     // d'un miroir a une normale unitaire, voir water_mirror.rs) : seulement les joueurs à
-    // portée, les autres hors de l'image.
-    if g.clip.y > 500.0 && distance(v.feet.xz, g.cam_pos.xz) > WATER_MIRROR_RANGE {
+    // portée, les autres hors de l'image. (v202) Et dans toute passe, ceux qui sont hors de
+    // son image.
+    if (g.clip.y > 500.0 && distance(v.feet.xz, g.cam_pos.xz) > WATER_MIRROR_RANGE)
+        || player_off_view(v.feet) {
         var out: PlayerOut;
         out.clip = vec4<f32>(0.0, 0.0, -1.0, 1.0);
         return out;

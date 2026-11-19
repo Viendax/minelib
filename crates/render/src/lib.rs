@@ -302,7 +302,8 @@ pub struct ShadowBox {
     /// Le soleil l'atteint (aucun bloc entre elle et lui) : sinon, pas d'ombre du soleil.
     pub sunlit: bool,
     /// (v201) À qui est ce morceau (0 : à personne en particulier) : une lumière tenue
-    /// (`DynLight::owner`, même numéro) n'a pas l'ombre de celui qui la tient.
+    /// (`DynLight::owner`) n'a pas l'ombre de celui qui la tient. (v202) En bits : écarté
+    /// d'une lumière qui a un de ses bits.
     pub owner: u32,
 }
 
@@ -2057,6 +2058,7 @@ impl Renderer {
                     block: block.join().expect("pipeline des blocs"),
                     reflective: reflective.join().expect("pipeline réfléchissant"),
                     translucent: translucent.join().expect("pipeline translucide"),
+                    translucent_flat: None,
                 }
             })
         })
@@ -2641,6 +2643,7 @@ impl Renderer {
     /// `level` vu d'au-dessus, prépare l'image (blocs au-dessus de l'eau dans le champ du
     /// reflet de l'œil et à portée, uniformes vus de lui) et le dit à l'eau dans `g`. `vp` :
     /// vue-projection sans tremblement ; `size` : taille de l'image du monde.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_water_mirror(
         &mut self,
         vp: Mat4,
@@ -2648,6 +2651,7 @@ impl Renderer {
         size: (u32, u32),
         fog_end: f32,
         level: Option<f32>,
+        players: &[PlayerInstance],
         g: &mut Globals,
     ) {
         self.water_mirror.level = None;
@@ -2699,6 +2703,22 @@ impl Renderer {
             );
         }
         wm.upload(&self.device, &self.queue);
+        // (v202) Les joueurs qu'on peut y voir : à portée, pas tout entiers sous l'eau, et
+        // leur reflet dans le champ de la caméra (des milliers dans la foule : la plupart
+        // sont derrière ou à côté).
+        let seen = frustum_planes(vp);
+        wm.players.clear();
+        wm.players.extend(players.iter().copied().filter(|pl| {
+            let f = Vec3::from(pl.feet);
+            let (dx, dz) = (f.x - eye.x, f.z - eye.z);
+            if dx * dx + dz * dz > range * range || f.y + 2.0 <= h {
+                return false;
+            }
+            let c = Vec3::new(f.x, 2.0 * h - (f.y + 0.9), f.z);
+            aabb_visible(&seen, c - Vec3::splat(1.8), c + Vec3::splat(1.8))
+        }));
+        self.entities
+            .prepare_water_players(&self.queue, &wm.players);
         // Uniformes vus du reflet de l'œil : rien sous l'eau, pas de bloc visé, ni miroirs
         // ni reflets à son rythme, ni lumière des torches renvoyée par les miroirs.
         let mut wg = *g;
@@ -2720,11 +2740,7 @@ impl Renderer {
 
     /// (v200) Dessine l'image des reflets dans l'eau préparée par `prepare_water_mirror` :
     /// la profondeur des blocs, puis les joueurs et les objets.
-    fn encode_water_mirror(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
-    ) {
+    fn encode_water_mirror(&self, encoder: &mut wgpu::CommandEncoder) {
         let wm = &self.water_mirror;
         let (Some(_), Some(pipe), Some(group)) = (
             wm.level,
@@ -2733,6 +2749,13 @@ impl Renderer {
         ) else {
             return;
         };
+        // (v202) Mesure demandée seulement si la passe a lieu : sans eau en vue, l'ancienne
+        // mesure restée dans les requêtes était relue à chaque image (0,91 ms qui ne
+        // bougeaient plus dans les bilans).
+        let timestamps = self
+            .gpu_timer
+            .as_ref()
+            .and_then(|t| t.pass(gpu_timer::WATER_MIRROR));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("reflets dans l'eau"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2783,9 +2806,13 @@ impl Renderer {
             pass.draw(0..24, 0..1);
         }
         self.screen.draw(pass, pipes.taa);
-        // Translucides de l'arrière vers l'avant, par-dessus la scène opaque.
+        // Translucides de l'arrière vers l'avant, par-dessus la scène opaque. (v202) Sans
+        // le code du raytracing quand il est coupé.
         pass.set_bind_group(0, self.world_group(), &[]);
-        pass.set_pipeline(&heavy.translucent);
+        pass.set_pipeline(match &heavy.translucent_flat {
+            Some(flat) if !self.raytracing => flat,
+            _ => &heavy.translucent,
+        });
         let mut bound = usize::MAX;
         for &(page, first, count, vstart) in self.translucent_draws.iter().rev() {
             if bound != page {
@@ -3142,6 +3169,7 @@ impl Renderer {
             world_size,
             p.fog_end,
             p.water_mirror,
+            p.players,
             &mut globals,
         );
         self.queue
@@ -3215,12 +3243,7 @@ impl Renderer {
         }
         // (v190) Images des miroirs, avant la scène qui les lit.
         self.encode_mirrors(&mut encoder);
-        self.encode_water_mirror(
-            &mut encoder,
-            self.gpu_timer
-                .as_ref()
-                .and_then(|t| t.pass(gpu_timer::WATER_MIRROR)),
-        );
+        self.encode_water_mirror(&mut encoder);
         // Lumières de l'éditeur : actives cette image, leurs pipelines prêts, et au moins
         // une case de l'écran éclairée (sinon leurs passes n'ont rien à faire).
         let lights_on =
@@ -3293,10 +3316,7 @@ impl Renderer {
                         t.internal,
                         &t.color_view,
                         &l.deferred,
-                        (
-                            timer.and_then(|t| t.pass(gpu_timer::LIGHTS_HALF)),
-                            timer.and_then(|t| t.pass(gpu_timer::LIGHTS)),
-                        ),
+                        timer,
                     );
                 }
             }
@@ -3356,9 +3376,7 @@ impl Renderer {
                         t.generation,
                         &t.color_view,
                         &l.deferred,
-                        self.gpu_timer
-                            .as_ref()
-                            .and_then(|t| t.pass(gpu_timer::WATER)),
+                        self.gpu_timer.as_ref(),
                     );
                 }
             }
@@ -3384,10 +3402,7 @@ impl Renderer {
                     t.internal,
                     &t.color_view,
                     vl,
-                    (
-                        timer.and_then(|t| t.pass(gpu_timer::VOLUMETRIC)),
-                        timer.and_then(|t| t.pass(gpu_timer::VL_COMPOSITE)),
-                    ),
+                    timer,
                 );
             }
         }
@@ -3483,8 +3498,11 @@ impl Renderer {
                 } else {
                     self.rt_quality = rt::RtQuality::default();
                 }
+                // (v202) Avec les lumières sur l'eau : la demi-résolution vaut pour les deux, et
+                // c'est sur l'eau, vue de près, qu'elle gagne le plus.
                 if g.lights > 0.0 {
-                    self.dyn_gpu.note_light_gpu(g.lights + g.lights_half);
+                    self.dyn_gpu
+                        .note_light_gpu(g.lights + g.lights_half + g.water);
                 }
                 perf::gpu(g);
             }

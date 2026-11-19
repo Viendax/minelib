@@ -108,19 +108,18 @@ fn water_on_ray(world: &World, o: Vec3, d: Vec3) -> Option<f32> {
 
 /// (v200) L'eau que la caméra voit d'au-dessus, où se reflètent les joueurs et les objets
 /// (essai, `water_mirror` dans le rendu) : une seule surface par image, celle que touchent
-/// le plus de rayons lancés sur une grille de l'image. Cherchée toutes les quelques images
-/// (elle change rarement) ; celle d'avant est gardée tant qu'elle est encore vue au moins
-/// moitié autant que la plus vue (pas de va-et-vient entre deux bassins).
+/// le plus de rayons lancés sur une grille de l'image. (v202) Une ligne de la grille par
+/// image (le coût reste faible et égal d'une image à l'autre), les autres gardées de leur
+/// dernier passage.
 #[derive(Default)]
 pub struct SeenWater {
+    /// Surfaces touchées par les rayons de chaque ligne (en neuvièmes de bloc).
+    rows: Vec<Vec<i32>>,
+    next: u32,
     level: Option<f32>,
-    frame: u32,
 }
 
 impl SeenWater {
-    /// Images entre deux recherches.
-    const EVERY: u32 = 6;
-
     /// Surface à refléter pour la caméra `eye` (vue `view`, champ vertical `fov_y` en
     /// radians, rapport largeur / hauteur `aspect`).
     pub fn update(
@@ -131,21 +130,92 @@ impl SeenWater {
         fov_y: f32,
         aspect: f32,
     ) -> Option<f32> {
-        if self.frame.is_multiple_of(Self::EVERY) {
-            self.level = seen_water_level(world, eye, view, fov_y, aspect, self.level);
+        if self.rows.len() != GRID.1 as usize {
+            self.rows = vec![Vec::new(); GRID.1 as usize];
         }
-        self.frame = self.frame.wrapping_add(1);
-        // Entre deux recherches, la caméra a pu passer sous l'eau.
-        self.level.filter(|&h| eye.y > h + 0.05)
+        let j = self.next % GRID.1;
+        self.next = self.next.wrapping_add(1);
+        let row = &mut self.rows[j as usize];
+        row.clear();
+        row.extend(row_levels(world, eye, view, fov_y, aspect, j));
+        self.level = choose_level(self.rows.iter().flatten().copied(), self.level, eye);
+        self.level
     }
 }
 
 /// Grille de rayons : colonnes et lignes de l'image.
-const GRID: (u32, u32) = (8, 6);
+const GRID: (u32, u32) = (16, 9);
 
-/// Surface d'eau vue d'au-dessus que touchent le plus de rayons de la grille (voir
-/// `SeenWater`), `prev` gardée si elle en a au moins la moitié.
-pub fn seen_water_level(
+/// Surfaces d'eau (en neuvièmes de bloc) que touchent les rayons de la ligne `j` de la
+/// grille, vues d'au-dessus.
+fn row_levels(
+    world: &World,
+    eye: Vec3,
+    view: Mat4,
+    fov_y: f32,
+    aspect: f32,
+    j: u32,
+) -> impl Iterator<Item = i32> + '_ {
+    // Repère de la caméra : lignes de la vue (droite, haut, arrière).
+    let right = view.row(0).truncate();
+    let up = view.row(1).truncate();
+    let forward = -view.row(2).truncate();
+    let ty = (fov_y * 0.5).tan();
+    let tx = ty * aspect;
+    (0..GRID.0).filter_map(move |i| {
+        let x = ((i as f32 + 0.5) / GRID.0 as f32) * 2.0 - 1.0;
+        let y = ((j as f32 + 0.5) / GRID.1 as f32) * 2.0 - 1.0;
+        let d = (forward + right * (x * tx) + up * (y * ty)).normalize();
+        water_on_ray(world, eye, d)
+            .filter(|&h| eye.y > h + 0.05)
+            .map(|h| (h * 9.0).round() as i32)
+    })
+}
+
+/// Case (hauteur entière) d'une surface d'eau en neuvièmes de bloc : celle du bloc d'eau.
+fn level_cell(key: i32) -> i32 {
+    (key - 1).div_euclid(9)
+}
+
+/// Surface à refléter parmi celles touchées (`keys`, en neuvièmes de bloc) : (v202) la
+/// nappe d'eau (même case) la plus touchée, et dans celle-ci la hauteur la plus touchée.
+/// Une eau qui s'étale a toutes les hauteurs (1/9 à 8/9) dans la même case : le rendu
+/// prend toute la case (`water_mirror`). `prev`, celle d'avant, est gardée tant que sa
+/// nappe et sa hauteur ont encore au moins la moitié des rayons des plus touchées.
+fn choose_level(keys: impl Iterator<Item = i32>, prev: Option<f32>, eye: Vec3) -> Option<f32> {
+    // (Hauteur, nombre de rayons.)
+    let mut votes: Vec<(i32, u32)> = Vec::new();
+    for key in keys.filter(|&k| eye.y > k as f32 / 9.0 + 0.05) {
+        match votes.iter_mut().find(|v| v.0 == key) {
+            Some(v) => v.1 += 1,
+            None => votes.push((key, 1)),
+        }
+    }
+    let in_cell = |cell: i32| votes.iter().filter(move |v| level_cell(v.0) == cell);
+    let cell_votes = |cell: i32| in_cell(cell).map(|v| v.1).sum::<u32>();
+    let best_cell = votes
+        .iter()
+        .map(|v| level_cell(v.0))
+        .max_by_key(|&c| (cell_votes(c), c))?;
+    let best_key = in_cell(best_cell).max_by_key(|v| (v.1, v.0))?;
+    let keep = prev.and_then(|p| {
+        let key = (p * 9.0).round() as i32;
+        let cell = level_cell(key);
+        let own = votes.iter().find(|v| v.0 == key)?.1;
+        let strong = cell_votes(cell) * 2 >= cell_votes(best_cell)
+            && in_cell(cell)
+                .map(|v| v.1)
+                .max()
+                .is_some_and(|m| own * 2 >= m);
+        strong.then_some(p)
+    });
+    keep.or(Some(best_key.0 as f32 / 9.0))
+}
+
+/// Surface d'eau vue d'au-dessus que touchent le plus de rayons de toute la grille (voir
+/// `SeenWater`, `choose_level`), `prev` gardée si elle en a encore assez (essais).
+#[cfg(test)]
+fn seen_water_level(
     world: &World,
     eye: Vec3,
     view: Mat4,
@@ -153,38 +223,10 @@ pub fn seen_water_level(
     aspect: f32,
     prev: Option<f32>,
 ) -> Option<f32> {
-    // Repère de la caméra : lignes de la vue (droite, haut, arrière).
-    let right = view.row(0).truncate();
-    let up = view.row(1).truncate();
-    let forward = -view.row(2).truncate();
-    let ty = (fov_y * 0.5).tan();
-    let tx = ty * aspect;
-    // (Niveau en neuvièmes de bloc, nombre de rayons.)
-    let mut votes: Vec<(i32, u32)> = Vec::new();
-    for j in 0..GRID.1 {
-        for i in 0..GRID.0 {
-            let x = ((i as f32 + 0.5) / GRID.0 as f32) * 2.0 - 1.0;
-            let y = ((j as f32 + 0.5) / GRID.1 as f32) * 2.0 - 1.0;
-            let d = (forward + right * (x * tx) + up * (y * ty)).normalize();
-            let Some(h) = water_on_ray(world, eye, d).filter(|&h| eye.y > h + 0.05) else {
-                continue;
-            };
-            let key = (h * 9.0).round() as i32;
-            match votes.iter_mut().find(|v| v.0 == key) {
-                Some(v) => v.1 += 1,
-                None => votes.push((key, 1)),
-            }
-        }
-    }
-    let best = votes.iter().max_by_key(|v| v.1)?;
-    let keep = prev.and_then(|p| {
-        let key = (p * 9.0).round() as i32;
-        votes
-            .iter()
-            .find(|v| v.0 == key && v.1 * 2 >= best.1)
-            .map(|_| p)
-    });
-    keep.or(Some(best.0 as f32 / 9.0))
+    let keys: Vec<i32> = (0..GRID.1)
+        .flat_map(|j| row_levels(world, eye, view, fov_y, aspect, j))
+        .collect();
+    choose_level(keys.into_iter(), prev, eye)
 }
 
 #[cfg(test)]
@@ -240,9 +282,44 @@ mod tests {
         let under = Vec3::new(8.0, 11.2, 8.0);
         let v = look(under, Vec3::new(8.0, 0.0, 9.0));
         assert!(seen_water_level(&w, under, v, fov, 16.0 / 9.0, None).is_none());
-        // Recherchée toutes les quelques images, et oubliée dès qu'on passe dessous.
+        // Une ligne de la grille par image ; oubliée dès qu'on passe dessous.
         let mut seen = SeenWater::default();
-        assert_eq!(seen.update(&w, eye, down, fov, 16.0 / 9.0), Some(h));
+        let mut got = None;
+        for _ in 0..GRID.1 {
+            got = seen.update(&w, eye, down, fov, 16.0 / 9.0);
+        }
+        assert_eq!(got, Some(h));
         assert_eq!(seen.update(&w, under, down, fov, 16.0 / 9.0), None);
+    }
+
+    /// (v202) Une eau qui s'étale (hauteurs de 1/9 à 8/9 dans la même case) : c'est sa case
+    /// qui compte, plus touchée qu'une piscine à côté, et la hauteur la plus vue.
+    #[test]
+    fn spreading_water_is_one_sheet() {
+        let eye = Vec3::new(0.0, 140.0, 0.0);
+        let k = |h: f32| (h * 9.0).round() as i32;
+        // Flaque de la case 131 à hauteurs mêlées (6 rayons), piscine de la case 120 (4).
+        let keys = [
+            131.0 + 1.0 / 9.0,
+            131.0 + 1.0 / 9.0,
+            131.0 + 4.0 / 9.0,
+            131.0 + 5.0 / 9.0,
+            131.0 + 1.0 / 9.0,
+            131.0 + 8.0 / 9.0,
+            120.0 + 8.0 / 9.0,
+            120.0 + 8.0 / 9.0,
+            120.0 + 8.0 / 9.0,
+            120.0 + 8.0 / 9.0,
+        ];
+        let got = choose_level(keys.iter().map(|&h| k(h)), None, eye).expect("eau");
+        assert!((got - (131.0 + 1.0 / 9.0)).abs() < 1e-4, "{got}");
+        assert_eq!(level_cell(k(got)), 131);
+        assert_eq!(level_cell(k(131.0 + 8.0 / 9.0)), 131);
+        assert_eq!(level_cell(k(132.0)), 131);
+        // Celle d'avant reste tant qu'elle est encore bien vue.
+        let prev = Some(131.0 + 4.0 / 9.0);
+        let more = [131.0 + 4.0 / 9.0, 131.0 + 1.0 / 9.0, 131.0 + 1.0 / 9.0];
+        let kept = choose_level(more.iter().map(|&h| k(h)), prev, eye);
+        assert_eq!(kept, prev);
     }
 }

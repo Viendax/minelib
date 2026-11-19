@@ -91,7 +91,10 @@ pub struct DynLight {
     /// Lumière au centre d'un bloc lumineux : sa propre case ne lui fait pas d'ombre.
     pub inside_block: bool,
     /// (v201) Lumière tenue (lampe torche) : les morceaux de celui qui la tient
-    /// (`ShadowBox::owner`, même numéro) ne lui font pas d'ombre ; 0 : à personne.
+    /// (`ShadowBox::owner`) ne lui font pas d'ombre ; 0 : à personne. (v202) En bits : sont
+    /// écartés les morceaux qui ont un de ses bits. Non nul : lumière portée (elle bouge sans
+    /// cesse) : ses bords d'ombre restent en pente douce, sa carte est refaite avant celles
+    /// des autres.
     pub owner: u32,
     /// Rayons volumétriques : force (0 = aucun), densité, anisotropie (−0,95..0,95).
     pub beam: f32,
@@ -512,12 +515,14 @@ fn box_touches_sphere(mn: [f32; 3], mx: [f32; 3], c: Vec3, r: f32) -> bool {
 
 /// Morceaux de joueurs (bits de `boxes`) qui peuvent faire de l'ombre à `l` : ceux que sa
 /// lumière atteint. (v201) Pas ceux de celui qui la tient : sa lampe est contre lui, parfois
-/// dans sa boîte (tout serait alors dans l'ombre).
+/// dans sa boîte (tout serait alors dans l'ombre). (v202) Propriétaires en bits : une
+/// lumière écarte les morceaux qui ont un de ses bits (la lampe torche, tout le joueur ;
+/// la torche tenue, seulement le morceau tout contre sa flamme).
 fn box_mask(l: &DynLight, boxes: &[crate::ShadowBox]) -> u64 {
     let (c, r) = (Vec3::from(l.pos), l.range);
     let mut mask = 0u64;
     for (k, b) in boxes.iter().enumerate() {
-        let holder = l.owner != 0 && b.owner == l.owner;
+        let holder = l.owner & b.owner != 0;
         if !holder && box_touches_sphere(b.min, b.max, c, r) {
             mask |= 1 << k;
         }
@@ -583,7 +588,15 @@ fn pack_light(
             ],
             _ => [-1.0, 0.0, 1.0, 0.0],
         },
-        shadow: [sk, tan_half, if soft { 0.0 } else { 1.0 }, 0.0],
+        // (v202) w = 1 : lumière portée (elle bouge sans cesse avec celui qui la tient) :
+        // bords d'ombre en pente douce, sans le resserrement, pour qu'ils glissent au lieu de
+        // sauter d'un texel de la carte à l'autre.
+        shadow: [
+            sk,
+            tan_half,
+            if soft { 0.0 } else { 1.0 },
+            if l.owner != 0 { 1.0 } else { 0.0 },
+        ],
         boxes: [
             boxes as u32,
             (boxes >> 32) as u32,
@@ -2377,6 +2390,10 @@ impl DynGpu {
             }
         }
         self.cache.sweep(frame, 120);
+        // (v202) Les lumières portées (torche tenue, lampe torche) d'abord : elles bougent à
+        // chaque image, leur carte doit suivre. Derrière des torches à refaire (blocs changés,
+        // grille de blocs déplacée), elles attendaient leur tour et leurs ombres sautaient.
+        again.sort_by_key(|&i| self.lights[i].owner == 0);
         // 2. Cases à calculer : premiers calculs d'abord (jusqu'à 4 fois le budget), puis les
         // cartes périmées dans la limite du budget (au moins une lumière par image).
         let budget = st.bake_budget.max(1) as usize;
@@ -2691,8 +2708,8 @@ impl DynGpu {
         self.vl_active
     }
 
-    /// Temps GPU de l'éclairage différé d'une image passée (ms) : pour l'essai de la
-    /// demi-résolution.
+    /// Temps GPU de l'éclairage différé d'une image passée (ms ; v202 : opaque et eau) : pour
+    /// l'essai de la demi-résolution.
     pub fn note_light_gpu(&mut self, ms: f32) {
         self.half_trial.note(ms);
     }
@@ -2717,7 +2734,7 @@ impl DynGpu {
         generation: u64,
         color: &wgpu::TextureView,
         pipes: &DeferredPipes,
-        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+        timer: Option<&crate::gpu_timer::GpuTimer>,
     ) {
         if self.rects.is_empty() || self.gpu_lights.is_empty() {
             return;
@@ -2770,6 +2787,9 @@ impl DynGpu {
             return;
         };
         let soft = self.any_soft;
+        // (v202) Mesure demandée seulement quand les passes ont lieu (sinon l'ancienne mesure,
+        // restée dans les requêtes, était relue à chaque image).
+        let timestamps = timer.and_then(|t| t.pass(crate::gpu_timer::WATER));
         // Début dans la première passe, fin dans la seconde (une seule mesure pour les deux).
         let (ts_half, ts_main) = match timestamps {
             Some(ts) if self.half_now => (
@@ -2869,10 +2889,7 @@ impl DynGpu {
         size: (u32, u32),
         color: &wgpu::TextureView,
         pipes: &DeferredPipes,
-        timestamps: (
-            Option<wgpu::RenderPassTimestampWrites<'_>>,
-            Option<wgpu::RenderPassTimestampWrites<'_>>,
-        ),
+        timer: Option<&crate::gpu_timer::GpuTimer>,
     ) {
         if self
             .def_targets
@@ -2965,6 +2982,10 @@ impl DynGpu {
             return;
         };
         let soft = self.any_soft;
+        // (v202) Chaque mesure demandée seulement si sa passe a lieu : en calcul exact, la
+        // dernière mesure d'« un pixel sur quatre », restée dans les requêtes, était relue à
+        // chaque image (et comptée dans l'essai de la demi-résolution).
+        let ts = |pass: u32| timer.and_then(|t| t.pass(pass));
         // 1. Un pixel sur quatre (rien d'autre n'est écrit : 0, aucune lumière calculée).
         if self.half_now {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2978,7 +2999,7 @@ impl DynGpu {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: timestamps.0,
+                timestamp_writes: ts(crate::gpu_timer::LIGHTS_HALF),
                 occlusion_query_set: None,
             });
             pass.set_pipeline(if soft { &pipes.half } else { &pipes.half_hard });
@@ -3005,7 +3026,7 @@ impl DynGpu {
                     store: wgpu::StoreOp::Discard,
                 }),
             }),
-            timestamp_writes: timestamps.1,
+            timestamp_writes: ts(crate::gpu_timer::LIGHTS),
             occlusion_query_set: None,
         });
         pass.set_bind_group(0, world_group, &[]);
@@ -3046,14 +3067,14 @@ impl DynGpu {
         size: (u32, u32),
         color: &wgpu::TextureView,
         pipes: &VlPipes,
-        timestamps: (
-            Option<wgpu::RenderPassTimestampWrites<'_>>,
-            Option<wgpu::RenderPassTimestampWrites<'_>>,
-        ),
+        timer: Option<&crate::gpu_timer::GpuTimer>,
     ) {
         if !self.volumetric_active() {
             return;
         }
+        // (v202) Mesures demandées seulement quand leurs passes ont lieu (voir
+        // `encode_deferred`).
+        let ts = |pass: u32| timer.and_then(|t| t.pass(pass));
         let k = self.settings.vl_scale.clamp(2, 4);
         let half = (size.0.div_ceil(k), size.1.div_ceil(k));
         let key = (half.0, half.1, generation);
@@ -3140,7 +3161,7 @@ impl DynGpu {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: timestamps.0,
+                timestamp_writes: ts(crate::gpu_timer::VOLUMETRIC),
                 occlusion_query_set: None,
             });
             pass.set_pipeline(if self.vl_noise {
@@ -3163,7 +3184,7 @@ impl DynGpu {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: timestamps.1,
+            timestamp_writes: ts(crate::gpu_timer::VL_COMPOSITE),
             occlusion_query_set: None,
         });
         pass.set_pipeline(&pipes.composite);
@@ -3657,18 +3678,22 @@ mod tests {
             sunlit: true,
             owner,
         };
+        // (v202) Le troisième morceau (sa main) est aussi tout contre la flamme de sa torche
+        // (bit 2).
         let boxes = [
             b([0.0, 0.0, 0.0], [1.0, 2.0, 1.0], 1),
             b([3.0, 0.0, 0.0], [4.0, 2.0, 1.0], 0),
-            b([0.0, 2.0, 0.0], [1.0, 3.0, 1.0], 1),
+            b([0.0, 2.0, 0.0], [1.0, 3.0, 1.0], 1 | 2),
             b([60.0, 0.0, 0.0], [61.0, 2.0, 1.0], 0),
         ];
         let mut l = spot(9, [0.5, 1.5, 0.5], [1.0, 0.0, 0.0], 20.0, 30.0);
         assert_eq!(box_mask(&l, &boxes), 0b0111, "trop loin : pas d'ombre");
+        // Sa lampe torche : aucun de ses morceaux.
         l.owner = 1;
         assert_eq!(box_mask(&l, &boxes), 0b0010);
+        // Sa torche tenue : son corps fait son ombre, pas sa main.
         l.owner = 2;
-        assert_eq!(box_mask(&l, &boxes), 0b0111);
+        assert_eq!(box_mask(&l, &boxes), 0b0011);
     }
 
     #[test]

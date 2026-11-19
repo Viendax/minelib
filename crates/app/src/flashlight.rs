@@ -15,6 +15,10 @@ pub const LIGHT_ID: u64 = 0x7f1a_5410_0000_0001;
 /// d'ombre à sa lumière.
 pub const HOLDER: u32 = 1;
 
+/// (v202) Bit en plus du morceau du joueur tout contre la flamme de la torche qu'il tient
+/// (sa main) : seul écarté de la lumière de la torche, le reste du joueur y fait son ombre.
+pub const NEAR_FLAME: u32 = 2;
+
 /// Couleurs (sRGB) : corps, bagues, interrupteur, tête, verre allumé et éteint.
 pub const BODY: [u8; 3] = [40, 40, 44];
 const RING: [u8; 3] = [24, 24, 27];

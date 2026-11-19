@@ -61,6 +61,8 @@ pub(crate) struct WaterMirror {
     pub groups: Vec<(usize, u32, u32)>,
     /// Niveau de l'eau redessiné à cette image (None : pas d'image).
     pub level: Option<f32>,
+    /// (v202) Les joueurs qu'on peut y voir (tableau repris d'une image à l'autre).
+    pub players: Vec<crate::PlayerInstance>,
 }
 
 fn texture(
@@ -127,6 +129,7 @@ impl WaterMirror {
             cmds: Vec::new(),
             groups: Vec::new(),
             level: None,
+            players: Vec::new(),
         }
     }
 

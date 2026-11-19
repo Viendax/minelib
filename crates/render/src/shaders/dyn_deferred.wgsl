@@ -12,8 +12,10 @@
 // reprend ensuite la moyenne de ses voisins calculés (`fs_interp` : lui-même, ses deux
 // voisins, ou ses quatre en diagonale), mais seulement si tous sont sur sa face (même
 // normale, même brillance, profondeurs dans son plan) et qu'ils reçoivent presque la même
-// lumière (moins de 2 % d'écart). Sinon, au bord d'un objet, d'une ombre, d'un faisceau,
-// d'un reflet, il est laissé de côté (pochoir à 0) et calculé exactement par `fs_deferred`.
+// lumière (moins de 2 % d'écart) ou (v202) une lumière qui varie en pente douce, sans
+// courbure ni saut (vu avec les voisins suivants). Sinon, au bord d'un objet, d'une ombre,
+// d'un faisceau net, d'un reflet, il est laissé de côté (pochoir à 0) et calculé
+// exactement par `fs_deferred`.
 
 // Début des uniformes du monde.
 struct Globals {
@@ -191,21 +193,85 @@ fn half_in_plane(d: f32, dsum: f32) -> bool {
     return abs(dsum * 0.25 - d) <= d * 1e-3;
 }
 
-/// Moyenne de la lumière des voisins, si elle est presque la même partout (ni bord
-/// d'ombre, de faisceau ou de gobo, ni tache de reflet entre eux) ; sinon diffus < 0.
-fn half_average(q: HalfQuad) -> DynOut {
+/// (v202) Lumière d'un voisin calculé plus loin (`c`, coordonnées de demi-taille), s'il
+/// est sur la face de clé `key` ; sinon diffus < 0.
+fn half_far(c: vec2<i32>, key: u32) -> HalfTap {
+    let hi = vec2<i32>(textureDimensions(half_light)) - 1;
+    let t = textureLoad(half_light, clamp(c, vec2<i32>(0), hi), 0);
+    if (t.w & 0x1ffffffu) != key {
+        return HalfTap(vec3<f32>(-1.0), vec3<f32>(0.0));
+    }
+    return half_tap(t);
+}
+
+/// (v202) Sur une variation douce (pente d'un bord de faisceau étalé, d'une atténuation,
+/// d'un grand reflet), la moyenne de deux voisins calculés `b` et `c` vaut le milieu même
+/// s'ils diffèrent de plus de 2 %. Les voisins suivants, `a` avant et `d` après, le disent :
+/// ni courbure (écart entre le milieu de la courbe qui passe par les quatre et celui de la
+/// droite : (d − c − b + a) / 16), ni saut (pente du milieu loin de la moyenne de celles
+/// d'à côté : un bord d'ombre net entre `b` et `c`) au-delà de 0,4 % de la plus forte.
+fn half_line(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>, d: vec3<f32>) -> bool {
+    let tol = max(max(a, b), max(c, d)) * 0.004 + vec3<f32>(1e-4);
+    let sm = b - a;
+    let sc = c - b;
+    let sp = d - c;
+    return all(abs(sp - sm) * (1.0 / 16.0) <= tol) && all(abs(sc - (sm + sp) * 0.5) <= tol * 2.0);
+}
+
+/// (v202) `half_line` pour le diffus et les reflets.
+fn half_line_tap(a: HalfTap, b: HalfTap, c: HalfTap, d: HalfTap) -> bool {
+    return a.diffuse.x >= 0.0 && d.diffuse.x >= 0.0
+        && half_line(a.diffuse, b.diffuse, c.diffuse, d.diffuse)
+        && half_line(a.specular, b.specular, c.specular, d.specular);
+}
+
+/// Moyenne de la lumière des voisins du pixel `px` (face de clé `key`), si elle vaut le
+/// calcul exact : presque la même lumière partout (2 %), ou (v202) une variation douce,
+/// sans courbure ni saut (`half_line`, avec les voisins suivants sur la même face). Pas
+/// au bord d'une ombre, d'un faisceau net, d'un gobo, ni au sommet d'une tache de reflet.
+/// Sinon diffus < 0.
+fn half_average(q: HalfQuad, px: vec2<i32>, key: u32) -> DynOut {
     let l00 = half_tap(q.t00);
     let l10 = half_tap(q.t10);
     let l01 = half_tap(q.t01);
     let l11 = half_tap(q.t11);
-    if !half_close(l00.diffuse, l10.diffuse, l01.diffuse, l11.diffuse)
-        || !half_close(l00.specular, l10.specular, l01.specular, l11.specular) {
-        return DynOut(vec3<f32>(-1.0), vec3<f32>(0.0));
-    }
-    return DynOut(
+    let avg = DynOut(
         (l00.diffuse + l10.diffuse + l01.diffuse + l11.diffuse) * 0.25,
         (l00.specular + l10.specular + l01.specular + l11.specular) * 0.25,
     );
+    if half_close(l00.diffuse, l10.diffuse, l01.diffuse, l11.diffuse)
+        && half_close(l00.specular, l10.specular, l01.specular, l11.specular) {
+        return avg;
+    }
+    let h = px / 2;
+    let o = vec2<i32>(px.x & 1, px.y & 1);
+    var ok = true;
+    // Entre deux voisins de la même ligne : ceux d'avant et d'après sur cette ligne.
+    if o.x == 1 {
+        ok = ok && half_line_tap(
+            half_far(h - vec2<i32>(1, 0), key), l00, l10, half_far(h + vec2<i32>(2, 0), key),
+        );
+    }
+    // De même en colonne.
+    if ok && o.y == 1 {
+        ok = ok && half_line_tap(
+            half_far(h - vec2<i32>(0, 1), key), l00, l01, half_far(h + vec2<i32>(0, 2), key),
+        );
+    }
+    // Au milieu de quatre : le quatrième dans le plan des trois autres (pas d'ombre ni de
+    // bord qui ne toucherait que lui).
+    if ok && o.x == 1 && o.y == 1 {
+        let tol = max(max(l00.diffuse, l10.diffuse), max(l01.diffuse, l11.diffuse)) * 0.004
+            + vec3<f32>(1e-4);
+        let tol_s = max(max(l00.specular, l10.specular), max(l01.specular, l11.specular)) * 0.004
+            + vec3<f32>(1e-4);
+        ok = all(abs(l11.diffuse - l10.diffuse - l01.diffuse + l00.diffuse) <= tol * 2.0)
+            && all(abs(l11.specular - l10.specular - l01.specular + l00.specular) <= tol_s * 2.0);
+    }
+    if !ok {
+        return DynOut(vec3<f32>(-1.0), vec3<f32>(0.0));
+    }
+    return avg;
 }
 
 /// Moyenne des voisins calculés si elle vaut le calcul exact (voir en tête) ; sinon le
@@ -224,7 +290,8 @@ fn fs_interp(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let a = textureLoad(gb_albedo, px, 0);
     let q = half_quad(px);
-    if !half_same(q, half_key(s, a)) {
+    let key = half_key(s, a);
+    if !half_same(q, key) {
         discard;
     }
     let full = vec2<i32>(textureDimensions(scene_depth)) - 1;
@@ -235,7 +302,7 @@ fn fs_interp(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if !half_in_plane(textureLoad(scene_depth, px, 0), dsum) {
         discard;
     }
-    let avg = half_average(q);
+    let avg = half_average(q, px, key);
     if avg.diffuse.x < 0.0 {
         discard;
     }
@@ -310,7 +377,8 @@ fn fs_water_interp(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32>
         discard;
     }
     let q = half_quad(px);
-    if !half_same(q, half_key(f.s, f.a)) {
+    let key = half_key(f.s, f.a);
+    if !half_same(q, key) {
         discard;
     }
     let full = vec2<i32>(textureDimensions(water_gb)) - 1;
@@ -321,7 +389,7 @@ fn fs_water_interp(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32>
     if !half_in_plane(f.depth, dsum) {
         discard;
     }
-    let avg = half_average(q);
+    let avg = half_average(q, px, key);
     if avg.diffuse.x < 0.0 {
         discard;
     }

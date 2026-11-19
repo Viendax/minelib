@@ -400,10 +400,27 @@ fn fs_block_mv(i: VOut) -> GbOut {
 @fragment
 fn fs_block_translucent_mv(i: VOut) -> TrOut {
     let s = shade_full(i, true, true, true);
-    let c = s.color;
-    if c.a < 0.02 || from_behind(i) {
+    if s.color.a < 0.02 || from_behind(i) {
         discard;
     }
+    return translucent_out(i, s);
+}
+
+/// (v202) La même chose sans le code du raytracing (servi quand il est coupé, image
+/// identique) : la carte garde moins de registres pour ce gros shader, et en fait tourner
+/// plus à la fois sur l'eau.
+@fragment
+fn fs_block_translucent_flat_mv(i: VOut) -> TrOut {
+    let s = shade_rt(i, true, true, true, false);
+    if s.color.a < 0.02 || from_behind(i) {
+        discard;
+    }
+    return translucent_out(i, s);
+}
+
+/// Sorties d'une face translucide ombrée `s` (voir `TrOut`).
+fn translucent_out(i: VOut, s: Shaded) -> TrOut {
+    let c = s.color;
     let a = max(c.a, 0.25);
     var o: TrOut;
     o.color = vec4<f32>(c.rgb, a);
@@ -501,6 +518,12 @@ fn block_uv(i: VOut) -> vec2<f32> {
 /// `reflections` = false : blocs sans reflet (la grande majorité) ; le compilateur retire
 /// tout le code des reflets, le shader est bien plus léger et la carte va plus vite.
 fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
+    return shade_rt(i, reflections, cached, cheap, true);
+}
+
+/// `shade_full`, avec (`rt`) ou sans le code du raytracing : constante à la compilation,
+/// comme les autres choix (le compilateur de DirectX retire ce qui ne sert pas).
+fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> Shaded {
     let n = face_normal(i.face);
     let p = i.world - n * 0.001;            // légèrement à l'intérieur du bloc
     let cell = vec3<i32>(floor(p));
@@ -575,7 +598,7 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
         torch = max(torch, held * select(1.0, 0.35, ts.a > 0.5));
     }
     // Lumière des torches renvoyée par les miroirs (raytracing).
-    if g.rt.x > 0.5 && g.light.w > 0.0 {
+    if rt && g.rt.x > 0.5 && g.light.w > 0.0 {
         torch = max(torch, mirror_light(i.world + n * 0.01, n) * flicker * mix(0.55, 1.0, i.ao));
     }
     var color = albedo * (sky_light * ao + torch);
@@ -641,7 +664,7 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
             // Miroir pas redessiné, trop loin pour un rayon : opaque.
             env = vec3<f32>(0.0);
             cover = 0.0;
-        } else if g.rt.x > 0.5 {
+        } else if rt && g.rt.x > 0.5 {
             // Un seul appel à `trace` (le compilateur de DirectX recopie tout à chaque appel).
             var found = false;
             if cached && !short {
@@ -668,10 +691,12 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
             cover = select(1.0, 0.0, short);
         }
         // (v200) Joueurs et objets reflétés dans l'eau (image faite à part, sans rayon) :
-        // par-dessus le reste du reflet, sur le dessus de l'eau à ce niveau (un peu plus
-        // bas au bord, où les coins de l'eau s'abaissent vers l'air).
-        if g.mirror_count.z > 0.5 && i.face == 2u && i.world.y > g.mirror_count.y - 0.12
-            && i.world.y < g.mirror_count.y + 0.03 {
+        // par-dessus le reste du reflet, sur le dessus de l'eau de cette nappe. (v202) Toute
+        // la case de la nappe : une eau qui s'étale y a toutes les hauteurs (1/9 à 8/9, coins
+        // en pente), son reflet pris au plan le plus vu.
+        let water_cell = floor(g.mirror_count.y - 0.001);
+        if g.mirror_count.z > 0.5 && i.face == 2u && i.world.y > water_cell - 0.12
+            && i.world.y < water_cell + 0.95 {
             let w = water_mirror(i.world);
             env = mix(env, w.rgb, w.a);
             cover = max(cover, w.a);
@@ -687,7 +712,7 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
         // sur un miroir, plus étalé sur le métal ; avec ou sans raytracing. (Pas sur un
         // miroir redessiné : les flammes sont déjà dans son image.)
         if (g.rt.x < 0.5 || i.reflect < 0.99) && planar.a < 0.5 && !deepest {
-            color += specular(i.world, r, i.reflect, i.light) * flicker * reflect_fade;
+            color += specular(i.world, r, i.reflect, i.light, rt) * flicker * reflect_fade;
         }
     }
 
@@ -850,7 +875,7 @@ fn voxel(c: vec3<i32>) -> u32 {
 /// `face_light` : lumière des torches reçue par la face (propagée case par case, donc
 /// arrêtée par les murs) : une source dont la lumière n'arrive pas jusqu'ici est cachée
 /// derrière un mur, son reflet n'apparaît pas.
-fn specular(p: vec3<f32>, r: vec3<f32>, k: f32, face_light: vec3<f32>) -> vec3<f32> {
+fn specular(p: vec3<f32>, r: vec3<f32>, k: f32, face_light: vec3<f32>, rt: bool) -> vec3<f32> {
     let m = max(face_light.x, max(face_light.y, face_light.z));
     let lit2 = m * m;
     let shin = exp2(mix(5.0, 13.0, k));
@@ -893,7 +918,7 @@ fn specular(p: vec3<f32>, r: vec3<f32>, k: f32, face_light: vec3<f32>) -> vec3<f
             best_at = lp.xyz;
         }
     }
-    if g.rt.x > 0.5 && dot(best, vec3<f32>(1.0)) > 0.003 && !light_clear(p, best_at) {
+    if rt && g.rt.x > 0.5 && dot(best, vec3<f32>(1.0)) > 0.003 && !light_clear(p, best_at) {
         c = max(c - best, vec3<f32>(0.0));
     }
     if g.held_pos.w > 0.0 {

@@ -290,6 +290,15 @@ crates/
   ensuite par les lumières de l'éditeur (`fs_water*`, `dyn_deferred.wgsl`). Toute pipeline
   dessinée dans cette passe (contour, écrans, fumigènes…) doit la déclarer, avec une
   écriture vide si elle ne s'en sert pas : sinon wgpu la refuse (erreur de validation).
+- **Une mesure GPU se demande quand sa passe commence** (`GpuTimer::pass`, juste avant
+  `begin_render_pass`). Demandée pour une passe qui n'a finalement pas lieu, elle relit
+  l'ancienne mesure restée dans les requêtes : jusqu'à la v201, les bilans montraient des
+  « reflets dans l'eau 0,91 ms » figés sans eau en vue, et l'essai de la demi-résolution
+  comptait en calcul exact le temps d'« un pixel sur quatre » qui n'avait pas tourné.
+- **L'alpha de l'historique du TAA n'est pas une opacité.** Depuis la v202, il marque où un
+  objet bougeait (1, divisé par deux à chaque image) : la résolution y resserre ses bornes
+  pour ne pas laisser de traînées derrière les PNJ. La copie à l'écran l'ignore ; toute
+  autre lecture de l'historique doit l'ignorer aussi.
 
 ### Relais
 

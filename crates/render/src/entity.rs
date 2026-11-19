@@ -152,6 +152,9 @@ struct Players {
     count: u32,
     /// (v190) Instances après `count` dessinées seulement dans les miroirs (soi-même).
     extra: u32,
+    /// (v202) Ceux qu'on peut voir reflétés dans l'eau (voir `water_mirror`), à part.
+    water: wgpu::Buffer,
+    water_count: u32,
     skins: wgpu::Texture,
     group: wgpu::BindGroup,
 }
@@ -321,6 +324,12 @@ impl Players {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let water = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("joueurs reflétés dans l'eau (instances)"),
+            size: (MAX_PLAYERS * std::mem::size_of::<PlayerInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             plain: pipeline("joueurs", "fs_player", &[target(surface)]),
             taa: pipeline("joueurs (TAA)", "fs_player_taa", &taa_targets),
@@ -329,6 +338,8 @@ impl Players {
             instances,
             count: 0,
             extra: 0,
+            water,
+            water_count: 0,
             skins,
             group,
         }
@@ -397,6 +408,28 @@ impl Players {
 
     fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, world: &'a wgpu::BindGroup, taa: bool) {
         self.draw_n(pass, world, taa, self.count);
+    }
+
+    /// (v202) Les joueurs de l'image des reflets dans l'eau (choisis par `water_mirror`).
+    fn set_water(&mut self, queue: &wgpu::Queue, players: &[PlayerInstance]) {
+        let n = players.len().min(MAX_PLAYERS);
+        self.water_count = n as u32;
+        if n > 0 {
+            queue.write_buffer(&self.water, 0, bytemuck::cast_slice(&players[..n]));
+        }
+    }
+
+    /// (v202) Ceux-là, dans l'image des reflets dans l'eau (sans anticrénelage).
+    fn draw_water<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, world: &'a wgpu::BindGroup) {
+        if self.water_count == 0 || self.mesh_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.plain);
+        pass.set_bind_group(0, world, &[]);
+        pass.set_bind_group(1, &self.group, &[]);
+        pass.set_vertex_buffer(0, self.mesh.slice(..));
+        pass.set_vertex_buffer(1, self.water.slice(..));
+        pass.draw(0..self.mesh_count, 0..self.water_count);
     }
 
     /// `n` premières instances (les autres joueurs ; plus soi-même dans un miroir).
@@ -671,17 +704,28 @@ impl Entities {
         self.players.count > 0 || self.count > 0 || !self.static_draw.is_empty()
     }
 
+    /// (v202) Les autres joueurs qu'on peut voir reflétés dans l'eau (choisis par
+    /// `water_mirror`) : à dessiner dans son image.
+    pub(crate) fn prepare_water_players(
+        &mut self,
+        queue: &wgpu::Queue,
+        players: &[PlayerInstance],
+    ) {
+        self.players.set_water(queue, players);
+    }
+
     /// (v200) Les entités dans l'image des reflets dans l'eau (pipelines sans anticrénelage,
-    /// comme dans un miroir) : les autres joueurs, les entités fixes et celles de l'image,
-    /// sans soi-même à la première personne (sa tête reflétée boucherait la vue au ras de
-    /// l'eau ; à la 3e personne, son modèle est parmi les entités de l'image).
+    /// comme dans un miroir) : les autres joueurs (v202 : ceux qu'on peut y voir), les
+    /// entités fixes et celles de l'image, sans soi-même à la première personne (sa tête
+    /// reflétée boucherait la vue au ras de l'eau ; à la 3e personne, son modèle est parmi
+    /// les entités de l'image).
     pub(crate) fn draw_water_mirror<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         group: &'a wgpu::BindGroup,
     ) {
         let p = &self.pipes;
-        self.players.draw_n(pass, group, false, self.players.count);
+        self.players.draw_water(pass, group);
         pass.set_bind_group(0, group, &[]);
         pass.set_pipeline(&p.plain);
         for key in &self.static_draw {

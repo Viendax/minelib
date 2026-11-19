@@ -168,6 +168,9 @@ pub struct Heavy {
     pub block: wgpu::RenderPipeline,
     pub reflective: wgpu::RenderPipeline,
     pub translucent: wgpu::RenderPipeline,
+    /// (v202) Translucides sans le code du raytracing, quand il est coupé (anticrénelage
+    /// seulement) : même image, plus léger pour la carte.
+    pub translucent_flat: Option<wgpu::RenderPipeline>,
 }
 
 /// Un pipeline du monde qui écrit la couleur et le mouvement (TAA), et, dans la passe des
@@ -280,11 +283,29 @@ pub(crate) fn build_heavy(
     std::thread::scope(|sc| {
         let block = sc.spawn(|| mk("blocs (TAA)", "fs_block_fast_mv"));
         let reflective = sc.spawn(|| mk("reflets (TAA)", "fs_block_mv"));
-        let translucent = sc.spawn(|| translucent_pipeline(device, layout, shader));
+        let translucent = sc.spawn(|| {
+            translucent_pipeline(
+                device,
+                layout,
+                shader,
+                "translucide (TAA)",
+                "fs_block_translucent_mv",
+            )
+        });
+        let translucent_flat = sc.spawn(|| {
+            translucent_pipeline(
+                device,
+                layout,
+                shader,
+                "translucide sans raytracing (TAA)",
+                "fs_block_translucent_flat_mv",
+            )
+        });
         Heavy {
             block: block.join().expect("pipeline des blocs (TAA)"),
             reflective: reflective.join().expect("pipeline réfléchissant (TAA)"),
             translucent: translucent.join().expect("pipeline translucide (TAA)"),
+            translucent_flat: Some(translucent_flat.join().expect("pipeline translucide (TAA)")),
         }
     })
 }
@@ -296,13 +317,15 @@ fn translucent_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    label: &str,
+    fs: &str,
 ) -> wgpu::RenderPipeline {
     block_pipeline(
         device,
         layout,
         shader,
-        "translucide (TAA)",
-        "fs_block_translucent_mv",
+        label,
+        fs,
         None,
         false,
         Some(wgpu::BlendState::ALPHA_BLENDING),

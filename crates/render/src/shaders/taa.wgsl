@@ -5,6 +5,7 @@
 // de mouvement), on y lit l'historique, on le borne aux couleurs voisines de l'image
 // courante (évite les traînées) et on mélange un peu de l'image courante. Au fil des
 // images, chaque pixel devient la moyenne de nombreux échantillons : plus de scintillement.
+// (v202) L'alpha de l'historique marque où un objet bougeait (voir `fs_resolve`).
 
 @group(0) @binding(0) var cur_color: texture_2d<f32>;
 @group(0) @binding(1) var cur_motion: texture_2d<f32>;
@@ -126,6 +127,8 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     var cmax = vec3<f32>(-1e9);
     var best_depth = -1.0;
     var best = p;
+    // (v202) Plus grand mouvement du voisinage (px², au carré) : un objet qui bouge tout près.
+    var mmax = 0.0;
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
             let q = clamp(p + vec2<i32>(dx, dy), vec2<i32>(0), size - 1);
@@ -139,16 +142,20 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
                 best_depth = d;
                 best = q;
             }
+            let mv = textureLoad(cur_motion, q, 0).xy;
+            mmax = max(mmax, dot(mv, mv));
         }
     }
     let mean = m1 / 9.0;
     let sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3<f32>(0.0)));
     let motion = textureLoad(cur_motion, best, 0).xy;
     let prev_uv = i.uv + motion / params.internal.xy;
+    // (v202) Un objet bouge tout près (joueur, PNJ qui marche, bras qui balance).
+    let near_motion = mmax > 1e-4;
 
     let offscreen = any(prev_uv < vec2<f32>(0.0)) || any(prev_uv > vec2<f32>(1.0));
     if params.size.z > 0.5 || offscreen {
-        return vec4<f32>(cur, 1.0);
+        return vec4<f32>(cur, select(0.0, 1.0, near_motion));
     }
 
     // Pixel immobile (caméra arrêtée) : l'historique est exact, seul le décalage sous-pixel
@@ -159,6 +166,13 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     // still.y = 1 : la scène vient de changer (chunk chargé, bloc posé) : comme en mouvement.
     let moving = max(smoothstep(0.05, 1.0, speed), params.still.y);
     let hist_raw = to_ycocg(sample_history(prev_uv));
+    // (v202) Alpha de l'historique : 1 là où un objet bougeait à l'image d'avant (et sur
+    // un pixel autour), divisé par deux à chaque image. Un PNJ qui marche avance de plus
+    // d'un pixel par image : là où il était, plus rien ne bouge, mais l'historique a
+    // encore sa couleur.
+    let was_moving = textureSampleLevel(history, lin_sampler, prev_uv, 0.0).a;
+    let flag = max(select(0.0, 1.0, near_motion), was_moving * 0.5);
+    let recent = near_motion || was_moving > 0.2;
     // Immobile : la géométrie a-t-elle changé ici (bloc posé, chunk chargé) ? On compare la
     // profondeur courante à celles de l'image précédente autour du pixel. Si rien n'a
     // changé, l'historique est bon : on ne le borne que très largement (les détails plus
@@ -174,18 +188,38 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
         pmin = min(pmin, d);
         pmax = max(pmax, d);
     }
-    let same_geometry = d_cur >= pmin * 0.98 - 1e-7 && d_cur <= pmax * 1.02 + 1e-7;
+    // (v202) Un objet bouge ou bougeait tout près (`recent`) alors que ce pixel-ci est
+    // immobile (caméra arrêtée) : ce qu'il y avait ici à l'image d'avant a pu partir. La
+    // croix des profondeurs d'avant (qui recouvre l'objet et le fond à son bord) le
+    // prendrait pour la même géométrie et garderait sa couleur : une traînée derrière
+    // chaque membre, des contours laissés partout où les PNJ sont passés. Ici, seule la
+    // profondeur de ce pixel-ci compte ; si elle a changé, l'historique est celui d'autre
+    // chose : l'image courante seule.
+    let mv_here = textureLoad(cur_motion, p, 0).xy;
+    let still_here = dot(mv_here, mv_here) < 1e-4;
+    let d_prev = textureLoad(prev_depth, p, 0);
+    let changed_here = abs(d_prev - d_cur) > d_cur * 0.02 + 1e-7;
+    if recent && still_here && changed_here {
+        return vec4<f32>(cur, flag);
+    }
+    let same_geometry = select(
+        d_cur >= pmin * 0.98 - 1e-7 && d_cur <= pmax * 1.02 + 1e-7,
+        !changed_here,
+        recent,
+    );
+    // Près d'un objet qui bouge : bornes serrées et mélange rapide, comme en mouvement.
+    let tight = max(moving, select(0.0, 1.0, recent));
     let span = cmax - cmin;
     let margin = select(span * 0.1, span + vec3<f32>(mean.x * 0.5 + 0.02), same_geometry);
-    let lo = mix(cmin - margin, max(mean - sigma, cmin), moving);
-    let hi = mix(cmax + margin, min(mean + sigma, cmax), moving);
+    let lo = mix(cmin - margin, max(mean - sigma, cmin), tight);
+    let hi = mix(cmax + margin, min(mean + sigma, cmax), tight);
     let hist = clip_box(hist_raw, lo, hi, mean);
 
     // Historique très corrigé (objet apparu, chunk chargé…) : on reprend l'image courante.
     let rejected = abs(hist_raw.x - hist.x) / max(mean.x, 0.05);
-    let base = mix(params.still.x, params.size.w, moving);
-    let alpha = clamp(base + speed * 0.01 + rejected * mix(0.5, 2.0, moving), base, 0.8);
+    let base = mix(params.still.x, params.size.w, tight);
+    let alpha = clamp(base + speed * 0.01 + rejected * mix(0.5, 2.0, tight), base, 0.8);
     let out = mix(hist, to_ycocg(cur), alpha);
-    return vec4<f32>(from_ycocg(out), 1.0);
+    return vec4<f32>(from_ycocg(out), flag);
 }
 

@@ -376,6 +376,10 @@ pub struct Session {
     /// Lumières à afficher cette image, et état de leurs shaders (« Préparation des
     /// lumières… » tant qu'ils compilent).
     lights_wanted: bool,
+    /// (v202) Lumières de l'image où les joueurs font leur ombre (place, portée) : un joueur
+    /// tout près d'elles fait une ombre géante, il passe avant ceux qui sont seulement près
+    /// de la caméra.
+    shadow_lights: Vec<(Vec3, f32)>,
     lights_state: minelib_render::DynState,
     /// Déjà fait dans cette partie : lumières notées comme utilisées, refus dit au joueur.
     lights_marked: bool,
@@ -631,6 +635,7 @@ impl Session {
             light_editor: Default::default(),
             light_op_probe: None,
             lights_wanted: false,
+            shadow_lights: Vec::new(),
             lights_state: minelib_render::DynState::Off,
             lights_marked: false,
             lights_failed_said: false,
@@ -1693,6 +1698,12 @@ impl Session {
                 list.truncate(minelib_render::MAX_DYN_LIGHTS);
             }
             renderer.set_dyn_lights(&list, &self.lights.settings.render);
+            self.shadow_lights.clear();
+            self.shadow_lights.extend(
+                list.iter()
+                    .filter(|l| l.shadows && !l.blocks_only)
+                    .map(|l| (Vec3::from(l.pos), l.range)),
+            );
             renderer.set_torch_swap(self.lights.torch_swap());
             self.lights_wanted = !list.is_empty();
             self.lights_state = renderer.dyn_stats().state;
@@ -6586,9 +6597,14 @@ impl Session {
         shadows.clear();
         if visible && self.spectating.is_none() {
             let mut own = crate::player_model::shadow_boxes(&pose);
-            // (v201) Sa lampe torche n'a pas l'ombre de son bras ni de sa tête.
+            // (v201) Sa lampe torche n'a pas l'ombre de son bras ni de sa tête. (v202) Sa
+            // torche tenue, seulement pas celle du morceau tout contre la flamme (sa main).
+            let flame = self.held_torch_light().map(|l| Vec3::from(l.pos));
             for b in &mut own {
                 b.owner = crate::flashlight::HOLDER;
+                if flame.is_some_and(|f| near_box(b, f, 0.2)) {
+                    b.owner |= crate::flashlight::NEAR_FLAME;
+                }
             }
             shadows.push((self.player.pos, own));
         }
@@ -6750,7 +6766,10 @@ impl Session {
             order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             for (rank, &(d2, i)) in order.iter().enumerate() {
                 let o = &others[i as usize];
-                let shadow = rank < 24 && d2 < 48.0 * 48.0;
+                // (v202) Ou tout près d'une lumière : son ombre y est géante, on la voit de
+                // loin (avant, elle disparaissait dès qu'on s'éloignait un peu).
+                let shadow = (rank < 24 && d2 < 48.0 * 48.0)
+                    || light_shadow_score(&self.shadow_lights, o.pos) < SHADOW_LIGHT_NEAR;
                 let w = o.walk.or_else(|| self.walks.get(o.pseudo));
                 let other = crate::player_model::Pose {
                     feet: o.pos,
@@ -6802,10 +6821,12 @@ impl Session {
             self.items
                 .build(cam, &|p| sky_light(world, p, daylight), &mut model);
         }
-        // Ombres des joueurs : les plus proches de la caméra (place limitée).
-        shadows.sort_by(|a, b| {
-            a.0.distance_squared(cam)
-                .total_cmp(&b.0.distance_squared(cam))
+        // Ombres des joueurs : les plus proches de la caméra (place limitée), (v202) ou d'une
+        // lumière (ombre géante, voir `light_shadow_score`).
+        let lights = &self.shadow_lights;
+        shadows.sort_by_cached_key(|s| {
+            let score = s.0.distance(cam).min(light_shadow_score(lights, s.0));
+            (score * 64.0) as u32
         });
         let mut shadow_boxes = std::mem::take(&mut scratch.boxes);
         shadow_boxes.clear();
@@ -7593,6 +7614,31 @@ impl Default for SunSeen {
             seen: HashMap::new(),
         }
     }
+}
+
+/// (v202) Distance (blocs) en deçà de laquelle un joueur près d'une lumière fait son ombre
+/// même loin de la caméra (score de `light_shadow_score`).
+const SHADOW_LIGHT_NEAR: f32 = 48.0;
+
+/// (v202) Importance de l'ombre d'un joueur (pieds en `feet`) aux lumières `lights` (place,
+/// portée), comparable à une distance à la caméra : plus il est près d'une lumière, plus son
+/// ombre est grande (elle grandit comme l'inverse de la distance) : 4 fois sa distance à la
+/// plus proche dont il est à portée ; infini sinon.
+fn light_shadow_score(lights: &[(Vec3, f32)], feet: Vec3) -> f32 {
+    let body = feet + Vec3::Y * 0.9;
+    lights
+        .iter()
+        .filter_map(|&(c, r)| {
+            let d = body.distance(c);
+            (d < r).then_some(d * 4.0)
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
+/// (v202) Le point `p` est-il dans la boîte `b` (alignée sur les axes) agrandie de `margin` ?
+fn near_box(b: &ShadowBox, p: Vec3, margin: f32) -> bool {
+    let (mn, mx) = (Vec3::from(b.min) - margin, Vec3::from(b.max) + margin);
+    p.cmpge(mn).all() && p.cmple(mx).all()
 }
 
 /// Le soleil (direction `sun`) atteint-il le milieu de la boîte ? La réponse de

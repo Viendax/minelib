@@ -850,8 +850,8 @@ pub fn scan_auto(world: &World, cam: Vec3, radius: f32, culling: bool) -> (Vec<A
 }
 
 /// (v201) Torche tenue, avec les torches en lumières ponctuelles : la même lumière qu'une
-/// torche posée (réglages des lumières automatiques), à sa flamme (`rgb`, sRGB), sans
-/// l'ombre de celui qui la tient.
+/// torche posée (réglages des lumières automatiques), à sa flamme (`rgb`, sRGB). (v202) Avec
+/// l'ombre de celui qui la tient, sauf sa main tout contre la flamme.
 pub fn held_torch(pos: Vec3, rgb: [u8; 3], s: &LightSettings) -> DynLight {
     let m = rgb.iter().copied().max().unwrap_or(1).max(1) as u32;
     DynLight {
@@ -861,8 +861,10 @@ pub fn held_torch(pos: Vec3, rgb: [u8; 3], s: &LightSettings) -> DynLight {
         color: rgb.map(|v| ((v as u32 * 255 / m) as f32 / 255.0).powf(2.2)),
         intensity: 1.2 * s.auto_intensity,
         range: 10.0 * s.auto_reach,
-        shadows: s.auto_shadows,
-        owner: crate::flashlight::HOLDER,
+        // (v202) L'ombre des joueurs, celui qui la tient compris (sauf sa main, tout contre
+        // la flamme : `NEAR_FLAME`).
+        shadows: true,
+        owner: crate::flashlight::NEAR_FLAME,
         beam: 0.0,
         ..Default::default()
     }
@@ -1096,7 +1098,9 @@ impl Lights {
                     color: lin,
                     intensity: 1.2 * a.strength * s.auto_intensity,
                     range: a.radius * s.auto_reach,
-                    shadows: s.auto_shadows && k < 8,
+                    // (v202) Torches en lumières ponctuelles : les joueurs y font leur ombre,
+                    // comme sous les torches du jeu de base.
+                    shadows: (s.auto_shadows || self.point_torches) && k < 8,
                     inside_block: a.inside,
                     beam: 0.0,
                     ..Default::default()

@@ -24,7 +24,7 @@ struct DynLight {
     cookie: vec4<f32>,
     // x = carte d'ombre (0 aucune, 1 projecteur, 2 cube de 6 cases), y = tangente du
     // demi-angle de la carte (1 pour un cube), z = 1 : arrêt net par les murs seulement
-    // (ombres douces décochées).
+    // (ombres douces décochées), w = 1 (v202) : lumière portée, bords en pente douce.
     shadow: vec4<f32>,
     // x, y = boîtes des joueurs à portée (bits 0..63) : leurs ombres ; z = distance (bits
     // d'un f32) en deçà de laquelle aucune ne peut cacher la lumière (voir `box_sphere`).
@@ -326,8 +326,11 @@ fn dl_shadow_tent(L: DynLight, fr: DlFrame, dir: vec3<f32>, n: vec3<f32>, ndt: f
         sum += w * textureSampleCompareLevel(shadow_atlas, shadow_cmp, rect.xy + pt / atlas, tk / range - eps);
     }
     // Bord resserré autour de la moitié : la courbe à mi-ombre de la tente est lisse (pas de
-    // marches), le bord reste net au lieu d'un flou de trois texels.
-    return smoothstep(0.35, 0.65, sum * (1.0 / 16.0));
+    // marches), le bord reste net au lieu d'un flou de trois texels. (v202) Sauf pour une
+    // lumière portée (shadow.w) : elle bouge sans cesse, sa carte est refaite à chaque pas
+    // et chaque bord y saute d'un texel ; en pente douce, il glisse.
+    let v = sum * (1.0 / 16.0);
+    return select(smoothstep(0.35, 0.65, v), v, L.shadow.w > 0.5);
 }
 
 /// Visibilité (0 dans l'ombre … 1 éclairé) de la lumière `L` en `p`, face de normale `n`
