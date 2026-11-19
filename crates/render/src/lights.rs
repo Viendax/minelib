@@ -848,6 +848,17 @@ impl ShadowCache {
     }
 }
 
+/// (v203) Empreintes d'une grille de blocs (voir `brick_hashes`), calculées avec elle en
+/// arrière-plan : à son arrivée, l'image n'a plus à parcourir son million de cases (une
+/// demi à plus d'une milliseconde, à chaque grille refaite pendant qu'on se déplace).
+pub struct VoxelBricks(HashMap<[i32; 3], u64>);
+
+impl VoxelBricks {
+    pub fn new(origin: [i32; 3], ids: &[u16]) -> Self {
+        Self(brick_hashes(origin, ids))
+    }
+}
+
 /// Empreintes de la grille de blocs par cubes de 8 (coin monde du cube → empreinte), pour
 /// savoir où des blocs ont changé d'une grille à l'autre.
 fn brick_hashes(origin: [i32; 3], ids: &[u16]) -> HashMap<[i32; 3], u64> {
@@ -2323,15 +2334,15 @@ impl DynGpu {
         !self.lights.is_empty()
     }
 
-    /// Nouvelle grille de blocs : les cartes des lumières près des blocs qui ont changé sont
-    /// à refaire.
-    pub fn on_voxels(&mut self, origin: [i32; 3], ids: &[u16]) {
+    /// Nouvelle grille de blocs (ses empreintes, `VoxelBricks`) : les cartes des lumières près
+    /// des blocs qui ont changé sont à refaire.
+    pub fn on_voxels(&mut self, bricks: VoxelBricks) {
         if self.cache.slots.is_empty() && !self.wants_voxels() {
             // Personne n'en a besoin : l'empreinte sera prise à la prochaine grille utile.
             self.bricks.clear();
             return;
         }
-        let new = brick_hashes(origin, ids);
+        let new = bricks.0;
         if self.bricks.is_empty() {
             self.cache.invalidate_all();
         } else {

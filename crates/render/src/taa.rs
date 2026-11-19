@@ -388,6 +388,9 @@ impl Taa {
                 out
             })
         };
+        // (v203) Dessiné après les opaques, seulement là où rien ne l'a été : sa profondeur
+        // (0, l'infini) ne passe le test « supérieur ou égal » que sur la valeur effacée.
+        // Plus calculé sous tout le monde.
         let sky = world_pipeline(
             device,
             world_layout,
@@ -398,7 +401,7 @@ impl Taa {
             &[],
             None,
             false,
-            wgpu::CompareFunction::Always,
+            wgpu::CompareFunction::GreaterEqual,
             None,
             wgpu::ColorWrites::ALL,
             // Dans la passe des opaques : rien pour l'éclairage différé (le ciel n'en prend pas).

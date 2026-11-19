@@ -41,8 +41,8 @@ pub use entity::{
 };
 pub use latency::{LowLatencyKind, Marker};
 pub use lights::{
-    bounding_sphere, DynKind, DynLight, DynSettings, DynState, DynStats, GoboImage, GOBO_SIZE,
-    MAX_DYN_LIGHTS, MAX_GOBOS, SHADOW_QUALITY, SHADOW_QUALITY_NAMES,
+    bounding_sphere, DynKind, DynLight, DynSettings, DynState, DynStats, GoboImage, VoxelBricks,
+    GOBO_SIZE, MAX_DYN_LIGHTS, MAX_GOBOS, SHADOW_QUALITY, SHADOW_QUALITY_NAMES,
 };
 pub use overlay::{set_translator, tr, Line, Overlay, Ui};
 pub use screen::ScreenAnchor;
@@ -1171,11 +1171,13 @@ impl Renderer {
                 blend,
             )
         };
+        // (v203) Comme celui de l'anticrénelage : après les opaques, là où rien n'a été
+        // dessiné (voir `draw_opaque`).
         let sky_pipeline = make(
             "ciel",
             "vs_sky",
             "fs_sky",
-            wgpu::CompareFunction::Always,
+            wgpu::CompareFunction::GreaterEqual,
             None,
         );
         let outline_pipeline = make(
@@ -1663,10 +1665,11 @@ impl Renderer {
     }
 
     /// Grille de blocs autour du joueur pour le raytracing (voir `rt::VOX`), et pour les
-    /// ombres des lumières dynamiques.
-    pub fn set_voxels(&mut self, origin: [i32; 3], ids: &[u16]) {
+    /// ombres des lumières dynamiques, avec ses empreintes (`VoxelBricks::new(origin, ids)`,
+    /// calculées en arrière-plan avec elle).
+    pub fn set_voxels(&mut self, origin: [i32; 3], ids: &[u16], bricks: VoxelBricks) {
         self.voxels.upload(&self.queue, origin, ids);
-        self.dyn_gpu.on_voxels(origin, ids);
+        self.dyn_gpu.on_voxels(bricks);
     }
 
     /// Lumières dynamiques (éditeur de lumières) de la prochaine image, et leurs réglages.
@@ -2337,10 +2340,10 @@ impl Renderer {
     ) -> bool {
         pass.set_bind_group(0, self.world_group(), &[]);
 
-        pass.set_pipeline(pipes.sky);
-        pass.draw(0..3, 0..1);
         // Shaders lourds pas encore compilés (tout début du jeu) : le ciel seulement.
         let Some(heavy) = pipes.heavy else {
+            pass.set_pipeline(pipes.sky);
+            pass.draw(0..3, 0..1);
             return false;
         };
 
@@ -2375,6 +2378,13 @@ impl Renderer {
         // Entités (joueurs, têtes, cadres) avant le verre et l'eau : elles se voient à
         // travers, teintées, au lieu de passer devant.
         self.entities.draw(pass, self.world_group(), pipes.taa);
+        // (v203) Le ciel en dernier, seulement sur les pixels où rien n'a été dessiné (sa
+        // profondeur, 0 à l'infini, ne passe que sur la valeur effacée) : avant, il était
+        // calculé pour tout l'écran (nuages, étoiles, lune), puis recouvert. Même image (tout
+        // ce qui est dessiné avant écrit sa profondeur, sans mélange).
+        pass.set_bind_group(0, self.world_group(), &[]);
+        pass.set_pipeline(pipes.sky);
+        pass.draw(0..3, 0..1);
         true
     }
 
@@ -2574,8 +2584,6 @@ impl Renderer {
             let [x, y, w, h] = d.scissor;
             pass.set_scissor_rect(x, y, w, h);
             pass.set_bind_group(0, group, &[]);
-            pass.set_pipeline(&self.sky_pipeline);
-            pass.draw(0..3, 0..1);
             // (v198) Lumières de l'éditeur : leurs taches de lumière aussi dans le reflet.
             let block = self
                 .planar_lit()
@@ -2618,6 +2626,10 @@ impl Renderer {
             }
             self.entities.draw_mirror(&mut pass, group);
             pass.set_bind_group(0, group, &[]);
+            // (v203) Le ciel après les opaques, là où rien n'a été dessiné (voir
+            // `draw_opaque`), avant les translucides qui se mélangent à lui.
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.draw(0..3, 0..1);
             pass.set_pipeline(&pipes.translucent);
             let mut bound = usize::MAX;
             for key in d.chunks.iter().rev() {
@@ -3406,6 +3418,9 @@ impl Renderer {
                 );
             }
         }
+        // (v203) Profondeur de cette image, lue avant `resolve` qui passe à l'image suivante
+        // (après, c'était celle de l'image d'avant : une image de retard sous l'eau).
+        let scene_depth = taa.depth_index();
         taa.resolve(
             &self.queue,
             &mut encoder,
@@ -3420,7 +3435,7 @@ impl Renderer {
                 p.eye,
                 p.water_level,
                 p.daylight,
-                &t.depth_views[taa.depth_index()],
+                &t.depth_views[scene_depth],
                 (self.config.width, self.config.height),
             );
         }
@@ -3437,9 +3452,11 @@ impl Renderer {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
+                    // (v203) Profondeur de la main seulement : effacée à chaque usage, rien ne
+                    // la relit après cette passe, pas la peine de la garder en mémoire.
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
                 }),

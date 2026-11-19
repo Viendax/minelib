@@ -160,17 +160,21 @@ impl GpuTimer {
                         0.0
                     }
                 };
-                let (first, last) = (t[SCENE as usize * 2], t[PRESENT as usize * 2 + 1]);
-                // Début du travail de l'image : les cartes d'ombre si elles ont été calculées.
-                let start = if marks & (1 << BAKE) != 0 && t[BAKE as usize * 2] != 0 {
-                    t[BAKE as usize * 2].min(first)
-                } else {
-                    first
-                };
+                let last = t[PRESENT as usize * 2 + 1];
+                // Début du travail de l'image : sa première passe mesurée (les cartes d'ombre
+                // si elles ont été calculées, (v203) et les reflets dans l'eau, avant la scène).
+                // Avant, « du début à la fin » partait de la scène, et ce qui la précède était
+                // compté « entre deux images » : il ne reste là que l'inoccupé et ce qui n'est
+                // pas mesuré.
+                let first = (0..PASSES)
+                    .filter(|&a| marks & (1 << a) != 0 && t[a as usize * 2] != 0)
+                    .map(|a| t[a as usize * 2])
+                    .min()
+                    .unwrap_or(0);
                 let frame = self.slot_frame[k];
                 let gap = match self.prev_end {
-                    Some((f, end)) if f + 1 == frame && start > end && end != 0 => {
-                        Some((start - end) as f32 * self.period_ns / 1e6)
+                    Some((f, end)) if f + 1 == frame && first > end && end != 0 => {
+                        Some((first - end) as f32 * self.period_ns / 1e6)
                     }
                     _ => None,
                 };

@@ -2920,7 +2920,7 @@ impl Session {
             match rx.try_recv() {
                 Ok(grid) => {
                     let _p = minelib_render::perf::scope("grille raytracing (envoi)");
-                    renderer.set_voxels(grid.origin, &grid.ids);
+                    renderer.set_voxels(grid.origin, &grid.ids, grid.bricks);
                     self.mirror_planes = grid.planes;
                     self.lights_timer = 0.0;
                     self.vox_job = None;
@@ -2967,9 +2967,12 @@ impl Session {
                 minelib_platform::lower_thread_priority();
                 let t = std::time::Instant::now();
                 let (ids, planes) = build_voxel_grid(&chunks, origin);
+                // (v203) Ses empreintes aussi, ici plutôt qu'à son arrivée dans l'image.
+                let bricks = minelib_render::VoxelBricks::new(origin, &ids);
                 let _ = tx.send(VoxelGrid {
                     origin,
                     ids,
+                    bricks,
                     planes,
                     ms: t.elapsed().as_secs_f32() * 1000.0,
                 });
@@ -8045,6 +8048,7 @@ fn sky_light_grid(ids: &mut [u16], solid: &[bool], covered: &[bool], [vx, vy, vz
 struct VoxelGrid {
     origin: [i32; 3],
     ids: Vec<u16>,
+    bricks: minelib_render::VoxelBricks,
     planes: Vec<MirrorPlane>,
     ms: f32,
 }
