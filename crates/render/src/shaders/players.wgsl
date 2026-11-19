@@ -151,8 +151,20 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     return base * m_trans(vec3<f32>(0.0, 24.0 - drop * 1.6, -lean * 4.0)) * m_rot_x(pitch);
 }
 
+/// (v200) Portée des reflets dans l'eau (blocs, à l'horizontale, `water_mirror::RANGE`) : les
+/// blocs plus loin n'y sont pas, ils ne cacheraient pas un joueur derrière eux.
+const WATER_MIRROR_RANGE: f32 = 64.0;
+
 @vertex
 fn vs_player(v: PlayerIn) -> PlayerOut {
+    // (v200) Image des reflets dans l'eau (sa coupe au plan est multipliée par 1 000, celle
+    // d'un miroir a une normale unitaire, voir water_mirror.rs) : seulement les joueurs à
+    // portée, les autres hors de l'image.
+    if g.clip.y > 500.0 && distance(v.feet.xz, g.cam_pos.xz) > WATER_MIRROR_RANGE {
+        var out: PlayerOut;
+        out.clip = vec4<f32>(0.0, 0.0, -1.0, 1.0);
+        return out;
+    }
     let xf = part_matrix(v.part, v);
     let world = (xf * vec4<f32>(v.pos, 1.0)).xyz;
     let n = normalize((xf * vec4<f32>(v.normal, 0.0)).xyz);

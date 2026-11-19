@@ -25,6 +25,8 @@ pub struct GpuTimes {
     pub lights_half: f32,
     /// (v199) Lumières sur l'eau, le verre et la glace.
     pub water: f32,
+    /// (v200) Image des joueurs et des objets reflétés dans l'eau.
+    pub water_mirror: f32,
     pub bake: f32,
     /// Du début de la scène à la fin de l'affichage, temps morts entre passes compris.
     pub span: f32,
@@ -46,6 +48,7 @@ impl GpuTimes {
             + self.vl_composite
             + self.lights_half
             + self.water
+            + self.water_mirror
             + self.bake
     }
 
@@ -56,6 +59,7 @@ impl GpuTimes {
             ("lumières : un pixel sur quatre", self.lights_half),
             ("lumières", self.lights),
             ("lumières sur l'eau", self.water),
+            ("reflets dans l'eau", self.water_mirror),
             ("rayons", self.volumetric),
             ("recomposition des rayons", self.vl_composite),
             ("cartes d'ombre", self.bake),
@@ -225,6 +229,7 @@ pub fn gpu(t: GpuTimes) {
             + t.lights
             + t.lights_half
             + t.water
+            + t.water_mirror
             + t.volumetric
             + t.vl_composite
             + t.bake;
@@ -241,6 +246,7 @@ pub fn gpu(t: GpuTimes) {
         p.window_gpu.0.vl_composite += t.vl_composite;
         p.window_gpu.0.lights_half += t.lights_half;
         p.window_gpu.0.water += t.water;
+        p.window_gpu.0.water_mirror += t.water_mirror;
         p.window_gpu.0.bake += t.bake;
         p.window_gpu.0.span += t.span;
         p.window_gpu.0.gap += t.gap;

@@ -30,6 +30,7 @@ pub mod textures;
 pub mod thermal;
 mod underwater;
 pub mod viewmodel;
+mod water_mirror;
 
 pub use capture::Screenshot;
 
@@ -502,6 +503,9 @@ pub struct FrameParams<'a> {
     /// (v194) Surface de l'eau au-dessus de la caméra, quand elle est sous l'eau ou tout
     /// près : ce qu'elle voit sous la ligne de l'eau est bleuté.
     pub water_level: Option<f32>,
+    /// (v200) Niveau de l'eau qu'on voit, où se reflètent les joueurs et les objets (essai,
+    /// voir `water_mirror`) ; None : pas de reflets dans l'eau.
+    pub water_mirror: Option<f32>,
     /// Yeux du joueur (torche tenue en main), même à la 3e personne.
     pub player_eye: Vec3,
     pub view: Mat4,
@@ -694,6 +698,10 @@ pub struct Renderer {
     /// (prêts un peu après le lancement).
     planar: planar::Planar,
     planar_pipes: lazy::Lazy<planar::Pipes>,
+    /// (v200) Joueurs et objets reflétés dans l'eau, sans raytracing (voir `water_mirror`),
+    /// et le pipeline de ses blocs.
+    water_mirror: water_mirror::WaterMirror,
+    water_mirror_pipe: lazy::Lazy<wgpu::RenderPipeline>,
     sky_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     /// Le contour du bloc visé est-il à dessiner ?
@@ -1021,6 +1029,17 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // (v200) Joueurs et objets reflétés dans l'eau (voir `water_mirror`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // Pixel art : agrandissement net, réduction lissée entre les mipmaps.
@@ -1040,6 +1059,7 @@ impl Renderer {
         let mut dyn_gpu = lights::DynGpu::new(&device, &queue);
         dyn_gpu.bind_bake(&device, &voxels, &block_view, &block_sampler);
         let mut planar = planar::Planar::new(&device, config.format, (1, 1));
+        let mut water_mirror = water_mirror::WaterMirror::new(&device, config.format, (1, 1));
         let bind_groups = world_groups(
             &device,
             &bgl,
@@ -1050,6 +1070,7 @@ impl Renderer {
             &refl,
             &dyn_gpu,
             &planar.images[0].view,
+            &water_mirror.color,
         );
         planar.groups = planar_groups(
             &device,
@@ -1060,7 +1081,20 @@ impl Renderer {
             &voxels,
             &refl,
             &dyn_gpu,
+            &water_mirror.color,
         );
+        water_mirror.group = Some(world_group(
+            &device,
+            &bgl,
+            &water_mirror.globals,
+            &block_sampler,
+            &block_view,
+            &voxels,
+            &refl.views[0],
+            &dyn_gpu,
+            &planar.images[0].view,
+            &water_mirror.dummy,
+        ));
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("main"),
             bind_group_layouts: &[&bgl],
@@ -1086,6 +1120,14 @@ impl Renderer {
                     t0.elapsed().as_secs_f32()
                 );
                 p
+            })
+        };
+        // (v200) Reflets des joueurs dans l'eau : les blocs (profondeur), en tâche de fond.
+        let water_mirror_pipe = {
+            let (device, layout, shader) = (device.clone(), layout.clone(), shader.clone());
+            let surface = config.format;
+            lazy::Lazy::spawn("shader des reflets dans l'eau", move || {
+                water_mirror::depth_pipeline(&device, &layout, &shader, surface)
             })
         };
         // (v190) Miroirs redessinés : leurs pipelines aussi, en tâche de fond.
@@ -1224,6 +1266,8 @@ impl Renderer {
             reflect_pipeline,
             planar,
             planar_pipes,
+            water_mirror,
+            water_mirror_pipe,
             sky_pipeline,
             outline_pipeline,
             outline: false,
@@ -1538,6 +1582,7 @@ impl Renderer {
             &self.refl,
             &self.dyn_gpu,
             &self.planar.images[0].view,
+            &self.water_mirror.color,
         );
         self.planar.groups = planar_groups(
             &self.device,
@@ -1548,7 +1593,20 @@ impl Renderer {
             &self.voxels,
             &self.refl,
             &self.dyn_gpu,
+            &self.water_mirror.color,
         );
+        self.water_mirror.group = Some(world_group(
+            &self.device,
+            &self.bgl,
+            &self.water_mirror.globals,
+            &self.block_sampler,
+            &self.block_view,
+            &self.voxels,
+            &self.refl.views[0],
+            &self.dyn_gpu,
+            &self.planar.images[0].view,
+            &self.water_mirror.dummy,
+        ));
         self.dyn_gpu.rebind = false;
     }
 
@@ -2539,6 +2597,140 @@ impl Renderer {
         }
     }
 
+    /// (v200) Joueurs et objets reflétés dans l'eau (voir `water_mirror`) : au niveau
+    /// `level` vu d'au-dessus, prépare l'image (blocs au-dessus de l'eau dans le champ du
+    /// reflet de l'œil et à portée, uniformes vus de lui) et le dit à l'eau dans `g`. `vp` :
+    /// vue-projection sans tremblement ; `size` : taille de l'image du monde.
+    fn prepare_water_mirror(
+        &mut self,
+        vp: Mat4,
+        eye: Vec3,
+        size: (u32, u32),
+        fog_end: f32,
+        level: Option<f32>,
+        g: &mut Globals,
+    ) {
+        self.water_mirror.level = None;
+        let Some(h) = level else {
+            return;
+        };
+        if eye.y <= h + 0.05
+            || self.water_mirror_pipe.try_get().is_none()
+            || !self.entities.any_in_water_mirror()
+        {
+            return;
+        }
+        let _s = perf::scope("rendu : reflets dans l'eau (préparation)");
+        // Image à la taille du monde, faite à la première eau vue.
+        if self.water_mirror.size != size {
+            self.water_mirror.resize(&self.device, size);
+            self.rebuild_world_groups();
+        }
+        let plane = water_mirror::plane(h);
+        let wvp = plane.view_proj(vp);
+        let reye = plane.reflect(eye);
+        let frustum = frustum_planes(wvp);
+        let range = water_mirror::RANGE.min(fog_end);
+        // Blocs au-dessus de l'eau, dans le champ du reflet et à portée, par page du tampon
+        // et de l'avant vers l'arrière dans chacune (les plus proches cachent les autres).
+        let mut list: Vec<(f32, MeshKey)> = self
+            .meshes
+            .iter()
+            .filter_map(|(key, c)| {
+                let dx = (c.min.x - eye.x).max(0.0).max(eye.x - c.max.x);
+                let dz = (c.min.z - eye.z).max(0.0).max(eye.z - c.max.z);
+                let d = (dx * dx + dz * dz).sqrt();
+                (c.count > 0 && c.max.y > h && d <= range && aabb_visible(&frustum, c.min, c.max))
+                    .then_some((d, *key))
+            })
+            .collect();
+        list.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        list.sort_by_key(|(_, k)| self.meshes[k].slot.page);
+        let wm = &mut self.water_mirror;
+        wm.cmds.clear();
+        wm.groups.clear();
+        for (_, key) in &list {
+            chunk_commands(
+                &self.meshes[key],
+                occlusion::ALL,
+                reye,
+                &mut wm.cmds,
+                &mut wm.groups,
+            );
+        }
+        wm.upload(&self.device, &self.queue);
+        // Uniformes vus du reflet de l'œil : rien sous l'eau, pas de bloc visé, ni miroirs
+        // ni reflets à son rythme, ni lumière des torches renvoyée par les miroirs.
+        let mut wg = *g;
+        wg.view_proj = wvp.to_cols_array_2d();
+        wg.cur_view_proj = wg.view_proj;
+        wg.prev_view_proj = wg.view_proj;
+        wg.cam_pos = [reye.x, reye.y, reye.z, g.cam_pos[3]];
+        wg.clip = water_mirror::clip(h);
+        wg.sel_min[3] = 0.0;
+        wg.light[3] = 0.0;
+        wg.refl_cam[3] = 0.0;
+        wg.mirror_count = [0.0; 4];
+        self.queue
+            .write_buffer(&wm.globals, 0, bytemuck::bytes_of(&wg));
+        wm.level = Some(h);
+        g.mirror_count[1] = h;
+        g.mirror_count[2] = 1.0;
+    }
+
+    /// (v200) Dessine l'image des reflets dans l'eau préparée par `prepare_water_mirror` :
+    /// la profondeur des blocs, puis les joueurs et les objets.
+    fn encode_water_mirror(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let wm = &self.water_mirror;
+        let (Some(_), Some(pipe), Some(group)) = (
+            wm.level,
+            self.water_mirror_pipe.try_get(),
+            wm.group.as_ref(),
+        ) else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("reflets dans l'eau"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &wm.color,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &wm.depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: timestamps,
+            occlusion_query_set: None,
+        });
+        pass.set_bind_group(0, group, &[]);
+        pass.set_pipeline(pipe);
+        for &(page, first, count) in &wm.groups {
+            let pg = &self.arena.pages[page];
+            pass.set_vertex_buffer(0, pg.vertices.slice(..));
+            pass.set_index_buffer(pg.indices.slice(..), wgpu::IndexFormat::Uint32);
+            if self.multi_draw {
+                pass.multi_draw_indexed_indirect(&wm.indirect, first as u64 * 20, count);
+            } else {
+                for k in 0..count {
+                    pass.draw_indexed_indirect(&wm.indirect, (first + k) as u64 * 20);
+                }
+            }
+        }
+        self.entities.draw_water_mirror(&mut pass, group);
+    }
+
     /// Après les opaques (et l'éclairage différé) : contour du bloc visé, écrans vidéo,
     /// translucides de l'arrière vers l'avant.
     fn draw_after<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, pipes: &ScenePipes<'p>) {
@@ -2902,6 +3094,14 @@ impl Renderer {
         self.entities
             .prepare_mirror(&self.queue, p.mirror_self, p.mirror_held);
         self.prepare_mirrors(view_proj, p.eye, world_size, p.fog_end, &mut globals);
+        self.prepare_water_mirror(
+            view_proj,
+            p.eye,
+            world_size,
+            p.fog_end,
+            p.water_mirror,
+            &mut globals,
+        );
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         drop(prep);
@@ -2973,6 +3173,12 @@ impl Renderer {
         }
         // (v190) Images des miroirs, avant la scène qui les lit.
         self.encode_mirrors(&mut encoder);
+        self.encode_water_mirror(
+            &mut encoder,
+            self.gpu_timer
+                .as_ref()
+                .and_then(|t| t.pass(gpu_timer::WATER_MIRROR)),
+        );
         // Lumières de l'éditeur : actives cette image, leurs pipelines prêts, et au moins
         // une case de l'écran éclairée (sinon leurs passes n'ont rien à faire).
         let lights_on =
@@ -3391,6 +3597,7 @@ fn world_groups(
     refl: &reflections::Reflections,
     dyn_gpu: &lights::DynGpu,
     mirrors: &wgpu::TextureView,
+    water: &wgpu::TextureView,
 ) -> [wgpu::BindGroup; 2] {
     std::array::from_fn(|i| {
         world_group(
@@ -3403,6 +3610,7 @@ fn world_groups(
             &refl.views[i],
             dyn_gpu,
             mirrors,
+            water,
         )
     })
 }
@@ -3420,6 +3628,7 @@ fn planar_groups(
     voxels: &rt::Voxels,
     refl: &reflections::Reflections,
     dyn_gpu: &lights::DynGpu,
+    water: &wgpu::TextureView,
 ) -> [Vec<wgpu::BindGroup>; 2] {
     std::array::from_fn(|array| {
         planar.globals[array]
@@ -3435,6 +3644,7 @@ fn planar_groups(
                     &refl.views[0],
                     dyn_gpu,
                     &planar.images[1 - array].view,
+                    water,
                 )
             })
             .collect()
@@ -3459,7 +3669,8 @@ fn mirror_uniforms<'a>(g: &mut Globals, seen: impl Iterator<Item = &'a planar::N
 }
 
 /// Un groupe de liaison du monde : uniformes, textures des blocs, grille du raytracing,
-/// image des reflets `refl`, skin, lumières dynamiques, images des miroirs.
+/// image des reflets `refl`, skin, lumières dynamiques, images des miroirs, et (v200) celle
+/// des joueurs reflétés dans l'eau (`water`).
 #[allow(clippy::too_many_arguments)]
 fn world_group(
     device: &wgpu::Device,
@@ -3471,6 +3682,7 @@ fn world_group(
     refl: &wgpu::TextureView,
     dyn_gpu: &lights::DynGpu,
     mirrors: &wgpu::TextureView,
+    water: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     let [d7, d8, d9, d10, d11, d12, d13] = dyn_gpu.bind_entries();
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3515,6 +3727,10 @@ fn world_group(
             wgpu::BindGroupEntry {
                 binding: 14,
                 resource: wgpu::BindingResource::TextureView(mirrors),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: wgpu::BindingResource::TextureView(water),
             },
         ],
     })

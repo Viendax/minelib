@@ -666,6 +666,36 @@ impl Entities {
         }
     }
 
+    /// (v200) Y a-t-il de quoi refléter dans l'eau (joueurs, entités) ?
+    pub(crate) fn any_in_water_mirror(&self) -> bool {
+        self.players.count > 0 || self.count > 0 || !self.static_draw.is_empty()
+    }
+
+    /// (v200) Les entités dans l'image des reflets dans l'eau (pipelines sans anticrénelage,
+    /// comme dans un miroir) : les autres joueurs, les entités fixes et celles de l'image,
+    /// sans soi-même à la première personne (sa tête reflétée boucherait la vue au ras de
+    /// l'eau ; à la 3e personne, son modèle est parmi les entités de l'image).
+    pub(crate) fn draw_water_mirror<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        group: &'a wgpu::BindGroup,
+    ) {
+        let p = &self.pipes;
+        self.players.draw_n(pass, group, false, self.players.count);
+        pass.set_bind_group(0, group, &[]);
+        pass.set_pipeline(&p.plain);
+        for key in &self.static_draw {
+            if let Some((b, n, _)) = self.statics.get(key) {
+                pass.set_vertex_buffer(0, b.slice(..));
+                pass.draw(0..*n, 0..1);
+            }
+        }
+        if self.count > 0 {
+            pass.set_vertex_buffer(0, self.buffer.slice(..));
+            pass.draw(0..self.count, 0..1);
+        }
+    }
+
     /// Dessine les entités dans la passe du monde (`taa` : passe à deux cibles ; `lit` :
     /// pipelines éclairés par les lumières de l'éditeur, s'il y en a).
     pub(crate) fn draw<'a>(

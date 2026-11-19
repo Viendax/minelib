@@ -343,6 +343,11 @@ pub struct Session {
     /// essai voulu (v185 : `/npc stresstest true|false`, éteint par défaut).
     crowd: Option<crate::crowd::Crowd>,
     crowd_on: bool,
+    /// (v200, essai) Joueurs et objets reflétés dans l'eau sans raytracing (`/npc reflets
+    /// on|off`, allumé par défaut), et l'eau qu'on voit (cherchée toutes les quelques
+    /// images, pendant le rendu).
+    water_mirror_on: bool,
+    seen_water: std::cell::RefCell<crate::underwater::SeenWater>,
     /// (v172) Pseudo du joueur (compte connecté ; vide sinon), et partie contre des bots
     /// voulue en mode FPS dans un monde solo (`/bots off` l'arrête).
     pub pseudo: String,
@@ -599,6 +604,8 @@ impl Session {
             sun_seen: Default::default(),
             crowd: None,
             crowd_on: false,
+            water_mirror_on: true,
+            seen_water: Default::default(),
             pseudo: String::new(),
             bots_auto: true,
             walk_amp: 0.0,
@@ -4812,7 +4819,8 @@ impl Session {
                 }
             }
             // (v165, essai) Foule simulée en solo : (v185) `/npc stresstest true|false`,
-            // éteinte par défaut ; (v197) aussi on/off, 1/0, oui/non.
+            // éteinte par défaut ; (v197) aussi on/off, 1/0, oui/non. (v200, essai)
+            // `/npc reflets on|off` : les joueurs reflétés dans l'eau, allumés par défaut.
             "npc" => {
                 let sub = arg.map(str::to_lowercase);
                 let value = parts.next().and_then(chat::switch);
@@ -4834,9 +4842,22 @@ impl Session {
                             chat::YELLOW,
                         );
                     }
-                    _ => self
-                        .chat
-                        .say("Utilisation : /npc stresstest <on|off>", chat::RED),
+                    (Some("reflets" | "reflet" | "reflections"), Some(on)) => {
+                        self.water_mirror_on = on;
+                        self.chat.say(
+                            if on {
+                                "Reflets des joueurs dans l'eau (essai, sans raytracing) : \
+                                 allumés."
+                            } else {
+                                "Reflets des joueurs dans l'eau : éteints."
+                            },
+                            chat::YELLOW,
+                        );
+                    }
+                    _ => self.chat.say(
+                        "Utilisation : /npc stresstest <on|off>, /npc reflets <on|off>",
+                        chat::RED,
+                    ),
                 }
             }
             // Compensation du retard mesuré de la touche « avancer » (voir `keycomp`).
@@ -5174,6 +5195,7 @@ impl Session {
                     "/give tête <pseudo> [nombre] : la tête d'un joueur, avec son skin",
                     "/yt [recherche | adresse] : YouTube sur les écrans vidéo",
                     "/lumieres : éditeur de lumières (touche L) ; /lumieres effacer : les retire",
+                    "/npc reflets on|off : les joueurs reflétés dans l'eau (essai, allumé)",
                     "Vol : deux appuis rapides sur Espace",
                     "Mode FPS : clic molette = ping (pas d'inventaire ni de blocs)",
                     "Spectateur (/gm 3) : vol forcé, on traverse les blocs",
@@ -6784,6 +6806,17 @@ impl Session {
             players: &players,
             eye: cam,
             water_level: crate::underwater::eye_water_level(&self.world, cam),
+            water_mirror: if self.water_mirror_on {
+                self.seen_water.borrow_mut().update(
+                    &self.world,
+                    cam,
+                    view,
+                    fov.to_radians(),
+                    renderer.aspect(),
+                )
+            } else {
+                None
+            },
             player_eye: self.player.eye(),
             view,
             fov_y: fov.to_radians(),

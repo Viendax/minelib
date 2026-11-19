@@ -54,7 +54,8 @@ struct Globals {
     shadow_max: array<vec4<f32>, 48>,
     // (v190) Miroirs redessinés à part (voir planar.rs), nombre dans mirror_count.x : pour
     // chacun, la vue-projection de son image et son plan (x = axe, y = coordonnée, z = côté
-    // vers lequel il regarde ±1, w = couche de `mirror_tex`).
+    // vers lequel il regarde ±1, w = couche de `mirror_tex`). (v200) mirror_count.z = 1 :
+    // l'eau au niveau mirror_count.y a l'image de ses reflets (`water_tex`).
     mirror_vp: array<mat4x4<f32>, 4>,
     mirror_info: array<vec4<f32>, 4>,
     mirror_count: vec4<f32>,
@@ -71,6 +72,9 @@ struct Globals {
 @group(0) @binding(6) var skin_tex: texture_2d<f32>;
 // (v190) Images des miroirs redessinés (une couche par plan, voir planar.rs).
 @group(0) @binding(14) var mirror_tex: texture_2d_array<f32>;
+// (v200) Joueurs et objets reflétés dans l'eau (voir water_mirror.rs), image retournée de
+// gauche à droite ; a = 0 là où rien ne s'y reflète.
+@group(0) @binding(15) var water_tex: texture_2d<f32>;
 
 const HORIZON: vec3<f32> = vec3<f32>(0.62, 0.78, 0.95);
 const ZENITH: vec3<f32> = vec3<f32>(0.25, 0.47, 0.85);
@@ -277,6 +281,35 @@ fn planar_mirror(p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(0.0);
 }
 
+/// (v200) Joueurs et objets reflétés dans l'eau au point `p` de sa surface : lus dans
+/// l'image faite à part (water_mirror.rs), là où `p` est à l'écran, retourné de gauche à
+/// droite (même vue-projection, sans le tremblement du TAA) ; a = 0 : rien ne s'y reflète.
+fn water_mirror(p: vec3<f32>) -> vec4<f32> {
+    let c = g.cur_view_proj * vec4<f32>(p, 1.0);
+    if c.w <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    let uv = c.xy / c.w * vec2<f32>(-0.5, -0.5) + 0.5;
+    let dims = vec2<i32>(textureDimensions(water_tex));
+    let px = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - 1);
+    return textureLoad(water_tex, px, 0);
+}
+
+/// (v200) Image des reflets dans l'eau : les blocs n'y laissent que leur profondeur (ils
+/// cachent les joueurs derrière eux), coupés au plan de l'eau ; leurs pixels transparents
+/// (feuillage, vitres) laissent voir au travers.
+@fragment
+fn fs_block_depth(i: VOut) -> @location(0) vec4<f32> {
+    if behind_mirror(i.world) || from_behind(i) {
+        discard;
+    }
+    let a = textureSampleLevel(blocks, block_sampler, fract(block_uv(i)), i.tex & 4095u, 0.0).a;
+    if a < 0.3 {
+        discard;
+    }
+    return vec4<f32>(0.0);
+}
+
 /// (v190) La face en `p` (normale `n`) est-elle sur un des plans redessinés à cette image ?
 fn has_planar(p: vec3<f32>, n: vec3<f32>) -> bool {
     let count = u32(g.mirror_count.x);
@@ -433,6 +466,21 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
     return shade_full(i, reflections, cached, cheap).color;
 }
 
+/// Coordonnées de texture continues d'une face (1 bloc = 1 texture), sauf faces penchées
+/// (`TEX_LOCAL_UV`) : les leurs.
+fn block_uv(i: VOut) -> vec2<f32> {
+    let an = abs(face_normal(i.face));
+    return select(
+        select(
+            select(vec2<f32>(i.world.x, -i.world.y), vec2<f32>(i.world.x, i.world.z), an.y > 0.5),
+            vec2<f32>(i.world.z, -i.world.y),
+            an.x > 0.5,
+        ),
+        i.uv,
+        (i.tex & 8192u) != 0u,
+    );
+}
+
 /// `reflections` = false : blocs sans reflet (la grande majorité) ; le compilateur retire
 /// tout le code des reflets, le shader est bien plus léger et la carte va plus vite.
 fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
@@ -446,16 +494,7 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
     // Texture du pack : coordonnées tirées de la position monde (1 bloc = 1 texture),
     // dérivées calculées avant tout branchement, sur les coordonnées continues
     // (pas de couture de mipmap aux bords des blocs).
-    let an = abs(n);
-    let raw = select(
-        select(
-            select(vec2<f32>(i.world.x, -i.world.y), vec2<f32>(i.world.x, i.world.z), an.y > 0.5),
-            vec2<f32>(i.world.z, -i.world.y),
-            an.x > 0.5,
-        ),
-        i.uv,
-        (i.tex & 8192u) != 0u,
-    );
+    let raw = block_uv(i);
     let layer = i.tex & 4095u;
     // Torche (TEX_SHARP, bit 14) : toujours en pleine résolution, sinon elle s'efface de loin.
     let sharp = select(1.0, 0.0, (i.tex & 16384u) != 0u);
@@ -609,6 +648,15 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
         } else {
             env = sky_color(r);
             cover = select(1.0, 0.0, short);
+        }
+        // (v200) Joueurs et objets reflétés dans l'eau (image faite à part, sans rayon) :
+        // par-dessus le reste du reflet, sur le dessus de l'eau à ce niveau (un peu plus
+        // bas au bord, où les coins de l'eau s'abaissent vers l'air).
+        if g.mirror_count.z > 0.5 && i.face == 2u && i.world.y > g.mirror_count.y - 0.12
+            && i.world.y < g.mirror_count.y + 0.03 {
+            let w = water_mirror(i.world);
+            env = mix(env, w.rgb, w.a);
+            cover = max(cover, w.a);
         }
         let fresnel = pow(1.0 - max(dot(-v, n), 0.0), 5.0);
         let k = select(i.reflect * (0.55 + 0.45 * fresnel), 0.96, i.reflect > 0.99) * reflect_fade * cover;

@@ -21,7 +21,9 @@ pub const VL_COMPOSITE: u32 = 7;
 pub const LIGHTS_HALF: u32 = 8;
 /// (v199) Lumières de l'éditeur sur l'eau, le verre et la glace (face translucide).
 pub const WATER: u32 = 9;
-const PASSES: u32 = 10;
+/// (v200) Image des joueurs et des objets reflétés dans l'eau.
+pub const WATER_MIRROR: u32 = 10;
+const PASSES: u32 = 11;
 /// Chaque passe × (début, fin).
 const QUERIES: u32 = PASSES * 2;
 /// Tampons de relecture en rotation (le GPU a quelques images d'avance).
@@ -185,6 +187,7 @@ impl GpuTimer {
                     vl_composite: ms(VL_COMPOSITE),
                     lights_half: ms(LIGHTS_HALF),
                     water: ms(WATER),
+                    water_mirror: ms(WATER_MIRROR),
                     bake: ms(BAKE),
                     span: if last > first && first != 0 {
                         (last - first) as f32 * self.period_ns / 1e6
