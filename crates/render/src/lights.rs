@@ -90,6 +90,9 @@ pub struct DynLight {
     pub shadows: bool,
     /// Lumière au centre d'un bloc lumineux : sa propre case ne lui fait pas d'ombre.
     pub inside_block: bool,
+    /// (v201) Lumière tenue (lampe torche) : les morceaux de celui qui la tient
+    /// (`ShadowBox::owner`, même numéro) ne lui font pas d'ombre ; 0 : à personne.
+    pub owner: u32,
     /// Rayons volumétriques : force (0 = aucun), densité, anisotropie (−0,95..0,95).
     pub beam: f32,
     pub density: f32,
@@ -119,6 +122,7 @@ impl Default for DynLight {
             bulb: 0.0,
             shadows: true,
             inside_block: false,
+            owner: 0,
             beam: 1.0,
             density: 0.05,
             anisotropy: 0.4,
@@ -504,6 +508,21 @@ fn lit_rects(tiles: &[u32], out: &mut Vec<[f32; 4]>) {
 fn box_touches_sphere(mn: [f32; 3], mx: [f32; 3], c: Vec3, r: f32) -> bool {
     let q = c.clamp(Vec3::from(mn), Vec3::from(mx));
     q.distance_squared(c) <= r * r
+}
+
+/// Morceaux de joueurs (bits de `boxes`) qui peuvent faire de l'ombre à `l` : ceux que sa
+/// lumière atteint. (v201) Pas ceux de celui qui la tient : sa lampe est contre lui, parfois
+/// dans sa boîte (tout serait alors dans l'ombre).
+fn box_mask(l: &DynLight, boxes: &[crate::ShadowBox]) -> u64 {
+    let (c, r) = (Vec3::from(l.pos), l.range);
+    let mut mask = 0u64;
+    for (k, b) in boxes.iter().enumerate() {
+        let holder = l.owner != 0 && b.owner == l.owner;
+        if !holder && box_touches_sphere(b.min, b.max, c, r) {
+            mask |= 1 << k;
+        }
+    }
+    mask
 }
 
 /// Une lumière dans le format du shader. `tile` : première case d'ombre prête (sinon pas
@@ -2433,15 +2452,11 @@ impl DynGpu {
         let atlas_px = self.atlas_size.max(1) as f32;
         let tile_uv = self.tile_size as f32 / atlas_px;
         for (i, l) in self.lights.iter().enumerate() {
-            let mut mask = 0u64;
-            if box_shadows && l.shadows {
-                let (c, r) = (Vec3::from(l.pos), l.range);
-                for (k, b) in boxes.iter().take(nboxes).enumerate() {
-                    if box_touches_sphere(b.min, b.max, c, r) {
-                        mask |= 1 << k;
-                    }
-                }
-            }
+            let mask = if box_shadows && l.shadows {
+                box_mask(l, &boxes[..nboxes])
+            } else {
+                0
+            };
             // Case de la carte d'ombre (même calcul que `dl_tile_rect`).
             let rect = tiles_of[i].map_or([0.0; 3], |t| {
                 let (row, col) = (t / per, t % per);
@@ -3631,6 +3646,31 @@ mod tests {
         );
     }
 
+    /// (v201) Une lampe torche n'a pas l'ombre de celui qui la tient, mais celle des autres
+    /// joueurs ; une lumière à personne a l'ombre de tous.
+    #[test]
+    fn a_held_light_is_not_shadowed_by_its_holder() {
+        let b = |a: [f32; 3], c: [f32; 3], owner: u32| crate::ShadowBox {
+            min: a,
+            max: c,
+            to_unit: [[0.0; 4]; 3],
+            sunlit: true,
+            owner,
+        };
+        let boxes = [
+            b([0.0, 0.0, 0.0], [1.0, 2.0, 1.0], 1),
+            b([3.0, 0.0, 0.0], [4.0, 2.0, 1.0], 0),
+            b([0.0, 2.0, 0.0], [1.0, 3.0, 1.0], 1),
+            b([60.0, 0.0, 0.0], [61.0, 2.0, 1.0], 0),
+        ];
+        let mut l = spot(9, [0.5, 1.5, 0.5], [1.0, 0.0, 0.0], 20.0, 30.0);
+        assert_eq!(box_mask(&l, &boxes), 0b0111, "trop loin : pas d'ombre");
+        l.owner = 1;
+        assert_eq!(box_mask(&l, &boxes), 0b0010);
+        l.owner = 2;
+        assert_eq!(box_mask(&l, &boxes), 0b0111);
+    }
+
     #[test]
     fn the_box_sphere_holds_every_box_of_the_mask() {
         let b = |a: [f32; 3], c: [f32; 3]| crate::ShadowBox {
@@ -3638,6 +3678,7 @@ mod tests {
             max: c,
             to_unit: [[0.0; 4]; 3],
             sunlit: true,
+            owner: 0,
         };
         let boxes = [
             b([0.0, 0.0, 0.0], [1.0, 2.0, 1.0]),

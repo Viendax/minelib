@@ -296,6 +296,9 @@ pub struct Session {
     /// Main et objet tenu (première personne), et leur éclairage.
     hand: Hand,
     hand_light: [f32; 3],
+    /// (v201) Lampe torche allumée (clic droit pour l'éteindre), vaut pour toutes les lampes
+    /// qu'on tient.
+    flashlight_on: bool,
     /// Vue (F5) : 0 première personne, 1 troisième personne de dos, 2 de face.
     perspective: u8,
     /// Écrans vidéo posés dans le monde (objet « Écran vidéo »), chargés à la première
@@ -585,6 +588,7 @@ impl Session {
             fps_duck_on: false,
             hand: Hand::default(),
             hand_light: [1.0; 3],
+            flashlight_on: true,
             perspective: 0,
             screens: Vec::new(),
             screens_loaded: false,
@@ -1576,6 +1580,7 @@ impl Session {
                 && (self.keys.pressed(input, Action::Attack)
                     || self.keys.pressed(input, Action::Use));
             self.hand.update(dt, speed, swung, held);
+            self.hand.flashlight_on = self.flashlight_on;
             // Balancement des bras et des jambes du modèle (vue F5), et des autres joueurs.
             self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
             // (v165, essai) Foule simulée en solo, hors mode FPS. (v185) Seulement si on l'a
@@ -1675,12 +1680,20 @@ impl Session {
                     self.lights.gobos.iter().map(|g| g.image.clone()).collect();
                 renderer.set_gobos(&imgs);
             }
-            let list = if allowed {
+            let mut list = if allowed {
                 self.lights.frame_lights()
             } else {
                 Vec::new()
             };
+            // (v201) Lampe torche allumée en main, ou torche tenue avec les torches en
+            // lumières ponctuelles : la première (sa carte d'ombre, à refaire dès qu'on
+            // bouge, passe avant celles des autres).
+            if let Some(l) = self.flashlight_light().or_else(|| self.held_torch_light()) {
+                list.insert(0, l);
+                list.truncate(minelib_render::MAX_DYN_LIGHTS);
+            }
             renderer.set_dyn_lights(&list, &self.lights.settings.render);
+            renderer.set_torch_swap(self.lights.torch_swap());
             self.lights_wanted = !list.is_empty();
             self.lights_state = renderer.dyn_stats().state;
             if self.lights_wanted && !self.lights_marked {
@@ -2427,6 +2440,22 @@ impl Session {
             }
             return;
         }
+        // (v201) Lampe torche tenue : clic droit l'allume ou l'éteint, même sans bloc visé
+        // (sur une porte, une trappe ou un coffre, il les ouvre, sauf accroupi).
+        if self.inventory.selected_item() == Some(Item::Flashlight)
+            && keys.pressed(input, Action::Use)
+        {
+            let opens = hit.as_ref().is_some_and(|h| {
+                (hinged(h.id).is_some() || h.id.def().key == "chest")
+                    && !keys.held(input, Action::Sneak)
+            });
+            if !opens {
+                self.flashlight_on = !self.flashlight_on;
+                self.fps.sounds.push((crate::audio::Sfx::Dry, 0.0, 0.6));
+                self.place_cooldown = 0.22;
+                return;
+            }
+        }
         let Some(hit) = hit else { return };
 
         // Écran vidéo tenu : clic droit le pose sur la face visée (aucun bloc posé).
@@ -2952,6 +2981,71 @@ impl Session {
     fn lights_allowed(&self) -> bool {
         // (v172) Contre les bots (partie solo), aussi.
         !(self.game.mode == GameMode::Fps && self.online_match())
+    }
+
+    /// (v201) Lumière de la lampe torche tenue et allumée : un projecteur au verre de la
+    /// lampe (devant les yeux à la première personne, dans la main du modèle à la troisième),
+    /// pointé où l'on regarde.
+    fn flashlight_light(&self) -> Option<minelib_render::DynLight> {
+        let held = self.game.mode.has_inventory()
+            && self.flashlight_on
+            && self.held_item() == Some(Item::Flashlight)
+            && self.lights_allowed();
+        if !held {
+            return None;
+        }
+        let eye = self.player.eye();
+        let look = self.player.look_dir();
+        let lens = if self.perspective == 0 {
+            None
+        } else {
+            let held = crate::player_model::Held::Flashlight(true);
+            crate::player_model::flashlight_lens(&self.own_pose(held))
+        };
+        let mut pos = lens.unwrap_or_else(|| crate::flashlight::lens_position(eye, look));
+        // Collé à un mur, le verre reste de ce côté-ci (sinon le mur arrête toute la
+        // lumière).
+        let to = pos - eye;
+        let len = to.length();
+        if len > 1e-4 {
+            if let Some(h) = raycast(&self.world, eye.into(), (to / len).into(), len) {
+                pos = eye + to / len * (h.distance - 0.05).max(0.0);
+            }
+        }
+        Some(crate::flashlight::light(pos, look))
+    }
+
+    /// (v201) Torche tenue, avec les torches en lumières ponctuelles : une lumière
+    /// ponctuelle à sa flamme, comme les torches posées (au lieu de la lumière simple de la
+    /// torche tenue).
+    fn held_torch_light(&self) -> Option<minelib_render::DynLight> {
+        if !self.lights.point_torches || !self.lights_allowed() {
+            return None;
+        }
+        let Some(Item::Torch(chem)) = self.held_item() else {
+            return None;
+        };
+        let rgb = chem
+            .and_then(|i| minelib_world::flame::CHEMICALS.get(i))
+            .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb);
+        let pose = self.own_pose(crate::player_model::Held::Torch(rgb));
+        let tip = crate::player_model::torch_tip(&pose)?;
+        Some(crate::lights::held_torch(tip, rgb, &self.lights.settings))
+    }
+
+    /// (v201) Pose du joueur qui tient `held`, pour placer la lumière de ce qu'il tient.
+    fn own_pose(&self, held: crate::player_model::Held) -> crate::player_model::Pose {
+        crate::player_model::Pose {
+            feet: self.player.pos,
+            yaw: self.player.yaw,
+            pitch: self.player.pitch,
+            walk: self.walk_phase,
+            swing: self.walk_amp,
+            crouch: self.player.crouch,
+            light: self.hand_light,
+            held: Some(held),
+            skin: None,
+        }
     }
 
     fn open_light_editor(&mut self) {
@@ -5033,6 +5127,18 @@ impl Session {
                         self.chat
                             .say(format!("{count} torche(s) données."), chat::YELLOW);
                     }
+                    // (v201) Lampe torche (« /give lampe torche » aussi) : une seule, sauf
+                    // nombre donné.
+                    _ if matches!(
+                        want.as_str(),
+                        "lampe" | "lampe_torche" | "lampetorche" | "flashlight"
+                    ) =>
+                    {
+                        let n: u32 = next.and_then(|n| n.parse().ok()).unwrap_or(1).clamp(1, 64);
+                        self.inventory.add(Item::Flashlight, n);
+                        self.chat
+                            .say(format!("{n} lampe(s) torche(s) donnée(s)."), chat::YELLOW);
+                    }
                     Some(b) if b != BlockId::AIR => {
                         self.inventory.add(Item::Block(b), count);
                         self.chat.say(
@@ -5193,6 +5299,7 @@ impl Session {
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
                     "/give petit_ecran | grand_ecran | ecran_geant : les autres tailles d'écran",
                     "/give tête <pseudo> [nombre] : la tête d'un joueur, avec son skin",
+                    "/give lampe : une lampe torche (clic droit : l'allumer ou l'éteindre)",
                     "/yt [recherche | adresse] : YouTube sur les écrans vidéo",
                     "/lumieres : éditeur de lumières (touche L) ; /lumieres effacer : les retire",
                     "/npc reflets on|off : les joueurs reflétés dans l'eau (essai, allumé)",
@@ -6441,6 +6548,8 @@ impl Session {
                 )),
                 Some(Item::Wand) => Some(Held::Wand([70, 60, 90])),
                 Some(Item::Screen(_)) => Some(Held::Wand([30, 30, 36])),
+                // (v201) Lampe torche, verre allumé ou non.
+                Some(Item::Flashlight) => Some(Held::Flashlight(self.flashlight_on)),
                 // Tête tenue (vue en 3e personne) : comme le bloc « tête ».
                 Some(Item::Head(_)) => {
                     Some(Held::Block(minelib_world::registry::skull_block(false, 0)))
@@ -6476,7 +6585,12 @@ impl Session {
         let mut shadows = std::mem::take(&mut scratch.shadows);
         shadows.clear();
         if visible && self.spectating.is_none() {
-            shadows.push((self.player.pos, crate::player_model::shadow_boxes(&pose)));
+            let mut own = crate::player_model::shadow_boxes(&pose);
+            // (v201) Sa lampe torche n'a pas l'ombre de son bras ni de sa tête.
+            for b in &mut own {
+                b.owner = crate::flashlight::HOLDER;
+            }
+            shadows.push((self.player.pos, own));
         }
         // (v172) Les autres joueurs : dessinés par la carte graphique, tous d'un coup (un
         // modèle commun, une instance chacun), comme soi en F5 : leur skin pixel par pixel,
@@ -6823,6 +6937,10 @@ impl Session {
             fog_start: fog_end * 0.45,
             fog_end,
             held_light: match self.inventory.selected_item() {
+                // (v201) Torches en lumières ponctuelles : la torche tenue a la sienne.
+                Some(Item::Torch(_)) if self.lights.point_torches && renderer.torch_swap_on() => {
+                    None
+                }
                 Some(Item::Torch(chem)) if self.game.mode.has_inventory() => {
                     let rgb = chem
                         .and_then(|i| minelib_world::flame::CHEMICALS.get(i))

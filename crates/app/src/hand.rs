@@ -27,6 +27,8 @@ pub struct Hand {
     /// Objet qui remonte après un changement (1 = caché en bas).
     equip: f32,
     last: Option<Item>,
+    /// (v201) Lampe torche allumée (son verre brille).
+    pub flashlight_on: bool,
 }
 
 // Rotation de chaque objet tenu par rapport au regard (x à droite, y en haut, −z
@@ -103,7 +105,7 @@ fn push_lantern(out: &mut Vec<VmVertex>, m: Mat4, block: BlockId, light: [f32; 3
 /// Une boîte (coordonnées 0..1 du modèle) transformée vers l'écran ; textures par face
 /// (dessus, côtés, dessous) ou couleur unie.
 #[allow(clippy::too_many_arguments)]
-fn push_box(
+pub(crate) fn push_box(
     out: &mut Vec<VmVertex>,
     mvp: Mat4,
     min: Vec3,
@@ -577,6 +579,16 @@ impl Hand {
                     * Mat4::from_scale(Vec3::splat(0.5))
                     * Mat4::from_translation(Vec3::new(-0.5, -0.1, -0.5));
                 torch_model(&mut out, proj * m, chem, light);
+            }
+            // (v201) Lampe torche : pointée devant, un peu vers le viseur, le verre au loin.
+            Item::Flashlight => {
+                let m = base
+                    * Mat4::from_translation(Vec3::new(0.4, -0.42, -0.86))
+                    * Mat4::from_rotation_y(0.16)
+                    * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2 + 0.06)
+                    * Mat4::from_scale(Vec3::splat(0.44))
+                    * Mat4::from_translation(Vec3::new(-0.5, -0.3, -0.5));
+                crate::flashlight::model(&mut out, proj * m, light, self.flashlight_on);
             }
             Item::Wand => {
                 // Tenue droite, logo en haut, légèrement tournée vers le centre.

@@ -2036,6 +2036,34 @@ const TABLE: &[[&str; 7]] = &[
         "Editor de luzes: reservado aos OP deste servidor.",
         "Lichteditor: alleen voor de OP's van deze server.",
     ],
+    // (v201) Torches en lumières ponctuelles (paramètres graphiques).
+    [
+        "Torches ponctuelles",
+        "Point-light torches",
+        "Antorchas puntuales",
+        "Punktlicht-Fackeln",
+        "Torce a luce puntiforme",
+        "Tochas pontuais",
+        "Puntlicht-fakkels",
+    ],
+    [
+        "réglages dans l'éditeur de lumières (L), onglet Auto.",
+        "settings in the light editor (L), Auto tab.",
+        "ajustes en el editor de luces (L), pestaña Auto.",
+        "Einstellungen im Lichteditor (L), Reiter Auto.",
+        "impostazioni nell'editor delle luci (L), scheda Auto.",
+        "definições no editor de luzes (L), separador Auto.",
+        "instellingen in de lichteditor (L), tabblad Auto.",
+    ],
+    [
+        "Allumées par « Torches ponctuelles » (paramètres graphiques).",
+        "Turned on by 'Point-light torches' (graphics settings).",
+        "Encendidas por «Antorchas puntuales» (ajustes gráficos).",
+        "Eingeschaltet durch »Punktlicht-Fackeln« (Grafikeinstellungen).",
+        "Accese da «Torce a luce puntiforme» (impostazioni grafiche).",
+        "Ligadas por «Tochas pontuais» (definições gráficas).",
+        "Ingeschakeld door 'Puntlicht-fakkels' (grafische instellingen).",
+    ],
 ];
 
 #[cfg(test)]
@@ -2060,6 +2088,10 @@ mod tests {
         assert_eq!(
             translate("Lumières automatiques : 3").as_deref(),
             Some("Automatic lights: 3")
+        );
+        assert_eq!(
+            translate("Torches ponctuelles : activé").as_deref(),
+            Some("Point-light torches: on")
         );
         assert_eq!(
             translate("F : caméra libre").as_deref(),

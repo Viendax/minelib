@@ -245,6 +245,9 @@ struct Globals {
     mirror_vp: [[[f32; 4]; 4]; planar::MAX_PLANAR],
     mirror_info: [[f32; 4]; planar::MAX_PLANAR],
     mirror_count: [f32; 4],
+    /// (v201) Torches en lumières ponctuelles : centre (xyz) et rayon (w) de la sphère où
+    /// leur lumière des blocs laisse la place aux lumières dynamiques ; w = 0 : nulle part.
+    torch_swap: [f32; 4],
 }
 
 /// Rayon de la caméra qui passe par le point `ndc` de l'écran, à l'échelle d'une unité de
@@ -298,6 +301,9 @@ pub struct ShadowBox {
     pub to_unit: [[f32; 4]; 3],
     /// Le soleil l'atteint (aucun bloc entre elle et lui) : sinon, pas d'ombre du soleil.
     pub sunlit: bool,
+    /// (v201) À qui est ce morceau (0 : à personne en particulier) : une lumière tenue
+    /// (`DynLight::owner`, même numéro) n'a pas l'ombre de celui qui la tient.
+    pub owner: u32,
 }
 
 impl ShadowBox {
@@ -322,6 +328,7 @@ impl ShadowBox {
             max: max.into(),
             to_unit: [0, 1, 2].map(|i| to_unit.row(i).to_array()),
             sunlit: true,
+            owner: 0,
         }
     }
 }
@@ -742,6 +749,9 @@ pub struct Renderer {
     lit: Option<lazy::Lazy<Result<LitPipes, String>>>,
     /// (v198) Blocs vus dans les miroirs, éclairés par les lumières de l'éditeur.
     planar_lit: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
+    /// (v201) Torches en lumières ponctuelles : centre et rayon de la sphère où chaque bloc
+    /// lumineux a sa lumière dynamique (voir `set_torch_swap`).
+    torch_swap: Option<(Vec3, f32)>,
     /// Images restantes pendant lesquelles l'anticrénelage considère que les lumières ont
     /// changé (déplacées, réglées) : comme `mesh_changes`.
     dyn_changes: u32,
@@ -1240,6 +1250,7 @@ impl Renderer {
             dyn_gpu,
             lit: None,
             planar_lit: None,
+            torch_swap: None,
             dyn_changes: 0,
             skin_key: None,
             lights_pos: [[0.0; 4]; MAX_LIGHTS],
@@ -1791,6 +1802,28 @@ impl Renderer {
     /// (v198) Blocs vus dans les miroirs, éclairés, s'ils sont prêts.
     fn planar_lit(&self) -> Option<&wgpu::RenderPipeline> {
         self.planar_lit.as_ref()?.try_get()?.as_ref().ok()
+    }
+
+    /// (v201) Torches en lumières ponctuelles (réglage vidéo) : dans la sphère `swap`
+    /// (centre, rayon), chaque bloc lumineux a sa lumière dynamique, et leur lumière des
+    /// blocs s'efface (elle revient vers le bord, voir `torch_keep` dans world.wgsl).
+    /// `None` : la lumière des blocs partout.
+    pub fn set_torch_swap(&mut self, swap: Option<(Vec3, f32)>) {
+        self.torch_swap = swap.filter(|s| s.1 > 0.0);
+    }
+
+    /// (v201) La lumière des blocs laisse-t-elle vraiment la place (voir `set_torch_swap`) ?
+    /// Seulement quand les lumières dynamiques sont dessinées (l'eau les prend avec les
+    /// opaques) : tant que leurs shaders se compilent, ou si la carte les refuse, elle reste.
+    pub fn torch_swap_on(&self) -> bool {
+        self.torch_swap.is_some() && self.dyn_gpu.active() && self.lit_pipes().is_some()
+    }
+
+    fn torch_swap_uniform(&self) -> [f32; 4] {
+        match self.torch_swap {
+            Some((c, r)) if self.torch_swap_on() => [c.x, c.y, c.z, r],
+            _ => [0.0; 4],
+        }
     }
 
     /// Les lumières dynamiques ont-elles besoin de la grille de blocs (ombres) ?
@@ -2384,6 +2417,9 @@ impl Renderer {
         if roots.is_empty() {
             return;
         }
+        // (v201) Les blocs des images sont-ils dessinés avec les lumières (comme dans
+        // `encode_mirrors`) ?
+        let mirror_lit = self.planar_lit().is_some() && self.dyn_gpu.active();
         // Images à la taille du monde, faites au premier miroir vu (pas de mémoire prise
         // dans les mondes sans miroir).
         if self.planar.size != size {
@@ -2448,6 +2484,10 @@ impl Renderer {
             // rebonds ; pas de lumière des torches renvoyée par les miroirs (un rayon par
             // pixel).
             let mut mg = *g;
+            // (v201) Sans les lumières dans l'image du miroir, la lumière des blocs reste.
+            if !mirror_lit {
+                mg.torch_swap = [0.0; 4];
+            }
             mg.view_proj = n.vp.to_cols_array_2d();
             mg.cur_view_proj = mg.view_proj;
             mg.prev_view_proj = mg.view_proj;
@@ -2833,6 +2873,7 @@ impl Renderer {
             mirror_vp: [[[0.0; 4]; 4]; planar::MAX_PLANAR],
             mirror_info: [[0.0; 4]; planar::MAX_PLANAR],
             mirror_count: [0.0; 4],
+            torch_swap: self.torch_swap_uniform(),
         };
         let mut globals = globals;
 
@@ -3038,6 +3079,7 @@ impl Renderer {
             mirror_vp: [[[0.0; 4]; 4]; planar::MAX_PLANAR],
             mirror_info: [[0.0; 4]; planar::MAX_PLANAR],
             mirror_count: [0.0; 4],
+            torch_swap: self.torch_swap_uniform(),
         };
         self.overlay
             .prepare(&self.device, &self.queue, p.overlay, p.ui, size);

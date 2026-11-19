@@ -253,6 +253,7 @@ impl PlacedLight {
             bulb: self.bulb,
             shadows: self.shadows,
             inside_block: false,
+            owner: 0,
             beam: if self.volumetric { self.beam } else { 0.0 },
             density: self.density,
             anisotropy: self.anisotropy,
@@ -848,6 +849,29 @@ pub fn scan_auto(world: &World, cam: Vec3, radius: f32, culling: bool) -> (Vec<A
     (out, found)
 }
 
+/// (v201) Torche tenue, avec les torches en lumières ponctuelles : la même lumière qu'une
+/// torche posée (réglages des lumières automatiques), à sa flamme (`rgb`, sRGB), sans
+/// l'ombre de celui qui la tient.
+pub fn held_torch(pos: Vec3, rgb: [u8; 3], s: &LightSettings) -> DynLight {
+    let m = rgb.iter().copied().max().unwrap_or(1).max(1) as u32;
+    DynLight {
+        id: HELD_TORCH_ID,
+        kind: DynKind::Point,
+        pos: pos.to_array(),
+        color: rgb.map(|v| ((v as u32 * 255 / m) as f32 / 255.0).powf(2.2)),
+        intensity: 1.2 * s.auto_intensity,
+        range: 10.0 * s.auto_reach,
+        shadows: s.auto_shadows,
+        owner: crate::flashlight::HOLDER,
+        beam: 0.0,
+        ..Default::default()
+    }
+}
+
+/// Identifiant de la lumière de la torche tenue (à part des lumières posées et
+/// automatiques, et de la lampe torche).
+const HELD_TORCH_ID: u64 = 0x7f1a_5410_0000_0002;
+
 /// Identifiant stable d'une lumière automatique (d'après sa position).
 fn auto_id(p: Vec3) -> u64 {
     let q = (p * 16.0).round().as_ivec3();
@@ -874,8 +898,13 @@ pub struct Lights {
     auto: Vec<AutoLight>,
     pub auto_found: usize,
     auto_timer: f32,
+    /// (v201) Où la dernière recherche a été faite (caméra), si elle l'a été.
+    auto_center: Option<Vec3>,
     /// Les gobos sont à envoyer à la carte graphique.
     pub gobos_dirty: bool,
+    /// (v201) Réglage vidéo « torches en lumières ponctuelles » : les lumières automatiques
+    /// remplacent la lumière des blocs autour de soi (voir `torch_swap`).
+    pub point_torches: bool,
 }
 
 impl Lights {
@@ -894,7 +923,9 @@ impl Lights {
             auto: Vec::new(),
             auto_found: 0,
             auto_timer: 0.0,
+            auto_center: None,
             gobos_dirty: true,
+            point_torches: false,
         };
         for i in 0..s.scene.len() {
             s.scene[i].id = s.new_id();
@@ -964,7 +995,7 @@ impl Lights {
                 self.save_now();
             }
         }
-        if self.settings.auto && active {
+        if self.auto_on() && active {
             self.auto_timer -= dt;
             if self.auto_timer <= 0.0 {
                 self.auto_timer = 0.25;
@@ -976,19 +1007,72 @@ impl Lights {
                 );
                 self.auto = v;
                 self.auto_found = found;
+                self.auto_center = Some(cam);
             }
-        } else if !self.auto.is_empty() {
+        } else if self.auto_center.is_some() || !self.auto.is_empty() {
             self.auto.clear();
             self.auto_found = 0;
+            self.auto_center = None;
+            self.auto_timer = 0.0;
         }
+    }
+
+    /// Lumières automatiques demandées : dans l'éditeur, ou par le réglage vidéo des
+    /// torches en lumières ponctuelles (v201).
+    fn auto_on(&self) -> bool {
+        self.settings.auto || self.point_torches
+    }
+
+    /// (v201) Torches en lumières ponctuelles : combien peuvent avoir leurs cartes d'ombre
+    /// (six cases chacune : les murs arrêtent leur lumière, comme celle des blocs), avec la
+    /// place que prennent les lumières posées et une lampe ou une torche tenue.
+    fn point_cap(&self) -> usize {
+        let table = minelib_render::SHADOW_QUALITY;
+        let q = (self.settings.render.shadow_quality as usize).min(table.len() - 1);
+        let (atlas, tile) = table[q];
+        let per = (atlas / tile.max(1)) as usize;
+        let placed: usize = self
+            .scene
+            .iter()
+            .filter(|l| l.on)
+            .map(|l| {
+                if l.kind == Kind::Spot && l.angle <= 120.0 {
+                    1
+                } else {
+                    6
+                }
+            })
+            .sum();
+        (per * per).saturating_sub(placed + 6) / 6
+    }
+
+    /// (v201) Torches en lumières ponctuelles : centre et rayon de la sphère où chaque bloc
+    /// lumineux a sa lumière (la lumière des blocs y laisse la place) : celle de la
+    /// recherche, ou jusqu'à la dernière lumière gardée quand il y en a plus que de place.
+    pub fn torch_swap(&self) -> Option<(Vec3, f32)> {
+        let center = self.auto_center.filter(|_| self.point_torches)?;
+        let n = self.auto_active();
+        let radius = if n < self.auto.len() {
+            n.checked_sub(1)
+                .map_or(0.0, |last| self.auto[last].pos.distance(center))
+        } else {
+            self.settings.auto_radius as f32
+        };
+        (radius > 0.0).then_some((center, radius))
     }
 
     /// Nombre de lumières automatiques actives.
     pub fn auto_active(&self) -> usize {
-        self.auto
+        let n = self
+            .auto
             .len()
             .min(self.settings.auto_max as usize)
-            .min(minelib_render::MAX_DYN_LIGHTS.saturating_sub(self.scene.len()))
+            .min(minelib_render::MAX_DYN_LIGHTS.saturating_sub(self.scene.len() + 1));
+        if self.point_torches {
+            n.min(self.point_cap())
+        } else {
+            n
+        }
     }
 
     /// Lumières à dessiner : celles du joueur d'abord (elles passent avant pour les ombres),
@@ -1001,7 +1085,7 @@ impl Lights {
             .map(|l| l.to_dyn(self.gobo_layer(&l.gobo)))
             .collect();
         let s = &self.settings;
-        if s.auto {
+        if self.auto_on() {
             // Ombres : les 8 plus proches au plus (les cartes coûtent cher).
             for (k, a) in self.auto.iter().take(self.auto_active()).enumerate() {
                 let lin = a.rgb.map(|v| (v as f32 / 255.0).powf(2.2));
@@ -1191,5 +1275,52 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert!(m[0].pos.distance(Vec3::new(5.0, y as f32 + 1.0, 5.0)) < 1e-4);
         assert!(m[0].radius > 12.0 && !m[0].inside);
+    }
+
+    /// (v201) Torches en lumières ponctuelles (réglage vidéo) : les lumières automatiques
+    /// s'allument sans l'éditeur, pas plus que l'atlas des ombres n'en tient (les murs
+    /// arrêtent leur lumière), et la lumière des blocs laisse la place jusqu'à la dernière.
+    #[test]
+    fn point_torches_replace_the_block_light_around_the_camera() {
+        use minelib_world::ChunkPos;
+        let root = std::env::temp_dir().join(format!("minelib-ponctuelles-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut w = World::new(0);
+        for cz in -1..=1 {
+            for cx in -7..=7 {
+                w.ensure_chunk(ChunkPos { x: cx, z: cz });
+            }
+        }
+        // Un bloc lumineux tous les 4 blocs sur une ligne (chacun sa lumière).
+        let glow = minelib_world::registry::registry()
+            .by_key("glowstone")
+            .unwrap();
+        let y = 120;
+        for x in (-96..=96).step_by(4) {
+            w.set(x, y, 0, glow);
+        }
+        let cam = Vec3::new(0.5, y as f32 + 0.5, 0.5);
+        let mut l = Lights::load(&root, &root);
+        l.update(0.1, &w, cam, true);
+        assert!(
+            l.frame_lights().is_empty() && l.torch_swap().is_none(),
+            "désactivé"
+        );
+        l.point_torches = true;
+        l.update(0.1, &w, cam, true);
+        // Qualité Moyenne : 256 cases, de la place pour les 23 à moins de 48 blocs.
+        assert_eq!(l.frame_lights().len(), 23);
+        let (c, r) = l.torch_swap().unwrap();
+        assert!(c.distance(cam) < 1e-4 && r == l.settings.auto_radius as f32);
+        // Qualité Ultra : 64 cases, 9 lumières ; la lumière des blocs revient après la
+        // dernière (à 16 blocs).
+        l.settings.render.shadow_quality = 3;
+        assert_eq!(l.frame_lights().len(), 9);
+        let (_, r) = l.torch_swap().unwrap();
+        assert!((r - 16.0).abs() < 1e-4, "{r}");
+        // Hors des lumières (partie FPS) : plus rien, la lumière des blocs partout.
+        l.update(0.1, &w, cam, false);
+        assert!(l.frame_lights().is_empty() && l.torch_swap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

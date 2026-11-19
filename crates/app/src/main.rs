@@ -35,6 +35,7 @@
 //!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
 //!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
 //!   MINELIB_UI=lumieres         éditeur de lumières ouvert en entrant dans le monde (essais)
+//!   MINELIB_UI=settings|graphics paramètres, ou paramètres graphiques, au lancement (essais)
 //!   MINELIB_LUMIERES_LENTES=<s> shaders des lumières prêts <s> secondes plus tard (essais)
 //!   MINELIB_SMOKE=<x>,<y>,<z>   mode FPS : fumigène posée là toutes les 18 s (essais)
 //!   MINELIB_SMOKE_Q=<n>,<pas>   qualité des fumigènes : pas max et longueur (essais)
@@ -55,6 +56,7 @@ mod daytime;
 mod debug;
 mod drops;
 mod equip;
+mod flashlight;
 mod fluids;
 mod fps;
 mod fpsmap;
@@ -422,6 +424,10 @@ impl Game {
                 .and_then(|b| skin::Skin::from_png(&b).ok());
             if std::env::var("MINELIB_UI").is_ok_and(|v| v == "settings") {
                 g.screen = Screen::Settings;
+            }
+            // (v201) Paramètres graphiques ouverts au lancement (essais de l'interface).
+            if std::env::var("MINELIB_UI").is_ok_and(|v| v == "graphics") {
+                g.screen = Screen::Graphics;
             }
             // Essais de l'interface : écran FPS avec un lobby d'exemple.
             if std::env::var("MINELIB_UI").is_ok_and(|v| v == "lobby") {
@@ -3042,6 +3048,17 @@ impl Game {
             raytracing = !raytracing;
         }
         y += step;
+        // (v201) Torches en lumières ponctuelles (non par défaut) : autour de soi, chaque
+        // torche ou bloc lumineux éclaire comme une lumière ponctuelle de l'éditeur.
+        let pt_label = if self.options.point_torches {
+            "Torches ponctuelles : activé"
+        } else {
+            "Torches ponctuelles : désactivé"
+        };
+        if c.button(pt_label, cx, y, 300.0, true) {
+            self.options.point_torches = !self.options.point_torches;
+        }
+        y += step;
         let fs_label = if self.options.fullscreen {
             "Plein écran : oui (F11)"
         } else {
@@ -3080,12 +3097,22 @@ impl Game {
             ds,
             GREY,
         );
+        let mut hint_y = y + 4.0 * s + ds * 10.0;
+        if self.options.point_torches {
+            c.text_center(
+                "Torches ponctuelles : réglages dans l'éditeur de lumières (L), onglet Auto.",
+                hint_y,
+                ds,
+                GREY,
+            );
+            hint_y += ds * 10.0;
+        }
         if let Some(shown) = &self.optimus {
             c.text_center(
                 &format!(
                     "Écran sur « {shown} » : active le mode GPU dédié (MUX) pour plus de FPS."
                 ),
-                y + 4.0 * s + ds * 10.0,
+                hint_y,
                 ds,
                 GREY,
             );
@@ -3419,6 +3446,10 @@ impl GameLoop for Game {
         }
         // (v179) En ligne, avec la même option : le son des écrans est coupé tant qu'un menu
         // est ouvert par-dessus la partie (pause, paramètres…), et revient ensuite.
+        // (v201) Réglage vidéo des torches en lumières ponctuelles.
+        if let Some(s) = &mut self.session {
+            s.lights.point_torches = self.options.point_torches;
+        }
         if let Some(s) = &mut self.session {
             let mute =
                 self.options.mute_screens_menu && self.screen != Screen::Playing && s.online();

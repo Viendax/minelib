@@ -29,6 +29,9 @@ pub enum Item {
     /// Tête avec un skin (`heads::skin_of`) : texture d'une tête de Minecraft, ou skin d'un
     /// joueur du jeu ; posée, elle le garde.
     Head(u32),
+    /// (v201) Lampe torche : éclaire comme un projecteur, là où l'on regarde (clic droit :
+    /// l'allumer ou l'éteindre).
+    Flashlight,
 }
 
 impl Item {
@@ -45,6 +48,7 @@ impl Item {
             Item::Screen(0) => 0x3_0001,
             Item::Screen(n) => 0x3_0000 + u32::from(n.min(3)),
             Item::Head(_) => minelib_world::registry::skull_block(false, 0).0 as u32,
+            Item::Flashlight => 0x4_0000,
         }
     }
 
@@ -64,6 +68,7 @@ impl Item {
                 crate::heads::HeadSkin::Player(p) => format!("skull {p}"),
                 _ => "skull".into(),
             },
+            Item::Flashlight => "lampe_torche".into(),
         }
     }
 
@@ -82,6 +87,7 @@ impl Item {
     pub fn from_code(code: u32) -> Option<Self> {
         match code {
             0x2_0000 => Some(Item::Wand),
+            0x4_0000 => Some(Item::Flashlight),
             0x3_0000 => Some(Item::Screen(crate::screen::NORMAL)),
             0x3_0001 => Some(Item::Screen(0)),
             0x3_0002 => Some(Item::Screen(2)),
@@ -100,6 +106,7 @@ impl Item {
         match self {
             Item::Block(b) => capitalize(b.name()),
             Item::Wand => "Baguette de sélection".into(),
+            Item::Flashlight => "Lampe torche".into(),
             Item::Screen(n) => crate::screen::size_name(n).into(),
             Item::Head(n) => crate::heads::skin_of(n).item_name(),
             Item::Torch(None) => "Torche".into(),
@@ -121,7 +128,9 @@ impl Item {
         match self {
             Item::Torch(None) => Some(WOOD_FLAME),
             Item::Torch(Some(i)) => Some(CHEMICALS[i].rgb),
-            Item::Block(_) | Item::Wand | Item::Screen(_) | Item::Head(_) => None,
+            Item::Block(_) | Item::Wand | Item::Screen(_) | Item::Head(_) | Item::Flashlight => {
+                None
+            }
         }
     }
 
@@ -161,6 +170,11 @@ impl Item {
                     "Clic droit : la poser au sol (tournée vers soi) ou contre un mur".into(),
                     GREY,
                 ));
+            }
+            Item::Flashlight => {
+                lines.push(("Éclaire comme un projecteur, où tu regardes".into(), WHITE));
+                lines.push(("Clic droit : l'allumer ou l'éteindre".into(), WHITE));
+                lines.push(("Ses rayons : réglages des lumières (touche L)".into(), GREY));
             }
             Item::Torch(None) => {
                 lines.push(("Flamme orange (bois)".into(), WHITE));
@@ -479,6 +493,7 @@ pub fn catalogue() -> &'static [(Item, usize)] {
         blocks.sort_by_key(|b| (b.0, b.1));
         let mut items: Vec<(Item, usize)> = blocks.into_iter().map(|(t, _, it)| (it, t)).collect();
         items.push((Item::Wand, 6));
+        items.push((Item::Flashlight, 6));
         items.extend((0..crate::screen::SIZES.len() as u8).map(|n| (Item::Screen(n), 6)));
         items.push((Item::Torch(None), 6));
         items.extend((0..CHEMICALS.len()).map(|i| (Item::Torch(Some(i)), 6)));
@@ -760,6 +775,9 @@ impl Inventory {
                             "ecran video tele television youtube petit grand geant".contains(&q)
                         }
                         Item::Head(_) => "tete skull head".contains(&q),
+                        Item::Flashlight => {
+                            "lampe torche flashlight lumiere projecteur".contains(&q)
+                        }
                     }
                 }
             })
@@ -1476,6 +1494,12 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
         )),
         // Baguette : image en pixels.
         Item::Wand => crate::wand::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s),
+        // (v201) Lampe torche : son modèle en 3D, verre allumé.
+        Item::Flashlight => ui.model(crate::flashlight::icon(
+            x + slot / 2.0,
+            y + slot / 2.0,
+            15.0 * s,
+        )),
         // Écran vidéo : petite télé en pixels.
         Item::Screen(n) => crate::screen::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s, n),
         // Barrières (invisibles) : un panneau « interdit », rouge (bleu : à fluides).

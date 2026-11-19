@@ -334,6 +334,15 @@ fn emit_ground_item(out: &mut Vec<EntityVertex>, xf: Mat4, item: Item, light: [f
                 .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb);
             crate::player_model::emit_torch_item(out, center(TORCH_SIZE), rgb, light);
         }
+        // (v201) Lampe torche : couchée sur le flanc, éteinte.
+        Item::Flashlight => {
+            let lying = xf
+                * Mat4::from_scale(Vec3::splat(FLASHLIGHT_SIZE))
+                * Mat4::from_translation(Vec3::new(0.0, 5.0 / 16.0, 0.0))
+                * Mat4::from_rotation_z(-std::f32::consts::FRAC_PI_2)
+                * Mat4::from_translation(Vec3::new(-0.5, -6.7 / 16.0, -0.5));
+            crate::player_model::emit_flashlight_item(out, lying, false, light);
+        }
         _ => {
             let h = BLOCK_SIZE / 2.0;
             crate::player_model::emit_item(
@@ -352,6 +361,8 @@ fn emit_ground_item(out: &mut Vec<EntityVertex>, xf: Mat4, item: Item, light: [f
 /// fois ce facteur).
 const BLOCK_SIZE: f32 = 0.28;
 const TORCH_SIZE: f32 = 0.6;
+/// (v201) Lampe torche au sol : sa vraie taille fois ce facteur.
+const FLASHLIGHT_SIZE: f32 = 0.6;
 /// Dans l'eau : vitesse de l'objet porté par le courant, de sa remontée, de sa chute une
 /// fois sorti (blocs/s), et de combien il s'enfonce sous la surface.
 const ITEM_CURRENT: f32 = 2.0;
@@ -374,6 +385,7 @@ fn icon_kind(item: Item) -> RayBoxKind {
             RayBoxKind::Flat(rgb)
         }
         Item::Wand => RayBoxKind::Flat([120, 80, 200]),
+        Item::Flashlight => RayBoxKind::Flat(crate::flashlight::BODY),
         Item::Screen(_) => RayBoxKind::Flat([30, 30, 36]),
         // Tête à skin (au sol, elle devient une tête simple : voir `Item::code`).
         Item::Head(_) => RayBoxKind::Flat([214, 166, 132]),

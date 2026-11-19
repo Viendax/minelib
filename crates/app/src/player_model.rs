@@ -344,6 +344,8 @@ pub enum Held {
     /// personne) : arme (indice dans `WEAPONS`, tenue à deux mains, pointée où l'on
     /// regarde), grenade (`ITEM_NADE` + type), bombe (`cs::W_BOMB`) ou couteau (le reste).
     Gear(u8),
+    /// (v201) Lampe torche (allumée ou non), pointée où l'on regarde.
+    Flashlight(bool),
 }
 
 /// (v177) Arme à feu en main : les deux bras se tendent vers le regard (`aims`).
@@ -501,6 +503,26 @@ fn item_frame(pose: &Pose, hand: Mat4, rot: Mat4, fwd: f32) -> Mat4 {
         * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4))
         * rot
         * Mat4::from_scale(Vec3::splat(PX))
+}
+
+/// (v201) Repère d'une lampe torche tenue : au poing, pointée où l'on regarde (−z).
+fn flashlight_frame(pose: &Pose, hand: Mat4) -> Mat4 {
+    item_frame(pose, hand, Mat4::IDENTITY, 2.0)
+}
+
+/// (v201) Point de la lampe debout (`flashlight::parts`, seizièmes de bloc) dans son repère
+/// tenu (pixels) : couchée vers l'avant, prise au milieu du manche, à la moitié de sa taille
+/// en bloc (comme à la première personne : environ 40 cm de long).
+fn flashlight_lay(p: [f32; 3]) -> [f32; 3] {
+    [(p[0] - 8.0) * 0.5, (p[2] - 8.0) * 0.5, -(p[1] - 4.0) * 0.5]
+}
+
+/// (v201) Verre d'une lampe torche tenue par le modèle (monde), d'où part sa lumière ;
+/// `None` sans bras droit.
+pub fn flashlight_lens(pose: &Pose) -> Option<Vec3> {
+    let frame = flashlight_frame(pose, hand_frame(pose)?);
+    // Juste devant le verre (en haut de la lampe debout, y = 13,4).
+    Some(frame.transform_point3(Vec3::from(flashlight_lay([8.0, 13.6, 8.0]))))
 }
 
 /// Repère d'une torche tenue : un peu devant le poing, bâton sur +y.
@@ -779,6 +801,24 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
         )],
         // (v177) En triangles : `emit_gear`.
         Held::Gear(_) => Vec::new(),
+        // (v201) Lampe torche : dans le poing, pointée droit devant (−z), verre au bout.
+        Held::Flashlight(on) => {
+            let frame = flashlight_frame(pose, hand);
+            crate::flashlight::parts(on)
+                .into_iter()
+                .map(|(a, b, c, glow)| {
+                    let (a, b) = (flashlight_lay(a), flashlight_lay(b));
+                    let min = [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])];
+                    let max = [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
+                    let kind = if glow {
+                        RayBoxKind::Glow(c)
+                    } else {
+                        RayBoxKind::Flat(c)
+                    };
+                    (frame, min, max, kind)
+                })
+                .collect()
+        }
     }
 }
 
@@ -964,6 +1004,20 @@ pub fn emit_block_item(out: &mut Vec<EntityVertex>, xf: Mat4, block: BlockId, li
     };
     for (a, b) in boxes.into_iter().take(4) {
         emit_textured_box(out, xf, a, b, def.tex, glow, light);
+    }
+}
+
+/// (v201) Lampe torche (objet au sol) : `xf` place le repère du bloc (0..1, lampe debout sur
+/// +y), comme celui de la vue à la première personne.
+pub fn emit_flashlight_item(out: &mut Vec<EntityVertex>, xf: Mat4, on: bool, light: [f32; 3]) {
+    let px = xf * Mat4::from_scale(Vec3::splat(1.0 / 16.0));
+    for (a, b, c, glow) in crate::flashlight::parts(on) {
+        let kind = if glow {
+            RayBoxKind::Glow(c)
+        } else {
+            RayBoxKind::Flat(c)
+        };
+        emit_item(out, px, a, b, kind, light);
     }
 }
 
@@ -1212,7 +1266,17 @@ pub fn player_mesh() -> Vec<PlayerVertex> {
                 rect,
             };
             let (a, b, c, d) = (corner(0, 0), corner(nu, 0), corner(nu, nv), corner(0, nv));
-            out.extend([a, b, c, c, d, a]);
+            // (v201) Triangles tournés vers le dehors du pavé, comme ceux du monde : la carte
+            // écarte les faces arrière des joueurs depuis la v197. `du × dv` (la normale de
+            // l'ombrage, gardée telle quelle) pointe vers l'intérieur pour quatre faces sur
+            // six (devant, derrière, côtés) : on voyait l'intérieur des pavés.
+            let center = (Vec3::from(min) + Vec3::from(max)) / 2.0;
+            let mid = o + (du * nu as f32 + dv * nv as f32) / 2.0;
+            if du.cross(dv).dot(mid - center) > 0.0 {
+                out.extend([a, b, c, c, d, a]);
+            } else {
+                out.extend([a, d, c, c, b, a]);
+            }
         }
     }
     out
@@ -1540,7 +1604,9 @@ mod tests {
             let cpu = build(&pose);
             let mut at = 0;
             for face in mesh.chunks(6) {
-                let [a, b, c, _, d, _] = [0, 1, 2, 3, 4, 5].map(|i| face[i]);
+                // (v201) Dans une face tournée dans l'autre sens, b et d sont échangés.
+                let [a, x, c, _, y, _] = [0, 1, 2, 3, 4, 5].map(|i| face[i]);
+                let (b, d) = if x.uv[1] == a.uv[1] { (x, y) } else { (y, x) };
                 let xf = shader_part_matrix(a.part, &inst);
                 let n = xf.transform_vector3(Vec3::from(a.normal)).normalize();
                 let shade = face_shade(n);
@@ -1634,7 +1700,9 @@ mod tests {
             n += 1;
         }
         assert!(n > 20, "l'essai n'a regardé que {n} triangles du monde");
-        // Le même sens pour les joueurs, avec la matrice du shader.
+        // Le même sens pour les joueurs, avec la matrice du shader : vers le dehors du pavé.
+        // (v201) Pas vers la normale des sommets : celle de l'ombrage (`du × dv`) pointe vers
+        // l'intérieur pour quatre faces sur six, et l'essai passait quand même.
         let mesh = player_mesh();
         for pose in test_poses() {
             let inst = instance(&pose, 0, &Prev::still(&pose));
@@ -1642,12 +1710,19 @@ mod tests {
                 let xf = shader_part_matrix(t[0].part, &inst);
                 let p = [0, 1, 2].map(|k| xf.transform_point3(Vec3::from(t[k].pos)));
                 let wind = (p[1] - p[0]).cross(p[2] - p[0]);
-                let out = xf.transform_vector3(Vec3::from(t[0].normal));
+                let (mn, mx, _) = PARTS[t[0].part as usize];
+                let center = xf.transform_point3((Vec3::from(mn) + Vec3::from(mx)) / 2.0);
+                let out = (p[0] + p[1] + p[2]) / 3.0 - center;
                 assert!(wind.length_squared() > 1e-12, "triangle plat du joueur");
                 assert!(
-                    wind.normalize().dot(out.normalize()) > 0.9,
-                    "joueur : triangle tourné dans l'autre sens (partie {})",
+                    wind.dot(out) > 0.0,
+                    "joueur : triangle tourné vers l'intérieur (partie {})",
                     t[0].part
+                );
+                let n = xf.transform_vector3(Vec3::from(t[0].normal));
+                assert!(
+                    wind.normalize().dot(n.normalize()).abs() > 0.9,
+                    "normale de travers"
                 );
             }
         }

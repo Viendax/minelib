@@ -59,6 +59,9 @@ struct Globals {
     mirror_vp: array<mat4x4<f32>, 4>,
     mirror_info: array<vec4<f32>, 4>,
     mirror_count: vec4<f32>,
+    // (v201) Torches en lumières ponctuelles (réglage vidéo) : centre (xyz) et rayon (w) de
+    // la sphère où chaque bloc lumineux a sa lumière dynamique ; w = 0 : aucune.
+    torch_swap: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -99,6 +102,20 @@ fn hash3(v: vec3<i32>) -> f32 {
     h = (h ^ (h >> 13u)) * 1274126177u;
     h = h ^ (h >> 16u);
     return f32(h & 0xffffu) / 65535.0;
+}
+
+/// (v201) Part de la lumière des blocs (torches, blocs lumineux) gardée en `p` : avec les
+/// torches en lumières ponctuelles, rien au cœur de la sphère où chacune a sa lumière
+/// dynamique, puis tout vers son bord. Ses 16 derniers blocs servent de marge : un bloc y
+/// est éclairé par des torches un peu plus loin, qui n'ont plus la leur.
+fn torch_keep(p: vec3<f32>) -> f32 {
+    let r = g.torch_swap.w;
+    if r <= 0.0 {
+        return 1.0;
+    }
+    let d = distance(p, g.torch_swap.xyz);
+    let inner = max(r - 16.0, 0.0);
+    return smoothstep(inner, max(r - 6.0, inner + 2.0), d);
 }
 
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
@@ -537,6 +554,7 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
     let t = g.cam_pos.w;
     let flicker = 0.93 + 0.07 * sin(t * 9.0 + hash3(cell / vec3<i32>(4)) * 6.28);
     var torch = pow(i.light, vec3<f32>(2.0)) * g.light.y * flicker * mix(0.55, 1.0, i.ao);
+    torch *= torch_keep(i.world);
     let lit = max(i.light.x, max(i.light.y, i.light.z)) > 0.05;
     var ts = vec4<f32>(0.0);
     if shadows && (lit || g.held_pos.w > 0.0) {

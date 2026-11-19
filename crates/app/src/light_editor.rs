@@ -1307,13 +1307,13 @@ impl Editor {
                 tr("Cases d'ombre"),
                 stats.tiles_used,
                 stats.tiles_total,
-                if lights.settings.auto {
+                if lights.settings.auto || lights.point_torches {
                     format!("   auto : {}", lights.auto_active())
                 } else {
                     String::new()
                 }
             )
-        } else if lights.settings.auto {
+        } else if lights.settings.auto || lights.point_torches {
             format!("Lumières automatiques : {}", lights.auto_active())
         } else {
             "Minelib — d'après IRLights (qualet)".to_string()
@@ -2319,6 +2319,13 @@ impl Editor {
                     "Expérimental : une vraie lumière sur chaque torche, lanterne ou bloc lumineux proche.",
                     [1.0, 0.75, 0.3, 1.0],
                 );
+                // (v201) Le réglage vidéo les allume aussi, avec ces réglages.
+                if lights.point_torches {
+                    p.note(
+                        "Allumées par « Torches ponctuelles » (paramètres graphiques).",
+                        DIM,
+                    );
+                }
                 self.check(p, "Ignorer les blocs enterrés", &mut s.auto_culling);
                 self.check(p, "Ombres (les 8 plus proches)", &mut s.auto_shadows);
                 if let Some(v) = self.slider(
