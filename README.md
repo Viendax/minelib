@@ -284,6 +284,11 @@ crates/
   s'éloigne, elles ne voient plus les murs et la lumière passe à travers (v193 : on garde
   la carte d'avant tant que la grille ne voit pas toute la lumière ; tests
   `moving_the_grid_redoes_only_what_enters_it` et `a_far_grid_does_not_cover_the_light`).
+- **La passe des translucides (TAA) a trois cibles.** Depuis la v199, l'eau, le verre et la
+  glace y laissent leur face dans une troisième image (`taa::WATER_GB_FORMAT`), éclairée
+  ensuite par les lumières de l'éditeur (`fs_water*`, `dyn_deferred.wgsl`). Toute pipeline
+  dessinée dans cette passe (contour, écrans, fumigènes…) doit la déclarer, avec une
+  écriture vide si elle ne s'en sert pas : sinon wgpu la refuse (erreur de validation).
 
 ### Relais
 

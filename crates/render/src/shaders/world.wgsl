@@ -348,13 +348,40 @@ fn fs_block_mv(i: VOut) -> GbOut {
 }
 
 @fragment
-fn fs_block_translucent_mv(i: VOut) -> MvOut {
-    let c = shade_with(i, true, true, true);
+fn fs_block_translucent_mv(i: VOut) -> TrOut {
+    let s = shade_full(i, true, true, true);
+    let c = s.color;
     if c.a < 0.02 || from_behind(i) {
         discard;
     }
-    return MvOut(vec4<f32>(c.rgb, max(c.a, 0.25)), vec2<f32>(0.0));
+    let a = max(c.a, 0.25);
+    var o: TrOut;
+    o.color = vec4<f32>(c.rgb, a);
+    o.motion = vec2<f32>(0.0);
+    // Comme `gb_out`, poids multipliés par l'opacité de la face (mélange : face × a).
+    // Albédo en racine carrée (8 bits, plus de nuances dans le sombre).
+    o.water = vec4<u32>(
+        bitcast<u32>(i.clip.z),
+        pack4x8unorm(vec4<f32>(sqrt(clamp(s.albedo, vec3<f32>(0.0), vec3<f32>(1.0))), clamp(i.reflect, 0.0, 1.0) * 0.99)),
+        pack4x8unorm(vec4<f32>(
+            gb_oct_encode(face_normal(i.face)),
+            clamp(s.wd * a, 0.0, 1.0),
+            gb_pack_spec(s.ws * a, i.short != 0u),
+        )),
+        0u,
+    );
+    return o;
 }
+
+/// (v199) Translucides avec l'anticrénelage : couleur, mouvement (celui de ce qui est
+/// derrière, gardé), et la face pour l'éclairage différé des lumières dynamiques (`fs_water`
+/// de dyn_deferred.wgsl : eau, verre, glace). La dernière face dessinée d'un pixel
+/// l'emporte (les translucides vont de l'arrière vers l'avant, chunk par chunk).
+struct TrOut {
+    @location(0) color: vec4<f32>,
+    @location(1) motion: vec2<f32>,
+    @location(2) water: vec4<u32>,
+};
 
 fn shade(i: VOut) -> vec4<f32> {
     return shade_with(i, true, false, false);
@@ -781,7 +808,13 @@ fn specular(p: vec3<f32>, r: vec3<f32>, k: f32, face_light: vec3<f32>) -> vec3<f
         // Source étendue : on élargit le lobe selon sa taille apparente.
         let size = max(lp.w, 0.25) / max(d, 0.3);
         let cosr = max(dot(r, to_l / d), 0.0);
-        let s = pow(cosr, min(shin, 2.0 / (size * size)));
+        // (v199) Hors du lobe (cosr^e < 2⁻¹⁶, invisible même × gain × couleur) : rien à
+        // ajouter, ni la suite. Même image, la plupart des pixels s'arrêtent là.
+        let lg = min(shin, 2.0 / (size * size)) * log2(max(cosr, 1e-30));
+        if lg < -16.0 {
+            continue;
+        }
+        let s = exp2(lg);
         // Sans obstacle, la lumière de cette source (−25 % par case, en ligne brisée : au
         // plus √3 fois la distance) arrive ici à au moins ~0,75^(1,75 (d + 0,7)) (au carré
         // ici) ; bien moins : elle contourne un mur, la source est cachée.

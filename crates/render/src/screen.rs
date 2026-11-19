@@ -9,7 +9,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
-use crate::taa::{COLOR_FORMAT, MOTION_FORMAT};
+use crate::taa::{COLOR_FORMAT, MOTION_FORMAT, WATER_GB_FORMAT};
 use crate::DEPTH_FORMAT;
 
 /// Où est posé l'écran : centre, axes unitaires dans le plan de l'écran et taille en
@@ -135,10 +135,20 @@ impl Screen {
             })
         };
         let plain = pipeline("écran", "fs_main", &[target(surface)]);
+        // (v199) Dessiné dans la passe des translucides : sa 3e cible (l'eau) n'est pas
+        // écrite.
         let taa = pipeline(
             "écran (TAA)",
             "fs_taa_world",
-            &[target(COLOR_FORMAT), target(MOTION_FORMAT)],
+            &[
+                target(COLOR_FORMAT),
+                target(MOTION_FORMAT),
+                Some(wgpu::ColorTargetState {
+                    format: WATER_GB_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                }),
+            ],
         );
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {

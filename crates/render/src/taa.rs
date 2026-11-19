@@ -10,6 +10,18 @@ use crate::DEPTH_FORMAT;
 
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
+/// (v199) Ce que les translucides (eau, verre, glace) laissent pour l'éclairage différé de
+/// leur face : profondeur, albédo, normale et poids (voir `fs_water`, dyn_deferred.wgsl).
+pub const WATER_GB_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
+
+/// Cibles en plus de la couleur et du mouvement.
+#[derive(Clone, Copy)]
+pub(crate) enum Extra {
+    /// Passe des opaques : albédo et surface (éclairage différé).
+    Gbuffer(wgpu::ColorWrites),
+    /// (v199) Passe des translucides : la face pour l'éclairage différé de l'eau.
+    Water(wgpu::ColorWrites),
+}
 /// Ce que le monde opaque laisse pour l'éclairage différé des lumières dynamiques (voir
 /// `shaders/gbuffer.wgsl`) : albédo et brillance, normale et poids.
 pub const GB_ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -40,6 +52,9 @@ pub struct Targets {
     pub motion_view: wgpu::TextureView,
     /// Albédo et surface (éclairage différé des lumières dynamiques).
     pub gbuf_views: [wgpu::TextureView; 2],
+    /// (v199) Face translucide de chaque pixel pour l'éclairage différé de l'eau (effacée à
+    /// chaque image par la passe des translucides).
+    pub water_view: wgpu::TextureView,
     /// Profondeurs en alternance : la scène écrit `depth_views[i]` pendant que l'image
     /// précédente reste lisible dans l'autre (plus de copie de la profondeur à chaque image).
     pub depth_views: [wgpu::TextureView; 2],
@@ -171,7 +186,7 @@ fn world_pipeline(
     compare: wgpu::CompareFunction,
     blend: Option<wgpu::BlendState>,
     motion_writes: wgpu::ColorWrites,
-    gbuffer: Option<wgpu::ColorWrites>,
+    extra: Option<Extra>,
 ) -> wgpu::RenderPipeline {
     let mut targets = vec![
         Some(wgpu::ColorTargetState {
@@ -185,14 +200,22 @@ fn world_pipeline(
             write_mask: motion_writes,
         }),
     ];
-    if let Some(mask) = gbuffer {
-        for format in [GB_ALBEDO_FORMAT, GB_SURF_FORMAT] {
-            targets.push(Some(wgpu::ColorTargetState {
-                format,
-                blend: None,
-                write_mask: mask,
-            }));
+    match extra {
+        Some(Extra::Gbuffer(mask)) => {
+            for format in [GB_ALBEDO_FORMAT, GB_SURF_FORMAT] {
+                targets.push(Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: mask,
+                }));
+            }
         }
+        Some(Extra::Water(mask)) => targets.push(Some(wgpu::ColorTargetState {
+            format: WATER_GB_FORMAT,
+            blend: None,
+            write_mask: mask,
+        })),
+        None => {}
     }
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
@@ -251,7 +274,7 @@ pub(crate) fn build_heavy(
             true,
             None,
             all,
-            Some(all),
+            Some(Extra::Gbuffer(all)),
         )
     };
     std::thread::scope(|sc| {
@@ -267,9 +290,9 @@ pub(crate) fn build_heavy(
 }
 
 /// Translucides (eau, glace, verre teinté) : couleur mélangée, on garde le mouvement de ce
-/// qui est derrière. Sert aussi à la variante éclairée par les lumières dynamiques (elles
-/// ne passent pas par l'éclairage différé : il ne voit que l'opaque derrière).
-pub(crate) fn translucent_pipeline(
+/// qui est derrière. (v199) Ils laissent aussi leur face (profondeur, albédo, normale,
+/// poids) : les lumières dynamiques y sont ajoutées après coup, comme sur l'opaque.
+fn translucent_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
@@ -284,7 +307,7 @@ pub(crate) fn translucent_pipeline(
         false,
         Some(wgpu::BlendState::ALPHA_BLENDING),
         wgpu::ColorWrites::empty(),
-        None,
+        Some(Extra::Water(wgpu::ColorWrites::ALL)),
     )
 }
 
@@ -299,7 +322,7 @@ fn block_pipeline(
     depth_write: bool,
     blend: Option<wgpu::BlendState>,
     motion_writes: wgpu::ColorWrites,
-    gbuffer: Option<wgpu::ColorWrites>,
+    extra: Option<Extra>,
 ) -> wgpu::RenderPipeline {
     let vertex_layout = crate::world_vertex_layout();
     world_pipeline(
@@ -315,7 +338,7 @@ fn block_pipeline(
         wgpu::CompareFunction::Greater, // Z inversé
         blend,
         motion_writes,
-        gbuffer,
+        extra,
     )
 }
 
@@ -356,7 +379,7 @@ impl Taa {
             None,
             wgpu::ColorWrites::ALL,
             // Dans la passe des opaques : rien pour l'éclairage différé (le ciel n'en prend pas).
-            Some(wgpu::ColorWrites::empty()),
+            Some(Extra::Gbuffer(wgpu::ColorWrites::empty())),
         );
         let outline = world_pipeline(
             device,
@@ -371,7 +394,8 @@ impl Taa {
             wgpu::CompareFunction::GreaterEqual,
             Some(wgpu::BlendState::ALPHA_BLENDING),
             wgpu::ColorWrites::empty(),
-            None,
+            // Passe des translucides : rien pour l'eau.
+            Some(Extra::Water(wgpu::ColorWrites::empty())),
         );
         let float = wgpu::TextureSampleType::Float { filterable: true };
         let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -513,6 +537,7 @@ impl Taa {
             tex("albédo (éclairage différé)", GB_ALBEDO_FORMAT, rt),
             tex("surface (éclairage différé)", GB_SURF_FORMAT, rt),
         ];
+        let water_view = tex("eau (éclairage différé)", WATER_GB_FORMAT, rt);
         let depth_views = [
             raw("profondeur (TAA) 0", DEPTH_FORMAT, rt).create_view(&Default::default()),
             raw("profondeur (TAA) 1", DEPTH_FORMAT, rt).create_view(&Default::default()),
@@ -580,6 +605,7 @@ impl Taa {
             color_view,
             motion_view,
             gbuf_views,
+            water_view,
             depth_views,
             history_views,
             resolve_groups,

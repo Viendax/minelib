@@ -994,6 +994,20 @@ pub(crate) struct DeferredPipes {
     interp: wgpu::RenderPipeline,
     exact: wgpu::RenderPipeline,
     exact_hard: wgpu::RenderPipeline,
+    /// (v199) Les mêmes sur la face translucide de chaque pixel (eau, verre, glace).
+    water_half: wgpu::RenderPipeline,
+    water_half_hard: wgpu::RenderPipeline,
+    water_interp: wgpu::RenderPipeline,
+    water: wgpu::RenderPipeline,
+    water_hard: wgpu::RenderPipeline,
+}
+
+/// (v199) Groupes des passes de l'eau (voir `encode_water`), pour les images du TAA de
+/// génération `generation`.
+struct WaterGroups {
+    generation: u64,
+    group: wgpu::BindGroup,
+    interp: wgpu::BindGroup,
 }
 
 /// Liaisons de l'éclairage différé (profondeur lue, albédo, surface), refaites quand les
@@ -1121,6 +1135,12 @@ pub(crate) struct DynGpu {
     /// Celles de `fs_interp` : les mêmes, plus la lumière d'un pixel sur quatre.
     pub(crate) interp_bgl: wgpu::BindGroupLayout,
     def_targets: Option<DeferredTargets>,
+    /// (v199) Celles de `fs_water` et `fs_water_half` : cases éclairées et face translucide
+    /// de chaque pixel ; celles de `fs_water_interp` : les mêmes, plus la lumière d'un pixel
+    /// sur quatre. Leurs groupes, refaits quand les images du TAA sont recréées.
+    pub(crate) water_bgl: wgpu::BindGroupLayout,
+    pub(crate) water_interp_bgl: wgpu::BindGroupLayout,
+    water_groups: Option<WaterGroups>,
     // État de l'image.
     lights: Vec<DynLight>,
     settings: DynSettings,
@@ -1266,6 +1286,8 @@ pub(crate) fn light_pipes(
     comp_bgl: &wgpu::BindGroupLayout,
     def_bgl: &wgpu::BindGroupLayout,
     interp_bgl: &wgpu::BindGroupLayout,
+    water_bgl: &wgpu::BindGroupLayout,
+    water_interp_bgl: &wgpu::BindGroupLayout,
     surface: wgpu::TextureFormat,
 ) -> (
     wgpu::RenderPipeline,
@@ -1312,6 +1334,16 @@ pub(crate) fn light_pipes(
     let interp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("éclairage différé : moyenne des voisins"),
         bind_group_layouts: &[world_bgl, interp_bgl],
+        push_constant_ranges: &[],
+    });
+    let water_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("lumières sur l'eau"),
+        bind_group_layouts: &[world_bgl, water_bgl],
+        push_constant_ranges: &[],
+    });
+    let water_interp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("lumières sur l'eau : moyenne des voisins"),
+        bind_group_layouts: &[world_bgl, water_interp_bgl],
         push_constant_ranges: &[],
     });
     let add = wgpu::BlendComponent {
@@ -1393,6 +1425,79 @@ pub(crate) fn light_pipes(
             true,
             false,
         );
+        // (v199) Eau, verre, glace : la face translucide de chaque pixel, de la même façon.
+        let (water_layout, water_interp_layout) = (&water_layout, &water_interp_layout);
+        let water =
+            |label: &'static str, vs: &'static str, fs: &'static str, hard: bool, half: bool| {
+                sc.spawn(move || {
+                    timed(label, || {
+                        stencil_variant(
+                            device,
+                            label,
+                            water_layout,
+                            def_shader,
+                            vs,
+                            fs,
+                            if half {
+                                HALF_LIGHT_FORMAT
+                            } else {
+                                COLOR_FORMAT
+                            },
+                            if half { None } else { additive },
+                            if hard {
+                                &[("DL_SOFT_SHADOWS", 0.0)]
+                            } else {
+                                &[]
+                            },
+                            (!half).then(|| light_stencil(false)),
+                        )
+                    })
+                })
+            };
+        let water_half = water(
+            "lumières sur l'eau : un pixel sur quatre",
+            "vs_tiles_half",
+            "fs_water_half",
+            false,
+            true,
+        );
+        let water_half_hard = water(
+            "lumières sur l'eau : un pixel sur quatre (ombres nettes)",
+            "vs_tiles_half",
+            "fs_water_half",
+            true,
+            true,
+        );
+        let water_exact = water(
+            "lumières sur l'eau : calcul exact",
+            "vs_tiles",
+            "fs_water",
+            false,
+            false,
+        );
+        let water_exact_hard = water(
+            "lumières sur l'eau : calcul exact (ombres nettes)",
+            "vs_tiles",
+            "fs_water",
+            true,
+            false,
+        );
+        let water_interp = sc.spawn(move || {
+            timed("lumières sur l'eau : moyenne des voisins", || {
+                stencil_variant(
+                    device,
+                    "lumières sur l'eau : moyenne des voisins",
+                    water_interp_layout,
+                    def_shader,
+                    "vs_tiles",
+                    "fs_water_interp",
+                    COLOR_FORMAT,
+                    additive,
+                    &[],
+                    Some(light_stencil(true)),
+                )
+            })
+        });
         let interp = sc.spawn(|| {
             timed("éclairage différé : moyenne des voisins", || {
                 stencil_variant(
@@ -1502,6 +1607,11 @@ pub(crate) fn light_pipes(
                 interp: interp.join().expect("éclairage différé : moyenne"),
                 exact: exact.join().expect("éclairage différé : calcul exact"),
                 exact_hard: exact_hard.join().expect("éclairage différé : calcul exact"),
+                water_half: water_half.join().expect("lumières sur l'eau"),
+                water_half_hard: water_half_hard.join().expect("lumières sur l'eau"),
+                water_interp: water_interp.join().expect("lumières sur l'eau"),
+                water: water_exact.join().expect("lumières sur l'eau"),
+                water_hard: water_exact_hard.join().expect("lumières sur l'eau"),
             },
             arm.join().expect("pipeline du bras éclairé"),
         )
@@ -1899,6 +2009,51 @@ impl DynGpu {
                 ),
             ],
         });
+        let water_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lumières sur l'eau"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                tex_entry(
+                    5,
+                    wgpu::TextureSampleType::Uint,
+                    wgpu::TextureViewDimension::D2,
+                ),
+            ],
+        });
+        let water_interp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lumières sur l'eau : moyenne des voisins"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                tex_entry(
+                    4,
+                    wgpu::TextureSampleType::Uint,
+                    wgpu::TextureViewDimension::D2,
+                ),
+                tex_entry(
+                    5,
+                    wgpu::TextureSampleType::Uint,
+                    wgpu::TextureViewDimension::D2,
+                ),
+            ],
+        });
         let max_texture = device.limits().max_texture_dimension_2d;
         let mut g = Self {
             header,
@@ -1927,6 +2082,9 @@ impl DynGpu {
             def_bgl,
             interp_bgl,
             def_targets: None,
+            water_bgl,
+            water_interp_bgl,
+            water_groups: None,
             lights: Vec::new(),
             settings: DynSettings::default(),
             cache: ShadowCache::default(),
@@ -2527,6 +2685,154 @@ impl DynGpu {
     /// Des cartes d'ombre à calculer à cette image ?
     pub fn bake_pending(&self) -> bool {
         !self.jobs.is_empty() && self.bake_group.is_some() && self.atlas.is_some()
+    }
+
+    /// (v199) Lumières sur la face translucide de chaque pixel (eau, verre, glace), après la
+    /// passe des translucides : `water` est ce qu'elle a laissé (images du TAA de génération
+    /// `generation`), ajouté à `color` dans les cases éclairées, comme `encode_deferred` (un
+    /// pixel sur quatre, puis la moyenne des voisins ou le calcul exact, dans ses images à
+    /// elle, libres une fois l'opaque éclairé). `timestamps` : début et fin des deux passes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_water(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        world_group: &wgpu::BindGroup,
+        water: &wgpu::TextureView,
+        generation: u64,
+        color: &wgpu::TextureView,
+        pipes: &DeferredPipes,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        if self.rects.is_empty() || self.gpu_lights.is_empty() {
+            return;
+        }
+        // Images de l'éclairage de l'opaque (même génération : refaites avant, cette image).
+        let Some(t) = self
+            .def_targets
+            .as_ref()
+            .filter(|t| t.generation == generation)
+        else {
+            return;
+        };
+        if self
+            .water_groups
+            .as_ref()
+            .is_none_or(|g| g.generation != generation)
+        {
+            let rects = wgpu::BindGroupEntry {
+                binding: 3,
+                resource: self.rects_buf.as_entire_binding(),
+            };
+            let face = wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(water),
+            };
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lumières sur l'eau"),
+                layout: &self.water_bgl,
+                entries: &[rects.clone(), face.clone()],
+            });
+            let interp = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lumières sur l'eau : moyenne des voisins"),
+                layout: &self.water_interp_bgl,
+                entries: &[
+                    rects,
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&t.half_view),
+                    },
+                    face,
+                ],
+            });
+            self.water_groups = Some(WaterGroups {
+                generation,
+                group,
+                interp,
+            });
+        }
+        let Some(g) = &self.water_groups else {
+            return;
+        };
+        let soft = self.any_soft;
+        // Début dans la première passe, fin dans la seconde (une seule mesure pour les deux).
+        let (ts_half, ts_main) = match timestamps {
+            Some(ts) if self.half_now => (
+                Some(wgpu::RenderPassTimestampWrites {
+                    query_set: ts.query_set,
+                    beginning_of_pass_write_index: ts.beginning_of_pass_write_index,
+                    end_of_pass_write_index: None,
+                }),
+                Some(wgpu::RenderPassTimestampWrites {
+                    query_set: ts.query_set,
+                    beginning_of_pass_write_index: None,
+                    end_of_pass_write_index: ts.end_of_pass_write_index,
+                }),
+            ),
+            ts => (None, ts),
+        };
+        // 1. Un pixel sur quatre.
+        if self.half_now {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lumières sur l'eau : un pixel sur quatre"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.half_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: ts_half,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(if soft {
+                &pipes.water_half
+            } else {
+                &pipes.water_half_hard
+            });
+            pass.set_bind_group(0, world_group, &[]);
+            pass.set_bind_group(1, &g.group, &[]);
+            pass.draw(0..6, 0..self.rects.len() as u32);
+        }
+        // 2. La moyenne des voisins là où elle suffit (pochoir à 1), le calcul exact ailleurs.
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("lumières sur l'eau"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &t.stencil_view,
+                depth_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+            }),
+            timestamp_writes: ts_main,
+            occlusion_query_set: None,
+        });
+        pass.set_bind_group(0, world_group, &[]);
+        if self.half_now {
+            pass.set_stencil_reference(1);
+            pass.set_pipeline(&pipes.water_interp);
+            pass.set_bind_group(1, &g.interp, &[]);
+            pass.draw(0..6, 0..self.rects.len() as u32);
+        }
+        pass.set_stencil_reference(0);
+        pass.set_pipeline(if soft {
+            &pipes.water
+        } else {
+            &pipes.water_hard
+        });
+        pass.set_bind_group(1, &g.group, &[]);
+        pass.draw(0..6, 0..self.rects.len() as u32);
     }
 
     /// Éclairage différé : ajoute la lumière des lumières dynamiques à `color` (image du

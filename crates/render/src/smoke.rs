@@ -8,7 +8,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
-use crate::taa::{COLOR_FORMAT, MOTION_FORMAT};
+use crate::taa::{COLOR_FORMAT, MOTION_FORMAT, WATER_GB_FORMAT};
 use crate::DEPTH_FORMAT;
 
 /// Au plus autant de nuages dessinés à la fois.
@@ -162,8 +162,14 @@ impl Smokes {
                 blend: None,
                 write_mask: wgpu::ColorWrites::empty(),
             };
+            // (v199) Dans la passe des translucides : sa 3e cible (l'eau) n'est pas écrite.
+            let water = wgpu::ColorTargetState {
+                format: WATER_GB_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            };
             let targets: Vec<Option<wgpu::ColorTargetState>> = if taa {
-                vec![Some(color), Some(motion)]
+                vec![Some(color), Some(motion), Some(water)]
             } else {
                 vec![Some(color)]
             };

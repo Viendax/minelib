@@ -23,6 +23,8 @@ pub struct GpuTimes {
     pub vl_composite: f32,
     /// Éclairage différé d'un pixel sur quatre, à part du reste (`lights`).
     pub lights_half: f32,
+    /// (v199) Lumières sur l'eau, le verre et la glace.
+    pub water: f32,
     pub bake: f32,
     /// Du début de la scène à la fin de l'affichage, temps morts entre passes compris.
     pub span: f32,
@@ -43,6 +45,7 @@ impl GpuTimes {
             + self.volumetric
             + self.vl_composite
             + self.lights_half
+            + self.water
             + self.bake
     }
 
@@ -52,6 +55,7 @@ impl GpuTimes {
             ("translucides", self.after),
             ("lumières : un pixel sur quatre", self.lights_half),
             ("lumières", self.lights),
+            ("lumières sur l'eau", self.water),
             ("rayons", self.volumetric),
             ("recomposition des rayons", self.vl_composite),
             ("cartes d'ombre", self.bake),
@@ -216,8 +220,14 @@ pub fn gpu(t: GpuTimes) {
         let mut p = p.borrow_mut();
         p.gpu_last = Some(t);
         // La scène entière : opaques, translucides (passe à part) et lumières.
-        let scene =
-            t.scene + t.after + t.lights + t.lights_half + t.volumetric + t.vl_composite + t.bake;
+        let scene = t.scene
+            + t.after
+            + t.lights
+            + t.lights_half
+            + t.water
+            + t.volumetric
+            + t.vl_composite
+            + t.bake;
         p.gpu_smooth = Some(match p.gpu_smooth {
             Some(v) => v + (scene - v) * 0.02,
             None => scene,
@@ -230,6 +240,7 @@ pub fn gpu(t: GpuTimes) {
         p.window_gpu.0.volumetric += t.volumetric;
         p.window_gpu.0.vl_composite += t.vl_composite;
         p.window_gpu.0.lights_half += t.lights_half;
+        p.window_gpu.0.water += t.water;
         p.window_gpu.0.bake += t.bake;
         p.window_gpu.0.span += t.span;
         p.window_gpu.0.gap += t.gap;
