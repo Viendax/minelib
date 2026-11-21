@@ -121,7 +121,17 @@ setInterval(sr,500);sr();})();"#;
 /// soit ni lue ni corrigée pendant ce temps. Il lit, il ne touche à rien.
 const PUB_JS: &str = r#"(()=>{if(window.__minelib_pub)return;window.__minelib_pub=1;let x=-1;
 setInterval(()=>{const a=document.querySelector('.ad-showing')?1:0;
-if(a!==x){x=a;console.log('__minelib_pub__'+a);}},400);})();"#;
+if(a!==x){x=a;console.log('__minelib_pub__'+a);}},400);
+let v=null,mt=-1,rt=0,gel=0,perdues=-1;const D=m=>console.log('__minelib_diag__'+m);
+const suit=e=>{if(!e||e===v)return;v=e;['waiting','stalled','seeking','emptied','pause','play'].forEach(n=>e.addEventListener(n,()=>D(n+' a '+e.currentTime.toFixed(2))));};
+setInterval(()=>{suit(document.querySelector('video'));if(!v)return;const now=performance.now();
+if(v.paused||v.ended||v.readyState<3){mt=-1;gel=0;return;}
+const t=v.currentTime;if(mt>=0){const dr=now-rt,dm=(t-mt)*1000/(v.playbackRate||1);
+if(dm<dr*0.5&&dr>0){gel+=dr;}else{if(gel>=120)D('gel '+Math.round(gel)+' ms a '+t.toFixed(2));gel=0;}
+if(dm>dr+250)D('saut '+Math.round(dm-dr)+' ms a '+t.toFixed(2));}
+mt=t;rt=now;
+const q=v.getVideoPlaybackQuality&&v.getVideoPlaybackQuality();if(q){const p=q.droppedVideoFrames;
+if(perdues>=0&&p-perdues>=6)D('images perdues '+(p-perdues));perdues=p;}},100);})();"#;
 
 /// (v210) La page du lecteur des écrans, servie par le navigateur à `filtre::LECTEUR`.
 const LECTEUR_HTML: &str = include_str!("lecteur.html");
@@ -223,6 +233,9 @@ enum Cmd {
     /// (v213) Page précédente, page suivante (boutons retour et suivant de l'écran).
     Back(u32),
     Forward(u32),
+    /// (v214) Chromium demande à faire son travail dans tant de millisecondes (pas du jeu :
+    /// voir `Pompe`).
+    Pump(i64),
     Quit,
 }
 
@@ -379,6 +392,11 @@ wrap_display_handler! {
             } else if let Some(v) = text.strip_prefix("__minelib_scroll__") {
                 let flags = v.trim().parse::<u32>().unwrap_or(0) & 3;
                 push_event(&self.out, *b"MLBW", self.id, flags, Vec::new());
+                1
+            } else if let Some(d) = text.strip_prefix("__minelib_diag__") {
+                // (v214) Ce que voit le lecteur : gel du temps de la vidéo (le son s'arrête
+                // avec), saut, mise en mémoire, images perdues. Pour trouver les coupures.
+                eprintln!("{} onglet {} : lecteur : {d}", heure(), self.id);
                 1
             } else if let Some(v) = text.strip_prefix("__minelib_pub__") {
                 self.pub_.store(v.trim() == "1", Ordering::Relaxed);
@@ -833,9 +851,44 @@ wrap_resource_handler! {
     }
 }
 
+/// (v214) L'heure (UTC, à la milliseconde), comme le journal du jeu, pour comparer les deux.
+fn heure() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ms = d.as_millis() % 86_400_000;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
+}
+
 /// L'adresse d'une requête, en texte.
 fn url_de(request: &mut Request) -> String {
     CefString::from(&request.url()).to_string()
+}
+
+/// (v214) Où Chromium demande à faire son travail (voir `Pompe`) : le fil principal.
+static POMPE: std::sync::OnceLock<mpsc::Sender<Cmd>> = std::sync::OnceLock::new();
+
+wrap_browser_process_handler! {
+    // (v214) Chromium dit lui-même quand il a du travail (`external_message_pump`), au lieu
+    // d'être servi à un rythme fixe. Avant, la boucle le servait puis dormait 4 ms ; sous
+    // Windows, une attente de 4 ms dure souvent 15,6 ms (résolution par défaut de
+    // l'horloge), et l'image d'un écran tombait alors presque à zéro par moments (essai :
+    // 1806 images en 46 s avec 4 ms, 10 avec 16 ms) : les micro-coupures.
+    struct Pompe;
+
+    impl BrowserProcessHandler {
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            if let Some(tx) = POMPE.get() {
+                let _ = tx.send(Cmd::Pump(delay_ms));
+            }
+        }
+    }
 }
 
 wrap_app! {
@@ -844,6 +897,10 @@ wrap_app! {
     }
 
     impl App {
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(Pompe::new())
+        }
+
         fn on_before_command_line_processing(
             &self,
             _process_type: Option<&CefString>,
@@ -1075,9 +1132,22 @@ fn main() {
         std::process::exit(code);
     }
 
+    // (v214) Les commandes du jeu et les demandes de Chromium arrivent au fil principal par
+    // le même canal (voir `Pompe`) : créé avant que Chromium démarre.
+    let (tx, rx) = mpsc::channel();
+    let _ = POMPE.set(tx.clone());
+    // (v214) Horloge de Windows à la milliseconde pour ce programme : une attente demandée
+    // dure ce qu'elle doit.
+    #[cfg(windows)]
+    // SAFETY : appel Windows sans état partagé ; rendu par la fin du programme.
+    unsafe {
+        let _ = windows::Win32::Media::timeBeginPeriod(1);
+    }
+
     let mut settings = Settings {
         no_sandbox: 1,
         windowless_rendering_enabled: 1,
+        external_message_pump: 1,
         persist_session_cookies: if opts.sans_compte { 0 } else { 1 },
         locale: CefString::from("fr"),
         log_severity: LogSeverity::from(sys::cef_log_severity_t::LOGSEVERITY_WARNING),
@@ -1111,7 +1181,6 @@ fn main() {
         std::thread::spawn(move || send_out(out))
     };
     // Commandes du jeu (fin de l'entrée : le jeu est fermé).
-    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -1148,11 +1217,29 @@ fn main() {
     // Boucle de Chromium sur ce fil (le fil « UI » de CEF) : les commandes y sont jouées.
     let mut tabs: HashMap<u32, Tab> = HashMap::new();
     let left = MouseButtonType::from(sys::cef_mouse_button_type_t::MBT_LEFT);
+    // (v214) Prochain moment où Chromium veut travailler. Filet : au moins toutes les
+    // `FILET` même sans demande (ce que CEF conseille).
+    const FILET: Duration = Duration::from_millis(33);
+    let mut next: Option<Instant> = Some(Instant::now());
     'run: loop {
-        do_message_loop_work();
-        while let Ok(cmd) = rx.try_recv() {
+        let wait = next
+            .map_or(FILET, |n| n.saturating_duration_since(Instant::now()))
+            .min(FILET);
+        let first = match rx.recv_timeout(wait) {
+            Ok(cmd) => Some(cmd),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break 'run,
+        };
+        if first.is_none() && next.is_none() {
+            next = Some(Instant::now());
+        }
+        for cmd in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match cmd {
                 Cmd::Quit => break 'run,
+                Cmd::Pump(ms) => {
+                    let at = Instant::now() + Duration::from_millis(ms.max(0) as u64);
+                    next = Some(next.map_or(at, |n| n.min(at)));
+                }
                 // (v205) Une adresse refusée n'arrive même pas à Chromium : le jeu le
                 // sait tout de suite, l'onglet ne bouge pas, et un onglet neuf ne s'ouvre
                 // pas du tout.
@@ -1225,6 +1312,7 @@ fn main() {
                 }
                 Cmd::Fps(id, fps) => {
                     let fps = fps.clamp(1, MAX_FPS);
+                    eprintln!("{} onglet {id} : {fps} images/s", heure());
                     if let Some(t) = tabs.get(&id) {
                         t.host.set_windowless_frame_rate(fps);
                     }
@@ -1251,7 +1339,10 @@ fn main() {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(4));
+        if next.is_some_and(|n| n <= Instant::now()) {
+            next = None;
+            do_message_loop_work();
+        }
     }
 
     // Fermeture : les onglets se ferment, puis CEF.
