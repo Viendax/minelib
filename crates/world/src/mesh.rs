@@ -36,7 +36,8 @@ pub const TEX_LOCAL_UV: u32 = 1 << 13;
 /// une texture surtout transparente (torche). Avec les mipmaps, de loin, la moyenne des
 /// pixels devient transparente et le modèle disparaît, sauf quelques bords.
 pub const TEX_SHARP: u32 = 1 << 14;
-/// Face vue des deux côtés (surface de l'eau et de la lave, vue d'en dessous).
+/// Face vue des deux côtés (surface de l'eau et de la lave, vue d'en dessous ; (v218) pas
+/// leurs côtés).
 pub const TEX_TWO_SIDED: u32 = 1 << 15;
 
 /// Pixels pleins de chaque couche de texture, sur une grille de 16 × 16 (ligne `v`, bit
@@ -2040,8 +2041,11 @@ fn mesh_block(
                     } else {
                         face_tex(id, face as u32)
                     };
-                    // Échafaudage : on voit aussi l'intérieur de ses côtés.
-                    let tex = if fluid_here.is_some() || def.key == "scaffolding" {
+                    // Échafaudage : on voit aussi l'intérieur de ses côtés. Fluides : (v218)
+                    // seulement le dessus, la surface qu'on voit d'en dessous. Leurs côtés vus de
+                    // dos s'ajoutaient à ceux de devant : dans une chute d'eau, on voyait au
+                    // travers les faces du fond de chaque étage, une « surface » par bloc.
+                    let tex = if (fluid_here.is_some() && face == 2) || def.key == "scaffolding" {
                         tex | TEX_TWO_SIDED
                     } else {
                         tex

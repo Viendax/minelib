@@ -544,6 +544,24 @@ mod tests {
         w.set(6, 10, 8, BlockId::WATER);
         run(&mut w, &mut fl, 2.0);
         assert_eq!(w.get(5, 10, 8), BlockId::WATER, "source infinie");
+        // (v218) Elle ne disparaît pas quand on retire les deux autres.
+        w.set(4, 10, 8, BlockId::AIR);
+        w.set(6, 10, 8, BlockId::AIR);
+        run(&mut w, &mut fl, 4.0);
+        assert_eq!(w.get(5, 10, 8), BlockId::WATER, "la nouvelle source reste");
+        // (v218) Sur un sol à découvert aussi (pas seulement dans une rigole), et entre deux
+        // sources posées l'une après l'autre.
+        let mut w = world();
+        let mut fl = Fluids::default();
+        w.set(4, 10, 4, BlockId::WATER);
+        run(&mut w, &mut fl, 3.0);
+        w.set(6, 10, 4, BlockId::WATER);
+        run(&mut w, &mut fl, 3.0);
+        assert_eq!(w.get(5, 10, 4), BlockId::WATER, "source infinie à découvert");
+        w.set(4, 10, 4, BlockId::AIR);
+        w.set(6, 10, 4, BlockId::AIR);
+        run(&mut w, &mut fl, 4.0);
+        assert_eq!(w.get(5, 10, 4), BlockId::WATER, "elle reste à découvert");
         // Lave source touchée par l'eau : obsidienne ; lave qui coule : pierre taillée.
         let mut w = world();
         let mut fl = Fluids::default();

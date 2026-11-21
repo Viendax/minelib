@@ -156,7 +156,11 @@ fn fs_taa(i: VOut) -> TaaOut {
 }
 
 // Le reste (têtes des cartes, autres joueurs, bombe, armes au sol) : fixé dans le monde,
-// il bouge à l'écran comme les blocs (sinon l'anticrénelage le fait traîner).
+// il bouge à l'écran comme les blocs (sinon l'anticrénelage le fait traîner). (v218) Plus un
+// cinquantième de pixel (rien pour la reprojection) : ces modèles bougent souvent eux-mêmes
+// (objets lâchés qui tombent, flottent et tournent), sans vecteur de mouvement à eux ;
+// l'anticrénelage les traite comme près d'un objet qui bouge (bornes serrées, et l'endroit
+// marqué pour les images suivantes) : plus de traînée derrière un objet lâché.
 @fragment
 fn fs_taa_world(i: VOut) -> TaaOut {
     let n = face_normal(i.world);
@@ -164,5 +168,5 @@ fn fs_taa_world(i: VOut) -> TaaOut {
     let cur = g.cur_view_proj * p;
     let prev = g.prev_view_proj * p;
     let d = prev.xy / prev.w - cur.xy / cur.w;
-    return taa_out(i, n, d * vec2<f32>(0.5, -0.5) * g.screen.xy);
+    return taa_out(i, n, d * vec2<f32>(0.5, -0.5) * g.screen.xy + vec2<f32>(0.02, 0.0));
 }
