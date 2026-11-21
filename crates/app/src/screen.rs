@@ -877,9 +877,17 @@ impl Displays {
 /// longueur en `u` vaut 16/9 de la même en `v`.
 const BOUTON: ([f32; 2], f32) = ([0.030, 0.947], 0.022);
 
-/// Autour du bouton, de quoi le faire apparaître : sa surface et un peu plus (le coin en
-/// bas à gauche de l'écran est dedans). Ailleurs sur l'écran, il s'en va.
+/// Autour du bouton (en rayons du bouton) : sa surface et un peu plus. Arrivé là, il est
+/// tout à fait visible ; dès qu'on en sort, il s'en va.
 const ZONE: f32 = 2.3;
+
+/// (v207) Le coin, en rayons du bouton : là où l'on peut entrer sur l'écran par le bord et
+/// glisser vers le bouton, qui apparaît de plus en plus en approchant.
+const COIN: f32 = 6.0;
+
+/// (v207) Bande du bord par laquelle il faut entrer sur l'écran (fraction de l'écran) : un
+/// réticule qui arrive de l'extérieur, même vite, tombe d'abord tout près du bord.
+const BORD: f32 = 0.08;
 
 /// Temps pour apparaître et pour disparaître (secondes) : un glissement lent suffit, et
 /// un passage rapide dans le coin ne le fait pas clignoter.
@@ -907,9 +915,62 @@ pub fn on_search_button(uv: [f32; 2]) -> bool {
     to_button(uv) <= BOUTON.1
 }
 
-/// Le réticule est-il assez près du bouton pour le faire apparaître ?
+/// Le réticule est-il dans la zone du bouton (sa surface et un peu autour) ?
 pub fn near_search_button(uv: [f32; 2]) -> bool {
     to_button(uv) <= BOUTON.1 * ZONE
+}
+
+/// (v207) Comment le bouton de recherche se montre. Demande du joueur : il n'apparaît
+/// **que si l'on arrive d'un glissement depuis le bord de l'écran**, dans le coin en bas à
+/// gauche, vers le bouton — pas si l'on est déjà sur l'écran et qu'on descend dans le coin.
+/// Il apparaît de plus en plus en approchant, est tout à fait visible sur lui et un peu
+/// autour, et s'en va dès qu'on en sort ; pour le revoir, il faut ressortir de l'écran et
+/// revenir par le bord.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Corner {
+    /// Entré sur l'écran par le bord, dans le coin, et pas reparti ailleurs depuis.
+    armed: bool,
+    /// Déjà arrivé sur le bouton (ou tout près) depuis cette entrée.
+    reached: bool,
+    /// Le réticule était sur l'écran à l'image d'avant.
+    was_on: bool,
+}
+
+impl Corner {
+    /// L'apparition voulue (0 à 1) pour ce point du réticule (`None` : pas sur l'écran).
+    fn target(&mut self, cursor: Option<[f32; 2]>) -> f32 {
+        let entered = !self.was_on;
+        self.was_on = cursor.is_some();
+        let Some(uv) = cursor else {
+            self.armed = false;
+            self.reached = false;
+            return 0.0;
+        };
+        let d = to_button(uv);
+        let r = BOUTON.1;
+        if entered {
+            // On arrive sur l'écran : par le bord gauche ou par le bas, et dans le coin.
+            let par_le_bord = uv[0] <= BORD || uv[1] >= 1.0 - BORD;
+            self.armed = par_le_bord && d <= r * COIN;
+            self.reached = false;
+        }
+        if !self.armed {
+            return 0.0;
+        }
+        if d <= r * ZONE {
+            self.reached = true;
+            return 1.0;
+        }
+        // Sorti de la zone après y être arrivé, ou parti hors du coin en chemin : il s'en
+        // va, et il faudra revenir par le bord.
+        if self.reached || d > r * COIN {
+            self.armed = false;
+            self.reached = false;
+            return 0.0;
+        }
+        // En chemin depuis le bord : de plus en plus visible en approchant.
+        1.0 - (d - r * ZONE) / (r * (COIN - ZONE))
+    }
 }
 
 /// Ce qu'affiche un écran.
@@ -937,9 +998,10 @@ struct Tab {
     loading: bool,
     /// La page peut défiler sous le curseur : vers le haut (1), vers le bas (2).
     scroll: u8,
-    /// (v206) Apparition du bouton de recherche, de 0 à 1 : elle monte quand le réticule
-    /// est dans le coin en bas à gauche, autour du bouton, et redescend sinon.
+    /// (v206) Apparition du bouton de recherche, de 0 à 1, et (v207) ce qui la commande :
+    /// une arrivée par le bord, dans le coin en bas à gauche (voir `Corner`).
     reveal: f32,
+    corner: Corner,
     /// Page voulue ouverte (sinon en veille : dernière image assombrie) et images par
     /// seconde voulues (voir `Displays::schedule`) ; page ouverte dans le navigateur et
     /// images par seconde qui lui ont été demandées.
@@ -970,6 +1032,7 @@ impl Tab {
             loading: false,
             scroll: 0,
             reveal: 0.0,
+            corner: Corner::default(),
             want_awake: true,
             want_fps: FPS_DEFAULT,
             opened: false,
@@ -982,11 +1045,9 @@ impl Tab {
     }
 
     fn update(&mut self, dt: f32) {
-        // (v206) Le bouton de recherche apparaît et disparaît en fondu.
-        let vers = f32::from(
-            self.cursor
-                .is_some_and(near_search_button),
-        );
+        // (v206) Le bouton de recherche apparaît et disparaît en fondu ; (v207) seulement
+        // quand on arrive par le bord de l'écran, dans son coin (voir `Corner`).
+        let vers = self.corner.target(self.cursor);
         let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
         let avant = self.reveal;
         self.reveal = if vers > self.reveal {
@@ -1512,45 +1573,101 @@ mod tests {
         assert!(c[1] > 0.5);
     }
 
-    /// (v206) Il se montre quand le réticule arrive dans son coin, en glissant même
-    /// lentement, et s'en va dès qu'on va ailleurs sur l'écran.
-    #[test]
-    fn the_search_button_shows_up_in_its_corner_and_fades_away_elsewhere() {
-        let (c, r) = BOUTON;
-        let mut t = Tab::new("x");
-        assert_eq!(t.reveal, 0.0);
-        // Le coin lui-même fait apparaître le bouton.
-        assert!(near_search_button([0.0, 1.0]));
-        assert!(near_search_button(c));
-        assert!(near_search_button([c[0] + r * (ZONE - 0.2), c[1]]));
-        assert!(!near_search_button([c[0] + r * (ZONE + 0.2), c[1]]));
-        assert!(!near_search_button([0.5, 0.5]));
-        // Un glissement lent depuis le coin : il monte jusqu'au bout.
-        t.cursor = Some([0.0, 1.0]);
-        for _ in 0..40 {
+    /// Le réticule glisse de `de` à `vers` en `n` images (une image : 16 ms), puis y reste
+    /// `pause` images.
+    fn glide(t: &mut Tab, de: [f32; 2], vers: [f32; 2], n: usize, pause: usize) {
+        for k in 0..=n {
+            let a = k as f32 / n.max(1) as f32;
+            t.cursor = Some([de[0] + (vers[0] - de[0]) * a, de[1] + (vers[1] - de[1]) * a]);
             t.update(0.016);
         }
-        assert!(t.reveal > 0.99, "{}", t.reveal);
-        // Il faut qu'il soit visible pour prendre le clic.
-        assert!(t.reveal >= CLIQUABLE);
-        // On part ailleurs : il s'en va, et il ne prend plus le clic en route.
-        t.cursor = Some([0.5, 0.5]);
-        t.update(0.016);
-        assert!(t.reveal < 1.0 && t.reveal > 0.9, "{}", t.reveal);
-        for _ in 0..40 {
+        for _ in 0..pause {
             t.update(0.016);
         }
-        assert_eq!(t.reveal, 0.0);
-        // Un passage éclair dans le coin ne le rend pas cliquable.
-        t.cursor = Some(c);
-        t.update(0.016);
-        assert!(t.reveal < CLIQUABLE, "{}", t.reveal);
-        // Sans réticule sur l'écran, il reste caché.
+    }
+
+    fn leave(t: &mut Tab) {
         t.cursor = None;
         for _ in 0..40 {
             t.update(0.016);
         }
+    }
+
+    /// (v207) Il ne se montre que si l'on arrive sur l'écran **par son bord**, dans le coin
+    /// en bas à gauche, et qu'on glisse vers lui — même lentement.
+    #[test]
+    fn the_search_button_shows_up_when_sliding_in_from_the_edge_of_its_corner() {
+        let (c, _) = BOUTON;
+        // Par le bord gauche, lentement (une seconde et demie de glissement).
+        let mut t = Tab::new("x");
+        glide(&mut t, [0.0, 0.80], c, 90, 30);
+        assert!(t.reveal > 0.99, "{}", t.reveal);
+        assert!(t.reveal >= CLIQUABLE);
+        // Par le bas, vite.
+        let mut t = Tab::new("x");
+        glide(&mut t, [0.10, 1.0], c, 6, 30);
+        assert!(t.reveal > 0.99, "{}", t.reveal);
+        // Au milieu du chemin, il est déjà là mais pas tout à fait.
+        let mut t = Tab::new("x");
+        let milieu = [0.06, 0.82];
+        glide(&mut t, [0.0, 0.76], milieu, 20, 40);
+        assert!(t.reveal > 0.05 && t.reveal < 0.95, "{}", t.reveal);
+    }
+
+    /// (v207) Déjà sur l'écran, descendre dans le coin ne le fait pas apparaître ; entrer
+    /// par un bord loin du coin non plus.
+    #[test]
+    fn the_search_button_stays_hidden_when_already_on_the_screen() {
+        let (c, _) = BOUTON;
+        let mut t = Tab::new("x");
+        glide(&mut t, [0.5, 0.5], c, 60, 40);
         assert_eq!(t.reveal, 0.0);
+        // Même en tournant dans le coin.
+        glide(&mut t, c, [0.0, 1.0], 20, 20);
+        glide(&mut t, [0.0, 1.0], c, 20, 20);
+        assert_eq!(t.reveal, 0.0);
+        // Par le bord gauche, mais en haut de l'écran : pas son coin.
+        let mut t = Tab::new("x");
+        glide(&mut t, [0.0, 0.3], c, 60, 40);
+        assert_eq!(t.reveal, 0.0);
+        // Par le bord droit, en bas : pas son coin non plus.
+        let mut t = Tab::new("x");
+        glide(&mut t, [1.0, 0.95], c, 60, 40);
+        assert_eq!(t.reveal, 0.0);
+    }
+
+    /// (v207) Une fois là, il s'en va dès qu'on sort de sa zone, et pour le revoir il faut
+    /// ressortir de l'écran et revenir par le bord.
+    #[test]
+    fn the_search_button_fades_away_elsewhere_and_needs_a_new_entry() {
+        let (c, r) = BOUTON;
+        let mut t = Tab::new("x");
+        glide(&mut t, [0.0, 0.85], c, 30, 30);
+        assert!(t.reveal > 0.99);
+        // Un peu autour du bouton : il reste.
+        glide(&mut t, c, [c[0] + r * (ZONE - 0.3), c[1]], 10, 20);
+        assert!(t.reveal > 0.99, "{}", t.reveal);
+        // On sort de sa zone, sans quitter l'écran : il s'en va en fondu.
+        glide(&mut t, [c[0] + r * (ZONE - 0.3), c[1]], [0.3, 0.6], 10, 0);
+        assert!(t.reveal < 1.0, "{}", t.reveal);
+        for _ in 0..40 {
+            t.update(0.016);
+        }
+        assert_eq!(t.reveal, 0.0);
+        // Revenir dessus sans quitter l'écran : il ne revient pas.
+        glide(&mut t, [0.3, 0.6], c, 30, 30);
+        assert_eq!(t.reveal, 0.0);
+        // Ressortir de l'écran puis revenir par le bord : il revient.
+        leave(&mut t);
+        glide(&mut t, [0.0, 0.85], c, 30, 30);
+        assert!(t.reveal > 0.99, "{}", t.reveal);
+        // Un passage éclair par le bord ne le rend pas cliquable.
+        leave(&mut t);
+        t.cursor = Some([0.0, 0.95]);
+        t.update(0.016);
+        t.cursor = Some(c);
+        t.update(0.016);
+        assert!(t.reveal < CLIQUABLE, "{}", t.reveal);
     }
     use super::*;
 
