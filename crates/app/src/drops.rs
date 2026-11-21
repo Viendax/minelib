@@ -248,6 +248,32 @@ impl Items {
         }
     }
 
+    /// (v217) Les Foudres de Zeus posées au sol près de `cam` : où dessiner l'éclair de
+    /// chacune (son pied) et son décalage (chacune vit à son rythme). Mêmes places que
+    /// `build`.
+    pub fn bolts(&self, cam: Vec3) -> Vec<(Vec3, f32)> {
+        let t = self.start.elapsed().as_secs_f32();
+        let mut out = Vec::new();
+        for (id, d) in self.view.live_drops() {
+            let rest = Vec3::from(d.pos);
+            if rest.distance_squared(cam) > 64.0 * 64.0
+                || Item::from_code(d.pile.item) != Some(Item::Zeus)
+            {
+                continue;
+            }
+            let phase = (id % 628) as f32 / 100.0;
+            let mut at = rest + Vec3::Y * (0.12 + 0.06 * (t * 2.0 + phase).sin());
+            if let Some((born, Some(from), _)) = self.born.get(&id) {
+                let k = born.elapsed().as_secs_f32() / FLIGHT;
+                if k < 1.0 {
+                    at = from.lerp(at, k) + Vec3::Y * 1.2 * k * (1.0 - k);
+                }
+            }
+            out.push((at, phase));
+        }
+        out
+    }
+
     /// (v185) Solo : un objet dans l'eau remonte à sa surface et suit le courant (arrêté par
     /// les murs), descend les chutes d'eau ; sorti de l'eau (elle a séché, il est arrivé au
     /// bout), il retombe au sol. En ligne, l'arbitre ne fait pas couler l'eau : les objets
@@ -350,28 +376,9 @@ fn emit_ground_item(out: &mut Vec<EntityVertex>, xf: Mat4, item: Item, light: [f
                 * Mat4::from_translation(Vec3::new(-0.5, -6.7 / 16.0, -0.5));
             crate::player_model::emit_flashlight_item(out, lying, false, light);
         }
-        // (v216) Foudre de Zeus : un petit éclair en zigzag, lumineux, debout.
-        Item::Zeus => {
-            let pts = [
-                Vec3::new(0.08, 0.5, 0.0),
-                Vec3::new(-0.07, 0.27, 0.0),
-                Vec3::new(0.05, 0.25, 0.0),
-                Vec3::new(-0.08, 0.02, 0.0),
-            ];
-            for w in pts.windows(2) {
-                let d = w[1] - w[0];
-                let bar =
-                    xf * Mat4::from_translation(w[0]) * Mat4::from_rotation_z(-d.x.atan2(d.y));
-                crate::player_model::emit_item(
-                    out,
-                    bar,
-                    [-0.022, -0.01, -0.022],
-                    [0.022, d.length() + 0.01, 0.022],
-                    RayBoxKind::Glow(ZEUS_GLOW),
-                    light,
-                );
-            }
-        }
+        // (v216) Foudre de Zeus. (v217) Rien de solide : c'est le vrai éclair, dessiné à part
+        // (voir `Items::bolts`).
+        Item::Zeus => {}
         _ => {
             let h = BLOCK_SIZE / 2.0;
             crate::player_model::emit_item(

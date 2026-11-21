@@ -26,8 +26,10 @@ struct Globals {
 @group(1) @binding(0) var scene_depth: texture_depth_2d;
 
 struct Seg {
-    // Extrémités : dans le monde (xyz, w ignoré) ou déjà à l'écran (clip space) selon
-    // `misc.w`.
+    // Extrémités : dans le monde (xyz) ou déjà à l'écran (clip space) selon `misc.w`.
+    // (v217) Dans le monde, `a.w` dit ce qu'est le segment devant la couche de nuages :
+    // 1 = un éclair (les nuages le cachent une fois qu'il y est entré), 2 = sa lueur dans
+    // le nuage (large et douce, visible seulement là où il y a du nuage).
     @location(0) a: vec4<f32>,
     @location(1) b: vec4<f32>,
     // rgb = teinte du halo, a = force à l'extrémité a.
@@ -47,6 +49,10 @@ struct VOut {
     @location(2) @interpolate(flat) seg: vec3<f32>,
     // Position à l'écran (−1 … 1), pour lire la profondeur du monde.
     @location(3) @interpolate(linear) ndc: vec2<f32>,
+    // (v217) x, y = hauteur des extrémités a et b au-dessus de la caméra, sur la planète
+    // des nuages (blocs) ; z = 0 : pas de nuages devant (segment à l'écran), 1 : éclair,
+    // 2 : lueur dans le nuage.
+    @location(4) @interpolate(flat) cloud: vec3<f32>,
 };
 
 /// Plus près que ça de l'œil (w), un bout de segment est ramené devant.
@@ -56,6 +62,9 @@ const MIN_PX: f32 = 1.3;
 /// Le rectangle dépasse d'autant les deux bouts du segment (en demi-largeurs) : le halo
 /// d'un bout de segment s'arrondit au-delà de lui.
 const CAP: f32 = 1.0;
+/// Rayon de la caméra sur la planète des nuages, à peu près (blocs ; il ne sert qu'à la
+/// courbure de la couche au loin : voir `sky.rs`, `PLANET`).
+const SHELL: f32 = 20300.0;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, s: Seg) -> VOut {
@@ -75,6 +84,7 @@ fn place(vi: u32, s: Seg, view_proj: mat4x4<f32>) -> VOut {
     o.color = s.color.rgb;
     o.seg = vec3<f32>(0.0);
     o.ndc = vec2<f32>(0.0);
+    o.cloud = vec3<f32>(0.0);
     let screen = s.misc.w > 0.5;
     var a = s.a;
     var b = s.b;
@@ -85,6 +95,14 @@ fn place(vi: u32, s: Seg, view_proj: mat4x4<f32>) -> VOut {
     if !screen {
         a = view_proj * vec4<f32>(s.a.xyz, 1.0);
         b = view_proj * vec4<f32>(s.b.xyz, 1.0);
+        // Hauteur sur la planète des nuages : la couche descend vers l'horizon.
+        let va = s.a.xyz - g.cam_pos.xyz;
+        let vb = s.b.xyz - g.cam_pos.xyz;
+        o.cloud = vec3<f32>(
+            va.y + dot(va.xz, va.xz) / (2.0 * SHELL),
+            vb.y + dot(vb.xz, vb.xz) / (2.0 * SHELL),
+            select(1.0, 2.0, s.a.w > 1.5),
+        );
     }
     // Derrière l'œil : rien, ou le bout qui dépasse ramené devant.
     if a.w < NEAR_W && b.w < NEAR_W {
@@ -162,9 +180,52 @@ fn glow(i: VOut) -> vec3<f32> {
     return c * edge * force;
 }
 
+/// Direction du regard pour ce point de l'écran, tirée des lignes de la matrice `m` (ni
+/// inversion de matrice ni soustraction de la position de la caméra : voir `sky_dir`,
+/// world.wgsl).
+fn pixel_dir(ndc: vec2<f32>, m: mat4x4<f32>) -> vec3<f32> {
+    let rx = vec3<f32>(m[0][0], m[1][0], m[2][0]);
+    let ry = vec3<f32>(m[0][1], m[1][1], m[2][1]);
+    let rw = vec3<f32>(m[0][3], m[1][3], m[2][3]);
+    let d = cross(rx - ndc.x * rw, ry - ndc.y * rw);
+    return normalize(d * select(-1.0, 1.0, dot(rw, d) >= 0.0));
+}
+
+/// (v217) L'éclair devant ou dans la couche de nuages. Sous leur base, on le voit en
+/// entier. Une fois entré dans la couche, les nuages de ce côté du ciel le cachent : il
+/// reste visible par les trouées, et là où il y a du nuage c'est sa lueur, large et douce,
+/// qui éclaire le nuage de l'intérieur.
+fn bolt_light(i: VOut, m: mat4x4<f32>) -> vec3<f32> {
+    let mode = i.cloud.z;
+    if mode < 0.5 {
+        return glow(i);
+    }
+    let k = clamp(i.at.x / max(i.seg.x, 1e-5), 0.0, 1.0);
+    // Hauteur dans la couche : 0 à sa base … 1 à son sommet.
+    let thick = max(sky.cloud_geo.w, 1.0);
+    let base = sky.cloud_geo.y - 0.4 * thick;
+    let h = (sky.cloud_geo.x + mix(i.cloud.x, i.cloud.y, k) - base) / thick;
+    if mode < 1.5 {
+        if h <= 0.0 {
+            return glow(i);
+        }
+        let open = clouds(pixel_dir(i.ndc, m)).a;
+        return glow(i) * mix(1.0, open, smoothstep(0.0, 0.3, h));
+    }
+    if h <= -0.06 {
+        return vec3<f32>(0.0);
+    }
+    let cloudy = 1.0 - clouds(pixel_dir(i.ndc, m)).a;
+    let y = i.at.y;
+    let edge = (1.0 - y * y) * (1.0 - y * y);
+    let force = mix(i.seg.y, i.seg.z, k);
+    let soft = line_light(i.at.x, y, i.seg.x, 0.6);
+    return (i.color * 0.8 + vec3<f32>(0.2)) * soft * edge * force * cloudy * smoothstep(-0.06, 0.2, h);
+}
+
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(glow(i), 0.0);
+    return vec4<f32>(bolt_light(i, g.view_proj), 0.0);
 }
 
 /// Ce pixel de l'éclair est-il derrière le monde ? (Profondeur inversée : plus grand =
@@ -180,5 +241,5 @@ fn fs_post(i: VOut) -> @location(0) vec4<f32> {
     if behind_world(i.ndc, i.clip.z) {
         discard;
     }
-    return vec4<f32>(glow(i), 0.0);
+    return vec4<f32>(bolt_light(i, g.cur_view_proj), 0.0);
 }

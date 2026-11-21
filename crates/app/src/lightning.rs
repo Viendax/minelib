@@ -6,7 +6,7 @@
 //! foudre du ciel, l'éclair tenu en main et ses étincelles ont la même lumière.
 
 use glam::{Mat4, Vec3};
-use minelib_render::{BoltSeg, BOLT_TINT};
+use minelib_render::{BoltSeg, BOLT, BOLT_CLOUD_GLOW, BOLT_TINT};
 
 /// Dégâts de la foudre, comme dans Minecraft : 5 points de vie (deux cœurs et demi) à ce
 /// qui se trouve dans la boîte de l'éclair : 3 blocs autour du point frappé, de 3 blocs
@@ -16,8 +16,35 @@ pub const DAMAGE_REACH: f32 = 3.0;
 pub const DAMAGE_BELOW: f32 = 3.0;
 pub const DAMAGE_ABOVE: f32 = 9.0;
 
-/// Longueur de l'éclair tenu en main (blocs) : la moitié de la taille du joueur (1,8).
-pub const HELD_LEN: f32 = 0.9;
+/// Longueur de l'éclair tenu en main (blocs). (v217) 40 % plus grand qu'avant (0,9, la
+/// moitié de la taille du joueur) : tout l'éclair grandit d'autant (`HELD_SCALE`), ses
+/// arcs, son halo et ses étincelles compris.
+pub const HELD_SCALE: f32 = 1.4;
+pub const HELD_LEN: f32 = 0.9 * HELD_SCALE;
+/// Son halo ne grossit pas autant que lui : il resterait un trait fin.
+const HELD_HALO: f32 = 1.15;
+
+/// (v217) Teinte du halo d'un éclair : le bleu de la foudre, tiré vers le violet de `k`
+/// (0 … 1). Le cœur reste blanc : ce ne sont que des touches, d'un morceau à l'autre.
+fn tint(k: f32) -> [f32; 3] {
+    const VIOLET: [f32; 3] = [0.68, 0.4, 1.0];
+    let k = k.clamp(0.0, 1.0);
+    [0, 1, 2].map(|i| BOLT_TINT[i] + (VIOLET[i] - BOLT_TINT[i]) * k)
+}
+
+/// Tirage fixe (0 … 1) d'un morceau d'éclair, pour sa teinte.
+fn shade(n: usize, seed: u32) -> f32 {
+    let mut h = (n as u32).wrapping_mul(0x9e37_79b9) ^ seed.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    ((h >> 8) & 0xffff) as f32 / 65535.0
+}
+
+/// (v217) Demi-largeur du halo d'un éclair au plus, en part de sa distance à l'œil (soit à
+/// l'écran) : de près, la foudre reste un trait fin et vif, comme l'éclair tenu en main.
+const NEAR_WIDTH: f32 = 0.03;
+/// En deçà (blocs), le canal a aussi ses filaments et ses arcs courts.
+const DETAIL_REACH: f32 = 70.0;
 
 /// Tirages au sort reproductibles (la forme d'un éclair ne dépend que de sa graine).
 #[derive(Clone, Debug)]
@@ -98,13 +125,35 @@ struct Piece {
     /// Le long d'une branche : 1 à sa naissance … 0 à sa pointe.
     ta: f32,
     tb: f32,
+    /// Largeur du halo en `a` et en `b`, par rapport à celle d'un éclair lointain (un
+    /// éclair qui part de la main est fin près d'elle).
+    wa: f32,
+    wb: f32,
+}
+
+/// (v217) Sortes d'éclairs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Du nuage au sol : la foudre qui tombe.
+    Ground,
+    /// De la main vers le ciel (Foudre de Zeus, `/thor` en visant le ciel) : il monte,
+    /// entre dans les nuages et les traverse.
+    Sky,
+    /// Dans les nuages pendant l'orage : il court sous leur base et dedans, sans tomber.
+    Cloud,
 }
 
 /// Un coup de foudre.
 #[derive(Clone, Debug)]
 pub struct Strike {
-    /// Point frappé.
+    pub kind: Kind,
+    /// Altitude (monde) de la base des nuages là où il passe : au-dessus, il éclaire le
+    /// nuage de l'intérieur.
+    cloud_base: f32,
+    /// Point frappé (`Ground`), d'où il part (`Sky`), ou son milieu (`Cloud`).
     pub pos: Vec3,
+    /// Côté du ciel vers lequel il va (x, z ; unitaire ou nul).
+    pub heading: Vec3,
     /// Temps avant qu'il parte (s), puis son âge.
     pub delay: f32,
     pub age: f32,
@@ -127,6 +176,68 @@ impl Strike {
         let lean = rng.dir() * Vec3::new(1.0, 0.0, 1.0) * (height * rng.range(0.1, 0.4));
         let top = pos + Vec3::new(lean.x, height, lean.z);
         let main = jagged(top, pos, 7, 0.34, &mut rng);
+        Self::build(Kind::Ground, main, pos, pos.y + height, seed, delay, rng)
+    }
+
+    /// (v217) Éclair qui part de `from` (la main) dans la direction `dir` et monte dans
+    /// les nuages : il entre par leur base (à l'altitude `cloud_base` au-dessus de lui) et
+    /// traverse la couche, épaisse de `thick` blocs.
+    pub fn up(from: Vec3, dir: Vec3, seed: u32, cloud_base: f32, thick: f32) -> Self {
+        let mut rng = Rng::new(seed as u64 | 0x52_0000_0000);
+        let dir = dir.normalize_or(Vec3::Y);
+        // Jusqu'au haut de la couche ; presque à l'horizontale, il se perd au loin.
+        let rise = (cloud_base - from.y).max(40.0) + thick * rng.range(0.7, 0.95);
+        let len = (rise / dir.y.max(0.05)).min(1600.0);
+        // Par tronçons de plus en plus longs : vu de son départ, le canal doit être brisé
+        // fin tout près (sinon son premier morceau barrerait l'écran d'un trait droit) et
+        // rester du côté où l'on vise ; il s'écarte davantage en montant.
+        let side = |rng: &mut Rng, along: f32| {
+            let r = rng.dir();
+            (r - dir * r.dot(dir)) * (along * 0.07)
+        };
+        let mut main = vec![from];
+        let mut at = 0.0;
+        for (reach, levels) in [(3.0f32, 4u32), (20.0, 5), (110.0, 5), (len.max(130.0), 6)] {
+            let reach = reach.min(len);
+            if reach <= at {
+                continue;
+            }
+            let a = main[main.len() - 1];
+            let b = from + dir * reach + side(&mut rng, reach);
+            main.pop();
+            main.extend(jagged(a, b, levels, 0.2, &mut rng));
+            at = reach;
+        }
+        Self::build(Kind::Sky, main, from, cloud_base, seed, 0.0, rng)
+    }
+
+    /// (v217) Éclair d'orage qui ne tombe pas : il court de `a` à `b` dans la couche de
+    /// nuages en passant par `dip`, plus bas (sous leur base, on l'y voit en entier).
+    pub fn cloud(a: Vec3, dip: Vec3, b: Vec3, seed: u32, cloud_base: f32) -> Self {
+        let mut rng = Rng::new(seed as u64 | 0x53_0000_0000);
+        let mut main = jagged(a, dip, 6, 0.36, &mut rng);
+        main.pop();
+        main.extend(jagged(dip, b, 6, 0.36, &mut rng));
+        Self::build(Kind::Cloud, main, dip, cloud_base, seed, 0.0, rng)
+    }
+
+    /// Le canal `main` (du départ du traceur à son arrivée), ses branches et son déroulé.
+    fn build(
+        kind: Kind,
+        main: Vec<Vec3>,
+        pos: Vec3,
+        cloud_base: f32,
+        seed: u32,
+        delay: f32,
+        mut rng: Rng,
+    ) -> Self {
+        let (start, end) = (main[0], main[main.len() - 1]);
+        // Largeur du halo à la distance `d` du départ : un éclair parti de la main est fin
+        // près d'elle (sinon son halo remplirait l'écran), puis prend sa largeur.
+        let wide = |p: Vec3| match kind {
+            Kind::Sky => ((p - start).length() * 0.035 / 1.7).clamp(0.03, 1.0),
+            _ => 1.0,
+        };
         let lengths: Vec<f32> = main.windows(2).map(|w| (w[1] - w[0]).length()).collect();
         let total: f32 = lengths.iter().sum::<f32>().max(1.0);
         let mut pieces = Vec::with_capacity(700);
@@ -143,22 +254,39 @@ impl Strike {
                 level: 0,
                 ta: 1.0,
                 tb: 1.0,
+                wa: wide(w[0]),
+                wb: wide(w[1]),
             });
             s = e;
         }
-        // Branches : elles partent du canal vers le bas, de côté, et se ramifient parfois.
+        // Branches : elles partent du canal dans le sens où il avance (vers le bas pour la
+        // foudre qui tombe, vers le haut pour celle qui monte), de côté, et se ramifient
+        // parfois.
         let n = main.len() - 1;
-        for i in 6..n - 6 {
-            if rng.unit() > 0.085 {
+        let often = if kind == Kind::Cloud { 0.06 } else { 0.085 };
+        for i in 6..n.saturating_sub(6) {
+            if rng.unit() > often {
                 continue;
             }
-            let down = (main[(i + 4).min(n)] - main[i]).normalize_or(Vec3::NEG_Y);
-            let room = (main[i].y - pos.y).max(8.0);
-            let len = room * rng.range(0.14, 0.45);
-            let end = main[i] + tilt(down, rng.range(0.32, 0.9), &mut rng) * len;
-            let branch = jagged(main[i], end, 5, 0.36, &mut rng);
+            let ahead = (main[(i + 4).min(n)] - main[i]).normalize_or(Vec3::NEG_Y);
+            let room = match kind {
+                Kind::Ground => (main[i].y - end.y).max(8.0),
+                _ => (end - main[i]).length().clamp(8.0, 320.0),
+            };
+            let mut len = room * rng.range(0.14, 0.45);
+            if kind == Kind::Sky {
+                // Près de la main, pas de grande branche : vue de si près, elle barrerait
+                // l'écran.
+                let gone = (main[i] - start).length();
+                if gone < 30.0 {
+                    continue;
+                }
+                len = len.min(gone * 0.5);
+            }
+            let tip = main[i] + tilt(ahead, rng.range(0.32, 0.9), &mut rng) * len;
+            let branch = jagged(main[i], tip, 5, 0.36, &mut rng);
             let from = pieces.len();
-            push_branch(&mut pieces, &branch, along[i], total, 1);
+            push_branch(&mut pieces, &branch, along[i], total, 1, wide(main[i]));
             // Rameaux.
             let made = pieces.len() - from;
             for k in 4..made.saturating_sub(4) {
@@ -167,14 +295,18 @@ impl Strike {
                 }
                 let p = pieces[from + k];
                 let dir = (p.b - p.a).normalize_or(Vec3::NEG_Y);
-                let end =
+                let tip =
                     p.a + tilt(dir, rng.range(0.35, 1.0), &mut rng) * (len * rng.range(0.15, 0.4));
-                let twig = jagged(p.a, end, 3, 0.36, &mut rng);
-                push_branch(&mut pieces, &twig, p.sa, total, 2);
+                let twig = jagged(p.a, tip, 3, 0.36, &mut rng);
+                push_branch(&mut pieces, &twig, p.sa, total, 2, p.wa);
             }
         }
-        // Le traceur descend, puis deux à quatre arcs en retour, de moins en moins forts.
-        let leader_s = rng.range(0.045, 0.075);
+        // Le traceur avance, puis deux à quatre arcs en retour, de moins en moins forts.
+        let leader_s = match kind {
+            Kind::Ground => rng.range(0.045, 0.075),
+            Kind::Sky => rng.range(0.06, 0.1),
+            Kind::Cloud => rng.range(0.09, 0.17),
+        };
         let mut strokes = vec![(leader_s, 1.0)];
         let mut t = leader_s;
         let mut force = 1.0;
@@ -184,7 +316,10 @@ impl Strike {
             strokes.push((t, force));
         }
         Self {
+            kind,
+            cloud_base,
             pos,
+            heading: ((end - start) * Vec3::new(1.0, 0.0, 1.0)).normalize_or_zero(),
             delay,
             age: 0.0,
             pieces,
@@ -202,6 +337,11 @@ impl Strike {
             return false;
         }
         self.age += dt;
+        // Essais : MINELIB_FOUDRE_FIGEE=1 arrête chaque éclair à son plus vif (captures).
+        static FROZEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FROZEN.get_or_init(|| std::env::var("MINELIB_FOUDRE_FIGEE").is_ok_and(|v| v == "1")) {
+            self.age = self.age.min(self.leader_s + 0.004);
+        }
         if !self.landed && self.age >= self.leader_s {
             self.landed = true;
             return true;
@@ -234,11 +374,17 @@ impl Strike {
         (arcs + leader).min(1.0)
     }
 
-    /// Ses segments à cet instant.
-    pub fn segments(&self, out: &mut Vec<BoltSeg>) {
+    /// Ses segments à cet instant, vus de `eye`. (v217) Tout près, le canal garde la
+    /// finesse de l'éclair tenu en main (son halo ne dépasse pas une largeur à l'écran : à
+    /// quelques blocs, c'était une colonne blanche qui mangeait l'image), et il en prend
+    /// les animations : des filaments qui courent autour de lui, de courts arcs sur les
+    /// côtés (`detail`).
+    pub fn segments(&self, eye: Vec3, out: &mut Vec<BoltSeg>) {
         if self.delay > 0.0 {
             return;
         }
+        // Demi-largeur du halo au plus, à la distance `d` de l'œil.
+        let thin = |p: Vec3| NEAR_WIDTH * (p - eye).length() + 0.012;
         let reach = self.age / self.leader_s;
         // Canal : rallumé par chaque arc, puis une lueur qui traîne.
         let since = self.age - self.leader_s;
@@ -257,7 +403,7 @@ impl Strike {
         } else {
             (0.0, 0.0)
         };
-        for p in &self.pieces {
+        for (n, p) in self.pieces.iter().enumerate() {
             let (mut b, mut sb, mut tb) = (p.b, p.sb, p.tb);
             let mut tip = 0.0;
             if since < 0.0 {
@@ -275,8 +421,14 @@ impl Strike {
                 tip = 1.0;
             }
             let force = |s: f32, t: f32| {
-                // Le haut du canal se perd dans le nuage.
-                let fade = smooth(0.0, 0.07, s);
+                // Le haut de la foudre qui tombe se perd dans le nuage ; celle qui monte
+                // se perd à son bout (dans la couche, ce sont les nuages qui la cachent) ;
+                // celle des nuages, à ses deux bouts.
+                let fade = match self.kind {
+                    Kind::Ground => smooth(0.0, 0.07, s),
+                    Kind::Sky => 1.0 - smooth(0.88, 1.0, s),
+                    Kind::Cloud => smooth(0.0, 0.06, s) * (1.0 - smooth(0.94, 1.0, s)),
+                };
                 let base = match p.level {
                     0 => main,
                     _ => branch * t.powf(0.6),
@@ -294,22 +446,148 @@ impl Strike {
                 _ => 0.35 + 0.35 * t,
             };
             out.push(BoltSeg {
-                a: [p.a.x, p.a.y, p.a.z, 1.0],
+                a: [p.a.x, p.a.y, p.a.z, BOLT],
                 b: [b.x, b.y, b.z, 1.0],
-                color: BOLT_TINT,
+                // Des touches de violet : à peine sur le canal, davantage sur les branches.
+                color: tint(shade(n / 16, self.seed) * if p.level == 0 { 0.35 } else { 0.9 }),
                 force_a: fa,
                 force_b: fb,
-                width_a: width(p.ta),
-                width_b: width(tb),
+                width_a: (width(p.ta) * p.wa).min(thin(p.a)),
+                width_b: (width(tb) * p.wb).min(thin(b)),
                 screen: 0.0,
             });
         }
+        if since >= 0.0 && main > 0.05 {
+            self.detail(eye, main, out);
+        }
+        // (v217) Dans la couche de nuages, le canal éclaire le nuage de l'intérieur : une
+        // lueur large et douce le long de lui, par tronçons de huit morceaux (le rendu ne la
+        // montre que là où il y a du nuage, voir bolt.wgsl).
+        if self.kind == Kind::Ground {
+            return;
+        }
+        let level = if since >= 0.0 { main } else { 0.25 };
+        let main_pieces = self.pieces.iter().take_while(|p| p.level == 0);
+        let mut run: Option<(Vec3, Vec3, f32)> = None;
+        for (k, p) in main_pieces.enumerate() {
+            let inside = p.b.y > self.cloud_base - 20.0 && (since >= 0.0 || p.sb <= reach);
+            if inside {
+                run = Some(match run {
+                    Some((a, _, s)) => (a, p.b, s),
+                    None => (p.a, p.b, p.sa),
+                });
+            }
+            if (k % 8 == 7 || !inside) && run.is_some() {
+                let (a, b, s) = run.take().unwrap_or((p.a, p.b, p.sa));
+                let fade = match self.kind {
+                    Kind::Sky => 1.0 - smooth(0.9, 1.0, s),
+                    _ => 1.0,
+                };
+                let force = (level * 0.11).min(0.6) * fade;
+                if force > 0.004 {
+                    out.push(BoltSeg {
+                        a: [a.x, a.y, a.z, BOLT_CLOUD_GLOW],
+                        b: [b.x, b.y, b.z, 1.0],
+                        color: BOLT_TINT,
+                        force_a: force,
+                        force_b: force,
+                        width_a: 60.0,
+                        width_b: 60.0,
+                        screen: 0.0,
+                    });
+                }
+            }
+        }
     }
 
-    /// Ce coup de foudre blesse-t-il ce qui se tient en `feet` (ses pieds) ?
+    /// (v217) Près de l'œil, le canal allumé a les animations de l'éclair tenu en main :
+    /// deux ou trois filaments fins courent autour de lui d'un point à un autre, et de
+    /// courts arcs partent sur les côtés et s'éteignent en pointe ; ils changent plusieurs
+    /// dizaines de fois par seconde. `level` : éclat du canal.
+    fn detail(&self, eye: Vec3, level: f32, out: &mut Vec<BoltSeg>) {
+        // Les points du canal à moins de 70 blocs de l'œil.
+        let near: Vec<Vec3> = self
+            .pieces
+            .iter()
+            .take_while(|p| p.level == 0)
+            .filter(|p| (p.a - eye).length_squared() < DETAIL_REACH * DETAIL_REACH)
+            .map(|p| p.a)
+            .collect();
+        if near.len() < 8 {
+            return;
+        }
+        let force = (level * 0.3).min(1.3);
+        let mut push = |a: Vec3, b: Vec3, fa: f32, fb: f32, wide: f32| {
+            let w = |p: Vec3| wide * (NEAR_WIDTH * (p - eye).length() + 0.012);
+            out.push(BoltSeg {
+                a: [a.x, a.y, a.z, BOLT],
+                b: [b.x, b.y, b.z, 1.0],
+                color: tint(0.25 + 0.7 * fa.fract()),
+                force_a: fa,
+                force_b: fb,
+                width_a: w(a),
+                width_b: w(b),
+                screen: 0.0,
+            });
+        };
+        // Filaments (31 fois par seconde).
+        let mut rng = Rng::new((self.age * 31.0) as u64 ^ (self.seed as u64) << 8 ^ 0xf11a);
+        for _ in 0..3 {
+            let i = (rng.next() as usize) % (near.len() - 6);
+            let j = (i + 4 + (rng.next() as usize) % 14).min(near.len() - 1);
+            let f = force * rng.range(0.4, 0.9);
+            for w in jagged(near[i], near[j], 4, 0.3, &mut rng).windows(2) {
+                push(w[0], w[1], f, f, 0.45);
+            }
+        }
+        // Arcs courts (23 fois par seconde).
+        let mut rng = Rng::new((self.age * 23.0) as u64 ^ (self.seed as u64) << 8 ^ 0xa4c5);
+        for _ in 0..7 {
+            if rng.unit() < 0.3 {
+                continue;
+            }
+            let i = 1 + (rng.next() as usize) % (near.len() - 2);
+            let along = (near[i + 1] - near[i - 1]).normalize_or(Vec3::Y)
+                * if rng.unit() < 0.5 { 1.0 } else { -1.0 };
+            let len = ((near[i] - eye).length() * rng.range(0.05, 0.2)).min(7.0);
+            let tip = near[i] + tilt(along, rng.range(0.5, 1.25), &mut rng) * len;
+            let path = jagged(near[i], tip, 3, 0.28, &mut rng);
+            let n = (path.len() - 1) as f32;
+            let f = force * rng.range(0.7, 1.3);
+            for (k, w) in path.windows(2).enumerate() {
+                let (ta, tb) = (1.0 - k as f32 / n, 1.0 - (k + 1) as f32 / n);
+                push(w[0], w[1], f * ta, f * tb, 0.3 + 0.35 * ta);
+            }
+        }
+    }
+
+    /// (v220) D'où part la lumière qu'il jette : deux points de son canal même, à 1,5 et à
+    /// une vingtaine de blocs du point frappé (ou de la main, pour celui qui monte). La
+    /// lumière et les ombres viennent ainsi de là où l'on voit l'éclair, pas d'à côté.
+    pub fn light_points(&self) -> [Vec3; 2] {
+        let from = self.pos;
+        let mut out = [from + Vec3::Y * 1.5, from + Vec3::Y * 20.0];
+        let (mut near, mut far) = (f32::MAX, f32::MAX);
+        for p in self.pieces.iter().take_while(|p| p.level == 0) {
+            let d = (p.a - from).length();
+            if (d - 1.5).abs() < near {
+                near = (d - 1.5).abs();
+                out[0] = p.a;
+            }
+            if (d - 20.0).abs() < far {
+                far = (d - 20.0).abs();
+                out[1] = p.a;
+            }
+        }
+        out
+    }
+
+    /// Ce coup de foudre blesse-t-il ce qui se tient en `feet` (ses pieds) ? (Seule la
+    /// foudre qui tombe blesse.)
     pub fn hurts(&self, feet: Vec3) -> bool {
         let d = feet - self.pos;
-        d.x.abs() <= DAMAGE_REACH
+        self.kind == Kind::Ground
+            && d.x.abs() <= DAMAGE_REACH
             && d.z.abs() <= DAMAGE_REACH
             && d.y >= -DAMAGE_BELOW
             && d.y <= DAMAGE_ABOVE
@@ -328,7 +606,7 @@ fn tilt(dir: Vec3, angle: f32, rng: &mut Rng) -> Vec3 {
     (dir * angle.cos() + side * angle.sin()).normalize()
 }
 
-fn push_branch(out: &mut Vec<Piece>, pts: &[Vec3], s0: f32, total: f32, level: u8) {
+fn push_branch(out: &mut Vec<Piece>, pts: &[Vec3], s0: f32, total: f32, level: u8, wide: f32) {
     let len: f32 = pts
         .windows(2)
         .map(|w| (w[1] - w[0]).length())
@@ -345,6 +623,8 @@ fn push_branch(out: &mut Vec<Piece>, pts: &[Vec3], s0: f32, total: f32, level: u
             level,
             ta: 1.0 - done / len,
             tb: 1.0 - (done + l) / len,
+            wa: wide,
+            wb: wide,
         });
         done += l;
     }
@@ -363,6 +643,8 @@ pub struct Arc {
     /// Demi-largeur du halo (blocs).
     pub width_a: f32,
     pub width_b: f32,
+    /// (v217) Part de violet dans son halo (0 : le bleu de la foudre).
+    pub violet: f32,
 }
 
 /// Une étincelle : un point incandescent parti de l'éclair, qui file, ralentit et tombe.
@@ -389,6 +671,8 @@ pub struct HeldBolt {
     sparks: Vec<Spark>,
     owed: f32,
     rng: Rng,
+    /// (v217) Sursaut : l'éclair flambe un instant quand la foudre part (1 → 0).
+    surge: f32,
 }
 
 impl Default for HeldBolt {
@@ -398,6 +682,7 @@ impl Default for HeldBolt {
             sparks: Vec::new(),
             owed: 0.0,
             rng: Rng::new(0x2e05),
+            surge: 0.0,
         }
     }
 }
@@ -405,6 +690,8 @@ impl Default for HeldBolt {
 /// Étincelles par seconde, et au plus autant en vol.
 const SPARKS_PER_S: f32 = 46.0;
 const MAX_SPARKS: usize = 96;
+/// (v217) Avec les gerbes (foudre lancée, foudre tombée tout près).
+const MAX_SPARKS_BURST: usize = 220;
 
 impl HeldBolt {
     /// Le canal du milieu à l'instant `t` : du bas (−y) au haut de l'éclair, en passant
@@ -426,6 +713,7 @@ impl HeldBolt {
     /// déjà parties finissent leur course).
     pub fn update(&mut self, dt: f32, place: Mat4, on: bool) {
         self.t += dt;
+        self.surge = (self.surge - dt / 0.22).max(0.0);
         // Par pas de 6 ms au plus : les traits ont la même longueur à toutes les cadences
         // (sinon une image longue les étirerait).
         let steps = (dt / 0.006).ceil().clamp(1.0, 40.0);
@@ -465,7 +753,8 @@ impl HeldBolt {
             let along = (core[i + 1] - core[i - 1]).normalize_or(Vec3::Y)
                 * if rng.unit() < 0.5 { 1.0 } else { -1.0 };
             let out = (core[i] * Vec3::new(1.0, 0.0, 1.0)).normalize_or(rng.dir());
-            let local = along * rng.range(0.8, 4.2) + out * rng.range(0.4, 2.6) + rng.dir() * 0.9;
+            let local = (along * rng.range(0.8, 4.2) + out * rng.range(0.4, 2.6) + rng.dir() * 0.9)
+                * (0.5 + 0.5 * HELD_SCALE);
             let pos = place.transform_point3(core[i]);
             let life = rng.range(0.1, 0.55);
             self.sparks.push(Spark {
@@ -482,13 +771,48 @@ impl HeldBolt {
         }
     }
 
+    /// (v217) La foudre part : l'éclair flambe un instant et jette une gerbe d'étincelles
+    /// depuis `tip` (monde), dans la direction `dir`.
+    pub fn surge(&mut self, tip: Vec3, dir: Vec3) {
+        self.surge = 1.0;
+        self.burst(tip, dir, 26, 7.0);
+    }
+
+    /// (v217) Gerbe de `n` étincelles depuis `pos` (monde), surtout vers `dir`, à `speed`
+    /// blocs par seconde environ : la foudre lancée, ou tombée tout près.
+    pub fn burst(&mut self, pos: Vec3, dir: Vec3, n: usize, speed: f32) {
+        for _ in 0..n {
+            if self.sparks.len() >= MAX_SPARKS_BURST {
+                break;
+            }
+            let rng = &mut self.rng;
+            let vel = (dir * rng.range(0.2, 1.0) + rng.dir() * rng.range(0.4, 1.0)) * speed;
+            self.sparks.push(Spark {
+                pos,
+                vel,
+                age: 0.0,
+                life: rng.range(0.15, 0.75),
+                trail: [pos; 3],
+                since: 0.0,
+                every: rng.range(0.004, 0.02),
+                bright: rng.range(0.7, 1.6),
+            });
+        }
+    }
+
     /// L'éclair lui-même, dans son repère.
     pub fn arcs(&self, out: &mut Vec<Arc>) {
-        let t = self.t;
+        Self::arcs_at(self.t, 1.0 + 0.9 * self.surge, out);
+    }
+
+    /// L'éclair à l'instant `t`, dans son repère (`boost` : son éclat, 1 d'ordinaire). Le
+    /// même partout où on le voit : en main, (v217) en icône dans l'inventaire et posé au
+    /// sol.
+    pub fn arcs_at(t: f32, boost: f32, out: &mut Vec<Arc>) {
         let half = HELD_LEN * 0.5;
         // Scintillement : l'éclat saute 40 fois par seconde.
         let mut fl = Rng::new((t * 40.0) as u64 ^ 0xf1_1c);
-        let flicker = fl.range(0.72, 1.3);
+        let flicker = fl.range(0.72, 1.3) * boost;
         // S'effile vers les deux pointes.
         let taper = |y: f32| (1.0 - (y.abs() / half).powi(3)).clamp(0.0, 1.0);
         let core = Self::core(t);
@@ -498,8 +822,9 @@ impl HeldBolt {
                 b: w[1],
                 force_a: 1.9 * flicker * (0.35 + 0.65 * taper(w[0].y)),
                 force_b: 1.9 * flicker * (0.35 + 0.65 * taper(w[1].y)),
-                width_a: 0.03 + 0.05 * taper(w[0].y),
-                width_b: 0.03 + 0.05 * taper(w[1].y),
+                width_a: (0.03 + 0.05 * taper(w[0].y)) * HELD_HALO,
+                width_b: (0.03 + 0.05 * taper(w[1].y)) * HELD_HALO,
+                violet: 0.15,
             });
         }
         // Deux filaments courent autour du canal, plus fins, plus nerveux (31 fois par
@@ -518,8 +843,9 @@ impl HeldBolt {
                     b: w[1],
                     force_a: force,
                     force_b: force,
-                    width_a: 0.034,
-                    width_b: 0.034,
+                    width_a: 0.034 * HELD_HALO,
+                    width_b: 0.034 * HELD_HALO,
+                    violet: 0.8,
                 });
             }
         }
@@ -533,7 +859,8 @@ impl HeldBolt {
             let i = 1 + (rng.next() as usize) % (core.len() - 2);
             let along = (core[i + 1] - core[i - 1]).normalize_or(Vec3::Y)
                 * if rng.unit() < 0.5 { 1.0 } else { -1.0 };
-            let end = core[i] + tilt(along, rng.range(0.5, 1.25), &mut rng) * rng.range(0.07, 0.3);
+            let end = core[i]
+                + tilt(along, rng.range(0.5, 1.25), &mut rng) * (rng.range(0.07, 0.3) * HELD_SCALE);
             let path = jagged(core[i], end, 3, 0.28, &mut rng);
             let n = (path.len() - 1) as f32;
             let force = rng.range(0.7, 1.3) * flicker;
@@ -544,8 +871,9 @@ impl HeldBolt {
                     b: w[1],
                     force_a: force * ta,
                     force_b: force * tb,
-                    width_a: 0.016 + 0.024 * ta,
-                    width_b: 0.016 + 0.024 * tb,
+                    width_a: (0.016 + 0.024 * ta) * HELD_HALO,
+                    width_b: (0.016 + 0.024 * tb) * HELD_HALO,
+                    violet: force.fract(),
                 });
             }
         }
@@ -570,6 +898,7 @@ impl HeldBolt {
                     force_b: force * fb,
                     width_a: 0.011 + 0.012 * fa,
                     width_b: 0.011 + 0.012 * fb,
+                    violet: (s.bright * 3.7).fract() * 0.7,
                 });
             }
         }
@@ -580,26 +909,64 @@ impl HeldBolt {
     pub fn glow(&self) -> f32 {
         let mut fl = Rng::new((self.t * 40.0) as u64 ^ 0xf1_1c);
         let flicker = fl.range(0.72, 1.3);
-        flicker * (0.85 + 0.3 * (self.sparks.len() as f32 / MAX_SPARKS as f32))
+        flicker
+            * (0.85 + 0.3 * (self.sparks.len() as f32 / MAX_SPARKS as f32).min(1.0))
+            * (1.0 + 1.5 * self.surge)
     }
 }
 
 /// Segments à dessiner dans le monde : `arcs` placés par `place` (du repère des arcs vers
 /// le monde ; l'identité pour des arcs déjà dans le monde).
 pub fn in_world(arcs: &[Arc], place: Mat4, out: &mut Vec<BoltSeg>) {
+    in_world_scaled(arcs, place, 1.0, out);
+}
+
+/// Comme `in_world`, pour un repère `place` qui agrandit ou réduit de `scale` (les halos
+/// suivent) : (v217) la Foudre de Zeus posée au sol est le même éclair, en petit.
+pub fn in_world_scaled(arcs: &[Arc], place: Mat4, scale: f32, out: &mut Vec<BoltSeg>) {
     for s in arcs {
         let (a, b) = (place.transform_point3(s.a), place.transform_point3(s.b));
         out.push(BoltSeg {
-            a: [a.x, a.y, a.z, 1.0],
+            a: [a.x, a.y, a.z, BOLT],
             b: [b.x, b.y, b.z, 1.0],
-            color: BOLT_TINT,
+            color: tint(s.violet),
             force_a: s.force_a,
             force_b: s.force_b,
-            width_a: s.width_a,
-            width_b: s.width_b,
+            width_a: s.width_a * scale,
+            width_b: s.width_b * scale,
             screen: 0.0,
         });
     }
+}
+
+/// (v217) Horloge des icônes (s) : la même pour toutes, elle tourne toujours.
+pub fn clock() -> f32 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f32()
+}
+
+/// (v217) L'éclair tenu en main, en icône : centré en (`cx`, `cy`) (pixels), haut de
+/// `size` pixels, à l'instant `t` (il vit comme en main). Pour `Ui::bolts`.
+pub fn icon(t: f32, cx: f32, cy: f32, size: f32) -> Vec<BoltSeg> {
+    let mut arcs = Vec::new();
+    HeldBolt::arcs_at(t, 1.0, &mut arcs);
+    let k = size / HELD_LEN;
+    arcs.iter()
+        .map(|s| BoltSeg {
+            a: [cx + s.a.x * k, cy - s.a.y * k, 0.0, 1.0],
+            b: [cx + s.b.x * k, cy - s.b.y * k, 0.0, 1.0],
+            color: tint(s.violet),
+            force_a: s.force_a,
+            force_b: s.force_b,
+            // (Un peu plus large qu'à l'échelle : une icône doit se lire.)
+            width_a: (s.width_a * k * 1.5).max(1.6),
+            width_b: (s.width_b * k * 1.5).max(1.6),
+            screen: 1.0,
+        })
+        .collect()
 }
 
 /// Segments à dessiner à la première personne : `arcs` passés à l'écran par `mvp` (la
@@ -615,7 +982,7 @@ pub fn on_screen(arcs: &[Arc], mvp: Mat4, out: &mut Vec<BoltSeg>) {
         out.push(BoltSeg {
             a: a.to_array(),
             b: b.to_array(),
-            color: BOLT_TINT,
+            color: tint(s.violet),
             force_a: s.force_a,
             force_b: s.force_b,
             // (En part de la hauteur de l'écran.)
@@ -689,12 +1056,12 @@ mod tests {
         let pos = Vec3::new(0.0, 64.0, 0.0);
         let mut s = Strike::new(pos, 5, 400.0, 0.2);
         let mut segs = Vec::new();
-        s.segments(&mut segs);
+        s.segments(Vec3::new(900.0, 64.0, 0.0), &mut segs);
         assert!(segs.is_empty() && s.light() == 0.0, "pas encore parti");
         assert!(!s.update(0.21));
         // Traceur à mi-chemin : rien près du sol, sa lumière est faible.
         s.age = s.leader_s * 0.5;
-        s.segments(&mut segs);
+        s.segments(Vec3::new(900.0, 64.0, 0.0), &mut segs);
         assert!(!segs.is_empty());
         let lowest = segs.iter().map(|g| g.b[1]).fold(f32::MAX, f32::min);
         assert!(lowest > pos.y + 60.0, "le traceur n'est qu'à {lowest}");
@@ -721,7 +1088,7 @@ mod tests {
         assert_eq!(relit, s.strokes.len());
         segs.clear();
         s.age = s.leader_s + 0.004;
-        s.segments(&mut segs);
+        s.segments(Vec3::new(900.0, 64.0, 0.0), &mut segs);
         let main_peak = segs.iter().map(|g| g.force_a).fold(0.0, f32::max);
         assert!(main_peak > 2.5 && main_peak > leader_peak * 2.0);
         assert!(
@@ -732,7 +1099,7 @@ mod tests {
         s.age = 5.0;
         assert!(s.done() && s.light() < 1e-3);
         segs.clear();
-        s.segments(&mut segs);
+        s.segments(Vec3::new(900.0, 64.0, 0.0), &mut segs);
         assert!(segs.is_empty());
     }
 
@@ -759,17 +1126,19 @@ mod tests {
             h.update(1.0 / 120.0, Mat4::IDENTITY, true);
             let core = HeldBolt::core(h.t);
             assert_eq!(core.len(), 33);
-            assert!((core[0].y + 0.45).abs() < 1e-5 && (core[32].y - 0.45).abs() < 1e-5);
+            let half = HELD_LEN * 0.5;
+            assert!((core[0].y + half).abs() < 1e-5 && (core[32].y - half).abs() < 1e-5);
             assert!((core[32].y - core[0].y - HELD_LEN).abs() < 1e-5);
-            assert!((HELD_LEN - 1.8 / 2.0).abs() < 1e-6, "la moitié de 1,8 bloc");
+            // (v217) 40 % de plus que la moitié de 1,8 bloc.
+            assert!((HELD_LEN - 0.9 * 1.4).abs() < 1e-6);
             assert!(core[16].length() < 0.05, "passe par le poing");
-            assert!(core.iter().all(|p| Vec3::new(p.x, 0.0, p.z).length() < 0.3));
+            assert!(core.iter().all(|p| Vec3::new(p.x, 0.0, p.z).length() < 0.42));
             shapes.insert(core[8].x.to_bits());
             let mut arcs = Vec::new();
             h.arcs(&mut arcs);
             assert!(arcs.len() >= 32);
             for a in &arcs {
-                assert!(a.a.length() < 0.8 && a.b.length() < 0.8, "près de l'éclair");
+                assert!(a.a.length() < 1.15 && a.b.length() < 1.15, "près de l'éclair");
                 assert!(a.force_a >= 0.0 && a.force_a < 3.0 && a.width_a > 0.0);
             }
             flickers.push(h.glow());
@@ -795,7 +1164,7 @@ mod tests {
             let before = h.sparks.len();
             h.update(1.0 / 240.0, place, true);
             for s in h.sparks.iter().skip(before) {
-                assert!((s.pos - origin).length() < 0.7, "née sur l'éclair");
+                assert!((s.pos - origin).length() < 0.95, "née sur l'éclair");
                 born += 1;
             }
             for s in &h.sparks {
@@ -844,12 +1213,14 @@ mod tests {
         let mut sky = Vec::new();
         let mut s = Strike::new(Vec3::ZERO, 3, 300.0, 0.0);
         s.age = s.leader_s + 0.01;
-        s.segments(&mut sky);
-        assert!(world
-            .iter()
-            .chain(&screen)
-            .chain(&sky)
-            .all(|g| g.color == BOLT_TINT));
+        s.segments(Vec3::new(900.0, 64.0, 0.0), &mut sky);
+        // (v217) Le bleu de la foudre, avec au plus une touche de violet : jamais d'autre
+        // teinte, et le bleu reste entier.
+        assert!(world.iter().chain(&screen).chain(&sky).all(|g| {
+            g.color[2] == 1.0
+                && (BOLT_TINT[0]..=0.68 + 1e-4).contains(&g.color[0])
+                && (0.4 - 1e-4..=BOLT_TINT[1]).contains(&g.color[1])
+        }));
         assert!((world[0].a[0] - arcs[0].a.x - 3.0).abs() < 1e-5 && world[0].screen == 0.0);
         // À l'écran : devant l'œil, et un halo de quelques centièmes de la hauteur.
         for g in &screen {

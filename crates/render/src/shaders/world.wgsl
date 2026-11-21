@@ -151,10 +151,15 @@ struct Sky {
     cloud_b: vec4<f32>,
     cloud_c: vec4<f32>,
     // x = rayon de la caméra, y = rayon du milieu de la couche, z = 1 / angle du bord des
-    // cartes.
+    // cartes, w = épaisseur de la couche (blocs).
     cloud_geo: vec4<f32>,
     // xy = direction (xz) de l'éclair vu de la caméra.
     flash: vec4<f32>,
+    // (v217) Sol lointain, sous l'horizon : rgb = sa couleur (sans éclairage), w = hauteur
+    // de l'œil au-dessus de lui (blocs).
+    ground: vec4<f32>,
+    // x = 1 / distance de brume du sol lointain.
+    haze: vec4<f32>,
 };
 
 // Atmosphère (image cube calculée sur le processeur), les trois cartes des nuages (tout le
@@ -223,37 +228,121 @@ fn value_noise(p: vec3<f32>) -> f32 {
     return mix(mix(a, b, u.y), mix(c, d, u.y), u.z);
 }
 
-/// La lune : une sphère éclairée par le vrai soleil (ses phases en découlent), avec ses
-/// mers sombres, et sa lueur. Elle montre toujours la même face.
-fn moon_shade(dir: vec3<f32>) -> vec3<f32> {
+/// (v220) Une mer de la lune : la tache sombre autour du point `c` de sa face, de rayon `r`.
+fn moon_sea(q: vec3<f32>, c: vec2<f32>, r: f32) -> f32 {
+    let d = q - vec3<f32>(c, sqrt(max(1.0 - dot(c, c), 0.0)));
+    return exp(-dot(d, d) / (r * r));
+}
+
+/// (v220) Un cratère jeune de la lune : sa tache claire en `c`, et les traînées claires qui
+/// en partent en étoile jusqu'à `reach`.
+fn moon_crater(q: vec3<f32>, c: vec2<f32>, r: f32, reach: f32) -> f32 {
+    let v = q.xy - c;
+    let d2 = dot(v, v);
+    if d2 > reach * reach * 9.0 {
+        return 0.0;
+    }
+    // (Bruit lu sur un cercle autour du cratère : une traînée par bosse, sans couture.)
+    let u = v * inverseSqrt(d2 + 1e-6);
+    var streak = value_noise(vec3<f32>(u * 6.0, c.x * 40.0));
+    streak *= streak;
+    let d = sqrt(d2);
+    return 0.5 * exp(-d2 / (r * r)) + 0.4 * streak * streak * exp(-d / reach) * smoothstep(r * 0.5, r * 2.0, d);
+}
+
+/// (v220) Les cratères de la lune de taille `1 / f` : ce que leur relief ajoute ou retire à
+/// la lumière quand le soleil (`sun`, sa direction sur la face) rase le sol. Un cratère par
+/// case, au plus : le bord de sa cuvette tourné vers le soleil est clair, l'autre à l'ombre.
+fn moon_relief(p: vec2<f32>, f: f32, sun: vec2<f32>) -> f32 {
+    let u = p * f;
+    let cell = vec3<i32>(i32(floor(u.x)), i32(floor(u.y)), i32(f));
+    let h = sky_hash(cell);
+    if h < 0.3 {
+        return 0.0;
+    }
+    let c = 0.5 + (vec2<f32>(sky_hash(cell + vec3<i32>(7, 0, 0)), sky_hash(cell + vec3<i32>(0, 13, 0))) - 0.5) * 0.4;
+    let v = (fract(u) - c) / (0.1 + 0.2 * h);
+    let r = length(v);
+    if r > 1.3 || r < 0.001 {
+        return 0.0;
+    }
+    // Pente : elle monte vers le bord dans la cuvette, redescend dehors.
+    let slope = select(-0.5 * sin((r - 1.0) * 10.47), sin(r * 3.1416), r < 1.0);
+    return -dot(v / r, sun) * slope;
+}
+
+/// La lune : une sphère éclairée par le vrai soleil (ses phases en découlent), et sa lueur.
+/// Elle montre toujours la même face. (v220) Trois fois plus grande (3° de rayon), et sa
+/// face est celle de la vraie : ses mers à leur place, ses grands cratères clairs et leurs
+/// traînées, son relief qui ressort le long de la limite du jour, et un sol de poussière
+/// (aussi clair au bord qu'au centre à la pleine lune, pas une boule de plâtre). Basse sur
+/// l'horizon, l'air la rougit. Rend sa lumière (rgb) et la part du ciel qu'elle cache (a :
+/// les étoiles ne brillent pas à travers son côté sombre).
+fn moon_shade(dir: vec3<f32>) -> vec4<f32> {
     let k = sky.moon.w;
     let m = sky.moon.xyz;
     let s = dot(dir, m);
     if k <= 0.0 || s < 0.9 {
-        return vec3<f32>(0.0);
+        return vec4<f32>(0.0);
     }
     let ang = sqrt(max(2.0 - 2.0 * s, 0.0));
-    // Rayon : 1° (deux fois la vraie, comme le soleil : lisible à l'écran).
-    let rm = 0.0175;
-    var c = vec3<f32>(0.55, 0.66, 0.9) * (0.035 * exp(-ang * 26.0) + 0.006 * exp(-ang * 7.0)) * k;
+    let rm = 0.0524;
+    var cover = 0.0;
+    let low = 1.0 - smoothstep(0.0, 0.34, m.y);
+    let tint = mix(vec3<f32>(1.0, 0.975, 0.93), vec3<f32>(1.0, 0.64, 0.34), low * low) * (1.0 - 0.3 * low * low);
+    var c = mix(vec3<f32>(0.55, 0.66, 0.9), tint, 0.3) * (0.035 * exp(-ang * 20.0) + 0.006 * exp(-ang * 7.0)) * k;
     if ang < rm {
         let right = normalize(cross(vec3<f32>(0.0, 0.0, 1.0), m));
         let up = cross(m, right);
         let x = dot(dir, right) / rm;
         let y = dot(dir, up) / rm;
         let z = sqrt(max(1.0 - x * x - y * y, 0.0));
-        // Normale de la sphère, tournée vers nous.
-        let n = right * x + up * y - m * z;
-        let lit = smoothstep(-0.03, 0.2, dot(n, normalize(g.sun.xyz)));
-        // Mers : grandes taches sombres, fixes sur la face.
+        // Point de la face (x à droite, y en haut, z vers nous), et sa normale dans le monde.
         let q = vec3<f32>(x, y, z);
-        let seas = value_noise(q * 2.3 + 7.0) * 0.65 + value_noise(q * 5.9 + 3.0) * 0.35;
-        let albedo = mix(0.5, 1.0, smoothstep(0.38, 0.62, seas));
-        let edge = 1.0 - smoothstep(0.93, 1.0, ang / rm);
-        // (Côté nuit à peine visible : la lumière cendrée.)
-        c = mix(c, vec3<f32>(0.93, 0.95, 1.0) * albedo * (lit * 1.05 + 0.012) * k, edge);
+        let n = right * x + up * y - m * z;
+        let sun = normalize(g.sun.xyz);
+        let mu = max(dot(n, sun), 0.0);
+        // Sol de poussière : il renvoie la lumière vers d'où elle vient.
+        var lit = min(2.0 * mu / (mu + z + 0.04), 1.1);
+        // Mers : les plaines sombres, à leur place sur la face, aux bords irréguliers.
+        let w = q + (vec3<f32>(value_noise(q * 3.3 + 7.0), value_noise(q * 3.3 + 19.0), 0.5) - 0.5) * 0.26
+            + (vec3<f32>(value_noise(q * 9.0 + 5.0), value_noise(q * 9.0 + 23.0), 0.5) - 0.5) * 0.08;
+        let sea = moon_sea(w, vec2<f32>(-0.60, 0.20), 0.36)
+            + moon_sea(w, vec2<f32>(-0.24, 0.52), 0.27)
+            + moon_sea(w, vec2<f32>(0.27, 0.46), 0.17)
+            + moon_sea(w, vec2<f32>(0.47, 0.13), 0.20)
+            + moon_sea(w, vec2<f32>(0.79, 0.30), 0.10)
+            + moon_sea(w, vec2<f32>(0.71, -0.09), 0.14)
+            + moon_sea(w, vec2<f32>(0.50, -0.28), 0.085)
+            + moon_sea(w, vec2<f32>(-0.25, -0.36), 0.19)
+            + moon_sea(w, vec2<f32>(-0.58, -0.40), 0.10)
+            + moon_sea(w, vec2<f32>(-0.05, 0.80), 0.12)
+            + moon_sea(w, vec2<f32>(-0.36, 0.75), 0.10);
+        // Grain du sol (hautes terres claires, mouchetées).
+        let grain = value_noise(q * 13.0 + 3.0) * 0.6 + value_noise(q * 31.0) * 0.4;
+        let mare = smoothstep(0.27, 0.62, sea + (grain - 0.5) * 0.3);
+        var albedo = mix(1.0, 0.47, mare) * (0.75 + 0.3 * grain);
+        albedo += moon_crater(q, vec2<f32>(-0.10, -0.69), 0.04, 0.4)
+            + moon_crater(q, vec2<f32>(-0.33, 0.17), 0.032, 0.15)
+            + moon_crater(q, vec2<f32>(-0.61, 0.14), 0.022, 0.09)
+            + moon_crater(q, vec2<f32>(-0.68, 0.40), 0.024, 0.06);
+        // Relief : on ne le voit que là où la lumière rase le sol, près de la limite du
+        // jour, et pas à la pleine lune (on la regarde alors d'où vient la lumière : aucune
+        // ombre visible). Les mers sont plus lisses que les hautes terres.
+        let sl = vec3<f32>(dot(sun, right), dot(sun, up), -dot(sun, m));
+        let graze = (1.0 - smoothstep(0.0, 0.5, mu)) * (1.0 - smoothstep(0.55, 0.96, sl.z)) * (1.0 - 0.55 * mare);
+        if graze > 0.01 {
+            let sd = sl.xy * inverseSqrt(max(dot(sl.xy, sl.xy), 1e-6));
+            let relief = moon_relief(q.xy, 4.3, sd) + 0.8 * moon_relief(q.xy + 0.37, 8.7, sd);
+            lit *= 1.0 + clamp(relief * 1.1, -0.85, 0.9) * graze;
+        }
+        let edge = 1.0 - smoothstep(0.955, 1.0, ang / rm);
+        // (Côté nuit à peine visible : la lumière cendrée, bleutée.)
+        let disc = (tint * lit * 0.8 + vec3<f32>(0.6, 0.75, 1.0) * 0.013) * albedo * k;
+        c = mix(c, disc, edge);
+        cover = edge;
     }
-    return c;
+    return vec4<f32>(c, cover);
 }
 
 /// Étoiles (elles tournent avec l'heure autour de l'axe du monde, se lèvent et se
@@ -350,26 +439,80 @@ fn sky_env(dir: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
-/// (v216) Le ciel : l'atmosphère, les étoiles, la lune et le soleil, puis les nuages devant
-/// (ils les cachent), et la lueur d'un éclair dans les nuages.
-fn sky_shade(dir: vec3<f32>) -> vec4<f32> {
+/// (v217) La brume de l'horizon du côté `flat` (x, z, unitaire) : le bas du ciel, sans le
+/// dessin des nuages. Le ciel s'y fond dans ses derniers degrés (davantage sous la pluie :
+/// l'horizon est bouché), et sous l'horizon le sol lointain s'y perd : les deux se
+/// rejoignent sans couture. La lueur d'un éclair l'éclaire aussi.
+fn horizon_haze(flat: vec2<f32>) -> vec3<f32> {
+    let hd = normalize(vec3<f32>(flat.x, 0.012, flat.y));
+    var c = sky_color(hd) + sun_glow(hd, false);
+    if sky.misc.w > 0.0 {
+        let side = max(dot(flat, sky.flash.xy), 0.0);
+        c += vec3<f32>(0.72, 0.8, 1.0) * sky.misc.w * (0.07 + 0.55 * sky.fog.w) * (0.3 + 0.7 * side * side);
+    }
+    return c;
+}
+
+/// Le ciel au-dessus de l'horizon : l'atmosphère, les étoiles, la lune et le soleil
+/// (`bodies` : avec leurs disques), puis les nuages devant eux, la lueur des éclairs, et
+/// la brume de l'horizon.
+fn sky_above(dir: vec3<f32>, bodies: bool) -> vec3<f32> {
     var c = sky_color(dir);
-    if sky.misc.x > 0.01 && dir.y > 0.0 {
-        c += stars(dir) * sky.misc.x * smoothstep(0.0, 0.2, dir.y);
+    if bodies {
+        let moon = moon_shade(dir);
+        if sky.misc.x > 0.01 && dir.y > 0.0 && moon.a < 1.0 {
+            c += stars(dir) * sky.misc.x * smoothstep(0.0, 0.2, dir.y) * (1.0 - moon.a);
+        }
+        c += moon.rgb;
     }
-    c += moon_shade(dir) + sun_glow(dir, true);
-    var veil = 0.0;
-    if dir.y > -0.03 {
-        let cl = clouds(dir);
-        c = c * cl.a + cl.rgb;
-        veil = 1.0 - cl.a;
-    }
+    let glow = sun_glow(dir, false);
+    c += glow;
+    let cl = clouds(dir);
+    c = c * cl.a + cl.rgb;
     if sky.misc.w > 0.0 {
         // Éclair : les nuages s'illuminent de l'intérieur, surtout du côté où il tombe.
         let side = max(dot(dir.xz * inverseSqrt(max(dot(dir.xz, dir.xz), 1e-12)), sky.flash.xy), 0.0);
-        c += vec3<f32>(0.72, 0.8, 1.0) * sky.misc.w * (veil * 0.85 + 0.07) * (0.3 + 0.7 * side * side);
+        c += vec3<f32>(0.72, 0.8, 1.0) * sky.misc.w * ((1.0 - cl.a) * 0.85 + 0.07) * (0.3 + 0.7 * side * side);
     }
-    return vec4<f32>(c, 1.0);
+    // Les derniers degrés au-dessus de l'horizon se perdent dans sa brume (3° par beau
+    // temps, une dizaine sous un ciel couvert).
+    let near = 1.0 - smoothstep(0.0, 0.05 + 0.13 * sky.fog.w, dir.y);
+    if near > 0.0 {
+        let flat = dir.xz * inverseSqrt(max(dot(dir.xz, dir.xz), 1e-12));
+        c = mix(c, horizon_haze(flat), near * near);
+    }
+    if bodies {
+        // Le disque du soleil, par-dessus la brume (on le voit se coucher), derrière les
+        // nuages.
+        c += (sun_glow(dir, true) - glow) * cl.a;
+    }
+    return c;
+}
+
+/// Le ciel dans la direction `dir`, et ce qu'on voit sous l'horizon au-delà du monde
+/// chargé : (v217) le sol qui continue, de la couleur du relief lointain, éclairé comme
+/// lui (les éclairs compris), et qui se perd peu à peu dans la brume de l'air jusqu'à
+/// l'horizon, où il rejoint le bas du ciel sans couture. Avant, une bande unie restait
+/// sous l'horizon : coupée net du ciel couvert, et noire pendant un éclair. Le brouillard
+/// du bout de la vue se fond dans cette même image : le relief s'y perd comme le sol.
+fn sky_shade(dir: vec3<f32>) -> vec4<f32> {
+    if dir.y >= 0.0 {
+        return vec4<f32>(sky_above(dir, true), 1.0);
+    }
+    let flat = dir.xz * inverseSqrt(max(dot(dir.xz, dir.xz), 1e-12));
+    let low = horizon_haze(flat);
+    // Distance au sol lointain le long du regard, et ce que la brume en laisse.
+    let t = sky.ground.w / max(-dir.y, 1e-4);
+    let haze = 1.0 - exp(-t * sky.haze.x);
+    // Éclairé comme le dessus des blocs : soleil et ciel selon l'heure, à peine la nuit.
+    let day = g.light.x;
+    let sun = max(normalize(g.sun.xyz).y, 0.0);
+    let lit = ((g.sun.w + (1.0 - g.sun.w) * sun) * day + 0.04 * (1.0 - day)) * 0.82 + 0.012;
+    // De larges taches, à peine : un sol uni se verrait.
+    let at = g.cam_pos.xz + dir.xz * t;
+    let patches = 0.86 + 0.28 * value_noise(vec3<f32>(at.x, 0.0, at.y) / 96.0);
+    let ground = sky.ground.rgb * lit * mix(patches, 1.0, haze);
+    return vec4<f32>(mix(ground, low, haze), 1.0);
 }
 
 // CIEL : FIN

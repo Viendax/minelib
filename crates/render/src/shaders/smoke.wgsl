@@ -272,6 +272,115 @@ fn march(frag: vec4<f32>, world: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(col + sun_tint * rim, a);
 }
 
+/// (v217) Où la fumée devient opaque le long du regard : distance à l'œil, ou −1 si on
+/// voit encore à travers (bord du nuage, tunnel d'une balle). Mêmes pas et même densité que
+/// `march`, sans l'éclairage.
+fn solid_at(frag: vec4<f32>, world: vec3<f32>) -> f32 {
+    let o = g.cam_pos.xyz;
+    let d = normalize(world - o);
+    let inv = 1.0 / select(d, vec3<f32>(1e-6), abs(d) < vec3<f32>(1e-6));
+    let ta = (s.box_min.xyz - o) * inv;
+    let tb = (s.box_max.xyz - o) * inv;
+    let t_in = max(max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z)), 0.0);
+    let t_out = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
+    if t_out <= t_in {
+        return -1.0;
+    }
+    var mask = 0u;
+    let nt = u32(s.params.x);
+    for (var k = 0u; k < 16u; k++) {
+        if k >= nt {
+            break;
+        }
+        let a = s.tunnel_a[k];
+        if a.w > 0.0 && ray_segment(o, d, t_in, t_out, a.xyz, s.tunnel_b[k].xyz) < a.w + 0.1 {
+            mask |= 1u << k;
+        }
+    }
+    let front = s.size.w;
+    let age = s.params.y;
+    let dt = s.params.w;
+    let steps = i32(s.params.z);
+    var t = t_in + dt * hash12(frag.xy + vec2<f32>(age * 37.0, age * 11.0));
+    var trans = 1.0;
+    for (var i = 0; i < 160; i++) {
+        if i >= steps || t > t_out {
+            break;
+        }
+        let p = o + d * t;
+        let fd = field_at(p, front, age, true);
+        if fd.y > 0.5 {
+            break;
+        }
+        var dens = fd.x;
+        if dens > 0.001 && mask != 0u {
+            for (var k = 0u; k < 16u; k++) {
+                if (mask & (1u << k)) != 0u {
+                    let a = s.tunnel_a[k];
+                    dens *= clamp((seg_dist(p, a.xyz, s.tunnel_b[k].xyz) - a.w) / 0.06, 0.0, 1.0);
+                }
+            }
+        }
+        if dens > 0.001 {
+            let core = front - fd.z > 0.6 && mask == 0u;
+            let step_len = select(dt, 0.24, core);
+            trans *= exp(-dens * 13.0 * step_len);
+            if trans < 0.06 {
+                return t;
+            }
+            t += step_len;
+        } else {
+            t += clamp((fd.z - front) * 3.5, dt, 0.45);
+        }
+    }
+    return -1.0;
+}
+
+/// (v217) La fumée opaque cache ce qui est dessiné après elle : elle écrit sa profondeur là
+/// où l'on ne voit plus à travers. Les rayons des projecteurs, la pluie, les flammes et les
+/// éclairs, dessinés ensuite d'après la profondeur du monde, ne passent plus devant elle
+/// quand ils sont derrière. (La fumée ne s'écrivait nulle part : tout ce qui venait après
+/// elle se dessinait par-dessus.)
+fn solid_depth(frag: vec4<f32>, world: vec3<f32>) -> f32 {
+    let t = solid_at(frag, world);
+    if t < 0.0 {
+        discard;
+    }
+    let c = g.view_proj * vec4<f32>(g.cam_pos.xyz + normalize(world - g.cam_pos.xyz) * t, 1.0);
+    return c.z / max(c.w, 1e-6);
+}
+
+struct SolidOut {
+    @builtin(frag_depth) depth: f32,
+    @location(0) color: vec4<f32>,
+};
+
+@fragment
+fn fs_solid(i: VOut) -> SolidOut {
+    var o: SolidOut;
+    o.depth = solid_depth(i.clip, i.world);
+    o.color = vec4<f32>(0.0);
+    return o;
+}
+
+struct SolidTaaOut {
+    @builtin(frag_depth) depth: f32,
+    @location(0) color: vec4<f32>,
+    @location(1) motion: vec2<f32>,
+    // La face d'eau ou de verre gardée derrière la fumée n'a plus à être éclairée.
+    @location(2) water: vec4<u32>,
+};
+
+@fragment
+fn fs_solid_taa(i: VOut) -> SolidTaaOut {
+    var o: SolidTaaOut;
+    o.depth = solid_depth(i.clip, i.world);
+    o.color = vec4<f32>(0.0);
+    o.motion = vec2<f32>(0.0);
+    o.water = vec4<u32>(0u);
+    return o;
+}
+
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     return march(i.clip, i.world);

@@ -1,26 +1,27 @@
 //! (v216) Flammes du molotov : un liquide qui brûle au sol, comme de l'alcool (voir
-//! flame.wgsl). Le jeu fournit chaque image la liste des flammes et des flaques ; chacune
-//! est un rectangle dont la carte graphique fait la forme, le mouvement et les couleurs.
-//! Sans feu, rien n'est dessiné ni calculé.
+//! flame.wgsl). (v217) Le jeu fournit chaque image la liste des cases en feu ; chacune est
+//! une boîte que la carte graphique traverse pas à pas dans un champ de flammes posé dans
+//! le monde : un vrai volume, pas des panneaux tournés vers l'œil. Sans feu, rien n'est
+//! dessiné ni calculé.
 
 use bytemuck::{Pod, Zeroable};
 
 use crate::DEPTH_FORMAT;
 
-/// Une flamme (ou la flaque de feu au sol).
+/// Une case en feu.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct Flame {
-    /// Pied de la flamme (monde) et sa taille (blocs : elle fait 1,2 fois sa taille de
-    /// large, 1,6 de haut ; la flaque, deux fois sa taille de côté).
+    /// Milieu de la case, au sol (monde), et hauteur de ses plus hautes flammes (blocs).
     pub pos: [f32; 3],
-    pub size: f32,
-    /// Graine : chaque flamme bouge à sa façon.
+    pub height: f32,
+    /// Graine : la lueur au sol de chaque case vacille à sa façon.
     pub seed: f32,
     /// Force (0 : éteinte … 1).
     pub force: f32,
-    /// 0 : une flamme debout ; 1 : la flaque au sol.
-    pub pool: f32,
+    /// Côtés où la case voisine brûle aussi (bits : 1 +x, 2 −x, 4 +z, 8 −z) : ailleurs, le
+    /// feu s'arrête en s'amincissant.
+    pub sides: f32,
     pub _pad: f32,
 }
 
@@ -109,6 +110,9 @@ impl Flames {
             },
         };
         let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+        // `post` : après l'anticrénelage, les faces arrière de la boîte (dessinées même
+        // l'œil dedans), et le shader lit la profondeur du monde ; sinon ses faces avant,
+        // cachées par ce qui est devant.
         let pipeline = |post: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("flammes"),
@@ -124,7 +128,11 @@ impl Flames {
                     }],
                 },
                 primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
+                    cull_mode: Some(if post {
+                        wgpu::Face::Front
+                    } else {
+                        wgpu::Face::Back
+                    }),
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -167,10 +175,15 @@ impl Flames {
         }
     }
 
-    pub fn prepare(&mut self, queue: &wgpu::Queue, flames: &[Flame]) {
+    /// Cases en feu de l'image, vues de `eye` : dessinées de la plus lointaine à la plus
+    /// proche (chacune couvre un peu ce qui est derrière elle).
+    pub fn prepare(&mut self, queue: &wgpu::Queue, flames: &[Flame], eye: glam::Vec3) {
         let n = flames.len().min(MAX_FLAMES);
         if n > 0 {
-            queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&flames[..n]));
+            let mut sorted = flames[..n].to_vec();
+            let far = |f: &Flame| (glam::Vec3::from(f.pos) - eye).length_squared();
+            sorted.sort_by(|a, b| far(b).total_cmp(&far(a)));
+            queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&sorted));
         }
         self.count = n as u32;
     }
@@ -202,6 +215,6 @@ impl Flames {
             pass.set_bind_group(2, d, &[]);
         }
         pass.set_vertex_buffer(0, self.buffer.slice(..));
-        pass.draw(0..6, 0..self.count);
+        pass.draw(0..36, 0..self.count);
     }
 }

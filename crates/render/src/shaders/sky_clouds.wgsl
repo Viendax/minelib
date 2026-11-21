@@ -64,9 +64,11 @@ fn shape(q: vec3<f32>, h: f32, wide: bool) -> f32 {
     // Ciel couvert : le dessous de la couche n'est pas un plafond lisse (il remonte là où
     // le bruit est faible), et la couche reste plus ou moins dense selon le bruit : des
     // masses sombres, des trouées plus claires.
+    // (v217) Ce dessous ondule doucement et s'effiloche : il n'a ni marches ni parois (elles
+    // découpaient le ciel d'orage en aplats gris aux bords nets).
     let over = c.haze.w;
-    let lo = over * 0.3 * clamp(1.2 - 1.4 * w.r, 0.0, 1.0);
-    let profile = smoothstep(lo, lo + 0.06, h) * (1.0 - smoothstep(top * 0.5, top, h));
+    let lo = over * 0.13 * clamp(1.2 - 1.4 * w.r, 0.0, 1.0);
+    let profile = smoothstep(lo, lo + mix(0.06, 0.24, over), h) * (1.0 - smoothstep(top * 0.5, top, h));
     let base = clamp((w.r * profile - thr) * 3.0, 0.0, 1.0);
     return base * mix(1.0, 0.35 + 1.1 * smoothstep(0.45, 0.95, w.r), over);
 }
@@ -126,6 +128,13 @@ fn fs_clouds(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let jitter = fract(52.9829189 * fract(dot(pos.xy, vec2<f32>(0.06711056, 0.00583715))));
     let light = normalize(c.light_dir.xyz);
     let cos_t = dot(d, light);
+    // (v217) Chemin qui reste dans la couche vers la lumière après la marche des ombres,
+    // en gros (blocs) : très long quand elle est basse.
+    let rest = min(thick * 0.6 / max(abs(light.y), 0.03), 3000.0);
+    // Lumière qui arrive par en dessous (soleil ou lune sous l'horizon de la couche) : la
+    // planète la cache, elle s'éteint en passant sous l'horizon ; et sous un ciel couvert
+    // il n'y a pas de bord par où une lumière basse entrerait.
+    let below = smoothstep(-0.03, 0.05, light.y) * (1.0 - c.haze.w * (1.0 - smoothstep(0.05, 0.35, light.y)));
     // Diffusion multiple approchée : trois « octaves », de plus en plus étalées et de moins
     // en moins absorbées.
     let p0 = phase(cos_t, 1.0);
@@ -173,6 +182,10 @@ fn fs_clouds(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             ls *= 1.8;
         }
+        // (v217) La marche s'arrête à 270 blocs : sous un ciel couvert, la couche continue
+        // bien au-delà. Sans ce reste, un soleil bas éclairait de biais le dessous des
+        // nuages d'orage (des traînées beiges, en pointillé d'un pixel à l'autre).
+        od += c.shape.y * 0.5 * c.haze.w * c.haze.w * rest;
         // Dans les creux et sur les bords (peu denses), moins de lumière a été diffusée
         // vers nous que dans le cœur d'un bourgeon : c'est ce qui dessine la « choucroute ».
         let crease = 0.35 + 0.65 * pow(e, mix(0.4, 1.4, smoothstep(0.15, 0.9, h)));
@@ -180,10 +193,15 @@ fn fs_clouds(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // fois (elle décroît lentement avec l'épaisseur) : le gris des ciels de pluie, plus
         // sombre sous les masses épaisses.
         let deep = 0.22 * (1.0 - exp(-od * 0.5)) / (1.0 + 0.10 * od);
-        let direct = c.light_col.rgb
+        let direct = c.light_col.rgb * below
             * (crease * (exp(-od) * p0 + exp(-od * 0.35) * p1 + exp(-od * 0.12) * p2) + deep);
         // Lumière du ciel : plus forte en haut du nuage, celle du sol en dessous.
-        let amb = mix(c.amb_bot.rgb, c.amb_top.rgb, pow(h, 0.7)) * (0.55 + 0.45 * exp(-dens * (1.0 - h) * thick * 0.6));
+        var amb = mix(c.amb_bot.rgb, c.amb_top.rgb, pow(h, 0.7) * (1.0 - 0.75 * c.haze.w)) * (0.55 + 0.45 * exp(-dens * (1.0 - h) * thick * 0.6));
+        // (v217) Sous un ciel couvert, la lumière vient d'en haut à travers la couche : le
+        // dessous est plus clair là où elle est mince, sombre sous ses masses épaisses, en
+        // dégradés doux (avant : un gris uni).
+        let load = textureSampleLevel(noise, noise_s, vec3<f32>(q.x, 900.0, q.z) / 3100.0, 0.0).a;
+        amb *= mix(1.0, mix(1.38, 0.5, smoothstep(0.3, 0.72, load * 0.55 + base * 0.45)), c.haze.w);
         let a = 1.0 - exp(-dens * ds);
         lum += through * a * (direct + amb);
         far += through * a * s;

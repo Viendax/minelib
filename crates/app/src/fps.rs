@@ -2084,8 +2084,9 @@ impl Fps {
         }
     }
 
-    /// (v216) Flammes des molotovs qui brûlent, pour le rendu : sur chaque case en feu,
-    /// une grande flamme, une plus petite à côté, et la flaque au sol. Le feu prend en un
+    /// (v216) Feu des molotovs qui brûlent, pour le rendu. (v217) Une boîte de flammes par
+    /// case en feu (un vrai volume, voir flame.wgsl), avec les côtés où la case voisine
+    /// brûle aussi : le feu ne s'amincit qu'au bord de la surface qui brûle. Il prend en un
     /// tiers de seconde et s'éteint pendant sa dernière seconde.
     pub fn flames(&self) -> Vec<minelib_render::Flame> {
         let mut out = Vec::new();
@@ -2094,28 +2095,27 @@ impl Fps {
                 continue;
             };
             let force = (age / 0.35).clamp(0.0, 1.0) * (7.0 - age).clamp(0.0, 1.0);
+            let key = |c: &Vec3| (c.x.floor() as i32, c.z.floor() as i32);
+            let burning: std::collections::HashSet<(i32, i32)> = cells.iter().map(key).collect();
             for (i, c) in cells.iter().enumerate() {
-                // Tirages fixes par case : chaque flamme garde sa place et sa taille.
-                let h = |k: u32| {
-                    let x = ((c.x * 12.9898 + c.z * 78.233 + k as f32 * 37.719).sin() * 43758.547)
-                        .fract()
-                        .abs();
-                    x
-                };
-                let seed = i as f32 * 7.31 + h(0) * 50.0;
-                let flame = |pos: Vec3, size: f32, seed: f32, pool: f32| minelib_render::Flame {
-                    pos: pos.to_array(),
-                    size,
-                    seed,
+                // Tirage fixe par case : elle garde sa hauteur.
+                let h = ((c.x * 12.9898 + c.z * 78.233).sin() * 43758.547)
+                    .fract()
+                    .abs();
+                let (x, z) = key(c);
+                let sides = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (dx, dz))| burning.contains(&(x + dx, z + dz)))
+                    .fold(0u32, |m, (k, _)| m | 1 << k);
+                out.push(minelib_render::Flame {
+                    pos: c.to_array(),
+                    height: 2.0 + 0.25 * h,
+                    seed: i as f32 * 7.31 + h * 50.0,
                     force,
-                    pool,
+                    sides: sides as f32,
                     _pad: 0.0,
-                };
-                out.push(flame(*c, 0.95, seed, 1.0));
-                let a = *c + Vec3::new(h(1) - 0.5, 0.0, h(2) - 0.5) * 0.35;
-                out.push(flame(a, 1.25 + 0.6 * h(3), seed + 1.7, 0.0));
-                let b = *c + Vec3::new(h(4) - 0.5, 0.0, h(5) - 0.5) * 0.8;
-                out.push(flame(b, 0.7 + 0.4 * h(6), seed + 4.1, 0.0));
+                });
             }
         }
         out

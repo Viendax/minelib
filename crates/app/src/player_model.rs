@@ -442,7 +442,12 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         }
         // Bras tendu vers l'avant (rotation positive : la main part vers −z), qui suit
         // un peu le regard (l'objet tenu est tourné comme à la 1re personne).
-        let raise = if side > 0.0 && pose.held.is_some() {
+        let raise = if side > 0.0 && pose.held == Some(Held::Zeus) {
+            // (v217) Foudre de Zeus : le bras levé devant soi, quel que soit le regard
+            // (l'éclair reste debout, loin du corps : sa lumière, qui en part, garde
+            // l'ombre du joueur entier).
+            1.15
+        } else if side > 0.0 && pose.held.is_some() {
             (0.65 + 0.6 * pose.pitch.clamp(-1.4, 1.4)).clamp(0.0, 2.0)
         } else {
             0.0
@@ -869,16 +874,11 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
 }
 
 /// (v216) Repère de la Foudre de Zeus tenue par le modèle (blocs → monde) : le poing à
-/// l'origine, l'éclair le long de +y, tenu comme à la première personne par rapport au
-/// regard. `None` sans bras droit.
+/// l'origine, l'éclair le long de +y. (v217) Debout (à la verticale du monde), quel que
+/// soit le regard. `None` sans bras droit.
 pub fn zeus_frame(pose: &Pose) -> Option<Mat4> {
     let at = hand_frame(pose)?.transform_point3(Vec3::new(0.0, 0.0, -2.0));
-    Some(
-        Mat4::from_translation(at)
-            * Mat4::from_rotation_y(-pose.yaw)
-            * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4))
-            * crate::hand::zeus_rotation(),
-    )
+    Some(Mat4::from_translation(at) * Mat4::from_rotation_y(-pose.yaw))
 }
 
 /// Position (monde) de la flamme d'une torche tenue en main : la lumière part de là.

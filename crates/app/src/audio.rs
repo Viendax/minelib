@@ -828,12 +828,16 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                 // (v216) La pluie : une boucle, créée à la première averse, et son volume
                 // propre (sans celui du jeu).
                 let mut rain: Option<(Sink, f32)> = None;
+                // (v217) Les tonnerres en cours, à part : ils se taisent quand on quitte la
+                // partie.
+                let mut thunders: Vec<(Sink, f32)> = Vec::new();
                 // (v220) Crépitements des éclairs tenus : une boucle par éclair.
                 let mut crackling: HashMap<u64, rodio::SpatialSink> = HashMap::new();
                 while let Ok(cmd) = rx.recv() {
                     if cmd.reopen {
                         // Les sons en cours étaient liés à l'ancienne sortie.
                         sinks.clear();
+                        thunders.clear();
                         voices.clear();
                         rain = None;
                         crackling.clear();
@@ -883,6 +887,10 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                     }
                     // (v216) Pluie : son de fond en boucle, à son volume (× celui du jeu).
                     if let Some(volume) = cmd.rain {
+                        // (v217) Partie quittée : le tonnerre en cours se tait aussi.
+                        if volume < 0.0 {
+                            thunders.clear();
+                        }
                         if volume <= 0.0 {
                             if let Some((r, base)) = &mut rain {
                                 r.pause();
@@ -908,8 +916,9 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                     }
                     // (v216) Son calculé (tonnerre).
                     if let Some((samples, rate)) = cmd.pcm {
-                        if sinks.len() >= 48 {
-                            sinks.remove(0);
+                        thunders.retain(|s| !s.0.empty());
+                        if thunders.len() >= 16 {
+                            thunders.remove(0);
                         }
                         if let Ok(sink) = Sink::try_new(handle) {
                             sink.set_volume(cmd.volume * master());
@@ -918,14 +927,14 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                                     .speed(cmd.speed.clamp(0.5, 2.0))
                                     .delay(Duration::from_secs_f32(cmd.delay.max(0.0))),
                             );
-                            sinks.push((sink, cmd.volume));
+                            thunders.push((sink, cmd.volume));
                         }
                         continue;
                     }
                     // (v215) Volume du jeu changé : tout de suite pour les sons en cours.
                     if cmd.file.is_empty() && cmd.voice.is_none() {
                         let m = master();
-                        for (sink, base) in &sinks {
+                        for (sink, base) in sinks.iter().chain(&thunders) {
                             sink.set_volume(base * m);
                         }
                         if let Some((r, base)) = &rain {
@@ -1006,10 +1015,25 @@ pub fn play(sfx: Sfx, delay: f32, gain: f32) {
     }
 }
 
+/// (v217) Numéro de la partie pour les sons de la météo : un tonnerre encore en calcul
+/// quand on la quitte ne part plus.
+static WEATHER_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// (v217) La partie est quittée : la pluie s'arrête et les tonnerres en cours se taisent
+/// (ils continuaient à l'accueil).
+pub fn weather_off() {
+    WEATHER_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    send_rain(-1.0);
+}
+
 /// (v216) Volume du bruit de la pluie (0 : elle s'arrête), sans le volume du jeu (il s'y
 /// ajoute, voir `set_master`). À appeler quand il change : la pluie continue toute seule
 /// entre deux appels.
 pub fn rain(volume: f32) {
+    send_rain(volume.clamp(0.0, 1.0));
+}
+
+fn send_rain(volume: f32) {
     if let Some(tx) = sender() {
         if let Ok(tx) = tx.lock() {
             let _ = tx.send(Cmd {
@@ -1020,7 +1044,7 @@ pub fn rain(volume: f32) {
                 voice: None,
                 reopen: false,
                 pcm: None,
-                rain: Some(volume.clamp(0.0, 1.0)),
+                rain: Some(volume),
                 crackle: None,
             });
         }
@@ -1039,10 +1063,15 @@ pub fn thunder(distance: f32, seed: u32) {
         return;
     };
     let started = std::time::Instant::now();
+    let epoch = WEATHER_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
     let _ = std::thread::Builder::new()
         .name("tonnerre".into())
         .spawn(move || {
             let (pcm, rate) = synth::thunder(distance, seed);
+            // (v217) Partie quittée entre-temps : il ne part plus.
+            if WEATHER_EPOCH.load(std::sync::atomic::Ordering::Relaxed) != epoch {
+                return;
+            }
             let delay = distance / 343.0 - started.elapsed().as_secs_f32();
             let _ = tx.send(Cmd {
                 file: "",

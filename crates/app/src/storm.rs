@@ -168,6 +168,8 @@ pub struct Storm {
     pub weather: Weather,
     strikes: Vec<Strike>,
     pub held: HeldBolt,
+    /// (v217) Étincelles dans le monde : la gerbe d'une foudre tombée tout près.
+    sparks: HeldBolt,
     /// Segments à dessiner cette image : dans le monde, et à la première personne.
     pub bolts: Vec<BoltSeg>,
     pub hand_bolts: Vec<BoltSeg>,
@@ -188,6 +190,10 @@ pub struct Storm {
     /// Essais (MINELIB_ZEUS, MINELIB_THOR) : objet déjà donné, temps avant le prochain coup.
     pub test_given: bool,
     pub test_in: f32,
+    /// (v217) Horloge des éclairs posés au sol.
+    clock: f32,
+    /// Œil du joueur à la dernière image.
+    eye: Vec3,
 }
 
 impl Storm {
@@ -196,6 +202,7 @@ impl Storm {
             weather: Weather::new(seed),
             strikes: Vec::new(),
             held: HeldBolt::default(),
+            sparks: HeldBolt::default(),
             bolts: Vec::new(),
             hand_bolts: Vec::new(),
             flash: 0.0,
@@ -210,6 +217,8 @@ impl Storm {
             active: false,
             test_given: false,
             test_in: 0.0,
+            clock: 0.0,
+            eye: Vec3::ZERO,
         }
     }
 
@@ -220,6 +229,8 @@ impl Storm {
         self.hand_bolts.clear();
         self.active = f.active;
         self.cooldown = (self.cooldown - dt).max(0.0);
+        self.clock += dt;
+        self.eye = f.eye;
         if f.active {
             self.weather.update(dt, f.online.then(weather::unix_now));
             // La foudre du ciel : elle vise une colonne, le relief l'attire.
@@ -229,32 +240,63 @@ impl Storm {
                     let pos = Vec3::new(x as f32 + 0.5, (top + 1) as f32, z as f32 + 0.5);
                     self.strikes
                         .push(Strike::new(pos, spot.seed, cloud_y(pos), spot.delay));
+                    self.maybe_cloud_bolt(pos, spot.delay);
                 }
             }
         }
         let mut hurt = 0u8;
         for s in &mut self.strikes {
             if s.update(dt) {
-                crate::audio::thunder((s.pos - f.eye).length(), s.seed);
+                match s.kind {
+                    // (Le tonnerre d'un éclair des nuages part avec sa lueur.)
+                    lightning::Kind::Cloud => {}
+                    // Celle qui part de la main claque tout près.
+                    lightning::Kind::Sky => crate::audio::thunder(25.0, s.seed),
+                    lightning::Kind::Ground => {
+                        let d = (s.pos - f.eye).length();
+                        crate::audio::thunder(d, s.seed);
+                        // (v217) Une gerbe d'étincelles jaillit du point frappé : dense tout
+                        // près, et encore visible de loin (elles volent alors plus loin,
+                        // pour rester une gerbe à l'écran).
+                        if d < 420.0 {
+                            let far = (d / 45.0).max(1.0);
+                            let n = if d < 70.0 { 60 } else { 34 };
+                            self.sparks
+                                .burst(s.pos + Vec3::Y * 0.1, Vec3::Y, n, 9.0 * far);
+                        }
+                    }
+                }
                 if s.hurts(f.feet) {
                     hurt = hurt.saturating_add(lightning::DAMAGE);
                 }
             }
         }
         self.strikes.retain(|s| !s.done());
+        self.sparks.update(dt, Mat4::IDENTITY, false);
+        let mut arcs = std::mem::take(&mut self.arcs);
+        arcs.clear();
+        self.sparks.sparks(&mut arcs);
+        lightning::in_world(&arcs, Mat4::IDENTITY, &mut self.bolts);
+        self.arcs = arcs;
         // Éclat sur le monde (il faiblit avec la distance) et lueur dans les nuages, du
         // côté de l'éclair le plus fort.
         let mut best = (0.0f32, [0.0f32; 2]);
         for s in &self.strikes {
-            s.segments(&mut self.bolts);
+            s.segments(f.eye, &mut self.bolts);
             let l = s.light();
-            if l <= 0.0 {
+            // (L'éclat d'un éclair des nuages vient de sa lueur, plus bas.)
+            if l <= 0.0 || s.kind == lightning::Kind::Cloud {
                 continue;
             }
             let d = Vec3::new(s.pos.x - f.eye.x, 0.0, s.pos.z - f.eye.z);
             let level = l / (1.0 + (d.length() / 150.0).powi(2));
             if level > best.0 {
-                let n = d.normalize_or_zero();
+                // (Celle qui monte de la main : les nuages s'allument du côté où elle va.)
+                let n = if s.kind == lightning::Kind::Sky {
+                    s.heading
+                } else {
+                    d.normalize_or_zero()
+                };
                 best = (level, [n.x, n.z]);
             }
         }
@@ -281,6 +323,11 @@ impl Storm {
                 });
                 let far = self.rng.range(450.0, 1500.0);
                 crate::audio::thunder(far, self.rng.next() as u32);
+                // (v217) Deux fois sur trois on voit l'éclair lui-même : il court sous la
+                // base des nuages et dedans, de ce côté-là du ciel, sans tomber.
+                if self.rng.unit() < 0.67 {
+                    self.cloud_bolt(f.eye, [a.cos(), a.sin()]);
+                }
             }
         }
         if let Some(g) = &self.glow {
@@ -319,6 +366,88 @@ impl Storm {
     pub fn strike(&mut self, pos: Vec3) {
         let seed = self.rng.next() as u32;
         self.strikes.push(Strike::new(pos, seed, cloud_y(pos), 0.0));
+        self.maybe_cloud_bolt(pos, 0.0);
+    }
+
+    /// (v220) Près de trois fois sur dix, un éclair court aussi dans les nuages au moment
+    /// où la foudre part vers `pos` (foudre du ciel, Foudre de Zeus ou `/thor`, par tous
+    /// les temps), de ce côté-là du ciel.
+    fn maybe_cloud_bolt(&mut self, pos: Vec3, delay: f32) {
+        if self.rng.unit() >= 0.3 {
+            return;
+        }
+        let eye = self.eye;
+        let to = Vec3::new(pos.x - eye.x, 0.0, pos.z - eye.z);
+        let a = self.rng.range(0.0, std::f32::consts::TAU);
+        let side = to.normalize_or(Vec3::new(a.cos(), 0.0, a.sin()));
+        let away = (to.length() + self.rng.range(-60.0, 160.0)).clamp(80.0, 900.0);
+        let before = self.strikes.len();
+        self.cloud_bolt_at(eye, [side.x, side.z], away);
+        if let Some(s) = self.strikes.get_mut(before) {
+            s.delay = delay;
+        }
+    }
+
+    /// (v217) En visant le ciel : la foudre ne tombe pas, elle part de `from` (la pointe
+    /// de l'éclair tenu, ou la main) dans la direction `dir`, monte et traverse les
+    /// nuages. `eye_y` : hauteur de l'œil (la base des nuages en dépend).
+    pub fn strike_up(&mut self, from: Vec3, dir: Vec3, eye_y: f32) {
+        let seed = self.rng.next() as u32;
+        let base = minelib_render::sky::cloud_base_y(eye_y);
+        let thick = minelib_render::sky::thickness(&self.sky());
+        self.strikes.push(Strike::up(from, dir, seed, base, thick));
+        self.held.surge(from, dir);
+        self.maybe_cloud_bolt(from + dir * 400.0, 0.0);
+    }
+
+    /// (v217) Éclair d'orage dans les nuages, du côté `side` (x, z) du ciel vu de `eye` : il
+    /// part de la couche, descend sous sa base (on l'y voit en entier), puis y remonte ou
+    /// se perd dans l'air.
+    fn cloud_bolt(&mut self, eye: Vec3, side: [f32; 2]) {
+        let away = self.rng.range(260.0, 950.0);
+        self.cloud_bolt_at(eye, side, away);
+    }
+
+    /// Le même, à `away` blocs (à plat) de `eye`.
+    fn cloud_bolt_at(&mut self, eye: Vec3, side: [f32; 2], away: f32) {
+        use minelib_render::sky::{cloud_base_y, layer_y, thickness};
+        let thick = thickness(&self.sky());
+        let side = Vec3::new(side[0], 0.0, side[1]);
+        let across = Vec3::new(-side.z, 0.0, side.x);
+        let half = self.rng.range(150.0, 420.0);
+        let turn = self.rng.range(-0.7, 0.7);
+        let along = (across * turn.cos() + side * turn.sin()).normalize();
+        let centre = eye + side * away;
+        let rng = &mut self.rng;
+        let at = |k: f32, above: f32, rng: &mut Rng| {
+            let p = centre + along * (half * k) + side * rng.range(-60.0, 60.0);
+            let flat = Vec3::new(p.x - eye.x, 0.0, p.z - eye.z).length();
+            Vec3::new(p.x, layer_y(eye.y, flat, above), p.z)
+        };
+        let a = at(-1.0, thick * rng.range(0.04, 0.3), rng);
+        let dip = at(rng.range(-0.25, 0.25), -rng.range(10.0, 55.0), rng);
+        // Une fois sur trois, il finit dans l'air sous les nuages au lieu d'y remonter.
+        let b = if rng.unit() < 0.33 {
+            at(1.0, -rng.range(30.0, 110.0), rng)
+        } else {
+            at(1.0, thick * rng.range(0.04, 0.3), rng)
+        };
+        let seed = rng.next() as u32;
+        self.strikes
+            .push(Strike::cloud(a, dip, b, seed, cloud_base_y(eye.y)));
+    }
+
+    /// (v217) La Foudre de Zeus posée au sol en `at` (objet lâché) : le même éclair qu'en
+    /// main, en petit, debout. `phase` : chaque objet vit à son rythme.
+    pub fn ground_item(&mut self, at: Vec3, phase: f32) {
+        let mut arcs = std::mem::take(&mut self.arcs);
+        arcs.clear();
+        HeldBolt::arcs_at(self.clock + phase, 1.0, &mut arcs);
+        let scale = GROUND_ITEM / lightning::HELD_LEN;
+        let place = Mat4::from_translation(at + Vec3::Y * (GROUND_ITEM * 0.5 + 0.03))
+            * Mat4::from_scale(Vec3::splat(scale));
+        lightning::in_world_scaled(&arcs, place, scale, &mut self.bolts);
+        self.arcs = arcs;
     }
 
     /// La Foudre de Zeus tenue en main, pour cette image. `local` : du repère de l'éclair
@@ -352,22 +481,32 @@ impl Storm {
     pub fn lights(&self, eye: Vec3, out: &mut Vec<DynLight>) {
         for (k, s) in self.strikes.iter().enumerate() {
             let l = s.light();
-            if l < 0.03 || (s.pos - eye).length() > 110.0 {
+            if l < 0.03
+                || s.kind == lightning::Kind::Cloud
+                || (s.pos - eye).length() > 110.0
+            {
                 continue;
             }
-            out.push(DynLight {
-                id: STRIKE_LIGHT_ID + (k as u64 & 0xff),
-                kind: DynKind::Point,
-                pos: (s.pos + Vec3::Y * 2.5).to_array(),
-                color: BOLT_LIGHT,
-                intensity: 16.0 * l,
-                range: 26.0,
-                // (Pas d'ombres : un éclair dure un tiers de seconde, leur calcul ferait
-                // sauter une image.)
-                shadows: false,
-                beam: 0.0,
-                ..Default::default()
-            });
+            // (v220) Deux lumières sur le canal lui-même : tout près du point frappé, et
+            // plus haut le long de l'éclair (elle éclaire de là où il passe).
+            let [low, high] = s.light_points();
+            for (n, (pos, intensity, range)) in
+                [(low, 16.0, 26.0), (high, 20.0, 48.0)].into_iter().enumerate()
+            {
+                out.push(DynLight {
+                    id: STRIKE_LIGHT_ID + ((k as u64 & 0x7f) << 1) + n as u64,
+                    kind: DynKind::Point,
+                    pos: pos.to_array(),
+                    color: BOLT_LIGHT,
+                    intensity: intensity * l,
+                    range,
+                    // (Pas d'ombres : un éclair dure un tiers de seconde, leur calcul
+                    // ferait sauter une image.)
+                    shadows: false,
+                    beam: 0.0,
+                    ..Default::default()
+                });
+            }
         }
     }
 
@@ -379,8 +518,8 @@ impl Storm {
             kind: DynKind::Point,
             pos: pos.to_array(),
             color: BOLT_LIGHT,
-            intensity: 2.4 * self.held.glow(),
-            range: 12.0,
+            intensity: 3.0 * self.held.glow(),
+            range: 14.0,
             shadows: true,
             // (Comme la torche tenue : l'ombre du joueur, sauf sa main tout contre.)
             owner: crate::flashlight::NEAR_FLAME,
@@ -436,6 +575,48 @@ impl Storm {
     }
 }
 
+/// (v217) Hauteur de la Foudre de Zeus posée au sol (blocs).
+const GROUND_ITEM: f32 = 0.55;
+
+/// (v217) Quitter la partie fait taire la pluie et le tonnerre (ils continuaient à
+/// l'accueil : la boucle de la pluie ne s'arrêtait qu'avec la météo de la partie).
+impl Drop for Storm {
+    fn drop(&mut self) {
+        crate::audio::weather_off();
+    }
+}
+
+/// (v217) Le relief au loin, pour le sol que le ciel dessine sous l'horizon au-delà du
+/// monde chargé : couleur moyenne du dessus des blocs (`color` : celle d'une image de bloc)
+/// et hauteur moyenne, relevées sur deux cercles autour de `eye` (à 55 % et 80 % de
+/// `reach`, la distance de vue). `None` : rien de chargé là-bas.
+pub fn far_ground(
+    world: &World,
+    eye: Vec3,
+    reach: f32,
+    color: &dyn Fn(u16) -> [f32; 3],
+) -> Option<([f32; 3], f32)> {
+    let (mut sum, mut height, mut n) = ([0.0f32; 3], 0.0f32, 0u32);
+    for k in 0..16 {
+        let a = k as f32 * std::f32::consts::TAU / 16.0;
+        let r = reach * if k % 2 == 0 { 0.8 } else { 0.55 };
+        let (x, z) = (
+            (eye.x + a.cos() * r).floor() as i32,
+            (eye.z + a.sin() * r).floor() as i32,
+        );
+        let Some(y) = column_top(world, x, z) else {
+            continue;
+        };
+        let c = color(world.get(x, y, z).def().tex[0]);
+        for i in 0..3 {
+            sum[i] += c[i];
+        }
+        height += (y + 1) as f32;
+        n += 1;
+    }
+    (n >= 3).then(|| (sum.map(|v| v / n as f32), height / n as f32))
+}
+
 /// D'où part un éclair qui frappe `pos` : la base des nuages, toujours bien au-dessus.
 fn cloud_y(pos: Vec3) -> f32 {
     CLOUD_Y.max(pos.y + 160.0)
@@ -487,11 +668,19 @@ mod tests {
             let mut l = Vec::new();
             s.lights(feet, &mut l);
             lights = lights.max(l.len());
-            assert!(l.iter().all(|l| !l.shadows && l.intensity <= 16.0));
+            assert!(l.iter().all(|l| !l.shadows && l.intensity <= 20.0));
+            // (v220) Ses lumières sont sur son canal : au-dessus du point frappé, l'une
+            // tout près de lui, l'autre une vingtaine de blocs plus haut.
+            if let [low, high] = &l[..] {
+                let at = |l: &DynLight| Vec3::from(l.pos) - Vec3::new(5.5, 65.0, 5.0);
+                assert!(at(low).length() < 4.0, "{:?}", at(low));
+                assert!(at(high).y > 12.0 && at(high).length() < 28.0, "{:?}", at(high));
+                assert_ne!(low.id, high.id);
+            }
         }
         assert_eq!(hurt, lightning::DAMAGE as u32);
         assert!(
-            flash > 0.9 && lights == 1 && segs > 150,
+            flash > 0.9 && lights == 2 && segs > 150,
             "{flash} {lights} {segs}"
         );
         assert!(s.strikes.is_empty() && s.flash == 0.0 && s.bolts.is_empty());
@@ -533,7 +722,8 @@ mod tests {
         let (mut on_tower, mut on_ground, mut seen) = (0, 0, std::collections::HashSet::new());
         for _ in 0..40_000 {
             s.update(0.05, &frame(&world, feet));
-            for k in &s.strikes {
+            // (Les éclairs des nuages ne tombent pas : on ne compte que la foudre.)
+            for k in s.strikes.iter().filter(|k| k.kind == lightning::Kind::Ground) {
                 if seen.insert(k.seed) {
                     if k.pos == Vec3::new(8.5, 95.0, 8.5) {
                         on_tower += 1;

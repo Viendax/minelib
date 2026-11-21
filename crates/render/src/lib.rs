@@ -40,7 +40,7 @@ mod water_mirror;
 
 pub use capture::Screenshot;
 
-pub use bolts::{BoltSeg, BOLT_LIGHT, BOLT_TINT};
+pub use bolts::{BoltSeg, BOLT, BOLT_CLOUD_GLOW, BOLT_LIGHT, BOLT_TINT};
 #[doc(hidden)]
 pub use entity::draw_offscreen;
 pub use entity::{
@@ -618,6 +618,11 @@ pub struct FrameParams<'a> {
     /// (v216) Lueur d'un éclair dans les nuages : côté d'où elle vient (x, z, unitaire) et
     /// force (0 … 1).
     pub sky_flash: [f32; 3],
+    /// (v217) Sol au-delà du monde chargé, vu sous l'horizon : couleur du dessus des blocs
+    /// du lointain (linéaire, sans éclairage, voir `Renderer::layer_mean`) et sa hauteur ;
+    /// `None` : inconnu à cette image. Et la distance de brume de ce sol (blocs).
+    pub far_ground: Option<([f32; 3], f32)>,
+    pub haze_len: f32,
     /// (v216) Éclairs : segments lumineux dans le monde, et à la première personne (dans la
     /// main, déjà placés à l'écran).
     pub bolts: &'a [BoltSeg],
@@ -815,6 +820,9 @@ pub struct Renderer {
     /// Groupes de liaison du monde ; `bind_groups[i]` lit l'image de reflets `i`.
     bind_groups: [wgpu::BindGroup; 2],
     block_view: wgpu::TextureView,
+    /// (v217) Couleur moyenne de chaque image de bloc (linéaire) : le sol lointain prend
+    /// celle du relief autour.
+    layer_means: Vec<[f32; 3]>,
     refl: reflections::Reflections,
     pub pack_name: String,
     /// Pipelines du monde sans anticrénelage (essais) : compilés à la première utilisation.
@@ -1218,6 +1226,7 @@ impl Renderer {
         let voxels = rt::Voxels::new(&device);
         voxels.upload_palette(&queue, &block_tex);
         let block_view = upload_block_texture(&device, &queue, &block_tex);
+        let layer_means = layer_means(&block_tex);
         let refl = reflections::Reflections::new(&device, (1, 1));
         let mut dyn_gpu = lights::DynGpu::new(&device, &queue);
         dyn_gpu.bind_bake(&device, &voxels, &block_view, &block_sampler);
@@ -1468,6 +1477,7 @@ impl Renderer {
             block_sampler,
             bind_groups,
             block_view,
+            layer_means,
             refl,
             pack_name: pack.name.clone(),
             plain: std::sync::OnceLock::new(),
@@ -2209,6 +2219,8 @@ impl Renderer {
             sky_time: p.sky_time,
             weather: p.weather,
             flash: p.sky_flash,
+            ground: p.far_ground,
+            haze_len: p.haze_len,
         };
         self.sky.prepare(&self.queue, &input);
         self.sky.upload(&self.queue);
@@ -2245,10 +2257,20 @@ impl Renderer {
         }
     }
 
+    /// (v217) Couleur moyenne (linéaire) de l'image de bloc `layer`, sans ses pixels
+    /// transparents : le dessus d'un bloc vu de très loin.
+    pub fn layer_mean(&self, layer: u16) -> [f32; 3] {
+        self.layer_means
+            .get(layer as usize)
+            .copied()
+            .unwrap_or([0.1, 0.1, 0.1])
+    }
+
     /// Charge les textures d'un autre pack de ressources (blocs + interface).
     pub fn load_pack(&mut self, pack: &ResourcePack) {
         let block_tex = textures::load_block_textures(pack);
         self.block_view = upload_block_texture(&self.device, &self.queue, &block_tex);
+        self.layer_means = layer_means(&block_tex);
         self.dyn_gpu.bind_bake(
             &self.device,
             &self.voxels,
@@ -3305,11 +3327,11 @@ impl Renderer {
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         self.bolts
-            .prepare(&self.device, &self.queue, p.bolts, p.hand_bolts);
+            .prepare(&self.device, &self.queue, p.bolts, p.hand_bolts, &self.overlay.bolts);
         let fog = self.sky.globals().fog;
         self.rain
             .prepare(&self.queue, &p.rain, [fog[0], fog[1], fog[2]]);
-        self.flames.prepare(&self.queue, p.flames);
+        self.flames.prepare(&self.queue, p.flames, p.eye);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
         // (v217) Carte d'ombre du soleil des joueurs (lue aussi dans les miroirs).
         let sun_map = self.prepare_sun_map(p, &mut globals);
@@ -3539,11 +3561,11 @@ impl Renderer {
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
         self.bolts
-            .prepare(&self.device, &self.queue, p.bolts, p.hand_bolts);
+            .prepare(&self.device, &self.queue, p.bolts, p.hand_bolts, &self.overlay.bolts);
         let fog = self.sky.globals().fog;
         self.rain
             .prepare(&self.queue, &p.rain, [fog[0], fog[1], fog[2]]);
-        self.flames.prepare(&self.queue, p.flames);
+        self.flames.prepare(&self.queue, p.flames, p.eye);
         let mut stats = {
             let _c = perf::scope("rendu : tri des chunks");
             self.cull(view_proj, p.eye, p.fog_end)
@@ -4023,11 +4045,29 @@ fn draw_hud<'a>(
     if let Some(w) = water {
         w.draw(pass);
     }
+    // L'interface, avec à leur tour ses objets en 3D et (v217) ses éclairs.
     let mut done = 0;
-    for (mark, range) in &overlay.splits {
-        overlay.draw_range(pass, done..*mark);
-        vm.draw_range(pass, group, hand + range.start..hand + range.end);
-        done = *mark;
+    let (mut m, mut e) = (0, 0);
+    loop {
+        let model = overlay.splits.get(m);
+        let bolt = overlay.bolt_splits.get(e).filter(|_| bolts.is_some());
+        match (model, bolt) {
+            (Some((mark, range)), b) if b.is_none_or(|b| *mark <= b.0) => {
+                overlay.draw_range(pass, done..*mark);
+                vm.draw_range(pass, group, hand + range.start..hand + range.end);
+                done = *mark;
+                m += 1;
+            }
+            (_, Some((mark, range))) => {
+                overlay.draw_range(pass, done..*mark);
+                if let Some(b) = bolts {
+                    b.draw_ui(pass, group, range.clone());
+                }
+                done = *mark;
+                e += 1;
+            }
+            _ => break,
+        }
     }
     overlay.draw_range(pass, done..u32::MAX);
 }
@@ -4060,6 +4100,28 @@ fn selection(sel: Option<([f32; 3], [f32; 3])>) -> ([f32; 4], [f32; 4]) {
         Some((a, b)) => ([a[0], a[1], a[2], 1.0], [b[0], b[1], b[2], 0.0]),
         None => ([0.0; 4], [0.0; 4]),
     }
+}
+
+/// (v217) Couleur moyenne de chaque image de bloc (linéaire), pesée par l'opacité.
+fn layer_means(tex: &textures::BlockTextures) -> Vec<[f32; 3]> {
+    tex.layers
+        .iter()
+        .map(|img| {
+            let (mut sum, mut weight) = ([0.0f32; 3], 0.0f32);
+            for px in img.data.chunks_exact(4) {
+                let a = px[3] as f32 / 255.0;
+                for c in 0..3 {
+                    sum[c] += (px[c] as f32 / 255.0).powf(2.2) * a;
+                }
+                weight += a;
+            }
+            if weight > 0.0 {
+                sum.map(|v| v / weight)
+            } else {
+                [0.1, 0.1, 0.1]
+            }
+        })
+        .collect()
 }
 
 /// Groupe de liaison du monde : uniformes + tableau de textures des blocs (avec mipmaps).
@@ -4664,7 +4726,7 @@ mod tests {
             ),
             (
                 "éclairs",
-                include_str!("shaders/bolt.wgsl").to_string(),
+                bolts::source(),
                 &[],
             ),
             ("pluie", include_str!("shaders/rain.wgsl").to_string(), &[]),
@@ -4767,7 +4829,7 @@ mod tests {
                 "nuages",
                 include_str!("shaders/sky_clouds.wgsl").to_string(),
             ),
-            ("éclairs", include_str!("shaders/bolt.wgsl").to_string()),
+            ("éclairs", bolts::source()),
             ("pluie", include_str!("shaders/rain.wgsl").to_string()),
             ("flammes", include_str!("shaders/flame.wgsl").to_string()),
         ] {

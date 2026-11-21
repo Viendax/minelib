@@ -1,8 +1,9 @@
 //! (v216) Éclairs : la foudre, l'arc de la Foudre de Zeus tenue en main et ses étincelles.
 //! Le jeu fournit chaque image une liste de segments lumineux ; chacun est dessiné comme un
 //! rectangle tourné vers l'écran (un cœur blanc très fin, un halo bleuté), ajouté à l'image.
-//! Deux listes : dans le monde (cachés par les murs devant eux), et à la première personne
-//! (dans la main, par-dessus la main).
+//! Trois listes : dans le monde (cachés par les murs devant eux, et par les nuages une
+//! fois entrés dans leur couche), à la première personne (dans la main, par-dessus la
+//! main), et (v217) dans l'interface (l'icône de la Foudre de Zeus est le vrai éclair).
 
 use bytemuck::{Pod, Zeroable};
 
@@ -60,8 +61,10 @@ impl SceneDepth {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct BoltSeg {
-    /// Extrémités : dans le monde (xyz, w libre), ou déjà à l'écran (clip space, comme
-    /// `VmVertex::clip`) si `screen` vaut 1.
+    /// Extrémités : dans le monde (xyz), ou déjà à l'écran (clip space, comme
+    /// `VmVertex::clip`) si `screen` vaut 1. (v217) Dans le monde, `a[3]` : 1 = un éclair
+    /// (`BOLT`), 2 = sa lueur dans le nuage (`BOLT_CLOUD_GLOW` : large et douce, visible
+    /// seulement là où il y a du nuage).
     pub a: [f32; 4],
     pub b: [f32; 4],
     /// Teinte du halo (linéaire), et force à l'extrémité `a` (1 : plein éclat).
@@ -83,6 +86,20 @@ pub const BOLT_TINT: [f32; 3] = [0.42, 0.56, 1.0];
 
 /// Couleur de la lumière que jette un éclair (linéaire).
 pub const BOLT_LIGHT: [f32; 3] = [0.72, 0.82, 1.0];
+
+/// (v217) `BoltSeg::a[3]` d'un segment du monde : un éclair, ou sa lueur dans le nuage.
+pub const BOLT: f32 = 1.0;
+pub const BOLT_CLOUD_GLOW: f32 = 2.0;
+
+/// Le shader des éclairs, avec le ciel de world.wgsl : il y lit les nuages qui cachent un
+/// éclair entré dans leur couche.
+pub(crate) fn source() -> String {
+    format!(
+        "{}\n{}",
+        include_str!("shaders/bolt.wgsl"),
+        crate::entity::sky_wgsl()
+    )
+}
 
 struct Batch {
     buffer: wgpu::Buffer,
@@ -134,6 +151,8 @@ pub const MAX_SEGS: usize = 16_384;
 pub struct Bolts {
     world: Batch,
     hand: Batch,
+    /// (v217) Dans l'interface, dessinés à leur tour parmi ses éléments (`draw_ui`).
+    ui: Batch,
     /// Dans le monde : dans la passe du monde (sans anticrénelage), ou après
     /// l'anticrénelage, sur l'image finale (voir `SceneDepth`).
     plain: wgpu::RenderPipeline,
@@ -151,7 +170,7 @@ impl Bolts {
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("éclairs"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/bolt.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(source().into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("éclairs"),
@@ -226,22 +245,43 @@ impl Bolts {
         Self {
             world: Batch::new(device, "éclairs (monde)"),
             hand: Batch::new(device, "éclairs (main)"),
+            ui: Batch::new(device, "éclairs (interface)"),
             plain: pipeline(false, true),
             post: pipeline(true, false),
             over: pipeline(false, false),
         }
     }
 
-    /// Segments de l'image : dans le monde, et à la première personne.
+    /// Segments de l'image : dans le monde, à la première personne, et dans l'interface.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         world: &[BoltSeg],
         hand: &[BoltSeg],
+        ui: &[BoltSeg],
     ) {
         self.world.set(device, queue, "éclairs (monde)", world);
         self.hand.set(device, queue, "éclairs (main)", hand);
+        self.ui.set(device, queue, "éclairs (interface)", ui);
+    }
+
+    /// (v217) Éclairs de l'interface `range` (voir `overlay::Ui::bolts`), à leur tour dans
+    /// l'ordre de l'interface.
+    pub fn draw_ui<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        world: &'a wgpu::BindGroup,
+        range: std::ops::Range<u32>,
+    ) {
+        let range = range.start.min(self.ui.count)..range.end.min(self.ui.count);
+        if range.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&self.over);
+        pass.set_bind_group(0, world, &[]);
+        pass.set_vertex_buffer(0, self.ui.buffer.slice(..));
+        pass.draw(0..6, range);
     }
 
     /// Éclairs du monde, dans la passe du monde (sans anticrénelage).

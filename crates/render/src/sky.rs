@@ -89,6 +89,13 @@ pub struct SkyInput {
     pub weather: SkyWeather,
     /// Éclair : direction (xz, depuis la caméra) et force de la lueur dans les nuages.
     pub flash: [f32; 3],
+    /// (v217) Le sol au-delà des chunks chargés, vu sous l'horizon : sa couleur (celle du
+    /// dessus des blocs du lointain, linéaire, sans éclairage) et sa hauteur (blocs) ;
+    /// `None` : pas connu à cette image (le ciel garde ce qu'il savait).
+    pub ground: Option<([f32; 3], f32)>,
+    /// (v217) Distance (blocs) au bout de laquelle ce sol lointain a perdu les deux tiers
+    /// de sa couleur dans la brume de l'air (plus courte sous la pluie).
+    pub haze_len: f32,
 }
 
 /// Uniformes du ciel (`Sky` dans world.wgsl, liaison 21).
@@ -108,10 +115,15 @@ pub struct SkyGlobals {
     /// z = rayon de la caméra à l'instantané, w = poids (0 : pas affichée).
     pub cloud: [[f32; 4]; MAPS],
     /// x = rayon de la caméra maintenant, y = rayon du milieu de la couche, z = 1 / angle
-    /// du bord de la carte, w = libre.
+    /// du bord de la carte, w = épaisseur de la couche (blocs).
     pub cloud_geo: [f32; 4],
     /// xy = direction (xz) de l'éclair vu de la caméra, zw = libres.
     pub flash: [f32; 4],
+    /// (v217) Sol lointain, sous l'horizon : rgb = sa couleur (linéaire, sans éclairage),
+    /// w = hauteur de l'œil au-dessus de lui (blocs).
+    pub ground: [f32; 4],
+    /// x = 1 / distance de brume du sol lointain (voir `SkyInput::haze_len`), yzw = libres.
+    pub haze: [f32; 4],
 }
 
 /// Ce que le ciel ajoute au groupe de liaisons du monde (liaisons 16 à 21, voir le bloc
@@ -266,6 +278,26 @@ pub struct Sky {
     last_frame: std::time::Instant,
     /// Dernière entrée (pour `globals`).
     input: Option<SkyInput>,
+    /// (v217) Sol lointain (couleur, hauteur), lissé : il change sans à-coup quand on
+    /// passe d'une forêt à la mer.
+    ground: Option<([f32; 3], f32)>,
+}
+
+/// Sol lointain tant qu'on ne sait rien du monde autour : un vert sombre de prairie.
+const GROUND_DEFAULT: [f32; 3] = [0.09, 0.13, 0.06];
+
+/// Altitude (monde) de la base des nuages au-dessus d'un œil à la hauteur `eye_y`, comme
+/// le ciel la dessine : 420, ou plus haut si l'on monte (elle reste au-dessus de soi).
+pub fn cloud_base_y(eye_y: f32) -> f32 {
+    eye_y + (CLOUD_BASE - eye_y).max(MIN_BELOW)
+}
+
+/// Altitude (monde) d'un point de la couche de nuages, `above` blocs au-dessus de sa base,
+/// à la distance `away` (blocs, à plat) d'un œil à la hauteur `eye_y`. La couche est une
+/// coquille : au loin, elle descend vers l'horizon.
+pub fn layer_y(eye_y: f32, away: f32, above: f32) -> f32 {
+    let r = PLANET + CLOUD_BASE + above;
+    eye_y + (r * r - away * away).max(0.0).sqrt() - cam_radius(eye_y)
 }
 
 /// Rayon de la caméra pour le ciel : sous la base des nuages, d'au moins `MIN_BELOW`.
@@ -274,7 +306,7 @@ fn cam_radius(eye_y: f32) -> f32 {
 }
 
 /// Épaisseur de la couche de nuages (blocs) selon la météo.
-fn thickness(w: &SkyWeather) -> f32 {
+pub fn thickness(w: &SkyWeather) -> f32 {
     170.0 + 90.0 * w.rain + 220.0 * w.storm
 }
 
@@ -332,14 +364,16 @@ fn sky_display(atm: &Atmosphere, d: Vec3, r: &Request) -> Vec3 {
     }
     if r.moon.y > -0.2 && r.moon_lit > 0.01 {
         // (Clair de lune : 400 000 fois plus faible que le jour en vrai ; ici ce que l'œil
-        // habitué au noir en voit, un bleu profond.)
-        c += expose(atm.sky(up, r.moon) * (0.035 * r.moon_lit), EXPOSURE)
+        // habitué au noir en voit, un bleu profond. (v221) Quatre fois plus sombre : le
+        // ciel de la nuit était trop clair, les étoiles s'y perdaient.)
+        c += expose(atm.sky(up, r.moon) * (0.008 * r.moon_lit), EXPOSURE)
             * Vec3::new(0.75, 0.85, 1.0);
     }
     // Nuit : bleu très sombre (lueur du ciel, étoiles trop faibles pour être vues une à une).
     let night = night_of(r.sun.y);
     let t = up.y.clamp(0.0, 1.0);
-    c += Vec3::new(0.010, 0.014, 0.030).lerp(Vec3::new(0.002, 0.004, 0.012), t) * night;
+    // (v221) Presque noir au zénith sans lune (trois à quatre fois plus sombre qu'avant).
+    c += Vec3::new(0.003, 0.0045, 0.010).lerp(Vec3::new(0.0005, 0.0011, 0.0038), t) * night;
     // Sous l'horizon : le lointain dans la brume, plus sombre et plus terne que le ciel.
     let below = (-d.y * 3.5).clamp(0.0, 1.0);
     let y = c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
@@ -367,7 +401,8 @@ fn bake(atm: &Atmosphere, r: &Request) -> Baked {
     let lift = |d: Vec3| Vec3::new(d.x, d.y + 0.035, d.z).normalize();
     let warm = 1.0 + 0.6 * smoothstep(0.10, -0.03, r.sun.y);
     let sun = atm.sun_light(lift(r.sun)) * warm;
-    let moon = atm.sun_light(lift(r.moon)) * Vec3::new(0.055, 0.065, 0.085) * 0.5 * r.moon_lit;
+    // (v221) Les nuages au clair de lune : moitié moins clairs, avec le ciel de la nuit.
+    let moon = atm.sun_light(lift(r.moon)) * Vec3::new(0.055, 0.065, 0.085) * 0.26 * r.moon_lit;
     let zenith = sky_display(atm, Vec3::Y, r);
     let mut horizon = Vec3::ZERO;
     for k in 0..8 {
@@ -837,6 +872,7 @@ impl Sky {
             last_sky_time: None,
             last_frame: std::time::Instant::now(),
             input: None,
+            ground: None,
         }
     }
 
@@ -934,6 +970,19 @@ impl Sky {
         self.last_sky_time = Some(i.sky_time);
         self.drift += DVec2::new(i.weather.wind[0] as f64, i.weather.wind[1] as f64) * d_sky as f64;
         self.input = Some(*i);
+        // (v217) Le sol lointain suit ce que le jeu relève, en une seconde environ.
+        if let Some((rgb, y)) = i.ground {
+            self.ground = Some(match self.ground {
+                Some((old, old_y)) if (old_y - y).abs() < 96.0 => {
+                    let k = 1.0 - (-dt / 0.9).exp();
+                    (
+                        [0, 1, 2].map(|c| old[c] + (rgb[c] - old[c]) * k),
+                        old_y + (y - old_y) * k,
+                    )
+                }
+                _ => (rgb, y),
+            });
+        }
         if self.thresholds.is_none() || self.baked_sun.is_none() {
             return;
         }
@@ -1173,9 +1222,14 @@ impl Sky {
                 cam_radius(i.eye.y),
                 PLANET + CLOUD_BASE + 0.4 * thickness(&w),
                 1.0 / THETA_MAX,
-                0.0,
+                thickness(&w),
             ],
             flash: [i.flash[0], i.flash[1], 0.0, 0.0],
+            ground: {
+                let (rgb, y) = self.ground.unwrap_or((GROUND_DEFAULT, i.eye.y - 24.0));
+                [rgb[0], rgb[1], rgb[2], (i.eye.y - y).max(1.5)]
+            },
+            haze: [1.0 / i.haze_len.max(16.0), 0.0, 0.0, 0.0],
         }
     }
 }

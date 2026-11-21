@@ -1520,11 +1520,13 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
             y + slot / 2.0,
             15.0 * s,
         )),
-        // (v216) Foudre de Zeus : un éclair.
-        Item::Zeus => ui.model(crate::hand::zeus_icon(
+        // (v216) Foudre de Zeus. (v217) Le vrai éclair, celui qu'on tient en main : il vit
+        // dans sa case (chaque case à son rythme).
+        Item::Zeus => ui.bolts(crate::lightning::icon(
+            crate::lightning::clock() + x * 0.013 + y * 0.007,
             x + slot / 2.0,
             y + slot / 2.0,
-            15.0 * s,
+            16.5 * s,
         )),
         // Écran vidéo : petite télé en pixels.
         Item::Screen(n) => crate::screen::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s, n),

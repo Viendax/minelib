@@ -233,7 +233,7 @@ pub struct Session {
     daylight_shown: f32,
     /// (v216) `/thor` sur un serveur de construction : la demande « suis-je OP ? » en
     /// route, et le point visé.
-    thor_probe: Option<(std::time::Instant, Vec3)>,
+    thor_probe: Option<(std::time::Instant, Aim)>,
     daylight: f32,
     break_cooldown: f32,
     place_cooldown: f32,
@@ -696,7 +696,11 @@ impl Session {
             hand_light: [1.0; 3],
             flashlight_on: false,
             flashlight_focus: crate::flashlight::saved_focus(),
-            perspective: 0,
+            // Essais : MINELIB_F5=1 (vu de derrière) ou 2 (de face).
+            perspective: std::env::var("MINELIB_F5")
+                .ok()
+                .and_then(|v| v.trim().parse::<u8>().ok())
+                .map_or(0, |v| v % 3),
             screens: Vec::new(),
             screens_loaded: false,
             shown: Vec::new(),
@@ -2825,8 +2829,8 @@ impl Session {
         // avec /thor (rien n'est cassé, même en créatif).
         if self.inventory.selected_item() == Some(Item::Zeus) && keys.held(input, Action::Attack) {
             if keys.pressed(input, Action::Attack) && self.storm.cooldown <= 0.0 {
-                if let Some(pos) = self.aimed_point() {
-                    self.storm.strike(pos);
+                if let Some(aim) = self.aimed() {
+                    self.throw_lightning(aim);
                     self.storm.cooldown = crate::storm::ZEUS_COOLDOWN;
                     self.say_lightning_is_local();
                 }
@@ -3456,20 +3460,16 @@ impl Session {
         if !self.holding_zeus() || !self.lights_allowed() {
             return None;
         }
-        let third = if self.game.mode == GameMode::Fps {
-            0
-        } else {
-            self.perspective
-        };
+        // (v217) Elle part de l'éclair lui-même, au-dessus du poing du modèle, à la première
+        // personne comme vu de derrière : loin de la tête et du bras, tout le joueur fait
+        // son ombre (avant, devant les yeux, sa tête et son bras n'en faisaient pas, et
+        // son ombre n'était pas la même en F5).
         let pose = self.own_pose(crate::player_model::Held::Zeus);
-        let grip = (third != 0)
-            .then(|| crate::player_model::zeus_frame(&pose))
-            .flatten()
-            .map_or_else(
-                || crate::flashlight::lens_position(self.player.eye(), self.player.look_dir()),
-                |m| m.transform_point3(Vec3::ZERO),
-            );
-        Some(self.storm.held_light(grip))
+        let at = crate::player_model::zeus_frame(&pose).map_or_else(
+            || crate::flashlight::lens_position(self.player.eye(), self.player.look_dir()),
+            |m| m.transform_point3(Vec3::Y * (crate::lightning::HELD_LEN * 0.42)),
+        );
+        Some(self.storm.held_light(at))
     }
 
     /// (v216) Météo, foudre et pluie de l'image, et la Foudre de Zeus tenue en main.
@@ -3513,9 +3513,9 @@ impl Session {
         if let Some(every) = thor {
             self.storm.test_in -= dt;
             if self.storm.test_in <= 0.0 {
-                self.storm.test_in = every;
-                if let Some(p) = self.aimed_point() {
-                    self.storm.strike(p);
+                if let Some(aim) = self.aimed() {
+                    self.storm.test_in = every;
+                    self.throw_lightning(aim);
                 }
             }
         }
@@ -3541,15 +3541,20 @@ impl Session {
                 .unwrap_or_else(|| Mat4::from_translation(self.player.eye()));
             self.storm.hold(dt, place, None, on);
         }
+        // (v217) Les Foudres de Zeus posées au sol : le même éclair, en petit.
+        for (at, phase) in self.items.bolts(eye) {
+            self.storm.ground_item(at, phase);
+        }
         // Lumière du jour montrée : moins sous un ciel couvert, plus l'éclat des éclairs.
         self.daylight_shown =
             (self.daylight * self.storm.light() + self.storm.flash * 1.5).min(2.2);
     }
 
-    /// (v216) Point que vise le regard, pour la foudre : sur le premier bloc touché à
-    /// moins de 256 blocs ; sinon sur le sol, 120 blocs plus loin dans la direction du
+    /// (v216) Ce que vise le regard, pour la foudre : le premier bloc touché à moins de
+    /// 256 blocs ; sinon, (v217) le ciel si l'on regarde au-dessus de l'horizon (la foudre
+    /// y monte au lieu de tomber) ; sinon le sol, 120 blocs plus loin dans la direction du
     /// regard (`None` : rien de chargé là-bas).
-    fn aimed_point(&self) -> Option<Vec3> {
+    fn aimed(&self) -> Option<Aim> {
         let (eye, dir) = (self.player.eye(), self.player.look_dir());
         if let Some(h) = raycast(
             &self.world,
@@ -3557,13 +3562,16 @@ impl Session {
             dir.into(),
             crate::storm::THOR_RANGE,
         ) {
-            return Some(eye + dir * h.distance);
+            return Some(Aim::Ground(eye + dir * h.distance));
+        }
+        if dir.y > 0.1 {
+            return Some(Aim::Sky(dir));
         }
         let flat = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
         let p = eye + flat * 120.0;
         let (x, z) = (p.x.floor() as i32, p.z.floor() as i32);
         crate::storm::column_top(&self.world, x, z)
-            .map(|top| Vec3::new(x as f32 + 0.5, (top + 1) as f32, z as f32 + 0.5))
+            .map(|top| Aim::Ground(Vec3::new(x as f32 + 0.5, (top + 1) as f32, z as f32 + 0.5)))
     }
 
     /// (v216) `/thor` : la foudre tombe là où l'on vise. En solo, celui qui joue ; sur un
@@ -3574,7 +3582,7 @@ impl Session {
             self.chat.say("Pas de foudre en partie FPS.", chat::RED);
             return;
         }
-        let Some(pos) = self.aimed_point() else {
+        let Some(aim) = self.aimed() else {
             self.chat.say("Rien à viser par là.", chat::RED);
             return;
         };
@@ -3586,7 +3594,7 @@ impl Session {
             {
                 return;
             }
-            self.thor_probe = Some((std::time::Instant::now(), pos));
+            self.thor_probe = Some((std::time::Instant::now(), aim));
             self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
                 action: minelib_net::proto::SERVER_LIST,
                 pseudo: String::new(),
@@ -3594,7 +3602,52 @@ impl Session {
             });
             return;
         }
-        self.storm.strike(pos);
+        self.throw_lightning(aim);
+    }
+
+    /// (v217) La foudre part : elle tombe sur le point visé, ou, en visant le ciel, monte
+    /// de la pointe de l'éclair tenu (de la main, sans lui) et traverse les nuages.
+    fn throw_lightning(&mut self, aim: Aim) {
+        match aim {
+            Aim::Ground(pos) => {
+                self.storm.strike(pos);
+                if self.holding_zeus() {
+                    let tip = self.zeus_tip();
+                    self.storm.held.surge(tip, (pos - tip).normalize_or(Vec3::Y));
+                }
+            }
+            Aim::Sky(dir) => {
+                let from = if self.holding_zeus() {
+                    self.zeus_tip()
+                } else {
+                    self.player.eye() + dir * 0.9 - Vec3::Y * 0.25
+                };
+                self.storm.strike_up(from, dir, self.camera_pos().y);
+            }
+        }
+    }
+
+    /// (v217) Pointe de l'éclair tenu, dans le monde, là où on la voit : à la première
+    /// personne, la main est dessinée avec son propre angle de vue, ramené à celui du
+    /// monde ; vu de derrière, au poing du modèle.
+    fn zeus_tip(&self) -> Vec3 {
+        let top = Vec3::Y * (crate::lightning::HELD_LEN * 0.5);
+        let third = if self.game.mode == GameMode::Fps {
+            0
+        } else {
+            self.perspective
+        };
+        if third == 0 && self.light_editor.free_cam.is_none() {
+            let (_, view, _) = self.view_camera();
+            let k = crate::hand::Hand::to_world_view(self.fov);
+            let p = self.hand.zeus_frame().transform_point3(top);
+            let to_world = view.inverse();
+            to_world.transform_point3(Vec3::new(p.x * k, p.y * k, p.z))
+        } else {
+            let pose = self.own_pose(crate::player_model::Held::Zeus);
+            crate::player_model::zeus_frame(&pose)
+                .map_or_else(|| self.player.eye(), |m| m.transform_point3(top))
+        }
     }
 
     /// (v216) En ligne, la foudre qu'on lance n'est pas encore envoyée aux autres joueurs :
@@ -3713,10 +3766,10 @@ impl Session {
     /// Renvoie vrai si c'était bien elle (son texte n'est alors pas affiché tel quel).
     pub fn light_op_answer(&mut self, op: bool) -> bool {
         // (v216) La même demande sert à `/thor` : la foudre est réservée aux OP du serveur.
-        if let Some((asked, pos)) = self.thor_probe.take() {
+        if let Some((asked, aim)) = self.thor_probe.take() {
             if asked.elapsed().as_secs_f32() <= 10.0 {
                 if op {
-                    self.storm.strike(pos);
+                    self.throw_lightning(aim);
                     self.say_lightning_is_local();
                 } else {
                     self.chat
@@ -8101,6 +8154,10 @@ impl Session {
                 renderer.set_screen_frame(*id, version, w, h, pixels);
             }
         }
+        // (v217) Le relief au loin, pour le sol dessiné sous l'horizon au-delà du monde
+        // chargé.
+        let far_ground =
+            crate::storm::far_ground(&self.world, cam, fog_end, &|layer| renderer.layer_mean(layer));
         let params = FrameParams {
             ray_boxes: &ray_boxes,
             smokes: &smokes,
@@ -8185,6 +8242,13 @@ impl Session {
             moon: self.moon,
             weather: self.storm.sky(),
             sky_flash: self.storm.sky_flash,
+            far_ground,
+            // Par beau temps le sol lointain se voit loin ; sous la pluie et l'orage il se
+            // perd vite dans le rideau de pluie : l'horizon est bouché.
+            haze_len: {
+                let w = self.storm.sky();
+                3.5 * fog_end * self.storm.visibility().powi(2) / (1.0 + 3.0 * w.rain + 3.0 * w.storm)
+            },
             bolts: &self.storm.bolts,
             hand_bolts: &self.storm.hand_bolts,
             rain: self.storm.rain(self.daylight_shown.min(1.0)),
@@ -8870,6 +8934,15 @@ fn light_shadow_score(lights: &[(Vec3, f32)], feet: Vec3) -> f32 {
 fn near_box(b: &ShadowBox, p: Vec3, margin: f32) -> bool {
     let (mn, mx) = (Vec3::from(b.min) - margin, Vec3::from(b.max) + margin);
     p.cmpge(mn).all() && p.cmple(mx).all()
+}
+
+/// (v217) Ce que vise la foudre lancée (`/thor`, Foudre de Zeus).
+#[derive(Clone, Copy, Debug)]
+enum Aim {
+    /// Ce point du monde : elle y tombe.
+    Ground(Vec3),
+    /// Le ciel, dans cette direction : elle y monte et traverse les nuages.
+    Sky(Vec3),
 }
 
 /// Le soleil (direction `sun`) atteint-il le milieu de la boîte ? La réponse de

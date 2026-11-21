@@ -80,6 +80,8 @@ pub struct Smokes {
     layout: wgpu::BindGroupLayout,
     /// [dehors, dedans] × [direct, TAA].
     pipelines: [[wgpu::RenderPipeline; 2]; 2],
+    /// (v217) Les mêmes, pour la profondeur de la fumée opaque (voir `fs_solid`).
+    solid: [[wgpu::RenderPipeline; 2]; 2],
     noise_view: wgpu::TextureView,
     _noise: wgpu::Texture,
     fill_sampler: wgpu::Sampler,
@@ -151,11 +153,17 @@ impl Smokes {
                 operation: wgpu::BlendOperation::Add,
             },
         };
-        let pipeline = |inside: bool, taa: bool| {
+        // `solid` : (v217) la passe qui écrit la profondeur de la fumée opaque (rien dans
+        // l'image), pour cacher ce qui est dessiné après elle.
+        let pipeline = |inside: bool, taa: bool, solid: bool| {
             let color = wgpu::ColorTargetState {
                 format: if taa { COLOR_FORMAT } else { surface },
-                blend: Some(blend),
-                write_mask: wgpu::ColorWrites::ALL,
+                blend: if solid { None } else { Some(blend) },
+                write_mask: if solid {
+                    wgpu::ColorWrites::empty()
+                } else {
+                    wgpu::ColorWrites::ALL
+                },
             };
             let motion = wgpu::ColorTargetState {
                 format: MOTION_FORMAT,
@@ -163,10 +171,16 @@ impl Smokes {
                 write_mask: wgpu::ColorWrites::empty(),
             };
             // (v199) Dans la passe des translucides : sa 3e cible (l'eau) n'est pas écrite.
+            // (v217) La fumée opaque efface la face d'eau gardée derrière elle : les
+            // lumières n'y sont plus ajoutées à travers la fumée.
             let water = wgpu::ColorTargetState {
                 format: WATER_GB_FORMAT,
                 blend: None,
-                write_mask: wgpu::ColorWrites::empty(),
+                write_mask: if solid {
+                    wgpu::ColorWrites::ALL
+                } else {
+                    wgpu::ColorWrites::empty()
+                },
             };
             let targets: Vec<Option<wgpu::ColorTargetState>> = if taa {
                 vec![Some(color), Some(motion), Some(water)]
@@ -194,8 +208,10 @@ impl Smokes {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: false,
-                    depth_compare: if inside {
+                    depth_write_enabled: solid,
+                    // (La passe de la profondeur compare celle de la fumée, donnée par le
+                    // shader, à celle du monde : un joueur devant la fumée reste devant.)
+                    depth_compare: if inside && !solid {
                         wgpu::CompareFunction::Always
                     } else {
                         wgpu::CompareFunction::GreaterEqual
@@ -206,7 +222,12 @@ impl Smokes {
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some(if taa { "fs_taa" } else { "fs_main" }),
+                    entry_point: Some(match (solid, taa) {
+                        (false, true) => "fs_taa",
+                        (false, false) => "fs_main",
+                        (true, true) => "fs_solid_taa",
+                        (true, false) => "fs_solid",
+                    }),
                     compilation_options: Default::default(),
                     targets: &targets,
                 }),
@@ -215,8 +236,12 @@ impl Smokes {
             })
         };
         let pipelines = [
-            [pipeline(false, false), pipeline(false, true)],
-            [pipeline(true, false), pipeline(true, true)],
+            [pipeline(false, false, false), pipeline(false, true, false)],
+            [pipeline(true, false, false), pipeline(true, true, false)],
+        ];
+        let solid = [
+            [pipeline(false, false, true), pipeline(false, true, true)],
+            [pipeline(true, false, true), pipeline(true, true, true)],
         ];
         // Bruit de valeur 32³ qui se répète, pour les volutes.
         const N: u32 = 32;
@@ -263,6 +288,7 @@ impl Smokes {
         Self {
             layout,
             pipelines,
+            solid,
             noise_view: noise.create_view(&Default::default()),
             _noise: noise,
             fill_sampler: linear(wgpu::AddressMode::ClampToEdge),
@@ -400,6 +426,14 @@ impl Smokes {
     ) {
         for s in &self.slots {
             pass.set_pipeline(&self.pipelines[s.inside as usize][taa as usize]);
+            pass.set_bind_group(0, world, &[]);
+            pass.set_bind_group(1, &s.group, &[]);
+            pass.draw(0..36, 0..1);
+        }
+        // (v217) Puis la profondeur de la fumée opaque : ce qui est dessiné après elle
+        // (rayons des projecteurs, pluie, flammes, éclairs) ne passe plus devant.
+        for s in &self.slots {
+            pass.set_pipeline(&self.solid[s.inside as usize][taa as usize]);
             pass.set_bind_group(0, world, &[]);
             pass.set_bind_group(1, &s.group, &[]);
             pass.draw(0..36, 0..1);

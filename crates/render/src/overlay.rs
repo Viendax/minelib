@@ -109,6 +109,8 @@ enum UiCmd {
         tint: [f32; 4],
     },
     Model(Vec<VmVertex>),
+    /// (v217) Segments lumineux (éclairs), en pixels.
+    Bolts(Vec<crate::BoltSeg>),
 }
 
 impl Ui {
@@ -235,6 +237,15 @@ impl Ui {
         self.cmds.push(UiCmd::Model(vertices));
     }
 
+    /// (v217) Éclairs (l'icône de la Foudre de Zeus est le vrai éclair) : segments dont les
+    /// extrémités `a` et `b` (x, y) et les demi-largeurs sont en pixels. Dessinés à leur
+    /// place dans l'ordre de l'interface ; leur lumière s'ajoute à ce qui est dessous.
+    pub fn bolts(&mut self, segs: Vec<crate::BoltSeg>) {
+        if !segs.is_empty() {
+            self.cmds.push(UiCmd::Bolts(segs));
+        }
+    }
+
     /// Largeur en pixels d'un texte à l'échelle `scale`.
     pub fn text_width(text: &str, scale: f32) -> f32 {
         let n = match TRANSLATE.get().and_then(|f| f(text)) {
@@ -269,6 +280,10 @@ pub(crate) struct OverlayRenderer {
     /// Sommets de l'image précédente (mémoire réutilisée).
     scratch: Vec<TextVertex>,
     pub(crate) splits: Vec<(u32, std::ops::Range<u32>)>,
+    /// (v217) Éclairs de l'interface (déjà à l'écran) et, pour chaque paquet, le nombre de
+    /// sommets 2D à dessiner avant lui et sa plage dans `bolts`.
+    pub(crate) bolts: Vec<crate::BoltSeg>,
+    pub(crate) bolt_splits: Vec<(u32, std::ops::Range<u32>)>,
 }
 
 /// Traduction des textes de l'interface (branchée par le jeu ; `None` : texte inchangé).
@@ -552,6 +567,8 @@ impl OverlayRenderer {
             gpu_bytes: Self::bytes(capacity),
             models: Vec::new(),
             splits: Vec::new(),
+            bolts: Vec::new(),
+            bolt_splits: Vec::new(),
             scratch: Vec::with_capacity(8192),
         }
     }
@@ -640,6 +657,8 @@ impl OverlayRenderer {
         self.count = 0;
         self.models.clear();
         self.splits.clear();
+        self.bolts.clear();
+        self.bolt_splits.clear();
         if overlay.is_none() && ui.is_none() {
             return;
         }
@@ -720,6 +739,21 @@ impl OverlayRenderer {
                         }));
                         self.splits
                             .push((b.verts.len() as u32, start..self.models.len() as u32));
+                    }
+                    UiCmd::Bolts(segs) => {
+                        let start = self.bolts.len() as u32;
+                        let clip = |p: [f32; 4]| [p[0] / w * 2.0 - 1.0, 1.0 - p[1] / h * 2.0, 0.5, 1.0];
+                        self.bolts.extend(segs.iter().map(|s| crate::BoltSeg {
+                            a: clip(s.a),
+                            b: clip(s.b),
+                            // (Demi-largeurs en part de la hauteur de l'écran.)
+                            width_a: s.width_a / h,
+                            width_b: s.width_b / h,
+                            screen: 1.0,
+                            ..*s
+                        }));
+                        self.bolt_splits
+                            .push((b.verts.len() as u32, start..self.bolts.len() as u32));
                     }
                     UiCmd::Text {
                         x,

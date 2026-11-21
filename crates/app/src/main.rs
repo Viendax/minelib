@@ -33,6 +33,8 @@
 //!   MINELIB_METEO=clear|rain|storm  météo imposée et figée dès l'arrivée (essais)
 //!   MINELIB_ZEUS=1              la Foudre de Zeus en main à l'arrivée (essais)
 //!   MINELIB_THOR=<s>            la foudre tombe là où l'on regarde toutes les <s> s (essais)
+//!   MINELIB_F5=1|2              commencer vu de derrière (1) ou de face (2) (essais)
+//!   MINELIB_FOUDRE_FIGEE=1      chaque éclair s'arrête à son plus vif (captures d'essai)
 //!   MINELIB_DEMO=1              nouveau monde : mur + toutes les torches colorées
 //!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé ; aussi
 //!                               dans un monde neuf et dans la démo)
