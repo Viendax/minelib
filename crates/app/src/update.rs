@@ -58,7 +58,7 @@ pub fn clear_match_lock(root: &std::path::Path) {
 }
 
 /// Numéro de cette version (l'étiquette GitHub est `v` suivi de ce nombre).
-pub const VERSION: u32 = 207;
+pub const VERSION: u32 = 208;
 const REPO: &str = "https://api.github.com/repos/Viendax/minelib/releases";
 const EVERY: Duration = Duration::from_secs(120);
 
@@ -74,7 +74,7 @@ pub struct Release {
 /// Client HTTPS : certificats du système (Windows), pour passer aussi derrière un
 /// antivirus ou un réseau d'entreprise qui inspecte les connexions (sinon « certificat
 /// inconnu » et le téléchargement échoue).
-fn http() -> ureq::Agent {
+pub(crate) fn http() -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig};
     ureq::Agent::config_builder()
         .tls_config(

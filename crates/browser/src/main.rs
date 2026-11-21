@@ -17,7 +17,8 @@
 //! **Options** : `--width`, `--height`, `--cache <dossier de session>`, `--log <journal>`,
 //! `--fps <images par seconde d'un nouvel onglet, 30 par défaut>`, `--scroll`,
 //! `--filtre blanche|noire`, `--listes <dossier des listes>`,
-//! `--restreint strict|modere|non` (mode restreint de YouTube et SafeSearch).
+//! `--restreint strict|modere|non` (mode restreint de YouTube et SafeSearch),
+//! `--sans-compte` (v208, en ligne : pas de connexion à un compte, cookies effacés).
 //!
 //! **Filtrage (v205)** : le jeu est tout public, donc une page qui n'est pas autorisée ne
 //! s'ouvre pas du tout — ni dans l'onglet, ni dans un cadre de la page. Voir `filtre`.
@@ -122,6 +123,8 @@ struct Options {
     listes: Option<PathBuf>,
     /// Mode restreint de YouTube et SafeSearch (strict par défaut).
     restreint: Restreint,
+    /// (v208) En ligne : pas de page de connexion, cookies effacés au lancement.
+    sans_compte: bool,
 }
 
 impl Options {
@@ -136,6 +139,7 @@ impl Options {
             filtre: Mode::Blanche,
             listes: None,
             restreint: Restreint::Strict,
+            sans_compte: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -149,6 +153,7 @@ impl Options {
                 "--fps" => o.fps = value().parse().unwrap_or(o.fps).clamp(1, MAX_FPS),
                 "--filtre" => o.filtre = Mode::from_name(&value()).unwrap_or(o.filtre),
                 "--listes" => o.listes = Some(PathBuf::from(value())),
+                "--sans-compte" => o.sans_compte = true,
                 "--restreint" => o.restreint = Restreint::from_name(&value()).unwrap_or(o.restreint),
                 _ => {}
             }
@@ -907,7 +912,7 @@ fn main() {
     let mut settings = Settings {
         no_sandbox: 1,
         windowless_rendering_enabled: 1,
-        persist_session_cookies: 1,
+        persist_session_cookies: if opts.sans_compte { 0 } else { 1 },
         locale: CefString::from("fr"),
         log_severity: LogSeverity::from(sys::cef_log_severity_t::LOGSEVERITY_WARNING),
         ..Default::default()
@@ -955,8 +960,22 @@ fn main() {
 
     // (v205) Le filtre, partagé par tous les onglets.
     let (filtre, mot) = Filtre::charge(opts.filtre, opts.listes.as_deref());
+    let filtre = if opts.sans_compte {
+        // (v208) En ligne : on part sans aucune session (personne n'y regarde avec le compte
+        // d'un autre), et aucune page de connexion ne s'ouvrira.
+        if let Some(cookies) = cookie_manager_get_global_manager(None) {
+            cookies.delete_cookies(None, None, None);
+            cookies.flush_store(None);
+        }
+        filtre.sans_compte()
+    } else {
+        filtre
+    };
     let filtre = Arc::new(filtre);
-    eprintln!("filtrage des pages : {mot}");
+    eprintln!(
+        "filtrage des pages : {mot}{}",
+        if opts.sans_compte { " ; en ligne, sans compte" } else { "" }
+    );
     // Boucle de Chromium sur ce fil (le fil « UI » de CEF) : les commandes y sont jouées.
     let mut tabs: HashMap<u32, Tab> = HashMap::new();
     let left = MouseButtonType::from(sys::cef_mouse_button_type_t::MBT_LEFT);

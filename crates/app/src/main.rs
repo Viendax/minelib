@@ -56,6 +56,7 @@ mod daytime;
 mod debug;
 mod drops;
 mod equip;
+mod filtres;
 mod flashlight;
 mod fluids;
 mod fps;

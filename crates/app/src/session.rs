@@ -1882,7 +1882,8 @@ impl Session {
         // un écran. En solo, la liste noire si elle est installée (voir
         // `claude/ecran-en-jeu.md`), sinon la même liste blanche.
         let en_ligne = self.build.is_some() || self.net.is_some();
-        let mode = if en_ligne { "blanche" } else { self.solo_filter() };
+        // (v208) En ligne : liste blanche, et ni compte ni session gardés (chacun ses pubs).
+        let mode = if en_ligne { "en_ligne" } else { self.solo_filter() };
         self.displays.set_filter(mode);
         // Une page par écran : onglets ouverts et fermés avec les écrans.
         let ids: Vec<u32> = self.shown.iter().map(|s| s.0.id()).collect();
@@ -1970,6 +1971,7 @@ impl Session {
                 1 => "ce genre d'adresse ne s'ouvre pas sur un écran",
                 2 => "pas de machine du réseau local sur un écran",
                 4 => "site filtré",
+                5 => "pas de connexion à un compte sur les écrans en ligne",
                 _ => "site hors de la liste autorisée (écran public)",
             };
             self.chat.say(format!("Écran : {quoi}."), chat::YELLOW);

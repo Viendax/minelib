@@ -409,9 +409,10 @@ pub struct Displays {
     /// (une vidéo qui commence repart au volume de la page).
     volume: f32,
     volume_in: f32,
-    /// (v205) Filtrage des pages : `blanche` (rien que YouTube et Google) ou `noire`
-    /// (tout sauf les sites filtrés). En ligne c'est toujours `blanche` : le monde est
-    /// public. Changer de mode relance le navigateur.
+    /// (v205) Filtrage des pages : `blanche` (YouTube, Google et les sites pour enfants),
+    /// `noire` (tout sauf les sites filtrés) ou, en ligne, `en_ligne` (v208 : la liste
+    /// blanche, sans connexion à un compte, dans une session à part dont les cookies sont
+    /// effacés à chaque lancement). Changer de mode relance le navigateur.
     filtre: &'static str,
     /// Pages refusées depuis le dernier `take_blocked` : (écran, raison).
     blocked: Vec<(u32, u8)>,
@@ -1304,10 +1305,15 @@ impl Browser {
         let data = minelib_assets::data_dir();
         let logs = data.join("logs");
         let _ = std::fs::create_dir_all(&logs);
+        // (v208) En ligne, une session à part : celle du solo (et son compte) n'y est pas.
+        let en_ligne = filtre == "en_ligne";
+        let base = if en_ligne { "cef-en-ligne" } else { "cef-cache" };
         let session = match cache {
-            0 => "cef-cache".to_string(),
-            n => format!("cef-cache-{}", n + 1),
+            0 => base.to_string(),
+            n => format!("{base}-{}", n + 1),
         };
+        // (v208) La liste des sites pour enfants de l'UT1, rafraîchie une fois par jour.
+        crate::filtres::rafraichir(data.join("filtres"));
         // Sa sortie d'erreur, ajoutée au journal (vidé au-delà de 256 Ko).
         let path = logs.join("navigateur-sortie.log");
         let big = std::fs::metadata(&path).is_ok_and(|m| m.len() > 256 * 1024);
@@ -1337,11 +1343,12 @@ impl Browser {
             // (v205) Le jeu est tout public : filtrage des pages, mode restreint de
             // YouTube et SafeSearch. Les listes sont dans `.minelib\\filtres`.
             .arg("--filtre")
-            .arg(filtre)
+            .arg(if en_ligne { "blanche" } else { filtre })
             .arg("--listes")
             .arg(data.join("filtres"))
             .arg("--restreint")
             .arg("strict")
+            .args(en_ligne.then_some("--sans-compte"))
             .current_dir(exe.parent().ok_or(Launch::Absent)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

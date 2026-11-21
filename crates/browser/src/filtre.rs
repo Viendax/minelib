@@ -15,6 +15,16 @@
 //!    jour tous les jours. Sans fichier de liste, on retombe sur la liste blanche : jamais
 //!    « tout ouvert par défaut ».
 //!
+//! (v208) La liste blanche intégrée : YouTube et Google (ci-dessous), la liste « child »
+//! de l'Université Toulouse 1 Capitole (sites pour les moins de 10 ans, tenue à jour par
+//! elle ; copie dans `ut1_enfants.txt`, version fraîche téléchargée chaque jour par le jeu
+//! dans `enfants_ut1.txt`), et quelques sites choisis à la main (`CHOISIS`). Pas de
+//! Wikipédia (« Wikipedia is not censored » : des images explicites y restent), ni de
+//! plateforme de vidéos d'inconnus autre que YouTube en mode restreint.
+//!
+//! En ligne (`sans_compte`), aucune page de connexion Google ne s'ouvre : on regarde
+//! ensemble chacun avec ses pubs, personne avec l'abonnement d'un autre.
+//!
 //! Les publicités de YouTube ne sont **pas** bloquées, et leurs domaines sont dans la
 //! liste blanche : les conditions de YouTube interdisent d'empêcher une publicité de
 //! passer, et c'est ce qui rend le « regarder ensemble » légitime.
@@ -59,6 +69,8 @@ pub enum Refus {
     HorsBlanche = 3,
     /// Dans la liste noire.
     Noire = 4,
+    /// (v208) Une page de connexion à un compte, en ligne.
+    Compte = 5,
 }
 
 impl Refus {
@@ -68,6 +80,7 @@ impl Refus {
             Refus::Privee => "pas de machine du réseau local sur un écran",
             Refus::HorsBlanche => "site hors de la liste autorisée",
             Refus::Noire => "site filtré",
+            Refus::Compte => "pas de connexion à un compte sur les écrans en ligne",
         }
     }
 }
@@ -97,12 +110,22 @@ const BASE_BLANCHE: &[&str] = &[
     "googleadservices.com",
 ];
 
+/// (v208) Sites ajoutés à la main, tout public et libres de consultation :
+/// Vikidia, l'encyclopédie des 8-13 ans (CC BY-SA, contenu choquant exclu par ses principes
+/// fondateurs), et la NASA (images et vidéos sans droit d'auteur aux États-Unis).
+const CHOISIS: &[&str] = &["vikidia.org", "nasa.gov"];
+
+/// (v208) La liste « child » de l'UT1 au moment de la compilation.
+const UT1_ENFANTS: &str = include_str!("ut1_enfants.txt");
+
 /// Le filtre d'un navigateur : son mode et ses deux listes.
 #[derive(Debug, Clone)]
 pub struct Filtre {
     mode: Mode,
     blanche: HashSet<String>,
     noire: HashSet<String>,
+    /// (v208) En ligne : pas de page de connexion à un compte.
+    sans_compte: bool,
 }
 
 impl Filtre {
@@ -116,8 +139,17 @@ impl Filtre {
             let n = set.len();
             Some((set, n))
         };
-        let mut blanche: HashSet<String> = BASE_BLANCHE.iter().map(|d| d.to_string()).collect();
+        let mut blanche: HashSet<String> = BASE_BLANCHE
+            .iter()
+            .chain(CHOISIS)
+            .map(|d| d.to_string())
+            .collect();
+        blanche.extend(domaines(UT1_ENFANTS));
         let mut mot = String::new();
+        if let Some((plus, n)) = lire("enfants_ut1.txt") {
+            blanche.extend(plus);
+            mot.push_str(&format!("liste enfants de l'UT1 du jour : {n} domaines ; "));
+        }
         if let Some((plus, n)) = lire("liste_blanche.txt") {
             blanche.extend(plus);
             mot.push_str(&format!("liste blanche : {n} domaines en plus ; "));
@@ -139,9 +171,16 @@ impl Filtre {
                 mode,
                 blanche,
                 noire,
+                sans_compte: false,
             },
             mot,
         )
+    }
+
+    /// (v208) En ligne : plus aucune page de connexion à un compte.
+    pub fn sans_compte(mut self) -> Self {
+        self.sans_compte = true;
+        self
     }
 
     /// Cette adresse peut-elle s'ouvrir ?
@@ -156,6 +195,9 @@ impl Filtre {
         };
         if hote.is_empty() || !hote.contains('.') || adresse_chiffree(&hote) {
             return Err(Refus::Privee);
+        }
+        if self.sans_compte && connexion(&hote) {
+            return Err(Refus::Compte);
         }
         match self.mode {
             Mode::Blanche => {
@@ -230,6 +272,16 @@ fn adresse_chiffree(hote: &str) -> bool {
 }
 
 /// L'hôte, ou un de ses domaines parents, est-il dans la liste ?
+/// (v208) Les pages de connexion à un compte Google ou YouTube (`accounts.google.com`,
+/// `accounts.google.fr`, `myaccount.google.com`, `accounts.youtube.com`…).
+fn connexion(hote: &str) -> bool {
+    let Some((premier, reste)) = hote.split_once('.') else {
+        return false;
+    };
+    matches!(premier, "accounts" | "myaccount")
+        && (reste == "youtube.com" || reste == "google.com" || google_national(reste))
+}
+
 fn dans(set: &HashSet<String>, hote: &str) -> bool {
     if set.contains(hote) {
         return true;
@@ -372,7 +424,50 @@ mod tests {
             mode: Mode::Noire,
             blanche: HashSet::new(),
             noire: domaines(liste),
+            sans_compte: false,
         }
+    }
+
+    #[test]
+    fn la_liste_blanche_ouvre_les_sites_pour_enfants_et_rien_de_plus() {
+        let f = blanche();
+        for ok in [
+            "https://www.lumni.fr/",
+            "https://fr.vikidia.org/wiki/Chat",
+            "https://www.nasa.gov/",
+            "https://www.pbskids.org/",
+            "https://galhia.eklablog.com/",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ] {
+            assert_eq!(f.juge(ok), Ok(()), "{ok}");
+        }
+        for non in [
+            "https://fr.wikipedia.org/",
+            "https://www.dailymotion.com/",
+            "https://www.twitch.tv/",
+            "https://archive.org/",
+            "https://eklablog.com/",
+            "https://autre.eklablog.com/",
+        ] {
+            assert_eq!(f.juge(non), Err(Refus::HorsBlanche), "{non}");
+        }
+    }
+
+    #[test]
+    fn en_ligne_aucune_connexion_a_un_compte() {
+        let solo = blanche();
+        let en_ligne = blanche().sans_compte();
+        for url in [
+            "https://accounts.google.com/ServiceLogin?service=youtube",
+            "https://accounts.google.fr/",
+            "https://myaccount.google.com/",
+            "https://accounts.youtube.com/accounts/SetSID",
+        ] {
+            assert_ne!(solo.juge(url), Err(Refus::Compte), "{url}");
+            assert_eq!(en_ligne.juge(url), Err(Refus::Compte), "{url}");
+        }
+        assert_eq!(en_ligne.juge("https://www.youtube.com/"), Ok(()));
+        assert_eq!(en_ligne.juge("https://www.google.com/search?q=chat"), Ok(()));
     }
 
     #[test]
