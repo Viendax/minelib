@@ -19,6 +19,7 @@ pub mod igpu;
 mod occlusion;
 mod reflections;
 mod smoke;
+mod sunmap;
 pub use wgpu;
 mod latency;
 mod lazy;
@@ -261,6 +262,10 @@ struct Globals {
     /// après la dernière). `shadow_spans[0].z` : nombre de groupes.
     shadow_groups: [[f32; 4]; MAX_SHADOW_GROUPS],
     shadow_spans: [[u32; 4]; MAX_SHADOW_GROUPS],
+    /// (v217) Carte d'ombre du soleil des joueurs (voir `sunmap`) : sa vue-projection, et
+    /// x = 1 quand elle est à lire, y = son côté (texels), z = marge de profondeur.
+    psm_vp: [[f32; 4]; 4],
+    psm_info: [f32; 4],
 }
 
 /// Rayon de la caméra qui passe par le point `ndc` de l'écran, à l'échelle d'une unité de
@@ -652,6 +657,11 @@ pub struct FrameParams<'a> {
     pub ray_light: [f32; 3],
     /// Morceaux des joueurs qui font de l'ombre (soleil, torches, lumières dynamiques).
     pub shadow_boxes: &'a [ShadowBox],
+    /// (v217) Les autres joueurs à moins de `player_shadow_distance` de la caméra, qui font
+    /// leur ombre au soleil par la carte (voir `sunmap`) : ceux qui n'ont pas de boîtes
+    /// exactes dans `shadow_boxes`.
+    pub sun_casters: &'a [PlayerInstance],
+    pub player_shadow_distance: f32,
     /// Écran de debug (F3) à afficher par-dessus la scène.
     pub overlay: Option<&'a Overlay>,
     /// (v190) Ce que seuls les miroirs montrent (à la première personne) : le modèle du
@@ -814,6 +824,10 @@ pub struct Renderer {
     /// (v200) Joueurs et objets reflétés dans l'eau, sans raytracing (voir `water_mirror`),
     /// et le pipeline de ses blocs.
     water_mirror: water_mirror::WaterMirror,
+    /// (v217) Carte d'ombre du soleil des joueurs (voir `sunmap`), et le groupe du monde de
+    /// sa passe.
+    sun_map: sunmap::SunMap,
+    sun_group: wgpu::BindGroup,
     water_mirror_pipe: lazy::Lazy<wgpu::RenderPipeline>,
     sky_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
@@ -1173,6 +1187,17 @@ impl Renderer {
                 sky_entries[3],
                 sky_entries[4],
                 sky_entries[5],
+                // (v217) Carte d'ombre du soleil des joueurs (voir `sunmap`), après le ciel.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 22,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // Pixel art : agrandissement net, réduction lissée entre les mipmaps.
@@ -1194,6 +1219,7 @@ impl Renderer {
         let mut planar = planar::Planar::new(&device, config.format, (1, 1));
         let mut water_mirror = water_mirror::WaterMirror::new(&device, config.format, (1, 1));
         let sky = sky::Sky::new(&device, &queue);
+        let sun_map = sunmap::SunMap::new(&device, std::mem::size_of::<Globals>() as u64);
         let bind_groups = world_groups(
             &device,
             &bgl,
@@ -1206,6 +1232,7 @@ impl Renderer {
             &planar.images[0].view,
             &water_mirror.color,
             &sky,
+            &sun_map.view,
         );
         planar.groups = planar_groups(
             &device,
@@ -1218,6 +1245,7 @@ impl Renderer {
             &dyn_gpu,
             &water_mirror.color,
             &sky,
+            &sun_map.view,
         );
         water_mirror.group = Some(world_group(
             &device,
@@ -1231,7 +1259,22 @@ impl Renderer {
             &planar.images[0].view,
             &water_mirror.dummy,
             &sky,
+            &sun_map.view,
         ));
+        let sun_group = world_group(
+            &device,
+            &bgl,
+            &sun_map.globals,
+            &block_sampler,
+            &block_view,
+            &voxels,
+            &refl.views[0],
+            &dyn_gpu,
+            &planar.images[0].view,
+            &water_mirror.dummy,
+            &sky,
+            &sun_map.dummy,
+        );
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("main"),
             bind_group_layouts: &[&bgl],
@@ -1427,6 +1470,8 @@ impl Renderer {
             planar,
             planar_pipes,
             water_mirror,
+            sun_map,
+            sun_group,
             water_mirror_pipe,
             sky_pipeline,
             outline_pipeline,
@@ -1747,6 +1792,7 @@ impl Renderer {
             &self.planar.images[0].view,
             &self.water_mirror.color,
             &self.sky,
+            &self.sun_map.view,
         );
         self.planar.groups = planar_groups(
             &self.device,
@@ -1759,6 +1805,7 @@ impl Renderer {
             &self.dyn_gpu,
             &self.water_mirror.color,
             &self.sky,
+            &self.sun_map.view,
         );
         self.water_mirror.group = Some(world_group(
             &self.device,
@@ -1772,7 +1819,24 @@ impl Renderer {
             &self.planar.images[0].view,
             &self.water_mirror.dummy,
             &self.sky,
+            &self.sun_map.view,
         ));
+        // (v217) Groupe de la passe de la carte d'ombre du soleil : ses propres uniformes,
+        // et une carte vide à la place de la sienne.
+        self.sun_group = world_group(
+            &self.device,
+            &self.bgl,
+            &self.sun_map.globals,
+            &self.block_sampler,
+            &self.block_view,
+            &self.voxels,
+            &self.refl.views[0],
+            &self.dyn_gpu,
+            &self.planar.images[0].view,
+            &self.water_mirror.dummy,
+            &self.sky,
+            &self.sun_map.dummy,
+        );
         self.dyn_gpu.rebind = false;
     }
 
@@ -2624,6 +2688,53 @@ impl Renderer {
         true
     }
 
+    /// (v217) Carte d'ombre du soleil des joueurs (voir `sunmap`) : joueurs de
+    /// `p.sun_casters` envoyés à la carte graphique, uniformes de sa passe écrits, et
+    /// `globals` reçoit sa vue-projection (x = 0 : rien à lire, soleil couché ou personne).
+    /// Renvoie vrai si sa passe est à faire.
+    fn prepare_sun_map(&mut self, p: &FrameParams, globals: &mut Globals) -> bool {
+        let sun = Vec3::from(p.sun);
+        let on = !p.sun_casters.is_empty()
+            && sun.y > -0.02
+            && p.daylight > 0.0
+            && self.entities.has_player_mesh();
+        self.entities
+            .prepare_sun_casters(&self.queue, if on { p.sun_casters } else { &[] });
+        if !on {
+            globals.psm_info = [0.0; 4];
+            return false;
+        }
+        let half = p.player_shadow_distance.max(16.0) + 4.0;
+        let (vp, bias) = sunmap::view_proj(sun, p.eye, half);
+        globals.psm_vp = vp.to_cols_array_2d();
+        globals.psm_info = [1.0, sunmap::SIZE as f32, bias, 0.0];
+        let mut own = *globals;
+        own.view_proj = globals.psm_vp;
+        own.clip = [0.0; 4];
+        self.queue
+            .write_buffer(&self.sun_map.globals, 0, bytemuck::bytes_of(&own));
+        true
+    }
+
+    /// (v217) Passe de la carte d'ombre du soleil : les joueurs en profondeur, vus du soleil.
+    fn encode_sun_map(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ombres des joueurs au soleil"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.sun_map.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        self.entities.draw_sun_casters(&mut pass, &self.sun_group);
+    }
+
     /// (v190) Miroirs redessinés à cette image (voir `planar`) : choisit les images (miroirs
     /// des chunks dessinés vus de face, dans le champ, à portée des reflets ; puis
     /// les miroirs vus dans leurs images, et ainsi de suite), prépare pour chacune ce
@@ -3159,6 +3270,8 @@ impl Renderer {
             torch_swap: self.torch_swap_uniform(),
             shadow_groups: sg.groups,
             shadow_spans: sg.spans,
+            psm_vp: [[0.0; 4]; 4],
+            psm_info: [0.0; 4],
         };
         let mut globals = globals;
 
@@ -3182,6 +3295,8 @@ impl Renderer {
             .prepare(&self.queue, &p.rain, [fog[0], fog[1], fog[2]]);
         self.flames.prepare(&self.queue, p.flames);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
+        // (v217) Carte d'ombre du soleil des joueurs (lue aussi dans les miroirs).
+        let sun_map = self.prepare_sun_map(p, &mut globals);
         // (v190) Miroirs redessinés (voir `planar`), puis les uniformes de l'image.
         self.entities
             .prepare_mirror(&self.queue, p.mirror_self, p.mirror_held);
@@ -3192,6 +3307,9 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // (v216) Quelques rangées de la carte des nuages (voir `sky`).
         self.sky.encode(&mut encoder);
+        if sun_map {
+            self.encode_sun_map(&mut encoder);
+        }
         self.encode_mirrors(&mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3388,6 +3506,8 @@ impl Renderer {
             torch_swap: self.torch_swap_uniform(),
             shadow_groups: sg.groups,
             shadow_spans: sg.spans,
+            psm_vp: [[0.0; 4]; 4],
+            psm_info: [0.0; 4],
         };
         self.overlay
             .prepare(&self.device, &self.queue, p.overlay, p.ui, size);
@@ -3446,6 +3566,8 @@ impl Renderer {
             globals.refl_vp = vp;
             globals.refl_cam = cam;
         }
+        // (v217) Carte d'ombre du soleil des joueurs (lue aussi dans les miroirs).
+        let sun_map = self.prepare_sun_map(p, &mut globals);
         // (v190) Miroirs redessinés (voir `planar`).
         self.entities
             .prepare_mirror(&self.queue, p.mirror_self, p.mirror_held);
@@ -3490,6 +3612,9 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // (v216) Quelques rangées de la carte des nuages (voir `sky`).
         self.sky.encode(&mut encoder);
+        if sun_map {
+            self.encode_sun_map(&mut encoder);
+        }
         // Cartes d'ombre des lumières dynamiques (seulement celles qui ont changé).
         if let Some(l) = self.lit_pipes().filter(|_| self.dyn_gpu.bake_pending()) {
             let ts = self
@@ -3982,6 +4107,7 @@ fn world_groups(
     mirrors: &wgpu::TextureView,
     water: &wgpu::TextureView,
     sky: &sky::Sky,
+    psm: &wgpu::TextureView,
 ) -> [wgpu::BindGroup; 2] {
     std::array::from_fn(|i| {
         world_group(
@@ -3996,6 +4122,7 @@ fn world_groups(
             mirrors,
             water,
             sky,
+            psm,
         )
     })
 }
@@ -4015,6 +4142,7 @@ fn planar_groups(
     dyn_gpu: &lights::DynGpu,
     water: &wgpu::TextureView,
     sky: &sky::Sky,
+    psm: &wgpu::TextureView,
 ) -> [Vec<wgpu::BindGroup>; 2] {
     std::array::from_fn(|array| {
         planar.globals[array]
@@ -4032,6 +4160,7 @@ fn planar_groups(
                     &planar.images[1 - array].view,
                     water,
                     sky,
+                    psm,
                 )
             })
             .collect()
@@ -4071,6 +4200,7 @@ fn world_group(
     mirrors: &wgpu::TextureView,
     water: &wgpu::TextureView,
     sky: &sky::Sky,
+    psm: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     let [d7, d8, d9, d10, d11, d12, d13] = dyn_gpu.bind_entries();
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4143,6 +4273,10 @@ fn world_group(
             wgpu::BindGroupEntry {
                 binding: 21,
                 resource: sky.uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 22,
+                resource: wgpu::BindingResource::TextureView(psm),
             },
         ],
     })

@@ -67,6 +67,10 @@ struct Globals {
     // nombre de groupes.
     shadow_groups: array<vec4<f32>, 16>,
     shadow_spans: array<vec4<u32>, 16>,
+    // (v217) Carte d'ombre du soleil des joueurs (voir sunmap.rs) : vue-projection, et x = 1
+    // quand elle est à lire, y = son côté (texels), z = marge de profondeur.
+    psm_vp: mat4x4<f32>,
+    psm_info: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -83,6 +87,9 @@ struct Globals {
 // (v200) Joueurs et objets reflétés dans l'eau (voir water_mirror.rs), image retournée de
 // gauche à droite ; a = 0 là où rien ne s'y reflète.
 @group(0) @binding(15) var water_tex: texture_2d<f32>;
+// (v217) Carte d'ombre du soleil des joueurs (profondeur vue du soleil, 1 : personne),
+// après les liaisons du ciel (16 à 21).
+@group(0) @binding(22) var psm: texture_depth_2d;
 
 fn lin(c: vec3<f32>) -> vec3<f32> {
     return pow(c, vec3<f32>(2.2));
@@ -619,6 +626,14 @@ fn gb_out(i: VOut, s: Shaded) -> GbOut {
     var o: GbOut;
     o.color = vec4<f32>(s.color.rgb, 1.0);
     o.motion = motion_of(vec4<f32>(i.world, 1.0));
+    // (v217) Dans l'ombre d'un joueur : un mouvement d'un cinquantième de pixel (rien pour
+    // la reprojection), que l'anticrénelage prend pour un objet qui bouge tout près (voir
+    // `near_motion` dans taa.wgsl) : bornes serrées, et l'endroit marqué pour les images
+    // suivantes (`was_moving`). Une ombre qui avance ne laisse plus de traînée derrière elle
+    // (« rémanence »), ni là où elle était.
+    if s.pshadow > 0.004 {
+        o.motion.x += 0.02;
+    }
     o.albedo = vec4<f32>(s.albedo, clamp(i.reflect, 0.0, 1.0) * 0.99);
     o.surf = vec4<f32>(
         gb_oct_encode(face_normal(i.face)),
@@ -744,6 +759,9 @@ struct Shaded {
     albedo: vec3<f32>,
     wd: f32,
     ws: f32,
+    // (v217) Ombre d'un joueur sur ce pixel (soleil ou torches, 0 à 1), pour l'anticrénelage
+    // (voir `gb_out`).
+    pshadow: f32,
 };
 
 fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32> {
@@ -800,7 +818,7 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
         if fog > 0.0 {
             fc = mix(flame, sky_color(to_frag / dist), fog * 0.6);
         }
-        return Shaded(vec4<f32>(fc, 1.0), vec3<f32>(0.0), 0.0, 0.0);
+        return Shaded(vec4<f32>(fc, 1.0), vec3<f32>(0.0), 0.0, 0.0, 0.0);
     }
     let alpha = tex.a;
     let albedo = tex.rgb;
@@ -814,8 +832,13 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
     let shadow_from = i.world + n * 0.02;
     let shadows = g.shadow_info.x > 0.5;
     let open_sky = smoothstep(0.94, 0.995, i.sky);
-    if shadows && diffuse > 0.0 && open_sky > 0.0 {
-        diffuse *= 1.0 - 0.85 * open_sky * player_shadow(shadow_from, sun, 64.0);
+    var pshadow = 0.0;
+    // (v217) Aussi sans aucune boîte exacte : la carte du soleil peut avoir des joueurs.
+    if (shadows || g.psm_info.x > 0.5) && diffuse > 0.0 && open_sky > 0.0 {
+        // (v217) Les joueurs au-delà des boîtes exactes : par la carte du soleil.
+        let ps = max(player_shadow(shadow_from, sun, 64.0), psm_shadow(shadow_from));
+        diffuse *= 1.0 - 0.85 * open_sky * ps;
+        pshadow = ps * open_sky;
     }
     let ao = mix(0.42, 1.0, i.ao * i.ao);
     let day = g.light.x;
@@ -832,6 +855,7 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
     var ts = vec4<f32>(0.0);
     if shadows && (lit || g.held_pos.w > 0.0) {
         ts = torch_shadow(shadow_from);
+        pshadow = max(pshadow, max(max(ts.r, ts.g), max(ts.b, ts.a)));
     }
     if lit {
         torch = max(torch - ts.rgb * flicker, torch * 0.35);
@@ -977,7 +1001,7 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
     if fog > 0.0 {
         color = mix(color, sky_shade(to_frag / dist).rgb, fog);
     }
-    return Shaded(vec4<f32>(color, alpha), albedo, wd * (1.0 - fog), 1.0 - fog);
+    return Shaded(vec4<f32>(color, alpha), albedo, wd * (1.0 - fog), 1.0 - fog, pshadow);
 }
 
 // ---------------------------------------------------------------- ciel
@@ -1817,6 +1841,31 @@ fn trace(o0: vec3<f32>, d0: vec3<f32>, short: bool) -> vec4<f32> {
     return vec4<f32>(acc, 1.0);
 }
 
+
+/// (v217) Part de l'ombre des joueurs de la carte du soleil en `p` (0 à 1) : un joueur y est
+/// plus près du soleil que `p` le long de son rayon. Quatre texels voisins, pondérés par la
+/// place du point (bord en pente sur un texel, qui ne scintille pas).
+fn psm_shadow(p: vec3<f32>) -> f32 {
+    if g.psm_info.x < 0.5 {
+        return 0.0;
+    }
+    let c = g.psm_vp * vec4<f32>(p, 1.0);
+    let uv = vec2<f32>(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);
+    if any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) || c.z <= 0.0 || c.z >= 1.0 {
+        return 0.0;
+    }
+    let size = g.psm_info.y;
+    let t = uv * size - 0.5;
+    let i0 = vec2<i32>(floor(t));
+    let f = t - floor(t);
+    let hi = vec2<i32>(i32(size) - 1);
+    let z = c.z - g.psm_info.z;
+    let s00 = select(0.0, 1.0, textureLoad(psm, clamp(i0, vec2<i32>(0), hi), 0) < z);
+    let s10 = select(0.0, 1.0, textureLoad(psm, clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), hi), 0) < z);
+    let s01 = select(0.0, 1.0, textureLoad(psm, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi), 0) < z);
+    let s11 = select(0.0, 1.0, textureLoad(psm, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi), 0) < z);
+    return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+}
 
 /// Rayon `o + t d` (0 < t < `tmax`) qui touche une des boîtes des joueurs : 1, sinon 0.
 /// Ne regarde que les boîtes à moins de 24 blocs de `o`.

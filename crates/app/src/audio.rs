@@ -307,6 +307,54 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
     }
 }
 
+/// (v217) Variation de hauteur d'un son à chaque fois qu'il est joué, au plus (demi-tons, de
+/// part et d'autre) : le même son répété (pas, tirs en rafale, rebonds) ne sonne plus comme
+/// un disque rayé. Rien sur le bip de la bombe (un signal que l'on compte) ni sur la lunette.
+fn pitch_spread(sfx: Sfx) -> f32 {
+    match sfx {
+        Sfx::BombBeep | Sfx::ScopeIn | Sfx::ScopeOut => 0.0,
+        Sfx::Shot(_) | Sfx::Decoy | Sfx::Dry => 0.4,
+        Sfx::Reload(_)
+        | Sfx::ReloadEnd
+        | Sfx::Draw(_)
+        | Sfx::DrawKnife
+        | Sfx::DrawNade
+        | Sfx::Cycle
+        | Sfx::Shell
+        | Sfx::Hammer
+        | Sfx::Fire
+        | Sfx::BombBlast => 0.5,
+        Sfx::Pin | Sfx::Throw | Sfx::Pain => 0.7,
+        Sfx::He | Sfx::Flash | Sfx::Smoke | Sfx::Molotov | Sfx::Door(_) => 0.8,
+        Sfx::KnifeSwing | Sfx::KnifeHit | Sfx::KnifeFlesh | Sfx::Land | Sfx::Splash => 1.0,
+        Sfx::Bounce | Sfx::Ladder => 1.2,
+        Sfx::Step => 1.5,
+    }
+}
+
+/// (v217) Nombre au hasard entre −1 et 1 (xorshift, pour la hauteur des sons).
+fn jitter() -> f32 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        x = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64)
+            | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    (x >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+}
+
+/// (v217) Vitesse de lecture d'un `sfx` (hauteur et durée) : 1 à ± `pitch_spread` demi-tons.
+fn pitch_of(sfx: Sfx) -> f32 {
+    2f32.powf(pitch_spread(sfx) * jitter() / 12.0)
+}
+
 /// Après le tir, l'arme réarme-t-elle à la main (culasse, pompe) ?
 pub fn cycles_after_shot(i: usize) -> bool {
     matches!(WEAPONS[i].name, "AWP" | "SSG 08" | "Nova" | "Sawed-Off")
@@ -316,6 +364,8 @@ struct Cmd {
     file: &'static str,
     volume: f32,
     delay: f32,
+    /// (v217) Vitesse de lecture (hauteur), 1 : telle quelle.
+    speed: f32,
     /// Chat vocal : (joueur, échantillons 16 kHz mono) au lieu d'un son du jeu.
     voice: Option<(u64, Vec<i16>)>,
     /// La sortie son choisie a changé : elle est rouverte.
@@ -350,6 +400,7 @@ pub fn set_master(v: f32) {
                 file: "",
                 volume: 0.0,
                 delay: 0.0,
+                speed: 1.0,
                 voice: None,
                 reopen: false,
                 pcm: None,
@@ -391,6 +442,7 @@ pub fn set_output(name: &str) {
                 file: "",
                 volume: 0.0,
                 delay: 0.0,
+                speed: 1.0,
                 voice: None,
                 reopen: true,
                 pcm: None,
@@ -564,7 +616,10 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                     }
                     if let Ok(sink) = Sink::try_new(handle) {
                         sink.set_volume(cmd.volume * master());
-                        sink.append(src.delay(Duration::from_secs_f32(cmd.delay.max(0.0))));
+                        sink.append(
+                            src.speed(cmd.speed.clamp(0.5, 2.0))
+                                .delay(Duration::from_secs_f32(cmd.delay.max(0.0))),
+                        );
                         sinks.push((sink, cmd.volume));
                     }
                 }
@@ -587,6 +642,7 @@ pub fn play(sfx: Sfx, delay: f32, gain: f32) {
                 file,
                 volume: volume * gain,
                 delay,
+                speed: pitch_of(sfx),
                 voice: None,
                 reopen: false,
                 pcm: None,
@@ -606,6 +662,7 @@ pub fn rain(volume: f32) {
                 file: "",
                 volume: 0.0,
                 delay: 0.0,
+                speed: 1.0,
                 voice: None,
                 reopen: false,
                 pcm: None,
@@ -636,6 +693,7 @@ pub fn thunder(distance: f32, seed: u32) {
                 file: "",
                 volume: synth::thunder_gain(distance),
                 delay: delay.max(0.0),
+                speed: 1.0,
                 voice: None,
                 reopen: false,
                 pcm: Some((pcm, rate)),
@@ -652,6 +710,7 @@ pub fn voice(who: u64, samples: Vec<i16>, volume: f32) {
                 file: "",
                 volume,
                 delay: 0.0,
+                speed: 1.0,
                 voice: Some((who, samples)),
                 reopen: false,
                 pcm: None,
@@ -948,6 +1007,20 @@ pub mod synth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v217) La hauteur des sons varie un peu à chaque fois (pas plus que prévu), jamais
+    /// celle du bip de la bombe.
+    #[test]
+    fn repeated_sounds_change_pitch_a_little() {
+        let steps: Vec<f32> = (0..200).map(|_| pitch_of(Sfx::Step)).collect();
+        let (lo, hi) = (2f32.powf(-1.5 / 12.0), 2f32.powf(1.5 / 12.0));
+        assert!(steps.iter().all(|&p| p >= lo - 1e-4 && p <= hi + 1e-4));
+        let spread = steps.iter().cloned().fold(f32::MIN, f32::max)
+            - steps.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(spread > 0.1, "les pas varient : {spread}");
+        assert!((0..50).all(|_| pitch_of(Sfx::BombBeep) == 1.0));
+        assert!((0..50).all(|_| (pitch_of(Sfx::Shot(0)) - 1.0).abs() < 0.024));
+    }
 
     /// (v195) Le plongeon part dès qu'on touche l'eau : au-dessus du dixième de sa crête
     /// (−20 dB) dans les 20 premières millisecondes, son gros (−12 dB) dans les 60. Avant,

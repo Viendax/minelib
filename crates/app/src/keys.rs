@@ -457,8 +457,9 @@ impl Action {
             // Comme IRLights : L ouvre l'éditeur, F y bascule la caméra libre.
             Action::LightEditor => Some(Bind::Key(KeyCode::KeyL)),
             Action::FreeCamera => Some(Bind::Key(KeyCode::KeyF)),
-            // (v215) Comme en FPS : K maintenu.
-            Action::Talk => Some(Bind::Key(KeyCode::KeyK)),
+            // (v215) Maintenue pour parler ; (v217) V par défaut (demande de Viendax), K
+            // reste celle du FPS.
+            Action::Talk => Some(Bind::Key(KeyCode::KeyV)),
             Action::Command => Some(Bind::Key(KeyCode::Slash)),
             Action::Debug => Some(Bind::Key(KeyCode::F3)),
             Action::Screenshot => Some(Bind::Key(KeyCode::F2)),
@@ -819,23 +820,26 @@ mod tests {
         assert_eq!(b.get(Action::Debug), None);
         assert!(!Action::tab(false).contains(&Action::FpsBuy));
         assert!(Action::tab(true).contains(&Action::Debug));
-        // (v215) Parler : une touche dans chaque onglet (K par défaut), active (pas grisée),
-        // que rien d'autre n'a dans son onglet ; changer celle de la construction ne change
-        // pas celle du FPS.
+        // (v215) Parler : une touche dans chaque onglet, active (pas grisée), que rien d'autre
+        // n'a dans son onglet ((v217) V en construction, K en FPS) ; changer celle de la
+        // construction ne change pas celle du FPS.
         assert!(Action::tab(false).contains(&Action::Talk));
         assert!(Action::tab(true).contains(&Action::FpsVoice));
         assert!(!Action::Talk.coming_soon() && !Action::FpsVoice.coming_soon());
         let mut d = Bindings::default();
-        for (talk, fps) in [(Action::Talk, false), (Action::FpsVoice, true)] {
-            assert_eq!(d.get(talk), Some(Bind::Key(KeyCode::KeyK)));
+        for (talk, fps, key) in [
+            (Action::Talk, false, KeyCode::KeyV),
+            (Action::FpsVoice, true, KeyCode::KeyK),
+        ] {
+            assert_eq!(d.get(talk), Some(Bind::Key(key)));
             for a in Action::tab(fps) {
                 if a != talk {
-                    assert_ne!(d.get(a), Some(Bind::Key(KeyCode::KeyK)), "{a:?}");
+                    assert_ne!(d.get(a), Some(Bind::Key(key)), "{a:?}");
                 }
             }
         }
-        d.bind(Action::Talk, Bind::Key(KeyCode::KeyV));
-        assert_eq!(d.get(Action::Talk), Some(Bind::Key(KeyCode::KeyV)));
+        d.bind(Action::Talk, Bind::Key(KeyCode::KeyB));
+        assert_eq!(d.get(Action::Talk), Some(Bind::Key(KeyCode::KeyB)));
         assert_eq!(d.get(Action::FpsVoice), Some(Bind::Key(KeyCode::KeyK)));
         b.walk_toggle = true;
         let dir = std::env::temp_dir().join(format!("minelib-keys2-{}", std::process::id()));

@@ -85,15 +85,33 @@ pub fn icon(cx: f32, cy: f32, size: f32) -> Vec<VmVertex> {
     out
 }
 
-/// (v215) Réglage du faisceau : 0 large, 1 serré ; la première fois, au milieu.
-const FOCUS_FILE: &str = "torche_reglage";
+/// (v215) Réglage du faisceau : 0 large, 1 serré ; la première fois, au milieu. (v217) Sur
+/// la course raccourcie (voir `WIDEST`) : un autre fichier que celui de la v215.
+const FOCUS_FILE: &str = "torche_faisceau";
+/// (v215) Le réglage de la v215, sur l'ancienne course (repris une fois, converti).
+const OLD_FOCUS_FILE: &str = "torche_reglage";
 
-/// (v215) Réglage du faisceau gardé (`.minelib/torche_reglage`), sinon 0,5.
-pub fn saved_focus() -> f32 {
-    std::fs::read_to_string(minelib_assets::data_dir().join(FOCUS_FILE))
+/// (v217) La molette vers le bas s'arrête là de l'ancienne course (0 large … 1 serré) :
+/// « les 40 derniers % du scroll vers le bas sont de trop » (Viendax). Le réglage va de
+/// celui-là (0) au plus serré (1).
+pub const WIDEST: f32 = 0.4;
+/// (v217) Intensité de la lampe : 30 % de moins que celle de la v215 (Viendax).
+const INTENSITY: f32 = 0.7;
+/// (v217) Crans de la molette d'un bout à l'autre.
+pub const STEPS: f32 = 10.0;
+
+fn read(file: &str) -> Option<f32> {
+    std::fs::read_to_string(minelib_assets::data_dir().join(file))
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
         .filter(|f| f.is_finite())
+}
+
+/// (v215) Réglage du faisceau gardé (`.minelib/torche_faisceau`), sinon celui de la v215
+/// ramené à la nouvelle course (le même faisceau, ou le plus large qui reste), sinon 0,5.
+pub fn saved_focus() -> f32 {
+    read(FOCUS_FILE)
+        .or_else(|| read(OLD_FOCUS_FILE).map(|t| (t - WIDEST) / (1.0 - WIDEST)))
         .map_or(0.5, |f| f.clamp(0.0, 1.0))
 }
 
@@ -111,11 +129,14 @@ pub fn save_focus(f: f32) {
 /// l'éditeur de lumières (angle 1 à 179°, portée 0,1 à 128 blocs et intensité 0 à 20, ces
 /// deux-là au carré de la position), comme demandé : serré, intensité et portée à 100 % de
 /// leur curseur, angle à 25 % ; large, angle à 100 %, portée à 25 % et intensité à 50 %.
+/// (v217) Le réglage ne parcourt plus que la fin de cette course, de `WIDEST` (angle à
+/// 70 %, portée à 55 %, intensité à 70 % de leur curseur) au plus serré, et l'intensité est
+/// 30 % plus basse partout.
 pub fn beam(focus: f32) -> (f32, f32, f32) {
-    let t = focus.clamp(0.0, 1.0);
+    let t = WIDEST + (1.0 - WIDEST) * focus.clamp(0.0, 1.0);
     let angle = 1.0 + 178.0 * (1.0 - 0.75 * t);
     let range = 0.1 + 127.9 * (0.25 + 0.75 * t).powi(2);
-    let intensity = 20.0 * (0.5 + 0.5 * t).powi(2);
+    let intensity = INTENSITY * 20.0 * (0.5 + 0.5 * t).powi(2);
     (angle, range, intensity)
 }
 
@@ -196,23 +217,31 @@ mod tests {
 
     /// (v215) Molette : serré, angle à 25 % de son curseur, portée et intensité à 100 % ;
     /// large, angle à 100 %, portée à 25 % et intensité à 50 % (positions des curseurs de
-    /// l'éditeur de lumières : angle linéaire, portée et intensité au carré).
+    /// l'éditeur de lumières : angle linéaire, portée et intensité au carré). (v217) Sans
+    /// les 40 % les plus larges : au plus large, angle à 70 %, portée à 55 %, intensité à
+    /// 70 % ; intensité 30 % plus basse partout.
     #[test]
     fn the_flashlight_focus_moves_the_light_editor_sliders() {
         let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
         let (angle, range, intensity) = beam(1.0);
         assert!(close(angle, 1.0 + 178.0 * 0.25), "angle serré {angle}");
         assert!(close(range, 128.0), "portée serrée {range}");
-        assert!(close(intensity, 20.0), "intensité serrée {intensity}");
+        assert!(close(intensity, 0.7 * 20.0), "intensité serrée {intensity}");
         let (angle, range, intensity) = beam(0.0);
-        assert!(close(angle, 179.0), "angle large {angle}");
+        assert!(close(angle, 1.0 + 178.0 * 0.7), "angle large {angle}");
         assert!(
-            close(range, 0.1 + 127.9 * 0.25 * 0.25),
+            close(range, 0.1 + 127.9 * 0.55 * 0.55),
             "portée large {range}"
         );
         assert!(
-            close(intensity, 20.0 * 0.5 * 0.5),
+            close(intensity, 0.7 * 20.0 * 0.7 * 0.7),
             "intensité large {intensity}"
+        );
+        // Le milieu de la nouvelle course (réglage de départ) : 70 % de l'ancienne.
+        let (angle, _, _) = beam(0.5);
+        assert!(
+            close(angle, 1.0 + 178.0 * (1.0 - 0.75 * 0.7)),
+            "angle au milieu {angle}"
         );
         // Entre les deux, tout suit le réglage sans à-coup.
         let mut last = beam(0.0);

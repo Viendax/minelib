@@ -919,6 +919,18 @@ fn changed_bricks(
 /// celle de son cône) ? Sur un axe où le volume est plus grand que la grille, il suffit
 /// qu'elle en couvre presque toute la largeur. Sinon une carte calculée maintenant laisserait
 /// passer la lumière là où la grille ne voit pas les blocs.
+/// Une carte d'ombre à refaire attend-elle que la grille de blocs voie toute sa lumière ?
+/// Oui pour une lumière posée loin du joueur : on garde celle d'avant, refaite quand la grille
+/// la verra (une première carte se calcule quand même : mieux qu'aucune). (v217) Jamais pour
+/// une lumière portée (lampe torche, torche tenue) : elle est au milieu de la grille, qui ne
+/// voit pas toujours toute sa portée (la lampe porte jusqu'à 128 blocs), et sa carte d'avant,
+/// prise d'ailleurs et dans une autre direction, ne vaut plus rien : sa lumière était coupée
+/// par des ombres de ce qu'elle éclairait au moment où on l'a allumée. Au-delà de la grille,
+/// rien ne l'arrête.
+fn keeps_old_map(baked: bool, l: &DynLight, voxels: Option<[i32; 3]>) -> bool {
+    baked && l.owner == 0 && voxels.is_some_and(|o| !grid_covers(o, l))
+}
+
 fn grid_covers(origin: [i32; 3], l: &DynLight) -> bool {
     use crate::rt::VOX;
     let (c, r) = bounding_sphere(l);
@@ -2426,12 +2438,23 @@ impl DynGpu {
         // chaque image, leur carte doit suivre. Derrière des torches à refaire (blocs changés,
         // grille de blocs déplacée), elles attendaient leur tour et leurs ombres sautaient.
         again.sort_by_key(|&i| self.lights[i].owner == 0);
+        // (v217) Et avant tout le reste, sans limite : une lumière portée dont la carte est à
+        // faire ou à refaire (derrière les premiers calculs d'autres lumières, elle pouvait
+        // garder sa carte d'avant une image ou plus : l'ombre de ce qu'elle éclairait avant).
+        let carried: Vec<usize> = first
+            .iter()
+            .chain(again.iter())
+            .copied()
+            .filter(|&i| self.lights[i].owner != 0)
+            .collect();
+        first.retain(|&i| self.lights[i].owner == 0);
+        again.retain(|&i| self.lights[i].owner == 0);
         // 2. Cases à calculer : premiers calculs d'abord (jusqu'à 4 fois le budget), puis les
         // cartes périmées dans la limite du budget (au moins une lumière par image).
         let budget = st.bake_budget.max(1) as usize;
         self.jobs.clear();
         let per = (self.atlas_size / self.tile_size.max(1)).max(1);
-        for (list, limit) in [(&first, budget * 4), (&again, budget)] {
+        for (list, limit) in [(&carried, usize::MAX), (&first, budget * 4), (&again, budget)] {
             let mut used = 0usize;
             for &i in list.iter() {
                 let l = self.lights[i];
@@ -2439,9 +2462,8 @@ impl DynGpu {
                     continue;
                 };
                 // Carte à refaire, mais la grille ne voit pas toute la lumière (joueur loin) :
-                // on garde celle d'avant, refaite quand la grille la verra. (Une première
-                // carte se calcule quand même : mieux qu'aucune.)
-                if s.baked && voxels.is_some_and(|o| !grid_covers(o, &l)) {
+                // on garde celle d'avant (voir `keeps_old_map`).
+                if keeps_old_map(s.baked, &l, voxels) {
                     continue;
                 }
                 let n = s.count as usize;
@@ -3280,6 +3302,35 @@ mod tests {
             inner_deg: outer * 0.7,
             ..Default::default()
         }
+    }
+
+    /// (v217) La lampe torche, au milieu de la grille de blocs mais plus longue qu'elle,
+    /// refait sa carte à chaque fois qu'elle bouge ; une lumière posée que la grille ne voit
+    /// pas toute garde la sienne en attendant.
+    #[test]
+    fn a_carried_light_always_rebakes_its_map() {
+        let origin = [-64, 40, -64];
+        let mut lamp = spot(9, [0.5, 72.0, 0.5], [0.0, -0.2, -1.0], 128.0, 45.0);
+        assert!(
+            !grid_covers(origin, &lamp),
+            "la grille ne voit pas toute la lampe"
+        );
+        assert!(
+            keeps_old_map(true, &lamp, Some(origin)),
+            "sans porteur : gardée"
+        );
+        lamp.owner = 1;
+        assert!(
+            !keeps_old_map(true, &lamp, Some(origin)),
+            "portée : refaite"
+        );
+        assert!(!keeps_old_map(false, &lamp, Some(origin)));
+        let far = spot(10, [300.0, 72.0, 0.5], [0.0, -1.0, 0.0], 20.0, 45.0);
+        assert!(keeps_old_map(true, &far, Some(origin)));
+        assert!(
+            !keeps_old_map(false, &far, Some(origin)),
+            "une première carte se calcule"
+        );
     }
 
     #[test]

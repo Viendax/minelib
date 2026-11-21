@@ -187,6 +187,11 @@ struct Players {
     /// (v202) Ceux qu'on peut voir reflétés dans l'eau (voir `water_mirror`), à part.
     water: wgpu::Buffer,
     water_count: u32,
+    /// (v217) Carte d'ombre du soleil (voir `sunmap`) : profondeur des joueurs vue du soleil,
+    /// sans couleur, et ceux qui y sont dessinés (au-delà des boîtes d'ombre exactes).
+    sun: wgpu::RenderPipeline,
+    sun_instances: wgpu::Buffer,
+    sun_count: u32,
     skins: wgpu::Texture,
     group: wgpu::BindGroup,
 }
@@ -358,6 +363,57 @@ impl Players {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // (v217) Ombres au soleil des joueurs loin de la caméra : leur profondeur seule, vue
+        // du soleil, dans la carte de `sunmap` (profondeur 0 près du soleil, faces des deux
+        // côtés : un joueur n'y laisse jamais de trou). Le shader de sommets ne lit que les
+        // uniformes du monde (groupe 0).
+        let sun_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("joueurs : ombre au soleil"),
+            bind_group_layouts: &[world_bgl],
+            push_constant_ranges: &[],
+        });
+        let sun = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("joueurs : ombre au soleil"),
+            layout: Some(&sun_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_player"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<PlayerVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &MESH,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<PlayerInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &INSTANCE,
+                    },
+                ],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::sunmap::FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: None,
+            multiview: None,
+            cache: None,
+        });
+        let sun_instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("joueurs : ombre au soleil (instances)"),
+            size: (MAX_PLAYERS * std::mem::size_of::<PlayerInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             plain: pipeline("joueurs", "fs_player", &[target(surface)]),
             taa: pipeline("joueurs (TAA)", "fs_player_taa", &taa_targets),
@@ -368,9 +424,34 @@ impl Players {
             extra: 0,
             water,
             water_count: 0,
+            sun,
+            sun_instances,
+            sun_count: 0,
             skins,
             group,
         }
+    }
+
+    /// (v217) Joueurs de la carte d'ombre du soleil.
+    fn set_sun_casters(&mut self, queue: &wgpu::Queue, players: &[PlayerInstance]) {
+        let n = players.len().min(MAX_PLAYERS);
+        self.sun_count = n as u32;
+        if n > 0 {
+            queue.write_buffer(&self.sun_instances, 0, bytemuck::cast_slice(&players[..n]));
+        }
+    }
+
+    /// (v217) Ceux-là, en profondeur seule, avec la vue du soleil (`world` : groupe du monde
+    /// de la passe de la carte, ses propres uniformes).
+    fn draw_sun<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, world: &'a wgpu::BindGroup) {
+        if self.sun_count == 0 || self.mesh_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.sun);
+        pass.set_bind_group(0, world, &[]);
+        pass.set_vertex_buffer(0, self.mesh.slice(..));
+        pass.set_vertex_buffer(1, self.sun_instances.slice(..));
+        pass.draw(0..self.mesh_count, 0..self.sun_count);
     }
 
     fn set_mesh(&mut self, queue: &wgpu::Queue, vertices: &[PlayerVertex]) {
@@ -670,6 +751,20 @@ impl Entities {
     /// (v172) Les autres joueurs de cette image.
     pub fn prepare_players(&mut self, queue: &wgpu::Queue, players: &[PlayerInstance]) {
         self.players.set_instances(queue, players);
+    }
+
+    /// (v217) Ceux qui font leur ombre au soleil par la carte (voir `sunmap`).
+    pub(crate) fn prepare_sun_casters(&mut self, queue: &wgpu::Queue, players: &[PlayerInstance]) {
+        self.players.set_sun_casters(queue, players);
+    }
+
+    /// (v217) Passe de la carte d'ombre du soleil : les joueurs, vus du soleil.
+    pub(crate) fn draw_sun_casters<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        world: &'a wgpu::BindGroup,
+    ) {
+        self.players.draw_sun(pass, world);
     }
 
     /// `follow` : les premiers sommets suivent la caméra (modèle du joueur local), les

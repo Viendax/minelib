@@ -47,7 +47,7 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 - **Votes et pauses** (Échap pendant une partie) : proposer d'exclure un coéquipier (tous les autres doivent être d'accord) ou une pause tactique (la majorité ; 3 par équipe, 30 s, au départ de la manche suivante). Le vote s'affiche à gauche : F1 oui, F2 non. Un joueur qui se déconnecte déclenche une pause technique jusqu'à son retour (5 minutes au plus) ; le temps de pause ne compte pas dans les absences.
 - **Un vrai ciel** : sa couleur vient de la diffusion de la lumière dans l'air (bleu de midi, horizon doré au lever et au coucher, bleu nuit), avec le soleil et son halo, la lune et ses phases, les étoiles, et des **nuages en volume** éclairés par le soleil ou la lune, qui dérivent avec le vent. Presque gratuit à l'image : l'atmosphère et les nuages sont calculés à part, un peu à chaque image, et le ciel se lit ensuite en deux ou trois lectures de texture.
 - **Fumigènes et molotovs** : une fumée éclairée par le soleil et le ciel, avec ses volutes ; un feu d'alcool pour le molotov (base bleue, corps jaune, pointes orange, nappe au sol).
-- **Ombres des joueurs** au soleil et devant la lumière la plus proche (torche, lanterne).
+- **Ombres des joueurs** au soleil et devant la lumière la plus proche (torche, lanterne) : au soleil, tous les joueurs et PNJ jusqu'à la distance réglée (*Échap → Paramètres graphiques → Lumières → Ombres*, 128 blocs par défaut), même dans une foule.
 - **Minimap** en haut à droite : tes coéquipiers toujours, les adversaires seulement quand quelqu'un de ton équipe les voit (dans son champ de vision, ni derrière des blocs pleins ni derrière une fumée, l'écran pas tout blanc d'une flash) ; leur dernière position vue reste 3,5 s. Le porteur de la bombe y a un logo de bombe (à sa couleur, ou en rouge chez l'adversaire repéré). Les sites de bombe et la bombe quand ton équipe la connaît.
 - **Réseau à 256 Hz** : positions envoyées 256 fois par seconde, prédiction et rembobinage des tirs. À 10 joueurs, l'hôte envoie moins de 1 Mo par seconde.
 - **Entraîne-toi contre des bots** : en mode FPS dans un monde solo, la carte se remplit de bots qui achètent, se battent en équipe, posent et désamorcent la bombe. Trois niveaux : `/bot facile` (par défaut), `/bot normal`, `/bot difficile`, pris tout de suite par ceux de la partie ; `/bot off` pour jouer seul, `/bot` pour les rappeler ou compléter la partie sans la recommencer, `/bot maxbot 2` à `20` pour le nombre de joueurs (toi compris, gardé pour les parties suivantes), `/start` pour la lancer et `/restart` pour la recommencer. Mort, tu vois l'écran du coéquipier que tu regardes comme si c'était toi (sa vie, ses armes, l'arme dans ses mains) ; la touche Utiliser te fait prendre la place du bot regardé, avec sa vie, ses armes et la bombe s'il la porte. En spectateur (`/gm 3`), la partie continue sans toi, et `/gm fps` t'y remet tout de suite. Chaque bot a son skin, dessiné pour lui aux couleurs de son équipe (tenues de terrain côté T, tenue d'intervention côté CT).
@@ -179,7 +179,7 @@ Les touches sont **physiques** (même place en AZERTY et en QWERTY) et se règle
 | C (maintenu) | Zoom | | F5 | Vue 1re / 3e personne |
 | F2 | Capture d'écran | | F3 | Écran de debug |
 | L | Éditeur de lumières | | F (éditeur ouvert) | Caméra libre |
-| K (maintenu) | Parler (micro, en ligne) | | | |
+| V (maintenu) | Parler (micro, en ligne) | | | |
 
 </details>
 

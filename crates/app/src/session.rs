@@ -1989,7 +1989,8 @@ impl Session {
             // changer d'objet (vers le haut : plus serré, plus fort et plus loin ; vers le
             // bas : plus large, moins fort et moins loin), gardé pour la suite.
             if self.flashlight_on && before == Some(Item::Flashlight) {
-                let f = (self.flashlight_focus + 0.1 * input.scroll.signum()).clamp(0.0, 1.0);
+                let step = input.scroll.signum() / crate::flashlight::STEPS;
+                let f = (self.flashlight_focus + step).clamp(0.0, 1.0);
                 if (f - self.flashlight_focus).abs() > 1e-4 {
                     self.flashlight_focus = f;
                     crate::flashlight::save_focus(f);
@@ -6149,7 +6150,7 @@ impl Session {
                 ny - s,
                 tw + 2.0 * s,
                 10.0 * s,
-                [0.0, 0.0, 0.0, 0.45],
+                [0.0, 0.0, 0.0, NAME_BACK],
             );
             ui.text(x - tw / 2.0, ny, s, col, name);
         }
@@ -6992,12 +6993,14 @@ impl Session {
             {
                 continue;
             }
+            // (v217) Fond presque opaque : deux pseudos qui se chevauchent restent lisibles
+            // (le plus proche cache celui de derrière ; avant, on lisait les deux mêlés).
             ui.rect(
                 x - tw / 2.0 - ts,
                 y - ts,
                 tw + 2.0 * ts,
                 10.0 * ts,
-                [0.0, 0.0, 0.0, 0.45 * alpha],
+                [0.0, 0.0, 0.0, NAME_BACK * alpha],
             );
             ui.text(
                 x - tw / 2.0,
@@ -7438,8 +7441,15 @@ impl Session {
                     b.owner |= crate::flashlight::NEAR_FLAME;
                 }
             }
-            shadows.push((self.player.pos, own));
+            shadows.push((self.player.pos, own, None));
         }
+        // (v217) Ombres des joueurs jusqu'à la distance réglée (Paramètres graphiques →
+        // Lumières → Ombres) : boîtes exactes pour les plus proches (de la caméra ou d'une
+        // lumière), carte d'ombre du soleil pour tous les autres (`sun_casters`).
+        let shadow_d = self.lights.settings.player_shadow_distance;
+        let shadow_d2 = shadow_d * shadow_d;
+        let mut sun_casters = std::mem::take(&mut scratch.sun_casters);
+        sun_casters.clear();
         // (v172) Les autres joueurs : dessinés par la carte graphique, tous d'un coup (un
         // modèle commun, une instance chacun), comme soi en F5 : leur skin pixel par pixel,
         // la lumière de là où ils sont (lumières dynamiques comprises). Seul l'objet tenu
@@ -7485,13 +7495,18 @@ impl Session {
                     // (v177) Les bots aussi ont un skin, dessiné pour eux.
                     skin: self.skins.in_match(&v.pseudo, v.team),
                 };
-                shadows.push((v.pos, crate::player_model::shadow_boxes(&other)));
+                let layer = layers.layer(other.skin.as_ref(), renderer);
+                let prev = Walk::prev_of(&self.walks, &v.pseudo, &other);
+                let inst = crate::player_model::instance(&other, layer, &prev);
+                // (v217) Jusqu'à la distance réglée ; au-delà des boîtes exactes, dans la
+                // carte du soleil (à 10 contre 10, les derniers n'avaient pas d'ombre).
+                if v.pos.distance_squared(cam) <= shadow_d2 {
+                    shadows.push((v.pos, crate::player_model::shadow_boxes(&other), Some(inst)));
+                }
                 if inside == Some(v.pseudo.as_str()) {
                     continue;
                 }
-                let layer = layers.layer(other.skin.as_ref(), renderer);
-                let prev = Walk::prev_of(&self.walks, &v.pseudo, &other);
-                players.push(crate::player_model::instance(&other, layer, &prev));
+                players.push(inst);
                 // (v177) Le modèle de son arme de près, sa silhouette de loin.
                 let near = v.pos.distance_squared(cam) < GEAR_DETAIL * GEAR_DETAIL;
                 model.extend(crate::player_model::held_model(&other, near));
@@ -7636,17 +7651,31 @@ impl Session {
                     held: None,
                     skin: o.skin.clone(),
                 };
-                if shadow {
-                    shadows.push((o.pos, crate::player_model::shadow_boxes(&other)));
-                }
                 if players.len() < minelib_render::MAX_PLAYERS {
                     let layer = layers.layer(other.skin.as_ref(), renderer);
                     let prev = w.map_or_else(
                         || crate::player_model::Prev::still(&other),
                         |w| w.prev,
                     );
-                    players.push(crate::player_model::instance(&other, layer, &prev));
+                    let inst = crate::player_model::instance(&other, layer, &prev);
+                    // (v217) Candidat aux boîtes exactes, sinon dans la carte du soleil,
+                    // jusqu'à la distance réglée.
+                    if d2 <= shadow_d2 {
+                        if shadow {
+                            shadows.push((
+                                o.pos,
+                                crate::player_model::shadow_boxes(&other),
+                                Some(inst),
+                            ));
+                        } else {
+                            sun_casters.push(inst);
+                        }
+                    }
+                    players.push(inst);
                 } else {
+                    if shadow && d2 <= shadow_d2 {
+                        shadows.push((o.pos, crate::player_model::shadow_boxes(&other), None));
+                    }
                     model.extend(crate::player_model::build_tiny(&other));
                 }
             }
@@ -7681,12 +7710,16 @@ impl Session {
         });
         let mut shadow_boxes = std::mem::take(&mut scratch.boxes);
         shadow_boxes.clear();
-        shadow_boxes.extend(
-            shadows
-                .iter()
-                .flat_map(|s| s.1.iter().copied())
-                .take(minelib_render::MAX_SHADOW_BOXES),
-        );
+        // (v217) Joueur par joueur, tant que toutes ses boîtes tiennent ; les suivants dans la
+        // carte du soleil (avant, les boîtes en trop étaient perdues, et un joueur pouvait
+        // n'avoir que la moitié de son ombre).
+        for (_, boxes, inst) in shadows.iter() {
+            if shadow_boxes.len() + boxes.len() <= minelib_render::MAX_SHADOW_BOXES {
+                shadow_boxes.extend_from_slice(boxes);
+            } else if let Some(i) = inst {
+                sun_casters.push(*i);
+            }
+        }
         // Morceau de joueur que des blocs cachent du soleil : pas d'ombre du soleil (on ne
         // voit pas son ombre à l'abri d'un toit, d'un arbre…).
         {
@@ -7854,6 +7887,8 @@ impl Session {
             held_light_pos: crate::player_model::torch_tip(&pose),
             ray_light: self.hand_light,
             shadow_boxes: &shadow_boxes,
+            sun_casters: &sun_casters,
+            player_shadow_distance: shadow_d,
             viewmodel: &hand,
             arm: &arm,
             entities: &model,
@@ -7940,6 +7975,7 @@ impl Session {
         scratch.players = players;
         scratch.shadows = shadows;
         scratch.boxes = shadow_boxes;
+        scratch.sun_casters = sun_casters;
         *self.scratch.borrow_mut() = scratch;
         stats
     }
@@ -8057,6 +8093,9 @@ const NAME_SIZE_AT: f32 = 8.0;
 /// effacés peu à peu sur les [`NAME_FADE`] derniers blocs. Avant : jusqu'à ce que le texte
 /// passe sous 7 pixels de haut, 15 à 22 blocs selon la taille de l'écran.
 const NAME_RANGE: f32 = 32.0;
+/// (v217) Opacité du fond des pseudos au-dessus des joueurs (0,45 avant) : « j'ai du mal à
+/// lire les pseudos quand ils se superposent » (Viendax).
+const NAME_BACK: f32 = 0.82;
 const NAME_FADE: f32 = 4.0;
 
 /// (v189) Pseudo à `d` blocs de la caméra (`s` : échelle de l'interface) : taille du texte
@@ -8554,8 +8593,12 @@ fn stairs_placement(hit: &Hit, item: BlockId, look: Vec3, point: Vec3) -> Option
 struct Scratch {
     players: Vec<minelib_render::PlayerInstance>,
     order: Vec<(f32, u32)>,
-    shadows: Vec<(Vec3, Vec<ShadowBox>)>,
+    /// Candidats aux ombres exactes : pieds, boîtes, et (v217) leur instance, pour la carte
+    /// du soleil s'ils n'y ont pas de place.
+    shadows: Vec<(Vec3, Vec<ShadowBox>, Option<minelib_render::PlayerInstance>)>,
     boxes: Vec<ShadowBox>,
+    /// (v217) Joueurs de la carte d'ombre du soleil.
+    sun_casters: Vec<minelib_render::PlayerInstance>,
 }
 
 /// (v197) Réponses de `sun_reaches` gardées par demi-bloc (voir `Session::sun_seen`).

@@ -335,7 +335,14 @@ pub struct LightSettings {
     pub auto_max: u32,
     /// L'avertissement « expérimental » a été lu.
     pub auto_warned: bool,
+    /// (v217) Distance (blocs) jusqu'à laquelle les joueurs et les PNJ font leur ombre, au
+    /// soleil comme aux lumières : 128 par défaut, la portée des rayons.
+    pub player_shadow_distance: f32,
 }
+
+/// (v217) Bornes de `LightSettings::player_shadow_distance` (blocs).
+pub const PLAYER_SHADOW_MIN: f32 = 16.0;
+pub const PLAYER_SHADOW_MAX: f32 = 256.0;
 
 /// (v215) Réglages des lumières de Viendax au 21 novembre, devenus ceux du jeu par défaut
 /// (« mes réglages actuels doivent être ceux par défaut ») : qualité « Rapide » mais rayons
@@ -387,6 +394,7 @@ impl Default for LightSettings {
             auto_radius: 50,
             auto_max: 200,
             auto_warned: false,
+            player_shadow_distance: 128.0,
         }
     }
 }
@@ -458,6 +466,13 @@ impl LightSettings {
         s.auto_radius = u("auto_rayon", dd.auto_radius, 8, 128);
         s.auto_max = u("auto_max", dd.auto_max, 1, 240);
         s.auto_warned = b("auto_lu", dd.auto_warned);
+        s.player_shadow_distance = f(
+            "ombres_joueurs_distance",
+            dd.player_shadow_distance,
+            PLAYER_SHADOW_MIN,
+            PLAYER_SHADOW_MAX,
+        )
+        .round();
         s
     }
 
@@ -511,6 +526,10 @@ impl LightSettings {
         kv("auto_rayon", self.auto_radius.to_string());
         kv("auto_max", self.auto_max.to_string());
         kv("auto_lu", self.auto_warned.to_string());
+        kv(
+            "ombres_joueurs_distance",
+            self.player_shadow_distance.to_string(),
+        );
         out
     }
 

@@ -2284,6 +2284,23 @@ impl Editor {
                     DIM,
                 );
                 self.check(p, "Ombres des joueurs", &mut r.entity_shadows);
+                // (v217) Jusqu'où les joueurs et les PNJ font leur ombre (soleil compris).
+                if let Some(v) = self.slider(
+                    p,
+                    222,
+                    "Ombres des joueurs jusqu'à",
+                    s.player_shadow_distance,
+                    lights::PLAYER_SHADOW_MIN,
+                    lights::PLAYER_SHADOW_MAX,
+                    1.0,
+                    &blocks(s.player_shadow_distance, 0),
+                ) {
+                    s.player_shadow_distance = v.round();
+                }
+                p.note(
+                    "Au soleil comme aux lumières, tous les joueurs et les PNJ jusqu'à cette distance font leur ombre.",
+                    DIM,
+                );
                 self.check(p, "Cache des ombres", &mut r.shadow_cache);
 
                 if let Some(v) = self.slider(
