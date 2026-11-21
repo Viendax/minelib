@@ -31,6 +31,7 @@
 //!   MINELIB_DEMO=1              nouveau monde : mur + toutes les torches colorées
 //!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé ; aussi
 //!                               dans un monde neuf et dans la démo)
+//!   MINELIB_FPS_START=<x>,<y>,<z>,lacet°  partie FPS : départ du joueur local fixé (essais)
 //!   MINELIB_EXIT_AFTER=<s>      quitter automatiquement (tests)
 //!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
 //!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
@@ -89,6 +90,7 @@ mod save;
 mod screen;
 mod session;
 mod skin;
+mod spotting;
 mod stick;
 mod streaming;
 mod underwater;

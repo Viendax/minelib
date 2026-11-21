@@ -192,8 +192,9 @@ impl Radar {
         size: f32,
         s: f32,
         me: (Vec3, Vec3, [f32; 4]),
-        mates: &[(Vec3, [f32; 4])],
-        enemies: &[Vec3],
+        me_bomb: bool,
+        mates: &[(Vec3, [f32; 4], bool)],
+        enemies: &[(Vec3, bool)],
         bomb: Option<Vec3>,
     ) {
         let Some(c) = self.center else { return };
@@ -287,20 +288,59 @@ impl Radar {
             );
             ui.rect(px - r, py - r, 2.0 * r, 2.0 * r, col);
         };
+        // (v209) Logo de bombe (celui qui la porte), à la couleur de son point.
+        let bomb_icon = |ui: &mut Ui, (px, py): (f32, f32), col: [f32; 4]| {
+            let px_size = s * 0.9;
+            let half = 3.5 * px_size;
+            ui.rect(
+                px - half - s,
+                py - half - s,
+                2.0 * half + 2.0 * s,
+                2.0 * half + 2.0 * s,
+                [0.0, 0.0, 0.0, 0.8],
+            );
+            for (row, line) in ICON_BOMB.iter().enumerate() {
+                for (k, ch) in line.chars().enumerate() {
+                    if ch == '#' {
+                        ui.rect(
+                            px - half + k as f32 * px_size,
+                            py - half + row as f32 * px_size,
+                            px_size + 0.3,
+                            px_size + 0.3,
+                            col,
+                        );
+                    }
+                }
+            }
+        };
         if let Some(b) = bomb {
             dot(ui, b, [1.0, 0.25, 0.2, 1.0], 2.0 * s);
         }
-        for e in enemies {
-            dot(ui, *e, [0.95, 0.2, 0.2, 1.0], 1.5 * s);
+        let enemy_col = [0.95, 0.2, 0.2, 1.0];
+        for &(e, carries) in enemies {
+            if carries {
+                bomb_icon(ui, to(e), enemy_col);
+            } else {
+                dot(ui, e, enemy_col, 1.5 * s);
+            }
         }
-        for (p, col) in mates {
-            dot(ui, *p, *col, 1.5 * s);
+        for &(p, col, carries) in mates {
+            if carries {
+                bomb_icon(ui, to(p), col);
+            } else {
+                dot(ui, p, col, 1.5 * s);
+            }
         }
         // Soi : point à sa couleur (cerclé de blanc) au centre, trait vers le haut (le
         // regard).
         for k in 1..=4 {
             let f = k as f32 * 1.6 * s;
             ui.rect(cx - s / 2.0, cy - f - s / 2.0, s, s, [1.0, 1.0, 1.0, 0.9]);
+        }
+        // (v209) Soi avec la bombe : son logo à sa couleur.
+        if me_bomb {
+            bomb_icon(ui, (cx, cy), me.2);
+            return;
         }
         let r = 2.0 * s;
         ui.rect(
@@ -313,6 +353,12 @@ impl Radar {
         ui.rect(cx - r, cy - r, 2.0 * r, 2.0 * r, me.2);
     }
 }
+
+/// (v209) Logo de la bombe sur la minimap (7 × 7 points, dessiné pour Minelib) : une charge
+/// avec sa mèche.
+const ICON_BOMB: [&str; 7] = [
+    "....#..", "...#...", "..###..", ".#####.", "#######", ".#####.", "..###..",
+];
 
 /// Teinte d'une colonne : mur s'il y a un bloc plein à hauteur du torse, sinon sol (plus
 /// clair quand il est plus haut), vide s'il n'y a rien en dessous.

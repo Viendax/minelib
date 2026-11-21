@@ -119,6 +119,24 @@ pub struct Online {
     pub warmup: bool,
 }
 
+/// (v209) Le joueur regardé en spectateur : ce qu'il faut pour montrer son écran comme si
+/// c'était soi (`Fps::mirror`). Rempli par `NetGame::watched`.
+#[derive(Clone, Debug, Default)]
+pub struct Watched {
+    pub hp: u32,
+    /// En main : code de `Fps::held_weapon` (arme, grenade, bombe, 255 : couteau).
+    pub weapon: u8,
+    /// Armes et grenades portées, quand on les connaît (hôte).
+    pub guns: Option<(u8, u8)>,
+    pub nades: Option<[u8; 5]>,
+    pub online: Online,
+    /// Munitions de l'arme en main (chargeur, réserve), rechargement restant (s), lunette :
+    /// connus pour un bot.
+    pub ammo: Option<(u32, u32)>,
+    pub reload: Option<f32>,
+    pub scoped: bool,
+}
+
 const GEAR: [(u16, &str); 3] = [
     (minelib_net::game::ITEM_KEVLAR, "Gilet"),
     (minelib_net::game::ITEM_HELMET, "Gilet+casque"),
@@ -227,6 +245,8 @@ pub struct Fps {
     sparks: Vec<(Vec3, Vec3, f32)>,
     /// Gouttes de sang (position, vitesse, âge) : un joueur touché.
     blood: Vec<(Vec3, Vec3, f32)>,
+    /// (v209) Flashs éclatées pas encore lues par la minimap (`take_flashes`).
+    flashes: Vec<Vec3>,
     flash: f32,
     kick: f32,
     /// Dual Berettas : le pistolet de gauche vient de tirer (ils tirent l'un après l'autre).
@@ -302,6 +322,7 @@ impl Fps {
             holes: Vec::new(),
             sparks: Vec::new(),
             blood: Vec::new(),
+            flashes: Vec::new(),
             flash: 0.0,
             kick: 0.0,
             left_fired: true,
@@ -384,6 +405,125 @@ impl Fps {
         fix(&mut self.secondary, guns.1);
         self.nades = nades;
         self.reload = None;
+    }
+
+    /// (v209) Spectateur : cette instance (pas celle du joueur) montre le joueur regardé
+    /// comme si c'était soi : sa vie, son équipement, l'arme qu'il a en main (qui sort quand
+    /// il en change), ses munitions et sa lunette quand on les connaît. Ses tirs :
+    /// `mirror_fire`.
+    pub fn mirror(&mut self, w: &Watched, dt: f32) {
+        self.deploy = (self.deploy - dt).max(0.0);
+        self.flash = (self.flash - dt).max(0.0);
+        self.kick = (self.kick - dt * 6.0).max(0.0);
+        self.swing = (self.swing - dt * 3.0).max(0.0);
+        self.since_shot += dt;
+        self.sounds.clear();
+        self.hp = w.hp;
+        self.online = Some(w.online);
+        let fix = |slot: &mut Option<Gun>, want: u8| {
+            let have = slot.map_or(255, |g| g.def as u8);
+            if have != want {
+                *slot = ((want as usize) < WEAPONS.len()).then(|| Gun::new(want as usize));
+            }
+        };
+        if let Some((a, b)) = w.guns {
+            fix(&mut self.primary, a);
+            fix(&mut self.secondary, b);
+        }
+        if let Some(n) = w.nades {
+            self.nades = n;
+        }
+        let code = w.weapon as u16;
+        let nade = minelib_net::game::ITEM_NADE;
+        let sel = if (w.weapon as usize) < WEAPONS.len() {
+            // Arme pas encore connue dans ses emplacements (invité) : mise à sa place.
+            let pistol = WEAPONS[w.weapon as usize].category == Category::Pistol;
+            if pistol {
+                fix(&mut self.secondary, w.weapon);
+                Sel::Secondary
+            } else {
+                fix(&mut self.primary, w.weapon);
+                Sel::Primary
+            }
+        } else if w.weapon == crate::cs::W_BOMB {
+            Sel::Bomb
+        } else if (nade..nade + 5).contains(&code) {
+            let n = Nade::ALL[(code - nade) as usize];
+            if w.nades.is_none() {
+                self.nades[n.index()] = self.nades[n.index()].max(1);
+            }
+            Sel::Nade(n)
+        } else {
+            Sel::Knife
+        };
+        if sel != self.sel {
+            self.prev = self.sel;
+            self.sel = sel;
+            self.deploy = DEPLOY_S;
+            self.swing = 0.0;
+            self.toss = 0.0;
+        }
+        match sel {
+            Sel::Primary => self.use_primary = true,
+            Sel::Secondary => self.use_primary = false,
+            _ => {}
+        }
+        if let (Some((mag, reserve)), Some(g)) = (w.ammo, self.active_mut()) {
+            g.mag = mag;
+            g.reserve = reserve;
+        }
+        self.reload = w.reload;
+        self.scoped = u8::from(
+            w.scoped
+                && self
+                    .active()
+                    .is_some_and(|g| !WEAPONS[g.def].scope.is_empty()),
+        );
+    }
+
+    /// (v209) Spectateur : le joueur regardé vient de tirer (recul, flamme, geste du couteau).
+    pub fn mirror_fire(&mut self) {
+        match self.sel {
+            Sel::Knife => {
+                self.swing = 1.0;
+                self.heavy = false;
+            }
+            Sel::Nade(_) => self.toss = 1.0,
+            _ => {
+                self.since_shot = 0.0;
+                self.flash = 0.05;
+                self.kick = 1.0;
+                self.left_fired = !self.left_fired;
+            }
+        }
+    }
+
+    /// (v209) On prend la place d'un bot (partie solo) : ce qu'il tenait en main, et les
+    /// munitions de ses armes (les armes elles-mêmes arrivent par `set_guns`).
+    pub fn take_over(&mut self, held: u8, ammo: &[(u8, (u32, u32))]) {
+        for g in [&mut self.primary, &mut self.secondary]
+            .into_iter()
+            .flatten()
+        {
+            if let Some((_, (mag, reserve))) = ammo.iter().find(|(w, _)| *w as usize == g.def) {
+                g.mag = *mag;
+                g.reserve = *reserve;
+            }
+        }
+        let sel = match (self.primary, self.secondary) {
+            (Some(p), _) if p.def == held as usize => Sel::Primary,
+            (_, Some(s)) if s.def == held as usize => Sel::Secondary,
+            _ => Sel::Knife,
+        };
+        // Comme une arme qu'on sort : pas de tir avant qu'elle soit prête.
+        self.sel = Sel::Knife;
+        self.select(sel);
+        if sel == Sel::Knife {
+            self.deploy = DEPLOY_S;
+        }
+        self.blind = 0.0;
+        self.buy_open = false;
+        self.hold_fire = true;
     }
 
     /// Objet acheté (accepté par l'hôte).
@@ -1131,8 +1271,10 @@ impl Fps {
             self.hp = self.hp.saturating_sub(whole as u32);
         }
         if hits.flash > 0.0 {
-            self.blind = self.blind.max(hits.flash * 3.5);
+            self.blind = self.blind.max(hits.flash * equip::FLASH_BLIND);
         }
+        // (v209) Pour la minimap : les flashs qui ont éclaté (aveuglement des coéquipiers).
+        self.flashes.extend(hits.flashes);
         self.blind = (self.blind - dt).max(0.0);
     }
 
@@ -1277,6 +1419,16 @@ impl Fps {
     /// Aveuglé par une flash (pour le fil des éliminations).
     pub fn is_blind(&self) -> bool {
         self.blind > 0.3
+    }
+
+    /// (v209) Blanc de flash (s) : l'écran est tout blanc à partir de 1.
+    pub fn blind_amount(&self) -> f32 {
+        self.blind
+    }
+
+    /// (v209) Flashs éclatées depuis le dernier appel (minimap).
+    pub fn take_flashes(&mut self) -> Vec<Vec3> {
+        std::mem::take(&mut self.flashes)
     }
 
     /// Fumées en cours : (centre, rayon).

@@ -349,8 +349,55 @@ impl Player {
             self.move_axis(world, 1, lift);
             self.vel.y = self.vel.y.max(0.0);
         }
-        self.move_axis(world, 0, back.x);
-        self.move_axis(world, 2, back.z);
+        // (v209) Debout sur quelque chose (bloc, télé, joueur) : le retour ne le fait jamais
+        // tomber, il s'arrête au bord comme un joueur accroupi. (Ramené au-delà du bord de la
+        // télé sur laquelle il se tenait, il tombait.)
+        let guard = lift <= 0.0 && self.on_ground && !self.flying;
+        for axis in [0, 2] {
+            let before = self.pos;
+            self.move_axis(world, axis, back[axis]);
+            if guard && !self.supported(world) {
+                // La plus grande part du retour qui le laisse sur ses pieds.
+                let (mut lo, mut hi) = (0.0f32, 1.0f32);
+                for _ in 0..8 {
+                    let mid = (lo + hi) / 2.0;
+                    self.pos = before;
+                    self.move_axis(world, axis, back[axis] * mid);
+                    if self.supported(world) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                self.pos = before;
+                self.move_axis(world, axis, back[axis] * lo);
+            }
+        }
+    }
+
+    /// (v209) Y aurait-il un appui sous ses pieds s'il était en `at` ?
+    pub fn supported_at(&mut self, world: &World, at: Vec3) -> bool {
+        let saved = self.pos;
+        self.pos = at;
+        let s = self.supported(world);
+        self.pos = saved;
+        s
+    }
+
+    /// (v209) Mode FPS, au sol : distance (blocs) parcourue avant l'arrêt en lâchant tout,
+    /// depuis la vitesse `speed` (friction de CS et freinage sans touche, voir `update`).
+    pub fn fps_stop_distance(speed: f32, dt: f32) -> f32 {
+        let (mut v, mut d) = (speed.max(0.0), 0.0);
+        for _ in 0..256 {
+            if v < 0.1 * cs::UNIT {
+                break;
+            }
+            let drop = v.max(cs::STOP_SPEED) * cs::FRICTION * dt;
+            v = (v - drop).max(0.0);
+            v = (v - FPS_IDLE_BRAKE * dt).max(0.0);
+            d += v * dt;
+        }
+        d
     }
 
     /// Note les directions qui viennent d'être lâchées (voir `released`), et oublie celles
@@ -583,18 +630,23 @@ impl Player {
         let target = if crouching { 1.0 } else { 0.0 };
         let crouch_before = self.crouch;
         self.crouch += (target - self.crouch) * (dt * duck_rate).min(1.0);
+        // (v209) Saut accroupi dans tous les modes de jeu (avant : en mode FPS seulement).
+        // Hors mode FPS, pas dans l'eau ni sur une échelle (accroupi, on y descend ou on s'y
+        // tient : les jambes n'ont pas à remonter).
+        let tuck =
+            !self.flying && !self.noclip && (fps || (self.swimming.is_none() && !self.on_ladder));
         // (v179) Se relever sous un plafond bas : on reste accroupi tant que la place
-        // manque (accroupi, la boîte fait 1,5 bloc). En l'air en mode FPS, ce sont les
-        // jambes qui se déplient (plus bas).
-        if self.crouch < crouch_before && !self.noclip && (self.on_ground || !fps) {
+        // manque (accroupi, la boîte fait 1,5 bloc). En l'air, ce sont les jambes qui se
+        // déplient (plus bas).
+        if self.crouch < crouch_before && !self.noclip && (self.on_ground || !tuck) {
             let room = self.headroom(world);
             let need = ((HEIGHT - room) / CROUCH_DROP).clamp(0.0, 1.0);
             self.crouch = self.crouch.max(need.min(crouch_before));
         }
-        // Saut accroupi (mode FPS) : s'accroupir en l'air replie les jambes, les pieds
-        // montent d'autant que la vue descend (la vue ne bouge pas) ; se relever en l'air
-        // les redescend. Saut (1,45 bloc) + jambes repliées : on atteint 1,5 bloc.
-        if fps && !self.on_ground {
+        // Saut accroupi : s'accroupir en l'air replie les jambes, les pieds montent
+        // d'autant que la vue descend (la vue ne bouge pas) ; se relever en l'air les
+        // redescend. Saut (1,45 bloc) + jambes repliées : on atteint 1,5 bloc.
+        if tuck && !self.on_ground {
             let lift = CROUCH_DROP * (self.crouch - crouch_before);
             self.move_axis(world, 1, lift);
             self.slide = None;
@@ -1316,6 +1368,15 @@ fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec3, Vec3)> {
             )
         })
         .collect()
+}
+
+/// (v209) Un joueur dont les pieds sont en `feet` (accroupi de `crouch`) est sur une
+/// échelle ou une liane : pour entendre les échelles des autres joueurs du monde en ligne,
+/// dont on ne connaît que la position.
+pub fn ladder_at(world: &World, feet: Vec3, crouch: f32) -> bool {
+    let mut p = Player::new(feet);
+    p.crouch = crouch;
+    p.ladder(world, false).is_some()
 }
 
 /// Échelle ou liane (`ladder:<côté>`, `vine:<côté>`) : côté du mur où elle est
@@ -2072,6 +2133,39 @@ mod tests {
         }
     }
 
+    /// (v209) Le retour de la compensation du clavier (`nudge`) ne fait jamais tomber d'un
+    /// bord : debout sur un pilier d'un bloc, ramené de deux blocs, il s'arrête au bord.
+    #[test]
+    fn the_key_lag_nudge_never_walks_off_an_edge() {
+        let mut w = flat_world();
+        for y in 11..13 {
+            w.set(8, y, 8, BlockId::STONE);
+        }
+        let mut p = Player::new(Vec3::new(8.5, 13.0, 8.5));
+        for _ in 0..30 {
+            p.update(&w, &MoveInput::default(), 1.0 / 64.0);
+        }
+        assert!(p.on_ground && (p.pos.y - 13.0).abs() < 1e-3, "{:?}", p.pos);
+        p.nudge(&w, Vec3::new(0.0, 0.0, 2.0), 0.0);
+        assert!(
+            p.pos.z > 8.5 && p.pos.z < 9.0 + HALF_WIDTH + 1e-3,
+            "{:?}",
+            p.pos
+        );
+        for _ in 0..30 {
+            p.update(&w, &MoveInput::default(), 1.0 / 64.0);
+        }
+        assert!(
+            (p.pos.y - 13.0).abs() < 1e-3,
+            "toujours sur le pilier : {:?}",
+            p.pos
+        );
+        // En l'air (tombé d'un bord pendant le retard, `lift`) : remonté puis ramené.
+        let mut p = Player::new(Vec3::new(8.5, 12.4, 9.8));
+        p.nudge(&w, Vec3::new(0.0, 0.0, -1.3), 0.6);
+        assert!((p.pos.z - 8.5).abs() < 1e-3, "{:?}", p.pos);
+    }
+
     #[test]
     fn sneaking_does_not_walk_off_edges() {
         let w = flat_world(); // sol en y = 10 sur x, z dans 0..16
@@ -2218,6 +2312,41 @@ mod tests {
             on_wall |= p.on_ground && (p.pos.y - 12.5).abs() < 1e-3;
         }
         assert!(on_wall, "monté sur le mur : {:?}", p.pos);
+    }
+
+    /// (v209) Le saut accroupi marche aussi hors mode FPS : s'accroupir en l'air replie les
+    /// jambes, les pieds montent d'autant (la vue ne bouge pas).
+    #[test]
+    fn crouch_jump_works_in_every_mode() {
+        let w = flat_world();
+        let peak = |duck: bool| {
+            let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+            for _ in 0..64 {
+                p.update(&w, &MoveInput::default(), 1.0 / 64.0);
+            }
+            let y0 = p.pos.y;
+            let jump = MoveInput {
+                jump: true,
+                jump_pressed: true,
+                ..Default::default()
+            };
+            p.update(&w, &jump, 1.0 / 64.0);
+            let air = MoveInput {
+                sneak: duck,
+                ..Default::default()
+            };
+            let mut top: f32 = 0.0;
+            for _ in 0..128 {
+                p.update(&w, &air, 1.0 / 64.0);
+                top = top.max(p.pos.y - y0);
+            }
+            top
+        };
+        let (plain, ducked) = (peak(false), peak(true));
+        assert!(
+            ducked > plain + CROUCH_DROP * 0.9,
+            "saut {plain}, saut accroupi {ducked}"
+        );
     }
 
     /// Les joueurs sont solides entre eux : on ne se traverse pas, on monte sur une tête,

@@ -160,30 +160,29 @@ fn rgb(p: [u8; 4]) -> u32 {
     (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32
 }
 
-/// Dessine un visage de skin (8 × 8) dans un carré de l'interface.
-pub fn draw_face(
+/// Dessine un visage de skin (8 × 8) dans un carré de l'interface. (v209) Passé au gris
+/// (`gray` : 0 en couleurs, 1 tout gris), puis assombri (`dim`).
+pub fn draw_face_gray(
     ui: &mut minelib_render::Ui,
     face: &[[u8; 3]; 64],
     x: f32,
     y: f32,
     size: f32,
     dim: f32,
+    gray: f32,
 ) {
     let c = size / 8.0;
     for v in 0..8 {
         for u in 0..8 {
-            let p = face[v * 8 + u];
+            let p = face[v * 8 + u].map(|k| k as f32 / 255.0);
+            let l = 0.3 * p[0] + 0.59 * p[1] + 0.11 * p[2];
+            let m = |k: f32| (k + (l - k) * gray) * dim;
             ui.rect(
                 x + u as f32 * c,
                 y + v as f32 * c,
                 c + 0.5,
                 c + 0.5,
-                [
-                    p[0] as f32 / 255.0 * dim,
-                    p[1] as f32 / 255.0 * dim,
-                    p[2] as f32 / 255.0 * dim,
-                    1.0,
-                ],
+                [m(p[0]), m(p[1]), m(p[2]), 1.0],
             );
         }
     }

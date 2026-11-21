@@ -25,6 +25,8 @@ pub struct Streamer {
     wanted_list: Vec<ChunkPos>,
     /// Chunks à garder en mémoire (chunks voulus + un anneau pour le maillage).
     keep_chunks: HashSet<ChunkPos>,
+    /// (v209) Chunks gardés en mémoire même hors de la distance de vue (voir `pin`).
+    pinned: HashSet<ChunkPos>,
     /// Chunks à afficher.
     needed_chunks: HashSet<ChunkPos>,
     meshed: HashSet<ChunkPos>,
@@ -83,6 +85,7 @@ impl Streamer {
             radius,
             wanted_list: Vec::new(),
             keep_chunks: HashSet::new(),
+            pinned: HashSet::new(),
             needed_chunks: HashSet::new(),
             meshed: HashSet::new(),
             gen_pending: HashSet::new(),
@@ -227,6 +230,21 @@ impl Streamer {
         }
     }
 
+    /// (v209) Chunks à garder chargés dans le monde même loin de la caméra (pas affichés
+    /// pour autant) : sous les joueurs d'une partie FPS servie ici, pour que leur
+    /// simulation ait toujours le sol sous les pieds. Rend ceux qu'il faut charger tout de
+    /// suite (ni chargés, ni en cours de génération).
+    pub fn pin(&mut self, world: &World, set: HashSet<ChunkPos>) -> Vec<ChunkPos> {
+        let missing = set
+            .iter()
+            .copied()
+            .filter(|c| !world.contains(*c) && !self.gen_pending.contains(c))
+            .collect();
+        self.keep_chunks.extend(set.iter().copied());
+        self.pinned = set;
+        missing
+    }
+
     fn reselect(&mut self, world: &mut World, px: f32, pz: f32) {
         self.last_select = Some((px, pz));
         self.idle = false;
@@ -244,6 +262,7 @@ impl Streamer {
                 }
             }
         }
+        self.keep_chunks.extend(self.pinned.iter().copied());
         // Données de chunks qui ne servent plus. Les libérer peut prendre des centaines de
         // millisecondes quand des milliers de chunks partent d'un coup (distance de rendu
         // baissée) : c'est fait sur un thread à part, pas sur celui du jeu.

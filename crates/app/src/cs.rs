@@ -890,6 +890,69 @@ impl Match {
         Some(Resume::Fresh { reset })
     }
 
+    /// (v209) Partie solo : le joueur `me`, mort, prend la place du bot `bot` de son équipe,
+    /// en vie dans la manche en cours. Il reprend tout de lui : vie, gilet, casque, kit,
+    /// armes, grenades, la bombe s'il la porte. Le bot sort de la manche sans que sa mort
+    /// soit comptée (il revient à la suivante, avec le pistolet de départ).
+    pub fn take_over(&mut self, me: u64, bot: u64) -> bool {
+        if !matches!(self.phase, phase::FREEZE | phase::LIVE | phase::PLANTED) || me == bot {
+            return false;
+        }
+        let (Some(m), Some(b)) = (self.players.get(&me), self.players.get(&bot)) else {
+            return false;
+        };
+        if m.alive || !b.alive || m.team != b.team || m.excluded() {
+            return false;
+        }
+        let b = self.players.get_mut(&bot).expect("bot");
+        b.alive = false;
+        b.reset = true;
+        b.dead_for = 0.0;
+        let (hp, armor, helmet, kit, guns, nades) =
+            (b.hp, b.armor, b.helmet, b.kit, b.guns, b.nades);
+        let (shots_left, shots_tick) = (b.shots_left, b.shots_tick);
+        b.guns = (255, 255);
+        b.nades = [0; 5];
+        b.kit = false;
+        let m = self.players.get_mut(&me).expect("joueur");
+        m.alive = true;
+        m.present = true;
+        m.dead_for = 0.0;
+        m.reset = false;
+        m.idle = 0.0;
+        m.hp = hp;
+        m.armor = armor;
+        m.helmet = helmet;
+        m.kit = kit;
+        m.guns = guns;
+        m.nades = nades;
+        m.shots_left = shots_left;
+        m.shots_tick = shots_tick;
+        m.bought.clear();
+        if self.carrier == Some(bot) {
+            self.carrier = Some(me);
+        }
+        // Pose ou désamorçage en cours du bot : à recommencer (comme s'il était mort).
+        if self.planter == Some(bot) && self.bomb == bomb::CARRIED {
+            self.plant_progress = 0.0;
+        }
+        if self.defuser == Some(bot) {
+            self.defuser = None;
+            self.defuse_progress = 0.0;
+        }
+        let m = self.players.get_mut(&me).expect("joueur");
+        m.plant_key = false;
+        m.defuse_key = false;
+        true
+    }
+
+    /// (v209) Partie solo : un bot retiré (`/bot`), sans pause technique ; il ne reste
+    /// pas au tableau des scores.
+    pub fn remove_bot(&mut self, id: u64, at: Option<Vec3>) {
+        self.step_out(id, at);
+        self.players.remove(&id);
+    }
+
     /// Changer d'équipe : refusé. Les équipes sont faites à l'entrée (matchmaking, lobby
     /// dans la même équipe) et ne bougent plus, même pendant l'échauffement.
     pub fn switch_team(&mut self, _id: u64, _team: u8) -> Option<Ev> {

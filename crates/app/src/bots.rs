@@ -58,6 +58,31 @@ pub fn save_level(level: u8) {
     }
 }
 
+/// (v209) Joueurs d'une partie contre les bots, soi compris (`/bot maxbot`, gardé dans
+/// `.minelib/bots_joueurs`) : les bots la remplissent jusque-là. Absent : la carte décide
+/// (son nombre de joueurs).
+pub fn saved_players() -> Option<usize> {
+    std::fs::read_to_string(minelib_assets::data_dir().join("bots_joueurs"))
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(MIN_PLAYERS, MAX_PLAYERS))
+}
+
+/// (v209) Garde le nombre de joueurs choisi pour les parties suivantes.
+pub fn save_players(n: usize) {
+    let n = n.clamp(MIN_PLAYERS, MAX_PLAYERS);
+    if let Err(e) = std::fs::write(
+        minelib_assets::data_dir().join("bots_joueurs"),
+        n.to_string(),
+    ) {
+        log::warn!("nombre de joueurs des bots non enregistré : {e}");
+    }
+}
+
+/// (v209) Bornes de `/bot maxbot` : de 1 contre 1 à 10 contre 10.
+pub const MIN_PLAYERS: usize = 2;
+pub const MAX_PLAYERS: usize = minelib_net::proto::FPS_MAX_PLAYERS as usize;
+
 /// Niveau d'après son nom (français ou anglais). (v195) Plus par un chiffre : `/bots 0` et
 /// `/bots 1` arrêtent et lancent les bots, comme off et on.
 pub fn level_named(s: &str) -> Option<u8> {
@@ -523,28 +548,121 @@ impl Search {
 }
 
 /// Relève la carte d'un monde enregistré (`dir`) en tâche de fond, pour les bots.
-pub fn nav_in_background(dir: std::path::PathBuf, map: FpsMap, starts: Vec<Vec3>) -> Receiver<Nav> {
+pub fn nav_in_background(
+    dir: std::path::PathBuf,
+    map: FpsMap,
+    starts: Vec<Vec3>,
+) -> Receiver<Arc<Nav>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // (v209) Un seul relevé par carte : déjà fait, il est repris ; en cours, on l'attend.
+    // Avant, chaque passage en mode FPS en relançait un (12 à 34 s sur tous les cœurs pour
+    // une grande carte), et cinq tournaient en même temps quand on y passait plusieurs fois
+    // de suite : le processeur à fond chauffait aussi la carte graphique.
+    let key = survey_key(&dir, &map, &starts);
+    {
+        let Ok(mut guard) = SURVEYS.lock() else {
+            return rx;
+        };
+        let surveys = guard.get_or_insert_with(HashMap::new);
+        match surveys.get_mut(&key) {
+            Some(Survey::Done(nav)) => {
+                log::info!("bots : relevé de la carte repris ({} cases)", nav.len());
+                let _ = tx.send(nav.clone());
+                return rx;
+            }
+            Some(Survey::Running(waiting)) => {
+                log::info!("bots : relevé de la carte déjà en cours, attendu");
+                waiting.push(tx);
+                return rx;
+            }
+            None => {
+                surveys.insert(key.clone(), Survey::Running(vec![tx]));
+            }
+        }
+    }
     let _ = std::thread::Builder::new()
         .name("releve-bots".into())
         .spawn(move || {
             let t = std::time::Instant::now();
-            let Some(world) = crate::radar::load_map_world(&dir, &map) else {
+            let nav = crate::radar::load_map_world(&dir, &map).map(|world| {
+                let nav = Nav::build(&world, &map, &starts);
+                if nav.is_empty() {
+                    log::warn!(
+                        "bots : aucune case où se tenir aux départs, ils resteront sur place"
+                    );
+                }
+                log::info!(
+                    "bots : relevé de la carte, {} cases en {:.1} s",
+                    nav.len(),
+                    t.elapsed().as_secs_f32()
+                );
+                Arc::new(nav)
+            });
+            let Ok(mut guard) = SURVEYS.lock() else {
+                return;
+            };
+            let surveys = guard.get_or_insert_with(HashMap::new);
+            let waiting = match surveys.remove(&key) {
+                Some(Survey::Running(w)) => w,
+                _ => Vec::new(),
+            };
+            let Some(nav) = nav else {
                 log::warn!("bots : carte illisible, ils resteront sur place");
                 return;
             };
-            let nav = Nav::build(&world, &map, &starts);
-            if nav.is_empty() {
-                log::warn!("bots : aucune case où se tenir aux départs, ils resteront sur place");
+            // Seul le dernier relevé fini est gardé (plusieurs dizaines de Mo pour une
+            // grande carte).
+            surveys.retain(|_, s| matches!(s, Survey::Running(_)));
+            surveys.insert(key, Survey::Done(nav.clone()));
+            for tx in waiting {
+                let _ = tx.send(nav.clone());
             }
-            log::info!(
-                "bots : relevé de la carte, {} cases en {:.1} s",
-                nav.len(),
-                t.elapsed().as_secs_f32()
-            );
-            let _ = tx.send(nav);
         });
     rx
+}
+
+/// (v209) Relevé d'une carte : en cours (ceux qui l'attendent) ou fait.
+enum Survey {
+    Running(Vec<std::sync::mpsc::Sender<Arc<Nav>>>),
+    Done(Arc<Nav>),
+}
+
+/// (v209) Relevés par carte (voir `nav_in_background`).
+static SURVEYS: std::sync::Mutex<Option<HashMap<String, Survey>>> = std::sync::Mutex::new(None);
+
+/// (v209) Ce qui fait un relevé : la carte enregistrée (chunks importés, blocs changés),
+/// ses réglages FPS et les départs. `chunks.bin` n'est plus réécrit à chaque sauvegarde :
+/// sa taille et sa date suffisent ; les blocs changés (petit fichier, réécrit à chaque
+/// sauvegarde) comptent par leur contenu.
+fn survey_key(dir: &std::path::Path, map: &FpsMap, starts: &[Vec3]) -> String {
+    use std::hash::{Hash, Hasher};
+    let meta = |name: &str| {
+        std::fs::metadata(dir.join(name)).map_or(String::from("-"), |m| {
+            let at = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            format!("{}@{at}", m.len())
+        })
+    };
+    let content = |name: &str| {
+        std::fs::read(dir.join(name)).map_or(String::from("-"), |b| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            b.hash(&mut h);
+            format!("{}#{:x}", b.len(), h.finish())
+        })
+    };
+    let starts: Vec<[u32; 3]> = starts
+        .iter()
+        .map(|v| v.to_array().map(f32::to_bits))
+        .collect();
+    format!(
+        "{}|{map:?}|{starts:?}|{}|{}",
+        dir.display(),
+        meta("chunks.bin"),
+        content("edits.bin")
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -667,6 +785,13 @@ struct Plan {
     freeze_at: f32,
 }
 
+/// (v174) Adresse selon le niveau choisi, pas tous égaux : facile 0,20 à 0,42, normal 0,45
+/// à 0,68, difficile 0,72 à 0,95 (les bots d'avant).
+fn skill_for(level: u8, seed: u32) -> f32 {
+    let (low, span) = [(0.20, 0.22), (0.45, 0.23), (0.72, 0.23)][level.min(2) as usize];
+    low + (seed % 1000) as f32 / 1000.0 * span
+}
+
 fn team_index(team: u8) -> usize {
     (team == T) as usize
 }
@@ -675,7 +800,7 @@ pub struct Bots {
     /// (v174) Niveau des bots (0 facile, 1 normal, 2 difficile).
     level: u8,
     nav: Option<Arc<Nav>>,
-    building: Option<Receiver<Nav>>,
+    building: Option<Receiver<Arc<Nav>>>,
     brains: Vec<Brain>,
     rng: u32,
     time: f32,
@@ -795,23 +920,67 @@ impl Bots {
             .collect()
     }
 
+    /// (v209) Un bot de moins (retiré de la partie par l'hôte).
+    pub fn remove(&mut self, id: u64) {
+        self.brains.retain(|b| b.id != id);
+    }
+
+    /// (v209) Ce que le bot `id` a en main : munitions de chacune de ses armes (chargeur,
+    /// réserve), rechargement restant (s), lunette. Pour le montrer au spectateur comme si
+    /// c'était lui qui jouait, et pour que le joueur qui prend sa place reprenne tout.
+    pub fn hands(&self, id: u64) -> Option<Hands> {
+        let b = self.brains.iter().find(|b| b.id == id)?;
+        let ammo = |w: u8| {
+            WEAPONS.get(w as usize).map(|def| {
+                b.ammo
+                    .get(&w)
+                    .copied()
+                    .unwrap_or((def.magazine, def.reserve))
+            })
+        };
+        Some(Hands {
+            weapon: b.weapon,
+            ammo: b
+                .ammo
+                .keys()
+                .copied()
+                .chain(std::iter::once(b.weapon))
+                .filter_map(|w| ammo(w).map(|a| (w, a)))
+                .collect(),
+            reload: (b.reload > 0.0).then_some(b.reload),
+            scoped: b.scoped,
+        })
+    }
+
     /// Un bot de plus (identifiant donné par l'hôte).
     pub fn add(&mut self, id: u64) {
         let seed = xorshift(&mut self.rng);
-        // (v174) Adresse selon le niveau choisi, pas tous égaux : facile 0,20 à 0,42,
-        // normal 0,45 à 0,68, difficile 0,72 à 0,95 (les bots d'avant).
-        let (low, span) = [(0.20, 0.22), (0.45, 0.23), (0.72, 0.23)][self.level as usize];
-        let skill = low + (seed % 1000) as f32 / 1000.0 * span;
-        self.brains.push(Brain::new(id, skill, seed));
+        self.brains
+            .push(Brain::new(id, skill_for(self.level, seed), seed));
+    }
+
+    /// (v209) Autre niveau en cours de partie (`/bot <niveau>`), sans la recommencer :
+    /// chaque bot garde sa place dans la fourchette du niveau.
+    pub fn set_level(&mut self, level: u8) {
+        self.level = level.min(2);
+        for b in &mut self.brains {
+            b.skill = skill_for(self.level, b.seed);
+        }
     }
 
     /// Relevé de la carte en cours de préparation (voir `nav_in_background`).
-    pub fn set_building(&mut self, rx: Receiver<Nav>) {
+    pub fn set_building(&mut self, rx: Receiver<Arc<Nav>>) {
         self.building = Some(rx);
     }
 
+    #[cfg(test)]
     pub fn set_nav(&mut self, nav: Nav) {
-        self.nav = Some(Arc::new(nav));
+        self.set_shared_nav(Arc::new(nav));
+    }
+
+    /// (v209) Relevé partagé (le même pour toutes les parties sur cette carte).
+    pub fn set_shared_nav(&mut self, nav: Arc<Nav>) {
+        self.nav = Some(nav);
         self.building = None;
     }
 
@@ -820,7 +989,7 @@ impl Bots {
         self.time += dt;
         if let Some(rx) = &self.building {
             match rx.try_recv() {
-                Ok(nav) => self.set_nav(nav),
+                Ok(nav) => self.set_shared_nav(nav),
                 Err(TryRecvError::Disconnected) => self.building = None,
                 Err(TryRecvError::Empty) => {}
             }
@@ -999,6 +1168,17 @@ struct Brain {
     buy_at: f32,
 }
 
+/// (v209) Ce qu'un bot a en main (voir `Bots::hands`).
+#[derive(Clone, Debug, Default)]
+pub struct Hands {
+    /// Arme en main (indice dans `WEAPONS`, 255 : couteau).
+    pub weapon: u8,
+    /// Munitions par arme : (arme, (chargeur, réserve)).
+    pub ammo: Vec<(u8, (u32, u32))>,
+    pub reload: Option<f32>,
+    pub scoped: bool,
+}
+
 /// Vue (lacet, tangage) qui regarde dans la direction `d`.
 fn angles(d: Vec3) -> (f32, f32) {
     let yaw = d.x.atan2(-d.z).rem_euclid(std::f32::consts::TAU);
@@ -1053,7 +1233,7 @@ fn blocks_sight(id: BlockId) -> bool {
 }
 
 /// On voit `to` depuis `from` (aucun bloc opaque entre les deux).
-fn clear_sight(world: &World, from: Vec3, to: Vec3) -> bool {
+pub(crate) fn clear_sight(world: &World, from: Vec3, to: Vec3) -> bool {
     let d = to - from;
     let len = d.length();
     if len < 1e-3 {
@@ -1064,7 +1244,7 @@ fn clear_sight(world: &World, from: Vec3, to: Vec3) -> bool {
 }
 
 /// Le segment passe dans une fumée.
-fn smoked(smokes: &[(Vec3, f32)], a: Vec3, b: Vec3) -> bool {
+pub(crate) fn smoked(smokes: &[(Vec3, f32)], a: Vec3, b: Vec3) -> bool {
     smokes.iter().any(|&(c, r)| {
         let ab = b - a;
         let t = ((c - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);

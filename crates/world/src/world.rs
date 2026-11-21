@@ -38,6 +38,9 @@ pub struct World {
     /// Chunks importés (ex. monde Minecraft converti), compressés : ils remplacent la
     /// génération procédurale à leur emplacement.
     bases: HashMap<ChunkPos, Arc<Vec<u8>>>,
+    /// (v209) Numéro de l'ensemble `bases` actuel (un nouveau à chaque `set_bases`, unique
+    /// dans le programme) : la sauvegarde ne réécrit `chunks.bin` que s'il a changé.
+    bases_version: u64,
     /// Horloge du monde en secondes (avancée par le jeu).
     pub clock: f64,
     /// Génération des chunks hors zone importée.
@@ -65,6 +68,7 @@ impl World {
             torches: HashMap::new(),
             edits: HashMap::new(),
             bases: HashMap::new(),
+            bases_version: 0,
             clock: 0.0,
             generator: Generator::Procedural,
             journal: None,
@@ -76,6 +80,8 @@ impl World {
 
     /// Installe des chunks importés (compressés en RLE). Les chunks invalides sont ignorés.
     pub fn set_bases(&mut self, bases: HashMap<ChunkPos, Vec<u8>>) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.bases_version = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bases.clear();
         for (pos, rle) in bases {
             if Chunk::from_rle(pos, &rle).is_some() {
@@ -97,6 +103,11 @@ impl World {
 
     pub fn bases(&self) -> impl Iterator<Item = (ChunkPos, &[u8])> + '_ {
         self.bases.iter().map(|(p, d)| (*p, d.as_slice()))
+    }
+
+    /// (v209) Numéro de l'ensemble des chunks importés (voir `bases_version`).
+    pub fn bases_version(&self) -> u64 {
+        self.bases_version
     }
 
     pub fn base_count(&self) -> usize {

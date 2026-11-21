@@ -62,6 +62,11 @@ struct Globals {
     // (v201) Torches en lumières ponctuelles (réglage vidéo) : centre (xyz) et rayon (w) de
     // la sphère où chaque bloc lumineux a sa lumière dynamique ; w = 0 : aucune.
     torch_swap: vec4<f32>,
+    // (v209) Boîtes d'ombre par groupes de voisines (un joueur, en général) : boule qui
+    // contient le groupe (centre xyz, rayon w) et ses boîtes [x, y[ ; shadow_spans[0].z :
+    // nombre de groupes.
+    shadow_groups: array<vec4<f32>, 16>,
+    shadow_spans: array<vec4<u32>, 16>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -200,10 +205,10 @@ fn vs_block(v: VIn) -> VOut {
 
 @fragment
 fn fs_block_fast(i: VOut) -> @location(0) vec4<f32> {
-    let c = shade_with(i, false, false, false);
-    if c.a < 0.3 || from_behind(i) {
+    if cut_out(i, 0.3) {
         discard;
     }
+    let c = shade_with(i, false, false, false);
     return vec4<f32>(c.rgb, 1.0);
 }
 
@@ -216,22 +221,42 @@ fn from_behind(i: VOut) -> bool {
         && dot(face_normal(i.face), g.cam_pos.xyz - i.world) < 0.0;
 }
 
+/// (v209) Ce pixel sera-t-il jeté (trou de la texture sous `cut`, face vue de dos) ? Testé
+/// avant l'ombrage, avec la texture lue comme dans `shade_rt` (même échantillon, mêmes
+/// dérivées) : mêmes pixels gardés, mais ceux qui partent (feuillage, grillages, vitres
+/// claires) ne paient plus l'ombrage entier (soleil, ombres des joueurs, brouillard).
+fn cut_out(i: VOut, cut: f32) -> bool {
+    let raw = block_uv(i);
+    let dx = dpdx(raw);
+    let dy = dpdy(raw);
+    if from_behind(i) {
+        return true;
+    }
+    // Flamme : toujours opaque (voir `shade_rt`).
+    if (i.tex & 4096u) != 0u {
+        return false;
+    }
+    let sharp = select(1.0, 0.0, (i.tex & 16384u) != 0u);
+    let a = textureSampleGrad(blocks, block_sampler, fract(raw), i.tex & 4095u, dx * sharp, dy * sharp).a;
+    return a < cut;
+}
+
 @fragment
 fn fs_block(i: VOut) -> @location(0) vec4<f32> {
-    let c = shade(i);
-    if c.a < 0.3 || from_behind(i) {
+    if cut_out(i, 0.3) {
         discard; // pixels transparents (feuillage, torche, verre clair)
     }
+    let c = shade(i);
     return vec4<f32>(c.rgb, 1.0);
 }
 
 /// Passe translucide (eau, glace, verre teinté) : mélange selon l'alpha de la texture.
 @fragment
 fn fs_block_translucent(i: VOut) -> @location(0) vec4<f32> {
-    let c = shade_with(i, true, true, true);
-    if c.a < 0.02 || from_behind(i) {
+    if cut_out(i, 0.02) {
         discard;
     }
+    let c = shade_with(i, true, true, true);
     return vec4<f32>(c.rgb, max(c.a, 0.25));
 }
 
@@ -244,10 +269,10 @@ fn behind_mirror(p: vec3<f32>) -> bool {
 /// (v190) Blocs vus dans un miroir (opaques et ceux qui reflètent, sans leurs reflets).
 @fragment
 fn fs_block_mirror(i: VOut) -> @location(0) vec4<f32> {
-    let c = shade_with(i, false, false, false);
-    if c.a < 0.3 || from_behind(i) || behind_mirror(i.world) {
+    if cut_out(i, 0.3) || behind_mirror(i.world) {
         discard;
     }
+    let c = shade_with(i, false, false, false);
     return vec4<f32>(c.rgb, 1.0);
 }
 
@@ -256,20 +281,20 @@ fn fs_block_mirror(i: VOut) -> @location(0) vec4<f32> {
 /// si le raytracing est activé.
 @fragment
 fn fs_block_mirror_reflect(i: VOut) -> @location(0) vec4<f32> {
-    let c = shade_with(i, true, false, false);
-    if c.a < 0.3 || from_behind(i) || behind_mirror(i.world) {
+    if cut_out(i, 0.3) || behind_mirror(i.world) {
         discard;
     }
+    let c = shade_with(i, true, false, false);
     return vec4<f32>(c.rgb, 1.0);
 }
 
 /// (v190) Eau, glace, verre vus dans un miroir.
 @fragment
 fn fs_block_translucent_mirror(i: VOut) -> @location(0) vec4<f32> {
-    let c = shade_with(i, true, true, true);
-    if c.a < 0.02 || from_behind(i) || behind_mirror(i.world) {
+    if cut_out(i, 0.02) || behind_mirror(i.world) {
         discard;
     }
+    let c = shade_with(i, true, true, true);
     return vec4<f32>(c.rgb, max(c.a, 0.25));
 }
 
@@ -380,29 +405,29 @@ fn gb_out(i: VOut, s: Shaded) -> GbOut {
 
 @fragment
 fn fs_block_fast_mv(i: VOut) -> GbOut {
-    let s = shade_full(i, false, false, false);
-    if s.color.a < 0.3 || from_behind(i) {
+    if cut_out(i, 0.3) {
         discard;
     }
+    let s = shade_full(i, false, false, false);
     return gb_out(i, s);
 }
 
 @fragment
 fn fs_block_mv(i: VOut) -> GbOut {
-    // Reflets lus dans l'image des reflets (calculée à part, à son propre rythme).
-    let s = shade_full(i, true, true, false);
-    if s.color.a < 0.3 || from_behind(i) {
+    if cut_out(i, 0.3) {
         discard;
     }
+    // Reflets lus dans l'image des reflets (calculée à part, à son propre rythme).
+    let s = shade_full(i, true, true, false);
     return gb_out(i, s);
 }
 
 @fragment
 fn fs_block_translucent_mv(i: VOut) -> TrOut {
-    let s = shade_full(i, true, true, true);
-    if s.color.a < 0.02 || from_behind(i) {
+    if cut_out(i, 0.02) {
         discard;
     }
+    let s = shade_full(i, true, true, true);
     return translucent_out(i, s);
 }
 
@@ -411,10 +436,10 @@ fn fs_block_translucent_mv(i: VOut) -> TrOut {
 /// plus à la fois sur l'eau.
 @fragment
 fn fs_block_translucent_flat_mv(i: VOut) -> TrOut {
-    let s = shade_rt(i, true, true, true, false);
-    if s.color.a < 0.02 || from_behind(i) {
+    if cut_out(i, 0.02) {
         discard;
     }
+    let s = shade_rt(i, true, true, true, false);
     return translucent_out(i, s);
 }
 
@@ -1625,25 +1650,39 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
         return 0.0;
     }
     let inv = 1.0 / select(d, vec3<f32>(1e-6), abs(d) < vec3<f32>(1e-6));
-    for (var k = 0u; k < n; k++) {
-        let mn = g.shadow_min[k].xyz;
-        let mx = g.shadow_max[k].xyz;
-        let c = (mn + mx) * 0.5;
-        if dot(c - o, c - o) > 576.0 {
+    // (v209) Groupe par groupe (un joueur, en général) : un rayon qui passe loin de la boule
+    // d'un groupe ne touche aucune de ses boîtes. Avant, chaque pixel essayait toutes les
+    // boîtes (48 avec les bots) dès que le rayon passait dans la boule de toutes.
+    let groups = g.shadow_spans[0].z;
+    for (var q = 0u; q < groups; q++) {
+        let s = g.shadow_groups[q];
+        let oc = s.xyz - o;
+        let tc = dot(oc, d);
+        let r = s.w + 0.25;
+        if tc < -r || dot(oc, oc) - tc * tc > r * r {
             continue;
         }
-        // Des blocs cachent la boîte du soleil : elle n'en fait pas d'ombre. (Un point du
-        // monde dans la boîte, le sol sous les pieds posés, est dans son ombre : pas de trou
-        // clair à la place des pieds.)
-        if fract(g.shadow_min[k].w) > 0.25 {
-            continue;
-        }
-        let t0 = (mn - o) * inv;
-        let t1 = (mx - o) * inv;
-        let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
-        let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
-        if far >= max(near, 0.0) && near < tmax {
-            return 1.0;
+        let span = g.shadow_spans[q];
+        for (var k = span.x; k < span.y; k++) {
+            let mn = g.shadow_min[k].xyz;
+            let mx = g.shadow_max[k].xyz;
+            let c = (mn + mx) * 0.5;
+            if dot(c - o, c - o) > 576.0 {
+                continue;
+            }
+            // Des blocs cachent la boîte du soleil : elle n'en fait pas d'ombre. (Un point
+            // du monde dans la boîte, le sol sous les pieds posés, est dans son ombre : pas
+            // de trou clair à la place des pieds.)
+            if fract(g.shadow_min[k].w) > 0.25 {
+                continue;
+            }
+            let t0 = (mn - o) * inv;
+            let t1 = (mx - o) * inv;
+            let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+            let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+            if far >= max(near, 0.0) && near < tmax {
+                return 1.0;
+            }
         }
     }
     return 0.0;
@@ -1661,38 +1700,50 @@ fn torch_shadow(p: vec3<f32>) -> vec4<f32> {
     if n == 0u || dot(bm, bm) > br * br {
         return c;
     }
-    for (var k = 0u; k < n; k++) {
-        let j = i32(floor(g.shadow_min[k].w));
-        let mn = g.shadow_min[k].xyz;
-        let mx = g.shadow_max[k].xyz;
-        let m = (mn + mx) * 0.5 - p;
-        // (Un point du monde dans la boîte, le sol sous les pieds posés, est dans son
-        // ombre : pas de trou clair à la place des pieds.)
-        if j == -1 || dot(m, m) > 36.0 {
+    // (v209) Groupe par groupe : une boîte n'agit qu'à moins de 6 blocs, un groupe plus
+    // loin que ça de toutes ses boîtes est sauté d'un seul essai.
+    let groups = g.shadow_spans[0].z;
+    for (var q = 0u; q < groups; q++) {
+        let s = g.shadow_groups[q];
+        let gm = s.xyz - p;
+        let gr = s.w + 6.25;
+        if dot(gm, gm) > gr * gr {
             continue;
         }
-        let held = j == -2;
-        let lp = select(g.lights_pos[max(j, 0)].xyz, g.held_pos.xyz, held);
-        // Torche tenue dans la boîte (la main qui la tient) : pas d'ombre de celle-ci.
-        if held && (g.held_pos.w <= 0.0 || (all(lp > mn) && all(lp < mx))) {
-            continue;
-        }
-        let to_l = lp - p;
-        let d = length(to_l);
-        if d < 0.3 || d > 14.0 {
-            continue;
-        }
-        let dir = to_l / d;
-        let inv = 1.0 / select(dir, vec3<f32>(1e-6), abs(dir) < vec3<f32>(1e-6));
-        let t0 = (mn - p) * inv;
-        let t1 = (mx - p) * inv;
-        let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
-        let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
-        if far >= max(near, 0.0) && near < d {
-            if held {
-                c.a = 1.0;
-            } else {
-                c = vec4<f32>(max(c.rgb, g.lights_col[j].rgb * torch_falloff(d)), c.a);
+        let span = g.shadow_spans[q];
+        for (var k = span.x; k < span.y; k++) {
+            let j = i32(floor(g.shadow_min[k].w));
+            let mn = g.shadow_min[k].xyz;
+            let mx = g.shadow_max[k].xyz;
+            let m = (mn + mx) * 0.5 - p;
+            // (Un point du monde dans la boîte, le sol sous les pieds posés, est dans son
+            // ombre : pas de trou clair à la place des pieds.)
+            if j == -1 || dot(m, m) > 36.0 {
+                continue;
+            }
+            let held = j == -2;
+            let lp = select(g.lights_pos[max(j, 0)].xyz, g.held_pos.xyz, held);
+            // Torche tenue dans la boîte (la main qui la tient) : pas d'ombre de celle-ci.
+            if held && (g.held_pos.w <= 0.0 || (all(lp > mn) && all(lp < mx))) {
+                continue;
+            }
+            let to_l = lp - p;
+            let d = length(to_l);
+            if d < 0.3 || d > 14.0 {
+                continue;
+            }
+            let dir = to_l / d;
+            let inv = 1.0 / select(dir, vec3<f32>(1e-6), abs(dir) < vec3<f32>(1e-6));
+            let t0 = (mn - p) * inv;
+            let t1 = (mx - p) * inv;
+            let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+            let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+            if far >= max(near, 0.0) && near < d {
+                if held {
+                    c.a = 1.0;
+                } else {
+                    c = vec4<f32>(max(c.rgb, g.lights_col[j].rgb * torch_falloff(d)), c.a);
+                }
             }
         }
     }

@@ -96,7 +96,28 @@ fn step(p: &mut Player, world: &World, n: &NetInput, dt: f32) {
     p.pitch = n.pitch;
     // Jamais plus vite qu'au couteau, ni plus lentement qu'une arme lourde à la lunette.
     p.carry = n.carry.clamp(100, 250);
+    // (v209) Terrain pas encore chargé là où il est (début de partie : les chunks arrivent
+    // de près en loin) : il attend sur place. Avant, un bot sur un chunk pas encore là
+    // tombait à travers le sol, faute de sol.
+    if !ground_loaded(world, p.pos) {
+        p.vel = Vec3::ZERO;
+        return;
+    }
     p.update(world, &from_net(n), dt);
+}
+
+/// (v209) Les chunks sous un joueur (sa boîte, et ce qu'il touche en un pas) sont-ils
+/// chargés ?
+fn ground_loaded(world: &World, feet: Vec3) -> bool {
+    [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)]
+        .iter()
+        .all(|&(dx, dz)| {
+            let x = (feet.x + dx).floor() as i32;
+            let z = (feet.z + dz).floor() as i32;
+            world
+                .chunk(minelib_world::ChunkPos::containing(x, z))
+                .is_some()
+        })
 }
 
 /// Un autre joueur, tel qu'il faut le dessiner.
@@ -129,6 +150,15 @@ pub enum Local {
         fresh: bool,
         reset: bool,
         team: u8,
+    },
+    /// (v209) Le joueur local prend la place du bot `bot` (partie solo, mort) : là où il
+    /// est, avec ce qu'il tenait en main et les munitions de ses armes (voir
+    /// `NetGame::take_over` ; vie et armes arrivent juste avant, par `SetHp` et `Guns`).
+    TakeOver {
+        state: SimState,
+        bot: String,
+        held: u8,
+        ammo: Vec<(u8, (u32, u32))>,
     },
     Chat(String),
     /// Ligne en couleur (annonces des règles).
@@ -1313,7 +1343,7 @@ struct Stride {
 /// Distance entre deux pas (blocs).
 pub const STRIDE: f32 = crate::player::FPS_SPRINT * 0.34;
 /// Portée des bruits de pas (blocs).
-const HEARD_STEPS: f32 = 32.0;
+pub const HEARD_STEPS: f32 = 32.0;
 
 pub struct Host {
     link: Sender<Inbound>,
@@ -1379,6 +1409,8 @@ pub struct Host {
     /// qui jouent comme des invités.
     solo: bool,
     bots: Option<Box<crate::bots::Bots>>,
+    /// (v209) Graine des noms des bots (ceux ajoutés en cours de partie prennent la suite).
+    bot_seed: u32,
     /// (v174) Partie solo regardée en spectateur : le joueur local en est sorti (manches
     /// jouées à ce moment, et s'il était en vie), les bots continuent entre eux.
     away: Option<(u32, bool)>,
@@ -1573,6 +1605,7 @@ impl NetGame {
             shown: HashMap::new(),
             solo: false,
             bots: None,
+            bot_seed: 0,
             away: None,
         };
         h.events(ev, &mut out);
@@ -1588,7 +1621,7 @@ impl NetGame {
         pseudo: String,
         map: FpsMap,
         spawn: Vec3,
-        nav: Option<std::sync::mpsc::Receiver<crate::bots::Nav>>,
+        nav: Option<std::sync::mpsc::Receiver<std::sync::Arc<crate::bots::Nav>>>,
         level: u8,
     ) -> Self {
         // Personne au bout du fil : les messages pour les autres ne partent nulle part.
@@ -1603,12 +1636,15 @@ impl NetGame {
             if let Some(rx) = nav {
                 bots.set_building(rx);
             }
+            // (v209) Les joueurs choisis (`/bot maxbot`), sinon ceux de la carte ; soi compris.
+            let players = crate::bots::saved_players().unwrap_or(players);
             let names = crate::bots::Bots::names(players.saturating_sub(1), seed);
             for (i, name) in names.into_iter().enumerate() {
                 let id = crate::bots::BOT_BASE + i as u64 + 1;
                 bots.add(id);
                 h.add_bot(id, name);
             }
+            h.bot_seed = seed;
             h.bots = Some(Box::new(bots));
             // Tout le monde est là : la partie commence tout de suite, chacun à son départ.
             h.spawns.clear();
@@ -1618,6 +1654,209 @@ impl NetGame {
             h.out.extend(out);
         }
         g
+    }
+
+    /// (v209) Partie solo : autant de bots que `want`, ajoutés ou retirés tout de suite,
+    /// sans recommencer la partie (`/bot`, `/bot maxbot`). Rend le nombre de bots.
+    pub fn set_bot_count(&mut self, want: usize) -> usize {
+        let NetGame::Host(h) = self else {
+            return 0;
+        };
+        if !h.solo {
+            return 0;
+        }
+        let Some(mut bots) = h.bots.take() else {
+            return 0;
+        };
+        let mut ids: Vec<u64> = h
+            .peers
+            .keys()
+            .copied()
+            .filter(|&id| id > crate::bots::BOT_BASE)
+            .collect();
+        ids.sort_unstable();
+        if ids.len() < want {
+            let used: Vec<String> = h.peers.values().map(|r| r.pseudo.clone()).collect();
+            let mut names = crate::bots::Bots::names(want + used.len() + 4, h.bot_seed)
+                .into_iter()
+                .filter(|n| !used.contains(n));
+            let mut next = ids.last().copied().unwrap_or(crate::bots::BOT_BASE) + 1;
+            while ids.len() < want {
+                let Some(name) = names.next() else { break };
+                bots.add(next);
+                h.add_bot(next, name);
+                ids.push(next);
+                next += 1;
+            }
+        } else {
+            for id in ids.split_off(want) {
+                bots.remove(id);
+                if let Some(r) = h.peers.remove(&id) {
+                    h.m.remove_bot(id, Some(r.player.pos));
+                }
+                h.shown.remove(&id);
+                h.strides.remove(&id);
+            }
+        }
+        h.bots = Some(bots);
+        ids.len()
+    }
+
+    /// (v209) Niveau des bots changé en cours de partie solo (sans la recommencer).
+    pub fn set_bot_level(&mut self, level: u8) {
+        if let NetGame::Host(h) = self {
+            if let Some(b) = h.bots.as_mut() {
+                b.set_level(level);
+            }
+        }
+    }
+
+    /// (v209) Bots de la partie solo.
+    pub fn bot_count(&self) -> usize {
+        match self {
+            NetGame::Host(h) if h.solo => h
+                .peers
+                .keys()
+                .filter(|&&id| id > crate::bots::BOT_BASE)
+                .count(),
+            _ => 0,
+        }
+    }
+
+    /// (v209) Partie solo encore à l'échauffement : elle commence tout de suite (`/start`).
+    /// Rend vrai si elle a commencé.
+    pub fn start_now(&mut self) -> bool {
+        let NetGame::Host(h) = self else {
+            return false;
+        };
+        if !h.solo || h.m.phase != game::phase::WARMUP {
+            return false;
+        }
+        let ev = h.m.start_now();
+        let mut out = Vec::new();
+        h.events(ev, &mut out);
+        h.out.extend(out);
+        true
+    }
+
+    /// (v209) Partie solo, mort, en regardant un bot de son équipe : on prend sa place (son
+    /// corps, sa vie, ses armes et leurs munitions, la bombe s'il la porte) ; le bot sort
+    /// de la manche, sans mort comptée. Rend vrai si c'est fait.
+    pub fn take_over(&mut self, pseudo: &str) -> bool {
+        let NetGame::Host(h) = self else {
+            return false;
+        };
+        if !h.solo {
+            return false;
+        }
+        let Some((&id, r)) = h
+            .peers
+            .iter()
+            .find(|(&id, r)| id > crate::bots::BOT_BASE && r.pseudo == pseudo)
+        else {
+            return false;
+        };
+        let mut player = r.player.clone();
+        player.vel = Vec3::ZERO;
+        let hands = h
+            .bots
+            .as_ref()
+            .and_then(|b| b.hands(id))
+            .unwrap_or_default();
+        if !h.m.take_over(0, id) {
+            return false;
+        }
+        let Some(me) = h.m.players.get(&0) else {
+            return false;
+        };
+        let (hp, guns, nades) = (me.hp, me.guns, me.nades);
+        let state = player.net_state();
+        h.local_pos = player.pos;
+        h.local_state = state;
+        h.record(0, Move::Set(state));
+        h.out.push(Local::SetHp(hp));
+        h.out.push(Local::Guns { guns, nades });
+        h.out.push(Local::TakeOver {
+            state,
+            bot: pseudo.to_string(),
+            held: hands.weapon,
+            ammo: hands.ammo,
+        });
+        true
+    }
+
+    /// (v209) Le joueur `pseudo` est un bot (partie solo).
+    pub fn is_bot(&self, pseudo: &str) -> bool {
+        match self {
+            NetGame::Host(h) => h
+                .peers
+                .iter()
+                .any(|(&id, r)| id > crate::bots::BOT_BASE && r.pseudo == pseudo),
+            NetGame::Guest(_) => false,
+        }
+    }
+
+    /// (v209) Ce que l'on sait du joueur `pseudo`, regardé en spectateur : de quoi montrer
+    /// son écran comme si c'était soi qui jouait (vie, équipement, arme en main ; pour un
+    /// bot, ses munitions). L'hôte connaît tout l'équipement ; un invité, la vie et l'arme
+    /// en main.
+    pub fn watched(&self, pseudo: &str) -> Option<crate::fps::Watched> {
+        use crate::fps::{Online, Watched};
+        match self {
+            NetGame::Host(h) => {
+                let (&id, r) = h.peers.iter().find(|(_, r)| r.pseudo == pseudo)?;
+                let p = h.m.players.get(&id)?;
+                let hands = h.bots.as_ref().and_then(|b| b.hands(id));
+                let held = hands.as_ref().map_or(r.weapon, |b| b.weapon);
+                let ammo = hands
+                    .as_ref()
+                    .and_then(|b| b.ammo.iter().find(|(w, _)| *w == held).map(|a| a.1));
+                Some(Watched {
+                    hp: p.hp,
+                    weapon: if hands.is_some() { held } else { r.weapon },
+                    guns: Some(p.guns),
+                    nades: Some(p.nades),
+                    online: Online {
+                        team: p.team,
+                        money: p.money,
+                        armor: p.armor,
+                        helmet: p.helmet,
+                        kit: p.kit,
+                        bomb: h.m.carrier == Some(id),
+                        can_buy: false,
+                        warmup: h.m.phase == game::phase::WARMUP,
+                    },
+                    ammo,
+                    reload: hands.as_ref().and_then(|b| b.reload),
+                    scoped: hands.as_ref().is_some_and(|b| b.scoped),
+                })
+            }
+            NetGame::Guest(g) => {
+                let p = g.full.iter().find(|p| p.pseudo == pseudo)?;
+                let snap = g
+                    .snaps
+                    .back()
+                    .and_then(|(_, ps)| ps.iter().find(|q| q.pseudo == pseudo));
+                let weapon = snap.map_or(p.weapon, |q| q.weapon);
+                let flags = snap.map_or(p.flags, |q| q.flags);
+                Some(Watched {
+                    hp: snap.map_or(p.hp, |q| q.hp) as u32,
+                    weapon,
+                    guns: None,
+                    nades: None,
+                    online: Online {
+                        team: p.team,
+                        money: g.hud.money,
+                        kit: flags & game::FLAG_KIT != 0,
+                        bomb: flags & game::FLAG_BOMB != 0,
+                        ..Online::default()
+                    },
+                    ammo: None,
+                    reload: None,
+                    scoped: false,
+                })
+            }
+        }
     }
 
     /// (v174) Partie solo contre des bots : le joueur local la regarde en spectateur
@@ -2372,6 +2611,7 @@ impl NetGame {
             shown: HashMap::new(),
             solo: false,
             bots: None,
+            bot_seed: 0,
             away: None,
         }));
         if let NetGame::Host(h) = self {
@@ -3095,7 +3335,12 @@ impl Host {
             let Some(team) = self.m.players.get(&id).map(|p| p.team) else {
                 continue;
             };
-            let at = self.spawn_point(world, team, &taken);
+            let mut at = self.spawn_point(world, team, &taken);
+            // (v209) Essais : départ fixé (MINELIB_FPS_START), même vue d'une partie à l'autre.
+            let fixed = (id == 0).then(fixed_fps_start).flatten();
+            if let Some((p, _)) = fixed {
+                at = p;
+            }
             taken.push(at);
             // Face au camp adverse.
             let target = {
@@ -3106,9 +3351,11 @@ impl Host {
                 };
                 other.map(|z| Vec3::from(z.center()))
             };
-            let yaw = target.map_or(0.0, |t| {
-                let d = t - at;
-                d.x.atan2(-d.z)
+            let yaw = fixed.map(|(_, y)| y).unwrap_or_else(|| {
+                target.map_or(0.0, |t| {
+                    let d = t - at;
+                    d.x.atan2(-d.z)
+                })
             });
             let mut p = Player::new(at);
             p.yaw = yaw;
@@ -3277,6 +3524,16 @@ impl Host {
                     pos: origin.to_array(),
                     hits: Vec::new(),
                 });
+                // (v209) L'hôte l'entend aussi (contre des bots, c'est le seul joueur) : les
+                // mêmes bruits qu'en ligne.
+                if self.playing {
+                    return vec![Local::Shot {
+                        weapon,
+                        pos: origin,
+                        heard: who != 0,
+                        hits: Vec::new(),
+                    }];
+                }
             }
             Vec::new()
         }
@@ -4160,6 +4417,17 @@ impl Guest {
             })
             .collect()
     }
+}
+
+/// (v209) Essais : `MINELIB_FPS_START=x,y,z,lacet°` place le joueur local là à chaque départ
+/// d'une partie FPS (mesures à vue identique).
+fn fixed_fps_start() -> Option<(Vec3, f32)> {
+    let v: Vec<f32> = std::env::var("MINELIB_FPS_START")
+        .ok()?
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    (v.len() >= 4).then(|| (Vec3::new(v[0], v[1], v[2]), v[3].to_radians()))
 }
 
 #[cfg(test)]

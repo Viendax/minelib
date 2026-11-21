@@ -367,9 +367,31 @@ pub fn save_world(dir: &Path, d: &SaveData, world: &World) -> Result<()> {
     write_torches(dir, world)
 }
 
+/// (v209) `chunks.bin` déjà sur le disque pour cet ensemble de chunks importés (dossier →
+/// `World::bases_version`) : ils ne changent jamais après l'import, la sauvegarde ne les
+/// réécrit plus à chaque fois (30 à 60 Mo pour une carte, sur le fil du jeu : la partie
+/// FPS en enregistrait cinq d'affilée en démarrant).
+static BASES_ON_DISK: std::sync::Mutex<Option<HashMap<std::path::PathBuf, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn bases_on_disk(dir: &Path, world: &World) -> bool {
+    let known = BASES_ON_DISK
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|m| m.get(dir).copied()));
+    known == Some(world.bases_version()) && dir.join("chunks.bin").exists()
+}
+
+fn note_bases_on_disk(dir: &Path, world: &World) {
+    if let Ok(mut m) = BASES_ON_DISK.lock() {
+        m.get_or_insert_with(HashMap::new)
+            .insert(dir.to_path_buf(), world.bases_version());
+    }
+}
+
 /// `chunks.bin` : chunks importés (monde Minecraft converti).
 fn write_chunks_bin(dir: &Path, world: &World) -> Result<()> {
-    if world.base_count() > 0 {
+    if world.base_count() > 0 && !bases_on_disk(dir, world) {
         // Écriture dans un fichier temporaire puis renommage : pas de fichier à moitié écrit.
         let mut bin = b"MLCH".to_vec();
         bin.extend_from_slice(&(world.base_count() as u32).to_le_bytes());
@@ -382,6 +404,7 @@ fn write_chunks_bin(dir: &Path, world: &World) -> Result<()> {
         let tmp = dir.join("chunks.bin.tmp");
         fs::write(&tmp, bin)?;
         fs::rename(&tmp, dir.join("chunks.bin"))?;
+        note_bases_on_disk(dir, world);
     }
     Ok(())
 }
@@ -522,6 +545,8 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
     if !reimported {
         if let Ok(bin) = fs::read(dir.join("chunks.bin")) {
             world.set_bases(read_chunks_bin(&bin));
+            // (v209) Ce qui est sur le disque : pas à réécrire.
+            note_bases_on_disk(dir, &world);
         }
     }
     if let Ok(text) = fs::read_to_string(dir.join("torches.txt")) {

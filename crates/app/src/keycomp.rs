@@ -207,6 +207,28 @@ struct Since {
     long: bool,
 }
 
+/// (v209) Entrée (avancer, de côté : −1, 0 ou 1 chacune) dont la direction, pour la vue
+/// `yaw`, est la plus proche de `dir` (dans le monde) : au plus 22,5° d'écart.
+pub fn input_towards(dir: Vec3, yaw: f32) -> (f32, f32) {
+    let (s, c) = yaw.sin_cos();
+    let fwd = Vec3::new(s, 0.0, -c);
+    let right = Vec3::new(c, 0.0, s);
+    let mut best = (0.0, 0.0, f32::MIN);
+    for f in [-1.0f32, 0.0, 1.0] {
+        for r in [-1.0f32, 0.0, 1.0] {
+            let w = (fwd * f + right * r).normalize_or_zero();
+            if w == Vec3::ZERO {
+                continue;
+            }
+            let d = w.dot(dir);
+            if d > best.2 {
+                best = (f, r, d);
+            }
+        }
+    }
+    (best.0, best.1)
+}
+
 /// Fenêtre (s) après « courir » relâchée, pour un retard réglé `lag` et un appui de `held` s.
 fn window(lag: f32, held: f32) -> f32 {
     let ramp = ((held - HOLD_FROM) / (HOLD_FULL - HOLD_FROM)).clamp(0.0, 1.0);
@@ -290,6 +312,13 @@ impl Comp {
     /// chemin dû est oublié (sa visée et ses touches passent devant).
     pub fn drop_owed(&mut self) {
         self.owed = 0.0;
+    }
+
+    /// (v209) Mode FPS en ligne : chemin encore dû (blocs) et sa direction dans le monde
+    /// (pas par rapport à la vue : le joueur qui tourne la souris pendant le retour ne
+    /// tourne plus en rond).
+    pub fn owed(&self) -> (f32, Vec3) {
+        (self.owed, self.owed_dir)
     }
 
     /// Un pas de simulation (`dt` secondes) vient d'être fait : « avancer » tenue (`fwd`),
@@ -387,6 +416,24 @@ impl Comp {
                 None => fixed,
             }
             .min(self.steps.len());
+            // (v209) Jamais de retour à travers un saut ni une chute voulue : debout, seul le
+            // chemin fait depuis qu'il a les pieds sur ce sol est repris (sauté sur la télé
+            // pendant le retard, il était ramené en l'air, d'où il tombait) ; en l'air après
+            // un saut, rien (« si je viens de sauter, ça ne doit pas me ramener »). Seule
+            // exception : tombé d'un bord pendant le retard, il y est remonté (plus bas), et
+            // seulement en le replaçant (pas par les entrées).
+            let fell_off = n > 0 && {
+                let then = self.steps[(self.steps.len() - n).saturating_sub(1)];
+                then.on_ground && falling && then.y > feet_y && then.y - feet_y < 2.0
+            };
+            let grounded = self.steps.iter().rev().take_while(|s| s.on_ground).count();
+            let n = if fell_off && !by_input {
+                n
+            } else if on_ground {
+                n.min(grounded)
+            } else {
+                0
+            };
             if n > 0 {
                 let from = self.steps.len() - n;
                 let back: Vec3 = self.steps.iter().skip(from).map(|s| s.forward).sum();
@@ -401,16 +448,10 @@ impl Comp {
                 // Au sol quand le doigt s'est levé, en chute maintenant : il est tombé d'un
                 // bord pendant le retard, on l'y remonte.
                 // (État à la fin du pas d'avant : le moment où le doigt s'est levé.)
-                let then = self.steps[from.saturating_sub(1)];
-                if !by_input
-                    && then.on_ground
-                    && falling
-                    && then.y > feet_y
-                    && then.y - feet_y < 2.0
-                {
+                if fell_off && !by_input {
                     // Remonté et ramené d'un coup : un retour en douceur le laisserait
                     // retomber contre le flanc du bloc.
-                    out.lift = then.y - feet_y;
+                    out.lift = self.steps[from.saturating_sub(1)].y - feet_y;
                     self.instant = true;
                 }
                 self.last = Some((n as f32 * dt, back.length()));
@@ -698,6 +739,136 @@ mod tests {
         // Remonté, et ramené d'un seul coup de tout le chemin du retard (13 pas).
         assert!((n.lift - 0.3).abs() < 0.05, "{n:?}");
         assert!((n.back.z - 13.0 * 0.07).abs() < 0.01, "{n:?}");
+    }
+
+    /// (v209) Pas de retour à travers un saut : en l'air après un saut, rien ; posé ailleurs
+    /// (plus haut) pendant le retard, seul le chemin fait depuis l'atterrissage est repris.
+    #[test]
+    fn no_give_back_across_a_jump() {
+        let step = Vec3::new(0.0, 0.0, -0.07);
+        let long_run = |c: &mut Comp| {
+            for _ in 0..640 {
+                c.tick(DT, 0.3, false, true, false, 0.0, step, 10.0, true, false);
+            }
+        };
+        // Saut pendant le retard, toujours en l'air (en montée) au relâchement : rien.
+        let mut c = Comp::default();
+        long_run(&mut c);
+        for i in 0..10 {
+            c.tick(
+                DT,
+                0.3,
+                false,
+                true,
+                false,
+                0.0,
+                step,
+                10.0 + 0.05 * i as f32,
+                false,
+                false,
+            );
+        }
+        let n = c.tick(
+            DT,
+            0.3,
+            false,
+            false,
+            false,
+            0.0,
+            Vec3::ZERO,
+            10.5,
+            false,
+            false,
+        );
+        assert_eq!(n, Nudge::default(), "pas ramené en plein saut");
+        assert!(c.last.is_none());
+        // Pareil par les entrées (mode FPS en ligne).
+        let mut c = Comp::default();
+        long_run(&mut c);
+        for i in 0..10 {
+            c.tick(
+                DT,
+                0.3,
+                true,
+                true,
+                false,
+                0.0,
+                step,
+                10.0 + 0.05 * i as f32,
+                false,
+                false,
+            );
+        }
+        c.tick(
+            DT,
+            0.3,
+            true,
+            false,
+            false,
+            0.0,
+            Vec3::ZERO,
+            10.5,
+            false,
+            false,
+        );
+        assert!(!c.back_input(), "pas de recul en plein saut");
+        // Sauté sur une télé (1 bloc plus haut) pendant le retard, posé depuis 4 pas : seuls
+        // ces 4 pas sont repris (il n'est pas ramené en l'air, d'où il tomberait).
+        let mut c = Comp::default();
+        long_run(&mut c);
+        for _ in 0..8 {
+            c.tick(DT, 0.3, false, true, false, 0.0, step, 10.6, false, false);
+        }
+        for _ in 0..4 {
+            c.tick(DT, 0.3, false, true, false, 0.0, step, 11.0, true, false);
+        }
+        let mut back = 0.0;
+        let n = c.tick(
+            DT,
+            0.3,
+            false,
+            false,
+            false,
+            0.0,
+            Vec3::ZERO,
+            11.0,
+            true,
+            false,
+        );
+        back += n.back.z;
+        for _ in 0..32 {
+            back += c
+                .tick(
+                    DT,
+                    0.3,
+                    false,
+                    false,
+                    false,
+                    0.0,
+                    Vec3::ZERO,
+                    11.0,
+                    true,
+                    false,
+                )
+                .back
+                .z;
+        }
+        assert!((back - 4.0 * 0.07).abs() < 0.01, "{back}");
+    }
+
+    #[test]
+    fn the_input_towards_a_direction_is_the_closest_of_eight() {
+        // Vue vers -z (lacet 0) : vers +z, c'est reculer ; vers +x, aller à droite.
+        assert_eq!(input_towards(Vec3::Z, 0.0), (-1.0, 0.0));
+        assert_eq!(input_towards(Vec3::X, 0.0), (0.0, 1.0));
+        // Le joueur s'est tourné d'un quart de tour vers +x : +z est maintenant à droite.
+        assert_eq!(
+            input_towards(Vec3::Z, std::f32::consts::FRAC_PI_2),
+            (0.0, 1.0)
+        );
+        // En diagonale.
+        let d = Vec3::new(1.0, 0.0, 1.0).normalize();
+        assert_eq!(input_towards(d, 0.0), (-1.0, 1.0));
     }
 
     #[test]

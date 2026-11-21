@@ -115,6 +115,8 @@ pub struct Session {
     /// (état, position du porteur).
     bomb_fly: Option<(Vec3, Vec3, f32)>,
     bomb_last: (u8, Option<Vec3>),
+    /// (v209) Adversaires repérés par l'équipe (minimap).
+    spotting: crate::spotting::Spotting,
     /// (v177) Bombe posée : temps avant le prochain bip, et voyant allumé (s).
     bomb_beep: f32,
     bomb_flash: f32,
@@ -170,6 +172,9 @@ pub struct Session {
     screen_size: (f32, f32),
     /// Mort en ligne : coéquipier suivi (pseudo) et rang dans la liste.
     spectating: Option<String>,
+    /// (v209) Spectateur : l'écran du joueur regardé (vie, armes, arme en main), montré
+    /// comme si c'était soi qui jouait (`Fps::mirror`).
+    spec_fps: crate::fps::Fps,
     spectate_idx: usize,
     pub dir: PathBuf,
     pub meta: WorldMeta,
@@ -185,6 +190,9 @@ pub struct Session {
     bulk_refused: std::time::Instant,
     /// Hauteur grimpée à pleine vitesse sur une échelle depuis le dernier bruit.
     ladder_climb: f32,
+    /// (v209) Monde en ligne : échelles des autres joueurs (hauteur à l'image d'avant,
+    /// hauteur grimpée depuis le dernier bruit, image où on l'a vu).
+    ladders: HashMap<String, (f32, f32, u32)>,
     pub inventory: Inventory,
     /// Heure du jour (0..24) ; arrêtée (`/timefix`).
     time_h: f32,
@@ -493,6 +501,7 @@ impl Session {
             ground_seen: std::collections::HashSet::new(),
             bomb_fly: None,
             bomb_last: (0, None),
+            spotting: Default::default(),
             bomb_beep: 0.0,
             bomb_flash: 0.0,
             tick_acc: 0.0,
@@ -511,6 +520,7 @@ impl Session {
             build: None,
             fps_avg: 0.0,
             spectating: None,
+            spec_fps: crate::fps::Fps::new(),
             spectate_idx: 0,
             voice: None,
             voice_volumes: HashMap::new(),
@@ -530,6 +540,7 @@ impl Session {
             we: crate::worldedit::WorldEdit::default(),
             bulk_refused: std::time::Instant::now() - std::time::Duration::from_secs(10),
             ladder_climb: 0.0,
+            ladders: HashMap::new(),
             inventory: data.inventory.unwrap_or_else(Inventory::starter),
             time_h,
             time_fixed: data.time_fixed,
@@ -1269,6 +1280,8 @@ impl Session {
             } else {
                 self.fps.buy_open = false;
                 self.build_splash();
+                // (v209) Échelles : les siennes et celles des autres, dans tous les modes.
+                self.own_ladder_noise(dt, true);
                 // Sons des autres modes (portes…) : joués tout de suite (sinon ils
                 // s'accumulaient et partaient tous d'un coup en passant en mode FPS).
                 for (sfx, delay, gain) in self.fps.sounds.drain(..) {
@@ -1509,6 +1522,49 @@ impl Session {
                         carrier.or(self.bomb_last.1.filter(|_| hud.bomb == bomb::CARRIED)),
                     );
                 }
+                // (v209) Minimap : qui de l'équipe voit quel adversaire (voir `spotting`).
+                {
+                    let hud = n.hud();
+                    let views = n.views();
+                    let me_alive = !self.net_dead && self.spectating.is_none();
+                    let mut observers: Vec<crate::spotting::Observer> = views
+                        .iter()
+                        .filter(|v| v.alive && v.team == hud.team)
+                        .map(|v| crate::spotting::Observer {
+                            pseudo: &v.pseudo,
+                            eye: eye_of(v.pos, v.crouch),
+                            look: {
+                                let (sy, cy) = v.yaw.sin_cos();
+                                let (sp, cp) = v.pitch.sin_cos();
+                                Vec3::new(sy * cp, sp, -cy * cp)
+                            },
+                            own_blind: None,
+                        })
+                        .collect();
+                    if me_alive {
+                        observers.push(crate::spotting::Observer {
+                            pseudo: "",
+                            eye: self.player.eye(),
+                            look: self.player.look_dir(),
+                            own_blind: Some(self.fps.blind_amount()),
+                        });
+                    }
+                    for at in self.fps.take_flashes() {
+                        self.spotting.flash(at, &self.world, &observers);
+                    }
+                    let targets: Vec<crate::spotting::Target> = views
+                        .iter()
+                        .filter(|v| v.alive && v.team != hud.team)
+                        .map(|v| crate::spotting::Target {
+                            pseudo: &v.pseudo,
+                            feet: v.pos,
+                            crouch: v.crouch,
+                        })
+                        .collect();
+                    let smokes = self.fps.smoke_spheres();
+                    self.spotting
+                        .update(dt, &self.world, &observers, &targets, &smokes);
+                }
                 // Mort : on suit un coéquipier (clic : le suivant).
                 if self.net_dead {
                     let hud = n.hud();
@@ -1532,8 +1588,27 @@ impl Session {
                         self.player.pos = v.pos;
                         self.player.yaw = v.yaw;
                         self.player.pitch = v.pitch;
+                        self.player.crouch = v.crouch;
                         self.player.vel = Vec3::ZERO;
+                        // (v209) Son écran comme si c'était soi : vie, équipement, arme en
+                        // main (une autre personne regardée : tout repart de zéro).
+                        if self.spectating.as_deref() != Some(v.pseudo.as_str()) {
+                            self.spec_fps = crate::fps::Fps::new();
+                        }
+                        if let Some(w) = n.watched(&v.pseudo) {
+                            self.spec_fps.mirror(&w, dt);
+                        }
                         self.spectating = Some(v.pseudo.clone());
+                        // (v209) Partie solo : touche Utiliser, on prend la place du bot.
+                        if input.grabbed
+                            && !typing
+                            && self.keys.pressed(input, Action::FpsUse)
+                            && n.is_bot(&v.pseudo)
+                        {
+                            // (Ce qui en découle arrive à la fin de l'image : `TakeOver`.)
+                            let pseudo = v.pseudo.clone();
+                            n.take_over(&pseudo);
+                        }
                     }
                 } else {
                     self.spectating = None;
@@ -1629,6 +1704,7 @@ impl Session {
             }
             drop(mark);
             self.walks.retain(|_, w| w.stamp == stamp);
+            self.others_ladder_noise(dt);
             let target = (speed / 4.3).min(1.0);
             self.walk_amp += (target - self.walk_amp) * (dt * 10.0).min(1.0);
             self.hand_light = self.light_at_player(held);
@@ -1733,6 +1809,32 @@ impl Session {
         {
             let _s = perf::scope("lumières proches");
             self.update_lights(renderer, dt);
+        }
+        // (v209) Partie FPS servie ici (contre les bots, ou hôte d'une partie en ligne) : le
+        // sol sous chaque joueur reste chargé, même loin de soi (petite distance de vue, carte
+        // plus grande qu'elle) ; sinon sa simulation l'attend (`netgame::step`) au lieu de le
+        // faire tomber à travers le sol, et lui avec (il réapparaissait sous la carte).
+        if let Some(n) = self.net.as_ref().filter(|n| n.is_host()) {
+            let mut set = std::collections::HashSet::new();
+            for v in n.views() {
+                let c = ChunkPos::containing(v.pos.x.floor() as i32, v.pos.z.floor() as i32);
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        set.insert(ChunkPos {
+                            x: c.x + dx,
+                            z: c.z + dz,
+                        });
+                    }
+                }
+            }
+            // Au plus 12 par image (un chunk importé se décode vite, un chunk généré moins) :
+            // au départ d'une manche, tout est là avant la fin du temps d'achat.
+            for c in self.streamer.pin(&self.world, set).into_iter().take(12) {
+                self.world.ensure_chunk(c);
+            }
+        } else {
+            self.streamer
+                .pin(&self.world, std::collections::HashSet::new());
         }
         self.streamer.update(
             &mut self.world,
@@ -3366,10 +3468,14 @@ impl Session {
         self.tick_acc = (self.tick_acc + dt).min(SIM_TICK * MAX_TICKS as f32);
         // Retard mesuré de la touche « avancer » (0 : rien à compenser).
         let fps_mode = self.game.mode == GameMode::Fps;
-        // (v185) Mode FPS, en ligne ou contre des bots : l'hôte simule le joueur à partir des
-        // entrées, le chemin dû est donc rendu par les entrées (voir `keycomp`), et il n'y a
-        // pas de ralenti d'avance (il ne passerait pas le réseau).
-        let by_input = fps_mode || self.net.is_some();
+        // (v185) Mode FPS en ligne : l'hôte simule le joueur à partir des entrées, le chemin
+        // dû est donc rendu par les entrées (voir `keycomp`), et il n'y a pas de ralenti
+        // d'avance (il ne passerait pas le réseau). (v209) Contre des bots (ou seul), c'est ce
+        // jeu qui fait foi pour son joueur (`NetGame::on_tick` prend sa position) : il est
+        // replacé en douceur comme en construction, au lieu de reculer à pied — un recul que
+        // le journal montrait (« le joueur avance sans touche depuis 0,3 s », juste après
+        // chaque retour) et qui, en tournant la souris, le faisait tourner en rond.
+        let by_input = self.online_match();
         let fwd_action = if fps_mode {
             Action::FpsForward
         } else {
@@ -3406,12 +3512,27 @@ impl Session {
                     }
                 }
             }
-            // Mode FPS : le chemin dû après le relâchement annoncé en retard est rendu en
-            // demandant « reculer », comme si le joueur l'avait fait — l'hôte reçoit la même
+            // Mode FPS en ligne : le chemin dû après le relâchement annoncé en retard est rendu
+            // en demandant de reculer, comme si le joueur l'avait fait — l'hôte reçoit la même
             // entrée et arrive au même endroit. Sa visée et ses touches passent devant.
+            // (v209) Droit vers là où le doigt s'est levé, quelle que soit la vue (la
+            // direction de l'entrée la plus proche, parmi huit) ; lâché assez tôt pour que la
+            // glissade s'arrête juste là ; jamais en l'air, ni vers un bord d'où il tomberait.
             if key_lag > 0.0 && by_input && self.key_comp.back_input() {
-                if can_move && mt.forward == 0.0 && !self.fps_aiming {
-                    mt.forward = -1.0;
+                let (owed, dir) = self.key_comp.owed();
+                let speed = self.player.vel.x * dir.x + self.player.vel.z * dir.z;
+                let stop = crate::player::Player::fps_stop_distance(speed, SIM_TICK);
+                let behind = self.player.pos + dir * 0.35;
+                let free = can_move
+                    && mt.forward == 0.0
+                    && mt.strafe == 0.0
+                    && !mt.jump
+                    && !self.fps_aiming
+                    && self.player.on_ground;
+                if free && owed > stop && self.player.supported_at(&self.world, behind) {
+                    let (f, s) = crate::keycomp::input_towards(dir, self.player.yaw);
+                    mt.forward = f;
+                    mt.strafe = s;
                 } else {
                     self.key_comp.drop_owed();
                 }
@@ -3526,6 +3647,35 @@ impl Session {
             .say(format!("Mode de jeu : {}", mode.label()), chat::YELLOW);
     }
 
+    /// (v209) `/bot` : sans partie, en lance une ; sinon la complète jusqu'au nombre de
+    /// joueurs choisi (`/bot maxbot`, sinon celui de la carte), sans la recommencer.
+    fn fill_bots(&mut self) {
+        let Some(n) = self.net.as_mut().filter(|n| n.is_solo()) else {
+            if self.online_match() {
+                return;
+            }
+            // Nouvelle partie (commencée à l'image suivante).
+            self.bots_auto = true;
+            return;
+        };
+        // Partie finie : on en refait une.
+        if n.phase() == minelib_net::game::phase::GAME_OVER {
+            self.stop_bots();
+            self.bots_auto = true;
+            return;
+        }
+        let players = crate::bots::saved_players()
+            .unwrap_or_else(|| crate::fpsmap::load(&self.dir).players() as usize);
+        let before = n.bot_count();
+        let now = n.set_bot_count(players.saturating_sub(1));
+        let t = if now == before {
+            format!("Déjà {now} bots dans la partie (/bot maxbot <2-20> pour en changer).")
+        } else {
+            format!("{now} bots dans la partie.")
+        };
+        self.chat.say(t, chat::YELLOW);
+    }
+
     /// Partie FPS en ligne (pas la partie solo contre des bots).
     pub fn online_match(&self) -> bool {
         self.net.as_ref().is_some_and(|n| !n.is_solo())
@@ -3560,8 +3710,9 @@ impl Session {
         self.game_over = None;
         self.chat.say(
             format!(
-                "Partie contre des bots ({}) : elle commence. (/bots off pour les retirer, \
-                 /bots pour en refaire une, /bots facile|normal|difficile pour leur niveau.)",
+                "Partie contre des bots ({}) : elle commence. (/restart : la recommencer, \
+                 /bot maxbot <2-20> : joueurs de la partie, /bot facile|normal|difficile : \
+                 leur niveau, /bot off : les retirer.)",
                 crate::bots::LEVELS[level as usize]
             ),
             chat::YELLOW,
@@ -3953,6 +4104,8 @@ impl Session {
                         .as_ref()
                         .is_some_and(|n| n.hud().phase == minelib_net::game::phase::WARMUP);
                     self.fps.new_round(reset, team, !warmup);
+                    // (v209) Nouvelle manche : plus aucun adversaire repéré.
+                    self.spotting.clear();
                     self.net_dead = false;
                 }
                 // (v174) Retour dans la partie solo après le mode spectateur, là où l'on
@@ -3964,6 +4117,26 @@ impl Session {
                     self.net_dead = false;
                     self.spectating = None;
                     self.chat.say("Tu reprends la partie.", chat::YELLOW);
+                }
+                // (v209) Partie solo, mort : on prend la place du bot regardé, là où il est,
+                // avec ce qu'il avait en main (vie et armes viennent d'arriver).
+                Local::TakeOver {
+                    state,
+                    bot,
+                    held,
+                    ammo,
+                } => {
+                    self.player.set_net_state(&state);
+                    self.player.vel = Vec3::ZERO;
+                    self.sim = None;
+                    self.prev_pos = self.player.pos;
+                    self.fall_from = None;
+                    self.net_dead = false;
+                    self.spectating = None;
+                    self.spec_fps = crate::fps::Fps::new();
+                    self.fps.take_over(held, &ammo);
+                    self.chat
+                        .say(format!("Tu prends la place de {bot}."), chat::YELLOW);
                 }
                 Local::Chat(t) => self.chat.say(t, chat::WHITE),
                 Local::Notice(t) => self.chat.say(t, chat::YELLOW),
@@ -3997,6 +4170,10 @@ impl Session {
                     hits,
                 } => {
                     let eye = self.player.eye();
+                    // (v209) Spectateur : le tir du joueur regardé se voit dans ses mains.
+                    if self.spectating.is_some() && pos.distance(eye) < 1.2 {
+                        self.spec_fps.mirror_fire();
+                    }
                     if heard {
                         self.fps.heard_shot(weapon, pos, eye);
                     }
@@ -4049,7 +4226,7 @@ impl Session {
                         self.match_result = Some(summary.clone());
                     } else {
                         self.chat.say(
-                            "Partie finie. /bots pour en refaire une, /bots off pour rester \
+                            "Partie finie. /restart pour en refaire une, /bot off pour rester \
                              seul sur la carte.",
                             chat::YELLOW,
                         );
@@ -4265,18 +4442,7 @@ impl Session {
         // doux en marchant ou accroupi (eux ne les entendent pas).
         let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
         let alive = !(self.net.is_some() && self.net_dead);
-        // Échelle à pleine vitesse (pas accroupi) : ses barreaux, un bruit tous les deux (les
-        // autres l'entendent aussi, voir l'hôte).
-        let vy = self.player.vel.y.abs();
-        if alive && self.player.on_ladder && vy >= crate::player::LADDER_NOISY {
-            self.ladder_climb += vy * dt;
-            if self.ladder_climb >= crate::player::LADDER_RUNG {
-                self.ladder_climb -= crate::player::LADDER_RUNG;
-                self.fps.sounds.push((crate::audio::Sfx::Ladder, 0.0, 0.6));
-            }
-        } else {
-            self.ladder_climb = crate::player::LADDER_RUNG * 0.8;
-        }
+        self.own_ladder_noise(dt, alive);
         // Plongeon dans l'eau (les autres l'entendent aussi), sinon réception d'une chute
         // d'au moins 1,3 bloc.
         if crate::player::in_water(&self.world, self.player.pos) {
@@ -4325,6 +4491,66 @@ impl Session {
         if self.fps.hp == 0 && self.net.is_none() {
             self.die();
         }
+    }
+
+    /// Échelle à pleine vitesse (pas accroupi) : ses barreaux, un bruit tous les deux (les
+    /// autres l'entendent aussi : l'hôte en partie FPS, chacun d'eux dans le monde en
+    /// ligne, voir `others_ladder_noise`). (v209) Dans tous les modes de jeu.
+    fn own_ladder_noise(&mut self, dt: f32, alive: bool) {
+        let vy = self.player.vel.y.abs();
+        if alive && self.player.on_ladder && vy >= crate::player::LADDER_NOISY {
+            self.ladder_climb += vy * dt;
+            if self.ladder_climb >= crate::player::LADDER_RUNG {
+                self.ladder_climb -= crate::player::LADDER_RUNG;
+                self.fps.sounds.push((crate::audio::Sfx::Ladder, 0.0, 0.6));
+            }
+        } else {
+            self.ladder_climb = crate::player::LADDER_RUNG * 0.8;
+        }
+    }
+
+    /// (v209) Monde en ligne : les échelles grimpées à pleine vitesse par les joueurs
+    /// proches s'entendent, comme en partie FPS. On ne connaît que leur position : sur une
+    /// échelle et montant ou descendant vite, un bruit tous les deux barreaux.
+    fn others_ladder_noise(&mut self, dt: f32) {
+        let Some(b) = &self.build else {
+            self.ladders.clear();
+            return;
+        };
+        let eye = self.player.eye();
+        let stamp = self.walk_stamp;
+        let rung = crate::player::LADDER_RUNG;
+        for o in b.others.values() {
+            // (Pseudo recopié seulement à la première rencontre : voir `walk_stamp`.)
+            if !self.ladders.contains_key(&o.pseudo) {
+                self.ladders
+                    .insert(o.pseudo.clone(), (o.pos.y, rung * 0.8, stamp));
+            }
+            let Some(c) = self.ladders.get_mut(&o.pseudo) else {
+                continue;
+            };
+            let dy = (o.pos.y - c.0).abs();
+            c.0 = o.pos.y;
+            c.2 = stamp;
+            let d = (o.pos - eye).length();
+            // (Position adoucie à l'arrivée : un peu sous la vitesse de l'échelle.)
+            let fast = dy / dt.max(1e-4) >= crate::player::LADDER_NOISY * 0.85 && dy < 1.0;
+            if fast
+                && d < crate::netgame::HEARD_STEPS
+                && crate::player::ladder_at(&self.world, o.pos, o.crouch)
+            {
+                c.1 += dy;
+                if c.1 >= rung {
+                    c.1 -= rung;
+                    self.fps
+                        .sounds
+                        .push((crate::audio::Sfx::Ladder, 0.0, 0.9 / (1.0 + d / 8.0)));
+                }
+            } else {
+                c.1 = rung * 0.8;
+            }
+        }
+        self.ladders.retain(|_, c| c.2 == stamp);
     }
 
     /// Coin de sélection posé avec la baguette.
@@ -5088,7 +5314,9 @@ impl Session {
             }
             // (v172) Partie contre des bots (mode FPS en solo) : retirer, refaire. (v197) Arrêt :
             // off, false, 0, non ou stop ; lancement : rien, on, true, 1 ou oui. Les niveaux
-            // se donnent par leur nom (0 et 1 veulent dire arrêt et lancement).
+            // se donnent par leur nom (0 et 1 veulent dire arrêt et lancement). (v209) `/bot`
+            // ne recommence plus la partie : il la complète (`/restart` pour la refaire) ;
+            // `/bot maxbot <2-20>` : joueurs de la partie, soi compris.
             "bots" | "bot" => match arg.map(str::to_lowercase).as_deref() {
                 Some(w) if w == "stop" || chat::switch(w) == Some(false) => {
                     self.bots_auto = false;
@@ -5098,8 +5326,8 @@ impl Session {
                             .say("Bots retirés : tu es seul sur la carte.", chat::YELLOW);
                     }
                 }
-                // (v174) Niveau des bots, gardé pour les parties suivantes ; la partie
-                // reprend du début avec eux.
+                // (v174) Niveau des bots, gardé pour les parties suivantes ; (v209) ceux de
+                // la partie en cours le prennent tout de suite.
                 Some(l) if crate::bots::level_named(l).is_some() => {
                     let level = crate::bots::level_named(l).unwrap_or(0);
                     crate::bots::save_level(level);
@@ -5107,16 +5335,45 @@ impl Session {
                         format!("Bots : niveau {}.", crate::bots::LEVELS[level as usize]),
                         chat::YELLOW,
                     );
-                    if self.game.mode == GameMode::Fps && self.online_match() {
-                        return;
+                    if let Some(n) = self.net.as_mut().filter(|n| n.is_solo()) {
+                        n.set_bot_level(level);
                     }
-                    if self.game.mode == GameMode::Fps {
-                        self.stop_bots();
-                        self.bots_auto = true;
+                }
+                Some("maxbot" | "maxbots" | "max" | "nombre" | "joueurs") => {
+                    let range = crate::bots::MIN_PLAYERS..=crate::bots::MAX_PLAYERS;
+                    match parts.next().and_then(|n| n.parse::<usize>().ok()) {
+                        Some(n) if range.contains(&n) => {
+                            crate::bots::save_players(n);
+                            let bots = n - 1;
+                            let now = self
+                                .net
+                                .as_mut()
+                                .filter(|n| n.is_solo())
+                                .map(|g| g.set_bot_count(bots));
+                            let t = match now {
+                                Some(b) => format!(
+                                    "Partie à {n} joueurs, toi compris : {b} bot{} maintenant.",
+                                    if b > 1 { "s" } else { "" }
+                                ),
+                                None => {
+                                    format!("Parties contre les bots : {n} joueurs, toi compris.")
+                                }
+                            };
+                            self.chat.say(t, chat::YELLOW);
+                        }
+                        _ => self.chat.say(
+                            format!(
+                                "Utilisation : /bot maxbot <{}-{}> (joueurs de la partie, toi \
+                                 compris ; les bots complètent)",
+                                range.start(),
+                                range.end()
+                            ),
+                            chat::RED,
+                        ),
                     }
                 }
                 Some(w) if chat::switch(w) != Some(true) => self.chat.say(
-                    "Utilisation : /bots [on|off|facile|normal|difficile]",
+                    "Utilisation : /bot [on|off|facile|normal|difficile|maxbot <2-20>]",
                     chat::RED,
                 ),
                 _ => {
@@ -5125,11 +5382,40 @@ impl Session {
                             .say("Les bots jouent en mode FPS : /gm fps.", chat::RED);
                         return;
                     }
-                    // Nouvelle partie (commencée à l'image suivante).
-                    self.stop_bots();
-                    self.bots_auto = true;
+                    self.fill_bots();
                 }
             },
+            // (v209) Partie contre les bots : la lancer (ou la faire commencer tout de suite),
+            // la recommencer du début.
+            "start" => {
+                if self.game.mode != GameMode::Fps {
+                    self.chat
+                        .say("La partie se joue en mode FPS : /gm fps.", chat::RED);
+                    return;
+                }
+                match self.net.as_mut().filter(|n| n.is_solo()) {
+                    Some(n) => {
+                        let t = if n.start_now() {
+                            "La partie commence."
+                        } else {
+                            "La partie est déjà commencée (/restart : la recommencer)."
+                        };
+                        self.chat.say(t, chat::YELLOW);
+                    }
+                    None => self.fill_bots(),
+                }
+            }
+            "restart" => {
+                if self.game.mode != GameMode::Fps {
+                    self.chat
+                        .say("La partie se joue en mode FPS : /gm fps.", chat::RED);
+                    return;
+                }
+                // Nouvelle partie (commencée à l'image suivante).
+                self.stop_bots();
+                self.bots_auto = true;
+                self.chat.say("La partie recommence.", chat::YELLOW);
+            }
             "gamemode" | "gm" => match arg.and_then(GameMode::parse) {
                 Some(mode) => self.set_mode(mode),
                 None => self.chat.say(
@@ -5445,10 +5731,9 @@ impl Session {
             if !seen || dist > 60.0 {
                 continue;
             }
-            let mut name = v.pseudo.clone();
-            if v.flags & minelib_net::game::FLAG_BOMB != 0 {
-                name += " [bombe]";
-            }
+            // (v209) Plus de « [bombe] » après le pseudo de celui qui la porte (la minimap
+            // la montre).
+            let name = v.pseudo.clone();
             let tw = Ui::text_width(&name, s);
             let ny = y - 11.0 * s;
             ui.rect(
@@ -5460,14 +5745,11 @@ impl Session {
             );
             ui.text(x - tw / 2.0, ny, s, col, name);
         }
-        // Bombe posée ou lâchée (connue de l'équipe) : repère à l'écran.
-        if matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED) {
+        // Bombe lâchée (connue de l'équipe) : repère à l'écran. (v209) Posée : plus rien
+        // d'écrit au-dessus (la minimap et le compte à rebours la montrent).
+        if hud.bomb == bomb::DROPPED {
             if let Some((x, y)) = to_screen(Vec3::from(hud.bomb_pos) + Vec3::Y * 0.4) {
-                let t = if hud.bomb == bomb::PLANTED {
-                    "BOMBE"
-                } else {
-                    "bombe lâchée"
-                };
+                let t = "bombe lâchée";
                 let tw = Ui::text_width(t, s);
                 ui.text(x - tw / 2.0, y, s, [1.0, 0.3, 0.25, 1.0], t);
             }
@@ -5528,13 +5810,18 @@ impl Session {
                 } else {
                     cx + off
                 };
-                let col = if side == my_team {
-                    mate_color(r.color as usize)
-                } else {
-                    team_color(side)
+                // (v209) Chacun sa couleur, adversaires compris (avant : celle de leur
+                // équipe pour tous).
+                let col = mate_color(r.color as usize);
+                // (v209) Mort : cadre, couleur et visage passés au gris (avant : seulement
+                // assombris, la couleur restait).
+                let (dim, gray) = if r.alive { (1.0, 0.0) } else { (0.45, 0.85) };
+                let grayed = |c: [f32; 4]| {
+                    let l = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+                    let m = |v: f32| (v + (l - v) * gray) * dim;
+                    [m(c[0]), m(c[1]), m(c[2]), c[3]]
                 };
-                let dim = if r.alive { 1.0 } else { 0.3 };
-                let c = [col[0] * dim, col[1] * dim, col[2] * dim, 0.95];
+                let c = grayed([col[0], col[1], col[2], 0.95]);
                 ui.rect(x, top, head, head + 4.0 * s, [0.0, 0.0, 0.0, 0.55]);
                 ui.rect(x + s, top + s, head - 2.0 * s, head - 2.0 * s, c);
                 // Tête : le visage du skin (pas pendant l'échauffement, anonyme), sinon
@@ -5549,7 +5836,15 @@ impl Session {
                 };
                 if let Some(sk) = skin {
                     let inner = head - 4.0 * s;
-                    crate::skin::draw_face(ui, &sk.face(), x + 2.0 * s, top + 2.0 * s, inner, dim);
+                    crate::skin::draw_face_gray(
+                        ui,
+                        &sk.face(),
+                        x + 2.0 * s,
+                        top + 2.0 * s,
+                        inner,
+                        dim,
+                        gray,
+                    );
                 } else {
                     let ch: String = r.pseudo.chars().take(1).collect::<String>().to_uppercase();
                     let cw = Ui::text_width(&ch, s);
@@ -5561,22 +5856,17 @@ impl Session {
                         ch,
                     );
                 }
-                // (v177) Bande du bas : la couleur du joueur pour ses coéquipiers (bots
-                // compris), celle de l'équipe pour les adversaires.
-                let band = if side == my_team {
-                    mate_color(r.color as usize)
-                } else {
-                    team_color(side)
-                };
+                // (v177) Bande du bas : la couleur du joueur (bots compris). (v209) Celle de
+                // chaque adversaire aussi, grisée s'il est mort.
+                let band = grayed(col);
                 ui.rect(x + s, top + head, head - 2.0 * s, 3.0 * s, band);
+                // (v209) Mort : une croix rouge, aussi fine que l'ancienne barre.
                 if !r.alive {
-                    ui.rect(
-                        x + 2.0 * s,
-                        top + head / 2.0,
-                        head - 4.0 * s,
-                        s,
-                        [0.9, 0.2, 0.2, 0.9],
-                    );
+                    let (x0, y0) = (x + 2.0 * s, top + 2.0 * s);
+                    let (x1, y1) = (x + head - 2.0 * s, top + head - 2.0 * s);
+                    let red = [0.9, 0.2, 0.2, 0.9];
+                    ui.line(x0, y0, x1, y1, s, red);
+                    ui.line(x1, y0, x0, y1, s, red);
                 }
             }
         }
@@ -5688,7 +5978,13 @@ impl Session {
         }
         // Mort : qui on suit.
         if let Some(name) = &self.spectating {
-            let t = format!("Tu regardes {name} (clic : suivant, clic droit : précédent)");
+            // (v209) Partie solo : on peut prendre la place du bot regardé.
+            let take = if n.is_bot(name) {
+                ", E : prendre sa place"
+            } else {
+                ""
+            };
+            let t = format!("Tu regardes {name} (clic : suivant, clic droit : précédent{take})");
             ui.text(
                 cx - Ui::text_width(&t, s) / 2.0,
                 size.1 * 0.8,
@@ -5761,7 +6057,10 @@ impl Session {
         let radar_size = (72.0 * s).min(size.1 * 0.3);
         let radar_x = size.0 - radar_size - 6.0 * s;
         {
-            let mates: Vec<(Vec3, [f32; 4])> = views
+            use minelib_net::game::FLAG_BOMB;
+            // (v209) Celui qui porte la bombe : un logo de bombe à sa couleur au lieu du
+            // point (les adversaires : en rouge, s'ils sont repérés).
+            let mates: Vec<(Vec3, [f32; 4], bool)> = views
                 .iter()
                 .filter(|v| v.alive && v.team == my_team)
                 .map(|v| {
@@ -5769,13 +6068,20 @@ impl Session {
                         .iter()
                         .find(|r| r.pseudo == v.pseudo)
                         .map_or(0, |r| r.color as usize);
-                    (v.pos, mate_color(k))
+                    (v.pos, mate_color(k), v.flags & FLAG_BOMB != 0)
                 })
                 .collect();
-            let enemies: Vec<Vec3> = views
-                .iter()
-                .filter(|v| v.alive && v.team != my_team)
-                .map(|v| v.pos)
+            // (v209) Adversaires : seulement ceux que l'équipe voit ou vient de voir (3,5 s,
+            // à leur dernière position vue). Avant : tous, tout le temps.
+            let enemies: Vec<(Vec3, bool)> = self
+                .spotting
+                .shown()
+                .map(|(pseudo, at)| {
+                    let bomb = views
+                        .iter()
+                        .any(|v| v.pseudo == pseudo && v.alive && v.flags & FLAG_BOMB != 0);
+                    (at, bomb)
+                })
                 .collect();
             let bomb_at =
                 matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED).then(|| Vec3::from(hud.bomb_pos));
@@ -5792,6 +6098,7 @@ impl Session {
                 radar_size,
                 s,
                 (self.player.pos, self.player.look_dir(), my_color),
+                hud.carrying && !self.net_dead,
                 &mates,
                 &enemies,
                 bomb_at,
@@ -6406,7 +6713,12 @@ impl Session {
             if self.game.mode == GameMode::Fps {
                 self.fps.screen_fx(ui, size, self.player.eye());
                 if !self.light_editor.open {
-                    self.fps.hud(ui, size, input.cursor, debug);
+                    // (v209) Spectateur : l'écran du joueur regardé, comme si c'était soi.
+                    if self.spectating.is_some() {
+                        self.spec_fps.hud(ui, size, None, debug);
+                    } else {
+                        self.fps.hud(ui, size, input.cursor, debug);
+                    }
                 }
             }
             // Cœurs (survie) : au-dessus de la barre d'objets, à gauche, images du pack.
@@ -6578,7 +6890,10 @@ impl Session {
     ) -> FrameStats {
         let fog_end = self.fog_end();
         let fps_mode = self.game.mode == GameMode::Fps;
-        let fov = if fps_mode {
+        let fov = if fps_mode && self.spectating.is_some() {
+            // (v209) Spectateur : la lunette du joueur regardé.
+            self.spec_fps.scope_fov().unwrap_or(self.fov)
+        } else if fps_mode {
             self.fps.scope_fov().unwrap_or(self.fov)
         } else {
             self.fov
@@ -6906,7 +7221,18 @@ impl Session {
         } else {
             Vec::new()
         };
-        let hand = if self.spectating.is_some() {
+        let hand = if self.spectating.is_some() && fps_mode {
+            // (v209) Spectateur : l'arme du joueur regardé dans ses mains, et ce qui est dans
+            // le monde (balles traçantes, grenades en vol, impacts) comme en jouant.
+            let mut v = self.spec_fps.viewmodel(renderer.aspect(), self.hand_light);
+            let proj =
+                Mat4::perspective_infinite_reverse_rh(fov.to_radians(), renderer.aspect(), 0.05);
+            v.extend(
+                self.fps
+                    .world_fx(proj * view, self.player.eye(), &self.world, self.daylight),
+            );
+            v
+        } else if self.spectating.is_some() {
             Vec::new()
         } else if fps_mode {
             // Arme en main, puis balles traçantes, étincelles et impacts dans le monde.

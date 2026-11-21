@@ -248,6 +248,11 @@ struct Globals {
     /// (v201) Torches en lumières ponctuelles : centre (xyz) et rayon (w) de la sphère où
     /// leur lumière des blocs laisse la place aux lumières dynamiques ; w = 0 : nulle part.
     torch_swap: [f32; 4],
+    /// (v209) Boîtes d'ombre par groupes de voisines (un joueur, en général) : boule qui
+    /// contient chaque groupe (centre xyz, rayon w), et ses boîtes (x : la première, y :
+    /// après la dernière). `shadow_spans[0].z` : nombre de groupes.
+    shadow_groups: [[f32; 4]; MAX_SHADOW_GROUPS],
+    shadow_spans: [[u32; 4]; MAX_SHADOW_GROUPS],
 }
 
 /// Rayon de la caméra qui passe par le point `ndc` de l'écran, à l'échelle d'une unité de
@@ -287,6 +292,13 @@ pub fn eye_relative(view_proj: Mat4) -> Mat4 {
 
 /// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre.
 pub const MAX_SHADOW_BOXES: usize = 48;
+
+/// (v209) Nombre maximal de groupes de boîtes d'ombre (voir `shadow_groups`).
+pub const MAX_SHADOW_GROUPS: usize = 16;
+
+/// (v209) Diagonale maximale d'un groupe de boîtes voisines : un joueur (1,9 bloc de haut)
+/// y tient, deux joueurs collés aussi.
+const SHADOW_GROUP_SPAN: f32 = 4.0;
 
 /// Morceau de joueur qui fait de l'ombre : sa boîte exacte (tournée avec lui), et la
 /// boîte alignée sur les axes du monde qui la contient.
@@ -334,16 +346,66 @@ impl ShadowBox {
     }
 }
 
-/// Uniformes des ombres des joueurs : (nombre, coins min, coins max).
+/// Uniformes des ombres des joueurs.
+struct ShadowGlobals {
+    /// Nombre de boîtes (x) et centre de la boule qui les contient toutes (yzw).
+    info: [f32; 4],
+    min: [[f32; 4]; MAX_SHADOW_BOXES],
+    max: [[f32; 4]; MAX_SHADOW_BOXES],
+    groups: [[f32; 4]; MAX_SHADOW_GROUPS],
+    spans: [[u32; 4]; MAX_SHADOW_GROUPS],
+}
+
+/// (v209) Groupes de boîtes voisines qui se suivent (les morceaux d'un même joueur se
+/// suivent), chacun dans une boule : un rayon qui passe loin de la boule d'un groupe ne
+/// touche aucune de ses boîtes, le shader les saute toutes d'un seul essai. Avant, chaque
+/// pixel essayait les 48 boîtes dès que le rayon passait dans la boule de toutes (avec les
+/// bots, presque partout : la carte entière). Le dernier groupe prend tout ce qui reste.
+fn shadow_groups(
+    mn: &[[f32; 4]],
+    mx: &[[f32; 4]],
+) -> ([[f32; 4]; MAX_SHADOW_GROUPS], [[u32; 4]; MAX_SHADOW_GROUPS]) {
+    let mut groups = [[0.0; 4]; MAX_SHADOW_GROUPS];
+    let mut spans = [[0u32; 4]; MAX_SHADOW_GROUPS];
+    let n = mn.len().min(mx.len());
+    let diag =
+        |lo: &[f32; 3], hi: &[f32; 3]| (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f32>().sqrt();
+    let mut count = 0;
+    let mut start = 0;
+    while start < n {
+        let mut lo = [mn[start][0], mn[start][1], mn[start][2]];
+        let mut hi = [mx[start][0], mx[start][1], mx[start][2]];
+        let last = count + 1 == MAX_SHADOW_GROUPS;
+        let mut end = start + 1;
+        while end < n {
+            let lo2: [f32; 3] = std::array::from_fn(|k| lo[k].min(mn[end][k]));
+            let hi2: [f32; 3] = std::array::from_fn(|k| hi[k].max(mx[end][k]));
+            if !last && diag(&lo2, &hi2) > SHADOW_GROUP_SPAN {
+                break;
+            }
+            (lo, hi) = (lo2, hi2);
+            end += 1;
+        }
+        groups[count] = [
+            (lo[0] + hi[0]) / 2.0,
+            (lo[1] + hi[1]) / 2.0,
+            (lo[2] + hi[2]) / 2.0,
+            diag(&lo, &hi) / 2.0,
+        ];
+        spans[count] = [start as u32, end as u32, 0, 0];
+        count += 1;
+        start = end;
+    }
+    spans[0][2] = count as u32;
+    (groups, spans)
+}
+
+/// Uniformes des ombres des joueurs : (nombre, coins min, coins max, groupes).
 fn shadow_globals(
     boxes: &[ShadowBox],
     lights: &[[f32; 4]],
     held: Option<[f32; 3]>,
-) -> (
-    [f32; 4],
-    [[f32; 4]; MAX_SHADOW_BOXES],
-    [[f32; 4]; MAX_SHADOW_BOXES],
-) {
+) -> ShadowGlobals {
     let n = boxes.len().min(MAX_SHADOW_BOXES);
     let mut mn = [[0.0; 4]; MAX_SHADOW_BOXES];
     let mut mx = [[0.0; 4]; MAX_SHADOW_BOXES];
@@ -384,7 +446,14 @@ fn shadow_globals(
         ];
         mx[0][3] = r;
     }
-    (info, mn, mx)
+    let (groups, spans) = shadow_groups(&mn[..n], &mx[..n]);
+    ShadowGlobals {
+        info,
+        min: mn,
+        max: mx,
+        groups,
+        spans,
+    }
 }
 
 /// Nombre maximal de pavés du joueur vus dans les reflets.
@@ -2986,14 +3055,16 @@ impl Renderer {
             ray_min: rg.2,
             ray_max: rg.3,
             ray_uv: rg.4,
-            shadow_info: sg.0,
-            shadow_min: sg.1,
-            shadow_max: sg.2,
+            shadow_info: sg.info,
+            shadow_min: sg.min,
+            shadow_max: sg.max,
             clip: [0.0; 4],
             mirror_vp: [[[0.0; 4]; 4]; planar::MAX_PLANAR],
             mirror_info: [[0.0; 4]; planar::MAX_PLANAR],
             mirror_count: [0.0; 4],
             torch_swap: self.torch_swap_uniform(),
+            shadow_groups: sg.groups,
+            shadow_spans: sg.spans,
         };
         let mut globals = globals;
 
@@ -3193,14 +3264,16 @@ impl Renderer {
             ray_min: rg.2,
             ray_max: rg.3,
             ray_uv: rg.4,
-            shadow_info: sg.0,
-            shadow_min: sg.1,
-            shadow_max: sg.2,
+            shadow_info: sg.info,
+            shadow_min: sg.min,
+            shadow_max: sg.max,
             clip: [0.0; 4],
             mirror_vp: [[[0.0; 4]; 4]; planar::MAX_PLANAR],
             mirror_info: [[0.0; 4]; planar::MAX_PLANAR],
             mirror_count: [0.0; 4],
             torch_swap: self.torch_swap_uniform(),
+            shadow_groups: sg.groups,
+            shadow_spans: sg.spans,
         };
         self.overlay
             .prepare(&self.device, &self.queue, p.overlay, p.ui, size);
@@ -3951,6 +4024,72 @@ fn aabb_visible(planes: &[Vec4; 4], min: Vec3, max: Vec3) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v209) Groupes de boîtes d'ombre : chaque boîte dans un seul groupe, dans l'ordre, et
+    /// tout entière dans la boule de son groupe (sinon le shader en oublierait l'ombre).
+    #[test]
+    fn shadow_groups_hold_every_box_once() {
+        // 10 joueurs de 6 morceaux (60 boîtes, 48 gardées), à 3 blocs les uns des autres,
+        // puis un groupe serré : deux joueurs collés.
+        let mut boxes = Vec::new();
+        for p in 0..10 {
+            let f = Vec3::new(p as f32 * 3.0, 64.0, (p % 3) as f32 * 7.0);
+            for k in 0..6 {
+                let lo = f + Vec3::new(-0.3 + 0.1 * k as f32, 0.3 * k as f32, -0.2);
+                let hi = lo + Vec3::new(0.5, 0.6, 0.4);
+                boxes.push(ShadowBox {
+                    min: lo.into(),
+                    max: hi.into(),
+                    to_unit: [[0.0; 4]; 3],
+                    sunlit: true,
+                    owner: 0,
+                });
+            }
+        }
+        let sg = shadow_globals(&boxes, &[], None);
+        let n = sg.info[0] as usize;
+        assert_eq!(n, MAX_SHADOW_BOXES);
+        let count = sg.spans[0][2] as usize;
+        assert!((1..=MAX_SHADOW_GROUPS).contains(&count));
+        let mut next = 0;
+        for q in 0..count {
+            let [a, b, _, _] = sg.spans[q];
+            assert_eq!(a as usize, next, "groupes à la suite");
+            assert!(b > a);
+            next = b as usize;
+            let s = sg.groups[q];
+            let c = Vec3::new(s[0], s[1], s[2]);
+            for k in a as usize..b as usize {
+                for corner in 0..8 {
+                    let p = Vec3::new(
+                        if corner & 1 == 0 {
+                            sg.min[k][0]
+                        } else {
+                            sg.max[k][0]
+                        },
+                        if corner & 2 == 0 {
+                            sg.min[k][1]
+                        } else {
+                            sg.max[k][1]
+                        },
+                        if corner & 4 == 0 {
+                            sg.min[k][2]
+                        } else {
+                            sg.max[k][2]
+                        },
+                    );
+                    assert!(
+                        p.distance(c) <= s[3] + 1e-4,
+                        "boîte {k} hors de la boule {q}"
+                    );
+                }
+            }
+        }
+        assert_eq!(next, n, "toutes les boîtes");
+        // Un joueur par groupe ici (3 blocs entre eux, plus que la diagonale permise
+        // de deux joueurs) : 8 groupes de 6.
+        assert_eq!(count, 8);
+    }
 
     /// Les shaders se compilent (erreur de WGSL vue avant de lancer le jeu), et les
     /// uniformes du monde ont la taille que le shader attend.

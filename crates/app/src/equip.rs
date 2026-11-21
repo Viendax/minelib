@@ -559,6 +559,26 @@ pub struct Hits {
     pub damage: f32,
     /// Aveuglement (0..1) d'une flash.
     pub flash: f32,
+    /// (v209) Flashs qui ont éclaté à cette image (minimap : aveuglement des coéquipiers).
+    pub flashes: Vec<Vec3>,
+}
+
+/// (v209) Secondes de blanc par unité d'aveuglement (`Fps::blind`) : l'écran est tout
+/// blanc tant qu'il en reste plus d'une.
+pub const FLASH_BLIND: f32 = 3.5;
+
+/// (v209) Aveuglement (0..1) par une flash qui éclate en `at`, pour un œil en `eye` qui
+/// regarde vers `look` : distance, angle et ligne de vue.
+pub fn flash_strength(world: &World, at: Vec3, eye: Vec3, look: Vec3) -> f32 {
+    let to = at - eye;
+    let d = to.length();
+    if d < 30.0 && visible(world, at + Vec3::Y * 0.1, eye) {
+        let facing = look.dot(to / d.max(0.01)).clamp(-1.0, 1.0);
+        let f = flash_angle_factor(facing.acos().to_degrees());
+        f * (1.0 - d / 30.0).clamp(0.0, 1.0).sqrt()
+    } else {
+        0.0
+    }
 }
 
 /// Pas de projectile : rebond sur les blocs pleins (vitesse amortie), roulé au sol.
@@ -677,13 +697,8 @@ pub fn detonate(
         Nade::Flash => {
             effects.push(Effect::Blast(p, 0.25));
             sounds.push((Sfx::Flash, 0.0, p));
-            let to = p - eye;
-            let d = to.length();
-            if d < 30.0 && visible(world, p + Vec3::Y * 0.1, eye) {
-                let facing = look.dot(to / d.max(0.01)).clamp(-1.0, 1.0);
-                let f = flash_angle_factor(facing.acos().to_degrees());
-                hits.flash = hits.flash.max(f * (1.0 - d / 30.0).clamp(0.0, 1.0).sqrt());
-            }
+            hits.flash = hits.flash.max(flash_strength(world, p, eye, look));
+            hits.flashes.push(p);
         }
         Nade::Smoke => {
             sounds.push((Sfx::Smoke, 0.0, p));

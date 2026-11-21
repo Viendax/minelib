@@ -34,6 +34,11 @@ pub fn load(dir: &Path) -> FpsMap {
     let Ok(text) = fs::read_to_string(dir.join(FILE)) else {
         return m;
     };
+    // (v209) Doubles portes réglées sans dire si les portes s'ouvrent : elles s'ouvrent
+    // (on ne règle pas des doubles portes pour les garder fermées). Inferno n'avait que
+    // `portes_doubles=1` : ses portes restaient fixes, la touche Utiliser n'y faisait rien.
+    // CHANGEMENT DE CARTE : ces cartes changent de signature (`MapPackage::fps`).
+    let mut doors_said = false;
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
@@ -48,6 +53,7 @@ pub fn load(dir: &Path) -> FpsMap {
         }
         if k.trim() == "portes" {
             m.set_doors(v.trim() == "1");
+            doors_said = true;
             continue;
         }
         let z = parse_zone(v);
@@ -59,6 +65,9 @@ pub fn load(dir: &Path) -> FpsMap {
             "c" => m.sites[2] = z,
             _ => {}
         }
+    }
+    if m.door_sync() && !doors_said {
+        m.set_doors(true);
     }
     m
 }
@@ -81,6 +90,9 @@ pub fn save(dir: &Path, m: &FpsMap) -> Result<()> {
     }
     if m.doors() {
         s += "portes=1\n";
+    } else if m.door_sync() {
+        // (v209) Fixes malgré les doubles portes : à écrire (sinon elles s'ouvriraient).
+        s += "portes=0\n";
     }
     if m.door_sync() {
         s += "portes_doubles=1\n";
