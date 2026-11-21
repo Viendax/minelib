@@ -1002,9 +1002,9 @@ pub fn on_button(uv: [f32; 2], b: usize) -> bool {
 /// revenir par le bord.
 ///
 /// (v211) Les deux boutons, en haut à gauche, vont ensemble, comme une petite barre : on
-/// entre par le bord gauche ou par le haut, près de l'un d'eux, et on glisse vers eux ;
-/// chacun apparaît d'autant plus qu'on s'approche de lui, et passer de l'un à l'autre ne
-/// fait partir ni l'un ni l'autre.
+/// entre par le bord gauche ou par le haut, près de l'un d'eux, et on glisse vers eux.
+/// (v212) Ils apparaissent et disparaissent **ensemble**, du même fondu : l'apparition
+/// suit la distance au plus proche des deux.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Corner {
     /// Entré sur l'écran par le bord, dans le coin, et pas reparti ailleurs depuis.
@@ -1047,8 +1047,10 @@ impl Corner {
             self.reached = false;
             return [0.0; 2];
         }
-        // De plus en plus visible en approchant : tout à fait dans sa zone.
-        each.map(|e| (1.0 - (e - r * ZONE) / (r * (COIN - ZONE))).clamp(0.0, 1.0))
+        // De plus en plus visible en approchant : tout à fait dans la zone. La même pour
+        // les deux boutons.
+        let v = (1.0 - (d - r * ZONE) / (r * (COIN - ZONE))).clamp(0.0, 1.0);
+        [v; 2]
     }
 }
 
@@ -1756,24 +1758,45 @@ mod tests {
         let mut t = Tab::new("x");
         glide(&mut t, [0.0, 0.24], [0.06, 0.18], 20, 40);
         assert!(t.reveal[LOUPE] > 0.05 && t.reveal[LOUPE] < 0.95, "{:?}", t.reveal);
-        // Le bouton vidéo, par le haut juste au-dessus de lui : il est là, et la loupe à
-        // côté de lui presque autant (ils vont ensemble).
+        // Le bouton vidéo, par le haut juste au-dessus de lui : tous deux sont là.
         let v = BOUTONS[VIDEO];
         let mut t = Tab::new("x");
         glide(&mut t, [v[0] + 0.01, 0.0], v, 20, 30);
-        assert!(t.reveal[VIDEO] > 0.99, "{:?}", t.reveal);
-        assert!(t.reveal[LOUPE] > 0.9, "{:?}", t.reveal);
-        // Par le coin, en passant devant la loupe pour aller à la vidéo : tous deux restent.
+        assert_eq!(t.reveal, [1.0; 2]);
+        // Par le coin, en passant devant la loupe pour aller à la vidéo, et retour : tous
+        // deux restent.
         let mut t = Tab::new("x");
         glide(&mut t, [0.0, 0.053], v, 40, 30);
-        assert!(t.reveal[VIDEO] > 0.99 && t.reveal[LOUPE] > 0.9, "{:?}", t.reveal);
-        // Et en revenant de la vidéo à la loupe.
         glide(&mut t, v, BOUTONS[LOUPE], 20, 30);
-        assert!(t.reveal[LOUPE] > 0.99 && t.reveal[VIDEO] > 0.9, "{:?}", t.reveal);
-        // Loin de la vidéo, en arrivant par le bord gauche plus bas : la loupe d'abord.
+        assert_eq!(t.reveal, [1.0; 2]);
+    }
+
+    /// (v212) Les deux boutons apparaissent et disparaissent ensemble, image par image.
+    #[test]
+    fn the_two_buttons_fade_in_and_out_together() {
         let mut t = Tab::new("x");
-        glide(&mut t, [0.0, 0.2], [0.0, 0.15], 10, 0);
-        assert!(t.reveal[LOUPE] > t.reveal[VIDEO], "{:?}", t.reveal);
+        let mut vus = Vec::new();
+        let chemin = [
+            ([0.0, 0.25], BOUTONS[LOUPE]),
+            (BOUTONS[LOUPE], BOUTONS[VIDEO]),
+            (BOUTONS[VIDEO], [0.5, 0.5]),
+        ];
+        for (de, vers) in chemin {
+            for k in 0..=30 {
+                let a = k as f32 / 30.0;
+                t.cursor = Some([de[0] + (vers[0] - de[0]) * a, de[1] + (vers[1] - de[1]) * a]);
+                t.update(0.016);
+                vus.push(t.reveal);
+            }
+        }
+        for _ in 0..40 {
+            t.update(0.016);
+            vus.push(t.reveal);
+        }
+        assert!(vus.iter().all(|r| r[0] == r[1]), "{vus:?}");
+        // Ils sont bien apparus, puis repartis.
+        assert!(vus.iter().any(|r| r[0] > 0.99));
+        assert_eq!(vus.last(), Some(&[0.0; 2]));
     }
 
     /// (v207) Déjà sur l'écran, monter dans le coin ne les fait pas apparaître ; entrer
