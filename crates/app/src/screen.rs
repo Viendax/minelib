@@ -407,6 +407,12 @@ pub struct Displays {
     /// (une vidéo qui commence repart au volume de la page).
     volume: f32,
     volume_in: f32,
+    /// (v205) Filtrage des pages : `blanche` (rien que YouTube et Google) ou `noire`
+    /// (tout sauf les sites filtrés). En ligne c'est toujours `blanche` : le monde est
+    /// public. Changer de mode relance le navigateur.
+    filtre: &'static str,
+    /// Pages refusées depuis le dernier `take_blocked` : (écran, raison).
+    blocked: Vec<(u32, u8)>,
 }
 
 impl Displays {
@@ -422,7 +428,30 @@ impl Displays {
             states: Vec::new(),
             volume: 1.0,
             volume_in: 0.0,
+            filtre: "blanche",
+            blocked: Vec::new(),
         }
+    }
+
+    /// (v205) Le mode de filtrage des pages (`blanche` ou `noire`). Le navigateur est
+    /// relancé s'il change, le filtre étant chargé à son lancement.
+    pub fn set_filter(&mut self, mode: &'static str) {
+        if self.filtre == mode {
+            return;
+        }
+        log::info!("écrans vidéo : filtrage des pages en liste {mode}");
+        self.filtre = mode;
+        // Son `Drop` lui demande de quitter.
+        self.browser = None;
+        for tab in self.tabs.values_mut() {
+            tab.opened = false;
+        }
+    }
+
+    /// Les pages refusées depuis la dernière fois : (écran, raison) — voir `filtre::Refus`
+    /// du navigateur.
+    pub fn take_blocked(&mut self) -> Vec<(u32, u8)> {
+        std::mem::take(&mut self.blocked)
     }
 
     /// Volume du son de tous les écrans (0 à 1).
@@ -560,7 +589,7 @@ impl Displays {
         {
             return;
         }
-        match Browser::start(self.cache) {
+        match Browser::start(self.cache, self.filtre) {
             Err(Launch::Absent) => {
                 log::info!("écrans vidéo : navigateur absent (dossier « cef »), mires affichées");
                 self.absent = true;
@@ -808,6 +837,7 @@ impl Displays {
                         Event::Editing(on) => tab.editing = on,
                         Event::State(s) => self.states.push((id, s)),
                         Event::Scroll(f) => tab.scroll = f,
+                        Event::Blocked(raison) => self.blocked.push((id, raison)),
                     }
                 }
             }
@@ -825,6 +855,22 @@ impl Displays {
             tab.update(dt);
         }
     }
+}
+
+/// (v205) Le bouton de recherche en haut à gauche d'un écran : mêmes mesures que ce que
+/// dessine `screen.wgsl` (`BTN_C`, `BTN_R`), et les pages font 1280 × 720, donc une
+/// longueur en `u` vaut 16/9 de la même en `v`.
+const BOUTON: ([f32; 2], f32) = ([0.030, 0.053], 0.022);
+
+/// L'adresse où mène le bouton (SafeSearch est imposé par le navigateur).
+pub const RECHERCHE: &str = "https://www.google.com/";
+
+/// Le clic est-il sur le bouton de recherche ?
+pub fn on_search_button(uv: [f32; 2]) -> bool {
+    let (c, r) = BOUTON;
+    let dx = uv[0] - c[0];
+    let dy = (uv[1] - c[1]) * 9.0 / 16.0;
+    dx * dx + dy * dy <= r * r
 }
 
 /// Ce qu'affiche un écran.
@@ -1079,6 +1125,9 @@ enum Event {
     State(String),
     /// La page peut défiler sous la souris : vers le haut (1), vers le bas (2).
     Scroll(u8),
+    /// (v205) Une page a été refusée par le filtre, avec sa raison (voir `filtre::Refus`
+    /// du navigateur).
+    Blocked(u8),
 }
 
 /// Ce que le navigateur a envoyé depuis la dernière lecture : la dernière image de chaque
@@ -1129,7 +1178,7 @@ impl Browser {
     }
 
     /// Lance le navigateur avec la session `cache` (0 : `cef-cache`, n : `cef-cache-<n+1>`).
-    fn start(cache: u32) -> Result<Self, Launch> {
+    fn start(cache: u32, filtre: &str) -> Result<Self, Launch> {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let exe = Self::find().ok_or(Launch::Absent)?;
@@ -1166,6 +1215,14 @@ impl Browser {
             .arg(logs.join("navigateur.log"))
             // Qu'il dise où la page peut défiler (la molette n'y va que si elle y sert).
             .arg("--scroll")
+            // (v205) Le jeu est tout public : filtrage des pages, mode restreint de
+            // YouTube et SafeSearch. Les listes sont dans `.minelib\\filtres`.
+            .arg("--filtre")
+            .arg(filtre)
+            .arg("--listes")
+            .arg(data.join("filtres"))
+            .arg("--restreint")
+            .arg("strict")
             .current_dir(exe.parent().ok_or(Launch::Absent)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1343,6 +1400,13 @@ fn read_records(mut out: impl std::io::Read, inbox: std::sync::Arc<std::sync::Mu
                     i.events.push((id, Event::Scroll((a & 3) as u8)));
                 }
             }
+            // (v205) Page refusée : `a` est la raison. L'adresse reste au journal du
+            // navigateur (`navigateur-sortie.log`) : le jeu n'a pas à l'afficher.
+            b"MLBX" => {
+                if let Ok(mut i) = inbox.lock() {
+                    i.events.push((id, Event::Blocked((a & 0xff) as u8)));
+                }
+            }
             b"MLBS" => {
                 if a > 1 << 16 {
                     log::warn!("écrans vidéo : état de page trop long ({a} octets)");
@@ -1369,6 +1433,25 @@ fn read_records(mut out: impl std::io::Read, inbox: std::sync::Arc<std::sync::Mu
 
 #[cfg(test)]
 mod tests {
+
+    /// (v205) Le bouton de recherche : rond pour de vrai (les pages sont en 16/9), au coin
+    /// en haut à gauche, et il ne mange pas la page.
+    #[test]
+    fn the_search_button_is_a_round_corner_button() {
+        let (c, r) = BOUTON;
+        assert!(on_search_button(c));
+        // Son bord : à `r` en largeur, à `r * 16/9` en hauteur.
+        assert!(on_search_button([c[0] + r * 0.95, c[1]]));
+        assert!(!on_search_button([c[0] + r * 1.05, c[1]]));
+        assert!(on_search_button([c[0], c[1] + r * 16.0 / 9.0 * 0.95]));
+        assert!(!on_search_button([c[0], c[1] + r * 16.0 / 9.0 * 1.05]));
+        // Le reste de l'écran est à la page.
+        for ailleurs in [[0.5, 0.5], [0.0, 0.5], [0.5, 0.0], [0.97, 0.05], [0.03, 0.9]] {
+            assert!(!on_search_button(ailleurs), "{ailleurs:?}");
+        }
+        // Il tient dans l'écran.
+        assert!(c[0] - r > 0.0 && c[1] - r * 16.0 / 9.0 > 0.0);
+    }
     use super::*;
 
     /// Écran sur la face +Z du bloc (0, 1, 0) : regarde vers +Z.

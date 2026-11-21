@@ -329,6 +329,9 @@ pub struct Session {
     /// Marche des autres joueurs (par pseudo) : comme la sienne en F5, calculée sur leur
     /// déplacement affiché (fluide, quel que soit le rythme des messages).
     walks: HashMap<String, Walk>,
+    /// (v205) Mode de filtrage des écrans en solo, retenu une fois pour la session : la
+    /// liste noire demande un fichier installé, et on ne va pas le chercher à chaque image.
+    solo_filtre: Option<&'static str>,
     /// (v191) Numéro de l'image en cours, pour oublier les joueurs partis (voir `Walk`).
     walk_stamp: u32,
     /// (v172) Skins des autres joueurs envoyés à la carte (ils sont dessinés par elle) ;
@@ -607,6 +610,7 @@ impl Session {
             walk_phase: 0.0,
             walks: HashMap::new(),
             walk_stamp: 0,
+            solo_filtre: None,
             skin_layers: Default::default(),
             scratch: Default::default(),
             sun_seen: Default::default(),
@@ -1874,6 +1878,12 @@ impl Session {
         );
         // Hitbox pour la physique.
         self.player.solids = self.shown.iter().map(|s| s.0.hitbox()).collect();
+        // (v205) Le jeu est tout public : en ligne, seuls YouTube et Google s'ouvrent sur
+        // un écran. En solo, la liste noire si elle est installée (voir
+        // `claude/ecran-en-jeu.md`), sinon la même liste blanche.
+        let en_ligne = self.build.is_some() || self.net.is_some();
+        let mode = if en_ligne { "blanche" } else { self.solo_filter() };
+        self.displays.set_filter(mode);
         // Une page par écran : onglets ouverts et fermés avec les écrans.
         let ids: Vec<u32> = self.shown.iter().map(|s| s.0.id()).collect();
         self.displays.sync(&ids);
@@ -1919,8 +1929,15 @@ impl Session {
                 // En mode FPS, « utiliser » est une lettre : elle va dans le champ de texte.
                 && !(fps && editing)
             {
-                self.displays.press(ids[i], uv);
-                self.screen_touch = Some(ids[i]);
+                // (v205) Le bouton de recherche en haut à gauche mène sur Google ; le
+                // reste de l'écran est la page.
+                if crate::screen::on_search_button(uv) {
+                    self.displays.open(ids[i], crate::screen::RECHERCHE);
+                    self.screen_last = Some(ids[i]);
+                } else {
+                    self.displays.press(ids[i], uv);
+                    self.screen_touch = Some(ids[i]);
+                }
             }
         }
         // Molette sur un écran dont la page peut défiler dans ce sens sous le réticule :
@@ -1947,11 +1964,39 @@ impl Session {
         }
         self.displays.hover(aimed);
         self.displays.update(dt);
+        // Pages refusées par le filtre : un mot au joueur, une fois par raison.
+        for (_, raison) in self.displays.take_blocked() {
+            let quoi = match raison {
+                1 => "ce genre d'adresse ne s'ouvre pas sur un écran",
+                2 => "pas de machine du réseau local sur un écran",
+                4 => "site filtré",
+                _ => "site hors de la liste autorisée (écran public)",
+            };
+            self.chat.say(format!("Écran : {quoi}."), chat::YELLOW);
+        }
         self.watch_together(dt);
     }
 
     /// Regarder ensemble (construction en ligne) : ce que rapportent les pages, messages
     /// aux joueurs proches (par le canal de la voix), pages amenées à la vidéo partagée.
+    /// (v205) En solo : la liste noire si son fichier est installé, sinon la liste
+    /// blanche. Jamais « tout ouvert » par défaut.
+    fn solo_filter(&mut self) -> &'static str {
+        if let Some(m) = self.solo_filtre {
+            return m;
+        }
+        let liste = minelib_assets::data_dir()
+            .join("filtres")
+            .join("liste_noire.txt");
+        let m = if liste.is_file() { "noire" } else { "blanche" };
+        log::info!(
+            "écrans vidéo : filtrage en solo, liste {m} ({})",
+            liste.display()
+        );
+        self.solo_filtre = Some(m);
+        m
+    }
+
     fn watch_together(&mut self, dt: f32) {
         let states = self.displays.take_states();
         let Some(b) = &self.build else {

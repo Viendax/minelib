@@ -15,7 +15,12 @@
 //! - `quit`.
 //!
 //! **Options** : `--width`, `--height`, `--cache <dossier de session>`, `--log <journal>`,
-//! `--fps <images par seconde d'un nouvel onglet, 30 par défaut>`, `--scroll`.
+//! `--fps <images par seconde d'un nouvel onglet, 30 par défaut>`, `--scroll`,
+//! `--filtre blanche|noire`, `--listes <dossier des listes>`,
+//! `--restreint strict|modere|non` (mode restreint de YouTube et SafeSearch).
+//!
+//! **Filtrage (v205)** : le jeu est tout public, donc une page qui n'est pas autorisée ne
+//! s'ouvre pas du tout — ni dans l'onglet, ni dans un cadre de la page. Voir `filtre`.
 //!
 //! Aucune fenêtre ne s'ouvre jamais : les liens « nouvel onglet » cliqués s'ouvrent dans
 //! l'écran, les fenêtres ouvertes par un script sont bloquées, `alert`/`confirm`/`prompt`
@@ -43,9 +48,13 @@
 //! (connexion à un compte, cookies) est la sienne, dans le dossier `--cache`.
 #![windows_subsystem = "windows"]
 
+mod filtre;
+
+use filtre::{Filtre, Mode, Restreint};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -107,6 +116,12 @@ struct Options {
     scroll: bool,
     /// Images par seconde d'un nouvel onglet (le jeu les règle ensuite par onglet).
     fps: i32,
+    /// (v205) Liste blanche (le défaut : rien que YouTube et Google) ou liste noire.
+    filtre: Mode,
+    /// Dossier des fichiers `liste_blanche.txt` et `liste_noire.txt`.
+    listes: Option<PathBuf>,
+    /// Mode restreint de YouTube et SafeSearch (strict par défaut).
+    restreint: Restreint,
 }
 
 impl Options {
@@ -118,6 +133,9 @@ impl Options {
             log: None,
             scroll: false,
             fps: 30,
+            filtre: Mode::Blanche,
+            listes: None,
+            restreint: Restreint::Strict,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -129,6 +147,9 @@ impl Options {
                 "--log" => o.log = Some(value()),
                 "--scroll" => o.scroll = true,
                 "--fps" => o.fps = value().parse().unwrap_or(o.fps).clamp(1, MAX_FPS),
+                "--filtre" => o.filtre = Mode::from_name(&value()).unwrap_or(o.filtre),
+                "--listes" => o.listes = Some(PathBuf::from(value())),
+                "--restreint" => o.restreint = Restreint::from_name(&value()).unwrap_or(o.restreint),
                 _ => {}
             }
         }
@@ -508,6 +529,7 @@ wrap_client! {
         dialogs: JsdialogHandler,
         files: DialogHandler,
         permissions: PermissionHandler,
+        requests: RequestHandler,
     }
 
     impl Client {
@@ -538,11 +560,117 @@ wrap_client! {
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(self.loader.clone())
         }
+
+        // (v205) Le filtrage des pages.
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.requests.clone())
+        }
     }
 }
 
+// (v205) Le garde d'un onglet : il refuse une page avant qu'elle ne s'ouvre, refuse de
+// même les ressources d'une page refusée (un cadre, une vidéo, une image), met le mode
+// restreint de YouTube et SafeSearch sur les recherches Google, et dit au jeu ce qu'il a
+// refusé pour qu'il l'écrive au joueur.
+wrap_request_handler! {
+    struct Garde {
+        id: u32,
+        filtre: Arc<Filtre>,
+        restreint: Restreint,
+        out: Shared,
+    }
+
+    impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _user_gesture: ::std::os::raw::c_int,
+            _is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let url = request.map(url_de).unwrap_or_default();
+            match self.filtre.juge(&url) {
+                Ok(()) => 0,
+                Err(refus) => {
+                    eprintln!(
+                        "onglet {} : page refusée ({}) : {url}",
+                        self.id,
+                        refus.raison()
+                    );
+                    push_event(&self.out, *b"MLBX", self.id, refus as u32, Vec::new());
+                    1
+                }
+            }
+        }
+
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _is_navigation: ::std::os::raw::c_int,
+            _is_download: ::std::os::raw::c_int,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
+        ) -> Option<ResourceRequestHandler> {
+            Some(Entetes::new(self.filtre.clone(), self.restreint))
+        }
+    }
+}
+
+wrap_resource_request_handler! {
+    struct Entetes {
+        filtre: Arc<Filtre>,
+        restreint: Restreint,
+    }
+
+    impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            let Some(req) = request else {
+                return ReturnValue::CONTINUE;
+            };
+            let url = url_de(req);
+            if self.filtre.juge(&url).is_err() {
+                return ReturnValue::CANCEL;
+            }
+            // Mode restreint de YouTube : l'en-tête que Google documente pour les réseaux
+            // encadrés, sur les seuls noms qu'il indique.
+            if let Some(valeur) = self.restreint.entete() {
+                if filtre::hote(&url).is_some_and(|h| filtre::youtube(&h)) {
+                    req.set_header_by_name(
+                        Some(&CefString::from("YouTube-Restrict")),
+                        Some(&CefString::from(valeur)),
+                        1,
+                    );
+                }
+                // SafeSearch : une recherche Google part toujours avec `safe=active`.
+                if filtre::recherche_google(&url) {
+                    if let Some(neuf) = filtre::avec_safe(&url) {
+                        req.set_url(Some(&CefString::from(neuf.as_str())));
+                    }
+                }
+            }
+            ReturnValue::CONTINUE
+        }
+    }
+}
+
+/// L'adresse d'une requête, en texte.
+fn url_de(request: &mut Request) -> String {
+    CefString::from(&request.url()).to_string()
+}
+
 wrap_app! {
-    struct BrowserApp;
+    struct BrowserApp {
+        restreint: Restreint,
+    }
 
     impl App {
         fn on_before_command_line_processing(
@@ -556,6 +684,26 @@ wrap_app! {
                     Some(&CefString::from("autoplay-policy")),
                     Some(&CefString::from("no-user-gesture-required")),
                 );
+                // (v205) Mode restreint de YouTube et SafeSearch aussi par le DNS, la
+                // seconde méthode que Google documente : les noms qu'il indique (et aucun
+                // autre) pointent vers son hôte restreint. Deux barrières valent mieux
+                // qu'une, et celle-ci tient même si une page contourne l'en-tête.
+                if let Some(cible) = self.restreint.hote_dns() {
+                    let mut regles: Vec<String> = filtre::HOTES_YOUTUBE
+                        .iter()
+                        .map(|h| format!("MAP {h} {cible}"))
+                        .collect();
+                    regles.push("MAP www.google.com forcesafesearch.google.com".into());
+                    cl.append_switch_with_value(
+                        Some(&CefString::from("host-resolver-rules")),
+                        Some(&CefString::from(regles.join(",").as_str())),
+                    );
+                    // Le DNS chiffré du navigateur passerait à côté de ces règles.
+                    cl.append_switch_with_value(
+                        Some(&CefString::from("disable-features")),
+                        Some(&CefString::from("DnsOverHttps,DnsOverHttpsUpgrade")),
+                    );
+                }
             }
         }
     }
@@ -569,7 +717,7 @@ struct Tab {
 }
 
 impl Tab {
-    fn open(id: u32, url: &str, opts: &Options, out: &Shared) -> Option<Self> {
+    fn open(id: u32, url: &str, opts: &Options, filtre: &Arc<Filtre>, out: &Shared) -> Option<Self> {
         let painted = Arc::new(AtomicBool::new(false));
         let painter = Painter::new(id, (opts.width, opts.height), out.clone(), painted);
         let console = Console::new(id, out.clone());
@@ -581,6 +729,7 @@ impl Tab {
             Dialogs::new(),
             Files::new(),
             Permissions::new(),
+            Garde::new(id, filtre.clone(), opts.restreint, out.clone()),
         );
         let window_info = WindowInfo::default().set_as_windowless(sys::HWND::default());
         let settings = BrowserSettings {
@@ -742,7 +891,8 @@ fn main() {
     // Version de l'API de CEF dont ce programme a été compilé : avant tout autre appel.
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = args::Args::new();
-    let mut app = BrowserApp::new();
+    let opts = Options::parse();
+    let mut app = BrowserApp::new(opts.restreint);
 
     // Sous-processus de Chromium (rendu, GPU…) : il fait son travail puis s'arrête ici.
     let code = execute_process(
@@ -754,7 +904,6 @@ fn main() {
         std::process::exit(code);
     }
 
-    let opts = Options::parse();
     let mut settings = Settings {
         no_sandbox: 1,
         windowless_rendering_enabled: 1,
@@ -804,6 +953,10 @@ fn main() {
         let _ = tx.send(Cmd::Quit);
     });
 
+    // (v205) Le filtre, partagé par tous les onglets.
+    let (filtre, mot) = Filtre::charge(opts.filtre, opts.listes.as_deref());
+    let filtre = Arc::new(filtre);
+    eprintln!("filtrage des pages : {mot}");
     // Boucle de Chromium sur ce fil (le fil « UI » de CEF) : les commandes y sont jouées.
     let mut tabs: HashMap<u32, Tab> = HashMap::new();
     let left = MouseButtonType::from(sys::cef_mouse_button_type_t::MBT_LEFT);
@@ -812,20 +965,29 @@ fn main() {
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Cmd::Quit => break 'run,
-                Cmd::Open(id, url) => match tabs.get(&id) {
-                    Some(t) => {
-                        if let Some(frame) = t.browser.main_frame() {
-                            frame.load_url(Some(&CefString::from(url.as_str())));
-                        }
+                // (v205) Une adresse refusée n'arrive même pas à Chromium : le jeu le
+                // sait tout de suite, l'onglet ne bouge pas, et un onglet neuf ne s'ouvre
+                // pas du tout.
+                Cmd::Open(id, url) => match filtre.juge(&url) {
+                    Err(refus) => {
+                        eprintln!("onglet {id} : ouverture refusée ({}) : {url}", refus.raison());
+                        push_event(&out, *b"MLBX", id, refus as u32, Vec::new());
                     }
-                    None => {
-                        if let Ok(mut o) = out.0.lock() {
-                            o.fps.insert(id, opts.fps);
+                    Ok(()) => match tabs.get(&id) {
+                        Some(t) => {
+                            if let Some(frame) = t.browser.main_frame() {
+                                frame.load_url(Some(&CefString::from(url.as_str())));
+                            }
                         }
-                        if let Some(t) = Tab::open(id, &url, &opts, &out) {
-                            tabs.insert(id, t);
+                        None => {
+                            if let Ok(mut o) = out.0.lock() {
+                                o.fps.insert(id, opts.fps);
+                            }
+                            if let Some(t) = Tab::open(id, &url, &opts, &filtre, &out) {
+                                tabs.insert(id, t);
+                            }
                         }
-                    }
+                    },
                 },
                 Cmd::Close(id) => {
                     if let Some(t) = tabs.remove(&id) {
