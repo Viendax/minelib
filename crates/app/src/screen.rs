@@ -193,6 +193,34 @@ pub fn save(dir: &Path, screens: &[Placed]) {
 /// Point de l'écran `a` visé par le rayon `eye + t·dir` (0 < t ≤ `limit`) : distance `t`
 /// et coordonnées de l'écran (0..1, origine en haut à gauche). `None` si le rayon passe
 /// à côté, ou arrive par le dos ou la tranche.
+/// (v210) L'adresse d'un état de page (`{"u":…}`).
+fn page_address(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("u")?.as_str().map(|u| u.chars().take(2048).collect())
+}
+
+/// (v210) Part de l'écran visible à l'image (0 à 1), à travers `view_proj` : la part de ses
+/// points (une grille de 9 × 9) qui tombent dans l'image, devant la caméra. Ce qui le cache
+/// (un mur, un joueur) n'est pas compté.
+pub fn visible_part(a: &ScreenAnchor, view_proj: glam::Mat4) -> f32 {
+    const N: usize = 9;
+    let c = Vec3::from(a.center);
+    let r = Vec3::from(a.right) * a.size[0];
+    let u = Vec3::from(a.up) * a.size[1];
+    let mut dedans = 0;
+    for i in 0..N {
+        for j in 0..N {
+            let x = i as f32 / (N - 1) as f32 - 0.5;
+            let y = j as f32 / (N - 1) as f32 - 0.5;
+            let p = view_proj * (c + r * x + u * y).extend(1.0);
+            if p.w > 1e-4 && p.x.abs() <= p.w && p.y.abs() <= p.w {
+                dedans += 1;
+            }
+        }
+    }
+    dedans as f32 / (N * N) as f32
+}
+
 pub fn aim(a: &ScreenAnchor, eye: Vec3, dir: Vec3, limit: f32) -> Option<(f32, [f32; 2])> {
     let c = Vec3::from(a.center);
     let r = Vec3::from(a.right);
@@ -278,8 +306,14 @@ const PAGE_H: u32 = 720;
 /// Page ouverte sur un nouvel écran.
 pub const HOME_URL: &str = "https://www.youtube.com/";
 /// Script qui met en pause les vidéos et les sons d'une page.
-const PAUSE_JS: &str =
-    "(()=>{document.querySelectorAll('video,audio').forEach(m=>{if(!m.paused)m.pause();});})()";
+const PAUSE_JS: &str = "(()=>{document.querySelectorAll('video,audio').forEach(m=>{if(!m.paused)m.pause();});\
+if(window.__mlb)window.__mlb.pauseVideo();})()";
+/// (v210) Lecture automatique permise sur la page du lecteur de l'écran regardé.
+const REGARDE_JS: &str = "(()=>{if(window.__mlb)window.__mlb.regarde();})()";
+/// (v210) Un écran est « regardé » (sa vidéo démarre seule) s'il est visé et visible à
+/// plus de moitié ; l'accord lui est redonné tant qu'il l'est (une page qui se recharge).
+const REGARDE_PART: f32 = 0.5;
+const REGARDE_S: f32 = 1.0;
 /// Durée de l'onde qui montre un appui (secondes).
 const RIPPLE_S: f32 = 0.35;
 /// Durée d'un tour de la barre de progression de la mire (secondes).
@@ -416,6 +450,10 @@ pub struct Displays {
     filtre: &'static str,
     /// Pages refusées depuis le dernier `take_blocked` : (écran, raison).
     blocked: Vec<(u32, u8)>,
+    /// (v210) Écran regardé (lecture automatique permise, un seul à la fois), et temps
+    /// avant de lui redonner l'accord.
+    regarde: Option<u32>,
+    regarde_in: f32,
 }
 
 impl Displays {
@@ -433,6 +471,32 @@ impl Displays {
             volume_in: 0.0,
             filtre: "blanche",
             blocked: Vec::new(),
+            regarde: None,
+            regarde_in: 0.0,
+        }
+    }
+
+    /// (v210) L'écran regardé : visé et visible à plus de moitié (`part`, voir
+    /// [`visible_part`]). Seule la page du lecteur de cet écran-là peut lancer sa vidéo
+    /// d'elle-même ; les autres attendent un clic dans leur lecteur. Les règles du lecteur
+    /// officiel de YouTube : un seul lecteur en lecture automatique à la fois, et seulement
+    /// s'il est visible à plus de moitié.
+    pub fn look(&mut self, aimed: Option<(u32, f32)>, dt: f32) {
+        let id = aimed.filter(|a| a.1 > REGARDE_PART).map(|a| a.0);
+        if id != self.regarde {
+            self.regarde = id;
+            self.regarde_in = 0.0;
+        }
+        let Some(id) = id else {
+            return;
+        };
+        self.regarde_in -= dt;
+        if self.regarde_in > 0.0 {
+            return;
+        }
+        self.regarde_in = REGARDE_S;
+        if self.tabs.get(&id).is_some_and(|t| crate::watch::is_player(&t.addr)) {
+            self.eval(id, REGARDE_JS);
         }
     }
 
@@ -482,7 +546,7 @@ impl Displays {
     /// Donne le volume choisi aux vidéos et aux sons des pages ouvertes.
     fn apply_volume(&mut self) {
         let js = format!(
-            "(()=>{{const v={:.3};document.querySelectorAll('video,audio').forEach(m=>{{if(Math.abs(m.volume-v)>0.001)m.volume=v;}});}})()",
+            "(()=>{{const v={:.3};document.querySelectorAll('video,audio').forEach(m=>{{if(Math.abs(m.volume-v)>0.001)m.volume=v;}});if(window.__mlb)window.__mlb.volume(v);}})()",
             self.volume
         );
         let ids: Vec<u32> = self
@@ -851,7 +915,12 @@ impl Displays {
                     };
                     match ev {
                         Event::Editing(on) => tab.editing = on,
-                        Event::State(s) => self.states.push((id, s)),
+                        Event::State(s) => {
+                            if let Some(u) = page_address(&s) {
+                                tab.addr = u;
+                            }
+                            self.states.push((id, s))
+                        }
                         Event::Scroll(f) => tab.scroll = f,
                         Event::Blocked(raison) => self.blocked.push((id, raison)),
                     }
@@ -916,11 +985,6 @@ pub fn on_search_button(uv: [f32; 2]) -> bool {
     to_button(uv) <= BOUTON.1
 }
 
-/// Le réticule est-il dans la zone du bouton (sa surface et un peu autour) ?
-pub fn near_search_button(uv: [f32; 2]) -> bool {
-    to_button(uv) <= BOUTON.1 * ZONE
-}
-
 /// (v207) Comment le bouton de recherche se montre. Demande du joueur : il n'apparaît
 /// **que si l'on arrive d'un glissement depuis le bord de l'écran**, dans le coin en bas à
 /// gauche, vers le bouton — pas si l'on est déjà sur l'écran et qu'on descend dans le coin.
@@ -978,6 +1042,8 @@ impl Corner {
 struct Tab {
     /// Adresse ouverte (rouverte si le navigateur est relancé).
     url: String,
+    /// (v210) Adresse de la page, telle qu'elle la rapporte.
+    addr: String,
     /// Image affichée (BGRA), de taille `size`.
     pixels: Vec<u8>,
     size: (u32, u32),
@@ -1020,6 +1086,7 @@ impl Tab {
     fn new(url: &str) -> Self {
         let mut t = Self {
             url: url.to_string(),
+            addr: url.to_string(),
             pixels: Vec::new(),
             size: (W, H),
             page: Vec::new(),
@@ -1049,6 +1116,8 @@ impl Tab {
         // (v206) Le bouton de recherche apparaît et disparaît en fondu ; (v207) seulement
         // quand on arrive par le bord de l'écran, dans son coin (voir `Corner`).
         let vers = self.corner.target(self.cursor);
+        // (v210) Rien par-dessus le lecteur officiel de YouTube : pas de bouton.
+        let vers = if crate::watch::is_player(&self.addr) { 0.0 } else { vers };
         let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
         let avant = self.reveal;
         self.reveal = if vers > self.reveal {
@@ -1559,6 +1628,51 @@ fn read_records(mut out: impl std::io::Read, inbox: std::sync::Arc<std::sync::Mu
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn on_sait_quelle_part_de_l_ecran_est_a_l_image() {
+        use glam::Mat4;
+        let a = ScreenAnchor {
+            center: [0.0, 0.0, -4.0],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            size: [2.0, 1.125],
+            reveal: 0.0,
+        };
+        let proj = Mat4::perspective_infinite_reverse_rh(70f32.to_radians(), 16.0 / 9.0, 0.05);
+        let face = proj * Mat4::look_to_rh(Vec3::ZERO, -Vec3::Z, Vec3::Y);
+        assert_eq!(visible_part(&a, face), 1.0);
+        let dos = proj * Mat4::look_to_rh(Vec3::ZERO, Vec3::Z, Vec3::Y);
+        assert_eq!(visible_part(&a, dos), 0.0);
+        // Tout près, décalé : le bord droit de l'image passe au milieu de l'écran (à 1 bloc,
+        // l'image fait 2 × 1,245 de large), donc à peu près sa moitié est à l'image.
+        let pres = ScreenAnchor { center: [0.0, 0.0, -1.0], ..a };
+        let bord = proj * Mat4::look_to_rh(Vec3::new(-1.245, 0.0, 0.0), -Vec3::Z, Vec3::Y);
+        let part = visible_part(&pres, bord);
+        assert!((0.4..0.65).contains(&part), "{part}");
+    }
+
+    #[test]
+    fn la_page_dit_son_adresse() {
+        let u = format!("{}?v=dQw4w9WgXcQ", crate::watch::LECTEUR);
+        let json = format!(r#"{{"u":"{u}","t":1,"p":false,"a":false,"i":"dQw4w9WgXcQ"}}"#);
+        assert_eq!(page_address(&json), Some(u));
+        assert_eq!(page_address("{}"), None);
+        assert_eq!(page_address("pas du json"), None);
+    }
+
+    #[test]
+    fn seul_l_ecran_regarde_a_plus_de_moitie_demarre_seul() {
+        let mut d = Displays::new();
+        d.look(Some((7, 0.4)), 0.1);
+        assert_eq!(d.regarde, None);
+        d.look(Some((7, 0.8)), 0.1);
+        assert_eq!(d.regarde, Some(7));
+        d.look(Some((9, 0.9)), 0.1);
+        assert_eq!(d.regarde, Some(9));
+        d.look(None, 0.1);
+        assert_eq!(d.regarde, None);
+    }
 
     /// (v206) Le bouton de recherche : rond pour de vrai (les pages sont en 16/9), au coin
     /// **en bas à gauche**, et il ne mange pas la page.

@@ -2008,6 +2008,19 @@ impl Session {
             self.screen_aim = look.filter(|a| a.1 <= REACH);
         }
         self.schedule_screens(look.map(|a| ids[a.0]));
+        // (v210) L'écran regardé, et quelle part de lui est à l'image : seul celui-là peut
+        // lancer sa vidéo de lui-même (règles du lecteur officiel de YouTube).
+        let regarde = look.and_then(|(i, _, _)| {
+            let s = self.shown.get(i)?;
+            let (_, view, _) = self.view_camera();
+            let proj = Mat4::perspective_infinite_reverse_rh(
+                self.fov.to_radians(),
+                self.screen_size.0 / self.screen_size.1.max(1.0),
+                0.05,
+            );
+            Some((ids[i], crate::screen::visible_part(&s.0.anchor(), proj * view)))
+        });
+        self.displays.look(regarde, dt);
         let aimed = self.screen_aim.map(|(i, _, uv)| (ids[i], uv));
         let editing = aimed.is_some_and(|a| self.displays.editing(a.0));
         if let Some((id, _)) = aimed {

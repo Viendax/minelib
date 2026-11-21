@@ -196,6 +196,10 @@ impl Filtre {
         if hote.is_empty() || !hote.contains('.') || adresse_chiffree(&hote) {
             return Err(Refus::Privee);
         }
+        // (v210) La page du lecteur, que le navigateur sert lui-même.
+        if est_lecteur(url) {
+            return Ok(());
+        }
         if self.sans_compte && connexion(&hote) {
             return Err(Refus::Compte);
         }
@@ -367,6 +371,88 @@ pub const HOTES_YOUTUBE: &[&str] = &[
 ];
 
 /// Faut-il mettre l'en-tête `YouTube-Restrict` sur une requête vers cet hôte ?
+/// (v210) La page du lecteur officiel de YouTube sur les écrans (`lecteur.html`), servie
+/// par le navigateur lui-même à cette adresse — jamais demandée au réseau. C'est l'identité
+/// du jeu (le compte GitHub de son auteur) : YouTube la reçoit comme origine du lecteur.
+pub const LECTEUR: &str = "https://viendax.github.io/minelib/lecteur";
+
+/// L'adresse est-elle celle de la page du lecteur ?
+pub fn est_lecteur(url: &str) -> bool {
+    url.strip_prefix(LECTEUR)
+        .is_some_and(|r| r.is_empty() || r.starts_with('?') || r.starts_with('#'))
+}
+
+/// (v210) Une vidéo du site YouTube (`/watch?v=…`, `/shorts/…`, `/live/…`, `youtu.be/…`) :
+/// la page du lecteur qui la joue, au même temps. Le site complet ne sert qu'à chercher.
+pub fn vers_lecteur(url: &str) -> Option<String> {
+    let reste = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let reste = reste.split('#').next()?;
+    let (hote, chemin) = reste.split_once('/').unwrap_or((reste, ""));
+    let (chemin, requete) = chemin.split_once('?').unwrap_or((chemin, ""));
+    let parametre = |nom: &str| {
+        requete
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(nom).and_then(|v| v.strip_prefix('=')))
+    };
+    let id = match hote.to_ascii_lowercase().as_str() {
+        "youtu.be" | "www.youtu.be" => chemin.split('/').next()?,
+        "www.youtube.com" | "youtube.com" | "m.youtube.com" => {
+            if chemin == "watch" {
+                parametre("v")?
+            } else {
+                ["shorts/", "live/"]
+                    .iter()
+                    .find_map(|p| chemin.strip_prefix(p))?
+                    .split('/')
+                    .next()?
+            }
+        }
+        _ => return None,
+    };
+    let ok = id.len() == 11
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !ok {
+        return None;
+    }
+    let t = parametre("t").or_else(|| parametre("start")).map_or(0, secondes);
+    Some(if t > 0 {
+        format!("{LECTEUR}?v={id}&t={t}")
+    } else {
+        format!("{LECTEUR}?v={id}")
+    })
+}
+
+/// `90`, `90s`, `1m30s`, `1h2m3s` : en secondes (0 si illisible).
+fn secondes(t: &str) -> u32 {
+    let mut total: u32 = 0;
+    let mut n: u32 = 0;
+    let mut chiffres = false;
+    for c in t.chars() {
+        match c {
+            '0'..='9' => {
+                n = n.saturating_mul(10).saturating_add(c as u32 - '0' as u32);
+                chiffres = true;
+            }
+            'h' | 'm' | 's' if chiffres => {
+                let k = match c {
+                    'h' => 3600,
+                    'm' => 60,
+                    _ => 1,
+                };
+                total = total.saturating_add(n.saturating_mul(k));
+                n = 0;
+                chiffres = false;
+            }
+            _ => return 0,
+        }
+    }
+    total.saturating_add(n).min(360_000)
+}
+
 pub fn youtube(hote: &str) -> bool {
     HOTES_YOUTUBE.iter().any(|h| *h == hote)
         || hote == "youtube.com"
@@ -451,6 +537,44 @@ mod tests {
         ] {
             assert_eq!(f.juge(non), Err(Refus::HorsBlanche), "{non}");
         }
+    }
+
+    #[test]
+    fn une_video_du_site_s_ouvre_dans_le_lecteur() {
+        let l = |id: &str| format!("{LECTEUR}?v={id}");
+        let x = "dQw4w9WgXcQ";
+        assert_eq!(vers_lecteur(&format!("https://www.youtube.com/watch?v={x}")), Some(l(x)));
+        assert_eq!(
+            vers_lecteur(&format!("https://www.youtube.com/watch?list=PL1&v={x}&t=1m30s")),
+            Some(format!("{}&t=90", l(x)))
+        );
+        assert_eq!(vers_lecteur(&format!("https://m.youtube.com/shorts/{x}")), Some(l(x)));
+        assert_eq!(vers_lecteur(&format!("https://youtu.be/{x}?t=42")), Some(format!("{}&t=42", l(x))));
+        assert_eq!(vers_lecteur(&format!("https://www.youtube.com/live/{x}")), Some(l(x)));
+        // La recherche, l'accueil, une chaîne et le lecteur embarqué restent où ils sont.
+        for reste in [
+            "https://www.youtube.com/",
+            "https://www.youtube.com/results?search_query=chat",
+            "https://www.youtube.com/@chaine",
+            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=court",
+            "https://www.youtube.com.mechant.example/watch?v=dQw4w9WgXcQ",
+        ] {
+            assert_eq!(vers_lecteur(reste), None, "{reste}");
+        }
+        assert_eq!(secondes("abc"), 0);
+        assert_eq!(secondes("1h2m3s"), 3723);
+    }
+
+    #[test]
+    fn la_page_du_lecteur_s_ouvre_partout_mais_pas_le_reste_du_domaine() {
+        let f = blanche().sans_compte();
+        assert_eq!(f.juge(&format!("{LECTEUR}?v=dQw4w9WgXcQ")), Ok(()));
+        assert!(est_lecteur(LECTEUR));
+        assert!(!est_lecteur(&format!("{LECTEUR}-faux")));
+        assert_eq!(f.juge("https://viendax.github.io/autre"), Err(Refus::HorsBlanche));
+        assert_eq!(f.juge(&format!("{LECTEUR}-faux")), Err(Refus::HorsBlanche));
     }
 
     #[test]

@@ -71,7 +71,21 @@ const deep=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot
 let f=null;const focus=()=>{const v=ed(deep())?1:0;if(v!==f){f=v;console.log('__minelib_focus__'+v);}};
 document.addEventListener('focusin',focus,true);
 document.addEventListener('focusout',()=>setTimeout(focus,0),true);
-let s='';setInterval(()=>{focus();const mp=document.getElementById('movie_player');
+const L='https://viendax.github.io/minelib/lecteur';
+const vid=u=>{try{const x=new URL(u,location.href);const h=x.hostname.toLowerCase();let i='';
+if(h==='youtu.be')i=x.pathname.split('/')[1]||'';
+else if(h==='www.youtube.com'||h==='youtube.com'||h==='m.youtube.com'){
+if(x.pathname==='/watch')i=x.searchParams.get('v')||'';
+else{const m=x.pathname.match(/^\/(shorts|live)\/([^\/?#]+)/);if(m)i=m[2];}}
+if(!/^[A-Za-z0-9_-]{11}$/.test(i))return '';
+const t=parseInt(x.searchParams.get('t')||x.searchParams.get('start')||'0',10)||0;
+return L+'?v='+i+(t>0?'&t='+t:'');}catch(e){return '';}};
+if(/(^|\.)youtube\.com$/.test(location.hostname)){
+const go=(u,r)=>{const l=vid(u);if(l){if(r)location.replace(l);else location.href=l;return true;}return false;};
+document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagName==='A'&&x.href);
+if(a&&vid(a.href)){e.preventDefault();e.stopImmediatePropagation();go(a.href,false);}},true);
+setInterval(()=>go(location.href,true),250);go(location.href,true);}
+let s='';setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById('movie_player');
 const v=(mp&&mp.querySelector('video'))||document.querySelector('video');
 let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
 const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing'),i:i});
@@ -81,6 +95,7 @@ if(st!==s){s=st;console.log('__minelib_state__'+st);}},500);})();"#;
 /// sous la souris, vers le haut (1) et vers le bas (2) (`__minelib_scroll__<0..3>`), pour
 /// que la molette n'aille à l'écran que si elle y sert.
 const SCROLL_JS: &str = r#"(()=>{if(window.__minelib_scroll)return;window.__minelib_scroll=1;
+if(window.__mlb_lecteur){console.log('__minelib_scroll__0');return;}
 let mx=-1,my=-1,w=-1;
 const sf=()=>{let f=0;const d=document.scrollingElement||document.documentElement;
 if(d){if(d.scrollTop>0)f|=1;if(d.scrollTop+window.innerHeight<d.scrollHeight-1)f|=2;}
@@ -96,6 +111,24 @@ const sr=()=>{const v=sf();if(v!==w){w=v;console.log('__minelib_scroll__'+v);}};
 document.addEventListener('mousemove',ev=>{mx=ev.clientX;my=ev.clientY;sr();},true);
 document.addEventListener('scroll',()=>setTimeout(sr,0),true);
 setInterval(sr,500);sr();})();"#;
+
+/// (v210) Injecté dans le cadre du lecteur officiel (`youtube-nocookie.com/embed`) : dit
+/// seulement si une publicité y joue (`__minelib_pub__0|1`), pour que la vidéo partagée ne
+/// soit ni lue ni corrigée pendant ce temps. Il lit, il ne touche à rien.
+const PUB_JS: &str = r#"(()=>{if(window.__minelib_pub)return;window.__minelib_pub=1;let x=-1;
+setInterval(()=>{const a=document.querySelector('.ad-showing')?1:0;
+if(a!==x){x=a;console.log('__minelib_pub__'+a);}},400);})();"#;
+
+/// (v210) La page du lecteur des écrans, servie par le navigateur à `filtre::LECTEUR`.
+const LECTEUR_HTML: &str = include_str!("lecteur.html");
+
+/// Le cadre du lecteur officiel (où injecter `PUB_JS`).
+fn cadre_du_lecteur(url: &str) -> bool {
+    filtre::hote(url).is_some_and(|h| h == "www.youtube-nocookie.com" || h == "www.youtube.com")
+        && url.split_once("://").is_some_and(|(_, r)| {
+            r.split_once('/').is_some_and(|(_, chemin)| chemin.starts_with("embed/"))
+        })
+}
 
 /// Le champ de texte qui a le focus le perd.
 const BLUR_JS: &str = "(()=>{let a=document.activeElement;\
@@ -309,6 +342,8 @@ wrap_display_handler! {
     struct Console {
         id: u32,
         out: Shared,
+        // (v210) Une pub joue dans le lecteur officiel de la page.
+        pub_: Arc<AtomicBool>,
     }
 
     impl DisplayHandler {
@@ -329,8 +364,17 @@ wrap_display_handler! {
                 let flags = v.trim().parse::<u32>().unwrap_or(0) & 3;
                 push_event(&self.out, *b"MLBW", self.id, flags, Vec::new());
                 1
+            } else if let Some(v) = text.strip_prefix("__minelib_pub__") {
+                self.pub_.store(v.trim() == "1", Ordering::Relaxed);
+                1
             } else if let Some(state) = text.strip_prefix("__minelib_state__") {
-                let data = state.as_bytes().to_vec();
+                // (v210) Une pub dans le cadre du lecteur : la page le dit au jeu.
+                let state = if self.pub_.load(Ordering::Relaxed) {
+                    state.replace("\"a\":false", "\"a\":true")
+                } else {
+                    state.to_string()
+                };
+                let data = state.into_bytes();
                 push_event(&self.out, *b"MLBS", self.id, data.len() as u32, data);
                 1
             } else {
@@ -376,7 +420,12 @@ wrap_load_handler! {
             _http_status_code: ::std::os::raw::c_int,
         ) {
             if let Some(frame) = frame {
-                if frame.is_main() != 0 {
+                if frame.is_main() == 0 {
+                    let url = CefString::from(&frame.url()).to_string();
+                    if cadre_du_lecteur(&url) {
+                        frame.execute_java_script(Some(&CefString::from(PUB_JS)), None, 0);
+                    }
+                } else {
                     frame.execute_java_script(Some(&CefString::from(PAGE_JS)), None, 0);
                     if self.scroll {
                         frame.execute_java_script(Some(&CefString::from(SCROLL_JS)), None, 0);
@@ -589,7 +638,7 @@ wrap_request_handler! {
         fn on_before_browse(
             &self,
             _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            frame: Option<&mut Frame>,
             request: Option<&mut Request>,
             _user_gesture: ::std::os::raw::c_int,
             _is_redirect: ::std::os::raw::c_int,
@@ -603,7 +652,11 @@ wrap_request_handler! {
                         self.id,
                         refus.raison()
                     );
-                    push_event(&self.out, *b"MLBX", self.id, refus as u32, Vec::new());
+                    // (v210) Seulement ce que le joueur voit : une page refusée dans un cadre
+                    // caché (la vérification de connexion de YouTube) ne lui dit rien.
+                    if frame.is_some_and(|f| f.is_main() != 0) {
+                        push_event(&self.out, *b"MLBX", self.id, refus as u32, Vec::new());
+                    }
                     1
                 }
             }
@@ -645,6 +698,13 @@ wrap_resource_request_handler! {
             if self.filtre.juge(&url).is_err() {
                 return ReturnValue::CANCEL;
             }
+            // (v210) Une vidéo du site YouTube ouverte dans l'onglet : le lecteur officiel.
+            if req.resource_type() == ResourceType::MAIN_FRAME {
+                if let Some(lecteur) = filtre::vers_lecteur(&url) {
+                    req.set_url(Some(&CefString::from(lecteur.as_str())));
+                    return ReturnValue::CONTINUE;
+                }
+            }
             // Mode restreint de YouTube : l'en-tête que Google documente pour les réseaux
             // encadrés, sur les seuls noms qu'il indique.
             if let Some(valeur) = self.restreint.entete() {
@@ -663,6 +723,83 @@ wrap_resource_request_handler! {
                 }
             }
             ReturnValue::CONTINUE
+        }
+
+        fn resource_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+        ) -> Option<ResourceHandler> {
+            let url = request.map(url_de)?;
+            filtre::est_lecteur(&url).then(|| PageLecteur::new(Arc::new(Mutex::new(0))))
+        }
+    }
+}
+
+wrap_resource_handler! {
+    // (v210) La page du lecteur, servie sans réseau.
+    struct PageLecteur {
+        lu: Arc<Mutex<usize>>,
+    }
+
+    impl ResourceHandler {
+        fn open(
+            &self,
+            _request: Option<&mut Request>,
+            handle_request: Option<&mut ::std::os::raw::c_int>,
+            _callback: Option<&mut Callback>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(h) = handle_request {
+                *h = 1;
+            }
+            1
+        }
+
+        fn response_headers(
+            &self,
+            response: Option<&mut Response>,
+            response_length: Option<&mut i64>,
+            _redirect_url: Option<&mut CefString>,
+        ) {
+            if let Some(r) = response {
+                r.set_status(200);
+                r.set_mime_type(Some(&CefString::from("text/html")));
+                r.set_charset(Some(&CefString::from("utf-8")));
+                r.set_header_by_name(
+                    Some(&CefString::from("Cache-Control")),
+                    Some(&CefString::from("no-store")),
+                    1,
+                );
+            }
+            if let Some(n) = response_length {
+                *n = LECTEUR_HTML.len() as i64;
+            }
+        }
+
+        fn read(
+            &self,
+            data_out: *mut u8,
+            bytes_to_read: ::std::os::raw::c_int,
+            bytes_read: Option<&mut ::std::os::raw::c_int>,
+            _callback: Option<&mut ResourceReadCallback>,
+        ) -> ::std::os::raw::c_int {
+            let page = LECTEUR_HTML.as_bytes();
+            let mut lu = self.lu.lock().unwrap_or_else(|e| e.into_inner());
+            let n = (page.len() - *lu).min(bytes_to_read.max(0) as usize);
+            if n == 0 || data_out.is_null() {
+                if let Some(b) = bytes_read {
+                    *b = 0;
+                }
+                return 0;
+            }
+            // SAFETY : CEF fournit `bytes_to_read` octets à écrire en `data_out`.
+            unsafe { std::ptr::copy_nonoverlapping(page[*lu..].as_ptr(), data_out, n) };
+            *lu += n;
+            if let Some(b) = bytes_read {
+                *b = n as i32;
+            }
+            1
         }
     }
 }
@@ -725,7 +862,7 @@ impl Tab {
     fn open(id: u32, url: &str, opts: &Options, filtre: &Arc<Filtre>, out: &Shared) -> Option<Self> {
         let painted = Arc::new(AtomicBool::new(false));
         let painter = Painter::new(id, (opts.width, opts.height), out.clone(), painted);
-        let console = Console::new(id, out.clone());
+        let console = Console::new(id, out.clone(), Arc::new(AtomicBool::new(false)));
         let mut client = TabClient::new(
             painter,
             console,

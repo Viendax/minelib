@@ -642,8 +642,13 @@ pub fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// (v210) La page du lecteur officiel de YouTube sur les écrans, servie par le navigateur
+/// du jeu (`crates/browser/src/lecteur.html`, même adresse que `filtre::LECTEUR`). Le site
+/// complet de YouTube ne sert plus qu'à chercher : ses vidéos s'ouvrent là.
+pub const LECTEUR: &str = "https://viendax.github.io/minelib/lecteur";
+
 /// Vidéo YouTube d'une adresse (`youtube.com/watch?v=…`, `/shorts/…`, `/embed/…`,
-/// `/live/…`, `youtu.be/…`), s'il y en a une.
+/// `/live/…`, `youtu.be/…`, et la page du lecteur), s'il y en a une.
 pub fn video_of(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
@@ -652,6 +657,9 @@ pub fn video_of(url: &str) -> Option<String> {
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let id = match host.to_ascii_lowercase().as_str() {
+        "viendax.github.io" if path == "minelib/lecteur" => {
+            query.split('&').find_map(|kv| kv.strip_prefix("v="))?
+        }
         "youtu.be" => path.split('/').next()?,
         "www.youtube.com" | "youtube.com" | "m.youtube.com" => {
             if path == "watch" {
@@ -668,13 +676,20 @@ pub fn video_of(url: &str) -> Option<String> {
     valid_id(id).then(|| id.to_string())
 }
 
-/// Adresse qui ouvre la vidéo `id` au temps `t`.
+/// Adresse qui ouvre la vidéo `id` au temps `t` : (v210) la page du lecteur.
 pub fn watch_url(id: &str, t: f32) -> String {
-    format!("https://www.youtube.com/watch?v={id}&t={}s", t.max(0.0) as u32)
+    format!("{LECTEUR}?v={id}&t={}", t.max(0.0) as u32)
+}
+
+/// (v210) L'adresse est-elle la page du lecteur ?
+pub fn is_player(url: &str) -> bool {
+    url.strip_prefix(LECTEUR)
+        .is_some_and(|r| r.is_empty() || r.starts_with('?') || r.starts_with('#'))
 }
 
 /// Script qui met la vidéo de la page au temps `seek` (s'il y en a un) et en pause ou en
-/// lecture (lecteur de YouTube, sinon la balise vidéo).
+/// lecture (v210 : la page du lecteur, qui ne lance la lecture que si elle en a le droit ;
+/// sinon le lecteur du site de YouTube, ou la balise vidéo).
 pub fn control_js(seek: Option<f32>, paused: bool) -> String {
     let seek = seek.map_or(String::new(), |t| {
         format!("if(p&&p.seekTo)p.seekTo({t:.1},true);else if(v)v.currentTime={t:.1};")
@@ -685,8 +700,8 @@ pub fn control_js(seek: Option<f32>, paused: bool) -> String {
         "if(p&&p.playVideo)p.playVideo();else if(v)v.play();"
     };
     format!(
-        "(()=>{{const p=document.getElementById('movie_player');\
-         const v=(p&&p.querySelector('video'))||document.querySelector('video');{seek}{play}}})()"
+        "(()=>{{const p=window.__mlb||document.getElementById('movie_player');\
+         const v=(p&&p.querySelector&&p.querySelector('video'))||document.querySelector('video');{seek}{play}}})()"
     )
 }
 
@@ -746,7 +761,10 @@ mod tests {
         assert_eq!(ok("https://evil.example/watch?v=dQw4w9WgXcQ"), None);
         assert_eq!(ok("https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ"), None);
         assert_eq!(ok("https://www.youtube.com/watch?v=dQw4w9WgXc<"), None);
-        assert_eq!(watch_url(X, 61.9), format!("https://www.youtube.com/watch?v={X}&t=61s"));
+        assert_eq!(watch_url(X, 61.9), format!("{LECTEUR}?v={X}&t=61"));
+        assert_eq!(ok(&watch_url(X, 61.9)), Some(X.into()));
+        assert!(is_player(&watch_url(X, 0.0)) && !is_player("https://viendax.github.io/"));
+        assert_eq!(ok("https://viendax.github.io/minelib/autre?v=dQw4w9WgXcQ"), None);
     }
 
     #[test]
@@ -783,6 +801,7 @@ mod tests {
         let js = control_js(None, false);
         assert!(!js.contains("seekTo") && js.contains("playVideo"));
         assert!(!js.contains('\n'));
+        assert!(js.contains("window.__mlb||"));
     }
 
     /// Une page de navigateur simulée : ouvre les vidéos, avance, obéit aux scripts.

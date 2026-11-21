@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>minelib — lecteur YouTube</title>
+<!--
+  (v210) La page du lecteur des écrans de minelib : le lecteur officiel de YouTube
+  (API IFrame, www.youtube-nocookie.com), un seul cadre, rien par-dessus. Le navigateur du
+  jeu la sert lui-même à l'adresse https://viendax.github.io/minelib/lecteur : c'est
+  l'identité du jeu (le compte GitHub de son auteur), envoyée à YouTube comme origine.
+
+  Lecture automatique : seulement quand le jeu le permet (`__mlb.regarde()`, l'écran
+  regardé, à plus de moitié visible, un seul à la fois), sinon sur un clic dans le lecteur.
+  Tant qu'elle attend, la page se dit « en pub » au jeu : rien n'est lu ni corrigé.
+-->
+<style>
+html,body{margin:0;height:100%;background:#0f0f0f;color:#f1f1f1;
+  font:16px "Segoe UI",Roboto,Arial,sans-serif;overflow:hidden}
+#barre{position:absolute;top:0;left:0;right:0;height:48px;display:flex;
+  align-items:center;gap:14px;padding:0 14px;box-sizing:border-box}
+#retour{background:#272727;color:#f1f1f1;border:0;border-radius:18px;height:34px;
+  padding:0 16px;font:inherit;cursor:pointer;white-space:nowrap}
+#retour:hover{background:#3f3f3f}
+#titre{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#aaa}
+#cadre{position:absolute;top:48px;left:0;right:0;bottom:0}
+#cadre iframe{width:100%;height:100%;border:0;display:block}
+#mot{position:absolute;top:48px;left:0;right:0;bottom:0;display:none;
+  align-items:center;justify-content:center;text-align:center;padding:60px;
+  box-sizing:border-box;font-size:22px;line-height:1.5;color:#ccc}
+</style>
+</head>
+<body>
+<div id="barre"><button id="retour">&larr; Rechercher une vidéo</button><div id="titre"></div></div>
+<div id="cadre"><div id="lecteur"></div></div>
+<div id="mot"></div>
+<script>
+(()=>{
+window.__mlb_lecteur=1;
+const ok=s=>/^[A-Za-z0-9_-]{11}$/.test(s||'');
+const q=new URLSearchParams(location.search);
+let id=ok(q.get('v'))?q.get('v'):'';
+const debut=Math.max(0,Math.min(360000,parseInt(q.get('t')||'0',10)||0));
+const ACCUEIL='https://www.youtube.com/';
+let P=null,pret=false,permis=false,voulu=true,erreur=false,vol=-1,cherche=null;
+let s=-1,dernier=-2,depuis=0,etat='';
+document.getElementById('retour').onclick=()=>{
+  if(history.length>1)history.back();else location.href=ACCUEIL;};
+const mot=t=>{document.getElementById('cadre').style.display='none';
+  const m=document.getElementById('mot');m.textContent=t;m.style.display='flex';};
+// Commandes du jeu (regarder ensemble, volume, pause de tous les écrans). Lancer la
+// lecture n'est permis qu'après un clic dans le lecteur ou l'accord du jeu.
+window.__mlb={
+  seekTo:t=>{if(P&&pret)P.seekTo(t,true);else cherche=t;},
+  playVideo:()=>{voulu=true;if(P&&pret&&permis)P.playVideo();},
+  pauseVideo:()=>{voulu=false;if(P&&pret)P.pauseVideo();},
+  regarde:()=>{if(permis)return;permis=true;if(P&&pret&&voulu)P.playVideo();},
+  volume:v=>{vol=Math.round(Math.max(0,Math.min(1,v))*100);if(P&&pret)P.setVolume(vol);},
+};
+if(!id){mot("Pas de vidéo à lire.");return;}
+window.onYouTubeIframeAPIReady=()=>{
+  P=new YT.Player('lecteur',{
+    host:'https://www.youtube-nocookie.com',
+    videoId:id,
+    width:'100%',height:'100%',
+    playerVars:{autoplay:0,start:debut,playsinline:1,rel:0,enablejsapi:1,
+      origin:location.origin,widget_referrer:location.href},
+    events:{
+      onReady:()=>{pret=true;
+        if(vol>=0)P.setVolume(vol);
+        if(cherche!==null){P.seekTo(cherche,true);cherche=null;}
+        if(permis&&voulu)P.playVideo();},
+      onStateChange:e=>{
+        // Lecture sans notre accord : c'est un clic dans le lecteur.
+        if(e.data===1&&!permis)permis=true;
+        try{const d=P.getVideoData();
+          if(d&&d.title)document.getElementById('titre').textContent=d.title;
+          if(d&&ok(d.video_id)&&d.video_id!==id){id=d.video_id;
+            history.replaceState(null,'',location.pathname+'?v='+id);}}catch(_){}
+      },
+      onError:e=>{erreur=true;
+        mot(e.data===101||e.data===150||e.data===153
+          ?"L'auteur de cette vidéo ne permet pas de la lire en dehors de YouTube."
+          :"Cette vidéo ne peut pas être lue (introuvable, privée ou retirée).");},
+    }});
+};
+const api=document.createElement('script');
+api.src='https://www.youtube.com/iframe_api';
+document.head.appendChild(api);
+// État pour le jeu, comme les autres pages : adresse, temps, pause, « pub », vidéo.
+setInterval(()=>{
+  let t=-1,p=true,i=id;
+  if(P&&pret&&!erreur){
+    try{t=Math.round(P.getCurrentTime()*10)/10;s=P.getPlayerState();p=s!==1&&s!==3;
+      const d=P.getVideoData();if(d&&ok(d.video_id))i=d.video_id;}catch(_){t=-1;}
+  }
+  // En lecture, un temps qui n'avance plus : une pub (ou un arrêt) joue à la place.
+  const now=performance.now();
+  if(s!==1||t!==dernier){dernier=t;depuis=now;}
+  const fige=s===1&&now-depuis>1200;
+  const a=!permis||fige;
+  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i});
+  if(st!==etat){etat=st;console.log('__minelib_state__'+st);}
+},500);
+})();
+</script>
+</body>
+</html>
