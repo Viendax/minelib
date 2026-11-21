@@ -23,12 +23,15 @@ struct Globals {
 struct VIn {
     @location(0) pos: vec3<f32>,
     @location(1) uv: vec2<f32>,
+    // (v206) Apparition du bouton de recherche, de 0 à 1 (voir `screen.rs` côté jeu).
+    @location(2) reveal: f32,
 };
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) world: vec3<f32>,
+    @location(2) @interpolate(flat) reveal: f32,
 };
 
 @vertex
@@ -37,6 +40,7 @@ fn vs_main(v: VIn) -> VOut {
     o.clip = g.view_proj * vec4<f32>(v.pos, 1.0);
     o.uv = v.uv;
     o.world = v.pos;
+    o.reveal = v.reveal;
     return o;
 }
 
@@ -52,9 +56,10 @@ fn texel(i: VOut) -> vec4<f32> {
 // Les pages des écrans font 1280 × 720 : une longueur donnée en `u` vaut 16/9 de la même
 // en `v`, c'est ce qui rend le rond rond.
 const BTN_ASPECT = 16.0 / 9.0;
-const BTN_C = vec2<f32>(0.030, 0.053);
+// En bas à gauche (v206) : il ne se montre que quand le réticule arrive dans ce coin.
+const BTN_C = vec2<f32>(0.030, 0.947);
 const BTN_R = 0.022;
-const LOUPE_C = vec2<f32>(0.0265, 0.0455);
+const LOUPE_C = vec2<f32>(0.0265, 0.9395);
 const LOUPE_R = 0.0092;
 const TRAIT = 0.0026;
 
@@ -70,7 +75,10 @@ fn btn_space(uv: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(uv.x, uv.y / BTN_ASPECT);
 }
 
-fn search_button(uv: vec2<f32>, dessous: vec3<f32>) -> vec3<f32> {
+fn search_button(uv: vec2<f32>, reveal: f32, dessous: vec3<f32>) -> vec3<f32> {
+    if reveal <= 0.001 {
+        return dessous;
+    }
     let p = btn_space(uv);
     let c = btn_space(BTN_C);
     let lc = btn_space(LOUPE_C);
@@ -88,14 +96,15 @@ fn search_button(uv: vec2<f32>, dessous: vec3<f32>) -> vec3<f32> {
     let d_manche = dist_seg(p, a, b) - TRAIT * 0.55;
     let d_loupe = min(d_anneau, d_manche);
     let loupe = 1.0 - smoothstep(-aa, aa, d_loupe);
-    // Gris foncé, et la loupe presque blanche par-dessus.
-    let fond = mix(dessous, vec3<f32>(0.11, 0.115, 0.125), rond * 0.93);
-    return mix(fond, vec3<f32>(0.92, 0.93, 0.95), loupe * rond);
+    // Gris foncé, et la loupe presque blanche par-dessus. Le tout apparaît et disparaît
+    // en fondu avec `reveal`.
+    let fond = mix(dessous, vec3<f32>(0.11, 0.115, 0.125), rond * 0.93 * reveal);
+    return mix(fond, vec3<f32>(0.92, 0.93, 0.95), loupe * rond * reveal);
 }
 
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(search_button(i.uv, texel(i).rgb), 1.0);
+    return vec4<f32>(search_button(i.uv, i.reveal, texel(i).rgb), 1.0);
 }
 
 struct TaaOut {
@@ -120,7 +129,11 @@ fn fs_taa_world(i: VOut) -> TaaOut {
     let off = (jit.xy / jit.w - cur.xy / cur.w) * vec2<f32>(0.5, -0.5) * g.screen.xy;
     let uv = i.uv + dpdx(i.uv) * off.x + dpdy(i.uv) * off.y;
     o.color = vec4<f32>(
-        search_button(i.uv, textureSampleLevel(vid, vid_s, uv, 0.0).rgb),
+        search_button(
+            i.uv,
+            i.reveal,
+            textureSampleLevel(vid, vid_s, uv, 0.0).rgb,
+        ),
         1.0,
     );
     o.motion = NO_HISTORY;

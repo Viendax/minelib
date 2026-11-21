@@ -105,6 +105,8 @@ impl Placed {
             right: right.into(),
             up: up.into(),
             size: [width, height],
+            // Le bouton de recherche : mis par la session, qui sait où est le réticule.
+            reveal: 0.0,
         }
     }
 
@@ -446,6 +448,19 @@ impl Displays {
         for tab in self.tabs.values_mut() {
             tab.opened = false;
         }
+    }
+
+    /// (v206) Apparition du bouton de recherche de cet écran (0 à 1) : le rendu la passe
+    /// au shader, et un clic ne compte comme un clic sur le bouton qu'au-delà de
+    /// `CLIQUABLE`.
+    pub fn reveal(&self, id: u32) -> f32 {
+        self.tabs.get(&id).map_or(0.0, |t| t.reveal)
+    }
+
+    /// Un clic à cet endroit de cet écran est-il un clic sur le bouton de recherche ?
+    /// (Invisible ou presque, il laisse le clic à la page.)
+    pub fn search_clicked(&self, id: u32, uv: [f32; 2]) -> bool {
+        self.reveal(id) >= CLIQUABLE && on_search_button(uv)
     }
 
     /// Les pages refusées depuis la dernière fois : (écran, raison) — voir `filtre::Refus`
@@ -857,20 +872,44 @@ impl Displays {
     }
 }
 
-/// (v205) Le bouton de recherche en haut à gauche d'un écran : mêmes mesures que ce que
-/// dessine `screen.wgsl` (`BTN_C`, `BTN_R`), et les pages font 1280 × 720, donc une
+/// (v206) Le bouton de recherche, **en bas à gauche** d'un écran : mêmes mesures que ce
+/// que dessine `screen.wgsl` (`BTN_C`, `BTN_R`), et les pages font 1280 × 720, donc une
 /// longueur en `u` vaut 16/9 de la même en `v`.
-const BOUTON: ([f32; 2], f32) = ([0.030, 0.053], 0.022);
+const BOUTON: ([f32; 2], f32) = ([0.030, 0.947], 0.022);
+
+/// Autour du bouton, de quoi le faire apparaître : sa surface et un peu plus (le coin en
+/// bas à gauche de l'écran est dedans). Ailleurs sur l'écran, il s'en va.
+const ZONE: f32 = 2.3;
+
+/// Temps pour apparaître et pour disparaître (secondes) : un glissement lent suffit, et
+/// un passage rapide dans le coin ne le fait pas clignoter.
+const PARAIT: f32 = 0.14;
+const SEN_VA: f32 = 0.28;
+
+/// En dessous de ça, le bouton est trop peu visible pour prendre le clic : il part à la
+/// page, comme n'importe quel autre endroit de l'écran.
+const CLIQUABLE: f32 = 0.35;
 
 /// L'adresse où mène le bouton (SafeSearch est imposé par le navigateur).
 pub const RECHERCHE: &str = "https://www.google.com/";
 
-/// Le clic est-il sur le bouton de recherche ?
-pub fn on_search_button(uv: [f32; 2]) -> bool {
-    let (c, r) = BOUTON;
+/// Distance au centre du bouton, en mesures de la largeur (le 16/9 des pages est enlevé,
+/// donc un rond est rond).
+fn to_button(uv: [f32; 2]) -> f32 {
+    let (c, _) = BOUTON;
     let dx = uv[0] - c[0];
     let dy = (uv[1] - c[1]) * 9.0 / 16.0;
-    dx * dx + dy * dy <= r * r
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Le clic est-il sur le bouton de recherche ?
+pub fn on_search_button(uv: [f32; 2]) -> bool {
+    to_button(uv) <= BOUTON.1
+}
+
+/// Le réticule est-il assez près du bouton pour le faire apparaître ?
+pub fn near_search_button(uv: [f32; 2]) -> bool {
+    to_button(uv) <= BOUTON.1 * ZONE
 }
 
 /// Ce qu'affiche un écran.
@@ -898,6 +937,9 @@ struct Tab {
     loading: bool,
     /// La page peut défiler sous le curseur : vers le haut (1), vers le bas (2).
     scroll: u8,
+    /// (v206) Apparition du bouton de recherche, de 0 à 1 : elle monte quand le réticule
+    /// est dans le coin en bas à gauche, autour du bouton, et redescend sinon.
+    reveal: f32,
     /// Page voulue ouverte (sinon en veille : dernière image assombrie) et images par
     /// seconde voulues (voir `Displays::schedule`) ; page ouverte dans le navigateur et
     /// images par seconde qui lui ont été demandées.
@@ -927,6 +969,7 @@ impl Tab {
             editing: false,
             loading: false,
             scroll: 0,
+            reveal: 0.0,
             want_awake: true,
             want_fps: FPS_DEFAULT,
             opened: false,
@@ -939,6 +982,21 @@ impl Tab {
     }
 
     fn update(&mut self, dt: f32) {
+        // (v206) Le bouton de recherche apparaît et disparaît en fondu.
+        let vers = f32::from(
+            self.cursor
+                .is_some_and(near_search_button),
+        );
+        let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
+        let avant = self.reveal;
+        self.reveal = if vers > self.reveal {
+            (self.reveal + pas).min(vers)
+        } else {
+            (self.reveal - pas).max(vers)
+        };
+        if (self.reveal - avant).abs() > 1e-4 {
+            self.dirty = true;
+        }
         if let Some((_, age)) = &mut self.ripple {
             *age += dt;
             self.dirty = true;
@@ -1434,8 +1492,8 @@ fn read_records(mut out: impl std::io::Read, inbox: std::sync::Arc<std::sync::Mu
 #[cfg(test)]
 mod tests {
 
-    /// (v205) Le bouton de recherche : rond pour de vrai (les pages sont en 16/9), au coin
-    /// en haut à gauche, et il ne mange pas la page.
+    /// (v206) Le bouton de recherche : rond pour de vrai (les pages sont en 16/9), au coin
+    /// **en bas à gauche**, et il ne mange pas la page.
     #[test]
     fn the_search_button_is_a_round_corner_button() {
         let (c, r) = BOUTON;
@@ -1443,14 +1501,56 @@ mod tests {
         // Son bord : à `r` en largeur, à `r * 16/9` en hauteur.
         assert!(on_search_button([c[0] + r * 0.95, c[1]]));
         assert!(!on_search_button([c[0] + r * 1.05, c[1]]));
-        assert!(on_search_button([c[0], c[1] + r * 16.0 / 9.0 * 0.95]));
-        assert!(!on_search_button([c[0], c[1] + r * 16.0 / 9.0 * 1.05]));
+        assert!(on_search_button([c[0], c[1] - r * 16.0 / 9.0 * 0.95]));
+        assert!(!on_search_button([c[0], c[1] - r * 16.0 / 9.0 * 1.05]));
         // Le reste de l'écran est à la page.
-        for ailleurs in [[0.5, 0.5], [0.0, 0.5], [0.5, 0.0], [0.97, 0.05], [0.03, 0.9]] {
+        for ailleurs in [[0.5, 0.5], [0.0, 0.5], [0.5, 1.0], [0.97, 0.95], [0.03, 0.1]] {
             assert!(!on_search_button(ailleurs), "{ailleurs:?}");
         }
-        // Il tient dans l'écran.
-        assert!(c[0] - r > 0.0 && c[1] - r * 16.0 / 9.0 > 0.0);
+        // Il tient dans l'écran, en bas à gauche.
+        assert!(c[0] - r > 0.0 && c[1] + r * 16.0 / 9.0 < 1.0);
+        assert!(c[1] > 0.5);
+    }
+
+    /// (v206) Il se montre quand le réticule arrive dans son coin, en glissant même
+    /// lentement, et s'en va dès qu'on va ailleurs sur l'écran.
+    #[test]
+    fn the_search_button_shows_up_in_its_corner_and_fades_away_elsewhere() {
+        let (c, r) = BOUTON;
+        let mut t = Tab::new("x");
+        assert_eq!(t.reveal, 0.0);
+        // Le coin lui-même fait apparaître le bouton.
+        assert!(near_search_button([0.0, 1.0]));
+        assert!(near_search_button(c));
+        assert!(near_search_button([c[0] + r * (ZONE - 0.2), c[1]]));
+        assert!(!near_search_button([c[0] + r * (ZONE + 0.2), c[1]]));
+        assert!(!near_search_button([0.5, 0.5]));
+        // Un glissement lent depuis le coin : il monte jusqu'au bout.
+        t.cursor = Some([0.0, 1.0]);
+        for _ in 0..40 {
+            t.update(0.016);
+        }
+        assert!(t.reveal > 0.99, "{}", t.reveal);
+        // Il faut qu'il soit visible pour prendre le clic.
+        assert!(t.reveal >= CLIQUABLE);
+        // On part ailleurs : il s'en va, et il ne prend plus le clic en route.
+        t.cursor = Some([0.5, 0.5]);
+        t.update(0.016);
+        assert!(t.reveal < 1.0 && t.reveal > 0.9, "{}", t.reveal);
+        for _ in 0..40 {
+            t.update(0.016);
+        }
+        assert_eq!(t.reveal, 0.0);
+        // Un passage éclair dans le coin ne le rend pas cliquable.
+        t.cursor = Some(c);
+        t.update(0.016);
+        assert!(t.reveal < CLIQUABLE, "{}", t.reveal);
+        // Sans réticule sur l'écran, il reste caché.
+        t.cursor = None;
+        for _ in 0..40 {
+            t.update(0.016);
+        }
+        assert_eq!(t.reveal, 0.0);
     }
     use super::*;
 

@@ -1931,7 +1931,7 @@ impl Session {
             {
                 // (v205) Le bouton de recherche en haut à gauche mène sur Google ; le
                 // reste de l'écran est la page.
-                if crate::screen::on_search_button(uv) {
+                if self.displays.search_clicked(ids[i], uv) {
                     self.displays.open(ids[i], crate::screen::RECHERCHE);
                     self.screen_last = Some(ids[i]);
                 } else {
@@ -6967,7 +6967,18 @@ impl Session {
         let screens: Vec<(u32, minelib_render::ScreenAnchor)> = self
             .shown
             .iter()
-            .map(|s| (s.0.id(), s.0.anchor()))
+            .map(|s| {
+                let id = s.0.id();
+                // (v206) L'apparition du bouton de recherche voyage avec l'écran.
+                let reveal = self.displays.reveal(id);
+                (
+                    id,
+                    minelib_render::ScreenAnchor {
+                        reveal,
+                        ..s.0.anchor()
+                    },
+                )
+            })
             .collect();
         renderer.set_screens(&screens);
         for (id, _) in &screens {

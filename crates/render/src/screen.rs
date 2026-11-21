@@ -21,6 +21,9 @@ pub struct ScreenAnchor {
     pub up: [f32; 3],
     /// Largeur et hauteur, en blocs.
     pub size: [f32; 2],
+    /// (v206) Apparition du bouton de recherche, de 0 (invisible) à 1 : le jeu la monte
+    /// quand le réticule glisse dans le coin en bas à gauche, et la redescend sinon.
+    pub reveal: f32,
 }
 
 #[repr(C)]
@@ -28,6 +31,7 @@ pub struct ScreenAnchor {
 struct ScreenVertex {
     pos: [f32; 3],
     uv: [f32; 2],
+    reveal: f32,
 }
 
 /// Au plus tant d'écrans dessinés.
@@ -88,8 +92,8 @@ impl Screen {
             push_constant_ranges: &[],
         });
 
-        const ATTRS: [wgpu::VertexAttribute; 2] =
-            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2];
+        const ATTRS: [wgpu::VertexAttribute; 3] =
+            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32];
 
         let pipeline = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -281,6 +285,7 @@ impl Screen {
             let v = |p: Vec3, uv: [f32; 2]| ScreenVertex {
                 pos: [p.x, p.y, p.z],
                 uv,
+                reveal: a.reveal,
             };
             // uv (0,0) en haut-gauche.
             verts.extend([
