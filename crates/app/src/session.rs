@@ -2591,6 +2591,10 @@ impl Session {
                 b.send_item(chunk, &req);
             }
         }
+        // (v219) Objet ramassé au sol : un « pop », plus ou moins aigu.
+        if std::mem::take(&mut self.items.picked) > 0 {
+            crate::audio::pickup();
+        }
         // Ce que l'arbitre accorde entre dans l'inventaire ; ce qui n'y tient plus retombe
         // aux pieds du joueur.
         for p in std::mem::take(&mut self.items.credits) {

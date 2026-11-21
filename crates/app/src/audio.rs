@@ -332,6 +332,101 @@ fn pitch_spread(sfx: Sfx) -> f32 {
     }
 }
 
+/// (v219) Variation de hauteur du tonnerre, de part et d'autre (demi-tons).
+const THUNDER_SPREAD: f32 = 1.5;
+/// (v219) Variation de hauteur du « pop » d'un objet ramassé (demi-tons).
+const PICKUP_SPREAD: f32 = 4.0;
+/// (v219) Volume du « pop » d'un objet ramassé.
+const PICKUP_VOLUME: f32 = 0.35;
+
+/// (v219) Une boucle lue sans fin, à une vitesse qui ondule lentement (deux sinus de
+/// périodes 13 s et 7,3 s, ± un demi-ton en tout) : pas de raccord (la boucle se referme
+/// sur elle-même), et la même boucle ne se reconnaît plus d'un tour à l'autre.
+struct Wobble {
+    buf: Vec<i16>,
+    rate: u32,
+    pos: f64,
+    t: f64,
+    phase: f64,
+}
+
+impl Wobble {
+    fn new(buf: Vec<i16>, rate: u32, phase: f32) -> Self {
+        Self {
+            buf,
+            rate,
+            pos: 0.0,
+            t: 0.0,
+            phase: phase as f64 * std::f64::consts::PI,
+        }
+    }
+
+    /// Vitesse de lecture au temps `t` (s).
+    fn rate_at(&self, t: f64) -> f64 {
+        use std::f64::consts::TAU;
+        let semi = 0.32 * (t * TAU / 13.0 + self.phase).sin()
+            + 0.18 * (t * TAU / 7.3 + 1.0 + self.phase).sin();
+        2f64.powf(semi / 12.0)
+    }
+}
+
+impl Iterator for Wobble {
+    type Item = i16;
+
+    fn next(&mut self) -> Option<i16> {
+        let n = self.buf.len();
+        if n < 2 {
+            return None;
+        }
+        let i = self.pos as usize % n;
+        let f = self.pos - self.pos.floor();
+        let (a, b) = (self.buf[i] as f64, self.buf[(i + 1) % n] as f64);
+        let v = a + (b - a) * f;
+        self.pos = (self.pos + self.rate_at(self.t)) % n as f64;
+        self.t += 1.0 / self.rate as f64;
+        Some(v as i16)
+    }
+}
+
+impl rodio::Source for Wobble {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        1
+    }
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// (v219) Objet ramassé : un petit « pop » calculé (voir `synth::pop`), plus ou moins aigu
+/// à chaque fois.
+pub fn pickup() {
+    if master() <= 0.0 {
+        return;
+    }
+    static POP: OnceLock<(Vec<i16>, u32)> = OnceLock::new();
+    let (pcm, rate) = POP.get_or_init(synth::pop).clone();
+    if let Some(tx) = sender() {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(Cmd {
+                file: "",
+                volume: PICKUP_VOLUME,
+                delay: 0.0,
+                speed: 2f32.powf(PICKUP_SPREAD * jitter() / 12.0),
+                voice: None,
+                reopen: false,
+                pcm: Some((pcm, rate)),
+                rain: None,
+            });
+        }
+    }
+}
+
 /// (v217) Nombre au hasard entre −1 et 1 (xorshift, pour la hauteur des sons).
 fn jitter() -> f32 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -540,10 +635,9 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                         if rain.is_none() {
                             rain = Sink::try_new(handle).ok().map(|s| {
                                 let (pcm, rate) = synth::rain_loop();
-                                s.append(
-                                    rodio::buffer::SamplesBuffer::new(1, rate, pcm)
-                                        .repeat_infinite(),
-                                );
+                                // (v219) Sa hauteur ondule lentement : la boucle de 7 s ne
+                                // se reconnaît plus.
+                                s.append(Wobble::new(pcm, rate, jitter()));
                                 (s, volume)
                             });
                         }
@@ -563,6 +657,7 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                             sink.set_volume(cmd.volume * master());
                             sink.append(
                                 rodio::buffer::SamplesBuffer::new(1, rate, samples)
+                                    .speed(cmd.speed.clamp(0.5, 2.0))
                                     .delay(Duration::from_secs_f32(cmd.delay.max(0.0))),
                             );
                             sinks.push((sink, cmd.volume));
@@ -693,7 +788,9 @@ pub fn thunder(distance: f32, seed: u32) {
                 file: "",
                 volume: synth::thunder_gain(distance),
                 delay: delay.max(0.0),
-                speed: 1.0,
+                // (v219) Chaque coup de tonnerre un peu plus aigu ou plus grave (déjà
+                // différent par son tirage).
+                speed: 2f32.powf(THUNDER_SPREAD * jitter() / 12.0),
                 voice: None,
                 reopen: false,
                 pcm: Some((pcm, rate)),
@@ -788,6 +885,38 @@ pub mod synth {
             y2 += a * (y1 - y2);
             *o += y2 * env * k;
         }
+    }
+
+    /// (v219) « Pop » d'un objet ramassé (90 ms) : une note qui monte vite (de 520 à
+    /// 1 250 Hz), avec un peu de son harmonique et un claquement de bruit au tout début,
+    /// éteinte en douceur.
+    pub fn pop() -> (Vec<i16>, u32) {
+        let n = (RATE as f32 * 0.09) as usize;
+        let mut rng = Noise(0x51a7_c0de);
+        let mut phase = 0.0f32;
+        let mut s: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let k = (t / 0.09).min(1.0);
+                let f = 520.0 * (1250.0f32 / 520.0).powf(k.sqrt());
+                phase += TAU * f / RATE as f32;
+                let attack = (t / 0.003).min(1.0);
+                let env = attack * (-t / 0.028).exp();
+                let click = if t < 0.0015 {
+                    rng.next() * (1.0 - t / 0.0015)
+                } else {
+                    0.0
+                };
+                (phase.sin() + 0.25 * (2.0 * phase).sin()) * env + 0.3 * click
+            })
+            .collect();
+        let fade = (RATE as usize / 200).min(n);
+        for (i, v) in s[n - fade..].iter_mut().enumerate() {
+            *v *= 1.0 - i as f32 / fade as f32;
+        }
+        let peak = s.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let k = 0.9 * 32767.0 / peak;
+        (s.iter().map(|v| (v * k) as i16).collect(), RATE)
     }
 
     /// Volume du tonnerre selon la distance (blocs) : fort tout près, il faiblit sans
@@ -1007,6 +1136,32 @@ pub mod synth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v219) Le « pop » d'un objet ramassé : court, pas saturé, sans clic à la fin ; la
+    /// pluie lue en ondulant ne s'arrête jamais et reste dans ± un demi-ton.
+    #[test]
+    fn the_pickup_pop_and_the_wobbling_rain() {
+        let (pop, rate) = synth::pop();
+        assert_eq!(rate, synth::RATE);
+        assert!(pop.len() < rate as usize / 10);
+        assert!(
+            pop.last().is_some_and(|v| v.unsigned_abs() < 200),
+            "pas de clic à la fin"
+        );
+        let w = Wobble::new((0..1000).map(|i| (i % 100) as i16).collect(), 1000, 0.3);
+        for k in 0..200 {
+            let sp = w.rate_at(k as f64 * 0.1);
+            assert!(
+                (2f64.powf(-0.5 / 12.0)..=2f64.powf(0.5 / 12.0)).contains(&sp),
+                "{sp}"
+            );
+        }
+        let mut w = w;
+        assert!(
+            (0..50_000).all(|_| w.next().is_some()),
+            "la pluie ne s'arrête pas"
+        );
+    }
 
     /// (v217) La hauteur des sons varie un peu à chaque fois (pas plus que prévu), jamais
     /// celle du bip de la bombe.

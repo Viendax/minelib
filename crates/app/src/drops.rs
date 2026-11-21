@@ -37,6 +37,8 @@ pub struct Items {
     pub outbox: Vec<([i32; 2], BuildMsg)>,
     /// Piles gagnées, à verser à l'inventaire.
     pub credits: Vec<Pile>,
+    /// (v219) Objets du sol ramassés depuis la dernière lecture (pour leur son).
+    pub picked: u32,
     /// Objets vus apparaître : quand, d'où ils ont été lancés, et si c'est le mien.
     born: HashMap<u64, (Instant, Option<Vec3>, bool)>,
     /// Objets qu'on a demandé à ramasser (pas deux demandes pour le même).
@@ -61,6 +63,7 @@ impl Items {
             ledger: Ledger::starting_at(rand::random()),
             outbox: Vec::new(),
             credits: Vec::new(),
+            picked: 0,
             born: HashMap::new(),
             asked: HashMap::new(),
             dirty: false,
@@ -203,6 +206,10 @@ impl Items {
         // En solo l'arbitre a déjà changé `view` ; le refaire ne change rien.
         self.view.absorb(m);
         if let Some(Credit::Give(p)) = self.ledger.on_message(m, me) {
+            // (v219) Ramassé au sol (pas pris dans un coffre) : son « pop ».
+            if matches!(m, BuildMsg::Item { .. }) {
+                self.picked += 1;
+            }
             self.credits.push(p);
         }
     }
