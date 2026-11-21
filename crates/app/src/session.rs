@@ -2045,10 +2045,15 @@ impl Session {
                 // En mode FPS, « utiliser » est une lettre : elle va dans le champ de texte.
                 && !(fps && editing)
             {
-                // (v205) Le bouton de recherche en haut à gauche mène sur Google ; le
-                // reste de l'écran est la page.
-                if self.displays.search_clicked(ids[i], uv) {
-                    self.displays.open(ids[i], crate::screen::RECHERCHE);
+                // (v205) Les boutons en haut à gauche : la loupe mène sur Google, (v211) la
+                // vidéo sur la recherche de YouTube ; le reste de l'écran est la page.
+                if let Some(b) = self.displays.button_clicked(ids[i], uv) {
+                    let url = if b == crate::screen::VIDEO {
+                        crate::screen::RECHERCHE_VIDEO
+                    } else {
+                        crate::screen::RECHERCHE
+                    };
+                    self.displays.open(ids[i], url);
                     self.screen_last = Some(ids[i]);
                 } else {
                     self.displays.press(ids[i], uv);
@@ -7310,7 +7315,7 @@ impl Session {
             .iter()
             .map(|s| {
                 let id = s.0.id();
-                // (v206) L'apparition du bouton de recherche voyage avec l'écran.
+                // (v206) L'apparition des boutons voyage avec l'écran.
                 let reveal = self.displays.reveal(id);
                 (
                     id,

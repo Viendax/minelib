@@ -23,15 +23,16 @@ struct Globals {
 struct VIn {
     @location(0) pos: vec3<f32>,
     @location(1) uv: vec2<f32>,
-    // (v206) Apparition du bouton de recherche, de 0 à 1 (voir `screen.rs` côté jeu).
-    @location(2) reveal: f32,
+    // (v206) Apparition des boutons, de 0 à 1 (voir `screen.rs` côté jeu) ; (v211) la
+    // loupe en `x`, la vidéo en `y`.
+    @location(2) reveal: vec2<f32>,
 };
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) world: vec3<f32>,
-    @location(2) @interpolate(flat) reveal: f32,
+    @location(2) @interpolate(flat) reveal: vec2<f32>,
 };
 
 @vertex
@@ -48,20 +49,26 @@ fn texel(i: VOut) -> vec4<f32> {
     return vec4<f32>(textureSampleLevel(vid, vid_s, i.uv, 0.0).rgb, 1.0);
 }
 
-// Le bouton de recherche, en haut à gauche de l'écran : un rond gris foncé et une loupe,
-// dessinés ici même (aucune image, aucune police, donc aucune licence). Un clic dessus
-// amène la page sur Google — le jeu le reconnaît avec `screen::on_search_button`, qui
-// garde les mêmes mesures que ce qui est dessiné ici. (v205)
+// Les boutons des écrans, **en haut à gauche** (v211) : un rond gris foncé avec une loupe
+// (Google), et à sa droite un rond avec une vidéo (la recherche de YouTube). Dessinés ici
+// même (aucune image, aucune police, donc aucune licence ; la vidéo est un cadre arrondi
+// et un triangle de lecture blancs, pas le logo de YouTube). Le jeu reconnaît les clics
+// avec `screen::on_button`, qui garde les mêmes mesures (`BOUTONS`, `RAYON`).
 //
 // Les pages des écrans font 1280 × 720 : une longueur donnée en `u` vaut 16/9 de la même
-// en `v`, c'est ce qui rend le rond rond.
+// en `v`, c'est ce qui rend le rond rond. Centres à 38 px des bords, rayon 28 px, 12 px
+// entre les deux.
 const BTN_ASPECT = 16.0 / 9.0;
-// En bas à gauche (v206) : il ne se montre que quand le réticule arrive dans ce coin.
-const BTN_C = vec2<f32>(0.030, 0.947);
+const BTN_C = vec2<f32>(0.030, 0.053);
+const BTN2_C = vec2<f32>(0.0828, 0.053);
 const BTN_R = 0.022;
-const LOUPE_C = vec2<f32>(0.0265, 0.9395);
+// La loupe : son anneau un peu en haut à gauche du centre du rond.
+const LOUPE_D = vec2<f32>(-0.0035, -0.0035);
 const LOUPE_R = 0.0092;
 const TRAIT = 0.0026;
+// La vidéo (en mesures de `u`) : demi-largeur et demi-hauteur du cadre, et son arrondi.
+const CADRE = vec2<f32>(0.0112, 0.0080);
+const CADRE_R = 0.0028;
 
 // Distance d'un point à un segment (pour le manche de la loupe).
 fn dist_seg(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
@@ -70,41 +77,70 @@ fn dist_seg(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     return length(p - a - ab * t);
 }
 
+// Distance signée à un rectangle arrondi centré en 0.
+fn dist_cadre(q: vec2<f32>, demi: vec2<f32>, r: f32) -> f32 {
+    let d = abs(q) - demi + vec2<f32>(r, r);
+    return length(max(d, vec2<f32>(0.0, 0.0))) + min(max(d.x, d.y), 0.0) - r;
+}
+
+// Distance (approchée) à un triangle de lecture pointant à droite, centré en 0.
+fn dist_lecture(q: vec2<f32>) -> f32 {
+    let a = vec2<f32>(-0.0030, -0.0040);
+    let b = vec2<f32>(-0.0030, 0.0040);
+    let c = vec2<f32>(0.0042, 0.0);
+    let n1 = normalize(vec2<f32>(-1.0, 0.0));
+    let n2 = normalize(vec2<f32>(b.y - c.y, c.x - b.x));
+    let n3 = normalize(vec2<f32>(c.y - a.y, a.x - c.x));
+    return max(dot(q - a, n1), max(dot(q - b, n2), dot(q - c, n3)));
+}
+
 // `uv` ramené en mesures rondes (celles de `u`).
 fn btn_space(uv: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(uv.x, uv.y / BTN_ASPECT);
 }
 
-fn search_button(uv: vec2<f32>, reveal: f32, dessous: vec3<f32>) -> vec3<f32> {
-    if reveal <= 0.001 {
-        return dessous;
-    }
-    let p = btn_space(uv);
-    let c = btn_space(BTN_C);
-    let lc = btn_space(LOUPE_C);
+// Un bouton : rond gris foncé, et son dessin (distance signée `d_icone`) presque blanc.
+fn bouton(p: vec2<f32>, c: vec2<f32>, d_icone: f32, reveal: f32, aa: f32, dessous: vec3<f32>) -> vec3<f32> {
     let d_rond = length(p - c) - BTN_R;
-    // Lissage sur la largeur d'un pixel de l'écran, quelle que soit la distance.
-    let aa = max(fwidth(d_rond), 1e-6);
     let rond = 1.0 - smoothstep(-aa, aa, d_rond);
-    if rond <= 0.001 {
+    let icone = 1.0 - smoothstep(-aa, aa, d_icone);
+    // Le tout apparaît et disparaît en fondu avec `reveal`.
+    let fond = mix(dessous, vec3<f32>(0.11, 0.115, 0.125), rond * 0.93 * reveal);
+    return mix(fond, vec3<f32>(0.92, 0.93, 0.95), icone * rond * reveal);
+}
+
+fn buttons(uv: vec2<f32>, reveal: vec2<f32>, dessous: vec3<f32>) -> vec3<f32> {
+    let p = btn_space(uv);
+    // Lissage sur la largeur d'un pixel de l'écran, quelle que soit la distance (calculé
+    // avant tout test : une dérivée se prend partout pareil).
+    let aa = max(length(fwidth(p)) * 0.7071, 1e-6);
+    if max(reveal.x, reveal.y) <= 0.001 {
         return dessous;
     }
+    var col = dessous;
     // La loupe : un anneau et son manche.
-    let d_anneau = abs(length(p - lc) - LOUPE_R) - TRAIT * 0.5;
-    let a = lc + vec2<f32>(0.7071, 0.7071) * (LOUPE_R + TRAIT * 0.2);
-    let b = lc + vec2<f32>(0.7071, 0.7071) * (LOUPE_R + TRAIT * 0.2 + 0.0082);
-    let d_manche = dist_seg(p, a, b) - TRAIT * 0.55;
-    let d_loupe = min(d_anneau, d_manche);
-    let loupe = 1.0 - smoothstep(-aa, aa, d_loupe);
-    // Gris foncé, et la loupe presque blanche par-dessus. Le tout apparaît et disparaît
-    // en fondu avec `reveal`.
-    let fond = mix(dessous, vec3<f32>(0.11, 0.115, 0.125), rond * 0.93 * reveal);
-    return mix(fond, vec3<f32>(0.92, 0.93, 0.95), loupe * rond * reveal);
+    let c1 = btn_space(BTN_C);
+    if reveal.x > 0.001 && length(p - c1) < BTN_R * 1.5 {
+        let lc = c1 + LOUPE_D;
+        let d_anneau = abs(length(p - lc) - LOUPE_R) - TRAIT * 0.5;
+        let a = lc + vec2<f32>(0.7071, 0.7071) * (LOUPE_R + TRAIT * 0.2);
+        let b = lc + vec2<f32>(0.7071, 0.7071) * (LOUPE_R + TRAIT * 0.2 + 0.0082);
+        let d_manche = dist_seg(p, a, b) - TRAIT * 0.55;
+        col = bouton(p, c1, min(d_anneau, d_manche), reveal.x, aa, col);
+    }
+    // La vidéo : un cadre arrondi et un triangle de lecture.
+    let c2 = btn_space(BTN2_C);
+    if reveal.y > 0.001 && length(p - c2) < BTN_R * 1.5 {
+        let q = p - c2;
+        let d_cadre = abs(dist_cadre(q, CADRE, CADRE_R)) - TRAIT * 0.5;
+        col = bouton(p, c2, min(d_cadre, dist_lecture(q)), reveal.y, aa, col);
+    }
+    return col;
 }
 
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(search_button(i.uv, i.reveal, texel(i).rgb), 1.0);
+    return vec4<f32>(buttons(i.uv, i.reveal, texel(i).rgb), 1.0);
 }
 
 struct TaaOut {
@@ -129,7 +165,7 @@ fn fs_taa_world(i: VOut) -> TaaOut {
     let off = (jit.xy / jit.w - cur.xy / cur.w) * vec2<f32>(0.5, -0.5) * g.screen.xy;
     let uv = i.uv + dpdx(i.uv) * off.x + dpdy(i.uv) * off.y;
     o.color = vec4<f32>(
-        search_button(
+        buttons(
             i.uv,
             i.reveal,
             textureSampleLevel(vid, vid_s, uv, 0.0).rgb,

@@ -10,6 +10,9 @@
   jeu la sert lui-même à l'adresse https://viendax.github.io/minelib/lecteur : c'est
   l'identité du jeu (le compte GitHub de son auteur), envoyée à YouTube comme origine.
 
+  (v211) Plus de barre : le lecteur prend toute la page. Pour revenir à la recherche, le
+  bouton vidéo du jeu (en haut à gauche de l'écran, en glissant depuis le bord).
+
   Lecture automatique : seulement quand le jeu le permet (`__mlb.regarde()`, l'écran
   regardé, à plus de moitié visible, un seul à la fois), sinon sur un clic dans le lecteur.
   Tant qu'elle attend, la page se dit « en pub » au jeu : rien n'est lu ni corrigé.
@@ -17,21 +20,14 @@
 <style>
 html,body{margin:0;height:100%;background:#0f0f0f;color:#f1f1f1;
   font:16px "Segoe UI",Roboto,Arial,sans-serif;overflow:hidden}
-#barre{position:absolute;top:0;left:0;right:0;height:48px;display:flex;
-  align-items:center;gap:14px;padding:0 14px;box-sizing:border-box}
-#retour{background:#272727;color:#f1f1f1;border:0;border-radius:18px;height:34px;
-  padding:0 16px;font:inherit;cursor:pointer;white-space:nowrap}
-#retour:hover{background:#3f3f3f}
-#titre{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#aaa}
-#cadre{position:absolute;top:48px;left:0;right:0;bottom:0}
+#cadre{position:absolute;top:0;left:0;right:0;bottom:0}
 #cadre iframe{width:100%;height:100%;border:0;display:block}
-#mot{position:absolute;top:48px;left:0;right:0;bottom:0;display:none;
+#mot{position:absolute;top:0;left:0;right:0;bottom:0;display:none;
   align-items:center;justify-content:center;text-align:center;padding:60px;
   box-sizing:border-box;font-size:22px;line-height:1.5;color:#ccc}
 </style>
 </head>
 <body>
-<div id="barre"><button id="retour">&larr; Rechercher une vidéo</button><div id="titre"></div></div>
 <div id="cadre"><div id="lecteur"></div></div>
 <div id="mot"></div>
 <script>
@@ -41,11 +37,8 @@ const ok=s=>/^[A-Za-z0-9_-]{11}$/.test(s||'');
 const q=new URLSearchParams(location.search);
 let id=ok(q.get('v'))?q.get('v'):'';
 const debut=Math.max(0,Math.min(360000,parseInt(q.get('t')||'0',10)||0));
-const ACCUEIL='https://www.youtube.com/';
 let P=null,pret=false,permis=false,voulu=true,erreur=false,vol=-1,cherche=null;
 let s=-1,dernier=-2,depuis=0,etat='';
-document.getElementById('retour').onclick=()=>{
-  if(history.length>1)history.back();else location.href=ACCUEIL;};
 const mot=t=>{document.getElementById('cadre').style.display='none';
   const m=document.getElementById('mot');m.textContent=t;m.style.display='flex';};
 // Commandes du jeu (regarder ensemble, volume, pause de tous les écrans). Lancer la
@@ -74,7 +67,7 @@ window.onYouTubeIframeAPIReady=()=>{
         // Lecture sans notre accord : c'est un clic dans le lecteur.
         if(e.data===1&&!permis)permis=true;
         try{const d=P.getVideoData();
-          if(d&&d.title)document.getElementById('titre').textContent=d.title;
+          if(d&&d.title)document.title=d.title;
           if(d&&ok(d.video_id)&&d.video_id!==id){id=d.video_id;
             history.replaceState(null,'',location.pathname+'?v='+id);}}catch(_){}
       },

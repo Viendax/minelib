@@ -105,8 +105,8 @@ impl Placed {
             right: right.into(),
             up: up.into(),
             size: [width, height],
-            // Le bouton de recherche : mis par la session, qui sait où est le réticule.
-            reveal: 0.0,
+            // Les boutons : mis par la session, qui sait où est le réticule.
+            reveal: [0.0; 2],
         }
     }
 
@@ -515,17 +515,18 @@ impl Displays {
         }
     }
 
-    /// (v206) Apparition du bouton de recherche de cet écran (0 à 1) : le rendu la passe
-    /// au shader, et un clic ne compte comme un clic sur le bouton qu'au-delà de
-    /// `CLIQUABLE`.
-    pub fn reveal(&self, id: u32) -> f32 {
-        self.tabs.get(&id).map_or(0.0, |t| t.reveal)
+    /// (v206) Apparition des boutons de cet écran (0 à 1 ; v211 : la loupe, puis la
+    /// vidéo) : le rendu la passe au shader, et un clic ne compte comme un clic sur un
+    /// bouton qu'au-delà de `CLIQUABLE`.
+    pub fn reveal(&self, id: u32) -> [f32; 2] {
+        self.tabs.get(&id).map_or([0.0; 2], |t| t.reveal)
     }
 
-    /// Un clic à cet endroit de cet écran est-il un clic sur le bouton de recherche ?
-    /// (Invisible ou presque, il laisse le clic à la page.)
-    pub fn search_clicked(&self, id: u32, uv: [f32; 2]) -> bool {
-        self.reveal(id) >= CLIQUABLE && on_search_button(uv)
+    /// Un clic à cet endroit de cet écran est-il un clic sur un bouton (`LOUPE`,
+    /// `VIDEO`) ? (Invisible ou presque, un bouton laisse le clic à la page.)
+    pub fn button_clicked(&self, id: u32, uv: [f32; 2]) -> Option<usize> {
+        let r = self.reveal(id);
+        (0..2).find(|&b| r[b] >= CLIQUABLE && on_button(uv, b))
     }
 
     /// Les pages refusées depuis la dernière fois : (écran, raison) — voir `filtre::Refus`
@@ -942,10 +943,16 @@ impl Displays {
     }
 }
 
-/// (v206) Le bouton de recherche, **en bas à gauche** d'un écran : mêmes mesures que ce
-/// que dessine `screen.wgsl` (`BTN_C`, `BTN_R`), et les pages font 1280 × 720, donc une
-/// longueur en `u` vaut 16/9 de la même en `v`.
-const BOUTON: ([f32; 2], f32) = ([0.030, 0.947], 0.022);
+/// (v211) Les boutons d'un écran, **en haut à gauche** : la loupe (Google), puis à sa
+/// droite la vidéo (la recherche de YouTube). Mêmes mesures que ce que dessine
+/// `screen.wgsl` (`BTN_C`, `BTN2_C`, `BTN_R`) ; les pages font 1280 × 720, donc une longueur
+/// en `u` vaut 16/9 de la même en `v`. Centres à 38 px du bord, rayon 28 px, 12 px entre
+/// les deux.
+const BOUTONS: [[f32; 2]; 2] = [[0.030, 0.053], [0.0828, 0.053]];
+const RAYON: f32 = 0.022;
+/// Le bouton de recherche (Google) et le bouton vidéo (YouTube).
+pub const LOUPE: usize = 0;
+pub const VIDEO: usize = 1;
 
 /// Autour du bouton (en rayons du bouton) : sa surface et un peu plus. Arrivé là, il est
 /// tout à fait visible ; dès qu'on en sort, il s'en va.
@@ -968,21 +975,23 @@ const SEN_VA: f32 = 0.28;
 /// page, comme n'importe quel autre endroit de l'écran.
 const CLIQUABLE: f32 = 0.35;
 
-/// L'adresse où mène le bouton (SafeSearch est imposé par le navigateur).
+/// L'adresse où mène la loupe (SafeSearch est imposé par le navigateur).
 pub const RECHERCHE: &str = "https://www.google.com/";
+/// (v211) L'adresse où mène le bouton vidéo : la recherche de YouTube (mode restreint).
+pub const RECHERCHE_VIDEO: &str = "https://www.youtube.com/";
 
 /// Distance au centre du bouton, en mesures de la largeur (le 16/9 des pages est enlevé,
 /// donc un rond est rond).
-fn to_button(uv: [f32; 2]) -> f32 {
-    let (c, _) = BOUTON;
+fn to_button(uv: [f32; 2], b: usize) -> f32 {
+    let c = BOUTONS[b];
     let dx = uv[0] - c[0];
     let dy = (uv[1] - c[1]) * 9.0 / 16.0;
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Le clic est-il sur le bouton de recherche ?
-pub fn on_search_button(uv: [f32; 2]) -> bool {
-    to_button(uv) <= BOUTON.1
+/// Le clic est-il sur le bouton `b` ?
+pub fn on_button(uv: [f32; 2], b: usize) -> bool {
+    to_button(uv, b) <= RAYON
 }
 
 /// (v207) Comment le bouton de recherche se montre. Demande du joueur : il n'apparaît
@@ -991,6 +1000,11 @@ pub fn on_search_button(uv: [f32; 2]) -> bool {
 /// Il apparaît de plus en plus en approchant, est tout à fait visible sur lui et un peu
 /// autour, et s'en va dès qu'on en sort ; pour le revoir, il faut ressortir de l'écran et
 /// revenir par le bord.
+///
+/// (v211) Les deux boutons, en haut à gauche, vont ensemble, comme une petite barre : on
+/// entre par le bord gauche ou par le haut, près de l'un d'eux, et on glisse vers eux ;
+/// chacun apparaît d'autant plus qu'on s'approche de lui, et passer de l'un à l'autre ne
+/// fait partir ni l'un ni l'autre.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Corner {
     /// Entré sur l'écran par le bord, dans le coin, et pas reparti ailleurs depuis.
@@ -1002,39 +1016,39 @@ struct Corner {
 }
 
 impl Corner {
-    /// L'apparition voulue (0 à 1) pour ce point du réticule (`None` : pas sur l'écran).
-    fn target(&mut self, cursor: Option<[f32; 2]>) -> f32 {
+    /// L'apparition voulue (0 à 1) de chaque bouton pour ce point du réticule (`None` : pas
+    /// sur l'écran).
+    fn target(&mut self, cursor: Option<[f32; 2]>) -> [f32; 2] {
         let entered = !self.was_on;
         self.was_on = cursor.is_some();
         let Some(uv) = cursor else {
             self.armed = false;
             self.reached = false;
-            return 0.0;
+            return [0.0; 2];
         };
-        let d = to_button(uv);
-        let r = BOUTON.1;
+        let each = [to_button(uv, LOUPE), to_button(uv, VIDEO)];
+        let d = each[0].min(each[1]);
+        let r = RAYON;
         if entered {
-            // On arrive sur l'écran : par le bord gauche ou par le bas, et dans le coin.
-            let par_le_bord = uv[0] <= BORD || uv[1] >= 1.0 - BORD;
+            // On arrive sur l'écran : par le bord gauche ou par le haut, et dans le coin.
+            let par_le_bord = uv[0] <= BORD || uv[1] <= BORD;
             self.armed = par_le_bord && d <= r * COIN;
             self.reached = false;
         }
         if !self.armed {
-            return 0.0;
+            return [0.0; 2];
         }
         if d <= r * ZONE {
             self.reached = true;
-            return 1.0;
-        }
-        // Sorti de la zone après y être arrivé, ou parti hors du coin en chemin : il s'en
-        // va, et il faudra revenir par le bord.
-        if self.reached || d > r * COIN {
+        } else if self.reached || d > r * COIN {
+            // Sorti de la zone après y être arrivé, ou parti hors du coin en chemin : ils
+            // s'en vont, et il faudra revenir par le bord.
             self.armed = false;
             self.reached = false;
-            return 0.0;
+            return [0.0; 2];
         }
-        // En chemin depuis le bord : de plus en plus visible en approchant.
-        1.0 - (d - r * ZONE) / (r * (COIN - ZONE))
+        // De plus en plus visible en approchant : tout à fait dans sa zone.
+        each.map(|e| (1.0 - (e - r * ZONE) / (r * (COIN - ZONE))).clamp(0.0, 1.0))
     }
 }
 
@@ -1067,7 +1081,7 @@ struct Tab {
     scroll: u8,
     /// (v206) Apparition du bouton de recherche, de 0 à 1, et (v207) ce qui la commande :
     /// une arrivée par le bord, dans le coin en bas à gauche (voir `Corner`).
-    reveal: f32,
+    reveal: [f32; 2],
     corner: Corner,
     /// Page voulue ouverte (sinon en veille : dernière image assombrie) et images par
     /// seconde voulues (voir `Displays::schedule`) ; page ouverte dans le navigateur et
@@ -1099,7 +1113,7 @@ impl Tab {
             editing: false,
             loading: false,
             scroll: 0,
-            reveal: 0.0,
+            reveal: [0.0; 2],
             corner: Corner::default(),
             want_awake: true,
             want_fps: FPS_DEFAULT,
@@ -1113,20 +1127,22 @@ impl Tab {
     }
 
     fn update(&mut self, dt: f32) {
-        // (v206) Le bouton de recherche apparaît et disparaît en fondu ; (v207) seulement
-        // quand on arrive par le bord de l'écran, dans son coin (voir `Corner`).
-        let vers = self.corner.target(self.cursor);
-        // (v210) Rien par-dessus le lecteur officiel de YouTube : pas de bouton.
-        let vers = if crate::watch::is_player(&self.addr) { 0.0 } else { vers };
-        let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
-        let avant = self.reveal;
-        self.reveal = if vers > self.reveal {
-            (self.reveal + pas).min(vers)
-        } else {
-            (self.reveal - pas).max(vers)
-        };
-        if (self.reveal - avant).abs() > 1e-4 {
-            self.dirty = true;
+        // (v206) Les boutons apparaissent et disparaissent en fondu ; (v207) seulement
+        // quand on arrive par le bord de l'écran, dans leur coin (voir `Corner`) ; (v211)
+        // chacun le sien, et sur toutes les pages, le lecteur YouTube compris.
+        let cible = self.corner.target(self.cursor);
+        for (b, vers) in cible.into_iter().enumerate() {
+            let r = &mut self.reveal[b];
+            let pas = dt / if vers > *r { PARAIT } else { SEN_VA };
+            let avant = *r;
+            *r = if vers > *r {
+                (*r + pas).min(vers)
+            } else {
+                (*r - pas).max(vers)
+            };
+            if (*r - avant).abs() > 1e-4 {
+                self.dirty = true;
+            }
         }
         if let Some((_, age)) = &mut self.ripple {
             *age += dt;
@@ -1637,7 +1653,7 @@ mod tests {
             right: [1.0, 0.0, 0.0],
             up: [0.0, 1.0, 0.0],
             size: [2.0, 1.125],
-            reveal: 0.0,
+            reveal: [0.0; 2],
         };
         let proj = Mat4::perspective_infinite_reverse_rh(70f32.to_radians(), 16.0 / 9.0, 0.05);
         let face = proj * Mat4::look_to_rh(Vec3::ZERO, -Vec3::Z, Vec3::Y);
@@ -1674,24 +1690,31 @@ mod tests {
         assert_eq!(d.regarde, None);
     }
 
-    /// (v206) Le bouton de recherche : rond pour de vrai (les pages sont en 16/9), au coin
-    /// **en bas à gauche**, et il ne mange pas la page.
+    /// (v206) Les boutons : ronds pour de vrai (les pages sont en 16/9), (v211) **en haut à
+    /// gauche**, la vidéo à droite de la loupe, et ils ne mangent pas la page.
     #[test]
-    fn the_search_button_is_a_round_corner_button() {
-        let (c, r) = BOUTON;
-        assert!(on_search_button(c));
-        // Son bord : à `r` en largeur, à `r * 16/9` en hauteur.
-        assert!(on_search_button([c[0] + r * 0.95, c[1]]));
-        assert!(!on_search_button([c[0] + r * 1.05, c[1]]));
-        assert!(on_search_button([c[0], c[1] - r * 16.0 / 9.0 * 0.95]));
-        assert!(!on_search_button([c[0], c[1] - r * 16.0 / 9.0 * 1.05]));
-        // Le reste de l'écran est à la page.
-        for ailleurs in [[0.5, 0.5], [0.0, 0.5], [0.5, 1.0], [0.97, 0.95], [0.03, 0.1]] {
-            assert!(!on_search_button(ailleurs), "{ailleurs:?}");
+    fn the_buttons_are_round_and_sit_in_the_top_left_corner() {
+        let r = RAYON;
+        for b in [LOUPE, VIDEO] {
+            let c = BOUTONS[b];
+            assert!(on_button(c, b));
+            // Le bord : à `r` en largeur, à `r * 16/9` en hauteur.
+            assert!(on_button([c[0] + r * 0.95, c[1]], b));
+            assert!(!on_button([c[0] + r * 1.05, c[1]], b));
+            assert!(on_button([c[0], c[1] + r * 16.0 / 9.0 * 0.95], b));
+            assert!(!on_button([c[0], c[1] + r * 16.0 / 9.0 * 1.05], b));
+            // Tient dans l'écran, en haut à gauche.
+            assert!(c[0] - r > 0.0 && c[1] - r * 16.0 / 9.0 > 0.0);
+            assert!(c[1] < 0.5 && c[0] < 0.2);
+            for ailleurs in [[0.5, 0.5], [0.0, 0.5], [0.5, 1.0], [0.03, 0.95], [0.97, 0.05]] {
+                assert!(!on_button(ailleurs, b), "{ailleurs:?}");
+            }
         }
-        // Il tient dans l'écran, en bas à gauche.
-        assert!(c[0] - r > 0.0 && c[1] + r * 16.0 / 9.0 < 1.0);
-        assert!(c[1] > 0.5);
+        // La vidéo à droite de la loupe, à la même hauteur, sans se toucher.
+        let (l, v) = (BOUTONS[LOUPE], BOUTONS[VIDEO]);
+        assert_eq!(l[1], v[1]);
+        assert!(v[0] - l[0] > 2.0 * r);
+        assert!(!on_button(v, LOUPE) && !on_button(l, VIDEO));
     }
 
     /// Le réticule glisse de `de` à `vers` en `n` images (une image : 16 ms), puis y reste
@@ -1714,81 +1737,119 @@ mod tests {
         }
     }
 
-    /// (v207) Il ne se montre que si l'on arrive sur l'écran **par son bord**, dans le coin
-    /// en bas à gauche, et qu'on glisse vers lui — même lentement.
+    /// (v207) Un bouton ne se montre que si l'on arrive sur l'écran **par son bord**, dans
+    /// son coin, et qu'on glisse vers lui — même lentement. (v211) En haut à gauche : par le
+    /// bord gauche ou par le haut.
     #[test]
-    fn the_search_button_shows_up_when_sliding_in_from_the_edge_of_its_corner() {
-        let (c, _) = BOUTON;
+    fn a_button_shows_up_when_sliding_in_from_the_edge_of_its_corner() {
+        let c = BOUTONS[LOUPE];
         // Par le bord gauche, lentement (une seconde et demie de glissement).
         let mut t = Tab::new("x");
-        glide(&mut t, [0.0, 0.80], c, 90, 30);
-        assert!(t.reveal > 0.99, "{}", t.reveal);
-        assert!(t.reveal >= CLIQUABLE);
-        // Par le bas, vite.
+        glide(&mut t, [0.0, 0.20], c, 90, 30);
+        assert!(t.reveal[LOUPE] > 0.99, "{:?}", t.reveal);
+        assert!(t.reveal[LOUPE] >= CLIQUABLE);
+        // Par le haut, vite.
         let mut t = Tab::new("x");
-        glide(&mut t, [0.10, 1.0], c, 6, 30);
-        assert!(t.reveal > 0.99, "{}", t.reveal);
+        glide(&mut t, [0.10, 0.0], c, 6, 30);
+        assert!(t.reveal[LOUPE] > 0.99, "{:?}", t.reveal);
         // Au milieu du chemin, il est déjà là mais pas tout à fait.
         let mut t = Tab::new("x");
-        let milieu = [0.06, 0.82];
-        glide(&mut t, [0.0, 0.76], milieu, 20, 40);
-        assert!(t.reveal > 0.05 && t.reveal < 0.95, "{}", t.reveal);
+        glide(&mut t, [0.0, 0.24], [0.06, 0.18], 20, 40);
+        assert!(t.reveal[LOUPE] > 0.05 && t.reveal[LOUPE] < 0.95, "{:?}", t.reveal);
+        // Le bouton vidéo, par le haut juste au-dessus de lui : il est là, et la loupe à
+        // côté de lui presque autant (ils vont ensemble).
+        let v = BOUTONS[VIDEO];
+        let mut t = Tab::new("x");
+        glide(&mut t, [v[0] + 0.01, 0.0], v, 20, 30);
+        assert!(t.reveal[VIDEO] > 0.99, "{:?}", t.reveal);
+        assert!(t.reveal[LOUPE] > 0.9, "{:?}", t.reveal);
+        // Par le coin, en passant devant la loupe pour aller à la vidéo : tous deux restent.
+        let mut t = Tab::new("x");
+        glide(&mut t, [0.0, 0.053], v, 40, 30);
+        assert!(t.reveal[VIDEO] > 0.99 && t.reveal[LOUPE] > 0.9, "{:?}", t.reveal);
+        // Et en revenant de la vidéo à la loupe.
+        glide(&mut t, v, BOUTONS[LOUPE], 20, 30);
+        assert!(t.reveal[LOUPE] > 0.99 && t.reveal[VIDEO] > 0.9, "{:?}", t.reveal);
+        // Loin de la vidéo, en arrivant par le bord gauche plus bas : la loupe d'abord.
+        let mut t = Tab::new("x");
+        glide(&mut t, [0.0, 0.2], [0.0, 0.15], 10, 0);
+        assert!(t.reveal[LOUPE] > t.reveal[VIDEO], "{:?}", t.reveal);
     }
 
-    /// (v207) Déjà sur l'écran, descendre dans le coin ne le fait pas apparaître ; entrer
+    /// (v207) Déjà sur l'écran, monter dans le coin ne les fait pas apparaître ; entrer
     /// par un bord loin du coin non plus.
     #[test]
-    fn the_search_button_stays_hidden_when_already_on_the_screen() {
-        let (c, _) = BOUTON;
-        let mut t = Tab::new("x");
-        glide(&mut t, [0.5, 0.5], c, 60, 40);
-        assert_eq!(t.reveal, 0.0);
-        // Même en tournant dans le coin.
-        glide(&mut t, c, [0.0, 1.0], 20, 20);
-        glide(&mut t, [0.0, 1.0], c, 20, 20);
-        assert_eq!(t.reveal, 0.0);
-        // Par le bord gauche, mais en haut de l'écran : pas son coin.
-        let mut t = Tab::new("x");
-        glide(&mut t, [0.0, 0.3], c, 60, 40);
-        assert_eq!(t.reveal, 0.0);
-        // Par le bord droit, en bas : pas son coin non plus.
-        let mut t = Tab::new("x");
-        glide(&mut t, [1.0, 0.95], c, 60, 40);
-        assert_eq!(t.reveal, 0.0);
+    fn the_buttons_stay_hidden_when_already_on_the_screen() {
+        for b in [LOUPE, VIDEO] {
+            let c = BOUTONS[b];
+            let mut t = Tab::new("x");
+            glide(&mut t, [0.5, 0.5], c, 60, 40);
+            assert_eq!(t.reveal, [0.0; 2]);
+            // Même en tournant dans le coin.
+            glide(&mut t, c, [0.0, 0.0], 20, 20);
+            glide(&mut t, [0.0, 0.0], c, 20, 20);
+            assert_eq!(t.reveal, [0.0; 2]);
+            // Par le bord gauche, mais en bas de l'écran : pas leur coin.
+            let mut t = Tab::new("x");
+            glide(&mut t, [0.0, 0.7], c, 60, 40);
+            assert_eq!(t.reveal, [0.0; 2]);
+            // Par le haut, mais à droite : pas leur coin non plus.
+            let mut t = Tab::new("x");
+            glide(&mut t, [0.6, 0.0], c, 60, 40);
+            assert_eq!(t.reveal, [0.0; 2]);
+        }
     }
 
-    /// (v207) Une fois là, il s'en va dès qu'on sort de sa zone, et pour le revoir il faut
-    /// ressortir de l'écran et revenir par le bord.
+    /// (v207) Une fois là, un bouton s'en va dès qu'on sort de sa zone, et pour le revoir
+    /// il faut ressortir de l'écran et revenir par le bord.
     #[test]
-    fn the_search_button_fades_away_elsewhere_and_needs_a_new_entry() {
-        let (c, r) = BOUTON;
+    fn a_button_fades_away_elsewhere_and_needs_a_new_entry() {
+        let c = BOUTONS[LOUPE];
+        let r = RAYON;
         let mut t = Tab::new("x");
-        glide(&mut t, [0.0, 0.85], c, 30, 30);
-        assert!(t.reveal > 0.99);
-        // Un peu autour du bouton : il reste.
-        glide(&mut t, c, [c[0] + r * (ZONE - 0.3), c[1]], 10, 20);
-        assert!(t.reveal > 0.99, "{}", t.reveal);
+        glide(&mut t, [0.0, 0.15], c, 30, 30);
+        assert!(t.reveal[LOUPE] > 0.99);
+        // Un peu autour du bouton (côté écran) : il reste.
+        let autour = [c[0], c[1] + r * (ZONE - 0.3) * 16.0 / 9.0];
+        glide(&mut t, c, autour, 10, 20);
+        assert!(t.reveal[LOUPE] > 0.99, "{:?}", t.reveal);
         // On sort de sa zone, sans quitter l'écran : il s'en va en fondu.
-        glide(&mut t, [c[0] + r * (ZONE - 0.3), c[1]], [0.3, 0.6], 10, 0);
-        assert!(t.reveal < 1.0, "{}", t.reveal);
+        glide(&mut t, autour, [0.3, 0.4], 10, 0);
+        assert!(t.reveal[LOUPE] < 1.0, "{:?}", t.reveal);
         for _ in 0..40 {
             t.update(0.016);
         }
-        assert_eq!(t.reveal, 0.0);
+        assert_eq!(t.reveal[LOUPE], 0.0);
         // Revenir dessus sans quitter l'écran : il ne revient pas.
-        glide(&mut t, [0.3, 0.6], c, 30, 30);
-        assert_eq!(t.reveal, 0.0);
+        glide(&mut t, [0.3, 0.4], c, 30, 30);
+        assert_eq!(t.reveal[LOUPE], 0.0);
         // Ressortir de l'écran puis revenir par le bord : il revient.
         leave(&mut t);
-        glide(&mut t, [0.0, 0.85], c, 30, 30);
-        assert!(t.reveal > 0.99, "{}", t.reveal);
+        glide(&mut t, [0.0, 0.15], c, 30, 30);
+        assert!(t.reveal[LOUPE] > 0.99, "{:?}", t.reveal);
         // Un passage éclair par le bord ne le rend pas cliquable.
         leave(&mut t);
-        t.cursor = Some([0.0, 0.95]);
+        t.cursor = Some([0.0, 0.05]);
         t.update(0.016);
         t.cursor = Some(c);
         t.update(0.016);
-        assert!(t.reveal < CLIQUABLE, "{}", t.reveal);
+        assert!(t.reveal[LOUPE] < CLIQUABLE, "{:?}", t.reveal);
+    }
+
+    /// (v211) Sur la page du lecteur YouTube aussi, et le clic va au bon bouton.
+    #[test]
+    fn the_buttons_work_on_the_player_page_and_take_their_own_click() {
+        let mut t = Tab::new(&format!("{}?v=dQw4w9WgXcQ", crate::watch::LECTEUR));
+        let v = BOUTONS[VIDEO];
+        glide(&mut t, [v[0], 0.0], v, 20, 30);
+        assert!(t.reveal[VIDEO] > 0.99, "{:?}", t.reveal);
+        let mut d = Displays::new();
+        d.tabs.insert(3, t);
+        assert_eq!(d.button_clicked(3, v), Some(VIDEO));
+        assert_eq!(d.button_clicked(3, BOUTONS[LOUPE]), Some(LOUPE));
+        // Entre les deux ronds : à la page.
+        assert_eq!(d.button_clicked(3, [(BOUTONS[LOUPE][0] + v[0]) / 2.0, v[1]]), None);
+        assert_eq!(d.button_clicked(3, [0.5, 0.5]), None);
     }
     use super::*;
 
