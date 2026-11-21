@@ -508,6 +508,10 @@ pub enum BuildMsg {
         speed: f32,
         /// (v165) Son ping avec son relais (ms), montré dans la liste des joueurs (Tab).
         ping: u16,
+        /// (v222) Ce qu'il tient en main (`poses::Held::byte` : lampe torche, Foudre de
+        /// Zeus), 0 : rien de cela. Les autres le voient dans sa main (la lumière de la
+        /// lampe allumée, le crépitement de l'éclair).
+        held: u8,
     },
     /// Le relais du monde refuse la modification du joueur `peer` en `pos` : remise à lui
     /// seul, qui remet le bloc d'avant.
@@ -581,6 +585,7 @@ pub fn pose_of(data: &[u8]) -> Option<(String, crate::poses::Pose)> {
             crouch,
             speed,
             ping,
+            held,
         } => {
             let pose = crate::poses::Pose {
                 pos,
@@ -589,6 +594,7 @@ pub fn pose_of(data: &[u8]) -> Option<(String, crate::poses::Pose)> {
                 crouch,
                 speed,
                 ping: (ping > 0).then_some(ping),
+                held: crate::poses::Held::of(held).map_or(0, crate::poses::Held::byte),
             };
             pose.sane().then_some((pseudo, pose))
         }
@@ -779,5 +785,31 @@ mod tests {
         assert_ne!(a, b);
         m.fps.ct = Some(Zone::new([4, 10, 4], [0, 10, 0]));
         assert_eq!(b, m.signature(), "même zone, coins dans l'autre sens");
+    }
+
+    /// (v222) L'objet tenu (lampe torche, éclair) reste dans la position que le relais
+    /// regroupe avec d'autres (`pose_of`) ; un octet absurde y devient « rien ».
+    #[test]
+    fn the_held_item_stays_in_the_regrouped_position() {
+        let player = |held: u8| {
+            encode(&BuildMsg::Player {
+                pseudo: "Lampe".into(),
+                pos: [3.0, 70.0, -8.0],
+                yaw: 1.0,
+                pitch: -0.2,
+                crouch: 0.0,
+                speed: 4.0,
+                ping: 40,
+                held,
+            })
+        };
+        let on = crate::poses::Lamp { on: true, step: 7 }.byte();
+        let (name, pose) = pose_of(&player(on)).expect("position");
+        assert_eq!((name.as_str(), pose.held), ("Lampe", on));
+        let zeus = crate::poses::Held::Zeus.byte();
+        assert_eq!(pose_of(&player(zeus)).expect("position").1.held, zeus);
+        assert_eq!(pose_of(&player(0)).expect("position").1.held, 0);
+        assert_eq!(pose_of(&player(0x80 | 0x20)).expect("position").1.held, 0);
+        assert_eq!(pose_of(&player(0x21)).expect("position").1.held, 0);
     }
 }

@@ -171,9 +171,10 @@ fn dl_ign(frag: vec2<f32>) -> f32 {
 }
 
 /// Repère d'un projecteur dirigé selon `d` : (droite, haut, avant). Le même pour l'ombre,
-/// le gobo et le calcul de la carte d'ombre.
+/// le gobo et le calcul de la carte d'ombre (`spot_basis` de lights.rs, v222 : la droite
+/// suit le cap jusqu'à la verticale).
 fn dl_spot_basis(d: vec3<f32>) -> mat3x3<f32> {
-    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(d.y) > 0.99);
+    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), length(d.xz) < 1e-6);
     let s = normalize(cross(d, up));
     let u = cross(s, d);
     return mat3x3<f32>(s, u, d);

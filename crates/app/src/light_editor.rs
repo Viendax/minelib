@@ -816,10 +816,15 @@ impl Editor {
         best
     }
 
-    /// Repère du cône d'un projecteur : (direction, deux axes perpendiculaires).
+    /// Repère du cône d'un projecteur : (direction, deux axes perpendiculaires). (v222) Comme
+    /// celui du rendu (`spot_basis`) : il suit le cap jusqu'à la verticale.
     fn spot_frame(l: &PlacedLight) -> (Vec3, Vec3, Vec3) {
         let d = Vec3::from(l.direction).normalize_or(Vec3::NEG_Y);
-        let up = if d.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+        let up = if (d.x * d.x + d.z * d.z).sqrt() < 1e-6 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
         let s = d.cross(up).normalize();
         (d, s, s.cross(d))
     }

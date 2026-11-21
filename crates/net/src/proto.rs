@@ -4,7 +4,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Version du protocole : le relais refuse un jeu trop ancien.
-pub const PROTOCOL: u32 = 54;
+/// (v222) 55 : la lampe torche en main part avec la position (poses, `BuildMsg::Player`).
+pub const PROTOCOL: u32 = 55;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.

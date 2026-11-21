@@ -1221,6 +1221,7 @@ mod tests {
             crouch: 0.0,
             speed: 5.5,
             ping: 40,
+            held: 0,
         });
         let payload = postcard::to_allocvec(&Response::FromZone {
             peer: 123_456,
@@ -1342,6 +1343,7 @@ mod tests {
                                             crouch: 0.0,
                                             speed: 4.3,
                                             ping: None,
+                                            held: 0,
                                         };
                                         ((i as u64) * (n / k.max(1)).max(1) as u64 + 1, None, pose)
                                     })

@@ -785,16 +785,22 @@ pub fn tick_effects(
 
 // ------------------------------------------------------------ objets lâchés
 
-/// Vitesse du lancer d'un objet lâché (touche G) et pesanteur de sa chute : sur un sol
-/// plat, regard à l'horizontale, il retombe à environ 4 blocs.
+/// Vitesse du lancer d'un objet lâché (touche G en FPS ; (v222) en construction et en survie
+/// aussi, touche Q) et pesanteur de sa chute : sur un sol plat, regard à l'horizontale, il
+/// retombe à environ 4 blocs.
 const TOSS_SPEED: f32 = 6.5;
 const TOSS_LIFT: f32 = 2.5;
 const TOSS_GRAVITY: f32 = 16.0;
 
-/// Point de chute (posé sur le sol) d'un objet lâché depuis `eye` en regardant `look` :
-/// il part en cloche, s'arrête contre un mur et retombe jusqu'au sol (au plus 40 blocs
-/// plus bas, sinon il reste où il est). Toujours à moins de `cs::MAX_TOSS` des pieds.
-pub fn toss_landing(world: &World, eye: Vec3, look: Vec3) -> Vec3 {
+/// (v222) Temps entre deux points de `toss_path` (s).
+pub const TOSS_STEP: f32 = 1.0 / 30.0;
+
+/// (v222) Trajet d'un objet lancé depuis `eye` en regardant `look` : il part de la main (un
+/// peu sous les yeux) en cloche, s'arrête contre un mur et retombe jusqu'au sol. Regard vers
+/// le haut : lancé haut et plus loin ; vers le bas : à ses pieds. Un point tous les
+/// `TOSS_STEP` s ; le dernier est le point de chute, posé sur le sol (au bout de 8 s de vol
+/// au plus, assez pour tomber du haut du monde).
+pub fn toss_path(world: &World, eye: Vec3, look: Vec3) -> Vec<Vec3> {
     let solid = |p: Vec3| {
         world
             .get(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32)
@@ -805,9 +811,17 @@ pub fn toss_landing(world: &World, eye: Vec3, look: Vec3) -> Vec3 {
     if solid(p) {
         p = eye;
     }
+    let mut path = vec![p];
     let mut v = look.normalize_or_zero() * TOSS_SPEED + Vec3::Y * TOSS_LIFT;
     let dt = 1.0 / 240.0;
-    for _ in 0..(240 * 4) {
+    let every = (TOSS_STEP / dt).round() as usize;
+    for i in 0..(240 * 8) {
+        if i > 0 && i % every == 0 {
+            path.push(p);
+        }
+        if p.y < 0.0 {
+            break;
+        }
         v.y -= TOSS_GRAVITY * dt;
         let next = p + v * dt;
         if solid(next) {
@@ -839,6 +853,26 @@ pub fn toss_landing(world: &World, eye: Vec3, look: Vec3) -> Vec3 {
         }
         p = next;
     }
+    p.y = p.y.max(0.0);
+    if path.last() != Some(&p) {
+        path.push(p);
+    }
+    path
+}
+
+/// Point de chute (posé sur le sol) d'un objet lâché depuis `eye` en regardant `look` :
+/// il part en cloche, s'arrête contre un mur et retombe jusqu'au sol (voir `toss_path`).
+/// Toujours à moins de `cs::MAX_TOSS` des pieds.
+pub fn toss_landing(world: &World, eye: Vec3, look: Vec3) -> Vec3 {
+    let solid = |p: Vec3| {
+        world
+            .get(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32)
+            .is_solid()
+    };
+    let mut p = toss_path(world, eye, look)
+        .last()
+        .copied()
+        .unwrap_or(eye);
     // Ne pas sortir de la portée permise par l'hôte (ni rester dans un bloc).
     let feet = eye - Vec3::Y * 1.62;
     let d = Vec3::new(p.x - feet.x, 0.0, p.z - feet.z);
@@ -1026,6 +1060,37 @@ mod tests {
             }
         }
         w
+    }
+
+    /// (v222) Lâcher en construction ou en survie (Q) : le regard compte. Vers le haut, en
+    /// cloche (plus haut, et plus loin qu'à l'horizontale jusqu'à 45°) ; vers le bas, au sol
+    /// devant ses pieds. Le trajet part de la main et finit posé sur le sol.
+    #[test]
+    fn the_throw_follows_the_look() {
+        let w = floor();
+        let eye = Vec3::new(0.5, 11.0 + 1.62, 0.5);
+        let dir = |deg: f32| {
+            let p = deg.to_radians();
+            Vec3::new(0.0, p.sin(), -p.cos())
+        };
+        let (flat, up, down) = (
+            toss_path(&w, eye, dir(0.0)),
+            toss_path(&w, eye, dir(45.0)),
+            toss_path(&w, eye, dir(-60.0)),
+        );
+        let top = |p: &[Vec3]| p.iter().map(|q| q.y).fold(f32::MIN, f32::max);
+        let far = |p: &[Vec3]| 0.5 - p.last().map_or(0.5, |q| q.z);
+        for p in [&flat, &up, &down] {
+            assert!((p[0] - (eye - Vec3::Y * 0.3)).length() < 1e-4, "{:?}", p[0]);
+            let end = p.last().copied().unwrap_or_default();
+            assert!((end.y - 11.0).abs() < 0.05, "au sol : {end}");
+        }
+        assert!(top(&up) > top(&flat) + 1.0, "en cloche");
+        assert!(far(&up) > far(&flat) + 0.5, "{} {}", far(&up), far(&flat));
+        assert!(far(&down) < 1.6, "à ses pieds : {}", far(&down));
+        // Le vol dure le temps du lancer (un point tous les `TOSS_STEP`).
+        let span = (up.len() - 1) as f32 * TOSS_STEP;
+        assert!((0.9..1.3).contains(&span), "{span}");
     }
 
     #[test]

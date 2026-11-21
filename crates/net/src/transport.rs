@@ -602,6 +602,7 @@ mod tests {
                                 crouch: 0.0,
                                 speed: 4.0,
                                 ping: None,
+                                held: 0,
                             },
                         });
                         push_pose(&tx, &pose);

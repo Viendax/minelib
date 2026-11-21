@@ -19,13 +19,11 @@ use crate::inventory::Item;
 pub const FILE: &str = "objets.bin";
 /// On ramasse un objet à cette distance (blocs).
 pub const PICK_RANGE: f32 = 1.5;
-/// Un objet se lâche à cette distance devant soi, comme dans Minecraft.
-pub const DROP_REACH: f32 = 2.2;
 /// Délai avant de pouvoir ramasser un objet qui vient d'apparaître (le sien : plus long,
 /// le temps de s'en éloigner).
 const PICK_DELAY: f32 = 0.6;
 const OWN_PICK_DELAY: f32 = 2.0;
-/// Durée du vol d'un objet lâché (s).
+/// Durée du vol d'un objet lâché par un autre (s ; le sien suit son vrai trajet).
 const FLIGHT: f32 = 0.45;
 
 pub struct Items {
@@ -41,6 +39,9 @@ pub struct Items {
     pub picked: u32,
     /// Objets vus apparaître : quand, d'où ils ont été lancés, et si c'est le mien.
     born: HashMap<u64, (Instant, Option<Vec3>, bool)>,
+    /// (v222) Objets que je viens de lancer : leur trajet (un point tous les
+    /// `equip::TOSS_STEP` s, de ma main au sol), qu'ils suivent en volant.
+    flights: HashMap<u64, Vec<Vec3>>,
     /// Objets qu'on a demandé à ramasser (pas deux demandes pour le même).
     asked: HashMap<u64, Instant>,
     /// Le monde a changé depuis le dernier enregistrement.
@@ -65,6 +66,7 @@ impl Items {
             credits: Vec::new(),
             picked: 0,
             born: HashMap::new(),
+            flights: HashMap::new(),
             asked: HashMap::new(),
             dirty: false,
             start: Instant::now(),
@@ -106,12 +108,25 @@ impl Items {
         }
     }
 
-    /// Lâche `pile` (déjà retirée de l'inventaire) de `from` vers `to`.
-    pub fn drop_item(&mut self, from: Vec3, to: Vec3, pile: Pile) {
+    /// Lâche `pile` (déjà retirée de l'inventaire) de `from` vers `to` ; rend son numéro.
+    pub fn drop_item(&mut self, from: Vec3, to: Vec3, pile: Pile) -> u64 {
         let id: u64 = rand::random();
         self.born.insert(id, (Instant::now(), Some(from), true));
         let req = self.ledger.drop_item(id, to.to_array(), pile);
         self.outbox.push((chunk_at(to.x, to.z), req));
+        id
+    }
+
+    /// (v222) Lance `pile` (déjà retirée de l'inventaire) le long de `path`
+    /// (`equip::toss_path`) : il tombe au dernier point, et le suit en volant.
+    pub fn throw_item(&mut self, path: Vec<Vec3>, pile: Pile) {
+        let (Some(&from), Some(&to)) = (path.first(), path.last()) else {
+            return;
+        };
+        let id = self.drop_item(from, to, pile);
+        if path.len() >= 2 {
+            self.flights.insert(id, path);
+        }
     }
 
     /// Pose `pile` (déjà retirée de l'inventaire) dans un coffre.
@@ -135,6 +150,14 @@ impl Items {
         let now = Instant::now();
         self.asked
             .retain(|_, t| now.duration_since(*t).as_secs_f32() < 3.0);
+        // (v222) Trajets des objets lancés, une fois arrivés : oubliés.
+        let born = &self.born;
+        self.flights.retain(|id, path| {
+            born.get(id).is_some_and(|b| {
+                now.duration_since(b.0).as_secs_f32()
+                    < path.len() as f32 * crate::equip::TOSS_STEP + 1.0
+            })
+        });
         let near: Vec<(u64, [f32; 3])> = self
             .view
             .live_drops()
@@ -196,6 +219,7 @@ impl Items {
                 } else {
                     self.born.remove(id);
                     self.asked.remove(id);
+                    self.flights.remove(id);
                 }
                 self.dirty = true;
             }
@@ -232,7 +256,19 @@ impl Items {
             // Chaque objet a son propre décalage (ils ne bougent pas tous ensemble).
             let phase = (id % 628) as f32 / 100.0;
             let mut at = rest + Vec3::Y * (0.12 + 0.06 * (t * 2.0 + phase).sin());
-            if let Some((born, Some(from), _)) = self.born.get(&id) {
+            let flight = self.flights.get(&id);
+            if let (Some((born, _, _)), Some(path)) = (self.born.get(&id), flight) {
+                // (v222) Lancé par moi : son vrai trajet (en cloche, contre les murs), et
+                // son flottement d'objet posé qui arrive peu à peu (pas de saut à la fin).
+                let span = (path.len() - 1) as f32 * crate::equip::TOSS_STEP;
+                let f = born.elapsed().as_secs_f32();
+                if f < span {
+                    let k = f / crate::equip::TOSS_STEP;
+                    let i = (k as usize).min(path.len() - 2);
+                    let on = path[i].lerp(path[i + 1], (k - i as f32).min(1.0));
+                    at = on + (at - rest) * (f / span);
+                }
+            } else if let Some((born, Some(from), _)) = self.born.get(&id) {
                 let k = born.elapsed().as_secs_f32() / FLIGHT;
                 if k < 1.0 {
                     at = from.lerp(at, k) + Vec3::Y * 1.2 * k * (1.0 - k);
@@ -430,37 +466,6 @@ fn icon_kind(item: Item) -> RayBoxKind {
         // Tête à skin (au sol, elle devient une tête simple : voir `Item::code`).
         Item::Head(_) => RayBoxKind::Flat([214, 166, 132]),
     }
-}
-
-/// Où retombe un objet lâché de `eye` dans la direction `dir` : devant le joueur, posé sur
-/// le premier sol en dessous ; contre un mur, il tombe à ses pieds.
-pub fn landing(world: &World, eye: Vec3, dir: Vec3) -> Vec3 {
-    let flat = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
-    let solid = |p: Vec3| {
-        world
-            .get(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32)
-            .is_solid()
-    };
-    // Le plus loin possible devant soi sans traverser un mur.
-    let mut reach = 0.0;
-    let mut d = 0.2;
-    while d <= DROP_REACH {
-        if solid(eye + flat * d) {
-            break;
-        }
-        reach = d;
-        d += 0.2;
-    }
-    let mut p = eye + flat * reach;
-    // Chute jusqu'au sol.
-    for _ in 0..256 {
-        let below = p - Vec3::Y * 0.25;
-        if below.y < 0.0 || solid(below) {
-            break;
-        }
-        p = below;
-    }
-    Vec3::new(p.x, p.y.floor().max(0.0), p.z)
 }
 
 #[cfg(test)]

@@ -15,16 +15,19 @@ const HAND_FOV: f32 = 70.0;
 /// de l'écran. Épaisseur : le tiers, comme sur le modèle (4 × 12 × 4 pixels).
 const ARM_FIST: Vec3 = Vec3::new(0.474, -0.472, -0.938);
 const ARM_LEN: f32 = 0.6;
+/// (v222) Base du bras (le bout de l'épaule, en bas à droite de l'écran) : le coup vers le
+/// bas tourne autour d'elle.
+const ARM_BASE: Vec3 = Vec3::new(ARM_FIST.x, ARM_FIST.y, ARM_FIST.z + ARM_LEN);
 
 /// (v220) Geste de la main en cassant un bloc : un petit coup vers le bas, qui revient vite.
 /// En créatif, un coup par bloc cassé (`DIP_S`) ; en survie, tant qu'on casse, des coups en
 /// boucle, 50 % plus lents (`DIP_S` × 1,5), un toutes les `DIG_EVERY_S` (le temps de casser
-/// un bloc : une pause entre deux).
+/// un bloc : une pause entre deux). (v222) Tout le bras et ce qu'il tient tournent d'un bloc
+/// autour de la base du bras, qui ne bouge pas : seul le bout descend (demande de Viendax).
 pub const DIP_S: f32 = 0.2;
 pub const DIG_EVERY_S: f32 = 0.5;
-/// Descente (vue, blocs) et inclinaison (radians) au plus bas du coup.
-const DIP_DOWN: f32 = 0.06;
-const DIP_TILT: f32 = 0.25;
+/// Rotation (radians) au plus bas du coup : le poing descend de 0,6 × sin(0,12) ≈ 0,07.
+const DIP_TILT: f32 = 0.12;
 
 /// (v220) Geste demandé à la main à cette image.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -500,19 +503,19 @@ impl Hand {
         }
     }
 
-    /// (v220) Le coup vers le bas, dans la vue (x à droite, y en haut, −z devant) : la main
-    /// descend et s'incline un peu, quelle que soit sa place (objet, bras, lampe tenue par le
-    /// bras du modèle).
+    /// (v220) Le coup vers le bas, dans la vue (x à droite, y en haut, −z devant), pour la
+    /// main dessinée et tout ce qu'elle tient. (v222) Autour de la base du bras.
     pub fn dip_view(&self) -> Mat4 {
-        self.dip_about(ARM_FIST)
+        self.dip_about(ARM_BASE)
     }
 
-    /// (v220) Le même coup vers le bas, incliné autour de `pivot` (vue) : le poing de la
-    /// main dessinée, ou la lampe que tient le bras du modèle.
+    /// (v222) Le coup vers le bas : le bras et ce qu'il tient tournent d'un bloc autour de
+    /// `pivot` (vue), la base du bras (la main dessinée, ou l'épaule du bras du modèle qui
+    /// tient la lampe). La base ne bouge pas, le bout descend. (En v220, tout descendait et
+    /// penchait autour du poing : la base remontait.)
     pub fn dip_about(&self, pivot: Vec3) -> Mat4 {
         let d = self.dip_amount();
-        // (Inclinée autour du poing, pas des yeux : elle ne fait que pencher.)
-        Mat4::from_translation(Vec3::new(0.0, -DIP_DOWN * d, 0.0) + pivot)
+        Mat4::from_translation(pivot)
             * Mat4::from_rotation_x(-DIP_TILT * d)
             * Mat4::from_translation(-pivot)
     }
@@ -859,6 +862,13 @@ mod tests {
         assert!(deepest.0 < -0.05 && deepest.0 > -0.1, "{deepest:?}");
         assert!(deepest.1 < DIP_S * 0.5, "{deepest:?}");
         assert!(low(&h).abs() < 1e-6, "revenu");
+        // (v222) Au plus bas, la base du bras n'a pas bougé : seul le bout descend.
+        let mut h = Hand::default();
+        h.update(dt, 0.0, Gesture::Dip, None);
+        h.update(DIP_S / 3.0 - dt, 0.0, Gesture::None, None);
+        assert!(low(&h) < -0.06, "{}", low(&h));
+        let base = h.dip_view().transform_point3(ARM_BASE);
+        assert!(base.distance(ARM_BASE) < 1e-5, "{base} {ARM_BASE}");
         // Survie : des coups en boucle, un par `DIG_EVERY_S`, chacun plus long (1,5 ×).
         let mut h = Hand::default();
         let (mut starts, mut was, mut t) = (Vec::new(), false, 0.0);

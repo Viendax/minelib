@@ -403,33 +403,48 @@ impl rodio::Source for Wobble {
     }
 }
 
-/// (v220) Crépitement électrique sans fin et jamais pareil (la Foudre de Zeus tenue) : des
-/// claquements secs (bruit d'une à trois millisecondes), parfois en rafale, de temps en temps
-/// un grésillement (bruit filtré, 20 à 70 ms) ou un « zap » (dents de scie qui tombent d'une
-/// octave en 40 à 90 ms). Instants, forces et hauteurs tirés au hasard à chaque fois : rien
-/// ne se répète (règle des sons du jeu : voir `claude/sons.md` du projet).
+/// (v220) Crépitement électrique sans fin et jamais pareil (la Foudre de Zeus tenue). (v222)
+/// Sourd, étouffé, demandé par Viendax (« un truc qui crépite plus sourdement ») : des
+/// claquements graves (bruit filtré passe-bas de 400 à 1 600 Hz et un petit coup sourd de 55
+/// à 135 Hz, 5 à 16 ms), parfois en rafale ; de temps en temps un grésillement étouffé (bruit
+/// sous 350 à 700 Hz, 50 à 180 ms) ou un ronflement (dents de scie graves, 70 à 160 Hz, qui
+/// tombent d'une demi-octave en 60 à 150 ms) ; le tout sous un passe-bas à 1 800 Hz. Avant :
+/// des claquements secs de bruit blanc et des « zaps » aigus (centre du spectre vers 5 kHz,
+/// 400 Hz maintenant). Instants, forces, hauteurs et filtres tirés au hasard à chaque fois :
+/// rien ne se répète (règle des sons du jeu : voir `claude/sons.md` du projet).
 pub struct Crackle {
     rng: u64,
     sparks: Vec<Spark>,
-    /// Échantillons avant le prochain claquement, et avant le prochain grésillement ou zap ;
-    /// claquements encore à venir dans la rafale en cours.
+    /// Échantillons avant le prochain claquement, et avant le prochain grésillement ou
+    /// ronflement ; claquements encore à venir dans la rafale en cours.
     next_click: u32,
     next_buzz: u32,
     burst: u32,
-    /// Filtres (passe-bas d'un pôle) du bruit des grésillements, et du tout (adoucit).
-    lp: f32,
-    out: f32,
+    /// Passe-bas (deux pôles) du tout : étouffé.
+    lp1: f32,
+    lp2: f32,
 }
 
 #[derive(Clone, Copy)]
 struct Spark {
-    /// 0 claquement, 1 grésillement, 2 zap.
+    /// 0 claquement, 1 grésillement, 2 ronflement.
     kind: u8,
     age: u32,
     len: u32,
     amp: f32,
+    /// Coefficient de son passe-bas (deux pôles, `lp` et `lp2`).
+    cut: f32,
+    /// Claquement : hauteur du coup sourd et sa part ; ronflement : hauteur de départ.
     freq: f32,
+    mix: f32,
     phase: f32,
+    lp: f32,
+    lp2: f32,
+}
+
+/// Coefficient d'un passe-bas d'un pôle coupant à `hz`.
+fn lowpass(hz: f32) -> f32 {
+    1.0 - (-std::f32::consts::TAU * hz / synth::RATE as f32).exp()
 }
 
 impl Crackle {
@@ -440,11 +455,11 @@ impl Crackle {
             next_click: 0,
             next_buzz: 0,
             burst: 0,
-            lp: 0.0,
-            out: 0.0,
+            lp1: 0.0,
+            lp2: 0.0,
         };
-        c.next_click = c.between(200, 2_000);
-        c.next_buzz = c.between(4_000, 20_000);
+        c.next_click = c.between(300, 2_500);
+        c.next_buzz = c.between(6_000, 24_000);
         c
     }
 
@@ -472,94 +487,114 @@ impl Crackle {
 
     fn spark(&mut self, kind: u8) {
         let ms = synth::RATE / 1000;
-        let s = match kind {
-            0 => Spark {
-                kind,
-                age: 0,
-                len: self.between(ms, 3 * ms),
-                amp: 0.25 + 0.75 * self.unit(),
-                freq: 0.0,
-                phase: 0.0,
-            },
-            1 => Spark {
-                kind,
-                age: 0,
-                len: self.between(20 * ms, 70 * ms),
-                amp: 0.15 + 0.3 * self.unit(),
-                freq: 0.0,
-                phase: 0.0,
-            },
-            _ => Spark {
-                kind,
-                age: 0,
-                len: self.between(40 * ms, 90 * ms),
-                amp: 0.12 + 0.2 * self.unit(),
-                freq: 280.0 * 2f32.powf(self.unit() * 1.6),
-                phase: 0.0,
-            },
+        let mut s = Spark {
+            kind,
+            age: 0,
+            len: 0,
+            amp: 0.0,
+            cut: 0.0,
+            freq: 0.0,
+            mix: 0.0,
+            phase: 0.0,
+            lp: 0.0,
+            lp2: 0.0,
         };
+        match kind {
+            0 => {
+                s.len = self.between(5 * ms, 16 * ms);
+                s.amp = 0.3 + 0.7 * self.unit();
+                s.cut = lowpass(400.0 * 2f32.powf(self.unit() * 2.0));
+                s.freq = 55.0 * 2f32.powf(self.unit() * 1.3);
+                s.mix = 0.05 + 0.2 * self.unit();
+            }
+            1 => {
+                s.len = self.between(50 * ms, 180 * ms);
+                s.amp = 0.15 + 0.25 * self.unit();
+                s.cut = lowpass(350.0 * 2f32.powf(self.unit()));
+            }
+            _ => {
+                s.len = self.between(60 * ms, 150 * ms);
+                s.amp = 0.15 + 0.2 * self.unit();
+                s.cut = lowpass(600.0);
+                s.freq = 70.0 * 2f32.powf(self.unit() * 1.2);
+            }
+        }
         if self.sparks.len() < 24 {
             self.sparks.push(s);
         }
     }
 }
 
+/// Bruit filtré par deux pôles de coefficient `a` : son écart-type est à peu près
+/// 0,29·√a ; ramené à 0,72 (le bruit blanc de départ est à 0,58).
+const NOISE_LEVEL: f32 = 2.5;
+
 impl Iterator for Crackle {
     type Item = i16;
 
     fn next(&mut self) -> Option<i16> {
-        // Claquements : un à la fois (10 à 95 ms d'écart), ou une rafale de 3 à 6 très
-        // rapprochés (2 à 9 ms).
+        // Claquements : un à la fois (15 à 120 ms d'écart), ou une rafale de 3 à 6
+        // rapprochés (3 à 12 ms).
         if self.next_click == 0 {
             self.spark(0);
             if self.burst > 0 {
                 self.burst -= 1;
-                self.next_click = self.between(60, 300);
-            } else if self.unit() < 0.18 {
-                self.burst = self.between(2, 6);
-                self.next_click = self.between(60, 300);
+                self.next_click = self.between(90, 380);
+            } else if self.unit() < 0.2 {
+                self.burst = self.between(2, 5);
+                self.next_click = self.between(90, 380);
             } else {
-                self.next_click = self.between(320, 3_000);
+                self.next_click = self.between(480, 3_800);
             }
         }
         self.next_click -= 1;
         if self.next_buzz == 0 {
-            let zap = self.unit() < 0.4;
-            self.spark(if zap { 2 } else { 1 });
-            self.next_buzz = self.between(11_000, 45_000);
+            let rumble = self.unit() < 0.45;
+            self.spark(if rumble { 2 } else { 1 });
+            self.next_buzz = self.between(12_000, 48_000);
         }
         self.next_buzz -= 1;
         let mut v = 0.0f32;
         let mut sparks = std::mem::take(&mut self.sparks);
         for sp in &mut sparks {
             let u = sp.age as f32 / sp.len.max(1) as f32;
+            let a = sp.cut;
+            let x = if sp.kind == 2 {
+                // Dents de scie graves qui tombent d'une demi-octave.
+                let f = sp.freq * 2f32.powf(-0.5 * u);
+                sp.phase = (sp.phase + f / synth::RATE as f32).fract();
+                sp.phase * 2.0 - 1.0
+            } else {
+                self.noise()
+            };
+            sp.lp += a * (x - sp.lp);
+            sp.lp2 += a * (sp.lp - sp.lp2);
             v += match sp.kind {
                 0 => {
-                    // Bruit dont la force tombe vite (exponentielle).
-                    self.noise() * sp.amp * (-5.0 * u).exp()
+                    // Montée d'un tiers de milliseconde (pas de clic sec), baisse
+                    // exponentielle ; un coup sourd qui descend un peu dessous.
+                    let env = (sp.age as f32 / 12.0).min(1.0) * (-4.5 * u).exp();
+                    let f = sp.freq * (1.0 - 0.35 * u);
+                    sp.phase = (sp.phase + f / synth::RATE as f32).fract();
+                    let thump = (std::f32::consts::TAU * sp.phase).sin() * (-6.0 * u).exp();
+                    let n = sp.lp2 * NOISE_LEVEL / a.sqrt();
+                    sp.amp * (n * (1.0 - sp.mix) + thump * sp.mix) * env
                 }
                 1 => {
-                    // Bruit adouci (passe-bas), montée de 2 ms, puis baisse.
-                    let n = self.noise();
-                    self.lp += 0.35 * (n - self.lp);
-                    let env = (sp.age as f32 / 64.0).min(1.0) * (1.0 - u);
-                    (n - self.lp) * sp.amp * env
+                    let env = (std::f32::consts::PI * u).sin();
+                    sp.amp * sp.lp2 * NOISE_LEVEL / a.sqrt() * env
                 }
-                _ => {
-                    // Dents de scie qui tombent d'une octave, un peu de bruit dessus.
-                    let f = sp.freq * 2f32.powf(-u);
-                    sp.phase = (sp.phase + f / synth::RATE as f32).fract();
-                    let saw = sp.phase * 2.0 - 1.0;
-                    (saw * 0.8 + self.noise() * 0.2) * sp.amp * (1.0 - u) * (1.0 - u)
-                }
+                _ => sp.amp * sp.lp2 * 1.4 * (1.0 - u) * (1.0 - u),
             };
             sp.age += 1;
         }
         sparks.retain(|sp| sp.age < sp.len);
         self.sparks = sparks;
-        // Un peu adouci, et jamais saturé.
-        self.out += 0.6 * (v - self.out);
-        Some((self.out.tanh() * 0.8 * i16::MAX as f32) as i16)
+        // Étouffé (passe-bas à 1 800 Hz), et jamais saturé.
+        let g = lowpass(1_800.0);
+        self.lp1 += g * (v - self.lp1);
+        self.lp2 += g * (self.lp1 - self.lp2);
+        Some(((self.lp2 * 0.55).tanh() * 0.8 * i16::MAX as f32) as i16)
     }
 }
 
@@ -1430,7 +1465,7 @@ mod tests {
 
     /// (v220) Le crépitement de l'éclair tenu : de vrais craquements (ni silence ni
     /// saturation), jamais deux fois la même chose (deux demi-secondes de suite diffèrent,
-    /// deux éclairs aussi), et entendu jusqu'à `ZEUS_HEAR` blocs seulement.
+    /// deux éclairs aussi), sourd (v222), et entendu jusqu'à `ZEUS_HEAR` blocs seulement.
     #[test]
     fn the_crackle_never_repeats() {
         let half = synth::RATE as usize / 2;
@@ -1448,6 +1483,13 @@ mod tests {
             );
         }
         assert_ne!(a, b);
+        // (v222) Sourd : la fréquence moyenne (d'après la pente du signal) reste sous
+        // 1 200 Hz (plus de 5 kHz pour les claquements secs de la v220).
+        let x: Vec<f64> = a.iter().map(|&v| v as f64).collect();
+        let e: f64 = x.iter().map(|v| v * v).sum();
+        let d: f64 = x.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum();
+        let hz = synth::RATE as f64 / std::f64::consts::TAU * (d / e).sqrt();
+        assert!(hz < 1_200.0, "trop aigu : {hz:.0} Hz");
         assert_eq!(crackle_gain(0.0), 1.0);
         assert!(crackle_gain(5.0) > 0.2 && crackle_gain(5.0) < 0.3);
         assert_eq!(crackle_gain(ZEUS_HEAR), 0.0);

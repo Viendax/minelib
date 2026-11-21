@@ -622,6 +622,24 @@ fn cloud_y(pos: Vec3) -> f32 {
     CLOUD_Y.max(pos.y + 160.0)
 }
 
+
+/// (v222) Lumière de la Foudre de Zeus tenue par un autre joueur (le `k`-ième proche), en
+/// `pos` : comme la sienne (`Storm::held_light`), avec le scintillement (`glow`) de son
+/// éclair. Son bit de porteur est mis par l'appelant (ses morceaux ne la cachent pas).
+pub fn held_light_at(pos: Vec3, glow: f32, k: usize) -> DynLight {
+    DynLight {
+        id: ZEUS_LIGHT_ID + 1 + k as u64,
+        kind: DynKind::Point,
+        pos: pos.to_array(),
+        color: BOLT_LIGHT,
+        intensity: 3.0 * glow,
+        range: 14.0,
+        shadows: true,
+        beam: 0.0,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

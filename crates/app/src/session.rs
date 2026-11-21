@@ -63,6 +63,18 @@ const PING_S: f32 = 8.0;
 const PING_RANGE: f32 = 400.0;
 const MAX_PINGS: usize = 3;
 
+/// (v222) On voit l'éclair tenu par un autre joueur jusqu'à tant de blocs.
+const ZEUS_SEEN: f32 = 64.0;
+
+/// (v222) Numéro du crépitement de l'éclair d'un autre joueur (jamais celui du sien, 1).
+fn crackle_id(pseudo: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in pseudo.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h | 2
+}
+
 /// (v220) Survie : temps (s) de clic tenu pour casser un bloc, le même pour tous les blocs
 /// pour l'instant. En créatif, un bloc se casse tout de suite.
 const BREAK_S: f32 = 0.5;
@@ -245,6 +257,8 @@ pub struct Session {
     gesture: crate::hand::Gesture,
     /// (v220) Interface masquée (touche F1, construction) : voir `hud_off`.
     hud_hidden: bool,
+    /// (v222) Éclairs tenus par les autres joueurs (voir `update_remote_bolts`).
+    remote_bolts: HashMap<String, crate::lightning::HeldBolt>,
     /// (v220) Un éclair tenu crépitait à l'image d'avant (voir `update_crackles`).
     crackling: bool,
     pub fov: f32,
@@ -442,6 +456,9 @@ pub struct Session {
     /// tout près d'elles fait une ombre géante, il passe avant ceux qui sont seulement près
     /// de la caméra.
     shadow_lights: Vec<(Vec3, f32)>,
+    /// (v222) Lampes allumées des autres joueurs qui éclairent à cette image : leur pseudo
+    /// et leur bit de porteur (voir `remote_lamp_lights`).
+    remote_lamps: Vec<(String, u32)>,
     lights_state: minelib_render::DynState,
     /// Déjà fait dans cette partie : lumières notées comme utilisées, refus dit au joueur.
     lights_marked: bool,
@@ -630,6 +647,7 @@ impl Session {
             dig: None,
             gesture: crate::hand::Gesture::None,
             hud_hidden: false,
+            remote_bolts: HashMap::new(),
             crackling: false,
             place_cooldown: 0.0,
             fov: FOV,
@@ -744,6 +762,7 @@ impl Session {
             light_op_probe: None,
             lights_wanted: false,
             shadow_lights: Vec::new(),
+            remote_lamps: Vec::new(),
             lights_state: minelib_render::DynState::Off,
             lights_marked: false,
             lights_failed_said: false,
@@ -1490,10 +1509,25 @@ impl Session {
             if dt > 0.0 {
                 self.fps_avg += (1.0 / dt - self.fps_avg) * 0.02;
             }
+            // (v222) Ce qu'on tient et que les autres voient, envoyé avec la position : la
+            // lampe torche (allumée ou non, son réglage) ou la Foudre de Zeus.
+            let held = match self.held_item() {
+                Some(Item::Flashlight) => Some(minelib_net::poses::Held::Lamp(
+                    minelib_net::poses::Lamp {
+                        on: self.flashlight_on,
+                        step: (self.flashlight_focus
+                            * f32::from(minelib_net::poses::Lamp::STEPS))
+                        .round() as u8,
+                    },
+                )),
+                Some(Item::Zeus) => Some(minelib_net::poses::Held::Zeus),
+                _ => None,
+            };
             if let Some(b) = &mut self.build {
                 if self.world.journal.is_none() {
                     self.world.journal = Some(Vec::new());
                 }
+                b.held = held;
                 let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
                 let (caps, dirty) = b.update(
                     &mut self.world,
@@ -1890,12 +1924,26 @@ impl Session {
             // bouge, passe avant celles des autres).
             // (v216) De même la Foudre de Zeus tenue ; et les coups de foudre proches
             // éclairent le sol et les murs autour d'eux.
+            let mut at = 0;
             if let Some(l) = self
                 .flashlight_light()
                 .or_else(|| self.held_torch_light())
                 .or_else(|| self.zeus_light())
             {
                 list.insert(0, l);
+                at = 1;
+            }
+            // (v222) Lampes allumées et éclairs des autres joueurs, les plus proches : juste
+            // après la sienne (portées, leurs cartes d'ombre suivent chaque image).
+            let remote = if allowed {
+                self.remote_held_lights(cam)
+            } else {
+                Vec::new()
+            };
+            self.remote_lamps.clear();
+            for (k, (pseudo, l)) in remote.into_iter().enumerate() {
+                self.remote_lamps.push((pseudo, l.owner));
+                list.insert((at + k).min(list.len()), l);
             }
             if allowed {
                 self.storm.lights(cam, &mut list);
@@ -2563,7 +2611,9 @@ impl Session {
         }
         let playing = self.game.mode.has_inventory() && self.game.mode != GameMode::Fps;
         if playing {
-            // Lâcher l'objet en main (Ctrl : toute la pile), comme dans Minecraft.
+            // Lâcher l'objet en main (Ctrl : toute la pile), comme dans Minecraft. (v222)
+            // Lancé selon le regard, comme les armes en FPS : vers le haut, en cloche et plus
+            // loin ; vers le bas, au sol devant ses pieds.
             if input.grabbed
                 && !typing
                 && !self.inventory.open
@@ -2572,13 +2622,16 @@ impl Session {
                 let all = input.held(KeyCode::ControlLeft) || input.held(KeyCode::ControlRight);
                 let n = if all { crate::inventory::MAX_STACK } else { 1 };
                 if let Some(st) = self.inventory.take_from(self.inventory.selected, n) {
-                    let eye = self.player.eye();
-                    let to = crate::drops::landing(&self.world, eye, self.player.look_dir());
+                    let path = crate::equip::toss_path(
+                        &self.world,
+                        self.player.eye(),
+                        self.player.look_dir(),
+                    );
                     let pile = Pile {
                         item: st.item.code(),
                         count: st.count.min(64) as u8,
                     };
-                    self.items.drop_item(eye - Vec3::Y * 0.3, to, pile);
+                    self.items.throw_item(path, pile);
                 }
             }
             // Ramasser ce qui est à portée, s'il y a de la place ; (v220) pas avant d'être
@@ -3429,6 +3482,142 @@ impl Session {
         ))
     }
 
+    /// (v222) Pose du modèle d'un autre joueur (construction en ligne) tenant `held`.
+    fn other_pose(
+        &self,
+        o: &crate::buildnet::Other,
+        held: Option<crate::player_model::Held>,
+    ) -> crate::player_model::Pose {
+        let w = self.walks.get(&o.pseudo);
+        crate::player_model::Pose {
+            feet: o.pos,
+            yaw: o.yaw,
+            pitch: o.pitch,
+            walk: w.map_or(0.0, |w| w.phase),
+            swing: w.map_or(0.0, |w| w.amp),
+            crouch: o.crouch,
+            light: [1.0; 3],
+            held,
+            skin: None,
+        }
+    }
+
+    /// (v222) Lumières de ce que tiennent les autres joueurs (construction en ligne) : leur
+    /// lampe torche allumée (depuis l'ampoule de la lampe que tient leur modèle, vers leur
+    /// regard, à leur réglage) ou leur Foudre de Zeus (depuis leur poing, avec son
+    /// scintillement). Les `flashlight::REMOTE_LAMPS` plus proches de la caméra, à moins de
+    /// `flashlight::REMOTE_RANGE` ; chacune a son bit de porteur : les morceaux de celui qui
+    /// la tient ne la cachent pas (voir `lamp_owner`).
+    fn remote_held_lights(&self, cam: Vec3) -> Vec<(String, minelib_render::DynLight)> {
+        use minelib_net::poses::Held;
+        let Some(b) = &self.build else {
+            return Vec::new();
+        };
+        let range2 = crate::flashlight::REMOTE_RANGE * crate::flashlight::REMOTE_RANGE;
+        let mut near: Vec<(f32, &crate::buildnet::Other)> = b
+            .others
+            .values()
+            .filter(|o| match o.held {
+                Some(Held::Lamp(l)) => l.on,
+                Some(Held::Zeus) => true,
+                None => false,
+            })
+            .map(|o| (o.pos.distance_squared(cam), o))
+            .filter(|(d2, _)| *d2 < range2)
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut out = Vec::new();
+        for (k, (_, o)) in near
+            .into_iter()
+            .take(crate::flashlight::REMOTE_LAMPS)
+            .enumerate()
+        {
+            let mut l = match o.held {
+                Some(Held::Lamp(lamp)) => {
+                    let pose =
+                        self.other_pose(o, Some(crate::player_model::Held::Flashlight(true)));
+                    let Some(bulb) = crate::player_model::flashlight_bulb(&pose) else {
+                        continue;
+                    };
+                    let (sy, cy) = o.yaw.sin_cos();
+                    let (sp, cp) = o.pitch.sin_cos();
+                    let look = Vec3::new(sy * cp, sp, -cy * cp);
+                    let focus = f32::from(lamp.step) / f32::from(minelib_net::poses::Lamp::STEPS);
+                    let mut l =
+                        crate::flashlight::light(bulb, eye_of(o.pos, o.crouch), look, focus);
+                    l.id = crate::flashlight::LIGHT_ID + 1 + k as u64;
+                    l
+                }
+                Some(Held::Zeus) => {
+                    let pose = self.other_pose(o, Some(crate::player_model::Held::Zeus));
+                    let Some(grip) = crate::player_model::zeus_frame(&pose) else {
+                        continue;
+                    };
+                    let glow = self.remote_bolts.get(&o.pseudo).map_or(1.0, |h| h.glow());
+                    // Comme la sienne : de l'éclair lui-même, au-dessus du poing.
+                    let at = grip.transform_point3(Vec3::Y * (crate::lightning::HELD_LEN * 0.42));
+                    crate::storm::held_light_at(at, glow, k)
+                }
+                None => continue,
+            };
+            l.owner = crate::flashlight::REMOTE_HOLDER << k;
+            out.push((o.pseudo.clone(), l));
+        }
+        out
+    }
+
+    /// (v222) Éclairs tenus par les autres joueurs (construction en ligne) à moins de
+    /// `ZEUS_SEEN` blocs de la caméra : chacun son éclair qui crépite et ses étincelles,
+    /// dans sa main (comme on voit le sien à la troisième personne).
+    fn update_remote_bolts(&mut self, dt: f32, cam: Vec3) {
+        use minelib_net::poses::Held;
+        let holders: Vec<(String, Mat4)> = self
+            .build
+            .as_ref()
+            .map(|b| {
+                b.others
+                    .values()
+                    .filter(|o| {
+                        o.held == Some(Held::Zeus)
+                            && o.pos.distance_squared(cam) < ZEUS_SEEN * ZEUS_SEEN
+                    })
+                    .filter_map(|o| {
+                        let pose = self.other_pose(o, Some(crate::player_model::Held::Zeus));
+                        Some((o.pseudo.clone(), crate::player_model::zeus_frame(&pose)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // (Ceux qui l'ont rangé : leurs étincelles finissent leur course, puis on les oublie.)
+        let mut arcs = Vec::new();
+        for (pseudo, bolt) in &mut self.remote_bolts {
+            let place = holders.iter().find(|(p, _)| p == pseudo).map(|h| h.1);
+            bolt.update(dt, place.unwrap_or(Mat4::IDENTITY), place.is_some());
+            arcs.clear();
+            if let Some(place) = place {
+                bolt.arcs(&mut arcs);
+                crate::lightning::in_world(&arcs, place, &mut self.storm.bolts);
+            }
+            arcs.clear();
+            bolt.sparks(&mut arcs);
+            crate::lightning::in_world(&arcs, Mat4::IDENTITY, &mut self.storm.bolts);
+        }
+        self.remote_bolts
+            .retain(|p, b| holders.iter().any(|h| &h.0 == p) || b.has_sparks());
+        for (pseudo, _) in holders {
+            self.remote_bolts.entry(pseudo).or_default();
+        }
+    }
+
+    /// (v222) Bit de porteur de la lampe allumée de l'autre joueur `pseudo` (voir
+    /// `remote_lamp_lights`), s'il en a une qui éclaire ici.
+    fn lamp_owner(&self, pseudo: &str) -> Option<u32> {
+        self.remote_lamps
+            .iter()
+            .find(|(p, _)| p == pseudo)
+            .map(|(_, bit)| *bit)
+    }
+
     /// (v201) Torche tenue, avec les torches en lumières ponctuelles : une lumière
     /// ponctuelle à sa flamme, comme les torches posées (au lieu de la lumière simple de la
     /// torche tenue).
@@ -3545,6 +3734,9 @@ impl Session {
         for (at, phase) in self.items.bolts(eye) {
             self.storm.ground_item(at, phase);
         }
+        // (v222) Ceux des autres joueurs.
+        let cam = self.camera_pos();
+        self.update_remote_bolts(dt, cam);
         // Lumière du jour montrée : moins sous un ciel couvert, plus l'éclat des éclairs.
         self.daylight_shown =
             (self.daylight * self.storm.light() + self.storm.flash * 1.5).min(2.2);
@@ -4242,6 +4434,31 @@ impl Session {
                 dir: v.normalize_or(Vec3::NEG_Z).to_array(),
                 gain: crate::audio::crackle_gain(hand.distance(cam)),
             });
+        }
+        // (v222) Ceux des autres joueurs (construction en ligne) à moins de `ZEUS_HEAR` blocs,
+        // depuis leur poing : les huit plus proches.
+        if active && self.loading.is_none() {
+            let mut near: Vec<(f32, u64, Vec3)> = self
+                .build
+                .iter()
+                .flat_map(|b| b.others.values())
+                .filter(|o| o.held == Some(minelib_net::poses::Held::Zeus))
+                .filter_map(|o| {
+                    let pose = self.other_pose(o, Some(crate::player_model::Held::Zeus));
+                    let p = crate::player_model::zeus_frame(&pose)?.transform_point3(Vec3::ZERO);
+                    let d = p.distance(cam);
+                    (d < crate::audio::ZEUS_HEAR).then(|| (d, crackle_id(&o.pseudo), p))
+                })
+                .collect();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (d, id, p) in near.into_iter().take(8) {
+                let v = view.transform_point3(p);
+                list.push(crate::audio::CrackleAt {
+                    id,
+                    dir: v.normalize_or(Vec3::NEG_Z).to_array(),
+                    gain: crate::audio::crackle_gain(d),
+                });
+            }
         }
         if !list.is_empty() || self.crackling {
             self.crackling = !list.is_empty();
@@ -7848,6 +8065,7 @@ impl Session {
                 walk: None,
                 skin: self.skins.of(&o.pseudo),
                 covered: None,
+                held: o.held,
             }));
         }
         if let Some(c) = &self.crowd {
@@ -7863,6 +8081,7 @@ impl Session {
                 // jamais.
                 skin: n.skin.clone(),
                 covered: Some(n.covered),
+                held: None,
             }));
         }
         if !others.is_empty() {
@@ -7910,8 +8129,28 @@ impl Session {
                             sky_light(&self.world, eye_of(o.pos, o.crouch), self.daylight_shown)
                         }
                     },
-                    held: None,
+                    // (v222) Ce qu'il tient : sa lampe torche (bras tendu vers son regard,
+                    // comme on la voit soi-même dans un miroir) ou la Foudre de Zeus (l'éclair
+                    // est dessiné à part : voir `update_remote_bolts`).
+                    held: o.held.map(|h| match h {
+                        minelib_net::poses::Held::Lamp(l) => Held::Flashlight(l.on),
+                        minelib_net::poses::Held::Zeus => Held::Zeus,
+                    }),
                     skin: o.skin.clone(),
+                };
+                if other.held.is_some() {
+                    model.extend(crate::player_model::held_model(&other, true));
+                }
+                // (v222) Sa propre lampe n'est pas cachée par lui (voir `remote_lamps`).
+                let own_lamp = self.lamp_owner(o.pseudo);
+                let boxes_of = |other: &crate::player_model::Pose| {
+                    let mut boxes = crate::player_model::shadow_boxes(other);
+                    if let Some(bit) = own_lamp {
+                        for b in &mut boxes {
+                            b.owner |= bit;
+                        }
+                    }
+                    boxes
                 };
                 if players.len() < minelib_render::MAX_PLAYERS {
                     let layer = layers.layer(other.skin.as_ref(), renderer);
@@ -7924,11 +8163,7 @@ impl Session {
                     // jusqu'à la distance réglée.
                     if d2 <= shadow_d2 {
                         if shadow {
-                            shadows.push((
-                                o.pos,
-                                crate::player_model::shadow_boxes(&other),
-                                Some(inst),
-                            ));
+                            shadows.push((o.pos, boxes_of(&other), Some(inst)));
                         } else {
                             sun_casters.push(inst);
                         }
@@ -7937,7 +8172,7 @@ impl Session {
                     players.push(inst);
                 } else {
                     if shadow && d2 <= shadow_d2 {
-                        shadows.push((o.pos, crate::player_model::shadow_boxes(&other), None));
+                        shadows.push((o.pos, boxes_of(&other), None));
                     }
                     model.extend(crate::player_model::build_tiny(&other));
                 }
@@ -8031,9 +8266,10 @@ impl Session {
                 crate::player_model::flashlight_matrix(&p)?,
                 crate::player_model::right_arm_matrix(&p)?,
             );
-            // (v220) Le coup vers le bas de la main (bloc cassé) : la lampe et le bras
-            // penchent autour de la lampe, comme la main dessinée autour du poing.
-            let pivot = view.transform_point3(lamp.transform_point3(Vec3::splat(0.5)));
+            // (v220) Le coup vers le bas de la main (bloc cassé). (v222) La lampe et le bras
+            // tournent ensemble autour de l'épaule (la base du bras, bout z = 1 de sa
+            // boîte), comme la main dessinée autour de la sienne : seul le bout descend.
+            let pivot = view.transform_point3(arm.transform_point3(Vec3::new(0.5, 0.5, 1.0)));
             let dip = view.inverse() * self.hand.dip_about(pivot) * view;
             Some((dip * lamp, dip * arm))
         })
@@ -8981,6 +9217,8 @@ struct Other<'a> {
     /// (v191) Abri déjà connu (la foule le garde en mémoire), sinon cherché ici : voir
     /// `sky_light`.
     covered: Option<bool>,
+    /// (v222) Ce qu'il tient en main (construction en ligne) : lampe torche, Foudre de Zeus.
+    held: Option<minelib_net::poses::Held>,
 }
 
 /// Marche d'un autre joueur : même balancement que le sien en F5, d'après la vitesse

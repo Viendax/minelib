@@ -2,7 +2,8 @@
 //! l'éditeur de lumières (cône de lumière, arrêté par les murs, rayons dans l'air selon les
 //! réglages des lumières), droit devant, là où l'on regarde. Clic droit : l'allumer ou
 //! l'éteindre. Comme les autres lumières de l'éditeur, elle n'éclaire que chez celui qui la
-//! tient.
+//! tient ; (v222) sauf en construction en ligne, où les autres la voient dans sa main et en
+//! reçoivent la lumière (voir `REMOTE_LAMPS`).
 
 use glam::{Mat4, Vec3};
 use minelib_render::{DynKind, DynLight, VmVertex};
@@ -18,6 +19,13 @@ pub const HOLDER: u32 = 1;
 /// (v202) Bit en plus du morceau du joueur tout contre la flamme de la torche qu'il tient
 /// (sa main) : seul écarté de la lumière de la torche, le reste du joueur y fait son ombre.
 pub const NEAR_FLAME: u32 = 2;
+
+/// (v222) Lampes des autres joueurs (construction en ligne) qui éclairent ici : au plus tant,
+/// les plus proches de la caméra, à moins de `REMOTE_RANGE` blocs. Chacune a son bit de
+/// porteur, `REMOTE_HOLDER << k` : les morceaux de celui qui la tient ne la cachent pas.
+pub const REMOTE_LAMPS: usize = 8;
+pub const REMOTE_HOLDER: u32 = 4;
+pub const REMOTE_RANGE: f32 = 96.0;
 
 /// Couleurs (sRGB) : corps, bagues, interrupteur, tête, verre allumé et éteint.
 pub const BODY: [u8; 3] = [40, 40, 44];

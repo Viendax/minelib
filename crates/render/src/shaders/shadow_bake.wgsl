@@ -215,7 +215,8 @@ fn shadow_march(o: vec3<f32>, d: vec3<f32>, max_t: f32, skip_start: bool) -> f32
             break; // hors de la grille : rien de connu au-delà
         }
         let id = raw & 4095u;
-        let own = skip_start && all(cell == start);
+        let at_start = all(cell == start);
+        let own = skip_start && at_start;
         if id != 0u && !own {
             let pal = textureLoad(palette, i32(id), 0);
             let torch = (pal.w >> 8u) & 7u;
@@ -224,7 +225,14 @@ fn shadow_march(o: vec3<f32>, d: vec3<f32>, max_t: f32, skip_start: bool) -> f32
             let partial = kind != 0u && kind != 3u;
             var ht = t;
             var hax = axis;
-            var hit = torch == 0u;
+            // (v222) Lumière posée dans un bloc non plein à trous (feuillage, verre clair) ou
+            // dans une plante : elle en sort, son propre bloc ne l'arrête pas. Avant, chaque
+            // rayon y lisait la texture au point de départ (la lumière elle-même), le même
+            // pour tous : selon l'endroit de la case, toute la lumière passait ou aucune.
+            // (Dalles, escaliers, clôtures : leurs boîtes comptent ; celle où est la
+            // lumière ne l'arrête pas, voir `shape_hit`.)
+            let holed = kind == 3u || (kind == 0u && ((shp.w >> 4u) & 1u) != 0u);
+            var hit = torch == 0u && !(at_start && holed);
             if hit && kind == 3u {
                 // Plante : ses deux plans, trous de la texture compris.
                 ht = cross_hit(o, d, cell, t, pal.y);

@@ -3209,6 +3209,7 @@ pub(crate) fn player_as(data: &[u8], pseudo: &str) -> Option<Vec<u8>> {
             crouch,
             speed,
             ping,
+            held,
             ..
         } => Some(game::encode(&game::BuildMsg::Player {
             pseudo: pseudo.to_string(),
@@ -3218,6 +3219,7 @@ pub(crate) fn player_as(data: &[u8], pseudo: &str) -> Option<Vec<u8>> {
             crouch,
             speed,
             ping,
+            held,
         })),
         _ => None,
     }
@@ -10079,6 +10081,7 @@ mod tests {
                     crouch: 0.0,
                     speed: 0.0,
                     ping: 0,
+                    held: 0,
                 }),
             },
         );

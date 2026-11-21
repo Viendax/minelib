@@ -111,6 +111,8 @@ pub struct Other {
     seen: f32,
     /// (v165) Son ping avec son relais (ms), s'il est connu.
     pub ping: Option<u16>,
+    /// (v222) Ce qu'il tient en main et qu'on voit (lampe torche, Foudre de Zeus).
+    pub held: Option<minelib_net::poses::Held>,
 }
 
 /// Le bloc qui fait foi en `pos` vient de changer (`truth` : publié par le garant, ou
@@ -285,6 +287,9 @@ pub struct BuildNet {
     /// part pas, les autres ne le voient pas apparaître avant. (Ce qu'il faut du monde, si :
     /// le relais apprend dans quel chunk on arrive et envoie ce qu'il y a de changé.)
     pub hidden: bool,
+    /// (v222) Ce qu'on tient en main et que les autres voient (lampe torche, Foudre de
+    /// Zeus ; donné par la partie à chaque image), envoyé avec ses positions.
+    pub held: Option<minelib_net::poses::Held>,
     /// Clé du relais du monde (dans le billet) : vérifie les bonjours de la voix.
     root: Option<[u8; 32]>,
     /// Clé du compte (modifications signées dans une région souveraine), et date de la
@@ -504,6 +509,7 @@ impl BuildNet {
             voice_in: Vec::new(),
             ping: 0,
             hidden: false,
+            held: None,
             root: None,
             identity: None,
             sign_t: 0,
@@ -1766,6 +1772,7 @@ impl BuildNet {
                 crouch,
                 speed,
                 ping: self.ping,
+                held: self.held.map_or(0, minelib_net::poses::Held::byte),
             };
             self.send_at(
                 chunk,
@@ -1985,6 +1992,7 @@ impl BuildNet {
                 crouch,
                 speed,
                 ping,
+                held,
             } => {
                 let pose = minelib_net::poses::Pose {
                     pos,
@@ -1993,6 +2001,7 @@ impl BuildNet {
                     crouch,
                     speed,
                     ping: (ping > 0).then_some(ping),
+                    held,
                 };
                 // Numéro sur le relais du monde (le vocal passe par lui).
                 self.player_seen((peer != 0).then_some(peer), &pseudo, pose);
@@ -2056,6 +2065,7 @@ impl BuildNet {
                 if p.ping.is_some() {
                     o.ping = p.ping;
                 }
+                o.held = minelib_net::poses::Held::of(p.held);
             }
             None => {
                 self.others.insert(
@@ -2072,6 +2082,7 @@ impl BuildNet {
                         speed: p.speed,
                         seen: 0.0,
                         ping: p.ping,
+                        held: minelib_net::poses::Held::of(p.held),
                     },
                 );
             }
@@ -2994,6 +3005,16 @@ mod tests {
         }
     }
 
+    /// (v222) Ce que tient le joueur `i` d'un scénario (voir `run`).
+    fn item_of(i: usize) -> Option<minelib_net::poses::Held> {
+        use minelib_net::poses::{Held, Lamp};
+        match i {
+            1 => Some(Held::Zeus),
+            2 => Some(Held::Lamp(Lamp { on: true, step: 4 })),
+            _ => None,
+        }
+    }
+
     /// Ce qui se passe pendant un essai.
     #[derive(Default)]
     struct Scenario {
@@ -3182,6 +3203,10 @@ mod tests {
                 if gone.contains(&i) {
                     continue;
                 }
+                // (v222) Le deuxième tient la Foudre de Zeus, le troisième sa lampe allumée.
+                if let Some(n) = b.net.as_mut() {
+                    n.held = item_of(i);
+                }
                 let r = rnd();
                 b.pos.x = (b.pos.x + (r % 3) as f32 - 1.0).clamp(33.0, 95.0);
                 b.pos.z = (b.pos.z + ((r >> 4) % 3) as f32 - 1.0).clamp(1.0, 30.0);
@@ -3316,6 +3341,23 @@ mod tests {
                 "{} : en attente",
                 b.name
             );
+        }
+        // (v222) Ce que tiennent les autres arrive avec leurs positions, quel que soit le
+        // chemin (relais du monde, relais de la région, d'un relais à l'autre).
+        for who in [1, 2] {
+            if who >= bots.len() || gone.contains(&who) {
+                continue;
+            }
+            let name: String = bots[who].name.chars().take(16).collect();
+            let seen: Vec<_> = live
+                .iter()
+                .filter(|b| b.name != bots[who].name)
+                .filter_map(|b| b.net.as_ref().unwrap().others.get(&name))
+                .collect();
+            assert!(!seen.is_empty(), "personne ne voit {name}");
+            for o in seen {
+                assert_eq!(o.held, item_of(who), "ce que tient {name}");
+            }
         }
         // Plusieurs relais : chacun voit quand même tous les autres (les positions passent
         // d'un relais à l'autre).
@@ -6228,6 +6270,7 @@ mod tests {
                 crouch: 0.0,
                 speed: 4.0,
                 ping: 30,
+                held: 0,
             })
         };
         let dt = 0.05;
@@ -6248,6 +6291,39 @@ mod tests {
             .fold(0.0, f32::max);
         assert!(jumps < 0.5, "bond de {jumps}");
         assert!(shown[119] > 15.0, "il avance : {}", shown[119]);
+    }
+
+    /// (v222) Ce que tient un autre joueur arrive avec sa position : la lampe torche allumée à
+    /// tel cran, éteinte, la Foudre de Zeus, puis rien.
+    #[test]
+    fn another_players_held_item_comes_with_his_position() {
+        use minelib_net::poses::{Held, Lamp};
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut b = BuildNet::new(tx, "Moi".into(), false);
+        let mut w = World::new(0);
+        let msg = |held: u8| {
+            game::encode(&BuildMsg::Player {
+                pseudo: "Lampe".into(),
+                pos: [2.0, 64.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                crouch: 0.0,
+                speed: 0.0,
+                ping: 30,
+                held,
+            })
+        };
+        let on = Lamp { on: true, step: 3 };
+        b.receive(7, [0, 0], &msg(on.byte()), &mut w);
+        let _ = b.update(&mut w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, 0.05);
+        assert_eq!(b.others["Lampe"].held, Some(Held::Lamp(on)));
+        let off = Lamp { on: false, step: 10 };
+        b.receive(7, [0, 0], &msg(off.byte()), &mut w);
+        assert_eq!(b.others["Lampe"].held, Some(Held::Lamp(off)));
+        b.receive(7, [0, 0], &msg(Held::Zeus.byte()), &mut w);
+        assert_eq!(b.others["Lampe"].held, Some(Held::Zeus));
+        b.receive(7, [0, 0], &msg(0), &mut w);
+        assert_eq!(b.others["Lampe"].held, None);
     }
 
     #[test]

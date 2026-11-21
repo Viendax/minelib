@@ -19,6 +19,67 @@ pub struct Pose {
     /// (v165) Son ping avec son relais (ms), pour la liste des joueurs (Tab) : il ne part
     /// qu'avec une position sur huit environ (à 4 ms près, au plus 1020).
     pub ping: Option<u16>,
+    /// (v222) Ce qu'il tient en main et que les autres voient (voir `Held`) : 0, rien de
+    /// particulier.
+    pub held: u8,
+}
+
+/// (v222) La lampe torche d'un joueur, telle que les autres la voient : en main ou non,
+/// allumée ou non, et le réglage de son faisceau (0 : large … 10 : serré, par crans de la
+/// molette). Un octet : 0 sans lampe ; sinon bit 7 = en main, bit 6 = allumée, bits 0 à 3 =
+/// le réglage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Lamp {
+    pub on: bool,
+    /// Cran du faisceau, 0 à `Lamp::STEPS`.
+    pub step: u8,
+}
+
+/// (v222) Ce qu'un joueur tient en main et que les autres voient et entendent : la lampe
+/// torche (son octet, voir `Lamp`) ou la Foudre de Zeus (`Held::ZEUS`). Un octet, 0 :
+/// rien de tout cela.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    Lamp(Lamp),
+    Zeus,
+}
+
+impl Held {
+    /// L'octet de la Foudre de Zeus (bit 7 à 0 : jamais celui d'une lampe).
+    pub const ZEUS: u8 = 0x20;
+
+    pub fn byte(self) -> u8 {
+        match self {
+            Held::Lamp(l) => l.byte(),
+            Held::Zeus => Self::ZEUS,
+        }
+    }
+
+    /// Ce que dit un octet (`None` : rien, ou octet absurde).
+    pub fn of(b: u8) -> Option<Held> {
+        if b == Self::ZEUS {
+            Some(Held::Zeus)
+        } else {
+            Lamp::of(b).map(Held::Lamp)
+        }
+    }
+}
+
+impl Lamp {
+    pub const STEPS: u8 = 10;
+
+    /// L'octet d'une lampe en main.
+    pub fn byte(self) -> u8 {
+        0x80 | (self.on as u8) << 6 | self.step.min(Self::STEPS)
+    }
+
+    /// La lampe que dit un octet (`None` : pas de lampe en main, ou octet absurde).
+    pub fn of(b: u8) -> Option<Lamp> {
+        (b & 0x80 != 0 && b & 0x30 == 0 && b & 0x0f <= Self::STEPS).then_some(Lamp {
+            on: b & 0x40 != 0,
+            step: b & 0x0f,
+        })
+    }
 }
 
 /// Paquets écrits jusqu'ici : le ping de chaque joueur part à tour de rôle.
@@ -89,19 +150,29 @@ pub fn pack_poses(entries: &mut Vec<(u64, Option<&str>, Pose)>) -> Vec<u8> {
     for (id, name, p) in entries.iter() {
         put(&mut out, id - last);
         last = *id;
-        // Pseudo présent ou non, accroupi sur 2 bits, ping présent ou non (une position sur
-        // huit, à tour de rôle), vitesse sur 4 (par pas de 2 blocs/s).
+        // Pseudo présent ou non, accroupi sur 2 bits, suppléments ou non, vitesse sur 4
+        // (par pas de 2 blocs/s). (v222) Les suppléments (un octet de plus, qui dit lesquels
+        // suivent) : le ping (une position sur huit, à tour de rôle), l'objet tenu (lampe
+        // torche, éclair).
         let crouch = (p.crouch.clamp(0.0, 1.0) * 3.0).round() as u8;
         let speed = (p.speed.clamp(0.0, 30.0) / 2.0).round() as u8;
         let ping = p.ping.filter(|_| id.wrapping_add(round) % 8 == 0);
+        let held = Held::of(p.held).map(Held::byte);
+        let extras = ping.is_some() as u8 | (held.is_some() as u8) << 1;
         let name = name.map(|n| &n.as_bytes()[..n.len().min(255)]);
-        out.push(name.is_some() as u8 | crouch << 1 | (ping.is_some() as u8) << 3 | speed << 4);
+        out.push(name.is_some() as u8 | crouch << 1 | ((extras != 0) as u8) << 3 | speed << 4);
         if let Some(n) = name {
             out.push(n.len() as u8);
             out.extend_from_slice(n);
         }
+        if extras != 0 {
+            out.push(extras);
+        }
         if let Some(ms) = ping {
             out.push((ms / 4).min(255) as u8);
+        }
+        if let Some(b) = held {
+            out.push(b);
         }
         for (v, b) in p.pos.iter().zip(base) {
             put_signed(&mut out, fixed(*v) - b);
@@ -138,12 +209,30 @@ pub fn unpack_poses(data: &[u8]) -> Option<Vec<(u64, Option<String>, Pose)>> {
         } else {
             None
         };
-        let ping = if flags & 8 != 0 {
+        // (v222) Suppléments : ping, objet tenu ; un bit inconnu : paquet refusé.
+        let extras = if flags & 8 != 0 {
+            let e = *data.get(at)?;
+            at += 1;
+            if e & !3 != 0 || e == 0 {
+                return None;
+            }
+            e
+        } else {
+            0
+        };
+        let ping = if extras & 1 != 0 {
             let v = *data.get(at)? as u16 * 4;
             at += 1;
             Some(v)
         } else {
             None
+        };
+        let held = if extras & 2 != 0 {
+            let b = *data.get(at)?;
+            at += 1;
+            Held::of(b)?.byte()
+        } else {
+            0
         };
         let mut pos = [0f32; 3];
         for (a, p) in pos.iter_mut().enumerate() {
@@ -160,6 +249,7 @@ pub fn unpack_poses(data: &[u8]) -> Option<Vec<(u64, Option<String>, Pose)>> {
             crouch: (flags >> 1 & 3) as f32 / 3.0,
             speed: (flags >> 4) as f32 * 2.0,
             ping,
+            held,
         };
         if !pose.sane() {
             return None;
@@ -209,6 +299,12 @@ mod tests {
                         crouch: unit(&mut seed),
                         speed: unit(&mut seed) * 30.0,
                         ping: Some((rnd(&mut seed) % 900) as u16),
+                        held: [
+                            0,
+                            Lamp { on: true, step: 3 }.byte(),
+                            Lamp { on: false, step: 10 }.byte(),
+                            Held::Zeus.byte(),
+                        ][(rnd(&mut seed) % 4) as usize],
                     };
                     (id, p)
                 })
@@ -238,6 +334,8 @@ mod tests {
                 if let Some(ms) = b.ping {
                     assert!(p.ping.is_some_and(|q| q.abs_diff(ms) < 4), "{p:?} {b:?}");
                 }
+                // (v222) L'objet tenu (lampe torche, éclair), tel quel.
+                assert_eq!(p.held, b.held);
             }
         }
     }
@@ -260,6 +358,7 @@ mod tests {
                     crouch: 0.0,
                     speed: 4.0,
                     ping: Some(40),
+                    held: 0,
                 };
                 ((3u64 << 40) + 17 + i * 5, None, p)
             })
@@ -285,6 +384,7 @@ mod tests {
             crouch: 0.0,
             speed: 0.0,
             ping: Some(123),
+            held: 0,
         };
         let mut heard = [false; 20];
         for _ in 0..8 {
@@ -308,6 +408,7 @@ mod tests {
             crouch: 0.0,
             speed: 0.0,
             ping: None,
+            held: 0,
         };
         let mut e = vec![
             (1u64, None, good),

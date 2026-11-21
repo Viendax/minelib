@@ -357,9 +357,14 @@ const F_BOX_SHADOWS: u32 = 128;
 const F_HALF_LIGHT: u32 = 256;
 
 /// Repère d'un projecteur dirigé selon `d` : (droite, haut, avant) — le même que
-/// `dl_spot_basis` dans dynlights.wgsl.
+/// `dl_spot_basis` dans dynlights.wgsl. La droite est horizontale, de côté par rapport au
+/// cap de `d` : elle tourne avec lui, sans à-coup, jusqu'à la verticale (v222 ; avant, au-delà
+/// de 0,99 de pente, elle passait d'un coup à un repère fixe : un gobo tournait brusquement).
+/// L'éditeur et la caméra s'arrêtent à 89,9° : seul un `d` tout à fait vertical, sans cap,
+/// prend le repère fixe.
 pub fn spot_basis(d: Vec3) -> (Vec3, Vec3, Vec3) {
-    let up = if d.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let flat = (d.x * d.x + d.z * d.z).sqrt();
+    let up = if flat < 1e-6 { Vec3::Z } else { Vec3::Y };
     let s = d.cross(up).normalize();
     let u = s.cross(d);
     (s, u, d)
@@ -746,6 +751,16 @@ struct Slot {
     /// À recalculer (lumière déplacée, bloc changé près d'elle).
     dirty: bool,
     seen: u64,
+    /// (v222) La lumière telle qu'elle était quand sa carte a été calculée.
+    baked_key: Option<ShadowKey>,
+}
+
+impl Slot {
+    /// (v222) Carte calculée pour la lumière telle qu'elle est (ni déplacée, ni tournée, ni
+    /// changée depuis) : à refaire seulement si des blocs ont changé.
+    fn current(&self) -> bool {
+        self.baked && self.baked_key == Some(self.key)
+    }
 }
 
 /// Places dans l'atlas des ombres : cases libres, et carte de chaque lumière.
@@ -828,6 +843,7 @@ impl ShadowCache {
                     baked: false,
                     dirty: true,
                     seen: frame,
+                    baked_key: None,
                 },
             );
         }
@@ -955,7 +971,8 @@ fn changed_bricks(
 /// voit pas toujours toute sa portée (la lampe porte jusqu'à 128 blocs), et sa carte d'avant,
 /// prise d'ailleurs et dans une autre direction, ne vaut plus rien : sa lumière était coupée
 /// par des ombres de ce qu'elle éclairait au moment où on l'a allumée. Au-delà de la grille,
-/// rien ne l'arrête.
+/// rien ne l'arrête. (v222) `baked` : une carte faite pour la lumière telle qu'elle est
+/// (`Slot::current`) ; déplacée, tournée ou changée, elle est refaite.
 fn keeps_old_map(baked: bool, l: &DynLight, voxels: Option<[i32; 3]>) -> bool {
     baked && l.owner == 0 && voxels.is_some_and(|o| !grid_covers(o, l))
 }
@@ -2590,8 +2607,11 @@ impl DynGpu {
                     continue;
                 };
                 // Carte à refaire, mais la grille ne voit pas toute la lumière (joueur loin) :
-                // on garde celle d'avant (voir `keeps_old_map`).
-                if keeps_old_map(s.baked, &l, voxels) {
+                // on garde celle d'avant (voir `keeps_old_map`), (v222) si elle a été faite
+                // pour la lumière telle qu'elle est. Déplacée ou tournée, sa carte d'avant ne
+                // vaut plus rien : son ombre ne suivait plus (un projecteur mis tout droit
+                // vers le bas, loin de la caméra, gardait l'ombre de sa direction d'avant).
+                if keeps_old_map(s.current(), &l, voxels) {
                     continue;
                 }
                 let n = s.count as usize;
@@ -2627,6 +2647,7 @@ impl DynGpu {
                     push(s.tile, spot_basis(unit_dir(l.dir)), s.key.tan_half);
                 }
                 s.baked = true;
+                s.baked_key = Some(s.key);
                 s.dirty = false;
             }
         }
@@ -3549,6 +3570,48 @@ mod tests {
             !keeps_old_map(false, &far, Some(origin)),
             "une première carte se calcule"
         );
+    }
+
+    /// (v222) Une lumière posée que la grille ne voit pas toute garde sa carte tant qu'elle
+    /// ne change pas (des blocs changés près d'elle) ; tournée (un projecteur mis tout droit
+    /// vers le bas, loin de la caméra), sa carte d'avant ne vaut plus rien : refaite.
+    #[test]
+    fn a_turned_light_rebakes_even_out_of_the_grid() {
+        let origin = [-64, 40, -64];
+        let mut far = spot(10, [300.0, 72.0, 0.5], [0.13, -0.99, -0.08], 20.0, 45.0);
+        let mut c = ShadowCache::default();
+        c.reset(16);
+        let s = c.request(&far, 1).unwrap();
+        s.baked = true;
+        s.baked_key = Some(s.key);
+        s.dirty = true; // un bloc a changé près d'elle
+        assert!(keeps_old_map(c.slots[&10].current(), &far, Some(origin)));
+        far.dir = [0.0, -1.0, 0.0];
+        let s = c.request(&far, 2).unwrap();
+        assert!(s.dirty && !s.current());
+        assert!(!keeps_old_map(s.current(), &far, Some(origin)), "refaite");
+    }
+
+    /// (v222) Le repère d'un projecteur tourne avec son cap jusqu'à la verticale, sans
+    /// à-coup : 360° sans souci, gobo et carte d'ombre compris.
+    #[test]
+    fn the_spot_frame_turns_smoothly_down_to_vertical() {
+        let cap = 58f32.to_radians();
+        let dir = |pitch: f32| {
+            let p = pitch.to_radians();
+            Vec3::new(cap.sin() * p.cos(), p.sin(), -cap.cos() * p.cos())
+        };
+        let (r0, _, _) = spot_basis(dir(-60.0));
+        for k in 0..3000 {
+            let pitch = -60.0 - k as f32 * 0.01; // jusqu'à −89,99°
+            let (r, u, f) = spot_basis(dir(pitch));
+            assert!((r - r0).length() < 1e-4, "{pitch} : {r} / {r0}");
+            assert!(r.dot(u).abs() < 1e-4 && r.dot(f).abs() < 1e-4 && u.dot(f).abs() < 1e-4);
+            assert!((r.length() - 1.0).abs() < 1e-4 && (u.length() - 1.0).abs() < 1e-4);
+        }
+        // Tout à fait vertical : un repère quand même.
+        let (r, u, _) = spot_basis(Vec3::NEG_Y);
+        assert!(r.is_finite() && u.is_finite() && r.length() > 0.99);
     }
 
     #[test]

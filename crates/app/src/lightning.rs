@@ -906,6 +906,11 @@ impl HeldBolt {
 
     /// Éclat de l'éclair à cet instant (autour de 1) : sa lumière sur les murs scintille
     /// avec lui, et monte quand il crépite.
+    /// (v222) Des étincelles volent encore (l'éclair rangé, elles finissent leur course).
+    pub fn has_sparks(&self) -> bool {
+        !self.sparks.is_empty()
+    }
+
     pub fn glow(&self) -> f32 {
         let mut fl = Rng::new((self.t * 40.0) as u64 ^ 0xf1_1c);
         let flicker = fl.range(0.72, 1.3);
