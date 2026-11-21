@@ -56,7 +56,9 @@ fn from_ycocg(c: vec3<f32>) -> vec3<f32> {
 
 /// Lecture bicubique (Catmull-Rom) en 5 lectures bilinéaires au lieu de 9 : les 4 coins,
 /// de poids presque nul, sont omis et les poids renormalisés. L'historique reste net.
-fn sample_history(uv: vec2<f32>) -> vec3<f32> {
+/// (v204) Rend aussi l'alpha de la lecture du milieu (le marqueur des objets en mouvement,
+/// voir `fs_resolve`) : une lecture de moins qu'en le relisant à part.
+fn sample_history(uv: vec2<f32>) -> vec4<f32> {
     let size = params.size.xy;
     let pos = uv * size;
     let center = floor(pos - 0.5) + 0.5;
@@ -75,7 +77,8 @@ fn sample_history(uv: vec2<f32>) -> vec3<f32> {
     let wr = w3.x * w12.y;
     let wt = w12.x * w0.y;
     let wb = w12.x * w3.y;
-    let sc = textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t12.y), 0.0).rgb;
+    let sc4 = textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t12.y), 0.0);
+    let sc = sc4.rgb;
     let sl = textureSampleLevel(history, lin_sampler, vec2<f32>(t0.x, t12.y), 0.0).rgb;
     let sr = textureSampleLevel(history, lin_sampler, vec2<f32>(t3.x, t12.y), 0.0).rgb;
     let st = textureSampleLevel(history, lin_sampler, vec2<f32>(t12.x, t0.y), 0.0).rgb;
@@ -87,7 +90,7 @@ fn sample_history(uv: vec2<f32>) -> vec3<f32> {
     // lectures elles-mêmes (des moyennes des pixels voisins), il reste net sans liseré.
     let lo = min(min(min(sc, sl), min(sr, st)), sb);
     let hi = max(max(max(sc, sl), max(sr, st)), sb);
-    return clamp(c, lo, hi);
+    return vec4<f32>(clamp(c, lo, hi), sc4.a);
 }
 
 /// Rapproche `c` de `center` jusqu'à ce qu'il entre dans la boîte [lo, hi].
@@ -109,49 +112,73 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     let size = vec2<i32>(params.internal.xy);
     let upscale = params.internal.z < 0.999;
     let p = select(vec2<i32>(i.clip.xy), clamp(vec2<i32>(i.uv * params.internal.xy), vec2<i32>(0), size - 1), upscale);
-    // Échelle réduite : couleur lue entre les pixels du monde, à l'endroit exact de ce pixel
-    // d'écran (décalage sous-pixel annulé) ; sinon le pixel lui-même.
-    let cur_uv = i.uv + params.jitter.xy / params.internal.xy;
-    let cur = select(
-        textureLoad(cur_color, p, 0).rgb,
-        textureSampleLevel(cur_color, lin_sampler, cur_uv, 0.0).rgb,
-        upscale,
-    );
-
     // Voisinage 3×3 : moyenne et écart type (en YCoCg), et le voisin le plus proche de la
     // caméra (Z inversé : profondeur la plus grande) dont on prend le mouvement — les bords
     // des objets proches suivent ainsi l'objet et non le fond.
+    //
+    // (v204) Mêmes valeurs, moins de lectures (43 → 26 par pixel) : les neuf profondeurs
+    // viennent de quatre lectures groupées (`textureGather` : les quatre pixels autour d'un
+    // coin, tels quels), le pixel du milieu n'est plus relu à part, et le mouvement du
+    // voisinage se lit en quatre moyennes de 2 × 2 pixels au lieu de neuf pixels.
+    let isize = params.internal.xy;
+    let corner = vec2<f32>(p);
+    // Ordre de `textureGather` : (x0, y1), (x1, y1), (x1, y0), (x0, y0).
+    let g00 = textureGather(cur_depth, lin_sampler, corner / isize);
+    let g10 = textureGather(cur_depth, lin_sampler, (corner + vec2<f32>(1.0, 0.0)) / isize);
+    let g01 = textureGather(cur_depth, lin_sampler, (corner + vec2<f32>(0.0, 1.0)) / isize);
+    let g11 = textureGather(cur_depth, lin_sampler, (corner + vec2<f32>(1.0, 1.0)) / isize);
+    // Les neuf profondeurs, ligne par ligne (dy = -1, 0, 1 ; dx = -1, 0, 1).
+    var depths = array<f32, 9>(g00.w, g00.z, g10.z, g00.x, g00.y, g10.y, g01.x, g01.y, g11.y);
+    let d_cur = depths[4];
     var m1 = vec3<f32>(0.0);
     var m2 = vec3<f32>(0.0);
     var cmin = vec3<f32>(1e9);
     var cmax = vec3<f32>(-1e9);
     var best_depth = -1.0;
     var best = p;
-    // (v202) Plus grand mouvement du voisinage (px², au carré) : un objet qui bouge tout près.
-    var mmax = 0.0;
-    for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
-            let q = clamp(p + vec2<i32>(dx, dy), vec2<i32>(0), size - 1);
-            let c = to_ycocg(textureLoad(cur_color, q, 0).rgb);
-            m1 += c;
-            m2 += c * c;
-            cmin = min(cmin, c);
-            cmax = max(cmax, c);
-            let d = textureLoad(cur_depth, q, 0);
-            if d > best_depth {
-                best_depth = d;
-                best = q;
-            }
-            let mv = textureLoad(cur_motion, q, 0).xy;
-            mmax = max(mmax, dot(mv, mv));
+    var center = vec3<f32>(0.0);
+    for (var k = 0; k < 9; k++) {
+        let q = clamp(p + vec2<i32>(k % 3 - 1, k / 3 - 1), vec2<i32>(0), size - 1);
+        let rgb = textureLoad(cur_color, q, 0).rgb;
+        if k == 4 {
+            center = rgb;
         }
+        let c = to_ycocg(rgb);
+        m1 += c;
+        m2 += c * c;
+        cmin = min(cmin, c);
+        cmax = max(cmax, c);
+        let d = depths[k];
+        if d > best_depth {
+            best_depth = d;
+            best = q;
+        }
+    }
+    // Échelle réduite : couleur lue entre les pixels du monde, à l'endroit exact de ce pixel
+    // d'écran (décalage sous-pixel annulé) ; sinon le pixel lui-même.
+    var cur = center;
+    if upscale {
+        let cur_uv = i.uv + params.jitter.xy / isize;
+        cur = textureSampleLevel(cur_color, lin_sampler, cur_uv, 0.0).rgb;
+    }
+    // (v202) Un objet bouge tout près (joueur, PNJ qui marche, bras qui balance) : un des
+    // neuf pixels bouge de plus d'un centième de pixel. (v204) Lu en quatre moyennes de
+    // 2 × 2 pixels, aux quatre coins du pixel : un seul pixel qui bouge de 0,01 y compte
+    // pour 0,0025.
+    let ma = textureSampleLevel(cur_motion, lin_sampler, corner / isize, 0.0).xy;
+    let mb = textureSampleLevel(cur_motion, lin_sampler, (corner + vec2<f32>(1.0, 0.0)) / isize, 0.0).xy;
+    let mc = textureSampleLevel(cur_motion, lin_sampler, (corner + vec2<f32>(0.0, 1.0)) / isize, 0.0).xy;
+    let md = textureSampleLevel(cur_motion, lin_sampler, (corner + vec2<f32>(1.0, 1.0)) / isize, 0.0).xy;
+    let mmax = max(max(dot(ma, ma), dot(mb, mb)), max(dot(mc, mc), dot(md, md)));
+    let near_motion = mmax > 6.25e-6;
+    let mv_here = textureLoad(cur_motion, p, 0).xy;
+    var motion = mv_here;
+    if any(best != p) {
+        motion = textureLoad(cur_motion, best, 0).xy;
     }
     let mean = m1 / 9.0;
     let sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3<f32>(0.0)));
-    let motion = textureLoad(cur_motion, best, 0).xy;
     let prev_uv = i.uv + motion / params.internal.xy;
-    // (v202) Un objet bouge tout près (joueur, PNJ qui marche, bras qui balance).
-    let near_motion = mmax > 1e-4;
 
     let offscreen = any(prev_uv < vec2<f32>(0.0)) || any(prev_uv > vec2<f32>(1.0));
     if params.size.z > 0.5 || offscreen {
@@ -165,29 +192,27 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     let speed = length(motion);
     // still.y = 1 : la scène vient de changer (chunk chargé, bloc posé) : comme en mouvement.
     let moving = max(smoothstep(0.05, 1.0, speed), params.still.y);
-    let hist_raw = to_ycocg(sample_history(prev_uv));
+    let hist4 = sample_history(prev_uv);
+    let hist_raw = to_ycocg(hist4.rgb);
     // (v202) Alpha de l'historique : 1 là où un objet bougeait à l'image d'avant (et sur
     // un pixel autour), divisé par deux à chaque image. Un PNJ qui marche avance de plus
     // d'un pixel par image : là où il était, plus rien ne bouge, mais l'historique a
     // encore sa couleur.
-    let was_moving = textureSampleLevel(history, lin_sampler, prev_uv, 0.0).a;
+    let was_moving = hist4.a;
     let flag = max(select(0.0, 1.0, near_motion), was_moving * 0.5);
     let recent = near_motion || was_moving > 0.2;
     // Immobile : la géométrie a-t-elle changé ici (bloc posé, chunk chargé) ? On compare la
     // profondeur courante à celles de l'image précédente autour du pixel. Si rien n'a
     // changé, l'historique est bon : on ne le borne que très largement (les détails plus
     // fins qu'un pixel, vus seulement par certains décalages, ne clignotent plus).
-    let d_cur = textureLoad(cur_depth, p, 0);
-    // En croix (5 lectures au lieu de 9) : suffit à reconnaître la même géométrie.
-    var pmin = 1e9;
-    var pmax = -1e9;
-    for (var k = 0; k < 5; k++) {
-        let o = select(select(select(select(vec2<i32>(0, 0), vec2<i32>(1, 0), k == 1), vec2<i32>(-1, 0), k == 2), vec2<i32>(0, 1), k == 3), vec2<i32>(0, -1), k == 4);
-        let q = clamp(p + o, vec2<i32>(0), size - 1);
-        let d = textureLoad(prev_depth, q, 0);
-        pmin = min(pmin, d);
-        pmax = max(pmax, d);
-    }
+    // En croix (le pixel et ses quatre voisins) : suffit à reconnaître la même géométrie.
+    // (v204) Deux lectures groupées au lieu de six pixels : les coins haut-gauche et
+    // bas-droite du pixel donnent la croix (et deux diagonales, laissées de côté).
+    let h0 = textureGather(prev_depth, lin_sampler, corner / isize);
+    let h1 = textureGather(prev_depth, lin_sampler, (corner + vec2<f32>(1.0, 1.0)) / isize);
+    let d_prev = h0.y;
+    let pmin = min(min(d_prev, h0.z), min(min(h0.x, h1.z), h1.x));
+    let pmax = max(max(d_prev, h0.z), max(max(h0.x, h1.z), h1.x));
     // (v202) Un objet bouge ou bougeait tout près (`recent`) alors que ce pixel-ci est
     // immobile (caméra arrêtée) : ce qu'il y avait ici à l'image d'avant a pu partir. La
     // croix des profondeurs d'avant (qui recouvre l'objet et le fond à son bord) le
@@ -195,9 +220,7 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     // chaque membre, des contours laissés partout où les PNJ sont passés. Ici, seule la
     // profondeur de ce pixel-ci compte ; si elle a changé, l'historique est celui d'autre
     // chose : l'image courante seule.
-    let mv_here = textureLoad(cur_motion, p, 0).xy;
     let still_here = dot(mv_here, mv_here) < 1e-4;
-    let d_prev = textureLoad(prev_depth, p, 0);
     let changed_here = abs(d_prev - d_cur) > d_cur * 0.02 + 1e-7;
     if recent && still_here && changed_here {
         return vec4<f32>(cur, flag);

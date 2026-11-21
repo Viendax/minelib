@@ -3342,11 +3342,6 @@ impl GameLoop for Game {
         if self.warm_lights {
             self.warm_lights = !renderer.warm_dyn_lights();
         }
-        // Reflex / Anti-Lag 2 : attente pilotée par le pilote avant la simulation.
-        {
-            let _r = minelib_render::perf::scope("Reflex / Anti-Lag (attente du pilote)");
-            renderer.frame_begin();
-        }
         let size = renderer.size();
         let sizef = (size.0 as f32, size.1 as f32);
         self.ui.clear();
@@ -3620,6 +3615,12 @@ impl GameLoop for Game {
         self.renderer = Some(renderer);
         self.frames_drawn = self.frames_drawn.saturating_add(1);
         self.limit_fps();
+        // (v204) Tout ce qui fait attendre (pilote, file de la carte, image de la fenêtre)
+        // se passe ici, juste avant que la fenêtre relise le clavier et la souris : l'image
+        // suivante part avec les entrées les plus fraîches.
+        if let Some(r) = &mut self.renderer {
+            r.next_frame();
+        }
         minelib_render::perf::frame_end();
         !self.quit
     }

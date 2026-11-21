@@ -295,6 +295,14 @@ crates/
   l'ancienne mesure restée dans les requêtes : jusqu'à la v201, les bilans montraient des
   « reflets dans l'eau 0,91 ms » figés sans eau en vue, et l'essai de la demi-résolution
   comptait en calcul exact le temps d'« un pixel sur quatre » qui n'avait pas tourné.
+- **Tout ce qui fait attendre le jeu se passe avant la lecture des entrées**
+  (`Renderer::next_frame`, à la fin de chaque image) : l'attente du pilote (Reflex), la
+  file de la carte graphique et l'image de la fenêtre. Une attente placée après la lecture
+  du clavier et de la souris s'ajoute à leur retard (jusqu'à la v203 : 2,6 ms en moyenne,
+  plus trois images en file). Le jeu borne lui-même la file de la carte (`in_flight`, deux
+  images) : wgpu présente quand même quand son attente d'une seconde expire (écran en
+  veille), et la chaîne d'images de Windows ne borne alors plus rien — le 19 novembre, la
+  souris avait un retard énorme après une longue absence, à 243 images par seconde.
 - **L'alpha de l'historique du TAA n'est pas une opacité.** Depuis la v202, il marque où un
   objet bougeait (1, divisé par deux à chaque image) : la résolution y resserre ses bornes
   pour ne pas laisser de traînées derrière les PNJ. La copie à l'écran l'ignore ; toute

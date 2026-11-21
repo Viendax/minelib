@@ -681,6 +681,17 @@ pub struct Renderer {
     latency: Option<latency::LowLatency>,
     /// Capture d'écran demandée (F2), relue quelques images plus tard.
     capture: capture::Capture,
+    /// (v204) Image de la fenêtre prise d'avance, à la fin de l'image d'avant (voir
+    /// `next_frame`). Déclarée avant `surface` : rendue avant elle.
+    ahead: Option<wgpu::SurfaceTexture>,
+    /// (v204) Images envoyées à la carte et pas encore attendues, la plus ancienne d'abord
+    /// (voir `next_frame`).
+    in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
+    /// (v204) Images envoyées, et images finies par la carte (comptées quand elle le dit).
+    sent: u64,
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// (v204) Images que la carte peut avoir en file quand le jeu lit les entrées.
+    queue_depth: usize,
     /// Anticrénelage temporel (TAA), si activé.
     taa: Option<taa::Taa>,
     world_layout: wgpu::PipelineLayout,
@@ -1239,6 +1250,11 @@ impl Renderer {
             cave_culling: true,
             async_reflections: false,
             latency,
+            ahead: None,
+            in_flight: std::collections::VecDeque::new(),
+            sent: 0,
+            done: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            queue_depth: gpu_queue_depth(),
             capture: capture::Capture::default(),
             taa: None,
             world_layout: layout,
@@ -1315,6 +1331,9 @@ impl Renderer {
         }
         self.config.width = width;
         self.config.height = height;
+        // (L'image prise d'avance est rendue d'abord : wgpu refuse de refaire la chaîne
+        // d'images tant qu'une image est sortie.)
+        self.ahead = None;
         self.surface.configure(&self.device, &self.config);
         self.depth = create_depth(&self.device, &self.config);
     }
@@ -1915,14 +1934,75 @@ impl Renderer {
         // Chaîne d'images neuve : rien de l'état d'avant ne reste chez le pilote (après
         // une attente coupée, le processeur et la carte ne travaillaient plus en même
         // temps, voir `latency`).
+        self.ahead = None;
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// À appeler en début d'image, avant de lire les entrées du joueur.
-    pub fn frame_begin(&mut self) {
-        if let Some(l) = &mut self.latency {
-            l.frame_begin();
+    /// (v204) Fin d'une image, juste avant que la fenêtre relise le clavier et la souris :
+    /// tout ce qui fait attendre le jeu se passe ici, **avant** la lecture des entrées, pour
+    /// que l'image suivante parte avec les entrées les plus fraîches.
+    ///
+    /// 1. L'attente du pilote (Reflex / Anti-Lag), si le réglage est activé. Jusqu'à la
+    ///    v203 elle venait après la lecture des entrées : son temps s'ajoutait à la latence.
+    /// 2. La file de la carte : on attend que l'avant-dernière image envoyée soit finie.
+    ///    La carte n'a ainsi jamais plus de `queue_depth` images devant elle (une qu'elle
+    ///    dessine, une prête), et le processeur prépare la suivante pendant qu'elle dessine :
+    ///    aucune image de moins. Jusqu'à la v203, seule la chaîne d'images de Windows bornait
+    ///    la file (3 images), et wgpu présente quand même quand son attente d'une seconde
+    ///    expire (écran en veille) : après une veille de l'écran, la file pouvait rester bien
+    ///    plus longue (partie du 19 novembre : 243 images par seconde et une souris très en
+    ///    retard, sans rien d'anormal dans les mesures).
+    /// 3. L'image de la fenêtre de l'image suivante (son attente était au milieu de l'image,
+    ///    après la lecture des entrées : 2,6 ms de latence en moyenne quand la carte fait la
+    ///    cadence).
+    pub fn next_frame(&mut self) {
+        {
+            let _r = perf::scope("Reflex / Anti-Lag (attente du pilote)");
+            if let Some(l) = &mut self.latency {
+                l.frame_begin();
+            }
         }
+        let _s = perf::scope("rendu : attente de l'image (GPU)");
+        let waited = std::time::Instant::now();
+        while self.in_flight.len() >= self.queue_depth.max(1) {
+            let Some(oldest) = self.in_flight.pop_front() else {
+                break;
+            };
+            let _ = self
+                .device
+                .poll(wgpu::PollType::WaitForSubmissionIndex(oldest));
+        }
+        if self.ahead.is_none() {
+            // (Refusée — fenêtre réduite, chaîne d'images à refaire… : l'image suivante la
+            // redemandera et s'en occupera, comme avant.)
+            self.ahead = self.surface.get_current_texture().ok();
+        }
+        self.note_stall("l'attente de l'image de la fenêtre", waited);
+    }
+
+    /// L'image de la fenêtre où dessiner : celle prise d'avance (`next_frame`), sinon
+    /// demandée maintenant (première image, fenêtre redimensionnée).
+    fn window_frame(&mut self) -> Result<wgpu::SurfaceTexture, wgpu::SurfaceError> {
+        match self.ahead.take() {
+            Some(f) => Ok(f),
+            None => self.surface.get_current_texture(),
+        }
+    }
+
+    /// Une image vient d'être envoyée à la carte (`index`) : comptée dans sa file.
+    fn note_submit(&mut self, index: wgpu::SubmissionIndex) {
+        self.in_flight.push_back(index);
+        self.sent += 1;
+        let done = self.done.clone();
+        self.queue.on_submitted_work_done(move || {
+            done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        // Au journal : images envoyées que la carte n'a pas finies au moment de l'envoi
+        // (celle-ci comprise). Au-delà de `queue_depth`, la souris prend du retard.
+        let pending = self
+            .sent
+            .saturating_sub(self.done.load(std::sync::atomic::Ordering::Relaxed));
+        perf::gauge("file de la carte (images)", pending as f32);
     }
 
     fn marker(&self, m: Marker) {
@@ -2084,7 +2164,7 @@ impl Renderer {
 
     /// Image sans monde : seulement l'interface (menus).
     pub fn render_ui(&mut self, ui: &Ui) {
-        let frame = match self.surface.get_current_texture() {
+        let frame = match self.window_frame() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
@@ -2145,7 +2225,8 @@ impl Renderer {
             .encode(&self.device, &mut encoder, &frame.texture);
         self.marker(Marker::SimulationEnd);
         self.marker(Marker::RenderSubmitStart);
-        self.queue.submit([encoder.finish()]);
+        let sent = self.queue.submit([encoder.finish()]);
+        self.note_submit(sent);
         self.marker(Marker::RenderSubmitEnd);
         self.marker(Marker::PresentStart);
         frame.present();
@@ -2841,7 +2922,7 @@ impl Renderer {
         if self.taa.is_some() {
             return self.render_taa(p);
         }
-        let frame = match self.surface.get_current_texture() {
+        let frame = match self.window_frame() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
@@ -3010,7 +3091,8 @@ impl Renderer {
             .encode(&self.device, &mut encoder, &frame.texture);
         self.marker(Marker::SimulationEnd);
         self.marker(Marker::RenderSubmitStart);
-        self.queue.submit([encoder.finish()]);
+        let sent = self.queue.submit([encoder.finish()]);
+        self.note_submit(sent);
         self.marker(Marker::RenderSubmitEnd);
         self.marker(Marker::PresentStart);
         frame.present();
@@ -3188,11 +3270,11 @@ impl Renderer {
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         drop(prep);
 
-        // Image de la fenêtre demandée le plus tard possible : tout le travail CPU ci-dessus
-        // se fait pendant que le GPU termine les images précédentes.
+        // Image de la fenêtre : (v204) déjà prise à la fin de l'image d'avant, avant la
+        // lecture des entrées (`next_frame`) ; demandée ici seulement s'il n'y en a pas.
         let acquire = perf::scope("rendu : attente de l'image (GPU)");
         let waited = std::time::Instant::now();
-        let frame = match self.surface.get_current_texture() {
+        let frame = match self.window_frame() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
@@ -3494,7 +3576,8 @@ impl Renderer {
         self.marker(Marker::RenderSubmitStart);
         {
             let _s = perf::scope("rendu : envoi au GPU");
-            self.queue.submit([encoder.finish()]);
+            let sent = self.queue.submit([encoder.finish()]);
+            self.note_submit(sent);
         }
         self.marker(Marker::RenderSubmitEnd);
         self.marker(Marker::PresentStart);
@@ -3811,6 +3894,20 @@ fn world_group(
             },
         ],
     })
+}
+
+/// (v204) Images que la carte peut avoir devant elle quand le jeu lit les entrées (voir
+/// `Renderer::next_frame`) : 2 par défaut (celle qu'elle dessine et une prête : aucune image
+/// de moins, et moitié moins de retard qu'avec les 3 images de la chaîne de Windows).
+/// `MINELIB_FILE_CARTE=1` : le processeur et la carte travaillent l'un après l'autre (latence
+/// la plus courte, moins d'images) ; `=3` : comme avant la v204.
+fn gpu_queue_depth() -> usize {
+    let depth = std::env::var("MINELIB_FILE_CARTE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(2, |d| d.clamp(1, 8));
+    log::info!("file de la carte : {depth} image(s) au plus devant elle à la lecture des entrées");
+    depth
 }
 
 fn create_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
