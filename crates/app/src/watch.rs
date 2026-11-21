@@ -511,6 +511,8 @@ impl Party {
         let mut acts = Vec::new();
         for (&id, t) in self.tracks.iter_mut() {
             let page = self.pages.get(&id).map(|s| &s.page);
+            // Depuis combien de temps la page a donné ce temps.
+            let page_age = self.pages.get(&id).map_or(0.0, |s| s.age);
             let key = (t.video.seq, t.video.by.clone());
             let on_it = page.filter(|p| p.video.as_deref() == Some(t.video.id.as_str()));
             if t.applied.as_ref() != Some(&key) {
@@ -518,12 +520,24 @@ impl Party {
                 if t.applied_video.as_deref() != Some(t.video.id.as_str()) {
                     // Nouvelle vidéo : ouverte, même si la page était ailleurs.
                     t.applied_video = Some(t.video.id.clone());
+                    log::info!(
+                        "regarder ensemble : écran {id}, vidéo {} donnée par {} ouverte à {:.1} s",
+                        t.video.id,
+                        t.video.by,
+                        t.now()
+                    );
                     acts.push(Act::Open(id, watch_url(&t.video.id, t.now())));
                     t.settle = SETTLE_OPEN_S;
                     t.fine = true;
                 } else if let Some(p) = on_it {
                     // Même vidéo : temps et pause (une page partie ailleurs y reste).
                     let seek = (p.t < 0.0 || (p.t - t.now()).abs() > FINE_S).then(|| t.now());
+                    log::info!(
+                        "regarder ensemble : écran {id}, geste de {} ({}{})",
+                        t.video.by,
+                        if t.video.paused { "pause" } else { "lecture" },
+                        seek.map_or(String::new(), |s| format!(", page à {:.1} s amenée à {s:.1} s", p.t))
+                    );
                     acts.push(Act::Eval(id, control_js(seek, t.video.paused)));
                     t.settle = SETTLE_EVAL_S;
                 }
@@ -536,11 +550,35 @@ impl Party {
             if t.settle > 0.0 || t.guess || p.ad || p.t < 0.0 {
                 continue;
             }
+            // (v213) Personne d'autre près de l'écran : rien à garder ensemble. La vidéo
+            // partagée suit alors la page (une page qui a bloqué un instant n'est jamais
+            // avancée d'un saut, ce qui s'entendait comme une petite coupure) ; un joueur
+            // qui arrive reçoit le temps où en est vraiment la page.
+            let seul = shown
+                .get(&id)
+                .is_none_or(|(s, _)| near(players, center(s), RANGE).is_empty());
+            if seul {
+                t.video.t = p.t.clamp(0.0, MAX_T);
+                t.video.paused = p.paused;
+                t.age = page_age;
+                t.fine = false;
+                continue;
+            }
             let off = (p.t - t.now()).abs();
             let limit = if t.fine { FINE_S } else { DRIFT_S };
             t.fine = false;
             if p.paused != t.video.paused || off > limit {
                 let seek = (off > FINE_S).then(|| t.now());
+                // (v213) Chaque recalage est écrit : une coupure entendue se retrouve ici
+                // si elle vient du jeu.
+                log::info!(
+                    "regarder ensemble : écran {id} recalé (page à {:.1} s{}, vidéo partagée à {:.1} s{}){}",
+                    p.t,
+                    if p.paused { " en pause" } else { "" },
+                    t.now(),
+                    if t.video.paused { " en pause" } else { "" },
+                    if seek.is_some() { ", saut" } else { ", sans saut" }
+                );
                 acts.push(Act::Eval(id, control_js(seek, t.video.paused)));
                 t.settle = SETTLE_EVAL_S;
             }
@@ -1215,6 +1253,35 @@ mod tests {
         assert!(p.screens(&[]).is_empty());
         // Ancien format (sans taille) : pas pour nous, rendu à la voix.
         assert!(!p.receive(A, &[0xFF, b'M', b'T', b'V', 0], Some(Vec3::ZERO), &[]));
+    }
+
+    /// (v213) Seul devant son écran, une page qui a bloqué un instant n'est jamais avancée
+    /// d'un saut : la vidéo partagée la suit. Un ami qui arrive ensuite reçoit le temps où
+    /// en est vraiment la page.
+    #[test]
+    fn seul_devant_l_ecran_la_video_n_est_jamais_sautee() {
+        let mut party = Party::new();
+        let s = screen_at(0);
+        let id = s.id();
+        let state = |t: f32, ad: bool| {
+            format!(r#"{{"u":"{}","t":{t},"p":false,"a":{ad},"i":"{X}"}}"#, watch_url(X, 0.0))
+        };
+        party.observe(id, &state(10.0, false), A);
+        party.observe(id, &state(10.5, false), A);
+        let mut acts = Vec::new();
+        // La page bloque 6 s (temps figé, « pub ») puis repart d'où elle était.
+        for k in 0..60 {
+            party.observe(id, &state(11.0, k > 2), A);
+            acts.extend(party.update(0.1, &[s], &[]));
+        }
+        for k in 0..20 {
+            party.observe(id, &state(11.0 + k as f32 * 0.1, false), A);
+            acts.extend(party.update(0.1, &[s], &[]));
+        }
+        assert!(acts.is_empty(), "{acts:?}");
+        // Un ami arrive : il reçoit le temps de la page (13 s), pas 19 s.
+        let t = party.tracks.get(&id).unwrap();
+        assert!((t.now() - 12.9).abs() < 0.3, "{}", t.now());
     }
 
     #[test]

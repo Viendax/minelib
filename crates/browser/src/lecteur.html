@@ -37,18 +37,19 @@ const ok=s=>/^[A-Za-z0-9_-]{11}$/.test(s||'');
 const q=new URLSearchParams(location.search);
 let id=ok(q.get('v'))?q.get('v'):'';
 const debut=Math.max(0,Math.min(360000,parseInt(q.get('t')||'0',10)||0));
-let P=null,pret=false,permis=false,voulu=true,erreur=false,vol=-1,cherche=null;
+let P=null,pret=false,permis=false,voulu=true,erreur=false,cherche=null;
 let s=-1,dernier=-2,depuis=0,etat='';
 const mot=t=>{document.getElementById('cadre').style.display='none';
   const m=document.getElementById('mot');m.textContent=t;m.style.display='flex';};
-// Commandes du jeu (regarder ensemble, volume, pause de tous les écrans). Lancer la
-// lecture n'est permis qu'après un clic dans le lecteur ou l'accord du jeu.
+// Commandes du jeu (regarder ensemble, pause de tous les écrans). Lancer la lecture
+// n'est permis qu'après un clic dans le lecteur ou l'accord du jeu. (v213) Le volume des
+// écrans ne passe plus par ici : le lecteur est à fond, et le jeu règle le son du
+// navigateur dans Windows.
 window.__mlb={
   seekTo:t=>{if(P&&pret)P.seekTo(t,true);else cherche=t;},
   playVideo:()=>{voulu=true;if(P&&pret&&permis)P.playVideo();},
   pauseVideo:()=>{voulu=false;if(P&&pret)P.pauseVideo();},
   regarde:()=>{if(permis)return;permis=true;if(P&&pret&&voulu)P.playVideo();},
-  volume:v=>{vol=Math.round(Math.max(0,Math.min(1,v))*100);if(P&&pret)P.setVolume(vol);},
 };
 if(!id){mot("Pas de vidéo à lire.");return;}
 window.onYouTubeIframeAPIReady=()=>{
@@ -60,7 +61,8 @@ window.onYouTubeIframeAPIReady=()=>{
       origin:location.origin,widget_referrer:location.href},
     events:{
       onReady:()=>{pret=true;
-        if(vol>=0)P.setVolume(vol);
+        // (v213) Le son à fond à chaque vidéo (le réglage des écrans est dans le jeu).
+        P.unMute();P.setVolume(100);
         if(cherche!==null){P.seekTo(cherche,true);cherche=null;}
         if(permis&&voulu)P.playVideo();},
       onStateChange:e=>{
@@ -80,6 +82,8 @@ window.onYouTubeIframeAPIReady=()=>{
 const api=document.createElement('script');
 api.src='https://www.youtube.com/iframe_api';
 document.head.appendChild(api);
+// Revenue par « précédent » ou « suivant » (cache du navigateur) : l'état est redit.
+window.addEventListener('pageshow',()=>{etat='';});
 // État pour le jeu, comme les autres pages : adresse, temps, pause, « pub », vidéo.
 setInterval(()=>{
   let t=-1,p=true,i=id;

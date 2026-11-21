@@ -22,8 +22,9 @@ pub struct ScreenAnchor {
     /// Largeur et hauteur, en blocs.
     pub size: [f32; 2],
     /// (v206) Apparition des boutons, de 0 (invisible) à 1 : le jeu la monte quand le
-    /// réticule glisse vers eux depuis le bord, et la redescend sinon. (v211) Deux boutons,
-    /// en haut à gauche : la loupe, puis la vidéo.
+    /// réticule glisse vers eux depuis le bord, et la redescend sinon (v212 : une seule pour
+    /// tous les boutons, en premier). (v213) En second : les pages où aller, précédente (1)
+    /// et suivante (2), pour griser les boutons retour et suivant.
     pub reveal: [f32; 2],
 }
 

@@ -23,8 +23,9 @@ struct Globals {
 struct VIn {
     @location(0) pos: vec3<f32>,
     @location(1) uv: vec2<f32>,
-    // (v206) Apparition des boutons, de 0 à 1 (voir `screen.rs` côté jeu) ; (v211) la
-    // loupe en `x`, la vidéo en `y`.
+    // (v206) Apparition des boutons, de 0 à 1 (voir `screen.rs` côté jeu) ; (v212) une
+    // seule pour tous, en `x` ; (v213) en `y`, les pages où aller : précédente (1),
+    // suivante (2) — sans elles, retour et suivant sont grisés.
     @location(2) reveal: vec2<f32>,
 };
 
@@ -50,7 +51,9 @@ fn texel(i: VOut) -> vec4<f32> {
 }
 
 // Les boutons des écrans, **en haut à gauche** (v211) : un rond gris foncé avec une loupe
-// (Google), et à sa droite un rond avec une vidéo (la recherche de YouTube). Dessinés ici
+// (Google), et à sa droite un rond avec une vidéo (la recherche de YouTube), puis (v213)
+// une flèche à gauche (page précédente) et une flèche à droite (page suivante). Ils
+// apparaissent tous ensemble, du même fondu (`reveal.x`). Dessinés ici
 // même (aucune image, aucune police, donc aucune licence ; la vidéo est un cadre arrondi
 // et un triangle de lecture blancs, pas le logo de YouTube). Le jeu reconnaît les clics
 // avec `screen::on_button`, qui garde les mêmes mesures (`BOUTONS`, `RAYON`).
@@ -61,6 +64,11 @@ fn texel(i: VOut) -> vec4<f32> {
 const BTN_ASPECT = 16.0 / 9.0;
 const BTN_C = vec2<f32>(0.030, 0.053);
 const BTN2_C = vec2<f32>(0.0828, 0.053);
+const BTN3_C = vec2<f32>(0.1356, 0.053);
+const BTN4_C = vec2<f32>(0.1884, 0.053);
+// Les flèches (en mesures de `u`) : demi-longueur du trait, et la pointe.
+const FLECHE_L = 0.0078;
+const POINTE = 0.0052;
 const BTN_R = 0.022;
 // La loupe : son anneau un peu en haut à gauche du centre du rond.
 const LOUPE_D = vec2<f32>(-0.0035, -0.0035);
@@ -94,9 +102,30 @@ fn dist_lecture(q: vec2<f32>) -> f32 {
     return max(dot(q - a, n1), max(dot(q - b, n2), dot(q - c, n3)));
 }
 
+// Distance à une flèche horizontale centrée en 0, vers la gauche (`sens` = -1) ou vers la
+// droite (`sens` = 1) : un trait et deux branches de pointe.
+fn dist_fleche(q: vec2<f32>, sens: f32) -> f32 {
+    let bout = vec2<f32>(FLECHE_L * sens, 0.0);
+    let d_trait = dist_seg(q, vec2<f32>(-FLECHE_L * sens, 0.0), bout);
+    let haut = bout + vec2<f32>(-POINTE * sens, -POINTE);
+    let bas = bout + vec2<f32>(-POINTE * sens, POINTE);
+    let d_pointe = min(dist_seg(q, bout, haut), dist_seg(q, bout, bas));
+    return min(d_trait, d_pointe) - TRAIT * 0.55;
+}
+
 // `uv` ramené en mesures rondes (celles de `u`).
 fn btn_space(uv: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(uv.x, uv.y / BTN_ASPECT);
+}
+
+// (v213) Un bouton dont le dessin est gris s'il n'a nulle part où aller (`actif` faux).
+fn bouton_actif(p: vec2<f32>, c: vec2<f32>, d_icone: f32, reveal: f32, aa: f32, actif: bool, dessous: vec3<f32>) -> vec3<f32> {
+    let d_rond = length(p - c) - BTN_R;
+    let rond = 1.0 - smoothstep(-aa, aa, d_rond);
+    let icone = 1.0 - smoothstep(-aa, aa, d_icone);
+    let encre = select(vec3<f32>(0.36, 0.37, 0.39), vec3<f32>(0.92, 0.93, 0.95), actif);
+    let fond = mix(dessous, vec3<f32>(0.11, 0.115, 0.125), rond * 0.93 * reveal);
+    return mix(fond, encre, icone * rond * reveal);
 }
 
 // Un bouton : rond gris foncé, et son dessin (distance signée `d_icone`) presque blanc.
@@ -114,7 +143,7 @@ fn buttons(uv: vec2<f32>, reveal: vec2<f32>, dessous: vec3<f32>) -> vec3<f32> {
     // Lissage sur la largeur d'un pixel de l'écran, quelle que soit la distance (calculé
     // avant tout test : une dérivée se prend partout pareil).
     let aa = max(length(fwidth(p)) * 0.7071, 1e-6);
-    if max(reveal.x, reveal.y) <= 0.001 {
+    if reveal.x <= 0.001 {
         return dessous;
     }
     var col = dessous;
@@ -130,10 +159,20 @@ fn buttons(uv: vec2<f32>, reveal: vec2<f32>, dessous: vec3<f32>) -> vec3<f32> {
     }
     // La vidéo : un cadre arrondi et un triangle de lecture.
     let c2 = btn_space(BTN2_C);
-    if reveal.y > 0.001 && length(p - c2) < BTN_R * 1.5 {
+    if reveal.x > 0.001 && length(p - c2) < BTN_R * 1.5 {
         let q = p - c2;
         let d_cadre = abs(dist_cadre(q, CADRE, CADRE_R)) - TRAIT * 0.5;
-        col = bouton(p, c2, min(d_cadre, dist_lecture(q)), reveal.y, aa, col);
+        col = bouton(p, c2, min(d_cadre, dist_lecture(q)), reveal.x, aa, col);
+    }
+    // Retour et suivant : des flèches, grisées sans page où aller.
+    let pages = u32(reveal.y + 0.5);
+    let c3 = btn_space(BTN3_C);
+    if reveal.x > 0.001 && length(p - c3) < BTN_R * 1.5 {
+        col = bouton_actif(p, c3, dist_fleche(p - c3, -1.0), reveal.x, aa, (pages & 1u) != 0u, col);
+    }
+    let c4 = btn_space(BTN4_C);
+    if reveal.x > 0.001 && length(p - c4) < BTN_R * 1.5 {
+        col = bouton_actif(p, c4, dist_fleche(p - c4, 1.0), reveal.x, aa, (pages & 2u) != 0u, col);
     }
     return col;
 }

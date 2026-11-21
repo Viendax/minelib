@@ -117,7 +117,9 @@ pub struct Options {
     pub audio_in: String,
     /// Volume du micro (gain appliqué à ce qu'on envoie : 0..2, 1 = tel quel).
     pub volume_mic: f32,
-    /// Volume du son des écrans vidéo (0..1).
+    /// Volume du son des écrans vidéo (0..1). (v213) 50 % par défaut, enregistré sous
+    /// `volume_tele` ; l'ancienne clé `volume_screens` est relue une fois (son ancien
+    /// défaut, 100 %, devient 50 %).
     pub volume_screens: f32,
     /// (v179) Menu du jeu ouvert : en solo, les vidéos des écrans se mettent en pause ; en
     /// ligne, leur son est coupé tant que le menu est ouvert. Non par défaut : elles
@@ -164,7 +166,7 @@ impl Default for Options {
             audio_out: String::new(),
             audio_in: String::new(),
             volume_mic: 1.0,
-            volume_screens: 1.0,
+            volume_screens: 0.5,
             mute_screens_menu: false,
             volume_voice: 1.0,
             relay: "auto".into(),
@@ -234,8 +236,12 @@ impl Options {
             if let Some(v) = kv.get("volume_mic").and_then(|v| v.parse::<f32>().ok()) {
                 o.volume_mic = v.clamp(0.0, 2.0);
             }
-            if let Some(v) = kv.get("volume_screens").and_then(|v| v.parse::<f32>().ok()) {
+            if let Some(v) = kv.get("volume_tele").and_then(|v| v.parse::<f32>().ok()) {
                 o.volume_screens = v.clamp(0.0, 1.0);
+            } else if let Some(v) = kv.get("volume_screens").and_then(|v| v.parse::<f32>().ok()) {
+                // (v213) Avant : 100 % par défaut. Un réglage laissé au défaut passe au
+                // nouveau défaut ; un réglage choisi est gardé.
+                o.volume_screens = if v >= 0.999 { 0.5 } else { v.clamp(0.0, 1.0) };
             }
             if let Some(v) = kv.get("mute_screens_menu") {
                 o.mute_screens_menu = v == "true";
@@ -270,7 +276,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_screens={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -902,6 +908,30 @@ fn read_zip(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v213) Le son des écrans : 50 % par défaut ; l'ancien défaut (100 %) y passe, un
+    /// réglage choisi reste, et la nouvelle clé est relue telle quelle.
+    #[test]
+    fn le_son_des_ecrans_est_a_50_par_defaut() {
+        let dir = std::env::temp_dir().join(format!("minelib-tele-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("options.txt");
+        assert_eq!(Options::load(&dir.join("absent.txt")).volume_screens, 0.5);
+        for (texte, voulu) in [
+            ("volume_screens=1\n", 0.5),
+            ("volume_screens=0.3\n", 0.3),
+            ("volume_tele=1\n", 1.0),
+            ("volume_tele=0.8\nvolume_screens=1\n", 0.8),
+        ] {
+            fs::write(&f, texte).unwrap();
+            assert_eq!(Options::load(&f).volume_screens, voulu, "{texte}");
+        }
+        let mut o = Options::load(&f);
+        o.volume_screens = 1.0;
+        o.save(&f).unwrap();
+        assert_eq!(Options::load(&f).volume_screens, 1.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn builtin_pack_has_textures() {

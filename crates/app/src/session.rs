@@ -2048,12 +2048,18 @@ impl Session {
                 // (v205) Les boutons en haut à gauche : la loupe mène sur Google, (v211) la
                 // vidéo sur la recherche de YouTube ; le reste de l'écran est la page.
                 if let Some(b) = self.displays.button_clicked(ids[i], uv) {
-                    let url = if b == crate::screen::VIDEO {
-                        crate::screen::RECHERCHE_VIDEO
-                    } else {
-                        crate::screen::RECHERCHE
-                    };
-                    self.displays.open(ids[i], url);
+                    // (v213) Puis le retour et le suivant (pages précédente et suivante).
+                    match b {
+                        crate::screen::VIDEO => {
+                            self.displays.open(ids[i], crate::screen::RECHERCHE_VIDEO);
+                        }
+                        crate::screen::RETOUR => self.displays.history(ids[i], false),
+                        crate::screen::SUIVANT => self.displays.history(ids[i], true),
+                        crate::screen::LOUPE => {
+                            self.displays.open(ids[i], crate::screen::RECHERCHE);
+                        }
+                        _ => {}
+                    }
                     self.screen_last = Some(ids[i]);
                 } else {
                     self.displays.press(ids[i], uv);
@@ -7316,7 +7322,11 @@ impl Session {
             .map(|s| {
                 let id = s.0.id();
                 // (v206) L'apparition des boutons voyage avec l'écran.
-                let reveal = self.displays.reveal(id);
+                // (v213) En second : les pages où aller (retour 1, suivant 2), pour griser.
+                let reveal = [
+                    self.displays.reveal(id),
+                    f32::from(self.displays.history_of(id)),
+                ];
                 (
                     id,
                     minelib_render::ScreenAnchor {

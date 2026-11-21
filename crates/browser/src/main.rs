@@ -18,7 +18,9 @@
 //! `--fps <images par seconde d'un nouvel onglet, 30 par défaut>`, `--scroll`,
 //! `--filtre blanche|noire`, `--listes <dossier des listes>`,
 //! `--restreint strict|modere|non` (mode restreint de YouTube et SafeSearch),
-//! `--sans-compte` (v208, en ligne : pas de connexion à un compte, cookies effacés).
+//! `--sans-compte` (v208, en ligne : pas de connexion à un compte, cookies effacés),
+//! `--volume <0..100>` (v213, volume des sons du navigateur dans Windows ; ensuite la
+//! commande `volume 0 <0..100>`).
 //!
 //! **Filtrage (v205)** : le jeu est tout public, donc une page qui n'est pas autorisée ne
 //! s'ouvre pas du tout — ni dans l'onglet, ni dans un cadre de la page. Voir `filtre`.
@@ -35,7 +37,8 @@
 //! - `MLBS` : état de la page, `a` octets UTF-8 (`{"u":adresse,"t":temps,"p":pause,
 //!   "a":pub,"i":vidéo du lecteur}`) ;
 //! - `MLBW` (seulement avec `--scroll`) : la page peut défiler sous la souris vers le haut
-//!   (`a` & 1) et vers le bas (`a` & 2).
+//!   (`a` & 1) et vers le bas (`a` & 2) ;
+//! - `MLBH` (v213) : il y a une page précédente (`a` & 1), une page suivante (`a` & 2).
 //!
 //! Ce qu'il écrit sur sa sortie d'erreur (onglets ouverts, première image de chaque onglet,
 //! chargements ratés) va dans `logs/navigateur-sortie.log`.
@@ -50,6 +53,7 @@
 #![windows_subsystem = "windows"]
 
 mod filtre;
+mod volume;
 
 use filtre::{Filtre, Mode, Restreint};
 use std::collections::{HashMap, VecDeque};
@@ -85,7 +89,7 @@ const go=(u,r)=>{const l=vid(u);if(l){if(r)location.replace(l);else location.hre
 document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagName==='A'&&x.href);
 if(a&&vid(a.href)){e.preventDefault();e.stopImmediatePropagation();go(a.href,false);}},true);
 setInterval(()=>go(location.href,true),250);go(location.href,true);}
-let s='';setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById('movie_player');
+let s='';window.addEventListener('pageshow',()=>{s='';});setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById('movie_player');
 const v=(mp&&mp.querySelector('video'))||document.querySelector('video');
 let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
 const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing'),i:i});
@@ -158,6 +162,8 @@ struct Options {
     restreint: Restreint,
     /// (v208) En ligne : pas de page de connexion, cookies effacés au lancement.
     sans_compte: bool,
+    /// (v213) Volume des sons du navigateur au lancement, en pour cent.
+    volume: i32,
 }
 
 impl Options {
@@ -173,6 +179,7 @@ impl Options {
             listes: None,
             restreint: Restreint::Strict,
             sans_compte: false,
+            volume: 50,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -187,6 +194,7 @@ impl Options {
                 "--filtre" => o.filtre = Mode::from_name(&value()).unwrap_or(o.filtre),
                 "--listes" => o.listes = Some(PathBuf::from(value())),
                 "--sans-compte" => o.sans_compte = true,
+                "--volume" => o.volume = value().parse().unwrap_or(o.volume).clamp(0, 100),
                 "--restreint" => o.restreint = Restreint::from_name(&value()).unwrap_or(o.restreint),
                 _ => {}
             }
@@ -210,6 +218,11 @@ enum Cmd {
     Eval(u32, String),
     /// Images par seconde de l'onglet (1 à 60).
     Fps(u32, i32),
+    /// (v213) Volume de tous les sons du navigateur, en pour cent (l'onglet est ignoré).
+    Volume(i32),
+    /// (v213) Page précédente, page suivante (boutons retour et suivant de l'écran).
+    Back(u32),
+    Forward(u32),
     Quit,
 }
 
@@ -238,6 +251,9 @@ fn parse_cmd(line: &str) -> Option<Cmd> {
         "blur" => Cmd::Blur(id),
         "eval" => Cmd::Eval(id, rest.to_string()),
         "fps" => Cmd::Fps(id, num()?),
+        "volume" => Cmd::Volume(num()?),
+        "back" => Cmd::Back(id),
+        "forward" => Cmd::Forward(id),
         _ => return None,
     })
 }
@@ -388,9 +404,22 @@ wrap_load_handler! {
     struct Loader {
         id: u32,
         scroll: bool,
+        out: Shared,
     }
 
     impl LoadHandler {
+        // (v213) Les boutons retour et suivant de l'écran sont grisés sans page où aller.
+        fn on_loading_state_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _is_loading: ::std::os::raw::c_int,
+            can_go_back: ::std::os::raw::c_int,
+            can_go_forward: ::std::os::raw::c_int,
+        ) {
+            let bits = u32::from(can_go_back != 0) | u32::from(can_go_forward != 0) << 1;
+            push_event(&self.out, *b"MLBH", self.id, bits, Vec::new());
+        }
+
         fn on_load_error(
             &self,
             _browser: Option<&mut Browser>,
@@ -866,7 +895,7 @@ impl Tab {
         let mut client = TabClient::new(
             painter,
             console,
-            Loader::new(id, opts.scroll),
+            Loader::new(id, opts.scroll, out.clone()),
             Popups::new(id),
             Dialogs::new(),
             Files::new(),
@@ -1113,6 +1142,9 @@ fn main() {
         "filtrage des pages : {mot}{}",
         if opts.sans_compte { " ; en ligne, sans compte" } else { "" }
     );
+    // (v213) Volume des sons du navigateur dans Windows (le lecteur de YouTube reste à fond).
+    let volume = volume::Volume::new(volume::from_pct(opts.volume));
+    volume.start();
     // Boucle de Chromium sur ce fil (le fil « UI » de CEF) : les commandes y sont jouées.
     let mut tabs: HashMap<u32, Tab> = HashMap::new();
     let left = MouseButtonType::from(sys::cef_mouse_button_type_t::MBT_LEFT);
@@ -1203,6 +1235,18 @@ fn main() {
                 Cmd::Eval(id, code) => {
                     if let Some(t) = tabs.get(&id) {
                         t.js(&code);
+                    }
+                }
+                Cmd::Volume(pct) => volume.set(volume::from_pct(pct)),
+                // (Par la page : `go_back` de CEF ne faisait rien sur ces onglets hors écran.)
+                Cmd::Back(id) => {
+                    if let Some(t) = tabs.get(&id) {
+                        t.js("history.back()");
+                    }
+                }
+                Cmd::Forward(id) => {
+                    if let Some(t) = tabs.get(&id) {
+                        t.js("history.forward()");
                     }
                 }
             }

@@ -193,6 +193,11 @@ pub fn save(dir: &Path, screens: &[Placed]) {
 /// Point de l'écran `a` visé par le rayon `eye + t·dir` (0 < t ≤ `limit`) : distance `t`
 /// et coordonnées de l'écran (0..1, origine en haut à gauche). `None` si le rayon passe
 /// à côté, ou arrive par le dos ou la tranche.
+/// (v213) Volume des écrans en pour cent, pour le navigateur.
+fn volume_pct(v: f32) -> u32 {
+    (v.clamp(0.0, 1.0) * 100.0).round() as u32
+}
+
 /// (v210) L'adresse d'un état de page (`{"u":…}`).
 fn page_address(json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -439,10 +444,8 @@ pub struct Displays {
     tabs: std::collections::HashMap<u32, Tab>,
     /// États rapportés par les pages depuis le dernier `take_states` (regarder ensemble).
     states: Vec<(u32, String)>,
-    /// Volume du son des écrans (Paramètres → Son), et temps avant de le redonner aux pages
-    /// (une vidéo qui commence repart au volume de la page).
+    /// Volume du son des écrans (Paramètres → Son), donné au navigateur.
     volume: f32,
-    volume_in: f32,
     /// (v205) Filtrage des pages : `blanche` (YouTube, Google et les sites pour enfants),
     /// `noire` (tout sauf les sites filtrés) ou, en ligne, `en_ligne` (v208 : la liste
     /// blanche, sans connexion à un compte, dans une session à part dont les cookies sont
@@ -467,8 +470,7 @@ impl Displays {
             idle: 0.0,
             tabs: std::collections::HashMap::new(),
             states: Vec::new(),
-            volume: 1.0,
-            volume_in: 0.0,
+            volume: 0.5,
             filtre: "blanche",
             blocked: Vec::new(),
             regarde: None,
@@ -515,18 +517,39 @@ impl Displays {
         }
     }
 
-    /// (v206) Apparition des boutons de cet écran (0 à 1 ; v211 : la loupe, puis la
-    /// vidéo) : le rendu la passe au shader, et un clic ne compte comme un clic sur un
-    /// bouton qu'au-delà de `CLIQUABLE`.
-    pub fn reveal(&self, id: u32) -> [f32; 2] {
-        self.tabs.get(&id).map_or([0.0; 2], |t| t.reveal)
+    /// (v206) Apparition des boutons de cet écran (0 à 1 ; v212 : la même pour tous) : le
+    /// rendu la passe au shader, et un clic ne compte comme un clic sur un bouton qu'au-delà
+    /// de `CLIQUABLE`.
+    pub fn reveal(&self, id: u32) -> f32 {
+        self.tabs.get(&id).map_or(0.0, |t| t.reveal)
     }
 
     /// Un clic à cet endroit de cet écran est-il un clic sur un bouton (`LOUPE`,
-    /// `VIDEO`) ? (Invisible ou presque, un bouton laisse le clic à la page.)
+    /// `VIDEO`, `RETOUR`, `SUIVANT`) ? (Invisibles ou presque, les boutons laissent le clic à
+    /// la page.)
     pub fn button_clicked(&self, id: u32, uv: [f32; 2]) -> Option<usize> {
-        let r = self.reveal(id);
-        (0..2).find(|&b| r[b] >= CLIQUABLE && on_button(uv, b))
+        if self.reveal(id) < CLIQUABLE {
+            return None;
+        }
+        (0..BOUTONS.len()).find(|&b| on_button(uv, b))
+    }
+
+    /// (v213) Y a-t-il une page précédente (1), une page suivante (2) ? Le rendu grise les
+    /// boutons qui n'ont nulle part où aller.
+    pub fn history_of(&self, id: u32) -> u8 {
+        self.tabs.get(&id).map_or(0, |t| t.history)
+    }
+
+    /// (v213) La page précédente de cet écran (bouton retour), ou la suivante (`forward`).
+    /// Un bouton grisé ne fait rien.
+    pub fn history(&mut self, id: u32, forward: bool) {
+        let bit = if forward { 2 } else { 1 };
+        if !self.tabs.get(&id).is_some_and(|t| t.opened && t.history & bit != 0) {
+            return;
+        }
+        if let Some(b) = self.browser.as_mut() {
+            b.send(&format!("{} {id}", if forward { "forward" } else { "back" }));
+        }
     }
 
     /// Les pages refusées depuis la dernière fois : (écran, raison) — voir `filtre::Refus`
@@ -535,29 +558,17 @@ impl Displays {
         std::mem::take(&mut self.blocked)
     }
 
-    /// Volume du son de tous les écrans (0 à 1).
+    /// Volume du son de tous les écrans (0 à 1). (v213) Il ne touche plus aux pages : le
+    /// navigateur règle le volume de ses propres sons dans Windows (`volume`), et le lecteur
+    /// de YouTube reste à fond. Un script toutes les deux secondes sur chaque page, qui
+    /// redonnait aussi son volume au lecteur, faisait de petites coupures.
     pub fn set_volume(&mut self, v: f32) {
         let v = v.clamp(0.0, 1.0);
         if (v - self.volume).abs() > 1e-4 {
             self.volume = v;
-            self.volume_in = 0.0;
-        }
-    }
-
-    /// Donne le volume choisi aux vidéos et aux sons des pages ouvertes.
-    fn apply_volume(&mut self) {
-        let js = format!(
-            "(()=>{{const v={:.3};document.querySelectorAll('video,audio').forEach(m=>{{if(Math.abs(m.volume-v)>0.001)m.volume=v;}});if(window.__mlb)window.__mlb.volume(v);}})()",
-            self.volume
-        );
-        let ids: Vec<u32> = self
-            .tabs
-            .iter()
-            .filter(|(_, t)| t.opened)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            self.eval(id, &js);
+            if let Some(b) = self.browser.as_mut() {
+                b.send(&format!("volume 0 {}", volume_pct(v)));
+            }
         }
     }
 
@@ -670,7 +681,7 @@ impl Displays {
         {
             return;
         }
-        match Browser::start(self.cache, self.filtre) {
+        match Browser::start(self.cache, self.filtre, self.volume) {
             Err(Launch::Absent) => {
                 log::info!("écrans vidéo : navigateur absent (dossier « cef »), mires affichées");
                 self.absent = true;
@@ -857,13 +868,6 @@ impl Displays {
     /// le navigateur après `IDLE_STOP_S` sans écran, le relance s'il s'est arrêté.
     pub fn update(&mut self, dt: f32) {
         self.retry_in = (self.retry_in - dt).max(0.0);
-        // Volume des écrans : redonné aux pages toutes les deux secondes (une nouvelle vidéo
-        // repart au volume de sa page).
-        self.volume_in -= dt;
-        if self.volume_in <= 0.0 {
-            self.volume_in = 2.0;
-            self.apply_volume();
-        }
         if self.tabs.is_empty() {
             self.idle += dt;
             if self.idle >= IDLE_STOP_S && self.browser.is_some() {
@@ -923,6 +927,12 @@ impl Displays {
                             self.states.push((id, s))
                         }
                         Event::Scroll(f) => tab.scroll = f,
+                        Event::History(h) => {
+                            if tab.history != h {
+                                tab.history = h;
+                                tab.dirty = true;
+                            }
+                        }
                         Event::Blocked(raison) => self.blocked.push((id, raison)),
                     }
                 }
@@ -944,15 +954,23 @@ impl Displays {
 }
 
 /// (v211) Les boutons d'un écran, **en haut à gauche** : la loupe (Google), puis à sa
-/// droite la vidéo (la recherche de YouTube). Mêmes mesures que ce que dessine
-/// `screen.wgsl` (`BTN_C`, `BTN2_C`, `BTN_R`) ; les pages font 1280 × 720, donc une longueur
-/// en `u` vaut 16/9 de la même en `v`. Centres à 38 px du bord, rayon 28 px, 12 px entre
-/// les deux.
-const BOUTONS: [[f32; 2]; 2] = [[0.030, 0.053], [0.0828, 0.053]];
+/// droite la vidéo (la recherche de YouTube), puis (v213) le retour (page précédente) et
+/// le suivant (page suivante). Mêmes mesures que ce que dessine `screen.wgsl` (`BTN_C`,
+/// `BTN2_C`, `BTN3_C`, `BTN4_C`, `BTN_R`) ;
+/// les pages font 1280 × 720, donc une longueur en `u` vaut 16/9 de la même en `v`.
+/// Centres à 38 px du bord, rayon 28 px, 12 px entre deux.
+const BOUTONS: [[f32; 2]; 4] = [
+    [0.030, 0.053],
+    [0.0828, 0.053],
+    [0.1356, 0.053],
+    [0.1884, 0.053],
+];
 const RAYON: f32 = 0.022;
-/// Le bouton de recherche (Google) et le bouton vidéo (YouTube).
+/// Le bouton de recherche (Google), le bouton vidéo (YouTube), le retour et le suivant.
 pub const LOUPE: usize = 0;
 pub const VIDEO: usize = 1;
+pub const RETOUR: usize = 2;
+pub const SUIVANT: usize = 3;
 
 /// Autour du bouton (en rayons du bouton) : sa surface et un peu plus. Arrivé là, il est
 /// tout à fait visible ; dès qu'on en sort, il s'en va.
@@ -1018,16 +1036,17 @@ struct Corner {
 impl Corner {
     /// L'apparition voulue (0 à 1) de chaque bouton pour ce point du réticule (`None` : pas
     /// sur l'écran).
-    fn target(&mut self, cursor: Option<[f32; 2]>) -> [f32; 2] {
+    fn target(&mut self, cursor: Option<[f32; 2]>) -> f32 {
         let entered = !self.was_on;
         self.was_on = cursor.is_some();
         let Some(uv) = cursor else {
             self.armed = false;
             self.reached = false;
-            return [0.0; 2];
+            return 0.0;
         };
-        let each = [to_button(uv, LOUPE), to_button(uv, VIDEO)];
-        let d = each[0].min(each[1]);
+        let d = (0..BOUTONS.len())
+            .map(|b| to_button(uv, b))
+            .fold(f32::MAX, f32::min);
         let r = RAYON;
         if entered {
             // On arrive sur l'écran : par le bord gauche ou par le haut, et dans le coin.
@@ -1036,7 +1055,7 @@ impl Corner {
             self.reached = false;
         }
         if !self.armed {
-            return [0.0; 2];
+            return 0.0;
         }
         if d <= r * ZONE {
             self.reached = true;
@@ -1045,12 +1064,11 @@ impl Corner {
             // s'en vont, et il faudra revenir par le bord.
             self.armed = false;
             self.reached = false;
-            return [0.0; 2];
+            return 0.0;
         }
         // De plus en plus visible en approchant : tout à fait dans la zone. La même pour
-        // les deux boutons.
-        let v = (1.0 - (d - r * ZONE) / (r * (COIN - ZONE))).clamp(0.0, 1.0);
-        [v; 2]
+        // tous les boutons.
+        (1.0 - (d - r * ZONE) / (r * (COIN - ZONE))).clamp(0.0, 1.0)
     }
 }
 
@@ -1083,8 +1101,11 @@ struct Tab {
     scroll: u8,
     /// (v206) Apparition du bouton de recherche, de 0 à 1, et (v207) ce qui la commande :
     /// une arrivée par le bord, dans le coin en bas à gauche (voir `Corner`).
-    reveal: [f32; 2],
+    reveal: f32,
     corner: Corner,
+    /// (v213) Il y a une page précédente (1), une page suivante (2) : sans elles, les
+    /// boutons retour et suivant sont grisés et ne font rien.
+    history: u8,
     /// Page voulue ouverte (sinon en veille : dernière image assombrie) et images par
     /// seconde voulues (voir `Displays::schedule`) ; page ouverte dans le navigateur et
     /// images par seconde qui lui ont été demandées.
@@ -1115,8 +1136,9 @@ impl Tab {
             editing: false,
             loading: false,
             scroll: 0,
-            reveal: [0.0; 2],
+            reveal: 0.0,
             corner: Corner::default(),
+            history: 0,
             want_awake: true,
             want_fps: FPS_DEFAULT,
             opened: false,
@@ -1132,19 +1154,16 @@ impl Tab {
         // (v206) Les boutons apparaissent et disparaissent en fondu ; (v207) seulement
         // quand on arrive par le bord de l'écran, dans leur coin (voir `Corner`) ; (v211)
         // chacun le sien, et sur toutes les pages, le lecteur YouTube compris.
-        let cible = self.corner.target(self.cursor);
-        for (b, vers) in cible.into_iter().enumerate() {
-            let r = &mut self.reveal[b];
-            let pas = dt / if vers > *r { PARAIT } else { SEN_VA };
-            let avant = *r;
-            *r = if vers > *r {
-                (*r + pas).min(vers)
-            } else {
-                (*r - pas).max(vers)
-            };
-            if (*r - avant).abs() > 1e-4 {
-                self.dirty = true;
-            }
+        let vers = self.corner.target(self.cursor);
+        let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
+        let avant = self.reveal;
+        self.reveal = if vers > self.reveal {
+            (self.reveal + pas).min(vers)
+        } else {
+            (self.reveal - pas).max(vers)
+        };
+        if (self.reveal - avant).abs() > 1e-4 {
+            self.dirty = true;
         }
         if let Some((_, age)) = &mut self.ripple {
             *age += dt;
@@ -1335,6 +1354,8 @@ enum Event {
     /// (v205) Une page a été refusée par le filtre, avec sa raison (voir `filtre::Refus`
     /// du navigateur).
     Blocked(u8),
+    /// (v213) Il y a une page précédente (1), une page suivante (2).
+    History(u8),
 }
 
 /// Ce que le navigateur a envoyé depuis la dernière lecture : la dernière image de chaque
@@ -1385,7 +1406,7 @@ impl Browser {
     }
 
     /// Lance le navigateur avec la session `cache` (0 : `cef-cache`, n : `cef-cache-<n+1>`).
-    fn start(cache: u32, filtre: &str) -> Result<Self, Launch> {
+    fn start(cache: u32, filtre: &str, volume: f32) -> Result<Self, Launch> {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let exe = Self::find().ok_or(Launch::Absent)?;
@@ -1436,6 +1457,9 @@ impl Browser {
             .arg("--restreint")
             .arg("strict")
             .args(en_ligne.then_some("--sans-compte"))
+            // (v213) Le volume des écrans dès le lancement, sans un éclat de son avant.
+            .arg("--volume")
+            .arg(volume_pct(volume).to_string())
             .current_dir(exe.parent().ok_or(Launch::Absent)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1613,6 +1637,12 @@ fn read_records(mut out: impl std::io::Read, inbox: std::sync::Arc<std::sync::Mu
                     i.events.push((id, Event::Scroll((a & 3) as u8)));
                 }
             }
+            // (v213) Page précédente (`a` & 1), page suivante (`a` & 2).
+            b"MLBH" => {
+                if let Ok(mut i) = inbox.lock() {
+                    i.events.push((id, Event::History((a & 3) as u8)));
+                }
+            }
             // (v205) Page refusée : `a` est la raison. L'adresse reste au journal du
             // navigateur (`navigateur-sortie.log`) : le jeu n'a pas à l'afficher.
             b"MLBX" => {
@@ -1693,11 +1723,12 @@ mod tests {
     }
 
     /// (v206) Les boutons : ronds pour de vrai (les pages sont en 16/9), (v211) **en haut à
-    /// gauche**, la vidéo à droite de la loupe, et ils ne mangent pas la page.
+    /// gauche**, (v213) quatre en ligne — loupe, vidéo, retour, suivant — et ils ne mangent
+    /// pas la page.
     #[test]
     fn the_buttons_are_round_and_sit_in_the_top_left_corner() {
         let r = RAYON;
-        for b in [LOUPE, VIDEO] {
+        for b in [LOUPE, VIDEO, RETOUR, SUIVANT] {
             let c = BOUTONS[b];
             assert!(on_button(c, b));
             // Le bord : à `r` en largeur, à `r * 16/9` en hauteur.
@@ -1707,16 +1738,18 @@ mod tests {
             assert!(!on_button([c[0], c[1] + r * 16.0 / 9.0 * 1.05], b));
             // Tient dans l'écran, en haut à gauche.
             assert!(c[0] - r > 0.0 && c[1] - r * 16.0 / 9.0 > 0.0);
-            assert!(c[1] < 0.5 && c[0] < 0.2);
+            assert!(c[1] < 0.5 && c[0] < 0.25);
             for ailleurs in [[0.5, 0.5], [0.0, 0.5], [0.5, 1.0], [0.03, 0.95], [0.97, 0.05]] {
                 assert!(!on_button(ailleurs, b), "{ailleurs:?}");
             }
         }
-        // La vidéo à droite de la loupe, à la même hauteur, sans se toucher.
-        let (l, v) = (BOUTONS[LOUPE], BOUTONS[VIDEO]);
-        assert_eq!(l[1], v[1]);
-        assert!(v[0] - l[0] > 2.0 * r);
-        assert!(!on_button(v, LOUPE) && !on_button(l, VIDEO));
+        // Chacun à droite du précédent, à la même hauteur, sans se toucher.
+        for b in 1..BOUTONS.len() {
+            let (g, d) = (BOUTONS[b - 1], BOUTONS[b]);
+            assert_eq!(g[1], d[1]);
+            assert!(d[0] - g[0] > 2.0 * r);
+            assert!(!on_button(d, b - 1) && !on_button(g, b));
+        }
     }
 
     /// Le réticule glisse de `de` à `vers` en `n` images (une image : 16 ms), puis y reste
@@ -1739,124 +1772,94 @@ mod tests {
         }
     }
 
-    /// (v207) Un bouton ne se montre que si l'on arrive sur l'écran **par son bord**, dans
-    /// son coin, et qu'on glisse vers lui — même lentement. (v211) En haut à gauche : par le
-    /// bord gauche ou par le haut.
+    /// (v207) Les boutons ne se montrent que si l'on arrive sur l'écran **par son bord**,
+    /// près d'eux, et qu'on glisse vers eux — même lentement. (v211) En haut à gauche : par
+    /// le bord gauche ou par le haut. (v212) Tous ensemble, du même fondu.
     #[test]
-    fn a_button_shows_up_when_sliding_in_from_the_edge_of_its_corner() {
+    fn the_buttons_show_up_when_sliding_in_from_the_edge_of_their_corner() {
         let c = BOUTONS[LOUPE];
         // Par le bord gauche, lentement (une seconde et demie de glissement).
         let mut t = Tab::new("x");
         glide(&mut t, [0.0, 0.20], c, 90, 30);
-        assert!(t.reveal[LOUPE] > 0.99, "{:?}", t.reveal);
-        assert!(t.reveal[LOUPE] >= CLIQUABLE);
+        assert!(t.reveal > 0.99, "{}", t.reveal);
         // Par le haut, vite.
         let mut t = Tab::new("x");
         glide(&mut t, [0.10, 0.0], c, 6, 30);
-        assert!(t.reveal[LOUPE] > 0.99, "{:?}", t.reveal);
-        // Au milieu du chemin, il est déjà là mais pas tout à fait.
+        assert!(t.reveal > 0.99, "{}", t.reveal);
+        // Au milieu du chemin, ils sont déjà là mais pas tout à fait.
         let mut t = Tab::new("x");
         glide(&mut t, [0.0, 0.24], [0.06, 0.18], 20, 40);
-        assert!(t.reveal[LOUPE] > 0.05 && t.reveal[LOUPE] < 0.95, "{:?}", t.reveal);
-        // Le bouton vidéo, par le haut juste au-dessus de lui : tous deux sont là.
-        let v = BOUTONS[VIDEO];
-        let mut t = Tab::new("x");
-        glide(&mut t, [v[0] + 0.01, 0.0], v, 20, 30);
-        assert_eq!(t.reveal, [1.0; 2]);
-        // Par le coin, en passant devant la loupe pour aller à la vidéo, et retour : tous
-        // deux restent.
-        let mut t = Tab::new("x");
-        glide(&mut t, [0.0, 0.053], v, 40, 30);
-        glide(&mut t, v, BOUTONS[LOUPE], 20, 30);
-        assert_eq!(t.reveal, [1.0; 2]);
-    }
-
-    /// (v212) Les deux boutons apparaissent et disparaissent ensemble, image par image.
-    #[test]
-    fn the_two_buttons_fade_in_and_out_together() {
-        let mut t = Tab::new("x");
-        let mut vus = Vec::new();
-        let chemin = [
-            ([0.0, 0.25], BOUTONS[LOUPE]),
-            (BOUTONS[LOUPE], BOUTONS[VIDEO]),
-            (BOUTONS[VIDEO], [0.5, 0.5]),
-        ];
-        for (de, vers) in chemin {
-            for k in 0..=30 {
-                let a = k as f32 / 30.0;
-                t.cursor = Some([de[0] + (vers[0] - de[0]) * a, de[1] + (vers[1] - de[1]) * a]);
-                t.update(0.016);
-                vus.push(t.reveal);
-            }
+        assert!(t.reveal > 0.05 && t.reveal < 0.95, "{}", t.reveal);
+        // Par le haut, juste au-dessus de chacun des autres boutons.
+        for b in [VIDEO, RETOUR, SUIVANT] {
+            let v = BOUTONS[b];
+            let mut t = Tab::new("x");
+            glide(&mut t, [v[0] + 0.01, 0.0], v, 20, 30);
+            assert_eq!(t.reveal, 1.0, "bouton {b}");
+            // Et en passant de l'un à l'autre, jusqu'à la loupe : ils restent.
+            glide(&mut t, v, BOUTONS[LOUPE], 30, 30);
+            assert_eq!(t.reveal, 1.0, "bouton {b}");
         }
-        for _ in 0..40 {
-            t.update(0.016);
-            vus.push(t.reveal);
-        }
-        assert!(vus.iter().all(|r| r[0] == r[1]), "{vus:?}");
-        // Ils sont bien apparus, puis repartis.
-        assert!(vus.iter().any(|r| r[0] > 0.99));
-        assert_eq!(vus.last(), Some(&[0.0; 2]));
     }
 
     /// (v207) Déjà sur l'écran, monter dans le coin ne les fait pas apparaître ; entrer
     /// par un bord loin du coin non plus.
     #[test]
     fn the_buttons_stay_hidden_when_already_on_the_screen() {
-        for b in [LOUPE, VIDEO] {
+        for b in [LOUPE, VIDEO, RETOUR, SUIVANT] {
             let c = BOUTONS[b];
             let mut t = Tab::new("x");
             glide(&mut t, [0.5, 0.5], c, 60, 40);
-            assert_eq!(t.reveal, [0.0; 2]);
+            assert_eq!(t.reveal, 0.0);
             // Même en tournant dans le coin.
             glide(&mut t, c, [0.0, 0.0], 20, 20);
             glide(&mut t, [0.0, 0.0], c, 20, 20);
-            assert_eq!(t.reveal, [0.0; 2]);
+            assert_eq!(t.reveal, 0.0);
             // Par le bord gauche, mais en bas de l'écran : pas leur coin.
             let mut t = Tab::new("x");
             glide(&mut t, [0.0, 0.7], c, 60, 40);
-            assert_eq!(t.reveal, [0.0; 2]);
+            assert_eq!(t.reveal, 0.0);
             // Par le haut, mais à droite : pas leur coin non plus.
             let mut t = Tab::new("x");
             glide(&mut t, [0.6, 0.0], c, 60, 40);
-            assert_eq!(t.reveal, [0.0; 2]);
+            assert_eq!(t.reveal, 0.0);
         }
     }
 
-    /// (v207) Une fois là, un bouton s'en va dès qu'on sort de sa zone, et pour le revoir
-    /// il faut ressortir de l'écran et revenir par le bord.
+    /// (v207) Une fois là, ils s'en vont dès qu'on sort de leur zone, et pour les revoir il
+    /// faut ressortir de l'écran et revenir par le bord.
     #[test]
-    fn a_button_fades_away_elsewhere_and_needs_a_new_entry() {
+    fn the_buttons_fade_away_elsewhere_and_need_a_new_entry() {
         let c = BOUTONS[LOUPE];
         let r = RAYON;
         let mut t = Tab::new("x");
         glide(&mut t, [0.0, 0.15], c, 30, 30);
-        assert!(t.reveal[LOUPE] > 0.99);
-        // Un peu autour du bouton (côté écran) : il reste.
+        assert!(t.reveal > 0.99);
+        // Un peu autour du bouton (côté écran) : ils restent.
         let autour = [c[0], c[1] + r * (ZONE - 0.3) * 16.0 / 9.0];
         glide(&mut t, c, autour, 10, 20);
-        assert!(t.reveal[LOUPE] > 0.99, "{:?}", t.reveal);
-        // On sort de sa zone, sans quitter l'écran : il s'en va en fondu.
+        assert!(t.reveal > 0.99, "{}", t.reveal);
+        // On sort de leur zone, sans quitter l'écran : ils s'en vont en fondu.
         glide(&mut t, autour, [0.3, 0.4], 10, 0);
-        assert!(t.reveal[LOUPE] < 1.0, "{:?}", t.reveal);
+        assert!(t.reveal < 1.0, "{}", t.reveal);
         for _ in 0..40 {
             t.update(0.016);
         }
-        assert_eq!(t.reveal[LOUPE], 0.0);
-        // Revenir dessus sans quitter l'écran : il ne revient pas.
+        assert_eq!(t.reveal, 0.0);
+        // Revenir dessus sans quitter l'écran : ils ne reviennent pas.
         glide(&mut t, [0.3, 0.4], c, 30, 30);
-        assert_eq!(t.reveal[LOUPE], 0.0);
-        // Ressortir de l'écran puis revenir par le bord : il revient.
+        assert_eq!(t.reveal, 0.0);
+        // Ressortir de l'écran puis revenir par le bord : ils reviennent.
         leave(&mut t);
         glide(&mut t, [0.0, 0.15], c, 30, 30);
-        assert!(t.reveal[LOUPE] > 0.99, "{:?}", t.reveal);
-        // Un passage éclair par le bord ne le rend pas cliquable.
+        assert!(t.reveal > 0.99, "{}", t.reveal);
+        // Un passage éclair par le bord ne les rend pas cliquables.
         leave(&mut t);
         t.cursor = Some([0.0, 0.05]);
         t.update(0.016);
         t.cursor = Some(c);
         t.update(0.016);
-        assert!(t.reveal[LOUPE] < CLIQUABLE, "{:?}", t.reveal);
+        assert!(t.reveal < CLIQUABLE, "{}", t.reveal);
     }
 
     /// (v211) Sur la page du lecteur YouTube aussi, et le clic va au bon bouton.
@@ -1865,12 +1868,18 @@ mod tests {
         let mut t = Tab::new(&format!("{}?v=dQw4w9WgXcQ", crate::watch::LECTEUR));
         let v = BOUTONS[VIDEO];
         glide(&mut t, [v[0], 0.0], v, 20, 30);
-        assert!(t.reveal[VIDEO] > 0.99, "{:?}", t.reveal);
+        assert_eq!(t.reveal, 1.0);
         let mut d = Displays::new();
         d.tabs.insert(3, t);
-        assert_eq!(d.button_clicked(3, v), Some(VIDEO));
-        assert_eq!(d.button_clicked(3, BOUTONS[LOUPE]), Some(LOUPE));
-        // Entre les deux ronds : à la page.
+        for b in [LOUPE, VIDEO, RETOUR, SUIVANT] {
+            assert_eq!(d.button_clicked(3, BOUTONS[b]), Some(b));
+        }
+        // (v213) Sans page précédente ni suivante, retour et suivant sont grisés : le clic
+        // leur revient quand même (il ne part pas à la page), mais ils ne font rien.
+        assert_eq!(d.history_of(3), 0);
+        d.history(3, false);
+        d.history(3, true);
+        // Entre deux ronds, ou ailleurs : à la page.
         assert_eq!(d.button_clicked(3, [(BOUTONS[LOUPE][0] + v[0]) / 2.0, v[1]]), None);
         assert_eq!(d.button_clicked(3, [0.5, 0.5]), None);
     }
@@ -2035,6 +2044,7 @@ mod tests {
         data.extend(rec(b"MLBK", 7, 1, 0, &[]));
         data.extend(rec(b"MLBS", 7, 2, 0, b"{}"));
         data.extend(rec(b"MLBW", 7, 2, 0, &[]));
+        data.extend(rec(b"MLBH", 7, 3, 0, &[]));
         let inbox = std::sync::Arc::new(std::sync::Mutex::new(Inbox::default()));
         read_records(&data[..], inbox.clone());
         let i = inbox.lock().unwrap();
@@ -2044,7 +2054,8 @@ mod tests {
             vec![
                 (7, Event::Editing(true)),
                 (7, Event::State("{}".into())),
-                (7, Event::Scroll(2))
+                (7, Event::Scroll(2)),
+                (7, Event::History(3))
             ]
         );
     }
