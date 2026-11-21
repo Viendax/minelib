@@ -87,6 +87,16 @@ fn deferred_color(d: DynOut, a: vec4<f32>, w: f32, spec: vec2<f32>) -> vec4<f32>
     return vec4<f32>(a.rgb * d.diffuse * w + sp * spec.x, 0.0);
 }
 
+/// (v215) La même chose pour un pixel de l'opaque, avec le voile noir des entités
+/// (`gb_dark_veil` : albédo.a = 1).
+fn opaque_color(d: DynOut, a: vec4<f32>, w: f32, spec: vec2<f32>) -> vec4<f32> {
+    let c = deferred_color(d, a, w, spec);
+    if a.a > 0.995 {
+        return c * gb_dark_veil(a.rgb);
+    }
+    return c;
+}
+
 /// Clé d'une surface : normale (octaèdre, 2 × 8 bits), brillance (8 bits), bit 24 : la
 /// lumière a été calculée. Deux pixels de même clé sont sur des faces parallèles d'un même
 /// matériau (le plan se vérifie à part, par les profondeurs).
@@ -306,7 +316,7 @@ fn fs_interp(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if avg.diffuse.x < 0.0 {
         discard;
     }
-    return deferred_color(avg, a, s.b, spec);
+    return opaque_color(avg, a, s.b, spec);
 }
 
 /// Calcul exact : les pixels que `fs_interp` a laissés (pochoir à 0), ou tous quand la
@@ -321,7 +331,7 @@ fn fs_deferred(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
     let a = textureLoad(gb_albedo, px, 0);
-    return deferred_color(deferred_light(px, s, a), a, s.b, spec);
+    return opaque_color(deferred_light(px, s, a), a, s.b, spec);
 }
 
 /// (v199) Lumières sur l'eau, le verre et la glace : la face translucide de chaque pixel

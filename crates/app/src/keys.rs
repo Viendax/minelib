@@ -94,6 +94,9 @@ pub enum Action {
     LightEditor,
     /// Caméra libre, dans l'éditeur de lumières.
     FreeCamera,
+    /// (v215) Parler au micro en construction (touche maintenue), réglée à part de celle du
+    /// mode FPS.
+    Talk,
     Command,
     Debug,
     Screenshot,
@@ -143,7 +146,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 61] = [
+    pub const ALL: [Action; 62] = [
         Action::Attack,
         Action::Use,
         Action::Pick,
@@ -161,6 +164,7 @@ impl Action {
         Action::Perspective,
         Action::LightEditor,
         Action::FreeCamera,
+        Action::Talk,
         Action::Command,
         Action::Debug,
         Action::Screenshot,
@@ -225,7 +229,8 @@ impl Action {
             | Action::Zoom
             | Action::Perspective
             | Action::LightEditor
-            | Action::FreeCamera => Group::Build,
+            | Action::FreeCamera
+            | Action::Talk => Group::Build,
             Action::Command | Action::Debug | Action::Screenshot => Group::Shared,
             Action::FpsForward
             | Action::FpsBack
@@ -291,7 +296,6 @@ impl Action {
                 | Action::FpsRadio1
                 | Action::FpsRadio2
                 | Action::FpsRadio3
-                | Action::FpsVoice
                 | Action::FpsSpray
         )
     }
@@ -315,6 +319,7 @@ impl Action {
             Action::Perspective => "Vue (1re / 3e personne)",
             Action::LightEditor => "Éditeur de lumières",
             Action::FreeCamera => "Caméra libre (éditeur)",
+            Action::Talk => "Parler (micro)",
             Action::Command => "Commande",
             Action::Debug => "Debug (F3)",
             Action::Screenshot => "Capture d'écran",
@@ -353,7 +358,7 @@ impl Action {
             Action::FpsRadio1 => "Radio : ordres",
             Action::FpsRadio2 => "Radio : groupe",
             Action::FpsRadio3 => "Radio : rapports",
-            Action::FpsVoice => "Micro",
+            Action::FpsVoice => "Parler (micro)",
             Action::FpsSpray => "Graffiti",
             Action::FpsPing => "Signaler (ping)",
             Action::FpsScreenshot => "Capture d'écran",
@@ -381,6 +386,7 @@ impl Action {
             Action::Perspective => "perspective",
             Action::LightEditor => "light_editor",
             Action::FreeCamera => "free_camera",
+            Action::Talk => "talk",
             Action::Command => "command",
             Action::Debug => "debug",
             Action::Screenshot => "screenshot",
@@ -451,6 +457,8 @@ impl Action {
             // Comme IRLights : L ouvre l'éditeur, F y bascule la caméra libre.
             Action::LightEditor => Some(Bind::Key(KeyCode::KeyL)),
             Action::FreeCamera => Some(Bind::Key(KeyCode::KeyF)),
+            // (v215) Comme en FPS : K maintenu.
+            Action::Talk => Some(Bind::Key(KeyCode::KeyK)),
             Action::Command => Some(Bind::Key(KeyCode::Slash)),
             Action::Debug => Some(Bind::Key(KeyCode::F3)),
             Action::Screenshot => Some(Bind::Key(KeyCode::F2)),
@@ -811,6 +819,24 @@ mod tests {
         assert_eq!(b.get(Action::Debug), None);
         assert!(!Action::tab(false).contains(&Action::FpsBuy));
         assert!(Action::tab(true).contains(&Action::Debug));
+        // (v215) Parler : une touche dans chaque onglet (K par défaut), active (pas grisée),
+        // que rien d'autre n'a dans son onglet ; changer celle de la construction ne change
+        // pas celle du FPS.
+        assert!(Action::tab(false).contains(&Action::Talk));
+        assert!(Action::tab(true).contains(&Action::FpsVoice));
+        assert!(!Action::Talk.coming_soon() && !Action::FpsVoice.coming_soon());
+        let mut d = Bindings::default();
+        for (talk, fps) in [(Action::Talk, false), (Action::FpsVoice, true)] {
+            assert_eq!(d.get(talk), Some(Bind::Key(KeyCode::KeyK)));
+            for a in Action::tab(fps) {
+                if a != talk {
+                    assert_ne!(d.get(a), Some(Bind::Key(KeyCode::KeyK)), "{a:?}");
+                }
+            }
+        }
+        d.bind(Action::Talk, Bind::Key(KeyCode::KeyV));
+        assert_eq!(d.get(Action::Talk), Some(Bind::Key(KeyCode::KeyV)));
+        assert_eq!(d.get(Action::FpsVoice), Some(Bind::Key(KeyCode::KeyK)));
         b.walk_toggle = true;
         let dir = std::env::temp_dir().join(format!("minelib-keys2-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

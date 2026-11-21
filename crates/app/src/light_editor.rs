@@ -135,8 +135,7 @@ pub struct Editor {
     pub open: bool,
     pub selected: Option<usize>,
     tab: Tab,
-    /// Réglages généraux affichés à la place de la lumière.
-    settings: bool,
+    /// Onglet des réglages généraux (`settings_screen`).
     cat: Cat,
     pub free_cam: Option<FreeCam>,
     /// La souris tourne la vue (le jeu capture alors le curseur).
@@ -166,7 +165,6 @@ impl Default for Editor {
             open: false,
             selected: None,
             tab: Tab::Base,
-            settings: false,
             cat: Cat::Presets,
             free_cam: None,
             looking: false,
@@ -414,8 +412,6 @@ impl Editor {
             self.editing_name = false;
         } else if self.warn_auto {
             self.warn_auto = false;
-        } else if self.settings {
-            self.settings = false;
         } else {
             self.close();
         }
@@ -1115,18 +1111,13 @@ impl Editor {
             y: py + pad * 2.0,
             clip: (py, py + ph),
         };
-        // Titre, réglages, fermer.
+        // Titre, fermer. (v215) Les réglages de toutes les lumières sont dans Paramètres
+        // graphiques → Lumières (`settings_screen`) : ici, chaque lumière.
         {
             let y = p.y;
             p.text(p.x, y + (row - 8.0 * ts) / 2.0, WHITE, "LUMIÈRES");
             let bw = 18.0 * ts;
             let close_x = p.x + p.w - bw;
-            let set_w = Ui::text_width("Réglages", ts) + 6.0 * ts;
-            let set_x = close_x - pad - set_w;
-            if p.button_at(set_x, set_w, "Réglages", self.settings, true) {
-                self.settings = !self.settings;
-                self.settings_scroll = 0.0;
-            }
             if p.button_at(close_x, bw, "x", false, true) {
                 self.close();
                 return;
@@ -1269,9 +1260,7 @@ impl Editor {
         // Bas du panneau : état des ombres.
         let foot = 2.0 * row;
         let body_end = py + ph - foot - pad;
-        if self.settings {
-            self.settings_body(&mut p, input, lights, body_end);
-        } else if let Some(i) = self.selected.filter(|&i| i < lights.scene.len()) {
+        if let Some(i) = self.selected.filter(|&i| i < lights.scene.len()) {
             self.light_body(&mut p, input, lights, i, cam, body_end);
         } else {
             p.note(
@@ -1984,6 +1973,83 @@ impl Editor {
         }
         p.y = y0 + h + p.pad;
         changed
+    }
+
+    /// (v215) Réglages de toutes les lumières (préréglages, rayons, ombres, surfaces,
+    /// lumières automatiques, interface), seuls dans une fenêtre au milieu de l'écran :
+    /// Échap → Paramètres graphiques → Lumières. Le panneau de l'éditeur (L) ne règle plus
+    /// que chaque lumière. Échap ferme d'abord l'avertissement des lumières automatiques.
+    /// Renvoie vrai quand la fenêtre se ferme (« Terminé », « x » ou Échap).
+    pub fn settings_screen(
+        &mut self,
+        ui: &mut Ui,
+        input: &Input,
+        lights: &mut Lights,
+        size: (f32, f32),
+    ) -> bool {
+        let (ts, row, pad) = Self::metrics(size.1);
+        let w = (300.0 * ts).min(size.0 - pad * 4.0);
+        let h = size.1 - row * 4.0;
+        let (px, py) = ((size.0 - w) / 2.0, row * 2.0);
+        if !input.mouse_held(Mouse::Left) {
+            self.drag = None;
+        }
+        let mut done = false;
+        if input.pressed(KeyCode::Escape) {
+            if self.warn_auto {
+                self.warn_auto = false;
+            } else {
+                done = true;
+            }
+        }
+        ui.rect(px, py, w, h, PANEL_BG);
+        ui.rect(px, py, w, 2.0 * ts, FILL);
+        let cursor = if self.warn_auto { None } else { input.cursor };
+        let mut p = P {
+            ui,
+            cursor,
+            click: input.mouse_pressed(Mouse::Left) && !input.grabbed,
+            held: input.mouse_held(Mouse::Left),
+            wheel: if cursor.is_some() { input.scroll } else { 0.0 },
+            ctrl: input.held(KeyCode::ControlLeft) || input.held(KeyCode::ControlRight),
+            ts,
+            row,
+            pad,
+            x: px + pad * 2.0,
+            w: w - pad * 4.0,
+            y: py + pad * 2.0,
+            clip: (py, py + h),
+        };
+        {
+            let y = p.y;
+            p.text(
+                p.x,
+                y + (row - 8.0 * ts) / 2.0,
+                WHITE,
+                "Réglages des lumières",
+            );
+            let bw = 18.0 * ts;
+            if p.button_at(p.x + p.w - bw, bw, "x", false, true) {
+                done = true;
+            }
+            p.y += row + pad;
+        }
+        let foot_y = py + h - row - pad;
+        self.settings_body(&mut p, input, lights, foot_y - pad);
+        p.clip = (py, py + h);
+        p.y = foot_y;
+        let bw = (Ui::text_width("Terminé", ts) + 24.0 * ts).min(p.w);
+        if p.button_at(px + (w - bw) / 2.0, bw, "Terminé", false, true) {
+            done = true;
+        }
+        if self.warn_auto {
+            self.auto_warning(ui, input, lights, size);
+        }
+        if done {
+            self.warn_auto = false;
+            self.drag = None;
+        }
+        done
     }
 
     /// Réglages généraux (préréglages, rayons, ombres, surfaces, lumières automatiques,

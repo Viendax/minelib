@@ -322,6 +322,36 @@ struct Cmd {
     reopen: bool,
 }
 
+/// (v215) Volume du jeu (Paramètres → Son), à part du volume de chaque son : changé, il
+/// vaut tout de suite pour les sons en cours aussi (feu, bips de la bombe), comme le volume
+/// des écrans pour leurs vidéos. Bits d'un `f32`.
+static MASTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f19_999a);
+
+fn master() -> f32 {
+    f32::from_bits(MASTER.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// (v215) Volume du jeu (0 à 1) : les sons en cours le prennent tout de suite.
+pub fn set_master(v: f32) {
+    let v = v.clamp(0.0, 1.0);
+    let old = MASTER.swap(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    if old == v.to_bits() {
+        return;
+    }
+    if let Some(tx) = sender() {
+        if let Ok(tx) = tx.lock() {
+            // (Commande vide : le fil du son redonne le volume à ses sons en cours.)
+            let _ = tx.send(Cmd {
+                file: "",
+                volume: 0.0,
+                delay: 0.0,
+                voice: None,
+                reopen: false,
+            });
+        }
+    }
+}
+
 /// Sortie son choisie (nom du périphérique ; vide : celle par défaut du système).
 static OUTPUT: Mutex<String> = Mutex::new(String::new());
 
@@ -358,6 +388,16 @@ pub fn set_output(name: &str) {
                 reopen: true,
             });
         }
+    }
+}
+
+/// (v215) Windows ne baisse plus le son du jeu pendant une communication (voir
+/// `minelib_platform::audio_no_ducking`) : « quand je ne suis pas dans le jeu, le son se
+/// réduit lentement, et quand je reviens il réaugmente ».
+fn no_ducking() {
+    match minelib_platform::audio_no_ducking() {
+        Ok(()) => log::info!("audio : son du jeu jamais baissé par Windows (communications)"),
+        Err(e) => log::warn!("audio : baisse du son par Windows pas désactivée ({e})"),
     }
 }
 
@@ -398,11 +438,13 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
             .name("audio".into())
             .spawn(move || {
                 let mut out = open_output();
+                no_ducking();
                 let mut cache: HashMap<
                     &'static str,
                     rodio::source::Buffered<Decoder<Cursor<&'static [u8]>>>,
                 > = HashMap::new();
-                let mut sinks: Vec<Sink> = Vec::new();
+                // Chaque son avec son volume propre (sans le volume du jeu, `master`).
+                let mut sinks: Vec<(Sink, f32)> = Vec::new();
                 // Une file par joueur qui parle.
                 let mut voices: HashMap<u64, Sink> = HashMap::new();
                 while let Ok(cmd) = rx.recv() {
@@ -414,12 +456,21 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                         // qu'une fois.)
                         drop(out.take());
                         out = open_output();
+                        no_ducking();
                         continue;
                     }
                     let Some((_, handle)) = &out else {
                         continue;
                     };
-                    sinks.retain(|s| !s.empty());
+                    sinks.retain(|s| !s.0.empty());
+                    // (v215) Volume du jeu changé : tout de suite pour les sons en cours.
+                    if cmd.file.is_empty() && cmd.voice.is_none() {
+                        let m = master();
+                        for (sink, base) in &sinks {
+                            sink.set_volume(base * m);
+                        }
+                        continue;
+                    }
                     if let Some((who, samples)) = cmd.voice {
                         let Some(sink) = (match voices.entry(who) {
                             std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
@@ -455,9 +506,9 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                         sinks.remove(0);
                     }
                     if let Ok(sink) = Sink::try_new(handle) {
-                        sink.set_volume(cmd.volume);
+                        sink.set_volume(cmd.volume * master());
                         sink.append(src.delay(Duration::from_secs_f32(cmd.delay.max(0.0))));
-                        sinks.push(sink);
+                        sinks.push((sink, cmd.volume));
                     }
                 }
             });
@@ -466,9 +517,10 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
     .as_ref()
 }
 
-/// Joue `sfx` après `delay` secondes, au volume général `master` (0..1).
-pub fn play(sfx: Sfx, delay: f32, master: f32) {
-    if master <= 0.0 {
+/// Joue `sfx` après `delay` secondes, à `gain` (distance… 0..1), au volume du jeu
+/// (`set_master`).
+pub fn play(sfx: Sfx, delay: f32, gain: f32) {
+    if gain <= 0.0 || master() <= 0.0 {
         return;
     }
     let (file, volume) = file_of(sfx);
@@ -476,7 +528,7 @@ pub fn play(sfx: Sfx, delay: f32, master: f32) {
         if let Ok(tx) = tx.lock() {
             let _ = tx.send(Cmd {
                 file,
-                volume: volume * master,
+                volume: volume * gain,
                 delay,
                 voice: None,
                 reopen: false,

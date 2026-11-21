@@ -62,6 +62,50 @@ fn vl_pick(s: VlTap, d: f32, b: f32) -> vec4<f32> {
     return vec4<f32>(e * w, w);
 }
 
+/// (v215) Tout l'écran de l'image volumétrique, en un triangle.
+@vertex
+fn vs_full(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((vi << 1u) & 2u) * 2.0 - 1.0;
+    let y = f32(vi & 2u) * 2.0 - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+
+/// (v215) Lissage des rayons, entre la marche et la recomposition : chaque pixel de l'image
+/// volumétrique (demi- ou quart de résolution) prend la moyenne pondérée de ses 3 × 3
+/// voisins (tente 1-2-1), la couche proche avec les couches proches à sa distance, la
+/// lointaine avec les lointaines (mêmes poids de profondeur que `vl_pick` : rien ne bave
+/// d'un objet sur le fond). La marche décale ses pas d'un tramage différent à chaque pixel
+/// (et à chaque image) : seule, l'image grésille et l'anticrénelage la lisse en quelques
+/// images, ce qui se voit en tournant vite. Moyennée sur ses voisins, elle est lisse tout de
+/// suite. Neuf lectures par pixel de l'image réduite : presque rien.
+@fragment
+fn fs_smooth(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<u32> {
+    let hd = vec2<i32>(textureDimensions(vl_tex));
+    let c = vec2<i32>(floor(frag.xy));
+    let s = vl_tap(c);
+    var near = vec4<f32>(0.0);
+    var far = vec4<f32>(0.0);
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let q = vl_tap(clamp(c + vec2<i32>(x, y), vec2<i32>(0), hd - 1));
+            let b = f32((2 - abs(x)) * (2 - abs(y)));
+            let wn = b * exp(-abs(q.dn - s.dn) / max(max(q.dn, s.dn), 1e-6) * 24.0);
+            let wf = b * exp(-abs(q.df - s.df) / max(max(q.df, s.df), 1e-6) * 24.0);
+            near += vec4<f32>(q.n * wn, wn);
+            far += vec4<f32>(q.f * wf, wf);
+        }
+    }
+    // Le pixel lui-même a toujours son poids (4) : jamais de division par zéro.
+    let n = near.rgb / near.w;
+    let f = far.rgb / far.w;
+    return vec4<u32>(
+        pack2x16float(n.rg),
+        pack2x16float(vec2<f32>(n.b, s.dn)),
+        pack2x16float(f.rg),
+        pack2x16float(vec2<f32>(f.b, s.df)),
+    );
+}
+
 @fragment
 fn fs_composite(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let fd = vec2<i32>(textureDimensions(full_depth));

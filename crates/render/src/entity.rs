@@ -98,6 +98,8 @@ impl PlayerInstance {
     pub const HOLDS: u32 = 1 << 16;
     /// (v177) Bit de `skin` : arme à feu en main, les deux bras tendus vers le regard.
     pub const AIMS: u32 = 1 << 17;
+    /// (v215) Bit de `skin` : lampe torche en main, le bras droit seul tendu vers le regard.
+    pub const AIMS_RIGHT: u32 = 1 << 18;
 }
 
 /// Demi-flottant (IEEE 754 binaire16) le plus proche d'un nombre positif (couleurs).
@@ -142,6 +144,41 @@ pub const PLAYER_SKINS: u32 = 64;
 /// Sommets au plus du modèle commun (six pavés : 216).
 const MESH_MAX: usize = 512;
 
+/// (v215) Le ciel des blocs (`sky_color` de world.wgsl et ce qu'il lit), recopié tel quel à
+/// l'assemblage : le brouillard des entités et des joueurs va vers la même couleur que
+/// celui des blocs, sans un second ciel à tenir à jour.
+pub(crate) fn sky_wgsl() -> String {
+    let src = include_str!("shaders/world.wgsl");
+    let mut out = String::new();
+    for start in ["const HORIZON", "const ZENITH", "fn lin(", "fn sky_color("] {
+        let at = src
+            .find(start)
+            .unwrap_or_else(|| panic!("world.wgsl : « {start} » introuvable"));
+        let rest = &src[at..];
+        let len = if start.starts_with("const") {
+            rest.find('\n').map(|e| e + 1)
+        } else {
+            rest.find("\n}\n").map(|e| e + 3)
+        };
+        out.push_str(&rest[..len.unwrap_or(rest.len())]);
+    }
+    out
+}
+
+/// (v215) Shader des entités (entity.wgsl), avec le ciel de leur brouillard.
+pub(crate) fn entity_wgsl() -> String {
+    format!("{}\n{}", include_str!("shaders/entity.wgsl"), sky_wgsl())
+}
+
+/// (v215) Shader des autres joueurs : celui des entités, puis players.wgsl.
+pub(crate) fn players_wgsl() -> String {
+    format!(
+        "{}\n{}",
+        entity_wgsl(),
+        include_str!("shaders/players.wgsl")
+    )
+}
+
 /// Les autres joueurs : un modèle, une instance chacun, une couche de skin par skin.
 struct Players {
     plain: wgpu::RenderPipeline,
@@ -165,11 +202,7 @@ impl Players {
         world_bgl: &wgpu::BindGroupLayout,
         surface: wgpu::TextureFormat,
     ) -> Self {
-        let src = crate::lights::without_dynlights(&format!(
-            "{}\n{}",
-            include_str!("shaders/entity.wgsl"),
-            include_str!("shaders/players.wgsl")
-        ));
+        let src = crate::lights::without_dynlights(&players_wgsl());
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("joueurs"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -467,7 +500,7 @@ impl EntityPipes {
         bgl: &wgpu::BindGroupLayout,
         surface: wgpu::TextureFormat,
     ) -> Self {
-        let src = crate::lights::without_dynlights(include_str!("shaders/entity.wgsl"));
+        let src = crate::lights::without_dynlights(&entity_wgsl());
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("entités"),
             source: wgpu::ShaderSource::Wgsl(src.into()),

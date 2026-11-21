@@ -75,6 +75,22 @@ fn shade(i: VOut) -> vec3<f32> {
     return texel(i) * i.light.rgb * 2.0;
 }
 
+/// (v215) Brouillard au point `world`, comme celui des blocs : rien de près, tout au bout de
+/// la vue, où l'entité (un joueur, ce qu'il tient) s'efface avec le relief au lieu de
+/// rester dessinée dans le brouillard. Distance à la caméra, hauteur comprise.
+fn entity_fog(world: vec3<f32>) -> f32 {
+    return smoothstep(g.fog.x, g.fog.y, distance(world, g.cam_pos.xyz));
+}
+
+/// (v215) `c` dans le brouillard `fog` : vers la couleur du ciel derrière, comme les blocs
+/// (`sky_color`, ajouté à l'assemblage : voir `entity_wgsl`).
+fn fogged(c: vec3<f32>, world: vec3<f32>, fog: f32) -> vec3<f32> {
+    if fog <= 0.0 {
+        return c;
+    }
+    return mix(c, sky_color(normalize(world - g.cam_pos.xyz)), fog);
+}
+
 /// Normale de la face (vers la caméra), d'après les dérivées de la position : à calculer
 /// avant tout branchement.
 fn face_normal(world: vec3<f32>) -> vec3<f32> {
@@ -105,7 +121,7 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     if dot(g.clip.xyz, i.world) + g.clip.w < -MIRROR_SLACK {
         discard;
     }
-    return vec4<f32>(shade(i), 1.0);
+    return vec4<f32>(fogged(shade(i), i.world, entity_fog(i.world)), 1.0);
 }
 
 /// Avec l'anticrénelage : couleur, mouvement, et de quoi y ajouter les lumières dynamiques
@@ -119,10 +135,12 @@ struct TaaOut {
 
 fn taa_out(i: VOut, n: vec3<f32>, motion: vec2<f32>) -> TaaOut {
     let base = texel(i);
-    // `light.a` à 0 : pas de lumières dynamiques sur cette entité.
-    let lit = select(0.0, 1.0, i.light.a > 0.5);
+    // (v215) Dans le brouillard, les lumières dynamiques s'effacent avec lui (comme sur
+    // les blocs) : `light.a` à 0, aucune sur cette entité.
+    let fog = entity_fog(i.world);
+    let lit = select(0.0, 1.0, i.light.a > 0.5) * (1.0 - fog);
     var o: TaaOut;
-    o.color = vec4<f32>(base * i.light.rgb * 2.0, 1.0);
+    o.color = vec4<f32>(fogged(base * i.light.rgb * 2.0, i.world, fog), 1.0);
     o.motion = motion;
     o.albedo = vec4<f32>(base, 1.0);
     o.surf = vec4<f32>(gb_oct_encode(n), lit, gb_pack_spec(0.5 * lit, false));

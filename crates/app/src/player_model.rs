@@ -353,6 +353,13 @@ fn aims(pose: &Pose) -> bool {
     matches!(pose.held, Some(Held::Gear(c)) if (c as usize) < crate::weapons::WEAPONS.len())
 }
 
+/// (v215) Lampe torche en main : le bras droit seul tendu là où l'on regarde (comme pour
+/// une arme à feu), la lampe pointée devant. Ainsi elle est dans le champ à la première
+/// personne, à la place même où la voient les miroirs et les autres joueurs.
+fn aims_right(pose: &Pose) -> bool {
+    matches!(pose.held, Some(Held::Flashlight(_)))
+}
+
 /// (v177) Bras tendus d'une arme à feu : rotation autour de la verticale (radians) qui
 /// ramène la main vers le milieu du corps, pour le bras droit et pour le gauche (qui vient
 /// tenir l'arme devant). Les mêmes que `AIM_TURN_*` de players.wgsl.
@@ -407,8 +414,9 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     // Bras : pivot à l'épaule (y = 22 depuis la hanche : 10), balancement inverse des
     // jambes ; le bras droit (x +6) tient l'objet un peu levé devant lui.
     let aim = aims(pose);
+    let aim_right = aims_right(pose);
     for (side, sign) in [(-6.0f32, -1.0f32), (6.0, 1.0)] {
-        if aim {
+        if aim || (aim_right && side > 0.0) {
             // (v177) Arme à feu : les deux bras tendus là où l'on regarde (le haut du corps
             // penché compris), un peu tournés vers l'arme, qui est tenue devant, entre les
             // deux mains ; ils ne se balancent presque plus en marchant.
@@ -517,12 +525,48 @@ fn flashlight_lay(p: [f32; 3]) -> [f32; 3] {
     [(p[0] - 8.0) * 0.5, (p[2] - 8.0) * 0.5, -(p[1] - 4.0) * 0.5]
 }
 
-/// (v201) Verre d'une lampe torche tenue par le modèle (monde), d'où part sa lumière ;
-/// `None` sans bras droit.
-pub fn flashlight_lens(pose: &Pose) -> Option<Vec3> {
+/// (v215) Ampoule d'une lampe torche tenue par le modèle (monde), d'où part sa lumière :
+/// dans la tête de la lampe, au centre de sa base (là où serait l'ampoule d'une vraie
+/// lampe ; lampe debout : tête de y = 9 à 13). La même pour soi (à la première personne
+/// aussi, voir `flashlight_matrix`), dans les miroirs et pour les autres joueurs. `None`
+/// sans bras droit.
+pub fn flashlight_bulb(pose: &Pose) -> Option<Vec3> {
+    Some(flashlight_matrix(pose)?.transform_point3(Vec3::new(0.5, 9.6 / 16.0, 0.5)))
+}
+
+/// (v215) Bras droit du modèle : de la boîte 0..1 du bras de la première personne (x vers
+/// l'extérieur, y vers l'avant du bras, z = 1 à l'épaule et 0 au poing ; voir `hand::arm`)
+/// au monde. Pour dessiner à la première personne le bras qui tient la lampe là où le
+/// modèle le tient.
+pub fn right_arm_matrix(pose: &Pose) -> Option<Mat4> {
+    let (m, _, _, _) = parts(pose)
+        .into_iter()
+        .filter(|p| p.3 == Part::Arm)
+        .nth(1)?;
+    // Pavé du bras (pixels) : x de −2 à 2, y de −10 (poing) à 2 (épaule), z de −2 (devant)
+    // à 2.
+    let unit = Mat4::from_cols(
+        glam::Vec4::new(4.0, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, 0.0, -4.0, 0.0),
+        glam::Vec4::new(0.0, 12.0, 0.0, 0.0),
+        glam::Vec4::new(-2.0, -10.0, 2.0, 1.0),
+    );
+    Some(m * unit)
+}
+
+/// (v215) Repère de la lampe tenue par le modèle : de son repère de bloc (0..1, lampe
+/// debout sur +y, comme `flashlight::model`) au monde. Sert à la dessiner, à la première
+/// personne comme sur le modèle, et à placer son ampoule.
+pub fn flashlight_matrix(pose: &Pose) -> Option<Mat4> {
     let frame = flashlight_frame(pose, hand_frame(pose)?);
-    // Juste devant le verre (en haut de la lampe debout, y = 13,4).
-    Some(frame.transform_point3(Vec3::from(flashlight_lay([8.0, 13.6, 8.0]))))
+    // `flashlight_lay` en matrice, sur des coordonnées de bloc (seizièmes / 16).
+    let lay = Mat4::from_cols(
+        glam::Vec4::new(8.0, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, 0.0, -8.0, 0.0),
+        glam::Vec4::new(0.0, 8.0, 0.0, 0.0),
+        glam::Vec4::new(-4.0, -4.0, 2.0, 1.0),
+    );
+    Some(frame * lay)
 }
 
 /// Repère d'une torche tenue : un peu devant le poing, bâton sur +y.
@@ -1338,6 +1382,9 @@ pub fn instance(pose: &Pose, layer: u32, prev: &Prev) -> PlayerInstance {
     let held = if aims(pose) {
         // (v177) Arme à feu : les deux bras tendus.
         PlayerInstance::HOLDS | PlayerInstance::AIMS
+    } else if aims_right(pose) {
+        // (v215) Lampe torche : le bras droit tendu.
+        PlayerInstance::HOLDS | PlayerInstance::AIMS_RIGHT
     } else if pose.held.is_some() {
         PlayerInstance::HOLDS
     } else {

@@ -122,7 +122,9 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     }
     // (v177) Arme à feu (bit 17) : les deux bras tendus vers le regard, un peu tournés
     // vers l'arme (`AIM_TURN_RIGHT`, `AIM_TURN_LEFT` de player_model.rs).
-    if (part == 3u || part == 4u) && (v.skin & 0x20000u) != 0u {
+    // (v215) Lampe torche (bit 18) : le bras droit seul, tendu de même.
+    if ((part == 3u || part == 4u) && (v.skin & 0x20000u) != 0u)
+        || (part == 4u && (v.skin & 0x40000u) != 0u) {
         var side = -6.0;
         var turn = -0.5;
         var sign = -1.0;
@@ -221,7 +223,8 @@ fn fs_player(i: PlayerOut) -> @location(0) vec4<f32> {
     if dot(g.clip.xyz, i.world) + g.clip.w < -MIRROR_SLACK {
         discard;
     }
-    return vec4<f32>(player_albedo(i) * i.light, 1.0);
+    // (v215) Dans le brouillard comme les blocs (`entity_fog`).
+    return vec4<f32>(fogged(player_albedo(i) * i.light, i.world, entity_fog(i.world)), 1.0);
 }
 
 // Avec l'anticrénelage : comme les entités fixes dans le monde (`fs_taa_world`).
@@ -235,10 +238,12 @@ fn fs_player_taa(i: PlayerOut) -> TaaOut {
     let prev = g.prev_view_proj * vec4<f32>(i.prev_world, 1.0);
     let d = prev.xy / prev.w - cur.xy / cur.w;
     let base = player_albedo(i);
+    // (v215) Dans le brouillard comme les blocs, lumières dynamiques comprises.
+    let fog = entity_fog(i.world);
     var o: TaaOut;
-    o.color = vec4<f32>(base * i.light, 1.0);
+    o.color = vec4<f32>(fogged(base * i.light, i.world, fog), 1.0);
     o.motion = d * vec2<f32>(0.5, -0.5) * g.screen.xy;
     o.albedo = vec4<f32>(base, 1.0);
-    o.surf = vec4<f32>(gb_oct_encode(n), 1.0, gb_pack_spec(0.5, false));
+    o.surf = vec4<f32>(gb_oct_encode(n), 1.0 - fog, gb_pack_spec(0.5 * (1.0 - fog), false));
     return o;
 }

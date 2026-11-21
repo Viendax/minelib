@@ -459,6 +459,31 @@ impl Hand {
         // derrière lui (un bord de faisceau décalé d'environ 10 %, 25 % en courant).
         let k = (fov_deg.to_radians() * 0.5).tan() / (HAND_FOV.to_radians() * 0.5).tan();
         let world = to_world * Mat4::from_scale(Vec3::new(k, k, 1.0)) * arm;
+        arm_mesh(proj * arm, world, light, skin)
+    }
+
+    /// (v215) Bras droit du modèle à la première personne, là où il tient la lampe torche :
+    /// `world`, boîte 0..1 du bras → monde (`player_model::right_arm_matrix`), dessiné avec
+    /// la vue du monde (`view_proj`), pas celle de la main.
+    pub fn arm_world(
+        view_proj: Mat4,
+        world: Mat4,
+        light: [f32; 3],
+        skin: Option<&crate::skin::Skin>,
+    ) -> Vec<ArmVertex> {
+        arm_mesh(view_proj * world, world, light, skin)
+    }
+}
+
+/// Pavé du bras droit, pixel par pixel du skin : `clip`, boîte 0..1 → écran ; `world`,
+/// boîte 0..1 → monde (éclairage et ombrage des faces).
+fn arm_mesh(
+    clip: Mat4,
+    world: Mat4,
+    light: [f32; 3],
+    skin: Option<&crate::skin::Skin>,
+) -> Vec<ArmVertex> {
+    {
         let center = world.transform_point3(Vec3::splat(0.5));
         // Faces : 0 +x, 1 −x, 2 +y, 3 −y, 4 +z (épaule), 5 −z (poing) ; coins dans l'ordre
         // (origine, +s, +s +t, +t).
@@ -551,7 +576,7 @@ impl Hand {
                     let quad = [at(s0, t0), at(s1, t0), at(s1, t1), at(s0, t1)];
                     for k in [0usize, 1, 2, 2, 3, 0] {
                         out.push(ArmVertex {
-                            clip: (proj * arm * quad[k].extend(1.0)).to_array(),
+                            clip: (clip * quad[k].extend(1.0)).to_array(),
                             world: world.transform_point3(quad[k]).to_array(),
                             normal: n.to_array(),
                             albedo,
@@ -563,7 +588,9 @@ impl Hand {
         }
         out
     }
+}
 
+impl Hand {
     /// Triangles de l'objet tenu, pour un écran de rapport `aspect` (le bras : `arm`).
     pub fn build(&self, item: Option<Item>, aspect: f32, light: [f32; 3]) -> Vec<VmVertex> {
         let proj = Mat4::perspective_infinite_reverse_rh(HAND_FOV.to_radians(), aspect, 0.01);

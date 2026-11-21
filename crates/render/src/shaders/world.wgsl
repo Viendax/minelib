@@ -217,8 +217,17 @@ fn fs_block_fast(i: VOut) -> @location(0) vec4<f32> {
 /// d'une vitre se superposent à ceux du dessus). Les plantes en croix (face 6) se voient
 /// des deux côtés.
 fn from_behind(i: VOut) -> bool {
+    // (v215) La vraie normale de la face (dérivées de la position, à prendre avant tout
+    // branchement), dans le sens de celle de son axe : une torche murale est penchée de
+    // 22,5°, ses faces ne regardent pas droit le long de leur axe. Jugée avec l'axe, une face
+    // qu'on voyait de face était jetée sous certains angles (de haut, ou juste sous le haut
+    // de la torche) et on voyait au travers. Les faces droites gardent leur axe.
+    let gn = cross(dpdx(i.world), dpdy(i.world));
+    let axis = face_normal(i.face);
+    let along = dot(gn, axis);
+    let n = select(axis, gn * sign(along), along * along > 0.5 * dot(gn, gn) && dot(gn, gn) > 1e-24);
     return i.face < 6u && (i.tex & 32768u) == 0u
-        && dot(face_normal(i.face), g.cam_pos.xyz - i.world) < 0.0;
+        && dot(n, g.cam_pos.xyz - i.world) < 0.0;
 }
 
 /// (v209) Ce pixel sera-t-il jeté (trou de la texture sous `cut`, face vue de dos) ? Testé
@@ -342,7 +351,9 @@ fn water_mirror(p: vec3<f32>) -> vec4<f32> {
 /// (feuillage, vitres) laissent voir au travers.
 @fragment
 fn fs_block_depth(i: VOut) -> @location(0) vec4<f32> {
-    if behind_mirror(i.world) || from_behind(i) {
+    // (v215) `from_behind` prend des dérivées : appelée avant tout branchement.
+    let back = from_behind(i);
+    if behind_mirror(i.world) || back {
         discard;
     }
     let a = textureSampleLevel(blocks, block_sampler, fract(block_uv(i)), i.tex & 4095u, 0.0).a;

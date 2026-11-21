@@ -36,3 +36,13 @@ fn gb_unpack_spec(a: f32) -> vec2<f32> {
     let u = u32(round(a * 255.0));
     return vec2<f32>(f32(u >> 2u) / 63.0, select(0.0, 1.0, (u & 2u) != 0u));
 }
+
+/// (v215) Voile noir sur la lumière des lumières dynamiques qui tombe sur une entité (un
+/// joueur, son skin) d'albédo `albedo` : plus le pixel est sombre, moins elle s'y voit. Un
+/// pixel blanc la prend toute, comme avant ; un pixel noir, la moitié (la lumière d'un
+/// projecteur faisait briller en rose un skin sombre). Clarté perçue : la luminance remise
+/// en sRGB.
+fn gb_dark_veil(albedo: vec3<f32>) -> f32 {
+    let lum = clamp(dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+    return 1.0 - 0.5 * (1.0 - pow(lum, 1.0 / 2.2));
+}

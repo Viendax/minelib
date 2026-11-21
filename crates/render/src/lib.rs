@@ -4354,10 +4354,7 @@ mod tests {
                 "world",
                 lights::with_dynlights(include_str!("shaders/world.wgsl")),
             ),
-            (
-                "entity",
-                lights::with_dynlights(include_str!("shaders/entity.wgsl")),
-            ),
+            ("entity", lights::with_dynlights(&entity::entity_wgsl())),
             // Shaders de tous les jours (sans le code des lumières de l'éditeur).
             (
                 "world (sans lumières)",
@@ -4365,15 +4362,11 @@ mod tests {
             ),
             (
                 "entity (sans lumières)",
-                lights::without_dynlights(include_str!("shaders/entity.wgsl")),
+                lights::without_dynlights(&entity::entity_wgsl()),
             ),
             (
                 "joueurs",
-                lights::without_dynlights(&format!(
-                    "{}\n{}",
-                    include_str!("shaders/entity.wgsl"),
-                    include_str!("shaders/players.wgsl")
-                )),
+                lights::without_dynlights(&entity::players_wgsl()),
             ),
             (
                 "volumetric",

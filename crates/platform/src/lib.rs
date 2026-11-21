@@ -502,8 +502,14 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => self.game.on_resize(size.width, size.height),
-            WindowEvent::Focused(true) => self.input.focused = true,
+            WindowEvent::Focused(true) => {
+                // (v215) Au journal : à rapprocher de ce que le joueur entend ou voit quand
+                // il quitte le jeu et y revient.
+                log::info!("fenêtre : au premier plan");
+                self.input.focused = true;
+            }
             WindowEvent::Focused(false) => {
+                log::info!("fenêtre : plus au premier plan");
                 self.input.focused = false;
                 self.input.held.clear();
                 self.input.raw_down.clear();
@@ -843,6 +849,36 @@ mod native_crash {
         let _ = std::io::stderr().write_all(msg.as_bytes());
         0 // EXCEPTION_CONTINUE_SEARCH : fermeture normale après le rapport
     }
+}
+
+/// (v215) Le son du jeu n'est plus baissé par Windows pendant une communication (appel,
+/// tchat vocal d'un autre logiciel : « réduire le volume des autres sons de 80 % ») : cette
+/// baisse se fait lentement, et le son remonte lentement ensuite. Vaut pour la session son
+/// du jeu sur la sortie par défaut ; à appeler une fois la sortie ouverte. Rend l'erreur de
+/// Windows le cas échéant.
+pub fn audio_no_ducking() -> Result<(), String> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::Interface;
+        use windows::Win32::Media::Audio::{
+            eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
+            MMDeviceEnumerator,
+        };
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+        };
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let run = || -> windows::core::Result<()> {
+            let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let dev = en.GetDefaultAudioEndpoint(eRender, eConsole)?;
+            let mgr: IAudioSessionManager2 = dev.Activate(CLSCTX_ALL, None)?;
+            let ctl: IAudioSessionControl2 = mgr.GetAudioSessionControl(None, 0)?.cast()?;
+            ctl.SetDuckingPreference(true)
+        };
+        run().map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    Ok(())
 }
 
 /// Thread de fond (génération, maillages) : priorité sous celle du rendu, pour que le jeu

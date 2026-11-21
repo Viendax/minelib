@@ -37,6 +37,7 @@
 //!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
 //!   MINELIB_UI=lumieres         éditeur de lumières ouvert en entrant dans le monde (essais)
 //!   MINELIB_UI=settings|graphics paramètres, ou paramètres graphiques, au lancement (essais)
+//!   MINELIB_UI=reglages_lumieres paramètres graphiques → lumières, au lancement (essais)
 //!   MINELIB_LUMIERES_LENTES=<s> shaders des lumières prêts <s> secondes plus tard (essais)
 //!   MINELIB_SMOKE=<x>,<y>,<z>   mode FPS : fumigène posée là toutes les 18 s (essais)
 //!   MINELIB_SMOKE_Q=<n>,<pas>   qualité des fumigènes : pas max et longueur (essais)
@@ -122,6 +123,8 @@ enum Screen {
     Packs,
     Settings,
     Graphics,
+    /// (v215) Paramètres graphiques → Lumières : réglages de toutes les lumières.
+    Lights,
     Controls,
     /// Paramètres → Son : sortie et micro, volumes.
     Sound,
@@ -138,6 +141,53 @@ enum Screen {
     Account(account::Page),
     /// Choix du monde à ouvrir en construction en ligne.
     HostPick,
+}
+
+/// (v215) Sorties son et micros du système, relevés en arrière-plan : le relevé (cpal)
+/// prend jusqu'à une seconde sous Windows, l'écran Son s'ouvre tout de suite avec le
+/// dernier.
+#[derive(Default)]
+struct DeviceScan {
+    lists: std::sync::Arc<std::sync::Mutex<(Vec<String>, Vec<String>)>>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DeviceScan {
+    /// Premier relevé lancé dès le démarrage du jeu.
+    fn started() -> Self {
+        let s = Self::default();
+        s.refresh();
+        s
+    }
+
+    /// Refait le relevé en arrière-plan (sauf s'il est déjà en cours).
+    fn refresh(&self) {
+        use std::sync::atomic::Ordering;
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (lists, busy) = (self.lists.clone(), self.busy.clone());
+        let spawned = std::thread::Builder::new()
+            .name("relevé du son".into())
+            .spawn(move || {
+                let found = (
+                    crate::audio::output_devices(),
+                    crate::voice::input_devices(),
+                );
+                if let Ok(mut l) = lists.lock() {
+                    *l = found;
+                }
+                busy.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.busy.store(false, Ordering::Release);
+        }
+    }
+
+    /// Le dernier relevé (vide tant que le premier n'est pas fini).
+    fn get(&self) -> (Vec<String>, Vec<String>) {
+        self.lists.lock().map(|l| l.clone()).unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -225,6 +275,15 @@ struct Game {
     /// Écran Son : sorties et micros du système (lus en l'ouvrant), défilement et barre
     /// tenue de chaque liste.
     sound_devices: (Vec<String>, Vec<String>),
+    /// (v215) Relevé des sorties et micros en arrière-plan, et quand il a été demandé.
+    sound_scan: DeviceScan,
+    sound_scan_at: f32,
+    /// (v215) Fréquence de l'écran où est la fenêtre (Hz), relue toutes les 3 s.
+    refresh_hz: Option<f32>,
+    /// (v215) Paramètres graphiques → Lumières hors d'une partie : les réglages relus de
+    /// `.minelib/lumieres.txt` (en jeu, ceux de la partie), et leur fenêtre.
+    menu_lights: Option<lights::Lights>,
+    menu_light_editor: light_editor::Editor,
     sound_scroll: [usize; 2],
     sound_drag: [bool; 2],
     /// Distance de rendu permise par la mémoire vive (mesurée au lancement).
@@ -301,6 +360,7 @@ impl Game {
         crate::audio::set_output(&options.audio_out);
         crate::voice::set_input(&options.audio_in);
         crate::voice::set_mic_gain(options.volume_mic);
+        crate::audio::set_master(options.volume);
         let packs = list_packs(&paths.resourcepacks);
         let pack = packs
             .iter()
@@ -366,6 +426,11 @@ impl Game {
             settings_return: Screen::Title,
             slider_drag: None,
             sound_devices: (Vec::new(), Vec::new()),
+            sound_scan: DeviceScan::started(),
+            sound_scan_at: 0.0,
+            refresh_hz: None,
+            menu_lights: None,
+            menu_light_editor: light_editor::Editor::default(),
             sound_scroll: [0; 2],
             sound_drag: [false; 2],
             ram_view_limit: session::ram_view_limit(),
@@ -431,6 +496,10 @@ impl Game {
             // (v201) Paramètres graphiques ouverts au lancement (essais de l'interface).
             if std::env::var("MINELIB_UI").is_ok_and(|v| v == "graphics") {
                 g.screen = Screen::Graphics;
+            }
+            // (v215) Paramètres graphiques → Lumières au lancement (essais de l'interface).
+            if std::env::var("MINELIB_UI").is_ok_and(|v| v == "reglages_lumieres") {
+                g.screen = Screen::Lights;
             }
             // Essais de l'interface : écran FPS avec un lobby d'exemple.
             if std::env::var("MINELIB_UI").is_ok_and(|v| v == "lobby") {
@@ -595,11 +664,15 @@ impl Game {
     }
 
     fn limit_fps(&mut self) {
-        // Hors du jeu, les menus n'ont pas besoin de plus de 120 images/s.
-        let max = if self.session.is_some() {
-            self.fps_limit()
+        // (v215) À l'accueil et dans le menu Échap (et tout ce qu'on ouvre depuis lui) : pas
+        // plus d'images par seconde que l'écran n'en affiche (avant : 120 hors du jeu, et
+        // aucune limite dans le menu Échap). 120 si l'écran ne dit pas sa fréquence.
+        let menu = self.session.is_none() || self.screen != Screen::Playing;
+        let max = if menu {
+            let screen = self.refresh_hz.filter(|h| *h >= 30.0).unwrap_or(120.0);
+            Some(self.fps_limit().map_or(screen, |l| l.min(screen)))
         } else {
-            Some(self.fps_limit().unwrap_or(120.0).min(120.0))
+            self.fps_limit()
         };
         if let Some(max) = max {
             let _s = minelib_render::perf::scope("limiteur de FPS (attente voulue)");
@@ -2445,10 +2518,11 @@ impl Game {
             self.screen = Screen::Graphics;
         }
         if sound {
-            self.sound_devices = (
-                crate::audio::output_devices(),
-                crate::voice::input_devices(),
-            );
+            // (v215) Le dernier relevé tout de suite (le refaire prend jusqu'à une seconde
+            // sous Windows : l'écran s'ouvrait après), et un neuf en arrière-plan.
+            self.sound_devices = self.sound_scan.get();
+            self.sound_scan.refresh();
+            self.sound_scan_at = self.time;
             self.sound_scroll = [0; 2];
             self.screen = Screen::Sound;
         }
@@ -2480,6 +2554,13 @@ impl Game {
     /// le micro, son volume. En dessous, le volume des écrans vidéo et, à sa droite, celui
     /// du tchat vocal entrant.
     fn sound_screen(&mut self, input: &Input, size: (u32, u32), over_game: bool) {
+        // (v215) Listes tenues à jour en arrière-plan (un casque branché apparaît), sans
+        // jamais faire attendre l'écran.
+        if self.time - self.sound_scan_at > 2.0 {
+            self.sound_scan.refresh();
+            self.sound_scan_at = self.time;
+        }
+        self.sound_devices = self.sound_scan.get();
         let mut c = Ctx::new(&mut self.ui, input, size);
         if over_game {
             c.dim(0.7);
@@ -2623,7 +2704,7 @@ impl Game {
         if let Some(name) = chosen[0].take() {
             crate::audio::set_output(&name);
             self.options.audio_out = name;
-            crate::audio::play(crate::audio::Sfx::Dry, 0.0, self.options.volume);
+            crate::audio::play(crate::audio::Sfx::Dry, 0.0, 1.0);
         }
         if let Some(name) = chosen[1].take() {
             crate::voice::set_input(&name);
@@ -2636,7 +2717,9 @@ impl Game {
                 if let Some(sess) = &mut self.session {
                     sess.volume = v;
                 }
-                crate::audio::play(crate::audio::Sfx::Dry, 0.0, v);
+                // (v215) Tout de suite, sons en cours compris.
+                crate::audio::set_master(v);
+                crate::audio::play(crate::audio::Sfx::Dry, 0.0, 1.0);
             }
         }
         if let Some(f) = mic_vol {
@@ -3103,7 +3186,7 @@ impl Game {
         let mut hint_y = y + 4.0 * s + ds * 10.0;
         if self.options.point_torches {
             c.text_center(
-                "Torches ponctuelles : réglages dans l'éditeur de lumières (L), onglet Auto.",
+                "Torches ponctuelles : réglages dans « Lumières », onglet Auto.",
                 hint_y,
                 ds,
                 GREY,
@@ -3120,8 +3203,15 @@ impl Game {
                 GREY,
             );
         }
-        let done = c.button("Terminé", cx, c.h * 0.78, 200.0, true);
+        // (v215) Les réglages de toutes les lumières (avant : bouton « Réglages » de
+        // l'éditeur de lumières), à côté de « Terminé ».
+        let to_lights = c.button("Lumières", cx - 76.0 * s, c.h * 0.78, 148.0, true);
+        let done = c.button("Terminé", cx + 76.0 * s, c.h * 0.78, 148.0, true);
         let leave = done || input.pressed(KeyCode::Escape);
+        if to_lights && !leave {
+            self.slider_drag = None;
+            self.screen = Screen::Lights;
+        }
 
         if cfg.view_distance != self.config.view_distance {
             self.config = cfg;
@@ -3152,6 +3242,38 @@ impl Game {
                 log::error!("options : {e:#}");
             }
             self.screen = Screen::Settings;
+        }
+    }
+
+    /// (v215) Paramètres graphiques → Lumières : les réglages de toutes les lumières. En jeu,
+    /// ceux de la partie, appliqués tout de suite ; hors d'une partie, relus de
+    /// `.minelib/lumieres.txt` et enregistrés en sortant.
+    fn lights_screen(&mut self, input: &Input, size: (u32, u32), over_game: bool) {
+        let sizef = (size.0 as f32, size.1 as f32);
+        {
+            let mut c = Ctx::new(&mut self.ui, input, size);
+            if over_game {
+                c.dim(0.7);
+            } else {
+                c.background();
+            }
+        }
+        let done = match &mut self.session {
+            Some(sess) => sess.light_settings_ui(&mut self.ui, sizef, input),
+            None => {
+                let lights = self.menu_lights.get_or_insert_with(|| {
+                    let root = minelib_assets::data_dir();
+                    lights::Lights::load(&root, &root)
+                });
+                self.menu_light_editor
+                    .settings_screen(&mut self.ui, input, lights, sizef)
+            }
+        };
+        if done {
+            if let Some(mut l) = self.menu_lights.take() {
+                l.save_now();
+            }
+            self.screen = Screen::Graphics;
         }
     }
 
@@ -3298,6 +3420,11 @@ impl GameLoop for Game {
         let mut target: Option<winit::monitor::MonitorHandle> = None;
         if check {
             self.direct_display.0 = Some(std::time::Instant::now());
+            // (v215) Fréquence de l'écran où est la fenêtre : limite des menus.
+            self.refresh_hz = window
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz())
+                .map(|mhz| mhz as f32 / 1000.0);
             if let Some(r) = &self.renderer {
                 let outputs = minelib_platform::gpu_output_names(&r.adapter_name);
                 target = window
@@ -3514,6 +3641,7 @@ impl GameLoop for Game {
                     | Screen::Packs
                     | Screen::Settings
                     | Screen::Graphics
+                    | Screen::Lights
                     | Screen::Controls
                     | Screen::Sound
             );
@@ -3539,6 +3667,7 @@ impl GameLoop for Game {
                 Screen::Packs => self.packs_screen(input, size, true),
                 Screen::Settings => self.settings_screen(input, size, true),
                 Screen::Graphics => self.graphics_screen(input, size, true, &mut renderer),
+                Screen::Lights => self.lights_screen(input, size, true),
                 Screen::Controls => self.controls_screen(input, size, true),
                 Screen::Sound => self.sound_screen(input, size, true),
                 _ => {}
@@ -3580,6 +3709,7 @@ impl GameLoop for Game {
                 Screen::Packs => self.packs_screen(input, size, false),
                 Screen::Settings => self.settings_screen(input, size, false),
                 Screen::Graphics => self.graphics_screen(input, size, false, &mut renderer),
+                Screen::Lights => self.lights_screen(input, size, false),
                 Screen::Controls => self.controls_screen(input, size, false),
                 Screen::Sound => self.sound_screen(input, size, false),
                 Screen::Loading => self.loading_screen(input, size),

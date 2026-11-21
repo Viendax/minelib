@@ -11,5 +11,7 @@ fn fs_arm_lit(i: ArmOut) -> @location(0) vec4<f32> {
     let d = dyn_light_all(i.world, n, g.cam_pos.xyz, 0.15, true, i.clip.xy);
     // Poids des reflets d'une entité, tel que l'image des surfaces le garde.
     let spec = gb_unpack_spec(gb_pack_spec(0.5, false)).x;
-    return vec4<f32>(i.albedo * i.light + i.albedo * d.diffuse + d.specular * spec, 1.0);
+    // (v215) Avec le voile noir des entités, comme son modèle en F5.
+    let dynamic = (i.albedo * d.diffuse + d.specular * spec) * gb_dark_veil(i.albedo);
+    return vec4<f32>(i.albedo * i.light + dynamic, 1.0);
 }

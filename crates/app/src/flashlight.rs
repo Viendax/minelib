@@ -85,18 +85,57 @@ pub fn icon(cx: f32, cy: f32, size: f32) -> Vec<VmVertex> {
     out
 }
 
-/// Projecteur de la lampe : part de `pos` (le verre), éclaire vers `dir`.
-pub fn light(pos: Vec3, dir: Vec3) -> DynLight {
+/// (v215) Réglage du faisceau : 0 large, 1 serré ; la première fois, au milieu.
+const FOCUS_FILE: &str = "torche_reglage";
+
+/// (v215) Réglage du faisceau gardé (`.minelib/torche_reglage`), sinon 0,5.
+pub fn saved_focus() -> f32 {
+    std::fs::read_to_string(minelib_assets::data_dir().join(FOCUS_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|f| f.is_finite())
+        .map_or(0.5, |f| f.clamp(0.0, 1.0))
+}
+
+pub fn save_focus(f: f32) {
+    if let Err(e) = std::fs::write(
+        minelib_assets::data_dir().join(FOCUS_FILE),
+        format!("{:.2}", f.clamp(0.0, 1.0)),
+    ) {
+        log::warn!("lampe torche : réglage pas enregistré ({e})");
+    }
+}
+
+/// (v215) Faisceau pour un réglage `focus` (0 large … 1 serré) : (angle du cône en degrés,
+/// portée en blocs, intensité). Chaque valeur est la position de son curseur dans
+/// l'éditeur de lumières (angle 1 à 179°, portée 0,1 à 128 blocs et intensité 0 à 20, ces
+/// deux-là au carré de la position), comme demandé : serré, intensité et portée à 100 % de
+/// leur curseur, angle à 25 % ; large, angle à 100 %, portée à 25 % et intensité à 50 %.
+pub fn beam(focus: f32) -> (f32, f32, f32) {
+    let t = focus.clamp(0.0, 1.0);
+    let angle = 1.0 + 178.0 * (1.0 - 0.75 * t);
+    let range = 0.1 + 127.9 * (0.25 + 0.75 * t).powi(2);
+    let intensity = 20.0 * (0.5 + 0.5 * t).powi(2);
+    (angle, range, intensity)
+}
+
+/// Projecteur de la lampe : part de `pos` (l'ampoule), réglé par `focus` (voir `beam`).
+/// (v215) Il vise le centre de l'écran à mi-portée : le point à `range / 2` devant les yeux
+/// (`eye`, regard `look`), d'où qu'il parte.
+pub fn light(pos: Vec3, eye: Vec3, look: Vec3, focus: f32) -> DynLight {
+    let (angle, range, intensity) = beam(focus);
+    let aim = eye + look.normalize_or_zero() * range * 0.5;
+    let dir = (aim - pos).normalize_or(look);
     DynLight {
         id: LIGHT_ID,
         kind: DynKind::Spot,
         pos: pos.to_array(),
-        dir: dir.normalize_or_zero().to_array(),
+        dir: dir.to_array(),
         color: lin([255, 242, 220]),
-        intensity: 4.0,
-        range: 28.0,
-        outer_deg: 40.0,
-        inner_deg: 16.0,
+        intensity,
+        range,
+        outer_deg: angle,
+        inner_deg: angle * 0.4,
         shadows: true,
         owner: HOLDER,
         beam: 0.35,
@@ -119,8 +158,9 @@ pub fn lens_position(eye: Vec3, look: Vec3) -> Vec3 {
 mod tests {
     use super::*;
 
-    /// La lampe éclaire droit devant, depuis la main droite (un peu devant les yeux, à
-    /// droite, en dessous), quel que soit le regard ; son verre ne brille qu'allumée.
+    /// La lampe éclaire depuis la main droite (un peu devant les yeux, à droite, en
+    /// dessous), quel que soit le regard ; (v215) son faisceau passe par le centre de l'écran
+    /// à mi-portée, quel que soit le réglage ; son verre ne brille qu'allumée.
     #[test]
     fn the_flashlight_shines_ahead_from_the_right_hand() {
         let eye = Vec3::new(10.0, 70.0, -4.0);
@@ -137,16 +177,49 @@ mod tests {
                 "à droite : {d}"
             );
             assert!(d.length() < 0.7, "dans la main : {d}");
-            let l = light(p, look * 3.0);
-            assert_eq!(l.kind, DynKind::Spot);
-            assert!((Vec3::from(l.dir) - look).length() < 1e-5);
-            assert!(
-                l.shadows && l.range > 20.0,
-                "arrêtée par les murs, porte loin"
-            );
-            assert_eq!(l.owner, HOLDER, "pas l'ombre du bras qui la tient");
+            for focus in [0.0, 0.5, 1.0] {
+                let l = light(p, eye, look, focus);
+                assert_eq!(l.kind, DynKind::Spot);
+                let mid = eye + look * l.range * 0.5;
+                let hit = p + Vec3::from(l.dir) * (mid - p).length();
+                assert!(
+                    (hit - mid).length() < 1e-3,
+                    "réglage {focus} : le faisceau passe en {hit}, pas au centre de l'écran {mid}"
+                );
+                assert!(l.shadows, "arrêtée par les murs");
+                assert_eq!(l.owner, HOLDER, "pas l'ombre du bras qui la tient");
+            }
         }
         assert!(parts(true).iter().any(|p| p.3));
         assert!(!parts(false).iter().any(|p| p.3));
+    }
+
+    /// (v215) Molette : serré, angle à 25 % de son curseur, portée et intensité à 100 % ;
+    /// large, angle à 100 %, portée à 25 % et intensité à 50 % (positions des curseurs de
+    /// l'éditeur de lumières : angle linéaire, portée et intensité au carré).
+    #[test]
+    fn the_flashlight_focus_moves_the_light_editor_sliders() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let (angle, range, intensity) = beam(1.0);
+        assert!(close(angle, 1.0 + 178.0 * 0.25), "angle serré {angle}");
+        assert!(close(range, 128.0), "portée serrée {range}");
+        assert!(close(intensity, 20.0), "intensité serrée {intensity}");
+        let (angle, range, intensity) = beam(0.0);
+        assert!(close(angle, 179.0), "angle large {angle}");
+        assert!(
+            close(range, 0.1 + 127.9 * 0.25 * 0.25),
+            "portée large {range}"
+        );
+        assert!(
+            close(intensity, 20.0 * 0.5 * 0.5),
+            "intensité large {intensity}"
+        );
+        // Entre les deux, tout suit le réglage sans à-coup.
+        let mut last = beam(0.0);
+        for k in 1..=20 {
+            let b = beam(k as f32 / 20.0);
+            assert!(b.0 < last.0 && b.1 > last.1 && b.2 > last.2);
+            last = b;
+        }
     }
 }

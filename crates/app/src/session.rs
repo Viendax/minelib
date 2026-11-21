@@ -304,9 +304,12 @@ pub struct Session {
     /// Main et objet tenu (première personne), et leur éclairage.
     hand: Hand,
     hand_light: [f32; 3],
-    /// (v201) Lampe torche allumée (clic droit pour l'éteindre), vaut pour toutes les lampes
-    /// qu'on tient.
+    /// (v201) Lampe torche allumée, vaut pour toutes les lampes qu'on tient. (v215) Clic
+    /// molette pour l'allumer ou l'éteindre ; éteinte quand on arrive dessus dans la barre.
     flashlight_on: bool,
+    /// (v215) Réglage du faisceau de la lampe (0 : large, 1 : serré ; molette, lampe
+    /// allumée), gardé d'une partie à l'autre (`flashlight::saved_focus`).
+    flashlight_focus: f32,
     /// Vue (F5) : 0 première personne, 1 troisième personne de dos, 2 de face.
     perspective: u8,
     /// Écrans vidéo posés dans le monde (objet « Écran vidéo »), chargés à la première
@@ -606,7 +609,8 @@ impl Session {
             fps_duck_on: false,
             hand: Hand::default(),
             hand_light: [1.0; 3],
-            flashlight_on: true,
+            flashlight_on: false,
+            flashlight_focus: crate::flashlight::saved_focus(),
             perspective: 0,
             screens: Vec::new(),
             screens_loaded: false,
@@ -1285,7 +1289,7 @@ impl Session {
                 // Sons des autres modes (portes…) : joués tout de suite (sinon ils
                 // s'accumulaient et partaient tous d'un coup en passant en mode FPS).
                 for (sfx, delay, gain) in self.fps.sounds.drain(..) {
-                    crate::audio::play(sfx, delay, self.volume * gain);
+                    crate::audio::play(sfx, delay, gain);
                 }
             }
             // Partie en ligne : envoi des entrées et des tirs, marqueur de touche.
@@ -1911,6 +1915,7 @@ impl Session {
             KeyCode::Digit9,
             KeyCode::Digit0,
         ];
+        let before = self.inventory.selected_item();
         for (i, key) in keys.into_iter().enumerate() {
             if input.pressed(key) {
                 self.inventory.select(i);
@@ -1924,7 +1929,23 @@ impl Session {
             && self.game.mode != GameMode::Fps
             && self.screen_aim.is_none()
         {
-            self.inventory.scroll(-input.scroll.signum() as i32);
+            // (v215) Lampe torche allumée en main : la molette règle son faisceau au lieu de
+            // changer d'objet (vers le haut : plus serré, plus fort et plus loin ; vers le
+            // bas : plus large, moins fort et moins loin), gardé pour la suite.
+            if self.flashlight_on && before == Some(Item::Flashlight) {
+                let f = (self.flashlight_focus + 0.1 * input.scroll.signum()).clamp(0.0, 1.0);
+                if (f - self.flashlight_focus).abs() > 1e-4 {
+                    self.flashlight_focus = f;
+                    crate::flashlight::save_focus(f);
+                }
+            } else {
+                self.inventory.scroll(-input.scroll.signum() as i32);
+            }
+        }
+        // (v215) On arrive sur la lampe torche (molette, chiffre) : elle est éteinte.
+        let now = self.inventory.selected_item();
+        if now != before && now == Some(Item::Flashlight) {
+            self.flashlight_on = false;
         }
     }
 
@@ -2037,7 +2058,10 @@ impl Session {
                     None => self.break_screen(i),
                 }
                 self.screen_broke = true;
-            } else if near && self.keys.pressed(input, Action::Pick) {
+            } else if near
+                && self.keys.pressed(input, Action::Pick)
+                && self.inventory.selected_item() != Some(Item::Flashlight)
+            {
                 let size = self.shown.get(i).map_or(crate::screen::NORMAL, |s| s.0.size);
                 self.give_picked(Item::Screen(size));
             } else if self.keys.pressed(input, use_key)
@@ -2241,7 +2265,18 @@ impl Session {
     /// `Displays::schedule`) : `looked`, l'écran sous le réticule.
     fn schedule_screens(&mut self, looked: Option<u32>) {
         let eye = self.player.eye();
-        let dir = self.player.look_dir();
+        // (v215) Vu dès qu'un bout de sa hitbox est dans l'image, de face comme de dos
+        // (avant : vu de face seulement, et le centre devant soi dans un cône large ; vu de
+        // dos, l'écran passait à 2 images par seconde). Avec la caméra de l'image (F5,
+        // caméra libre de l'éditeur) et son champ de vision.
+        let (cam, view, _) = self.view_camera();
+        let fov = if self.game.mode == GameMode::Fps {
+            self.fps.scope_fov().unwrap_or(self.fov)
+        } else {
+            self.fov
+        };
+        let aspect = (self.screen_size.0 / self.screen_size.1.max(1.0)).max(0.1);
+        let view_proj = Mat4::perspective_rh(fov.to_radians(), aspect, 0.05, 4096.0) * view;
         let seen: Vec<crate::screen::Seen> = self
             .shown
             .iter()
@@ -2249,10 +2284,9 @@ impl Session {
                 let a = s.anchor();
                 let to = Vec3::from(a.center) - eye;
                 let dist = to.length();
-                let facing = Vec3::from(a.right).cross(Vec3::from(a.up));
-                // Devant soi (champ de vision large) et vu de face.
-                let visible = dist < 1.5
-                    || (to.dot(dir) > dist * 0.5 && facing.dot(-to) > 0.0);
+                let (mn, mx) = s.hitbox();
+                let visible =
+                    (Vec3::from(a.center) - cam).length() < 1.5 || box_in_view(view_proj, mn, mx);
                 crate::screen::Seen {
                     id: s.id(),
                     dist,
@@ -2592,6 +2626,13 @@ impl Session {
                 return;
             }
         }
+        // (v215) Lampe torche tenue : la touche « Copier le bloc » (clic molette) l'allume
+        // ou l'éteint, même sans bloc visé ; elle ne copie rien tant qu'on la tient.
+        if pick && self.inventory.selected_item() == Some(Item::Flashlight) {
+            self.flashlight_on = !self.flashlight_on;
+            self.fps.sounds.push((crate::audio::Sfx::Dry, 0.0, 0.6));
+            return;
+        }
         // « Copier le bloc » sur une tête portée par une entité de la carte (porte-armure,
         // affichage, cadre) devant le bloc visé : la tête, avec son skin, vient en main.
         if pick && self.inventory.selected_item() != Some(Item::Wand) {
@@ -2624,22 +2665,8 @@ impl Session {
             }
             return;
         }
-        // (v201) Lampe torche tenue : clic droit l'allume ou l'éteint, même sans bloc visé
-        // (sur une porte, une trappe ou un coffre, il les ouvre, sauf accroupi).
-        if self.inventory.selected_item() == Some(Item::Flashlight)
-            && keys.pressed(input, Action::Use)
-        {
-            let opens = hit.as_ref().is_some_and(|h| {
-                (hinged(h.id).is_some() || h.id.def().key == "chest")
-                    && !keys.held(input, Action::Sneak)
-            });
-            if !opens {
-                self.flashlight_on = !self.flashlight_on;
-                self.fps.sounds.push((crate::audio::Sfx::Dry, 0.0, 0.6));
-                self.place_cooldown = 0.22;
-                return;
-            }
-        }
+        // (v215) Lampe torche tenue : le clic droit n'allume plus rien (c'est le clic
+        // molette) ; il ouvre les portes, trappes et coffres comme d'habitude.
         let Some(hit) = hit else { return };
 
         // Écran vidéo tenu : clic droit le pose sur la face visée (aucun bloc posé).
@@ -3183,13 +3210,13 @@ impl Session {
         }
         let eye = self.player.eye();
         let look = self.player.look_dir();
-        let lens = if self.perspective == 0 {
-            None
-        } else {
-            let held = crate::player_model::Held::Flashlight(true);
-            crate::player_model::flashlight_lens(&self.own_pose(held))
-        };
-        let mut pos = lens.unwrap_or_else(|| crate::flashlight::lens_position(eye, look));
+        // (v215) Toujours l'ampoule de la lampe que tient le modèle du joueur (celui des
+        // miroirs, de la troisième personne et des autres joueurs), même à la première
+        // personne, où la lampe en main est dessinée à cette même place : la lumière part de
+        // la lampe qu'on voit, de face comme dans un miroir.
+        let held = crate::player_model::Held::Flashlight(true);
+        let bulb = crate::player_model::flashlight_bulb(&self.own_pose(held));
+        let mut pos = bulb.unwrap_or_else(|| crate::flashlight::lens_position(eye, look));
         // Collé à un mur, le verre reste de ce côté-ci (sinon le mur arrête toute la
         // lumière).
         let to = pos - eye;
@@ -3199,7 +3226,12 @@ impl Session {
                 pos = eye + to / len * (h.distance - 0.05).max(0.0);
             }
         }
-        Some(crate::flashlight::light(pos, look))
+        Some(crate::flashlight::light(
+            pos,
+            eye,
+            look,
+            self.flashlight_focus,
+        ))
     }
 
     /// (v201) Torche tenue, avec les torches en lumières ponctuelles : une lumière
@@ -3312,6 +3344,14 @@ impl Session {
             let cam = eye + back * dist;
             (cam, Mat4::look_to_rh(cam, -back, Vec3::Y), -back)
         }
+    }
+
+    /// (v215) Paramètres graphiques → Lumières : les réglages de toutes les lumières de la
+    /// partie, appliqués tout de suite (voir `light_editor::Editor::settings_screen`).
+    /// Renvoie vrai quand la fenêtre se ferme.
+    pub fn light_settings_ui(&mut self, ui: &mut Ui, size: (f32, f32), input: &Input) -> bool {
+        self.light_editor
+            .settings_screen(ui, input, &mut self.lights, size)
     }
 
     /// Éditeur de lumières (s'il est ouvert) : guides et poignées dans le monde, puis son
@@ -4509,7 +4549,7 @@ impl Session {
             self.stride = crate::netgame::STRIDE * 0.7;
         }
         for (sfx, delay, gain) in self.fps.sounds.drain(..) {
-            crate::audio::play(sfx, delay, self.volume * gain);
+            crate::audio::play(sfx, delay, gain);
         }
         // Explosion, feu : mort à 0 point de vie (en ligne, l'hôte en décide).
         if self.fps.hp == 0 && self.net.is_none() {
@@ -6331,12 +6371,22 @@ impl Session {
         (Vec::new(), Vec::new())
     }
 
+    /// (v215) Touche Parler du mode : celle de l'onglet FPS des touches en FPS, celle de
+    /// l'onglet Build ailleurs (réglées à part, K toutes deux par défaut).
+    fn talk_action(&self) -> Action {
+        if self.game.mode == GameMode::Fps {
+            Action::FpsVoice
+        } else {
+            Action::Talk
+        }
+    }
+
     /// Micro (touche maintenue), volumes au curseur (Tab + clic droit).
     fn update_voice(&mut self, input: &Input, dt: f32, typing: bool) {
         if self.voice.is_none() {
             return;
         }
-        let ptt = !typing && self.keys.held(input, Action::FpsVoice);
+        let ptt = !typing && self.keys.held(input, self.talk_action());
         let (all, listen) = self.voice_peers();
         let build = self.build.is_some();
         if let Some(v) = &mut self.voice {
@@ -6407,15 +6457,60 @@ impl Session {
         v
     }
 
+    /// (v215) Haut-parleur en bas à gauche tant qu'on tient la touche Parler : blanc quand
+    /// la voix part, rouge sans micro utilisable, gris hors ligne (personne ne l'entend).
+    /// En FPS, au-dessus de la vie.
+    fn draw_talk_icon(&self, ui: &mut Ui, size: (f32, f32), input: &Input, s: f32) {
+        let held = !self.chat.open
+            && !self.keyboard_on_screen()
+            && self.keys.held(input, self.talk_action());
+        let (color, note) = match &self.voice {
+            Some(v) if v.talking => ([1.0, 1.0, 1.0, 1.0], None),
+            Some(_) if held => ([1.0, 0.35, 0.3, 1.0], Some("Aucun micro")),
+            None if held => ([0.6, 0.6, 0.6, 1.0], Some("Hors ligne")),
+            _ => return,
+        };
+        let x = 8.0 * s;
+        let y = if self.game.mode == GameMode::Fps {
+            size.1 - 42.0 * s
+        } else {
+            size.1 - 20.0 * s
+        };
+        let w = note.map_or(0.0, |t| Ui::text_width(t, s) + 4.0 * s);
+        ui.rect(
+            x - 2.0 * s,
+            y - 2.0 * s,
+            16.0 * s + w,
+            16.0 * s,
+            [0.0, 0.0, 0.0, 0.45],
+        );
+        // Corps, pavillon qui s'évase, deux ondes (en pixels de 1 × s).
+        for (px, py, pw, ph) in [
+            (0.0, 4.0, 3.0, 4.0),
+            (3.0, 3.0, 1.0, 6.0),
+            (4.0, 2.0, 1.0, 8.0),
+            (5.0, 1.0, 1.0, 10.0),
+            (6.0, 0.0, 1.0, 12.0),
+            (8.0, 3.0, 1.0, 1.0),
+            (9.0, 4.0, 1.0, 4.0),
+            (8.0, 8.0, 1.0, 1.0),
+            (10.0, 1.0, 1.0, 1.0),
+            (11.0, 2.0, 1.0, 8.0),
+            (10.0, 10.0, 1.0, 1.0),
+        ] {
+            ui.rect(x + px * s, y + py * s, pw * s, ph * s, color);
+        }
+        if let Some(t) = note {
+            ui.text(x + 15.0 * s, y + 2.0 * s, s, color, t);
+        }
+    }
+
     /// Curseurs de volume et qui parle.
     fn draw_voice(&self, ui: &mut Ui, size: (f32, f32), input: &Input, s: f32) {
+        self.draw_talk_icon(ui, size, input, s);
         let Some(v) = &self.voice else { return };
-        // Qui parle, en haut à gauche ; le micro quand on émet.
+        // Qui parle, en haut à gauche (soi : le haut-parleur en bas à gauche).
         let mut y = 40.0 * s;
-        if v.talking {
-            ui.text(8.0 * s, y, s, [1.0, 0.4, 0.35, 1.0], "Micro ouvert");
-            y += 11.0 * s;
-        }
         for id in v.speaking.keys() {
             let (name, _) = self.speaker(*id);
             ui.text(8.0 * s, y, s, [0.6, 1.0, 0.6, 1.0], format!("> {name}"));
@@ -7013,9 +7108,19 @@ impl Session {
         } else {
             self.spectating.as_deref()
         };
+        // (v215) Les autres joueurs (et ce qu'ils tiennent) sont dans le brouillard comme le
+        // relief (`entity_fog`) : à `fog_end` de la caméra, tout entiers (le modèle tient
+        // dans 2 blocs autour de ses pieds), on ne les voit plus. Plus loin, ils ne sont pas
+        // dessinés : ni de face, ni dans un reflet, ni par leur ombre. Ce n'est pas le tri
+        // du champ de vision (refusé en v192) : où que regarde la caméra, la même distance.
+        let hidden2 = (fog_end + 2.0) * (fog_end + 2.0);
         // Partie en ligne : les autres joueurs.
         if let Some(n) = &self.net {
-            for v in n.views().iter().filter(|v| v.alive) {
+            for v in n
+                .views()
+                .iter()
+                .filter(|v| v.alive && v.pos.distance_squared(cam) <= hidden2)
+            {
                 // (v177) Ce qu'il a en main, avec son vrai modèle : arme, couteau (255),
                 // grenade ou bombe.
                 let held = Some(Held::Gear(v.weapon));
@@ -7154,6 +7259,13 @@ impl Session {
             );
             order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             for (rank, &(d2, i)) in order.iter().enumerate() {
+                // (v215) Au bout de la vue, ils disparaissent dans le brouillard comme le
+                // relief (distance hauteur comprise) : plus loin, plus rien à dessiner. Vu
+                // de haut, ils restaient tous dessinés, nets dans le brouillard (et des
+                // milliers dans une foule).
+                if d2 > hidden2 {
+                    break;
+                }
                 let o = &others[i as usize];
                 // (v202) Ou tout près d'une lumière : son ombre y est géante, on la voit de
                 // loin (avant, elle disparaissait dès qu'on s'éloignait un peu).
@@ -7245,6 +7357,33 @@ impl Session {
         } else {
             Vec::new()
         };
+        // (v215) Lampe torche en main, à la première personne : la lampe et le bras du modèle
+        // (pieds remontés comme la caméra sur une marche), dessinés dans la vue du monde.
+        let world_proj =
+            Mat4::perspective_infinite_reverse_rh(fov.to_radians(), renderer.aspect(), 0.05);
+        let first_person_lamp = (third == 0
+            && !fps_mode
+            && self.spectating.is_none()
+            && self.game.mode != GameMode::Spectator
+            && self.held_item() == Some(Item::Flashlight))
+        .then(|| {
+            let p = crate::player_model::Pose {
+                feet: pose.feet + Vec3::Y * self.step_offset,
+                yaw: pose.yaw,
+                pitch: pose.pitch,
+                walk: pose.walk,
+                swing: pose.swing,
+                crouch: pose.crouch,
+                light: pose.light,
+                held: pose.held,
+                skin: None,
+            };
+            Some((
+                crate::player_model::flashlight_matrix(&p)?,
+                crate::player_model::right_arm_matrix(&p)?,
+            ))
+        })
+        .flatten();
         let hand = if self.spectating.is_some() && fps_mode {
             // (v209) Spectateur : l'arme du joueur regardé dans ses mains, et ce qui est dans
             // le monde (balles traçantes, grenades en vol, impacts) comme en jouant.
@@ -7270,7 +7409,20 @@ impl Session {
             v
         } else {
             // À la 3e personne : pas de main à l'écran (le modèle est dans le monde).
-            let mut v = if third == 0 {
+            let mut v = if third == 0 && first_person_lamp.is_some() {
+                // (v215) Lampe torche : dessinée là où le modèle la tient (vue du monde), là
+                // où la lumière part et où la montrent les miroirs.
+                let mut v = Vec::new();
+                if let Some((lamp, _)) = first_person_lamp {
+                    crate::flashlight::model(
+                        &mut v,
+                        world_proj * view * lamp,
+                        self.hand_light,
+                        self.flashlight_on,
+                    );
+                }
+                v
+            } else if third == 0 {
                 self.hand
                     .build(self.held_item(), renderer.aspect(), self.hand_light)
             } else {
@@ -7291,7 +7443,10 @@ impl Session {
         };
         // Bras à la première personne (pas en mode FPS, qui a ses armes, ni en spectateur) :
         // éclairé comme le modèle du joueur en F5.
-        let arm = if third == 0
+        let arm = if let Some((_, arm)) = first_person_lamp {
+            // (v215) Lampe torche : le bras droit du modèle, tendu, qui la tient.
+            crate::hand::Hand::arm_world(world_proj * view, arm, self.hand_light, skin.as_deref())
+        } else if third == 0
             && !fps_mode
             && self.spectating.is_none()
             && self.game.mode != GameMode::Spectator
@@ -7370,7 +7525,9 @@ impl Session {
             player_eye: self.player.eye(),
             view,
             fov_y: fov.to_radians(),
-            fog_start: fog_end * 0.45,
+            // (v215) Bande de brouillard au bord de la distance de vue deux fois plus
+            // étroite (avant : de 45 % à 100 % de la distance, maintenant de 72,5 %).
+            fog_start: fog_end * 0.725,
             fog_end,
             held_light: match self.inventory.selected_item() {
                 // (v201) Torches en lumières ponctuelles : la torche tenue a la sienne.
@@ -7586,6 +7743,29 @@ fn floor_rotation(look: Vec3) -> u8 {
 }
 
 /// Côté vertical (0 +X, 1 −X, 4 +Z, 5 −Z) dans la direction horizontale dominante de `v`.
+/// (v215) Une boîte (coins `mn`, `mx`) a-t-elle un bout dans l'image de `view_proj` ?
+/// Prudent : écartée seulement si ses huit coins sont tous du même côté d'un des plans
+/// du champ (gauche, droite, bas, haut, devant).
+fn box_in_view(view_proj: Mat4, mn: Vec3, mx: Vec3) -> bool {
+    let corners: Vec<glam::Vec4> = (0..8)
+        .map(|i| {
+            let p = Vec3::new(
+                if i & 1 == 0 { mn.x } else { mx.x },
+                if i & 2 == 0 { mn.y } else { mx.y },
+                if i & 4 == 0 { mn.z } else { mx.z },
+            );
+            view_proj * p.extend(1.0)
+        })
+        .collect();
+    let out = |f: &dyn Fn(&glam::Vec4) -> bool| corners.iter().all(f);
+    !(out(&|c| c.x < -c.w)
+        || out(&|c| c.x > c.w)
+        || out(&|c| c.y < -c.w)
+        || out(&|c| c.y > c.w)
+        || out(&|c| c.w <= 0.0)
+        || out(&|c| c.z > c.w))
+}
+
 fn side_toward(v: Vec3) -> u8 {
     if v.x.abs() > v.z.abs() {
         if v.x > 0.0 {

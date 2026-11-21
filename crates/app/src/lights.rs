@@ -337,17 +337,54 @@ pub struct LightSettings {
     pub auto_warned: bool,
 }
 
+/// (v215) Réglages des lumières de Viendax au 21 novembre, devenus ceux du jeu par défaut
+/// (« mes réglages actuels doivent être ceux par défaut ») : qualité « Rapide » mais rayons
+/// jusqu'à 128 blocs, style « Net », plus intenses et plus brillants que ceux d'IRLights.
+fn default_render() -> DynSettings {
+    DynSettings {
+        intensity: 1.448_895_3,
+        specular: 1.202_566_5,
+        toon: false,
+        toon_bands: 4,
+        toon_smooth: 0.5,
+        shadows: true,
+        block_shadows: false,
+        entity_shadows: true,
+        shadow_quality: 0,
+        shadow_cache: true,
+        softness: 0.196_201_12,
+        bake_budget: 15,
+        volumetric: true,
+        vl_intensity: 1.0,
+        vl_steps: 16,
+        vl_scale: 4,
+        vl_max_dist: 128.0,
+        vl_tip_boost: 1.0,
+        vl_tip_radius: 1.5,
+        vl_shadows: false,
+        vl_shadow_stride: 4,
+        vl_noise: false,
+        vl_noise_amount: 0.6,
+        vl_noise_scale: 2.0,
+        vl_noise_speed: 0.25,
+        vl_noise_morph: 0.0,
+        vl_noise_stride: 4,
+        vl_dither_temporal: true,
+        half_lighting: true,
+    }
+}
+
 impl Default for LightSettings {
     fn default() -> Self {
         Self {
-            render: DynSettings::default(),
+            render: default_render(),
             guides: true,
             auto: false,
             auto_culling: true,
             auto_shadows: false,
             auto_intensity: 1.0,
             auto_reach: 1.0,
-            auto_radius: 48,
+            auto_radius: 50,
             auto_max: 200,
             auto_warned: false,
         }
@@ -376,7 +413,8 @@ impl LightSettings {
                 .map_or(d, |v| v.clamp(lo, hi))
         };
         let r = &mut s.render;
-        let d = DynSettings::default();
+        // (v215) Ce qui manque au fichier prend les valeurs par défaut du jeu.
+        let d = default_render();
         r.intensity = f("intensite", d.intensity, 0.0, 4.0);
         r.specular = f("reflets", d.specular, 0.0, 4.0);
         r.toon = b("bandes", d.toon);
@@ -1163,12 +1201,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (v215) Les réglages de Viendax (son `lumieres.txt` du 21 novembre) sont ceux du jeu
+    /// par défaut : un fichier vide les donne, et le sien redonne les mêmes.
+    #[test]
+    fn the_default_light_settings_are_viendax_s() {
+        let his = "intensite=1.4488953\nreflets=1.2025665\nbandes=false\nbandes_nombre=4\n\
+            bandes_douceur=0.5\nombres=true\nombres_blocs=false\nombres_joueurs=true\n\
+            ombres_qualite=0\nombres_cache=true\nombres_douceur=0.19620112\nombres_budget=15\n\
+            rayons=true\nrayons_intensite=1\nrayons_pas=16\nrayons_resolution=4\n\
+            eclairage_demi=true\nrayons_distance=128\nrayons_lueur=1\nrayons_lueur_rayon=1.5\n\
+            rayons_ombres=false\nrayons_ombres_pas=4\nrayons_bruit=false\nrayons_bruit_part=0.6\n\
+            rayons_bruit_taille=2\nrayons_bruit_vitesse=0.25\nrayons_bruit_metamorphose=0\n\
+            rayons_bruit_pas=4\nrayons_tramage=true\nguides=true\nauto=false\nauto_cachees=true\n\
+            auto_ombres=false\nauto_intensite=1\nauto_portee=1\nauto_rayon=50\nauto_max=200\n\
+            auto_lu=false\n";
+        assert_eq!(LightSettings::parse(his), LightSettings::default());
+        assert_eq!(LightSettings::parse(""), LightSettings::default());
+    }
+
     #[test]
     fn settings_round_trip_and_presets_are_recognised() {
         let mut s = LightSettings::default();
-        // Les valeurs par défaut sont « Équilibré » et « Poussiéreux », comme IRLights.
-        assert_eq!(quality_preset(&s.render), Some(1));
-        assert_eq!(style_preset(&s.render), Some(1));
+        // (v215) Les valeurs par défaut (celles de Viendax) : qualité « Rapide » avec des
+        // rayons plus longs (réglages personnels), style « Net ».
+        assert_eq!(quality_preset(&s.render), None);
+        assert_eq!(style_preset(&s.render), Some(0));
         apply_quality(&mut s.render, 0);
         apply_style(&mut s.render, 2);
         s.auto = true;
@@ -1186,7 +1243,10 @@ mod tests {
         let w = LightSettings::parse("rayons_pas=100000\nombres_qualite=9\nintensite=nan\n");
         assert_eq!(w.render.vl_steps, 96);
         assert_eq!(w.render.shadow_quality, 3);
-        assert_eq!(w.render.intensity, 1.0);
+        assert_eq!(
+            w.render.intensity,
+            LightSettings::default().render.intensity
+        );
     }
 
     #[test]
@@ -1305,6 +1365,10 @@ mod tests {
         }
         let cam = Vec3::new(0.5, y as f32 + 0.5, 0.5);
         let mut l = Lights::load(&root, &root);
+        // (v215) Réglages de l'essai fixés (les valeurs par défaut sont devenues celles de
+        // Viendax : qualité Basse, recherche à 50 blocs).
+        l.settings.render.shadow_quality = 1;
+        l.settings.auto_radius = 48;
         l.update(0.1, &w, cam, true);
         assert!(
             l.frame_lights().is_empty() && l.torch_swap().is_none(),

@@ -1015,8 +1015,12 @@ fn resample_gobo(img: &GoboImage) -> Vec<u8> {
 struct VlTargets {
     key: (u32, u32, u64),
     view: wgpu::TextureView,
-    /// Groupes de la passe volumétrique et de la recomposition, selon la profondeur lue.
+    /// (v215) L'image de la marche lissée (`fs_smooth`), lue par la recomposition.
+    smooth_view: wgpu::TextureView,
+    /// Groupes de la passe volumétrique, du lissage et de la recomposition, selon la
+    /// profondeur lue.
     vl_groups: [wgpu::BindGroup; 2],
+    smooth_groups: [wgpu::BindGroup; 2],
     comp_groups: [wgpu::BindGroup; 2],
 }
 
@@ -1024,6 +1028,8 @@ pub(crate) struct VlPipes {
     march: wgpu::RenderPipeline,
     /// La même marche sans le code du bruit (bruit décoché, le cas habituel).
     march_plain: wgpu::RenderPipeline,
+    /// (v215) Lissage de l'image de la marche (voir `fs_smooth`).
+    smooth: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
 }
 
@@ -1631,6 +1637,20 @@ pub(crate) fn light_pipes(
                 )
             })
         });
+        let smooth = sc.spawn(|| {
+            timed("lissage des rayons", || {
+                fullscreen_pipeline(
+                    device,
+                    "volumétrique : lissage",
+                    &comp_layout,
+                    &comp_shader,
+                    "vs_full",
+                    "fs_smooth",
+                    VL_FORMAT,
+                    None,
+                )
+            })
+        });
         (
             bake.join().expect("pipeline des ombres des lumières"),
             VlPipes {
@@ -1638,6 +1658,7 @@ pub(crate) fn light_pipes(
                 march_plain: march_plain
                     .join()
                     .expect("pipeline volumétrique (sans bruit)"),
+                smooth: smooth.join().expect("pipeline de lissage des rayons"),
                 composite: composite.join().expect("pipeline de recomposition"),
             },
             DeferredPipes {
@@ -3090,22 +3111,53 @@ impl DynGpu {
         let half = (size.0.div_ceil(k), size.1.div_ceil(k));
         let key = (half.0, half.1, generation);
         if self.vl_targets.as_ref().is_none_or(|t| t.key != key) {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("volumétrique"),
-                size: wgpu::Extent3d {
-                    width: half.0.max(1),
-                    height: half.1.max(1),
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: VL_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
+            let image = |label: &str| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width: half.0.max(1),
+                            height: half.1.max(1),
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: VL_FORMAT,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default())
+            };
+            let view = image("volumétrique");
+            let smooth_view = image("volumétrique lissé");
+            // (v215) Lissage puis recomposition : chacun lit l'image de la passe d'avant.
+            let comp_group = |i: usize, src: &wgpu::TextureView, label: &str| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &self.comp_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(src),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&depths[i]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.rects_buf.as_entire_binding(),
+                        },
+                    ],
+                })
+            };
+            let smooth_groups =
+                std::array::from_fn(|i| comp_group(i, &view, "volumétrique : lissage"));
+            let comp_groups = std::array::from_fn(|i| {
+                comp_group(i, &smooth_view, "volumétrique : recomposition")
             });
-            let view = tex.create_view(&Default::default());
             let vl_groups = std::array::from_fn(|i| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("volumétrique"),
@@ -3130,30 +3182,12 @@ impl DynGpu {
                     ],
                 })
             });
-            let comp_groups = std::array::from_fn(|i| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("volumétrique : recomposition"),
-                    layout: &self.comp_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&depths[i]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: self.rects_buf.as_entire_binding(),
-                        },
-                    ],
-                })
-            });
             self.vl_targets = Some(VlTargets {
                 key,
                 view,
+                smooth_view,
                 vl_groups,
+                smooth_groups,
                 comp_groups,
             });
         }
@@ -3183,6 +3217,27 @@ impl DynGpu {
             pass.set_bind_group(0, world_group, &[]);
             pass.set_bind_group(1, &t.vl_groups[depth_index], &[]);
             pass.draw(0..6, 0..self.rects.len() as u32);
+        }
+        // (v215) Lissage : toute l'image réduite (hors des cases éclairées, des zéros qui le
+        // restent), un triangle.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lumière volumétrique : lissage"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.smooth_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipes.smooth);
+            pass.set_bind_group(0, &t.smooth_groups[depth_index], &[]);
+            pass.draw(0..3, 0..1);
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("lumière volumétrique : recomposition"),
