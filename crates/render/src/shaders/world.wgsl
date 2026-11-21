@@ -84,9 +84,6 @@ struct Globals {
 // gauche à droite ; a = 0 là où rien ne s'y reflète.
 @group(0) @binding(15) var water_tex: texture_2d<f32>;
 
-const HORIZON: vec3<f32> = vec3<f32>(0.62, 0.78, 0.95);
-const ZENITH: vec3<f32> = vec3<f32>(0.25, 0.47, 0.85);
-
 fn lin(c: vec3<f32>) -> vec3<f32> {
     return pow(c, vec3<f32>(2.2));
 }
@@ -123,35 +120,252 @@ fn torch_keep(p: vec3<f32>) -> f32 {
     return smoothstep(inner, max(r - 6.0, inner + 2.0), d);
 }
 
+// ---------------------------------------------------------------- ciel
+// CIEL : DÉBUT (ce bloc est recopié tel quel dans les shaders des entités et des joueurs,
+// voir `entity::sky_wgsl` : leur brouillard va vers le même ciel que celui des blocs. Il ne
+// lit de `g` que son début : `sun`, `cam_pos`.)
+
+// (v216) Ciel (voir sky.rs) : ses uniformes, à part de ceux du monde.
+struct Sky {
+    // Soleil : rgb = couleur de son disque, w = part de sa
+    // lumière qui arrive (0 : couché).
+    sun: vec4<f32>,
+    // xyz = direction vers la lune, w = son éclat.
+    moon: vec4<f32>,
+    // x = étoiles (0 jour … 1 nuit), y = angle du ciel étoilé (rad), z = voile de nuages
+    // hauts (halo de 22° autour du soleil et de la lune), w = lueur d'un éclair.
+    misc: vec4<f32>,
+    // rgb = couleur du ciel couvert, w = part de ciel couvert (brouillard).
+    fog: vec4<f32>,
+    // Les trois cartes des nuages : xy = chemin fait depuis leur instantané (vent et
+    // caméra, blocs), z = rayon de la caméra à l'instantané, w = poids (0 : pas affichée ;
+    // deux au plus le sont, en fondu continu de l'une vers l'autre).
+    cloud_a: vec4<f32>,
+    cloud_b: vec4<f32>,
+    cloud_c: vec4<f32>,
+    // x = rayon de la caméra, y = rayon du milieu de la couche, z = 1 / angle du bord des
+    // cartes.
+    cloud_geo: vec4<f32>,
+    // xy = direction (xz) de l'éclair vu de la caméra.
+    flash: vec4<f32>,
+};
+
+// Atmosphère (image cube calculée sur le processeur), les trois cartes des nuages (tout le
+// ciel en œil de poisson ; rgb = lumière, a = ce qui passe derrière).
+@group(0) @binding(16) var sky_cube: texture_cube<f32>;
+@group(0) @binding(17) var cloud_x: texture_2d<f32>;
+@group(0) @binding(18) var cloud_y: texture_2d<f32>;
+@group(0) @binding(19) var cloud_z: texture_2d<f32>;
+@group(0) @binding(20) var sky_samp: sampler;
+@group(0) @binding(21) var<uniform> sky: Sky;
+
+/// Tirage (0 … 1) d'une case de l'espace.
+fn sky_hash(v: vec3<i32>) -> f32 {
+    var h = (u32(v.x) * 73856093u) ^ (u32(v.y) * 19349663u) ^ (u32(v.z) * 83492791u);
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h = h ^ (h >> 16u);
+    return f32(h & 0xffffu) / 65535.0;
+}
+
+/// (v216) Couleur du ciel sans nuages ni astres dans la direction `dir` : l'atmosphère (image
+/// cube calculée sur le processeur, voir sky.rs), grisée sous un ciel couvert. Le brouillard
+/// des blocs lointains s'y fond. Une seule lecture (avant : un dégradé calculé par pixel).
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
-    // Ciel analytique (aucune texture, quelques opérations) : dégradé horizon → zénith,
-    // horizon chaud du côté du soleil quand il est bas, halo et disque du soleil, nuit bleue.
-    let day = g.light.x;
-    let sun = normalize(g.sun.xyz);
-    let t = clamp(dir.y, 0.0, 1.0);
-    let s = max(dot(dir, sun), 0.0);
-    // Soleil bas : crépuscule (0 haut dans le ciel … 1 sur l'horizon).
-    let dusk = (1.0 - smoothstep(0.0, 0.45, abs(sun.y))) * smoothstep(-0.25, 0.05, sun.y);
-    let k = 1.0 - exp(-3.2 * t);
-    var c = mix(lin(HORIZON), lin(ZENITH), k) * day;
-    // Bande chaude à l'horizon, plus forte vers le soleil.
-    let toward = 0.35 + 0.65 * s * s;
-    let warm = mix(vec3<f32>(1.0, 0.42, 0.14), vec3<f32>(0.95, 0.35, 0.45), t * 2.0);
-    c = mix(c, warm * (0.25 + 0.75 * day), dusk * toward * exp(-5.0 * t));
-    // Sous l'horizon : brume plus sombre.
-    c *= 1.0 - 0.35 * clamp(-dir.y * 3.0, 0.0, 1.0);
-    // Nuit : bleu très sombre.
-    c += mix(vec3<f32>(0.010, 0.014, 0.030), vec3<f32>(0.002, 0.004, 0.012), t) * (1.0 - day);
-    // Soleil : disque net, couronne, grand halo ; plus orangé quand il est bas.
-    let tint = mix(vec3<f32>(1.0, 0.93, 0.78), vec3<f32>(1.0, 0.55, 0.22), dusk);
-    let s2 = s * s;
-    let s8 = s2 * s2 * s2 * s2;
-    let s64 = s8 * s8 * s8 * s8 * s8 * s8 * s8 * s8;
-    let disc = smoothstep(0.99955, 0.99975, s);
-    let up = smoothstep(-0.08, 0.02, sun.y);
-    c += tint * (disc * 7.0 + s64 * s64 * 0.5 + s8 * 0.10) * up * max(day, 0.15);
+    let c = textureSampleLevel(sky_cube, sky_samp, dir, 0.0).rgb;
+    return mix(c, sky.fog.rgb, sky.fog.w);
+}
+
+/// Halo du soleil, et son disque si `disc` : l'auréole serrée autour du disque, la grande
+/// lueur, et le halo de 22° (cristaux de glace) quand un voile de nuages hauts s'installe
+/// avant la pluie. Couleur du soleil tel qu'il arrive ici : blanc en haut du ciel, orangé
+/// puis rouge à l'horizon (`sky_sun`).
+fn sun_glow(dir: vec3<f32>, disc: bool) -> vec3<f32> {
+    let s = dot(dir, normalize(g.sun.xyz));
+    if s < 0.55 || sky.sun.w <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    // Angle au soleil (rad) sans acos : exact à 1 % près sous 35°.
+    let ang = sqrt(max(2.0 - 2.0 * s, 0.0));
+    let col = sky.sun.rgb;
+    var c = col * (0.42 * exp(-ang * 34.0) + 0.045 * exp(-ang * 7.0));
+    if disc {
+        // Disque de 0,9° de rayon, un peu plus sombre au bord.
+        let x = ang / 0.0157;
+        c += col * (1.0 - smoothstep(0.9, 1.0, x)) * (0.6 + 0.4 * sqrt(max(1.0 - x * x, 0.0)));
+    }
+    let veil = sky.misc.z;
+    if veil > 0.0 {
+        // Anneau à 22° : bord intérieur net et rougeâtre, extérieur qui s'étale, bleuté.
+        let h = (ang - 0.384) * select(55.0, 16.0, ang > 0.384);
+        let ring = exp(-h * h);
+        let tint = mix(vec3<f32>(1.0, 0.72, 0.55), vec3<f32>(0.85, 0.92, 1.0), smoothstep(0.37, 0.43, ang));
+        c += col * tint * ring * 0.02 * veil;
+    }
     return c;
 }
+
+/// Bruit lissé (3D) à partir de `hash3` : 8 tirages.
+fn value_noise(p: vec3<f32>) -> f32 {
+    let i = vec3<i32>(floor(p));
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = mix(sky_hash(i), sky_hash(i + vec3<i32>(1, 0, 0)), u.x);
+    let b = mix(sky_hash(i + vec3<i32>(0, 1, 0)), sky_hash(i + vec3<i32>(1, 1, 0)), u.x);
+    let c = mix(sky_hash(i + vec3<i32>(0, 0, 1)), sky_hash(i + vec3<i32>(1, 0, 1)), u.x);
+    let d = mix(sky_hash(i + vec3<i32>(0, 1, 1)), sky_hash(i + vec3<i32>(1, 1, 1)), u.x);
+    return mix(mix(a, b, u.y), mix(c, d, u.y), u.z);
+}
+
+/// La lune : une sphère éclairée par le vrai soleil (ses phases en découlent), avec ses
+/// mers sombres, et sa lueur. Elle montre toujours la même face.
+fn moon_shade(dir: vec3<f32>) -> vec3<f32> {
+    let k = sky.moon.w;
+    let m = sky.moon.xyz;
+    let s = dot(dir, m);
+    if k <= 0.0 || s < 0.9 {
+        return vec3<f32>(0.0);
+    }
+    let ang = sqrt(max(2.0 - 2.0 * s, 0.0));
+    // Rayon : 1° (deux fois la vraie, comme le soleil : lisible à l'écran).
+    let rm = 0.0175;
+    var c = vec3<f32>(0.55, 0.66, 0.9) * (0.035 * exp(-ang * 26.0) + 0.006 * exp(-ang * 7.0)) * k;
+    if ang < rm {
+        let right = normalize(cross(vec3<f32>(0.0, 0.0, 1.0), m));
+        let up = cross(m, right);
+        let x = dot(dir, right) / rm;
+        let y = dot(dir, up) / rm;
+        let z = sqrt(max(1.0 - x * x - y * y, 0.0));
+        // Normale de la sphère, tournée vers nous.
+        let n = right * x + up * y - m * z;
+        let lit = smoothstep(-0.03, 0.2, dot(n, normalize(g.sun.xyz)));
+        // Mers : grandes taches sombres, fixes sur la face.
+        let q = vec3<f32>(x, y, z);
+        let seas = value_noise(q * 2.3 + 7.0) * 0.65 + value_noise(q * 5.9 + 3.0) * 0.35;
+        let albedo = mix(0.5, 1.0, smoothstep(0.38, 0.62, seas));
+        let edge = 1.0 - smoothstep(0.93, 1.0, ang / rm);
+        // (Côté nuit à peine visible : la lumière cendrée.)
+        c = mix(c, vec3<f32>(0.93, 0.95, 1.0) * albedo * (lit * 1.05 + 0.012) * k, edge);
+    }
+    return c;
+}
+
+/// Étoiles (elles tournent avec l'heure autour de l'axe du monde, se lèvent et se
+/// couchent) et Voie lactée. Le ciel est découpé en cases : une étoile dans quelques-unes,
+/// sa place, son éclat (beaucoup de faibles, peu de brillantes) et sa teinte tirés au sort.
+fn stars(dir: vec3<f32>) -> vec3<f32> {
+    let a = sky.misc.y;
+    let ca = cos(a);
+    let sa = sin(a);
+    let d = vec3<f32>(dir.x * ca + dir.y * sa, -dir.x * sa + dir.y * ca, dir.z);
+    let p = d * 110.0;
+    let cell = vec3<i32>(floor(p));
+    let h = sky_hash(cell);
+    var c = vec3<f32>(0.0);
+    if h > 0.984 {
+        let o = vec3<f32>(
+            sky_hash(cell + vec3<i32>(17, 0, 0)),
+            sky_hash(cell + vec3<i32>(0, 31, 0)),
+            sky_hash(cell + vec3<i32>(0, 0, 47)),
+        ) - 0.5;
+        var dd = fract(p) - 0.5 - o * 0.5;
+        // (Écart mesuré sur la voûte seulement : l'étoile est un point rond.)
+        dd -= d * dot(dd, d);
+        let mag = (h - 0.984) / 0.016;
+        let bright = mag * mag * mag * mag;
+        let size = 0.0045 + 0.012 * bright;
+        let twinkle = 0.8 + 0.2 * sin(g.cam_pos.w * (1.7 + 4.0 * mag) + h * 900.0);
+        let tint = mix(vec3<f32>(1.0, 0.82, 0.62), vec3<f32>(0.72, 0.84, 1.0), sky_hash(cell + vec3<i32>(5, 5, 5)));
+        c = tint * (0.22 + 2.6 * bright) * exp(-dot(dd, dd) / size) * twinkle;
+    }
+    // Voie lactée : une bande pâle et inégale en travers du ciel.
+    let across = dot(d, vec3<f32>(0.37, 0.18, 0.91));
+    let band = exp(-across * across * 14.0);
+    if band > 0.02 {
+        let dust = value_noise(d * 7.0) * 0.6 + value_noise(d * 19.0) * 0.4;
+        c += vec3<f32>(0.5, 0.56, 0.75) * band * smoothstep(0.25, 0.75, dust) * 0.045;
+    }
+    return c;
+}
+
+/// Où tombe, dans une carte des nuages, le point `q` vu de la caméra de son instantané
+/// (œil de poisson : le zénith au centre, l'angle depuis le zénith en rayon).
+fn cloud_uv(q: vec3<f32>) -> vec2<f32> {
+    let d = normalize(q);
+    let th = acos(clamp(d.y, -1.0, 1.0));
+    let h = d.xz * inverseSqrt(max(dot(d.xz, d.xz), 1e-12));
+    return 0.5 + 0.5 * th * sky.cloud_geo.z * h;
+}
+
+/// Nuages dans la direction `dir` : rgb = leur lumière, a = part du ciel qui passe
+/// derrière. Une lecture par carte affichée (deux en fondu, le plus souvent), au point de
+/// la couche que vise `dir`, déplacé du vent et du chemin de la caméra depuis l'instantané
+/// de la carte.
+fn clouds(dir: vec3<f32>) -> vec4<f32> {
+    let wa = sky.cloud_a.w;
+    let wb = sky.cloud_b.w;
+    let wc = sky.cloud_c.w;
+    let total = wa + wb + wc;
+    if total <= 0.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    let rc = sky.cloud_geo.x;
+    let rs = sky.cloud_geo.y;
+    let b = dir.y * rc;
+    let s = -b + sqrt(max(b * b - rc * rc + rs * rs, 0.0));
+    // Point visé, depuis le centre de la planète des nuages.
+    let p = vec3<f32>(dir.x * s, dir.y * s + rc, dir.z * s);
+    var c = vec4<f32>(0.0);
+    if wa > 0.0 {
+        let q = p + vec3<f32>(sky.cloud_a.x, -sky.cloud_a.z, sky.cloud_a.y);
+        c += textureSampleLevel(cloud_x, sky_samp, cloud_uv(q), 0.0) * wa;
+    }
+    if wb > 0.0 {
+        let q = p + vec3<f32>(sky.cloud_b.x, -sky.cloud_b.z, sky.cloud_b.y);
+        c += textureSampleLevel(cloud_y, sky_samp, cloud_uv(q), 0.0) * wb;
+    }
+    if wc > 0.0 {
+        let q = p + vec3<f32>(sky.cloud_c.x, -sky.cloud_c.z, sky.cloud_c.y);
+        c += textureSampleLevel(cloud_z, sky_samp, cloud_uv(q), 0.0) * wc;
+    }
+    // (Première carte en train d'apparaître : le reste du poids est du ciel pur.)
+    c.a += 1.0 - total;
+    return c;
+}
+
+/// Ce que reflètent l'eau et les miroirs quand rien n'est devant : le ciel, ses nuages et
+/// le soleil.
+fn sky_env(dir: vec3<f32>) -> vec3<f32> {
+    var c = sky_color(dir) + sun_glow(dir, true);
+    if dir.y > -0.03 {
+        let cl = clouds(dir);
+        c = c * cl.a + cl.rgb;
+    }
+    return c;
+}
+
+/// (v216) Le ciel : l'atmosphère, les étoiles, la lune et le soleil, puis les nuages devant
+/// (ils les cachent), et la lueur d'un éclair dans les nuages.
+fn sky_shade(dir: vec3<f32>) -> vec4<f32> {
+    var c = sky_color(dir);
+    if sky.misc.x > 0.01 && dir.y > 0.0 {
+        c += stars(dir) * sky.misc.x * smoothstep(0.0, 0.2, dir.y);
+    }
+    c += moon_shade(dir) + sun_glow(dir, true);
+    var veil = 0.0;
+    if dir.y > -0.03 {
+        let cl = clouds(dir);
+        c = c * cl.a + cl.rgb;
+        veil = 1.0 - cl.a;
+    }
+    if sky.misc.w > 0.0 {
+        // Éclair : les nuages s'illuminent de l'intérieur, surtout du côté où il tombe.
+        let side = max(dot(dir.xz * inverseSqrt(max(dot(dir.xz, dir.xz), 1e-12)), sky.flash.xy), 0.0);
+        c += vec3<f32>(0.72, 0.8, 1.0) * sky.misc.w * (veil * 0.85 + 0.07) * (0.3 + 0.7 * side * side);
+    }
+    return vec4<f32>(c, 1.0);
+}
+
+// CIEL : FIN
 
 // ---------------------------------------------------------------- blocs
 
@@ -713,7 +927,7 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
             // 100 ms devant de grandes verrières) ; le ciel, selon ce que la face en voit.
             // L'eau (face du dessus) garde son vrai reflet.
             if !found && cheap && i.face != 2u {
-                env = sky_color(r);
+                env = sky_env(r);
                 cover = i.sky * i.sky;
                 found = true;
             }
@@ -723,7 +937,7 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
                 cover = e.a;
             }
         } else {
-            env = sky_color(r);
+            env = sky_env(r);
             cover = select(1.0, 0.0, short);
         }
         // (v200) Joueurs et objets reflétés dans l'eau (image faite à part, sans rayon) :
@@ -754,10 +968,14 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
 
     color += dyn_spec;
 
-    // Brouillard vers la couleur du ciel dans la direction du regard (calculée seulement là
-    // où il y a du brouillard : les pixels proches n'en ont pas).
+    // Brouillard : le lointain se fond dans le ciel tel qu'on le voit derrière lui dans la
+    // direction du regard (calculé seulement là où il y a du brouillard : les pixels proches
+    // n'en ont pas). (v216) Le ciel entier, avec le soleil, la lune, les étoiles et les
+    // nuages : avant, une montagne lointaine, déjà fondue dans le brouillard donc invisible,
+    // gardait la couleur du ciel vide et cachait encore le soleil (il « passait derrière »
+    // un relief qu'on ne voyait pas), et elle aurait découpé sa silhouette dans les nuages.
     if fog > 0.0 {
-        color = mix(color, sky_color(to_frag / dist), fog);
+        color = mix(color, sky_shade(to_frag / dist).rgb, fog);
     }
     return Shaded(vec4<f32>(color, alpha), albedo, wd * (1.0 - fog), 1.0 - fog);
 }
@@ -805,52 +1023,6 @@ fn fs_sky_mv(i: SkyOut) -> MvOut {
 @fragment
 fn fs_sky(i: SkyOut) -> @location(0) vec4<f32> {
     return sky_shade(sky_dir(i.ndc));
-}
-
-/// Bruit lissé (2D) pour les nuages : 4 tirages par appel.
-fn cloud_noise(p: vec2<f32>) -> f32 {
-    let i = vec2<i32>(floor(p));
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = hash3(vec3<i32>(i.x, 17, i.y));
-    let b = hash3(vec3<i32>(i.x + 1, 17, i.y));
-    let c = hash3(vec3<i32>(i.x, 17, i.y + 1));
-    let d = hash3(vec3<i32>(i.x + 1, 17, i.y + 1));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-fn sky_shade(dir: vec3<f32>) -> vec4<f32> {
-    var c = sky_color(dir);
-    let day = g.light.x;
-    let night = 1.0 - day;
-    let sun = normalize(g.sun.xyz);
-    if dir.y > 0.0 {
-        // Étoiles la nuit (elles scintillent doucement).
-        if night > 0.05 {
-            let q = vec3<i32>(floor(dir * 420.0));
-            let h = hash3(q);
-            if h > 0.9975 {
-                let tw = 0.75 + 0.25 * sin(g.cam_pos.w * 2.0 + h * 900.0);
-                c += vec3<f32>(0.8, 0.85, 1.0) * (h - 0.9975) * 400.0 * night * dir.y * tw;
-            }
-        }
-        // Nuages : une couche plate très haute, trois octaves de bruit qui dérivent avec
-        // le vent (immobiles quand l'heure est arrêtée : `fog.w`) ; éclairés par le soleil (dorés quand il est bas), estompés à l'horizon.
-        let uv = dir.xz / (dir.y + 0.12) * 1.6 + vec2<f32>(g.fog.w * 0.006, g.fog.w * 0.002);
-        let n = cloud_noise(uv) * 0.55 + cloud_noise(uv * 2.3 + 7.1) * 0.30
-            + cloud_noise(uv * 5.1 + 3.7) * 0.15;
-        let cover = smoothstep(0.52, 0.78, n) * smoothstep(0.02, 0.22, dir.y);
-        let dusk = (1.0 - smoothstep(0.0, 0.45, abs(sun.y))) * smoothstep(-0.25, 0.05, sun.y);
-        let lit = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.0, 0.62, 0.38), dusk);
-        let shade = 0.72 + 0.28 * smoothstep(0.55, 0.9, n);
-        let cloud = lit * shade * (0.06 + 0.94 * day);
-        c = mix(c, cloud, cover * 0.85);
-    }
-    // Lune : à l'opposé du soleil, la nuit.
-    let m = max(dot(dir, -sun), 0.0);
-    c += vec3<f32>(0.75, 0.8, 0.9) * (smoothstep(0.9993, 0.9996, m) * 0.9 + pow(m, 200.0) * 0.05)
-        * night * smoothstep(-0.05, 0.05, -sun.y);
-    return vec4<f32>(c, 1.0);
 }
 
 // ---------------------------------------------------------------- contour du bloc visé
@@ -1586,7 +1758,7 @@ fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
         let r = f32((pal.w >> 4u) & 15u) / 15.0;
         return RayHit(albedo, ht, nrm, select(0.0, 0.96, r > 0.99), shade, vec3<f32>(0.0), sky_hit);
     }
-    return RayHit(sky_color(d), 1e9, vec3<f32>(0.0), 0.0, -1.0, vec3<f32>(0.0), 1.0);
+    return RayHit(sky_env(d), 1e9, vec3<f32>(0.0), 0.0, -1.0, vec3<f32>(0.0), 1.0);
 }
 
 /// Reflet vu depuis `o` dans la direction `d` : jusqu'à 4 rebonds de miroir en miroir.

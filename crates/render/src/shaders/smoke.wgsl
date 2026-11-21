@@ -24,6 +24,10 @@ struct Smoke {
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
+// (v216) Le ciel de l'image (atmosphère, voir sky.rs) : la fumée prend la teinte de la
+// lumière qui l'éclaire (bleutée à l'ombre sous un ciel bleu, dorée au couchant).
+@group(0) @binding(16) var sky_cube: texture_cube<f32>;
+@group(0) @binding(20) var sky_samp: sampler;
 @group(1) @binding(0) var<uniform> s: Smoke;
 @group(1) @binding(1) var fill: texture_3d<f32>;
 @group(1) @binding(2) var noise: texture_3d<f32>;
@@ -100,6 +104,12 @@ fn seg_dist(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>) -> f32 {
 /// Fumée au point `p` : x = densité 0..1 (front, volutes), y = 1 dans un mur, z = moment
 /// où la fumée arrive là (0 centre … 1 bord, plus : jamais).
 fn field(p: vec3<f32>, front: f32, age: f32) -> vec3<f32> {
+    return field_at(p, front, age, false);
+}
+
+/// `wisps` : avec les filaments fins du bord (pour la densité vue ; pas pour le relief ni
+/// l'ombre, qu'ils rendraient tachetés).
+fn field_at(p: vec3<f32>, front: f32, age: f32, wisps: bool) -> vec3<f32> {
     let raw = textureSampleLevel(fill, fill_sampler, (p - s.origin.xyz) / s.size.xyz, 0.0).rg;
     // Moment d'arrivée rangé ×0,8 (voir equip::SMOKE_REACH_SCALE) : 1,25 = jamais.
     let f = vec2<f32>(raw.r * 1.25, raw.g);
@@ -118,7 +128,16 @@ fn field(p: vec3<f32>, front: f32, age: f32) -> vec3<f32> {
     let n2 = textureSampleLevel(noise, noise_sampler, p * 0.5 - drift * 1.6, 0.0).r;
     let b = abs(n1 * 2.0 - 1.0) * 0.62 + abs(n2 * 2.0 - 1.0) * 0.38;
     let erode = (0.05 + b * 0.42) * edge;
-    return vec3<f32>(clamp((front - f.r - erode) * 8.0, 0.0, 1.0), 0.0, f.r);
+    var inside = front - f.r - erode;
+    if wisps {
+        // (v216) Des filaments fins tout au bord : la fumée s'effiloche au lieu de finir
+        // en boules nettes. Ils ne font que creuser un peu plus la surface des volutes
+        // (moins que l'épaisseur de son bord) : le relief et l'ombre, pris sans eux,
+        // restent ceux des volutes.
+        let n3 = textureSampleLevel(noise, noise_sampler, p * 1.3 + drift * 3.1, 0.0).r;
+        inside -= abs(n3 * 2.0 - 1.0) * 0.07 * edge;
+    }
+    return vec3<f32>(clamp(inside * 8.0, 0.0, 1.0), 0.0, f.r);
 }
 
 fn march(frag: vec4<f32>, world: vec3<f32>) -> vec4<f32> {
@@ -152,18 +171,24 @@ fn march(frag: vec4<f32>, world: vec3<f32>) -> vec4<f32> {
     let sun = normalize(g.sun.xyz);
     let day = g.light.x;
     let amb = mix(0.05, 1.0, day);
+    // (v216) Teinte de la lumière du soleil : celle du ciel autour de lui (blanche à midi,
+    // dorée puis orangée quand il descend).
+    let around = textureSampleLevel(sky_cube, sky_samp, sun, 0.0).rgb;
+    let sun_tint = mix(vec3<f32>(1.0), around / max(max(around.r, around.g), max(around.b, 0.02)), 0.55);
     var t = t_in + dt * hash12(frag.xy + vec2<f32>(age * 37.0, age * 11.0));
     var trans = 1.0;
     var col = vec3<f32>(0.0);
-    // Éclairage de la surface du nuage, calculé au premier contact (normale des volutes).
-    var light = -1.0;
+    // Éclairage de la surface du nuage, calculé au premier contact (normale des volutes) ;
+    // `lit` : pas encore fait.
+    var light = vec3<f32>(0.0);
+    var lit = false;
     var t_hit = 0.0;
     for (var i = 0; i < 160; i++) {
         if i >= steps || t > t_out || trans < 0.015 {
             break;
         }
         let p = o + d * t;
-        let fd = field(p, front, age);
+        let fd = field_at(p, front, age, true);
         // Mur (bloc plein) : la fumée derrière est cachée.
         if fd.y > 0.5 {
             break;
@@ -178,12 +203,13 @@ fn march(frag: vec4<f32>, world: vec3<f32>) -> vec4<f32> {
             }
         }
         if dens > 0.001 {
-            if light < 0.0 && t < 0.3 {
+            if !lit && t < 0.3 {
                 // Œil dans la fumée : brouillard uniforme, pas besoin du relief.
-                light = amb * 0.62;
+                light = vec3<f32>(amb * 0.62);
+                lit = true;
                 t_hit = t;
             }
-            if light < 0.0 {
+            if !lit {
                 // Bord exact de la fumée entre le pas précédent et celui-ci (sinon les
                 // pas dessinent des bandes), puis la normale : la fumée s'épaissit vers
                 // l'intérieur.
@@ -209,7 +235,14 @@ fn march(frag: vec4<f32>, world: vec3<f32>) -> vec4<f32> {
                 let sh = field(q + sun * 0.9, front, age).x;
                 let sky = 0.5 + 0.5 * nrm.y;
                 let direct = max(dot(nrm, sun), 0.0) * (1.0 - 0.6 * sh);
-                light = amb * (0.52 + 0.26 * sky) + day * 0.32 * direct;
+                // (v216) La lumière du ciel qui arrive de ce côté-là : sa teinte, adoucie
+                // (la fumée reste grise, à peine bleutée à l'ombre).
+                let side = normalize(vec3<f32>(nrm.x, max(nrm.y, 0.0) + 0.4, nrm.z));
+                let above = textureSampleLevel(sky_cube, sky_samp, side, 0.0).rgb;
+                let luma = max(dot(above, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.02);
+                let sky_tint = min(mix(vec3<f32>(1.0), above / luma, 0.14), vec3<f32>(1.15));
+                light = amb * (0.52 + 0.26 * sky) * sky_tint + day * 0.34 * direct * sun_tint;
+                lit = true;
                 t_hit = t;
             }
             // Cœur du nuage (plein, sans volutes) : pas plus longs, deux suffisent.
@@ -232,7 +265,11 @@ fn march(frag: vec4<f32>, world: vec3<f32>) -> vec4<f32> {
     if a < 0.003 {
         discard;
     }
-    return vec4<f32>(col, a);
+    // (v216) À contre-jour, les bords minces de la fumée laissent passer le soleil : un
+    // liseré clair du côté du soleil.
+    let toward = max(dot(d, sun), 0.0);
+    let rim = toward * toward * toward * toward * a * (1.0 - a) * 1.2 * day;
+    return vec4<f32>(col + sun_tint * rim, a);
 }
 
 @fragment

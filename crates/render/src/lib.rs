@@ -9,8 +9,11 @@
 //! - trois passes dans un même render pass : ciel, blocs, réticule.
 
 mod arena;
+pub mod atmosphere;
+mod bolts;
 mod capture;
 mod entity;
+mod flames;
 mod gpu_timer;
 pub mod igpu;
 mod occlusion;
@@ -23,8 +26,10 @@ mod lights;
 mod overlay;
 pub mod perf;
 mod planar;
+mod rain;
 pub mod rt;
 mod screen;
+pub mod sky;
 mod taa;
 pub mod textures;
 pub mod thermal;
@@ -34,17 +39,20 @@ mod water_mirror;
 
 pub use capture::Screenshot;
 
+pub use bolts::{BoltSeg, BOLT_LIGHT, BOLT_TINT};
 #[doc(hidden)]
 pub use entity::draw_offscreen;
 pub use entity::{
     EntityVertex, PlayerInstance, PlayerVertex, FLAME as ENTITY_FLAME, MAX_PLAYERS, PLAYER_SKINS,
 };
+pub use flames::Flame;
 pub use latency::{LowLatencyKind, Marker};
 pub use lights::{
     bounding_sphere, DynKind, DynLight, DynSettings, DynState, DynStats, GoboImage, VoxelBricks,
     GOBO_SIZE, MAX_DYN_LIGHTS, MAX_GOBOS, SHADOW_QUALITY, SHADOW_QUALITY_NAMES,
 };
 pub use overlay::{set_translator, tr, Line, Overlay, Ui};
+pub use rain::{Rain, TOPS_N as RAIN_TOPS_N};
 pub use screen::ScreenAnchor;
 pub use smoke::{SmokeQuality, SmokeVolume};
 pub use viewmodel::{ArmVertex, VmVertex, FLAME, NO_TEXTURE};
@@ -598,6 +606,21 @@ pub struct FrameParams<'a> {
     pub daylight: f32,
     /// Direction vers le soleil (unitaire).
     pub sun: [f32; 3],
+    /// (v216) Direction vers la lune.
+    pub moon: [f32; 3],
+    /// (v216) Météo vue par le ciel : couverture de nuages, pluie, orage, vent.
+    pub weather: sky::SkyWeather,
+    /// (v216) Lueur d'un éclair dans les nuages : côté d'où elle vient (x, z, unitaire) et
+    /// force (0 … 1).
+    pub sky_flash: [f32; 3],
+    /// (v216) Éclairs : segments lumineux dans le monde, et à la première personne (dans la
+    /// main, déjà placés à l'écran).
+    pub bolts: &'a [BoltSeg],
+    pub hand_bolts: &'a [BoltSeg],
+    /// (v216) Pluie.
+    pub rain: Rain<'a>,
+    /// (v216) Flammes du molotov.
+    pub flames: &'a [Flame],
     /// Interface (inventaire, barre d'objets…) dessinée par-dessus tout.
     pub ui: Option<&'a Ui>,
     /// Main et objet tenu (triangles déjà projetés).
@@ -763,6 +786,8 @@ pub struct Renderer {
     queue_depth: usize,
     /// Anticrénelage temporel (TAA), si activé.
     taa: Option<taa::Taa>,
+    /// (v216) Ciel : atmosphère et nuages.
+    sky: sky::Sky,
     world_layout: wgpu::PipelineLayout,
     world_shader: wgpu::ShaderModule,
     surface: wgpu::Surface<'static>,
@@ -822,6 +847,12 @@ pub struct Renderer {
     screen: screen::Screen,
     /// Fumigènes en volume.
     smokes: smoke::Smokes,
+    bolts: bolts::Bolts,
+    rain: rain::RainRenderer,
+    /// (v216) Profondeur du monde pour les éclairs et la pluie dessinés après
+    /// l'anticrénelage.
+    scene_depth: bolts::SceneDepth,
+    flames: flames::Flames,
     voxels: rt::Voxels,
     /// Lumières dynamiques (éditeur de lumières) : ombres, volumétrique, gobos.
     dyn_gpu: lights::DynGpu,
@@ -1029,6 +1060,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let dyn_entries = lights::world_layout_entries();
+        let sky_entries = sky::layout_entries();
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("monde"),
             entries: &[
@@ -1131,6 +1163,16 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // (v216) Ciel (voir `sky::layout_entries`) : image cube de l'atmosphère,
+                // les trois cartes des nuages, leur échantillonneur, et les uniformes du
+                // ciel, à part de ceux du monde (liaisons 16 à 21). Les shaders des entités
+                // les lisent aussi : leur brouillard va vers le même ciel.
+                sky_entries[0],
+                sky_entries[1],
+                sky_entries[2],
+                sky_entries[3],
+                sky_entries[4],
+                sky_entries[5],
             ],
         });
         // Pixel art : agrandissement net, réduction lissée entre les mipmaps.
@@ -1151,6 +1193,7 @@ impl Renderer {
         dyn_gpu.bind_bake(&device, &voxels, &block_view, &block_sampler);
         let mut planar = planar::Planar::new(&device, config.format, (1, 1));
         let mut water_mirror = water_mirror::WaterMirror::new(&device, config.format, (1, 1));
+        let sky = sky::Sky::new(&device, &queue);
         let bind_groups = world_groups(
             &device,
             &bgl,
@@ -1162,6 +1205,7 @@ impl Renderer {
             &dyn_gpu,
             &planar.images[0].view,
             &water_mirror.color,
+            &sky,
         );
         planar.groups = planar_groups(
             &device,
@@ -1173,6 +1217,7 @@ impl Renderer {
             &refl,
             &dyn_gpu,
             &water_mirror.color,
+            &sky,
         );
         water_mirror.group = Some(world_group(
             &device,
@@ -1185,6 +1230,7 @@ impl Renderer {
             &dyn_gpu,
             &planar.images[0].view,
             &water_mirror.dummy,
+            &sky,
         ));
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("main"),
@@ -1277,6 +1323,16 @@ impl Renderer {
         let entities = entity::Entities::new(&device, &bgl, config.format);
         let screen = screen::Screen::new(&device, &bgl, config.format);
         let smokes = smoke::Smokes::new(&device, &queue, &bgl, config.format);
+        let scene_depth = bolts::SceneDepth::new(&device);
+        let bolts = bolts::Bolts::new(&device, &bgl, &scene_depth.layout, config.format);
+        let rain = rain::RainRenderer::new(&device, &bgl, &scene_depth.layout, config.format);
+        let flames = flames::Flames::new(
+            &device,
+            &bgl,
+            &scene_depth.layout,
+            (&sky.noise_view, &sky.noise_sampler),
+            config.format,
+        );
         let indirect = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dessins indirects"),
             size: 20 * 4096,
@@ -1319,6 +1375,7 @@ impl Renderer {
             cave_culling: true,
             async_reflections: false,
             latency,
+            sky,
             ahead: None,
             in_flight: std::collections::VecDeque::new(),
             sent: 0,
@@ -1334,6 +1391,10 @@ impl Renderer {
             entities,
             screen,
             smokes,
+            bolts,
+            rain,
+            scene_depth,
+            flames,
             voxels,
             dyn_gpu,
             lit: None,
@@ -1685,6 +1746,7 @@ impl Renderer {
             &self.dyn_gpu,
             &self.planar.images[0].view,
             &self.water_mirror.color,
+            &self.sky,
         );
         self.planar.groups = planar_groups(
             &self.device,
@@ -1696,6 +1758,7 @@ impl Renderer {
             &self.refl,
             &self.dyn_gpu,
             &self.water_mirror.color,
+            &self.sky,
         );
         self.water_mirror.group = Some(world_group(
             &self.device,
@@ -1708,6 +1771,7 @@ impl Renderer {
             &self.dyn_gpu,
             &self.planar.images[0].view,
             &self.water_mirror.dummy,
+            &self.sky,
         ));
         self.dyn_gpu.rebind = false;
     }
@@ -1911,6 +1975,12 @@ impl Renderer {
         self.torch_swap.is_some() && self.dyn_gpu.active() && self.lit_pipes().is_some()
     }
 
+    /// (v216) Les lumières dynamiques sont-elles dessinées à cette image (il y en a, leurs
+    /// shaders sont prêts) ? Sinon ce qu'on tient garde sa lumière simple.
+    pub fn dyn_lights_drawn(&self) -> bool {
+        self.dyn_gpu.active() && self.lit_pipes().is_some()
+    }
+
     fn torch_swap_uniform(&self) -> [f32; 4] {
         match self.torch_swap {
             Some((c, r)) if self.torch_swap_on() => [c.x, c.y, c.z, r],
@@ -2047,6 +2117,21 @@ impl Renderer {
             self.ahead = self.surface.get_current_texture().ok();
         }
         self.note_stall("l'attente de l'image de la fenêtre", waited);
+    }
+
+    /// (v216) Le ciel de cette image : atmosphère reçue, vent, rangées de nuages à dessiner
+    /// (`sky::Sky::prepare`). Rend les uniformes de l'éclair (position et portée, couleur).
+    fn prepare_sky(&mut self, p: &FrameParams) {
+        let input = sky::SkyInput {
+            eye: p.eye,
+            sun: Vec3::from(p.sun).normalize_or(Vec3::Y),
+            moon: Vec3::from(p.moon).normalize_or(Vec3::NEG_Y),
+            sky_time: p.sky_time,
+            weather: p.weather,
+            flash: p.sky_flash,
+        };
+        self.sky.prepare(&self.queue, &input);
+        self.sky.upload(&self.queue);
     }
 
     /// L'image de la fenêtre où dessiner : celle prise d'avance (`next_frame`), sinon
@@ -2286,6 +2371,7 @@ impl Renderer {
                 &self.overlay,
                 self.world_group(),
                 hand,
+                None,
                 None,
                 None,
             );
@@ -3018,12 +3104,20 @@ impl Renderer {
                 [h[0], h[1], h[2]]
             }),
         );
+        self.prepare_sky(p);
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: [p.eye.x, p.eye.y, p.eye.z, p.time],
             fog: [p.fog_start, p.fog_end, self.aspect(), p.sky_time],
-            sun: [p.sun[0], p.sun[1], p.sun[2], 0.48],
+            // (v216) Sous un ciel couvert, la lumière vient de partout : les faces à
+            // l'ombre sont presque aussi claires que les autres, les ombres s'effacent.
+            sun: [
+                p.sun[0],
+                p.sun[1],
+                p.sun[2],
+                0.48 + 0.4 * overcast(&p.weather),
+            ],
             sel_min,
             sel_max,
             light: [
@@ -3081,6 +3175,12 @@ impl Renderer {
             .prepare_static(&self.device, &self.queue, p.static_entities);
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
+        self.bolts
+            .prepare(&self.device, &self.queue, p.bolts, p.hand_bolts);
+        let fog = self.sky.globals().fog;
+        self.rain
+            .prepare(&self.queue, &p.rain, [fog[0], fog[1], fog[2]]);
+        self.flames.prepare(&self.queue, p.flames);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
         // (v190) Miroirs redessinés (voir `planar`), puis les uniformes de l'image.
         self.entities
@@ -3090,6 +3190,8 @@ impl Renderer {
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        // (v216) Quelques rangées de la carte des nuages (voir `sky`).
+        self.sky.encode(&mut encoder);
         self.encode_mirrors(&mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3124,6 +3226,9 @@ impl Renderer {
                 &mut stats,
             );
             self.smokes.draw(&mut pass, self.world_group(), false);
+            self.flames.draw(&mut pass, self.world_group(), None);
+            self.rain.draw(&mut pass, self.world_group(), None);
+            self.bolts.draw(&mut pass, self.world_group());
         }
         // Main + objet tenu (profondeur à part), puis l'interface.
         {
@@ -3156,6 +3261,7 @@ impl Renderer {
                 hand,
                 None,
                 None,
+                Some(&self.bolts),
             );
         }
         self.capture
@@ -3227,12 +3333,20 @@ impl Renderer {
                 [h[0], h[1], h[2]]
             }),
         );
+        self.prepare_sky(p);
         let globals = Globals {
             view_proj: jittered.to_cols_array_2d(),
             inv_view_proj: jittered.inverse().to_cols_array_2d(),
             cam_pos: [p.eye.x, p.eye.y, p.eye.z, p.time],
             fog: [p.fog_start, p.fog_end, self.aspect(), p.sky_time],
-            sun: [p.sun[0], p.sun[1], p.sun[2], 0.48],
+            // (v216) Sous un ciel couvert, la lumière vient de partout : les faces à
+            // l'ombre sont presque aussi claires que les autres, les ombres s'effacent.
+            sun: [
+                p.sun[0],
+                p.sun[1],
+                p.sun[2],
+                0.48 + 0.4 * overcast(&p.weather),
+            ],
             sel_min,
             sel_max,
             light: [
@@ -3288,6 +3402,12 @@ impl Renderer {
             .prepare_static(&self.device, &self.queue, p.static_entities);
         self.smokes
             .prepare(&self.device, &self.queue, p.smokes, p.eye);
+        self.bolts
+            .prepare(&self.device, &self.queue, p.bolts, p.hand_bolts);
+        let fog = self.sky.globals().fog;
+        self.rain
+            .prepare(&self.queue, &p.rain, [fog[0], fog[1], fog[2]]);
+        self.flames.prepare(&self.queue, p.flames);
         let mut stats = {
             let _c = perf::scope("rendu : tri des chunks");
             self.cull(view_proj, p.eye, p.fog_end)
@@ -3368,6 +3488,8 @@ impl Renderer {
             t.begin();
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        // (v216) Quelques rangées de la carte des nuages (voir `sky`).
+        self.sky.encode(&mut encoder);
         // Cartes d'ombre des lumières dynamiques (seulement celles qui ont changé).
         if let Some(l) = self.lit_pipes().filter(|_| self.dyn_gpu.bake_pending()) {
             let ts = self
@@ -3594,6 +3716,16 @@ impl Renderer {
                 (self.config.width, self.config.height),
             );
         }
+        // (v216) Pluie et éclairs : après l'anticrénelage, sur l'image finale (nets dès la
+        // première image, sans traînée) ; la profondeur du monde dit ce qui les cache.
+        let after = self.rain.any() || self.bolts.any() || self.flames.any();
+        self.scene_depth.prepare(
+            &self.device,
+            taa.targets
+                .as_ref()
+                .filter(|_| after)
+                .map(|t| &t.depth_views[scene_depth]),
+        );
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("écran (TAA)"),
@@ -3622,6 +3754,11 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             taa.present(&mut pass);
+            if let Some(depth) = self.scene_depth.group() {
+                self.flames.draw(&mut pass, self.world_group(), Some(depth));
+                self.rain.draw(&mut pass, self.world_group(), Some(depth));
+                self.bolts.draw_post(&mut pass, self.world_group(), depth);
+            }
             // Bras avec les lumières dynamiques dès qu'il y en a et que leurs shaders sont
             // prêts (sinon comme sans lumières).
             let arm_lit = if self.dyn_gpu.active() {
@@ -3637,6 +3774,7 @@ impl Renderer {
                 hand,
                 arm_lit,
                 Some(&self.underwater),
+                Some(&self.bolts),
             );
         }
         if let Some(t) = &self.gpu_timer {
@@ -3713,6 +3851,7 @@ fn opaque_ranges(mesh: &MeshData) -> Vec<(u8, u8, u32, u32)> {
 
 /// Main et objet tenu, puis l'interface 2D avec ses objets 3D (torches animées) dessinés
 /// à leur place dans l'ordre.
+#[allow(clippy::too_many_arguments)]
 fn draw_hud<'a>(
     pass: &mut wgpu::RenderPass<'a>,
     vm: &'a viewmodel::ViewModel,
@@ -3721,9 +3860,14 @@ fn draw_hud<'a>(
     hand: u32,
     arm_lit: Option<&'a wgpu::RenderPipeline>,
     water: Option<&'a underwater::Underwater>,
+    bolts: Option<&'a bolts::Bolts>,
 ) {
     vm.draw_arm(pass, group, arm_lit);
     vm.draw_range(pass, group, 0..hand);
+    // (v216) L'éclair tenu en main, par-dessus la main.
+    if let Some(b) = bolts {
+        b.draw_hand(pass, group);
+    }
     // (v194) Sous la ligne de l'eau : le monde, la main et le bras bleutés, pas l'interface.
     if let Some(w) = water {
         w.draw(pass);
@@ -3735,6 +3879,12 @@ fn draw_hud<'a>(
         done = *mark;
     }
     overlay.draw_range(pass, done..u32::MAX);
+}
+
+/// (v216) Ciel couvert (0 beau temps … 1 couvert), comme le voit le rendu du ciel.
+fn overcast(w: &sky::SkyWeather) -> f32 {
+    let t = ((w.cover - 0.55) / 0.4).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Lumière de la torche tenue : un peu devant et à droite des yeux.
@@ -3831,6 +3981,7 @@ fn world_groups(
     dyn_gpu: &lights::DynGpu,
     mirrors: &wgpu::TextureView,
     water: &wgpu::TextureView,
+    sky: &sky::Sky,
 ) -> [wgpu::BindGroup; 2] {
     std::array::from_fn(|i| {
         world_group(
@@ -3844,6 +3995,7 @@ fn world_groups(
             dyn_gpu,
             mirrors,
             water,
+            sky,
         )
     })
 }
@@ -3862,6 +4014,7 @@ fn planar_groups(
     refl: &reflections::Reflections,
     dyn_gpu: &lights::DynGpu,
     water: &wgpu::TextureView,
+    sky: &sky::Sky,
 ) -> [Vec<wgpu::BindGroup>; 2] {
     std::array::from_fn(|array| {
         planar.globals[array]
@@ -3878,6 +4031,7 @@ fn planar_groups(
                     dyn_gpu,
                     &planar.images[1 - array].view,
                     water,
+                    sky,
                 )
             })
             .collect()
@@ -3916,6 +4070,7 @@ fn world_group(
     dyn_gpu: &lights::DynGpu,
     mirrors: &wgpu::TextureView,
     water: &wgpu::TextureView,
+    sky: &sky::Sky,
 ) -> wgpu::BindGroup {
     let [d7, d8, d9, d10, d11, d12, d13] = dyn_gpu.bind_entries();
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3964,6 +4119,30 @@ fn world_group(
             wgpu::BindGroupEntry {
                 binding: 15,
                 resource: wgpu::BindingResource::TextureView(water),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: wgpu::BindingResource::TextureView(&sky.cube_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(&sky.map_views[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: wgpu::BindingResource::TextureView(&sky.map_views[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 19,
+                resource: wgpu::BindingResource::TextureView(&sky.map_views[2]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::Sampler(&sky.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: sky.uniform.as_entire_binding(),
             },
         ],
     })
@@ -4279,7 +4458,7 @@ mod tests {
         use wgpu::naga;
         // Nom, source, constantes fixées.
         type Variant = (&'static str, String, &'static [(&'static str, f64)]);
-        let cases: [Variant; 7] = [
+        let cases: [Variant; 12] = [
             (
                 "éclairage différé",
                 lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
@@ -4316,6 +4495,24 @@ mod tests {
                 lights::without_dynlights(include_str!("shaders/world.wgsl")),
                 &[],
             ),
+            // (v216) Ciel, foudre, pluie, flammes, fumée : refusés, on les perdrait.
+            (
+                "nuages",
+                include_str!("shaders/sky_clouds.wgsl").to_string(),
+                &[],
+            ),
+            (
+                "éclairs",
+                include_str!("shaders/bolt.wgsl").to_string(),
+                &[],
+            ),
+            ("pluie", include_str!("shaders/rain.wgsl").to_string(), &[]),
+            (
+                "flammes",
+                include_str!("shaders/flame.wgsl").to_string(),
+                &[],
+            ),
+            ("fumée", include_str!("shaders/smoke.wgsl").to_string(), &[]),
         ];
         for (name, src, constants) in cases {
             let module = naga::front::wgsl::parse_str(&src)
@@ -4405,6 +4602,13 @@ mod tests {
                 "sous l'eau",
                 include_str!("shaders/underwater.wgsl").to_string(),
             ),
+            (
+                "nuages",
+                include_str!("shaders/sky_clouds.wgsl").to_string(),
+            ),
+            ("éclairs", include_str!("shaders/bolt.wgsl").to_string()),
+            ("pluie", include_str!("shaders/rain.wgsl").to_string()),
+            ("flammes", include_str!("shaders/flame.wgsl").to_string()),
         ] {
             let src = src.as_str();
             let module = naga::front::wgsl::parse_str(src)
@@ -4428,7 +4632,9 @@ mod tests {
                     }
                     if let Some(b) = &var.binding {
                         assert!(
-                            !(b.group == 0 && (7..=13).contains(&b.binding)),
+                            !(b.group == 0
+                                && ((7..=13).contains(&b.binding)
+                                    || (16..=21).contains(&b.binding))),
                             "{name} : le sommet {} lit la liaison {} des lumières",
                             ep.name,
                             b.binding

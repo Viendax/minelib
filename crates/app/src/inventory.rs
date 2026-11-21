@@ -32,6 +32,9 @@ pub enum Item {
     /// (v201) Lampe torche : éclaire comme un projecteur, là où l'on regarde (clic droit :
     /// l'allumer ou l'éteindre).
     Flashlight,
+    /// (v216) Foudre de Zeus : un éclair tenu en main (clic gauche : la foudre tombe là où
+    /// l'on vise).
+    Zeus,
 }
 
 impl Item {
@@ -49,6 +52,7 @@ impl Item {
             Item::Screen(n) => 0x3_0000 + u32::from(n.min(3)),
             Item::Head(_) => minelib_world::registry::skull_block(false, 0).0 as u32,
             Item::Flashlight => 0x4_0000,
+            Item::Zeus => 0x5_0000,
         }
     }
 
@@ -69,6 +73,7 @@ impl Item {
                 _ => "skull".into(),
             },
             Item::Flashlight => "lampe_torche".into(),
+            Item::Zeus => "foudre_de_zeus".into(),
         }
     }
 
@@ -88,6 +93,7 @@ impl Item {
         match code {
             0x2_0000 => Some(Item::Wand),
             0x4_0000 => Some(Item::Flashlight),
+            0x5_0000 => Some(Item::Zeus),
             0x3_0000 => Some(Item::Screen(crate::screen::NORMAL)),
             0x3_0001 => Some(Item::Screen(0)),
             0x3_0002 => Some(Item::Screen(2)),
@@ -107,6 +113,7 @@ impl Item {
             Item::Block(b) => capitalize(b.name()),
             Item::Wand => "Baguette de sélection".into(),
             Item::Flashlight => "Lampe torche".into(),
+            Item::Zeus => "Foudre de Zeus".into(),
             Item::Screen(n) => crate::screen::size_name(n).into(),
             Item::Head(n) => crate::heads::skin_of(n).item_name(),
             Item::Torch(None) => "Torche".into(),
@@ -128,9 +135,12 @@ impl Item {
         match self {
             Item::Torch(None) => Some(WOOD_FLAME),
             Item::Torch(Some(i)) => Some(CHEMICALS[i].rgb),
-            Item::Block(_) | Item::Wand | Item::Screen(_) | Item::Head(_) | Item::Flashlight => {
-                None
-            }
+            Item::Block(_)
+            | Item::Wand
+            | Item::Screen(_)
+            | Item::Head(_)
+            | Item::Flashlight
+            | Item::Zeus => None,
         }
     }
 
@@ -170,6 +180,12 @@ impl Item {
                     "Clic droit : la poser au sol (tournée vers soi) ou contre un mur".into(),
                     GREY,
                 ));
+            }
+            Item::Zeus => {
+                lines[0].1 = [170, 205, 255];
+                lines.push(("Un éclair tenu en main".into(), WHITE));
+                lines.push(("Clic gauche : la foudre tombe là où tu vises".into(), WHITE));
+                lines.push(("Elle blesse comme la foudre du ciel".into(), GREY));
             }
             Item::Flashlight => {
                 lines.push(("Éclaire comme un projecteur, où tu regardes".into(), WHITE));
@@ -494,6 +510,7 @@ pub fn catalogue() -> &'static [(Item, usize)] {
         let mut items: Vec<(Item, usize)> = blocks.into_iter().map(|(t, _, it)| (it, t)).collect();
         items.push((Item::Wand, 6));
         items.push((Item::Flashlight, 6));
+        items.push((Item::Zeus, 6));
         items.extend((0..crate::screen::SIZES.len() as u8).map(|n| (Item::Screen(n), 6)));
         items.push((Item::Torch(None), 6));
         items.extend((0..CHEMICALS.len()).map(|i| (Item::Torch(Some(i)), 6)));
@@ -777,6 +794,9 @@ impl Inventory {
                         Item::Head(_) => "tete skull head".contains(&q),
                         Item::Flashlight => {
                             "lampe torche flashlight lumiere projecteur".contains(&q)
+                        }
+                        Item::Zeus => {
+                            "foudre de zeus eclair lightning thunder tonnerre thor".contains(&q)
                         }
                     }
                 }
@@ -1496,6 +1516,12 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
         Item::Wand => crate::wand::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s),
         // (v201) Lampe torche : son modèle en 3D, verre allumé.
         Item::Flashlight => ui.model(crate::flashlight::icon(
+            x + slot / 2.0,
+            y + slot / 2.0,
+            15.0 * s,
+        )),
+        // (v216) Foudre de Zeus : un éclair.
+        Item::Zeus => ui.model(crate::hand::zeus_icon(
             x + slot / 2.0,
             y + slot / 2.0,
             15.0 * s,

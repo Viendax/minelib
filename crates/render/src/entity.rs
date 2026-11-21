@@ -144,25 +144,20 @@ pub const PLAYER_SKINS: u32 = 64;
 /// Sommets au plus du modèle commun (six pavés : 216).
 const MESH_MAX: usize = 512;
 
-/// (v215) Le ciel des blocs (`sky_color` de world.wgsl et ce qu'il lit), recopié tel quel à
-/// l'assemblage : le brouillard des entités et des joueurs va vers la même couleur que
-/// celui des blocs, sans un second ciel à tenir à jour.
+/// (v215) Le ciel des blocs, recopié tel quel à l'assemblage : le brouillard des entités
+/// et des joueurs va vers le même ciel que celui des blocs, sans un second ciel à tenir à
+/// jour. (v216) C'est le bloc « CIEL » de world.wgsl, entre ses deux repères : l'atmosphère,
+/// le soleil, la lune, les étoiles et les nuages (`sky_shade`), avec leurs liaisons.
 pub(crate) fn sky_wgsl() -> String {
     let src = include_str!("shaders/world.wgsl");
-    let mut out = String::new();
-    for start in ["const HORIZON", "const ZENITH", "fn lin(", "fn sky_color("] {
-        let at = src
-            .find(start)
-            .unwrap_or_else(|| panic!("world.wgsl : « {start} » introuvable"));
-        let rest = &src[at..];
-        let len = if start.starts_with("const") {
-            rest.find('\n').map(|e| e + 1)
-        } else {
-            rest.find("\n}\n").map(|e| e + 3)
-        };
-        out.push_str(&rest[..len.unwrap_or(rest.len())]);
-    }
-    out
+    let (from, to) = ("// CIEL : DÉBUT", "// CIEL : FIN");
+    let a = src
+        .find(from)
+        .unwrap_or_else(|| panic!("world.wgsl : « {from} » introuvable"));
+    let b = src
+        .find(to)
+        .unwrap_or_else(|| panic!("world.wgsl : « {to} » introuvable"));
+    src[a..b].to_string()
 }
 
 /// (v215) Shader des entités (entity.wgsl), avec le ciel de leur brouillard.
@@ -834,7 +829,9 @@ pub fn draw_offscreen(
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
     // Ce que lisent les entités et les joueurs des uniformes du monde : la caméra, et les
-    // images des blocs (ici une seule, vide).
+    // images des blocs (ici une seule, vide). (v216) Et le ciel de leur brouillard (liaisons
+    // 16 à 21, ici vides : le brouillard est nul ou le même dans les deux images).
+    let sky_entries = crate::sky::layout_entries();
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[
@@ -864,6 +861,12 @@ pub fn draw_offscreen(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            sky_entries[0],
+            sky_entries[1],
+            sky_entries[2],
+            sky_entries[3],
+            sky_entries[4],
+            sky_entries[5],
         ],
     });
     let globals = device.create_buffer(&wgpu::BufferDescriptor {
@@ -894,6 +897,39 @@ pub fn draw_offscreen(
         ..Default::default()
     });
     let sampler = device.create_sampler(&Default::default());
+    // Le ciel : une image cube et une carte des nuages d'un pixel, des uniformes à zéro.
+    let empty = |layers: u32| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    };
+    let sky_cube = empty(6).create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::Cube),
+        ..Default::default()
+    });
+    let sky_map = empty(1).create_view(&Default::default());
+    let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let sky_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: std::mem::size_of::<crate::sky::SkyGlobals>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM,
+        mapped_at_creation: false,
+    });
     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &bgl,
@@ -909,6 +945,30 @@ pub fn draw_offscreen(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: wgpu::BindingResource::TextureView(&sky_cube),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(&sky_map),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: wgpu::BindingResource::TextureView(&sky_map),
+            },
+            wgpu::BindGroupEntry {
+                binding: 19,
+                resource: wgpu::BindingResource::TextureView(&sky_map),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::Sampler(&sky_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: sky_uniform.as_entire_binding(),
             },
         ],
     });

@@ -346,6 +346,8 @@ pub enum Held {
     Gear(u8),
     /// (v201) Lampe torche (allumée ou non), pointée où l'on regarde.
     Flashlight(bool),
+    /// (v216) Foudre de Zeus : rien de solide (l'éclair est dessiné à part, voir `storm`).
+    Zeus,
 }
 
 /// (v177) Arme à feu en main : les deux bras se tendent vers le regard (`aims`).
@@ -843,8 +845,8 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
             [0.75, 9.0, 0.75],
             RayBoxKind::Flat(c),
         )],
-        // (v177) En triangles : `emit_gear`.
-        Held::Gear(_) => Vec::new(),
+        // (v177) En triangles : `emit_gear`. (v216) Foudre de Zeus : pas de pavés.
+        Held::Gear(_) | Held::Zeus => Vec::new(),
         // (v201) Lampe torche : dans le poing, pointée droit devant (−z), verre au bout.
         Held::Flashlight(on) => {
             let frame = flashlight_frame(pose, hand);
@@ -864,6 +866,19 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
                 .collect()
         }
     }
+}
+
+/// (v216) Repère de la Foudre de Zeus tenue par le modèle (blocs → monde) : le poing à
+/// l'origine, l'éclair le long de +y, tenu comme à la première personne par rapport au
+/// regard. `None` sans bras droit.
+pub fn zeus_frame(pose: &Pose) -> Option<Mat4> {
+    let at = hand_frame(pose)?.transform_point3(Vec3::new(0.0, 0.0, -2.0));
+    Some(
+        Mat4::from_translation(at)
+            * Mat4::from_rotation_y(-pose.yaw)
+            * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4))
+            * crate::hand::zeus_rotation(),
+    )
 }
 
 /// Position (monde) de la flamme d'une torche tenue en main : la lumière part de là.

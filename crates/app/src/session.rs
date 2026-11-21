@@ -108,6 +108,7 @@ struct StopMeas {
 pub struct Session {
     /// Essais : temps avant la prochaine fumigène de MINELIB_SMOKE.
     test_smoke_timer: f32,
+    test_fire_timer: f32,
     /// Objets au sol encore en vol (lancés en cloche) : temps depuis leur apparition.
     ground_fly: std::collections::HashMap<u32, f32>,
     ground_seen: std::collections::HashSet<u32>,
@@ -201,6 +202,17 @@ pub struct Session {
     fps_time: Option<Option<f32>>,
     /// Direction vers le soleil.
     sun: [f32; 3],
+    /// (v216) Direction vers la lune, et son âge (jours depuis la pleine lune, 0 … 8).
+    moon: [f32; 3],
+    moon_age: f32,
+    /// (v216) Météo, foudre, pluie, Foudre de Zeus tenue en main.
+    storm: crate::storm::Storm,
+    /// (v216) Lumière du jour montrée : celle de l'heure (`daylight`), moins sous un ciel
+    /// couvert, plus l'éclat d'un éclair.
+    daylight_shown: f32,
+    /// (v216) `/thor` sur un serveur de construction : la demande « suis-je OP ? » en
+    /// route, et le point visé.
+    thor_probe: Option<(std::time::Instant, Vec3)>,
     daylight: f32,
     break_cooldown: f32,
     place_cooldown: f32,
@@ -484,7 +496,29 @@ impl Session {
             player.flying = false;
         }
         let spawn = player.pos;
-        let time_h = if std::env::var("MINELIB_NIGHT").is_ok_and(|v| v.trim() == "1") {
+        // (v216) Météo du monde. MINELIB_METEO=clear|rain|storm : imposée et figée (essais).
+        let mut storm = crate::storm::Storm::new(u64::from(world.seed));
+        storm.weather.load(&data.weather);
+        if let Some(k) = std::env::var("MINELIB_METEO")
+            .ok()
+            .and_then(|v| crate::weather::Kind::parse(v.trim()))
+        {
+            storm.weather.fix(true);
+            storm.weather.force(k);
+        }
+        // (v216) MINELIB_LUNE=<jours> : âge de la lune au départ (essais du ciel).
+        let test_moon = std::env::var("MINELIB_LUNE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .map_or(0.0, |a| a.rem_euclid(crate::daytime::MOON_DAYS));
+        // (v216) MINELIB_HEURE=<h> : commencer à cette heure, arrêtée (essais du ciel).
+        let test_hour = std::env::var("MINELIB_HEURE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .map(|h| h.rem_euclid(24.0));
+        let time_h = if let Some(h) = test_hour {
+            h
+        } else if std::env::var("MINELIB_NIGHT").is_ok_and(|v| v.trim() == "1") {
             0.0
         } else {
             data.time
@@ -496,6 +530,7 @@ impl Session {
         log::info!("monde « {} » (graine {})", data.meta.name, data.meta.seed);
         Ok(Self {
             test_smoke_timer: 0.0,
+            test_fire_timer: 0.0,
             stride: 0.0,
             fall_top: None,
             step_offset: 0.0,
@@ -546,9 +581,14 @@ impl Session {
             ladders: HashMap::new(),
             inventory: data.inventory.unwrap_or_else(Inventory::starter),
             time_h,
-            time_fixed: data.time_fixed,
+            time_fixed: data.time_fixed || test_hour.is_some(),
             fps_time: None,
             sun: crate::daytime::sun_dir(time_h),
+            moon: crate::daytime::moon_dir(time_h, test_moon),
+            moon_age: test_moon,
+            storm,
+            daylight_shown: crate::daytime::daylight(time_h),
+            thor_probe: None,
             daylight: crate::daytime::daylight(time_h),
             break_cooldown: 0.0,
             place_cooldown: 0.0,
@@ -755,6 +795,7 @@ impl Session {
             clock: self.world.clock,
             time: self.time_h,
             time_fixed: self.time_fixed,
+            weather: self.storm.weather.save(),
             inventory: Some(inv),
         };
         // Objets au sol et coffres : en solo, ou chez le propriétaire d'un monde en ligne.
@@ -792,6 +833,7 @@ impl Session {
             clock: self.world.clock,
             time: self.time_h,
             time_fixed: self.time_fixed,
+            weather: self.storm.weather.save(),
             inventory: None,
         };
         save::save_world(&dir, &data, &self.world)?;
@@ -1757,6 +1799,11 @@ impl Session {
             self.streamer
                 .remesh_now(&self.world, &mut self.workers, pos);
         }
+        // (v216) Météo, foudre, pluie, Foudre de Zeus tenue.
+        {
+            let _s = perf::scope("météo et foudre");
+            self.update_storm(dt);
+        }
         // Lumières de l'éditeur : lumières automatiques, enregistrement, envoi au rendu
         // (avant la grille de blocs : leurs ombres en ont besoin).
         {
@@ -1777,10 +1824,19 @@ impl Session {
             // (v201) Lampe torche allumée en main, ou torche tenue avec les torches en
             // lumières ponctuelles : la première (sa carte d'ombre, à refaire dès qu'on
             // bouge, passe avant celles des autres).
-            if let Some(l) = self.flashlight_light().or_else(|| self.held_torch_light()) {
+            // (v216) De même la Foudre de Zeus tenue ; et les coups de foudre proches
+            // éclairent le sol et les murs autour d'eux.
+            if let Some(l) = self
+                .flashlight_light()
+                .or_else(|| self.held_torch_light())
+                .or_else(|| self.zeus_light())
+            {
                 list.insert(0, l);
-                list.truncate(minelib_render::MAX_DYN_LIGHTS);
             }
+            if allowed {
+                self.storm.lights(cam, &mut list);
+            }
+            list.truncate(minelib_render::MAX_DYN_LIGHTS);
             renderer.set_dyn_lights(&list, &self.lights.settings.render);
             self.shadow_lights.clear();
             self.shadow_lights.extend(
@@ -2665,6 +2721,18 @@ impl Session {
             }
             return;
         }
+        // (v216) Foudre de Zeus tenue : clic gauche, la foudre tombe là où l'on vise, comme
+        // avec /thor (rien n'est cassé, même en créatif).
+        if self.inventory.selected_item() == Some(Item::Zeus) && keys.held(input, Action::Attack) {
+            if keys.pressed(input, Action::Attack) && self.storm.cooldown <= 0.0 {
+                if let Some(pos) = self.aimed_point() {
+                    self.storm.strike(pos);
+                    self.storm.cooldown = crate::storm::ZEUS_COOLDOWN;
+                    self.say_lightning_is_local();
+                }
+            }
+            return;
+        }
         // (v215) Lampe torche tenue : le clic droit n'allume plus rien (c'est le clic
         // molette) ; il ouvre les portes, trappes et coffres comme d'habitude.
         let Some(hit) = hit else { return };
@@ -3252,6 +3320,231 @@ impl Session {
         Some(crate::lights::held_torch(tip, rgb, &self.lights.settings))
     }
 
+    /// (v216) La Foudre de Zeus est-elle en main ?
+    fn holding_zeus(&self) -> bool {
+        self.held_item() == Some(Item::Zeus)
+            && self.spectating.is_none()
+            && self.game.mode != GameMode::Spectator
+    }
+
+    /// (v216) Lumière de la Foudre de Zeus tenue : au poing, avec les ombres (celle du
+    /// joueur comprise, sauf sa main), scintillante comme l'éclair.
+    fn zeus_light(&self) -> Option<minelib_render::DynLight> {
+        if !self.holding_zeus() || !self.lights_allowed() {
+            return None;
+        }
+        let third = if self.game.mode == GameMode::Fps {
+            0
+        } else {
+            self.perspective
+        };
+        let pose = self.own_pose(crate::player_model::Held::Zeus);
+        let grip = (third != 0)
+            .then(|| crate::player_model::zeus_frame(&pose))
+            .flatten()
+            .map_or_else(
+                || crate::flashlight::lens_position(self.player.eye(), self.player.look_dir()),
+                |m| m.transform_point3(Vec3::ZERO),
+            );
+        Some(self.storm.held_light(grip))
+    }
+
+    /// (v216) Météo, foudre et pluie de l'image, et la Foudre de Zeus tenue en main.
+    fn update_storm(&mut self, dt: f32) {
+        let fps = self.game.mode == GameMode::Fps;
+        // Pas de météo sur les cartes FPS, ni à l'heure « par défaut » (soleil immobile).
+        let active = !fps && self.time_h >= 0.0;
+        let eye = self.camera_pos();
+        let hurt = self.storm.update(
+            dt,
+            &crate::storm::Frame {
+                world: &self.world,
+                feet: self.player.pos,
+                eye,
+                active,
+                online: self.build.is_some(),
+                covered: covered_above(&self.world, eye),
+            },
+        );
+        if hurt > 0 {
+            self.damage(hurt);
+        }
+        // Essais : MINELIB_ZEUS=1 (la Foudre de Zeus en main à l'arrivée), MINELIB_THOR=<s>
+        // (la foudre tombe là où l'on regarde, toutes les <s> secondes).
+        static TESTS: std::sync::OnceLock<(bool, Option<f32>)> = std::sync::OnceLock::new();
+        let (zeus, thor) = *TESTS.get_or_init(|| {
+            (
+                std::env::var("MINELIB_ZEUS").is_ok_and(|v| v.trim() == "1"),
+                std::env::var("MINELIB_THOR")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .filter(|s| *s > 0.0),
+            )
+        });
+        if zeus && !std::mem::replace(&mut self.storm.test_given, true) {
+            self.inventory.slots[self.inventory.selected] = Some(inventory::Stack {
+                item: Item::Zeus,
+                count: 1,
+            });
+        }
+        if let Some(every) = thor {
+            self.storm.test_in -= dt;
+            if self.storm.test_in <= 0.0 {
+                self.storm.test_in = every;
+                if let Some(p) = self.aimed_point() {
+                    self.storm.strike(p);
+                }
+            }
+        }
+        // L'éclair tenu : à la première personne, dessiné par-dessus la main (avec la
+        // projection de la main) ; vu de derrière (F5, caméra libre), dans le monde, au
+        // poing du modèle.
+        let on = self.holding_zeus();
+        let third = if fps { 0 } else { self.perspective };
+        if third == 0 && self.light_editor.free_cam.is_none() {
+            let (_, view, _) = self.view_camera();
+            let aspect = self.screen_size.0 / self.screen_size.1.max(1.0);
+            let proj = crate::hand::hand_proj(aspect);
+            let frame = self.hand.zeus_frame();
+            self.storm.hold(
+                dt,
+                view.inverse() * frame,
+                Some((proj * frame, proj * view)),
+                on,
+            );
+        } else {
+            let pose = self.own_pose(crate::player_model::Held::Zeus);
+            let place = crate::player_model::zeus_frame(&pose)
+                .unwrap_or_else(|| Mat4::from_translation(self.player.eye()));
+            self.storm.hold(dt, place, None, on);
+        }
+        // Lumière du jour montrée : moins sous un ciel couvert, plus l'éclat des éclairs.
+        self.daylight_shown =
+            (self.daylight * self.storm.light() + self.storm.flash * 1.5).min(2.2);
+    }
+
+    /// (v216) Point que vise le regard, pour la foudre : sur le premier bloc touché à
+    /// moins de 256 blocs ; sinon sur le sol, 120 blocs plus loin dans la direction du
+    /// regard (`None` : rien de chargé là-bas).
+    fn aimed_point(&self) -> Option<Vec3> {
+        let (eye, dir) = (self.player.eye(), self.player.look_dir());
+        if let Some(h) = raycast(
+            &self.world,
+            eye.into(),
+            dir.into(),
+            crate::storm::THOR_RANGE,
+        ) {
+            return Some(eye + dir * h.distance);
+        }
+        let flat = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
+        let p = eye + flat * 120.0;
+        let (x, z) = (p.x.floor() as i32, p.z.floor() as i32);
+        crate::storm::column_top(&self.world, x, z)
+            .map(|top| Vec3::new(x as f32 + 0.5, (top + 1) as f32, z as f32 + 0.5))
+    }
+
+    /// (v216) `/thor` : la foudre tombe là où l'on vise. En solo, celui qui joue ; sur un
+    /// serveur de construction, les OP (le relais dit qui l'est, comme pour l'éditeur de
+    /// lumières).
+    fn thor_command(&mut self) {
+        if self.game.mode == GameMode::Fps {
+            self.chat.say("Pas de foudre en partie FPS.", chat::RED);
+            return;
+        }
+        let Some(pos) = self.aimed_point() else {
+            self.chat.say("Rien à viser par là.", chat::RED);
+            return;
+        };
+        if self.build.is_some() {
+            // Déjà demandé (réponse en route) : pas une deuxième fois.
+            if self
+                .thor_probe
+                .is_some_and(|(t, _)| t.elapsed().as_secs_f32() < 5.0)
+            {
+                return;
+            }
+            self.thor_probe = Some((std::time::Instant::now(), pos));
+            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                action: minelib_net::proto::SERVER_LIST,
+                pseudo: String::new(),
+                reason: String::new(),
+            });
+            return;
+        }
+        self.storm.strike(pos);
+    }
+
+    /// (v216) En ligne, la foudre qu'on lance n'est pas encore envoyée aux autres joueurs :
+    /// dit une fois.
+    fn say_lightning_is_local(&mut self) {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.build.is_some() && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.chat.say(
+                "En ligne, ta foudre n'est pas encore montrée aux autres joueurs.",
+                chat::GREY,
+            );
+        }
+    }
+
+    /// (v216) `/weather` : le temps qu'il fait ; `/weather clear|rain|storm` : un temps
+    /// imposé (il arrive peu à peu : les nuages, puis la pluie, puis l'orage) pour une
+    /// durée ordinaire ; `/weather fix [on|off]` : le temps ne change plus tout seul.
+    fn weather_command(&mut self, arg: Option<&str>, next: Option<&str>) {
+        use crate::weather::Kind;
+        if self.game.mode == GameMode::Fps || self.time_h < 0.0 {
+            self.chat.say("Pas de météo sur les cartes FPS.", chat::RED);
+            return;
+        }
+        let local = if self.build.is_some() {
+            " (chez toi : la météo imposée n'est pas encore partagée en ligne)"
+        } else {
+            ""
+        };
+        let w = &mut self.storm.weather;
+        let text = match arg.map(str::to_lowercase).as_deref() {
+            None => format!(
+                "Météo : {}{}. /weather clear|rain|storm, /weather fix [on|off]",
+                w.kind().label(),
+                if w.fixed { " (figée)" } else { "" }
+            ),
+            Some("fix" | "fixe" | "fige" | "figer" | "figée" | "lock") => {
+                let on = match next.map(str::to_lowercase).as_deref() {
+                    Some("on" | "oui" | "true" | "1") => true,
+                    Some("off" | "non" | "false" | "0") => false,
+                    _ => !w.fixed,
+                };
+                w.fix(on);
+                if on {
+                    format!("Météo figée : {}{local}.", w.kind().label())
+                } else {
+                    format!("La météo change de nouveau toute seule{local}.")
+                }
+            }
+            Some(word) => match Kind::parse(word) {
+                Some(k) => {
+                    w.force(k);
+                    let what = match k {
+                        Kind::Clear => "Le ciel se dégage",
+                        Kind::Rain => "La pluie arrive",
+                        Kind::Storm => "L'orage arrive",
+                    };
+                    format!(
+                        "{what}{}{local}.",
+                        if w.fixed { " (météo figée)" } else { "" }
+                    )
+                }
+                None => {
+                    self.chat.say(
+                        "Usage : /weather clear|rain|storm, /weather fix [on|off]",
+                        chat::RED,
+                    );
+                    return;
+                }
+            },
+        };
+        self.chat.say(text, chat::YELLOW);
+    }
+
     /// (v201) Pose du joueur qui tient `held`, pour placer la lumière de ce qu'il tient.
     fn own_pose(&self, held: crate::player_model::Held) -> crate::player_model::Pose {
         crate::player_model::Pose {
@@ -3296,6 +3589,19 @@ impl Session {
     /// Réponse du relais à la demande de `open_light_editor` (`op` : on est OP du serveur).
     /// Renvoie vrai si c'était bien elle (son texte n'est alors pas affiché tel quel).
     pub fn light_op_answer(&mut self, op: bool) -> bool {
+        // (v216) La même demande sert à `/thor` : la foudre est réservée aux OP du serveur.
+        if let Some((asked, pos)) = self.thor_probe.take() {
+            if asked.elapsed().as_secs_f32() <= 10.0 {
+                if op {
+                    self.storm.strike(pos);
+                    self.say_lightning_is_local();
+                } else {
+                    self.chat
+                        .say("/thor : réservé aux OP de ce serveur.", chat::RED);
+                }
+                return true;
+            }
+        }
         let Some(asked) = self.light_op_probe.take() else {
             return false;
         };
@@ -3397,7 +3703,7 @@ impl Session {
 
     /// Éclairage approximatif de la main : ciel (abrité ou non), jour/nuit, torche tenue.
     fn light_at_player(&self, held: Option<Item>) -> [f32; 3] {
-        let mut l = sky_light(&self.world, self.player.eye(), self.daylight);
+        let mut l = sky_light(&self.world, self.player.eye(), self.daylight_shown);
         if let Some(Item::Torch(_)) = held {
             for (c, w) in l.iter_mut().zip([1.0, 0.78, 0.5]) {
                 *c = c.max(w);
@@ -4325,10 +4631,12 @@ impl Session {
             match t {
                 Some(h) => {
                     self.sun = daytime::sun_dir(h);
+                    self.moon = daytime::moon_dir(h, 0.0);
                     self.daylight = daytime::daylight(h);
                 }
                 None => {
                     self.sun = daytime::dust2_sun();
+                    self.moon = daytime::moon_opposite(self.sun);
                     self.daylight = 1.0;
                 }
             }
@@ -4337,6 +4645,7 @@ impl Session {
         // Heure « par défaut » : le soleil de Dust2, immobile.
         if self.time_h < 0.0 {
             self.sun = daytime::dust2_sun();
+            self.moon = daytime::moon_opposite(self.sun);
             self.daylight = 1.0;
             return;
         }
@@ -4344,8 +4653,11 @@ impl Session {
             self.time_h = daytime::advance(self.time_h, dt);
             // Le ciel ne bouge (nuages) que si l'heure avance.
             self.sky_clock += dt;
+            // (v216) La lune prend un jour de retard par jour : un cycle en huit jours.
+            self.moon_age = (self.moon_age + dt / daytime::DAY_S).rem_euclid(daytime::MOON_DAYS);
         }
         self.sun = daytime::sun_dir(self.time_h);
+        self.moon = daytime::moon_dir(self.time_h, self.moon_age);
         self.daylight = daytime::daylight(self.time_h);
     }
 
@@ -4497,6 +4809,20 @@ impl Session {
                 self.test_smoke_timer = 6.0 - 18.0;
                 self.fps
                     .spawn_test_smoke(Vec3::new(v[0], v[1], v[2]), &self.world);
+            }
+        }
+        // (v216) De même MINELIB_FEU=<distance> : un feu de molotov devant soi, 4 s après
+        // le départ, puis toutes les 9 s.
+        if let Some(d) = std::env::var("MINELIB_FEU")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+        {
+            self.test_fire_timer += dt;
+            if self.test_fire_timer > 4.0 {
+                self.test_fire_timer = 4.0 - 9.0;
+                let (sy, cy) = self.player.yaw.sin_cos();
+                let p = eye + Vec3::new(sy, 0.0, -cy) * d;
+                self.fps.spawn_test_fire(p, &self.world);
             }
         }
         self.fps
@@ -5538,6 +5864,15 @@ impl Session {
                         self.chat
                             .say(format!("{count} torche(s) données."), chat::YELLOW);
                     }
+                    // (v216) Foudre de Zeus (« /give foudre », « /give zeus »).
+                    _ if matches!(
+                        want.as_str(),
+                        "foudre" | "foudre_de_zeus" | "zeus" | "eclair" | "éclair" | "lightning"
+                    ) =>
+                    {
+                        self.inventory.add(Item::Zeus, 1);
+                        self.chat.say("Foudre de Zeus donnée.", chat::YELLOW);
+                    }
                     // (v201) Lampe torche (« /give lampe torche » aussi) : une seule, sauf
                     // nombre donné.
                     _ if matches!(
@@ -5563,6 +5898,13 @@ impl Session {
                     ),
                 }
             }
+            // (v216) Météo : /weather clear|rain|storm, /weather fix [on|off].
+            "weather" | "meteo" | "météo" => {
+                let next = parts.next();
+                self.weather_command(arg, next);
+            }
+            // (v216) La foudre tombe là où l'on vise.
+            "thor" | "foudre" => self.thor_command(),
             // Heure du jour (sur un serveur de construction : OP, pour tout le monde).
             "timeset" | "heure" => {
                 let default = matches!(
@@ -5707,6 +6049,8 @@ impl Session {
                     "/worldname <nom> : renomme le monde",
                     "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
                     "/timefix on|off : arrête ou relance le temps",
+                    "/weather clear|rain|storm : le temps qu'il fait ; /weather fix [on|off] : le fige",
+                    "/thor : la foudre tombe là où tu vises ; /give foudre : la Foudre de Zeus",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
                     "/give petit_ecran | grand_ecran | ecran_geant : les autres tailles d'écran",
                     "/give tête <pseudo> [nombre] : la tête d'un joueur, avec son skin",
@@ -7045,6 +7389,7 @@ impl Session {
                 Some(Item::Screen(_)) => Some(Held::Wand([30, 30, 36])),
                 // (v201) Lampe torche, verre allumé ou non.
                 Some(Item::Flashlight) => Some(Held::Flashlight(self.flashlight_on)),
+                Some(Item::Zeus) => Some(Held::Zeus),
                 // Tête tenue (vue en 3e personne) : comme le bloc « tête ».
                 Some(Item::Head(_)) => {
                     Some(Held::Block(minelib_world::registry::skull_block(false, 0)))
@@ -7083,7 +7428,10 @@ impl Session {
             let mut own = crate::player_model::shadow_boxes(&pose);
             // (v201) Sa lampe torche n'a pas l'ombre de son bras ni de sa tête. (v202) Sa
             // torche tenue, seulement pas celle du morceau tout contre la flamme (sa main).
-            let flame = self.held_torch_light().map(|l| Vec3::from(l.pos));
+            let flame = self
+                .held_torch_light()
+                .or_else(|| self.zeus_light())
+                .map(|l| Vec3::from(l.pos));
             for b in &mut own {
                 b.owner = crate::flashlight::HOLDER;
                 if flame.is_some_and(|f| near_box(b, f, 0.2)) {
@@ -7132,7 +7480,7 @@ impl Session {
                     walk: w.phase,
                     swing: w.amp,
                     crouch: v.crouch,
-                    light: sky_light(&self.world, eye_of(v.pos, v.crouch), self.daylight),
+                    light: sky_light(&self.world, eye_of(v.pos, v.crouch), self.daylight_shown),
                     held,
                     // (v177) Les bots aussi ont un skin, dessiné pour eux.
                     skin: self.skins.in_match(&v.pseudo, v.team),
@@ -7169,7 +7517,7 @@ impl Session {
                 }
                 let nade = crate::cs::nade_code(g.weapon);
                 // (v172) Éclairés là où ils sont, comme les joueurs.
-                let light = sky_light(&self.world, pos, self.daylight);
+                let light = sky_light(&self.world, pos, self.daylight_shown);
                 if far > 24.0 && fly.is_none() {
                     let len = crate::weapons::WEAPONS
                         .get(g.weapon as usize)
@@ -7202,7 +7550,7 @@ impl Session {
                     Some((from, to, t)) if hud.bomb == bomb::DROPPED => toss_arc(from, to, t),
                     _ => Vec3::from(hud.bomb_pos),
                 };
-                let light = sky_light(&self.world, at, self.daylight);
+                let light = sky_light(&self.world, at, self.daylight_shown);
                 model.extend(crate::player_model::bomb(at, blink, light));
             }
         }
@@ -7280,8 +7628,10 @@ impl Session {
                     swing: w.map_or(0.0, |w| w.amp),
                     crouch: o.crouch,
                     light: match o.covered {
-                        Some(c) => sky_light_covered(c, self.daylight),
-                        None => sky_light(&self.world, eye_of(o.pos, o.crouch), self.daylight),
+                        Some(c) => sky_light_covered(c, self.daylight_shown),
+                        None => {
+                            sky_light(&self.world, eye_of(o.pos, o.crouch), self.daylight_shown)
+                        }
                     },
                     held: None,
                     skin: o.skin.clone(),
@@ -7318,7 +7668,7 @@ impl Session {
         // Objets au sol : ils flottent et tournent. (v185) Leur vrai modèle, éclairés comme
         // les joueurs (lumière du ciel à leur place).
         if self.game.mode != GameMode::Fps {
-            let (world, daylight) = (&self.world, self.daylight);
+            let (world, daylight) = (&self.world, self.daylight_shown);
             self.items
                 .build(cam, &|p| sky_light(world, p, daylight), &mut model);
         }
@@ -7462,6 +7812,7 @@ impl Session {
             Vec::new()
         };
         let smokes = self.fps.smoke_volumes();
+        let flames = self.fps.flames();
         // Têtes (par zone) et cadres des cartes importées.
         let mut statics = self
             .heads
@@ -7527,7 +7878,8 @@ impl Session {
             fov_y: fov.to_radians(),
             // (v215) Bande de brouillard au bord de la distance de vue deux fois plus
             // étroite (avant : de 45 % à 100 % de la distance, maintenant de 72,5 %).
-            fog_start: fog_end * 0.725,
+            // (v216) Sous la pluie, le lointain se voile de plus près.
+            fog_start: fog_end * 0.725 * self.storm.visibility().powi(2),
             fog_end,
             held_light: match self.inventory.selected_item() {
                 // (v201) Torches en lumières ponctuelles : la torche tenue a la sienne.
@@ -7539,6 +7891,11 @@ impl Session {
                         .and_then(|i| minelib_world::flame::CHEMICALS.get(i))
                         .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb);
                     Some((rgb, 10.0))
+                }
+                // (v216) Foudre de Zeus : sa lumière simple, tant que les lumières
+                // dynamiques ne sont pas dessinées (sinon c'est la sienne, avec ombres).
+                Some(Item::Zeus) if self.holding_zeus() && !renderer.dyn_lights_drawn() => {
+                    Some(([170, 205, 255], 11.0))
                 }
                 _ => None,
             },
@@ -7562,8 +7919,15 @@ impl Session {
             },
             time,
             sky_time: self.sky_clock,
-            daylight: self.daylight,
+            daylight: self.daylight_shown,
             sun: self.sun,
+            moon: self.moon,
+            weather: self.storm.sky(),
+            sky_flash: self.storm.sky_flash,
+            bolts: &self.storm.bolts,
+            hand_bolts: &self.storm.hand_bolts,
+            rain: self.storm.rain(self.daylight_shown.min(1.0)),
+            flames: &flames,
             ui: Some(ui),
             overlay: show_debug.then_some(&self.overlay),
             mirror_self,

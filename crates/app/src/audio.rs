@@ -320,6 +320,11 @@ struct Cmd {
     voice: Option<(u64, Vec<i16>)>,
     /// La sortie son choisie a changé : elle est rouverte.
     reopen: bool,
+    /// (v216) Son calculé (tonnerre) : échantillons mono et leur cadence, au lieu d'un
+    /// fichier.
+    pcm: Option<(Vec<i16>, u32)>,
+    /// (v216) Volume de la pluie (son de fond en boucle ; 0 : silence).
+    rain: Option<f32>,
 }
 
 /// (v215) Volume du jeu (Paramètres → Son), à part du volume de chaque son : changé, il
@@ -347,6 +352,8 @@ pub fn set_master(v: f32) {
                 delay: 0.0,
                 voice: None,
                 reopen: false,
+                pcm: None,
+                rain: None,
             });
         }
     }
@@ -386,6 +393,8 @@ pub fn set_output(name: &str) {
                 delay: 0.0,
                 voice: None,
                 reopen: true,
+                pcm: None,
+                rain: None,
             });
         }
     }
@@ -447,11 +456,15 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                 let mut sinks: Vec<(Sink, f32)> = Vec::new();
                 // Une file par joueur qui parle.
                 let mut voices: HashMap<u64, Sink> = HashMap::new();
+                // (v216) La pluie : une boucle, créée à la première averse, et son volume
+                // propre (sans celui du jeu).
+                let mut rain: Option<(Sink, f32)> = None;
                 while let Ok(cmd) = rx.recv() {
                     if cmd.reopen {
                         // Les sons en cours étaient liés à l'ancienne sortie.
                         sinks.clear();
                         voices.clear();
+                        rain = None;
                         // (L'ancienne fermée d'abord : un périphérique peut ne s'ouvrir
                         // qu'une fois.)
                         drop(out.take());
@@ -463,11 +476,55 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                         continue;
                     };
                     sinks.retain(|s| !s.0.empty());
+                    // (v216) Pluie : son de fond en boucle, à son volume (× celui du jeu).
+                    if let Some(volume) = cmd.rain {
+                        if volume <= 0.0 {
+                            if let Some((r, base)) = &mut rain {
+                                r.pause();
+                                *base = 0.0;
+                            }
+                            continue;
+                        }
+                        if rain.is_none() {
+                            rain = Sink::try_new(handle).ok().map(|s| {
+                                let (pcm, rate) = synth::rain_loop();
+                                s.append(
+                                    rodio::buffer::SamplesBuffer::new(1, rate, pcm)
+                                        .repeat_infinite(),
+                                );
+                                (s, volume)
+                            });
+                        }
+                        if let Some((r, base)) = &mut rain {
+                            *base = volume;
+                            r.set_volume(volume * master());
+                            r.play();
+                        }
+                        continue;
+                    }
+                    // (v216) Son calculé (tonnerre).
+                    if let Some((samples, rate)) = cmd.pcm {
+                        if sinks.len() >= 48 {
+                            sinks.remove(0);
+                        }
+                        if let Ok(sink) = Sink::try_new(handle) {
+                            sink.set_volume(cmd.volume * master());
+                            sink.append(
+                                rodio::buffer::SamplesBuffer::new(1, rate, samples)
+                                    .delay(Duration::from_secs_f32(cmd.delay.max(0.0))),
+                            );
+                            sinks.push((sink, cmd.volume));
+                        }
+                        continue;
+                    }
                     // (v215) Volume du jeu changé : tout de suite pour les sons en cours.
                     if cmd.file.is_empty() && cmd.voice.is_none() {
                         let m = master();
                         for (sink, base) in &sinks {
                             sink.set_volume(base * m);
+                        }
+                        if let Some((r, base)) = &rain {
+                            r.set_volume(base * m);
                         }
                         continue;
                     }
@@ -532,9 +589,59 @@ pub fn play(sfx: Sfx, delay: f32, gain: f32) {
                 delay,
                 voice: None,
                 reopen: false,
+                pcm: None,
+                rain: None,
             });
         }
     }
+}
+
+/// (v216) Volume du bruit de la pluie (0 : elle s'arrête), sans le volume du jeu (il s'y
+/// ajoute, voir `set_master`). À appeler quand il change : la pluie continue toute seule
+/// entre deux appels.
+pub fn rain(volume: f32) {
+    if let Some(tx) = sender() {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(Cmd {
+                file: "",
+                volume: 0.0,
+                delay: 0.0,
+                voice: None,
+                reopen: false,
+                pcm: None,
+                rain: Some(volume.clamp(0.0, 1.0)),
+            });
+        }
+    }
+}
+
+/// (v216) Tonnerre d'un éclair tombé à `distance` blocs : calculé pour cette distance
+/// (un claquement sec tout près, un roulement sourd au loin ; voir `synth::thunder`), il
+/// arrive après le temps que met le son à venir (343 blocs par seconde, comme en vrai).
+/// Le calcul se fait dans un fil à part : le jeu n'attend pas.
+pub fn thunder(distance: f32, seed: u32) {
+    if master() <= 0.0 {
+        return;
+    }
+    let Some(tx) = sender().and_then(|tx| tx.lock().ok().map(|t| t.clone())) else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let _ = std::thread::Builder::new()
+        .name("tonnerre".into())
+        .spawn(move || {
+            let (pcm, rate) = synth::thunder(distance, seed);
+            let delay = distance / 343.0 - started.elapsed().as_secs_f32();
+            let _ = tx.send(Cmd {
+                file: "",
+                volume: synth::thunder_gain(distance),
+                delay: delay.max(0.0),
+                voice: None,
+                reopen: false,
+                pcm: Some((pcm, rate)),
+                rain: None,
+            });
+        });
 }
 
 /// Joue un paquet de voix d'un joueur (`volume` : réglage du joueur × distance).
@@ -547,7 +654,293 @@ pub fn voice(who: u64, samples: Vec<i16>, volume: f32) {
                 delay: 0.0,
                 voice: Some((who, samples)),
                 reopen: false,
+                pcm: None,
+                rain: None,
             });
+        }
+    }
+}
+
+/// (v216) Sons calculés : la pluie et le tonnerre. Pas d'enregistrement : le tonnerre est
+/// refait pour chaque éclair selon sa distance, et la pluie est une boucle sans raccord.
+pub mod synth {
+    use std::f32::consts::TAU;
+
+    /// Cadence des sons calculés (Hz).
+    pub const RATE: u32 = 32_000;
+
+    struct Noise(u32);
+
+    impl Noise {
+        /// Bruit blanc, −1 … 1.
+        fn next(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            (self.0 >> 8) as f32 / 8_388_608.0 - 1.0
+        }
+
+        /// 0 … 1.
+        fn unit(&mut self) -> f32 {
+            self.next() * 0.5 + 0.5
+        }
+    }
+
+    /// Filtre passe-bas à un pôle : coefficient pour la fréquence de coupure `hz`.
+    fn pole(hz: f32) -> f32 {
+        1.0 - (-TAU * hz / RATE as f32).exp()
+    }
+
+    /// Ce que deux de ces filtres à la suite laissent d'un bruit blanc (rapport des
+    /// niveaux) : de quoi rendre à un bruit filtré le niveau demandé.
+    fn kept(a: f32) -> f32 {
+        let r = 1.0 - a;
+        let r2 = r * r;
+        a * a * ((1.0 + r2) / (1.0 - r2).powi(3)).sqrt()
+    }
+
+    /// Une bouffée de bruit filtré (sous `hz`) à partir de l'instant `at` : montée en
+    /// `attack` s, éteinte en `decay` s, de niveau `gain`.
+    fn burst(
+        out: &mut [f32],
+        rng: &mut Noise,
+        at: f32,
+        gain: f32,
+        attack: f32,
+        decay: f32,
+        hz: f32,
+    ) {
+        let start = (at * RATE as f32) as usize;
+        let len = ((attack + decay * 7.0) * RATE as f32) as usize;
+        let a = pole(hz.clamp(40.0, 12_000.0));
+        let k = gain / kept(a);
+        let (mut y1, mut y2) = (0.0f32, 0.0f32);
+        for i in 0..len {
+            let Some(o) = out.get_mut(start + i) else {
+                break;
+            };
+            let t = i as f32 / RATE as f32;
+            let env = if t < attack {
+                t / attack
+            } else {
+                (-(t - attack) / decay).exp()
+            };
+            y1 += a * (rng.next() - y1);
+            y2 += a * (y1 - y2);
+            *o += y2 * env * k;
+        }
+    }
+
+    /// Volume du tonnerre selon la distance (blocs) : fort tout près, il faiblit sans
+    /// disparaître (on entend un orage de loin).
+    pub fn thunder_gain(distance: f32) -> f32 {
+        (1.0 / (1.0 + distance.max(0.0) / 110.0)).max(0.12)
+    }
+
+    /// Tonnerre d'un éclair tombé à `distance` blocs.
+    ///
+    /// Le canal de foudre est long de plusieurs centaines de blocs : chaque morceau fait
+    /// son propre claquement, qui arrive plus ou moins tard selon sa distance à l'oreille.
+    /// Tout près on entend d'abord un claquement sec et ses répliques (les morceaux les
+    /// plus proches, presque ensemble), puis le roulement des morceaux lointains et de
+    /// leurs échos ; au loin l'air a mangé les aigus : il ne reste que le roulement sourd,
+    /// qui s'installe peu à peu.
+    pub fn thunder(distance: f32, seed: u32) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed.wrapping_mul(2_654_435_761) | 1);
+        let near = (1.0 - distance / 260.0).clamp(0.0, 1.0);
+        let far = (distance / 500.0).clamp(0.0, 1.0);
+        let secs = 5.0 + 3.0 * far + rng.unit();
+        let n = (secs * RATE as f32) as usize;
+        let mut out = vec![0.0f32; n];
+        // L'air mange les aigus avec la distance : 7 kHz tout près, 1 kHz à 300 blocs.
+        let air = 7000.0 / (1.0 + distance / 55.0);
+        // 1. Le claquement et ses répliques (tout près seulement).
+        if near > 0.0 {
+            burst(&mut out, &mut rng, 0.0, 1.0 * near, 0.0012, 0.05, air);
+            for _ in 0..2 + (6.0 * near) as usize {
+                let at = 0.03 + 0.45 * rng.unit() * rng.unit();
+                let gain = (0.2 + 0.5 * rng.unit()) * near;
+                let decay = 0.02 + 0.05 * rng.unit();
+                let hz = air * (0.6 + 0.4 * rng.unit());
+                burst(&mut out, &mut rng, at, gain, 0.002, decay, hz);
+            }
+        }
+        // 2. Le roulement : les claquements des morceaux plus lointains et leurs échos, de
+        //    plus en plus tardifs, faibles et sourds.
+        let spread = 1.6 + 2.4 * far + 1.2 * rng.unit();
+        for _ in 0..26 + (rng.unit() * 14.0) as usize {
+            let late = rng.unit().powf(1.4);
+            let at = 0.04 + 0.5 * far + spread * late;
+            let gain = (0.3 - 0.2 * late) * (0.5 + 0.5 * rng.unit()) * (1.0 - 0.35 * near);
+            let attack = 0.02 + 0.05 * rng.unit() + 0.05 * far;
+            let decay = 0.18 + 0.5 * rng.unit();
+            let hz = (air * (0.5 - 0.35 * late)).max(90.0);
+            burst(&mut out, &mut rng, at, gain, attack, decay, hz);
+        }
+        // 3. Le grondement de fond : un bruit très grave qui roule (son niveau ondule) et
+        //    s'éteint lentement.
+        let a = pole(60.0 + 50.0 * (1.0 - far));
+        let k = 0.2 / kept(a);
+        let (mut y1, mut y2) = (0.0f32, 0.0f32);
+        let (wobble, phase) = (2.2 + 3.0 * rng.unit(), rng.unit() * TAU);
+        for (i, o) in out.iter_mut().enumerate() {
+            let t = i as f32 / RATE as f32;
+            let env = (t / (0.25 + 0.6 * far)).min(1.0) * (-t / (secs * 0.36)).exp();
+            let roll = 0.72 + 0.28 * (TAU * wobble * t + phase).sin() * (TAU * 0.47 * t).cos();
+            y1 += a * (rng.next() - y1);
+            y2 += a * (y1 - y2);
+            *o += y2 * k * env * roll;
+        }
+        (finish(out), RATE)
+    }
+
+    /// Met le son à l'échelle (crête à 90 %), fond sa fin, et le passe en entiers 16 bits.
+    fn finish(mut s: Vec<f32>) -> Vec<i16> {
+        let n = s.len();
+        let fade = (RATE as usize / 2).min(n);
+        for (i, v) in s[n - fade..].iter_mut().enumerate() {
+            *v *= 1.0 - i as f32 / fade as f32;
+        }
+        let peak = s.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let k = 0.9 * 32767.0 / peak;
+        s.iter().map(|v| (v * k) as i16).collect()
+    }
+
+    /// Boucle de pluie (7 s, sans raccord) : le chuintement des gouttes dans l'air et sur
+    /// le sol (bruit entre 0,9 et 6,5 kHz), le fond sourd de l'averse au loin, et le
+    /// crépitement des gouttes proches (de brefs « plic » aigus, serrés).
+    pub fn rain_loop() -> (Vec<i16>, u32) {
+        let n = 7 * RATE as usize;
+        // Une demi-seconde de plus, fondue avec le début : la boucle se referme sans
+        // raccord.
+        let extra = RATE as usize / 2;
+        let mut rng = Noise(0x9a17_3d05);
+        let mut raw = vec![0.0f32; n + extra];
+        let (lo, hi, deep) = (pole(900.0), pole(6500.0), pole(420.0));
+        let (mut l1, mut h1, mut h2, mut d1, mut d2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for (i, o) in raw.iter_mut().enumerate() {
+            let t = i as f32 / RATE as f32;
+            let w = rng.next();
+            // Chuintement : au-dessus de 0,9 kHz (le bruit moins sa partie grave), sous
+            // 6,5 kHz.
+            l1 += lo * (w - l1);
+            h1 += hi * ((w - l1) - h1);
+            h2 += hi * (h1 - h2);
+            // Fond sourd, qui respire lentement (périodes entières sur la boucle).
+            d1 += deep * (rng.next() - d1);
+            d2 += deep * (d1 - d2);
+            let breath =
+                1.0 + 0.25 * (TAU * t * 2.0 / 7.0).sin() + 0.15 * (TAU * t * 5.0 / 7.0).cos();
+            *o = h2 * 0.9 + d2 * 2.4 * breath;
+        }
+        // Gouttes proches : 150 par seconde, chacune un « plic » de quelques millisecondes.
+        let drops = 150 * (n + extra) / RATE as usize;
+        for _ in 0..drops {
+            let at = (rng.unit() * (n + extra) as f32) as usize;
+            let hz = 1800.0 + 4200.0 * rng.unit() * rng.unit();
+            let decay = 0.0015 + 0.004 * rng.unit();
+            let gain = 0.5 * rng.unit().powi(3);
+            let len = (decay * 7.0 * RATE as f32) as usize;
+            for i in 0..len {
+                let Some(o) = raw.get_mut(at + i) else {
+                    break;
+                };
+                let t = i as f32 / RATE as f32;
+                *o += (TAU * hz * t).sin() * (-t / decay).exp() * gain;
+            }
+        }
+        let mut out = raw[..n].to_vec();
+        for i in 0..extra {
+            let k = i as f32 / extra as f32;
+            // (Deux bruits sans lien : fondu à puissance constante.)
+            out[i] = raw[i] * (k * TAU / 4.0).sin() + raw[n + i] * (k * TAU / 4.0).cos();
+        }
+        let peak = out.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let k = 0.9 * 32767.0 / peak;
+        (out.iter().map(|v| (v * k) as i16).collect(), RATE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn rms(s: &[i16]) -> f32 {
+            (s.iter().map(|v| (*v as f32).powi(2)).sum::<f32>() / s.len().max(1) as f32).sqrt()
+        }
+
+        /// Part des aigus : niveau de ce qui change d'un échantillon au suivant, rapporté
+        /// au niveau du son (un son grave change lentement).
+        fn brightness(s: &[i16]) -> f32 {
+            let d: Vec<i16> = s.windows(2).map(|w| w[1].saturating_sub(w[0])).collect();
+            rms(&d) / rms(s).max(1.0)
+        }
+
+        /// Tout près : un claquement sec, tout de suite, puis le roulement. Au loin : pas
+        /// de claquement, un roulement sourd qui monte peu à peu, plus long.
+        #[test]
+        fn thunder_cracks_nearby_and_rumbles_far_away() {
+            let ms = RATE as usize / 1000;
+            let (near, rate) = thunder(15.0, 7);
+            let (far, _) = thunder(700.0, 7);
+            assert_eq!(rate, RATE);
+            for s in [&near, &far] {
+                let peak = s.iter().map(|v| v.unsigned_abs()).max().unwrap();
+                assert!((29_000..=29_500).contains(&peak), "crête {peak}");
+                assert_eq!(*s.last().unwrap(), 0, "fini en fondu");
+                let mean = s.iter().map(|v| *v as f64).sum::<f64>() / s.len() as f64;
+                assert!(mean.abs() < 400.0, "pas de décalage ({mean})");
+            }
+            assert!(near.len() >= 5 * RATE as usize && far.len() > near.len() + RATE as usize);
+            // Le claquement : la crête dans les 30 premières millisecondes, bien plus fort
+            // que la suite.
+            let crack = rms(&near[..30 * ms]);
+            let tail = rms(&near[1500 * ms..2500 * ms]);
+            assert!(crack > tail * 2.5, "claquement {crack}, suite {tail}");
+            assert!(near[..30 * ms].iter().any(|v| v.unsigned_abs() > 20_000));
+            // Au loin : rien de sec au départ, le plus fort vient après.
+            let start = rms(&far[..100 * ms]);
+            let later = rms(&far[800 * ms..2800 * ms]);
+            assert!(later > start * 3.0, "départ {start}, suite {later}");
+            // Et c'est bien plus sourd.
+            assert!(
+                brightness(&near[..200 * ms]) > brightness(&far[800 * ms..2800 * ms]) * 4.0,
+                "{} contre {}",
+                brightness(&near[..200 * ms]),
+                brightness(&far[800 * ms..2800 * ms])
+            );
+            // Chaque éclair a son tonnerre ; le même éclair, le même.
+            assert_ne!(thunder(15.0, 8).0, near);
+            assert_eq!(thunder(15.0, 7).0, near);
+            assert!(thunder_gain(0.0) > 0.99 && thunder_gain(110.0) < 0.51);
+            assert!(thunder_gain(5000.0) >= 0.12, "un orage s'entend de loin");
+        }
+
+        /// La pluie : un son régulier d'un bout à l'autre, plein d'aigus, qui se referme
+        /// sur lui-même sans raccord.
+        #[test]
+        fn rain_is_a_steady_seamless_loop() {
+            let (s, rate) = rain_loop();
+            assert_eq!((s.len(), rate), (7 * RATE as usize, RATE));
+            let level = rms(&s);
+            assert!(level > 2500.0 && level < 12_000.0, "niveau {level}");
+            // Régulière : chaque demi-seconde au même niveau, à 25 % près.
+            for c in s.chunks(RATE as usize / 2) {
+                let r = rms(c) / level;
+                assert!((0.75..1.25).contains(&r), "demi-seconde à {r}");
+            }
+            assert!(brightness(&s) > 0.35, "chuintante ({})", brightness(&s));
+            // Le raccord : la fin et le début s'enchaînent comme deux instants voisins
+            // (pas de saut plus grand que ceux du son lui-même).
+            let jump = (s[0] as i32 - s[s.len() - 1] as i32).abs();
+            let usual = s
+                .windows(2)
+                .map(|w| (w[1] as i32 - w[0] as i32).abs())
+                .max()
+                .unwrap();
+            assert!(
+                jump <= usual,
+                "saut de {jump} au raccord (au plus {usual} ailleurs)"
+            );
         }
     }
 }

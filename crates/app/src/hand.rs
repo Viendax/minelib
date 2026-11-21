@@ -45,6 +45,60 @@ pub fn torch_rotation() -> Mat4 {
     Mat4::from_rotation_y(0.4) * Mat4::from_rotation_x(0.2)
 }
 
+/// (v216) Foudre de Zeus : l'éclair (le long de +y dans son repère) est tenu en biais, la
+/// pointe vers le haut, l'avant et l'intérieur.
+pub fn zeus_rotation() -> Mat4 {
+    Mat4::from_quat(glam::Quat::from_rotation_arc(
+        Vec3::Y,
+        Vec3::new(0.05, 0.78, -0.62).normalize(),
+    ))
+}
+
+/// Projection de la main et de l'objet tenu à la première personne.
+pub fn hand_proj(aspect: f32) -> Mat4 {
+    Mat4::perspective_infinite_reverse_rh(HAND_FOV.to_radians(), aspect, 0.01)
+}
+
+/// (v216) Icône d'inventaire de la Foudre de Zeus : un éclair en zigzag, blanc bleuté,
+/// cerné de bleu, centré en (`cx`, `cy`), haut d'environ `size` pixels.
+pub fn zeus_icon(cx: f32, cy: f32, size: f32) -> Vec<VmVertex> {
+    let m = Mat4::from_translation(Vec3::new(cx, cy, 0.6))
+        * Mat4::from_scale(Vec3::new(size, -size, 0.02));
+    // Zigzag (y vers le haut, hauteur 1).
+    let pts = [
+        Vec3::new(0.17, 0.5, 0.0),
+        Vec3::new(-0.15, 0.04, 0.0),
+        Vec3::new(0.11, 0.0, 0.0),
+        Vec3::new(-0.17, -0.5, 0.0),
+    ];
+    let mut out = Vec::new();
+    // Le cerne d'abord (derrière), puis le cœur.
+    for (width, z, color) in [
+        (0.2, -0.3, [0.07, 0.2, 0.95]),
+        (0.085, 0.0, [0.8, 0.9, 1.0]),
+    ] {
+        for w in pts.windows(2) {
+            let d = w[1] - w[0];
+            let bar = m
+                * Mat4::from_translation(w[0] + Vec3::new(0.0, 0.0, z))
+                * Mat4::from_rotation_z(-d.x.atan2(d.y));
+            // (Un peu plus long que le segment : les barres se rejoignent aux coudes.)
+            let over = width * 0.35;
+            push_box(
+                &mut out,
+                bar,
+                Vec3::new(-width * 0.5, -over, 0.0),
+                Vec3::new(width * 0.5, d.length() + over, 0.1),
+                None,
+                color,
+                [1.0; 3],
+                true,
+            );
+        }
+    }
+    out
+}
+
 /// Baguette de WorldEdit (tenue droite).
 pub fn wand_rotation() -> Mat4 {
     Mat4::from_rotation_y(-0.45) * Mat4::from_rotation_z(0.1)
@@ -431,6 +485,13 @@ impl Hand {
             * Mat4::from_rotation_x(-0.6 * s)
     }
 
+    /// (v216) Repère de la Foudre de Zeus tenue, dans la vue (x à droite, y en haut, −z
+    /// devant) : le poing à l'origine, l'éclair le long de +y. Elle suit les gestes de la
+    /// main (balancement de la marche, coup).
+    pub fn zeus_frame(&self) -> Mat4 {
+        self.base() * Mat4::from_translation(ARM_FIST) * zeus_rotation()
+    }
+
     /// Bras droit à la première personne, tel que le modèle du joueur le montre en F5 :
     /// mêmes pixels du skin (4 × 12 × 4), mêmes couleurs, même ombrage selon l'orientation
     /// de chaque face dans le monde. Tendu droit devant (parallèle au regard), sorti du bas
@@ -647,6 +708,9 @@ impl Hand {
                 out.extend(crate::heads::head_vm(s.as_deref(), proj * m, light));
             }
             Item::Head(_) => {}
+            // (v216) Foudre de Zeus : rien de solide, l'éclair est dessiné à part (voir
+            // `storm`).
+            Item::Zeus => {}
             Item::Block(b) => {
                 let def = b.def();
                 let t = def.tex;

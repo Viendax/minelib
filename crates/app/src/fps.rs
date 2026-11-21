@@ -1724,22 +1724,8 @@ impl Fps {
                 }
                 // Fumigène : dessinée en volume par la carte graphique (voir `smokes`).
                 Effect::Smoke(_) => {}
-                Effect::Fire(cells, a, _) => {
-                    let fade = ((7.0 - a) / 1.0).clamp(0.0, 1.0);
-                    for (i, c) in cells.iter().enumerate() {
-                        if !seen(*c + Vec3::Y * 0.3) {
-                            continue;
-                        }
-                        // Deux flammes croisées par case, qui ondulent.
-                        let h = (0.5 + 0.25 * ((a * 9.0 + i as f32 * 1.7).sin())) * fade;
-                        let col = [4.0, 1.6 + 0.4 * (a * 13.0 + i as f32).sin(), 0.2, 1.0];
-                        for (dx, dz) in [(0.45, 0.0), (0.0, 0.45)] {
-                            let w = Vec3::new(dx, 0.0, dz);
-                            let top = *c + Vec3::Y * h;
-                            push_tri(&mut out, view_proj, [*c - w, *c + w, top], col);
-                        }
-                    }
-                }
+                // (v216) Feu du molotov : dessiné par la carte graphique (voir `flames`).
+                Effect::Fire(..) => {}
                 Effect::Decoy(..) => {}
             }
         }
@@ -2096,6 +2082,66 @@ impl Fps {
             }
             y += h + gap;
         }
+    }
+
+    /// (v216) Flammes des molotovs qui brûlent, pour le rendu : sur chaque case en feu,
+    /// une grande flamme, une plus petite à côté, et la flaque au sol. Le feu prend en un
+    /// tiers de seconde et s'éteint pendant sa dernière seconde.
+    pub fn flames(&self) -> Vec<minelib_render::Flame> {
+        let mut out = Vec::new();
+        for e in &self.effects {
+            let Effect::Fire(cells, age, _) = e else {
+                continue;
+            };
+            let force = (age / 0.35).clamp(0.0, 1.0) * (7.0 - age).clamp(0.0, 1.0);
+            for (i, c) in cells.iter().enumerate() {
+                // Tirages fixes par case : chaque flamme garde sa place et sa taille.
+                let h = |k: u32| {
+                    let x = ((c.x * 12.9898 + c.z * 78.233 + k as f32 * 37.719).sin() * 43758.547)
+                        .fract()
+                        .abs();
+                    x
+                };
+                let seed = i as f32 * 7.31 + h(0) * 50.0;
+                let flame = |pos: Vec3, size: f32, seed: f32, pool: f32| minelib_render::Flame {
+                    pos: pos.to_array(),
+                    size,
+                    seed,
+                    force,
+                    pool,
+                    _pad: 0.0,
+                };
+                out.push(flame(*c, 0.95, seed, 1.0));
+                let a = *c + Vec3::new(h(1) - 0.5, 0.0, h(2) - 0.5) * 0.35;
+                out.push(flame(a, 1.25 + 0.6 * h(3), seed + 1.7, 0.0));
+                let b = *c + Vec3::new(h(4) - 0.5, 0.0, h(5) - 0.5) * 0.8;
+                out.push(flame(b, 0.7 + 0.4 * h(6), seed + 4.1, 0.0));
+            }
+        }
+        out
+    }
+
+    /// (v216) Essais : feu de molotov allumé directement en `p` (variable MINELIB_FEU).
+    pub fn spawn_test_fire(&mut self, p: Vec3, world: &World) {
+        let (cx, cz) = (p.x.floor() as i32, p.z.floor() as i32);
+        let mut cells = Vec::new();
+        for dz in -2..=2i32 {
+            for dx in -2..=2i32 {
+                if dx * dx + dz * dz > 5 {
+                    continue;
+                }
+                let (x, z) = (cx + dx, cz + dz);
+                let mut y = p.y.floor() as i32 + 1;
+                for _ in 0..64 {
+                    if world.get(x, y - 1, z).is_solid() && !world.get(x, y, z).is_solid() {
+                        cells.push(Vec3::new(x as f32 + 0.5, y as f32, z as f32 + 0.5));
+                        break;
+                    }
+                    y -= 1;
+                }
+            }
+        }
+        self.effects.push(Effect::Fire(cells, 0.0, 0));
     }
 
     /// Essais : fumigène posée directement en `p` (variable MINELIB_SMOKE).

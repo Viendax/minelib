@@ -132,6 +132,8 @@ pub struct SaveData {
     /// Heure du jour (0..24) et cycle arrêté.
     pub time: f32,
     pub time_fixed: bool,
+    /// (v216) Météo (`Weather::save`) ; vide : monde d'avant la météo.
+    pub weather: String,
     pub inventory: Option<Inventory>,
 }
 
@@ -273,6 +275,7 @@ pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
             clock: 0.0,
             time: crate::daytime::START_HOUR,
             time_fixed: false,
+            weather: String::new(),
             inventory: None,
         },
     )?;
@@ -284,6 +287,7 @@ fn item_code(item: Item) -> String {
         Item::Block(b) => format!("block;{}", b.0),
         Item::Wand => "wand;-".into(),
         Item::Flashlight => "flashlight;-".into(),
+        Item::Zeus => "zeus;-".into(),
         // (Normal : comme avant les tailles.)
         Item::Screen(1) => "screen;-".into(),
         Item::Screen(n) => format!("screen;{n}"),
@@ -299,6 +303,7 @@ fn parse_item(kind: &str, arg: &str) -> Option<Item> {
         "torch" => Some(Item::Torch(arg.parse().ok())),
         "wand" => Some(Item::Wand),
         "flashlight" => Some(Item::Flashlight),
+        "zeus" => Some(Item::Zeus),
         "screen" => Some(Item::Screen(
             arg.parse::<u8>().map_or(crate::screen::NORMAL, |n| n.min(3)),
         )),
@@ -322,6 +327,9 @@ fn write_level(dir: &Path, d: &SaveData) -> Result<()> {
         d.time_fixed as u8,
         d.generator.name()
     );
+    if !d.weather.is_empty() {
+        s += &format!("meteo={}\n", d.weather);
+    }
     s += &format!(
         "gamemode={}\nfly={}\nhealth={}\n",
         d.game.mode.key(),
@@ -489,6 +497,7 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
             },
         ),
         time_fixed: kv.get("heure_fixe").is_some_and(|v| *v == "1"),
+        weather: kv.get("meteo").map(|v| v.to_string()).unwrap_or_default(),
         meta,
         player,
         inventory,
@@ -660,6 +669,7 @@ fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
         clock: 0.0,
         time: crate::daytime::START_HOUR,
         time_fixed: false,
+        weather: String::new(),
         inventory: None,
     };
     Ok((data, world))

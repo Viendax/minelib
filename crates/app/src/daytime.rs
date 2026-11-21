@@ -42,6 +42,28 @@ pub fn sun_dir(h: f32) -> [f32; 3] {
     [x / l, y / l, z / l]
 }
 
+/// (v216) Jours d'un cycle de la lune, comme dans Minecraft.
+pub const MOON_DAYS: f32 = 8.0;
+
+/// (v216) Direction vers la lune à l'heure `h`, `age` jours après la pleine lune. Elle suit
+/// le chemin du soleil avec un retard qui grandit d'un tour par cycle : pleine lune à
+/// l'opposé du soleil (elle se lève quand il se couche), puis chaque nuit plus tard,
+/// nouvelle lune près du soleil au bout de quatre jours. Ses phases viennent de là : le
+/// rendu l'éclaire avec le vrai soleil.
+pub fn moon_dir(h: f32, age: f32) -> [f32; 3] {
+    use std::f32::consts::{PI, TAU};
+    let a = (h - 6.0) / 24.0 * TAU - PI - age / MOON_DAYS * TAU;
+    // (Pas tout à fait le chemin du soleil : pas d'éclipse à chaque nouvelle lune.)
+    let (x, y, z) = (a.cos(), a.sin(), 0.08);
+    let l = (x * x + y * y + z * z).sqrt();
+    [x / l, y / l, z / l]
+}
+
+/// Lune d'un soleil immobile (cartes FPS, soleil de Dust2) : à l'opposé.
+pub fn moon_opposite(sun: [f32; 3]) -> [f32; 3] {
+    [-sun[0], -sun[1], sun[2]]
+}
+
 /// Lumière du jour (0 nuit … 1 plein jour) selon la hauteur du soleil.
 pub fn daylight(h: f32) -> f32 {
     let e = ((h - 6.0) / 24.0 * std::f32::consts::TAU).sin();
@@ -99,6 +121,14 @@ mod tests {
         assert_eq!(daylight(0.0), 0.0);
         // Une journée en 20 minutes.
         assert!((advance(23.0, DAY_S / 24.0) - 0.0).abs() < 1e-4);
+        // Pleine lune : à l'opposé du soleil ; quatre jours plus tard, nouvelle lune, du même
+        // côté que lui ; à mi-chemin, un quart de tour derrière.
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        assert!(dot(sun_dir(0.0), moon_dir(0.0, 0.0)) < -0.9);
+        assert!(moon_dir(0.0, 0.0)[1] > 0.9, "pleine lune haute à minuit");
+        assert!(dot(sun_dir(15.0), moon_dir(15.0, 4.0)) > 0.9);
+        assert!(dot(sun_dir(9.0), moon_dir(9.0, 2.0)).abs() < 0.2);
+        assert!(dot(moon_dir(3.0, 1.0), moon_dir(3.0, 9.0)) > 0.999);
         // Soleil de Dust2 : haut (≈ 54°) et vers le sud.
         let s = dust2_sun();
         assert!((s[1] - 54.18_f32.to_radians().sin()).abs() < 1e-3);

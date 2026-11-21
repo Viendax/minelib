@@ -343,6 +343,28 @@ fn emit_ground_item(out: &mut Vec<EntityVertex>, xf: Mat4, item: Item, light: [f
                 * Mat4::from_translation(Vec3::new(-0.5, -6.7 / 16.0, -0.5));
             crate::player_model::emit_flashlight_item(out, lying, false, light);
         }
+        // (v216) Foudre de Zeus : un petit éclair en zigzag, lumineux, debout.
+        Item::Zeus => {
+            let pts = [
+                Vec3::new(0.08, 0.5, 0.0),
+                Vec3::new(-0.07, 0.27, 0.0),
+                Vec3::new(0.05, 0.25, 0.0),
+                Vec3::new(-0.08, 0.02, 0.0),
+            ];
+            for w in pts.windows(2) {
+                let d = w[1] - w[0];
+                let bar =
+                    xf * Mat4::from_translation(w[0]) * Mat4::from_rotation_z(-d.x.atan2(d.y));
+                crate::player_model::emit_item(
+                    out,
+                    bar,
+                    [-0.022, -0.01, -0.022],
+                    [0.022, d.length() + 0.01, 0.022],
+                    RayBoxKind::Glow(ZEUS_GLOW),
+                    light,
+                );
+            }
+        }
         _ => {
             let h = BLOCK_SIZE / 2.0;
             crate::player_model::emit_item(
@@ -356,6 +378,9 @@ fn emit_ground_item(out: &mut Vec<EntityVertex>, xf: Mat4, item: Item, light: [f
         }
     }
 }
+
+/// (v216) Couleur (sRGB) de la Foudre de Zeus posée au sol.
+const ZEUS_GLOW: [u8; 3] = [190, 220, 255];
 
 /// Côté d'un bloc posé au sol comme objet (blocs) ; taille de la torche (sa vraie taille
 /// fois ce facteur).
@@ -386,6 +411,7 @@ fn icon_kind(item: Item) -> RayBoxKind {
         }
         Item::Wand => RayBoxKind::Flat([120, 80, 200]),
         Item::Flashlight => RayBoxKind::Flat(crate::flashlight::BODY),
+        Item::Zeus => RayBoxKind::Glow(ZEUS_GLOW),
         Item::Screen(_) => RayBoxKind::Flat([30, 30, 36]),
         // Tête à skin (au sol, elle devient une tête simple : voir `Item::code`).
         Item::Head(_) => RayBoxKind::Flat([214, 166, 132]),

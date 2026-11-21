@@ -28,6 +28,11 @@
 //!   MINELIB_FPS_MAX=<n>         plafond de FPS optionnel
 //!   MINELIB_DEBUG=1             F3 ouvert au démarrage
 //!   MINELIB_NIGHT=1             commencer de nuit
+//!   MINELIB_HEURE=<h>           commencer à cette heure (0 … 24), arrêtée (essais du ciel)
+//!   MINELIB_LUNE=<jours>        âge de la lune au départ (0 pleine … 4 nouvelle … 8)
+//!   MINELIB_METEO=clear|rain|storm  météo imposée et figée dès l'arrivée (essais)
+//!   MINELIB_ZEUS=1              la Foudre de Zeus en main à l'arrivée (essais)
+//!   MINELIB_THOR=<s>            la foudre tombe là où l'on regarde toutes les <s> s (essais)
 //!   MINELIB_DEMO=1              nouveau monde : mur + toutes les torches colorées
 //!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé ; aussi
 //!                               dans un monde neuf et dans la démo)
@@ -41,6 +46,7 @@
 //!   MINELIB_LUMIERES_LENTES=<s> shaders des lumières prêts <s> secondes plus tard (essais)
 //!   MINELIB_SMOKE=<x>,<y>,<z>   mode FPS : fumigène posée là toutes les 18 s (essais)
 //!   MINELIB_SMOKE_Q=<n>,<pas>   qualité des fumigènes : pas max et longueur (essais)
+//!   MINELIB_FEU=<distance>      mode FPS : feu de molotov devant soi toutes les 9 s (essais)
 
 // Windows : pas de fenêtre de console à côté du jeu (le journal va dans .minelib/logs).
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -78,6 +84,7 @@ mod keylag;
 mod keytest;
 mod keys;
 mod light_editor;
+mod lightning;
 mod lights;
 mod mcimport;
 mod menu;
@@ -93,6 +100,7 @@ mod session;
 mod skin;
 mod spotting;
 mod stick;
+mod storm;
 mod streaming;
 mod underwater;
 mod update;
@@ -100,6 +108,7 @@ mod voice;
 mod wand;
 mod watch;
 mod weapons;
+mod weather;
 mod worldedit;
 
 use std::collections::VecDeque;

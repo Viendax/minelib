@@ -82,13 +82,13 @@ fn entity_fog(world: vec3<f32>) -> f32 {
     return smoothstep(g.fog.x, g.fog.y, distance(world, g.cam_pos.xyz));
 }
 
-/// (v215) `c` dans le brouillard `fog` : vers la couleur du ciel derrière, comme les blocs
-/// (`sky_color`, ajouté à l'assemblage : voir `entity_wgsl`).
+/// (v215) `c` dans le brouillard `fog` : vers le ciel derrière, comme les blocs (`sky_shade`,
+/// ajouté à l'assemblage : voir `entity_wgsl` ; (v216) le ciel entier, nuages compris).
 fn fogged(c: vec3<f32>, world: vec3<f32>, fog: f32) -> vec3<f32> {
     if fog <= 0.0 {
         return c;
     }
-    return mix(c, sky_color(normalize(world - g.cam_pos.xyz)), fog);
+    return mix(c, sky_shade(normalize(world - g.cam_pos.xyz)).rgb, fog);
 }
 
 /// Normale de la face (vers la caméra), d'après les dérivées de la position : à calculer
