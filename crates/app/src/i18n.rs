@@ -2000,6 +2000,35 @@ const TABLE: &[[&str; 7]] = &[
         "A preparar as luzes…",
         "Lichten worden voorbereid…",
     ],
+    // (v220) Touche F1 (construction).
+    [
+        "Masquer l'interface",
+        "Hide interface",
+        "Ocultar la interfaz",
+        "Oberfläche ausblenden",
+        "Nascondi interfaccia",
+        "Ocultar a interface",
+        "Interface verbergen",
+    ],
+    // (v220) Écran de chargement d'un monde.
+    [
+        "Chargement du monde…",
+        "Loading world…",
+        "Cargando el mundo…",
+        "Welt wird geladen…",
+        "Caricamento del mondo…",
+        "A carregar o mundo…",
+        "Wereld laden…",
+    ],
+    [
+        "Préparation des shaders…",
+        "Preparing shaders…",
+        "Preparando los shaders…",
+        "Shader werden vorbereitet…",
+        "Preparazione degli shader…",
+        "A preparar os shaders…",
+        "Shaders worden voorbereid…",
+    ],
     [
         "Lumières indisponibles sur cette carte graphique (voir le journal).",
         "Lights are unavailable on this graphics card (see the log).",

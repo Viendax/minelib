@@ -63,6 +63,27 @@ const PING_S: f32 = 8.0;
 const PING_RANGE: f32 = 400.0;
 const MAX_PINGS: usize = 3;
 
+/// (v220) Survie : temps (s) de clic tenu pour casser un bloc, le même pour tous les blocs
+/// pour l'instant. En créatif, un bloc se casse tout de suite.
+const BREAK_S: f32 = 0.5;
+
+/// (v220) À l'arrivée dans un monde, on n'y apparaît (chez soi comme chez les autres)
+/// qu'une fois affichés les chunks à moins de tant de chunks de soi (au plus la distance de
+/// rendu), et les shaders du monde prêts ; au plus tard après `LOAD_MAX_S` secondes. Au
+/// moins `LOAD_MIN_S` : en ligne, ce que le relais a de changé autour de soi arrive avant.
+const LOAD_RADIUS: i32 = 4;
+const LOAD_MIN_S: f32 = 0.5;
+const LOAD_MAX_S: f32 = 30.0;
+
+/// (v220) Monde en cours de chargement (voir `Session::loading`).
+struct Loading {
+    since: std::time::Instant,
+    /// Chunks affichés autour de soi, et combien il en faut.
+    shown: (usize, usize),
+    /// Shaders du monde prêts.
+    shaders: bool,
+}
+
 /// Réglages de rendu choisis au lancement.
 #[derive(Clone, Copy)]
 pub struct SessionConfig {
@@ -216,6 +237,16 @@ pub struct Session {
     daylight: f32,
     break_cooldown: f32,
     place_cooldown: f32,
+    /// (v220) Survie : bloc qu'on est en train de casser, et depuis combien de temps (voir
+    /// `BREAK_S`).
+    dig: Option<([i32; 3], f32)>,
+    /// (v220) Geste de la main décidé en cassant ou en posant (`handle_blocks`), joué à
+    /// l'image suivante (`Hand::update`).
+    gesture: crate::hand::Gesture,
+    /// (v220) Interface masquée (touche F1, construction) : voir `hud_off`.
+    hud_hidden: bool,
+    /// (v220) Un éclair tenu crépitait à l'image d'avant (voir `update_crackles`).
+    crackling: bool,
     pub fov: f32,
     /// Sensibilité de la souris (valeur Counter-Strike).
     pub sensitivity: f32,
@@ -291,6 +322,11 @@ pub struct Session {
     items: crate::drops::Items,
     /// `items` est-il prêt (sauvegarde relue, ou remise au relais par le propriétaire) ?
     items_ready: bool,
+    /// (v220) Monde pas encore chargé (voir `LOAD_RADIUS`) : on n'y apparaît pas. Ni
+    /// touches ni physique (le joueur reste où il arrive), sa position ne part pas aux autres
+    /// (construction en ligne) et il ne se présente pas à l'hôte (partie FPS) ; l'écran de
+    /// chargement cache le monde.
+    loading: Option<Loading>,
     items_seeded: bool,
     /// Horloge du ciel : n'avance qu'avec l'heure (nuages immobiles à heure fixe).
     sky_clock: f32,
@@ -591,6 +627,10 @@ impl Session {
             thor_probe: None,
             daylight: crate::daytime::daylight(time_h),
             break_cooldown: 0.0,
+            dig: None,
+            gesture: crate::hand::Gesture::None,
+            hud_hidden: false,
+            crackling: false,
             place_cooldown: 0.0,
             fov: FOV,
             sensitivity: minelib_assets::DEFAULT_SENSITIVITY,
@@ -634,6 +674,11 @@ impl Session {
             frame_aim: None,
             items: crate::drops::Items::new(true),
             items_ready: false,
+            loading: Some(Loading {
+                since: std::time::Instant::now(),
+                shown: (0, 1),
+                shaders: false,
+            }),
             items_seeded: false,
             sky_clock: 0.0,
             overlay: Overlay::default(),
@@ -884,17 +929,26 @@ impl Session {
             self.keys.mouse_muted = false;
         }
         crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
+        // (v220) Monde pas encore chargé : on n'y apparaît pas (voir `loading`).
+        self.check_loaded(renderer);
         // Test des touches : il lit le clavier et la souris, le jeu ne reçoit rien.
         let quiet;
         let input = if self.key_test.is_some() {
             self.run_key_test(input, dt, active);
             quiet = input.silenced();
             &quiet
+        } else if self.loading.is_some() {
+            // (v220) Pendant le chargement : ni touches, ni souris.
+            let mut q = input.silenced();
+            q.mouse_delta = (0.0, 0.0);
+            quiet = q;
+            &quiet
         } else {
             input
         };
         // (v172) Mode FPS dans un monde solo : partie contre des bots.
         if self.bots_auto
+            && self.loading.is_none()
             && self.net.is_none()
             && self.build.is_none()
             && self.game.mode == GameMode::Fps
@@ -1315,7 +1369,10 @@ impl Session {
                 self.player.pos.x.floor() as i32,
                 self.player.pos.z.floor() as i32,
             );
-            if self.player.flying || self.world.contains(here) {
+            if self.loading.is_some() {
+                // (v220) Pas encore chargé : le joueur reste où il arrive (ni chute, ni
+                // poussée).
+            } else if self.player.flying || self.world.contains(here) {
                 self.simulate(&m, dt);
             } else {
                 self.check_fall();
@@ -1702,14 +1759,15 @@ impl Session {
             } else {
                 0.0
             };
-            let swung = input.grabbed
-                && !fps_mode
-                && !typing
-                && !editing
-                && !self.inventory.open
-                && (self.keys.pressed(input, Action::Attack)
-                    || self.keys.pressed(input, Action::Use));
-            self.hand.update(dt, speed, swung, held);
+            // (v220) Geste de la main : décidé en cassant, en frappant ou en posant (voir
+            // `handle_blocks`, à l'image d'avant).
+            let gesture = if !fps_mode && !typing && !editing && !self.inventory.open {
+                std::mem::take(&mut self.gesture)
+            } else {
+                self.gesture = crate::hand::Gesture::None;
+                crate::hand::Gesture::None
+            };
+            self.hand.update(dt, speed, gesture, held);
             self.hand.flashlight_on = self.flashlight_on;
             // Balancement des bras et des jambes du modèle (vue F5), et des autres joueurs.
             self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
@@ -1789,6 +1847,8 @@ impl Session {
             }
         }
 
+        // (v220) Éclair tenu : son crépitement (arrêté en pause).
+        self.update_crackles(active);
         drop(logic);
         if !self.dirty.is_empty() {
             self.vox_dirty = true;
@@ -1934,6 +1994,11 @@ impl Session {
         // F5 : 1re personne → 3e de dos → 3e de face (pas en mode FPS).
         if self.keys.pressed(input, Action::Perspective) && self.game.mode != GameMode::Fps {
             self.perspective = (self.perspective + 1) % 3;
+        }
+        // (v220) F1 : plus d'interface, seulement le jeu et les pseudos (voir `hud_off`) ;
+        // un second appui la rend.
+        if self.keys.pressed(input, Action::HideHud) && self.game.mode != GameMode::Fps {
+            self.hud_hidden = !self.hud_hidden;
         }
         // Double appui sur Espace : vol (toujours en créatif, en survie après /fly).
         if self.keys.pressed(input, Action::Jump) && !self.inventory.open {
@@ -2099,7 +2164,12 @@ impl Session {
             Some((ids[i], crate::screen::visible_part(&s.0.anchor(), proj * view)))
         });
         self.displays.look(regarde, dt);
-        let aimed = self.screen_aim.map(|(i, _, uv)| (ids[i], uv));
+        // (v220) Seulement de face : par derrière, on ne touche que sa hitbox (la casser, la
+        // copier), pas sa page.
+        let aimed = self
+            .screen_aim
+            .filter(|a| a.2[0] >= 0.0)
+            .map(|(i, _, uv)| (ids[i], uv));
         let editing = aimed.is_some_and(|a| self.displays.editing(a.0));
         if let Some((id, _)) = aimed {
             self.screen_last = Some(id);
@@ -2122,6 +2192,7 @@ impl Session {
                 let size = self.shown.get(i).map_or(crate::screen::NORMAL, |s| s.0.size);
                 self.give_picked(Item::Screen(size));
             } else if self.keys.pressed(input, use_key)
+                && uv[0] >= 0.0
                 && (fps || !self.keys.held(input, Action::Sneak))
                 // En mode FPS, « utiliser » est une lettre : elle va dans le champ de texte.
                 && !(fps && editing)
@@ -2302,6 +2373,7 @@ impl Session {
     /// focus) ? Le jeu ne lit alors plus ses touches.
     pub fn keyboard_on_screen(&self) -> bool {
         self.screen_aim
+            .filter(|a| a.2[0] >= 0.0)
             .and_then(|a| self.shown.get(a.0))
             .is_some_and(|s| self.displays.editing(s.0.id()))
     }
@@ -2355,7 +2427,9 @@ impl Session {
     }
 
     /// Écran visé par le réticule jusqu'à `range` (le plus proche, s'il n'est pas caché
-    /// par un bloc) : indice, distance et point visé dessus (0..1).
+    /// par un bloc) : indice, distance et point visé dessus (0..1). (v220) Sa hitbox se
+    /// touche aussi par derrière ou par le côté : point visé (−1, −1), on peut le casser ou
+    /// le copier, pas cliquer dans sa page.
     fn aimed_screen(&self, range: f32) -> Option<(usize, f32, [f32; 2])> {
         let eye = self.player.eye();
         let dir = self.player.look_dir();
@@ -2364,7 +2438,11 @@ impl Session {
         let limit = seen.map_or(range, |h| h.distance + 0.1);
         let mut best: Option<(usize, f32, [f32; 2])> = None;
         for (i, (s, _)) in self.shown.iter().enumerate() {
-            if let Some((t, uv)) = crate::screen::aim(&s.anchor(), eye, dir, limit) {
+            let hit = crate::screen::aim(&s.anchor(), eye, dir, limit).or_else(|| {
+                let (min, max) = s.hitbox();
+                crate::screen::aim_box(min, max, eye, dir, limit).map(|t| (t, [-1.0, -1.0]))
+            });
+            if let Some((t, uv)) = hit {
                 if best.is_none_or(|b| t < b.1) {
                     best = Some((i, t, uv));
                 }
@@ -2499,12 +2577,15 @@ impl Session {
                     self.items.drop_item(eye - Vec3::Y * 0.3, to, pile);
                 }
             }
-            // Ramasser ce qui est à portée, s'il y a de la place.
+            // Ramasser ce qui est à portée, s'il y a de la place ; (v220) pas avant d'être
+            // arrivé.
             let inv = &self.inventory;
-            self.items.pick_up(self.player.pos, |p| {
-                crate::inventory::Item::from_code(p.item)
-                    .is_some_and(|item| inv.has_room(item, p.count as u32))
-            });
+            if self.loading.is_none() {
+                self.items.pick_up(self.player.pos, |p| {
+                    crate::inventory::Item::from_code(p.item)
+                        .is_some_and(|item| inv.has_room(item, p.count as u32))
+                });
+            }
         }
         // Écran du coffre ouvert.
         if let Some(pos) = self.inventory.chest {
@@ -2614,11 +2695,23 @@ impl Session {
     }
 
     fn handle_blocks(&mut self, input: &Input, dt: f32) {
+        use crate::hand::Gesture;
         self.break_cooldown -= dt;
         self.place_cooldown -= dt;
         self.frame_aim = None;
+        // (v220) Bloc en train d'être cassé (survie) : oublié si on ne le casse plus à cette
+        // image (voir plus bas).
+        let dig = self.dig.take();
         if !input.grabbed || self.inventory.open {
             return;
+        }
+        // (v220) Clic gauche ou droit : la main frappe (arc), sauf si un bloc se casse (coup
+        // vers le bas, plus bas).
+        if self.game.mode != GameMode::Fps
+            && self.game.mode != GameMode::Spectator
+            && (self.keys.pressed(input, Action::Attack) || self.keys.pressed(input, Action::Use))
+        {
+            self.gesture = Gesture::Swing;
         }
         // Écran vidéo visé à portée (ou touche encore tenue après l'avoir touché ou cassé) :
         // ses touches sont pour lui (voir `update_screens`), rien n'est cassé ni posé
@@ -2664,6 +2757,8 @@ impl Session {
             }
             return;
         }
+        // Tout de suite (créatif, cadres, écrans) ; en survie, un bloc demande `BREAK_S` de
+        // clic tenu (voir plus bas).
         let breaking = keys.pressed(input, Action::Attack)
             || (keys.held(input, Action::Attack) && self.break_cooldown <= 0.0);
         let placing = keys.pressed(input, Action::Use)
@@ -2832,6 +2927,29 @@ impl Session {
         // En créatif, comme dans Minecraft : même la bedrock et les barrières se cassent.
         let breakable = hit.id.is_breakable()
             || (self.game.mode == GameMode::Creative && hit.id.is_targetable());
+        // (v220) En créatif, le bloc part tout de suite, la main fait un petit coup vers le
+        // bas. En survie, il faut tenir le clic `BREAK_S` sur le même bloc, et la main frappe
+        // en boucle pendant ce temps (plus lentement, une pause entre deux coups).
+        let breaking = if self.game.mode == GameMode::Creative {
+            if breaking && breakable {
+                self.gesture = Gesture::Dip;
+            }
+            breaking
+        } else if keys.held(input, Action::Attack) && breakable {
+            let t = match dig {
+                Some((b, t)) if b == hit.block => t + dt,
+                _ => 0.0,
+            };
+            self.gesture = Gesture::Dig;
+            if t >= BREAK_S {
+                true
+            } else {
+                self.dig = Some((hit.block, t));
+                false
+            }
+        } else {
+            false
+        };
         if breaking && breakable {
             self.opened.remove(&hit.block);
             // Porte : les deux moitiés partent ensemble.
@@ -3674,7 +3792,8 @@ impl Session {
         input: &Input,
         stats: minelib_render::DynStats,
     ) {
-        if !self.light_editor.open {
+        // (v220) Interface masquée (F1) : le panneau aussi.
+        if !self.light_editor.open || self.hud_off() {
             return;
         }
         let (pos, view, look) = self.view_camera();
@@ -4052,6 +4171,76 @@ impl Session {
     }
 
     /// Partie FPS en ligne (pas la partie solo contre des bots).
+    /// (v220) Éclairs tenus qui crépitent (voir `audio::crackles`) : le sien, depuis sa
+    /// main, entendu de là où est la caméra (à droite et devant à la première personne).
+    fn update_crackles(&mut self, active: bool) {
+        let mut list = Vec::new();
+        let mine = active
+            && self.loading.is_none()
+            && self.game.mode.has_inventory()
+            && self.game.mode != GameMode::Fps
+            && self.held_item() == Some(Item::Zeus);
+        let (cam, view, _) = self.view_camera();
+        if mine {
+            let hand = crate::flashlight::lens_position(self.player.eye(), self.player.look_dir());
+            let v = view.transform_point3(hand);
+            list.push(crate::audio::CrackleAt {
+                id: 1,
+                dir: v.normalize_or(Vec3::NEG_Z).to_array(),
+                gain: crate::audio::crackle_gain(hand.distance(cam)),
+            });
+        }
+        if !list.is_empty() || self.crackling {
+            self.crackling = !list.is_empty();
+            crate::audio::crackles(list);
+        }
+    }
+
+    /// (v220) Chargement du monde : chunks affichés autour de soi (voir `LOAD_RADIUS`),
+    /// shaders du monde ; fini (ou trop long), on apparaît : chez les autres en construction
+    /// en ligne (sa position part), à l'hôte d'une partie FPS (il se présente).
+    fn check_loaded(&mut self, renderer: &Renderer) {
+        if let Some(l) = &mut self.loading {
+            let p = self.player.pos;
+            l.shown = self.streamer.shown_within(p.x, p.z, LOAD_RADIUS);
+            l.shaders = renderer.world_ready();
+            let t = l.since.elapsed().as_secs_f32();
+            let ready = l.shaders && l.shown.0 >= l.shown.1 && t >= LOAD_MIN_S;
+            if ready || t >= LOAD_MAX_S {
+                if ready {
+                    log::info!(
+                        "monde chargé en {t:.1} s ({} chunks autour de soi affichés)",
+                        l.shown.1
+                    );
+                } else {
+                    log::warn!(
+                        "monde pas fini de charger après {t:.0} s ({} chunks sur {}, shaders {}) \
+                         : on y entre quand même",
+                        l.shown.0,
+                        l.shown.1,
+                        if l.shaders { "prêts" } else { "pas prêts" }
+                    );
+                }
+                self.loading = None;
+                if let Some(n) = &mut self.net {
+                    n.loaded();
+                }
+            }
+        }
+        if let Some(b) = &mut self.build {
+            b.hidden = self.loading.is_some();
+        }
+    }
+
+    /// (v220) Monde en cours de chargement : part déjà faite (0 à 1), et shaders prêts.
+    pub fn loading_progress(&self) -> Option<(f32, bool)> {
+        self.loading.as_ref().map(|l| {
+            let chunks = l.shown.0 as f32 / l.shown.1.max(1) as f32;
+            let time = l.since.elapsed().as_secs_f32() / LOAD_MIN_S;
+            (chunks.min(time).clamp(0.0, 1.0), l.shaders)
+        })
+    }
+
     pub fn online_match(&self) -> bool {
         self.net.as_ref().is_some_and(|n| !n.is_solo())
     }
@@ -7156,8 +7345,19 @@ impl Session {
         }
     }
 
+    /// (v220) Interface masquée (F1, hors mode FPS) : ni barre d'objets, ni viseur, ni
+    /// tchat, ni écran F3, ni main ou objet tenu à la première personne, ni contour du bloc
+    /// visé ; il reste le jeu et les pseudos des joueurs et des PNJ.
+    pub fn hud_off(&self) -> bool {
+        self.hud_hidden && self.game.mode != GameMode::Fps
+    }
+
     pub fn draw_hud(&self, ui: &mut Ui, size: (f32, f32), input: &Input, debug: bool) {
         let s = (size.1 / 360.0).floor().max(1.0);
+        if self.hud_off() {
+            self.draw_build_names(ui, size, s);
+            return;
+        }
         self.draw_net(ui, size, input, s);
         self.draw_build_names(ui, size, s);
         self.draw_voice(ui, size, input, s);
@@ -7454,6 +7654,10 @@ impl Session {
         let shadow_d2 = shadow_d * shadow_d;
         let mut sun_casters = std::mem::take(&mut scratch.sun_casters);
         sun_casters.clear();
+        // (v220) Et tous, jusqu'à cette distance, pour l'ombre aux lumières dynamiques (atlas
+        // des joueurs).
+        let mut light_casters = std::mem::take(&mut scratch.light_casters);
+        light_casters.clear();
         // (v172) Les autres joueurs : dessinés par la carte graphique, tous d'un coup (un
         // modèle commun, une instance chacun), comme soi en F5 : leur skin pixel par pixel,
         // la lumière de là où ils sont (lumières dynamiques comprises). Seul l'objet tenu
@@ -7506,6 +7710,7 @@ impl Session {
                 // carte du soleil (à 10 contre 10, les derniers n'avaient pas d'ombre).
                 if v.pos.distance_squared(cam) <= shadow_d2 {
                     shadows.push((v.pos, crate::player_model::shadow_boxes(&other), Some(inst)));
+                    light_casters.push(inst);
                 }
                 if inside == Some(v.pseudo.as_str()) {
                     continue;
@@ -7674,6 +7879,7 @@ impl Session {
                         } else {
                             sun_casters.push(inst);
                         }
+                        light_casters.push(inst);
                     }
                     players.push(inst);
                 } else {
@@ -7748,8 +7954,11 @@ impl Session {
         // (pieds remontés comme la caméra sur une marche), dessinés dans la vue du monde.
         let world_proj =
             Mat4::perspective_infinite_reverse_rh(fov.to_radians(), renderer.aspect(), 0.05);
+        // (v220) Interface masquée (F1) : ni main ni objet tenu à la première personne.
+        let hud_off = self.hud_off();
         let first_person_lamp = (third == 0
             && !fps_mode
+            && !hud_off
             && self.spectating.is_none()
             && self.game.mode != GameMode::Spectator
             && self.held_item() == Some(Item::Flashlight))
@@ -7765,10 +7974,15 @@ impl Session {
                 held: pose.held,
                 skin: None,
             };
-            Some((
+            let (lamp, arm) = (
                 crate::player_model::flashlight_matrix(&p)?,
                 crate::player_model::right_arm_matrix(&p)?,
-            ))
+            );
+            // (v220) Le coup vers le bas de la main (bloc cassé) : la lampe et le bras
+            // penchent autour de la lampe, comme la main dessinée autour du poing.
+            let pivot = view.transform_point3(lamp.transform_point3(Vec3::splat(0.5)));
+            let dip = view.inverse() * self.hand.dip_about(pivot) * view;
+            Some((dip * lamp, dip * arm))
         })
         .flatten();
         let hand = if self.spectating.is_some() && fps_mode {
@@ -7809,7 +8023,7 @@ impl Session {
                     );
                 }
                 v
-            } else if third == 0 {
+            } else if third == 0 && !hud_off {
                 self.hand
                     .build(self.held_item(), renderer.aspect(), self.hand_light)
             } else {
@@ -7818,6 +8032,7 @@ impl Session {
             // Sélection WorldEdit : arêtes de la zone et coins (en créatif, baguette en main).
             if self.game.mode == GameMode::Creative
                 && self.inventory.selected_item() == Some(Item::Wand)
+                && !hud_off
             {
                 let proj = Mat4::perspective_infinite_reverse_rh(
                     fov.to_radians(),
@@ -7835,6 +8050,7 @@ impl Session {
             crate::hand::Hand::arm_world(world_proj * view, arm, self.hand_light, skin.as_deref())
         } else if third == 0
             && !fps_mode
+            && !hud_off
             && self.spectating.is_none()
             && self.game.mode != GameMode::Spectator
         {
@@ -7892,6 +8108,7 @@ impl Session {
             ray_light: self.hand_light,
             shadow_boxes: &shadow_boxes,
             sun_casters: &sun_casters,
+            light_casters: &light_casters,
             player_shadow_distance: shadow_d,
             viewmodel: &hand,
             arm: &arm,
@@ -7938,8 +8155,13 @@ impl Session {
                 }
                 _ => None,
             },
-            // Pas de contour du bloc visé en mode FPS (ni dans l'éditeur de lumières).
-            selected: if grabbed && self.game.mode != GameMode::Fps && !self.light_editor.open {
+            // Pas de contour du bloc visé en mode FPS (ni dans l'éditeur de lumières, ni
+            // (v220) l'interface masquée).
+            selected: if grabbed
+                && self.game.mode != GameMode::Fps
+                && !self.light_editor.open
+                && !self.hud_off()
+            {
                 // Hitbox de l'écran visé (à portée de main), sinon cadre, sinon bloc.
                 self.screen_aim
                     .filter(|a| a.1 <= REACH)
@@ -7980,6 +8202,7 @@ impl Session {
         scratch.shadows = shadows;
         scratch.boxes = shadow_boxes;
         scratch.sun_casters = sun_casters;
+        scratch.light_casters = light_casters;
         *self.scratch.borrow_mut() = scratch;
         stats
     }
@@ -8603,6 +8826,8 @@ struct Scratch {
     boxes: Vec<ShadowBox>,
     /// (v217) Joueurs de la carte d'ombre du soleil.
     sun_casters: Vec<minelib_render::PlayerInstance>,
+    /// (v220) Joueurs de l'atlas des ombres des joueurs (lumières dynamiques).
+    light_casters: Vec<minelib_render::PlayerInstance>,
 }
 
 /// (v197) Réponses de `sun_reaches` gardées par demi-bloc (voir `Session::sun_seen`).

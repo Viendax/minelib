@@ -662,6 +662,10 @@ pub struct FrameParams<'a> {
     /// exactes dans `shadow_boxes`.
     pub sun_casters: &'a [PlayerInstance],
     pub player_shadow_distance: f32,
+    /// (v220) Tous les autres joueurs à moins de `player_shadow_distance` de la caméra : leur
+    /// ombre aux lumières dynamiques, par l'atlas des joueurs (voir `lights::EntJob`), en
+    /// plus des boîtes exactes des plus proches.
+    pub light_casters: &'a [PlayerInstance],
     /// Écran de debug (F3) à afficher par-dessus la scène.
     pub overlay: Option<&'a Overlay>,
     /// (v190) Ce que seuls les miroirs montrent (à la première personne) : le modèle du
@@ -1155,6 +1159,7 @@ impl Renderer {
                 dyn_entries[4],
                 dyn_entries[5],
                 dyn_entries[6],
+                dyn_entries[7],
                 // (v190) Images des miroirs redessinés (voir `planar`).
                 wgpu::BindGroupLayoutEntry {
                     binding: 14,
@@ -2081,15 +2086,26 @@ impl Renderer {
     /// Prépare les lumières dynamiques de l'image (cartes d'ombre à calculer, tuiles).
     fn prepare_dyn(&mut self, view_proj: Mat4, p: &FrameParams) {
         let voxels = self.voxels.uploaded.then_some(self.voxels.origin);
+        let feet: Vec<[f32; 3]> = p.light_casters.iter().map(|c| c.feet).collect();
         self.dyn_gpu.prepare(
             &self.device,
             &self.queue,
             view_proj,
             p.eye,
             p.shadow_boxes,
+            &feet,
             p.time,
             voxels,
         );
+        // (v220) Les joueurs de l'atlas des ombres des joueurs, case par case.
+        if !self.dyn_gpu.ent_jobs.is_empty() {
+            self.entities.prepare_light_casters(
+                &self.queue,
+                &self.dyn_gpu.ent_jobs,
+                &self.dyn_gpu.ent_casters,
+                p.light_casters,
+            );
+        }
         if self.dyn_gpu.rebind {
             self.rebuild_world_groups();
         }
@@ -3623,6 +3639,15 @@ impl Renderer {
                 .and_then(|t| t.pass(gpu_timer::BAKE));
             self.dyn_gpu.encode_bake(&mut encoder, &l.bake, ts);
         }
+        // (v220) Atlas des ombres des joueurs : effacé, puis les joueurs à portée de chaque
+        // lumière, dans ses cases (et seulement effacé quand il n'y a plus personne).
+        if !self.dyn_gpu.ent_jobs.is_empty() || self.dyn_gpu.ent_dirty {
+            if let Some((atlas, _)) = self.dyn_gpu.ent_target() {
+                let draw = !self.dyn_gpu.ent_jobs.is_empty();
+                self.entities.draw_light_casters(&mut encoder, atlas, draw);
+            }
+            self.dyn_gpu.ent_dirty = !self.dyn_gpu.ent_jobs.is_empty();
+        }
         if do_refl {
             // Écrit l'image `latest` (déjà avancée par `ran`) en lisant l'autre.
             let write = self.refl.latest;
@@ -3729,6 +3754,7 @@ impl Renderer {
                         t.generation,
                         t.internal,
                         &t.color_view,
+                        &t.motion_view,
                         &l.deferred,
                         timer,
                     );
@@ -4202,7 +4228,7 @@ fn world_group(
     sky: &sky::Sky,
     psm: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
-    let [d7, d8, d9, d10, d11, d12, d13] = dyn_gpu.bind_entries();
+    let [d7, d8, d9, d10, d11, d12, d13, d23] = dyn_gpu.bind_entries();
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("monde"),
         layout: bgl,
@@ -4242,6 +4268,7 @@ fn world_group(
             d11,
             d12,
             d13,
+            d23,
             wgpu::BindGroupEntry {
                 binding: 14,
                 resource: wgpu::BindingResource::TextureView(mirrors),

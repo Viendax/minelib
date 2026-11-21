@@ -403,6 +403,211 @@ impl rodio::Source for Wobble {
     }
 }
 
+/// (v220) Crépitement électrique sans fin et jamais pareil (la Foudre de Zeus tenue) : des
+/// claquements secs (bruit d'une à trois millisecondes), parfois en rafale, de temps en temps
+/// un grésillement (bruit filtré, 20 à 70 ms) ou un « zap » (dents de scie qui tombent d'une
+/// octave en 40 à 90 ms). Instants, forces et hauteurs tirés au hasard à chaque fois : rien
+/// ne se répète (règle des sons du jeu : voir `claude/sons.md` du projet).
+pub struct Crackle {
+    rng: u64,
+    sparks: Vec<Spark>,
+    /// Échantillons avant le prochain claquement, et avant le prochain grésillement ou zap ;
+    /// claquements encore à venir dans la rafale en cours.
+    next_click: u32,
+    next_buzz: u32,
+    burst: u32,
+    /// Filtres (passe-bas d'un pôle) du bruit des grésillements, et du tout (adoucit).
+    lp: f32,
+    out: f32,
+}
+
+#[derive(Clone, Copy)]
+struct Spark {
+    /// 0 claquement, 1 grésillement, 2 zap.
+    kind: u8,
+    age: u32,
+    len: u32,
+    amp: f32,
+    freq: f32,
+    phase: f32,
+}
+
+impl Crackle {
+    pub fn new(seed: u64) -> Self {
+        let mut c = Self {
+            rng: seed | 1,
+            sparks: Vec::new(),
+            next_click: 0,
+            next_buzz: 0,
+            burst: 0,
+            lp: 0.0,
+            out: 0.0,
+        };
+        c.next_click = c.between(200, 2_000);
+        c.next_buzz = c.between(4_000, 20_000);
+        c
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // xorshift64*.
+        self.rng ^= self.rng >> 12;
+        self.rng ^= self.rng << 25;
+        self.rng ^= self.rng >> 27;
+        self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Au hasard dans 0..1.
+    fn unit(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Nombre d'échantillons au hasard dans `a..b`.
+    fn between(&mut self, a: u32, b: u32) -> u32 {
+        a + (self.unit() * (b - a) as f32) as u32
+    }
+
+    fn noise(&mut self) -> f32 {
+        self.unit() * 2.0 - 1.0
+    }
+
+    fn spark(&mut self, kind: u8) {
+        let ms = synth::RATE / 1000;
+        let s = match kind {
+            0 => Spark {
+                kind,
+                age: 0,
+                len: self.between(ms, 3 * ms),
+                amp: 0.25 + 0.75 * self.unit(),
+                freq: 0.0,
+                phase: 0.0,
+            },
+            1 => Spark {
+                kind,
+                age: 0,
+                len: self.between(20 * ms, 70 * ms),
+                amp: 0.15 + 0.3 * self.unit(),
+                freq: 0.0,
+                phase: 0.0,
+            },
+            _ => Spark {
+                kind,
+                age: 0,
+                len: self.between(40 * ms, 90 * ms),
+                amp: 0.12 + 0.2 * self.unit(),
+                freq: 280.0 * 2f32.powf(self.unit() * 1.6),
+                phase: 0.0,
+            },
+        };
+        if self.sparks.len() < 24 {
+            self.sparks.push(s);
+        }
+    }
+}
+
+impl Iterator for Crackle {
+    type Item = i16;
+
+    fn next(&mut self) -> Option<i16> {
+        // Claquements : un à la fois (10 à 95 ms d'écart), ou une rafale de 3 à 6 très
+        // rapprochés (2 à 9 ms).
+        if self.next_click == 0 {
+            self.spark(0);
+            if self.burst > 0 {
+                self.burst -= 1;
+                self.next_click = self.between(60, 300);
+            } else if self.unit() < 0.18 {
+                self.burst = self.between(2, 6);
+                self.next_click = self.between(60, 300);
+            } else {
+                self.next_click = self.between(320, 3_000);
+            }
+        }
+        self.next_click -= 1;
+        if self.next_buzz == 0 {
+            let zap = self.unit() < 0.4;
+            self.spark(if zap { 2 } else { 1 });
+            self.next_buzz = self.between(11_000, 45_000);
+        }
+        self.next_buzz -= 1;
+        let mut v = 0.0f32;
+        let mut sparks = std::mem::take(&mut self.sparks);
+        for sp in &mut sparks {
+            let u = sp.age as f32 / sp.len.max(1) as f32;
+            v += match sp.kind {
+                0 => {
+                    // Bruit dont la force tombe vite (exponentielle).
+                    self.noise() * sp.amp * (-5.0 * u).exp()
+                }
+                1 => {
+                    // Bruit adouci (passe-bas), montée de 2 ms, puis baisse.
+                    let n = self.noise();
+                    self.lp += 0.35 * (n - self.lp);
+                    let env = (sp.age as f32 / 64.0).min(1.0) * (1.0 - u);
+                    (n - self.lp) * sp.amp * env
+                }
+                _ => {
+                    // Dents de scie qui tombent d'une octave, un peu de bruit dessus.
+                    let f = sp.freq * 2f32.powf(-u);
+                    sp.phase = (sp.phase + f / synth::RATE as f32).fract();
+                    let saw = sp.phase * 2.0 - 1.0;
+                    (saw * 0.8 + self.noise() * 0.2) * sp.amp * (1.0 - u) * (1.0 - u)
+                }
+            };
+            sp.age += 1;
+        }
+        sparks.retain(|sp| sp.age < sp.len);
+        self.sparks = sparks;
+        // Un peu adouci, et jamais saturé.
+        self.out += 0.6 * (v - self.out);
+        Some((self.out.tanh() * 0.8 * i16::MAX as f32) as i16)
+    }
+}
+
+impl rodio::Source for Crackle {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        1
+    }
+    fn sample_rate(&self) -> u32 {
+        synth::RATE
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// (v220) Éclairs tenus qui crépitent cette image (le sien, ceux des autres joueurs à moins
+/// de `ZEUS_HEAR` blocs) : chacun sa boucle sans fin (`Crackle`), qui vient de sa direction
+/// (oreille gauche ou droite) et dont le volume suit sa distance. Une liste vide arrête tout.
+pub fn crackles(list: Vec<CrackleAt>) {
+    if let Some(tx) = sender() {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(Cmd {
+                file: "",
+                volume: 0.0,
+                delay: 0.0,
+                speed: 1.0,
+                voice: None,
+                reopen: false,
+                pcm: None,
+                rain: None,
+                crackle: Some(list),
+            });
+        }
+    }
+}
+
+/// (v220) Portée (blocs) du crépitement d'un éclair tenu, et son volume à `d` blocs (1
+/// tout près, 0 à la portée).
+pub const ZEUS_HEAR: f32 = 10.0;
+
+pub fn crackle_gain(d: f32) -> f32 {
+    let x = (1.0 - d / ZEUS_HEAR).clamp(0.0, 1.0);
+    x * x
+}
+
 /// (v219) Objet ramassé : un petit « pop » calculé (voir `synth::pop`), plus ou moins aigu
 /// à chaque fois.
 pub fn pickup() {
@@ -422,6 +627,7 @@ pub fn pickup() {
                 reopen: false,
                 pcm: Some((pcm, rate)),
                 rain: None,
+                crackle: None,
             });
         }
     }
@@ -470,7 +676,21 @@ struct Cmd {
     pcm: Option<(Vec<i16>, u32)>,
     /// (v216) Volume de la pluie (son de fond en boucle ; 0 : silence).
     rain: Option<f32>,
+    /// (v220) Crépitements des Foudres de Zeus tenues (voir `crackles`).
+    crackle: Option<Vec<CrackleAt>>,
 }
+
+/// (v220) Un éclair tenu qui crépite : son numéro (une boucle par éclair), sa direction
+/// vue de l'oreille (repère de l'écoute : x à droite, unitaire) et son volume (distance).
+#[derive(Clone, Copy, Debug)]
+pub struct CrackleAt {
+    pub id: u64,
+    pub dir: [f32; 3],
+    pub gain: f32,
+}
+
+/// (v220) Volume propre du crépitement (× la distance, × le volume du jeu).
+const CRACKLE_VOLUME: f32 = 0.22;
 
 /// (v215) Volume du jeu (Paramètres → Son), à part du volume de chaque son : changé, il
 /// vaut tout de suite pour les sons en cours aussi (feu, bips de la bombe), comme le volume
@@ -500,6 +720,7 @@ pub fn set_master(v: f32) {
                 reopen: false,
                 pcm: None,
                 rain: None,
+                crackle: None,
             });
         }
     }
@@ -542,6 +763,7 @@ pub fn set_output(name: &str) {
                 reopen: true,
                 pcm: None,
                 rain: None,
+                crackle: None,
             });
         }
     }
@@ -606,12 +828,15 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                 // (v216) La pluie : une boucle, créée à la première averse, et son volume
                 // propre (sans celui du jeu).
                 let mut rain: Option<(Sink, f32)> = None;
+                // (v220) Crépitements des éclairs tenus : une boucle par éclair.
+                let mut crackling: HashMap<u64, rodio::SpatialSink> = HashMap::new();
                 while let Ok(cmd) = rx.recv() {
                     if cmd.reopen {
                         // Les sons en cours étaient liés à l'ancienne sortie.
                         sinks.clear();
                         voices.clear();
                         rain = None;
+                        crackling.clear();
                         // (L'ancienne fermée d'abord : un périphérique peut ne s'ouvrir
                         // qu'une fois.)
                         drop(out.take());
@@ -623,6 +848,39 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                         continue;
                     };
                     sinks.retain(|s| !s.0.empty());
+                    // (v220) Crépitements : une boucle par éclair tenu, qui suit sa direction
+                    // (l'oreille la plus proche l'entend plus fort) et sa distance (volume).
+                    // Les oreilles à un bloc l'une de l'autre, l'éclair à un bloc : rodio ne
+                    // baisse pas le son de lui-même (la distance est dans `gain`).
+                    if let Some(list) = cmd.crackle {
+                        crackling.retain(|id, sink| {
+                            let keep = list.iter().any(|c| c.id == *id);
+                            if !keep {
+                                sink.stop();
+                            }
+                            keep
+                        });
+                        let (left, right) = ([-0.5, 0.0, 0.0], [0.5, 0.0, 0.0]);
+                        for c in list {
+                            let sink = match crackling.entry(c.id) {
+                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    match rodio::SpatialSink::try_new(handle, c.dir, left, right) {
+                                        Ok(s) => {
+                                            s.append(Crackle::new(
+                                                c.id ^ (jitter().to_bits() as u64) << 20,
+                                            ));
+                                            e.insert(s)
+                                        }
+                                        Err(_) => continue,
+                                    }
+                                }
+                            };
+                            sink.set_emitter_position(c.dir);
+                            sink.set_volume(CRACKLE_VOLUME * c.gain * master());
+                        }
+                        continue;
+                    }
                     // (v216) Pluie : son de fond en boucle, à son volume (× celui du jeu).
                     if let Some(volume) = cmd.rain {
                         if volume <= 0.0 {
@@ -742,6 +1000,7 @@ pub fn play(sfx: Sfx, delay: f32, gain: f32) {
                 reopen: false,
                 pcm: None,
                 rain: None,
+                crackle: None,
             });
         }
     }
@@ -762,6 +1021,7 @@ pub fn rain(volume: f32) {
                 reopen: false,
                 pcm: None,
                 rain: Some(volume.clamp(0.0, 1.0)),
+                crackle: None,
             });
         }
     }
@@ -795,6 +1055,7 @@ pub fn thunder(distance: f32, seed: u32) {
                 reopen: false,
                 pcm: Some((pcm, rate)),
                 rain: None,
+                crackle: None,
             });
         });
 }
@@ -812,6 +1073,7 @@ pub fn voice(who: u64, samples: Vec<i16>, volume: f32) {
                 reopen: false,
                 pcm: None,
                 rain: None,
+                crackle: None,
             });
         }
     }
@@ -1136,6 +1398,32 @@ pub mod synth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v220) Le crépitement de l'éclair tenu : de vrais craquements (ni silence ni
+    /// saturation), jamais deux fois la même chose (deux demi-secondes de suite diffèrent,
+    /// deux éclairs aussi), et entendu jusqu'à `ZEUS_HEAR` blocs seulement.
+    #[test]
+    fn the_crackle_never_repeats() {
+        let half = synth::RATE as usize / 2;
+        let a: Vec<i16> = Crackle::new(7).take(half * 6).collect();
+        let b: Vec<i16> = Crackle::new(8).take(half * 6).collect();
+        let peak = a.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+        assert!(peak > 3_000 && peak < i16::MAX as u16, "pic {peak}");
+        // Des silences entre les craquements (ce n'est pas un souffle continu).
+        let quiet = a.iter().filter(|v| v.unsigned_abs() < 200).count();
+        assert!(quiet > a.len() / 4, "silences : {quiet}");
+        for w in 0..5 {
+            assert_ne!(
+                a[w * half..(w + 1) * half],
+                a[(w + 1) * half..(w + 2) * half]
+            );
+        }
+        assert_ne!(a, b);
+        assert_eq!(crackle_gain(0.0), 1.0);
+        assert!(crackle_gain(5.0) > 0.2 && crackle_gain(5.0) < 0.3);
+        assert_eq!(crackle_gain(ZEUS_HEAR), 0.0);
+        assert_eq!(crackle_gain(30.0), 0.0);
+    }
 
     /// (v219) Le « pop » d'un objet ramassé : court, pas saturé, sans clic à la fin ; la
     /// pluie lue en ondulant ne s'arrête jamais et reste dans ± un demi-ton.

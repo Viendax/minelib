@@ -54,6 +54,33 @@ const NOISE_SIZE: u32 = 32;
 /// de lumière et un de profondeur.
 const VL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
 const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// (v220) Atlas des ombres des joueurs (voir `EntJob`) : au plus ce côté (pixels). En
+/// qualité Haute et Ultra, la moitié de l'atlas des blocs (mêmes cases, en proportion).
+const ENT_ATLAS_MAX: u32 = 4096;
+/// Joueurs au plus dans l'atlas des joueurs à une image, toutes lumières comprises.
+pub(crate) const MAX_ENT_CASTERS: usize = 4096;
+/// Format de l'atlas des joueurs (la passe des joueurs y écrit sa profondeur).
+pub(crate) const ENT_ATLAS_FORMAT: wgpu::TextureFormat = ATLAS_FORMAT;
+
+/// (v220) Une case de l'atlas des ombres des joueurs à dessiner à cette image : sa place
+/// (pixels : x, y, côté), le repère de la lumière pour elle (le même que celui de sa carte des
+/// blocs), et les joueurs à y dessiner (place dans `DynGpu::ent_casters`).
+#[derive(Clone, Debug)]
+pub(crate) struct EntJob {
+    pub rect: [u32; 3],
+    pub frame: EntFrame,
+    pub casters: std::ops::Range<u32>,
+}
+
+/// Uniformes d'une case de l'atlas des joueurs (`LightJob` de players.wgsl).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub(crate) struct EntFrame {
+    pub pos_range: [f32; 4],
+    pub right: [f32; 4],
+    pub up: [f32; 4],
+    pub fwd: [f32; 4],
+}
 
 /// Sorte de lumière.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -541,6 +568,7 @@ fn pack_light(
     rect: [f32; 3],
     box_sphere: [f32; 4],
     soft: bool,
+    ent: bool,
 ) -> GpuLight {
     let spot = l.kind == DynKind::Spot;
     let outer = l.outer_deg.clamp(1.0, 179.0);
@@ -597,11 +625,12 @@ fn pack_light(
             if soft { 0.0 } else { 1.0 },
             if l.owner != 0 { 1.0 } else { 0.0 },
         ],
+        // (v220) w = 1 : des joueurs à sa portée dans l'atlas des ombres des joueurs.
         boxes: [
             boxes as u32,
             (boxes >> 32) as u32,
             box_cone(Vec3::from(l.pos), box_sphere).1.to_bits(),
-            0,
+            ent as u32,
         ],
         right: {
             let (r, _, _) = spot_basis(d);
@@ -1061,6 +1090,9 @@ pub(crate) struct DeferredPipes {
     water_interp: wgpu::RenderPipeline,
     water: wgpu::RenderPipeline,
     water_hard: wgpu::RenderPipeline,
+    /// (v220) Ombres des joueurs aux lumières : un peu de mouvement pour l'anticrénelage
+    /// (`fs_shadow_motion`).
+    motion: wgpu::RenderPipeline,
 }
 
 /// (v199) Groupes des passes de l'eau (voir `encode_water`), pour les images du TAA de
@@ -1216,15 +1248,30 @@ pub(crate) struct DynGpu {
     vl_noise: bool,
     /// Une lumière au moins a des ombres douces (sinon : l'éclairage différé sans leur code).
     any_soft: bool,
+    /// (v220) Une lumière au moins a des ombres de joueurs (boîtes ou atlas des joueurs) :
+    /// passe du mouvement de leurs ombres (voir `encode_deferred`).
+    any_player_shadow: bool,
     /// Éclairage en demi-résolution à cette image (réglage coché et plus rapide ici).
     half_now: bool,
     half_trial: HalfTrial,
     gpu_lights: Vec<GpuLight>,
     tiles: Vec<u32>,
+    /// (v220) Atlas des ombres des joueurs : mêmes cases que `atlas`, en proportion. Effacé
+    /// puis redessiné à chaque image où des joueurs sont à portée d'une lumière qui a sa
+    /// carte : toute une foule y fait son ombre, au-delà des boîtes exactes.
+    ent_atlas: Option<(wgpu::Texture, wgpu::TextureView)>,
+    ent_size: u32,
+    /// Cases de l'atlas des joueurs à dessiner à cette image, et leurs joueurs (indices dans
+    /// les joueurs donnés à `prepare`).
+    pub(crate) ent_jobs: Vec<EntJob>,
+    pub(crate) ent_casters: Vec<u32>,
+    /// Il y a quelque chose dans l'atlas des joueurs (à effacer quand il n'y a plus rien).
+    pub(crate) ent_dirty: bool,
 }
 
-/// Entrées du groupe du monde (liaisons 7 à 13) pour les lumières dynamiques.
-pub(crate) fn world_layout_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
+/// Entrées du groupe du monde (liaisons 7 à 13, et (v220) 23) pour les lumières
+/// dynamiques.
+pub(crate) fn world_layout_entries() -> [wgpu::BindGroupLayoutEntry; 8] {
     let frag = wgpu::ShaderStages::FRAGMENT;
     [
         wgpu::BindGroupLayoutEntry {
@@ -1289,7 +1336,38 @@ pub(crate) fn world_layout_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         },
+        // (v220) Atlas des ombres des joueurs.
+        wgpu::BindGroupLayoutEntry {
+            binding: 23,
+            visibility: frag,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
     ]
+}
+
+/// (v220) Un atlas des ombres des joueurs de `size` pixels de côté.
+fn ent_atlas(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ombres des joueurs aux lumières"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: ENT_ATLAS_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    (tex, view)
 }
 
 fn tex_entry(
@@ -1486,6 +1564,26 @@ pub(crate) fn light_pipes(
             true,
             false,
         );
+        // (v220) Ombres des joueurs : mouvement ajouté sur l'image des mouvements.
+        let motion = sc.spawn(move || {
+            timed("ombres des joueurs : mouvement", || {
+                stencil_variant(
+                    device,
+                    "ombres des joueurs : mouvement",
+                    def_layout,
+                    def_shader,
+                    "vs_tiles",
+                    "fs_shadow_motion",
+                    crate::taa::MOTION_FORMAT,
+                    Some(wgpu::BlendState {
+                        color: add,
+                        alpha: add,
+                    }),
+                    &[("DL_SOFT_SHADOWS", 0.0)],
+                    None,
+                )
+            })
+        });
         // (v199) Eau, verre, glace : la face translucide de chaque pixel, de la même façon.
         let (water_layout, water_interp_layout) = (&water_layout, &water_interp_layout);
         let water =
@@ -1688,6 +1786,7 @@ pub(crate) fn light_pipes(
                 water_interp: water_interp.join().expect("lumières sur l'eau"),
                 water: water_exact.join().expect("lumières sur l'eau"),
                 water_hard: water_exact_hard.join().expect("lumières sur l'eau"),
+                motion: motion.join().expect("ombres des joueurs : mouvement"),
             },
             arm.join().expect("pipeline du bras éclairé"),
         )
@@ -2171,10 +2270,16 @@ impl DynGpu {
             vl_active: false,
             vl_noise: true,
             any_soft: true,
+            any_player_shadow: false,
             half_now: false,
             half_trial: HalfTrial::default(),
             gpu_lights: Vec::new(),
             tiles: vec![0; (TILES_X * TILES_Y * WORDS) as usize],
+            ent_atlas: None,
+            ent_size: 0,
+            ent_jobs: Vec::new(),
+            ent_casters: Vec::new(),
+            ent_dirty: false,
         };
         g.placeholder_atlas(device);
         g.rebind = false;
@@ -2203,6 +2308,9 @@ impl DynGpu {
         self.atlas_size = 16;
         self.tile_size = 16;
         self.quality = u8::MAX;
+        self.ent_atlas = Some(ent_atlas(device, 16));
+        self.ent_size = 16;
+        self.ent_dirty = true;
         self.cache.reset(0);
         self.rebind = true;
     }
@@ -2297,20 +2405,35 @@ impl DynGpu {
         self.atlas_size = size;
         self.tile_size = tile;
         self.quality = q;
+        // (v220) L'atlas des joueurs : mêmes cases, en proportion (au plus `ENT_ATLAS_MAX`).
+        let ent = size.min(ENT_ATLAS_MAX);
+        self.ent_atlas = Some(ent_atlas(device, ent));
+        self.ent_size = ent;
+        self.ent_dirty = true;
         let per = (size / tile) as usize;
         self.cache.reset(per * per);
         self.rebind = true;
         log::info!(
-            "ombres des lumières : qualité {} (atlas {size} px, {} cases de {tile} px, {} Mo)",
+            "ombres des lumières : qualité {} (atlas {size} px, {} cases de {tile} px, {} Mo ; joueurs {ent} px)",
             SHADOW_QUALITY_NAMES[q as usize],
             per * per,
-            size as u64 * size as u64 * 4 / (1024 * 1024)
+            (size as u64 * size as u64 + ent as u64 * ent as u64) * 4 / (1024 * 1024)
         );
     }
 
-    /// Liaisons 7 à 13 du groupe du monde.
-    pub fn bind_entries(&self) -> [wgpu::BindGroupEntry<'_>; 7] {
+    /// (v220) L'atlas des ombres des joueurs (pour sa passe : voir `Entities::draw_light_casters`)
+    /// et la taille d'une de ses cases.
+    pub(crate) fn ent_target(&self) -> Option<(&wgpu::TextureView, u32)> {
+        let per = (self.atlas_size / self.tile_size.max(1)).max(1);
+        self.ent_atlas
+            .as_ref()
+            .map(|(_, v)| (v, (self.ent_size / per).max(1)))
+    }
+
+    /// Liaisons 7 à 13 du groupe du monde, et (v220) 23.
+    pub fn bind_entries(&self) -> [wgpu::BindGroupEntry<'_>; 8] {
         let atlas = &self.atlas.as_ref().expect("atlas des ombres").1;
+        let ent = &self.ent_atlas.as_ref().expect("atlas des joueurs").1;
         [
             wgpu::BindGroupEntry {
                 binding: 7,
@@ -2339,6 +2462,10 @@ impl DynGpu {
             wgpu::BindGroupEntry {
                 binding: 13,
                 resource: wgpu::BindingResource::Sampler(&self.gobo_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 23,
+                resource: wgpu::BindingResource::TextureView(ent),
             },
         ]
     }
@@ -2397,6 +2524,7 @@ impl DynGpu {
         view_proj: Mat4,
         eye: Vec3,
         boxes: &[crate::ShadowBox],
+        casters: &[[f32; 3]],
         time: f32,
         voxels: Option<[i32; 3]>,
     ) -> u32 {
@@ -2516,10 +2644,68 @@ impl DynGpu {
                 }
             }
         }
+        // (v220) 3 bis. Atlas des ombres des joueurs : pour chaque lumière qui a sa carte, les
+        // joueurs à sa portée (toute une foule, au-delà des boîtes exactes), dessinés dans les
+        // mêmes cases que sa carte des blocs (une, ou six pour un cube), avec le même repère.
+        self.ent_jobs.clear();
+        self.ent_casters.clear();
+        let mut ent_of = vec![false; self.lights.len()];
+        if st.shadows && st.entity_shadows && !casters.is_empty() {
+            let per = (self.atlas_size / self.tile_size.max(1)).max(1);
+            let et = (self.ent_size / per).max(1);
+            for (i, l) in self.lights.iter().enumerate() {
+                let (Some(tile), true) = (tiles_of[i], l.shadows) else {
+                    continue;
+                };
+                let Some(slot) = self.cache.slots.get(&l.id) else {
+                    continue;
+                };
+                let p = Vec3::from(l.pos);
+                let reach = l.range.max(0.05) + 1.5;
+                let start = self.ent_casters.len() as u32;
+                for (k, f) in casters.iter().enumerate() {
+                    if self.ent_casters.len() >= MAX_ENT_CASTERS {
+                        break;
+                    }
+                    // (Le milieu du joueur, à 1,5 bloc près : sa taille.)
+                    let mid = Vec3::from(*f) + Vec3::Y * 0.9;
+                    if mid.distance_squared(p) < reach * reach {
+                        self.ent_casters.push(k as u32);
+                    }
+                }
+                let end = self.ent_casters.len() as u32;
+                if end == start {
+                    continue;
+                }
+                ent_of[i] = true;
+                let range = l.range.max(0.05);
+                let mut push = |t: u32, (r, u, f): (Vec3, Vec3, Vec3), tan_half: f32| {
+                    let (row, col) = (t / per, t % per);
+                    self.ent_jobs.push(EntJob {
+                        rect: [col * et, row * et, et],
+                        frame: EntFrame {
+                            pos_range: [p.x, p.y, p.z, range],
+                            right: [r.x, r.y, r.z, 0.0],
+                            up: [u.x, u.y, u.z, 0.0],
+                            fwd: [f.x, f.y, f.z, tan_half],
+                        },
+                        casters: start..end,
+                    });
+                };
+                if slot.key.kind == 2 {
+                    for f in 0..6 {
+                        push(tile + f, face_basis(f), 1.0);
+                    }
+                } else {
+                    push(tile, spot_basis(unit_dir(l.dir)), slot.key.tan_half);
+                }
+            }
+        }
         let nboxes = boxes.len().min(MAX_BOXES);
         let box_shadows = st.shadows && st.entity_shadows && nboxes > 0;
         self.gpu_lights.clear();
         self.any_soft = false;
+        self.any_player_shadow = false;
         let atlas_px = self.atlas_size.max(1) as f32;
         let tile_uv = self.tile_size as f32 / atlas_px;
         for (i, l) in self.lights.iter().enumerate() {
@@ -2539,8 +2725,16 @@ impl DynGpu {
             let soft = st.shadows && st.block_shadows && l.shadows;
             // (Une lumière sans carte prête n'a pas d'ombre des blocs, douce ou non.)
             self.any_soft |= soft && tiles_of[i].is_some();
-            self.gpu_lights
-                .push(pack_light(l, tiles_of[i], mask, rect, sphere, soft));
+            self.any_player_shadow |= mask != 0 || ent_of[i];
+            self.gpu_lights.push(pack_light(
+                l,
+                tiles_of[i],
+                mask,
+                rect,
+                sphere,
+                soft,
+                ent_of[i],
+            ));
         }
         bin_tiles(&self.lights, view_proj, eye, &mut self.tiles);
         lit_rects(&self.tiles, &mut self.rects);
@@ -2942,6 +3136,7 @@ impl DynGpu {
         generation: u64,
         size: (u32, u32),
         color: &wgpu::TextureView,
+        motion: &wgpu::TextureView,
         pipes: &DeferredPipes,
         timer: Option<&crate::gpu_timer::GpuTimer>,
     ) {
@@ -3098,6 +3293,29 @@ impl DynGpu {
         });
         pass.set_bind_group(1, &t.groups[depth_index], &[]);
         pass.draw(0..6, 0..self.rects.len() as u32);
+        drop(pass);
+        // (v220) 3. Ombres des joueurs : un peu de mouvement là où elles tombent (voir
+        // `fs_shadow_motion`), seulement si une lumière en a.
+        if self.any_player_shadow {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ombres des joueurs : mouvement"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: motion,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipes.motion);
+            pass.set_bind_group(0, world_group, &[]);
+            pass.set_bind_group(1, &t.groups[depth_index], &[]);
+            pass.draw(0..6, 0..self.rects.len() as u32);
+        }
     }
 
     /// Nombre de rectangles de cases éclairées à l'écran (0 : aucune lumière en vue, les
@@ -3658,6 +3876,7 @@ mod tests {
             [0.25, 0.5, 0.0625],
             [1.0, 2.0, 3.0, 4.0],
             false,
+            true,
         );
         // Ombres douces décochées : arrêt net par les murs.
         assert_eq!(g.shadow[2], 1.0);
@@ -3669,6 +3888,8 @@ mod tests {
         assert_eq!(g.color, [2.0, 1.0, 0.0, 2.0]);
         assert_eq!((g.shadow[0], g.vol[3]), (1.0, 5.0));
         assert_eq!(g.boxes[0], 0b101);
+        // (v220) Des joueurs à portée dans l'atlas des joueurs.
+        assert_eq!(g.boxes[3], 1);
         // Repère du projecteur, case et sphère : passés tels quels au shader ; le repère
         // est celui des cartes d'ombre (`spot_basis`).
         let (r, u, _) = spot_basis(Vec3::new(0.0, 0.0, -1.0));
@@ -3691,8 +3912,10 @@ mod tests {
             [0.0; 3],
             [0.0, 0.0, 0.0, -1.0],
             true,
+            false,
         );
         assert_eq!(p.cookie[0], -1.0);
+        assert_eq!(p.boxes[3], 0);
         assert_eq!(p.shadow[2], 0.0);
         assert_eq!((p.shadow[0], p.vol[3]), (0.0, -1.0));
         assert_eq!(p.dir_type[3], 0.0);

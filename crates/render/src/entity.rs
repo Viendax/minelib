@@ -143,6 +143,10 @@ pub const PLAYER_SKINS: u32 = 64;
 
 /// Sommets au plus du modèle commun (six pavés : 216).
 const MESH_MAX: usize = 512;
+/// (v220) Cases au plus de l'atlas des joueurs à une image, et place des uniformes de
+/// chacune (alignement des décalages dynamiques).
+const MAX_LIGHT_JOBS: usize = 384;
+const LIGHT_JOB_STRIDE: u64 = 256;
 
 /// (v215) Le ciel des blocs, recopié tel quel à l'assemblage : le brouillard des entités
 /// et des joueurs va vers le même ciel que celui des blocs, sans un second ciel à tenir à
@@ -192,6 +196,15 @@ struct Players {
     sun: wgpu::RenderPipeline,
     sun_instances: wgpu::Buffer,
     sun_count: u32,
+    /// (v220) Atlas des ombres des joueurs aux lumières dynamiques (voir `lights::EntJob`) :
+    /// leur profondeur vue de chaque lumière (distance rapportée à sa portée), une case par
+    /// case de la carte des blocs ; uniformes de chaque case (décalage dynamique), joueurs
+    /// de chacune (à la suite), et les cases de l'image (place, décalage, joueurs).
+    light: wgpu::RenderPipeline,
+    light_jobs: wgpu::Buffer,
+    light_group: wgpu::BindGroup,
+    light_instances: wgpu::Buffer,
+    light_draws: Vec<([u32; 3], u32, std::ops::Range<u32>)>,
     skins: wgpu::Texture,
     group: wgpu::BindGroup,
 }
@@ -414,6 +427,96 @@ impl Players {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // (v220) Ombres des joueurs aux lumières dynamiques : leur distance à la lumière,
+        // dans l'atlas des joueurs (voir `lights::EntJob`). Une case à la fois (ses
+        // uniformes par décalage dynamique) ; faces des deux côtés.
+        let light_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("joueurs : ombre aux lumières"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 24,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                        crate::lights::EntFrame,
+                    >() as u64),
+                },
+                count: None,
+            }],
+        });
+        let light_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("joueurs : ombre aux lumières"),
+            bind_group_layouts: &[&light_bgl],
+            push_constant_ranges: &[],
+        });
+        let light = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("joueurs : ombre aux lumières"),
+            layout: Some(&light_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_player_light"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<PlayerVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &MESH,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<PlayerInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &INSTANCE,
+                    },
+                ],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::lights::ENT_ATLAS_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_player_light"),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let light_jobs = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("joueurs : ombre aux lumières (cases)"),
+            size: MAX_LIGHT_JOBS as u64 * LIGHT_JOB_STRIDE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("joueurs : ombre aux lumières"),
+            layout: &light_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 24,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &light_jobs,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(
+                        std::mem::size_of::<crate::lights::EntFrame>() as u64
+                    ),
+                }),
+            }],
+        });
+        let light_instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("joueurs : ombre aux lumières (instances)"),
+            size: (crate::lights::MAX_ENT_CASTERS * std::mem::size_of::<PlayerInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             plain: pipeline("joueurs", "fs_player", &[target(surface)]),
             taa: pipeline("joueurs (TAA)", "fs_player_taa", &taa_targets),
@@ -427,8 +530,88 @@ impl Players {
             sun,
             sun_instances,
             sun_count: 0,
+            light,
+            light_jobs,
+            light_group,
+            light_instances,
+            light_draws: Vec::new(),
             skins,
             group,
+        }
+    }
+
+    /// (v220) Cases de l'atlas des joueurs à dessiner (`jobs`), avec leurs joueurs :
+    /// `casters` (indices dans `players`) dans l'ordre des cases.
+    fn set_light_casters(
+        &mut self,
+        queue: &wgpu::Queue,
+        jobs: &[crate::lights::EntJob],
+        casters: &[u32],
+        players: &[PlayerInstance],
+    ) {
+        self.light_draws.clear();
+        let n = casters.len().min(crate::lights::MAX_ENT_CASTERS);
+        let list: Vec<PlayerInstance> = casters[..n]
+            .iter()
+            .filter_map(|&i| players.get(i as usize).copied())
+            .collect();
+        if list.len() != n || n == 0 {
+            return;
+        }
+        queue.write_buffer(&self.light_instances, 0, bytemuck::cast_slice(&list));
+        let mut frames = vec![0u8; jobs.len().min(MAX_LIGHT_JOBS) * LIGHT_JOB_STRIDE as usize];
+        for (k, j) in jobs.iter().take(MAX_LIGHT_JOBS).enumerate() {
+            let at = k * LIGHT_JOB_STRIDE as usize;
+            let bytes = bytemuck::bytes_of(&j.frame);
+            frames[at..at + bytes.len()].copy_from_slice(bytes);
+            let end = j.casters.end.min(n as u32);
+            if j.casters.start < end {
+                self.light_draws.push((
+                    j.rect,
+                    (k as u64 * LIGHT_JOB_STRIDE) as u32,
+                    j.casters.start..end,
+                ));
+            }
+        }
+        if !frames.is_empty() {
+            queue.write_buffer(&self.light_jobs, 0, &frames);
+        }
+    }
+
+    /// (v220) La passe de l'atlas des joueurs : effacé (distance 1 : personne), puis chaque
+    /// case et ses joueurs.
+    fn draw_light_casters(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        atlas: &wgpu::TextureView,
+        draw: bool,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ombres des joueurs aux lumières"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: atlas,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if !draw || self.mesh_count == 0 || self.light_draws.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&self.light);
+        pass.set_vertex_buffer(0, self.mesh.slice(..));
+        pass.set_vertex_buffer(1, self.light_instances.slice(..));
+        for (rect, offset, range) in &self.light_draws {
+            let [x, y, size] = *rect;
+            pass.set_viewport(x as f32, y as f32, size as f32, size as f32, 0.0, 1.0);
+            pass.set_scissor_rect(x, y, size, size);
+            pass.set_bind_group(0, &self.light_group, &[*offset]);
+            pass.draw(0..self.mesh_count, range.clone());
         }
     }
 
@@ -756,6 +939,29 @@ impl Entities {
     /// (v217) Ceux qui font leur ombre au soleil par la carte (voir `sunmap`).
     pub(crate) fn prepare_sun_casters(&mut self, queue: &wgpu::Queue, players: &[PlayerInstance]) {
         self.players.set_sun_casters(queue, players);
+    }
+
+    /// (v220) Joueurs de l'atlas des ombres des joueurs (voir `lights::EntJob`).
+    pub(crate) fn prepare_light_casters(
+        &mut self,
+        queue: &wgpu::Queue,
+        jobs: &[crate::lights::EntJob],
+        casters: &[u32],
+        players: &[PlayerInstance],
+    ) {
+        self.players
+            .set_light_casters(queue, jobs, casters, players);
+    }
+
+    /// (v220) Passe de l'atlas des ombres des joueurs : effacé, puis (`draw`) les joueurs de
+    /// chaque case.
+    pub(crate) fn draw_light_casters(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        atlas: &wgpu::TextureView,
+        draw: bool,
+    ) {
+        self.players.draw_light_casters(encoder, atlas, draw);
     }
 
     /// (v217) Passe de la carte d'ombre du soleil : les joueurs, vus du soleil.

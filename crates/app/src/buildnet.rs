@@ -281,6 +281,10 @@ pub struct BuildNet {
     /// (v165) Son ping (ms) avec le relais qui sert l'endroit où l'on est (0 : pas encore
     /// mesuré) : il part avec ses positions, montré aux autres dans leur liste (Tab).
     ping: u16,
+    /// (v220) Son monde n'est pas encore chargé (voir `Session::loading`) : sa position ne
+    /// part pas, les autres ne le voient pas apparaître avant. (Ce qu'il faut du monde, si :
+    /// le relais apprend dans quel chunk on arrive et envoie ce qu'il y a de changé.)
+    pub hidden: bool,
     /// Clé du relais du monde (dans le billet) : vérifie les bonjours de la voix.
     root: Option<[u8; 32]>,
     /// Clé du compte (modifications signées dans une région souveraine), et date de la
@@ -499,6 +503,7 @@ impl BuildNet {
             spot_timer: 0.0,
             voice_in: Vec::new(),
             ping: 0,
+            hidden: false,
             root: None,
             identity: None,
             sign_t: 0,
@@ -1751,7 +1756,7 @@ impl BuildNet {
         self.from_shard = None;
         self.pos_timer -= dt;
         self.spot_timer -= dt;
-        if self.pos_timer <= 0.0 {
+        if self.pos_timer <= 0.0 && !self.hidden {
             self.pos_timer = pos_every(self.others.len());
             let msg = BuildMsg::Player {
                 pseudo: self.pseudo.clone(),

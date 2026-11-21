@@ -226,6 +226,28 @@ pub fn visible_part(a: &ScreenAnchor, view_proj: glam::Mat4) -> f32 {
     dedans as f32 / (N * N) as f32
 }
 
+/// (v220) Distance où le rayon (`eye`, `dir`) entre dans la boîte (`min`, `max`), jusqu'à
+/// `limit` : la hitbox d'un écran touchée par derrière ou par le côté.
+pub fn aim_box(min: Vec3, max: Vec3, eye: Vec3, dir: Vec3, limit: f32) -> Option<f32> {
+    let mut near = 0.0f32;
+    let mut far = limit;
+    for k in 0..3 {
+        if dir[k].abs() < 1e-9 {
+            if eye[k] < min[k] || eye[k] > max[k] {
+                return None;
+            }
+            continue;
+        }
+        let (a, b) = ((min[k] - eye[k]) / dir[k], (max[k] - eye[k]) / dir[k]);
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+        if near > far {
+            return None;
+        }
+    }
+    Some(near)
+}
+
 pub fn aim(a: &ScreenAnchor, eye: Vec3, dir: Vec3, limit: f32) -> Option<(f32, [f32; 2])> {
     let c = Vec3::from(a.center);
     let r = Vec3::from(a.right);
@@ -1919,6 +1941,30 @@ mod tests {
         // Face +Z du bloc (0,1,0) : z = 1. La hitbox part de la face, épaisseur THICK.
         assert!((mn.z - 1.0).abs() < 1e-5 && (mx.z - (1.0 + THICK)).abs() < 1e-5);
         assert!((mx.x - mn.x - WIDTH).abs() < 1e-5 && (mx.y - mn.y - HEIGHT).abs() < 1e-5);
+    }
+
+    /// (v220) Un écran debout (posé au sol) se touche aussi par derrière et par le côté
+    /// (sa hitbox) ; sa page, seulement de face.
+    #[test]
+    fn la_hitbox_se_touche_aussi_par_derriere() {
+        // Sol : face +Y du bloc (0, 0, 0), le joueur en (0,5 ; 2 ; 9) : l'écran le regarde
+        // (vers +Z).
+        let f = Placed::new([0, 0, 0], [0, 1, 0], Vec3::new(0.5, 2.0, 9.0), NORMAL);
+        let (mn, mx) = f.hitbox();
+        let mid = (mn + mx) * 0.5;
+        let a = f.anchor();
+        // De face : la page (point visé dans 0..1).
+        let eye = mid + Vec3::Z * 3.0;
+        assert!(aim(&a, eye, -Vec3::Z, 10.0).is_some());
+        // Par derrière : pas la page, mais la hitbox, à la bonne distance.
+        let eye = mid - Vec3::Z * 3.0;
+        assert!(aim(&a, eye, Vec3::Z, 10.0).is_none());
+        let t = aim_box(mn, mx, eye, Vec3::Z, 10.0).expect("touchée par derrière");
+        assert!((t - (3.0 - (mx.z - mn.z) * 0.5)).abs() < 1e-3, "{t}");
+        // Par le côté, et pas au-delà de la portée ni à côté.
+        assert!(aim_box(mn, mx, mid + Vec3::X * 4.0, -Vec3::X, 10.0).is_some());
+        assert!(aim_box(mn, mx, mid + Vec3::X * 4.0, -Vec3::X, 1.0).is_none());
+        assert!(aim_box(mn, mx, mid + Vec3::new(4.0, 5.0, 0.0), -Vec3::X, 10.0).is_none());
     }
 
     #[test]

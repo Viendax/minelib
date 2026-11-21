@@ -27,7 +27,8 @@ struct DynLight {
     // (ombres douces décochées), w = 1 (v202) : lumière portée, bords en pente douce.
     shadow: vec4<f32>,
     // x, y = boîtes des joueurs à portée (bits 0..63) : leurs ombres ; z = distance (bits
-    // d'un f32) en deçà de laquelle aucune ne peut cacher la lumière (voir `box_sphere`).
+    // d'un f32) en deçà de laquelle aucune ne peut cacher la lumière (voir `box_sphere`) ;
+    // w = 1 (v220) : des joueurs à portée dans l'atlas des ombres des joueurs.
     boxes: vec4<u32>,
     // Calculés une fois pour toutes par le jeu (pas à chaque pixel) : repère du projecteur
     // (xyz : droite, haut ; right.w = 1 / tan du demi-angle, up.w et rect.w = cos et sin de
@@ -75,6 +76,9 @@ struct DynHeader {
 @group(0) @binding(11) var shadow_cmp: sampler_comparison;
 @group(0) @binding(12) var gobos: texture_2d_array<f32>;
 @group(0) @binding(13) var gobo_sampler: sampler;
+// (v220) Atlas des ombres des joueurs : leur distance à chaque lumière (rapportée à sa
+// portée ; 1 : personne), dans les mêmes cases que les cartes des blocs (voir `EntJob`).
+@group(0) @binding(23) var ent_atlas: texture_depth_2d;
 
 const DL_VL_SHADOWS: u32 = 1u;
 const DL_VL_NOISE: u32 = 2u;
@@ -467,6 +471,27 @@ fn dl_box_shadow(L: DynLight, p: vec3<f32>, entity: bool, l: vec3<f32>, d: f32) 
     return hit;
 }
 
+/// (v220) Ombre des joueurs de l'atlas des joueurs sur le trajet `p` → lumière (0 : caché,
+/// 1 : éclairé ; filtrage bilinéaire comparé, bord doux d'un texel). `l`, `d` : direction
+/// (unitaire) et distance de la lumière vues de `p`.
+fn dl_ent_shadow(L: DynLight, fr: DlFrame, p: vec3<f32>, l: vec3<f32>, d: f32) -> f32 {
+    let s = dl_shadow_uv(L, fr, -l);
+    if s.z < 0.5 {
+        return 1.0;
+    }
+    // Un demi-texel de cet atlas (moins fin que celui des blocs en Haute et Ultra) à
+    // l'intérieur de la case : le filtrage ne lit jamais les joueurs de la case voisine.
+    var rect = fr.rect;
+    if L.shadow.x > 1.5 {
+        rect = dl_tile_rect(L.vol.w + f32(dl_cube_face(-l)));
+    }
+    let px = 0.5 / f32(max(textureDimensions(ent_atlas).x, 1u));
+    let uv = clamp(s.xy, rect.xy + vec2<f32>(px), rect.xy + vec2<f32>(rect.z - px));
+    let range = max(L.pos_range.w, 1e-3);
+    // Marge : 5 centièmes de bloc (le sol sous les pieds n'est pas dans leur ombre propre).
+    return textureSampleCompareLevel(ent_atlas, shadow_cmp, uv, (d - 0.05) / range);
+}
+
 /// Éclairage en bandes (style dessin animé).
 fn dl_toon(x: f32, bands: f32, w: f32) -> f32 {
     let v = clamp(x, 0.0, 1.0) * max(bands, 1.0);
@@ -533,6 +558,11 @@ fn dl_one(
             if boxes_on && att > 0.0 && (L.boxes.x | L.boxes.y) != 0u {
                 att *= 1.0 - dl_box_shadow(L, p + n * 0.02, entity, l, d);
             }
+            // (v220) Les autres joueurs à portée, dans l'atlas des joueurs (sur le monde : un
+            // joueur garde l'ombre des boîtes exactes, sans s'ombrer lui-même).
+            if boxes_on && !entity && att > 0.0 && L.boxes.w != 0u {
+                att *= dl_ent_shadow(L, fr, p + n * 0.02, l, d);
+            }
             var diff = att * ndl;
             if toon {
                 diff = dl_toon(diff, dh.surf.z, dh.surf.w);
@@ -588,6 +618,51 @@ fn dyn_light(
     o.diffuse *= dh.surf.x;
     o.specular *= dh.surf.x;
     return o;
+}
+
+/// (v220) Un joueur fait-il de l'ombre en `p` (normale `n`) à une des lumières de sa tuile
+/// d'écran (boîtes exactes, ou atlas des joueurs) ? Pour l'anticrénelage : voir
+/// `fs_shadow_motion` (dyn_deferred.wgsl).
+fn dl_player_shadowed(p: vec3<f32>, n: vec3<f32>, entity: bool, frag: vec2<f32>, size: vec2<f32>) -> bool {
+    let count = dh.counts.x;
+    if count == 0u || (dh.vl_c.w & DL_BOX_SHADOWS) == 0u {
+        return false;
+    }
+    let base = dl_tile_base(frag, size);
+    let words = dl_tile_words(count);
+    let q = p + n * 0.02;
+    for (var w = 0u; w < words; w++) {
+        var bits = dtiles[base + w];
+        loop {
+            if bits == 0u {
+                break;
+            }
+            let b = firstTrailingBit(bits);
+            bits = bits & (bits - 1u);
+            let L = dlights[min(w * 32u + b, count - 1u)];
+            if (L.boxes.x | L.boxes.y | L.boxes.w) == 0u {
+                continue;
+            }
+            let to_l = L.pos_range.xyz - p;
+            let d2 = dot(to_l, to_l);
+            let r = L.pos_range.w;
+            if d2 >= r * r || d2 <= 1e-8 {
+                continue;
+            }
+            let d = sqrt(d2);
+            let l = to_l / d;
+            if dot(n, l) <= 0.0 || (L.dir_type.w > 0.5 && dot(-l, L.dir_type.xyz) < L.cone.x) {
+                continue;
+            }
+            if (L.boxes.x | L.boxes.y) != 0u && dl_box_shadow(L, q, entity, l, d) > 0.5 {
+                return true;
+            }
+            if !entity && L.boxes.w != 0u && dl_ent_shadow(L, dl_frame(L), q, l, d) < 0.5 {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /// Comme `dyn_light`, avec toutes les lumières (pas seulement celles d'une tuile de

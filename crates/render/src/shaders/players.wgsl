@@ -247,3 +247,52 @@ fn fs_player_taa(i: PlayerOut) -> TaaOut {
     o.surf = vec4<f32>(gb_oct_encode(n), 1.0 - fog, gb_pack_spec(0.5 * (1.0 - fog), false));
     return o;
 }
+
+// ---------------------------------------------------------------- (v220) ombres des lumières
+// Les joueurs dans l'atlas des ombres des joueurs (voir `EntAtlas` dans lights.rs) : une case
+// par projecteur, six par lumière ponctuelle, mêmes places et même repère que l'atlas des
+// blocs. Ce qui y est écrit : la distance à la lumière, rapportée à sa portée (comme les
+// cartes des blocs, shadow_bake.wgsl).
+
+struct LightJob {
+    // xyz = position de la lumière, w = portée.
+    pos_range: vec4<f32>,
+    // Repère de la case : droite, haut, avant (w = tangente du demi-angle ; 1 pour une face
+    // de cube).
+    right: vec4<f32>,
+    up: vec4<f32>,
+    fwd: vec4<f32>,
+};
+
+// (Liaison 24 : après celles du ciel, 16 à 21, et des cartes d'ombre, 22 et 23.)
+@group(0) @binding(24) var<uniform> lj: LightJob;
+
+struct LjOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+};
+
+@vertex
+fn vs_player_light(v: PlayerIn) -> LjOut {
+    let xf = part_matrix(v.part, v);
+    let world = (xf * vec4<f32>(v.pos, 1.0)).xyz;
+    let to = world - lj.pos_range.xyz;
+    let c = vec3<f32>(dot(lj.right.xyz, to), dot(lj.up.xyz, to), dot(lj.fwd.xyz, to));
+    let t = max(lj.fwd.w, 1e-4);
+    var o: LjOut;
+    // Même projection que `dl_shadow_uv` : (x, y) / (z · tan). La profondeur vient du
+    // fragment (distance) : ici, seulement de quoi ne jamais couper devant ni derrière.
+    o.clip = vec4<f32>(c.x / t, c.y / t, c.z * 0.5, c.z);
+    o.world = world;
+    return o;
+}
+
+@fragment
+fn fs_player_light(i: LjOut) -> @builtin(frag_depth) f32 {
+    let d = distance(i.world, lj.pos_range.xyz);
+    // Collé à la lumière (la main qui tient une lampe) : pas d'ombre.
+    if d < 0.3 {
+        discard;
+    }
+    return clamp(d / max(lj.pos_range.w, 1e-3), 0.0, 1.0);
+}

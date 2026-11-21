@@ -81,6 +81,30 @@ fn light_at(px: vec2<i32>, depth: f32, s: vec4<f32>, a: vec4<f32>) -> DynOut {
     return dyn_light(p, n, g.cam_pos.xyz, gloss, entity, frag, g.screen.xy);
 }
 
+/// (v220) Pixel de l'opaque dans l'ombre d'un joueur à une lumière dynamique : un
+/// cinquantième de pixel ajouté à son mouvement (passe additive sur l'image des mouvements,
+/// comme `gb_out` de world.wgsl pour le soleil et les torches) : l'anticrénelage y borne
+/// l'image d'avant de près, une ombre qui bouge ne laisse pas de traînée.
+@fragment
+fn fs_shadow_motion(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let px = vec2<i32>(frag.xy);
+    let depth = textureLoad(scene_depth, px, 0);
+    // (Profondeur inversée : 0, le ciel.)
+    if depth <= 0.0 {
+        discard;
+    }
+    let s = textureLoad(gb_surf, px, 0);
+    let a = textureLoad(gb_albedo, px, 0);
+    let fc = vec2<f32>(px) + 0.5;
+    let ndc = vec2<f32>(fc.x / g.screen.x * 2.0 - 1.0, 1.0 - fc.y / g.screen.y * 2.0);
+    let p = g.cam_pos.xyz + dl_view_offset(g.view_proj, ndc, depth);
+    let n = gb_oct_decode(s.rg);
+    if !dl_player_shadowed(p, n, a.a > 0.995, fc, g.screen.xy) {
+        discard;
+    }
+    return vec4<f32>(0.02, 0.0, 0.0, 0.0);
+}
+
 /// Ce que la lumière `d` ajoute au pixel (albédo `a`, poids diffus `w`, reflets `spec`).
 fn deferred_color(d: DynOut, a: vec4<f32>, w: f32, spec: vec2<f32>) -> vec4<f32> {
     let sp = select(d.specular, d.specular * a.rgb * 1.6, spec.y > 0.5);

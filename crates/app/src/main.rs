@@ -1874,7 +1874,9 @@ impl Game {
             s.game.can_fly = false;
             s.player.flying = false;
             s.voice = Some(voice::Voice::new(link.clone()));
-            s.net = Some(netgame::NetGame::guest(link, sig));
+            // (v220) Présenté à l'hôte seulement une fois son monde chargé (voir
+            // `Session::loading`) : personne ne le voit apparaître avant.
+            s.net = Some(netgame::NetGame::guest_loading(link, sig));
             s.chat.say(
                 if host.is_empty() {
                     "Partie rejointe.".to_string()
@@ -3660,16 +3662,26 @@ impl GameLoop for Game {
             let stats = self.last_stats;
             let sys = self.sysmon.latest();
             let fps_max = self.fps_limit();
+            // (v220) Monde pas encore chargé : un écran de chargement le cache, sans
+            // l'interface du jeu (voir `Session::loading`).
+            let mut loading = None;
+            let mut hud_off = false;
             if let Some(s) = &mut self.session {
                 s.update(input, dt, &mut renderer, active);
                 let _ui = minelib_render::perf::scope("interface");
-                if self.show_debug {
+                loading = s.loading_progress();
+                // (v220) Interface masquée (F1, construction) : pas d'écran F3 non plus.
+                hud_off = s.hud_off();
+                if self.show_debug && loading.is_none() && !hud_off {
                     s.build_debug(frames, sys, &renderer, stats, fps_max);
                 }
-                if active {
+                if active && loading.is_none() {
                     s.draw_hud(&mut self.ui, sizef, input, self.show_debug);
                     s.light_editor_ui(&mut self.ui, sizef, input, renderer.dyn_stats());
                 }
+            }
+            if let Some((part, shaders)) = loading {
+                world_loading_screen(&mut self.ui, input, size, part, shaders);
             }
             match self.screen {
                 Screen::Paused => self.pause_menu(input, size),
@@ -3683,7 +3695,7 @@ impl GameLoop for Game {
             }
             // Monde ouvert dans les toutes premières secondes du jeu : les shaders lourds
             // finissent de se compiler en tâche de fond.
-            if !renderer.world_ready() {
+            if !renderer.world_ready() && loading.is_none() {
                 let s = (sizef.1 / 300.0).floor().max(1.0);
                 let t = "Préparation des shaders…";
                 let w = Ui::text_width(t, s);
@@ -3694,7 +3706,7 @@ impl GameLoop for Game {
                 self.last_stats = s.render(
                     &mut renderer,
                     &self.ui,
-                    self.show_debug,
+                    self.show_debug && loading.is_none() && !hud_off,
                     self.time,
                     input.grabbed,
                 );
@@ -3825,6 +3837,24 @@ impl GameLoop for Game {
 }
 
 /// Cartes déjà jouées en ligne (`maps/partagees.txt`, une signature par ligne).
+/// (v220) Écran de chargement d'un monde, par-dessus le jeu (voir `Session::loading`) :
+/// fond des menus, ce qu'on attend et une barre (`part`, 0 à 1).
+fn world_loading_screen(ui: &mut Ui, input: &Input, size: (u32, u32), part: f32, shaders: bool) {
+    let mut c = Ctx::new(ui, input, size);
+    c.background();
+    let s = c.s;
+    let title = if shaders {
+        "Chargement du monde…"
+    } else {
+        "Préparation des shaders…"
+    };
+    c.text_center(title, c.h * 0.42, s * 2.0, WHITE);
+    let (w, h) = (160.0 * s, 4.0 * s);
+    let (x, y) = ((c.w - w) / 2.0, c.h * 0.42 + 26.0 * s);
+    c.ui.rect(x, y, w, h, [0.0, 0.0, 0.0, 0.6]);
+    c.ui.rect(x, y, w * part.clamp(0.0, 1.0), h, [0.35, 0.85, 0.4, 1.0]);
+}
+
 fn load_shared(root: &std::path::Path) -> std::collections::HashSet<[u8; 32]> {
     std::fs::read_to_string(root.join("maps").join("partagees.txt"))
         .unwrap_or_default()

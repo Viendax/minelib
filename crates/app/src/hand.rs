@@ -16,10 +16,38 @@ const HAND_FOV: f32 = 70.0;
 const ARM_FIST: Vec3 = Vec3::new(0.474, -0.472, -0.938);
 const ARM_LEN: f32 = 0.6;
 
+/// (v220) Geste de la main en cassant un bloc : un petit coup vers le bas, qui revient vite.
+/// En créatif, un coup par bloc cassé (`DIP_S`) ; en survie, tant qu'on casse, des coups en
+/// boucle, 50 % plus lents (`DIP_S` × 1,5), un toutes les `DIG_EVERY_S` (le temps de casser
+/// un bloc : une pause entre deux).
+pub const DIP_S: f32 = 0.2;
+pub const DIG_EVERY_S: f32 = 0.5;
+/// Descente (vue, blocs) et inclinaison (radians) au plus bas du coup.
+const DIP_DOWN: f32 = 0.06;
+const DIP_TILT: f32 = 0.25;
+
+/// (v220) Geste demandé à la main à cette image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Gesture {
+    #[default]
+    None,
+    /// Arc vers l'avant et le bas (poser un bloc, frapper dans le vide, la foudre).
+    Swing,
+    /// Un coup vers le bas (bloc cassé en créatif).
+    Dip,
+    /// Coups vers le bas en boucle (bloc qu'on casse en survie).
+    Dig,
+}
+
 #[derive(Default)]
 pub struct Hand {
     /// Geste (1 → 0).
     swing: f32,
+    /// (v220) Coup vers le bas : temps restant et durée du coup en cours ; en survie, temps
+    /// jusqu'au suivant (`None` : pas en train de casser).
+    dip: f32,
+    dip_len: f32,
+    dig_next: Option<f32>,
     /// Phase du balancement de marche.
     bob: f32,
     /// Amplitude du balancement (suit la vitesse).
@@ -459,11 +487,31 @@ pub fn block_icon(cx: f32, cy: f32, size: f32, block: BlockId) -> Vec<VmVertex> 
 }
 
 impl Hand {
-    /// `speed` : vitesse horizontale (m/s) au sol, 0 en l'air ; `swung` : geste commencé.
-    pub fn update(&mut self, dt: f32, speed: f32, swung: bool, item: Option<Item>) {
-        if swung {
-            self.swing = 1.0;
+    /// `speed` : vitesse horizontale (m/s) au sol, 0 en l'air ; `gesture` : geste commencé
+    /// (ou, pour `Gesture::Dig`, qui continue).
+    pub fn update(&mut self, dt: f32, speed: f32, gesture: Gesture, item: Option<Item>) {
+        match gesture {
+            Gesture::Swing => self.swing = 1.0,
+            Gesture::Dip => self.start_dip(DIP_S),
+            Gesture::Dig => {
+                // Premier coup tout de suite, puis un par bloc (une pause entre deux).
+                let next = self.dig_next.get_or_insert(0.0);
+                *next -= dt;
+                if *next <= 0.0 {
+                    *next += DIG_EVERY_S;
+                    if *next <= 0.0 {
+                        *next = DIG_EVERY_S;
+                    }
+                    self.start_dip(DIP_S * 1.5);
+                }
+            }
+            Gesture::None => {}
         }
+        if gesture != Gesture::Dig {
+            // Le coup en cours finit, sans en commencer d'autre.
+            self.dig_next = None;
+        }
+        self.dip = (self.dip - dt).max(0.0);
         self.swing = (self.swing - dt / 0.28).max(0.0);
         let target = (speed / 4.4).min(1.5);
         self.bob_amp += (target - self.bob_amp) * (dt * 8.0).min(1.0);
@@ -475,13 +523,51 @@ impl Hand {
         self.equip = (self.equip - dt / 0.2).max(0.0);
     }
 
-    /// Geste (arc vers l'avant et le bas) et balancement en huit pendant la marche : repère
-    /// de la main par rapport aux yeux.
+    fn start_dip(&mut self, len: f32) {
+        self.dip_len = len;
+        self.dip = len;
+    }
+
+    /// (v220) Coup vers le bas en cours, de 0 (rien) à 1 (au plus bas) : descente rapide
+    /// (le premier tiers), remontée un peu plus douce.
+    fn dip_amount(&self) -> f32 {
+        if self.dip <= 0.0 || self.dip_len <= 0.0 {
+            return 0.0;
+        }
+        let u = 1.0 - self.dip / self.dip_len;
+        if u < 1.0 / 3.0 {
+            (u * 3.0 * std::f32::consts::FRAC_PI_2).sin()
+        } else {
+            let v = (u - 1.0 / 3.0) * 1.5;
+            0.5 + 0.5 * (v * std::f32::consts::PI).cos()
+        }
+    }
+
+    /// (v220) Le coup vers le bas, dans la vue (x à droite, y en haut, −z devant) : la main
+    /// descend et s'incline un peu, quelle que soit sa place (objet, bras, lampe tenue par le
+    /// bras du modèle).
+    pub fn dip_view(&self) -> Mat4 {
+        self.dip_about(ARM_FIST)
+    }
+
+    /// (v220) Le même coup vers le bas, incliné autour de `pivot` (vue) : le poing de la
+    /// main dessinée, ou la lampe que tient le bras du modèle.
+    pub fn dip_about(&self, pivot: Vec3) -> Mat4 {
+        let d = self.dip_amount();
+        // (Inclinée autour du poing, pas des yeux : elle ne fait que pencher.)
+        Mat4::from_translation(Vec3::new(0.0, -DIP_DOWN * d, 0.0) + pivot)
+            * Mat4::from_rotation_x(-DIP_TILT * d)
+            * Mat4::from_translation(-pivot)
+    }
+
+    /// Geste (arc vers l'avant et le bas), (v220) coup vers le bas, et balancement en huit
+    /// pendant la marche : repère de la main par rapport aux yeux.
     fn base(&self) -> Mat4 {
         let s = (std::f32::consts::PI * (1.0 - self.swing)).sin() * (self.swing > 0.0) as u8 as f32;
         let bob =
             Vec3::new(self.bob.sin() * 0.025, -(self.bob.cos().abs()) * 0.03, 0.0) * self.bob_amp;
-        Mat4::from_translation(bob + Vec3::new(0.0, -0.35 * self.equip - 0.12 * s, -0.12 * s))
+        self.dip_view()
+            * Mat4::from_translation(bob + Vec3::new(0.0, -0.35 * self.equip - 0.12 * s, -0.12 * s))
             * Mat4::from_rotation_x(-0.6 * s)
     }
 
@@ -770,7 +856,7 @@ mod tests {
     #[test]
     fn hand_and_items_stay_in_front_of_the_camera() {
         let mut h = Hand::default();
-        h.update(0.5, 0.0, false, Some(Item::Block(BlockId::STONE)));
+        h.update(0.5, 0.0, Gesture::None, Some(Item::Block(BlockId::STONE)));
         for item in [
             Some(Item::Block(BlockId::STONE)),
             Some(Item::Torch(Some(2))),
@@ -784,6 +870,53 @@ mod tests {
                 assert!(x / w > -0.3 && y / w < 0.5, "{:?}", p.clip);
             }
         }
+    }
+
+    /// (v220) Casser un bloc : en créatif, un petit coup vers le bas qui revient vite
+    /// (`DIP_S`) ; en survie, tant qu'on casse, un coup 50 % plus lent toutes les
+    /// `DIG_EVERY_S` (une pause entre deux), et le dernier finit quand on s'arrête.
+    #[test]
+    fn breaking_a_block_dips_the_hand() {
+        let dt = 1.0 / 200.0;
+        let low = |h: &Hand| h.dip_view().transform_point3(ARM_FIST).y - ARM_FIST.y;
+        // Créatif : un coup, au plus bas tôt (descente rapide), fini à `DIP_S`.
+        let mut h = Hand::default();
+        h.update(dt, 0.0, Gesture::Dip, None);
+        let mut deepest = (0.0f32, 0.0f32);
+        let mut t = dt;
+        while t < DIP_S + 0.05 {
+            h.update(dt, 0.0, Gesture::None, None);
+            t += dt;
+            if low(&h) < deepest.0 {
+                deepest = (low(&h), t);
+            }
+        }
+        assert!(deepest.0 < -0.05 && deepest.0 > -0.1, "{deepest:?}");
+        assert!(deepest.1 < DIP_S * 0.5, "{deepest:?}");
+        assert!(low(&h).abs() < 1e-6, "revenu");
+        // Survie : des coups en boucle, un par `DIG_EVERY_S`, chacun plus long (1,5 ×).
+        let mut h = Hand::default();
+        let (mut starts, mut was, mut t) = (Vec::new(), false, 0.0);
+        while t < 1.9 {
+            h.update(dt, 0.0, Gesture::Dig, None);
+            let down = low(&h) < -1e-4;
+            if down && !was {
+                starts.push(t);
+            }
+            was = down;
+            t += dt;
+        }
+        assert_eq!(starts.len(), 4, "{starts:?}");
+        for w in starts.windows(2) {
+            assert!((w[1] - w[0] - DIG_EVERY_S).abs() < 0.02, "{starts:?}");
+        }
+        // On lâche : le coup en cours finit, aucun autre.
+        let mut t = 0.0;
+        while t < 1.0 {
+            h.update(dt, 0.0, Gesture::None, None);
+            t += dt;
+        }
+        assert!(low(&h).abs() < 1e-6);
     }
 
     /// Les lumières touchent le bras là où on le voit : chaque sommet, placé dans le monde

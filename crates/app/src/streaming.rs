@@ -109,6 +109,14 @@ impl Streamer {
             .collect()
     }
 
+    /// (v220) Chargement d'un monde : chunks affichés (maillés et envoyés au GPU) parmi ceux
+    /// à moins de `radius` chunks de (`px`, `pz`), et leur nombre.
+    pub fn shown_within(&self, px: f32, pz: f32, radius: i32) -> (usize, usize) {
+        let list = select(px, pz, radius.min(self.radius).max(0));
+        let shown = list.iter().filter(|c| self.meshed.contains(c)).count();
+        (shown, list.len())
+    }
+
     /// Nouvelle distance de rendu : la sélection sera refaite à l'image suivante.
     pub fn set_radius(&mut self, radius: i32) {
         self.radius = radius;

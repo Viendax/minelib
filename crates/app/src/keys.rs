@@ -97,6 +97,9 @@ pub enum Action {
     /// (v215) Parler au micro en construction (touche maintenue), réglée à part de celle du
     /// mode FPS.
     Talk,
+    /// (v220) Masquer toute l'interface en construction (il ne reste que le jeu et les
+    /// pseudos) ; un second appui la rend.
+    HideHud,
     Command,
     Debug,
     Screenshot,
@@ -146,7 +149,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 62] = [
+    pub const ALL: [Action; 63] = [
         Action::Attack,
         Action::Use,
         Action::Pick,
@@ -165,6 +168,7 @@ impl Action {
         Action::LightEditor,
         Action::FreeCamera,
         Action::Talk,
+        Action::HideHud,
         Action::Command,
         Action::Debug,
         Action::Screenshot,
@@ -230,7 +234,8 @@ impl Action {
             | Action::Perspective
             | Action::LightEditor
             | Action::FreeCamera
-            | Action::Talk => Group::Build,
+            | Action::Talk
+            | Action::HideHud => Group::Build,
             Action::Command | Action::Debug | Action::Screenshot => Group::Shared,
             Action::FpsForward
             | Action::FpsBack
@@ -320,6 +325,7 @@ impl Action {
             Action::LightEditor => "Éditeur de lumières",
             Action::FreeCamera => "Caméra libre (éditeur)",
             Action::Talk => "Parler (micro)",
+            Action::HideHud => "Masquer l'interface",
             Action::Command => "Commande",
             Action::Debug => "Debug (F3)",
             Action::Screenshot => "Capture d'écran",
@@ -387,6 +393,7 @@ impl Action {
             Action::LightEditor => "light_editor",
             Action::FreeCamera => "free_camera",
             Action::Talk => "talk",
+            Action::HideHud => "hide_hud",
             Action::Command => "command",
             Action::Debug => "debug",
             Action::Screenshot => "screenshot",
@@ -460,6 +467,8 @@ impl Action {
             // (v215) Maintenue pour parler ; (v217) V par défaut (demande de Viendax), K
             // reste celle du FPS.
             Action::Talk => Some(Bind::Key(KeyCode::KeyV)),
+            // (v220) F1, comme la touche qui cache l'interface dans Minecraft.
+            Action::HideHud => Some(Bind::Key(KeyCode::F1)),
             Action::Command => Some(Bind::Key(KeyCode::Slash)),
             Action::Debug => Some(Bind::Key(KeyCode::F3)),
             Action::Screenshot => Some(Bind::Key(KeyCode::F2)),

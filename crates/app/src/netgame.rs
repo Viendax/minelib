@@ -1457,6 +1457,9 @@ pub struct Guest {
     pub conflicts: Vec<Conflict>,
     /// Présentation renvoyée tant que l'hôte n'a pas répondu.
     hello_timer: f32,
+    /// (v220) Son monde n'est pas encore chargé : il ne se présente pas (voir
+    /// `NetGame::guest_loading`).
+    loading: bool,
     /// Positions prédites par numéro d'entrée (pour juger un désaccord sur soi).
     predicted: VecDeque<(u32, [f32; 3])>,
     /// (v165) Envois d'entrées (dernier numéro, quand) pas encore confirmés : leur
@@ -1932,6 +1935,30 @@ impl NetGame {
         g
     }
 
+    /// (v220) Invité dont le monde n'est pas encore chargé (voir `Session::loading`) : il
+    /// ne se présente pas à l'hôte, qui ne le met donc pas dans la partie (personne ne le
+    /// voit apparaître) tant que `loaded` n'a pas été appelé.
+    pub fn guest_loading(link: Sender<Inbound>, map_sig: [u8; 32]) -> Self {
+        let mut g = Self::guest_quiet(link, map_sig);
+        if let NetGame::Guest(x) = &mut g {
+            x.hello_timer = f32::INFINITY;
+            x.loading = true;
+        }
+        g
+    }
+
+    /// (v220) Le monde de l'invité est chargé : il se présente à l'hôte tout de suite.
+    pub fn loaded(&mut self) {
+        if let NetGame::Guest(g) = self {
+            if g.loading {
+                g.loading = false;
+                if !g.auditor && g.you.is_none() {
+                    g.hello_timer = 0.0;
+                }
+            }
+        }
+    }
+
     /// Garant indépendant en attente : reçoit les copies de la partie, les vérifie, et
     /// reprend la partie si l'hôte part (ou triche).
     pub fn standby(link: Sender<Inbound>, map_sig: [u8; 32]) -> Self {
@@ -1973,6 +2000,7 @@ impl NetGame {
             audit: Auditor::default(),
             conflicts: Vec::new(),
             hello_timer: 1.0,
+            loading: false,
             sent: VecDeque::new(),
             ping: None,
             ping_timer: 1.0,
@@ -2632,8 +2660,9 @@ impl NetGame {
             g.loadout = (255, 255);
             g.backup = None;
             g.audit.reset();
-            // Un garant en attente n'est pas un joueur : il ne se présente pas.
-            if !g.auditor {
+            // Un garant en attente n'est pas un joueur : il ne se présente pas ; (v220) un
+            // invité pas encore chargé non plus (il le fera en fin de chargement).
+            if !g.auditor && !g.loading {
                 g.to_host(&ToHost::Hello {
                     map_hash: g.map_sig,
                 });
