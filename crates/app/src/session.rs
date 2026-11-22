@@ -83,6 +83,9 @@ const MAX_PINGS: usize = 3;
 
 /// (v222) On voit l'éclair tenu par un autre joueur jusqu'à tant de blocs.
 const ZEUS_SEEN: f32 = 64.0;
+/// (v238) Volume du clic de la lampe torche qu'on allume ou éteint (« réduis le son
+/// d'allumage/extinction de la lampe torche de 50 % » : 0,6 avant).
+const FLASHLIGHT_CLICK: f32 = 0.3;
 
 /// (v222) Numéro du crépitement de l'éclair d'un autre joueur (jamais celui du sien, 1).
 fn crackle_id(pseudo: &str) -> u64 {
@@ -2866,6 +2869,10 @@ impl Session {
                     crate::crowd::Hit::Npc => {
                         self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.55));
                     }
+                    // (v238) Ce coup l'a tué : un cri plus fort ; il est reparti d'ailleurs.
+                    crate::crowd::Hit::Killed => {
+                        self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.85));
+                    }
                     crate::crowd::Hit::Hidden => {
                         if let (Some(out), Some(b)) = (self.crowd_out.as_mut(), &self.build) {
                             out.found = Some((b.pseudo().to_string(), at.to_array()));
@@ -2950,7 +2957,7 @@ impl Session {
                             );
                         }
                     }
-                    crate::crowd::Hit::Npc => {
+                    crate::crowd::Hit::Npc | crate::crowd::Hit::Killed => {
                         if let Some(g) = npc_cry_gain(at.distance(me)) {
                             self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, g));
                         }
@@ -3136,7 +3143,8 @@ impl Session {
         // ou l'éteint, même sans bloc visé ; elle ne copie rien tant qu'on la tient.
         if pick && self.inventory.selected_item() == Some(Item::Flashlight) {
             self.flashlight_on = !self.flashlight_on;
-            self.fps.sounds.push((crate::audio::Sfx::Dry, 0.0, 0.6));
+            // (v238) Son de l'interrupteur deux fois moins fort (0,6 avant).
+            self.fps.sounds.push((crate::audio::Sfx::Dry, 0.0, FLASHLIGHT_CLICK));
             return;
         }
         // « Copier le bloc » sur une tête portée par une entité de la carte (porte-armure,
@@ -3175,25 +3183,12 @@ impl Session {
         // avec /thor (rien n'est cassé, même en créatif).
         if self.inventory.selected_item() == Some(Item::Zeus) && keys.held(input, Action::Attack) {
             if keys.pressed(input, Action::Attack) && self.storm.cooldown <= 0.0 {
-                // (v235) Un PNJ visé : la foudre tombe sur lui (`aimed`), et il réagit comme
-                // à un coup (le nôtre, où qu'il soit ; celui d'un autre OP, à portée de coup :
-                // c'est son jeu qui en décide).
-                let seen = raycast(
-                    &self.world,
-                    self.player.eye().into(),
-                    self.player.look_dir().into(),
-                    crate::storm::THOR_RANGE,
-                );
-                let limit = seen.map_or(crate::storm::THOR_RANGE, |h| h.distance);
-                let npc = self.aimed_person(limit).and_then(|(_, npc, t)| Some((npc?, t)));
+                // (v235) Un PNJ visé : la foudre tombe sur lui (`aimed`). (v238) Elle le blesse
+                // en tombant, comme un joueur, et le fait sauter (`Crowd::struck`) : plus de
+                // coup de poing en plus.
                 if let Some(aim) = self.aimed() {
                     self.cast_lightning(aim);
                     self.storm.cooldown = crate::storm::ZEUS_COOLDOWN;
-                    if let Some((target, t)) = npc {
-                        if matches!(target, NpcTarget::Mine(_)) || t <= NPC_REACH {
-                            self.hit_npc(target);
-                        }
-                    }
                 }
             }
             return;
@@ -3996,6 +3991,24 @@ impl Session {
         );
         if hurt > 0 {
             self.damage(hurt);
+        }
+        // (v238) La foudre blesse aussi les PNJ de notre foule, comme un joueur (et les fait
+        // sauter) ; ceux de la foule d'un autre OP sautent tout de suite (son jeu, où elle
+        // tombe aussi, leur ôte la vie). Le plus proche crie.
+        let me = self.player.eye();
+        let center = self.player.pos;
+        for at in std::mem::take(&mut self.storm.landed) {
+            let mut hit = Vec::new();
+            if let Some(c) = self.crowd.as_mut() {
+                hit.extend(c.struck(&self.world, at, center));
+            }
+            for rc in self.remote_crowds.values_mut() {
+                hit.extend(rc.struck(at));
+            }
+            let near = hit.iter().map(|p| p.distance(me)).fold(f32::INFINITY, f32::min);
+            if let Some(g) = npc_cry_gain(near) {
+                self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, g));
+            }
         }
         // Essais : MINELIB_ZEUS=1 (la Foudre de Zeus en main à l'arrivée), MINELIB_THOR=<s>
         // (la foudre tombe là où l'on regarde, toutes les <s> secondes).

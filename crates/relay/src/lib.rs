@@ -9889,7 +9889,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Serveur de construction : le créateur est OP, nomme les OP, qui bannissent.
+    /// Serveur de construction : le créateur est OP, nomme les OP, qui bannissent (et, v238,
+    /// en nomment d'autres, pas tout de suite).
     #[test]
     fn build_server_ops_ban_and_the_creator_is_op_by_default() {
         let dir = std::env::temp_dir().join(format!("minelib-op-{}", rand::random::<u32>()));
@@ -9946,9 +9947,10 @@ mod tests {
         assert!(wait_error(&bob).contains("OP"));
         admin(&creator, proto::SERVER_OP, "bob");
         assert!(ok(&creator).contains("OP"));
-        // Seul le créateur nomme les OP ; personne ne bannit le créateur.
+        // (v238) Tout juste OP, Bob attend 30 s avant de nommer un OP (le refus dit combien) ;
+        // personne ne bannit le créateur.
         admin(&bob, proto::SERVER_OP, "Eve");
-        assert!(wait_error(&bob).contains("créateur"));
+        assert!(wait_error(&bob).contains("Tu pourras nommer un OP dans"));
         admin(&bob, proto::SERVER_BAN, "Createur");
         assert!(wait_error(&bob).contains("créateur"));
         // Bob bannit Eve : exclue tout de suite, ne peut plus revenir.

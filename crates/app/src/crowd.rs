@@ -10,6 +10,11 @@
 //! foule comme les autres), s'y promène : celui qui le trouve et le frappe est prévenu, et
 //! il repart se cacher ailleurs.
 //!
+//! (v238) Ils ont la vie d'un joueur (20 points ; un coup en ôte un, la foudre cinq, une chute
+//! de plus de 4 blocs aussi) : tués, ils réapparaissent ailleurs dans la foule. Ils se
+//! déplacent comme un joueur : ils sautent sur une marche d'un bloc, tombent d'un rebord (et
+//! s'y font mal), nagent en surface dans l'eau ; un mur de deux blocs les fait tourner.
+//!
 //! (v227) En construction en ligne, un OP peut la lancer : son jeu la mène (`Crowd`) et dit
 //! aux joueurs proches, par le relais, ce qui change (`Outbox`, paquets de
 //! `minelib_net::crowd`) ; chez eux, elle avance de même entre deux nouvelles
@@ -44,7 +49,23 @@ const RESPAWNS_PER_FRAME: usize = 64;
 /// maintenant près de 5 coups par seconde au lieu de 3, et ils montent bien moins vite.
 const KNOCK: f32 = 5.0;
 const KNOCK_UP: f32 = 3.175;
-const GRAVITY: f32 = 30.0;
+/// (v238) Pesanteur : celle d'un joueur (`player::GRAVITY`, 30 avant).
+const GRAVITY: f32 = 28.0;
+/// (v238) Vie d'un PNJ : celle d'un joueur. Un coup en ôte `PUNCH` (comme un coup de poing
+/// sur un joueur), la foudre `lightning::DAMAGE`, une chute ce qu'elle ôte à un joueur.
+pub const NPC_HP: f32 = 20.0;
+const PUNCH: f32 = 1.0;
+/// (v238) Saut d'un PNJ sur une marche d'un bloc (blocs/s) : celui d'un joueur
+/// (`player::JUMP_SPEED`).
+const JUMP_UP: f32 = 8.6;
+/// (v238) Chute sans dégâts (blocs), comme un joueur (`session::SAFE_FALL`).
+const SAFE_FALL: f32 = 4.0;
+/// (v238) Dans l'eau, il nage en surface : ses pieds à cette profondeur sous la surface, à
+/// cette part de sa vitesse.
+const SWIM_DEPTH: f32 = 1.3;
+const SWIM_SPEED: f32 = 0.5;
+/// (v238) Tué, il réapparaît au moins à cette distance de qui l'a tué (blocs).
+const RESPAWN_AWAY: f32 = 24.0;
 /// (v226) Durée du rouge d'un coup reçu, et de la fuite en courant qui suit (s).
 pub const HURT_S: f32 = 0.4;
 const FLEE_S: f32 = 3.0;
@@ -100,6 +121,15 @@ pub struct Npc {
     /// (v227) Foule reçue : le dernier état reçu le disait-il frappé ? (Son cri : seulement
     /// quand il vient de l'être.)
     heard_hurt: bool,
+    /// (v238) Points de vie (`NPC_HP` au départ).
+    pub hp: f32,
+    /// (v238) En l'air : le plus haut de sa chute (dégâts à l'arrivée).
+    top: f32,
+    /// (v238) Dans l'eau : il nage (en surface, plus lentement).
+    swim: bool,
+    /// (v238) En l'air sur un saut : un mur devant l'arrête sans lui ôter son élan (il
+    /// passe dessus une fois assez haut).
+    jumping: bool,
 }
 
 pub struct Crowd {
@@ -129,6 +159,8 @@ pub struct Crowd {
 pub enum Hit {
     /// Un PNJ de la foule : il recule et s'enfuit.
     Npc,
+    /// (v238) Ce coup l'a tué : il est reparti d'ailleurs, avec toute sa vie.
+    Killed,
     /// Le personnage caché : trouvé, il est reparti se cacher ailleurs.
     Hidden,
 }
@@ -260,6 +292,10 @@ impl Crowd {
             hidden: false,
             num,
             heard_hurt: false,
+            hp: NPC_HP,
+            top: y,
+            swim: false,
+            jumping: false,
         })
     }
 
@@ -280,7 +316,85 @@ impl Crowd {
             return Hit::Hidden;
         }
         self.npcs[i].knock(from);
+        // (v238) Un point de vie de moins ; plus rien : il réapparaît ailleurs.
+        if self.hurt(world, i, PUNCH, center, from) {
+            return Hit::Killed;
+        }
         Hit::Npc
+    }
+
+    /// (v238) Le PNJ `i` perd `amount` points de vie ; à zéro, il réapparaît ailleurs dans la
+    /// foule (autour de `center`, à `RESPAWN_AWAY` blocs au moins de `from`), avec toute sa
+    /// vie. Rend vrai s'il en est mort. (Le personnage caché ne meurt pas.)
+    fn hurt(&mut self, world: &World, i: usize, amount: f32, center: Vec3, from: Vec3) -> bool {
+        let n = &mut self.npcs[i];
+        if n.hidden {
+            return false;
+        }
+        n.hp -= amount;
+        n.hurt = HURT_S;
+        n.heard_hurt = true;
+        if n.hp > 0.0 {
+            return false;
+        }
+        self.changed.push(i as u16);
+        self.respawn(world, i, center, from);
+        true
+    }
+
+    /// (v238) Le PNJ `i` repart d'ailleurs (mort) : un endroit de la foule autour de `center`,
+    /// loin de `from` (sinon le premier trouvé), avec toute sa vie et le même pseudo. Reste où
+    /// il est, sa vie refaite, s'il n'en trouve pas (chunks pas chargés).
+    fn respawn(&mut self, world: &World, i: usize, center: Vec3, from: Vec3) {
+        let (mut found, mut near) = (None, None);
+        for _ in 0..16 {
+            let Some(m) = self.spawn(world, center) else {
+                continue;
+            };
+            // (Le pseudo pris par `spawn` n'est pas utilisé.)
+            self.next -= 1;
+            if m.pos.distance(from) >= RESPAWN_AWAY {
+                found = Some(m);
+                break;
+            }
+            near = Some(m);
+        }
+        let found = found.or(near);
+        let n = &mut self.npcs[i];
+        match found {
+            Some(m) => {
+                let name = std::mem::take(&mut n.name);
+                let (num, skin) = (n.num, n.skin.take());
+                *n = Npc {
+                    name,
+                    num,
+                    skin,
+                    ..m
+                };
+            }
+            None => {
+                n.hp = NPC_HP;
+                n.hurt = 0.0;
+            }
+        }
+    }
+
+    /// (v238) La foudre tombée en `at` : les PNJ qu'elle touche (comme un joueur, voir
+    /// `lightning::hurts_at`) perdent `lightning::DAMAGE` points et sautent loin d'elle (ceux
+    /// qui en meurent réapparaissent ailleurs). Rend où ils étaient.
+    pub fn struck(&mut self, world: &World, at: Vec3, center: Vec3) -> Vec<Vec3> {
+        let mut hit = Vec::new();
+        for i in 0..self.npcs.len() {
+            let n = &self.npcs[i];
+            if n.hidden || !crate::lightning::hurts_at(at, n.pos) {
+                continue;
+            }
+            hit.push(n.pos);
+            self.changed.push(i as u16);
+            self.npcs[i].knock(at);
+            self.hurt(world, i, crate::lightning::DAMAGE as f32, center, at);
+        }
+        hit
     }
 
     /// (v226) Le personnage caché `i` part se cacher ailleurs : à un endroit de la foule
@@ -322,10 +436,22 @@ impl Crowd {
         let r2 = self.rnd();
         let n = &mut self.npcs[i];
         n.hurt = (n.hurt - dt).max(0.0);
-        // (v226) En l'air après un coup : il retombe, puis s'enfuit.
+        // (v226) En l'air après un coup : il retombe, puis s'enfuit. (v238) Ou après un saut,
+        // ou d'un rebord : une chute de plus de `SAFE_FALL` blocs lui fait mal.
         if n.air > 0.0 {
-            if fly(world, n, dt) {
+            let (jumped, from) = (n.jumping, n.cell);
+            if let Some(fall) = fly(world, n, dt) {
                 self.changed.push(i as u16);
+                // (v238) Un saut qui n'a pas passé la marche (retombé dans sa case) : il
+                // fait demi-tour, sinon il ressauterait sans fin.
+                let n = &mut self.npcs[i];
+                if jumped && n.cell == from {
+                    n.yaw = (n.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
+                }
+                if fall > SAFE_FALL {
+                    let at = self.npcs[i].pos;
+                    self.hurt(world, i, (fall - SAFE_FALL).ceil(), center, at);
+                }
             }
             return;
         }
@@ -374,20 +500,48 @@ impl Crowd {
             return;
         }
         let (sy, cy) = n.yaw.sin_cos();
-        let next = n.pos + Vec3::new(sy, 0.0, -cy) * n.speed * dt;
+        let dir = Vec3::new(sy, 0.0, -cy);
+        // (v238) Dans l'eau, il nage, plus lentement.
+        let speed = n.speed * if n.swim { SWIM_SPEED } else { 1.0 };
+        let next = n.pos + dir * speed * dt;
         let cell = (next.x.floor() as i32, next.z.floor() as i32);
         if cell == n.cell {
             n.pos = next;
             return;
         }
-        // Nouvelle case : son sol, à une marche près ; sinon (mur, trou), demi-tour.
-        match step_ground(world, next.x, next.z, n.pos.y) {
-            Some(y) => {
+        // Nouvelle case : (v238) comme un joueur. Même sol (ou une marche plus bas) : il y
+        // va ; un bloc plus haut : il saute ; plus bas : il tombe ; de l'eau : il nage en
+        // surface (et en ressort sur une berge d'un bloc au plus) ; un mur : demi-tour.
+        match ahead(world, n.pos, next.x, next.z, n.swim) {
+            Ahead::Walk(y) => {
                 n.pos = Vec3::new(next.x, y, next.z);
                 n.cell = cell;
+                n.swim = false;
                 n.covered = covered(world, n.pos);
             }
-            None => {
+            Ahead::Swim(y) => {
+                n.pos = Vec3::new(next.x, y, next.z);
+                n.cell = cell;
+                n.swim = true;
+                n.covered = covered(world, n.pos);
+            }
+            Ahead::Jump => {
+                n.push = dir * speed + Vec3::Y * JUMP_UP;
+                n.air = 1e-3;
+                n.top = n.pos.y;
+                n.jumping = true;
+                self.changed.push(i as u16);
+            }
+            Ahead::Fall => {
+                n.pos = Vec3::new(next.x, n.pos.y, next.z);
+                n.cell = cell;
+                n.push = dir * speed;
+                n.air = 1e-3;
+                n.top = n.pos.y;
+                n.swim = false;
+                self.changed.push(i as u16);
+            }
+            Ahead::Wall => {
                 n.yaw = (n.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
                 self.changed.push(i as u16);
             }
@@ -406,6 +560,10 @@ impl Npc {
         }
         self.push = away * KNOCK + Vec3::Y * KNOCK_UP;
         self.air = self.air.max(1e-3);
+        self.jumping = false;
+        if self.air <= 1e-3 {
+            self.top = self.pos.y;
+        }
         self.hurt = HURT_S;
         self.heard_hurt = true;
         self.yaw = away.x.atan2(-away.z).rem_euclid(std::f32::consts::TAU);
@@ -447,6 +605,10 @@ impl Npc {
             hidden: false,
             num: s.num,
             heard_hurt: false,
+            hp: NPC_HP,
+            top: pos.y,
+            swim: false,
+            jumping: false,
         };
         n.set(world, s);
         n
@@ -475,11 +637,17 @@ impl Npc {
         match s.push {
             Some(v) => {
                 self.push = Vec3::from(v);
+                // (v238) Un saut (vers le haut, sans coup reçu) garde son élan contre la
+                // marche, comme chez celui qui mène la foule.
+                if self.air <= 0.0 {
+                    self.jumping = v[1] > 0.0 && !s.hurt;
+                }
                 self.air = self.air.max(1e-3);
             }
             None => {
                 self.push = Vec3::ZERO;
                 self.air = 0.0;
+                self.jumping = false;
             }
         }
         if s.hidden != self.hidden {
@@ -684,6 +852,20 @@ impl RemoteCrowd {
             .map(|id| id as u16)
     }
 
+    /// (v238) La foudre tombée en `at` (la même chez tous) : ses PNJ touchés sautent tout de
+    /// suite, sans attendre le jeu qui mène la foule (lui leur ôte la vie, et dit la suite).
+    /// Rend où ils étaient.
+    pub fn struck(&mut self, at: Vec3) -> Vec<Vec3> {
+        let mut hit = Vec::new();
+        for n in &mut self.npcs {
+            if !n.hidden && crate::lightning::hurts_at(at, n.pos) {
+                hit.push(n.pos);
+                n.knock(at);
+            }
+        }
+        hit
+    }
+
     /// Coup donné ici au PNJ `i` : il recule tout de suite, sans attendre le jeu qui mène la
     /// foule (le personnage caché, lui, ne bouge que quand celui-ci l'a déplacé).
     pub fn hit(&mut self, i: usize, from: Vec3) {
@@ -720,10 +902,12 @@ fn glide(world: &World, n: &mut Npc, dt: f32) {
 
 /// (v226) Un pas du bond d'un coup reçu : il recule (un mur l'arrête), monte, retombe sur le
 /// sol (au plus 2 s en l'air : au-delà, posé sur le sol de sa colonne). Posé, il s'enfuit à la
-/// vitesse décidée par le coup. (v227) Rend vrai à l'image où il se pose.
-fn fly(world: &World, n: &mut Npc, dt: f32) -> bool {
+/// vitesse décidée par le coup. (v227) Rend vrai à l'image où il se pose. (v238) Aussi un
+/// saut ou une chute : rend alors la hauteur de la chute (0 dans l'eau, qui l'amortit).
+fn fly(world: &World, n: &mut Npc, dt: f32) -> Option<f32> {
     n.air += dt;
     n.push.y -= GRAVITY * dt;
+    n.top = n.top.max(n.pos.y);
     let mut next = n.pos + n.push * dt;
     let solid = |x: f32, y: f32, z: f32| {
         world
@@ -743,8 +927,11 @@ fn fly(world: &World, n: &mut Npc, dt: f32) -> bool {
     {
         next.x = n.pos.x;
         next.z = n.pos.z;
-        n.push.x = 0.0;
-        n.push.z = 0.0;
+        // (v238) Sur un saut, il garde son élan : il passera une fois assez haut.
+        if !n.jumping {
+            n.push.x = 0.0;
+            n.push.z = 0.0;
+        }
     }
     // Plafond : il ne monte plus.
     if n.push.y > 0.0 && solid(next.x, next.y + 1.8, next.z) {
@@ -752,6 +939,19 @@ fn fly(world: &World, n: &mut Npc, dt: f32) -> bool {
         n.push.y = 0.0;
     }
     let mut land = None;
+    // (v238) Dans l'eau : elle l'arrête (sans mal), il nage en surface.
+    if n.push.y <= 0.0 {
+        if let Some(top) = water_surface(world, next.x, next.y, next.z) {
+            n.pos = Vec3::new(next.x, swim_feet(world, next.x, next.z, top), next.z);
+            n.push = Vec3::ZERO;
+            n.air = 0.0;
+            n.jumping = false;
+            n.swim = true;
+            n.cell = (next.x.floor() as i32, next.z.floor() as i32);
+            n.covered = covered(world, n.pos);
+            return Some(0.0);
+        }
+    }
     if n.push.y <= 0.0 {
         // Sol : le haut du bloc plein sous ses pieds, s'il l'atteint à cette image.
         let floor = next.y.floor();
@@ -766,18 +966,126 @@ fn fly(world: &World, n: &mut Npc, dt: f32) -> bool {
     }
     match land {
         Some(y) => {
+            let fall = (n.top - y).max(0.0);
             n.pos = Vec3::new(next.x, y, next.z);
             n.push = Vec3::ZERO;
             n.air = 0.0;
+            n.jumping = false;
+            n.swim = false;
+            n.top = y;
             n.cell = (next.x.floor() as i32, next.z.floor() as i32);
             n.covered = covered(world, n.pos);
-            true
+            Some(fall)
         }
         None => {
             n.pos = next;
-            false
+            None
         }
     }
+}
+
+/// (v238) Ce qu'un PNJ trouve en entrant dans la colonne (`x`, `z`), ses pieds à `feet_y`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Ahead {
+    /// Un sol à cette hauteur (le même, une marche plus bas, ou une berge en sortant de
+    /// l'eau).
+    Walk(f32),
+    /// Un bloc devant ses pieds, la place au-dessus : il saute.
+    Jump,
+    /// Rien sous ses pieds : il tombe.
+    Fall,
+    /// De l'eau : il nage, les pieds à cette hauteur.
+    Swim(f32),
+    /// Un mur (deux blocs, ou un plafond trop bas) : demi-tour.
+    Wall,
+}
+
+fn ahead(world: &World, from: Vec3, x: f32, z: f32, swimming: bool) -> Ahead {
+    use minelib_world::registry::{fluid, Fluid};
+    let (bx, bz) = (x.floor() as i32, z.floor() as i32);
+    // Un chunk pas chargé : comme un mur (il ne s'y jette pas dans le vide).
+    if !world.contains(minelib_world::ChunkPos::containing(bx, bz)) {
+        return Ahead::Wall;
+    }
+    let feet_y = from.y;
+    let y0 = feet_y.floor() as i32;
+    let solid = |y: i32| world.get(bx, y, bz).is_solid();
+    // De la lave devant lui ou sous ses pieds : il n'y va pas.
+    let lava = |y: i32| matches!(fluid(world.get(bx, y, bz)), Some((Fluid::Lava, _)));
+    if lava(y0) || lava(y0 - 1) {
+        return Ahead::Wall;
+    }
+    if swimming {
+        // En nageant : de l'eau encore, ou une berge à moins d'un bloc au-dessus de la
+        // surface (il s'y hisse), sinon un mur.
+        let surface = feet_y + SWIM_DEPTH;
+        if let Some(top) = water_surface(world, x, feet_y + 0.5, z) {
+            return Ahead::Swim(swim_feet(world, x, z, top));
+        }
+        let s0 = surface.floor() as i32;
+        return match (s0 - 1..=s0 + 1)
+            .rev()
+            .find(|&y| solid(y) && !solid(y + 1) && !solid(y + 2))
+        {
+            Some(y) => Ahead::Walk((y + 1) as f32),
+            None => Ahead::Wall,
+        };
+    }
+    if solid(y0) {
+        // Une marche : la place au-dessus d'elle, et au-dessus de sa tête pour sauter.
+        let head = world
+            .get(from.x.floor() as i32, y0 + 2, from.z.floor() as i32)
+            .is_solid();
+        return if !solid(y0 + 1) && !solid(y0 + 2) && !head {
+            Ahead::Jump
+        } else {
+            Ahead::Wall
+        };
+    }
+    if solid(y0 + 1) {
+        return Ahead::Wall;
+    }
+    if let Some(top) = water_surface(world, x, feet_y - 0.5, z) {
+        return Ahead::Swim(swim_feet(world, x, z, top));
+    }
+    if solid(y0 - 1) {
+        Ahead::Walk(y0 as f32)
+    } else {
+        Ahead::Fall
+    }
+}
+
+/// (v238) Pieds d'un PNJ dans l'eau dont la surface est à `top` (colonne `x`, `z`) : à
+/// `SWIM_DEPTH` sous la surface, ou sur le fond si l'eau est moins profonde (il y marche).
+fn swim_feet(world: &World, x: f32, z: f32, top: f32) -> f32 {
+    let (bx, bz) = (x.floor() as i32, z.floor() as i32);
+    let want = top - SWIM_DEPTH;
+    let mut y = top.floor() as i32;
+    while (y + 1) as f32 > want {
+        if world.get(bx, y, bz).is_solid() {
+            return (y + 1) as f32;
+        }
+        y -= 1;
+    }
+    want
+}
+
+/// (v238) Surface de l'eau de la colonne (`x`, `z`) si le point (`x`, `y`, `z`) est dans
+/// l'eau : le haut du dernier bloc d'eau au-dessus (sa hauteur de fluide comprise).
+fn water_surface(world: &World, x: f32, y: f32, z: f32) -> Option<f32> {
+    use minelib_world::registry::{fluid, fluid_height, Fluid};
+    // (Le haut d'une colonne d'eau : sa propre hauteur de fluide.)
+    let (bx, bz) = (x.floor() as i32, z.floor() as i32);
+    let mut yy = y.floor() as i32;
+    let is_water = |yy: i32| matches!(fluid(world.get(bx, yy, bz)), Some((Fluid::Water, _)));
+    if !is_water(yy) {
+        return None;
+    }
+    while is_water(yy + 1) && yy < y.floor() as i32 + 64 {
+        yy += 1;
+    }
+    let h = fluid_height(world.get(bx, yy, bz), world.get(bx, yy + 1, bz)).map_or(0.9, |f| f.1);
+    Some(yy as f32 + h)
 }
 
 /// (v226) Distance du rayon `o` + t · `d` à la boîte (`min`, `max`), s'il la touche.
@@ -841,8 +1149,9 @@ mod tests {
                 w.insert_empty(ChunkPos { x: cx, z: cz });
             }
         }
-        for z in -200..200 {
-            for x in -200..200 {
+        // (v238) Sur tous les chunks : un PNJ qui sortirait du sol tomberait dans le vide.
+        for z in -256..256 {
+            for x in -256..256 {
                 w.set(x, 10, z, BlockId::STONE);
             }
         }
@@ -860,6 +1169,155 @@ mod tests {
         c.npcs.push(n);
         c.changed.push(0);
         c
+    }
+
+    /// Une foule qui ne grandit plus : ce PNJ seul.
+    fn alone(w: &World, at: Vec3) -> Crowd {
+        let mut c = one_at(w, at);
+        c.t = f32::NEG_INFINITY;
+        c
+    }
+
+    /// Un PNJ seul qui marche droit vers +x (sans tourner).
+    fn walker(w: &World, at: Vec3) -> Crowd {
+        let mut c = alone(w, at);
+        c.npcs[0].yaw = std::f32::consts::FRAC_PI_2;
+        c.npcs[0].speed = 4.3;
+        c
+    }
+
+    fn run(c: &mut Crowd, w: &World, seconds: f32) {
+        let skins = crate::skin::Skins::default();
+        for _ in 0..(seconds * 60.0) as usize {
+            c.update(w, &skins, Vec3::new(0.5, 11.0, 0.5), 1.0 / 60.0);
+        }
+    }
+
+    /// (v238) « Il a la même vie qu'un joueur » : vingt coups pour le tuer ; tué, il
+    /// réapparaît ailleurs (loin de qui l'a tué), avec toute sa vie et le même pseudo.
+    #[test]
+    fn a_killed_npc_comes_back_elsewhere_with_full_life() {
+        let w = flat();
+        let mut c = alone(&w, Vec3::new(3.5, 11.0, 0.5));
+        let name = c.npcs[0].name.clone();
+        for k in 1..=20 {
+            let eye = c.npcs[0].pos - Vec3::X * 1.5 + Vec3::Y * 1.62;
+            let hit = c.hit(&w, 0, eye, Vec3::new(0.5, 11.0, 0.5));
+            if k < 20 {
+                assert_eq!(hit, Hit::Npc, "coup {k}");
+                assert_eq!(c.npcs[0].hp, NPC_HP - k as f32);
+                // Il retombe avant le coup suivant.
+                run(&mut c, &w, 0.5);
+            } else {
+                assert_eq!(hit, Hit::Killed, "le vingtième coup le tue");
+                let n = &c.npcs[0];
+                assert_eq!(n.hp, NPC_HP, "toute sa vie");
+                assert_eq!(n.name, name, "le même pseudo");
+                assert!(n.pos.distance(eye) >= RESPAWN_AWAY, "ailleurs : {}", n.pos);
+            }
+        }
+        // La foudre : cinq points par coup (elle le fait sauter), la quatrième le tue.
+        for k in 1..=4 {
+            let at = c.npcs[0].pos;
+            let strike = at + Vec3::X;
+            let hit = c.struck(&w, strike, Vec3::new(0.5, 11.0, 0.5));
+            assert_eq!(hit, vec![at], "foudre {k}");
+            let n = &c.npcs[0];
+            if k < 4 {
+                assert_eq!(n.hp, NPC_HP - 5.0 * k as f32, "foudre {k}");
+                assert!(n.air > 0.0, "il saute");
+            } else {
+                assert_eq!(n.hp, NPC_HP, "réapparu avec toute sa vie");
+                assert!(n.pos.distance(strike) >= RESPAWN_AWAY, "ailleurs : {}", n.pos);
+            }
+            run(&mut c, &w, 0.5);
+        }
+        // Trop loin d'elle : rien.
+        let at = c.npcs[0].pos;
+        assert!(c.struck(&w, at + Vec3::X * 4.0, Vec3::new(0.5, 11.0, 0.5)).is_empty());
+        assert_eq!(c.npcs[0].hp, NPC_HP);
+    }
+
+    /// (v238) « Les mêmes déplacements possibles » : il saute sur une marche d'un bloc, tombe
+    /// d'un rebord (et se fait mal au-delà de 4 blocs, comme un joueur), nage en surface
+    /// dans l'eau et en ressort sur la berge ; un mur de deux blocs le fait tourner.
+    #[test]
+    fn npcs_jump_fall_and_swim_like_players() {
+        // Une estrade d'un bloc de haut à partir de x = 6 (sous un plafond, au besoin).
+        let stage = |ceiling: bool| {
+            let mut w = flat();
+            for z in -3..4 {
+                for x in 6..20 {
+                    w.set(x, 11, z, BlockId::STONE);
+                }
+                for x in 0..6 {
+                    if ceiling {
+                        w.set(x, 13, z, BlockId::STONE);
+                    }
+                }
+            }
+            w
+        };
+        let w = stage(false);
+        let mut c = walker(&w, Vec3::new(3.5, 11.0, 0.5));
+        run(&mut c, &w, 1.5);
+        let n = &c.npcs[0];
+        assert!(n.pos.x > 7.0 && n.pos.y == 12.0, "monté sur l'estrade : {}", n.pos);
+        // Sous un plafond trop bas pour sauter : demi-tour.
+        let w = stage(true);
+        let mut c = walker(&w, Vec3::new(3.5, 11.0, 0.5));
+        run(&mut c, &w, 1.5);
+        let n = &c.npcs[0];
+        assert!(n.pos.x < 6.0 && n.pos.y == 11.0, "pas de saut sous le plafond : {}", n.pos);
+        // Un rebord de 6 blocs : il tombe, perd 2 points, et repart.
+        let mut w = flat();
+        for x in 0..5 {
+            for z in -3..4 {
+                for y in 11..17 {
+                    w.set(x, y, z, BlockId::STONE);
+                }
+            }
+        }
+        let mut c = walker(&w, Vec3::new(2.5, 17.0, 0.5));
+        run(&mut c, &w, 2.0);
+        let n = &c.npcs[0];
+        assert_eq!(n.pos.y, 11.0, "tombé en bas : {}", n.pos);
+        assert_eq!(n.hp, NPC_HP - 2.0, "une chute de 6 blocs ôte 2 points");
+        // Une piscine de deux blocs (eau de x = 5 à 9) : il y nage, en surface, puis remonte
+        // sur la berge.
+        let mut w = flat();
+        for x in 5..10 {
+            for z in -3..4 {
+                w.set(x, 8, z, BlockId::STONE);
+                w.set(x, 9, z, BlockId::WATER);
+                w.set(x, 10, z, BlockId::WATER);
+            }
+        }
+        let mut c = walker(&w, Vec3::new(3.5, 11.0, 0.5));
+        let mut swam = false;
+        let skins = crate::skin::Skins::default();
+        for _ in 0..(6.0 * 60.0) as usize {
+            c.update(&w, &skins, Vec3::new(0.5, 11.0, 0.5), 1.0 / 60.0);
+            let n = &c.npcs[0];
+            if n.swim {
+                swam = true;
+                assert!(n.pos.y > 9.3 && n.pos.y < 10.0, "en surface : {}", n.pos);
+            }
+        }
+        let n = &c.npcs[0];
+        assert!(swam, "il a nagé");
+        assert!(n.pos.x > 10.0 && n.pos.y == 11.0 && !n.swim, "sur la berge : {}", n.pos);
+        assert_eq!(n.hp, NPC_HP, "l'eau ne fait pas mal");
+        // Un mur de deux blocs : demi-tour.
+        let mut w = flat();
+        for z in -3..4 {
+            w.set(6, 11, z, BlockId::STONE);
+            w.set(6, 12, z, BlockId::STONE);
+        }
+        let mut c = walker(&w, Vec3::new(3.5, 11.0, 0.5));
+        run(&mut c, &w, 1.5);
+        let n = &c.npcs[0];
+        assert!(n.pos.x < 6.0 && n.pos.y == 11.0, "arrêté par le mur : {}", n.pos);
     }
 
     /// (v234) Loin de la foule (en vol, plus de sol à moins de 40 blocs, chunks pas chargés),

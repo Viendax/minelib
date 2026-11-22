@@ -2,6 +2,8 @@
 //! d'office (on ne peut ni le bannir ni lui retirer l'OP) ; il nomme les autres OP. Les
 //! OP bannissent et débannissent. Gardé par le relais (pas par l'hôte du moment : le
 //! serveur peut changer de propriétaire en cours de route), par créateur et par monde.
+//! (v238) Un OP nommé peut aussi nommer un OP : un au plus toutes les `OP_WAIT` secondes,
+//! et pas avant `OP_WAIT` secondes après l'être devenu ; seul le créateur retire l'OP.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,7 +51,15 @@ pub struct Store {
     /// (v223) Point d'apparition de chaque serveur (fichier `….spawns`) : [x, y, z, lacet,
     /// tangage], pour qui y arrive la première fois.
     spawns: HashMap<String, [f32; 5]>,
+    /// (v238) Serveur → OP nommé (minuscules) → quand il pourra de nouveau nommer un OP
+    /// (`OP_WAIT` après en avoir nommé un, ou après l'être devenu). En mémoire seulement.
+    op_ready: HashMap<String, HashMap<String, std::time::Instant>>,
 }
+
+/// (v238) Un OP nommé (pas le créateur) nomme un OP au plus une fois toutes les… et pas
+/// avant ce temps après l'être devenu (s).
+pub const OP_WAIT_S: u64 = 30;
+const OP_WAIT: std::time::Duration = std::time::Duration::from_secs(OP_WAIT_S);
 
 /// Positions des joueurs écrites sur le disque au plus toutes les…
 const POSITIONS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -153,7 +163,22 @@ impl Store {
             times,
             spawns,
             weathers,
+            op_ready: HashMap::new(),
         }
+    }
+
+    /// (v238) Secondes (arrondies au-dessus) avant que l'OP nommé `who` puisse nommer un OP ;
+    /// 0 : il le peut (le créateur toujours).
+    pub fn op_wait_left(&self, server: &str, creator: &str, who: &str) -> u64 {
+        if who.eq_ignore_ascii_case(creator) {
+            return 0;
+        }
+        let now = std::time::Instant::now();
+        self.op_ready
+            .get(server)
+            .and_then(|m| m.get(&who.to_ascii_lowercase()))
+            .filter(|at| **at > now)
+            .map_or(0, |at| (*at - now).as_secs_f32().ceil().max(1.0) as u64)
     }
 
     /// Heure du serveur maintenant, et si elle est arrêtée.
@@ -544,7 +569,7 @@ impl Store {
                 let mut ops = vec![format!("{creator} (créateur)")];
                 ops.extend(a.ops.iter().cloned());
                 let bans: Vec<String> = a.bans.iter().map(|b| b.0.clone()).collect();
-                return Ok(format!(
+                let mut text = format!(
                     "OP : {}. Bannis : {}.",
                     ops.join(", "),
                     if bans.is_empty() {
@@ -552,7 +577,13 @@ impl Store {
                     } else {
                         bans.join(", ")
                     }
-                ));
+                );
+                // (v238) Un OP nommé qui attend encore : le temps qui lui reste.
+                let left = self.op_wait_left(server, creator, by);
+                if left > 0 {
+                    text += &format!(" Tu pourras nommer un OP dans {left} s.");
+                }
+                return Ok(text);
             }
             _ if target.is_empty() => return Err("Pseudo manquant.".into()),
             Action::Kill => return Ok(format!("{target} est tué.")),
@@ -588,16 +619,45 @@ impl Store {
                 }
                 format!("{target} n'est plus banni.")
             }
-            Action::Op | Action::Deop if !by.eq_ignore_ascii_case(creator) => {
-                return Err("Seul le créateur du serveur nomme les OP.".into())
+            Action::Deop if !by.eq_ignore_ascii_case(creator) => {
+                return Err("Seul le créateur du serveur retire l'OP.".into())
             }
             Action::Op if is_creator => return Err("Le créateur est déjà OP.".into()),
+            Action::Op if a.ops.contains(&low) => return Err(format!("{target} est déjà OP.")),
             Action::Op => {
-                if !a.ops.contains(&low) {
-                    a.ops.push(low);
+                // (v238) Un OP nommé en nomme un au plus toutes les `OP_WAIT_S` secondes, et
+                // pas avant `OP_WAIT_S` secondes après l'être devenu ; le créateur, quand il veut.
+                let now = std::time::Instant::now();
+                let ready = self.op_ready.entry(server.to_string()).or_default();
+                ready.retain(|_, at| *at > now);
+                let by_creator = by.eq_ignore_ascii_case(creator);
+                if !by_creator {
+                    let me = by.to_ascii_lowercase();
+                    if let Some(&at) = ready.get(&me) {
+                        let left = (at - now).as_secs_f32().ceil().max(1.0) as u64;
+                        return Err(format!(
+                            "Tu pourras nommer un OP dans {left} s (un OP nommé en nomme un \
+                             toutes les {OP_WAIT_S} s au plus, et {OP_WAIT_S} s après l'être \
+                             devenu)."
+                        ));
+                    }
+                    ready.insert(me, now + OP_WAIT);
                 }
+                // Le nouvel OP attend avant d'en nommer un à son tour.
+                ready.insert(low.clone(), now + OP_WAIT);
+                a.ops.push(low);
                 a.bans.retain(|b| !b.0.eq_ignore_ascii_case(target));
-                format!("{target} est OP de ce serveur.")
+                if by_creator {
+                    format!(
+                        "{target} est OP de ce serveur ({target} pourra nommer un OP dans \
+                         {OP_WAIT_S} s)."
+                    )
+                } else {
+                    format!(
+                        "{target} est OP de ce serveur. Tu pourras nommer un autre OP dans \
+                         {OP_WAIT_S} s."
+                    )
+                }
             }
             Action::Deop if is_creator => {
                 return Err("Le créateur reste OP.".into());
@@ -702,6 +762,61 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("weather"));
     }
 
+    /// (v238) « Un OP classique peut OP une autre personne toutes les 30 secondes max, et on
+    /// doit attendre 30 s pour pouvoir OP quand on le devient ; indique le temps restant. »
+    #[test]
+    fn a_named_op_names_an_op_every_30_seconds() {
+        let path = std::env::temp_dir().join(format!("minelib-opwait-{}", rand::random::<u32>()));
+        let mut s = Store::open(path.clone());
+        let k = key("Createur", "monde");
+        let act = |s: &mut Store, by: &str, a: Action, t: &str| s.act(&k, "Createur", by, a, t, "");
+        // Le temps passe (`secs` secondes) pour les attentes.
+        let later = |s: &mut Store, secs: u64| {
+            for at in s.op_ready.values_mut().flat_map(|m| m.values_mut()) {
+                *at = at.checked_sub(std::time::Duration::from_secs(secs)).unwrap();
+            }
+        };
+        act(&mut s, "Createur", Action::Op, "Bob").unwrap();
+        // Tout juste OP : il attend 30 s, et le refus dit combien il en reste.
+        let e = act(&mut s, "Bob", Action::Op, "Eve").unwrap_err();
+        assert!(e.contains("dans 30 s"), "{e}");
+        assert!(!s.is_op(&k, "Createur", "eve"));
+        assert_eq!(s.op_wait_left(&k, "Createur", "bob"), 30);
+        let list = act(&mut s, "Bob", Action::List, "").unwrap();
+        assert!(list.starts_with("OP :") && list.contains("dans 30 s"), "{list}");
+        later(&mut s, 12);
+        let e = act(&mut s, "Bob", Action::Op, "Eve").unwrap_err();
+        assert!(e.contains("dans 18 s"), "{e}");
+        later(&mut s, 18);
+        // 30 s après : il nomme Eve, puis attend de nouveau 30 s.
+        let ok = act(&mut s, "Bob", Action::Op, "Eve").unwrap();
+        assert!(ok.contains("dans 30 s"), "{ok}");
+        assert!(s.is_op(&k, "Createur", "eve"));
+        let e = act(&mut s, "Bob", Action::Op, "Zoe").unwrap_err();
+        assert!(e.contains("dans 30 s"), "{e}");
+        // Eve, tout juste OP, attend aussi ; nommer quelqu'un qui l'est déjà ne compte pas.
+        let e = act(&mut s, "Eve", Action::Op, "Zoe").unwrap_err();
+        assert!(e.contains("dans 30 s"), "{e}");
+        let e = act(&mut s, "Createur", Action::Op, "EVE").unwrap_err();
+        assert!(e.contains("déjà OP"), "{e}");
+        // Le créateur en nomme quand il veut, plusieurs de suite.
+        act(&mut s, "Createur", Action::Op, "Zoe").unwrap();
+        act(&mut s, "Createur", Action::Op, "Max").unwrap();
+        assert_eq!(s.op_wait_left(&k, "Createur", "createur"), 0);
+        assert!(!act(&mut s, "Createur", Action::List, "")
+            .unwrap()
+            .contains("Tu pourras"));
+        // Seul le créateur retire l'OP.
+        let e = act(&mut s, "Bob", Action::Deop, "Eve").unwrap_err();
+        assert!(e.contains("créateur"), "{e}");
+        later(&mut s, 30);
+        act(&mut s, "Bob", Action::Op, "Lea").unwrap();
+        act(&mut s, "Eve", Action::Op, "Noe").unwrap();
+        act(&mut s, "Createur", Action::Deop, "Eve").unwrap();
+        assert!(!s.is_op(&k, "Createur", "eve"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn the_creator_is_op_and_names_the_others() {
         let path = std::env::temp_dir().join(format!("minelib-ops-{}", rand::random::<u32>()));
@@ -713,10 +828,9 @@ mod tests {
             "Bob n'est pas OP"
         );
         assert!(act(&mut s, "createur", Action::Op, "Bob").is_ok());
-        assert!(
-            act(&mut s, "Bob", Action::Op, "Eve").is_err(),
-            "seul le créateur nomme"
-        );
+        // (v238) Tout juste OP : il attend 30 s avant d'en nommer un.
+        let e = act(&mut s, "Bob", Action::Op, "Eve").unwrap_err();
+        assert!(e.contains("Tu pourras nommer un OP dans"), "{e}");
         assert!(act(&mut s, "Bob", Action::Ban, "Eve").is_ok());
         assert!(s.banned(&k, "EVE").is_some());
         assert!(act(&mut s, "Bob", Action::Ban, "Createur").is_err());

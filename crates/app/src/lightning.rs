@@ -698,13 +698,18 @@ impl Strike {
     /// Ce coup de foudre blesse-t-il ce qui se tient en `feet` (ses pieds) ? (Seule la
     /// foudre qui tombe blesse.)
     pub fn hurts(&self, feet: Vec3) -> bool {
-        let d = feet - self.pos;
-        self.kind == Kind::Ground
-            && d.x.abs() <= DAMAGE_REACH
-            && d.z.abs() <= DAMAGE_REACH
-            && d.y >= -DAMAGE_BELOW
-            && d.y <= DAMAGE_ABOVE
+        self.kind == Kind::Ground && hurts_at(self.pos, feet)
     }
+}
+
+/// (v238) La foudre tombée en `at` blesse-t-elle ce qui se tient en `feet` (ses pieds) ? Pour
+/// le joueur (`Strike::hurts`) comme pour les PNJ de la foule.
+pub fn hurts_at(at: Vec3, feet: Vec3) -> bool {
+    let d = feet - at;
+    d.x.abs() <= DAMAGE_REACH
+        && d.z.abs() <= DAMAGE_REACH
+        && d.y >= -DAMAGE_BELOW
+        && d.y <= DAMAGE_ABOVE
 }
 
 fn smooth(a: f32, b: f32, x: f32) -> f32 {

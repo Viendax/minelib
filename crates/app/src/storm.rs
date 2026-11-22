@@ -195,6 +195,8 @@ pub struct Storm {
     pub test_cmds: usize,
     /// (v217) Horloge des éclairs posés au sol.
     clock: f32,
+    /// (v238) Foudre tombée au sol à cette image (où) : elle blesse aussi les PNJ de la foule.
+    pub landed: Vec<Vec3>,
     /// Œil du joueur à la dernière image.
     eye: Vec3,
 }
@@ -224,6 +226,7 @@ impl Storm {
             test_cmds: 0,
             clock: 0.0,
             eye: Vec3::ZERO,
+            landed: Vec::new(),
         }
     }
 
@@ -250,8 +253,12 @@ impl Storm {
             }
         }
         let mut hurt = 0u8;
+        self.landed.clear();
         for s in &mut self.strikes {
             if s.update(dt) {
+                if s.kind == lightning::Kind::Ground {
+                    self.landed.push(s.pos);
+                }
                 match s.kind {
                     // (Le tonnerre d'un éclair des nuages part avec sa lueur.)
                     lightning::Kind::Cloud => {}
