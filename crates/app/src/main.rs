@@ -34,7 +34,8 @@
 //!   MINELIB_ZEUS=1              la Foudre de Zeus en main à l'arrivée (essais)
 //!   MINELIB_THOR=<s>            la foudre tombe là où l'on regarde toutes les <s> s (essais)
 //!   MINELIB_F5=1|2              commencer vu de derrière (1) ou de face (2) (essais)
-//!   MINELIB_FOUDRE_FIGEE=1      chaque éclair s'arrête à son plus vif (captures d'essai)
+//!   MINELIB_FOUDRE_FIGEE=1      chaque éclair s'arrête à son plus vif (captures d'essai) ;
+//!                               un autre nombre : à tant de secondes après le premier arc
 //!   MINELIB_FUSION=0            ne fusionne pas les faces de blocs voisines (essais : pour
 //!                               comparer l'image et le nombre de triangles)
 //!   MINELIB_EN_LIGNE=1          ouvre MINELIB_WORLD en ligne (construction), dès que le

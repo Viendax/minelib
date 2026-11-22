@@ -1111,7 +1111,10 @@ impl Sky {
         let direct = 1.0 - 0.25 * w.rain - 0.25 * w.storm;
         let dark = 1.0 - 0.3 * w.rain - 0.35 * w.storm;
         let (gray, over) = self.overcast(&w);
-        let neutral = |c: Vec3| c.lerp(Vec3::new(0.94, 0.97, 1.0) * lum(c), over);
+        // (v235) Sous un ciel couvert, la lumière du ciel prend la teinte du temps qu'il
+        // fait (gris à peine bleu, gris-bleu de la pluie, ardoise de l'orage).
+        let tint = weather_tint(&w);
+        let neutral = |c: Vec3| c.lerp(tint * lum(c), over);
         let p = CloudParams {
             origin: [
                 cam.x.rem_euclid(WRAP) as f32,
@@ -1149,11 +1152,13 @@ impl Sky {
 
     /// Gris du ciel couvert (la brume et le lointain y tendent), et à quel point le ciel
     /// l'est (0 beau temps … 1 couvert).
+    /// (v235) Avec la teinte du temps qu'il fait (`weather_tint`), et un reste de la couleur
+    /// du ciel dégagé à cette heure : un soir de pluie garde un peu de son couchant.
     fn overcast(&self, w: &SkyWeather) -> (Vec3, f32) {
         let over = smoothstep(0.55, 0.95, w.cover);
         let clear = self.light.horizon * 0.55 + self.light.zenith * 0.25;
-        let y = clear.dot(Vec3::new(0.2126, 0.7152, 0.0722));
-        let gray = Vec3::new(0.93, 0.96, 1.0) * y * (1.0 - 0.3 * w.rain - 0.4 * w.storm)
+        let y = clear.dot(LUMA);
+        let gray = (weather_tint(w) * y).lerp(clear, 0.16) * (1.0 - 0.3 * w.rain - 0.4 * w.storm)
             + Vec3::splat(0.003);
         (gray, over)
     }
@@ -1238,6 +1243,22 @@ impl Sky {
 /// monde (z), elles se lèvent et se couchent.
 fn star_angle(sun: Vec3) -> f32 {
     sun.y.atan2(sun.x)
+}
+
+const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+
+/// (v235) Teinte d'un ciel couvert selon le temps qu'il fait, de luminance 1 : un gris à
+/// peine bleu sous de simples nuages, le gris-bleu froid de la pluie, l'ardoise sombre (un
+/// rien de vert) de l'orage. Avant, les trois étaient du même gris neutre, plus ou moins
+/// foncé : l'horizon et les nuages d'un orage avaient la couleur d'une pluie sombre.
+pub fn weather_tint(w: &SkyWeather) -> Vec3 {
+    let unit = |c: Vec3| c / c.dot(LUMA);
+    let cloudy = unit(Vec3::new(0.93, 0.96, 1.0));
+    let rain = unit(Vec3::new(0.78, 0.89, 1.0));
+    let storm = unit(Vec3::new(0.60, 0.80, 0.98));
+    cloudy
+        .lerp(rain, w.rain.clamp(0.0, 1.0))
+        .lerp(storm, w.storm.clamp(0.0, 1.0))
 }
 
 #[cfg(test)]

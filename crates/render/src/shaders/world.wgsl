@@ -184,7 +184,10 @@ fn sky_hash(v: vec3<i32>) -> f32 {
 /// des blocs lointains s'y fond. Une seule lecture (avant : un dégradé calculé par pixel).
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
     let c = textureSampleLevel(sky_cube, sky_samp, dir, 0.0).rgb;
-    return mix(c, sky.fog.rgb, sky.fog.w);
+    // (v235) Un ciel couvert laisse passer un peu de la couleur du ciel derrière lui, du
+    // côté où l'on regarde : un horizon un peu plus clair que les nuages en plein jour, une
+    // lueur du côté du couchant le soir. (Tout gris, l'horizon était le même partout.)
+    return mix(c, sky.fog.rgb, sky.fog.w * 0.86);
 }
 
 /// Halo du soleil, et son disque si `disc` : l'auréole serrée autour du disque, la grande

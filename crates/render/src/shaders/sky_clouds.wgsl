@@ -226,7 +226,8 @@ fn fs_clouds(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // Brume : les nuages lointains prennent la couleur du ciel de l'horizon.
     let dist = select(s0, far / max(weight, 1e-5), weight > 0.0);
     let haze = 1.0 - exp(-dist / 3400.0);
-    let sky = mix(textureSampleLevel(sky_cube, sky_s, d, 0.0).rgb, c.haze.rgb, c.haze.w);
+    // (0,86 : comme `sky_color` de world.wgsl, le ciel couvert laisse passer un peu du ciel.)
+    let sky = mix(textureSampleLevel(sky_cube, sky_s, d, 0.0).rgb, c.haze.rgb, c.haze.w * 0.86);
     lum = mix(lum, sky * opacity, haze);
     // Par beau temps, les nuages les plus lointains s'effacent en partie dans la brume :
     // l'horizon reste dégagé, on voit le soleil s'y coucher. (Pas sous un ciel couvert :

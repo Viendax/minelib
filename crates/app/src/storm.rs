@@ -457,7 +457,8 @@ impl Storm {
     }
 
     /// (v217) La Foudre de Zeus posée au sol en `at` (objet lâché) : le même éclair qu'en
-    /// main, en petit, debout. `phase` : chaque objet vit à son rythme.
+    /// main, debout. (v235) De la même taille qu'en main (il était plus de deux fois plus
+    /// petit). `phase` : chaque objet vit à son rythme.
     pub fn ground_item(&mut self, at: Vec3, phase: f32) {
         let mut arcs = std::mem::take(&mut self.arcs);
         arcs.clear();
@@ -507,10 +508,14 @@ impl Storm {
                 continue;
             }
             // (v220) Deux lumières sur le canal lui-même : tout près du point frappé, et
-            // plus haut le long de l'éclair (elle éclaire de là où il passe).
+            // plus haut le long de l'éclair (elle éclaire de là où il passe). (v235) Bien
+            // moins fortes (16 et 20 avant), et la première un peu plus haut : l'éclat d'une
+            // lumière vaut jusqu'au bout de sa portée ou presque, et à 16 et 20 tout le sol
+            // devenait blanc sur des dizaines de blocs : on ne voyait plus l'éclair qui
+            // venait de tomber, ni rien d'autre.
             let [low, high] = s.light_points();
             for (n, (pos, intensity, range)) in
-                [(low, 16.0, 26.0), (high, 20.0, 48.0)].into_iter().enumerate()
+                [(low, 2.0, 22.0), (high, 1.2, 44.0)].into_iter().enumerate()
             {
                 out.push(DynLight {
                     id: STRIKE_LIGHT_ID + ((k as u64 & 0x7f) << 1) + n as u64,
@@ -598,8 +603,9 @@ impl Storm {
 /// curseur « Volume de la météo » (Paramètres → Son) s'y ajoute.
 const RAIN_VOLUME: f32 = 0.75;
 
-/// (v217) Hauteur de la Foudre de Zeus posée au sol (blocs).
-const GROUND_ITEM: f32 = 0.55;
+/// (v217) Hauteur de la Foudre de Zeus posée au sol (blocs). (v235) Celle de l'éclair tenu
+/// en main (elle valait 0,55).
+const GROUND_ITEM: f32 = lightning::HELD_LEN;
 
 /// (v217) Quitter la partie fait taire la pluie et le tonnerre (ils continuaient à
 /// l'accueil : la boucle de la pluie ne s'arrêtait qu'avec la météo de la partie).

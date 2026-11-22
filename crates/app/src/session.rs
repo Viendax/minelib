@@ -3106,8 +3106,11 @@ impl Session {
         );
         // (v226) PNJ de la foule d'essai visé avant le bloc : le clic le frappe ; clic tenu,
         // rien n'est cassé derrière lui.
+        // (v235) Sauf avec la Foudre de Zeus en main : le clic lance la foudre, qui tombe sur
+        // lui (plus bas).
         let attack = keys.pressed(input, Action::Attack);
-        if attack || keys.held(input, Action::Attack) {
+        let zeus = self.inventory.selected_item() == Some(Item::Zeus);
+        if (attack || keys.held(input, Action::Attack)) && !zeus {
             let before_block = |t: f32| hit.as_ref().is_none_or(|b| t <= b.distance);
             if let Some((target, _)) = self.npc_aimed().filter(|(_, t)| before_block(*t)) {
                 if attack {
@@ -3172,9 +3175,25 @@ impl Session {
         // avec /thor (rien n'est cassé, même en créatif).
         if self.inventory.selected_item() == Some(Item::Zeus) && keys.held(input, Action::Attack) {
             if keys.pressed(input, Action::Attack) && self.storm.cooldown <= 0.0 {
+                // (v235) Un PNJ visé : la foudre tombe sur lui (`aimed`), et il réagit comme
+                // à un coup (le nôtre, où qu'il soit ; celui d'un autre OP, à portée de coup :
+                // c'est son jeu qui en décide).
+                let seen = raycast(
+                    &self.world,
+                    self.player.eye().into(),
+                    self.player.look_dir().into(),
+                    crate::storm::THOR_RANGE,
+                );
+                let limit = seen.map_or(crate::storm::THOR_RANGE, |h| h.distance);
+                let npc = self.aimed_person(limit).and_then(|(_, npc, t)| Some((npc?, t)));
                 if let Some(aim) = self.aimed() {
                     self.cast_lightning(aim);
                     self.storm.cooldown = crate::storm::ZEUS_COOLDOWN;
+                    if let Some((target, t)) = npc {
+                        if matches!(target, NpcTarget::Mine(_)) || t <= NPC_REACH {
+                            self.hit_npc(target);
+                        }
+                    }
                 }
             }
             return;
@@ -4051,7 +4070,7 @@ impl Session {
                 .unwrap_or_else(|| Mat4::from_translation(self.player.eye()));
             self.storm.hold(dt, place, None, on);
         }
-        // (v217) Les Foudres de Zeus posées au sol : le même éclair, en petit.
+        // (v217) Les Foudres de Zeus posées au sol : le même éclair, (v235) de la même taille.
         for (at, phase) in self.items.bolts(eye) {
             self.storm.ground_item(at, phase);
         }
@@ -4059,8 +4078,13 @@ impl Session {
         let cam = self.camera_pos();
         self.update_remote_bolts(dt, cam);
         // Lumière du jour montrée : moins sous un ciel couvert, plus l'éclat des éclairs.
+        // (v235) L'éclat d'un éclair compte d'autant moins qu'il fait déjà clair : en plein
+        // soleil, la foudre tombée tout près doublait la lumière du jour, et le sol clair
+        // (la neige surtout) devenait une tache blanche où l'on ne voyait plus l'éclair.
+        // La nuit et sous l'orage, rien ne change ou presque.
+        let day = self.daylight * self.storm.light();
         self.daylight_shown =
-            (self.daylight * self.storm.light() + self.storm.flash * 1.5).min(2.2);
+            (day + self.storm.flash * 1.5 * (1.0 - 0.8 * day.clamp(0.0, 1.0))).min(2.2);
     }
 
     /// (v216) Ce que vise le regard, pour la foudre : le premier bloc touché à moins de
@@ -4069,12 +4093,18 @@ impl Session {
     /// regard (`None` : rien de chargé là-bas).
     fn aimed(&self) -> Option<Aim> {
         let (eye, dir) = (self.player.eye(), self.player.look_dir());
-        if let Some(h) = raycast(
+        let block = raycast(
             &self.world,
             eye.into(),
             dir.into(),
             crate::storm::THOR_RANGE,
-        ) {
+        );
+        // (v235) Un joueur ou un PNJ visé, devant le premier bloc : la foudre tombe sur lui.
+        let limit = block.as_ref().map_or(crate::storm::THOR_RANGE, |h| h.distance);
+        if let Some((feet, _, _)) = self.aimed_person(limit) {
+            return Some(Aim::Ground(feet));
+        }
+        if let Some(h) = block {
             return Some(Aim::Ground(eye + dir * h.distance));
         }
         if dir.y > 0.1 {
@@ -4085,6 +4115,39 @@ impl Session {
         let (x, z) = (p.x.floor() as i32, p.z.floor() as i32);
         crate::storm::column_top(&self.world, x, z)
             .map(|top| Aim::Ground(Vec3::new(x as f32 + 0.5, (top + 1) as f32, z as f32 + 0.5)))
+    }
+
+    /// (v235) Joueur ou PNJ (foule d'essai, la nôtre ou celle d'un autre OP) visé à moins de
+    /// `limit` blocs : ses pieds, le PNJ si c'en est un, et sa distance. Le plus proche.
+    fn aimed_person(&self, limit: f32) -> Option<(Vec3, Option<NpcTarget>, f32)> {
+        let (eye, dir) = (self.player.eye(), self.player.look_dir());
+        let mut best: Option<(Vec3, Option<NpcTarget>, f32)> = None;
+        let mut keep = |feet: Vec3, npc: Option<NpcTarget>, t: f32| {
+            if t <= limit && best.as_ref().is_none_or(|b| t < b.2) {
+                best = Some((feet, npc, t));
+            }
+        };
+        if let Some((i, t)) = self.crowd.as_ref().and_then(|c| c.aimed(eye, dir, limit)) {
+            if let Some(c) = &self.crowd {
+                keep(c.npcs[i].pos, Some(NpcTarget::Mine(i)), t);
+            }
+        }
+        for (owner, rc) in &self.remote_crowds {
+            if let Some((i, t)) = rc.aimed(eye, dir, limit) {
+                keep(rc.npcs[i].pos, Some(NpcTarget::Theirs(owner.clone(), i)), t);
+            }
+        }
+        if let Some(b) = &self.build {
+            let h = crate::player::HALF_WIDTH;
+            for o in b.others.values() {
+                let min = o.pos - Vec3::new(h, 0.0, h);
+                let max = o.pos + Vec3::new(h, crate::player::HEIGHT, h);
+                if let Some(t) = crate::screen::aim_box(min, max, eye, dir, limit) {
+                    keep(o.pos, None, t);
+                }
+            }
+        }
+        best
     }
 
     /// (v216) `/thor` : la foudre tombe là où l'on vise. En solo, celui qui joue ; sur un

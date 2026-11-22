@@ -337,10 +337,19 @@ impl Strike {
             return false;
         }
         self.age += dt;
-        // Essais : MINELIB_FOUDRE_FIGEE=1 arrête chaque éclair à son plus vif (captures).
-        static FROZEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *FROZEN.get_or_init(|| std::env::var("MINELIB_FOUDRE_FIGEE").is_ok_and(|v| v == "1")) {
-            self.age = self.age.min(self.leader_s + 0.004);
+        // Essais : MINELIB_FOUDRE_FIGEE=1 arrête chaque éclair à son plus vif (captures) ;
+        // un autre nombre : à tant de secondes après que le premier arc a touché le sol
+        // (négatif : avant, pendant la descente du traceur).
+        static FROZEN: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        let frozen = FROZEN.get_or_init(|| {
+            let v = std::env::var("MINELIB_FOUDRE_FIGEE").ok()?;
+            match v.trim() {
+                "1" => Some(0.004),
+                v => v.parse().ok(),
+            }
+        });
+        if let Some(at) = frozen {
+            self.age = self.age.min((self.leader_s + at).max(0.0));
         }
         if !self.landed && self.age >= self.leader_s {
             self.landed = true;
@@ -561,17 +570,18 @@ impl Strike {
         }
     }
 
-    /// (v220) D'où part la lumière qu'il jette : deux points de son canal même, à 1,5 et à
+    /// (v220) D'où part la lumière qu'il jette : deux points de son canal même, à 3,5 et à
     /// une vingtaine de blocs du point frappé (ou de la main, pour celui qui monte). La
     /// lumière et les ombres viennent ainsi de là où l'on voit l'éclair, pas d'à côté.
+    /// (v235) 3,5 blocs et non 1,5 : collée au sol, elle le blanchissait tout autour.
     pub fn light_points(&self) -> [Vec3; 2] {
         let from = self.pos;
-        let mut out = [from + Vec3::Y * 1.5, from + Vec3::Y * 20.0];
+        let mut out = [from + Vec3::Y * 3.5, from + Vec3::Y * 20.0];
         let (mut near, mut far) = (f32::MAX, f32::MAX);
         for p in self.pieces.iter().take_while(|p| p.level == 0) {
             let d = (p.a - from).length();
-            if (d - 1.5).abs() < near {
-                near = (d - 1.5).abs();
+            if (d - 3.5).abs() < near {
+                near = (d - 3.5).abs();
                 out[0] = p.a;
             }
             if (d - 20.0).abs() < far {
@@ -927,7 +937,8 @@ pub fn in_world(arcs: &[Arc], place: Mat4, out: &mut Vec<BoltSeg>) {
 }
 
 /// Comme `in_world`, pour un repère `place` qui agrandit ou réduit de `scale` (les halos
-/// suivent) : (v217) la Foudre de Zeus posée au sol est le même éclair, en petit.
+/// suivent) : (v217) la Foudre de Zeus posée au sol est le même éclair ((v235) de la même
+/// taille qu'en main).
 pub fn in_world_scaled(arcs: &[Arc], place: Mat4, scale: f32, out: &mut Vec<BoltSeg>) {
     for s in arcs {
         let (a, b) = (place.transform_point3(s.a), place.transform_point3(s.b));

@@ -21,6 +21,12 @@ const ARM_THICK: f32 = ARM_LEN * crate::player_model::ARM_RATIO;
 /// bas tourne autour d'elle.
 const ARM_BASE: Vec3 = Vec3::new(ARM_FIST.x, ARM_FIST.y, ARM_FIST.z + ARM_LEN);
 
+/// (v235) Foudre de Zeus : le bras se lève de cet angle (rad) autour de sa base, pour que
+/// le poing monte vers le milieu de l'écran. L'éclair, tenu par son milieu, se voit ainsi
+/// au-dessus et au-dessous du poing (le bras tendu vers le bas de l'écran, sa moitié basse
+/// sortait de l'image : il semblait posé sur la main).
+const ZEUS_RAISE: f32 = 0.61;
+
 /// (v220) Geste de la main en cassant un bloc : un petit coup vers le bas, qui revient vite.
 /// En créatif, un coup par bloc cassé (`DIP_S`) ; en survie, tant qu'on casse, des coups en
 /// boucle, 50 % plus lents (`DIP_S` × 1,5), un toutes les `DIG_EVERY_S` (le temps de casser
@@ -529,6 +535,9 @@ impl Hand {
         let bob =
             Vec3::new(self.bob.sin() * 0.025, -(self.bob.cos().abs()) * 0.03, 0.0) * self.bob_amp;
         self.dip_view()
+            * Mat4::from_translation(ARM_BASE)
+            * Mat4::from_rotation_x(self.zeus_raise())
+            * Mat4::from_translation(-ARM_BASE)
             * Mat4::from_translation(bob + Vec3::new(0.0, -0.35 * self.equip - 0.12 * s, -0.12 * s))
             * Mat4::from_rotation_x(-0.6 * s)
     }
@@ -537,7 +546,21 @@ impl Hand {
     /// devant) : le poing à l'origine, l'éclair le long de +y. Elle suit les gestes de la
     /// main (balancement de la marche, coup).
     pub fn zeus_frame(&self) -> Mat4 {
-        self.base() * Mat4::from_translation(ARM_FIST) * zeus_rotation()
+        // (v235) Le bras est levé, l'éclair reste droit : au bout du poing, tenu par son
+        // milieu.
+        self.base()
+            * Mat4::from_translation(ARM_FIST)
+            * Mat4::from_rotation_x(-self.zeus_raise())
+            * zeus_rotation()
+    }
+
+    /// (v235) De combien le bras est levé (rad) : avec la Foudre de Zeus en main.
+    fn zeus_raise(&self) -> f32 {
+        if matches!(self.last, Some(Item::Zeus)) {
+            ZEUS_RAISE
+        } else {
+            0.0
+        }
     }
 
     /// (v217) Rapport entre l'angle de vue de la main (fixe) et celui du monde

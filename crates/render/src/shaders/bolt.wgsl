@@ -57,6 +57,9 @@ struct VOut {
 
 /// Plus près que ça de l'œil (w), un bout de segment est ramené devant.
 const NEAR_W: f32 = 0.02;
+/// (v235) Demi-largeur à l'écran (la demi-hauteur de l'écran vaut 1) que le halo d'un coup
+/// de foudre ne dépasse pas, si près de l'œil qu'il passe.
+const NEAR_R: f32 = 0.075;
 /// Demi-largeur minimale à l'écran (px) : un éclair lointain reste un trait visible.
 const MIN_PX: f32 = 1.3;
 /// Le rectangle dépasse d'autant les deux bouts du segment (en demi-largeurs) : le halo
@@ -127,6 +130,16 @@ fn place(vi: u32, s: Seg, view_proj: mat4x4<f32>) -> VOut {
     if !screen {
         ra = wa * scale / a.w;
         rb = wb * scale / b.w;
+        // (v235) Un coup de foudre tombé tout près : le canal passe à côté de l'œil, ou
+        // au-dessus de lui. Un point loin de l'œil mais presque dans son plan (profondeur
+        // presque nulle) prenait une largeur immense à l'écran, et un grand rectangle blanc
+        // couvrait l'image dès qu'on regardait vers le sol. La largeur que le jeu donne à
+        // ces morceaux compte la distance à l'œil, pas la profondeur : c'est ici, à
+        // l'écran, qu'elle se borne. (Pas l'éclair tenu ni la lueur dans les nuages.)
+        if s.a.w > 0.5 && s.a.w < 1.5 {
+            ra = min(ra, NEAR_R);
+            rb = min(rb, NEAR_R);
+        }
     }
     let r = max(0.5 * (ra + rb), MIN_PX * 2.0 / max(g.screen.y, 1.0));
     // Le segment à l'écran, en pixels carrés (x multiplié par le rapport de l'écran).
