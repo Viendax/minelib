@@ -5,6 +5,65 @@
 use minelib_render::igpu::{self, IgpuReport};
 use minelib_render::wgpu;
 
+/// (v228) Où est l'écran par rapport à la carte qui dessine (`DisplayLink`), et nombre de
+/// cartes graphiques de la machine : relevés au démarrage du rendu (`note`), repris quand le
+/// jeu passe sur un écran branché sur sa carte (`now_direct`). Pour l'écran de debug (F3) et
+/// le choix de la carte dans les paramètres graphiques.
+static DISPLAY: std::sync::Mutex<Option<DisplayLink>> = std::sync::Mutex::new(None);
+static CARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// (v228) Voir `DISPLAY` : les cartes vues par Windows, celle qui dessine le jeu.
+pub fn note(cards: &[minelib_platform::GpuAdapter], render_gpu: &str) {
+    CARDS.store(cards.len(), std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut d) = DISPLAY.lock() {
+        *d = link_in(cards, render_gpu);
+    }
+}
+
+/// (v228) Le jeu s'affiche maintenant sur un écran branché sur la carte qui dessine.
+pub fn now_direct() {
+    if let Ok(mut d) = DISPLAY.lock() {
+        *d = Some(DisplayLink::Direct);
+    }
+}
+
+/// (v228) Voir `DISPLAY` (`None` : inconnu, ou pas sous Windows).
+pub fn display() -> Option<DisplayLink> {
+    DISPLAY.lock().ok()?.clone()
+}
+
+/// (v228) Plusieurs cartes graphiques (une partie intégrée et une carte dédiée, le plus
+/// souvent) : le choix de la carte a un sens.
+pub fn several_cards() -> bool {
+    CARDS.load(std::sync::atomic::Ordering::Relaxed) >= 2
+}
+
+/// (v228) Où est branché l'écran, par rapport à la carte qui dessine le jeu.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DisplayLink {
+    /// Sur elle : rien à recopier.
+    Direct,
+    /// Sur une autre carte (`name`) : chaque image y est recopiée ; `integrated` : c'est la
+    /// partie graphique du processeur (presque pas de mémoire dédiée).
+    Elsewhere { name: String, integrated: bool },
+}
+
+/// (v228) L'écran est-il branché sur la carte `render_gpu` qui dessine le jeu ? `None` :
+/// inconnu (pas sous Windows, carte pas trouvée dans la liste).
+fn link_in(cards: &[minelib_platform::GpuAdapter], render_gpu: &str) -> Option<DisplayLink> {
+    let main = cards
+        .iter()
+        .find(|a| render_gpu.contains(&a.name) || a.name.contains(render_gpu))?;
+    if main.has_display {
+        return Some(DisplayLink::Direct);
+    }
+    let shown = cards.iter().find(|a| a.has_display)?;
+    Some(DisplayLink::Elsewhere {
+        name: shown.name.clone(),
+        integrated: shown.dedicated < 1 << 30,
+    })
+}
+
 /// Lance le bilan dans un processus à part (aucune gêne pour le jeu : ni verrou partagé avec
 /// sa carte graphique, ni saccade), une seule fois par machine : le résultat est gardé dans
 /// `.minelib/logs/bilan_gpu.txt` (supprimer ce fichier pour le refaire).
@@ -139,4 +198,44 @@ fn report(render_gpu: &str) {
         "bilan : partie intégrée laissée au repos pendant le jeu — sur un portable elle partage l'énergie et la \
          chaleur du processeur, la charger ferait baisser la fréquence du processeur qui prépare les images."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minelib_platform::GpuAdapter;
+
+    /// (v228) L'écran sur la carte du jeu, ou sur une autre (la partie intégrée d'un portable :
+    /// chaque image y est recopiée) ; carte du jeu pas dans la liste : inconnu.
+    #[test]
+    fn the_screen_is_on_the_game_card_or_elsewhere() {
+        let card = |name: &str, dedicated: u64, has_display: bool| GpuAdapter {
+            name: name.into(),
+            dedicated,
+            shared: 8 << 30,
+            has_display,
+        };
+        let laptop = [
+            card("Intel(R) UHD Graphics 770", 128 << 20, true),
+            card("NVIDIA GeForce RTX 4060 Laptop GPU", 8 << 30, false),
+        ];
+        assert_eq!(
+            link_in(&laptop, "NVIDIA GeForce RTX 4060 Laptop GPU"),
+            Some(DisplayLink::Elsewhere {
+                name: "Intel(R) UHD Graphics 770".into(),
+                integrated: true
+            })
+        );
+        assert_eq!(
+            link_in(&laptop, "Intel(R) UHD Graphics 770"),
+            Some(DisplayLink::Direct)
+        );
+        let desktop = [card("AMD Radeon RX 7800 XT", 16 << 30, true)];
+        assert_eq!(
+            link_in(&desktop, "AMD Radeon RX 7800 XT"),
+            Some(DisplayLink::Direct)
+        );
+        assert_eq!(link_in(&desktop, "llvmpipe (LLVM 17.0.6, 256 bits)"), None);
+        assert_eq!(link_in(&[], "AMD Radeon RX 7800 XT"), None);
+    }
 }

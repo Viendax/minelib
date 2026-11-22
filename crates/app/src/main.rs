@@ -351,6 +351,9 @@ struct Game {
     message: Option<(String, f32)>,
     /// Écran branché sur une autre carte que celle qui dessine (Optimus) : son nom.
     optimus: Option<String>,
+    /// (v228) Partie graphique intégrée voulue au lancement (`Options::igpu`) : le choix
+    /// changé depuis ne compte qu'au prochain lancement.
+    igpu_at_start: bool,
     /// Shaders des lumières à lancer dès que possible (lumières utilisées ces derniers
     /// jours).
     warm_lights: bool,
@@ -487,6 +490,7 @@ impl Game {
             clear_meshes: false,
             quit: false,
             optimus: None,
+            igpu_at_start: false,
             warm_lights: false,
             vram: None,
         })
@@ -3168,6 +3172,23 @@ impl Game {
             self.options.fullscreen = !self.options.fullscreen;
         }
         y += step;
+        // (v228) Carte graphique : la plus puissante ou la partie intégrée au processeur (moins
+        // de chaleur et de batterie), quand la machine en a plusieurs ; compte au prochain
+        // lancement.
+        if gpu_report::several_cards() {
+            let mut gpu_label = if self.options.igpu {
+                "Carte graphique : partie intégrée".to_string()
+            } else {
+                "Carte graphique : la plus puissante".to_string()
+            };
+            if self.options.igpu != self.igpu_at_start {
+                gpu_label.push_str(" (au prochain lancement)");
+            }
+            if c.button(&gpu_label, cx, y, 300.0, true) {
+                self.options.igpu = !self.options.igpu;
+            }
+            y += step;
+        }
         // Répartition du processeur (prise en compte au prochain monde chargé).
         let cpu_label = if self.options.cpu_uniform {
             "Processeur : tous les coeurs"
@@ -3320,6 +3341,9 @@ impl GameLoop for Game {
             .startup_pack
             .take()
             .unwrap_or_else(|| ResourcePack::builtin().expect("pack intégré"));
+        // (v228) La carte choisie dans les paramètres graphiques.
+        minelib_render::prefer_integrated(self.options.igpu);
+        self.igpu_at_start = self.options.igpu;
         match Renderer::new(window, &pack) {
             Ok(mut r) => {
                 r.set_low_latency(self.options.low_latency);
@@ -3349,6 +3373,8 @@ impl GameLoop for Game {
                 self.vram = minelib_platform::VramMonitor::new(&r.adapter_name)
                     .map(|m| (m, std::time::Instant::now(), false));
                 let adapters = minelib_platform::gpu_adapters();
+                // (v228) Où est l'écran (écran de debug), combien de cartes (paramètres).
+                gpu_report::note(&adapters, &r.adapter_name);
                 if let Some(a) = adapters
                     .iter()
                     .find(|a| r.adapter_name.contains(&a.name) || a.name.contains(&r.adapter_name))
@@ -3450,6 +3476,7 @@ impl GameLoop for Game {
                 if let (Some(m), Some(n)) = (&target, &name) {
                     log::info!("écran {n} branché sur la carte qui dessine : le jeu s'y affiche (pas de recopie entre cartes)");
                     self.optimus = None;
+                    gpu_report::now_direct();
                     if !self.options.fullscreen {
                         window.set_outer_position(m.position());
                     }

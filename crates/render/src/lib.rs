@@ -935,6 +935,16 @@ pub struct Renderer {
     pub backend: String,
 }
 
+/// (v228) Carte voulue pour le rendu : la partie graphique intégrée au processeur (moins de
+/// chaleur, moins de batterie ; ou l'écran branché dessus) plutôt que la plus puissante. Lue
+/// à la création du rendu (`Renderer::new`) : un changement compte au prochain lancement.
+static PREFER_INTEGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// (v228) Voir `PREFER_INTEGRATED`.
+pub fn prefer_integrated(on: bool) {
+    PREFER_INTEGRATED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Renderer {
     pub fn new(window: Arc<Window>, pack: &ResourcePack) -> Result<Self> {
         pollster::block_on(Self::new_async(window, pack))
@@ -993,7 +1003,13 @@ impl Renderer {
             };
             let Ok(adapter) = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    power_preference: if PREFER_INTEGRATED
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        wgpu::PowerPreference::LowPower
+                    } else {
+                        wgpu::PowerPreference::HighPerformance
+                    },
                     compatible_surface: Some(&surface),
                     force_fallback_adapter: false,
                 })

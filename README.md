@@ -145,7 +145,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 - **Lampe torche** (inventaire créatif, ou `/give lampe`) : un vrai projecteur dans ta main, dont la lumière part de l'ampoule et vise le centre de l'écran, que les murs arrêtent et qui trace ses rayons dans l'air selon les réglages des lumières. Elle arrive éteinte dans ta main ; **clic molette** pour l'allumer ou l'éteindre. Allumée, la **molette** règle son faisceau, du plus serré (loin et fort) au plus large (court et doux), et ton réglage est gardé. À la troisième personne et dans les miroirs, tu la tiens, bras tendu, et son verre brille. En construction en ligne, les autres te la voient en main, et sa lumière les éclaire (les huit lampes allumées les plus proches, jusqu'à 96 blocs).
 - **Météo** (hors cartes FPS) : la pluie et l'orage arrivent et repartent tout seuls (une averse dure de 10 à 20 minutes, puis le temps reste sec de 10 minutes à 2 h 30) ; les nuages s'épaississent, le jour s'assombrit, la pluie tombe (pas sous un toit), puis le tonnerre. La **foudre** tombe pendant l'orage, un éclair toutes les 11 secondes en moyenne autour de toi, de préférence sur les points hauts (règle des paratonnerres : un sommet attire ce qui tomberait à moins de trois fois sa hauteur), éclaire tout le paysage, fait jaillir une gerbe d'étincelles et blesse à 3 blocs (5 points de vie) ; d'autres éclairs courent dans les nuages sans tomber, cachés par eux là où ils y entrent. Au-delà du monde chargé, le sol continue jusqu'à l'horizon et se perd dans la brume, plus proche sous la pluie. Chaque coup de tonnerre sonne un peu plus grave ou plus aigu, et la pluie ne tourne pas en boucle à l'oreille. En ligne, tous les joueurs d'un monde ont le même temps au même moment. `/weather clear|rain|storm` impose un temps, `/weather fix` le fige.
 - **Foudre de Zeus** (inventaire créatif, ou `/give foudre`) : un éclair tenu droit dans le poing, par son milieu, long de 1,26 bloc, de la même lumière que la foudre du ciel (blanche, avec des touches de bleu et de violet) ; il crépite sourdement (un grésillement électrique étouffé qui vient de ta main, jamais deux fois pareil), lance des étincelles et éclaire les murs et les joueurs autour de toi, avec ton ombre entière. Son icône et l'objet posé au sol sont ce même éclair. Clic gauche : la foudre tombe là où tu vises, comme avec `/thor` (réservé aux OP sur un serveur de construction) ; en visant le ciel, elle part de ta main, monte et traverse les nuages. En construction en ligne, les autres te voient la tenir, en reçoivent la lumière et l'entendent crépiter jusqu'à 10 blocs ; la météo imposée et la foudre lancée ne se voient encore que chez soi.
-- **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`).
+- **Construis à plusieurs, sans limite de joueurs** : ouvre ton monde en ligne, il continue même si tu pars. Le créateur est OP et gère son serveur (`/op`, `/ban`, `/kill`, le mode de jeu d'un joueur avec `/gm <mode> <pseudo>`, celui des nouveaux venus avec `/defaultgamemode`).
 - **Importe tes mondes Java** (format Anvil, toutes versions) et tes **packs de textures** : les fichiers d'origine ne sont jamais modifiés. Les décors faits d'**entités d'affichage** (blocs et objets posés, souvent dans des barrières) deviennent de vrais blocs, les **têtes à skin** gardent leur texture (téléchargée une fois depuis les serveurs de textures de Minecraft, puis gardée sur ton PC, calque du dessus compris), les **cadres** accrochés aux murs montrent le bloc qu'ils tiennent (et se cassent). Les blocs récents ont leur propre bloc, avec la texture de ton pack s'il l'a : ardoise des abîmes, tuf, roche noire, boue, cuivre (ses quatre états), basalte, mousse, calcite, coraux, champignons géants, bambou, grenouillères, ateliers, feu de camp, lichen lumineux, nouvelles essences de bois (palétuvier, cerisier, bambou, carmin, biscornu, chêne pâle). Chaque muret garde sa pierre, et les lumières invisibles des cartes éclairent. Lanternes, bougies et échafaudages ont leur équivalent.
 
 ---
@@ -178,7 +178,7 @@ Les touches sont **physiques** (même place en AZERTY et en QWERTY) et se règle
 | Ctrl gauche | Courir | | 1 à 0, molette | Barre d'objets |
 | E | Inventaire | | T / `/` | Tchat / commande |
 | C (maintenu) | Zoom | | F5 | Vue 1re / 3e personne |
-| F2 | Capture d'écran | | F3 | Écran de debug |
+| F2 | Capture d'écran | | F3 | Écran de debug (dont la carte qui dessine, et l'écran : branché sur elle ou sur une autre) |
 | L | Éditeur de lumières | | F (éditeur ouvert) | Caméra libre |
 | V (maintenu) | Parler (micro, en ligne) | | F1 | Masquer l'interface (il reste le jeu et les pseudos) |
 
@@ -208,7 +208,8 @@ Le tchat se navigue avec ← → (Début, Fin, Suppr). Partout où une commande 
 | Commande | Effet |
 |----------|-------|
 | `/help` | Toutes les commandes |
-| `/gm <0-3>` | Mode de jeu |
+| `/gm <0-3> [pseudo]` | Mode de jeu (`survival`, `creative`, `fps`, `spectator` marchent aussi) ; celui d'un autre joueur : OP d'un serveur de construction |
+| `/defaultgamemode <mode\|none>` | Mode de jeu des nouveaux venus sur un serveur de construction (OP) ; `none` : plus de mode imposé |
 | `/kill [pseudo]` | Mourir, ou tuer un joueur (OP d'un serveur de construction) |
 | `/tp <x> <y> <z>` · `/tp <pseudo>` · `/tp <pseudo> <x> <y> <z>` · `/tp <pseudo> <pseudo2>` | Se téléporter (« ~ » : par rapport à soi, `~ ~10 ~`), ou téléporter un joueur ; en solo, soi seulement ; sur un serveur de construction, OP seulement |
 | `/setspawn` | Le point d'apparition là où tu es : gardé avec le monde en solo ; sur un serveur de construction (OP), là où arrivent les nouveaux venus |
@@ -236,6 +237,8 @@ Le tchat se navigue avec ← → (Début, Fin, Suppr). Partout où une commande 
 Le jeu compare aussi son propre fichier à la version officielle (« fichiers vérifiés », ou « exécutable non officiel » s'il a été modifié ou abîmé : une alerte honnête, pas une protection absolue, ce sont les garants qui empêchent la triche). La ligne en bas à gauche de l'accueil indique la version, par exemple « Minelib v77 - à jour (lanceur) ».
 
 Tes mondes, captures et réglages sont dans `%APPDATA%\.minelib` (Windows) ou `~/.minelib` (Linux). Dépose un monde Java dans `saves/` ou un pack de textures dans `resourcepacks/`.
+
+**PC portable** : le jeu dessine avec la carte la plus puissante. Si l'écran est branché sur la partie graphique du processeur, chaque image y est recopiée (FPS plafonnés) : l'écran de debug (F3) le dit, et un écran externe branché sur la prise de la carte dédiée prend le relais tout seul. Pour moins de chaleur et de batterie, *Échap → Paramètres graphiques → Carte graphique : partie intégrée* (au prochain lancement ; seulement sur une machine qui a plusieurs cartes).
 
 | Plateforme | État |
 |------------|------|

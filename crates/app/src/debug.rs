@@ -262,10 +262,37 @@ pub fn build(d: &DebugInfo) -> Overlay {
         )),
         Line::white(""),
         Line::new(
-            format!("GPU : {} ({})", r.adapter_name, r.backend),
+            format!(
+                "GPU : {} ({}{})",
+                r.adapter_name,
+                r.backend,
+                match r.device_type {
+                    minelib_render::wgpu::DeviceType::IntegratedGpu => ", partie intégrée",
+                    minelib_render::wgpu::DeviceType::DiscreteGpu => ", carte dédiée",
+                    minelib_render::wgpu::DeviceType::Cpu => ", logiciel",
+                    _ => "",
+                }
+            ),
             Line::DIM,
         ),
     ];
+    // (v228) L'écran : branché sur la carte qui dessine, ou sur une autre (souvent la partie
+    // graphique du processeur, sur un portable) : chaque image y est alors recopiée.
+    match crate::gpu_report::display() {
+        Some(crate::gpu_report::DisplayLink::Direct) => {
+            right.push(Line::new("Écran : branché sur cette carte", Line::GOOD));
+        }
+        Some(crate::gpu_report::DisplayLink::Elsewhere { name, integrated }) => {
+            right.push(Line::new(
+                format!(
+                    "Écran : branché sur « {name} »{}, images recopiées",
+                    if integrated { " (processeur)" } else { "" }
+                ),
+                Line::WARN,
+            ));
+        }
+        None => {}
+    }
     right.push(match (s.gpu_usage, s.gpu_process) {
         (Some(all), Some(me)) => Line::new(
             format!("GPU : {all:.0} %   (processus {me:.0} %)"),

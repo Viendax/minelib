@@ -98,6 +98,10 @@ pub struct Options {
     /// lumineux) éclaire comme une lumière ponctuelle de l'éditeur, au lieu de la lumière
     /// des blocs. Non par défaut.
     pub point_torches: bool,
+    /// (v228) Dessiner avec la partie graphique intégrée au processeur plutôt qu'avec la carte
+    /// la plus puissante (moins de chaleur et de batterie ; utile aussi quand l'écran est
+    /// branché dessus). Non par défaut ; compte au prochain lancement.
+    pub igpu: bool,
     /// Échelle de rendu du monde (0,5 … 1) : en dessous de 1, le monde est calculé en plus
     /// petit puis reconstruit en pleine résolution par l'anticrénelage (plus de FPS).
     pub render_scale: f32,
@@ -158,6 +162,7 @@ impl Default for Options {
             language: "fr".into(),
             raytracing: true,
             point_torches: false,
+            igpu: false,
             render_scale: 1.0,
             fps_max: 0,
             cpu_uniform: true,
@@ -199,6 +204,9 @@ impl Options {
             }
             if let Some(v) = kv.get("torches_ponctuelles") {
                 o.point_torches = v == "true";
+            }
+            if let Some(v) = kv.get("carte_integree") {
+                o.igpu = v == "true";
             }
             if let Some(v) = kv.get("fullscreen") {
                 o.fullscreen = v == "true";
@@ -276,7 +284,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -293,7 +301,8 @@ impl Options {
                 self.fps_color,
                 self.language,
                 self.mute_screens_menu,
-                self.point_torches
+                self.point_torches,
+                self.igpu
             ),
         )?;
         Ok(())
@@ -1050,14 +1059,16 @@ mod tests {
         let pack = ResourcePack::open(&packs[0]).unwrap();
         assert!(pack.block_image("grass_top").is_some());
         let mut o = Options::load(&paths.options);
-        // (v201) Torches en lumières ponctuelles : non par défaut, gardé ensuite.
-        assert!(!o.point_torches);
+        // (v201) Torches en lumières ponctuelles : non par défaut, gardé ensuite. (v228)
+        // Pareil pour la partie graphique intégrée.
+        assert!(!o.point_torches && !o.igpu);
         o.resource_pack = "Autre".into();
         o.point_torches = true;
+        o.igpu = true;
         o.save(&paths.options).unwrap();
         let back = Options::load(&paths.options);
         assert_eq!(back.resource_pack, "Autre");
-        assert!(back.point_torches);
+        assert!(back.point_torches && back.igpu);
         let _ = fs::remove_dir_all(dir);
     }
 }
