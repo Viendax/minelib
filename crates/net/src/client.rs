@@ -184,6 +184,12 @@ pub enum Cmd {
         pseudo: String,
         add: bool,
     },
+    /// (v231) Invite un ami dans le monde de construction où l'on est.
+    Invite(String),
+    /// (v231) Statut vu par ses amis : invisible ou non.
+    Presence(bool),
+    /// (v231) Refuse la demande d'ami de ce joueur.
+    FriendDecline(String),
     /// Lobby (`proto::PARTY_*`).
     Party {
         action: u8,
@@ -313,6 +319,26 @@ pub enum Event {
     },
     /// Amis, et s'ils sont en ligne.
     Friends(Vec<(String, bool)>),
+    /// (v231) Où sont ses amis (même ordre que `Friends`, juste après lui), et les demandes
+    /// d'ami reçues.
+    FriendInfo {
+        places: Vec<crate::proto::FriendPlace>,
+        requests: Vec<String>,
+    },
+    /// (v231) `from` vient de nous ajouter en ami (`mutual` : on l'avait ajouté ; sinon,
+    /// c'est une demande).
+    FriendAdded {
+        from: String,
+        mutual: bool,
+    },
+    /// (v231) Invitation de `from` dans son monde de construction `room` (`name`).
+    Invited {
+        from: String,
+        room: u64,
+        name: String,
+    },
+    /// (v231) Invitation envoyée à ce joueur.
+    InviteSent(String),
     PartyInvite(String),
     Skin {
         pseudo: String,
@@ -788,6 +814,8 @@ impl Worker {
                 party,
             },
             Response::PartyInvite { from } => Event::PartyInvite(from),
+            Response::Invited { from, room, name } => Event::Invited { from, room, name },
+            Response::FriendAdded { from, mutual } => Event::FriendAdded { from, mutual },
             Response::SkinChanged { pseudo } => Event::SkinChanged(pseudo),
             Response::Party { id, members } => Event::Party { id, members },
             Response::PartyGo { room, map, map_sig } => Event::PartyGo { room, map, map_sig },
@@ -1574,16 +1602,25 @@ impl Worker {
                     r => self.unexpected(r),
                 }
             }
-            Cmd::Friend { pseudo, add } => match self.request(&Request::Friend { pseudo, add })? {
-                Response::Friends { list, online } => {
-                    let both = list
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, p)| (p, online.get(i).copied().unwrap_or(false)))
-                        .collect();
-                    self.emit(Event::Friends(both));
+            Cmd::Friend { pseudo, add } => {
+                let r = self.request(&Request::Friend { pseudo, add })?;
+                self.friends_answer(r)
+            }
+            Cmd::FriendDecline(pseudo) => {
+                let r = self.request(&Request::FriendDecline { pseudo })?;
+                self.friends_answer(r)
+            }
+            Cmd::Invite(pseudo) => match self.request(&Request::Invite {
+                pseudo: pseudo.clone(),
+            })? {
+                Response::Done => {
+                    self.emit(Event::InviteSent(pseudo));
                     Ok(())
                 }
+                r => self.unexpected(r),
+            },
+            Cmd::Presence(hidden) => match self.request(&Request::Presence { hidden })? {
+                Response::Done => Ok(()),
                 r => self.unexpected(r),
             },
             Cmd::SkinPut(png) => match self.request(&Request::SkinPut { png })? {
@@ -1748,6 +1785,28 @@ impl Worker {
                 });
                 let _ = (map, map_sig);
                 self.emit(Event::TakenOver { room, host });
+                Ok(())
+            }
+            r => self.unexpected(r),
+        }
+    }
+
+    /// Liste d'amis reçue : `Event::Friends`, puis `Event::FriendInfo` (où ils sont, demandes).
+    fn friends_answer(&mut self, r: Response) -> Result<()> {
+        match r {
+            Response::Friends {
+                list,
+                online,
+                places,
+                requests,
+            } => {
+                let both = list
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, p)| (p, online.get(i).copied().unwrap_or(false)))
+                    .collect();
+                self.emit(Event::Friends(both));
+                self.emit(Event::FriendInfo { places, requests });
                 Ok(())
             }
             r => self.unexpected(r),

@@ -78,6 +78,7 @@ mod fluids;
 mod fps;
 mod fpsmap;
 mod frames;
+mod friends;
 mod garant;
 mod garant_worker;
 mod gpu_plan;
@@ -159,6 +160,8 @@ enum Screen {
     Account(account::Page),
     /// Choix du monde à ouvrir en construction en ligne.
     HostPick,
+    /// (v231) Amis : depuis l'accueil ou le menu du jeu (retour : `friends_back`).
+    Friends,
 }
 
 /// (v215) Sorties son et micros du système, relevés en arrière-plan : le relevé (cpal)
@@ -288,6 +291,14 @@ struct Game {
     packs_return: Screen,
     /// Où revenir en quittant les paramètres.
     settings_return: Screen,
+    /// (v231) Écran des amis : son état, l'écran d'où on l'a ouvert, un message (invitation
+    /// envoyée, erreur) et depuis quand il est affiché.
+    friends_ui: friends::FriendsUi,
+    friends_back: Screen,
+    friends_note: Option<(String, f32)>,
+    /// (v231) Partie (salle du relais) où l'on est : un ami qui y est déjà n'a ni « Rejoindre »
+    /// ni « Inviter ».
+    current_room: Option<u64>,
     /// Curseur de réglage tenu à la souris.
     slider_drag: Option<u32>,
     /// Écran Son : sorties et micros du système (lus en l'ouvrant), défilement et barre
@@ -397,12 +408,14 @@ impl Game {
         let view_distance = env_parse("MINELIB_VIEW")
             .unwrap_or(options.render_distance)
             .clamp(2, session::MAX_VIEW_DISTANCE);
-        let accounts = account::Accounts::new(
+        let mut accounts = account::Accounts::new(
             options.relay.clone(),
             &options.relay_key,
             paths.root.join("relay"),
             options.pseudo.clone(),
         );
+        // (v231) Invisible pour ses amis : redit au relais à chaque connexion.
+        accounts.invisible = options.invisible;
         Ok(Self {
             accounts,
             after_login: Screen::Title,
@@ -447,6 +460,10 @@ impl Game {
             screen: Screen::Account(account::Page::Welcome),
             packs_return: Screen::Title,
             settings_return: Screen::Title,
+            friends_ui: friends::FriendsUi::default(),
+            friends_back: Screen::Title,
+            friends_note: None,
+            current_room: None,
             slider_drag: None,
             sound_devices: (Vec::new(), Vec::new()),
             sound_scan: DeviceScan::started(),
@@ -635,8 +652,118 @@ impl Game {
         }
     }
 
+    /// (v231) Bouton « Amis », avec ce qui y attend : invitations, demandes d'ami.
+    fn friends_label(accounts: &account::Accounts) -> String {
+        let plural = |n: usize| if n > 1 { "s" } else { "" };
+        let i = accounts.world_invites.len();
+        let r = accounts.friend_requests.len();
+        match (i, r) {
+            (0, 0) => "Amis".to_string(),
+            (i, 0) => format!("Amis ({i} invitation{})", plural(i)),
+            (0, r) => format!("Amis ({r} demande{})", plural(r)),
+            (i, r) => format!("Amis ({})", i + r),
+        }
+    }
+
+    /// (v231) Ouvre l'écran des amis (retour à `back`) et redemande la liste.
+    fn open_friends(&mut self, back: Screen) {
+        self.friends_back = back;
+        self.friends_ui.asked = None;
+        self.screen = Screen::Friends;
+    }
+
+    /// (v231) L'écran des amis : la liste redemandée toutes les `friends::REFRESH_S` s ;
+    /// rejoindre un monde (en quittant celui où l'on est), inviter, ajouter, retirer,
+    /// devenir invisible.
+    fn friends_screen(&mut self, input: &Input, size: (u32, u32)) {
+        use minelib_net::client::Cmd;
+        if self
+            .friends_ui
+            .asked
+            .is_none_or(|t| t.elapsed().as_secs_f32() >= friends::REFRESH_S)
+        {
+            self.friends_ui.asked = Some(std::time::Instant::now());
+            self.accounts.room(Cmd::Friend {
+                pseudo: String::new(),
+                add: false,
+            });
+        }
+        let in_world = self
+            .session
+            .as_ref()
+            .filter(|s| s.build.is_some())
+            .and(self.current_room);
+        let note = self
+            .friends_note
+            .as_ref()
+            .filter(|(_, t)| self.time - t < 6.0)
+            .map(|(n, _)| n.clone());
+        let time = self.time;
+        let over_game = self.session.is_some();
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        if over_game {
+            c.dim(0.7);
+        } else {
+            c.background();
+        }
+        let view = friends::FriendsView {
+            friends: &self.accounts.friends,
+            places: &self.accounts.friend_places,
+            invites: &self.accounts.world_invites,
+            requests: &self.accounts.friend_requests,
+            invisible: self.accounts.invisible,
+            in_world,
+            note: note.as_deref(),
+        };
+        let action = friends::screen(&mut c, input, &mut self.friends_ui, &view, time);
+        match action {
+            friends::FriendsAction::None => {}
+            friends::FriendsAction::Back => self.screen = self.friends_back,
+            friends::FriendsAction::Add(p) => {
+                // Accepter une demande, c'est l'ajouter aussi.
+                self.accounts
+                    .friend_requests
+                    .retain(|r| !r.eq_ignore_ascii_case(&p));
+                self.accounts.room(Cmd::Friend { pseudo: p, add: true });
+            }
+            friends::FriendsAction::Decline(p) => {
+                self.accounts
+                    .friend_requests
+                    .retain(|r| !r.eq_ignore_ascii_case(&p));
+                self.accounts.room(Cmd::FriendDecline(p));
+            }
+            friends::FriendsAction::Remove(p) => {
+                self.accounts.room(Cmd::Friend { pseudo: p, add: false });
+            }
+            friends::FriendsAction::Invite(p) => self.accounts.room(Cmd::Invite(p)),
+            friends::FriendsAction::Invisible(on) => {
+                self.accounts.invisible = on;
+                self.options.invisible = on;
+                if let Err(e) = self.options.save(&self.paths.options) {
+                    log::error!("options : {e:#}");
+                }
+                self.accounts.room(Cmd::Presence(on));
+            }
+            friends::FriendsAction::Dismiss(i) => {
+                if i < self.accounts.world_invites.len() {
+                    self.accounts.world_invites.remove(i);
+                }
+            }
+            friends::FriendsAction::Join(room) => {
+                self.accounts.world_invites.retain(|i| i.room != room);
+                // Dans un monde : on le quitte d'abord (enregistré s'il est à nous).
+                if self.session.is_some() {
+                    self.leave_world();
+                }
+                self.accounts.room(Cmd::Join(room));
+                self.friends_note = Some(("Connexion au monde…".into(), self.time));
+            }
+        }
+    }
+
     /// Enregistre et ferme le monde en cours.
     fn leave_world(&mut self) {
+        self.current_room = None;
         if let Some(mut s) = self.session.take() {
             // Partie en ligne : on la quitte ; un invité n'enregistre pas la carte de l'hôte.
             // Partie FPS en ligne : la carte ne change pas (sa signature non plus).
@@ -733,6 +860,9 @@ impl Game {
         let solo = c.button("Solo", cx, y, 200.0, true);
         y += step;
         let multi = c.button("Multijoueur", cx, y, 200.0, true);
+        // (v231) Amis : où ils sont, les rejoindre, les inviter (et ce qui les attend).
+        y += step;
+        let friends = c.button(&Self::friends_label(&self.accounts), cx, y, 200.0, true);
         // Compte, en haut à droite : pseudo connecté ou invitation à se connecter.
         let account_label = match &self.accounts.account {
             Some(a) => format!("Compte : {}", a.pseudo),
@@ -788,6 +918,14 @@ impl Game {
                 self.screen = Screen::Multiplayer;
             } else {
                 self.after_login = Screen::Multiplayer;
+                self.goto_account(account::Page::Welcome);
+            }
+        }
+        if friends {
+            if self.accounts.logged_in() {
+                self.open_friends(Screen::Title);
+            } else {
+                self.after_login = Screen::Title;
                 self.goto_account(account::Page::Welcome);
             }
         }
@@ -897,6 +1035,18 @@ impl Game {
     /// Événements de partie en ligne reçus du relais.
     fn handle_game_events(&mut self) {
         use minelib_net::client::{Cmd, Event};
+        // (v231) Demandes d'ami pas encore annoncées (reçues en jeu, ou hors ligne).
+        let new = std::mem::take(&mut self.accounts.new_requests);
+        if !new.is_empty() {
+            let t = match new.as_slice() {
+                [one] => format!("{one} veut être ton ami (Amis : Accepter)."),
+                more => format!("{} demandes d'ami (Amis).", more.len()),
+            };
+            if let Some(s) = &mut self.session {
+                s.chat.say(t.clone(), chat::YELLOW);
+            }
+            self.notify(t);
+        }
         for e in std::mem::take(&mut self.accounts.game_events) {
             // Garant indépendant (au menu) : ses événements de partie.
             if self.session.is_none() && self.garant.is_some() {
@@ -985,6 +1135,7 @@ impl Game {
             }
             match &e {
                 Event::Hosted(room) => {
+                    self.current_room = Some(*room);
                     if let Some((sig, name, Some(dir))) = self.searching.take() {
                         self.fps_status = None;
                         self.mark_shared(sig);
@@ -1007,8 +1158,12 @@ impl Game {
                     }
                 }
                 Event::Joined {
-                    map, host, map_sig, ..
+                    map,
+                    host,
+                    map_sig,
+                    room,
                 } => {
+                    self.current_room = Some(*room);
                     let fps = self.searching.is_some();
                     let searched = self.searching.take().and_then(|s| s.2);
                     let dir = searched.or_else(|| self.local_map(map_sig));
@@ -1061,6 +1216,25 @@ impl Game {
                     if let Some(s) = self.session.as_mut().filter(|s| s.build.is_some()) {
                         s.skins.forget(pseudo);
                     }
+                }
+                // (v231) Invitation dans le monde d'un ami : notification, et dans le tchat.
+                Event::Invited { from, name, .. } => {
+                    let t = format!("{from} t'invite dans « {name} » (Amis : Rejoindre).");
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(t.clone(), chat::YELLOW);
+                    }
+                    self.notify(t);
+                }
+                Event::InviteSent(to) => {
+                    self.friends_note = Some((format!("Invitation envoyée à {to}."), self.time));
+                }
+                // (v231) Demande d'ami acceptée.
+                Event::FriendAdded { from, .. } => {
+                    let t = format!("{from} t'a ajouté aussi : vous êtes amis.");
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(t.clone(), chat::YELLOW);
+                    }
+                    self.notify(t);
                 }
                 Event::PartyInvite(from) => {
                     let t = format!("{from} t'invite dans son lobby (Multijoueur → FPS).");
@@ -1171,14 +1345,24 @@ impl Game {
                     }
                 }
                 Event::Friends(list) => {
-                    if let Some(s) = &mut self.session {
+                    // (v231) Dans le tchat seulement pour `/amis` (l'écran des amis redemande
+                    // la liste toutes les quelques secondes).
+                    if let Some(s) = self.session.as_mut().filter(|s| s.friends_said) {
+                        s.friends_said = false;
                         let t = if list.is_empty() {
                             "Aucun ami pour l'instant (/ami <pseudo>).".to_string()
                         } else {
+                            let places = &self.accounts.friend_places;
                             let names: Vec<String> = list
                                 .iter()
-                                .map(|(p, on)| {
-                                    if *on {
+                                .enumerate()
+                                .map(|(i, (p, on))| {
+                                    let pending = places.get(i).is_some_and(|w| {
+                                        w.kind == minelib_net::proto::FRIEND_PENDING
+                                    });
+                                    if pending {
+                                        format!("{p} (demande envoyée)")
+                                    } else if *on {
                                         format!("{p} (en ligne)")
                                     } else {
                                         p.clone()
@@ -2369,6 +2553,12 @@ impl Game {
         let resume = c.button("Reprendre", cx, y, 200.0, true);
         y += 24.0 * s;
         let settings = c.button("Paramètres", cx, y, 200.0, true);
+        // (v231) Amis (connecté) : les inviter dans ce monde, en rejoindre un.
+        let logged = self.accounts.logged_in();
+        let friends = logged && {
+            y += 24.0 * s;
+            c.button(&Self::friends_label(&self.accounts), cx, y, 200.0, true)
+        };
         // Serveur de construction : une copie du monde tel qu'il est, dans ses mondes solo.
         let on_build = self.session.as_ref().is_some_and(|s| s.build.is_some());
         let download = on_build && {
@@ -2441,6 +2631,9 @@ impl Game {
         if settings {
             self.settings_return = Screen::Paused;
             self.screen = Screen::Settings;
+        }
+        if friends {
+            self.open_friends(Screen::Paused);
         }
         if download {
             let saves = self.paths.saves.clone();
@@ -3710,6 +3903,7 @@ impl GameLoop for Game {
                     | Screen::Lights
                     | Screen::Controls
                     | Screen::Sound
+                    | Screen::Friends
             );
         if in_world {
             let active = self.screen == Screen::Playing;
@@ -3746,6 +3940,7 @@ impl GameLoop for Game {
                 Screen::Lights => self.lights_screen(input, size, true),
                 Screen::Controls => self.controls_screen(input, size, true),
                 Screen::Sound => self.sound_screen(input, size, true),
+                Screen::Friends => self.friends_screen(input, size),
                 _ => {}
             }
             // Monde ouvert dans les toutes premières secondes du jeu : les shaders lourds
@@ -3794,6 +3989,7 @@ impl GameLoop for Game {
                 Screen::Account(page) => self.account_screen(input, size, page),
                 Screen::HostPick => self.host_pick_screen(input, size),
                 Screen::FpsHome => self.fps_home_screen(input, size),
+                Screen::Friends => self.friends_screen(input, size),
                 Screen::Playing | Screen::Paused => self.screen = Screen::Title,
             }
             self.draw_message(size, dt);

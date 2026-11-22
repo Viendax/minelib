@@ -5,6 +5,7 @@
 //! Si le relais configuré est sur ce PC (127.0.0.1) et ne répond pas, le jeu en lance un
 //! lui-même, avec ses données dans `.minelib/relay`.
 
+use std::collections::HashSet;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -298,6 +299,17 @@ pub struct Accounts {
     pub leaderboard: Option<(bool, Vec<proto::RankEntry>, Option<proto::RankEntry>)>,
     /// Amis et s'ils sont en ligne.
     pub friends: Vec<(String, bool)>,
+    /// (v231) Où ils sont (même ordre), invitations reçues dans le monde d'un ami (la plus
+    /// récente d'abord), statut invisible voulu (redit au relais à chaque connexion).
+    pub friend_places: Vec<proto::FriendPlace>,
+    pub world_invites: Vec<crate::friends::WorldInvite>,
+    pub invisible: bool,
+    /// (v231) Demandes d'ami reçues (dernière liste, et poussées depuis), celles pas encore
+    /// annoncées (notification), et toutes celles déjà vues depuis le lancement (en
+    /// minuscules : une reconnexion ne les annonce pas de nouveau).
+    pub friend_requests: Vec<String>,
+    pub new_requests: Vec<String>,
+    requests_seen: HashSet<String>,
     /// Lobby : n° (0 : seul) et membres (l'hôte d'abord) ; invitations reçues.
     pub party: (u64, Vec<String>),
     pub invites: Vec<String>,
@@ -380,6 +392,12 @@ impl Accounts {
             game_events: Vec::new(),
             leaderboard: None,
             friends: Vec::new(),
+            friend_places: Vec::new(),
+            world_invites: Vec::new(),
+            invisible: false,
+            friend_requests: Vec::new(),
+            new_requests: Vec::new(),
+            requests_seen: HashSet::new(),
             party: (0, Vec::new()),
             invites: Vec::new(),
             maps_rev: 0,
@@ -753,6 +771,18 @@ impl Accounts {
                     if let (Some(room), Some(c)) = (self.join_after_login.take(), &self.client) {
                         c.send(Cmd::Join(room));
                     }
+                    // (v231) Invisible pour ses amis : le relais l'apprend à chaque connexion.
+                    // Liste d'amis demandée tout de suite : les demandes d'ami reçues hors
+                    // ligne sont annoncées.
+                    if let Some(c) = &self.client {
+                        if self.invisible {
+                            c.send(Cmd::Presence(true));
+                        }
+                        c.send(Cmd::Friend {
+                            pseudo: String::new(),
+                            add: false,
+                        });
+                    }
                 }
                 // Code 2FA juste : ce PC est de confiance, la 2FA ne sera plus demandée ici.
                 Event::DeviceTrusted { pseudo, token } => self.keep_device(&pseudo, &token),
@@ -795,6 +825,7 @@ impl Accounts {
                     self.account = None;
                     self.party = (0, Vec::new());
                     self.invites.clear();
+                    self.forget_friends();
                 }
                 // Le relais du monde est tombé pendant qu'on joue dans un monde qui a un
                 // relais de secours : on y reprend la partie, sans la quitter (la suite de
@@ -900,11 +931,59 @@ impl Accounts {
                     self.busy = None;
                     self.leaderboard = Some((friends, list, me));
                 }
+                // (v231) Liste d'amis : passée au jeu avec ce qui la suit (où ils sont, demandes).
                 Event::Friends(list) => {
                     self.busy = None;
-                    self.friends = list.clone();
-                    self.game_events.push(Event::Friends(list));
+                    self.friends = list;
                 }
+                Event::FriendInfo { places, requests } => {
+                    self.friend_places = places;
+                    for r in &requests {
+                        if self.requests_seen.insert(r.to_lowercase()) {
+                            self.new_requests.push(r.clone());
+                        }
+                    }
+                    self.friend_requests = requests;
+                    self.game_events.push(Event::Friends(self.friends.clone()));
+                }
+                // Demande d'ami poussée (annoncée), ou « vous êtes amis » (au jeu).
+                Event::FriendAdded { from, mutual } => {
+                    if mutual {
+                        // Il est maintenant en ligne pour nous, et l'on sait où : liste à jour.
+                        if let Some(c) = &self.client {
+                            c.send(Cmd::Friend {
+                                pseudo: String::new(),
+                                add: false,
+                            });
+                        }
+                        self.game_events.push(Event::FriendAdded { from, mutual });
+                    } else {
+                        if !self
+                            .friend_requests
+                            .iter()
+                            .any(|r| r.eq_ignore_ascii_case(&from))
+                        {
+                            self.friend_requests.insert(0, from.clone());
+                        }
+                        // Poussée : il vient de nous ajouter (encore, après un refus) : annoncée.
+                        self.requests_seen.insert(from.to_lowercase());
+                        self.new_requests.push(from);
+                    }
+                }
+                Event::Invited { from, room, name } => {
+                    self.world_invites.retain(|i| !i.from.eq_ignore_ascii_case(&from));
+                    self.world_invites.insert(
+                        0,
+                        crate::friends::WorldInvite {
+                            from: from.clone(),
+                            room,
+                            name: name.clone(),
+                        },
+                    );
+                    self.world_invites.truncate(5);
+                    self.game_events.push(Event::Invited { from, room, name });
+                }
+                e @ Event::InviteSent(_) => self.game_events.push(e),
                 Event::Maps(list) => {
                     self.busy = None;
                     self.maps = list;
@@ -1086,6 +1165,17 @@ impl Accounts {
         } else {
             self.account = None;
         }
+    }
+
+    /// (v231) Déconnexion voulue : rien des amis de ce compte ne reste (un autre compte peut se
+    /// connecter ensuite).
+    fn forget_friends(&mut self) {
+        self.friends.clear();
+        self.friend_places.clear();
+        self.world_invites.clear();
+        self.friend_requests.clear();
+        self.new_requests.clear();
+        self.requests_seen.clear();
     }
 
     /// Dossier du relais (le nœud iroh du jeu est gardé à côté).
@@ -1605,6 +1695,7 @@ impl Accounts {
             self.login_secret = None;
             self.client().send(Cmd::Logout);
             self.account = None;
+            self.forget_friends();
             // Déconnexion voulue : le compte n'est plus gardé sur ce PC.
             let _ = std::fs::remove_file(self.session_path());
             return Outcome::Goto(Page::Welcome);

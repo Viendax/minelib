@@ -451,6 +451,8 @@ pub struct Session {
     crowd_probe: Option<std::time::Instant>,
     /// (v227) Foules d'essai menées par d'autres joueurs (OP), par pseudo de celui qui la mène.
     remote_crowds: HashMap<String, crate::crowd::RemoteCrowd>,
+    /// (v231) `/amis` vient d'être tapé : la liste reçue va dans le tchat.
+    pub friends_said: bool,
     /// (v200, essai) Joueurs et objets reflétés dans l'eau sans raytracing (`/npc reflets
     /// on|off`, allumé par défaut), et l'eau qu'on voit (cherchée toutes les quelques
     /// images, pendant le rendu).
@@ -784,6 +786,7 @@ impl Session {
             crowd_out: None,
             crowd_probe: None,
             remote_crowds: HashMap::new(),
+            friends_said: false,
             water_mirror_on: true,
             seen_water: Default::default(),
             pseudo: String::new(),
@@ -6260,6 +6263,7 @@ impl Session {
                     .map_or(String::new(), |p| p.to_string());
                 self.relay_cmds
                     .push(minelib_net::client::Cmd::Friend { pseudo, add });
+                self.friends_said = true;
                 true
             }
             "equipe" | "équipe" | "team" => {

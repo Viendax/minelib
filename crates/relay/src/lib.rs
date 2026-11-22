@@ -965,6 +965,12 @@ struct Conn {
     /// (`CROWD_RATE`, `CROWD_HIT_RATE`).
     crowd_rate: (Instant, u32),
     crowd_hit_rate: (Instant, u32),
+    /// (v231) Invisible pour ses amis (`Request::Presence`) : hors ligne pour eux, pas
+    /// d'invitations.
+    hidden_presence: bool,
+    /// (v231) Invitations envoyées et demandes d'ami poussées dans la minute en cours
+    /// (`INVITE_RATE`).
+    invite_rate: (Instant, u32),
     /// Modifications de blocs dans la seconde en cours (voir `EDIT_RATE`), et celles
     /// dues à l'écoulement d'un fluide (`FLUID_RATE`).
     edit_rate: (Instant, u32),
@@ -1015,6 +1021,8 @@ impl Conn {
             thor_rate: (Instant::now(), 0),
             crowd_rate: (Instant::now(), 0),
             crowd_hit_rate: (Instant::now(), 0),
+            hidden_presence: false,
+            invite_rate: (Instant::now(), 0),
             edit_rate: (Instant::now(), 0),
             fluid_rate: (Instant::now(), 0),
             served: HashSet::new(),
@@ -2510,6 +2518,90 @@ const THOR_REACH: i32 = 20;
 /// coups à ses PNJ par joueur et par seconde (un par clic).
 const CROWD_RATE: u32 = 40;
 const CROWD_HIT_RATE: u32 = 20;
+
+/// (v231) Invitations dans un monde de construction et demandes d'ami poussées, par joueur et
+/// par minute, au plus.
+const INVITE_RATE: u32 = 12;
+
+/// (v231) Où est cet ami, vu par `asker` : au menu, dans un monde de construction
+/// (rejoignable s'il n'est pas fermé à `asker` par sa liste blanche), dans une partie FPS.
+/// `None` : hors ligne pour lui (ou invisible). On ne sait rien de quelqu'un qui ne nous a pas
+/// ajouté aussi (`FRIEND_PENDING`, hors ligne).
+fn friend_place(st: &State, friend: &str, asker: &str) -> Option<proto::FriendPlace> {
+    if !st.stats.befriends(friend, asker) {
+        return None;
+    }
+    let c = st.conns.get(&conn_of(st, friend)?)?;
+    if c.hidden_presence {
+        return None;
+    }
+    let Some((rid, r)) = c.room.and_then(|rid| st.rooms.get(&rid).map(|r| (rid, r))) else {
+        return Some(proto::FriendPlace::default());
+    };
+    Some(if r.kind == 1 {
+        proto::FriendPlace {
+            kind: proto::FRIEND_BUILD,
+            room: rid,
+            name: r.name.clone(),
+            joinable: !st.servers.whitelisted_out(&r.server, &r.creator, asker),
+        }
+    } else {
+        proto::FriendPlace {
+            kind: proto::FRIEND_FPS,
+            room: rid,
+            name: r.map.clone(),
+            joinable: false,
+        }
+    })
+}
+
+/// (v231) Demandes d'ami montrées au plus.
+const FRIEND_REQUESTS_MAX: usize = 50;
+
+/// (v231) Sa liste d'amis : en ligne (s'ils nous ont ajouté aussi et ne sont pas invisibles),
+/// où ils sont, et les demandes reçues.
+fn friends_response(st: &State, pseudo: &str) -> Response {
+    let list = st
+        .stats
+        .get(pseudo)
+        .map(|s| s.friends.clone())
+        .unwrap_or_default();
+    let places: Vec<Option<proto::FriendPlace>> =
+        list.iter().map(|f| friend_place(st, f, pseudo)).collect();
+    let online = places.iter().map(Option::is_some).collect();
+    let places = list
+        .iter()
+        .zip(places)
+        .map(|(f, p)| {
+            p.unwrap_or_else(|| proto::FriendPlace {
+                kind: if st.stats.befriends(f, pseudo) {
+                    proto::FRIEND_MENU
+                } else {
+                    proto::FRIEND_PENDING
+                },
+                ..Default::default()
+            })
+        })
+        .collect();
+    Response::Friends {
+        list,
+        online,
+        places,
+        requests: st.stats.requests_to(pseudo, FRIEND_REQUESTS_MAX),
+    }
+}
+
+/// (v231) Un de plus dans la minute en cours de ce compteur d'invitations (et de demandes
+/// d'ami poussées) : encore permis (`INVITE_RATE`) ?
+fn invite_calm(st: &mut State, id: u64) -> bool {
+    st.conns.get_mut(&id).is_some_and(|c| {
+        if c.invite_rate.0.elapsed() >= Duration::from_secs(60) {
+            c.invite_rate = (Instant::now(), 0);
+        }
+        c.invite_rate.1 += 1;
+        c.invite_rate.1 <= INVITE_RATE
+    })
+}
 
 /// (v227) Un de plus dans la seconde en cours de ce compteur : encore permis (au plus `max`) ?
 fn within_rate(rate: &mut (Instant, u32), max: u32) -> bool {
@@ -6685,19 +6777,100 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 };
                 let name = found.pseudo.clone();
                 let me = st.stats.get_mut(pseudo);
+                let had = me.friends.iter().any(|f| f.eq_ignore_ascii_case(&name));
                 me.friends.retain(|f| !f.eq_ignore_ascii_case(&name));
-                if add && !name.eq_ignore_ascii_case(pseudo) && me.friends.len() < 200 {
-                    me.friends.push(name);
+                let added = add && !name.eq_ignore_ascii_case(pseudo) && me.friends.len() < 200;
+                if added {
+                    me.friends.push(name.clone());
                 }
                 st.stats.save(pseudo);
+                // (v231) Il l'apprend s'il est en ligne (et pas invisible) : une demande, ou
+                // « vous êtes amis » s'il nous avait ajouté.
+                let target = conn_of(st, &name)
+                    .filter(|t| st.conns.get(t).is_some_and(|c| !c.hidden_presence));
+                let avoid = st.stats.get(&name).is_some_and(|s| s.avoids(pseudo))
+                    || st.stats.get(pseudo).is_some_and(|s| s.avoids(&name));
+                if let Some(t) = target.filter(|_| added && !had && !avoid) {
+                    if invite_calm(st, id) {
+                        let mutual = st.stats.befriends(&name, pseudo);
+                        if let Some(c) = st.conns.get(&t) {
+                            transport::push(
+                                &c.tx,
+                                &Response::FriendAdded {
+                                    from: pseudo.to_string(),
+                                    mutual,
+                                },
+                            );
+                        }
+                    }
+                }
             }
-            let list = st
-                .stats
-                .get(pseudo)
-                .map(|s| s.friends.clone())
-                .unwrap_or_default();
-            let online = list.iter().map(|f| conn_of(st, f).is_some()).collect();
-            Response::Friends { list, online }
+            friends_response(st, pseudo)
+        }
+        // (v231) Demande d'ami refusée : on est retiré de sa liste.
+        Request::FriendDecline { pseudo: who } => {
+            if st.stats.befriends(&who, pseudo) {
+                let s = st.stats.get_mut(&who);
+                s.friends.retain(|f| !f.eq_ignore_ascii_case(pseudo));
+                st.stats.save(&who);
+            }
+            friends_response(st, pseudo)
+        }
+        // (v231) Invitation d'un ami dans le monde de construction où l'on est.
+        Request::Invite { pseudo: who } => {
+            let Some((rid, name)) = my_room
+                .and_then(|rid| st.rooms.get(&rid).map(|r| (rid, r)))
+                .filter(|(_, r)| r.kind == 1)
+                .map(|(rid, r)| (rid, r.name.clone()))
+            else {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Tu n'es dans aucun monde de construction en ligne.",
+                ));
+            };
+            if !st.stats.befriends(pseudo, &who) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    format!("« {who} » n'est pas dans tes amis (/ami {who})."),
+                ));
+            }
+            if !st.stats.befriends(&who, pseudo) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    format!("« {who} » ne t'a pas encore ajouté en ami."),
+                ));
+            }
+            let target = conn_of(st, &who)
+                .filter(|t| st.conns.get(t).is_some_and(|c| !c.hidden_presence));
+            let Some(target) = target else {
+                return Some(err(
+                    ErrorCode::Refused,
+                    format!("« {who} » n'est pas en ligne."),
+                ));
+            };
+            if !invite_calm(st, id) {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Trop d'invitations : attends un peu.",
+                ));
+            }
+            if let Some(c) = st.conns.get(&target) {
+                transport::push(
+                    &c.tx,
+                    &Response::Invited {
+                        from: pseudo.to_string(),
+                        room: rid,
+                        name,
+                    },
+                );
+            }
+            Response::Done
+        }
+        Request::Presence { hidden } => {
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.hidden_presence = hidden;
+            }
+            Response::Done
         }
         Request::Maps => {
             let mut list = st.maps.entries();
@@ -7682,6 +7855,9 @@ fn handle(
             | Request::CheatFound { .. }
             | Request::Leaderboard { .. }
             | Request::Friend { .. }
+            | Request::Invite { .. }
+            | Request::Presence { .. }
+            | Request::FriendDecline { .. }
             | Request::Party { .. }
             | Request::SkinPut { .. }
             | Request::SkinGet { .. }
@@ -9300,13 +9476,14 @@ mod tests {
             Event::Joined { map_sig, .. } => assert_eq!(map_sig, map),
             e => panic!("{e:?}"),
         }
-        // Classement et amis.
+        // Classement et amis. (v231) Cid n'a pas ajouté Ana : il n'est pas « en ligne » pour
+        // elle (demande d'ami en attente).
         a.send(Cmd::Friend {
             pseudo: "cid".into(),
             add: true,
         });
         match wait(&a, |e| matches!(e, Event::Friends(_))) {
-            Event::Friends(l) => assert_eq!(l, vec![("Cid".to_string(), true)]),
+            Event::Friends(l) => assert_eq!(l, vec![("Cid".to_string(), false)]),
             _ => unreachable!(),
         }
         a.send(Cmd::Leaderboard { friends: true });
@@ -9315,6 +9492,153 @@ mod tests {
             _ => unreachable!(),
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v231) Amis dans les deux sens : une demande d'ami arrive à l'autre (poussée, et dans
+    /// ses demandes) ; tant qu'il n'a pas accepté, on ne sait rien de lui ; refusée, on est
+    /// retiré de sa liste. Ses amis : où ils sont (au menu, dans un monde de construction
+    /// rejoignable) ; une invitation dans son monde arrive à l'ami ; invisible, il est hors
+    /// ligne pour les autres et ne peut plus être invité ; pas d'invitation à qui n'est pas son
+    /// ami (dans les deux sens), ni hors d'un monde.
+    #[test]
+    fn friends_see_where_others_are_and_get_invited() {
+        let dir = std::env::temp_dir().join(format!("minelib-amis-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            c
+        };
+        // Réponse d'amis de `c` : (pseudo, en ligne), où ils sont, demandes reçues.
+        let answer = |c: &Client| {
+            let l = match wait(c, |e| matches!(e, Event::Friends(_))) {
+                Event::Friends(l) => l,
+                _ => unreachable!(),
+            };
+            match wait(c, |e| matches!(e, Event::FriendInfo { .. })) {
+                Event::FriendInfo { places, requests } => (l, places, requests),
+                _ => unreachable!(),
+            }
+        };
+        let friends = |c: &Client| {
+            c.send(Cmd::Friend {
+                pseudo: String::new(),
+                add: false,
+            });
+            answer(c)
+        };
+        let add = |c: &Client, who: &str| {
+            c.send(Cmd::Friend {
+                pseudo: who.into(),
+                add: true,
+            });
+            answer(c)
+        };
+        let added = |c: &Client| match wait(c, |e| matches!(e, Event::FriendAdded { .. })) {
+            Event::FriendAdded { from, mutual } => (from, mutual),
+            _ => unreachable!(),
+        };
+        // Erreur attendue (texte).
+        let error = |c: &Client| loop {
+            if let Some(Event::Error(m)) = c.poll() {
+                return m;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let pending = proto::FriendPlace {
+            kind: proto::FRIEND_PENDING,
+            ..Default::default()
+        };
+        let alice = login("Alice");
+        let bob = login("Bob");
+        // Demande : Bob la reçoit ; Alice ne sait rien de lui tant qu'il n'a pas accepté.
+        let (l, p, _) = add(&alice, "bob");
+        assert_eq!(l, vec![("Bob".to_string(), false)]);
+        assert_eq!(p, vec![pending.clone()]);
+        assert_eq!(added(&bob), ("Alice".to_string(), false));
+        let (l, _, r) = friends(&bob);
+        assert!(l.is_empty());
+        assert_eq!(r, vec!["Alice".to_string()]);
+        // Acceptée : vous êtes amis, Alice l'apprend.
+        let (l, _, r) = add(&bob, "Alice");
+        assert_eq!(l, vec![("Alice".to_string(), true)]);
+        assert!(r.is_empty());
+        assert_eq!(added(&alice), ("Bob".to_string(), true));
+        // Hors d'un monde : pas d'invitation.
+        alice.send(Cmd::Invite("Bob".into()));
+        assert!(error(&alice).contains("aucun monde"));
+        alice.send(Cmd::Host {
+            kind: 1,
+            name: "Château".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let (l, p, _) = friends(&bob);
+        assert_eq!(l, vec![("Alice".to_string(), true)]);
+        assert_eq!(
+            p,
+            vec![proto::FriendPlace {
+                kind: proto::FRIEND_BUILD,
+                room,
+                name: "Château".into(),
+                joinable: true
+            }]
+        );
+        let (l, p, _) = friends(&alice);
+        assert_eq!(l, vec![("Bob".to_string(), true)]);
+        assert_eq!(p, vec![proto::FriendPlace::default()], "au menu");
+        // Invitation : Bob la reçoit.
+        alice.send(Cmd::Invite("bob".into()));
+        wait(&alice, |e| matches!(e, Event::InviteSent(_)));
+        match wait(&bob, |e| matches!(e, Event::Invited { .. })) {
+            Event::Invited { from, room: r, name } => {
+                assert_eq!((from.as_str(), r, name.as_str()), ("Alice", room, "Château"));
+            }
+            _ => unreachable!(),
+        }
+        // Pas à quelqu'un qui n'est pas son ami, ni qui ne l'a pas ajoutée.
+        let carol = login("Carol");
+        alice.send(Cmd::Invite("Carol".into()));
+        assert!(error(&alice).contains("pas dans tes amis"));
+        let dave = login("Dave");
+        add(&alice, "Dave");
+        assert_eq!(added(&dave), ("Alice".to_string(), false));
+        alice.send(Cmd::Invite("Dave".into()));
+        assert!(error(&alice).contains("pas encore ajouté"));
+        // Demande de Carol refusée : Carol n'a plus Alice dans sa liste.
+        add(&carol, "Alice");
+        assert_eq!(added(&alice), ("Carol".to_string(), false));
+        assert_eq!(friends(&alice).2, vec!["Carol".to_string()]);
+        alice.send(Cmd::FriendDecline("carol".into()));
+        assert!(answer(&alice).2.is_empty());
+        assert!(friends(&carol).0.is_empty(), "retirée de sa liste");
+        // Bob invisible : hors ligne pour Alice, plus d'invitation.
+        bob.send(Cmd::Presence(true));
+        std::thread::sleep(Duration::from_millis(100));
+        let (l, p, _) = friends(&alice);
+        assert_eq!(l[0], ("Bob".to_string(), false));
+        assert_eq!(p[0], proto::FriendPlace::default());
+        alice.send(Cmd::Invite("Bob".into()));
+        assert!(error(&alice).contains("pas en ligne"));
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

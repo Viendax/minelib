@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 /// (v229) 58 : la météo imposée par un OP pour tout le serveur (`SERVER_WEATHER`,
 /// `Response::SetWeather`, `ProvinceSettings::weather`) et la foudre de `/thor` et de la
 /// Foudre de Zeus montrée aux joueurs proches (`BuildMsg::ThorAsk`, `Thor`, `ThorDenied`).
-pub const PROTOCOL: u32 = 58;
+/// (v231) 59 : où sont ses amis (`Response::Friends::places`), demandes d'ami
+/// (`Response::Friends::requests`, `Request::FriendDecline`, `Response::FriendAdded`),
+/// invitations dans un monde de construction (`Request::Invite`, `Response::Invited`), statut
+/// invisible (`Request::Presence`).
+pub const PROTOCOL: u32 = 59;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -685,6 +689,22 @@ pub enum Request {
         signer: [u8; 32],
         token: [u8; 32],
     },
+    /// (v231) Invite un ami en ligne (sur ce relais) dans le monde de construction où l'on
+    /// est : il en est prévenu (`Response::Invited`) et peut le rejoindre. Seulement quelqu'un
+    /// de sa liste d'amis, qui n'est pas invisible.
+    Invite {
+        pseudo: String,
+    },
+    /// (v231) Statut vu par ses amis : `hidden` (invisible) : hors ligne pour eux, et pas
+    /// d'invitations.
+    Presence {
+        hidden: bool,
+    },
+    /// (v231) Refuse la demande d'ami de `pseudo` (on est retiré de sa liste). Réponse :
+    /// `Response::Friends`.
+    FriendDecline {
+        pseudo: String,
+    },
 }
 
 impl Request {
@@ -883,8 +903,14 @@ pub enum Response {
     },
     Friends {
         list: Vec<String>,
-        /// En ligne sur ce relais (même ordre que `list`).
+        /// En ligne sur ce relais (même ordre que `list`). (v231) Seulement pour un ami qui
+        /// nous a ajouté aussi, et qui n'est pas invisible.
         online: Vec<bool>,
+        /// (v231) Où ils sont (même ordre ; défaut pour ceux qui sont hors ligne,
+        /// `FRIEND_PENDING` pour ceux qui ne nous ont pas ajouté).
+        places: Vec<FriendPlace>,
+        /// (v231) Demandes d'ami : ceux qui nous ont ajouté et qu'on n'a pas ajoutés.
+        requests: Vec<String>,
     },
     /// Skin d'un joueur (vide : aucun).
     Skin {
@@ -1421,7 +1447,36 @@ pub enum Response {
         left: f32,
         fixed: bool,
     },
+    /// (v231) Poussé : `from` nous invite dans son monde de construction `room` (`name`).
+    Invited {
+        from: String,
+        room: u64,
+        name: String,
+    },
+    /// (v231) Poussé : `from` vient de nous ajouter en ami ; `mutual` : on l'avait ajouté
+    /// (vous êtes amis), sinon c'est une demande.
+    FriendAdded {
+        from: String,
+        mutual: bool,
+    },
 }
+
+/// (v231) Où est un ami en ligne : au menu (`FRIEND_MENU`), dans un monde de construction
+/// (`FRIEND_BUILD`), dans une partie FPS (`FRIEND_FPS`) ; `room`, `name` : la partie ;
+/// `joinable` : on peut l'y rejoindre (monde de construction ouvert à tous ou à nous).
+/// `FRIEND_PENDING` : il ne nous a pas (encore) ajouté, on ne sait rien de lui.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct FriendPlace {
+    pub kind: u8,
+    pub room: u64,
+    pub name: String,
+    pub joinable: bool,
+}
+
+pub const FRIEND_MENU: u8 = 0;
+pub const FRIEND_BUILD: u8 = 1;
+pub const FRIEND_FPS: u8 = 2;
+pub const FRIEND_PENDING: u8 = 3;
 
 impl Response {
     /// Message poussé par le relais (pas une réponse à une requête).
@@ -1430,6 +1485,8 @@ impl Response {
             self,
             Response::PeerJoined { .. }
                 | Response::PartyInvite { .. }
+                | Response::Invited { .. }
+                | Response::FriendAdded { .. }
                 | Response::Party { .. }
                 | Response::PartyGo { .. }
                 | Response::SkinChanged { .. }

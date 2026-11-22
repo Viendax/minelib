@@ -428,6 +428,35 @@ impl Store {
         (list, mine)
     }
 
+    /// (v231) `a` a ajouté `b` en ami.
+    pub fn befriends(&self, a: &str, b: &str) -> bool {
+        self.get(a)
+            .is_some_and(|s| s.friends.iter().any(|f| f.eq_ignore_ascii_case(b)))
+    }
+
+    /// (v231) Demandes d'ami de `me` : ceux qui l'ont ajouté sans qu'il les ait ajoutés (ni
+    /// signalés, ni signalé par eux), par ordre alphabétique, `max` au plus.
+    pub fn requests_to(&self, me: &str, max: usize) -> Vec<String> {
+        let mine = self.get(me);
+        let mut v: Vec<String> = self
+            .all
+            .values()
+            .filter(|s| {
+                !s.pseudo.eq_ignore_ascii_case(me)
+                    && s.friends.iter().any(|f| f.eq_ignore_ascii_case(me))
+                    && !s.avoids(me)
+                    && mine.is_none_or(|m| {
+                        !m.avoids(&s.pseudo)
+                            && !m.friends.iter().any(|f| f.eq_ignore_ascii_case(&s.pseudo))
+                    })
+            })
+            .map(|s| s.pseudo.clone())
+            .collect();
+        v.sort_by_key(|p| p.to_lowercase());
+        v.truncate(max);
+        v
+    }
+
     /// Classement entre amis (soi compris).
     pub fn friends_top(&self, me: &str) -> (Vec<RankEntry>, Option<RankEntry>) {
         let friends: Vec<String> = self.get(me).map(|s| s.friends.clone()).unwrap_or_default();
