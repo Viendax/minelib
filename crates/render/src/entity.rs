@@ -100,6 +100,10 @@ impl PlayerInstance {
     pub const AIMS: u32 = 1 << 17;
     /// (v215) Bit de `skin` : lampe torche en main, le bras droit seul tendu vers le regard.
     pub const AIMS_RIGHT: u32 = 1 << 18;
+    /// (v225) Bit de `skin` : Foudre de Zeus en main, le bras droit levé devant soi quel que
+    /// soit le regard (comme `player_model::parts` ; avant, les autres joueurs le baissaient
+    /// avec le regard, loin de l'éclair et de leur ombre).
+    pub const RAISED: u32 = 1 << 19;
 }
 
 /// Demi-flottant (IEEE 754 binaire16) le plus proche d'un nombre positif (couleurs).

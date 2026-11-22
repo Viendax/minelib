@@ -12,9 +12,11 @@ use crate::inventory::Item;
 const HAND_FOV: f32 = 70.0;
 /// Bras à la première personne : milieu du poing (par rapport aux yeux : x à droite, y en
 /// haut, −z devant ; là où les objets tenus sont placés) et longueur jusqu'à l'épaule, hors
-/// de l'écran. Épaisseur : le tiers, comme sur le modèle (4 × 12 × 4 pixels).
+/// de l'écran. Épaisseur : celle du bras du modèle par rapport à sa longueur (le tiers
+/// jusqu'à la v224 ; v225, proportions de CS2 : `player_model::ARM_RATIO`).
 const ARM_FIST: Vec3 = Vec3::new(0.474, -0.472, -0.938);
 const ARM_LEN: f32 = 0.6;
+const ARM_THICK: f32 = ARM_LEN * crate::player_model::ARM_RATIO;
 /// (v222) Base du bras (le bout de l'épaule, en bas à droite de l'écran) : le coup vers le
 /// bas tourne autour d'elle.
 const ARM_BASE: Vec3 = Vec3::new(ARM_FIST.x, ARM_FIST.y, ARM_FIST.z + ARM_LEN);
@@ -565,7 +567,7 @@ impl Hand {
         // Boîte 0..1 : x vers la droite, y vers le haut, z = 1 à l'épaule, 0 au poing.
         let arm = self.base()
             * Mat4::from_translation(ARM_FIST)
-            * Mat4::from_scale(Vec3::new(ARM_LEN / 3.0, ARM_LEN / 3.0, ARM_LEN))
+            * Mat4::from_scale(Vec3::new(ARM_THICK, ARM_THICK, ARM_LEN))
             * Mat4::from_translation(Vec3::new(-0.5, -0.5, 0.0));
         // Le bras est dessiné avec l'angle de vue de la main (70°), le monde avec le sien.
         // Pour l'éclairer, il est placé là où il paraît être dans l'image du monde, à la même

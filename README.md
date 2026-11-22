@@ -37,7 +37,7 @@ Gratuit, sans publicité, sans compte e-mail, sans rien à installer.
 **La sensation d'un FPS tactique de référence, dans un monde que tu as construit.**
 
 - **Déplacements au poil** : *air strafe*, **bunny hop**, saut accroupi pour monter à 1,5 bloc, et une vitesse qui dépend de l'arme en main (couteau rapide, AWP lourde).
-- **Des dégâts qui ne pardonnent pas** : des valeurs propres à chaque arme, perte avec la distance, tête ×4, gilet et casque. Les balles traversent un mur fin.
+- **Des dégâts qui ne pardonnent pas** : des valeurs propres à chaque arme, perte avec la distance, tête ×4, gilet et casque. Les personnages ont des proportions réalistes (petite tête, longues jambes) et leur hitbox les suit : la tête, plus étroite que les épaules, se vise. Les balles traversent un mur fin.
 - **34 armes et 5 grenades** : pistolets, mitraillettes, fusils à pompe, fusils d'assaut, fusils de précision ; HE, flash, fumigène, molotov et leurre (qui imite *ton* arme principale).
 - **Tout ce qu'on attend d'un compétitif** : menu d'achat par camp, économie, bombe et kit, prolongations, tableau des scores, fil des éliminations avec tirs en tête, à travers un mur ou une fumée, armes et grenades qu'on lâche et qu'on ramasse.
 - **Menu d'achat (B)** : il reste ouvert après un achat ; un clic droit sur un achat de la manche le revend au prix payé, tant qu'on peut encore acheter. Personne ne tire tant que la manche n'a pas commencé, ni pendant les pauses.
@@ -157,7 +157,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 - **Connexion automatique** au lancement, sans retaper ton mot de passe ni ton code.
 - **Un pseudo est unique** sur tous les relais, inscrit dans un registre public signé.
 - **Amis** : ajoute-les depuis le jeu, retrouve-les dans le classement.
-- **Ton skin** : dans **Paramètres**, un aperçu en 3D de ton personnage et le bouton **Changer de skin** (PNG de 64 × 64 au format des jeux de blocs). Les autres joueurs le voient ; il change en direct en construction, et reste le même pendant une partie FPS. Pendant l'échauffement, tout le monde garde le modèle par défaut (anonymat).
+- **Ton skin** : dans **Paramètres**, un aperçu en 3D de ton personnage et le bouton **Changer de skin** (PNG de 64 × 64 au format des jeux de blocs, posé sur le modèle aux proportions réalistes du jeu : joueurs, bots et PNJ). Les autres joueurs le voient ; il change en direct en construction, et reste le même pendant une partie FPS. Pendant l'échauffement, tout le monde garde le modèle par défaut (anonymat).
 - **7 langues** : français, English, español, Deutsch, italiano, português, Nederlands (Paramètres → Langue).
 - **Chat vocal chiffré de bout en bout** : à ton équipe en FPS, aux joueurs proches en construction. Ni le relais, ni l'hôte ne peuvent écouter.
 

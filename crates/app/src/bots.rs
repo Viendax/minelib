@@ -690,13 +690,17 @@ impl Body {
         self.feet + Vec3::Y * (EYE - 0.3 * self.crouch)
     }
 
-    /// Milieu de la tête (zone de la tête : les 0,3 bloc du haut de la boîte).
+    /// Milieu de la tête (zone de la tête : le haut de la boîte). (v225) Aux proportions de
+    /// CS2 du modèle : la tête fait un septième de la hauteur.
     fn head(&self) -> Vec3 {
-        self.feet + Vec3::Y * (1.65 - 0.3 * self.crouch)
+        let h = crate::player::HEIGHT - crate::player_model::HEAD_BLOCKS / 2.0;
+        self.feet + Vec3::Y * (h - 0.3 * self.crouch)
     }
 
+    /// (v225) Milieu du corps du modèle.
     fn chest(&self) -> Vec3 {
-        self.feet + Vec3::Y * (1.15 - 0.15 * self.crouch)
+        let h = (crate::player_model::HIP_BLOCKS + crate::player_model::NECK_BLOCKS) / 2.0;
+        self.feet + Vec3::Y * (h - 0.15 * self.crouch)
     }
 
     fn speed(&self) -> f32 {

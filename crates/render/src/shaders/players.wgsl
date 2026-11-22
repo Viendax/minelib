@@ -97,6 +97,16 @@ fn m_rot_y(a: f32) -> mat4x4<f32> {
     );
 }
 
+// (v225) Proportions d'un personnage de CS2 : mêmes valeurs que `player_model` (LEG, LEG_X,
+// SHOULDER_Y, ARM_X, NECK_Y, en pixels de 1,8/32 bloc).
+const LEG: f32 = 15.0;
+const LEG_X: f32 = 1.75;
+const SHOULDER_Y: f32 = 10.75;
+const ARM_X: f32 = 4.875;
+const NECK_Y: f32 = 27.5;
+// (v225) Foudre de Zeus : le bras droit levé (radians), `player_model::ZEUS_RAISE`.
+const ZEUS_RAISE: f32 = 1.15;
+
 /// Repère (pixels → monde) d'une partie du modèle dans la pose de l'instance : le calcul de
 /// `player_model::parts`.
 fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
@@ -109,14 +119,14 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     let pitch = clamp(v.look.y, -1.4, 1.4);
     // (v189) Jambe d'un seul morceau : accroupi, elle se tasse de `drop` au lieu de se
     // faire recouvrir au quart par le bas du corps (pli visible à la hanche). Pieds au sol.
-    let shrink = m_scale_y((12.0 - drop) / 12.0);
+    let shrink = m_scale_y((LEG - drop) / LEG);
     if part == 0u {
-        return base * m_trans(vec3<f32>(-2.0, 12.0 - drop, 0.0)) * m_rot_x(swing) * shrink;
+        return base * m_trans(vec3<f32>(-LEG_X, LEG - drop, 0.0)) * m_rot_x(swing) * shrink;
     }
     if part == 1u {
-        return base * m_trans(vec3<f32>(2.0, 12.0 - drop, 0.0)) * m_rot_x(-swing) * shrink;
+        return base * m_trans(vec3<f32>(LEG_X, LEG - drop, 0.0)) * m_rot_x(-swing) * shrink;
     }
-    let upper = base * m_trans(vec3<f32>(0.0, 12.0 - drop, 0.0)) * m_rot_x(-lean);
+    let upper = base * m_trans(vec3<f32>(0.0, LEG - drop, 0.0)) * m_rot_x(-lean);
     if part == 2u {
         return upper;
     }
@@ -125,32 +135,37 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     // (v215) Lampe torche (bit 18) : le bras droit seul, tendu de même.
     if ((part == 3u || part == 4u) && (v.skin & 0x20000u) != 0u)
         || (part == 4u && (v.skin & 0x40000u) != 0u) {
-        var side = -6.0;
+        var side = -ARM_X;
         var turn = -0.5;
         var sign = -1.0;
         if part == 4u {
-            side = 6.0;
+            side = ARM_X;
             turn = 0.15;
             sign = 1.0;
         }
-        return upper * m_trans(vec3<f32>(side, 10.0, 0.0)) * m_rot_y(turn)
+        return upper * m_trans(vec3<f32>(side, SHOULDER_Y, 0.0)) * m_rot_y(turn)
             * m_rot_x(1.5707964 + pitch + lean + swing * sign * 0.1);
     }
     if part == 3u {
-        return upper * m_trans(vec3<f32>(-6.0, 10.0, 0.0)) * m_rot_x(-swing + lean * 0.6);
+        return upper * m_trans(vec3<f32>(-ARM_X, SHOULDER_Y, 0.0)) * m_rot_x(-swing + lean * 0.6);
     }
     if part == 4u {
         var raise = 0.0;
         var k = 1.0;
-        if (v.skin & 0x10000u) != 0u {
+        // (v225) Foudre de Zeus (bit 19) : le bras levé devant soi, quel que soit le regard
+        // (`player_model::parts`).
+        if (v.skin & 0x80000u) != 0u {
+            raise = ZEUS_RAISE;
+            k = 0.3;
+        } else if (v.skin & 0x10000u) != 0u {
             raise = clamp(0.65 + 0.6 * pitch, 0.0, 2.0);
             if raise != 0.0 {
                 k = 0.3;
             }
         }
-        return upper * m_trans(vec3<f32>(6.0, 10.0, 0.0)) * m_rot_x(swing * k + lean * 0.6 + raise);
+        return upper * m_trans(vec3<f32>(ARM_X, SHOULDER_Y, 0.0)) * m_rot_x(swing * k + lean * 0.6 + raise);
     }
-    return base * m_trans(vec3<f32>(0.0, 24.0 - drop * 1.6, -lean * 4.0)) * m_rot_x(pitch);
+    return base * m_trans(vec3<f32>(0.0, NECK_Y - drop * 1.6, -lean * 4.0)) * m_rot_x(pitch);
 }
 
 /// (v200) Portée des reflets dans l'eau (blocs, à l'horizontale, `water_mirror::RANGE`) : les

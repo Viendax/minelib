@@ -1,7 +1,12 @@
-//! Modèle du joueur vu à la 3e personne (F5) : tête, corps, bras et jambes en pavés, aux
-//! proportions classiques des jeux de blocs (32 pixels de haut pour 1,8 bloc), avec un skin
-//! original dessiné pixel par pixel. Les bras et les jambes se balancent en marchant, la
-//! tête suit le regard, le corps se penche quand on s'accroupit.
+//! Modèle du joueur vu à la 3e personne (F5) : tête, corps, bras et jambes en pavés, avec
+//! un skin original dessiné pixel par pixel. Les bras et les jambes se balancent en marchant,
+//! la tête suit le regard, le corps se penche quand on s'accroupit.
+//!
+//! (v225) Aux proportions d'un personnage de CS2, à la même taille (1,8 bloc = 32 pixels) :
+//! une tête d'un septième de la hauteur (un quart avant, comme dans les jeux de blocs), des
+//! jambes de près de la moitié, des bras et des jambes plus fins. Chaque pavé garde les
+//! pixels de sa zone du skin (`TEX`, la disposition des skins 64 × 64), étirés à sa taille
+//! (`PARTS`).
 
 use glam::{Mat4, Vec3, Vec4};
 use minelib_render::{EntityVertex, PlayerInstance, PlayerVertex, RayBox, RayBoxKind, ShadowBox};
@@ -215,16 +220,19 @@ fn box_faces(
 
 /// Pavé `[min, max]` (pixels, repère du modèle : x droite, y haut, z arrière) transformé
 /// par `xf` (pixels → monde), découpé en pixels colorés.
+/// (v225) `size` : pixels du skin du pavé (`TEX`), étirés à sa taille.
+#[allow(clippy::too_many_arguments)]
 fn emit_box(
     out: &mut Vec<EntityVertex>,
     xf: Mat4,
     min: [f32; 3],
     max: [f32; 3],
+    size: [usize; 3],
     part: Part,
     light: [f32; 3],
     tex: Option<(&crate::skin::Skin, usize)>,
 ) {
-    emit_box_layer(out, xf, min, max, part, light, tex, None, 1);
+    emit_box_layer(out, xf, min, max, Some(size), part, light, tex, None, 1);
 }
 
 /// Comme `emit_box` ; `layer` : pixels transparents laissés vides (têtes des cartes :
@@ -236,6 +244,7 @@ fn emit_box_layer(
     xf: Mat4,
     min: [f32; 3],
     max: [f32; 3],
+    size: Option<[usize; 3]>,
     part: Part,
     light: [f32; 3],
     tex: Option<(&crate::skin::Skin, usize)>,
@@ -245,13 +254,9 @@ fn emit_box_layer(
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
     let lit = EntityVertex::light(light, true);
-    // Nombre de pixels du skin par côté (une boîte agrandie garde 8 pixels : chacun un
-    // peu plus grand).
-    let (w, h, d) = (
-        (x1 - x0).round() as usize,
-        (y1 - y0).round() as usize,
-        (z1 - z0).round() as usize,
-    );
+    // Nombre de pixels du skin par côté : ceux de sa zone du skin (`size`, v225), sinon la
+    // taille du pavé arrondie (une boîte agrandie garde 8 pixels : chacun un peu plus grand).
+    let [w, h, d] = size.unwrap_or_else(|| box_size(min, max));
     let k = [
         (x1 - x0) / w.max(1) as f32,
         (y1 - y0) / h.max(1) as f32,
@@ -367,20 +372,101 @@ fn aims_right(pose: &Pose) -> bool {
 /// tenir l'arme devant). Les mêmes que `AIM_TURN_*` de players.wgsl.
 const AIM_TURN_RIGHT: f32 = 0.15;
 const AIM_TURN_LEFT: f32 = -0.5;
+/// (v217) Foudre de Zeus : le bras droit levé devant soi (radians), quel que soit le regard.
+/// Le même que `ZEUS_RAISE` de players.wgsl (v225 : avant, les autres joueurs le baissaient
+/// avec le regard).
+const ZEUS_RAISE: f32 = 1.15;
+
+// (v225) Proportions d'un personnage de CS2 (demande de Viendax, liste du 21 novembre,
+// point 23 : « les proportions tête/corps d'un personnage de CS2, même taille totale »), en
+// pixels de 1,8/32 bloc. Avant (jeux de blocs) : jambes et corps de 12, tête de 8, bras et
+// jambes de 4 d'épaisseur. Les mêmes valeurs dans `part_matrix` (players.wgsl).
 
 /// Hauteur d'une jambe (pixels) : la hanche est à cette hauteur quand on est debout.
-const LEG: f32 = 12.0;
+const LEG: f32 = 15.0;
+/// Épaisseur d'une jambe (largeur et profondeur) ; les deux côte à côte font le corps.
+const LEG_W: f32 = 3.5;
+/// Corps : hauteur (de la hanche au cou), largeur, profondeur.
+const BODY_H: f32 = 12.5;
+const BODY_W: f32 = 7.0;
+const BODY_D: f32 = 3.5;
+/// Côté de la tête (un cube, sur le cou : en haut, à 32 pixels).
+const HEAD_S: f32 = 4.5;
+/// Bras : épaisseur, longueur au-dessus du pivot de l'épaule (le haut du bras arrive en haut
+/// du corps) et au-dessous (jusqu'au poing, un peu au-dessus de la hanche).
+const ARM_W: f32 = 2.75;
+const ARM_UP: f32 = 1.75;
+const ARM_DOWN: f32 = 9.75;
+/// Pivot de l'épaule : hauteur au-dessus de la hanche, écart au milieu du corps.
+const SHOULDER_Y: f32 = BODY_H - ARM_UP;
+const ARM_X: f32 = BODY_W / 2.0 + ARM_W / 2.0;
+/// Écart d'une jambe au milieu.
+const LEG_X: f32 = LEG_W / 2.0;
+/// Cou (bas de la tête), debout.
+const NECK_Y: f32 = LEG + BODY_H;
+
+/// (v225) Hauteurs du modèle debout, en blocs : hanches, bas de la tête, côté de la tête.
+/// Zones des coups en mode FPS (`netgame::damage_at`), visée des bots.
+pub const HIP_BLOCKS: f32 = LEG * PX;
+pub const NECK_BLOCKS: f32 = NECK_Y * PX;
+pub const HEAD_BLOCKS: f32 = HEAD_S * PX;
+/// (v225) Épaisseur d'un bras par rapport à sa longueur (le bras à la première personne a
+/// les mêmes proportions, `hand::ARM_THICK`).
+pub const ARM_RATIO: f32 = ARM_W / (ARM_UP + ARM_DOWN);
+// Debout : 32 pixels (1,8 bloc), la tête en haut, une tête d'un septième de la hauteur, le
+// poing au-dessus de la hanche.
+const _: () = assert!(
+    NECK_Y + HEAD_S == 32.0
+        && SHOULDER_Y - ARM_DOWN > 0.0
+        && (HEAD_BLOCKS / 1.8 - 1.0 / 7.1).abs() < 0.01
+);
 
 /// Pavés des six parties, dans l'ordre de `parts` et de `Skin::color` (jambe gauche, jambe
 /// droite, corps, bras gauche, bras droit, tête) : coins (pixels, repère de la partie) et
 /// sorte.
 const PARTS: [([f32; 3], [f32; 3], Part); 6] = [
-    ([-2.0, -12.0, -2.0], [2.0, 0.0, 2.0], Part::Leg),
-    ([-2.0, -12.0, -2.0], [2.0, 0.0, 2.0], Part::Leg),
-    ([-4.0, 0.0, -2.0], [4.0, 12.0, 2.0], Part::Body),
-    ([-2.0, -10.0, -2.0], [2.0, 2.0, 2.0], Part::Arm),
-    ([-2.0, -10.0, -2.0], [2.0, 2.0, 2.0], Part::Arm),
-    ([-4.0, 0.0, -4.0], [4.0, 8.0, 4.0], Part::Head),
+    (
+        [-LEG_W / 2.0, -LEG, -LEG_W / 2.0],
+        [LEG_W / 2.0, 0.0, LEG_W / 2.0],
+        Part::Leg,
+    ),
+    (
+        [-LEG_W / 2.0, -LEG, -LEG_W / 2.0],
+        [LEG_W / 2.0, 0.0, LEG_W / 2.0],
+        Part::Leg,
+    ),
+    (
+        [-BODY_W / 2.0, 0.0, -BODY_D / 2.0],
+        [BODY_W / 2.0, BODY_H, BODY_D / 2.0],
+        Part::Body,
+    ),
+    (
+        [-ARM_W / 2.0, -ARM_DOWN, -ARM_W / 2.0],
+        [ARM_W / 2.0, ARM_UP, ARM_W / 2.0],
+        Part::Arm,
+    ),
+    (
+        [-ARM_W / 2.0, -ARM_DOWN, -ARM_W / 2.0],
+        [ARM_W / 2.0, ARM_UP, ARM_W / 2.0],
+        Part::Arm,
+    ),
+    (
+        [-HEAD_S / 2.0, 0.0, -HEAD_S / 2.0],
+        [HEAD_S / 2.0, HEAD_S, HEAD_S / 2.0],
+        Part::Head,
+    ),
+];
+
+/// (v225) Pixels du skin de chaque pavé (largeur, hauteur, profondeur) : les zones des skins
+/// 64 × 64 (jambes et bras 4 × 12 × 4, corps 8 × 12 × 4, tête 8 × 8 × 8), étirées à la taille
+/// du pavé.
+const TEX: [[usize; 3]; 6] = [
+    [4, 12, 4],
+    [4, 12, 4],
+    [8, 12, 4],
+    [4, 12, 4],
+    [4, 12, 4],
+    [8, 8, 8],
 ];
 
 /// Pavés du modèle dans cette pose : repère (pixels → monde), coins (pixels), partie.
@@ -399,7 +485,7 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     // faire recouvrir au quart par le bas du corps, qui laissait voir un pli à la hanche.
     // Les pieds restent au sol.
     let shrink = (LEG - drop) / LEG;
-    for (side, sign) in [(-2.0f32, 1.0f32), (2.0, -1.0)] {
+    for (side, sign) in [(-LEG_X, 1.0f32), (LEG_X, -1.0)] {
         let xf = base
             * Mat4::from_translation(Vec3::new(side, LEG - drop, 0.0))
             * Mat4::from_rotation_x(swing * sign)
@@ -409,15 +495,15 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     }
     // Haut du corps : penché vers l'avant quand on s'accroupit (pivot à la hanche).
     let upper = base
-        * Mat4::from_translation(Vec3::new(0.0, 12.0 - drop, 0.0))
+        * Mat4::from_translation(Vec3::new(0.0, LEG - drop, 0.0))
         * Mat4::from_rotation_x(-lean);
     let (min, max, part) = PARTS[2];
     out.push((upper, min, max, part));
-    // Bras : pivot à l'épaule (y = 22 depuis la hanche : 10), balancement inverse des
-    // jambes ; le bras droit (x +6) tient l'objet un peu levé devant lui.
+    // Bras : pivot à l'épaule (`SHOULDER_Y` au-dessus de la hanche), balancement inverse
+    // des jambes ; le bras droit (x + `ARM_X`) tient l'objet un peu levé devant lui.
     let aim = aims(pose);
     let aim_right = aims_right(pose);
-    for (side, sign) in [(-6.0f32, -1.0f32), (6.0, 1.0)] {
+    for (side, sign) in [(-ARM_X, -1.0f32), (ARM_X, 1.0)] {
         if aim || (aim_right && side > 0.0) {
             // (v177) Arme à feu : les deux bras tendus là où l'on regarde (le haut du corps
             // penché compris), un peu tournés vers l'arme, qui est tenue devant, entre les
@@ -428,7 +514,7 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
                 AIM_TURN_LEFT
             };
             let xf = upper
-                * Mat4::from_translation(Vec3::new(side, 10.0, 0.0))
+                * Mat4::from_translation(Vec3::new(side, SHOULDER_Y, 0.0))
                 * Mat4::from_rotation_y(turn)
                 * Mat4::from_rotation_x(
                     std::f32::consts::FRAC_PI_2
@@ -446,7 +532,7 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
             // (v217) Foudre de Zeus : le bras levé devant soi, quel que soit le regard
             // (l'éclair reste debout, loin du corps : sa lumière, qui en part, garde
             // l'ombre du joueur entier).
-            1.15
+            ZEUS_RAISE
         } else if side > 0.0 && pose.held.is_some() {
             (0.65 + 0.6 * pose.pitch.clamp(-1.4, 1.4)).clamp(0.0, 2.0)
         } else {
@@ -454,14 +540,14 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         };
         let swing_k = if raise != 0.0 { 0.3 } else { 1.0 };
         let xf = upper
-            * Mat4::from_translation(Vec3::new(side, 10.0, 0.0))
+            * Mat4::from_translation(Vec3::new(side, SHOULDER_Y, 0.0))
             * Mat4::from_rotation_x(swing * sign * swing_k + lean * 0.6 + raise);
         let (min, max, part) = PARTS[out.len()];
         out.push((xf, min, max, part));
     }
     // Tête : pivot au cou, suit le regard (tangage), sans suivre la penche du corps.
     let head = base
-        * Mat4::from_translation(Vec3::new(0.0, 24.0 - drop * 1.6, -lean * 4.0))
+        * Mat4::from_translation(Vec3::new(0.0, NECK_Y - drop * 1.6, -lean * 4.0))
         * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4));
     let (min, max, part) = PARTS[5];
     out.push((head, min, max, part));
@@ -506,7 +592,7 @@ fn hand_frame(pose: &Pose) -> Option<Mat4> {
         .into_iter()
         .rev()
         .find(|p| p.3 == Part::Arm)
-        .map(|p| p.0 * Mat4::from_translation(Vec3::new(0.0, -10.0, 0.0)))
+        .map(|p| p.0 * Mat4::from_translation(Vec3::new(0.0, -ARM_DOWN, 0.0)))
 }
 
 /// Repère d'un objet tenu (pixels → monde) : au poing (`fwd` pixels devant), tourné
@@ -550,13 +636,13 @@ pub fn right_arm_matrix(pose: &Pose) -> Option<Mat4> {
         .into_iter()
         .filter(|p| p.3 == Part::Arm)
         .nth(1)?;
-    // Pavé du bras (pixels) : x de −2 à 2, y de −10 (poing) à 2 (épaule), z de −2 (devant)
-    // à 2.
+    // Pavé du bras (pixels) : x de −`ARM_W`/2 à `ARM_W`/2, y de −`ARM_DOWN` (poing) à
+    // `ARM_UP` (épaule), z de −`ARM_W`/2 (devant) à `ARM_W`/2.
     let unit = Mat4::from_cols(
-        glam::Vec4::new(4.0, 0.0, 0.0, 0.0),
-        glam::Vec4::new(0.0, 0.0, -4.0, 0.0),
-        glam::Vec4::new(0.0, 12.0, 0.0, 0.0),
-        glam::Vec4::new(-2.0, -10.0, 2.0, 1.0),
+        glam::Vec4::new(ARM_W, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, 0.0, -ARM_W, 0.0),
+        glam::Vec4::new(0.0, ARM_UP + ARM_DOWN, 0.0, 0.0),
+        glam::Vec4::new(-ARM_W / 2.0, -ARM_DOWN, ARM_W / 2.0, 1.0),
     );
     Some(m * unit)
 }
@@ -697,11 +783,11 @@ fn gear_frame(pose: &Pose) -> Option<(Mat4, &'static Gear)> {
     let at = if aims(pose) {
         // Arme à feu : entre les deux poings (leur milieu, à 2 pixels du bout des bras),
         // posée dessus.
-        let fist = |arm: &Mat4| arm.transform_point3(Vec3::new(0.0, -8.0, 0.0));
+        let fist = |arm: &Mat4| arm.transform_point3(Vec3::new(0.0, 2.0 - ARM_DOWN, 0.0));
         (fist(arms.get(1)?) + fist(&arms[0])) * 0.5 + look.transform_vector3(Vec3::Y) * (2.0 * PX)
     } else {
         // Le reste : tenu au bout du poing droit.
-        arms.get(1)?.transform_point3(Vec3::new(0.0, -9.5, 0.0))
+        arms.get(1)?.transform_point3(Vec3::new(0.0, 0.5 - ARM_DOWN, 0.0))
     };
     Some((
         Mat4::from_translation(at)
@@ -1217,6 +1303,7 @@ pub fn head(skin: &crate::skin::Skin, xf: Mat4, light: [f32; 3], lod: usize) -> 
         xf,
         [-4.0, 0.0, -4.0],
         [4.0, 8.0, 4.0],
+        None,
         Part::Head,
         light,
         Some((skin, 5)),
@@ -1235,6 +1322,7 @@ pub fn default_head(xf: Mat4, light: [f32; 3], lod: usize) -> Vec<EntityVertex> 
         xf,
         [-4.0, 0.0, -4.0],
         [4.0, 8.0, 4.0],
+        None,
         Part::Head,
         light,
         None,
@@ -1251,10 +1339,16 @@ pub fn build_tiny(pose: &Pose) -> Vec<EntityVertex> {
     let base = Mat4::from_translation(pose.feet)
         * Mat4::from_rotation_y(-pose.yaw)
         * Mat4::from_scale(Vec3::splat(PX));
+    // (v225) Aux proportions du modèle : jambes, corps et bras, tête.
+    let wide = BODY_W / 2.0 + ARM_W;
     for (min, max, c) in [
-        ([-4.0, 0.0, -2.0], [4.0, 12.0, 2.0], PANTS),
-        ([-8.0, 12.0, -2.0], [8.0, 24.0, 2.0], SHIRT),
-        ([-4.0, 24.0, -4.0], [4.0, 32.0, 4.0], SKIN),
+        ([-LEG_W, 0.0, -LEG_W / 2.0], [LEG_W, LEG, LEG_W / 2.0], PANTS),
+        ([-wide, LEG, -BODY_D / 2.0], [wide, NECK_Y, BODY_D / 2.0], SHIRT),
+        (
+            [-HEAD_S / 2.0, NECK_Y, -HEAD_S / 2.0],
+            [HEAD_S / 2.0, NECK_Y + HEAD_S, HEAD_S / 2.0],
+            SKIN,
+        ),
     ] {
         let rgb = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
         emit_item(&mut out, base, min, max, RayBoxKind::Flat(rgb), pose.light);
@@ -1269,7 +1363,7 @@ pub fn build(pose: &Pose) -> Vec<EntityVertex> {
     // (les mêmes numéros que `Skin::color`).
     for (i, (xf, min, max, part)) in parts(pose).into_iter().enumerate() {
         let tex = pose.skin.as_deref().map(|s| (s, i));
-        emit_box(&mut out, xf, min, max, part, pose.light, tex);
+        emit_box(&mut out, xf, min, max, TEX[i], part, pose.light, tex);
     }
     for (xf, min, max, kind) in held_parts(pose) {
         emit_item(&mut out, xf, min, max, kind, pose.light);
@@ -1306,9 +1400,15 @@ fn atlas(i: usize, k: usize, [w, _, d]: [usize; 3]) -> (usize, usize) {
 pub fn player_mesh() -> Vec<PlayerVertex> {
     let mut out = Vec::with_capacity(216);
     for (i, &(min, max, _)) in PARTS.iter().enumerate() {
-        let size = box_size(min, max);
+        // (v225) Les pixels de sa zone du skin, étirés à la taille du pavé.
+        let size = TEX[i];
+        let step = (Vec3::from(max) - Vec3::from(min)) / Vec3::from(size.map(|n| n as f32));
         for (k, (_, o, du, dv, nu, nv)) in box_faces(min, max, size).into_iter().enumerate() {
-            let (o, du, dv) = (Vec3::from(o), Vec3::from(du), Vec3::from(dv));
+            let (o, du, dv) = (
+                Vec3::from(o),
+                Vec3::from(du) * step,
+                Vec3::from(dv) * step,
+            );
             let (fx, fy) = atlas(i, k, size);
             let rect = [
                 fx as f32 / 64.0,
@@ -1347,7 +1447,7 @@ pub fn player_mesh() -> Vec<PlayerVertex> {
 pub fn bake_skin(tex: Option<&crate::skin::Skin>) -> Vec<[f32; 3]> {
     let mut out = vec![[0.0; 3]; 64 * 64];
     for (i, &(min, max, part)) in PARTS.iter().enumerate() {
-        let size = box_size(min, max);
+        let size = TEX[i];
         let s = size.map(|n| n as u32);
         for (k, (face, _, _, _, nu, nv)) in box_faces(min, max, size).into_iter().enumerate() {
             let (fx, fy) = atlas(i, k, size);
@@ -1400,6 +1500,9 @@ pub fn instance(pose: &Pose, layer: u32, prev: &Prev) -> PlayerInstance {
     } else if aims_right(pose) {
         // (v215) Lampe torche : le bras droit tendu.
         PlayerInstance::HOLDS | PlayerInstance::AIMS_RIGHT
+    } else if pose.held == Some(Held::Zeus) {
+        // (v225) Foudre de Zeus : le bras droit levé, quel que soit le regard.
+        PlayerInstance::HOLDS | PlayerInstance::RAISED
     } else if pose.held.is_some() {
         PlayerInstance::HOLDS
     } else {
@@ -1569,44 +1672,49 @@ mod tests {
         let lean = 0.45 * crouch;
         let drop = 0.3 / px * crouch * 0.6;
         let pitch = p.pitch.clamp(-1.4, 1.4);
-        let shrink = Mat4::from_scale(Vec3::new(1.0, (12.0 - drop) / 12.0, 1.0));
+        let shrink = Mat4::from_scale(Vec3::new(1.0, (LEG - drop) / LEG, 1.0));
         if part == 0 {
-            return base * t(-2.0, 12.0 - drop, 0.0) * Mat4::from_rotation_x(swing) * shrink;
+            return base * t(-LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(swing) * shrink;
         }
         if part == 1 {
-            return base * t(2.0, 12.0 - drop, 0.0) * Mat4::from_rotation_x(-swing) * shrink;
+            return base * t(LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(-swing) * shrink;
         }
-        let upper = base * t(0.0, 12.0 - drop, 0.0) * Mat4::from_rotation_x(-lean);
+        let upper = base * t(0.0, LEG - drop, 0.0) * Mat4::from_rotation_x(-lean);
         if part == 2 {
             return upper;
         }
-        if (part == 3 || part == 4) && p.skin & 0x20000 != 0 {
+        if ((part == 3 || part == 4) && p.skin & 0x20000 != 0)
+            || (part == 4 && p.skin & 0x40000 != 0)
+        {
             let (side, turn, sign) = if part == 4 {
-                (6.0, 0.15, 1.0)
+                (ARM_X, 0.15, 1.0)
             } else {
-                (-6.0, -0.5, -1.0)
+                (-ARM_X, -0.5, -1.0)
             };
             return upper
-                * t(side, 10.0, 0.0)
+                * t(side, SHOULDER_Y, 0.0)
                 * Mat4::from_rotation_y(turn)
                 * Mat4::from_rotation_x(1.570_796_4 + pitch + lean + swing * sign * 0.1);
         }
         if part == 3 {
-            return upper * t(-6.0, 10.0, 0.0) * Mat4::from_rotation_x(-swing + lean * 0.6);
+            return upper * t(-ARM_X, SHOULDER_Y, 0.0) * Mat4::from_rotation_x(-swing + lean * 0.6);
         }
         if part == 4 {
             let (mut raise, mut k) = (0.0, 1.0);
-            if p.skin & 0x10000 != 0 {
+            if p.skin & 0x80000 != 0 {
+                raise = ZEUS_RAISE;
+                k = 0.3;
+            } else if p.skin & 0x10000 != 0 {
                 raise = (0.65 + 0.6 * pitch).clamp(0.0, 2.0);
                 if raise != 0.0 {
                     k = 0.3;
                 }
             }
             return upper
-                * t(6.0, 10.0, 0.0)
+                * t(ARM_X, SHOULDER_Y, 0.0)
                 * Mat4::from_rotation_x(swing * k + lean * 0.6 + raise);
         }
-        base * t(0.0, 24.0 - drop * 1.6, -lean * 4.0) * Mat4::from_rotation_x(pitch)
+        base * t(0.0, NECK_Y - drop * 1.6, -lean * 4.0) * Mat4::from_rotation_x(pitch)
     }
 
     /// Skin aux pixels pris au hasard, dont des transparents (le modèle par défaut se voit
@@ -1633,14 +1741,15 @@ mod tests {
             .iter()
             .position(|w| w.name == "AK-47")
             .unwrap() as u8;
-        (0..4)
+        // (v225) Plus la Foudre de Zeus (bras levé) et la lampe torche (bras droit tendu).
+        (0..6)
             .map(|n| Pose {
                 feet: Vec3::new(3.0 + n as f32, 70.0, -5.0),
                 yaw: 0.7 + n as f32 * 2.1,
-                pitch: [-0.5, 0.3, 1.2, -0.2][n],
+                pitch: [-0.5, 0.3, 1.2, -0.2, -0.6, 0.4][n],
                 walk: 1.3 + n as f32,
-                swing: [0.0, 0.8, 0.5, 0.6][n],
-                crouch: [0.0, 0.6, 1.0, 0.0][n],
+                swing: [0.0, 0.8, 0.5, 0.6, 0.7, 0.3][n],
+                crouch: [0.0, 0.6, 1.0, 0.0, 0.3, 0.0][n],
                 // Exactement représentable au format des sommets (k / 127,5).
                 light: [0.8, 0.4, 1.2],
                 held: [
@@ -1648,10 +1757,42 @@ mod tests {
                     Some(Held::Gear(ak)),
                     Some(Held::Block(BlockId::STONE)),
                     Some(Held::Gear(crate::cs::W_KNIFE)),
+                    Some(Held::Zeus),
+                    Some(Held::Flashlight(true)),
                 ][n],
                 skin: (n > 0).then(|| skin.clone()),
             })
             .collect()
+    }
+
+    /// (v225) Les proportions du modèle (de CS2), et le bras levé de la Foudre de Zeus, sont
+    /// les mêmes dans le shader des autres joueurs (`part_matrix` de players.wgsl).
+    #[test]
+    fn the_shader_has_the_same_proportions() {
+        let src = include_str!("../../render/src/shaders/players.wgsl");
+        for (name, v) in [
+            ("LEG", LEG),
+            ("LEG_X", LEG_X),
+            ("SHOULDER_Y", SHOULDER_Y),
+            ("ARM_X", ARM_X),
+            ("NECK_Y", NECK_Y),
+            ("ZEUS_RAISE", ZEUS_RAISE),
+        ] {
+            let line = src
+                .lines()
+                .find(|l| l.starts_with(&format!("const {name}: f32 =")))
+                .unwrap_or_else(|| panic!("{name} absent de players.wgsl"));
+            let got: f32 = line
+                .split('=')
+                .nth(1)
+                .unwrap()
+                .trim()
+                .trim_end_matches(';')
+                .parse()
+                .unwrap();
+            assert_eq!(got, v, "{name}");
+        }
+        // (Hauteur, tête, poing : vérifiés à la compilation, sous `ARM_RATIO`.)
     }
 
     #[test]
@@ -1674,10 +1815,11 @@ mod tests {
                 let shade = face_shade(n);
                 let (pa, pb, pd) = (Vec3::from(a.pos), Vec3::from(b.pos), Vec3::from(d.pos));
                 let (ua, ub, ud) = (Vec2::from(a.uv), Vec2::from(b.uv), Vec2::from(d.uv));
-                assert_eq!(Vec3::from(c.pos), pb + pd - pa);
-                // Pixels de la face : (b - a) et (d - a) font un pixel de long chacun.
-                let nu = (pb - pa).length().round() as usize;
-                let nv = (pd - pa).length().round() as usize;
+                assert!(Vec3::from(c.pos).distance(pb + pd - pa) < 1e-5);
+                // Pixels de la face : ceux de sa zone du skin ((b - a) et (d - a) en font un
+                // chacun ; v225 : étirés à la taille du pavé).
+                let nu = ((ub - ua).length() * 64.0).round() as usize;
+                let nv = ((ud - ua).length() * 64.0).round() as usize;
                 for v in 0..nv {
                     for u in 0..nu {
                         let quad = &cpu[at..at + 6];
@@ -1926,32 +2068,43 @@ mod tests {
                 * Mat4::from_scale(Vec3::splat(PX));
             let at = |x: f32, y: f32, z: f32| base.transform_point3(Vec3::new(x, y, z));
             // Lumière devant et au-dessus (45°), à 3 blocs.
-            let light = at(0.0, 24.0, -2.0)
-                + (at(0.0, 24.0, -10.0) - at(0.0, 24.0, -2.0)).normalize() * 2.1
+            let front = -BODY_D / 2.0;
+            let light = at(0.0, NECK_Y, front)
+                + (at(0.0, NECK_Y, -10.0) - at(0.0, NECK_Y, front)).normalize() * 2.1
                 + Vec3::Y * 2.1;
-            // Devant du torse (z = −2), décollé comme dans le shader (0,02 bloc).
+            // Devant du torse, décollé comme dans le shader (0,02 bloc).
             let off = (at(0.0, 0.0, -1.0) - at(0.0, 0.0, 0.0)).normalize() * 0.02;
-            // Juste sous le menton : la tête dépasse de 2 pixels, l'ombre y tombe.
+            // Juste sous le menton : la tête dépasse du torse (v225 : d'un demi-pixel), l'ombre
+            // y tombe, dans ce qui reste de ce demi-pixel devant le point décollé (lumière à
+            // 45° : autant en hauteur).
+            let margin = HEAD_S / 2.0 - BODY_D / 2.0 - 0.02 / PX;
+            assert!(margin > 0.0, "la tête ne dépasse plus du torse");
             assert!(
-                shadowed(&boxes, at(0.0, 23.0, -2.0) + off, light),
+                shadowed(&boxes, at(0.0, NECK_Y - margin / 2.0, front) + off, light),
                 "menton, {yaw_deg}°"
             );
             // Plus bas sur le torse et sur les côtés : rien (avant : un triangle).
-            for (x, y) in [(0.0, 18.0), (-3.0, 21.0), (3.0, 21.0), (0.0, 14.0)] {
+            let side = BODY_W / 2.0 - 0.75;
+            for (x, y) in [
+                (0.0, NECK_Y - 6.0),
+                (-side, NECK_Y - 3.0),
+                (side, NECK_Y - 3.0),
+                (0.0, LEG + 2.0),
+            ] {
                 assert!(
-                    !shadowed(&boxes, at(x, y, -2.0) + off, light),
+                    !shadowed(&boxes, at(x, y, front) + off, light),
                     "torse ({x}, {y}), {yaw_deg}°"
                 );
             }
             // Le dessus de l'épaule gauche, lumière au-dessus de l'épaule droite : la tête
             // lui fait de l'ombre ; lumière juste au-dessus d'elle : non.
-            let shoulder = at(-6.0, 24.0, 0.0) + Vec3::Y * 0.02;
+            let shoulder = at(-ARM_X, NECK_Y, 0.0) + Vec3::Y * 0.02;
             assert!(
                 shadowed(&boxes, shoulder, at(10.0, 40.0, 0.0)),
                 "épaule, {yaw_deg}°"
             );
             assert!(
-                !shadowed(&boxes, shoulder, at(-6.0, 60.0, 0.0)),
+                !shadowed(&boxes, shoulder, at(-ARM_X, 60.0, 0.0)),
                 "épaule, {yaw_deg}°"
             );
         }

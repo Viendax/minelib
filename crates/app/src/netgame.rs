@@ -528,13 +528,13 @@ fn shot(
             if id == shooter || !m.players.get(&id).is_some_and(|p| p.alive) {
                 continue;
             }
-            let (min, max, head_y) = hitbox(feet, crouch);
-            if let Some(t) = ray_box(origin, dir, min, max) {
+            let (body, head, _) = hitbox(feet, crouch);
+            if let Some((t, in_head)) = ray_player(origin, dir, body, head) {
                 let factor = path.factor_at(t);
                 let wall = t >= path.first;
                 if let (Some(factor), true) = (factor, best.is_none_or(|b| t < b.0)) {
                     let point = origin + dir * t;
-                    let (d, hurt) = damage_at(weapon, t, point.y, feet.y, head_y);
+                    let (d, hurt) = damage_at(weapon, t, point.y, feet.y, head[1].y, in_head);
                     let damage = if wall { (d as f32 * factor) as u32 } else { d };
                     best = Some((
                         t,
@@ -563,8 +563,8 @@ fn rays_loaded(world: &World, frame: &Frame, origin: Vec3, dirs: &[Vec3]) -> boo
         let far = frame
             .iter()
             .filter_map(|&(_, feet, crouch)| {
-                let (min, max, _) = hitbox(feet, crouch);
-                ray_box(origin, dir, min, max)
+                let (body, head, _) = hitbox(feet, crouch);
+                ray_player(origin, dir, body, head).map(|(t, _)| t)
             })
             .fold(0.0f32, f32::max)
             .min(RANGE);
@@ -1478,12 +1478,42 @@ fn send(link: &Sender<Inbound>, req: &Request) {
     transport::push(link, req);
 }
 
-/// Boîte (min, max) d'un joueur et hauteur de sa tête.
-fn hitbox(feet: Vec3, crouch: f32) -> (Vec3, Vec3, f32) {
+/// (v225) Demi-côté de la boîte de la tête (blocs) : un peu plus que la moitié de la tête
+/// du modèle (`player_model::HEAD_BLOCKS`, 0,25 bloc), qui tourne avec le regard.
+const HEAD_HALF: f32 = 0.15;
+/// (v225) Haut du ventre (dégâts ×1,25), au-dessus des pieds, debout : le bas du corps.
+const STOMACH_BLOCKS: f32 = crate::player_model::HIP_BLOCKS + 0.25;
+
+/// Boîtes (min, max) d'un joueur : son corps (jusqu'au bas de la tête) et sa tête ; hauteur
+/// du bas de sa tête. (v225) Aux proportions de CS2 du modèle : la tête fait un septième de
+/// la hauteur (0,3 bloc avant), dans sa propre boîte, plus étroite que le corps (une balle
+/// qui passe à côté d'elle, à sa hauteur, ne touche pas).
+fn hitbox(feet: Vec3, crouch: f32) -> ([Vec3; 2], [Vec3; 2], f32) {
     let h = HEIGHT - 0.3 * crouch;
-    let min = feet - Vec3::new(HALF_WIDTH, 0.0, HALF_WIDTH);
-    let max = feet + Vec3::new(HALF_WIDTH, h, HALF_WIDTH);
-    (min, max, feet.y + h - 0.3)
+    let head_y = feet.y + h - crate::player_model::HEAD_BLOCKS;
+    let body = [
+        feet - Vec3::new(HALF_WIDTH, 0.0, HALF_WIDTH),
+        Vec3::new(feet.x + HALF_WIDTH, head_y, feet.z + HALF_WIDTH),
+    ];
+    let head = [
+        Vec3::new(feet.x - HEAD_HALF, head_y, feet.z - HEAD_HALF),
+        Vec3::new(feet.x + HEAD_HALF, feet.y + h, feet.z + HEAD_HALF),
+    ];
+    (body, head, head_y)
+}
+
+/// (v225) Distance du rayon à un joueur (boîtes de `hitbox`), s'il le touche, et s'il le
+/// touche d'abord à la tête.
+fn ray_player(o: Vec3, d: Vec3, body: [Vec3; 2], head: [Vec3; 2]) -> Option<(f32, bool)> {
+    match (
+        ray_box(o, d, body[0], body[1]),
+        ray_box(o, d, head[0], head[1]),
+    ) {
+        (Some(b), Some(h)) => Some(if h < b { (h, true) } else { (b, false) }),
+        (Some(b), None) => Some((b, false)),
+        (None, Some(h)) => Some((h, true)),
+        (None, None) => None,
+    }
 }
 
 /// Distance du rayon à la boîte, s'il la touche.
@@ -1496,8 +1526,17 @@ fn ray_box(o: Vec3, d: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     (far >= near.max(0.0)).then_some(near.max(0.0))
 }
 
-/// Dégâts d'un coup selon l'endroit touché : tête ×4, jambes ×0,75 (balles).
-fn damage_at(weapon: u8, dist: f32, hit_y: f32, feet_y: f32, head_y: f32) -> (u32, Hurt) {
+/// Dégâts d'un coup selon l'endroit touché : tête ×4, jambes ×0,75 (balles). `top_y` : haut
+/// de la tête (accroupi, plus bas : les zones se tassent d'autant) ; `head` : la boîte de la
+/// tête est touchée (v225).
+fn damage_at(
+    weapon: u8,
+    dist: f32,
+    hit_y: f32,
+    feet_y: f32,
+    top_y: f32,
+    head: bool,
+) -> (u32, Hurt) {
     if weapon == KNIFE_LIGHT || weapon == KNIFE_HEAVY {
         let d = if weapon == KNIFE_HEAVY { 55 } else { 34 };
         return (d, Hurt::Knife);
@@ -1508,13 +1547,15 @@ fn damage_at(weapon: u8, dist: f32, hit_y: f32, feet_y: f32, head_y: f32) -> (u3
     let base = WEAPONS
         .get(weapon as usize)
         .map_or(30.0, |w| w.damage_at(dist));
+    // (v225) Hanches et haut du ventre du modèle (proportions de CS2), tassés comme lui.
     let h = hit_y - feet_y;
-    let (head, legs) = (hit_y >= head_y, h < 0.75);
+    let k = ((top_y - feet_y) / HEIGHT).clamp(0.5, 1.0);
+    let legs = !head && h < crate::player_model::HIP_BLOCKS * k;
     let d = if head {
         base * 4.0
     } else if legs {
         base * 0.75
-    } else if h < 1.05 {
+    } else if h < STOMACH_BLOCKS * k {
         base * 1.25
     } else {
         base
@@ -3971,7 +4012,8 @@ impl Host {
         let side = Vec3::new(-to.z, 0.0, to.x) * 0.4;
         let mut points = Vec::with_capacity(10);
         for f in [feet, feet + Vec3::new(tvel.x, 0.0, tvel.z) * ahead] {
-            points.push(f + Vec3::Y * 1.65);
+            // (v225) Le milieu de la tête du modèle.
+            points.push(f + Vec3::Y * (HEIGHT - crate::player_model::HEAD_BLOCKS / 2.0));
             points.push(f + Vec3::Y * 1.1 + side);
             points.push(f + Vec3::Y * 1.1 - side);
             points.push(f + Vec3::Y * 0.3);
@@ -5381,22 +5423,49 @@ mod tests {
         assert!(why(&c).iter().any(|w| w.starts_with("règles")), "{c:?}");
     }
 
+    /// (v225) Tête aux proportions de CS2 : sa boîte est plus étroite que le corps. Une balle
+    /// qui passe à côté d'elle, à sa hauteur, ne touche pas ; juste dessous, c'est l'épaule.
+    #[test]
+    fn the_head_hitbox_is_narrower_than_the_body() {
+        let feet = Vec3::new(3.5, 64.0, -2.5);
+        let (body, head, head_y) = hitbox(feet, 0.0);
+        let shoot = |y: f32, dz: f32| {
+            ray_player(
+                Vec3::new(feet.x - 5.0, feet.y + y, feet.z + dz),
+                Vec3::X,
+                body,
+                head,
+            )
+        };
+        assert!(matches!(shoot(1.7, 0.0), Some((_, true))), "tête");
+        assert!(shoot(1.7, 0.25).is_none(), "à côté de la tête");
+        assert!(matches!(shoot(1.45, 0.25), Some((_, false))), "épaule");
+        assert!(matches!(shoot(0.5, 0.0), Some((_, false))), "jambes");
+        assert!(
+            (head_y - feet.y - (HEIGHT - crate::player_model::HEAD_BLOCKS)).abs() < 1e-5
+        );
+        // Accroupi : la tête descend avec le haut de la boîte.
+        let (_, low, _) = hitbox(feet, 1.0);
+        assert!((low[1].y - (feet.y + HEIGHT - 0.3)).abs() < 1e-5);
+    }
+
     /// Dégâts comme dans CS2 : une balle de Glock dans la tête sans casque tue de près
     /// (120), plus à 20 blocs ; l'AK tue toujours d'une balle dans la tête ; ventre ×1,25.
     #[test]
     fn bullet_damage_follows_cs2() {
         let gun = |n: &str| WEAPONS.iter().position(|w| w.name == n).unwrap() as u8;
-        let (feet, head_y) = (0.0, 1.5);
-        let dmg = |w: u8, dist: f32, y: f32| damage_at(w, dist, y, feet, head_y).0;
+        let (feet, top) = (0.0, HEIGHT);
+        let head_y = top - crate::player_model::HEAD_BLOCKS;
+        let dmg = |w: u8, dist: f32, y: f32| damage_at(w, dist, y, feet, top, y >= head_y).0;
         let glock = gun("Glock-18");
-        assert_eq!(dmg(glock, 0.0, 1.6), 120);
-        assert!(dmg(glock, 20.0, 1.6) < 100, "{}", dmg(glock, 20.0, 1.6));
-        assert_eq!(dmg(glock, 0.0, 1.2), 30, "poitrine");
-        assert_eq!(dmg(glock, 0.0, 0.9), 37, "ventre");
-        assert_eq!(dmg(glock, 0.0, 0.3), 22, "jambes");
+        assert_eq!(dmg(glock, 0.0, 1.65), 120);
+        assert!(dmg(glock, 20.0, 1.65) < 100, "{}", dmg(glock, 20.0, 1.65));
+        assert_eq!(dmg(glock, 0.0, 1.4), 30, "poitrine");
+        assert_eq!(dmg(glock, 0.0, 1.0), 37, "ventre");
+        assert_eq!(dmg(glock, 0.0, 0.5), 22, "jambes");
         let ak = gun("AK-47");
         assert!(
-            dmg(ak, 60.0, 1.6) > 100,
+            dmg(ak, 60.0, 1.65) > 100,
             "AK : une balle dans la tête, même de loin"
         );
         // Avec casque : le Glock ne tue jamais d'une balle (47 % passent), l'AK si.
@@ -5406,7 +5475,7 @@ mod tests {
         let hit = |m: &mut Match, w: u8| {
             let p = m.players.get_mut(&2).unwrap();
             (p.hp, p.armor, p.helmet, p.alive) = (100, 100, true, true);
-            let (d, h) = damage_at(w, 0.0, 1.6, feet, head_y);
+            let (d, h) = damage_at(w, 0.0, 1.65, feet, top, true);
             m.hurt(Some(1), 2, d, h);
             m.players[&2].hp
         };
