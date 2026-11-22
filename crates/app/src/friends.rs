@@ -238,7 +238,9 @@ pub fn screen(
                 out = FriendsAction::Join(place.map_or(0, |p| p.room));
             }
         }
-        if v.in_world.is_some() && *online && !here {
+        // (v232) Aussi un ami hors ligne : l'invitation l'attend (pas qui n'a pas accepté).
+        let pending = place.is_some_and(|p| p.kind == proto::FRIEND_PENDING);
+        if v.in_world.is_some() && !pending && !here {
             bx -= 54.0 * s;
             if c.button("Inviter", bx + 26.0 * s, ry - 2.0 * s, 52.0, true) {
                 out = FriendsAction::Invite(name.clone());

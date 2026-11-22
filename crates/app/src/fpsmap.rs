@@ -356,9 +356,108 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// (v232) Fichier d'une copie de carte dans ses mondes : la signature de la carte d'origine
+/// (en hexadécimal), pour ne pas la copier deux fois.
+const SOURCE_FILE: &str = "carte_source.txt";
+
+/// (v232) Copie d'une carte FPS (téléchargée) dans ses mondes solo, sous ce nom : un monde
+/// ordinaire en mode FPS, qui garde la carte d'origine (`solo_copy`).
+pub fn copy_to_saves(src: &Path, saves: &Path, name: &str, sig: &[u8; 32]) -> Result<PathBuf> {
+    let level = fs::read_to_string(src.join("level.txt"))
+        .with_context(|| format!("{}/level.txt", src.display()))?;
+    let dir = crate::save::create_world(saves, name, 0)?;
+    copy_dir(src, &dir)?;
+    // Son nom à lui, et la date d'aujourd'hui (le reste comme la carte : graine, mode FPS…).
+    let now = crate::save::now();
+    let name: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '=')
+        .take(40)
+        .collect();
+    let mut out = String::new();
+    for l in level.lines() {
+        let key = l.split_once('=').map_or("", |(k, _)| k.trim());
+        match key {
+            "name" => out += &format!("name={name}\n"),
+            "created" | "last_played" => out += &format!("{key}={now}\n"),
+            _ => {
+                out += l;
+                out.push('\n');
+            }
+        }
+    }
+    fs::write(dir.join("level.txt"), out)?;
+    fs::write(dir.join(SOURCE_FILE), minelib_net::crypto::hex(sig))?;
+    Ok(dir)
+}
+
+/// (v232) Monde de ses mondes solo copié de cette carte (`copy_to_saves`), s'il y en a un.
+pub fn solo_copy(saves: &Path, sig: &[u8; 32]) -> Option<PathBuf> {
+    let want = minelib_net::crypto::hex(sig);
+    crate::save::list_worlds(saves)
+        .into_iter()
+        .map(|w| w.dir)
+        .find(|d| fs::read_to_string(d.join(SOURCE_FILE)).is_ok_and(|t| t.trim() == want))
+}
+
+/// (v232) Cartes déjà copiées dans ses mondes solo (leurs signatures d'origine).
+pub fn solo_copies(saves: &Path) -> Vec<[u8; 32]> {
+    crate::save::list_worlds(saves)
+        .into_iter()
+        .filter_map(|w| fs::read_to_string(w.dir.join(SOURCE_FILE)).ok())
+        .filter_map(|t| minelib_net::crypto::unhex(t.trim())?.try_into().ok())
+        .collect()
+}
+
+/// Copie récursive d'un dossier (fichiers remplacés).
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for e in fs::read_dir(src)?.flatten() {
+        let to = dst.join(e.file_name());
+        let ty = e.file_type()?;
+        if ty.is_dir() {
+            copy_dir(&e.path(), &to)?;
+        } else if ty.is_file() {
+            fs::copy(e.path(), &to)
+                .with_context(|| format!("copie de {}", e.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v232) Une carte téléchargée, copiée dans ses mondes : même carte (signature), son nom,
+    /// en mode FPS, retrouvée ensuite (pas copiée deux fois).
+    #[test]
+    fn a_downloaded_map_is_copied_once_into_the_solo_worlds() {
+        let root = std::env::temp_dir().join(format!("minelib-copie-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = crate::save::create_world(&root.join("src"), "Mirage", 9).unwrap();
+        let mut m = load(&dir);
+        m.ct = Some(Zone::new([0, 64, 0], [5, 64, 5]));
+        m.t = Some(Zone::new([40, 64, 0], [45, 64, 5]));
+        save(&dir, &m).unwrap();
+        let p = package(&dir).unwrap();
+        let sig = p.signature();
+        let got = unpack(&root.join("maps"), "Mirage", &p.to_bytes()).unwrap();
+        let saves = root.join("saves");
+        assert_eq!(solo_copy(&saves, &sig), None);
+        let copy = copy_to_saves(&got, &saves, "Mirage", &sig).unwrap();
+        assert_eq!(package(&copy).unwrap().signature(), sig, "la même carte");
+        assert_eq!(load(&copy), m);
+        let w = crate::save::list_worlds(&saves);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].meta.name, "Mirage");
+        assert!(w[0].meta.created > 0);
+        let level = fs::read_to_string(copy.join("level.txt")).unwrap();
+        assert!(level.contains("gamemode=fps"));
+        assert_eq!(solo_copy(&saves, &sig), Some(copy));
+        assert_eq!(solo_copies(&saves), vec![sig]);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_map_survives_the_trip_and_spawns_make_it_another_map() {

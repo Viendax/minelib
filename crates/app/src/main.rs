@@ -108,6 +108,7 @@ mod save;
 mod screen;
 mod session;
 mod skin;
+mod solo_maps;
 mod spotting;
 mod stick;
 mod storm;
@@ -162,6 +163,9 @@ enum Screen {
     HostPick,
     /// (v231) Amis : depuis l'accueil ou le menu du jeu (retour : `friends_back`).
     Friends,
+    /// (v232) Solo → Cartes FPS : jouer contre des bots sur une carte FPS (de ce PC, ou du
+    /// relais, copiée dans ses mondes).
+    SoloMaps,
 }
 
 /// (v215) Sorties son et micros du système, relevés en arrière-plan : le relevé (cpal)
@@ -228,6 +232,14 @@ struct Game {
     server_selected: Option<usize>,
     fps_home: multiplayer::FpsHome,
     fps_home_maps_seen: u64,
+    /// (v232) Solo → Cartes FPS : état de l'écran, dernière liste du relais vue, et carte du
+    /// relais en cours de téléchargement (signature, nom, à jouer ensuite).
+    solo_maps: solo_maps::SoloMaps,
+    solo_maps_seen: u64,
+    solo_map_pending: Option<([u8; 32], String, bool)>,
+    /// Lignes de l'écran (index dans `map_rows`, ce qu'elles montrent), refaites quand la
+    /// liste change (pas à chaque image : elles regardent les mondes sur le disque).
+    solo_rows: (Vec<usize>, Vec<solo_maps::SoloRow>),
     /// Cartes de ce PC déjà jouées en partie FPS en ligne (hébergées ou rejointes) : on
     /// les renvoie au relais s'il ne les a pas, pour qu'elles restent disponibles à tous.
     /// Les autres mondes du joueur ne sont jamais partagés.
@@ -431,6 +443,10 @@ impl Game {
             kick_pick: false,
             party_go: None,
             fps_home_maps_seen: u64::MAX,
+            solo_maps: solo_maps::SoloMaps::default(),
+            solo_maps_seen: u64::MAX,
+            solo_map_pending: None,
+            solo_rows: (Vec::new(), Vec::new()),
             shared_maps: Default::default(),
             reshared: Default::default(),
             maps_rev_seen: 0,
@@ -1226,7 +1242,18 @@ impl Game {
                     self.notify(t);
                 }
                 Event::InviteSent(to) => {
-                    self.friends_note = Some((format!("Invitation envoyée à {to}."), self.time));
+                    // (v232) Hors ligne (ou invisible) : le relais la lui garde.
+                    let online = self
+                        .accounts
+                        .friends
+                        .iter()
+                        .any(|(p, on)| *on && p.eq_ignore_ascii_case(to));
+                    let t = if online {
+                        format!("Invitation envoyée à {to}.")
+                    } else {
+                        format!("{to} n'est pas en ligne : l'invitation l'attendra (2 h).")
+                    };
+                    self.friends_note = Some((t, self.time));
                 }
                 // (v231) Demande d'ami acceptée.
                 Event::FriendAdded { from, .. } => {
@@ -1277,6 +1304,12 @@ impl Game {
                             if let Some((_, _, host)) = self.pending_build.take() {
                                 self.fps_status = None;
                                 self.join_build(dir, host);
+                            } else if self.solo_map_pending.as_ref().is_some_and(|p| p.0 == *sig)
+                            {
+                                // (v232) Solo → Cartes FPS : copiée dans ses mondes (jouée).
+                                if let Some((sig, name, play)) = self.solo_map_pending.take() {
+                                    self.solo_map_copied(&dir, &name, &sig, play);
+                                }
                             } else if let Some(search) = &mut self.searching {
                                 let players = fpsmap::load(&dir).players();
                                 search.2 = Some(dir);
@@ -1298,6 +1331,7 @@ impl Game {
                 }
                 Event::MapFailed(_, m) => {
                     self.searching = None;
+                    self.solo_map_pending = None;
                     if self.pending_build.take().is_some() {
                         self.accounts.room(Cmd::Leave);
                     }
@@ -1673,6 +1707,168 @@ impl Game {
                 .map(|w| (w.dir, w.meta.name)),
         );
         v
+    }
+
+    /// (v232) Solo → Cartes FPS, liste à jour.
+    fn open_solo_maps(&mut self) {
+        if self.accounts.logged_in() {
+            self.accounts.room(minelib_net::client::Cmd::Maps);
+        }
+        if self.solo_map_pending.is_none() {
+            self.fps_status = None;
+        }
+        self.solo_maps.polled = self.time;
+        self.solo_maps_seen = self.accounts.maps_rev;
+        self.refresh_solo_rows();
+        self.screen = Screen::SoloMaps;
+    }
+
+    /// (v232) Lignes de Solo → Cartes FPS : les cartes du relais, celles téléchargées, et
+    /// celles de ses mondes dont les départs sont réglés (index dans `map_rows`).
+    fn refresh_solo_rows(&mut self) {
+        self.rebuild_map_rows();
+        let saves = &self.paths.saves;
+        let copies = fpsmap::solo_copies(saves);
+        let mut idx = Vec::new();
+        let mut rows = Vec::new();
+        for (i, m) in self.map_rows.iter().enumerate() {
+            let in_saves = m.local.as_ref().is_some_and(|d| d.starts_with(saves));
+            if in_saves && !m.configured {
+                continue;
+            }
+            let downloaded = m.local.is_some() && !in_saves;
+            let copied = !in_saves && copies.contains(&m.sig);
+            idx.push(i);
+            rows.push(solo_maps::SoloRow {
+                name: m.name.clone(),
+                detail: solo_maps::detail(
+                    in_saves || copied,
+                    downloaded,
+                    m.stored,
+                    &m.author,
+                    m.configured,
+                    m.plays,
+                ),
+                players: m.players,
+                can_play: m.local.is_some() || copied || m.stored,
+                can_download: !in_saves && !copied && (m.local.is_some() || m.stored),
+            });
+        }
+        self.solo_rows = (idx, rows);
+    }
+
+    fn solo_maps_screen(&mut self, input: &Input, size: (u32, u32)) {
+        use minelib_net::client::Cmd;
+        if self.accounts.maps_rev != self.solo_maps_seen {
+            self.solo_maps_seen = self.accounts.maps_rev;
+            self.refresh_solo_rows();
+        }
+        let time = self.time;
+        let logged = self.accounts.logged_in();
+        let busy = self.solo_map_pending.is_some();
+        let mut c = Ctx::new(&mut self.ui, input, size);
+        c.background();
+        let action = solo_maps::screen(
+            &mut c,
+            input,
+            &mut self.solo_maps,
+            &self.solo_rows.1,
+            self.fps_status.as_deref(),
+            logged,
+            busy,
+            time,
+        );
+        match action {
+            solo_maps::SoloMapsAction::None => {}
+            solo_maps::SoloMapsAction::Back => {
+                self.refresh_worlds();
+                self.screen = Screen::Solo;
+            }
+            solo_maps::SoloMapsAction::Poll => self.accounts.room(Cmd::Maps),
+            solo_maps::SoloMapsAction::Refresh => {
+                self.sig_cache = fpsmap::SigCache::default();
+                self.open_solo_maps();
+            }
+            solo_maps::SoloMapsAction::Play(k) => {
+                if let Some(&i) = self.solo_rows.0.get(k) {
+                    self.solo_map_go(i, true);
+                }
+            }
+            solo_maps::SoloMapsAction::Download(k) => {
+                if let Some(&i) = self.solo_rows.0.get(k) {
+                    self.solo_map_go(i, false);
+                }
+            }
+        }
+    }
+
+    /// (v232) Carte `i` de `map_rows` : jouée contre des bots (`play`) ou copiée dans ses
+    /// mondes. Du relais : téléchargée d'abord (suite dans `Event::MapDownloaded`).
+    fn solo_map_go(&mut self, i: usize, play: bool) {
+        use minelib_net::client::Cmd;
+        let Some(m) = self.map_rows.get(i).cloned() else {
+            return;
+        };
+        let saves = self.paths.saves.clone();
+        let mine = m
+            .local
+            .clone()
+            .filter(|d| d.starts_with(&saves))
+            .or_else(|| fpsmap::solo_copy(&saves, &m.sig));
+        if let Some(dir) = mine {
+            if play {
+                self.play_vs_bots(dir);
+            } else {
+                self.fps_status = Some(format!("« {} » est déjà dans tes mondes.", m.name));
+            }
+            return;
+        }
+        if let Some(src) = &m.local {
+            self.solo_map_copied(src, &m.name, &m.sig, play);
+            return;
+        }
+        if !self.accounts.logged_in() {
+            self.fps_status = Some("Connecte-toi pour télécharger les cartes du relais.".into());
+            return;
+        }
+        if !m.stored {
+            self.fps_status = Some("Cette carte est encore en cours d'envoi au relais.".into());
+            return;
+        }
+        self.solo_map_pending = Some((m.sig, m.name.clone(), play));
+        self.fps_status = Some("Téléchargement de la carte…".into());
+        self.accounts.room(Cmd::DownloadMap(m.sig));
+    }
+
+    /// (v232) Carte téléchargée (`src`, dans `maps`) : copiée dans ses mondes, puis jouée
+    /// contre des bots (`play`).
+    fn solo_map_copied(&mut self, src: &std::path::Path, name: &str, sig: &[u8; 32], play: bool) {
+        match fpsmap::copy_to_saves(src, &self.paths.saves, name, sig) {
+            Ok(dir) => {
+                log::info!("carte copiée dans {}", dir.display());
+                self.refresh_worlds();
+                self.refresh_solo_rows();
+                if play {
+                    self.play_vs_bots(dir);
+                } else {
+                    self.fps_status = Some(format!("« {name} » est maintenant dans tes mondes."));
+                }
+            }
+            Err(e) => self.fps_status = Some(format!("Copie impossible : {e:#}")),
+        }
+    }
+
+    /// (v232) Ouvre ce monde en mode FPS : partie contre des bots. Un monde qui n'était pas
+    /// en mode FPS garde le sien dans son fichier.
+    fn play_vs_bots(&mut self, dir: PathBuf) {
+        self.fps_status = None;
+        self.play(dir);
+        if let Some(s) = &mut self.session {
+            if s.game.mode != save::GameMode::Fps {
+                s.saved_mode = Some(s.game.mode);
+                s.set_mode(save::GameMode::Fps);
+            }
+        }
     }
 
     /// Écran FPS : classement et cartes à jour.
@@ -2372,7 +2568,9 @@ impl Game {
             self.selected_world.is_some(),
         );
         let new = c.button("Nouveau monde", cx + 80.0 * s, by, 150.0, true);
-        let back = c.button("Retour", cx, by + 24.0 * s, 150.0, true);
+        // (v232) Cartes FPS (de ce PC et du relais) : contre des bots.
+        let fps_maps = c.button("Cartes FPS", cx - 105.0 * s, by + 24.0 * s, 150.0, true);
+        let back = c.button("Retour", cx + 80.0 * s, by + 24.0 * s, 150.0, true);
 
         let mut launch = None;
         if let Some(k) = clicked {
@@ -2394,6 +2592,10 @@ impl Game {
             } else {
                 self.play(dir);
             }
+        }
+        if fps_maps {
+            self.open_solo_maps();
+            return;
         }
         if new {
             self.new_name = format!("Nouveau monde {}", self.worlds.len() + 1);
@@ -3990,6 +4192,7 @@ impl GameLoop for Game {
                 Screen::HostPick => self.host_pick_screen(input, size),
                 Screen::FpsHome => self.fps_home_screen(input, size),
                 Screen::Friends => self.friends_screen(input, size),
+                Screen::SoloMaps => self.solo_maps_screen(input, size),
                 Screen::Playing | Screen::Paused => self.screen = Screen::Title,
             }
             self.draw_message(size, dt);

@@ -453,6 +453,9 @@ pub struct Session {
     remote_crowds: HashMap<String, crate::crowd::RemoteCrowd>,
     /// (v231) `/amis` vient d'être tapé : la liste reçue va dans le tchat.
     pub friends_said: bool,
+    /// (v232) Monde ouvert en mode FPS par « Cartes FPS → Jouer contre des bots » : le mode
+    /// qu'il avait, enregistré à sa place (il le retrouve en l'ouvrant depuis « Mondes »).
+    pub saved_mode: Option<GameMode>,
     /// (v200, essai) Joueurs et objets reflétés dans l'eau sans raytracing (`/npc reflets
     /// on|off`, allumé par défaut), et l'eau qu'on voit (cherchée toutes les quelques
     /// images, pendant le rendu).
@@ -787,6 +790,7 @@ impl Session {
             crowd_probe: None,
             remote_crowds: HashMap::new(),
             friends_said: false,
+            saved_mode: None,
             water_mirror_on: true,
             seen_water: Default::default(),
             pseudo: String::new(),
@@ -904,8 +908,12 @@ impl Session {
         let mut inv = Inventory::empty();
         inv.slots = self.inventory.slots;
         inv.selected = self.inventory.selected;
+        let mut game = self.game;
+        if let Some(m) = self.saved_mode {
+            game.mode = m;
+        }
         let data = SaveData {
-            game: self.game,
+            game,
             generator: self.world.generator,
             meta: self.meta.clone(),
             player: Some(PlayerState {
@@ -4825,6 +4833,10 @@ impl Session {
 
     /// Change le mode de jeu du joueur.
     pub fn set_mode(&mut self, mode: GameMode) {
+        // (v232) Un mode choisi en jeu (autre que FPS) est celui que le monde garde.
+        if mode != GameMode::Fps && mode != GameMode::Spectator {
+            self.saved_mode = None;
+        }
         // (v172) Mode FPS en solo : partie contre des bots (lancée à l'image suivante) ;
         // on la quitte en changeant de mode. (v174) Sauf en spectateur : on la regarde,
         // les bots continuent entre eux, et on y revient en repassant en mode FPS (à la

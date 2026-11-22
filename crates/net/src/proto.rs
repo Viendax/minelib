@@ -689,9 +689,10 @@ pub enum Request {
         signer: [u8; 32],
         token: [u8; 32],
     },
-    /// (v231) Invite un ami en ligne (sur ce relais) dans le monde de construction où l'on
-    /// est : il en est prévenu (`Response::Invited`) et peut le rejoindre. Seulement quelqu'un
-    /// de sa liste d'amis, qui n'est pas invisible.
+    /// (v231) Invite un ami (dans les deux sens) dans le monde de construction où l'on est : il
+    /// en est prévenu (`Response::Invited`) et peut le rejoindre. (v232) Hors ligne ou
+    /// invisible : l'invitation l'attend (deux heures au plus, si le monde est encore ouvert),
+    /// donnée quand il demande sa liste d'amis (à sa connexion).
     Invite {
         pseudo: String,
     },
