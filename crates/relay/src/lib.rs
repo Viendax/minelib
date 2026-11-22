@@ -33,7 +33,7 @@ use minelib_net::proto::{self, ErrorCode, Request, Response};
 use minelib_net::transport;
 #[cfg(test)]
 use minelib_net::transport::Inbound;
-use minelib_net::{crypto, game, sovereign, totp};
+use minelib_net::{crypto, game, passkey, sovereign, totp};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -968,6 +968,8 @@ struct Conn {
     /// (v231) Invisible pour ses amis (`Request::Presence`) : hors ligne pour eux, pas
     /// d'invitations.
     hidden_presence: bool,
+    /// (v240) Dernier défi donné pour une connexion par clé d'accès, et quand.
+    passkey_challenge: Option<([u8; 32], Instant)>,
     /// (v231) Invitations envoyées et demandes d'ami poussées dans la minute en cours
     /// (`INVITE_RATE`).
     invite_rate: (Instant, u32),
@@ -1022,6 +1024,7 @@ impl Conn {
             crowd_rate: (Instant::now(), 0),
             crowd_hit_rate: (Instant::now(), 0),
             hidden_presence: false,
+            passkey_challenge: None,
             invite_rate: (Instant::now(), 0),
             edit_rate: (Instant::now(), 0),
             fluid_rate: (Instant::now(), 0),
@@ -8428,6 +8431,160 @@ fn handle_account(
             }
             Response::Welcome { pseudo, totp }
         }
+        // (v240) Clés d'accès : défi, connexion.
+        Request::PasskeyChallenge => {
+            let mut challenge = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut challenge);
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.passkey_challenge = Some((challenge, Instant::now()));
+            }
+            Response::PasskeyChallenge { challenge }
+        }
+        Request::PasskeyLogin {
+            pseudo,
+            id: key_id,
+            authenticator_data,
+            signature,
+            hw,
+        } => {
+            let mut keys = vec![format!("pseudo:{}", pseudo.to_ascii_lowercase())];
+            if peer != "127.0.0.1" && peer != "::1" {
+                keys.push(format!("ip:{peer}"));
+            }
+            if let Some(wait) = keys.iter().filter_map(|k| st.limits.wait(k)).max() {
+                return err(
+                    ErrorCode::TooManyAttempts,
+                    format!("Réessaie dans {wait} s."),
+                );
+            }
+            // Le défi ne sert qu'une fois, deux minutes au plus.
+            let challenge = st
+                .conns
+                .get_mut(&id)
+                .and_then(|c| c.passkey_challenge.take())
+                .filter(|(_, t)| t.elapsed() < Duration::from_secs(120))
+                .map(|(ch, _)| ch);
+            let record = st.accounts.load(&pseudo);
+            let checked = challenge.zip(record).and_then(|(ch, mut r)| {
+                let i = r.passkeys.iter().position(|k| k.id == key_id)?;
+                let key = passkey::CoseKey::from_bytes(&r.passkeys[i].key)?;
+                let count = passkey::check_assertion(
+                    &key,
+                    r.passkeys[i].count,
+                    &authenticator_data,
+                    &ch,
+                    &signature,
+                )
+                .map_err(|e| log::info!("clé d'accès de « {pseudo} » refusée : {e}"))
+                .ok()?;
+                r.passkeys[i].count = count;
+                r.passkeys[i].used = hardware::now();
+                Some((r, i))
+            });
+            let Some((record, i)) = checked else {
+                for k in &keys {
+                    st.limits.failed(k);
+                }
+                return err(
+                    ErrorCode::Refused,
+                    "Clé d'accès refusée : inconnue de ce relais, ou retirée du compte.",
+                );
+            };
+            if st.registry.is_banned(&record.pubkey) {
+                return err(ErrorCode::Banned, "(à vie)");
+            }
+            if let Some(until) = st.hardware.banned_until(&hw) {
+                let days = until.saturating_sub(hardware::now()).div_ceil(86_400);
+                return err(
+                    ErrorCode::Banned,
+                    format!("Cette machine est bannie encore {days} jour(s)."),
+                );
+            }
+            if let Some(c) = st.conns.get_mut(&id) {
+                c.hw = hw.clone();
+            }
+            st.hardware.seen(&record.pseudo, hw);
+            let mut record = record;
+            // Clé vérifiée (utilisateur compris) : appareil de confiance, sans 2FA.
+            let device = record.trust_new_device();
+            if let Err(e) = st.accounts.save(&record) {
+                return err(ErrorCode::Internal, format!("{e:#}"));
+            }
+            for k in &keys {
+                st.limits.succeeded(k);
+            }
+            log::info!("« {} » : clé d'accès vérifiée", record.pseudo);
+            Response::PasskeyOk {
+                vault: record.passkeys[i].vault.clone(),
+                device,
+            }
+        }
+        // (v240) Clés d'accès du compte connecté : en ajouter, les voir, en retirer.
+        Request::PasskeyAdd { .. } | Request::PasskeyList | Request::PasskeyRemove { .. } => {
+            let Session::LoggedIn { pseudo } = &*session else {
+                return err(ErrorCode::NotLoggedIn, "");
+            };
+            let Some(mut record) = st.accounts.load(pseudo) else {
+                return err(ErrorCode::NotLoggedIn, "");
+            };
+            match req {
+                Request::PasskeyAdd {
+                    id: key_id,
+                    authenticator_data,
+                    vault,
+                    name,
+                } => {
+                    let (key, count) = match passkey::check_creation(&authenticator_data, &key_id) {
+                        Ok(k) => k,
+                        Err(e) => return err(ErrorCode::Refused, format!("Clé d'accès : {e}.")),
+                    };
+                    if vault.len() > 256 {
+                        return err(ErrorCode::Refused, "Clé d'accès : coffre trop grand.");
+                    }
+                    record.passkeys.retain(|k| k.id != key_id);
+                    if record.passkeys.len() >= accounts::PASSKEYS_MAX {
+                        return err(
+                            ErrorCode::Refused,
+                            format!("{} clés d'accès au plus.", accounts::PASSKEYS_MAX),
+                        );
+                    }
+                    let name: String = name
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(40)
+                        .collect();
+                    record.passkeys.push(accounts::Passkey {
+                        id: key_id,
+                        key: key.to_bytes(),
+                        count,
+                        vault,
+                        name,
+                        created: hardware::now(),
+                        used: 0,
+                    });
+                    log::info!("« {pseudo} » : nouvelle clé d'accès");
+                }
+                Request::PasskeyRemove { id: key_id } => {
+                    record.passkeys.retain(|k| k.id != key_id);
+                }
+                _ => {}
+            }
+            if let Err(e) = st.accounts.save(&record) {
+                return err(ErrorCode::Internal, format!("{e:#}"));
+            }
+            Response::Passkeys {
+                list: record
+                    .passkeys
+                    .iter()
+                    .map(|k| proto::PasskeyInfo {
+                        id: k.id.clone(),
+                        name: k.name.clone(),
+                        created: k.created,
+                        used: k.used,
+                    })
+                    .collect(),
+            }
+        }
         Request::TotpBegin | Request::TotpConfirm { .. } | Request::TotpDisable { .. } => {
             let Session::LoggedIn { pseudo } = &*session else {
                 return err(ErrorCode::NotLoggedIn, "");
@@ -9233,6 +9390,120 @@ mod tests {
         let reg = Registry::open(&dir.join("registry.log"), signer).unwrap();
         assert!(reg.lookup("VIENDAX").is_some());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v240) Clé d'accès : créée par le compte connecté (son coffre : les clés du compte),
+    /// puis connexion sur une nouvelle connexion : défi, signature, coffre rendu et appareil de
+    /// confiance (pas de 2FA), connexion avec les clés du compte. Refusées : une signature
+    /// rejouée, celle d'un autre défi, une clé retirée.
+    #[test]
+    fn a_passkey_signs_in_without_the_password_nor_2fa() {
+        use minelib_net::passkey::{self, SoftKey};
+        let dir = std::env::temp_dir().join(format!("minelib-cle-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let c = Client::spawn(addr.clone(), Some(h.public));
+        c.send(Cmd::Register {
+            pseudo: "Viendax".into(),
+            password: "motdepasse1".into(),
+        });
+        wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+        // 2FA activée : la clé d'accès s'en passe.
+        c.send(Cmd::TotpBegin);
+        let secret = match wait(&c, |e| matches!(e, Event::TotpSecret { .. })) {
+            Event::TotpSecret { secret, .. } => secret,
+            _ => unreachable!(),
+        };
+        c.send(Cmd::TotpConfirm(totp::code(&secret, totp::now_step())));
+        wait(&c, |e| matches!(e, Event::TotpOn));
+        let keys = crypto::derive("Viendax", "motdepasse1").unwrap();
+        let vault_key = [9u8; 32];
+        let (mut soft, created) = SoftKey::create(&passkey::user_handle(&vault_key, "Viendax"));
+        // Une création pour un autre « site » est refusée.
+        let mut other = created.clone();
+        other[0] ^= 1;
+        c.send(Cmd::PasskeyAdd {
+            id: soft.id.clone(),
+            authenticator_data: other,
+            vault: vec![1; 64],
+            name: "PC".into(),
+        });
+        assert!(wait_error(&c).contains("site"));
+        c.send(Cmd::PasskeyAdd {
+            id: soft.id.clone(),
+            authenticator_data: created,
+            vault: crypto::seal(&vault_key, &crypto::keys_to_bytes(&keys)),
+            name: "PC de Viendax".into(),
+        });
+        match wait(&c, |e| matches!(e, Event::Passkeys(_))) {
+            Event::Passkeys(l) => {
+                assert_eq!(l.len(), 1);
+                assert_eq!(l[0].name, "PC de Viendax");
+            }
+            _ => unreachable!(),
+        }
+        // Connexion par la clé, sur une autre connexion.
+        let signin = |soft: &mut SoftKey| {
+            let c2 = Client::spawn(addr.clone(), Some(h.public));
+            c2.send(Cmd::PasskeyChallenge);
+            let ch = match wait(&c2, |e| matches!(e, Event::PasskeyChallenge(_))) {
+                Event::PasskeyChallenge(ch) => ch,
+                _ => unreachable!(),
+            };
+            let (ad, sig) = soft.sign(&ch);
+            c2.send(Cmd::PasskeyLogin {
+                pseudo: "Viendax".into(),
+                id: soft.id.clone(),
+                authenticator_data: ad.clone(),
+                signature: sig.clone(),
+            });
+            (c2, ad, sig)
+        };
+        let (c2, ad, sig) = signin(&mut soft);
+        let (vault, device) = match wait(&c2, |e| matches!(e, Event::PasskeyOk { .. })) {
+            Event::PasskeyOk { vault, device, .. } => (vault, device),
+            _ => unreachable!(),
+        };
+        let got = crypto::keys_from_bytes(&crypto::open(&vault_key, &vault).unwrap()).unwrap();
+        assert_eq!((got.auth, got.enc), (keys.auth, keys.enc));
+        c2.send(Cmd::Login {
+            pseudo: "Viendax".into(),
+            password: crypto::keys_as_password(&got),
+            totp: None,
+            backup: None,
+            device: Some(device),
+        });
+        match wait(&c2, |e| matches!(e, Event::LoggedIn { .. } | Event::NeedTotp)) {
+            Event::LoggedIn { pseudo, .. } => assert_eq!(pseudo, "Viendax"),
+            e => panic!("pas de 2FA après une clé d'accès : {e:?}"),
+        }
+        // La même signature (défi déjà servi, ou un autre) : refusée.
+        let c3 = Client::spawn(addr.clone(), Some(h.public));
+        c3.send(Cmd::PasskeyChallenge);
+        wait(&c3, |e| matches!(e, Event::PasskeyChallenge(_)));
+        c3.send(Cmd::PasskeyLogin {
+            pseudo: "Viendax".into(),
+            id: soft.id.clone(),
+            authenticator_data: ad,
+            signature: sig,
+        });
+        assert!(wait_error(&c3).contains("Clé d'accès refusée"));
+        // Retirée : refusée.
+        c.send(Cmd::PasskeyRemove(soft.id.clone()));
+        match wait(&c, |e| matches!(e, Event::Passkeys(_))) {
+            Event::Passkeys(l) => assert!(l.is_empty()),
+            _ => unreachable!(),
+        }
+        let (c4, _, _) = signin(&mut soft);
+        assert!(wait_error(&c4).contains("Clé d'accès refusée"));
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

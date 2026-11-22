@@ -2831,6 +2831,7 @@ dependencies = [
  "log",
  "postcard",
  "rand 0.8.8",
+ "ring",
  "serde",
  "sha1",
  "sha2 0.10.9",

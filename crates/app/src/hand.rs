@@ -1,8 +1,8 @@
 //! Main et objet tenu à la première personne : bras, bloc ou torche en 3D, balancement
 //! pendant la marche, geste quand on casse ou pose, objet qui remonte quand on en change.
 //! (v239) Un objet tenu en construction est dessiné dans la main du bras du modèle, comme en
-//! F5 (`item_mesh`, `player_model::held_item_matrix`) ; la main de ce module reste celle de la
-//! main vide et de la Foudre de Zeus.
+//! F5 (`item_mesh`, `player_model::held_item_matrix`) ; (v240) la Foudre de Zeus aussi (son
+//! éclair : `player_model::zeus_frame`). La main de ce module reste celle de la main vide.
 
 use glam::{Mat4, Vec3, Vec4};
 use minelib_render::{ArmVertex, VmVertex, FLAME, NO_TEXTURE};
@@ -23,12 +23,6 @@ const ARM_THICK: f32 = ARM_LEN * crate::player_model::ARM_RATIO;
 /// (v222) Base du bras (le bout de l'épaule, en bas à droite de l'écran) : le coup vers le
 /// bas tourne autour d'elle.
 const ARM_BASE: Vec3 = Vec3::new(ARM_FIST.x, ARM_FIST.y, ARM_FIST.z + ARM_LEN);
-
-/// (v235) Foudre de Zeus : le bras se lève de cet angle (rad) autour de sa base, pour que
-/// le poing monte vers le milieu de l'écran. L'éclair, tenu par son milieu, se voit ainsi
-/// au-dessus et au-dessous du poing (le bras tendu vers le bas de l'écran, sa moitié basse
-/// sortait de l'image : il semblait posé sur la main).
-const ZEUS_RAISE: f32 = 0.61;
 
 /// (v220) Geste de la main en cassant un bloc : un petit coup vers le bas, qui revient vite.
 /// En créatif, un coup par bloc cassé (`DIP_S`) ; en survie, tant qu'on casse, des coups en
@@ -86,17 +80,6 @@ pub fn block_rotation() -> Mat4 {
 /// Torche tenue.
 pub fn torch_rotation() -> Mat4 {
     Mat4::from_rotation_y(0.4) * Mat4::from_rotation_x(0.2)
-}
-
-/// (v216) Foudre de Zeus : l'éclair (le long de +y dans son repère). (v217) Tenu droit,
-/// debout dans le poing (il penchait vers l'avant et l'intérieur).
-pub fn zeus_rotation() -> Mat4 {
-    Mat4::IDENTITY
-}
-
-/// Projection de la main et de l'objet tenu à la première personne.
-pub fn hand_proj(aspect: f32) -> Mat4 {
-    Mat4::perspective_infinite_reverse_rh(HAND_FOV.to_radians(), aspect, 0.01)
 }
 
 /// Baguette de WorldEdit (tenue droite).
@@ -552,40 +535,8 @@ impl Hand {
         let bob =
             Vec3::new(self.bob.sin() * 0.025, -(self.bob.cos().abs()) * 0.03, 0.0) * self.bob_amp;
         self.dip_view()
-            * Mat4::from_translation(ARM_BASE)
-            * Mat4::from_rotation_x(self.zeus_raise())
-            * Mat4::from_translation(-ARM_BASE)
             * Mat4::from_translation(bob + Vec3::new(0.0, -0.35 * self.equip - 0.12 * s, -0.12 * s))
             * Mat4::from_rotation_x(-0.6 * s)
-    }
-
-    /// (v216) Repère de la Foudre de Zeus tenue, dans la vue (x à droite, y en haut, −z
-    /// devant) : le poing à l'origine, l'éclair le long de +y. Elle suit les gestes de la
-    /// main (balancement de la marche, coup).
-    pub fn zeus_frame(&self) -> Mat4 {
-        // (v235) Le bras est levé, l'éclair reste droit : au bout du poing, tenu par son
-        // milieu.
-        self.base()
-            * Mat4::from_translation(ARM_FIST)
-            * Mat4::from_rotation_x(-self.zeus_raise())
-            * zeus_rotation()
-    }
-
-    /// (v235) De combien le bras est levé (rad) : avec la Foudre de Zeus en main.
-    fn zeus_raise(&self) -> f32 {
-        if matches!(self.last, Some(Item::Zeus)) {
-            ZEUS_RAISE
-        } else {
-            0.0
-        }
-    }
-
-    /// (v217) Rapport entre l'angle de vue de la main (fixe) et celui du monde
-    /// (`fov_deg`) : un point de la vue de la main (x, y multipliés par ce rapport) tombe
-    /// au même endroit de l'écran dans la vue du monde. La foudre qui part de la pointe de
-    /// l'éclair tenu part ainsi de là où on le voit.
-    pub fn to_world_view(fov_deg: f32) -> f32 {
-        (fov_deg.to_radians() * 0.5).tan() / (HAND_FOV.to_radians() * 0.5).tan()
     }
 
     /// Bras droit à la première personne, tel que le modèle du joueur le montre en F5 :

@@ -1964,6 +1964,42 @@ mod tests {
         }
     }
 
+    /// (v240) La Foudre de Zeus à la première personne est l'éclair du modèle (`zeus_frame`,
+    /// comme en F5) : debout au bout du bras levé, à droite, on en voit une bonne partie, le
+    /// regard un peu en bas, droit devant ou un peu en haut.
+    #[test]
+    fn the_held_bolt_is_seen_in_first_person() {
+        let half = (crate::session::FOV.to_radians() * 0.5).tan();
+        for pitch in [-0.4f32, 0.0, 0.3] {
+            let pose = Pose {
+                feet: Vec3::new(2.0, 64.0, -1.0),
+                yaw: 2.2,
+                pitch,
+                walk: 0.0,
+                swing: 0.0,
+                crouch: 0.0,
+                light: [1.0; 3],
+                held: Some(Held::Zeus),
+                skin: None,
+            };
+            let eye = crate::session::eye_of(pose.feet, 0.0);
+            let view = (Mat4::from_translation(eye)
+                * Mat4::from_rotation_y(-pose.yaw)
+                * Mat4::from_rotation_x(pitch))
+            .inverse();
+            let bolt = view * zeus_frame(&pose).unwrap();
+            let len = crate::lightning::HELD_LEN;
+            let seen = (0..=8)
+                .map(|k| bolt.transform_point3(Vec3::Y * len * (k as f32 / 8.0 - 0.5)))
+                .filter(|p| {
+                    let (x, y) = (p.x / -p.z / (half * 16.0 / 9.0), p.y / -p.z / half);
+                    p.z < -0.1 && x.abs() <= 1.0 && y.abs() <= 1.0 && x > 0.1
+                })
+                .count();
+            assert!(seen >= 3, "regard {pitch} : {seen} points de l'éclair à l'écran");
+        }
+    }
+
     /// (v225) Les proportions du modèle (de CS2), et le bras levé de la Foudre de Zeus, sont
     /// les mêmes dans le shader des autres joueurs (`part_matrix` de players.wgsl).
     #[test]

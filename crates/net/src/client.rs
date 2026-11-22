@@ -190,6 +190,26 @@ pub enum Cmd {
     Presence(bool),
     /// (v231) Refuse la demande d'ami de ce joueur.
     FriendDecline(String),
+    /// (v240) Défi pour une connexion par clé d'accès (nouvelle connexion au relais) :
+    /// `Event::PasskeyChallenge`.
+    PasskeyChallenge,
+    /// (v240) Clé d'accès signée (sur la connexion du défi) : `Event::PasskeyOk`.
+    PasskeyLogin {
+        pseudo: String,
+        id: Vec<u8>,
+        authenticator_data: Vec<u8>,
+        signature: Vec<u8>,
+    },
+    /// (v240) Compte connecté : nouvelle clé d'accès, ses clés, en retirer une
+    /// (`Event::Passkeys`).
+    PasskeyAdd {
+        id: Vec<u8>,
+        authenticator_data: Vec<u8>,
+        vault: Vec<u8>,
+        name: String,
+    },
+    PasskeyList,
+    PasskeyRemove(Vec<u8>),
     /// Lobby (`proto::PARTY_*`).
     Party {
         action: u8,
@@ -339,6 +359,17 @@ pub enum Event {
     },
     /// (v231) Invitation envoyée à ce joueur.
     InviteSent(String),
+    /// (v240) Défi à faire signer par une clé d'accès.
+    PasskeyChallenge([u8; 32]),
+    /// (v240) Clé d'accès vérifiée par le relais : son coffre (les clés du compte), et un
+    /// jeton d'appareil de confiance.
+    PasskeyOk {
+        pseudo: String,
+        vault: Vec<u8>,
+        device: [u8; 32],
+    },
+    /// (v240) Clés d'accès du compte.
+    Passkeys(Vec<crate::proto::PasskeyInfo>),
     PartyInvite(String),
     Skin {
         pseudo: String,
@@ -1359,7 +1390,12 @@ impl Worker {
                 // Les clés du compte se calculent (une seconde environ) pendant qu'on
                 // cherche le relais et qu'on s'y connecte.
                 let (p, w) = (pseudo.clone(), password.clone());
-                let deriving = std::thread::spawn(move || crypto::derive(&p, &w));
+                // (v240) Clés du compte gardées à la place du mot de passe (clé d'accès) :
+                // rien à calculer.
+                let deriving = std::thread::spawn(move || match crypto::keys_from_password(&w) {
+                    Some(k) => Ok(k),
+                    None => crypto::derive(&p, &w),
+                });
                 self.connect()?;
                 self.emit(Event::Progress("Vérification du mot de passe…"));
                 let keys = deriving
@@ -1610,6 +1646,66 @@ impl Worker {
                 let r = self.request(&Request::FriendDecline { pseudo })?;
                 self.friends_answer(r)
             }
+            Cmd::PasskeyChallenge => {
+                self.chan = None;
+                self.connect()?;
+                match self.request(&Request::PasskeyChallenge)? {
+                    Response::PasskeyChallenge { challenge } => {
+                        self.emit(Event::PasskeyChallenge(challenge));
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
+            }
+            Cmd::PasskeyLogin {
+                pseudo,
+                id,
+                authenticator_data,
+                signature,
+            } => {
+                self.emit(Event::Progress("Vérification de la clé d'accès…"));
+                let hw = crate::hw::fingerprints_for(&self.relay_pub);
+                let r = self.request(&Request::PasskeyLogin {
+                    pseudo: pseudo.clone(),
+                    id,
+                    authenticator_data,
+                    signature,
+                    hw,
+                })?;
+                match r {
+                    Response::PasskeyOk { vault, device } => {
+                        self.emit(Event::PasskeyOk {
+                            pseudo,
+                            vault,
+                            device,
+                        });
+                        Ok(())
+                    }
+                    r => self.unexpected(r),
+                }
+            }
+            Cmd::PasskeyAdd {
+                id,
+                authenticator_data,
+                vault,
+                name,
+            } => {
+                let r = self.request(&Request::PasskeyAdd {
+                    id,
+                    authenticator_data,
+                    vault,
+                    name,
+                })?;
+                self.passkeys_answer(r)
+            }
+            Cmd::PasskeyList => {
+                let r = self.request(&Request::PasskeyList)?;
+                self.passkeys_answer(r)
+            }
+            Cmd::PasskeyRemove(id) => {
+                let r = self.request(&Request::PasskeyRemove { id })?;
+                self.passkeys_answer(r)
+            }
             Cmd::Invite(pseudo) => match self.request(&Request::Invite {
                 pseudo: pseudo.clone(),
             })? {
@@ -1785,6 +1881,17 @@ impl Worker {
                 });
                 let _ = (map, map_sig);
                 self.emit(Event::TakenOver { room, host });
+                Ok(())
+            }
+            r => self.unexpected(r),
+        }
+    }
+
+    /// (v240) Clés d'accès du compte reçues.
+    fn passkeys_answer(&mut self, r: Response) -> Result<()> {
+        match r {
+            Response::Passkeys { list } => {
+                self.emit(Event::Passkeys(list));
                 Ok(())
             }
             r => self.unexpected(r),

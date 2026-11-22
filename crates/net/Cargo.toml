@@ -17,4 +17,6 @@ hkdf = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
 sha1 = "0.10"
+# (v240) Clés d'accès : vérification des signatures ES256 et RS256 (déjà dans le projet).
+ring = "0.17"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

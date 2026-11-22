@@ -310,6 +310,14 @@ pub struct Accounts {
     pub friend_requests: Vec<String>,
     pub new_requests: Vec<String>,
     requests_seen: HashSet<String>,
+    /// (v240) Clés d'accès du compte (page Compte, demandées en l'ouvrant), l'opération en
+    /// cours avec Windows (fil de fond), une connexion par clé voulue (en attente du défi),
+    /// et la clé du coffre de la clé donnée.
+    pub passkeys: Vec<proto::PasskeyInfo>,
+    passkeys_asked: bool,
+    passkey_job: Option<std::sync::mpsc::Receiver<crate::passkeys::Done>>,
+    passkey_login: bool,
+    passkey_key: Option<[u8; 32]>,
     /// Lobby : n° (0 : seul) et membres (l'hôte d'abord) ; invitations reçues.
     pub party: (u64, Vec<String>),
     pub invites: Vec<String>,
@@ -398,6 +406,11 @@ impl Accounts {
             friend_requests: Vec::new(),
             new_requests: Vec::new(),
             requests_seen: HashSet::new(),
+            passkeys: Vec::new(),
+            passkeys_asked: false,
+            passkey_job: None,
+            passkey_login: false,
+            passkey_key: None,
             party: (0, Vec::new()),
             invites: Vec::new(),
             maps_rev: 0,
@@ -596,6 +609,7 @@ impl Accounts {
     }
 
     pub fn poll(&mut self) {
+        self.passkey_upkeep();
         if !self.auto_tried {
             self.auto_tried = true;
             if self.account.is_none() && self.client.is_none() {
@@ -820,6 +834,30 @@ impl Accounts {
                     self.busy = None;
                     self.servers = list;
                 }
+                // (v240) Clés d'accès : défi reçu (connexion), clé vérifiée par le relais
+                // (on se connecte avec les clés du compte de son coffre), clés du compte.
+                Event::PasskeyChallenge(challenge) => {
+                    if self.passkey_login {
+                        self.passkey_login = false;
+                        self.busy = Some("Clé d'accès : réponds à la fenêtre de Windows…".into());
+                        self.passkey_job = Some(crate::passkeys::start_get(challenge));
+                    }
+                }
+                Event::PasskeyOk {
+                    pseudo,
+                    vault,
+                    device,
+                } => self.passkey_verified(pseudo, &vault, device),
+                Event::Passkeys(list) => {
+                    if self.busy.is_some() && list.len() > self.passkeys.len() {
+                        self.info = Some(
+                            "Clé d'accès ajoutée : « Se connecter » → « Avec une clé d'accès »."
+                                .into(),
+                        );
+                    }
+                    self.busy = None;
+                    self.passkeys = list;
+                }
                 Event::LoggedOut => {
                     self.busy = None;
                     self.account = None;
@@ -888,6 +926,8 @@ impl Accounts {
                 }
                 Event::Error(m) => {
                     go_home |= self.join_after_login.take().is_some();
+                    self.passkey_login = false;
+                    self.passkey_key = None;
                     self.busy = None;
                     self.sent = None;
                     self.auto_pending = false;
@@ -1167,9 +1207,117 @@ impl Accounts {
         }
     }
 
+    /// (v240) Connexion par une clé d'accès : un défi du relais d'abord (suite :
+    /// `Event::PasskeyChallenge`, puis la fenêtre de Windows dans un fil de fond).
+    fn passkey_login_start(&mut self) {
+        self.passkey_login = true;
+        self.passkey_key = None;
+        self.send(Cmd::PasskeyChallenge);
+    }
+
+    /// (v240) Nouvelle clé d'accès pour le compte connecté (fenêtre de Windows, dans un fil
+    /// de fond ; suite dans `passkey_upkeep`).
+    fn passkey_add_start(&mut self) {
+        let (Some(a), Some((_, password))) = (self.account.clone(), self.login_secret.clone())
+        else {
+            self.error = Some("Reconnecte-toi avec ton mot de passe d'abord.".into());
+            return;
+        };
+        self.error = None;
+        self.info = None;
+        self.busy = Some("Clé d'accès : réponds à la fenêtre de Windows…".into());
+        self.passkey_job = Some(crate::passkeys::start_create(a.pseudo, password));
+    }
+
+    /// (v240) Réponse de la fenêtre de Windows (fil de fond).
+    fn passkey_upkeep(&mut self) {
+        let Some(rx) = &self.passkey_job else {
+            return;
+        };
+        let done = match rx.try_recv() {
+            Ok(d) => d,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.passkey_job = None;
+                self.busy = None;
+                return;
+            }
+        };
+        self.passkey_job = None;
+        match done {
+            crate::passkeys::Done::Created {
+                result: Ok(c),
+                key,
+                keys,
+            } => {
+                self.busy = Some("Enregistrement de la clé d'accès…".into());
+                self.client().send(Cmd::PasskeyAdd {
+                    id: c.id,
+                    authenticator_data: c.authenticator_data,
+                    vault: crypto::seal(&key, &keys),
+                    name: crate::passkeys::new_name(),
+                });
+            }
+            crate::passkeys::Done::Got(Ok(a)) => {
+                match minelib_net::passkey::parse_user_handle(&a.user_handle) {
+                    Some((key, pseudo)) => {
+                        self.passkey_key = Some(key);
+                        self.pseudo = pseudo.clone();
+                        self.busy = Some("Vérification de la clé d'accès…".into());
+                        self.client().send(Cmd::PasskeyLogin {
+                            pseudo,
+                            id: a.id,
+                            authenticator_data: a.authenticator_data,
+                            signature: a.signature,
+                        });
+                    }
+                    None => {
+                        self.busy = None;
+                        self.error = Some("Cette clé d'accès n'est pas une clé de Minelib.".into());
+                    }
+                }
+            }
+            crate::passkeys::Done::Created { result: Err(e), .. }
+            | crate::passkeys::Done::Got(Err(e)) => {
+                self.busy = None;
+                self.error = Some(e);
+            }
+        }
+    }
+
+    /// (v240) Clé d'accès vérifiée par le relais : son coffre donne les clés du compte, avec
+    /// lesquelles on se connecte (comme avec le mot de passe, gardées pour la suite) ; ce PC
+    /// est de confiance (pas de 2FA).
+    fn passkey_verified(&mut self, pseudo: String, vault: &[u8], device: [u8; 32]) {
+        let keys = self
+            .passkey_key
+            .take()
+            .and_then(|k| crypto::open(&k, vault).ok())
+            .and_then(|raw| crypto::keys_from_bytes(&raw));
+        let Some(keys) = keys else {
+            self.busy = None;
+            self.error = Some("Coffre de la clé d'accès illisible.".into());
+            return;
+        };
+        self.keep_device(&pseudo, &device);
+        let password = crypto::keys_as_password(&keys);
+        let backup = std::fs::read(self.backup_path(&pseudo)).ok();
+        self.sent = Some((pseudo.clone(), password.clone()));
+        self.pseudo = pseudo.clone();
+        self.send(Cmd::Login {
+            pseudo,
+            password,
+            totp: None,
+            backup,
+            device: Some(device),
+        });
+    }
+
     /// (v231) Déconnexion voulue : rien des amis de ce compte ne reste (un autre compte peut se
     /// connecter ensuite).
     fn forget_friends(&mut self) {
+        self.passkeys.clear();
+        self.passkeys_asked = false;
         self.friends.clear();
         self.friend_places.clear();
         self.world_invites.clear();
@@ -1618,6 +1766,13 @@ impl Accounts {
             "Créer le compte"
         };
         let go = c.button(label, cx - 80.0 * s, by, 150.0, ok);
+        // (v240) Connexion par une clé d'accès (pas de pseudo ni de mot de passe à taper).
+        if page == Page::Login
+            && crate::passkeys::available()
+            && c.button("Avec une clé d'accès", cx, y + 18.0 * s, 310.0, idle)
+        {
+            self.passkey_login_start();
+        }
         let back = c.button("Retour", cx + 80.0 * s, by, 150.0, true);
         if go || (ok && input.pressed(KeyCode::Enter)) {
             let pseudo = self.pseudo.trim().to_string();
@@ -1683,7 +1838,67 @@ impl Accounts {
         let toggle = c.button(toggle_label, cx, y, 310.0, idle);
         y += 24.0 * s;
         let logout = c.button("Se déconnecter", cx, y, 310.0, idle);
+        // (v240) Clés d'accès : les voir, en ajouter, en retirer.
+        if !self.passkeys_asked {
+            self.passkeys_asked = true;
+            self.client().send(Cmd::PasskeyList);
+        }
+        y += 34.0 * s;
+        let ds = (s / 2.0).floor().max(1.0);
+        let n = self.passkeys.len();
+        let state = match n {
+            0 => "Clés d'accès : aucune".to_string(),
+            1 => "Clés d'accès : 1".to_string(),
+            n => format!("Clés d'accès : {n}"),
+        };
+        c.text_center(&state, y, s, if n > 0 { WHITE } else { GREY });
+        y += 14.0 * s;
+        let usable = crate::passkeys::available();
+        let can_add = usable && idle && self.login_secret.is_some();
+        let add = c.button("Ajouter une clé d'accès", cx, y, 310.0, can_add);
+        if !usable {
+            c.text_center(
+                "Clés d'accès : Windows 10 (1903) ou plus récent.",
+                y + 22.0 * s,
+                ds,
+                GREY,
+            );
+        } else if n == 0 {
+            c.text_center(
+                "Windows Hello (visage, empreinte, code PIN), une clé de sécurité ou ton téléphone.",
+                y + 22.0 * s,
+                ds,
+                GREY,
+            );
+        }
+        y += 32.0 * s;
+        let mut remove = None;
+        let w = 310.0 * s;
+        for (i, k) in self.passkeys.iter().enumerate() {
+            // Autant qu'il en tient au-dessus de « Retour ».
+            if y + 22.0 * s > c.h - 52.0 * s {
+                break;
+            }
+            let used = if k.used > 0 {
+                format!(" - dernière connexion le {}", crate::save::format_date(k.used))
+            } else {
+                String::new()
+            };
+            let t = crate::menu::fit(&format!("{}{used}", k.name), w - 30.0 * s, ds);
+            c.ui.text(cx - w / 2.0, y + 6.0 * s, ds, GREY, t);
+            if c.button("x", cx + w / 2.0 - 10.0 * s, y, 20.0, idle) {
+                remove = Some(i);
+            }
+            y += 22.0 * s;
+        }
         let back = c.button("Retour", cx, c.h - 48.0 * s, 200.0, true);
+        if add {
+            self.passkey_add_start();
+        }
+        if let Some(id) = remove.and_then(|i| self.passkeys.get(i)).map(|k| k.id.clone()) {
+            self.busy = Some("Clé d'accès retirée…".into());
+            self.client().send(Cmd::PasskeyRemove(id));
+        }
         if toggle {
             return Outcome::Goto(if a.totp {
                 Page::TotpDisable

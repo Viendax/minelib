@@ -5,6 +5,7 @@
 //! Les touches sont des **touches physiques** (`KeyCode`) : `KeyW` est la touche
 //! en haut à gauche du pavé de déplacement, c'est-à-dire Z sur un clavier AZERTY.
 
+pub mod passkey;
 pub mod sysmon;
 
 use std::collections::HashSet;

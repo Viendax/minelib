@@ -101,6 +101,7 @@ mod mcimport;
 mod menu;
 mod multiplayer;
 mod netgame;
+mod passkeys;
 mod player;
 mod player_model;
 mod province_host;

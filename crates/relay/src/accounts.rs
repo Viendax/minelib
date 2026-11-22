@@ -24,6 +24,42 @@ pub struct Account {
     /// Appareils de confiance (empreintes de leur jeton) : la 2FA ne leur est plus
     /// redemandée. Huit au plus, les plus récents.
     pub devices: Vec<[u8; 32]>,
+    /// (v240) Clés d'accès (`PASSKEYS_MAX` au plus).
+    pub passkeys: Vec<Passkey>,
+}
+
+/// (v240) Clés d'accès d'un compte, au plus.
+pub const PASSKEYS_MAX: usize = 10;
+
+/// (v240) Clé d'accès d'un compte.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Passkey {
+    /// Identifiant donné par l'authentificateur.
+    pub id: Vec<u8>,
+    /// Clé publique (`minelib_net::passkey::CoseKey::to_bytes`).
+    pub key: Vec<u8>,
+    /// Compteur de signatures de l'authentificateur (0 : il n'en tient pas).
+    pub count: u32,
+    /// La clé privée du compte, chiffrée par une clé que seul l'authentificateur garde
+    /// (dans l'identifiant d'utilisateur) : le relais ne peut pas l'ouvrir.
+    pub vault: Vec<u8>,
+    pub name: String,
+    pub created: u64,
+    pub used: u64,
+}
+
+/// Compte enregistré avant les clés d'accès (relu, puis réenregistré au nouveau format).
+#[derive(Deserialize)]
+struct AccountV2 {
+    pseudo: String,
+    pubkey: [u8; 32],
+    auth_hash: String,
+    vault: Vec<u8>,
+    totp: Option<Vec<u8>>,
+    totp_pending: Option<Vec<u8>>,
+    last_totp_step: u64,
+    created: u64,
+    devices: Vec<[u8; 32]>,
 }
 
 /// Compte enregistré avant les appareils de confiance (relu, puis réenregistré au nouveau
@@ -77,6 +113,7 @@ impl Account {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
             devices: Vec::new(),
+            passkeys: Vec::new(),
         })
     }
 }
@@ -124,20 +161,38 @@ impl Store {
 
     pub fn load(&self, pseudo: &str) -> Option<Account> {
         let bytes = std::fs::read(self.path(pseudo)).ok()?;
-        postcard::from_bytes(&bytes).ok().or_else(|| {
-            let o: AccountV1 = postcard::from_bytes(&bytes).ok()?;
-            Some(Account {
-                pseudo: o.pseudo,
-                pubkey: o.pubkey,
-                auth_hash: o.auth_hash,
-                vault: o.vault,
-                totp: o.totp,
-                totp_pending: o.totp_pending,
-                last_totp_step: o.last_totp_step,
-                created: o.created,
-                devices: Vec::new(),
+        postcard::from_bytes(&bytes)
+            .ok()
+            .or_else(|| {
+                let o: AccountV2 = postcard::from_bytes(&bytes).ok()?;
+                Some(Account {
+                    pseudo: o.pseudo,
+                    pubkey: o.pubkey,
+                    auth_hash: o.auth_hash,
+                    vault: o.vault,
+                    totp: o.totp,
+                    totp_pending: o.totp_pending,
+                    last_totp_step: o.last_totp_step,
+                    created: o.created,
+                    devices: o.devices,
+                    passkeys: Vec::new(),
+                })
             })
-        })
+            .or_else(|| {
+                let o: AccountV1 = postcard::from_bytes(&bytes).ok()?;
+                Some(Account {
+                    pseudo: o.pseudo,
+                    pubkey: o.pubkey,
+                    auth_hash: o.auth_hash,
+                    vault: o.vault,
+                    totp: o.totp,
+                    totp_pending: o.totp_pending,
+                    last_totp_step: o.last_totp_step,
+                    created: o.created,
+                    devices: Vec::new(),
+                    passkeys: Vec::new(),
+                })
+            })
     }
 
     pub fn save(&self, a: &Account) -> Result<()> {

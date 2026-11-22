@@ -4060,22 +4060,21 @@ impl Session {
         }
         // (v229) Sur un serveur de construction : les foudres que publient les arbitres.
         self.update_thor();
-        // L'éclair tenu : à la première personne, dessiné par-dessus la main (avec la
-        // projection de la main) ; vu de derrière (F5, caméra libre), dans le monde, au
-        // poing du modèle.
+        // L'éclair tenu : vu de derrière (F5, caméra libre), dans le monde, au poing du
+        // modèle. (v240) À la première personne aussi (« pareil, ceux du personnage, à la
+        // même place qu'en F5 ») : au poing du modèle, avec les gestes de la main, dessiné
+        // dans la passe de la main avec la projection du monde (le bras le cache, les murs
+        // non). Avant, la main de la première personne le tenait à sa place à elle.
         let on = self.holding_zeus();
         let third = if fps { 0 } else { self.perspective };
         if third == 0 && self.light_editor.free_cam.is_none() {
             let (_, view, _) = self.view_camera();
             let aspect = self.screen_size.0 / self.screen_size.1.max(1.0);
-            let proj = crate::hand::hand_proj(aspect);
-            let frame = self.hand.zeus_frame();
-            self.storm.hold(
-                dt,
-                view.inverse() * frame,
-                Some((proj * frame, proj * view)),
-                on,
-            );
+            let proj =
+                Mat4::perspective_infinite_reverse_rh(self.fov.to_radians(), aspect, 0.05);
+            let place = self.first_person_zeus(view);
+            self.storm
+                .hold(dt, place, Some((proj * view * place, proj * view)), on);
         } else {
             let pose = self.own_pose(crate::player_model::Held::Zeus);
             let place = crate::player_model::zeus_frame(&pose)
@@ -4305,9 +4304,8 @@ impl Session {
         }
     }
 
-    /// (v217) Pointe de l'éclair tenu, dans le monde, là où on la voit : à la première
-    /// personne, la main est dessinée avec son propre angle de vue, ramené à celui du
-    /// monde ; vu de derrière, au poing du modèle.
+    /// (v217) Pointe de l'éclair tenu, dans le monde, là où on la voit : au poing du modèle
+    /// ((v240) à la première personne aussi, avec les gestes de la main).
     fn zeus_tip(&self) -> Vec3 {
         let top = Vec3::Y * (crate::lightning::HELD_LEN * 0.5);
         let third = if self.game.mode == GameMode::Fps {
@@ -4317,10 +4315,7 @@ impl Session {
         };
         if third == 0 && self.light_editor.free_cam.is_none() {
             let (_, view, _) = self.view_camera();
-            let k = crate::hand::Hand::to_world_view(self.fov);
-            let p = self.hand.zeus_frame().transform_point3(top);
-            let to_world = view.inverse();
-            to_world.transform_point3(Vec3::new(p.x * k, p.y * k, p.z))
+            self.first_person_zeus(view).transform_point3(top)
         } else {
             let pose = self.own_pose(crate::player_model::Held::Zeus);
             crate::player_model::zeus_frame(&pose)
@@ -4407,6 +4402,34 @@ impl Session {
     }
 
     /// (v201) Pose du joueur qui tient `held`, pour placer la lumière de ce qu'il tient.
+    /// (v240) Le modèle à la première personne : sa pose (pieds remontés comme la caméra sur
+    /// une marche), et les gestes de la main (coup vers le bas, arc, objet qui remonte)
+    /// autour de l'épaule de son bras droit, dans le monde (`view` : vue de cette image).
+    /// L'objet tenu et le bras y sont dessinés comme en F5.
+    fn first_person_hold(
+        &self,
+        held: crate::player_model::Held,
+        view: Mat4,
+    ) -> (crate::player_model::Pose, Mat4) {
+        let mut p = self.own_pose(held);
+        p.feet += Vec3::Y * self.step_offset;
+        let gesture = crate::player_model::right_arm_matrix(&p).map_or(Mat4::IDENTITY, |arm| {
+            // L'épaule : le bout z = 1 de la boîte du bras.
+            let pivot = view.transform_point3(arm.transform_point3(Vec3::new(0.5, 0.5, 1.0)));
+            view.inverse() * self.hand.gesture_about(pivot) * view
+        });
+        (p, gesture)
+    }
+
+    /// (v240) Repère de l'éclair tenu à la première personne (monde) : au poing du modèle,
+    /// comme en F5, avec les gestes de la main.
+    fn first_person_zeus(&self, view: Mat4) -> Mat4 {
+        let (p, gesture) = self.first_person_hold(crate::player_model::Held::Zeus, view);
+        gesture
+            * crate::player_model::zeus_frame(&p)
+                .unwrap_or_else(|| Mat4::from_translation(self.player.eye()))
+    }
+
     fn own_pose(&self, held: crate::player_model::Held) -> crate::player_model::Pose {
         crate::player_model::Pose {
             feet: self.player.pos,
@@ -9027,8 +9050,9 @@ impl Session {
         // (v215) Lampe torche en main, à la première personne : la lampe et le bras du modèle
         // (pieds remontés comme la caméra sur une marche), dessinés dans la vue du monde.
         // (v239) Tout objet tenu en construction (bloc, tête, torche, baguette, écran) aussi :
-        // le bras du modèle et l'objet là où il le tient, comme en F5. Pas la Foudre de Zeus
-        // (bras levé de la main de la première personne, v235), ni la main vide.
+        // le bras du modèle et l'objet là où il le tient, comme en F5. (v240) La Foudre de
+        // Zeus aussi (son éclair est dessiné avec l'orage, au poing du modèle). Pas la main
+        // vide.
         let world_proj =
             Mat4::perspective_infinite_reverse_rh(fov.to_radians(), renderer.aspect(), 0.05);
         // (v220) Interface masquée (F1) : ni main ni objet tenu à la première personne.
@@ -9040,31 +9064,23 @@ impl Session {
             && self.game.mode != GameMode::Spectator
             && matches!(
                 pose.held,
-                Some(Held::Flashlight(_) | Held::Block(_) | Held::Torch(_) | Held::Wand(_))
+                Some(
+                    Held::Flashlight(_)
+                        | Held::Block(_)
+                        | Held::Torch(_)
+                        | Held::Wand(_)
+                        | Held::Zeus
+                )
             ))
         .then(|| {
-            let p = crate::player_model::Pose {
-                feet: pose.feet + Vec3::Y * self.step_offset,
-                yaw: pose.yaw,
-                pitch: pose.pitch,
-                walk: pose.walk,
-                swing: pose.swing,
-                crouch: pose.crouch,
-                light: pose.light,
-                held: pose.held,
-                skin: None,
-            };
-            let (lamp, arm) = (
-                crate::player_model::held_item_matrix(&p)?,
-                crate::player_model::right_arm_matrix(&p)?,
-            );
             // (v220) Le coup vers le bas de la main (bloc cassé). (v222) La lampe et le bras
             // tournent ensemble autour de l'épaule (la base du bras, bout z = 1 de sa
             // boîte), comme la main dessinée autour de la sienne : seul le bout descend.
             // (v239) Et l'arc en posant ou en frappant, l'objet qui remonte en changeant.
-            let pivot = view.transform_point3(arm.transform_point3(Vec3::new(0.5, 0.5, 1.0)));
-            let dip = view.inverse() * self.hand.gesture_about(pivot) * view;
-            Some((dip * lamp, dip * arm))
+            let (p, dip) = self.first_person_hold(pose.held?, view);
+            let arm = crate::player_model::right_arm_matrix(&p)?;
+            let lamp = crate::player_model::held_item_matrix(&p);
+            Some((lamp.map(|m| dip * m), dip * arm))
         })
         .flatten();
         let hand = if self.spectating.is_some() && fps_mode {
@@ -9092,7 +9108,7 @@ impl Session {
             v
         } else {
             // À la 3e personne : pas de main à l'écran (le modèle est dans le monde).
-            let mut v = if let Some((item, _)) = first_person_lamp {
+            let mut v = if let Some((Some(item), _)) = first_person_lamp {
                 // (v215) Lampe torche : dessinée là où le modèle la tient (vue du monde), là
                 // où la lumière part et où la montrent les miroirs. (v239) Tout objet tenu.
                 crate::hand::item_mesh(

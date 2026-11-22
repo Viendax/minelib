@@ -48,6 +48,30 @@ pub fn derive(pseudo: &str, password: &str) -> Result<Keys> {
     Ok(keys)
 }
 
+/// (v240) Clés du compte (chiffrement puis preuve), en octets : ce que garde le coffre d'une
+/// clé d'accès.
+pub fn keys_to_bytes(k: &Keys) -> Vec<u8> {
+    [k.enc, k.auth].concat()
+}
+
+pub fn keys_from_bytes(b: &[u8]) -> Option<Keys> {
+    (b.len() == 64).then(|| Keys {
+        enc: b[..32].try_into().unwrap(),
+        auth: b[32..].try_into().unwrap(),
+    })
+}
+
+/// (v240) Clés du compte écrites à la place du mot de passe (après une clé d'accès) : le jeu
+/// s'en sert comme d'un mot de passe (reconnexion, autre relais). Un caractère de contrôle en
+/// tête : impossible à taper.
+pub fn keys_as_password(k: &Keys) -> String {
+    format!("\u{1}{}", hex(&keys_to_bytes(k)))
+}
+
+pub fn keys_from_password(p: &str) -> Option<Keys> {
+    keys_from_bytes(&unhex(p.strip_prefix('\u{1}')?)?)
+}
+
 /// Nouvelle clé de compte, au hasard.
 pub fn new_identity() -> SigningKey {
     SigningKey::generate(&mut rand::rngs::OsRng)

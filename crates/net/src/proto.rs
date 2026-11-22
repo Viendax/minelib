@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 /// (`Response::Friends::requests`, `Request::FriendDecline`, `Response::FriendAdded`),
 /// invitations dans un monde de construction (`Request::Invite`, `Response::Invited`), statut
 /// invisible (`Request::Presence`).
-pub const PROTOCOL: u32 = 59;
+/// (v240) 60 : clés d'accès (`Request::PasskeyChallenge`, `PasskeyLogin`, `PasskeyAdd`,
+/// `PasskeyList`, `PasskeyRemove`).
+pub const PROTOCOL: u32 = 60;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -705,6 +707,36 @@ pub enum Request {
     /// `Response::Friends`.
     FriendDecline {
         pseudo: String,
+    },
+    /// (v240) Défi pour se connecter par une clé d'accès (`Response::PasskeyChallenge`).
+    PasskeyChallenge,
+    /// (v240) Connexion par une clé d'accès (`crate::passkey`) : la clé `id` a signé les
+    /// données de l'authentificateur et celles du client pour le dernier défi donné. Réponse :
+    /// `Response::PasskeyOk` : le coffre de cette clé (les clés du compte, comme si le mot de
+    /// passe avait été tapé) et un jeton d'appareil de confiance (pas de 2FA : la clé vérifie
+    /// déjà l'utilisateur, visage, empreinte ou code) ; le jeu se connecte ensuite avec eux
+    /// (`Login`).
+    PasskeyLogin {
+        pseudo: String,
+        id: Vec<u8>,
+        authenticator_data: Vec<u8>,
+        signature: Vec<u8>,
+        hw: Vec<[u8; 32]>,
+    },
+    /// (v240) Compte connecté : nouvelle clé d'accès (données de l'authentificateur de sa
+    /// création, coffre chiffré par la clé gardée dans son identifiant d'utilisateur, nom).
+    /// Réponse : `Response::Passkeys`.
+    PasskeyAdd {
+        id: Vec<u8>,
+        authenticator_data: Vec<u8>,
+        vault: Vec<u8>,
+        name: String,
+    },
+    /// (v240) Compte connecté : ses clés d'accès (`Response::Passkeys`).
+    PasskeyList,
+    /// (v240) Compte connecté : retire cette clé d'accès (`Response::Passkeys`).
+    PasskeyRemove {
+        id: Vec<u8>,
     },
 }
 
@@ -1460,6 +1492,29 @@ pub enum Response {
         from: String,
         mutual: bool,
     },
+    /// (v240) Défi à faire signer par une clé d'accès (deux minutes, une fois).
+    PasskeyChallenge {
+        challenge: [u8; 32],
+    },
+    /// (v240) Clé d'accès vérifiée : son coffre, et un jeton d'appareil de confiance.
+    PasskeyOk {
+        vault: Vec<u8>,
+        device: [u8; 32],
+    },
+    /// (v240) Clés d'accès du compte.
+    Passkeys {
+        list: Vec<PasskeyInfo>,
+    },
+}
+
+/// (v240) Clé d'accès d'un compte, telle que le joueur la voit.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct PasskeyInfo {
+    pub id: Vec<u8>,
+    pub name: String,
+    /// Création, dernière connexion (secondes Unix ; 0 : jamais).
+    pub created: u64,
+    pub used: u64,
 }
 
 /// (v231) Où est un ami en ligne : au menu (`FRIEND_MENU`), dans un monde de construction

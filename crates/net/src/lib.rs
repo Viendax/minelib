@@ -15,6 +15,7 @@ pub mod guard;
 pub mod hw;
 pub mod items;
 pub mod lan;
+pub mod passkey;
 pub mod poses;
 pub mod proto;
 pub mod sovereign;
