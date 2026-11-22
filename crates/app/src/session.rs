@@ -8636,13 +8636,22 @@ impl Session {
             let mut own = crate::player_model::shadow_boxes(&pose);
             // (v201) Sa lampe torche n'a pas l'ombre de son bras ni de sa tête. (v202) Sa
             // torche tenue, seulement pas celle du morceau tout contre la flamme (sa main).
-            let flame = self
-                .held_torch_light()
-                .or_else(|| self.zeus_light())
-                .map(|l| Vec3::from(l.pos));
+            // (v237) La Foudre de Zeus : « l'ombre de mon bras qui tient l'éclair ne doit pas
+            // pouvoir disparaître ». Sa lumière est sur l'éclair, une demi-longueur au-dessus
+            // du poing : hors du bras. La marge de 0,2 bloc autour de la boîte droite du bras
+            // (bien plus grande que lui quand il est penché) l'écartait selon la pose : son
+            // ombre allait et venait en marchant. N'est écarté que le morceau où la lumière
+            // se trouverait vraiment (tout serait alors dans l'ombre).
+            let torch = self.held_torch_light().map(|l| Vec3::from(l.pos));
+            let zeus = match torch {
+                Some(_) => None,
+                None => self.zeus_light().map(|l| Vec3::from(l.pos)),
+            };
             for b in &mut own {
                 b.owner = crate::flashlight::HOLDER;
-                if flame.is_some_and(|f| near_box(b, f, 0.2)) {
+                if torch.is_some_and(|f| near_box(b, f, 0.2))
+                    || zeus.is_some_and(|f| inside_box(b, f))
+                {
                     b.owner |= crate::flashlight::NEAR_FLAME;
                 }
             }
@@ -9947,6 +9956,15 @@ fn near_box(b: &ShadowBox, p: Vec3, margin: f32) -> bool {
     p.cmpge(mn).all() && p.cmple(mx).all()
 }
 
+/// (v237) Le point `p` est-il dans le morceau `b` lui-même (sa boîte exacte, penchée comme
+/// lui ; 5 % de marge) ?
+fn inside_box(b: &ShadowBox, p: Vec3) -> bool {
+    b.to_unit.iter().all(|row| {
+        let u = Vec3::new(row[0], row[1], row[2]).dot(p) + row[3];
+        (-0.05..=1.05).contains(&u)
+    })
+}
+
 /// (v217) Ce que vise la foudre lancée (`/thor`, Foudre de Zeus).
 #[derive(Clone, Copy, Debug)]
 enum Aim {
@@ -10795,6 +10813,56 @@ mod slab_tests {
             at(0.0, -12.0) < at(9.0, 0.0),
             "loin dans l'axe, avant moins loin de côté"
         );
+    }
+
+    /// (v237) « L'ombre de mon bras qui tient l'éclair ne doit pas pouvoir disparaître » :
+    /// la lumière de la Foudre de Zeus tenue est hors de tous les morceaux du joueur,
+    /// quelle que soit sa pose : aucun n'est écarté, le bras garde toujours son ombre.
+    /// L'ancienne règle (0,2 bloc autour de la boîte droite de chaque morceau) en écartait
+    /// selon la pose : l'ombre allait et venait.
+    #[test]
+    fn the_arm_holding_the_bolt_always_casts_its_shadow() {
+        let (mut poses, mut dropped) = (0, 0);
+        for k in 0..48 {
+            for crouch in [0.0, 1.0] {
+                for pitch in [-1.2f32, 0.0, 1.2] {
+                    let pose = crate::player_model::Pose {
+                        feet: Vec3::new(3.0, 70.0, -2.0),
+                        yaw: 0.7 + k as f32 * 0.4,
+                        pitch,
+                        walk: k as f32 * 0.37,
+                        swing: (k % 3) as f32 * 0.5,
+                        crouch,
+                        light: [1.0; 3],
+                        held: Some(crate::player_model::Held::Zeus),
+                        skin: None,
+                    };
+                    let at = crate::player_model::zeus_frame(&pose)
+                        .unwrap()
+                        .transform_point3(Vec3::Y * (crate::lightning::HELD_LEN * 0.42));
+                    let boxes = crate::player_model::shadow_boxes(&pose);
+                    assert!(boxes.iter().all(|b| !inside_box(b, at)), "{k} {crouch} {pitch}");
+                    poses += 1;
+                    dropped += usize::from(boxes.iter().any(|b| near_box(b, at, 0.2)));
+                }
+            }
+        }
+        assert!(dropped > 0 && dropped < poses, "{dropped} poses sur {poses}");
+        // Dans un morceau, la lumière l'écarte toujours (sinon tout serait dans l'ombre).
+        let pose = crate::player_model::Pose {
+            feet: Vec3::new(3.0, 70.0, -2.0),
+            yaw: 0.7,
+            pitch: 0.0,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: Some(crate::player_model::Held::Zeus),
+            skin: None,
+        };
+        let boxes = crate::player_model::shadow_boxes(&pose);
+        let mid = (Vec3::from(boxes[0].min) + Vec3::from(boxes[0].max)) * 0.5;
+        assert!(inside_box(&boxes[0], mid));
     }
 
     #[test]

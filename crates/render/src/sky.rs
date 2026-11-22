@@ -88,7 +88,9 @@ pub struct SkyInput {
     pub sky_time: f32,
     pub weather: SkyWeather,
     /// Éclair : direction (xz, depuis la caméra) et force de la lueur dans les nuages.
-    pub flash: [f32; 3],
+    /// (v237) Puis le sinus de sa hauteur dans le ciel, et 0 (tout ce côté du ciel
+    /// s'allume) … 1 (une tache autour de lui : la foudre lancée vers le ciel).
+    pub flash: [f32; 5],
     /// (v217) Le sol au-delà des chunks chargés, vu sous l'horizon : sa couleur (celle du
     /// dessus des blocs du lointain, linéaire, sans éclairage) et sa hauteur (blocs) ;
     /// `None` : pas connu à cette image (le ciel garde ce qu'il savait).
@@ -117,7 +119,8 @@ pub struct SkyGlobals {
     /// x = rayon de la caméra maintenant, y = rayon du milieu de la couche, z = 1 / angle
     /// du bord de la carte, w = épaisseur de la couche (blocs).
     pub cloud_geo: [f32; 4],
-    /// xy = direction (xz) de l'éclair vu de la caméra, zw = libres.
+    /// xy = direction (xz) de l'éclair vu de la caméra. (v237) z = sinus de sa hauteur,
+    /// w = 0 : tout ce côté du ciel … 1 : une tache autour de lui.
     pub flash: [f32; 4],
     /// (v217) Sol lointain, sous l'horizon : rgb = sa couleur (linéaire, sans éclairage),
     /// w = hauteur de l'œil au-dessus de lui (blocs).
@@ -1229,7 +1232,7 @@ impl Sky {
                 1.0 / THETA_MAX,
                 thickness(&w),
             ],
-            flash: [i.flash[0], i.flash[1], 0.0, 0.0],
+            flash: [i.flash[0], i.flash[1], i.flash[3], i.flash[4]],
             ground: {
                 let (rgb, y) = self.ground.unwrap_or((GROUND_DEFAULT, i.eye.y - 24.0));
                 [rgb[0], rgb[1], rgb[2], (i.eye.y - y).max(1.5)]

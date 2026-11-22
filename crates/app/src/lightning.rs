@@ -45,6 +45,39 @@ fn shade(n: usize, seed: u32) -> f32 {
 const NEAR_WIDTH: f32 = 0.03;
 /// En deçà (blocs), le canal a aussi ses filaments et ses arcs courts.
 const DETAIL_REACH: f32 = 70.0;
+/// (v237) Vu de près, un morceau droit de l'éclair est brisé plus fin pour l'image
+/// (`fine_levels`). Un éclair tombé à quelques blocs était fait de trois ou quatre longs
+/// traits droits (ses morceaux font 3 blocs) ; il garde maintenant le dessin qu'il a aux
+/// distances moyennes, où chaque morceau tient 5 à 10 % de sa distance à l'œil.
+/// `FINE_FROM` : en deçà de cette part de sa distance à l'œil, un morceau est dessiné tel
+/// quel (à plus de 30 blocs pour un morceau de 3 : l'éclair des distances moyennes et
+/// lointaines ne change pas du tout). Au-delà, il est coupé jusqu'à ce que chaque bout tienne
+/// au plus `FINE` fois sa distance.
+const FINE_FROM: f32 = 0.1;
+const FINE: f32 = 0.06;
+/// Au plus 2^6 bouts par morceau.
+const FINE_LEVELS: u32 = 6;
+/// Écart des zigzags ajoutés, en part de la longueur de chaque bout (comme le canal).
+const FINE_ROUGH: f32 = 0.34;
+
+/// (v237) Combien de fois couper en deux le morceau `a`–`b`, vu de `eye` (0 : il est assez
+/// loin, on le dessine tel quel).
+fn fine_levels(a: Vec3, b: Vec3, eye: Vec3) -> u32 {
+    let ab = b - a;
+    let len2 = ab.length_squared();
+    if len2 < 1e-6 {
+        return 0;
+    }
+    // Distance de l'œil au morceau.
+    let t = ((eye - a).dot(ab) / len2).clamp(0.0, 1.0);
+    let d = (a + ab * t - eye).length().max(0.25);
+    let len = len2.sqrt();
+    if len <= FINE_FROM * d {
+        0
+    } else {
+        ((len / (FINE * d)).log2().ceil() as u32).clamp(1, FINE_LEVELS)
+    }
+}
 
 /// Tirages au sort reproductibles (la forme d'un éclair ne dépend que de sa graine).
 #[derive(Clone, Debug)]
@@ -152,8 +185,6 @@ pub struct Strike {
     cloud_base: f32,
     /// Point frappé (`Ground`), d'où il part (`Sky`), ou son milieu (`Cloud`).
     pub pos: Vec3,
-    /// Côté du ciel vers lequel il va (x, z ; unitaire ou nul).
-    pub heading: Vec3,
     /// Temps avant qu'il parte (s), puis son âge.
     pub delay: f32,
     pub age: f32,
@@ -319,7 +350,6 @@ impl Strike {
             kind,
             cloud_base,
             pos,
-            heading: ((end - start) * Vec3::new(1.0, 0.0, 1.0)).normalize_or_zero(),
             delay,
             age: 0.0,
             pieces,
@@ -412,7 +442,39 @@ impl Strike {
         } else {
             (0.0, 0.0)
         };
-        for (n, p) in self.pieces.iter().enumerate() {
+        // (v237) De près, chaque morceau est brisé plus fin (`fine_levels`) : mêmes zigzags
+        // à chaque image (ils ne dépendent que de la graine et du morceau), et ceux d'un
+        // niveau restent quand on en ajoute un en s'approchant.
+        let mut parts: Vec<Piece> = Vec::with_capacity(1 << FINE_LEVELS);
+        for (n, whole) in self.pieces.iter().enumerate() {
+            if since < 0.0 && whole.sa >= reach {
+                continue;
+            }
+            parts.clear();
+            let levels = fine_levels(whole.a, whole.b, eye);
+            if levels == 0 {
+                parts.push(*whole);
+            } else {
+                let mut rng = Rng::new((self.seed as u64) << 24 ^ n as u64 ^ 0xf1e0_0000_0000_0000);
+                let pts = jagged(whole.a, whole.b, levels, FINE_ROUGH, &mut rng);
+                let m = (pts.len() - 1) as f32;
+                let mix = |x: f32, y: f32, u: f32| x + (y - x) * u;
+                for (k, w) in pts.windows(2).enumerate() {
+                    let (u, v) = (k as f32 / m, (k + 1) as f32 / m);
+                    parts.push(Piece {
+                        a: w[0],
+                        b: w[1],
+                        sa: mix(whole.sa, whole.sb, u),
+                        sb: mix(whole.sa, whole.sb, v),
+                        level: whole.level,
+                        ta: mix(whole.ta, whole.tb, u),
+                        tb: mix(whole.ta, whole.tb, v),
+                        wa: mix(whole.wa, whole.wb, u),
+                        wb: mix(whole.wa, whole.wb, v),
+                    });
+                }
+            }
+          for p in &parts {
             let (mut b, mut sb, mut tb) = (p.b, p.sb, p.tb);
             let mut tip = 0.0;
             if since < 0.0 {
@@ -465,6 +527,7 @@ impl Strike {
                 width_b: (width(tb) * p.wb).min(thin(b)),
                 screen: 0.0,
             });
+          }
         }
         if since >= 0.0 && main > 0.05 {
             self.detail(eye, main, out);
@@ -528,16 +591,35 @@ impl Strike {
         let force = (level * 0.3).min(1.3);
         let mut push = |a: Vec3, b: Vec3, fa: f32, fb: f32, wide: f32| {
             let w = |p: Vec3| wide * (NEAR_WIDTH * (p - eye).length() + 0.012);
-            out.push(BoltSeg {
-                a: [a.x, a.y, a.z, BOLT],
-                b: [b.x, b.y, b.z, 1.0],
-                color: tint(0.25 + 0.7 * fa.fract()),
-                force_a: fa,
-                force_b: fb,
-                width_a: w(a),
-                width_b: w(b),
-                screen: 0.0,
-            });
+            let color = tint(0.25 + 0.7 * fa.fract());
+            let mut one = |a: Vec3, b: Vec3, fa: f32, fb: f32| {
+                out.push(BoltSeg {
+                    a: [a.x, a.y, a.z, BOLT],
+                    b: [b.x, b.y, b.z, 1.0],
+                    color,
+                    force_a: fa,
+                    force_b: fb,
+                    width_a: w(a),
+                    width_b: w(b),
+                    screen: 0.0,
+                });
+            };
+            // (v237) De près, brisés plus fin eux aussi : un filament court d'un point du
+            // canal à un autre, des dizaines de blocs plus loin, par bouts de plusieurs
+            // blocs ; à quelques blocs de l'œil c'étaient de longs traits droits et fins
+            // en travers de l'image.
+            let levels = fine_levels(a, b, eye);
+            if levels == 0 {
+                one(a, b, fa, fb);
+                return;
+            }
+            let mut rng = Rng::new((a.x.to_bits() as u64) << 32 ^ (b.y.to_bits() as u64) ^ 0xf11e);
+            let pts = jagged(a, b, levels, FINE_ROUGH, &mut rng);
+            let m = (pts.len() - 1) as f32;
+            for (k, s) in pts.windows(2).enumerate() {
+                let (u, v) = (k as f32 / m, (k + 1) as f32 / m);
+                one(s[0], s[1], fa + (fb - fa) * u, fa + (fb - fa) * v);
+            }
         };
         // Filaments (31 fois par seconde).
         let mut rng = Rng::new((self.age * 31.0) as u64 ^ (self.seed as u64) << 8 ^ 0xf11a);
@@ -574,22 +656,43 @@ impl Strike {
     /// une vingtaine de blocs du point frappé (ou de la main, pour celui qui monte). La
     /// lumière et les ombres viennent ainsi de là où l'on voit l'éclair, pas d'à côté.
     /// (v235) 3,5 blocs et non 1,5 : collée au sol, elle le blanchissait tout autour.
+    /// (v237) Celle qu'on lance vers le ciel : à 12 et à 45 blocs de la main. Tout près de
+    /// la main, la lumière semblait venir d'au-dessus de soi, pas de là où l'on tape.
     pub fn light_points(&self) -> [Vec3; 2] {
         let from = self.pos;
-        let mut out = [from + Vec3::Y * 3.5, from + Vec3::Y * 20.0];
+        let [low, high] = if self.kind == Kind::Sky {
+            [12.0, 45.0]
+        } else {
+            [3.5, 20.0]
+        };
+        let mut out = [from + Vec3::Y * low, from + Vec3::Y * high];
         let (mut near, mut far) = (f32::MAX, f32::MAX);
         for p in self.pieces.iter().take_while(|p| p.level == 0) {
             let d = (p.a - from).length();
-            if (d - 3.5).abs() < near {
-                near = (d - 3.5).abs();
+            if (d - low).abs() < near {
+                near = (d - low).abs();
                 out[0] = p.a;
             }
-            if (d - 20.0).abs() < far {
-                far = (d - 20.0).abs();
+            if (d - high).abs() < far {
+                far = (d - high).abs();
                 out[1] = p.a;
             }
         }
         out
+    }
+
+    /// (v237) Où il allume les nuages : le milieu de ce que son canal parcourt dans leur
+    /// couche (celui qui monte y entre par la base) ; à défaut, son bout.
+    pub fn cloud_entry(&self) -> Vec3 {
+        let mut end = self.pos;
+        let mut entry = None;
+        for p in self.pieces.iter().take_while(|p| p.level == 0) {
+            end = p.b;
+            if entry.is_none() && p.b.y >= self.cloud_base {
+                entry = Some(p.b);
+            }
+        }
+        entry.map_or(end, |e| (e + end) * 0.5)
     }
 
     /// Ce coup de foudre blesse-t-il ce qui se tient en `feet` (ses pieds) ? (Seule la
@@ -1144,6 +1247,83 @@ mod tests {
         segs.clear();
         s.segments(Vec3::new(900.0, 64.0, 0.0), &mut segs);
         assert!(segs.is_empty());
+    }
+
+    /// (v237) Vu de près, l'éclair garde le dessin qu'il a aux distances moyennes : ses
+    /// morceaux droits de plusieurs blocs sont brisés plus fin (aucun ne barre l'image d'un
+    /// long trait), il touche toujours le même point, il ne tremble pas d'une image à
+    /// l'autre, et de loin rien ne change.
+    #[test]
+    fn a_strike_seen_from_close_is_broken_finer_and_the_same_from_afar() {
+        let pos = Vec3::new(0.0, 64.0, 0.0);
+        let mut s = Strike::new(pos, 21, 420.0, 0.0);
+        s.age = s.leader_s + 0.004;
+        let seen = |eye: Vec3| {
+            let mut segs = Vec::new();
+            s.segments(eye, &mut segs);
+            segs
+        };
+        let ends = |g: &BoltSeg| (Vec3::from_slice(&g.a[..3]), Vec3::from_slice(&g.b[..3]));
+        // Le plus long morceau à moins de 30 blocs de l'œil, en part de sa distance à lui.
+        let longest = |eye: Vec3, pieces: &[(Vec3, Vec3)]| {
+            pieces
+                .iter()
+                .filter_map(|&(a, b)| {
+                    let ab = b - a;
+                    let t = ((eye - a).dot(ab) / ab.length_squared().max(1e-9)).clamp(0.0, 1.0);
+                    let d = (a + ab * t - eye).length();
+                    (3.0..30.0).contains(&d).then(|| ab.length() / d)
+                })
+                .fold(0.0, f32::max)
+        };
+        // De loin : ses morceaux tels quels, d'où qu'on le voie.
+        let far = seen(Vec3::new(600.0, 64.0, 0.0));
+        let farther = seen(Vec3::new(3000.0, 64.0, 0.0));
+        assert_eq!(far.len(), farther.len());
+        assert!(far.iter().zip(&farther).all(|(a, b)| ends(a) == ends(b)));
+        // À cinq blocs du point frappé.
+        let eye = pos + Vec3::new(5.0, 1.6, 0.0);
+        let raw: Vec<_> = s.pieces.iter().map(|p| (p.a, p.b)).collect();
+        assert!(longest(eye, &raw) > 0.4, "{}", longest(eye, &raw));
+        let near = seen(eye);
+        let drawn: Vec<_> = near.iter().map(ends).collect();
+        assert!(near.len() > far.len() + 60, "{} {}", near.len(), far.len());
+        assert!(longest(eye, &drawn) < 0.3, "{}", longest(eye, &drawn));
+        assert!(drawn.iter().any(|(_, b)| (*b - pos).length() < 1e-3), "jusqu'au sol");
+        // (Les filaments et les arcs courts changent des dizaines de fois par seconde, pas
+        // le canal ni ses branches : au même instant, la même image.)
+        let again = seen(eye);
+        assert_eq!(again.len(), near.len());
+        assert!(again.iter().zip(&near).all(|(a, b)| ends(a) == ends(b)));
+        // En s'approchant, les zigzags déjà là restent : seuls de plus fins s'ajoutent.
+        let (a, b) = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(4.0, 0.0, 0.0));
+        let coarse = jagged(a, b, 2, FINE_ROUGH, &mut Rng::new(9));
+        let fine = jagged(a, b, 4, FINE_ROUGH, &mut Rng::new(9));
+        assert!(coarse.iter().enumerate().all(|(i, p)| fine[i * 4] == *p));
+        assert_eq!(fine_levels(a, b, Vec3::new(2.0, 0.0, 41.0)), 0);
+        assert_eq!(fine_levels(a, b, Vec3::new(2.0, 0.0, 39.0)), 1);
+        assert_eq!(fine_levels(a, b, Vec3::new(2.0, 0.0, 20.0)), 2);
+        assert_eq!(fine_levels(a, b, Vec3::new(2.0, 0.0, 0.1)), FINE_LEVELS);
+    }
+
+    /// (v237) Celle qu'on lance vers le ciel : ses lumières sont le long d'elle, loin de la
+    /// main, et l'endroit où elle allume les nuages est du côté où on la lance.
+    #[test]
+    fn a_bolt_thrown_at_the_sky_lights_from_where_it_goes() {
+        let from = Vec3::new(0.0, 66.0, 0.0);
+        let dir = Vec3::new(0.6, 0.5, -0.3).normalize();
+        let s = Strike::up(from, dir, 8, 420.0, 180.0);
+        let [low, high] = s.light_points();
+        let along = |p: Vec3| (p - from).dot(dir);
+        assert!((along(low) - 12.0).abs() < 4.0, "{}", along(low));
+        assert!((along(high) - 45.0).abs() < 8.0, "{}", along(high));
+        let glow = s.cloud_entry();
+        assert!(glow.y > 420.0 && glow.y < 600.0, "{glow}");
+        assert!((glow - from).normalize().dot(dir) > 0.97);
+        // La foudre qui tombe garde les siennes près du point frappé.
+        let g = Strike::new(from, 8, 420.0, 0.0);
+        let [low, high] = g.light_points();
+        assert!((low - from).length() < 5.0 && (high - from).length() < 28.0);
     }
 
     /// Dégâts comme dans Minecraft : dans la boîte de 3 blocs autour du point frappé.

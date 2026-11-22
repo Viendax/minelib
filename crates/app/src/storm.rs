@@ -176,7 +176,7 @@ pub struct Storm {
     /// Éclat de la foudre là où est le joueur (0 : rien … 1 : tombée tout près).
     pub flash: f32,
     /// Lueur dans les nuages : côté d'où elle vient (x, z) et force.
-    pub sky_flash: [f32; 3],
+    pub sky_flash: [f32; 5],
     tops: Tops,
     glow: Option<Glow>,
     glow_in: f32,
@@ -209,7 +209,7 @@ impl Storm {
             bolts: Vec::new(),
             hand_bolts: Vec::new(),
             flash: 0.0,
-            sky_flash: [0.0; 3],
+            sky_flash: [0.0; 5],
             tops: Tops::new(),
             glow: None,
             glow_in: 4.0,
@@ -285,7 +285,8 @@ impl Storm {
         self.arcs = arcs;
         // Éclat sur le monde (il faiblit avec la distance) et lueur dans les nuages, du
         // côté de l'éclair le plus fort.
-        let mut best = (0.0f32, [0.0f32; 2]);
+        let mut best = (0.0f32, [0.0f32; 2], [0.0f32; 2]);
+        let mut world = 0.0f32;
         for s in &self.strikes {
             s.segments(f.eye, &mut self.bolts);
             let l = s.light();
@@ -295,18 +296,27 @@ impl Storm {
             }
             let d = Vec3::new(s.pos.x - f.eye.x, 0.0, s.pos.z - f.eye.z);
             let level = l / (1.0 + (d.length() / 150.0).powi(2));
+            // (v237) Celle qu'on lance vers le ciel : « le spot lumineux doit venir d'où je
+            // tape, pas d'au-dessus de moi ». Les nuages s'allument en une tache là où elle
+            // entre dans leur couche (avant : tout ce côté du ciel, jusqu'au-dessus de la
+            // tête), et le paysage reçoit bien moins d'éclat du ciel (cet éclat-là tombe
+            // d'en haut, comme le jour) : il est éclairé par les lumières de son canal, du
+            // côté où elle part (`lights`).
+            let up = s.kind == lightning::Kind::Sky;
+            world = world.max(if up { level * SKY_STRIKE_FLASH } else { level });
             if level > best.0 {
-                // (Celle qui monte de la main : les nuages s'allument du côté où elle va.)
-                let n = if s.kind == lightning::Kind::Sky {
-                    s.heading
+                best = if up {
+                    let to = (s.cloud_entry() - f.eye).normalize_or(Vec3::Y);
+                    let flat = Vec3::new(to.x, 0.0, to.z).normalize_or_zero();
+                    (level, [flat.x, flat.z], [to.y, 1.0])
                 } else {
-                    d.normalize_or_zero()
+                    let n = d.normalize_or_zero();
+                    (level, [n.x, n.z], [0.0, 0.0])
                 };
-                best = (level, [n.x, n.z]);
             }
         }
-        self.flash = best.0;
-        let mut sky = (best.0, best.1);
+        self.flash = world;
+        let mut sky = (best.0, best.1, best.2);
         // Éclairs dans les nuages, au loin.
         let thundering = f.active && self.weather.thundering();
         if let Some(g) = &mut self.glow {
@@ -340,10 +350,10 @@ impl Storm {
             // (La lueur des nuages éclaire un peu le sol aussi.)
             self.flash = self.flash.max(l * 0.22);
             if l > sky.0 {
-                sky = (l, g.dir);
+                sky = (l, g.dir, [0.0, 0.0]);
             }
         }
-        self.sky_flash = [sky.1[0], sky.1[1], sky.0.min(1.0)];
+        self.sky_flash = [sky.1[0], sky.1[1], sky.0.min(1.0), sky.2[0], sky.2[1]];
         // Pluie : la carte des toits, et son bruit (assourdi sous un toit).
         let rain = if f.active {
             self.weather.rain_amount
@@ -514,8 +524,16 @@ impl Storm {
             // devenait blanc sur des dizaines de blocs : on ne voyait plus l'éclair qui
             // venait de tomber, ni rien d'autre.
             let [low, high] = s.light_points();
-            for (n, (pos, intensity, range)) in
-                [(low, 2.0, 22.0), (high, 1.2, 44.0)].into_iter().enumerate()
+            // (v237) Celle qu'on lance vers le ciel : ses lumières sont plus loin le long
+            // d'elle (voir `light_points`), elles portent donc plus loin.
+            let reach = if s.kind == lightning::Kind::Sky {
+                [34.0, 90.0]
+            } else {
+                [22.0, 44.0]
+            };
+            for (n, (pos, intensity, range)) in [(low, 2.0, reach[0]), (high, 1.2, reach[1])]
+                .into_iter()
+                .enumerate()
             {
                 out.push(DynLight {
                     id: STRIKE_LIGHT_ID + ((k as u64 & 0x7f) << 1) + n as u64,
@@ -598,6 +616,10 @@ impl Storm {
         }
     }
 }
+
+/// (v237) Part de l'éclat du ciel (celui qui éclaire tout le paysage d'en haut) que donne
+/// la foudre lancée vers le ciel.
+const SKY_STRIKE_FLASH: f32 = 0.3;
 
 /// (v234) Volume propre de la pluie (avant : 1 ; « 25 % moins fort en général »). Le
 /// curseur « Volume de la météo » (Paramètres → Son) s'y ajoute.
@@ -739,6 +761,54 @@ mod tests {
             flash = flash.max(s.flash);
         }
         assert!(hurt == 0 && flash > 0.1 && flash < 0.3, "{flash}");
+    }
+
+    /// (v237) « Quand je tape vers le ciel, le spot lumineux doit venir d'où je tape, pas
+    /// d'au-dessus de moi » : les nuages s'allument en une tache du côté où part la foudre
+    /// (et non tout un côté du ciel), le paysage reçoit peu d'éclat du ciel, et ses lumières
+    /// sont le long d'elle, loin de la main.
+    #[test]
+    fn a_bolt_thrown_at_the_sky_lights_the_clouds_where_it_goes() {
+        let world = flat(64);
+        let mut s = Storm::new(3);
+        let feet = Vec3::new(0.5, 65.0, 0.5);
+        let eye = feet + Vec3::Y * 1.6;
+        let dir = Vec3::new(0.6, 0.5, -0.3).normalize();
+        s.strike_up(eye + dir * 0.9, dir, eye.y);
+        let (mut flash, mut glow, mut lit) = (0.0f32, 0.0f32, 0);
+        for _ in 0..300 {
+            s.update(1.0 / 200.0, &frame(&world, feet));
+            flash = flash.max(s.flash);
+            let [x, z, level, rise, focus] = s.sky_flash;
+            if level > 0.0 {
+                glow = glow.max(level);
+                let flat = (1.0 - rise * rise).max(0.0).sqrt();
+                let at = Vec3::new(x * flat, rise, z * flat);
+                assert!(focus == 1.0 && at.dot(dir) > 0.97, "{:?}", s.sky_flash);
+            }
+            let mut l = Vec::new();
+            s.lights(eye, &mut l);
+            if let [low, high] = &l[..] {
+                lit += 1;
+                let along = |l: &DynLight| (Vec3::from(l.pos) - eye).dot(dir);
+                assert!(along(low) > 8.0 && along(high) > 30.0);
+                assert!(low.range > 30.0 && high.range > 80.0);
+            }
+        }
+        assert!(glow > 0.9 && lit > 0, "{glow} {lit}");
+        assert!(flash > 0.1 && flash <= SKY_STRIKE_FLASH + 1e-3, "{flash}");
+        // La foudre qui tombe : tout son côté du ciel, comme avant.
+        s.strike(Vec3::new(60.5, 65.0, 0.5));
+        let mut wide = false;
+        for _ in 0..300 {
+            s.update(1.0 / 200.0, &frame(&world, feet));
+            let [x, _, level, rise, focus] = s.sky_flash;
+            if level > 0.0 {
+                wide = true;
+                assert!(focus == 0.0 && rise == 0.0 && x > 0.99, "{:?}", s.sky_flash);
+            }
+        }
+        assert!(wide);
     }
 
     /// Orage : la foudre tombe d'elle-même autour du joueur, sur le dessus du relief, et

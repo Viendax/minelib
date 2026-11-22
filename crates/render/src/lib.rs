@@ -620,8 +620,9 @@ pub struct FrameParams<'a> {
     /// (v216) Météo vue par le ciel : couverture de nuages, pluie, orage, vent.
     pub weather: sky::SkyWeather,
     /// (v216) Lueur d'un éclair dans les nuages : côté d'où elle vient (x, z, unitaire) et
-    /// force (0 … 1).
-    pub sky_flash: [f32; 3],
+    /// force (0 … 1). (v237) Puis le sinus de sa hauteur dans le ciel, et 0 (tout ce côté
+    /// du ciel s'allume) … 1 (une tache autour de lui).
+    pub sky_flash: [f32; 5],
     /// (v217) Sol au-delà du monde chargé, vu sous l'horizon : couleur du dessus des blocs
     /// du lointain (linéaire, sans éclairage, voir `Renderer::layer_mean`) et sa hauteur ;
     /// `None` : inconnu à cette image. Et la distance de brume de ce sol (blocs).
@@ -4066,7 +4067,7 @@ fn draw_hud<'a>(
 ) {
     vm.draw_arm(pass, group, arm_lit);
     vm.draw_range(pass, group, 0..hand);
-    // (v216) L'éclair tenu en main, par-dessus la main.
+    // (v216) L'éclair tenu en main. (v237) Le bras cache ce qui passe derrière lui.
     if let Some(b) = bolts {
         b.draw_hand(pass, group);
     }

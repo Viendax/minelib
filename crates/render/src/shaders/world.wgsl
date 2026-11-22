@@ -153,7 +153,9 @@ struct Sky {
     // x = rayon de la caméra, y = rayon du milieu de la couche, z = 1 / angle du bord des
     // cartes, w = épaisseur de la couche (blocs).
     cloud_geo: vec4<f32>,
-    // xy = direction (xz) de l'éclair vu de la caméra.
+    // xy = direction (xz) de l'éclair vu de la caméra. (v237) z = sinus de sa hauteur dans
+    // le ciel, w = 0 : tout ce côté du ciel s'allume … 1 : une tache autour de lui (voir
+    // `flash_side`).
     flash: vec4<f32>,
     // (v217) Sol lointain, sous l'horizon : rgb = sa couleur (sans éclairage), w = hauteur
     // de l'œil au-dessus de lui (blocs).
@@ -442,6 +444,26 @@ fn sky_env(dir: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
+/// (v237) Part de la lueur d'un éclair que reçoit le ciel du côté `dir` (unitaire). La
+/// foudre qui tombe allume tout son côté du ciel, du bas jusqu'au-dessus de la tête (de
+/// loin, on ne voit pas d'où vient la lueur). Celle qu'on lance vers le ciel allume une
+/// tache autour de l'endroit où elle entre dans les nuages : avant, les nuages
+/// s'allumaient aussi fort au-dessus de soi que là où l'on visait.
+fn flash_side(dir: vec3<f32>) -> f32 {
+    let f = sky.flash;
+    let flat = dir.xz * inverseSqrt(max(dot(dir.xz, dir.xz), 1e-12));
+    let side = max(dot(flat, f.xy), 0.0);
+    let wide = 0.3 + 0.7 * side * side;
+    if f.w <= 0.0 {
+        return wide;
+    }
+    let level = sqrt(max(1.0 - f.z * f.z, 0.0));
+    let at = vec3<f32>(f.x * level, f.z, f.y * level);
+    let k = max(dot(normalize(dir), at), 0.0);
+    let k4 = k * k * k * k;
+    return mix(wide, 0.04 + 0.96 * k4 * k4, f.w);
+}
+
 /// (v217) La brume de l'horizon du côté `flat` (x, z, unitaire) : le bas du ciel, sans le
 /// dessin des nuages. Le ciel s'y fond dans ses derniers degrés (davantage sous la pluie :
 /// l'horizon est bouché), et sous l'horizon le sol lointain s'y perd : les deux se
@@ -450,8 +472,7 @@ fn horizon_haze(flat: vec2<f32>) -> vec3<f32> {
     let hd = normalize(vec3<f32>(flat.x, 0.012, flat.y));
     var c = sky_color(hd) + sun_glow(hd, false);
     if sky.misc.w > 0.0 {
-        let side = max(dot(flat, sky.flash.xy), 0.0);
-        c += vec3<f32>(0.72, 0.8, 1.0) * sky.misc.w * (0.07 + 0.55 * sky.fog.w) * (0.3 + 0.7 * side * side);
+        c += vec3<f32>(0.72, 0.8, 1.0) * sky.misc.w * (0.07 + 0.55 * sky.fog.w) * flash_side(hd);
     }
     return c;
 }
@@ -474,8 +495,7 @@ fn sky_above(dir: vec3<f32>, bodies: bool) -> vec3<f32> {
     c = c * cl.a + cl.rgb;
     if sky.misc.w > 0.0 {
         // Éclair : les nuages s'illuminent de l'intérieur, surtout du côté où il tombe.
-        let side = max(dot(dir.xz * inverseSqrt(max(dot(dir.xz, dir.xz), 1e-12)), sky.flash.xy), 0.0);
-        c += vec3<f32>(0.72, 0.8, 1.0) * sky.misc.w * ((1.0 - cl.a) * 0.85 + 0.07) * (0.3 + 0.7 * side * side);
+        c += vec3<f32>(0.72, 0.8, 1.0) * sky.misc.w * ((1.0 - cl.a) * 0.85 + 0.07) * flash_side(dir);
     }
     // Les derniers degrés au-dessus de l'horizon se perdent dans sa brume (3° par beau
     // temps, une dizaine sous un ciel couvert).

@@ -318,12 +318,15 @@ impl Bolts {
         self.world.count > 0
     }
 
-    /// Éclairs tenus en main, par-dessus la main (passe de la main et de l'interface).
+    /// Éclairs tenus en main (passe de la main et de l'interface), après le bras.
+    /// (v237) Le bras cache ce qui passe derrière lui (profondeur de cette passe, où il n'y
+    /// a que lui et l'objet tenu) : l'éclair est au bout du poing, on ne le voit plus à
+    /// travers le bras qui le tient. Avant, il était dessiné par-dessus tout.
     pub fn draw_hand<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, world: &'a wgpu::BindGroup) {
         if self.hand.count == 0 {
             return;
         }
-        pass.set_pipeline(&self.over);
+        pass.set_pipeline(&self.plain);
         pass.set_bind_group(0, world, &[]);
         pass.set_vertex_buffer(0, self.hand.buffer.slice(..));
         pass.draw(0..6, 0..self.hand.count);
