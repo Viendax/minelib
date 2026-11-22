@@ -108,6 +108,46 @@ impl Items {
         }
     }
 
+    /// (v241) Solo, à l'ouverture d'une carte : un seul objet légendaire (la Foudre de Zeus)
+    /// au sol et dans les coffres, en un seul exemplaire ; `keep` faux : aucun (il est dans
+    /// l'inventaire du joueur). Rend vrai s'il en reste un.
+    pub fn keep_one_legend(&mut self, keep: bool) -> bool {
+        use minelib_net::items::LEGEND_ITEM;
+        if !self.local {
+            return false;
+        }
+        let mut found = !keep;
+        let mut changed = false;
+        for d in self.view.drops.values_mut() {
+            if let Some(drop) = d.as_mut().filter(|d| d.pile.item == LEGEND_ITEM) {
+                if found {
+                    *d = None;
+                    changed = true;
+                } else {
+                    changed |= drop.pile.count != 1;
+                    drop.pile.count = 1;
+                    found = true;
+                }
+            }
+        }
+        for chest in self.view.chests.values_mut() {
+            for slot in chest.iter_mut() {
+                if let Some(pile) = slot.as_mut().filter(|p| p.item == LEGEND_ITEM) {
+                    if found {
+                        *slot = None;
+                        changed = true;
+                    } else {
+                        changed |= pile.count != 1;
+                        pile.count = 1;
+                        found = true;
+                    }
+                }
+            }
+        }
+        self.dirty |= changed;
+        found && keep
+    }
+
     /// Lâche `pile` (déjà retirée de l'inventaire) de `from` vers `to` ; rend son numéro.
     pub fn drop_item(&mut self, from: Vec3, to: Vec3, pile: Pile) -> u64 {
         let id: u64 = rand::random();
@@ -476,6 +516,43 @@ mod tests {
 
     fn stone(n: u8) -> Pile {
         Pile { item: 1, count: n }
+    }
+
+    /// (v241) À l'ouverture d'une carte d'avant : une seule Foudre de Zeus reste au sol et
+    /// dans les coffres, en un seul exemplaire ; aucune si le joueur a déjà la sienne.
+    #[test]
+    fn only_one_legendary_bolt_stays_on_the_map() {
+        use minelib_net::items::{Dropped, LEGEND_ITEM};
+        let zeus = |n: u8| Pile { item: LEGEND_ITEM, count: n };
+        let stone = Pile { item: 1, count: 12 };
+        let fill = || {
+            let mut it = Items::new(true);
+            it.view.drops.insert(1, Some(Dropped { pos: [0.0; 3], pile: stone }));
+            it.view.drops.insert(2, Some(Dropped { pos: [0.0; 3], pile: zeus(64) }));
+            it.view.drops.insert(3, Some(Dropped { pos: [0.0; 3], pile: zeus(1) }));
+            let mut chest = [None; minelib_net::items::CHEST_SLOTS];
+            chest[4] = Some(zeus(5));
+            chest[5] = Some(stone);
+            it.view.chests.insert([1, 2, 3], chest);
+            it
+        };
+        let count = |it: &Items| {
+            let ground: u32 = it.view.live_drops().filter(|(_, d)| d.pile.item == LEGEND_ITEM).map(|(_, d)| d.pile.count as u32).sum();
+            let chests: u32 = it.view.chests.values().flatten().flatten().filter(|p| p.item == LEGEND_ITEM).map(|p| p.count as u32).sum();
+            ground + chests
+        };
+        let mut it = fill();
+        assert!(it.keep_one_legend(true) && it.dirty);
+        assert_eq!(count(&it), 1);
+        // Le reste ne bouge pas.
+        assert_eq!(it.view.drops[&1].map(|d| d.pile), Some(stone));
+        assert_eq!(it.view.chests[&[1, 2, 3]][5], Some(stone));
+        let mut it = fill();
+        assert!(!it.keep_one_legend(false));
+        assert_eq!(count(&it), 0);
+        // Rien à garder : rien ne change.
+        let mut it = Items::new(true);
+        assert!(!it.keep_one_legend(true) && !it.dirty);
     }
 
     #[test]

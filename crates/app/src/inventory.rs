@@ -184,8 +184,35 @@ impl Item {
             Item::Zeus => {
                 lines[0].1 = [170, 205, 255];
                 lines.push(("Un éclair tenu en main".into(), WHITE));
-                lines.push(("Clic gauche : la foudre tombe là où tu vises".into(), WHITE));
-                lines.push(("Elle blesse comme la foudre du ciel".into(), GREY));
+                match crate::zeus::shown() {
+                    // (v241) Objet légendaire : ses charges et ce que fait un coup.
+                    Some(n) => {
+                        lines.push((
+                            format!("Légendaire : un seul par carte. Charges : {n} / {}", crate::zeus::MAX_CHARGES),
+                            [255, 220, 120],
+                        ));
+                        lines.push((
+                            "Chargé : la foudre tombe du ciel où tu vises (128 blocs)".into(),
+                            WHITE,
+                        ));
+                        lines.push((
+                            format!(
+                                "Sans charge : un arc de sa pointe, jusqu'à 8 blocs ({} points de vie, la foudre : {})",
+                                crate::zeus::ARC_DAMAGE,
+                                crate::lightning::DAMAGE
+                            ),
+                            WHITE,
+                        ));
+                        lines.push((
+                            "Deux coups vers le ciel, ou un éclair dans les nuages : une charge".into(),
+                            GREY,
+                        ));
+                    }
+                    None => {
+                        lines.push(("Clic gauche : la foudre tombe là où tu vises".into(), WHITE));
+                        lines.push(("Elle blesse comme la foudre du ciel".into(), GREY));
+                    }
+                }
             }
             Item::Flashlight => {
                 lines.push(("Éclaire comme un projecteur, où tu regardes".into(), WHITE));
@@ -263,7 +290,23 @@ pub struct Inventory {
     pub chest_slots: [Option<Stack>; CHEST_SLOTS],
     /// Dernier clic dans l'écran du coffre, à traiter par la partie.
     pub chest_action: Option<ChestAction>,
+    /// (v241) La Foudre de Zeus est ici un objet légendaire (un seul par carte, que rien ne
+    /// supprime) : tenu à jour par la partie. Faux sur un serveur de construction, où le
+    /// relais ne tient pas encore ces règles : elle s'y prend comme avant.
+    pub legend: bool,
+    /// (v241) L'éclair de la carte peut encore être pris dans le catalogue (personne ne l'a).
+    pub legend_free: bool,
+    /// (v241) Il vient d'être pris dans le catalogue : la partie le note avec la carte.
+    pub legend_took: bool,
+    /// (v241) Message à dire dans le tchat (un refus), que la partie reprend.
+    pub notice: Option<&'static str>,
 }
+
+/// (v241) Refus du catalogue : l'éclair de la carte a déjà été pris.
+pub const LEGEND_GONE: &str =
+    "La Foudre de Zeus de cette carte a déjà été prise : il n'y en a qu'une.";
+/// (v241) Refus de la poubelle.
+pub const LEGEND_KEPT: &str = "La Foudre de Zeus ne peut pas être supprimée.";
 
 /// Emplacements d'un coffre (3 lignes de 10).
 pub const CHEST_SLOTS: usize = minelib_net::items::CHEST_SLOTS;
@@ -727,7 +770,42 @@ impl Inventory {
             chest: None,
             chest_slots: [None; CHEST_SLOTS],
             chest_action: None,
+            legend: false,
+            legend_free: false,
+            legend_took: false,
+            notice: None,
         }
+    }
+
+    /// (v241) Cette pile est-elle l'objet légendaire (que rien ne supprime) ?
+    fn is_legend(&self, st: Option<Stack>) -> bool {
+        self.legend && st.is_some_and(|s| s.item == Item::Zeus)
+    }
+
+    /// (v241) L'inventaire tient-il la Foudre de Zeus (barre, sac, ou au bout du curseur) ?
+    pub fn has_zeus(&self) -> bool {
+        self.slots
+            .iter()
+            .chain(std::iter::once(&self.held))
+            .flatten()
+            .any(|s| s.item == Item::Zeus)
+    }
+
+    /// (v241) À l'ouverture d'une carte : une seule Foudre de Zeus, en un seul exemplaire
+    /// (avant la v238, le catalogue en donnait des piles de 64). Rend vrai s'il y en a une ;
+    /// `keep` faux : aucune ne reste (elle est déjà ailleurs sur la carte).
+    pub fn keep_one_zeus(&mut self, keep: bool) -> bool {
+        let mut found = !keep;
+        for slot in self.slots.iter_mut().chain(std::iter::once(&mut self.held)) {
+            if slot.is_some_and(|s| s.item == Item::Zeus) {
+                *slot = (!found).then_some(Stack {
+                    item: Item::Zeus,
+                    count: 1,
+                });
+                found = true;
+            }
+        }
+        found && keep
     }
 
     /// Ouvre l'écran du coffre en `pos`.
@@ -956,7 +1034,14 @@ impl Inventory {
         self.search.clear();
         self.scroll_row = 0;
         if let Some(h) = self.held.take() {
-            self.add(h.item, h.count);
+            let left = self.add(h.item, h.count);
+            // (v241) Inventaire plein : l'objet légendaire ne se perd pas. Il prend la place
+            // de la dernière case du sac qui n'est pas lui.
+            if left > 0 && self.is_legend(Some(h)) {
+                if let Some(slot) = self.slots.iter_mut().rev().find(|s| !matches!(s, Some(st) if st.item == Item::Zeus)) {
+                    *slot = Some(Stack { item: h.item, count: 1 });
+                }
+            }
         }
     }
 
@@ -1037,9 +1122,18 @@ impl Inventory {
             return;
         }
         // Poubelle : détruit l'objet tenu ; Maj + clic : vide tout l'inventaire.
+        // (v241) Sauf l'objet légendaire : il reste au bout du curseur, ou dans sa case.
         if Creative::inside(c.trash, c.slot, x, y) {
+            if self.is_legend(self.held) {
+                self.notice = Some(LEGEND_KEPT);
+                return;
+            }
             if self.held.take().is_none() && shift {
-                self.slots = [None; SLOTS];
+                for i in 0..SLOTS {
+                    if !self.is_legend(self.slots[i]) {
+                        self.slots[i] = None;
+                    }
+                }
             }
             return;
         }
@@ -1049,20 +1143,43 @@ impl Inventory {
                 return;
             };
             // Objet tenu relâché sur le catalogue : il disparaît (comme dans Minecraft).
+            // (v241) Pas l'objet légendaire.
+            if self.is_legend(self.held) {
+                self.notice = Some(LEGEND_KEPT);
+                return;
+            }
             if self.held.take().is_some() {
                 return;
             }
-            let count = if right { 1 } else { MAX_STACK };
+            // (v241) La Foudre de Zeus : un seul exemplaire, une seule fois par carte.
+            let legend = self.legend && item == Item::Zeus;
+            if legend && !self.legend_free {
+                self.notice = Some(LEGEND_GONE);
+                return;
+            }
+            let count = if right || legend { 1 } else { MAX_STACK };
             if shift {
+                // (Jamais par-dessus l'objet légendaire.)
                 let slot = (0..HOTBAR)
                     .find(|&i| self.slots[i].is_none())
-                    .unwrap_or(self.selected);
+                    .or_else(|| {
+                        std::iter::once(self.selected)
+                            .chain(0..HOTBAR)
+                            .find(|&i| !self.is_legend(self.slots[i]))
+                    });
+                let Some(slot) = slot else {
+                    return;
+                };
                 self.slots[slot] = Some(Stack {
                     item,
-                    count: MAX_STACK,
+                    count: if legend { 1 } else { MAX_STACK },
                 });
             } else {
                 self.held = Some(Stack { item, count });
+            }
+            if legend {
+                self.legend_free = false;
+                self.legend_took = true;
             }
             return;
         }
@@ -1073,7 +1190,12 @@ impl Inventory {
             // Maj + clic sur une case de son inventaire (rien en main) : l'objet est
             // supprimé, comme dans l'inventaire créatif de Minecraft.
             if shift && self.held.is_none() {
-                self.slots[i] = None;
+                // (v241) Pas l'objet légendaire.
+                if self.is_legend(self.slots[i]) {
+                    self.notice = Some(LEGEND_KEPT);
+                } else {
+                    self.slots[i] = None;
+                }
             } else {
                 self.click_slot(i, right);
             }
@@ -1574,8 +1696,13 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
         let c = brighten(CHEMICALS[i].rgb);
         ui.text(x + s + ts, y + s + ts, ts, col(c, 1.0), CHEMICALS[i].symbol);
     }
-    if st.count > 1 {
-        let t = st.count.to_string();
+    // (v241) Sur la Foudre de Zeus : ses charges (0 à 10), à la place du nombre de la pile.
+    let charges = match st.item {
+        Item::Zeus => crate::zeus::shown(),
+        _ => None,
+    };
+    if st.count > 1 || charges.is_some() {
+        let t = charges.map_or(st.count, u32::from).to_string();
         let w = Ui::text_width(&t, ts);
         ui.text(
             x + slot - w - 2.0 * ts,
@@ -1666,6 +1793,85 @@ mod tests {
             .map(|s| s.count)
             .sum();
         assert_eq!(total, 64);
+    }
+
+    /// (v241) La Foudre de Zeus, objet légendaire : le catalogue en donne un seul exemplaire,
+    /// une seule fois par carte ; ni la poubelle, ni Maj + clic, ni le catalogue ne la
+    /// suppriment ; une carte d'avant qui en a des piles n'en garde qu'une.
+    #[test]
+    fn the_legendary_bolt_is_taken_once_and_never_deleted() {
+        let mut inv = Inventory::empty();
+        inv.creative = true;
+        inv.open = true;
+        inv.legend = true;
+        inv.legend_free = true;
+        inv.search_input("foudre de zeus", false, 0.0);
+        assert_eq!(inv.filtered(), vec![Item::Zeus]);
+        let size = (1280.0, 720.0);
+        let c = Creative::new(size.0, size.1);
+        let mid = |p: (f32, f32)| (p.0 + c.slot / 2.0, p.1 + c.slot / 2.0);
+        // Pris : un seul, et le catalogue le sait.
+        inv.click(size, mid(c.cell_pos(0)), false, false);
+        assert_eq!(inv.held, Some(Stack { item: Item::Zeus, count: 1 }));
+        assert!(inv.legend_took && !inv.legend_free && inv.has_zeus());
+        // Relâché sur le catalogue ou sur la poubelle : il reste au bout du curseur.
+        inv.click(size, mid(c.cell_pos(0)), false, false);
+        assert!(inv.held.is_some() && inv.notice.take() == Some(LEGEND_KEPT));
+        inv.click(size, mid(c.trash), false, false);
+        assert!(inv.held.is_some() && inv.notice.take() == Some(LEGEND_KEPT));
+        // Posé dans la barre ; un second ne se prend pas, même avec Maj.
+        inv.click(size, mid(c.hotbar_pos(3)), false, false);
+        assert!(inv.held.is_none() && inv.slots[3].is_some());
+        for shift in [false, true] {
+            inv.click(size, mid(c.cell_pos(0)), false, shift);
+            assert!(inv.held.is_none() && inv.notice.take() == Some(LEGEND_GONE));
+        }
+        let zeus = |inv: &Inventory| {
+            inv.slots.iter().flatten().filter(|s| s.item == Item::Zeus).map(|s| s.count).sum::<u32>()
+        };
+        assert_eq!(zeus(&inv), 1);
+        // Maj + clic sur sa case, Maj + clic sur la poubelle (tout vider) : il reste.
+        inv.slots[5] = Some(Stack { item: Item::Wand, count: 1 });
+        inv.click(size, mid(c.hotbar_pos(3)), false, true);
+        assert!(inv.slots[3].is_some() && inv.notice.take() == Some(LEGEND_KEPT));
+        inv.click(size, mid(c.trash), false, true);
+        assert!(inv.slots[5].is_none() && zeus(&inv) == 1);
+        // Maj + clic dans le catalogue, barre pleine : un autre objet ne prend pas sa place.
+        inv.search.clear();
+        inv.search_input("baguette", false, 0.0);
+        inv.selected = 3;
+        for i in 0..HOTBAR {
+            if i != 3 {
+                inv.slots[i] = Some(Stack { item: Item::Flashlight, count: 1 });
+            }
+        }
+        inv.click(size, mid(c.cell_pos(0)), false, true);
+        assert_eq!(zeus(&inv), 1);
+        assert_eq!(inv.slots[3].map(|s| s.item), Some(Item::Zeus));
+        // Fermer l'inventaire plein avec lui au bout du curseur : il n'est pas perdu.
+        for slot in inv.slots.iter_mut() {
+            *slot = Some(Stack { item: Item::Flashlight, count: MAX_STACK });
+        }
+        inv.held = Some(Stack { item: Item::Zeus, count: 1 });
+        inv.close();
+        assert_eq!(zeus(&inv), 1);
+        // Carte d'avant : des piles de 64. Il n'en reste qu'une, d'un seul éclair ; ou aucune
+        // si celui de la carte est déjà ailleurs.
+        let mut old = Inventory::empty();
+        old.slots[0] = Some(Stack { item: Item::Zeus, count: 64 });
+        old.slots[7] = Some(Stack { item: Item::Zeus, count: 3 });
+        assert!(old.keep_one_zeus(true) && zeus(&old) == 1 && old.slots[7].is_none());
+        assert!(!old.keep_one_zeus(false) && zeus(&old) == 0);
+        assert!(!Inventory::empty().keep_one_zeus(true));
+        // Sur un serveur de construction (règles pas encore tenues par le relais) : comme
+        // avant.
+        let mut net = Inventory::empty();
+        net.creative = true;
+        net.open = true;
+        net.search_input("foudre de zeus", false, 0.0);
+        net.click(size, mid(c.cell_pos(0)), false, false);
+        assert_eq!(net.held.map(|h| h.count), Some(MAX_STACK));
+        assert!(!net.legend_took);
     }
 
     #[test]

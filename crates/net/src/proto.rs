@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 /// invisible (`Request::Presence`).
 /// (v240) 60 : clés d'accès (`Request::PasskeyChallenge`, `PasskeyLogin`, `PasskeyAdd`,
 /// `PasskeyList`, `PasskeyRemove`).
-pub const PROTOCOL: u32 = 60;
+/// (v241) 61 : la Foudre de Zeus dans le dos de qui l'a sur lui sans la tenir (bit
+/// `poses::Held::BACK` de l'objet tenu, avec la position ; un jeu d'avant rejetait tout le
+/// paquet des positions qui le contient).
+pub const PROTOCOL: u32 = 61;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.

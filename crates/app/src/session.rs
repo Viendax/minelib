@@ -269,6 +269,9 @@ pub struct Session {
     /// réservée aux OP.
     thor_seq: u32,
     thor_refused: Option<std::time::Instant>,
+    /// (v241) La Foudre de Zeus de la carte, objet légendaire : prise ou non, ses charges
+    /// (`crate::zeus`). Gardée avec la carte.
+    legend: crate::zeus::Legend,
     daylight: f32,
     break_cooldown: f32,
     place_cooldown: f32,
@@ -692,6 +695,7 @@ impl Session {
             daylight_shown: crate::daytime::daylight(time_h),
             thor_seq: 0,
             thor_refused: None,
+            legend: crate::zeus::Legend::load(&data.zeus),
             daylight: crate::daytime::daylight(time_h),
             break_cooldown: 0.0,
             dig: None,
@@ -929,6 +933,7 @@ impl Session {
             time: self.time_h,
             time_fixed: self.time_fixed,
             weather: self.storm.weather.save(),
+            zeus: self.legend_saved(),
             inventory: Some(inv),
             spawn: self.spawn_set.then_some(self.spawn.to_array()),
         };
@@ -968,6 +973,7 @@ impl Session {
             time: self.time_h,
             time_fixed: self.time_fixed,
             weather: self.storm.weather.save(),
+            zeus: self.legend_saved(),
             inventory: None,
             spawn: self.spawn_set.then_some(self.spawn.to_array()),
         };
@@ -1122,6 +1128,7 @@ impl Session {
             self.pings.retain(|p| p.1 < PING_S);
             self.since_space += dt;
             self.inventory.creative = self.game.mode == GameMode::Creative;
+            self.sync_legend();
             if self.inventory.open && self.inventory.chest.is_some() && !typing {
                 // Coffre ouvert : E (ou Échap) le referme.
                 if self.keys.pressed(input, Action::Inventory) {
@@ -1595,6 +1602,11 @@ impl Session {
                     self.world.journal = Some(Vec::new());
                 }
                 b.held = held;
+                // (v241) La Foudre de Zeus sur soi sans la tenir : les autres la voient dans
+                // notre dos.
+                b.back = self.game.mode.has_inventory()
+                    && self.inventory.has_zeus()
+                    && held != Some(minelib_net::poses::Held::Zeus);
                 let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
                 let (caps, dirty) = b.update(
                     &mut self.world,
@@ -2016,7 +2028,7 @@ impl Session {
                 list.insert((at + k).min(list.len()), l);
             }
             if allowed {
-                self.storm.lights(cam, &mut list);
+                self.storm.lights(cam, self.daylight * self.storm.light(), &mut list);
             }
             list.truncate(minelib_render::MAX_DYN_LIGHTS);
             renderer.set_dyn_lights(&list, &self.lights.settings.render);
@@ -2652,6 +2664,17 @@ impl Session {
             self.items_seeded = false;
             if !online && self.net.is_none() {
                 self.items.restore(&Items::load(&self.dir));
+                // (v241) La Foudre de Zeus est unique : une carte d'avant peut en avoir des
+                // piles de 64, au sol et dans des coffres aussi. Il n'en reste qu'une, celle
+                // de l'inventaire d'abord. Aucune nulle part : elle peut de nouveau être
+                // prise (rien ne la supprime).
+                let mine = self.inventory.keep_one_zeus(true);
+                let elsewhere = self.items.keep_one_legend(!mine);
+                if mine || elsewhere {
+                    self.legend.taken = true;
+                } else {
+                    self.legend = crate::zeus::Legend::default();
+                }
             }
         }
         // Propriétaire d'un monde en ligne : sa sauvegarde est remise au relais, une fois.
@@ -2701,12 +2724,20 @@ impl Session {
             {
                 let all = input.held(KeyCode::ControlLeft) || input.held(KeyCode::ControlRight);
                 let n = if all { crate::inventory::MAX_STACK } else { 1 };
-                if let Some(st) = self.inventory.take_from(self.inventory.selected, n) {
-                    let path = crate::equip::toss_path(
-                        &self.world,
-                        self.player.eye(),
-                        self.player.look_dir(),
+                // (v241) La Foudre de Zeus ne se jette pas dans le vide (rien ne la
+                // supprime) : sans sol où tomber, elle reste en main.
+                let path = crate::equip::toss_path(
+                    &self.world,
+                    self.player.eye(),
+                    self.player.look_dir(),
+                );
+                let lost = path.last().is_none_or(|p| p.y < 1.0);
+                if lost && self.legend_on() && self.inventory.selected_item() == Some(Item::Zeus) {
+                    self.chat.say(
+                        "La Foudre de Zeus ne peut pas être jetée dans le vide.",
+                        chat::GREY,
                     );
+                } else if let Some(st) = self.inventory.take_from(self.inventory.selected, n) {
                     let pile = Pile {
                         item: st.item.code(),
                         count: st.count.min(64) as u8,
@@ -2857,6 +2888,13 @@ impl Session {
     /// pour le personnage caché, qui l'a trouvé) ; dans la nôtre menée en ligne, les joueurs
     /// proches sauront que nous l'avons trouvé.
     fn hit_npc(&mut self, target: NpcTarget) {
+        self.hit_npc_for(target, crate::crowd::PUNCH);
+    }
+
+    /// (v241) Le même coup, qui ôte `amount` points de vie au PNJ de notre foule (l'arc court
+    /// de la Foudre de Zeus : `zeus::ARC_DAMAGE`). (Celui de la foule d'un autre OP : son
+    /// jeu en décide.)
+    fn hit_npc_for(&mut self, target: NpcTarget, amount: f32) {
         let (eye, center) = (self.player.eye(), self.player.pos);
         match target {
             NpcTarget::Mine(i) => {
@@ -2864,7 +2902,7 @@ impl Session {
                     return;
                 };
                 let at = c.npcs[i].pos;
-                match c.hit(&self.world, i, eye, center) {
+                match c.hit_for(&self.world, i, eye, center, amount) {
                     crate::crowd::Hit::Npc => {
                         self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.55));
                     }
@@ -3181,6 +3219,13 @@ impl Session {
         // (v216) Foudre de Zeus tenue : clic gauche, la foudre tombe là où l'on vise, comme
         // avec /thor (rien n'est cassé, même en créatif).
         if self.inventory.selected_item() == Some(Item::Zeus) && keys.held(input, Action::Attack) {
+            // (v241) Objet légendaire : chargé ou non, le coup n'est pas le même.
+            if self.legend_on() {
+                if keys.pressed(input, Action::Attack) && self.storm.cooldown <= 0.0 {
+                    self.zeus_blow();
+                }
+                return;
+            }
             if keys.pressed(input, Action::Attack) && self.storm.cooldown <= 0.0 {
                 // (v235) Un PNJ visé : la foudre tombe sur lui (`aimed`). (v238) Elle le blesse
                 // en tombant, comme un joueur, et le fait sauter (`Crowd::struck`) : plus de
@@ -3898,6 +3943,25 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
+        // (v241) Ceux qui l'ont sur eux sans la tenir : dans leur dos.
+        let backs: Vec<(Mat4, f32)> = self
+            .build
+            .as_ref()
+            .map(|b| {
+                b.others
+                    .values()
+                    .filter(|o| o.back && o.pos.distance_squared(cam) < ZEUS_SEEN * ZEUS_SEEN)
+                    .filter_map(|o| {
+                        let pose = self.other_pose(o, None);
+                        let phase = o.pseudo.bytes().map(f32::from).sum::<f32>() % 6.28;
+                        Some((crate::player_model::zeus_back_frame(&pose)?, phase))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (place, phase) in backs {
+            self.storm.back_item(place, phase);
+        }
         // (Ceux qui l'ont rangé : leurs étincelles finissent leur course, puis on les oublie.)
         let mut arcs = Vec::new();
         for (pseudo, bolt) in &mut self.remote_bolts {
@@ -3953,6 +4017,115 @@ impl Session {
             && self.game.mode != GameMode::Spectator
     }
 
+    /// (v241) A-t-on la Foudre de Zeus sur soi sans la tenir (on la voit alors dans son dos) ?
+    fn zeus_on_back(&self) -> bool {
+        self.game.mode.has_inventory()
+            && self.spectating.is_none()
+            && self.game.mode != GameMode::Spectator
+            && self.inventory.has_zeus()
+            && !self.holding_zeus()
+    }
+
+    /// (v241) Les règles de l'objet légendaire valent-elles ici ? En solo. Sur un serveur de
+    /// construction, le relais ne les tient pas encore (il valide tout : rien n'y est décidé
+    /// par le jeu seul) ; la foudre y reste celle des OP.
+    fn legend_on(&self) -> bool {
+        self.build.is_none() && self.net.is_none() && self.game.mode != GameMode::Fps
+    }
+
+    /// (v241) Ce qu'on garde de l'éclair avec la carte (rien tant qu'il n'a pas été pris).
+    fn legend_saved(&self) -> String {
+        if self.legend.taken {
+            self.legend.save()
+        } else {
+            String::new()
+        }
+    }
+
+    /// (v241) Chaque image : l'inventaire sait si l'éclair de la carte peut encore être pris,
+    /// la partie note qu'il vient de l'être, les refus sont dits, et l'icône montre ses
+    /// charges.
+    fn sync_legend(&mut self) {
+        let on = self.legend_on();
+        self.inventory.legend = on;
+        if std::mem::take(&mut self.inventory.legend_took) && on {
+            self.legend.taken = true;
+        }
+        self.inventory.legend_free = on && !self.legend.taken;
+        if let Some(text) = self.inventory.notice.take() {
+            self.chat.say(text, chat::GREY);
+        }
+        crate::zeus::show(on.then_some(self.legend.charges));
+    }
+
+    /// (v241) Un coup de la Foudre de Zeus, objet légendaire. Vers le ciel : la foudre monte
+    /// de sa pointe, et deux coups font une charge. Chargée : la foudre tombe du ciel sur le
+    /// bloc, le joueur ou le PNJ visé à moins de 128 blocs (une charge de moins), même tout
+    /// près. Sans charge : un arc part de sa pointe jusqu'à ce qu'on vise, 8 blocs au plus ;
+    /// il part même si l'on ne vise rien (il finit alors en l'air). Rend vrai si un coup est
+    /// parti.
+    fn zeus_blow(&mut self) -> bool {
+        use crate::zeus::{Blow, ARC_REACH, STRIKE_REACH};
+        let (eye, dir) = (self.player.eye(), self.player.look_dir());
+        let block = raycast(&self.world, eye.into(), dir.into(), STRIKE_REACH);
+        let limit = block.as_ref().map_or(STRIKE_REACH, |h| h.distance);
+        let person = self.aimed_person(limit);
+        // Ce qu'on vise : quelqu'un devant le premier bloc, sinon ce bloc.
+        let target = match (&person, &block) {
+            (Some((feet, _, t)), _) => Some((*feet, *t)),
+            (None, Some(h)) => Some((eye + dir * h.distance, h.distance)),
+            (None, None) => None,
+        };
+        // Rien à moins de 128 blocs : le ciel, si l'on regarde au-dessus de l'horizon.
+        let blow = self
+            .legend
+            .blow(target.is_none() && dir.y > 0.0, target.is_some());
+        let someone = person.is_some();
+        let npc = person.and_then(|(_, npc, t)| Some((npc?, t)));
+        match (blow, target) {
+            (Blow::Sky, _) => {
+                self.throw_lightning(Aim::Sky(dir));
+                self.legend.sky_hit();
+            }
+            // (La foudre blesse en tombant ceux qu'elle touche, PNJ compris : `storm.landed`.)
+            (Blow::Strike, Some((pos, _))) => {
+                self.legend.spend();
+                self.throw_lightning(Aim::Ground(pos));
+            }
+            (Blow::Arc, _) => {
+                let tip = self.zeus_tip();
+                match target.filter(|(_, d)| *d <= ARC_REACH) {
+                    // À portée : jusqu'à lui (quelqu'un : à mi-corps, pas à ses pieds).
+                    Some((pos, _)) => {
+                        let to = if someone { pos + Vec3::Y * 0.9 } else { pos };
+                        self.storm.strike_arc(tip, to);
+                        if let Some((target, _)) = npc {
+                            self.hit_npc_for(target, f32::from(crate::zeus::ARC_DAMAGE));
+                        }
+                    }
+                    // Rien à portée : il part quand même, et finit en l'air 8 blocs plus loin.
+                    None => self.storm.strike_arc(tip, eye + dir * ARC_REACH),
+                }
+            }
+            _ => {
+                // Chargée, rien à viser : dit dans le tchat, au plus toutes les 3 s.
+                let quiet = self
+                    .thor_refused
+                    .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
+                if !quiet {
+                    self.thor_refused = Some(std::time::Instant::now());
+                    self.chat.say(
+                        format!("Trop loin : la foudre porte à {STRIKE_REACH:.0} blocs."),
+                        chat::GREY,
+                    );
+                }
+                return false;
+            }
+        }
+        self.storm.cooldown = crate::storm::ZEUS_COOLDOWN;
+        true
+    }
+
     /// (v216) Lumière de la Foudre de Zeus tenue : au poing, avec les ombres (celle du
     /// joueur comprise, sauf sa main), scintillante comme l'éclair.
     fn zeus_light(&self) -> Option<minelib_render::DynLight> {
@@ -3986,6 +4159,9 @@ impl Session {
                 active,
                 online: self.build.is_some(),
                 covered: covered_above(&self.world, eye),
+                // (v241) Celui qui porte l'éclair légendaire : le joueur, s'il l'a sur lui.
+                holder: (self.legend_on() && self.inventory.has_zeus())
+                    .then_some(self.player.pos),
             },
         );
         if hurt > 0 {
@@ -4009,28 +4185,65 @@ impl Session {
                 self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, g));
             }
         }
+        // (v241) Un éclair a couru dans les nuages au-dessus de lui : une charge de plus.
+        for _ in 0..self.storm.charged {
+            if self.legend.charge() {
+                self.chat.say(
+                    format!(
+                        "Un éclair a chargé la Foudre de Zeus ({} / {}).",
+                        self.legend.charges,
+                        crate::zeus::MAX_CHARGES
+                    ),
+                    chat::GREY,
+                );
+            }
+        }
         // Essais : MINELIB_ZEUS=1 (la Foudre de Zeus en main à l'arrivée), MINELIB_THOR=<s>
         // (la foudre tombe là où l'on regarde, toutes les <s> secondes).
-        static TESTS: std::sync::OnceLock<(bool, Option<f32>)> = std::sync::OnceLock::new();
+        static TESTS: std::sync::OnceLock<(u8, Option<f32>)> = std::sync::OnceLock::new();
         let (zeus, thor) = *TESTS.get_or_init(|| {
             (
-                std::env::var("MINELIB_ZEUS").is_ok_and(|v| v.trim() == "1"),
+                // (v241) 2 : sur soi sans la tenir (dans la case d'à côté).
+                std::env::var("MINELIB_ZEUS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u8>().ok())
+                    .filter(|v| (1..=2).contains(v))
+                    .unwrap_or(0),
                 std::env::var("MINELIB_THOR")
                     .ok()
                     .and_then(|v| v.trim().parse::<f32>().ok())
                     .filter(|s| *s > 0.0),
             )
         });
-        if zeus && !std::mem::replace(&mut self.storm.test_given, true) {
-            self.inventory.slots[self.inventory.selected] = Some(inventory::Stack {
+        if zeus > 0 && !std::mem::replace(&mut self.storm.test_given, true) {
+            self.inventory.keep_one_zeus(false);
+            self.items.keep_one_legend(false);
+            let slot = (self.inventory.selected + usize::from(zeus - 1)) % inventory::HOTBAR;
+            self.inventory.slots[slot] = Some(inventory::Stack {
                 item: Item::Zeus,
                 count: 1,
             });
+            // (v241) MINELIB_ZEUS_CHARGES=<n> : avec tant de charges.
+            self.legend = crate::zeus::Legend {
+                taken: true,
+                charges: std::env::var("MINELIB_ZEUS_CHARGES")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u8>().ok())
+                    .unwrap_or(0)
+                    .min(crate::zeus::MAX_CHARGES),
+                sky_hits: 0,
+            };
         }
         if let Some(every) = thor {
             self.storm.test_in -= dt;
             if self.storm.test_in <= 0.0 {
-                if let Some(aim) = self.aimed() {
+                // (v241) L'éclair légendaire en main : un coup de lui (chargé ou non), pas
+                // la foudre de `/thor`.
+                if zeus == 1 && self.legend_on() && self.holding_zeus() {
+                    if self.zeus_blow() {
+                        self.storm.test_in = every;
+                    }
+                } else if let Some(aim) = self.aimed() {
                     self.storm.test_in = every;
                     self.cast_lightning(aim);
                 }
@@ -4080,6 +4293,16 @@ impl Session {
             let place = crate::player_model::zeus_frame(&pose)
                 .unwrap_or_else(|| Mat4::from_translation(self.player.eye()));
             self.storm.hold(dt, place, None, on);
+        }
+        // (v241) « On voit l'éclair dans le dos du joueur, comme la bombe en FPS, quand il
+        // ne l'a pas en main mais dans son inventaire » : le sien, vu de derrière (à la
+        // première personne on ne voit pas son dos).
+        if !on && self.zeus_on_back() && (third != 0 || self.light_editor.free_cam.is_some()) {
+            let mut pose = self.own_pose(crate::player_model::Held::Zeus);
+            pose.held = None;
+            if let Some(place) = crate::player_model::zeus_back_frame(&pose) {
+                self.storm.back_item(place, 0.37);
+            }
         }
         // (v217) Les Foudres de Zeus posées au sol : le même éclair, (v235) de la même taille.
         for (at, phase) in self.items.bolts(eye) {
@@ -7079,8 +7302,15 @@ impl Session {
                         "foudre" | "foudre_de_zeus" | "zeus" | "eclair" | "éclair" | "lightning"
                     ) =>
                     {
-                        self.inventory.add(Item::Zeus, 1);
-                        self.chat.say("Foudre de Zeus donnée.", chat::YELLOW);
+                        // (v241) Objet légendaire : un seul par carte, une seule fois.
+                        if self.legend_on() && self.legend.taken {
+                            self.chat.say(crate::inventory::LEGEND_GONE, chat::RED);
+                        } else if self.inventory.add(Item::Zeus, 1) > 0 {
+                            self.chat.say("Pas de place dans l'inventaire.", chat::RED);
+                        } else {
+                            self.legend.taken |= self.legend_on();
+                            self.chat.say("Foudre de Zeus donnée.", chat::YELLOW);
+                        }
                     }
                     // (v201) Lampe torche (« /give lampe torche » aussi) : une seule, sauf
                     // nombre donné.

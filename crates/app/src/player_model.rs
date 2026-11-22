@@ -1843,6 +1843,49 @@ mod tests {
     /// Poses d'essai : immobile au skin par défaut, en marche avec un skin et une arme à feu
     /// (les deux bras tendus), accroupi regardant vers le haut avec un bloc en main, et
     /// couteau en main (le bras droit seul).
+    /// (v241) La Foudre de Zeus dans le dos : derrière le corps (jamais dedans), en travers
+    /// (de la hanche gauche à par-dessus l'épaule droite), de la taille de celle qu'on tient,
+    /// et elle suit le joueur qui tourne ou s'accroupit.
+    #[test]
+    fn the_bolt_on_the_back_lies_across_the_back() {
+        let half = crate::lightning::HELD_LEN * 0.5;
+        for (yaw, crouch) in [(0.0f32, 0.0f32), (1.3, 0.0), (-2.0, 1.0)] {
+            let pose = Pose {
+                feet: Vec3::new(4.0, 70.0, -3.0),
+                yaw,
+                pitch: 0.2,
+                walk: 0.4,
+                swing: 0.5,
+                crouch,
+                light: [1.0; 3],
+                held: None,
+                skin: None,
+            };
+            let m = zeus_back_frame(&pose).unwrap();
+            // Repère du joueur : x à droite, z vers l'arrière.
+            let local = |p: Vec3| Mat4::from_rotation_y(pose.yaw).transform_vector3(p - pose.feet);
+            let (low, mid, top) = (
+                local(m.transform_point3(-Vec3::Y * half)),
+                local(m.transform_point3(Vec3::ZERO)),
+                local(m.transform_point3(Vec3::Y * half)),
+            );
+            assert!(((top - low).length() - crate::lightning::HELD_LEN).abs() < 1e-3);
+            assert!(top.x > 0.2 && low.x < -0.2 && top.y > low.y + 0.6, "{low} {top}");
+            // À 45°, comme son icône (debout).
+            if crouch == 0.0 {
+                let d = top - low;
+                assert!((d.x - d.y).abs() < 0.05 && d.z.abs() < 0.05, "{d}");
+            }
+            // Derrière le dos (le corps fait 4 pixels d'épaisseur : son dos est à 2 pixels).
+            if crouch == 0.0 {
+                assert!(mid.z > 2.5 * PX && mid.z < 5.0 * PX, "{mid}");
+                assert!(mid.x.abs() < 0.05 && mid.y > 0.9 && mid.y < 1.3, "{mid}");
+            } else {
+                assert!(mid.y < 1.2 && low.z > 0.0);
+            }
+        }
+    }
+
     fn test_poses() -> Vec<Pose> {
         let skin = test_skin();
         let ak = crate::weapons::WEAPONS
@@ -2447,6 +2490,26 @@ pub fn bomb(pos: Vec3, blink: bool, light: [f32; 3]) -> Vec<EntityVertex> {
     emit_item(&mut out, xf, [2.0, 3.0, -1.0], [3.0, 3.6, 0.0], led, light);
     out
 }
+
+/// (v241) Foudre de Zeus portée dans le dos (il l'a sur lui sans la tenir), « comme la bombe
+/// en FPS » : son repère dans le monde (son milieu à l'origine, l'éclair le long de +y, en
+/// blocs). En travers du dos comme sur son icône (« dans le dos du joueur, en travers comme
+/// l'item ») : à 45°, du bas à gauche au haut à droite pour qui le voit de dos, à un pixel du
+/// dos ; elle suit le corps (accroupi, penché).
+pub fn zeus_back_frame(pose: &Pose) -> Option<Mat4> {
+    let body = parts(pose).into_iter().find(|p| p.3 == Part::Body)?;
+    // Repère du corps en pixels (y de la hanche aux épaules, z = 2 : le dos).
+    Some(
+        body.0
+            * Mat4::from_translation(Vec3::new(0.0, 7.0, 3.2))
+            * Mat4::from_rotation_z(-ZEUS_BACK_TILT)
+            * Mat4::from_scale(Vec3::splat(1.0 / PX)),
+    )
+}
+
+/// (v241) Penché de la Foudre de Zeus dans le dos (rad, depuis la verticale) : celui de son
+/// icône.
+pub const ZEUS_BACK_TILT: f32 = std::f32::consts::FRAC_PI_4;
 
 /// (v179) Bombe portée sur le dos : debout (sa longueur le long du dos), son dessous contre
 /// le dos du joueur, le clavier vers l'arrière. Le modèle est celui de la main, à la même

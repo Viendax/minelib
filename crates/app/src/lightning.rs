@@ -174,6 +174,9 @@ pub enum Kind {
     Sky,
     /// Dans les nuages pendant l'orage : il court sous leur base et dedans, sans tomber.
     Cloud,
+    /// (v241) Arc court de la pointe de la Foudre de Zeus sans charge jusqu'à ce qu'on vise
+    /// (8 blocs au plus) : il ne passe pas par le ciel.
+    Arc,
 }
 
 /// Un coup de foudre.
@@ -252,6 +255,14 @@ impl Strike {
         Self::build(Kind::Cloud, main, dip, cloud_base, seed, 0.0, rng)
     }
 
+    /// (v241) Arc de la Foudre de Zeus sans charge : de sa pointe `from` à ce qu'on vise,
+    /// `to`, tout droit (il ne passe pas par le ciel), avec quelques rameaux.
+    pub fn arc(from: Vec3, to: Vec3, seed: u32) -> Self {
+        let mut rng = Rng::new(seed as u64 | 0x54_0000_0000);
+        let main = jagged(from, to, 5, 0.2, &mut rng);
+        Self::build(Kind::Arc, main, to, f32::MAX, seed, 0.0, rng)
+    }
+
     /// Le canal `main` (du départ du traceur à son arrivée), ses branches et son déroulé.
     fn build(
         kind: Kind,
@@ -267,6 +278,8 @@ impl Strike {
         // près d'elle (sinon son halo remplirait l'écran), puis prend sa largeur.
         let wide = |p: Vec3| match kind {
             Kind::Sky => ((p - start).length() * 0.035 / 1.7).clamp(0.03, 1.0),
+            // (v241) L'arc court est fin d'un bout à l'autre.
+            Kind::Arc => 0.14,
             _ => 1.0,
         };
         let lengths: Vec<f32> = main.windows(2).map(|w| (w[1] - w[0]).length()).collect();
@@ -302,6 +315,8 @@ impl Strike {
             let ahead = (main[(i + 4).min(n)] - main[i]).normalize_or(Vec3::NEG_Y);
             let room = match kind {
                 Kind::Ground => (main[i].y - end.y).max(8.0),
+                // (v241) Les rameaux de l'arc court sont à sa mesure.
+                Kind::Arc => (end - main[i]).length(),
                 _ => (end - main[i]).length().clamp(8.0, 320.0),
             };
             let mut len = room * rng.range(0.14, 0.45);
@@ -337,6 +352,7 @@ impl Strike {
             Kind::Ground => rng.range(0.045, 0.075),
             Kind::Sky => rng.range(0.06, 0.1),
             Kind::Cloud => rng.range(0.09, 0.17),
+            Kind::Arc => rng.range(0.012, 0.022),
         };
         let mut strokes = vec![(leader_s, 1.0)];
         let mut t = leader_s;
@@ -499,6 +515,7 @@ impl Strike {
                     Kind::Ground => smooth(0.0, 0.07, s),
                     Kind::Sky => 1.0 - smooth(0.88, 1.0, s),
                     Kind::Cloud => smooth(0.0, 0.06, s) * (1.0 - smooth(0.94, 1.0, s)),
+                    Kind::Arc => 1.0,
                 };
                 let base = match p.level {
                     0 => main,
@@ -535,7 +552,7 @@ impl Strike {
         // (v217) Dans la couche de nuages, le canal éclaire le nuage de l'intérieur : une
         // lueur large et douce le long de lui, par tronçons de huit morceaux (le rendu ne la
         // montre que là où il y a du nuage, voir bolt.wgsl).
-        if self.kind == Kind::Ground {
+        if matches!(self.kind, Kind::Ground | Kind::Arc) {
             return;
         }
         let level = if since >= 0.0 { main } else { 0.25 };
@@ -1329,6 +1346,38 @@ mod tests {
         let g = Strike::new(from, 8, 420.0, 0.0);
         let [low, high] = g.light_points();
         assert!((low - from).length() < 5.0 && (high - from).length() < 28.0);
+    }
+
+    /// (v241) L'arc de la Foudre de Zeus sans charge : de la pointe à la cible, tout droit
+    /// (il ne monte pas au ciel), fin, bref, et il ne blesse pas comme la foudre qui tombe.
+    #[test]
+    fn the_short_arc_goes_straight_from_the_tip_to_the_target() {
+        let (from, to) = (Vec3::new(0.0, 66.0, 0.0), Vec3::new(6.0, 65.5, 2.0));
+        let mut s = Strike::arc(from, to, 3);
+        assert_eq!(s.kind, Kind::Arc);
+        let main: Vec<_> = s.pieces.iter().take_while(|p| p.level == 0).collect();
+        assert!(main[0].a == from && main[main.len() - 1].b == to);
+        let span = (to - from).length();
+        // Aucun morceau (canal, rameaux) ne s'écarte de plus de la moitié de sa longueur.
+        for p in &s.pieces {
+            let t = ((p.b - from).dot(to - from) / (span * span)).clamp(0.0, 1.0);
+            let off = (from + (to - from) * t - p.b).length();
+            assert!(off < span * 0.5, "{off}");
+            assert!(p.wa <= 0.2 && p.wb <= 0.2, "fin d'un bout à l'autre");
+        }
+        assert!(!s.hurts(to) && !s.hurts(to - Vec3::Y));
+        let mut landed = 0;
+        let mut segs = Vec::new();
+        for _ in 0..600 {
+            landed += usize::from(s.update(0.002));
+            s.segments(from + Vec3::new(0.0, 0.0, 3.0), &mut segs);
+        }
+        assert_eq!(landed, 1);
+        assert!(!segs.is_empty() && s.done());
+        let top = segs.iter().map(|g| g.a[1].max(g.b[1])).fold(f32::MIN, f32::max);
+        assert!(top < 72.0, "il ne passe pas par le ciel : {top}");
+        // (Aucune lueur dans les nuages.)
+        assert!(segs.iter().all(|g| g.a[3] == BOLT));
     }
 
     /// Dégâts comme dans Minecraft : dans la boîte de 3 blocs autour du point frappé.

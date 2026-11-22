@@ -27,6 +27,11 @@ pub const CHEST_SLOTS: usize = 30;
 pub const MAX_PILE: u8 = 64;
 /// Objets au sol gardés par monde (au-delà, les plus anciens disparaissent).
 pub const MAX_DROPS: usize = 4096;
+/// (v241) Code de l'objet légendaire (la Foudre de Zeus du jeu, `Item::Zeus`) : il n'y en a
+/// qu'un par carte et rien ne le supprime. Posé au sol, il n'est jamais celui qui disparaît
+/// quand il y a trop d'objets ; il ne se met pas en pile.
+pub const LEGEND_ITEM: u32 = 0x5_0000;
+
 /// Coffres garnis par monde (au-delà, on ne peut plus en remplir de nouveau).
 pub const MAX_CHESTS: usize = 65_536;
 
@@ -203,11 +208,10 @@ impl ItemStore {
                 let mut out = Vec::new();
                 // Trop d'objets au sol : le plus ancien encore là disparaît.
                 if self.live_drops().count() >= MAX_DROPS {
-                    let oldest = self
-                        .order
-                        .iter()
-                        .copied()
-                        .find(|i| matches!(self.drops.get(i), Some(Some(_))));
+                    // ((v241) Jamais l'objet légendaire.)
+                    let oldest = self.order.iter().copied().find(|i| {
+                        matches!(self.drops.get(i), Some(Some(d)) if d.pile.item != LEGEND_ITEM)
+                    });
                     if let Some(old) = oldest {
                         let at = self.drops[&old].map_or(pos, |d| d.pos);
                         self.drops.insert(old, None);
@@ -370,7 +374,8 @@ impl ItemStore {
                 if !valid(pile) || !sane || self.drops.contains_key(&id) {
                     return None;
                 }
-                if self.live_drops().count() >= MAX_DROPS {
+                // ((v241) L'objet légendaire revient toujours.)
+                if self.live_drops().count() >= MAX_DROPS && pile.item != LEGEND_ITEM {
                     return None;
                 }
                 self.remember(id, Some(Dropped { pos: at, pile }));
@@ -1086,5 +1091,51 @@ mod tests {
         assert_eq!(store.live_drops().count(), MAX_DROPS);
         // Les premiers lâchés (les plus grands numéros ici) sont partis.
         assert!(store.drops[&1_000_000].is_none());
+    }
+
+    /// (v241) L'objet légendaire posé au sol n'est jamais celui qui disparaît quand il y a
+    /// trop d'objets, même lâché le premier ; il revient toujours d'une sauvegarde, même sur
+    /// un sol plein.
+    #[test]
+    fn the_legendary_item_never_vanishes_from_a_full_ground() {
+        let mut store = ItemStore::default();
+        let legend = BuildMsg::DropItem {
+            seq: 1,
+            id: 7,
+            pos: [1.0, 2.0, 3.0],
+            pile: pile(LEGEND_ITEM, 1),
+        };
+        store.apply(&legend, "a").unwrap();
+        for id in 0..MAX_DROPS as u64 + 50 {
+            let req = BuildMsg::DropItem {
+                seq: id as u32 + 2,
+                id: 1_000 + id,
+                pos: [0.0; 3],
+                pile: pile(STONE, 1),
+            };
+            store.apply(&req, "a").unwrap();
+        }
+        assert_eq!(store.live_drops().count(), MAX_DROPS);
+        assert_eq!(store.drops[&7].map(|d| d.pile.item), Some(LEGEND_ITEM));
+        assert!(store.drops[&1_000].is_none(), "le plus ancien des autres est parti");
+        // D'une sauvegarde, sur un sol plein.
+        let saved = BuildMsg::Item {
+            id: 9,
+            at: [4.0, 5.0, 6.0],
+            drop: Some(pile(LEGEND_ITEM, 1)),
+            to: String::new(),
+            seq: 0,
+            got: None,
+        };
+        assert!(store.seed(&saved).is_some());
+        let stone = BuildMsg::Item {
+            id: 10,
+            at: [4.0, 5.0, 6.0],
+            drop: Some(pile(STONE, 1)),
+            to: String::new(),
+            seq: 0,
+            got: None,
+        };
+        assert!(store.seed(&stone).is_none());
     }
 }

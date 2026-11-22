@@ -134,6 +134,9 @@ pub struct SaveData {
     pub time_fixed: bool,
     /// (v216) Météo (`Weather::save`) ; vide : monde d'avant la météo.
     pub weather: String,
+    /// (v241) La Foudre de Zeus de la carte (`zeus::Legend::save`) : prise ou non, ses
+    /// charges ; vide : carte d'avant.
+    pub zeus: String,
     pub inventory: Option<Inventory>,
     /// (v223) Point d'apparition choisi par `/setspawn` (sinon : là où l'on a ouvert le
     /// monde).
@@ -279,6 +282,7 @@ pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
             time: crate::daytime::START_HOUR,
             time_fixed: false,
             weather: String::new(),
+            zeus: String::new(),
             inventory: None,
             spawn: None,
         },
@@ -333,6 +337,9 @@ fn write_level(dir: &Path, d: &SaveData) -> Result<()> {
     );
     if !d.weather.is_empty() {
         s += &format!("meteo={}\n", d.weather);
+    }
+    if !d.zeus.is_empty() {
+        s += &format!("foudre={}\n", d.zeus);
     }
     s += &format!(
         "gamemode={}\nfly={}\nhealth={}\n",
@@ -505,6 +512,7 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
         ),
         time_fixed: kv.get("heure_fixe").is_some_and(|v| *v == "1"),
         weather: kv.get("meteo").map(|v| v.to_string()).unwrap_or_default(),
+        zeus: kv.get("foudre").map(|v| v.to_string()).unwrap_or_default(),
         meta,
         player,
         inventory,
@@ -684,6 +692,7 @@ fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
         time: crate::daytime::START_HOUR,
         time_fixed: false,
         weather: String::new(),
+        zeus: String::new(),
         inventory: None,
         spawn: None,
     };

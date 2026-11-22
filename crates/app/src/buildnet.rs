@@ -113,6 +113,8 @@ pub struct Other {
     pub ping: Option<u16>,
     /// (v222) Ce qu'il tient en main et qu'on voit (lampe torche, Foudre de Zeus).
     pub held: Option<minelib_net::poses::Held>,
+    /// (v241) Il a la Foudre de Zeus sur lui sans la tenir : on la voit dans son dos.
+    pub back: bool,
 }
 
 /// Le bloc qui fait foi en `pos` vient de changer (`truth` : publié par le garant, ou
@@ -292,6 +294,9 @@ pub struct BuildNet {
     /// (v222) Ce qu'on tient en main et que les autres voient (lampe torche, Foudre de
     /// Zeus ; donné par la partie à chaque image), envoyé avec ses positions.
     pub held: Option<minelib_net::poses::Held>,
+    /// (v241) On a la Foudre de Zeus sur soi sans la tenir : les autres la voient dans
+    /// notre dos (donné par la partie, envoyé avec `held`).
+    pub back: bool,
     /// Clé du relais du monde (dans le billet) : vérifie les bonjours de la voix.
     root: Option<[u8; 32]>,
     /// Clé du compte (modifications signées dans une région souveraine), et date de la
@@ -530,6 +535,7 @@ impl BuildNet {
             ping: 0,
             hidden: false,
             held: None,
+            back: false,
             root: None,
             identity: None,
             sign_t: 0,
@@ -1947,7 +1953,7 @@ impl BuildNet {
                 crouch,
                 speed,
                 ping: self.ping,
-                held: self.held.map_or(0, minelib_net::poses::Held::byte),
+                held: minelib_net::poses::Held::pack(self.held, self.back),
             };
             self.send_at(
                 chunk,
@@ -2308,6 +2314,7 @@ impl BuildNet {
                     o.ping = p.ping;
                 }
                 o.held = minelib_net::poses::Held::of(p.held);
+                o.back = minelib_net::poses::Held::back(p.held);
             }
             None => {
                 self.others.insert(
@@ -2325,6 +2332,7 @@ impl BuildNet {
                         seen: 0.0,
                         ping: p.ping,
                         held: minelib_net::poses::Held::of(p.held),
+                        back: minelib_net::poses::Held::back(p.held),
                     },
                 );
             }

@@ -31,7 +31,9 @@
 //!   MINELIB_HEURE=<h>           commencer à cette heure (0 … 24), arrêtée (essais du ciel)
 //!   MINELIB_LUNE=<jours>        âge de la lune au départ (0 pleine … 4 nouvelle … 8)
 //!   MINELIB_METEO=clear|rain|storm  météo imposée et figée dès l'arrivée (essais)
-//!   MINELIB_ZEUS=1              la Foudre de Zeus en main à l'arrivée (essais)
+//!   MINELIB_ZEUS=1|2            la Foudre de Zeus en main à l'arrivée (essais ; 2 : sur soi,
+//!                               dans la case d'à côté, pas en main) ;
+//!                               MINELIB_ZEUS_CHARGES=<n> : avec tant de charges (0 à 10)
 //!   MINELIB_THOR=<s>            la foudre tombe là où l'on regarde toutes les <s> s (essais)
 //!   MINELIB_F5=1|2              commencer vu de derrière (1) ou de face (2) (essais)
 //!   MINELIB_FOUDRE_FIGEE=1      chaque éclair s'arrête à son plus vif (captures d'essai) ;
@@ -123,6 +125,7 @@ mod watch;
 mod weapons;
 mod weather;
 mod worldedit;
+mod zeus;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;

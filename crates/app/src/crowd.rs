@@ -54,7 +54,7 @@ const GRAVITY: f32 = 28.0;
 /// (v238) Vie d'un PNJ : celle d'un joueur. Un coup en ôte `PUNCH` (comme un coup de poing
 /// sur un joueur), la foudre `lightning::DAMAGE`, une chute ce qu'elle ôte à un joueur.
 pub const NPC_HP: f32 = 20.0;
-const PUNCH: f32 = 1.0;
+pub const PUNCH: f32 = 1.0;
 /// (v238) Saut d'un PNJ sur une marche d'un bloc (blocs/s) : celui d'un joueur
 /// (`player::JUMP_SPEED`).
 const JUMP_UP: f32 = 8.6;
@@ -310,6 +310,12 @@ impl Crowd {
     /// repart se cacher ailleurs dans la foule (autour de `center`, loin de `from`), sous un
     /// autre pseudo.
     pub fn hit(&mut self, world: &World, i: usize, from: Vec3, center: Vec3) -> Hit {
+        self.hit_for(world, i, from, center, PUNCH)
+    }
+
+    /// (v241) Le même coup, qui ôte `amount` points de vie (l'arc court de la Foudre de Zeus
+    /// sans charge : `zeus::ARC_DAMAGE`).
+    pub fn hit_for(&mut self, world: &World, i: usize, from: Vec3, center: Vec3, amount: f32) -> Hit {
         self.changed.push(i as u16);
         if self.npcs[i].hidden {
             self.hide(world, i, center, from);
@@ -317,7 +323,7 @@ impl Crowd {
         }
         self.npcs[i].knock(from);
         // (v238) Un point de vie de moins ; plus rien : il réapparaît ailleurs.
-        if self.hurt(world, i, PUNCH, center, from) {
+        if self.hurt(world, i, amount, center, from) {
             return Hit::Killed;
         }
         Hit::Npc

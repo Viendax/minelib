@@ -47,6 +47,38 @@ pub enum Held {
 impl Held {
     /// L'octet de la Foudre de Zeus (bit 7 à 0 : jamais celui d'une lampe).
     pub const ZEUS: u8 = 0x20;
+    /// (v241) Bit en plus de ce qu'il tient : il a la Foudre de Zeus sur lui sans l'avoir
+    /// en main, on la voit dans son dos. Jamais avec `ZEUS`. (Un jeu d'avant ne connaît pas
+    /// ce bit : il ne voit alors ni l'éclair dans le dos, ni la lampe tenue avec.)
+    pub const BACK: u8 = 0x10;
+
+    /// (v241) L'octet qui part : ce qu'il tient, et la Foudre de Zeus dans son dos ou non.
+    pub fn pack(held: Option<Held>, back: bool) -> u8 {
+        let b = held.map_or(0, Held::byte);
+        if back && b != Self::ZEUS {
+            b | Self::BACK
+        } else {
+            b
+        }
+    }
+
+    /// (v241) Cet octet dit-il la Foudre de Zeus dans le dos ?
+    pub fn back(b: u8) -> bool {
+        b & Self::BACK != 0 && b & Self::ZEUS == 0 && Self::clean(b) == b
+    }
+
+    /// (v241) L'octet tel qu'on le garde et le renvoie (0 : rien, ou octet absurde).
+    pub fn clean(b: u8) -> u8 {
+        if b & Self::ZEUS != 0 {
+            return if b == Self::ZEUS { b } else { 0 };
+        }
+        let rest = b & !Self::BACK;
+        if rest == 0 || Lamp::of(rest).is_some() {
+            b
+        } else {
+            0
+        }
+    }
 
     pub fn byte(self) -> u8 {
         match self {
@@ -55,12 +87,15 @@ impl Held {
         }
     }
 
-    /// Ce que dit un octet (`None` : rien, ou octet absurde).
+    /// Ce qu'il tient d'après un octet (`None` : rien, ou octet absurde). (v241) Le bit de
+    /// l'éclair dans le dos (`back`) n'y change rien.
     pub fn of(b: u8) -> Option<Held> {
         if b == Self::ZEUS {
             Some(Held::Zeus)
+        } else if b & Self::ZEUS != 0 {
+            None
         } else {
-            Lamp::of(b).map(Held::Lamp)
+            Lamp::of(b & !Self::BACK).map(Held::Lamp)
         }
     }
 }
@@ -157,7 +192,7 @@ pub fn pack_poses(entries: &mut Vec<(u64, Option<&str>, Pose)>) -> Vec<u8> {
         let crouch = (p.crouch.clamp(0.0, 1.0) * 3.0).round() as u8;
         let speed = (p.speed.clamp(0.0, 30.0) / 2.0).round() as u8;
         let ping = p.ping.filter(|_| id.wrapping_add(round) % 8 == 0);
-        let held = Held::of(p.held).map(Held::byte);
+        let held = Some(Held::clean(p.held)).filter(|b| *b != 0);
         let extras = ping.is_some() as u8 | (held.is_some() as u8) << 1;
         let name = name.map(|n| &n.as_bytes()[..n.len().min(255)]);
         out.push(name.is_some() as u8 | crouch << 1 | ((extras != 0) as u8) << 3 | speed << 4);
@@ -230,7 +265,7 @@ pub fn unpack_poses(data: &[u8]) -> Option<Vec<(u64, Option<String>, Pose)>> {
         let held = if extras & 2 != 0 {
             let b = *data.get(at)?;
             at += 1;
-            Held::of(b)?.byte()
+            Some(Held::clean(b)).filter(|c| *c != 0)?
         } else {
             0
         };
@@ -299,12 +334,15 @@ mod tests {
                         crouch: unit(&mut seed),
                         speed: unit(&mut seed) * 30.0,
                         ping: Some((rnd(&mut seed) % 900) as u16),
+                        // ((v241) Avec ou sans la Foudre de Zeus dans le dos.)
                         held: [
                             0,
                             Lamp { on: true, step: 3 }.byte(),
                             Lamp { on: false, step: 10 }.byte(),
                             Held::Zeus.byte(),
-                        ][(rnd(&mut seed) % 4) as usize],
+                            Held::BACK,
+                            Held::pack(Some(Held::Lamp(Lamp { on: true, step: 7 })), true),
+                        ][(rnd(&mut seed) % 6) as usize],
                     };
                     (id, p)
                 })
@@ -463,6 +501,26 @@ mod tests {
             if let Some(list) = unpack_poses(&junk) {
                 assert!(list.iter().all(|e| e.2.sane()));
             }
+        }
+    }
+    /// (v241) La Foudre de Zeus dans le dos : un bit en plus de ce qu'on tient, jamais avec
+    /// l'éclair en main ; ce qu'on tient se lit comme avant ; un octet absurde ne dit rien.
+    #[test]
+    fn the_bolt_on_the_back_travels_with_what_is_held() {
+        let lamp = Held::Lamp(Lamp { on: true, step: 4 });
+        for held in [None, Some(lamp), Some(Held::Zeus)] {
+            for back in [false, true] {
+                let b = Held::pack(held, back);
+                assert_eq!(Held::of(b), held);
+                assert_eq!(Held::back(b), back && held != Some(Held::Zeus));
+                assert_eq!(Held::clean(b), b);
+            }
+        }
+        assert_eq!(Held::pack(None, true), Held::BACK);
+        assert_eq!(Held::pack(Some(Held::Zeus), true), Held::ZEUS);
+        for absurd in [0x30u8, 0x21, 0x1f, 0x9f, 0x60] {
+            assert_eq!(Held::clean(absurd), 0, "{absurd:#x}");
+            assert!(!Held::back(absurd) && Held::of(absurd).is_none());
         }
     }
 }

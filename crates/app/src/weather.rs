@@ -170,6 +170,23 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// (v241) Éclairs qui courent dans les nuages au-dessus d'une zone pendant l'orage (ce sont
+/// eux qui chargent la Foudre de Zeus de celui qui la porte en dessous). Tirés de la graine
+/// et de l'horloge, par zone de `CLOUD_ZONE` blocs de côté et par créneau de `CLOUD_SLOT_S`
+/// secondes : les mêmes pour tous, **quel que soit le nombre de joueurs dans la zone**.
+pub const CLOUD_ZONE: i32 = 256;
+pub const CLOUD_SLOT_S: f64 = 15.0;
+/// Chance par zone et par créneau, orage installé : un toutes les deux minutes en moyenne
+/// au-dessus d'une zone (« ça doit quand même arriver un peu »).
+pub const CLOUD_P: f64 = 1.0 / 8.0;
+/// Autour de celui qui porte la Foudre de Zeus (à moins de `zeus::CHARGE_REACH` blocs de
+/// lui) : trois fois plus souvent.
+pub const CLOUD_BOOST: f64 = 3.0;
+/// On les tire jusqu'à cette distance de la caméra (blocs) : une dizaine de zones, soit
+/// cinq éclairs par minute environ (et autant des éclairs des nuages d'avant, tirés au
+/// hasard chez chacun : voir `Storm::update`).
+const CLOUD_REACH: f32 = 448.0;
+
 /// Un éclair que le ciel envoie : la colonne visée (avant que le relief ne l'attire), le
 /// moment (s après l'appel) et de quoi tirer sa forme.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -199,6 +216,8 @@ pub struct Weather {
     settled: bool,
     /// Dernière seconde dont la foudre a été tirée.
     last_slot: Option<i64>,
+    /// (v241) Dernier créneau des éclairs des nuages déjà tiré.
+    last_cloud_slot: Option<i64>,
     /// (v229) Ce que le serveur vient d'imposer (`impose`), posé à la prochaine `update`
     /// (l'horloge y est celle du moment).
     imposed: Option<(Option<Kind>, Option<f64>, bool)>,
@@ -218,6 +237,7 @@ impl Weather {
             storm_amount: 0.0,
             settled: false,
             last_slot: None,
+            last_cloud_slot: None,
             imposed: None,
         }
     }
@@ -447,6 +467,47 @@ impl Weather {
         });
         self.settled = false;
         self.last_slot = None;
+        self.last_cloud_slot = None;
+    }
+
+    /// (v241) Éclairs qui courent dans les nuages autour de `centre` pendant le créneau qui
+    /// commence (rien entre deux créneaux) : où (au-dessus de quelle colonne), quand (s après
+    /// l'appel) et de quoi tirer leur forme. `holder` : celui qui porte la Foudre de Zeus,
+    /// s'il y en a un ; près de lui ils sont trois fois plus fréquents. Les éclairs d'une
+    /// zone sans porteur sont aussi ceux qu'elle a avec lui : il en ajoute, il n'en change
+    /// aucun.
+    pub fn cloud_bolts(&mut self, centre: Vec3, holder: Option<Vec3>) -> Vec<Spot> {
+        let slot = (self.clock / CLOUD_SLOT_S).floor() as i64;
+        let last = self.last_cloud_slot.replace(slot);
+        let mut out = Vec::new();
+        if !self.thundering() || last.is_none_or(|l| slot <= l) {
+            return out;
+        }
+        let cell = |v: f32| (v / CLOUD_ZONE as f32).floor() as i32;
+        for cz in cell(centre.z - CLOUD_REACH)..=cell(centre.z + CLOUD_REACH) {
+            for cx in cell(centre.x - CLOUD_REACH)..=cell(centre.x + CLOUD_REACH) {
+                let key = (cx as u32 as u64) << 32 | cz as u32 as u64;
+                let s = slot as u64;
+                let x = (cx * CLOUD_ZONE) as f32
+                    + unit(self.seed ^ 0xc1, s, key) as f32 * CLOUD_ZONE as f32;
+                let z = (cz * CLOUD_ZONE) as f32
+                    + unit(self.seed ^ 0xc2, s, key) as f32 * CLOUD_ZONE as f32;
+                let near = holder.is_some_and(|h| {
+                    (h.x - x).hypot(h.z - z) <= crate::zeus::CHARGE_REACH
+                });
+                let p = if near { CLOUD_P * CLOUD_BOOST } else { CLOUD_P };
+                if unit(self.seed ^ 0xc10d, s, key) >= p {
+                    continue;
+                }
+                out.push(Spot {
+                    x,
+                    z,
+                    delay: (unit(self.seed ^ 0xc3, s, key) * CLOUD_SLOT_S) as f32,
+                    seed: mix64(self.seed ^ key ^ s << 24 ^ 0xc10d) as u32,
+                });
+            }
+        }
+        out
     }
 }
 
@@ -527,6 +588,58 @@ pub fn attach(x: i32, z: i32, relief: &dyn Relief) -> Option<(i32, i32, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v241) Les éclairs des nuages d'une zone : tirés de la graine et de l'horloge (les
+    /// mêmes pour tous, où qu'on soit et combien qu'on soit), une fois par créneau, pendant
+    /// l'orage seulement ; trois fois plus fréquents près de celui qui porte la Foudre de
+    /// Zeus, qui en ajoute sans changer les autres.
+    #[test]
+    fn cloud_bolts_come_per_zone_and_three_times_more_near_the_holder() {
+        let here = Vec3::new(100.0, 70.0, -40.0);
+        let count = |holder: Option<Vec3>, from: Vec3| {
+            let mut w = Weather::new(42);
+            w.fix(true);
+            w.force(Kind::Storm);
+            let mut all = Vec::new();
+            // Une heure d'orage.
+            for _ in 0..3600 {
+                w.update(1.0, None);
+                all.extend(w.cloud_bolts(from, holder));
+            }
+            all
+        };
+        let alone = count(None, here);
+        // Près d'ici (à portée de charge) : sans porteur, avec lui.
+        let near = |all: &[Spot]| {
+            all.iter()
+                .filter(|s| (s.x - here.x).hypot(s.z - here.z) <= crate::zeus::CHARGE_REACH)
+                .count()
+        };
+        let held = count(Some(here), here);
+        let (n0, n1) = (near(&alone), near(&held));
+        assert!(n0 >= 12, "il en vient un peu sans porteur : {n0} en une heure");
+        let ratio = n1 as f32 / n0 as f32;
+        assert!((2.2..=3.8).contains(&ratio), "{n1} avec lui, {n0} sans : {ratio}");
+        // Il en ajoute près de lui, il ne change rien ailleurs ni aux autres.
+        assert!(alone.iter().all(|s| held.contains(s)));
+        assert_eq!(alone.len() - n0, held.len() - n1);
+        // Les mêmes vus d'un peu plus loin (un autre joueur de la zone) : rien de plus.
+        let other = count(None, here + Vec3::new(90.0, 0.0, 60.0));
+        assert!(alone
+            .iter()
+            .filter(|s| (s.x - here.x).abs() < 300.0 && (s.z - here.z).abs() < 300.0)
+            .all(|s| other.iter().any(|o| o.x == s.x && o.z == s.z && o.seed == s.seed)));
+        // Sans orage : aucun.
+        let mut calm = Weather::new(42);
+        calm.fix(true);
+        calm.force(Kind::Clear);
+        let mut n = 0;
+        for _ in 0..600 {
+            calm.update(1.0, None);
+            n += calm.cloud_bolts(here, Some(here)).len();
+        }
+        assert_eq!(n, 0);
+    }
 
     /// Les deux horloges donnent les parts de temps de Minecraft : il pleut 16 % du temps
     /// (15 min toutes les 95 min en moyenne), il tonne 9 % du temps, et il y a orage quand
