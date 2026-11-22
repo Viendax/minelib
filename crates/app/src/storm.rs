@@ -353,9 +353,11 @@ impl Storm {
         if rain > 0.002 {
             self.tops.refresh(f.world, f.eye);
         }
+        // (v234) « Le son de la pluie 25 % moins fort en général » : × 0,75.
         let volume = if rain > 0.01 {
             rain.powf(1.3)
                 * (0.45 + 0.2 * self.weather.storm_amount)
+                * RAIN_VOLUME
                 * if f.covered { 0.4 } else { 1.0 }
         } else {
             0.0
@@ -591,6 +593,10 @@ impl Storm {
         }
     }
 }
+
+/// (v234) Volume propre de la pluie (avant : 1 ; « 25 % moins fort en général »). Le
+/// curseur « Volume de la météo » (Paramètres → Son) s'y ajoute.
+const RAIN_VOLUME: f32 = 0.75;
 
 /// (v217) Hauteur de la Foudre de Zeus posée au sol (blocs).
 const GROUND_ITEM: f32 = 0.55;

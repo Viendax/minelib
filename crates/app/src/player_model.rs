@@ -382,21 +382,28 @@ const ZEUS_RAISE: f32 = 1.15;
 // pixels de 1,8/32 bloc. Avant (jeux de blocs) : jambes et corps de 12, tête de 8, bras et
 // jambes de 4 d'épaisseur. Les mêmes valeurs dans `part_matrix` (players.wgsl).
 
+// (v234) Demande du 22 novembre : « si la tête augmente de 7,5 %, réduis ce qu'il faut pour
+// que le corps soit à la même taille qu'actuellement ». La tête grandit de 7,5 % ; tout le
+// reste (jambes, corps, bras, en hauteur comme en largeur) est réduit d'un même facteur
+// (`BODY_K`), pour garder 32 pixels de haut.
+
+/// Côté de la tête (un cube, sur le cou : en haut, à 32 pixels) : 4,5 en v225, +7,5 %.
+const HEAD_S: f32 = 4.5 * 1.075;
+/// (v234) Facteur du reste du corps par rapport à la v225 (27,5 pixels sous la tête).
+const BODY_K: f32 = (32.0 - HEAD_S) / 27.5;
 /// Hauteur d'une jambe (pixels) : la hanche est à cette hauteur quand on est debout.
-const LEG: f32 = 15.0;
+const LEG: f32 = 15.0 * BODY_K;
 /// Épaisseur d'une jambe (largeur et profondeur) ; les deux côte à côte font le corps.
-const LEG_W: f32 = 3.5;
+const LEG_W: f32 = 3.5 * BODY_K;
 /// Corps : hauteur (de la hanche au cou), largeur, profondeur.
-const BODY_H: f32 = 12.5;
-const BODY_W: f32 = 7.0;
-const BODY_D: f32 = 3.5;
-/// Côté de la tête (un cube, sur le cou : en haut, à 32 pixels).
-const HEAD_S: f32 = 4.5;
+const BODY_H: f32 = 12.5 * BODY_K;
+const BODY_W: f32 = 7.0 * BODY_K;
+const BODY_D: f32 = 3.5 * BODY_K;
 /// Bras : épaisseur, longueur au-dessus du pivot de l'épaule (le haut du bras arrive en haut
 /// du corps) et au-dessous (jusqu'au poing, un peu au-dessus de la hanche).
-const ARM_W: f32 = 2.75;
-const ARM_UP: f32 = 1.75;
-const ARM_DOWN: f32 = 9.75;
+const ARM_W: f32 = 2.75 * BODY_K;
+const ARM_UP: f32 = 1.75 * BODY_K;
+const ARM_DOWN: f32 = 9.75 * BODY_K;
 /// Pivot de l'épaule : hauteur au-dessus de la hanche, écart au milieu du corps.
 const SHOULDER_Y: f32 = BODY_H - ARM_UP;
 const ARM_X: f32 = BODY_W / 2.0 + ARM_W / 2.0;
@@ -413,13 +420,39 @@ pub const HEAD_BLOCKS: f32 = HEAD_S * PX;
 /// (v225) Épaisseur d'un bras par rapport à sa longueur (le bras à la première personne a
 /// les mêmes proportions, `hand::ARM_THICK`).
 pub const ARM_RATIO: f32 = ARM_W / (ARM_UP + ARM_DOWN);
-// Debout : 32 pixels (1,8 bloc), la tête en haut, une tête d'un septième de la hauteur, le
-// poing au-dessus de la hanche.
+// Debout : 32 pixels (1,8 bloc), la tête en haut (v234 : 7,5 % de plus qu'en v225, un peu
+// plus d'un septième de la hauteur), le poing au-dessus de la hanche.
 const _: () = assert!(
-    NECK_Y + HEAD_S == 32.0
+    (NECK_Y + HEAD_S - 32.0).abs() < 1e-4
         && SHOULDER_Y - ARM_DOWN > 0.0
-        && (HEAD_BLOCKS / 1.8 - 1.0 / 7.1).abs() < 0.01
+        && (HEAD_S / 4.5 - 1.075).abs() < 1e-5
+        && (HEAD_BLOCKS / 1.8 - 1.0 / 6.615).abs() < 0.001
 );
+
+/// Posture accroupie (`crouch` de 0 à 1) : penche du haut du corps vers l'avant (radians,
+/// autour des hanches) et tassement des hanches (pixels).
+fn crouch_lean(crouch: f32) -> (f32, f32) {
+    let c = crouch.clamp(0.0, 1.0);
+    (0.45 * c, 0.3 / PX * c * 0.6)
+}
+
+/// (v234) Cou (le milieu du haut du corps, sous la tête), dans le repère des pieds (pixels ;
+/// −z : devant). « Quand je me penche en avant, ma tête doit rester au milieu de mon cou » :
+/// accroupi, le corps se penche de `lean` autour des hanches (tassées de `drop`) et la tête
+/// reste posée sur le cou, au milieu ; elle avance avec lui (avant : un écart fixe la
+/// laissait en arrière du cou).
+fn neck(lean: f32, drop: f32) -> Vec3 {
+    Vec3::new(0.0, LEG - drop + BODY_H * lean.cos(), -BODY_H * lean.sin())
+}
+
+/// (v234) Tête du modèle accroupi de `crouch` (0 à 1) : de combien elle avance vers le regard
+/// et la hauteur de son bas au-dessus des pieds (blocs). Sa boîte des coups en partie FPS
+/// (`netgame::hitbox`) et la visée des bots la suivent. Debout : (0, 1,8 − son côté).
+pub fn head_place(crouch: f32) -> (f32, f32) {
+    let (lean, drop) = crouch_lean(crouch);
+    let n = neck(lean, drop);
+    (-n.z * PX, n.y * PX)
+}
 
 /// Pavés des six parties, dans l'ordre de `parts` et de `Skin::color` (jambe gauche, jambe
 /// droite, corps, bras gauche, bras droit, tête) : coins (pixels, repère de la partie) et
@@ -477,13 +510,11 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         * Mat4::from_rotation_y(-pose.yaw)
         * Mat4::from_scale(Vec3::splat(PX));
     let swing = pose.walk.sin() * 0.75 * pose.swing;
-    let crouch = pose.crouch.clamp(0.0, 1.0);
-    let lean = 0.45 * crouch;
-    let drop = 0.3 / PX * crouch * 0.6;
-    // Jambes : pivot à la hanche (y = 12 ; elle descend de `drop` accroupi), balancement
-    // opposé. (v189) La jambe reste un seul pavé : elle se tasse de `drop` au lieu de se
-    // faire recouvrir au quart par le bas du corps, qui laissait voir un pli à la hanche.
-    // Les pieds restent au sol.
+    let (lean, drop) = crouch_lean(pose.crouch);
+    // Jambes : pivot à la hanche (elle descend de `drop` accroupi), balancement opposé.
+    // (v189) La jambe reste un seul pavé : elle se tasse de `drop` au lieu de se faire
+    // recouvrir au quart par le bas du corps, qui laissait voir un pli à la hanche. Les
+    // pieds restent au sol.
     let shrink = (LEG - drop) / LEG;
     for (side, sign) in [(-LEG_X, 1.0f32), (LEG_X, -1.0)] {
         let xf = base
@@ -545,9 +576,10 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         let (min, max, part) = PARTS[out.len()];
         out.push((xf, min, max, part));
     }
-    // Tête : pivot au cou, suit le regard (tangage), sans suivre la penche du corps.
+    // Tête : pivot au cou (v234 : au milieu du haut du corps, même penché ; elle avance avec
+    // lui), suit le regard (tangage), sans suivre la penche du corps.
     let head = base
-        * Mat4::from_translation(Vec3::new(0.0, NECK_Y - drop * 1.6, -lean * 4.0))
+        * Mat4::from_translation(neck(lean, drop))
         * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4));
     let (min, max, part) = PARTS[5];
     out.push((head, min, max, part));
@@ -1714,7 +1746,8 @@ mod tests {
                 * t(ARM_X, SHOULDER_Y, 0.0)
                 * Mat4::from_rotation_x(swing * k + lean * 0.6 + raise);
         }
-        base * t(0.0, NECK_Y - drop * 1.6, -lean * 4.0) * Mat4::from_rotation_x(pitch)
+        let n = Vec3::new(0.0, LEG - drop + BODY_H * lean.cos(), -BODY_H * lean.sin());
+        base * t(n.x, n.y, n.z) * Mat4::from_rotation_x(pitch)
     }
 
     /// Skin aux pixels pris au hasard, dont des transparents (le modèle par défaut se voit
@@ -1765,6 +1798,35 @@ mod tests {
             .collect()
     }
 
+    /// (v234) La tête reste posée au milieu du haut du corps (le cou), debout comme penché
+    /// (accroupi), quel que soit le regard ; elle est là où le dit `head_place` (sa boîte des
+    /// coups en partie FPS), vers le regard ; debout, son haut est à 1,8 bloc.
+    #[test]
+    fn the_head_stays_on_the_neck_when_leaning() {
+        for pose in test_poses() {
+            let p = parts(&pose);
+            let neck = p[2].0.transform_point3(Vec3::new(0.0, BODY_H, 0.0));
+            let head = p[5].0.transform_point3(Vec3::ZERO);
+            assert!(
+                (neck - head).length() < 1e-4,
+                "accroupi à {} : tête à {head}, cou à {neck}",
+                pose.crouch
+            );
+            let (ahead, bottom) = head_place(pose.crouch);
+            let fwd = Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos());
+            let want = pose.feet + fwd * ahead + Vec3::Y * bottom;
+            assert!(
+                (head - want).length() < 1e-4,
+                "tête en {head}, `head_place` : {want}"
+            );
+        }
+        let (ahead, bottom) = head_place(0.0);
+        assert!(ahead.abs() < 1e-6 && (bottom + HEAD_BLOCKS - 1.8).abs() < 1e-4);
+        // Accroupi : la tête avance de 0,3 bloc avec le cou.
+        let (ahead, _) = head_place(1.0);
+        assert!((0.25..0.35).contains(&ahead), "{ahead}");
+    }
+
     /// (v225) Les proportions du modèle (de CS2), et le bras levé de la Foudre de Zeus, sont
     /// les mêmes dans le shader des autres joueurs (`part_matrix` de players.wgsl).
     #[test]
@@ -1775,7 +1837,7 @@ mod tests {
             ("LEG_X", LEG_X),
             ("SHOULDER_Y", SHOULDER_Y),
             ("ARM_X", ARM_X),
-            ("NECK_Y", NECK_Y),
+            ("BODY_H", BODY_H),
             ("ZEUS_RAISE", ZEUS_RAISE),
         ] {
             let line = src
@@ -1790,7 +1852,8 @@ mod tests {
                 .trim_end_matches(';')
                 .parse()
                 .unwrap();
-            assert_eq!(got, v, "{name}");
+            // (v234) Écrites à six décimales dans le shader.
+            assert!((got - v).abs() < 1e-4, "{name} : {got} au lieu de {v}");
         }
         // (Hauteur, tête, poing : vérifiés à la compilation, sous `ARM_RATIO`.)
     }
@@ -1968,7 +2031,9 @@ mod tests {
                     "pose {n}, vue {view} : {covered} pixels, {alone} d'un seul côté, \
                      {off} de couleur différente"
                 );
-                assert!(covered > 2000, "joueur trop petit à l'écran : {covered}");
+                // (v234) 1 500 : le corps est un peu plus mince (tête plus grosse, même
+                // taille en tout ; vue de haut, la pose 2 couvre 1 927 pixels).
+                assert!(covered > 1500, "joueur trop petit à l'écran : {covered}");
                 // Les écarts restants sont aux frontières des pixels du skin (le pixel de
                 // l'écran à cheval prend l'un ou l'autre), et sur les contours.
                 assert!(alone * 100 <= covered, "contours : {alone} sur {covered}");

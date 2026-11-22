@@ -691,10 +691,12 @@ impl Body {
     }
 
     /// Milieu de la tête (zone de la tête : le haut de la boîte). (v225) Aux proportions de
-    /// CS2 du modèle : la tête fait un septième de la hauteur.
+    /// CS2 du modèle : la tête fait un septième de la hauteur. (v234) Accroupi, elle avance
+    /// avec le cou vers le regard, comme sa boîte (`netgame::hitbox`).
     fn head(&self) -> Vec3 {
-        let h = crate::player::HEIGHT - crate::player_model::HEAD_BLOCKS / 2.0;
-        self.feet + Vec3::Y * (h - 0.3 * self.crouch)
+        let (ahead, bottom) = crate::player_model::head_place(self.crouch);
+        let fwd = Vec3::new(self.yaw.sin(), 0.0, -self.yaw.cos());
+        self.feet + fwd * ahead + Vec3::Y * (bottom + crate::player_model::HEAD_BLOCKS / 2.0)
     }
 
     /// (v225) Milieu du corps du modèle.

@@ -134,6 +134,8 @@ pub struct Options {
     pub mute_screens_menu: bool,
     /// Volume du tchat vocal entrant (0..2, 1 = tel quel).
     pub volume_voice: f32,
+    /// (v234) Volume de la météo : pluie et tonnerre (0..1, × le volume du jeu).
+    pub volume_weather: f32,
     /// Adresse du relais (comptes, liste des parties).
     pub relay: String,
     /// Au menu, ce jeu peut servir de garant indépendant pour les parties des autres.
@@ -178,6 +180,7 @@ impl Default for Options {
             volume_screens: 0.5,
             mute_screens_menu: false,
             volume_voice: 1.0,
+            volume_weather: 1.0,
             relay: "auto".into(),
             garant: true,
             relay_key: String::new(),
@@ -264,6 +267,9 @@ impl Options {
             if let Some(v) = kv.get("volume_voice").and_then(|v| v.parse::<f32>().ok()) {
                 o.volume_voice = v.clamp(0.0, 2.0);
             }
+            if let Some(v) = kv.get("volume_meteo").and_then(|v| v.parse::<f32>().ok()) {
+                o.volume_weather = v.clamp(0.0, 1.0);
+            }
             if let Some(v) = kv.get("sensitivity").and_then(|v| v.parse::<f32>().ok()) {
                 o.sensitivity = v.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
                 o.sensitivity_fps = o.sensitivity;
@@ -291,7 +297,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -310,7 +316,8 @@ impl Options {
                 self.mute_screens_menu,
                 self.point_torches,
                 self.igpu,
-                self.invisible
+                self.invisible,
+                self.volume_weather
             ),
         )?;
         Ok(())
@@ -1070,14 +1077,18 @@ mod tests {
         // (v201) Torches en lumières ponctuelles : non par défaut, gardé ensuite. (v228)
         // Pareil pour la partie graphique intégrée.
         assert!(!o.point_torches && !o.igpu && !o.invisible);
+        // (v234) Volume de la météo : 100 % par défaut, gardé ensuite.
+        assert_eq!(o.volume_weather, 1.0);
         o.resource_pack = "Autre".into();
         o.point_torches = true;
         o.igpu = true;
         o.invisible = true;
+        o.volume_weather = 0.35;
         o.save(&paths.options).unwrap();
         let back = Options::load(&paths.options);
         assert_eq!(back.resource_pack, "Autre");
         assert!(back.point_torches && back.igpu && back.invisible);
+        assert_eq!(back.volume_weather, 0.35);
         let _ = fs::remove_dir_all(dir);
     }
 }

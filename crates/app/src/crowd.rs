@@ -32,10 +32,18 @@ const GONE: f32 = 200.0;
 const LOG_EVERY: f32 = 10.0;
 /// Joueurs dont on reprend l'abri par image (voir `Npc::covered`).
 const RECHECK_PER_FRAME: usize = 64;
+/// (v234) PNJ partis trop loin (`GONE`) qu'on essaie de ramener par image. Avant, tous
+/// cherchaient un sol à chaque image : en volant loin de la foule (plus de sol à moins de
+/// 40 blocs, ou des chunks pas chargés), les 4 000 échouaient et recommençaient à chaque
+/// image, soit un million de blocs lus (« logique et physique » à 11 ms, 77 FPS).
+const RESPAWNS_PER_FRAME: usize = 64;
 /// (v226) Coup reçu : recul (blocs/s, à l'horizontale, puis vers le haut), pesanteur
-/// (blocs/s²) : un bond d'un peu moins d'un demi-bloc de haut, à 1,5 bloc en arrière.
+/// (blocs/s²). (v234) « Hauteur gagnée en étant tapé / 3 » (à force de clics, on les faisait
+/// monter dans le ciel) : vers le haut, 5,5 / √3 au lieu de 5,5, un bond d'un sixième de bloc
+/// de haut au lieu d'un demi, à un bloc en arrière. Pour les garder en l'air, il faut
+/// maintenant près de 5 coups par seconde au lieu de 3, et ils montent bien moins vite.
 const KNOCK: f32 = 5.0;
-const KNOCK_UP: f32 = 5.5;
+const KNOCK_UP: f32 = 3.175;
 const GRAVITY: f32 = 30.0;
 /// (v226) Durée du rouge d'un coup reçu, et de la fuite en courant qui suit (s).
 pub const HURT_S: f32 = 0.4;
@@ -109,6 +117,11 @@ pub struct Crowd {
     /// ailleurs) : ce que le jeu qui la mène en ligne dit tout de suite (`Outbox`). Vidé à
     /// chaque image.
     pub changed: Vec<u16>,
+    /// (v234) PNJ partis trop loin qu'on peut encore essayer de ramener à cette image.
+    respawns: usize,
+    /// (v234) Essais : recherches de sol faites (`spawn`).
+    #[cfg(test)]
+    tries: usize,
 }
 
 /// (v226) Ce qu'a fait un coup (`Crowd::hit`).
@@ -137,6 +150,9 @@ impl Crowd {
             recheck: 0,
             hidden_in: false,
             changed: Vec::new(),
+            respawns: 0,
+            #[cfg(test)]
+            tries: 0,
         }
     }
 
@@ -178,6 +194,7 @@ impl Crowd {
                 self.changed.push((self.npcs.len() - 1) as u16);
             }
         }
+        self.respawns = RESPAWNS_PER_FRAME;
         for i in 0..self.npcs.len() {
             self.step(world, center, i, dt);
         }
@@ -210,6 +227,10 @@ impl Crowd {
 
     /// Un joueur posé sur le sol, à une distance au hasard de `center`.
     fn spawn(&mut self, world: &World, center: Vec3) -> Option<Npc> {
+        #[cfg(test)]
+        {
+            self.tries += 1;
+        }
         let a = self.rnd() * std::f32::consts::TAU;
         // Réparti sur la surface du disque (autant de monde loin que près, par bloc²).
         let r = NEAR + (FAR - NEAR) * self.rnd().sqrt();
@@ -316,7 +337,16 @@ impl Crowd {
             n.yaw = (n.yaw + (r2 - 0.5) * 2.5).rem_euclid(std::f32::consts::TAU);
         }
         let far = (n.pos - center).length() > GONE;
-        if far && n.hidden {
+        let hidden = n.hidden;
+        if far {
+            // (v234) Pas plus de `RESPAWNS_PER_FRAME` essais par image : les autres attendent
+            // (loin, invisibles, sans marcher).
+            if self.respawns == 0 {
+                return;
+            }
+            self.respawns -= 1;
+        }
+        if far && hidden {
             // (v226) Le personnage caché revient aussi, mais pas tout près.
             self.hide(world, i, center, center);
             return;
@@ -768,6 +798,10 @@ fn covered(world: &World, pos: Vec3) -> bool {
 /// un bloc plein avec deux cases libres au-dessus. `None` : rien (chunk absent, vide).
 fn surface(world: &World, x: f32, z: f32, near_y: f32) -> Option<f32> {
     let (bx, bz) = (x.floor() as i32, z.floor() as i32);
+    // (v234) Chunk pas chargé : rien à lire (81 hauteurs d'air).
+    if !world.contains(minelib_world::ChunkPos::containing(bx, bz)) {
+        return None;
+    }
     let y0 = near_y.floor() as i32;
     ((y0 - 40)..=(y0 + 40))
         .rev()
@@ -828,6 +862,67 @@ mod tests {
         c
     }
 
+    /// (v234) Loin de la foule (en vol, plus de sol à moins de 40 blocs, chunks pas chargés),
+    /// les PNJ restés loin ne cherchent pas tous un sol à chaque image : 64 au plus. Avant,
+    /// les 4 000 le faisaient (« logique et physique » à 11 ms, 77 FPS).
+    #[test]
+    fn far_from_the_crowd_the_respawns_are_bounded_per_frame() {
+        let w = flat();
+        let skins = crate::skin::Skins::default();
+        let mut c = Crowd::new();
+        let center = Vec3::new(0.0, 11.0, 0.0);
+        while c.npcs.len() < MAX {
+            if let Some(n) = c.spawn(&w, center) {
+                c.npcs.push(n);
+            }
+        }
+        c.t = 1000.0;
+        c.hidden_in = true;
+        for away in [Vec3::new(5000.0, 300.0, 0.0), Vec3::new(0.0, 300.0, 600.0)] {
+            c.tries = 0;
+            c.update(&w, &skins, away, 0.016);
+            assert!(
+                c.tries <= RESPAWNS_PER_FRAME,
+                "{} recherches de sol en une image",
+                c.tries
+            );
+        }
+        // Revenu au sol, loin d'eux : ils reviennent, 64 par image au plus.
+        for n in &mut c.npcs {
+            n.pos = Vec3::new(190.0, 11.0, 190.0);
+            n.cell = (190, 190);
+        }
+        let back = Vec3::new(-100.0, 11.0, -100.0);
+        c.update(&w, &skins, back, 0.016);
+        let near = c
+            .npcs
+            .iter()
+            .filter(|n| (n.pos - back).length() <= GONE)
+            .count();
+        assert!(near > 0 && near <= RESPAWNS_PER_FRAME, "{near} revenus");
+    }
+
+    /// (v234) « Hauteur gagnée en étant tapé / 3 » : frappé quatre fois par seconde pendant
+    /// trois secondes (de tout près, où qu'il soit), un PNJ ne monte plus dans le ciel (avant :
+    /// plus de 5 blocs) ; il ne quitte presque pas le sol.
+    #[test]
+    fn hits_in_a_row_no_longer_lift_an_npc_into_the_sky() {
+        let w = flat();
+        let skins = crate::skin::Skins::default();
+        let mut c = one_at(&w, Vec3::new(3.5, 11.0, 0.5));
+        let mut top = 0.0f32;
+        for k in 0..180 {
+            if k % 15 == 0 {
+                let p = c.npcs[0].pos;
+                let eye = p - Vec3::X * 1.5 + Vec3::Y * 1.62;
+                c.hit(&w, 0, eye, eye);
+            }
+            c.update(&w, &skins, Vec3::new(0.5, 12.62, 0.5), 1.0 / 60.0);
+            top = top.max(c.npcs[0].pos.y - 11.0);
+        }
+        assert!(top < 0.3, "monté de {top} bloc");
+    }
+
     /// (v226) Frappé, un PNJ recule d'un bond, rougit, retombe sur le sol, puis s'enfuit en
     /// courant loin du coup ; un mur arrête son recul. Clic dans le vide ou trop loin : rien.
     #[test]
@@ -847,7 +942,8 @@ mod tests {
             c.update(&w, &skins, eye, 1.0 / 60.0);
             top = top.max(c.npcs[0].pos.y);
         }
-        assert!(top > 11.2 && top < 11.8, "bond : {top}");
+        // (v234) Un sixième de bloc de haut (un demi avant).
+        assert!(top > 11.1 && top < 11.3, "bond : {top}");
         for _ in 0..30 {
             c.update(&w, &skins, eye, 1.0 / 60.0);
         }

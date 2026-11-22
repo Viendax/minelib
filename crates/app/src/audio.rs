@@ -772,6 +772,47 @@ pub fn set_master(v: f32) {
     if old == v.to_bits() {
         return;
     }
+    refresh_volumes();
+}
+
+/// (v234) Volume de la météo (Paramètres → Son : pluie et tonnerre), × celui du jeu. Bits
+/// d'un `f32`, 1 par défaut.
+static WEATHER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000);
+
+/// (v234) Un menu est ouvert par-dessus la partie (Échap, paramètres…) : la pluie et le
+/// tonnerre se taisent, et reprennent en revenant au jeu.
+static WEATHER_HUSH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// (v234) Ce que la météo garde de son volume (curseur, menu ouvert).
+fn weather_gain() -> f32 {
+    if WEATHER_HUSH.load(std::sync::atomic::Ordering::Relaxed) {
+        0.0
+    } else {
+        f32::from_bits(WEATHER.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// (v234) Volume de la météo (0 à 1) : la pluie et le tonnerre en cours le prennent tout
+/// de suite.
+pub fn set_weather_volume(v: f32) {
+    let v = v.clamp(0.0, 1.0);
+    let old = WEATHER.swap(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    if old != v.to_bits() {
+        refresh_volumes();
+    }
+}
+
+/// (v234) « Coupe le son de la météo dans Échap » : `true` tant qu'un menu est ouvert
+/// par-dessus la partie. Sans effet s'il ne change pas.
+pub fn weather_hush(on: bool) {
+    let old = WEATHER_HUSH.swap(on, std::sync::atomic::Ordering::Relaxed);
+    if old != on {
+        refresh_volumes();
+    }
+}
+
+/// Redonne leur volume aux sons en cours (volume du jeu ou de la météo changé).
+fn refresh_volumes() {
     if let Some(tx) = sender() {
         if let Ok(tx) = tx.lock() {
             // (Commande vide : le fil du son redonne le volume à ses sons en cours.)
@@ -973,7 +1014,7 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                         }
                         if let Some((r, base)) = &mut rain {
                             *base = volume;
-                            r.set_volume(volume * master());
+                            r.set_volume(volume * master() * weather_gain());
                             r.play();
                         }
                         continue;
@@ -985,7 +1026,7 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                             thunders.remove(0);
                         }
                         if let Ok(sink) = Sink::try_new(handle) {
-                            sink.set_volume(cmd.volume * master());
+                            sink.set_volume(cmd.volume * master() * weather_gain());
                             sink.append(
                                 rodio::buffer::SamplesBuffer::new(1, rate, samples)
                                     .speed(cmd.speed.clamp(0.5, 2.0))
@@ -996,13 +1037,18 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                         continue;
                     }
                     // (v215) Volume du jeu changé : tout de suite pour les sons en cours.
+                    // (v234) Pareil pour celui de la météo (curseur, menu ouvert).
                     if cmd.file.is_empty() && cmd.voice.is_none() {
                         let m = master();
-                        for (sink, base) in sinks.iter().chain(&thunders) {
+                        for (sink, base) in &sinks {
                             sink.set_volume(base * m);
                         }
+                        let w = m * weather_gain();
+                        for (sink, base) in &thunders {
+                            sink.set_volume(base * w);
+                        }
                         if let Some((r, base)) = &rain {
-                            r.set_volume(base * m);
+                            r.set_volume(base * w);
                         }
                         continue;
                     }
@@ -1120,7 +1166,8 @@ fn send_rain(volume: f32) {
 /// arrive après le temps que met le son à venir (343 blocs par seconde, comme en vrai).
 /// Le calcul se fait dans un fil à part : le jeu n'attend pas.
 pub fn thunder(distance: f32, seed: u32) {
-    if master() <= 0.0 {
+    // (v234) Météo à zéro ou menu ouvert : pas de tonnerre à calculer.
+    if master() <= 0.0 || weather_gain() <= 0.0 {
         return;
     }
     let Some(tx) = sender().and_then(|tx| tx.lock().ok().map(|t| t.clone())) else {
@@ -1576,6 +1623,19 @@ mod tests {
         assert!(crackle_gain(5.0) > 0.2 && crackle_gain(5.0) < 0.3);
         assert_eq!(crackle_gain(ZEUS_HEAR), 0.0);
         assert_eq!(crackle_gain(30.0), 0.0);
+    }
+
+    /// (v234) Curseur de la météo, et menu ouvert par-dessus la partie.
+    #[test]
+    fn the_weather_has_its_own_volume_and_hushes_in_menus() {
+        set_weather_volume(0.4);
+        assert_eq!(weather_gain(), 0.4);
+        weather_hush(true);
+        assert_eq!(weather_gain(), 0.0, "menu ouvert : ni pluie ni tonnerre");
+        weather_hush(false);
+        assert_eq!(weather_gain(), 0.4);
+        set_weather_volume(1.0);
+        assert_eq!(weather_gain(), 1.0);
     }
 
     /// (v219) Le « pop » d'un objet ramassé : court, pas saturé, sans clic à la fin ; la

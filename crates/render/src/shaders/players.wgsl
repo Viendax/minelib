@@ -98,12 +98,15 @@ fn m_rot_y(a: f32) -> mat4x4<f32> {
 }
 
 // (v225) Proportions d'un personnage de CS2 : mêmes valeurs que `player_model` (LEG, LEG_X,
-// SHOULDER_Y, ARM_X, NECK_Y, en pixels de 1,8/32 bloc).
-const LEG: f32 = 15.0;
-const LEG_X: f32 = 1.75;
-const SHOULDER_Y: f32 = 10.75;
-const ARM_X: f32 = 4.875;
-const NECK_Y: f32 = 27.5;
+// SHOULDER_Y, ARM_X, BODY_H, en pixels de 1,8/32 bloc).
+// (v234) Tête agrandie de 7,5 % (4,8375 pixels), le reste du corps réduit d'autant pour
+// garder 32 pixels de haut : les valeurs de la v225 fois 27,1625 / 27,5
+// (`player_model::BODY_K`).
+const LEG: f32 = 14.815909;
+const LEG_X: f32 = 1.728523;
+const SHOULDER_Y: f32 = 10.618068;
+const ARM_X: f32 = 4.815170;
+const BODY_H: f32 = 12.346591;
 // (v225) Foudre de Zeus : le bras droit levé (radians), `player_model::ZEUS_RAISE`.
 const ZEUS_RAISE: f32 = 1.15;
 
@@ -165,7 +168,10 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
         }
         return upper * m_trans(vec3<f32>(ARM_X, SHOULDER_Y, 0.0)) * m_rot_x(swing * k + lean * 0.6 + raise);
     }
-    return base * m_trans(vec3<f32>(0.0, NECK_Y - drop * 1.6, -lean * 4.0)) * m_rot_x(pitch);
+    // (v234) Tête posée au milieu du haut du corps (le cou), même penché : elle avance avec
+    // lui (`player_model::neck`).
+    let neck = vec3<f32>(0.0, LEG - drop + BODY_H * cos(lean), -BODY_H * sin(lean));
+    return base * m_trans(neck) * m_rot_x(pitch);
 }
 
 /// (v200) Portée des reflets dans l'eau (blocs, à l'horizontale, `water_mirror::RANGE`) : les

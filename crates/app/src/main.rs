@@ -404,6 +404,7 @@ impl Game {
         crate::voice::set_input(&options.audio_in);
         crate::voice::set_mic_gain(options.volume_mic);
         crate::audio::set_master(options.volume);
+        crate::audio::set_weather_volume(options.volume_weather);
         let packs = list_packs(&paths.resourcepacks);
         let pack = packs
             .iter()
@@ -3144,8 +3145,13 @@ impl Game {
             y2,
             200.0,
         );
-        // (v179) En dessous : couper le son des écrans quand on ouvre le menu du jeu.
+        // (v234) En dessous, à gauche : la météo (pluie et tonnerre).
         let y3 = y2 + 30.0 * s;
+        let wv = self.options.volume_weather;
+        let label = format!("Volume de la météo : {} %", (wv * 100.0).round());
+        let weather_vol = c.slider(23, &mut self.slider_drag, &label, wv, col[0], y3, 200.0);
+        // (v179) En dessous : couper le son des écrans quand on ouvre le menu du jeu.
+        let y3 = y3 + 30.0 * s;
         let mute_label = format!(
             "Couper le son des écrans dans le menu : {}",
             if self.options.mute_screens_menu {
@@ -3200,6 +3206,14 @@ impl Game {
                 if let Some(sess) = &mut self.session {
                     sess.set_screens_volume(v);
                 }
+            }
+        }
+        if let Some(f) = weather_vol {
+            let v = (f * 20.0).round() / 20.0;
+            if v != self.options.volume_weather {
+                self.options.volume_weather = v;
+                // Tout de suite, la pluie en cours comprise.
+                crate::audio::set_weather_volume(v);
             }
         }
         if let Some(f) = voice_vol {
@@ -4080,6 +4094,9 @@ impl GameLoop for Game {
                 self.options.volume_screens
             });
         }
+        // (v234) « Coupe le son de la météo dans Échap » : la pluie et le tonnerre se taisent
+        // tant qu'un menu est ouvert par-dessus la partie (Échap, paramètres…).
+        crate::audio::weather_hush(self.session.is_some() && self.screen != Screen::Playing);
 
         // Mémoire vidéo : relevé chaque seconde (bilan des 10 s), et plus de nouvelles pages
         // pour les chunks au-delà de 92 % du budget Windows (reprise sous 85 %).

@@ -524,11 +524,11 @@ fn shot(
             crate::weapons::bullet_path(world, origin, dir, range)
         };
         let mut best: Option<(f32, u64, Touch)> = None;
-        for &(id, feet, crouch) in frame {
+        for &(id, feet, crouch, yaw) in frame {
             if id == shooter || !m.players.get(&id).is_some_and(|p| p.alive) {
                 continue;
             }
-            let (body, head, _) = hitbox(feet, crouch);
+            let (body, head, _) = hitbox(feet, crouch, yaw);
             if let Some((t, in_head)) = ray_player(origin, dir, body, head) {
                 let factor = path.factor_at(t);
                 let wall = t >= path.first;
@@ -562,8 +562,8 @@ fn rays_loaded(world: &World, frame: &Frame, origin: Vec3, dirs: &[Vec3]) -> boo
     dirs.iter().all(|&dir| {
         let far = frame
             .iter()
-            .filter_map(|&(_, feet, crouch)| {
-                let (body, head, _) = hitbox(feet, crouch);
+            .filter_map(|&(_, feet, crouch, yaw)| {
+                let (body, head, _) = hitbox(feet, crouch, yaw);
                 ray_player(origin, dir, body, head).map(|(t, _)| t)
             })
             .fold(0.0f32, f32::max)
@@ -957,7 +957,7 @@ impl Auditor {
                         let frame: Frame = players
                             .iter()
                             .filter(|(id, _)| **id == 0 || ready.contains(id))
-                            .map(|(&id, p)| (id, p.pos, p.crouch))
+                            .map(|(&id, p)| (id, p.pos, p.crouch, p.yaw))
                             .collect();
                         now = *tick;
                         self.history.push_back((*tick, frame));
@@ -1302,8 +1302,9 @@ const BACKUP_PART: usize = 32 * 1024;
 /// Garant de secours : état reçu toutes les…
 const BACKUP_EVERY: u32 = 256;
 
-/// Positions de tous les joueurs à un pas : (joueur, pieds, accroupi).
-type Frame = Vec<(u64, Vec3, f32)>;
+/// Positions de tous les joueurs à un pas : (joueur, pieds, accroupi, cap du regard). (v234)
+/// Le cap : accroupi, la tête avance avec le cou, vers le regard (`hitbox`).
+type Frame = Vec<(u64, Vec3, f32, f32)>;
 
 /// Bruits de pas : au-dessus de cette vitesse au sol (blocs/s), on court et les autres
 /// l'entendent (135 unités de CS sur 250).
@@ -1479,25 +1480,34 @@ fn send(link: &Sender<Inbound>, req: &Request) {
 }
 
 /// (v225) Demi-côté de la boîte de la tête (blocs) : un peu plus que la moitié de la tête
-/// du modèle (`player_model::HEAD_BLOCKS`, 0,25 bloc), qui tourne avec le regard.
+/// du modèle (`player_model::HEAD_BLOCKS`, 0,27 bloc depuis la v234), qui tourne avec le
+/// regard. (v234) Accroupi, la tête avance avec le cou vers le regard : cette boîte la suit
+/// (`hitbox`).
 const HEAD_HALF: f32 = 0.15;
 /// (v225) Haut du ventre (dégâts ×1,25), au-dessus des pieds, debout : le bas du corps.
 const STOMACH_BLOCKS: f32 = crate::player_model::HIP_BLOCKS + 0.25;
 
 /// Boîtes (min, max) d'un joueur : son corps (jusqu'au bas de la tête) et sa tête ; hauteur
 /// du bas de sa tête. (v225) Aux proportions de CS2 du modèle : la tête fait un septième de
-/// la hauteur (0,3 bloc avant), dans sa propre boîte, plus étroite que le corps (une balle
-/// qui passe à côté d'elle, à sa hauteur, ne touche pas).
-fn hitbox(feet: Vec3, crouch: f32) -> ([Vec3; 2], [Vec3; 2], f32) {
-    let h = HEIGHT - 0.3 * crouch;
-    let head_y = feet.y + h - crate::player_model::HEAD_BLOCKS;
+/// la hauteur (0,3 bloc avant ; v234 : 7,5 % de plus, `player_model::HEAD_BLOCKS`), dans sa
+/// propre boîte, plus étroite que le corps (une balle qui passe à côté d'elle, à sa hauteur,
+/// ne touche pas). (v234) Accroupi, la tête du modèle avance avec le cou vers le regard
+/// (`yaw`) : sa boîte la suit (`player_model::head_place`), à sa hauteur.
+fn hitbox(feet: Vec3, crouch: f32, yaw: f32) -> ([Vec3; 2], [Vec3; 2], f32) {
+    let (ahead, bottom) = crate::player_model::head_place(crouch);
+    let head_y = feet.y + bottom;
+    let c = feet + Vec3::new(yaw.sin(), 0.0, -yaw.cos()) * ahead;
     let body = [
         feet - Vec3::new(HALF_WIDTH, 0.0, HALF_WIDTH),
         Vec3::new(feet.x + HALF_WIDTH, head_y, feet.z + HALF_WIDTH),
     ];
     let head = [
-        Vec3::new(feet.x - HEAD_HALF, head_y, feet.z - HEAD_HALF),
-        Vec3::new(feet.x + HEAD_HALF, feet.y + h, feet.z + HEAD_HALF),
+        Vec3::new(c.x - HEAD_HALF, head_y, c.z - HEAD_HALF),
+        Vec3::new(
+            c.x + HEAD_HALF,
+            head_y + crate::player_model::HEAD_BLOCKS,
+            c.z + HEAD_HALF,
+        ),
     ];
     (body, head, head_y)
 }
@@ -3932,13 +3942,13 @@ impl Host {
         // Mémoire des positions (rembobinage des tirs).
         let mut frame: Frame = Vec::new();
         if self.playing {
-            frame.push((0, local.pos, local.crouch));
+            frame.push((0, local.pos, local.crouch, local.yaw));
         }
         frame.extend(
             self.peers
                 .iter()
                 .filter(|(_, r)| r.ready)
-                .map(|(&id, r)| (id, r.player.pos, r.player.crouch)),
+                .map(|(&id, r)| (id, r.player.pos, r.player.crouch, r.player.yaw)),
         );
         frame.sort_by_key(|f| f.0);
         self.record(0, Move::Rule(Rule::Frame(self.tick)));
@@ -5423,12 +5433,15 @@ mod tests {
         assert!(why(&c).iter().any(|w| w.starts_with("règles")), "{c:?}");
     }
 
+    /// Mi-hauteur de la tête du modèle (blocs).
+    const HEAD_HALF_HEIGHT: f32 = crate::player_model::HEAD_BLOCKS / 2.0;
+
     /// (v225) Tête aux proportions de CS2 : sa boîte est plus étroite que le corps. Une balle
     /// qui passe à côté d'elle, à sa hauteur, ne touche pas ; juste dessous, c'est l'épaule.
     #[test]
     fn the_head_hitbox_is_narrower_than_the_body() {
         let feet = Vec3::new(3.5, 64.0, -2.5);
-        let (body, head, head_y) = hitbox(feet, 0.0);
+        let (body, head, head_y) = hitbox(feet, 0.0, 0.0);
         let shoot = |y: f32, dz: f32| {
             ray_player(
                 Vec3::new(feet.x - 5.0, feet.y + y, feet.z + dz),
@@ -5444,9 +5457,33 @@ mod tests {
         assert!(
             (head_y - feet.y - (HEIGHT - crate::player_model::HEAD_BLOCKS)).abs() < 1e-5
         );
-        // Accroupi : la tête descend avec le haut de la boîte.
-        let (_, low, _) = hitbox(feet, 1.0);
-        assert!((low[1].y - (feet.y + HEIGHT - 0.3)).abs() < 1e-5);
+        // (v234) Accroupi : la boîte de la tête suit la tête du modèle, qui avance avec le cou
+        // vers le regard (ici −z, puis +x) et descend.
+        let (ahead, bottom) = crate::player_model::head_place(1.0);
+        for (yaw, dir) in [(0.0, -Vec3::Z), (std::f32::consts::FRAC_PI_2, Vec3::X)] {
+            let (_, low, low_y) = hitbox(feet, 1.0, yaw);
+            let mid = (low[0] + low[1]) / 2.0;
+            let want = feet + dir * ahead + Vec3::Y * (bottom + HEAD_HALF_HEIGHT);
+            assert!(
+                (mid - want).length() < 1e-4,
+                "{yaw} : {mid} au lieu de {want}"
+            );
+            assert!((low_y - feet.y - bottom).abs() < 1e-5);
+            assert!(low[1].y < feet.y + 1.6, "la tête descend : {}", low[1].y);
+        }
+        // Une balle visée sur la tête avancée la touche ; au-dessus des pieds, plus.
+        let (body, head, _) = hitbox(feet, 1.0, 0.0);
+        let y = bottom + HEAD_HALF_HEIGHT;
+        let at = |dz: f32| {
+            ray_player(
+                Vec3::new(feet.x - 5.0, feet.y + y, feet.z + dz),
+                Vec3::X,
+                body,
+                head,
+            )
+        };
+        assert!(matches!(at(-ahead), Some((_, true))), "tête avancée");
+        assert!(!matches!(at(0.2), Some((_, true))), "derrière la tête");
     }
 
     /// Dégâts comme dans CS2 : une balle de Glock dans la tête sans casque tue de près
