@@ -28,6 +28,22 @@ use crate::streaming::Streamer;
 pub const REACH: f32 = 6.0;
 /// (v226) Portée d'un coup à un PNJ de la foule d'essai (blocs, depuis les yeux).
 const NPC_REACH: f32 = 4.5;
+/// (v227) Foule d'essai partagée en ligne : on entend crier un PNJ frappé par un autre à
+/// moins de… (blocs) ; on apprend que le personnage caché a été trouvé à moins de… (blocs).
+const NPC_CRY_HEAR: f32 = 24.0;
+const FOUND_NEAR: f32 = 64.0;
+
+/// (v227) Volume du cri d'un PNJ frappé à `d` blocs (`None` : trop loin pour l'entendre).
+fn npc_cry_gain(d: f32) -> Option<f32> {
+    let k = 1.0 - d / NPC_CRY_HEAR;
+    (k > 0.0).then_some(0.55 * k * k)
+}
+
+/// (v227) PNJ visé : dans notre foule d'essai, ou dans celle que mène un autre OP (son pseudo).
+enum NpcTarget {
+    Mine(usize),
+    Theirs(String, usize),
+}
 /// Taille d'écran nommée dans `/give` : `ecran` (normal), `petit_ecran`, `grand_ecran`,
 /// `ecran_geant` (aussi en anglais et avec accents, tirets ou espaces).
 fn screen_size(want: &str) -> Option<u8> {
@@ -426,6 +442,13 @@ pub struct Session {
     /// essai voulu (v185 : `/npc stresstest true|false`, éteint par défaut).
     crowd: Option<crate::crowd::Crowd>,
     crowd_on: bool,
+    /// (v227) Foule d'essai menée en construction en ligne (`Some` : on la mène, le relais
+    /// nous a dit OP) : ce qu'il reste à en dire aux joueurs proches.
+    crowd_out: Option<crate::crowd::Outbox>,
+    /// (v227) `/npc stresstest on` en ligne : réponse du relais attendue (OP ou non).
+    crowd_probe: Option<std::time::Instant>,
+    /// (v227) Foules d'essai menées par d'autres joueurs (OP), par pseudo de celui qui la mène.
+    remote_crowds: HashMap<String, crate::crowd::RemoteCrowd>,
     /// (v200, essai) Joueurs et objets reflétés dans l'eau sans raytracing (`/npc reflets
     /// on|off`, allumé par défaut), et l'eau qu'on voit (cherchée toutes les quelques
     /// images, pendant le rendu).
@@ -755,6 +778,9 @@ impl Session {
             sun_seen: Default::default(),
             crowd: None,
             crowd_on: false,
+            crowd_out: None,
+            crowd_probe: None,
+            remote_crowds: HashMap::new(),
             water_mirror_on: true,
             seen_water: Default::default(),
             pseudo: String::new(),
@@ -1835,13 +1861,16 @@ impl Session {
             self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
             // (v165, essai) Foule simulée en solo, hors mode FPS. (v185) Seulement si on l'a
             // demandée (`/npc stresstest true`), et sans message à l'arrivée.
+            // (v227) En construction en ligne, un OP la mène aussi pour les joueurs proches.
             let solo = self.build.is_none() && self.net.is_none();
-            if self.crowd_on && solo && self.game.mode != GameMode::Fps {
+            let lead = self.build.is_some() && self.crowd_out.is_some();
+            if self.crowd_on && (solo || lead) && self.game.mode != GameMode::Fps {
                 let c = self.crowd.get_or_insert_with(crate::crowd::Crowd::new);
                 c.update(&self.world, &self.skins, self.player.pos, dt);
             } else {
                 self.crowd = None;
             }
+            self.update_shared_crowds(dt);
             // (Avec leur pose : l'anticrénelage temporel a besoin de celle de l'image
             // d'avant, voir `Walk`.)
             // (v191) Des milliers de joueurs : leur pseudo n'est plus recopié à chaque
@@ -2786,35 +2815,204 @@ impl Session {
         }
     }
 
-    /// (v226) PNJ de la foule d'essai visé à portée de coup, et sa distance.
-    fn npc_aimed(&self) -> Option<(usize, f32)> {
-        let c = self.crowd.as_ref()?;
-        c.aimed(self.player.eye(), self.player.look_dir(), NPC_REACH)
-    }
-
-    /// (v226) Coup au PNJ `i` de la foule d'essai : il recule et crie (un des cris de douleur,
-    /// plus ou moins aigu à chaque fois). Si c'est le personnage caché : un petit air (jamais
-    /// tout à fait le même) et un message ; il est reparti se cacher.
-    fn hit_npc(&mut self, i: usize) {
-        let (eye, center) = (self.player.eye(), self.player.pos);
-        let Some(c) = self.crowd.as_mut() else {
-            return;
-        };
-        match c.hit(&self.world, i, eye, center) {
-            crate::crowd::Hit::Npc => {
-                self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.55));
-            }
-            crate::crowd::Hit::Hidden => {
-                crate::audio::found();
-                self.chat.say(
-                    format!(
-                        "Tu as trouvé {} ! Il est reparti se cacher dans la foule.",
-                        crate::crowd::HIDDEN_NAME
-                    ),
-                    chat::YELLOW,
-                );
+    /// (v226) PNJ de la foule d'essai visé à portée de coup, et sa distance. (v227) Le plus
+    /// proche, dans la nôtre ou dans celle d'un autre OP.
+    fn npc_aimed(&self) -> Option<(NpcTarget, f32)> {
+        let (eye, dir) = (self.player.eye(), self.player.look_dir());
+        let mut best = self
+            .crowd
+            .as_ref()
+            .and_then(|c| c.aimed(eye, dir, NPC_REACH))
+            .map(|(i, t)| (NpcTarget::Mine(i), t));
+        for (owner, rc) in &self.remote_crowds {
+            if let Some((i, t)) = rc.aimed(eye, dir, NPC_REACH) {
+                if best.as_ref().is_none_or(|b| t < b.1) {
+                    best = Some((NpcTarget::Theirs(owner.clone(), i), t));
+                }
             }
         }
+        best
+    }
+
+    /// (v226) Coup à un PNJ de la foule d'essai : il recule et crie (un des cris de douleur,
+    /// plus ou moins aigu à chaque fois). Si c'est le personnage caché : un petit air (jamais
+    /// tout à fait le même) et un message ; il est reparti se cacher. (v227) PNJ de la foule
+    /// d'un autre OP : il recule tout de suite ici, le coup part au jeu de l'OP (qui dit,
+    /// pour le personnage caché, qui l'a trouvé) ; dans la nôtre menée en ligne, les joueurs
+    /// proches sauront que nous l'avons trouvé.
+    fn hit_npc(&mut self, target: NpcTarget) {
+        let (eye, center) = (self.player.eye(), self.player.pos);
+        match target {
+            NpcTarget::Mine(i) => {
+                let Some(c) = self.crowd.as_mut() else {
+                    return;
+                };
+                let at = c.npcs[i].pos;
+                match c.hit(&self.world, i, eye, center) {
+                    crate::crowd::Hit::Npc => {
+                        self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.55));
+                    }
+                    crate::crowd::Hit::Hidden => {
+                        if let (Some(out), Some(b)) = (self.crowd_out.as_mut(), &self.build) {
+                            out.found = Some((b.pseudo().to_string(), at.to_array()));
+                        }
+                        self.say_found();
+                    }
+                }
+            }
+            NpcTarget::Theirs(owner, i) => {
+                let (Some(rc), Some(b)) = (self.remote_crowds.get_mut(&owner), &self.build) else {
+                    return;
+                };
+                let Some(id) = rc.id_of(i) else {
+                    return;
+                };
+                rc.hit(i, eye);
+                b.send_crowd_hit(&owner, id, eye.to_array());
+                if !rc.npcs[i].hidden {
+                    self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.55));
+                }
+            }
+        }
+    }
+
+    /// (v226) Nous avons trouvé le personnage caché : son petit air, et le message.
+    fn say_found(&mut self) {
+        crate::audio::found();
+        self.chat.say(
+            format!(
+                "Tu as trouvé {} ! Il est reparti se cacher dans la foule.",
+                crate::crowd::HIDDEN_NAME
+            ),
+            chat::YELLOW,
+        );
+    }
+
+    /// (v227) Foules d'essai en construction en ligne : la nôtre (OP), dite aux joueurs proches
+    /// avec les coups qu'ils donnent à ses PNJ ; celles des autres OP, reçues, qui avancent
+    /// ici entre deux nouvelles. Le personnage caché trouvé : celui qui l'a trouvé et les
+    /// joueurs à moins de `FOUND_NEAR` blocs de là le savent.
+    fn update_shared_crowds(&mut self, dt: f32) {
+        if self.crowd_out.is_none() {
+            // (Seul le jeu qui mène la foule en ligne dit ce qui y change.)
+            if let Some(c) = self.crowd.as_mut() {
+                c.changed.clear();
+            }
+        }
+        let Some(b) = self.build.as_mut() else {
+            self.remote_crowds.clear();
+            self.crowd_out = None;
+            self.crowd_probe = None;
+            return;
+        };
+        if std::mem::take(&mut b.crowd_denied) && self.crowd_out.take().is_some() {
+            self.crowd_on = false;
+            self.crowd = None;
+            self.chat.say(
+                "Essai de foule arrêté : réservé aux OP de ce serveur.",
+                chat::RED,
+            );
+        }
+        let me = self.player.pos;
+        let hits = std::mem::take(&mut b.crowd_hits);
+        if let (Some(c), Some(out)) = (self.crowd.as_mut(), self.crowd_out.as_mut()) {
+            for (by, id, from) in hits {
+                let i = id as usize;
+                let from = Vec3::from(from);
+                // Un coup venu de trop loin (ou d'un PNJ qui n'est plus là) : ignoré.
+                let Some(at) = c.npcs.get(i).map(|n| n.pos) else {
+                    continue;
+                };
+                if !from.is_finite() || at.distance(from) > NPC_REACH + 4.0 {
+                    continue;
+                }
+                match c.hit(&self.world, i, from, me) {
+                    crate::crowd::Hit::Hidden => {
+                        out.found = Some((by.clone(), at.to_array()));
+                        if at.distance(me) <= FOUND_NEAR {
+                            self.chat.say(
+                                format!("{by} a trouvé {} !", crate::crowd::HIDDEN_NAME),
+                                chat::YELLOW,
+                            );
+                        }
+                    }
+                    crate::crowd::Hit::Npc => {
+                        if let Some(g) = npc_cry_gain(at.distance(me)) {
+                            self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, g));
+                        }
+                    }
+                }
+            }
+            if let Some(p) = out.take(c, me, dt) {
+                b.send_crowd(minelib_net::crowd::pack(&p));
+            }
+        }
+        for (owner, data) in std::mem::take(&mut b.crowd_inbox) {
+            let Some(p) = minelib_net::crowd::unpack(&data) else {
+                continue;
+            };
+            if p.stop {
+                self.remote_crowds.remove(&owner);
+                continue;
+            }
+            let rc = self.remote_crowds.entry(owner).or_default();
+            for at in rc.apply(&self.world, &p) {
+                if let Some(g) = npc_cry_gain(at.distance(me)) {
+                    self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, g));
+                }
+            }
+            if let Some((by, at)) = p.found {
+                if by.eq_ignore_ascii_case(b.pseudo()) {
+                    crate::audio::found();
+                    self.chat.say(
+                        format!(
+                            "Tu as trouvé {} ! Il est reparti se cacher dans la foule.",
+                            crate::crowd::HIDDEN_NAME
+                        ),
+                        chat::YELLOW,
+                    );
+                } else if Vec3::from(at).distance(me) <= FOUND_NEAR {
+                    self.chat.say(
+                        format!("{by} a trouvé {} !", crate::crowd::HIDDEN_NAME),
+                        chat::YELLOW,
+                    );
+                }
+            }
+        }
+        for rc in self.remote_crowds.values_mut() {
+            rc.update(&self.world, dt);
+        }
+        self.remote_crowds
+            .retain(|_, rc| rc.heard < crate::crowd::REMOTE_TIMEOUT);
+    }
+
+    /// (v227) `/npc stresstest on` en construction en ligne, le relais nous a dit OP : la
+    /// foule apparaît autour de nous, pour les joueurs proches aussi.
+    fn start_crowd_online(&mut self) {
+        self.crowd_on = true;
+        self.crowd = None;
+        self.crowd_out = Some(crate::crowd::Outbox::new());
+        self.chat.say(
+            format!(
+                "Essai de foule : jusqu'à {} joueurs simulés autour de toi en 2 minutes, vus \
+                 aussi par les joueurs proches. Un clic gauche les frappe ; {} se cache parmi \
+                 eux.",
+                crate::crowd::MAX,
+                crate::crowd::HIDDEN_NAME
+            ),
+            chat::YELLOW,
+        );
+    }
+
+    /// (v227) Arrête notre foule d'essai ; menée en ligne, les joueurs proches la voient
+    /// partir.
+    fn stop_crowd(&mut self) {
+        if let (Some(_), Some(b)) = (self.crowd_out.take(), &self.build) {
+            let p = crate::crowd::stop_packet(self.player.pos);
+            b.send_crowd(minelib_net::crowd::pack(&p));
+        }
+        self.crowd_on = false;
+        self.crowd = None;
     }
 
     fn handle_blocks(&mut self, input: &Input, dt: f32) {
@@ -2897,9 +3095,9 @@ impl Session {
         let attack = keys.pressed(input, Action::Attack);
         if attack || keys.held(input, Action::Attack) {
             let before_block = |t: f32| hit.as_ref().is_none_or(|b| t <= b.distance);
-            if let Some((i, _)) = self.npc_aimed().filter(|&(_, t)| before_block(t)) {
+            if let Some((target, _)) = self.npc_aimed().filter(|(_, t)| before_block(*t)) {
                 if attack {
-                    self.hit_npc(i);
+                    self.hit_npc(target);
                 }
                 return;
             }
@@ -4111,6 +4309,18 @@ impl Session {
     /// Réponse du relais à la demande de `open_light_editor` (`op` : on est OP du serveur).
     /// Renvoie vrai si c'était bien elle (son texte n'est alors pas affiché tel quel).
     pub fn light_op_answer(&mut self, op: bool) -> bool {
+        // (v227) Et à `/npc stresstest on` en ligne.
+        if let Some(asked) = self.crowd_probe.take() {
+            if asked.elapsed().as_secs_f32() <= 10.0 {
+                if op {
+                    self.start_crowd_online();
+                } else {
+                    self.chat
+                        .say("/npc stresstest : réservé aux OP de ce serveur.", chat::RED);
+                }
+                return true;
+            }
+        }
         // (v216) La même demande sert à `/thor` : la foudre est réservée aux OP du serveur.
         if let Some((asked, aim)) = self.thor_probe.take() {
             if asked.elapsed().as_secs_f32() <= 10.0 {
@@ -6319,9 +6529,23 @@ impl Session {
                 let value = parts.next().and_then(chat::switch);
                 match (sub.as_deref(), value) {
                     (Some("stresstest"), Some(false)) => {
-                        self.crowd_on = false;
-                        self.crowd = None;
+                        self.stop_crowd();
                         self.chat.say("Essai de foule arrêté.", chat::YELLOW);
+                    }
+                    // (v227) En construction en ligne : seulement un OP (le relais le dit, comme
+                    // pour `/thor`), pour les joueurs proches aussi.
+                    (Some("stresstest"), Some(true)) if self.build.is_some() => {
+                        if !self
+                            .crowd_probe
+                            .is_some_and(|t| t.elapsed().as_secs_f32() < 5.0)
+                        {
+                            self.crowd_probe = Some(std::time::Instant::now());
+                            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                                action: minelib_net::proto::SERVER_LIST,
+                                pseudo: String::new(),
+                                reason: String::new(),
+                            });
+                        }
                     }
                     (Some("stresstest"), Some(true)) => {
                         self.crowd_on = true;
@@ -7691,6 +7915,10 @@ impl Session {
         if let Some(c) = &self.crowd {
             near.extend(c.npcs.iter().map(|n| (n.name.as_str(), n.pos)));
         }
+        // (v227) Et ceux des foules des autres OP.
+        for rc in self.remote_crowds.values() {
+            near.extend(rc.npcs.iter().map(|n| (n.name.as_str(), n.pos)));
+        }
         if near.is_empty() {
             return;
         }
@@ -8330,7 +8558,12 @@ impl Session {
         // d'agrandissements et autant de recopies par image.
         let mut others: Vec<Other> = Vec::with_capacity(
             self.build.as_ref().map_or(0, |b| b.others.len())
-                + self.crowd.as_ref().map_or(0, |c| c.npcs.len()),
+                + self.crowd.as_ref().map_or(0, |c| c.npcs.len())
+                + self
+                    .remote_crowds
+                    .values()
+                    .map(|rc| rc.npcs.len())
+                    .sum::<usize>(),
         );
         if let Some(b) = &self.build {
             others.extend(b.others.values().map(|o| Other {
@@ -8357,6 +8590,21 @@ impl Session {
                 // (v197) Son skin est gardé par lui (repris de temps en temps) : 4 000
                 // recherches par pseudo et par image pour une réponse qui ne change
                 // jamais.
+                skin: n.skin.clone(),
+                covered: Some(n.covered),
+                held: None,
+                hurt: n.hurt,
+            }));
+        }
+        // (v227) Les foules d'essai des autres OP, dessinées pareil.
+        for rc in self.remote_crowds.values() {
+            others.extend(rc.npcs.iter().map(|n| Other {
+                pseudo: &n.name,
+                pos: n.pos,
+                yaw: n.yaw,
+                pitch: n.pitch,
+                crouch: 0.0,
+                walk: Some(&n.walk),
                 skin: n.skin.clone(),
                 covered: Some(n.covered),
                 held: None,

@@ -634,6 +634,27 @@ impl Build {
             .map(|(c, m)| (*c, m))
     }
 
+    /// (v227) Joueurs à `radius` chunks au plus du chunk `chunk` (dans chaque direction),
+    /// sauf `except` : ceux qui voient la foule d'essai d'un OP.
+    pub fn within(&mut self, chunk: [i32; 2], radius: i32, except: u64) -> Vec<u64> {
+        self.reindex();
+        let lo = minelib_net::proto::zone_of([chunk[0] - radius, chunk[1] - radius]);
+        let hi = minelib_net::proto::zone_of([chunk[0] + radius, chunk[1] + radius]);
+        let mut out = Vec::new();
+        for zx in lo[0]..=hi[0] {
+            for zz in lo[1]..=hi[1] {
+                let Some(v) = self.by_zone.get(&[zx, zz]) else {
+                    continue;
+                };
+                out.extend(v.iter().filter_map(|&(m, c)| {
+                    let near = (c[0] - chunk[0]).abs() <= radius && (c[1] - chunk[1]).abs() <= radius;
+                    (near && m != except).then_some(m)
+                }));
+            }
+        }
+        out
+    }
+
     /// Joueurs à qui envoyer ce qui se passe au chunk `chunk` (tous ceux à portée : une
     /// modification du monde doit arriver à chacun).
     pub fn listeners(&self, chunk: [i32; 2], except: u64) -> Vec<u64> {

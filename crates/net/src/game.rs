@@ -596,7 +596,30 @@ pub enum BuildMsg {
     /// (v224) Demande de lumière `seq` refusée (pas OP, trop de demandes, monde en pause) :
     /// remise au seul demandeur, qui remet la lumière comme les autres l'ont.
     LightDenied { seq: u32 },
+    /// (v227) Foule d'essai d'un OP (paquet de `crate::crowd`), envoyée comme ses positions
+    /// (`Request::Nearby`) au relais qui les suit (relais du monde, ou de sa province) : il la
+    /// remet aux joueurs à `CROWD_CHUNKS` chunks de lui au plus, avec son pseudo (`owner`,
+    /// celui de sa session).
+    Crowd { owner: String, data: Vec<u8> },
+    /// (v227) Coup d'un joueur au PNJ `id` de la foule de `owner`, depuis ses yeux en `from` :
+    /// remis par le relais au seul `owner`, qui mène la foule, avec le pseudo de la session
+    /// de celui qui frappe (`by`).
+    CrowdHit {
+        owner: String,
+        by: String,
+        id: u16,
+        from: [f32; 3],
+    },
+    /// (v227) Foule refusée (pas OP de ce serveur, trop de paquets, paquet trop gros ou
+    /// absurde) : remis au seul demandeur, dont la foule s'arrête.
+    CrowdDenied,
 }
+
+/// (v227) Portée de la foule d'essai d'un OP (chunks autour de lui) : ses PNJ vont jusqu'à
+/// 200 blocs de lui, ceux qui les voient sont un peu plus loin.
+pub const CROWD_CHUNKS: i32 = 24;
+/// (v227) Taille d'un paquet de la foule, au plus (octets).
+pub const CROWD_MAX_BYTES: usize = 24 * 1024;
 
 /// (v224) Taille maximale du texte d'une lumière (`BuildMsg::LightPut`).
 pub const LIGHT_MAX_BYTES: usize = 2048;

@@ -959,6 +959,10 @@ struct Conn {
     item_rate: (Instant, u32),
     /// (v224) Demandes de lumières de l'éditeur dans la seconde en cours (`LIGHT_RATE`).
     light_rate: (Instant, u32),
+    /// (v227) Paquets de la foule d'essai, et coups à ses PNJ, dans la seconde en cours
+    /// (`CROWD_RATE`, `CROWD_HIT_RATE`).
+    crowd_rate: (Instant, u32),
+    crowd_hit_rate: (Instant, u32),
     /// Modifications de blocs dans la seconde en cours (voir `EDIT_RATE`), et celles
     /// dues à l'écoulement d'un fluide (`FLUID_RATE`).
     edit_rate: (Instant, u32),
@@ -1006,6 +1010,8 @@ impl Conn {
             talked: HashMap::new(),
             item_rate: (Instant::now(), 0),
             light_rate: (Instant::now(), 0),
+            crowd_rate: (Instant::now(), 0),
+            crowd_hit_rate: (Instant::now(), 0),
             edit_rate: (Instant::now(), 0),
             fluid_rate: (Instant::now(), 0),
             served: HashSet::new(),
@@ -2492,6 +2498,20 @@ const ITEM_RATE: u32 = 40;
 /// en envoie au plus `lightnet::RATE` par seconde).
 const LIGHT_RATE: u32 = 200;
 
+/// (v227) Paquets de la foule d'essai acceptés par OP et par seconde (le jeu en envoie 20), et
+/// coups à ses PNJ par joueur et par seconde (un par clic).
+const CROWD_RATE: u32 = 40;
+const CROWD_HIT_RATE: u32 = 20;
+
+/// (v227) Un de plus dans la seconde en cours de ce compteur : encore permis (au plus `max`) ?
+fn within_rate(rate: &mut (Instant, u32), max: u32) -> bool {
+    if rate.0.elapsed() >= Duration::from_secs(1) {
+        *rate = (Instant::now(), 0);
+    }
+    rate.1 += 1;
+    rate.1 <= max
+}
+
 /// Modifications de blocs acceptées par joueur et par seconde ; celles que le jeu dit dues
 /// à l'écoulement d'un fluide ont un budget à part, plus large (une inondation change
 /// beaucoup de cases d'un coup).
@@ -2908,6 +2928,86 @@ pub(crate) fn deny_light(st: &mut State, rid: u64, id: u64, m: &game::BuildMsg) 
 /// Publie des états d'objets (voir `minelib_net::items`) : gardés dans l'historique de
 /// leur zone et remis aux joueurs proches, le demandeur `asker` en premier (c'est lui qui
 /// attend la réponse) ; un refus ne va qu'à lui. (v224) Les lumières de l'éditeur aussi.
+/// (v227) Foule d'essai d'un OP : un paquet de sa foule (`BuildMsg::Crowd`), ou le coup d'un
+/// joueur à un de ses PNJ (`BuildMsg::CrowdHit`), arrivé avec ses positions (`chunk` : le sien).
+/// Le paquet : d'un OP du serveur seulement, `CROWD_RATE` par seconde au plus, d'une taille
+/// raisonnable et lisible ; remis, avec le pseudo de sa session, aux joueurs à
+/// `CROWD_CHUNKS` chunks de lui au plus. Sinon `CrowdDenied` à lui seul. Le coup : remis au
+/// seul OP qui mène cette foule (s'il est là), avec le pseudo de celui qui frappe.
+pub(crate) fn crowd_request(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    pseudo: &str,
+    chunk: [i32; 2],
+    m: game::BuildMsg,
+) {
+    let Some(room) = st.rooms.get(&rid).filter(|r| r.kind == 1) else {
+        return;
+    };
+    match m {
+        game::BuildMsg::Crowd { data, .. } => {
+            let op = st.servers.is_op(&room.server, &room.creator, pseudo);
+            let calm = st
+                .conns
+                .get_mut(&id)
+                .is_some_and(|c| within_rate(&mut c.crowd_rate, CROWD_RATE));
+            let fits = data.len() <= game::CROWD_MAX_BYTES
+                && minelib_net::crowd::unpack(&data).is_some();
+            if !(op && calm && fits) {
+                if !op {
+                    log::info!("foule d'essai de « {pseudo} » refusée : pas OP de ce serveur");
+                }
+                if let Some(c) = st.conns.get(&id) {
+                    push_zone(&c.tx, chunk, game::encode(&game::BuildMsg::CrowdDenied));
+                }
+                return;
+            }
+            let out = game::encode(&game::BuildMsg::Crowd {
+                owner: pseudo.chars().take(32).collect(),
+                data,
+            });
+            let Some(room) = st.rooms.get_mut(&rid) else {
+                return;
+            };
+            for m in room.build.within(chunk, game::CROWD_CHUNKS, id) {
+                if let Some(c) = st.conns.get(&m) {
+                    push_zone(&c.tx, chunk, out.clone());
+                }
+            }
+        }
+        game::BuildMsg::CrowdHit {
+            owner, id: npc, from, ..
+        } => {
+            let calm = st
+                .conns
+                .get_mut(&id)
+                .is_some_and(|c| within_rate(&mut c.crowd_hit_rate, CROWD_HIT_RATE));
+            if !calm || from.iter().any(|v| !v.is_finite()) {
+                return;
+            }
+            let lead = room.everyone().find(|&m| {
+                m != id
+                    && st
+                        .conns
+                        .get(&m)
+                        .and_then(|c| c.pseudo.as_deref())
+                        .is_some_and(|p| p.eq_ignore_ascii_case(&owner))
+            });
+            if let Some(c) = lead.and_then(|m| st.conns.get(&m)) {
+                let out = game::encode(&game::BuildMsg::CrowdHit {
+                    owner,
+                    by: pseudo.chars().take(32).collect(),
+                    id: npc,
+                    from,
+                });
+                push_zone(&c.tx, chunk, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn publish_items(st: &mut State, rid: u64, asker: u64, msgs: Vec<game::BuildMsg>) {
     for m in msgs {
         let data = game::encode(&m);
@@ -7018,10 +7118,21 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             return None;
         }
         Request::Nearby { chunk, data } => {
+            let msg = game::decode::<game::BuildMsg>(&data);
+            // (v227) Foule d'essai d'un OP, coup à un de ses PNJ.
+            if let Some(
+                m @ (game::BuildMsg::Crowd { .. } | game::BuildMsg::CrowdHit { .. }),
+            ) = msg
+            {
+                if let Some(rid) = my_room {
+                    crowd_request(st, rid, id, pseudo, chunk, m);
+                }
+                return None;
+            }
             // Position sur ce serveur, gardée pour son retour.
             if let Some(game::BuildMsg::Player {
                 pos, yaw, pitch, ..
-            }) = game::decode::<game::BuildMsg>(&data)
+            }) = msg
             {
                 if let Some((rid, server)) = my_room.and_then(|rid| {
                     st.rooms
@@ -10257,6 +10368,145 @@ mod tests {
                 m => panic!("{m:?}"),
             }
         }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v227) La foule d'essai d'un OP : remise, avec son pseudo, aux joueurs proches (pas à
+    /// ceux de l'autre bout du monde) ; refusée à un joueur qui n'est pas OP, à lui seul ; un
+    /// coup à un de ses PNJ ne va qu'à l'OP, avec le pseudo de celui qui frappe.
+    #[test]
+    fn only_ops_share_a_test_crowd_and_hits_go_to_them() {
+        let dir = std::env::temp_dir().join(format!("minelib-foule-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        // Prochain message de la foule reçu.
+        let next_crowd = |c: &Client| loop {
+            if let Event::FromZone { peer, data, .. } =
+                wait(c, |e| matches!(e, Event::FromZone { .. }))
+            {
+                assert_eq!(peer, 0, "remis par le relais");
+                match game::decode::<game::BuildMsg>(&data).expect("message") {
+                    m @ (game::BuildMsg::Crowd { .. }
+                    | game::BuildMsg::CrowdHit { .. }
+                    | game::BuildMsg::CrowdDenied) => return m,
+                    _ => continue,
+                }
+            }
+        };
+        let packet = minelib_net::crowd::pack(&minelib_net::crowd::Packet {
+            center: [8.0, 70.0, 8.0],
+            count: 1,
+            npcs: vec![minelib_net::crowd::NpcState {
+                id: 0,
+                num: 1,
+                pos: [12.0, 70.0, 8.0],
+                yaw: 0.0,
+                speed: 4.3,
+                push: None,
+                hurt: false,
+                hidden: true,
+            }],
+            found: None,
+            stop: false,
+        });
+        let crowd = |owner: &str, data: &[u8]| Request::Nearby {
+            chunk: [0, 0],
+            data: game::encode(&game::BuildMsg::Crowd {
+                owner: owner.into(),
+                data: data.to_vec(),
+            }),
+        };
+        let (createur, clink) = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        transport::push(&clink, &Request::Position { chunk: [0, 0] });
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&elink, &Request::Position { chunk: [3, -2] });
+        let (loin, llink) = login("Loin");
+        loin.send(Cmd::Join(room));
+        wait(&loin, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&llink, &Request::Position { chunk: [400, 0] });
+        std::thread::sleep(Duration::from_millis(100));
+        // Eve n'est pas OP : refusé, à elle seule (même en se disant le créateur).
+        transport::push(&elink, &crowd("Createur", &packet));
+        assert_eq!(next_crowd(&eve), game::BuildMsg::CrowdDenied);
+        // Le créateur (OP) : Eve la reçoit, à son nom ; un paquet illisible : refusé.
+        transport::push(&clink, &crowd("Quelqu'un", &packet));
+        match next_crowd(&eve) {
+            game::BuildMsg::Crowd { owner, data } => {
+                assert_eq!(owner, "Createur");
+                assert_eq!(data, packet);
+            }
+            m => panic!("{m:?}"),
+        }
+        transport::push(&clink, &crowd("Createur", &packet[..packet.len() - 1]));
+        assert_eq!(next_crowd(&createur), game::BuildMsg::CrowdDenied);
+        // Eve frappe le PNJ 0 : le coup va au créateur seul, au nom d'Eve.
+        transport::push(
+            &elink,
+            &Request::Nearby {
+                chunk: [3, -2],
+                data: game::encode(&game::BuildMsg::CrowdHit {
+                    owner: "createur".into(),
+                    by: "Createur".into(),
+                    id: 0,
+                    from: [10.0, 71.6, 8.0],
+                }),
+            },
+        );
+        assert_eq!(next_crowd(&createur), game::BuildMsg::CrowdHit {
+            owner: "createur".into(),
+            by: "Eve".into(),
+            id: 0,
+            from: [10.0, 71.6, 8.0],
+        });
+        // Celui qui est à l'autre bout du monde n'a rien reçu de tout cela.
+        std::thread::sleep(Duration::from_millis(200));
+        let mut got = Vec::new();
+        while let Some(e) = loin.poll() {
+            if let Event::FromZone { data, .. } = e {
+                got.push(game::decode::<game::BuildMsg>(&data));
+            }
+        }
+        assert!(
+            !got.iter().any(|m| matches!(
+                m,
+                Some(game::BuildMsg::Crowd { .. } | game::BuildMsg::CrowdHit { .. })
+            )),
+            "{got:?}"
+        );
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
     }

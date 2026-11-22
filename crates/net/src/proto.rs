@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 /// (v222) 55 : la lampe torche en main part avec la position (poses, `BuildMsg::Player`).
 /// (v224) 56 : les lumières de l'éditeur dans les mondes de construction en ligne
 /// (`BuildMsg::LightPut`, `Light`, `LightDenied`).
-pub const PROTOCOL: u32 = 56;
+/// (v227) 57 : la foule d'essai des OP en construction en ligne (`BuildMsg::Crowd`,
+/// `CrowdHit`, `CrowdDenied`).
+pub const PROTOCOL: u32 = 57;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.

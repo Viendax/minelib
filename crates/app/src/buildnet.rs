@@ -338,6 +338,13 @@ pub struct BuildNet {
     /// plus `LIGHT_WAIT` s, puis sont refusées ici.
     light_asked: HashMap<u32, PKey>,
     light_queue: Vec<(BuildMsg, f32)>,
+    /// (v227) Foules d'essai menées par d'autres joueurs (OP) : paquets reçus, par pseudo de
+    /// celui qui la mène (voir `crowd::RemoteCrowd`).
+    pub crowd_inbox: Vec<(String, Vec<u8>)>,
+    /// (v227) Coups des autres joueurs à notre foule d'essai : qui, quel PNJ, d'où (ses yeux).
+    pub crowd_hits: Vec<(String, u16, [f32; 3])>,
+    /// (v227) Notre foule d'essai a été refusée par le relais (pas OP, trop de paquets).
+    pub crowd_denied: bool,
     /// (v140) Tout ce qu'on avait en vue au dernier passage était servi par des relais de
     /// province où l'on est entré ; province dite au relais du monde avec la dernière
     /// position qu'il a reçue.
@@ -542,6 +549,9 @@ impl BuildNet {
             item_asked: HashMap::new(),
             light_asked: HashMap::new(),
             light_queue: Vec::new(),
+            crowd_inbox: Vec::new(),
+            crowd_hits: Vec::new(),
+            crowd_denied: false,
             was_deep: false,
             root_province: None,
             dozing: false,
@@ -1413,6 +1423,47 @@ impl BuildNet {
         }
     }
 
+    /// (v227) Paquet de notre foule d'essai (`minelib_net::crowd::pack`) : avec nos positions,
+    /// au relais qui les suit (relais du monde, ou de notre province), qui le remet aux joueurs
+    /// proches. Pas encore placé dans le monde : rien.
+    pub fn send_crowd(&self, data: Vec<u8>) {
+        let Some(chunk) = self.chunk else {
+            return;
+        };
+        let msg = BuildMsg::Crowd {
+            owner: self.pseudo.clone(),
+            data,
+        };
+        self.send_at(
+            chunk,
+            Request::Nearby {
+                chunk,
+                data: game::encode(&msg),
+            },
+        );
+    }
+
+    /// (v227) Coup au PNJ `id` de la foule d'essai que mène `owner`, depuis nos yeux en `from` :
+    /// au relais qui suit nos positions, qui le remet à `owner`.
+    pub fn send_crowd_hit(&self, owner: &str, id: u16, from: [f32; 3]) {
+        let Some(chunk) = self.chunk else {
+            return;
+        };
+        let msg = BuildMsg::CrowdHit {
+            owner: owner.to_string(),
+            by: self.pseudo.clone(),
+            id,
+            from,
+        };
+        self.send_at(
+            chunk,
+            Request::Nearby {
+                chunk,
+                data: game::encode(&msg),
+            },
+        );
+    }
+
     /// (v224) Demande de lumière de l'éditeur (`BuildMsg::LightPut`, d'un OP) : à l'arbitre
     /// de son chunk, comme une demande d'objet (le relais du monde, ou le relais de sa
     /// province). Province pas encore prête : refusée ici (la lumière revient comme les
@@ -2060,6 +2111,28 @@ impl BuildNet {
             | BuildMsg::ChestPut { .. }
             | BuildMsg::ChestTake { .. }
             | BuildMsg::LightPut { .. } => Vec::new(),
+            // (v227) Foule d'essai d'un OP, coups à la nôtre, refus de la nôtre : remis par un
+            // relais (jamais par un joueur, `peer` 0).
+            BuildMsg::Crowd { owner, data } => {
+                if peer == 0 && !owner.eq_ignore_ascii_case(&self.pseudo) {
+                    self.crowd_inbox.push((owner, data));
+                }
+                Vec::new()
+            }
+            BuildMsg::CrowdHit {
+                owner, by, id, from,
+            } => {
+                if peer == 0 && owner.eq_ignore_ascii_case(&self.pseudo) {
+                    self.crowd_hits.push((by, id, from));
+                }
+                Vec::new()
+            }
+            BuildMsg::CrowdDenied => {
+                if peer == 0 {
+                    self.crowd_denied = true;
+                }
+                Vec::new()
+            }
             BuildMsg::Reject { pos, .. } => {
                 // (Un relais de province ne refuse que dans ses zones.)
                 if !self.sender_decides(chunk_of(pos[0], pos[2])) {
@@ -6583,6 +6656,77 @@ mod tests {
         assert_eq!(b.others["Lampe"].held, Some(Held::Zeus));
         b.receive(7, [0, 0], &msg(0), &mut w);
         assert_eq!(b.others["Lampe"].held, None);
+    }
+
+    /// (v227) Foule d'essai : celle d'un OP arrive (remise par un relais, pas par un joueur ; la
+    /// nôtre ne nous revient pas), les coups à la nôtre aussi, le refus de la nôtre ; la nôtre
+    /// et nos coups partent avec nos positions, à notre nom.
+    #[test]
+    fn test_crowds_come_and_go_with_positions() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut b = BuildNet::new(tx, "Moi".into(), false);
+        let mut w = World::new(0);
+        let data = vec![1u8, 2, 3];
+        let crowd = |owner: &str| {
+            game::encode(&BuildMsg::Crowd {
+                owner: owner.into(),
+                data: data.clone(),
+            })
+        };
+        b.receive(0, [0, 0], &crowd("Op"), &mut w);
+        b.receive(9, [0, 0], &crowd("Tricheur"), &mut w);
+        b.receive(0, [0, 0], &crowd("moi"), &mut w);
+        assert_eq!(b.crowd_inbox, vec![("Op".to_string(), data.clone())]);
+        let hit = |owner: &str| {
+            game::encode(&BuildMsg::CrowdHit {
+                owner: owner.into(),
+                by: "Eve".into(),
+                id: 7,
+                from: [1.0, 2.0, 3.0],
+            })
+        };
+        b.receive(0, [0, 0], &hit("MOI"), &mut w);
+        b.receive(0, [0, 0], &hit("Op"), &mut w);
+        assert_eq!(b.crowd_hits, vec![("Eve".to_string(), 7, [1.0, 2.0, 3.0])]);
+        b.receive(0, [0, 0], &game::encode(&BuildMsg::CrowdDenied), &mut w);
+        assert!(b.crowd_denied);
+        // Pas encore placé : rien ne part ; placé, la foule et le coup partent avec nos
+        // positions (`Nearby`), à notre nom.
+        b.send_crowd(vec![4, 5]);
+        assert!(rx.try_recv().is_err());
+        let _ = b.update(&mut w, Vec3::new(40.0, 64.0, -20.0), (0.0, 0.0), 0.0, 0.0, 0.0, 0.05);
+        while rx.try_recv().is_ok() {}
+        b.send_crowd(vec![4, 5]);
+        b.send_crowd_hit("Op", 3, [1.0, 2.0, 3.0]);
+        let mut sent = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let transport::Inbound::Push(bytes) = m {
+                if let Some(Request::Nearby { chunk, data }) = game::decode::<Request>(&bytes) {
+                    sent.push((chunk, game::decode::<BuildMsg>(&data).unwrap()));
+                }
+            }
+        }
+        assert_eq!(
+            sent,
+            vec![
+                (
+                    [2, -2],
+                    BuildMsg::Crowd {
+                        owner: "Moi".into(),
+                        data: vec![4, 5]
+                    }
+                ),
+                (
+                    [2, -2],
+                    BuildMsg::CrowdHit {
+                        owner: "Op".into(),
+                        by: "Moi".into(),
+                        id: 3,
+                        from: [1.0, 2.0, 3.0]
+                    }
+                )
+            ]
+        );
     }
 
     #[test]

@@ -9,8 +9,15 @@
 //! s'enfuit en courant. Un personnage caché, Pistache (skin dessiné pour lui, pseudo de la
 //! foule comme les autres), s'y promène : celui qui le trouve et le frappe est prévenu, et
 //! il repart se cacher ailleurs.
+//!
+//! (v227) En construction en ligne, un OP peut la lancer : son jeu la mène (`Crowd`) et dit
+//! aux joueurs proches, par le relais, ce qui change (`Outbox`, paquets de
+//! `minelib_net::crowd`) ; chez eux, elle avance de même entre deux nouvelles
+//! (`RemoteCrowd`). Ils peuvent frapper ses PNJ (le coup part au jeu de l'OP) et trouver
+//! Pistache : les joueurs proches en sont prévenus.
 
 use glam::Vec3;
+use minelib_net::crowd::{NpcState, Packet};
 use minelib_world::World;
 
 /// Joueurs simulés au plus, et temps (s) pour y arriver depuis zéro.
@@ -38,6 +45,14 @@ const RUN: f32 = 5.6;
 const HIDE_MIN: f32 = 40.0;
 /// (v226) Son nom, dit à qui le trouve.
 pub const HIDDEN_NAME: &str = "Pistache";
+/// (v227) Foule menée en ligne : un paquet toutes les… (s), et chaque PNJ redit au moins
+/// toutes les… (s) (pour ceux qui arrivent) ; PNJ par paquet au plus.
+pub const PACKET_EVERY: f32 = 0.05;
+pub const REFRESH_S: f32 = 4.0;
+const PACKET_MAX: usize = 1200;
+/// (v227) Une foule reçue dont on n'a plus de nouvelles depuis… (s) est oubliée (celui qui la
+/// menait est parti, ou trop loin).
+pub const REMOTE_TIMEOUT: f32 = 5.0;
 
 /// Un joueur simulé.
 pub struct Npc {
@@ -72,6 +87,11 @@ pub struct Npc {
     pub hurt: f32,
     /// (v226) C'est Pistache, le personnage caché (un seul dans la foule).
     pub hidden: bool,
+    /// (v227) Numéro de son pseudo (`Pnj` suivi de ce numéro), dit aux autres joueurs.
+    num: u32,
+    /// (v227) Foule reçue : le dernier état reçu le disait-il frappé ? (Son cri : seulement
+    /// quand il vient de l'être.)
+    heard_hurt: bool,
 }
 
 pub struct Crowd {
@@ -85,6 +105,10 @@ pub struct Crowd {
     recheck: usize,
     /// (v226) Le personnage caché est-il dans la foule ? (Le premier venu assez loin.)
     hidden_in: bool,
+    /// (v227) PNJ qui viennent de changer (apparu, tourné, arrêté, frappé, retombé, reparti
+    /// ailleurs) : ce que le jeu qui la mène en ligne dit tout de suite (`Outbox`). Vidé à
+    /// chaque image.
+    pub changed: Vec<u16>,
 }
 
 /// (v226) Ce qu'a fait un coup (`Crowd::hit`).
@@ -112,6 +136,7 @@ impl Crowd {
             next: 1,
             recheck: 0,
             hidden_in: false,
+            changed: Vec::new(),
         }
     }
 
@@ -150,6 +175,7 @@ impl Crowd {
                     n.skin = Some(crate::bot_skin::hidden_skin());
                 }
                 self.npcs.push(n);
+                self.changed.push((self.npcs.len() - 1) as u16);
             }
         }
         for i in 0..self.npcs.len() {
@@ -189,7 +215,8 @@ impl Crowd {
         let r = NEAR + (FAR - NEAR) * self.rnd().sqrt();
         let (x, z) = (center.x + a.cos() * r, center.z + a.sin() * r);
         let y = surface(world, x, z, center.y)?;
-        let name = format!("Pnj{}", self.next);
+        let num = self.next as u32;
+        let name = format!("Pnj{num}");
         self.next += 1;
         let yaw = self.rnd() * std::f32::consts::TAU;
         let speed = self.pick_speed();
@@ -210,28 +237,15 @@ impl Crowd {
             air: 0.0,
             hurt: 0.0,
             hidden: false,
+            num,
+            heard_hurt: false,
         })
     }
 
     /// (v226) PNJ dont la boîte (0,6 × 1,8 × 0,6 bloc, comme un joueur) est touchée par le
     /// rayon `eye` + t · `dir` à moins de `reach` blocs : le plus proche, et sa distance.
     pub fn aimed(&self, eye: Vec3, dir: Vec3, reach: f32) -> Option<(usize, f32)> {
-        let h = crate::player::HALF_WIDTH;
-        let mut best: Option<(usize, f32)> = None;
-        for (i, n) in self.npcs.iter().enumerate() {
-            // Loin du rayon : écarté sans calcul (des milliers par image, clic tenu).
-            if (n.pos - eye).length_squared() > (reach + 2.0) * (reach + 2.0) {
-                continue;
-            }
-            let min = n.pos - Vec3::new(h, 0.0, h);
-            let max = n.pos + Vec3::new(h, crate::player::HEIGHT, h);
-            if let Some(t) = ray_box(eye, dir, min, max) {
-                if t <= reach && best.is_none_or(|b| t < b.1) {
-                    best = Some((i, t));
-                }
-            }
-        }
-        best
+        aimed_in(&self.npcs, eye, dir, reach)
     }
 
     /// (v226) Coup de celui dont les yeux sont en `from` au PNJ `i` : il recule d'un bond loin
@@ -239,22 +253,12 @@ impl Crowd {
     /// repart se cacher ailleurs dans la foule (autour de `center`, loin de `from`), sous un
     /// autre pseudo.
     pub fn hit(&mut self, world: &World, i: usize, from: Vec3, center: Vec3) -> Hit {
+        self.changed.push(i as u16);
         if self.npcs[i].hidden {
             self.hide(world, i, center, from);
             return Hit::Hidden;
         }
-        let n = &mut self.npcs[i];
-        let mut away = Vec3::new(n.pos.x - from.x, 0.0, n.pos.z - from.z).normalize_or_zero();
-        if away == Vec3::ZERO {
-            away = Vec3::X;
-        }
-        n.push = away * KNOCK + Vec3::Y * KNOCK_UP;
-        n.air = n.air.max(1e-3);
-        n.hurt = HURT_S;
-        // Puis il s'enfuit, droit devant lui, loin du coup.
-        n.yaw = away.x.atan2(-away.z).rem_euclid(std::f32::consts::TAU);
-        n.speed = RUN;
-        n.turn_in = FLEE_S;
+        self.npcs[i].knock(from);
         Hit::Npc
     }
 
@@ -262,6 +266,7 @@ impl Crowd {
     /// (autour de `center`) à au moins `HIDE_MIN` blocs de `away_from`, sous un pseudo neuf.
     /// Reste où il est s'il n'en trouve pas (chunks pas chargés).
     fn hide(&mut self, world: &World, i: usize, center: Vec3, away_from: Vec3) {
+        self.changed.push(i as u16);
         for _ in 0..32 {
             let Some(m) = self.spawn(world, center) else {
                 continue;
@@ -298,12 +303,15 @@ impl Crowd {
         n.hurt = (n.hurt - dt).max(0.0);
         // (v226) En l'air après un coup : il retombe, puis s'enfuit.
         if n.air > 0.0 {
-            fly(world, n, dt);
+            if fly(world, n, dt) {
+                self.changed.push(i as u16);
+            }
             return;
         }
         n.turn_in -= dt;
         let turn = n.turn_in <= 0.0;
         if turn {
+            self.changed.push(i as u16);
             n.turn_in = 1.0 + r1 * 6.0;
             n.yaw = (n.yaw + (r2 - 0.5) * 2.5).rem_euclid(std::f32::consts::TAU);
         }
@@ -317,7 +325,9 @@ impl Crowd {
             // Trop loin : il revient près du joueur.
             if let Some(m) = self.spawn(world, center) {
                 let name = std::mem::take(&mut self.npcs[i].name);
-                self.npcs[i] = Npc { name, ..m };
+                let num = self.npcs[i].num;
+                self.npcs[i] = Npc { name, num, ..m };
+                self.changed.push(i as u16);
                 // (v194) Il repart d'ailleurs : sa marche aussi, sinon il arriverait en
                 // courant (et laisserait une traînée d'anticrénelage sur tout le chemin).
                 // (Le pseudo pris par `spawn` n'est pas utilisé.)
@@ -349,15 +359,339 @@ impl Crowd {
             }
             None => {
                 n.yaw = (n.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
+                self.changed.push(i as u16);
             }
         }
     }
 }
 
+impl Npc {
+    /// (v226) Coup reçu de celui dont les yeux sont en `from` : un bond en arrière, le rouge,
+    /// puis la fuite, droit devant lui, loin du coup.
+    fn knock(&mut self, from: Vec3) {
+        let mut away =
+            Vec3::new(self.pos.x - from.x, 0.0, self.pos.z - from.z).normalize_or_zero();
+        if away == Vec3::ZERO {
+            away = Vec3::X;
+        }
+        self.push = away * KNOCK + Vec3::Y * KNOCK_UP;
+        self.air = self.air.max(1e-3);
+        self.hurt = HURT_S;
+        self.heard_hurt = true;
+        self.yaw = away.x.atan2(-away.z).rem_euclid(std::f32::consts::TAU);
+        self.speed = RUN;
+        self.turn_in = FLEE_S;
+    }
+
+    /// (v227) Ce que les autres joueurs en savent (`id` : sa place dans la foule).
+    fn state(&self, id: u16) -> NpcState {
+        NpcState {
+            id,
+            num: self.num,
+            pos: self.pos.to_array(),
+            yaw: self.yaw,
+            speed: self.speed,
+            push: (self.air > 0.0).then_some(self.push.to_array()),
+            hurt: self.hurt > 0.0,
+            hidden: self.hidden,
+        }
+    }
+
+    /// (v227) PNJ d'une foule reçue, tel que le dit son état.
+    fn received(world: &World, s: &NpcState) -> Npc {
+        let pos = Vec3::from(s.pos);
+        let mut n = Npc {
+            name: format!("Pnj{}", s.num),
+            pos,
+            yaw: s.yaw,
+            pitch: 0.0,
+            speed: s.speed,
+            turn_in: f32::INFINITY,
+            cell: (pos.x.floor() as i32, pos.z.floor() as i32),
+            walk: crate::session::Walk::new(pos),
+            skin: None,
+            covered: covered(world, pos),
+            push: Vec3::ZERO,
+            air: 0.0,
+            hurt: 0.0,
+            hidden: false,
+            num: s.num,
+            heard_hurt: false,
+        };
+        n.set(world, s);
+        n
+    }
+
+    /// (v227) Nouvel état reçu du jeu qui mène la foule. Rend vrai s'il vient d'être frappé
+    /// (son cri).
+    fn set(&mut self, world: &World, s: &NpcState) -> bool {
+        if s.num != self.num {
+            self.num = s.num;
+            self.name = format!("Pnj{}", s.num);
+        }
+        let pos = Vec3::from(s.pos);
+        // Reparti d'ailleurs (réapparu, personnage caché qui se cache) : sa marche aussi.
+        if pos.distance(self.pos) > 4.0 {
+            self.walk = crate::session::Walk::new(pos);
+        }
+        self.pos = pos;
+        let cell = (pos.x.floor() as i32, pos.z.floor() as i32);
+        if cell != self.cell {
+            self.cell = cell;
+            self.covered = covered(world, pos);
+        }
+        self.yaw = s.yaw;
+        self.speed = s.speed;
+        match s.push {
+            Some(v) => {
+                self.push = Vec3::from(v);
+                self.air = self.air.max(1e-3);
+            }
+            None => {
+                self.push = Vec3::ZERO;
+                self.air = 0.0;
+            }
+        }
+        if s.hidden != self.hidden {
+            self.hidden = s.hidden;
+            self.skin = s.hidden.then(crate::bot_skin::hidden_skin);
+        }
+        let fresh = s.hurt && !self.heard_hurt;
+        if fresh {
+            self.hurt = HURT_S;
+        }
+        self.heard_hurt = s.hurt;
+        fresh
+    }
+}
+
+/// (v226) PNJ de `npcs` dont la boîte (0,6 × 1,8 × 0,6 bloc, comme un joueur) est touchée par
+/// le rayon `eye` + t · `dir` à moins de `reach` blocs : le plus proche, et sa distance.
+fn aimed_in(npcs: &[Npc], eye: Vec3, dir: Vec3, reach: f32) -> Option<(usize, f32)> {
+    let h = crate::player::HALF_WIDTH;
+    let mut best: Option<(usize, f32)> = None;
+    for (i, n) in npcs.iter().enumerate() {
+        // Loin du rayon : écarté sans calcul (des milliers par image, clic tenu).
+        if (n.pos - eye).length_squared() > (reach + 2.0) * (reach + 2.0) {
+            continue;
+        }
+        let min = n.pos - Vec3::new(h, 0.0, h);
+        let max = n.pos + Vec3::new(h, crate::player::HEIGHT, h);
+        if let Some(t) = ray_box(eye, dir, min, max) {
+            if t <= reach && best.is_none_or(|b| t < b.1) {
+                best = Some((i, t));
+            }
+        }
+    }
+    best
+}
+
+/// (v227) Ce que le jeu qui mène la foule en ligne doit encore en dire aux autres joueurs :
+/// d'abord les PNJ qui ont changé, puis, à tour de rôle, tous les autres (en `REFRESH_S`
+/// secondes : ceux qui arrivent les ont tous).
+#[derive(Default)]
+pub struct Outbox {
+    queued: Vec<bool>,
+    queue: Vec<u16>,
+    cursor: usize,
+    credit: f32,
+    wait: f32,
+    /// Le personnage caché vient d'être trouvé : par qui, où (part avec le paquet suivant).
+    pub found: Option<(String, [f32; 3])>,
+}
+
+impl Outbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Une image : ce qui vient de changer dans la foule (`Crowd::changed`, vidé) ; toutes les
+    /// `PACKET_EVERY` secondes, le paquet à envoyer (`center` : le joueur qui la mène).
+    pub fn take(&mut self, crowd: &mut Crowd, center: Vec3, dt: f32) -> Option<Packet> {
+        for i in crowd.changed.drain(..) {
+            let k = i as usize;
+            if k >= self.queued.len() {
+                self.queued.resize(k + 1, false);
+            }
+            if !self.queued[k] {
+                self.queued[k] = true;
+                self.queue.push(i);
+            }
+        }
+        let count = crowd.npcs.len();
+        self.credit = (self.credit + count as f32 * dt / REFRESH_S).min(PACKET_MAX as f32);
+        self.wait -= dt;
+        if self.wait > 0.0 {
+            return None;
+        }
+        // (Au rythme moyen voulu, sans rafale après une image lente.)
+        self.wait = (self.wait + PACKET_EVERY).max(0.0);
+        let mut ids: Vec<u16> = Vec::new();
+        let first = self.queue.len().min(PACKET_MAX);
+        for i in self.queue.drain(..first) {
+            self.queued[i as usize] = false;
+            if (i as usize) < count {
+                ids.push(i);
+            }
+        }
+        while self.credit >= 1.0 && ids.len() < PACKET_MAX && count > 0 {
+            self.credit -= 1.0;
+            let k = self.cursor % count;
+            ids.push(k as u16);
+            self.cursor = k + 1;
+        }
+        Some(Packet {
+            center: center.to_array(),
+            count: count as u16,
+            npcs: ids.iter().map(|&i| crowd.npcs[i as usize].state(i)).collect(),
+            found: self.found.take(),
+            stop: false,
+        })
+    }
+}
+
+/// (v227) Le dernier paquet d'une foule menée en ligne : elle s'arrête.
+pub fn stop_packet(center: Vec3) -> Packet {
+    Packet {
+        center: center.to_array(),
+        stop: true,
+        ..Packet::default()
+    }
+}
+
+/// (v227) Foule d'essai menée par le jeu d'un autre joueur (un OP), reçue par le relais : ses
+/// PNJ avancent tout droit à la vitesse dite, sur le sol, jusqu'à la nouvelle suivante.
+#[derive(Default)]
+pub struct RemoteCrowd {
+    /// PNJ dont on a reçu l'état (dans l'ordre d'arrivée).
+    pub npcs: Vec<Npc>,
+    /// Place dans `npcs` (plus un) de chaque PNJ de la foule, 0 : pas encore reçu.
+    slot: Vec<u32>,
+    /// Temps depuis le dernier paquet (s).
+    pub heard: f32,
+}
+
+impl RemoteCrowd {
+    /// Un paquet du jeu qui la mène. Rend où sont les PNJ qui viennent d'être frappés (leur
+    /// cri).
+    pub fn apply(&mut self, world: &World, p: &Packet) -> Vec<Vec3> {
+        self.heard = 0.0;
+        let count = p.count as usize;
+        // Foule plus petite : ceux d'après n'y sont plus.
+        if self.slot.len() > count {
+            for id in count..self.slot.len() {
+                if self.slot[id] != 0 {
+                    self.forget(id);
+                }
+            }
+        }
+        self.slot.resize(count, 0);
+        let mut hurt = Vec::new();
+        for s in &p.npcs {
+            let id = s.id as usize;
+            if id >= count {
+                continue;
+            }
+            match self.slot[id] {
+                0 => {
+                    let n = Npc::received(world, s);
+                    if n.hurt > 0.0 {
+                        hurt.push(n.pos);
+                    }
+                    self.npcs.push(n);
+                    self.slot[id] = self.npcs.len() as u32;
+                }
+                k => {
+                    let n = &mut self.npcs[k as usize - 1];
+                    if n.set(world, s) {
+                        hurt.push(n.pos);
+                    }
+                }
+            }
+        }
+        hurt
+    }
+
+    /// Retire le PNJ `id` (sa place prise par le dernier de la liste).
+    fn forget(&mut self, id: usize) {
+        let k = self.slot[id] as usize - 1;
+        self.slot[id] = 0;
+        self.npcs.swap_remove(k);
+        if k < self.npcs.len() {
+            // Le dernier de la liste a pris sa place : sa place dans la foule le suit.
+            let last = self.npcs.len() as u32 + 1;
+            if let Some(s) = self.slot.iter_mut().find(|s| **s == last) {
+                *s = k as u32 + 1;
+            }
+        }
+    }
+
+    /// Une image : chaque PNJ avance (bond, marche), sa marche est reprise.
+    pub fn update(&mut self, world: &World, dt: f32) {
+        self.heard += dt;
+        for n in &mut self.npcs {
+            n.hurt = (n.hurt - dt).max(0.0);
+            if n.air > 0.0 {
+                fly(world, n, dt);
+            } else {
+                glide(world, n, dt);
+            }
+            let (pos, yaw, pitch) = (n.pos, n.yaw, n.pitch);
+            n.walk.update(pos, yaw, pitch, 0.0, dt);
+        }
+    }
+
+    /// PNJ visé à portée de coup, et sa distance (voir `Crowd::aimed`).
+    pub fn aimed(&self, eye: Vec3, dir: Vec3, reach: f32) -> Option<(usize, f32)> {
+        aimed_in(&self.npcs, eye, dir, reach)
+    }
+
+    /// Sa place dans la foule (celle que connaît le jeu qui la mène) du PNJ `i` de `npcs`.
+    pub fn id_of(&self, i: usize) -> Option<u16> {
+        self.slot
+            .iter()
+            .position(|&s| s as usize == i + 1)
+            .map(|id| id as u16)
+    }
+
+    /// Coup donné ici au PNJ `i` : il recule tout de suite, sans attendre le jeu qui mène la
+    /// foule (le personnage caché, lui, ne bouge que quand celui-ci l'a déplacé).
+    pub fn hit(&mut self, i: usize, from: Vec3) {
+        let n = &mut self.npcs[i];
+        if !n.hidden {
+            n.knock(from);
+        }
+    }
+}
+
+/// (v227) Un pas d'un PNJ d'une foule reçue : tout droit à sa vitesse, sur le sol ; devant un
+/// mur ou un trou, il s'arrête (le jeu qui mène la foule le fait tourner : la nouvelle
+/// arrive).
+fn glide(world: &World, n: &mut Npc, dt: f32) {
+    if n.speed <= 0.0 {
+        return;
+    }
+    let (sy, cy) = n.yaw.sin_cos();
+    let next = n.pos + Vec3::new(sy, 0.0, -cy) * n.speed * dt;
+    let cell = (next.x.floor() as i32, next.z.floor() as i32);
+    if cell == n.cell {
+        n.pos = next;
+        return;
+    }
+    match step_ground(world, next.x, next.z, n.pos.y) {
+        Some(y) => {
+            n.pos = Vec3::new(next.x, y, next.z);
+            n.cell = cell;
+            n.covered = covered(world, n.pos);
+        }
+        None => n.speed = 0.0,
+    }
+}
+
 /// (v226) Un pas du bond d'un coup reçu : il recule (un mur l'arrête), monte, retombe sur le
 /// sol (au plus 2 s en l'air : au-delà, posé sur le sol de sa colonne). Posé, il s'enfuit à la
-/// vitesse décidée par le coup.
-fn fly(world: &World, n: &mut Npc, dt: f32) {
+/// vitesse décidée par le coup. (v227) Rend vrai à l'image où il se pose.
+fn fly(world: &World, n: &mut Npc, dt: f32) -> bool {
     n.air += dt;
     n.push.y -= GRAVITY * dt;
     let mut next = n.pos + n.push * dt;
@@ -407,8 +741,12 @@ fn fly(world: &World, n: &mut Npc, dt: f32) {
             n.air = 0.0;
             n.cell = (next.x.floor() as i32, next.z.floor() as i32);
             n.covered = covered(world, n.pos);
+            true
         }
-        None => n.pos = next,
+        None => {
+            n.pos = next;
+            false
+        }
     }
 }
 
@@ -486,6 +824,7 @@ mod tests {
         n.speed = 0.0;
         n.turn_in = 100.0;
         c.npcs.push(n);
+        c.changed.push(0);
         c
     }
 
@@ -581,6 +920,128 @@ mod tests {
         }
         let n = c.npcs.iter().find(|n| n.hidden).unwrap();
         assert!(n.skin.as_ref().is_some_and(|s| std::sync::Arc::ptr_eq(s, &skin)));
+    }
+
+    /// (v227) Une foule menée en ligne, reçue par un autre joueur : chaque PNJ y est, au
+    /// même endroit à un pas près (les paquets passent par leurs octets), Pistache compris ;
+    /// chacun est redit au moins toutes les `REFRESH_S` secondes ; arrêtée, le dernier paquet
+    /// le dit.
+    #[test]
+    fn a_crowd_led_online_is_seen_the_same_by_others() {
+        let w = flat();
+        let skins = crate::skin::Skins::default();
+        let center = Vec3::new(0.0, 11.0, 0.0);
+        let mut c = Crowd::new();
+        let mut out = Outbox::new();
+        let mut far = RemoteCrowd::default();
+        let mut late = RemoteCrowd::default();
+        let (mut sent, mut packets, mut biggest) = (0usize, 0usize, 0usize);
+        let dt = 1.0 / 60.0;
+        let steps = (40.0 / dt) as usize;
+        for step in 0..steps {
+            c.update(&w, &skins, center, dt);
+            if let Some(p) = out.take(&mut c, center, dt) {
+                let data = minelib_net::crowd::pack(&p);
+                biggest = biggest.max(data.len());
+                sent += data.len();
+                packets += 1;
+                let p = minelib_net::crowd::unpack(&data).unwrap();
+                far.apply(&w, &p);
+                // Un autre arrive au bout de 30 s : en `REFRESH_S`, il a tout le monde.
+                if step as f32 * dt >= 30.0 {
+                    late.apply(&w, &p);
+                }
+            }
+            far.update(&w, dt);
+            if step as f32 * dt >= 30.0 {
+                late.update(&w, dt);
+            }
+        }
+        // Le paquet suivant : ce qui a changé aux toutes dernières images.
+        let p = out.take(&mut c, center, PACKET_EVERY).unwrap();
+        let p = minelib_net::crowd::unpack(&minelib_net::crowd::pack(&p)).unwrap();
+        far.apply(&w, &p);
+        late.apply(&w, &p);
+        // Un paquet toutes les 50 ms ; une quinzaine d'octets par PNJ redit.
+        assert!((packets as f32 - 40.0 / PACKET_EVERY).abs() < 4.0, "{packets} paquets");
+        assert!(biggest < 24 * 1024, "{biggest} octets");
+        let per_s = sent as f32 / 40.0;
+        eprintln!(
+            "{packets} paquets, {per_s:.0} octets/s pour {} PNJ, le plus gros : {biggest} octets",
+            c.npcs.len()
+        );
+        assert!(per_s < 40_000.0, "{per_s} octets/s pour {} PNJ", c.npcs.len());
+        for rc in [&far, &late] {
+            assert_eq!(rc.npcs.len(), c.npcs.len());
+            for (id, n) in c.npcs.iter().enumerate() {
+                let k = rc.slot[id] as usize;
+                assert!(k > 0, "PNJ {id} pas reçu");
+                let m = &rc.npcs[k - 1];
+                assert_eq!((&m.name, m.hidden), (&n.name, n.hidden));
+                let d = m.pos.distance(n.pos);
+                assert!(d < 0.6, "{} : {d} blocs d'écart", n.name);
+            }
+        }
+        let i = c.npcs.iter().position(|n| n.hidden).unwrap();
+        let k = far.slot[i] as usize - 1;
+        assert!(far.npcs[k]
+            .skin
+            .as_ref()
+            .is_some_and(|s| std::sync::Arc::ptr_eq(s, &crate::bot_skin::hidden_skin())));
+        // Arrêtée : le dernier paquet le dit.
+        let p = stop_packet(center);
+        let q = minelib_net::crowd::unpack(&minelib_net::crowd::pack(&p)).unwrap();
+        assert!(q.stop && q.npcs.is_empty());
+    }
+
+    /// (v227) Un PNJ de la foule d'un OP frappé par un autre joueur : il recule tout de suite
+    /// chez celui qui frappe, puis chez l'OP (le coup lui arrive) et chez un troisième, qui
+    /// l'entend crier, une seule fois ; celui qui a frappé ne l'entend pas une deuxième fois.
+    #[test]
+    fn a_hit_on_someone_elses_crowd_is_seen_by_everyone_once() {
+        let w = flat();
+        let skins = crate::skin::Skins::default();
+        let center = Vec3::new(0.5, 11.0, 0.5);
+        let mut c = one_at(&w, Vec3::new(3.5, 11.0, 0.5));
+        let mut out = Outbox::new();
+        let mut rcs = [RemoteCrowd::default(), RemoteCrowd::default()];
+        // Quelques images de l'OP et des deux autres ; les cris entendus par chacun.
+        let run = |c: &mut Crowd, out: &mut Outbox, rcs: &mut [RemoteCrowd; 2], frames| {
+            let dt = 1.0 / 60.0;
+            let mut cries = [0, 0];
+            for _ in 0..frames {
+                c.update(&w, &skins, center, dt);
+                if let Some(p) = out.take(c, center, dt) {
+                    let p = minelib_net::crowd::unpack(&minelib_net::crowd::pack(&p)).unwrap();
+                    for (k, rc) in rcs.iter_mut().enumerate() {
+                        cries[k] += rc.apply(&w, &p).len();
+                    }
+                }
+                for rc in rcs.iter_mut() {
+                    rc.update(&w, dt);
+                }
+            }
+            cries
+        };
+        assert_eq!(run(&mut c, &mut out, &mut rcs, 30), [0, 0]);
+        let hitter = &mut rcs[0];
+        // Il frappe le PNJ chez lui : il recule tout de suite.
+        let eye = Vec3::new(0.5, 12.62, 0.5);
+        let (i, _) = hitter.aimed(eye, Vec3::X, 4.5).unwrap();
+        let id = hitter.id_of(i).unwrap();
+        assert_eq!(id, 0);
+        hitter.hit(i, eye);
+        assert!(hitter.npcs[i].air > 0.0 && hitter.npcs[i].hurt > 0.0);
+        // Le coup arrive à l'OP (un peu plus tard), qui le dit à tous.
+        assert_eq!(c.hit(&w, id as usize, eye, center), Hit::Npc);
+        let cries = run(&mut c, &mut out, &mut rcs, 90);
+        assert_eq!(cries, [0, 1], "cris entendus");
+        for rc in &rcs {
+            let n = &rc.npcs[0];
+            assert_eq!(n.pos.y, 11.0, "retombé");
+            assert!(n.pos.x > 5.0, "reculé puis enfui : {}", n.pos.x);
+            assert!(n.pos.distance(c.npcs[0].pos) < 0.6);
+        }
     }
 
     #[test]
