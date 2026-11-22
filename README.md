@@ -222,6 +222,7 @@ Le tchat se navigue avec ← → (Début, Fin, Suppr). Partout où une commande 
 | `/thor` | La foudre tombe là où tu vises (aussi `/foudre` ; OP en ligne) |
 | `/worldname <nom>` | Renommer le monde |
 | `/lumieres` · `/lumieres effacer` | Ouvrir l'éditeur de lumières, ou retirer toutes les lumières du monde (en ligne : OP, pour tout le monde) |
+| `/npc stresstest on\|off` | Foule d'essai : jusqu'à 4 000 PNJ qui se promènent autour de toi, pour voir si le jeu reste fluide (solo, hors mode FPS). Un clic gauche les frappe (ils reculent et s'enfuient), et Pistache se cache parmi eux : à toi de le trouver |
 | `//…` | WorldEdit (créatif ; en ligne, OP du serveur seulement) |
 
 </details>

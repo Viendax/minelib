@@ -26,6 +26,8 @@ use crate::save::{self, GameMode, GameState, PlayerState, SaveData, WorldMeta, M
 use crate::streaming::Streamer;
 
 pub const REACH: f32 = 6.0;
+/// (v226) Portée d'un coup à un PNJ de la foule d'essai (blocs, depuis les yeux).
+const NPC_REACH: f32 = 4.5;
 /// Taille d'écran nommée dans `/give` : `ecran` (normal), `petit_ecran`, `grand_ecran`,
 /// `ecran_geant` (aussi en anglais et avec accents, tirets ou espaces).
 fn screen_size(want: &str) -> Option<u8> {
@@ -2784,6 +2786,37 @@ impl Session {
         }
     }
 
+    /// (v226) PNJ de la foule d'essai visé à portée de coup, et sa distance.
+    fn npc_aimed(&self) -> Option<(usize, f32)> {
+        let c = self.crowd.as_ref()?;
+        c.aimed(self.player.eye(), self.player.look_dir(), NPC_REACH)
+    }
+
+    /// (v226) Coup au PNJ `i` de la foule d'essai : il recule et crie (un des cris de douleur,
+    /// plus ou moins aigu à chaque fois). Si c'est le personnage caché : un petit air (jamais
+    /// tout à fait le même) et un message ; il est reparti se cacher.
+    fn hit_npc(&mut self, i: usize) {
+        let (eye, center) = (self.player.eye(), self.player.pos);
+        let Some(c) = self.crowd.as_mut() else {
+            return;
+        };
+        match c.hit(&self.world, i, eye, center) {
+            crate::crowd::Hit::Npc => {
+                self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.55));
+            }
+            crate::crowd::Hit::Hidden => {
+                crate::audio::found();
+                self.chat.say(
+                    format!(
+                        "Tu as trouvé {} ! Il est reparti se cacher dans la foule.",
+                        crate::crowd::HIDDEN_NAME
+                    ),
+                    chat::YELLOW,
+                );
+            }
+        }
+    }
+
     fn handle_blocks(&mut self, input: &Input, dt: f32) {
         use crate::hand::Gesture;
         self.break_cooldown -= dt;
@@ -2859,6 +2892,18 @@ impl Session {
             self.player.look_dir().into(),
             REACH,
         );
+        // (v226) PNJ de la foule d'essai visé avant le bloc : le clic le frappe ; clic tenu,
+        // rien n'est cassé derrière lui.
+        let attack = keys.pressed(input, Action::Attack);
+        if attack || keys.held(input, Action::Attack) {
+            let before_block = |t: f32| hit.as_ref().is_none_or(|b| t <= b.distance);
+            if let Some((i, _)) = self.npc_aimed().filter(|&(_, t)| before_block(t)) {
+                if attack {
+                    self.hit_npc(i);
+                }
+                return;
+            }
+        }
         // Cadre accroché au mur (carte importée) devant le bloc visé : il se casse.
         self.frame_aim = self.aimed_frame();
         if breaking {
@@ -6281,11 +6326,14 @@ impl Session {
                     (Some("stresstest"), Some(true)) => {
                         self.crowd_on = true;
                         self.crowd = None;
+                        // (v226) On peut les frapper, et le personnage caché est parmi eux.
                         self.chat.say(
                             format!(
                                 "Essai de foule : jusqu'à {} joueurs simulés autour de toi en \
-                                 2 minutes, en solo hors mode FPS.",
-                                crate::crowd::MAX
+                                 2 minutes, en solo hors mode FPS. Un clic gauche les frappe ; \
+                                 {} se cache parmi eux.",
+                                crate::crowd::MAX,
+                                crate::crowd::HIDDEN_NAME
                             ),
                             chat::YELLOW,
                         );
@@ -8295,6 +8343,7 @@ impl Session {
                 skin: self.skins.of(&o.pseudo),
                 covered: None,
                 held: o.held,
+                hurt: 0.0,
             }));
         }
         if let Some(c) = &self.crowd {
@@ -8311,6 +8360,7 @@ impl Session {
                 skin: n.skin.clone(),
                 covered: Some(n.covered),
                 held: None,
+                hurt: n.hurt,
             }));
         }
         if !others.is_empty() {
@@ -8352,12 +8402,17 @@ impl Session {
                     walk: w.map_or(0.0, |w| w.phase),
                     swing: w.map_or(0.0, |w| w.amp),
                     crouch: o.crouch,
-                    light: match o.covered {
-                        Some(c) => sky_light_covered(c, self.daylight_shown),
-                        None => {
-                            sky_light(&self.world, eye_of(o.pos, o.crouch), self.daylight_shown)
-                        }
-                    },
+                    light: hurt_tint(
+                        match o.covered {
+                            Some(c) => sky_light_covered(c, self.daylight_shown),
+                            None => sky_light(
+                                &self.world,
+                                eye_of(o.pos, o.crouch),
+                                self.daylight_shown,
+                            ),
+                        },
+                        o.hurt,
+                    ),
                     // (v222) Ce qu'il tient : sa lampe torche (bras tendu vers son regard,
                     // comme on la voit soi-même dans un miroir) ou la Foudre de Zeus (l'éclair
                     // est dessiné à part : voir `update_remote_bolts`).
@@ -9448,6 +9503,23 @@ struct Other<'a> {
     covered: Option<bool>,
     /// (v222) Ce qu'il tient en main (construction en ligne) : lampe torche, Foudre de Zeus.
     held: Option<minelib_net::poses::Held>,
+    /// (v226) Temps qui reste du rouge d'un coup reçu (PNJ de la foule d'essai), en s.
+    hurt: f32,
+}
+
+/// (v226) Lumière d'un PNJ qui vient de recevoir un coup (`hurt` secondes de rouge qui
+/// restent) : il rougit, de moins en moins.
+fn hurt_tint(light: [f32; 3], hurt: f32) -> [f32; 3] {
+    let k = (hurt / crate::crowd::HURT_S).clamp(0.0, 1.0);
+    if k <= 0.0 {
+        return light;
+    }
+    let lum = light.iter().fold(0.0f32, |m, &c| m.max(c)).max(0.35);
+    [
+        light[0] + (lum * 1.3 - light[0]) * k,
+        light[1] * (1.0 - 0.65 * k),
+        light[2] * (1.0 - 0.65 * k),
+    ]
 }
 
 /// Marche d'un autre joueur : même balancement que le sien en F5, d'après la vitesse

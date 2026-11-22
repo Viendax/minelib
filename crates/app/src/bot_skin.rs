@@ -4,7 +4,7 @@
 //! capuche, t-shirt ; bonnet, cagoule, foulard), tenue d'intervention pour les
 //! antiterroristes (bleu, noir, gris ; gilet à poches, casque ou casquette, gants,
 //! genouillères). Teintes de peau, cheveux et visages sont tirés de la même façon dans les
-//! deux équipes.
+//! deux équipes. (v226) Et celui de Pistache, le personnage caché de la foule d'essai.
 
 use std::sync::Arc;
 
@@ -693,18 +693,50 @@ fn leg_px(l: &Look, a: At) -> Rgb {
 pub fn bot_skin(name: &str, team: u8) -> Arc<Skin> {
     let l = Look::of(name, team);
     let seed = Rng::of(name, team).next();
+    paint_look(&l, seed)
+}
+
+/// (v226) Skin de Pistache, le personnage caché dans la foule d'essai (`crowd`), dessiné ici
+/// pour Minelib : reconnaissable de loin à qui le cherche (sweat vert pistache, casquette
+/// jaune, pantalon violet, baskets blanches), sans rien qui le distingue de près des autres
+/// (il a un pseudo de la foule). Toujours le même.
+pub fn hidden_skin() -> Arc<Skin> {
+    static SKIN: std::sync::OnceLock<Arc<Skin>> = std::sync::OnceLock::new();
+    SKIN.get_or_init(|| {
+        let l = Look {
+            skin: [232, 190, 152],
+            hair: [168, 86, 38],
+            hair_style: Hair::Short,
+            eyes: [62, 112, 58],
+            beard: false,
+            head: Headwear::Cap([244, 200, 36]),
+            glasses: false,
+            top_kind: Top::Hoodie,
+            top: [150, 198, 98],
+            under: [246, 236, 206],
+            vest: None,
+            gloves: None,
+            patch: None,
+            pants: [112, 62, 152],
+            knees: None,
+            boots: [236, 236, 228],
+            belt: [64, 42, 30],
+        };
+        paint_look(&l, 0x5157_ac4e_0000_0226)
+    })
+    .clone()
+}
+
+/// Les six pavés d'un skin, dessinés d'après `l`.
+fn paint_look(l: &Look, seed: u64) -> Arc<Skin> {
     let mut px = vec![[0u8; 4]; 64 * 64];
-    paint(&mut px, (0, 0), [8, 8, 8], usize::MAX, seed, |a| {
-        head_px(&l, a)
-    });
-    paint(&mut px, (16, 16), [8, 12, 4], usize::MAX, seed, |a| {
-        body_px(&l, a)
-    });
+    paint(&mut px, (0, 0), [8, 8, 8], usize::MAX, seed, |a| head_px(l, a));
+    paint(&mut px, (16, 16), [8, 12, 4], usize::MAX, seed, |a| body_px(l, a));
     // Bras droit (côté droit dehors) et gauche ; jambes de même.
-    paint(&mut px, (40, 16), [4, 12, 4], 2, seed, |a| arm_px(&l, a));
-    paint(&mut px, (32, 48), [4, 12, 4], 3, seed, |a| arm_px(&l, a));
-    paint(&mut px, (0, 16), [4, 12, 4], 2, seed, |a| leg_px(&l, a));
-    paint(&mut px, (16, 48), [4, 12, 4], 3, seed, |a| leg_px(&l, a));
+    paint(&mut px, (40, 16), [4, 12, 4], 2, seed, |a| arm_px(l, a));
+    paint(&mut px, (32, 48), [4, 12, 4], 3, seed, |a| arm_px(l, a));
+    paint(&mut px, (0, 16), [4, 12, 4], 2, seed, |a| leg_px(l, a));
+    paint(&mut px, (16, 48), [4, 12, 4], 3, seed, |a| leg_px(l, a));
     Skin::from_pixels(px)
 }
 
@@ -857,6 +889,40 @@ mod tests {
             let t = Look::of(&name, T);
             assert!(t.vest.is_none() && t.top_kind != Top::Uniform);
             assert!(!CT_UNIFORMS.contains(&t.top));
+        }
+    }
+
+    /// (v226) Pistache, le personnage caché de la foule d'essai : un skin complet, toujours le
+    /// même (une seule image pour tout le jeu), le sweat vert pistache, que n'a aucun bot.
+    #[test]
+    fn pistache_has_his_own_full_skin() {
+        let s = hidden_skin();
+        assert!(Arc::ptr_eq(&s, &hidden_skin()));
+        for part in 0..6 {
+            let size = match part {
+                5 => [8, 8, 8],
+                2 => [8, 12, 4],
+                _ => [4, 12, 4],
+            };
+            for face in 0..6 {
+                let (w, h) = match face {
+                    0 | 1 => (size[0], size[1]),
+                    2 | 3 => (size[2], size[1]),
+                    _ => (size[0], size[2]),
+                };
+                for v in 0..h {
+                    for u in 0..w {
+                        assert!(s.layer_color(part, face, u, v, size, false).is_some());
+                    }
+                }
+            }
+        }
+        for i in 0..40 {
+            for team in [CT, T] {
+                let l = Look::of(&format!("BOT Essai {i}"), team);
+                assert_ne!(l.top, [150, 198, 98]);
+                assert!(*bot_skin(&format!("BOT Essai {i}"), team) != *s);
+            }
         }
     }
 }

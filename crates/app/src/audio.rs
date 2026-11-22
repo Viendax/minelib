@@ -668,6 +668,35 @@ pub fn pickup() {
     }
 }
 
+/// (v226) Personnage caché trouvé (foule d'essai) : un petit air calculé (voir
+/// `synth::found`), tiré à chaque fois (forme, tempo, timbre, tonalité) : jamais deux fois
+/// le même.
+pub fn found() {
+    if master() <= 0.0 {
+        return;
+    }
+    let seed = ((jitter() + 1.0) * 1e6) as u32 | 1;
+    let (pcm, rate) = synth::found(seed);
+    if let Some(tx) = sender() {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(Cmd {
+                file: "",
+                volume: FOUND_VOLUME,
+                delay: 0.0,
+                speed: 1.0,
+                voice: None,
+                reopen: false,
+                pcm: Some((pcm, rate)),
+                rain: None,
+                crackle: None,
+            });
+        }
+    }
+}
+
+/// (v226) Volume du petit air du personnage caché trouvé.
+const FOUND_VOLUME: f32 = 0.4;
+
 /// (v217) Nombre au hasard entre −1 et 1 (xorshift, pour la hauteur des sons).
 fn jitter() -> f32 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1245,6 +1274,59 @@ pub mod synth {
         (s.iter().map(|v| (v * k) as i16).collect(), RATE)
     }
 
+    /// (v226) Petit air joyeux du personnage caché trouvé : quatre ou cinq notes qui montent
+    /// (accord majeur ou suspendu, dans l'un des ordres prévus), la dernière tenue ; tirés de
+    /// `seed` : la forme, la tonalité (± 3 demi-tons autour du mi), le tempo et le timbre
+    /// (cloche plus ou moins claire). Jamais deux fois le même.
+    pub fn found(seed: u32) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed | 1);
+        for _ in 0..4 {
+            rng.next();
+        }
+        const SHAPES: [&[f32]; 5] = [
+            &[0.0, 4.0, 7.0, 12.0],
+            &[0.0, 7.0, 4.0, 12.0],
+            &[0.0, 4.0, 7.0, 11.0, 12.0],
+            &[0.0, 5.0, 9.0, 12.0],
+            &[0.0, 2.0, 4.0, 7.0, 12.0],
+        ];
+        let shape = SHAPES[((rng.unit() * SHAPES.len() as f32) as usize).min(SHAPES.len() - 1)];
+        let root = 659.3 * 2f32.powf(((rng.unit() * 7.0).floor() - 3.0) / 12.0);
+        let step = 0.07 + 0.035 * rng.unit();
+        let bright = 0.15 + 0.35 * rng.unit();
+        let ring = 0.22 + 0.15 * rng.unit();
+        let last = step * (shape.len() - 1) as f32;
+        let total = last + ring * 3.5;
+        let n = (RATE as f32 * total) as usize;
+        let mut s = vec![0.0f32; n];
+        for (k, semi) in shape.iter().enumerate() {
+            let f = root * 2f32.powf(semi / 12.0);
+            let at = step * k as f32;
+            // Chaque note un peu plus ou moins forte, la dernière tenue plus longtemps.
+            let gain = 0.75 + 0.25 * rng.unit();
+            let decay = if k + 1 == shape.len() { ring * 1.6 } else { ring * 0.7 };
+            let start = (at * RATE as f32) as usize;
+            for (i, v) in s[start..].iter_mut().enumerate() {
+                let t = i as f32 / RATE as f32;
+                let env = (t / 0.004).min(1.0) * (-t / decay).exp();
+                if env < 1e-4 && t > 0.01 {
+                    break;
+                }
+                let p = TAU * f * t;
+                *v += gain
+                    * env
+                    * (p.sin() + bright * (2.0 * p).sin() + 0.5 * bright * (3.0 * p).sin());
+            }
+        }
+        let fade = (RATE as usize / 100).min(n);
+        for (i, v) in s[n - fade..].iter_mut().enumerate() {
+            *v *= 1.0 - i as f32 / fade as f32;
+        }
+        let peak = s.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let k = 0.85 * 32767.0 / peak;
+        (s.iter().map(|v| (v * k) as i16).collect(), RATE)
+    }
+
     /// Volume du tonnerre selon la distance (blocs) : fort tout près, il faiblit sans
     /// disparaître (on entend un orage de loin).
     pub fn thunder_gain(distance: f32) -> f32 {
@@ -1520,6 +1602,24 @@ mod tests {
             (0..50_000).all(|_| w.next().is_some()),
             "la pluie ne s'arrête pas"
         );
+    }
+
+    /// (v226) Le petit air du personnage caché : court, pas saturé, sans clic à la fin, et
+    /// jamais le même d'une fois à l'autre.
+    #[test]
+    fn the_found_jingle_changes_every_time() {
+        let mut seen = Vec::new();
+        for seed in [1u32, 2, 77, 4242, 99_999, 123_456_789] {
+            let (pcm, rate) = synth::found(seed);
+            assert_eq!(rate, synth::RATE);
+            let secs = pcm.len() as f32 / rate as f32;
+            assert!((0.4..2.0).contains(&secs), "{secs} s");
+            let peak = pcm.iter().map(|v| v.unsigned_abs()).max().unwrap();
+            assert!(peak > 20_000 && peak < 32_000, "{peak}");
+            assert!(pcm.last().is_some_and(|v| v.unsigned_abs() < 200), "clic à la fin");
+            assert!(!seen.contains(&pcm), "même air pour {seed}");
+            seen.push(pcm);
+        }
     }
 
     /// (v217) La hauteur des sons varie un peu à chaque fois (pas plus que prévu), jamais
