@@ -14,8 +14,10 @@
 //! La météo est une fonction de la graine du monde et d'une horloge : tout le monde y lit
 //! le même temps au même moment, sans rien s'échanger. En solo l'horloge est le temps joué
 //! dans ce monde (enregistré avec lui) ; sur un serveur de construction c'est l'heure du
-//! système, la même pour tous les joueurs. `/weather` impose un temps (chez soi) pour une
-//! durée tirée comme dans Minecraft, `/weather fix` le fige.
+//! système, la même pour tous les joueurs. `/weather` impose un temps pour une durée tirée
+//! comme dans Minecraft, `/weather fix` le fige. (v229) Sur un serveur de construction, c'est
+//! un OP qui l'impose, pour tous ses joueurs : le relais le dit à chacun (`impose`), et à
+//! ceux qui arrivent.
 //!
 //! Ce que voit le rendu est lissé : les nuages s'épaississent en une minute, la pluie
 //! commence quand le ciel est couvert, l'orage s'assombrit ensuite ; dans l'autre sens la
@@ -50,6 +52,17 @@ impl Kind {
             Kind::Clear => "clear",
             Kind::Rain => "rain",
             Kind::Storm => "storm",
+        }
+    }
+
+    /// (v229) Sur le réseau (`proto::WEATHER_…`).
+    pub fn from_byte(b: u8) -> Option<Self> {
+        use minelib_net::proto::{WEATHER_CLEAR, WEATHER_RAIN, WEATHER_STORM};
+        match b {
+            WEATHER_CLEAR => Some(Kind::Clear),
+            WEATHER_RAIN => Some(Kind::Rain),
+            WEATHER_STORM => Some(Kind::Storm),
+            _ => None,
         }
     }
 
@@ -186,6 +199,9 @@ pub struct Weather {
     settled: bool,
     /// Dernière seconde dont la foudre a été tirée.
     last_slot: Option<i64>,
+    /// (v229) Ce que le serveur vient d'imposer (`impose`), posé à la prochaine `update`
+    /// (l'horloge y est celle du moment).
+    imposed: Option<(Option<Kind>, Option<f64>, bool)>,
 }
 
 impl Weather {
@@ -202,6 +218,7 @@ impl Weather {
             storm_amount: 0.0,
             settled: false,
             last_slot: None,
+            imposed: None,
         }
     }
 
@@ -245,6 +262,13 @@ impl Weather {
         self.forced = Some((kind, until));
     }
 
+    /// (v229) Le serveur de construction dit sa météo (à l'arrivée, et quand un OP la
+    /// change) : `kind` imposé pour encore `left` secondes (`None` : sans fin), ou `None` :
+    /// celle des horloges du monde. Remplace ce qui était imposé ici.
+    pub fn impose(&mut self, kind: Option<Kind>, left: Option<f64>, fixed: bool) {
+        self.imposed = Some((kind, left.filter(|l| l.is_finite()), fixed && kind.is_some()));
+    }
+
     /// `/weather fix` : figer le temps qu'il fait (ou le laisser changer de nouveau).
     pub fn fix(&mut self, on: bool) {
         if on {
@@ -263,6 +287,10 @@ impl Weather {
         match unix {
             Some(u) => self.clock = (u - ONLINE_EPOCH_S).max(0.0),
             None => self.clock += dt as f64,
+        }
+        if let Some((kind, left, fixed)) = self.imposed.take() {
+            self.fixed = fixed;
+            self.forced = kind.map(|k| (k, left.map_or(f64::INFINITY, |l| self.clock + l.max(0.0))));
         }
         let kind = self.kind();
         // Par beau temps : plus ou moins de cumulus, d'une heure à l'autre.
@@ -606,6 +634,58 @@ mod tests {
         let mut odd = Weather::new(9);
         odd.load("n'importe quoi;;;");
         assert_eq!(odd.kind(), Kind::Clear);
+    }
+
+    /// (v229) Ce qu'impose le serveur de construction : compté sur l'horloge en ligne (l'heure
+    /// du système) du moment où on l'apprend, même reçu avant la première image ; déjà là à
+    /// l'arrivée (pas de transition) ; « aucun » efface ce qui était imposé ici.
+    #[test]
+    fn the_server_weather_replaces_ours_and_ends_on_the_online_clock() {
+        let unix = ONLINE_EPOCH_S + 5.0e6;
+        // Un monde qu'on avait figé chez soi sur l'orage, puis ouvert en ligne.
+        let mut w = Weather::new(9);
+        w.force(Kind::Storm);
+        w.fix(true);
+        w.impose(None, None, false);
+        w.update(0.016, Some(unix));
+        assert!(!w.fixed);
+        let natural = w.clone_at(w.clock).0;
+        assert_eq!(w.kind(), natural, "le serveur n'impose rien : les horloges");
+        // À l'arrivée : la pluie pour encore 300 s, reçue avant la première image.
+        let mut w = Weather::new(9);
+        w.impose(Kind::from_byte(1), Some(300.0), false);
+        w.update(0.016, Some(unix));
+        assert_eq!(w.kind(), Kind::Rain);
+        assert_eq!((w.cover, w.rain_amount), (1.0, 1.0), "déjà là, sans transition");
+        w.update(0.016, Some(unix + 299.0));
+        assert_eq!(w.kind(), Kind::Rain);
+        w.update(0.016, Some(unix + 301.0));
+        let natural = w.clone_at(w.clock).0;
+        assert_eq!(w.kind(), natural, "sa durée passée : les horloges");
+        // Un OP fige l'orage : sans fin, et il arrive peu à peu.
+        w.impose(Some(Kind::Storm), None, true);
+        w.update(0.016, Some(unix + 302.0));
+        assert!(w.fixed && w.storm_amount < 0.1);
+        w.update(0.016, Some(unix + 1.0e7));
+        assert_eq!(w.kind(), Kind::Storm);
+        // Un temps inconnu : comme « aucun ».
+        assert_eq!(Kind::from_byte(7), None);
+        for k in [Kind::Clear, Kind::Rain, Kind::Storm] {
+            let b = match k {
+                Kind::Clear => minelib_net::proto::WEATHER_CLEAR,
+                Kind::Rain => minelib_net::proto::WEATHER_RAIN,
+                Kind::Storm => minelib_net::proto::WEATHER_STORM,
+            };
+            assert_eq!(Kind::from_byte(b), Some(k));
+            // (Le relais tire les mêmes durées que `force`.)
+            let span = minelib_net::proto::weather_span(b).unwrap();
+            let ours = match k {
+                Kind::Clear => RAIN_OFF_S,
+                Kind::Rain => RAIN_ON_S,
+                Kind::Storm => THUNDER_ON_S,
+            };
+            assert_eq!((span.0 as f64, span.1 as f64), ours);
+        }
     }
 
     /// De beau temps à l'orage : les nuages d'abord, puis la pluie, puis l'orage, sans

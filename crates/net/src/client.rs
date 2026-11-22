@@ -295,6 +295,12 @@ pub enum Event {
         hours: f32,
         fixed: bool,
     },
+    /// (v229) Météo du serveur de construction (voir `Response::SetWeather`).
+    SetWeather {
+        kind: u8,
+        left: f32,
+        fixed: bool,
+    },
     /// Réponse du relais à des modifications en masse (WorldEdit) : `error` vide si publiées.
     BulkDone {
         id: u32,
@@ -820,6 +826,7 @@ impl Worker {
             Response::SetGamemode { mode, by } => Event::SetGamemode { mode, by },
             Response::BulkDone { id, error } => Event::BulkDone { id, error },
             Response::SetTime { hours, fixed } => Event::SetTime { hours, fixed },
+            Response::SetWeather { kind, left, fixed } => Event::SetWeather { kind, left, fixed },
             Response::BuildSpawn { pos, yaw, pitch } => Event::BuildSpawn { pos, yaw, pitch },
             Response::Arbitrate { case, map_sig, map } => Event::Arbitrate { case, map_sig, map },
             Response::Evidence {

@@ -1692,6 +1692,7 @@ pub(crate) fn settings_of(st: &State, server: &str) -> proto::ProvinceSettings {
         bans: st.servers.bans(server),
         modes: st.bags.modes_of(server),
         time: None,
+        weather: None,
     }
 }
 
@@ -1706,6 +1707,14 @@ pub(crate) fn push_settings(st: &State, server: &str) {
 pub(crate) fn push_time(st: &State, server: &str, time: (f32, bool)) {
     let mut settings = settings_of(st, server);
     settings.time = Some(time);
+    push_these(st, server, settings);
+}
+
+/// (v229) Relais du monde : un OP a changé la météo ; les provinces la disent à leurs
+/// joueurs (comme l'heure).
+pub(crate) fn push_weather(st: &State, server: &str, weather: (u8, f32, bool)) {
+    let mut settings = settings_of(st, server);
+    settings.weather = Some(weather);
     push_these(st, server, settings);
 }
 
@@ -4333,12 +4342,14 @@ pub(crate) fn to_zone(
         }
         if let Some(m) = &msg {
             super::deny_light(st, rid, id, m);
+            super::deny_thor(st, id, m);
         }
         return;
     }
-    // (v224) Lumière de l'éditeur : son chunk décide (comme pour un objet).
+    // (v224) Lumière de l'éditeur : son chunk décide (comme pour un objet). (v229) La
+    // foudre aussi.
     let chunk = match &msg {
-        Some(BuildMsg::LightPut { chunk: at, .. }) => *at,
+        Some(BuildMsg::LightPut { chunk: at, .. } | BuildMsg::ThorAsk { chunk: at, .. }) => *at,
         _ => chunk,
     };
     let region = proto::region_of(chunk);
@@ -4355,6 +4366,7 @@ pub(crate) fn to_zone(
         }
         if let Some(m) = &msg {
             super::deny_light(st, rid, id, m);
+            super::deny_thor(st, id, m);
         }
         return;
     }
@@ -4365,6 +4377,7 @@ pub(crate) fn to_zone(
         log::debug!("province : demande de {pseudo} en {chunk:?} hors de la province, ignorée");
         if let Some(m) = &msg {
             super::deny_light(st, rid, id, m);
+            super::deny_thor(st, id, m);
         }
         return;
     };
@@ -4372,6 +4385,11 @@ pub(crate) fn to_zone(
     // réglages que lui donne le relais du monde).
     if let Some(m @ BuildMsg::LightPut { .. }) = &msg {
         super::light_request(st, rid, id, pseudo, m);
+        return;
+    }
+    // (v229) Foudre d'un OP dans la province : de même.
+    if let Some(m @ BuildMsg::ThorAsk { .. }) = &msg {
+        super::thor_request(st, rid, id, pseudo, m);
         return;
     }
     let sovereign = room.sov.get(&region).map(|sv| sv.primary);
@@ -4840,15 +4858,25 @@ pub(crate) fn settings(st: &mut State, settings: proto::ProvinceSettings) {
             }
         }
     }
+    // (v229) La météo, de même.
+    if let (Some((kind, left, fixed)), Some(room)) = (settings.weather, st.rooms.get(&rid)) {
+        for m in room.members.iter().filter(|m| !room.hidden.contains(m)) {
+            if let Some(c) = st.conns.get(m) {
+                transport::push(&c.tx, &Response::SetWeather { kind, left, fixed });
+            }
+        }
+    }
     for id in banned {
         leave_room(st, id);
         if let Some(c) = st.conns.get(&id) {
             transport::push(&c.tx, &Response::RoomClosed);
         }
     }
-    // (v143) Un pays : à ses provinces aussi (v146 : avec l'heure, si elle vient de changer).
+    // (v143) Un pays : à ses provinces aussi (v146 : avec l'heure, si elle vient de changer ;
+    // v227 : et la météo).
     let mut down = settings_of(st, &server);
     down.time = settings.time;
+    down.weather = settings.weather;
     push_these(st, &server, down);
 }
 

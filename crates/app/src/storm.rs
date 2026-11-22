@@ -190,6 +190,9 @@ pub struct Storm {
     /// Essais (MINELIB_ZEUS, MINELIB_THOR) : objet déjà donné, temps avant le prochain coup.
     pub test_given: bool,
     pub test_in: f32,
+    /// Essais (`MINELIB_CMD`) : temps passé dans le monde, et commandes déjà tapées.
+    pub test_clock: f32,
+    pub test_cmds: usize,
     /// (v217) Horloge des éclairs posés au sol.
     clock: f32,
     /// Œil du joueur à la dernière image.
@@ -217,6 +220,8 @@ impl Storm {
             active: false,
             test_given: false,
             test_in: 0.0,
+            test_clock: 0.0,
+            test_cmds: 0,
             clock: 0.0,
             eye: Vec3::ZERO,
         }
@@ -365,6 +370,12 @@ impl Storm {
     /// `/thor`, ou un coup de la Foudre de Zeus : la foudre tombe en `pos`, tout de suite.
     pub fn strike(&mut self, pos: Vec3) {
         let seed = self.rng.next() as u32;
+        self.strike_seeded(pos, seed);
+    }
+
+    /// (v229) La même, de forme tirée de `seed` : sur un serveur de construction, l'arbitre
+    /// la publie avec sa graine, et tous ceux qui la voient voient le même éclair.
+    pub fn strike_seeded(&mut self, pos: Vec3, seed: u32) {
         self.strikes.push(Strike::new(pos, seed, cloud_y(pos), 0.0));
         self.maybe_cloud_bolt(pos, 0.0);
     }
@@ -393,10 +404,16 @@ impl Storm {
     /// nuages. `eye_y` : hauteur de l'œil (la base des nuages en dépend).
     pub fn strike_up(&mut self, from: Vec3, dir: Vec3, eye_y: f32) {
         let seed = self.rng.next() as u32;
+        self.strike_up_seeded(from, dir, eye_y, seed);
+        self.held.surge(from, dir);
+    }
+
+    /// (v229) La même, de forme tirée de `seed` (voir `strike_seeded`), sans le sursaut de
+    /// l'éclair tenu (c'est peut-être celle d'un autre joueur).
+    pub fn strike_up_seeded(&mut self, from: Vec3, dir: Vec3, eye_y: f32, seed: u32) {
         let base = minelib_render::sky::cloud_base_y(eye_y);
         let thick = minelib_render::sky::thickness(&self.sky());
         self.strikes.push(Strike::up(from, dir, seed, base, thick));
-        self.held.surge(from, dir);
         self.maybe_cloud_bolt(from + dir * 400.0, 0.0);
     }
 

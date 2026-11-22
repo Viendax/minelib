@@ -959,6 +959,8 @@ struct Conn {
     item_rate: (Instant, u32),
     /// (v224) Demandes de lumières de l'éditeur dans la seconde en cours (`LIGHT_RATE`).
     light_rate: (Instant, u32),
+    /// (v229) Demandes de foudre dans la seconde en cours (`THOR_RATE`).
+    thor_rate: (Instant, u32),
     /// (v227) Paquets de la foule d'essai, et coups à ses PNJ, dans la seconde en cours
     /// (`CROWD_RATE`, `CROWD_HIT_RATE`).
     crowd_rate: (Instant, u32),
@@ -1010,6 +1012,7 @@ impl Conn {
             talked: HashMap::new(),
             item_rate: (Instant::now(), 0),
             light_rate: (Instant::now(), 0),
+            thor_rate: (Instant::now(), 0),
             crowd_rate: (Instant::now(), 0),
             crowd_hit_rate: (Instant::now(), 0),
             edit_rate: (Instant::now(), 0),
@@ -2497,6 +2500,11 @@ const ITEM_RATE: u32 = 40;
 /// qu'on fait glisser part 20 fois par seconde, `/lumieres effacer` les retire toutes (le jeu
 /// en envoie au plus `lightnet::RATE` par seconde).
 const LIGHT_RATE: u32 = 200;
+/// (v229) Foudres qu'un OP peut demander par seconde (la Foudre de Zeus en lance une
+/// toutes les 0,3 s au plus), et distance (chunks) au-delà de laquelle le point visé est
+/// trop loin de celui qui la demande (elle porte à 256 blocs).
+const THOR_RATE: u32 = 6;
+const THOR_REACH: i32 = 20;
 
 /// (v227) Paquets de la foule d'essai acceptés par OP et par seconde (le jeu en envoie 20), et
 /// coups à ses PNJ par joueur et par seconde (un par clic).
@@ -2916,6 +2924,92 @@ pub(crate) fn light_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: 
         game::BuildMsg::LightDenied { seq: *seq }
     };
     publish_items(st, rid, id, vec![out]);
+}
+
+/// (v229) Demande de foudre (`BuildMsg::ThorAsk` : `/thor`, Foudre de Zeus), à l'arbitre de
+/// son chunk (le relais du monde, ou le relais de sa province) : seulement d'un OP du
+/// serveur, pas plus de `THOR_RATE` par seconde, rien d'absurde (`game::thor_sane`), pas plus
+/// loin de lui que sa portée. Acceptée : publiée aux joueurs proches et à lui (`Thor`),
+/// sans rien en garder (un éclair ne se rejoue pas à qui arrive ensuite). Sinon refusée,
+/// à lui seul.
+pub(crate) fn thor_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &game::BuildMsg) {
+    let game::BuildMsg::ThorAsk {
+        seq,
+        chunk,
+        up,
+        pos,
+        dir,
+        seed,
+    } = m
+    else {
+        return;
+    };
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let op = st.servers.is_op(&room.server, &room.creator, pseudo);
+    // (Là où ce relais le sait : un joueur qu'il n'a pas encore placé n'est pas refusé.)
+    let near = room.build.positions.get(&id).is_none_or(|at| {
+        (at[0] - chunk[0]).abs() <= THOR_REACH && (at[1] - chunk[1]).abs() <= THOR_REACH
+    });
+    let calm = st.conns.get_mut(&id).is_some_and(|c| {
+        if c.thor_rate.0.elapsed() >= Duration::from_secs(1) {
+            c.thor_rate = (Instant::now(), 0);
+        }
+        c.thor_rate.1 += 1;
+        c.thor_rate.1 <= THOR_RATE
+    });
+    if !(op && calm && near && game::thor_sane(m)) {
+        if !op {
+            log::info!("foudre de « {pseudo} » refusée : pas OP de ce serveur");
+        }
+        let why = if op { game::THOR_BUSY } else { game::THOR_NOT_OP };
+        push_to(st, id, &game::BuildMsg::ThorDenied { seq: *seq, why });
+        return;
+    }
+    log::debug!("foudre en {pos:?} par « {pseudo} »");
+    let data = game::encode(&game::BuildMsg::Thor {
+        chunk: *chunk,
+        up: *up,
+        pos: *pos,
+        dir: *dir,
+        seed: *seed,
+        by: pseudo.chars().take(32).collect(),
+        seq: *seq,
+    });
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let mut to = vec![id];
+    to.extend(room.build.listeners(*chunk, id));
+    for m in to {
+        if let Some(c) = st.conns.get(&m) {
+            push_zone(&c.tx, *chunk, data.clone());
+        }
+    }
+}
+
+/// (v229) Refus d'une demande de foudre (arbitre pas prêt, monde en pause), au seul
+/// demandeur.
+pub(crate) fn deny_thor(st: &mut State, id: u64, m: &game::BuildMsg) {
+    if let game::BuildMsg::ThorAsk { seq, .. } = m {
+        let why = game::THOR_BUSY;
+        push_to(st, id, &game::BuildMsg::ThorDenied { seq: *seq, why });
+    }
+}
+
+/// Un message de l'arbitre au seul joueur `id`.
+fn push_to(st: &State, id: u64, m: &game::BuildMsg) {
+    if let Some(c) = st.conns.get(&id) {
+        transport::push(
+            &c.tx,
+            &Response::FromZone {
+                peer: 0,
+                chunk: [0, 0],
+                data: game::encode(m),
+            },
+        );
+    }
 }
 
 /// (v224) Refus d'une demande de lumière, au seul demandeur.
@@ -6225,6 +6319,10 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 if let Some(c) = st.conns.get(&id) {
                     let (hours, fixed) = st.servers.time(&server);
                     transport::push(&c.tx, &Response::SetTime { hours, fixed });
+                    // (v229) Sa météo : celle qu'un OP a imposée, ou celle des horloges du
+                    // monde (dit aussi : le jeu oublie alors ce qu'il avait imposé chez lui).
+                    let (kind, left, fixed) = st.servers.weather(&server);
+                    transport::push(&c.tx, &Response::SetWeather { kind, left, fixed });
                 }
                 if !st.servers.is_op(&server, &creator, pseudo) {
                     if let (Some(mode), Some(c)) =
@@ -6238,6 +6336,18 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             },
                         );
                     }
+                }
+                return Some(Response::ServerAdmin {
+                    text: String::new(),
+                });
+            }
+            // (v229) Météo du serveur demandée (sans rien changer : `reason` vide) : à tout
+            // joueur du serveur. Le propriétaire la demande en ouvrant son monde (lui n'arrive
+            // pas par `SERVER_GAMEMODE_QUERY`).
+            if action == proto::SERVER_WEATHER && reason.trim().is_empty() {
+                if let Some(c) = st.conns.get(&id) {
+                    let (kind, left, fixed) = st.servers.weather(&server);
+                    transport::push(&c.tx, &Response::SetWeather { kind, left, fixed });
                 }
                 return Some(Response::ServerAdmin {
                     text: String::new(),
@@ -6259,6 +6369,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 proto::SERVER_RENAME => servers::Action::Rename,
                 proto::SERVER_TIMESET => servers::Action::TimeSet,
                 proto::SERVER_TIMEFIX => servers::Action::TimeFix,
+                proto::SERVER_WEATHER => servers::Action::Weather,
                 proto::SERVER_TELEPORT => servers::Action::Teleport,
                 proto::SERVER_SETSPAWN => servers::Action::SetSpawn,
                 _ => servers::Action::List,
@@ -6292,6 +6403,14 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                             transport::push(&c.tx, &Response::SetTime { hours, fixed });
                         }
                         provinces::push_time(st, &server, (hours, fixed));
+                    }
+                    // (v229) Météo changée : de même, à tous les joueurs du serveur.
+                    if act == servers::Action::Weather {
+                        let (kind, left, fixed) = st.servers.weather(&server);
+                        for c in st.conns.values().filter(|c| c.room == Some(rid)) {
+                            transport::push(&c.tx, &Response::SetWeather { kind, left, fixed });
+                        }
+                        provinces::push_weather(st, &server, (kind, left, fixed));
                     }
                     // Nom affiché dans la liste des serveurs.
                     if act == servers::Action::Rename {
@@ -6703,10 +6822,20 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 }
                 if let Some(m) = &msg {
                     deny_light(st, rid, id, m);
+                    deny_thor(st, id, m);
                 }
                 return None;
             }
             let msg = game::decode::<game::BuildMsg>(&data);
+            // (v229) Foudre d'un OP : à l'arbitre du chunk où elle tombe, comme les lumières.
+            if let Some(m @ game::BuildMsg::ThorAsk { chunk: at, .. }) = &msg {
+                if provinces::delegated(st, rid, proto::region_of(*at)) {
+                    deny_thor(st, id, m);
+                } else {
+                    thor_request(st, rid, id, pseudo, m);
+                }
+                return None;
+            }
             // (v224) Lumières de l'éditeur : comme les objets, à l'arbitre de leur chunk
             // (refusée ici pour une province servie par un relais de province : le jeu la
             // refait auprès d'elle).
@@ -10507,6 +10636,211 @@ mod tests {
             )),
             "{got:?}"
         );
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v229) La météo d'un serveur : seul un OP l'impose, tous ses joueurs l'apprennent (et
+    /// celui qui arrive ensuite). La foudre de `/thor` et de la Foudre de Zeus : seul un OP
+    /// la lance, les joueurs proches la reçoivent avec lui ; rien n'en est gardé.
+    #[test]
+    fn only_ops_set_the_weather_and_throw_lightning_for_everyone() {
+        use proto::{WEATHER_CLEAR, WEATHER_NATURAL, WEATHER_RAIN, WEATHER_STORM};
+        let dir = std::env::temp_dir().join(format!("minelib-thor-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        let weather_of = |c: &Client| match wait(c, |e| matches!(e, Event::SetWeather { .. })) {
+            Event::SetWeather { kind, left, fixed } => (kind, left, fixed),
+            _ => unreachable!(),
+        };
+        let admin = |c: &Client, reason: &str| {
+            c.send(Cmd::ServerAdmin {
+                action: proto::SERVER_WEATHER,
+                pseudo: String::new(),
+                reason: reason.into(),
+            });
+        };
+        // Prochain message de foudre ou de lumière reçu.
+        let next = |c: &Client| loop {
+            if let Event::FromZone { peer, data, .. } =
+                wait(c, |e| matches!(e, Event::FromZone { .. }))
+            {
+                assert_eq!(peer, 0, "publié par le relais");
+                match game::decode::<game::BuildMsg>(&data).expect("message") {
+                    m @ (game::BuildMsg::Thor { .. }
+                    | game::BuildMsg::ThorDenied { .. }
+                    | game::BuildMsg::Light { .. }) => return m,
+                    _ => continue,
+                }
+            }
+        };
+        let ask = |seq: u32, chunk: [i32; 2], pos: [f32; 3]| Request::ToZone {
+            chunk,
+            data: game::encode(&game::BuildMsg::ThorAsk {
+                seq,
+                chunk,
+                up: false,
+                pos,
+                dir: [0.0, -1.0, 0.0],
+                seed: 4242,
+            }),
+        };
+        let (createur, clink) = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        transport::push(&clink, &Request::Position { chunk: [0, 0] });
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&elink, &Request::Position { chunk: [1, 0] });
+        std::thread::sleep(Duration::from_millis(100));
+
+        // --- Météo ---
+        // Eve n'est pas OP : refusé, rien ne change.
+        admin(&eve, "storm");
+        assert!(wait_error(&eve).contains("OP"));
+        // Le créateur : l'orage, pour une durée d'orage ordinaire ; Eve l'apprend aussi.
+        admin(&createur, "storm");
+        for c in [&createur, &eve] {
+            let (kind, left, fixed) = weather_of(c);
+            assert_eq!((kind, fixed), (WEATHER_STORM, false));
+            assert!((170.0..=780.0).contains(&left), "{left}");
+        }
+        // Figée sur la pluie : sans fin ; un autre temps ensuite reste figé.
+        admin(&createur, "fix rain");
+        assert_eq!(weather_of(&eve), (WEATHER_RAIN, -1.0, true));
+        admin(&createur, "clear");
+        assert_eq!(weather_of(&eve), (WEATHER_CLEAR, -1.0, true));
+        // Un mot inconnu : refusé, la météo reste.
+        admin(&createur, "neige");
+        assert!(wait_error(&createur).contains("Usage"));
+        // Demandée sans rien changer : à n'importe quel joueur du serveur.
+        admin(&eve, "");
+        assert_eq!(weather_of(&eve), (WEATHER_CLEAR, -1.0, true));
+        // Bob arrive : il apprend la météo du serveur.
+        let (bob, blink) = login("Bob");
+        bob.send(Cmd::Join(room));
+        wait(&bob, |e| matches!(e, Event::Joined { .. }));
+        bob.send(Cmd::ServerAdmin {
+            action: proto::SERVER_GAMEMODE_QUERY,
+            pseudo: String::new(),
+            reason: String::new(),
+        });
+        assert_eq!(weather_of(&bob), (WEATHER_CLEAR, -1.0, true));
+        // De nouveau toute seule : chacun l'apprend ; qui arrive alors aussi.
+        admin(&createur, "auto");
+        for c in [&eve, &bob] {
+            assert_eq!(weather_of(c).0, WEATHER_NATURAL);
+        }
+        bob.send(Cmd::ServerAdmin {
+            action: proto::SERVER_GAMEMODE_QUERY,
+            pseudo: String::new(),
+            reason: String::new(),
+        });
+        assert_eq!(weather_of(&bob).0, WEATHER_NATURAL);
+
+        // --- Foudre ---
+        // Bob est loin (30 chunks) : il ne la verra pas.
+        transport::push(&blink, &Request::Position { chunk: [30, 0] });
+        std::thread::sleep(Duration::from_millis(100));
+        // Eve n'est pas OP : refusé, à elle seule.
+        transport::push(&elink, &ask(5, [0, 0], [3.5, 70.0, 4.5]));
+        assert_eq!(next(&eve), game::BuildMsg::ThorDenied {
+            seq: 5,
+            why: game::THOR_NOT_OP
+        });
+        // Le créateur : publiée, à lui et à Eve (tout près), telle qu'il l'a demandée.
+        transport::push(&clink, &ask(1, [0, 0], [3.5, 70.0, 4.5]));
+        for c in [&createur, &eve] {
+            assert_eq!(next(c), game::BuildMsg::Thor {
+                chunk: [0, 0],
+                up: false,
+                pos: [3.5, 70.0, 4.5],
+                dir: [0.0, -1.0, 0.0],
+                seed: 4242,
+                by: "Createur".into(),
+                seq: 1,
+            });
+        }
+        // Un point qui n'est pas dans le chunk annoncé, un nombre infini, trop loin de
+        // lui : refusées.
+        transport::push(&clink, &ask(2, [0, 0], [40.0, 70.0, 4.5]));
+        transport::push(&clink, &ask(3, [0, 0], [f32::NAN, 70.0, 4.5]));
+        transport::push(&clink, &ask(4, [40, 0], [645.0, 70.0, 4.5]));
+        for seq in [2, 3, 4] {
+            assert_eq!(next(&createur), game::BuildMsg::ThorDenied {
+                seq,
+                why: game::THOR_BUSY
+            });
+        }
+        // Pas plus de `THOR_RATE` par seconde.
+        std::thread::sleep(Duration::from_millis(1100));
+        for seq in 10..10 + THOR_RATE + 2 {
+            transport::push(&clink, &ask(seq, [0, 0], [3.5, 70.0, 4.5]));
+        }
+        let mut got = (0, 0);
+        for _ in 0..THOR_RATE + 2 {
+            match next(&createur) {
+                game::BuildMsg::Thor { .. } => got.0 += 1,
+                game::BuildMsg::ThorDenied { why, .. } => {
+                    assert_eq!(why, game::THOR_BUSY);
+                    got.1 += 1
+                }
+                m => panic!("{m:?}"),
+            }
+        }
+        assert_eq!(got, (THOR_RATE, 2));
+        // Rien n'est gardé : Bob s'approche, puis le créateur pose une lumière ; le premier
+        // message que Bob reçoit est la lumière (aucune des foudres passées, ni de celles
+        // tombées pendant qu'il était loin).
+        transport::push(&blink, &Request::Position { chunk: [0, 1] });
+        std::thread::sleep(Duration::from_millis(150));
+        transport::push(
+            &clink,
+            &Request::ToZone {
+                chunk: [0, 0],
+                data: game::encode(&game::BuildMsg::LightPut {
+                    seq: 50,
+                    uid: 9,
+                    chunk: [0, 0],
+                    light: Some(b"{}".to_vec()),
+                }),
+            },
+        );
+        assert!(matches!(next(&bob), game::BuildMsg::Light { uid: 9, .. }));
+        // Et maintenant qu'il est près, il voit la suivante.
+        std::thread::sleep(Duration::from_millis(1100));
+        transport::push(&clink, &ask(60, [0, 0], [3.5, 70.0, 4.5]));
+        assert!(matches!(next(&bob), game::BuildMsg::Thor { seq: 60, .. }));
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
     }

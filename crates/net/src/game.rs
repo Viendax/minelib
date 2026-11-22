@@ -613,6 +613,64 @@ pub enum BuildMsg {
     /// (v227) Foule refusée (pas OP de ce serveur, trop de paquets, paquet trop gros ou
     /// absurde) : remis au seul demandeur, dont la foule s'arrête.
     CrowdDenied,
+    /// (v229) Foudre de `/thor` ou de la Foudre de Zeus : demande d'un OP à l'arbitre du
+    /// chunk `chunk` (celui de `pos` ; le relais du monde, ou le relais de sa province). Elle
+    /// tombe en `pos`, ou (`up`) monte de `pos` vers le ciel dans la direction `dir`.
+    /// `seed` : de quoi tirer sa forme, la même chez tous ceux qui la voient.
+    ThorAsk {
+        seq: u32,
+        chunk: [i32; 2],
+        up: bool,
+        pos: [f32; 3],
+        dir: [f32; 3],
+        seed: u32,
+    },
+    /// (v229) Foudre publiée par l'arbitre aux joueurs proches (et à celui qui l'a
+    /// demandée) : elle part chez chacun à la réception. Rien n'en est gardé (un joueur qui
+    /// arrive ensuite ne la revoit pas). `by`, `seq` : l'OP dont la demande est acceptée.
+    Thor {
+        chunk: [i32; 2],
+        up: bool,
+        pos: [f32; 3],
+        dir: [f32; 3],
+        seed: u32,
+        by: String,
+        seq: u32,
+    },
+    /// (v229) Demande de foudre `seq` refusée, au seul demandeur. `why` : `THOR_NOT_OP`
+    /// (réservée aux OP du serveur), ou `THOR_BUSY` (trop de demandes, arbitre pas prêt,
+    /// monde en pause, point visé trop loin de soi).
+    ThorDenied { seq: u32, why: u8 },
+}
+
+pub const THOR_NOT_OP: u8 = 0;
+pub const THOR_BUSY: u8 = 1;
+
+/// (v229) La demande de foudre `m` (`BuildMsg::ThorAsk`) n'a-t-elle rien d'absurde ? Des
+/// nombres finis, un point dans les bornes du monde et dans le chunk annoncé, une
+/// direction de longueur 1 (vers le haut pour une foudre qui monte).
+pub fn thor_sane(m: &BuildMsg) -> bool {
+    let BuildMsg::ThorAsk {
+        chunk,
+        up,
+        pos,
+        dir,
+        ..
+    } = m
+    else {
+        return false;
+    };
+    let finite = pos.iter().chain(dir.iter()).all(|v| v.is_finite());
+    if !finite || pos[0].abs() > 3.0e7 || pos[2].abs() > 3.0e7 || !(-64.0..=4096.0).contains(&pos[1])
+    {
+        return false;
+    }
+    let at = [
+        (pos[0].floor() as i32).div_euclid(16),
+        (pos[2].floor() as i32).div_euclid(16),
+    ];
+    let len2 = dir.iter().map(|v| v * v).sum::<f32>();
+    at == *chunk && (!*up || ((0.9..=1.1).contains(&len2) && dir[1] > 0.05))
 }
 
 /// (v227) Portée de la foule d'essai d'un OP (chunks autour de lui) : ses PNJ vont jusqu'à

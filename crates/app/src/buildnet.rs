@@ -337,6 +337,12 @@ pub struct BuildNet {
     /// n'est pas encore prêt (province sans bail, connexion en cours) : elles attendent, au
     /// plus `LIGHT_WAIT` s, puis sont refusées ici.
     light_asked: HashMap<u32, PKey>,
+    /// (v229) Demandes de foudre faites au relais d'une province (numéro → laquelle) : un
+    /// refus n'est écouté que de celle à qui la demande a été faite.
+    thor_asked: HashMap<u32, PKey>,
+    /// (v229) Foudres publiées par les arbitres et refus de nos demandes (`BuildMsg::Thor`,
+    /// `ThorDenied`), pour la partie (`Session::update_thor`).
+    pub thor_inbox: Vec<BuildMsg>,
     light_queue: Vec<(BuildMsg, f32)>,
     /// (v227) Foules d'essai menées par d'autres joueurs (OP) : paquets reçus, par pseudo de
     /// celui qui la mène (voir `crowd::RemoteCrowd`).
@@ -548,6 +554,8 @@ impl BuildNet {
             province_retry: 0.0,
             item_asked: HashMap::new(),
             light_asked: HashMap::new(),
+            thor_asked: HashMap::new(),
+            thor_inbox: Vec::new(),
             light_queue: Vec::new(),
             crowd_inbox: Vec::new(),
             crowd_hits: Vec::new(),
@@ -853,7 +861,10 @@ impl BuildNet {
                     Event::Skin { pseudo, png } if !png.is_empty() => skins.push((pseudo, png)),
                     // (v147) Le pays appelle des garants parmi ses joueurs.
                     Event::Province(Response::GarantCall { call, .. }) => c.call = call,
-                    Event::SetGamemode { .. } | Event::Slain(_) | Event::SetTime { .. }
+                    Event::SetGamemode { .. }
+                    | Event::Slain(_)
+                    | Event::SetTime { .. }
+                    | Event::SetWeather { .. }
                         if dozing && here == Some(*p) =>
                     {
                         notices.push(e)
@@ -1509,6 +1520,37 @@ impl BuildNet {
         }
     }
 
+    /// (v229) Demande de foudre d'un OP (`BuildMsg::ThorAsk` : `/thor`, Foudre de Zeus) : à
+    /// l'arbitre du chunk où elle tombe (le relais du monde, ou le relais de sa province),
+    /// qui la publie aux joueurs proches. Arbitre pas prêt : refusée ici (un éclair
+    /// n'attend pas).
+    pub fn send_thor(&mut self, req: &BuildMsg) {
+        let BuildMsg::ThorAsk { seq, chunk, .. } = req else {
+            return;
+        };
+        let (seq, chunk) = (*seq, *chunk);
+        let ask = Request::ToZone {
+            chunk,
+            data: game::encode(req),
+        };
+        match self.authority(chunk) {
+            Authority::Root => self.send(ask),
+            Authority::Province(l) => {
+                if self.thor_asked.len() >= ITEM_ASKED_MAX {
+                    self.thor_asked.clear();
+                }
+                if let Some(p) = self.best(proto::region_of(chunk)).map(pkey) {
+                    self.thor_asked.insert(seq, p);
+                }
+                transport::push(&l, &ask);
+            }
+            Authority::Waiting => self.thor_inbox.push(BuildMsg::ThorDenied {
+                seq,
+                why: game::THOR_BUSY,
+            }),
+        }
+    }
+
     /// (v224) Demandes de lumières qui attendent leur arbitre : envoyées dès qu'il est prêt,
     /// dans l'ordre ; refusées ici après `LIGHT_WAIT` s.
     fn flush_lights(&mut self, dt: f32) {
@@ -2105,12 +2147,45 @@ impl BuildNet {
                 }
                 Vec::new()
             }
+            // (v229) Foudre d'un OP, publiée par l'arbitre du chunk où elle tombe : le relais
+            // du monde, ou le relais d'une province pour ses zones (jamais un joueur ni un
+            // relais de région). Rien à garder : elle part tout de suite.
+            BuildMsg::Thor { chunk: at, .. } => {
+                if peer != 0 || self.from_shard.is_some() {
+                    return Vec::new();
+                }
+                let ours = match self.from_province.clone() {
+                    None => true,
+                    Some(info) => info.has(proto::region_of(at)) && self.sender_decides(at),
+                };
+                if ours {
+                    self.thor_inbox.push(msg);
+                }
+                Vec::new()
+            }
+            // Un refus : du relais du monde, ou de la province à qui la demande a été faite.
+            BuildMsg::ThorDenied { seq, .. } => {
+                if peer != 0 || self.from_shard.is_some() {
+                    return Vec::new();
+                }
+                match self.from_province.clone() {
+                    None => self.thor_inbox.push(msg),
+                    Some(info) => {
+                        if self.thor_asked.get(&seq) == Some(&pkey(&info)) {
+                            self.thor_asked.remove(&seq);
+                            self.thor_inbox.push(msg);
+                        }
+                    }
+                }
+                Vec::new()
+            }
             // Les demandes ne vont qu'au relais.
             BuildMsg::DropItem { .. }
             | BuildMsg::TakeItem { .. }
             | BuildMsg::ChestPut { .. }
             | BuildMsg::ChestTake { .. }
-            | BuildMsg::LightPut { .. } => Vec::new(),
+            | BuildMsg::LightPut { .. }
+            | BuildMsg::ThorAsk { .. } => Vec::new(),
             // (v227) Foule d'essai d'un OP, coups à la nôtre, refus de la nôtre : remis par un
             // relais (jamais par un joueur, `peer` 0).
             BuildMsg::Crowd { owner, data } => {
@@ -2468,6 +2543,10 @@ mod tests {
         modes_seen: Vec<String>,
         slain: u32,
         times_seen: Vec<f32>,
+        /// (v229) Météos du serveur apprises en veille (par les provinces).
+        weather_seen: Vec<u8>,
+        /// (v229) Foudres publiées par les arbitres et refus reçus (`BuildNet::thor_inbox`).
+        thor_seen: Vec<BuildMsg>,
     }
 
     /// Chunks du terrain d'essai : 2 zones de part et d'autre d'une frontière.
@@ -2545,6 +2624,8 @@ mod tests {
                 modes_seen: Vec::new(),
                 slain: 0,
                 times_seen: Vec::new(),
+                weather_seen: Vec::new(),
+                thor_seen: Vec::new(),
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b
@@ -2595,6 +2676,8 @@ mod tests {
                 modes_seen: Vec::new(),
                 slain: 0,
                 times_seen: Vec::new(),
+                weather_seen: Vec::new(),
+                thor_seen: Vec::new(),
             };
             b.wait(|e| matches!(e, Event::LoggedIn { .. }));
             b.c.send(Cmd::GarantAvailable(true));
@@ -3111,9 +3194,11 @@ mod tests {
                         Event::SetGamemode { mode, .. } => self.modes_seen.push(mode),
                         Event::Slain(_) => self.slain += 1,
                         Event::SetTime { hours, .. } => self.times_seen.push(hours),
+                        Event::SetWeather { kind, .. } => self.weather_seen.push(kind),
                         _ => {}
                     }
                 }
+                self.thor_seen.append(&mut n.thor_inbox);
             }
             self.doze_tick();
             self.voice_tick(dt);
@@ -5528,6 +5613,12 @@ mod tests {
                         pseudo: String::new(),
                         reason: "6".into(),
                     });
+                    // (v229) Et il impose l'orage.
+                    bots[0].c.send(Cmd::ServerAdmin {
+                        action: proto::SERVER_WEATHER,
+                        pseudo: String::new(),
+                        reason: "storm".into(),
+                    });
                     bots[0].c.send(Cmd::ServerAdmin {
                         action: proto::SERVER_GAMEMODE,
                         pseudo: "Joueur4".into(),
@@ -5634,6 +5725,13 @@ mod tests {
         assert!(
             bots[1..].iter().all(|b| b.times_seen.contains(&6.0)),
             "l'heure donnée par l'OP arrive par les provinces à ceux qui sont en veille"
+        );
+        assert!(
+            bots[1..]
+                .iter()
+                .all(|b| b.weather_seen.contains(&proto::WEATHER_STORM)),
+            "la météo imposée par l'OP arrive de même : {:?}",
+            bots.iter().map(|b| b.weather_seen.clone()).collect::<Vec<_>>()
         );
         assert!(edits_dozing > 30, "on construit en veille : {edits_dozing}");
         assert_eq!(
@@ -6196,6 +6294,128 @@ mod tests {
             &mut Vec<u64>,
             &mut Vec<u32>,
         ) + 'a;
+
+    /// (v229) La foudre d'un OP à travers les provinces : demandée à l'arbitre du chunk où
+    /// elle tombe (le relais du monde à l'ouest, le relais de la province à l'est, tenu par
+    /// un joueur d'un autre monde), elle arrive à tous les joueurs proches, des deux côtés
+    /// de la frontière, avec la même graine ; celle d'un joueur qui n'est pas OP est
+    /// refusée par l'arbitre, à lui seul.
+    #[test]
+    fn lightning_thrown_by_an_op_reaches_everyone_through_provinces() {
+        let (dir, h, mut hosts, mut bots, _room) = province_setup(false);
+        let dt = 0.02;
+        let step = |bots: &mut Vec<Bot>, hosts: &mut Vec<(Bot, Bot)>| {
+            for b in bots.iter_mut() {
+                b.tick(dt);
+            }
+            for (w, g) in hosts.iter_mut() {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let ready = |bots: &Vec<Bot>| {
+            bots.iter().all(|b| {
+                b.net.as_ref().is_some_and(|n| {
+                    n.province_view()
+                        .iter()
+                        .any(|v| v.0 == [1, 0] && v.3)
+                })
+            })
+        };
+        let t = Instant::now();
+        while !ready(&bots) {
+            assert!(t.elapsed() < Duration::from_secs(40), "province de l'est");
+            step(&mut bots, &mut hosts);
+        }
+        assert!(h.provinces_delegated() >= 1);
+        let ask = |seq: u32, x: f32, up: bool, seed: u32| BuildMsg::ThorAsk {
+            seq,
+            chunk: chunk_of(x.floor() as i32, 16),
+            up,
+            pos: [x, 12.0, 16.5],
+            dir: if up { [0.0, 1.0, 0.0] } else { [0.0, -1.0, 0.0] },
+            seed,
+        };
+        // L'OP : une à l'ouest (relais du monde), une à l'est (province), une qui monte.
+        // Joueur3 (à l'est, pas OP) : une aussi, à l'est. La province vient d'être confiée :
+        // tant que son relais n'a pas son bail, il refuse (« pas prêt ») ; un éclair n'attend
+        // pas, on le redemande (sous un nouveau numéro) jusqu'à ce qu'il réponde pour de bon.
+        let send = |b: &mut Bot, m: BuildMsg| b.net.as_mut().expect("réseau").send_thor(&m);
+        let seeds = |b: &Bot| {
+            let mut s: Vec<(u32, bool, String)> = b
+                .thor_seen
+                .iter()
+                .filter_map(|m| match m {
+                    BuildMsg::Thor { seed, up, by, .. } => Some((*seed, *up, by.clone())),
+                    _ => None,
+                })
+                .collect();
+            s.sort();
+            s
+        };
+        let refused = |b: &Bot| {
+            b.thor_seen
+                .iter()
+                .any(|m| matches!(m, BuildMsg::ThorDenied { why, .. } if *why == game::THOR_NOT_OP))
+        };
+        let want = vec![
+            (111, false, bots[0].name.clone()),
+            (222, false, bots[0].name.clone()),
+            (333, true, bots[0].name.clone()),
+        ];
+        let plan = [(500.5, false, 111), (530.5, false, 222), (531.5, true, 333)];
+        let mut seq = 0;
+        let mut tries = 0;
+        let t = Instant::now();
+        loop {
+            if tries % 40 == 0 {
+                let got = seeds(&bots[0]);
+                for (x, up, seed) in plan {
+                    if !got.iter().any(|g| g.0 == seed) {
+                        seq += 1;
+                        send(&mut bots[0], ask(seq, x, up, seed));
+                    }
+                }
+                if !refused(&bots[3]) {
+                    seq += 1;
+                    send(&mut bots[3], ask(seq, 529.5, false, 999));
+                }
+            }
+            tries += 1;
+            step(&mut bots, &mut hosts);
+            if refused(&bots[3]) && bots.iter().all(|b| seeds(b) == want) {
+                break;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "foudres reçues : {:?}",
+                bots.iter().map(|b| b.thor_seen.clone()).collect::<Vec<_>>()
+            );
+        }
+        // Encore un moment : rien n'arrive en double, le refus n'est allé qu'à Joueur3, et
+        // c'est parce qu'il n'est pas OP.
+        for _ in 0..50 {
+            step(&mut bots, &mut hosts);
+        }
+        for (i, b) in bots.iter().enumerate() {
+            assert_eq!(seeds(b), want, "{} : chaque foudre une fois", b.name);
+            let denied: Vec<&BuildMsg> = b
+                .thor_seen
+                .iter()
+                .filter(|m| matches!(m, BuildMsg::ThorDenied { .. }))
+                .collect();
+            // (Les refus « pas prêt » du début ne vont qu'à ceux qui ont demandé ; « pas OP »
+            // qu'à Joueur3, une fois.)
+            let not_op = denied
+                .iter()
+                .filter(|m| matches!(m, BuildMsg::ThorDenied { why, .. } if *why == game::THOR_NOT_OP))
+                .count();
+            assert_eq!(not_op, usize::from(i == 3), "{} : {denied:?}", b.name);
+            assert!(i == 0 || i == 3 || denied.is_empty(), "{} : {denied:?}", b.name);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn lights_placed_by_an_op_reach_everyone_through_provinces() {

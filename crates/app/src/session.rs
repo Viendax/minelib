@@ -261,9 +261,11 @@ pub struct Session {
     /// (v216) Lumière du jour montrée : celle de l'heure (`daylight`), moins sous un ciel
     /// couvert, plus l'éclat d'un éclair.
     daylight_shown: f32,
-    /// (v216) `/thor` sur un serveur de construction : la demande « suis-je OP ? » en
-    /// route, et le point visé.
-    thor_probe: Option<(std::time::Instant, Aim)>,
+    /// (v229) Foudre sur un serveur de construction : numéro de notre dernière demande à
+    /// l'arbitre (`BuildMsg::ThorAsk`), et quand on a dit pour la dernière fois qu'elle est
+    /// réservée aux OP.
+    thor_seq: u32,
+    thor_refused: Option<std::time::Instant>,
     daylight: f32,
     break_cooldown: f32,
     place_cooldown: f32,
@@ -680,7 +682,8 @@ impl Session {
             moon_age: test_moon,
             storm,
             daylight_shown: crate::daytime::daylight(time_h),
-            thor_probe: None,
+            thor_seq: 0,
+            thor_refused: None,
             daylight: crate::daytime::daylight(time_h),
             break_cooldown: 0.0,
             dig: None,
@@ -3159,9 +3162,8 @@ impl Session {
         if self.inventory.selected_item() == Some(Item::Zeus) && keys.held(input, Action::Attack) {
             if keys.pressed(input, Action::Attack) && self.storm.cooldown <= 0.0 {
                 if let Some(aim) = self.aimed() {
-                    self.throw_lightning(aim);
+                    self.cast_lightning(aim);
                     self.storm.cooldown = crate::storm::ZEUS_COOLDOWN;
-                    self.say_lightning_is_local();
                 }
             }
             return;
@@ -3988,10 +3990,34 @@ impl Session {
             if self.storm.test_in <= 0.0 {
                 if let Some(aim) = self.aimed() {
                     self.storm.test_in = every;
-                    self.throw_lightning(aim);
+                    self.cast_lightning(aim);
                 }
             }
         }
+        // Essais : MINELIB_CMD=<s>:<commande>|… (commandes du tchat tapées à heure dite).
+        static CMDS: std::sync::OnceLock<Vec<(f32, String)>> = std::sync::OnceLock::new();
+        let cmds = CMDS.get_or_init(|| {
+            std::env::var("MINELIB_CMD")
+                .unwrap_or_default()
+                .split('|')
+                .filter_map(|c| {
+                    let (t, cmd) = c.split_once(':')?;
+                    Some((t.trim().parse().ok()?, cmd.trim().to_string()))
+                })
+                .collect()
+        });
+        if !cmds.is_empty() {
+            self.storm.test_clock += dt;
+            while let Some((at, cmd)) = cmds.get(self.storm.test_cmds) {
+                if self.storm.test_clock < *at {
+                    break;
+                }
+                self.storm.test_cmds += 1;
+                self.submit(cmd);
+            }
+        }
+        // (v229) Sur un serveur de construction : les foudres que publient les arbitres.
+        self.update_thor();
         // L'éclair tenu : à la première personne, dessiné par-dessus la main (avec la
         // projection de la main) ; vu de derrière (F5, caméra libre), dans le monde, au
         // poing du modèle.
@@ -4051,8 +4077,8 @@ impl Session {
     }
 
     /// (v216) `/thor` : la foudre tombe là où l'on vise. En solo, celui qui joue ; sur un
-    /// serveur de construction, les OP (le relais dit qui l'est, comme pour l'éditeur de
-    /// lumières).
+    /// serveur de construction, les OP (v227 : l'arbitre du chunk visé le vérifie et la
+    /// montre à tous les joueurs proches, voir `cast_lightning`).
     fn thor_command(&mut self) {
         if self.game.mode == GameMode::Fps {
             self.chat.say("Pas de foudre en partie FPS.", chat::RED);
@@ -4062,23 +4088,117 @@ impl Session {
             self.chat.say("Rien à viser par là.", chat::RED);
             return;
         };
-        if self.build.is_some() {
-            // Déjà demandé (réponse en route) : pas une deuxième fois.
-            if self
-                .thor_probe
-                .is_some_and(|(t, _)| t.elapsed().as_secs_f32() < 5.0)
-            {
-                return;
-            }
-            self.thor_probe = Some((std::time::Instant::now(), aim));
-            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
-                action: minelib_net::proto::SERVER_LIST,
-                pseudo: String::new(),
-                reason: String::new(),
-            });
+        self.cast_lightning(aim);
+    }
+
+    /// (v229) `/thor` ou un coup de la Foudre de Zeus vers `aim`. En solo : la foudre part
+    /// tout de suite. Sur un serveur de construction : demandée à l'arbitre du chunk où
+    /// elle tombe (le relais du monde ou celui de sa province), qui vérifie qu'on est OP et
+    /// la publie à tous les joueurs proches, nous compris : elle part chez chacun à la
+    /// réception (`update_thor`), le même éclair pour tous.
+    fn cast_lightning(&mut self, aim: Aim) {
+        if self.build.is_none() {
+            self.throw_lightning(aim);
             return;
         }
-        self.throw_lightning(aim);
+        let (up, pos, dir) = match aim {
+            Aim::Ground(pos) => (false, pos, Vec3::NEG_Y),
+            Aim::Sky(dir) => (true, self.sky_origin(dir), dir.normalize_or(Vec3::Y)),
+        };
+        self.thor_seq = self.thor_seq.wrapping_add(1);
+        let req = minelib_net::game::BuildMsg::ThorAsk {
+            seq: self.thor_seq,
+            chunk: [
+                (pos.x.floor() as i32).div_euclid(16),
+                (pos.z.floor() as i32).div_euclid(16),
+            ],
+            up,
+            pos: pos.to_array(),
+            dir: dir.to_array(),
+            seed: rand::random::<u32>(),
+        };
+        if let Some(b) = self.build.as_mut() {
+            b.send_thor(&req);
+        }
+    }
+
+    /// (v229) Ce que les arbitres publient (`BuildMsg::Thor` : la foudre d'un OP, la nôtre
+    /// comprise) part ici ; un refus de notre demande est dit dans le tchat.
+    fn update_thor(&mut self) {
+        use minelib_net::game::BuildMsg;
+        let Some(b) = self.build.as_mut() else {
+            return;
+        };
+        if b.thor_inbox.is_empty() {
+            return;
+        }
+        let me = b.pseudo().to_string();
+        for m in std::mem::take(&mut b.thor_inbox) {
+            match m {
+                BuildMsg::Thor {
+                    up,
+                    pos,
+                    dir,
+                    seed,
+                    by,
+                    seq,
+                    ..
+                } => {
+                    let (pos, dir) = (Vec3::from(pos), Vec3::from(dir));
+                    if !pos.is_finite() || !dir.is_finite() {
+                        continue;
+                    }
+                    // La nôtre : l'éclair tenu sursaute vers elle.
+                    let ours = by.eq_ignore_ascii_case(&me)
+                        && seq == self.thor_seq
+                        && self.holding_zeus();
+                    if up {
+                        let eye_y = self.camera_pos().y;
+                        self.storm.strike_up_seeded(pos, dir, eye_y, seed);
+                        if ours {
+                            self.storm.held.surge(pos, dir);
+                        }
+                    } else {
+                        self.storm.strike_seeded(pos, seed);
+                        if ours {
+                            let tip = self.zeus_tip();
+                            self.storm
+                                .held
+                                .surge(tip, (pos - tip).normalize_or(Vec3::Y));
+                        }
+                    }
+                }
+                BuildMsg::ThorDenied { why, .. } => {
+                    // (Dit au plus toutes les 3 s : on clique vite avec l'éclair en main.)
+                    let said = self
+                        .thor_refused
+                        .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
+                    if !said {
+                        self.thor_refused = Some(std::time::Instant::now());
+                        if why == minelib_net::game::THOR_NOT_OP {
+                            self.chat
+                                .say("La foudre est réservée aux OP de ce serveur.", chat::RED);
+                        } else {
+                            self.chat.say(
+                                "La foudre n'est pas partie (relais pas prêt, ou trop de demandes) : réessaie.",
+                                chat::GREY,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// (v217) D'où part la foudre qui monte vers le ciel : la pointe de l'éclair tenu, ou
+    /// la main sans lui.
+    fn sky_origin(&self, dir: Vec3) -> Vec3 {
+        if self.holding_zeus() {
+            self.zeus_tip()
+        } else {
+            self.player.eye() + dir * 0.9 - Vec3::Y * 0.25
+        }
     }
 
     /// (v217) La foudre part : elle tombe sur le point visé, ou, en visant le ciel, monte
@@ -4093,11 +4213,7 @@ impl Session {
                 }
             }
             Aim::Sky(dir) => {
-                let from = if self.holding_zeus() {
-                    self.zeus_tip()
-                } else {
-                    self.player.eye() + dir * 0.9 - Vec3::Y * 0.25
-                };
+                let from = self.sky_origin(dir);
                 self.storm.strike_up(from, dir, self.camera_pos().y);
             }
         }
@@ -4126,18 +4242,6 @@ impl Session {
         }
     }
 
-    /// (v216) En ligne, la foudre qu'on lance n'est pas encore envoyée aux autres joueurs :
-    /// dit une fois.
-    fn say_lightning_is_local(&mut self) {
-        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if self.build.is_some() && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            self.chat.say(
-                "En ligne, ta foudre n'est pas encore montrée aux autres joueurs.",
-                chat::GREY,
-            );
-        }
-    }
-
     /// (v216) `/weather` : le temps qu'il fait ; `/weather clear|rain|storm` : un temps
     /// imposé (il arrive peu à peu : les nuages, puis la pluie, puis l'orage) pour une
     /// durée ordinaire ; `/weather fix [on|off]` : le temps ne change plus tout seul.
@@ -4147,12 +4251,12 @@ impl Session {
             self.chat.say("Pas de météo sur les cartes FPS.", chat::RED);
             return;
         }
-        let local = if self.build.is_some() {
-            " (chez toi : la météo imposée n'est pas encore partagée en ligne)"
-        } else {
-            ""
-        };
+        // (v229) Sur un serveur de construction : la météo est celle du serveur. Un OP la
+        // change pour tous ses joueurs ; le relais le vérifie, répond (son texte s'affiche)
+        // et la dit à chacun (`Event::SetWeather`).
+        let online = self.build.is_some();
         let w = &mut self.storm.weather;
+        let mut ask: Option<String> = None;
         let text = match arg.map(str::to_lowercase).as_deref() {
             None => format!(
                 "Météo : {}{}. /weather clear|rain|storm, /weather fix [on|off]",
@@ -4165,14 +4269,28 @@ impl Session {
                     Some("off" | "non" | "false" | "0") => false,
                     _ => !w.fixed,
                 };
-                w.fix(on);
-                if on {
-                    format!("Météo figée : {}{local}.", w.kind().label())
+                if online {
+                    // (Le temps qu'on voit : le relais ne connaît pas celui des horloges.)
+                    ask = Some(if on {
+                        format!("fix {}", w.kind().key())
+                    } else {
+                        "auto".into()
+                    });
+                    String::new()
                 } else {
-                    format!("La météo change de nouveau toute seule{local}.")
+                    w.fix(on);
+                    if on {
+                        format!("Météo figée : {}.", w.kind().label())
+                    } else {
+                        "La météo change de nouveau toute seule.".to_string()
+                    }
                 }
             }
             Some(word) => match Kind::parse(word) {
+                Some(k) if online => {
+                    ask = Some(k.key().into());
+                    String::new()
+                }
                 Some(k) => {
                     w.force(k);
                     let what = match k {
@@ -4180,10 +4298,7 @@ impl Session {
                         Kind::Rain => "La pluie arrive",
                         Kind::Storm => "L'orage arrive",
                     };
-                    format!(
-                        "{what}{}{local}.",
-                        if w.fixed { " (météo figée)" } else { "" }
-                    )
+                    format!("{what}{}.", if w.fixed { " (météo figée)" } else { "" })
                 }
                 None => {
                     self.chat.say(
@@ -4194,6 +4309,14 @@ impl Session {
                 }
             },
         };
+        if let Some(reason) = ask {
+            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                action: minelib_net::proto::SERVER_WEATHER,
+                pseudo: String::new(),
+                reason,
+            });
+            return;
+        }
         self.chat.say(text, chat::YELLOW);
     }
 
@@ -4317,19 +4440,6 @@ impl Session {
                 } else {
                     self.chat
                         .say("/npc stresstest : réservé aux OP de ce serveur.", chat::RED);
-                }
-                return true;
-            }
-        }
-        // (v216) La même demande sert à `/thor` : la foudre est réservée aux OP du serveur.
-        if let Some((asked, aim)) = self.thor_probe.take() {
-            if asked.elapsed().as_secs_f32() <= 10.0 {
-                if op {
-                    self.throw_lightning(aim);
-                    self.say_lightning_is_local();
-                } else {
-                    self.chat
-                        .say("/thor : réservé aux OP de ce serveur.", chat::RED);
                 }
                 return true;
             }
@@ -5240,6 +5350,16 @@ impl Session {
                 Event::SetTime { hours, fixed } => {
                     self.time_h = *hours;
                     self.time_fixed = *fixed;
+                    return;
+                }
+                // (v229) Météo du serveur (à l'arrivée, ou changée par un OP) : le temps
+                // imposé et ce qu'il lui reste, ou celui des horloges du monde.
+                Event::SetWeather { kind, left, fixed } => {
+                    self.storm.weather.impose(
+                        crate::weather::Kind::from_byte(*kind),
+                        (*left >= 0.0).then_some(*left as f64),
+                        *fixed,
+                    );
                     return;
                 }
                 // Mode de jeu donné par un OP (ou par défaut du serveur, à l'arrivée).
@@ -7014,8 +7134,8 @@ impl Session {
                     "/worldname <nom> : renomme le monde",
                     "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
                     "/timefix on|off : arrête ou relance le temps",
-                    "/weather clear|rain|storm : le temps qu'il fait ; /weather fix [on|off] : le fige",
-                    "/thor : la foudre tombe là où tu vises ; /give foudre : la Foudre de Zeus",
+                    "/weather clear|rain|storm : le temps qu'il fait ; /weather fix [on|off] : le fige (en ligne, OP : pour tout le serveur)",
+                    "/thor : la foudre tombe là où tu vises (en ligne, OP : tous la voient) ; /give foudre : la Foudre de Zeus",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
                     "/give petit_ecran | grand_ecran | ecran_geant : les autres tailles d'écran",
                     "/give tête <pseudo> [nombre] : la tête d'un joueur, avec son skin",

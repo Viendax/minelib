@@ -35,6 +35,10 @@
 //!   MINELIB_THOR=<s>            la foudre tombe là où l'on regarde toutes les <s> s (essais)
 //!   MINELIB_F5=1|2              commencer vu de derrière (1) ou de face (2) (essais)
 //!   MINELIB_FOUDRE_FIGEE=1      chaque éclair s'arrête à son plus vif (captures d'essai)
+//!   MINELIB_EN_LIGNE=1          ouvre MINELIB_WORLD en ligne (construction), dès que le
+//!                               compte est connecté (voir MINELIB_TEST_ACCOUNT) (essais)
+//!   MINELIB_CMD=<s>:<commande>[|<s>:<commande>…]  tape ces commandes du tchat, chacune
+//!                               <s> secondes après l'entrée dans le monde (essais)
 //!   MINELIB_DEMO=1              nouveau monde : mur + toutes les torches colorées
 //!   MINELIB_START=<x>,<y>,<z>[,lacet°,tangage°]  position de départ (vol activé ; aussi
 //!                               dans un monde neuf et dans la démo)
@@ -360,6 +364,8 @@ struct Game {
     /// Mémoire vidéo utilisée et budget Windows, relus chaque seconde.
     vram: Option<(minelib_platform::VramMonitor, std::time::Instant, bool)>,
     auto_world: Option<String>,
+    /// Essais (`MINELIB_EN_LIGNE=1`) : monde à ouvrir en ligne dès que le compte est connecté.
+    auto_online: Option<PathBuf>,
     pending_open: Option<(PathBuf, u32)>,
     /// Vider tous les maillages GPU (changement de monde) en fin d'image.
     clear_meshes: bool,
@@ -486,6 +492,7 @@ impl Game {
             auto_world: std::env::var("MINELIB_WORLD")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            auto_online: None,
             pending_open: None,
             clear_meshes: false,
             quit: false,
@@ -1928,6 +1935,13 @@ impl Game {
             map: name.clone(),
             map_sig: sig,
             max_players: 0,
+        });
+        // (v229) Météo du serveur (celle qu'un OP y a imposée la dernière fois, gardée par le
+        // relais) : le propriétaire la demande, comme l'apprennent ceux qui le rejoignent.
+        self.accounts.room(minelib_net::client::Cmd::ServerAdmin {
+            action: minelib_net::proto::SERVER_WEATHER,
+            pseudo: String::new(),
+            reason: String::new(),
         });
         // Monde de construction : pour ceux qui le rejoignent, pas pour la liste des cartes.
         self.accounts.room(minelib_net::client::Cmd::UploadMap {
@@ -3422,7 +3436,11 @@ impl GameLoop for Game {
                 save::create_world(&self.paths.saves, &name, seed).ok()
             });
             if let Some(dir) = dir {
-                self.play(dir);
+                if std::env::var("MINELIB_EN_LIGNE").is_ok_and(|v| v.trim() == "1") {
+                    self.auto_online = Some(dir);
+                } else {
+                    self.play(dir);
+                }
             }
         }
     }
@@ -3436,6 +3454,11 @@ impl GameLoop for Game {
     fn on_frame(&mut self, window: &PlatformWindow, input: &Input, dt: f32) -> bool {
         self.time += dt;
         self.record_frame_time(dt);
+        if self.auto_online.is_some() && self.accounts.link.is_some() {
+            if let Some(dir) = self.auto_online.take() {
+                self.host_build(dir);
+            }
+        }
         if let Some(limit) = self.exit_after {
             if self.time > limit {
                 log::info!("arrêt automatique après {limit} s");

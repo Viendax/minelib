@@ -42,6 +42,10 @@ pub struct Store {
     /// Heure de chaque serveur (fichier `….times`) : (heure à l'instant `since` en
     /// secondes Unix, arrêtée). Elle avance comme dans Minecraft (24 h en 20 minutes).
     times: HashMap<String, (f32, u64, bool)>,
+    /// (v229) Météo imposée de chaque serveur (fichier `….weather`) : (temps
+    /// `proto::WEATHER_…`, jusqu'à cette heure du système (s), `u64::MAX` : sans fin,
+    /// figée). Absente ou passée : la météo des horloges du monde.
+    weathers: HashMap<String, (u8, u64, bool)>,
     /// (v223) Point d'apparition de chaque serveur (fichier `….spawns`) : [x, y, z, lacet,
     /// tangage], pour qui y arrive la première fois.
     spawns: HashMap<String, [f32; 5]>,
@@ -90,6 +94,8 @@ pub enum Action {
     /// Heure (OP) : `reason` = l'heure (0..24) ; l'arrêter ou la relancer (`reason` 1/0).
     TimeSet,
     TimeFix,
+    /// (v229) Météo du serveur (OP) : `reason` = voir `proto::SERVER_WEATHER`.
+    Weather,
     /// (v223) Téléporter (OP) : `target` = qui (vide : soi-même), `reason` = « x y z » ou
     /// « @pseudo ». Rien à garder : la permission, et le relais envoie la position.
     Teleport,
@@ -130,6 +136,10 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let weathers = std::fs::read(path.with_extension("weather"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Self {
             path,
             servers,
@@ -142,6 +152,7 @@ impl Store {
                 .unwrap_or_else(std::time::Instant::now),
             times,
             spawns,
+            weathers,
         }
     }
 
@@ -171,6 +182,80 @@ impl Store {
         if let Ok(b) = postcard::to_allocvec(&self.times) {
             let _ = crate::accounts::write_atomic(&self.path.with_extension("times"), &b);
         }
+    }
+
+    /// (v229) Météo du serveur, comme dans `Response::SetWeather` : (temps, secondes qu'il
+    /// lui reste, négatif : sans fin, figée) ; `WEATHER_NATURAL` si rien n'est imposé (ou
+    /// plus : sa durée est passée).
+    pub fn weather(&self, server: &str) -> (u8, f32, bool) {
+        use minelib_net::proto::WEATHER_NATURAL;
+        match self.weathers.get(server).copied() {
+            Some((kind, u64::MAX, fixed)) => (kind, -1.0, fixed),
+            Some((kind, until, _)) if until > unix_now() => {
+                (kind, (until - unix_now()) as f32, false)
+            }
+            _ => (WEATHER_NATURAL, 0.0, false),
+        }
+    }
+
+    /// (v229) `/weather` d'un OP (`reason` : voir `proto::SERVER_WEATHER`). Renvoie le
+    /// message à lui afficher. `roll` : nombre de 0 à 1 dont la durée est tirée.
+    fn set_weather(&mut self, server: &str, reason: &str, roll: f32) -> Result<String, String> {
+        use minelib_net::proto::{self, WEATHER_CLEAR, WEATHER_RAIN, WEATHER_STORM};
+        let kind_of = |w: &str| match w {
+            "clear" => Some(WEATHER_CLEAR),
+            "rain" => Some(WEATHER_RAIN),
+            "storm" => Some(WEATHER_STORM),
+            _ => None,
+        };
+        let label = |k: u8| match k {
+            WEATHER_CLEAR => "beau temps",
+            WEATHER_RAIN => "pluie",
+            _ => "orage",
+        };
+        let bad = || "Usage : /weather clear|rain|storm, /weather fix [on|off]".to_string();
+        let mut words = reason.split_whitespace();
+        let fixed = self.weather(server).2;
+        let text = match (words.next(), words.next()) {
+            (Some("auto"), None) => {
+                self.weathers.remove(server);
+                "La météo change de nouveau toute seule, pour tout le serveur.".to_string()
+            }
+            (Some("fix"), Some(w)) => {
+                let kind = kind_of(w).ok_or_else(bad)?;
+                self.weathers
+                    .insert(server.to_string(), (kind, u64::MAX, true));
+                format!("Météo figée pour tout le serveur : {}.", label(kind))
+            }
+            (Some(w), None) => {
+                let kind = kind_of(w).ok_or_else(bad)?;
+                let (lo, hi) = proto::weather_span(kind).ok_or_else(bad)?;
+                let until = if fixed {
+                    u64::MAX
+                } else {
+                    unix_now() + (lo + (hi - lo) * roll.clamp(0.0, 1.0)) as u64
+                };
+                self.weathers
+                    .insert(server.to_string(), (kind, until, fixed));
+                format!(
+                    "{} pour tout le serveur{}.",
+                    match kind {
+                        WEATHER_CLEAR => "Le ciel se dégage",
+                        WEATHER_RAIN => "La pluie arrive",
+                        _ => "L'orage arrive",
+                    },
+                    if fixed { " (météo figée)" } else { "" }
+                )
+            }
+            _ => return Err(bad()),
+        };
+        // (Les météos passées ne restent pas dans le fichier.)
+        let now = unix_now();
+        self.weathers.retain(|_, w| w.1 > now);
+        if let Ok(b) = postcard::to_allocvec(&self.weathers) {
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("weather"), &b);
+        }
+        Ok(text)
     }
 
     /// Dernière position connue de `pseudo` sur ce serveur.
@@ -357,6 +442,7 @@ impl Store {
             Action::Rename => {
                 return Ok(format!("Serveur renommé : {}.", reason.trim()));
             }
+            Action::Weather => return self.set_weather(server, reason, rand::random::<f32>()),
             Action::Teleport => {
                 return Ok(if target.is_empty() || target.eq_ignore_ascii_case(by) {
                     "Téléporté.".into()
@@ -479,6 +565,7 @@ impl Store {
             | Action::Rename
             | Action::TimeSet
             | Action::TimeFix
+            | Action::Weather
             | Action::Teleport
             | Action::SetSpawn
             | Action::DefaultGamemode => unreachable!("traité plus haut"),
@@ -564,6 +651,55 @@ mod tests {
         assert!(!s2.whitelisted_out(&k, "Createur", "eve"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("whitelist"));
+    }
+
+    /// (v229) La météo imposée : par un OP seulement, pour une durée ordinaire tirée par le
+    /// relais ; figée, elle n'a pas de fin ; gardée sur le disque ; passée, oubliée.
+    #[test]
+    fn the_weather_of_a_server_is_set_by_ops_kept_and_ends() {
+        use minelib_net::proto::{WEATHER_CLEAR, WEATHER_NATURAL, WEATHER_RAIN, WEATHER_STORM};
+        let path = std::env::temp_dir().join(format!("minelib-meteo-{}", rand::random::<u32>()));
+        let mut s = Store::open(path.clone());
+        let k = key("Createur", "monde");
+        assert_eq!(s.weather(&k).0, WEATHER_NATURAL);
+        assert!(s
+            .act(&k, "Createur", "Eve", Action::Weather, "", "storm")
+            .is_err());
+        assert_eq!(s.weather(&k).0, WEATHER_NATURAL, "pas OP : rien ne change");
+        // Durées ordinaires : aux deux bouts de ce que tire le relais.
+        for (word, kind, roll, want) in [
+            ("storm", WEATHER_STORM, 0.0, 180.0),
+            ("storm", WEATHER_STORM, 1.0, 780.0),
+            ("rain", WEATHER_RAIN, 0.5, 900.0),
+            ("clear", WEATHER_CLEAR, 1.0, 9000.0),
+        ] {
+            s.set_weather(&k, word, roll).unwrap();
+            let (got, left, fixed) = s.weather(&k);
+            assert_eq!((got, fixed), (kind, false));
+            assert!((left - want).abs() <= 2.0, "{word} {left}");
+        }
+        assert!(s.set_weather(&k, "neige", 0.5).is_err());
+        assert!(s.set_weather(&k, "fix", 0.5).is_err());
+        assert!(s.set_weather(&k, "fix neige", 0.5).is_err());
+        assert_eq!(s.weather(&k).0, WEATHER_CLEAR, "refusé : la météo reste");
+        // Figée : sans fin, et le temps qu'on impose ensuite le reste.
+        s.act(&k, "Createur", "Createur", Action::Weather, "", "fix rain")
+            .unwrap();
+        assert_eq!(s.weather(&k), (WEATHER_RAIN, -1.0, true));
+        s.set_weather(&k, "storm", 0.5).unwrap();
+        assert_eq!(s.weather(&k), (WEATHER_STORM, -1.0, true));
+        // Gardée sur le disque.
+        let mut again = Store::open(path.clone());
+        assert_eq!(again.weather(&k), (WEATHER_STORM, -1.0, true));
+        // De nouveau toute seule.
+        again.set_weather(&k, "auto", 0.5).unwrap();
+        assert_eq!(again.weather(&k).0, WEATHER_NATURAL);
+        assert_eq!(Store::open(path.clone()).weather(&k).0, WEATHER_NATURAL);
+        // Passée : oubliée.
+        again.weathers.insert(k.clone(), (WEATHER_RAIN, unix_now() - 1, false));
+        assert_eq!(again.weather(&k).0, WEATHER_NATURAL);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("weather"));
     }
 
     #[test]

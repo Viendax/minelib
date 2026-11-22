@@ -935,6 +935,7 @@ impl Accounts {
                 | Event::SetGamemode { .. }
                 | Event::BulkDone { .. }
                 | Event::SetTime { .. }
+                | Event::SetWeather { .. }
                 | Event::BuildSpawn { .. }
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)

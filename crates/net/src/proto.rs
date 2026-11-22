@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 /// (`BuildMsg::LightPut`, `Light`, `LightDenied`).
 /// (v227) 57 : la foule d'essai des OP en construction en ligne (`BuildMsg::Crowd`,
 /// `CrowdHit`, `CrowdDenied`).
-pub const PROTOCOL: u32 = 57;
+/// (v229) 58 : la météo imposée par un OP pour tout le serveur (`SERVER_WEATHER`,
+/// `Response::SetWeather`, `ProvinceSettings::weather`) et la foudre de `/thor` et de la
+/// Foudre de Zeus montrée aux joueurs proches (`BuildMsg::ThorAsk`, `Thor`, `ThorDenied`).
+pub const PROTOCOL: u32 = 58;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -71,6 +74,31 @@ pub const SERVER_TELEPORT: u8 = 17;
 /// (v223) Point d'apparition du serveur (OP) : `reason` = « x y z lacet tangage » (là où
 /// est l'OP). Un joueur qui arrive pour la première fois y apparaît (`BuildSpawn`).
 pub const SERVER_SETSPAWN: u8 = 18;
+/// (v229) Météo du serveur (OP), pour tous ses joueurs : `reason` = « clear », « rain » ou
+/// « storm » (ce temps, pour une durée ordinaire que tire le relais ; sans fin si la météo
+/// est figée), « fix <temps> » (figer : ce temps-là, celui que voit l'OP, ne change plus),
+/// « auto » (la météo change de nouveau toute seule). Le relais le dit à tous
+/// (`Response::SetWeather`), et à ceux qui arrivent. `reason` vide (tout joueur du serveur) :
+/// rien ne change, le relais redit la météo du serveur à celui qui la demande.
+pub const SERVER_WEATHER: u8 = 19;
+
+/// (v229) Temps qu'il fait, dans `Response::SetWeather` : beau temps, pluie, orage ; ou
+/// aucun temps imposé (celui des horloges du monde, que chaque jeu calcule).
+pub const WEATHER_CLEAR: u8 = 0;
+pub const WEATHER_RAIN: u8 = 1;
+pub const WEATHER_STORM: u8 = 2;
+pub const WEATHER_NATURAL: u8 = 255;
+
+/// (v229) Durée ordinaire (s, de… à…) d'un temps imposé : celles de Minecraft (une période
+/// de beau temps, une averse, un orage). `None` : pas un temps.
+pub fn weather_span(kind: u8) -> Option<(f32, f32)> {
+    match kind {
+        WEATHER_CLEAR => Some((600.0, 9000.0)),
+        WEATHER_RAIN => Some((600.0, 1200.0)),
+        WEATHER_STORM => Some((180.0, 780.0)),
+        _ => None,
+    }
+}
 
 /// Triches trouvées par le rejeu : sauts parfaits en chaîne (script de bunny hop), appuis
 /// plus rapides qu'une main (macro).
@@ -1385,6 +1413,14 @@ pub enum Response {
         from: String,
         data: Vec<u8>,
     },
+    /// (v229) Météo du serveur de construction (à l'arrivée, et quand un OP la change) :
+    /// `kind` (`WEATHER_…`) imposé pour encore `left` secondes (négatif : sans fin), ou
+    /// `WEATHER_NATURAL` : celle des horloges du monde. `fixed` : figée (`/weather fix`).
+    SetWeather {
+        kind: u8,
+        left: f32,
+        fixed: bool,
+    },
 }
 
 impl Response {
@@ -1411,6 +1447,7 @@ impl Response {
                 | Response::BulkDone { .. }
                 | Response::Probe { .. }
                 | Response::SetTime { .. }
+                | Response::SetWeather { .. }
                 | Response::BuildSpawn { .. }
                 | Response::Arbitrate { .. }
                 | Response::Evidence { .. }
@@ -1658,6 +1695,9 @@ pub struct ProvinceSettings {
     /// (v146) Heure du serveur (heures, figée), quand un OP vient de la changer : la
     /// province la dit à ses joueurs (ceux qui ne sont plus connectés au relais du monde).
     pub time: Option<(f32, bool)>,
+    /// (v229) Météo du serveur (temps, secondes qu'il lui reste, figée : comme dans
+    /// `Response::SetWeather`), quand un OP vient de la changer.
+    pub weather: Option<(u8, f32, bool)>,
 }
 
 /// Province d'un relais de région (dans `ShardTask`) : où la joindre, et le jeton qui
