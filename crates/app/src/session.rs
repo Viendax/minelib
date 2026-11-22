@@ -348,8 +348,10 @@ pub struct Session {
     pub chat: Chat,
     /// Mode de jeu, vol autorisé en survie (/fly), santé.
     pub game: GameState,
-    /// Point de réapparition (là où le monde a été ouvert).
+    /// Point de réapparition (là où le monde a été ouvert, ou (v223) `/setspawn`).
     spawn: Vec3,
+    /// (v223) `spawn` vient de `/setspawn` : enregistré avec le monde.
+    spawn_set: bool,
     /// Hauteur d'où le joueur tombe (pour les dégâts de chute).
     fall_from: Option<f32>,
     /// Temps depuis le dernier appui sur Espace (double appui = vol).
@@ -548,7 +550,9 @@ impl Session {
         if game.mode.mortal() && !game.can_fly {
             player.flying = false;
         }
-        let spawn = player.pos;
+        // (v223) Point d'apparition choisi par `/setspawn`, sinon là où l'on ouvre le monde.
+        let spawn_set = data.spawn.is_some();
+        let spawn = data.spawn.map_or(player.pos, Vec3::from);
         // (v216) Météo du monde. MINELIB_METEO=clear|rain|storm : imposée et figée (essais).
         let mut storm = crate::storm::Storm::new(u64::from(world.seed));
         storm.weather.load(&data.weather);
@@ -703,6 +707,7 @@ impl Session {
             chat: Chat::default(),
             game,
             spawn,
+            spawn_set,
             fall_from: None,
             since_space: 1.0,
             hurt: 0.0,
@@ -865,6 +870,7 @@ impl Session {
             time_fixed: self.time_fixed,
             weather: self.storm.weather.save(),
             inventory: Some(inv),
+            spawn: self.spawn_set.then_some(self.spawn.to_array()),
         };
         // Objets au sol et coffres : en solo, ou chez le propriétaire d'un monde en ligne.
         if self.items_ready && self.build.as_ref().is_none_or(|b| b.is_owner()) {
@@ -903,6 +909,7 @@ impl Session {
             time_fixed: self.time_fixed,
             weather: self.storm.weather.save(),
             inventory: None,
+            spawn: self.spawn_set.then_some(self.spawn.to_array()),
         };
         save::save_world(&dir, &data, &self.world)?;
         Ok(dir)
@@ -3159,6 +3166,14 @@ impl Session {
                     Some("ladder".to_string())
                 } else if key.starts_with("vine:") {
                     Some("vine".to_string())
+                } else if key.starts_with("tripwire_hook") {
+                    // (v223) Crochet (fil de déclenchement) : accroché au mur cliqué ; il ne
+                    // se pose ni sur le sol ni au plafond.
+                    if hit.normal[1] != 0 {
+                        self.place_cooldown = 0.22;
+                        return;
+                    }
+                    Some("tripwire_hook".to_string())
                 } else {
                     key.strip_prefix("banner_")
                         .and_then(|r| r.split(':').next())
@@ -4699,6 +4714,101 @@ impl Session {
         self.spawn
     }
 
+    /// (v223) `/tp` : `x y z` (« ~ » : par rapport à soi), `pseudo` (là où il est), `pseudo x
+    /// y z`, `pseudo pseudo2`. En solo, soi seulement ; sur un serveur de construction,
+    /// réservé aux OP : le relais vérifie, puis place celui qui part (`BuildSpawn`).
+    fn tp_command(&mut self, args: &[&str]) {
+        let usage = "Utilisation : /tp <x> <y> <z> (« ~ » : par rapport à toi), /tp <pseudo>, \
+                     /tp <pseudo> <x> <y> <z>, /tp <pseudo> <pseudo2>";
+        let here = self.player.pos;
+        let coords = |a: &[&str]| -> Option<Vec3> {
+            let mut out = [0.0f32; 3];
+            for (k, t) in a.iter().enumerate() {
+                let (rel, rest) = match t.strip_prefix('~') {
+                    Some(r) => (true, r),
+                    None => (false, *t),
+                };
+                let v: f32 = if rest.is_empty() { 0.0 } else { rest.parse().ok()? };
+                out[k] = if rel { here[k] + v } else { v };
+            }
+            let p = Vec3::from(out);
+            (p.is_finite() && p.y.abs() <= 4096.0).then_some(p)
+        };
+        // (Qui part, et où : coordonnées ou « @pseudo ».)
+        let (who, to): (&str, String) = match args {
+            [x, y, z] => match coords(&[x, y, z]) {
+                Some(p) => ("", format!("{} {} {}", p.x, p.y, p.z)),
+                None => return self.chat.say(usage, chat::RED),
+            },
+            [name] => ("", format!("@{name}")),
+            [name, x, y, z] => match coords(&[x, y, z]) {
+                Some(p) => (name, format!("{} {} {}", p.x, p.y, p.z)),
+                None => return self.chat.say(usage, chat::RED),
+            },
+            [name, other] => (name, format!("@{other}")),
+            _ => return self.chat.say(usage, chat::RED),
+        };
+        if self.build.is_some() {
+            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                action: minelib_net::proto::SERVER_TELEPORT,
+                pseudo: who.to_string(),
+                reason: to,
+            });
+            return;
+        }
+        // Solo : soi seulement (« /tp <son pseudo> x y z » aussi).
+        let me = !who.is_empty() && who.eq_ignore_ascii_case(&self.pseudo);
+        if (!who.is_empty() && !me) || to.starts_with('@') {
+            self.chat
+                .say("En solo, on ne téléporte que soi, vers des coordonnées.", chat::RED);
+            return;
+        }
+        let v: Vec<f32> = to.split(' ').filter_map(|t| t.parse().ok()).collect();
+        if let [x, y, z] = v[..] {
+            self.teleport(Vec3::new(x, y, z), None);
+            self.chat.say(
+                format!("Téléporté en {x:.1} {y:.1} {z:.1}."),
+                chat::YELLOW,
+            );
+        }
+    }
+
+    /// (v223) Placé ailleurs (`/tp`, arrivée sur un serveur) : sans vitesse ni chute en cours.
+    fn teleport(&mut self, pos: Vec3, look: Option<(f32, f32)>) {
+        self.player.pos = pos;
+        self.player.vel = Vec3::ZERO;
+        if let Some((yaw, pitch)) = look {
+            self.player.yaw = yaw;
+            self.player.pitch = pitch;
+        }
+        self.fall_from = None;
+        self.fall_top = None;
+    }
+
+    /// (v223) `/setspawn` : le point d'apparition là où l'on est. En solo, enregistré avec le
+    /// monde (on y réapparaît) ; sur un serveur de construction, réservé aux OP : ceux qui y
+    /// arrivent pour la première fois y apparaissent.
+    fn setspawn(&mut self) {
+        let p = self.player.pos;
+        if self.build.is_some() {
+            self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                action: minelib_net::proto::SERVER_SETSPAWN,
+                pseudo: String::new(),
+                reason: format!(
+                    "{} {} {} {} {}",
+                    p.x, p.y, p.z, self.player.yaw, self.player.pitch
+                ),
+            });
+            return;
+        }
+        self.spawn = p;
+        self.spawn_set = true;
+        self.chat.say(
+            format!("Point d'apparition : {:.0} {:.0} {:.0}.", p.x, p.y, p.z),
+            chat::YELLOW,
+        );
+    }
+
     /// Événement du relais pour la partie en ligne.
     pub fn net_event(&mut self, e: &minelib_net::client::Event) {
         use minelib_net::client::Event;
@@ -4751,12 +4861,9 @@ impl Session {
                 // WorldEdit refusé (pas OP) : les blocs reviennent.
                 // Arrivée sur le serveur : là où l'on était (gardé par le relais).
                 Event::BuildSpawn { pos, yaw, pitch } => {
-                    self.player.pos = Vec3::from(*pos);
-                    self.player.vel = Vec3::ZERO;
-                    self.player.yaw = *yaw;
-                    self.player.pitch = *pitch;
-                    self.fall_from = None;
-                    self.fall_top = None;
+                    // (À l'arrivée : sa dernière position ici ; (v223) `/tp`.)
+                    let look = (yaw.is_finite() && pitch.is_finite()).then_some((*yaw, *pitch));
+                    self.teleport(Vec3::from(*pos), look);
                     return;
                 }
                 Event::BulkDone { id, error } => {
@@ -6491,6 +6598,12 @@ impl Session {
                 self.game.health = MAX_HEALTH;
                 self.chat.say("Vous êtes soigné.", chat::YELLOW);
             }
+            // (v223) Téléportation et point d'apparition (voir `tp_command`, `setspawn`).
+            "tp" | "teleport" => {
+                let args: Vec<&str> = cmd.split_whitespace().skip(1).collect();
+                self.tp_command(&args);
+            }
+            "setspawn" | "spawnpoint" => self.setspawn(),
             // Éditeur de lumières (touche L) ; `/lumieres effacer` les retire toutes.
             "lumieres" | "lumières" | "lights" => match arg.map(|a| a.to_lowercase()) {
                 Some(a) if a == "effacer" || a == "clear" => {
@@ -6510,6 +6623,8 @@ impl Session {
                     "/gm (ou /gamemode) <0|1|2|3> : survie, créatif, fps, spectateur",
                     "/fly [on|off] : autorise ou interdit le vol en survie",
                     "/heal : rend tous les coeurs",
+                    "/tp <x y z | pseudo> ; /tp <pseudo> <x y z | pseudo> : téléporter (~ : par rapport à toi ; en ligne, OP)",
+                    "/setspawn : point d'apparition là où tu es (en ligne, OP : pour qui arrive)",
                     "/worldname <nom> : renomme le monde",
                     "/timeset <heure | default> : règle l'heure (11, 11:20, 11.20, 11h20)",
                     "/timefix on|off : arrête ou relance le temps",

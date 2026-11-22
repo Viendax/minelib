@@ -34,6 +34,10 @@ pub const MIN_AREA: f32 = 256.0;
 /// Portée des miroirs redessinés (blocs, comme celle des reflets : au-delà, le reflet
 /// s'est effacé).
 pub const RANGE: f32 = 64.0;
+/// (v223) Les faces de métal (fer, or, diamant) ne sont des miroirs que de près : à moins de
+/// tant de blocs de la caméra (`METAL_GONE` de world.wgsl ; leur reflet s'efface à partir
+/// de `METAL_FADE`, 1,75 bloc).
+pub const METAL_RANGE: f32 = 2.0;
 
 /// La boîte `min`..`max` touche-t-elle l'intérieur de tous les `planes` (normales vers
 /// l'intérieur) ?
@@ -277,6 +281,23 @@ pub fn candidates<'a>(
         }
     }
     planes
+}
+
+/// (v223) Ajoute à `planes` (miroirs vus) les plans de `more` (métaux proches) : un plan déjà
+/// là grandit (une image par plan), sinon il s'ajoute.
+pub fn merge(planes: &mut Vec<Plane>, more: Vec<Plane>) {
+    for p in more {
+        match planes
+            .iter_mut()
+            .find(|q| q.axis == p.axis && q.side == p.side && q.coord == p.coord)
+        {
+            Some(q) => {
+                q.lo = [q.lo[0].min(p.lo[0]), q.lo[1].min(p.lo[1])];
+                q.hi = [q.hi[0].max(p.hi[0]), q.hi[1].max(p.hi[1])];
+            }
+            None => planes.push(p),
+        }
+    }
 }
 
 /// Une image de miroir à redessiner à cette image.

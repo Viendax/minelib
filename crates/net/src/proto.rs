@@ -60,6 +60,13 @@ pub const SERVER_RENAME: u8 = 14;
 /// relancer (0).
 pub const SERVER_TIMESET: u8 = 15;
 pub const SERVER_TIMEFIX: u8 = 16;
+/// (v223) Téléporter (OP) : `pseudo` = qui (vide : soi-même), `reason` = « x y z », ou
+/// « @pseudo » pour aller là où est ce joueur. Le relais renvoie `BuildSpawn` à celui qui
+/// part.
+pub const SERVER_TELEPORT: u8 = 17;
+/// (v223) Point d'apparition du serveur (OP) : `reason` = « x y z lacet tangage » (là où
+/// est l'OP). Un joueur qui arrive pour la première fois y apparaît (`BuildSpawn`).
+pub const SERVER_SETSPAWN: u8 = 18;
 
 /// Triches trouvées par le rejeu : sauts parfaits en chaîne (script de bunny hop), appuis
 /// plus rapides qu'une main (macro).

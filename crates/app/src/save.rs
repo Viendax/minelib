@@ -135,6 +135,9 @@ pub struct SaveData {
     /// (v216) Météo (`Weather::save`) ; vide : monde d'avant la météo.
     pub weather: String,
     pub inventory: Option<Inventory>,
+    /// (v223) Point d'apparition choisi par `/setspawn` (sinon : là où l'on a ouvert le
+    /// monde).
+    pub spawn: Option<[f32; 3]>,
 }
 
 pub fn now() -> u64 {
@@ -277,6 +280,7 @@ pub fn create_world(saves: &Path, name: &str, seed: u32) -> Result<PathBuf> {
             time_fixed: false,
             weather: String::new(),
             inventory: None,
+            spawn: None,
         },
     )?;
     Ok(dir)
@@ -341,6 +345,9 @@ fn write_level(dir: &Path, d: &SaveData) -> Result<()> {
             "player={},{},{},{},{},{}\n",
             p.pos[0], p.pos[1], p.pos[2], p.yaw, p.pitch, p.flying as u8
         );
+    }
+    if let Some(p) = d.spawn {
+        s += &format!("spawn={},{},{}\n", p[0], p[1], p[2]);
     }
     if let Some(inv) = &d.inventory {
         s += &format!("selected={}\n", inv.selected);
@@ -501,6 +508,13 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
         meta,
         player,
         inventory,
+        spawn: kv.get("spawn").and_then(|v| {
+            let c: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            match c[..] {
+                [x, y, z] if x.is_finite() && y.is_finite() && z.is_finite() => Some([x, y, z]),
+                _ => None,
+            }
+        }),
     };
 
     let mut world = World::new(data.meta.seed);
@@ -671,6 +685,7 @@ fn import_minecraft(dir: &Path) -> Result<(SaveData, World)> {
         time_fixed: false,
         weather: String::new(),
         inventory: None,
+        spawn: None,
     };
     Ok((data, world))
 }

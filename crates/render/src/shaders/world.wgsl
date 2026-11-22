@@ -883,14 +883,15 @@ fn cached_reflection(p: vec3<f32>) -> vec4<f32> {
 @fragment
 fn fs_reflect(i: VOut) -> @location(0) vec4<f32> {
     let n = face_normal(i.face);
-    // (v190) Miroir redessiné à part : son image sert, pas de rayon.
-    if i.reflect > 0.99 && i.short == 0u && has_planar(i.world, n) {
+    // (v190) Miroir redessiné à part : son image sert, pas de rayon. (v223) Métal : jamais
+    // de rayon (l'image de son plan, de près).
+    if (i.reflect > 0.99 && i.short == 0u && has_planar(i.world, n)) || i.short != 0u {
         return vec4<f32>(0.0);
     }
     let to_frag = i.world - g.cam_pos.xyz;
     let dist = length(to_frag);
     let r = reflect(to_frag / max(dist, 1e-4), n);
-    let env = trace(i.world + n * 0.02, r, false).rgb;
+    let env = trace(i.world + n * 0.02, r).rgb;
     return vec4<f32>(env, dist);
 }
 
@@ -1064,16 +1065,27 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
         let r = reflect(v, n);
         var env: vec3<f32>;
         var cover = 1.0;
-        // Métal (`short`) : seulement les objets proches, pas le ciel ni le lointain.
+        // Métal (`short`, fer, or, diamant). (v223) Un vrai miroir, de près seulement
+        // (« le reflet complet, comme un miroir ; 2 blocs, il commence à disparaître à 1,75 ») :
+        // l'image redessinée de son plan (planar.rs, `METAL_RANGE`), teintée de sa couleur,
+        // qui s'efface de `METAL_FADE` à `METAL_GONE` blocs de la caméra ; au-delà, rien (le
+        // reflet des objets proches lancé en rayon, jusqu'à la v222, n'existe plus).
         let short = i.short != 0u;
+        let metal_fade = 1.0 - smoothstep(METAL_FADE, METAL_GONE, dist);
         // (v190) Miroir redessiné à part : son image, sans lancer de rayon.
         var planar = vec4<f32>(0.0);
-        if i.reflect > 0.99 && !short {
+        if (i.reflect > 0.99 && !short) || (short && metal_fade > 0.0) {
             planar = planar_mirror(i.world, n);
         }
         let deepest = in_mirror && i.reflect > 0.99 && !short && planar.a < 0.5;
-        let reflect_fade = select(rt_fade, mirror_fade, planar.a > 0.5 || deepest);
-        if planar.a > 0.5 {
+        var reflect_fade = select(rt_fade, mirror_fade, planar.a > 0.5 || deepest);
+        if short {
+            reflect_fade = metal_fade;
+        }
+        if short {
+            env = planar.rgb;
+            cover = planar.a;
+        } else if planar.a > 0.5 {
             env = planar.rgb;
         } else if deepest {
             env = vec3<f32>(0.0);
@@ -1084,7 +1096,7 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
         } else if rt && g.rt.x > 0.5 {
             // Un seul appel à `trace` (le compilateur de DirectX recopie tout à chaque appel).
             var found = false;
-            if cached && !short {
+            if cached {
                 let c = cached_reflection(i.world + n * 0.02);
                 env = c.rgb;
                 found = c.a > 0.5;
@@ -1099,13 +1111,12 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
                 found = true;
             }
             if !found {
-                let e = trace(i.world + n * 0.02, r, short);
+                let e = trace(i.world + n * 0.02, r);
                 env = e.rgb;
                 cover = e.a;
             }
         } else {
             env = sky_env(r);
-            cover = select(1.0, 0.0, short);
         }
         // (v200) Joueurs et objets reflétés dans l'eau (image faite à part, sans rayon) :
         // par-dessus le reste du reflet, sur le dessus de l'eau de cette nappe. (v202) Toute
@@ -1119,7 +1130,11 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
             cover = max(cover, w.a);
         }
         let fresnel = pow(1.0 - max(dot(-v, n), 0.0), 5.0);
-        let k = select(i.reflect * (0.55 + 0.45 * fresnel), 0.96, i.reflect > 0.99) * reflect_fade * cover;
+        var k = select(i.reflect * (0.55 + 0.45 * fresnel), 0.96, i.reflect > 0.99) * reflect_fade * cover;
+        if short {
+            // (v223) Métal poli : presque tout le reflet, comme un miroir.
+            k = METAL_MIRROR * reflect_fade * cover;
+        }
         // Métal : le reflet prend la couleur du métal (fer gris, or jaune, diamant bleu) au
         // lieu de la remplacer : le bloc garde sa teinte et ne paraît pas transparent.
         let tinted = select(env, env * albedo * 1.6, i.short != 0u);
@@ -1787,11 +1802,12 @@ const REFLECT_RANGE: f32 = 64.0;
 fn refl_range() -> f32 {
     return select(REFLECT_RANGE, clamp(g.screen.w, 4.0, REFLECT_RANGE), g.screen.w > 0.0);
 }
-/// Reflets des métaux : rien au-delà de 4 blocs, flou et fondu à partir de 3.
-const METAL_RANGE: f32 = 4.0;
-const METAL_BLUR: f32 = 3.0;
-/// 1 pendant le rayon d'un reflet de métal (textures lues plus floues).
-var<private> ray_blur: f32 = 0.0;
+/// (v223) Reflets des métaux : l'image redessinée de leur plan (comme un miroir), entière
+/// jusqu'à `METAL_FADE` blocs de la caméra, effacée à `METAL_GONE` (aussi dans planar.rs :
+/// `METAL_RANGE`, `METAL_FADE`) ; part du reflet sur le métal.
+const METAL_FADE: f32 = 1.75;
+const METAL_GONE: f32 = 2.0;
+const METAL_MIRROR: f32 = 0.85;
 
 fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
     var cell = vec3<i32>(floor(o));
@@ -1909,10 +1925,8 @@ fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
         let fs = -vec3<f32>(step);
         let nrm = select(select(vec3<f32>(0.0, 0.0, fs.z), vec3<f32>(0.0, fs.y, 0.0), hax == 1), vec3<f32>(fs.x, 0.0, 0.0), hax == 0);
         // Miroir : texture nette (pleine résolution jusqu'à ~30 blocs, comme vue en
-        // direct). Reflet d'un métal : déjà un peu flou, très flou à partir de 3 blocs.
-        let sharp_lod = log2(max(ht * 0.03, 1.0));
-        let blur_lod = log2(max(ht, 1.0) * 0.6) + 1.0 + 3.0 * smoothstep(2.5, 4.0, ht);
-        let lod = clamp(select(sharp_lod, blur_lod, ray_blur > 0.5), 0.0, 6.0);
+        // direct).
+        let lod = clamp(log2(max(ht * 0.03, 1.0)), 0.0, 6.0);
         let texel = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), lod);
         // Pixels transparents d'un bloc fin (rail, échelle) : le rayon passe.
         if partial && texel.a < 0.5 {
@@ -1929,10 +1943,9 @@ fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
 }
 
 /// Reflet vu depuis `o` dans la direction `d` : jusqu'à 4 rebonds de miroir en miroir.
-/// `short` : reflet d'un métal, seulement ce qui est à moins de 4 blocs, sans rebond ;
-/// a = part visible (1 jusqu'à 3 blocs, fondu jusqu'à 0 à 4 blocs). Un seul appel à
+/// (v223 : plus de reflet court des métaux ici, voir `METAL_FADE`.) Un seul appel à
 /// `march` par shader : le compilateur de DirectX (FXC) met bien moins longtemps.
-fn trace(o0: vec3<f32>, d0: vec3<f32>, short: bool) -> vec4<f32> {
+fn trace(o0: vec3<f32>, d0: vec3<f32>) -> vec4<f32> {
     var o = o0;
     var d = d0;
     var acc = vec3<f32>(0.0);
@@ -1944,8 +1957,7 @@ fn trace(o0: vec3<f32>, d0: vec3<f32>, short: bool) -> vec4<f32> {
     // `screen.z`, portée dans `screen.w`.
     let max_bounces = max(i32(g.screen.z), 1);
     var travelled = 0.0;
-    let range = select(refl_range(), METAL_RANGE, short);
-    ray_blur = select(0.0, 1.0, short);
+    let range = refl_range();
     for (var bounce = 0; bounce < max_bounces; bounce++) {
         var h = march(o, d, range - travelled);
         // Le joueur (et ce qu'il tient), devant ce que le rayon a touché.
@@ -1963,10 +1975,6 @@ fn trace(o0: vec3<f32>, d0: vec3<f32>, short: bool) -> vec4<f32> {
             let sky_light = ((g.sun.w + (1.0 - g.sun.w) * diffuse) * day + 0.04 * (1.0 - day)) * h.sky * h.sky + 0.012;
             let lit = max(point_light(p + h.normal * 0.02, h.normal), held_light(p + h.normal * 0.02, h.normal));
             color = h.color * (sky_light * mix(1.0, h.shade, 0.35) + lit * 0.8 + h.glow * 0.5);
-        }
-        if short {
-            let a = select(0.0, 1.0 - smoothstep(METAL_BLUR, METAL_RANGE, h.t), h.t < METAL_RANGE);
-            return vec4<f32>(color, a);
         }
         // Brouillard de fin de portée, comme en fin de vue : vers la couleur du ciel.
         let far = travelled + min(h.t, range);

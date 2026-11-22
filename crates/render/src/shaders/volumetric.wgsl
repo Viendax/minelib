@@ -7,6 +7,11 @@
 // surface la plus proche, et jusqu'à la plus lointaine. Recomposée en pleine résolution par
 // vl_composite.wgsl, chaque pixel prenant la couche de sa propre profondeur. dynlights.wgsl est
 // ajouté à la suite.
+// (v223) Deux images : les lumières posées (gardées et reprises d'une image à l'autre par
+// `fs_temporal`, vl_composite.wgsl) et les lumières portées (lampe torche, torche tenue :
+// elles bougent avec la caméra, calculées à chaque image). L'image des lumières posées
+// déborde de l'écran d'une marge (`vf.margin`) : en tournant, ce qui entre à l'écran est déjà
+// calculé. Chaque image, l'échantillon bouge un peu dans son carré de pixels (`vf.jitter`).
 // D'après la marche volumétrique d'IRLights (MIT, qualet), réécrite pour Minelib.
 
 // Début des uniformes du monde.
@@ -22,15 +27,44 @@ struct Globals {
     cur_view_proj: mat4x4<f32>,
     prev_view_proj: mat4x4<f32>,
     screen: vec4<f32>,
+    clip: vec4<f32>,
+    held_pos: vec4<f32>,
+    held_color: vec4<f32>,
+    // x = raytracing activé, yzw = coin bas de la grille de blocs.
+    rt: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
+// (v223) Grille de blocs du raytracing (aussi celle des cartes d'ombre) : profondeur de la
+// marge hors de l'écran, où l'image du monde n'existe pas.
+@group(0) @binding(3) var voxels: texture_3d<u32>;
+@group(0) @binding(4) var palette: texture_1d<u32>;
 // Profondeur de la scène (pleine résolution) et bruit 3D qui se répète (densité des rayons).
 @group(1) @binding(0) var scene_depth: texture_depth_2d;
 @group(1) @binding(1) var vnoise: texture_3d<f32>;
 @group(1) @binding(2) var vnoise_s: sampler;
 // Cases d'écran éclairées (rectangles en NDC) : la passe ne dessine que là.
 @group(1) @binding(3) var<storage, read> lit_rects: array<vec4<f32>>;
+
+/// (v223) Image des rayons d'une image à l'autre (voir `fs_temporal` de vl_composite.wgsl,
+/// où la même structure est recopiée).
+struct VlFrame {
+    // Vue-projection de cette image (sans le décalage de l'anticrénelage) et de la
+    // précédente, comptées chacune depuis sa caméra (voir `eye_relative`).
+    cur_rel: mat4x4<f32>,
+    prev_rel: mat4x4<f32>,
+    // xyz = caméra − caméra précédente ; w = 1 : l'historique est valable.
+    delta: vec4<f32>,
+    // x, y = marge autour de l'écran (pixels de l'image des rayons) ; z = pixels du monde
+    // par pixel des rayons ; w = 1 : la marge est marchée à cette image.
+    margin: vec4<f32>,
+    // xy = image du monde (pixels) ; zw = image des rayons, marge comprise (pixels).
+    size: vec4<f32>,
+    // xy = décalage de l'échantillon dans son carré (pixels du monde) ; z = part de l'image
+    // courante quand l'historique est bon ; w = pas de la marge (au plus).
+    jitter: vec4<f32>,
+};
+@group(1) @binding(4) var<uniform> vf: VlFrame;
 
 const VL_PI: f32 = 3.14159265;
 
@@ -53,7 +87,37 @@ fn vl_scale() -> i32 {
 fn vs_tiles(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
     let e = vec2<f32>(8.0 / max(g.screen.x, 1.0), 8.0 / max(g.screen.y, 1.0));
     let r = lit_rects[ii];
-    return dl_rect_corner(vi, vec4<f32>(r.x - e.x, r.y + e.y, r.z + e.x, r.w - e.y));
+    let c = dl_rect_corner(vi, vec4<f32>(r.x - e.x, r.y + e.y, r.z + e.x, r.w - e.y));
+    // (v223) De l'écran à l'image des rayons, plus grande de sa marge.
+    return vec4<f32>(vl_to_ext(c.xy), 0.0, 1.0);
+}
+
+/// (v223) Point de l'écran (NDC) → même point dans l'image des rayons, marge comprise
+/// (NDC de cette image) : l'écran y couvre les pixels `marge` à `marge + taille / k`.
+fn vl_to_ext(ndc: vec2<f32>) -> vec2<f32> {
+    let k = max(vf.margin.z, 1.0);
+    let px = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vf.size.xy / k + vf.margin.xy;
+    let e = px / max(vf.size.zw, vec2<f32>(1.0));
+    return vec2<f32>(e.x * 2.0 - 1.0, 1.0 - e.y * 2.0);
+}
+
+/// (v223) La marge autour de l'écran (images où elle est marchée) : quatre bandes de l'image
+/// des rayons, en NDC de cette image (gauche, droite, haut, bas).
+@vertex
+fn vs_margin(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
+    let lo = vf.margin.xy / max(vf.size.zw, vec2<f32>(1.0));
+    let hi = vec2<f32>(1.0) - lo;
+    // (x0, y0, x1, y1) en coordonnées 0..1 de l'image (y vers le bas).
+    var r = vec4<f32>(0.0, 0.0, lo.x, 1.0);
+    if ii == 1u {
+        r = vec4<f32>(hi.x, 0.0, 1.0, 1.0);
+    } else if ii == 2u {
+        r = vec4<f32>(lo.x, 0.0, hi.x, lo.y);
+    } else if ii == 3u {
+        r = vec4<f32>(lo.x, hi.y, hi.x, 1.0);
+    }
+    let n = vec4<f32>(r.x * 2.0 - 1.0, 1.0 - r.y * 2.0, r.z * 2.0 - 1.0, 1.0 - r.w * 2.0);
+    return dl_rect_corner(vi, n);
 }
 
 /// Diffusion de Henyey-Greenstein (g > 0 : vers l'avant), normalisée à 1/4π.
@@ -164,25 +228,33 @@ fn vl_shadow_at(L: DynLight, fr: DlFrame, q: vec3<f32>, range: f32) -> f32 {
 struct VlLayers {
     near: vec3<f32>,
     far: vec3<f32>,
+    // (v223) Les mêmes couches, pour les lumières portées (lampe torche, torche tenue).
+    near_d: vec3<f32>,
+    far_d: vec3<f32>,
 };
 
-/// Lumière diffusée vers la caméra `o`, direction `d`, par les lumières de la tuile du pixel
-/// `frag` (pleine résolution, image `size`) : jusqu'à `cut_t` (surface la plus proche) et
+/// Lumière diffusée vers la caméra `o`, direction `d`, par les lumières de la tuile dont le
+/// masque commence au mot `base` de `dtiles` : jusqu'à `cut_t` (surface la plus proche) et
 /// jusqu'à `max_t` (la plus lointaine, ou distance maximale). `cut_t` ≥ `max_t` : une seule
-/// couche, la marche d'avant.
-fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f32, frag: vec2<f32>, size: vec2<f32>) -> VlLayers {
+/// couche, la marche d'avant. (v223) `margin` : pixel de la marge hors de l'écran (lumières
+/// posées seulement, moins de pas : il prépare ce qui va entrer à l'écran).
+fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f32, base: u32, margin: bool) -> VlLayers {
     var result = vec3<f32>(0.0);
     var result_near = vec3<f32>(0.0);
+    var result_d = vec3<f32>(0.0);
+    var result_near_d = vec3<f32>(0.0);
     let count = dh.counts.x;
     if count == 0u || max_t < 0.01 {
-        return VlLayers(result, result);
+        return VlLayers(result, result, result, result);
     }
-    let base = dl_tile_base(frag, size);
     let words = dl_tile_words(count);
     let flags = dh.vl_c.w;
     let shadows_on = (flags & DL_VL_SHADOWS) != 0u && (flags & DL_SHADOWS) != 0u;
     let noise_on = VL_NOISE && (flags & DL_VL_NOISE) != 0u && dh.vl_b.x > 0.0;
-    let step_max = i32(clamp(dh.vl_c.x, 1u, 96u));
+    var step_max = i32(clamp(dh.vl_c.x, 1u, 96u));
+    if margin {
+        step_max = min(step_max, max(i32(vf.jitter.w), 4));
+    }
     let sh_stride = i32(clamp(dh.vl_c.y, 1u, 8u));
     let nz_stride = i32(clamp(dh.vl_c.z, 1u, 8u));
     let tip_r2 = max(dh.vl_a.w * dh.vl_a.w, 1e-4);
@@ -205,6 +277,12 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f3
             let b = firstTrailingBit(bits);
             bits = bits & (bits - 1u);
             let L = dlights[min(w * 32u + b, count - 1u)];
+            // (v223) Lumière portée (elle bouge avec celui qui la tient) : dans l'image
+            // calculée à chaque image, jamais dans la marge.
+            let carried = L.shadow.w > 0.5;
+            if margin && carried {
+                continue;
+            }
             let col = L.color.rgb * max(L.vol.z, 0.0);
             let lp = L.pos_range.xyz;
             let range = max(L.pos_range.w, 0.001);
@@ -354,45 +432,125 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f3
                         acc_n = acc;
                     }
                 }
-                result += acc;
-                result_near += acc_n;
+                if carried {
+                    result_d += acc;
+                    result_near_d += acc_n;
+                } else {
+                    result += acc;
+                    result_near += acc_n;
+                }
             }
         }
     }
     let k = dh.vl_a.x * dh.surf.x;
-    return VlLayers(result_near * k, result * k);
+    return VlLayers(result_near * k, result * k, result_near_d * k, result_d * k);
+}
+
+/// (v223) Distance de la première case pleine de la grille de blocs le long de `o + t d`
+/// (au plus `max_t`, 1e9 sans rien) : la profondeur d'un pixel de la marge, hors de l'écran.
+/// Torches et plantes laissées de côté ; un bloc non plein compte dès sa case.
+fn vl_voxel_depth(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> f32 {
+    let vox = vec3<i32>(textureDimensions(voxels));
+    let origin = vec3<i32>(g.rt.yzw);
+    var cell = vec3<i32>(floor(o));
+    let step = vec3<i32>(sign(d));
+    let inv = 1.0 / max(abs(d), vec3<f32>(1e-6));
+    var t_max = (select(vec3<f32>(cell), vec3<f32>(cell) + 1.0, d > vec3<f32>(0.0)) - o) * sign(d) * inv;
+    t_max = select(t_max, vec3<f32>(1e9), abs(d) < vec3<f32>(1e-6));
+    var t = 0.0;
+    let n = min(i32(ceil(max_t * 1.8)) + 3, 400);
+    for (var i = 0; i < 400; i++) {
+        if i >= n || t > max_t {
+            break;
+        }
+        let l = cell - origin;
+        if any(l < vec3<i32>(0)) || any(l >= vox) {
+            break;
+        }
+        let id = textureLoad(voxels, l, 0).r & 4095u;
+        if id != 0u && i > 0 {
+            let torch = (textureLoad(palette, i32(id), 0).w >> 8u) & 7u;
+            let kind = textureLoad(palette, i32(id) + 4096, 0).w & 3u;
+            if torch == 0u && kind != 3u {
+                return t;
+            }
+        }
+        if t_max.x < t_max.y && t_max.x < t_max.z {
+            t = t_max.x;
+            cell.x += step.x;
+            t_max.x += inv.x;
+        } else if t_max.y < t_max.z {
+            t = t_max.y;
+            cell.y += step.y;
+            t_max.y += inv.y;
+        } else {
+            t = t_max.z;
+            cell.z += step.z;
+            t_max.z += inv.z;
+        }
+    }
+    return 1e9;
+}
+
+/// (v223) Les deux images de la marche : lumières posées (`placed`) et portées (`carried`).
+struct VlOut {
+    @location(0) placed: vec4<u32>,
+    @location(1) carried: vec4<u32>,
+};
+
+fn vl_pack(n: vec3<f32>, dn: f32, f: vec3<f32>, df: f32) -> vec4<u32> {
+    return vec4<u32>(
+        pack2x16float(n.rg),
+        pack2x16float(vec2<f32>(n.b, dn)),
+        pack2x16float(f.rg),
+        pack2x16float(vec2<f32>(f.b, df)),
+    );
 }
 
 @fragment
-fn fs_vl(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<u32> {
+fn fs_vl(@builtin(position) frag: vec4<f32>) -> VlOut {
     let dims = vec2<i32>(textureDimensions(scene_depth));
     let sc = vl_scale();
-    let base = vec2<i32>(floor(frag.xy)) * sc;
-    // Surfaces la plus proche et la plus lointaine des pixels couverts (Z inversé : la plus
-    // proche a la plus grande profondeur, le ciel vaut 0).
-    var dn = 0.0;
-    var df = 1.0;
-    for (var y = 0; y < sc; y++) {
-        for (var x = 0; x < sc; x++) {
-            let q = clamp(base + vec2<i32>(x, y), vec2<i32>(0), dims - 1);
-            let z = textureLoad(scene_depth, q, 0);
-            dn = max(dn, z);
-            df = min(df, z);
-        }
-    }
+    // (v223) Case de l'écran (pixels des rayons) : l'image des rayons déborde de la marge.
+    let cell = vec2<i32>(floor(frag.xy)) - vec2<i32>(vf.margin.xy);
+    let on_w = (dims + vec2<i32>(sc - 1)) / sc;
+    let on_screen = all(cell >= vec2<i32>(0)) && all(cell < on_w);
+    let base = cell * sc;
     let full = vec2<f32>(dims);
-    let mid = vec2<f32>(base) + 0.5 * f32(sc);
+    let cam = g.cam_pos.xyz;
+    // L'échantillon bouge un peu dans son carré à chaque image : repris d'une image à
+    // l'autre, l'image des lumières posées est celle de tout le carré (bords nets).
+    let mid = vec2<f32>(base) + 0.5 * f32(sc) + vf.jitter.xy;
     let uv = mid / full;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let cam = g.cam_pos.xyz;
     // Direction du regard tirée des lignes de la matrice (pas d'inverse : voir
     // `dl_view_ray`), et distances des surfaces : proche / profondeur unités de vue.
     let ray = dl_view_ray(g.view_proj, ndc);
     let dir = normalize(ray);
     let unit = length(ray) * g.view_proj[3][2];
+    let reach = dh.vl_a.y;
+    // Surfaces la plus proche et la plus lointaine des pixels couverts (Z inversé : la plus
+    // proche a la plus grande profondeur, le ciel vaut 0).
+    var dn = 0.0;
+    var df = 1.0;
+    if on_screen {
+        for (var y = 0; y < sc; y++) {
+            for (var x = 0; x < sc; x++) {
+                let q = clamp(base + vec2<i32>(x, y), vec2<i32>(0), dims - 1);
+                let z = textureLoad(scene_depth, q, 0);
+                dn = max(dn, z);
+                df = min(df, z);
+            }
+        }
+    } else {
+        // (v223) Marge : pas d'image du monde ici, la surface est cherchée dans la grille de
+        // blocs (une seule couche).
+        let t = vl_voxel_depth(cam, dir, reach);
+        dn = select(0.0, unit / max(t, 1e-3), t < 1e8);
+        df = dn;
+    }
     let t_near = select(1e9, unit / dn, dn > 0.0);
     let t_far = select(1e9, unit / df, df > 0.0);
-    let reach = dh.vl_a.y;
     // Deux couches seulement au bord d'un objet (surface lointaine plus loin d'un quart au
     // moins : pas sur un sol vu de biais) quand la proche est encore dans la portée des
     // rayons ; sinon la marche s'arrête à la proche, comme avant.
@@ -402,13 +560,17 @@ fn fs_vl(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<u32> {
     if (dh.vl_c.w & DL_DITHER) != 0u {
         dither = fract(dither + dh.misc.x * 0.61803398);
     }
-    let c = dyn_volumetric(cam, dir, cut, max_t, dither, mid, full);
+    // Lumières de la tuile du pixel ; dans la marge, celles qui la touchent (une tuile de
+    // plus, après celles de l'écran).
+    var tile = dh.counts.y * dh.counts.z * dh.counts.w;
+    if on_screen {
+        tile = dl_tile_base(clamp(mid, vec2<f32>(0.0), full - 1.0), full);
+    }
+    let c = dyn_volumetric(cam, dir, cut, max_t, dither, tile, !on_screen);
     // Chaque couche avec sa profondeur (demi-flottants) : la recomposition prend, pour chaque
     // pixel, celle qui est à sa distance.
-    return vec4<u32>(
-        pack2x16float(c.near.rg),
-        pack2x16float(vec2<f32>(c.near.b, dn)),
-        pack2x16float(c.far.rg),
-        pack2x16float(vec2<f32>(c.far.b, df)),
-    );
+    var o: VlOut;
+    o.placed = vl_pack(c.near, dn, c.far, df);
+    o.carried = vl_pack(c.near_d, dn, c.far_d, df);
+    return o;
 }

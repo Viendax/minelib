@@ -42,6 +42,9 @@ pub struct Store {
     /// Heure de chaque serveur (fichier `….times`) : (heure à l'instant `since` en
     /// secondes Unix, arrêtée). Elle avance comme dans Minecraft (24 h en 20 minutes).
     times: HashMap<String, (f32, u64, bool)>,
+    /// (v223) Point d'apparition de chaque serveur (fichier `….spawns`) : [x, y, z, lacet,
+    /// tangage], pour qui y arrive la première fois.
+    spawns: HashMap<String, [f32; 5]>,
 }
 
 /// Positions des joueurs écrites sur le disque au plus toutes les…
@@ -87,6 +90,11 @@ pub enum Action {
     /// Heure (OP) : `reason` = l'heure (0..24) ; l'arrêter ou la relancer (`reason` 1/0).
     TimeSet,
     TimeFix,
+    /// (v223) Téléporter (OP) : `target` = qui (vide : soi-même), `reason` = « x y z » ou
+    /// « @pseudo ». Rien à garder : la permission, et le relais envoie la position.
+    Teleport,
+    /// (v223) Point d'apparition du serveur (OP) : `reason` = « x y z lacet tangage ».
+    SetSpawn,
 }
 
 /// Le relais s'arrête : les dernières positions sont écrites.
@@ -118,6 +126,10 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let spawns = std::fs::read(path.with_extension("spawns"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Self {
             path,
             servers,
@@ -129,6 +141,7 @@ impl Store {
                 .checked_sub(POSITIONS_EVERY)
                 .unwrap_or_else(std::time::Instant::now),
             times,
+            spawns,
         }
     }
 
@@ -208,6 +221,11 @@ impl Store {
         self.defaults.get(server).cloned()
     }
 
+    /// (v223) Point d'apparition du serveur (`/setspawn`), s'il en a un.
+    pub fn spawn(&self, server: &str) -> Option<[f32; 5]> {
+        self.spawns.get(server).copied()
+    }
+
     fn wl_path(path: &std::path::Path) -> PathBuf {
         path.with_extension("whitelist")
     }
@@ -221,6 +239,9 @@ impl Store {
         }
         if let Ok(b) = postcard::to_allocvec(&self.defaults) {
             let _ = crate::accounts::write_atomic(&self.path.with_extension("defaults"), &b);
+        }
+        if let Ok(b) = postcard::to_allocvec(&self.spawns) {
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("spawns"), &b);
         }
     }
 
@@ -336,6 +357,32 @@ impl Store {
             Action::Rename => {
                 return Ok(format!("Serveur renommé : {}.", reason.trim()));
             }
+            Action::Teleport => {
+                return Ok(if target.is_empty() || target.eq_ignore_ascii_case(by) {
+                    "Téléporté.".into()
+                } else {
+                    format!("{target} est téléporté.")
+                });
+            }
+            Action::SetSpawn => {
+                let v: Vec<f32> = reason
+                    .split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                let [x, y, z, yaw, pitch] = v[..] else {
+                    return Err("Position illisible.".into());
+                };
+                let at = [x, y, z, yaw, pitch];
+                if !at.iter().all(|c| c.is_finite()) || y.abs() > 4096.0 {
+                    return Err("Position illisible.".into());
+                }
+                self.spawns.insert(server.to_string(), at);
+                self.save();
+                return Ok(format!(
+                    "Point d'apparition du serveur : {:.0} {:.0} {:.0} (pour qui arrive la première fois).",
+                    x, y, z
+                ));
+            }
             Action::Gamemode => {
                 return Ok(if target.is_empty() || target.eq_ignore_ascii_case(by) {
                     format!("Mode de jeu : {mode}.")
@@ -432,6 +479,8 @@ impl Store {
             | Action::Rename
             | Action::TimeSet
             | Action::TimeFix
+            | Action::Teleport
+            | Action::SetSpawn
             | Action::DefaultGamemode => unreachable!("traité plus haut"),
             Action::Ban if is_creator => return Err("On ne bannit pas le créateur.".into()),
             Action::Ban if by.eq_ignore_ascii_case(target) => {

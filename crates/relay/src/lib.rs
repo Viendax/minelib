@@ -6037,10 +6037,13 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 (r.server.clone(), r.creator.clone())
             };
             if action == proto::SERVER_GAMEMODE_QUERY {
-                // Arrivée : on reprend sa position sur ce serveur.
-                if let (Some(p), Some(c)) =
-                    (st.servers.position(&server, pseudo), st.conns.get(&id))
-                {
+                // Arrivée : on reprend sa position sur ce serveur ; (v223) la première fois,
+                // au point d'apparition du serveur s'il en a un (`/setspawn`).
+                let at = st
+                    .servers
+                    .position(&server, pseudo)
+                    .or_else(|| st.servers.spawn(&server));
+                if let (Some(p), Some(c)) = (at, st.conns.get(&id)) {
                     transport::push(
                         &c.tx,
                         &Response::BuildSpawn {
@@ -6088,6 +6091,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 proto::SERVER_RENAME => servers::Action::Rename,
                 proto::SERVER_TIMESET => servers::Action::TimeSet,
                 proto::SERVER_TIMEFIX => servers::Action::TimeFix,
+                proto::SERVER_TELEPORT => servers::Action::Teleport,
+                proto::SERVER_SETSPAWN => servers::Action::SetSpawn,
                 _ => servers::Action::List,
             };
             // Nouveau nom : vide ou trop long refusé avant de vérifier qu'on est OP.
@@ -6163,6 +6168,62 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                                 ))
                             }
                         }
+                    }
+                    // (v223) Téléportation : la position (donnée, ou celle du joueur visé)
+                    // part à celui qui part (soi-même sans pseudo), qui s'y place.
+                    if act == servers::Action::Teleport {
+                        let who = if target.is_empty() {
+                            pseudo
+                        } else {
+                            target.as_str()
+                        };
+                        let to = match reason.trim().strip_prefix('@') {
+                            Some(other) => st.servers.position(&server, other.trim()),
+                            None => {
+                                let v: Vec<f32> = reason
+                                    .split_whitespace()
+                                    .filter_map(|t| t.parse().ok())
+                                    .filter(|c: &f32| c.is_finite())
+                                    .collect();
+                                // (Son regard reste le sien : le dernier connu ici.)
+                                let look = st
+                                    .servers
+                                    .position(&server, who)
+                                    .map_or((0.0, 0.0), |p| (p[3], p[4]));
+                                match v[..] {
+                                    [x, y, z] if y.abs() <= 4096.0 => {
+                                        Some([x, y, z, look.0, look.1])
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        };
+                        let Some(to) = to else {
+                            return Some(err(
+                                ErrorCode::Refused,
+                                "Position inconnue (joueur jamais venu sur ce serveur, ou coordonnées illisibles).",
+                            ));
+                        };
+                        let conn = st.conns.values().find(|c| {
+                            c.room == Some(rid)
+                                && c.pseudo
+                                    .as_deref()
+                                    .is_some_and(|p| p.eq_ignore_ascii_case(who))
+                        });
+                        let Some(c) = conn else {
+                            return Some(err(
+                                ErrorCode::Refused,
+                                format!("{who} n'est pas sur ce serveur."),
+                            ));
+                        };
+                        transport::push(
+                            &c.tx,
+                            &Response::BuildSpawn {
+                                pos: [to[0], to[1], to[2]],
+                                yaw: to[3],
+                                pitch: to[4],
+                            },
+                        );
                     }
                     if act == servers::Action::Kill {
                         let target_conn = st.conns.iter().find(|(_, c)| {

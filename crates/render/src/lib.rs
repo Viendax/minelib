@@ -708,6 +708,8 @@ struct ChunkGpu {
     max: Vec3,
     /// (v190) Miroirs du chunk (voir `MirrorRect`, `planar`).
     mirrors: Vec<minelib_world::mesh::MirrorRect>,
+    /// (v223) Ses faces de métal (miroirs de près : voir `planar::METAL_RANGE`).
+    metals: Vec<minelib_world::mesh::MirrorRect>,
 }
 
 /// Commandes de dessin indirect d'un chunk (faces tournées vers la caméra, tranches
@@ -1673,6 +1675,7 @@ impl Renderer {
                 min,
                 max,
                 mirrors: mesh.mirrors.clone(),
+                metals: mesh.metals.clone(),
             },
         );
     }
@@ -2798,18 +2801,23 @@ impl Renderer {
             // (v190) Seulement les miroirs des tranches qu'on peut voir (pas ceux de la
             // surface depuis une grotte fermée).
             let vis = &self.vis;
-            let rects = self
-                .draw_list
-                .iter()
-                .filter_map(|(_, k)| self.meshes.get(k).map(|c| (k, c)))
-                .flat_map(|(k, c)| {
-                    let MeshKey::Chunk(p) = k;
-                    let mask = vis.get(p).copied().unwrap_or(occlusion::ALL);
-                    c.mirrors
-                        .iter()
-                        .filter(move |r| planar::in_sections(r, mask))
-                });
-            planar::candidates(rects, eye, &frustum, planar::RANGE)
+            let visible = |metal: bool| {
+                self.draw_list
+                    .iter()
+                    .filter_map(|(_, k)| self.meshes.get(k).map(|c| (k, c)))
+                    .flat_map(move |(k, c)| {
+                        let MeshKey::Chunk(p) = k;
+                        let mask = vis.get(p).copied().unwrap_or(occlusion::ALL);
+                        if metal { &c.metals } else { &c.mirrors }
+                            .iter()
+                            .filter(move |r| planar::in_sections(r, mask))
+                    })
+            };
+            let mut roots = planar::candidates(visible(false), eye, &frustum, planar::RANGE);
+            // (v223) Les faces de métal tout près de la caméra : des miroirs aussi.
+            let metals = planar::candidates(visible(true), eye, &frustum, planar::METAL_RANGE);
+            planar::merge(&mut roots, metals);
+            roots
         };
         if roots.is_empty() {
             return;
@@ -3856,6 +3864,7 @@ impl Renderer {
                 let timer = self.gpu_timer.as_ref();
                 self.dyn_gpu.encode_volumetric(
                     &self.device,
+                    &self.queue,
                     &mut encoder,
                     &wg,
                     &t.depth_views,

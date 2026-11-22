@@ -1809,7 +1809,8 @@ fn build() -> Registry {
         }
     }
     for (key, v) in [
-        // Métaux : reflet court (4 blocs), teinté par la couleur du métal (voir world.wgsl).
+        // Métaux : (v223) un miroir de près (2 blocs), teinté par la couleur du métal (voir
+        // world.wgsl, `METAL_FADE`, et planar.rs, `METAL_RANGE`).
         ("iron_block", 3u8),
         ("gold_block", 3),
         ("diamond_block", 3),

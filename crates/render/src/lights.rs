@@ -53,6 +53,65 @@ const NOISE_SIZE: u32 = 32;
 /// plus proche et jusqu'à la plus lointaine des pixels couverts), chacune trois demi-flottants
 /// de lumière et un de profondeur.
 const VL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
+/// (v223) Rayons repris d'une image à l'autre (voir `fs_temporal`) : marge préparée autour de
+/// l'écran, de chaque côté (part de l'image des rayons) ; ce que l'image de la marche y
+/// trouve sans l'image du monde est cherché dans la grille de blocs.
+const VL_MARGIN: f32 = 0.06;
+/// La marge des tuiles de la marge (un peu plus large que `VL_MARGIN` : arrondis).
+const VL_MARGIN_BIN: f32 = 0.09;
+/// Part de la nouvelle image quand l'historique est bon (le reste : l'historique).
+const VL_NEW: f32 = 0.12;
+/// Caméra qui saute plus loin que ça d'une image à l'autre (téléportation) : historique oublié.
+const VL_JUMP: f32 = 8.0;
+
+/// (v223) Image des rayons effacée puis écrite par une passe.
+fn vl_attach(view: &wgpu::TextureView) -> Option<wgpu::RenderPassColorAttachment<'_>> {
+    Some(wgpu::RenderPassColorAttachment {
+        view,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            store: wgpu::StoreOp::Store,
+        },
+    })
+}
+
+/// (v223) `VlFrame` des shaders des rayons (volumetric.wgsl, vl_composite.wgsl).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Default)]
+struct VlFrameGpu {
+    cur_rel: [[f32; 4]; 4],
+    prev_rel: [[f32; 4]; 4],
+    delta: [f32; 4],
+    margin: [f32; 4],
+    size: [f32; 4],
+    jitter: [f32; 4],
+}
+
+/// (v223) Décalage de l'échantillon de la marche dans son carré, image `n` (suite de Halton
+/// en base 2 et 3, huit positions) : de −0,5 à 0,5.
+fn vl_jitter(n: u64) -> (f32, f32) {
+    let halton = |mut i: u64, b: u64| {
+        let (mut f, mut r) = (1.0f32, 0.0f32);
+        while i > 0 {
+            f /= b as f32;
+            r += f * (i % b) as f32;
+            i /= b;
+        }
+        r
+    };
+    let i = n % 8 + 1;
+    (halton(i, 2) - 0.5, halton(i, 3) - 0.5)
+}
+
+/// (v223) Marge de l'image des rayons (pixels de cette image) pour un écran de `on` pixels
+/// des rayons : de chaque côté.
+fn vl_margin(on: (u32, u32)) -> (u32, u32) {
+    (
+        (on.0 as f32 * VL_MARGIN).ceil() as u32,
+        (on.1 as f32 * VL_MARGIN).ceil() as u32,
+    )
+}
 const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// (v220) Atlas des ombres des joueurs (voir `EntJob`) : au plus ce côté (pixels). En
 /// qualité Haute et Ultra, la moitié de l'atlas des blocs (mêmes cases, en proportion).
@@ -490,10 +549,26 @@ pub fn screen_rect(view_proj: Mat4, eye: Vec3, center: Vec3, radius: f32) -> Opt
 }
 
 /// Range chaque lumière dans les tuiles de l'écran qu'elle peut toucher (bit `i` du masque).
+/// (v223) Une tuile de plus, après celles de l'écran : les lumières posées qui ont des rayons
+/// et touchent la marge préparée autour de l'écran (voir `VL_MARGIN`).
 pub fn bin_tiles(lights: &[DynLight], view_proj: Mat4, eye: Vec3, tiles: &mut [u32]) {
     tiles.fill(0);
+    let wide = Mat4::from_scale(Vec3::new(
+        1.0 / (1.0 + 2.0 * VL_MARGIN_BIN),
+        1.0 / (1.0 + 2.0 * VL_MARGIN_BIN),
+        1.0,
+    )) * view_proj;
+    let margin = (TILES_X * TILES_Y * WORDS) as usize;
     for (i, l) in lights.iter().enumerate().take(MAX_DYN_LIGHTS) {
         let (c, r) = bounding_sphere(l);
+        let (word, bit) = (i / 32, 1u32 << (i % 32));
+        if l.owner == 0
+            && l.beam > 0.0
+            && tiles.len() > margin + word
+            && screen_rect(wide, eye, c, r).is_some()
+        {
+            tiles[margin + word] |= bit;
+        }
         let Some([u0, v0, u1, v1]) = screen_rect(view_proj, eye, c, r) else {
             continue;
         };
@@ -501,10 +576,9 @@ pub fn bin_tiles(lights: &[DynLight], view_proj: Mat4, eye: Vec3, tiles: &mut [u
         let tx1 = ((u1 * TILES_X as f32).floor() as u32).min(TILES_X - 1);
         let ty0 = ((v0 * TILES_Y as f32).floor() as u32).min(TILES_Y - 1);
         let ty1 = ((v1 * TILES_Y as f32).floor() as u32).min(TILES_Y - 1);
-        let (word, bit) = (i as u32 / 32, 1u32 << (i % 32));
         for ty in ty0..=ty1 {
             for tx in tx0..=tx1 {
-                tiles[((ty * TILES_X + tx) * WORDS + word) as usize] |= bit;
+                tiles[((ty * TILES_X + tx) * WORDS) as usize + word] |= bit;
             }
         }
     }
@@ -1069,16 +1143,23 @@ fn resample_gobo(img: &GoboImage) -> Vec<u8> {
     out
 }
 
-/// Images de la lumière volumétrique (taille du monde dessiné / 2) et leurs liaisons.
+/// Images de la lumière volumétrique (taille du monde dessiné / 2 ou / 4, (v223) plus la
+/// marge de chaque côté) et leurs liaisons.
 struct VlTargets {
     key: (u32, u32, u64),
-    view: wgpu::TextureView,
-    /// (v215) L'image de la marche lissée (`fs_smooth`), lue par la recomposition.
-    smooth_view: wgpu::TextureView,
-    /// Groupes de la passe volumétrique, du lissage et de la recomposition, selon la
-    /// profondeur lue.
+    /// Marge de chaque côté de l'écran (pixels des rayons).
+    margin: (u32, u32),
+    /// (v223) La marche : lumières posées et portées.
+    fixed_view: wgpu::TextureView,
+    carried_view: wgpu::TextureView,
+    /// (v223) Historique des lumières posées (une image sur deux chacun) et image reprise
+    /// que lit la recomposition.
+    hist_views: [wgpu::TextureView; 2],
+    combined_view: wgpu::TextureView,
+    /// Groupes de la marche et de la recomposition, selon la profondeur lue ; de la reprise,
+    /// selon l'historique écrit puis la profondeur.
     vl_groups: [wgpu::BindGroup; 2],
-    smooth_groups: [wgpu::BindGroup; 2],
+    temporal_groups: [[wgpu::BindGroup; 2]; 2],
     comp_groups: [wgpu::BindGroup; 2],
 }
 
@@ -1086,8 +1167,12 @@ pub(crate) struct VlPipes {
     march: wgpu::RenderPipeline,
     /// La même marche sans le code du bruit (bruit décoché, le cas habituel).
     march_plain: wgpu::RenderPipeline,
-    /// (v215) Lissage de l'image de la marche (voir `fs_smooth`).
-    smooth: wgpu::RenderPipeline,
+    /// (v223) La marche de la marge autour de l'écran (voir `VL_MARGIN`).
+    margin: wgpu::RenderPipeline,
+    margin_plain: wgpu::RenderPipeline,
+    /// (v223) Reprise d'une image à l'autre et lissage (voir `fs_temporal` ; remplace le
+    /// lissage seul de la v215).
+    temporal: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
 }
 
@@ -1240,6 +1325,17 @@ pub(crate) struct DynGpu {
     noise_view: wgpu::TextureView,
     noise_sampler: wgpu::Sampler,
     vl_targets: Option<VlTargets>,
+    /// (v223) Rayons repris d'une image à l'autre : `VlFrameGpu` de l'image, caméra de cette
+    /// image et de la précédente (vue-projection comptée depuis la caméra, position),
+    /// empreinte des lumières posées à rayons (changée : historique oublié), image où les
+    /// rayons ont été faits la dernière fois, des lumières posées touchent la marge.
+    vl_frame_buf: wgpu::Buffer,
+    vl_cur: Option<(Mat4, Vec3)>,
+    vl_prev: Option<(Mat4, Vec3)>,
+    vl_sig: u64,
+    vl_sig_changed: bool,
+    vl_last: u64,
+    vl_margin_lights: bool,
     // Éclairage différé.
     pub(crate) def_bgl: wgpu::BindGroupLayout,
     /// Celles de `fs_interp` : les mêmes, plus la lumière d'un pixel sur quatre.
@@ -1721,31 +1817,48 @@ pub(crate) fn light_pipes(
                 })
             })
         });
+        // (v223) Deux images : lumières posées et lumières portées ; l'écran (`vs_tiles`)
+        // et la marge (`vs_margin`), avec ou sans le code du bruit.
         let march = sc.spawn(|| {
             timed("rayons volumétriques", || {
-                fullscreen_pipeline(
-                    device,
-                    "volumétrique",
-                    &layout,
-                    &shader,
-                    "vs_tiles",
-                    "fs_vl",
-                    VL_FORMAT,
-                    None,
-                )
+                pair_pipeline(device, "volumétrique", &layout, &shader, "vs_tiles", "fs_vl", &[])
             })
         });
         let march_plain = sc.spawn(|| {
             timed("rayons volumétriques (sans bruit)", || {
-                fullscreen_variant(
+                pair_pipeline(
                     device,
                     "volumétrique (sans bruit)",
                     &layout,
                     &shader,
                     "vs_tiles",
                     "fs_vl",
-                    VL_FORMAT,
-                    None,
+                    &[("VL_NOISE", 0.0)],
+                )
+            })
+        });
+        let margin = sc.spawn(|| {
+            timed("rayons volumétriques (marge)", || {
+                pair_pipeline(
+                    device,
+                    "volumétrique : marge",
+                    &layout,
+                    &shader,
+                    "vs_margin",
+                    "fs_vl",
+                    &[],
+                )
+            })
+        });
+        let margin_plain = sc.spawn(|| {
+            timed("rayons volumétriques (marge, sans bruit)", || {
+                pair_pipeline(
+                    device,
+                    "volumétrique : marge (sans bruit)",
+                    &layout,
+                    &shader,
+                    "vs_margin",
+                    "fs_vl",
                     &[("VL_NOISE", 0.0)],
                 )
             })
@@ -1764,17 +1877,16 @@ pub(crate) fn light_pipes(
                 )
             })
         });
-        let smooth = sc.spawn(|| {
-            timed("lissage des rayons", || {
-                fullscreen_pipeline(
+        let temporal = sc.spawn(|| {
+            timed("reprise des rayons", || {
+                pair_pipeline(
                     device,
-                    "volumétrique : lissage",
+                    "volumétrique : reprise",
                     &comp_layout,
                     &comp_shader,
                     "vs_full",
-                    "fs_smooth",
-                    VL_FORMAT,
-                    None,
+                    "fs_temporal",
+                    &[],
                 )
             })
         });
@@ -1785,7 +1897,11 @@ pub(crate) fn light_pipes(
                 march_plain: march_plain
                     .join()
                     .expect("pipeline volumétrique (sans bruit)"),
-                smooth: smooth.join().expect("pipeline de lissage des rayons"),
+                margin: margin.join().expect("pipeline volumétrique (marge)"),
+                margin_plain: margin_plain
+                    .join()
+                    .expect("pipeline volumétrique (marge, sans bruit)"),
+                temporal: temporal.join().expect("pipeline de reprise des rayons"),
                 composite: composite.join().expect("pipeline de recomposition"),
             },
             DeferredPipes {
@@ -1841,6 +1957,47 @@ fn fullscreen_variant(
     stencil_variant(
         device, label, layout, shader, vs, fs, format, blend, constants, None,
     )
+}
+
+/// (v223) Passe à deux images des rayons (`VL_FORMAT`), écrites en entier, sans mélange.
+fn pair_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    vs: &str,
+    fs: &str,
+    constants: &[(&str, f64)],
+) -> wgpu::RenderPipeline {
+    let target = Some(wgpu::ColorTargetState {
+        format: VL_FORMAT,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(vs),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
+            targets: &[target.clone(), target],
+        }),
+        multiview: None,
+        cache: None,
+    })
 }
 
 /// Canaux écrits : l'image du monde garde son alpha (on y ajoute la lumière) ; les images à
@@ -1951,10 +2108,16 @@ impl DynGpu {
             (MAX_DYN_LIGHTS * std::mem::size_of::<GpuLight>()) as u64,
             wgpu::BufferUsages::STORAGE,
         );
+        // (v223) Une tuile de plus : la marge des rayons (voir `bin_tiles`).
         let tiles_buf = buf(
             "lumières : tuiles",
-            (TILES_X * TILES_Y * WORDS * 4) as u64,
+            ((TILES_X * TILES_Y + 1) * WORDS * 4) as u64,
             wgpu::BufferUsages::STORAGE,
+        );
+        let vl_frame_buf = buf(
+            "volumétrique : image précédente",
+            std::mem::size_of::<VlFrameGpu>() as u64,
+            wgpu::BufferUsages::UNIFORM,
         );
         let rects_buf = buf(
             "lumières : cases éclairées",
@@ -2108,6 +2271,17 @@ impl DynGpu {
                     },
                     count: None,
                 },
+                // (v223) Image des rayons d'une image à l'autre (`VlFrame`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let comp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2129,6 +2303,27 @@ impl DynGpu {
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // (v223) Reprise : marche des lumières portées, historique, `VlFrame`.
+                tex_entry(
+                    3,
+                    wgpu::TextureSampleType::Uint,
+                    wgpu::TextureViewDimension::D2,
+                ),
+                tex_entry(
+                    4,
+                    wgpu::TextureSampleType::Uint,
+                    wgpu::TextureViewDimension::D2,
+                ),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -2271,6 +2466,13 @@ impl DynGpu {
             noise_view,
             noise_sampler,
             vl_targets: None,
+            vl_frame_buf,
+            vl_cur: None,
+            vl_prev: None,
+            vl_sig: 0,
+            vl_sig_changed: true,
+            vl_last: 0,
+            vl_margin_lights: false,
             def_bgl,
             interp_bgl,
             def_targets: None,
@@ -2291,7 +2493,7 @@ impl DynGpu {
             half_now: false,
             half_trial: HalfTrial::default(),
             gpu_lights: Vec::new(),
-            tiles: vec![0; (TILES_X * TILES_Y * WORDS) as usize],
+            tiles: vec![0; ((TILES_X * TILES_Y + 1) * WORDS) as usize],
             ent_atlas: None,
             ent_size: 0,
             ent_jobs: Vec::new(),
@@ -2599,6 +2801,9 @@ impl DynGpu {
         let budget = st.bake_budget.max(1) as usize;
         self.jobs.clear();
         let per = (self.atlas_size / self.tile_size.max(1)).max(1);
+        // (v223) Carte refaite d'une lumière posée qui a des rayons : ses ombres dans les rayons
+        // changent, l'image des rayons d'avant ne vaut plus (voir `vl_sig_changed`).
+        let mut rebaked_beam = false;
         for (list, limit) in [(&carried, usize::MAX), (&first, budget * 4), (&again, budget)] {
             let mut used = 0usize;
             for &i in list.iter() {
@@ -2649,6 +2854,7 @@ impl DynGpu {
                 s.baked = true;
                 s.baked_key = Some(s.key);
                 s.dirty = false;
+                rebaked_beam |= l.owner == 0 && l.beam > 0.0;
             }
         }
         // 3. Lumières pour le shader : case d'ombre seulement si la carte est prête (ou
@@ -2759,6 +2965,25 @@ impl DynGpu {
         }
         bin_tiles(&self.lights, view_proj, eye, &mut self.tiles);
         lit_rects(&self.tiles, &mut self.rects);
+        // (v223) Rayons repris d'une image à l'autre : la caméra de cette image, et l'empreinte
+        // des lumières posées à rayons (une lumière ajoutée, retirée, déplacée, changée, ou dont
+        // la carte d'ombre est refaite : l'image d'avant ne vaut plus, elle est oubliée).
+        self.vl_cur = Some((crate::eye_relative(view_proj), eye));
+        let mut sig = std::collections::hash_map::DefaultHasher::new();
+        for (l, g) in self.lights.iter().zip(&self.gpu_lights) {
+            if l.owner == 0 && l.beam > 0.0 {
+                // (Sans les joueurs qui lui font de l'ombre : les rayons ne les voient pas.)
+                let mut g = *g;
+                g.boxes = [0; 4];
+                g.box_sphere = [0.0; 4];
+                std::hash::Hash::hash(bytemuck::bytes_of(&g), &mut sig);
+            }
+        }
+        let sig = std::hash::Hasher::finish(&sig);
+        self.vl_sig_changed = sig != self.vl_sig || rebaked_beam;
+        self.vl_sig = sig;
+        let m = (TILES_X * TILES_Y * WORDS) as usize;
+        self.vl_margin_lights = self.tiles[m..m + WORDS as usize].iter().any(|w| *w != 0);
         // 4. En-tête.
         let vl_on = st.volumetric
             && st.vl_intensity > 0.0
@@ -3352,6 +3577,7 @@ impl DynGpu {
     pub fn encode_volumetric(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         world_group: &wgpu::BindGroup,
         depths: &[wgpu::TextureView; 2],
@@ -3369,16 +3595,19 @@ impl DynGpu {
         // `encode_deferred`).
         let ts = |pass: u32| timer.and_then(|t| t.pass(pass));
         let k = self.settings.vl_scale.clamp(2, 4);
-        let half = (size.0.div_ceil(k), size.1.div_ceil(k));
-        let key = (half.0, half.1, generation);
-        if self.vl_targets.as_ref().is_none_or(|t| t.key != key) {
+        let on = (size.0.div_ceil(k), size.1.div_ceil(k));
+        let margin = vl_margin(on);
+        let ext = (on.0 + 2 * margin.0, on.1 + 2 * margin.1);
+        let key = (on.0, on.1, generation);
+        let fresh_targets = self.vl_targets.as_ref().is_none_or(|t| t.key != key);
+        if fresh_targets {
             let image = |label: &str| {
                 device
                     .create_texture(&wgpu::TextureDescriptor {
                         label: Some(label),
                         size: wgpu::Extent3d {
-                            width: half.0.max(1),
-                            height: half.1.max(1),
+                            width: ext.0.max(1),
+                            height: ext.1.max(1),
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: 1,
@@ -3391,10 +3620,19 @@ impl DynGpu {
                     })
                     .create_view(&Default::default())
             };
-            let view = image("volumétrique");
-            let smooth_view = image("volumétrique lissé");
-            // (v215) Lissage puis recomposition : chacun lit l'image de la passe d'avant.
-            let comp_group = |i: usize, src: &wgpu::TextureView, label: &str| {
+            let fixed_view = image("volumétrique : lumières posées");
+            let carried_view = image("volumétrique : lumières portées");
+            let hist_views = [
+                image("volumétrique : historique 0"),
+                image("volumétrique : historique 1"),
+            ];
+            let combined_view = image("volumétrique : reprise");
+            // Reprise puis recomposition : chacune lit les images de la passe d'avant.
+            let comp_group = |i: usize,
+                              src: &wgpu::TextureView,
+                              carried: &wgpu::TextureView,
+                              hist: &wgpu::TextureView,
+                              label: &str| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some(label),
                     layout: &self.comp_bgl,
@@ -3411,13 +3649,41 @@ impl DynGpu {
                             binding: 2,
                             resource: self.rects_buf.as_entire_binding(),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(carried),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(hist),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: self.vl_frame_buf.as_entire_binding(),
+                        },
                     ],
                 })
             };
-            let smooth_groups =
-                std::array::from_fn(|i| comp_group(i, &view, "volumétrique : lissage"));
+            // Historique écrit `w` : lu, celui de l'autre image.
+            let temporal_groups = std::array::from_fn(|w| {
+                std::array::from_fn(|i| {
+                    comp_group(
+                        i,
+                        &fixed_view,
+                        &carried_view,
+                        &hist_views[1 - w],
+                        "volumétrique : reprise",
+                    )
+                })
+            });
             let comp_groups = std::array::from_fn(|i| {
-                comp_group(i, &smooth_view, "volumétrique : recomposition")
+                comp_group(
+                    i,
+                    &combined_view,
+                    &carried_view,
+                    &fixed_view,
+                    "volumétrique : recomposition",
+                )
             });
             let vl_groups = std::array::from_fn(|i| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3440,32 +3706,71 @@ impl DynGpu {
                             binding: 3,
                             resource: self.rects_buf.as_entire_binding(),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.vl_frame_buf.as_entire_binding(),
+                        },
                     ],
                 })
             });
             self.vl_targets = Some(VlTargets {
                 key,
-                view,
-                smooth_view,
+                margin,
+                fixed_view,
+                carried_view,
+                hist_views,
+                combined_view,
                 vl_groups,
-                smooth_groups,
+                temporal_groups,
                 comp_groups,
             });
         }
+        // (v223) L'image d'avant vaut-elle encore ? Pas si les images viennent d'être
+        // recréées, si les rayons n'ont pas été faits à l'image d'avant, si une lumière posée
+        // à rayons a changé, ou si la caméra a sauté.
+        let (cur_rel, eye) = self.vl_cur.unwrap_or((Mat4::IDENTITY, Vec3::ZERO));
+        let (prev_rel, prev_eye) = self.vl_prev.unwrap_or((cur_rel, eye));
+        let delta = eye - prev_eye;
+        let valid = !fresh_targets
+            && self.vl_last + 1 == self.frame
+            && self.vl_prev.is_some()
+            && !self.vl_sig_changed
+            && delta.length() < VL_JUMP;
+        self.vl_last = self.frame;
+        self.vl_prev = self.vl_cur;
+        // La marge, une image sur deux (et toujours quand l'historique repart de zéro).
+        let margin_now = self.vl_margin_lights && (!valid || self.frame % 2 == 0);
+        let (jx, jy) = vl_jitter(self.frame);
+        let frame = VlFrameGpu {
+            cur_rel: cur_rel.to_cols_array_2d(),
+            prev_rel: prev_rel.to_cols_array_2d(),
+            delta: [delta.x, delta.y, delta.z, if valid { 1.0 } else { 0.0 }],
+            margin: [
+                margin.0 as f32,
+                margin.1 as f32,
+                k as f32,
+                if margin_now { 1.0 } else { 0.0 },
+            ],
+            size: [size.0 as f32, size.1 as f32, ext.0 as f32, ext.1 as f32],
+            // (En se déplaçant vite, la nouvelle image compte un peu plus : les rayons vus
+            // d'ailleurs changent, l'image d'avant traînerait.)
+            jitter: [
+                jx * k as f32,
+                jy * k as f32,
+                (VL_NEW + delta.length() * 0.5).min(0.5),
+                (self.settings.vl_steps / 2).max(8) as f32,
+            ],
+        };
+        queue.write_buffer(&self.vl_frame_buf, 0, bytemuck::bytes_of(&frame));
         let Some(t) = &self.vl_targets else {
             return;
         };
+        let write = (self.frame % 2) as usize;
+        let attach = vl_attach;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("lumière volumétrique"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &[attach(&t.fixed_view), attach(&t.carried_view)],
                 depth_stencil_attachment: None,
                 timestamp_writes: ts(crate::gpu_timer::VOLUMETRIC),
                 occlusion_query_set: None,
@@ -3478,26 +3783,28 @@ impl DynGpu {
             pass.set_bind_group(0, world_group, &[]);
             pass.set_bind_group(1, &t.vl_groups[depth_index], &[]);
             pass.draw(0..6, 0..self.rects.len() as u32);
+            // (v223) La marge autour de l'écran : ce qui va y entrer en tournant.
+            if margin_now && t.margin.0 + t.margin.1 > 0 {
+                pass.set_pipeline(if self.vl_noise {
+                    &pipes.margin
+                } else {
+                    &pipes.margin_plain
+                });
+                pass.draw(0..6, 0..4);
+            }
         }
-        // (v215) Lissage : toute l'image réduite (hors des cases éclairées, des zéros qui le
-        // restent), un triangle.
+        // (v223) Reprise d'une image à l'autre (lumières posées), lissage (portées) : toute
+        // l'image des rayons, un triangle.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("lumière volumétrique : lissage"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.smooth_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                label: Some("lumière volumétrique : reprise"),
+                color_attachments: &[attach(&t.hist_views[write]), attach(&t.combined_view)],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&pipes.smooth);
-            pass.set_bind_group(0, &t.smooth_groups[depth_index], &[]);
+            pass.set_pipeline(&pipes.temporal);
+            pass.set_bind_group(0, &t.temporal_groups[write][depth_index], &[]);
             pass.draw(0..3, 0..1);
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3614,6 +3921,45 @@ mod tests {
         assert!(r.is_finite() && u.is_finite() && r.length() > 0.99);
     }
 
+    /// (v223) Les rayons repris d'une image à l'autre : l'échantillon de la marche visite tout
+    /// son carré en huit images (moyenne au centre), et la marge autour de l'écran reçoit les
+    /// lumières posées à rayons qui la touchent, pas les lumières portées.
+    #[test]
+    fn the_rays_prepare_a_margin_around_the_screen() {
+        let pts: Vec<(f32, f32)> = (0..8).map(vl_jitter).collect();
+        let sum = pts.iter().fold((0.0, 0.0), |a, p| (a.0 + p.0, a.1 + p.1));
+        let mean = (sum.0 / 8.0, sum.1 / 8.0);
+        assert!(mean.0.abs() < 0.07 && mean.1.abs() < 0.07, "{mean:?}");
+        assert!(pts.iter().all(|p| p.0.abs() <= 0.5 && p.1.abs() <= 0.5));
+        for q in [0.0f32, 0.5] {
+            assert!(pts.iter().any(|p| (p.0.abs() <= 0.25) == (q == 0.0)));
+        }
+        assert_eq!(vl_margin((400, 225)), (24, 14));
+        // Une caméra vers −z ; un projecteur à rayons juste à droite du champ (dans la
+        // marge), un autre porté au même endroit, un troisième derrière la caméra.
+        let proj = Mat4::perspective_infinite_reverse_rh(75f32.to_radians(), 16.0 / 9.0, 0.05);
+        let eye = Vec3::new(0.0, 64.0, 0.0);
+        let vp = proj * Mat4::look_to_rh(eye, Vec3::NEG_Z, Vec3::Y);
+        let mut side = spot(1, [0.0, 64.0, 0.0], [0.0, -1.0, 0.0], 3.0, 30.0);
+        let half_h = (75f32.to_radians() * 0.5).tan() * 16.0 / 9.0;
+        // Hors de l'écran, juste au-delà de son bord droit (dans la marge), à 30 blocs.
+        side.pos = [30.0 * half_h * 1.08 + 1.5, 64.0, -30.0];
+        side.beam = 1.0;
+        let mut held = side;
+        held.id = 2;
+        held.owner = 1;
+        let mut behind = side;
+        behind.id = 3;
+        behind.pos = [0.0, 64.0, 40.0];
+        let lights = [side, held, behind];
+        let mut tiles = vec![0u32; ((TILES_X * TILES_Y + 1) * WORDS) as usize];
+        bin_tiles(&lights, vp, eye, &mut tiles);
+        let m = (TILES_X * TILES_Y * WORDS) as usize;
+        assert_eq!(tiles[m] & 0b111, 0b001, "{:b}", tiles[m]);
+        let on_screen: u32 = tiles[..m].iter().fold(0, |a, w| a | w);
+        assert_eq!(on_screen & 1, 0, "hors de l'écran");
+    }
+
     #[test]
     fn gpu_layouts_match_the_shader() {
         use wgpu::naga;
@@ -3629,6 +3975,19 @@ mod tests {
         };
         assert_eq!(size("DynLight"), std::mem::size_of::<GpuLight>());
         assert_eq!(size("DynHeader"), std::mem::size_of::<GpuHeader>());
+        // (v223) L'image des rayons d'une image à l'autre, dans les deux shaders.
+        assert_eq!(size("VlFrame"), std::mem::size_of::<VlFrameGpu>());
+        let comp = naga::front::wgsl::parse_str(include_str!("shaders/vl_composite.wgsl"))
+            .expect("WGSL de la recomposition");
+        let vf = comp
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("VlFrame"))
+            .unwrap();
+        assert_eq!(
+            vf.1.inner.size(comp.to_ctx()) as usize,
+            std::mem::size_of::<VlFrameGpu>()
+        );
         let bake = naga::front::wgsl::parse_str(include_str!("shaders/shadow_bake.wgsl")).unwrap();
         let job = bake
             .types

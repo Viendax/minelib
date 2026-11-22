@@ -147,6 +147,9 @@ pub struct MeshData {
     /// (v190) Miroirs du chunk : faces de miroir dessinées, un rectangle par miroir d'un
     /// seul tenant (voir `MirrorRect`).
     pub mirrors: Vec<MirrorRect>,
+    /// (v223) Faces de métal (fer, or, diamant) : un rectangle par surface d'un seul tenant,
+    /// comme les miroirs. Le rendu en fait un miroir, de près seulement (voir planar.rs).
+    pub metals: Vec<MirrorRect>,
 }
 
 /// (v190) Un miroir d'un chunk : faces de miroir d'un même plan qui se touchent. Axe (0 x,
@@ -2085,6 +2088,10 @@ fn mesh_block(
                     // (v190) Face de miroir parfait : son plan, pour le rendu en miroir.
                     if def.reflect >= 15 && !def.metal && !def.translucent {
                         MirrorRect::add(&mut out.mirrors, [ox + x, y, oz + z], n);
+                    }
+                    // (v223) Face de métal : un miroir aussi, vu de près.
+                    if def.metal && !def.translucent {
+                        MirrorRect::add(&mut out.metals, [ox + x, y, oz + z], n);
                     }
                 }
             }
