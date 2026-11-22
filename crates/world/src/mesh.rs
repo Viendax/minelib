@@ -1395,6 +1395,12 @@ pub fn mesh_chunk(world: &World, pos: ChunkPos) -> MeshData {
 
 /// Maille le chunk central d'un voisinage (utilisable depuis un thread de travail).
 pub fn mesh_neighborhood(n: &Neighborhood) -> MeshData {
+    mesh_neighborhood_with(n, MERGE_FACES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Le même ; `merge` : fusionner les faces voisines que rien ne distingue (voir
+/// `merge_flat_faces`).
+pub fn mesh_neighborhood_with(n: &Neighborhood, merge: bool) -> MeshData {
     let mut out = MeshData::default();
     let pos = n.center;
     let Some(chunk) = n.get(0, 0) else {
@@ -1463,8 +1469,201 @@ pub fn mesh_neighborhood(n: &Neighborhood) -> MeshData {
             .collect();
     }
     out.connectivity = Some(section_connectivity(chunk));
+    if merge {
+        merge_flat_faces(&mut out);
+    }
     out.sort_by_face();
     out
+}
+
+/// (v230) Fusion des faces (voir `merge_flat_faces`) : coupée pour les essais
+/// (`MINELIB_FUSION=0`, comparaison d'images et de nombres de triangles).
+pub static MERGE_FACES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// (v230) Fusionne les faces de blocs pleins qui se touchent dans un même plan et que rien
+/// ne distingue : même direction, même texture, même lumière et même ombrage aux quatre
+/// coins de chacune (`data` et `tex` identiques pour tous leurs sommets). Un sol plat, un
+/// mur uni, le dessus d'une marche deviennent un seul rectangle (deux triangles) au lieu de
+/// deux triangles par bloc : le rendu de la scène coûte surtout par triangle.
+///
+/// L'image ne change pas : la texture se tire de la position dans le monde (elle se répète
+/// d'elle-même sur un grand rectangle), la lumière est la même partout sur ces faces, et la
+/// normale vient de la direction de la face. Ne sont jamais fusionnées : les faces dont un
+/// coin diffère (lumière qui varie, ombrage d'un bloc voisin), celles à texture propre au
+/// sommet ou vues des deux côtés, les modèles (dalles, torches, portes…), les blocs qui
+/// reflètent et les translucides (listes à part). Un rectangle ne traverse jamais une limite
+/// de tranche de 16 blocs de haut : le rendu choisit les tranches à dessiner une à une.
+pub fn merge_flat_faces(out: &mut MeshData) {
+    use std::collections::{HashMap, HashSet};
+    /// Rectangles fusionnables d'un même plan : direction, coordonnée du plan, données et
+    /// texture des sommets, et place de chaque sommet dans le carré (coin bas ou haut sur
+    /// chacun des deux axes du plan, dans l'ordre des quatre sommets).
+    #[derive(PartialEq, Eq, Hash, Clone, Copy)]
+    struct Key {
+        face: u8,
+        plane: i32,
+        data: u32,
+        tex: u32,
+        corners: [(bool, bool); 4],
+    }
+    let whole = |v: f32| v.fract() == 0.0 && v.abs() < 1.0e7;
+    let mut groups: HashMap<Key, HashSet<(i32, i32)>> = HashMap::new();
+    let mut order: Vec<Key> = Vec::new();
+    let mut kept: Vec<u32> = Vec::with_capacity(out.indices.len());
+    let mut i = 0;
+    while i + 3 <= out.indices.len() {
+        let quad = (|| {
+            let t = out.indices.get(i..i + 6)?;
+            let s = t[0];
+            if t != [s, s + 1, s + 2, s + 2, s + 3, s] {
+                return None;
+            }
+            let v: [Vertex; 4] = std::array::from_fn(|k| out.vertices[(s + k as u32) as usize]);
+            let (data, tex) = (v[0].data, v[0].tex);
+            let face = v[0].face() as usize;
+            if face >= 6
+                || tex & (TEX_LOCAL_UV | TEX_TWO_SIDED) != 0
+                || v.iter().any(|w| w.data != data || w.tex != tex)
+                || v.iter().any(|w| !w.pos.iter().all(|&c| whole(c)))
+            {
+                return None;
+            }
+            let (axis, a, b) = (face / 2, (face / 2 + 1) % 3, (face / 2 + 2) % 3);
+            let plane = v[0].pos[axis] as i32;
+            let lo = (
+                v.iter().map(|w| w.pos[a] as i32).min()?,
+                v.iter().map(|w| w.pos[b] as i32).min()?,
+            );
+            let mut corners = [(false, false); 4];
+            for (k, w) in v.iter().enumerate() {
+                let (da, db) = (w.pos[a] as i32 - lo.0, w.pos[b] as i32 - lo.1);
+                if w.pos[axis] as i32 != plane || !(0..=1).contains(&da) || !(0..=1).contains(&db)
+                {
+                    return None;
+                }
+                corners[k] = (da == 1, db == 1);
+            }
+            // (Un vrai carré : ses quatre coins, chacun une fois.)
+            let mut seen = [false; 4];
+            for c in corners {
+                seen[c.0 as usize * 2 + c.1 as usize] = true;
+            }
+            if seen != [true; 4] {
+                return None;
+            }
+            Some((
+                Key {
+                    face: face as u8,
+                    plane,
+                    data,
+                    tex,
+                    corners,
+                },
+                lo,
+            ))
+        })();
+        match quad {
+            Some((key, cell)) => {
+                let g = groups.entry(key).or_insert_with(|| {
+                    order.push(key);
+                    HashSet::new()
+                });
+                // (Deux faces au même endroit : la seconde reste telle quelle.)
+                if g.insert(cell) {
+                    i += 6;
+                    continue;
+                }
+                kept.extend_from_slice(&out.indices[i..i + 3]);
+                i += 3;
+            }
+            None => {
+                kept.extend_from_slice(&out.indices[i..i + 3]);
+                i += 3;
+            }
+        }
+    }
+    if groups.is_empty() {
+        return;
+    }
+    // Les sommets encore utilisés (triangles gardés, reflets, translucides) gardent leur
+    // place relative ; ceux des faces fusionnées disparaissent.
+    let mut remap: Vec<u32> = vec![u32::MAX; out.vertices.len()];
+    let mut vertices: Vec<Vertex> = Vec::with_capacity(out.vertices.len());
+    let mut renumber = |list: &mut Vec<u32>, vertices: &mut Vec<Vertex>| {
+        for ix in list.iter_mut() {
+            let old = *ix as usize;
+            if remap[old] == u32::MAX {
+                remap[old] = vertices.len() as u32;
+                vertices.push(out.vertices[old]);
+            }
+            *ix = remap[old];
+        }
+    };
+    renumber(&mut kept, &mut vertices);
+    let mut reflective = std::mem::take(&mut out.reflective);
+    let mut translucent = std::mem::take(&mut out.translucent);
+    renumber(&mut reflective, &mut vertices);
+    renumber(&mut translucent, &mut vertices);
+    for key in order {
+        let cells = &groups[&key];
+        let (axis, a, b) = (
+            key.face as usize / 2,
+            (key.face as usize / 2 + 1) % 3,
+            (key.face as usize / 2 + 2) % 3,
+        );
+        let mut todo: Vec<(i32, i32)> = cells.iter().copied().collect();
+        todo.sort_unstable();
+        let mut done: HashSet<(i32, i32)> = HashSet::with_capacity(todo.len());
+        // Sur une face verticale, l'un des deux axes du plan est la hauteur : un rectangle
+        // reste dans sa tranche de 16 blocs.
+        let same_slab = |p: (i32, i32), q: (i32, i32)| {
+            let y = |c: (i32, i32)| if a == 1 { Some(c.0) } else if b == 1 { Some(c.1) } else { None };
+            match (y(p), y(q)) {
+                (Some(u), Some(w)) => u.div_euclid(16) == w.div_euclid(16),
+                _ => true,
+            }
+        };
+        for &start in &todo {
+            if done.contains(&start) {
+                continue;
+            }
+            let free = |c: (i32, i32), done: &HashSet<(i32, i32)>| {
+                cells.contains(&c) && !done.contains(&c) && same_slab(start, c)
+            };
+            // D'abord le long du second axe, puis en élargissant sur le premier tant que
+            // toute la rangée est libre.
+            let mut nb = 1;
+            while free((start.0, start.1 + nb), &done) {
+                nb += 1;
+            }
+            let mut na = 1;
+            while (0..nb).all(|k| free((start.0 + na, start.1 + k), &done)) {
+                na += 1;
+            }
+            for da in 0..na {
+                for db in 0..nb {
+                    done.insert((start.0 + da, start.1 + db));
+                }
+            }
+            let first = vertices.len() as u32;
+            for (hi_a, hi_b) in key.corners {
+                let mut pos = [0.0f32; 3];
+                pos[axis] = key.plane as f32;
+                pos[a] = (start.0 + if hi_a { na } else { 0 }) as f32;
+                pos[b] = (start.1 + if hi_b { nb } else { 0 }) as f32;
+                vertices.push(Vertex {
+                    pos,
+                    data: key.data,
+                    tex: key.tex,
+                });
+            }
+            kept.extend_from_slice(&[0, 1, 2, 2, 3, 0].map(|k| first + k));
+        }
+    }
+    out.vertices = vertices;
+    out.indices = kept;
+    out.reflective = reflective;
+    out.translucent = translucent;
 }
 
 /// Lumière reçue en ces points (monde), comme celle des faces du maillage (voir
@@ -2112,6 +2311,147 @@ mod tests {
     }
     fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
         [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    /// (v230) Fusion des faces : ce qui est dessiné ne change pas. Sur un relief en marches
+    /// avec un grand mur, deux sortes de blocs, une torche (lumière qui varie d'une face à
+    /// l'autre), de l'eau et un bloc qui reflète : chaque case de chaque plan est couverte
+    /// une fois, avec les mêmes données de sommet, avant et après ; les faces que quelque
+    /// chose distingue restent telles quelles ; il y a bien moins de triangles ; un
+    /// rectangle ne traverse pas une limite de tranche de 16 blocs de haut ; les listes à
+    /// part (reflets, translucides) ne changent pas.
+    #[test]
+    fn merged_faces_cover_the_same_cells_with_fewer_triangles() {
+        use std::collections::HashMap;
+        let reg = crate::registry::registry();
+        let mut w = World::new(0);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                w.insert_empty(ChunkPos { x: dx, z: dz });
+            }
+        }
+        for x in 0..16 {
+            for z in 0..16 {
+                let h = 20 + x / 4 + z / 8;
+                for y in 10..h {
+                    let id = if (x + 2 * z) % 9 == 0 {
+                        BlockId::DIRT
+                    } else {
+                        BlockId::STONE
+                    };
+                    w.set(x, y, z, id);
+                }
+            }
+        }
+        // Un mur haut (il traverse y = 32), une torche, de l'eau, un bloc de fer.
+        for y in 20..44 {
+            for z in 2..14 {
+                w.set(9, y, z, BlockId::BRICK);
+            }
+        }
+        w.set(2, 21, 3, BlockId::TORCH);
+        if let Some(water) = reg.by_key("water") {
+            w.set(13, 24, 13, water);
+        }
+        if let Some(iron) = reg.by_key("iron_block") {
+            w.set(14, 26, 1, iron);
+            w.set(14, 26, 2, iron);
+        }
+        let n = Neighborhood::from_world(&w, ChunkPos { x: 0, z: 0 }).expect("voisinage");
+        let plain = mesh_neighborhood_with(&n, false);
+        let merged = mesh_neighborhood_with(&n, true);
+        // Ce que dessine une liste de triangles : les cases couvertes par les rectangles
+        // unis (direction, plan, données, texture → case → nombre de fois), et le reste
+        // tel quel (triangles triés).
+        type Cells = HashMap<(u32, i32, u32, u32, i32, i32), u32>;
+        let drawn = |m: &MeshData, list: &[u32]| -> (Cells, Vec<[([i32; 3], u32, u32); 3]>, i32) {
+            let mut cells = Cells::new();
+            let mut rest = Vec::new();
+            let mut tallest = 0;
+            let mut i = 0;
+            while i < list.len() {
+                let v = |k: usize| m.vertices[list[i + k] as usize];
+                let quad = (i + 6 <= list.len())
+                    .then(|| [v(0), v(1), v(2), v(3), v(4), v(5)])
+                    .filter(|q| {
+                        list[i + 2] == list[i + 3]
+                            && list[i] == list[i + 5]
+                            && q.iter().all(|w| w.data == q[0].data && w.tex == q[0].tex)
+                            && q[0].face() < 6
+                            && q[0].tex & (TEX_LOCAL_UV | TEX_TWO_SIDED) == 0
+                            && q.iter().all(|w| w.pos.iter().all(|c| c.fract() == 0.0))
+                    });
+                if let Some(q) = quad {
+                    let axis = q[0].face() as usize / 2;
+                    let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+                    let lo = |k: usize| q.iter().map(|w| w.pos[k] as i32).min().unwrap();
+                    let hi = |k: usize| q.iter().map(|w| w.pos[k] as i32).max().unwrap();
+                    if lo(axis) == hi(axis) {
+                        for ca in lo(a)..hi(a) {
+                            for cb in lo(b)..hi(b) {
+                                *cells
+                                    .entry((q[0].face(), lo(axis), q[0].data, q[0].tex, ca, cb))
+                                    .or_default() += 1;
+                            }
+                        }
+                        if axis != 1 {
+                            assert_eq!(
+                                lo(1).div_euclid(16),
+                                (hi(1) - 1).div_euclid(16),
+                                "un rectangle reste dans sa tranche"
+                            );
+                            tallest = tallest.max(hi(1) - lo(1));
+                        }
+                        i += 6;
+                        continue;
+                    }
+                }
+                let mut t = [v(0), v(1), v(2)].map(|w| (w.pos.map(|c| (c * 64.0) as i32), w.data, w.tex));
+                t.sort();
+                rest.push(t);
+                i += 3;
+            }
+            rest.sort();
+            (cells, rest, tallest)
+        };
+        // (Avant le tri par direction, les deux triangles d'une face se suivent ; après, ils
+        // se suivent encore : le tri garde l'ordre dans chaque tranche.)
+        let (cells_a, rest_a, _) = drawn(&plain, &plain.indices);
+        let (cells_b, rest_b, tallest) = drawn(&merged, &merged.indices);
+        assert!(cells_a.values().all(|&n| n == 1), "chaque case une fois");
+        assert_eq!(cells_a, cells_b, "mêmes cases, mêmes données");
+        assert_eq!(rest_a, rest_b, "les autres triangles ne changent pas");
+        assert!(
+            merged.indices.len() * 2 < plain.indices.len(),
+            "{} triangles au lieu de {}",
+            merged.indices.len() / 3,
+            plain.indices.len() / 3
+        );
+        assert!(tallest > 4 && tallest <= 16, "le mur fusionne par tranches : {tallest}");
+        assert!(merged.vertices.len() < plain.vertices.len());
+        for list in [&merged.indices, &merged.reflective, &merged.translucent] {
+            assert!(list.iter().all(|&i| (i as usize) < merged.vertices.len()));
+        }
+        // Reflets et translucides : mêmes triangles, sommet pour sommet.
+        let same = |a: &[u32], b: &[u32]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(&i, &j)| plain.vertices[i as usize] == merged.vertices[j as usize])
+        };
+        assert!(!plain.translucent.is_empty() || reg.by_key("water").is_none());
+        assert!(same(&plain.reflective, &merged.reflective));
+        assert!(same(&plain.translucent, &merged.translucent));
+        assert_eq!(plain.face_counts.iter().sum::<u32>() as usize, plain.indices.len());
+        assert_eq!(merged.face_counts.iter().sum::<u32>() as usize, merged.indices.len());
+    }
+
+    /// Maillage face par face, sans la fusion des faces unies (pour les essais qui lisent
+    /// les sommets d'une face précise).
+    fn mesh_plain(world: &World, pos: ChunkPos) -> MeshData {
+        Neighborhood::from_world(world, pos)
+            .map(|n| mesh_neighborhood_with(&n, false))
+            .unwrap_or_default()
     }
 
     /// Les essais qui changent `CUTOUTS` (globaux) passent l'un après l'autre.
@@ -2785,7 +3125,8 @@ mod tests {
                 w.set(x, 102, z, BlockId::AIR);
             }
         }
-        let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        // (Face par face : la fusion des faces unies retire les sommets qu'on lit ici.)
+        let m = mesh_plain(&w, ChunkPos { x: 0, z: 0 });
         let floor_sky = |x: f32, y: f32, z: f32| {
             m.vertices
                 .iter()
@@ -2829,8 +3170,12 @@ mod tests {
     fn adjacent_blocks_hide_shared_faces() {
         let mut w = empty_world_with_block(4, 100, 4);
         w.set(5, 100, 4, BlockId::STONE);
-        let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        let m = mesh_plain(&w, ChunkPos { x: 0, z: 0 });
         assert_eq!(m.vertices.len(), 40); // 2 × 6 − 2 faces
+        // (v230) Fusionnées : les quatre grandes faces des deux blocs n'en font qu'une
+        // chacune, quand leurs quatre coins ont la même lumière (ici : oui, en plein ciel).
+        let merged = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+        assert_eq!(merged.vertices.len(), 24); // 2 bouts + 4 longues faces
     }
 
     #[test]

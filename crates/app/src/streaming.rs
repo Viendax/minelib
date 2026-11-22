@@ -143,6 +143,16 @@ impl Streamer {
         }
     }
 
+    /// (v230) Tous les chunks affichés sont remaillés (la façon de mailler a changé :
+    /// `/fusion`). Renvoie leur nombre.
+    pub fn remesh_all(&mut self, world: &World, workers: &mut Workers) -> usize {
+        let all: Vec<ChunkPos> = self.meshed.iter().copied().collect();
+        for &pos in &all {
+            self.remesh_now(world, workers, pos);
+        }
+        all.len()
+    }
+
     pub fn update(
         &mut self,
         world: &mut World,

@@ -6563,6 +6563,32 @@ impl Session {
             self.youtube(&cmd[2..]);
             return;
         }
+        // (v230) `/fusion [on|off]` : fusion des faces de blocs voisines que rien ne
+        // distingue (moins de triangles : voir `mesh::merge_flat_faces`). Réglage du rendu,
+        // chez soi : permis aussi en ligne. Pour comparer l'image et les images par seconde.
+        if cmd == "fusion" || cmd.starts_with("fusion ") {
+            use std::sync::atomic::Ordering::Relaxed;
+            let flag = &minelib_world::mesh::MERGE_FACES;
+            let on = match chat::switch(cmd[6..].trim()) {
+                Some(v) => v,
+                None if cmd[6..].trim().is_empty() => !flag.load(Relaxed),
+                None => {
+                    self.chat
+                        .say("Utilisation : /fusion [on|off] (seul : bascule).", chat::RED);
+                    return;
+                }
+            };
+            flag.store(on, Relaxed);
+            let n = self.streamer.remesh_all(&self.world, &mut self.workers);
+            self.chat.say(
+                format!(
+                    "Fusion des faces voisines : {} ({n} chunks remaillés).",
+                    if on { "activée" } else { "désactivée" }
+                ),
+                chat::YELLOW,
+            );
+            return;
+        }
         if self.online_command(cmd) {
             return;
         }
@@ -7136,6 +7162,7 @@ impl Session {
                     "/timefix on|off : arrête ou relance le temps",
                     "/weather clear|rain|storm : le temps qu'il fait ; /weather fix [on|off] : le fige (en ligne, OP : pour tout le serveur)",
                     "/thor : la foudre tombe là où tu vises (en ligne, OP : tous la voient) ; /give foudre : la Foudre de Zeus",
+                    "/fusion [on|off] : fusionne les faces de blocs voisines (moins de triangles, plus d'images par seconde)",
                     "/give <bloc> [nombre] : ex. /give mirror, /give iron_block, /give ecran",
                     "/give petit_ecran | grand_ecran | ecran_geant : les autres tailles d'écran",
                     "/give tête <pseudo> [nombre] : la tête d'un joueur, avec son skin",

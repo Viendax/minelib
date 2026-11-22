@@ -35,6 +35,8 @@
 //!   MINELIB_THOR=<s>            la foudre tombe là où l'on regarde toutes les <s> s (essais)
 //!   MINELIB_F5=1|2              commencer vu de derrière (1) ou de face (2) (essais)
 //!   MINELIB_FOUDRE_FIGEE=1      chaque éclair s'arrête à son plus vif (captures d'essai)
+//!   MINELIB_FUSION=0            ne fusionne pas les faces de blocs voisines (essais : pour
+//!                               comparer l'image et le nombre de triangles)
 //!   MINELIB_EN_LIGNE=1          ouvre MINELIB_WORLD en ligne (construction), dès que le
 //!                               compte est connecté (voir MINELIB_TEST_ACCOUNT) (essais)
 //!   MINELIB_CMD=<s>:<commande>[|<s>:<commande>…]  tape ces commandes du tchat, chacune
@@ -4042,6 +4044,10 @@ pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 fn main() -> anyhow::Result<()> {
     // Version annoncée au relais (parties FPS entre jeux de la même version).
     minelib_net::client::GAME_VERSION.store(update::VERSION, std::sync::atomic::Ordering::Relaxed);
+    // Essais : MINELIB_FUSION=0, pas de fusion des faces voisines (voir `mesh::merge_flat_faces`).
+    if std::env::var("MINELIB_FUSION").is_ok_and(|v| v.trim() == "0") {
+        minelib_world::mesh::MERGE_FACES.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     // Processus de bilan des cartes graphiques (lancé par le jeu, voir `gpu_report`).
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|a| a == "--bilan-gpu") {
