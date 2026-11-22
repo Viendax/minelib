@@ -3739,7 +3739,7 @@ impl DynGpu {
         self.vl_last = self.frame;
         self.vl_prev = self.vl_cur;
         // La marge, une image sur deux (et toujours quand l'historique repart de zéro).
-        let margin_now = self.vl_margin_lights && (!valid || self.frame % 2 == 0);
+        let margin_now = self.vl_margin_lights && (!valid || self.frame.is_multiple_of(2));
         let (jx, jy) = vl_jitter(self.frame);
         let frame = VlFrameGpu {
             cur_rel: cur_rel.to_cols_array_2d(),

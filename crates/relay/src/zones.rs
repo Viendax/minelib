@@ -40,7 +40,8 @@ const WAKE_MAX: usize = 256;
 /// modification d'une case remplace l'ancienne (l'historique ne grossit qu'avec le nombre
 /// de cases changées, pas avec le temps).
 ///
-/// Deux sortes d'entrées : les blocs, et le reste (objets au sol, coffres). Un joueur servi
+/// Deux sortes d'entrées : les blocs, et le reste (objets au sol, coffres, et depuis la v224
+/// les lumières de l'éditeur). Un joueur servi
 /// par un relais de région reçoit les blocs de ce relais et le reste du relais du monde :
 /// ce qu'il a déjà reçu se compte donc à part pour chaque sorte.
 #[derive(Default)]
@@ -59,6 +60,8 @@ enum LogKey {
     Block([i32; 3]),
     Item(u64),
     Slot([i32; 3], u8),
+    /// (v224) Lumière de l'éditeur : la dernière de chaque lumière dans cette zone.
+    Light(u64),
 }
 
 /// Ce que décrit une entrée (la suivante de même clé la remplace).
@@ -68,6 +71,7 @@ fn key_of(data: &[u8]) -> Option<LogKey> {
         Some(BuildMsg::Set { pos, .. }) => Some(LogKey::Block(pos)),
         Some(BuildMsg::Item { id, .. }) => Some(LogKey::Item(id)),
         Some(BuildMsg::Slot { pos, slot, .. }) => Some(LogKey::Slot(pos, slot)),
+        Some(BuildMsg::Light { uid, .. }) => Some(LogKey::Light(uid)),
         _ => None,
     }
 }

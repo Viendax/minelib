@@ -571,7 +571,35 @@ pub enum BuildMsg {
     /// Région souveraine : demande de modification signée par son auteur, au relais de la
     /// région (voir `crate::sovereign`).
     Signed(crate::sovereign::Edit),
+    /// (v224) Lumière de l'éditeur (projecteur, lumière ponctuelle) : demande d'un OP à
+    /// l'arbitre du chunk `chunk` (le relais du monde, ou le relais de sa province, comme pour
+    /// les objets) : y mettre la lumière `uid` telle que la décrit `light` (son texte, comme
+    /// dans `lumieres.json`), ou l'en retirer (`None`). Une lumière qui change de zone est
+    /// retirée de l'ancienne et mise dans la nouvelle (deux demandes, voir `lightnet`).
+    LightPut {
+        seq: u32,
+        uid: u64,
+        chunk: [i32; 2],
+        light: Option<Vec<u8>>,
+    },
+    /// (v224) Lumière publiée par l'arbitre : gardée dans l'historique de la zone de `chunk`
+    /// (la dernière de chaque lumière dans chaque zone), remise aux joueurs proches et au
+    /// propriétaire (qui l'enregistre avec le monde). `None` : plus dans cette zone. `by`,
+    /// `seq` : l'OP dont la demande vient d'être acceptée.
+    Light {
+        uid: u64,
+        chunk: [i32; 2],
+        light: Option<Vec<u8>>,
+        by: String,
+        seq: u32,
+    },
+    /// (v224) Demande de lumière `seq` refusée (pas OP, trop de demandes, monde en pause) :
+    /// remise au seul demandeur, qui remet la lumière comme les autres l'ont.
+    LightDenied { seq: u32 },
 }
+
+/// (v224) Taille maximale du texte d'une lumière (`BuildMsg::LightPut`).
+pub const LIGHT_MAX_BYTES: usize = 2048;
 
 /// La position que décrit un `Player` (pour la remettre regroupée avec d'autres), si elle
 /// n'a rien d'absurde.

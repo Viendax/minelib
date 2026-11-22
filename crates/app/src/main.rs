@@ -86,6 +86,7 @@ mod keylag;
 mod keytest;
 mod keys;
 mod light_editor;
+mod lightnet;
 mod lightning;
 mod lights;
 mod mcimport;

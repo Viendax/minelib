@@ -4331,8 +4331,16 @@ pub(crate) fn to_zone(
         {
             super::publish_items(st, rid, id, vec![BuildMsg::Denied { seq }]);
         }
+        if let Some(m) = &msg {
+            super::deny_light(st, rid, id, m);
+        }
         return;
     }
+    // (v224) Lumière de l'éditeur : son chunk décide (comme pour un objet).
+    let chunk = match &msg {
+        Some(BuildMsg::LightPut { chunk: at, .. }) => *at,
+        _ => chunk,
+    };
     let region = proto::region_of(chunk);
     // (v143) Région confiée à une province du pays : c'est elle qui en décide (une demande
     // d'objet est refusée, le jeu la refera auprès d'elle ; un bloc lui sera renvoyé).
@@ -4345,6 +4353,9 @@ pub(crate) fn to_zone(
         {
             super::publish_items(st, rid, id, vec![BuildMsg::Denied { seq }]);
         }
+        if let Some(m) = &msg {
+            super::deny_light(st, rid, id, m);
+        }
         return;
     }
     let Some(room) = st.rooms.get(&rid) else {
@@ -4352,8 +4363,17 @@ pub(crate) fn to_zone(
     };
     let Some(pr) = room.province.as_ref().filter(|p| p.has(region)) else {
         log::debug!("province : demande de {pseudo} en {chunk:?} hors de la province, ignorée");
+        if let Some(m) = &msg {
+            super::deny_light(st, rid, id, m);
+        }
         return;
     };
+    // (v224) Lumière de l'éditeur dans la province : ce relais arbitre (OP, d'après les
+    // réglages que lui donne le relais du monde).
+    if let Some(m @ BuildMsg::LightPut { .. }) = &msg {
+        super::light_request(st, rid, id, pseudo, m);
+        return;
+    }
     let sovereign = room.sov.get(&region).map(|sv| sv.primary);
     // Objets et coffres de la province (v139) : ce relais arbitre ; un joueur en survie
     // attend son sac (prêté par le relais du monde).

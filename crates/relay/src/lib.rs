@@ -957,6 +957,8 @@ struct Conn {
     talked: HashMap<u64, Instant>,
     /// Demandes d'objets (au sol, coffres) dans la seconde en cours.
     item_rate: (Instant, u32),
+    /// (v224) Demandes de lumières de l'éditeur dans la seconde en cours (`LIGHT_RATE`).
+    light_rate: (Instant, u32),
     /// Modifications de blocs dans la seconde en cours (voir `EDIT_RATE`), et celles
     /// dues à l'écoulement d'un fluide (`FLUID_RATE`).
     edit_rate: (Instant, u32),
@@ -1003,6 +1005,7 @@ impl Conn {
             probe_dev: 0.0,
             talked: HashMap::new(),
             item_rate: (Instant::now(), 0),
+            light_rate: (Instant::now(), 0),
             edit_rate: (Instant::now(), 0),
             fluid_rate: (Instant::now(), 0),
             served: HashSet::new(),
@@ -2484,6 +2487,11 @@ const VOICE_BYTES: usize = 4096;
 /// Demandes d'objets (au sol, coffres) acceptées par joueur et par seconde.
 const ITEM_RATE: u32 = 40;
 
+/// (v224) Demandes de lumières de l'éditeur acceptées par OP et par seconde : une lumière
+/// qu'on fait glisser part 20 fois par seconde, `/lumieres effacer` les retire toutes (le jeu
+/// en envoie au plus `lightnet::RATE` par seconde).
+const LIGHT_RATE: u32 = 200;
+
 /// Modifications de blocs acceptées par joueur et par seconde ; celles que le jeu dit dues
 /// à l'écoulement d'un fluide ont un budget à part, plus large (une inondation change
 /// beaucoup de cases d'un coup).
@@ -2840,13 +2848,73 @@ fn item_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &game::Build
     publish_items(st, rid, id, out);
 }
 
+/// (v224) Demande de lumière de l'éditeur (`BuildMsg::LightPut`), à l'arbitre de son chunk
+/// (le relais du monde, ou le relais de sa province) : seulement d'un OP du serveur, pas
+/// plus de `LIGHT_RATE` par seconde, d'une taille raisonnable ; publiée comme l'état d'un
+/// objet (gardée dans l'historique de la zone, la dernière de chaque lumière ; remise aux
+/// joueurs proches et au propriétaire), sinon refusée au seul demandeur.
+pub(crate) fn light_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &game::BuildMsg) {
+    let game::BuildMsg::LightPut {
+        seq,
+        uid,
+        chunk,
+        light,
+    } = m
+    else {
+        return;
+    };
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let op = st.servers.is_op(&room.server, &room.creator, pseudo);
+    let calm = st.conns.get_mut(&id).is_some_and(|c| {
+        if c.light_rate.0.elapsed() >= Duration::from_secs(1) {
+            c.light_rate = (Instant::now(), 0);
+        }
+        c.light_rate.1 += 1;
+        c.light_rate.1 <= LIGHT_RATE
+    });
+    let fits = light
+        .as_ref()
+        .is_none_or(|l| !l.is_empty() && l.len() <= game::LIGHT_MAX_BYTES);
+    let out = if op && calm && fits && *uid != 0 {
+        log::debug!(
+            "lumière {uid:016x} {} en {chunk:?} par « {pseudo} »",
+            if light.is_some() { "posée" } else { "retirée" }
+        );
+        game::BuildMsg::Light {
+            uid: *uid,
+            chunk: *chunk,
+            light: light.clone(),
+            by: pseudo.chars().take(32).collect(),
+            seq: *seq,
+        }
+    } else {
+        if !op {
+            log::info!("lumière de « {pseudo} » refusée : pas OP de ce serveur");
+        }
+        game::BuildMsg::LightDenied { seq: *seq }
+    };
+    publish_items(st, rid, id, vec![out]);
+}
+
+/// (v224) Refus d'une demande de lumière, au seul demandeur.
+pub(crate) fn deny_light(st: &mut State, rid: u64, id: u64, m: &game::BuildMsg) {
+    if let game::BuildMsg::LightPut { seq, .. } = m {
+        publish_items(st, rid, id, vec![game::BuildMsg::LightDenied { seq: *seq }]);
+    }
+}
+
 /// Publie des états d'objets (voir `minelib_net::items`) : gardés dans l'historique de
 /// leur zone et remis aux joueurs proches, le demandeur `asker` en premier (c'est lui qui
-/// attend la réponse) ; un refus ne va qu'à lui.
+/// attend la réponse) ; un refus ne va qu'à lui. (v224) Les lumières de l'éditeur aussi.
 fn publish_items(st: &mut State, rid: u64, asker: u64, msgs: Vec<game::BuildMsg>) {
     for m in msgs {
         let data = game::encode(&m);
-        if matches!(m, game::BuildMsg::Denied { .. }) {
+        if matches!(
+            m,
+            game::BuildMsg::Denied { .. } | game::BuildMsg::LightDenied { .. }
+        ) {
             if let Some(c) = st.conns.get(&asker) {
                 transport::push(
                     &c.tx,
@@ -6525,17 +6593,32 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // Une demande d'objet est refusée ; une modification de bloc reste sans
             // réponse (le jeu la garde et la renvoie à la reprise).
             if guards::frozen(st, rid) {
-                if let Some(seq) = game::decode::<game::BuildMsg>(&data)
+                let msg = game::decode::<game::BuildMsg>(&data);
+                if let Some(seq) = msg
                     .as_ref()
                     .filter(|m| minelib_net::items::is_request(m))
                     .and_then(minelib_net::items::request_seq)
                 {
                     publish_items(st, rid, id, vec![game::BuildMsg::Denied { seq }]);
                 }
+                if let Some(m) = &msg {
+                    deny_light(st, rid, id, m);
+                }
+                return None;
+            }
+            let msg = game::decode::<game::BuildMsg>(&data);
+            // (v224) Lumières de l'éditeur : comme les objets, à l'arbitre de leur chunk
+            // (refusée ici pour une province servie par un relais de province : le jeu la
+            // refait auprès d'elle).
+            if let Some(m @ game::BuildMsg::LightPut { chunk: at, .. }) = &msg {
+                if provinces::delegated(st, rid, proto::region_of(*at)) {
+                    deny_light(st, rid, id, m);
+                } else {
+                    light_request(st, rid, id, pseudo, m);
+                }
                 return None;
             }
             let room = st.rooms.get_mut(&rid).expect("partie");
-            let msg = game::decode::<game::BuildMsg>(&data);
             // Objets au sol et coffres : ce relais arbitre (une demande après l'autre),
             // publie le résultat aux joueurs proches, ou refuse au seul demandeur.
             if let Some(m) = msg.as_ref().filter(|m| minelib_net::items::is_request(m)) {
@@ -10029,6 +10112,155 @@ mod tests {
     }
 
     /// WorldEdit en ligne : réservé aux OP ; leurs blocs vont aux joueurs proches.
+    /// (v224) Lumières de l'éditeur : seul un OP en pose ; publiées aux joueurs proches,
+    /// gardées dans l'historique de leur zone (la dernière de chaque lumière : un joueur qui
+    /// arrive reçoit son dernier état), un refus au seul demandeur.
+    #[test]
+    fn only_ops_place_lights_and_players_nearby_get_them() {
+        let dir = std::env::temp_dir().join(format!("minelib-lum-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        // Prochain message de lumière reçu (`Light` ou `LightDenied`).
+        let next_light = |c: &Client| loop {
+            if let Event::FromZone { peer, data, .. } =
+                wait(c, |e| matches!(e, Event::FromZone { .. }))
+            {
+                assert_eq!(peer, 0, "publié par le relais");
+                match game::decode::<game::BuildMsg>(&data).expect("message") {
+                    m @ (game::BuildMsg::Light { .. } | game::BuildMsg::LightDenied { .. }) => {
+                        return m
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        let put = |seq: u32, text: Option<&str>| {
+            game::encode(&game::BuildMsg::LightPut {
+                seq,
+                uid: 77,
+                chunk: [0, 0],
+                light: text.map(|t| t.as_bytes().to_vec()),
+            })
+        };
+        let (createur, clink) = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        transport::push(&clink, &Request::Position { chunk: [0, 0] });
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&elink, &Request::Position { chunk: [1, 0] });
+        std::thread::sleep(Duration::from_millis(100));
+        // Eve n'est pas OP : refusé, à elle seule.
+        transport::push(
+            &elink,
+            &Request::ToZone {
+                chunk: [0, 0],
+                data: put(5, Some("{}")),
+            },
+        );
+        assert_eq!(next_light(&eve), game::BuildMsg::LightDenied { seq: 5 });
+        // Le créateur (OP) : publié, Eve (tout près) la reçoit ; puis il la change.
+        for (seq, text) in [(1, "{\"nom\":\"A\"}"), (2, "{\"nom\":\"B\"}")] {
+            transport::push(
+                &clink,
+                &Request::ToZone {
+                    chunk: [0, 0],
+                    data: put(seq, Some(text)),
+                },
+            );
+            match next_light(&eve) {
+                game::BuildMsg::Light {
+                    uid, light, by, ..
+                } => {
+                    assert_eq!((uid, by.as_str()), (77, "Createur"));
+                    assert_eq!(light.as_deref(), Some(text.as_bytes()));
+                }
+                m => panic!("{m:?}"),
+            }
+        }
+        // Trop gros : refusé.
+        let big = "x".repeat(game::LIGHT_MAX_BYTES + 1);
+        transport::push(
+            &clink,
+            &Request::ToZone {
+                chunk: [0, 0],
+                data: put(3, Some(&big)),
+            },
+        );
+        assert_eq!(next_light(&createur), game::BuildMsg::Light {
+            uid: 77,
+            chunk: [0, 0],
+            light: Some(b"{\"nom\":\"A\"}".to_vec()),
+            by: "Createur".into(),
+            seq: 1,
+        });
+        assert_eq!(next_light(&createur), game::BuildMsg::Light {
+            uid: 77,
+            chunk: [0, 0],
+            light: Some(b"{\"nom\":\"B\"}".to_vec()),
+            by: "Createur".into(),
+            seq: 2,
+        });
+        assert_eq!(next_light(&createur), game::BuildMsg::LightDenied { seq: 3 });
+        // Bob arrive : il reçoit le dernier état de la lumière, pas le premier.
+        let (bob, blink) = login("Bob");
+        bob.send(Cmd::Join(room));
+        wait(&bob, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&blink, &Request::Position { chunk: [0, 1] });
+        match next_light(&bob) {
+            game::BuildMsg::Light { light, seq, .. } => {
+                assert_eq!((light.as_deref(), seq), (Some(&b"{\"nom\":\"B\"}"[..]), 2))
+            }
+            m => panic!("{m:?}"),
+        }
+        // Retirée : Eve et Bob l'apprennent.
+        transport::push(
+            &clink,
+            &Request::ToZone {
+                chunk: [0, 0],
+                data: put(4, None),
+            },
+        );
+        for c in [&eve, &bob] {
+            match next_light(c) {
+                game::BuildMsg::Light { light, seq, .. } => assert_eq!((light, seq), (None, 4)),
+                m => panic!("{m:?}"),
+            }
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn only_ops_send_bulk_edits_and_players_nearby_get_them() {
         let dir = std::env::temp_dir().join(format!("minelib-bulk-{}", rand::random::<u32>()));

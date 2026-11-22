@@ -2,9 +2,10 @@
 //! sites de bombe A / B / C, posés avec `/fps set …` après une sélection à la baguette),
 //! paquet partageable et signature.
 //!
-//! La signature est l'empreinte du paquet (terrain, modifications, torches, réglages FPS) :
-//! changer un départ ou un site, c'est une autre carte ; deux copies identiques (même sous
-//! deux noms) sont la même carte et n'apparaissent qu'une fois dans la liste.
+//! La signature est l'empreinte du paquet (terrain, modifications, torches, réglages FPS et,
+//! depuis la v224, lumières de l'éditeur) : changer un départ ou un site, c'est une autre
+//! carte ; deux copies identiques (même sous deux noms) sont la même carte et n'apparaissent
+//! qu'une fois dans la liste.
 
 use std::collections::HashMap;
 use std::fs;
@@ -198,6 +199,15 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
             .filter(|l| !l.trim().is_empty())
             .map(|l| format!("tete,{}", l.trim())),
     );
+    // CHANGEMENT DE CARTE (v224) : les lumières de l'éditeur (projecteurs, lumières
+    // ponctuelles) font partie de la carte, avec les torches, préfixées « lumiere, » (leur
+    // texte, identifiant compris : le même chez tous ceux qui ont la carte). Une carte qui a
+    // des lumières change donc de signature ; une carte sans lumières garde la sienne.
+    torches.extend(
+        crate::lights::load_scene(dir)
+            .iter()
+            .map(|l| format!("{LIGHT_PREFIX}{}", l.to_text())),
+    );
     torches.sort();
     torches.dedup();
     Ok(MapPackage {
@@ -209,6 +219,9 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
         fps: load(dir),
     })
 }
+
+/// (v224) Préfixe des lumières de l'éditeur parmi les torches d'un paquet.
+const LIGHT_PREFIX: &str = "lumiere,";
 
 /// Signatures déjà calculées : (dossier) → (date des fichiers, signature).
 #[derive(Default)]
@@ -225,6 +238,7 @@ pub(crate) fn stamp(dir: &Path) -> u64 {
         crate::mcimport::HEADS_FILE,
         TIME_FILE,
         FILE,
+        crate::lights::SCENE_FILE,
     ]
     .iter()
     .filter_map(|f| fs::metadata(dir.join(f)).ok())
@@ -308,10 +322,21 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         .find_map(|l| l.strip_prefix("heure,")?.parse::<f32>().ok())
         .filter(|h| h.is_finite() && (0.0..24.0).contains(h));
     save_time(&dir, time)?;
+    // (v224) Lumières de l'éditeur de la carte (ramenées dans leurs bornes : elle vient d'un
+    // autre joueur).
+    let lights: Vec<crate::lights::PlacedLight> = p
+        .torches
+        .iter()
+        .filter_map(|l| l.strip_prefix(LIGHT_PREFIX))
+        .filter_map(|t| crate::lights::PlacedLight::from_text(t.as_bytes()))
+        .filter(|l| l.uid != 0)
+        .take(crate::lights::MAX_PLACED)
+        .collect();
+    crate::lights::save_scene(&dir, &lights)?;
     let (heads, torches): (Vec<&String>, Vec<&String>) = p
         .torches
         .iter()
-        .filter(|l| !l.starts_with("heure,"))
+        .filter(|l| !l.starts_with("heure,") && !l.starts_with(LIGHT_PREFIX))
         .partition(|l| l.starts_with("tete,"));
     let mut t = torches
         .iter()
@@ -358,6 +383,50 @@ mod tests {
         assert_eq!(package(&copy).unwrap().signature(), b.signature());
         let mut cache = SigCache::default();
         assert_eq!(cache.signature(&copy), Some(b.signature()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// (v224) Les lumières de l'éditeur partent avec la carte : une carte sans lumières garde
+    /// sa signature, une carte avec en change ; reçue ailleurs, elle a les mêmes lumières (même
+    /// identifiant, même chez une lumière d'avant la v224, qui n'en avait pas).
+    #[test]
+    fn the_lights_of_a_map_go_with_it() {
+        use crate::lights::{Kind, PlacedLight};
+        let root = std::env::temp_dir().join(format!("minelib-carte-lum-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = crate::save::create_world(&root, "Scène", 7).unwrap();
+        let bare = package(&dir).unwrap();
+        assert!(!bare.torches.iter().any(|t| t.starts_with(LIGHT_PREFIX)));
+        // Un fichier d'avant la v224 (sans identifiants).
+        let old = r#"{"version":1,"lumieres":[{"nom":"Projecteur 1","sorte":"projecteur",
+            "position":[10.5,70.0,-3.25],"couleur":[1.0,0.2,0.4]},{"nom":"Lumière 1"}]}"#;
+        fs::write(dir.join(crate::lights::SCENE_FILE), old).unwrap();
+        let lit = package(&dir).unwrap();
+        assert_ne!(lit.signature(), bare.signature(), "des lumières : une autre carte");
+        assert_eq!(
+            package(&dir).unwrap().signature(),
+            lit.signature(),
+            "les identifiants tirés du fichier sont toujours les mêmes"
+        );
+        let mine = crate::lights::load_scene(&dir);
+        assert_eq!(mine.len(), 2);
+        assert!(mine.iter().all(|l| l.uid != 0) && mine[0].uid != mine[1].uid);
+        let copy = unpack(&root.join("maps"), "Copie", &lit.to_bytes()).unwrap();
+        let theirs = crate::lights::load_scene(&copy);
+        let key = |v: &[PlacedLight]| {
+            let mut k: Vec<(u64, String)> = v.iter().map(|l| (l.uid, l.to_text())).collect();
+            k.sort();
+            k
+        };
+        assert_eq!(key(&theirs), key(&mine));
+        assert!(theirs.iter().any(|l| l.kind == Kind::Spot && l.position[2] == -3.25));
+        assert_eq!(package(&copy).unwrap().signature(), lit.signature());
+        // Ni heure ni tête parmi les torches de la copie.
+        let t = fs::read_to_string(copy.join("torches.txt")).unwrap_or_default();
+        assert!(!t.contains(LIGHT_PREFIX));
+        // Enregistrées par le propriétaire (avec leurs identifiants) : même carte.
+        crate::lights::save_scene(&dir, &mine).unwrap();
+        assert_eq!(package(&dir).unwrap().signature(), lit.signature());
         let _ = fs::remove_dir_all(&root);
     }
 }

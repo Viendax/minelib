@@ -6,10 +6,11 @@
 //! Version Minelib d'IRLights (mod Minecraft de qualet, licence MIT) : mêmes réglages et
 //! mêmes valeurs par défaut (voir `minelib_render::DynLight` pour le rendu).
 //!
-//! Les lumières restent chez le joueur qui les place (comme dans IRLights) : sur un serveur
-//! de construction, elles sont gardées avec sa copie du monde et les autres ne les voient
-//! pas. Elles sont coupées en mode FPS (rien ne doit éclairer un coin sombre pour un seul
-//! joueur).
+//! (v224) Les lumières font partie de la carte : elles partent avec elle (paquet signé, voir
+//! `fpsmap::package`) et, sur un serveur de construction, les OP les posent pour tout le
+//! monde (`lightnet`). Seules les lumières proches, dans des chunks chargés, sont allumées
+//! et listées dans l'éditeur (`Lights::loaded`). Elles restent coupées en partie FPS en
+//! ligne.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,8 +52,15 @@ pub fn used_recently(root: &Path) -> bool {
 }
 /// Dossier des images de gobos du joueur (dans `.minelib`).
 pub const GOBO_DIR: &str = "gobos";
-/// Lumières placées au plus dans un monde.
-pub const MAX_PLACED: usize = 192;
+/// Lumières placées au plus dans un monde. (v224) 1024 (192 avant) : seules les plus
+/// proches sont chargées (`LOADED_MAX`, à `LOADED_DIST` blocs au plus).
+pub const MAX_PLACED: usize = 1024;
+/// (v224) Lumières placées chargées au plus (allumées, listées dans l'éditeur) : les plus
+/// proches de la caméra.
+pub const LOADED_MAX: usize = 192;
+/// (v224) Une lumière est chargée si son chunk l'est et si sa portée arrive à moins de cette
+/// distance (blocs) de la caméra (plus loin, ni elle ni ses rayons ne se voient).
+pub const LOADED_DIST: f32 = 192.0;
 
 /// Sorte de lumière.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +79,10 @@ pub struct PlacedLight {
     /// Identifiant stable pendant la partie (cache des ombres) ; pas enregistré.
     #[serde(skip)]
     pub id: u64,
+    /// (v224) Identifiant de la lumière dans la carte, le même chez tous les joueurs d'un
+    /// serveur (enregistré ; une lumière d'avant en reçoit un tiré de sa place et de son
+    /// contenu, le même partout : voir `load_scene`).
+    pub uid: u64,
     #[serde(rename = "nom")]
     pub name: String,
     #[serde(rename = "sorte")]
@@ -125,6 +137,7 @@ impl Default for PlacedLight {
     fn default() -> Self {
         Self {
             id: 0,
+            uid: 0,
             name: "Lumière".into(),
             kind: Kind::Point,
             on: true,
@@ -194,6 +207,7 @@ impl PlacedLight {
     pub fn reset_look(&mut self) {
         let keep = (
             self.id,
+            self.uid,
             self.name.clone(),
             self.kind,
             self.position,
@@ -203,12 +217,35 @@ impl PlacedLight {
         *self = Self::default();
         (
             self.id,
+            self.uid,
             self.name,
             self.kind,
             self.position,
             self.direction,
             self.on,
         ) = keep;
+    }
+
+    /// (v224) Chunk où elle se trouve.
+    pub fn chunk(&self) -> [i32; 2] {
+        [
+            (self.position[0].floor() as i64).div_euclid(16) as i32,
+            (self.position[2].floor() as i64).div_euclid(16) as i32,
+        ]
+    }
+
+    /// (v224) Son texte, tel qu'il part sur le réseau et dans le paquet d'une carte (sans
+    /// l'identifiant de la partie).
+    pub fn to_text(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// (v224) Une lumière reçue (texte d'un autre joueur, ou d'une carte), ramenée dans ses
+    /// bornes ; `None` si le texte est illisible.
+    pub fn from_text(text: &[u8]) -> Option<Self> {
+        let mut l: Self = serde_json::from_slice(text).ok()?;
+        l.sanitize();
+        Some(l)
     }
 
     pub fn pos(&self) -> Vec3 {
@@ -273,6 +310,33 @@ struct SceneFile {
     lights: Vec<PlacedLight>,
 }
 
+/// (v224) Identifiant neuf d'une lumière (jamais 0).
+pub fn fresh_uid() -> u64 {
+    rand::random::<u64>() | 1
+}
+
+/// (v224) Identifiants des lumières d'un fichier d'avant la v224 (aucun), ou en double : tirés
+/// de leur place dans le fichier et de leur contenu, les mêmes sur tous les PC qui ont ce
+/// fichier (le propriétaire d'un serveur et ceux qui ont reçu sa carte).
+fn settle_uids(v: &mut [PlacedLight]) {
+    let mut seen = std::collections::HashSet::new();
+    for (k, l) in v.iter_mut().enumerate() {
+        if l.uid != 0 && seen.insert(l.uid) {
+            continue;
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ k as u64;
+        l.uid = 0;
+        for b in l.to_text().bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+        // (Encore pris : un autre de la même suite.)
+        while h == 0 || !seen.insert(h | 1) {
+            h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(1);
+        }
+        l.uid = h | 1;
+    }
+}
+
 /// Lumières d'un monde, relues de son dossier (aucune si le fichier manque ou est abîmé :
 /// rien ne passe d'un monde à l'autre).
 pub fn load_scene(dir: &Path) -> Vec<PlacedLight> {
@@ -287,6 +351,7 @@ pub fn load_scene(dir: &Path) -> Vec<PlacedLight> {
             for l in &mut v {
                 l.sanitize();
             }
+            settle_uids(&mut v);
             log::info!("{} lumière(s) relue(s) pour ce monde", v.len());
             v
         }
@@ -964,6 +1029,14 @@ pub struct Lights {
     /// (v201) Réglage vidéo « torches en lumières ponctuelles » : les lumières automatiques
     /// remplacent la lumière des blocs autour de soi (voir `torch_swap`).
     pub point_torches: bool,
+    /// (v224) Lumières placées chargées (indices dans `scene`, dans son ordre) : proches de
+    /// la caméra, dans des chunks chargés (voir `refresh_loaded`). Elles seules sont
+    /// allumées et listées dans l'éditeur.
+    loaded: Vec<usize>,
+    /// (v224) Changements de `scene` (voir `touch_scene`) : le relevé des lumières chargées
+    /// est refait au suivant, et chaque fois que la caméra a assez bougé.
+    pub scene_gen: u64,
+    loaded_at: Option<(u64, Vec3)>,
 }
 
 impl Lights {
@@ -985,6 +1058,9 @@ impl Lights {
             auto_center: None,
             gobos_dirty: true,
             point_torches: false,
+            loaded: Vec::new(),
+            scene_gen: 0,
+            loaded_at: None,
         };
         for i in 0..s.scene.len() {
             s.scene[i].id = s.new_id();
@@ -992,15 +1068,73 @@ impl Lights {
         s
     }
 
+    /// (v224) Lumières placées chargées : indices dans `scene` (dans son ordre), toujours
+    /// valides.
+    pub fn loaded(&self) -> impl Iterator<Item = usize> + '_ {
+        let n = self.scene.len();
+        self.loaded.iter().copied().filter(move |&i| i < n)
+    }
+
+    /// (v224) Cette lumière (indice dans `scene`) est-elle chargée ?
+    pub fn is_loaded(&self, i: usize) -> bool {
+        self.loaded.binary_search(&i).is_ok()
+    }
+
+    /// (v224) Relevé des lumières chargées : celles dont le chunk est chargé et dont la portée
+    /// arrive à moins de `LOADED_DIST` blocs de la caméra, les `LOADED_MAX` plus proches. Refait
+    /// quand la scène change ou que la caméra a bougé de plus de 4 blocs (`force` : toujours).
+    pub fn refresh_loaded(&mut self, world: &World, cam: Vec3, force: bool) {
+        let fresh = self
+            .loaded_at
+            .is_some_and(|(g, at)| g == self.scene_gen && at.distance(cam) < 4.0);
+        if fresh && !force {
+            return;
+        }
+        self.loaded_at = Some((self.scene_gen, cam));
+        let mut near: Vec<(f32, usize)> = self
+            .scene
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let d = (l.pos().distance(cam) - l.reach()).max(0.0);
+                let [cx, cz] = l.chunk();
+                let chunk = minelib_world::ChunkPos { x: cx, z: cz };
+                (d <= LOADED_DIST && world.chunk(chunk).is_some()).then_some((d, i))
+            })
+            .collect();
+        if near.len() > LOADED_MAX {
+            near.select_nth_unstable_by(LOADED_MAX, |a, b| a.0.total_cmp(&b.0));
+            near.truncate(LOADED_MAX);
+        }
+        self.loaded = near.into_iter().map(|(_, i)| i).collect();
+        self.loaded.sort_unstable();
+    }
+
     pub fn new_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
     }
 
-    /// Les lumières ont changé : enregistrées bientôt.
+    /// (v224) `f` avec la scène et de quoi donner un identifiant de partie aux lumières qui
+    /// arrivent (voir `lightnet::LightSync::hear`).
+    pub fn with_scene<R>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<PlacedLight>, &mut dyn FnMut() -> u64) -> R,
+    ) -> R {
+        let next = &mut self.next_id;
+        let mut new_id = || {
+            *next += 1;
+            *next
+        };
+        f(&mut self.scene, &mut new_id)
+    }
+
+    /// Les lumières ont changé : enregistrées bientôt (et, v224, les lumières chargées
+    /// relevées de nouveau ; partagées sur un serveur, voir `lightnet`).
     pub fn touch_scene(&mut self) {
         self.scene_dirty = true;
         self.save_in = 1.0;
+        self.scene_gen += 1;
     }
 
     pub fn touch_settings(&mut self) {
@@ -1054,6 +1188,7 @@ impl Lights {
                 self.save_now();
             }
         }
+        self.refresh_loaded(world, cam, false);
         if self.auto_on() && active {
             self.auto_timer -= dt;
             if self.auto_timer <= 0.0 {
@@ -1091,8 +1226,8 @@ impl Lights {
         let (atlas, tile) = table[q];
         let per = (atlas / tile.max(1)) as usize;
         let placed: usize = self
-            .scene
-            .iter()
+            .loaded()
+            .map(|i| &self.scene[i])
             .filter(|l| l.on)
             .map(|l| {
                 if l.kind == Kind::Spot && l.angle <= 120.0 {
@@ -1126,7 +1261,7 @@ impl Lights {
             .auto
             .len()
             .min(self.settings.auto_max as usize)
-            .min(minelib_render::MAX_DYN_LIGHTS.saturating_sub(self.scene.len() + 1));
+            .min(minelib_render::MAX_DYN_LIGHTS.saturating_sub(self.loaded().count() + 1));
         if self.point_torches {
             n.min(self.point_cap())
         } else {
@@ -1135,11 +1270,11 @@ impl Lights {
     }
 
     /// Lumières à dessiner : celles du joueur d'abord (elles passent avant pour les ombres),
-    /// puis les automatiques les plus proches.
+    /// puis les automatiques les plus proches. (v224) Seulement les lumières placées chargées.
     pub fn frame_lights(&self) -> Vec<DynLight> {
         let mut out: Vec<DynLight> = self
-            .scene
-            .iter()
+            .loaded()
+            .map(|i| &self.scene[i])
             .filter(|l| l.on)
             .map(|l| l.to_dyn(self.gobo_layer(&l.gobo)))
             .collect();
@@ -1188,15 +1323,28 @@ mod tests {
             ..Default::default()
         };
         a.id = 99;
+        a.uid = 0x1234_5678_9abc_def1;
         let b = PlacedLight::default();
         save_scene(&dir, &[a.clone(), b.clone()]).unwrap();
         let back = load_scene(&dir);
         assert_eq!(back.len(), 2);
-        // L'identifiant n'est pas enregistré : le reste revient à l'identique.
+        // L'identifiant de partie n'est pas enregistré : le reste revient à l'identique,
+        // celui de la carte compris.
         let mut want = a.clone();
         want.id = 0;
         assert_eq!(back[0], want);
-        assert_eq!(back[1], b);
+        // (v224) Une lumière sans identifiant de carte en reçoit un, toujours le même.
+        assert_ne!(back[1].uid, 0);
+        assert_ne!(back[1].uid, back[0].uid);
+        assert_eq!(load_scene(&dir)[1].uid, back[1].uid);
+        let mut b2 = back[1].clone();
+        b2.uid = 0;
+        assert_eq!(b2, b);
+        // Deux lumières au même identifiant (copiées à la main) : la seconde en change.
+        save_scene(&dir, &[a.clone(), a.clone()]).unwrap();
+        let twins = load_scene(&dir);
+        assert_eq!(twins[0].uid, a.uid);
+        assert!(twins[1].uid != 0 && twins[1].uid != a.uid);
         // Un fichier plus ancien (champs manquants) ou modifié à la main.
         std::fs::write(
             dir.join(SCENE_FILE),

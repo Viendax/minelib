@@ -237,6 +237,8 @@ fn now_secs() -> u64 {
 }
 /// Demandes d'objets parties à des relais de province dont on garde la trace, au plus.
 const ITEM_ASKED_MAX: usize = 4096;
+/// (v224) Demande de lumière dont l'arbitre n'est pas prêt : refusée après ce temps (s).
+const LIGHT_WAIT: f32 = 8.0;
 /// Chunks autour de soi dont le relais du monde annonce les relais (comme `SHARD_VIEW` du
 /// relais).
 const ROOT_VIEW: i32 = 16;
@@ -304,7 +306,7 @@ pub struct BuildNet {
     bulks: HashMap<u32, Vec<([i32; 3], BlockId)>>,
     next_bulk: u32,
     /// États d'objets (au sol, coffres) et refus reçus du relais du monde, à traiter par
-    /// la partie (voir `crate::drops`).
+    /// la partie (voir `crate::drops`) ; (v224) et lumières de l'éditeur (`crate::lightnet`).
     pub item_inbox: Vec<BuildMsg>,
     /// Message en cours de traitement venu d'un relais de région (tenu par un joueur ; son
     /// numéro de connexion) : seul le relais du monde arbitre les objets, on n'en accepte
@@ -331,6 +333,11 @@ pub struct BuildNet {
     /// Demandes d'objets parties à un relais de province (numéro → province) : lui seul
     /// peut les refuser.
     item_asked: HashMap<u32, PKey>,
+    /// (v224) Pareil pour les demandes de lumières de l'éditeur ; et celles dont l'arbitre
+    /// n'est pas encore prêt (province sans bail, connexion en cours) : elles attendent, au
+    /// plus `LIGHT_WAIT` s, puis sont refusées ici.
+    light_asked: HashMap<u32, PKey>,
+    light_queue: Vec<(BuildMsg, f32)>,
     /// (v140) Tout ce qu'on avait en vue au dernier passage était servi par des relais de
     /// province où l'on est entré ; province dite au relais du monde avec la dernière
     /// position qu'il a reçue.
@@ -533,6 +540,8 @@ impl BuildNet {
             from_province: None,
             province_retry: 0.0,
             item_asked: HashMap::new(),
+            light_asked: HashMap::new(),
+            light_queue: Vec::new(),
             was_deep: false,
             root_province: None,
             dozing: false,
@@ -1404,6 +1413,78 @@ impl BuildNet {
         }
     }
 
+    /// (v224) Demande de lumière de l'éditeur (`BuildMsg::LightPut`, d'un OP) : à l'arbitre
+    /// de son chunk, comme une demande d'objet (le relais du monde, ou le relais de sa
+    /// province). Province pas encore prête : refusée ici (la lumière revient comme les
+    /// autres l'ont, voir `lightnet`).
+    pub fn send_light(&mut self, req: &BuildMsg) {
+        // (Derrière celles qui attendent : l'ordre des demandes compte.)
+        if !self.light_queue.is_empty() || !self.try_light(req) {
+            self.light_queue.push((req.clone(), 0.0));
+        }
+    }
+
+    /// (v224) Envoie la demande de lumière à son arbitre, s'il est prêt.
+    fn try_light(&mut self, req: &BuildMsg) -> bool {
+        let BuildMsg::LightPut { seq, chunk, .. } = req else {
+            return true;
+        };
+        let (seq, chunk) = (*seq, *chunk);
+        match self.authority(chunk) {
+            Authority::Root => {
+                self.send(Request::ToZone {
+                    chunk,
+                    data: game::encode(req),
+                });
+                true
+            }
+            Authority::Province(l) => {
+                if self.light_asked.len() >= ITEM_ASKED_MAX {
+                    self.light_asked.clear();
+                }
+                if let Some(p) = self.best(proto::region_of(chunk)).map(pkey) {
+                    self.light_asked.insert(seq, p);
+                }
+                transport::push(
+                    &l,
+                    &Request::ToZone {
+                        chunk,
+                        data: game::encode(req),
+                    },
+                );
+                true
+            }
+            Authority::Waiting => false,
+        }
+    }
+
+    /// (v224) Demandes de lumières qui attendent leur arbitre : envoyées dès qu'il est prêt,
+    /// dans l'ordre ; refusées ici après `LIGHT_WAIT` s.
+    fn flush_lights(&mut self, dt: f32) {
+        if self.light_queue.is_empty() {
+            return;
+        }
+        let queue = std::mem::take(&mut self.light_queue);
+        let mut blocked: HashSet<[i32; 2]> = HashSet::new();
+        for (req, age) in queue {
+            let BuildMsg::LightPut { seq, chunk, .. } = &req else {
+                continue;
+            };
+            let region = proto::region_of(*chunk);
+            // (Une demande d'une région qui attend passe après les précédentes.)
+            if !blocked.contains(&region) && self.try_light(&req) {
+                continue;
+            }
+            let age = age + dt;
+            if age >= LIGHT_WAIT {
+                self.item_inbox.push(BuildMsg::LightDenied { seq: *seq });
+            } else {
+                blocked.insert(region);
+                self.light_queue.push((req, age));
+            }
+        }
+    }
+
     /// Propriétaire du monde : remet au relais les objets de sa sauvegarde (le relais
     /// refuse ce qui ferait double emploi).
     pub fn seed_items(&self, saved: &[BuildMsg]) {
@@ -1552,6 +1633,7 @@ impl BuildNet {
             self.was_deep = deep;
         }
         self.doze_tick(chunk, deep, dt);
+        self.flush_lights(dt);
         // Ce que le joueur a changé (monde en pause : ça attend dans le journal).
         let edits = if self.paused {
             Vec::new()
@@ -1934,8 +2016,12 @@ impl BuildNet {
             }
             // Objets au sol et coffres : états publiés par le relais du monde, ou (v139) par
             // le relais d'une province pour ses zones (jamais par un joueur, `peer` 0, ni par
-            // un relais de région).
-            BuildMsg::Item { .. } | BuildMsg::Slot { .. } | BuildMsg::Denied { .. } => {
+            // un relais de région). (v224) Les lumières de l'éditeur aussi.
+            BuildMsg::Item { .. }
+            | BuildMsg::Slot { .. }
+            | BuildMsg::Denied { .. }
+            | BuildMsg::Light { .. }
+            | BuildMsg::LightDenied { .. } => {
                 if peer != 0 || self.from_shard.is_some() {
                     return Vec::new();
                 }
@@ -1947,6 +2033,13 @@ impl BuildNet {
                 if let BuildMsg::Denied { seq } = msg {
                     if self.item_asked.get(&seq) == Some(&pkey(&info)) {
                         self.item_asked.remove(&seq);
+                        self.item_inbox.push(msg);
+                    }
+                    return Vec::new();
+                }
+                if let BuildMsg::LightDenied { seq } = msg {
+                    if self.light_asked.get(&seq) == Some(&pkey(&info)) {
+                        self.light_asked.remove(&seq);
                         self.item_inbox.push(msg);
                     }
                     return Vec::new();
@@ -1965,7 +2058,8 @@ impl BuildNet {
             BuildMsg::DropItem { .. }
             | BuildMsg::TakeItem { .. }
             | BuildMsg::ChestPut { .. }
-            | BuildMsg::ChestTake { .. } => Vec::new(),
+            | BuildMsg::ChestTake { .. }
+            | BuildMsg::LightPut { .. } => Vec::new(),
             BuildMsg::Reject { pos, .. } => {
                 // (Un relais de province ne refuse que dans ses zones.)
                 if !self.sender_decides(chunk_of(pos[0], pos[2])) {
@@ -6010,6 +6104,171 @@ mod tests {
             differ.len(),
             &differ[..differ.len().min(5)]
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v224) Lumières de l'éditeur : l'OP (le propriétaire, à l'ouest) en pose une de chaque
+    /// côté de la frontière (la province de l'est est servie par le relais d'un joueur, qui
+    /// l'arbitre ; l'ouest par le relais du monde), en déplace une de l'ouest à l'est (d'un
+    /// arbitre à l'autre), en change une, en retire une ; un joueur de l'est qui n'est pas OP
+    /// en pose une : refusée, elle disparaît chez lui. Tous finissent avec les lumières de
+    /// l'OP, et rien n'est en attente.
+    /// Un passage de l'essai des lumières : bots, hôtes, scènes, partages, versions des
+    /// scènes, refus reçus.
+    type LightStep<'a> = dyn FnMut(
+            &mut Vec<Bot>,
+            &mut Vec<(Bot, Bot)>,
+            &mut Vec<Vec<crate::lights::PlacedLight>>,
+            &mut Vec<crate::lightnet::LightSync>,
+            &mut Vec<u64>,
+            &mut Vec<u32>,
+        ) + 'a;
+
+    #[test]
+    fn lights_placed_by_an_op_reach_everyone_through_provinces() {
+        use crate::lightnet::LightSync;
+        use crate::lights::{Kind, PlacedLight};
+        let (dir, h, mut hosts, mut bots, _room) = province_setup(false);
+        let n = bots.len();
+        let mut scenes: Vec<Vec<PlacedLight>> = vec![Vec::new(); n];
+        let mut syncs: Vec<LightSync> = bots.iter().map(|b| LightSync::new(&b.name, &[])).collect();
+        let mut gens = vec![0u64; n];
+        let mut denied = vec![0u32; n];
+        let mut next_id = 1u64;
+        let dt = 0.02;
+        let mut step = |bots: &mut Vec<Bot>,
+                        hosts: &mut Vec<(Bot, Bot)>,
+                        scenes: &mut Vec<Vec<PlacedLight>>,
+                        syncs: &mut Vec<LightSync>,
+                        gens: &mut Vec<u64>,
+                        denied: &mut Vec<u32>| {
+            for (i, b) in bots.iter_mut().enumerate() {
+                b.tick(dt);
+                let net = b.net.as_mut().expect("réseau");
+                let inbox = std::mem::take(&mut net.item_inbox);
+                let mut id = || {
+                    next_id += 1;
+                    next_id
+                };
+                for m in &inbox {
+                    let heard = syncs[i].hear(m, &mut scenes[i], &mut id);
+                    if heard.changed {
+                        gens[i] += 1;
+                    }
+                    denied[i] += heard.denied as u32;
+                }
+                for r in syncs[i].outgoing(&scenes[i], gens[i], dt) {
+                    net.send_light(&r);
+                }
+            }
+            for (w, g) in hosts.iter_mut() {
+                w.pump(&|_| false);
+                g.tick(dt);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // La province de l'est reçoit son relais, et tous y entrent (elle est en vue).
+        let ready = |bots: &Vec<Bot>| {
+            bots.iter().all(|b| {
+                b.net.as_ref().is_some_and(|n| {
+                    n.province_view()
+                        .iter()
+                        .any(|v| v.0 == [1, 0] && v.3)
+                })
+            })
+        };
+        let t = Instant::now();
+        while !ready(&bots) {
+            assert!(t.elapsed() < Duration::from_secs(40), "province de l'est");
+            step(&mut bots, &mut hosts, &mut scenes, &mut syncs, &mut gens, &mut denied);
+        }
+        assert!(h.provinces_delegated() >= 1);
+        let lamp = |uid: u64, x: f64, name: &str| PlacedLight {
+            id: uid,
+            uid,
+            name: name.into(),
+            kind: Kind::Spot,
+            position: [x, 14.0, 16.0],
+            color: [0.3, 0.6, 1.0],
+            ..Default::default()
+        };
+        // L'OP pose une lumière de chaque côté ; Joueur3 (à l'est, pas OP) aussi.
+        scenes[0].push(lamp(101, 500.5, "Ouest"));
+        scenes[0].push(lamp(102, 530.5, "Est"));
+        gens[0] += 1;
+        scenes[3].push(lamp(301, 528.5, "Pirate"));
+        gens[3] += 1;
+        let same = |scenes: &Vec<Vec<PlacedLight>>| {
+            let key = |v: &Vec<PlacedLight>| {
+                let mut k: Vec<String> = v.iter().map(|l| l.to_text()).collect();
+                k.sort();
+                k
+            };
+            scenes.iter().all(|s| key(s) == key(&scenes[0]))
+        };
+        let settle = |bots: &mut Vec<Bot>,
+                      hosts: &mut Vec<(Bot, Bot)>,
+                      scenes: &mut Vec<Vec<PlacedLight>>,
+                      syncs: &mut Vec<LightSync>,
+                      gens: &mut Vec<u64>,
+                      denied: &mut Vec<u32>,
+                      step: &mut LightStep,
+                      what: &str| {
+            let t = Instant::now();
+            loop {
+                step(bots, hosts, scenes, syncs, gens, denied);
+                if same(scenes) && syncs.iter().all(|s| s.pending() == 0) {
+                    break;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(20),
+                    "{what} : {:?}",
+                    scenes
+                        .iter()
+                        .map(|s| s.iter().map(|l| (l.name.clone(), l.position[0])).collect::<Vec<_>>())
+                        .collect::<Vec<_>>()
+                );
+            }
+            // (Les retraits des zones quittées partent juste après.)
+            for _ in 0..25 {
+                step(bots, hosts, scenes, syncs, gens, denied);
+            }
+            assert!(same(scenes), "{what} : encore pareil");
+        };
+        settle(
+            &mut bots, &mut hosts, &mut scenes, &mut syncs, &mut gens, &mut denied, &mut step,
+            "posées",
+        );
+        assert_eq!(
+            scenes[0].len(),
+            2,
+            "les deux de l'OP, pas celle de Joueur3 : {:?} refus {denied:?}",
+            scenes[0].iter().map(|l| &l.name).collect::<Vec<_>>()
+        );
+        assert!(denied[3] >= 1 && denied[0] == 0);
+        assert!(!scenes[3].iter().any(|l| l.uid == 301));
+        // Il déplace celle de l'ouest à l'est (de l'arbitre du relais du monde à celui de
+        // la province), change la couleur de celle de l'est.
+        scenes[0][0].position[0] = 524.5;
+        scenes[0][1].color = [1.0, 0.1, 0.1];
+        gens[0] += 1;
+        settle(
+            &mut bots, &mut hosts, &mut scenes, &mut syncs, &mut gens, &mut denied, &mut step,
+            "déplacée",
+        );
+        for s in &scenes {
+            let w = s.iter().filter(|l| l.uid == 101).collect::<Vec<_>>();
+            assert_eq!(w.len(), 1, "une seule fois");
+            assert_eq!(w[0].position[0], 524.5);
+        }
+        // Il retire celle de l'est.
+        scenes[0].retain(|l| l.uid != 102);
+        gens[0] += 1;
+        settle(
+            &mut bots, &mut hosts, &mut scenes, &mut syncs, &mut gens, &mut denied, &mut step,
+            "retirée",
+        );
+        assert!(scenes.iter().all(|s| s.len() == 1 && s[0].uid == 101));
         let _ = std::fs::remove_dir_all(dir);
     }
 

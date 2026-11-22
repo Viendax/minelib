@@ -490,6 +490,7 @@ impl Editor {
             l.direction = cam.look.normalize_or(Vec3::NEG_Y).to_array();
         }
         l.id = lights.new_id();
+        l.uid = lights::fresh_uid();
         lights.scene.push(l);
         self.selected = Some(lights.scene.len() - 1);
         lights.touch_scene();
@@ -504,6 +505,8 @@ impl Editor {
         }
         let mut l = lights.scene[i].clone();
         l.id = lights.new_id();
+        // (v224) Une autre lumière de la carte.
+        l.uid = lights::fresh_uid();
         l.name = format!("{} {}", l.name, tr("copie"))
             .chars()
             .take(40)
@@ -658,8 +661,17 @@ impl Editor {
                 }
             }
         }
+        // (v224) Les lumières chargées (proches), et la choisie.
+        let shown: Vec<usize> = {
+            let mut v: Vec<usize> = lights.loaded().collect();
+            if let Some(i) = sel.filter(|&i| !lights.is_loaded(i)) {
+                v.push(i);
+            }
+            v
+        };
         // Guides de toutes les lumières (plus marqués pour la choisie).
-        for (k, l) in lights.scene.iter().enumerate() {
+        for &k in &shown {
+            let l = &lights.scene[k];
             let chosen = sel == Some(k);
             if lights.settings.guides || chosen {
                 Self::draw_guides(ui, cam, l, chosen, line);
@@ -667,7 +679,8 @@ impl Editor {
         }
         // Marques : un losange de la couleur de la lumière ; clic pour la choisir.
         let mut best: Option<(usize, f32)> = None;
-        for (k, l) in lights.scene.iter().enumerate() {
+        for &k in &shown {
+            let l = &lights.scene[k];
             let Some((sx, sy)) = cam.project(l.pos()) else {
                 continue;
             };
@@ -1129,14 +1142,26 @@ impl Editor {
             }
             p.y += row + pad;
         }
-        // Liste des lumières.
-        p.section(&format!("{} ({})", tr("SOURCES"), lights.scene.len()));
+        // Liste des lumières. (v224) Celles qui sont chargées (proches, dans des chunks
+        // chargés), dans l'ordre de la scène ; leur distance à droite.
+        let shown: Vec<usize> = lights.loaded().collect();
+        let total = lights.scene.len();
+        if shown.len() == total {
+            p.section(&format!("{} ({})", tr("SOURCES"), total));
+        } else {
+            p.section(&format!(
+                "{} ({} / {})",
+                tr("SOURCES PROCHES"),
+                shown.len(),
+                total
+            ));
+        }
         let visible = 5usize;
         let list_y = p.y;
         let list_h = row * visible as f32;
         let bar_w = 4.0 * ts;
         p.ui.rect(p.x, list_y, p.w, list_h, [0.0, 0.0, 0.0, 0.35]);
-        let rows = lights.scene.len();
+        let rows = shown.len();
         if p.hovered(p.x, list_y, p.w, list_h) && p.wheel.abs() >= 1.0 {
             self.list_scroll = if p.wheel > 0.0 {
                 self.list_scroll.saturating_sub(1)
@@ -1146,7 +1171,12 @@ impl Editor {
         }
         self.list_scroll = self.list_scroll.min(rows.saturating_sub(visible));
         if rows == 0 {
-            p.text(p.x + pad, list_y + pad, DIM, "Aucune lumière.");
+            let none = if total == 0 {
+                "Aucune lumière."
+            } else {
+                "Aucune lumière proche."
+            };
+            p.text(p.x + pad, list_y + pad, DIM, none);
             p.text(
                 p.x + pad,
                 list_y + pad + row,
@@ -1155,14 +1185,14 @@ impl Editor {
             );
         }
         let mut toggle_on = None;
-        for (k, l) in lights
-            .scene
+        for (r, &k) in shown
             .iter()
             .enumerate()
             .skip(self.list_scroll)
             .take(visible)
         {
-            let y = list_y + (k - self.list_scroll) as f32 * row;
+            let l = &lights.scene[k];
+            let y = list_y + (r - self.list_scroll) as f32 * row;
             let w = p.w - bar_w - pad;
             let hover = p.hovered(p.x, y, w, row);
             if self.selected == Some(k) {
@@ -1187,8 +1217,16 @@ impl Editor {
             p.ui.text(p.x + pad * 2.0 + sw, ty, ts, GREY, icon);
             let name_x = p.x + pad * 3.0 + sw + 8.0 * ts;
             let eye_w = 12.0 * ts;
-            let name = fit(&l.name, w - (name_x - p.x) - eye_w - pad, ts);
+            // (v224) Sa distance à la caméra (blocs).
+            let dist = format!("{:.0}", l.pos().distance(cam.pos));
+            let dist_w = 8.0 * ts * dist.chars().count() as f32;
+            let name = fit(
+                &l.name,
+                w - (name_x - p.x) - eye_w - dist_w - pad * 2.0,
+                ts,
+            );
             p.ui.text(name_x, ty, ts, if l.on { WHITE } else { DIM }, name);
+            p.ui.text(p.x + w - eye_w - pad - dist_w, ty, ts, DIM, dist);
             let ex = p.x + w - eye_w;
             let eye_hover = p.hovered(ex, y, eye_w, row);
             p.ui.text(

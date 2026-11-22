@@ -451,6 +451,16 @@ pub struct Session {
     /// Construction en ligne : l'éditeur de lumières est réservé aux OP du serveur. Demande
     /// envoyée au relais (la liste des OP ne répond qu'à eux), en attente de sa réponse.
     light_op_probe: Option<std::time::Instant>,
+    /// (v224) Lumières de l'éditeur partagées sur un serveur de construction (voir
+    /// `lightnet`) ; dernier refus dit au joueur ; le relais a répondu qu'on est OP (pour
+    /// `/lumieres effacer`), et un `/lumieres effacer` attend cette réponse.
+    light_sync: Option<crate::lightnet::LightSync>,
+    /// (v224) Messages des lumières mis de côté par `update_items` (qui vide les états
+    /// publiés reçus) pour `update_light_sync`.
+    light_inbox: Vec<minelib_net::game::BuildMsg>,
+    light_denied_said: Option<std::time::Instant>,
+    light_op_ok: bool,
+    light_clear_asked: bool,
     /// Lumières à afficher cette image, et état de leurs shaders (« Préparation des
     /// lumières… » tant qu'ils compilent).
     lights_wanted: bool,
@@ -765,6 +775,11 @@ impl Session {
             },
             light_editor: Default::default(),
             light_op_probe: None,
+            light_sync: None,
+            light_inbox: Vec::new(),
+            light_denied_said: None,
+            light_op_ok: false,
+            light_clear_asked: false,
             lights_wanted: false,
             shadow_lights: Vec::new(),
             remote_lamps: Vec::new(),
@@ -1913,6 +1928,7 @@ impl Session {
         // (avant la grille de blocs : leurs ombres en ont besoin).
         {
             let _s = perf::scope("lumières de l'éditeur");
+            self.update_light_sync(dt);
             let cam = self.camera_pos();
             let allowed = self.lights_allowed();
             self.lights.update(dt, &self.world, cam, allowed);
@@ -2605,6 +2621,16 @@ impl Session {
         // Réponses et états publiés par le relais.
         if let Some(b) = self.build.as_mut() {
             for m in std::mem::take(&mut b.item_inbox) {
+                // (v224) Les lumières de l'éditeur arrivent par le même chemin : pour
+                // `update_light_sync`.
+                if matches!(
+                    m,
+                    minelib_net::game::BuildMsg::Light { .. }
+                        | minelib_net::game::BuildMsg::LightDenied { .. }
+                ) {
+                    self.light_inbox.push(m);
+                    continue;
+                }
                 // L'objet part de la main de celui qui l'a lâché, si on le voit.
                 let thrower = match &m {
                     minelib_net::game::BuildMsg::Item { to, .. } => {
@@ -3969,6 +3995,74 @@ impl Session {
         self.inventory.close();
     }
 
+    /// (v224) Lumières de l'éditeur sur un serveur de construction (voir `lightnet`) : ce
+    /// que publie l'arbitre de chaque chunk arrive dans la scène (les autres OP), ce que
+    /// l'éditeur y change part en demandes. À chaque image, même éditeur ouvert.
+    fn update_light_sync(&mut self, dt: f32) {
+        use minelib_net::game::BuildMsg;
+        let Some(b) = self.build.as_mut() else {
+            self.light_sync = None;
+            self.light_inbox.clear();
+            return;
+        };
+        let scene = &self.lights.scene;
+        let sync = self
+            .light_sync
+            .get_or_insert_with(|| crate::lightnet::LightSync::new(b.pseudo(), scene));
+        // (Celles que `update_items` a mises de côté d'abord : elles sont arrivées avant.)
+        let (more, rest): (Vec<BuildMsg>, Vec<BuildMsg>) = std::mem::take(&mut b.item_inbox)
+            .into_iter()
+            .partition(|m| matches!(m, BuildMsg::Light { .. } | BuildMsg::LightDenied { .. }));
+        b.item_inbox = rest;
+        let mut msgs = std::mem::take(&mut self.light_inbox);
+        msgs.extend(more);
+        let mut heard = crate::lightnet::Heard::default();
+        for m in &msgs {
+            let h = self
+                .lights
+                .with_scene(|scene, new_id| sync.hear(m, scene, new_id));
+            heard.changed |= h.changed;
+            heard.denied |= h.denied;
+            heard.removed.extend(h.removed);
+        }
+        if heard.changed {
+            self.lights.touch_scene();
+            let sel = crate::lightnet::follow_selection(self.light_editor.selected, &heard.removed);
+            if sel != self.light_editor.selected {
+                self.light_editor.selected = sel;
+                self.light_editor.editing_name = false;
+            }
+        }
+        if heard.denied
+            && self
+                .light_denied_said
+                .is_none_or(|t| t.elapsed().as_secs_f32() > 3.0)
+        {
+            self.light_denied_said = Some(std::time::Instant::now());
+            self.chat.say(
+                "Lumières : changement refusé par le serveur (réservé à ses OP) ; elles reviennent comme les autres les ont.",
+                chat::RED,
+            );
+        }
+        for r in sync.outgoing(&self.lights.scene, self.lights.scene_gen, dt) {
+            b.send_light(&r);
+        }
+    }
+
+    /// (v224) `/lumieres effacer` : toutes les lumières du monde retirées (en ligne, pour tout
+    /// le monde : réservé aux OP).
+    fn clear_lights(&mut self) {
+        let n = self.lights.scene.len();
+        self.lights.scene.clear();
+        self.light_editor.selected = None;
+        self.light_editor.editing_name = false;
+        self.lights.touch_scene();
+        self.chat.say(
+            format!("{n} lumière(s) retirée(s) de ce monde."),
+            chat::YELLOW,
+        );
+    }
+
     /// Réponse du relais à la demande de `open_light_editor` (`op` : on est OP du serveur).
     /// Renvoie vrai si c'était bien elle (son texte n'est alors pas affiché tel quel).
     pub fn light_op_answer(&mut self, op: bool) -> bool {
@@ -3989,7 +4083,19 @@ impl Session {
             return false;
         };
         if asked.elapsed().as_secs_f32() > 10.0 {
+            self.light_clear_asked = false;
             return false;
+        }
+        self.light_op_ok = op;
+        // (v224) `/lumieres effacer` en attente de la réponse.
+        if std::mem::take(&mut self.light_clear_asked) {
+            if op {
+                self.clear_lights();
+            } else {
+                self.chat
+                    .say("/lumieres effacer : réservé aux OP de ce serveur.", chat::RED);
+            }
+            return true;
         }
         if !op {
             self.chat.say(
@@ -6606,15 +6712,23 @@ impl Session {
             "setspawn" | "spawnpoint" => self.setspawn(),
             // Éditeur de lumières (touche L) ; `/lumieres effacer` les retire toutes.
             "lumieres" | "lumières" | "lights" => match arg.map(|a| a.to_lowercase()) {
+                // (v224) En ligne, pour tout le monde : seulement un OP (on le demande au
+                // relais, comme pour ouvrir l'éditeur).
                 Some(a) if a == "effacer" || a == "clear" => {
-                    let n = self.lights.scene.len();
-                    self.lights.scene.clear();
-                    self.light_editor.selected = None;
-                    self.lights.touch_scene();
-                    self.chat.say(
-                        format!("{n} lumière(s) retirée(s) de ce monde."),
-                        chat::YELLOW,
-                    );
+                    if self.build.is_none() || self.light_op_ok {
+                        self.clear_lights();
+                    } else if self
+                        .light_op_probe
+                        .is_none_or(|t| t.elapsed().as_secs_f32() >= 5.0)
+                    {
+                        self.light_op_probe = Some(std::time::Instant::now());
+                        self.light_clear_asked = true;
+                        self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                            action: minelib_net::proto::SERVER_LIST,
+                            pseudo: String::new(),
+                            reason: String::new(),
+                        });
+                    }
                 }
                 _ => self.open_light_editor(),
             },
