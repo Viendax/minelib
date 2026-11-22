@@ -109,6 +109,9 @@ const ARM_X: f32 = 4.815170;
 const BODY_H: f32 = 12.346591;
 // (v225) Foudre de Zeus : le bras droit levé (radians), `player_model::ZEUS_RAISE`.
 const ZEUS_RAISE: f32 = 1.15;
+// (v239) Objet tenu en construction : le bras droit pointé plus bas que le regard (radians),
+// `player_model::ITEM_AIM_DROP`.
+const ITEM_AIM_DROP: f32 = 0.367;
 
 /// Repère (pixels → monde) d'une partie du modèle dans la pose de l'instance : le calcul de
 /// `player_model::parts`.
@@ -135,19 +138,24 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     }
     // (v177) Arme à feu (bit 17) : les deux bras tendus vers le regard, un peu tournés
     // vers l'arme (`AIM_TURN_RIGHT`, `AIM_TURN_LEFT` de player_model.rs).
-    // (v215) Lampe torche (bit 18) : le bras droit seul, tendu de même.
+    // (v215) Lampe torche (bit 18) : le bras droit seul, tendu de même. (v239) Objet tenu en
+    // construction (bits 18 et 20) : tendu de même, pointé plus bas (`ITEM_AIM_DROP`).
     if ((part == 3u || part == 4u) && (v.skin & 0x20000u) != 0u)
         || (part == 4u && (v.skin & 0x40000u) != 0u) {
         var side = -ARM_X;
         var turn = -0.5;
         var sign = -1.0;
+        var down = 0.0;
         if part == 4u {
             side = ARM_X;
             turn = 0.15;
             sign = 1.0;
+            if (v.skin & 0x100000u) != 0u {
+                down = ITEM_AIM_DROP;
+            }
         }
         return upper * m_trans(vec3<f32>(side, SHOULDER_Y, 0.0)) * m_rot_y(turn)
-            * m_rot_x(1.5707964 + pitch + lean + swing * sign * 0.1);
+            * m_rot_x(1.5707964 + max(pitch - down, -1.4) + lean + swing * sign * 0.1);
     }
     if part == 3u {
         return upper * m_trans(vec3<f32>(-ARM_X, SHOULDER_Y, 0.0)) * m_rot_x(-swing + lean * 0.6);

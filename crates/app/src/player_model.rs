@@ -362,10 +362,28 @@ fn aims(pose: &Pose) -> bool {
 
 /// (v215) Lampe torche en main : le bras droit seul tendu là où l'on regarde (comme pour
 /// une arme à feu), la lampe pointée devant. Ainsi elle est dans le champ à la première
-/// personne, à la place même où la voient les miroirs et les autres joueurs.
-fn aims_right(pose: &Pose) -> bool {
-    matches!(pose.held, Some(Held::Flashlight(_)))
+/// personne, à la place même où la voient les miroirs et les autres joueurs. (v239) Tout objet
+/// tenu en construction aussi (bloc, tête, torche, baguette, écran), le bras pointé plus bas
+/// que le regard (`ITEM_AIM_DROP`) : rend de combien. Pas la Foudre de Zeus (bras levé), ni
+/// l'équipement du mode FPS.
+fn aims_right(pose: &Pose) -> Option<f32> {
+    match pose.held {
+        Some(Held::Flashlight(_)) => Some(0.0),
+        Some(Held::Block(_) | Held::Wand(_) | Held::Torch(_)) => Some(ITEM_AIM_DROP),
+        _ => None,
+    }
 }
+
+/// (v239) « Rends global ton travail sur la synchro du bras à la première personne et en F5
+/// avec la lampe torche, … sauf qu'en dehors de la lampe torche le bras pointe entre le
+/// milieu et le bas de l'écran, 50 % » : un objet tenu en construction (autre que la lampe)
+/// se tient le bras tendu comme elle, pointé plus bas que le regard de cet angle (radians).
+/// Le même que `ITEM_AIM_DROP` de players.wgsl.
+pub const ITEM_AIM_DROP: f32 = 0.367;
+
+/// (v239) Bras droit tendu (lampe, objet tenu) : angle sous l'horizontale (radians) le plus
+/// bas où il pointe (regard tout en bas, objet tenu pointé encore plus bas).
+const AIM_LOWEST: f32 = 1.4;
 
 /// (v177) Bras tendus d'une arme à feu : rotation autour de la verticale (radians) qui
 /// ramène la main vers le milieu du corps, pour le bras droit et pour le gauche (qui vient
@@ -535,21 +553,23 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     let aim = aims(pose);
     let aim_right = aims_right(pose);
     for (side, sign) in [(-ARM_X, -1.0f32), (ARM_X, 1.0)] {
-        if aim || (aim_right && side > 0.0) {
+        if aim || (aim_right.is_some() && side > 0.0) {
             // (v177) Arme à feu : les deux bras tendus là où l'on regarde (le haut du corps
             // penché compris), un peu tournés vers l'arme, qui est tenue devant, entre les
-            // deux mains ; ils ne se balancent presque plus en marchant.
+            // deux mains ; ils ne se balancent presque plus en marchant. (v239) Un objet
+            // tenu : le bras droit pointé un peu plus bas (`ITEM_AIM_DROP`).
             let turn = if side > 0.0 {
                 AIM_TURN_RIGHT
             } else {
                 AIM_TURN_LEFT
             };
+            let down = if aim { 0.0 } else { aim_right.unwrap_or(0.0) };
             let xf = upper
                 * Mat4::from_translation(Vec3::new(side, SHOULDER_Y, 0.0))
                 * Mat4::from_rotation_y(turn)
                 * Mat4::from_rotation_x(
                     std::f32::consts::FRAC_PI_2
-                        + pose.pitch.clamp(-1.4, 1.4)
+                        + (pose.pitch.clamp(-1.4, 1.4) - down).max(-AIM_LOWEST)
                         + lean
                         + swing * sign * 0.1,
                 );
@@ -697,6 +717,46 @@ pub fn flashlight_matrix(pose: &Pose) -> Option<Mat4> {
 /// Repère d'une torche tenue : un peu devant le poing, bâton sur +y.
 fn torch_frame(pose: &Pose, hand: Mat4) -> Mat4 {
     item_frame(pose, hand, crate::hand::torch_rotation(), 3.0)
+}
+
+/// (v239) Baguette ou écran tenu (objet plat, une image 16 × 16 en relief) : de cette taille
+/// (pixels du modèle), debout, centré sur la prise (plus haut, il cachait le viseur à la
+/// première personne).
+const FLAT_ITEM: f32 = 6.0;
+/// (v239) Torche tenue : à cette part de la taille du monde (celle de la première personne
+/// jusqu'ici), tenue par le haut de son bâton (le bas à `TORCH_LOW` pixels sous le poing).
+/// Entière, ou tenue plus bas, sa flamme montait au-dessus du viseur à la première personne.
+const HELD_TORCH: f32 = 0.5;
+const TORCH_LOW: f32 = 5.0;
+
+/// (v239) Repère du maillage de l'objet tenu à la première personne (`hand::item_mesh`), au
+/// monde : là où le modèle le tient, à sa taille (voir `held_parts`). Un bloc ou une tête : son
+/// cube 0..1 ; une torche, la lampe torche : leur bloc 0..1 (debout) ; la baguette, l'écran :
+/// leur image 0..1. `None` pour la Foudre de Zeus, l'équipement du mode FPS, la main vide.
+pub fn held_item_matrix(pose: &Pose) -> Option<Mat4> {
+    let hand = hand_frame(pose)?;
+    match pose.held? {
+        Held::Block(_) => Some(
+            item_frame(pose, hand, crate::hand::block_rotation(), 0.0)
+                * Mat4::from_translation(Vec3::new(-3.0, -5.0, -7.0))
+                * Mat4::from_scale(Vec3::splat(6.0)),
+        ),
+        // Bâton de 2 × 8 seizièmes de bloc, à la moitié de la taille du monde (un bloc :
+        // 32 / 1,8 pixels).
+        Held::Torch(_) => Some(
+            torch_frame(pose, hand)
+                * Mat4::from_translation(Vec3::new(0.0, -TORCH_LOW, 0.0))
+                * Mat4::from_scale(Vec3::splat(32.0 / 1.8 * HELD_TORCH))
+                * Mat4::from_translation(Vec3::new(-0.5, 0.0, -0.5)),
+        ),
+        Held::Wand(_) => Some(
+            item_frame(pose, hand, crate::hand::wand_rotation(), 2.0)
+                * Mat4::from_translation(Vec3::new(-FLAT_ITEM / 2.0, -FLAT_ITEM / 2.0, 0.0))
+                * Mat4::from_scale(Vec3::splat(FLAT_ITEM)),
+        ),
+        Held::Flashlight(_) => flashlight_matrix(pose),
+        Held::Gear(_) | Held::Zeus => None,
+    }
 }
 
 /// (v177) Équipement du mode FPS (`Held::Gear`) : son modèle en triangles (mètres, canon
@@ -877,16 +937,17 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
     match held {
         Held::Torch(flame) => {
             // Même modèle que la torche posée ou tenue : bâton texturé (2 × 8 seizièmes de
-            // bloc) éclairé par sa flamme (3 × 5 seizièmes), à la taille du monde.
-            let k = 32.0 / 1.8 / 16.0;
+            // bloc) éclairé par sa flamme (3 × 5 seizièmes), (v239) à la moitié de la taille
+            // du monde (`HELD_TORCH`).
+            let k = 32.0 / 1.8 / 16.0 * HELD_TORCH;
             let top = flame.iter().copied().max().unwrap_or(1).max(1) as u32;
             let bright = flame.map(|c| (c as u32 * 255 / top) as u8);
             let t = torch_frame(pose, hand);
             vec![
                 (
                     t,
-                    [-k, -3.0, -k],
-                    [k, -3.0 + 8.0 * k, k],
+                    [-k, -TORCH_LOW, -k],
+                    [k, -TORCH_LOW + 8.0 * k, k],
                     RayBoxKind::Block {
                         layer: BlockId::TORCH.def().tex[1] as u32,
                         uv: [0.4375, 0.5, 0.5625, 1.0],
@@ -895,8 +956,8 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
                 ),
                 (
                     t,
-                    [-1.5 * k, -3.0 + 8.0 * k, -1.5 * k],
-                    [1.5 * k, -3.0 + 13.0 * k, 1.5 * k],
+                    [-1.5 * k, -TORCH_LOW + 8.0 * k, -1.5 * k],
+                    [1.5 * k, -TORCH_LOW + 13.0 * k, 1.5 * k],
                     RayBoxKind::Flame(bright),
                 ),
             ]
@@ -962,10 +1023,12 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
                     .collect()
             }
         }
+        // (v239) Une plaque, là où la première personne dessine son image (`held_item_matrix`) :
+        // avant, un bâton de 11 pixels qu'on ne voyait qu'en F5.
         Held::Wand(c) => vec![(
             item_frame(pose, hand, crate::hand::wand_rotation(), 2.0),
-            [-0.75, -2.0, -0.75],
-            [0.75, 9.0, 0.75],
+            [-FLAT_ITEM / 2.0, -FLAT_ITEM / 2.0, -FLAT_ITEM / 32.0],
+            [FLAT_ITEM / 2.0, FLAT_ITEM / 2.0, FLAT_ITEM / 32.0],
             RayBoxKind::Flat(c),
         )],
         // (v177) En triangles : `emit_gear`. (v216) Foudre de Zeus : pas de pavés.
@@ -1002,8 +1065,10 @@ pub fn zeus_frame(pose: &Pose) -> Option<Mat4> {
 /// Position (monde) de la flamme d'une torche tenue en main : la lumière part de là.
 pub fn torch_tip(pose: &Pose) -> Option<Vec3> {
     match (hand_frame(pose), pose.held) {
+        // (v239) Au milieu de la flamme (la torche tenue est deux fois plus petite).
         (Some(hand), Some(Held::Torch(_))) => {
-            Some(torch_frame(pose, hand).transform_point3(Vec3::new(0.0, 8.0, 0.0)))
+            let k = 32.0 / 1.8 / 16.0 * HELD_TORCH;
+            Some(torch_frame(pose, hand).transform_point3(Vec3::new(0.0, -TORCH_LOW + 10.5 * k, 0.0)))
         }
         _ => None,
     }
@@ -1529,9 +1594,12 @@ pub fn instance(pose: &Pose, layer: u32, prev: &Prev) -> PlayerInstance {
     let held = if aims(pose) {
         // (v177) Arme à feu : les deux bras tendus.
         PlayerInstance::HOLDS | PlayerInstance::AIMS
-    } else if aims_right(pose) {
+    } else if aims_right(pose) == Some(0.0) {
         // (v215) Lampe torche : le bras droit tendu.
         PlayerInstance::HOLDS | PlayerInstance::AIMS_RIGHT
+    } else if aims_right(pose).is_some() {
+        // (v239) Objet tenu en construction : le bras droit tendu, pointé plus bas.
+        PlayerInstance::HOLDS | PlayerInstance::AIMS_RIGHT | PlayerInstance::AIMS_LOW
     } else if pose.held == Some(Held::Zeus) {
         // (v225) Foudre de Zeus : le bras droit levé, quel que soit le regard.
         PlayerInstance::HOLDS | PlayerInstance::RAISED
@@ -1723,10 +1791,17 @@ mod tests {
             } else {
                 (-ARM_X, -0.5, -1.0)
             };
+            let down = if part == 4 && p.skin & 0x100000 != 0 {
+                ITEM_AIM_DROP
+            } else {
+                0.0
+            };
             return upper
                 * t(side, SHOULDER_Y, 0.0)
                 * Mat4::from_rotation_y(turn)
-                * Mat4::from_rotation_x(1.570_796_4 + pitch + lean + swing * sign * 0.1);
+                * Mat4::from_rotation_x(
+                    1.570_796_4 + (pitch - down).max(-1.4) + lean + swing * sign * 0.1,
+                );
         }
         if part == 3 {
             return upper * t(-ARM_X, SHOULDER_Y, 0.0) * Mat4::from_rotation_x(-swing + lean * 0.6);
@@ -1827,6 +1902,68 @@ mod tests {
         assert!((0.25..0.35).contains(&ahead), "{ahead}");
     }
 
+    /// (v239) « Le bras pointe entre le milieu et le bas de l'écran, 50 % » : avec un objet
+    /// tenu en construction, le bras droit tendu pointe vers le point à mi-chemin du milieu et
+    /// du bas de l'écran (champ vertical de 75°), quel que soit le regard ; avec la lampe
+    /// torche, vers le milieu. L'objet est au bout du bras, là où la première personne le
+    /// dessine (`held_item_matrix`) et où F5 le montre (`held_parts`).
+    #[test]
+    fn with_an_item_the_arm_points_halfway_down_the_screen() {
+        let half = (crate::session::FOV.to_radians() * 0.5).tan();
+        assert!((ITEM_AIM_DROP.tan() / half - 0.5).abs() < 2e-3, "{}", ITEM_AIM_DROP.tan() / half);
+        for pitch in [-0.6f32, 0.0, 0.5] {
+            for (held, want) in [
+                (Held::Block(BlockId::STONE), -0.5),
+                (Held::Torch([255, 200, 100]), -0.5),
+                (Held::Wand([70, 60, 90]), -0.5),
+                (Held::Flashlight(false), 0.0),
+            ] {
+                let pose = Pose {
+                    feet: Vec3::new(1.0, 64.0, 2.0),
+                    yaw: 0.4,
+                    pitch,
+                    walk: 0.0,
+                    swing: 0.0,
+                    crouch: 0.0,
+                    light: [1.0; 3],
+                    held: Some(held),
+                    skin: None,
+                };
+                let arm = right_arm_matrix(&pose).unwrap();
+                // De l'épaule (z = 1 de la boîte du bras) au poing (z = 0).
+                let dir = arm.transform_point3(Vec3::new(0.5, 0.5, 0.0))
+                    - arm.transform_point3(Vec3::new(0.5, 0.5, 1.0));
+                let look = Mat4::from_rotation_y(-pose.yaw) * Mat4::from_rotation_x(pitch);
+                let d = look.inverse().transform_vector3(dir);
+                let y = d.y / -d.z / half;
+                assert!((y - want).abs() < 0.02, "{held:?}, regard {pitch} : {y}");
+                // L'objet est au bout du bras : son repère commence au poing ou tout près.
+                let fist = arm.transform_point3(Vec3::new(0.5, 0.5, 0.0));
+                let item = held_item_matrix(&pose).unwrap();
+                let c = item.transform_point3(Vec3::splat(0.5));
+                assert!(c.distance(fist) < 0.5, "{held:?} : {}", c.distance(fist));
+            }
+        }
+        // Un bloc : le cube de la première personne est la boîte de F5.
+        let pose = Pose {
+            feet: Vec3::ZERO,
+            yaw: 1.1,
+            pitch: 0.2,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.3,
+            light: [1.0; 3],
+            held: Some(Held::Block(BlockId::STONE)),
+            skin: None,
+        };
+        let (frame, min, max, _) = held_parts(&pose)[0];
+        let m = held_item_matrix(&pose).unwrap();
+        for (unit, px) in [(Vec3::ZERO, Vec3::from(min)), (Vec3::ONE, Vec3::from(max))] {
+            let (a, b) = (m.transform_point3(unit), frame.transform_point3(px));
+            assert!(a.distance(b) < 1e-4, "{a} {b}");
+        }
+    }
+
     /// (v225) Les proportions du modèle (de CS2), et le bras levé de la Foudre de Zeus, sont
     /// les mêmes dans le shader des autres joueurs (`part_matrix` de players.wgsl).
     #[test]
@@ -1839,6 +1976,7 @@ mod tests {
             ("ARM_X", ARM_X),
             ("BODY_H", BODY_H),
             ("ZEUS_RAISE", ZEUS_RAISE),
+            ("ITEM_AIM_DROP", ITEM_AIM_DROP),
         ] {
             let line = src
                 .lines()
@@ -2235,11 +2373,13 @@ mod held_tests {
         };
         let hand = hand_frame(&pose).unwrap().transform_point3(Vec3::ZERO);
         let tip = torch_tip(&pose).unwrap();
-        let shoulder = 22.0 * PX;
+        let shoulder = (LEG + SHOULDER_Y) * PX;
         eprintln!("main {hand:?} flamme {tip:?}");
-        // Main devant le corps (−z), flamme au-dessus de la main et encore plus devant.
-        assert!(hand.z < -0.1 && hand.y < shoulder, "{hand:?}");
-        assert!(tip.y > hand.y + 0.2 && tip.z < hand.z, "{tip:?}");
+        // Main devant le corps (−z), plus bas que l'épaule (v239 : le bras tendu, pointé plus
+        // bas que le regard), flamme au-dessus de la main (la torche tenue, deux fois plus
+        // petite qu'en v238, l'est par le haut de son bâton) et encore plus devant.
+        assert!(hand.z < -0.3 && hand.y < shoulder - 0.1, "{hand:?}");
+        assert!(tip.y > hand.y + 0.03 && tip.z < hand.z, "{tip:?}");
     }
 }
 

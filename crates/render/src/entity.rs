@@ -104,6 +104,10 @@ impl PlayerInstance {
     /// soit le regard (comme `player_model::parts` ; avant, les autres joueurs le baissaient
     /// avec le regard, loin de l'éclair et de leur ombre).
     pub const RAISED: u32 = 1 << 19;
+    /// (v239) Bit de `skin` (avec `AIMS_RIGHT`) : objet tenu en construction (bloc, torche,
+    /// baguette…), le bras droit tendu comme pour la lampe, pointé plus bas que le regard
+    /// (`player_model::ITEM_AIM_DROP`).
+    pub const AIMS_LOW: u32 = 1 << 20;
 }
 
 /// Demi-flottant (IEEE 754 binaire16) le plus proche d'un nombre positif (couleurs).

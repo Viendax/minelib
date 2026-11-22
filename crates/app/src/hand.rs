@@ -1,5 +1,8 @@
 //! Main et objet tenu à la première personne : bras, bloc ou torche en 3D, balancement
 //! pendant la marche, geste quand on casse ou pose, objet qui remonte quand on en change.
+//! (v239) Un objet tenu en construction est dessiné dans la main du bras du modèle, comme en
+//! F5 (`item_mesh`, `player_model::held_item_matrix`) ; la main de ce module reste celle de la
+//! main vide et de la Foudre de Zeus.
 
 use glam::{Mat4, Vec3, Vec4};
 use minelib_render::{ArmVertex, VmVertex, FLAME, NO_TEXTURE};
@@ -36,6 +39,9 @@ pub const DIP_S: f32 = 0.2;
 pub const DIG_EVERY_S: f32 = 0.5;
 /// Rotation (radians) au plus bas du coup : le poing descend de 0,6 × sin(0,12) ≈ 0,07.
 const DIP_TILT: f32 = 0.12;
+/// (v239) Rotation (radians) du bras du modèle au plus fort de l'arc (poser, frapper), à la
+/// première personne.
+const SWING_TILT: f32 = 0.3;
 
 /// (v220) Geste demandé à la main à cette image.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,8 +72,6 @@ pub struct Hand {
     /// Objet qui remonte après un changement (1 = caché en bas).
     equip: f32,
     last: Option<Item>,
-    /// (v201) Lampe torche allumée (son verre brille).
-    pub flashlight_on: bool,
 }
 
 // Rotation de chaque objet tenu par rapport au regard (x à droite, y en haut, −z
@@ -528,6 +532,19 @@ impl Hand {
             * Mat4::from_translation(-pivot)
     }
 
+    /// (v239) Gestes du bras du modèle à la première personne (objet tenu en construction) :
+    /// le bras et ce qu'il tient tournent autour de `pivot` (vue), le bout de l'épaule, pour le
+    /// coup vers le bas (`dip_about`) et l'arc en posant un bloc ou en frappant ; ils
+    /// remontent du bas de l'écran après un changement d'objet.
+    pub fn gesture_about(&self, pivot: Vec3) -> Mat4 {
+        let s = (std::f32::consts::PI * (1.0 - self.swing)).sin() * (self.swing > 0.0) as u8 as f32;
+        Mat4::from_translation(Vec3::new(0.0, -0.35 * self.equip, 0.0))
+            * self.dip_about(pivot)
+            * Mat4::from_translation(pivot)
+            * Mat4::from_rotation_x(-SWING_TILT * s)
+            * Mat4::from_translation(-pivot)
+    }
+
     /// Geste (arc vers l'avant et le bas), (v220) coup vers le bas, et balancement en huit
     /// pendant la marche : repère de la main par rapport aux yeux.
     fn base(&self) -> Mat4 {
@@ -730,137 +747,128 @@ fn arm_mesh(
     }
 }
 
-impl Hand {
-    /// Triangles de l'objet tenu, pour un écran de rapport `aspect` (le bras : `arm`).
-    pub fn build(&self, item: Option<Item>, aspect: f32, light: [f32; 3]) -> Vec<VmVertex> {
-        let proj = Mat4::perspective_infinite_reverse_rh(HAND_FOV.to_radians(), aspect, 0.01);
-        let mut out = Vec::new();
-        let base = self.base();
-
-        let Some(item) = item else { return out };
-        match item {
-            Item::Torch(chem) => {
-                let m = base
-                    * Mat4::from_translation(Vec3::new(0.47, -0.5, -0.98))
-                    * torch_rotation()
-                    * Mat4::from_scale(Vec3::splat(0.5))
-                    * Mat4::from_translation(Vec3::new(-0.5, -0.1, -0.5));
-                torch_model(&mut out, proj * m, chem, light);
-            }
-            // (v201) Lampe torche : pointée devant, un peu vers le viseur, le verre au loin.
-            Item::Flashlight => {
-                let m = base
-                    * Mat4::from_translation(Vec3::new(0.4, -0.42, -0.86))
-                    * Mat4::from_rotation_y(0.16)
-                    * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2 + 0.06)
-                    * Mat4::from_scale(Vec3::splat(0.44))
-                    * Mat4::from_translation(Vec3::new(-0.5, -0.3, -0.5));
-                crate::flashlight::model(&mut out, proj * m, light, self.flashlight_on);
-            }
-            Item::Wand => {
-                // Tenue droite, logo en haut, légèrement tournée vers le centre.
-                let m = base
-                    * Mat4::from_translation(Vec3::new(0.36, -0.58, -0.92))
-                    * wand_rotation()
-                    * Mat4::from_scale(Vec3::splat(0.34));
-                crate::wand::model(&mut out, proj * m, light);
-            }
-            Item::Screen(_) => {
-                // Tenu droit comme la baguette.
-                let m = base
-                    * Mat4::from_translation(Vec3::new(0.36, -0.58, -0.92))
-                    * wand_rotation()
-                    * Mat4::from_scale(Vec3::splat(0.34));
-                crate::screen::model(&mut out, proj * m, light);
-            }
-            // Tête (simple ou à skin) : tenue comme un bloc, avec son skin, le visage vers soi.
-            Item::Head(_) | Item::Block(_) if item.head_skin().is_some() => {
-                let skin = item.head_skin().unwrap_or(crate::heads::HeadSkin::Default);
-                let m = base
-                    * Mat4::from_translation(Vec3::new(0.5, -0.36, -1.02))
-                    * block_rotation()
-                    * Mat4::from_scale(Vec3::splat(0.26))
-                    * Mat4::from_rotation_y(std::f32::consts::PI)
-                    * Mat4::from_scale(Vec3::splat(1.0 / 8.0))
-                    * Mat4::from_translation(Vec3::new(0.0, -4.0, 0.0));
-                let s = crate::heads::loaded(&skin);
-                out.extend(crate::heads::head_vm(s.as_deref(), proj * m, light));
-            }
-            Item::Head(_) => {}
-            // (v216) Foudre de Zeus : rien de solide, l'éclair est dessiné à part (voir
-            // `storm`).
-            Item::Zeus => {}
-            Item::Block(b) => {
-                let def = b.def();
-                let t = def.tex;
-                let layers = [t[0] as u32, t[1] as u32, t[2] as u32];
-                let m = base
-                    * Mat4::from_translation(Vec3::new(0.5, -0.36, -1.02))
-                    * block_rotation()
-                    * Mat4::from_scale(Vec3::splat(0.26))
-                    * Mat4::from_translation(Vec3::splat(-0.5));
-                match def.shape {
-                    Shape::Cross => push_cross(&mut out, proj * m, layers[1], light),
-                    Shape::Air | Shape::Invisible => {}
-                    _ if push_lantern(&mut out, proj * m, b, light) => {}
-                    _ => {
-                        let boxes = if def.full {
-                            vec![([0, 0, 0], [16, 16, 16])]
-                        } else {
-                            def.boxes()
-                        };
-                        // Bannière, porte : deux blocs de haut, comme posées.
-                        let halves: Vec<(f32, [u32; 3])> = match tall_layers(b) {
-                            Some((top, bottom)) => vec![(0.5, [top; 3]), (-0.5, [bottom; 3])],
-                            None => vec![(0.0, layers)],
-                        };
-                        for &(dy, half) in &halves {
-                            // Moitié déplacée par la transformation (pas par ses
-                            // coordonnées, dont la texture est tirée).
-                            let m = m * Mat4::from_translation(Vec3::new(0.0, dy, 0.0));
-                            for &(a, c) in &boxes {
-                                let v = |p: [u8; 3]| {
-                                    Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) / 16.0
-                                };
-                                push_box(
-                                    &mut out,
-                                    proj * m,
-                                    v(a),
-                                    v(c),
-                                    Some(half),
-                                    [1.0; 3],
-                                    light,
-                                    false,
-                                );
-                            }
+/// (v239) Objet tenu, à la première personne comme en F5 : là où le modèle du joueur le tient
+/// (`player_model::held_item_matrix`), avec son maillage de la première personne. `clip` :
+/// du repère de ce maillage (cube 0..1 d'un bloc ou d'une tête, bloc 0..1 d'une torche ou de
+/// la lampe torche debout, image 0..1 de la baguette ou de l'écran) à l'écran. Avant, chaque
+/// objet avait sa place dans la vue de la main, et le bras de la première personne n'était
+/// pas celui qu'on voit en F5 (sauf avec la lampe torche, v215).
+pub fn item_mesh(
+    item: Option<Item>,
+    clip: Mat4,
+    light: [f32; 3],
+    flashlight_on: bool,
+) -> Vec<VmVertex> {
+    let mut out = Vec::new();
+    let Some(item) = item else { return out };
+    match item {
+        Item::Torch(chem) => torch_model(&mut out, clip, chem, light),
+        Item::Flashlight => crate::flashlight::model(&mut out, clip, light, flashlight_on),
+        Item::Wand => crate::wand::model(&mut out, clip, light),
+        Item::Screen(_) => crate::screen::model(&mut out, clip, light),
+        // Tête (simple ou à skin) : tenue comme un bloc, avec son skin, le visage vers soi.
+        Item::Head(_) | Item::Block(_) if item.head_skin().is_some() => {
+            let skin = item.head_skin().unwrap_or(crate::heads::HeadSkin::Default);
+            let m = clip
+                * Mat4::from_translation(Vec3::splat(0.5))
+                * Mat4::from_rotation_y(std::f32::consts::PI)
+                * Mat4::from_scale(Vec3::splat(1.0 / 8.0))
+                * Mat4::from_translation(Vec3::new(0.0, -4.0, 0.0));
+            let s = crate::heads::loaded(&skin);
+            out.extend(crate::heads::head_vm(s.as_deref(), m, light));
+        }
+        Item::Head(_) => {}
+        // (v216) Foudre de Zeus : rien de solide, l'éclair est dessiné à part (voir
+        // `storm`).
+        Item::Zeus => {}
+        Item::Block(b) => {
+            let def = b.def();
+            let t = def.tex;
+            let layers = [t[0] as u32, t[1] as u32, t[2] as u32];
+            match def.shape {
+                Shape::Cross => push_cross(&mut out, clip, layers[1], light),
+                Shape::Air | Shape::Invisible => {}
+                _ if push_lantern(&mut out, clip, b, light) => {}
+                _ => {
+                    let boxes = if def.full {
+                        vec![([0, 0, 0], [16, 16, 16])]
+                    } else {
+                        def.boxes()
+                    };
+                    // Bannière, porte : deux blocs de haut, comme posées (la moitié du bas
+                    // sous la place d'un bloc, comme sur le modèle).
+                    let halves: Vec<(f32, [u32; 3])> = match tall_layers(b) {
+                        Some((top, bottom)) => vec![(0.0, [top; 3]), (-1.0, [bottom; 3])],
+                        None => vec![(0.0, layers)],
+                    };
+                    for &(dy, half) in &halves {
+                        // Moitié déplacée par la transformation (pas par ses coordonnées,
+                        // dont la texture est tirée).
+                        let m = clip * Mat4::from_translation(Vec3::new(0.0, dy, 0.0));
+                        for &(a, c) in &boxes {
+                            let v = |p: [u8; 3]| {
+                                Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) / 16.0
+                            };
+                            push_box(&mut out, m, v(a), v(c), Some(half), [1.0; 3], light, false);
                         }
                     }
                 }
             }
         }
-        out
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// (v239) À la première personne, l'objet tenu est là où le modèle le tient (en F5) :
+    /// devant les yeux, à portée de main, dans le bas de l'écran (jamais au-dessus du viseur :
+    /// la flamme de la torche et la baguette, plus hautes, le cachaient), quel que soit le
+    /// regard ; la lampe torche, elle, pointe au milieu.
     #[test]
-    fn hand_and_items_stay_in_front_of_the_camera() {
-        let mut h = Hand::default();
-        h.update(0.5, 0.0, Gesture::None, Some(Item::Block(BlockId::STONE)));
-        for item in [
-            Some(Item::Block(BlockId::STONE)),
-            Some(Item::Torch(Some(2))),
-        ] {
-            let v = h.build(item, 16.0 / 9.0, [1.0; 3]);
-            assert!(!v.is_empty());
-            for p in &v {
-                let [x, y, _z, w] = p.clip;
-                assert!(w > 0.0, "derrière la caméra {item:?} {:?}", p.clip);
-                // Dans la moitié droite / basse de l'écran (avec un peu de marge).
-                assert!(x / w > -0.3 && y / w < 0.5, "{:?}", p.clip);
+    fn held_items_are_where_the_model_holds_them() {
+        use crate::player_model::{held_item_matrix, Held, Pose};
+        let aspect = 16.0 / 9.0;
+        for pitch in [-0.8f32, 0.0, 0.6] {
+            for (item, held) in [
+                (Item::Block(BlockId::STONE), Held::Block(BlockId::STONE)),
+                (Item::Torch(Some(2)), Held::Torch([255, 200, 100])),
+                (Item::Wand, Held::Wand([70, 60, 90])),
+                (Item::Flashlight, Held::Flashlight(true)),
+            ] {
+                let pose = Pose {
+                    feet: Vec3::new(4.0, 70.0, -3.0),
+                    yaw: 0.9,
+                    pitch,
+                    walk: 0.0,
+                    swing: 0.0,
+                    crouch: 0.0,
+                    light: [1.0; 3],
+                    held: Some(held),
+                    skin: None,
+                };
+                let eye = crate::session::eye_of(pose.feet, 0.0);
+                let to_world = Mat4::from_translation(eye)
+                    * Mat4::from_rotation_y(-pose.yaw)
+                    * Mat4::from_rotation_x(pitch);
+                let vp = Mat4::perspective_infinite_reverse_rh(
+                    crate::session::FOV.to_radians(),
+                    aspect,
+                    0.05,
+                ) * to_world.inverse();
+                let m = held_item_matrix(&pose).unwrap();
+                let v = item_mesh(Some(item), vp * m, [1.0; 3], true);
+                assert!(!v.is_empty(), "{item:?}");
+                for p in &v {
+                    let [x, y, _, w] = p.clip;
+                    assert!(w > 0.1 && w < 1.3, "{item:?} à {w} des yeux");
+                    // (La lampe, pointée au milieu, va jusqu'au viseur.)
+                    let top = if item == Item::Flashlight { 0.15 } else { 0.0 };
+                    assert!(y / w < top, "{item:?} trop haut : {}", y / w);
+                    assert!(x / w > -0.5, "{item:?} trop à gauche : {}", x / w);
+                }
             }
         }
     }

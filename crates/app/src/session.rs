@@ -1873,7 +1873,6 @@ impl Session {
                 crate::hand::Gesture::None
             };
             self.hand.update(dt, speed, gesture, held);
-            self.hand.flashlight_on = self.flashlight_on;
             // Balancement des bras et des jambes du modèle (vue F5), et des autres joueurs.
             self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
             // (v165, essai) Foule simulée en solo, hors mode FPS. (v185) Seulement si on l'a
@@ -9027,6 +9026,9 @@ impl Session {
         };
         // (v215) Lampe torche en main, à la première personne : la lampe et le bras du modèle
         // (pieds remontés comme la caméra sur une marche), dessinés dans la vue du monde.
+        // (v239) Tout objet tenu en construction (bloc, tête, torche, baguette, écran) aussi :
+        // le bras du modèle et l'objet là où il le tient, comme en F5. Pas la Foudre de Zeus
+        // (bras levé de la main de la première personne, v235), ni la main vide.
         let world_proj =
             Mat4::perspective_infinite_reverse_rh(fov.to_radians(), renderer.aspect(), 0.05);
         // (v220) Interface masquée (F1) : ni main ni objet tenu à la première personne.
@@ -9036,7 +9038,10 @@ impl Session {
             && !hud_off
             && self.spectating.is_none()
             && self.game.mode != GameMode::Spectator
-            && self.held_item() == Some(Item::Flashlight))
+            && matches!(
+                pose.held,
+                Some(Held::Flashlight(_) | Held::Block(_) | Held::Torch(_) | Held::Wand(_))
+            ))
         .then(|| {
             let p = crate::player_model::Pose {
                 feet: pose.feet + Vec3::Y * self.step_offset,
@@ -9050,14 +9055,15 @@ impl Session {
                 skin: None,
             };
             let (lamp, arm) = (
-                crate::player_model::flashlight_matrix(&p)?,
+                crate::player_model::held_item_matrix(&p)?,
                 crate::player_model::right_arm_matrix(&p)?,
             );
             // (v220) Le coup vers le bas de la main (bloc cassé). (v222) La lampe et le bras
             // tournent ensemble autour de l'épaule (la base du bras, bout z = 1 de sa
             // boîte), comme la main dessinée autour de la sienne : seul le bout descend.
+            // (v239) Et l'arc en posant ou en frappant, l'objet qui remonte en changeant.
             let pivot = view.transform_point3(arm.transform_point3(Vec3::new(0.5, 0.5, 1.0)));
-            let dip = view.inverse() * self.hand.dip_about(pivot) * view;
+            let dip = view.inverse() * self.hand.gesture_about(pivot) * view;
             Some((dip * lamp, dip * arm))
         })
         .flatten();
@@ -9086,23 +9092,17 @@ impl Session {
             v
         } else {
             // À la 3e personne : pas de main à l'écran (le modèle est dans le monde).
-            let mut v = if third == 0 && first_person_lamp.is_some() {
+            let mut v = if let Some((item, _)) = first_person_lamp {
                 // (v215) Lampe torche : dessinée là où le modèle la tient (vue du monde), là
-                // où la lumière part et où la montrent les miroirs.
-                let mut v = Vec::new();
-                if let Some((lamp, _)) = first_person_lamp {
-                    crate::flashlight::model(
-                        &mut v,
-                        world_proj * view * lamp,
-                        self.hand_light,
-                        self.flashlight_on,
-                    );
-                }
-                v
-            } else if third == 0 && !hud_off {
-                self.hand
-                    .build(self.held_item(), renderer.aspect(), self.hand_light)
+                // où la lumière part et où la montrent les miroirs. (v239) Tout objet tenu.
+                crate::hand::item_mesh(
+                    self.held_item(),
+                    world_proj * view * item,
+                    self.hand_light,
+                    self.flashlight_on,
+                )
             } else {
+                // (La Foudre de Zeus est dessinée avec l'orage ; la main vide n'a que le bras.)
                 Vec::new()
             };
             // Sélection WorldEdit : arêtes de la zone et coins (en créatif, baguette en main).
@@ -9122,7 +9122,8 @@ impl Session {
         // Bras à la première personne (pas en mode FPS, qui a ses armes, ni en spectateur) :
         // éclairé comme le modèle du joueur en F5.
         let arm = if let Some((_, arm)) = first_person_lamp {
-            // (v215) Lampe torche : le bras droit du modèle, tendu, qui la tient.
+            // (v215) Lampe torche : le bras droit du modèle, tendu, qui la tient. (v239) Tout
+            // objet tenu en construction.
             crate::hand::Hand::arm_world(world_proj * view, arm, self.hand_light, skin.as_deref())
         } else if third == 0
             && !fps_mode
