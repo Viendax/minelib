@@ -233,6 +233,33 @@ fn shadow_march(o: vec3<f32>, d: vec3<f32>, max_t: f32, skip_start: bool) -> f32
             // lumière ne l'arrête pas, voir `shape_hit`.)
             let holed = kind == 3u || (kind == 0u && ((shp.w >> 4u) & 1u) != 0u);
             var hit = torch == 0u && !(at_start && holed);
+            // (v236) « La lumière étant dans un bloc non plein doit faire le même effet » :
+            // dans un bloc plein à trous (feuillage, verre clair), chaque rayon lit la texture
+            // là où il sort de la case (la face qu'il traverse, vue de l'intérieur) ; elle
+            // l'arrête là si le texel est plein. La lumière sort par les trous, en rayons,
+            // comme celle qu'un feuillage cache. (Une plante : elle en sort toujours, ses
+            // deux plans passent par le milieu de la case.)
+            if at_start && kind == 0u && holed && torch == 0u {
+                let tx = select(t_max.x, 1e9, abs(d.x) < 1e-6);
+                let ty = select(t_max.y, 1e9, abs(d.y) < 1e-6);
+                let tz = select(t_max.z, 1e9, abs(d.z) < 1e-6);
+                let te = min(tx, min(ty, tz));
+                let p = o + d * te;
+                var uv = vec2<f32>(p.z, -p.y);
+                var layer = pal.y;
+                if ty <= tx && ty <= tz {
+                    // Sortie par le dessus (montant) ou par le dessous (descendant).
+                    uv = vec2<f32>(p.x, p.z);
+                    layer = select(pal.x, pal.z, step.y < 0);
+                } else if tz <= tx {
+                    uv = vec2<f32>(p.x, -p.y);
+                }
+                let a = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), 0.0).a;
+                if a >= 0.5 && te <= max_t {
+                    result = max(te, 0.0);
+                    break;
+                }
+            }
             if hit && kind == 3u {
                 // Plante : ses deux plans, trous de la texture compris.
                 ht = cross_hit(o, d, cell, t, pal.y);

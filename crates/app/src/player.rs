@@ -198,8 +198,10 @@ const LADDER_TOP_POP: f32 = 1.0;
 
 /// Vitesse verticale sur une échelle à partir de laquelle elle fait du bruit (à fond).
 pub const LADDER_NOISY: f32 = LADDER_SPEED * 0.95;
-/// Hauteur grimpée entre deux bruits d'échelle (un barreau sur deux).
-pub const LADDER_RUNG: f32 = 0.5;
+/// Hauteur grimpée entre deux bruits d'échelle (un barreau sur deux). (v236) « Le bruit
+/// des échelles doit se jouer deux fois moins vite entre chaque coup » : un bloc (avant :
+/// un demi), pour soi comme pour les autres joueurs.
+pub const LADDER_RUNG: f32 = 1.0;
 
 #[derive(Clone)]
 pub struct Player {

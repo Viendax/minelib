@@ -3056,7 +3056,7 @@ impl Host {
             let before = e.last;
             e.last = pos;
             let living = alive(&self.m, id);
-            // Échelle : à pleine vitesse (pas accroupi), un bruit tous les deux barreaux.
+            // Échelle : à pleine vitesse (pas accroupi), un bruit par bloc grimpé (v236).
             if on_ladder.contains(&id) {
                 e.top = None;
                 let dy = (pos.y - before.y).abs();

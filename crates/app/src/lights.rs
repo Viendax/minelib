@@ -434,7 +434,8 @@ fn default_render() -> DynSettings {
         vl_tip_boost: 1.0,
         vl_tip_radius: 1.5,
         vl_shadows: false,
-        vl_shadow_stride: 4,
+        // (v236) 1 (4 avant) : voir `QUALITY`.
+        vl_shadow_stride: 1,
         vl_noise: false,
         vl_noise_amount: 0.6,
         vl_noise_scale: 2.0,
@@ -513,7 +514,9 @@ impl LightSettings {
         r.vl_tip_boost = f("rayons_lueur", d.vl_tip_boost, 0.0, 4.0);
         r.vl_tip_radius = f("rayons_lueur_rayon", d.vl_tip_radius, 0.1, 4.0);
         r.vl_shadows = b("rayons_ombres", d.vl_shadows);
-        r.vl_shadow_stride = u("rayons_ombres_pas", d.vl_shadow_stride, 1, 8);
+        // (v236) Nouvelle clé : l'ancienne (4, le défaut d'avant) n'est pas reprise, voir
+        // `QUALITY`.
+        r.vl_shadow_stride = u("rayons_ombres_pas2", d.vl_shadow_stride, 1, 8);
         r.vl_noise = b("rayons_bruit", d.vl_noise);
         r.vl_noise_amount = f("rayons_bruit_part", d.vl_noise_amount, 0.2, 1.0);
         r.vl_noise_scale = f("rayons_bruit_taille", d.vl_noise_scale, 0.25, 6.0);
@@ -574,7 +577,7 @@ impl LightSettings {
         kv("rayons_lueur", r.vl_tip_boost.to_string());
         kv("rayons_lueur_rayon", r.vl_tip_radius.to_string());
         kv("rayons_ombres", r.vl_shadows.to_string());
-        kv("rayons_ombres_pas", r.vl_shadow_stride.to_string());
+        kv("rayons_ombres_pas2", r.vl_shadow_stride.to_string());
         kv("rayons_bruit", r.vl_noise.to_string());
         kv("rayons_bruit_part", r.vl_noise_amount.to_string());
         kv("rayons_bruit_taille", r.vl_noise_scale.to_string());
@@ -607,11 +610,16 @@ impl LightSettings {
 
 /// Préréglages de qualité : (pas des rayons, distance des rayons, pas entre deux ombres,
 /// pas entre deux bruits, ombres des rayons, qualité des ombres, ombres des blocs) — les
-/// mêmes qu'IRLights.
+/// mêmes qu'IRLights. (v236) L'ombre est lue à chaque pas dans tous (avant : un pas sur
+/// quatre en Rapide, sur deux en Équilibré) : « c'est trop pixelisé sous certains angles ».
+/// Avec 16 pas, une lecture tous les 4 tombait tous les 15 blocs le long du regard dans une
+/// lumière de 31 blocs de rayon : les rayons qui passent par les trous d'un feuillage étaient
+/// faits de gros pavés. Lues à chaque pas, ce sont des rayons nets (un peu plus de travail
+/// pour la carte : 16 lectures au lieu de 5 par lumière et par pixel des rayons).
 pub const QUALITY_NAMES: [&str; 4] = ["Rapide", "Équilibré", "Qualité", "Ultra"];
 const QUALITY: [(u32, f32, u32, u32, bool, u8, bool); 4] = [
-    (16, 48.0, 4, 4, false, 0, false),
-    (48, 96.0, 2, 2, true, 1, true),
+    (16, 48.0, 1, 4, false, 0, false),
+    (48, 96.0, 1, 2, true, 1, true),
     (56, 128.0, 1, 2, true, 2, true),
     (64, 192.0, 1, 1, true, 2, true),
 ];

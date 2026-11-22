@@ -6013,7 +6013,7 @@ impl Session {
         }
     }
 
-    /// Échelle à pleine vitesse (pas accroupi) : ses barreaux, un bruit tous les deux (les
+    /// Échelle à pleine vitesse (pas accroupi) : ses barreaux, un bruit par bloc (v236 ; les
     /// autres l'entendent aussi : l'hôte en partie FPS, chacun d'eux dans le monde en
     /// ligne, voir `others_ladder_noise`). (v209) Dans tous les modes de jeu.
     fn own_ladder_noise(&mut self, dt: f32, alive: bool) {
@@ -6031,7 +6031,7 @@ impl Session {
 
     /// (v209) Monde en ligne : les échelles grimpées à pleine vitesse par les joueurs
     /// proches s'entendent, comme en partie FPS. On ne connaît que leur position : sur une
-    /// échelle et montant ou descendant vite, un bruit tous les deux barreaux.
+    /// échelle et montant ou descendant vite, un bruit par bloc grimpé (v236).
     fn others_ladder_noise(&mut self, dt: f32) {
         let Some(b) = &self.build else {
             self.ladders.clear();
@@ -8866,7 +8866,8 @@ impl Session {
                 let o = &others[i as usize];
                 // (v202) Ou tout près d'une lumière : son ombre y est géante, on la voit de
                 // loin (avant, elle disparaissait dès qu'on s'éloignait un peu).
-                let shadow = (rank < 24 && d2 < 48.0 * 48.0)
+                // (v236) Les 48 plus proches (avant : 24), triés ensuite par l'axe de vue.
+                let shadow = (rank < 48 && d2 < 48.0 * 48.0)
                     || light_shadow_score(&self.shadow_lights, o.pos) < SHADOW_LIGHT_NEAR;
                 let w = o.walk.or_else(|| self.walks.get(o.pseudo));
                 let other = crate::player_model::Pose {
@@ -8958,10 +8959,16 @@ impl Session {
                 .build(cam, &|p| sky_light(world, p, daylight), &mut model);
         }
         // Ombres des joueurs : les plus proches de la caméra (place limitée), (v202) ou d'une
-        // lumière (ombre géante, voir `light_shadow_score`).
+        // lumière (ombre géante, voir `light_shadow_score`). (v236) « Fais la précision des
+        // ombres normalement pour les joueurs les plus proches de moi ou de mon axe de
+        // vue » : la distance compte double de côté, triple derrière (`shadow_view_score`).
         let lights = &self.shadow_lights;
+        let look = view
+            .inverse()
+            .transform_vector3(-Vec3::Z)
+            .normalize_or_zero();
         shadows.sort_by_cached_key(|s| {
-            let score = s.0.distance(cam).min(light_shadow_score(lights, s.0));
+            let score = shadow_view_score(cam, look, s.0).min(light_shadow_score(lights, s.0));
             (score * 64.0) as u32
         });
         let mut shadow_boxes = std::mem::take(&mut scratch.boxes);
@@ -9905,6 +9912,16 @@ impl Default for SunSeen {
     }
 }
 
+/// (v236) Importance de l'ombre exacte d'un joueur (pieds en `feet`) pour la caméra en `cam`
+/// qui regarde vers `look` (unitaire) : plus petit, plus important. Sa distance, comptée
+/// une fois dans l'axe de vue, deux fois de côté, trois fois derrière.
+fn shadow_view_score(cam: Vec3, look: Vec3, feet: Vec3) -> f32 {
+    let to = feet + Vec3::Y * 0.9 - cam;
+    let d = to.length();
+    let c = if d > 1e-3 { to.dot(look) / d } else { 1.0 };
+    d * (2.0 - c)
+}
+
 /// (v202) Distance (blocs) en deçà de laquelle un joueur près d'une lumière fait son ombre
 /// même loin de la caméra (score de `light_shadow_score`).
 const SHADOW_LIGHT_NEAR: f32 = 48.0;
@@ -10758,6 +10775,26 @@ mod slab_tests {
 
     fn key(id: BlockId) -> &'static str {
         &id.def().key
+    }
+
+    /// (v236) Ombres exactes de la foule : à distance égale, le joueur dans l'axe de vue
+    /// passe avant celui de côté, qui passe avant celui de derrière ; un joueur tout près
+    /// passe avant un plus loin dans l'axe.
+    #[test]
+    fn exact_shadows_go_to_the_nearest_and_to_the_view_axis() {
+        let cam = Vec3::new(0.0, 1.6, 0.0);
+        let look = -Vec3::Z;
+        let at = |x: f32, z: f32| shadow_view_score(cam, look, Vec3::new(x, 0.7, z));
+        let (ahead, side, behind) = (at(0.0, -10.0), at(10.0, 0.0), at(0.0, 10.0));
+        assert!(ahead < side && side < behind, "{ahead} {side} {behind}");
+        assert!(
+            at(2.0, 0.0) < at(0.0, -6.0),
+            "tout près de côté, avant loin devant"
+        );
+        assert!(
+            at(0.0, -12.0) < at(9.0, 0.0),
+            "loin dans l'axe, avant moins loin de côté"
+        );
     }
 
     #[test]

@@ -955,6 +955,9 @@ pub fn in_world_scaled(arcs: &[Arc], place: Mat4, scale: f32, out: &mut Vec<Bolt
     }
 }
 
+/// (v236) L'éclair en icône, penché en diagonale : un peu plus long que droit.
+const ICON_LONGER: f32 = 1.2;
+
 /// (v217) Horloge des icônes (s) : la même pour toutes, elle tourne toujours.
 pub fn clock() -> f32 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -964,16 +967,21 @@ pub fn clock() -> f32 {
         .as_secs_f32()
 }
 
-/// (v217) L'éclair tenu en main, en icône : centré en (`cx`, `cy`) (pixels), haut de
-/// `size` pixels, à l'instant `t` (il vit comme en main). Pour `Ui::bolts`.
+/// (v217) L'éclair tenu en main, en icône : centré en (`cx`, `cy`) (pixels), long de
+/// `size` pixels, à l'instant `t` (il vit comme en main). Pour `Ui::bolts`. (v236) « En
+/// diagonale, de en bas à gauche vers en haut à droite de sa case, plus droit » : penché de
+/// 45°, et 20 % plus long (la diagonale de la case l'est de 41 %).
 pub fn icon(t: f32, cx: f32, cy: f32, size: f32) -> Vec<BoltSeg> {
     let mut arcs = Vec::new();
     HeldBolt::arcs_at(t, 1.0, &mut arcs);
-    let k = size / HELD_LEN;
+    let k = size * ICON_LONGER / HELD_LEN;
+    // Le haut de l'éclair (+y) vers le haut à droite de l'écran (y vers le bas).
+    let c = std::f32::consts::FRAC_1_SQRT_2;
+    let at = |p: Vec3| [cx + (p.x + p.y) * c * k, cy - (p.y - p.x) * c * k, 0.0, 1.0];
     arcs.iter()
         .map(|s| BoltSeg {
-            a: [cx + s.a.x * k, cy - s.a.y * k, 0.0, 1.0],
-            b: [cx + s.b.x * k, cy - s.b.y * k, 0.0, 1.0],
+            a: at(s.a),
+            b: at(s.b),
             color: tint(s.violet),
             force_a: s.force_a,
             force_b: s.force_b,
@@ -1012,6 +1020,25 @@ pub fn on_screen(arcs: &[Arc], mvp: Mat4, out: &mut Vec<BoltSeg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v236) L'icône de la Foudre de Zeus est penchée : du bas à gauche au haut à droite.
+    #[test]
+    fn the_bolt_icon_goes_from_bottom_left_to_top_right() {
+        for t in [0.0, 0.3, 1.7] {
+            let segs = icon(t, 50.0, 50.0, 16.0);
+            // Corrélation entre « vers la droite » et « vers le haut » (y de l'écran vers
+            // le bas) : forte et positive, du bas à gauche au haut à droite.
+            let (mut xy, mut xx, mut yy) = (0.0, 0.0, 0.0);
+            for p in segs.iter().flat_map(|s| [s.a, s.b]) {
+                let (dx, dy) = (p[0] - 50.0, 50.0 - p[1]);
+                xy += dx * dy;
+                xx += dx * dx;
+                yy += dy * dy;
+            }
+            let r = xy / (xx * yy).sqrt().max(1e-6);
+            assert!(r > 0.8, "en diagonale : corrélation {r}");
+        }
+    }
 
     /// Un éclair relie le nuage au point frappé d'un seul tenant, ne dépend que de sa
     /// graine, et ses branches partent du canal vers le bas.

@@ -62,11 +62,11 @@ struct DynHeader {
     misc: vec4<f32>,
     // Boîtes exactes des joueurs (tournées avec eux) : lignes de la matrice qui ramène le
     // monde au cube unité de chaque boîte.
-    box_x: array<vec4<f32>, 48>,
-    box_y: array<vec4<f32>, 48>,
-    box_z: array<vec4<f32>, 48>,
+    box_x: array<vec4<f32>, 64>,
+    box_y: array<vec4<f32>, 64>,
+    box_z: array<vec4<f32>, 64>,
     // Sphère de chaque boîte (centre, rayon), élargie de quelques centièmes : premier tri.
-    box_s: array<vec4<f32>, 48>,
+    box_s: array<vec4<f32>, 64>,
 };
 
 @group(0) @binding(7) var<uniform> dh: DynHeader;

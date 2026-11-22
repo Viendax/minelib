@@ -303,8 +303,12 @@ pub fn eye_relative(view_proj: Mat4) -> Mat4 {
     )
 }
 
-/// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre.
-pub const MAX_SHADOW_BOXES: usize = 48;
+/// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre. (v236) 64 au lieu de
+/// 48 (onze ou douze joueurs au lieu de huit ou neuf) : dans une foule, les plus proches de
+/// la caméra et de l'axe de vue ont leur ombre exacte (les autres, celle de l'atlas des
+/// joueurs, moins fine). Pas plus : chaque lumière en garde la liste dans deux mots de
+/// 32 bits (`DynLight::boxes`).
+pub const MAX_SHADOW_BOXES: usize = 64;
 
 /// (v209) Nombre maximal de groupes de boîtes d'ombre (voir `shadow_groups`).
 pub const MAX_SHADOW_GROUPS: usize = 16;
@@ -4456,10 +4460,10 @@ mod tests {
     /// tout entière dans la boule de son groupe (sinon le shader en oublierait l'ombre).
     #[test]
     fn shadow_groups_hold_every_box_once() {
-        // 10 joueurs de 6 morceaux (60 boîtes, 48 gardées), à 3 blocs les uns des autres,
-        // puis un groupe serré : deux joueurs collés.
+        // 12 joueurs de 6 morceaux (72 boîtes, 64 gardées depuis la v236), à 3 blocs les
+        // uns des autres, puis un groupe serré : deux joueurs collés.
         let mut boxes = Vec::new();
-        for p in 0..10 {
+        for p in 0..12 {
             let f = Vec3::new(p as f32 * 3.0, 64.0, (p % 3) as f32 * 7.0);
             for k in 0..6 {
                 let lo = f + Vec3::new(-0.3 + 0.1 * k as f32, 0.3 * k as f32, -0.2);
@@ -4514,8 +4518,8 @@ mod tests {
         }
         assert_eq!(next, n, "toutes les boîtes");
         // Un joueur par groupe ici (3 blocs entre eux, plus que la diagonale permise
-        // de deux joueurs) : 8 groupes de 6.
-        assert_eq!(count, 8);
+        // de deux joueurs) : 10 groupes de 6, puis les 4 premières boîtes du onzième.
+        assert_eq!(count, 11);
     }
 
     /// Les shaders se compilent (erreur de WGSL vue avant de lancer le jeu), et les

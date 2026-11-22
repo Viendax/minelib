@@ -119,6 +119,19 @@ impl Input {
     pub fn next_frame(&mut self) {
         self.pressed.clear();
         self.text.clear();
+        self.mouse_pressed = [false; 3];
+        self.scroll = 0.0;
+    }
+
+    /// (v236) Essais : enfonce un bouton de la souris pour cette image (et le tient).
+    pub fn press_mouse(&mut self, b: Mouse) {
+        self.mouse_pressed[b as usize] = true;
+        self.mouse_held[b as usize] = true;
+    }
+
+    /// (v236) Essais : relâche un bouton de la souris.
+    pub fn release_mouse(&mut self, b: Mouse) {
+        self.mouse_held[b as usize] = false;
     }
 
     pub fn held(&self, k: KeyCode) -> bool {

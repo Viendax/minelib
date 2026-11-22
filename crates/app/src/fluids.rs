@@ -22,6 +22,12 @@
 //! son niveau, puis s'étale aussitôt avec ce niveau ; il ne remplit que des cases libres
 //! (un voisin du même fluide se recalcule lui-même à son tour) ; une source qui peut tomber
 //! tombe d'abord et ne s'étale qu'au pas suivant (sauf entourée d'au moins 3 sources).
+//!
+//! (v236) Eau qui sèche : chaque case qui baisse prévient ses voisines après un temps tiré
+//! au hasard (`dry_delay` : 3 à 7 ticks au lieu de 5). Avant, les cases baissaient une sur
+//! deux, au même rythme, en damier, et la dernière couche (le niveau 1, qui ne coule plus)
+//! restait un quart de seconde en damier parfait sur toute la flaque. Maintenant, elle
+//! s'en va par endroits, au hasard.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -46,6 +52,22 @@ pub struct Fluids {
     /// (v185) Blocs emportés par l'eau depuis le dernier relevé (position, bloc) : ils
     /// tombent en objets (voir la session). Ceux que la lave brûle n'y sont pas.
     pub washed: Vec<([i32; 3], BlockId)>,
+    /// (v236) Cases dont l'eau vient de baisser (ou de partir) : en les relevant (`notify`),
+    /// leurs voisines repartent après un temps tiré au hasard.
+    drying: HashSet<[i32; 3]>,
+}
+
+/// (v236) Retard (ticks) des voisines d'une case d'eau qui vient de baisser : de 3 à 7, 5 en
+/// moyenne, tiré d'après la case et le moment (le même d'une partie à l'autre).
+fn dry_delay(q: [i32; 3], tick: u64) -> u64 {
+    let mut h = (q[0] as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (q[1] as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
+        ^ (q[2] as u64).wrapping_mul(0x1656_67b1_9e37_79f9)
+        ^ tick.wrapping_mul(0x27d4_eb2f_1656_67c5);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 32;
+    3 + h % 5
 }
 
 fn delay(f: Fluid) -> u64 {
@@ -117,8 +139,12 @@ fn wet_lava(world: &World, q: [i32; 3]) -> bool {
 
 impl Fluids {
     fn schedule(&mut self, p: [i32; 3], f: Fluid) {
+        self.schedule_in(p, delay(f));
+    }
+
+    fn schedule_in(&mut self, p: [i32; 3], ticks: u64) {
         if self.queued.insert(p) {
-            self.due.entry(self.tick + delay(f)).or_default().push(p);
+            self.due.entry(self.tick + ticks).or_default().push(p);
         }
     }
 
@@ -126,6 +152,8 @@ impl Fluids {
     /// couler. (v185) La lave que l'eau vient de toucher se fige au tick suivant, comme
     /// dans Minecraft (elle attendait son tour, jusqu'à 1,5 s).
     pub fn notify(&mut self, world: &World, p: [i32; 3]) {
+        // (v236) L'eau vient d'y baisser : les voisines repartent au hasard (pas de damier).
+        let dried = self.drying.remove(&p);
         for d in [
             [0, 0, 0],
             [1, 0, 0],
@@ -139,6 +167,8 @@ impl Fluids {
             if let Some((f, _)) = fluid(world.get(q[0], q[1], q[2])) {
                 if wet_lava(world, q) {
                     self.due.entry(self.tick + 1).or_default().push(q);
+                } else if dried && f == Fluid::Water {
+                    self.schedule_in(q, dry_delay(q, self.tick));
                 } else {
                     self.schedule(q, f);
                 }
@@ -174,6 +204,16 @@ impl Fluids {
                             if washed_by_fluid(old) && matches!(fluid(id), Some((Fluid::Water, _)))
                             {
                                 self.washed.push((q, old));
+                            }
+                            // (v236) Eau qui baisse ou qui part : voir `dry_delay`.
+                            if let Some((Fluid::Water, was)) = fluid(old) {
+                                let lower = match fluid(id) {
+                                    Some((Fluid::Water, now)) => strength(now) < strength(was),
+                                    _ => true,
+                                };
+                                if lower {
+                                    self.drying.insert(q);
+                                }
                             }
                             dirty.extend(world.set(q[0], q[1], q[2], id));
                         }
@@ -582,6 +622,7 @@ mod tests {
 
     /// (v185) Les durées de Minecraft (5 ticks par bloc) : 7 blocs atteints en 1,75 s, et
     /// tout est sec 1,75 s après qu'on a retiré la source (simulation de `FlowingFluid`).
+    /// (v236) Sec en un peu plus de temps (jusqu'à 2,5 s) : l'eau qui sèche part au hasard.
     #[test]
     fn spreads_and_dries_at_minecraft_speed() {
         let mut w = world();
@@ -600,7 +641,59 @@ mod tests {
             run(&mut w, &mut fl, TICK);
             t += TICK;
         }
-        assert!((1.65..=1.85).contains(&t), "sec en {t:.2} s");
+        assert!((1.65..=2.5).contains(&t), "sec en {t:.2} s");
+    }
+
+    /// (v236) « Le dernier état de l'eau quand elle disparaît fait une grille » : une flaque
+    /// qui sèche ne laisse plus un damier parfait de niveau 1 sur toute sa surface (64 cases
+    /// à la fois, un quart de seconde) ; sa dernière couche s'en va par endroits, au hasard,
+    /// sans jamais couler (le niveau 1 ne s'étale pas), et tout est sec en moins de 3 s.
+    #[test]
+    fn drying_water_leaves_no_checkerboard() {
+        let mut w = world();
+        let mut fl = Fluids::default();
+        w.set(8, 10, 8, BlockId::WATER);
+        run(&mut w, &mut fl, 10.0);
+        let wet = |w: &World| {
+            let mut cells = Vec::new();
+            for x in 0..16 {
+                for z in 0..16 {
+                    if let Some((_, l)) = level(w, x, 10, z) {
+                        cells.push(([x, z], l));
+                    }
+                }
+            }
+            cells
+        };
+        assert_eq!(wet(&w).len(), 113, "flaque de 7 blocs de rayon");
+        w.set(8, 10, 8, BlockId::AIR);
+        fl.notify(&w, [8, 10, 8]);
+        let (mut t, mut most_ones, mut ends) = (0.0, 0, Vec::new());
+        let mut before = wet(&w).len();
+        while !wet(&w).is_empty() {
+            run(&mut w, &mut fl, TICK);
+            t += TICK;
+            assert!(t < 3.0, "toujours de l'eau après {t:.2} s");
+            let cells = wet(&w);
+            if cells.iter().all(|c| c.1 == 1) {
+                most_ones = most_ones.max(cells.len());
+                if cells.len() < before {
+                    ends.push(t);
+                }
+            }
+            // Jamais plus de cases mouillées qu'avant : rien ne recoule.
+            assert!(cells.len() <= before.max(113), "{} cases", cells.len());
+            before = cells.len();
+        }
+        assert!(
+            most_ones < 48,
+            "{most_ones} cases au niveau 1 à la fois (damier : 64)"
+        );
+        assert!(
+            ends.len() >= 3,
+            "la dernière couche part en {} fois",
+            ends.len()
+        );
     }
 
     /// (v185) L'eau emporte torches et redstone (elles tombent en objets) ; la lave les

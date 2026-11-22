@@ -50,8 +50,8 @@ struct Globals {
     // lumière dont la boîte fait l'ombre (partie entière : −1 aucune, −2 la torche tenue),
     // plus 0,5 si le soleil n'atteint pas la boîte (pas d'ombre du soleil).
     shadow_info: vec4<f32>,
-    shadow_min: array<vec4<f32>, 48>,
-    shadow_max: array<vec4<f32>, 48>,
+    shadow_min: array<vec4<f32>, 64>,
+    shadow_max: array<vec4<f32>, 64>,
     // (v190) Miroirs redessinés à part (voir planar.rs), nombre dans mirror_count.x : pour
     // chacun, la vue-projection de son image et son plan (x = axe, y = coordonnée, z = côté
     // vers lequel il regarde ±1, w = couche de `mirror_tex`). (v200) mirror_count.z = 1 :

@@ -753,8 +753,9 @@ pub struct CrackleAt {
     pub gain: f32,
 }
 
-/// (v220) Volume propre du crépitement (× la distance, × le volume du jeu).
-const CRACKLE_VOLUME: f32 = 0.22;
+/// (v220) Volume propre du crépitement (× la distance, × le volume du jeu). (v236) « Augmente
+/// le son du crépitement de l'éclair dans les mains de 50 % » : 0,33 (0,22 avant).
+const CRACKLE_VOLUME: f32 = 0.33;
 
 /// (v215) Volume du jeu (Paramètres → Son), à part du volume de chaque son : changé, il
 /// vaut tout de suite pour les sons en cours aussi (feu, bips de la bombe), comme le volume
