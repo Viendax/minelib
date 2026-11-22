@@ -11,6 +11,7 @@ mod bags;
 mod contacts;
 mod guards;
 mod hardware;
+mod invites;
 mod limits;
 mod maps;
 mod provinces;
@@ -1370,10 +1371,10 @@ struct State {
     rooms: HashMap<u64, Room>,
     /// Lobbies : n° → connexions (la première est l'hôte du lobby).
     parties: HashMap<u64, Vec<u64>>,
-    /// (v232) Invitations dans un monde de construction pour un ami hors ligne (ou invisible),
-    /// par pseudo invité (en minuscules) : données dès qu'il demande sa liste d'amis (à sa
-    /// connexion), si le monde est encore ouvert (`OFFLINE_INVITE_TTL`).
-    offline_invites: HashMap<String, Vec<OfflineInvite>>,
+    /// (v242) Invitations dans un monde de construction, gardées (fichier) sans limite de
+    /// temps jusqu'à la réponse de l'invité, et refus à dire à qui avait invité (voir
+    /// `invites`).
+    invites: invites::Store,
     next_id: u64,
     /// Dernier passage de l'entretien des garants.
     last_upkeep: Instant,
@@ -1524,7 +1525,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         conns: HashMap::new(),
         rooms: HashMap::new(),
         parties: HashMap::new(),
-        offline_invites: HashMap::new(),
+        invites: invites::Store::open(cfg_dir.join("invitations.bin")),
         next_id: 1,
         last_upkeep: Instant::now(),
         cfg,
@@ -2566,44 +2567,70 @@ fn friend_place(st: &State, friend: &str, asker: &str) -> Option<proto::FriendPl
 /// (v231) Demandes d'ami montrées au plus.
 const FRIEND_REQUESTS_MAX: usize = 50;
 
-/// (v232) Invitation gardée pour un ami hors ligne : de qui, dans quel monde, depuis quand.
-struct OfflineInvite {
-    from: String,
-    room: u64,
-    name: String,
-    at: Instant,
+/// (v242) Partie du relais où le serveur de construction `server` est ouvert en ce moment.
+fn open_world(st: &State, server: &str) -> Option<u64> {
+    st.rooms
+        .iter()
+        .find(|(_, r)| r.kind == 1 && r.server == server)
+        .map(|(&rid, _)| rid)
 }
 
-/// (v232) Une invitation gardée pour un ami hors ligne attend au plus… (s), et au plus
-/// `OFFLINE_INVITES_MAX` par ami (une par joueur qui l'invite, la plus récente).
-const OFFLINE_INVITE_TTL: Duration = Duration::from_secs(2 * 3600);
-const OFFLINE_INVITES_MAX: usize = 5;
-
-/// (v232) Invitations gardées pour `pseudo` (s'il n'est pas invisible) : poussées maintenant,
-/// celles dont le monde est encore ouvert. Celles qui ont trop attendu sont oubliées.
-fn deliver_offline_invites(st: &mut State, id: u64, pseudo: &str) {
-    if st.conns.get(&id).is_none_or(|c| c.hidden_presence) {
-        return;
-    }
-    let Some(list) = st.offline_invites.remove(&pseudo.to_ascii_lowercase()) else {
-        return;
-    };
-    let Some(c) = st.conns.get(&id) else {
-        return;
-    };
-    for inv in list {
-        let open = st.rooms.get(&inv.room).is_some_and(|r| r.kind == 1);
-        if open && inv.at.elapsed() < OFFLINE_INVITE_TTL {
-            transport::push(
-                &c.tx,
-                &Response::Invited {
-                    from: inv.from,
-                    room: inv.room,
-                    name: inv.name,
-                },
-            );
+/// (v242) À la demande de sa liste d'amis (sa connexion, puis toutes les 5 s quand le panneau
+/// est affiché) : les invitations de joueurs qui ne sont plus ses amis dans les deux sens sont
+/// oubliées ; il est prévenu une fois de celles qui sont arrivées pendant son absence (v232 :
+/// hors ligne ou invisible), et des refus de ses invitations pendant la sienne.
+fn deliver_invites(st: &mut State, id: u64, pseudo: &str) {
+    let stats = &st.stats;
+    st.invites.retain(pseudo, |i| {
+        stats.befriends(&i.from, pseudo) && stats.befriends(pseudo, &i.from)
+    });
+    let hidden = st.conns.get(&id).is_none_or(|c| c.hidden_presence);
+    let mut out = Vec::new();
+    if !hidden {
+        for inv in st.invites.take_unseen(pseudo) {
+            out.push(Response::Invited {
+                room: open_world(st, &inv.server).unwrap_or(0),
+                from: inv.from,
+                name: inv.name,
+            });
         }
     }
+    for d in st.invites.take_declined(pseudo) {
+        out.push(Response::InviteDeclined {
+            by: d.by,
+            name: d.name,
+        });
+    }
+    if let Some(c) = st.conns.get(&id) {
+        for m in &out {
+            transport::push(&c.tx, m);
+        }
+    }
+}
+
+/// (v242) Ses invitations (la plus récente d'abord), avec la partie de leur monde s'il est
+/// ouvert.
+fn invites_of(st: &State, pseudo: &str) -> Vec<proto::WorldInvite> {
+    st.invites
+        .of(pseudo)
+        .iter()
+        .map(|i| {
+            let room = open_world(st, &i.server);
+            proto::WorldInvite {
+                from: i.from.clone(),
+                room: room.unwrap_or(0),
+                name: i.name.clone(),
+                open: room.is_some(),
+            }
+        })
+        .collect()
+}
+
+/// Secondes Unix.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// (v231) Sa liste d'amis : en ligne (s'ils nous ont ajouté aussi et ne sont pas invisibles),
@@ -2636,6 +2663,7 @@ fn friends_response(st: &State, pseudo: &str) -> Response {
         online,
         places,
         requests: st.stats.requests_to(pseudo, FRIEND_REQUESTS_MAX),
+        invites: invites_of(st, pseudo),
     }
 }
 
@@ -6854,7 +6882,8 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 }
             }
             // (v232) Invitations reçues hors ligne : la liste est demandée à la connexion.
-            deliver_offline_invites(st, id, pseudo);
+            // (v242) Et les refus de ses invitations.
+            deliver_invites(st, id, pseudo);
             friends_response(st, pseudo)
         }
         // (v231) Demande d'ami refusée : on est retiré de sa liste.
@@ -6868,10 +6897,10 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
         }
         // (v231) Invitation d'un ami dans le monde de construction où l'on est.
         Request::Invite { pseudo: who } => {
-            let Some((rid, name)) = my_room
+            let Some((rid, name, server)) = my_room
                 .and_then(|rid| st.rooms.get(&rid).map(|r| (rid, r)))
                 .filter(|(_, r)| r.kind == 1)
-                .map(|(rid, r)| (rid, r.name.clone()))
+                .map(|(rid, r)| (rid, r.name.clone(), r.server.clone()))
             else {
                 return Some(err(
                     ErrorCode::Refused,
@@ -6896,38 +6925,59 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     "Trop d'invitations : attends un peu.",
                 ));
             }
+            // (v242) Gardée sans limite de temps jusqu'à sa réponse, une par joueur qui
+            // l'invite (la plus récente) : dans sa liste d'amis.
+            st.invites.add(
+                &who,
+                invites::Invite {
+                    from: pseudo.to_string(),
+                    server,
+                    name: name.clone(),
+                    at: unix_now(),
+                    seen: false,
+                },
+            );
             let target = conn_of(st, &who)
                 .filter(|t| st.conns.get(t).is_some_and(|c| !c.hidden_presence));
-            match target.and_then(|t| st.conns.get(&t)) {
-                Some(c) => {
-                    transport::push(
-                        &c.tx,
-                        &Response::Invited {
-                            from: pseudo.to_string(),
-                            room: rid,
-                            name,
-                        },
-                    );
-                }
-                // (v232) Hors ligne (ou invisible : on ne le distingue pas) : gardée pour sa
-                // prochaine connexion, une par joueur qui l'invite.
-                None => {
-                    let list = st.offline_invites.entry(who.to_ascii_lowercase()).or_default();
-                    list.retain(|i| {
-                        !i.from.eq_ignore_ascii_case(pseudo) && i.at.elapsed() < OFFLINE_INVITE_TTL
-                    });
-                    list.push(OfflineInvite {
+            // (v232) Hors ligne (ou invisible : on ne le distingue pas) : prévenu à sa
+            // prochaine connexion (`deliver_invites`).
+            if let Some(c) = target.and_then(|t| st.conns.get(&t)) {
+                transport::push(
+                    &c.tx,
+                    &Response::Invited {
                         from: pseudo.to_string(),
                         room: rid,
                         name,
-                        at: Instant::now(),
-                    });
-                    if list.len() > OFFLINE_INVITES_MAX {
-                        list.remove(0);
+                    },
+                );
+                st.invites.mark_seen(&who, pseudo);
+            }
+            Response::Done
+        }
+        // (v242) Réponse à une invitation : retirée ; refusée, celui qui avait invité en est
+        // prévenu (plus tard s'il n'est pas connecté) ; ignorée, il n'en sait rien.
+        Request::InviteReply { from, reply } => {
+            if let Some(inv) = st.invites.remove(pseudo, &from) {
+                if reply == proto::INVITE_DECLINE {
+                    let note = Response::InviteDeclined {
+                        by: pseudo.to_string(),
+                        name: inv.name.clone(),
+                    };
+                    let told = conn_of(st, &inv.from)
+                        .and_then(|t| st.conns.get(&t))
+                        .is_some_and(|c| transport::push(&c.tx, &note));
+                    if !told {
+                        st.invites.note_declined(
+                            &inv.from,
+                            invites::Declined {
+                                by: pseudo.to_string(),
+                                name: inv.name,
+                            },
+                        );
                     }
                 }
             }
-            Response::Done
+            friends_response(st, pseudo)
         }
         Request::Presence { hidden } => {
             if let Some(c) = st.conns.get_mut(&id) {
@@ -7919,6 +7969,7 @@ fn handle(
             | Request::Leaderboard { .. }
             | Request::Friend { .. }
             | Request::Invite { .. }
+            | Request::InviteReply { .. }
             | Request::Presence { .. }
             | Request::FriendDecline { .. }
             | Request::Party { .. }
@@ -9830,7 +9881,9 @@ mod tests {
     /// retiré de sa liste. Ses amis : où ils sont (au menu, dans un monde de construction
     /// rejoignable) ; une invitation dans son monde arrive à l'ami ; invisible, il est hors
     /// ligne pour les autres et ne peut plus être invité ; pas d'invitation à qui n'est pas son
-    /// ami (dans les deux sens), ni hors d'un monde.
+    /// ami (dans les deux sens), ni hors d'un monde. (v242) Les invitations restent dans la
+    /// liste de l'invité jusqu'à sa réponse, monde fermé compris : refusée, celui qui a invité
+    /// le sait (à sa connexion s'il était parti) ; ignorée, non.
     #[test]
     fn friends_see_where_others_are_and_get_invited() {
         let dir = std::env::temp_dir().join(format!("minelib-amis-{}", rand::random::<u32>()));
@@ -9852,14 +9905,19 @@ mod tests {
             wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
             c
         };
-        // Réponse d'amis de `c` : (pseudo, en ligne), où ils sont, demandes reçues.
+        // Réponse d'amis de `c` : (pseudo, en ligne), où ils sont, demandes reçues, (v242)
+        // invitations.
         let answer = |c: &Client| {
             let l = match wait(c, |e| matches!(e, Event::Friends(_))) {
                 Event::Friends(l) => l,
                 _ => unreachable!(),
             };
             match wait(c, |e| matches!(e, Event::FriendInfo { .. })) {
-                Event::FriendInfo { places, requests } => (l, places, requests),
+                Event::FriendInfo {
+                    places,
+                    requests,
+                    invites,
+                } => (l, places, requests, invites),
                 _ => unreachable!(),
             }
         };
@@ -9895,15 +9953,15 @@ mod tests {
         let alice = login("Alice");
         let bob = login("Bob");
         // Demande : Bob la reçoit ; Alice ne sait rien de lui tant qu'il n'a pas accepté.
-        let (l, p, _) = add(&alice, "bob");
+        let (l, p, _, _) = add(&alice, "bob");
         assert_eq!(l, vec![("Bob".to_string(), false)]);
         assert_eq!(p, vec![pending.clone()]);
         assert_eq!(added(&bob), ("Alice".to_string(), false));
-        let (l, _, r) = friends(&bob);
+        let (l, _, r, _) = friends(&bob);
         assert!(l.is_empty());
         assert_eq!(r, vec!["Alice".to_string()]);
         // Acceptée : vous êtes amis, Alice l'apprend.
-        let (l, _, r) = add(&bob, "Alice");
+        let (l, _, r, _) = add(&bob, "Alice");
         assert_eq!(l, vec![("Alice".to_string(), true)]);
         assert!(r.is_empty());
         assert_eq!(added(&alice), ("Bob".to_string(), true));
@@ -9921,7 +9979,7 @@ mod tests {
             Event::Hosted(r) => r,
             _ => unreachable!(),
         };
-        let (l, p, _) = friends(&bob);
+        let (l, p, _, _) = friends(&bob);
         assert_eq!(l, vec![("Alice".to_string(), true)]);
         assert_eq!(
             p,
@@ -9932,7 +9990,7 @@ mod tests {
                 joinable: true
             }]
         );
-        let (l, p, _) = friends(&alice);
+        let (l, p, _, _) = friends(&alice);
         assert_eq!(l, vec![("Bob".to_string(), true)]);
         assert_eq!(p, vec![proto::FriendPlace::default()], "au menu");
         // Invitation : Bob la reçoit.
@@ -9964,7 +10022,7 @@ mod tests {
         // qu'il est invisible, donnée quand il redevient visible et demande sa liste.
         bob.send(Cmd::Presence(true));
         std::thread::sleep(Duration::from_millis(100));
-        let (l, p, _) = friends(&alice);
+        let (l, p, _, _) = friends(&alice);
         assert_eq!(l[0], ("Bob".to_string(), false));
         assert_eq!(p[0], proto::FriendPlace::default());
         alice.send(Cmd::Invite("Bob".into()));
@@ -10022,6 +10080,90 @@ mod tests {
         }
         // Une seule fois.
         list_without_invite(&dave);
+        // (v242) Sans limite de temps : toujours dans leur liste, jusqu'à leur réponse.
+        let invite = |r: u64, open: bool| proto::WorldInvite {
+            from: "Alice".into(),
+            room: r,
+            name: "Château".into(),
+            open,
+        };
+        assert_eq!(friends(&bob).3, vec![invite(room, true)]);
+        assert_eq!(friends(&dave).3, vec![invite(room, true)]);
+        // Bob refuse : retirée, Alice le sait.
+        bob.send(Cmd::InviteReply {
+            from: "alice".into(),
+            reply: proto::INVITE_DECLINE,
+        });
+        assert!(answer(&bob).3.is_empty());
+        match wait(&alice, |e| matches!(e, Event::InviteDeclined { .. })) {
+            Event::InviteDeclined { by, name } => {
+                assert_eq!((by.as_str(), name.as_str()), ("Bob", "Château"));
+            }
+            _ => unreachable!(),
+        }
+        // Le monde fermé : l'invitation de Dave reste, sans partie ; rouvert, avec la nouvelle.
+        alice.send(Cmd::Leave);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(friends(&dave).3, vec![invite(0, false)]);
+        alice.send(Cmd::Host {
+            kind: 1,
+            name: "Château".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room2 = match wait(&alice, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        assert_eq!(friends(&dave).3, vec![invite(room2, true)]);
+        // Dave l'ignore : retirée, Alice n'en sait rien.
+        dave.send(Cmd::InviteReply {
+            from: "Alice".into(),
+            reply: proto::INVITE_IGNORE,
+        });
+        assert!(answer(&dave).3.is_empty());
+        alice.send(Cmd::Friend {
+            pseudo: String::new(),
+            add: false,
+        });
+        match wait(&alice, |e| {
+            matches!(e, Event::InviteDeclined { .. } | Event::FriendInfo { .. })
+        }) {
+            Event::FriendInfo { .. } => {}
+            e => panic!("ignorée : Alice n'en sait rien ({e:?})"),
+        }
+        // Refusée pendant qu'Alice n'est pas là : elle le sait à sa connexion.
+        alice.send(Cmd::Invite("Dave".into()));
+        wait(&alice, |e| matches!(e, Event::InviteSent(_)));
+        drop(alice);
+        let t = Instant::now();
+        while friends(&dave).0.contains(&("Alice".to_string(), true)) {
+            assert!(t.elapsed() < Duration::from_secs(10), "Alice toujours en ligne");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        dave.send(Cmd::InviteReply {
+            from: "Alice".into(),
+            reply: proto::INVITE_DECLINE,
+        });
+        assert!(answer(&dave).3.is_empty());
+        let alice = Client::spawn(addr.clone(), Some(h.public));
+        alice.send(Cmd::Login {
+            pseudo: "alice".into(),
+            password: "motdepasse".into(),
+            totp: None,
+            backup: None,
+            device: None,
+        });
+        wait(&alice, |e| matches!(e, Event::LoggedIn { .. }));
+        alice.send(Cmd::Friend {
+            pseudo: String::new(),
+            add: false,
+        });
+        match wait(&alice, |e| matches!(e, Event::InviteDeclined { .. })) {
+            Event::InviteDeclined { by, .. } => assert_eq!(by, "Dave"),
+            _ => unreachable!(),
+        }
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
     }

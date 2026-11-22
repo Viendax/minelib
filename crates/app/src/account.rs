@@ -976,8 +976,15 @@ impl Accounts {
                     self.busy = None;
                     self.friends = list;
                 }
-                Event::FriendInfo { places, requests } => {
+                Event::FriendInfo {
+                    places,
+                    requests,
+                    invites,
+                } => {
                     self.friend_places = places;
+                    // (v242) Le relais garde les invitations jusqu'à la réponse : sa liste fait
+                    // foi.
+                    self.world_invites = invites;
                     for r in &requests {
                         if self.requests_seen.insert(r.to_lowercase()) {
                             self.new_requests.push(r.clone());
@@ -1018,12 +1025,14 @@ impl Accounts {
                             from: from.clone(),
                             room,
                             name: name.clone(),
+                            open: room != 0,
                         },
                     );
-                    self.world_invites.truncate(5);
                     self.game_events.push(Event::Invited { from, room, name });
                 }
-                e @ Event::InviteSent(_) => self.game_events.push(e),
+                e @ (Event::InviteSent(_) | Event::InviteDeclined { .. }) => {
+                    self.game_events.push(e)
+                }
                 Event::Maps(list) => {
                     self.busy = None;
                     self.maps = list;

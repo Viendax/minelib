@@ -120,24 +120,33 @@ fn vl_ray(m: mat4x4<f32>, ndc: vec2<f32>) -> vec3<f32> {
     return d / dot(rw, d);
 }
 
+/// (v242) Point du rayon `ray` à la profondeur `z` (Z inversé ; 0 : à l'infini, la seule
+/// direction), dans l'image précédente (coordonnées de coupe).
+fn vl_prev_clip(ray: vec3<f32>, z: f32) -> vec4<f32> {
+    let near_plane = vf.cur_rel[3][2];
+    if z > 0.0 {
+        return vf.prev_rel * vec4<f32>(ray * (near_plane / z) + vf.delta.xyz, 1.0);
+    }
+    return vf.prev_rel * vec4<f32>(ray, 0.0);
+}
+
 /// (v223) Lumière d'une couche à la profondeur `z` (Z inversé, 0 : ciel) le long de `ray`,
 /// dans l'image précédente : (rgb × poids, poids). Le point est ramené à la caméra d'avant
 /// (exact quand on ne fait que tourner), puis lu chez ses quatre voisins de l'historique,
 /// pondérés par la place et l'accord de leur profondeur avec celle qu'il avait alors.
-fn vl_history(ray: vec3<f32>, z: f32, far: bool) -> vec4<f32> {
-    let near_plane = vf.cur_rel[3][2];
-    var pc: vec4<f32>;
-    if z > 0.0 {
-        pc = vf.prev_rel * vec4<f32>(ray * (near_plane / z) + vf.delta.xyz, 1.0);
-    } else {
-        // Ciel (ou rien) : seulement la direction.
-        pc = vf.prev_rel * vec4<f32>(ray, 0.0);
-    }
-    if pc.w <= 1e-6 {
+/// (v242) Lue là où était la lumière reçue (`zl`, sa distance moyenne ; 0 : celle de la
+/// surface) : en se déplaçant, les rayons d'une lumière à 10 blocs devant un mur à 50 ne
+/// glissent plus à la vitesse du mur (« la lumière des projecteurs ne va pas à la même
+/// vitesse que les blocs quand je me déplace »). L'accord des profondeurs reste celui de la
+/// surface.
+fn vl_history(ray: vec3<f32>, z: f32, zl: f32, far: bool) -> vec4<f32> {
+    let pc = vl_prev_clip(ray, select(z, zl, zl > 0.0));
+    let ps = vl_prev_clip(ray, z);
+    if pc.w <= 1e-6 || ps.w <= 1e-6 {
         return vec4<f32>(0.0);
     }
     let ndc = pc.xy / pc.w;
-    let expect = max(pc.z / pc.w, 0.0);
+    let expect = max(ps.z / ps.w, 0.0);
     let k = max(vf.margin.z, 1.0);
     let p = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vf.size.xy / k + vf.margin.xy - 0.5;
     let i0 = vec2<i32>(floor(p));
@@ -239,6 +248,8 @@ fn fs_temporal(@builtin(position) frag: vec4<f32>) -> TemporalOut {
         return o;
     }
     let s = vl_tap(c);
+    // (v242) Distances moyennes de la lumière reçue (profondeurs de l'image des portées).
+    let cd = vl_unpack(textureLoad(vl_carried, c, 0));
     var near = vec4<f32>(0.0);
     var far = vec4<f32>(0.0);
     var near_d = vec4<f32>(0.0);
@@ -281,8 +292,8 @@ fn fs_temporal(@builtin(position) frag: vec4<f32>) -> TemporalOut {
     var hn = vec4<f32>(0.0);
     var hf = vec4<f32>(0.0);
     if vf.delta.w > 0.5 {
-        hn = vl_history(ray, s.dn, false);
-        hf = vl_history(ray, s.df, true);
+        hn = vl_history(ray, s.dn, cd.dn, false);
+        hf = vl_history(ray, s.df, cd.df, true);
     }
     let a = clamp(vf.jitter.z, 0.02, 1.0);
     let kn = clamp(hn.w * 1.25 - 0.25, 0.0, 1.0);

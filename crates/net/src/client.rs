@@ -190,6 +190,12 @@ pub enum Cmd {
     Presence(bool),
     /// (v231) Refuse la demande d'ami de ce joueur.
     FriendDecline(String),
+    /// (v242) Réponse à l'invitation de `from` (`proto::INVITE_ACCEPT`, `INVITE_DECLINE`,
+    /// `INVITE_IGNORE`).
+    InviteReply {
+        from: String,
+        reply: u8,
+    },
     /// (v240) Défi pour une connexion par clé d'accès (nouvelle connexion au relais) :
     /// `Event::PasskeyChallenge`.
     PasskeyChallenge,
@@ -340,10 +346,16 @@ pub enum Event {
     /// Amis, et s'ils sont en ligne.
     Friends(Vec<(String, bool)>),
     /// (v231) Où sont ses amis (même ordre que `Friends`, juste après lui), et les demandes
-    /// d'ami reçues.
+    /// d'ami reçues. (v242) Et les invitations pas encore répondues.
     FriendInfo {
         places: Vec<crate::proto::FriendPlace>,
         requests: Vec<String>,
+        invites: Vec<crate::proto::WorldInvite>,
+    },
+    /// (v242) `by` a refusé notre invitation dans le monde `name`.
+    InviteDeclined {
+        by: String,
+        name: String,
     },
     /// (v231) `from` vient de nous ajouter en ami (`mutual` : on l'avait ajouté ; sinon,
     /// c'est une demande).
@@ -846,6 +858,7 @@ impl Worker {
             },
             Response::PartyInvite { from } => Event::PartyInvite(from),
             Response::Invited { from, room, name } => Event::Invited { from, room, name },
+            Response::InviteDeclined { by, name } => Event::InviteDeclined { by, name },
             Response::FriendAdded { from, mutual } => Event::FriendAdded { from, mutual },
             Response::SkinChanged { pseudo } => Event::SkinChanged(pseudo),
             Response::Party { id, members } => Event::Party { id, members },
@@ -1646,6 +1659,10 @@ impl Worker {
                 let r = self.request(&Request::FriendDecline { pseudo })?;
                 self.friends_answer(r)
             }
+            Cmd::InviteReply { from, reply } => {
+                let r = self.request(&Request::InviteReply { from, reply })?;
+                self.friends_answer(r)
+            }
             Cmd::PasskeyChallenge => {
                 self.chan = None;
                 self.connect()?;
@@ -1906,6 +1923,7 @@ impl Worker {
                 online,
                 places,
                 requests,
+                invites,
             } => {
                 let both = list
                     .into_iter()
@@ -1913,7 +1931,11 @@ impl Worker {
                     .map(|(i, p)| (p, online.get(i).copied().unwrap_or(false)))
                     .collect();
                 self.emit(Event::Friends(both));
-                self.emit(Event::FriendInfo { places, requests });
+                self.emit(Event::FriendInfo {
+                    places,
+                    requests,
+                    invites,
+                });
                 Ok(())
             }
             r => self.unexpected(r),

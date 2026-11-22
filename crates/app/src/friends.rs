@@ -6,7 +6,9 @@
 //! deux sens : ajouter quelqu'un lui envoie une demande (Accepter, ou x), et on ne sait rien
 //! de lui tant qu'il ne l'a pas acceptée. Les invitations et les demandes reçues y attendent
 //! (avec une notification à leur arrivée), et le statut rend invisible : hors ligne pour ses
-//! amis, sans invitations.
+//! amis, sans invitations. (v242) Une invitation attend sans limite de temps (le relais la
+//! garde) qu'on l'accepte (on rejoint le monde), la refuse (celui qui a invité le sait) ou
+//! l'ignore (il n'en sait rien).
 
 use minelib_net::proto::{self, FriendPlace};
 use minelib_platform::{Input, KeyCode, Mouse};
@@ -14,13 +16,9 @@ use minelib_render::Ui;
 
 use crate::menu::{fit, Ctx, GOLD, GREY, WHITE};
 
-/// Invitation reçue dans le monde de construction d'un ami.
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorldInvite {
-    pub from: String,
-    pub room: u64,
-    pub name: String,
-}
+/// Invitation reçue dans le monde de construction d'un ami. (v242) Celle du relais : avec sa
+/// partie si le monde est ouvert (`open`).
+pub use minelib_net::proto::WorldInvite;
 
 /// Ce que le panneau garde d'une image à l'autre.
 #[derive(Default)]
@@ -70,8 +68,10 @@ pub enum FriendsAction {
     Invite(String),
     /// Invisible (vrai) ou non.
     Invisible(bool),
-    /// Oublier l'invitation `i`.
-    Dismiss(usize),
+    /// (v242) Répondre à l'invitation `i` : `proto::INVITE_ACCEPT` (rejoindre son monde),
+    /// `INVITE_DECLINE` (refuser : celui qui a invité le sait), `INVITE_IGNORE` (l'oublier, il
+    /// n'en sait rien).
+    Answer(usize, u8),
     /// Refuser la demande d'ami de ce joueur (l'accepter : `Add`).
     Decline(String),
 }
@@ -84,6 +84,15 @@ pub fn place_text(online: bool, p: Option<&FriendPlace>) -> String {
         (true, Some(p)) if p.kind == proto::FRIEND_BUILD => format!("construit dans « {} »", p.name),
         (true, Some(p)) if p.kind == proto::FRIEND_FPS => format!("en partie FPS ({})", p.name),
         (true, _) => "au menu".into(),
+    }
+}
+
+/// (v242) Une invitation, en mots : de qui, quel monde, s'il est fermé pour l'instant.
+pub fn invite_text(inv: &WorldInvite) -> String {
+    if inv.open {
+        format!("{} t'invite dans « {} »", inv.from, inv.name)
+    } else {
+        format!("{} t'invite dans « {} » (fermé)", inv.from, inv.name)
     }
 }
 
@@ -206,22 +215,34 @@ pub fn panel(
         }
         y += 36.0 * s;
     }
-    // Invitations reçues dans le monde d'un ami.
+    // Invitations reçues dans le monde d'un ami (v242) : Accepter (son monde fermé : on ne peut
+    // pas encore), Refuser, Ignorer.
     for (i, inv) in v.invites.iter().enumerate().take(2) {
         c.ui.rect(lx, y, inner, 34.0 * s, [0.9, 0.75, 0.2, 0.15]);
-        let t = fit(
-            &format!("{} t'invite dans « {} »", inv.from, inv.name),
-            inner - 4.0 * s,
-            ds,
-        );
-        c.ui.text(lx + 3.0 * s, y + 4.0 * s, ds, GOLD, t);
-        if c.button("Rejoindre", lx + bw * s / 2.0 + s, y + 13.0 * s, bw, true) {
-            out = FriendsAction::Join(inv.room);
-        }
-        if c.button("x", xs, y + 13.0 * s, 20.0, true) {
-            out = FriendsAction::Dismiss(i);
+        c.ui.text(lx + 3.0 * s, y + 4.0 * s, ds, GOLD, fit(&invite_text(inv), inner - 4.0 * s, ds));
+        let third = (inner / s - 4.0) / 3.0;
+        let at = |k: f32| lx + (k * (third + 2.0) + third / 2.0) * s;
+        let replies = [
+            ("Accepter", proto::INVITE_ACCEPT, inv.open),
+            ("Refuser", proto::INVITE_DECLINE, true),
+            ("Ignorer", proto::INVITE_IGNORE, true),
+        ];
+        for (k, (label, reply, on)) in replies.into_iter().enumerate() {
+            if c.button(label, at(k as f32), y + 13.0 * s, third, on) {
+                out = FriendsAction::Answer(i, reply);
+            }
         }
         y += 36.0 * s;
+    }
+    if v.invites.len() > 2 {
+        let more = v.invites.len() - 2;
+        let t = if more == 1 {
+            "et 1 autre invitation".to_string()
+        } else {
+            format!("et {more} autres invitations")
+        };
+        c.ui.text(lx, y, ds, GOLD, fit(&t, inner, ds));
+        y += 6.0 * ds + 3.0 * s;
     }
     // Les amis (en ligne d'abord), filtrés par la recherche : deux lignes, le pseudo et où il
     // est. Clic : le rejoindre, ou l'inviter (dans un monde) ; clic droit : options.
@@ -441,6 +462,21 @@ mod tests {
         assert_eq!(actions(&view(Some(3)), 2), (None, false));
         // Déjà dans le monde de Bob : rien.
         assert_eq!(actions(&view(Some(7)), 0), (None, false));
+    }
+
+    /// (v242) Une invitation dit si son monde est fermé (on ne peut pas encore l'accepter).
+    #[test]
+    fn an_invitation_says_when_its_world_is_closed() {
+        let mut inv = WorldInvite {
+            from: "Ana".into(),
+            room: 7,
+            name: "Château".into(),
+            open: true,
+        };
+        assert_eq!(invite_text(&inv), "Ana t'invite dans « Château »");
+        inv.open = false;
+        inv.room = 0;
+        assert_eq!(invite_text(&inv), "Ana t'invite dans « Château » (fermé)");
     }
 
     #[test]

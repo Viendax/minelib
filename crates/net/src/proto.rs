@@ -21,7 +21,10 @@ use serde::{Deserialize, Serialize};
 /// (v241) 61 : la Foudre de Zeus dans le dos de qui l'a sur lui sans la tenir (bit
 /// `poses::Held::BACK` de l'objet tenu, avec la position ; un jeu d'avant rejetait tout le
 /// paquet des positions qui le contient).
-pub const PROTOCOL: u32 = 61;
+/// (v242) 62 : invitations gardées par le relais sans limite de temps, jusqu'à la réponse
+/// (`Response::Friends::invites`), Accepter / Refuser / Ignorer (`Request::InviteReply`), et
+/// le refus dit à qui avait invité (`Response::InviteDeclined`).
+pub const PROTOCOL: u32 = 62;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -696,10 +699,21 @@ pub enum Request {
     },
     /// (v231) Invite un ami (dans les deux sens) dans le monde de construction où l'on est : il
     /// en est prévenu (`Response::Invited`) et peut le rejoindre. (v232) Hors ligne ou
-    /// invisible : l'invitation l'attend (deux heures au plus, si le monde est encore ouvert),
-    /// donnée quand il demande sa liste d'amis (à sa connexion).
+    /// invisible : prévenu quand il demande sa liste d'amis (à sa connexion). (v242) Le relais
+    /// la garde sans limite de temps (une par joueur qui invite, la plus récente), jusqu'à ce
+    /// qu'il y réponde (`InviteReply`) : elle est dans sa liste d'amis
+    /// (`Response::Friends::invites`).
     Invite {
         pseudo: String,
+    },
+    /// (v242) Réponse à l'invitation de `from` (`INVITE_ACCEPT`, `INVITE_DECLINE`,
+    /// `INVITE_IGNORE`) : elle est retirée ; refusée, `from` en est prévenu
+    /// (`Response::InviteDeclined`, gardé pour lui s'il n'est pas en ligne) ; ignorée, il n'en
+    /// sait rien. Accepter ne fait pas entrer dans le monde (`Join` ensuite). Réponse :
+    /// `Response::Friends`.
+    InviteReply {
+        from: String,
+        reply: u8,
     },
     /// (v231) Statut vu par ses amis : `hidden` (invisible) : hors ligne pour eux, et pas
     /// d'invitations.
@@ -947,6 +961,8 @@ pub enum Response {
         places: Vec<FriendPlace>,
         /// (v231) Demandes d'ami : ceux qui nous ont ajouté et qu'on n'a pas ajoutés.
         requests: Vec<String>,
+        /// (v242) Invitations reçues, pas encore répondues (la plus récente d'abord).
+        invites: Vec<WorldInvite>,
     },
     /// Skin d'un joueur (vide : aucun).
     Skin {
@@ -1489,6 +1505,11 @@ pub enum Response {
         room: u64,
         name: String,
     },
+    /// (v242) Poussé : `by` a refusé notre invitation dans le monde `name`.
+    InviteDeclined {
+        by: String,
+        name: String,
+    },
     /// (v231) Poussé : `from` vient de nous ajouter en ami ; `mutual` : on l'avait ajouté
     /// (vous êtes amis), sinon c'est une demande.
     FriendAdded {
@@ -1537,6 +1558,21 @@ pub const FRIEND_BUILD: u8 = 1;
 pub const FRIEND_FPS: u8 = 2;
 pub const FRIEND_PENDING: u8 = 3;
 
+/// (v242) Invitation reçue dans le monde de construction d'un ami : de qui, le monde, sa
+/// partie sur le relais s'il est ouvert (`open` ; sinon 0 : on ne peut pas encore y entrer).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct WorldInvite {
+    pub from: String,
+    pub room: u64,
+    pub name: String,
+    pub open: bool,
+}
+
+/// (v242) Réponses à une invitation (`Request::InviteReply`).
+pub const INVITE_ACCEPT: u8 = 0;
+pub const INVITE_DECLINE: u8 = 1;
+pub const INVITE_IGNORE: u8 = 2;
+
 impl Response {
     /// Message poussé par le relais (pas une réponse à une requête).
     pub fn is_push(&self) -> bool {
@@ -1545,6 +1581,7 @@ impl Response {
             Response::PeerJoined { .. }
                 | Response::PartyInvite { .. }
                 | Response::Invited { .. }
+                | Response::InviteDeclined { .. }
                 | Response::FriendAdded { .. }
                 | Response::Party { .. }
                 | Response::PartyGo { .. }

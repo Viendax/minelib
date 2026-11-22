@@ -231,6 +231,10 @@ struct VlLayers {
     // (v223) Les mêmes couches, pour les lumières portées (lampe torche, torche tenue).
     near_d: vec3<f32>,
     far_d: vec3<f32>,
+    // (v242) Distance moyenne de la lumière reçue des lumières posées (pondérée par elle),
+    // jusqu'à la surface proche et jusqu'à la lointaine ; 0 : aucune.
+    tc_near: f32,
+    tc_far: f32,
 };
 
 /// Lumière diffusée vers la caméra `o`, direction `d`, par les lumières de la tuile dont le
@@ -243,9 +247,13 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f3
     var result_near = vec3<f32>(0.0);
     var result_d = vec3<f32>(0.0);
     var result_near_d = vec3<f32>(0.0);
+    var cw = 0.0;
+    var ct = 0.0;
+    var cw_n = 0.0;
+    var ct_n = 0.0;
     let count = dh.counts.x;
     if count == 0u || max_t < 0.01 {
-        return VlLayers(result, result, result, result);
+        return VlLayers(result, result, result, result, 0.0, 0.0);
     }
     let words = dl_tile_words(count);
     let flags = dh.vl_c.w;
@@ -327,109 +335,166 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f3
                     n1 = clamp(i32(ceil(f32(steps) * (cut - tn) / seg)), steps / 2, steps - 1);
                 }
                 let phase_spot = vl_phase(dot(d, -axis), g_hg);
+                // (v242) Point du rayon le plus proche de la lumière, et sa distance (au moins
+                // un centième de bloc) : les pas équiangulaires se serrent autour de lui.
+                let t0 = dot(lp - o, d);
+                let bq = max(length(o + d * t0 - lp), 0.01);
                 // Ombres des murs : un échantillon tous les `sh_stride` pas depuis le début de
-                // chaque partie, aux mêmes pas pour tous les pixels ; un pas qui éclaire prend
-                // l'interpolation des deux qui l'encadrent, lus à la demande (aucun là où le
-                // faisceau est trop faible pour compter). Le faisceau s'arrête au mur, sans
+                // chaque suite de pas, aux mêmes pas pour tous les pixels ; un pas qui éclaire
+                // prend l'interpolation des deux qui l'encadrent, lus à la demande (aucun là où
+                // le faisceau est trop faible pour compter). Le faisceau s'arrête au mur, sans
                 // traîner derrière ni passer avant le premier échantillon.
                 let sh_on = shadows_on && L.shadow.x > 0.5;
-                var trans = 1.0;
                 var acc = vec3<f32>(0.0);
                 var acc_n = vec3<f32>(0.0);
-                // Avant le premier échantillon, un pas trop faible pour en lire un ne compte pas
-                // (au plus 1 % du faisceau, à son bord) : rien ne passe sans avoir été vu.
-                var vis = select(1.0, 0.0, sh_on);
-                var nz = 0.5;
+                // (v242) Distance de la lumière reçue (moyenne pondérée par elle), jusqu'à la
+                // surface proche et jusqu'à la lointaine : la reprise d'une image à l'autre la
+                // lit là, pas sur la surface (voir `fs_temporal`).
+                var lw = 0.0;
+                var lt = 0.0;
+                var lw_n = 0.0;
+                var lt_n = 0.0;
                 for (var part = 0; part < 2; part++) {
                     let n = select(steps - n1, n1, part == 0);
-                    if n > 0 && trans >= 0.02 {
-                        let step_len = select((tf - cut) / f32(n), (cut - tn) / f32(n), part == 0);
-                        let absorb = exp(-ext * step_len);
-                        // Octave fine du bruit effacée quand le pas ne la voit plus (scintillement).
-                        let w2 = 0.35 * clamp(dh.vl_b.y / (2.53 * step_len), 0.0, 1.0);
-                        let last = n - 1;
-                        // Intervalle d'ombre [sh_a, sh_b] du pas, 1 / sa longueur, échantillons
-                        // lus (`loaded`), et celui du bout du précédent resservi (`b_ok`).
-                        // (Dernier bout plus court qu'un intervalle : sa valeur de départ.)
-                        var sh_a = 0;
-                        var sh_b = select(0, sh_stride, sh_stride <= last);
-                        var inv = 1.0 / f32(max(sh_b, 1));
-                        var loaded = false;
-                        var b_ok = false;
-                        var vis_a = 1.0;
-                        var vis_b = 1.0;
-                        var t = select(cut, tn, part == 0) + step_len * dither;
-                        for (var s = 0; s < 96; s++) {
-                            if s >= n || trans < 0.02 {
-                                break;
+                    let ta = select(cut, tn, part == 0);
+                    let tb = select(tf, cut, part == 0);
+                    // Absorption de Beer-Lambert depuis l'entrée dans la lumière : plus rien
+                    // ne compte au-delà de 98 %.
+                    if n > 0 && tb > ta && exp(-ext * (ta - tn)) >= 0.02 {
+                        let h = (tb - ta) / f32(n);
+                        // Octave fine du bruit effacée quand le pas ne la voit plus
+                        // (scintillement).
+                        let w2 = 0.35 * clamp(dh.vl_b.y / (2.53 * h), 0.0, 1.0);
+                        // (v242) Deux suites de pas : régulière (la moitié, au moins un) et
+                        // équiangulaire (l'autre moitié : des pas d'angle égal vus de la
+                        // lumière, serrés près d'elle, où ses faisceaux sont fins, lâches au
+                        // loin), mêlées par la pondération d'équilibre de Veach : la même lumière
+                        // en moyenne, sans le bruit près de la source (un feuillage autour d'une
+                        // lumière en fait des faisceaux très fins, que les pas réguliers
+                        // touchaient au hasard).
+                        let ang = vec2<f32>(atan2(ta - t0, bq), atan2(tb - t0, bq));
+                        let dang = max(ang.y - ang.x, 1e-6);
+                        let n_e = n / 2;
+                        let n_u = n - n_e;
+                        let pu = f32(n_u) / (tb - ta);
+                        for (var q = 0; q < 2; q++) {
+                            let eq = q == 1;
+                            let m = select(n_u, n_e, eq);
+                            if m <= 0 {
+                                continue;
                             }
-                            if s == sh_b && s > sh_a {
-                                sh_a = sh_b;
-                                sh_b = select(sh_a, sh_a + sh_stride, sh_a + sh_stride <= last);
-                                inv = 1.0 / f32(max(sh_b - sh_a, 1));
-                                b_ok = loaded;
-                                loaded = false;
-                            }
-                            let p = o + d * t;
-                            let to_l = lp - p;
-                            let dist = length(to_l);
-                            let l = to_l / max(dist, 1e-6);
-                            let fall = max(1.0 - dist / range, 0.0);
-                            var att = 0.0;
-                            var phase = phase_spot;
-                            if spot {
-                                let cone = clamp((dot(-l, axis) - L.cone.x) / max(L.cone.y - L.cone.x, 1e-6), 0.0, 1.0);
-                                att = fall * cone;
+                            let u0 = select(dither, fract(dither + 0.5), eq);
+                            let last = m - 1;
+                            // Intervalle d'ombre [sh_a, sh_b] du pas, 1 / sa longueur,
+                            // échantillons lus (`loaded`), et celui du bout du précédent
+                            // resservi (`b_ok`). (Dernier bout plus court qu'un intervalle : sa
+                            // valeur de départ.)
+                            var sh_a = 0;
+                            var sh_b = select(0, sh_stride, sh_stride <= last);
+                            var inv = 1.0 / f32(max(sh_b, 1));
+                            var loaded = false;
+                            var b_ok = false;
+                            var vis_a = 1.0;
+                            var vis_b = 1.0;
+                            // Avant le premier échantillon, un pas trop faible pour en lire un ne
+                            // compte pas (au plus 1 % du faisceau, à son bord) : rien ne passe
+                            // sans avoir été vu.
+                            var vis = select(1.0, 0.0, sh_on);
+                            var nz = 0.5;
+                            for (var s = 0; s < 96; s++) {
+                                if s >= m {
+                                    break;
+                                }
+                                if s == sh_b && s > sh_a {
+                                    sh_a = sh_b;
+                                    sh_b = select(sh_a, sh_a + sh_stride, sh_a + sh_stride <= last);
+                                    inv = 1.0 / f32(max(sh_b - sh_a, 1));
+                                    b_ok = loaded;
+                                    loaded = false;
+                                }
+                                let t = vl_seq_t(eq, f32(s) + u0, f32(m), ta, tb, t0, bq, ang);
+                                let tr = exp(-ext * (t - tn));
+                                if tr < 0.02 {
+                                    break;
+                                }
+                                let p = o + d * t;
+                                let to_l = lp - p;
+                                let dist = length(to_l);
+                                let l = to_l / max(dist, 1e-6);
+                                let fall = max(1.0 - dist / range, 0.0);
+                                var att = 0.0;
+                                var phase = phase_spot;
+                                if spot {
+                                    let cone = clamp((dot(-l, axis) - L.cone.x) / max(L.cone.y - L.cone.x, 1e-6), 0.0, 1.0);
+                                    att = fall * cone;
+                                    if att > 0.0 {
+                                        att *= dl_cookie(p, L, fr);
+                                    }
+                                } else {
+                                    att = fall * fall;
+                                    // (v242) Angle entre la lumière qui va de la source au point
+                                    // (−l) et celle qui en repart vers la caméra (−d) : vers
+                                    // l'avant quand on regarde la lumière. C'était l'inverse
+                                    // (« je ne vois pas les rayons qui passent devant moi, on
+                                    // dirait qu'ils sont derrière le bloc ») ; un projecteur
+                                    // prend son axe, dans le bon sens.
+                                    phase = vl_phase(dot(d, l), g_hg);
+                                }
                                 if att > 0.0 {
-                                    att *= dl_cookie(p, L, fr);
-                                }
-                            } else {
-                                att = fall * fall;
-                                phase = vl_phase(dot(d, -l), g_hg);
-                            }
-                            if att > 0.0 {
-                                if sh_on && att > 0.01 {
-                                    if !loaded {
-                                        if b_ok {
-                                            vis_a = vis_b;
-                                        } else {
-                                            vis_a = vl_shadow_at(L, fr, p - d * (f32(s - sh_a) * step_len), range);
+                                    if sh_on && att > 0.01 {
+                                        if !loaded {
+                                            if b_ok {
+                                                vis_a = vis_b;
+                                            } else {
+                                                let ts = vl_seq_t(eq, f32(sh_a) + u0, f32(m), ta, tb, t0, bq, ang);
+                                                vis_a = vl_shadow_at(L, fr, o + d * ts, range);
+                                            }
+                                            vis_b = vis_a;
+                                            if sh_b > sh_a {
+                                                let ts = vl_seq_t(eq, f32(sh_b) + u0, f32(m), ta, tb, t0, bq, ang);
+                                                vis_b = vl_shadow_at(L, fr, o + d * ts, range);
+                                            }
+                                            loaded = true;
                                         }
-                                        vis_b = vis_a;
-                                        if sh_b > sh_a {
-                                            vis_b = vl_shadow_at(L, fr, p + d * (f32(sh_b - s) * step_len), range);
-                                        }
-                                        loaded = true;
+                                        vis = mix(vis_a, vis_b, f32(s - sh_a) * inv);
                                     }
-                                    vis = mix(vis_a, vis_b, f32(s - sh_a) * inv);
-                                }
-                                // Lueur à la source : au-delà de `tip_cut`, force × exp(−d²/r²) reste
-                                // sous le demi-écart entre 1,0 et le f32 suivant (2⁻²⁴) : la somme
-                                // vaudrait 1,0 exactement. Même valeur, une exponentielle de moins.
-                                var tip = 1.0;
-                                let tq = dist * dist;
-                                if tq < tip_cut {
-                                    tip = 1.0 + dh.vl_a.z * exp(-tq / tip_r2);
-                                }
-                                var ins = att * vis * phase * exp(-ext * dist) * tip;
-                                if noise_on && ins > 1e-5 {
-                                    if s % nz_stride == 0 {
-                                        if morph_on {
-                                            nz = mix(vl_noise(p + off0, w2), vl_noise(p + off1, w2), morph_f);
-                                        } else {
-                                            nz = vl_noise(p, w2);
-                                        }
+                                    // Lueur à la source : au-delà de `tip_cut`, force × exp(−d²/r²)
+                                    // reste sous le demi-écart entre 1,0 et le f32 suivant (2⁻²⁴) :
+                                    // la somme vaudrait 1,0 exactement. Même valeur, une
+                                    // exponentielle de moins.
+                                    var tip = 1.0;
+                                    let tq = dist * dist;
+                                    if tq < tip_cut {
+                                        tip = 1.0 + dh.vl_a.z * exp(-tq / tip_r2);
                                     }
-                                    ins *= mix(1.0, 2.0 * nz, dh.vl_b.x);
+                                    var ins = att * vis * phase * exp(-ext * dist) * tip;
+                                    if noise_on && ins > 1e-5 {
+                                        if s % nz_stride == 0 {
+                                            if morph_on {
+                                                nz = mix(vl_noise(p + off0, w2), vl_noise(p + off1, w2), morph_f);
+                                            } else {
+                                                nz = vl_noise(p, w2);
+                                            }
+                                        }
+                                        ins *= mix(1.0, 2.0 * nz, dh.vl_b.x);
+                                    }
+                                    // Pondération d'équilibre : 1 / (densité des pas réguliers +
+                                    // densité des pas équiangulaires) en ce point.
+                                    let x = t - t0;
+                                    let pe = f32(n_e) * bq / (dang * (bq * bq + x * x));
+                                    let cv = col * ins * (ext * tr / (pu + pe));
+                                    acc += cv;
+                                    let cl = cv.r + cv.g + cv.b;
+                                    lw += cl;
+                                    lt += cl * t;
                                 }
-                                acc += col * ins * (1.0 - absorb) * trans;
-                                trans *= absorb;
                             }
-                            t += step_len;
                         }
                     }
                     if part == 0 {
                         acc_n = acc;
+                        lw_n = lw;
+                        lt_n = lt;
                     }
                 }
                 if carried {
@@ -438,12 +503,30 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f3
                 } else {
                     result += acc;
                     result_near += acc_n;
+                    cw += lw;
+                    ct += lt;
+                    cw_n += lw_n;
+                    ct_n += lt_n;
                 }
             }
         }
     }
     let k = dh.vl_a.x * dh.surf.x;
-    return VlLayers(result_near * k, result * k, result_near_d * k, result_d * k);
+    let tc_n = select(0.0, ct_n / cw_n, cw_n > 0.0);
+    let tc_f = select(0.0, ct / cw, cw > 0.0);
+    return VlLayers(result_near * k, result * k, result_near_d * k, result_d * k, tc_n, tc_f);
+}
+
+/// (v242) Distance du pas d'indice `i` (décalage compris) d'une suite de `n` pas sur
+/// [`ta`, `tb`] : régulière (`eq` faux), ou équiangulaire, d'angles égaux vus de la lumière,
+/// autour du point `t0` du rayon qui en est le plus proche (à la distance `b`, angles des
+/// bouts `ang`).
+fn vl_seq_t(eq: bool, i: f32, n: f32, ta: f32, tb: f32, t0: f32, b: f32, ang: vec2<f32>) -> f32 {
+    let u = i / n;
+    if eq {
+        return clamp(t0 + b * tan(mix(ang.x, ang.y, u)), ta, tb);
+    }
+    return mix(ta, tb, u);
 }
 
 /// (v223) Distance de la première case pleine de la grille de blocs le long de `o + t d`
@@ -571,6 +654,11 @@ fn fs_vl(@builtin(position) frag: vec4<f32>) -> VlOut {
     // pixel, celle qui est à sa distance.
     var o: VlOut;
     o.placed = vl_pack(c.near, dn, c.far, df);
-    o.carried = vl_pack(c.near_d, dn, c.far_d, df);
+    // (v242) Les profondeurs de l'image des lumières portées ne servaient à rien (ce sont
+    // celles des posées) : elles portent la distance moyenne de la lumière reçue des lumières
+    // posées, en profondeur (Z inversé, 0 : aucune), lue par la reprise.
+    let cn = select(0.0, unit / max(c.tc_near, 1e-3), c.tc_near > 0.0);
+    let cf = select(0.0, unit / max(c.tc_far, 1e-3), c.tc_far > 0.0);
+    o.carried = vl_pack(c.near_d, cn, c.far_d, cf);
     return o;
 }

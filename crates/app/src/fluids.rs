@@ -7,7 +7,10 @@
 //! - Sur les côtés, le fluide part vers le trou le plus proche (4 blocs pour l'eau, 2 pour
 //!   la lave) s'il y en a un, sinon dans toutes les directions.
 //! - Deux sources d'eau voisines au-dessus d'un sol (ou d'une autre source) en créent une
-//!   troisième entre elles (source infinie).
+//!   troisième entre elles (source infinie). (v242) Au-dessus de l'eau qui coule aussi
+//!   (« une case vide entre deux sources, à la même hauteur, devient une source », Viendax) :
+//!   deux sources posées au bord d'un trou faisaient tomber leur eau dessous, et la case
+//!   entre elles restait de l'eau qui coule pour toujours.
 //! - Lave et eau : la lave touchée par l'eau devient obsidienne (source) ou pierre taillée
 //!   (qui coule), aussitôt ; la lave qui tombe sur l'eau la change en pierre.
 //! - La barrière à fluides (et tout bloc solide) arrête l'écoulement. (v185) Les plantes,
@@ -268,8 +271,8 @@ fn hole_distance(
 }
 
 /// Niveau que prendrait le fluide `f` en `q` d'après ses voisins (`getNewLiquid` de
-/// Minecraft) : source entre deux sources d'eau posées sur un sol (ou une source), chute
-/// sous le même fluide, sinon le voisin le plus fort moins la perte (≤ 0 : rien).
+/// Minecraft) : source entre deux sources d'eau posées sur un sol (ou sur de l'eau, v242),
+/// chute sous le même fluide, sinon le voisin le plus fort moins la perte (≤ 0 : rien).
 fn new_level(get: &dyn Fn([i32; 3]) -> BlockId, q: [i32; 3], f: Fluid) -> i32 {
     let mut best = 0;
     let mut sources = 0;
@@ -285,7 +288,8 @@ fn new_level(get: &dyn Fn([i32; 3]) -> BlockId, q: [i32; 3], f: Fluid) -> i32 {
     }
     if f == Fluid::Water && sources >= 2 {
         let below = get(add(q, [0, -1, 0]));
-        if below.def().solid || fluid(below) == Some((f, FLUID_SOURCE)) {
+        // (v242) Sur de l'eau qui coule aussi (Minecraft demande un sol ou une source).
+        if below.def().solid || matches!(fluid(below), Some((Fluid::Water, _))) {
             return FLUID_SOURCE as i32;
         }
     }
@@ -618,6 +622,42 @@ mod tests {
                 .map(|b| b.def().key.clone())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// (v242) Cas de Viendax : deux sources posées au bord d'une fosse, une case vide entre
+    /// elles ; leur eau tombe dans la fosse (de l'eau qui coule, sous la case vide). La case
+    /// devient quand même une source, qui reste quand on retire les deux autres.
+    #[test]
+    fn two_sources_over_flowing_water_make_a_third() {
+        let mut w = world();
+        let mut fl = Fluids::default();
+        for x in 2..=8 {
+            for z in 6..=10 {
+                w.set(x, 10, z, BlockId::STONE);
+                w.set(x, 11, z, BlockId::STONE);
+            }
+        }
+        // La fosse (y = 10, x = 3 à 7) et la rigole au-dessus (y = 11, x = 4 à 6).
+        for x in 3..=7 {
+            w.set(x, 10, 8, BlockId::AIR);
+        }
+        for x in 4..=6 {
+            w.set(x, 11, 8, BlockId::AIR);
+        }
+        run(&mut w, &mut fl, 1.0);
+        w.set(4, 11, 8, BlockId::WATER);
+        w.set(6, 11, 8, BlockId::WATER);
+        run(&mut w, &mut fl, 4.0);
+        assert!(
+            matches!(level(&w, 5, 10, 8), Some((Fluid::Water, l)) if l != FLUID_SOURCE),
+            "dessous : de l'eau qui coule ({:?})",
+            level(&w, 5, 10, 8)
+        );
+        assert_eq!(w.get(5, 11, 8), BlockId::WATER, "source au-dessus de l'eau qui coule");
+        w.set(4, 11, 8, BlockId::AIR);
+        w.set(6, 11, 8, BlockId::AIR);
+        run(&mut w, &mut fl, 4.0);
+        assert_eq!(w.get(5, 11, 8), BlockId::WATER, "la nouvelle source reste");
     }
 
     /// (v185) Les durées de Minecraft (5 ticks par bloc) : 7 blocs atteints en 1,75 s, et

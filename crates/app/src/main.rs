@@ -768,13 +768,40 @@ impl Game {
                 }
                 self.accounts.room(Cmd::Presence(on));
             }
-            friends::FriendsAction::Dismiss(i) => {
-                if i < self.accounts.world_invites.len() {
-                    self.accounts.world_invites.remove(i);
+            // (v242) Accepter (on rejoint son monde), refuser (il le sait), ignorer (il n'en
+            // sait rien) : le relais la retire.
+            friends::FriendsAction::Answer(i, reply) => {
+                if i >= self.accounts.world_invites.len() {
+                    return;
+                }
+                let inv = self.accounts.world_invites.remove(i);
+                self.accounts.room(Cmd::InviteReply {
+                    from: inv.from.clone(),
+                    reply,
+                });
+                match reply {
+                    minelib_net::proto::INVITE_ACCEPT if inv.open => {
+                        self.friends_act(friends::FriendsAction::Join(inv.room));
+                    }
+                    minelib_net::proto::INVITE_DECLINE => {
+                        self.friends_note =
+                            Some((format!("Invitation de {} refusée.", inv.from), self.time));
+                    }
+                    _ => {}
                 }
             }
             friends::FriendsAction::Join(room) => {
-                self.accounts.world_invites.retain(|i| i.room != room);
+                // (v242) Les invitations dans ce monde sont acceptées (le relais les retire).
+                let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.accounts.world_invites)
+                    .into_iter()
+                    .partition(|i| i.open && i.room == room);
+                self.accounts.world_invites = keep;
+                for inv in done {
+                    self.accounts.room(Cmd::InviteReply {
+                        from: inv.from,
+                        reply: minelib_net::proto::INVITE_ACCEPT,
+                    });
+                }
                 // Dans un monde : on le quitte d'abord (enregistré s'il est à nous).
                 if self.session.is_some() {
                     self.leave_world();
@@ -1260,7 +1287,7 @@ impl Game {
                 Event::Invited { from, name, .. } => {
                     // (v233) Le module d'amis est sur l'accueil et dans le menu Échap.
                     let t = if self.session.is_some() {
-                        format!("{from} t'invite dans « {name} » (Échap : Rejoindre).")
+                        format!("{from} t'invite dans « {name} » (Échap : Accepter).")
                     } else {
                         format!("{from} t'invite dans « {name} ».")
                     };
@@ -1279,9 +1306,17 @@ impl Game {
                     let t = if online {
                         format!("Invitation envoyée à {to}.")
                     } else {
-                        format!("{to} n'est pas en ligne : l'invitation l'attendra (2 h).")
+                        format!("{to} n'est pas en ligne : l'invitation l'attendra.")
                     };
                     self.friends_note = Some((t, self.time));
+                }
+                // (v242) Une de nos invitations refusée.
+                Event::InviteDeclined { by, name } => {
+                    let t = format!("{by} a refusé ton invitation dans « {name} ».");
+                    if let Some(s) = &mut self.session {
+                        s.chat.say(t.clone(), chat::YELLOW);
+                    }
+                    self.notify(t);
                 }
                 // (v231) Demande d'ami acceptée.
                 Event::FriendAdded { from, .. } => {
