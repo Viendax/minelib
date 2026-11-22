@@ -161,8 +161,6 @@ enum Screen {
     Account(account::Page),
     /// Choix du monde à ouvrir en construction en ligne.
     HostPick,
-    /// (v231) Amis : depuis l'accueil ou le menu du jeu (retour : `friends_back`).
-    Friends,
     /// (v232) Solo → Cartes FPS : jouer contre des bots sur une carte FPS (de ce PC, ou du
     /// relais, copiée dans ses mondes).
     SoloMaps,
@@ -303,10 +301,9 @@ struct Game {
     packs_return: Screen,
     /// Où revenir en quittant les paramètres.
     settings_return: Screen,
-    /// (v231) Écran des amis : son état, l'écran d'où on l'a ouvert, un message (invitation
-    /// envoyée, erreur) et depuis quand il est affiché.
+    /// (v231) Module d'amis (v233 : panneau de l'accueil et du menu Échap) : son état, un
+    /// message (invitation envoyée, erreur) et depuis quand il est affiché.
     friends_ui: friends::FriendsUi,
-    friends_back: Screen,
     friends_note: Option<(String, f32)>,
     /// (v231) Partie (salle du relais) où l'on est : un ami qui y est déjà n'a ni « Rejoindre »
     /// ni « Inviter ».
@@ -477,7 +474,6 @@ impl Game {
             packs_return: Screen::Title,
             settings_return: Screen::Title,
             friends_ui: friends::FriendsUi::default(),
-            friends_back: Screen::Title,
             friends_note: None,
             current_room: None,
             slider_drag: None,
@@ -668,42 +664,55 @@ impl Game {
         }
     }
 
-    /// (v231) Bouton « Amis », avec ce qui y attend : invitations, demandes d'ami.
-    fn friends_label(accounts: &account::Accounts) -> String {
-        let plural = |n: usize| if n > 1 { "s" } else { "" };
-        let i = accounts.world_invites.len();
-        let r = accounts.friend_requests.len();
-        match (i, r) {
-            (0, 0) => "Amis".to_string(),
-            (i, 0) => format!("Amis ({i} invitation{})", plural(i)),
-            (0, r) => format!("Amis ({r} demande{})", plural(r)),
-            (i, r) => format!("Amis ({})", i + r),
+    /// (v233) Panneau des amis (accueil, menu Échap) : la liste redemandée au relais toutes
+    /// les `friends::REFRESH_S` s tant qu'il est affiché.
+    fn friends_refresh(&mut self) {
+        if !self.accounts.logged_in() {
+            self.friends_ui.asked = None;
+            return;
         }
-    }
-
-    /// (v231) Ouvre l'écran des amis (retour à `back`) et redemande la liste.
-    fn open_friends(&mut self, back: Screen) {
-        self.friends_back = back;
-        self.friends_ui.asked = None;
-        self.screen = Screen::Friends;
-    }
-
-    /// (v231) L'écran des amis : la liste redemandée toutes les `friends::REFRESH_S` s ;
-    /// rejoindre un monde (en quittant celui où l'on est), inviter, ajouter, retirer,
-    /// devenir invisible.
-    fn friends_screen(&mut self, input: &Input, size: (u32, u32)) {
-        use minelib_net::client::Cmd;
         if self
             .friends_ui
             .asked
             .is_none_or(|t| t.elapsed().as_secs_f32() >= friends::REFRESH_S)
         {
             self.friends_ui.asked = Some(std::time::Instant::now());
-            self.accounts.room(Cmd::Friend {
+            self.accounts.room(minelib_net::client::Cmd::Friend {
                 pseudo: String::new(),
                 add: false,
             });
         }
+    }
+
+    /// (v233) Dessine le panneau des amis dans ce rectangle (après `friends_refresh`).
+    #[allow(clippy::too_many_arguments)]
+    fn friends_panel(
+        c: &mut Ctx,
+        input: &Input,
+        st: &mut friends::FriendsUi,
+        accounts: &account::Accounts,
+        in_world: Option<u64>,
+        note: Option<&str>,
+        rect: (f32, f32, f32, f32),
+        time: f32,
+    ) -> friends::FriendsAction {
+        let view = friends::FriendsView {
+            logged_in: accounts.logged_in(),
+            friends: &accounts.friends,
+            places: &accounts.friend_places,
+            invites: &accounts.world_invites,
+            requests: &accounts.friend_requests,
+            invisible: accounts.invisible,
+            in_world,
+            note,
+        };
+        let (x, y, w, h) = rect;
+        friends::panel(c, input, st, &view, x, y, w, h, time)
+    }
+
+    /// (v233) Monde de construction en ligne où l'on est (on peut y inviter), et le message
+    /// du panneau des amis s'il est récent.
+    fn friends_context(&self) -> (Option<u64>, Option<String>) {
         let in_world = self
             .session
             .as_ref()
@@ -714,27 +723,20 @@ impl Game {
             .as_ref()
             .filter(|(_, t)| self.time - t < 6.0)
             .map(|(n, _)| n.clone());
-        let time = self.time;
-        let over_game = self.session.is_some();
-        let mut c = Ctx::new(&mut self.ui, input, size);
-        if over_game {
-            c.dim(0.7);
-        } else {
-            c.background();
-        }
-        let view = friends::FriendsView {
-            friends: &self.accounts.friends,
-            places: &self.accounts.friend_places,
-            invites: &self.accounts.world_invites,
-            requests: &self.accounts.friend_requests,
-            invisible: self.accounts.invisible,
-            in_world,
-            note: note.as_deref(),
-        };
-        let action = friends::screen(&mut c, input, &mut self.friends_ui, &view, time);
+        (in_world, note)
+    }
+
+    /// (v231) Ce qui a été demandé dans le panneau des amis : rejoindre un monde (en quittant
+    /// celui où l'on est), inviter, ajouter, accepter ou refuser une demande, retirer, devenir
+    /// invisible, se connecter.
+    fn friends_act(&mut self, action: friends::FriendsAction) {
+        use minelib_net::client::Cmd;
         match action {
             friends::FriendsAction::None => {}
-            friends::FriendsAction::Back => self.screen = self.friends_back,
+            friends::FriendsAction::Login => {
+                self.after_login = self.screen;
+                self.goto_account(account::Page::Welcome);
+            }
             friends::FriendsAction::Add(p) => {
                 // Accepter une demande, c'est l'ajouter aussi.
                 self.accounts
@@ -864,21 +866,41 @@ impl Game {
     // ------------------------------------------------------------ écrans
 
     fn title_screen(&mut self, input: &Input, size: (u32, u32)) {
+        self.friends_refresh();
+        let (in_world, note) = self.friends_context();
+        let time = self.time;
         let mut c = Ctx::new(&mut self.ui, input, size);
         c.background();
         let s = c.s;
+        // (v233) Module d'amis à droite (comme celui du lobby FPS), sous le bouton du compte ;
+        // le menu reste au milieu tant qu'il a la place.
+        let pw = friends::panel_width(&c);
+        let px = c.w - pw - 6.0 * s;
+        let rect = (px, 30.0 * s, pw, c.h - 48.0 * s);
+        let friends_action = Self::friends_panel(
+            &mut c,
+            input,
+            &mut self.friends_ui,
+            &self.accounts,
+            in_world,
+            note.as_deref(),
+            rect,
+            time,
+        );
+        let cx = (c.w / 2.0).min(px - 112.0 * s);
         let logo = s * 4.0;
-        c.text_center("MINELIB", c.h * 0.18, logo, GOLD);
-        c.text_center("moteur voxel en Rust", c.h * 0.18 + 36.0 * s, s, GREY);
-        let cx = c.w / 2.0;
+        for (t, y, scale, color) in [
+            ("MINELIB", c.h * 0.18, logo, GOLD),
+            ("moteur voxel en Rust", c.h * 0.18 + 36.0 * s, s, GREY),
+        ] {
+            let tw = Ui::text_width(t, scale);
+            c.ui.text(cx - tw / 2.0, y, scale, color, t);
+        }
         let mut y = c.h * 0.42;
         let step = 24.0 * s;
         let solo = c.button("Solo", cx, y, 200.0, true);
         y += step;
         let multi = c.button("Multijoueur", cx, y, 200.0, true);
-        // (v231) Amis : où ils sont, les rejoindre, les inviter (et ce qui les attend).
-        y += step;
-        let friends = c.button(&Self::friends_label(&self.accounts), cx, y, 200.0, true);
         // Compte, en haut à droite : pseudo connecté ou invitation à se connecter.
         let account_label = match &self.accounts.account {
             Some(a) => format!("Compte : {}", a.pseudo),
@@ -937,14 +959,7 @@ impl Game {
                 self.goto_account(account::Page::Welcome);
             }
         }
-        if friends {
-            if self.accounts.logged_in() {
-                self.open_friends(Screen::Title);
-            } else {
-                self.after_login = Screen::Title;
-                self.goto_account(account::Page::Welcome);
-            }
-        }
+        self.friends_act(friends_action);
         if account {
             if self.accounts.logged_in() {
                 self.after_login = Screen::Title;
@@ -1054,9 +1069,11 @@ impl Game {
         // (v231) Demandes d'ami pas encore annoncées (reçues en jeu, ou hors ligne).
         let new = std::mem::take(&mut self.accounts.new_requests);
         if !new.is_empty() {
-            let t = match new.as_slice() {
-                [one] => format!("{one} veut être ton ami (Amis : Accepter)."),
-                more => format!("{} demandes d'ami (Amis).", more.len()),
+            let t = match (new.as_slice(), self.session.is_some()) {
+                ([one], true) => format!("{one} veut être ton ami (Échap : Accepter)."),
+                ([one], false) => format!("{one} veut être ton ami."),
+                (more, true) => format!("{} demandes d'ami (Échap).", more.len()),
+                (more, false) => format!("{} demandes d'ami.", more.len()),
             };
             if let Some(s) = &mut self.session {
                 s.chat.say(t.clone(), chat::YELLOW);
@@ -1235,7 +1252,12 @@ impl Game {
                 }
                 // (v231) Invitation dans le monde d'un ami : notification, et dans le tchat.
                 Event::Invited { from, name, .. } => {
-                    let t = format!("{from} t'invite dans « {name} » (Amis : Rejoindre).");
+                    // (v233) Le module d'amis est sur l'accueil et dans le menu Échap.
+                    let t = if self.session.is_some() {
+                        format!("{from} t'invite dans « {name} » (Échap : Rejoindre).")
+                    } else {
+                        format!("{from} t'invite dans « {name} ».")
+                    };
                     if let Some(s) = &mut self.session {
                         s.chat.say(t.clone(), chat::YELLOW);
                     }
@@ -2746,21 +2768,35 @@ impl Game {
     }
 
     fn pause_menu(&mut self, input: &Input, size: (u32, u32)) {
+        self.friends_refresh();
+        let (in_world, note) = self.friends_context();
+        let time = self.time;
         let mut c = Ctx::new(&mut self.ui, input, size);
         c.dim(0.55);
         let s = c.s;
-        c.text_center("Jeu en pause", c.h * 0.2, s * 2.0, WHITE);
-        let cx = c.w / 2.0;
+        // (v233) Module d'amis à droite (comme celui du lobby FPS) : les inviter dans ce
+        // monde, en rejoindre un ; le menu reste au milieu tant qu'il a la place.
+        let pw = friends::panel_width(&c);
+        let px = c.w - pw - 6.0 * s;
+        let rect = (px, 8.0 * s, pw, c.h - 16.0 * s);
+        let friends_action = Self::friends_panel(
+            &mut c,
+            input,
+            &mut self.friends_ui,
+            &self.accounts,
+            in_world,
+            note.as_deref(),
+            rect,
+            time,
+        );
+        let cx = (c.w / 2.0).min(px - 126.0 * s);
+        let title = "Jeu en pause";
+        let tw = Ui::text_width(title, s * 2.0);
+        c.ui.text(cx - tw / 2.0, c.h * 0.2, s * 2.0, WHITE, title);
         let mut y = c.h * 0.36;
         let resume = c.button("Reprendre", cx, y, 200.0, true);
         y += 24.0 * s;
         let settings = c.button("Paramètres", cx, y, 200.0, true);
-        // (v231) Amis (connecté) : les inviter dans ce monde, en rejoindre un.
-        let logged = self.accounts.logged_in();
-        let friends = logged && {
-            y += 24.0 * s;
-            c.button(&Self::friends_label(&self.accounts), cx, y, 200.0, true)
-        };
         // Serveur de construction : une copie du monde tel qu'il est, dans ses mondes solo.
         let on_build = self.session.as_ref().is_some_and(|s| s.build.is_some());
         let download = on_build && {
@@ -2768,7 +2804,8 @@ impl Game {
             c.button("Télécharger la carte", cx, y, 200.0, true)
         };
         if let Some(t) = self.download_note.as_ref().filter(|_| on_build) {
-            c.text_center(t, y + 14.0 * s, s, GREY);
+            let tw = Ui::text_width(t, s);
+            c.ui.text(cx - tw / 2.0, y + 14.0 * s, s, GREY, t.clone());
         }
         // Partie FPS en ligne : votes d'équipe (comme dans CS).
         let choices = self.session.as_ref().and_then(|s| s.vote_choices());
@@ -2834,9 +2871,7 @@ impl Game {
             self.settings_return = Screen::Paused;
             self.screen = Screen::Settings;
         }
-        if friends {
-            self.open_friends(Screen::Paused);
-        }
+        self.friends_act(friends_action);
         if download {
             let saves = self.paths.saves.clone();
             if let Some(sess) = &mut self.session {
@@ -4105,7 +4140,6 @@ impl GameLoop for Game {
                     | Screen::Lights
                     | Screen::Controls
                     | Screen::Sound
-                    | Screen::Friends
             );
         if in_world {
             let active = self.screen == Screen::Playing;
@@ -4142,7 +4176,6 @@ impl GameLoop for Game {
                 Screen::Lights => self.lights_screen(input, size, true),
                 Screen::Controls => self.controls_screen(input, size, true),
                 Screen::Sound => self.sound_screen(input, size, true),
-                Screen::Friends => self.friends_screen(input, size),
                 _ => {}
             }
             // Monde ouvert dans les toutes premières secondes du jeu : les shaders lourds
@@ -4191,7 +4224,6 @@ impl GameLoop for Game {
                 Screen::Account(page) => self.account_screen(input, size, page),
                 Screen::HostPick => self.host_pick_screen(input, size),
                 Screen::FpsHome => self.fps_home_screen(input, size),
-                Screen::Friends => self.friends_screen(input, size),
                 Screen::SoloMaps => self.solo_maps_screen(input, size),
                 Screen::Playing | Screen::Paused => self.screen = Screen::Title,
             }
