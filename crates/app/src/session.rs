@@ -200,6 +200,10 @@ pub struct Session {
     pub room_started: Option<bool>,
     /// Pause de la partie FPS commencée / finie (hôte : à dire au relais).
     pub room_paused: Option<bool>,
+    /// (v243) Serveur de construction : partie FPS ouverte par un OP (son pseudo), et ouverture
+    /// demandée par ce joueur (`/start`, `/bot` : le relais vérifie qu'il est OP).
+    build_match: Option<String>,
+    match_opening: bool,
     /// Résultat de la partie à envoyer au relais (classement).
     pub match_result: Option<minelib_net::game::MatchSummary>,
     /// Tableau de fin de partie affiché (résultat, temps depuis la fin).
@@ -672,6 +676,8 @@ impl Session {
             screen_size: (1280.0, 720.0),
             room_started: None,
             room_paused: None,
+            build_match: None,
+            match_opening: false,
             dir,
             workers: Workers::new(data.meta.seed, world.generator),
             streamer: Streamer::new(radius),
@@ -3796,8 +3802,9 @@ impl Session {
     /// sont pas envoyées aux autres joueurs : un coin sombre éclairé pour un seul). En FPS
     /// solo, si.
     fn lights_allowed(&self) -> bool {
-        // (v172) Contre les bots (partie solo), aussi.
-        !(self.game.mode == GameMode::Fps && self.online_match())
+        // (v172) Contre les bots (partie solo), aussi. (v243) Et dans la partie d'un serveur de
+        // construction : ses lumières sont celles du serveur, pour tous.
+        !(self.game.mode == GameMode::Fps && self.ranked_match())
     }
 
     /// (v201) Lumière de la lampe torche tenue et allumée : un projecteur au verre de la
@@ -3953,7 +3960,8 @@ impl Session {
                     .filter(|o| o.back && o.pos.distance_squared(cam) < ZEUS_SEEN * ZEUS_SEEN)
                     .filter_map(|o| {
                         let pose = self.other_pose(o, None);
-                        let phase = o.pseudo.bytes().map(f32::from).sum::<f32>() % 6.28;
+                        let phase =
+                            o.pseudo.bytes().map(f32::from).sum::<f32>() % std::f32::consts::TAU;
                         Some((crate::player_model::zeus_back_frame(&pose)?, phase))
                     })
                     .collect()
@@ -5158,6 +5166,35 @@ impl Session {
         if mode != GameMode::Fps && mode != GameMode::Spectator {
             self.saved_mode = None;
         }
+        // (v243) Serveur de construction : en mode FPS, on entre dans la partie FPS qu'un OP y
+        // mène ; en en sortant, on la quitte (celui qui la mène la ferme).
+        let mut join = None;
+        if self.build.is_some() {
+            if mode == GameMode::Fps {
+                if !self.in_build_match() {
+                    join = self
+                        .build_match
+                        .clone()
+                        .filter(|h| !h.eq_ignore_ascii_case(&self.pseudo));
+                }
+            } else if self.in_build_match() {
+                let host = self.net.as_ref().is_some_and(|n| n.is_host());
+                self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                    action: minelib_net::proto::SERVER_MATCH,
+                    pseudo: String::new(),
+                    reason: if host { "close" } else { "leave" }.into(),
+                });
+                self.end_build_match();
+                self.chat.say(
+                    if host {
+                        "Partie FPS du serveur fermée."
+                    } else {
+                        "Tu as quitté la partie FPS du serveur."
+                    },
+                    chat::YELLOW,
+                );
+            }
+        }
         // (v172) Mode FPS en solo : partie contre des bots (lancée à l'image suivante) ;
         // on la quitte en changeant de mode. (v174) Sauf en spectateur : on la regarde,
         // les bots continuent entre eux, et on y revient en repassant en mode FPS (à la
@@ -5206,6 +5243,54 @@ impl Session {
         self.fall_from = None;
         self.chat
             .say(format!("Mode de jeu : {}", mode.label()), chat::YELLOW);
+        if let Some(host) = join {
+            self.join_build_match(&host);
+        }
+    }
+
+    /// (v243) La partie FPS du serveur de construction s'ouvre (menée par `host`) ou se ferme :
+    /// celle qu'on a demandée démarre chez soi (on en est l'hôte) ; celle d'un autre, on y entre
+    /// si l'on est en mode FPS ; fermée, on en sort.
+    fn build_match_event(&mut self, host: &str, open: bool) {
+        if open {
+            let mine = !self.pseudo.is_empty() && host.eq_ignore_ascii_case(&self.pseudo);
+            self.build_match = Some(host.to_string());
+            if mine {
+                if !self.in_build_match() {
+                    if self.match_opening && self.game.mode == GameMode::Fps {
+                        self.start_build_match();
+                    } else {
+                        // Sorti du mode FPS entre-temps, ou une partie à son nom que ce jeu
+                        // ne mène plus (reconnexion) : elle se referme.
+                        self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                            action: minelib_net::proto::SERVER_MATCH,
+                            pseudo: String::new(),
+                            reason: "close".into(),
+                        });
+                    }
+                }
+                self.match_opening = false;
+            } else if self.game.mode == GameMode::Fps {
+                if !self.in_build_match() {
+                    self.join_build_match(host);
+                }
+            } else {
+                self.chat.say(
+                    format!(
+                        "{host} mène une partie FPS sur ce serveur : les joueurs en mode FPS la \
+                         rejoignent."
+                    ),
+                    chat::YELLOW,
+                );
+            }
+        } else {
+            self.build_match = None;
+            if self.in_build_match() {
+                self.end_build_match();
+                self.chat
+                    .say("La partie FPS du serveur est finie.", chat::YELLOW);
+            }
+        }
     }
 
     /// (v209) `/bot` : sans partie, en lance une ; sinon la complète jusqu'au nombre de
@@ -5335,6 +5420,249 @@ impl Session {
 
     pub fn online_match(&self) -> bool {
         self.net.as_ref().is_some_and(|n| !n.is_solo())
+    }
+
+    /// (v243) Partie FPS en ligne du matchmaking (classée) : pas la partie solo contre des
+    /// bots, ni celle d'un serveur de construction (le relais n'en sait que les messages, le
+    /// monde reste celui du serveur).
+    pub fn ranked_match(&self) -> bool {
+        self.online_match() && self.build.is_none()
+    }
+
+    /// (v243) Dans la partie FPS du serveur de construction (son hôte ou un de ses joueurs).
+    fn in_build_match(&self) -> bool {
+        self.build.is_some() && self.online_match()
+    }
+
+    /// (v243) Ouvre la partie FPS du serveur de construction dont ce jeu est l'hôte (le relais
+    /// vient de l'accepter : ce joueur est OP) : autour de lui (départs à 10 blocs de part et
+    /// d'autre si le monde n'a pas de zones), complétée par des bots, commencée tout de suite.
+    /// Les bots relèvent une copie des chunks chargés autour.
+    fn start_build_match(&mut self) {
+        let Some(link) = self.build.as_ref().map(|b| b.world_link()) else {
+            return;
+        };
+        let map = crate::fpsmap::load(&self.dir);
+        let spawn = self.player.pos;
+        let mut starts = vec![spawn, spawn - Vec3::X * 10.0, spawn + Vec3::X * 10.0];
+        for z in [&map.ct, &map.t].into_iter().chain(map.sites.iter()).flatten() {
+            let c = |i: usize| (z.min[i] + z.max[i]) as f32 * 0.5;
+            starts.push(Vec3::new(c(0), c(1), c(2)));
+        }
+        // Copie des chunks chargés à 8 chunks au plus des départs et des zones.
+        let mut copy = World::new(0);
+        for pos in self.world.loaded().collect::<Vec<_>>() {
+            let mid = Vec3::new(pos.x as f32 * 16.0 + 8.0, 0.0, pos.z as f32 * 16.0 + 8.0);
+            let near = starts
+                .iter()
+                .any(|s| Vec3::new(s.x, 0.0, s.z).distance(mid) <= 8.0 * 16.0);
+            if near {
+                if let Some(c) = self.world.chunk_arc(pos) {
+                    copy.insert((*c).clone());
+                }
+            }
+        }
+        let nav = crate::bots::nav_from_world(copy, map.clone(), starts);
+        let players = crate::bots::saved_players().unwrap_or(map.players() as usize);
+        let level = crate::bots::saved_level();
+        let pseudo = if self.pseudo.is_empty() {
+            "Joueur".to_string()
+        } else {
+            self.pseudo.clone()
+        };
+        self.net = Some(crate::netgame::NetGame::build_host(
+            link,
+            pseudo,
+            map,
+            spawn,
+            Some(nav),
+            level,
+            players,
+        ));
+        self.net_dead = false;
+        self.player.flying = false;
+        self.radar_map = false;
+        self.game_over = None;
+        log::info!(
+            "partie FPS du serveur ouverte : {players} joueurs, bots {}",
+            crate::bots::LEVELS[level as usize]
+        );
+        self.chat.say(
+            format!(
+                "Partie FPS ouverte sur le serveur ({players} joueurs, bots {}) : les joueurs en \
+                 mode FPS la rejoignent. /restart : la recommencer, /bot maxbot <2-20> : joueurs \
+                 de la partie, /bot facile|normal|difficile : leur niveau, /bot off : la fermer.",
+                crate::bots::LEVELS[level as usize]
+            ),
+            chat::YELLOW,
+        );
+    }
+
+    /// (v243) Entre dans la partie FPS du serveur de construction ouverte par `host` (ce joueur
+    /// est en mode FPS) : le relais le dit à son hôte, et ce jeu en devient un invité.
+    fn join_build_match(&mut self, host: &str) {
+        let Some(link) = self.build.as_ref().map(|b| b.world_link()) else {
+            return;
+        };
+        self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+            action: minelib_net::proto::SERVER_MATCH,
+            pseudo: String::new(),
+            reason: "join".into(),
+        });
+        let mut n = crate::netgame::NetGame::guest_loading(link, [0; 32]);
+        n.loaded();
+        self.net = Some(n);
+        self.net_dead = false;
+        self.player.flying = false;
+        self.radar_map = false;
+        self.game_over = None;
+        log::info!("partie FPS du serveur rejointe (hôte : {host})");
+        self.chat
+            .say(format!("Partie FPS de {host} rejointe."), chat::YELLOW);
+    }
+
+    /// (v243) Hors de la partie FPS du serveur de construction (fermée, quittée) : seul en mode
+    /// FPS dans le monde, comme avant.
+    fn end_build_match(&mut self) {
+        log::info!("partie FPS du serveur quittée");
+        self.net = None;
+        self.net_dead = false;
+        self.fps.online = None;
+        self.fps.hp = 100;
+        self.feed.clear();
+        self.banner = None;
+        self.game_over = None;
+        self.spectating = None;
+    }
+
+    /// (v243) `/start`, `/bot …`, `/restart` sur un serveur de construction : la partie FPS du
+    /// serveur, menée par l'OP qui l'ouvre (le relais refuse les autres) ; ses réglages
+    /// changent chez son hôte seulement.
+    fn build_match_command(&mut self, cmd: &str, arg: Option<&str>, count: Option<&str>) {
+        use minelib_net::client::Cmd;
+        use minelib_net::proto::SERVER_MATCH;
+        if self.game.mode != GameMode::Fps {
+            self.chat.say(
+                "La partie se joue en mode FPS : /gm fps (OP).",
+                chat::RED,
+            );
+            return;
+        }
+        let ask = |what: &str| Cmd::ServerAdmin {
+            action: SERVER_MATCH,
+            pseudo: String::new(),
+            reason: what.into(),
+        };
+        let host_me = self
+            .net
+            .as_ref()
+            .is_some_and(|n| n.is_build() && n.is_host());
+        let level = arg.and_then(crate::bots::level_named);
+        let off = arg.is_some_and(|w| w == "stop" || chat::switch(w) == Some(false));
+        let maxbot = arg.is_some_and(|w| {
+            matches!(w, "maxbot" | "maxbots" | "max" | "nombre" | "joueurs")
+        });
+        if !host_me {
+            if let Some(host) = self.build_match.clone() {
+                if !host.eq_ignore_ascii_case(&self.pseudo) {
+                    self.chat.say(
+                        format!("La partie est menée par {host} : c'est lui qui la règle."),
+                        chat::RED,
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(l) = level {
+            crate::bots::save_level(l);
+            self.chat.say(
+                format!("Bots : niveau {}.", crate::bots::LEVELS[l as usize]),
+                chat::YELLOW,
+            );
+            if let Some(n) = self.net.as_mut().filter(|_| host_me) {
+                n.set_bot_level(l);
+            }
+            return;
+        }
+        if maxbot {
+            let range = crate::bots::MIN_PLAYERS..=crate::bots::MAX_PLAYERS;
+            match count.and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) if range.contains(&n) => {
+                    crate::bots::save_players(n);
+                    let now = self.net.as_mut().filter(|_| host_me).map(|g| {
+                        let humans = g.human_count();
+                        (humans, g.set_bot_count(n.saturating_sub(humans)))
+                    });
+                    let t = match now {
+                        Some((h, b)) => format!(
+                            "Partie à {n} joueurs : {h} joueur{} et {b} bot{} maintenant.",
+                            if h > 1 { "s" } else { "" },
+                            if b > 1 { "s" } else { "" }
+                        ),
+                        None => format!("Parties du serveur : {n} joueurs, bots compris."),
+                    };
+                    self.chat.say(t, chat::YELLOW);
+                }
+                _ => self.chat.say(
+                    format!(
+                        "Utilisation : /bot maxbot <{}-{}> (joueurs de la partie ; les bots \
+                         complètent)",
+                        range.start(),
+                        range.end()
+                    ),
+                    chat::RED,
+                ),
+            }
+            return;
+        }
+        if off {
+            if host_me {
+                self.relay_cmds.push(ask("close"));
+                self.end_build_match();
+                self.chat.say("Partie FPS du serveur fermée.", chat::YELLOW);
+            }
+            return;
+        }
+        if cmd == "restart" {
+            if host_me {
+                // Fermée puis rouverte : ses joueurs la rejoignent de nouveau.
+                self.relay_cmds.push(ask("close"));
+                self.end_build_match();
+                self.relay_cmds.push(ask("open"));
+                self.match_opening = true;
+                self.chat.say("La partie recommence.", chat::YELLOW);
+            } else {
+                self.chat
+                    .say("Aucune partie à recommencer : /start.", chat::RED);
+            }
+            return;
+        }
+        if host_me {
+            let n = self.net.as_mut().expect("partie");
+            let t = if cmd == "start" {
+                if n.start_now() {
+                    "La partie commence.".to_string()
+                } else {
+                    "La partie est déjà commencée (/restart : la recommencer).".to_string()
+                }
+            } else {
+                let players = crate::bots::saved_players()
+                    .unwrap_or_else(|| crate::fpsmap::load(&self.dir).players() as usize);
+                let before = n.bot_count();
+                let now = n.set_bot_count(players.saturating_sub(n.human_count()));
+                if now == before {
+                    format!("Déjà {now} bots dans la partie (/bot maxbot <2-20> pour en changer).")
+                } else {
+                    format!("{now} bots dans la partie.")
+                }
+            };
+            self.chat.say(t, chat::YELLOW);
+            return;
+        }
+        // Pas encore de partie : le relais vérifie qu'on est OP, puis l'ouvre (voir
+        // `Event::BuildMatch`).
+        self.relay_cmds.push(ask("open"));
+        self.match_opening = true;
     }
 
     /// (v172) Partie contre des bots (mode FPS dans un monde solo) : la carte se remplit de
@@ -5640,6 +5968,47 @@ impl Session {
             }
             return;
         }
+        // (v243) Partie FPS du serveur de construction : son ouverture, ses joueurs (chez son
+        // hôte), ses messages.
+        if self.build.is_some() {
+            match e {
+                Event::BuildMatch { host, open } => {
+                    self.build_match_event(host, *open);
+                    return;
+                }
+                Event::MatchPeer {
+                    peer,
+                    pseudo,
+                    joined,
+                } => {
+                    if let Some(n) = self.net.as_mut().filter(|n| n.is_build()) {
+                        if *joined {
+                            n.peer_joined(*peer, pseudo.clone());
+                        } else {
+                            n.peer_left(*peer);
+                        }
+                    }
+                    return;
+                }
+                Event::FromPeer { peer, data } => {
+                    let locals = match self.net.as_mut().filter(|n| n.is_build()) {
+                        Some(n) => n.receive(Some(*peer), data, &mut self.world),
+                        None => return,
+                    };
+                    self.apply_net(locals);
+                    return;
+                }
+                Event::FromHost(data) => {
+                    let locals = match self.net.as_mut().filter(|n| !n.is_solo()) {
+                        Some(n) => n.receive(None, data, &mut self.world),
+                        None => return,
+                    };
+                    self.apply_net(locals);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let Some(b) = &mut self.build {
             match e {
                 // Le fonctionnement côté serveur (propriétaire, zones) ne s'affiche pas.
@@ -5835,8 +6204,11 @@ impl Session {
     fn apply_net(&mut self, locals: Vec<crate::netgame::Local>) {
         use crate::netgame::Local;
         use minelib_net::game::{reason, CT};
-        // (Partie solo contre des bots : rien à dire au relais.)
-        let online = self.online_match();
+        // (Partie solo contre des bots : rien à dire au relais.) (v243) Ni de la partie d'un
+        // serveur de construction : le serveur continue, elle n'est ni classée ni en pause pour
+        // lui.
+        let online = self.ranked_match();
+        let build_match = self.in_build_match();
         for l in locals {
             match l {
                 Local::SetHp(hp) => {
@@ -5903,6 +6275,15 @@ impl Session {
                 Local::Kicked(reason) => {
                     if online {
                         self.kicked = Some(reason);
+                    } else if build_match {
+                        // (v243) Exclu de la partie du serveur : on y reste, seul en mode FPS.
+                        self.relay_cmds.push(minelib_net::client::Cmd::ServerAdmin {
+                            action: minelib_net::proto::SERVER_MATCH,
+                            pseudo: String::new(),
+                            reason: "leave".into(),
+                        });
+                        self.end_build_match();
+                        self.chat.say(reason, chat::RED);
                     } else {
                         // Partie solo contre des bots : elle s'arrête, on reste sur la carte.
                         self.stop_bots();
@@ -5982,6 +6363,12 @@ impl Session {
                 Local::GameOver(summary) => {
                     if online {
                         self.match_result = Some(summary.clone());
+                    } else if build_match {
+                        self.chat.say(
+                            "Partie finie. (L'OP qui la mène : /restart pour en refaire une, /bot \
+                             off pour la fermer.)",
+                            chat::YELLOW,
+                        );
                     } else {
                         self.chat.say(
                             "Partie finie. /restart pour en refaire une, /bot off pour rester \
@@ -6932,7 +7319,9 @@ impl Session {
         // Partie FPS en ligne : aucune autre commande (pas de triche : mode de jeu, vol,
         // objets, santé, WorldEdit…). Construction en ligne : pas de WorldEdit (les blocs
         // passent un par un par le garant). (Contre des bots en solo : tout est permis.)
-        if self.online_match() {
+        // (v243) La partie d'un serveur de construction garde les commandes du serveur (le
+        // relais y vérifie les OP).
+        if self.ranked_match() {
             self.chat.say(
                 "Commande interdite en partie en ligne. Permises : /report, /unreport, /ami, \
                  /equipe.",
@@ -7139,6 +7528,12 @@ impl Session {
             // se donnent par leur nom (0 et 1 veulent dire arrêt et lancement). (v209) `/bot`
             // ne recommence plus la partie : il la complète (`/restart` pour la refaire) ;
             // `/bot maxbot <2-20>` : joueurs de la partie, soi compris.
+            // (v243) Sur un serveur de construction : la partie FPS du serveur (OP).
+            "bots" | "bot" | "start" | "restart" if self.build.is_some() => {
+                let a = arg.map(str::to_lowercase);
+                let count = parts.next();
+                self.build_match_command(name.as_str(), a.as_deref(), count);
+            }
             "bots" | "bot" => match arg.map(str::to_lowercase).as_deref() {
                 Some(w) if w == "stop" || chat::switch(w) == Some(false) => {
                     self.bots_auto = false;
@@ -7452,7 +7847,7 @@ impl Session {
                     });
                 }
                 let guest = self.build.as_ref().is_some_and(|b| !b.is_owner());
-                if !self.online_match() && !guest {
+                if !self.ranked_match() && !guest {
                     self.meta.name = new_name.clone();
                     match self.save() {
                         Ok(()) => self
@@ -8397,11 +8792,23 @@ impl Session {
         }
     }
 
-    /// Construction en ligne : pseudos des joueurs proches.
+    /// Construction en ligne : pseudos des joueurs proches. (v243) Pas ceux de la partie FPS du
+    /// serveur quand on y est (on ne voit pas ses adversaires à travers les murs).
     fn draw_build_names(&self, ui: &mut Ui, size: (f32, f32), s: f32) {
         let mut near: Vec<(&str, Vec3)> = Vec::new();
+        let in_match: std::collections::HashSet<String> = match &self.net {
+            Some(n) if self.in_build_match() => {
+                n.views().iter().map(|v| v.pseudo.to_lowercase()).collect()
+            }
+            _ => Default::default(),
+        };
         if let Some(b) = &self.build {
-            near.extend(b.others.values().map(|o| (o.pseudo.as_str(), o.pos)));
+            near.extend(
+                b.others
+                    .values()
+                    .filter(|o| !in_match.contains(&o.pseudo.to_lowercase()))
+                    .map(|o| (o.pseudo.as_str(), o.pos)),
+            );
         }
         if let Some(c) = &self.crowd {
             near.extend(c.npcs.iter().map(|n| (n.name.as_str(), n.pos)));
@@ -9065,8 +9472,19 @@ impl Session {
                     .map(|rc| rc.npcs.len())
                     .sum::<usize>(),
         );
+        // (v243) Dans la partie FPS du serveur : ses joueurs sont ceux de la partie (dessinés
+        // plus haut, là où l'hôte les voit), pas leur position de construction.
+        let in_match: std::collections::HashSet<String> = match &self.net {
+            Some(n) if self.in_build_match() => {
+                n.views().iter().map(|v| v.pseudo.to_lowercase()).collect()
+            }
+            _ => Default::default(),
+        };
         if let Some(b) = &self.build {
-            others.extend(b.others.values().map(|o| Other {
+            let shown = |o: &&crate::buildnet::Other| {
+                in_match.is_empty() || !in_match.contains(&o.pseudo.to_lowercase())
+            };
+            others.extend(b.others.values().filter(shown).map(|o| Other {
                 pseudo: &o.pseudo,
                 pos: o.pos,
                 yaw: o.yaw,

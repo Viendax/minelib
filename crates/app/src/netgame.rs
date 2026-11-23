@@ -1415,6 +1415,9 @@ pub struct Host {
     /// (v174) Partie solo regardée en spectateur : le joueur local en est sorti (manches
     /// jouées à ce moment, et s'il était en vie), les bots continuent entre eux.
     away: Option<(u32, bool)>,
+    /// (v243) Partie d'un serveur de construction, menée par un OP : ses bots, les joueurs du
+    /// serveur en mode FPS, sans classement ni vérificateur (ni copies, ni journal).
+    build: bool,
 }
 
 pub struct Guest {
@@ -1661,10 +1664,56 @@ impl NetGame {
             bots: None,
             bot_seed: 0,
             away: None,
+            build: false,
         };
         h.events(ev, &mut out);
         h.out = out;
         NetGame::Host(Box::new(h))
+    }
+
+    /// (v243) Partie FPS d'un serveur de construction, dont ce jeu (celui de l'OP qui l'a
+    /// ouverte) est l'hôte : comme la partie solo contre des bots (`players` joueurs en tout,
+    /// soi compris, complétés par des bots ; elle commence tout de suite), mais en ligne : les
+    /// joueurs du serveur en mode FPS y entrent comme des invités (le relais leur passe ses
+    /// messages). Pas de classement, ni vérificateur, ni copie de la partie.
+    pub fn build_host(
+        link: Sender<Inbound>,
+        pseudo: String,
+        map: FpsMap,
+        spawn: Vec3,
+        nav: Option<std::sync::mpsc::Receiver<std::sync::Arc<crate::bots::Nav>>>,
+        level: u8,
+        players: usize,
+    ) -> Self {
+        let mut g = NetGame::host(link, pseudo, map, [0; 32], spawn);
+        if let NetGame::Host(h) = &mut g {
+            h.build = true;
+            h.auto_backup = false;
+            let seed = h.rand();
+            let mut bots = crate::bots::Bots::new(seed, level);
+            if let Some(rx) = nav {
+                bots.set_building(rx);
+            }
+            let names = crate::bots::Bots::names(players.saturating_sub(1), seed);
+            for (i, name) in names.into_iter().enumerate() {
+                let id = crate::bots::BOT_BASE + i as u64 + 1;
+                bots.add(id);
+                h.add_bot(id, name);
+            }
+            h.bot_seed = seed;
+            h.bots = Some(Box::new(bots));
+            h.spawns.clear();
+            let ev = h.m.start_now();
+            let mut out = Vec::new();
+            h.events(ev, &mut out);
+            h.out.extend(out);
+        }
+        g
+    }
+
+    /// (v243) Partie FPS d'un serveur de construction (hôte ou invité).
+    pub fn is_build(&self) -> bool {
+        matches!(self, NetGame::Host(h) if h.build)
     }
 
     /// (v172) Partie solo contre des bots (mode FPS dans un monde solo) : ce jeu en est
@@ -1716,7 +1765,8 @@ impl NetGame {
         let NetGame::Host(h) = self else {
             return 0;
         };
-        if !h.solo {
+        // (v243) Aussi la partie d'un serveur de construction (son hôte).
+        if !h.solo && !h.build {
             return 0;
         }
         let Some(mut bots) = h.bots.take() else {
@@ -1768,12 +1818,26 @@ impl NetGame {
     /// (v209) Bots de la partie solo.
     pub fn bot_count(&self) -> usize {
         match self {
-            NetGame::Host(h) if h.solo => h
+            NetGame::Host(h) if h.solo || h.build => h
                 .peers
                 .keys()
                 .filter(|&&id| id > crate::bots::BOT_BASE)
                 .count(),
             _ => 0,
+        }
+    }
+
+    /// (v243) Joueurs de la partie qui ne sont pas des bots (l'hôte compris s'il joue).
+    pub fn human_count(&self) -> usize {
+        match self {
+            NetGame::Host(h) => {
+                usize::from(h.playing)
+                    + h.peers
+                        .keys()
+                        .filter(|&&id| id <= crate::bots::BOT_BASE)
+                        .count()
+            }
+            NetGame::Guest(_) => 1,
         }
     }
 
@@ -1783,7 +1847,7 @@ impl NetGame {
         let NetGame::Host(h) = self else {
             return false;
         };
-        if !h.solo || h.m.phase != game::phase::WARMUP {
+        if (!h.solo && !h.build) || h.m.phase != game::phase::WARMUP {
             return false;
         }
         let ev = h.m.start_now();
@@ -2692,6 +2756,7 @@ impl NetGame {
             bots: None,
             bot_seed: 0,
             away: None,
+            build: false,
         }));
         if let NetGame::Host(h) = self {
             h.playing = h.m.players.contains_key(&0);
@@ -3310,8 +3375,9 @@ impl Host {
     fn record(&mut self, who: u64, mv: Move) {
         dbg_alive("hote", self.tick as u64, who, "(avant)", &self.m);
         note_activity(&mut self.m, who, &mv);
-        // Partie solo : pas de vérificateur, rien à garder.
-        if self.solo {
+        // Partie solo : pas de vérificateur, rien à garder. (v243) Ni sur un serveur de
+        // construction.
+        if self.solo || self.build {
             return;
         }
         self.chain = chain_step(&self.chain, self.tick, who, &mv);
@@ -5641,6 +5707,39 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// (v243) Partie d'un serveur de construction : comme la partie solo (bots ajoutés et
+    /// retirés, elle commence tout de suite), mais ses messages partent au relais (ses joueurs
+    /// les reçoivent), et un joueur du serveur y entre comme un invité ; pas de journal pour un
+    /// vérificateur.
+    #[test]
+    fn a_build_match_has_bots_and_talks_to_its_players() {
+        let (world, map, spawn) = obstacle_course();
+        let (link, rx) = std::sync::mpsc::channel();
+        let mut g = NetGame::build_host(link, "Op".into(), map, spawn, None, 0, 4);
+        assert!(g.is_build() && !g.is_solo());
+        assert_eq!((g.bot_count(), g.human_count()), (3, 1));
+        assert_ne!(g.phase(), game::phase::WARMUP, "commencée tout de suite");
+        // Un joueur du serveur entre : il compte parmi les joueurs, un bot lui laisse sa place
+        // quand on demande quatre joueurs en tout.
+        g.peer_joined(41, "Eve".into());
+        assert_eq!(g.human_count(), 2);
+        assert_eq!(g.set_bot_count(4 - g.human_count()), 2);
+        let me = Player::new(spawn);
+        let input = MoveInput {
+            fps: true,
+            ..Default::default()
+        };
+        let dt = 1.0 / 256.0;
+        for _ in 0..64 {
+            g.on_tick(&world, &me, &input, dt);
+            g.end_frame(&world, Vec::new(), 255, NadeOut::default(), dt);
+        }
+        assert!(rx.try_iter().count() > 0, "l'état de la partie part au relais");
+        assert!(host_of(&mut g).log.is_empty(), "pas de journal");
+        g.peer_left(41);
+        assert_eq!(g.human_count(), 1);
     }
 
     /// Parcours d'obstacles : départ des T, une marche, un trou à sauter, une échelle qui

@@ -819,7 +819,9 @@ impl Game {
             // Partie en ligne : on la quitte ; un invité n'enregistre pas la carte de l'hôte.
             // Partie FPS en ligne : la carte ne change pas (sa signature non plus).
             // (La partie solo contre des bots n'est pas en ligne : le monde s'enregistre.)
-            let online = s.online_match();
+            // (v243) La partie FPS d'un serveur de construction non plus : son monde à soi
+            // s'enregistre.
+            let online = s.ranked_match();
             let guest_build = s.build.as_ref().is_some_and(|b| !b.is_owner());
             if online || s.build.is_some() {
                 self.accounts.room(minelib_net::client::Cmd::Leave);
@@ -2884,7 +2886,7 @@ impl Game {
         let online = self
             .session
             .as_ref()
-            .is_some_and(|s| s.online_match() || s.build.as_ref().is_some_and(|b| !b.is_owner()));
+            .is_some_and(|s| s.ranked_match() || s.build.as_ref().is_some_and(|b| !b.is_owner()));
         let label = if online {
             "Quitter la partie"
         } else {

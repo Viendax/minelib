@@ -1096,6 +1096,8 @@ impl Accounts {
                 | Event::FromPeer { .. }
                 | Event::Witness { .. }
                 | Event::Rtt(_)
+                | Event::BuildMatch { .. }
+                | Event::MatchPeer { .. }
                 | Event::FromHost(_)) => self.game_events.push(e),
             }
         }

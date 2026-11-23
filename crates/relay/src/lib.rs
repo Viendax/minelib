@@ -1163,6 +1163,15 @@ const SOV_RANGE: u64 = 1 << 32;
 const SOV_FLOOR_MS: u64 = 60_000;
 
 /// Partie annoncée : l'hôte fait tourner le serveur, le relais transmet les données.
+/// (v243) Partie FPS d'un serveur de construction : son hôte (le jeu de l'OP qui l'a
+/// ouverte) et ses joueurs (connexions), entre qui vont ses messages (`ToHost`, `ToPeer`,
+/// `Broadcast`).
+struct BuildMatch {
+    host: u64,
+    host_pseudo: String,
+    members: Vec<u64>,
+}
+
 struct Room {
     kind: u8,
     name: String,
@@ -1276,6 +1285,9 @@ struct Room {
     /// Construction : créateur du serveur (OP d'office) et clé de ses OP et bannis.
     creator: String,
     server: String,
+    /// (v243) Construction : partie FPS ouverte par un OP (son jeu en est l'hôte, avec ses
+    /// bots), et les joueurs qui y sont.
+    fps_match: Option<BuildMatch>,
     /// Provinces (v138), relais du monde : celles confiées (ou en train de l'être) à un
     /// relais de province, et dernière liste envoyée à chaque joueur (empreinte).
     provinces: HashMap<[i32; 2], provinces::ProvinceRef>,
@@ -1857,6 +1869,160 @@ fn taken_elsewhere(req: &Request, state: &Mutex<State>) -> Option<Response> {
         .then(|| err(ErrorCode::PseudoTaken, "pris sur un autre relais"))
 }
 
+/// (v243) Le joueur `id` quitte la partie FPS du serveur de construction `room_id` (il part, ou
+/// change de mode de jeu) : son hôte le sait ; si c'est lui, elle se ferme pour tous.
+fn match_left(st: &mut State, room_id: u64, id: u64) {
+    let Some(r) = st.rooms.get_mut(&room_id) else {
+        return;
+    };
+    let Some(m) = &mut r.fps_match else {
+        return;
+    };
+    if m.host == id {
+        r.fps_match = None;
+        let close = Response::BuildMatch {
+            host: String::new(),
+            open: false,
+        };
+        let everyone: Vec<u64> = r.everyone().filter(|&m| m != id).collect();
+        for m in everyone {
+            if let Some(c) = st.conns.get(&m) {
+                transport::push(&c.tx, &close);
+            }
+        }
+        log::info!("monde {room_id} : partie FPS fermée");
+        return;
+    }
+    let before = m.members.len();
+    m.members.retain(|&p| p != id);
+    if m.members.len() != before {
+        let host = m.host;
+        let pseudo = st
+            .conns
+            .get(&id)
+            .and_then(|c| c.pseudo.clone())
+            .unwrap_or_default();
+        if let Some(c) = st.conns.get(&host) {
+            transport::push(
+                &c.tx,
+                &Response::MatchPeer {
+                    peer: id,
+                    pseudo,
+                    joined: false,
+                },
+            );
+        }
+    }
+}
+
+/// (v243) `SERVER_MATCH` : ouvrir (OP), fermer (son hôte ou un OP), y entrer, en sortir, ou
+/// savoir si elle est ouverte. Rend le texte de la réponse, ou le refus.
+fn build_match(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    pseudo: &str,
+    what: &str,
+    op: bool,
+) -> Result<String, String> {
+    let Some(r) = st.rooms.get_mut(&rid) else {
+        return Err("Monde introuvable.".into());
+    };
+    let open_msg = |host: &str| Response::BuildMatch {
+        host: host.to_string(),
+        open: true,
+    };
+    match what {
+        "open" => {
+            if !op {
+                return Err("Partie FPS : réservée aux OP de ce serveur.".into());
+            }
+            match &r.fps_match {
+                Some(m) if m.host != id => {
+                    return Err(format!("Une partie est déjà menée par {}.", m.host_pseudo));
+                }
+                Some(_) => {}
+                None => {
+                    r.fps_match = Some(BuildMatch {
+                        host: id,
+                        host_pseudo: pseudo.to_string(),
+                        members: Vec::new(),
+                    });
+                    log::info!("monde {rid} : partie FPS ouverte par « {pseudo} »");
+                }
+            }
+            let everyone: Vec<u64> = r.everyone().collect();
+            let msg = open_msg(pseudo);
+            for m in everyone {
+                if let Some(c) = st.conns.get(&m) {
+                    transport::push(&c.tx, &msg);
+                }
+            }
+            Ok(String::new())
+        }
+        "close" => {
+            let Some(host) = r.fps_match.as_ref().map(|m| m.host) else {
+                return Ok(String::new());
+            };
+            if host != id && !op {
+                return Err("Seuls son hôte et les OP ferment la partie.".into());
+            }
+            match_left(st, rid, host);
+            // Son hôte aussi l'apprend (match_left ne le dit qu'aux autres).
+            if let Some(c) = st.conns.get(&host) {
+                transport::push(
+                    &c.tx,
+                    &Response::BuildMatch {
+                        host: String::new(),
+                        open: false,
+                    },
+                );
+            }
+            Ok(String::new())
+        }
+        "join" => {
+            let Some(m) = &mut r.fps_match else {
+                return Err("Aucune partie FPS sur ce serveur.".into());
+            };
+            if m.host != id && !m.members.contains(&id) {
+                m.members.push(id);
+                let host = m.host;
+                if let Some(c) = st.conns.get(&host) {
+                    transport::push(
+                        &c.tx,
+                        &Response::MatchPeer {
+                            peer: id,
+                            pseudo: pseudo.to_string(),
+                            joined: true,
+                        },
+                    );
+                }
+            }
+            Ok(String::new())
+        }
+        "leave" => {
+            if r.fps_match.as_ref().is_some_and(|m| m.host != id) {
+                match_left(st, rid, id);
+            }
+            Ok(String::new())
+        }
+        _ => {
+            // « query » : où en est-elle (poussé, comme à tous).
+            let msg = match &r.fps_match {
+                Some(m) => open_msg(&m.host_pseudo),
+                None => Response::BuildMatch {
+                    host: String::new(),
+                    open: false,
+                },
+            };
+            if let Some(c) = st.conns.get(&id) {
+                transport::push(&c.tx, &msg);
+            }
+            Ok(String::new())
+        }
+    }
+}
+
 /// Le jeu `id` quitte sa partie : ferme celle qu'il héberge, prévient l'hôte sinon.
 fn leave_room(st: &mut State, id: u64) {
     let Some(room_id) = st.conns.get_mut(&id).and_then(|c| c.room.take()) else {
@@ -1864,6 +2030,8 @@ fn leave_room(st: &mut State, id: u64) {
     };
     // (v141 : relais de secours d'une province, ou copie qui la suit.)
     provinces::left(st, room_id, id);
+    // (v243) Sa partie FPS du serveur de construction : il en sort (son hôte : elle se ferme).
+    match_left(st, room_id, id);
     let me = st.conns.get(&id).and_then(|c| c.pseudo.clone());
     let Some(room) = st.rooms.get_mut(&room_id) else {
         return;
@@ -5618,6 +5786,7 @@ fn open_room(
             ban_review: None,
             creator: pseudo.to_string(),
             server: servers::key(pseudo, &map),
+            fps_match: None,
             provinces: HashMap::new(),
             provinces_sent: HashMap::new(),
             delegated: Arc::default(),
@@ -6491,6 +6660,17 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     // monde (dit aussi : le jeu oublie alors ce qu'il avait imposé chez lui).
                     let (kind, left, fixed) = st.servers.weather(&server);
                     transport::push(&c.tx, &Response::SetWeather { kind, left, fixed });
+                    // (v243) Une partie FPS y est ouverte : il le sait (en mode FPS, son jeu
+                    // la rejoint).
+                    if let Some(m) = st.rooms.get(&rid).and_then(|r| r.fps_match.as_ref()) {
+                        transport::push(
+                            &c.tx,
+                            &Response::BuildMatch {
+                                host: m.host_pseudo.clone(),
+                                open: true,
+                            },
+                        );
+                    }
                 }
                 if !st.servers.is_op(&server, &creator, pseudo) {
                     if let (Some(mode), Some(c)) =
@@ -6507,6 +6687,15 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 }
                 return Some(Response::ServerAdmin {
                     text: String::new(),
+                });
+            }
+            // (v243) Partie FPS du serveur (ouverte par un OP, qui la mène avec ses bots).
+            if action == proto::SERVER_MATCH {
+                let op = st.servers.is_op(&server, &creator, pseudo);
+                let what = reason.trim().to_ascii_lowercase();
+                return Some(match build_match(st, rid, id, pseudo, &what, op) {
+                    Ok(text) => Response::ServerAdmin { text },
+                    Err(e) => err(ErrorCode::Refused, e),
                 });
             }
             // (v229) Météo du serveur demandée (sans rien changer : `reason` vide) : à tout
@@ -7678,6 +7867,20 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     }
                 }
             }
+            // (v243) Monde de construction : à l'hôte de sa partie FPS, d'un de ses joueurs.
+            if let Some(m) = st
+                .rooms
+                .get(&rid)
+                .filter(|r| r.kind == 1)
+                .and_then(|r| r.fps_match.as_ref())
+            {
+                if m.members.contains(&id) {
+                    if let Some(c) = st.conns.get(&m.host) {
+                        transport::push(&c.tx, &Response::FromPeer { peer: id, data });
+                    }
+                }
+                return None;
+            }
             let r = st.rooms.get_mut(&rid)?;
             // Tirs, grenades, achats… : le garant vérificateur en reçoit une copie
             // attestée (l'hôte ne peut ni en inventer ni en taire), et le relais la garde
@@ -7911,6 +8114,17 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             return None;
         }
         Request::ToPeer { peer, data } => {
+            // (v243) Monde de construction : de l'hôte de sa partie FPS à un de ses joueurs.
+            if let Some(r) = my_room.and_then(|r| st.rooms.get(&r)).filter(|r| r.kind == 1) {
+                if let Some(m) = r.fps_match.as_ref().filter(|m| m.host == id) {
+                    if m.members.contains(&peer) {
+                        if let Some(c) = st.conns.get(&peer) {
+                            transport::push(&c.tx, &Response::FromHost { data });
+                        }
+                    }
+                }
+                return None;
+            }
             // Copie de la partie pour le vérificateur : le relais en garde les dernières
             // (pièces d'un arbitrage : personne ne peut les retoucher après coup).
             if let Some(r) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
@@ -7930,6 +8144,18 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             return None;
         }
         Request::Broadcast { data } => {
+            // (v243) Monde de construction : de l'hôte de sa partie FPS à ses joueurs seulement.
+            if let Some(r) = my_room.and_then(|r| st.rooms.get(&r)).filter(|r| r.kind == 1) {
+                if let Some(m) = r.fps_match.as_ref().filter(|m| m.host == id) {
+                    let msg = Response::FromHost { data };
+                    for p in &m.members {
+                        if let Some(c) = st.conns.get(p) {
+                            transport::push(&c.tx, &msg);
+                        }
+                    }
+                }
+                return None;
+            }
             if let Some(r) = my_room.and_then(|r| st.rooms.get(&r)) {
                 if r.host == id {
                     let msg = Response::FromHost { data };
@@ -11496,6 +11722,139 @@ mod tests {
     /// (v229) La météo d'un serveur : seul un OP l'impose, tous ses joueurs l'apprennent (et
     /// celui qui arrive ensuite). La foudre de `/thor` et de la Foudre de Zeus : seul un OP
     /// la lance, les joueurs proches la reçoivent avec lui ; rien n'en est gardé.
+    /// (v243) Partie FPS d'un serveur de construction : seul un OP l'ouvre (son jeu la mène) ;
+    /// tous les joueurs du serveur le savent, ceux qui arrivent aussi ; un joueur qui y entre
+    /// est annoncé à son hôte ; ses messages vont entre son hôte et ses joueurs seulement (pas à
+    /// un joueur qui n'y est pas) ; un joueur qui en sort est annoncé ; son hôte parti, elle se
+    /// ferme pour tous.
+    #[test]
+    fn a_build_match_runs_between_its_host_and_its_players() {
+        let dir = std::env::temp_dir().join(format!("minelib-partie-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        let act = |c: &Client, what: &str| {
+            c.send(Cmd::ServerAdmin {
+                action: proto::SERVER_MATCH,
+                pseudo: String::new(),
+                reason: what.into(),
+            });
+        };
+        let state = |c: &Client| match wait(c, |e| matches!(e, Event::BuildMatch { .. })) {
+            Event::BuildMatch { host, open } => (host, open),
+            _ => unreachable!(),
+        };
+        let peer = |c: &Client| match wait(c, |e| matches!(e, Event::MatchPeer { .. })) {
+            Event::MatchPeer {
+                peer,
+                pseudo,
+                joined,
+            } => (peer, pseudo, joined),
+            _ => unreachable!(),
+        };
+        let (createur, clink) = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        let (bob, blink) = login("Bob");
+        bob.send(Cmd::Join(room));
+        wait(&bob, |e| matches!(e, Event::Joined { .. }));
+        // Pas OP : refusé. Pas de partie : rien à rejoindre.
+        act(&eve, "open");
+        assert!(wait_error(&eve).contains("OP"));
+        act(&eve, "join");
+        assert!(wait_error(&eve).contains("Aucune partie"));
+        // Le créateur l'ouvre : tous le savent.
+        act(&createur, "open");
+        for c in [&createur, &eve, &bob] {
+            assert_eq!(state(c), ("Createur".to_string(), true));
+        }
+        // Eve y entre : son hôte le sait ; ses messages vont à l'hôte.
+        act(&eve, "join");
+        let (eve_id, pseudo, joined) = peer(&createur);
+        assert_eq!((pseudo.as_str(), joined), ("Eve", true));
+        transport::push(&elink, &Request::ToHost { data: vec![1, 2] });
+        match wait(&createur, |e| matches!(e, Event::FromPeer { .. })) {
+            Event::FromPeer { peer, data } => assert_eq!((peer, data), (eve_id, vec![1, 2])),
+            _ => unreachable!(),
+        }
+        // Bob n'y est pas : ses messages à l'hôte ne passent pas, et l'hôte ne lui parle pas.
+        transport::push(&blink, &Request::ToHost { data: vec![7] });
+        transport::push(&clink, &Request::Broadcast { data: vec![9] });
+        match wait(&eve, |e| matches!(e, Event::FromHost(_))) {
+            Event::FromHost(d) => assert_eq!(d, vec![9]),
+            _ => unreachable!(),
+        }
+        transport::push(&clink, &Request::ToPeer { peer: eve_id, data: vec![8] });
+        match wait(&eve, |e| matches!(e, Event::FromHost(_))) {
+            Event::FromHost(d) => assert_eq!(d, vec![8]),
+            _ => unreachable!(),
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        let mut bob_got = false;
+        while let Some(e) = bob.poll() {
+            bob_got |= matches!(e, Event::FromHost(_));
+        }
+        assert!(!bob_got, "Bob n'est pas dans la partie");
+        let mut host_got_bob = false;
+        while let Some(e) = createur.poll() {
+            host_got_bob |= matches!(e, Event::FromPeer { data, .. } if data == vec![7]);
+        }
+        assert!(!host_got_bob, "rien de Bob à l'hôte");
+        // Un joueur qui arrive l'apprend.
+        let (dan, _dlink) = login("Dan");
+        dan.send(Cmd::Join(room));
+        wait(&dan, |e| matches!(e, Event::Joined { .. }));
+        dan.send(Cmd::ServerAdmin {
+            action: proto::SERVER_GAMEMODE_QUERY,
+            pseudo: String::new(),
+            reason: String::new(),
+        });
+        assert_eq!(state(&dan), ("Createur".to_string(), true));
+        // Eve en sort : son hôte le sait.
+        act(&eve, "leave");
+        assert_eq!(peer(&createur), (eve_id, "Eve".to_string(), false));
+        // Eve revient, puis l'hôte s'en va : la partie se ferme pour tous.
+        act(&eve, "join");
+        peer(&createur);
+        createur.send(Cmd::Leave);
+        for c in [&eve, &bob, &dan] {
+            assert_eq!(state(c), (String::new(), false));
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn only_ops_set_the_weather_and_throw_lightning_for_everyone() {
         use proto::{WEATHER_CLEAR, WEATHER_NATURAL, WEATHER_RAIN, WEATHER_STORM};

@@ -621,6 +621,30 @@ pub fn nav_in_background(
     rx
 }
 
+/// (v243) Relevé de la carte d'une partie d'un serveur de construction, en tâche de fond : le
+/// monde n'est pas sur le disque (il arrive par le réseau), la session en donne une copie des
+/// chunks chargés autour de la partie (`world`). Pas gardé d'une partie à l'autre : le monde
+/// change pendant qu'on y construit.
+pub fn nav_from_world(world: World, map: FpsMap, starts: Vec<Vec3>) -> Receiver<Arc<Nav>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("releve-bots".into())
+        .spawn(move || {
+            let t = std::time::Instant::now();
+            let nav = Nav::build(&world, &map, &starts);
+            log::info!(
+                "bots : relevé de la partie du serveur en {:.1} s ({} cases)",
+                t.elapsed().as_secs_f32(),
+                nav.len()
+            );
+            if nav.is_empty() {
+                log::warn!("bots : aucune case où se tenir aux départs, ils resteront sur place");
+            }
+            let _ = tx.send(Arc::new(nav));
+        });
+    rx
+}
+
 /// (v209) Relevé d'une carte : en cours (ceux qui l'attendent) ou fait.
 enum Survey {
     Running(Vec<std::sync::mpsc::Sender<Arc<Nav>>>),

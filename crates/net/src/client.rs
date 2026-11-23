@@ -357,6 +357,18 @@ pub enum Event {
         by: String,
         name: String,
     },
+    /// (v243) Partie FPS du serveur de construction ouverte (menée par `host`) ou fermée.
+    BuildMatch {
+        host: String,
+        open: bool,
+    },
+    /// (v243) Hôte de la partie FPS d'un serveur de construction : `peer` (`pseudo`) y entre
+    /// ou en sort.
+    MatchPeer {
+        peer: u64,
+        pseudo: String,
+        joined: bool,
+    },
     /// (v231) `from` vient de nous ajouter en ami (`mutual` : on l'avait ajouté ; sinon,
     /// c'est une demande).
     FriendAdded {
@@ -859,6 +871,16 @@ impl Worker {
             Response::PartyInvite { from } => Event::PartyInvite(from),
             Response::Invited { from, room, name } => Event::Invited { from, room, name },
             Response::InviteDeclined { by, name } => Event::InviteDeclined { by, name },
+            Response::BuildMatch { host, open } => Event::BuildMatch { host, open },
+            Response::MatchPeer {
+                peer,
+                pseudo,
+                joined,
+            } => Event::MatchPeer {
+                peer,
+                pseudo,
+                joined,
+            },
             Response::FriendAdded { from, mutual } => Event::FriendAdded { from, mutual },
             Response::SkinChanged { pseudo } => Event::SkinChanged(pseudo),
             Response::Party { id, members } => Event::Party { id, members },

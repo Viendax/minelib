@@ -24,7 +24,11 @@ use serde::{Deserialize, Serialize};
 /// (v242) 62 : invitations gardées par le relais sans limite de temps, jusqu'à la réponse
 /// (`Response::Friends::invites`), Accepter / Refuser / Ignorer (`Request::InviteReply`), et
 /// le refus dit à qui avait invité (`Response::InviteDeclined`).
-pub const PROTOCOL: u32 = 62;
+/// (v243) 63 : partie FPS avec des bots sur un serveur de construction, menée par un OP
+/// (`SERVER_MATCH`, `Response::BuildMatch`, `Response::MatchPeer`) ; dans un monde de
+/// construction, `ToHost`, `ToPeer` et `Broadcast` vont entre l'hôte de cette partie et ses
+/// joueurs.
+pub const PROTOCOL: u32 = 63;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -93,6 +97,14 @@ pub const SERVER_SETSPAWN: u8 = 18;
 /// (`Response::SetWeather`), et à ceux qui arrivent. `reason` vide (tout joueur du serveur) :
 /// rien ne change, le relais redit la météo du serveur à celui qui la demande.
 pub const SERVER_WEATHER: u8 = 19;
+/// (v243) Partie FPS sur le serveur de construction : `reason` = « open » (un OP l'ouvre et
+/// la mène : son jeu en est l'hôte, avec ses bots), « close » (son hôte ou un OP la ferme),
+/// « join » / « leave » (un joueur en mode FPS y entre, en sort), « query » (est-elle
+/// ouverte ?). Le relais dit à tous les joueurs du serveur qu'elle s'ouvre ou se ferme
+/// (`Response::BuildMatch`, aussi à ceux qui arrivent), et à son hôte qui y entre ou en sort
+/// (`Response::MatchPeer`). Les messages de la partie (`ToHost`, `ToPeer`, `Broadcast`) ne vont
+/// qu'entre son hôte et ses joueurs.
+pub const SERVER_MATCH: u8 = 20;
 
 /// (v229) Temps qu'il fait, dans `Response::SetWeather` : beau temps, pluie, orage ; ou
 /// aucun temps imposé (celui des horloges du monde, que chaque jeu calcule).
@@ -1505,6 +1517,19 @@ pub enum Response {
         room: u64,
         name: String,
     },
+    /// (v243) Poussé : la partie FPS du serveur de construction est ouverte, menée par `host`
+    /// (`open`), ou fermée.
+    BuildMatch {
+        host: String,
+        open: bool,
+    },
+    /// (v243) Poussé à l'hôte de la partie FPS d'un serveur de construction : le joueur `peer`
+    /// (`pseudo`) y entre (`joined`) ou en sort.
+    MatchPeer {
+        peer: u64,
+        pseudo: String,
+        joined: bool,
+    },
     /// (v242) Poussé : `by` a refusé notre invitation dans le monde `name`.
     InviteDeclined {
         by: String,
@@ -1582,6 +1607,8 @@ impl Response {
                 | Response::PartyInvite { .. }
                 | Response::Invited { .. }
                 | Response::InviteDeclined { .. }
+                | Response::BuildMatch { .. }
+                | Response::MatchPeer { .. }
                 | Response::FriendAdded { .. }
                 | Response::Party { .. }
                 | Response::PartyGo { .. }

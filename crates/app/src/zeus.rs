@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(full.blow(false, false), Blow::TooFar);
         assert_eq!(empty.blow(true, false), Blow::Sky);
         assert_eq!(full.blow(true, false), Blow::Sky);
-        assert!(ARC_REACH < STRIKE_REACH);
+        const { assert!(ARC_REACH < STRIKE_REACH) };
         // 2,5 fois moins de dégâts que la foudre.
         assert_eq!(
             (crate::lightning::DAMAGE as f32 / 2.5).round() as u8,

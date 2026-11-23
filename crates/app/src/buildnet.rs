@@ -517,6 +517,11 @@ fn chunk_of(x: i32, z: i32) -> [i32; 2] {
 }
 
 impl BuildNet {
+    /// (v243) Lien vers le relais du monde : la partie FPS du serveur passe par lui.
+    pub fn world_link(&self) -> Sender<Inbound> {
+        self.link.clone()
+    }
+
     pub fn new(link: Sender<Inbound>, pseudo: String, owner: bool) -> Self {
         Self {
             link,
