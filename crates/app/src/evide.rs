@@ -39,6 +39,9 @@ const TALL: f32 = HEIGHT / crate::player::HEIGHT;
 const HALF: f32 = crate::player::HALF_WIDTH;
 /// Hauteur de sa boîte quand il rampe (« 1 de large et de haut »).
 const CRAWL_H: f32 = 0.95;
+/// (v277) Sous cette hauteur il est assez à plat pour mordre comme en rampant (la tête
+/// seule, nos jambes).
+const LOW: f32 = 1.5;
 /// En rampant : hauteur de ses hanches, et leur recul derrière sa position (sa boîte est à
 /// l'avant, autour de la poitrine et de la tête ; le corps traîne derrière, 3,5 de long).
 const CRAWL_HIP: f32 = 0.5;
@@ -184,13 +187,23 @@ pub fn parts(pos: Vec3, yaw: f32, a: &Anim) -> [(Mat4, [f32; 3], [f32; 3]); PART
     let mut out = [(Mat4::IDENTITY, [0.0; 3], [0.0; 3]); PARTS];
     let stride = a.walk.sin() * a.swing;
     // Jambes : balancées debout ; traînées derrière, presque à plat, en rampant.
+    // (v277) À toute hauteur entre les deux, les pieds restent au sol : la jambe part en
+    // arrière d'autant que la hanche descend.
+    // (L'angle où le coin le plus bas du pied touche juste le sol : la jambe, longue de `len`
+    // et épaisse de deux fois `half`, tournée de t, descend de len·cos t + half·sin t. Pris
+    // peu à peu sur le premier dixième, pour partir sans à-coup de la jambe droite.)
+    let (len, half) = (r.leg * TALL, (r.boxes[LEG_L].1[2] - r.boxes[LEG_L].0[2]) / 2.0);
+    let reach = (len * len + half * half).sqrt();
+    let touch = half.atan2(len) + (hip_y / reach).clamp(0.0, 1.0).acos();
+    let low = (c * 10.0).min(1.0);
     for (i, side, sign) in [(LEG_L, -r.leg_x, 1.0f32), (LEG_R, r.leg_x, -1.0)] {
-        let stand = stride * 0.75 * sign;
-        let lie = -FRAC_PI_2 + 0.24 + stride * 0.1 * sign;
+        // Debout, les jambes se balancent d'avant en arrière ; baissé, chacune ne se lève
+        // que vers l'arrière (vers l'avant, le pied passerait sous le sol).
+        let swing = stride * lerp(0.75, 0.1, c) * sign;
         let (lo, hi) = tall(i);
         let xf = hip
             * Mat4::from_translation(Vec3::new(side, 0.0, 0.0))
-            * Mat4::from_rotation_x(lerp(stand, lie, c));
+            * Mat4::from_rotation_x(lerp(swing, -touch - swing.abs(), low));
         out[i] = (xf, lo, hi);
     }
     let torso = hip * Mat4::from_rotation_x(-pitch);
@@ -562,6 +575,70 @@ fn fits(world: &World, pos: Vec3, h: f32) -> bool {
     true
 }
 
+/// (v277) La plus grande hauteur, de `CRAWL_H` à `HEIGHT`, à laquelle sa boîte tient là ;
+/// `None` : même à plat ventre il n'y tient pas (un mur, une marche).
+fn room(world: &World, pos: Vec3) -> Option<f32> {
+    if !fits(world, pos, CRAWL_H) {
+        return None;
+    }
+    if fits(world, pos, HEIGHT) {
+        return Some(HEIGHT);
+    }
+    let (mut ok, mut bad) = (CRAWL_H, HEIGHT);
+    for _ in 0..6 {
+        let mid = (ok + bad) / 2.0;
+        if fits(world, pos, mid) {
+            ok = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    Some(ok)
+}
+
+/// (v277) La hauteur de son corps (le sommet de son modèle, en blocs) quand il est baissé
+/// de `crawl` (0 debout … 1 à plat ventre).
+pub fn top_of(crawl: f32) -> f32 {
+    let a = Anim {
+        crawl,
+        hunch: 0.18,
+        ..Anim::default()
+    };
+    let mut top = 0.0f32;
+    for (xf, lo, hi) in parts(Vec3::ZERO, 0.0, &a) {
+        for k in 0..8 {
+            let c = Vec3::new(
+                if k & 1 == 0 { lo[0] } else { hi[0] },
+                if k & 2 == 0 { lo[1] } else { hi[1] },
+                if k & 4 == 0 { lo[2] } else { hi[2] },
+            );
+            top = top.max(xf.transform_point3(c).y);
+        }
+    }
+    top
+}
+
+/// (v277) « Il ne se penche pas plus que la taille dont il a besoin pour passer sous les
+/// blocs ; jusqu'à 1 de hauteur sa taille s'adapte en proportion » : de combien il se baisse
+/// (0 debout … 1 à plat ventre) pour que son corps tienne tout juste sous une hauteur `h`.
+pub fn crawl_for(h: f32) -> f32 {
+    const N: usize = 32;
+    static TOPS: std::sync::OnceLock<[f32; N + 1]> = std::sync::OnceLock::new();
+    let tops = TOPS.get_or_init(|| std::array::from_fn(|i| top_of(i as f32 / N as f32)));
+    // Sous un bloc : à plat ventre.
+    if h <= 1.0 {
+        return 1.0;
+    }
+    match (0..=N).find(|&i| tops[i] <= h) {
+        Some(0) => 0.0,
+        Some(i) => {
+            let (a, b) = (tops[i - 1], tops[i]);
+            (i as f32 - 1.0 + (a - h) / (a - b).max(1e-4)) / N as f32
+        }
+        None => 1.0,
+    }
+}
+
 /// (v272) La case (bloc) où sont ces pieds.
 fn cell_of(p: Vec3) -> [i32; 3] {
     [p.x.floor() as i32, (p.y + 0.01).floor() as i32, p.z.floor() as i32]
@@ -615,8 +692,9 @@ pub fn find_path(world: &World, from: [i32; 3], to: [i32; 3]) -> Vec<[i32; 3]> {
         if !blocked([c[0], c[1] - 1, c[2]]) && !wet([c[0], c[1] - 1, c[2]]) {
             return None;
         }
-        let low = (1..=3).any(|k| blocked([c[0], c[1] + k, c[2]]));
-        Some(if low { 3.4 } else { 1.0 })
+        // (v277) Selon la hauteur libre au-dessus : 1, 2, 3 blocs, ou toute sa taille.
+        let free = (1..=3).take_while(|k| !blocked([c[0], c[1] + k, c[2]])).count();
+        Some([3.4, 2.3, 1.5, 1.0][free])
     };
     let far = |c: [i32; 3]| {
         ((c[0] - to[0]).abs() + (c[2] - to[2]).abs()) as f32 + 1.2 * (c[1] - to[1]).abs() as f32
@@ -750,8 +828,9 @@ pub struct Evide {
     pub flesh: Flesh,
     on_ground: bool,
     crawling: bool,
-    /// Depuis combien de temps il a la place de se relever (s).
-    rise: f32,
+    /// (v277) La hauteur de sa boîte en ce moment (de `CRAWL_H` à `HEIGHT`) : celle du
+    /// passage où il est, pas moins.
+    tall: f32,
     mode: Mode,
     /// Où il nous a vus pour la dernière fois, et depuis quand il ne nous voit plus (s).
     known: Option<Vec3>,
@@ -804,7 +883,7 @@ impl Evide {
             flesh: Flesh::of(crate::flesh::Hard::Veins),
             on_ground: false,
             crawling: false,
-            rise: 0.0,
+            tall: HEIGHT,
             mode: Mode::Wander,
             known: None,
             unseen: 0.0,
@@ -845,6 +924,7 @@ impl Evide {
             "rampe" => {
                 (a.walk, a.swing, a.crawl, a.mouth) = (1.2, 1.0, 1.0, 0.35);
                 e.crawling = true;
+                e.tall = CRAWL_H;
             }
             "mord" => {
                 (a.hunch, a.arms, a.grab, a.mouth, a.head_pitch) = (1.5, 0.35, 1.0, 1.0, -0.2);
@@ -1146,26 +1226,44 @@ impl Evide {
         let [swim, swim_fast, swim_up] = crate::player::SWIM;
         self.swimming = water_at(world, self.pos + Vec3::Y * 0.7)
             || (self.swimming && water_at(world, self.pos + Vec3::Y * 0.3));
-        if legless || self.swimming || (!self.crawling && !fits(world, self.pos, HEIGHT)) {
-            self.crawling = true;
-            self.rise = 0.0;
-        } else if self.crawling {
-            let room = fits(world, self.pos, HEIGHT) && fits(world, self.pos + dir * 0.7, HEIGHT);
-            self.rise = if room { self.rise + dt } else { 0.0 };
-            if self.rise > 0.5 {
-                self.crawling = false;
+        // (v277) « Il ne se penche pas plus que la taille dont il a besoin pour passer sous
+        // les blocs ; jusqu'à 1 de hauteur sa taille s'adapte en proportion » : sa boîte prend
+        // la hauteur libre là où il est et juste devant lui (plus loin quand il court : il se
+        // baisse avant d'y être), son corps se baisse d'autant (`crawl_for`), son allure
+        // aussi, de la sienne debout à celle du sneak à plat ventre. Il se baisse vite, se
+        // redresse dès qu'il en a la place. Sans jambes ou à la nage : à plat.
+        let here = room(world, self.pos).unwrap_or(CRAWL_H);
+        let mut want = here;
+        if speed > 0.0 {
+            for reach in [0.6, 0.6 + speed * 0.12] {
+                if let Some(ahead) = room(world, self.pos + dir * reach) {
+                    want = want.min(ahead);
+                }
             }
         }
-        if self.crawling && speed > 0.0 {
+        let flat = legless || self.swimming;
+        if flat {
+            want = CRAWL_H;
+        }
+        self.tall = if flat {
+            CRAWL_H
+        } else if want < self.tall {
+            (self.tall - 8.0 * dt).max(want).min(here)
+        } else {
+            (self.tall + 2.5 * dt).min(want)
+        };
+        self.crawling = self.tall < LOW;
+        let stoop = crawl_for(self.tall);
+        if speed > 0.0 {
             speed = if !self.swimming {
-                sneak
+                lerp(speed, sneak, stoop)
             } else if self.mode == Mode::Chase {
                 swim_fast
             } else {
                 swim
             };
         }
-        let h = if self.crawling { CRAWL_H } else { HEIGHT };
+        let h = self.tall;
 
         // Il se tourne, puis avance où il regarde.
         let gap = turn(wish, self.yaw);
@@ -1221,13 +1319,11 @@ impl Evide {
                     // Une marche d'un bloc : il saute, comme un joueur.
                     self.vel.y = jump;
                     self.on_ground = false;
-                } else if !self.crawling
-                    && (fits(world, self.pos + ahead * 1.3, CRAWL_H)
-                        || (fits(world, up, CRAWL_H) && fits(world, up + ahead, CRAWL_H)))
+                } else if let Some(low) =
+                    room(world, up + ahead).filter(|r| *r < h && fits(world, up, *r))
                 {
-                    // Trop bas pour lui debout : il se met à plat ventre.
-                    self.crawling = true;
-                    self.rise = 0.0;
+                    // Un passage bas en haut d'une marche : il se baisse d'abord, puis saute.
+                    self.tall = low;
                 } else if self.blocked > 0.7 {
                     // Rien à faire ici : il longe l'obstacle un moment.
                     let side = if self.unit() < 0.5 { -1.0 } else { 1.0 };
@@ -1345,7 +1441,7 @@ impl Evide {
         let shiver = if seen { 0.03 * (self.age * 37.0).sin() } else { 0.0 };
 
         let a = &mut self.anim;
-        a.crawl = approach(a.crawl, if self.crawling { 1.0 } else { 0.0 }, dt / 0.45);
+        a.crawl = approach(a.crawl, stoop, dt / 0.3);
         a.hunch = approach(a.hunch, lean, dt * if feeding { 5.0 } else { 3.0 });
         a.arms = approach(a.arms, arms, dt * 5.0);
         let grab = if feeding && !self.crawling { 1.0 } else { 0.0 };
@@ -1355,12 +1451,12 @@ impl Evide {
         a.head_pitch = self.look.1;
         a.head_roll = approach(a.head_roll, self.tic.0, dt * 14.0) + shiver * dt * 30.0;
         a.head_roll = a.head_roll.clamp(-0.7, 0.7);
-        a.walk += moved * dt * if self.crawling { 4.0 } else { 1.6 };
-        let swing = if self.crawling {
-            (moved / (sneak * 0.5)).min(1.0)
-        } else {
-            (moved / walk).min(1.0) * 0.9
-        };
+        a.walk += moved * dt * lerp(1.6, 4.0, a.crawl);
+        let swing = lerp(
+            (moved / walk).min(1.0) * 0.9,
+            (moved / (sneak * 0.5)).min(1.0),
+            a.crawl,
+        );
         a.swing = approach(a.swing, swing, dt * 4.0);
         events
     }
@@ -1573,6 +1669,7 @@ impl Horde {
                         if horde.spawn(Vec3::new(n[0], n[1], n[2]), n[3]) {
                             if let Some(e) = horde.list.last_mut() {
                                 e.crawling = n[4] != 0.0;
+                                e.tall = if e.crawling { CRAWL_H } else { HEIGHT };
                                 e.anim.crawl = n[4].clamp(0.0, 1.0);
                             }
                         }
@@ -1804,6 +1901,77 @@ mod tests {
         let speed = (e.pos - from).length() / 2.0;
         assert!((speed - run_speed).abs() < 0.4, "il court à {speed}");
         assert!((e.pos.y - 11.0).abs() < 0.01, "il reste au sol : {}", e.pos.y);
+    }
+
+    /// (v277) « Il ne se penche pas plus que la taille dont il a besoin pour passer sous les
+    /// blocs ; jusqu'à 1 de hauteur sa taille s'adapte en proportion » : sous un plafond à
+    /// 3 blocs, à 2 blocs, à 1 bloc, son corps arrive juste dessous, pas plus bas, et il va
+    /// d'autant moins vite ; ses pieds restent au sol.
+    #[test]
+    fn it_stoops_only_as_much_as_the_ceiling_needs() {
+        // Plus il se baisse, plus il est bas, sans à-coup, de 3,5 blocs à moins d'un.
+        let mut last = top_of(0.0);
+        assert!((3.4..=3.5).contains(&last), "{last}");
+        for i in 1..=32 {
+            let top = top_of(i as f32 / 32.0);
+            assert!(top <= last + 1e-4 && last - top < 0.25, "{i} : {last} puis {top}");
+            last = top;
+        }
+        assert!(last <= CRAWL_H);
+        for h in [3.5f32, 3.0, 2.5, 2.0, 1.5, 1.0] {
+            let top = top_of(crawl_for(h));
+            assert!(top <= h + 1e-3 && top > h - 0.12, "sous {h} : haut de {top}");
+        }
+        let [_, run, sneak, ..] = crate::player::GAIT;
+        let mut speeds = Vec::new();
+        for clear in [3, 2, 1] {
+            let mut w = flat();
+            for z in -22..=-4 {
+                for x in -48..48 {
+                    w.set(x, 11 + clear, z, BlockId::STONE);
+                }
+            }
+            let p = prey(Vec3::new(0.5, 11.0, -30.0));
+            let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 5);
+            e.mode = Mode::Chase;
+            e.known = Some(p.feet);
+            let (mut lowest, mut highest, mut gone, mut time) = (f32::MAX, 0.0f32, 0.0f32, 0.0f32);
+            for _ in 0..(40 * 60) {
+                let before = e.pos;
+                e.update(&w, 1.0 / 60.0, Some(p));
+                let mut top = 0.0f32;
+                let mut feet = f32::MAX;
+                for (xf, lo, hi) in parts(e.pos, e.yaw, &e.anim) {
+                    for k in 0..8 {
+                        let c = Vec3::new(
+                            if k & 1 == 0 { lo[0] } else { hi[0] },
+                            if k & 2 == 0 { lo[1] } else { hi[1] },
+                            if k & 4 == 0 { lo[2] } else { hi[2] },
+                        );
+                        let y = xf.transform_point3(c).y - 11.0;
+                        (top, feet) = (top.max(y), feet.min(y));
+                    }
+                }
+                assert!(feet > -0.15, "plafond à {clear} : un pied à {feet}");
+                if e.pos.z < -9.0 && e.pos.z > -18.0 {
+                    (lowest, highest) = (lowest.min(top), highest.max(top));
+                    gone += (e.pos - before).length();
+                    time += 1.0 / 60.0;
+                }
+                if e.pos.z < -26.0 {
+                    break;
+                }
+            }
+            assert!(time > 0.5, "plafond à {clear} : il n'est pas passé ({})", e.pos);
+            let clear = clear as f32;
+            assert!(highest <= clear + 0.02, "plafond à {clear} : il dépasse ({highest})");
+            assert!(lowest > clear - 0.45, "plafond à {clear} : baissé jusqu'à {lowest}");
+            speeds.push(gone / time);
+            // Ressorti : debout de toute sa taille.
+            assert!(e.tall > 3.4 && !e.crawling, "plafond à {clear} : {} après", e.tall);
+        }
+        assert!(speeds[0] < run && speeds[0] > speeds[1] + 0.5 && speeds[1] > speeds[2] + 0.5);
+        assert!((speeds[2] - sneak).abs() < 0.1, "{speeds:?}");
     }
 
     /// Sous un plafond trop bas il rampe, à l'allure du sneak, et se relève dehors ; une

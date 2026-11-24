@@ -194,6 +194,55 @@ impl Flesh {
                 }
             }
         }
+        self.drop_loose(dims);
+    }
+
+    /// (v277) « Qu'il n'y ait pas de morceau qui vole seul quand le monstre mord » : dans un
+    /// pavé mordu, ce qui ne tient plus au dur (nos os, ses veines) de proche en proche, par
+    /// les faces, part avec la morsure. (Quand le morceau mangé repousse, il revient avec.)
+    fn drop_loose(&mut self, dims: &[[usize; 3]; PARTS]) {
+        let hard = self.hard;
+        if hard == Hard::Nothing {
+            return;
+        }
+        for (p, d) in dims.iter().enumerate() {
+            if !self.bitten(p) {
+                continue;
+            }
+            let count = d[0] * d[1] * d[2];
+            let cell = |i: usize| [i % d[0], i / d[0] % d[1], i / (d[0] * d[1])];
+            let mut held = vec![false; count];
+            let mut todo: Vec<usize> = (0..count).filter(|&i| hard.at(p, *d, cell(i))).collect();
+            if todo.is_empty() {
+                continue;
+            }
+            for &i in &todo {
+                held[i] = true;
+            }
+            while let Some(i) = todo.pop() {
+                let c = cell(i);
+                for a in 0..3 {
+                    for step in [-1i32, 1] {
+                        let v = c[a] as i32 + step;
+                        if v < 0 || v as usize >= d[a] {
+                            continue;
+                        }
+                        let mut n = c;
+                        n[a] = v as usize;
+                        let j = index(*d, n);
+                        if !held[j] && self.gone[p][j / 64] >> (j % 64) & 1 == 0 {
+                            held[j] = true;
+                            todo.push(j);
+                        }
+                    }
+                }
+            }
+            for (j, kept) in held.iter().enumerate() {
+                if !kept {
+                    self.gone[p][j / 64] |= 1 << (j % 64);
+                }
+            }
+        }
     }
 
     /// Le temps passe : un morceau mangé depuis `regrow` secondes revient (`None` : jamais,
@@ -433,8 +482,10 @@ pub fn organ(part: usize, c: [usize; 3], dims: [usize; 3]) -> u32 {
                 if mid(x, nx) {
                     return if z == 0 && top == 0 { MUSCLE } else { BONE };
                 }
+                // (v277) Les côtes font le tour : devant, sur les flancs, derrière, d'un seul
+                // tenant avec le sternum et la colonne.
                 if x == 0 || x == nx - 1 {
-                    return if top == 0 { BONE } else { MUSCLE };
+                    return if top % 2 == 0 { BONE } else { MUSCLE };
                 }
                 return if top % 2 == 0 { BONE } else { MUSCLE_DARK };
             }
@@ -462,8 +513,9 @@ pub fn organ(part: usize, c: [usize; 3], dims: [usize; 3]) -> u32 {
             // Derrière au milieu : la colonne ; en bas : le bassin ; dedans : le foie en haut
             // à droite, l'estomac en haut à gauche, les reins derrière, les intestins, la
             // vessie en bas.
+            // (v277) En bas du dos, le bassin rejoint la colonne (un seul squelette).
             if z == nz - 1 {
-                return if mid(x, nx) { BONE } else { MUSCLE_DARK };
+                return if mid(x, nx) || top == ny - 1 { BONE } else { MUSCLE_DARK };
             }
             if top == ny - 1 {
                 return if mid(x, nx) && z > 0 { BLADDER } else { BONE };
@@ -492,11 +544,16 @@ pub fn organ(part: usize, c: [usize; 3], dims: [usize; 3]) -> u32 {
             let core_z = mid(z, nz);
             let joint = top == ny / 2 || top == ny / 2 - 1;
             let end = top >= ny - 2;
+            // (v277) « Des os tout le long du corps » : l'os long est de l'os d'un bout à
+            // l'autre du membre (avant : sa moelle, que L'Évidé mangeait, sauf aux
+            // articulations).
             if core_x && core_z {
-                return if joint || end || top == 0 { BONE } else { MARROW };
+                return BONE;
             }
+            // (v277) La main, le pied : des os en croix, qui tiennent à l'os long (avant : un
+            // damier de petits os séparés, dont un pouvait rester en l'air avec sa chair).
             if end {
-                return if (x + z) % 2 == 0 { BONE } else { MUSCLE };
+                return if core_x || core_z { BONE } else { MUSCLE };
             }
             if joint && (core_x || core_z) {
                 return BONE;
@@ -525,6 +582,62 @@ pub fn jelly(c: [usize; 3], dims: [usize; 3]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v277) « Les os, il doit y en avoir tout le long du corps, qu'il n'y ait pas de
+    /// morceau qui vole seul quand le monstre mord » : chaque rangée des membres, de la
+    /// poitrine et du ventre a de l'os, d'un seul tenant dans chaque pavé ; mordu autant qu'on
+    /// veut, les os sont tous là et tout ce qui reste de chair tient à un os.
+    #[test]
+    fn bones_run_all_along_the_body_and_nothing_is_left_floating() {
+        let grids = crate::player_model::flesh_grids();
+        let cells = |d: [usize; 3]| {
+            (0..d[0] * d[1] * d[2]).map(move |i| [i % d[0], i / d[0] % d[1], i / (d[0] * d[1])])
+        };
+        for (p, d) in grids.iter().enumerate() {
+            // (La tête n'est jamais mordue : « c'est fait d'os ».)
+            if p == HEAD {
+                continue;
+            }
+            let bones: Vec<[usize; 3]> = cells(*d).filter(|c| bone(p, *c, *d)).collect();
+            for y in 0..d[1] {
+                assert!(bones.iter().any(|c| c[1] == y), "pavé {p} : pas d'os à la rangée {y}");
+            }
+            let mut seen = std::collections::HashSet::from([bones[0]]);
+            let mut todo = vec![bones[0]];
+            while let Some(c) = todo.pop() {
+                for n in &bones {
+                    if (0..3).map(|a| c[a].abs_diff(n[a])).sum::<usize>() == 1 && seen.insert(*n) {
+                        todo.push(*n);
+                    }
+                }
+            }
+            assert_eq!(seen.len(), bones.len(), "pavé {p} : squelette en plusieurs morceaux");
+        }
+        let mut f = Flesh::of(Hard::Bones);
+        for k in 0..80u32 {
+            f.bite_somewhere(k * 131 + 9, 3 + (k as usize % 2), &[0, 1, 2, 3, 4, 6], &grids);
+            if k % 20 != 19 {
+                continue;
+            }
+            for (p, d) in grids.iter().enumerate() {
+                // Ce qui reste, et ce qui tient à un os de proche en proche.
+                let left: Vec<[usize; 3]> = cells(*d).filter(|c| !f.gone(p, *d, *c)).collect();
+                let mut held: std::collections::HashSet<[usize; 3]> =
+                    left.iter().copied().filter(|c| bone(p, *c, *d)).collect();
+                assert_eq!(held.len(), cells(*d).filter(|c| bone(p, *c, *d)).count(), "os mangé");
+                let mut todo: Vec<[usize; 3]> = held.iter().copied().collect();
+                while let Some(c) = todo.pop() {
+                    for n in &left {
+                        if (0..3).map(|a| c[a].abs_diff(n[a])).sum::<usize>() == 1 && held.insert(*n) {
+                            todo.push(*n);
+                        }
+                    }
+                }
+                assert_eq!(held.len(), left.len(), "pavé {p} : un morceau vole seul");
+            }
+        }
+        assert!(f.eaten(&grids) > 0.3, "{}", f.eaten(&grids));
+    }
 
     const DIMS: [[usize; 3]; PARTS] = [
         [3, 12, 4],
