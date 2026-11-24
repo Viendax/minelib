@@ -236,6 +236,10 @@ struct Remote {
     weapon: u8,
     ready: bool,
     fall_from: Option<f32>,
+    /// (v260) Regard (cap, hauteur) de sa dernière entrée jouée : celui de ses boîtes des
+    /// coups (`Frame`). Une réapparition le replace sans y toucher ; le vérificateur le suit
+    /// de la même façon, d'après le journal des coups (il ne connaît que les entrées).
+    look: (f32, f32),
     /// Entrées qu'il peut encore jouer : une de plus à chaque pas (personne n'avance
     /// plus vite que le temps), avec un peu d'avance pour rattraper un à-coup du réseau.
     budget: u32,
@@ -249,6 +253,9 @@ struct Backup {
     host_pseudo: String,
     /// Joueurs (0 = l'hôte) : pseudo, état de déplacement, arme en main.
     players: Vec<(u64, String, SimState, u8)>,
+    /// (v260) Regard (cap, hauteur) de la dernière entrée de chacun : ses boîtes des coups
+    /// sont les pavés du modèle, tournés avec lui (`Frame`).
+    looks: Vec<(u64, f32, f32)>,
     tick: u32,
     spawn: [f32; 3],
     /// Coups joués depuis la copie précédente (pas, joueur, coup) : de quoi les rejouer.
@@ -806,7 +813,14 @@ impl Auditor {
         let mut players: BTreeMap<u64, Player> = prev
             .players
             .iter()
-            .map(|(id, _, s, _)| (*id, player_from(s)))
+            .map(|(id, _, s, _)| {
+                // (v260) Avec le regard de sa dernière entrée (ses boîtes des coups).
+                let mut p = player_from(s);
+                if let Some(l) = prev.looks.iter().find(|l| l.0 == *id) {
+                    (p.yaw, p.pitch) = (l.1, l.2);
+                }
+                (*id, p)
+            })
             .collect();
         let mut ready: BTreeSet<u64> = prev.players.iter().map(|p| p.0).collect();
         let mut falls: BTreeMap<u64, Option<f32>> =
@@ -937,7 +951,13 @@ impl Auditor {
                     if who == 0 {
                         cand0 = Some(player_from(state));
                     } else {
-                        players.insert(who, player_from(state));
+                        // (v260) Replacé, pas retourné : il garde le regard de sa dernière
+                        // entrée (comme `Remote::look` chez l'hôte).
+                        let mut p = player_from(state);
+                        if let Some(old) = players.get(&who) {
+                            (p.yaw, p.pitch) = (old.yaw, old.pitch);
+                        }
+                        players.insert(who, p);
                         falls.remove(&who);
                         skip.insert(who);
                     }
@@ -1336,7 +1356,9 @@ const BACKUP_EVERY: u32 = 256;
 /// Positions de tous les joueurs à un pas : (joueur, pieds, accroupi, cap du regard, hauteur
 /// du regard). (v234) Le cap : accroupi, la tête avance avec le cou, vers le regard
 /// (`hitbox`). (v256) La hauteur du regard : les boîtes des coups sont les pavés du modèle,
-/// dont la tête et les bras suivent le regard (`ray_model`).
+/// dont la tête et les bras suivent le regard (`ray_model`). Le regard est celui de la
+/// dernière entrée jouée de chacun (`Remote::look`, `Host::look0`) : l'hôte et le vérificateur
+/// le tirent du même journal, au bit près.
 type Frame = Vec<(u64, Vec3, f32, f32, f32)>;
 
 /// Bruits de pas : au-dessus de cette vitesse au sol (blocs/s), on court et les autres
@@ -1431,6 +1453,9 @@ pub struct Host {
     designated: Option<u64>,
     /// L'hôte joue lui-même (sinon : garant indépendant, sans personnage).
     playing: bool,
+    /// (v260) Regard (cap, hauteur) de la dernière entrée notée de l'hôte qui joue
+    /// (`Move::Own`) : celui de ses boîtes des coups (`Frame`), comme `Remote::look`.
+    look0: (f32, f32),
     /// Journal des coups depuis la dernière copie, et tête de la chaîne.
     log: Vec<(u32, u64, Move)>,
     chain: [u8; 32],
@@ -1718,6 +1743,7 @@ impl NetGame {
             backup: None,
             designated: None,
             playing: true,
+            look0: (0.0, 0.0),
             log: Vec::new(),
             chain: [0; 32],
             last_shot: HashMap::new(),
@@ -2345,6 +2371,7 @@ impl NetGame {
                     weapon: 255,
                     ready: false,
                     fall_from: None,
+                    look: (0.0, 0.0),
                     budget: INPUT_BURST / 4,
                 },
             );
@@ -2477,6 +2504,7 @@ impl NetGame {
             NetGame::Host(h) => {
                 if h.playing {
                     let n = to_net(input, local.yaw, local.pitch, local.carry);
+                    h.look0 = (n.yaw, n.pitch);
                     let mv = Move::Own(n, local.net_state());
                     h.record(0, mv);
                 }
@@ -2797,6 +2825,11 @@ impl NetGame {
                     weapon: state.map_or(255, |q| q.3),
                     ready: false,
                     fall_from,
+                    look: b
+                        .looks
+                        .iter()
+                        .find(|l| l.0 == key)
+                        .map_or((0.0, 0.0), |l| (l.1, l.2)),
                     budget: INPUT_BURST / 4,
                 },
             );
@@ -2833,6 +2866,7 @@ impl NetGame {
             backup: None,
             designated: None,
             playing: true,
+            look0: (0.0, 0.0),
             log: Vec::new(),
             chain: b.chain,
             last_shot: HashMap::new(),
@@ -3012,6 +3046,7 @@ impl Host {
                 weapon: 255,
                 ready: true,
                 fall_from: None,
+                look: (0.0, 0.0),
                 budget: INPUT_BURST / 4,
             },
         );
@@ -3430,8 +3465,10 @@ impl Host {
     /// Copie complète de la partie (et journal des coups depuis la précédente).
     fn make_backup(&mut self, local: &Player) -> Backup {
         let mut players = Vec::new();
+        let mut looks = Vec::new();
         if self.playing {
             players.push((0, self.pseudo.clone(), local.net_state(), 255));
+            looks.push((0, self.look0.0, self.look0.1));
         }
         players.extend(
             self.peers
@@ -3439,10 +3476,17 @@ impl Host {
                 .filter(|(_, r)| r.ready)
                 .map(|(&id, r)| (id, r.pseudo.clone(), r.player.net_state(), r.weapon)),
         );
+        looks.extend(
+            self.peers
+                .iter()
+                .filter(|(_, r)| r.ready)
+                .map(|(&id, r)| (id, r.look.0, r.look.1)),
+        );
         Backup {
             m: self.m.clone(),
             host_pseudo: self.pseudo.clone(),
             players,
+            looks,
             tick: self.tick,
             spawn: self.spawn.to_array(),
             log: std::mem::take(&mut self.log),
@@ -4052,6 +4096,7 @@ impl Host {
                     }
                     r.player.others = others_except(&feet, id);
                     step(&mut r.player, world, &input, dt);
+                    r.look = (input.yaw, input.pitch);
                     feet.insert(id, r.player.pos);
                     r.ack = seq;
                     moves.push((id, Move::Input(seq, input)));
@@ -4095,16 +4140,13 @@ impl Host {
         // Mémoire des positions (rembobinage des tirs).
         let mut frame: Frame = Vec::new();
         if self.playing {
-            frame.push((0, local.pos, local.crouch, local.yaw, local.pitch));
+            frame.push((0, local.pos, local.crouch, self.look0.0, self.look0.1));
         }
         frame.extend(
             self.peers
                 .iter()
                 .filter(|(_, r)| r.ready)
-                .map(|(&id, r)| {
-                    let p = &r.player;
-                    (id, p.pos, p.crouch, p.yaw, p.pitch)
-                }),
+                .map(|(&id, r)| (id, r.player.pos, r.player.crouch, r.look.0, r.look.1)),
         );
         frame.sort_by_key(|f| f.0);
         self.record(0, Move::Rule(Rule::Frame(self.tick)));

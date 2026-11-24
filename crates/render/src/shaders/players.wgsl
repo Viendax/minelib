@@ -125,6 +125,16 @@ const SHOULDER_Y: f32 = 10.769500;
 const ARM_X: f32 = 4.988410;
 const ARM_SPLAY: f32 = 0.104720;
 const BODY_H: f32 = 12.346591;
+// (v260) Hauteur du ventre (le bas du corps : 5 rangées du skin sur 12) et demi-profondeur du
+// corps : le dos se plie à la taille, autour du bord arrière du haut du ventre.
+const BELLY_H: f32 = 5.144413;
+const HALF_D: f32 = 1.728523;
+// (v260) Accroupi : penche du ventre, pli du dos à la taille (la poitrine est penchée de leur
+// somme) et tassement des hanches (pixels) ; `player_model::crouch_lean`. (v247) La tête
+// accroupie reste dans la boîte de 1,5 bloc.
+const CROUCH_BELLY_LEAN: f32 = 0.3248;
+const CROUCH_BEND: f32 = 0.25;
+const CROUCH_HIP_DROP: f32 = 4.266;
 // (v225) Foudre de Zeus : le bras droit levé (radians), `player_model::ZEUS_RAISE`.
 const ZEUS_RAISE: f32 = 1.15;
 // (v239) Objet tenu en construction : le bras droit pointé plus bas que le regard (radians),
@@ -138,10 +148,12 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     let base = m_trans(v.feet) * m_rot_y(-v.look.x) * m_scale(px);
     let swing = sin(v.motion.x) * 0.75 * v.motion.y;
     let crouch = clamp(v.motion.z, 0.0, 1.0);
-    // `CROUCH_LEAN`, `CROUCH_HIP_DROP` de player_model.rs (v247 : hanches tassées de 4,85
-    // pixels, la tête accroupie reste dans la boîte de 1,5 bloc).
-    let lean = 0.45 * crouch;
-    let drop = 4.85 * crouch;
+    // (v260) « Plie légèrement le dos quand on sneak » : le ventre penche de `belly` autour
+    // des hanches, la poitrine (avec les bras et la tête) de `lean`, un peu plus.
+    let belly = CROUCH_BELLY_LEAN * crouch;
+    let bend = CROUCH_BEND * crouch;
+    let lean = belly + bend;
+    let drop = CROUCH_HIP_DROP * crouch;
     let pitch = clamp(v.look.y, -1.4, 1.4);
     // (v189) Jambe d'un seul morceau : accroupi, elle se tasse de `drop` au lieu de se
     // faire recouvrir au quart par le bas du corps (pli visible à la hanche). Pieds au sol.
@@ -152,9 +164,22 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     if part == 1u {
         return base * m_trans(vec3<f32>(LEG_X, LEG - drop, 0.0)) * m_rot_x(-swing) * shrink;
     }
-    let upper = base * m_trans(vec3<f32>(0.0, LEG - drop, 0.0)) * m_rot_x(-lean);
-    // (v256) Poitrine (2) et ventre (6) : le même repère, le ventre sous la poitrine.
-    if part == 2u || part == 6u {
+    // (v260) Ventre (6) : sous la poitrine, penché autour des hanches.
+    if part == 6u {
+        return base * m_trans(vec3<f32>(0.0, LEG - drop, 0.0)) * m_rot_x(-belly);
+    }
+    // Poitrine (2) : pliée de `bend` autour du bord arrière de la taille. Son repère est celui
+    // du ventre, tourné de `bend` autour de sa hanche et décalé de p − R(bend)·p, où p est ce
+    // bord (`player_model::Crouch::chest_at`). Debout : le repère du ventre.
+    let sb = sin(bend);
+    let cb = cos(bend);
+    let dy = BELLY_H * (1.0 - cb) - HALF_D * sb;
+    let dz = BELLY_H * sb + HALF_D * (1.0 - cb);
+    let sa = sin(belly);
+    let ca = cos(belly);
+    let chest_at = vec3<f32>(0.0, LEG - drop + dy * ca + dz * sa, -dy * sa + dz * ca);
+    let upper = base * m_trans(chest_at) * m_rot_x(-lean);
+    if part == 2u {
         return upper;
     }
     // (v177) Arme à feu (bit 17) : les deux bras tendus vers le regard, un peu tournés
@@ -208,7 +233,7 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     }
     // (v234) Tête posée au milieu du haut du corps (le cou), même penché : elle avance avec
     // lui (`player_model::neck`).
-    let neck = vec3<f32>(0.0, LEG - drop + BODY_H * cos(lean), -BODY_H * sin(lean));
+    let neck = chest_at + vec3<f32>(0.0, BODY_H * cos(lean), -BODY_H * sin(lean));
     return base * m_trans(neck) * m_rot_x(pitch);
 }
 

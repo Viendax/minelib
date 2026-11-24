@@ -488,19 +488,61 @@ const _: () = assert!(
         && (HEAD_BLOCKS / 1.8 - 1.0 / 6.615).abs() < 0.001
 );
 
-/// Posture accroupie (`crouch` de 0 à 1) : penche du haut du corps vers l'avant (radians,
-/// autour des hanches) et tassement des hanches (pixels).
-fn crouch_lean(crouch: f32) -> (f32, f32) {
+/// Posture accroupie (`crouch` de 0 à 1). (v260) « Plie légèrement le dos quand on sneak » :
+/// le ventre se penche autour des hanches, la poitrine se plie un peu plus à la taille.
+#[derive(Clone, Copy, Debug)]
+struct Crouch {
+    /// Penche du ventre vers l'avant (radians, autour des hanches).
+    belly: f32,
+    /// Penche de la poitrine (celle du ventre plus le pli du dos) ; les bras et la tête
+    /// tiennent à la poitrine.
+    chest: f32,
+    /// Tassement des hanches (pixels).
+    drop: f32,
+    /// Origine du repère de la poitrine (là où tombe sa hanche), dans le repère des pieds
+    /// (pixels) : la hanche debout ; accroupi, décalée par le pli de la taille.
+    chest_at: Vec3,
+}
+
+impl Crouch {
+    /// Cou (le milieu du haut de la poitrine, sous la tête), dans le repère des pieds
+    /// (pixels ; −z : devant). (v234) « Quand je me penche en avant, ma tête doit rester au
+    /// milieu de mon cou » : la tête reste posée dessus, elle avance avec lui.
+    fn neck(&self) -> Vec3 {
+        self.chest_at + Vec3::new(0.0, BODY_H * self.chest.cos(), -BODY_H * self.chest.sin())
+    }
+}
+
+fn crouch_lean(crouch: f32) -> Crouch {
     let c = crouch.clamp(0.0, 1.0);
-    (CROUCH_LEAN * c, CROUCH_HIP_DROP * c)
+    let (belly, bend, drop) = (CROUCH_BELLY_LEAN * c, CROUCH_BEND * c, CROUCH_HIP_DROP * c);
+    // Le pli se fait à la taille, autour du bord arrière du haut du ventre : le dos reste
+    // joint, le bas de la poitrine entre un peu dans le ventre par-devant. Tourner la poitrine
+    // de `bend` autour de ce point `p` (repère du ventre), c'est la tourner autour de sa
+    // hanche puis la décaler de p − R(bend)·p ; le tout penché comme le ventre.
+    let (py, pz) = (BELLY_H, BODY_D / 2.0);
+    let (sb, cb) = bend.sin_cos();
+    let (dy, dz) = (py * (1.0 - cb) - pz * sb, py * sb + pz * (1.0 - cb));
+    let (sa, ca) = belly.sin_cos();
+    let chest_at = Vec3::new(0.0, LEG - drop + dy * ca + dz * sa, -dy * sa + dz * ca);
+    Crouch {
+        belly,
+        chest: belly + bend,
+        drop,
+        chest_at,
+    }
 }
 
 /// (v251) Balancement du bras levé en marchant (part du balancement des jambes) : celui du
 /// bras tendu de la lampe torche. Le même dans `part_matrix` (players.wgsl).
 const RAISED_SWING: f32 = 0.1;
 
-/// Penche du haut du corps accroupi (radians). La même dans `part_matrix` (players.wgsl).
-pub const CROUCH_LEAN: f32 = 0.45;
+/// Penche du ventre accroupi (radians), et pli du dos à la taille : la poitrine est penchée
+/// de leur somme. Les mêmes dans `part_matrix` (players.wgsl). (v260) Avant, tout le haut du
+/// corps était penché d'un bloc de 0,45 ; le dos se plie maintenant de 0,25 (14°), et ces
+/// valeurs laissent la tête exactement où elle était (à 0,0001 bloc près).
+pub const CROUCH_BELLY_LEAN: f32 = 0.3248;
+pub const CROUCH_BEND: f32 = 0.25;
 
 /// (v247) Tassement des hanches accroupi (pixels). « Mon crâne dépasse dans les blocs du
 /// dessus quand je passe accroupi sous 1,5 bloc ; mon corps ne descend pas assez » : avant,
@@ -508,24 +550,15 @@ pub const CROUCH_LEAN: f32 = 0.45;
 /// au-dessus de la boîte accroupie (1,5). Maintenant 4,85 : la tête accroupie, quel que soit le
 /// regard, reste sous 1,49 bloc, et son milieu à la hauteur des yeux (1,32). Debout, elle
 /// arrive à 1,8 (1,83 aux coins la tête penchée : rien ne passe sous 1,8 bloc debout). La même
-/// dans `part_matrix` (players.wgsl).
-pub const CROUCH_HIP_DROP: f32 = 4.85;
-
-/// (v234) Cou (le milieu du haut du corps, sous la tête), dans le repère des pieds (pixels ;
-/// −z : devant). « Quand je me penche en avant, ma tête doit rester au milieu de mon cou » :
-/// accroupi, le corps se penche de `lean` autour des hanches (tassées de `drop`) et la tête
-/// reste posée sur le cou, au milieu ; elle avance avec lui (avant : un écart fixe la
-/// laissait en arrière du cou).
-fn neck(lean: f32, drop: f32) -> Vec3 {
-    Vec3::new(0.0, LEG - drop + BODY_H * lean.cos(), -BODY_H * lean.sin())
-}
+/// dans `part_matrix` (players.wgsl). (v260) 4,266 : le dos plié raccourcit le haut du corps
+/// (du cou aux hanches) ; les hanches descendent d'autant moins, la tête reste à sa hauteur.
+pub const CROUCH_HIP_DROP: f32 = 4.266;
 
 /// (v234) Tête du modèle accroupi de `crouch` (0 à 1) : de combien elle avance vers le regard
 /// et la hauteur de son bas au-dessus des pieds (blocs). Sa boîte des coups en partie FPS
 /// (`netgame::hitbox`) et la visée des bots la suivent. Debout : (0, 1,8 − son côté).
 pub fn head_place(crouch: f32) -> (f32, f32) {
-    let (lean, drop) = crouch_lean(crouch);
-    let n = neck(lean, drop);
+    let n = crouch_lean(crouch).neck();
     (-n.z * PX, n.y * PX)
 }
 
@@ -668,7 +701,9 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         * Mat4::from_rotation_y(-pose.yaw)
         * Mat4::from_scale(Vec3::splat(PX));
     let swing = pose.walk.sin() * 0.75 * pose.swing;
-    let (lean, drop) = crouch_lean(pose.crouch);
+    let bent = crouch_lean(pose.crouch);
+    // `lean` : la penche de la poitrine, à laquelle tiennent les bras.
+    let (lean, drop) = (bent.chest, bent.drop);
     // Jambes : pivot à la hanche (elle descend de `drop` accroupi), balancement opposé.
     // (v189) La jambe reste un seul pavé : elle se tasse de `drop` au lieu de se faire
     // recouvrir au quart par le bas du corps, qui laissait voir un pli à la hanche. Les
@@ -682,10 +717,13 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         let (min, max, part) = PARTS[out.len()];
         out.push((xf, min, max, part));
     }
-    // Haut du corps : penché vers l'avant quand on s'accroupit (pivot à la hanche).
-    let upper = base
+    // Haut du corps : penché vers l'avant quand on s'accroupit (pivot à la hanche). (v260)
+    // Le ventre se penche autour des hanches ; la poitrine, pliée un peu plus à la taille, a
+    // son propre repère (`Crouch::chest_at`). Debout, les deux sont le même.
+    let belly = base
         * Mat4::from_translation(Vec3::new(0.0, LEG - drop, 0.0))
-        * Mat4::from_rotation_x(-lean);
+        * Mat4::from_rotation_x(-bent.belly);
+    let upper = base * Mat4::from_translation(bent.chest_at) * Mat4::from_rotation_x(-lean);
     let (min, max, part) = PARTS[CHEST];
     out.push((upper, min, max, part));
     // Bras : pivot à l'épaule (`SHOULDER_Y` au-dessus de la hanche), balancement inverse
@@ -750,13 +788,13 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     // Tête : pivot au cou (v234 : au milieu du haut du corps, même penché ; elle avance avec
     // lui), suit le regard (tangage), sans suivre la penche du corps.
     let head = base
-        * Mat4::from_translation(neck(lean, drop))
+        * Mat4::from_translation(bent.neck())
         * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4));
     let (min, max, part) = PARTS[5];
     out.push((head, min, max, part));
-    // (v256) Ventre : sous la poitrine, dans le même repère (il se penche avec elle).
+    // (v260) Ventre : sous la poitrine, penché autour des hanches.
     let (min, max, part) = PARTS[BELLY];
-    out.push((upper, min, max, part));
+    out.push((belly, min, max, part));
     out
 }
 
@@ -1951,12 +1989,12 @@ pub fn ray_boxes(pose: &Pose) -> Vec<RayBox> {
 /// aux six dixièmes de sa hauteur (dans la poitrine, sous les bras tendus), penché avec lui
 /// accroupi. Avant, un point à la verticale des pieds : accroupi, il tombait derrière le dos.
 pub fn chest_point(feet: Vec3, yaw: f32, crouch: f32) -> Vec3 {
-    let (lean, drop) = crouch_lean(crouch);
+    let bent = crouch_lean(crouch);
     let upper = Mat4::from_translation(feet)
         * Mat4::from_rotation_y(-yaw)
         * Mat4::from_scale(Vec3::splat(PX))
-        * Mat4::from_translation(Vec3::new(0.0, LEG - drop, 0.0))
-        * Mat4::from_rotation_x(-lean);
+        * Mat4::from_translation(bent.chest_at)
+        * Mat4::from_rotation_x(-bent.chest);
     upper.transform_point3(Vec3::new(0.0, BODY_H * 0.6, 0.0))
 }
 
@@ -2019,7 +2057,9 @@ mod tests {
             * Mat4::from_scale(Vec3::splat(px));
         let swing = p.walk.sin() * 0.75 * p.swing;
         let crouch = p.crouch.clamp(0.0, 1.0);
-        let lean = CROUCH_LEAN * crouch;
+        let belly = CROUCH_BELLY_LEAN * crouch;
+        let bend = CROUCH_BEND * crouch;
+        let lean = belly + bend;
         let drop = CROUCH_HIP_DROP * crouch;
         let pitch = p.pitch.clamp(-1.4, 1.4);
         let shrink = Mat4::from_scale(Vec3::new(1.0, (LEG - drop) / LEG, 1.0));
@@ -2029,8 +2069,16 @@ mod tests {
         if part == 1 {
             return base * t(LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(-swing) * shrink;
         }
-        let upper = base * t(0.0, LEG - drop, 0.0) * Mat4::from_rotation_x(-lean);
-        if part == 2 || part == 6 {
+        if part == 6 {
+            return base * t(0.0, LEG - drop, 0.0) * Mat4::from_rotation_x(-belly);
+        }
+        let (sb, cb) = (bend.sin(), bend.cos());
+        let dy = BELLY_H * (1.0 - cb) - BODY_D / 2.0 * sb;
+        let dz = BELLY_H * sb + BODY_D / 2.0 * (1.0 - cb);
+        let (sa, ca) = (belly.sin(), belly.cos());
+        let chest_at = Vec3::new(0.0, LEG - drop + dy * ca + dz * sa, -dy * sa + dz * ca);
+        let upper = base * t(chest_at.x, chest_at.y, chest_at.z) * Mat4::from_rotation_x(-lean);
+        if part == 2 {
             return upper;
         }
         if ((part == 3 || part == 4) && p.skin & 0x20000 != 0)
@@ -2076,7 +2124,7 @@ mod tests {
                 * Mat4::from_rotation_z(splay)
                 * Mat4::from_rotation_x(swing * k + lean * 0.6 + raise);
         }
-        let n = Vec3::new(0.0, LEG - drop + BODY_H * lean.cos(), -BODY_H * lean.sin());
+        let n = chest_at + Vec3::new(0.0, BODY_H * lean.cos(), -BODY_H * lean.sin());
         base * t(n.x, n.y, n.z) * Mat4::from_rotation_x(pitch)
     }
 
@@ -2354,6 +2402,11 @@ mod tests {
             ("ARM_X", ARM_X),
             ("ARM_SPLAY", ARM_SPLAY),
             ("BODY_H", BODY_H),
+            ("BELLY_H", BELLY_H),
+            ("HALF_D", BODY_D / 2.0),
+            ("CROUCH_BELLY_LEAN", CROUCH_BELLY_LEAN),
+            ("CROUCH_BEND", CROUCH_BEND),
+            ("CROUCH_HIP_DROP", CROUCH_HIP_DROP),
             ("ZEUS_RAISE", ZEUS_RAISE),
             ("ITEM_AIM_DROP", ITEM_AIM_DROP),
         ] {

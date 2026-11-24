@@ -38,7 +38,11 @@ use serde::{Deserialize, Serialize};
 /// (v256) 67 : en partie FPS, les balles touchent les sept pavés du modèle du joueur, tournés
 /// avec lui (plus une boîte droite) : l'hôte et le vérificateur doivent compter les mêmes
 /// touches.
-pub const PROTOCOL: u32 = 67;
+/// (v260) 68 : la copie de la partie FPS confiée au garant porte le regard de la dernière
+/// entrée de chaque joueur (`Backup::looks`) : ses boîtes des coups, tournées avec lui, sont
+/// les mêmes chez l'hôte et chez le vérificateur ; accroupi, le dos du modèle se plie à la
+/// taille (boîtes des coups comprises).
+pub const PROTOCOL: u32 = 68;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
