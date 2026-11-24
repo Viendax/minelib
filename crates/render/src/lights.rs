@@ -358,7 +358,8 @@ impl Default for DynSettings {
             vl_noise_morph: 0.0,
             vl_noise_stride: 2,
             vl_dither_temporal: true,
-            half_lighting: true,
+            // (v295) Décoché par défaut (voir `LightSettings` du jeu, clé `eclairage_demi2`).
+            half_lighting: false,
         }
     }
 }
@@ -1410,9 +1411,23 @@ struct HalfTrial {
     last: Option<bool>,
 }
 
+/// (v295) Essais : `MINELIB_DEMI_RES=0` ou `1` impose le calcul exact ou la demi-résolution
+/// (sans essai).
+fn forced_half() -> Option<bool> {
+    static F: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| match std::env::var("MINELIB_DEMI_RES").ok()?.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    })
+}
+
 impl HalfTrial {
     /// Mode de l'image en cours (vrai : demi-résolution).
     fn mode(&self) -> bool {
+        if let Some(f) = forced_half() {
+            return f;
+        }
         self.decided
             .unwrap_or((self.frames / HALF_BLOCK).is_multiple_of(2))
     }

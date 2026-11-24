@@ -359,6 +359,9 @@ struct Loading {
     shown: (usize, usize),
     /// Shaders du monde prêts, et (v283) ceux des lumières si le monde en a (sinon : vrai).
     shaders: bool,
+    /// (v295) Part de la barre de chargement (0 à 1) : le temps déjà attendu sur le temps
+    /// d'attente estimé (`load_bar`). Elle ne recule jamais.
+    bar: f32,
 }
 
 impl Loading {
@@ -367,8 +370,38 @@ impl Loading {
             since: std::time::Instant::now(),
             shown: (0, 1),
             shaders: false,
+            bar: 0.0,
         }
     }
+}
+
+/// (v295) Vitesse des chunks (par seconde) supposée au début d'un chargement, tant qu'on en a
+/// vu arriver peu (chez Viendax : 40 à 80 par seconde).
+const LOAD_CHUNKS_PRIOR: f32 = 40.0;
+
+/// (v295) Secondes qui restent, estimées, avant d'entrer dans le monde, `elapsed` s après le
+/// début de l'écran de chargement : la plus longue des attentes de `loading_done` (elles vont
+/// en même temps). Les chunks `shown` (affichés, voulus) à la vitesse vue jusqu'ici, les
+/// shaders d'après leur durée habituelle (`Renderer::shaders_left`), la météo du serveur
+/// (`weather` : arrivée), l'écran au moins `LOAD_MIN_S`.
+fn load_left(elapsed: f32, shown: (usize, usize), shaders_left: f32, weather: bool) -> f32 {
+    let missing = shown.1.saturating_sub(shown.0) as f32;
+    // Une seconde de « vitesse supposée », vite noyée dans ce qu'on voit.
+    let rate = (shown.0 as f32 + LOAD_CHUNKS_PRIOR) / (elapsed.max(0.0) + 1.0);
+    let chunks = missing / rate.max(1.0);
+    let weather = if weather { 0.0 } else { 1.0 };
+    let min = (LOAD_MIN_S - elapsed).max(0.0);
+    chunks.max(shaders_left).max(weather).max(min)
+}
+
+/// (v295) Barre de chargement : le temps déjà attendu sur le temps d'attente estimé (déjà
+/// attendu + `left`), jamais pleine avant l'entrée. « La barre de chargement quand on rejoint
+/// un monde : le temps ne correspond pas au temps qu'on attend » (Viendax, 24 novembre,
+/// 21 h 03) : elle suivait les chunks seuls, pleine en une vingtaine de secondes, puis on
+/// attendait encore les shaders du monde (une minute au lancement du jeu, chez lui).
+fn load_bar(elapsed: f32, left: f32) -> f32 {
+    let e = elapsed.max(0.0);
+    (e / (e + left.max(0.0)).max(1e-3)).min(0.99)
 }
 
 /// (v283) La seule porte d'entrée dans le monde (voir `LOAD_MIN_S`) : chaque chunk de toute la
@@ -383,6 +416,14 @@ fn loading_done(l: &Loading, weather: bool) -> bool {
         && l.shown.1 > 0
         && l.shown.0 >= l.shown.1
         && l.since.elapsed().as_secs_f32() >= LOAD_MIN_S
+}
+
+/// (v295) Le clic gauche est-il pour la Foudre de Zeus (tenue en main) ? Appuyé à cette image
+/// **ou** tenu : un clic bref, appuyé et relâché dans la même image (une image lente), n'est
+/// pas « tenu », et il cassait alors le bloc visé (« j'ai réussi à casser un bloc avec
+/// l'éclair, ça doit être impossible »).
+fn zeus_click(selected: Option<Item>, pressed: bool, held: bool) -> bool {
+    selected == Some(Item::Zeus) && (pressed || held)
 }
 
 /// Réglages de rendu choisis au lancement.
@@ -2512,6 +2553,10 @@ impl Session {
                             self.inventory.click((w as f32, h as f32), c, right, shift);
                         }
                     }
+                    // (v295) En créatif, clic molette sur un objet : une pile de cet objet.
+                    if input.mouse_pressed(Mouse::Middle) {
+                        self.inventory.middle_click((w as f32, h as f32), c);
+                    }
                 }
             }
             self.autosave -= dt;
@@ -3732,9 +3777,13 @@ impl Session {
                 && self.keys.held(input, Action::Sneak)
                 && !self.keys.held(input, Action::Attack);
             // (v247) La Foudre de Zeus en main : le clic gauche la lance, même sur un écran.
+            // (v295) Un clic bref (appuyé et relâché dans la même image) aussi.
             let zeus_blow = self.game.mode != GameMode::Fps
-                && self.inventory.selected_item() == Some(Item::Zeus)
-                && self.keys.held(input, Action::Attack);
+                && zeus_click(
+                    self.inventory.selected_item(),
+                    self.keys.pressed(input, Action::Attack),
+                    self.keys.held(input, Action::Attack),
+                );
             if !place_through && !zeus_blow {
                 return;
             }
@@ -3885,8 +3934,15 @@ impl Session {
             return;
         }
         // (v216) Foudre de Zeus tenue : clic gauche, la foudre tombe là où l'on vise, comme
-        // avec /thor (rien n'est cassé, même en créatif).
-        if self.inventory.selected_item() == Some(Item::Zeus) && keys.held(input, Action::Attack) {
+        // avec /thor (rien n'est cassé, même en créatif). (v295) « J'ai réussi à casser un
+        // bloc avec l'éclair, ça doit être impossible » : un clic bref, appuyé et relâché dans
+        // la même image (une image lente), n'était pas « tenu » : la foudre ne partait pas et
+        // le clic cassait le bloc visé. Appuyé ou tenu, le clic est pour elle (`zeus_click`).
+        if zeus_click(
+            self.inventory.selected_item(),
+            keys.pressed(input, Action::Attack),
+            keys.held(input, Action::Attack),
+        ) {
             // (v241) Objet légendaire : chargé ou non, le coup n'est pas le même.
             if self.legend_on() {
                 if keys.pressed(input, Action::Attack) && self.storm.cooldown <= 0.0 {
@@ -4028,8 +4084,10 @@ impl Session {
             }
         }
         // En créatif, comme dans Minecraft : même la bedrock et les barrières se cassent.
-        let breakable = hit.id.is_breakable()
-            || (self.game.mode == GameMode::Creative && hit.id.is_targetable());
+        // (v295) Jamais avec la Foudre de Zeus en main (voir `zeus_click`).
+        let breakable = (hit.id.is_breakable()
+            || (self.game.mode == GameMode::Creative && hit.id.is_targetable()))
+            && !zeus;
         // (v220) En créatif, le bloc part tout de suite, la main fait un petit coup vers le
         // bas. En survie, il faut tenir le clic `BREAK_S` sur le même bloc, et la main frappe
         // en boucle pendant ce temps (plus lentement, une pause entre deux coups).
@@ -6222,8 +6280,8 @@ impl Session {
             (eye, self.view_with_punch(), self.player.look_dir())
         } else {
             let eye = self.player.eye();
-            let look = self.player.look_dir();
-            let back = if third == 1 { -look } else { look };
+            // (v295) Jamais à la verticale sous les yeux (`third_person_dir`).
+            let back = third_person_dir(self.player.yaw, self.player.pitch, third);
             let dist = raycast(&self.world, eye.into(), back.into(), THIRD_PERSON_DIST)
                 .map_or(THIRD_PERSON_DIST, |h| (h.distance - 0.25).max(0.3));
             let cam = eye + back * dist;
@@ -6784,6 +6842,15 @@ impl Session {
             // avait un orage et les nuages étaient mal chargés) » : en ligne, aussi la météo du
             // serveur (elle arrive par le relais, juste après l'entrée).
             let weather = self.build.is_none() || self.weather_synced;
+            // (v295) La barre avance au rythme de toute l'attente, shaders compris.
+            let elapsed = l.since.elapsed().as_secs_f32();
+            let shaders_left = if l.shaders {
+                0.0
+            } else {
+                renderer.shaders_left(lights)
+            };
+            let left = load_left(elapsed, l.shown, shaders_left, weather);
+            l.bar = l.bar.max(load_bar(elapsed, left));
             if loading_done(l, weather) {
                 log::info!(
                     "monde chargé en {:.1} s ({} chunks affichés : toute la distance de rendu)",
@@ -6818,12 +6885,9 @@ impl Session {
     }
 
     /// (v220) Monde en cours de chargement : part déjà faite (0 à 1), et shaders prêts.
+    /// (v295) La part est celle du temps d'attente estimé (`load_bar`), plus celle des chunks.
     pub fn loading_progress(&self) -> Option<(f32, bool)> {
-        self.loading.as_ref().map(|l| {
-            let chunks = l.shown.0 as f32 / l.shown.1.max(1) as f32;
-            let time = l.since.elapsed().as_secs_f32() / LOAD_MIN_S;
-            (chunks.min(time).clamp(0.0, 1.0), l.shaders)
-        })
+        self.loading.as_ref().map(|l| (l.bar.clamp(0.0, 1.0), l.shaders))
     }
 
     pub fn online_match(&self) -> bool {
@@ -13079,6 +13143,22 @@ fn sun_reaches(world: &World, b: &ShadowBox, sun: [f32; 3]) -> bool {
 /// Recul de la caméra à la 3e personne (F5), en blocs, comme dans Minecraft.
 const THIRD_PERSON_DIST: f32 = 4.0;
 
+/// (v295) La caméra F5 ne descend pas plus bas que ça (degrés sous l'horizontale des yeux).
+const THIRD_PERSON_MAX_BELOW: f32 = 65.0;
+
+/// (v295) Direction des yeux vers la caméra F5 (`third` : 1 de dos, 2 de face) : à l'opposé du
+/// regard de dos, dans son sens de face, mais jamais plus de `THIRD_PERSON_MAX_BELOW` degrés
+/// sous l'horizontale (derrière le joueur de dos, devant lui de face). « Corrige ce point de
+/// vue » (Viendax, 24 novembre, 21 h 20, capture prise de l'intérieur de ses jambes) : regard
+/// droit vers le haut de dos, ou vers le bas de face, la caméra partait à la verticale sous les
+/// yeux ; le sol la ramenait contre eux, au milieu des jambes du joueur. Plus haut que
+/// l'horizontale (au-dessus de la tête), rien ne change.
+fn third_person_dir(yaw: f32, pitch: f32, third: u8) -> Vec3 {
+    let (side, p) = if third == 1 { (-1.0, -pitch) } else { (1.0, pitch) };
+    let p = p.max(-THIRD_PERSON_MAX_BELOW.to_radians());
+    Vec3::new(side * yaw.sin() * p.cos(), p.sin(), -side * yaw.cos() * p.cos())
+}
+
 /// Scène de démonstration : un mur de briques et toutes les torches colorées devant.
 /// (v198) Démo : un projecteur au-dessus du sol (`ground`) devant le miroir d'en face
 /// (lumières de l'éditeur : sa tache se voit au sol et dans les miroirs).
@@ -13907,6 +13987,7 @@ mod loading_tests {
             since: long_ago,
             shown: (shown, all),
             shaders,
+            bar: 0.0,
         };
         assert!(!loading_done(&l(4224, 4225, true), true), "un chunk manque");
         assert!(!loading_done(&l(4225, 4225, false), true), "shaders pas prêts");
@@ -13917,6 +13998,7 @@ mod loading_tests {
             since: std::time::Instant::now(),
             shown: (81, 81),
             shaders: true,
+            bar: 0.0,
         };
         assert!(!loading_done(&fresh, true), "l'écran se montre au moins LOAD_MIN_S");
         // Une seule porte, dans `check_loaded`, qui passe par `loading_done` et compte toute
@@ -13933,6 +14015,177 @@ mod loading_tests {
         let gate = &src[src.find("fn loading_done(").unwrap()..];
         let gate = &gate[..gate.find("\n}\n").unwrap()];
         assert!(!gate.contains("||"), "une autre façon d'entrer : {gate}");
+    }
+
+    /// (v295) « La barre de chargement quand on rejoint un monde : le temps ne correspond pas
+    /// au temps qu'on attend ». Son journal de 20 h 01 : monde ouvert 45 s après le lancement
+    /// du jeu, ses 806 chunks affichés en une vingtaine de secondes, entrée 49 s après, à la
+    /// fin de la compilation des shaders du monde (66 s depuis le lancement). La barre doit
+    /// avancer au rythme de toute l'attente : pas pleine quand les chunks le sont.
+    #[test]
+    fn the_loading_bar_follows_the_whole_wait() {
+        // Toute l'attente, image par image (une toutes les 0,1 s) : les chunks arrivent à 40
+        // par seconde ; la compilation des shaders du monde, lancée 17 s avant l'ouverture du
+        // monde, prend 66,2 s (comme aux lancements précédents) : elle finit 49,2 s après.
+        let (all, done_at) = (806usize, 49.2f32);
+        let mut bar = 0.0f32;
+        let mut t = 0.0f32;
+        while t < done_at {
+            let shown = ((t * 40.0) as usize).min(all);
+            let shaders_left = minelib_render::compile_time::left(t + 17.0, 66.2);
+            let left = load_left(t, (shown, all), shaders_left, true);
+            let b = load_bar(t, left);
+            assert!(b < 1.0, "pleine avant l'entrée, à {t} s");
+            bar = bar.max(b);
+            // Avant : les chunks seuls (pleine dès 20 s).
+            let before = shown as f32 / all as f32;
+            if t > 21.0 {
+                assert_eq!(before, 1.0);
+                assert!(bar < 0.99 && bar < t / done_at + 0.05, "{t} s : barre {bar}");
+            }
+            // La barre suit le temps : à ± 8 % près de la part de l'attente déjà faite.
+            if t > 2.0 {
+                assert!((bar - t / done_at).abs() < 0.08, "{t} s : barre {bar}");
+            }
+            t += 0.1;
+        }
+        // Shaders déjà prêts (monde rouvert) : la barre suit les chunks, comme avant.
+        let left = load_left(5.0, (400, 800), 0.0, true);
+        assert!((load_bar(5.0, left) - 0.5).abs() < 0.06);
+        // Rien n'arrive (chunks à 0, longtemps) : la barre ne se remplit pas.
+        let left = load_left(60.0, (0, 800), 0.0, true);
+        assert!(load_bar(60.0, left) < 0.1);
+        // En ligne, la météo du serveur pas encore là : pas pleine non plus.
+        assert!(load_left(10.0, (800, 800), 0.0, false) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod f5_camera_tests {
+    use super::*;
+
+    /// La case `p` est-elle dans la boîte `b` agrandie de `margin` blocs ?
+    fn inside(b: &minelib_render::ShadowBox, p: Vec3, margin: f32) -> bool {
+        b.to_unit.iter().all(|r| {
+            let u = r[0] * p.x + r[1] * p.y + r[2] * p.z + r[3];
+            let k = margin * (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+            u >= -k && u <= 1.0 + k
+        })
+    }
+
+    /// (v295) « Corrige ce point de vue » : sa capture était prise de l'intérieur de ses
+    /// jambes (F5 de face, regard vers le bas ; de même de dos, regard vers le haut). Debout ou
+    /// accroupi, immobile ou en marchant, sur un sol plat : la caméra F5 n'est jamais dans le
+    /// corps du joueur, de dos comme de face, quel que soit le regard ; et plus haut que 65°
+    /// sous l'horizontale, elle est là où elle était.
+    #[test]
+    fn the_third_person_camera_never_ends_inside_the_player() {
+        let feet = Vec3::new(8.5, 4.0, 8.5);
+        let mut checked = 0;
+        for third in [1u8, 2] {
+            for yaw_deg in [0.0f32, 37.0, 90.0, 200.0] {
+                for k in -22..=22 {
+                    let pitch = (k as f32 * 4.0).clamp(-89.0, 89.0).to_radians();
+                    let yaw = yaw_deg.to_radians();
+                    for (crouch, walk, swing) in [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.5, 1.0)] {
+                        let eye = feet + Vec3::Y * (crate::player::EYE - crate::player::CROUCH_DROP * crouch);
+                        let dir = third_person_dir(yaw, pitch, third);
+                        // Le sol (herbe sous les pieds) ramène la caméra comme `raycast`.
+                        let dist = if dir.y < 0.0 && (eye.y - feet.y) / -dir.y < THIRD_PERSON_DIST {
+                            ((eye.y - feet.y) / -dir.y - 0.25).max(0.3)
+                        } else {
+                            THIRD_PERSON_DIST
+                        };
+                        let cam = eye + dir * dist;
+                        let pose = crate::player_model::Pose {
+                            feet,
+                            yaw,
+                            pitch,
+                            walk,
+                            swing,
+                            crouch,
+                            light: [1.0; 3],
+                            held: None,
+                            skin: None,
+                            bow: 0.0,
+                        };
+                        for b in crate::player_model::shadow_boxes(&pose) {
+                            assert!(
+                                !inside(&b, cam, 0.06),
+                                "F5 {third}, cap {yaw_deg}°, regard {:.0}°, accroupi {crouch}, \
+                                 marche {walk} : caméra en {cam} dans le corps",
+                                pitch.to_degrees()
+                            );
+                        }
+                        // Au-dessus de 65° sous l'horizontale : comme avant (à l'opposé du
+                        // regard de dos, dans son sens de face).
+                        let (sy, cy) = yaw.sin_cos();
+                        let (sp, cp) = pitch.sin_cos();
+                        let look = Vec3::new(sy * cp, sp, -cy * cp);
+                        let before = if third == 1 { -look } else { look };
+                        if before.y >= -(THIRD_PERSON_MAX_BELOW.to_radians().sin()) + 1e-4 {
+                            assert!((dir - before).length() < 1e-4, "{dir} contre {before}");
+                        } else {
+                            // Plus bas : 65° sous l'horizontale, du même côté qu'avant.
+                            assert!((dir.y + THIRD_PERSON_MAX_BELOW.to_radians().sin()).abs() < 1e-4);
+                            let side = Vec3::new(dir.x, 0.0, dir.z).normalize();
+                            let want = if third == 1 { -Vec3::new(sy, 0.0, -cy) } else { Vec3::new(sy, 0.0, -cy) };
+                            assert!((side - want).length() < 1e-3, "{side} contre {want}");
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 500);
+        // Ce que faisait l'ancienne caméra (à la verticale sous les yeux) : dans les jambes.
+        let pose = crate::player_model::Pose {
+            feet,
+            yaw: 0.0,
+            pitch: (-89.0f32).to_radians(),
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: None,
+            skin: None,
+            bow: 0.0,
+        };
+        let eye = feet + Vec3::Y * crate::player::EYE;
+        let (sp, cp) = pose.pitch.sin_cos();
+        let old = Vec3::new(0.0, sp, -cp);
+        let old_cam = eye + old * ((crate::player::EYE / -old.y) - 0.25);
+        assert!(
+            crate::player_model::shadow_boxes(&pose)
+                .iter()
+                .any(|b| inside(b, old_cam, 0.06)),
+            "l'essai ne voit plus le cas de la capture"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeus_click_tests {
+    use super::*;
+
+    /// (v295) « J'ai réussi à casser un bloc avec l'éclair, ça doit être impossible » : avec la
+    /// Foudre de Zeus en main, un clic bref (appuyé et relâché dans la même image) est pour
+    /// elle comme un clic tenu ; et rien ne se casse avec elle en main.
+    #[test]
+    fn the_legendary_bolt_never_breaks_a_block() {
+        let zeus = Some(Item::Zeus);
+        assert!(zeus_click(zeus, true, false), "clic bref, dans une seule image");
+        assert!(zeus_click(zeus, true, true));
+        assert!(zeus_click(zeus, false, true), "clic tenu");
+        assert!(!zeus_click(zeus, false, false));
+        assert!(!zeus_click(Some(Item::Wand), true, true));
+        assert!(!zeus_click(None, true, false));
+        // Et le bloc visé n'est pas cassable avec elle en main (`handle_blocks`).
+        let src = include_str!("session.rs");
+        let f = &src[src.find("fn handle_blocks(").unwrap()..];
+        let f = &f[..f.find("\n    fn ").unwrap()];
+        assert!(f.contains("&& !zeus;"), "le bloc se casse avec la Foudre en main");
+        assert_eq!(f.matches("zeus_click(").count(), 2);
     }
 }
 

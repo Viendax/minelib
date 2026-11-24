@@ -484,7 +484,8 @@ fn default_render() -> DynSettings {
         vl_noise_morph: 0.0,
         vl_noise_stride: 4,
         vl_dither_temporal: true,
-        half_lighting: true,
+        // (v295) Décoché par défaut : voir `eclairage_demi2`.
+        half_lighting: false,
     }
 }
 
@@ -550,7 +551,12 @@ impl LightSettings {
         } else {
             2
         };
-        r.half_lighting = b("eclairage_demi", d.half_lighting);
+        // (v295) « Le bloc se met à revibrer » : l'éclairage en demi-résolution, gardé quand il
+        // était un peu plus rapide (0,98 ms contre 1,05 ms sur sa carte), l'était justement
+        // quand le bloc de feuillage autour de sa lumière vibrait (de 18 h 16 min 50 à 18 h 18
+        // min 35, et à 7 h 01). Décoché par défaut ; nouvelle clé : l'ancienne (cochée, le
+        // défaut d'avant) n'est pas reprise.
+        r.half_lighting = b("eclairage_demi2", d.half_lighting);
         r.vl_max_dist = f("rayons_distance", d.vl_max_dist, 8.0, 256.0);
         r.vl_tip_boost = f("rayons_lueur", d.vl_tip_boost, 0.0, 4.0);
         r.vl_tip_radius = f("rayons_lueur_rayon", d.vl_tip_radius, 0.1, 4.0);
@@ -613,7 +619,7 @@ impl LightSettings {
         kv("rayons_intensite", r.vl_intensity.to_string());
         kv("rayons_pas", r.vl_steps.to_string());
         kv("rayons_resolution", r.vl_scale.to_string());
-        kv("eclairage_demi", r.half_lighting.to_string());
+        kv("eclairage_demi2", r.half_lighting.to_string());
         kv("rayons_distance", r.vl_max_dist.to_string());
         kv("rayons_lueur", r.vl_tip_boost.to_string());
         kv("rayons_lueur_rayon", r.vl_tip_radius.to_string());
@@ -1449,6 +1455,20 @@ mod tests {
             auto_lu=false\n";
         assert_eq!(LightSettings::parse(his), LightSettings::default());
         assert_eq!(LightSettings::parse(""), LightSettings::default());
+    }
+
+    /// (v295) « Le bloc se met à revibrer » : l'éclairage en demi-résolution est décoché par
+    /// défaut, et l'ancienne clé (cochée chez tout le monde, le défaut d'avant) n'est pas
+    /// reprise ; cochée de nouveau à la main, elle est gardée.
+    #[test]
+    fn half_resolution_lighting_is_off_unless_chosen_again() {
+        assert!(!LightSettings::default().render.half_lighting);
+        assert!(!LightSettings::parse("eclairage_demi=true\n").render.half_lighting);
+        let mut s = LightSettings::default();
+        s.render.half_lighting = true;
+        let text = s.to_text();
+        assert!(text.contains("eclairage_demi2=true"));
+        assert!(LightSettings::parse(&text).render.half_lighting);
     }
 
     #[test]

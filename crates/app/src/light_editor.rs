@@ -2440,7 +2440,7 @@ impl Editor {
                 }
                 self.check(p, "Éclairage en demi-résolution", &mut r.half_lighting);
                 p.note(
-                    "Un pixel sur quatre calculé, les autres repris de leurs voisins sauf aux bords des objets, des ombres et des reflets (calculés exactement) : même image, moins de calcul.",
+                    "Un pixel sur quatre calculé, les autres repris de leurs voisins sauf aux bords des objets, des ombres et des reflets (calculés exactement) : moins de calcul. Décoché par défaut : sur certaines cartes graphiques, des blocs vibraient.",
                     DIM,
                 );
                 self.check(p, "Éclairage en bandes", &mut r.toon);

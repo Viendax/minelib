@@ -22,6 +22,7 @@ mod reflections;
 mod smoke;
 mod sunmap;
 pub use wgpu;
+pub mod compile_time;
 mod latency;
 mod lazy;
 mod lights;
@@ -964,6 +965,9 @@ pub struct Renderer {
     /// Leurs shaders, compilés à la première lumière posée (`Err` : refusés par la carte ou
     /// son pilote ; le jeu continue sans elles).
     lit: Option<lazy::Lazy<Result<LitPipes, String>>>,
+    /// (v295) Durées attendues des compilations du monde et des lumières (s ; celles des
+    /// lancements précédents, voir `compile_time`), pour l'écran de chargement.
+    compile_expect: [f32; 2],
     /// (v198) Blocs vus dans les miroirs, éclairés par les lumières de l'éditeur.
     planar_lit: Option<lazy::Lazy<Result<wgpu::RenderPipeline, String>>>,
     /// (v201) Torches en lumières ponctuelles : centre et rayon de la sphère où chaque bloc
@@ -1554,6 +1558,10 @@ impl Renderer {
             voxels,
             dyn_gpu,
             lit: None,
+            compile_expect: [
+                compile_time::expected(compile_time::WORLD),
+                compile_time::expected(compile_time::LIGHTS),
+            ],
             planar_lit: None,
             torch_swap: None,
             dyn_changes: 0,
@@ -2047,6 +2055,30 @@ impl Renderer {
             .is_some_and(|l| l.try_get().is_some())
     }
 
+    /// (v295) Secondes qui restent, estimées, avant que soient prêts les shaders qu'attend
+    /// l'écran de chargement d'un monde : ceux du monde, et ceux des lumières si `lights` (un
+    /// monde qui en a). D'après le temps passé depuis le lancement de chaque compilation et la
+    /// durée qu'elle a prise aux lancements précédents (`compile_time`). 0 : tout est prêt.
+    pub fn shaders_left(&self, lights: bool) -> f32 {
+        let [world_s, lights_s] = self.compile_expect;
+        let world = match &self.taa {
+            Some(t) if t.heavy.try_get().is_none() => {
+                compile_time::left(t.heavy.elapsed(), world_s)
+            }
+            _ => 0.0,
+        };
+        if !lights {
+            return world;
+        }
+        let lit = match &self.lit {
+            Some(l) if l.try_get().is_none() => compile_time::left(l.elapsed(), lights_s),
+            Some(_) => 0.0,
+            // Pas encore lancée (peu de cœurs : après celle du monde, voir `warm_dyn_lights`).
+            None => world + lights_s,
+        };
+        world.max(lit)
+    }
+
     /// Variantes éclairées, si elles sont prêtes.
     fn lit_pipes(&self) -> Option<&LitPipes> {
         self.lit.as_ref()?.try_get()?.as_ref().ok()
@@ -2102,6 +2134,8 @@ impl Renderer {
                 "shaders des lumières compilés en {:.1} s (en tâche de fond)",
                 t0.elapsed().as_secs_f32()
             );
+            // (v295) Pour la barre de l'écran de chargement des prochains lancements.
+            compile_time::record(compile_time::LIGHTS, t0.elapsed().as_secs_f32());
             Ok(LitPipes {
                 deferred,
                 bake,
@@ -4967,7 +5001,7 @@ mod tests {
         use wgpu::naga;
         // Nom, source, constantes fixées.
         type Variant = (&'static str, String, &'static [(&'static str, f64)]);
-        let cases: [Variant; 13] = [
+        let cases: [Variant; 14] = [
             (
                 "éclairage différé",
                 lights::with_dynlights_glass(include_str!("shaders/dyn_deferred.wgsl")),
@@ -5027,6 +5061,12 @@ mod tests {
                 &[],
             ),
             ("fumée", include_str!("shaders/smoke.wgsl").to_string(), &[]),
+            // (v295) La copie à l'écran lit la profondeur de la scène (`keep_hue`).
+            (
+                "copie à l'écran",
+                include_str!("shaders/present.wgsl").to_string(),
+                &[],
+            ),
         ];
         for (name, src, constants) in cases {
             let module = naga::front::wgsl::parse_str(&src)
@@ -5053,7 +5093,8 @@ mod tests {
             naga::back::hlsl::Writer::new(&mut out, &options)
                 .write(&module, &info, None)
                 .unwrap_or_else(|e| panic!("{name} : {e:?}"));
-            assert!(out.len() > 1000, "{name}");
+            let least = if name == "copie à l'écran" { 500 } else { 1000 };
+            assert!(out.len() > least, "{name}");
         }
     }
 

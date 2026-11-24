@@ -4,10 +4,13 @@
 
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 pub struct Lazy<T> {
     cell: OnceLock<T>,
     rx: Mutex<Option<Receiver<T>>>,
+    /// (v295) Lancement du calcul (pour l'écran de chargement : `Renderer::shaders_left`).
+    started: Instant,
 }
 
 impl<T: Send + 'static> Lazy<T> {
@@ -22,7 +25,13 @@ impl<T: Send + 'static> Lazy<T> {
         Self {
             cell: OnceLock::new(),
             rx: Mutex::new(Some(rx)),
+            started: Instant::now(),
         }
+    }
+
+    /// (v295) Secondes depuis le lancement du calcul.
+    pub fn elapsed(&self) -> f32 {
+        self.started.elapsed().as_secs_f32()
     }
 
     /// La valeur si elle est prête (sans attendre).

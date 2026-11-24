@@ -845,6 +845,43 @@ struct Spread {
     held: Stack,
 }
 
+/// (v295) Aperçu d'une répartition : chaque case parcourue et ce qu'elle aura, puis ce qui
+/// restera au bout du curseur.
+type SpreadView = (Vec<(usize, Stack)>, Option<Stack>);
+
+impl Spread {
+    /// (v295) La répartition : ce que chaque case parcourue aura (`slots` : l'inventaire tel
+    /// qu'il est) et ce qui restera au bout du curseur. Le même calcul sert à l'aperçu pendant
+    /// qu'on glisse (`Inventory::spread_view`) et au relâcher (`spread_out`) : l'aperçu est
+    /// exactement ce qui sera posé.
+    fn plan(&self, slots: &[Option<Stack>]) -> SpreadView {
+        let item = self.held.item;
+        let mut left = self.held.count;
+        let each = if self.right {
+            1
+        } else {
+            self.held.count / self.slots.len() as u32
+        };
+        let mut placed = Vec::with_capacity(self.slots.len());
+        for &k in &self.slots {
+            let have = slots[k].map_or(0, |s| s.count);
+            let n = each.min(MAX_STACK.saturating_sub(have)).min(left);
+            if n == 0 {
+                continue;
+            }
+            placed.push((
+                k,
+                Stack {
+                    item,
+                    count: have + n,
+                },
+            ));
+            left -= n;
+        }
+        (placed, (left > 0).then_some(Stack { item, count: left }))
+    }
+}
+
 /// (v247) Double-clic : deux appuis sur la même case en moins de tant (s).
 const DOUBLE_CLICK_S: f32 = 0.35;
 
@@ -1282,29 +1319,75 @@ impl Inventory {
 
     /// (v247) Répartition au relâcher : à parts égales (clic gauche ; ce qui ne se partage pas
     /// reste au bout du curseur) ou une par case (clic droit), sans dépasser 64 par case.
+    /// (v295) Exactement l'aperçu montré pendant qu'on glissait (`Spread::plan`).
     fn spread_out(&mut self, sp: Spread) {
-        let mut left = sp.held.count;
-        let each = if sp.right {
-            1
-        } else {
-            sp.held.count / sp.slots.len() as u32
-        };
-        for &k in &sp.slots {
-            let have = self.slots[k].map_or(0, |s| s.count);
-            let n = each.min(MAX_STACK - have).min(left);
-            if n == 0 {
-                continue;
-            }
-            self.slots[k] = Some(Stack {
-                item: sp.held.item,
-                count: have + n,
-            });
-            left -= n;
+        let (placed, left) = sp.plan(&self.slots);
+        for (k, st) in placed {
+            self.slots[k] = Some(st);
         }
-        self.held = (left > 0).then_some(Stack {
-            item: sp.held.item,
-            count: left,
-        });
+        self.held = left;
+    }
+
+    /// (v295) « Une prévisualisation quand on étale les objets dans l'inventaire » : pendant
+    /// qu'on glisse sur plusieurs cases, bouton tenu, ce que chacune recevra (au relâcher) et
+    /// ce qui restera au bout du curseur. Rien avant la deuxième case : la première montre
+    /// déjà la pose du clic.
+    fn spread_view(&self) -> Option<SpreadView> {
+        let sp = self.spread.as_ref().filter(|sp| sp.slots.len() >= 2)?;
+        Some(sp.plan(&self.slots))
+    }
+
+    /// (v295) La case `i` telle qu'on la montre : son contenu, ou pendant qu'on étale, ce
+    /// qu'elle aura au relâcher ; et si elle est en surbrillance (verte), comme sous la souris :
+    /// sous le curseur, ou parcourue par la répartition.
+    fn slot_view(
+        &self,
+        i: usize,
+        hover: bool,
+        view: Option<&SpreadView>,
+    ) -> (Option<Stack>, bool) {
+        let planned = view.and_then(|(placed, _)| placed.iter().find(|(k, _)| *k == i));
+        match planned {
+            Some(&(_, st)) => (Some(st), true),
+            None => (self.slots[i], hover),
+        }
+    }
+
+    /// (v295) La pile montrée au bout du curseur : pendant qu'on étale, ce qui restera en main
+    /// au relâcher (rien si tout est posé).
+    fn held_view(&self, view: Option<&SpreadView>) -> Option<Stack> {
+        match view {
+            Some((_, left)) => *left,
+            None => self.held,
+        }
+    }
+
+    /// (v295) « Clic molette sur un objet, en créatif, donne une pile de ce même objet » : sur
+    /// le catalogue comme sur une case de son inventaire (barre ou sac), une pile de 64 au bout
+    /// du curseur, sans rien retirer de la case. Seulement la main vide ; jamais la Foudre de
+    /// Zeus (il n'y en a qu'une : du catalogue, elle se prend comme d'un clic).
+    pub fn middle_click(&mut self, size: (f32, f32), cursor: (f32, f32)) {
+        if !(self.open && self.creative) || self.chest.is_some() || self.held.is_some() {
+            return;
+        }
+        let c = Creative::new(size.0, size.1);
+        let (x, y) = cursor;
+        if c.cell_at(x, y).is_some() {
+            // Comme le clic droit du catalogue : la pile la plus grande possible.
+            self.click_creative(size, cursor, true, false, None);
+            return;
+        }
+        let slot = c
+            .hotbar_at(x, y)
+            .or_else(|| c.storage_at(x, y).map(|i| HOTBAR + i));
+        if let Some(st) = slot.and_then(|i| self.slots[i]) {
+            if st.item != Item::Zeus {
+                self.held = Some(Stack {
+                    item: st.item,
+                    count: MAX_STACK,
+                });
+            }
+        }
     }
 
     /// Clic dans l'inventaire ouvert. `right` : clic droit (moitié / un seul objet),
@@ -1554,6 +1637,8 @@ impl Inventory {
         let hover = cursor
             .filter(|_| self.open)
             .and_then(|(x, y)| l.slot_at(x, y, true));
+        // (v295) Aperçu de la répartition en cours (voir `spread_view`).
+        let view = self.spread_view().filter(|_| self.open);
 
         if self.open {
             ui.rect(0.0, 0.0, size.0, size.1, [0.0, 0.0, 0.0, 0.45]);
@@ -1568,15 +1653,8 @@ impl Inventory {
             );
             for i in 0..SLOTS {
                 let (x, y) = l.slot_pos(i, true);
-                self.draw_slot(
-                    ui,
-                    &l,
-                    x,
-                    y,
-                    self.slots[i],
-                    i == self.selected,
-                    hover == Some(i),
-                );
+                let (stack, lit) = self.slot_view(i, hover == Some(i), view.as_ref());
+                self.draw_slot(ui, &l, x, y, stack, i == self.selected, lit);
             }
         } else {
             for i in 0..HOTBAR {
@@ -1613,9 +1691,11 @@ impl Inventory {
         }
 
         if let Some((cx, cy)) = cursor.filter(|_| self.open) {
-            if let Some(h) = self.held {
-                let half = l.slot / 2.0;
-                draw_icon(ui, cx - half, cy - half, l.slot, s, h);
+            if self.held.is_some() {
+                if let Some(h) = self.held_view(view.as_ref()) {
+                    let half = l.slot / 2.0;
+                    draw_icon(ui, cx - half, cy - half, l.slot, s, h);
+                }
             } else if let Some(stack) = hover.and_then(|i| self.slots[i]) {
                 self.draw_tooltip(ui, size, (cx, cy), s, stack.item);
             }
@@ -1749,14 +1829,17 @@ impl Inventory {
             (bh * shown).max(4.0 * s),
             col([200, 200, 210], 1.0),
         );
-        // Inventaire de survie, puis barre d'objets.
+        // Inventaire de survie, puis barre d'objets. (v295) Pendant qu'on étale une pile, ce
+        // que chaque case parcourue recevra, en surbrillance (`slot_view`).
+        let view = self.spread_view();
         for i in 0..COLS * ROWS {
             let (x, y) = c.storage_pos(i);
             let hover = Creative::inside((x, y), c.slot, mx, my);
             if hover {
                 hover_item = self.slots[HOTBAR + i].map(|st| st.item);
             }
-            self.draw_slot(ui, &l, x, y, self.slots[HOTBAR + i], false, hover);
+            let (stack, lit) = self.slot_view(HOTBAR + i, hover, view.as_ref());
+            self.draw_slot(ui, &l, x, y, stack, false, lit);
         }
         for i in 0..HOTBAR {
             let (x, y) = c.hotbar_pos(i);
@@ -1764,7 +1847,8 @@ impl Inventory {
             if hover {
                 hover_item = self.slots[i].map(|st| st.item);
             }
-            self.draw_slot(ui, &l, x, y, self.slots[i], i == self.selected, hover);
+            let (stack, lit) = self.slot_view(i, hover, view.as_ref());
+            self.draw_slot(ui, &l, x, y, stack, i == self.selected, lit);
         }
         // Poubelle.
         let (tx, ty) = c.trash;
@@ -1797,9 +1881,11 @@ impl Inventory {
         }
 
         if let Some((cx, cy)) = cursor {
-            if let Some(h) = self.held {
-                let half = c.slot / 2.0;
-                draw_icon(ui, cx - half, cy - half, c.slot, s, h);
+            if self.held.is_some() {
+                if let Some(h) = self.held_view(view.as_ref()) {
+                    let half = c.slot / 2.0;
+                    draw_icon(ui, cx - half, cy - half, c.slot, s, h);
+                }
             } else if over_trash {
                 let ts = (s / 2.0).floor().max(1.0);
                 let lines = [
@@ -2358,6 +2444,116 @@ mod tests {
         inv.click(size, at(10), false, false);
         assert_eq!(inv.held.map(|h| h.count), Some(64));
         assert_eq!(counts(&inv, &[9, 0, 11, 20]), vec![0, 4, 3, 4]);
+    }
+
+    /// (v295) « Une prévisualisation quand on étale les objets dans l'inventaire, et les cases
+    /// sur lesquelles on passe, qui ont des objets de cette prévisualisation, en vert comme
+    /// quand on passe la souris sur un objet » : pendant qu'on glisse, chaque case parcourue
+    /// montre ce qu'elle aura, en surbrillance, le curseur ce qui restera en main ; au
+    /// relâcher, c'est exactement ce qui est posé. Dans l'inventaire comme dans l'écran
+    /// créatif.
+    #[test]
+    fn spreading_previews_each_slot_in_green_and_drops_exactly_that() {
+        let stone = Item::Block(minelib_world::BlockId::STONE);
+        let size = (1280.0, 720.0);
+        let l = Layout::new(size.0, size.1);
+        let at = |i: usize| {
+            let (x, y) = l.slot_pos(i, true);
+            (x + l.slot / 2.0, y + l.slot / 2.0)
+        };
+        let st = |count| Some(Stack { item: stone, count });
+        let mut inv = Inventory::empty();
+        inv.open = true;
+        inv.slots[12] = st(62);
+        inv.held = st(64);
+        inv.click(size, at(10), false, false);
+        // Une seule case : la pose du clic, pas d'aperçu.
+        assert!(inv.spread_view().is_none());
+        inv.pointer(size, Some(at(11)), false, true, false);
+        inv.pointer(size, Some(at(12)), false, true, false);
+        inv.pointer(size, Some(at(13)), false, true, false);
+        let view = inv.spread_view().expect("aperçu pendant qu'on glisse");
+        // 64 en 4 : 16 par case, mais la case 12 n'a la place que pour 2.
+        let counts: Vec<(usize, u32)> = view.0.iter().map(|(k, s)| (*k, s.count)).collect();
+        assert_eq!(counts, vec![(10, 16), (11, 16), (12, 64), (13, 16)]);
+        assert!(view.0.iter().all(|(_, s)| s.item == stone));
+        assert_eq!(view.1, st(14));
+        for (k, s) in &view.0 {
+            assert_eq!(inv.slot_view(*k, false, Some(&view)), (Some(*s), true));
+        }
+        assert_eq!(inv.slot_view(14, false, Some(&view)), (None, false));
+        assert_eq!(inv.slot_view(14, true, Some(&view)), (None, true), "sous la souris");
+        assert_eq!(inv.held_view(Some(&view)), st(14));
+        // Rien n'est encore posé : relâché, c'est l'aperçu.
+        assert_eq!(inv.slots[11], None);
+        let mut ui = Ui::default();
+        inv.draw(&mut ui, size, Some(at(13)));
+        inv.pointer(size, Some(at(13)), false, false, false);
+        for (k, s) in &view.0 {
+            assert_eq!(inv.slots[*k], Some(*s));
+        }
+        assert_eq!(inv.held, view.1);
+        assert!(inv.spread_view().is_none());
+        // Clic droit glissé : une par case, le reste en main ; tout posé : rien au curseur.
+        let mut inv = Inventory::empty();
+        inv.open = true;
+        inv.held = st(3);
+        inv.click(size, at(0), true, false);
+        inv.pointer(size, Some(at(1)), false, false, true);
+        inv.pointer(size, Some(at(2)), false, false, true);
+        let view = inv.spread_view().unwrap();
+        assert_eq!(view.0.iter().map(|p| p.1.count).collect::<Vec<_>>(), vec![1, 1, 1]);
+        assert_eq!(inv.held_view(Some(&view)), None);
+        // L'écran créatif montre le même aperçu.
+        inv.creative = true;
+        let mut ui = Ui::default();
+        inv.draw(&mut ui, size, Some(at(2)));
+        inv.pointer(size, Some(at(2)), false, false, false);
+        assert_eq!(inv.slots[..3], [st(1), st(1), st(1)]);
+        assert_eq!(inv.held, None);
+    }
+
+    /// (v295) « Clic molette sur un objet en créatif donne une pile de ce même objet » : du
+    /// catalogue ou d'une case de son inventaire, sans rien y retirer ; seulement la main vide,
+    /// en créatif, et jamais une seconde Foudre de Zeus.
+    #[test]
+    fn a_middle_click_in_creative_gives_a_stack_of_the_item() {
+        let size = (1280.0, 720.0);
+        let c = Creative::new(size.0, size.1);
+        let mid = |p: (f32, f32)| (p.0 + c.slot / 2.0, p.1 + c.slot / 2.0);
+        let mut inv = Inventory::empty();
+        inv.open = true;
+        inv.creative = true;
+        inv.legend = true;
+        let first = inv.filtered()[0];
+        inv.middle_click(size, mid(c.cell_pos(0)));
+        assert_eq!(inv.held, Some(Stack { item: first, count: MAX_STACK }));
+        // Déjà quelque chose en main : rien.
+        inv.held = Some(Stack { item: Item::Wand, count: 1 });
+        inv.middle_click(size, mid(c.cell_pos(0)));
+        assert_eq!(inv.held, Some(Stack { item: Item::Wand, count: 1 }));
+        // D'une case de la barre ou du sac : une pile de plus, la case garde la sienne.
+        inv.held = None;
+        inv.slots[3] = Some(Stack { item: first, count: 5 });
+        inv.middle_click(size, mid(c.hotbar_pos(3)));
+        assert_eq!(inv.held, Some(Stack { item: first, count: MAX_STACK }));
+        assert_eq!(inv.slots[3], Some(Stack { item: first, count: 5 }));
+        inv.held = None;
+        inv.slots[HOTBAR + 7] = Some(Stack { item: Item::Flashlight, count: 1 });
+        inv.middle_click(size, mid(c.storage_pos(7)));
+        assert_eq!(inv.held, Some(Stack { item: Item::Flashlight, count: MAX_STACK }));
+        // Jamais une seconde Foudre de Zeus.
+        inv.held = None;
+        inv.slots[4] = Some(Stack { item: Item::Zeus, count: 1 });
+        inv.middle_click(size, mid(c.hotbar_pos(4)));
+        assert_eq!(inv.held, None);
+        // Case vide : rien.
+        inv.middle_click(size, mid(c.hotbar_pos(9)));
+        assert_eq!(inv.held, None);
+        // Hors du créatif : rien.
+        inv.creative = false;
+        inv.middle_click(size, mid(c.hotbar_pos(3)));
+        assert_eq!(inv.held, None);
     }
 
     /// (v247) Le nom d'un objet a la même couleur dans son info-bulle et au-dessus de la
