@@ -60,16 +60,22 @@ body.net{transition:none}
   left:calc(100% - var(--o)*(352px + 464px*var(--s)) + 464px*var(--s));
   box-sizing:border-box;padding:16px 14px;background:#0f0f0f;border-left:1px solid #272727}
 #file h2{margin:2px 4px 12px;font-size:18px;font-weight:600}
-#cherche{display:block;width:100%;margin:0 0 14px;padding:10px 14px;border:1px solid #3f3f3f;
-  border-radius:20px;background:#121212;color:#f1f1f1;font:inherit;font-size:15px;
-  text-align:left;cursor:pointer}
-#cherche::before{content:'🔍  '}
-body.cote #cherche::before{content:'✕  '}
+#chercher{margin:0 4px 8px;font-size:13px;color:#aaa}
+#sites{display:flex;gap:6px;margin:0 0 14px}
+#sites button{flex:1;min-width:0;padding:9px 2px;border:1px solid #3f3f3f;border-radius:18px;
+  background:#121212;color:#f1f1f1;font:inherit;font-size:13px;cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#sites button.actif{background:#f1f1f1;color:#0f0f0f;border-color:#f1f1f1;font-weight:600}
+#sites #ferme{flex:none;width:36px;padding:9px 0;display:none}
+body.cote #sites #ferme{display:block}
+#lecteur{width:100%;height:100%}
 #vide{color:#aaa;font-size:14px;line-height:1.4;margin:4px}
 .v{display:flex;align-items:center;gap:10px;margin-bottom:10px;position:relative}
 .v img{width:120px;height:68px;object-fit:cover;border-radius:6px;flex:none;background:#222}
 .v .n{position:absolute;left:4px;top:3px;font-size:12px;background:rgba(0,0,0,.75);
   border-radius:4px;padding:0 5px}
+.v .s{position:absolute;left:4px;bottom:3px;font-size:11px;background:rgba(0,0,0,.75);
+  border-radius:4px;padding:0 5px;color:#ddd}
 .v .t{flex:1;font-size:14px;line-height:1.3;max-height:54px;overflow:hidden;color:#f1f1f1}
 .v .x{flex:none;width:30px;height:30px;border-radius:15px;border:0;background:#272727;
   color:#f1f1f1;font-size:18px;line-height:30px;padding:0;cursor:pointer}
@@ -81,8 +87,10 @@ body.cote #cherche::before{content:'✕  '}
 </head>
 <body>
 <div id="cadre"><div id="lecteur"></div></div>
-<div id="trou">Chargement de YouTube…</div>
-<div id="file"><button id="cherche">Rechercher une vidéo</button><h2>À suivre</h2>
+<div id="trou">Chargement de la recherche…</div>
+<div id="file"><div id="chercher">Chercher une vidéo sur</div>
+<div id="sites"><button data-s="yt">YouTube</button><button data-s="dm">Dailymotion</button><button
+data-s="vm">Vimeo</button><button id="ferme" title="Fermer la recherche">✕</button></div><h2>À suivre</h2>
 <div id="liste"></div><div id="vide">Rien à suivre. Cherche une vidéo et clique-la : elle se
 mettra ici.</div></div>
 <div id="mot"></div>
@@ -96,39 +104,60 @@ const dit=s=>{try{window.chrome.webview.postMessage(s);}catch(_){console.log(s);
 window.addEventListener('message',e=>{
   if(e.origin==='https://www.youtube-nocookie.com'&&e.data&&typeof e.data.__mlb==='string'
     &&/^__minelib_(pub|diag)__/.test(e.data.__mlb)&&e.data.__mlb.length<400)dit(e.data.__mlb);});
-const ok=s=>/^[A-Za-z0-9_-]{11}$/.test(s||'');
+// (v265) Vidéos de YouTube (numéro de 11 signes), de Vimeo (`vm:` et son numéro) et de
+// Dailymotion (`dm:` et son identifiant).
+const ok=s=>/^[A-Za-z0-9_-]{11}$/.test(s||'')||/^vm:\d{1,12}$/.test(s||'')
+  ||/^dm:[A-Za-z0-9]{5,12}$/.test(s||'');
+const site=v=>v.startsWith('vm:')?'vm':v.startsWith('dm:')?'dm':'yt';
+const NOMS={yt:'YouTube',dm:'Dailymotion',vm:'Vimeo'};
+// (v265) Dailymotion : le « Player ID » d'un compte Dailymotion, s'il y en a un (son lecteur
+// se pilote alors par son API officielle ; sans, on essaie la bibliothèque sans numéro).
+const DM_PLAYER='';
 const q=new URLSearchParams(location.search);
 let id=ok(q.get('v'))?q.get('v'):'';
 const debut=Math.max(0,Math.min(360000,parseInt(q.get('t')||'0',10)||0));
-let P=null,pret=false,permis=false,voulu=true,erreur=false,cherche=null;
+let B=null,pret=false,permis=false,voulu=true,erreur=false,cherche=null;
 let s=-1,dernier=-2,depuis=0,etat='',fini=false;
-// (v253) La file d'attente : numéros, titres connus (chargés une fois chez YouTube).
-let file=[];const titres={};
-const titre=v=>{if(titres[v]!==undefined)return;titres[v]='';
-  fetch('https://www.youtube.com/oembed?format=json&url='+encodeURIComponent('https://www.youtube.com/watch?v='+v))
-  .then(r=>r.ok?r.json():null).then(j=>{if(j&&j.title){titres[v]=j.title;montre();}}).catch(()=>{});};
+// (v253) La file d'attente : numéros, titres et images connus (chargés une fois).
+let file=[];const infos={};
+const info=v=>{if(infos[v])return;const o=infos[v]={titre:'',image:''};const S=site(v);
+  const fin=()=>montre();
+  if(S==='yt'){o.image='https://i.ytimg.com/vi/'+v+'/mqdefault.jpg';
+    fetch('https://www.youtube.com/oembed?format=json&url='+encodeURIComponent('https://www.youtube.com/watch?v='+v))
+    .then(r=>r.ok?r.json():null).then(j=>{if(j&&j.title){o.titre=j.title;fin();}}).catch(()=>{});}
+  else if(S==='vm'){
+    fetch('https://vimeo.com/api/oembed.json?url='+encodeURIComponent('https://vimeo.com/'+v.slice(3)))
+    .then(r=>r.ok?r.json():null).then(j=>{if(j){o.titre=j.title||'';o.image=j.thumbnail_url||'';fin();}}).catch(()=>{});}
+  else{fetch('https://api.dailymotion.com/video/'+v.slice(3)+'?fields=title,thumbnail_360_url')
+    .then(r=>r.ok?r.json():null).then(j=>{if(j){o.titre=j.title||'';o.image=j.thumbnail_360_url||'';fin();}}).catch(()=>{});}};
 const montre=()=>{const l=document.getElementById('liste');l.textContent='';
-  file.forEach((v,i)=>{const d=document.createElement('div');d.className='v';
-    const im=document.createElement('img');im.src='https://i.ytimg.com/vi/'+v+'/mqdefault.jpg';
+  file.forEach((v,i)=>{info(v);const o=infos[v];const d=document.createElement('div');d.className='v';
+    const im=document.createElement('img');if(o.image)im.src=o.image;
     const n=document.createElement('span');n.className='n';n.textContent=String(i+1);
-    const t=document.createElement('div');t.className='t';t.textContent=titres[v]||'…';
+    const t=document.createElement('div');t.className='t';t.textContent=o.titre||'…';
     const x=document.createElement('button');x.className='x';x.textContent='×';x.title='Retirer';
     x.addEventListener('click',e=>{e.stopPropagation();
       dit('__minelib_ordre__'+JSON.stringify({retire:i,v:v}));});
-    d.append(im,n,t,x);l.append(d);titre(v);});
+    d.append(im,n,t,x);
+    if(site(v)!=='yt'){const b=document.createElement('span');b.className='s';b.textContent=NOMS[site(v)];d.append(b);}
+    l.append(d);});
   document.getElementById('vide').style.display=file.length?'none':'block';};
-// (v257) La file (`ouvert`) et la recherche à côté (`cote`), comme le jeu les veut.
-let ouvert=false,cote=false;
+// (v257) La file (`ouvert`) et la recherche à côté (`cote` : (v265) le site, ou rien), comme
+// le jeu les veut.
+let ouvert=false,cote='';
+const net=r=>r===true?'yt':(typeof r==='string'&&NOMS[r])?r:'';
 const applique=()=>{document.body.classList.toggle('file',ouvert);
-  document.body.classList.toggle('cote',cote);
-  document.getElementById('cherche').textContent=cote?'Fermer la recherche':'Rechercher une vidéo';};
+  document.body.classList.toggle('cote',!!cote);
+  document.querySelectorAll('#sites button[data-s]').forEach(b=>b.classList.toggle('actif',b.dataset.s===cote));};
 // Rechargée (vidéo suivante) : remise telle quelle, sans glisser.
 try{const m=JSON.parse(sessionStorage.getItem('mlb_panneau')||'null');
-  if(Array.isArray(m)){ouvert=!!m[0];cote=!!m[1];document.body.classList.add('net');applique();
+  if(Array.isArray(m)){ouvert=!!m[0];cote=net(m[1]);document.body.classList.add('net');applique();
     requestAnimationFrame(()=>requestAnimationFrame(()=>document.body.classList.remove('net')));}}catch(_){}
-// Le bouton de recherche : le jeu ouvre (ou ferme) la recherche à côté.
-document.getElementById('cherche').addEventListener('click',()=>{
-  dit('__minelib_ordre__'+JSON.stringify({recherche:!cote}));});
+// (v265) Un bouton par site : le jeu ouvre la recherche à côté sur ce site (ou la ferme).
+document.querySelectorAll('#sites button[data-s]').forEach(b=>b.addEventListener('click',()=>{
+  dit('__minelib_ordre__'+JSON.stringify({recherche:b.dataset.s}));}));
+document.getElementById('ferme').addEventListener('click',()=>{
+  dit('__minelib_ordre__'+JSON.stringify({recherche:false}));});
 const mot=t=>{document.getElementById('cadre').style.display='none';
   const m=document.getElementById('mot');m.textContent=t;m.style.display='flex';};
 // Commandes du jeu (regarder ensemble, pause de tous les écrans). Lancer la lecture
@@ -136,15 +165,21 @@ const mot=t=>{document.getElementById('cadre').style.display='none';
 // écrans ne passe plus par ici : le lecteur est à fond, et le jeu règle le son du
 // navigateur dans Windows.
 window.__mlb={
-  seekTo:t=>{if(P&&pret)P.seekTo(t,true);else cherche=t;},
-  playVideo:()=>{voulu=true;if(P&&pret&&permis)P.playVideo();},
-  pauseVideo:()=>{voulu=false;if(P&&pret)P.pauseVideo();},
-  regarde:()=>{if(permis)return;permis=true;if(P&&pret&&voulu)P.playVideo();},
+  seekTo:t=>{if(B&&pret)B.aller(t);else cherche=t;},
+  playVideo:()=>{voulu=true;if(B&&pret&&permis)B.jouer();},
+  pauseVideo:()=>{voulu=false;if(B&&pret)B.arreter();},
+  regarde:()=>{if(permis)return;permis=true;if(B&&pret&&voulu)B.jouer();},
   file:l=>{if(!Array.isArray(l))return;file=l.filter(ok).slice(0,30);montre();},
-  panneau:(o,r)=>{ouvert=!!o;cote=!!r;applique();
+  panneau:(o,r)=>{ouvert=!!o;cote=net(r);applique();
     try{sessionStorage.setItem('mlb_panneau',JSON.stringify([ouvert,cote]));}catch(_){}},
 };
 if(!id){mot("Pas de vidéo à lire.");return;}
+const charge=(src,ok,ko)=>{const e=document.createElement('script');e.src=src;e.onload=ok;
+  e.onerror=ko||(()=>{});document.head.appendChild(e);};
+// Chaque lecteur donne : jouer, arrêter, aller (secondes), lire (temps, en lecture, en
+// attente, pub, vidéo).
+if(site(id)==='yt'){
+let P=null;
 window.onYouTubeIframeAPIReady=()=>{
   P=new YT.Player('lecteur',{
     host:'https://www.youtube-nocookie.com',
@@ -180,23 +215,87 @@ window.onYouTubeIframeAPIReady=()=>{
         mot("Cette vidéo ne peut pas être lue (introuvable, privée ou retirée).");},
     }});
 };
-const api=document.createElement('script');
-api.src='https://www.youtube.com/iframe_api';
-document.head.appendChild(api);
+B={jouer:()=>P.playVideo(),arreter:()=>P.pauseVideo(),aller:t=>P.seekTo(t,true),
+  lire:()=>{const t=P.getCurrentTime();const e=P.getPlayerState();const d=P.getVideoData();
+    return {t:t,joue:e===1,attente:e===3,pub:false,i:(d&&ok(d.video_id))?d.video_id:id};}};
+charge('https://www.youtube.com/iframe_api');
+}
+// (v265) Vimeo : son lecteur officiel et son API (`player.js`).
+else if(site(id)==='vm'){
+const n=id.slice(3);let V=null,vt=debut,vq=performance.now(),vj=false,va=false;
+const versSite=()=>{erreur=true;mot("Ouverture de la vidéo sur Vimeo…");
+  let t=Math.floor(vt)||debut;location.replace('https://vimeo.com/'+n+'?mlb=site'+(t>0?'#t='+t+'s':''));};
+charge('https://player.vimeo.com/api/player.js',()=>{try{
+  V=new Vimeo.Player('lecteur',{id:Number(n),autoplay:false,dnt:true,playsinline:true,
+    title:false,byline:false,portrait:false,width:1280});
+  V.ready().then(()=>{pret=true;V.setVolume(1).catch(()=>{});
+    const t=cherche!==null?cherche:debut;cherche=null;
+    if(t>0)V.setCurrentTime(t).then(x=>{vt=x;vq=performance.now();}).catch(()=>{});
+    if(permis&&voulu)V.play().catch(()=>{});
+    V.getVideoTitle().then(x=>{if(x)document.title=x;}).catch(()=>{});
+  }).catch(()=>versSite());
+  V.on('play',()=>{fini=false;if(!permis)permis=true;});
+  V.on('playing',()=>{vj=true;va=false;});
+  V.on('pause',()=>{vj=false;});
+  V.on('ended',()=>{vj=false;fini=true;});
+  V.on('bufferstart',()=>{va=true;});
+  V.on('bufferend',()=>{va=false;});
+  V.on('timeupdate',d=>{vt=d.seconds;vq=performance.now();});
+  V.on('seeked',d=>{vt=d.seconds;vq=performance.now();});
+}catch(_){versSite();}},()=>mot("Le lecteur de Vimeo ne se charge pas."));
+B={jouer:()=>V&&V.play().catch(()=>{}),arreter:()=>V&&V.pause().catch(()=>{}),
+  aller:t=>V&&V.setCurrentTime(t).then(x=>{vt=x;vq=performance.now();}).catch(()=>{}),
+  lire:()=>({t:vt+(vj&&!va?(performance.now()-vq)/1000:0),joue:vj,attente:va,pub:false,i:id})};
+}
+// (v265) Dailymotion : son lecteur officiel et son API ; sans elle (pas de « Player ID »),
+// son lecteur simple, au bon moment, sans pause partagée (la page se dit « en pub » : rien
+// n'y est corrigé), et la fin d'après sa durée.
+else{
+const x=id.slice(3);let D=null,dt=debut,dq=performance.now(),dj=false,dpub=false;
+const simple=()=>{if(D)return;D=false;erreur=false;pret=false;
+  const f=document.createElement('iframe');f.allow='autoplay; fullscreen; encrypted-media';
+  f.src='https://geo.dailymotion.com/player.html?video='+x+'&startTime='+debut;
+  document.getElementById('lecteur').replaceWith(f);f.id='lecteur';
+  const t0=performance.now();
+  fetch('https://api.dailymotion.com/video/'+x+'?fields=title,duration').then(r=>r.ok?r.json():null)
+  .then(j=>{if(!j)return;if(j.title)document.title=j.title;
+    if(j.duration>0)setTimeout(()=>{fini=true;},Math.max(0,(j.duration-debut)*1000+3000));}).catch(()=>{});
+  B={jouer:()=>{},arreter:()=>{},aller:()=>{},lire:()=>({t:debut+(performance.now()-t0)/1000,joue:true,attente:false,pub:true,i:id})};
+  pret=true;};
+charge('https://geo.dailymotion.com/libs/player'+(DM_PLAYER?'/'+DM_PLAYER:'')+'.js',()=>{try{
+  dailymotion.createPlayer('lecteur',{video:x,params:{startTime:debut,mute:false}}).then(p=>{D=p;pret=true;
+    const ev=dailymotion.events||{};
+    const sur=(n,f)=>{if(ev[n])D.on(ev[n],f);};
+    sur('VIDEO_END',()=>{dj=false;fini=true;});
+    sur('AD_START',()=>{dpub=true;});
+    sur('AD_END',()=>{dpub=false;});
+    if(cherche!==null){D.seek(cherche);cherche=null;}
+    if(permis&&voulu)D.play();
+  }).catch(()=>simple());}catch(_){simple();}},()=>simple());
+// Son état, relu toutes les 500 ms ; une lecture partie sans l'accord du jeu attend le regard.
+setInterval(()=>{if(!D||!D.getState)return;D.getState().then(st=>{
+  dt=st.videoTime||0;dq=performance.now();dpub=!!st.adIsPlaying;
+  dj=!!st.playerIsPlaying&&!st.adIsPlaying;
+  if(st.videoTitle)document.title=st.videoTitle;
+  if(st.playerIsReplayScreen)fini=true;
+  if(dj&&!permis)D.pause();}).catch(()=>{});},500);
+B={jouer:()=>{if(D)D.play();},arreter:()=>{if(D)D.pause();},aller:t=>{if(D)D.seek(t);},
+  lire:()=>({t:dt+(dj?(performance.now()-dq)/1000:0),joue:dj,attente:false,pub:dpub,i:id})};
+}
 // Revenue par « précédent » ou « suivant » (cache du navigateur) : l'état est redit.
 window.addEventListener('pageshow',()=>{etat='';});
 // État pour le jeu, comme les autres pages : adresse, temps, pause, « pub », vidéo.
 setInterval(()=>{
-  let t=-1,p=true,i=id;
-  if(P&&pret&&!erreur){
-    try{t=Math.round(P.getCurrentTime()*10)/10;s=P.getPlayerState();p=s!==1&&s!==3;
-      const d=P.getVideoData();if(d&&ok(d.video_id))i=d.video_id;}catch(_){t=-1;}
+  let t=-1,p=true,i=id,pub=false;
+  if(B&&pret&&!erreur){
+    try{const r=B.lire();t=Math.round(r.t*10)/10;s=r.joue?1:(r.attente?3:2);p=!(r.joue||r.attente);
+      pub=!!r.pub;if(ok(r.i))i=r.i;}catch(_){t=-1;}
   }
   // En lecture, un temps qui n'avance plus : une pub (ou un arrêt) joue à la place.
   const now=performance.now();
   if(s!==1||t!==dernier){dernier=t;depuis=now;}
   const fige=s===1&&now-depuis>1200;
-  const a=!permis||fige;
+  const a=!permis||fige||pub;
   const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i,e:fini,f:file.join(','),o:ouvert,r:cote});
   if(st!==etat){etat=st;dit('__minelib_state__'+st);}
 },500);

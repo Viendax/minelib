@@ -876,6 +876,13 @@ fn valid_place(p: &Placed) -> bool {
 
 /// Numéro de vidéo YouTube : 11 caractères `A-Z a-z 0-9 - _`.
 pub fn valid_id(id: &str) -> bool {
+    // (v265) Vimeo : `vm:` et son numéro ; Dailymotion : `dm:` et son identifiant.
+    if let Some(n) = id.strip_prefix("vm:") {
+        return (1..=12).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit());
+    }
+    if let Some(x) = id.strip_prefix("dm:") {
+        return (5..=12).contains(&x.len()) && x.bytes().all(|b| b.is_ascii_alphanumeric());
+    }
     id.len() == 11
         && id
             .bytes()
@@ -896,9 +903,34 @@ pub fn video_of(url: &str) -> Option<String> {
     let rest = rest.split('#').next()?;
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let id = match host.to_ascii_lowercase().as_str() {
         "viendax.github.io" if path == "minelib/lecteur" => {
-            query.split('&').find_map(|kv| kv.strip_prefix("v="))?
+            let v = query.split('&').find_map(|kv| kv.strip_prefix("v="))?;
+            // (v265) `vm:…`, `dm:…` : le deux-points peut arriver encodé.
+            let v = v.replace("%3A", ":").replace("%3a", ":");
+            return valid_id(&v).then_some(v);
+        }
+        // (v265) Vimeo et Dailymotion.
+        "vimeo.com" | "www.vimeo.com" | "player.vimeo.com" => {
+            let n = match segs.as_slice() {
+                ["video", n, ..] if host.starts_with("player.") => *n,
+                [n, ..] if n.bytes().all(|b| b.is_ascii_digit()) => *n,
+                ["channels", _, n, ..] => *n,
+                ["groups", _, "videos", n, ..] => *n,
+                _ => return None,
+            };
+            let v = format!("vm:{n}");
+            return valid_id(&v).then_some(v);
+        }
+        "dailymotion.com" | "www.dailymotion.com" | "geo.dailymotion.com" | "dai.ly" => {
+            let x = match segs.as_slice() {
+                [x] if host == "dai.ly" => *x,
+                ["video", x, ..] => *x,
+                _ => return None,
+            };
+            let v = format!("dm:{x}");
+            return valid_id(&v).then_some(v);
         }
         "youtu.be" => path.split('/').next()?,
         "www.youtube.com" | "youtube.com" | "m.youtube.com" => {
@@ -1034,6 +1066,24 @@ mod tests {
     const B: &str = "Bob";
     const X: &str = "dQw4w9WgXcQ";
     const Y: &str = "9bZkp7q19f0";
+
+    /// (v265) Vimeo et Dailymotion : `vm:`, `dm:`, dans le lecteur comme sur leurs sites.
+    #[test]
+    fn videos_de_vimeo_et_dailymotion() {
+        assert!(valid_id("vm:76979871") && valid_id("dm:x8abcde") && valid_id(X));
+        assert!(!valid_id("vm:12a") && !valid_id("dm:x") && !valid_id("vm:") && !valid_id("yt:abc"));
+        assert_eq!(video_of("https://vimeo.com/76979871"), Some("vm:76979871".into()));
+        assert_eq!(video_of("https://vimeo.com/channels/staffpicks/76979871"), Some("vm:76979871".into()));
+        assert_eq!(video_of("https://player.vimeo.com/video/76979871?h=ab"), Some("vm:76979871".into()));
+        assert_eq!(video_of("https://vimeo.com/search?q=chat"), None);
+        assert_eq!(video_of("https://www.dailymotion.com/video/x8abcde"), Some("dm:x8abcde".into()));
+        assert_eq!(video_of("https://dai.ly/x8abcde"), Some("dm:x8abcde".into()));
+        assert_eq!(video_of("https://www.dailymotion.com/fr"), None);
+        let l = watch_url("dm:x8abcde", 12.0);
+        assert_eq!(video_of(&l), Some("dm:x8abcde".into()));
+        assert_eq!(video_of(&l.replace(':', "%3A").replacen("https%3A", "https:", 1)), Some("dm:x8abcde".into()));
+        assert!(is_player(&watch_url("vm:76979871", 0.0)));
+    }
 
     #[test]
     fn numero_de_video_des_adresses_youtube() {

@@ -1295,9 +1295,19 @@ fn message(id: u32, texte: &str, source: &str, out: &Shared, etat: &Partage) {
         Message::Diag(d) => eprintln!("{} onglet {id} : lecteur : {d}", heure()),
         Message::Ordre(o) => {
             // (v253) Seulement de la page du lecteur ou du site de YouTube.
+            // (v265) Et de Vimeo, de Dailymotion (recherche à côté, clic sur une vidéo).
             let de_confiance = filtre::est_lecteur(source)
                 || filtre::hote(source).is_some_and(|h| {
-                    matches!(h.as_str(), "www.youtube.com" | "youtube.com" | "m.youtube.com")
+                    matches!(
+                        h.as_str(),
+                        "www.youtube.com"
+                            | "youtube.com"
+                            | "m.youtube.com"
+                            | "vimeo.com"
+                            | "www.vimeo.com"
+                            | "www.dailymotion.com"
+                            | "dailymotion.com"
+                    )
                 });
             if de_confiance {
                 proto::push_event(out, *b"MLBO", id, o.len() as u32, o.into_bytes());

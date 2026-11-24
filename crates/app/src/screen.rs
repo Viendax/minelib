@@ -208,21 +208,47 @@ fn page_address(json: &str) -> Option<String> {
 
 /// (v243) Une vidéo joue-t-elle dans la page (temps connu, pas en pause) ?
 /// (v253) La page du lecteur montre-t-elle sa file d'attente (`o`) et (v257) la recherche à
-/// côté (`r`) ? `None` : pas dit.
-fn page_panel(json: &str) -> Option<(bool, bool)> {
+/// côté (`r`), (v265) sur quel site (`"yt"`, `"dm"`, `"vm"`, ou rien) ? `None` : pas dit.
+fn page_panel(json: &str) -> Option<(bool, &'static str)> {
     let v = serde_json::from_str::<serde_json::Value>(json).ok()?;
     let o = v.get("o")?.as_bool()?;
-    let r = v.get("r").and_then(|r| r.as_bool()).unwrap_or(false);
+    let r = match v.get("r") {
+        Some(serde_json::Value::Bool(true)) => "yt",
+        Some(serde_json::Value::String(s)) => site_recherche(s).unwrap_or(""),
+        _ => "",
+    };
     Some((o, r))
 }
 
+/// (v265) Les sites où chercher une vidéo depuis la file (un bouton chacun) : leur code et
+/// la page où commencer.
+pub const SITES_RECHERCHE: [(&str, &str); 3] = [
+    ("yt", RECHERCHE_VIDEO),
+    ("dm", "https://www.dailymotion.com/"),
+    ("vm", "https://vimeo.com/search"),
+];
+
+/// (v265) Le code d'un site où chercher (`yt`, `dm`, `vm`, ou leur nom en entier).
+fn site_recherche(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "yt" | "youtube" => "yt",
+        "dm" | "dailymotion" => "dm",
+        "vm" | "vimeo" => "vm",
+        _ => return None,
+    })
+}
+
 /// (v257) Un ordre de la page du lecteur pour la recherche à côté
-/// (`{"recherche":true|false}`) ; `None` : un autre ordre (pour regarder ensemble).
-fn ordre_recherche(json: &str) -> Option<bool> {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()?
-        .get("recherche")?
-        .as_bool()
+/// (`{"recherche":true|false}`, (v265) ou le site : `"yt"`, `"dm"`, `"vm"`) ; `None` : un
+/// autre ordre (pour regarder ensemble). `Some(None)` : la fermer.
+fn ordre_recherche(json: &str) -> Option<Option<&'static str>> {
+    let v = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    match v.get("recherche")? {
+        serde_json::Value::Bool(true) => Some(Some("yt")),
+        serde_json::Value::Bool(false) => Some(None),
+        serde_json::Value::String(s) => Some(site_recherche(s)),
+        _ => None,
+    }
 }
 
 fn page_playing(json: &str) -> bool {
@@ -690,28 +716,54 @@ impl Displays {
     /// (v257) Ouvre (`on`) ou ferme la recherche à côté du lecteur de l'écran `id` (le bouton
     /// de la file). Fermée, elle rentre sous la file, puis son onglet est fermé ; rouverte,
     /// elle revient là où elle en était.
-    pub fn recherche(&mut self, id: u32, on: bool) {
+    /// (v265) `site` : où chercher (`yt`, `dm`, `vm`) ; `None` : la fermer. Passer d'un site
+    /// à l'autre garde la page où on en était sur chacun.
+    pub fn recherche(&mut self, id: u32, site: Option<&'static str>) {
         let bid = self.cote_bid(id);
         let Some(tab) = self.tabs.get_mut(&id) else {
             return;
         };
-        match tab.cote.as_mut() {
-            Some(c) => {
-                c.voulue = on;
-                c.fermee = 0.0;
+        let depart = |tab: &Tab, s: &str| {
+            tab.cote_urls.get(s).cloned().unwrap_or_else(|| {
+                SITES_RECHERCHE
+                    .iter()
+                    .find(|(c, _)| *c == s)
+                    .map_or(RECHERCHE_VIDEO, |(_, u)| *u)
+                    .to_string()
+            })
+        };
+        match (site, tab.cote.is_some()) {
+            (None, true) => {
+                if let Some(c) = tab.cote.as_mut() {
+                    c.voulue = false;
+                    c.fermee = 0.0;
+                }
             }
-            None if on => {
-                let url = tab
-                    .cote_url
-                    .clone()
-                    .unwrap_or_else(|| RECHERCHE_VIDEO.to_string());
-                tab.cote = Some(Cote::new(bid, &url));
+            (None, false) => return,
+            (Some(s), false) => {
+                let url = depart(tab, s);
+                tab.cote = Some(Cote::new(bid, s, &url));
             }
-            None => return,
+            (Some(s), true) => {
+                let ancien = tab.cote.as_ref().map(|c| (c.site, c.url.clone()));
+                if let Some((a, u)) = ancien.filter(|(a, _)| *a != s) {
+                    tab.cote_urls.insert(a, u);
+                    let url = depart(tab, s);
+                    if let Some(c) = tab.cote.as_mut() {
+                        c.site = s;
+                        c.url = url.clone();
+                        c.change = Some(url);
+                    }
+                }
+                if let Some(c) = tab.cote.as_mut() {
+                    c.voulue = true;
+                    c.fermee = 0.0;
+                }
+            }
         }
         log::info!(
             "écrans vidéo : écran {id}, recherche à côté {}",
-            if on { "ouverte" } else { "fermée" }
+            site.map_or("fermée".to_string(), |s| format!("ouverte ({s})"))
         );
     }
 
@@ -864,6 +916,7 @@ impl Displays {
                 if tab.opened && !c.opened {
                     b.send(&format!("cote {} {COTE_W} {PAGE_H}", c.bid));
                     b.send(&format!("open {} {}", c.bid, c.url));
+                    c.change = None;
                     c.opened = true;
                     c.fps_sent = FPS_DEFAULT;
                     c.sent = None;
@@ -872,6 +925,10 @@ impl Displays {
                     c.opened = false;
                     c.editing = false;
                     c.scroll = 0;
+                }
+                // (v265) Un autre site demandé : son onglet y va.
+                if let Some(url) = c.change.take().filter(|_| c.opened) {
+                    b.send(&format!("open {} {url}", c.bid));
                 }
                 let fps = if tab.panel_open { tab.fps_sent.max(FPS_NEAR) } else { FPS_HIDDEN };
                 if c.opened && fps != c.fps_sent {
@@ -1252,7 +1309,7 @@ impl Displays {
                 if c.opened {
                     fermees.push(c.bid);
                 }
-                tab.cote_url = Some(c.url.clone());
+                tab.cote_urls.insert(c.site, c.url.clone());
                 tab.cote = None;
                 tab.dirty = true;
             }
@@ -1273,7 +1330,10 @@ impl Displays {
         let mut panneaux = Vec::new();
         for (id, tab) in self.tabs.iter_mut() {
             let sur_lecteur = crate::watch::is_player(&tab.addr);
-            let voulu = (tab.panel_open, tab.cote.as_ref().is_some_and(|c| c.voulue));
+            let voulu = (
+                tab.panel_open,
+                tab.cote.as_ref().filter(|c| c.voulue).map_or("", |c| c.site),
+            );
             if !tab.opened || !sur_lecteur || tab.panel_page == Some(voulu) {
                 continue;
             }
@@ -1287,7 +1347,7 @@ impl Displays {
             self.eval(
                 id,
                 &format!(
-                    "(()=>{{if(window.__mlb&&window.__mlb.panneau)window.__mlb.panneau({o},{r});}})()"
+                    "(()=>{{if(window.__mlb&&window.__mlb.panneau)window.__mlb.panneau({o},'{r}');}})()"
                 ),
             );
         }
@@ -1413,13 +1473,13 @@ impl Displays {
                         Event::Blocked(raison) => self.blocked.push((id, raison)),
                         // (v257) Le bouton de la file : la recherche à côté, ici même.
                         Event::Ordre(o) => match ordre_recherche(&o) {
-                            Some(on) => recherches.push((id, on)),
+                            Some(site) => recherches.push((id, site)),
                             None => self.orders.push((id, o, false)),
                         },
                     }
                 }
-                for (id, on) in recherches {
-                    self.recherche(id, on);
+                for (id, site) in recherches {
+                    self.recherche(id, site);
                 }
             }
         }
@@ -1584,6 +1644,10 @@ impl Panneau {
 struct Cote {
     /// Numéro de son onglet dans le navigateur.
     bid: u32,
+    /// (v265) Le site où l'on cherche (`yt`, `dm`, `vm`), et une page à ouvrir dans son onglet
+    /// (on vient d'en changer).
+    site: &'static str,
+    change: Option<String>,
     /// Voulue ouverte (« Fermer la recherche » la met à faux), et depuis quand elle ne
     /// l'est plus.
     voulue: bool,
@@ -1607,9 +1671,11 @@ struct Cote {
 }
 
 impl Cote {
-    fn new(bid: u32, url: &str) -> Self {
+    fn new(bid: u32, site: &'static str, url: &str) -> Self {
         Self {
             bid,
+            site,
+            change: None,
             voulue: true,
             fermee: 0.0,
             url: url.to_string(),
@@ -1798,13 +1864,13 @@ struct Tab {
     /// dit montrer, dernier ordre envoyé et depuis quand.
     panneau: Panneau,
     panel_open: bool,
-    panel_page: Option<(bool, bool)>,
-    panel_sent: Option<(bool, bool)>,
+    panel_page: Option<(bool, &'static str)>,
+    panel_sent: Option<(bool, &'static str)>,
     panel_ago: f32,
     /// (v257) La recherche à côté, si elle est ouverte (ou en train de rentrer), et où elle
     /// en était quand elle a été fermée (rouverte là).
     cote: Option<Cote>,
-    cote_url: Option<String>,
+    cote_urls: std::collections::HashMap<&'static str, String>,
     /// (v257) Le trou de la recherche dans l'image affichée : colonnes `[x0, x1)` en pixels
     /// de page (le curseur y va à la recherche).
     trou: Option<(i32, i32)>,
@@ -1861,7 +1927,7 @@ impl Tab {
             panel_sent: None,
             panel_ago: 0.0,
             cote: None,
-            cote_url: None,
+            cote_urls: std::collections::HashMap::new(),
             trou: None,
             appui_cote: false,
             history: 0,
@@ -2953,7 +3019,7 @@ mod tests {
         t.addr = t.url.clone();
         t.page = px;
         t.page_size = (w as u32, h as u32);
-        let mut c = Cote::new(9, RECHERCHE_VIDEO);
+        let mut c = Cote::new(9, "yt", RECHERCHE_VIDEO);
         c.page = vec![7u8; 8 * h * 4];
         c.page_size = (8, h as u32);
         t.cote = Some(c);
@@ -2987,7 +3053,7 @@ mod tests {
         let mut t = Tab::new(&url);
         t.addr = url;
         d.tabs.insert(1, t);
-        d.recherche(1, true);
+        d.recherche(1, Some("yt"));
         let bid = d.tabs[&1].cote.as_ref().unwrap().bid;
         assert_ne!(bid, 1);
         let t = d.tabs.get_mut(&1).unwrap();
@@ -3009,17 +3075,20 @@ mod tests {
         assert_eq!(d.clavier(1), 1);
         // Fermée : elle rentre, puis son onglet est fermé ; rouverte là où elle en était.
         d.tabs.get_mut(&1).unwrap().cote.as_mut().unwrap().url = "https://www.youtube.com/results?search_query=x".into();
-        d.recherche(1, false);
+        d.recherche(1, None);
         d.update(0.2);
         assert!(d.tabs[&1].cote.is_some());
         d.update(COTE_FERME_S);
         assert!(d.tabs[&1].cote.is_none());
-        d.recherche(1, true);
+        d.recherche(1, Some("yt"));
         assert_eq!(d.tabs[&1].cote.as_ref().unwrap().url, "https://www.youtube.com/results?search_query=x");
-        assert_eq!(ordre_recherche(r#"{"recherche":true}"#), Some(true));
+        assert_eq!(ordre_recherche(r#"{"recherche":true}"#), Some(Some("yt")));
+        assert_eq!(ordre_recherche(r#"{"recherche":"dm"}"#), Some(Some("dm")));
+        assert_eq!(ordre_recherche(r#"{"recherche":false}"#), Some(None));
         assert_eq!(ordre_recherche(r#"{"clic":"dQw4w9WgXcQ"}"#), None);
-        assert_eq!(page_panel(r#"{"o":true,"r":true}"#), Some((true, true)));
-        assert_eq!(page_panel(r#"{"o":true}"#), Some((true, false)));
+        assert_eq!(page_panel(r#"{"o":true,"r":true}"#), Some((true, "yt")));
+        assert_eq!(page_panel(r#"{"o":true,"r":"vm"}"#), Some((true, "vm")));
+        assert_eq!(page_panel(r#"{"o":true}"#), Some((true, "")));
     }
 
     /// (v243) Entrée rend le clavier au jeu tout de suite, et le champ perd le focus un

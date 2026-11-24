@@ -506,6 +506,38 @@ pub fn vers_lecteur(url: &str) -> Option<String> {
     if parametre("mlb") == Some("site") {
         return None;
     }
+    // (v265) Vimeo et Dailymotion : leur vidéo au lecteur des écrans aussi (`vm:…`, `dm:…`).
+    let segs: Vec<&str> = chemin.split('/').filter(|s| !s.is_empty()).collect();
+    let hote_bas = hote.to_ascii_lowercase();
+    let autre = match hote_bas.as_str() {
+        "vimeo.com" | "www.vimeo.com" => match segs.as_slice() {
+            [n] | [n, _] if n.bytes().all(|b| b.is_ascii_digit()) => Some(format!("vm:{n}")),
+            ["channels", _, n] if n.bytes().all(|b| b.is_ascii_digit()) => Some(format!("vm:{n}")),
+            ["groups", _, "videos", n] if n.bytes().all(|b| b.is_ascii_digit()) => {
+                Some(format!("vm:{n}"))
+            }
+            _ => None,
+        },
+        "dailymotion.com" | "www.dailymotion.com" => match segs.as_slice() {
+            ["video", x] => Some(format!("dm:{x}")),
+            _ => None,
+        },
+        "dai.ly" => match segs.as_slice() {
+            [x] => Some(format!("dm:{x}")),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(v) = autre {
+        let ok = match v.split_once(':') {
+            Some(("vm", n)) => (1..=12).contains(&n.len()),
+            Some(("dm", x)) => {
+                (5..=12).contains(&x.len()) && x.bytes().all(|b| b.is_ascii_alphanumeric())
+            }
+            _ => false,
+        };
+        return ok.then(|| format!("{LECTEUR}?v={v}"));
+    }
     let id = match hote.to_ascii_lowercase().as_str() {
         "youtu.be" | "www.youtu.be" => chemin.split('/').next()?,
         "www.youtube.com" | "youtube.com" | "m.youtube.com" => {
@@ -648,6 +680,25 @@ mod tests {
         ] {
             assert_eq!(f.juge(non), Err(Refus::HorsBlanche), "{non}");
         }
+    }
+
+    /// (v265) Les vidéos de Vimeo et Dailymotion vont au lecteur aussi (en ligne).
+    #[test]
+    fn vimeo_et_dailymotion_au_lecteur() {
+        assert_eq!(vers_lecteur("https://vimeo.com/76979871"), Some(format!("{LECTEUR}?v=vm:76979871")));
+        assert_eq!(
+            vers_lecteur("https://vimeo.com/channels/staffpicks/76979871"),
+            Some(format!("{LECTEUR}?v=vm:76979871"))
+        );
+        assert_eq!(vers_lecteur("https://vimeo.com/76979871?mlb=site"), None);
+        assert_eq!(vers_lecteur("https://vimeo.com/search?q=x"), None);
+        assert_eq!(vers_lecteur("https://vimeo.com/showcase/123"), None);
+        assert_eq!(
+            vers_lecteur("https://www.dailymotion.com/video/x8abcde"),
+            Some(format!("{LECTEUR}?v=dm:x8abcde"))
+        );
+        assert_eq!(vers_lecteur("https://www.dailymotion.com/search/chat/videos"), None);
+        assert_eq!(vers_lecteur("https://dai.ly/x8abcde"), Some(format!("{LECTEUR}?v=dm:x8abcde")));
     }
 
     #[test]

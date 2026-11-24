@@ -14,7 +14,9 @@
 #[path = "../../../browser/src/filtre.rs"]
 #[allow(dead_code)]
 pub mod filtre;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod proto;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod scripts;
 #[path = "../../../browser/src/volume.rs"]
 #[allow(dead_code)]
