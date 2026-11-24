@@ -67,6 +67,9 @@ struct VOut {
     @location(7) @interpolate(flat) fade: f32,
     // (v254) Place depuis la caméra, exacte loin du centre du monde (voir world.wgsl).
     @location(8) rel: vec3<f32>,
+    // (v264) 1 : rectangle posé à plat même après l'anticrénelage (impact dans une vitre : la
+    // vitre n'est pas dans la profondeur du monde, rien à quoi coller la boîte).
+    @location(9) @interpolate(flat) plat: f32,
 };
 
 const KIND_SPLAT: f32 = 1.0;
@@ -97,11 +100,17 @@ fn place(vi: u32, d: Decal, view_proj: mat4x4<f32>, flat: bool) -> VOut {
     let n = d.nrm.xyz;
     let u = d.tan.xyz;
     let v = cross(n, u);
-    let k = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u)[vi % 6u];
+    // (v264) Le rectangle à plat est donné dans les deux sens (sommets 6 à 11 : l'ordre
+    // inverse) : la passe d'après l'anticrénelage écarte les faces avant, l'autre aucune.
+    var k = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u)[vi % 6u];
+    if flat && vi >= 6u {
+        k = array<u32, 6>(0u, 2u, 1u, 0u, 3u, 2u)[vi % 6u];
+    }
     let c = array<vec2<f32>, 4>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0))[k];
     var o: VOut;
+    o.plat = select(0.0, 1.0, flat);
     if flat {
-        if vi >= 6u {
+        if vi >= 12u {
             return hidden();
         }
         let p = d.at.xyz + u * (c.x * d.size.x) + v * (c.y * d.size.y);
@@ -153,7 +162,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, d: Decal) -> VOut {
 // Après l'anticrénelage (sans son tremblement) : la boîte.
 @vertex
 fn vs_post(@builtin(vertex_index) vi: u32, d: Decal) -> VOut {
-    return place(vi, d, g.cur_view_proj, false);
+    // (v264) Impact dans une vitre (sorte 4, matière 3) : à plat sur la vitre.
+    let glass = floor(d.at.w + 0.01) == KIND_HOLE && u32(fract(d.at.w) * 16.0 + 0.5) == 3u;
+    return place(vi, d, g.cur_view_proj, glass);
 }
 
 // ---------------------------------------------------------------- hasard
@@ -277,34 +288,124 @@ fn drip(uv: vec2<f32>, seed: f32, age: f32, aspect: f32) -> vec2<f32> {
 
 // ---------------------------------------------------------------- impacts et brûlures
 
-/// Impact de balle : un trou noir, un cratère aux bords découpés, la matière plus claire
-/// mise à nu autour, quelques fissures, un peu de poussière. Rend (facteur, part couverte).
-fn hole(uv: vec2<f32>, seed: f32) -> vec4<f32> {
-    let so = seeded(seed);
-    let r = length(uv);
-    let dir = uv / max(r, 1e-4);
-    let pit = 1.0 - smoothstep(0.17, 0.25 + 0.06 * vnoise(dir * 3.0 + so), r);
-    let rim = 0.40 + 0.24 * vnoise(dir * 2.5 + so * 1.7);
-    let crater = 1.0 - smoothstep(rim - 0.08, rim, r);
-    let chip = (1.0 - smoothstep(rim, rim + 0.16, r)) * (1.0 - crater) * step(0.45, vnoise(dir * 6.0 + so));
-    // Fissures : des traits fins qui partent du trou.
+/// Fissures fines qui partent du trou : `count` traits, de `start` à au plus `reach`.
+fn cracks(uv: vec2<f32>, so: vec2<f32>, seed: f32, count: i32, start: f32, reach: f32, thin: f32) -> f32 {
     var crack = 0.0;
-    for (var k = 0; k < 4; k++) {
+    for (var k = 0; k < count; k++) {
         let h = hash2(vec2<f32>(f32(k) * 7.3, seed * 3.1) + so);
-        let a = (f32(k) + h.x) * 1.5708;
+        let a = (f32(k) + h.x) * 6.2831853 / f32(count);
         let cd = vec2<f32>(cos(a), sin(a));
         let along = dot(uv, cd);
         let across = abs(dot(uv, vec2<f32>(-cd.y, cd.x)) + 0.03 * sin(along * 14.0 + h.y * 6.0));
-        let reach = 0.45 + 0.5 * h.y;
-        crack = max(crack, step(0.0, along) * (1.0 - smoothstep(reach * 0.6, reach, along)) * (1.0 - smoothstep(0.012, 0.03, across)));
+        let far = start + (reach - start) * (0.45 + 0.55 * h.y);
+        crack = max(crack, step(start * 0.7, along) * (1.0 - smoothstep(far * 0.7, far, along))
+            * (1.0 - smoothstep(thin, thin * 2.4, across)));
     }
-    let dust = (1.0 - smoothstep(0.45, 1.0, r)) * 0.14;
-    var f = vec3<f32>(1.0 - dust);
-    f = mix(f, vec3<f32>(1.22, 1.20, 1.16), chip * 0.8);
-    f = mix(f, vec3<f32>(0.42, 0.41, 0.40), crack * 0.8);
-    f = mix(f, vec3<f32>(0.25 + 0.3 * smoothstep(0.2, rim, r)), crater);
-    f = mix(f, vec3<f32>(0.06), pit);
-    return vec4<f32>(f, 1.0 - smoothstep(0.92, 1.0, r));
+    return crack;
+}
+
+/// Impact de balle (v264) : facteurs de clarté (1 : rien ; plus : plus clair), selon la matière
+/// touchée `mat` (0 pierre, 1 bois, 2 métal, 3 verre, 4 matière meuble). `sun` : d'où vient
+/// la lumière, dans le repère de la trace : la paroi d'un creux qui lui fait face est claire,
+/// celle d'en face dans l'ombre (le relief). `aspect` : largeur sur hauteur de la trace
+/// (celle du bois est allongée le long du fil, son axe u).
+fn hole(uv: vec2<f32>, seed: f32, mat: u32, sun: vec2<f32>, aspect: f32) -> vec4<f32> {
+    let so = seeded(seed);
+    var f = vec3<f32>(1.0);
+    var edge = length(uv);
+    if mat == 1u {
+        // Bois : un petit trou, le bois arraché en fuseau le long du fil (plus clair, en
+        // fibres), des fentes qui filent dans le fil.
+        let q = vec2<f32>(uv.x * aspect, uv.y);
+        let r = length(q);
+        let side = step(0.0, q.x);
+        let span = aspect * (0.55 + 0.35 * hash1(vec2<f32>(side * 3.7 + 1.0, seed) + so));
+        let t = clamp(abs(q.x) / span, 0.0, 1.0);
+        let fib = vnoise(vec2<f32>(q.x * 1.6, q.y * 15.0) + so);
+        let wide = 0.46 * (1.0 - pow(t, 1.4)) * (0.72 + 0.5 * fib);
+        let torn = (1.0 - smoothstep(wide * 0.8, wide + 0.02, abs(q.y))) * step(t, 0.999);
+        let pit = 1.0 - smoothstep(0.15, 0.24, r);
+        let gaps = step(fib, 0.26) * torn;
+        let split = (1.0 - smoothstep(0.012, 0.035, abs(q.y - 0.06 * sin(q.x * 3.0 + seed))))
+            * (1.0 - smoothstep(aspect * 0.75, aspect * 0.98, abs(q.x))) * step(span * 0.6, abs(q.x));
+        // Relief : le bord du haut ou du bas du fuseau, selon la lumière.
+        let lit = -sign(q.y) * sun.y * smoothstep(wide * 0.5, wide, abs(q.y));
+        f = mix(f, vec3<f32>(1.30, 1.21, 1.02) * (0.86 + 0.26 * fib) * (1.0 + 0.22 * lit), torn);
+        f = mix(f, vec3<f32>(0.52, 0.47, 0.40), gaps * 0.8);
+        f = mix(f, vec3<f32>(0.50), split * 0.75);
+        f = mix(f, vec3<f32>(0.07), pit);
+        edge = max(abs(uv.x), abs(uv.y));
+    } else if mat == 2u {
+        // Métal : un trou net, son bord mis à nu qui brille du côté de la lumière, la tôle
+        // enfoncée autour, noircie près du trou ; pas de fissure.
+        let r = length(uv);
+        let dir = uv / max(r, 1e-4);
+        let lit = -dot(dir, sun);
+        let pit = 1.0 - smoothstep(0.17, 0.21, r);
+        let bevel = (1.0 - smoothstep(0.28, 0.33, r)) * (1.0 - pit);
+        let dent = (1.0 - smoothstep(0.30, 0.70, r)) * (1.0 - pit) * (1.0 - bevel);
+        let soot = (1.0 - smoothstep(0.30, 0.52, r)) * (1.0 - pit) * (1.0 - bevel);
+        let scratch = step(0.72, vnoise(vec2<f32>(atan2(dir.y, dir.x) * 7.0, r * 3.0) + so)) * dent;
+        f = mix(f, vec3<f32>(1.0 + 0.30 * lit), dent);
+        f = mix(f, f * 0.74, soot);
+        f = mix(f, f * 1.16, scratch * 0.6);
+        f = mix(f, vec3<f32>(1.08 + 0.62 * lit), bevel);
+        f = mix(f, vec3<f32>(0.04), pit);
+    } else if mat == 3u {
+        // Verre : un petit trou, le verre broyé autour (dépoli : gris, piqué de points
+        // clairs), une étoile de fissures et des arcs entre elles. Une fissure est un trait
+        // sombre bordé de clair : elle se voit devant le ciel comme devant un mur sombre.
+        let r = length(uv);
+        let dir = uv / max(r, 1e-4);
+        let pit = 1.0 - smoothstep(0.05, 0.08, r);
+        let crush = (1.0 - smoothstep(0.12, 0.24 + 0.08 * vnoise(dir * 4.0 + so), r)) * (1.0 - pit);
+        let star = cracks(uv, so, seed, 9, 0.10, 0.98, 0.009);
+        let glow = cracks(uv, so, seed, 9, 0.10, 0.98, 0.026);
+        let ang = atan2(dir.y, dir.x);
+        let sector = hash1(vec2<f32>(floor((ang + 3.1415927) * 9.0 / 6.2831853), seed) + so);
+        let ring1 = (1.0 - smoothstep(0.008, 0.022, abs(r - (0.36 + 0.06 * sector)))) * step(0.45, sector);
+        let ring2 = (1.0 - smoothstep(0.008, 0.022, abs(r - (0.60 + 0.08 * sector)))) * step(sector, 0.40);
+        let arcs = max(ring1, ring2);
+        f = mix(f, vec3<f32>(1.32), glow * 0.55);
+        f = mix(f, vec3<f32>(0.55), max(star, arcs) * 0.85);
+        let grit = vnoise(uv * 24.0 + so);
+        f = mix(f, mix(vec3<f32>(0.66), vec3<f32>(1.45), step(0.62, grit)), crush);
+        f = mix(f, vec3<f32>(0.38), pit);
+    } else if mat == 4u {
+        // Terre, sable, laine, feuilles : un creux aux bords mous, quelques grains autour.
+        let r = length(uv);
+        let dir = uv / max(r, 1e-4);
+        let lit = -dot(dir, sun);
+        let rim = 0.34 + 0.12 * vnoise(dir * 2.5 + so);
+        let bowl = 1.0 - smoothstep(rim * 0.35, rim, r);
+        let wall = smoothstep(rim * 0.3, rim * 0.8, r) * (1.0 - smoothstep(rim * 0.8, rim * 1.15, r));
+        let grains = step(0.70, vnoise(uv * 13.0 + so)) * (1.0 - smoothstep(rim, 0.9, r)) * (1.0 - bowl);
+        f = mix(f, vec3<f32>(0.42 + 0.3 * smoothstep(0.0, rim, r)), bowl);
+        f = f * (1.0 + 0.22 * lit * wall);
+        f = mix(f, f * 0.84, grains);
+    } else {
+        // Pierre, béton, brique : un petit trou, l'éclat arraché autour (la matière fraîche,
+        // plus claire, en cuvette), quelques éclats partis à côté, des fissures courtes.
+        let r = length(uv);
+        let dir = uv / max(r, 1e-4);
+        let lit = -dot(dir, sun);
+        let rp = 0.13 + 0.03 * vnoise(dir * 3.0 + so);
+        let pit = 1.0 - smoothstep(rp, rp + 0.05, r);
+        let rim = 0.42 + 0.22 * vnoise(dir * 2.5 + so * 1.7);
+        let spall = (1.0 - smoothstep(rim - 0.03, rim, r)) * (1.0 - pit);
+        let chip = step(0.64, vnoise(uv * 7.0 + so * 3.0)) * (1.0 - smoothstep(rim, rim + 0.26, r))
+            * (1.0 - spall) * (1.0 - pit);
+        let hair = cracks(uv, so, seed, 3, rim * 0.8, rim + 0.42, 0.011) * (1.0 - spall) * (1.0 - pit);
+        // La cuvette : plus sombre au fond, claire au bord ; sa paroi prend la lumière.
+        let depth = smoothstep(rp, rim * 0.85, r);
+        let fresh = (0.80 + 0.40 * depth) * (0.93 + 0.14 * vnoise(uv * 11.0 + so));
+        let wall = smoothstep(rp, rim * 0.5, r) * (1.0 - smoothstep(rim * 0.7, rim, r)) + 0.35;
+        f = mix(f, vec3<f32>(1.13, 1.12, 1.09), chip * 0.75);
+        f = mix(f, vec3<f32>(0.52), hair * 0.8);
+        f = mix(f, vec3<f32>(fresh * 1.02, fresh, fresh * 0.97) * (1.0 + 0.30 * lit * wall), spall);
+        f = mix(f, vec3<f32>(0.06), pit);
+    }
+    return vec4<f32>(f, 1.0 - smoothstep(0.92, 1.0, edge));
 }
 
 /// Entaille du couteau : une saignée sombre effilée aux deux bouts, la matière éraflée
@@ -397,7 +498,14 @@ fn trace(i: VOut, uv: vec2<f32>, seen: f32) -> vec4<f32> {
         // Rien ne touche le bord de la boîte.
         cov = b.x * (0.80 + 0.20 * b.y) * (1.0 - smoothstep(0.9, 1.0, max(abs(uv.x), abs(uv.y))));
     } else if kind == KIND_HOLE {
-        let h = hole(uv, seed);
+        // (v264) La matière touchée (en seizièmes après la sorte), et d'où vient la lumière
+        // dans le repère de la trace (le soleil, toujours un peu d'en haut : le relief reste
+        // lisible la nuit et à l'intérieur).
+        let mat = u32(fract(i.at.w) * 16.0 + 0.5);
+        let lw = normalize(g.sun.xyz * 0.7 + vec3<f32>(0.0, 0.8, 0.0));
+        let t3 = i.tan.xyz;
+        let s2 = vec2<f32>(dot(lw, t3), dot(lw, cross(i.nrm.xyz, t3)));
+        let h = hole(uv, seed, mat, s2 / max(length(s2), 0.4), i.size.x / max(i.size.y, 1e-4));
         f = h.rgb;
         cov = h.a;
     } else if kind == KIND_SLASH {
@@ -438,6 +546,11 @@ fn fs_post(i: VOut) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(scene_depth));
     let px = clamp((i.ndc * vec2<f32>(0.5, -0.5) + 0.5) * dims, vec2<f32>(0.0), dims - 1.0);
     let depth = max(textureLoad(scene_depth, vec2<i32>(px), 0), 1e-7);
+    // (v264) Rectangle à plat (vitre) : il se voit si rien d'opaque n'est devant lui (la
+    // profondeur est inversée : plus grande, plus près).
+    if i.plat > 0.5 {
+        return trace(i, i.uv, step(depth, i.clip.z * 1.002));
+    }
     // (v254) Depuis la caméra (exact loin du centre du monde ; ses dérivées aussi).
     let o = g.cam_pos.xyz;
     let p = i.rel * (i.clip.z / depth);

@@ -31,6 +31,61 @@ const MAX_DROPS: usize = 700;
 /// Pesanteur des gouttes (blocs/s²), comme les étincelles et les objets lancés.
 const GRAVITY: f32 = 14.0;
 
+/// (v264) Matière d'une surface touchée par une balle (« rendre les impacts réalistes, même
+/// ceux sur les blocs ») : l'impact n'y a ni la même forme ni les mêmes éclats. Pierre (et
+/// béton, brique : le défaut), bois, métal, verre, matière meuble (terre, sable, laine,
+/// feuilles, neige).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matter {
+    Stone,
+    Wood,
+    Metal,
+    Glass,
+    Soft,
+}
+
+impl Matter {
+    /// D'après la clé du bloc (`BlockDef::key` : `stone`, `slab:planks_oak:top`…).
+    pub fn of_key(key: &str) -> Matter {
+        let has = |words: &[&str]| words.iter().any(|w| key.contains(w));
+        if has(&["glass", "pane", "ice"]) {
+            Matter::Glass
+        } else if has(&[
+            "iron", "gold", "copper", "anvil", "chain", "rail", "bars", "cauldron", "hopper",
+            "metal", "steel", "netherite", "bell",
+        ]) {
+            Matter::Metal
+        } else if has(&["sandstone", "concrete"]) && !key.contains("powder") {
+            Matter::Stone
+        } else if has(&[
+            "dirt", "grass", "sand", "gravel", "clay", "snow", "wool", "leaves", "moss", "mud",
+            "soul", "farmland", "hay", "carpet", "sponge", "podzol", "mycelium", "path",
+            "cactus", "melon", "pumpkin", "slime", "honey", "cake", "bed", "powder", "web",
+        ]) {
+            Matter::Soft
+        } else if has(&[
+            "planks", "log", "wood", "oak", "spruce", "birch", "jungle", "acacia", "mangrove",
+            "cherry", "bamboo", "crimson", "warped", "door", "fence", "chest", "barrel",
+            "bookshelf", "crafting", "ladder", "sign", "stem", "table",
+        ]) {
+            Matter::Wood
+        } else {
+            Matter::Stone
+        }
+    }
+
+    /// Numéro de la matière pour la carte graphique (`hole` de decal.wgsl).
+    fn code(self) -> f32 {
+        match self {
+            Matter::Stone => 0.0,
+            Matter::Wood => 1.0,
+            Matter::Metal => 2.0,
+            Matter::Glass => 3.0,
+            Matter::Soft => 4.0,
+        }
+    }
+}
+
 /// Une goutte de sang en vol.
 #[derive(Clone, Copy, Debug)]
 pub struct Drop {
@@ -157,21 +212,52 @@ impl Traces {
         self.pushed += 1;
     }
 
-    /// Impact de balle en `at`, sur une surface de normale `n`.
-    pub fn hole(&mut self, at: Vec3, n: Vec3) {
-        let half = 0.075 * (1.0 + 0.15 * self.rnd());
+    /// Impact de balle en `at`, sur une surface de normale `n`. (v264) Selon la matière du
+    /// bloc touché (`Matter`), qu'il rend : éclat clair et fissures dans la pierre, bois
+    /// arraché le long du fil, trou net au bord brillant dans le métal, étoile de fissures
+    /// dans le verre, simple creux dans la terre.
+    pub fn hole(&mut self, world: &World, at: Vec3, n: Vec3) -> Matter {
+        let cell = (at - n * 0.02).floor();
+        let id = world.get(cell.x as i32, cell.y as i32, cell.z as i32);
+        let key = &minelib_world::registry::registry().get(id).key;
+        let matter = Matter::of_key(key);
         let (seed, angle) = (self.unit() * 900.0, self.rnd() * std::f32::consts::PI);
+        let vary = 1.0 + 0.15 * self.rnd();
+        let (size, tan) = match matter {
+            Matter::Stone => ([0.085 * vary; 2], tangent(n, angle)),
+            Matter::Wood => {
+                // L'axe u de la trace suit le fil du bois : debout pour un tronc, une porte,
+                // une barrière ; couché pour les planches.
+                let upright = ["log", "stem", "door", "fence", "ladder", "sign"]
+                    .iter()
+                    .any(|w| key.contains(w));
+                let wall = n.y.abs() < 0.9;
+                let grain = if wall && upright {
+                    Vec3::Y
+                } else if wall {
+                    Vec3::Y.cross(n).normalize_or(Vec3::X)
+                } else {
+                    Vec3::X
+                };
+                ([0.095 * vary, 0.045 * vary], grain)
+            }
+            Matter::Metal => ([0.05 * vary; 2], tangent(n, angle)),
+            Matter::Glass => ([0.17 * vary; 2], tangent(n, angle)),
+            Matter::Soft => ([0.06 * vary; 2], tangent(n, angle)),
+        };
         self.push(Decal {
             pos: at.to_array(),
-            kind: KIND_HOLE,
+            // La matière : en seizièmes, après la sorte (comme les côtés du sol brûlé).
+            kind: KIND_HOLE + matter.code() / 16.0,
             normal: n.to_array(),
             seed,
-            tangent: tangent(n, angle).to_array(),
+            tangent: tan.to_array(),
             born: self.clock,
-            size: [half, half],
+            size,
             depth: 0.05,
             force: 1.0,
         });
+        matter
     }
 
     /// Entaille du couteau en `at`.
@@ -577,13 +663,46 @@ mod tests {
         assert!(far.list().0.is_empty() && !far.drops().is_empty());
     }
 
+    /// (v264) La matière d'un bloc d'après sa clé : l'impact d'une balle en dépend.
+    #[test]
+    fn the_impact_depends_on_what_the_block_is_made_of() {
+        for (key, m) in [
+            ("stone", Matter::Stone),
+            ("bricks", Matter::Stone),
+            ("sandstone", Matter::Stone),
+            ("concrete_white", Matter::Stone),
+            ("concrete_powder_white", Matter::Soft),
+            ("slab:planks_oak:top", Matter::Wood),
+            ("log_oak", Matter::Wood),
+            ("leaves_oak", Matter::Soft),
+            ("iron_block", Matter::Metal),
+            ("door_iron", Matter::Metal),
+            ("door_oak", Matter::Wood),
+            ("glass", Matter::Glass),
+            ("glass_pane", Matter::Glass),
+            ("sand", Matter::Soft),
+            ("wool_red", Matter::Soft),
+            ("grass", Matter::Soft),
+        ] {
+            assert_eq!(Matter::of_key(key), m, "{key}");
+        }
+        // La matière part avec la trace (en seizièmes après la sorte), et la trace d'un
+        // impact dans le bois est allongée.
+        let w = room();
+        let mut t = Traces::default();
+        let m = t.hole(&w, Vec3::new(5.0, 11.0, 5.0), Vec3::Y);
+        let d = t.list().0[0];
+        assert_eq!(d.kind.floor(), KIND_HOLE);
+        assert!(((d.kind - KIND_HOLE) * 16.0 - m.code()).abs() < 1e-3);
+    }
+
     /// Impacts, entailles, suie et sol brûlé : posés sur leur surface, gardés, et au plus
     /// `MAX_DECALS` à la fois (les plus vieux s'en vont).
     #[test]
     fn impacts_and_grenade_marks_are_kept_up_to_the_cap() {
         let w = room();
         let mut t = Traces::default();
-        t.hole(Vec3::new(5.0, 11.0, 5.0), Vec3::Y);
+        t.hole(&w, Vec3::new(5.0, 11.0, 5.0), Vec3::Y);
         t.slash(Vec3::new(12.0, 13.0, 5.0), Vec3::NEG_X);
         assert_eq!((t.count(KIND_HOLE), t.count(KIND_SLASH)), (1, 1));
         for d in t.list().0 {
@@ -608,7 +727,7 @@ mod tests {
         assert_eq!(t.count(KIND_BURN), 2);
         // Le plafond.
         for k in 0..MAX_DECALS * 2 {
-            t.hole(Vec3::new(5.0 + (k % 7) as f32 * 0.1, 11.0, 5.0), Vec3::Y);
+            t.hole(&w, Vec3::new(5.0 + (k % 7) as f32 * 0.1, 11.0, 5.0), Vec3::Y);
         }
         assert!(t.list().0.len() <= MAX_DECALS);
         assert!(t.list().0.len() > MAX_DECALS * 3 / 4);

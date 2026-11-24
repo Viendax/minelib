@@ -116,25 +116,27 @@ fn m_rot_y(a: f32) -> mat4x4<f32> {
 // (v234) Tête agrandie de 7,5 % (4,8375 pixels), le reste du corps réduit d'autant pour
 // garder 32 pixels de haut : les valeurs de la v225 fois 27,1625 / 27,5
 // (`player_model::BODY_K`).
-const LEG: f32 = 14.815909;
+// (v264) Tête de 4 colonnes du skin du corps (3,6129 pixels), le corps agrandi pour garder
+// 32 pixels : les valeurs de la v225 fois 32 / 31.
+const LEG: f32 = 15.483871;
 // (v256) Jambes écartées (trois colonnes du skin de large, 0,8 pixel entre elles).
-const LEG_X: f32 = 1.696392;
+const LEG_X: f32 = 1.754839;
 // (v256) Épaule placée pour que le bras écarté de `ARM_SPLAY` (6°) ne touche la poitrine
 // que par le coin du haut.
-const SHOULDER_Y: f32 = 10.769500;
-const ARM_X: f32 = 4.988410;
+const SHOULDER_Y: f32 = 11.255033;
+const ARM_X: f32 = 5.213308;
 const ARM_SPLAY: f32 = 0.104720;
-const BODY_H: f32 = 12.346591;
+const BODY_H: f32 = 12.903226;
 // (v260) Hauteur du ventre (le bas du corps : 5 rangées du skin sur 12) et demi-profondeur du
 // corps : le dos se plie à la taille, autour du bord arrière du haut du ventre.
-const BELLY_H: f32 = 5.144413;
-const HALF_D: f32 = 1.728523;
+const BELLY_H: f32 = 5.376344;
+const HALF_D: f32 = 1.806452;
 // (v260) Accroupi : penche du ventre, pli du dos à la taille (la poitrine est penchée de leur
 // somme) et tassement des hanches (pixels) ; `player_model::crouch_lean`. (v247) La tête
 // accroupie reste dans la boîte de 1,5 bloc.
 const CROUCH_BELLY_LEAN: f32 = 0.3248;
 const CROUCH_BEND: f32 = 0.25;
-const CROUCH_HIP_DROP: f32 = 4.266;
+const CROUCH_HIP_DROP: f32 = 4.837;
 // (v225) Foudre de Zeus : le bras droit levé (radians), `player_model::ZEUS_RAISE`.
 const ZEUS_RAISE: f32 = 1.15;
 // (v239) Objet tenu en construction : le bras droit pointé plus bas que le regard (radians),

@@ -356,6 +356,10 @@ pub struct Session {
     heads: Option<crate::heads::Heads>,
     /// Dernière fois que les skins des têtes de joueurs ont été redemandés au relais.
     head_skins_at: Option<std::time::Instant>,
+    /// (v264) Plaies des joueurs de la partie FPS (« un impact dans le joueur ») : par pseudo
+    /// (vide : le joueur local), jusqu'à sa mort ou la fin de la manche, comme les traces sur
+    /// les blocs. Dessinées sur son modèle (`player_model::wound_model`).
+    wounds: HashMap<String, Vec<crate::player_model::Wound>>,
     /// (v256) Tenue d'équipe du joueur local en partie FPS (équipe, quand elle a été
     /// cherchée, skin), relue de temps en temps (`worn_skin`).
     #[allow(clippy::type_complexity)]
@@ -781,6 +785,12 @@ impl Session {
             heads: None,
             head_skins_at: None,
             team_skin: Default::default(),
+            // Essais : MINELIB_PLAIES=1 pose d'avance des plaies sur le joueur local.
+            wounds: if std::env::var_os("MINELIB_PLAIES").is_some() {
+                HashMap::from([(String::new(), crate::player_model::test_wounds())])
+            } else {
+                HashMap::new()
+            },
             probe_split: HashMap::new(),
             fps_elements: None,
             frames: None,
@@ -6124,6 +6134,8 @@ impl Session {
         self.net = None;
         self.net_dead = false;
         self.fps.online = None;
+        // (v264) La partie quittée : plus de plaies.
+        self.wounds.clear();
         self.fps.hp = 100;
         self.feed.clear();
         self.banner = None;
@@ -6307,6 +6319,8 @@ impl Session {
         self.net = None;
         self.net_dead = false;
         self.fps.online = None;
+        // (v264) La partie quittée : plus de plaies.
+        self.wounds.clear();
         self.fps.hp = 100;
         self.feed.clear();
         self.banner = None;
@@ -6832,11 +6846,20 @@ impl Session {
         // lui.
         let online = self.ranked_match();
         let build_match = self.in_build_match();
+        // (v264) Les plaies d'un joueur mort (ou parti) s'en vont avec lui.
+        if let (false, Some(n)) = (self.wounds.is_empty(), &self.net) {
+            let views = n.views();
+            self.wounds
+                .retain(|k, _| k.is_empty() || views.iter().any(|v| v.alive && v.pseudo == *k));
+        }
         for l in locals {
             match l {
                 Local::SetHp(hp) => {
                     if hp < self.fps.hp {
                         self.hurt = 0.35;
+                    }
+                    if hp == 0 {
+                        self.wounds.remove("");
                     }
                     self.fps.hp = hp;
                     if hp == 0 && !self.net_dead {
@@ -6857,6 +6880,12 @@ impl Session {
                         .as_ref()
                         .is_some_and(|n| n.hud().phase == minelib_net::game::phase::WARMUP);
                     self.fps.new_round(reset, team, !warmup);
+                    // (v264) Ses plaies s'en vont avec lui ; nouvelle manche : celles de tous.
+                    if warmup {
+                        self.wounds.remove("");
+                    } else {
+                        self.wounds.clear();
+                    }
                     // (v209) Nouvelle manche : plus aucun adversaire repéré.
                     self.spotting.clear();
                     self.net_dead = false;
@@ -6945,6 +6974,7 @@ impl Session {
                     let knife = weapon >= crate::netgame::KNIFE_HEAVY;
                     for h in hits {
                         self.fps.blood_at(h, pos, knife, eye, &self.world);
+                        self.wound_at(h, pos, knife);
                     }
                 }
                 Local::Step(pos, kind) => {
@@ -10268,6 +10298,54 @@ impl Session {
         });
     }
 
+    /// (v264) « Un impact dans le joueur » : le coup qui touche en `hit` (monde), tiré de
+    /// `from`, laisse une plaie sur le corps du joueur de la partie le plus proche de ce point
+    /// (le joueur local compris), sur le pavé de son modèle qui s'y trouve. Douze au plus par
+    /// joueur (les plus vieilles s'en vont).
+    fn wound_at(&mut self, hit: Vec3, from: Vec3, knife: bool) {
+        use crate::player_model::{Held, Pose};
+        let Some(n) = &self.net else { return };
+        let pose = |feet: Vec3, yaw: f32, pitch: f32, crouch: f32, weapon: u8| Pose {
+            feet,
+            yaw,
+            pitch,
+            walk: 0.0,
+            swing: 0.0,
+            crouch,
+            light: [1.0; 3],
+            held: Some(Held::Gear(weapon)),
+            skin: None,
+        };
+        let near = |feet: Vec3| (feet + Vec3::Y * 0.9).distance_squared(hit);
+        let mut best: Option<(f32, String, Pose)> = None;
+        let me = &self.player;
+        // Pas le tireur lui-même (le coup part de ses yeux).
+        if self.game.mode == GameMode::Fps && me.eye().distance(from) > 0.8 {
+            let p = pose(me.pos, me.yaw, me.pitch, me.crouch, self.fps.held_weapon());
+            best = Some((near(me.pos), String::new(), p));
+        }
+        for v in n.views().iter().filter(|v| v.alive) {
+            let d = near(v.pos);
+            let shooter = (v.pos + Vec3::Y * 1.5).distance(from) < 0.8;
+            if !shooter && best.as_ref().is_none_or(|b| d < b.0) {
+                let p = pose(v.pos, v.yaw, v.pitch, v.crouch, v.weapon);
+                best = Some((d, v.pseudo.clone(), p));
+            }
+        }
+        let Some((d, who, pose)) = best else { return };
+        if d > 2.0 * 2.0 {
+            return;
+        }
+        let seed = (hit.x * 977.0 + hit.y * 613.0 + hit.z * 331.0).to_bits() ^ 0x5bd1_e995;
+        if let Some(w) = crate::player_model::wound_at(&pose, hit, from, knife, seed) {
+            let list = self.wounds.entry(who).or_default();
+            if list.len() >= 12 {
+                list.remove(0);
+            }
+            list.push(w);
+        }
+    }
+
     /// (v256) Skin que porte le joueur local : le sien ; en partie FPS, la tenue de son
     /// équipe, la même que celle que les autres lui voient (`Skins::worn`).
     fn worn_skin(&self) -> Option<std::sync::Arc<crate::skin::Skin>> {
@@ -10368,7 +10446,12 @@ impl Session {
         };
         let visible = self.game.mode != GameMode::Spectator;
         let mut model = if third != 0 && visible {
-            crate::player_model::build(&pose)
+            let mut m = crate::player_model::build(&pose);
+            // (v264) Ses plaies (partie FPS), sur son corps.
+            if let Some(w) = self.wounds.get("") {
+                m.extend(crate::player_model::wound_model(&pose, w));
+            }
+            m
         } else {
             Vec::new()
         };
@@ -10478,6 +10561,12 @@ impl Session {
                 // (v177) Le modèle de son arme de près, sa silhouette de loin.
                 let near = v.pos.distance_squared(cam) < GEAR_DETAIL * GEAR_DETAIL;
                 model.extend(crate::player_model::held_model(&other, near));
+                // (v264) Ses plaies, sur son corps (pas de trop loin : 40 blocs).
+                if let Some(w) = self.wounds.get(&v.pseudo) {
+                    if v.pos.distance_squared(cam) < 40.0 * 40.0 {
+                        model.extend(crate::player_model::wound_model(&other, w));
+                    }
+                }
                 // (v179) La bombe sur le dos de celui qui la porte (pas dans ses mains),
                 // debout contre son dos.
                 if v.flags & minelib_net::game::FLAG_BOMB != 0 && v.weapon != crate::cs::W_BOMB {

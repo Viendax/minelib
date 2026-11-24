@@ -410,10 +410,19 @@ const ZEUS_RAISE: f32 = 1.15;
 // reste (jambes, corps, bras, en hauteur comme en largeur) est réduit d'un même facteur
 // (`BODY_K`), pour garder 32 pixels de haut.
 
-/// Côté de la tête (un cube, sur le cou : en haut, à 32 pixels) : 4,5 en v225, +7,5 %.
-const HEAD_S: f32 = 4.5 * 1.075;
+// (v264) Demande du 24 novembre : la tête d'un personnage de CS ramenée à notre taille est un
+// ovale de 0,165 × 0,24 bloc ; « si l'ovale était transformé en rond et qu'on prenait le carré
+// qui colle à ce rond, arrondi pour que ça colle à la grille de pixels du skin, vers le côté
+// le plus proche ». Le rond de même surface fait 0,199 bloc ; le carré autour, calé sur la
+// grille du skin du corps, 4 colonnes : 0,203 bloc (3 en feraient 0,152, 5 feraient 0,254). La
+// tête fait donc la moitié de la largeur de la poitrine et la profondeur du corps, et un
+// pixel du visage vaut un demi-pixel du corps. Le corps grandit pour garder 32 pixels.
+/// Côté de la tête (un cube, sur le cou : en haut, à 32 pixels) : 4,5 en v225, +7,5 % en
+/// v234 ; (v264) 4 colonnes du skin du corps (`COL`), soit 3,5 × `BODY_K`.
+const HEAD_S: f32 = 3.5 * BODY_K;
 /// (v234) Facteur du reste du corps par rapport à la v225 (27,5 pixels sous la tête).
-const BODY_K: f32 = (32.0 - HEAD_S) / 27.5;
+/// (v264) Tel que la tête (3,5 × ce facteur) et le corps fassent 32 pixels : 32/31.
+const BODY_K: f32 = 32.0 / 31.0;
 /// Hauteur d'une jambe (pixels) : la hanche est à cette hauteur quand on est debout.
 const LEG: f32 = 15.0 * BODY_K;
 /// Profondeur d'une jambe : les quatre colonnes de son skin.
@@ -479,13 +488,15 @@ pub const HEAD_BLOCKS: f32 = HEAD_S * PX;
 /// (v225) Épaisseur d'un bras par rapport à sa longueur (le bras à la première personne a
 /// les mêmes proportions, `hand::ARM_THICK`).
 pub const ARM_RATIO: f32 = ARM_W / (ARM_UP + ARM_DOWN);
-// Debout : 32 pixels (1,8 bloc), la tête en haut (v234 : 7,5 % de plus qu'en v225, un peu
-// plus d'un septième de la hauteur), le poing au-dessus de la hanche.
+// Debout : 32 pixels (1,8 bloc), la tête en haut (v264 : 4 colonnes du skin du corps, la
+// profondeur du corps, un peu moins d'un neuvième de la hauteur), le poing au-dessus de la
+// hanche.
 const _: () = assert!(
     (NECK_Y + HEAD_S - 32.0).abs() < 1e-4
         && SHOULDER_Y - ARM_DOWN > 0.0
-        && (HEAD_S / 4.5 - 1.075).abs() < 1e-5
-        && (HEAD_BLOCKS / 1.8 - 1.0 / 6.615).abs() < 0.001
+        && (HEAD_S - 4.0 * COL).abs() < 1e-5
+        && (HEAD_S - BODY_D).abs() < 1e-5
+        && (HEAD_BLOCKS / 1.8 - 1.0 / 8.857).abs() < 0.001
 );
 
 /// Posture accroupie (`crouch` de 0 à 1). (v260) « Plie légèrement le dos quand on sneak » :
@@ -552,7 +563,9 @@ pub const CROUCH_BEND: f32 = 0.25;
 /// arrive à 1,8 (1,83 aux coins la tête penchée : rien ne passe sous 1,8 bloc debout). La même
 /// dans `part_matrix` (players.wgsl). (v260) 4,266 : le dos plié raccourcit le haut du corps
 /// (du cou aux hanches) ; les hanches descendent d'autant moins, la tête reste à sa hauteur.
-pub const CROUCH_HIP_DROP: f32 = 4.266;
+/// (v264) 4,837 : la tête est plus petite et le corps plus grand ; accroupi, le milieu de la
+/// tête reste à la hauteur des yeux (1,32), son haut à 1,42 (1,45 aux coins, la tête penchée).
+pub const CROUCH_HIP_DROP: f32 = 4.837;
 
 /// (v234) Tête du modèle accroupi de `crouch` (0 à 1) : de combien elle avance vers le regard
 /// et la hauteur de son bas au-dessus des pieds (blocs). Sa boîte des coups en partie FPS
@@ -1998,6 +2011,210 @@ pub fn chest_point(feet: Vec3, yaw: f32, crouch: f32) -> Vec3 {
     upper.transform_point3(Vec3::new(0.0, BODY_H * 0.6, 0.0))
 }
 
+/// (v264) Plaie qu'un coup laisse sur le corps d'un joueur en partie FPS (« un impact dans le
+/// joueur ») : le pavé touché (numéro de `parts`), sa face (ordre de `box_faces`), la place de
+/// la plaie sur cette face (pixels du pavé : x ou z, puis y ou z) et sa graine (chaque plaie a
+/// sa forme). `knife` : une entaille de lame, sinon un trou de balle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Wound {
+    part: u8,
+    face: u8,
+    at: [f32; 2],
+    seed: u32,
+    knife: bool,
+}
+
+/// Axes d'une face de pavé (ordre de `box_faces` : devant, derrière, côté +x, côté −x,
+/// dessus, dessous) : l'axe qui sort de la face (0 x, 1 y, 2 z) et son sens, puis les deux
+/// axes dans la face (le second : la hauteur pour les quatre faces debout).
+const WOUND_FACES: [(usize, f32, usize, usize); 6] = [
+    (2, -1.0, 0, 1),
+    (2, 1.0, 0, 1),
+    (0, 1.0, 2, 1),
+    (0, -1.0, 2, 1),
+    (1, 1.0, 0, 2),
+    (1, -1.0, 0, 2),
+];
+
+/// Côté d'un carré de plaie (pixels du modèle) : un demi-pixel du skin (2,4 cm).
+const WOUND_CELL: f32 = COL * 0.5;
+
+/// (v264) Plaie au point `hit` (monde) du joueur dans la pose `pose`, touché depuis `from` :
+/// sur le pavé du modèle le plus proche du point, sur sa face tournée vers le tireur. Le
+/// point vient de l'hôte, compté sur le joueur tel qu'il était au moment du tir : `None` s'il
+/// est maintenant à plus de 0,6 bloc de tous ses pavés.
+pub fn wound_at(pose: &Pose, hit: Vec3, from: Vec3, knife: bool, seed: u32) -> Option<Wound> {
+    let mut best: Option<(f32, usize, Mat4, Vec3)> = None;
+    for (i, (xf, min, max, _)) in parts(pose).into_iter().enumerate() {
+        let inv = xf.inverse();
+        let c = inv
+            .transform_point3(hit)
+            .clamp(Vec3::from(min), Vec3::from(max));
+        let d = xf.transform_point3(c).distance(hit);
+        if best.as_ref().is_none_or(|b| d < b.0) {
+            best = Some((d, i, inv, c));
+        }
+    }
+    let (d, part, inv, c) = best?;
+    if d > 0.6 {
+        return None;
+    }
+    let (min, max) = (Vec3::from(PARTS[part].0), Vec3::from(PARTS[part].1));
+    // Vers le tireur, dans le repère du pavé.
+    let to = inv.transform_vector3(from - hit).normalize_or_zero();
+    let (face, _) = WOUND_FACES
+        .iter()
+        .enumerate()
+        .map(|(f, &(axis, sign, _, _))| {
+            // La face qui regarde le tireur, de préférence celle dont le point est proche.
+            let plane = if sign > 0.0 { max[axis] } else { min[axis] };
+            (f, to[axis] * sign - 0.2 * (c[axis] - plane).abs())
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let (_, _, a, b) = WOUND_FACES[face];
+    Some(Wound {
+        part: part as u8,
+        face: face as u8,
+        at: [c[a], c[b]],
+        seed,
+        knife,
+    })
+}
+
+/// (v264) Essais (MINELIB_PLAIES) : des plaies posées d'avance sur le joueur local, de face
+/// et de dos (poitrine, ventre, jambes, bras, tête ; une entaille).
+pub fn test_wounds() -> Vec<Wound> {
+    let w = |part: usize, face: u8, a: f32, b: f32, seed: u32, knife: bool| Wound {
+        part: part as u8,
+        face,
+        at: [a, b],
+        seed,
+        knife,
+    };
+    vec![
+        w(CHEST, 0, 1.2, BODY_H - 3.0, 11, false),
+        w(CHEST, 0, -1.8, BODY_H - 5.2, 23, true),
+        w(BELLY, 0, -0.6, 3.0, 37, false),
+        w(0, 0, 0.2, -5.0, 41, false),
+        w(1, 0, -0.3, -9.0, 59, false),
+        w(4, 0, 0.3, -2.0, 61, false),
+        w(5, 0, 1.0, 1.4, 67, false),
+        w(CHEST, 1, 0.8, BODY_H - 2.5, 71, false),
+        w(BELLY, 1, 0.5, 2.0, 83, false),
+        w(1, 1, 0.2, -4.0, 97, true),
+    ]
+}
+
+/// (v264) Carrés d'une plaie : (colonne, rangée vers le bas, couleur sRGB). Un trou de balle :
+/// le trou presque noir, sa couronne sombre, le sang autour (jamais deux fois la même tache)
+/// et une coulure ; une entaille : un trait en biais.
+fn wound_cells(w: &Wound) -> Vec<(i32, i32, u32)> {
+    const CORE: u32 = 0x1a0303;
+    const RING: u32 = 0x470707;
+    const BLOOD: u32 = 0x760e0e;
+    const DRIP: u32 = 0x640b0b;
+    let h = |k: u32| (w.seed ^ k.wrapping_mul(0x9e37_79b9)).wrapping_mul(0x85eb_ca6b) >> 13;
+    let mut cells = Vec::with_capacity(24);
+    if w.knife {
+        let slope = if h(1) & 1 == 0 { 1 } else { -1 };
+        for k in -3i32..=3 {
+            let c = if k.abs() <= 1 { CORE } else { RING };
+            cells.push((k, k * slope, c));
+            if h((k + 13) as u32) % 3 != 0 {
+                cells.push((k, k * slope + 1, BLOOD));
+            }
+        }
+    } else {
+        // Le sang d'abord (dessous), puis la couronne et le trou.
+        for (n, (i, j)) in [
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+            (-2, 0),
+            (2, 0),
+            (0, -2),
+            (0, 2),
+            (-2, 1),
+            (2, 1),
+            (-1, 2),
+            (1, 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if h(20 + n as u32) % 5 < 3 {
+                cells.push((i, j, BLOOD));
+            }
+        }
+        for (i, j) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            cells.push((i, j, RING));
+        }
+        cells.push((0, 0, CORE));
+    }
+    // Coulure : sur les faces debout seulement.
+    if w.face < 4 {
+        let col = (h(3) % 3) as i32 - 1;
+        for j in 2..4 + (h(4) % 4) as i32 {
+            cells.push((col, j, DRIP));
+        }
+    }
+    cells
+}
+
+/// (v264) Triangles des plaies d'un joueur dans cette pose : chaque plaie suit son pavé (un
+/// bras, une jambe qui bouge), posée juste au-dessus de sa face et coupée à ses bords.
+pub fn wound_model(pose: &Pose, wounds: &[Wound]) -> Vec<EntityVertex> {
+    let mut out = Vec::with_capacity(wounds.len() * 96);
+    if wounds.is_empty() {
+        return out;
+    }
+    let parts = parts(pose);
+    let lit = EntityVertex::light(pose.light, true);
+    for w in wounds {
+        let Some(&(xf, min, max, _)) = parts.get(w.part as usize) else {
+            continue;
+        };
+        let (axis, sign, a, b) = WOUND_FACES[w.face.min(5) as usize];
+        // Juste au-dessus de la face (0,04 pixel : 2 mm).
+        let plane = if sign > 0.0 { max[axis] } else { min[axis] } + sign * 0.04;
+        let mut n = Vec3::ZERO;
+        n[axis] = sign;
+        let shade = face_shade(xf.transform_vector3(n).normalize_or_zero());
+        for (i, j, rgb) in wound_cells(w) {
+            let s = WOUND_CELL;
+            // La rangée descend : vers −y sur les faces debout.
+            let (ca, cb) = (w.at[0] + i as f32 * s, w.at[1] - j as f32 * s);
+            let (a0, a1) = ((ca - s / 2.0).max(min[a]), (ca + s / 2.0).min(max[a]));
+            let (b0, b1) = ((cb - s / 2.0).max(min[b]), (cb + s / 2.0).min(max[b]));
+            if a1 - a0 < 0.02 || b1 - b0 < 0.02 {
+                continue;
+            }
+            let c = srgb(rgb);
+            let g = grain((w.seed as usize & 0xffff) + (i * 7 + j * 13) as usize % 64);
+            let color = [0, 1, 2].map(|k| c[k] * shade * g);
+            let at = |pa: f32, pb: f32| {
+                let mut p = Vec3::ZERO;
+                p[axis] = plane;
+                p[a] = pa;
+                p[b] = pb;
+                xf.transform_point3(p)
+            };
+            let (p0, p1, p2, p3) = (at(a0, b0), at(a1, b0), at(a1, b1), at(a0, b1));
+            for q in [p0, p1, p2, p2, p3, p0] {
+                out.push(EntityVertex {
+                    pos: q.to_array(),
+                    color,
+                    uv: [0.0; 2],
+                    layer: -1,
+                    light: lit,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// (v256) Partie du corps touchée par une balle en partie FPS (`hit_boxes`) : les dégâts en
 /// dépendent (`netgame::damage_at`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2499,17 +2716,80 @@ mod tests {
             let hand = xf.transform_point3(Vec3::new(inner, mn[1], 0.0));
             assert!(hand.x * sign > (BODY_W / 2.0 + 1.0) * PX, "{i} : {hand}");
         }
-        // D'une main à l'autre : moins d'un bloc (0,83).
+        // D'une main à l'autre : moins d'un bloc (0,83 en v256 ; 0,86 depuis que le corps a
+        // grandi sous une tête plus petite).
         let (lo, hi) = world
             .iter()
             .fold((f32::MAX, f32::MIN), |(lo, hi), w| (lo.min(w.0.x), hi.max(w.1.x)));
-        assert!(hi - lo < 0.85 && hi - lo > 0.8, "{}", hi - lo);
+        assert!(hi - lo < 0.9 && hi - lo > 0.82, "{}", hi - lo);
         assert!((SPLAY_SIN - ARM_SPLAY.sin()).abs() < 1e-6);
         assert!((SPLAY_COS - ARM_SPLAY.cos()).abs() < 1e-6);
         assert!((ARM_SPLAY.to_degrees() - 6.0).abs() < 1e-4);
         // Un objet en main : ce bras-là n'est plus écarté (il est tendu devant).
         let (xf, _, _, _) = parts(&pose(Some(Held::Wand([255, 0, 0]))))[4];
         assert!(xf.transform_vector3(Vec3::X).y.abs() < 1e-6);
+    }
+
+    /// (v264) « Un impact dans le joueur » : la plaie est sur le pavé touché, sur sa face
+    /// tournée vers le tireur, et ses carrés restent sur cette face (coupés à ses bords) ;
+    /// elle suit le membre qui bouge.
+    #[test]
+    fn a_hit_leaves_a_wound_on_the_box_it_touched() {
+        let pose = |walk: f32| Pose {
+            feet: Vec3::new(4.0, 10.0, -3.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            walk,
+            swing: if walk == 0.0 { 0.0 } else { 1.0 },
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: None,
+            skin: None,
+        };
+        let feet = pose(0.0).feet;
+        // De face (il regarde vers −z) : au milieu de la poitrine, puis dans la jambe droite.
+        let shooter = feet + Vec3::new(0.0, 1.3, -6.0);
+        let chest = feet + Vec3::new(0.02, 1.3, -BODY_D / 2.0 * PX);
+        let w = wound_at(&pose(0.0), chest, shooter, false, 7).expect("plaie");
+        assert_eq!((w.part as usize, w.face), (CHEST, 0));
+        let leg = feet + Vec3::new(LEG_X * PX, 0.4, -LEG_D / 2.0 * PX);
+        let w2 = wound_at(&pose(0.0), leg, shooter, false, 9).expect("plaie");
+        assert_eq!((w2.part, w2.face), (1, 0));
+        // De dos : la face arrière ; de côté : le bras.
+        let behind = wound_at(&pose(0.0), chest + Vec3::Z * 0.2, feet + Vec3::new(0.0, 1.3, 6.0), true, 3);
+        assert_eq!(behind.map(|w| (w.part as usize, w.face)), Some((CHEST, 1)));
+        let side = wound_at(
+            &pose(0.0),
+            feet + Vec3::new(0.3, 1.2, 0.0),
+            feet + Vec3::new(6.0, 1.2, 0.0),
+            false,
+            5,
+        );
+        assert_eq!(side.map(|w| (w.part, w.face)), Some((4, 2)));
+        // Trop loin de lui : rien.
+        assert!(wound_at(&pose(0.0), feet + Vec3::X * 3.0, shooter, false, 1).is_none());
+        // Les carrés : sur la face, à 2 mm au-dessus, dans ses bords ; ils suivent la jambe.
+        for walk in [0.0, 1.2] {
+            let p = pose(walk);
+            let tris = wound_model(&p, &[w, w2]);
+            assert!(tris.len() >= 2 * 6 * 6 && tris.len() % 6 == 0, "{}", tris.len());
+            let parts = parts(&p);
+            for (k, v) in tris.iter().enumerate() {
+                let on = [CHEST, 1].iter().any(|&i| {
+                    let (xf, min, max, _) = parts[i];
+                    let l = xf.inverse().transform_point3(Vec3::from(v.pos));
+                    (l.z - (min[2] - 0.04)).abs() < 1e-3
+                        && l.x >= min[0] - 1e-3
+                        && l.x <= max[0] + 1e-3
+                        && l.y >= min[1] - 1e-3
+                        && l.y <= max[1] + 1e-3
+                });
+                assert!(on, "sommet {k} hors de sa face (marche {walk})");
+            }
+        }
+        // Deux plaies n'ont pas la même tache.
+        assert_ne!(wound_cells(&w), wound_cells(&Wound { seed: 8, ..w }));
+        assert!(!test_wounds().is_empty());
     }
 
     /// (v256) Ce que chaque pavé montre du skin : la poitrine les 7 rangées du haut du
@@ -2845,13 +3125,12 @@ mod tests {
                 + Vec3::Y * 2.1;
             // Devant du torse, décollé comme dans le shader (0,02 bloc).
             let off = (at(0.0, 0.0, -1.0) - at(0.0, 0.0, 0.0)).normalize() * 0.02;
-            // Juste sous le menton : la tête dépasse du torse (v225 : d'un demi-pixel), l'ombre
-            // y tombe, dans ce qui reste de ce demi-pixel devant le point décollé (lumière à
-            // 45° : autant en hauteur).
-            let margin = HEAD_S / 2.0 - BODY_D / 2.0 - 0.02 / PX;
-            assert!(margin > 0.0, "la tête ne dépasse plus du torse");
+            // Juste sous le menton. (v225) La tête dépassait du torse d'un demi-pixel : l'ombre
+            // y tombait. (v264) La tête a la profondeur du corps (4 colonnes de son skin) : elle
+            // ne dépasse plus, le devant du torse est éclairé jusqu'en haut.
+            assert!((HEAD_S - BODY_D).abs() < 1e-5);
             assert!(
-                shadowed(&boxes, at(0.0, NECK_Y - margin / 2.0, front) + off, light),
+                !shadowed(&boxes, at(0.0, NECK_Y - 0.1, front) + off, light),
                 "menton, {yaw_deg}°"
             );
             // Plus bas sur le torse et sur les côtés : rien (avant : un triangle).

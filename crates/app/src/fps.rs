@@ -104,6 +104,9 @@ pub enum BuyItem {
     Gear(u16),
 }
 
+/// Couleur d'une étincelle (elle brille : au-delà de 1).
+const SPARK: [f32; 3] = [4.0, 2.6, 0.8];
+
 /// Équipement de la partie en ligne, tenu par l'hôte (repris de son HUD).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Online {
@@ -241,7 +244,9 @@ pub struct Fps {
     /// Dernière arme achetée (racheter).
     last_bought: Option<usize>,
     tracers: Vec<Tracer>,
-    sparks: Vec<(Vec3, Vec3, f32)>,
+    /// Éclats des impacts : place, vitesse, âge, couleur. (v264) Selon la matière touchée
+    /// (`debris`) : étincelles sur le métal seulement.
+    sparks: Vec<(Vec3, Vec3, f32, [f32; 3])>,
     /// (v249) Sang, impacts de balles, marques des grenades : gardés jusqu'à la fin de la
     /// manche.
     traces: crate::traces::Traces,
@@ -412,11 +417,8 @@ impl Fps {
             }
             if gun {
                 for (at, n) in weapons::bullet_path(world, origin, dir, RANGE).impacts {
-                    self.traces.hole(at, n);
-                    for _ in 0..3 {
-                        let v = n * 2.0 + Vec3::new(self.random(), self.random(), self.random()) * 2.5;
-                        self.sparks.push((at + n * 0.02, v, 0.0));
-                    }
+                    let matter = self.traces.hole(world, at, n);
+                    self.debris(at, n, matter, 3);
                 }
             } else if let Some(h) = raycast(world, origin.into(), dir.into(), 2.0) {
                 let n = Vec3::new(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
@@ -426,6 +428,24 @@ impl Fps {
         if self.sparks.len() > 400 {
             let extra = self.sparks.len() - 400;
             self.sparks.drain(..extra);
+        }
+    }
+
+    /// (v264) Éclats d'un impact de balle, selon la matière : étincelles sur le métal,
+    /// poussière et éclats gris de la pierre, échardes du bois, éclats clairs du verre, mottes
+    /// de terre. Ils partent de la surface (normale `n`), un peu en gerbe.
+    fn debris(&mut self, at: Vec3, n: Vec3, matter: crate::traces::Matter, count: usize) {
+        use crate::traces::Matter;
+        let (color, speed) = match matter {
+            Matter::Metal => (SPARK, 1.0),
+            Matter::Stone => ([0.50, 0.48, 0.45], 0.75),
+            Matter::Wood => ([0.46, 0.32, 0.17], 0.7),
+            Matter::Glass => ([0.85, 0.95, 1.0], 0.9),
+            Matter::Soft => ([0.26, 0.19, 0.12], 0.55),
+        };
+        for _ in 0..count {
+            let v = n * 2.0 + Vec3::new(self.random(), self.random(), self.random()) * 2.5;
+            self.sparks.push((at + n * 0.02, v * speed, 0.0, color));
         }
     }
 
@@ -1207,11 +1227,8 @@ impl Fps {
                 travelled: 0.0,
             });
             for (at, n) in path.impacts {
-                self.traces.hole(at, n);
-                for _ in 0..5 {
-                    let v = n * 2.0 + Vec3::new(self.random(), self.random(), self.random()) * 2.5;
-                    self.sparks.push((at + n * 0.02, v, 0.0));
-                }
+                let matter = self.traces.hole(world, at, n);
+                self.debris(at, n, matter, 5);
             }
         }
         self.shots.push((gun.def as u8, eye, dirs));
@@ -1362,7 +1379,7 @@ impl Fps {
                 self.traces.slash(p, n);
                 for _ in 0..6 {
                     let v = n * 1.5 + Vec3::new(self.random(), self.random(), self.random()) * 2.0;
-                    self.sparks.push((p + n * 0.02, v, 0.0));
+                    self.sparks.push((p + n * 0.02, v, 0.0, SPARK));
                 }
                 self.sounds.push((Sfx::KnifeHit, 0.12, 1.0));
             }
@@ -1718,16 +1735,20 @@ impl Fps {
             push_tri(&mut out, view_proj, [tail, b.pos - w, b.pos + w], red);
             push_tri(&mut out, view_proj, [b.pos - w, b.pos + d * s * 0.8, b.pos + w], red);
         }
-        for (p, v, age) in &self.sparks {
+        for (p, v, age, c) in &self.sparks {
             let s = 0.025 * (1.0 - age / 0.35);
             let d = v.normalize_or_zero();
             let w = cam_right(*p, d) * s;
-            let tail = *p - d * s * 3.0;
+            // (v264) Une étincelle brille d'elle-même, étirée par sa vitesse ; un éclat de
+            // pierre, de bois ou de verre est à la lumière du lieu, plus trapu.
+            let glows = c[0] > 1.5;
+            let k = if glows { 1.0 } else { lit };
+            let tail = *p - d * s * if glows { 3.0 } else { 1.6 };
             push_tri(
                 &mut out,
                 view_proj,
                 [tail, *p - w, *p + w],
-                [4.0, 2.6, 0.8, 1.0],
+                [c[0] * k, c[1] * k, c[2] * k, 1.0],
             );
         }
         // Grenades en vol.
@@ -2193,6 +2214,17 @@ impl Fps {
             })
             .collect();
         self.shot_seen(world, 0, eye, &dirs);
+        // (v264) Un éventail de tirs, à deux hauteurs : un impact sur chaque matière d'un
+        // rang de blocs d'essai.
+        for half in [-1.0f32, 1.0] {
+            let fan: Vec<Vec3> = (0..16)
+                .map(|k| {
+                    let a = half * (0.03 + 0.062 * k as f32);
+                    (dir + side * a + Vec3::Y * (0.05 * (k % 3) as f32 - 0.02)).normalize()
+                })
+                .collect();
+            self.shot_seen(world, 0, eye, &fan);
+        }
         self.shot_seen(world, crate::netgame::KNIFE_LIGHT, at + side * 1.2, &[dir]);
         if let Some(h) = raycast(world, (at - side * 2.5).into(), [0.0, -1.0, 0.0], 12.0) {
             let ground = at - side * 2.5 - Vec3::Y * (h.distance - 0.1);

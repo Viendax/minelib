@@ -42,7 +42,10 @@ use serde::{Deserialize, Serialize};
 /// entrée de chaque joueur (`Backup::looks`) : ses boîtes des coups, tournées avec lui, sont
 /// les mêmes chez l'hôte et chez le vérificateur ; accroupi, le dos du modèle se plie à la
 /// taille (boîtes des coups comprises).
-pub const PROTOCOL: u32 = 68;
+/// (v264) 69 : la tête du personnage rapetisse (4 colonnes du skin du corps) et son corps
+/// grandit d'autant : ses boîtes des coups en partie FPS, les pavés du modèle, doivent être
+/// les mêmes chez l'hôte, ses invités et le vérificateur.
+pub const PROTOCOL: u32 = 69;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
