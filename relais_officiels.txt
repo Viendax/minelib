@@ -1,0 +1,12 @@
+# Relais officiels de Minelib (v279) : essayés avant tout autre, sans passer par le DHT.
+#
+# Un relais par ligne : <nœud iroh, 64 caractères hexadécimaux> <clé du canal chiffré, 64
+# caractères hexadécimaux> <nom>. `minelib-relay` écrit cette ligne toute faite à son
+# lancement (« Ligne pour relais_officiels.txt : … ») ; son nœud ne change plus d'un
+# lancement à l'autre (fichier `noeud.key` à côté de son dossier : à garder, et à ne pas
+# donner). Lignes vides et lignes « # » ignorées.
+#
+# Cette liste est compilée dans le jeu : c'est la publication d'une version qui fait foi,
+# il n'y a aucune clé secrète à garder. Tant qu'elle est vide, le jeu fait comme avant
+# (relais déjà utilisés, puis liste ouverte du DHT), et n'importe quel PC peut devenir un
+# relais.

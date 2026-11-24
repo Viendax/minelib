@@ -87,6 +87,54 @@ pub fn upsert(mut list: Vec<Ad>, me: Ad) -> Vec<u8> {
     }
 }
 
+/// (v279) Relais officiels : la liste compilée dans le jeu (`relais_officiels.txt`, à la
+/// racine du dépôt). La liste du DHT est ouverte à tous (sa clé se déduit d'un texte
+/// public : n'importe qui peut la réécrire, la remplir de faux relais ou la bloquer avec
+/// un numéro de version énorme) ; celle-ci ne change qu'avec une version publiée du jeu.
+pub fn official() -> Vec<Ad> {
+    parse_relays(include_str!("../../../relais_officiels.txt"))
+}
+
+/// Relais écrits un par ligne : nœud iroh et clé du canal chiffré en hexadécimal, puis le
+/// nom (voir `relais_officiels.txt` ; même format pour les relais retenus par le jeu).
+pub fn parse_relays(text: &str) -> Vec<Ad> {
+    fn key(hex: &str) -> Option<[u8; 32]> {
+        if hex.len() != 64 || !hex.is_ascii() {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+        }
+        Some(out)
+    }
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, char::is_whitespace);
+            let node = key(parts.next()?)?;
+            let noise = key(parts.next()?)?;
+            let name: String = parts.next().unwrap_or("").trim().chars().take(40).collect();
+            Some(Ad {
+                node,
+                noise,
+                name,
+                since: 0,
+                seen: now(),
+            })
+        })
+        .collect()
+}
+
+/// Ces relais écrits au format de `parse_relays`.
+pub fn format_relays(list: &[Ad]) -> String {
+    let hex = |k: &[u8; 32]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    list.iter()
+        .map(|a| format!("{} {} {}\n", hex(&a.node), hex(&a.noise), a.name.replace('\n', " ")))
+        .collect()
+}
+
 /// Client du DHT, créé une fois et gardé (le rejoindre prend une à deux secondes).
 fn dht() -> Result<mainline::Dht> {
     static DHT: std::sync::Mutex<Option<mainline::Dht>> = std::sync::Mutex::new(None);
@@ -342,6 +390,29 @@ mod tests {
             name: format!("relais {n}"),
             since,
             seen: now(),
+        }
+    }
+
+    /// (v279) Les relais écrits un par ligne se relisent ; une ligne fausse est ignorée, et
+    /// la liste officielle compilée dans le jeu se lit sans erreur.
+    #[test]
+    fn relays_written_one_per_line_read_back() {
+        let ad = |n: u8, name: &str| Ad {
+            node: [n; 32],
+            noise: [n + 1; 32],
+            name: name.into(),
+            since: 0,
+            seen: 0,
+        };
+        let text = format_relays(&[ad(1, "Relais de Paris"), ad(7, "")]);
+        let extra = format!("# commentaire\n\n{text}trop court abc nom\n");
+        let back = parse_relays(&extra);
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[0].node, back[0].noise), ([1; 32], [2; 32]));
+        assert_eq!(back[0].name, "Relais de Paris");
+        assert_eq!((back[1].node, back[1].name.as_str()), ([7; 32], ""));
+        for a in official() {
+            assert_ne!(a.node, a.noise);
         }
     }
 

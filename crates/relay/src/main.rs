@@ -39,6 +39,7 @@ fn main() -> Result<()> {
         }
         i += 2;
     }
+    let key_path = cfg.dir.with_file_name("noeud.key");
     let h = minelib_relay::start(cfg)?;
     println!("Relais prêt sur {}", h.addr);
     println!(
@@ -47,7 +48,19 @@ fn main() -> Result<()> {
     );
     // Joignable sans port ouvert, et inscrit dans le DHT.
     let _node = if dht {
-        match minelib_p2p::Node::start() {
+        // (v279) Identité iroh gardée d'un lancement à l'autre (`noeud.key`, comme le jeu) :
+        // les jeux retiennent le nœud des relais où ils ont joué et le joignent
+        // directement, et c'est lui qu'on écrit dans `relais_officiels.txt`. Avant, il
+        // changeait à chaque lancement.
+        let secret: [u8; 32] = std::fs::read(&key_path)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or_else(|| {
+                let k: [u8; 32] = minelib_net::transport::generate_static().0;
+                let _ = std::fs::write(&key_path, k);
+                k
+            });
+        match minelib_p2p::Node::start_with(Some(secret)) {
             Ok(node) => {
                 let node: &'static minelib_p2p::Node = Box::leak(Box::new(node));
                 // Pseudos uniques avec les autres relais du DHT.
@@ -66,6 +79,11 @@ fn main() -> Result<()> {
                 println!(
                     "Inscrit dans le DHT : les jeux en relay=auto le trouvent (nœud {}).",
                     minelib_net::crypto::hex(&node.id()[..8])
+                );
+                println!(
+                    "Ligne pour relais_officiels.txt : {} {} Minelib",
+                    minelib_net::crypto::hex(&node.id()),
+                    minelib_net::crypto::hex(&h.public)
                 );
                 Some(node)
             }

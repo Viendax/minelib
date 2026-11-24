@@ -52,6 +52,62 @@ pub(crate) fn p2p_node(dir: &std::path::Path) -> Option<&'static minelib_p2p::No
     .as_ref()
 }
 
+/// (v279) Relais retenus au plus sur ce PC (`relais_connus`, à côté de `relais_connu`).
+const KNOWN_MAX: usize = 8;
+
+/// (v279) Relais où ce PC a déjà ouvert un compte ou s'y est connecté, le dernier d'abord.
+/// Ils sont joints directement à chaque lancement (leur nœud iroh et leur clé suffisent),
+/// avant la liste du DHT et quoi qu'elle dise : la fausser ou la bloquer ne coupe plus un
+/// joueur de son relais.
+fn known_relays(dir: &std::path::Path) -> Vec<minelib_p2p::Ad> {
+    std::fs::read_to_string(dir.with_file_name("relais_connus"))
+        .map(|t| minelib_p2p::parse_relays(&t))
+        .unwrap_or_default()
+}
+
+/// Le relais joint par le tunnel iroh à ce lancement (pour le retenir si le compte s'y
+/// connecte : voir `remember_relay`).
+static CHOSEN: std::sync::Mutex<Option<minelib_p2p::Ad>> = std::sync::Mutex::new(None);
+
+/// (v279) Le compte vient de se connecter au relais choisi à ce lancement : il est retenu,
+/// en tête. Seulement à ce moment-là : pour connecter un compte il faut rendre son coffre,
+/// que seul son vrai relais détient ; un faux relais glissé dans la liste du DHT qui se
+/// contente de répondre n'entre donc jamais ici.
+fn remember_relay(dir: &std::path::Path) {
+    let Some(ad) = CHOSEN.lock().unwrap().clone() else {
+        return;
+    };
+    let mut list = known_relays(dir);
+    if list.first().is_some_and(|a| a.node == ad.node && a.noise == ad.noise) {
+        return;
+    }
+    list.retain(|a| a.node != ad.node);
+    list.insert(0, ad);
+    list.truncate(KNOWN_MAX);
+    let _ = std::fs::write(
+        dir.with_file_name("relais_connus"),
+        minelib_p2p::format_relays(&list),
+    );
+}
+
+/// (v279) Relais à joindre sans le DHT : les officiels (compilés dans le jeu), puis ceux
+/// déjà utilisés ; ni soi-même, ni ceux déjà essayés sans succès à ce lancement.
+fn pinned_relays(
+    dir: &std::path::Path,
+    me: [u8; 32],
+    mine: Option<[u8; 32]>,
+    failed: &[[u8; 32]],
+) -> Vec<minelib_p2p::Ad> {
+    let mut list = minelib_p2p::official();
+    for a in known_relays(dir) {
+        if !list.iter().any(|o| o.node == a.node) {
+            list.push(a);
+        }
+    }
+    list.retain(|a| a.node != me && Some(a.noise) != mine && !failed.contains(&a.node));
+    list
+}
+
 /// Relais du DHT qui répond vraiment : chaque candidat est essayé en même temps (tunnel
 /// iroh, puis poignée de main chiffrée avec la clé annoncée), le premier qui répond est
 /// pris, le relais déjà connu d'abord s'il répond aussi vite. Un relais éteint dont
@@ -122,6 +178,7 @@ fn auto_relay(
     failed: &mut Vec<[u8; 32]>,
 ) -> anyhow::Result<(String, Option<[u8; 32]>)> {
     let t0 = std::time::Instant::now();
+    *CHOSEN.lock().unwrap() = None;
     let port = minelib_net::DEFAULT_PORT;
     let local = SocketAddr::from(([127, 0, 0, 1], port));
     if TcpStream::connect_timeout(&local, Duration::from_millis(300)).is_ok() {
@@ -139,9 +196,38 @@ fn auto_relay(
         let list = minelib_p2p::find_relays();
         let _ = dht_tx.send((node, list));
     });
+    // (v279) En même temps, sans attendre le DHT : les relais officiels et ceux où l'on a
+    // déjà joué, joints directement.
+    let (pin_tx, pin_rx) = std::sync::mpsc::channel();
+    let (dir2, tried) = (dir.to_path_buf(), failed.clone());
+    std::thread::spawn(move || {
+        let hit = node(&dir2).and_then(|n| {
+            let mine = minelib_relay::public_key(&dir2);
+            let pinned = pinned_relays(&dir2, n.id(), mine, &tried);
+            reachable_relay(n, pinned, None)
+        });
+        let _ = pin_tx.send(hit);
+    });
     if let Ok(Some((lan, key))) = lan_rx.recv() {
         log::info!("relais trouvé sur le réseau local : {lan}");
         return Ok((lan.to_string(), Some(key)));
+    }
+    // Un relais officiel ou déjà utilisé a 2,5 s pour répondre (le temps que met le DHT) :
+    // s'il répond, la liste du DHT ne sert pas.
+    let pinned = |wait: Duration| -> Option<(String, Option<[u8; 32]>)> {
+        let (addr, ad) = pin_rx.recv_timeout(wait).ok().flatten()?;
+        log::info!(
+            "relais « {} » déjà connu joint directement (nœud {}), en {:.1} s",
+            ad.name,
+            crypto::hex(&ad.node[..8]),
+            t0.elapsed().as_secs_f32()
+        );
+        let key = ad.noise;
+        *CHOSEN.lock().unwrap() = Some(ad);
+        Some((addr.to_string(), Some(key)))
+    };
+    if let Some(found) = pinned(Duration::from_millis(2500).saturating_sub(t0.elapsed())) {
+        return Ok(found);
     }
     // Le DHT répond en 2 à 3 secondes ; au-delà (réseau filtré), on fait sans.
     let left = Duration::from_secs(6).saturating_sub(t0.elapsed());
@@ -176,7 +262,13 @@ fn auto_relay(
         for a in &ads {
             failed.push(a.node);
         }
-        if let Some((addr, ad)) = reachable_relay(node, ads, known) {
+        // (v279) Un relais officiel ou déjà utilisé qui répond pendant qu'on essaie ceux
+        // de la liste passe avant eux.
+        let listed = reachable_relay(node, ads, known);
+        if let Some(found) = pinned(Duration::from_millis(1500)) {
+            return Ok(found);
+        }
+        if let Some((addr, ad)) = listed {
             log::info!(
                 "relais « {} » trouvé dans le DHT (nœud {}), en {:.1} s",
                 ad.name,
@@ -186,7 +278,9 @@ fn auto_relay(
             if known.is_none() {
                 let _ = std::fs::write(&known_path, crypto::hex(&ad.noise));
             }
-            return Ok((addr.to_string(), Some(ad.noise)));
+            let key = ad.noise;
+            *CHOSEN.lock().unwrap() = Some(ad);
+            return Ok((addr.to_string(), Some(key)));
         }
     }
     // Personne : ce PC devient le relais.
@@ -768,6 +862,9 @@ impl Accounts {
                     self.need_totp = false;
                     self.auto_pending = false;
                     self.auto_fails = 0;
+                    // (v279) Ce relais détient bien le compte : il sera joint directement
+                    // aux prochains lancements, quoi que dise la liste du DHT.
+                    remember_relay(&self.relay_dir);
                     // Compte gardé sur ce PC : connexion automatique au prochain lancement.
                     if let Some((p, w)) = self.sent.take() {
                         self.login_secret = Some((p.clone(), w.clone()));
@@ -2026,5 +2123,49 @@ fn draw_qr(ui: &mut Ui, data: &str, x: f32, y: f32, side: f32) {
             let (cx, cy) = ((i % w + quiet) as f32, (i / w + quiet) as f32);
             ui.rect(x + cx * m, y + cy * m, m, m, [0.0, 0.0, 0.0, 1.0]);
         }
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    /// (v279) Les relais où le compte s'est connecté sont retenus, le dernier d'abord, sans
+    /// doublon et pas plus de `KNOWN_MAX` ; ni ce PC ni un relais déjà essayé sans succès ne
+    /// sont rejoints.
+    #[test]
+    fn relays_used_before_are_kept_and_tried_first() {
+        let root = std::env::temp_dir().join(format!("minelib-connus-{}", std::process::id()));
+        let dir = root.join("relais");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ad = |n: u8| minelib_p2p::Ad {
+            node: [n; 32],
+            noise: [n.wrapping_add(100); 32],
+            name: format!("Relais {n}"),
+            since: 0,
+            seen: 0,
+        };
+        // Rien de choisi à ce lancement : rien n'est retenu.
+        *CHOSEN.lock().unwrap() = None;
+        remember_relay(&dir);
+        assert!(known_relays(&dir).is_empty());
+        for n in [1u8, 2, 1, 3] {
+            *CHOSEN.lock().unwrap() = Some(ad(n));
+            remember_relay(&dir);
+        }
+        let nodes = |l: Vec<minelib_p2p::Ad>| l.iter().map(|a| a.node[0]).collect::<Vec<u8>>();
+        assert_eq!(nodes(known_relays(&dir)), vec![3, 1, 2]);
+        assert_eq!(known_relays(&dir)[0].noise, [103; 32]);
+        for n in 10..30u8 {
+            *CHOSEN.lock().unwrap() = Some(ad(n));
+            remember_relay(&dir);
+        }
+        assert_eq!(known_relays(&dir).len(), KNOWN_MAX);
+        assert_eq!(known_relays(&dir)[0].node, [29; 32]);
+        // Ni soi-même (nœud ou clé de son propre relais), ni un relais déjà essayé.
+        let pinned = pinned_relays(&dir, [29; 32], Some([128; 32]), &[[27; 32]]);
+        assert_eq!(nodes(pinned), vec![26, 25, 24, 23, 22]);
+        *CHOSEN.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(root);
     }
 }
