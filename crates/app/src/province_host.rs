@@ -302,7 +302,9 @@ impl ProvinceHost {
         // Joignable de partout par iroh (sans donner d'adresse IP), sinon sur le réseau
         // local.
         let node = if p2p {
-            minelib_p2p::Node::start_private().ok().map(Arc::new)
+            minelib_p2p::Node::start_host(minelib_net::fast::probed_recently())
+                .ok()
+                .map(Arc::new)
         } else {
             None
         };

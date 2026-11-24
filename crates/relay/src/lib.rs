@@ -5589,7 +5589,10 @@ fn pick_host(
             } else {
                 return None;
             };
-            Some((g, zones::aptitude(&candidate(st, g)?) + bonus * 1_000_000.0))
+            // (v297) À rang égal, un passeur vérifié d'abord : le relais qu'il héberge peut
+            // être joint en direct, sans les serveurs relais publics d'iroh (débit limité).
+            let open = if st.fast.is_open(g) { 500_000.0 } else { 0.0 };
+            Some((g, zones::aptitude(&candidate(st, g)?) + bonus * 1_000_000.0 + open))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(g, _)| g)

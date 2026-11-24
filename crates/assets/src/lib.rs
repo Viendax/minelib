@@ -140,11 +140,13 @@ pub struct Options {
     pub relay: String,
     /// Au menu, ce jeu peut servir de garant indépendant pour les parties des autres.
     pub garant: bool,
-    /// (v280) Quand ce jeu héberge le relais d'une région, d'une province ou un relais de
-    /// secours, les joueurs servis le joignent en direct (ils voient son adresse IP) au
-    /// lieu de passer par les serveurs relais publics d'iroh, au débit limité. Faux par
-    /// défaut (`hote_direct=true` dans `options.txt` pour l'activer).
-    pub host_direct: bool,
+    /// Quand ce jeu héberge le relais d'une région, d'une province ou un relais de secours,
+    /// les joueurs servis le joignent-ils en direct (ils voient son adresse IP) au lieu de
+    /// passer par les serveurs relais publics d'iroh, au débit limité ? (v280)
+    /// `hote_direct=true` ou `false` dans `options.txt` ; (v297) sans la ligne (`auto`) :
+    /// oui seulement quand ce PC sert déjà de passeur (sa box laisse entrer l'UDP, son
+    /// adresse est déjà donnée aux joueurs des parties qu'il porte).
+    pub host_direct: Option<bool>,
     /// Clé du relais retenue au premier contact (hexadécimal, vide = pas encore).
     pub relay_key: String,
     /// Dernier pseudo utilisé (prérempli à la connexion).
@@ -188,7 +190,7 @@ impl Default for Options {
             volume_weather: 1.0,
             relay: "auto".into(),
             garant: true,
-            host_direct: false,
+            host_direct: None,
             relay_key: String::new(),
             pseudo: String::new(),
         }
@@ -243,7 +245,11 @@ impl Options {
                 o.garant = v != "false";
             }
             if let Some(v) = kv.get("hote_direct") {
-                o.host_direct = v == "true";
+                o.host_direct = match v.as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                };
             }
             if let Some(v) = kv.get("relay_key") {
                 o.relay_key = v.trim().to_string();
@@ -327,7 +333,11 @@ impl Options {
                 self.igpu,
                 self.invisible,
                 self.volume_weather,
-                self.host_direct
+                match self.host_direct {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "auto",
+                }
             ),
         )?;
         Ok(())

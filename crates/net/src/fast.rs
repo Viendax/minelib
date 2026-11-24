@@ -252,6 +252,29 @@ pub type Mapper = Box<dyn Fn(u16) -> Option<SocketAddrV4> + Send + Sync>;
 
 static MAPPER: OnceLock<Mapper> = OnceLock::new();
 
+/// (v297) Dernière sonde du relais reçue par le passeur de ce jeu (s, époque Unix ; 0 :
+/// jamais). Une sonde reçue, c'est la preuve que la box laisse entrer l'UDP : ce PC sert de
+/// passeur, et son adresse est déjà donnée aux joueurs des parties qu'il porte.
+static PROBED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Le passeur de ce jeu vient de recevoir une sonde du relais.
+pub fn note_probed() {
+    PROBED.store(now_s(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// (v297) Ce jeu est un passeur vérifié en ce moment (sonde du relais reçue depuis moins
+/// de 3 minutes ; le relais en renvoie une toutes les 30 s).
+pub fn probed_recently() -> bool {
+    let t = PROBED.load(std::sync::atomic::Ordering::Relaxed);
+    t != 0 && now_s().saturating_sub(t) < 180
+}
+
 pub fn set_mapper(m: Mapper) {
     let _ = MAPPER.set(m);
 }

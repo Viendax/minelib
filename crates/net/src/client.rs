@@ -956,6 +956,7 @@ impl Worker {
         }
         while let Ok(nonce) = ps.probes.try_recv() {
             ps.heard = Instant::now();
+            crate::fast::note_probed();
             if ps.on {
                 offers.push(Request::PasseurEcho { nonce });
             }

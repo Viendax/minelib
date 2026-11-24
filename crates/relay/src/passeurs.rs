@@ -101,6 +101,12 @@ pub(crate) struct Fast {
 }
 
 impl Fast {
+    /// (v297) Cette connexion de garant est celle d'un passeur vérifié (sa box laisse
+    /// entrer l'UDP) : le relais qu'il hébergerait pourrait être joint en direct.
+    pub(crate) fn is_open(&self, id: u64) -> bool {
+        self.offers.get(&id).is_some_and(|o| o.verified)
+    }
+
     /// (v287) Pour le relevé de santé : passeurs annoncés, vérifiés, et parties portées.
     pub(crate) fn counts(&self) -> (usize, usize, usize) {
         (

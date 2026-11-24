@@ -216,12 +216,37 @@ fn remote_key(conn: &iroh::endpoint::Connection, first: Option<std::net::IpAddr>
     }
 }
 
-/// (v280) Les relais de région, de province et de secours hébergés par ce jeu sont joignables
-/// en direct (voir `Node::start_private`). Faux par défaut : l'hôte reste anonyme.
-static HOSTS_DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Les relais de région, de province et de secours hébergés par ce jeu sont-ils joignables
+/// en direct ? (v280 : `hote_direct=true` dans `options.txt`.) (v297) Trois réglages :
+/// 1 toujours, 2 jamais, 0 automatique (sans la ligne) : en direct seulement quand ce PC
+/// est un passeur vérifié, c'est-à-dire que sa box laisse entrer l'UDP et que son adresse
+/// est déjà donnée aux joueurs des parties FPS qu'il porte (voir `host_direct`).
+static HOSTS_DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-pub fn set_hosts_direct(on: bool) {
-    HOSTS_DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
+pub fn set_hosts_direct(choice: Option<bool>) {
+    let v = match choice {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    HOSTS_DIRECT.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// (v297) Un relais hébergé par ce jeu doit-il être joignable en direct ? `open_box` : ce
+/// PC est un passeur vérifié en ce moment.
+///
+/// Anonyme, un hôte n'est joint que par les serveurs relais publics d'iroh : débit limité
+/// sur sa seule connexion, par laquelle passent tous les joueurs qu'il sert. C'est ce qui
+/// sature en premier quand une région se remplit, et ce qui y interdit les positions
+/// rapprochées (256 par seconde aux voisins les plus proches). En direct, les joueurs
+/// servis voient son adresse IP : on ne le fait de soi-même que pour un PC dont l'adresse
+/// est déjà montrée à des joueurs sans lien avec lui (passeur).
+pub fn host_direct(open_box: bool) -> bool {
+    match HOSTS_DIRECT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => open_box,
+    }
 }
 
 /// (v285) Connexions iroh ouvertes par les tunnels de ce jeu, par nœud distant.
@@ -288,16 +313,15 @@ impl Node {
     /// Nœud anonyme : joignable seulement par les serveurs relais d'iroh, jamais en direct.
     /// Ceux qui s'y connectent ne voient pas son adresse IP (hôte d'une région d'un monde :
     /// un joueur d'une autre partie qui doit rester anonyme pour les joueurs servis).
-    ///
-    /// (v280) Sauf si le joueur l'a demandé (`hote_direct=true` dans `options.txt`, voir
-    /// `set_hosts_direct`) : le nœud est alors joignable en direct, comme un relais du
-    /// monde, et ne passe par les serveurs relais d'iroh que si le direct échoue. Ces
-    /// serveurs publics limitent le débit de chaque connexion et ne sont prévus que pour
-    /// le développement et les essais ; un hôte anonyme y fait passer tous les joueurs
-    /// qu'il sert. En direct, ces joueurs voient son adresse IP.
     pub fn start_private() -> Result<Self> {
-        let direct = HOSTS_DIRECT.load(std::sync::atomic::Ordering::Relaxed);
-        Self::build(None, !direct)
+        Self::build(None, true)
+    }
+
+    /// (v297) Nœud d'un relais hébergé par ce jeu (région, province, secours) : anonyme,
+    /// ou joignable en direct selon `host_direct` (les serveurs relais d'iroh ne servent
+    /// alors que si le direct échoue).
+    pub fn start_host(open_box: bool) -> Result<Self> {
+        Self::build(None, !host_direct(open_box))
     }
 
     fn build(secret: Option<[u8; 32]>, private: bool) -> Result<Self> {
@@ -440,6 +464,19 @@ mod tests {
 
     /// (v279) Les relais écrits un par ligne se relisent ; une ligne fausse est ignorée, et
     /// la liste officielle compilée dans le jeu se lit sans erreur.
+    /// (v297) Un hôte est joint en direct quand le joueur l'a demandé, jamais quand il l'a
+    /// refusé, et sinon seulement si son PC est déjà un passeur vérifié.
+    #[test]
+    fn a_host_is_direct_when_asked_or_when_its_box_is_already_open() {
+        set_hosts_direct(None);
+        assert!(!host_direct(false) && host_direct(true));
+        set_hosts_direct(Some(true));
+        assert!(host_direct(false) && host_direct(true));
+        set_hosts_direct(Some(false));
+        assert!(!host_direct(false) && !host_direct(true));
+        set_hosts_direct(None);
+    }
+
     #[test]
     fn relays_written_one_per_line_read_back() {
         let ad = |n: u8, name: &str| Ad {
