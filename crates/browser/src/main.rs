@@ -1017,6 +1017,8 @@ const DOH_FAMILLE: &str = "https://family.cloudflare-dns.com/dns-query";
 wrap_app! {
     struct BrowserApp {
         restreint: Restreint,
+        // (v248) Journal réseau de Chromium à écrire (diagnostic), s'il est demandé.
+        journal: Option<String>,
     }
 
     impl App {
@@ -1049,6 +1051,19 @@ wrap_app! {
                     None => Vec::new(),
                 };
                 regles.push("MAP www.google.com forcesafesearch.google.com".into());
+                // (v248) Diagnostic : le journal réseau de Chromium (noms résolus, adresses
+                // des serveurs, connexions réutilisées), sans cookies ni mots de passe
+                // (mode « Default »).
+                if let Some(j) = &self.journal {
+                    cl.append_switch_with_value(
+                        Some(&CefString::from("log-net-log")),
+                        Some(&CefString::from(j.as_str())),
+                    );
+                    cl.append_switch_with_value(
+                        Some(&CefString::from("net-log-capture-mode")),
+                        Some(&CefString::from("Default")),
+                    );
+                }
                 cl.append_switch_with_value(
                     Some(&CefString::from("host-resolver-rules")),
                     Some(&CefString::from(regles.join(",").as_str())),
@@ -1241,7 +1256,17 @@ fn main() {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = args::Args::new();
     let opts = Options::parse();
-    let mut app = BrowserApp::new(opts.restreint);
+    // (v248) Diagnostic à la demande : un fichier `journal-reseau.demande` à côté du journal
+    // du navigateur fait écrire le journal réseau de Chromium dans `journal-reseau.json`.
+    let journal = opts.log.as_deref().and_then(|l| {
+        let dossier = std::path::Path::new(l).parent()?;
+        dossier
+            .join("journal-reseau.demande")
+            .is_file()
+            .then(|| dossier.join("journal-reseau.json").to_string_lossy().into_owned())
+    });
+    let app_journal = journal.clone();
+    let mut app = BrowserApp::new(opts.restreint, journal);
 
     // Sous-processus de Chromium (rendu, GPU…) : il fait son travail puis s'arrête ici.
     let code = execute_process(
@@ -1295,6 +1320,9 @@ fn main() {
         std::process::exit(2);
     }
     eprintln!("minelib-browser : prêt");
+    if let Some(j) = &app_journal {
+        eprintln!("journal réseau de Chromium demandé : {j}");
+    }
 
     let out: Shared = Arc::new((Mutex::new(Outbox::default()), Condvar::new()));
     let writer = {
