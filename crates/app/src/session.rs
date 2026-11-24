@@ -4163,19 +4163,10 @@ impl Session {
         if !mine {
             (self.legend.charges, self.legend.sky_hits) = (0, 0);
         } else if seq != 0 || act == ZEUS_CLOUD {
-            let gained = charges > self.legend.charges;
+            // (Une charge donnée par un éclair des nuages se lit sur l'objet, pas dans le
+            // tchat : règle 17 de `claude/foudre-de-zeus.md`.)
             self.legend.charges = charges.min(crate::zeus::MAX_CHARGES);
             self.legend.sky_hits = sky_hits.min(crate::zeus::SKY_HITS - 1);
-            if act == ZEUS_CLOUD && gained {
-                self.chat.say(
-                    format!(
-                        "Un éclair a chargé la Foudre de Zeus ({} / {}).",
-                        self.legend.charges,
-                        crate::zeus::MAX_CHARGES
-                    ),
-                    chat::GREY,
-                );
-            }
         }
         match act {
             ZEUS_CLAIM if seq != 0 => {
