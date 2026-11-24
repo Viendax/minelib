@@ -19,7 +19,8 @@
 //! `--filtre blanche|noire`, `--listes <dossier des listes>`,
 //! `--restreint strict|modere|non` (mode restreint de YouTube ; SafeSearch est toujours
 //! imposé), `--sans-compte` (v208 : pas de connexion à un compte, cookies effacés ; le jeu
-//! ne s'en sert plus depuis la v243),
+//! ne s'en sert plus depuis la v243), `--site-complet` (v246, solo : le site complet de
+//! YouTube, jamais le lecteur embarqué),
 //! `--volume <0..100>` (v213, volume des sons du navigateur dans Windows ; ensuite la
 //! commande `volume 0 <0..100>`).
 //!
@@ -76,6 +77,11 @@ use cef::*;
 /// son focus même inchangé : le jeu ne donne le clavier à un champ que juste après un clic.
 /// (v243) Une vidéo que le lecteur embarqué a renvoyée au site (`&mlb=site` : YouTube ne
 /// la permet pas ailleurs) y reste, même si YouTube enlève ce paramètre de l'adresse.
+/// (v246) En solo (`window.__mlb_site`, posé avant), rien ne part au lecteur : le site
+/// complet. Les Shorts restent toujours sur le site ; en ligne, un Short ne se lance que
+/// sur l'écran regardé (`__mlb_short()`, appelé par le jeu), et l'état vient du lecteur
+/// des Shorts (`#shorts-player`). Une pub glissée entre deux Shorts (le Short au milieu
+/// de l'écran porte un badge « Sponsorisé ») se dit « pub » : rien ne se partage pendant.
 const PAGE_JS: &str = r#"(()=>{if(window.__minelib)return;window.__minelib=1;
 const ed=e=>!!e&&(e.isContentEditable||e.tagName==='TEXTAREA'||(e.tagName==='INPUT'&&!/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/i.test(e.type||'')));
 const deep=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a;};
@@ -89,21 +95,31 @@ const vid=u=>{try{const x=new URL(u,location.href);const h=x.hostname.toLowerCas
 if(h==='youtu.be')i=x.pathname.split('/')[1]||'';
 else if(h==='www.youtube.com'||h==='youtube.com'||h==='m.youtube.com'){
 if(x.pathname==='/watch')i=x.searchParams.get('v')||'';
-else{const m=x.pathname.match(/^\/(shorts|live)\/([^\/?#]+)/);if(m)i=m[2];}}
+else{const m=x.pathname.match(/^\/live\/([^\/?#]+)/);if(m)i=m[1];}}
 if(!/^[A-Za-z0-9_-]{11}$/.test(i))return '';
 if(x.searchParams.get('mlb')==='site'){try{sessionStorage.setItem('mlb_site_'+i,'1');}catch(e){}return '';}
 if(SS('mlb_site_'+i))return '';
 const t=parseInt(x.searchParams.get('t')||x.searchParams.get('start')||'0',10)||0;
 return L+'?v='+i+(t>0?'&t='+t:'');}catch(e){return '';}};
-if(/(^|\.)youtube\.com$/.test(location.hostname)){
+const yt=/(^|\.)youtube\.com$/.test(location.hostname);
+const SH=()=>location.pathname.startsWith('/shorts/');
+const gate=yt&&!window.__mlb_site;let ok=false;const SV=()=>document.querySelector('#shorts-player video');
+const attend=()=>gate&&SH()&&!ok;
+const PUBS='ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer,ad-badge-view-model,ytd-ad-inline-playback-meta-block,[class*="ad-badge"]';
+const pubShort=()=>{if(!SH())return false;const c=document.elementFromPoint(innerWidth/2,innerHeight/2);
+const r=c&&c.closest&&c.closest('ytd-reel-video-renderer');return !!r&&(!!r.querySelector(PUBS)||/Sponsoris|Sponsored/.test(r.innerText||''));};
+if(gate){window.__mlb_short=()=>{if(ok)return;ok=true;const v=SV();if(v&&v.paused)v.play().catch(()=>{});};
+document.addEventListener('play',e=>{if(attend()&&e.target&&e.target.pause)e.target.pause();},true);
+setInterval(()=>{const v=SV();if(attend()&&v&&!v.paused)v.pause();},250);}
+if(yt&&!window.__mlb_site){
 const go=(u,r)=>{const l=vid(u);if(l){if(r)location.replace(l);else location.href=l;return true;}return false;};
 document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagName==='A'&&x.href);
 if(a&&vid(a.href)){e.preventDefault();e.stopImmediatePropagation();go(a.href,false);}},true);
 setInterval(()=>go(location.href,true),250);go(location.href,true);}
-let s='';window.addEventListener('pageshow',()=>{s='';});setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById('movie_player');
+let s='';window.addEventListener('pageshow',()=>{s='';});setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById(SH()?'shorts-player':'movie_player');
 const v=(mp&&mp.querySelector('video'))||document.querySelector('video');
 let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
-const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing'),i:i});
+const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||attend()||pubShort(),i:i});
 if(st!==s){s=st;console.log('__minelib_state__'+st);}},500);})();"#;
 
 /// Script injecté si le jeu le demande (`--scroll`) : signale si la page peut défiler
@@ -185,6 +201,8 @@ struct Options {
     sans_compte: bool,
     /// (v213) Volume des sons du navigateur au lancement, en pour cent.
     volume: i32,
+    /// (v246) Solo : le site complet de YouTube, jamais le lecteur embarqué.
+    site: bool,
 }
 
 impl Options {
@@ -201,6 +219,7 @@ impl Options {
             restreint: Restreint::Strict,
             sans_compte: false,
             volume: 50,
+            site: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -215,6 +234,7 @@ impl Options {
                 "--filtre" => o.filtre = Mode::from_name(&value()).unwrap_or(o.filtre),
                 "--listes" => o.listes = Some(PathBuf::from(value())),
                 "--sans-compte" => o.sans_compte = true,
+                "--site-complet" => o.site = true,
                 "--volume" => o.volume = value().parse().unwrap_or(o.volume).clamp(0, 100),
                 "--restreint" => o.restreint = Restreint::from_name(&value()).unwrap_or(o.restreint),
                 _ => {}
@@ -433,6 +453,8 @@ wrap_load_handler! {
     struct Loader {
         id: u32,
         scroll: bool,
+        // (v246) Solo : le site complet de YouTube, sans le lecteur embarqué.
+        site: bool,
         out: Shared,
     }
 
@@ -484,6 +506,9 @@ wrap_load_handler! {
                         frame.execute_java_script(Some(&CefString::from(PUB_JS)), None, 0);
                     }
                 } else {
+                    if self.site {
+                        frame.execute_java_script(Some(&CefString::from("window.__mlb_site=1;")), None, 0);
+                    }
                     frame.execute_java_script(Some(&CefString::from(PAGE_JS)), None, 0);
                     if self.scroll {
                         frame.execute_java_script(Some(&CefString::from(SCROLL_JS)), None, 0);
@@ -689,6 +714,8 @@ wrap_request_handler! {
         id: u32,
         filtre: Arc<Filtre>,
         restreint: Restreint,
+        // (v246) Solo : pas de lecteur embarqué.
+        site: bool,
         out: Shared,
     }
 
@@ -730,7 +757,7 @@ wrap_request_handler! {
             _request_initiator: Option<&CefString>,
             _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
         ) -> Option<ResourceRequestHandler> {
-            Some(Entetes::new(self.filtre.clone(), self.restreint))
+            Some(Entetes::new(self.filtre.clone(), self.restreint, self.site))
         }
     }
 }
@@ -739,6 +766,8 @@ wrap_resource_request_handler! {
     struct Entetes {
         filtre: Arc<Filtre>,
         restreint: Restreint,
+        // (v246) Solo : pas de lecteur embarqué.
+        site: bool,
     }
 
     impl ResourceRequestHandler {
@@ -757,7 +786,8 @@ wrap_resource_request_handler! {
                 return ReturnValue::CANCEL;
             }
             // (v210) Une vidéo du site YouTube ouverte dans l'onglet : le lecteur officiel.
-            if req.resource_type() == ResourceType::MAIN_FRAME {
+            // (v246) En ligne seulement : en solo, le site complet.
+            if !self.site && req.resource_type() == ResourceType::MAIN_FRAME {
                 if let Some(lecteur) = filtre::vers_lecteur(&url) {
                     req.set_url(Some(&CefString::from(lecteur.as_str())));
                     return ReturnValue::CONTINUE;
@@ -948,6 +978,37 @@ fn dns_doh() {
         "DNS familial de Cloudflare : {} (mode {mode})",
         if ok { "en place" } else { "PAS en place" }
     );
+    restrictions_de_la_machine();
+}
+
+/// (v246) Ce que Chromium impose de lui-même à YouTube et à Google, d'après ses préférences
+/// (`ForceYouTubeRestrict`, `ForceGoogleSafeSearch` : des règles de Chrome qu'un logiciel ou
+/// un administrateur peut poser sur la machine, et que ce navigateur relit). Écrit au
+/// journal pour savoir d'où vient un mode restreint de YouTube ; « imposé » si la règle ne
+/// peut pas être changée ici. On ne la change pas : c'est le choix de la machine.
+fn restrictions_de_la_machine() {
+    let Some(ctx) = request_context_get_global_context() else {
+        return;
+    };
+    for nom in ["settings.force_youtube_restrict", "settings.force_google_safesearch"] {
+        let c = CefString::from(nom);
+        if ctx.has_preference(Some(&c)) != 1 {
+            eprintln!("règle de Chromium {nom} : absente");
+            continue;
+        }
+        let valeur = ctx.preference(Some(&c)).map_or(String::from("?"), |v| {
+            match v.get_type() {
+                t if t == ValueType::from(sys::cef_value_type_t::VTYPE_INT) => v.int().to_string(),
+                t if t == ValueType::from(sys::cef_value_type_t::VTYPE_BOOL) => (v.bool() != 0).to_string(),
+                t => format!("{t:?}"),
+            }
+        });
+        let impose = ctx.can_set_preference(Some(&c)) != 1;
+        eprintln!(
+            "règle de Chromium {nom} : {valeur}{}",
+            if impose { " (imposée par la machine)" } else { "" }
+        );
+    }
 }
 
 /// (v243) Le DNS chiffré familial de Cloudflare (adresse documentée par Cloudflare).
@@ -1012,12 +1073,12 @@ impl Tab {
         let mut client = TabClient::new(
             painter,
             console,
-            Loader::new(id, opts.scroll, out.clone()),
+            Loader::new(id, opts.scroll, opts.site, out.clone()),
             Popups::new(id),
             Dialogs::new(),
             Files::new(),
             Permissions::new(),
-            Garde::new(id, filtre.clone(), opts.restreint, out.clone()),
+            Garde::new(id, filtre.clone(), opts.restreint, opts.site, out.clone()),
         );
         let window_info = WindowInfo::default().set_as_windowless(sys::HWND::default());
         let settings = BrowserSettings {

@@ -367,7 +367,9 @@ pub const HOME_URL: &str = "https://www.youtube.com/";
 const PAUSE_JS: &str = "(()=>{document.querySelectorAll('video,audio').forEach(m=>{if(!m.paused)m.pause();});\
 if(window.__mlb)window.__mlb.pauseVideo();})()";
 /// (v210) Lecture automatique permise sur la page du lecteur de l'écran regardé.
-const REGARDE_JS: &str = "(()=>{if(window.__mlb)window.__mlb.regarde();})()";
+/// (v246) Et sur un Short du site, en ligne : le Short de l'écran regardé se lance.
+const REGARDE_JS: &str =
+    "(()=>{if(window.__mlb)window.__mlb.regarde();else if(window.__mlb_short)window.__mlb_short();})()";
 /// (v210) Un écran est « regardé » (sa vidéo démarre seule) s'il est visé et visible à
 /// plus de moitié ; l'accord lui est redonné tant qu'il l'est (une page qui se recharge).
 const REGARDE_PART: f32 = 0.5;
@@ -561,7 +563,11 @@ impl Displays {
             return;
         }
         self.regarde_in = REGARDE_S;
-        if self.tabs.get(&id).is_some_and(|t| crate::watch::is_player(&t.addr)) {
+        if self
+            .tabs
+            .get(&id)
+            .is_some_and(|t| crate::watch::is_player(&t.addr) || crate::watch::is_short(&t.addr))
+        {
             self.eval(id, REGARDE_JS);
         }
     }
@@ -1596,6 +1602,9 @@ impl Browser {
             .arg(data.join("filtres"))
             .arg("--restreint")
             .arg("non")
+            // (v246) En solo, le site complet de YouTube, pas le lecteur embarqué (demande
+            // du propriétaire).
+            .args((!en_ligne).then_some("--site-complet"))
             // (v213) Le volume des écrans dès le lancement, sans un éclat de son avant.
             .arg("--volume")
             .arg(volume_pct(volume).to_string())

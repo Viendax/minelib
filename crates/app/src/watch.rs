@@ -18,6 +18,10 @@
 //!   récente et y amène sa page (vidéo ouverte, temps et pause corrigés). Une page en retard
 //!   de plus de 4 s (chargement) est recalée. Pendant une pub YouTube, rien n'est lu ni
 //!   corrigé. Qui reçoit plus ancien que ce qu'il a répond avec le sien.
+//! - **(v246) Shorts.** Ils restent sur le site de YouTube, chez chacun : glisser au Short
+//!   suivant change la vidéo de l'écran, et les autres sont amenés au même Short
+//!   (`youtube.com/shorts/<numéro>`) dans leur propre navigateur. On partage le numéro du
+//!   Short, jamais les images de la page.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,9 +32,9 @@ use crate::screen::Placed;
 
 /// Début des messages de cette partie dans le canal de la voix. Lu comme un message de la
 /// voix, `0xFF` puis `M` est un numéro de variante que la voix n'a pas : ignoré. `2` : avec
-/// la taille des écrans (v160) ; un jeu plus ancien (`V`) ignore ces messages, et
-/// inversement.
-pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'2'];
+/// la taille des écrans (v160) ; `3` : (v246) une vidéo peut être un Short. Un jeu plus
+/// ancien ignore ces messages, et inversement.
+pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'3'];
 /// Un écran est montré aux joueurs à moins de tant de blocs de lui.
 pub const RANGE: f32 = 64.0;
 /// Un écran annoncé plus loin que ça de celui qui l'annonce est refusé.
@@ -77,6 +81,8 @@ pub struct Video {
     pub seq: u32,
     /// Qui l'a donnée.
     pub by: String,
+    /// (v246) Un Short : il s'ouvre sur le site de YouTube, pas dans le lecteur.
+    pub short: bool,
 }
 
 impl Video {
@@ -133,6 +139,8 @@ pub struct Page {
     pub paused: bool,
     /// Une pub YouTube passe.
     pub ad: bool,
+    /// (v246) La page est un Short du site de YouTube.
+    pub short: bool,
 }
 
 /// Vidéo partagée d'un écran, telle qu'on la connaît ici.
@@ -278,7 +286,7 @@ impl Party {
         // Vidéo changée ici avant d'en avoir le temps : on le donne dès qu'on l'a.
         if track.is_some_and(|t| t.guess) && page.video == shared && page.t >= 0.0 {
             if let Some(v) = page.video.clone() {
-                self.local(id, v, page.t, page.paused, me);
+                self.local(id, v, page.t, page.paused, page.short, me);
             }
             return;
         }
@@ -290,7 +298,7 @@ impl Party {
         if Some(&v) != shared.as_ref() {
             // Une autre vidéo ouverte sur cette page (clic, vidéo suivante, `/yt`).
             if before.as_ref() != Some(&v) {
-                self.local(id, v, page.t, page.paused, me);
+                self.local(id, v, page.t, page.paused, page.short, me);
             }
             return;
         }
@@ -305,12 +313,12 @@ impl Party {
         let elapsed = if p.paused { 0.0 } else { prev.age };
         let jumped = page.t > p.t + elapsed + JUMP_FWD_S || page.t < p.t - JUMP_BACK_S;
         if page.paused != p.paused || jumped {
-            self.local(id, v, page.t, page.paused, me);
+            self.local(id, v, page.t, page.paused, page.short, me);
         }
     }
 
     /// Geste du joueur sur la page de l'écran `id` : nouvelle vidéo partagée.
-    fn local(&mut self, id: u32, video: String, t: f32, paused: bool, me: &str) {
+    fn local(&mut self, id: u32, video: String, t: f32, paused: bool, short: bool, me: &str) {
         let seq = self
             .tracks
             .get(&id)
@@ -323,6 +331,7 @@ impl Party {
             paused,
             seq,
             by: by.clone(),
+            short,
         };
         self.tracks.insert(
             id,
@@ -526,7 +535,7 @@ impl Party {
                         t.video.by,
                         t.now()
                     );
-                    acts.push(Act::Open(id, watch_url(&t.video.id, t.now())));
+                    acts.push(Act::Open(id, open_url(&t.video, t.now())));
                     t.settle = SETTLE_OPEN_S;
                     t.fine = true;
                 } else if let Some(p) = on_it {
@@ -719,6 +728,35 @@ pub fn watch_url(id: &str, t: f32) -> String {
     format!("{LECTEUR}?v={id}&t={}", t.max(0.0) as u32)
 }
 
+/// (v246) L'adresse d'un Short sur le site de YouTube (il recommence en boucle : le temps
+/// est corrigé ensuite, une fois la page là).
+pub fn short_url(id: &str) -> String {
+    format!("https://www.youtube.com/shorts/{id}")
+}
+
+/// (v246) L'adresse qui ouvre une vidéo partagée : le lecteur, ou le site pour un Short.
+fn open_url(v: &Video, t: f32) -> String {
+    if v.short {
+        short_url(&v.id)
+    } else {
+        watch_url(&v.id, t)
+    }
+}
+
+/// (v246) L'adresse est-elle un Short du site de YouTube ?
+pub fn is_short(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or("");
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "www.youtube.com" | "youtube.com" | "m.youtube.com"
+    ) && path.starts_with("shorts/")
+        && video_of(url).is_some()
+}
+
 /// (v210) L'adresse est-elle la page du lecteur ?
 pub fn is_player(url: &str) -> bool {
     url.strip_prefix(LECTEUR)
@@ -738,7 +776,7 @@ pub fn control_js(seek: Option<f32>, paused: bool) -> String {
         "if(p&&p.playVideo)p.playVideo();else if(v)v.play();"
     };
     format!(
-        "(()=>{{const p=window.__mlb||document.getElementById('movie_player');\
+        "(()=>{{const p=window.__mlb||document.getElementById(location.pathname.startsWith('/shorts/')?'shorts-player':'movie_player');\
          const v=(p&&p.querySelector&&p.querySelector('video'))||document.querySelector('video');{seek}{play}}})()"
     )
 }
@@ -765,11 +803,13 @@ pub fn parse_page(json: &str) -> Option<Page> {
     if !r.i.is_empty() && video.as_deref() != Some(r.i.as_str()) {
         t = -1.0;
     }
+    let short = is_short(&r.u);
     Some(Page {
         video,
         t,
         paused: r.p,
         ad: r.a,
+        short,
     })
 }
 
@@ -817,9 +857,18 @@ mod tests {
                 video: Some(X.into()),
                 t: 12.5,
                 paused: false,
-                ad: false
+                ad: false,
+                short: false,
             }
         );
+        // (v246) Un Short du site.
+        let p = parse_page(&format!(
+            r#"{{"u":"https://www.youtube.com/shorts/{X}","t":3,"p":false,"a":false,"i":"{X}"}}"#
+        ))
+        .unwrap();
+        assert!(p.short && p.video.as_deref() == Some(X));
+        assert!(is_short(&short_url(X)) && !is_short(&watch_url(X, 0.0)));
+        assert!(!is_short("https://www.youtube.com/shorts/court"));
         // Le lecteur joue encore l'ancienne vidéo : temps pas sûr.
         let p = parse_page(&format!(
             r#"{{"u":"https://www.youtube.com/watch?v={X}","t":80,"p":false,"i":"{Y}"}}"#
@@ -998,6 +1047,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// (v246) Alice glisse d'un Short à l'autre sur le site : Bob est amené à chacun, sur
+    /// le site aussi (jamais dans le lecteur).
+    #[test]
+    fn les_shorts_se_suivent_sur_le_site() {
+        let s = screen_at(0);
+        let id = s.id();
+        let mut ps = vec![
+            Player::new(A, Vec3::new(0.0, 65.0, 6.0)),
+            Player::new(B, Vec3::new(3.0, 65.0, 8.0)),
+        ];
+        ps[0].local.push(s);
+        ps[0].party.screens_changed();
+        run(&mut ps, 1.0);
+        ps[0].page(id).act(&Act::Open(id, short_url(X)));
+        run(&mut ps, 6.0);
+        assert_eq!(ps[1].page(id).url, short_url(X));
+        // Short suivant.
+        ps[0].page(id).act(&Act::Open(id, short_url(Y)));
+        run(&mut ps, 6.0);
+        assert_eq!(ps[1].page(id).url, short_url(Y));
+        assert_eq!(ps[0].page(id).url, short_url(Y));
+        // Puis une vidéo ordinaire : le lecteur.
+        ps[1].page(id).act(&Act::Open(id, watch_url(X, 0.0)));
+        run(&mut ps, 7.0);
+        assert!(is_player(&ps[0].page(id).url), "{}", ps[0].page(id).url);
     }
 
     fn screen_at(x: i32) -> Placed {
@@ -1189,6 +1265,7 @@ mod tests {
             paused: false,
             seq: 1,
             by: A.into(),
+            short: false,
         };
         let m = msg(&Msg::Screens(vec![shared(&s, Some(bad))]));
         p.receive(A, &m, Some(Vec3::new(0.0, 65.0, 5.0)), &[]);
@@ -1202,6 +1279,7 @@ mod tests {
             paused: false,
             seq,
             by: A.into(),
+            short: false,
         };
         let m = msg(&Msg::Video {
             screen: s.id(),

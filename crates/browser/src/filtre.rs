@@ -479,8 +479,9 @@ pub fn est_lecteur(url: &str) -> bool {
         .is_some_and(|r| r.is_empty() || r.starts_with('?') || r.starts_with('#'))
 }
 
-/// (v210) Une vidéo du site YouTube (`/watch?v=…`, `/shorts/…`, `/live/…`, `youtu.be/…`) :
-/// la page du lecteur qui la joue, au même temps. Le site complet ne sert qu'à chercher.
+/// (v210) Une vidéo du site YouTube (`/watch?v=…`, `/live/…`, `youtu.be/…`) : la page du
+/// lecteur qui la joue, au même temps. Le site complet ne sert qu'à chercher. (v246) Les
+/// Shorts restent sur le site (on y passe de l'un à l'autre en glissant).
 pub fn vers_lecteur(url: &str) -> Option<String> {
     let reste = url
         .strip_prefix("https://")
@@ -504,11 +505,7 @@ pub fn vers_lecteur(url: &str) -> Option<String> {
             if chemin == "watch" {
                 parametre("v")?
             } else {
-                ["shorts/", "live/"]
-                    .iter()
-                    .find_map(|p| chemin.strip_prefix(p))?
-                    .split('/')
-                    .next()?
+                chemin.strip_prefix("live/")?.split('/').next()?
             }
         }
         _ => return None,
@@ -655,7 +652,8 @@ mod tests {
             vers_lecteur(&format!("https://www.youtube.com/watch?list=PL1&v={x}&t=1m30s")),
             Some(format!("{}&t=90", l(x)))
         );
-        assert_eq!(vers_lecteur(&format!("https://m.youtube.com/shorts/{x}")), Some(l(x)));
+        // (v246) Les Shorts restent sur le site.
+        assert_eq!(vers_lecteur(&format!("https://m.youtube.com/shorts/{x}")), None);
         assert_eq!(vers_lecteur(&format!("https://youtu.be/{x}?t=42")), Some(format!("{}&t=42", l(x))));
         assert_eq!(vers_lecteur(&format!("https://www.youtube.com/live/{x}")), Some(l(x)));
         // La recherche, l'accueil, une chaîne et le lecteur embarqué restent où ils sont.
