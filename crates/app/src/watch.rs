@@ -38,10 +38,14 @@ use crate::screen::Placed;
 /// Début des messages de cette partie dans le canal de la voix. Lu comme un message de la
 /// voix, `0xFF` puis `M` est un numéro de variante que la voix n'a pas : ignoré. `2` : avec
 /// la taille des écrans (v160) ; `3` : (v246) une vidéo peut être un Short ; `4` : (v253)
-/// avec la file d'attente. Un jeu plus ancien ignore ces messages, et inversement.
-pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'4'];
-/// (v253) Au plus tant de vidéos dans la file d'un écran.
+/// avec la file d'attente ; `5` : (v291) avec les vidéos déjà vues (la playlist entière).
+/// Un jeu plus ancien ignore ces messages, et inversement.
+pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'5'];
+/// (v253) Au plus tant de vidéos ajoutées dans la file d'un écran.
 pub const MAX_FILE: usize = 30;
+/// (v291) Au plus tant de vidéos dans la playlist d'un écran, sans celle en cours (déjà
+/// vues et à suivre) : au-delà, les plus anciennes vues s'en vont.
+pub const MAX_LISTE: usize = 60;
 /// Un écran est montré aux joueurs à moins de tant de blocs de lui.
 pub const RANGE: f32 = 64.0;
 /// Un écran annoncé plus loin que ça de celui qui l'annonce est refusé.
@@ -92,6 +96,9 @@ pub struct Video {
     pub short: bool,
     /// (v253) La file d'attente de l'écran (numéros de vidéos, dans l'ordre).
     pub queue: Vec<String>,
+    /// (v291) Les vidéos déjà vues de la playlist, de la plus ancienne à la dernière : la
+    /// playlist entière est `lus`, puis `id` (en cours), puis `queue`.
+    pub lus: Vec<String>,
 }
 
 impl Video {
@@ -106,8 +113,37 @@ impl Video {
             && self.seq < SEQ_MAX
             && !self.by.is_empty()
             && self.by.len() <= 32
-            && self.queue.len() <= MAX_FILE
-            && self.queue.iter().all(|v| valid_id(v))
+            && self.queue.len() + self.lus.len() <= MAX_LISTE
+            && self.queue.iter().chain(&self.lus).all(|v| valid_id(v))
+    }
+
+    /// (v291) La playlist entière (vues, en cours, à suivre) et le rang de celle en cours.
+    fn liste(&self) -> (Vec<String>, usize) {
+        let mut l = self.lus.clone();
+        l.push(self.id.clone());
+        l.extend(self.queue.iter().cloned());
+        (l, self.lus.len())
+    }
+
+    /// (v291) Remet la playlist `l`, la vidéo en cours au rang `pos` (les vues avant, les
+    /// à suivre après). Au-delà de `MAX_LISTE`, les plus anciennes vues s'en vont.
+    fn set_liste(&mut self, mut l: Vec<String>, pos: usize) {
+        if pos >= l.len() {
+            return;
+        }
+        self.queue = l.split_off(pos + 1);
+        if let Some(v) = l.pop() {
+            self.id = v;
+        }
+        self.lus = l;
+        self.rogne();
+    }
+
+    /// (v291) La playlist tient dans `MAX_LISTE` : les plus anciennes vues s'en vont.
+    fn rogne(&mut self) {
+        let trop = (self.lus.len() + self.queue.len()).saturating_sub(MAX_LISTE);
+        self.lus.drain(..trop.min(self.lus.len()));
+        self.queue.truncate(MAX_LISTE);
     }
 }
 
@@ -176,6 +212,9 @@ struct Track {
     guess: bool,
     /// Vidéo ouverte pour elle : la page sera recalée au plus près une fois chargée.
     fine: bool,
+    /// (v291) Personne d'autre près de l'écran (à la dernière mise à jour) : quitter la
+    /// vidéo pour un autre site la met alors en pause ; avec d'autres, elle continue pour eux.
+    seul: bool,
 }
 
 impl Track {
@@ -315,11 +354,22 @@ impl Party {
             }
             return;
         }
+        let before = prev.as_ref().and_then(|p| p.page.video.clone());
         let Some(v) = page.video.clone() else {
-            // Accueil, recherche, autre site : rien ne se partage.
+            // Accueil, recherche, autre site : rien ne se partage. (v291) Mais quitter la
+            // vidéo partagée pour un autre site la met en pause là où elle en était (demande
+            // du propriétaire) : un clic sur elle dans la playlist la reprend à cet endroit.
+            // Seulement sans personne d'autre près de l'écran : avec d'autres, elle continue
+            // pour eux, et le clic ramène la page au moment où ils en sont.
+            if before.is_some() && before == shared {
+                if let Some(t) = self.tracks.get(&id).filter(|t| !t.video.paused && t.seul) {
+                    let (vid, at, short) = (t.video.id.clone(), t.now(), t.video.short);
+                    log::info!("regarder ensemble : écran {id}, page partie ailleurs : {vid} en pause à {at:.1} s");
+                    self.local(id, vid, at, true, short, me);
+                }
+            }
             return;
         };
-        let before = prev.as_ref().and_then(|p| p.page.video.clone());
         if Some(&v) != shared.as_ref() {
             // Une autre vidéo ouverte sur cette page (clic, vidéo suivante, `/yt`).
             if before.as_ref() != Some(&v) {
@@ -350,15 +400,24 @@ impl Party {
             .map_or(1, |t| t.video.seq.saturating_add(1))
             .min(SEQ_MAX - 1);
         let by: String = me.chars().take(32).collect();
-        let video = Video {
+        // (v291) Une autre vidéo ouverte sur la page : celle d'avant passe dans les vues ;
+        // la playlist reste (une page Google ou un autre site n'y touchent pas).
+        let avant = self.tracks.get(&id).map(|t| &t.video);
+        let mut lus = avant.map(|v| v.lus.clone()).unwrap_or_default();
+        if let Some(v) = avant.filter(|v| v.id != video) {
+            lus.push(v.id.clone());
+        }
+        let mut video = Video {
             id: video,
             t: t.clamp(0.0, MAX_T),
             paused,
             seq,
             by: by.clone(),
             short,
-            queue: self.tracks.get(&id).map(|t| t.video.queue.clone()).unwrap_or_default(),
+            queue: avant.map(|v| v.queue.clone()).unwrap_or_default(),
+            lus,
         };
+        video.rogne();
         self.tracks.insert(
             id,
             Track {
@@ -370,6 +429,7 @@ impl Party {
                 corrected: CORRECT_S,
                 guess: t < 0.0,
                 fine: false,
+                seul: true,
             },
         );
         self.changed.push(id);
@@ -389,6 +449,7 @@ impl Party {
                 corrected: CORRECT_S,
                 guess: false,
                 fine: false,
+                seul: true,
             },
         );
         self.changed.push(id);
@@ -412,7 +473,10 @@ impl Party {
         }
         let next = queue.remove(0);
         log::info!("regarder ensemble : écran {id}, vidéo finie, suivante de la file : {next}");
-        let video = Video {
+        // (v291) La finie reste dans la playlist, avec les vues.
+        let mut lus = t.video.lus.clone();
+        lus.push(t.video.id.clone());
+        let mut video = Video {
             id: next,
             t: 0.0,
             paused: false,
@@ -420,7 +484,9 @@ impl Party {
             by: me.chars().take(32).collect(),
             short: false,
             queue,
+            lus,
         };
+        video.rogne();
         self.give(id, video);
     }
 
@@ -431,6 +497,13 @@ impl Party {
     ///   cours ; sinon elle s'ouvre ;
     /// - `{"retire":rang,"v":vidéo}` (la croix dans la file) : retirée de la file.
     ///
+    /// (v291) Les rangs sont ceux de la playlist entière (vues, en cours, à suivre) :
+    /// - `{"joue":rang,"v":vidéo}` (clic sur une vidéo de la playlist) : elle se lance pour
+    ///   tous ; celles d'avant comptent comme vues, celles d'après sont à suivre ;
+    /// - `{"monte":rang,"v":vidéo}`, `{"descend":rang,"v":vidéo}` (les flèches) : échangée
+    ///   avec sa voisine, vues comprises ; celle en cours continue ;
+    /// - `{"retire":rang,"v":vidéo}` : retirée (pas celle en cours).
+    ///
     /// (v257) `cote` : l'ordre vient de la recherche à côté du lecteur (un autre onglet) ; la
     /// page du lecteur n'a pas bougé, rien n'est rouvert quand la vidéo va dans la file.
     pub fn order(&mut self, id: u32, json: &str, me: &str, cote: bool) -> Option<Act> {
@@ -440,6 +513,14 @@ impl Party {
             clic: Option<String>,
             #[serde(default)]
             retire: Option<usize>,
+            #[serde(default)]
+            joue: Option<usize>,
+            #[serde(default)]
+            monte: Option<usize>,
+            #[serde(default)]
+            descend: Option<usize>,
+            #[serde(default)]
+            reprend: Option<usize>,
             #[serde(default)]
             v: Option<String>,
         }
@@ -469,18 +550,81 @@ impl Party {
             self.put(id, video);
             return retour;
         }
-        if let (Some(i), Some(vid)) = (o.retire, o.v) {
-            let t = self.tracks.get(&id)?;
-            if t.video.queue.get(i) != Some(&vid) {
+        let geste = o
+            .joue
+            .map(|i| (Geste::Joue, i))
+            .or(o.monte.map(|i| (Geste::Monte, i)))
+            .or(o.descend.map(|i| (Geste::Descend, i)))
+            .or(o.retire.map(|i| (Geste::Retire, i)))
+            .or(o.reprend.map(|i| (Geste::Reprend, i)));
+        let (Some((g, i)), Some(vid)) = (geste, o.v) else {
+            return None;
+        };
+        self.geste(id, g, i, &vid, me)
+    }
+
+    /// (v291) Un geste sur la playlist de l'écran `id` : la vidéo au rang `i` (de la
+    /// playlist entière) doit être `vid`, sinon rien (la playlist a changé entre-temps).
+    fn geste(&mut self, id: u32, g: Geste, i: usize, vid: &str, me: &str) -> Option<Act> {
+        let t = self.tracks.get(&id)?;
+        let (mut l, mut pos) = t.video.liste();
+        if l.get(i).map(String::as_str) != Some(vid) {
+            return None;
+        }
+        let mut video = t.at_now();
+        video.seq = self.next_seq(id);
+        video.by = me.chars().take(32).collect();
+        match g {
+            Geste::Reprend => {
+                if i != pos {
+                    return None;
+                }
+                // Celle en cours, en pause (la page est partie ailleurs, ou mise en pause) :
+                // elle reprend pour tous là où elle en était, et la page y revient. Pas en
+                // pause : la page seule y revient, au temps de tous.
+                if !video.paused {
+                    return Some(Act::Open(id, open_url(&video, t.now())));
+                }
+                video.paused = false;
+                log::info!("regarder ensemble : écran {id}, {vid} reprise à {:.1} s", video.t);
+                self.give(id, video);
                 return None;
             }
-            let mut video = t.at_now();
-            video.queue.remove(i);
-            video.seq = self.next_seq(id);
-            video.by = me.chars().take(32).collect();
-            log::info!("regarder ensemble : écran {id}, {vid} retirée de la file");
-            self.put(id, video);
+            Geste::Joue => {
+                if i == pos {
+                    return None;
+                }
+                video.set_liste(l, i);
+                video.t = 0.0;
+                video.paused = false;
+                video.short = false;
+                log::info!("regarder ensemble : écran {id}, {vid} lancée depuis la playlist");
+                self.give(id, video);
+                return None;
+            }
+            Geste::Monte | Geste::Descend => {
+                let j = if g == Geste::Monte { i.checked_sub(1) } else { Some(i + 1) };
+                let j = j.filter(|&j| j < l.len())?;
+                l.swap(i, j);
+                if pos == i {
+                    pos = j;
+                } else if pos == j {
+                    pos = i;
+                }
+            }
+            Geste::Retire => {
+                if i == pos {
+                    return None;
+                }
+                l.remove(i);
+                if i < pos {
+                    pos -= 1;
+                }
+                log::info!("regarder ensemble : écran {id}, {vid} retirée de la playlist");
+            }
         }
+        video.set_liste(l, pos);
+        self.put(id, video);
         None
     }
 
@@ -512,10 +656,13 @@ impl Party {
         None
     }
 
-    /// (v289) La file d'attente de l'écran `id` (vide s'il n'y en a pas) : son volet la
-    /// montre.
-    pub fn file(&self, id: u32) -> &[String] {
-        self.tracks.get(&id).map_or(&[], |t| &t.video.queue)
+    /// (v289) La playlist de l'écran `id`, que son volet montre : (v291) les vues, celle en
+    /// cours, celles à suivre, et si celle en cours est en pause. `None` : rien de partagé
+    /// sur l'écran.
+    pub fn liste(&self, id: u32) -> Option<(&[String], &str, &[String], bool)> {
+        self.tracks.get(&id).map(|t| {
+            (&t.video.lus[..], t.video.id.as_str(), &t.video.queue[..], t.video.paused)
+        })
     }
 
     /// (v253) La même vidéo, au même point, avec une autre file : rien à faire à la page
@@ -613,6 +760,7 @@ impl Party {
                         corrected: CORRECT_S,
                         guess: false,
                         fine: false,
+                        seul: true,
                     },
                 );
             }
@@ -704,6 +852,11 @@ impl Party {
             // de l'écran qui la montre, sur toutes les pages (voir `Party::file`).
             // Depuis combien de temps la page a donné ce temps.
             let page_age = self.pages.get(&id).map_or(0.0, |s| s.age);
+            // (v213) Personne d'autre près de l'écran : rien à garder ensemble (voir plus bas).
+            let seul = shown
+                .get(&id)
+                .is_none_or(|(s, _)| near(players, center(s), RANGE).is_empty());
+            t.seul = seul;
             let key = (t.video.seq, t.video.by.clone());
             let on_it = page.filter(|p| p.video.as_deref() == Some(t.video.id.as_str()));
             if t.applied.as_ref() != Some(&key) {
@@ -745,9 +898,6 @@ impl Party {
             // partagée suit alors la page (une page qui a bloqué un instant n'est jamais
             // avancée d'un saut, ce qui s'entendait comme une petite coupure) ; un joueur
             // qui arrive reçoit le temps où en est vraiment la page.
-            let seul = shown
-                .get(&id)
-                .is_none_or(|(s, _)| near(players, center(s), RANGE).is_empty());
             if seul {
                 t.video.t = p.t.clamp(0.0, MAX_T);
                 t.video.paused = p.paused;
@@ -836,6 +986,16 @@ impl Party {
     pub fn take_out(&mut self) -> Vec<(Vec<String>, Vec<u8>)> {
         std::mem::take(&mut self.out)
     }
+}
+
+/// (v291) Un geste sur la playlist d'un écran (voir [`Party::order`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Geste {
+    Joue,
+    Monte,
+    Descend,
+    Retire,
+    Reprend,
 }
 
 /// Joueurs à moins de `range` de `p`.
@@ -1352,10 +1512,13 @@ mod tests {
             assert_eq!(p.party.tracks[&id].video.queue, vec![Y.to_string(), z.to_string()]);
             assert_eq!(p.party.tracks[&id].video.id, X);
         }
-        // Une croix chez Alice retire z (le bon rang et le bon numéro seulement).
-        assert_eq!(ps[0].party.order(id, &format!(r#"{{"retire":0,"v":"{z}"}}"#), A, false), None);
+        // Une croix chez Alice retire z (le bon rang et le bon numéro seulement ; v291 : rangs
+        // de la playlist entière, X en cours au rang 0).
+        assert_eq!(ps[0].party.order(id, &format!(r#"{{"retire":1,"v":"{z}"}}"#), A, false), None);
         assert_eq!(ps[0].party.tracks[&id].video.queue.len(), 2);
-        ps[0].party.order(id, &format!(r#"{{"retire":1,"v":"{z}"}}"#), A, false);
+        ps[0].party.order(id, &format!(r#"{{"retire":0,"v":"{X}"}}"#), A, false);
+        assert_eq!(ps[0].party.tracks[&id].video.id, X, "pas celle en cours");
+        ps[0].party.order(id, &format!(r#"{{"retire":2,"v":"{z}"}}"#), A, false);
         run(&mut ps, 2.0);
         assert_eq!(ps[1].party.tracks[&id].video.queue, vec![Y.to_string()]);
         // La vidéo d'Alice finit : tout le monde passe à Y, la file se vide.
@@ -1365,10 +1528,103 @@ mod tests {
         for p in &mut ps {
             assert_eq!(p.page(id).video().as_deref(), Some(Y));
             assert!(p.party.tracks[&id].video.queue.is_empty());
+            // (v291) X reste dans la playlist, avec les vues.
+            assert_eq!(p.party.tracks[&id].video.lus, vec![X.to_string()]);
         }
-        // (v289) Le volet montre la file de l'écran.
-        assert!(ps[0].party.file(id).is_empty());
-        assert!(ps[0].party.file(id + 1).is_empty());
+        // (v289) Le volet montre la playlist de l'écran.
+        let empty: &[String] = &[];
+        assert_eq!(ps[0].party.liste(id), Some((&[X.to_string()][..], Y, empty, false)));
+        assert!(ps[0].party.liste(id + 1).is_none());
+    }
+
+    /// (v291) La playlist entière : un clic lance une vidéo (vues avant, à suivre après), les
+    /// flèches échangent deux voisines, vues comprises, sans arrêter celle en cours ; une page
+    /// Google (ou tout autre site) n'y touche pas ; une autre vidéo ouverte à la main passe
+    /// celle d'avant dans les vues.
+    #[test]
+    fn la_playlist_se_lance_se_range_et_reste() {
+        let mut p = Party::new();
+        let ecran = screen_at(0);
+        let id = ecran.id();
+        let (a, b, c, d) = ("aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd");
+        let page = |v: &str| {
+            format!(r#"{{"u":"{}","t":12,"p":false,"a":false,"i":"{v}","e":false}}"#, watch_url(v, 0.0))
+        };
+        p.observe(id, &page(a), A);
+        for v in [b, c, d] {
+            p.order(id, &format!(r#"{{"clic":"{v}"}}"#), A, true);
+        }
+        let liste = |p: &Party| {
+            let (l, cur, q, _) = p.liste(id).unwrap();
+            (l.to_vec(), cur.to_string(), q.to_vec())
+        };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(liste(&p), (s(&[]), a.to_string(), s(&[b, c, d])));
+        // Une page Google, puis un autre site : la playlist ne bouge pas, et la vidéo en
+        // cours se met en pause là où elle en était.
+        p.update(3.0, &[ecran], &[]);
+        assert!(!p.tracks[&id].video.paused);
+        let avant = p.tracks[&id].now();
+        p.observe(id, r#"{"u":"https://www.google.com/search?q=chat","t":-1,"p":true,"a":false,"i":"","e":false}"#, A);
+        p.update(5.0, &[ecran], &[]);
+        p.observe(id, r#"{"u":"https://www.twitch.tv/","t":-1,"p":true,"a":false,"i":"","e":false}"#, A);
+        assert_eq!(liste(&p), (s(&[]), a.to_string(), s(&[b, c, d])));
+        assert!(p.liste(id).unwrap().3, "en pause");
+        assert!(close(p.tracks[&id].now(), avant, 0.01), "{} / {avant}", p.tracks[&id].now());
+        // Un clic sur elle : elle reprend à cet endroit, et la page y revient.
+        let reprend = |i: usize, v: &str| format!(r#"{{"reprend":{i},"v":"{v}"}}"#);
+        assert_eq!(p.order(id, &reprend(1, b), A, false), None);
+        assert!(p.liste(id).unwrap().3, "pas la bonne : rien");
+        p.order(id, &reprend(0, a), A, false);
+        assert!(!p.liste(id).unwrap().3);
+        let acts = p.update(0.05, &[ecran], &[]);
+        assert!(
+            acts.iter().any(|x| matches!(x, Act::Open(_, u) if u.contains(a) && u.contains(&format!("t={}", avant as u32)))),
+            "{acts:?}"
+        );
+        // Pas en pause : la page seule y revient, au temps de tous.
+        let ici = p.order(id, &reprend(0, a), A, false);
+        assert!(matches!(&ici, Some(Act::Open(_, u)) if u.contains(a)), "{ici:?}");
+        // Clic sur c (rang 2) : elle se lance ; a et b sont vues, d à suivre.
+        let joue = |i: usize, v: &str| format!(r#"{{"joue":{i},"v":"{v}"}}"#);
+        assert_eq!(p.order(id, &joue(2, b), A, false), None, "mauvais numéro : rien");
+        assert_eq!(liste(&p).1, a);
+        p.order(id, &joue(2, c), A, false);
+        assert_eq!(liste(&p), (s(&[a, b]), c.to_string(), s(&[d])));
+        let acts = p.update(0.05, &[ecran], &[]);
+        assert!(acts.iter().any(|x| matches!(x, Act::Open(_, u) if u.contains(c))), "{acts:?}");
+        // Monter d au-dessus de c (en cours) : d passe dans les vues, c continue.
+        let t = p.tracks[&id].now();
+        p.order(id, &format!(r#"{{"monte":3,"v":"{d}"}}"#), A, false);
+        assert_eq!(liste(&p), (s(&[a, b, d]), c.to_string(), s(&[])));
+        assert!(close(p.tracks[&id].now(), t, 0.01) && !p.tracks[&id].video.paused);
+        // Descendre a (une vue) : elle reste vue tant qu'elle est avant c.
+        p.order(id, &format!(r#"{{"descend":0,"v":"{a}"}}"#), A, false);
+        assert_eq!(liste(&p), (s(&[b, a, d]), c.to_string(), s(&[])));
+        // Descendre c (en cours) sous rien : rien ; monter c : d devient à suivre.
+        p.order(id, &format!(r#"{{"descend":3,"v":"{c}"}}"#), A, false);
+        assert_eq!(liste(&p).1, c);
+        p.order(id, &format!(r#"{{"monte":3,"v":"{c}"}}"#), A, false);
+        assert_eq!(liste(&p), (s(&[b, a]), c.to_string(), s(&[d])));
+        // Relancer une vue (b, rang 0) : tout le reste est à suivre.
+        p.order(id, &joue(0, b), A, false);
+        assert_eq!(liste(&p), (s(&[]), b.to_string(), s(&[a, c, d])));
+        // Une autre vidéo ouverte à la main sur la page : b passe dans les vues.
+        p.update(6.0, &[ecran], &[]);
+        let x = "xxxxxxxxxxx";
+        p.observe(id, &page(b), A);
+        p.observe(id, &page(x), A);
+        assert_eq!(liste(&p), (s(&[b]), x.to_string(), s(&[a, c, d])));
+        // Jamais plus de MAX_LISTE : les plus anciennes vues s'en vont.
+        let mut v = p.tracks[&id].video.clone();
+        let (l, _) = v.liste();
+        let mut grande: Vec<String> = (0..MAX_LISTE + 5).map(|k| format!("{k:011}")).collect();
+        grande.extend(l);
+        let pos = grande.len() - 4;
+        v.set_liste(grande, pos);
+        assert_eq!(v.lus.len() + v.queue.len(), MAX_LISTE);
+        assert!(v.valid());
+        assert_eq!(v.queue, s(&[a, c, d]));
     }
 
     /// (v259) Depuis la recherche ouverte par la file, un clic ajoute toujours à la file,
@@ -1467,11 +1723,13 @@ mod tests {
         assert!(a > before + 8.5, "Alice a reculé : {before} puis {a}");
         assert!(close(a, b, 1.5), "retard pas rattrapé : Alice {a}, Bob {b}");
 
-        // Bob s'en va dans les recherches : rien ne change chez Alice.
+        // Bob s'en va dans les recherches : rien ne change chez Alice (v291 : la vidéo ne se
+        // met en pause en partant que pour qui est seul devant l'écran).
         ps[1].page(id).url = "https://www.youtube.com/results?search_query=chat".into();
         run(&mut ps, 2.0);
         assert_eq!(ps[0].page(id).video().as_deref(), Some(Y));
         assert!(!ps[0].page(id).paused);
+        assert!(!ps[1].party.tracks[&id].video.paused);
 
         // Alice retire son écran : il disparaît chez Bob.
         ps[0].local.clear();
@@ -1590,6 +1848,7 @@ mod tests {
             by: A.into(),
             short: false,
             queue: Vec::new(),
+            lus: Vec::new(),
         };
         let m = msg(&Msg::Screens(vec![shared(&s, Some(bad))]));
         p.receive(A, &m, Some(Vec3::new(0.0, 65.0, 5.0)), &[]);
@@ -1605,6 +1864,7 @@ mod tests {
             by: A.into(),
             short: false,
             queue: Vec::new(),
+            lus: Vec::new(),
         };
         let m = msg(&Msg::Video {
             screen: s.id(),

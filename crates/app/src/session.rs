@@ -2998,7 +2998,7 @@ impl Session {
         let orders = self.displays.take_orders();
         // (v289) Le volet de chaque écran montre sa file (en ligne seulement).
         let en_ligne = self.build.is_some();
-        self.displays.set_files(en_ligne, |id| self.party.file(id));
+        self.displays.set_files(en_ligne, |id| self.party.liste(id));
         let Some(b) = &self.build else {
             // (v253) Sans regarder ensemble, une vidéo cliquée s'ouvre, tout simplement.
             for (id, json, cote) in orders {

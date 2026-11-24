@@ -253,32 +253,49 @@ fn ordre_recherche(json: &str) -> Option<Option<&'static str>> {
     }
 }
 
-/// (v289) Un bouton du haut du volet : Google, la page précédente, la suivante.
+/// (v289) Un bouton du haut du volet : Google, (v291) Twitch, la page précédente, la
+/// suivante.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Nav {
     Google,
+    Twitch,
     Retour,
     Suivant,
 }
 
-/// (v289) L'ordre d'un bouton du haut du volet (`{"nav":"google"|"retour"|"suivant"}`).
+/// (v289) L'ordre d'un bouton du haut du volet
+/// (`{"nav":"google"|"twitch"|"retour"|"suivant"}`).
 fn ordre_nav(json: &str) -> Option<Nav> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     match v.get("nav")?.as_str()? {
         "google" => Some(Nav::Google),
+        "twitch" => Some(Nav::Twitch),
         "retour" => Some(Nav::Retour),
         "suivant" => Some(Nav::Suivant),
         _ => None,
     }
 }
 
-/// (v289) Ce que le volet d'un écran doit montrer (`__mlb.etat` de `panneau.html`) : la file
-/// (`f`, numéros vérifiés), les pages où aller (`h` : 1 retour, 2 suivant), la recherche
-/// ouverte (`r` : son site, ou rien) et si l'on est en ligne (`l`).
+/// (v289) Ce que le volet d'un écran doit montrer (`__mlb.etat` de `panneau.html`) : la
+/// playlist (`f`, v291 : entière, vues comprises ; un numéro invalide devient vide, les rangs
+/// restent), le rang de celle en cours (`c`, -1 sans rien), si elle est en pause (`p`) et si
+/// la page de l'écran la montre (`i`) — sinon un clic sur elle la reprend —, les pages où
+/// aller (`h` : 1 retour, 2 suivant), la recherche ouverte (`r` : son site, ou rien) et si
+/// l'on est en ligne (`l`).
 fn etat_volet(t: &Tab) -> String {
-    let file: Vec<&String> = t.file.iter().filter(|v| crate::watch::valid_id(v)).collect();
+    let file: Vec<&str> = t
+        .file
+        .iter()
+        .map(|v| if crate::watch::valid_id(v) { v.as_str() } else { "" })
+        .collect();
+    let c = t.pos.map_or(-1, |p| p as i64);
+    let cur = t.pos.and_then(|p| t.file.get(p));
+    let ici = cur.is_some() && crate::watch::video_of(&t.addr).as_ref() == cur;
     let r = t.cote.as_ref().filter(|c| c.voulue).map_or("", |c| c.site);
-    serde_json::json!({"f": file, "h": t.history, "r": r, "l": t.en_ligne}).to_string()
+    serde_json::json!({
+        "f": file, "c": c, "p": t.pause, "i": ici, "h": t.history, "r": r, "l": t.en_ligne
+    })
+    .to_string()
 }
 
 fn page_playing(json: &str) -> bool {
@@ -799,15 +816,37 @@ impl Displays {
         b
     }
 
-    /// (v289) La file d'attente de chaque écran (`file`, regarder ensemble) et si l'on est
-    /// en ligne : le volet les montre.
-    pub fn set_files<'a>(&mut self, en_ligne: bool, file: impl Fn(u32) -> &'a [String]) {
+    /// (v289) La playlist de chaque écran (regarder ensemble) et si l'on est en ligne : le
+    /// volet les montre. (v291) `liste` : les vues, celle en cours, celles à suivre, et si
+    /// celle en cours est en pause.
+    pub fn set_files<'a>(
+        &mut self,
+        en_ligne: bool,
+        liste: impl Fn(u32) -> Option<(&'a [String], &'a str, &'a [String], bool)>,
+    ) {
         for (id, tab) in self.tabs.iter_mut() {
-            let f = file(*id);
-            if tab.file != f {
-                tab.file = f.to_vec();
-            }
             tab.en_ligne = en_ligne;
+            let Some((lus, cur, queue, pause)) = liste(*id) else {
+                tab.file.clear();
+                tab.pos = None;
+                tab.pause = false;
+                continue;
+            };
+            tab.pause = pause;
+            let pareil = tab.pos == Some(lus.len())
+                && tab.file.len() == lus.len() + 1 + queue.len()
+                && tab
+                    .file
+                    .iter()
+                    .map(String::as_str)
+                    .eq(lus.iter().map(String::as_str).chain([cur]).chain(queue.iter().map(String::as_str)));
+            if !pareil {
+                tab.file.clear();
+                tab.file.extend(lus.iter().cloned());
+                tab.file.push(cur.to_string());
+                tab.file.extend(queue.iter().cloned());
+                tab.pos = Some(lus.len());
+            }
         }
     }
 
@@ -1657,6 +1696,9 @@ impl Displays {
                         Nav::Google => {
                             self.open(id, RECHERCHE);
                         }
+                        Nav::Twitch => {
+                            self.open(id, TWITCH);
+                        }
                         Nav::Retour => self.history(id, false),
                         Nav::Suivant => self.history(id, true),
                     }
@@ -1685,6 +1727,8 @@ impl Displays {
 pub const RECHERCHE: &str = "https://www.google.com/";
 /// (v211) La recherche de YouTube.
 pub const RECHERCHE_VIDEO: &str = "https://www.youtube.com/";
+/// (v291) L'adresse où mène le bouton Twitch du volet (demande du propriétaire).
+pub const TWITCH: &str = "https://www.twitch.tv/";
 
 /// (v253) La file d'attente du lecteur YouTube, sur la droite de l'écran (largeur
 /// `PANNEAU_U`..1, 352 px de 1280 dans la page). Comme les boutons, et pour soi seul : elle
@@ -1989,8 +2033,12 @@ struct Tab {
     o: f32,
     s: f32,
     /// (v289) La file d'attente de l'écran (regarder ensemble), et si l'on est en ligne
-    /// (en solo, pas de file : une vidéo cliquée s'ouvre).
+    /// (en solo, pas de file : une vidéo cliquée s'ouvre). (v291) La playlist entière (vues,
+    /// en cours, à suivre) et le rang de celle en cours.
     file: Vec<String>,
+    pos: Option<usize>,
+    /// (v291) Celle en cours est en pause (la page partie ailleurs, ou mise en pause).
+    pause: bool,
     en_ligne: bool,
     /// (v257) Où est allé le dernier appui (v289 : la page, la recherche ou le volet).
     appui: Cible,
@@ -2048,6 +2096,8 @@ impl Tab {
             o: 0.0,
             s: 0.0,
             file: Vec::new(),
+            pos: None,
+            pause: false,
             en_ligne: false,
             appui: Cible::Page,
             history: 0,
@@ -3053,6 +3103,7 @@ mod tests {
         assert_eq!(ordre_recherche(r#"{"recherche":false}"#), Some(None));
         assert_eq!(ordre_recherche(r#"{"clic":"dQw4w9WgXcQ"}"#), None);
         assert_eq!(ordre_nav(r#"{"nav":"google"}"#), Some(Nav::Google));
+        assert_eq!(ordre_nav(r#"{"nav":"twitch"}"#), Some(Nav::Twitch));
         assert_eq!(ordre_nav(r#"{"nav":"retour"}"#), Some(Nav::Retour));
         assert_eq!(ordre_nav(r#"{"nav":"suivant"}"#), Some(Nav::Suivant));
         assert_eq!(ordre_nav(r#"{"nav":"ailleurs"}"#), None);
@@ -3068,19 +3119,32 @@ mod tests {
     fn le_volet_se_cree_et_recoit_son_etat() {
         let mut d = Displays::new();
         d.tabs.insert(4, Tab::new(HOME_URL));
-        let file = vec!["dQw4w9WgXcQ".to_string(), "<script>".to_string(), "dm:x8abcd".to_string()];
-        d.set_files(true, |id| if id == 4 { &file[..] } else { &[] });
+        d.tabs.insert(5, Tab::new(HOME_URL));
+        let lus = vec!["dQw4w9WgXcQ".to_string()];
+        let file = vec!["<script>".to_string(), "dm:x8abcd".to_string()];
+        d.set_files(true, |id| (id == 4).then_some((&lus[..], "vm:123456", &file[..], true)));
+        assert_eq!(d.tabs[&4].file.len(), 4);
+        assert_eq!(d.tabs[&4].pos, Some(1));
+        assert!(d.tabs[&5].file.is_empty() && d.tabs[&5].pos.is_none());
         d.tabs.get_mut(&4).unwrap().panel_open = true;
         d.update(0.016);
         let t = &d.tabs[&4];
         let v = t.volet.as_ref().expect("volet créé");
         assert_ne!(v.bid, 4);
         let mut t = Tab::new(HOME_URL);
-        t.file = file.clone();
+        t.file = d.tabs[&4].file.clone();
+        t.pos = Some(1);
+        t.pause = d.tabs[&4].pause;
         t.en_ligne = true;
         t.history = 1;
         let e: serde_json::Value = serde_json::from_str(&etat_volet(&t)).unwrap();
-        assert_eq!(e["f"], serde_json::json!(["dQw4w9WgXcQ", "dm:x8abcd"]));
+        assert_eq!(e["f"], serde_json::json!(["dQw4w9WgXcQ", "vm:123456", "", "dm:x8abcd"]));
+        assert_eq!(e["c"], 1);
+        assert_eq!(e["p"], true);
+        assert_eq!(e["i"], false, "la page n'est pas sur elle");
+        t.addr = crate::watch::watch_url("vm:123456", 30.0);
+        let e: serde_json::Value = serde_json::from_str(&etat_volet(&t)).unwrap();
+        assert_eq!(e["i"], true);
         assert_eq!(e["h"], 1);
         assert_eq!(e["r"], "");
         assert_eq!(e["l"], true);
