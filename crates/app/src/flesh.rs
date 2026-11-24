@@ -40,7 +40,33 @@ pub struct Bite {
     pub part: u8,
     pub lo: [u8; 3],
     pub hi: [u8; 3],
+    /// (v272) Le cube du bord d'où la morsure est partie : elle ne retire, dans sa boîte, que
+    /// ce qu'on atteint depuis lui sans traverser du dur (un os, une veine).
+    pub start: [u8; 3],
     pub age: f32,
+}
+
+/// (v272) Ce qui ne se mange pas dans un corps : « il ne doit pas pouvoir manger nos os »
+/// (`bone`), « on ne doit pas pouvoir manger ses veines » (`evide::vein`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Hard {
+    /// Tout se mange (essais).
+    #[default]
+    Nothing,
+    /// Un joueur ou un PNJ : ses os et ses dents restent.
+    Bones,
+    /// L'Évidé : ses veines restent.
+    Veins,
+}
+
+impl Hard {
+    fn at(self, part: usize, dims: [usize; 3], c: [usize; 3]) -> bool {
+        match self {
+            Hard::Nothing => false,
+            Hard::Bones => bone(part, c, dims),
+            Hard::Veins => crate::evide::vein(part, c),
+        }
+    }
 }
 
 /// Ce qui manque à un corps : ses morsures, et pour chaque pavé les cubes qu'elles ont
@@ -49,6 +75,8 @@ pub struct Bite {
 pub struct Flesh {
     bites: Vec<Bite>,
     gone: [Vec<u64>; PARTS],
+    /// (v272) Ce qui ne se mange pas dans ce corps.
+    hard: Hard,
 }
 
 fn index(dims: [usize; 3], c: [usize; 3]) -> usize {
@@ -56,6 +84,38 @@ fn index(dims: [usize; 3], c: [usize; 3]) -> usize {
 }
 
 impl Flesh {
+    /// (v272) Un corps entier dont ceci ne se mange pas.
+    pub fn of(hard: Hard) -> Self {
+        Self {
+            hard,
+            ..Self::default()
+        }
+    }
+
+    /// (v272) Ses morsures (pour l'enregistrer avec le monde).
+    pub fn bites(&self) -> &[Bite] {
+        &self.bites
+    }
+
+    /// (v272) Un corps relu du disque : ce qui ne s'y mange pas, ses morsures.
+    pub fn restored(hard: Hard, bites: Vec<Bite>, dims: &[[usize; 3]; PARTS]) -> Self {
+        let mut f = Self::of(hard);
+        f.bites = bites
+            .into_iter()
+            .filter(|b| {
+                let d = dims.get(b.part as usize);
+                d.is_some_and(|d| (0..3).all(|a| b.lo[a] < b.hi[a] && b.hi[a] as usize <= d[a]))
+            })
+            .collect();
+        f.rebuild(dims);
+        f
+    }
+
+    /// (v272) Ce cube est-il dur (jamais mangé) ?
+    pub fn is_hard(&self, part: usize, dims: [usize; 3], c: [usize; 3]) -> bool {
+        self.hard.at(part, dims, c)
+    }
+
     pub fn is_whole(&self) -> bool {
         self.bites.is_empty()
     }
@@ -92,15 +152,43 @@ impl Flesh {
             self.gone[p].clear();
             self.gone[p].resize(words, 0);
         }
+        // (v272) Chaque morsure retire, dans sa boîte, les cubes qu'on atteint depuis son cube
+        // de départ de proche en proche (par les faces) sans traverser un cube dur : un os
+        // protège ce qu'il y a derrière lui, une veine reste dans le creux.
+        let mut todo = Vec::new();
+        let hard = self.hard;
         for b in &self.bites {
-            let d = dims[b.part as usize];
-            for z in b.lo[2]..b.hi[2] {
-                for y in b.lo[1]..b.hi[1] {
-                    for x in b.lo[0]..b.hi[0] {
-                        let c = [x as usize, y as usize, z as usize];
-                        if c[0] < d[0] && c[1] < d[1] && c[2] < d[2] {
-                            let i = index(d, c);
-                            self.gone[b.part as usize][i / 64] |= 1 << (i % 64);
+            let (p, d) = (b.part as usize, dims[b.part as usize]);
+            let inside = |c: [usize; 3]| {
+                (0..3).all(|a| c[a] >= b.lo[a] as usize && c[a] < (b.hi[a] as usize).min(d[a]))
+            };
+            let start = b.start.map(|v| v as usize);
+            if !inside(start) || hard.at(p, d, start) {
+                continue;
+            }
+            let side = [0, 1, 2].map(|a| (b.hi[a] - b.lo[a]) as usize);
+            let local = |c: [usize; 3]| {
+                ((c[2] - b.lo[2] as usize) * side[1] + c[1] - b.lo[1] as usize) * side[0] + c[0]
+                    - b.lo[0] as usize
+            };
+            let mut seen = vec![false; side[0] * side[1] * side[2]];
+            seen[local(start)] = true;
+            todo.clear();
+            todo.push(start);
+            while let Some(c) = todo.pop() {
+                let i = index(d, c);
+                self.gone[p][i / 64] |= 1 << (i % 64);
+                for a in 0..3 {
+                    for step in [-1i32, 1] {
+                        let v = c[a] as i32 + step;
+                        if v < 0 {
+                            continue;
+                        }
+                        let mut n = c;
+                        n[a] = v as usize;
+                        if inside(n) && !seen[local(n)] && !hard.at(p, d, n) {
+                            seen[local(n)] = true;
+                            todo.push(n);
                         }
                     }
                 }
@@ -134,7 +222,8 @@ impl Flesh {
             for y in 0..dims[1] {
                 for x in 0..dims[0] {
                     let c = [x, y, z];
-                    if self.gone(part, dims, c) {
+                    // (v272) On ne mord pas dans du dur.
+                    if self.gone(part, dims, c) || self.is_hard(part, dims, c) {
                         continue;
                     }
                     let open = (0..3).any(|a| {
@@ -185,11 +274,23 @@ impl Flesh {
             part: part as u8,
             lo,
             hi,
+            start: c.map(|v| v as u8),
             age: 0.0,
         };
         self.bites.push(bite);
         self.rebuild(dims);
         Some(bite)
+    }
+
+    /// (v272) Du sang coule sur ce cube : à combien de cubes au-dessus de lui (1 … `DRIP`)
+    /// se trouve un cube mangé de la même colonne ; 0 : aucun.
+    pub fn drip(&self, part: usize, dims: [usize; 3], c: [usize; 3]) -> usize {
+        if self.bites.is_empty() {
+            return 0;
+        }
+        (1..=DRIP)
+            .find(|j| c[1] + j < dims[1] && self.gone(part, dims, [c[0], c[1] + j, c[2]]))
+            .unwrap_or(0)
     }
 
     /// Mord au hasard (`seed`) sur un bord du corps, de préférence un pavé encore peu mangé :
@@ -201,6 +302,19 @@ impl Flesh {
         allowed: &[usize],
         dims: &[[usize; 3]; PARTS],
     ) -> Option<Bite> {
+        let (part, c) = self.pick(seed, allowed, dims)?;
+        self.bite_at(part, c, size, dims)
+    }
+
+    /// (v272) Là où la prochaine morsure tombera : un cube du bord de ce qui reste, tiré de
+    /// `seed` parmi les pavés `allowed`, de préférence un pavé encore peu mangé. Le monstre
+    /// le vise avant de mordre : (pavé, cube).
+    pub fn pick(
+        &self,
+        seed: u32,
+        allowed: &[usize],
+        dims: &[[usize; 3]; PARTS],
+    ) -> Option<(usize, [usize; 3])> {
         let mut rng = seed.wrapping_mul(0x9e37_79b9) | 1;
         let mut next = || {
             rng ^= rng << 13;
@@ -227,13 +341,22 @@ impl Flesh {
                 .copied()
                 .find(|&p| !self.edge_cells(p, dims[p]).is_empty())?;
             let e = self.edge_cells(other, dims[other]);
-            let c = e[next() as usize % e.len()];
-            return self.bite_at(other, c, size, dims);
+            return Some((other, e[next() as usize % e.len()]));
         }
-        let c = edge[next() as usize % edge.len()];
-        self.bite_at(part, c, size, dims)
+        Some((part, edge[next() as usize % edge.len()]))
     }
 }
+
+/// (v272) Un os ou une dent : ce que L'Évidé ne peut pas manger (la moelle, enfermée dans
+/// l'os, et le cerveau, dans le crâne, sont donc à l'abri aussi).
+pub fn bone(part: usize, c: [usize; 3], dims: [usize; 3]) -> bool {
+    matches!(organ(part, c, dims), BONE | TEETH)
+}
+
+/// (v272) Le sang coule au plus sur tant de cubes sous une morsure.
+pub const DRIP: usize = 5;
+/// (v272) Couleur du sang frais sur la peau (sRGB).
+pub const BLOOD: u32 = 0x7c0a0a;
 
 // Couleurs de l'intérieur du corps (sRGB).
 const MUSCLE: u32 = 0xa83a34;

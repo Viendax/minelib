@@ -20,7 +20,9 @@
 //! et le saut du joueur (`player::GAIT`) et les mêmes boîtes de collision ; haut de 3,5 blocs,
 //! il rampe partout où le plafond est plus bas.
 //!
-//! En solo seulement pour l'instant (en ligne, le relais devra tout valider).
+//! (v272) Dans un monde de construction en ligne, chacun a les siens : ils vivent dans son
+//! jeu, les autres joueurs ne les voient pas (la version partagée, que le relais devra
+//! valider de bout en bout, reste à faire). Jamais en partie FPS.
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
@@ -50,14 +52,26 @@ const VIEW_TAN_X: f32 = VIEW_TAN_Y * 16.0 / 9.0;
 const FEEL: f32 = 3.0;
 /// Sans nous voir, il nous cherche encore ce temps-là (s) avant de reprendre sa ronde.
 const GIVE_UP_S: f32 = 10.0;
-/// Il s'arrête à cette distance (blocs, à plat) pour nous attraper : debout, en rampant.
-const HOLD: f32 = 1.5;
+/// Il se met à mordre quand nos pieds sont à moins de tant de blocs des siens (à plat) :
+/// debout, en rampant. Il place ensuite sa bouche sur l'endroit visé (`Prey::spot`).
+const HOLD: f32 = 2.3;
+const CRAWL_NEAR: f32 = 1.5;
+/// En rampant, il s'arrête à cette distance de l'endroit visé (seule sa tête bouge).
 const CRAWL_HOLD: f32 = 0.9;
+/// (v272) Debout, jusqu'où son buste se plie aux hanches pour amener sa bouche à la hauteur
+/// de ce qu'il mord (rad depuis la verticale : plus de π/2, il plonge vers le sol).
+const LEAN_MAX: f32 = 3.0;
+/// (v272) Sa tête quand il mord debout : le visage tourné vers le bas (rad).
+const BITE_PITCH: f32 = -1.2;
 /// Une morsure : durée du geste (s), instant où la bouche se referme.
 const BITE_S: f32 = 1.6;
 const BITE_AT: f32 = 1.04;
-/// On peut le manger de cette distance (blocs) : « de près ».
-pub const EAT_REACH: f32 = 2.2;
+/// On peut viser un morceau de lui à manger de cette distance (blocs, depuis nos yeux) :
+/// « de près ». (v272) Il faut ensuite que notre bouche y arrive en se penchant.
+pub const EAT_REACH: f32 = 1.5;
+/// (v272) « Si sa bouche se décolle avant, ça ne nous mange pas » : au moment où elle se
+/// referme, sa bouche doit être à moins de tant de blocs de l'endroit visé.
+pub const TOUCH: f32 = 0.3;
 /// Côté (cubes) du morceau qu'on lui mange à chaque bouchée.
 const OUR_BITE: usize = 4;
 /// Il meurt quand on a mangé cette part de son corps, ou cette part de sa tête.
@@ -97,6 +111,8 @@ const HOLLOW: u32 = 0xcbc9c1;
 const OUTLINE: u32 = 0xa3a29c;
 const SOCKET: u32 = 0xd9d8d3;
 const MOUTH: [u32; 3] = [0x2a1418, 0x160a0d, 0x070304];
+// (v272) Ses veines, dans la gelée.
+const VEIN: [u32; 2] = [0x4d2a68, 0x3a2152];
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
@@ -272,6 +288,165 @@ fn srgb(c: u32) -> [f32; 3] {
     [16, 8, 0].map(|s| (((c >> s) & 255) as f32 / 255.0).powf(2.2))
 }
 
+/// (v272) « Fais-lui des veines dans les cubes de son corps, qui se propagent partout ; on ne
+/// doit pas pouvoir les manger » : le cube `c` du pavé `part` est-il une veine ? Un arbre par
+/// pavé (`grow_veins`), poussé une fois pour toutes ; `flesh::Hard::Veins` les rend
+/// immangeables : elles restent, nues, dans les creux qu'on lui fait.
+pub fn vein(part: usize, c: [usize; 3]) -> bool {
+    static VEINS: std::sync::OnceLock<[Vec<bool>; PARTS]> = std::sync::OnceLock::new();
+    let d = grids()[part];
+    VEINS.get_or_init(grow_veins)[part]
+        .get((c[2] * d[1] + c[1]) * d[0] + c[0])
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Couleur d'un cube de l'intérieur de son corps : une veine, ou de la gelée.
+pub fn inside(part: usize, c: [usize; 3], d: [usize; 3]) -> u32 {
+    if vein(part, c) {
+        VEIN[(c[0] + c[1] + c[2]) % 2]
+    } else {
+        crate::flesh::jelly(c, d)
+    }
+}
+
+/// Fait pousser ses veines. Dans chaque pavé : un tronc d'un bout à l'autre (les veines
+/// passent d'un pavé au suivant par les articulations), puis des rameaux tirés au hasard,
+/// chacun parti d'un cube déjà veiné vers un voisin qui n'en touche aucun autre (des fils
+/// d'un cube d'épaisseur, sans boucle, qui gagnent tout le pavé). Jamais dans la peau du
+/// tour, ni dans le creux de la bouche, ni au sommet du crâne, ni au bout des mains et des
+/// pieds. Toujours les mêmes (graine fixe).
+fn grow_veins() -> [Vec<bool>; PARTS] {
+    let grids = grids();
+    std::array::from_fn(|part| {
+        let d = grids[part];
+        let at = |c: [usize; 3]| (c[2] * d[1] + c[1]) * d[0] + c[0];
+        let limb = matches!(part, LEG_L | LEG_R | ARM_L | ARM_R);
+        let ok = |c: [usize; 3]| {
+            c[0] >= 1
+                && c[0] + 1 < d[0]
+                && c[2] >= 1
+                && c[2] + 1 < d[2]
+                && !(part == HEAD && (c[1] + 1 >= d[1] || mouth(c, d, 1.0)))
+                && !(limb && c[1] == 0)
+        };
+        let mut rng = 0x9e37_79b9u32.wrapping_mul(part as u32 + 11) | 1;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng >> 8) as usize % n.max(1)
+        };
+        let mut cells = vec![false; d[0] * d[1] * d[2]];
+        let mut list: Vec<[usize; 3]> = Vec::new();
+        // Le tronc : au milieu (au fond du crâne dans la tête, derrière la bouche), il
+        // serpente d'un cube de côté toutes les trois rangées.
+        let (mut x, mut z) = (d[0] / 2, if part == HEAD { d[2] - 2 } else { d[2] / 2 });
+        for y in 0..d[1] {
+            if y % 3 == 2 {
+                let (nx, nz) = match next(4) {
+                    0 => (x + 1, z),
+                    1 => (x.wrapping_sub(1), z),
+                    2 => (x, z + 1),
+                    _ => (x, z.wrapping_sub(1)),
+                };
+                if nx < d[0] && nz < d[2] && ok([nx, y, nz]) && ok([x, y, z]) {
+                    if !cells[at([x, y, z])] {
+                        cells[at([x, y, z])] = true;
+                        list.push([x, y, z]);
+                    }
+                    (x, z) = (nx, nz);
+                }
+            }
+            if ok([x, y, z]) && !cells[at([x, y, z])] {
+                cells[at([x, y, z])] = true;
+                list.push([x, y, z]);
+            }
+        }
+        // Dans la poitrine, le ventre et la tête : une branche en travers toutes les trois
+        // rangées, du tronc jusqu'aux deux flancs (vers les épaules, vers les hanches).
+        if !limb {
+            for y in (1..d[1]).step_by(3) {
+                let Some(root) = list.iter().copied().find(|c| c[1] == y) else {
+                    continue;
+                };
+                for dir in [-1i32, 1] {
+                    let mut c = root;
+                    loop {
+                        let v = c[0] as i32 + dir;
+                        if v < 0 {
+                            break;
+                        }
+                        c[0] = v as usize;
+                        if c[0] >= d[0] || !ok(c) || cells[at(c)] {
+                            break;
+                        }
+                        // Sans toucher le tronc ailleurs qu'à sa racine.
+                        let touches = (0..3).any(|a| {
+                            a != 0
+                                && [-1i32, 1].into_iter().any(|s| {
+                                    let w = c[a] as i32 + s;
+                                    let mut m = c;
+                                    m[a] = w.max(0) as usize;
+                                    w >= 0 && m[a] < d[a] && cells[at(m)]
+                                })
+                        });
+                        if touches {
+                            break;
+                        }
+                        cells[at(c)] = true;
+                        list.push(c);
+                    }
+                }
+            }
+        }
+        // Les rameaux.
+        let room = (0..d[0] * d[1] * d[2])
+            .filter(|i| ok([i % d[0], i / d[0] % d[1], i / (d[0] * d[1])]))
+            .count();
+        let goal = (room as f32 * if limb { 0.42 } else { 0.4 }) as usize;
+        for _ in 0..60_000 {
+            if list.len() >= goal || list.is_empty() {
+                break;
+            }
+            // Une fois sur deux depuis un cube récent : les rameaux s'allongent.
+            let from = if next(2) > 0 {
+                list[list.len() - 1 - next(list.len().min(6))]
+            } else {
+                list[next(list.len())]
+            };
+            let (a, up) = (next(3), next(2) == 1);
+            let mut n = from;
+            if up {
+                n[a] += 1;
+            } else if n[a] > 0 {
+                n[a] -= 1;
+            } else {
+                continue;
+            }
+            if n[a] >= d[a] || !ok(n) || cells[at(n)] {
+                continue;
+            }
+            let mut near = 0;
+            for b in 0..3 {
+                for s in [-1i32, 1] {
+                    let v = n[b] as i32 + s;
+                    if v >= 0 && (v as usize) < d[b] {
+                        let mut m = n;
+                        m[b] = v as usize;
+                        near += cells[at(m)] as usize;
+                    }
+                }
+            }
+            if near == 1 {
+                cells[at(n)] = true;
+                list.push(n);
+            }
+        }
+        cells
+    })
+}
+
 /// Un pavé de L'Évidé, cube par cube : sa peau au-dehors, le noir de sa bouche dans le creux
 /// de la tête, de la gelée (`flesh::jelly`) là où on l'a mangé.
 #[allow(clippy::too_many_arguments)]
@@ -312,7 +487,8 @@ fn emit_part(
                         // Plus noir au fond de la gorge.
                         MOUTH[(z * 8 / dims[2].max(1)).min(4) / 2]
                     } else if flesh.gone(part, dims, nc) {
-                        crate::flesh::jelly(c, dims)
+                        // De la gelée, ou une veine mise à nu.
+                        inside(part, c, dims)
                     } else {
                         continue;
                     };
@@ -386,11 +562,158 @@ fn fits(world: &World, pos: Vec3, h: f32) -> bool {
     true
 }
 
+/// (v272) La case (bloc) où sont ces pieds.
+fn cell_of(p: Vec3) -> [i32; 3] {
+    [p.x.floor() as i32, (p.y + 0.01).floor() as i32, p.z.floor() as i32]
+}
+
+/// (v272) De l'eau dans le bloc où est ce point.
+fn water_at(world: &World, p: Vec3) -> bool {
+    let id = world.get(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+    matches!(
+        minelib_world::registry::fluid(id),
+        Some((minelib_world::registry::Fluid::Water, _))
+    )
+}
+
+/// (v272) Cases visitées au plus par une recherche de chemin, et écart entre deux recherches
+/// (s) quand il poursuit.
+const PATH_BUDGET: usize = 900;
+const REPLAN_S: f32 = 0.7;
+
+/// (v272) « Pas de recherche de chemin : règle ça. » Le chemin d'une case à une autre pour
+/// quelqu'un qui se déplace comme lui : de case en case sur le sol (quatre directions), une
+/// marche d'un bloc montée d'un saut, une chute de trois blocs au plus, à plat ventre là où
+/// le plafond est à moins de 3,5 blocs (plus lent : ce chemin compte plus cher), à la nage
+/// dans l'eau (en tous sens). A* sur les blocs du monde, `PATH_BUDGET` cases au plus : si le
+/// but n'est pas atteint dans ce budget (trop loin, inaccessible), le chemin mène à la case
+/// trouvée la plus proche de lui. Rend les cases à suivre, sans celle du départ.
+pub fn find_path(world: &World, from: [i32; 3], to: [i32; 3]) -> Vec<[i32; 3]> {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap};
+    let mut solid: HashMap<[i32; 3], bool> = HashMap::new();
+    let mut blocked = |c: [i32; 3]| {
+        *solid
+            .entry(c)
+            .or_insert_with(|| !crate::player::collision_boxes(world, c[0], c[1], c[2]).is_empty())
+    };
+    let wet = |c: [i32; 3]| {
+        matches!(
+            minelib_world::registry::fluid(world.get(c[0], c[1], c[2])),
+            Some((minelib_world::registry::Fluid::Water, _))
+        )
+    };
+    // Peut-il être là, et à quel prix par case : debout 1, à la nage 2,2, à plat ventre 3,4
+    // (le rapport des allures).
+    let spot = |c: [i32; 3], blocked: &mut dyn FnMut([i32; 3]) -> bool| -> Option<f32> {
+        if blocked(c) {
+            return None;
+        }
+        if wet(c) {
+            return Some(2.2);
+        }
+        if !blocked([c[0], c[1] - 1, c[2]]) && !wet([c[0], c[1] - 1, c[2]]) {
+            return None;
+        }
+        let low = (1..=3).any(|k| blocked([c[0], c[1] + k, c[2]]));
+        Some(if low { 3.4 } else { 1.0 })
+    };
+    let far = |c: [i32; 3]| {
+        ((c[0] - to[0]).abs() + (c[2] - to[2]).abs()) as f32 + 1.2 * (c[1] - to[1]).abs() as f32
+    };
+    // (case, coût depuis le départ, d'où l'on vient)
+    let mut nodes: Vec<([i32; 3], f32, u32)> = vec![(from, 0.0, u32::MAX)];
+    let mut index: HashMap<[i32; 3], u32> = HashMap::from([(from, 0)]);
+    let mut open = BinaryHeap::from([(Reverse((far(from) * 100.0) as u32), 0u32)]);
+    let (mut best, mut best_far) = (0u32, far(from));
+    let mut seen = 0;
+    let mut next: Vec<([i32; 3], f32)> = Vec::with_capacity(8);
+    while let Some((_, i)) = open.pop() {
+        let (c, g, _) = nodes[i as usize];
+        let d = far(c);
+        if d < best_far {
+            (best, best_far) = (i, d);
+        }
+        // Arrivé : sur sa case, ou tout contre (la proie peut être en l'air).
+        if (c[0] - to[0]).abs() + (c[2] - to[2]).abs() <= 1 && (c[1] - to[1]).abs() <= 2 {
+            best = i;
+            break;
+        }
+        seen += 1;
+        if seen > PATH_BUDGET {
+            break;
+        }
+        next.clear();
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let n = [c[0] + dx, c[1], c[2] + dz];
+            if blocked(n) {
+                // Une marche : il lui faut la place de sauter.
+                let up = [n[0], n[1] + 1, n[2]];
+                if !blocked([c[0], c[1] + 1, c[2]]) {
+                    if let Some(k) = spot(up, &mut blocked) {
+                        next.push((up, k + 0.6));
+                    }
+                }
+            } else if let Some(k) = spot(n, &mut blocked) {
+                next.push((n, k));
+            } else {
+                // Un vide : il se laisse tomber, de trois blocs au plus.
+                for fall in 1..=3 {
+                    let down = [n[0], n[1] - fall, n[2]];
+                    if blocked(down) {
+                        break;
+                    }
+                    if let Some(k) = spot(down, &mut blocked) {
+                        next.push((down, k + 0.3 * fall as f32));
+                        break;
+                    }
+                }
+            }
+        }
+        if wet(c) {
+            for dy in [1, -1] {
+                let n = [c[0], c[1] + dy, c[2]];
+                if !blocked(n) && wet(n) {
+                    next.push((n, 2.2));
+                }
+            }
+        }
+        for &(n, k) in &next {
+            let cost = g + k;
+            let j = match index.get(&n) {
+                Some(&j) if nodes[j as usize].1 <= cost => continue,
+                Some(&j) => {
+                    nodes[j as usize] = (n, cost, i);
+                    j
+                }
+                None => {
+                    nodes.push((n, cost, i));
+                    index.insert(n, nodes.len() as u32 - 1);
+                    nodes.len() as u32 - 1
+                }
+            };
+            open.push((Reverse(((cost + far(n)) * 100.0) as u32), j));
+        }
+    }
+    let mut path = Vec::new();
+    let mut i = best;
+    while i != u32::MAX && i != 0 {
+        path.push(nodes[i as usize].0);
+        i = nodes[i as usize].2;
+    }
+    path.reverse();
+    path
+}
+
 /// Sa proie : le joueur (pieds, yeux).
 #[derive(Clone, Copy, Debug)]
 pub struct Prey {
     pub feet: Vec3,
     pub eye: Vec3,
+    /// (v272) L'endroit de son corps que la prochaine morsure enlèvera, là où il est en ce
+    /// moment (un bras qui se balance bouge) : « il se penche jusqu'à la hauteur où il mord »
+    /// et « suit le mouvement du bras, sa hauteur aussi, en le mangeant ».
+    pub spot: Option<Vec3>,
 }
 
 /// Ce qui vient de se passer, pour la partie (sons, blessures).
@@ -400,6 +723,9 @@ pub enum Event {
     Voice(Vec3),
     /// Sa bouche vient de se refermer sur nous (`low` : en rampant, sur nos jambes).
     Bites { low: bool, at: Vec3, seed: u32 },
+    /// (v272) Il choisit où mordre ensuite (`low` : en rampant, nos jambes seulement) : à la
+    /// partie de lui dire où c'est (`Prey::spot`).
+    Aims { low: bool, seed: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -413,6 +739,8 @@ enum Mode {
 /// Un Évidé.
 #[derive(Clone, Debug)]
 pub struct Evide {
+    /// (v272) Son numéro dans la horde (pour le retrouver d'une image à l'autre).
+    pub id: u32,
     /// Ses pieds (en rampant : le milieu de sa boîte, à l'avant du corps).
     pub pos: Vec3,
     pub vel: Vec3,
@@ -435,9 +763,17 @@ pub struct Evide {
     /// Bloqué contre un mur depuis (s) ; détour en cours (s).
     blocked: f32,
     detour: f32,
+    /// (v272) Le chemin qu'il suit (cases), vers quelle case, temps avant de le refaire (s).
+    path: Vec<[i32; 3]>,
+    path_goal: [i32; 3],
+    replan: f32,
+    /// (v272) Il nage.
+    swimming: bool,
     /// Morsure en cours : temps dans le geste (s).
     feed: f32,
     feeding: bool,
+    /// (v272) Il a choisi où mordre pour la morsure en cours.
+    aimed: bool,
     /// Il sursaute quand on le mord (s).
     flinch: f32,
     /// Sa fin : depuis quand il s'affaisse (s).
@@ -457,6 +793,7 @@ pub struct Evide {
 impl Evide {
     pub fn new(pos: Vec3, yaw: f32, seed: u32) -> Self {
         let mut e = Self {
+            id: seed,
             pos,
             vel: Vec3::ZERO,
             yaw,
@@ -464,7 +801,7 @@ impl Evide {
                 hunch: 0.18,
                 ..Anim::default()
             },
-            flesh: Flesh::default(),
+            flesh: Flesh::of(crate::flesh::Hard::Veins),
             on_ground: false,
             crawling: false,
             rise: 0.0,
@@ -476,8 +813,13 @@ impl Evide {
             pausing: false,
             blocked: 0.0,
             detour: 0.0,
+            path: Vec::new(),
+            path_goal: [i32::MAX; 3],
+            replan: 0.0,
+            swimming: false,
             feed: 0.0,
             feeding: false,
+            aimed: false,
             flinch: 0.0,
             dying: None,
             look: (0.0, -0.12),
@@ -544,6 +886,27 @@ impl Evide {
         self.pos
             + Vec3::Y * (hip + len * pitch.cos())
             + forward(self.yaw) * (len * pitch.sin() - c * CRAWL_BACK)
+    }
+
+    /// (v272) Où est, dans le monde, le milieu du cube `cell` de son pavé `part` : le morceau
+    /// de lui qu'on vise pour le manger, là où il est maintenant.
+    pub fn cell_point(&self, part: usize, cell: [usize; 3]) -> Vec3 {
+        let part = part.min(PARTS - 1);
+        let (xf, lo, hi) = parts(self.pos, self.yaw, &self.anim)[part];
+        let d = grids()[part];
+        let (lo, hi) = (Vec3::from(lo), Vec3::from(hi));
+        let t = Vec3::new(
+            (cell[0] as f32 + 0.5) / d[0] as f32,
+            (cell[1] as f32 + 0.5) / d[1] as f32,
+            (cell[2] as f32 + 0.5) / d[2] as f32,
+        );
+        xf.transform_point3(lo + (hi - lo) * t)
+    }
+
+    /// (v272) Le milieu de sa bouche, dans le monde, dans sa posture du moment.
+    pub fn mouth_point(&self) -> Vec3 {
+        let (xf, lo, hi) = parts(self.pos, self.yaw, &self.anim)[HEAD];
+        xf.transform_point3(Vec3::new(0.0, lo[1] + 0.28 * (hi[1] - lo[1]), lo[2]))
     }
 
     /// Ses yeux (il n'en a pas : là où ils seraient).
@@ -665,6 +1028,9 @@ impl Evide {
         let mut wish = self.yaw;
         let mut speed = 0.0;
         let mut feeding = false;
+        // (v272) En mordant : l'allure qui amène sa bouche sur l'endroit visé (il avance,
+        // recule, suit le membre qui bouge).
+        let mut shuffle: Option<f32> = None;
         match (self.mode, self.known) {
             (Mode::Chase, Some(target)) => {
                 let to = target - self.pos;
@@ -673,16 +1039,53 @@ impl Evide {
                 if d > 0.05 {
                     wish = flat.x.atan2(-flat.z);
                 }
-                let hold = if self.crawling { CRAWL_HOLD } else { HOLD };
+                let hold = if self.crawling { CRAWL_NEAR } else { HOLD };
                 let slack = if self.feeding { 0.6 } else { 0.0 };
                 if seen && d <= hold + slack && (-2.0..=2.6).contains(&to.y) {
                     feeding = true;
+                    // Tourné vers l'endroit visé, sa bouche dessus.
+                    let spot = prey
+                        .and_then(|p| p.spot)
+                        .unwrap_or(target + Vec3::Y * 1.1);
+                    let to = spot - self.pos;
+                    let flat = Vec3::new(to.x, 0.0, to.z);
+                    if flat.length() > 0.2 {
+                        wish = flat.x.atan2(-flat.z);
+                    }
+                    shuffle = Some(if self.crawling {
+                        ((flat.length() - CRAWL_HOLD) * 3.0).clamp(-0.6, sneak)
+                    } else {
+                        let miss = spot - self.mouth_point();
+                        (miss.dot(forward(self.yaw)) * 5.0).clamp(-2.0, 3.0)
+                    });
                 } else if self.detour > 0.0 {
                     self.detour -= dt;
                     wish = self.heading;
                     speed = run;
                 } else if seen || d > 0.7 {
                     speed = run;
+                    // (v272) Par le chemin (`find_path`), refait toutes les `REPLAN_S`
+                    // secondes ou dès que la proie change de case ; tout près et en vue, droit
+                    // sur elle.
+                    self.replan -= dt;
+                    let goal = cell_of(target);
+                    if self.replan <= 0.0 || (goal != self.path_goal && self.replan < REPLAN_S - 0.25) {
+                        self.replan = REPLAN_S;
+                        self.path_goal = goal;
+                        self.path = find_path(world, cell_of(self.pos), goal);
+                    }
+                    while let Some(n) = self.path.first() {
+                        let mid = Vec3::new(n[0] as f32 + 0.5, n[1] as f32, n[2] as f32 + 0.5);
+                        let off = mid - self.pos;
+                        if Vec3::new(off.x, 0.0, off.z).length() < 0.35 && off.y.abs() < 1.3 {
+                            self.path.remove(0);
+                        } else {
+                            if !(seen && d < 2.5) && Vec3::new(off.x, 0.0, off.z).length() > 0.05 {
+                                wish = off.x.atan2(-off.z);
+                            }
+                            break;
+                        }
+                    }
                 } else {
                     // Arrivé là où il nous a vus : il continue un peu, il cherche.
                     wish = self.yaw + 0.6 * (self.age * 0.7).sin();
@@ -707,6 +1110,7 @@ impl Evide {
         }
         if !feeding {
             self.feed = 0.0;
+            self.aimed = false;
         }
         self.feeding = feeding;
 
@@ -736,7 +1140,13 @@ impl Evide {
         // Sa posture : il rampe sous un plafond trop bas (ou sans jambes), se relève dès
         // qu'il en a la place.
         let dir = forward(self.yaw);
-        if legless || (!self.crawling && !fits(world, self.pos, HEIGHT)) {
+        // (v272) « Il ne nage pas : règle ça. » Dans l'eau assez profonde il nage, à plat,
+        // aux allures de nage du joueur ; il flotte à la surface, plonge si sa proie est
+        // dessous, se hisse sur la berge.
+        let [swim, swim_fast, swim_up] = crate::player::SWIM;
+        self.swimming = water_at(world, self.pos + Vec3::Y * 0.7)
+            || (self.swimming && water_at(world, self.pos + Vec3::Y * 0.3));
+        if legless || self.swimming || (!self.crawling && !fits(world, self.pos, HEIGHT)) {
             self.crawling = true;
             self.rise = 0.0;
         } else if self.crawling {
@@ -747,7 +1157,13 @@ impl Evide {
             }
         }
         if self.crawling && speed > 0.0 {
-            speed = sneak;
+            speed = if !self.swimming {
+                sneak
+            } else if self.mode == Mode::Chase {
+                swim_fast
+            } else {
+                swim
+            };
         }
         let h = if self.crawling { CRAWL_H } else { HEIGHT };
 
@@ -756,10 +1172,20 @@ impl Evide {
         let rate = if self.mode == Mode::Chase { 6.0 } else { 2.5 };
         self.yaw += gap.clamp(-rate * dt, rate * dt);
         let dir = forward(self.yaw);
-        let go = speed * gap.cos().max(0.0);
+        let go = shuffle.unwrap_or(speed * gap.cos().max(0.0));
         self.vel.x = dir.x * go;
         self.vel.z = dir.z * go;
         self.vel.y = (self.vel.y - gravity * dt).max(-60.0);
+        if self.swimming {
+            let dive = seen && self.known.is_some_and(|k| k.y < self.pos.y - 1.0);
+            self.vel.y = if dive {
+                -swim_up * 0.6
+            } else if water_at(world, self.pos + Vec3::Y * 0.95) {
+                swim_up
+            } else {
+                0.0
+            };
+        }
         let before = self.pos;
         let steps = (dt / 0.02).ceil().max(1.0);
         let (mut wall, mut floor, mut ceiling) = (false, false, false);
@@ -780,7 +1206,15 @@ impl Evide {
         }
         if wall && go > 0.1 {
             self.blocked += dt;
-            if self.on_ground {
+            if self.swimming {
+                // La berge : il se hisse dessus.
+                let up = self.pos + Vec3::Y * 1.05;
+                if fits(world, up, h) && fits(world, up + dir * 0.5, h) {
+                    self.vel.y = jump;
+                    self.pos.y += 0.05;
+                    self.swimming = false;
+                }
+            } else if self.on_ground {
                 let up = self.pos + Vec3::Y * 1.05;
                 let ahead = dir * 0.5;
                 if fits(world, up, h) && fits(world, up + ahead, h) {
@@ -821,18 +1255,35 @@ impl Evide {
             Mode::Chase => 1.25,
             Mode::Wander => 0.06 + 0.05 * (self.age * 1.1).sin(),
         };
+        let mut spot = None;
         if let (true, Some(p)) = (feeding, prey) {
+            if !self.aimed {
+                // Où mordre cette fois : la partie nous dira où c'est, image après image.
+                self.aimed = true;
+                let seed = self.rng;
+                self.unit();
+                events.push(Event::Aims {
+                    low: self.crawling,
+                    seed,
+                });
+            }
             let was = self.feed % BITE_S;
             self.feed += dt;
             let t = self.feed % BITE_S;
             if was < BITE_AT && t >= BITE_AT && self.feed > BITE_S * 0.5 {
-                let seed = self.rng;
-                self.unit();
-                events.push(Event::Bites {
-                    low: self.crawling,
-                    at: self.eye(),
-                    seed,
-                });
+                // (v272) « Si sa bouche se décolle avant, ça ne nous mange pas » : elle se
+                // referme dans le vide si l'endroit visé lui a échappé.
+                let mouth = self.mouth_point();
+                if p.spot.is_none_or(|s| s.distance(mouth) <= TOUCH) {
+                    let seed = self.rng;
+                    self.unit();
+                    events.push(Event::Bites {
+                        low: self.crawling,
+                        at: mouth,
+                        seed,
+                    });
+                }
+                self.aimed = false;
             }
             mouth = if t < 0.45 {
                 0.3
@@ -843,14 +1294,20 @@ impl Evide {
             } else {
                 -0.5 + 0.8 * (t - 1.3) / (BITE_S - 1.3)
             };
-            // Penché jusqu'à nous : son cou arrive au-dessus de notre tête.
-            let to = p.eye - self.pos;
-            let d = Vec3::new(to.x, 0.0, to.z).length();
-            let hip = crate::player_model::rig().leg * TALL * crate::player_model::rig().px;
-            lean = (d - 0.05).atan2(to.y + 0.4 - hip).clamp(0.8, 1.75);
-            // Ses bras descendent vers nous.
-            let chest = p.feet + Vec3::Y * 1.1 - self.neck();
-            arms = (FRAC_PI_2 + chest.y.atan2(d.max(0.2))).clamp(0.2, 1.9) - lean * 0.15;
+            let at = p.spot.unwrap_or(p.feet + Vec3::Y * 1.1);
+            spot = Some(at);
+            if !self.crawling {
+                // (v272) « Il se penche jusqu'à la hauteur où il mord » : son buste se plie
+                // aux hanches de ce qu'il manque à sa bouche pour être à la hauteur visée
+                // (un cran d'un pas de Newton : sa bouche descend d'environ 1,4 bloc par
+                // radian), image après image : elle suit un bras qui monte et descend.
+                let miss = at.y - self.mouth_point().y;
+                lean = (self.anim.hunch - miss * 0.7).clamp(0.6, LEAN_MAX);
+                // Ses bras autour de nous ; plié bas, ils partent devant pour ne pas
+                // entrer dans le sol.
+                let shoulder = self.neck().y - self.pos.y - 0.25;
+                arms = (shoulder / 1.1).clamp(0.0, 1.0).acos().max(0.3);
+            }
         }
         if self.flinch > 0.0 {
             mouth = 1.0;
@@ -863,10 +1320,15 @@ impl Evide {
             (0.25 * (self.age * 0.6).sin(), -0.12)
         };
         if let (Some(p), true) = (prey, seen) {
-            let to = p.eye - self.eye();
+            // (En mordant : sur l'endroit qu'il mord.)
+            let to = spot.unwrap_or(p.eye) - self.eye();
             let flat = Vec3::new(to.x, 0.0, to.z).length();
             look_yaw = turn(to.x.atan2(-to.z), self.yaw).clamp(-1.3, 1.3);
             look_pitch = to.y.atan2(flat.max(0.05)).clamp(-1.45, 0.9);
+            if spot.is_some() && !self.crawling {
+                // Debout, plié sur nous : le visage vers le bas, la bouche sur nous.
+                (look_yaw, look_pitch) = (0.0, BITE_PITCH);
+            }
         }
         self.look.0 = approach(self.look.0, look_yaw, dt * 8.0);
         self.look.1 = approach(self.look.1, look_pitch, dt * 8.0);
@@ -884,7 +1346,7 @@ impl Evide {
 
         let a = &mut self.anim;
         a.crawl = approach(a.crawl, if self.crawling { 1.0 } else { 0.0 }, dt / 0.45);
-        a.hunch = approach(a.hunch, lean, dt * 3.0);
+        a.hunch = approach(a.hunch, lean, dt * if feeding { 5.0 } else { 3.0 });
         a.arms = approach(a.arms, arms, dt * 5.0);
         let grab = if feeding && !self.crawling { 1.0 } else { 0.0 };
         a.grab = approach(a.grab, grab, dt * 4.0);
@@ -977,6 +1439,8 @@ pub struct Horde {
     pub list: Vec<Evide>,
     /// Combien sont venus tout seuls (les autres sortent d'un œuf).
     natural: usize,
+    /// (v272) Combien il y en a eu en tout (leurs numéros).
+    count: u32,
     rng: u32,
     /// Temps avant le prochain tirage d'une apparition (s).
     wait: f32,
@@ -1002,7 +1466,10 @@ impl Horde {
             return false;
         }
         let seed = (self.unit() * 16_777_216.0) as u32;
-        self.list.push(Evide::new(pos, yaw, seed));
+        let mut e = Evide::new(pos, yaw, seed);
+        self.count += 1;
+        e.id = self.count;
+        self.list.push(e);
         true
     }
 
@@ -1062,13 +1529,85 @@ impl Horde {
         events
     }
 
-    /// L'Évidé visé : (lequel, distance, pavé, cube).
-    pub fn aimed(&self, eye: Vec3, dir: Vec3, reach: f32) -> Option<(usize, f32, usize, [usize; 3])> {
+    /// (v272) « Il n'est pas enregistré avec le monde : règle ça. » Les Évidés vivants dans
+    /// `evides.txt`, dans le dossier du monde : une ligne `e x y z lacet rampe` par monstre,
+    /// suivie d'une ligne `b pavé lo(3) hi(3) départ(3)` par morceau qu'on lui a mangé.
+    pub fn save(&self, dir: &std::path::Path) {
+        let mut text = String::new();
+        for e in self.list.iter().filter(|e| !e.frozen && e.dying.is_none()) {
+            let p = e.pos;
+            text += &format!("e {} {} {} {} {}\n", p.x, p.y, p.z, e.yaw, e.crawling as u8);
+            for b in e.flesh.bites() {
+                let n: Vec<String> = [b.lo, b.hi, b.start].iter().flatten().map(u8::to_string).collect();
+                text += &format!("b {} {}\n", b.part, n.join(" "));
+            }
+        }
+        let file = dir.join("evides.txt");
+        if text.is_empty() {
+            let _ = std::fs::remove_file(file);
+        } else if let Err(e) = std::fs::write(&file, text) {
+            log::warn!("Évidés non enregistrés ({}) : {e}", file.display());
+        }
+    }
+
+    /// (v272) Les Évidés enregistrés avec ce monde (aucun si le fichier manque).
+    pub fn load(dir: &std::path::Path) -> Self {
+        let mut horde = Self::default();
+        let Ok(text) = std::fs::read_to_string(dir.join("evides.txt")) else {
+            return horde;
+        };
+        let grids = grids();
+        let mut bites: Vec<crate::flesh::Bite> = Vec::new();
+        let close = |h: &mut Self, bites: &mut Vec<crate::flesh::Bite>| {
+            if let Some(e) = h.list.last_mut() {
+                e.flesh = Flesh::restored(crate::flesh::Hard::Veins, std::mem::take(bites), &grids);
+            }
+        };
+        for line in text.lines() {
+            let mut f = line.split_whitespace();
+            match f.next() {
+                Some("e") => {
+                    close(&mut horde, &mut bites);
+                    let n: Vec<f32> = f.filter_map(|v| v.parse().ok()).collect();
+                    if n.len() >= 5 && n.iter().all(|v| v.is_finite()) {
+                        if horde.spawn(Vec3::new(n[0], n[1], n[2]), n[3]) {
+                            if let Some(e) = horde.list.last_mut() {
+                                e.crawling = n[4] != 0.0;
+                                e.anim.crawl = n[4].clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+                }
+                Some("b") if !horde.list.is_empty() => {
+                    let n: Vec<u8> = f.filter_map(|v| v.parse().ok()).collect();
+                    if n.len() == 10 {
+                        bites.push(crate::flesh::Bite {
+                            part: n[0],
+                            lo: [n[1], n[2], n[3]],
+                            hi: [n[4], n[5], n[6]],
+                            start: [n[7], n[8], n[9]],
+                            age: 0.0,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        close(&mut horde, &mut bites);
+        horde
+    }
+
+    /// L'Évidé visé : (son numéro, distance, pavé, cube).
+    pub fn aimed(&self, eye: Vec3, dir: Vec3, reach: f32) -> Option<(u32, f32, usize, [usize; 3])> {
         self.list
             .iter()
-            .enumerate()
-            .filter_map(|(i, e)| e.aimed(eye, dir, reach).map(|(t, p, c)| (i, t, p, c)))
+            .filter_map(|e| e.aimed(eye, dir, reach).map(|(t, p, c)| (e.id, t, p, c)))
             .min_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// (v272) Celui qui porte ce numéro, s'il est encore là.
+    pub fn by_id(&mut self, id: u32) -> Option<&mut Evide> {
+        self.list.iter_mut().find(|e| e.id == id)
     }
 }
 
@@ -1137,6 +1676,7 @@ mod tests {
         Prey {
             feet: at,
             eye: at + Vec3::Y * 1.62,
+            spot: None,
         }
     }
 
@@ -1271,9 +1811,10 @@ mod tests {
     #[test]
     fn it_crawls_under_low_ceilings_and_jumps_one_block_steps() {
         let mut w = flat();
-        // Un tunnel d'un bloc de haut, de z = −6 à −14, avec des murs autour.
+        // Un tunnel d'un bloc de haut, de z = −6 à −14, dans un mur d'un bord à l'autre du
+        // monde (plus étroit, il en ferait le tour : c'est plus court que de ramper).
         for z in -14..=-6 {
-            for x in -2..=2 {
+            for x in -48..48 {
                 for y in 11..16 {
                     if !(x == 0 && y == 11) {
                         w.set(x, y, z, BlockId::STONE);
@@ -1339,8 +1880,14 @@ mod tests {
         assert!((3..=5).contains(&bites), "{bites} morsures en 8 s");
         assert!(events.iter().any(|e| matches!(e, Event::Voice(_))));
         assert!(e.anim.hunch > 0.8 && e.anim.grab > 0.9, "{:?}", e.anim);
-        let d = Vec3::new(e.pos.x - p.feet.x, 0.0, e.pos.z - p.feet.z).length();
-        assert!((0.8..=HOLD + 0.1).contains(&d), "à {d} de nous");
+        // Sans endroit précis, il vise notre poitrine : sa bouche y est.
+        let miss = e.mouth_point().distance(p.feet + Vec3::Y * 1.1);
+        assert!(miss < 0.2, "sa bouche à {miss} de notre poitrine");
+        assert_eq!(
+            events.iter().filter(|e| matches!(e, Event::Aims { low: false, .. })).count(),
+            bites + 1,
+            "il choisit où mordre avant chaque morsure"
+        );
         // On le vise et on le mange : chaque bouchée retire quelque chose de plus.
         let eye = p.eye;
         let dims = grids();
@@ -1372,6 +1919,247 @@ mod tests {
         // Rien ne repousse.
         e.flesh.tick(600.0, None, &dims);
         assert_eq!(e.flesh.eaten(&dims), eaten);
+    }
+
+    /// (v272) Ses veines : dans chaque pavé, d'un seul tenant, jamais dans la peau du tour ;
+    /// on a beau le manger, elles restent toutes.
+    #[test]
+    fn its_veins_spread_everywhere_and_cannot_be_eaten() {
+        let grids = grids();
+        let mut all = 0;
+        for (part, d) in grids.iter().enumerate() {
+            let cells: Vec<[usize; 3]> = (0..d[0] * d[1] * d[2])
+                .map(|i| [i % d[0], i / d[0] % d[1], i / (d[0] * d[1])])
+                .filter(|c| vein(part, *c))
+                .collect();
+            let share = cells.len() as f32 / (d[0] * d[1] * d[2]) as f32;
+            assert!((0.04..=0.25).contains(&share), "pavé {part} : {share}");
+            all += cells.len();
+            for c in &cells {
+                assert!(c[0] >= 1 && c[0] + 1 < d[0] && c[2] >= 1 && c[2] + 1 < d[2], "{c:?}");
+                assert!(!(part == HEAD && mouth(*c, *d, 1.0)));
+            }
+            // Du haut en bas du pavé (sauf le bout des membres et le sommet du crâne).
+            let rows: std::collections::HashSet<usize> = cells.iter().map(|c| c[1]).collect();
+            assert!(rows.len() + 1 >= d[1], "pavé {part} : {} rangées sur {}", rows.len(), d[1]);
+            // D'un seul tenant : tout se rejoint de proche en proche.
+            let mut seen = std::collections::HashSet::from([cells[0]]);
+            let mut todo = vec![cells[0]];
+            while let Some(c) = todo.pop() {
+                for n in &cells {
+                    let far: usize = (0..3).map(|a| c[a].abs_diff(n[a])).sum();
+                    if far == 1 && seen.insert(*n) {
+                        todo.push(*n);
+                    }
+                }
+            }
+            assert_eq!(seen.len(), cells.len(), "pavé {part} : veines en plusieurs morceaux");
+        }
+        assert!(all > 200, "{all} cubes de veine");
+        // On le mange autant qu'on peut : aucune veine ne part.
+        let mut e = Evide::new(Vec3::ZERO, 0.0, 4);
+        for k in 0..400u32 {
+            e.flesh.bite_somewhere(k * 97 + 3, OUR_BITE, &[0, 1, 2, 3, 4, 5, 6], &grids);
+        }
+        assert!(e.flesh.eaten(&grids) > 0.6, "{}", e.flesh.eaten(&grids));
+        for (part, d) in grids.iter().enumerate() {
+            for i in 0..d[0] * d[1] * d[2] {
+                let c = [i % d[0], i / d[0] % d[1], i / (d[0] * d[1])];
+                assert!(!(vein(part, c) && e.flesh.gone(part, *d, c)), "veine mangée : {part} {c:?}");
+            }
+        }
+    }
+
+    /// (v272) « Montre-moi la radio des veines » : L'Évidé debout, de face et de profil, son
+    /// corps en gris (plus clair où il est plus épais), ses veines en clair. Écrit dans le
+    /// fichier nommé par MINELIB_IRM (essai à lancer à la main).
+    #[test]
+    #[ignore]
+    fn radio_of_the_veins() {
+        let Ok(path) = std::env::var("MINELIB_IRM") else {
+            return;
+        };
+        const SCALE: f32 = 230.0;
+        let (w, h) = (640usize, 860usize);
+        let mut body = vec![0.0f32; w * h];
+        let mut veins = vec![0.0f32; w * h];
+        let grids = grids();
+        for (part, (xf, lo, hi)) in parts(Vec3::ZERO, 0.0, &Anim::default()).into_iter().enumerate() {
+            let d = grids[part];
+            let (lo, hi) = (Vec3::from(lo), Vec3::from(hi));
+            let step = (hi - lo) / Vec3::new(d[0] as f32, d[1] as f32, d[2] as f32);
+            for i in 0..d[0] * d[1] * d[2] {
+                let c = [i % d[0], i / d[0] % d[1], i / (d[0] * d[1])];
+                if part == HEAD && mouth(c, d, 0.35) {
+                    continue;
+                }
+                let mid = lo + (Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32) + 0.5) * step;
+                let p = xf.transform_point3(mid);
+                let half = xf.transform_vector3(step).abs() * 0.5 * SCALE;
+                for (view, side) in [(0usize, p.x), (1, p.z)] {
+                    let (cx, cy) = (160.0 + 320.0 * view as f32 + side * SCALE, h as f32 - 30.0 - p.y * SCALE);
+                    let hx = if view == 0 { half.x } else { half.z };
+                    for y in (cy - half.y).round() as usize..(cy + half.y).round() as usize {
+                        for x in (cx - hx).round() as usize..(cx + hx).round() as usize {
+                            if x < w && y < h {
+                                body[y * w + x] += 1.0;
+                                veins[y * w + x] += vein(part, c) as u8 as f32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut img = image::RgbImage::from_pixel(w as u32, h as u32, image::Rgb([6, 9, 14]));
+        for (i, px) in img.pixels_mut().enumerate() {
+            if body[i] > 0.0 {
+                let g = (26.0 + 9.0 * body[i]).min(120.0);
+                let v = (veins[i] * 95.0).min(170.0);
+                *px = image::Rgb([
+                    (g * 0.8 + v * 0.75).min(255.0) as u8,
+                    (g * 0.92 + v * 0.9).min(255.0) as u8,
+                    (g + v).min(255.0) as u8,
+                ]);
+            }
+        }
+        img.save(path).unwrap();
+    }
+
+    /// (v272) « Il se penche jusqu'à la hauteur où il mord » et « suit le mouvement du bras,
+    /// sa hauteur aussi » : sa bouche vient sur l'endroit visé, d'une jambe à une épaule, et
+    /// y reste quand cet endroit se balance.
+    #[test]
+    fn it_bends_down_to_what_it_bites_and_follows_a_moving_arm() {
+        let w = flat();
+        let feet = Vec3::new(0.5, 11.0, -1.8);
+        for (side, height) in [(0.1f32, 0.55f32), (0.36, 0.95), (-0.36, 1.3), (0.0, 1.55)] {
+            let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 9);
+            let spot = feet + Vec3::new(side, height, 0.0);
+            let p = Prey {
+                spot: Some(spot),
+                ..prey(feet)
+            };
+            run(&mut e, &w, 4.0, Some(p));
+            let miss = e.mouth_point().distance(spot);
+            assert!(miss < 0.15, "hauteur {height} : sa bouche à {miss}");
+            // Plus c'est bas, plus il se plie (au-delà de l'horizontale pour une jambe).
+            assert!(e.anim.hunch > 2.9 - 1.1 * height, "hauteur {height} : {}", e.anim.hunch);
+            // Ses mains ne passent pas sous le sol.
+            let low = parts(e.pos, e.yaw, &e.anim)[ARM_L..=ARM_R]
+                .iter()
+                .map(|(xf, lo, _)| xf.transform_point3(Vec3::new(0.0, lo[1], 0.0)).y)
+                .fold(f32::MAX, f32::min);
+            assert!(low > 10.95, "hauteur {height} : une main à {low}");
+        }
+        // Un bras qui se balance : 0,25 bloc d'avant en arrière et 0,15 de haut en bas, une
+        // fois et demie par seconde.
+        let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 9);
+        let mut worst = 0.0f32;
+        for i in 0..(8 * 60) {
+            let t = i as f32 / 60.0;
+            let swing = (t * 1.5 * TAU).sin();
+            let spot = feet + Vec3::new(0.36, 1.0 + 0.15 * swing.abs(), 0.25 * swing);
+            let p = Prey {
+                spot: Some(spot),
+                ..prey(feet)
+            };
+            e.update(&w, 1.0 / 60.0, Some(p));
+            if t > 3.0 {
+                worst = worst.max(e.mouth_point().distance(spot));
+            }
+        }
+        assert!(worst < 0.3, "sa bouche s'écarte du bras jusqu'à {worst}");
+    }
+
+    /// (v272) Un mur entre lui et nous : il en fait le tour par le chemin le plus court au
+    /// lieu de buter dessus ; un bassin en travers : il le passe à la nage, à plat, à la
+    /// surface, et se hisse sur l'autre berge.
+    #[test]
+    fn it_finds_its_way_around_walls_and_swims_across_water() {
+        let mut w = flat();
+        for x in -6..=6 {
+            for y in 11..16 {
+                w.set(x, y, -5, BlockId::STONE);
+            }
+        }
+        let p = prey(Vec3::new(0.5, 11.0, -10.5));
+        let path = find_path(&w, [0, 11, 0], cell_of(p.feet));
+        // Par un bout du mur : 7 cases de côté, 10 de long, 6 ou 7 de retour.
+        assert!((20..=28).contains(&path.len()), "{} cases", path.len());
+        assert!(path.iter().all(|c| c[1] == 11 && !(c[2] == -5 && c[0].abs() <= 6)));
+        assert!(path.iter().any(|c| c[0].abs() == 7 && c[2] == -5), "{path:?}");
+        let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 5);
+        e.mode = Mode::Chase;
+        e.known = Some(p.feet);
+        let mut reached = None;
+        for i in 0..(9 * 60) {
+            e.update(&w, 1.0 / 60.0, Some(p));
+            if e.feeding {
+                reached = Some(i as f32 / 60.0);
+                break;
+            }
+        }
+        // 24 blocs à 6,6 blocs/s : moins de cinq secondes (en butant sur le mur, jamais).
+        assert!(reached.is_some_and(|t| t < 5.5), "{reached:?} : {}", e.pos);
+        // Hors de portée de la recherche : le chemin mène au plus près.
+        let far = find_path(&flat(), [0, 11, 0], [0, 11, -44]);
+        assert!(far.len() >= 40 && far.last().is_some_and(|c| c[2] <= -40), "{}", far.len());
+
+        // Un bassin de 9 blocs de large, d'un bord à l'autre du monde, profond de 2.
+        let mut w = flat();
+        for z in -13..=-5 {
+            for x in -48..48 {
+                w.set(x, 10, z, BlockId::WATER);
+                w.set(x, 9, z, BlockId::WATER);
+                w.set(x, 8, z, BlockId::STONE);
+            }
+        }
+        let p = prey(Vec3::new(0.5, 11.0, -18.5));
+        let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 5);
+        let (mut swam, mut floated, mut reached) = (0.0f32, true, None);
+        for i in 0..(14 * 60) {
+            e.update(&w, 1.0 / 60.0, Some(p));
+            if e.swimming && e.pos.z < -6.0 && e.pos.z > -12.0 {
+                swam += 1.0 / 60.0;
+                floated &= e.crawling && (9.9..=10.4).contains(&e.pos.y);
+            }
+            if e.feeding {
+                reached = Some(i as f32 / 60.0);
+                break;
+            }
+        }
+        let [_, swim_fast, _] = crate::player::SWIM;
+        assert!(swam > 5.0 / swim_fast && floated, "nagé {swam} s, à la surface : {floated}");
+        assert!(reached.is_some() && e.pos.z < -15.0 && !e.swimming, "{reached:?} {}", e.pos);
+    }
+
+    /// (v272) Enregistrés avec le monde : on les retrouve où ils étaient, entamés comme on
+    /// les avait laissés ; plus de fichier quand il n'y en a plus.
+    #[test]
+    fn they_are_saved_with_the_world() {
+        let dir = std::env::temp_dir().join(format!("minelib_evides_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let grids = grids();
+        let mut h = Horde::default();
+        assert!(h.spawn(Vec3::new(3.5, 70.0, -8.25), 1.25));
+        assert!(h.spawn(Vec3::new(-40.5, 12.0, 100.5), -0.5));
+        for k in 0..7u32 {
+            h.list[1].flesh.bite_somewhere(k * 31 + 5, OUR_BITE, &[0, 2, 3, 5], &grids);
+        }
+        h.list[1].crawling = true;
+        h.save(&dir);
+        let back = Horde::load(&dir);
+        assert_eq!(back.list.len(), 2);
+        for (a, b) in h.list.iter().zip(&back.list) {
+            assert_eq!((a.pos, a.yaw, a.crawling), (b.pos, b.yaw, b.crawling));
+            assert_eq!(a.flesh.bites(), b.flesh.bites());
+            assert_eq!(a.flesh.eaten(&grids), b.flesh.eaten(&grids));
+        }
+        assert!(back.list[1].flesh.eaten(&grids) > 0.05 && back.list[0].flesh.is_whole());
+        h.list.clear();
+        h.save(&dir);
+        assert!(!dir.join("evides.txt").exists() && Horde::load(&dir).list.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Il apparaît tout seul la nuit, rarement (une fois par vingt minutes en moyenne), dans
@@ -1437,7 +2225,7 @@ mod tests {
                 };
                 Some(match face {
                     Some(k) => skin(part, c, d, k),
-                    None => crate::flesh::jelly(c, d),
+                    None => inside(part, c, d),
                 })
             },
             TALL,

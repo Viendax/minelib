@@ -238,7 +238,7 @@ impl Item {
                 lines.push(("Clic droit : un Évidé sort là où tu vises".into(), WHITE));
                 lines.push(("3,5 blocs de gelée blanche, qui te cherche".into(), GREY));
                 lines.push(("Les épées ne lui font rien : mange-le (clic gauche, de près)".into(), GREY));
-                lines.push(("En solo seulement pour l'instant".into(), GREY));
+                lines.push(("En ligne : toi seul le vois, pour l'instant".into(), GREY));
             }
             Item::Flashlight => {
                 lines.push(("Éclaire comme un projecteur, où tu regardes".into(), WHITE));

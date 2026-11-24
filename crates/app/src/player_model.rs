@@ -49,6 +49,11 @@ pub struct Pose {
     pub held: Option<Held>,
     /// Skin du joueur (sinon le modèle par défaut de Minelib).
     pub skin: Option<std::sync::Arc<crate::skin::Skin>>,
+    /// (v272) Le haut du corps plié en avant aux hanches (rad), en plus de l'accroupi : « on
+    /// doit se voir se pencher pour manger le morceau qu'on vise ». La tête garde son regard.
+    /// 0 presque toujours (le joueur local seulement : le modèle partagé de la carte
+    /// graphique ne le connaît pas).
+    pub bow: f32,
 }
 
 fn srgb(c: u32) -> [f32; 3] {
@@ -341,6 +346,64 @@ fn emit_box_layer(
     }
 }
 
+/// (v272) Le milieu de la bouche du modèle dans cette pose (monde) : au bas du visage.
+pub fn mouth_point(pose: &Pose) -> Vec3 {
+    let (xf, lo, hi, _) = parts(pose)[5];
+    xf.transform_point3(Vec3::new(0.0, lo[1] + 0.22 * (hi[1] - lo[1]), lo[2]))
+}
+
+/// (v272) Plié au plus de tant (rad) pour manger.
+pub const BOW_MAX: f32 = 1.9;
+
+/// (v272) Plie le modèle (`pose.bow`, de 0 à `BOW_MAX`) pour amener sa bouche au plus près
+/// de `target` ; rend l'écart qui reste (blocs). La bouche décrit un arc autour des
+/// hanches : l'écart n'a qu'un creux, cherché par tiers.
+pub fn bow_to(pose: &mut Pose, target: Vec3) -> f32 {
+    let mut miss = |bow: f32| {
+        pose.bow = bow;
+        mouth_point(pose).distance(target)
+    };
+    let (mut lo, mut hi) = (0.0f32, BOW_MAX);
+    for _ in 0..18 {
+        let (a, b) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+        if miss(a) < miss(b) {
+            hi = b;
+        } else {
+            lo = a;
+        }
+    }
+    miss((lo + hi) / 2.0)
+}
+
+/// (v272) De combien les yeux du modèle se déplacent quand il se plie de `pose.bow` (monde) :
+/// à la première personne, la caméra plonge avec la tête.
+pub fn bow_shift(pose: &Pose) -> Vec3 {
+    if pose.bow == 0.0 {
+        return Vec3::ZERO;
+    }
+    let bent = crouch_lean(pose.crouch);
+    let p = bent.neck() + Vec3::new(0.0, 0.6 * HEAD_S, 0.0) - Vec3::new(0.0, LEG - bent.drop, 0.0);
+    let moved = Mat4::from_rotation_x(-pose.bow).transform_vector3(p) - p;
+    (Mat4::from_rotation_y(-pose.yaw) * Mat4::from_scale(Vec3::splat(PX))).transform_vector3(moved)
+}
+
+/// (v272) Où est, dans le monde, le milieu du cube `cell` du pavé `part` (grille
+/// `flesh_grids`) d'un joueur dans cette pose : l'endroit que L'Évidé vise, d'où le sang
+/// goutte. Il suit le membre qui bouge.
+pub fn cell_point(pose: &Pose, part: usize, cell: [usize; 3]) -> Vec3 {
+    let all = parts(pose);
+    let part = part.min(all.len() - 1);
+    let (xf, lo, hi, _) = all[part];
+    let d = ZONES[part].size;
+    let (lo, hi) = (Vec3::from(lo), Vec3::from(hi));
+    let t = Vec3::new(
+        (cell[0] as f32 + 0.5) / d[0] as f32,
+        (cell[1] as f32 + 0.5) / d[1] as f32,
+        (cell[2] as f32 + 0.5) / d[2] as f32,
+    );
+    xf.transform_point3(lo + (hi - lo) * t)
+}
+
 /// (v269) Les mesures du modèle (pixels), pour L'Évidé : le même corps, étiré en hauteur.
 pub(crate) struct Rig {
     /// Taille d'un pixel, en blocs.
@@ -454,7 +517,19 @@ fn emit_flesh(
                             .and_then(|t| t.color(zone.skin, k, su as u32, sv as u32, full))
                             .unwrap_or_else(|| skin(part, FACES[k], su, sv, zone.width(k)));
                         let g = grain(k * 4096 + sv * 64 + su + part as usize * 977);
-                        srgb(rgb).map(|c| c * shade * g)
+                        let mut lin = srgb(rgb);
+                        // (v272) « Fais que du sang en coule » : sur les faces du tour, les
+                        // cubes sous un cube mangé rougissent, de moins en moins, sur deux
+                        // à cinq cubes selon la colonne.
+                        if axis != 1 {
+                            let j = flesh.drip(index, dims, c);
+                            if j > 0 && j <= 2 + (x * 31 + z * 17 + index * 7) % 4 {
+                                let t = 0.92 - 0.13 * (j as f32 - 1.0);
+                                let blood = srgb(crate::flesh::BLOOD);
+                                lin = [0, 1, 2].map(|i| lin[i] + (blood[i] - lin[i]) * t);
+                            }
+                        }
+                        lin.map(|c| c * shade * g)
                     } else {
                         let g = grain(index * 7919 + (z * 64 + y) * 64 + x + k * 131);
                         srgb(inside(index, c, dims)).map(|c| c * shade * g * 0.86)
@@ -909,10 +984,20 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     // Haut du corps : penché vers l'avant quand on s'accroupit (pivot à la hanche). (v260)
     // Le ventre se penche autour des hanches ; la poitrine, pliée un peu plus à la taille, a
     // son propre repère (`Crouch::chest_at`). Debout, les deux sont le même.
-    let belly = base
+    // (v272) Plié en avant pour manger (`Pose::bow`) : tout le haut du corps tourne autour
+    // des hanches.
+    let up = if pose.bow == 0.0 {
+        base
+    } else {
+        let hip = Vec3::new(0.0, LEG - drop, 0.0);
+        base * Mat4::from_translation(hip)
+            * Mat4::from_rotation_x(-pose.bow)
+            * Mat4::from_translation(-hip)
+    };
+    let belly = up
         * Mat4::from_translation(Vec3::new(0.0, LEG - drop, 0.0))
         * Mat4::from_rotation_x(-bent.belly);
-    let upper = base * Mat4::from_translation(bent.chest_at) * Mat4::from_rotation_x(-lean);
+    let upper = up * Mat4::from_translation(bent.chest_at) * Mat4::from_rotation_x(-lean);
     let (min, max, part) = PARTS[CHEST];
     out.push((upper, min, max, part));
     // Bras : pivot à l'épaule (`SHOULDER_Y` au-dessus de la hanche), balancement inverse
@@ -976,9 +1061,9 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     }
     // Tête : pivot au cou (v234 : au milieu du haut du corps, même penché ; elle avance avec
     // lui), suit le regard (tangage), sans suivre la penche du corps.
-    let head = base
+    let head = up
         * Mat4::from_translation(bent.neck())
-        * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4));
+        * Mat4::from_rotation_x(pose.bow + pose.pitch.clamp(-1.4, 1.4));
     let (min, max, part) = PARTS[5];
     out.push((head, min, max, part));
     // (v260) Ventre : sous la poitrine, penché autour des hanches.
@@ -2236,6 +2321,7 @@ pub fn first_person_body(
         light: pose.light,
         held: pose.held,
         skin: pose.skin.clone(),
+        bow: pose.bow,
     };
     let mut out = Vec::with_capacity(6400);
     let mut quads = Vec::with_capacity(1600);
@@ -2521,6 +2607,7 @@ pub fn hit_boxes(feet: Vec3, yaw: f32, pitch: f32, crouch: f32) -> [(Mat4, Vec3,
         light: [1.0; 3],
         held: Some(Held::Gear(0)),
         skin: None,
+        bow: 0.0,
     };
     let p = parts(&pose);
     std::array::from_fn(|i| {
@@ -2711,6 +2798,7 @@ mod tests {
                 light: [1.0; 3],
                 held: None,
                 skin: None,
+                bow: 0.0,
             };
             let m = zeus_back_frame(&pose).unwrap();
             // Repère du joueur : x à droite, z vers l'arrière.
@@ -2764,6 +2852,7 @@ mod tests {
                     Some(Held::Flashlight(true)),
                 ][n],
                 skin: (n > 0).then(|| skin.clone()),
+                bow: 0.0,
             })
             .collect()
     }
@@ -2823,6 +2912,7 @@ mod tests {
                     light: [1.0; 3],
                     held: Some(held),
                     skin: None,
+                    bow: 0.0,
                 };
                 let arm = right_arm_matrix(&pose).unwrap();
                 // De l'épaule (z = 1 de la boîte du bras) au poing (z = 0).
@@ -2850,6 +2940,7 @@ mod tests {
             light: [1.0; 3],
             held: Some(Held::Block(BlockId::STONE)),
             skin: None,
+            bow: 0.0,
         };
         let (frame, min, max, _) = held_parts(&pose)[0];
         let m = held_item_matrix(&pose).unwrap();
@@ -2875,6 +2966,7 @@ mod tests {
                 light: [1.0; 3],
                 held: None,
                 skin: None,
+                bow: 0.0,
             };
             let mut hi = f32::MIN;
             for (xf, mn, mx, _) in parts(&pose) {
@@ -2919,6 +3011,7 @@ mod tests {
                 light: [1.0; 3],
                 held: Some(Held::Zeus),
                 skin: None,
+                bow: 0.0,
             };
             let eye = crate::session::eye_of(pose.feet, 0.0);
             let view = (Mat4::from_translation(eye)
@@ -2991,6 +3084,7 @@ mod tests {
             light: [1.0; 3],
             held,
             skin: None,
+            bow: 0.0,
         };
         let p = parts(&pose(None));
         assert_eq!(p.len(), 7);
@@ -3078,6 +3172,7 @@ mod tests {
             light: [1.0; 3],
             held: None,
             skin: Some(skin),
+            bow: 0.0,
         };
         // Un carré : son milieu et sa couleur ; deux carrés sont les mêmes au centième de
         // millimètre et au dix-millième de couleur près (les deux dessins ne font pas leurs
@@ -3120,16 +3215,69 @@ mod tests {
             let (before, after) = (quads(&plain), quads(&bitten));
             let (lost, new) = (missing(&before, &after), missing(&after, &before));
             // Le coin de 2 × 2 × 2 cubes : 3 faces de 4 carrés du skin en moins, 3 faces de
-            // 4 carrés de chair en plus (là où le cube mordu touchait le reste).
+            // 4 carrés de chair en plus (là où le cube mordu touchait le reste). (v272) Et
+            // le sang qui en coule : sous la morsure, sur les deux faces du tour entamées,
+            // quatre colonnes de carrés du skin rougis (deux à cinq carrés chacune, moins
+            // si le pavé finit avant).
             let size: Vec<usize> = (0..3).map(|a| (b.hi[a] - b.lo[a]) as usize).collect();
             let outer = size[0] * size[1] + size[1] * size[2] + size[0] * size[2];
-            assert_eq!(lost, outer, "pavé {i} : carrés du skin partis");
-            assert_eq!(new, outer, "pavé {i} : carrés de chair");
+            let below = (d[1] - size[1]).min(crate::flesh::DRIP);
+            assert_eq!(lost, new, "pavé {i} : un carré pour un carré");
+            let red = lost - outer;
+            assert!((4 * below.min(2)..=4 * below).contains(&red), "pavé {i} : {red} rougis");
         }
         // Le modèle entier : `build_bitten` sans morsure est `build`.
         let (a, b) = (quads(&build(&pose)), quads(&build_bitten(&pose, Some(&Flesh::default()))));
         assert_eq!(a.len(), b.len());
         assert_eq!((missing(&a, &b), missing(&b, &a)), (0, 0), "modèle entier sans morsure");
+    }
+
+    /// (v272) « On doit se voir se pencher pour manger le morceau qu'on vise » : plié aux
+    /// hanches, les pieds et les jambes ne bougent pas, la bouche arrive sur ce qu'on vise
+    /// devant soi (de la hauteur de la cuisse à celle du visage, à la bonne distance), le regard
+    /// reste où il était ; trop loin, elle n'y arrive pas.
+    #[test]
+    fn bowing_brings_the_mouth_onto_what_one_aims_at() {
+        let feet = Vec3::new(4.0, 20.0, -3.0);
+        let straight = |bow: f32| Pose {
+            feet,
+            yaw: 0.0,
+            pitch: -0.3,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: None,
+            skin: None,
+            bow,
+        };
+        let up = mouth_point(&straight(0.0));
+        assert!((up.y - feet.y - 1.63).abs() < 0.06 && (up.z - feet.z + 0.1).abs() < 0.06, "{up}");
+        // Devant soi (−z), de plus en plus bas : la bouche y arrive, de plus en plus plié.
+        let mut last = 0.0;
+        for (ahead, height) in [(0.45f32, 1.5f32), (0.72, 1.3), (0.82, 0.95), (0.79, 0.72)] {
+            let target = feet + Vec3::new(0.0, height, -ahead);
+            let mut pose = straight(0.0);
+            let miss = bow_to(&mut pose, target);
+            assert!(miss < 0.1, "{ahead} devant, {height} de haut : à {miss}");
+            assert!(pose.bow > last && pose.bow <= BOW_MAX, "{}", pose.bow);
+            last = pose.bow;
+            let (a, b) = (parts(&straight(0.0)), parts(&pose));
+            for leg in 0..2 {
+                assert_eq!(a[leg].0, b[leg].0, "les jambes ne bougent pas");
+            }
+            // La tête garde son regard (elle ne tourne pas avec le dos).
+            let look = |p: &[(Mat4, [f32; 3], [f32; 3], Part)]| p[5].0.transform_vector3(Vec3::NEG_Z);
+            assert!(look(&a).angle_between(look(&b)) < 1e-3);
+            // La caméra plonge d'autant que les yeux.
+            let shift = bow_shift(&pose);
+            assert!(shift.z < -0.2 && shift.y < 0.0 && shift.length() < 1.5, "{shift}");
+        }
+        // Trop loin, ou derrière soi : la bouche n'y arrive pas.
+        for target in [feet + Vec3::new(0.0, 1.0, -1.5), feet + Vec3::new(0.0, 1.0, 0.8)] {
+            assert!(bow_to(&mut straight(0.0), target) > 0.3);
+        }
+        assert_eq!(bow_shift(&straight(0.0)), Vec3::ZERO);
     }
 
     /// (v269) « Tu me montreras l'IRM des couches de notre modèle 3D joueur » : les couches du
@@ -3165,6 +3313,7 @@ mod tests {
                     light: [1.0; 3],
                     held: None,
                     skin: None,
+                    bow: 0.0,
                 };
                 let eye = crate::session::eye_of(pose.feet, crouch);
                 let view = (Mat4::from_translation(eye)
@@ -3229,6 +3378,7 @@ mod tests {
             light: [1.0; 3],
             held: None,
             skin: None,
+            bow: 0.0,
         };
         let feet = pose(0.0).feet;
         // De face (il regarde vers −z) : au milieu de la poitrine, puis dans la jambe droite.
@@ -3524,6 +3674,7 @@ mod tests {
             light: [1.0; 3],
             held: None,
             skin: None,
+            bow: 0.0,
         };
         let v = build(&pose);
         assert!(v.len() > 5000 && v.len().is_multiple_of(3));
@@ -3593,6 +3744,7 @@ mod tests {
                 light: [1.0; 3],
                 held: None,
                 skin: None,
+                bow: 0.0,
             };
             let boxes = shadow_boxes(&pose);
             // Immobile : les deux jambes ne font qu'une boîte (v256 : six avec le ventre).
@@ -3655,6 +3807,7 @@ mod tests {
             light: [1.0; 3],
             held: None,
             skin: None,
+            bow: 0.0,
         };
         let boxes = shadow_boxes(&pose);
         let lamp = pose.feet + Vec3::new(1.5, 3.0, 2.0);
@@ -3681,6 +3834,7 @@ mod tests {
             light: [1.0; 3],
             held: None,
             skin: None,
+            bow: 0.0,
         };
         assert_eq!(shadow_boxes(&walking).len(), 7);
     }
@@ -3702,6 +3856,7 @@ mod held_tests {
             light: [1.0; 3],
             held: Some(Held::Torch([255, 200, 100])),
             skin: None,
+            bow: 0.0,
         };
         let hand = hand_frame(&pose).unwrap().transform_point3(Vec3::ZERO);
         let tip = torch_tip(&pose).unwrap();

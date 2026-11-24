@@ -122,6 +122,8 @@ pub struct Traces {
     clock: f32,
     drops: Vec<Drop>,
     rng: u32,
+    /// (v272) Prochain tri des vieilles taches de sang (horloge des traces).
+    next_expire: f32,
 }
 
 impl Default for Traces {
@@ -133,6 +135,7 @@ impl Default for Traces {
             clock: 0.0,
             drops: Vec::new(),
             rng: 0x7ace_5eed,
+            next_expire: 0.0,
         }
     }
 }
@@ -159,6 +162,7 @@ impl Traces {
         self.decals.clear();
         self.drops.clear();
         self.clock = 0.0;
+        self.next_expire = 0.0;
     }
 
     /// Pour le rendu : la liste, sa révision, l'horloge de leurs heures de naissance.
@@ -506,6 +510,54 @@ impl Traces {
         }
     }
 
+    /// (v272) Du sang goutte d'une blessure en `at` (qui bouge à `vel`) : `count` gouttes qui
+    /// tombent presque droit et tachent le sol où elles arrivent ; `spurt` : un jet (la
+    /// morsure vient d'arracher le morceau), elles partent plus fort, tout autour.
+    pub fn bleed(&mut self, at: Vec3, vel: Vec3, count: usize, spurt: bool) {
+        if !(at.is_finite() && vel.is_finite()) {
+            return;
+        }
+        if self.drops.len() + count > MAX_DROPS {
+            let extra = (self.drops.len() + count - MAX_DROPS).min(self.drops.len());
+            self.drops.drain(..extra);
+        }
+        for _ in 0..count {
+            let out = self.rnd3();
+            let push = if spurt { 0.4 + 1.0 * self.unit() } else { 0.15 + 0.3 * self.unit() };
+            let up = if spurt { 0.4 + 1.0 * self.unit() } else { 0.0 };
+            let size = 0.010 + 0.016 * self.unit().powi(2);
+            self.drops.push(Drop {
+                pos: at + out * 0.03,
+                vel: vel * 0.5 + Vec3::new(out.x, 0.0, out.z) * push + Vec3::Y * up,
+                age: 0.0,
+                life: 4.0,
+                size,
+                mist: false,
+            });
+        }
+    }
+
+    /// (v272) « En build le sang reste 5 minutes au sol » : hors partie FPS, les taches de
+    /// sang (taches, giclées, coulures) plus vieilles que `max_age` secondes s'en vont ; les
+    /// autres traces restent. (En partie FPS, tout reste jusqu'à la fin de la manche.)
+    pub fn expire_blood(&mut self, max_age: f32) {
+        // Une fois par seconde suffit.
+        if self.clock < self.next_expire {
+            return;
+        }
+        self.next_expire = self.clock + 1.0;
+        let clock = self.clock;
+        let before = self.decals.len();
+        self.decals.retain(|d| {
+            let blood = d.kind == KIND_SPLAT || d.kind == KIND_SPRAY || d.kind == KIND_DRIP;
+            !(blood && clock - d.born > max_age)
+        });
+        if self.decals.len() != before {
+            self.epoch = self.epoch.wrapping_add(1);
+            self.pushed = 0;
+        }
+    }
+
     /// Avance de `dt` : les gouttes volent ; celle qui touche un bloc y laisse sa tache.
     pub fn tick(&mut self, world: &World, dt: f32) {
         self.clock += dt;
@@ -565,6 +617,47 @@ mod tests {
             }
         }
         w
+    }
+
+    /// (v272) Une morsure saigne : les gouttes tombent et tachent le sol sous elle ; hors
+    /// partie FPS ces taches s'en vont au bout de cinq minutes, pas les impacts de balles.
+    #[test]
+    fn a_bite_bleeds_on_the_ground_and_the_blood_goes_after_five_minutes() {
+        let w = room();
+        let mut t = Traces::default();
+        t.hole(&w, Vec3::new(5.5, 11.0, 5.5), Vec3::Y);
+        t.bleed(Vec3::new(6.0, 12.2, 8.0), Vec3::ZERO, 14, true);
+        t.bleed(Vec3::new(6.0, 12.2, 8.0), Vec3::ZERO, 6, false);
+        assert_eq!(t.drops().len(), 20);
+        for _ in 0..300 {
+            t.tick(&w, 1.0 / 60.0);
+        }
+        assert!(t.drops().is_empty());
+        let (list, ..) = t.list();
+        let blood: Vec<_> = list.iter().filter(|d| d.kind != KIND_HOLE).collect();
+        assert!(blood.len() >= 18, "{} taches", blood.len());
+        for d in &blood {
+            // Au sol (dessus du bloc), à moins de deux blocs de la morsure.
+            assert!((d.pos[1] - 11.0).abs() < 1e-3 && d.normal == [0.0, 1.0, 0.0]);
+            assert!(Vec3::new(d.pos[0] - 6.0, 0.0, d.pos[2] - 8.0).length() < 2.0);
+        }
+        // Quatre minutes et demie plus tard elles sont encore là ; à cinq minutes passées,
+        // il ne reste que l'impact.
+        let total = list.len();
+        for _ in 0..265 {
+            t.tick(&w, 1.0);
+            t.expire_blood(300.0);
+        }
+        assert_eq!(t.list().0.len(), total);
+        let rev = t.list().1;
+        for _ in 0..40 {
+            t.tick(&w, 1.0);
+            t.expire_blood(300.0);
+        }
+        let (list, after, _) = t.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, KIND_HOLE);
+        assert_ne!(rev, after, "la carte doit recevoir la liste raccourcie");
     }
 
     /// Un tir qui touche un joueur devant un mur : le sang gicle, marque le mur derrière

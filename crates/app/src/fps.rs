@@ -1478,6 +1478,23 @@ impl Fps {
         }
     }
 
+    /// (v272) Du sang goutte d'une morsure (voir `Traces::bleed`).
+    pub fn bleed(&mut self, at: Vec3, vel: Vec3, count: usize, spurt: bool) {
+        self.traces.bleed(at, vel, count, spurt);
+    }
+
+    /// (v272) Hors partie FPS (où `tick_effects` ne tourne pas) : les gouttes de sang
+    /// tombent et tachent le sol, et le sang n'y reste que `max_age` secondes.
+    pub fn tick_blood(&mut self, dt: f32, world: &World, max_age: f32) {
+        self.traces.tick(world, dt);
+        self.traces.expire_blood(max_age);
+    }
+
+    /// (v272) Des gouttes de sang sont en vol (à dessiner : `world_fx`).
+    pub fn has_drops(&self) -> bool {
+        !self.traces.drops().is_empty()
+    }
+
     /// Aveuglé par une flash (pour le fil des éliminations).
     pub fn is_blind(&self) -> bool {
         self.blind > 0.3

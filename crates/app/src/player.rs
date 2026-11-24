@@ -1397,6 +1397,8 @@ impl Player {
 /// (v269) Les allures du joueur, pour ce qui se déplace comme lui (L'Évidé) : marche, course,
 /// marche accroupie (blocs par seconde), pesanteur et élan du saut.
 pub(crate) const GAIT: [f32; 5] = [WALK, SPRINT, SNEAK, GRAVITY, JUMP_SPEED];
+/// (v272) Et sa nage dans l'eau : lente, rapide, vers le haut (blocs par seconde).
+pub(crate) const SWIM: [f32; 3] = [SWIM_WATER, SWIM_WATER_SPRINT, SWIM_UP_WATER];
 
 /// Boîtes de collision (coordonnées monde) du bloc en (x, y, z) : la forme réelle
 /// (dalle, escalier, clôture reliée à ses voisins…), pas un cube entier.

@@ -42,7 +42,34 @@ fn npc_cry_gain(d: f32) -> Option<f32> {
 /// (v269) Une morsure de L'Évidé : points de vie perdus (sur 20) ; temps entre deux de nos
 /// bouchées (s) ; au-delà de cette distance (blocs) il n'est plus dessiné.
 const EVIDE_BITE: u8 = 3;
-const EVIDE_EAT_S: f32 = 0.3;
+/// (v272) Une morsure saigne : gouttes du premier jet, puis gouttes par seconde au début,
+/// qui s'espacent (divisées par e toutes les `BLEED_FADE_S` secondes), pendant `BLEED_S`.
+const BLEED_SPURT: usize = 14;
+const BLEED_RATE: f32 = 9.0;
+const BLEED_FADE_S: f32 = 3.5;
+const BLEED_S: f32 = 12.0;
+/// (v272) « En build le sang reste 5 minutes au sol » (hors partie FPS).
+const BLOOD_ON_GROUND_S: f32 = 300.0;
+
+/// (v272) Où sont l'endroit visé par L'Évidé et les morsures qui saignent, dans la pose
+/// dessinée : (l'endroit visé, (pavé, cube, position) de chaque morsure).
+type BitePoints = (Option<Vec3>, Vec<(usize, [usize; 3], Vec3)>);
+
+/// (v272) Les pavés du joueur que L'Évidé peut mordre : tout le tour du corps (jambes,
+/// poitrine, bras, ventre ; pas la tête), ou les jambes seulement quand il rampe.
+fn bite_parts(low: bool) -> &'static [usize] {
+    if low {
+        &[0, 1]
+    } else {
+        &[0, 1, 2, 3, 4, 6]
+    }
+}
+/// (v272) Notre bouchée : on mord à `EAT_IN` s, le geste dure `EAT_S` s ; notre bouche doit
+/// alors être à moins de `EAT_TOUCH` bloc du morceau ; vitesse à laquelle on se plie (rad/s).
+const EAT_IN: f32 = 0.2;
+const EAT_S: f32 = 0.38;
+const EAT_TOUCH: f32 = 0.25;
+const BOW_SPEED: f32 = 9.0;
 const EVIDE_DRAWN: f32 = 160.0;
 
 /// (v249) Durée de l'éblouissement par la foudre qu'on prend (s) : l'écran reste blanc
@@ -365,8 +392,24 @@ pub struct Session {
     /// (v269) Ce que L'Évidé a mangé de chacun (par pseudo ; vide : le joueur local) : les
     /// morceaux qui manquent à son corps, qui reviennent en cinq minutes (`flesh::Flesh`).
     flesh: HashMap<String, crate::flesh::Flesh>,
-    /// (v269) Les Évidés du monde (`evide`) : en solo seulement pour l'instant.
+    /// (v269) Les Évidés du monde (`evide`). (v272) En ligne, dans un monde de construction :
+    /// ceux de ce joueur (les autres ne les voient pas) ; jamais en partie FPS.
     evides: crate::evide::Horde,
+    /// (v272) Notre bouchée en cours sur un Évidé : (son numéro, pavé, cube visés, temps écoulé
+    /// en s, déjà mordu). On se plie vers le morceau, on le mange si notre bouche le touche.
+    eating: Option<(u32, usize, [usize; 3], f32, bool)>,
+    /// (v272) De combien le haut de notre corps est plié en avant pour manger (rad).
+    eat_bow: f32,
+    /// (v272) L'endroit de notre corps que L'Évidé mordra ensuite (pavé, cube) : il le vise,
+    /// se penche jusqu'à lui et le suit s'il bouge.
+    evide_spot: Option<(usize, [usize; 3])>,
+    /// (v272) Nos morsures qui saignent : (pavé, cube d'où le sang goutte, âge en s, gouttes
+    /// dues).
+    bleeding: Vec<(usize, [usize; 3], f32, f32)>,
+    /// (v272) Où sont, dans la pose dessinée, l'endroit visé et les morsures qui saignent
+    /// (écrit par `render`, lu à l'image suivante : la pose exacte, objet tenu compris, n'est
+    /// connue que là).
+    bite_points: std::cell::RefCell<BitePoints>,
     /// (v264) Plaies des joueurs de la partie FPS (« un impact dans le joueur ») : par pseudo
     /// (vide : le joueur local), jusqu'à sa mort ou la fin de la manche, comme les traces sur
     /// les blocs. Dessinées sur son modèle (`player_model::wound_model`).
@@ -606,6 +649,8 @@ impl Session {
     pub fn open(dir: PathBuf, cfg: SessionConfig) -> Result<Self> {
         let (data, mut world) = save::load_world(&dir)?;
         let dir_for_lights = dir.clone();
+        // (v272) Les Évidés enregistrés avec ce monde.
+        let evides_saved = crate::evide::Horde::load(&dir);
         let (mut player, fresh) = match data.player {
             Some(p) => {
                 let mut pl = Player::new(Vec3::from(p.pos));
@@ -796,11 +841,16 @@ impl Session {
             heads: None,
             head_skins_at: None,
             team_skin: Default::default(),
+            eating: None,
+            eat_bow: 0.0,
+            evide_spot: None,
+            bleeding: Vec::new(),
+            bite_points: Default::default(),
             // Essais : MINELIB_EVIDE="x,y,z,lacet°[,posture]" pose d'avance un Évidé (figé dans
             // la posture nommée : debout, court, rampe, mord, mange ; vivant sans posture) ;
             // plusieurs séparés par « ; ».
             evides: {
-                let mut horde = crate::evide::Horde::default();
+                let mut horde = evides_saved;
                 for one in std::env::var("MINELIB_EVIDE").unwrap_or_default().split(';') {
                     let f: Vec<&str> = one.split(',').map(str::trim).collect();
                     let n: Vec<f32> = f.iter().take(4).filter_map(|v| v.parse().ok()).collect();
@@ -826,7 +876,7 @@ impl Session {
                     .unwrap_or(0);
                 if n > 0 {
                     let grids = crate::player_model::flesh_grids();
-                    let mut f = crate::flesh::Flesh::default();
+                    let mut f = crate::flesh::Flesh::of(crate::flesh::Hard::Bones);
                     for k in 0..n {
                         f.bite_somewhere(k * 31 + 7, 2 + (k % 2) as usize, &[0, 1, 2, 3, 5, 6], &grids);
                     }
@@ -1065,6 +1115,11 @@ impl Session {
         if self.items_ready && self.build.as_ref().is_none_or(|b| b.is_owner()) {
             self.items.save(&self.dir);
         }
+        // (v272) Les Évidés : avec le monde (en ligne : avec la copie de ce joueur, ce sont
+        // les siens).
+        if self.net.is_none() {
+            self.evides.save(&self.dir);
+        }
         // Lumières de l'éditeur : avec la copie du monde de ce joueur (même en ligne).
         self.lights.save_now();
         save::save_world(&self.dir, &data, &self.world)
@@ -1271,13 +1326,80 @@ impl Session {
                 }
                 self.flesh.retain(|_, f| !f.is_whole());
             }
-            // (v269) Les Évidés : en solo seulement pour l'instant (en ligne, le relais devra
-            // tout valider). La nuit, il en vient tout seuls, rarement (`evide::SPAWN_EVERY_S`).
-            if self.net.is_none() && self.build.is_none() {
+            // (v272) « Fais que du sang en coule » : chaque morsure saigne `BLEED_S` secondes,
+            // des gouttes de plus en plus rares qui tombent de l'endroit mordu (là où il est
+            // dans la pose dessinée) et tachent le sol. « En build le sang reste 5 minutes au
+            // sol » : hors partie FPS, les taches de sang s'en vont après ce temps-là.
+            if !self.bleeding.is_empty() {
+                let vel = self.player.vel;
+                let mut drops = Vec::new();
+                {
+                    let seen = self.bite_points.borrow();
+                    for b in &mut self.bleeding {
+                        b.2 += dt;
+                        b.3 += dt * BLEED_RATE * (-b.2 / BLEED_FADE_S).exp();
+                        let n = b.3 as usize;
+                        b.3 -= n as f32;
+                        let at = seen.1.iter().find(|p| (p.0, p.1) == (b.0, b.1));
+                        if let (true, Some(at)) = (n > 0, at) {
+                            drops.push((at.2, n));
+                        }
+                    }
+                }
+                for (at, n) in drops {
+                    self.fps.bleed(at, vel, n, false);
+                }
+                self.bleeding.retain(|b| b.2 < BLEED_S);
+            }
+            if self.game.mode != GameMode::Fps {
+                self.fps.tick_blood(dt, &self.world, BLOOD_ON_GROUND_S);
+            }
+            // (v272) Notre bouchée : on se plie vers le morceau visé, là où il est maintenant ;
+            // au bout de `EAT_IN` secondes on le mange si notre bouche le touche, sinon rien
+            // (« si la bouche se décolle avant, ça ne mange pas, dans les deux sens ») ; puis
+            // on se redresse.
+            let mut bow = 0.0;
+            if let Some((id, part, cell, t, done)) = self.eating {
+                let target = self
+                    .evides
+                    .by_id(id)
+                    .filter(|e| !e.is_dying())
+                    .map(|e| e.cell_point(part, cell));
+                self.eating = None;
+                if let Some(target) = target {
+                    let mut pose = self.body_pose();
+                    let reach = crate::player_model::bow_to(&mut pose, target);
+                    bow = pose.bow;
+                    let (t, mut done) = (t + dt, done);
+                    if t >= EAT_IN && !done {
+                        done = true;
+                        let mouth = crate::player_model::mouth_point(&self.body_pose());
+                        if reach <= EAT_TOUCH && mouth.distance(target) <= EAT_TOUCH {
+                            let eaten = self.evides.by_id(id).and_then(|e| e.eaten_at(part, cell));
+                            if let Some(dead) = eaten {
+                                crate::audio::jelly_bite(0.0);
+                                if dead {
+                                    crate::audio::evide_voice(0.0);
+                                }
+                            }
+                        }
+                    }
+                    if t < EAT_S {
+                        self.eating = Some((id, part, cell, t, done));
+                    }
+                }
+            }
+            self.eat_bow += (bow - self.eat_bow).clamp(-BOW_SPEED * dt, BOW_SPEED * dt);
+            // (v269) Les Évidés. (v272) En solo et dans un monde de construction en ligne (là,
+            // ceux de ce joueur seulement : rien n'est partagé, le relais n'a rien à valider) ;
+            // pas en partie FPS. La nuit, il en vient tout seuls, rarement
+            // (`evide::SPAWN_EVERY_S`).
+            if self.net.is_none() {
                 let prey = (self.game.mode != GameMode::Spectator && self.spectating.is_none())
                     .then(|| crate::evide::Prey {
                         feet: self.player.pos,
                         eye: self.player.eye(),
+                        spot: self.evide_spot.and(self.bite_points.borrow().0),
                     });
                 let night = self.game.mode != GameMode::Fps
                     && self.time_h >= 0.0
@@ -3417,13 +3539,17 @@ impl Session {
                 .evides
                 .aimed(self.player.eye(), self.player.look_dir(), crate::evide::EAT_REACH)
                 .filter(|a| hit.as_ref().is_none_or(|b| a.1 <= b.distance));
-            if let Some((i, _, part, cell)) = aim {
-                if attack && self.break_cooldown <= 0.0 {
-                    self.break_cooldown = EVIDE_EAT_S;
-                    if let Some(dead) = self.evides.list[i].eaten_at(part, cell) {
-                        crate::audio::jelly_bite(0.0);
-                        if dead {
-                            crate::audio::evide_voice(0.0);
+            if let Some((id, _, part, cell)) = aim {
+                // (v272) « On doit se voir se pencher pour manger le morceau qu'on vise si on
+                // est assez près de lui » : la bouchée ne part que si notre bouche peut
+                // arriver sur ce morceau en pliant le haut du corps ; elle est menée image
+                // après image plus bas (`eating`).
+                if attack && self.eating.is_none() {
+                    let target = self.evides.by_id(id).map(|e| e.cell_point(part, cell));
+                    if let Some(target) = target {
+                        let mut pose = self.body_pose();
+                        if crate::player_model::bow_to(&mut pose, target) <= EAT_TOUCH {
+                            self.eating = Some((id, part, cell, 0.0, false));
                         }
                     }
                 }
@@ -4162,6 +4288,7 @@ impl Session {
             light: [1.0; 3],
             held,
             skin: None,
+            bow: 0.0,
         }
     }
 
@@ -5361,6 +5488,22 @@ impl Session {
                 .unwrap_or_else(|| Mat4::from_translation(self.player.eye()))
     }
 
+    /// (v272) Notre corps tel qu'il est (sans l'objet tenu), plié de `eat_bow`.
+    fn body_pose(&self) -> crate::player_model::Pose {
+        crate::player_model::Pose {
+            feet: self.player.pos,
+            yaw: self.player.yaw,
+            pitch: self.player.pitch,
+            walk: self.walk_phase,
+            swing: self.walk_amp,
+            crouch: self.player.crouch,
+            light: self.hand_light,
+            held: None,
+            skin: None,
+            bow: self.eat_bow,
+        }
+    }
+
     fn own_pose(&self, held: crate::player_model::Held) -> crate::player_model::Pose {
         crate::player_model::Pose {
             feet: self.player.pos,
@@ -5372,6 +5515,7 @@ impl Session {
             light: self.hand_light,
             held: Some(held),
             skin: None,
+            bow: self.eat_bow,
         }
     }
 
@@ -5535,8 +5679,14 @@ impl Session {
             // comptées depuis la caméra, sans la translation de la vue) ; sans elle, la caméra
             // sautait d'un coup sur une dalle, et la vue (tri des chunks, lumières) ne tombait
             // plus juste avec l'image.
+            // (v272) Plié pour manger : la caméra plonge avec la tête.
+            let bow = if self.eat_bow == 0.0 {
+                Vec3::ZERO
+            } else {
+                crate::player_model::bow_shift(&self.body_pose())
+            };
             (
-                self.player.eye() + Vec3::Y * self.step_offset,
+                self.player.eye() + Vec3::Y * self.step_offset + bow,
                 self.view_with_punch(),
                 self.player.look_dir(),
             )
@@ -6535,9 +6685,9 @@ impl Session {
 
     /// (v269) Œuf de L'Évidé : il sort là où l'on a cliqué, tourné vers nous.
     fn hatch_evide(&mut self, hit: minelib_world::raycast::Hit) {
-        if self.net.is_some() || self.build.is_some() || self.game.mode == GameMode::Fps {
+        if self.net.is_some() || self.game.mode == GameMode::Fps {
             self.chat
-                .say("L'Évidé n'existe qu'en solo pour l'instant.", chat::RED);
+                .say("L'Évidé ne vient pas en partie FPS.", chat::RED);
             return;
         }
         let [x, y, z] = hit.adjacent();
@@ -6559,21 +6709,44 @@ impl Session {
         let ear = self.player.eye();
         match ev {
             crate::evide::Event::Voice(at) => crate::audio::evide_voice(at.distance(ear)),
+            // (v272) Il choisit où mordre : partout sur le tour de notre corps (les bras, le
+            // torse, le ventre, les jambes ; pas la tête), les jambes seulement s'il rampe.
+            // `render` dira où est cet endroit dans notre pose, image après image.
+            crate::evide::Event::Aims { low, seed } => {
+                let grids = crate::player_model::flesh_grids();
+                self.evide_spot = self
+                    .flesh
+                    .entry(String::new())
+                    .or_insert_with(|| crate::flesh::Flesh::of(crate::flesh::Hard::Bones))
+                    .pick(seed, bite_parts(low), &grids);
+                self.bite_points.borrow_mut().0 = None;
+            }
             crate::evide::Event::Bites { low, at, seed } => {
                 crate::audio::jelly_bite(at.distance(ear));
                 if self.game.mode == GameMode::Spectator {
                     return;
                 }
-                // En rampant, sa tête est au ras du sol : nos jambes ; debout, penché sur
-                // nous : le haut du corps (pas le bras droit, dessiné à part à la première
-                // personne).
-                let allowed: &[usize] = if low { &[0, 1] } else { &[2, 3, 5, 6] };
-                let size = 2 + (seed >> 9) as usize % 2;
+                // (v272) « La morsure n'est pas assez grande » : un cube de 3 ou 4 de côté
+                // (2 ou 3 en v269), là où il visait.
+                let size = 3 + (seed >> 9) as usize % 2;
                 let grids = crate::player_model::flesh_grids();
-                self.flesh
+                let flesh = self
+                    .flesh
                     .entry(String::new())
-                    .or_default()
-                    .bite_somewhere(seed, size, allowed, &grids);
+                    .or_insert_with(|| crate::flesh::Flesh::of(crate::flesh::Hard::Bones));
+                let bite = match self.evide_spot.take() {
+                    Some((part, cell)) => flesh.bite_at(part, cell, size, &grids),
+                    None => flesh.bite_somewhere(seed, size, bite_parts(low), &grids),
+                };
+                if let Some(b) = bite {
+                    // Le sang part du bas de la morsure : un jet tout de suite, puis des
+                    // gouttes.
+                    let mid = |a: usize| ((b.lo[a] + b.hi[a]) / 2) as usize;
+                    let cell = [mid(0), b.lo[1] as usize, mid(2)];
+                    let from = self.bite_points.borrow().0.unwrap_or(at);
+                    self.fps.bleed(from, self.player.vel, BLEED_SPURT, true);
+                    self.bleeding.push((b.part as usize, cell, 0.0, 0.0));
+                }
                 self.damage(EVIDE_BITE);
             }
         }
@@ -6612,6 +6785,10 @@ impl Session {
         self.fall_from = None;
         // (v269) Un corps neuf : ce que L'Évidé avait mangé est revenu.
         self.flesh.remove("");
+        self.bleeding.clear();
+        self.evide_spot = None;
+        self.eating = None;
+        self.eat_bow = 0.0;
         self.fps.respawn();
     }
 
@@ -10486,6 +10663,7 @@ impl Session {
             light: [1.0; 3],
             held: Some(Held::Gear(weapon)),
             skin: None,
+            bow: 0.0,
         };
         let near = |feet: Vec3| (feet + Vec3::Y * 0.9).distance_squared(hit);
         let mut best: Option<(f32, String, Pose)> = None;
@@ -10615,7 +10793,21 @@ impl Session {
             light: self.hand_light,
             held,
             skin: self.worn_skin(),
+            bow: self.eat_bow,
         };
+        // (v272) Où sont, dans cette pose, l'endroit que L'Évidé vise et nos morsures qui
+        // saignent : lus à l'image suivante (`Prey::spot`, gouttes de sang).
+        if self.evide_spot.is_some() || !self.bleeding.is_empty() {
+            let mut seen = self.bite_points.borrow_mut();
+            seen.0 = self
+                .evide_spot
+                .map(|(p, c)| crate::player_model::cell_point(&pose, p, c));
+            seen.1 = self
+                .bleeding
+                .iter()
+                .map(|b| (b.0, b.1, crate::player_model::cell_point(&pose, b.0, b.1)))
+                .collect();
+        }
         let visible = self.game.mode != GameMode::Spectator;
         let mut model = if third != 0 && visible {
             // (v269) Avec ce que L'Évidé lui a mangé.
@@ -10717,6 +10909,7 @@ impl Session {
                     // (v177) Les bots aussi ont un skin, dessiné pour eux. (v256) Les
                     // joueurs portent la même tenue d'équipe qu'eux.
                     skin: self.skins.worn(&v.pseudo, v.team),
+                    bow: 0.0,
                 };
                 let layer = layers.layer(other.skin.as_ref(), renderer);
                 let prev = Walk::prev_of(&self.walks, &v.pseudo, &other);
@@ -10938,6 +11131,7 @@ impl Session {
                         minelib_net::poses::Held::Zeus => Held::Zeus,
                     }),
                     skin: o.skin.clone(),
+                    bow: 0.0,
                 };
                 if other.held.is_some() {
                     model.extend(crate::player_model::held_model(&other, true));
@@ -11146,6 +11340,16 @@ impl Session {
                     .filter(|_| self.game.mode != GameMode::Fps)
                     .map(|e| &e.map);
                 v.extend(selection_lines(&self.we, map, proj * view, cam));
+            }
+            // (v272) Les gouttes de sang de nos morsures, en vol (dessinées jusqu'ici en
+            // partie FPS seulement).
+            if self.fps.has_drops() {
+                let proj = Mat4::perspective_infinite_reverse_rh(
+                    fov.to_radians(),
+                    renderer.aspect(),
+                    0.05,
+                );
+                v.extend(self.fps.world_fx(proj * view, cam, &self.world, self.daylight));
             }
             // (v255) `/fps showelements` : portes, sites et départs, à travers les murs.
             if let Some(e) = &self.fps_elements {
@@ -13147,6 +13351,7 @@ mod slab_tests {
                         light: [1.0; 3],
                         held: Some(crate::player_model::Held::Zeus),
                         skin: None,
+                        bow: 0.0,
                     };
                     let at = crate::player_model::zeus_frame(&pose)
                         .unwrap()
@@ -13172,6 +13377,7 @@ mod slab_tests {
             light: [1.0; 3],
             held: Some(crate::player_model::Held::Zeus),
             skin: None,
+            bow: 0.0,
         };
         let boxes = crate::player_model::shadow_boxes(&pose);
         let mid = (Vec3::from(boxes[0].min) + Vec3::from(boxes[0].max)) * 0.5;
@@ -13195,6 +13401,7 @@ mod slab_tests {
             light: [1.0; 3],
             held: None,
             skin: None,
+            bow: 0.0,
         };
         let boxes = crate::player_model::shadow_boxes(&pose);
         let sun = Vec3::new(0.3, 0.9, 0.2).normalize().to_array();

@@ -844,6 +844,7 @@ mod tests {
                 light: [1.0; 3],
                 held: Some(Held::Gear(gear[i])),
                 skin: Some(bot_skin(name, team)),
+                bow: 0.0,
             };
             verts.extend(build(&pose));
             // Le premier porte la bombe sur le dos.
