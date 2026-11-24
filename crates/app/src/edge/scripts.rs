@@ -80,10 +80,12 @@ document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagN
 if(a&&lec(a.href)){e.preventDefault();e.stopImmediatePropagation();
 dit('__minelib_ordre__'+JSON.stringify({clic:new URL(lec(a.href)).searchParams.get('v')}));}},true);
 setInterval(()=>go(location.href,true),250);go(location.href,true);}
-let s='';window.addEventListener('pageshow',()=>{s='';});setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById(SH()?'shorts-player':'movie_player');
+let s='',fin=0,der=-1,derU='';window.addEventListener('pageshow',()=>{s='';});setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById(SH()?'shorts-player':'movie_player');
 const v=(mp&&mp.querySelector('video'))||document.querySelector('video');
+if(location.href!==derU){derU=location.href;der=-1;fin=0;}
+if(SH()&&v&&!v.paused&&v.duration>3){const c=v.currentTime;if(der>v.duration-1.5&&c<1.5)fin=Date.now();der=c;}
 let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
-const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||pubShort(),w:attend(),i:i,e:!!(v&&v.ended)});
+const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||pubShort(),w:attend(),i:i,e:!!(v&&v.ended)||Date.now()-fin<1600});
 if(st!==s){s=st;dit('__minelib_state__'+st);}},500);})();"#;
 
 /// Dit si la page peut défiler sous la souris (la molette ne va à l'écran que si elle y

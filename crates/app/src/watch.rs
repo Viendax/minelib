@@ -675,6 +675,11 @@ impl Party {
     /// elle était déjà à suivre, elle en sort). Rien encore de partagé sur l'écran : la vidéo
     /// que montre la page devient d'abord celle de l'écran (elle sera dans les vues). Une page
     /// sans vidéo du tout ouvre simplement la cliquée.
+    ///
+    /// (v296) Demande du propriétaire : **si une lecture est déjà en cours** (une vidéo qui
+    /// joue, pas en pause ni finie, sur les trois lecteurs, Shorts compris), la cliquée va au
+    /// bout de la playlist au lieu de se lancer. Un Short tourne en boucle : la page dit qu'il
+    /// est fini à chaque tour (`PAGE_JS`), et la playlist passe alors à la suivante.
     fn lance_cote(&mut self, id: u32, vid: String, me: &str) -> Option<Act> {
         if !self.tracks.contains_key(&id) {
             let page = self.pages.get(&id).map(|s| s.page.clone());
@@ -688,6 +693,25 @@ impl Party {
         if video.id == vid {
             // Déjà celle en cours : la page y revient (et elle reprend, si en pause).
             return self.geste(id, Geste::Reprend, video.lus.len(), &vid, me);
+        }
+        let fini = self.pages.get(&id).is_some_and(|s| {
+            s.page.ended && s.page.video.as_deref() == Some(video.id.as_str())
+        });
+        if !video.paused && !fini {
+            // Une lecture en cours : au bout de la playlist (pas deux fois de suite la même).
+            if video.queue.len() >= MAX_FILE || video.queue.last() == Some(&vid) {
+                return None;
+            }
+            video.queue.push(vid.clone());
+            video.seq = self.next_seq(id);
+            video.by = me.chars().take(32).collect();
+            video.rogne();
+            log::info!(
+                "regarder ensemble : écran {id}, {vid} ajoutée à la playlist depuis la recherche ({} à suivre)",
+                video.queue.len()
+            );
+            self.put(id, video);
+            return None;
         }
         video.lus.push(std::mem::replace(&mut video.id, vid.clone()));
         if let Some(k) = video.queue.iter().position(|v| *v == vid) {
@@ -1824,16 +1848,18 @@ mod tests {
 
     /// (v292) Depuis la recherche ouverte par la playlist, un clic **lance** la vidéo (demande
     /// du propriétaire ; v259 : elle allait au bout de la file) : celle en cours passe dans
-    /// les vues, les à suivre restent, et une vidéo déjà à suivre en sort.
+    /// les vues, les à suivre restent, et une vidéo déjà à suivre en sort. (v296) Sauf si une
+    /// lecture est en cours (pas en pause, pas finie ; Shorts compris) : au bout de la
+    /// playlist. Un Short qui finit un tour passe à la suivante.
     #[test]
-    fn un_clic_dans_la_recherche_lance_la_video() {
+    fn un_clic_dans_la_recherche_lance_ou_ajoute() {
         let mut p = Party::new();
         let id = 7;
         let clic = |v: &str| format!(r#"{{"clic":"{v}"}}"#);
-        let z = "zzzzzzzzzzz";
+        let (z, w) = ("zzzzzzzzzzz", "wwwwwwwwwww");
         // Pas même une vidéo sur la page : elle s'ouvre.
         assert_eq!(p.order(id, &clic(Y), A, true), Some(Act::Open(id, watch_url(Y, 0.0))));
-        // Le lecteur montre X, pas encore lancée (« en pub » : rien de partagé).
+        // Le lecteur montre X, pas encore lancée (« en pub » : rien de partagé, en pause).
         let etat = format!(
             r#"{{"u":"{}","t":0,"p":true,"a":true,"i":"{X}","e":false,"o":true,"r":true}}"#,
             watch_url(X, 0.0)
@@ -1845,16 +1871,37 @@ mod tests {
             let (l, cur, q, pause) = p.liste(id).unwrap();
             (l.to_vec(), cur.to_string(), q.to_vec(), pause)
         };
-        assert_eq!(liste(&p), (vec![X.to_string()], Y.to_string(), vec![], false));
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(liste(&p), (s(&[X]), Y.to_string(), s(&[]), false));
         assert!(p.tracks[&id].applied.is_none(), "la page va l'ouvrir");
-        // Une vidéo déjà à suivre : lancée, et elle n'est plus à suivre.
-        p.order(id, &format!(r#"{{"clic":"{z}"}}"#), A, false);
-        assert_eq!(liste(&p).2, vec![z.to_string()]);
+        // Y joue : z va au bout de la playlist, une seule fois.
         assert_eq!(p.order(id, &clic(z), A, true), None);
-        assert_eq!(liste(&p), (vec![X.to_string(), Y.to_string()], z.to_string(), vec![], false));
+        assert_eq!(p.order(id, &clic(z), A, true), None);
+        assert_eq!(liste(&p), (s(&[X]), Y.to_string(), s(&[z]), false));
+        // Y en pause : z se lance, et n'est plus à suivre.
+        p.tracks.get_mut(&id).unwrap().video.paused = true;
+        assert_eq!(p.order(id, &clic(z), A, true), None);
+        assert_eq!(liste(&p), (s(&[X, Y]), z.to_string(), s(&[]), false));
+        // z finie : w se lance.
+        let fin = format!(r#"{{"u":"{}","t":30,"p":true,"a":false,"i":"{z}","e":true}}"#, watch_url(z, 30.0));
+        p.observe(id, &fin, A);
+        assert_eq!(p.order(id, &clic(w), A, true), None);
+        assert_eq!(liste(&p).1, w);
         // Celle en cours : la page y revient seulement.
-        assert!(matches!(p.order(id, &clic(z), A, true), Some(Act::Open(_, u)) if u.contains(z)));
-        assert_eq!(liste(&p).1, z);
+        assert!(matches!(p.order(id, &clic(w), A, true), Some(Act::Open(_, u)) if u.contains(w)));
+        assert_eq!(liste(&p).1, w);
+        // Un Short qui joue : la cliquée va dans la playlist ; au bout de son tour, elle passe.
+        let mut p = Party::new();
+        let court = |t: f32, e: bool| {
+            format!(r#"{{"u":"{}","t":{t},"p":false,"a":false,"i":"{X}","e":{e}}}"#, short_url(X))
+        };
+        p.observe(id, &court(2.0, false), A);
+        assert!(p.tracks[&id].video.short && !p.tracks[&id].video.paused);
+        assert_eq!(p.order(id, &clic(Y), A, true), None);
+        assert_eq!(liste(&p), (s(&[]), X.to_string(), s(&[Y]), false));
+        p.observe(id, &court(0.3, true), A);
+        assert_eq!(liste(&p), (s(&[X]), Y.to_string(), s(&[]), false));
+        assert!(!p.tracks[&id].video.short, "la suivante s'ouvre dans le lecteur");
     }
 
     fn screen_at(x: i32) -> Placed {
