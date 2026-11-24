@@ -49,7 +49,9 @@ use serde::{Deserialize, Serialize};
 /// `PasseurTask`), routes des joueurs (`FastWant`, `FastGuest`, `FastHost`), entrées
 /// envoyées aussi par la voie rapide (`game::ToHost::InputsFast`) et sondes
 /// (`game::ToPeer::FastPing`).
-pub const PROTOCOL: u32 = 70;
+/// (v274) 71 : voie rapide : l'hôte signale un passeur muet ou lent (`FastBad`), les états
+/// complets partent aussi par les passeurs.
+pub const PROTOCOL: u32 = 71;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -891,6 +893,13 @@ pub enum Request {
     FastWant {
         groups: Vec<Vec<u64>>,
     },
+    /// (v274) Hôte d'une partie FPS : le passeur numéro `via` de la route du joueur `peer`
+    /// est muet ou nettement plus lent que l'autre (aller-retour mesuré de bout en bout).
+    /// Le relais l'écarte de cette partie et refait l'attribution avec un autre.
+    FastBad {
+        peer: u64,
+        via: u8,
+    },
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -996,6 +1005,7 @@ impl Request {
                 | Request::PasseurEcho { .. }
                 | Request::PasseurOff
                 | Request::FastWant { .. }
+                | Request::FastBad { .. }
                 | Request::BulkEdit { .. }
                 | Request::Served { .. }
                 | Request::CheatFound { .. }

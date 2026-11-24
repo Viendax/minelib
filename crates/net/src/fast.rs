@@ -28,6 +28,11 @@
 //! seules de petites sondes passent encore (`send_any`) pour savoir quand ce n'est plus
 //! vrai. La voie rapide ne doit jamais faire moins bien que le relais seul.
 //!
+//! (v274) Chaque bout mesure le temps d'aller-retour par chaque passeur (`FLAG_PING`,
+//! `FLAG_PONG`, deux fois par seconde) : quand l'un est nettement plus rapide que l'autre,
+//! `send_one` ne prend que lui au lieu d'alterner, et le jeu peut demander au relais de
+//! remplacer un passeur lent ou muet (`Endpoint::paths`).
+//!
 //! Rien de ce qui doit arriver à coup sûr ne passe par ici : le canal du relais reste la
 //! référence (les entrées y partent toujours aussi), la voie rapide ne fait qu'arriver plus
 //! tôt.
@@ -79,6 +84,15 @@ const TAG: usize = 16;
 const FLAG_KEEP: u8 = 0x80;
 /// Celui qui écrit reçoit plus vite par le relais que par les passeurs.
 const FLAG_SLOW: u8 = 0x40;
+/// Mesure de l'aller-retour par un passeur : un numéro suit, à renvoyer tel quel par le
+/// même passeur (`FLAG_PONG`). Ni l'un ni l'autre ne porte de message.
+const FLAG_PING: u8 = 0x20;
+const FLAG_PONG: u8 = 0x10;
+/// Une mesure d'aller-retour par chaque passeur toutes les…
+const PING_EVERY: Duration = Duration::from_millis(500);
+/// Écart d'aller-retour (ms) au-delà duquel le passeur le plus rapide est pris à chaque
+/// fois, au lieu d'alterner.
+const PREFER_MS: f32 = 4.0;
 /// Un passeur par lequel rien n'est arrivé depuis ce temps ne compte plus.
 const FRESH: Duration = Duration::from_millis(300);
 /// Sans rien d'autre à envoyer par un passeur, un paquet d'entretien tous les…
@@ -273,8 +287,10 @@ struct PasseurInner {
     probes: Mutex<Sender<u64>>,
     stop: AtomicBool,
     carried: AtomicU64,
-    /// Essais : un paquet sur tant est perdu (0 : aucun).
+    /// Essais : un paquet sur tant est perdu (0 : aucun), et chaque paquet attend tant de
+    /// millisecondes avant de repartir.
     lose: AtomicU64,
+    delay: AtomicU64,
 }
 
 /// Passeur : transmet les paquets des routes que le relais lui confie, d'un bout à l'autre.
@@ -316,6 +332,7 @@ impl Passeur {
             stop: AtomicBool::new(false),
             carried: AtomicU64::new(0),
             lose: AtomicU64::new(0),
+            delay: AtomicU64::new(0),
         });
         let run = inner.clone();
         std::thread::Builder::new()
@@ -377,6 +394,12 @@ impl Passeur {
     pub fn lose_one_in(&self, n: u64) {
         self.inner.lose.store(n, Ordering::Relaxed);
     }
+
+    /// Essais : retient chaque paquet `ms` millisecondes (un passeur mal placé).
+    #[doc(hidden)]
+    pub fn delay_ms(&self, ms: u64) {
+        self.inner.delay.store(ms, Ordering::Relaxed);
+    }
 }
 
 impl Drop for Passeur {
@@ -433,6 +456,10 @@ impl PasseurInner {
         if lose != 0 && n.is_multiple_of(lose) {
             return;
         }
+        let delay = self.delay.load(Ordering::Relaxed);
+        if delay != 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
         let _ = self.sock.send_to(p, to);
     }
 }
@@ -475,6 +502,19 @@ struct LiveVia {
     seal: [u8; 32],
     rx_at: Option<Instant>,
     tx_at: Option<Instant>,
+    /// Dernière mesure envoyée (numéro, quand), si sa réponse est encore attendue, et
+    /// aller-retour lissé (ms).
+    ping: (u8, Option<Instant>),
+    ping_wait: bool,
+    rtt: Option<f32>,
+}
+
+/// Un passeur d'une route, vu d'un bout : l'autre bout reçoit-il par lui, et le temps
+/// d'aller-retour par lui (ms), s'il a été mesuré.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PathInfo {
+    pub open: bool,
+    pub rtt_ms: Option<f32>,
 }
 
 struct Live {
@@ -622,6 +662,9 @@ impl Endpoint {
                             seal: v.seal,
                             rx_at: None,
                             tx_at: None,
+                            ping: (0, None),
+                            ping_wait: false,
+                            rtt: None,
                         })
                         .collect(),
                     seq: 0,
@@ -687,11 +730,21 @@ impl Endpoint {
             return false;
         }
         let n = l.vias.len();
-        let Some(i) = (1..=n)
+        let Some(next) = (1..=n)
             .map(|k| (l.alt + k) % n)
             .find(|i| open & (1 << i) != 0)
         else {
             return false;
+        };
+        // Un passeur nettement plus rapide que les autres est pris à chaque fois ; sinon
+        // on alterne (deux chemins valent mieux qu'un quand l'un perd des paquets).
+        let fastest = (0..n)
+            .filter(|i| open & (1 << i) != 0)
+            .filter_map(|i| Some((i, l.vias[i].rtt?)))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let i = match (fastest, l.vias[next].rtt) {
+            (Some((best, ms)), Some(mine)) if mine > ms + PREFER_MS => best,
+            _ => next,
         };
         l.alt = i;
         let seq = l.seq;
@@ -731,6 +784,23 @@ impl Endpoint {
             heard: l.open(Instant::now()),
             ..l.stats
         })
+    }
+
+    /// État de chaque passeur de la route vers `peer`, dans l'ordre de l'attribution.
+    pub fn paths(&self, peer: u64) -> Vec<PathInfo> {
+        let st = self.inner.st.lock().unwrap();
+        let Some(l) = st.ways.get(&peer) else {
+            return Vec::new();
+        };
+        let open = l.open(Instant::now());
+        l.vias
+            .iter()
+            .enumerate()
+            .map(|(i, v)| PathInfo {
+                open: open & (1 << i) != 0,
+                rtt_ms: v.rtt,
+            })
+            .collect()
     }
 
     /// Adresses des passeurs de la route vers `peer`.
@@ -794,6 +864,25 @@ impl EndInner {
             l.heard = flags & ((1 << VIAS) - 1);
             l.heard_at = Some(now);
             l.slow_in = flags & FLAG_SLOW != 0;
+            // Mesure d'aller-retour : on renvoie le numéro par le même passeur ; au
+            // retour du nôtre, le temps écoulé (lissé).
+            if flags & FLAG_PING != 0 {
+                let id = msg.first().copied().unwrap_or(0);
+                let seq = l.seq;
+                l.seq += 1;
+                let p = l.packet(self.dir, i, seq, FLAG_KEEP | FLAG_PONG, &[id], now);
+                let _ = self.sock.send_to(&p, l.vias[i].addr);
+            }
+            if flags & FLAG_PONG != 0 {
+                let v = &mut l.vias[i];
+                if let (Some(&id), (mine, Some(at))) = (msg.first(), v.ping) {
+                    if id == mine && v.ping_wait {
+                        let ms = now.duration_since(at).as_secs_f32() * 1000.0;
+                        v.rtt = Some(v.rtt.map_or(ms, |r| r * 0.75 + ms * 0.25));
+                        v.ping_wait = false;
+                    }
+                }
+            }
             if flags & FLAG_KEEP != 0 {
                 return;
             }
@@ -811,6 +900,22 @@ impl EndInner {
         let mut st = self.st.lock().unwrap();
         for l in st.ways.values_mut() {
             for i in 0..l.vias.len() {
+                // Mesure d'aller-retour par ce passeur, de temps en temps (elle vaut
+                // aussi paquet d'entretien). Une mesure restée sans réponse est refaite.
+                let due = l.vias[i]
+                    .ping
+                    .1
+                    .is_none_or(|t| now.duration_since(t) >= PING_EVERY);
+                if due {
+                    let id = l.vias[i].ping.0.wrapping_add(1);
+                    l.vias[i].ping = (id, Some(now));
+                    l.vias[i].ping_wait = true;
+                    let seq = l.seq;
+                    l.seq += 1;
+                    let p = l.packet(self.dir, i, seq, FLAG_KEEP | FLAG_PING, &[id], now);
+                    let _ = self.sock.send_to(&p, l.vias[i].addr);
+                    continue;
+                }
                 if l.vias[i]
                     .tx_at
                     .is_some_and(|t| now.duration_since(t) < KEEP)
@@ -1163,6 +1268,35 @@ mod tests {
         guest.set_slow(0, false);
         assert!(wait(|| !host.slow(7)));
         assert!(host.send_one(7, b"positions"));
+    }
+
+    #[test]
+    fn the_faster_passeur_is_preferred_once_both_are_timed() {
+        let (a, _pa) = passeur();
+        let (b, _pb) = passeur();
+        let (_guest, grx, host, _hrx) = link(&[&a, &b]);
+        // Le second passeur retient chaque paquet 15 ms (dans chaque sens).
+        b.delay_ms(15);
+        assert!(wait(|| {
+            let p = host.paths(7);
+            p.len() == 2
+                && p.iter().all(|x| x.open)
+                && matches!((p[0].rtt_ms, p[1].rtt_ms), (Some(x), Some(y)) if y > x + 20.0)
+        }));
+        while grx.try_recv().is_ok() {}
+        let (ca, cb) = (a.carried(), b.carried());
+        for i in 0..60u8 {
+            assert!(host.send_one(7, &[i]));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Presque tout est parti par le premier (le second ne porte plus que l'entretien).
+        let (da, db) = (a.carried() - ca, b.carried() - cb);
+        assert!(da >= 60 && db < 20, "{da} par le rapide, {db} par le lent");
+        let mut got = 0;
+        while grx.recv_timeout(Duration::from_millis(300)).is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, 60);
     }
 
     #[test]

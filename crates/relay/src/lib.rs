@@ -8710,6 +8710,7 @@ fn handle(
             | Request::PasseurEcho { .. }
             | Request::PasseurOff
             | Request::FastWant { .. }
+            | Request::FastBad { .. }
     ) {
         if matches!(&*session, Session::LoggedIn { .. }) {
             match req {
@@ -8719,6 +8720,7 @@ fn handle(
                 Request::PasseurEcho { nonce } => passeurs::echo(st, id, nonce),
                 Request::PasseurOff => passeurs::off(st, id),
                 Request::FastWant { groups } => passeurs::want(st, id, groups),
+                Request::FastBad { peer, via } => passeurs::bad(st, id, peer, via),
                 _ => {}
             }
         }

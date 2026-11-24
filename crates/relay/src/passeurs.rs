@@ -51,6 +51,13 @@ const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
 /// Sondes perdues de suite avant de ne plus compter sur un passeur.
 const MISSES_MAX: u8 = 3;
+/// (v274) Un passeur signalé par l'hôte (`FastBad`) n'est remplacé que si la dernière
+/// attribution de la partie a au moins cet âge : chaque remplacement redonne toutes les
+/// routes, la voie rapide s'interrompt un instant.
+#[cfg(not(test))]
+const BAD_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(test)]
+const BAD_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
 /// Annonces acceptées d'une même connexion par minute (chacune fait partir une sonde vers
 /// l'adresse annoncée : pas question de s'en servir pour arroser quelqu'un).
 const OFFERS_PER_MIN: u8 = 6;
@@ -74,6 +81,12 @@ struct Assign {
     groups: Vec<Vec<u64>>,
     /// Passeurs retenus, et le nombre de routes confiées à chacun.
     passeurs: Vec<(u64, usize)>,
+    /// (v274) Passeurs de chaque équipe, dans l'ordre donné aux joueurs ; ceux que l'hôte
+    /// a signalés (muets ou lents pour cette partie : plus jamais pour elle) ; et quand
+    /// cette attribution a été faite.
+    picked: Vec<Vec<u64>>,
+    bad: Vec<u64>,
+    at: Instant,
 }
 
 /// Passeurs connus du relais et parties servies.
@@ -325,18 +338,54 @@ pub(crate) fn want(st: &mut State, id: u64, groups: Vec<Vec<u64>>) {
         })
         .filter(|g| !g.is_empty())
         .collect();
-    let old = st.fast.rooms.insert(
+    let old = st.fast.rooms.remove(&rid);
+    // (Même hôte : les passeurs qu'il a signalés restent écartés.)
+    let bad = old
+        .as_ref()
+        .filter(|a| a.host == id)
+        .map(|a| a.bad.clone())
+        .unwrap_or_default();
+    if let Some(a) = &old {
+        release(st, a);
+    }
+    st.fast.rooms.insert(
         rid,
         Assign {
             lot: 0,
             host: id,
             groups,
             passeurs: Vec::new(),
+            picked: Vec::new(),
+            bad,
+            at: Instant::now(),
         },
     );
-    if let Some(a) = old {
-        release(st, &a);
+    assign(st, rid);
+}
+
+/// `FastBad` : l'hôte signale le passeur numéro `via` de la route de `peer` (muet, ou
+/// nettement plus lent que l'autre). Il est écarté de cette partie, et l'attribution est
+/// refaite avec ceux qui restent.
+pub(crate) fn bad(st: &mut State, id: u64, peer: u64, via: u8) {
+    let Some(rid) = st.conns.get(&id).and_then(|c| c.room) else {
+        return;
+    };
+    let Some(a) = st.fast.rooms.get_mut(&rid) else {
+        return;
+    };
+    if a.host != id || a.at.elapsed() < BAD_EVERY {
+        return;
     }
+    let Some(g) = a.groups.iter().position(|g| g.contains(&peer)) else {
+        return;
+    };
+    let Some(&p) = a.picked.get(g).and_then(|v| v.get(via as usize)) else {
+        return;
+    };
+    if !a.bad.contains(&p) && a.bad.len() < 16 {
+        a.bad.push(p);
+    }
+    log::info!("voie rapide : partie {rid}, un passeur signalé par l'hôte est écarté");
     assign(st, rid);
 }
 
@@ -379,56 +428,16 @@ fn assign(st: &mut State, rid: u64) {
         .filter_map(|m| st.conns.get(m)?.pseudo.clone())
         .collect();
     let apart = super::machines_apart(st);
-    let mut cands: Vec<(usize, f32, u64, SocketAddrV4)> = st
-        .fast
-        .offers
-        .iter()
-        .filter(|(_, o)| o.verified)
-        .filter(|(p, _)| !inside.contains(p))
-        .filter_map(|(&p, o)| {
-            let c = st.conns.get(&p)?;
-            let name = c.pseudo.as_deref()?;
-            if c.kicked || c.garant_banned || super::link_bad(c) {
-                return None;
-            }
-            // Pas sur la machine d'un joueur de la partie (même box : même adresse).
-            if apart
-                && inside
-                    .iter()
-                    .filter_map(|m| st.conns.get(m))
-                    .any(|m| super::same_machine(c, m))
-            {
-                return None;
-            }
-            if !super::unrelated(st, name, &names) || !super::trusted(st, name) {
-                return None;
-            }
-            let load = st.fast.load(p);
-            // Délai jusqu'au relais, par tranches de 20 ms : faute de mieux, c'est ce qui
-            // dit qu'un passeur n'est pas à l'autre bout du monde.
-            let ms = super::link_ms(c).unwrap_or(999.0);
-            let tier = (ms / 20.0) as usize;
-            (load < LOAD_MAX).then(|| (tier * 1000 + load, ms, p, o.addr))
-        })
-        .collect();
-    // Les mieux connectés d'abord (par tranches), puis les moins chargés (le numéro
-    // départage).
-    cands.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.2.cmp(&b.2))
-    });
-    // Jamais deux passeurs d'une même partie à la même adresse (une seule box).
-    let mut picked: Vec<(u64, SocketAddrV4)> = Vec::new();
-    for (_, _, p, addr) in cands {
-        if !apart || picked.iter().all(|(_, a)| a.ip() != addr.ip()) {
-            picked.push((p, addr));
+    // Sans les passeurs signalés par l'hôte ; s'il n'en reste pas assez pour en donner un à
+    // chaque équipe, on les reprend (un passeur lent vaut mieux qu'aucun : au pire, les
+    // positions repassent par le relais).
+    let mut bad = old.bad.clone();
+    let (picked, per) = loop {
+        let (picked, per) = choose(st, &groups, &inside, &names, &bad, apart);
+        if per > 0 || bad.is_empty() {
+            break (picked, per);
         }
-    }
-    let per = if groups.is_empty() {
-        0
-    } else {
-        (picked.len() / groups.len()).min(PER_GROUP)
+        bad.clear();
     };
     if per == 0 {
         // La demande est gardée : dès qu'un passeur de plus est vérifié, on réessaie.
@@ -440,11 +449,15 @@ fn assign(st: &mut State, rid: u64) {
                 host: old.host,
                 groups: old.groups,
                 passeurs: Vec::new(),
+                picked: Vec::new(),
+                bad,
+                at: Instant::now(),
             },
         );
         return;
     }
     let lot: u64 = rand::random();
+    let groups_n = groups.len();
     let mut tasks: HashMap<u64, Vec<(u64, [u8; 32])>> = HashMap::new();
     let mut ways: Vec<FastWay> = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
@@ -508,8 +521,83 @@ fn assign(st: &mut State, rid: u64) {
             host: old.host,
             groups,
             passeurs: tasks.iter().map(|(p, r)| (*p, r.len())).collect(),
+            picked: (0..groups_n)
+                .map(|gi| {
+                    picked[gi * per..(gi + 1) * per]
+                        .iter()
+                        .map(|(p, _)| *p)
+                        .collect()
+                })
+                .collect(),
+            bad,
+            at: Instant::now(),
         },
     );
+}
+
+/// Passeurs retenus pour une partie, les meilleurs d'abord, et combien chaque équipe en
+/// reçoit (le même nombre pour toutes ; 0 : pas assez de passeurs). `skip` : ceux que
+/// l'hôte a signalés.
+fn choose(
+    st: &State,
+    groups: &[Vec<u64>],
+    inside: &[u64],
+    names: &[String],
+    skip: &[u64],
+    apart: bool,
+) -> (Vec<(u64, SocketAddrV4)>, usize) {
+    let mut cands: Vec<(usize, f32, u64, SocketAddrV4)> = st
+        .fast
+        .offers
+        .iter()
+        .filter(|(_, o)| o.verified)
+        .filter(|(p, _)| !inside.contains(p) && !skip.contains(p))
+        .filter_map(|(&p, o)| {
+            let c = st.conns.get(&p)?;
+            let name = c.pseudo.as_deref()?;
+            if c.kicked || c.garant_banned || super::link_bad(c) {
+                return None;
+            }
+            // Pas sur la machine d'un joueur de la partie (même box : même adresse).
+            if apart
+                && inside
+                    .iter()
+                    .filter_map(|m| st.conns.get(m))
+                    .any(|m| super::same_machine(c, m))
+            {
+                return None;
+            }
+            if !super::unrelated(st, name, names) || !super::trusted(st, name) {
+                return None;
+            }
+            let load = st.fast.load(p);
+            // Délai jusqu'au relais, par tranches de 20 ms : faute de mieux, c'est ce qui
+            // dit qu'un passeur n'est pas à l'autre bout du monde.
+            let ms = super::link_ms(c).unwrap_or(999.0);
+            let tier = (ms / 20.0) as usize;
+            (load < LOAD_MAX).then(|| (tier * 1000 + load, ms, p, o.addr))
+        })
+        .collect();
+    // Les mieux connectés d'abord (par tranches), puis les moins chargés (le numéro
+    // départage).
+    cands.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.cmp(&b.2))
+    });
+    // Jamais deux passeurs d'une même partie à la même adresse (une seule box).
+    let mut picked: Vec<(u64, SocketAddrV4)> = Vec::new();
+    for (_, _, p, addr) in cands {
+        if !apart || picked.iter().all(|(_, a)| a.ip() != addr.ip()) {
+            picked.push((p, addr));
+        }
+    }
+    let per = if groups.is_empty() {
+        0
+    } else {
+        (picked.len() / groups.len()).min(PER_GROUP)
+    };
+    (picked, per)
 }
 
 /// Voie rapide fermée pour ces joueurs et leur hôte (pas assez de passeurs).
@@ -586,6 +674,106 @@ mod tests {
         ] {
             assert_eq!(public(ip.parse().unwrap()), ok, "{ip}");
         }
+    }
+
+    /// (v274) L'hôte signale un passeur muet ou lent pour sa partie : le relais l'écarte et
+    /// en donne un autre. Quand il les a tous signalés, on reprend les mêmes plutôt que de
+    /// fermer la voie rapide.
+    #[test]
+    fn a_passeur_reported_by_the_host_is_replaced() {
+        let dir = std::env::temp_dir().join(format!("minelib-passeurs-{}", rand::random::<u32>()));
+        {
+            let mut st = stats::Store::open(dir.join("stats")).unwrap();
+            for g in ["Pas1", "Pas2", "Pas3"] {
+                st.get_mut(g).games = 5;
+                st.save(g);
+            }
+        }
+        crate::ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        let (host, hl) = login("Hote");
+        host.send(Cmd::Search {
+            map_sig: [5; 32],
+            map: "carte".into(),
+            players: 10,
+        });
+        wait(&host, |e| matches!(e, Event::Hosted(_)));
+        let (a, _) = login("Alice");
+        a.send(Cmd::Search {
+            map_sig: [5; 32],
+            map: "carte".into(),
+            players: 10,
+        });
+        wait(&a, |e| matches!(e, Event::Joined { .. }));
+        let a_id = match wait(&host, |e| matches!(e, Event::PeerJoined { .. })) {
+            Event::PeerJoined { peer, .. } => peer,
+            _ => unreachable!(),
+        };
+        let ps: Vec<Client> = ["Pas1", "Pas2", "Pas3"]
+            .iter()
+            .map(|p| {
+                let (c, _) = login(p);
+                c.send(Cmd::Passeur(true));
+                c
+            })
+            .collect();
+        until(|| h.state.lock().unwrap().fast.verified() == 3);
+        host.send(Cmd::FastWant(vec![vec![a_id]]));
+        let first = fast(&host).unwrap().vias(a_id);
+        assert_eq!(first.len(), 2);
+        let _ = fast(&a);
+        // Le premier passeur est signalé : il n'est plus donné, le troisième le remplace.
+        std::thread::sleep(BAD_EVERY * 2);
+        transport::push(
+            &hl,
+            &minelib_net::proto::Request::FastBad { peer: a_id, via: 0 },
+        );
+        let second = fast(&host).unwrap().vias(a_id);
+        assert_eq!(second.len(), 2);
+        assert!(!second.contains(&first[0]), "{first:?} puis {second:?}");
+        assert!(second.contains(&first[1]));
+        assert_eq!(fast(&a).unwrap().vias(0), second);
+        // Un signalement trop rapproché n'est pas suivi (pas d'attribution en rafale).
+        transport::push(
+            &hl,
+            &minelib_net::proto::Request::FastBad { peer: a_id, via: 0 },
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(host.poll().is_none_or(|e| !matches!(e, Event::Fast(_))));
+        // Les deux qui restent sont signalés à leur tour : il n'en resterait aucun, donc
+        // on les reprend tous plutôt que de fermer la voie.
+        for _ in 0..2 {
+            std::thread::sleep(BAD_EVERY * 2);
+            transport::push(
+                &hl,
+                &minelib_net::proto::Request::FastBad { peer: a_id, via: 0 },
+            );
+            assert!(!fast(&host).unwrap().vias(a_id).is_empty());
+            let _ = fast(&a);
+        }
+        assert_eq!(h.state.lock().unwrap().fast.verified(), 3);
+        drop(ps);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Un passeur qui ne répond plus aux sondes (PC en veille, port refermé, adresse qui a
