@@ -1,7 +1,24 @@
 //! Ce qui peut s'ouvrir sur un écran en jeu, et rien d'autre. (v205)
 //!
-//! Le jeu est tout public : il doit être **impossible** de finir sur du porno ou sur un
-//! site illégal depuis un écran. Trois barrières, dans cet ordre :
+//! (v243) **Le jeu est interdit aux moins de 18 ans**, et le propriétaire a choisi « le web
+//! ouvert sauf les interdits » : tout s'ouvre, sauf le porno, les jeux d'argent non agréés,
+//! la drogue, le piratage, les arnaques et les virus, et les sites qui servent à contourner
+//! ce filtre. La liste noire devient le mode par défaut, en ligne comme en solo :
+//!
+//! - **DNS chiffré familial de Cloudflare** (`family.cloudflare-dns.com`, voir `main.rs`) :
+//!   les sites pour adultes et les logiciels malveillants ne se résolvent pas ;
+//! - **listes de l'Université Toulouse 1 Capitole** : une copie intégrée
+//!   (`ut1_noire.txt.gz` : contenus adultes mêlés, jeux d'argent sauf les opérateurs
+//!   agréés en France, drogue, piratage, minage caché, attaques, logiciels espions, armes,
+//!   haine, contournement du filtrage), plus la version du jour que le jeu télécharge
+//!   (`noire_ut1.txt`, avec en plus l'hameçonnage), plus `liste_noire.txt` à la main ;
+//! - **Twitch et Vimeo** sont refusés avec leur raison : leurs vidéos sont en H.264 et AAC,
+//!   que ce navigateur (CEF sans codecs propriétaires) ne lit pas (essai du 24/11/2026).
+//!
+//! Chaque joueur ne voit que les pages qu'il ouvre lui-même (« regarder ensemble » ne
+//! partage qu'un numéro de vidéo YouTube).
+//!
+//! Avant (v205-v242), le jeu était tout public. Trois barrières, dans cet ordre :
 //!
 //! 1. **Les schémas et les adresses privées** sont refusés quoi qu'il arrive : rien que
 //!    `http` et `https` vers un nom de domaine. Donc pas de `file://` qui lirait un
@@ -71,6 +88,8 @@ pub enum Refus {
     Noire = 4,
     /// (v208) Une page de connexion à un compte, en ligne.
     Compte = 5,
+    /// (v243) Twitch ou Vimeo : leurs vidéos ne se lisent pas dans ce navigateur.
+    Lecture = 6,
 }
 
 impl Refus {
@@ -81,6 +100,10 @@ impl Refus {
             Refus::HorsBlanche => "site hors de la liste autorisée",
             Refus::Noire => "site filtré",
             Refus::Compte => "pas de connexion à un compte sur les écrans en ligne",
+            Refus::Lecture => {
+                "Twitch et Vimeo ne se lisent pas sur les écrans (leurs vidéos demandent des \
+                 codecs que le navigateur n'a pas)"
+            }
         }
     }
 }
@@ -118,12 +141,66 @@ const CHOISIS: &[&str] = &["vikidia.org", "nasa.gov"];
 /// (v208) La liste « child » de l'UT1 au moment de la compilation.
 const UT1_ENFANTS: &str = include_str!("ut1_enfants.txt");
 
+/// (v243) La liste noire de l'UT1 au moment de la compilation, compressée (voir le mot
+/// d'en-tête du module).
+const UT1_NOIRE: &[u8] = include_bytes!("ut1_noire.txt.gz");
+
+/// (v243) Les plateformes dont les vidéos ne se lisent pas ici (H.264 et AAC).
+const SANS_LECTURE: &[&str] = &["twitch.tv", "vimeo.com"];
+
+/// (v243) Une liste de domaines rangée en empreintes de 64 bits triées : quelques centaines
+/// de milliers de domaines en quelques Mo de mémoire, au lieu de dizaines.
+#[derive(Debug, Clone, Default)]
+pub struct Empreintes(Vec<u64>);
+
+impl Empreintes {
+    /// Ajoute les domaines d'un texte (même format que `domaines`) ; rend leur nombre.
+    fn ajoute(&mut self, texte: &str) -> usize {
+        let avant = self.0.len();
+        chaque_domaine(texte, |d| self.0.push(empreinte(d)));
+        self.0.len() - avant
+    }
+
+    /// À faire après les ajouts, avant de chercher.
+    fn range(&mut self) {
+        self.0.sort_unstable();
+        self.0.dedup();
+    }
+
+    fn contient(&self, domaine: &str) -> bool {
+        self.0.binary_search(&empreinte(domaine)).is_ok()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// FNV-1a sur 64 bits : stable d'une version à l'autre, et deux domaines n'ont qu'une
+/// chance sur des milliards de milliards d'avoir la même.
+fn empreinte(d: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in d.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// La copie intégrée de la liste noire de l'UT1.
+fn ut1_noire() -> String {
+    use std::io::Read;
+    let mut texte = String::new();
+    let _ = flate2::read::GzDecoder::new(UT1_NOIRE).read_to_string(&mut texte);
+    texte
+}
+
 /// Le filtre d'un navigateur : son mode et ses deux listes.
 #[derive(Debug, Clone)]
 pub struct Filtre {
     mode: Mode,
     blanche: HashSet<String>,
-    noire: HashSet<String>,
+    noire: Empreintes,
     /// (v208) En ligne : pas de page de connexion à un compte.
     sans_compte: bool,
 }
@@ -132,10 +209,11 @@ impl Filtre {
     /// Le filtre demandé, avec les listes du dossier s'il y en a. Rend aussi ce qu'il faut
     /// dire au journal (pourquoi on n'a pas eu ce qui était demandé).
     pub fn charge(mode: Mode, dossier: Option<&Path>) -> (Filtre, String) {
+        let lire_texte = |nom: &str| -> Option<String> {
+            std::fs::read_to_string(dossier?.join(nom)).ok()
+        };
         let lire = |nom: &str| -> Option<(HashSet<String>, usize)> {
-            let d = dossier?;
-            let texte = std::fs::read_to_string(d.join(nom)).ok()?;
-            let set = domaines(&texte);
+            let set = domaines(&lire_texte(nom)?);
             let n = set.len();
             Some((set, n))
         };
@@ -154,17 +232,21 @@ impl Filtre {
             blanche.extend(plus);
             mot.push_str(&format!("liste blanche : {n} domaines en plus ; "));
         }
-        let (noire, mode) = match (mode, lire("liste_noire.txt")) {
-            (Mode::Noire, Some((set, n))) => {
-                mot.push_str(&format!("liste noire : {n} domaines ; "));
-                (set, Mode::Noire)
+        // (v243) La liste noire : la copie intégrée de l'UT1, celle du jour, et celle du
+        // propriétaire. Toujours là, donc jamais de repli sur la liste blanche.
+        let mut noire = Empreintes::default();
+        if mode == Mode::Noire {
+            let n = noire.ajoute(&ut1_noire());
+            mot.push_str(&format!("liste noire intégrée de l'UT1 : {n} domaines ; "));
+            for (nom, quoi) in [("noire_ut1.txt", "de l'UT1 du jour"), ("liste_noire.txt", "à la main")] {
+                if let Some(texte) = lire_texte(nom) {
+                    let n = noire.ajoute(&texte);
+                    mot.push_str(&format!("liste noire {quoi} : {n} domaines ; "));
+                }
             }
-            (Mode::Noire, None) => {
-                mot.push_str("pas de fichier de liste noire : liste blanche à la place ; ");
-                (HashSet::new(), Mode::Blanche)
-            }
-            (Mode::Blanche, autre) => (autre.map(|(s, _)| s).unwrap_or_default(), Mode::Blanche),
-        };
+            noire.range();
+            mot.push_str(&format!("liste noire en tout : {} domaines ; ", noire.len()));
+        }
         mot.push_str(&format!("mode {}", mode.name()));
         (
             Filtre {
@@ -203,6 +285,9 @@ impl Filtre {
         if self.sans_compte && connexion(&hote) {
             return Err(Refus::Compte);
         }
+        if SANS_LECTURE.iter().any(|d| sous(&hote, d)) {
+            return Err(Refus::Lecture);
+        }
         match self.mode {
             Mode::Blanche => {
                 if dans(&self.blanche, &hote) || google_national(&hote) {
@@ -212,7 +297,7 @@ impl Filtre {
                 }
             }
             Mode::Noire => {
-                if dans(&self.noire, &hote) {
+                if suffixes(&hote).any(|d| self.noire.contient(d)) {
                     Err(Refus::Noire)
                 } else {
                     Ok(())
@@ -226,6 +311,14 @@ impl Filtre {
 /// fin enlevés. On accepte aussi les lignes d'un fichier `hosts` (« 0.0.0.0 domaine »).
 pub fn domaines(texte: &str) -> HashSet<String> {
     let mut set = HashSet::new();
+    chaque_domaine(texte, |d| {
+        set.insert(d.to_string());
+    });
+    set
+}
+
+/// Chaque domaine d'un fichier de liste (voir `domaines`), sans tout garder en mémoire.
+fn chaque_domaine(texte: &str, mut f: impl FnMut(&str)) {
     for ligne in texte.lines() {
         let ligne = ligne.split('#').next().unwrap_or("").trim();
         if ligne.is_empty() {
@@ -236,10 +329,9 @@ pub fn domaines(texte: &str) -> HashSet<String> {
         let mot = mot.trim_start_matches("www.").trim_matches('.').trim();
         let mot = mot.to_ascii_lowercase();
         if mot.contains('.') && !adresse_chiffree(&mot) {
-            set.insert(mot);
+            f(&mot);
         }
     }
-    set
 }
 
 /// L'hôte d'une adresse `http`/`https`, en minuscules, sans le port, sans ce qui précède
@@ -287,17 +379,22 @@ fn connexion(hote: &str) -> bool {
 }
 
 fn dans(set: &HashSet<String>, hote: &str) -> bool {
-    if set.contains(hote) {
-        return true;
-    }
-    let mut reste = hote;
-    while let Some((_, parent)) = reste.split_once('.') {
-        if parent.contains('.') && set.contains(parent) {
-            return true;
-        }
-        reste = parent;
-    }
-    false
+    suffixes(hote).any(|d| set.contains(d))
+}
+
+/// L'hôte puis ses domaines parents qui ont encore un point (`a.b.exemple.fr`,
+/// `b.exemple.fr`, `exemple.fr`).
+fn suffixes(hote: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(hote), |h| h.split_once('.').map(|(_, p)| p))
+        .filter(|d| d.contains('.'))
+}
+
+/// (v243) L'hôte est-il ce domaine ou un de ses sous-domaines ?
+fn sous(hote: &str, domaine: &str) -> bool {
+    hote == domaine
+        || hote
+            .strip_suffix(domaine)
+            .is_some_and(|r| r.ends_with('.'))
 }
 
 /// `google.fr`, `www.google.co.uk`… : Google renvoie souvent vers le domaine du pays, et
@@ -396,6 +493,11 @@ pub fn vers_lecteur(url: &str) -> Option<String> {
             .split('&')
             .find_map(|kv| kv.strip_prefix(nom).and_then(|v| v.strip_prefix('=')))
     };
+    // (v243) Le lecteur embarqué a renvoyé la vidéo au site (YouTube ne la permet pas
+    // ailleurs : limitée par l'âge, ou intégration coupée par son auteur).
+    if parametre("mlb") == Some("site") {
+        return None;
+    }
     let id = match hote.to_ascii_lowercase().as_str() {
         "youtu.be" | "www.youtu.be" => chemin.split('/').next()?,
         "www.youtube.com" | "youtube.com" | "m.youtube.com" => {
@@ -509,7 +611,12 @@ mod tests {
         Filtre {
             mode: Mode::Noire,
             blanche: HashSet::new(),
-            noire: domaines(liste),
+            noire: {
+                let mut e = Empreintes::default();
+                e.ajoute(liste);
+                e.range();
+                e
+            },
             sans_compte: false,
         }
     }
@@ -527,10 +634,10 @@ mod tests {
         ] {
             assert_eq!(f.juge(ok), Ok(()), "{ok}");
         }
+        assert_eq!(f.juge("https://www.twitch.tv/"), Err(Refus::Lecture));
         for non in [
             "https://fr.wikipedia.org/",
             "https://www.dailymotion.com/",
-            "https://www.twitch.tv/",
             "https://archive.org/",
             "https://eklablog.com/",
             "https://autre.eklablog.com/",
@@ -559,6 +666,7 @@ mod tests {
             "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
             "https://www.youtube.com/embed/dQw4w9WgXcQ",
             "https://www.youtube.com/watch?v=court",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&mlb=site",
             "https://www.youtube.com.mechant.example/watch?v=dQw4w9WgXcQ",
         ] {
             assert_eq!(vers_lecteur(reste), None, "{reste}");
@@ -702,12 +810,49 @@ mod tests {
         }
     }
 
+    /// (v243) Sans fichier, la liste noire intégrée suffit : le web s'ouvre, sauf les
+    /// interdits ; les opérateurs de jeux agréés en France (ARJEL) restent ouverts.
     #[test]
-    fn without_a_blocklist_file_we_fall_back_to_the_allowlist() {
+    fn without_a_blocklist_file_the_built_in_one_is_used() {
         let (f, mot) = Filtre::charge(Mode::Noire, Some(Path::new("/dossier/qui/n/existe/pas")));
-        assert_eq!(f.mode, Mode::Blanche);
-        assert!(mot.contains("pas de fichier"), "{mot}");
-        assert_eq!(f.juge("https://exemple-porno.example/"), Err(Refus::HorsBlanche));
+        assert_eq!(f.mode, Mode::Noire);
+        assert!(f.noire.len() > 200_000, "{mot}");
+        for bon in [
+            "https://fr.wikipedia.org/wiki/Chat",
+            "https://www.lemonde.fr/",
+            "https://github.com/",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.winamax.fr/",
+        ] {
+            assert_eq!(f.juge(bon), Ok(()), "{bon}");
+        }
+        for mauvais in [
+            "https://www.pokerstars.com/",
+            "https://www.888casino.com/",
+            "https://4chan.org/",
+            "https://unblocktheweb.appspot.com/",
+        ] {
+            assert_eq!(f.juge(mauvais), Err(Refus::Noire), "{mauvais}");
+        }
+        for plateforme in ["https://www.twitch.tv/x", "https://player.vimeo.com/video/1", "https://vimeo.com/1"] {
+            assert_eq!(f.juge(plateforme), Err(Refus::Lecture), "{plateforme}");
+        }
+        assert_eq!(f.juge("https://nottwitch.tv/"), Ok(()));
+    }
+
+    #[test]
+    fn the_daily_blocklist_adds_to_the_built_in_one() {
+        let d = std::env::temp_dir().join(format!("minelib-noire-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("noire_ut1.txt"), "# du jour\nnouveau-mechant.example\n").unwrap();
+        std::fs::write(d.join("liste_noire.txt"), "a-la-main.example\n").unwrap();
+        let (f, mot) = Filtre::charge(Mode::Noire, Some(&d));
+        std::fs::remove_dir_all(&d).ok();
+        assert!(mot.contains("du jour : 1 domaines"), "{mot}");
+        assert_eq!(f.juge("https://cdn.nouveau-mechant.example/x"), Err(Refus::Noire));
+        assert_eq!(f.juge("https://a-la-main.example/"), Err(Refus::Noire));
+        assert_eq!(f.juge("https://www.pokerstars.com/"), Err(Refus::Noire));
+        assert_eq!(f.juge("https://exemple.com/"), Ok(()));
     }
 
     #[test]

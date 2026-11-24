@@ -105,8 +105,10 @@ impl Placed {
             right: right.into(),
             up: up.into(),
             size: [width, height],
-            // Les boutons : mis par la session, qui sait où est le réticule.
+            // Les boutons, le curseur et l'onde : mis par la session.
             reveal: [0.0; 2],
+            cursor: [0.0; 4],
+            ripple: [0.0, 0.0, -1.0, 0.0],
         }
     }
 
@@ -204,6 +206,16 @@ fn page_address(json: &str) -> Option<String> {
     v.get("u")?.as_str().map(|u| u.chars().take(2048).collect())
 }
 
+/// (v243) Une vidéo joue-t-elle dans la page (temps connu, pas en pause) ?
+fn page_playing(json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let t = v.get("t").and_then(|t| t.as_f64()).unwrap_or(-1.0);
+    let p = v.get("p").and_then(|p| p.as_bool()).unwrap_or(true);
+    t >= 0.0 && !p
+}
+
 /// (v210) Part de l'écran visible à l'image (0 à 1), à travers `view_proj` : la part de ses
 /// points (une grille de 9 × 9) qui tombent dans l'image, devant la caméra. Ce qui le cache
 /// (un mur, un joueur) n'est pas compté.
@@ -246,6 +258,25 @@ pub fn aim_box(min: Vec3, max: Vec3, eye: Vec3, dir: Vec3, limit: f32) -> Option
         }
     }
     Some(near)
+}
+
+/// (v243) Où le regard coupe le plan de l'écran (devant lui, côté image), à toute distance
+/// et même hors de l'écran : `x`, `y` en dehors de 0..1. `None` s'il ne le coupe pas.
+pub fn ray_uv(a: &ScreenAnchor, eye: Vec3, dir: Vec3) -> Option<[f32; 2]> {
+    let c = Vec3::from(a.center);
+    let r = Vec3::from(a.right);
+    let u = Vec3::from(a.up);
+    let n = r.cross(u);
+    let denom = dir.dot(n);
+    if denom >= -1e-6 {
+        return None;
+    }
+    let t = (c - eye).dot(n) / denom;
+    if t <= 0.0 {
+        return None;
+    }
+    let p = eye + dir * t - c;
+    Some([p.dot(r) / a.size[0] + 0.5, 0.5 - p.dot(u) / a.size[1]])
 }
 
 pub fn aim(a: &ScreenAnchor, eye: Vec3, dir: Vec3, limit: f32) -> Option<(f32, [f32; 2])> {
@@ -420,11 +451,22 @@ pub const MAX_PAGES: usize = 8;
 /// l'écran regardé (ou, sans écran regardé, le plus proche à moins de `NEAR_60` blocs) ;
 /// jusqu'à `MAX_30` autres écrans en vue à moins de `NEAR_30` blocs ; les autres en vue ;
 /// ceux qu'on ne voit pas (derrière soi, de dos), qui gardent leur son.
+/// (v243) Après un clic dans une page, temps pendant lequel un champ de texte peut prendre
+/// le clavier (son focus arrive du navigateur jusqu'à une demi-seconde après).
+const TYPING_AFTER_CLICK: f32 = 1.5;
+/// (v243) Après Entrée dans un champ, il perd le focus au bout de ce temps (la touche est
+/// arrivée à la page avant).
+const BLUR_AFTER_ENTER: f32 = 0.25;
+
 pub const FPS_LOOKED: i32 = 60;
 pub const FPS_NEAR: i32 = 30;
 pub const FPS_SEEN: i32 = 10;
 pub const FPS_HIDDEN: i32 = 2;
 const NEAR_60: f32 = 16.0;
+/// (v243) Écrans qui jouent une vidéo et qu'on voit, gardés à 60 images/s sans être visés.
+const MAX_PLAYING_60: usize = 2;
+/// (v243) Une baisse d'images par seconde n'est appliquée qu'au bout de ce temps.
+const LOWER_AFTER: f32 = 1.5;
 const NEAR_30: f32 = 32.0;
 const MAX_30: usize = 3;
 /// Images par seconde d'un onglet tant que `schedule` ne l'a pas réglé.
@@ -556,6 +598,21 @@ impl Displays {
         (0..BOUTONS.len()).find(|&b| on_button(uv, b))
     }
 
+    /// (v243) Le curseur et l'onde d'un appui de l'écran `id`, pour le shader (voir
+    /// `ScreenAnchor::cursor` et `ripple`) : dessinés au-dessus des boutons.
+    pub fn marks(&self, id: u32) -> ([f32; 4], [f32; 4]) {
+        let Some(t) = self.tabs.get(&id) else {
+            return ([0.0; 4], [0.0, 0.0, -1.0, 0.0]);
+        };
+        let cursor = t.cursor.map_or([0.0; 4], |c| {
+            [c[0], c[1], if t.editing { 2.0 } else { 1.0 }, 0.0]
+        });
+        let ripple = t.ripple.map_or([0.0, 0.0, -1.0, 0.0], |(uv, age)| {
+            [uv[0], uv[1], (age / RIPPLE_S).clamp(0.0, 1.0), 0.0]
+        });
+        (cursor, ripple)
+    }
+
     /// (v213) Y a-t-il une page précédente (1), une page suivante (2) ? Le rendu grise les
     /// boutons qui n'ont nulle part où aller.
     pub fn history_of(&self, id: u32) -> u8 {
@@ -646,8 +703,18 @@ impl Displays {
                 .map(|s| s.id);
         }
         let mut near = 0;
+        let mut playing = 0;
         for (rank, s) in order.iter().enumerate() {
-            let fps = if Some(s.id) == top {
+            // (v243) Une vidéo qui joue sur un écran qu'on voit : 60 images/s même sans
+            // le viser (à 30, l'image d'une vidéo saccadait).
+            let joue = s.visible
+                && s.dist <= 48.0
+                && playing < MAX_PLAYING_60
+                && self.tabs.get(&s.id).is_some_and(|t| t.playing);
+            if joue && Some(s.id) != top {
+                playing += 1;
+            }
+            let fps = if Some(s.id) == top || joue {
                 FPS_LOOKED
             } else if s.visible && s.dist <= NEAR_30 && near < MAX_30 {
                 near += 1;
@@ -686,7 +753,9 @@ impl Displays {
                 tab.editing = false;
                 tab.scroll = 0;
             }
-            if tab.opened && tab.want_fps != tab.fps_sent {
+            // (v243) Une hausse tout de suite, une baisse après `LOWER_AFTER`.
+            let lower = tab.want_fps < tab.fps_sent && tab.lower_for < LOWER_AFTER;
+            if tab.opened && tab.want_fps != tab.fps_sent && !lower {
                 b.send(&format!("fps {id} {}", tab.want_fps));
                 tab.fps_sent = tab.want_fps;
             }
@@ -754,12 +823,19 @@ impl Displays {
     }
 
     /// Le réticule survole le point `uv` de l'écran `id` (`None` : d'aucun écran).
+    /// (v243) Où le regard coupe le plan de chaque écran, à toute distance (pour savoir si
+    /// le réticule arrive sur un écran par son bord). Les écrans absents : nulle part.
+    pub fn rays(&mut self, rays: &[(u32, Option<[f32; 2]>)]) {
+        for (id, tab) in self.tabs.iter_mut() {
+            tab.ray = rays.iter().find(|r| r.0 == *id).and_then(|r| r.1);
+        }
+    }
+
     pub fn hover(&mut self, aim: Option<(u32, [f32; 2])>) {
         for (id, tab) in self.tabs.iter_mut() {
             let uv = aim.filter(|a| a.0 == *id).map(|a| a.1);
             if uv != tab.cursor {
                 tab.cursor = uv;
-                tab.dirty = true;
             }
             let Some(p) = uv.map(page_point) else {
                 continue;
@@ -779,7 +855,10 @@ impl Displays {
             return;
         };
         tab.ripple = Some((uv, 0.0));
-        tab.dirty = true;
+        // (v243) Un clic dans la page : un champ de texte peut prendre le clavier (son focus
+        // arrive du navigateur un peu après).
+        tab.typing_ok = TYPING_AFTER_CLICK;
+        tab.blur_in = None;
         let p = page_point(uv);
         match self.browser.as_mut() {
             Some(b) => {
@@ -833,9 +912,22 @@ impl Displays {
     }
 
     /// Touche spéciale (`back`, `enter`, `ctrl+v`…) pour l'écran `id`.
+    ///
+    /// (v243) Entrée rend le clavier au jeu tout de suite (avant, il attendait que la page
+    /// dise que son champ avait perdu le focus : les touches de déplacement tapées pendant
+    /// le chargement partaient dans la barre de recherche, qui rouvrait sa liste par-dessus
+    /// les résultats), et le champ perd le focus un instant après, une fois la recherche
+    /// partie.
     pub fn key(&mut self, id: u32, name: &str) {
         if let Some(b) = self.browser.as_mut() {
             b.send(&format!("key {id} {name}"));
+        }
+        if name == "enter" {
+            if let Some(tab) = self.tabs.get_mut(&id) {
+                tab.editing = false;
+                tab.typing_ok = 0.0;
+                tab.blur_in = Some(BLUR_AFTER_ENTER);
+            }
         }
     }
 
@@ -890,6 +982,29 @@ impl Displays {
     /// le navigateur après `IDLE_STOP_S` sans écran, le relance s'il s'est arrêté.
     pub fn update(&mut self, dt: f32) {
         self.retry_in = (self.retry_in - dt).max(0.0);
+        // (v243) Fenêtre de saisie après un clic, et champ qui perd le focus après Entrée ;
+        // temps depuis lequel un onglet voudrait moins d'images par seconde.
+        let mut blur = Vec::new();
+        for (id, tab) in self.tabs.iter_mut() {
+            tab.lower_for = if tab.want_fps < tab.fps_sent {
+                tab.lower_for + dt
+            } else {
+                0.0
+            };
+            tab.typing_ok = (tab.typing_ok - dt).max(0.0);
+            if let Some(t) = tab.blur_in.as_mut() {
+                *t -= dt;
+                if *t <= 0.0 {
+                    tab.blur_in = None;
+                    blur.push(*id);
+                }
+            }
+        }
+        for id in blur {
+            if let Some(b) = self.browser.as_mut() {
+                b.send(&format!("blur {id}"));
+            }
+        }
         if self.tabs.is_empty() {
             self.idle += dt;
             if self.idle >= IDLE_STOP_S && self.browser.is_some() {
@@ -941,20 +1056,17 @@ impl Displays {
                         continue;
                     };
                     match ev {
-                        Event::Editing(on) => tab.editing = on,
+                        // (v243) Un champ ne prend le clavier que juste après un clic.
+                        Event::Editing(on) => tab.editing = on && tab.typing_ok > 0.0,
                         Event::State(s) => {
                             if let Some(u) = page_address(&s) {
                                 tab.addr = u;
                             }
+                            tab.playing = page_playing(&s);
                             self.states.push((id, s))
                         }
                         Event::Scroll(f) => tab.scroll = f,
-                        Event::History(h) => {
-                            if tab.history != h {
-                                tab.history = h;
-                                tab.dirty = true;
-                            }
-                        }
+                        Event::History(h) => tab.history = h,
                         Event::Blocked(raison) => self.blocked.push((id, raison)),
                     }
                 }
@@ -1002,10 +1114,6 @@ const ZONE: f32 = 2.3;
 /// glisser vers le bouton, qui apparaît de plus en plus en approchant.
 const COIN: f32 = 6.0;
 
-/// (v207) Bande du bord par laquelle il faut entrer sur l'écran (fraction de l'écran) : un
-/// réticule qui arrive de l'extérieur, même vite, tombe d'abord tout près du bord.
-const BORD: f32 = 0.08;
-
 /// Temps pour apparaître et pour disparaître (secondes) : un glissement lent suffit, et
 /// un passage rapide dans le coin ne le fait pas clignoter.
 const PARAIT: f32 = 0.14;
@@ -1017,7 +1125,7 @@ const CLIQUABLE: f32 = 0.35;
 
 /// L'adresse où mène la loupe (SafeSearch est imposé par le navigateur).
 pub const RECHERCHE: &str = "https://www.google.com/";
-/// (v211) L'adresse où mène le bouton vidéo : la recherche de YouTube (mode restreint).
+/// (v211) L'adresse où mène le bouton vidéo : la recherche de YouTube.
 pub const RECHERCHE_VIDEO: &str = "https://www.youtube.com/";
 
 /// Distance au centre du bouton, en mesures de la largeur (le 16/9 des pages est enlevé,
@@ -1051,32 +1159,51 @@ struct Corner {
     armed: bool,
     /// Déjà arrivé sur le bouton (ou tout près) depuis cette entrée.
     reached: bool,
-    /// Le réticule était sur l'écran à l'image d'avant.
-    was_on: bool,
+    /// (v243) Où le regard coupait le plan de l'écran à l'image d'avant, à toute distance
+    /// (hors de l'écran : en dehors de 0..1).
+    prev: Option<[f32; 2]>,
+}
+
+/// Le point est-il sur l'écran ?
+fn on_screen(p: [f32; 2]) -> bool {
+    (0.0..=1.0).contains(&p[0]) && (0.0..=1.0).contains(&p[1])
 }
 
 impl Corner {
-    /// L'apparition voulue (0 à 1) de chaque bouton pour ce point du réticule (`None` : pas
-    /// sur l'écran).
-    fn target(&mut self, cursor: Option<[f32; 2]>) -> f32 {
-        let entered = !self.was_on;
-        self.was_on = cursor.is_some();
-        let Some(uv) = cursor else {
+    /// L'apparition voulue (0 à 1) des boutons. `ray` : où le regard coupe le plan de
+    /// l'écran, à toute distance (`None` : il ne le coupe pas) ; `cursor` : le réticule sur
+    /// l'écran, seulement à portée de main (`None` sinon).
+    ///
+    /// (v243) L'entrée sur l'écran se juge sur le regard, pas sur la portée : avant, viser
+    /// le coin en marchant vers l'écran faisait « entrer » le réticule là où il arrivait à
+    /// portée de main, dans la bande du bord du haut, et les boutons apparaissaient. Il faut
+    /// maintenant que le regard **franchisse** le bord gauche ou le haut de l'écran.
+    fn target(&mut self, cursor: Option<[f32; 2]>, ray: Option<[f32; 2]>) -> f32 {
+        let prev = std::mem::replace(&mut self.prev, ray);
+        let now_in = ray.is_some_and(on_screen);
+        if !now_in {
             self.armed = false;
             self.reached = false;
             return 0.0;
-        };
+        }
+        let Some(p) = ray else { return 0.0 };
         let d = (0..BOUTONS.len())
-            .map(|b| to_button(uv, b))
+            .map(|b| to_button(p, b))
             .fold(f32::MAX, f32::min);
         let r = RAYON;
-        if entered {
-            // On arrive sur l'écran : par le bord gauche ou par le haut, et dans le coin.
-            let par_le_bord = uv[0] <= BORD || uv[1] <= BORD;
+        if !prev.is_some_and(on_screen) {
+            // Le regard arrive sur l'écran en franchissant le bord gauche ou le haut, et dans
+            // le coin. Venu de nulle part (dos tourné, écran qui vient d'apparaître), aucun
+            // bord n'a été vu franchi : rien.
+            let par_le_bord = prev.is_some_and(|q| q[0] < 0.0 || q[1] < 0.0);
             self.armed = par_le_bord && d <= r * COIN;
             self.reached = false;
         }
         if !self.armed {
+            return 0.0;
+        }
+        // Hors de portée de main : rien à montrer (mais l'entrée reste valable).
+        if cursor.is_none() {
             return 0.0;
         }
         if d <= r * ZONE {
@@ -1111,11 +1238,20 @@ struct Tab {
     paused: bool,
     /// Point visé (curseur), s'il y en a un, et dernier point envoyé au navigateur.
     cursor: Option<[f32; 2]>,
+    /// (v243) Où le regard coupe le plan de l'écran, à toute distance (voir `Corner`).
+    ray: Option<[f32; 2]>,
     sent: Option<(i32, i32)>,
     /// Dernier appui : point et âge (secondes).
     ripple: Option<([f32; 2], f32)>,
     /// Un champ de texte de la page a le focus.
     editing: bool,
+    /// (v243) Temps (s) pendant lequel un champ de texte peut prendre le clavier : il ne le
+    /// prend qu'après un clic du joueur dans la page, jamais de lui-même (une page qui met
+    /// le focus dans sa barre de recherche en se chargeant ne vole pas les touches).
+    typing_ok: f32,
+    /// (v243) Après Entrée : le champ de texte perd le focus dans tant de secondes (le
+    /// temps que la recherche parte), le clavier est déjà revenu au jeu.
+    blur_in: Option<f32>,
     /// Un navigateur est lancé ou va l'être : sans page, l'écran montre qu'il charge
     /// (sinon, sa mire).
     loading: bool,
@@ -1133,6 +1269,12 @@ struct Tab {
     /// images par seconde qui lui ont été demandées.
     want_awake: bool,
     want_fps: i32,
+    /// (v243) Une vidéo joue dans la page (d'après son état) : vue, elle garde 60 images/s.
+    playing: bool,
+    /// (v243) Depuis combien de temps l'onglet voudrait moins d'images par seconde : une
+    /// baisse n'est appliquée qu'au bout de `LOWER_AFTER` (un coup d'œil ailleurs ne fait
+    /// pas chuter l'image d'une vidéo).
+    lower_for: f32,
     opened: bool,
     fps_sent: i32,
     /// À redessiner (nouvelle image de la page, curseur déplacé…).
@@ -1153,9 +1295,12 @@ impl Tab {
             time: 0.0,
             paused: false,
             cursor: None,
+            ray: None,
             sent: None,
             ripple: None,
             editing: false,
+            typing_ok: 0.0,
+            blur_in: None,
             loading: false,
             scroll: 0,
             reveal: 0.0,
@@ -1163,6 +1308,8 @@ impl Tab {
             history: 0,
             want_awake: true,
             want_fps: FPS_DEFAULT,
+            playing: false,
+            lower_for: 0.0,
             opened: false,
             fps_sent: 0,
             dirty: true,
@@ -1176,20 +1323,17 @@ impl Tab {
         // (v206) Les boutons apparaissent et disparaissent en fondu ; (v207) seulement
         // quand on arrive par le bord de l'écran, dans leur coin (voir `Corner`) ; (v211)
         // chacun le sien, et sur toutes les pages, le lecteur YouTube compris.
-        let vers = self.corner.target(self.cursor);
+        let vers = self.corner.target(self.cursor, self.ray);
         let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
-        let avant = self.reveal;
         self.reveal = if vers > self.reveal {
             (self.reveal + pas).min(vers)
         } else {
             (self.reveal - pas).max(vers)
         };
-        if (self.reveal - avant).abs() > 1e-4 {
-            self.dirty = true;
-        }
+        // (v243) Les boutons, le curseur et l'onde sont dessinés par le shader : la page
+        // n'est pas redessinée (ni renvoyée à la carte graphique) quand ils bougent.
         if let Some((_, age)) = &mut self.ripple {
             *age += dt;
-            self.dirty = true;
         }
         if self.ripple.is_some_and(|r| r.1 > RIPPLE_S) {
             self.ripple = None;
@@ -1227,24 +1371,8 @@ impl Tab {
                 }
             }
         }
-        // Les anneaux gardent la même taille à l'écran quelle que soit la résolution.
-        let k = self.size.0 as f32 / W as f32;
-        // Onde de l'appui : cercle qui s'agrandit et s'efface.
-        if let Some((uv, age)) = self.ripple {
-            let t = age / RIPPLE_S;
-            let shade = (255.0 * (1.0 - t)) as u8;
-            self.ring(uv, (8.0 + 40.0 * t) * k, 3.0 * k, [shade, shade, shade]);
-        }
-        // Curseur : petit anneau là où vise le réticule (bleu quand le clavier va dans
-        // la page).
-        if let Some(uv) = self.cursor {
-            let c = if self.editing {
-                [255, 170, 60]
-            } else {
-                [255, 255, 255]
-            };
-            self.ring(uv, 7.0 * k, 2.0 * k, c);
-        }
+        // (v243) Le curseur et l'onde d'un appui ne sont plus dessinés ici mais par le
+        // shader, au-dessus des boutons (voir `Displays::marks`).
         self.dirty = false;
         self.version += 1;
     }
@@ -1325,20 +1453,6 @@ impl Tab {
                     if (y - cy).abs() < (tri - dx) / 2 {
                         self.put(x, y, [240, 240, 240]);
                     }
-                }
-            }
-        }
-    }
-
-    /// Anneau de rayon `radius` (pixels) et d'épaisseur `width` centré en `uv`.
-    fn ring(&mut self, uv: [f32; 2], radius: f32, width: f32, bgr: [u8; 3]) {
-        let (cx, cy) = (uv[0] * self.size.0 as f32, uv[1] * self.size.1 as f32);
-        let reach = (radius + width) as i32 + 1;
-        for y in cy as i32 - reach..=cy as i32 + reach {
-            for x in cx as i32 - reach..=cx as i32 + reach {
-                let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
-                if (d - radius).abs() <= width * 0.5 {
-                    self.put(x, y, bgr);
                 }
             }
         }
@@ -1436,13 +1550,15 @@ impl Browser {
         let logs = data.join("logs");
         let _ = std::fs::create_dir_all(&logs);
         // (v208) En ligne, une session à part : celle du solo (et son compte) n'y est pas.
+        // (v243) On peut s'y connecter à un compte (jeu interdit aux moins de 18 ans).
         let en_ligne = filtre == "en_ligne";
         let base = if en_ligne { "cef-en-ligne" } else { "cef-cache" };
         let session = match cache {
             0 => base.to_string(),
             n => format!("{base}-{}", n + 1),
         };
-        // (v208) La liste des sites pour enfants de l'UT1, rafraîchie une fois par jour.
+        // (v208) Les listes de l'UT1 (sites pour enfants, liste noire), rafraîchies une fois
+        // par jour.
         crate::filtres::rafraichir(data.join("filtres"));
         // Sa sortie d'erreur, ajoutée au journal (vidé au-delà de 256 Ko).
         let path = logs.join("navigateur-sortie.log");
@@ -1470,15 +1586,16 @@ impl Browser {
             .arg(logs.join("navigateur.log"))
             // Qu'il dise où la page peut défiler (la molette n'y va que si elle y sert).
             .arg("--scroll")
-            // (v205) Le jeu est tout public : filtrage des pages, mode restreint de
-            // YouTube et SafeSearch. Les listes sont dans `.minelib\\filtres`.
+            // (v205) Filtrage des pages et SafeSearch. (v243) Le jeu est interdit aux moins
+            // de 18 ans : la liste noire partout (le web sauf les interdits), sans mode
+            // restreint de YouTube, connexion à un compte permise. Les listes sont dans
+            // `.minelib\\filtres`.
             .arg("--filtre")
-            .arg(if en_ligne { "blanche" } else { filtre })
+            .arg(if en_ligne { "noire" } else { filtre })
             .arg("--listes")
             .arg(data.join("filtres"))
             .arg("--restreint")
-            .arg("strict")
-            .args(en_ligne.then_some("--sans-compte"))
+            .arg("non")
             // (v213) Le volume des écrans dès le lancement, sans un éclat de son avant.
             .arg("--volume")
             .arg(volume_pct(volume).to_string())
@@ -1708,6 +1825,8 @@ mod tests {
             up: [0.0, 1.0, 0.0],
             size: [2.0, 1.125],
             reveal: [0.0; 2],
+            cursor: [0.0; 4],
+            ripple: [0.0, 0.0, -1.0, 0.0],
         };
         let proj = Mat4::perspective_infinite_reverse_rh(70f32.to_radians(), 16.0 / 9.0, 0.05);
         let face = proj * Mat4::look_to_rh(Vec3::ZERO, -Vec3::Z, Vec3::Y);
@@ -1777,9 +1896,17 @@ mod tests {
     /// Le réticule glisse de `de` à `vers` en `n` images (une image : 16 ms), puis y reste
     /// `pause` images.
     fn glide(t: &mut Tab, de: [f32; 2], vers: [f32; 2], n: usize, pause: usize) {
+        // Partir du bord sans être déjà sur l'écran, c'est arriver de dehors : le regard y
+        // était juste avant.
+        if (de[0] <= 0.0 || de[1] <= 0.0) && !t.ray.is_some_and(on_screen) {
+            t.cursor = None;
+            t.ray = Some([de[0] - 0.02, de[1] - 0.02]);
+            t.update(0.016);
+        }
         for k in 0..=n {
             let a = k as f32 / n.max(1) as f32;
             t.cursor = Some([de[0] + (vers[0] - de[0]) * a, de[1] + (vers[1] - de[1]) * a]);
+            t.ray = t.cursor;
             t.update(0.016);
         }
         for _ in 0..pause {
@@ -1789,6 +1916,7 @@ mod tests {
 
     fn leave(t: &mut Tab) {
         t.cursor = None;
+        t.ray = None;
         for _ in 0..40 {
             t.update(0.016);
         }
@@ -1877,11 +2005,58 @@ mod tests {
         assert!(t.reveal > 0.99, "{}", t.reveal);
         // Un passage éclair par le bord ne les rend pas cliquables.
         leave(&mut t);
+        t.ray = Some([-0.02, 0.05]);
+        t.update(0.016);
         t.cursor = Some([0.0, 0.05]);
+        t.ray = t.cursor;
         t.update(0.016);
         t.cursor = Some(c);
+        t.ray = t.cursor;
         t.update(0.016);
         assert!(t.reveal < CLIQUABLE, "{}", t.reveal);
+    }
+
+    /// (v243) Marcher vers l'écran en visant ses boutons ne les montre pas : le regard
+    /// était déjà sur l'écran, il n'a franchi aucun bord. Le regard qui franchit le bord
+    /// gauche de loin, puis qu'on approche : ils apparaissent.
+    #[test]
+    fn walking_up_to_the_screen_does_not_show_the_buttons() {
+        let c = BOUTONS[VIDEO];
+        let mut t = Tab::new("x");
+        // De loin (hors de portée de main), le regard sur le coin, puis à portée.
+        t.ray = Some(c);
+        for _ in 0..30 {
+            t.update(0.016);
+        }
+        t.cursor = Some(c);
+        for _ in 0..30 {
+            t.update(0.016);
+        }
+        assert_eq!(t.reveal, 0.0);
+        // Même en bougeant un peu dans le coin, sans franchir de bord.
+        glide(&mut t, c, [0.02, 0.02], 10, 10);
+        assert_eq!(t.reveal, 0.0);
+        // Le regard franchit le bord gauche de loin, puis on s'approche : ils viennent.
+        let mut t = Tab::new("x");
+        t.ray = Some([-0.2, 0.05]);
+        t.update(0.016);
+        t.ray = Some([0.01, 0.05]);
+        t.update(0.016);
+        t.ray = Some(c);
+        t.update(0.016);
+        t.cursor = Some(c);
+        for _ in 0..30 {
+            t.update(0.016);
+        }
+        assert_eq!(t.reveal, 1.0);
+        // Arrivé par la droite, ou par le bas : non.
+        for venu in [[1.2, 0.05], [0.05, 1.2]] {
+            let mut t = Tab::new("x");
+            t.ray = Some(venu);
+            t.update(0.016);
+            glide(&mut t, [0.06, 0.06], c, 10, 30);
+            assert_eq!(t.reveal, 0.0, "{venu:?}");
+        }
     }
 
     /// (v211) Sur la page du lecteur YouTube aussi, et le clic va au bon bouton.
@@ -2032,6 +2207,56 @@ mod tests {
         d.press(1, [0.2, 0.2]);
         d.update(0.1);
         assert!(!d.tabs[&1].paused && d.tabs[&1].time > t);
+    }
+
+    /// (v243) Entrée rend le clavier au jeu tout de suite, et le champ perd le focus un
+    /// instant après. Un champ qui prend le focus sans clic récent (la page qui le remet
+    /// en chargeant) n'a pas le clavier.
+    #[test]
+    fn entree_rend_le_clavier_et_la_page_ne_le_reprend_pas_seule() {
+        let mut d = Displays::new();
+        d.tabs.insert(1, Tab::new(HOME_URL));
+        d.press(1, [0.5, 0.1]);
+        assert!(d.tabs[&1].typing_ok > 0.0, "un clic ouvre la fenêtre de saisie");
+        d.tabs.get_mut(&1).unwrap().editing = true;
+        d.key(1, "enter");
+        let t = &d.tabs[&1];
+        assert!(!t.editing && t.typing_ok == 0.0 && t.blur_in.is_some());
+        d.update(BLUR_AFTER_ENTER + 0.01);
+        assert!(d.tabs[&1].blur_in.is_none());
+        // Longtemps après le clic, la fenêtre de saisie est fermée.
+        d.press(1, [0.5, 0.1]);
+        d.update(TYPING_AFTER_CLICK + 0.1);
+        assert_eq!(d.tabs[&1].typing_ok, 0.0);
+    }
+
+    /// (v243) Une vidéo qui joue sur un écran en vue reste à 60 images/s même sans le
+    /// viser, et une baisse n'est demandée qu'après `LOWER_AFTER`.
+    #[test]
+    fn une_video_qui_joue_garde_ses_60_images() {
+        let mut d = Displays::new();
+        for id in 1..=4 {
+            d.tabs.insert(id, Tab::new(HOME_URL));
+        }
+        for id in [2, 3, 4] {
+            d.tabs.get_mut(&id).unwrap().playing = true;
+        }
+        let seen: Vec<Seen> = (1..=4)
+            .map(|id| Seen { id, dist: 5.0 + id as f32, visible: true })
+            .collect();
+        d.schedule(&seen, Some(1));
+        let fps: Vec<i32> = (1..=4).map(|id| d.tabs[&id].want_fps).collect();
+        // Le regardé, puis deux vidéos qui jouent ; la troisième redescend à 30.
+        assert_eq!(fps, vec![FPS_LOOKED, FPS_LOOKED, FPS_LOOKED, FPS_NEAR]);
+        // Une baisse voulue s'accumule avant d'être envoyée.
+        let t = d.tabs.get_mut(&4).unwrap();
+        t.fps_sent = FPS_LOOKED;
+        d.update(0.5);
+        d.update(0.5);
+        assert!((d.tabs[&4].lower_for - 1.0).abs() < 1e-4);
+        d.tabs.get_mut(&4).unwrap().want_fps = FPS_LOOKED;
+        d.update(0.1);
+        assert_eq!(d.tabs[&4].lower_for, 0.0);
     }
 
     #[test]

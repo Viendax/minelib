@@ -26,6 +26,12 @@ pub struct ScreenAnchor {
     /// tous les boutons, en premier). (v213) En second : les pages où aller, précédente (1)
     /// et suivante (2), pour griser les boutons retour et suivant.
     pub reveal: [f32; 2],
+    /// (v243) Le curseur (le rond là où vise le réticule) : `x`, `y` (0..1 sur la page),
+    /// `z` = 0 pas de curseur, 1 curseur, 2 curseur quand le clavier va dans la page. Dessiné
+    /// par le shader **au-dessus** des boutons (avant, dans l'image de la page, dessous).
+    pub cursor: [f32; 4],
+    /// (v243) L'onde d'un appui : `x`, `y`, `z` = son âge de 0 à 1 (négatif : pas d'onde).
+    pub ripple: [f32; 4],
 }
 
 #[repr(C)]
@@ -34,6 +40,8 @@ struct ScreenVertex {
     pos: [f32; 3],
     uv: [f32; 2],
     reveal: [f32; 2],
+    cursor: [f32; 4],
+    ripple: [f32; 4],
 }
 
 /// Au plus tant d'écrans dessinés.
@@ -94,8 +102,14 @@ impl Screen {
             push_constant_ranges: &[],
         });
 
-        const ATTRS: [wgpu::VertexAttribute; 3] =
-            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x2];
+        const ATTRS: [wgpu::VertexAttribute; 5] =
+            wgpu::vertex_attr_array![
+                0 => Float32x3,
+                1 => Float32x2,
+                2 => Float32x2,
+                3 => Float32x4,
+                4 => Float32x4
+            ];
 
         let pipeline = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -288,6 +302,8 @@ impl Screen {
                 pos: [p.x, p.y, p.z],
                 uv,
                 reveal: a.reveal,
+                cursor: a.cursor,
+                ripple: a.ripple,
             };
             // uv (0,0) en haut-gauche.
             verts.extend([

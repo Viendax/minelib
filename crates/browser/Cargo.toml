@@ -13,6 +13,8 @@ path = "src/main.rs"
 # Chromium Embedded Framework (bindings Rust de tauri-apps). Sans bac à sable : il demande
 # une bibliothèque statique propre à MSVC.
 cef = { version = "150", default-features = false }
+# (v243) La copie intégrée de la liste noire de l'UT1 est compressée (1 Mo au lieu de 4).
+flate2 = "1.1"
 
 # (v213) Volume des écrans : celui des sons du navigateur dans Windows (sessions audio).
 [target.'cfg(windows)'.dependencies]

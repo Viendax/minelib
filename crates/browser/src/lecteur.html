@@ -16,6 +16,9 @@
   Lecture automatique : seulement quand le jeu le permet (`__mlb.regarde()`, l'écran
   regardé, à plus de moitié visible, un seul à la fois), sinon sur un clic dans le lecteur.
   Tant qu'elle attend, la page se dit « en pub » au jeu : rien n'est lu ni corrigé.
+
+  (v243) Une vidéo que YouTube ne permet pas hors de son site (limitée par l'âge, ou
+  intégration coupée par son auteur) s'ouvre sur le site complet (`&mlb=site`).
 -->
 <style>
 html,body{margin:0;height:100%;background:#0f0f0f;color:#f1f1f1;
@@ -74,9 +77,15 @@ window.onYouTubeIframeAPIReady=()=>{
             history.replaceState(null,'',location.pathname+'?v='+id);}}catch(_){}
       },
       onError:e=>{erreur=true;
-        mot(e.data===101||e.data===150||e.data===153
-          ?"L'auteur de cette vidéo ne permet pas de la lire en dehors de YouTube."
-          :"Cette vidéo ne peut pas être lue (introuvable, privée ou retirée).");},
+        // (v243) YouTube ne permet pas cette vidéo hors de son site (limitée par l'âge, ou
+        // intégration coupée par son auteur) : on l'ouvre sur le site, au même moment.
+        // `mlb=site` dit au navigateur du jeu de ne pas la ramener ici.
+        if(e.data===101||e.data===150||e.data===153){
+          let t=debut;try{t=Math.floor(P.getCurrentTime())||debut;}catch(_){}
+          mot("Ouverture de la vidéo sur YouTube…");
+          location.replace('https://www.youtube.com/watch?v='+id+(t>0?'&t='+t+'s':'')+'&mlb=site');
+          return;}
+        mot("Cette vidéo ne peut pas être lue (introuvable, privée ou retirée).");},
     }});
 };
 const api=document.createElement('script');

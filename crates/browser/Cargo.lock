@@ -640,6 +640,7 @@ name = "minelib-browser"
 version = "0.1.0"
 dependencies = [
  "cef",
+ "flate2",
  "windows",
 ]
 

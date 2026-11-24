@@ -9,41 +9,129 @@
 //! Téléchargée en HTTPS depuis le site de l'université, jamais d'un miroir : une liste
 //! blanche ajoute des sites, il ne faut la prendre qu'à sa source. Un fichier qui ne
 //! ressemble pas à une liste de domaines est ignoré, et l'ancien reste.
+//!
+//! (v243) Le jeu est interdit aux moins de 18 ans et les écrans ouvrent le web sauf les
+//! interdits : on rafraîchit aussi, dans `noire_ut1.txt`, la liste noire de l'université
+//! (contenus adultes mêlés, jeux d'argent sauf les opérateurs agréés en France, drogue,
+//! piratage, minage caché, attaques, logiciels espions, armes, haine, contournement du
+//! filtrage, hameçonnage). Le navigateur l'ajoute à sa copie intégrée. Le porno lui-même
+//! (4,6 millions de domaines, 18 Mo par jour) est laissé au DNS familial de Cloudflare.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const SOURCE: &str = "https://dsi.ut-capitole.fr/blacklists/download/child.tar.gz";
-const FICHIER: &str = "enfants_ut1.txt";
+const SOURCES: &str = "https://dsi.ut-capitole.fr/blacklists/download/";
 const CHAQUE: Duration = Duration::from_secs(24 * 3600);
-/// Bornes raisonnables : la liste fait moins d'une centaine de domaines.
-const MAX_DOMAINES: usize = 5000;
-const MAX_ARCHIVE: u64 = 4 * 1024 * 1024;
+/// La plus grosse archive, l'hameçonnage, fait 2,4 Mo (5 Mo une fois ouverte).
+const MAX_ARCHIVE: u64 = 16 * 1024 * 1024;
 
-/// Rafraîchit la liste en arrière-plan si elle a plus d'un jour (ou n'existe pas).
-pub fn rafraichir(dossier: PathBuf) {
-    let chemin = dossier.join(FICHIER);
-    let recente = std::fs::metadata(&chemin)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|age| age < CHAQUE);
-    if recente {
-        return;
-    }
-    std::thread::spawn(move || match telecharge(&dossier) {
-        Ok(n) => log::info!("filtres : liste enfants de l'UT1 rafraîchie ({n} domaines)"),
-        Err(e) => log::warn!("filtres : liste enfants de l'UT1 pas rafraîchie : {e}"),
-    });
+/// Une liste rafraîchie chaque jour : son fichier, les catégories de l'UT1 qui la font.
+struct Liste {
+    nom: &'static str,
+    fichier: &'static str,
+    categories: &'static [&'static str],
+    /// Catégories dont les domaines sont retirés de la liste.
+    sauf: &'static [&'static str],
+    /// Borne raisonnable par catégorie (la plus grosse, la presse, en a moins de 5000).
+    max: usize,
+    entete: &'static str,
 }
 
-fn telecharge(dossier: &Path) -> Result<usize, String> {
+const LISTES: [Liste; 2] = [
+    Liste {
+        nom: "liste enfants",
+        fichier: "enfants_ut1.txt",
+        categories: &["child"],
+        sauf: &[],
+        max: 5000,
+        entete: "# Liste « child » de l'Université Toulouse 1 Capitole (Fabrice Prigent), CC BY-SA 4.0.\n\
+                 # https://dsi.ut-capitole.fr/blacklists/ : sites autorisés aux moins de 10 ans.\n\
+                 # Rafraîchie chaque jour par minelib ; ne pas modifier (liste_blanche.txt pour les ajouts).\n",
+    },
+    Liste {
+        nom: "liste noire",
+        fichier: "noire_ut1.txt",
+        categories: &[
+            "mixed_adult",
+            "gambling",
+            "drogue",
+            "warez",
+            "cryptojacking",
+            "ddos",
+            "stalkerware",
+            "dangerous_material",
+            "agressif",
+            "redirector",
+            "phishing",
+        ],
+        sauf: &["arjel"],
+        max: 2_000_000,
+        entete: "# Liste noire de l'Université Toulouse 1 Capitole (Fabrice Prigent), CC BY-SA 4.0,\n\
+                 # https://dsi.ut-capitole.fr/blacklists/ : mixed_adult, gambling (moins arjel),\n\
+                 # drogue, warez, cryptojacking, ddos, stalkerware, dangerous_material, agressif,\n\
+                 # redirector, phishing. Rafraîchie chaque jour par minelib ; ne pas modifier\n\
+                 # (liste_noire.txt pour les ajouts).\n",
+    },
+];
+
+/// Rafraîchit les listes en arrière-plan si elles ont plus d'un jour (ou n'existent pas).
+pub fn rafraichir(dossier: PathBuf) {
+    for liste in &LISTES {
+        let chemin = dossier.join(liste.fichier);
+        let recente = std::fs::metadata(&chemin)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .is_some_and(|age| age < CHAQUE);
+        if recente {
+            continue;
+        }
+        let dossier = dossier.clone();
+        std::thread::spawn(move || match telecharge(&dossier, liste) {
+            Ok(n) => log::info!("filtres : {} de l'UT1 rafraîchie ({n} domaines)", liste.nom),
+            Err(e) => log::warn!("filtres : {} de l'UT1 pas rafraîchie : {e}", liste.nom),
+        });
+    }
+}
+
+/// Toutes les catégories de la liste, ou rien : on garde l'ancienne plutôt qu'une liste
+/// à laquelle manquerait une catégorie.
+fn telecharge(dossier: &Path, liste: &Liste) -> Result<usize, String> {
+    let lit = |c: &str| -> Result<Vec<String>, String> {
+        valide(&categorie(c)?, liste.max).ok_or(format!("{c} : ce n'est pas une liste de domaines"))
+    };
+    let mut domaines = Vec::new();
+    for c in liste.categories {
+        domaines.append(&mut lit(c)?);
+    }
+    let mut sauf = Vec::new();
+    for c in liste.sauf {
+        sauf.append(&mut lit(c)?);
+    }
+    domaines.sort();
+    domaines.dedup();
+    sauf.sort();
+    domaines.retain(|d| sauf.binary_search(d).is_err());
+    std::fs::create_dir_all(dossier).map_err(|e| e.to_string())?;
+    let mut sortie = String::from(liste.entete);
+    for d in &domaines {
+        sortie.push_str(d);
+        sortie.push('\n');
+    }
+    let tmp = dossier.join(format!("{}.tmp", liste.fichier));
+    std::fs::write(&tmp, sortie).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, dossier.join(liste.fichier)).map_err(|e| e.to_string())?;
+    Ok(domaines.len())
+}
+
+/// Les domaines d'une catégorie de l'UT1, depuis son archive sur le site de l'université.
+fn categorie(c: &str) -> Result<String, String> {
     use std::io::Read;
     let mut resp = crate::update::http()
-        .get(SOURCE)
+        .get(&format!("{SOURCES}{c}.tar.gz"))
         .header("User-Agent", "minelib-filtres")
         .call()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{c} : {e}"))?;
     let mut gz = Vec::new();
     resp.body_mut()
         .as_reader()
@@ -55,22 +143,7 @@ fn telecharge(dossier: &Path) -> Result<usize, String> {
         .take(MAX_ARCHIVE * 4)
         .read_to_end(&mut tar)
         .map_err(|e| e.to_string())?;
-    let texte = dans_tar(&tar, "child/domains").ok_or("pas de child/domains dans l'archive")?;
-    let domaines = valide(&texte).ok_or("ce n'est pas une liste de domaines")?;
-    std::fs::create_dir_all(dossier).map_err(|e| e.to_string())?;
-    let mut sortie = String::from(
-        "# Liste « child » de l'Université Toulouse 1 Capitole (Fabrice Prigent), CC BY-SA 4.0.\n\
-         # https://dsi.ut-capitole.fr/blacklists/ : sites autorisés aux moins de 10 ans.\n\
-         # Rafraîchie chaque jour par minelib ; ne pas modifier (liste_blanche.txt pour les ajouts).\n",
-    );
-    for d in &domaines {
-        sortie.push_str(d);
-        sortie.push('\n');
-    }
-    let tmp = dossier.join(format!("{FICHIER}.tmp"));
-    std::fs::write(&tmp, sortie).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, dossier.join(FICHIER)).map_err(|e| e.to_string())?;
-    Ok(domaines.len())
+    dans_tar(&tar, &format!("{c}/domains")).ok_or(format!("pas de {c}/domains dans l'archive"))
 }
 
 /// Le contenu d'un fichier d'une archive tar (format ustar, sans extension).
@@ -105,21 +178,22 @@ fn dans_tar(tar: &[u8], nom: &str) -> Option<String> {
     None
 }
 
-/// Les domaines d'une liste, si c'en est bien une (un nom de domaine par ligne).
-fn valide(texte: &str) -> Option<Vec<String>> {
+/// Les domaines d'une liste, si c'en est bien une (un nom de domaine par ligne ; le `_`,
+/// interdit dans un nom d'hôte, se trouve pourtant dans quelques domaines des listes).
+fn valide(texte: &str, max: usize) -> Option<Vec<String>> {
     let mut domaines = Vec::new();
     for ligne in texte.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let ok = ligne.contains('.')
             && ligne.len() <= 253
             && ligne
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
         if !ok {
             return None;
         }
         domaines.push(ligne.to_ascii_lowercase());
     }
-    (!domaines.is_empty() && domaines.len() <= MAX_DOMAINES).then_some(domaines)
+    (!domaines.is_empty() && domaines.len() <= max).then_some(domaines)
 }
 
 #[cfg(test)]
@@ -143,14 +217,15 @@ mod tests {
         tar.extend(entree("child/domains", b"lumni.fr\npbskids.org\n"));
         tar.extend([0u8; 1024]);
         let texte = dans_tar(&tar, "child/domains").unwrap();
-        assert_eq!(valide(&texte).unwrap(), vec!["lumni.fr", "pbskids.org"]);
+        assert_eq!(valide(&texte, 5000).unwrap(), vec!["lumni.fr", "pbskids.org"]);
         assert!(dans_tar(&tar, "child/usage").is_none());
     }
 
     #[test]
     fn une_page_d_erreur_n_est_pas_une_liste() {
-        assert!(valide("<html><body>Erreur 500</body></html>").is_none());
-        assert!(valide("").is_none());
-        assert!(valide("lumni.fr\n0.0.0.0 mechant.example\n").is_none());
+        assert!(valide("<html><body>Erreur 500</body></html>", 5000).is_none());
+        assert!(valide("", 5000).is_none());
+        assert!(valide("lumni.fr\n0.0.0.0 mechant.example\n", 5000).is_none());
+        assert!(valide("a.fr\nb.fr\nc.fr\n", 2).is_none());
     }
 }

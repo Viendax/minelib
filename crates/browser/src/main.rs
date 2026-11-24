@@ -17,13 +17,17 @@
 //! **Options** : `--width`, `--height`, `--cache <dossier de session>`, `--log <journal>`,
 //! `--fps <images par seconde d'un nouvel onglet, 30 par défaut>`, `--scroll`,
 //! `--filtre blanche|noire`, `--listes <dossier des listes>`,
-//! `--restreint strict|modere|non` (mode restreint de YouTube et SafeSearch),
-//! `--sans-compte` (v208, en ligne : pas de connexion à un compte, cookies effacés),
+//! `--restreint strict|modere|non` (mode restreint de YouTube ; SafeSearch est toujours
+//! imposé), `--sans-compte` (v208 : pas de connexion à un compte, cookies effacés ; le jeu
+//! ne s'en sert plus depuis la v243),
 //! `--volume <0..100>` (v213, volume des sons du navigateur dans Windows ; ensuite la
 //! commande `volume 0 <0..100>`).
 //!
-//! **Filtrage (v205)** : le jeu est tout public, donc une page qui n'est pas autorisée ne
-//! s'ouvre pas du tout — ni dans l'onglet, ni dans un cadre de la page. Voir `filtre`.
+//! **Filtrage (v205)** : une page qui n'est pas autorisée ne s'ouvre pas du tout — ni dans
+//! l'onglet, ni dans un cadre de la page. Voir `filtre`. (v243) Le jeu est interdit aux
+//! moins de 18 ans : le web s'ouvre sauf les interdits (liste noire), et le DNS passe par
+//! le DNS chiffré familial de Cloudflare, qui ne résout ni les sites pour adultes ni ceux
+//! des logiciels malveillants.
 //!
 //! Aucune fenêtre ne s'ouvre jamais : les liens « nouvel onglet » cliqués s'ouvrent dans
 //! l'écran, les fenêtres ouvertes par un script sont bloquées, `alert`/`confirm`/`prompt`
@@ -68,20 +72,27 @@ use cef::*;
 /// Script injecté dans chaque page : signale quand un champ de texte prend ou perd le
 /// focus (`__minelib_focus__0/1`), et l'adresse et l'état de la vidéo
 /// (`__minelib_state__{…}` : temps, pause, pub YouTube en cours, vidéo du lecteur), par des
-/// messages de la console que ce programme intercepte.
+/// messages de la console que ce programme intercepte. (v243) Après chaque clic, il redit
+/// son focus même inchangé : le jeu ne donne le clavier à un champ que juste après un clic.
+/// (v243) Une vidéo que le lecteur embarqué a renvoyée au site (`&mlb=site` : YouTube ne
+/// la permet pas ailleurs) y reste, même si YouTube enlève ce paramètre de l'adresse.
 const PAGE_JS: &str = r#"(()=>{if(window.__minelib)return;window.__minelib=1;
 const ed=e=>!!e&&(e.isContentEditable||e.tagName==='TEXTAREA'||(e.tagName==='INPUT'&&!/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/i.test(e.type||'')));
 const deep=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a;};
 let f=null;const focus=()=>{const v=ed(deep())?1:0;if(v!==f){f=v;console.log('__minelib_focus__'+v);}};
 document.addEventListener('focusin',focus,true);
 document.addEventListener('focusout',()=>setTimeout(focus,0),true);
+document.addEventListener('mousedown',()=>setTimeout(()=>{f=null;focus();},0),true);
 const L='https://viendax.github.io/minelib/lecteur';
+const SS=k=>{try{return sessionStorage.getItem(k);}catch(e){return null;}};
 const vid=u=>{try{const x=new URL(u,location.href);const h=x.hostname.toLowerCase();let i='';
 if(h==='youtu.be')i=x.pathname.split('/')[1]||'';
 else if(h==='www.youtube.com'||h==='youtube.com'||h==='m.youtube.com'){
 if(x.pathname==='/watch')i=x.searchParams.get('v')||'';
 else{const m=x.pathname.match(/^\/(shorts|live)\/([^\/?#]+)/);if(m)i=m[2];}}
 if(!/^[A-Za-z0-9_-]{11}$/.test(i))return '';
+if(x.searchParams.get('mlb')==='site'){try{sessionStorage.setItem('mlb_site_'+i,'1');}catch(e){}return '';}
+if(SS('mlb_site_'+i))return '';
 const t=parseInt(x.searchParams.get('t')||x.searchParams.get('start')||'0',10)||0;
 return L+'?v='+i+(t>0?'&t='+t:'');}catch(e){return '';}};
 if(/(^|\.)youtube\.com$/.test(location.hostname)){
@@ -753,7 +764,7 @@ wrap_resource_request_handler! {
                 }
             }
             // Mode restreint de YouTube : l'en-tête que Google documente pour les réseaux
-            // encadrés, sur les seuls noms qu'il indique.
+            // encadrés, sur les seuls noms qu'il indique. (v243) Coupé par défaut.
             if let Some(valeur) = self.restreint.entete() {
                 if filtre::hote(&url).is_some_and(|h| filtre::youtube(&h)) {
                     req.set_header_by_name(
@@ -762,11 +773,13 @@ wrap_resource_request_handler! {
                         1,
                     );
                 }
-                // SafeSearch : une recherche Google part toujours avec `safe=active`.
-                if filtre::recherche_google(&url) {
-                    if let Some(neuf) = filtre::avec_safe(&url) {
-                        req.set_url(Some(&CefString::from(neuf.as_str())));
-                    }
+            }
+            // SafeSearch : une recherche Google part toujours avec `safe=active`. (v243)
+            // Gardé pour un jeu interdit aux moins de 18 ans : les images d'une recherche
+            // viennent des serveurs de Google, que la liste noire ne voit pas.
+            if filtre::recherche_google(&url) {
+                if let Some(neuf) = filtre::avec_safe(&url) {
+                    req.set_url(Some(&CefString::from(neuf.as_str())));
                 }
             }
             ReturnValue::CONTINUE
@@ -880,9 +893,16 @@ wrap_browser_process_handler! {
     // Windows, une attente de 4 ms dure souvent 15,6 ms (résolution par défaut de
     // l'horloge), et l'image d'un écran tombait alors presque à zéro par moments (essai :
     // 1806 images en 46 s avec 4 ms, 10 avec 16 ms) : les micro-coupures.
+    //
+    // (v243) C'est aussi là que le DNS chiffré familial de Cloudflare est mis en place, une
+    // fois Chromium prêt (`dns_doh`).
     struct Pompe;
 
     impl BrowserProcessHandler {
+        fn on_context_initialized(&self) {
+            dns_doh();
+        }
+
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
             if let Some(tx) = POMPE.get() {
                 let _ = tx.send(Cmd::Pump(delay_ms));
@@ -890,6 +910,48 @@ wrap_browser_process_handler! {
         }
     }
 }
+
+/// (v243) Le DNS du navigateur passe, chiffré, par le DNS familial de Cloudflare
+/// (« 1.1.1.1 for Families », filtre logiciels malveillants et contenus pour adultes) : un
+/// site pour adultes ne se résout pas, donc ne s'ouvre pas, même absent des listes. Mode
+/// « secure » : pas de repli sur le DNS de la machine. Les règles de SafeSearch
+/// (`host-resolver-rules`) passent avant. Limite : derrière un proxy, c'est le proxy qui
+/// résout les noms, et ce filtre-ci ne joue pas (la liste noire, si).
+fn dns_doh() {
+    let Some(prefs) = preference_manager_get_global() else {
+        eprintln!("DNS familial : préférences de Chromium introuvables");
+        return;
+    };
+    let mut ok = true;
+    for (nom, valeur) in [
+        ("dns_over_https.mode", "secure"),
+        ("dns_over_https.templates", DOH_FAMILLE),
+    ] {
+        let Some(mut v) = value_create() else {
+            ok = false;
+            continue;
+        };
+        v.set_string(Some(&CefString::from(valeur)));
+        // Une chaîne vide, pas `default()` : celle-ci passe un pointeur nul, et CEF refuse
+        // alors tout sans rien dire (vu le 24/11/2026).
+        let mut erreur = CefString::from("");
+        if prefs.set_preference(Some(&CefString::from(nom)), Some(&mut v), Some(&mut erreur)) != 1 {
+            eprintln!("DNS familial : {nom} non réglé ({erreur})");
+            ok = false;
+        }
+    }
+    let mode = prefs
+        .preference(Some(&CefString::from("dns_over_https.mode")))
+        .map(|v| CefString::from(&v.string()).to_string())
+        .unwrap_or_default();
+    eprintln!(
+        "DNS familial de Cloudflare : {} (mode {mode})",
+        if ok { "en place" } else { "PAS en place" }
+    );
+}
+
+/// (v243) Le DNS chiffré familial de Cloudflare (adresse documentée par Cloudflare).
+const DOH_FAMILLE: &str = "https://family.cloudflare-dns.com/dns-query";
 
 wrap_app! {
     struct BrowserApp {
@@ -915,23 +977,21 @@ wrap_app! {
                 // (v205) Mode restreint de YouTube et SafeSearch aussi par le DNS, la
                 // seconde méthode que Google documente : les noms qu'il indique (et aucun
                 // autre) pointent vers son hôte restreint. Deux barrières valent mieux
-                // qu'une, et celle-ci tient même si une page contourne l'en-tête.
-                if let Some(cible) = self.restreint.hote_dns() {
-                    let mut regles: Vec<String> = filtre::HOTES_YOUTUBE
+                // qu'une, et celle-ci tient même si une page contourne l'en-tête. (v243)
+                // SafeSearch toujours, le mode restreint de YouTube seulement s'il est
+                // demandé. Ces règles passent avant le DNS, chiffré ou non (voir `Pompe`).
+                let mut regles: Vec<String> = match self.restreint.hote_dns() {
+                    Some(cible) => filtre::HOTES_YOUTUBE
                         .iter()
                         .map(|h| format!("MAP {h} {cible}"))
-                        .collect();
-                    regles.push("MAP www.google.com forcesafesearch.google.com".into());
-                    cl.append_switch_with_value(
-                        Some(&CefString::from("host-resolver-rules")),
-                        Some(&CefString::from(regles.join(",").as_str())),
-                    );
-                    // Le DNS chiffré du navigateur passerait à côté de ces règles.
-                    cl.append_switch_with_value(
-                        Some(&CefString::from("disable-features")),
-                        Some(&CefString::from("DnsOverHttps,DnsOverHttpsUpgrade")),
-                    );
-                }
+                        .collect(),
+                    None => Vec::new(),
+                };
+                regles.push("MAP www.google.com forcesafesearch.google.com".into());
+                cl.append_switch_with_value(
+                    Some(&CefString::from("host-resolver-rules")),
+                    Some(&CefString::from(regles.join(",").as_str())),
+                );
             }
         }
     }

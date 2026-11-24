@@ -2285,11 +2285,10 @@ impl Session {
         );
         // Hitbox pour la physique.
         self.player.solids = self.shown.iter().map(|s| s.0.hitbox()).collect();
-        // (v205) Le jeu est tout public : en ligne, seuls YouTube et Google s'ouvrent sur
-        // un écran. En solo, la liste noire si elle est installée (voir
-        // `claude/ecran-en-jeu.md`), sinon la même liste blanche.
+        // (v243) Le jeu est interdit aux moins de 18 ans : le web sauf les interdits (liste
+        // noire), en solo comme en ligne. En ligne, une session du navigateur à part (son
+        // propre compte, s'il s'y connecte) ; chacun voit ses pubs.
         let en_ligne = self.build.is_some() || self.net.is_some();
-        // (v208) En ligne : liste blanche, et ni compte ni session gardés (chacun ses pubs).
         let mode = if en_ligne { "en_ligne" } else { self.solo_filter() };
         self.displays.set_filter(mode);
         // Une page par écran : onglets ouverts et fermés avec les écrans.
@@ -2403,6 +2402,18 @@ impl Session {
         if self.screen_broke && !self.keys.held(input, Action::Attack) {
             self.screen_broke = false;
         }
+        // (v243) Où le regard coupe chaque écran, à toute distance : les boutons d'un écran
+        // n'apparaissent que si le regard franchit son bord, pas en marchant vers lui.
+        {
+            let eye = self.player.eye();
+            let dir = self.player.look_dir();
+            let rays: Vec<(u32, Option<[f32; 2]>)> = self
+                .shown
+                .iter()
+                .map(|(s, _)| (s.id(), crate::screen::ray_uv(&s.anchor(), eye, dir)))
+                .collect();
+            self.displays.rays(&rays);
+        }
         self.displays.hover(aimed);
         self.displays.update(dt);
         // Pages refusées par le filtre : un mot au joueur, une fois par raison.
@@ -2412,7 +2423,9 @@ impl Session {
                 2 => "pas de machine du réseau local sur un écran",
                 4 => "site filtré",
                 5 => "pas de connexion à un compte sur les écrans en ligne",
-                _ => "site hors de la liste autorisée (écran public)",
+                6 => "Twitch et Vimeo ne se lisent pas sur les écrans (leurs vidéos demandent \
+                      des codecs que le navigateur n'a pas)",
+                _ => "site hors de la liste autorisée",
             };
             self.chat.say(format!("Écran : {quoi}."), chat::YELLOW);
         }
@@ -2422,19 +2435,14 @@ impl Session {
     /// Regarder ensemble (construction en ligne) : ce que rapportent les pages, messages
     /// aux joueurs proches (par le canal de la voix), pages amenées à la vidéo partagée.
     /// (v205) En solo : la liste noire si son fichier est installé, sinon la liste
-    /// blanche. Jamais « tout ouvert » par défaut.
+    /// blanche. (v243) Le jeu est interdit aux moins de 18 ans : la liste noire toujours
+    /// (le navigateur en a une copie intégrée), en solo comme en ligne.
     fn solo_filter(&mut self) -> &'static str {
         if let Some(m) = self.solo_filtre {
             return m;
         }
-        let liste = minelib_assets::data_dir()
-            .join("filtres")
-            .join("liste_noire.txt");
-        let m = if liste.is_file() { "noire" } else { "blanche" };
-        log::info!(
-            "écrans vidéo : filtrage en solo, liste {m} ({})",
-            liste.display()
-        );
+        let m = "noire";
+        log::info!("écrans vidéo : filtrage en solo, liste {m}");
         self.solo_filtre = Some(m);
         m
     }
@@ -10197,10 +10205,14 @@ impl Session {
                     self.displays.reveal(id),
                     f32::from(self.displays.history_of(id)),
                 ];
+                // (v243) Le curseur et l'onde d'un appui, dessinés au-dessus des boutons.
+                let (cursor, ripple) = self.displays.marks(id);
                 (
                     id,
                     minelib_render::ScreenAnchor {
                         reveal,
+                        cursor,
+                        ripple,
                         ..s.0.anchor()
                     },
                 )

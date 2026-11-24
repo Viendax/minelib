@@ -27,6 +27,10 @@ struct VIn {
     // seule pour tous, en `x` ; (v213) en `y`, les pages où aller : précédente (1),
     // suivante (2) — sans elles, retour et suivant sont grisés.
     @location(2) reveal: vec2<f32>,
+    // (v243) Curseur (x, y, 0 aucun / 1 / 2 clavier dans la page) et onde d'un appui
+    // (x, y, âge 0..1, négatif : aucune), dessinés au-dessus des boutons.
+    @location(3) cursor: vec4<f32>,
+    @location(4) ripple: vec4<f32>,
 };
 
 struct VOut {
@@ -34,6 +38,8 @@ struct VOut {
     @location(0) uv: vec2<f32>,
     @location(1) world: vec3<f32>,
     @location(2) @interpolate(flat) reveal: vec2<f32>,
+    @location(3) @interpolate(flat) cursor: vec4<f32>,
+    @location(4) @interpolate(flat) ripple: vec4<f32>,
 };
 
 @vertex
@@ -43,6 +49,8 @@ fn vs_main(v: VIn) -> VOut {
     o.uv = v.uv;
     o.world = v.pos;
     o.reveal = v.reveal;
+    o.cursor = v.cursor;
+    o.ripple = v.ripple;
     return o;
 }
 
@@ -177,9 +185,44 @@ fn buttons(uv: vec2<f32>, reveal: vec2<f32>, dessous: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
+// (v243) Le curseur et l'onde d'un appui, en pixels de la page (1280 × 720), au-dessus de
+// tout. Avant, le jeu les dessinait dans l'image de la page : sous les boutons, et toute
+// l'image repartait à la carte graphique à chaque mouvement du réticule.
+const PAGE_PX = vec2<f32>(1280.0, 720.0);
+
+fn anneau(px: vec2<f32>, c: vec2<f32>, rayon: f32, epais: f32, couleur: vec3<f32>, force: f32, aa: f32, dessous: vec3<f32>) -> vec3<f32> {
+    let d = abs(length(px - c) - rayon) - epais * 0.5;
+    let a = (1.0 - smoothstep(-aa, aa, d)) * force;
+    return mix(dessous, couleur, a);
+}
+
+fn marks(uv: vec2<f32>, cursor: vec4<f32>, ripple: vec4<f32>, dessous: vec3<f32>) -> vec3<f32> {
+    let px = uv * PAGE_PX;
+    let aa = max(length(fwidth(px)) * 0.7071, 1e-4);
+    var col = dessous;
+    // Onde : un cercle qui s'agrandit et s'efface (blanc vers le noir, comme avant).
+    if ripple.z >= 0.0 {
+        let t = clamp(ripple.z, 0.0, 1.0);
+        let gris = pow(1.0 - t, 2.2);
+        col = anneau(px, ripple.xy * PAGE_PX, 8.0 + 40.0 * t, 3.0, vec3<f32>(gris), 1.0, aa, col);
+    }
+    // Curseur : petit anneau blanc, bleu quand le clavier va dans la page (couleurs de la
+    // page, sRGB, passées en linéaire comme la texture).
+    if cursor.z > 0.5 {
+        let bleu = vec3<f32>(0.0452, 0.402, 1.0);
+        let c = select(vec3<f32>(1.0), bleu, cursor.z > 1.5);
+        col = anneau(px, cursor.xy * PAGE_PX, 7.0, 2.0, c, 1.0, aa, col);
+    }
+    return col;
+}
+
+fn overlay(i: VOut, page: vec3<f32>) -> vec3<f32> {
+    return marks(i.uv, i.cursor, i.ripple, buttons(i.uv, i.reveal, page));
+}
+
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(buttons(i.uv, i.reveal, texel(i).rgb), 1.0);
+    return vec4<f32>(overlay(i, texel(i).rgb), 1.0);
 }
 
 struct TaaOut {
@@ -203,14 +246,7 @@ fn fs_taa_world(i: VOut) -> TaaOut {
     let cur = g.cur_view_proj * p;
     let off = (jit.xy / jit.w - cur.xy / cur.w) * vec2<f32>(0.5, -0.5) * g.screen.xy;
     let uv = i.uv + dpdx(i.uv) * off.x + dpdy(i.uv) * off.y;
-    o.color = vec4<f32>(
-        buttons(
-            i.uv,
-            i.reveal,
-            textureSampleLevel(vid, vid_s, uv, 0.0).rgb,
-        ),
-        1.0,
-    );
+    o.color = vec4<f32>(overlay(i, textureSampleLevel(vid, vid_s, uv, 0.0).rgb), 1.0);
     o.motion = NO_HISTORY;
     return o;
 }
