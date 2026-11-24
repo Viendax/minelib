@@ -404,8 +404,14 @@ impl Party {
             return;
         };
         if Some(&v) != shared.as_ref() {
-            // Une autre vidéo ouverte sur cette page (clic, vidéo suivante, `/yt`).
-            if before.as_ref() != Some(&v) {
+            // Une autre vidéo ouverte sur cette page (clic, vidéo suivante, `/yt`). (v300) Aussi
+            // quand la page la montrait déjà mais en attendant (pub, regard, chargement) : la
+            // première vidéo lue n'était jamais partagée (ni dans la playlist) si elle avait
+            // attendu le regard avant de démarrer.
+            let deja = prev.as_ref().is_some_and(|s| {
+                s.page.video.as_ref() == Some(&v) && !s.page.ad && s.page.t >= 0.0
+            });
+            if !deja {
                 self.local(id, v, page.t, page.paused, page.short, me);
             }
             return;
@@ -496,6 +502,18 @@ impl Party {
         self.changed.push(id);
     }
 
+    /// (v300) La même vidéo, changée ici (pause ou reprise depuis la playlist) : la page, qui
+    /// la montre déjà, y est amenée sans être rechargée (temps et pause), comme pour un geste
+    /// reçu d'un autre.
+    fn change(&mut self, id: u32, video: Video) {
+        if let Some(t) = self.tracks.get_mut(&id) {
+            t.video = video;
+            t.age = 0.0;
+            t.applied = None;
+            self.changed.push(id);
+        }
+    }
+
     fn next_seq(&self, id: u32) -> u32 {
         self.tracks
             .get(&id)
@@ -563,6 +581,8 @@ impl Party {
             #[serde(default)]
             reprend: Option<usize>,
             #[serde(default)]
+            bascule: Option<usize>,
+            #[serde(default)]
             v: Option<String>,
         }
         let o: Ordre = serde_json::from_str(json).ok()?;
@@ -597,7 +617,8 @@ impl Party {
             .or(o.monte.map(|i| (Geste::Monte, i)))
             .or(o.descend.map(|i| (Geste::Descend, i)))
             .or(o.retire.map(|i| (Geste::Retire, i)))
-            .or(o.reprend.map(|i| (Geste::Reprend, i)));
+            .or(o.reprend.map(|i| (Geste::Reprend, i)))
+            .or(o.bascule.map(|i| (Geste::Bascule, i)));
         let (Some((g, i)), Some(vid)) = (geste, o.v) else {
             return None;
         };
@@ -616,19 +637,35 @@ impl Party {
         video.seq = self.next_seq(id);
         video.by = me.chars().take(32).collect();
         match g {
-            Geste::Reprend => {
+            Geste::Reprend | Geste::Bascule => {
                 if i != pos {
                     return None;
                 }
                 // Celle en cours, en pause (la page est partie ailleurs, ou mise en pause) :
                 // elle reprend pour tous là où elle en était, et la page y revient. Pas en
-                // pause : la page seule y revient, au temps de tous.
-                if !video.paused {
+                // pause : la page seule y revient, au temps de tous. (v300) Un clic sur elle
+                // dans la playlist (`bascule`), la page dessus : pause, puis reprise.
+                let ici = self
+                    .pages
+                    .get(&id)
+                    .is_some_and(|s| s.page.video.as_deref() == Some(video.id.as_str()));
+                if !video.paused && !ici {
                     return Some(Act::Open(id, open_url(&video, t.now())));
                 }
-                video.paused = false;
-                log::info!("regarder ensemble : écran {id}, {vid} reprise à {:.1} s", video.t);
-                self.give(id, video);
+                if !video.paused && g == Geste::Reprend {
+                    return None;
+                }
+                video.paused = !video.paused;
+                log::info!(
+                    "regarder ensemble : écran {id}, {vid} {} à {:.1} s",
+                    if video.paused { "mise en pause depuis la playlist" } else { "reprise" },
+                    video.t
+                );
+                if ici {
+                    self.change(id, video);
+                } else {
+                    self.give(id, video);
+                }
                 return None;
             }
             Geste::Joue => {
@@ -1158,6 +1195,7 @@ enum Geste {
     Descend,
     Retire,
     Reprend,
+    Bascule,
 }
 
 /// Joueurs à moins de `range` de `p`.
@@ -1844,6 +1882,41 @@ mod tests {
         assert_eq!(v.lus.len() + v.queue.len(), MAX_LISTE);
         assert!(v.valid());
         assert_eq!(v.queue, s(&[a, c, d]));
+    }
+
+    /// (v300) La première vidéo lue est dans la playlist même si elle a attendu le regard
+    /// (« en pub ») avant de démarrer ; un clic sur elle dans la playlist la met en pause, un
+    /// autre la reprend, sans recharger la page.
+    #[test]
+    fn la_premiere_video_est_dans_la_playlist_et_un_clic_la_met_en_pause() {
+        let mut p = Party::new();
+        let ecran = screen_at(0);
+        let id = ecran.id();
+        let etat = |t: f32, pause: bool, pub_: bool| {
+            format!(
+                r#"{{"u":"{}","t":{t},"p":{pause},"a":{pub_},"i":"{X}","e":false}}"#,
+                watch_url(X, 0.0)
+            )
+        };
+        p.observe(id, &etat(0.0, true, true), A);
+        assert!(p.liste(id).is_none(), "elle attend le regard");
+        p.observe(id, &etat(0.5, false, false), A);
+        assert_eq!(p.liste(id).map(|l| l.1), Some(X), "la première vidéo lue est dans la playlist");
+        p.update(0.05, &[ecran], &[]);
+        // Un clic sur elle : pause, sans recharger la page.
+        let bascule = format!(r#"{{"bascule":0,"v":"{X}"}}"#);
+        assert_eq!(p.order(id, &bascule, A, false), None);
+        assert!(p.liste(id).unwrap().3);
+        let acts = p.update(0.05, &[ecran], &[]);
+        assert!(matches!(&acts[..], [Act::Eval(_, js)] if js.contains("pauseVideo()")), "{acts:?}");
+        p.observe(id, &etat(0.6, true, false), A);
+        p.update(2.0, &[ecran], &[]);
+        assert!(p.liste(id).unwrap().3, "toujours en pause");
+        // Un autre : reprise.
+        assert_eq!(p.order(id, &bascule, A, false), None);
+        assert!(!p.liste(id).unwrap().3);
+        let acts = p.update(0.05, &[ecran], &[]);
+        assert!(matches!(&acts[..], [Act::Eval(_, js)] if js.contains("playVideo()")), "{acts:?}");
     }
 
     /// (v292) Depuis la recherche ouverte par la playlist, un clic **lance** la vidéo (demande

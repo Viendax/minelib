@@ -16,14 +16,15 @@
   (v291) La playlist entière : les vidéos déjà vues (au-dessus : on remonte pour les voir),
   celle en cours, celles à suivre. Un clic sur une vidéo la lance ; ▲ ▼ la montent ou la
   descendent d'un rang (vues comprises) ; × la retire. Partir sur un autre site met celle en
-  cours en pause : un clic sur elle la reprend là où elle en était.
+  cours en pause : un clic sur elle la reprend là où elle en était. (v300) Un clic sur celle
+  en cours la met en pause, un autre la reprend.
 
   Le jeu lui dit tout par `__mlb.etat({f, c, p, i, h, r, l})` : la playlist (numéros), le
   rang de celle en cours, si elle est en pause, si la page de l'écran la montre, les pages où
   aller (1 retour, 2 suivant), le site de la recherche ouverte, en ligne ou non. Elle répond
   par des ordres : `{"nav":"google"|"twitch"|"retour"|"suivant"}`,
   `{"recherche":"yt"|"dm"|"vm"|false}`,
-  `{"joue"|"monte"|"descend"|"retire"|"reprend":rang,"v":numéro}`.
+  `{"joue"|"monte"|"descend"|"retire"|"bascule":rang,"v":numéro}`.
 -->
 <style>
 [hidden]{display:none!important}
@@ -117,7 +118,7 @@ const bouton=(cl,txt,titre,f)=>{const b=document.createElement('button');if(cl)b
 const montre=()=>{const l=$('liste');const haut=l.scrollTop;l.textContent='';
   liste.forEach((v,i)=>{info(v);const o=infos[v]||{titre:'',image:''};
     const d=document.createElement('div');
-    const rep=i===cour&&(pause||!ici);
+    const rep=i===cour;
     d.className='v'+(i<cour?' lu':i===cour?' cours':'')+(i===cour&&pause?' pause':'')+(rep?' reprendre':'');
     const im=document.createElement('div');im.className='im';
     const img=document.createElement(o.image?'img':'div');img.className='img';
@@ -128,7 +129,7 @@ const montre=()=>{const l=$('liste');const haut=l.scrollTop;l.textContent='';
     const nom=document.createElement('div');nom.className='nom';nom.textContent=o.titre||'…';t.append(nom);
     if(i<=cour){const et=document.createElement('div');et.className='et';
       et.textContent=i<cour?'Déjà vue':pause?'⏸ En pause : clique pour reprendre'
-        :ici?'▶ En cours':'▶ En cours : clique pour y revenir';t.append(et);}
+        :ici?'▶ En cours : clique pour mettre en pause':'▶ En cours : clique pour y revenir';t.append(et);}
     const fl=document.createElement('div');fl.className='fl';
     const h=bouton('','▲','Monter',()=>ordre({monte:i,v:v}));h.disabled=i===0;
     const b=bouton('','▼','Descendre',()=>ordre({descend:i,v:v}));b.disabled=i===liste.length-1;
@@ -136,7 +137,7 @@ const montre=()=>{const l=$('liste');const haut=l.scrollTop;l.textContent='';
     const x=bouton('x','×','Retirer',()=>ordre({retire:i,v:v}));
     d.append(im,t,fl,x);
     if(i!==cour)d.addEventListener('click',()=>ordre({joue:i,v:v}));
-    else if(rep)d.addEventListener('click',()=>ordre({reprend:i,v:v}));
+    else d.addEventListener('click',()=>ordre({bascule:i,v:v}));
     l.append(d);});
   const vide=document.createElement('div');vide.id='vide';
   vide.textContent='Rien à suivre. Cherche une vidéo et clique dessus : elle se mettra ici.';
