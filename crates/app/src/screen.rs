@@ -1562,10 +1562,14 @@ impl Browser {
         let data = minelib_assets::data_dir();
         let logs = data.join("logs");
         let _ = std::fs::create_dir_all(&logs);
-        // (v208) En ligne, une session à part : celle du solo (et son compte) n'y est pas.
+        // (v208) En ligne, une session à part : celle du solo (et son compte) n'y était pas.
         // (v243) On peut s'y connecter à un compte (jeu interdit aux moins de 18 ans).
+        // (v251) Une seule session, en solo comme en ligne (demande du propriétaire) : on
+        // reste connecté à YouTube en passant de l'un à l'autre. Rien n'en sort : chaque
+        // joueur a son navigateur, et « regarder ensemble » ne partage qu'un numéro de
+        // vidéo ; le compte (et le Premium) ne sert qu'à celui à qui il est.
         let en_ligne = filtre == "en_ligne";
-        let base = if en_ligne { "cef-en-ligne" } else { "cef-cache" };
+        let base = "cef-cache";
         let session = match cache {
             0 => base.to_string(),
             n => format!("{base}-{}", n + 1),
