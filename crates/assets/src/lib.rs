@@ -147,6 +147,9 @@ pub struct Options {
     /// oui seulement quand ce PC sert déjà de passeur (sa box laisse entrer l'UDP, son
     /// adresse est déjà donnée aux joueurs des parties qu'il porte).
     pub host_direct: Option<bool>,
+    /// (v298) Invitation reçue d'un ami : la ligne de son fichier `invitation.txt` (nœud et
+    /// clé de son relais). Ce relais est joint directement, sans la liste du DHT.
+    pub invitation: String,
     /// Clé du relais retenue au premier contact (hexadécimal, vide = pas encore).
     pub relay_key: String,
     /// Dernier pseudo utilisé (prérempli à la connexion).
@@ -191,6 +194,7 @@ impl Default for Options {
             relay: "auto".into(),
             garant: true,
             host_direct: None,
+            invitation: String::new(),
             relay_key: String::new(),
             pseudo: String::new(),
         }
@@ -250,6 +254,9 @@ impl Options {
                     "false" => Some(false),
                     _ => None,
                 };
+            }
+            if let Some(v) = kv.get("invitation") {
+                o.invitation = v.trim().to_string();
             }
             if let Some(v) = kv.get("relay_key") {
                 o.relay_key = v.trim().to_string();
@@ -312,7 +319,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\ninvitation={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -337,7 +344,8 @@ impl Options {
                     Some(true) => "true",
                     Some(false) => "false",
                     None => "auto",
-                }
+                },
+                self.invitation.replace('\n', " ")
             ),
         )?;
         Ok(())
@@ -955,6 +963,32 @@ mod tests {
 
     /// (v213) Le son des écrans : 50 % par défaut ; l'ancien défaut (100 %) y passe, un
     /// réglage choisi reste, et la nouvelle clé est relue telle quelle.
+    /// (v298) `hote_direct` a trois valeurs (rien ou `auto`, `true`, `false`) et
+    /// l'invitation d'un ami est gardée telle quelle quand les options sont réécrites.
+    #[test]
+    fn l_hote_direct_et_l_invitation_se_relisent() {
+        let dir = std::env::temp_dir().join(format!("minelib-hote-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("options.txt");
+        assert_eq!(Options::load(&dir.join("absent.txt")).host_direct, None);
+        let invite = format!("{} {} Relais d'un ami", "ab".repeat(32), "cd".repeat(32));
+        for (texte, voulu) in [
+            ("hote_direct=true\n", Some(true)),
+            ("hote_direct=false\n", Some(false)),
+            ("hote_direct=auto\n", None),
+            ("volume=1\n", None),
+        ] {
+            fs::write(&f, format!("{texte}invitation={invite}\n")).unwrap();
+            let o = Options::load(&f);
+            assert_eq!(o.host_direct, voulu, "{texte}");
+            assert_eq!(o.invitation, invite);
+            o.save(&f).unwrap();
+            let again = Options::load(&f);
+            assert_eq!((again.host_direct, again.invitation.as_str()), (voulu, invite.as_str()));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn le_son_des_ecrans_est_a_50_par_defaut() {
         let dir = std::env::temp_dir().join(format!("minelib-tele-{}", std::process::id()));

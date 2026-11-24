@@ -69,6 +69,45 @@ fn known_relays(dir: &std::path::Path) -> Vec<minelib_p2p::Ad> {
 /// connecte : voir `remember_relay`).
 static CHOSEN: std::sync::Mutex<Option<minelib_p2p::Ad>> = std::sync::Mutex::new(None);
 
+/// (v298) Le relais que ce PC est devenu, faute d'en trouver un (pour l'invitation).
+static OWN: std::sync::Mutex<Option<minelib_p2p::Ad>> = std::sync::Mutex::new(None);
+
+/// (v298) Relais des invitations reçues (`invitation=` dans `options.txt`).
+static INVITED: std::sync::Mutex<Vec<minelib_p2p::Ad>> = std::sync::Mutex::new(Vec::new());
+
+/// (v298) Invitation reçue d'un ami : la ligne de son fichier `invitation.txt` (nœud et clé
+/// de son relais, puis son nom). Ce relais est joint directement à chaque lancement, avant
+/// les relais déjà utilisés et sans la liste du DHT : un joueur tout neuf, qui n'a encore
+/// joué nulle part, ne dépend plus de cette liste ouverte à tous, que n'importe qui peut
+/// fausser.
+pub fn set_invitation(text: &str) {
+    *INVITED.lock().unwrap() = minelib_p2p::parse_relays(text);
+}
+
+/// (v298) Écrit `invitation.txt` à côté des options : la ligne à donner à un ami pour qu'il
+/// rejoigne le relais où ce compte vient de se connecter (celui de ce PC s'il en est un).
+fn write_invitation(dir: &std::path::Path) {
+    let ad = CHOSEN
+        .lock()
+        .unwrap()
+        .clone()
+        .or_else(|| OWN.lock().unwrap().clone());
+    let Some(ad) = ad else {
+        return;
+    };
+    let text = format!(
+        "# Invitation Minelib : pour qu'un ami rejoigne ton relais sans passer par la liste\n\
+         # publique des relais (ouverte à tous, donc falsifiable).\n\
+         # Il ajoute cette ligne à son fichier options.txt :\n\
+         invitation={}",
+        minelib_p2p::format_relays(&[ad])
+    );
+    let path = dir.with_file_name("invitation.txt");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 /// (v279) Le compte vient de se connecter au relais choisi à ce lancement : il est retenu,
 /// en tête. Seulement à ce moment-là : pour connecter un compte il faut rendre son coffre,
 /// que seul son vrai relais détient ; un faux relais glissé dans la liste du DHT qui se
@@ -99,7 +138,9 @@ fn pinned_relays(
     failed: &[[u8; 32]],
 ) -> Vec<minelib_p2p::Ad> {
     let mut list = minelib_p2p::official();
-    for a in known_relays(dir) {
+    // (v298) Puis les invitations reçues, puis les relais déjà utilisés.
+    let invited = INVITED.lock().unwrap().clone();
+    for a in invited.into_iter().chain(known_relays(dir)) {
         if !list.iter().any(|o| o.node == a.node) {
             list.push(a);
         }
@@ -315,13 +356,15 @@ fn auto_relay(
         // Pseudos uniques avec les autres relais du DHT.
         h.set_whois(minelib_relay::federated_whois(node, public));
         h.set_peer_servers(minelib_relay::federated_servers(node, public));
-        minelib_p2p::publish(minelib_p2p::Ad {
+        let ad = minelib_p2p::Ad {
             node: node.id(),
             noise: public,
             name: "Relais d'un joueur".into(),
             since: minelib_p2p::now(),
             seen: minelib_p2p::now(),
-        });
+        };
+        *OWN.lock().unwrap() = Some(ad.clone());
+        minelib_p2p::publish(ad);
     });
     Ok((mine.to_string(), Some(public)))
 }
@@ -865,6 +908,8 @@ impl Accounts {
                     // (v279) Ce relais détient bien le compte : il sera joint directement
                     // aux prochains lancements, quoi que dise la liste du DHT.
                     remember_relay(&self.relay_dir);
+                    // (v298) Et la ligne à donner à un ami pour qu'il le rejoigne.
+                    write_invitation(&self.relay_dir);
                     // Compte gardé sur ce PC : connexion automatique au prochain lancement.
                     if let Some((p, w)) = self.sent.take() {
                         self.login_secret = Some((p.clone(), w.clone()));
@@ -2165,6 +2210,19 @@ mod relay_tests {
         // Ni soi-même (nœud ou clé de son propre relais), ni un relais déjà essayé.
         let pinned = pinned_relays(&dir, [29; 32], Some([128; 32]), &[[27; 32]]);
         assert_eq!(nodes(pinned), vec![26, 25, 24, 23, 22]);
+        // (v298) Une invitation reçue passe avant les relais déjà utilisés ; et le relais
+        // où le compte se connecte est écrit dans `invitation.txt`, relisible tel quel par
+        // l'ami qui colle la ligne dans ses options.
+        set_invitation(&minelib_p2p::format_relays(&[ad(77)]));
+        let pinned = pinned_relays(&dir, [29; 32], Some([128; 32]), &[[27; 32]]);
+        assert_eq!(nodes(pinned), vec![77, 26, 25, 24, 23, 22]);
+        set_invitation("");
+        *CHOSEN.lock().unwrap() = Some(ad(5));
+        write_invitation(&dir);
+        let text = std::fs::read_to_string(dir.with_file_name("invitation.txt")).unwrap();
+        let line = text.lines().find_map(|l| l.strip_prefix("invitation=")).expect("la ligne");
+        let back = minelib_p2p::parse_relays(line);
+        assert_eq!((back.len(), back[0].node, back[0].noise), (1, [5; 32], [105; 32]));
         *CHOSEN.lock().unwrap() = None;
         let _ = std::fs::remove_dir_all(root);
     }

@@ -432,6 +432,7 @@ impl Game {
         let keys = keys::Bindings::load(&paths.root.join("keys.txt"));
         let options = Options::load(&paths.options);
         minelib_p2p::set_hosts_direct(options.host_direct);
+        account::set_invitation(&options.invitation);
         jobs::set_uniform_sharing(options.cpu_uniform);
         crate::audio::set_output(&options.audio_out);
         crate::voice::set_input(&options.audio_in);
