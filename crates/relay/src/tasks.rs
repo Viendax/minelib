@@ -8,7 +8,7 @@
 //! traite avec ce que les autres connexions y déposent (comme le faisaient les deux fils,
 //! voir `minelib_net::transport::Channel`), et attend sans fil quand il n'y a rien.
 //!
-//! Le traitement des demandes ne change pas (`handle`) ; seule la question posée aux
+//! Le traitement des demandes ne change pas (`handle_prepared`) ; seule la question posée aux
 //! autres relais à l'inscription d'un pseudo (qui attend le réseau) part sur un fil à
 //! part, pour ne pas bloquer les autres connexions.
 
@@ -26,7 +26,7 @@ use tokio::sync::mpsc::{
     error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
 
-use super::{err, handle, leave_room, party_leave, taken_elsewhere, Conn, Session, State};
+use super::{err, leave_room, party_leave, taken_elsewhere, Conn, Session, State};
 
 /// Délai de la poignée de main.
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -403,7 +403,21 @@ async fn serve_loop(link: &mut Link, state: &Arc<Mutex<State>>, peer: &str, id: 
             };
             match taken {
                 Some(t) => Some(t),
-                None => handle(req, state, &mut session, peer, id),
+                None => {
+                    // (v276) Le mot de passe d'une connexion ou d'une inscription est
+                    // vérifié ou haché ici, sur un fil à part : le relais n'attend pas.
+                    let prepared =
+                        if matches!(req, Request::Login { .. } | Request::Register { .. }) {
+                            let (st, r, p) = (state.clone(), req.clone(), peer.to_string());
+                            tokio::task::spawn_blocking(move || crate::prepare(&r, &st, &p))
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                    crate::handle_prepared(req, prepared, state, &mut session, peer, id)
+                }
             }
         };
         if let Some(r) = resp {

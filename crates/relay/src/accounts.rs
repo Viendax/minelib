@@ -95,13 +95,10 @@ impl Account {
         token
     }
 
-    pub fn new(pseudo: &str, pubkey: [u8; 32], auth: &[u8; 32], vault: Vec<u8>) -> Result<Self> {
-        let salt = SaltString::generate(&mut rand::rngs::OsRng);
-        let auth_hash = Argon2::default()
-            .hash_password(auth, &salt)
-            .map_err(|e| anyhow!("{e}"))?
-            .to_string();
-        Ok(Self {
+    /// Compte neuf ; `auth_hash` : sa preuve de mot de passe hachée (`hash_auth`, v276 :
+    /// calculée hors du verrou du relais).
+    pub fn with_hash(pseudo: &str, pubkey: [u8; 32], auth_hash: String, vault: Vec<u8>) -> Self {
+        Self {
             pseudo: pseudo.to_string(),
             pubkey,
             auth_hash,
@@ -114,8 +111,18 @@ impl Account {
                 .map_or(0, |d| d.as_secs()),
             devices: Vec::new(),
             passkeys: Vec::new(),
-        })
+        }
     }
+}
+
+/// Argon2id de la preuve de mot de passe (format PHC). Plusieurs dizaines de millisecondes
+/// de calcul : jamais en tenant l'état du relais (voir `prepare` dans lib.rs).
+pub fn hash_auth(auth: &[u8; 32]) -> Result<String> {
+    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    Ok(Argon2::default()
+        .hash_password(auth, &salt)
+        .map_err(|e| anyhow!("{e}"))?
+        .to_string())
 }
 
 /// Vérifie la preuve de mot de passe ; sans compte, fait le même travail sur un faux

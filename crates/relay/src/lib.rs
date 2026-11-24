@@ -1394,6 +1394,10 @@ struct State {
     rooms: HashMap<u64, Room>,
     /// Passeurs de la voie rapide des parties FPS, et parties qu'ils portent.
     fast: passeurs::Fast,
+    /// (v276) Calcul fait d'avance, hors du verrou, pour la demande en cours (`prepare`),
+    /// et places de calcul de ce relais.
+    prepared: Option<Prepared>,
+    auth_gate: Arc<AuthGate>,
     /// Lobbies : n° → connexions (la première est l'hôte du lobby).
     parties: HashMap<u64, Vec<u64>>,
     /// (v242) Invitations dans un monde de construction, gardées (fichier) sans limite de
@@ -1550,6 +1554,8 @@ pub fn start(cfg: Config) -> Result<Handle> {
         conns: HashMap::new(),
         rooms: HashMap::new(),
         fast: passeurs::Fast::default(),
+        prepared: None,
+        auth_gate: Arc::default(),
         parties: HashMap::new(),
         invites: invites::Store::open(cfg_dir.join("invitations.bin")),
         next_id: 1,
@@ -8623,8 +8629,145 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
     })
 }
 
-fn handle(
+/// (v276) Calcul long d'une demande, fait avant de la traiter et sans tenir l'état du
+/// relais : l'Argon2 d'une preuve de mot de passe (plusieurs dizaines de millisecondes).
+/// Avant, il se faisait dans `handle`, verrou tenu : chaque connexion d'un compte (une par
+/// lancement du jeu) et chaque inscription figeaient tout le relais ce temps-là, parties
+/// FPS à 256 pas par seconde comprises, et quelques connexions par seconde, même fausses
+/// (pseudos inventés), suffisaient à le figer tout à fait.
+pub(crate) enum Prepared {
+    /// Connexion : `auth` comparée à `hash` (celui du compte à ce moment-là, ou aucun).
+    Login {
+        auth: [u8; 32],
+        hash: Option<String>,
+        ok: bool,
+    },
+    /// Inscription : `auth` hachée.
+    Register { auth: [u8; 32], hash: String },
+    /// Trop de calculs en attente : la demande est refusée, à refaire plus tard.
+    Busy,
+}
+
+/// Calculs d'Argon2 en même temps au plus sur ce relais (19 Mo de mémoire chacun) : la
+/// moitié des cœurs, le reste sert les joueurs. Et demandes en attente au plus : au-delà,
+/// `Prepared::Busy`.
+fn auth_slots() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)))
+}
+const AUTH_QUEUE: usize = 64;
+
+/// Places de calcul d'un relais : (prises, demandes en attente).
+#[derive(Default)]
+struct AuthGate {
+    count: Mutex<(usize, usize)>,
+    wake: std::sync::Condvar,
+}
+
+/// Une place parmi `auth_slots()`, rendue quand elle est lâchée.
+struct AuthSlot(Arc<AuthGate>);
+
+impl AuthSlot {
+    /// Attend une place ; aucune quand trop de demandes attendent déjà.
+    fn take(gate: Arc<AuthGate>) -> Option<Self> {
+        {
+            let mut g = gate.count.lock().unwrap();
+            if g.1 >= AUTH_QUEUE {
+                return None;
+            }
+            g.1 += 1;
+            while g.0 >= auth_slots() {
+                g = gate.wake.wait(g).unwrap();
+            }
+            g.1 -= 1;
+            g.0 += 1;
+        }
+        Some(Self(gate))
+    }
+}
+
+impl Drop for AuthSlot {
+    fn drop(&mut self) {
+        self.0.count.lock().unwrap().0 -= 1;
+        self.0.wake.notify_one();
+    }
+}
+
+/// Clés des essais de connexion d'un compte (limite d'essais) : le pseudo, et l'adresse
+/// du joueur (par le tunnel iroh, `peer` est sa vraie adresse).
+fn login_keys(pseudo: &str, peer: &str) -> Vec<String> {
+    let mut keys = vec![format!("pseudo:{}", pseudo.to_ascii_lowercase())];
+    if peer != "127.0.0.1" && peer != "::1" {
+        keys.push(format!("ip:{peer}"));
+    }
+    keys
+}
+
+/// (v276) Ce qu'il y a de long à calculer pour `req`, calculé ici (à appeler sur un fil
+/// qui peut attendre, sans tenir l'état) ; `None` quand il n'y a rien, ou que la demande
+/// sera refusée de toute façon (trop d'essais, pseudo pris, preuve de travail fausse…).
+pub(crate) fn prepare(req: &Request, state: &Mutex<State>, peer: &str) -> Option<Prepared> {
+    match req {
+        Request::Login { pseudo, auth, .. } => {
+            let (hash, gate) = {
+                let st = state.lock().unwrap();
+                if login_keys(pseudo, peer).iter().any(|k| st.limits.wait(k).is_some()) {
+                    return None;
+                }
+                let hash = st.accounts.load(pseudo).map(|r| r.auth_hash);
+                (hash, st.auth_gate.clone())
+            };
+            let Some(_slot) = AuthSlot::take(gate) else {
+                return Some(Prepared::Busy);
+            };
+            let ok = accounts::check_auth(hash.as_deref(), auth);
+            Some(Prepared::Login {
+                auth: *auth,
+                hash,
+                ok,
+            })
+        }
+        Request::Register {
+            pseudo,
+            pubkey,
+            auth,
+            vault,
+            pow,
+        } => {
+            let gate = {
+                let mut st = state.lock().unwrap();
+                if !proto::valid_pseudo(pseudo)
+                    || st.limits.register_wait(peer).is_some()
+                    || !crypto::pow_ok(pseudo, pubkey, *pow, st.cfg.pow_bits)
+                    || st.registry.lookup(pseudo).is_some()
+                    || vault.len() > 256
+                {
+                    return None;
+                }
+                st.auth_gate.clone()
+            };
+            let Some(_slot) = AuthSlot::take(gate) else {
+                return Some(Prepared::Busy);
+            };
+            let hash = accounts::hash_auth(auth).ok()?;
+            Some(Prepared::Register { auth: *auth, hash })
+        }
+        _ => None,
+    }
+}
+
+/// (v276) Trop de mots de passe à vérifier en même temps : à refaire dans un instant.
+fn busy() -> Response {
+    err(
+        ErrorCode::TooManyAttempts,
+        "Le relais est très demandé : réessaie dans quelques secondes.",
+    )
+}
+
+/// Traite une demande ; `prepared` : ce que `prepare` a calculé d'avance pour elle.
+pub(crate) fn handle_prepared(
     req: Request,
+    prepared: Option<Prepared>,
     state: &Mutex<State>,
     session: &mut Session,
     peer: &str,
@@ -8632,6 +8775,7 @@ fn handle(
 ) -> Option<Response> {
     let mut st = state.lock().unwrap();
     let st = &mut *st;
+    st.prepared = prepared;
     let room_request = matches!(
         req,
         Request::Servers { .. }
@@ -8802,8 +8946,14 @@ fn handle_account(
             if vault.len() > 256 {
                 return err(ErrorCode::Internal, "coffre trop grand");
             }
-            let record = match accounts::Account::new(&pseudo, pubkey, &auth, vault) {
-                Ok(r) => r,
+            // (v276) Preuve de mot de passe hachée d'avance, hors du verrou (`prepare`).
+            let hash = match st.prepared.take() {
+                Some(Prepared::Busy) => return busy(),
+                Some(Prepared::Register { auth: a, hash }) if a == auth => Ok(hash),
+                _ => accounts::hash_auth(&auth),
+            };
+            let record = match hash {
+                Ok(h) => accounts::Account::with_hash(&pseudo, pubkey, h, vault),
                 Err(e) => return err(ErrorCode::Internal, format!("{e:#}")),
             };
             if let Err(e) = st.accounts.save(&record) {
@@ -8832,10 +8982,7 @@ fn handle_account(
             device,
         } => {
             // Par le tunnel iroh, `peer` est la vraie adresse du joueur (préambule).
-            let mut keys = vec![format!("pseudo:{}", pseudo.to_ascii_lowercase())];
-            if peer != "127.0.0.1" && peer != "::1" {
-                keys.push(format!("ip:{peer}"));
-            }
+            let keys = login_keys(&pseudo, peer);
             if let Some(wait) = keys.iter().filter_map(|k| st.limits.wait(k)).max() {
                 return err(
                     ErrorCode::TooManyAttempts,
@@ -8844,7 +8991,18 @@ fn handle_account(
             }
             let record = st.accounts.load(&pseudo);
             // Même travail que le compte existe ou non (pas d'indice sur les pseudos).
-            let ok = accounts::check_auth(record.as_ref().map(|r| r.auth_hash.as_str()), &auth);
+            // (v276) Fait d'avance, hors du verrou (`prepare`), s'il l'a été pour cette
+            // preuve et ce hachage-là (le mot de passe n'a pas changé entre-temps).
+            let hash = record.as_ref().map(|r| r.auth_hash.as_str());
+            let ok = match st.prepared.take() {
+                Some(Prepared::Busy) => return busy(),
+                Some(Prepared::Login {
+                    auth: a,
+                    hash: h,
+                    ok,
+                }) if a == auth && h.as_deref() == hash => ok,
+                _ => accounts::check_auth(hash, &auth),
+            };
             let Some(mut record) = record.filter(|_| ok) else {
                 for k in &keys {
                     st.limits.failed(k);
@@ -14035,6 +14193,88 @@ mod tests {
             mbit(answer)
         );
         drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v276) Pendant qu'il vérifie un mot de passe (Argon2), le relais répond toujours aux
+    /// autres. Avant, il vérifiait en tenant son état : la demande de n'importe quel autre
+    /// joueur attendait la fin du calcul, à chaque connexion d'un compte.
+    #[test]
+    fn checking_a_password_does_not_hold_the_relay() {
+        use minelib_net::transport::Channel;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        fn open(addr: &str) -> Channel {
+            let (mut c, _) = Channel::connect(addr, Duration::from_secs(5)).unwrap();
+            c.send(&Request::Hello {
+                protocol: proto::PROTOCOL,
+                client: "essai".into(),
+            })
+            .unwrap();
+            assert!(matches!(c.recv::<Response>().unwrap(), Response::Hello { .. }));
+            c
+        }
+        let dir = std::env::temp_dir().join(format!("minelib-argon-{}", rand::random::<u32>()));
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        // Ce que dure une vérification sur cette machine (la deuxième : la première
+        // prépare aussi le faux hachage des comptes inconnus).
+        accounts::check_auth(None, &[1; 32]);
+        let t = Instant::now();
+        accounts::check_auth(None, &[1; 32]);
+        let argon = t.elapsed();
+        // Un joueur demande « tu es là ? » sans arrêt, et compte les réponses qui ont mis
+        // plus de la moitié de ce temps.
+        let stop = Arc::new(AtomicBool::new(false));
+        let asker = {
+            let (addr, stop) = (addr.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut c = open(&addr);
+                let (mut asked, mut slow) = (0u32, 0u32);
+                while !stop.load(Ordering::Relaxed) {
+                    let t = Instant::now();
+                    c.send(&Request::Ping).unwrap();
+                    assert!(matches!(c.recv::<Response>().unwrap(), Response::Pong));
+                    asked += 1;
+                    slow += u32::from(t.elapsed() > argon / 2);
+                }
+                (asked, slow)
+            })
+        };
+        // Pendant ce temps, six connexions de compte à la suite (comptes inconnus : le
+        // même calcul est fait, pour ne rien dire des pseudos).
+        let mut c = open(&addr);
+        std::thread::sleep(Duration::from_millis(50));
+        for i in 0..6u8 {
+            c.send(&Request::Login {
+                pseudo: format!("Inconnu{i}"),
+                auth: [i; 32],
+                totp: None,
+                hw: Vec::new(),
+                device: None,
+            })
+            .unwrap();
+            assert!(matches!(
+                c.recv::<Response>().unwrap(),
+                Response::Error {
+                    code: ErrorCode::WrongCredentials,
+                    ..
+                }
+            ));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (asked, slow) = asker.join().unwrap();
+        eprintln!("ARGON {argon:?} par vérification ; {slow} réponses lentes sur {asked}");
+        // État tenu pendant le calcul : à chacune des six connexions, la demande en cours
+        // aurait attendu presque tout ce temps (six réponses lentes au moins).
+        assert!(asked > 6, "{asked} demandes");
+        assert!(slow <= 1, "{slow} réponses sur {asked} ont attendu plus de {:?}", argon / 2);
+        drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }
 
