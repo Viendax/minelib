@@ -297,6 +297,8 @@ fn item_code(item: Item) -> String {
         Item::Flashlight => "flashlight;-".into(),
         Item::Zeus => "zeus;-".into(),
         Item::Egg => "egg;-".into(),
+        Item::Bucket(None) => "bucket;-".into(),
+        Item::Bucket(Some(f)) => format!("bucket;{}", f.key()),
         // (Normal : comme avant les tailles.)
         Item::Screen(1) => "screen;-".into(),
         Item::Screen(n) => format!("screen;{n}"),
@@ -314,6 +316,11 @@ fn parse_item(kind: &str, arg: &str) -> Option<Item> {
         "flashlight" => Some(Item::Flashlight),
         "zeus" => Some(Item::Zeus),
         "egg" => Some(Item::Egg),
+        "bucket" => Some(Item::Bucket(match arg {
+            "water" => Some(minelib_world::registry::Fluid::Water),
+            "lava" => Some(minelib_world::registry::Fluid::Lava),
+            _ => None,
+        })),
         "screen" => Some(Item::Screen(
             arg.parse::<u8>().map_or(crate::screen::NORMAL, |n| n.min(3)),
         )),

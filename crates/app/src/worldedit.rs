@@ -136,6 +136,11 @@ fn parse_pattern(s: &str) -> Result<Pattern, String> {
             None => (1.0, part),
         };
         let b = parse_block(name).ok_or_else(|| format!("bloc inconnu : {name}"))?;
+        // (v281) Les dalles et escaliers retirés ne se posent plus (un masque les trouve
+        // encore : de quoi remplacer ceux déjà posés).
+        if minelib_world::registry::retired_shape_base(b).is_some() {
+            return Err(format!("{name} : ces dalles et escaliers n'existent plus"));
+        }
         v.push((w.max(0.0), b));
     }
     if v.is_empty() {

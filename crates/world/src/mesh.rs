@@ -873,6 +873,21 @@ fn emit_box_t(
         let (du, dv) = (e[axis(u)], e[axis(v)]);
         let start = out.vertices.len() as u32;
         let tex = tex_of(face as u32) | extra;
+        // (v281) « Les torches n'apparaissent pas bien selon là où on les place » : `xf` tourne
+        // la torche murale vers son mur (d'un quart ou d'un demi-tour) ; la face gardait le
+        // numéro de son axe d'avant, et le shader, qui juge avec lui si on la voit de dos
+        // (`from_behind`), jetait ses côtés : il ne restait que le dessus du bâton, un trait
+        // sombre. Le numéro écrit est celui de l'axe vers lequel elle regarde vraiment (sa
+        // lumière aussi) ; sa texture reste celle de sa face d'origine.
+        let shown = {
+            let a = xf(base);
+            let b = xf(std::array::from_fn(|i| base[i] + n[i] as f32));
+            let d: [f32; 3] = std::array::from_fn(|i| b[i] - a[i]);
+            let k = (0..3)
+                .max_by(|&i, &j| d[i].abs().total_cmp(&d[j].abs()))
+                .unwrap_or(0);
+            (k * 2) as u32 + u32::from(d[k] < 0.0)
+        };
         for (a, c) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
             let p: [f32; 3] =
                 std::array::from_fn(|i| base[i] + a * du * u[i] as f32 + c * dv * v[i] as f32);
@@ -891,7 +906,7 @@ fn emit_box_t(
             }
             out.vertices.push(Vertex {
                 pos: xf(p),
-                data: Vertex::block_data(face as u32, 3, light[face]) | reflect_bits(id),
+                data: Vertex::block_data(shown, 3, light[face]) | reflect_bits(id),
                 tex,
             });
         }
@@ -2871,6 +2886,52 @@ mod tests {
                 );
             }
             start += count;
+        }
+    }
+
+    /// (v281) « Les torches n'apparaissent pas bien selon là où on les place » : chaque face
+    /// d'une torche murale, quel que soit son mur, porte le numéro de l'axe vers lequel elle
+    /// regarde vraiment (le shader juge avec lui si on la voit de dos : sinon, ses côtés
+    /// étaient jetés, il ne restait qu'un trait sombre).
+    #[test]
+    fn wall_torch_faces_carry_the_axis_they_really_face() {
+        for d in [0u8, 1, 4, 5] {
+            let mut w = World::new(0);
+            w.insert_empty(ChunkPos { x: 0, z: 0 });
+            w.set(6, 100, 6, BlockId::STONE);
+            let at = match d {
+                0 => [5, 100, 6],
+                1 => [7, 100, 6],
+                4 => [6, 100, 5],
+                _ => [6, 100, 7],
+            };
+            w.place_torch_block(at[0], at[1], at[2], BlockId::wall_torch(d), None);
+            let m = mesh_chunk(&w, ChunkPos { x: 0, z: 0 });
+            let mut checked = 0;
+            for tri in m.indices.chunks_exact(3) {
+                let v = |i: u32| m.vertices[i as usize];
+                let (a, b, c) = (v(tri[0]).pos, v(tri[1]).pos, v(tri[2]).pos);
+                let inside = |p: [f32; 3]| (0..3).all(|k| p[k] >= at[k] as f32 && p[k] <= at[k] as f32 + 1.0);
+                if !(inside(a) && inside(b) && inside(c)) {
+                    continue;
+                }
+                let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let t = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let n = [
+                    u[1] * t[2] - u[2] * t[1],
+                    u[2] * t[0] - u[0] * t[2],
+                    u[0] * t[1] - u[1] * t[0],
+                ];
+                let k = (0..3).max_by(|&i, &j| n[i].abs().total_cmp(&n[j].abs())).unwrap();
+                let face = (v(tri[0]).data >> 8) & 7;
+                assert_eq!(
+                    face,
+                    (k * 2) as u32 + u32::from(n[k] < 0.0),
+                    "torche murale {d} : normale {n:?}"
+                );
+                checked += 1;
+            }
+            assert!(checked >= 24, "torche murale {d} : {checked} triangles");
         }
     }
 

@@ -101,8 +101,75 @@ struct ZeusPending {
     to: Vec3,
     seed: u32,
     npc: Option<NpcTarget>,
+    /// (v281) Le petit éclair touche quelqu'un : le coup sec partira avec lui.
+    hit: bool,
     at: std::time::Instant,
 }
+
+/// (v244) Le petit éclair de la Foudre de Zeus touche un joueur ou un PNJ à mi-corps : à tant
+/// de blocs au-dessus de ses pieds.
+const ARC_BODY: f32 = 0.9;
+
+/// (v281) Celui que vise `Session::aimed_person`.
+#[derive(Clone, Debug)]
+struct Aimed {
+    /// Ses pieds : la foudre chargée y tombe.
+    feet: Vec3,
+    /// Où le petit éclair le touche : à mi-corps (joueur, PNJ) ; L'Évidé (3,5 blocs debout, un à
+    /// plat ventre), là où l'on vise son corps.
+    body: Vec3,
+    /// Le PNJ, si c'en est un.
+    npc: Option<NpcTarget>,
+    /// Sa distance à l'œil (blocs).
+    t: f32,
+}
+/// (v281) « Quand on casse un bloc en survie, il doit apparaître en objet au sol à l'endroit
+/// du bloc cassé, pas dans mon inventaire directement » : ce qu'on vient de casser part de `at`
+/// (le milieu de sa case, d'un écran) et tombe sur le sol sous lui ; on le ramasse en passant
+/// dessus (`Items::pick_up`). Avant, il allait dans l'inventaire (perdu s'il était plein). Une
+/// tête à skin y va encore : au sol, elle perdrait son skin (le code d'un objet ne le porte
+/// pas, voir `Item::code`).
+fn drop_broken(
+    world: &World,
+    inventory: &mut inventory::Inventory,
+    items: &mut crate::drops::Items,
+    at: Vec3,
+    item: Item,
+) {
+    if matches!(item, Item::Head(_)) {
+        inventory.add(item, 1);
+        return;
+    }
+    let (x, z) = (at.x.floor() as i32, at.z.floor() as i32);
+    let mut y = at.y.floor() as i32;
+    while y > 0 && !world.get(x, y - 1, z).is_solid() {
+        y -= 1;
+    }
+    let pile = minelib_net::items::Pile {
+        item: item.code(),
+        count: 1,
+    };
+    items.drop_broken(at, Vec3::new(at.x, y as f32, at.z), pile);
+}
+
+/// (v281) Seau nommé dans `/give` : `seau` (vide), `seau_eau`, `seau_lave` (aussi en anglais,
+/// avec accents, tirets ou espaces). `Some(None)` : le seau vide.
+fn bucket_named(want: &str) -> Option<Option<minelib_world::registry::Fluid>> {
+    use minelib_world::registry::Fluid;
+    let w: String = want
+        .to_lowercase()
+        .replace(['é', 'è'], "e")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    match w.as_str() {
+        "seau" | "bucket" | "seauvide" | "emptybucket" => Some(None),
+        "seaueau" | "seaudeau" | "waterbucket" | "bucketwater" => Some(Some(Fluid::Water)),
+        "seaulave" | "seaudelave" | "lavabucket" | "bucketlava" => Some(Some(Fluid::Lava)),
+        _ => None,
+    }
+}
+
 /// Taille d'écran nommée dans `/give` : `ecran` (normal), `petit_ecran`, `grand_ecran`,
 /// `ecran_geant` (aussi en anglais et avec accents, tirets ou espaces).
 fn screen_size(want: &str) -> Option<u8> {
@@ -2966,18 +3033,22 @@ impl Session {
     }
 
     /// Casse l'écran `i` (un des siens, les premiers de `shown`) : l'objet revient dans
-    /// l'inventaire (hors créatif).
+    /// l'inventaire (hors créatif). (v281) Il tombe au sol, de son milieu, comme un bloc cassé
+    /// (`drop_broken`).
     fn break_screen(&mut self, i: usize) {
         if i >= self.screens.len() {
             return;
         }
-        let size = self.screens.remove(i).size;
+        let screen = self.screens.remove(i);
         self.screen_aim = None;
         if self.game.mode != GameMode::Creative {
-            self.inventory.add(Item::Screen(size), 1);
+            let at = Vec3::from(screen.anchor().center);
+            let item = Item::Screen(screen.size);
+            drop_broken(&self.world, &mut self.inventory, &mut self.items, at, item);
         }
         self.screens_changed(true);
     }
+
 
     /// Ses écrans ont changé : hitbox pour la physique du joueur (refaite aussi à chaque
     /// image), enregistrement, et les joueurs proches le savent tout de suite.
@@ -3654,6 +3725,21 @@ impl Session {
             }
             return;
         }
+        // (v281) Seau tenu : clic droit, il prend la source visée ou la repose (voir
+        // `use_bucket`) ; le clic gauche casse comme d'habitude.
+        if let Some(Item::Bucket(content)) = self.inventory.selected_item() {
+            // (Une porte, une trappe ou un coffre visés s'ouvrent, comme avec autre chose en
+            // main ; accroupi, le seau sert quand même.)
+            let opens = hit
+                .as_ref()
+                .is_some_and(|h| hinged(h.id).is_some() || h.id.def().key == "chest")
+                && !keys.held(input, Action::Sneak);
+            if keys.pressed(input, Action::Use) && !opens {
+                self.use_bucket(content);
+                self.place_cooldown = 0.22;
+                return;
+            }
+        }
         // (v215) Lampe torche tenue : le clic droit n'allume plus rien (c'est le clic
         // molette) ; il ouvre les portes, trappes et coffres comme d'habitude.
         let Some(hit) = hit else { return };
@@ -3818,8 +3904,10 @@ impl Session {
             };
             self.dirty.extend(self.world.set(x, y, z, BlockId::AIR));
             // En créatif, comme dans Minecraft : le bloc cassé ne s'ajoute pas à l'inventaire.
+            // (v281) En survie, il tombe en objet au sol, de sa case (`drop_broken`).
             if self.game.mode != GameMode::Creative {
-                self.inventory.add(item, 1);
+                let at = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                drop_broken(&self.world, &mut self.inventory, &mut self.items, at, item);
             }
             self.break_cooldown = 0.22;
         }
@@ -4029,7 +4117,8 @@ impl Session {
                         .map_or(crate::heads::HeadSkin::Default, |h| h.skin_at(hit.block)),
                 )
             } else {
-                Item::Block(hit.id)
+                // (v281) Une dalle ou un escalier retiré (déjà posé) : son bloc plein.
+                Item::Block(minelib_world::registry::retired_shape_base(hit.id).unwrap_or(hit.id))
             };
             self.give_picked(wanted);
         }
@@ -4095,6 +4184,71 @@ impl Session {
 
     /// « Copier le bloc » : l'objet visé vient en main (déjà dans la barre : on le
     /// choisit ; sinon, en créatif, une pile neuve).
+    /// (v281) Seau tenu, clic droit (voir `bucket`) : le vide prend la première source d'eau ou
+    /// de lave visée, le plein pose la sienne sur la face visée. En survie, il change dans la
+    /// main (`turn_selected_into`) ; en créatif, il ne change pas : le vide enlève les sources
+    /// sans se remplir, le plein ne se vide jamais. Ce que la source posée remplace (plante,
+    /// torche) tombe en objet en solo, comme quand le fluide coule dessus.
+    fn use_bucket(&mut self, content: Option<minelib_world::registry::Fluid>) {
+        use minelib_world::registry::{Fluid, FLUID_SOURCE};
+        let (eye, dir) = (self.aim_eye().to_array(), self.player.look_dir().to_array());
+        let now = match content {
+            None => {
+                let Some((at, f)) = crate::bucket::source_aimed(&self.world, eye, dir, REACH)
+                else {
+                    return;
+                };
+                let changed = self.world.set(at[0], at[1], at[2], BlockId::AIR);
+                if changed.is_empty() {
+                    return;
+                }
+                self.dirty.extend(changed);
+                crate::audio::bucket(true, f == Fluid::Lava);
+                Some(f)
+            }
+            Some(f) => {
+                let Some(at) = crate::bucket::place_aimed(&self.world, eye, dir, REACH) else {
+                    return;
+                };
+                let old = self.world.get(at[0], at[1], at[2]);
+                let changed = self.world.set(at[0], at[1], at[2], f.block(FLUID_SOURCE));
+                if changed.is_empty() {
+                    return;
+                }
+                self.dirty.extend(changed);
+                self.fluids.washed.push((at, old));
+                crate::audio::bucket(false, f == Fluid::Lava);
+                None
+            }
+        };
+        self.gesture = crate::hand::Gesture::Swing;
+        if self.game.mode != GameMode::Creative {
+            self.turn_selected_into(Item::Bucket(now));
+        }
+    }
+
+    /// (v281) L'objet en main devient `item` : seul, il est remplacé ; d'une pile, elle en perd
+    /// un et `item` va dans l'inventaire (à nos pieds s'il est plein).
+    fn turn_selected_into(&mut self, item: Item) {
+        let i = self.inventory.selected;
+        let Some(stack) = self.inventory.slots[i].as_mut() else {
+            return;
+        };
+        if stack.count <= 1 {
+            stack.item = item;
+            return;
+        }
+        stack.count -= 1;
+        if self.inventory.add(item, 1) > 0 {
+            let feet = self.player.pos;
+            let pile = minelib_net::items::Pile {
+                item: item.code(),
+                count: 1,
+            };
+            self.items.drop_item(feet + Vec3::Y, feet, pile);
+        }
+    }
+
     fn give_picked(&mut self, wanted: Item) {
         if let Some(i) = self.inventory.slots[..inventory::HOTBAR]
             .iter()
@@ -4503,7 +4657,7 @@ impl Session {
     /// `ZEUS_ARC`), de `pos` vers `to` (voir `BuildMsg::ZeusAsk`). S'il l'accorde, son
     /// laissez-passer part à l'arbitre du chunk (`on_zeus`), qui publie le coup à tous ceux
     /// qui sont près, nous compris (`update_thor`).
-    fn zeus_ask(&mut self, act: u8, pos: Vec3, to: Vec3, npc: Option<NpcTarget>) {
+    fn zeus_ask(&mut self, act: u8, pos: Vec3, to: Vec3, npc: Option<NpcTarget>, hit: bool) {
         self.thor_seq = self.thor_seq.wrapping_add(1);
         let seq = self.thor_seq;
         let chunk = [
@@ -4523,6 +4677,7 @@ impl Session {
             to,
             seed: rand::random::<u32>(),
             npc,
+            hit,
             at: std::time::Instant::now(),
         });
         self.relay_cmds.push(minelib_net::client::Cmd::Zeus {
@@ -4761,7 +4916,8 @@ impl Session {
         if online && !self.zeus_mine_online() {
             return false;
         }
-        let (eye, dir) = (self.player.eye(), self.player.look_dir());
+        // (v281) Visé depuis le viseur (`aim_eye`), comme `aimed` et `aimed_person`.
+        let (eye, dir) = (self.aim_eye(), self.player.look_dir());
         // (v244) « Enlève la distance max pour taper avec la foudre, c'est comme le /thor » :
         // ce qu'on vise est ce que vise `/thor` (`aimed`).
         let aim = self.aimed();
@@ -4770,7 +4926,7 @@ impl Session {
             (Blow::Sky, Some(Aim::Sky(dir))) => {
                 if online {
                     let from = self.sky_origin(dir);
-                    self.zeus_ask(ZEUS_SKY, from, dir.normalize_or(Vec3::Y), None);
+                    self.zeus_ask(ZEUS_SKY, from, dir.normalize_or(Vec3::Y), None, false);
                 } else {
                     self.throw_lightning(Aim::Sky(dir));
                     self.legend.sky_hit();
@@ -4779,7 +4935,7 @@ impl Session {
             // (La foudre blesse en tombant ceux qu'elle touche, PNJ compris : `storm.landed`.)
             (Blow::Strike, Some(Aim::Ground(pos))) => {
                 if online {
-                    self.zeus_ask(ZEUS_STRIKE, pos, pos, None);
+                    self.zeus_ask(ZEUS_STRIKE, pos, pos, None, false);
                 } else {
                     self.legend.spend();
                     self.throw_lightning(Aim::Ground(pos));
@@ -4797,15 +4953,16 @@ impl Session {
                 let limit = block.as_ref().map_or(far, |h| h.distance);
                 let person = self.aimed_person(limit);
                 let reached = |t: f32| (eye + dir * t - tip).length() <= ARC_REACH;
-                let (to, npc) = match (person, &block) {
-                    (Some((feet, npc, t)), _) if reached(t) => (feet + Vec3::Y * 0.9, npc),
-                    (None, Some(h)) if reached(h.distance) => (eye + dir * h.distance, None),
-                    _ => (crate::zeus::arc_end(eye, dir, tip, ARC_REACH), None),
+                // (v281) `hit` : il touche quelqu'un (le coup sec part avec lui).
+                let (to, npc, hit) = match (person, &block) {
+                    (Some(p), _) if reached(p.t) => (p.body, p.npc, true),
+                    (None, Some(h)) if reached(h.distance) => (eye + dir * h.distance, None, false),
+                    _ => (crate::zeus::arc_end(eye, dir, tip, ARC_REACH), None, false),
                 };
                 if online {
-                    self.zeus_ask(ZEUS_ARC, tip, to, npc);
+                    self.zeus_ask(ZEUS_ARC, tip, to, npc, hit);
                 } else {
-                    self.storm.strike_arc(tip, to);
+                    self.storm.strike_arc(tip, to, hit);
                     if let Some(target) = npc {
                         self.hit_npc_for(target, f32::from(crate::zeus::ARC_DAMAGE));
                     }
@@ -4900,6 +5057,24 @@ impl Session {
                 if let Some(id) = hidden {
                     sends.push((owner.clone(), id));
                 }
+            }
+            // (v281) « Joue-le quand on touche un joueur, un PNJ ou un monstre avec l'éclair
+            // chargé » : elle a touché quelqu'un (un PNJ, caché compris, nous, un autre joueur,
+            // L'Évidé, qu'elle ne blesse pas) : le coup sec, juste après son claquement ; la
+            // nôtre en entier, où qu'elle tombe.
+            let hurts = |feet: Vec3| crate::lightning::hurts_at(at, feet);
+            let touched = !hit.is_empty()
+                || found
+                || !sends.is_empty()
+                || hurts(self.player.pos)
+                || self
+                    .build
+                    .as_ref()
+                    .is_some_and(|b| b.others.values().any(|o| hurts(o.pos)))
+                || self.evides.list.iter().any(|e| !e.is_dying() && hurts(e.pos));
+            if touched {
+                let d = if mine { 0.0 } else { at.distance(me) };
+                crate::audio::zeus_hit(d, crate::storm::HIT_AFTER);
             }
             if let Some(b) = &self.build {
                 for (owner, id) in sends {
@@ -5098,7 +5273,8 @@ impl Session {
     /// y monte au lieu de tomber) ; sinon le sol, 120 blocs plus loin dans la direction du
     /// regard (`None` : rien de chargé là-bas).
     fn aimed(&self) -> Option<Aim> {
-        let (eye, dir) = (self.player.eye(), self.player.look_dir());
+        // (v281) Depuis le viseur (la caméra avance accroupi, v274).
+        let (eye, dir) = (self.aim_eye(), self.player.look_dir());
         let block = raycast(
             &self.world,
             eye.into(),
@@ -5107,8 +5283,8 @@ impl Session {
         );
         // (v235) Un joueur ou un PNJ visé, devant le premier bloc : la foudre tombe sur lui.
         let limit = block.as_ref().map_or(crate::storm::THOR_RANGE, |h| h.distance);
-        if let Some((feet, _, _)) = self.aimed_person(limit) {
-            return Some(Aim::Ground(feet));
+        if let Some(p) = self.aimed_person(limit) {
+            return Some(Aim::Ground(p.feet));
         }
         if let Some(h) = block {
             return Some(Aim::Ground(eye + dir * h.distance));
@@ -5124,23 +5300,28 @@ impl Session {
     }
 
     /// (v235) Joueur ou PNJ (foule d'essai, la nôtre ou celle d'un autre OP) visé à moins de
-    /// `limit` blocs : ses pieds, le PNJ si c'en est un, et sa distance. Le plus proche.
-    fn aimed_person(&self, limit: f32) -> Option<(Vec3, Option<NpcTarget>, f32)> {
-        let (eye, dir) = (self.player.eye(), self.player.look_dir());
-        let mut best: Option<(Vec3, Option<NpcTarget>, f32)> = None;
-        let mut keep = |feet: Vec3, npc: Option<NpcTarget>, t: f32| {
-            if t <= limit && best.as_ref().is_none_or(|b| t < b.2) {
-                best = Some((feet, npc, t));
+    /// `limit` blocs : le plus proche. (v281) L'Évidé aussi (« quand on touche un joueur, un
+    /// PNJ ou un monstre ») : la foudre ne lui fait rien (il ne meurt qu'en étant mangé), mais
+    /// elle s'arrête sur lui (avant, elle le traversait). Visé depuis le viseur (`aim_eye`).
+    fn aimed_person(&self, limit: f32) -> Option<Aimed> {
+        let (eye, dir) = (self.aim_eye(), self.player.look_dir());
+        let mut best: Option<Aimed> = None;
+        let mut keep = |feet: Vec3, body: Vec3, npc: Option<NpcTarget>, t: f32| {
+            if t <= limit && best.as_ref().is_none_or(|b| t < b.t) {
+                best = Some(Aimed { feet, body, npc, t });
             }
         };
+        let mid = Vec3::Y * ARC_BODY;
         if let Some((i, t)) = self.crowd.as_ref().and_then(|c| c.aimed(eye, dir, limit)) {
             if let Some(c) = &self.crowd {
-                keep(c.npcs[i].pos, Some(NpcTarget::Mine(i)), t);
+                let feet = c.npcs[i].pos;
+                keep(feet, feet + mid, Some(NpcTarget::Mine(i)), t);
             }
         }
         for (owner, rc) in &self.remote_crowds {
             if let Some((i, t)) = rc.aimed(eye, dir, limit) {
-                keep(rc.npcs[i].pos, Some(NpcTarget::Theirs(owner.clone(), i)), t);
+                let feet = rc.npcs[i].pos;
+                keep(feet, feet + mid, Some(NpcTarget::Theirs(owner.clone(), i)), t);
             }
         }
         if let Some(b) = &self.build {
@@ -5149,11 +5330,33 @@ impl Session {
                 let min = o.pos - Vec3::new(h, 0.0, h);
                 let max = o.pos + Vec3::new(h, crate::player::HEIGHT, h);
                 if let Some(t) = crate::screen::aim_box(min, max, eye, dir, limit) {
-                    keep(o.pos, None, t);
+                    keep(o.pos, o.pos + mid, None, t);
                 }
             }
         }
+        if let Some((id, t, _, _)) = self.evides.aimed(eye, dir, limit) {
+            if let Some(e) = self.evides.list.iter().find(|e| e.id == id) {
+                keep(e.pos, eye + dir * t, None, t);
+            }
+        }
         best
+    }
+
+    /// (v281) Quelqu'un est-il à mi-corps en `at` (à moins d'un bloc) : un autre joueur, un PNJ
+    /// (le petit éclair d'un autre joueur qui s'arrête là l'a touché) ?
+    fn someone_at(&self, at: Vec3) -> bool {
+        let near = |feet: Vec3| (at - (feet + Vec3::Y * ARC_BODY)).length() < 1.0;
+        self.crowd
+            .as_ref()
+            .is_some_and(|c| c.npcs.iter().any(|n| !n.hidden && near(n.pos)))
+            || self
+                .remote_crowds
+                .values()
+                .any(|rc| rc.npcs.iter().any(|n| !n.hidden && near(n.pos)))
+            || self
+                .build
+                .as_ref()
+                .is_some_and(|b| b.others.values().any(|o| near(o.pos)))
     }
 
     /// (v216) `/thor` : la foudre tombe là où l'on vise. En solo, celui qui joue ; sur un
@@ -5298,14 +5501,21 @@ impl Session {
                         ZEUS_ARC => {
                             // Le nôtre part de la pointe de l'éclair, là où elle est maintenant.
                             let from = if ours { self.zeus_tip() } else { pos };
-                            self.storm.strike_arc_seeded(from, to, seed, ours);
+                            // Celui d'un autre nous touche (à mi-corps).
+                            let on_me = !own
+                                && (to - (self.player.pos + Vec3::Y * ARC_BODY)).length() < 1.0;
+                            // (v281) Touche-t-il quelqu'un (le coup sec part avec lui) ? Le
+                            // nôtre : ce qu'on visait ; celui d'un autre : nous, ou quelqu'un à
+                            // mi-corps à son bout.
+                            let hit = match &asked {
+                                Some(p) => p.hit,
+                                None => on_me || self.someone_at(to),
+                            };
+                            self.storm.strike_arc_seeded(from, to, seed, ours, hit);
                             if let Some(target) = asked.and_then(|p| p.npc) {
                                 self.hit_npc_for(target, f32::from(crate::zeus::ARC_DAMAGE));
-                            } else if !own
-                                && (to - (self.player.pos + Vec3::Y * 0.9)).length() < 1.0
-                            {
-                                // Celui d'un autre nous touche (à mi-corps). (v249) Il
-                                // éblouit, moins que la foudre du ciel.
+                            } else if on_me {
+                                // (v249) Il éblouit, moins que la foudre du ciel.
                                 self.dazzle = self.dazzle.max(0.6);
                                 self.damage(crate::zeus::ARC_DAMAGE);
                             }
@@ -5519,9 +5729,47 @@ impl Session {
             swing: self.walk_amp,
             crouch: self.player.crouch,
             light: self.hand_light,
-            held: None,
+            // (v281) Le bras tel qu'il est dessiné (la main vide tendue).
+            held: self.model_held(),
             skin: None,
             bow: self.eat_bow,
+        }
+    }
+
+    /// Ce que le modèle du joueur tient (F5, miroirs, ombre, première personne). (v281) Sorti
+    /// de `render` : `body_pose` (où L'Évidé vise, la tête pliée) a le même bras.
+    fn model_held(&self) -> Option<crate::player_model::Held> {
+        use crate::player_model::Held;
+        if self.game.mode == GameMode::Fps {
+            // (v177) Ce qu'on a en main, avec son vrai modèle (reflets, ombre : les deux bras
+            // tendus avec une arme à feu, comme les autres nous voient).
+            Some(Held::Gear(self.fps.held_weapon()))
+        } else if self.game.mode.has_inventory() {
+            match self.held_item() {
+                Some(Item::Block(b)) => Some(Held::Block(b)),
+                Some(Item::Torch(chem)) => Some(Held::Torch(
+                    chem.and_then(|i| minelib_world::flame::CHEMICALS.get(i))
+                        .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb),
+                )),
+                Some(Item::Wand) => Some(Held::Wand([70, 60, 90])),
+                Some(Item::Screen(_)) => Some(Held::Wand([30, 30, 36])),
+                Some(Item::Egg) => Some(Held::Wand(crate::evide::EGG_RGB)),
+                Some(Item::Bucket(_)) => Some(Held::Wand(crate::bucket::RGB)),
+                // (v201) Lampe torche, verre allumé ou non.
+                Some(Item::Flashlight) => Some(Held::Flashlight(self.flashlight_on)),
+                Some(Item::Zeus) => Some(Held::Zeus),
+                // Tête tenue (vue en 3e personne) : comme le bloc « tête ».
+                Some(Item::Head(_)) => {
+                    Some(Held::Block(minelib_world::registry::skull_block(false, 0)))
+                }
+                // (v281) « Comme quand je tiens un item, mon bras en F5, je dois le voir dans la
+                // même position qu'à la première personne, aussi quand je ne tiens pas d'item » :
+                // la main vide est tendue comme si elle tenait un bloc (un bloc d'air : rien
+                // dedans), en F5, dans les miroirs et à la première personne (v247).
+                None => Some(Held::Block(minelib_world::BlockId::AIR)),
+            }
+        } else {
+            None
         }
     }
 
@@ -9032,12 +9280,16 @@ impl Session {
                     }
                 }
                 let count: u32 = next.and_then(|n| n.parse().ok()).unwrap_or(64).clamp(1, 64);
-                let found = reg.by_key(&want).or_else(|| {
-                    // Sinon par le nom affiché (« miroir », « bloc de fer »…).
-                    (1..reg.len())
-                        .map(|i| BlockId(i as u16))
-                        .find(|b| b.def().name.to_lowercase() == want)
-                });
+                let found = reg
+                    .by_key(&want)
+                    .or_else(|| {
+                        // Sinon par le nom affiché (« miroir », « bloc de fer »…).
+                        (1..reg.len())
+                            .map(|i| BlockId(i as u16))
+                            .find(|b| b.def().name.to_lowercase() == want)
+                    })
+                    // (v281) Pas les dalles et escaliers retirés (TNT, eau, lave, minerais…).
+                    .filter(|b| minelib_world::registry::retired_shape_base(*b).is_none());
                 match found {
                     _ if screen_size(&want).is_some() => {
                         let size = screen_size(&want).unwrap_or(crate::screen::NORMAL);
@@ -9080,6 +9332,16 @@ impl Session {
                             self.legend.taken |= self.legend_on();
                             self.chat.say("Foudre de Zeus donnée.", chat::YELLOW);
                         }
+                    }
+                    // (v281) Seaux : vide, d'eau, de lave.
+                    _ if bucket_named(&want).is_some() => {
+                        let content = bucket_named(&want).flatten();
+                        let item = Item::Bucket(content);
+                        self.inventory.add(item, count);
+                        self.chat.say(
+                            format!("{count} × {} donné(s).", item.name().to_lowercase()),
+                            chat::YELLOW,
+                        );
                     }
                     // (v269) Œuf de L'Évidé.
                     _ if matches!(want.as_str(), "oeuf" | "oeuf_evide" | "evide" | "egg") => {
@@ -10810,32 +11072,7 @@ impl Session {
         };
         let (cam, view, _) = self.view_camera();
         use crate::player_model::Held;
-        let held = if fps_mode {
-            // (v177) Ce qu'on a en main, avec son vrai modèle (reflets, ombre : les deux bras
-            // tendus avec une arme à feu, comme les autres nous voient).
-            Some(Held::Gear(self.fps.held_weapon()))
-        } else if self.game.mode.has_inventory() {
-            match self.held_item() {
-                Some(Item::Block(b)) => Some(Held::Block(b)),
-                Some(Item::Torch(chem)) => Some(Held::Torch(
-                    chem.and_then(|i| minelib_world::flame::CHEMICALS.get(i))
-                        .map_or(minelib_world::flame::WOOD_FLAME, |c| c.rgb),
-                )),
-                Some(Item::Wand) => Some(Held::Wand([70, 60, 90])),
-                Some(Item::Screen(_)) => Some(Held::Wand([30, 30, 36])),
-                Some(Item::Egg) => Some(Held::Wand(crate::evide::EGG_RGB)),
-                // (v201) Lampe torche, verre allumé ou non.
-                Some(Item::Flashlight) => Some(Held::Flashlight(self.flashlight_on)),
-                Some(Item::Zeus) => Some(Held::Zeus),
-                // Tête tenue (vue en 3e personne) : comme le bloc « tête ».
-                Some(Item::Head(_)) => {
-                    Some(Held::Block(minelib_world::registry::skull_block(false, 0)))
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
+        let held = self.model_held();
         let pose = crate::player_model::Pose {
             feet: self.player.pos,
             yaw: self.player.yaw,
@@ -11325,6 +11562,8 @@ impl Session {
         // rien dedans (avant : une main dessinée à part, à l'écran, qui ne suivait pas
         // l'accroupi).
         let first_hold = match pose.held {
+            // (v281) La main vide (un bloc d'air, comme en F5) : le bras seul.
+            Some(h @ Held::Block(b)) if b == minelib_world::BlockId::AIR => Some((h, false)),
             Some(
                 h @ (Held::Flashlight(_)
                 | Held::Block(_)

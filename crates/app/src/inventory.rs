@@ -7,6 +7,7 @@
 
 use minelib_render::Ui;
 use minelib_world::flame::{format_duration, CHARGE_G, CHEMICALS, WOOD_FLAME};
+use minelib_world::registry::Fluid;
 use minelib_world::BlockId;
 
 pub const HOTBAR: usize = 10;
@@ -37,6 +38,9 @@ pub enum Item {
     Zeus,
     /// (v269) Œuf d'apparition de L'Évidé : clic droit, il sort là où l'on vise.
     Egg,
+    /// (v281) Seau : vide (`None`), d'eau ou de lave. Clic droit : le vide prend la source
+    /// visée, le plein la repose (voir `bucket`).
+    Bucket(Option<Fluid>),
 }
 
 impl Item {
@@ -56,6 +60,9 @@ impl Item {
             Item::Flashlight => 0x4_0000,
             Item::Zeus => 0x5_0000,
             Item::Egg => 0x6_0000,
+            Item::Bucket(None) => 0x7_0000,
+            Item::Bucket(Some(Fluid::Water)) => 0x7_0001,
+            Item::Bucket(Some(Fluid::Lava)) => 0x7_0002,
         }
     }
 
@@ -78,6 +85,9 @@ impl Item {
             Item::Flashlight => "lampe_torche".into(),
             Item::Zeus => "foudre_de_zeus".into(),
             Item::Egg => "oeuf_evide".into(),
+            Item::Bucket(None) => "seau".into(),
+            Item::Bucket(Some(Fluid::Water)) => "seau_eau".into(),
+            Item::Bucket(Some(Fluid::Lava)) => "seau_lave".into(),
         }
     }
 
@@ -99,6 +109,9 @@ impl Item {
             0x4_0000 => Some(Item::Flashlight),
             0x5_0000 => Some(Item::Zeus),
             0x6_0000 => Some(Item::Egg),
+            0x7_0000 => Some(Item::Bucket(None)),
+            0x7_0001 => Some(Item::Bucket(Some(Fluid::Water))),
+            0x7_0002 => Some(Item::Bucket(Some(Fluid::Lava))),
             0x3_0000 => Some(Item::Screen(crate::screen::NORMAL)),
             0x3_0001 => Some(Item::Screen(0)),
             0x3_0002 => Some(Item::Screen(2)),
@@ -120,6 +133,9 @@ impl Item {
             Item::Flashlight => "Lampe torche".into(),
             Item::Zeus => "Foudre de Zeus".into(),
             Item::Egg => "Œuf de L'Évidé".into(),
+            Item::Bucket(None) => "Seau".into(),
+            Item::Bucket(Some(Fluid::Water)) => "Seau d'eau".into(),
+            Item::Bucket(Some(Fluid::Lava)) => "Seau de lave".into(),
             Item::Screen(n) => crate::screen::size_name(n).into(),
             Item::Head(n) => crate::heads::skin_of(n).item_name(),
             Item::Torch(None) => "Torche".into(),
@@ -147,7 +163,8 @@ impl Item {
             | Item::Head(_)
             | Item::Flashlight
             | Item::Zeus
-            | Item::Egg => None,
+            | Item::Egg
+            | Item::Bucket(_) => None,
         }
     }
 
@@ -239,6 +256,14 @@ impl Item {
                 lines.push(("3,5 blocs de gelée blanche, qui te cherche".into(), GREY));
                 lines.push(("Les épées ne lui font rien : mange-le (clic gauche, de près)".into(), GREY));
                 lines.push(("En ligne : toi seul le vois, pour l'instant".into(), GREY));
+            }
+            Item::Bucket(None) => {
+                lines.push(("Clic droit sur une source d'eau ou de lave : la prendre".into(), WHITE));
+                lines.push(("En créatif, il l'enlève et reste vide".into(), GREY));
+            }
+            Item::Bucket(Some(_)) => {
+                lines.push(("Clic droit : poser la source là où tu vises".into(), WHITE));
+                lines.push(("En créatif, il ne se vide jamais".into(), GREY));
             }
             Item::Flashlight => {
                 lines.push(("Éclaire comme un projecteur, où tu regardes".into(), WHITE));
@@ -576,6 +601,8 @@ pub fn catalogue() -> &'static [(Item, usize)] {
                 || d.key.starts_with("reserved")
                 || d.key.ends_with("_upper")
                 || d.key.contains(":upper")
+                // (v281) Dalles et escaliers retirés (TNT, eau, lave, minerais, feuillages…).
+                || minelib_world::registry::retired_shape_base(BlockId(i as u16)).is_some()
             {
                 continue;
             }
@@ -597,6 +624,10 @@ pub fn catalogue() -> &'static [(Item, usize)] {
         items.push((Item::Flashlight, 6));
         items.push((Item::Zeus, 6));
         items.push((Item::Egg, 6));
+        // (v281) Les seaux.
+        items.push((Item::Bucket(None), 6));
+        items.push((Item::Bucket(Some(Fluid::Water)), 6));
+        items.push((Item::Bucket(Some(Fluid::Lava)), 6));
         items.extend((0..crate::screen::SIZES.len() as u8).map(|n| (Item::Screen(n), 6)));
         items.push((Item::Torch(None), 6));
         items.extend((0..CHEMICALS.len()).map(|i| (Item::Torch(Some(i)), 6)));
@@ -986,6 +1017,7 @@ impl Inventory {
                             "foudre de zeus eclair lightning thunder tonnerre thor".contains(&q)
                         }
                         Item::Egg => "oeuf evide spawn egg monstre mob gelee".contains(&q),
+                        Item::Bucket(_) => "seau bucket eau lave water lava source".contains(&q),
                     }
                 }
             })
@@ -1908,6 +1940,14 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
             16.0 * s,
             crate::evide::egg_pixels(),
         ),
+        // (v281) Seau : image en pixels, son contenu vu par-dessus.
+        Item::Bucket(content) => crate::wand::pixel_icon(
+            ui,
+            x + slot / 2.0,
+            y + slot / 2.0,
+            16.0 * s,
+            crate::bucket::pixels(content),
+        ),
         // Écran vidéo : petite télé en pixels.
         Item::Screen(n) => crate::screen::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s, n),
         // Barrières (invisibles) : un panneau « interdit », rouge (bleu : à fluides).
@@ -2186,6 +2226,19 @@ mod tests {
             .filter(|i| matches!(i, Item::Block(b) if b.def().key.starts_with("stairs:planks_oak")))
             .count();
         assert_eq!(stairs, 1);
+        // (v281) Ni dalle ni escalier de TNT, d'eau, de lave, de minerai, de feuilles…
+        let shaped = |m: &str| {
+            cat.iter().any(|i| {
+                matches!(i, Item::Block(b) if b.def().key.starts_with(&format!("slab:{m}:"))
+                    || b.def().key.starts_with(&format!("stairs:{m}:")))
+            })
+        };
+        for m in ["tnt", "water", "lava", "iron_ore", "leaves_oak", "shulker_red", "furnace"] {
+            assert!(!shaped(m), "{m}");
+        }
+        for m in ["stone", "planks_oak", "glass", "wool_red", "cut_copper"] {
+            assert!(shaped(m), "{m}");
+        }
         assert!(!cat
             .iter()
             .any(|i| matches!(i, Item::Block(b) if b.def().key.starts_with("wall_torch"))));

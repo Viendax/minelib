@@ -73,6 +73,7 @@ mod anticheat;
 mod audio;
 mod bot_skin;
 mod bots;
+mod bucket;
 mod buildnet;
 mod chat;
 mod cmdhelp;

@@ -449,6 +449,65 @@ pub fn registry() -> &'static Registry {
     R.get_or_init(build)
 }
 
+/// (v281) « Enlève les dalles et escaliers du jeu qui ne sont pas cohérents, type TNT, eau,
+/// lave, minerais, feuillage ; je ne sais pas si j'en ai oublié » : les matériaux qui n'ont
+/// plus de dalles ni d'escaliers à prendre. Ceux qu'il a nommés (fluides, TNT, minerais,
+/// feuilles), et du même ordre : le socle (indestructible), les blocs qui servent à quelque
+/// chose (établi, four, piston, chaudron, bloc de commande, juke-box, bloc musical,
+/// observateur, distributeur, bloc d'énergie, bibliothèque, boîtes de Shulker), les fruits et
+/// les blocs « vivants » ou piégés (citrouille, pastèque, éponge, slime, magma, et le bloc de
+/// verrue, feuillage des champignons du Nether). 47 matériaux, 658 blocs (par matériau : deux
+/// dalles, quatre dalles debout, huit escaliers).
+///
+/// Leurs blocs restent dans le registre, à leur numéro : les mondes enregistrent les blocs par
+/// numéro (`edits.bin`, `chunks.bin`) et les envoient ainsi en ligne ; en retirer décalerait
+/// tous ceux d'après. Déjà posés, ils restent ; ils ne sont plus proposés (menu créatif,
+/// `/give`, motifs de WorldEdit) et « copier le bloc » donne le bloc plein.
+pub fn shapes_retired(material: &str) -> bool {
+    const RETIRED: [&str; 21] = [
+        "water",
+        "lava",
+        "tnt",
+        "bedrock",
+        "crafting_table",
+        "furnace",
+        "piston",
+        "cauldron",
+        "command_block",
+        "jukebox",
+        "noteblock",
+        "observer",
+        "dispenser",
+        "redstone_block",
+        "bookshelf",
+        "pumpkin",
+        "melon",
+        "sponge",
+        "slime",
+        "magma",
+        "nether_wart_block",
+    ];
+    RETIRED.contains(&material)
+        || material.ends_with("_ore")
+        || material.starts_with("leaves_")
+        || material.starts_with("shulker_")
+}
+
+/// (v281) Dalle ou escalier d'un matériau qui n'en a plus (`shapes_retired`) : son bloc plein.
+pub fn retired_shape_base(block: BlockId) -> Option<BlockId> {
+    let reg = registry();
+    let key = &reg.defs.get(block.0 as usize)?.key;
+    let mut parts = key.split(':');
+    if !matches!(parts.next(), Some("slab" | "stairs")) {
+        return None;
+    }
+    let material = parts.next()?;
+    if !shapes_retired(material) {
+        return None;
+    }
+    reg.by_key(material)
+}
+
 /// Couverture des faces du bloc par de la matière qui arrête la lumière des torches :
 /// pour chaque face (0 +X, 1 −X, 2 +Y, 3 −Y, 4 +Z, 5 −Z), une grille 4 × 4 de quarts
 /// de face (bit = quart couvert). Un cube plein couvre tout ; une dalle du bas couvre
@@ -3874,6 +3933,46 @@ mod tests {
         );
         assert!(r.by_key("flower_pot:plant:wheat").is_none());
         assert!(r.by_key("flower_pot:plant:brain_coral").is_some());
+    }
+
+    /// (v281) Dalles et escaliers retirés : 47 matériaux (ceux que Viendax a nommés et ceux du
+    /// même ordre) ; leurs blocs restent à leur numéro (les mondes les enregistrent par numéro)
+    /// et donnent leur bloc plein ; les matériaux de construction gardent les leurs.
+    #[test]
+    fn incoherent_slabs_and_stairs_are_retired_but_keep_their_numbers() {
+        let reg = registry();
+        let mut retired = std::collections::BTreeSet::new();
+        let mut blocks = 0;
+        for (i, d) in reg.defs.iter().enumerate() {
+            if let Some(base) = retired_shape_base(BlockId(i as u16)) {
+                let material = d.key.split(':').nth(1).unwrap_or_default();
+                assert_eq!(reg.defs[base.0 as usize].key, material);
+                retired.insert(material.to_string());
+                blocks += 1;
+            }
+        }
+        // (Par matériau : deux dalles, quatre dalles debout, huit escaliers.)
+        assert_eq!((retired.len(), blocks), (47, 47 * 14), "{retired:?}");
+        for m in [
+            "tnt", "water", "lava", "coal_ore", "diamond_ore", "leaves_oak", "leaves_birch",
+            "bedrock", "furnace", "shulker_red", "nether_wart_block",
+        ] {
+            assert!(retired.contains(m), "{m}");
+        }
+        for m in [
+            "stone", "planks_oak", "log_oak", "glass", "sand", "grass", "wool_red",
+            "concrete_red", "glazed_red", "hay", "quartz", "cut_copper", "tuff",
+        ] {
+            assert!(!retired.contains(m), "{m}");
+            assert!(reg.by_key(&format!("slab:{m}:bottom")).is_some(), "{m}");
+        }
+        // Les blocs retirés sont toujours là (ceux déjà posés restent tels quels).
+        for key in ["slab:tnt:bottom", "slab:tnt:top", "stairs:leaves_oak:3:top"] {
+            let b = reg.by_key(key).unwrap();
+            assert_eq!(reg.defs[b.0 as usize].key, key);
+            assert!(retired_shape_base(b).is_some());
+        }
+        assert_eq!(retired_shape_base(reg.by_key("tnt").unwrap()), None);
     }
 
     #[test]

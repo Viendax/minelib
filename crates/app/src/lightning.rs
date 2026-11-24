@@ -218,6 +218,9 @@ pub struct Strike {
     /// (v247) Lancée par ce joueur (Foudre de Zeus, `/thor`) : ce qu'elle touche, il l'a
     /// frappé lui-même (« Pistache peut être trouvé en tapant avec la foudre »).
     pub mine: bool,
+    /// (v281) Petit éclair qui touche quelqu'un (joueur, PNJ, L'Évidé) : le coup sec part avec
+    /// lui (`audio::zeus_hit`).
+    pub hit: bool,
 }
 
 impl Strike {
@@ -403,6 +406,7 @@ impl Strike {
             mine: false,
             seed,
             follow: false,
+            hit: false,
         }
     }
 

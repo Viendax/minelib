@@ -718,6 +718,9 @@ pub fn item_mesh(
         Item::Flashlight => crate::flashlight::model(&mut out, clip, light, flashlight_on),
         Item::Wand => crate::wand::model(&mut out, clip, light),
         Item::Egg => crate::wand::pixel_model(&mut out, clip, light, crate::evide::egg_pixels()),
+        Item::Bucket(content) => {
+            crate::wand::pixel_model(&mut out, clip, light, crate::bucket::pixels(content))
+        }
         Item::Screen(_) => crate::screen::model(&mut out, clip, light),
         // Tête (simple ou à skin) : tenue comme un bloc, avec son skin, le visage vers soi.
         Item::Head(_) | Item::Block(_) if item.head_skin().is_some() => {

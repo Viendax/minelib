@@ -264,6 +264,22 @@ struct TextVertex {
     color: [f32; 4],
 }
 
+/// (v281) Profondeur d'un objet 3D de l'interface (icônes de la barre d'objets, de
+/// l'inventaire) : « mes items disparaissent de ma barre quand je regarde trop bas et que mon
+/// torse passe au-dessus ». Le bras, l'objet tenu et le corps vus à la première personne sont
+/// dessinés avant eux, dans la même profondeur (inversée : 1 au plan proche, à 0,05 bloc de
+/// l'œil ; le torse, tout près en baissant les yeux, dépassait 0,5, celle des icônes). Leur
+/// profondeur (0 … 1, pour l'ordre de leurs faces) est serrée tout contre le plan proche : seul
+/// ce qui serait à moins de 0,05005 bloc de l'œil (rien : le plan proche coupe à 0,05) passerait
+/// devant elles ; l'ordre de leurs faces est gardé (≈ 500 pas de profondeur sur un cube).
+fn ui_depth(z: f32) -> f32 {
+    1.0 - (1.0 - z.clamp(0.0, 1.0)) * UI_DEPTH_SPAN
+}
+
+/// (v281) Part de la profondeur (juste devant le plan proche) laissée aux objets 3D de
+/// l'interface.
+const UI_DEPTH_SPAN: f32 = 1e-3;
+
 pub(crate) struct OverlayRenderer {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
@@ -750,7 +766,7 @@ impl OverlayRenderer {
                             v.clip = [
                                 v.clip[0] / w * 2.0 - 1.0,
                                 1.0 - v.clip[1] / h * 2.0,
-                                v.clip[2],
+                                ui_depth(v.clip[2]),
                                 1.0,
                             ];
                             v
@@ -886,6 +902,19 @@ impl OverlayRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v281) Les objets 3D de l'interface (icônes de la barre d'objets) passent devant le bras
+    /// et le corps de la première personne (profondeur inversée, plan proche à 0,05 bloc),
+    /// même à un cheveu du plan proche, et gardent l'ordre de leurs faces.
+    #[test]
+    fn interface_models_stay_in_front_of_the_first_person_body() {
+        let body = |d: f32| 0.05 / d;
+        for z in [0.0f32, 0.48, 0.5, 0.52, 1.0] {
+            assert!(ui_depth(z) > body(0.0501), "{z}");
+        }
+        assert!(ui_depth(0.483) < ui_depth(0.5) && ui_depth(0.5) < ui_depth(0.517));
+        assert_eq!(ui_depth(1.0), 1.0);
+    }
 
     /// (v271) Le l minuscule ne ressemble plus au chiffre 1 ni au I majuscule (pseudo
     /// « lside » lu « 1side ») : au moins quatre pixels de différence avec chacun, et le pied

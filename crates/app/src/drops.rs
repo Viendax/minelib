@@ -157,6 +157,20 @@ impl Items {
         id
     }
 
+    /// (v281) « Quand on casse un bloc en survie, il doit apparaître en objet au sol à l'endroit
+    /// du bloc cassé, pas dans mon inventaire directement » : `pile` (jamais entrée dans
+    /// l'inventaire) part de la case du bloc `from` et tombe en `to` (le sol sous elle). Il se
+    /// ramasse comme celui d'un autre (`PICK_DELAY`), pas après le long délai de ce qu'on lâche
+    /// soi-même : on ne s'en éloigne pas. Refusé par l'arbitre (relais pas prêt), il va dans
+    /// l'inventaire (règle du `Ledger` : rendu sur un refus) : rien n'est perdu.
+    pub fn drop_broken(&mut self, from: Vec3, to: Vec3, pile: Pile) -> u64 {
+        let id = self.drop_item(from, to, pile);
+        if let Some(b) = self.born.get_mut(&id) {
+            b.2 = false;
+        }
+        id
+    }
+
     /// (v222) Lance `pile` (déjà retirée de l'inventaire) le long de `path`
     /// (`equip::toss_path`) : il tombe au dernier point, et le suit en volant.
     pub fn throw_item(&mut self, path: Vec<Vec3>, pile: Pile) {
@@ -530,6 +544,7 @@ fn icon_kind(item: Item) -> RayBoxKind {
         Item::Zeus => RayBoxKind::Glow(ZEUS_GLOW),
         Item::Screen(_) => RayBoxKind::Flat([30, 30, 36]),
         Item::Egg => RayBoxKind::Flat(crate::evide::EGG_RGB),
+        Item::Bucket(_) => RayBoxKind::Flat(crate::bucket::RGB),
         // Tête à skin (au sol, elle devient une tête simple : voir `Item::code`).
         Item::Head(_) => RayBoxKind::Flat([214, 166, 132]),
     }
@@ -633,6 +648,37 @@ mod tests {
         it.block_changed(chest, ME);
         assert_eq!(it.view.totals()[&1], 65);
         assert_eq!(it.view.live_drops().count(), 2);
+    }
+
+    /// (v281) Un bloc cassé en survie tombe au sol (rien dans l'inventaire avant qu'on le
+    /// ramasse) ; on le ramasse plus tôt que ce qu'on lâche soi-même, une seule fois.
+    #[test]
+    fn a_broken_block_falls_to_the_ground_and_is_picked_up_soon() {
+        let mut it = Items::new(true);
+        let (from, to) = (Vec3::new(4.5, 11.5, 2.5), Vec3::new(4.5, 10.0, 2.5));
+        it.drop_broken(from, to, stone(1));
+        it.drop_item(from, to, stone(2));
+        it.arbitrate(ME);
+        assert!(it.credits.is_empty());
+        assert_eq!(it.view.live_drops().count(), 2);
+        // Une seconde plus tard : le bloc cassé se ramasse, pas encore ce qu'on a lâché.
+        for b in it.born.values_mut() {
+            b.0 -= std::time::Duration::from_secs(1);
+        }
+        for _ in 0..3 {
+            it.pick_up(to, |_| true);
+            it.arbitrate(ME);
+        }
+        assert_eq!(it.credits, vec![stone(1)]);
+        assert_eq!(it.view.live_drops().count(), 1);
+        // Refusé par l'arbitre (en ligne, relais pas prêt) : il va dans l'inventaire.
+        let mut online = Items::new(false);
+        online.drop_broken(from, to, stone(1));
+        let Some((_, BuildMsg::DropItem { seq, .. })) = online.outbox.first().cloned() else {
+            panic!("demande de dépôt");
+        };
+        online.hear(&BuildMsg::Denied { seq }, ME, None);
+        assert_eq!(online.credits, vec![stone(1)]);
     }
 
     #[test]

@@ -630,6 +630,7 @@ pub fn crackles(list: Vec<CrackleAt>) {
                 pcm: None,
                 rain: None,
                 crackle: Some(list),
+                weather: false,
             });
         }
     }
@@ -664,6 +665,7 @@ pub fn pickup() {
                 pcm: Some((pcm, rate)),
                 rain: None,
                 crackle: None,
+                weather: false,
             });
         }
     }
@@ -690,6 +692,7 @@ pub fn found() {
                 pcm: Some((pcm, rate)),
                 rain: None,
                 crackle: None,
+                weather: false,
             });
         }
     }
@@ -701,6 +704,11 @@ const FOUND_VOLUME: f32 = 0.4;
 /// (v247) Un son calculé, joué une fois à `volume` (× le volume du jeu), à la vitesse
 /// `speed` (hauteur et durée).
 fn play_pcm(pcm: Vec<i16>, rate: u32, volume: f32, speed: f32) {
+    play_pcm_after(pcm, rate, volume, speed, 0.0);
+}
+
+/// (v281) Le même, qui part dans `delay` secondes.
+fn play_pcm_after(pcm: Vec<i16>, rate: u32, volume: f32, speed: f32, delay: f32) {
     if master() <= 0.0 || volume <= 0.0 {
         return;
     }
@@ -709,13 +717,14 @@ fn play_pcm(pcm: Vec<i16>, rate: u32, volume: f32, speed: f32) {
             let _ = tx.send(Cmd {
                 file: "",
                 volume,
-                delay: 0.0,
+                delay,
                 speed,
                 voice: None,
                 reopen: false,
                 pcm: Some((pcm, rate)),
                 rain: None,
                 crackle: None,
+                weather: false,
             });
         }
     }
@@ -728,18 +737,53 @@ fn fresh_seed() -> u32 {
 
 /// (v247) « Peut-être un autre bruit pour quand on tape avec l'éclair de 8 blocs max » : l'arc
 /// court de la Foudre de Zeus sans charge ne tonne plus, il grésille et claque (décharge
-/// électrique, `synth::zap`), tiré à chaque fois. (v247) « Réduis de 25 % le son de
-/// l'éclair quand c'est le petit éclair de 8 blocs » : 75 % du tonnerre qu'il faisait.
-/// (v266) « Change le son de l'éclair à 8 blocs, mais un son d'éclair, pas celui qu'on a
-/// déjà : un petit coup sec » : le claquement bref d'un éclair tout proche (`synth::crack`),
-/// au même volume.
-pub fn zap() {
+/// électrique), tiré à chaque fois. (v266) « Change le son de l'éclair à 8 blocs, mais un son
+/// d'éclair, pas celui qu'on a déjà : un petit coup sec » : le claquement bref d'un éclair tout
+/// proche (`synth::crack`). (v281) « Pour l'éclair à 8 blocs quand il n'est pas chargé, change le
+/// son par un truc plus impressionnant » : une vraie décharge, d'un peu plus d'une seconde
+/// (`synth::arc_blast`), tirée à chaque fois. `distance` : blocs entre son bout et nos
+/// oreilles (le nôtre en entier ; celui d'un autre joueur, au loin, s'entend moins : `arc_gain`).
+pub fn zeus_arc(distance: f32) {
+    let (pcm, rate) = synth::arc_blast(fresh_seed());
+    play_pcm(pcm, rate, ARC_VOLUME * arc_gain(distance), 2f32.powf(1.5 * jitter() / 12.0));
+}
+
+/// (v281) « Le son actuel, mets-le 10 % plus fort et joue-le quand on touche un joueur, un PNJ
+/// ou un monstre avec l'éclair de 8 blocs ou avec l'éclair chargé » : le coup sec d'un éclair
+/// tout proche (`synth::crack`, le son du petit éclair des v266 à v274), tiré à chaque fois, à
+/// 1,1 fois son volume d'alors. `distance` : blocs entre le coup et nos oreilles (0 : notre
+/// coup, entendu en entier où qu'il tombe) ; `delay` : il part après l'arc (s).
+pub fn zeus_hit(distance: f32, delay: f32) {
     let (pcm, rate) = synth::crack(fresh_seed());
-    play_pcm(pcm, rate, ZAP_VOLUME, 2f32.powf(1.5 * jitter() / 12.0));
+    let volume = HIT_VOLUME * arc_gain(distance);
+    play_pcm_after(pcm, rate, volume, 2f32.powf(1.5 * jitter() / 12.0), delay);
+}
+
+/// (v281) Ce qu'il reste d'un éclair de la Foudre de Zeus entendu à `d` blocs : tout jusqu'à
+/// 10 blocs (ce qu'on frappe soi-même), puis comme 10 ÷ d (la moitié à 20 blocs, un dixième à
+/// 100).
+pub fn arc_gain(d: f32) -> f32 {
+    10.0 / d.max(10.0)
 }
 
 /// (v247) Volume de l'arc court : 0,75 × celui du tonnerre qu'il faisait (40 blocs : 0,73).
+/// (v281) Celui du coup sec qu'il faisait, devenu celui du coup qui touche.
 const ZAP_VOLUME: f32 = 0.55;
+/// (v281) Le coup qui touche : 10 % plus fort que lui.
+const HIT_VOLUME: f32 = ZAP_VOLUME * 1.1;
+/// (v281) La décharge du petit éclair : plus longue et plus pleine que le coup sec (elle sonne
+/// plus fort à volume égal), un peu au-dessus de lui.
+const ARC_VOLUME: f32 = 0.6;
+
+/// (v281) Seau qui se remplit (`fill`) ou qu'on vide, d'eau ou de lave (`lava`) :
+/// `synth::bucket`, tiré à chaque fois (jamais deux fois le même).
+pub fn bucket(fill: bool, lava: bool) {
+    let (pcm, rate) = synth::bucket(fresh_seed(), fill, lava);
+    play_pcm(pcm, rate, BUCKET_VOLUME, 2f32.powf(1.5 * jitter() / 12.0));
+}
+
+/// (v281) Volume du seau.
+const BUCKET_VOLUME: f32 = 0.45;
 
 /// (v269) Morsure de L'Évidé, la sienne comme la nôtre : « un bruit de morsure gélatineuse, à
 /// 40 % » ; calculée à chaque fois (`synth::squelch`) : jamais deux fois la même. `distance` :
@@ -831,6 +875,11 @@ struct Cmd {
     rain: Option<f32>,
     /// (v220) Crépitements des Foudres de Zeus tenues (voir `crackles`).
     crackle: Option<Vec<CrackleAt>>,
+    /// (v281) Son calculé de la météo (tonnerre) : au volume de la météo, il se tait dans les
+    /// menus et quand on quitte la partie. Les autres sons calculés (objet ramassé, Foudre de
+    /// Zeus, L'Évidé, seau…) sont au seul volume du jeu (avant, le curseur de la météo les
+    /// baissait aussi).
+    weather: bool,
 }
 
 /// (v220) Un éclair tenu qui crépite : son numéro (une boucle par éclair), sa direction
@@ -917,6 +966,7 @@ fn refresh_volumes() {
                 pcm: None,
                 rain: None,
                 crackle: None,
+                weather: false,
             });
         }
     }
@@ -960,6 +1010,7 @@ pub fn set_output(name: &str) {
                 pcm: None,
                 rain: None,
                 crackle: None,
+                weather: false,
             });
         }
     }
@@ -976,9 +1027,14 @@ fn no_ducking() {
 }
 
 /// Ouvre la sortie choisie, sinon celle par défaut.
-fn open_output() -> Option<(OutputStream, rodio::OutputStreamHandle)> {
+/// La sortie son choisie, ou celle par défaut. (v281) `say` : le dire dans le journal (pas à
+/// chaque nouvel essai, toutes les trois secondes, quand il n'y a aucune sortie).
+fn open_output(say: bool) -> Option<(OutputStream, rodio::OutputStreamHandle)> {
     use rodio::cpal::traits::{DeviceTrait, HostTrait};
     let name = OUTPUT.lock().map(|o| o.clone()).unwrap_or_default();
+    // (v281) Ouverte à la place de la sortie choisie (introuvable) : la surveillance la rouvre
+    // dès qu'elle revient (`Watchdog`).
+    FELL_BACK.store(!name.is_empty(), std::sync::atomic::Ordering::Relaxed);
     if !name.is_empty() {
         let dev = rodio::cpal::default_host()
             .output_devices()
@@ -987,21 +1043,136 @@ fn open_output() -> Option<(OutputStream, rodio::OutputStreamHandle)> {
         match dev.map(|d| OutputStream::try_from_device(&d)) {
             Some(Ok(out)) => {
                 log::info!("audio : sortie « {name} »");
+                FELL_BACK.store(false, std::sync::atomic::Ordering::Relaxed);
                 return Some(out);
             }
-            Some(Err(e)) => {
+            Some(Err(e)) if say => {
                 log::warn!("audio : sortie « {name} » impossible à ouvrir ({e}), celle par défaut")
             }
-            None => log::warn!("audio : sortie « {name} » introuvable, celle par défaut"),
+            None if say => log::warn!("audio : sortie « {name} » introuvable, celle par défaut"),
+            _ => {}
         }
     }
     match OutputStream::try_default() {
         Ok(out) => Some(out),
         Err(_) => {
-            log::warn!("audio : aucune sortie son, jeu sans son");
+            if say {
+                log::warn!("audio : aucune sortie son, jeu sans son");
+            }
             None
         }
     }
+}
+
+/// (v281) La sortie choisie (Paramètres → Son) n'a pas pu être ouverte : celle par défaut l'a
+/// remplacée.
+static FELL_BACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// (v281) « Des fois je suis obligé de changer le périphérique de son puis le remettre pour
+/// entendre ; corrige, je ne dois pas avoir besoin de le faire. » La sortie ouverte par rodio
+/// (cpal) reste celle du lancement : quand Windows change de sortie par défaut (casque branché,
+/// Bluetooth revenu), le son continue là-bas ; quand le périphérique se perd (débranché, mis en
+/// veille, pris par une autre application), le flux s'arrête sans rien dire (rodio écrit
+/// l'erreur sur la sortie d'erreur, rien d'autre) et le jeu devient muet. Choisir une autre
+/// sortie puis la remettre la rouvrait. Le fil du son le fait maintenant tout seul : chaque
+/// seconde, il regarde si la sortie par défaut du système a changé (quand on la suit), et si un
+/// son muet sans fin (`probe`) avance encore ; sinon, il rouvre la sortie. Sans aucune sortie,
+/// il réessaie toutes les trois secondes ; la sortie choisie introuvable (casque éteint), il la
+/// reprend dès qu'elle revient.
+struct Watchdog {
+    /// Son muet sans fin sur la sortie : sa position avance tant qu'elle joue.
+    probe: Option<Sink>,
+    last_pos: Duration,
+    /// Depuis quand sa position n'avance plus.
+    stalled_since: Option<std::time::Instant>,
+    /// La sortie par défaut du système à l'ouverture, quand c'est elle qu'on suit.
+    default_name: Option<String>,
+    /// Pas de sortie du tout : on réessaie.
+    none: bool,
+    /// La sortie choisie, remplacée par celle par défaut : on la reprend quand elle revient.
+    missing: Option<String>,
+    /// Vérifications faites (une par seconde).
+    ticks: u32,
+    next_check: std::time::Instant,
+}
+
+impl Watchdog {
+    fn new(handle: Option<&rodio::OutputStreamHandle>, host: &rodio::cpal::Host) -> Self {
+        use rodio::cpal::traits::{DeviceTrait, HostTrait};
+        let probe = handle
+            .and_then(|h| Sink::try_new(h).ok())
+            .inspect(|s| s.append(rodio::source::Zero::<f32>::new(1, 48_000)));
+        let follows_default = OUTPUT.lock().map(|o| o.is_empty()).unwrap_or(true);
+        let default_name = follows_default
+            .then(|| host.default_output_device().and_then(|d| d.name().ok()))
+            .flatten();
+        let missing = FELL_BACK
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| OUTPUT.lock().map(|o| o.clone()).unwrap_or_default())
+            .filter(|n| !n.is_empty());
+        let now = std::time::Instant::now();
+        Self {
+            probe,
+            last_pos: Duration::ZERO,
+            stalled_since: None,
+            default_name,
+            none: handle.is_none(),
+            missing,
+            ticks: 0,
+            next_check: now + Duration::from_secs(if handle.is_none() { 3 } else { 1 }),
+        }
+    }
+
+    /// Pourquoi rouvrir la sortie maintenant (au plus une fois par seconde), s'il le faut.
+    fn lost(&mut self, host: &rodio::cpal::Host) -> Option<String> {
+        use rodio::cpal::traits::{DeviceTrait, HostTrait};
+        let now = std::time::Instant::now();
+        if now < self.next_check {
+            return None;
+        }
+        self.next_check = now + Duration::from_secs(1);
+        if self.none {
+            return Some("aucune sortie son jusqu'ici, nouvel essai".to_string());
+        }
+        // La sortie choisie est revenue (toutes les trois secondes : lister les périphériques
+        // coûte un peu plus).
+        self.ticks = self.ticks.wrapping_add(1);
+        if let Some(name) = &self.missing {
+            if self.ticks.is_multiple_of(3) {
+                let back = host.output_devices().ok().is_some_and(|mut it| {
+                    it.any(|d| d.name().ok().as_deref() == Some(name.as_str()))
+                });
+                if back {
+                    return Some(format!("sortie « {name} » revenue"));
+                }
+            }
+        }
+        if let Some(opened) = &self.default_name {
+            let current = host.default_output_device().and_then(|d| d.name().ok());
+            if let Some(cur) = current.filter(|c| c != opened) {
+                return Some(format!("sortie par défaut changée (« {opened} » → « {cur} »)"));
+            }
+        }
+        if let Some(p) = &self.probe {
+            let pos = p.get_pos();
+            if pos != self.last_pos {
+                self.last_pos = pos;
+                self.stalled_since = None;
+            } else if now - *self.stalled_since.get_or_insert(now) >= Duration::from_secs(2) {
+                return Some("la sortie ne joue plus (périphérique perdu ou en veille)".to_string());
+            }
+        }
+        None
+    }
+}
+
+/// (v216) La boucle de la pluie sur la sortie `handle`. (v219) Sa hauteur ondule lentement : la
+/// boucle de 7 s ne se reconnaît plus.
+fn rain_sink(handle: &rodio::OutputStreamHandle) -> Option<Sink> {
+    Sink::try_new(handle).ok().inspect(|s| {
+        let (pcm, rate) = synth::rain_loop();
+        s.append(Wobble::new(pcm, rate, jitter()));
+    })
 }
 
 fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
@@ -1011,8 +1182,11 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
         let spawned = std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
-                let mut out = open_output();
+                let host = rodio::cpal::default_host();
+                let mut out = open_output(true);
                 no_ducking();
+                // (v281) La sortie est surveillée : rouverte toute seule (voir `Watchdog`).
+                let mut watch = Watchdog::new(out.as_ref().map(|o| &o.1), &host);
                 let mut cache: HashMap<
                     &'static str,
                     rodio::source::Buffered<Decoder<Cursor<&'static [u8]>>>,
@@ -1024,26 +1198,64 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                 // (v216) La pluie : une boucle, créée à la première averse, et son volume
                 // propre (sans celui du jeu).
                 let mut rain: Option<(Sink, f32)> = None;
+                // (v281) Son dernier volume demandé (> 0 : elle tombe), pour la reprendre sur
+                // une sortie rouverte.
+                let mut rain_volume = 0.0f32;
                 // (v217) Les tonnerres en cours, à part : ils se taisent quand on quitte la
                 // partie.
                 let mut thunders: Vec<(Sink, f32)> = Vec::new();
                 // (v220) Crépitements des éclairs tenus : une boucle par éclair.
                 let mut crackling: HashMap<u64, rodio::SpatialSink> = HashMap::new();
-                while let Ok(cmd) = rx.recv() {
-                    if cmd.reopen {
+                // (v281) Essais de suite sans aucune sortie son.
+                let mut silent_tries = 0u32;
+                loop {
+                    // (v281) Réveillé au moins deux fois par seconde : la surveillance de la
+                    // sortie tourne même quand aucun son ne part.
+                    let cmd = match rx.recv_timeout(Duration::from_millis(500)) {
+                        Ok(cmd) => Some(cmd),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let lost = watch.lost(&host);
+                    if lost.is_some() || cmd.as_ref().is_some_and(|c| c.reopen) {
+                        // (Sans aucune sortie, l'essai revient toutes les trois secondes : dit
+                        // la première fois, puis toutes les cinq minutes.)
+                        if watch.none {
+                            silent_tries += 1;
+                        } else {
+                            silent_tries = 0;
+                        }
+                        let say = silent_tries == 0 || silent_tries % 100 == 1;
+                        if let Some(why) = lost.as_ref().filter(|_| say) {
+                            log::warn!("audio : {why} : sortie rouverte");
+                        }
                         // Les sons en cours étaient liés à l'ancienne sortie.
                         sinks.clear();
                         thunders.clear();
                         voices.clear();
                         rain = None;
                         crackling.clear();
+                        watch.probe = None;
                         // (L'ancienne fermée d'abord : un périphérique peut ne s'ouvrir
                         // qu'une fois.)
                         drop(out.take());
-                        out = open_output();
-                        no_ducking();
-                        continue;
+                        out = open_output(say);
+                        if out.is_some() {
+                            no_ducking();
+                        }
+                        watch = Watchdog::new(out.as_ref().map(|o| &o.1), &host);
+                        // La pluie en cours reprend (le jeu ne redit son volume que quand il
+                        // change).
+                        if let Some((_, h)) = out.as_ref().filter(|_| rain_volume > 0.0) {
+                            rain = rain_sink(h).map(|s| {
+                                s.set_volume(rain_volume * master() * weather_gain());
+                                (s, rain_volume)
+                            });
+                        }
                     }
+                    let Some(cmd) = cmd.filter(|c| !c.reopen) else {
+                        continue;
+                    };
                     let Some((_, handle)) = &out else {
                         continue;
                     };
@@ -1088,20 +1300,16 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                             thunders.clear();
                         }
                         if volume <= 0.0 {
+                            rain_volume = 0.0;
                             if let Some((r, base)) = &mut rain {
                                 r.pause();
                                 *base = 0.0;
                             }
                             continue;
                         }
+                        rain_volume = volume;
                         if rain.is_none() {
-                            rain = Sink::try_new(handle).ok().map(|s| {
-                                let (pcm, rate) = synth::rain_loop();
-                                // (v219) Sa hauteur ondule lentement : la boucle de 7 s ne
-                                // se reconnaît plus.
-                                s.append(Wobble::new(pcm, rate, jitter()));
-                                (s, volume)
-                            });
+                            rain = rain_sink(handle).map(|s| (s, volume));
                         }
                         if let Some((r, base)) = &mut rain {
                             *base = volume;
@@ -1110,20 +1318,24 @@ fn sender() -> Option<&'static Mutex<Sender<Cmd>>> {
                         }
                         continue;
                     }
-                    // (v216) Son calculé (tonnerre).
+                    // (v216) Son calculé (tonnerre). (v281) Celui de la météo seulement suit
+                    // son volume ; les autres, celui du jeu, comme les sons enregistrés.
                     if let Some((samples, rate)) = cmd.pcm {
-                        thunders.retain(|s| !s.0.empty());
-                        if thunders.len() >= 16 {
-                            thunders.remove(0);
+                        let weather = cmd.weather;
+                        let list = if weather { &mut thunders } else { &mut sinks };
+                        list.retain(|s| !s.0.empty());
+                        if list.len() >= if weather { 16 } else { 48 } {
+                            list.remove(0);
                         }
                         if let Ok(sink) = Sink::try_new(handle) {
-                            sink.set_volume(cmd.volume * master() * weather_gain());
+                            let gain = if weather { weather_gain() } else { 1.0 };
+                            sink.set_volume(cmd.volume * master() * gain);
                             sink.append(
                                 rodio::buffer::SamplesBuffer::new(1, rate, samples)
                                     .speed(cmd.speed.clamp(0.5, 2.0))
                                     .delay(Duration::from_secs_f32(cmd.delay.max(0.0))),
                             );
-                            thunders.push((sink, cmd.volume));
+                            list.push((sink, cmd.volume));
                         }
                         continue;
                     }
@@ -1211,6 +1423,7 @@ pub fn play(sfx: Sfx, delay: f32, gain: f32) {
                 pcm: None,
                 rain: None,
                 crackle: None,
+                weather: false,
             });
         }
     }
@@ -1247,6 +1460,7 @@ fn send_rain(volume: f32) {
                 pcm: None,
                 rain: Some(volume),
                 crackle: None,
+                weather: false,
             });
         }
     }
@@ -1287,6 +1501,7 @@ pub fn thunder(distance: f32, seed: u32, gain: f32) {
                 pcm: Some((pcm, rate)),
                 rain: None,
                 crackle: None,
+                weather: true,
             });
         });
 }
@@ -1305,6 +1520,7 @@ pub fn voice(who: u64, samples: Vec<i16>, volume: f32) {
                 pcm: None,
                 rain: None,
                 crackle: None,
+                weather: false,
             });
         }
     }
@@ -1441,7 +1657,8 @@ pub mod synth {
     /// petits dans les 50 ms qui suivent (l'air qui se déchire), un coup sourd qui lui donne
     /// du corps et une courte queue de souffle. Un cinquième de seconde ; tirés de `seed` :
     /// hauteur, place et force des éclats. Jamais deux fois le même. (v247 : une décharge
-    /// qui bourdonnait et grésillait un tiers de seconde.)
+    /// qui bourdonnait et grésillait un tiers de seconde.) (v281) Le coup qui touche quelqu'un
+    /// (`zeus_hit`) ; le petit éclair a sa décharge (`arc_blast`).
     pub fn crack(seed: u32) -> (Vec<i16>, u32) {
         let mut rng = Noise(seed.wrapping_mul(2_246_822_519) | 1);
         let secs = 0.17 + 0.05 * rng.unit();
@@ -1475,6 +1692,175 @@ pub mod synth {
                 // La queue : un souffle grave, très court.
                 let tail = svf(&mut air, noise, 520.0, 1.2) * (-t / 0.05).exp() * 0.45;
                 snap + body + tail
+            })
+            .collect();
+        finish_short(s)
+    }
+
+    /// (v281) Petit éclair de la Foudre de Zeus (8 blocs, sans charge) : « change le son par un
+    /// truc plus impressionnant ». Une décharge qu'on sent : un claquement sec et clair (l'air
+    /// qui se déchire, deux ou trois répliques), un coup de fouet électrique qui siffle en
+    /// plongeant, l'arc qui rugit (un train d'étincelles serrées, rauque, dont la hauteur
+    /// tremble et qui vacille par à-coups, sur un bourdonnement grave), des étincelles qui
+    /// crépitent de moins en moins, un coup sourd qui descend dans le grave, et un court
+    /// roulement de tonnerre avec ses échos. Un peu plus d'une seconde ; tirés de `seed` :
+    /// hauteurs, durée de l'arc, à-coups, étincelles, échos. Jamais deux fois le même.
+    pub fn arc_blast(seed: u32) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed.wrapping_mul(2_480_367_069) | 1);
+        let secs = 1.1 + 0.3 * rng.unit();
+        let n = (secs * RATE as f32) as usize;
+        let mut out = vec![0.0f32; n];
+        // Le roulement : le souffle grave du coup, puis deux à quatre échos de plus en plus
+        // tardifs, faibles et sourds.
+        burst(&mut out, &mut rng, 0.0, 0.6, 0.003, 0.09, 1100.0);
+        let echoes = 2 + (rng.unit() * 2.99) as usize;
+        for k in 0..echoes {
+            let at = 0.06 + 0.12 * k as f32 + 0.08 * rng.unit();
+            let gain = (0.6 - 0.1 * k as f32) * (0.75 + 0.25 * rng.unit());
+            let decay = 0.12 + 0.1 * rng.unit() + 0.05 * k as f32;
+            let (attack, hz) = (0.015 + 0.02 * rng.unit(), 150.0 + 170.0 * rng.unit());
+            burst(&mut out, &mut rng, at, gain, attack, decay, hz);
+        }
+        let tone = 2800.0 + 1800.0 * rng.unit();
+        // Répliques du claquement : (instant, force).
+        let mut cracks = [(0.0f32, 0.0f32); 3];
+        let count = 2 + (rng.unit() * 1.99) as usize;
+        for c in cracks.iter_mut().take(count) {
+            *c = (0.006 + 0.045 * rng.unit(), 0.35 + 0.45 * rng.unit());
+        }
+        let (whip_from, whip_to) = (4500.0 + 2500.0 * rng.unit(), 380.0 + 300.0 * rng.unit());
+        let whip_len = 0.06 + 0.05 * rng.unit();
+        // L'arc : sa hauteur (étincelles par seconde), sa durée, ses à-coups par seconde.
+        let rip_hz = 105.0 + 70.0 * rng.unit();
+        let arc_len = 0.3 + 0.22 * rng.unit();
+        let flicker = 14.0 + 16.0 * rng.unit();
+        let rip_band = 1500.0 + 1300.0 * rng.unit();
+        let sparks = 70.0 + 70.0 * rng.unit();
+        let boom = 62.0 + 26.0 * rng.unit();
+        let (mut bright, mut band, mut hum, mut fizz) =
+            ((0.0f32, 0.0f32), (0.0f32, 0.0f32), (0.0f32, 0.0f32), (0.0f32, 0.0f32));
+        let (mut p_whip, mut p_rip, mut p_boom) = (0.0f32, 0.0f32, 0.0f32);
+        let (mut drift, mut kick, mut gate, mut spark) = (0.0f32, 0.0f32, 1.0f32, 0.0f32);
+        let kick_fall = (-1.0 / (0.0016 * RATE as f32)).exp();
+        let spark_fall = (-1.0 / (0.0007 * RATE as f32)).exp();
+        let dt = 1.0 / RATE as f32;
+        for (i, o) in out.iter_mut().enumerate() {
+            let t = i as f32 * dt;
+            let noise = rng.next();
+            // 1. Le claquement et ses répliques : plein bruit, très bref.
+            let mut env = 1.5 * (t / 0.0003).min(1.0) * (-t / 0.006).exp();
+            for &(at, force) in cracks.iter().take(count) {
+                if t >= at {
+                    env += force * (-(t - at) / 0.0035).exp();
+                }
+            }
+            let snap = (noise * 0.6 + svf(&mut bright, noise, tone, 0.6)) * env;
+            // 2. Le fouet : un sifflement qui plonge de l'aigu au grave.
+            let w = (t / whip_len).min(1.0);
+            p_whip = (p_whip + whip_from * (whip_to / whip_from).powf(w) * dt).fract();
+            let whip = (TAU * p_whip).sin()
+                * (t / 0.002).min(1.0)
+                * (-t / (whip_len * 0.5)).exp()
+                * 0.45;
+            // 3. L'arc qui rugit : à chaque tour, une étincelle (un éclat de bruit de force tirée
+            //    au hasard) ; la hauteur tremble et baisse un peu ; des à-coups le font vaciller.
+            drift += (noise - drift) * pole(30.0);
+            let fade = (t / arc_len).min(1.0);
+            let hz = rip_hz * (1.0 + 0.3 * drift) * (1.0 - 0.18 * fade);
+            let before = p_rip;
+            p_rip = (p_rip + hz * dt).fract();
+            if p_rip < before {
+                kick = 0.55 + 0.45 * rng.unit();
+            }
+            kick *= kick_fall;
+            if rng.unit() < flicker * dt {
+                gate = if rng.unit() < 0.3 { 0.2 } else { 0.65 + 0.35 * rng.unit() };
+            }
+            let life = (t / 0.003).min(1.0)
+                * if t < arc_len { 1.0 } else { (-(t - arc_len) / 0.045).exp() };
+            let rip = noise * kick;
+            let roar = (svf(&mut band, rip, rip_band, 0.7) * 1.3 + rip * 0.45
+                + svf(&mut hum, 2.0 * p_rip - 1.0, 420.0, 0.9) * 0.5)
+                * life
+                * gate;
+            // 4. Les étincelles qui crépitent, de moins en moins souvent et de moins en moins
+            //    fort (plus aucune passé l'arc).
+            let dying = (-t / 0.3).exp();
+            if t < arc_len + 0.15 && rng.unit() < sparks * dying * dt {
+                spark = (0.5 + 0.5 * rng.unit()) * dying.sqrt();
+            }
+            spark *= spark_fall;
+            let crackle = svf(&mut fizz, noise, 5200.0, 1.1) * spark * 1.4;
+            // 5. Le coup sourd, qui descend dans le grave.
+            p_boom = (p_boom + boom * (1.35 - 0.7 * (t / 0.35).min(1.0)) * dt).fract();
+            let thump = (TAU * p_boom).sin() * (t / 0.003).min(1.0) * (-t / 0.15).exp() * 0.95;
+            *o += snap + whip + roar + crackle + thump;
+        }
+        // Le roulement finit en douceur (pas de coupure).
+        let fade = (RATE as usize / 8).min(n);
+        for (i, v) in out[n - fade..].iter_mut().enumerate() {
+            *v *= 1.0 - i as f32 / fade as f32;
+        }
+        finish_short(out)
+    }
+
+    /// (v281) Seau qui se remplit (`fill`) ou qu'on vide, d'eau ou de lave (`lava`) : un
+    /// glouglou de bulles (chacune une petite note qui monte vite et s'éteint, de plus en plus
+    /// aiguës quand le seau se remplit, de plus en plus graves quand on le vide), le souffle du
+    /// fluide qui coule, un petit coup sur le métal au début ; la lave plus grave, aux bulles
+    /// plus lentes et plus grosses, qui craque. Un tiers à deux tiers de seconde ; tirés de
+    /// `seed` : durée, hauteurs, bulles, timbre du métal.
+    pub fn bucket(seed: u32, fill: bool, lava: bool) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed.wrapping_mul(3_032_354_929) | 1);
+        let secs = if lava {
+            0.5 + 0.15 * rng.unit()
+        } else {
+            0.34 + 0.12 * rng.unit()
+        };
+        let (lo, hi) = if lava { (110.0, 300.0) } else { (320.0, 950.0) };
+        let (from, to) = if fill { (lo, hi) } else { (hi, lo) };
+        let (from, to) = (from * (0.85 + 0.3 * rng.unit()), to * (0.85 + 0.3 * rng.unit()));
+        let per_s = if lava { 18.0 } else { 55.0 } * (0.8 + 0.4 * rng.unit());
+        let life = if lava { 0.045 } else { 0.018 };
+        let metal = 1100.0 + 600.0 * rng.unit();
+        let n = (secs * RATE as f32) as usize;
+        let dt = 1.0 / RATE as f32;
+        // Bulles en cours : (phase, hauteur, âge, durée, force).
+        let mut live: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
+        let (mut pour, mut fry) = ((0.0f32, 0.0f32), (0.0f32, 0.0f32));
+        let mut pop = 0.0f32;
+        let s = (0..n)
+            .map(|i| {
+                let t = i as f32 * dt;
+                let k = t / secs;
+                let noise = rng.next();
+                let env = (t / 0.015).min(1.0) * (1.0 - k).powf(if fill { 0.7 } else { 1.3 });
+                if live.len() < 10 && rng.unit() < per_s * dt * (0.3 + env) {
+                    let hz = from * (to / from).powf(k) * (0.75 + 0.5 * rng.unit());
+                    let len = life * (0.6 + 0.8 * rng.unit());
+                    live.push((0.0, hz, 0.0, len, (0.5 + 0.5 * rng.unit()) * env.max(0.2)));
+                }
+                // Chaque bulle : une note qui monte vite et s'éteint.
+                let mut glug = 0.0;
+                for b in live.iter_mut() {
+                    let u = b.2 / b.3;
+                    b.0 = (b.0 + b.1 * (1.0 + 1.2 * u) * dt).fract();
+                    glug += (TAU * b.0).sin() * b.4 * (u / 0.08).min(1.0) * (-u * 3.0).exp();
+                    b.2 += dt;
+                }
+                live.retain(|b| b.2 < b.3 * 2.0);
+                let flow = svf(&mut pour, noise, if lava { 380.0 } else { 900.0 }, 0.9) * env * 0.5;
+                // Le seau : un petit coup sur le métal.
+                let clank = ((TAU * metal * t).sin() + 0.5 * (TAU * metal * 2.7 * t).sin())
+                    * (-t / 0.03).exp()
+                    * 0.25;
+                // La lave : quelques craquements, de plus en plus rares.
+                if lava && rng.unit() < 25.0 * (1.0 - k) * dt {
+                    pop = 0.7 + 0.3 * rng.unit();
+                }
+                pop *= 0.992;
+                let crackle = svf(&mut fry, noise, 4200.0, 1.0) * pop * pop * 0.35;
+                glug + flow + clank + crackle
             })
             .collect();
         finish_short(s)
@@ -2040,6 +2426,69 @@ mod tests {
             assert!(!seen.contains(&pcm), "même air pour {seed}");
             seen.push(pcm);
         }
+    }
+
+    /// (v281) La décharge du petit éclair de la Foudre de Zeus : plus d'une seconde, pas saturée,
+    /// sans clic à la fin, jamais la même ; plus pleine que le coup sec (qui sert désormais au
+    /// coup qui touche, 10 % plus fort) ; entendue en entier jusqu'à 10 blocs.
+    #[test]
+    fn the_zeus_arc_is_a_blast_and_the_hit_is_the_old_crack() {
+        let energy = |pcm: &[i16], secs: f32| {
+            let n = ((secs * synth::RATE as f32) as usize).min(pcm.len());
+            pcm[..n].iter().map(|&v| (v as f64).powi(2)).sum::<f64>()
+        };
+        let mut seen = Vec::new();
+        for seed in [1u32, 7, 12_345, 999_999, 31_337] {
+            let (pcm, rate) = synth::arc_blast(seed);
+            assert_eq!(rate, synth::RATE);
+            let secs = pcm.len() as f32 / rate as f32;
+            assert!((1.0..1.5).contains(&secs), "{secs} s");
+            let peak = pcm.iter().map(|v| v.unsigned_abs()).max().unwrap();
+            assert!(peak > 25_000 && peak < 32_000, "{peak}");
+            assert!(pcm.last().is_some_and(|v| v.unsigned_abs() < 200), "clic à la fin");
+            let (crack, _) = synth::crack(seed);
+            // Plus pleine que le coup sec : sa première demi-seconde porte deux fois plus
+            // d'énergie que lui tout entier, au moins (à crête égale).
+            assert!(energy(&pcm, 0.5) > 2.0 * energy(&crack, 1.0), "{seed}");
+            assert!(!seen.contains(&pcm), "même décharge pour {seed}");
+            seen.push(pcm);
+        }
+        assert!((HIT_VOLUME - 0.605).abs() < 1e-6);
+        assert_eq!(arc_gain(0.0), 1.0);
+        assert_eq!(arc_gain(9.0), 1.0);
+        assert!((arc_gain(20.0) - 0.5).abs() < 1e-6);
+        assert!((arc_gain(100.0) - 0.1).abs() < 1e-6);
+    }
+
+    /// (v281) Le seau : court, pas saturé, sans clic à la fin, jamais le même ; la lave plus
+    /// longue et plus grave que l'eau ; le remplir et le vider ne sonnent pas pareil.
+    #[test]
+    fn the_bucket_sounds_change_every_time() {
+        let pitch = |pcm: &[i16]| {
+            let x: Vec<f64> = pcm.iter().map(|&v| v as f64).collect();
+            let e: f64 = x.iter().map(|v| v * v).sum();
+            let d: f64 = x.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum();
+            synth::RATE as f64 / std::f64::consts::TAU * (d / e).sqrt()
+        };
+        let mut seen = Vec::new();
+        for (fill, lava) in [(true, false), (false, false), (true, true), (false, true)] {
+            for seed in [3u32, 4, 99] {
+                let (pcm, rate) = synth::bucket(seed, fill, lava);
+                assert_eq!(rate, synth::RATE);
+                let secs = pcm.len() as f32 / rate as f32;
+                assert!((0.3..0.7).contains(&secs), "{secs} s");
+                let peak = pcm.iter().map(|v| v.unsigned_abs()).max().unwrap();
+                assert!(peak > 25_000 && peak < 32_000, "{peak}");
+                assert!(pcm.last().is_some_and(|v| v.unsigned_abs() < 200), "clic à la fin");
+                assert!(!seen.contains(&pcm), "même son");
+                seen.push(pcm);
+            }
+        }
+        let water = synth::bucket(7, true, false).0;
+        let lava = synth::bucket(7, true, true).0;
+        assert!(lava.len() > water.len());
+        assert!(pitch(&lava) < pitch(&water), "la lave plus grave");
+        assert_ne!(synth::bucket(7, true, false).0, synth::bucket(7, false, false).0);
     }
 
     /// (v217) La hauteur des sons varie un peu à chaque fois (pas plus que prévu), jamais

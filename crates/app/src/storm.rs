@@ -305,8 +305,14 @@ impl Storm {
                     lightning::Kind::Sky => crate::audio::thunder(25.0, s.seed, SKY_THROW_GAIN),
                     // (v241) L'arc court claque sec, et des étincelles jaillissent de ce
                     // qu'il touche. (v247) Son propre bruit : une décharge, pas un tonnerre.
+                    // (v281) Une décharge qui impressionne ; et le coup sec quand il touche
+                    // quelqu'un, juste après elle (le nôtre en entier, où qu'il touche).
                     lightning::Kind::Arc => {
-                        crate::audio::zap();
+                        let d = (s.pos - f.eye).length();
+                        crate::audio::zeus_arc(d);
+                        if s.hit {
+                            crate::audio::zeus_hit(if s.follow { 0.0 } else { d }, HIT_AFTER);
+                        }
                         self.sparks.burst(s.pos, Vec3::Y, 26, 5.0);
                     }
                     lightning::Kind::Ground => {
@@ -454,18 +460,20 @@ impl Storm {
     }
 
     /// (v241) Foudre de Zeus sans charge : un arc part de sa pointe `from` jusqu'à `to`, sans
-    /// passer par le ciel. L'éclair tenu sursaute vers lui.
-    pub fn strike_arc(&mut self, from: Vec3, to: Vec3) {
+    /// passer par le ciel. L'éclair tenu sursaute vers lui. (v281) `hit` : il touche quelqu'un
+    /// (le coup sec part avec lui).
+    pub fn strike_arc(&mut self, from: Vec3, to: Vec3, hit: bool) {
         let seed = self.rng.next() as u32;
-        self.strike_arc_seeded(from, to, seed, true);
+        self.strike_arc_seeded(from, to, seed, true, hit);
     }
 
     /// (v244) Le même, de forme tirée de `seed` (sur un serveur de construction, l'arbitre
     /// le publie avec sa graine). `own` : c'est le sien, parti de l'éclair qu'on tient : il
     /// sursaute, et l'arc suit sa pointe tant qu'il dure (`follow_arcs`).
-    pub fn strike_arc_seeded(&mut self, from: Vec3, to: Vec3, seed: u32, own: bool) {
+    pub fn strike_arc_seeded(&mut self, from: Vec3, to: Vec3, seed: u32, own: bool, hit: bool) {
         let mut s = Strike::arc(from, to, seed);
         s.follow = own;
+        s.hit = hit;
         self.strikes.push(s);
         if own {
             self.held.surge(from, (to - from).normalize_or(Vec3::Y));
@@ -787,6 +795,11 @@ const STORM_GAIN: f32 = 0.9;
 /// (v247) Foudre lancée vers le ciel (celle qui charge la Foudre de Zeus) : 20 % moins fort.
 const SKY_THROW_GAIN: f32 = 0.8;
 
+/// (v281) Le coup sec de l'éclair qui touche quelqu'un part ce temps (s) après le claquement
+/// du petit éclair, ou de la foudre qui tombe : on entend l'éclair, puis le coup (et leurs
+/// crêtes ne s'ajoutent pas).
+pub const HIT_AFTER: f32 = 0.03;
+
 /// (v217) Hauteur de la Foudre de Zeus posée au sol (blocs). (v235) Celle de l'éclair tenu
 /// en main (elle valait 0,55).
 const GROUND_ITEM: f32 = lightning::HELD_LEN;
@@ -918,7 +931,7 @@ mod tests {
         // L'arc court.
         let mut s = Storm::new(5);
         let (tip, to) = (Vec3::new(8.0, 66.5, 8.0), Vec3::new(13.0, 65.9, 9.0));
-        s.strike_arc(tip, to);
+        s.strike_arc(tip, to, false);
         let (mut hurt, mut lit, mut high, mut flash) = (0u32, 0usize, f32::MIN, 0.0f32);
         for _ in 0..300 {
             let mut f = frame(&world, Vec3::new(13.0, 65.0, 9.0));

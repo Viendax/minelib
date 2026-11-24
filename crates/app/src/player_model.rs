@@ -1391,6 +1391,10 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
     let (Some(hand), Some(held)) = (hand_frame(pose), pose.held) else {
         return Vec::new();
     };
+    // (v281) La main vide, tendue comme si elle tenait un bloc : un bloc d'air, rien à dessiner.
+    if held == Held::Block(BlockId::AIR) {
+        return Vec::new();
+    }
     // Un bloc tenu fait 6 pixels de côté (≈ un tiers de bloc), posé devant le poing.
     let block_box = |a: [u8; 3], b: [u8; 3], dy: f32| {
         let k = 6.0 / 16.0;
