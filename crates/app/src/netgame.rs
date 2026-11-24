@@ -2438,6 +2438,15 @@ impl NetGame {
         }
     }
 
+    /// (v294) Invité : retard des nouvelles de l'hôte sur sa propre horloge, en pas.
+    #[cfg(test)]
+    pub fn behind(&self) -> f32 {
+        match self {
+            NetGame::Guest(g) => g.seen_tick.map_or(0.0, |s| g.clock - s as f32),
+            NetGame::Host(_) => 0.0,
+        }
+    }
+
     /// (v286) Invité : messages d'entrées partis par le relais depuis le début.
     #[cfg(test)]
     pub fn relay_inputs(&self) -> u32 {
@@ -5393,6 +5402,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// (v294) Cadence d'un essai de partie en réseau. Ces essais font avancer la partie bien
+    /// plus vite que le temps réel (une image de 15,6 ms de jeu en une milliseconde ou
+    /// moins), alors que les messages passent par de vrais fils et de vraies sockets. Sur
+    /// une machine très chargée, un message met plusieurs millisecondes à traverser : pour
+    /// l'essai, plusieurs images. Il échouait alors pour un retard qui n'existe pas en jeu,
+    /// où une image dure son vrai temps.
+    ///
+    /// La pause entre deux images s'allonge donc tant que les invités ont du retard sur
+    /// l'hôte (les messages n'ont pas eu le temps d'arriver), et revient à sa valeur quand
+    /// le réseau suit. Elle ne dépasse jamais la durée réelle d'une image : un retard qui
+    /// existerait aussi en temps réel est toujours compté, et l'essai échoue toujours.
+    struct Pace {
+        base_ms: f32,
+        /// Retard (pas) à partir duquel la pause s'allonge.
+        limit: f32,
+        ms: f32,
+        owed: f32,
+    }
+
+    impl Pace {
+        /// Durée réelle d'une image de ces essais (4 pas de 1/256 s).
+        const REAL_MS: f32 = 4.0 * crate::session::SIM_TICK * 1000.0;
+
+        fn new(base_ms: f32, limit: f32) -> Self {
+            Pace {
+                base_ms,
+                limit,
+                ms: base_ms,
+                owed: 0.0,
+            }
+        }
+
+        /// Fin d'une image ; `behind` : le plus grand retard d'un invité sur l'hôte (pas).
+        fn wait(&mut self, behind: f32) {
+            self.ms = if behind > self.limit {
+                (self.ms * 2.0).clamp(1.0, Self::REAL_MS)
+            } else {
+                (self.ms * 0.98).max(self.base_ms)
+            };
+            // (Une pause plus courte qu'une milliseconde : une de temps en temps.)
+            self.owed += self.ms;
+            if self.owed >= 1.0 {
+                std::thread::sleep(Duration::from_secs_f32(self.owed / 1000.0));
+                self.owed = 0.0;
+            }
+        }
+    }
+
     /// Ce qu'on a mesuré dans une partie d'essai de la voie rapide (`fast_match`).
     struct FastRun {
         /// Écart entre l'invité et ce que l'hôte en voit, en pleine course puis à la fin.
@@ -5502,6 +5559,8 @@ mod tests {
         let mut late_h: VecDeque<(usize, Event)> = VecDeque::new();
         let mut late_g: VecDeque<(usize, Event)> = VecDeque::new();
         let mut slow_from: Option<usize> = None;
+        // (Dès le retard que l'invité compte comme une image bloquée.)
+        let mut pace = Pace::new(1.0, STALL_TICKS);
         // (v286) Messages d'entrées déjà partis par le relais quand la voie s'ouvre, et la
         // dernière image.
         let (mut inputs_before, mut last_frame) = (0u32, 0usize);
@@ -5681,7 +5740,7 @@ mod tests {
                 done = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            pace.wait(guest.as_ref().map_or(0.0, |g| g.behind()));
         }
         assert!(done, "la voie rapide ne s'est jamais ouverte");
         let (NetGame::Host(hs), Some(NetGame::Guest(gs))) = (&host, &guest) else {
@@ -5719,6 +5778,7 @@ mod tests {
     #[test]
     fn the_fast_way_keeps_up_when_the_relay_lags() {
         let r = fast_match(false);
+        eprintln!("VOIE RAPIDE : {} images bloquées sur {}", r.stalled, r.frames);
         // L'invité court à plus de 4 blocs par seconde : par le relais seul, l'hôte l'aurait
         // vu avec 40 images de retard, soit 3 blocs en arrière.
         assert!(r.mid_gap < 1.0, "en pleine course, l'hôte suit l'invité à {} bloc", r.mid_gap);
@@ -6062,6 +6122,9 @@ mod tests {
         let mut accepted: Vec<u64> = Vec::new();
         let begin = Instant::now();
         let mut frame: u64 = 0;
+        // (Par le relais, un joueur a couramment une ou deux images de retard, 4 à 8 pas :
+        // la pause ne s'allonge qu'au-delà de 8 images, quand le réseau ne suit plus.)
+        let mut pace = Pace::new(0.25, 32.0);
         // Après la fin chez tous, encore un peu de temps (dernière copie au vérificateur).
         let mut after = 0;
         while after < 300 {
@@ -6069,9 +6132,13 @@ mod tests {
                 after += 1;
             }
             frame += 1;
+            // (v294) La limite est en images de jeu, pas en temps : une machine chargée met
+            // plus longtemps, pas plus d'images (25 000 d'habitude). Le temps ne sert plus
+            // que de garde-fou contre un blocage complet.
             assert!(
-                begin.elapsed() < Duration::from_secs(900),
-                "la partie ne finit pas (image {frame})"
+                frame < 200_000 && begin.elapsed() < Duration::from_secs(3600),
+                "la partie ne finit pas (image {frame}, {:.0} s)",
+                begin.elapsed().as_secs_f32()
             );
             // Messages reçus : l'hôte (et la copie attestée pour le vérificateur).
             while let Some(e) = hc.poll() {
@@ -6255,10 +6322,12 @@ mod tests {
                 b.net
                     .end_frame(&world, shots, ak(), NadeOut::default(), 4.0 * dt);
             }
-            if frame.is_multiple_of(4) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            // (v294) Une milliseconde toutes les 4 images quand le réseau suit ; plus quand
+            // les joueurs ont du retard sur l'hôte (machine chargée : voir `Pace`).
+            let behind = bots.iter().map(|b| b.net.behind()).fold(0.0, f32::max);
+            pace.wait(if host_over.is_some() { 0.0 } else { behind });
         }
+        eprintln!("DIX JOUEURS : partie finie en {frame} images, {:.0} s", begin.elapsed().as_secs_f32());
         // Les derniers messages (copie finale) arrivent.
         for _ in 0..200 {
             for b in &mut bots {
