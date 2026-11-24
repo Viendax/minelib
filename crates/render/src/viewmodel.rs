@@ -42,8 +42,9 @@ pub struct ArmVertex {
 
 /// Main, effets du monde et icônes 3D de l'interface (menu d'achat : toutes les armes).
 const MAX_VERTICES: usize = 524_288;
-/// Bras : 4 × 12 × 4 pixels de skin, deux triangles chacun.
-const MAX_ARM_VERTICES: usize = 4096;
+/// Bras : 4 × 12 × 4 pixels de skin, deux triangles chacun. (v267) Et le corps du joueur vu
+/// de ses propres yeux (jambes, ventre, poitrine, bras gauche : 6 000 sommets), avec ses plaies.
+const MAX_ARM_VERTICES: usize = 16_384;
 
 pub struct ViewModel {
     pipeline: wgpu::RenderPipeline,

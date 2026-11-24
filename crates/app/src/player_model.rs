@@ -9,7 +9,7 @@
 //! (`PARTS`).
 
 use glam::{Mat4, Vec3, Vec4};
-use minelib_render::{EntityVertex, PlayerInstance, PlayerVertex, RayBox, RayBoxKind, ShadowBox};
+use minelib_render::{ArmVertex, EntityVertex, PlayerInstance, PlayerVertex, RayBox, RayBoxKind, ShadowBox};
 use minelib_world::BlockId;
 
 /// Taille d'un pixel du skin, en blocs (32 pixels = hauteur du joueur).
@@ -2020,6 +2020,71 @@ pub fn chest_point(feet: Vec3, yaw: f32, crouch: f32) -> Vec3 {
     upper.transform_point3(Vec3::new(0.0, BODY_H * 0.6, 0.0))
 }
 
+/// (v267) « On doit voir notre corps dans le jeu, pour voir les traces de morsure et car
+/// j'aime ; pas en mode FPS » : de combien le corps vu de ses propres yeux est reculé (blocs).
+/// La caméra est à la verticale des pieds, au milieu du corps ; de vrais yeux sont sur le
+/// visage, devant. Reculé d'autant, le corps se voit comme on voit le sien en baissant les
+/// yeux (la poitrine, le ventre, les jambes, les pieds), sans que la caméra soit dedans.
+pub const FIRST_PERSON_BACK: f32 = 0.15;
+/// (v267) Recul au plus (accroupi, la tête du modèle avance de 0,32 bloc : le corps suivrait
+/// d'autant ; au-delà de la demi-largeur du joueur, il entrerait dans le mur derrière lui).
+const FIRST_PERSON_BACK_MAX: f32 = 0.3;
+/// (v267) Le regard doit être baissé d'au moins cet angle (radians) pour qu'un morceau du
+/// corps entre dans l'image : au-dessus, rien n'est construit.
+pub const FIRST_PERSON_PITCH: f32 = -0.15;
+
+/// (v267) Le corps du joueur vu de ses propres yeux, à dessiner avec son bras de la première
+/// personne (mêmes sommets, même éclairage : lumière du lieu et lumières dynamiques) : les
+/// jambes, le ventre, la poitrine et le bras gauche du modèle, pixel par pixel de son skin,
+/// avec ses plaies. Ni la tête (la caméra y est), ni le bras droit (il est dessiné tendu, avec
+/// ce qu'il tient : `right_arm_matrix`). `view_proj` : du monde à l'écran.
+pub fn first_person_body(pose: &Pose, wounds: &[Wound], view_proj: Mat4) -> Vec<ArmVertex> {
+    let (ahead, _) = head_place(pose.crouch);
+    let back = (ahead + FIRST_PERSON_BACK).min(FIRST_PERSON_BACK_MAX);
+    let seen = Pose {
+        feet: pose.feet - Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos()) * back,
+        yaw: pose.yaw,
+        pitch: pose.pitch,
+        walk: pose.walk,
+        swing: pose.swing,
+        crouch: pose.crouch,
+        light: pose.light,
+        held: pose.held,
+        skin: pose.skin.clone(),
+    };
+    let mut out = Vec::with_capacity(6400);
+    let mut quads = Vec::with_capacity(1600);
+    for (i, (xf, min, max, part)) in parts(&seen).into_iter().enumerate() {
+        if i == 4 || i == 5 {
+            continue;
+        }
+        quads.clear();
+        emit_box(&mut quads, xf, min, max, ZONES[i], part, seen.light, seen.skin.as_deref());
+        for w in wounds.iter().filter(|w| w.part as usize == i) {
+            quads.extend(wound_model(&seen, std::slice::from_ref(w)));
+        }
+        // La normale de chaque carré, vers le dehors du pavé (pour les lumières).
+        let center = xf.transform_point3((Vec3::from(min) + Vec3::from(max)) / 2.0);
+        for q in quads.chunks_exact(6) {
+            let (a, b, c) = (Vec3::from(q[0].pos), Vec3::from(q[1].pos), Vec3::from(q[2].pos));
+            let mut n = (b - a).cross(c - a).normalize_or_zero();
+            if n.dot((a + c) / 2.0 - center) < 0.0 {
+                n = -n;
+            }
+            for v in q {
+                out.push(ArmVertex {
+                    clip: (view_proj * Vec3::from(v.pos).extend(1.0)).to_array(),
+                    world: v.pos,
+                    normal: n.to_array(),
+                    albedo: v.color,
+                    light: seen.light,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// (v264) Plaie qu'un coup laisse sur le corps d'un joueur en partie FPS (« un impact dans le
 /// joueur ») : le pavé touché (numéro de `parts`), sa face (ordre de `box_faces`), la place de
 /// la plaie sur cette face (pixels du pavé : x ou z, puis y ou z) et sa graine (chaque plaie a
@@ -2737,6 +2802,74 @@ mod tests {
         // Un objet en main : ce bras-là n'est plus écarté (il est tendu devant).
         let (xf, _, _, _) = parts(&pose(Some(Held::Wand([255, 0, 0]))))[4];
         assert!(xf.transform_vector3(Vec3::X).y.abs() < 1e-6);
+    }
+
+    /// (v267) « On doit voir notre corps dans le jeu » : à la première personne, en baissant
+    /// les yeux, on voit sa poitrine, son ventre, ses jambes et son bras gauche ; ni sa tête,
+    /// ni son bras droit (dessiné à part). Rien n'est trop près des yeux pour être coupé par
+    /// le plan proche de la caméra (0,05), debout comme accroupi, quel que soit le regard.
+    #[test]
+    fn looking_down_one_sees_ones_own_body() {
+        let near = 0.05;
+        for crouch in [0.0f32, 1.0] {
+            for pitch in [-1.5f32, -1.0, -0.5] {
+                let pose = Pose {
+                    feet: Vec3::new(3.0, 20.0, -7.0),
+                    yaw: 0.8,
+                    pitch,
+                    walk: 0.0,
+                    swing: 0.0,
+                    crouch,
+                    light: [1.0; 3],
+                    held: None,
+                    skin: None,
+                };
+                let eye = crate::session::eye_of(pose.feet, crouch);
+                let view = (Mat4::from_translation(eye)
+                    * Mat4::from_rotation_y(-pose.yaw)
+                    * Mat4::from_rotation_x(pitch))
+                .inverse();
+                let proj = Mat4::perspective_infinite_reverse_rh(
+                    crate::session::FOV.to_radians(),
+                    16.0 / 9.0,
+                    near,
+                );
+                let body = first_person_body(&pose, &test_wounds(), proj * view);
+                assert!(body.len() > 5000 && body.len() % 6 == 0, "{}", body.len());
+                // Des carrés dans l'image, devant le plan proche.
+                let seen = body
+                    .iter()
+                    .filter(|v| {
+                        let [x, y, _, w] = v.clip;
+                        w > near && x.abs() < w && y.abs() < w
+                    })
+                    .count();
+                // (Debout sans bouger, le regard à peine baissé, on ne voit pas encore son
+                // corps : il est sous soi.)
+                if pitch <= -1.0 {
+                    assert!(seen > 600, "accroupi {crouch}, regard {pitch} : {seen} sommets vus");
+                }
+                // Le plan proche ne coupe aucun carré dans l'image (on verrait dedans) : là
+                // où un côté de triangle le traverse, c'est hors de l'écran.
+                for t in body.chunks_exact(3) {
+                    for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+                        let (a, b) = (glam::Vec4::from(t[a].clip), glam::Vec4::from(t[b].clip));
+                        if (a.w - near) * (b.w - near) < 0.0 {
+                            let c = a + (b - a) * ((near - a.w) / (b.w - a.w));
+                            assert!(
+                                c.x.abs() > c.w || c.y.abs() > c.w,
+                                "accroupi {crouch}, regard {pitch} : coupé par le plan proche \
+                                 dans l'image ({}, {})",
+                                c.x / c.w,
+                                c.y / c.w
+                            );
+                        }
+                    }
+                }
+                // Normales vers le dehors : unitaires.
+                assert!(body.iter().all(|v| (Vec3::from(v.normal).length() - 1.0).abs() < 1e-3));
+            }
+        }
     }
 
     /// (v264) « Un impact dans le joueur » : la plaie est sur le pavé touché, sur sa face

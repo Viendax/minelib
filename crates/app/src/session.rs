@@ -10978,7 +10978,7 @@ impl Session {
         };
         // Bras à la première personne (pas en mode FPS, qui a ses armes, ni en spectateur) :
         // éclairé comme le modèle du joueur en F5.
-        let arm = if let Some((_, arm)) = first_person_lamp {
+        let mut arm = if let Some((_, arm)) = first_person_lamp {
             // (v215) Lampe torche : le bras droit du modèle, tendu, qui la tient. (v239) Tout
             // objet tenu en construction.
             crate::hand::Hand::arm_world(world_proj * view, arm, self.hand_light, skin.as_deref())
@@ -10998,6 +10998,23 @@ impl Session {
         } else {
             Vec::new()
         };
+        // (v267) « On doit voir notre corps dans le jeu […] pas en mode FPS » : son propre
+        // corps à la première personne, quand le regard est assez baissé pour qu'il entre
+        // dans l'image (avec ses plaies). Ni spectateur, ni interface masquée (F1).
+        if third == 0
+            && !fps_mode
+            && !hud_off
+            && visible
+            && self.spectating.is_none()
+            && self.player.pitch < crate::player_model::FIRST_PERSON_PITCH
+        {
+            let wounds = self.wounds.get("").map_or(&[][..], Vec::as_slice);
+            arm.extend(crate::player_model::first_person_body(
+                &pose,
+                wounds,
+                world_proj * view,
+            ));
+        }
         let smokes = self.fps.smoke_volumes();
         let flames = self.fps.flames();
         // Têtes (par zone) et cadres des cartes importées.
