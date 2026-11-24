@@ -207,6 +207,14 @@ fn page_address(json: &str) -> Option<String> {
 }
 
 /// (v243) Une vidéo joue-t-elle dans la page (temps connu, pas en pause) ?
+/// (v253) La page du lecteur montre-t-elle sa file d'attente (`o`) ? `None` : pas dit.
+fn page_panel(json: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get("o")?
+        .as_bool()
+}
+
 fn page_playing(json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return false;
@@ -519,6 +527,8 @@ pub struct Displays {
     filtre: &'static str,
     /// Pages refusées depuis le dernier `take_blocked` : (écran, raison).
     blocked: Vec<(u32, u8)>,
+    /// (v253) Ordres des pages depuis le dernier `take_orders` : (écran, JSON).
+    orders: Vec<(u32, String)>,
     /// (v210) Écran regardé (lecture automatique permise, un seul à la fois), et temps
     /// avant de lui redonner l'accord.
     regarde: Option<u32>,
@@ -539,6 +549,7 @@ impl Displays {
             volume: 0.5,
             filtre: "blanche",
             blocked: Vec::new(),
+            orders: Vec::new(),
             regarde: None,
             regarde_in: 0.0,
         }
@@ -641,6 +652,12 @@ impl Displays {
     /// du navigateur.
     pub fn take_blocked(&mut self) -> Vec<(u32, u8)> {
         std::mem::take(&mut self.blocked)
+    }
+
+    /// (v253) Les ordres des pages depuis la dernière fois : (écran, JSON) — vidéo cliquée
+    /// sur le site de YouTube, vidéo retirée de la file d'attente (voir `watch::Party::order`).
+    pub fn take_orders(&mut self) -> Vec<(u32, String)> {
+        std::mem::take(&mut self.orders)
     }
 
     /// Volume du son de tous les écrans (0 à 1). (v213) Il ne touche plus aux pages : le
@@ -1018,6 +1035,26 @@ impl Displays {
                 b.send(&format!("blur {id}"));
             }
         }
+        // (v253) La file d'attente du lecteur s'ouvre ou se ferme (la page la fait glisser) ;
+        // redit au plus une fois par seconde à une page qui ne l'a pas encore fait.
+        let mut panneaux = Vec::new();
+        for (id, tab) in self.tabs.iter_mut() {
+            let sur_lecteur = crate::watch::is_player(&tab.addr);
+            if !tab.opened || !sur_lecteur || tab.panel_page == Some(tab.panel_open) {
+                continue;
+            }
+            if tab.panel_sent != Some(tab.panel_open) || tab.panel_ago >= 1.0 {
+                tab.panel_sent = Some(tab.panel_open);
+                tab.panel_ago = 0.0;
+                panneaux.push((*id, tab.panel_open));
+            }
+        }
+        for (id, o) in panneaux {
+            self.eval(
+                id,
+                &format!("(()=>{{if(window.__mlb&&window.__mlb.panneau)window.__mlb.panneau({o});}})()"),
+            );
+        }
         if self.tabs.is_empty() {
             self.idle += dt;
             if self.idle >= IDLE_STOP_S && self.browser.is_some() {
@@ -1076,11 +1113,13 @@ impl Displays {
                                 tab.addr = u;
                             }
                             tab.playing = page_playing(&s);
+                            tab.panel_page = page_panel(&s);
                             self.states.push((id, s))
                         }
                         Event::Scroll(f) => tab.scroll = f,
                         Event::History(h) => tab.history = h,
                         Event::Blocked(raison) => self.blocked.push((id, raison)),
+                        Event::Ordre(o) => self.orders.push((id, o)),
                     }
                 }
             }
@@ -1175,6 +1214,47 @@ struct Corner {
     /// (v243) Où le regard coupait le plan de l'écran à l'image d'avant, à toute distance
     /// (hors de l'écran : en dehors de 0..1).
     prev: Option<[f32; 2]>,
+}
+
+/// (v253) La file d'attente du lecteur YouTube, sur la droite de l'écran (largeur
+/// `PANNEAU_U`..1, 352 px de 1280 dans la page). Comme les boutons, et pour soi seul : elle
+/// ne vient que si le regard **entre sur l'écran par son bord droit** et reste sur elle ; elle
+/// s'en va dès qu'on regarde ailleurs sur l'écran (et il faut revenir par le bord), ou qu'on
+/// s'éloigne (hors de portée de main ; elle revient en se rapprochant sans quitter la
+/// zone). La page la fait glisser depuis la droite, et la vidéo se réduit à côté (jamais
+/// par-dessus).
+const PANNEAU_U: f32 = 1.0 - 352.0 / 1280.0;
+/// (v253) Un peu de marge avant de la refermer en allant vers la vidéo.
+const PANNEAU_MARGE: f32 = 0.02;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Panneau {
+    /// Entré par le bord droit, sur la zone de la file, et pas reparti ailleurs depuis.
+    armed: bool,
+    /// Où le regard coupait le plan de l'écran à l'image d'avant.
+    prev: Option<[f32; 2]>,
+}
+
+impl Panneau {
+    /// La file doit-elle être ouverte ?
+    fn target(&mut self, cursor: Option<[f32; 2]>, ray: Option<[f32; 2]>) -> bool {
+        let prev = std::mem::replace(&mut self.prev, ray);
+        let Some(p) = ray.filter(|p| on_screen(*p)) else {
+            self.armed = false;
+            return false;
+        };
+        if !prev.is_some_and(on_screen) {
+            self.armed = prev.is_some_and(|q| q[0] > 1.0) && p[0] >= PANNEAU_U;
+        }
+        if !self.armed || cursor.is_none() {
+            return false;
+        }
+        if p[0] < PANNEAU_U - PANNEAU_MARGE {
+            self.armed = false;
+            return false;
+        }
+        true
+    }
 }
 
 /// Le point est-il sur l'écran ?
@@ -1274,6 +1354,13 @@ struct Tab {
     /// une arrivée par le bord, dans le coin en bas à gauche (voir `Corner`).
     reveal: f32,
     corner: Corner,
+    /// (v253) La file d'attente du lecteur (bord droit) : voulue ouverte, ce que la page
+    /// dit montrer, dernier ordre envoyé et depuis quand.
+    panneau: Panneau,
+    panel_open: bool,
+    panel_page: Option<bool>,
+    panel_sent: Option<bool>,
+    panel_ago: f32,
     /// (v213) Il y a une page précédente (1), une page suivante (2) : sans elles, les
     /// boutons retour et suivant sont grisés et ne font rien.
     history: u8,
@@ -1318,6 +1405,11 @@ impl Tab {
             scroll: 0,
             reveal: 0.0,
             corner: Corner::default(),
+            panneau: Panneau::default(),
+            panel_open: false,
+            panel_page: None,
+            panel_sent: None,
+            panel_ago: 0.0,
             history: 0,
             want_awake: true,
             want_fps: FPS_DEFAULT,
@@ -1337,6 +1429,10 @@ impl Tab {
         // quand on arrive par le bord de l'écran, dans leur coin (voir `Corner`) ; (v211)
         // chacun le sien, et sur toutes les pages, le lecteur YouTube compris.
         let vers = self.corner.target(self.cursor, self.ray);
+        // (v253) La file d'attente, sur le lecteur seulement.
+        self.panel_open = self.panneau.target(self.cursor, self.ray)
+            && crate::watch::is_player(&self.addr);
+        self.panel_ago += dt;
         let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
         self.reveal = if vers > self.reveal {
             (self.reveal + pas).min(vers)
@@ -1505,6 +1601,9 @@ enum Event {
     Blocked(u8),
     /// (v213) Il y a une page précédente (1), une page suivante (2).
     History(u8),
+    /// (v253) Un ordre de la page pour le jeu (JSON : vidéo cliquée, vidéo retirée de la
+    /// file d'attente).
+    Ordre(String),
 }
 
 /// Ce que le navigateur a envoyé depuis la dernière lecture : la dernière image de chaque
@@ -1807,6 +1906,19 @@ fn read_records(mut out: impl std::io::Read, inbox: std::sync::Arc<std::sync::Mu
             b"MLBX" => {
                 if let Ok(mut i) = inbox.lock() {
                     i.events.push((id, Event::Blocked((a & 0xff) as u8)));
+                }
+            }
+            b"MLBO" => {
+                if a > 512 {
+                    log::warn!("écrans vidéo : ordre de page trop long ({a} octets)");
+                    return;
+                }
+                let mut data = vec![0u8; a as usize];
+                if out.read_exact(&mut data).is_err() {
+                    return;
+                }
+                if let Ok(mut i) = inbox.lock() {
+                    i.events.push((id, Event::Ordre(String::from_utf8_lossy(&data).into_owned())));
                 }
             }
             b"MLBS" => {
@@ -2227,6 +2339,39 @@ mod tests {
         d.press(1, [0.2, 0.2]);
         d.update(0.1);
         assert!(!d.tabs[&1].paused && d.tabs[&1].time > t);
+    }
+
+    /// (v253) La file d'attente vient en entrant par le bord droit sur sa zone, s'en va en
+    /// regardant la vidéo (il faut revenir par le bord), ou hors de portée (elle revient en
+    /// se rapprochant). S'approcher en la visant déjà ne l'ouvre pas.
+    #[test]
+    fn la_file_vient_du_bord_droit_et_repart() {
+        let mut p = Panneau::default();
+        let z = [0.9, 0.4];
+        // Le regard arrive de la droite.
+        assert!(!p.target(None, Some([1.1, 0.4])));
+        assert!(p.target(Some(z), Some(z)));
+        assert!(p.target(Some([0.8, 0.6]), Some([0.8, 0.6])));
+        // Hors de portée : fermée, mais elle revient en se rapprochant.
+        assert!(!p.target(None, Some(z)));
+        assert!(p.target(Some(z), Some(z)));
+        // Le regard va sur la vidéo : fermée, et revenir sur la zone ne la rouvre pas.
+        assert!(!p.target(Some([0.5, 0.4]), Some([0.5, 0.4])));
+        assert!(!p.target(Some(z), Some(z)));
+        // Ressortir à droite puis revenir : rouverte.
+        assert!(!p.target(None, Some([1.05, 0.4])));
+        assert!(p.target(Some(z), Some(z)));
+        // Regard déjà sur l'écran, ou entrée par le haut : non.
+        let mut p = Panneau::default();
+        assert!(!p.target(None, Some(z)));
+        assert!(!p.target(Some(z), Some(z)));
+        let mut p = Panneau::default();
+        p.target(None, Some([0.9, -0.1]));
+        assert!(!p.target(Some(z), Some(z)));
+        // Par le bord droit mais à hauteur de la vidéo (pas dans la zone) : non plus.
+        let mut p = Panneau::default();
+        p.target(None, Some([1.1, 0.4]));
+        assert!(!p.target(Some([0.6, 0.4]), Some([0.6, 0.4])));
     }
 
     /// (v243) Entrée rend le clavier au jeu tout de suite, et le champ perd le focus un

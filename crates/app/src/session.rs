@@ -2515,10 +2515,29 @@ impl Session {
 
     fn watch_together(&mut self, dt: f32) {
         let states = self.displays.take_states();
+        let orders = self.displays.take_orders();
         let Some(b) = &self.build else {
+            // (v253) Sans regarder ensemble, une vidéo cliquée s'ouvre, tout simplement.
+            for (id, json) in orders {
+                if let Some(crate::watch::Act::Open(id, url)) =
+                    crate::watch::Party::new().order(id, &json, "")
+                {
+                    self.displays.open(id, &url);
+                }
+            }
             return;
         };
         let me = b.pseudo().to_string();
+        // (v253) Ordres des pages : vidéo cliquée (file d'attente), vidéo retirée.
+        for (id, json) in orders {
+            match self.party.order(id, &json, &me) {
+                Some(crate::watch::Act::Open(id, url)) => {
+                    self.displays.open(id, &url);
+                }
+                Some(crate::watch::Act::Eval(id, js)) => self.displays.eval(id, &js),
+                None => {}
+            }
+        }
         let players: Vec<(String, Vec3)> = b
             .others
             .values()

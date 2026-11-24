@@ -18,6 +18,11 @@
 //!   récente et y amène sa page (vidéo ouverte, temps et pause corrigés). Une page en retard
 //!   de plus de 4 s (chargement) est recalée. Pendant une pub YouTube, rien n'est lu ni
 //!   corrigé. Qui reçoit plus ancien que ce qu'il a répond avec le sien.
+//! - **(v253) File d'attente.** Chaque écran a sa file, partagée avec la vidéo (même rang) :
+//!   en ligne, cliquer une vidéo sur le site de YouTube l'y ajoute (ou l'ouvre s'il n'y a
+//!   rien en cours), la page du lecteur la montre à droite et chacun peut en retirer une.
+//!   Quand la vidéo finit, celui qui le voit passe à la suivante pour tous. Seuls des numéros
+//!   de vidéo voyagent ; titres et images, chacun les charge chez YouTube.
 //! - **(v246) Shorts.** Ils restent sur le site de YouTube, chez chacun : glisser au Short
 //!   suivant change la vidéo de l'écran, et les autres sont amenés au même Short
 //!   (`youtube.com/shorts/<numéro>`) dans leur propre navigateur. On partage le numéro du
@@ -32,9 +37,14 @@ use crate::screen::Placed;
 
 /// Début des messages de cette partie dans le canal de la voix. Lu comme un message de la
 /// voix, `0xFF` puis `M` est un numéro de variante que la voix n'a pas : ignoré. `2` : avec
-/// la taille des écrans (v160) ; `3` : (v246) une vidéo peut être un Short. Un jeu plus
-/// ancien ignore ces messages, et inversement.
-pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'3'];
+/// la taille des écrans (v160) ; `3` : (v246) une vidéo peut être un Short ; `4` : (v253)
+/// avec la file d'attente. Un jeu plus ancien ignore ces messages, et inversement.
+pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'4'];
+/// (v253) Au plus tant de vidéos dans la file d'un écran.
+pub const MAX_FILE: usize = 30;
+/// (v253) La file est redonnée à une page qui ne la montre pas au plus une fois par tant
+/// de secondes (le temps qu'elle le dise).
+const FILE_S: f32 = 1.0;
 /// Un écran est montré aux joueurs à moins de tant de blocs de lui.
 pub const RANGE: f32 = 64.0;
 /// Un écran annoncé plus loin que ça de celui qui l'annonce est refusé.
@@ -83,6 +93,8 @@ pub struct Video {
     pub by: String,
     /// (v246) Un Short : il s'ouvre sur le site de YouTube, pas dans le lecteur.
     pub short: bool,
+    /// (v253) La file d'attente de l'écran (numéros de vidéos, dans l'ordre).
+    pub queue: Vec<String>,
 }
 
 impl Video {
@@ -97,6 +109,8 @@ impl Video {
             && self.seq < SEQ_MAX
             && !self.by.is_empty()
             && self.by.len() <= 32
+            && self.queue.len() <= MAX_FILE
+            && self.queue.iter().all(|v| valid_id(v))
     }
 }
 
@@ -141,6 +155,11 @@ pub struct Page {
     pub ad: bool,
     /// (v246) La page est un Short du site de YouTube.
     pub short: bool,
+    /// (v253) La vidéo est finie.
+    pub ended: bool,
+    /// (v253) La file que montre la page du lecteur (numéros séparés par des virgules) ;
+    /// `None` : la page n'en montre pas (ce n'est pas le lecteur).
+    pub file: Option<String>,
 }
 
 /// Vidéo partagée d'un écran, telle qu'on la connaît ici.
@@ -160,6 +179,8 @@ struct Track {
     guess: bool,
     /// Vidéo ouverte pour elle : la page sera recalée au plus près une fois chargée.
     fine: bool,
+    /// (v253) Depuis la dernière file envoyée à la page (secondes).
+    file_sent: f32,
 }
 
 impl Track {
@@ -264,6 +285,15 @@ impl Party {
                 age: 0.0,
             },
         );
+        // (v253) La vidéo partagée est finie ici : la suivante de la file, pour tous.
+        if page.ended
+            && self.tracks.get(&id).is_some_and(|t| {
+                page.video.as_deref() == Some(t.video.id.as_str()) && !t.video.queue.is_empty()
+            })
+        {
+            self.advance(id, me);
+            return;
+        }
         // La page se met à jour : ce rapport n'est pas un geste. Elle a fini dès qu'elle
         // montre la vidéo partagée (même vidéo, même pause, même temps ; une vidéo qu'on
         // vient d'ouvrir est recalée ensuite).
@@ -332,6 +362,7 @@ impl Party {
             seq,
             by: by.clone(),
             short,
+            queue: self.tracks.get(&id).map(|t| t.video.queue.clone()).unwrap_or_default(),
         };
         self.tracks.insert(
             id,
@@ -344,9 +375,126 @@ impl Party {
                 corrected: CORRECT_S,
                 guess: t < 0.0,
                 fine: false,
+                file_sent: FILE_S,
             },
         );
         self.changed.push(id);
+    }
+
+    /// (v253) Nouvelle vidéo partagée de l'écran `id` donnée par `me` (rang suivant) : la
+    /// page sera amenée à elle par `update`, comme pour une vidéo reçue.
+    fn give(&mut self, id: u32, video: Video) {
+        self.tracks.insert(
+            id,
+            Track {
+                video,
+                age: 0.0,
+                applied: None,
+                applied_video: None,
+                settle: 0.0,
+                corrected: CORRECT_S,
+                guess: false,
+                fine: false,
+                file_sent: FILE_S,
+            },
+        );
+        self.changed.push(id);
+    }
+
+    fn next_seq(&self, id: u32) -> u32 {
+        self.tracks
+            .get(&id)
+            .map_or(1, |t| t.video.seq.saturating_add(1))
+            .min(SEQ_MAX - 1)
+    }
+
+    /// (v253) La vidéo de l'écran `id` est finie : la première de la file la remplace.
+    fn advance(&mut self, id: u32, me: &str) {
+        let Some(t) = self.tracks.get(&id) else {
+            return;
+        };
+        let mut queue = t.video.queue.clone();
+        if queue.is_empty() {
+            return;
+        }
+        let next = queue.remove(0);
+        log::info!("regarder ensemble : écran {id}, vidéo finie, suivante de la file : {next}");
+        let video = Video {
+            id: next,
+            t: 0.0,
+            paused: false,
+            seq: self.next_seq(id),
+            by: me.chars().take(32).collect(),
+            short: false,
+            queue,
+        };
+        self.give(id, video);
+    }
+
+    /// (v253) Un ordre de la page de l'écran `id` (JSON du navigateur). Rend ce qu'il faut
+    /// faire à la page :
+    /// - `{"clic":vidéo}` (une vidéo cliquée sur le site de YouTube) : si une vidéo est en
+    ///   cours sur l'écran, la cliquée va au bout de sa file et la page revient à celle en
+    ///   cours ; sinon elle s'ouvre ;
+    /// - `{"retire":rang,"v":vidéo}` (la croix dans la file) : retirée de la file.
+    pub fn order(&mut self, id: u32, json: &str, me: &str) -> Option<Act> {
+        #[derive(Deserialize)]
+        struct Ordre {
+            #[serde(default)]
+            clic: Option<String>,
+            #[serde(default)]
+            retire: Option<usize>,
+            #[serde(default)]
+            v: Option<String>,
+        }
+        let o: Ordre = serde_json::from_str(json).ok()?;
+        if let Some(vid) = o.clic.filter(|v| valid_id(v)) {
+            let en_cours = self.tracks.get(&id).filter(|t| {
+                let fini = self.pages.get(&id).is_some_and(|s| {
+                    s.page.ended && s.page.video.as_deref() == Some(t.video.id.as_str())
+                });
+                !t.video.short && !fini
+            });
+            let Some(t) = en_cours else {
+                return Some(Act::Open(id, watch_url(&vid, 0.0)));
+            };
+            let retour = Act::Open(id, watch_url(&t.video.id, t.now()));
+            if t.video.queue.len() >= MAX_FILE || t.video.id == vid {
+                return Some(retour);
+            }
+            let mut video = t.at_now();
+            video.queue.push(vid.clone());
+            video.seq = self.next_seq(id);
+            video.by = me.chars().take(32).collect();
+            log::info!("regarder ensemble : écran {id}, {vid} ajoutée à la file ({} en tout)", video.queue.len());
+            self.put(id, video);
+            return Some(retour);
+        }
+        if let (Some(i), Some(vid)) = (o.retire, o.v) {
+            let t = self.tracks.get(&id)?;
+            if t.video.queue.get(i) != Some(&vid) {
+                return None;
+            }
+            let mut video = t.at_now();
+            video.queue.remove(i);
+            video.seq = self.next_seq(id);
+            video.by = me.chars().take(32).collect();
+            log::info!("regarder ensemble : écran {id}, {vid} retirée de la file");
+            self.put(id, video);
+        }
+        None
+    }
+
+    /// (v253) La même vidéo, au même point, avec une autre file : rien à faire à la page
+    /// que de lui redonner sa file.
+    fn put(&mut self, id: u32, video: Video) {
+        if let Some(t) = self.tracks.get_mut(&id) {
+            t.applied = Some((video.seq, video.by.clone()));
+            t.video = video;
+            t.age = 0.0;
+            t.file_sent = FILE_S;
+            self.changed.push(id);
+        }
     }
 
     /// Message reçu de `from` (dans le canal de la voix). `false` : ce n'est pas un des
@@ -433,6 +581,7 @@ impl Party {
                         corrected: CORRECT_S,
                         guess: false,
                         fine: false,
+                        file_sent: FILE_S,
                     },
                 );
             }
@@ -466,6 +615,7 @@ impl Party {
             t.age += dt;
             t.settle -= dt;
             t.corrected += dt;
+            t.file_sent += dt;
         }
         for p in self.pages.values_mut() {
             p.age += dt;
@@ -520,6 +670,15 @@ impl Party {
         let mut acts = Vec::new();
         for (&id, t) in self.tracks.iter_mut() {
             let page = self.pages.get(&id).map(|s| &s.page);
+            // (v253) La page du lecteur montre la file de l'écran.
+            if let Some(p) = page.filter(|p| p.video.as_deref() == Some(t.video.id.as_str())) {
+                if p.file.as_deref().is_some_and(|f| f != t.video.queue.join(","))
+                    && t.file_sent >= FILE_S
+                {
+                    acts.push(Act::Eval(id, file_js(&t.video.queue)));
+                    t.file_sent = 0.0;
+                }
+            }
             // Depuis combien de temps la page a donné ce temps.
             let page_age = self.pages.get(&id).map_or(0.0, |s| s.age);
             let key = (t.video.seq, t.video.by.clone());
@@ -757,6 +916,20 @@ pub fn is_short(url: &str) -> bool {
         && video_of(url).is_some()
 }
 
+/// (v253) Script qui donne sa file d'attente à la page du lecteur (des numéros de vidéo
+/// déjà vérifiés : rien d'autre n'entre dans le script).
+pub fn file_js(queue: &[String]) -> String {
+    let ids: Vec<String> = queue
+        .iter()
+        .filter(|v| valid_id(v))
+        .map(|v| format!("\"{v}\""))
+        .collect();
+    format!(
+        "(()=>{{if(window.__mlb&&window.__mlb.file)window.__mlb.file([{}]);}})()",
+        ids.join(",")
+    )
+}
+
 /// (v210) L'adresse est-elle la page du lecteur ?
 pub fn is_player(url: &str) -> bool {
     url.strip_prefix(LECTEUR)
@@ -793,6 +966,10 @@ pub fn parse_page(json: &str) -> Option<Page> {
         a: bool,
         #[serde(default)]
         i: String,
+        #[serde(default)]
+        e: bool,
+        #[serde(default)]
+        f: Option<String>,
     }
     let r: Raw = serde_json::from_str(json).ok()?;
     let video = video_of(&r.u);
@@ -810,6 +987,8 @@ pub fn parse_page(json: &str) -> Option<Page> {
         paused: r.p,
         ad: r.a,
         short,
+        ended: r.e,
+        file: r.f,
     })
 }
 
@@ -859,6 +1038,8 @@ mod tests {
                 paused: false,
                 ad: false,
                 short: false,
+                ended: false,
+                file: None,
             }
         );
         // (v246) Un Short du site.
@@ -901,6 +1082,7 @@ mod tests {
         loading: Option<(f32, String, f32)>,
         report_in: f32,
         last: String,
+        ended: bool,
     }
 
     impl FakePage {
@@ -914,6 +1096,7 @@ mod tests {
                 loading: None,
                 report_in: 0.0,
                 last: String::new(),
+                ended: false,
             }
         }
 
@@ -926,6 +1109,7 @@ mod tests {
                         .and_then(|s| s.trim_end_matches('s').parse().ok())
                         .unwrap_or(0.0);
                     self.loading = Some((0.8, url.clone(), t));
+                    self.ended = false;
                 }
                 Act::Eval(_, js) => {
                     if let Some(s) = js.split("seekTo(").nth(1) {
@@ -961,10 +1145,11 @@ mod tests {
             let ad = self.ad > 0.0;
             let t = if ad { 3.0 } else { self.t };
             let r = format!(
-                r#"{{"u":"{}","t":{:.1},"p":{},"a":{ad}}}"#,
+                r#"{{"u":"{}","t":{:.1},"p":{},"a":{ad},"e":{}}}"#,
                 self.url,
                 (t * 10.0).round() / 10.0,
-                self.paused
+                self.paused,
+                self.ended
             );
             (r != self.last).then(|| {
                 self.last = r.clone();
@@ -1074,6 +1259,58 @@ mod tests {
         ps[1].page(id).act(&Act::Open(id, watch_url(X, 0.0)));
         run(&mut ps, 7.0);
         assert!(is_player(&ps[0].page(id).url), "{}", ps[0].page(id).url);
+    }
+
+    /// (v253) Bob clique une vidéo pendant celle d'Alice : elle va dans la file de tous, et
+    /// passe quand celle d'Alice finit. Une croix l'en retire. Sans vidéo en cours, un clic
+    /// l'ouvre.
+    #[test]
+    fn la_file_d_attente_se_partage_et_avance() {
+        let s = screen_at(0);
+        let id = s.id();
+        let mut ps = vec![
+            Player::new(A, Vec3::new(0.0, 65.0, 6.0)),
+            Player::new(B, Vec3::new(3.0, 65.0, 8.0)),
+        ];
+        ps[0].local.push(s);
+        ps[0].party.screens_changed();
+        run(&mut ps, 1.0);
+        // Rien en cours : le clic ouvre la vidéo.
+        assert_eq!(
+            ps[1].party.order(id, &format!(r#"{{"clic":"{X}"}}"#), B),
+            Some(Act::Open(id, watch_url(X, 0.0)))
+        );
+        ps[0].page(id).act(&Act::Open(id, watch_url(X, 0.0)));
+        run(&mut ps, 6.0);
+        // Bob clique Y : dans la file, et sa page revient à X.
+        let a = ps[1].party.order(id, &format!(r#"{{"clic":"{Y}"}}"#), B);
+        assert!(matches!(&a, Some(Act::Open(_, u)) if u.contains(X)), "{a:?}");
+        let z = "aaaaaaaaaaa";
+        ps[1].party.order(id, &format!(r#"{{"clic":"{z}"}}"#), B);
+        run(&mut ps, 2.0);
+        for p in &ps {
+            assert_eq!(p.party.tracks[&id].video.queue, vec![Y.to_string(), z.to_string()]);
+            assert_eq!(p.party.tracks[&id].video.id, X);
+        }
+        // Une croix chez Alice retire z (le bon rang et le bon numéro seulement).
+        assert_eq!(ps[0].party.order(id, &format!(r#"{{"retire":0,"v":"{z}"}}"#), A), None);
+        assert_eq!(ps[0].party.tracks[&id].video.queue.len(), 2);
+        ps[0].party.order(id, &format!(r#"{{"retire":1,"v":"{z}"}}"#), A);
+        run(&mut ps, 2.0);
+        assert_eq!(ps[1].party.tracks[&id].video.queue, vec![Y.to_string()]);
+        // La vidéo d'Alice finit : tout le monde passe à Y, la file se vide.
+        ps[0].page(id).ended = true;
+        ps[0].page(id).paused = true;
+        run(&mut ps, 7.0);
+        for p in &mut ps {
+            assert_eq!(p.page(id).video().as_deref(), Some(Y));
+            assert!(p.party.tracks[&id].video.queue.is_empty());
+        }
+        // La file part en script vers la page, rien que des numéros vérifiés.
+        assert_eq!(
+            file_js(&[Y.to_string(), "<script>".to_string()]),
+            format!(r#"(()=>{{if(window.__mlb&&window.__mlb.file)window.__mlb.file(["{Y}"]);}})()"#)
+        );
     }
 
     fn screen_at(x: i32) -> Placed {
@@ -1266,6 +1503,7 @@ mod tests {
             seq: 1,
             by: A.into(),
             short: false,
+            queue: Vec::new(),
         };
         let m = msg(&Msg::Screens(vec![shared(&s, Some(bad))]));
         p.receive(A, &m, Some(Vec3::new(0.0, 65.0, 5.0)), &[]);
@@ -1280,6 +1518,7 @@ mod tests {
             seq,
             by: A.into(),
             short: false,
+            queue: Vec::new(),
         };
         let m = msg(&Msg::Video {
             screen: s.id(),

@@ -43,7 +43,9 @@
 //!   "a":pub,"i":vidéo du lecteur}`) ;
 //! - `MLBW` (seulement avec `--scroll`) : la page peut défiler sous la souris vers le haut
 //!   (`a` & 1) et vers le bas (`a` & 2) ;
-//! - `MLBH` (v213) : il y a une page précédente (`a` & 1), une page suivante (`a` & 2).
+//! - `MLBH` (v213) : il y a une page précédente (`a` & 1), une page suivante (`a` & 2) ;
+//! - `MLBO` (v253) : un ordre de la page pour le jeu, `a` octets de JSON (`{"clic":vidéo}`,
+//!   `{"retire":rang,"v":vidéo}`).
 //!
 //! Ce qu'il écrit sur sa sortie d'erreur (onglets ouverts, première image de chaque onglet,
 //! chargements ratés) va dans `logs/navigateur-sortie.log`.
@@ -82,6 +84,9 @@ use cef::*;
 /// sur l'écran regardé (`__mlb_short()`, appelé par le jeu), et l'état vient du lecteur
 /// des Shorts (`#shorts-player`). Une pub glissée entre deux Shorts (le Short au milieu
 /// de l'écran porte un badge « Sponsorisé ») se dit « pub » : rien ne se partage pendant.
+/// (v253) En ligne, un clic sur une vidéo du site ne l'ouvre plus : il le dit au jeu
+/// (`__minelib_ordre__{"clic":numéro}`), qui la met dans la file d'attente de l'écran, ou
+/// l'ouvre s'il n'y a rien en cours. L'état dit aussi si la vidéo est finie (`e`).
 const PAGE_JS: &str = r#"(()=>{if(window.__minelib)return;window.__minelib=1;
 const ed=e=>!!e&&(e.isContentEditable||e.tagName==='TEXTAREA'||(e.tagName==='INPUT'&&!/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/i.test(e.type||'')));
 const deep=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a;};
@@ -114,12 +119,13 @@ setInterval(()=>{const v=SV();if(attend()&&v&&!v.paused)v.pause();},250);}
 if(yt&&!window.__mlb_site){
 const go=(u,r)=>{const l=vid(u);if(l){if(r)location.replace(l);else location.href=l;return true;}return false;};
 document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagName==='A'&&x.href);
-if(a&&vid(a.href)){e.preventDefault();e.stopImmediatePropagation();go(a.href,false);}},true);
+if(a&&vid(a.href)){e.preventDefault();e.stopImmediatePropagation();
+console.log('__minelib_ordre__'+JSON.stringify({clic:new URL(vid(a.href)).searchParams.get('v')}));}},true);
 setInterval(()=>go(location.href,true),250);go(location.href,true);}
 let s='';window.addEventListener('pageshow',()=>{s='';});setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById(SH()?'shorts-player':'movie_player');
 const v=(mp&&mp.querySelector('video'))||document.querySelector('video');
 let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
-const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||attend()||pubShort(),i:i});
+const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||attend()||pubShort(),i:i,e:!!(v&&v.ended)});
 if(st!==s){s=st;console.log('__minelib_state__'+st);}},500);})();"#;
 
 /// Script injecté si le jeu le demande (`--scroll`) : signale si la page peut défiler
@@ -428,6 +434,22 @@ wrap_display_handler! {
                 // (v214) Ce que voit le lecteur : gel du temps de la vidéo (le son s'arrête
                 // avec), saut, mise en mémoire, images perdues. Pour trouver les coupures.
                 eprintln!("{} onglet {} : lecteur : {d}", heure(), self.id);
+                1
+            } else if let Some(ordre) = text.strip_prefix("__minelib_ordre__") {
+                // (v253) Un ordre de la page pour le jeu (vidéo cliquée, vidéo retirée de la
+                // file), seulement de la page du lecteur ou du site de YouTube.
+                let principale = _browser
+                    .and_then(|b| b.main_frame())
+                    .map(|f| CefString::from(&f.url()).to_string())
+                    .unwrap_or_default();
+                let de_confiance = filtre::est_lecteur(&principale)
+                    || filtre::hote(&principale).is_some_and(|h| {
+                        matches!(h.as_str(), "www.youtube.com" | "youtube.com" | "m.youtube.com")
+                    });
+                if de_confiance && ordre.len() <= 512 {
+                    let data = ordre.as_bytes().to_vec();
+                    push_event(&self.out, *b"MLBO", self.id, data.len() as u32, data);
+                }
                 1
             } else if let Some(v) = text.strip_prefix("__minelib_pub__") {
                 self.pub_.store(v.trim() == "1", Ordering::Relaxed);

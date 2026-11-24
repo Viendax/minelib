@@ -19,11 +19,38 @@
 
   (v243) Une vidéo que YouTube ne permet pas hors de son site (limitée par l'âge, ou
   intégration coupée par son auteur) s'ouvre sur le site complet (`&mlb=site`).
+
+  (v253) La file d'attente de l'écran, à droite du lecteur : le jeu la donne
+  (`__mlb.file([...numéros])`), la page montre l'image et le titre de chaque vidéo (chargés
+  chez YouTube), dans l'ordre, du haut vers le bas, avec une croix pour la retirer
+  (`__minelib_ordre__{"retire":i,"v":numéro}`), et un bouton de recherche (le site de
+  YouTube : une vidéo cliquée là va dans la file). Elle n'est là que quand le jeu l'ouvre
+  (`__mlb.panneau(true)`, le joueur arrivé par le bord droit de l'écran) : elle glisse
+  depuis la droite et la vidéo se réduit à côté (jamais par-dessus). La page dit au jeu ce
+  qu'elle montre (`f`, `o`) et quand la vidéo est finie (`e`) : le jeu passe à la suivante.
 -->
 <style>
 html,body{margin:0;height:100%;background:#0f0f0f;color:#f1f1f1;
   font:16px "Segoe UI",Roboto,Arial,sans-serif;overflow:hidden}
-#cadre{position:absolute;top:0;left:0;right:0;bottom:0}
+#cadre{position:absolute;top:0;left:0;right:0;bottom:0;transition:right .28s ease}
+body.file #cadre{right:352px}
+#file{position:absolute;top:0;right:0;bottom:0;width:352px;overflow:hidden;
+  box-sizing:border-box;padding:16px 14px;background:#0f0f0f;border-left:1px solid #272727;
+  transform:translateX(100%);transition:transform .28s ease}
+body.file #file{transform:none}
+#file h2{margin:2px 4px 12px;font-size:18px;font-weight:600}
+#cherche{display:block;width:100%;margin:0 0 14px;padding:10px 14px;border:1px solid #3f3f3f;
+  border-radius:20px;background:#121212;color:#f1f1f1;font:inherit;font-size:15px;
+  text-align:left;cursor:pointer}
+#cherche::before{content:'🔍  '}
+#vide{color:#aaa;font-size:14px;line-height:1.4;margin:4px}
+.v{display:flex;align-items:center;gap:10px;margin-bottom:10px;position:relative}
+.v img{width:120px;height:68px;object-fit:cover;border-radius:6px;flex:none;background:#222}
+.v .n{position:absolute;left:4px;top:3px;font-size:12px;background:rgba(0,0,0,.75);
+  border-radius:4px;padding:0 5px}
+.v .t{flex:1;font-size:14px;line-height:1.3;max-height:54px;overflow:hidden;color:#f1f1f1}
+.v .x{flex:none;width:30px;height:30px;border-radius:15px;border:0;background:#272727;
+  color:#f1f1f1;font-size:18px;line-height:30px;padding:0;cursor:pointer}
 #cadre iframe{width:100%;height:100%;border:0;display:block}
 #mot{position:absolute;top:0;left:0;right:0;bottom:0;display:none;
   align-items:center;justify-content:center;text-align:center;padding:60px;
@@ -32,6 +59,9 @@ html,body{margin:0;height:100%;background:#0f0f0f;color:#f1f1f1;
 </head>
 <body>
 <div id="cadre"><div id="lecteur"></div></div>
+<div id="file"><button id="cherche">Rechercher une vidéo</button><h2>À suivre</h2>
+<div id="liste"></div><div id="vide">Rien à suivre. Cherche une vidéo et clique-la : elle se
+mettra ici.</div></div>
 <div id="mot"></div>
 <script>
 (()=>{
@@ -41,7 +71,25 @@ const q=new URLSearchParams(location.search);
 let id=ok(q.get('v'))?q.get('v'):'';
 const debut=Math.max(0,Math.min(360000,parseInt(q.get('t')||'0',10)||0));
 let P=null,pret=false,permis=false,voulu=true,erreur=false,cherche=null;
-let s=-1,dernier=-2,depuis=0,etat='';
+let s=-1,dernier=-2,depuis=0,etat='',fini=false;
+// (v253) La file d'attente : numéros, titres connus (chargés une fois chez YouTube).
+let file=[];const titres={};
+const titre=v=>{if(titres[v]!==undefined)return;titres[v]='';
+  fetch('https://www.youtube.com/oembed?format=json&url='+encodeURIComponent('https://www.youtube.com/watch?v='+v))
+  .then(r=>r.ok?r.json():null).then(j=>{if(j&&j.title){titres[v]=j.title;montre();}}).catch(()=>{});};
+const montre=()=>{const l=document.getElementById('liste');l.textContent='';
+  file.forEach((v,i)=>{const d=document.createElement('div');d.className='v';
+    const im=document.createElement('img');im.src='https://i.ytimg.com/vi/'+v+'/mqdefault.jpg';
+    const n=document.createElement('span');n.className='n';n.textContent=String(i+1);
+    const t=document.createElement('div');t.className='t';t.textContent=titres[v]||'…';
+    const x=document.createElement('button');x.className='x';x.textContent='×';x.title='Retirer';
+    x.addEventListener('click',e=>{e.stopPropagation();
+      console.log('__minelib_ordre__'+JSON.stringify({retire:i,v:v}));});
+    d.append(im,n,t,x);l.append(d);titre(v);});
+  document.getElementById('vide').style.display=file.length?'none':'block';};
+let ouvert=false;
+// Le bouton de recherche : le site de YouTube (une vidéo cliquée là va dans la file).
+document.getElementById('cherche').addEventListener('click',()=>{location.href='https://www.youtube.com/';});
 const mot=t=>{document.getElementById('cadre').style.display='none';
   const m=document.getElementById('mot');m.textContent=t;m.style.display='flex';};
 // Commandes du jeu (regarder ensemble, pause de tous les écrans). Lancer la lecture
@@ -53,6 +101,8 @@ window.__mlb={
   playVideo:()=>{voulu=true;if(P&&pret&&permis)P.playVideo();},
   pauseVideo:()=>{voulu=false;if(P&&pret)P.pauseVideo();},
   regarde:()=>{if(permis)return;permis=true;if(P&&pret&&voulu)P.playVideo();},
+  file:l=>{if(!Array.isArray(l))return;file=l.filter(ok).slice(0,30);montre();},
+  panneau:o=>{ouvert=!!o;document.body.classList.toggle('file',ouvert);},
 };
 if(!id){mot("Pas de vidéo à lire.");return;}
 window.onYouTubeIframeAPIReady=()=>{
@@ -69,6 +119,8 @@ window.onYouTubeIframeAPIReady=()=>{
         if(cherche!==null){P.seekTo(cherche,true);cherche=null;}
         if(permis&&voulu)P.playVideo();},
       onStateChange:e=>{
+        // (v253) Fin de la vidéo : le jeu passe à la suivante de la file.
+        fini=e.data===0;
         // Lecture sans notre accord : c'est un clic dans le lecteur.
         if(e.data===1&&!permis)permis=true;
         try{const d=P.getVideoData();
@@ -105,7 +157,7 @@ setInterval(()=>{
   if(s!==1||t!==dernier){dernier=t;depuis=now;}
   const fige=s===1&&now-depuis>1200;
   const a=!permis||fige;
-  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i});
+  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i,e:fini,f:file.join(','),o:ouvert});
   if(st!==etat){etat=st;console.log('__minelib_state__'+st);}
 },500);
 })();
