@@ -795,6 +795,51 @@ const TOSS_GRAVITY: f32 = 16.0;
 /// (v222) Temps entre deux points de `toss_path` (s).
 pub const TOSS_STEP: f32 = 1.0 / 30.0;
 
+/// (v263) Demi-largeur d'un objet lancé, pour les murs (blocs) : un bloc posé au sol comme
+/// objet fait 0,28 de côté et tourne sur lui-même (0,2 de son centre à ses coins). « Les
+/// objets quand je les lâche contre un mur ne doivent pas pouvoir s'y coller autant, là ils
+/// sont à moitié dans le bloc devant » : avant, seul leur centre s'arrêtait au mur.
+pub const TOSS_RADIUS: f32 = 0.2;
+
+/// (v263) Hauteur du milieu d'un objet posé au-dessus de son point (il flotte un peu) : là où
+/// ses côtés touchent les murs.
+const TOSS_BODY: f32 = 0.2;
+
+/// (v263) Un mur touche-t-il le côté d'un objet dont le point est `q` (ses quatre côtés, à
+/// `TOSS_RADIUS` de son centre, à la hauteur de son corps) ?
+fn toss_touches_wall(world: &World, q: Vec3) -> bool {
+    let y = (q.y + TOSS_BODY).floor() as i32;
+    [(TOSS_RADIUS, 0.0), (-TOSS_RADIUS, 0.0), (0.0, TOSS_RADIUS), (0.0, -TOSS_RADIUS)]
+        .iter()
+        .any(|&(dx, dz)| {
+            world
+                .get((q.x + dx).floor() as i32, y, (q.z + dz).floor() as i32)
+                .is_solid()
+        })
+}
+
+/// (v263) Point `p` d'un objet posé écarté des murs qui le touchent : à `TOSS_RADIUS` de leur
+/// face (sur chaque axe, d'un côté seulement : dans un passage d'un bloc, il tient au milieu).
+pub fn clear_of_walls(world: &World, mut p: Vec3) -> Vec3 {
+    let y = (p.y + TOSS_BODY).floor() as i32;
+    for axis in [0usize, 2] {
+        let wall = |d: f32| {
+            let mut q = p;
+            q[axis] += d;
+            world
+                .get(q.x.floor() as i32, y, q.z.floor() as i32)
+                .is_solid()
+        };
+        let (low, high) = (wall(-TOSS_RADIUS), wall(TOSS_RADIUS));
+        if high && !low {
+            p[axis] = (p[axis] + TOSS_RADIUS).floor() - TOSS_RADIUS - 1e-3;
+        } else if low && !high {
+            p[axis] = (p[axis] - TOSS_RADIUS).floor() + 1.0 + TOSS_RADIUS + 1e-3;
+        }
+    }
+    p
+}
+
 /// (v222) Trajet d'un objet lancé depuis `eye` en regardant `look` : il part de la main (un
 /// peu sous les yeux) en cloche, s'arrête contre un mur et retombe jusqu'au sol. Regard vers
 /// le haut : lancé haut et plus loin ; vers le bas : à ses pieds. Un point tous les
@@ -823,7 +868,17 @@ pub fn toss_path(world: &World, eye: Vec3, look: Vec3) -> Vec<Vec3> {
             break;
         }
         v.y -= TOSS_GRAVITY * dt;
-        let next = p + v * dt;
+        let mut next = p + v * dt;
+        // (v263) Son côté touche un mur (pas seulement son centre) : il s'arrête là, puis
+        // glisse le long et retombe.
+        if (v.x != 0.0 || v.z != 0.0)
+            && toss_touches_wall(world, Vec3::new(next.x, p.y, next.z))
+            && !toss_touches_wall(world, p)
+        {
+            v.x = 0.0;
+            v.z = 0.0;
+            next = Vec3::new(p.x, next.y, p.z);
+        }
         if solid(next) {
             // Sol (ou plafond) : seule la hauteur bloque.
             let flat = Vec3::new(next.x, p.y, next.z);
@@ -854,6 +909,8 @@ pub fn toss_path(world: &World, eye: Vec3, look: Vec3) -> Vec<Vec3> {
         p = next;
     }
     p.y = p.y.max(0.0);
+    // (v263) Posé : jamais à moitié dans un mur (parti tout contre lui, par exemple).
+    p = clear_of_walls(world, p);
     if path.last() != Some(&p) {
         path.push(p);
     }
@@ -1111,6 +1168,12 @@ mod tests {
         let at = toss_landing(&w, eye, Vec3::new(0.0, 0.0, -1.0));
         assert!(at.z > -1.0 && at.z < 0.5, "arrêté par le mur : {at}");
         assert!((at.y - 11.0).abs() < 0.05, "au sol : {at}");
+        // (v263) Pas à moitié dans le mur : son côté s'arrête contre lui.
+        assert!(at.z >= -1.0 + TOSS_RADIUS - 0.01, "pas collé dans le mur : {at}");
+        // Lancé de tout contre le mur (les yeux à 0,1 bloc de lui) : posé à sa demi-largeur.
+        let close = Vec3::new(0.5, 11.0 + 1.62, -0.9);
+        let at = toss_landing(&w, close, Vec3::new(0.0, -0.3, -1.0).normalize());
+        assert!(at.z >= -1.0 + TOSS_RADIUS - 0.01, "pas dans le mur : {at}");
         // Regard vers le sol : à ses pieds ou presque, jamais dans le sol.
         let at = toss_landing(&floor(), eye, Vec3::new(0.0, -1.0, -0.05));
         assert!(

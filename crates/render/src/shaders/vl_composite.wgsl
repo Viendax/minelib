@@ -199,6 +199,10 @@ fn vl_keep(ray: vec3<f32>) -> VlTap {
         }
         let b = select(1.0 - fw.x, fw.x, o.x == 1) * select(1.0 - fw.y, fw.y, o.y == 1);
         let h = vl_unpack(textureLoad(vl_hist, q, 0));
+        // (v263) Un texel qui n'avait déjà rien (profondeurs négatives) ne compte pas.
+        if h.dn < 0.0 {
+            continue;
+        }
         out.n += h.n * b;
         out.f += h.f * b;
         wsum += b;
@@ -210,6 +214,15 @@ fn vl_keep(ray: vec3<f32>) -> VlTap {
     }
     out.n /= max(wsum, 1e-6);
     out.f /= max(wsum, 1e-6);
+    // (v263) Rien de l'image d'avant à cet endroit (la caméra a tourné plus vite que la marge
+    // n'en couvre) : pas une lumière nulle gardée comme si elle était vraie, mais pas
+    // d'historique (profondeurs négatives : aucun accord dans `vl_history`). Avant, ces trous
+    // gardés noirs entraient à l'écran et y restaient des bandes sombres pendant des images
+    // (« si je bouge vite ma caméra » : stries verticales au bord de l'écran).
+    if wsum <= 0.0 {
+        out.dn = -1.0;
+        out.df = -1.0;
+    }
     return out;
 }
 
@@ -360,7 +373,8 @@ fn fs_temporal(@builtin(position) frag: vec4<f32>) -> TemporalOut {
     var o: TemporalOut;
     if !fresh {
         // Marge pas marchée à cette image : gardée telle quelle (rien sans historique).
-        var kept = VlTap(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
+        // (v263) Sans historique : rien de gardé (profondeurs négatives, voir `vl_keep`).
+        var kept = VlTap(vec3<f32>(0.0), -1.0, vec3<f32>(0.0), -1.0);
         if vf.delta.w > 0.5 {
             kept = vl_keep(ray);
         }
@@ -456,10 +470,26 @@ fn fs_temporal(@builtin(position) frag: vec4<f32>) -> TemporalOut {
     }
     let cn = clamp(hist_n, lo_n, hi_n);
     let cf = clamp(hist_f, lo_f, hi_f);
+    // (v263) « Quand je me déplace, il reste des artéfacts lumineux ou de la neige » : en se
+    // déplaçant, la nouvelle image compte plus (`a` monte avec le chemin parcouru d'une image à
+    // l'autre) ; son échantillon, qui bouge dans son carré à chaque image, y laissait du grain
+    // (près de la lumière surtout, où la droite épipolaire est courte) et des bords de faisceaux
+    // grumeleux. Sa part est alors aussi lissée en 3 × 3 (pondérée par les profondeurs),
+    // d'autant plus que la caméra va vite. Immobile (`a` = `VL_NEW`), rien ne change :
+    // l'échantillon qui bouge, repris image après image, garde le détail des faisceaux.
+    //
+    // Et la marge hors de l'écran (marchée une image sur deux, avec moitié moins de pas, et
+    // reprise seulement quand elle l'est) : « si je bouge vite ma caméra », ce qu'elle a
+    // préparé entre à l'écran en une ou deux images, avec son tramage encore visible (des
+    // stries verticales, le tramage des pas variant surtout d'une colonne à l'autre). Elle
+    // garde donc la part nouvelle lissée, comme en se déplaçant vite.
+    let moving = select(smoothstep(0.1, 0.3, a), 1.0, !vl_on_screen(c));
+    let fresh_n = mix(cur_n, 0.5 * (cur_n + sn), moving);
+    let fresh_f = mix(cur_f, 0.5 * (cur_f + sf), moving);
     // Historique bon : la nouvelle valeur (son échantillon bouge à chaque image) ; sinon
     // lissée.
-    let out_n = mix(smooth_n, mix(cur_n, cn, 1.0 - a), kn);
-    let out_f = mix(smooth_f, mix(cur_f, cf, 1.0 - a), kf);
+    let out_n = mix(smooth_n, mix(fresh_n, cn, 1.0 - a), kn);
+    let out_f = mix(smooth_f, mix(fresh_f, cf, 1.0 - a), kf);
     o.hist = vl_pack(out_n, s.dn, out_f, s.df);
     o.combined = vl_pack(out_n + sn_d, s.dn, out_f + sf_d, s.df);
     return o;

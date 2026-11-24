@@ -4755,6 +4755,22 @@ impl Session {
                 self.submit(cmd);
             }
         }
+        // (v263) Essais : MINELIB_TOURNE=<amplitude°>,<période s> : la vue oscille de gauche à
+        // droite autour de sa direction de départ (caméra qui tourne vite : rayons repris d'une
+        // image à l'autre, marge préparée hors de l'écran).
+        static TURN: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+        static TURN_AT: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
+        let turn = TURN.get_or_init(|| {
+            let v = std::env::var("MINELIB_TOURNE").ok()?;
+            let (a, p) = v.split_once(',')?;
+            Some((a.trim().parse().ok()?, p.trim().parse().ok()?))
+        });
+        if let (Some((amp, period)), Ok(mut at)) = (*turn, TURN_AT.lock()) {
+            let (base, clock) = at.get_or_insert((self.player.yaw, 0.0));
+            *clock += dt;
+            let phase = *clock * std::f32::consts::TAU / period.max(0.05);
+            self.player.yaw = *base + amp.to_radians() * phase.sin();
+        }
         // (v229) Sur un serveur de construction : les foudres que publient les arbitres.
         self.update_thor();
         // L'éclair tenu : vu de derrière (F5, caméra libre), dans le monde, au poing du
@@ -4795,7 +4811,7 @@ impl Session {
             }
         }
         // (v217) Les Foudres de Zeus posées au sol : le même éclair, (v235) de la même taille.
-        for (at, phase) in self.items.bolts(eye) {
+        for (at, phase) in self.items.bolts(&self.world, eye) {
             self.storm.ground_item(at, phase);
         }
         // (v222) Ceux des autres joueurs.
@@ -10709,7 +10725,7 @@ impl Session {
         if self.game.mode != GameMode::Fps {
             let (world, daylight) = (&self.world, self.daylight_shown);
             self.items
-                .build(cam, &|p| sky_light(world, p, daylight), &mut model);
+                .build(world, cam, &|p| sky_light(world, p, daylight), &mut model);
         }
         // Ombres des joueurs : les plus proches de la caméra (place limitée), (v202) ou d'une
         // lumière (ombre géante, voir `light_shadow_score`). (v236) « Fais la précision des

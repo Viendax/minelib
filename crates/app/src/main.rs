@@ -49,6 +49,8 @@
 //!                               dans un monde neuf et dans la démo)
 //!   MINELIB_FPS_START=<x>,<y>,<z>,lacet°  partie FPS : départ du joueur local fixé (essais)
 //!   MINELIB_EXIT_AFTER=<s>      quitter automatiquement (tests)
+//!   MINELIB_TOURNE=<amplitude°>,<période s>  la vue oscille de gauche à droite (essais des
+//!                               rayons quand la caméra tourne vite)
 //!   MINELIB_TAILLE=<l>x<h>      taille de la fenêtre au lancement (essais ; 1280x720 sinon)
 //!   MINELIB_PAS_FIXE=<n>        chaque image fait avancer le jeu de 1/<n> s, quel que soit le
 //!                               temps qu'elle a pris (essais : les déplacements d'une image à

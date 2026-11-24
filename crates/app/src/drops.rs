@@ -283,10 +283,18 @@ impl Items {
     /// sa flamme ; deux pour une pile), qui flotte et tourne sur lui-même, éclairé comme les
     /// joueurs par `light` (lumière du ciel à sa place : abrité ou non, jour ou nuit) ; juste
     /// lâché, il vole de la main au sol.
-    pub fn build(&self, cam: Vec3, light: &dyn Fn(Vec3) -> [f32; 3], out: &mut Vec<EntityVertex>) {
+    pub fn build(
+        &self,
+        world: &World,
+        cam: Vec3,
+        light: &dyn Fn(Vec3) -> [f32; 3],
+        out: &mut Vec<EntityVertex>,
+    ) {
         let t = self.start.elapsed().as_secs_f32();
         for (id, d) in self.view.live_drops() {
-            let rest = Vec3::from(d.pos);
+            // (v263) Dessiné écarté des murs (les objets posés avant, ou lâchés par un jeu
+            // d'avant, ne restent pas à moitié dans un bloc).
+            let rest = crate::equip::clear_of_walls(world, Vec3::from(d.pos));
             if rest.distance_squared(cam) > 64.0 * 64.0 {
                 continue;
             }
@@ -327,11 +335,11 @@ impl Items {
     /// (v217) Les Foudres de Zeus posées au sol près de `cam` : où dessiner l'éclair de
     /// chacune (son pied) et son décalage (chacune vit à son rythme). Mêmes places que
     /// `build`.
-    pub fn bolts(&self, cam: Vec3) -> Vec<(Vec3, f32)> {
+    pub fn bolts(&self, world: &World, cam: Vec3) -> Vec<(Vec3, f32)> {
         let t = self.start.elapsed().as_secs_f32();
         let mut out = Vec::new();
         for (id, d) in self.view.live_drops() {
-            let rest = Vec3::from(d.pos);
+            let rest = crate::equip::clear_of_walls(world, Vec3::from(d.pos));
             if rest.distance_squared(cam) > 64.0 * 64.0
                 || Item::from_code(d.pile.item) != Some(Item::Zeus)
             {

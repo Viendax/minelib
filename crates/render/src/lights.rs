@@ -133,6 +133,12 @@ fn vl_epi_lights(lights: &[DynLight], eye: Vec3) -> Vec<([f32; 4], f32)> {
     out.into_iter().map(|(a, s, _)| (a, s)).collect()
 }
 
+/// (v263) `smoothstep` de WGSL : 0 avant `a`, 1 après `b`, en S entre les deux.
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// (v223) Décalage de l'échantillon de la marche dans son carré, image `n` (suite de Halton
 /// en base 2 et 3, huit positions) : de −0,5 à 0,5.
 fn vl_jitter(n: u64) -> (f32, f32) {
@@ -4050,6 +4056,14 @@ impl DynGpu {
         // La marge, une image sur deux (et toujours quand l'historique repart de zéro).
         let margin_now = self.vl_margin_lights && (!valid || self.frame.is_multiple_of(2));
         let (jx, jy) = vl_jitter(self.frame);
+        // Part de la nouvelle image (voir `jitter` plus bas).
+        let fresh = (VL_NEW + delta.length() * VL_MOVE).min(0.5);
+        // (v263) « Quand je me déplace, de la neige dans les rayons » : en se déplaçant,
+        // l'échantillon bouge moins dans son carré (un quart à pleine vitesse) : la nouvelle
+        // image, qui compte alors plus, scintille moins d'une image à l'autre. Immobile, il
+        // fait tout le carré (le détail des faisceaux, repris image après image).
+        let calm = 1.0 - smoothstep(0.1, 0.3, fresh);
+        let spread = 0.25 + 0.75 * calm;
         let mut epi_lights = [[0.0f32; 4]; 2 * VL_EPI_LIGHTS];
         let found = vl_epi_lights(&self.lights, eye);
         for (i, (a, strength)) in found.iter().enumerate() {
@@ -4075,9 +4089,9 @@ impl DynGpu {
             // aligné quand je me déplace ») : déjà lissée le long des droites épipolaires, elle
             // n'est plus bruitée.
             jitter: [
-                jx * k as f32,
-                jy * k as f32,
-                (VL_NEW + delta.length() * VL_MOVE).min(0.5),
+                jx * k as f32 * spread,
+                jy * k as f32 * spread,
+                fresh,
                 (self.settings.vl_steps / 2).max(8) as f32,
             ],
             epi: [found.len() as f32, VL_EPI_HALF, 0.0, 0.0],
