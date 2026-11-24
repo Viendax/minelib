@@ -27,6 +27,11 @@
 //!   suivant change la vidéo de l'écran, et les autres sont amenés au même Short
 //!   (`youtube.com/shorts/<numéro>`) dans leur propre navigateur. On partage le numéro du
 //!   Short, jamais les images de la page.
+//! - **(v293) Pub pendant un Short : tout le monde attend** (demande du propriétaire). Qui a
+//!   une pub sur le Short de l'écran le dit aux autres (`Msg::Pub`, redit chaque seconde) ;
+//!   chez eux, le Short se met en pause et son temps s'arrête, puis tout reprend ensemble
+//!   quand la pub est finie. Pas pour les nouveaux venus : qui arrive sur un Short déjà
+//!   commencé (plus de `ARRIVANT_S` secondes) n'arrête personne avec ses pubs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -46,6 +51,13 @@ pub const MAX_FILE: usize = 30;
 /// (v291) Au plus tant de vidéos dans la playlist d'un écran, sans celle en cours (déjà
 /// vues et à suivre) : au-delà, les plus anciennes vues s'en vont.
 pub const MAX_LISTE: usize = 60;
+/// (v293) Un Short reçu déjà commencé de plus que ça (secondes) : on est un nouveau venu, nos
+/// pubs n'arrêtent pas les autres.
+const ARRIVANT_S: f32 = 3.0;
+/// (v293) Une pub sur un Short est redite aux autres toutes les tant de secondes, et oubliée
+/// chez eux sans nouvelle depuis tant (un joueur parti ne bloque personne).
+const PUB_REDIT_S: f32 = 1.0;
+const PUB_OUBLI_S: f32 = 3.0;
 /// Un écran est montré aux joueurs à moins de tant de blocs de lui.
 pub const RANGE: f32 = 64.0;
 /// Un écran annoncé plus loin que ça de celui qui l'annonce est refusé.
@@ -165,6 +177,9 @@ enum Msg {
     Screens(Vec<Shared>),
     /// La vidéo de l'écran `screen`.
     Video { screen: u32, video: Video },
+    /// (v293) Une pub passe (`on`), ou est finie, chez celui qui l'envoie, sur le Short
+    /// `video` de l'écran `screen` : tant qu'elle passe, les autres attendent.
+    Pub { screen: u32, video: String, on: bool },
 }
 
 /// Ce qu'il faut faire à la page d'un écran pour l'amener à la vidéo partagée.
@@ -184,8 +199,11 @@ pub struct Page {
     /// Temps de la vidéo ; négatif s'il n'est pas sûr (pas de vidéo, changement en cours).
     pub t: f32,
     pub paused: bool,
-    /// Une pub YouTube passe.
+    /// Une pub YouTube passe. (v293) Ou un Short attend le regard pour démarrer.
     pub ad: bool,
+    /// (v293) Une vraie pub passe (pas l'attente du regard) : sur un Short, les autres
+    /// l'attendent.
+    pub vraie_pub: bool,
     /// (v246) La page est un Short du site de YouTube.
     pub short: bool,
     /// (v253) La vidéo est finie.
@@ -215,6 +233,13 @@ struct Track {
     /// (v291) Personne d'autre près de l'écran (à la dernière mise à jour) : quitter la
     /// vidéo pour un autre site la met alors en pause ; avec d'autres, elle continue pour eux.
     seul: bool,
+    /// (v293) Arrivé sur ce Short déjà commencé : nos pubs n'arrêtent personne.
+    arrivant: bool,
+    /// (v293) Notre pub sur ce Short est dite aux autres, et dans combien de temps la redire.
+    pub_dite: bool,
+    pub_dans: f32,
+    /// (v293) Notre page attend la fin de la pub d'un autre (Short en pause, temps arrêté).
+    en_attente: bool,
 }
 
 impl Track {
@@ -259,6 +284,9 @@ pub struct Party {
     /// Réponses à faire : (joueur, écran).
     corrections: Vec<(String, u32)>,
     out: Vec<(Vec<String>, Vec<u8>)>,
+    /// (v293) Pubs des autres sur le Short d'un écran : (le Short, qui (minuscules) → depuis
+    /// quand sans nouvelle).
+    attentes: HashMap<u32, (String, HashMap<String, f32>)>,
 }
 
 impl Party {
@@ -273,6 +301,7 @@ impl Party {
             changed: Vec::new(),
             corrections: Vec::new(),
             out: Vec::new(),
+            attentes: HashMap::new(),
         }
     }
 
@@ -343,6 +372,10 @@ impl Party {
             return;
         }
         if page.ad {
+            return;
+        }
+        // (v293) La page attend la pub d'un autre : sa pause n'est pas un geste.
+        if self.tracks.get(&id).is_some_and(|t| t.en_attente) {
             return;
         }
         let track = self.tracks.get(&id);
@@ -430,6 +463,10 @@ impl Party {
                 guess: t < 0.0,
                 fine: false,
                 seul: true,
+                arrivant: false,
+                pub_dite: false,
+                pub_dans: 0.0,
+                en_attente: false,
             },
         );
         self.changed.push(id);
@@ -450,6 +487,10 @@ impl Party {
                 guess: false,
                 fine: false,
                 seul: true,
+                arrivant: false,
+                pub_dite: false,
+                pub_dans: 0.0,
+                en_attente: false,
             },
         );
         self.changed.push(id);
@@ -744,6 +785,29 @@ impl Party {
                     self.offer(screen, video, from);
                 }
             }
+            Msg::Pub { screen, video, on } => {
+                // Seulement sur le Short que montre l'écran chez nous.
+                let sur = self
+                    .tracks
+                    .get(&screen)
+                    .is_some_and(|t| t.video.short && t.video.id == video);
+                if !sur || from.is_empty() || from.len() > 32 {
+                    return true;
+                }
+                let qui = from.to_lowercase();
+                let e = self.attentes.entry(screen).or_insert_with(|| (video.clone(), HashMap::new()));
+                if e.0 != video {
+                    *e = (video, HashMap::new());
+                }
+                if on {
+                    if !e.1.contains_key(&qui) {
+                        log::info!("regarder ensemble : écran {screen}, pub chez {from} : on l'attend");
+                    }
+                    e.1.insert(qui, 0.0);
+                } else if e.1.remove(&qui).is_some() {
+                    log::info!("regarder ensemble : écran {screen}, pub finie chez {from}");
+                }
+            }
         }
         true
     }
@@ -754,6 +818,7 @@ impl Party {
         if !v.valid() {
             return;
         }
+        let arrivant = v.short && v.t > ARRIVANT_S;
         match self.tracks.get_mut(&id) {
             None => {
                 self.tracks.insert(
@@ -768,12 +833,19 @@ impl Party {
                         guess: false,
                         fine: false,
                         seul: true,
+                        arrivant,
+                        pub_dite: false,
+                        pub_dans: 0.0,
+                        en_attente: false,
                     },
                 );
             }
             Some(t) if v.newer_than(&t.video) => {
                 if v.seq > t.video.seq.saturating_add(SEQ_JUMP) {
                     return;
+                }
+                if v.id != t.video.id {
+                    t.arrivant = arrivant;
                 }
                 t.video = v;
                 t.age = 0.0;
@@ -797,10 +869,27 @@ impl Party {
         local: &[Placed],
         players: &[(String, Vec3)],
     ) -> Vec<Act> {
-        for t in self.tracks.values_mut() {
-            t.age += dt;
+        // (v293) Les pubs des autres sur un Short : oubliées sans nouvelle, ou quand l'écran
+        // montre autre chose. Tant qu'il en reste une, ou que la nôtre passe (on n'est pas un
+        // nouveau venu), le temps du Short s'arrête : tout le monde reprend au même moment.
+        let tracks = &self.tracks;
+        self.attentes.retain(|id, (v, qui)| {
+            qui.retain(|_, age| {
+                *age += dt;
+                *age < PUB_OUBLI_S
+            });
+            !qui.is_empty() && tracks.get(id).is_some_and(|t| t.video.short && t.video.id == *v)
+        });
+        for (id, t) in self.tracks.iter_mut() {
+            let ma_pub = t.video.short
+                && !t.arrivant
+                && self.pages.get(id).is_some_and(|s| s.page.vraie_pub && s.page.short);
+            if !self.attentes.contains_key(id) && !ma_pub {
+                t.age += dt;
+            }
             t.settle -= dt;
             t.corrected += dt;
+            t.pub_dans -= dt;
         }
         for p in self.pages.values_mut() {
             p.age += dt;
@@ -853,6 +942,7 @@ impl Party {
 
         // Pages amenées à la vidéo partagée.
         let mut acts = Vec::new();
+        let mut pubs: Vec<(Vec<String>, Msg)> = Vec::new();
         for (&id, t) in self.tracks.iter_mut() {
             let page = self.pages.get(&id).map(|s| &s.page);
             // (v253) La page du lecteur montrait la file de l'écran ; (v289) c'est le volet
@@ -866,6 +956,21 @@ impl Party {
             t.seul = seul;
             let key = (t.video.seq, t.video.by.clone());
             let on_it = page.filter(|p| p.video.as_deref() == Some(t.video.id.as_str()));
+            // (v293) Notre pub sur le Short de l'écran : dite aux autres (redite chaque seconde),
+            // puis sa fin. Pas si l'on est arrivé sur ce Short déjà commencé.
+            let ma_pub = t.video.short && !t.arrivant && page.is_some_and(|p| p.vraie_pub && p.short);
+            if (ma_pub && t.pub_dans <= 0.0) || (!ma_pub && t.pub_dite) {
+                t.pub_dite = ma_pub;
+                t.pub_dans = PUB_REDIT_S;
+                if let Some((s, owner)) = shown.get(&id) {
+                    let mut to = near(players, center(s), RANGE);
+                    if let Some(o) = owner.as_ref().filter(|o| !to.iter().any(|p| p.eq_ignore_ascii_case(o))) {
+                        to.push(o.clone());
+                    }
+                    let msg = Msg::Pub { screen: id, video: t.video.id.clone(), on: ma_pub };
+                    pubs.push((to, msg));
+                }
+            }
             if t.applied.as_ref() != Some(&key) {
                 t.applied = Some(key);
                 if t.applied_video.as_deref() != Some(t.video.id.as_str()) {
@@ -890,6 +995,29 @@ impl Party {
                         seek.map_or(String::new(), |s| format!(", page à {:.1} s amenée à {s:.1} s", p.t))
                     );
                     acts.push(Act::Eval(id, control_js(seek, t.video.paused)));
+                    t.settle = SETTLE_EVAL_S;
+                }
+                continue;
+            }
+            // (v293) La pub d'un autre sur ce Short : notre page attend, en pause, au temps
+            // (arrêté) du Short ; elle reprend avec tout le monde quand elle est finie.
+            let attente = t.video.short && self.attentes.contains_key(&id);
+            if attente || t.en_attente {
+                if attente != t.en_attente {
+                    t.en_attente = attente;
+                    log::info!(
+                        "regarder ensemble : écran {id}, {} à {:.1} s",
+                        if attente { "Short en pause, on attend une pub" } else { "pub finie, le Short reprend" },
+                        t.now()
+                    );
+                    if let Some(p) = on_it.filter(|p| !p.ad || !attente) {
+                        let seek = (p.t < 0.0 || (p.t - t.now()).abs() > FINE_S).then(|| t.now());
+                        acts.push(Act::Eval(id, control_js(seek, attente || t.video.paused)));
+                        t.settle = SETTLE_EVAL_S;
+                    }
+                } else if let Some(p) = on_it.filter(|p| attente && !p.paused && !p.ad && t.settle <= 0.0) {
+                    let seek = (p.t < 0.0 || (p.t - t.now()).abs() > FINE_S).then(|| t.now());
+                    acts.push(Act::Eval(id, control_js(seek, true)));
                     t.settle = SETTLE_EVAL_S;
                 }
                 continue;
@@ -930,6 +1058,9 @@ impl Party {
                 acts.push(Act::Eval(id, control_js(seek, t.video.paused)));
                 t.settle = SETTLE_EVAL_S;
             }
+        }
+        for (to, msg) in pubs {
+            self.send(to, &msg);
         }
         acts
     }
@@ -1178,6 +1309,9 @@ pub fn parse_page(json: &str) -> Option<Page> {
         e: bool,
         #[serde(default)]
         f: Option<String>,
+        /// (v293) Le Short attend le regard pour démarrer (pas une pub).
+        #[serde(default)]
+        w: bool,
     }
     let r: Raw = serde_json::from_str(json).ok()?;
     let video = video_of(&r.u);
@@ -1193,7 +1327,8 @@ pub fn parse_page(json: &str) -> Option<Page> {
         video,
         t,
         paused: r.p,
-        ad: r.a,
+        ad: r.a || r.w,
+        vraie_pub: r.a,
         short,
         ended: r.e,
         file: r.f,
@@ -1263,6 +1398,7 @@ mod tests {
                 t: 12.5,
                 paused: false,
                 ad: false,
+                vraie_pub: false,
                 short: false,
                 ended: false,
                 file: None,
@@ -1485,6 +1621,56 @@ mod tests {
         ps[1].page(id).act(&Act::Open(id, watch_url(X, 0.0)));
         run(&mut ps, 7.0);
         assert!(is_player(&ps[0].page(id).url), "{}", ps[0].page(id).url);
+    }
+
+    /// (v293) Une pub chez Bob sur un Short : Alice l'attend (Short en pause, temps arrêté),
+    /// puis tous deux reprennent ensemble. Carol, arrivée sur le Short déjà commencé,
+    /// n'arrête personne avec la sienne. Le Short qui attend le regard n'est pas une pub.
+    #[test]
+    fn une_pub_sur_un_short_fait_attendre_tout_le_monde_sauf_les_nouveaux() {
+        let s = screen_at(0);
+        let id = s.id();
+        let mut ps = vec![
+            Player::new(A, Vec3::new(0.0, 65.0, 6.0)),
+            Player::new(B, Vec3::new(3.0, 65.0, 8.0)),
+            Player::new("Carol", Vec3::new(500.0, 65.0, 6.0)),
+        ];
+        ps[0].local.push(s);
+        ps[0].party.screens_changed();
+        run(&mut ps, 1.0);
+        ps[0].page(id).act(&Act::Open(id, short_url(X)));
+        run(&mut ps, 2.0);
+        assert_eq!(ps[1].page(id).url, short_url(X));
+        // Bob a une pub de 6 s : Alice attend, son temps ne bouge plus.
+        ps[1].page(id).ad = 6.0;
+        run(&mut ps, 1.5);
+        assert!(ps[0].page(id).paused, "Alice n'attend pas la pub de Bob");
+        let gele = ps[0].page(id).t;
+        run(&mut ps, 3.0);
+        assert!(ps[0].page(id).paused);
+        assert!(close(ps[0].page(id).t, gele, 0.01), "{} / {gele}", ps[0].page(id).t);
+        assert!(!ps[0].party.tracks[&id].video.paused, "ce n'est pas une pause de quelqu'un");
+        // La pub finie : tout le monde reprend, ensemble.
+        run(&mut ps, 4.0);
+        assert!(!ps[0].page(id).paused && !ps[1].page(id).paused);
+        let (a, b) = (ps[0].page(id).t, ps[1].page(id).t);
+        assert!(close(a, b, 1.5), "Alice {a}, Bob {b}");
+        assert!(a < gele + 4.5, "Alice a sauté la pub de Bob : {gele} puis {a}");
+        // Carol arrive sur le Short déjà commencé : sa pub n'arrête personne.
+        ps[2].pos = Vec3::new(-3.0, 65.0, 8.0);
+        run(&mut ps, 4.0);
+        assert_eq!(ps[2].page(id).url, short_url(X));
+        assert!(ps[2].party.tracks[&id].arrivant);
+        ps[2].page(id).ad = 5.0;
+        run(&mut ps, 2.0);
+        assert!(!ps[0].page(id).paused && !ps[1].page(id).paused, "la pub de Carol a arrêté les autres");
+        // Le Short attend le regard chez Bob (« w ») : ce n'est pas une pub.
+        let p = parse_page(&format!(
+            r#"{{"u":"{}","t":0,"p":true,"a":false,"w":true,"i":"{X}"}}"#,
+            short_url(X)
+        ))
+        .unwrap();
+        assert!(p.ad && !p.vraie_pub);
     }
 
     /// (v253) Bob clique une vidéo pendant celle d'Alice : elle va dans la file de tous, et

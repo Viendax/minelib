@@ -955,6 +955,7 @@ impl Navigateur {
             | Cmd::Text(id, _)
             | Cmd::Key(id, _)
             | Cmd::Blur(id)
+            | Cmd::Largeur(id, _)
             | Cmd::Eval(id, _)
             | Cmd::Back(id)
             | Cmd::Forward(id) => Some(*id),
@@ -975,6 +976,24 @@ impl Navigateur {
                 Cmd::Close(id) => self.fermer(id),
                 Cmd::Cote(id, w, h) => {
                     self.cotes.insert(id, (w.clamp(64, 3840), h.clamp(64, 2160)));
+                }
+                Cmd::Largeur(id, l) => {
+                    // (v293) Un Short à côté du volet : la page se met en page plus étroite (le
+                    // jeu la décale à droite du volet), sans redimensionner l'onglet ni sa
+                    // capture. Le protocole des outils de développement la place en haut à
+                    // gauche de l'onglet.
+                    if let Some(o) = self.onglets.get(&id) {
+                        let (w, h) = self.cotes.get(&id).copied().unwrap_or((self.opts.width, self.opts.height));
+                        if l <= 0 || l >= w {
+                            cdp(&o.vue, "Emulation.clearDeviceMetricsOverride", "{}");
+                        } else {
+                            cdp(
+                                &o.vue,
+                                "Emulation.setDeviceMetricsOverride",
+                                &format!("{{\"width\":{},\"height\":{h},\"deviceScaleFactor\":0,\"mobile\":false}}", l.max(200)),
+                            );
+                        }
+                    }
                 }
                 Cmd::Move(id, x, y) => {
                     if let Some(o) = self.onglets.get(&id) {

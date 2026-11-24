@@ -83,7 +83,7 @@ setInterval(()=>go(location.href,true),250);go(location.href,true);}
 let s='';window.addEventListener('pageshow',()=>{s='';});setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById(SH()?'shorts-player':'movie_player');
 const v=(mp&&mp.querySelector('video'))||document.querySelector('video');
 let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
-const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||attend()||pubShort(),i:i,e:!!(v&&v.ended)});
+const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||pubShort(),w:attend(),i:i,e:!!(v&&v.ended)});
 if(st!==s){s=st;dit('__minelib_state__'+st);}},500);})();"#;
 
 /// Dit si la page peut défiler sous la souris (la molette ne va à l'écran que si elle y

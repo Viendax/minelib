@@ -970,11 +970,19 @@ impl Displays {
                 tab.opened = true;
                 tab.fps_sent = FPS_DEFAULT;
                 tab.sent = None;
+                tab.largeur = PAGE_W;
             } else if !tab.want_awake && tab.opened {
                 b.send(&format!("close {id}"));
                 tab.opened = false;
                 tab.editing = false;
                 tab.scroll = 0;
+            }
+            // (v293) Un Short ne passe pas sous le volet : sa page se met en page à sa droite
+            // (le jeu la décale d'autant, voir `Tab::coller`).
+            let largeur = tab.largeur_voulue();
+            if tab.opened && largeur != tab.largeur {
+                b.send(&format!("largeur {id} {largeur}"));
+                tab.largeur = largeur;
             }
             // (v243) Une hausse tout de suite, une baisse après `LOWER_AFTER`.
             let lower = tab.want_fps < tab.fps_sent && tab.lower_for < LOWER_AFTER;
@@ -1247,7 +1255,7 @@ impl Displays {
             }
             return;
         }
-        let Some(p) = uv.map(page_point).or(tab.sent) else {
+        let Some(p) = ici.or(tab.sent) else {
             return;
         };
         if let Some(b) = self.browser.as_mut() {
@@ -1908,6 +1916,9 @@ enum Cible {
     Volet,
 }
 
+/// (v289) Le fond sombre sous le volet, la recherche ou un Short décalé (BGRA).
+const SOMBRE: [u8; 4] = [15, 15, 15, 255];
+
 /// (v289) Un glissement de 0 à 1 en douceur (accélère puis ralentit).
 fn doux(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
@@ -1924,7 +1935,6 @@ fn colle(dst: &mut [u8], w: usize, h: usize, gauche: f32, x0: f32, x1: f32, src:
     if w == 0 || h == 0 || dst.len() < w * h * 4 {
         return;
     }
-    const SOMBRE: [u8; 4] = [15, 15, 15, 255];
     let k = w as f32 / PAGE_W as f32;
     let a = ((x0.max(0.0) * k).round() as usize).min(w);
     let b = ((x1.min(PAGE_W as f32) * k).round() as usize).min(w);
@@ -2039,6 +2049,10 @@ struct Tab {
     pos: Option<usize>,
     /// (v291) Celle en cours est en pause (la page partie ailleurs, ou mise en pause).
     pause: bool,
+    /// (v293) Largeur de mise en page demandée au navigateur pour la page (pixels de page) :
+    /// moins que `PAGE_W` sur un Short à côté du volet, que le Short se range à sa droite au
+    /// lieu d'être dessous.
+    largeur: u32,
     en_ligne: bool,
     /// (v257) Où est allé le dernier appui (v289 : la page, la recherche ou le volet).
     appui: Cible,
@@ -2098,6 +2112,7 @@ impl Tab {
             file: Vec::new(),
             pos: None,
             pause: false,
+            largeur: PAGE_W,
             en_ligne: false,
             appui: Cible::Page,
             history: 0,
@@ -2192,12 +2207,39 @@ impl Tab {
         Some((o * b, b, sorti))
     }
 
+    /// (v293) La page est-elle un Short (il se range à droite du volet, jamais dessous) ?
+    fn court(&self) -> bool {
+        crate::watch::is_short(&self.addr)
+    }
+
+    /// (v293) Largeur de mise en page voulue pour la page : un Short avec le volet ouvert
+    /// laisse la place du volet (et de la recherche ouverte).
+    fn largeur_voulue(&self) -> u32 {
+        if !(self.court() && self.panel_open) {
+            return PAGE_W;
+        }
+        let cote = if self.cote.as_ref().is_some_and(|c| c.voulue) { COTE_W } else { 0 };
+        PAGE_W - VOLET_W - cote
+    }
+
     /// (v289) Colle le volet sur la gauche de l'image de la page, et la recherche à côté à
     /// sa droite (elle sort de sous lui en glissant : on en voit d'abord la droite). Sans
-    /// image d'eux encore : sombre.
+    /// image d'eux encore : sombre. (v293) Un Short est d'abord décalé vers la droite d'autant
+    /// que le bloc est sorti (sa page, mise en page plus étroite, y tient).
     fn coller(&mut self) {
         let Some((r, b, sorti)) = self.bloc() else { return };
         let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+        if self.court() && w > 0 && self.pixels.len() >= w * h * 4 {
+            let k = w as f32 / PAGE_W as f32;
+            let d = ((r * k).round() as usize).min(w);
+            let n = (w - d).min((self.largeur as f32 * k).round() as usize);
+            for ligne in self.pixels.chunks_exact_mut(w * 4).take(h) {
+                ligne.copy_within(0..n * 4, d * 4);
+                for p in ligne[(d + n) * 4..].chunks_exact_mut(4) {
+                    p.copy_from_slice(&SOMBRE);
+                }
+            }
+        }
         if sorti > 0.5 {
             if let Some(c) = self.cote.as_ref() {
                 let (sw, sh) = (c.page_size.0 as usize, c.page_size.1 as usize);
@@ -2217,6 +2259,13 @@ impl Tab {
         let p = page_point(uv);
         let Some((r, b, sorti)) = self.bloc() else {
             return (Cible::Page, p);
+        };
+        // (v293) Un Short décalé à droite du bloc : le point dans sa page.
+        let p = if self.court() {
+            let x = (uv[0].clamp(0.0, 1.0) * PAGE_W as f32 - r) as i32;
+            (x.clamp(0, self.largeur as i32 - 1), p.1)
+        } else {
+            p
         };
         let x = uv[0].clamp(0.0, 1.0) * PAGE_W as f32;
         // Le point dans un onglet (`larg` pixels de page de large) dont la gauche est à `g`.
@@ -3022,6 +3071,48 @@ mod tests {
         assert!(t.bloc().is_none());
         assert_eq!(at(&t, 10, 10), 200, "rentré : la page entière");
         assert_eq!(t.cible([0.1, 0.5]).0, Cible::Page);
+    }
+
+    /// (v293) Un Short ne passe pas sous le volet : sa page se met en page plus étroite (la
+    /// place du volet, et de la recherche ouverte) et le jeu la décale à droite du volet ; le
+    /// clic suit. Une autre page reste dessous.
+    #[test]
+    fn un_short_se_range_a_droite_du_volet() {
+        let (w, h) = (PAGE_W as usize, PAGE_H as usize);
+        let mut t = Tab::new(&crate::watch::short_url("dQw4w9WgXcQ"));
+        t.addr = t.url.clone();
+        t.loading = true;
+        // Chaque colonne de la page porte son numéro (sur 8 bits).
+        t.page = (0..w * h).flat_map(|i| [(i % w) as u8, ((i % w) >> 8) as u8, 0, 255]).collect();
+        t.page_size = (w as u32, h as u32);
+        assert_eq!(t.largeur_voulue(), PAGE_W);
+        entre_par_la_gauche(&mut t, 40);
+        assert_eq!(t.largeur_voulue(), PAGE_W - VOLET_W);
+        t.largeur = t.largeur_voulue();
+        t.draw();
+        let col = |t: &Tab, x: usize| {
+            let i = (10 * w + x) * 4;
+            t.pixels[i] as usize | (t.pixels[i + 1] as usize) << 8
+        };
+        assert_eq!(col(&t, 352), 0, "la page commence à droite du volet");
+        assert_eq!(col(&t, 1279), 927);
+        assert_eq!(t.cible([0.5, 0.5]), (Cible::Page, (640 - 352, 360)));
+        // La recherche ouverte : encore plus étroit.
+        t.cote = Some(Cote::new(5, "yt", RECHERCHE_VIDEO));
+        assert_eq!(t.largeur_voulue(), PAGE_W - VOLET_W - COTE_W);
+        // Une page ordinaire : le volet passe devant, rien ne bouge.
+        let mut g = Tab::new(RECHERCHE);
+        g.addr = g.url.clone();
+        g.panel_open = true;
+        assert_eq!(g.largeur_voulue(), PAGE_W);
+        // Volet parti : toute la largeur.
+        t.cote = None;
+        t.pres = false;
+        t.cursor = None;
+        for _ in 0..40 {
+            t.update(0.016);
+        }
+        assert_eq!(t.largeur_voulue(), PAGE_W);
     }
 
     /// (v289) Le collage suit l'échelle des images (page ou onglet plus petits) et met du

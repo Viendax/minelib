@@ -95,6 +95,10 @@ pub enum Cmd {
     Eval(u32, String),
     Fps(u32, i32),
     Cote(u32, i32, i32),
+    /// (v293) Largeur de mise en page de l'onglet (pixels) : plus étroite que l'onglet, la
+    /// page se met en page dans sa partie gauche (le volet est à côté) ; sa largeur entière
+    /// (ou 0) rend la normale.
+    Largeur(u32, i32),
     Volume(i32),
     Back(u32),
     Forward(u32),
@@ -127,6 +131,7 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
         "eval" => Cmd::Eval(id, rest.to_string()),
         "fps" => Cmd::Fps(id, num()?),
         "cote" => Cmd::Cote(id, num()?, num()?),
+        "largeur" => Cmd::Largeur(id, num()?),
         "volume" => Cmd::Volume(num()?),
         "back" => Cmd::Back(id),
         "forward" => Cmd::Forward(id),
@@ -362,6 +367,7 @@ mod tests {
         assert_eq!(parse_cmd("move 3 10 20"), Some(Cmd::Move(3, 10, 20)));
         assert_eq!(parse_cmd("wheel 3 5 6 -120"), Some(Cmd::Wheel(3, 5, 6, -120)));
         assert_eq!(parse_cmd("cote 9 464 720"), Some(Cmd::Cote(9, 464, 720)));
+        assert_eq!(parse_cmd("largeur 9 928"), Some(Cmd::Largeur(9, 928)));
         assert_eq!(
             parse_cmd("open 7 https://www.youtube.com/watch?v=x"),
             Some(Cmd::Open(7, "https://www.youtube.com/watch?v=x".into()))
