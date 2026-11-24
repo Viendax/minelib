@@ -110,8 +110,9 @@ fn drop_vertex(vi: u32, id: u32, view_proj: mat4x4<f32>) -> VOut {
     if low.y < roof(low) {
         return o;
     }
-    let a = view_proj * vec4<f32>(p, 1.0);
-    let b = view_proj * vec4<f32>(low, 1.0);
+    // (v254) Comptés depuis la caméra (matrices du jeu sans sa translation).
+    let a = view_proj * vec4<f32>(p - cam, 1.0);
+    let b = view_proj * vec4<f32>(low - cam, 1.0);
     if a.w < 0.05 || b.w < 0.05 {
         return o;
     }
@@ -311,7 +312,7 @@ fn splash_vertex(vi: u32, id: u32, view_proj: mat4x4<f32>) -> VOut {
     );
     let size = 0.2;
     let w = vec3<f32>(p.x + corner.x * size, top + 0.02, p.z + corner.y * size);
-    o.clip = view_proj * vec4<f32>(w, 1.0);
+    o.clip = view_proj * vec4<f32>(w - cam, 1.0);
     let edge = 1.0 - smoothstep(0.75, 1.0, max(abs(rel.x), abs(rel.y)) / (0.5 * GROUND));
     o.uv = vec4<f32>(corner, edge, age);
     o.ndc = o.clip.xy / max(o.clip.w, 1e-4);

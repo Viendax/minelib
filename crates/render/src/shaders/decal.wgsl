@@ -65,6 +65,8 @@ struct VOut {
     @location(6) uv: vec2<f32>,
     // 1 de près … 0 au bout de la distance où on les dessine.
     @location(7) @interpolate(flat) fade: f32,
+    // (v254) Place depuis la caméra, exacte loin du centre du monde (voir world.wgsl).
+    @location(8) rel: vec3<f32>,
 };
 
 const KIND_SPLAT: f32 = 1.0;
@@ -130,7 +132,9 @@ fn place(vi: u32, d: Decal, view_proj: mat4x4<f32>, flat: bool) -> VOut {
         o.world = d.at.xyz + u * (l.x * d.size.x) + v * (l.y * d.size.y) + n * (l.z * d.size.z);
         o.uv = l.xy;
     }
-    o.clip = view_proj * vec4<f32>(o.world, 1.0);
+    // (v254) Les matrices du jeu sont comptées depuis la caméra : le point aussi.
+    o.rel = o.world - cam;
+    o.clip = view_proj * vec4<f32>(o.rel, 1.0);
     o.at = d.at;
     o.nrm = d.nrm;
     o.tan = d.tan;
@@ -434,12 +438,13 @@ fn fs_post(i: VOut) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(scene_depth));
     let px = clamp((i.ndc * vec2<f32>(0.5, -0.5) + 0.5) * dims, vec2<f32>(0.0), dims - 1.0);
     let depth = max(textureLoad(scene_depth, vec2<i32>(px), 0), 1e-7);
+    // (v254) Depuis la caméra (exact loin du centre du monde ; ses dérivées aussi).
     let o = g.cam_pos.xyz;
-    let p = o + (i.world - o) * (i.clip.z / depth);
+    let p = i.rel * (i.clip.z / depth);
     // Sa place dans la trace.
     let n = i.nrm.xyz;
     let u = i.tan.xyz;
-    let q = p - i.at.xyz;
+    let q = p - (i.at.xyz - o);
     let l = vec3<f32>(dot(q, u) / i.size.x, dot(q, cross(n, u)) / i.size.y, dot(q, n) / i.size.z);
     let within = step(max(abs(l.x), max(abs(l.y), abs(l.z))), 1.0);
     // La surface regarde-t-elle du côté de la trace ? (Sinon : le flanc d'une marche, un mur

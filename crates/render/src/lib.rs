@@ -310,6 +310,25 @@ pub fn eye_relative(view_proj: Mat4) -> Mat4 {
     )
 }
 
+/// (v254) Une matrice comptée depuis `from` (`rel × (p − from, 1)`), comptée depuis `to` : le
+/// même point de l'écran pour `rel' × (p − to, 1)`. `to − from` : deux grands nombres voisins,
+/// exact ; puis petit, sans perte de précision.
+pub fn shifted(rel: Mat4, from: Vec3, to: Vec3) -> Mat4 {
+    let d = to - from;
+    Mat4::from_cols(
+        rel.x_axis,
+        rel.y_axis,
+        rel.z_axis,
+        rel.w_axis + rel.x_axis * d.x + rel.y_axis * d.y + rel.z_axis * d.z,
+    )
+}
+
+/// (v254) `m` (vue-projection du jeu, œil en `eye`) comptée depuis `cam` : la matrice que
+/// reçoivent les shaders, qui multiplient `p − caméra` (voir `vs_block` de world.wgsl).
+pub fn relative_to(m: Mat4, eye: Vec3, cam: Vec3) -> Mat4 {
+    shifted(eye_relative(m), eye, cam)
+}
+
 /// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre. (v236) 64 au lieu de
 /// 48 (onze ou douze joueurs au lieu de huit ou neuf) : dans une foule, les plus proches de
 /// la caméra et de l'axe de vue ont leur ombre exacte (les autres, celle de l'atlas des
@@ -2367,6 +2386,7 @@ impl Renderer {
         if let Some(t) = &mut self.taa {
             t.reset = true;
             t.prev_view_proj = None;
+            t.prev_eye = None;
         }
     }
 
@@ -2784,7 +2804,8 @@ impl Renderer {
             return false;
         }
         let half = p.player_shadow_distance.max(16.0) + 4.0;
-        let (vp, bias) = sunmap::view_proj(sun, p.eye, half);
+        // (v254) Comptée depuis la caméra, comme celles de la caméra.
+        let (vp, bias) = sunmap::view_proj_from(sun, p.eye, half, p.eye);
         globals.psm_vp = vp.to_cols_array_2d();
         globals.psm_info = [1.0, sunmap::SIZE as f32, bias, 0.0];
         let mut own = *globals;
@@ -2931,10 +2952,17 @@ impl Renderer {
             if !mirror_lit {
                 mg.torch_swap = [0.0; 4];
             }
-            mg.view_proj = n.vp.to_cols_array_2d();
+            // (v254) Comptées depuis le reflet de l'œil, sa caméra (et la carte du soleil,
+            // comptée depuis l'œil, ramenée à lui).
+            mg.view_proj = eye_relative(n.vp).to_cols_array_2d();
             mg.cur_view_proj = mg.view_proj;
             mg.prev_view_proj = mg.view_proj;
             mg.cam_pos = [n.eye.x, n.eye.y, n.eye.z, g.cam_pos[3]];
+            let main_eye = Vec3::new(g.cam_pos[0], g.cam_pos[1], g.cam_pos[2]);
+            mg.psm_vp =
+                shifted(Mat4::from_cols_array_2d(&g.psm_vp), main_eye, n.eye).to_cols_array_2d();
+            mg.refl_vp =
+                shifted(Mat4::from_cols_array_2d(&g.refl_vp), main_eye, n.eye).to_cols_array_2d();
             mg.screen = [
                 size.0 as f32,
                 size.1 as f32,
@@ -2945,7 +2973,7 @@ impl Renderer {
             mg.sel_min[3] = 0.0;
             mg.light[3] = 0.0;
             mg.refl_cam[3] = 0.0;
-            mirror_uniforms(&mut mg, n.children.iter().map(|&c| &nodes[c]));
+            mirror_uniforms(&mut mg, n.eye, n.children.iter().map(|&c| &nodes[c]));
             self.queue.write_buffer(
                 &self.planar.globals[n.array][n.layer],
                 0,
@@ -2962,7 +2990,7 @@ impl Renderer {
                 },
             ));
         }
-        mirror_uniforms(g, nodes.iter().filter(|n| n.parent.is_none()));
+        mirror_uniforms(g, eye, nodes.iter().filter(|n| n.parent.is_none()));
         // Les images des miroirs vus dans un miroir avant celle où on les voit.
         draws.sort_by_key(|d| std::cmp::Reverse(d.0));
         let n = (cmds.len() / 20) as u64;
@@ -3164,11 +3192,13 @@ impl Renderer {
             .prepare_water_players(&self.queue, &wm.players);
         // Uniformes vus du reflet de l'œil : rien sous l'eau, pas de bloc visé, ni miroirs
         // ni reflets à son rythme, ni lumière des torches renvoyée par les miroirs.
+        // (v254) Comptées depuis le reflet de l'œil, sa caméra.
         let mut wg = *g;
-        wg.view_proj = wvp.to_cols_array_2d();
+        wg.view_proj = eye_relative(wvp).to_cols_array_2d();
         wg.cur_view_proj = wg.view_proj;
         wg.prev_view_proj = wg.view_proj;
         wg.cam_pos = [reye.x, reye.y, reye.z, g.cam_pos[3]];
+        wg.psm_vp = shifted(Mat4::from_cols_array_2d(&g.psm_vp), eye, reye).to_cols_array_2d();
         wg.clip = water_mirror::clip(h);
         wg.sel_min[3] = 0.0;
         wg.light[3] = 0.0;
@@ -3304,8 +3334,10 @@ impl Renderer {
             }),
         );
         self.prepare_sky(p);
+        // (v254) Matrices comptées depuis la caméra (les shaders multiplient `p − caméra`).
+        let rel = eye_relative(view_proj).to_cols_array_2d();
         let globals = Globals {
-            view_proj: view_proj.to_cols_array_2d(),
+            view_proj: rel,
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: [p.eye.x, p.eye.y, p.eye.z, p.time],
             fog: [p.fog_start, p.fog_end, self.aspect(), p.sky_time],
@@ -3325,8 +3357,8 @@ impl Renderer {
                 self.light_count as f32,
                 self.mirror_count as f32,
             ],
-            cur_view_proj: view_proj.to_cols_array_2d(),
-            prev_view_proj: view_proj.to_cols_array_2d(),
+            cur_view_proj: rel,
+            prev_view_proj: rel,
             screen: [
                 self.config.width as f32,
                 self.config.height as f32,
@@ -3385,6 +3417,13 @@ impl Renderer {
         self.decals
             .prepare(&self.queue, p.decals.0, p.decals.1, p.decals.2);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
+        // (v254) La vue-projection de la dernière image des reflets, comptée depuis la caméra.
+        globals.refl_vp = relative_to(
+            Mat4::from_cols_array_2d(&globals.refl_vp),
+            Vec3::new(globals.refl_cam[0], globals.refl_cam[1], globals.refl_cam[2]),
+            p.eye,
+        )
+        .to_cols_array_2d();
         // (v217) Carte d'ombre du soleil des joueurs (lue aussi dans les miroirs).
         let sun_map = self.prepare_sun_map(p, &mut globals);
         // (v190) Miroirs redessinés (voir `planar`), puis les uniformes de l'image.
@@ -3544,8 +3583,11 @@ impl Renderer {
             }),
         );
         self.prepare_sky(p);
+        // (v254) Matrices comptées depuis la caméra (les shaders multiplient `p − caméra`) ;
+        // celle de l'image d'avant, depuis la caméra d'aujourd'hui.
+        let prev_rel = relative_to(prev, taa.prev_eye.unwrap_or(p.eye), p.eye);
         let globals = Globals {
-            view_proj: jittered.to_cols_array_2d(),
+            view_proj: eye_relative(jittered).to_cols_array_2d(),
             inv_view_proj: jittered.inverse().to_cols_array_2d(),
             cam_pos: [p.eye.x, p.eye.y, p.eye.z, p.time],
             fog: [p.fog_start, p.fog_end, self.aspect(), p.sky_time],
@@ -3565,8 +3607,8 @@ impl Renderer {
                 self.light_count as f32,
                 self.mirror_count as f32,
             ],
-            cur_view_proj: view_proj.to_cols_array_2d(),
-            prev_view_proj: prev.to_cols_array_2d(),
+            cur_view_proj: eye_relative(view_proj).to_cols_array_2d(),
+            prev_view_proj: prev_rel.to_cols_array_2d(),
             screen: [
                 world_size.0 as f32,
                 world_size.1 as f32,
@@ -3660,6 +3702,14 @@ impl Renderer {
             globals.refl_vp = vp;
             globals.refl_cam = cam;
         }
+        // (v254) La vue-projection de la dernière image des reflets (prise de sa caméra),
+        // comptée depuis la caméra d'aujourd'hui.
+        globals.refl_vp = relative_to(
+            Mat4::from_cols_array_2d(&globals.refl_vp),
+            Vec3::new(globals.refl_cam[0], globals.refl_cam[1], globals.refl_cam[2]),
+            p.eye,
+        )
+        .to_cols_array_2d();
         // (v217) Carte d'ombre du soleil des joueurs (lue aussi dans les miroirs).
         let sun_map = self.prepare_sun_map(p, &mut globals);
         // (v190) Miroirs redessinés (voir `planar`).
@@ -4054,6 +4104,7 @@ impl Renderer {
         }
 
         taa.prev_view_proj = Some(view_proj);
+        taa.prev_eye = Some(p.eye);
         self.taa = Some(taa);
         stats
     }
@@ -4318,10 +4369,15 @@ fn planar_groups(
 
 /// (v190) Images de miroir que lit une passe (vue de la caméra, ou image d'un miroir) :
 /// vue-projection et plan de chacune, et leur nombre.
-fn mirror_uniforms<'a>(g: &mut Globals, seen: impl Iterator<Item = &'a planar::Node>) {
+/// (v254) Comptées depuis `cam`, la caméra de la passe qui les lit.
+fn mirror_uniforms<'a>(
+    g: &mut Globals,
+    cam: Vec3,
+    seen: impl Iterator<Item = &'a planar::Node>,
+) {
     let mut count = 0;
     for (k, n) in seen.take(planar::MAX_PLANAR).enumerate() {
-        g.mirror_vp[k] = n.vp.to_cols_array_2d();
+        g.mirror_vp[k] = relative_to(n.vp, n.eye, cam).to_cols_array_2d();
         g.mirror_info[k] = [
             n.plane.axis as f32,
             n.plane.coord,
@@ -4488,6 +4544,62 @@ fn aabb_visible(planes: &[Vec4; 4], min: Vec3, max: Vec3) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v254) « En 40 000 40 000 je suis déjà dans les farlands » : les matrices comptées depuis
+    /// la caméra donnent le même point de l'écran que les matrices du monde, et loin du centre
+    /// du monde, le bon (comparé à un calcul en f64) quand celles du monde se trompent.
+    #[test]
+    fn camera_relative_matrices_stay_exact_far_from_the_origin() {
+        use glam::{DMat4, DVec3, DVec4};
+        let proj = Mat4::perspective_infinite_reverse_rh(1.3, 16.0 / 9.0, 0.05);
+        let dir = Vec3::new(0.6, -0.25, -0.76).normalize();
+        let ndc = |c: Vec4| glam::Vec2::new(c.x / c.w, c.y / c.w);
+        for (cam, max_rel) in [
+            (Vec3::new(12.3, 70.6, -8.9), 1e-4f32),
+            (Vec3::new(40000.3, 70.6, 40000.9), 1e-4),
+            (Vec3::new(400000.3, 70.6, -400000.9), 1e-4),
+        ] {
+            let view = Mat4::look_to_rh(cam, dir, Vec3::Y);
+            let vp = proj * view;
+            // Référence en f64.
+            let dview = DMat4::look_to_rh(cam.as_dvec3(), dir.as_dvec3(), DVec3::Y);
+            let dvp = proj.as_dmat4() * dview;
+            let rel = eye_relative(vp);
+            for off in [
+                Vec3::new(0.5, -0.25, -1.0),
+                Vec3::new(-0.8, 0.3, -2.5),
+                Vec3::new(3.0, -1.0, -6.0),
+            ] {
+                // Un coin de bloc devant la caméra : exact en f32 (seizièmes de bloc).
+                let p = ((cam + off) * 16.0).round() / 16.0;
+                let want = dvp * DVec4::new(p.x as f64, p.y as f64, p.z as f64, 1.0);
+                let want = glam::Vec2::new((want.x / want.w) as f32, (want.y / want.w) as f32);
+                let got = ndc(rel * (p - cam).extend(1.0));
+                assert!((got - want).length() < max_rel, "{cam} {off} : {got} {want}");
+            }
+            // `relative_to` et `shifted` : la matrice d'une autre caméra, comptée depuis celle-ci.
+            let eye2 = cam + Vec3::new(0.7, 0.1, -0.4);
+            let vp2 = proj * Mat4::look_to_rh(eye2, dir, Vec3::Y);
+            let p = ((cam + Vec3::new(0.2, -0.5, -3.0)) * 16.0).round() / 16.0;
+            let d2 = proj.as_dmat4() * DMat4::look_to_rh(eye2.as_dvec3(), dir.as_dvec3(), DVec3::Y);
+            let want = d2 * DVec4::new(p.x as f64, p.y as f64, p.z as f64, 1.0);
+            let want = glam::Vec2::new((want.x / want.w) as f32, (want.y / want.w) as f32);
+            let got = ndc(relative_to(vp2, eye2, cam) * (p - cam).extend(1.0));
+            assert!((got - want).length() < max_rel, "{cam} : {got} {want}");
+            let back = shifted(relative_to(vp2, eye2, cam), cam, eye2);
+            let got = ndc(back * (p - eye2).extend(1.0));
+            assert!((got - want).length() < max_rel, "{cam} : {got} {want}");
+        }
+        // Avec les matrices du monde, à 400 000 blocs, l'erreur se voit (plus d'un pixel).
+        let cam = Vec3::new(400000.3, 70.6, -400000.9);
+        let vp = proj * Mat4::look_to_rh(cam, dir, Vec3::Y);
+        let p = ((cam + Vec3::new(0.5, -0.25, -1.0)) * 16.0).round() / 16.0;
+        let dvp = proj.as_dmat4() * DMat4::look_to_rh(cam.as_dvec3(), dir.as_dvec3(), DVec3::Y);
+        let want = dvp * DVec4::new(p.x as f64, p.y as f64, p.z as f64, 1.0);
+        let want = glam::Vec2::new((want.x / want.w) as f32, (want.y / want.w) as f32);
+        let old = ndc(vp * p.extend(1.0));
+        assert!((old - want).length() > 1e-3, "{old} {want}");
+    }
 
     /// (v209) Groupes de boîtes d'ombre : chaque boîte dans un seul groupe, dans l'ordre, et
     /// tout entière dans la boule de son groupe (sinon le shader en oublierait l'ombre).

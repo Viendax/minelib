@@ -65,7 +65,8 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     let unit = 0.5 + 0.5 * (n + c.x * u + c.y * v);
     let p = s.box_min.xyz + unit * (s.box_max.xyz - s.box_min.xyz);
     var o: VOut;
-    o.clip = g.view_proj * vec4<f32>(p, 1.0);
+    // (v254) Compté depuis la caméra (matrices du jeu sans sa translation).
+    o.clip = g.view_proj * vec4<f32>(p - g.cam_pos.xyz, 1.0);
     o.world = p;
     return o;
 }
@@ -346,7 +347,7 @@ fn solid_depth(frag: vec4<f32>, world: vec3<f32>) -> f32 {
     if t < 0.0 {
         discard;
     }
-    let c = g.view_proj * vec4<f32>(g.cam_pos.xyz + normalize(world - g.cam_pos.xyz) * t, 1.0);
+    let c = g.view_proj * vec4<f32>(normalize(world - g.cam_pos.xyz) * t, 1.0);
     return c.z / max(c.w, 1e-6);
 }
 

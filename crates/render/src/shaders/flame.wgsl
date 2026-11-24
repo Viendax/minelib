@@ -91,7 +91,8 @@ fn place(vi: u32, f: Flame, view_proj: mat4x4<f32>) -> VOut {
     let size = vec3<f32>(1.0, f.at.w * TOP, 1.0);
     var o: VOut;
     o.world = lo + unit * size;
-    o.clip = view_proj * vec4<f32>(o.world, 1.0);
+    // (v254) Compté depuis la caméra (matrices du jeu sans sa translation).
+    o.clip = view_proj * vec4<f32>(o.world - g.cam_pos.xyz, 1.0);
     o.at = f.at;
     o.misc = f.misc;
     o.ndc = o.clip.xy / max(o.clip.w, 1e-4);
@@ -189,8 +190,9 @@ fn flame(i: VOut, view_proj: mat4x4<f32>, depth: f32) -> vec4<f32> {
     let n = clamp(ceil((t1 - t0) / 0.1), 3.0, 18.0);
     let ds = (t1 - t0) / n;
     // Profondeur à l'écran le long du rayon (elle varie droit avec la distance).
-    let c0 = view_proj * vec4<f32>(o + d * t0, 1.0);
-    let c1 = view_proj * vec4<f32>(o + d * t1, 1.0);
+    // (v254) Depuis la caméra (`o`), comme les matrices.
+    let c0 = view_proj * vec4<f32>(d * t0, 1.0);
+    let c1 = view_proj * vec4<f32>(d * t1, 1.0);
     var t = t0 + ds * dither(i.clip.xy);
     var lum = vec3<f32>(0.0);
     var through = 1.0;

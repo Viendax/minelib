@@ -45,7 +45,8 @@ struct VOut {
 @vertex
 fn vs_main(v: VIn) -> VOut {
     var o: VOut;
-    o.clip = g.view_proj * vec4<f32>(v.pos, 1.0);
+    // (v254) Compté depuis la caméra (matrices du jeu sans sa translation).
+    o.clip = g.view_proj * vec4<f32>(v.pos - g.cam_pos.xyz, 1.0);
     o.uv = v.uv;
     o.world = v.pos;
     o.reveal = v.reveal;
@@ -241,7 +242,7 @@ const NO_HISTORY = vec2<f32>(30000.0, 30000.0);
 @fragment
 fn fs_taa_world(i: VOut) -> TaaOut {
     var o: TaaOut;
-    let p = vec4<f32>(i.world, 1.0);
+    let p = vec4<f32>(i.world - g.cam_pos.xyz, 1.0);
     let jit = g.view_proj * p;
     let cur = g.cur_view_proj * p;
     let off = (jit.xy / jit.w - cur.xy / cur.w) * vec2<f32>(0.5, -0.5) * g.screen.xy;

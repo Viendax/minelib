@@ -44,6 +44,9 @@ struct PlayerOut {
     @location(5) @interpolate(flat) rect: vec4<f32>,
     /// Le même point à l'image d'avant (le joueur a bougé entre les deux).
     @location(6) prev_world: vec3<f32>,
+    /// (v254) Place depuis la caméra, exacte (normale de la face, vecteurs de mouvement).
+    @location(7) rel: vec3<f32>,
+    @location(8) prev_rel: vec3<f32>,
 };
 
 fn m_trans(t: vec3<f32>) -> mat4x4<f32> {
@@ -196,7 +199,7 @@ const WATER_MIRROR_RANGE: f32 = 64.0;
 /// 216 sommets n'ont plus à calculer deux poses chacun.
 fn player_off_view(feet: vec3<f32>) -> bool {
     let m = g.view_proj;
-    let c = m * vec4<f32>(feet + vec3<f32>(0.0, 0.9, 0.0), 1.0);
+    let c = m * vec4<f32>(feet + vec3<f32>(0.0, 0.9, 0.0) - g.cam_pos.xyz, 1.0);
     let r = 1.8;
     let lx = length(vec3<f32>(m[0][0], m[1][0], m[2][0]));
     let ly = length(vec3<f32>(m[0][1], m[1][1], m[2][1]));
@@ -219,18 +222,27 @@ fn vs_player(v: PlayerIn) -> PlayerOut {
         out.clip = vec4<f32>(0.0, 0.0, -1.0, 1.0);
         return out;
     }
-    let xf = part_matrix(v.part, v);
-    let world = (xf * vec4<f32>(v.pos, 1.0)).xyz;
+    // (v254) Le modèle est posé depuis la caméra (ses pieds moins la caméra : deux grands
+    // nombres voisins, exact), puis compté comme tel : loin du centre du monde, ses sommets
+    // ne tremblent plus les uns par rapport aux autres. Sa place dans le monde en est tirée.
+    let cam = g.cam_pos.xyz;
+    var vr = v;
+    vr.feet = v.feet - cam;
+    let xf = part_matrix(v.part, vr);
+    let rel = (xf * vec4<f32>(v.pos, 1.0)).xyz;
+    let world = rel + cam;
     let n = normalize((xf * vec4<f32>(v.normal, 0.0)).xyz);
     var o: PlayerOut;
-    o.clip = g.view_proj * vec4<f32>(world, 1.0);
+    o.clip = g.view_proj * vec4<f32>(rel, 1.0);
     // (v187) Où ce point était à l'image d'avant : la même partie du corps, dans la pose
     // de l'image d'avant (déplacement, demi-tour et balancement des membres compris).
     var p = v;
-    p.feet = v.prev_feet;
+    p.feet = v.prev_feet - cam;
     p.look = v.prev_look;
     p.motion = v.prev_motion;
-    o.prev_world = (part_matrix(v.part, p) * vec4<f32>(v.pos, 1.0)).xyz;
+    o.prev_rel = (part_matrix(v.part, p) * vec4<f32>(v.pos, 1.0)).xyz;
+    o.prev_world = o.prev_rel + cam;
+    o.rel = rel;
     o.uv = v.uv;
     o.layer = i32(v.skin & 0xffffu);
     o.world = world;
@@ -262,12 +274,12 @@ fn fs_player(i: PlayerOut) -> @location(0) vec4<f32> {
 // Avec l'anticrénelage : comme les entités fixes dans le monde (`fs_taa_world`).
 @fragment
 fn fs_player_taa(i: PlayerOut) -> TaaOut {
-    let n = face_normal(i.world);
-    let cur = g.cur_view_proj * vec4<f32>(i.world, 1.0);
+    let n = face_normal(i.rel);
+    let cur = g.cur_view_proj * vec4<f32>(i.rel, 1.0);
     // (v187) Depuis où il était à l'image d'avant, et pas depuis le même point du monde :
     // sinon un joueur qui marche devant une caméra immobile n'aurait aucun mouvement, et
     // l'anticrénelage le ferait traîner.
-    let prev = g.prev_view_proj * vec4<f32>(i.prev_world, 1.0);
+    let prev = g.prev_view_proj * vec4<f32>(i.prev_rel, 1.0);
     let d = prev.xy / prev.w - cur.xy / cur.w;
     let base = player_albedo(i);
     // (v215) Dans le brouillard comme les blocs, lumières dynamiques comprises.

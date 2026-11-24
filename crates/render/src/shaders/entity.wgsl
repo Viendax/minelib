@@ -46,6 +46,8 @@ struct VOut {
     @location(2) @interpolate(flat) layer: i32,
     @location(3) world: vec3<f32>,
     @location(4) light: vec4<f32>,
+    // (v254) Place depuis la caméra, exacte : pour les dérivées (normale de la face).
+    @location(5) rel: vec3<f32>,
 };
 
 /// Couleur du pixel sans l'éclairage : couleur du sommet, texturée pour un bloc tenu
@@ -92,22 +94,28 @@ fn fogged(c: vec3<f32>, world: vec3<f32>, fog: f32) -> vec3<f32> {
 }
 
 /// Normale de la face (vers la caméra), d'après les dérivées de la position : à calculer
-/// avant tout branchement.
-fn face_normal(world: vec3<f32>) -> vec3<f32> {
-    var n = cross(dpdx(world), dpdy(world));
+/// avant tout branchement. (v254) La position depuis la caméra (`rel`) : celle du monde,
+/// arrondie à 4 mm à 40 000 blocs, donnait des normales au hasard loin du centre du monde.
+fn face_normal(rel: vec3<f32>) -> vec3<f32> {
+    var n = cross(dpdx(rel), dpdy(rel));
     let len = length(n);
     n = select(vec3<f32>(0.0, 1.0, 0.0), n / max(len, 1e-12), len > 1e-12);
-    return select(n, -n, dot(n, g.cam_pos.xyz - world) < 0.0);
+    return select(n, -n, dot(n, -rel) < 0.0);
 }
 
 @vertex
 fn vs_main(v: VIn) -> VOut {
     var o: VOut;
-    o.clip = g.view_proj * vec4<f32>(v.pos, 1.0);
+    // (v254) Les matrices du jeu sont comptées depuis la caméra (sans sa translation) : le
+    // point aussi. Loin du centre du monde (40 000 blocs), deux grands nombres voisins qui se
+    // soustraient d'abord restent exacts ; multipliés par la matrice puis soustraits, ils
+    // perdaient des millimètres et l'image tremblait.
+    o.clip = g.view_proj * vec4<f32>(v.pos - g.cam_pos.xyz, 1.0);
     o.color = v.color;
     o.uv = v.uv;
     o.layer = v.layer;
     o.world = v.pos;
+    o.rel = v.pos - g.cam_pos.xyz;
     o.light = v.light;
     return o;
 }
@@ -151,7 +159,7 @@ fn taa_out(i: VOut, n: vec3<f32>, motion: vec2<f32>) -> TaaOut {
 // vecteur de mouvement.
 @fragment
 fn fs_taa(i: VOut) -> TaaOut {
-    let n = face_normal(i.world);
+    let n = face_normal(i.rel);
     return taa_out(i, n, vec2<f32>(0.0));
 }
 
@@ -163,8 +171,9 @@ fn fs_taa(i: VOut) -> TaaOut {
 // marqué pour les images suivantes) : plus de traînée derrière un objet lâché.
 @fragment
 fn fs_taa_world(i: VOut) -> TaaOut {
-    let n = face_normal(i.world);
-    let p = vec4<f32>(i.world, 1.0);
+    let n = face_normal(i.rel);
+    // (v254) Comptés depuis la caméra (voir `vs_main`).
+    let p = vec4<f32>(i.rel, 1.0);
     let cur = g.cur_view_proj * p;
     let prev = g.prev_view_proj * p;
     let d = prev.xy / prev.w - cur.xy / cur.w;

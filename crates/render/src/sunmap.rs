@@ -26,7 +26,15 @@ const DEPTH_MARGIN: f32 = 96.0;
 /// centrée sur `center`, carré de demi-côté `half` (blocs). Le centre est aligné sur les
 /// texels de la carte (le plan de la carte avance d'un texel entier) : une ombre ne bouge pas
 /// quand seule la caméra bouge. Renvoie aussi la marge de profondeur (unités de la carte).
+/// (v254) Le jeu se sert de `view_proj_from` ; celle-ci reste pour les essais.
+#[cfg(test)]
 pub fn view_proj(sun: Vec3, center: Vec3, half: f32) -> (Mat4, f32) {
+    view_proj_from(sun, center, half, Vec3::ZERO)
+}
+
+/// (v254) La même, comptée depuis `origin` (la caméra : `m × (p − origin, 1)`), pour les
+/// shaders qui multiplient `p − caméra` : sans la translation des grandes coordonnées.
+pub fn view_proj_from(sun: Vec3, center: Vec3, half: f32, origin: Vec3) -> (Mat4, f32) {
     let d = -sun.normalize_or(Vec3::Y);
     let up = if d.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
     let right = d.cross(up).normalize();
@@ -36,7 +44,7 @@ pub fn view_proj(sun: Vec3, center: Vec3, half: f32) -> (Mat4, f32) {
     let cy = (center.dot(up) / texel).floor() * texel;
     let c = right * cx + up * cy + d * center.dot(d);
     let depth = half + DEPTH_MARGIN;
-    let view = Mat4::look_to_rh(c - d * depth, d, up);
+    let view = Mat4::look_to_rh((c - origin) - d * depth, d, up);
     let proj = Mat4::orthographic_rh(-half, half, -half, half, 0.0, 2.0 * depth);
     (proj * view, BIAS_BLOCKS / (2.0 * depth))
 }

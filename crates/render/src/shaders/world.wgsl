@@ -566,13 +566,36 @@ struct VOut {
     @location(8) reflect: f32,
     // Coordonnées de texture du sommet (faces penchées, voir TEX_LOCAL_UV).
     @location(9) uv: vec2<f32>,
+    // (v254) Place depuis la caméra, exacte (`v.pos − caméra`) : pour ce que l'arrondi des
+    // grandes coordonnées (± 4 mm à 40 000 blocs) fausse, dérivées (faces vues de dos),
+    // coordonnées de texture et case du bloc (voir `local_pos`).
+    @location(10) rel: vec3<f32>,
 };
+
+/// (v254) Position du pixel ramenée près de l'origine : depuis la case de la caméra
+/// (`rel` + la partie fractionnaire de la caméra, toutes deux exactes). Mêmes parties
+/// fractionnaires que la position dans le monde ; la case du monde est `floor(local_pos)` +
+/// `cam_cell()`.
+fn local_pos(i: VOut) -> vec3<f32> {
+    return i.rel + (g.cam_pos.xyz - floor(g.cam_pos.xyz));
+}
+
+fn cam_cell() -> vec3<i32> {
+    return vec3<i32>(floor(g.cam_pos.xyz));
+}
 
 @vertex
 fn vs_block(v: VIn) -> VOut {
     var o: VOut;
-    o.clip = g.view_proj * vec4<f32>(v.pos, 1.0);
+    // (v254) « En 40 000 40 000 je suis déjà dans les farlands, le jeu commence à présenter des
+    // bugs » : les matrices du jeu sont comptées depuis la caméra (sans sa translation), le
+    // point aussi. Les coins des blocs sont exacts en f32 jusqu'à un million de blocs, la
+    // caméra à ±4 mm à 40 000 : leur différence est exacte, et petite. Avant, la matrice
+    // portait la translation de la caméra (40 000 en f32) et le produit des deux grands
+    // nombres se soustrayait : des millimètres d'erreur à chaque sommet, l'image tremblait.
+    o.clip = g.view_proj * vec4<f32>(v.pos - g.cam_pos.xyz, 1.0);
     o.world = v.pos;
+    o.rel = v.pos - g.cam_pos.xyz;
     o.block = 0u;
     o.sky = f32(v.data & 15u) / 15.0;
     o.reflect = f32((v.data >> 4u) & 15u) / 15.0;
@@ -609,12 +632,15 @@ fn from_behind(i: VOut) -> bool {
     // 22,5°, ses faces ne regardent pas droit le long de leur axe. Jugée avec l'axe, une face
     // qu'on voyait de face était jetée sous certains angles (de haut, ou juste sous le haut
     // de la torche) et on voyait au travers. Les faces droites gardent leur axe.
-    let gn = cross(dpdx(i.world), dpdy(i.world));
+    // (v254) Depuis la caméra : loin du centre du monde, les dérivées de la position dans le
+    // monde (arrondie à 4 mm à 40 000 blocs) donnaient des normales au hasard, et des faces
+    // jetées comme vues de dos.
+    let gn = cross(dpdx(i.rel), dpdy(i.rel));
     let axis = face_normal(i.face);
     let along = dot(gn, axis);
     let n = select(axis, gn * sign(along), along * along > 0.5 * dot(gn, gn) && dot(gn, gn) > 1e-24);
     return i.face < 6u && (i.tex & 32768u) == 0u
-        && dot(n, g.cam_pos.xyz - i.world) < 0.0;
+        && dot(n, -i.rel) < 0.0;
 }
 
 /// (v209) Ce pixel sera-t-il jeté (trou de la texture sous `cut`, face vue de dos) ? Testé
@@ -707,7 +733,7 @@ fn planar_mirror(p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
         if n[axis] * m.z < 0.5 || abs(p[axis] - m.y) > 0.25 {
             continue;
         }
-        let clip = g.mirror_vp[k] * vec4<f32>(p, 1.0);
+        let clip = g.mirror_vp[k] * vec4<f32>(p - g.cam_pos.xyz, 1.0);
         if clip.w <= 0.0 {
             continue;
         }
@@ -723,7 +749,7 @@ fn planar_mirror(p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
 /// l'image faite à part (water_mirror.rs), là où `p` est à l'écran, retourné de gauche à
 /// droite (même vue-projection, sans le tremblement du TAA) ; a = 0 : rien ne s'y reflète.
 fn water_mirror(p: vec3<f32>) -> vec4<f32> {
-    let c = g.cur_view_proj * vec4<f32>(p, 1.0);
+    let c = g.cur_view_proj * vec4<f32>(p - g.cam_pos.xyz, 1.0);
     if c.w <= 0.0 {
         return vec4<f32>(0.0);
     }
@@ -773,8 +799,10 @@ struct MvOut {
 /// Déplacement à l'écran (pixels, y vers le bas) entre cette image et la précédente :
 /// position précédente − position courante.
 fn motion_of(p: vec4<f32>) -> vec2<f32> {
-    let cur = g.cur_view_proj * p;
-    let prev = g.prev_view_proj * p;
+    // (v254) Un point (w = 1) compté depuis la caméra ; une direction (w = 0) telle quelle.
+    let q = vec4<f32>(p.xyz - g.cam_pos.xyz * p.w, p.w);
+    let cur = g.cur_view_proj * q;
+    let prev = g.prev_view_proj * q;
     let d = prev.xy / prev.w - cur.xy / cur.w;
     return d * vec2<f32>(0.5, -0.5) * g.screen.xy;
 }
@@ -889,7 +917,7 @@ fn shade(i: VOut) -> vec4<f32> {
 /// y est retrouvée par sa position dans le monde, donc juste même si la caméra a bougé
 /// depuis. a = 0 si elle n'y figurait pas (cachée, hors champ) : on lance alors le rayon.
 fn cached_reflection(p: vec3<f32>) -> vec4<f32> {
-    let clip = g.refl_vp * vec4<f32>(p, 1.0);
+    let clip = g.refl_vp * vec4<f32>(p - g.cam_pos.xyz, 1.0);
     let ndc = clip.xy / max(clip.w, 1e-6);
     let uv = ndc * vec2<f32>(0.5, -0.5) + 0.5;
     let dims = vec2<i32>(textureDimensions(refl_tex));
@@ -911,7 +939,7 @@ fn fs_reflect(i: VOut) -> @location(0) vec4<f32> {
     if (i.reflect > 0.99 && i.short == 0u && has_planar(i.world, n)) || i.short != 0u {
         return vec4<f32>(0.0);
     }
-    let to_frag = i.world - g.cam_pos.xyz;
+    let to_frag = i.rel;
     let dist = length(to_frag);
     let r = reflect(to_frag / max(dist, 1e-4), n);
     let env = trace(i.world + n * 0.02, r).rgb;
@@ -939,10 +967,13 @@ fn shade_with(i: VOut, reflections: bool, cached: bool, cheap: bool) -> vec4<f32
 /// (`TEX_LOCAL_UV`) : les leurs.
 fn block_uv(i: VOut) -> vec2<f32> {
     let an = abs(face_normal(i.face));
+    // (v254) Près de l'origine (mêmes parties fractionnaires) : des coordonnées de texture et
+    // leurs dérivées justes loin du centre du monde.
+    let w = local_pos(i);
     return select(
         select(
-            select(vec2<f32>(i.world.x, -i.world.y), vec2<f32>(i.world.x, i.world.z), an.y > 0.5),
-            vec2<f32>(i.world.z, -i.world.y),
+            select(vec2<f32>(w.x, -w.y), vec2<f32>(w.x, w.z), an.y > 0.5),
+            vec2<f32>(w.z, -w.y),
             an.x > 0.5,
         ),
         i.uv,
@@ -960,9 +991,11 @@ fn shade_full(i: VOut, reflections: bool, cached: bool, cheap: bool) -> Shaded {
 /// comme les autres choix (le compilateur de DirectX retire ce qui ne sert pas).
 fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> Shaded {
     let n = face_normal(i.face);
-    let p = i.world - n * 0.001;            // légèrement à l'intérieur du bloc
-    let cell = vec3<i32>(floor(p));
-    let to_frag = i.world - g.cam_pos.xyz;
+    // Case du bloc : légèrement à l'intérieur. (v254) Comptée depuis la case de la caméra : loin
+    // du centre du monde, le millième de bloc se perdait dans l'arrondi (± 4 mm à 40 000) et la
+    // case tombait parfois chez le voisin (éclairage d'une autre case).
+    let cell = vec3<i32>(floor(local_pos(i) - n * 0.001)) + cam_cell();
+    let to_frag = i.rel;
     let dist = length(to_frag);
     let fog = smoothstep(g.fog.x, g.fog.y, dist);
 
@@ -979,7 +1012,7 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
     if (i.tex & 4096u) != 0u {
         let t = g.cam_pos.w;
         let wobble = 0.85 + 0.15 * sin(t * 11.0 + i.world.y * 20.0 + f32(cell.x * 7 + cell.z * 3));
-        let core = clamp(1.0 - (fract(i.world.y) - 0.5) * 3.2, 0.0, 1.0);
+        let core = clamp(1.0 - (fract(local_pos(i).y) - 0.5) * 3.2, 0.0, 1.0);
         let flame = lin(i.light) * 1.3 * wobble + lin(i.light) * core * 0.5 + vec3<f32>(0.25, 0.22, 0.18) * core;
         var fc = flame;
         if fog > 0.0 {
@@ -1065,7 +1098,10 @@ fn shade_rt(i: VOut, reflections: bool, cached: bool, cheap: bool, rt: bool) -> 
     // Seulement ses propres faces (point pris juste derrière la face), pas celles des
     // voisins qui le touchent et qu'on voit à travers du verre.
     let eps = vec3<f32>(0.0005);
-    if g.sel_min.w > 0.5 && all(p >= g.sel_min.xyz - eps) && all(p <= g.sel_max.xyz + eps) {
+    // (v254) Compté depuis la caméra (le demi-millième se perdait loin du centre du monde).
+    let p = i.rel - n * 0.001;
+    let cam = g.cam_pos.xyz;
+    if g.sel_min.w > 0.5 && all(p >= g.sel_min.xyz - cam - eps) && all(p <= g.sel_max.xyz - cam + eps) {
         color = color * 1.25 + 0.02;
         wd *= 1.25;
     }
@@ -1257,7 +1293,7 @@ fn vs_outline(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
         select(lo.y, hi.y, (c & 2u) != 0u),
         select(lo.z, hi.z, (c & 4u) != 0u),
     );
-    return g.view_proj * vec4<f32>(pos, 1.0);
+    return g.view_proj * vec4<f32>(pos - g.cam_pos.xyz, 1.0);
 }
 
 @fragment
@@ -2025,7 +2061,7 @@ fn psm_shadow(p: vec3<f32>) -> f32 {
     if g.psm_info.x < 0.5 {
         return 0.0;
     }
-    let c = g.psm_vp * vec4<f32>(p, 1.0);
+    let c = g.psm_vp * vec4<f32>(p - g.cam_pos.xyz, 1.0);
     let uv = vec2<f32>(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);
     if any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) || c.z <= 0.0 || c.z >= 1.0 {
         return 0.0;

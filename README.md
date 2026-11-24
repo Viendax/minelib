@@ -133,7 +133,7 @@ Les mots peuvent être dans n'importe quel ordre (`/fps set ct spawn` marche aus
 
 ## 🧱 Le mode construction
 
-- **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts.
+- **Un monde infini** généré à la volée, avec un cycle jour/nuit, des grottes et des forêts. Loin du centre (40 000 blocs et bien au-delà), l'image reste nette : tout est dessiné depuis la caméra, sans les tremblements, les faces qui disparaissent ni les textures qui grésillent des grandes coordonnées ; et on y marche, s'accroupit ou vole à la même vitesse qu'au centre, même à 300 images par seconde.
 - **Survie, créatif, spectateur** (`/gm 0`, `1`, `3`), et **FPS** (`/gm 2`) pour essayer sa carte, même sur un serveur de construction. En survie, un bloc se casse après une demi-seconde de clic tenu, la main frappant à petits coups ; en créatif, tout de suite, d'un petit coup de la main. Avec le vol permis (`/fly`), aucune chute ne blesse. Le bras pivote depuis l'épaule, qui ne bouge pas : seul le bout descend, avec ce qu'il tient.
 - **Arrivée dans un monde** : un écran de chargement tant que le monde autour de toi n'est pas affiché ; tu n'y apparais, chez toi comme chez les autres joueurs (en construction en ligne, en partie FPS), qu'une fois tout chargé.
 - **WorldEdit intégré** : plus de 40 commandes `//` (remplir, copier, coller, tourner, sphères, cylindres, annuler…). Sur un serveur de construction en ligne, réservé à ses OP : le relais vérifie et envoie les blocs à tous.
@@ -292,6 +292,16 @@ crates/
   lignes de la matrice : `view_ray` et `eye_relative` (crate `render`), `dl_view_ray` et
   `dl_view_offset` (`dynlights.wgsl`), `sky_dir` (`world.wgsl`). Le test
   `nothing_rebuilds_the_view_with_the_inverse_matrix` refuse tout retour en arrière.
+- **(v254) Les vue-projections des shaders sont comptées depuis la caméra.** Chaque passe
+  reçoit ses matrices sans la translation de sa caméra (`eye_relative`, `relative_to`,
+  `shifted`) et multiplie `p − g.cam_pos.xyz` : deux grands nombres voisins qui se
+  soustraient d'abord restent exacts, alors qu'une matrice qui porte la translation
+  (40 000 en f32, à ± 4 mm) et un point de même grandeur se perdent dans l'arrondi (sommets
+  qui tremblent loin du centre du monde). Dérivées, coordonnées de texture et case d'un bloc
+  partent de la place depuis la caméra (`rel`, `local_pos` de `world.wgsl`). Une nouvelle
+  matrice pour les shaders, ou un nouveau `view_proj * vec4(p, 1.0)`, doit suivre la même
+  règle ; le test `camera_relative_matrices_stay_exact_far_from_the_origin` vérifie les
+  aides.
 - **Une image à part s'écrit en entier** (`ColorWrites::ALL`). Seule l'image du monde, où
   l'on ajoute la lumière, garde son alpha. De la v151 à la v186, les rayons n'écrivaient
   pas leur alpha, qui portait la profondeur : la recomposition ne savait plus séparer un

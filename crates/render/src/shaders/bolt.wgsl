@@ -97,8 +97,10 @@ fn place(vi: u32, s: Seg, view_proj: mat4x4<f32>) -> VOut {
     var ia = s.color.a;
     var ib = s.misc.x;
     if !screen {
-        a = view_proj * vec4<f32>(s.a.xyz, 1.0);
-        b = view_proj * vec4<f32>(s.b.xyz, 1.0);
+        // (v254) Comptés depuis la caméra (matrices du jeu sans sa translation : loin du
+        // centre du monde, les grandes coordonnées ne font plus trembler l'image).
+        a = view_proj * vec4<f32>(s.a.xyz - g.cam_pos.xyz, 1.0);
+        b = view_proj * vec4<f32>(s.b.xyz - g.cam_pos.xyz, 1.0);
         // Hauteur sur la planète des nuages : la couche descend vers l'horizon.
         let va = s.a.xyz - g.cam_pos.xyz;
         let vb = s.b.xyz - g.cam_pos.xyz;

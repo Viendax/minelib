@@ -250,6 +250,11 @@ pub struct Player {
     last_axes: (f32, f32),
     /// (v185) Arrêté par un mur à l'horizontale pendant ce pas.
     bumped: bool,
+    /// (v254) Ce qui reste du déplacement voulu et que la position (f32) n'a pas pu faire :
+    /// loin du centre du monde, elle ne vaut qu'à 4 mm près (40 000 blocs), 3 cm (400 000) ;
+    /// un petit pas (accroupi, à 300 images par seconde) s'y arrondissait à rien ou au double.
+    /// Rendu au pas suivant : la vitesse reste juste partout.
+    rest: glam::DVec3,
 }
 
 /// Un autre joueur, vu comme un obstacle.
@@ -320,6 +325,7 @@ impl Player {
             released: [None, None],
             last_axes: (0.0, 0.0),
             bumped: false,
+            rest: glam::DVec3::ZERO,
         }
     }
 
@@ -875,10 +881,15 @@ impl Player {
         let fall_speed = -self.vel.y;
         let crouching = crouching && !fps;
 
-        let delta = self.vel * dt;
+        // (v254) Le pas que la position peut faire : le reste d'avant compris, arrondi à ce
+        // qu'un f32 sait représenter ici ; ce qui manque attend le pas suivant (`settle_rest`).
+        let start = self.pos;
+        let target = start.as_dvec3() + self.rest + (self.vel * dt).as_dvec3();
+        let delta = target.as_vec3() - start;
         if self.noclip {
             self.pos += delta;
             self.on_ground = false;
+            self.settle_rest(start, target);
             return;
         }
         // Petits pas pour ne jamais traverser un bloc à grande vitesse.
@@ -924,6 +935,24 @@ impl Player {
         if fps && self.on_ground && !was_on_ground && fall_speed > 0.0 {
             self.stamina =
                 (self.stamina + cs::STAMINA_LAND_COST * fall_speed / cs::UNIT).min(cs::STAMINA_MAX);
+        }
+        self.settle_rest(start, target);
+    }
+
+    /// (v254) Après un pas parti de `start` vers `target` (exact, f64) : sur chaque axe où le
+    /// joueur a fait tout le pas, ce qui manque à la position pour y être est gardé ; là où un
+    /// mur, le sol, une marche ou un bord l'a arrêté (vitesse coupée, ou position loin de la
+    /// visée), rien.
+    fn settle_rest(&mut self, start: Vec3, target: glam::DVec3) {
+        for k in 0..3 {
+            let left = target[k] - f64::from(self.pos[k]);
+            // Quelques unités du dernier chiffre de la position ici, au plus.
+            let ulp = f64::from(self.pos[k].abs().max(start[k].abs()).max(1.0) * f32::EPSILON);
+            self.rest[k] = if self.vel[k] != 0.0 && left.abs() <= 4.0 * ulp {
+                left
+            } else {
+                0.0
+            };
         }
     }
 
@@ -1722,6 +1751,32 @@ mod tests {
         }
         assert!(p.on_ground);
         assert!((p.pos.y - 11.0).abs() < 0.01, "y = {}", p.pos.y);
+    }
+
+    /// (v254) Loin du centre du monde (300 000 blocs, où un f32 ne vaut qu'à 3 cm près), à
+    /// 300 images par seconde, on vole aussi loin qu'au centre : le reste de chaque petit pas
+    /// est gardé pour le suivant (sans lui, chaque pas de 4 cm s'arrondissait à 3 cm).
+    #[test]
+    fn far_from_the_origin_small_steps_keep_their_speed() {
+        let w = World::new(0);
+        let m = MoveInput {
+            forward: 1.0,
+            ..Default::default()
+        };
+        let flown = |x0: f32| {
+            let mut p = Player::new(Vec3::new(x0, 100.0, 0.5));
+            p.flying = true;
+            p.pitch = 0.0;
+            p.yaw = std::f32::consts::FRAC_PI_2; // vers +X
+            for _ in 0..300 {
+                p.update(&w, &m, 1.0 / 300.0);
+            }
+            f64::from(p.pos.x) - f64::from(x0)
+        };
+        let near = flown(0.3);
+        let far = flown(300_000.3);
+        assert!(near > 5.0, "{near}");
+        assert!((far - near).abs() < 0.07, "au centre {near}, loin {far}");
     }
 
     #[test]

@@ -85,6 +85,8 @@ pub struct Taa {
     written: usize,
     /// Vue-projection sans décalage de l'image précédente.
     pub prev_view_proj: Option<glam::Mat4>,
+    /// (v254) Et sa caméra : les shaders la reçoivent comptée depuis celle d'aujourd'hui.
+    pub prev_eye: Option<glam::Vec3>,
     pub reset: bool,
 }
 
@@ -503,6 +505,7 @@ impl Taa {
             still_frames: 0,
             scene_changed: false,
             prev_view_proj: None,
+            prev_eye: None,
             reset: true,
         }
     }
