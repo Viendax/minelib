@@ -225,7 +225,9 @@ fn page_panel(json: &str) -> Option<(bool, &'static str)> {
 pub const SITES_RECHERCHE: [(&str, &str); 3] = [
     ("yt", RECHERCHE_VIDEO),
     ("dm", "https://www.dailymotion.com/"),
-    ("vm", "https://vimeo.com/search"),
+    // (v284) Vimeo a fermé la recherche de son site en Europe : une page à nous, qui
+    // cherche par Google (voir `edge::scripts::RECHERCHE_VIMEO`).
+    ("vm", crate::edge::scripts::RECHERCHE_VIMEO),
 ];
 
 /// (v265) Le code d'un site où chercher (`yt`, `dm`, `vm`, ou leur nom en entier).

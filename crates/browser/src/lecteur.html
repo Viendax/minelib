@@ -91,7 +91,7 @@ body.cote #sites #ferme{display:block}
 <div id="file"><div id="chercher">Chercher une vidéo sur</div>
 <div id="sites"><button data-s="yt">YouTube</button><button data-s="dm">Dailymotion</button><button
 data-s="vm">Vimeo</button><button id="ferme" title="Fermer la recherche">✕</button></div><h2>À suivre</h2>
-<div id="liste"></div><div id="vide">Rien à suivre. Cherche une vidéo et clique-la : elle se
+<div id="liste"></div><div id="vide">Rien à suivre. Cherche une vidéo et clique dessus : elle se
 mettra ici.</div></div>
 <div id="mot"></div>
 <script>
@@ -247,22 +247,17 @@ B={jouer:()=>V&&V.play().catch(()=>{}),arreter:()=>V&&V.pause().catch(()=>{}),
   aller:t=>V&&V.setCurrentTime(t).then(x=>{vt=x;vq=performance.now();}).catch(()=>{}),
   lire:()=>({t:vt+(vj&&!va?(performance.now()-vq)/1000:0),joue:vj,attente:va,pub:false,i:id})};
 }
-// (v265) Dailymotion : son lecteur officiel et son API ; sans elle (pas de « Player ID »),
-// son lecteur simple, au bon moment, sans pause partagée (la page se dit « en pub » : rien
-// n'y est corrigé), et la fin d'après sa durée.
+// (v265) Dailymotion : son lecteur officiel et son API, avec un « Player ID » (compte
+// Dailymotion, onglet Players du Studio). (v284) Sans lui, Dailymotion refuse son lecteur
+// (« Forbidden », HTTP 403) : la vidéo s'ouvre sur son site (`mlb=site`), au même moment.
 else{
 const x=id.slice(3);let D=null,dt=debut,dq=performance.now(),dj=false,dpub=false;
-const simple=()=>{if(D)return;D=false;erreur=false;pret=false;
-  const f=document.createElement('iframe');f.allow='autoplay; fullscreen; encrypted-media';
-  f.src='https://geo.dailymotion.com/player.html?video='+x+'&startTime='+debut;
-  document.getElementById('lecteur').replaceWith(f);f.id='lecteur';
-  const t0=performance.now();
-  fetch('https://api.dailymotion.com/video/'+x+'?fields=title,duration').then(r=>r.ok?r.json():null)
-  .then(j=>{if(!j)return;if(j.title)document.title=j.title;
-    if(j.duration>0)setTimeout(()=>{fini=true;},Math.max(0,(j.duration-debut)*1000+3000));}).catch(()=>{});
-  B={jouer:()=>{},arreter:()=>{},aller:()=>{},lire:()=>({t:debut+(performance.now()-t0)/1000,joue:true,attente:false,pub:true,i:id})};
-  pret=true;};
-charge('https://geo.dailymotion.com/libs/player'+(DM_PLAYER?'/'+DM_PLAYER:'')+'.js',()=>{try{
+const versSite=()=>{if(erreur)return;erreur=true;mot("Ouverture de la vidéo sur Dailymotion…");
+  let t=Math.floor(dt)||debut;
+  location.replace('https://www.dailymotion.com/video/'+x+'?mlb=site'+(t>0?'&start='+t:''));};
+if(!DM_PLAYER)versSite();
+else{
+charge('https://geo.dailymotion.com/libs/player/'+DM_PLAYER+'.js',()=>{try{
   dailymotion.createPlayer('lecteur',{video:x,params:{startTime:debut,mute:false}}).then(p=>{D=p;pret=true;
     const ev=dailymotion.events||{};
     const sur=(n,f)=>{if(ev[n])D.on(ev[n],f);};
@@ -271,7 +266,7 @@ charge('https://geo.dailymotion.com/libs/player'+(DM_PLAYER?'/'+DM_PLAYER:'')+'.
     sur('AD_END',()=>{dpub=false;});
     if(cherche!==null){D.seek(cherche);cherche=null;}
     if(permis&&voulu)D.play();
-  }).catch(()=>simple());}catch(_){simple();}},()=>simple());
+  }).catch(()=>versSite());}catch(_){versSite();}},()=>versSite());
 // Son état, relu toutes les 500 ms ; une lecture partie sans l'accord du jeu attend le regard.
 setInterval(()=>{if(!D||!D.getState)return;D.getState().then(st=>{
   dt=st.videoTime||0;dq=performance.now();dpub=!!st.adIsPlaying;
@@ -279,6 +274,7 @@ setInterval(()=>{if(!D||!D.getState)return;D.getState().then(st=>{
   if(st.videoTitle)document.title=st.videoTitle;
   if(st.playerIsReplayScreen)fini=true;
   if(dj&&!permis)D.pause();}).catch(()=>{});},500);
+}
 B={jouer:()=>{if(D)D.play();},arreter:()=>{if(D)D.pause();},aller:t=>{if(D)D.seek(t);},
   lire:()=>({t:dt+(dj?(performance.now()-dq)/1000:0),joue:dj,attente:false,pub:dpub,i:id})};
 }

@@ -10,6 +10,9 @@
 /// Signale le focus d'un champ de texte, l'état de la page (vidéo, temps, pause, pub),
 /// renvoie les vidéos de YouTube au lecteur (en ligne), garde les Shorts jusqu'au regard,
 /// et dit les vidéos cliquées (file d'attente). Voir le navigateur Chromium pour l'histoire.
+/// (v284) Dans la recherche à côté, une vidéo cliquée va dans la file **sur tout site** :
+/// Vimeo se cherche par Google (sa recherche est fermée en Europe), liens `google…/url?q=`
+/// compris.
 pub const PAGE_JS: &str = r#"(()=>{if(window.top!==window||window.__minelib)return;window.__minelib=1;
 const dit=s=>{try{window.chrome.webview.postMessage(s);}catch(e){}};
 
@@ -41,7 +44,9 @@ const r=c&&c.closest&&c.closest('ytd-reel-video-renderer');return !!r&&(!!r.quer
 if(gate){window.__mlb_short=()=>{if(ok)return;ok=true;const v=SV();if(v&&v.paused)v.play().catch(()=>{});};
 document.addEventListener('play',e=>{if(attend()&&e.target&&e.target.pause)e.target.pause();},true);
 setInterval(()=>{const v=SV();if(attend()&&v&&!v.paused)v.pause();},250);}
-const num=u=>{try{const x=new URL(u,location.href);const h=x.hostname.toLowerCase().replace(/^www\./,'');let i='';
+const num=u=>{try{let x=new URL(u,location.href);
+if(/(^|\.)google\.[a-z.]+$/.test(x.hostname)&&x.pathname==='/url'){const c=x.searchParams.get('q')||x.searchParams.get('url');if(!c)return '';x=new URL(c);}
+const h=x.hostname.toLowerCase().replace(/^www\./,'');let i='';
 if(h==='youtu.be')i=x.pathname.split('/')[1]||'';
 else if(/(^|\.)youtube\.com$/.test(h)){if(x.pathname==='/watch')i=x.searchParams.get('v')||'';
 else{const m=x.pathname.match(/^\/(live|shorts)\/([^\/?#]+)/);if(m)i=m[2];}}
@@ -63,7 +68,7 @@ const dm=/(^|\.)dailymotion\.com$/.test(location.hostname);
 const autre=u=>{const i=num(u);if(!i||!/^(vm|dm):/.test(i))return '';
 try{if(new URL(u,location.href).searchParams.get('mlb')==='site'){sessionStorage.setItem('mlb_site_'+i,'1');return '';}}catch(e){}
 if(SS('mlb_site_'+i))return '';return L+'?v='+i;};
-if((yt||vm||dm)&&window.__mlb_cote){let dit='';
+if(window.__mlb_cote){let dit='';
 document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagName==='A'&&x.href);const i=a&&num(a.href);
 if(i){e.preventDefault();e.stopImmediatePropagation();ordre({clic:i});}},true);
 setInterval(()=>{const i=num(location.href);if(!i){dit='';return;}if(i===dit)return;dit=i;ordre({clic:i});
@@ -123,6 +128,30 @@ if(perdues>=0&&p-perdues>=6)D('images perdues '+(p-perdues));perdues=p;}},100);}
 pub const BLUR_JS: &str = "(()=>{let a=document.activeElement;\
 while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;\
 if(a&&a.blur)a.blur();})()";
+
+/// (v284) La recherche de Vimeo : Vimeo a fermé la recherche de son site dans l'Union
+/// européenne et au Royaume-Uni (ses vidéos s'ouvrent et s'intègrent toujours). Cette page,
+/// servie par le navigateur à [`RECHERCHE_VIMEO`], cherche par Google (SafeSearch), limité
+/// aux vidéos de Vimeo.
+pub const RECHERCHE_VIMEO_HTML: &str = r#"<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<title>Rechercher sur Vimeo</title><style>
+html,body{margin:0;height:100%;background:#0f0f0f;color:#f1f1f1;font:16px system-ui,'Segoe UI',Roboto,sans-serif}
+main{padding:32px 20px}h1{font-size:24px;margin:0 0 8px}
+p{color:#aaa;font-size:13px;line-height:1.4;margin:0 0 20px}
+form{display:flex;gap:8px}
+input{flex:1;min-width:0;padding:12px 16px;border-radius:22px;border:1px solid #3f3f3f;background:#121212;color:#f1f1f1;font:inherit}
+button{padding:0 18px;border-radius:22px;border:0;background:#f1f1f1;color:#0f0f0f;font:inherit;font-weight:600;cursor:pointer}
+</style></head><body><main><h1>Vimeo</h1>
+<p>Vimeo ne permet plus de chercher sur son site en Europe. La recherche passe par Google, limitée aux vidéos de Vimeo ; une vidéo cliquée va dans la file.</p>
+<form id="f"><input id="q" placeholder="Rechercher une vidéo" autocomplete="off"><button>Chercher</button></form></main>
+<script>document.getElementById('f').addEventListener('submit',e=>{e.preventDefault();
+const q=document.getElementById('q').value.trim();if(!q)return;
+location.href='https://www.google.com/search?tbm=vid&safe=active&q='+encodeURIComponent('site:vimeo.com '+q);});</script>
+</body></html>"#;
+
+/// (v284) L'adresse de la recherche de Vimeo, servie par le navigateur (jamais demandée au
+/// réseau).
+pub const RECHERCHE_VIMEO: &str = "https://viendax.github.io/minelib/recherche-vimeo";
 
 /// La page du lecteur des écrans, servie par le navigateur à `filtre::LECTEUR`.
 pub const LECTEUR_HTML: &str = include_str!("../../../browser/src/lecteur.html");

@@ -673,7 +673,12 @@ impl Navigateur {
                             return Ok(());
                         }
                         // (v210) Une vidéo du site : le lecteur officiel ; (v246) en ligne seulement.
-                        let neuf = if site { None } else { filtre::vers_lecteur(&url) }
+                        // (v284) Pas après une redirection du site : une vidéo ouverte sur son
+                        // site exprès (`mlb=site`) ne revient pas au lecteur si le site enlève
+                        // le paramètre en redirigeant.
+                        let mut redirige = BOOL(0);
+                        let _ = args.IsRedirected(&mut redirige);
+                        let neuf = if site || redirige.as_bool() { None } else { filtre::vers_lecteur(&url) }
                             .or_else(|| filtre::recherche_google(&url).then(|| filtre::avec_safe(&url)).flatten());
                         if let Some(neuf) = neuf.filter(|n| *n != url) {
                             let _ = args.SetCancel(true);
@@ -1206,9 +1211,18 @@ fn ressource(
     unsafe {
         let Ok(req) = args.Request() else { return };
         let url = chaine(|p| req.Uri(p));
-        // (v210) La page du lecteur, servie sans réseau.
-        if filtre::est_lecteur(&url) {
-            let stream = SHCreateMemStream(Some(scripts::LECTEUR_HTML.as_bytes()));
+        // (v210) La page du lecteur, servie sans réseau ; (v284) et la recherche de Vimeo.
+        let locale = if filtre::est_lecteur(&url) {
+            Some(scripts::LECTEUR_HTML)
+        } else if url.strip_prefix(scripts::RECHERCHE_VIMEO).is_some_and(|r| {
+            r.is_empty() || r.starts_with('?') || r.starts_with('#')
+        }) {
+            Some(scripts::RECHERCHE_VIMEO_HTML)
+        } else {
+            None
+        };
+        if let Some(html) = locale {
+            let stream = SHCreateMemStream(Some(html.as_bytes()));
             if let Ok(r) = env.CreateWebResourceResponse(
                 stream.as_ref(),
                 200,
@@ -1295,7 +1309,8 @@ fn message(id: u32, texte: &str, source: &str, out: &Shared, etat: &Partage) {
         Message::Diag(d) => eprintln!("{} onglet {id} : lecteur : {d}", heure()),
         Message::Ordre(o) => {
             // (v253) Seulement de la page du lecteur ou du site de YouTube.
-            // (v265) Et de Vimeo, de Dailymotion (recherche à côté, clic sur une vidéo).
+            // (v265) Et de Vimeo, de Dailymotion (recherche à côté, clic sur une vidéo) ;
+            // (v284) et de Google (la recherche de Vimeo passe par lui).
             let de_confiance = filtre::est_lecteur(source)
                 || filtre::hote(source).is_some_and(|h| {
                     matches!(
@@ -1307,6 +1322,8 @@ fn message(id: u32, texte: &str, source: &str, out: &Shared, etat: &Partage) {
                             | "www.vimeo.com"
                             | "www.dailymotion.com"
                             | "dailymotion.com"
+                            | "www.google.com"
+                            | "www.google.fr"
                     )
                 });
             if de_confiance {
