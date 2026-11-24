@@ -1187,7 +1187,15 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             let relays = st.peers.len() + 1;
             let (name, pose) = game::pose_of(&data)?;
             let pose = Arc::new(transport::PoseOf { id, name, pose });
-            for m in st.build.nearby(id, chunk, relays) {
+            // (v275) Jusqu'à 256 par seconde quand elle part à peu de joueurs ; 66 comme
+            // avant sinon, et toujours quand la région a plusieurs relais (une foule :
+            // chaque position est aussi redite à chacun d'eux).
+            let near = st.build.nearby(id, chunk, relays);
+            let to = if relays > 1 { usize::MAX } else { near.len() };
+            if !st.build.pos_fits(id, to) {
+                return None;
+            }
+            for m in near {
                 if let Some(c) = st.conns.get(&m) {
                     transport::push_pose(&c.tx, &pose);
                 }

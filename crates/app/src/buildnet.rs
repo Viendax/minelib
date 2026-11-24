@@ -61,7 +61,10 @@ fn fluid_edit(old: BlockId, new: BlockId) -> bool {
 /// 100 joueurs au même endroit, et déjà 55 Mbit/s pour 16. C'est la connexion de celui
 /// qui héberge le relais qui cassait en premier, bien avant le nombre de joueurs.
 const POS_EVERY: f32 = 0.1;
-const POS_FASTEST: f32 = 1.0 / 60.0;
+const POS_CROWD: f32 = 1.0 / 60.0;
+/// (v275) Avec peu de voisins (`POS_CLOSE` au plus) : voir `pos_every`.
+const POS_FASTEST: f32 = 1.0 / 256.0;
+const POS_CLOSE: usize = 3;
 /// Positions reçues par seconde qu'on vise au plus (tous les voisins proches réunis) : le
 /// rythme d'envoi de chacun baisse quand il y a du monde autour.
 const POS_BUDGET: f32 = 960.0;
@@ -75,8 +78,22 @@ const SPOT_EVERY: f32 = 10.0;
 /// Intervalle entre deux envois de sa position, selon le nombre de joueurs autour : 60
 /// fois par seconde jusqu'à 16 voisins, puis de moins en moins (30 à 32 voisins), jamais
 /// moins de 10.
-fn pos_every(others: usize) -> f32 {
-    let hz = (POS_BUDGET / others.max(1) as f32).clamp(1.0 / POS_EVERY, 1.0 / POS_FASTEST);
+///
+/// (v275) Avec `POS_CLOSE` voisins au plus (4 joueurs au même endroit), 256 fois par
+/// seconde : chacun en reçoit alors 768 au plus, sous `POS_BUDGET`, et le relais ne les
+/// retient plus 20 ms (`transport::FAST_LINGER`). Une position part au plus par image :
+/// il faut que le jeu tourne à 256 images par seconde pour y arriver. Au-delà de
+/// `POS_CLOSE` voisins rien ne change (le relais regroupe les positions par 20 ms : en
+/// envoyer plus de 60 n'arriverait pas), et seul non plus (personne ne les reçoit).
+///
+/// `hosted` : la position part au relais d'une région ou d'une province, hébergé par un
+/// joueur. Rien ne change là non plus : on ne le joint que par les serveurs relais publics
+/// d'iroh, qui limitent le débit, et c'est ce qui casserait en premier.
+fn pos_every(others: usize, hosted: bool) -> f32 {
+    if !hosted && (1..=POS_CLOSE).contains(&others) {
+        return POS_FASTEST;
+    }
+    let hz = (POS_BUDGET / others.max(1) as f32).clamp(1.0 / POS_EVERY, 1.0 / POS_CROWD);
     1.0 / hz
 }
 
@@ -1952,7 +1969,11 @@ impl BuildNet {
         self.pos_timer -= dt;
         self.spot_timer -= dt;
         if self.pos_timer <= 0.0 && !self.hidden {
-            self.pos_timer = pos_every(self.others.len());
+            // (v275) Le retard pris est reporté sur l'envoi suivant : à 300 images par
+            // seconde il en part bien 256, et non une image sur deux (150).
+            let hosted = self.shards.link(proto::region_of(chunk)).is_some()
+                || self.province_link(chunk).is_some();
+            self.pos_timer = (self.pos_timer + pos_every(self.others.len(), hosted)).max(0.0);
             let msg = BuildMsg::Player {
                 pseudo: self.pseudo.clone(),
                 pos: feet.to_array(),
@@ -2503,6 +2524,22 @@ mod tests {
     use super::*;
     use minelib_net::client::{Client, Cmd, Event};
     use std::time::{Duration, Instant};
+
+    /// (v275) 256 positions par seconde avec 3 voisins au plus ; au-delà et seul, comme
+    /// avant (60, puis de moins en moins dans une foule, jamais moins de 10).
+    #[test]
+    fn a_position_goes_256_times_a_second_to_three_neighbours_at_most() {
+        let hz = |others: usize| (1.0 / pos_every(others, false)).round() as u32;
+        assert_eq!([hz(1), hz(2), hz(3)], [256, 256, 256]);
+        // Par le relais d'une région ou d'une province (hébergé par un joueur) : 60.
+        assert_eq!((1.0 / pos_every(2, true)).round() as u32, 60);
+        assert_eq!([hz(0), hz(4), hz(16), hz(32), hz(96), hz(3000)], [60, 60, 60, 30, 10, 10]);
+        // Chacun reçoit au plus `POS_BUDGET` positions par seconde, à tout nombre de voisins.
+        for others in 1..200 {
+            let got = hz(others) as f32 * others as f32;
+            assert!(got <= POS_BUDGET + 100.0 || hz(others) == 10, "{others} voisins : {got}");
+        }
+    }
 
     /// Un joueur simulé : sa connexion, son monde, ce qu'il a changé.
     struct Bot {
@@ -6822,6 +6859,73 @@ mod tests {
             garant_leaves: true,
             ..Default::default()
         });
+    }
+
+    /// (v275) Deux joueurs au même endroit, par un vrai relais : chacun voit arriver les
+    /// positions de l'autre au rythme de ses images, jusqu'à 256 par seconde (avant : 60
+    /// envoyées, et 50 livrées au plus, regroupées par 20 ms).
+    #[test]
+    fn two_neighbours_see_each_other_at_every_frame() {
+        let dir = std::env::temp_dir().join(format!("minelib-proches-{}", rand_u32()));
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let mut a = Bot::new(&addr, h.public, "Proprio", false);
+        a.c.send(Cmd::Host {
+            kind: 1,
+            name: "Essai".into(),
+            map: "essai".into(),
+            map_sig: [7; 32],
+            max_players: 0,
+        });
+        let mut room = None;
+        let t = Instant::now();
+        while room.is_none() {
+            while let Some(e) = a.c.poll() {
+                match e {
+                    Event::Hosted(r) => room = Some(r),
+                    Event::Link(l) => a.link = Some(l),
+                    _ => {}
+                }
+            }
+            assert!(t.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        a.start_net(true);
+        let mut b = Bot::new(&addr, h.public, "Joueur1", false);
+        b.c.send(Cmd::Join(room.unwrap()));
+        b.wait(|e| matches!(e, Event::Joined { .. }));
+        b.start_net(false);
+        // Une image toutes les 2 à 3 ms (plus de 256 par seconde quand la machine suit),
+        // pendant 3 s ; compté sur les 2 dernières : les images de B où une position de A
+        // vient d'arriver (`seen` repart de zéro).
+        let (mut frames, mut got) = (0u32, 0u32);
+        let (t, mut last) = (Instant::now(), Instant::now());
+        while t.elapsed() < Duration::from_secs(3) {
+            let dt = last.elapsed().as_secs_f32();
+            last = Instant::now();
+            a.pos.x += 4.0 * dt;
+            a.tick(dt);
+            b.tick(dt);
+            if t.elapsed() > Duration::from_secs(1) {
+                frames += 1;
+                let seen = b.net.as_ref().and_then(|n| n.others.get("Proprio"));
+                got += u32::from(seen.is_some_and(|o| o.seen <= dt));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        eprintln!("PROCHES {frames} images en 2 s, {got} avec une position de l'autre");
+        // Machine chargée : moins d'images, donc moins de positions (une par image au
+        // plus) ; on demande la moitié de ce qui pouvait arriver, 256 par seconde au plus.
+        // Avant, 100 au plus en 2 s.
+        assert!(frames > 150, "{frames} images : machine trop chargée pour juger");
+        assert!(got * 2 >= frames.min(512), "{got} positions pour {frames} images");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

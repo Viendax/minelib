@@ -225,6 +225,7 @@ pub struct Build {
     pos_count: HashMap<u64, u32>,
     /// Droit d'envoyer de chaque joueur : (dernier compte, positions encore permises).
     pos_tokens: HashMap<u64, (Instant, f32)>,
+    wide_tokens: HashMap<u64, (Instant, f32)>,
     /// Joueurs par chunk (même contenu que `positions`, rangé pour trouver les voisins
     /// sans parcourir tout le monde) ; `indexed` : nombre de joueurs rangés.
     by_chunk: HashMap<[i32; 2], Vec<u64>>,
@@ -286,11 +287,19 @@ pub fn reach(n: u32) -> usize {
     }
 }
 
-/// Positions par seconde acceptées d'un joueur (le jeu en envoie 60 au plus) : au-delà,
-/// elles ne sont pas diffusées (ancienne version du jeu, qui en envoyait jusqu'à 256, ou
-/// jeu modifié). De quoi absorber une rafale (réseau qui regroupe les envois).
-pub const POS_MAX_HZ: f32 = 66.0;
-const POS_BURST: f32 = 8.0;
+/// Positions par seconde acceptées d'un joueur : au-delà, elles ne sont pas diffusées (jeu
+/// modifié). De quoi absorber une rafale (réseau qui regroupe les envois).
+///
+/// (v275) Deux limites. Le jeu en envoie de nouveau jusqu'à 256, mais seulement quand il a
+/// 3 voisins ou moins (`pos_every` dans crates/app/src/buildnet.rs) : `POS_MAX_HZ` vaut
+/// pour une position qui part à `POS_FEW` joueurs au plus. Dès qu'elle part à davantage
+/// (ou que la région a plusieurs relais : c'est une foule), c'est la limite d'avant,
+/// `POS_WIDE_HZ` : un jeu modifié ne fait pas travailler le relais plus qu'avant.
+pub const POS_MAX_HZ: f32 = 280.0;
+const POS_BURST: f32 = 32.0;
+pub const POS_WIDE_HZ: f32 = 66.0;
+const POS_WIDE_BURST: f32 = 8.0;
+pub const POS_FEW: usize = 4;
 
 /// Une modification du monde est poussée tout de suite à ce nombre de joueurs au plus ;
 /// au-delà (foule), chacun la reçoit avec sa prochaine position, compactée. Le travail par
@@ -543,6 +552,27 @@ impl Build {
         let t = self.pos_tokens.entry(id).or_insert((now, POS_BURST));
         let gained = now.saturating_duration_since(t.0).as_secs_f32() * POS_MAX_HZ;
         *t = (now, (t.1 + gained).min(POS_BURST));
+        if t.1 < 1.0 {
+            return false;
+        }
+        t.1 -= 1.0;
+        true
+    }
+
+    /// (v275) Cette position, qui partirait à `to` joueurs, peut-elle partir ? À
+    /// `POS_FEW` au plus, oui (`pos_due` l'a déjà comptée) ; à davantage, `POS_WIDE_HZ`
+    /// par seconde, lissé.
+    pub fn pos_fits(&mut self, id: u64, to: usize) -> bool {
+        self.pos_fits_at(id, to, Instant::now())
+    }
+
+    fn pos_fits_at(&mut self, id: u64, to: usize, now: Instant) -> bool {
+        if to <= POS_FEW {
+            return true;
+        }
+        let t = self.wide_tokens.entry(id).or_insert((now, POS_WIDE_BURST));
+        let gained = now.saturating_duration_since(t.0).as_secs_f32() * POS_WIDE_HZ;
+        *t = (now, (t.1 + gained).min(POS_WIDE_BURST));
         if t.1 < 1.0 {
             return false;
         }
@@ -972,6 +1002,7 @@ impl Build {
         self.known.remove(&id);
         self.pos_count.remove(&id);
         self.pos_tokens.remove(&id);
+        self.wide_tokens.remove(&id);
     }
 }
 
@@ -1616,6 +1647,36 @@ mod tests {
         assert_eq!(got, vec![([0, 0], vec![a, c])]);
         // L'historique remis à un relais de région ne contient que les blocs.
         assert_eq!(b.logs_in(|_| true)[0].1.len(), 2);
+    }
+
+    /// (v275) Une position qui part à peu de joueurs passe 256 fois par seconde ; dès
+    /// qu'elle part à davantage, 66 fois comme avant, quel que soit le rythme d'envoi.
+    #[test]
+    fn positions_pass_256_times_a_second_to_few_players_and_66_to_a_crowd() {
+        let passed = |to: usize, hz: u32| {
+            let mut b = Build::default();
+            let t0 = Instant::now();
+            (0..hz * 4)
+                .filter(|i| {
+                    let now = t0 + Duration::from_secs_f64(f64::from(*i) / f64::from(hz));
+                    b.pos_due_at(7, now) && b.pos_fits_at(7, to, now)
+                })
+                .count() as f32
+                / 4.0
+        };
+        // Le jeu : 256 par seconde à 3 voisins, 60 au-delà ; rien n'est écarté.
+        assert_eq!(passed(3, 256), 256.0);
+        assert_eq!(passed(POS_FEW, 256), 256.0);
+        assert_eq!(passed(16, 60), 60.0);
+        assert_eq!(passed(2048, 10), 10.0);
+        // Un jeu modifié : 280 au plus vers peu de joueurs, 66 vers une foule (rafale du
+        // début comprise).
+        let few = passed(3, 1000);
+        assert!((270.0..=290.0).contains(&few), "{few}");
+        let crowd = passed(POS_FEW + 1, 1000);
+        assert!((60.0..=70.0).contains(&crowd), "{crowd}");
+        let crowd = passed(2048, 256);
+        assert!((60.0..=70.0).contains(&crowd), "{crowd}");
     }
 
     #[test]

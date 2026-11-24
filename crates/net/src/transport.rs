@@ -41,6 +41,18 @@ pub const OUT_MAX: usize = 32 * 1024;
 /// Les positions de joueurs (`push_pose`) partent de la même façon, avec eux : dans une
 /// foule c'est de loin le plus gros du trafic (500 positions par seconde et par joueur).
 const CELL_LINGER: Duration = Duration::from_millis(20);
+/// (v275) Vers un joueur qui a peu de voisins (`FEW` au plus, comptés sur `FEW_WINDOW`) et
+/// dont les voisins envoient leur position bien plus de 50 fois par seconde (plus de
+/// `FAST_FROM` chacun par `FEW_WINDOW` : le jeu en envoie jusqu'à 256 à 3 voisins au
+/// plus), un paquet n'attend que ce temps : elles arrivent une par une au lieu d'être
+/// retenues 20 ms (et remplacées en route par la suivante). Sinon rien ne change : une
+/// foule, ou des voisins à 60 positions par seconde (c'est le cas par le relais d'une
+/// région ou d'une province, voir `pos_every` dans crates/app/src/buildnet.rs), restent
+/// regroupés en une cinquantaine de paquets par seconde.
+const FAST_LINGER: Duration = Duration::from_millis(3);
+const FEW: usize = 4;
+const FEW_WINDOW: Duration = Duration::from_millis(500);
+const FAST_FROM: u32 = 40;
 /// Le pseudo d'un joueur est redit avec sa position au plus tôt ce temps après la dernière
 /// fois (le jeu qui reçoit le retient entre-temps ; s'il l'a oublié, il le retrouve vite).
 const NAME_EVERY: Duration = Duration::from_secs(5);
@@ -112,6 +124,13 @@ pub struct Grouper {
     cells: Vec<crate::cells::Cell>,
     cells_due: Instant,
     cells_sent: Instant,
+    /// (v275) Attente avant le prochain paquet (`FAST_LINGER` avec peu de voisins rapides),
+    /// et de quoi en juger : les joueurs dont une position est passée ici depuis `few_at`
+    /// (`FEW + 1` retenus au plus), et combien de positions.
+    linger: Duration,
+    few: Vec<u64>,
+    few_n: u32,
+    few_at: Instant,
     /// Positions en attente (la dernière de chaque joueur), et quand le pseudo de chaque
     /// joueur a été dit sur cette connexion pour la dernière fois.
     poses: std::collections::HashMap<u64, (std::sync::Arc<PoseOf>, Instant)>,
@@ -132,6 +151,10 @@ impl Grouper {
             cells: Vec::new(),
             cells_due: Instant::now(),
             cells_sent: Instant::now(),
+            linger: CELL_LINGER,
+            few: Vec::new(),
+            few_n: 0,
+            few_at: Instant::now(),
             poses: std::collections::HashMap::new(),
             named: std::collections::HashMap::new(),
             ready: std::collections::VecDeque::new(),
@@ -153,10 +176,23 @@ impl Grouper {
         self.ready.pop_front()
     }
 
+    /// (v275) Un voisin de plus dont une position passe ici (voir `FEW`) ; dès qu'il y en
+    /// a trop, les paquets attendent de nouveau `CELL_LINGER`, sans attendre la fin du
+    /// décompte.
+    fn count(&mut self, id: u64) {
+        self.few_n = self.few_n.saturating_add(1);
+        if self.few.len() <= FEW && !self.few.contains(&id) {
+            self.few.push(id);
+            if self.few.len() > FEW {
+                self.linger = CELL_LINGER;
+            }
+        }
+    }
+
     /// Un bloc changé. Vrai s'il y en a assez pour un paquet plein (`pack` tout de suite).
     pub fn add_cell(&mut self, c: crate::cells::Cell) -> bool {
         if !self.waiting() {
-            self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
+            self.cells_due = (self.cells_sent + self.linger).max(Instant::now());
         }
         self.cells.push(c);
         self.cells.len() >= crate::cells::CELLS_MAX
@@ -166,8 +202,9 @@ impl Grouper {
     /// plein.
     pub fn add_pose(&mut self, p: std::sync::Arc<PoseOf>, at: Instant) -> bool {
         if !self.waiting() {
-            self.cells_due = (self.cells_sent + CELL_LINGER).max(Instant::now());
+            self.cells_due = (self.cells_sent + self.linger).max(Instant::now());
         }
+        self.count(p.id);
         self.poses.insert(p.id, (p, at));
         self.poses.len() >= crate::poses::POSES_MAX
     }
@@ -181,6 +218,7 @@ impl Grouper {
             match more() {
                 Some(Inbound::Cell(c)) => self.cells.push(c),
                 Some(Inbound::Pose(p, at)) => {
+                    self.count(p.id);
                     self.poses.insert(p.id, (p, at));
                 }
                 Some(m) => {
@@ -191,6 +229,13 @@ impl Grouper {
             }
         }
         self.cells_sent = Instant::now();
+        if self.cells_sent.saturating_duration_since(self.few_at) >= FEW_WINDOW {
+            let fast = self.few.len() <= FEW && self.few_n > FAST_FROM * self.few.len() as u32;
+            self.linger = if fast { FAST_LINGER } else { CELL_LINGER };
+            self.few.clear();
+            self.few_n = 0;
+            self.few_at = self.cells_sent;
+        }
         if !self.poses.is_empty() {
             let now = self.cells_sent;
             if self.named.len() > 8192 {
@@ -573,6 +618,108 @@ impl Drop for Channel {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// (v275) Trois voisins seulement, 250 positions par seconde chacun : passé le temps de
+    /// s'en apercevoir (une demi-seconde), rien n'est plus retenu 20 ms et presque toutes
+    /// arrivent. (Une foule, elle, reste regroupée : essai suivant.)
+    #[test]
+    fn a_few_close_neighbours_are_not_held_back() {
+        // 300 positions de chacun, une toutes les 4 ms ; comptées à partir de la 160e
+        // (0,64 s) : 420. Retenues 20 ms, il n'en serait arrivé qu'une sur cinq (28
+        // paquets, 84 positions) : ici, au moins les deux tiers.
+        let (packets, entries) = three_neighbours(300, 4, 160.0);
+        assert!(entries >= 280, "{entries} positions arrivées sur 420");
+        assert!(packets >= 90, "{packets} paquets");
+    }
+
+    /// (v275) Les mêmes à 60 positions par seconde (ce que le jeu envoie par le relais
+    /// d'une région ou d'une province) : regroupées par 20 ms comme avant, pas un paquet
+    /// par position.
+    #[test]
+    fn a_few_slow_neighbours_stay_grouped() {
+        // 90 positions de chacun, une toutes les 16 ms ; comptées à partir de la 45e
+        // (0,72 s) : 0,72 s de plus, soit 36 paquets de 20 ms au plus.
+        let (packets, entries) = three_neighbours(90, 16, 45.0);
+        assert!(packets <= 45, "{packets} paquets");
+        assert!(entries >= 100, "{entries} positions arrivées sur 135");
+    }
+
+    /// Trois joueurs envoient chacun `steps` positions, une toutes les `every_ms`
+    /// millisecondes, à un quatrième : paquets et positions qu'il reçoit, comptés à partir
+    /// de la position `from` de chacun.
+    fn three_neighbours(steps: u32, every_ms: u64, from: f32) -> (u32, u32) {
+        use crate::game::{self, BuildMsg};
+        use crate::poses::Pose;
+        use crate::proto::{Request, Response};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (private, _) = generate_static();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut c = Channel::accept(stream, &private, Duration::from_secs(5)).unwrap();
+            let tx = c.pusher();
+            std::thread::spawn(move || {
+                for step in 0..steps {
+                    for id in 1..=3u64 {
+                        let pose = std::sync::Arc::new(PoseOf {
+                            id,
+                            name: format!("Joueur{id}"),
+                            pose: Pose {
+                                pos: [id as f32, 64.0, step as f32],
+                                yaw: 1.0,
+                                pitch: 0.0,
+                                crouch: 0.0,
+                                speed: 4.0,
+                                ping: None,
+                                held: 0,
+                            },
+                        });
+                        push_pose(&tx, &pose);
+                    }
+                    std::thread::sleep(Duration::from_millis(every_ms));
+                }
+                std::thread::sleep(Duration::from_millis(60));
+                push(&tx, &Response::Pong);
+            });
+            loop {
+                match c.recv_any::<Request>(Duration::from_millis(500)) {
+                    Ok(Some(Incoming::Push(p))) => c.send_raw(&p).unwrap(),
+                    Ok(Some(Incoming::Msg(_))) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        });
+        let (mut c, _) = Channel::connect(&addr, Duration::from_secs(5)).unwrap();
+        let (mut packets, mut entries) = (0u32, 0u32);
+        let mut last = std::collections::HashMap::new();
+        let t = Instant::now();
+        loop {
+            assert!(t.elapsed() < Duration::from_secs(10));
+            match c
+                .recv_timeout::<Response>(Duration::from_millis(200))
+                .unwrap()
+            {
+                Some(Response::FromZone { data, .. }) => {
+                    let Some(BuildMsg::Poses(p)) = game::decode(&data) else {
+                        panic!("un paquet de positions")
+                    };
+                    let mut counted = false;
+                    for (id, _, pose) in crate::poses::unpack_poses(&p).expect("lisible") {
+                        counted |= pose.pos[2] >= from;
+                        entries += u32::from(pose.pos[2] >= from);
+                        last.insert(id, pose.pos[2]);
+                    }
+                    packets += u32::from(counted);
+                }
+                Some(Response::Pong) => break,
+                _ => {}
+            }
+        }
+        drop(c);
+        server.join().unwrap();
+        assert!(last.values().all(|z| *z == (steps - 1) as f32), "la dernière de chacun");
+        (packets, entries)
+    }
 
     /// Les positions de trente joueurs, soixante fois par seconde chacun, arrivent en une
     /// cinquantaine de paquets par seconde ; le pseudo de chacun n'est dit qu'une fois, et

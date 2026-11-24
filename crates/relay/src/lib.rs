@@ -91,6 +91,9 @@ pub(crate) mod tests_support {
     /// Positions envoyées par seconde par un joueur qui en voit `others` autour de lui
     /// (même règle que `pos_every` dans crates/app/src/buildnet.rs).
     pub fn pos_hz(others: usize) -> f32 {
+        if (1..=3).contains(&others) {
+            return 256.0;
+        }
         (960.0 / others.max(1) as f32).clamp(10.0, 60.0)
     }
 }
@@ -8208,7 +8211,13 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     name: pseudo.to_string(),
                     pose,
                 });
-                for m in room.build.nearby(id, chunk, 1) {
+                // (v275) Jusqu'à 256 par seconde quand elle part à peu de joueurs, 66 comme
+                // avant sinon (`zones::POS_FEW`).
+                let near = room.build.nearby(id, chunk, 1);
+                if !room.build.pos_fits(id, near.len()) {
+                    return None;
+                }
+                for m in near {
                     if let Some(c) = st.conns.get(&m) {
                         transport::push_pose(&c.tx, &pose);
                     }
