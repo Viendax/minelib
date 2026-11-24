@@ -1621,11 +1621,12 @@ pub(crate) fn world_layout_entries() -> [wgpu::BindGroupLayoutEntry; 9] {
             count: None,
         },
         // (v251) Atlas des teintes (lumière passée par le verre), lu texel par texel.
+        // (v262) Entiers : quatre paires de demi-flottants par texel.
         wgpu::BindGroupLayoutEntry {
             binding: 24,
             visibility: frag,
             ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                sample_type: wgpu::TextureSampleType::Uint,
                 view_dimension: wgpu::TextureViewDimension::D2,
                 multisampled: false,
             },
@@ -1635,13 +1636,15 @@ pub(crate) fn world_layout_entries() -> [wgpu::BindGroupLayoutEntry; 9] {
 }
 
 /// (v220) Un atlas des ombres des joueurs de `size` pixels de côté.
-/// (v251) Format de la carte de teinte des lumières près du verre : rgb = filtre des verres
-/// traversés, a = distance du premier (rapportée à la portée).
-pub(crate) const TINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// (v251) Format de la carte de teinte des lumières près du verre. (v262) Quatre paires de
+/// demi-flottants (`fs_tint` de shadow_bake.wgsl) : ce qu'absorbent le premier verre et tous
+/// les verres traversés, avec la distance du premier et celle de la dernière surface de verre
+/// (le rayon entre deux verres n'a que la couleur du premier).
+pub(crate) const TINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
 
 /// (v251) Côté de l'atlas des teintes pour un atlas des ombres de `size` pixels : les mêmes
 /// cases, deux fois plus petites de côté (quatre au-delà de 4 096 : au plus 2 048 pixels,
-/// 32 Mo).
+/// 64 Mo depuis la v259, 16 octets par texel).
 fn tint_side(size: u32) -> u32 {
     if size > 4096 {
         (size / 4).max(1)
@@ -2883,7 +2886,7 @@ impl DynGpu {
             "ombres des lumières : qualité {} (atlas {size} px, {} cases de {tile} px, {} Mo ; joueurs {ent} px ; teintes {tint} px)",
             SHADOW_QUALITY_NAMES[q as usize],
             per * per,
-            (size as u64 * size as u64 * 4 + ent as u64 * ent as u64 * 4 + tint as u64 * tint as u64 * 8)
+            (size as u64 * size as u64 * 4 + ent as u64 * ent as u64 * 4 + tint as u64 * tint as u64 * 16)
                 / (1024 * 1024)
         );
     }

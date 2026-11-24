@@ -174,22 +174,58 @@ fn cross_hit(o: vec3<f32>, d: vec3<f32>, cell: vec3<i32>, t_in: f32, layer: u32)
 
 /// (v251) Ce que la lumière rencontre : distance du premier bloc qui l'arrête (`t`), et avant
 /// lui, la teinte des verres traversés (`tint`, produit de leurs filtres) et la distance du
-/// premier (`glass`, 1e9 : aucun).
+/// premier (`glass`, 1e9 : aucun). (v262) Aussi le filtre après le premier verre (ou amas de
+/// verres collés) seul (`tint1`) et la distance de la dernière surface de verre (`last`) :
+/// entre le premier verre et le dernier, la lumière n'a traversé que le premier.
 struct March {
     t: f32,
     tint: vec3<f32>,
     glass: f32,
+    tint1: vec3<f32>,
+    last: f32,
 };
 
-/// (v251) Filtre d'un texel de verre (`c` : couleur et opacité) : un verre teinté arrête les
-/// autres couleurs, la lumière qui le traverse prend sa teinte (ramenée à sa couleur la plus
-/// vive : un verre rouge sombre donne une lumière bien rouge, pas grise), d'autant plus qu'il
-/// est opaque (le verre teinté du jeu l'est aux trois huitièmes, ses reflets plus) ; il en
-/// garde un peu moins. Un verre incolore : à peine plus sombre.
-fn glass_filter(c: vec4<f32>) -> vec3<f32> {
-    let k = clamp(c.a * 2.0, 0.0, 1.0);
-    let hue = c.rgb / max(max(c.r, c.g), max(c.b, 1e-3));
-    return mix(vec3<f32>(1.0), hue, k) * (1.0 - 0.15 * k);
+/// (v262) « Que ce soit réaliste » : ce que laisse passer une surface de verre que la lumière
+/// traverse, par couleur. `c` : couleur (linéaire) et opacité du texel où elle passe ;
+/// `cosi` : cosinus de l'angle avec la normale de la surface.
+/// - Une part se réfléchit (Schlick, verre d'indice 1,5 : 4 % de face, presque tout en
+///   rasant).
+/// - Le reste traverse la couche teintée (Beer-Lambert) : la couleur du verre est ce que laisse
+///   passer une couche d'épaisseur 1 (opacité 1) ; l'opacité du texel est son épaisseur, plus
+///   longue en biais (1 / cos). Un verre foncé laisse passer peu de lumière, un verre noir
+///   presque rien (la v251 ramenait chaque teinte à sa couleur la plus vive : un verre noir ou
+///   gris laissait tout passer) ; les vides du verre incolore (opacité 0), tout ; son cadre,
+///   un peu moins.
+/// Plusieurs verres se multiplient, comme de vrais filtres : jaune puis cyan donnent du vert,
+/// rouge puis bleu presque rien.
+fn glass_pass(c: vec4<f32>, cosi: f32) -> vec3<f32> {
+    let mu = clamp(cosi, 0.0, 1.0);
+    let fresnel = 1.0 - (0.04 + 0.96 * pow(1.0 - mu, 5.0));
+    let depth = clamp(c.a, 0.0, 1.0) / max(mu, 0.2);
+    return fresnel * pow(clamp(c.rgb, vec3<f32>(1e-4), vec3<f32>(1.0)), vec3<f32>(depth));
+}
+
+/// (v262) Filtre de la face d'un bloc de verre (`pal` : ses textures) que la lumière, partie
+/// de `o` vers `d`, traverse au temps `t`, perpendiculaire à l'axe `axis` : le texel de la face
+/// à cet endroit. `exit` : la face par où elle sort de la case (sinon : celle par où elle y
+/// entre).
+fn glass_face(o: vec3<f32>, d: vec3<f32>, t: f32, axis: i32, step: vec3<i32>, pal: vec4<u32>, exit: bool) -> vec3<f32> {
+    let p = o + d * t;
+    var uv = vec2<f32>(p.x, p.z);
+    // Le dessus quand elle entre en descendant ou sort en montant ; le dessous sinon.
+    var layer = select(pal.z, pal.x, (step.y < 0) != exit);
+    var cosi = abs(d.y);
+    if axis == 0 {
+        uv = vec2<f32>(p.z, -p.y);
+        layer = pal.y;
+        cosi = abs(d.x);
+    } else if axis == 2 {
+        uv = vec2<f32>(p.x, -p.y);
+        layer = pal.y;
+        cosi = abs(d.z);
+    }
+    let c = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), 0.0);
+    return glass_pass(c, cosi);
 }
 
 /// Distance du premier bloc qui arrête la lumière partie de `o` vers `d` (au plus `max_t`).
@@ -207,6 +243,15 @@ fn shadow_march(o: vec3<f32>, d: vec3<f32>, max_t: f32, skip_start: bool, tint: 
     var result = max_t;
     var filt = vec3<f32>(1.0);
     var first_glass = 1e9;
+    // (v262) Dans un amas de blocs de verre collés (pas de face entre eux, comme à l'écran) :
+    // le filtre se prend à ses surfaces, en y entrant et en en sortant ; les textures du
+    // dernier bloc de verre traversé ; le filtre après le premier amas (ou la première
+    // vitre) ; la distance de la dernière surface de verre.
+    var in_glass = false;
+    var glass_pal = vec4<u32>(0u);
+    var filt1 = vec3<f32>(1.0);
+    var first_done = false;
+    var last_glass = 0.0;
     // Au plus ~√3 cases par bloc parcouru (borne lue à l'exécution : pas de déroulement).
     let n = i32(ceil(max_t * 1.8)) + 3;
     for (var i = 0; i < 512; i++) {
@@ -241,46 +286,57 @@ fn shadow_march(o: vec3<f32>, d: vec3<f32>, max_t: f32, skip_start: bool, tint: 
         let id = raw & 4095u;
         let at_start = all(cell == start);
         let own = skip_start && at_start;
+        var pal = vec4<u32>(0u);
+        var shp = vec4<u32>(0u);
+        if id != 0u {
+            pal = textureLoad(palette, i32(id), 0);
+            shp = textureLoad(palette, i32(id) + 4096, 0);
+        }
+        // (v262) Bloc de verre plein (pas une vitre : bit 11 de la palette, forme pleine).
+        let glass_cube = id != 0u && !own && ((pal.w >> 11u) & 1u) == 1u && (shp.w & 3u) != 2u;
+        // Sortie d'un amas de verre (vers l'air, une vitre, un bloc qui arrête la lumière,
+        // même si cette face-là n'est pas dessinée contre lui) : sa surface, vue de dedans.
+        if tint && in_glass && !glass_cube {
+            filt *= glass_face(o, d, t, axis, step, glass_pal, true);
+            last_glass = t;
+            if !first_done {
+                filt1 = filt;
+                first_done = true;
+            }
+            in_glass = false;
+        }
         if id != 0u && !own {
-            let pal = textureLoad(palette, i32(id), 0);
             let torch = (pal.w >> 8u) & 7u;
-            let shp = textureLoad(palette, i32(id) + 4096, 0);
             let kind = shp.w & 3u;
             let partial = kind != 0u && kind != 3u;
             // (v251) Verre (bit 11 de la palette) : il n'arrête pas la lumière, il la teinte.
-            // Un bloc de verre la filtre une fois, là où elle y entre (où elle en sort si elle
-            // part de dedans) ; une vitre, là où elle traverse sa plaque.
+            // (v262) Comme à l'écran : un bloc de verre (ou des blocs de verre collés, même de
+            // couleurs différentes : pas de face entre eux) la filtre à ses surfaces, là où
+            // elle y entre et là où elle en sort ; une vitre, aux deux faces de sa plaque.
             if ((pal.w >> 11u) & 1u) == 1u {
                 if tint {
-                    var gt = t;
-                    var gax = axis;
-                    var through = true;
                     if kind == 2u {
                         let sh = shape_hit(o, d, cell, shp, t);
-                        through = sh.x >= 0.0;
-                        gt = sh.x;
-                        gax = i32(sh.y);
-                    } else if at_start {
-                        let tx = select(t_max.x, 1e9, abs(d.x) < 1e-6);
-                        let ty = select(t_max.y, 1e9, abs(d.y) < 1e-6);
-                        let tz = select(t_max.z, 1e9, abs(d.z) < 1e-6);
-                        gt = min(tx, min(ty, tz));
-                        gax = select(select(2, 1, ty <= tz), 0, tx <= ty && tx <= tz);
-                    }
-                    if through && gt <= max_t {
-                        let p = o + d * gt;
-                        var uv = vec2<f32>(p.x, p.z);
-                        var layer = select(pal.z, pal.x, step.y < 0);
-                        if gax == 0 {
-                            uv = vec2<f32>(p.z, -p.y);
-                            layer = pal.y;
-                        } else if gax == 2 {
-                            uv = vec2<f32>(p.x, -p.y);
-                            layer = pal.y;
+                        if sh.x >= 0.0 && sh.x <= max_t {
+                            let f = glass_face(o, d, sh.x, i32(sh.y), step, pal, false);
+                            filt *= f * f;
+                            first_glass = min(first_glass, max(sh.x, 0.0));
+                            last_glass = max(last_glass, sh.x);
+                            if !first_done {
+                                filt1 = filt;
+                                first_done = true;
+                            }
                         }
-                        let c = textureSampleLevel(blocks, block_sampler, fract(uv), i32(layer), 0.0);
-                        filt *= glass_filter(c);
-                        first_glass = min(first_glass, max(gt, 0.0));
+                    } else {
+                        if !in_glass {
+                            // Partie de dedans : seulement la face par où elle sort.
+                            if !at_start {
+                                filt *= glass_face(o, d, t, axis, step, pal, false);
+                            }
+                            first_glass = min(first_glass, max(t, 0.0));
+                        }
+                        in_glass = true;
+                        glass_pal = pal;
                     }
                 }
                 continue;
@@ -358,9 +414,12 @@ fn shadow_march(o: vec3<f32>, d: vec3<f32>, max_t: f32, skip_start: bool, tint: 
     // Un verre plus loin que le bloc qui arrête la lumière ne compte pas (la boucle s'arrête à
     // lui ; une vitre dans la même case que lui, si).
     if first_glass > result {
-        return March(result, vec3<f32>(1.0), 1e9);
+        return March(result, vec3<f32>(1.0), 1e9, vec3<f32>(1.0), 1e9);
     }
-    return March(result, filt, first_glass);
+    if !first_done {
+        filt1 = filt;
+    }
+    return March(result, filt, first_glass, filt1, max(last_glass, first_glass));
 }
 
 @fragment
@@ -374,17 +433,28 @@ fn fs_bake(i: VOut) -> @builtin(frag_depth) f32 {
 }
 
 /// (v251) Carte de teinte d'une lumière près du verre (mêmes cases que les cartes d'ombre,
-/// à une résolution moindre) : rgb = filtre des verres que traverse la lumière avant le
-/// premier bloc qui l'arrête, a = distance du premier verre rapportée à la portée (1 : aucun).
+/// à une résolution moindre). (v262) Quatre paires de demi-flottants (`dl_tint_one`) : ce
+/// qu'absorbe le premier verre (1 − son filtre, rgb) et sa distance, ce qu'absorbent tous
+/// (1 − leur filtre) et la distance de la dernière surface de verre, rapportées à la portée.
+/// Rien que des zéros : pas de verre.
 @fragment
-fn fs_tint(i: VOut) -> @location(0) vec4<f32> {
+fn fs_tint(i: VOut) -> @location(0) vec4<u32> {
     let j = jobs[i.job];
     let ndc = vec2<f32>(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
     let d = normalize(j.fwd.xyz + (j.right.xyz * ndc.x + j.up.xyz * ndc.y) * j.fwd.w);
     let range = max(j.pos_range.w, 0.01);
     let m = shadow_march(j.pos_range.xyz, d, range, j.right.w > 0.5, true);
     if m.glass > 1e8 {
-        return vec4<f32>(1.0);
+        return vec4<u32>(0u);
     }
-    return vec4<f32>(m.tint, clamp(m.glass / range, 0.0, 1.0));
+    let a1 = vec3<f32>(1.0) - m.tint1;
+    let a = vec3<f32>(1.0) - m.tint;
+    let d1 = clamp(m.glass / range, 0.0, 1.0);
+    let dn = clamp(m.last / range, 0.0, 1.0);
+    return vec4<u32>(
+        pack2x16float(a1.xy),
+        pack2x16float(vec2<f32>(a1.z, d1)),
+        pack2x16float(a.xy),
+        pack2x16float(vec2<f32>(a.z, dn)),
+    );
 }

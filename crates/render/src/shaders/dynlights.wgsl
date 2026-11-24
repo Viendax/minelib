@@ -81,10 +81,10 @@ struct DynHeader {
 // (v220) Atlas des ombres des joueurs : leur distance à chaque lumière (rapportée à sa
 // portée ; 1 : personne), dans les mêmes cases que les cartes des blocs (voir `EntJob`).
 @group(0) @binding(23) var ent_atlas: texture_depth_2d;
-// (v251) Atlas des teintes : la lumière passée par le verre (rgb : filtre des verres traversés,
-// a : distance du premier, rapportée à la portée), dans les mêmes cases que les cartes des
-// blocs, deux ou quatre fois plus petites de côté.
-@group(0) @binding(24) var tint_atlas: texture_2d<f32>;
+// (v251) Atlas des teintes : la lumière passée par le verre, dans les mêmes cases que les
+// cartes des blocs, deux ou quatre fois plus petites de côté. (v262) Quatre paires de
+// demi-flottants par texel (`dl_tint_one`).
+@group(0) @binding(24) var tint_atlas: texture_2d<u32>;
 
 const DL_VL_SHADOWS: u32 = 1u;
 const DL_VL_NOISE: u32 = 2u;
@@ -288,11 +288,40 @@ fn dl_shadow_uv(L: DynLight, fr: DlFrame, d: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(rect.xy + local, select(0.0, 1.0, ok));
 }
 
+/// (v262) Case de l'atlas où la lumière `L` voit la direction `d` (celle de `dl_shadow_uv`) :
+/// coin et côté (uv).
+fn dl_light_rect(L: DynLight, fr: DlFrame, d: vec3<f32>) -> vec3<f32> {
+    if L.shadow.x > 1.5 {
+        return dl_tile_rect(L.vol.w + f32(dl_cube_face(d)));
+    }
+    return fr.rect;
+}
+
+/// (v262) Un texel de la carte de teinte (`fs_tint` de shadow_bake.wgsl) : ce que la lumière a
+/// traversé de verre en arrivant à `t` (distance rapportée à la portée). Avant le premier
+/// verre : rien. Après la dernière surface de verre : tous. Entre les deux : le premier seul
+/// (le rayon entre deux verres n'a que la couleur du premier). `surface` : une surface que la
+/// lumière éclaire est le premier bloc qui l'arrête, tous les verres notés sont devant elle.
+fn dl_tint_one(q: vec4<u32>, t: f32, surface: bool) -> vec3<f32> {
+    let p0 = unpack2x16float(q.x);
+    let p1 = unpack2x16float(q.y);
+    let p2 = unpack2x16float(q.z);
+    let p3 = unpack2x16float(q.w);
+    if t <= p1.y + 0.004 {
+        return vec3<f32>(1.0);
+    }
+    if surface || t > p3.y + 0.004 {
+        return clamp(vec3<f32>(1.0) - vec3<f32>(p2.x, p2.y, p3.x), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    return clamp(vec3<f32>(1.0) - vec3<f32>(p0.x, p0.y, p1.x), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 /// (v251) « Les blocs comme les vitres colorées doivent affecter la coloration de la lumière » :
 /// couleur que prend la lumière `L` en arrivant, à la distance `dist` (portée `range`), dans la
-/// direction `d` (de la lumière vers le point) : le filtre des verres qu'elle a traversés si le
-/// point est au-delà du premier, sinon blanc. Sans carte de teinte : blanc.
-fn dl_tint(L: DynLight, fr: DlFrame, d: vec3<f32>, dist: f32, range: f32) -> vec3<f32> {
+/// direction `d` (de la lumière vers le point). Sans carte de teinte : blanc. (v262) Les verres
+/// traversés jusqu'à ce point seulement (`dl_tint_one`, `surface` : une surface éclairée), lus
+/// sur quatre texels voisins mêlés (bords de la tache colorée sans marches).
+fn dl_tint(L: DynLight, fr: DlFrame, d: vec3<f32>, dist: f32, range: f32, surface: bool) -> vec3<f32> {
     if L.tint.x < 0.5 {
         return vec3<f32>(1.0);
     }
@@ -301,8 +330,22 @@ fn dl_tint(L: DynLight, fr: DlFrame, d: vec3<f32>, dist: f32, range: f32) -> vec
         return vec3<f32>(1.0);
     }
     let dims = vec2<f32>(textureDimensions(tint_atlas));
-    let q = textureLoad(tint_atlas, vec2<i32>(clamp(su.xy * dims, vec2<f32>(0.0), dims - 1.0)), 0);
-    return select(vec3<f32>(1.0), q.rgb, dist / max(range, 1e-3) > q.a + 0.004);
+    let rect = dl_light_rect(L, fr, d);
+    // Texels de la case seulement (pas ceux d'une lumière voisine).
+    let lo = vec2<i32>(ceil(rect.xy * dims - 0.001));
+    let hi = max(vec2<i32>(floor((rect.xy + rect.z) * dims + 0.001)) - 1, lo);
+    let p = su.xy * dims - 0.5;
+    let b = vec2<i32>(floor(p));
+    let f = p - floor(p);
+    let t = dist / max(range, 1e-3);
+    var acc = vec3<f32>(0.0);
+    for (var k = 0; k < 4; k++) {
+        let o = vec2<i32>(k & 1, k >> 1u);
+        let c = clamp(b + o, lo, hi);
+        let w = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1);
+        acc += w * dl_tint_one(textureLoad(tint_atlas, c, 0), t, surface);
+    }
+    return acc;
 }
 
 /// Rotation du disque de Vogel d'un échantillon au suivant (angle d'or).
@@ -592,7 +635,7 @@ fn dl_one(
                 diff = dl_toon(diff, dh.surf.z, dh.surf.w);
             }
             // (v251) Passée par du verre : de sa couleur.
-            let col = L.color.rgb * dl_tint(L, fr, -l, d, r);
+            let col = L.color.rgb * dl_tint(L, fr, -l, d, r, true);
             o.diffuse = col * diff;
             if spec_k > 0.0 {
                 // Blinn-Phong normalisé : tache nette sur un miroir, large et faible

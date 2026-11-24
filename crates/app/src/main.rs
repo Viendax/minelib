@@ -374,7 +374,7 @@ struct Game {
     /// Capture automatique à ce temps (essais).
     shot_at: Option<f32>,
     /// (v251) Dernière capture (en mémoire, le PNG s'écrit en tâche de fond) et le moment où
-    /// elle a été prise : Ctrl+C la copie peu après (`SHOT_COPY_S`).
+    /// elle a été prise : Ctrl+C la copie (en jeu, peu après : `SHOT_COPY_S`).
     last_shot: Option<LastShot>,
     show_debug: bool,
     fps_max: Option<f32>,
@@ -655,8 +655,9 @@ impl Game {
     /// (v251) « Ctrl+C dans le jeu pour copier rapidement mon screen après l'avoir pris, avec
     /// le même message que si on clique » : la dernière capture, prise il y a moins de
     /// `SHOT_COPY_S`, copiée dans le presse-papier (depuis la mémoire : son PNG est peut-être
-    /// encore en train de s'écrire). Pas tchat ouvert (Ctrl+C y copie le texte choisi), ni
-    /// en écrivant dans la page d'un écran, ni en réglant une touche. « Le C de ce Ctrl+C ne
+    /// encore en train de s'écrire). (v262) Dans les menus et le tchat ouvert, à tout moment ;
+    /// pas avec du texte sélectionné dans le tchat (Ctrl+C copie ce texte), ni en écrivant
+    /// dans la page d'un écran, ni en réglant une touche. « Le C de ce Ctrl+C ne
     /// déclenche ni le zoom ni la radio ni rien qui pourrait être bind et interférer » : la
     /// touche C est ignorée par les réglages du jeu et de la partie jusqu'à ce qu'elle soit
     /// relâchée. Rend vrai si la capture a été copiée (ou a essayé).
@@ -665,14 +666,23 @@ impl Game {
         if !ctrl || !input.pressed(KeyCode::KeyC) || self.binding.is_some() {
             return false;
         }
-        let Some(shot) = self.last_shot.as_ref().filter(|s| self.time - s.at < SHOT_COPY_S)
+        // (v262) « Je dois pouvoir faire Ctrl+C partout dans le jeu avec mon screen » : la
+        // dernière capture, dans tous les écrans et menus, tchat ouvert compris (sauf du
+        // texte sélectionné dans le tchat : c'est lui qu'on copie), à tout moment. En jeu
+        // (curseur capturé), seulement dans la minute qui suit (`SHOT_COPY_S`) : Ctrl et C y
+        // servent aussi (courir et zoomer, s'accroupir et la radio). Pas en écrivant dans la
+        // page d'un écran (Ctrl+C y est à la page).
+        let Some(shot) = self
+            .last_shot
+            .as_ref()
+            .filter(|s| !input.grabbed || self.time - s.at < SHOT_COPY_S)
         else {
             return false;
         };
         if self
             .session
             .as_ref()
-            .is_some_and(|s| s.chat.open || s.keyboard_on_screen())
+            .is_some_and(|s| s.chat.has_selection() || s.keyboard_on_screen())
         {
             return false;
         }
@@ -4642,9 +4652,9 @@ struct LastShot {
     at: f32,
 }
 
-/// (v251) Ctrl+C copie la dernière capture pendant ce temps après l'avoir prise (s) : assez
-/// pour la copier tout de suite ou après avoir lu le tchat, pas plus (Ctrl et C servent aussi
-/// en jeu : courir et zoomer, s'accroupir et la radio).
+/// (v251) En jeu (curseur capturé), Ctrl+C copie la dernière capture pendant ce temps après
+/// l'avoir prise (s), pas plus : Ctrl et C servent aussi en jeu (courir et zoomer,
+/// s'accroupir et la radio). (v262) Dans les menus et le tchat ouvert : toujours.
 const SHOT_COPY_S: f32 = 60.0;
 
 fn stamp() -> String {

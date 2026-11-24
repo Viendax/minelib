@@ -50,6 +50,23 @@ struct Layout {
     line_h: f32,
     /// Saisie : début du texte (x), haut et hauteur de la boîte, premier caractère montré.
     input: (f32, f32, f32, usize),
+    /// (v262) Bord gauche de la colonne des messages (à droite de l'écran quand l'aide des
+    /// commandes est montrée, à gauche sinon).
+    x: f32,
+    /// (v262) Aide des commandes montrée à la dernière image : sa boîte (x, y, largeur,
+    /// hauteur), ses lignes en tout et celles qui tiennent (le reste défile à la molette).
+    help: Option<HelpBox>,
+}
+
+/// (v262) Boîte de l'aide des commandes à l'écran.
+#[derive(Clone, Copy, Debug, Default)]
+struct HelpBox {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rows: usize,
+    shown: usize,
 }
 
 /// (v236) Ce que la souris tient (bouton gauche enfoncé).
@@ -78,8 +95,11 @@ pub struct Chat {
     pub open: bool,
     input: String,
     /// (v251) Aide de la commande qu'on tape (`cmdhelp::lines`), montrée au-dessus de la
-    /// saisie ; donnée par la partie.
-    pub hint: Vec<(String, [f32; 4])>,
+    /// saisie ; donnée par la partie (`set_hint`). (v262) À gauche de l'écran, toutes ses
+    /// lignes (le tchat passe à droite).
+    hint: Vec<(String, [f32; 4])>,
+    /// (v262) Lignes de l'aide passées en haut (molette).
+    hint_scroll: usize,
     /// (texte, couleur, âge en secondes, lien éventuel)
     lines: Vec<(String, [f32; 4], f32, Option<PathBuf>)>,
     /// Zones cliquables affichées à la dernière image : (x, y, largeur, hauteur, lien).
@@ -123,6 +143,7 @@ impl Default for Chat {
             open: false,
             input: String::new(),
             hint: Vec::new(),
+            hint_scroll: 0,
             lines: Vec::new(),
             hits: RefCell::new(Vec::new()),
             clicked: None,
@@ -402,6 +423,21 @@ impl Chat {
         &self.input
     }
 
+    /// (v262) Nouvelle aide des commandes : elle repart de sa première ligne quand ce n'est
+    /// plus la même commande (pas en tapant ses arguments).
+    pub fn set_hint(&mut self, hint: Vec<(String, [f32; 4])>) {
+        if self.hint.first() != hint.first() {
+            self.hint_scroll = 0;
+        }
+        self.hint = hint;
+    }
+
+    /// (v262) Du texte est sélectionné dans le tchat ouvert (messages ou saisie) : Ctrl+C
+    /// copie ce texte ; sinon, la dernière capture.
+    pub fn has_selection(&self) -> bool {
+        self.open && (self.input_selection().is_some() || self.selected_text().is_some())
+    }
+
     /// Saisie quand le tchat est ouvert. Renvoie le texte envoyé (Entrée).
     pub fn update(&mut self, input: &Input, dt: f32) -> Option<String> {
         self.time += dt;
@@ -414,14 +450,25 @@ impl Chat {
         }
         let ctrl = input.held(KeyCode::ControlLeft) || input.held(KeyCode::ControlRight);
         let shift = input.held(KeyCode::ShiftLeft) || input.held(KeyCode::ShiftRight);
-        // (v236) Molette : remonter dans les messages (et redescendre).
+        // (v236) Molette : remonter dans les messages (et redescendre). (v262) Sur l'aide des
+        // commandes, ou hors de la colonne des messages quand l'aide ne tient pas : l'aide.
         if input.scroll.abs() >= 1.0 {
-            let max = {
+            let (max, help, col) = {
                 let l = self.layout.borrow();
-                l.rows.len().saturating_sub(l.shown)
+                (l.rows.len().saturating_sub(l.shown), l.help, l.x)
             };
             let d = input.scroll.round() as i64 * WHEEL_ROWS;
-            self.scroll = (self.scroll as i64 + d).clamp(0, max as i64) as usize;
+            let on_help = help.filter(|h| h.rows > h.shown).filter(|h| {
+                input.cursor.is_none_or(|(cx, cy)| {
+                    (cx >= h.x && cx <= h.x + h.w && cy >= h.y && cy <= h.y + h.h) || cx < col
+                })
+            });
+            if let Some(h) = on_help {
+                let most = (h.rows - h.shown) as i64;
+                self.hint_scroll = (self.hint_scroll as i64 - d).clamp(0, most) as usize;
+            } else {
+                self.scroll = (self.scroll as i64 + d).clamp(0, max as i64) as usize;
+            }
         }
         if input.mouse_pressed(Mouse::Left) {
             if let Some((cx, cy)) = input.cursor {
@@ -605,8 +652,13 @@ impl Chat {
     fn build_layout(&self, size: (f32, f32)) -> Layout {
         let s = (size.1 / 360.0).floor().max(1.0);
         let line_h = 10.0 * s;
-        let x = 4.0 * s;
         let width = (320.0 * s).min(size.0 - 8.0 * s);
+        // (v262) « L'aide des commandes à gauche et le tchat à droite quand elle apparaît. »
+        let x = if self.hint.is_empty() {
+            4.0 * s
+        } else {
+            (size.0 - width - 6.0 * s).max(4.0 * s)
+        };
         let bottom = size.1 - 38.0 * s;
         let mut rows = Vec::new();
         for (msg, (text, ..)) in self.lines.iter().enumerate() {
@@ -644,7 +696,10 @@ impl Chat {
             shown,
             s,
             line_h,
-            input: (x + 2.0 * s, iy, line_h + 2.0 * s, start),
+            // La saisie reste en bas à gauche, sur toute la largeur.
+            input: (4.0 * s + 2.0 * s, iy, line_h + 2.0 * s, start),
+            x,
+            help: None,
         }
     }
 
@@ -660,7 +715,9 @@ impl Chat {
         if self.open {
             // (v236) Tchat ouvert : toutes les lignes, remontées avec la molette ; la
             // sélection en clair derrière le texte.
-            let layout = self.build_layout(size);
+            let mut layout = self.build_layout(size);
+            // (v262) Colonne des messages : à droite de l'écran quand l'aide est montrée.
+            let x = layout.x;
             let sel = self.sel.map(|(a, b)| reading(a, b));
             for row in &layout.rows {
                 let Some((tx, ty)) = row.at else { continue };
@@ -718,12 +775,19 @@ impl Chat {
                 ui.rect(x + width, y, 2.0 * s, bar, [1.0, 1.0, 1.0, 0.6]);
             }
             let y = size.1 - 13.0 * s;
+            let x = 4.0 * s;
             // (v251) Aide de la commande qu'on tape, juste au-dessus de la saisie, sur un fond
-            // plus sombre que les messages.
+            // plus sombre que les messages. (v262) À gauche de l'écran (les messages sont
+            // passés à droite), toutes ses lignes : celles qui ne tiennent pas défilent à la
+            // molette, avec un ascenseur.
             if !self.hint.is_empty() {
-                // Les lignes trop longues pour l'écran continuent à la ligne suivante, en retrait
-                // (avant : coupées au bord).
-                let max_w = size.0 - 16.0 * s;
+                // Les lignes trop longues continuent à la ligne suivante, en retrait.
+                let right = if layout.x > x + 1.0 {
+                    layout.x - 6.0 * s
+                } else {
+                    size.0 - 4.0 * s
+                };
+                let max_w = (right - x - 6.0 * s).max(80.0 * s);
                 let rows: Vec<(String, [f32; 4])> = self
                     .hint
                     .iter()
@@ -735,15 +799,36 @@ impl Chat {
                     .fold(0.0f32, f32::max)
                     .min(max_w)
                     + 4.0 * s;
-                let top = y - 2.0 * s - rows.len() as f32 * line_h;
-                ui.rect(x, top - s, w, rows.len() as f32 * line_h + 2.0 * s, [0.02, 0.02, 0.05, 0.88]);
-                for (k, (t, c)) in rows.into_iter().enumerate() {
-                    let mut shown = t;
-                    while shown.chars().count() > 4 && Ui::text_width(&shown, s) > max_w {
-                        shown.pop();
+                let bottom_y = y - 2.0 * s;
+                let room = (((bottom_y - 4.0 * s) / line_h).floor() as usize).max(1);
+                let n = rows.len();
+                let shown = n.min(room);
+                let first = self.hint_scroll.min(n - shown);
+                let top = bottom_y - shown as f32 * line_h;
+                let h = shown as f32 * line_h + 2.0 * s;
+                ui.rect(x, top - s, w, h, [0.02, 0.02, 0.05, 0.88]);
+                for (k, (t, c)) in rows.into_iter().skip(first).take(shown).enumerate() {
+                    let mut text = t;
+                    while text.chars().count() > 4 && Ui::text_width(&text, s) > max_w {
+                        text.pop();
                     }
-                    ui.text(x + 2.0 * s, top + k as f32 * line_h + s, s, c, shown);
+                    ui.text(x + 2.0 * s, top + k as f32 * line_h + s, s, c, text);
                 }
+                // Ascenseur : où l'on est dans l'aide.
+                if n > shown {
+                    let bar = (h * shown as f32 / n as f32).max(4.0 * s);
+                    let by = top - s + (h - bar) * first as f32 / (n - shown) as f32;
+                    ui.rect(x + w, top - s, 2.0 * s, h, [1.0, 1.0, 1.0, 0.12]);
+                    ui.rect(x + w, by, 2.0 * s, bar, [1.0, 1.0, 1.0, 0.6]);
+                }
+                layout.help = Some(HelpBox {
+                    x,
+                    y: top - s,
+                    w: w + 2.0 * s,
+                    h,
+                    rows: n,
+                    shown,
+                });
             }
             ui.rect(
                 x,
@@ -1048,6 +1133,49 @@ mod mouse_tests {
         assert_eq!(c.scroll, 40 - 12, "pas plus haut que le premier message");
         c.close();
         assert_eq!(c.scroll, 0);
+    }
+
+    /// (v262) L'aide des commandes à gauche : les messages passent à droite ; toutes ses
+    /// lignes, la molette sur elle la fait défiler (pas les messages), et sur les messages,
+    /// les messages ; elle repart du haut pour une autre commande, pas en tapant les
+    /// arguments de la même. Sans texte sélectionné, Ctrl+C est pour la capture.
+    #[test]
+    fn the_command_help_goes_left_and_scrolls() {
+        let msgs: Vec<String> = (0..40).map(|i| format!("message {i}")).collect();
+        let refs: Vec<&str> = msgs.iter().map(String::as_str).collect();
+        let mut c = open_with(&refs);
+        let left = c.build_layout(SIZE).x;
+        let help: Vec<(String, [f32; 4])> = (0..60).map(|k| (format!("/aide {k}"), WHITE)).collect();
+        c.set_hint(help.clone());
+        let mut lay = c.build_layout(SIZE);
+        assert!(lay.x > left + 100.0, "messages à droite : {} puis {}", left, lay.x);
+        // Ce que l'image a montré : 20 lignes sur 60, dans une boîte à gauche.
+        lay.help = Some(HelpBox {
+            x: 8.0,
+            y: 100.0,
+            w: 300.0,
+            h: 400.0,
+            rows: 60,
+            shown: 20,
+        });
+        *c.layout.borrow_mut() = lay;
+        let mut i = Input::default();
+        i.cursor = Some((50.0, 200.0));
+        i.scroll = -2.0;
+        c.update(&i, 0.016);
+        assert_eq!((c.hint_scroll, c.scroll), (6, 0), "deux crans vers le bas sur l'aide");
+        i.scroll = -100.0;
+        c.update(&i, 0.016);
+        assert_eq!(c.hint_scroll, 40, "pas plus bas que sa dernière ligne");
+        i.cursor = Some((SIZE.0 - 20.0, 200.0));
+        i.scroll = 1.0;
+        c.update(&i, 0.016);
+        assert_eq!((c.hint_scroll, c.scroll), (40, 3), "sur les messages : les messages");
+        c.set_hint(help);
+        assert_eq!(c.hint_scroll, 40, "la même commande");
+        c.set_hint(vec![("/autre".to_string(), WHITE)]);
+        assert_eq!(c.hint_scroll, 0, "une autre commande : en haut");
+        assert!(!c.has_selection());
     }
 
     /// (v236) Glisser sur les messages sélectionne du texte (sur deux lignes d'un même

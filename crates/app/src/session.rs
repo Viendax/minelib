@@ -1171,7 +1171,9 @@ impl Session {
                 String::new()
             };
             if typed != self.hint_for {
-                self.chat.hint = crate::cmdhelp::lines(&typed, 14, |name| self.command_state(name));
+                // (v262) Toutes ses lignes (« … et 17 lignes de plus » avant) : elles défilent.
+                let hint = crate::cmdhelp::lines(&typed, usize::MAX, |name| self.command_state(name));
+                self.chat.set_hint(hint);
                 self.hint_for = typed;
             }
             // Éditeur de lumières (touche L) et sa caméra libre (F) ; pas en partie FPS en

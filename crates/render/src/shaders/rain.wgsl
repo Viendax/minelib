@@ -240,7 +240,7 @@ fn rain_lights(p: vec3<f32>, ndc: vec2<f32>, g_hg: f32, splash: bool) -> vec3<f3
                 phase += 6.0 * pow(max(h.y, 0.0), 64.0) * step(0.0, l.y);
             }
             // (v251) Passée par du verre : de sa couleur.
-            acc += L.color.rgb * dl_tint(L, fr, -l, d, range) * (att * phase);
+            acc += L.color.rgb * dl_tint(L, fr, -l, d, range, false) * (att * phase);
         }
     }
     return acc * dh.surf.x;

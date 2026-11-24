@@ -487,10 +487,11 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f3
                                     let x = t - t0;
                                     let pe = f32(n_e) * bq / (dang * (bq * bq + x * x));
                                     // (v251) Passés par du verre, les rayons en prennent la
-                                    // couleur (après lui seulement).
+                                    // couleur (après lui seulement). (v262) Seulement des
+                                    // verres déjà traversés à cette distance.
                                     var colk = col;
                                     if L.tint.x > 0.5 {
-                                        colk = col * dl_tint(L, fr, -l, dist, range);
+                                        colk = col * dl_tint(L, fr, -l, dist, range, false);
                                     }
                                     let cv = colk * ins * (ext * tr / (pu + pe));
                                     acc += cv;
