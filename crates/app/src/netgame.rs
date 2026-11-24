@@ -51,6 +51,9 @@ const FAST_BAD_CHECKS: u8 = 6;
 /// Retard (pas) des nouvelles de l'hôte au-delà duquel une image compte comme bloquée
 /// (≈ 23 ms) : la mesure qui dit si la voie rapide sert à quelque chose.
 const STALL_TICKS: f32 = 6.0;
+/// (v286) Voie rapide en bon état : les entrées d'un invité partent par le relais tous les
+/// tant de pas seulement (elles arrivent à l'hôte par les passeurs entre-temps).
+const RELAY_INPUTS_EVERY: usize = 4;
 /// Positions gardées pour rembobiner les tirs : 1 s.
 const HISTORY: usize = 256;
 /// Retard d'affichage des autres joueurs chez l'invité (pas) : ~47 ms.
@@ -1519,6 +1522,10 @@ pub struct Guest {
     fast_votes: u8,
     fast_late: u8,
     fast_slow: bool,
+    /// (v286) Images depuis le dernier envoi des entrées par le relais, et messages
+    /// d'entrées partis par le relais (voir `RELAY_INPUTS_EVERY`).
+    held_frames: u8,
+    relay_inputs: u32,
     /// (v274) Pas du dernier état complet pris en compte : ils arrivent par le relais et
     /// par les passeurs, le second (ou un plus ancien) est ignoré.
     snap_tick: Option<u32>,
@@ -2268,6 +2275,8 @@ impl NetGame {
             fast_votes: 0,
             fast_late: 0,
             fast_slow: false,
+            held_frames: 0,
+            relay_inputs: 0,
             own_tick: None,
             seen_tick: None,
             snap_tick: None,
@@ -2424,6 +2433,15 @@ impl NetGame {
                 g.fast_late = 0;
                 g.fast_slow = false;
             }
+        }
+    }
+
+    /// (v286) Invité : messages d'entrées partis par le relais depuis le début.
+    #[cfg(test)]
+    pub fn relay_inputs(&self) -> u32 {
+        match self {
+            NetGame::Guest(g) => g.relay_inputs,
+            NetGame::Host(_) => 0,
         }
     }
 
@@ -2682,7 +2700,24 @@ impl NetGame {
                         map_hash: g.map_sig,
                     });
                 }
-                if !g.outbox.is_empty() {
+                // (v286) Voie rapide ouverte et pas plus lente que le relais : les entrées
+                // arrivent à l'hôte par les passeurs, image par image ; par le relais elles
+                // ne partent plus que par `RELAY_INPUTS_EVERY` pas (ou autant d'images),
+                // quatre fois moins de messages à lui faire porter à 256 images par
+                // seconde. Rien n'est perdu : tous les pas y sont, et la voie rapide en
+                // redit 8 à chaque image. Voie fermée ou lente : comme avant, à chaque
+                // image.
+                g.held_frames = g.held_frames.saturating_add(1);
+                let healthy = !g.fast_slow && g.fast.as_ref().is_some_and(|f| f.open(0));
+                let due = !healthy
+                    || g.outbox.len() >= RELAY_INPUTS_EVERY
+                    || usize::from(g.held_frames) >= RELAY_INPUTS_EVERY;
+                if !g.outbox.is_empty() && !due {
+                    g.fast_inputs(weapon);
+                }
+                if !g.outbox.is_empty() && due {
+                    g.held_frames = 0;
+                    g.relay_inputs = g.relay_inputs.wrapping_add(1);
                     let inputs = std::mem::take(&mut g.outbox);
                     let last = g.outbox_first + inputs.len() as u32 - 1;
                     let msg = ToHost::Inputs {
@@ -4712,6 +4747,12 @@ impl Guest {
         (self.net_frames, self.net_stalled)
     }
 
+    /// (v286) Messages d'entrées partis par le relais depuis le début.
+    #[cfg(test)]
+    pub fn relay_inputs(&self) -> u32 {
+        self.relay_inputs
+    }
+
     /// Voie rapide : un message au pas `tick` vient d'arriver par les passeurs (positions,
     /// ou sonde `ping` quand on a demandé le relais). S'il arrive alors qu'on a déjà reçu
     /// ce pas ou un plus récent, le relais a été plus rapide. Tous les `FAST_VOTES`
@@ -5340,6 +5381,10 @@ mod tests {
         /// Images de l'invité, et celles où l'hôte avait trop de retard.
         frames: u32,
         stalled: u32,
+        /// (v286) Messages d'entrées de l'invité partis par le relais, sur combien d'images
+        /// en tout.
+        relay_inputs: u32,
+        all_frames: u32,
         /// Passeurs en retard : l'invité a demandé le relais, l'hôte l'a su, et le retard
         /// des nouvelles de l'hôte (pas) à ce moment-là ; puis, les passeurs redevenus les
         /// plus rapides, tout le monde y est revenu.
@@ -5360,6 +5405,12 @@ mod tests {
     ///
     /// L'invité court pendant 200 images, et on regarde où l'hôte le voit.
     fn fast_match(passeurs_lag: bool) -> FastRun {
+        fast_match_at(passeurs_lag, 1)
+    }
+
+    /// `div` : 1 pour 4 pas par image (64 images par seconde), 4 pour un pas par image (256
+    /// images par seconde).
+    fn fast_match_at(passeurs_lag: bool, div: u32) -> FastRun {
         const LAG: usize = 40;
         let dir = std::env::temp_dir().join(format!("minelib-net-rapide-{}", rand_u32()));
         for p in ["Pas1", "Pas2"] {
@@ -5421,10 +5472,14 @@ mod tests {
         let mut guest_p = Player::new(Vec3::new(0.0, 30.0, 0.0));
         let mut guest: Option<NetGame> = None;
         let dt = crate::session::SIM_TICK;
+        let ticks = 4 / div;
         // Ce qui est retenu en route, et jusqu'à quelle image.
         let mut late_h: VecDeque<(usize, Event)> = VecDeque::new();
         let mut late_g: VecDeque<(usize, Event)> = VecDeque::new();
         let mut slow_from: Option<usize> = None;
+        // (v286) Messages d'entrées déjà partis par le relais quand la voie s'ouvre, et la
+        // dernière image.
+        let (mut inputs_before, mut last_frame) = (0u32, 0usize);
         let (mut held, mut by_fast) = (0u32, 0u32);
         let mut mid_gap = f32::NAN;
         let mut hfast: Option<minelib_net::fast::Endpoint> = None;
@@ -5434,7 +5489,7 @@ mod tests {
         // la première copie de chaque pas est celle qui n'a pas de retard.
         let mut snaps_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut done = false;
-        for frame in 0..8000 {
+        for frame in 0..8000 * div as usize {
             // Depuis combien d'images le retard est en place, et sur quel chemin.
             let since = slow_from.map(|f| frame - f);
             let healed = passeurs_lag && since.is_some_and(|n| n >= 400);
@@ -5543,7 +5598,9 @@ mod tests {
                 && guest.as_ref().is_some_and(|g| g.fast_open())
             {
                 slow_from = Some(frame);
+                inputs_before = guest.as_ref().map_or(0, |g| g.relay_inputs());
             }
+            last_frame = frame;
             // L'invité court de la 80e à la 280e image du retard.
             let walking = since.is_some_and(|n| (2 * LAG..2 * LAG + 200).contains(&n));
             let m = MoveInput {
@@ -5559,7 +5616,7 @@ mod tests {
             if let Some(g) = &mut guest {
                 g.reconcile(&mut guest_p, &world, dt);
             }
-            for _ in 0..4 {
+            for _ in 0..ticks {
                 host_p.update(&world, &idle, dt);
                 host.on_tick(&world, &host_p, &idle, dt);
                 if let Some(g) = &mut guest {
@@ -5568,13 +5625,13 @@ mod tests {
                     g.on_tick(&world, &guest_p, &m, dt);
                 }
             }
-            for l in host.end_frame(&world, Vec::new(), 255, NadeOut::default(), 4.0 * dt) {
+            for l in host.end_frame(&world, Vec::new(), 255, NadeOut::default(), ticks as f32 * dt) {
                 if let Local::Respawn { state, .. } = l {
                     host_p.set_net_state(&state);
                 }
             }
             if let Some(g) = &mut guest {
-                g.end_frame(&world, Vec::new(), 255, NadeOut::default(), 4.0 * dt);
+                g.end_frame(&world, Vec::new(), 255, NadeOut::default(), ticks as f32 * dt);
             }
             let (NetGame::Host(hs), Some(NetGame::Guest(gs))) = (&host, &guest) else {
                 continue;
@@ -5607,6 +5664,8 @@ mod tests {
         };
         let (&peer, remote) = hs.peers.iter().next().expect("invité chez l'hôte");
         let (frames, stalled) = gs.stalls();
+        let relay_inputs = gs.relay_inputs() - inputs_before;
+        let all_frames = (last_frame - slow_from.unwrap_or(last_frame)) as u32;
         let run = FastRun {
             mid_gap,
             end_gap: (remote.player.pos - guest_p.pos).length(),
@@ -5615,6 +5674,8 @@ mod tests {
             stats: hfast.as_ref().and_then(|f| f.stats(peer)).expect("route"),
             frames,
             stalled,
+            relay_inputs,
+            all_frames,
             asked_relay,
             host_knew,
             behind,
@@ -5652,6 +5713,25 @@ mod tests {
         // (v274) Les états complets viennent aussi par les passeurs : la vie, l'arme et le
         // tableau de bord ne sont pas figés par le retard du relais (160 pas).
         assert!(r.snap_behind < 24.0, "dernier état complet vieux de {} pas", r.snap_behind);
+        // (v286) À 64 images par seconde (4 pas par image), un message d'entrées par image
+        // par le relais, comme avant.
+        assert!(r.relay_inputs.abs_diff(r.all_frames) <= 2, "{} pour {}", r.relay_inputs, r.all_frames);
+    }
+
+    /// (v286) À 256 images par seconde, voie rapide en bon état : les entrées de l'invité
+    /// ne partent plus par le relais qu'une image sur quatre (avant : à chaque image), et
+    /// l'hôte le suit toujours (elles lui arrivent par les passeurs).
+    #[test]
+    fn inputs_go_through_the_relay_four_times_less_when_the_fast_way_is_open() {
+        let r = fast_match_at(false, 4);
+        assert!(
+            r.relay_inputs * 3 < r.all_frames && r.relay_inputs * 6 > r.all_frames,
+            "{} messages d'entrées par le relais pour {} images",
+            r.relay_inputs,
+            r.all_frames
+        );
+        assert!(r.by_fast > 100, "entrées venues par les passeurs : {}", r.by_fast);
+        assert!(r.end_gap < 0.05, "prédiction de l'invité = hôte (écart {})", r.end_gap);
     }
 
     /// Les passeurs sont mal placés (40 images de retard) : la voie rapide ne doit jamais
