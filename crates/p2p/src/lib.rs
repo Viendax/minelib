@@ -604,6 +604,7 @@ mod tests {
     /// Une route par ces passeurs, donnée aux deux bouts comme le fait le relais du monde.
     fn give(node: [u8; 32], route: u64, passeurs: &[&minelib_net::fast::Passeur]) {
         use minelib_net::fast::{tunnel_given, TunnelRoute, Via};
+        minelib_net::fast::note_passeurs();
         let vias: Vec<Via> = passeurs
             .iter()
             .map(|p| {
@@ -692,6 +693,107 @@ mod tests {
         for i in 0..200u32 {
             assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
         }
+    }
+
+    /// Chemins de la connexion `i` de ce programme vers `remote` : (chemin employé par
+    /// un serveur relais d'iroh ?, tous les chemins).
+    fn paths_of(remote: [u8; 32], i: usize) -> (Option<bool>, Vec<String>) {
+        let t = TUNNELS.lock().unwrap();
+        let Some((_, c)) = t.iter().filter(|(n, _)| *n == remote).nth(i) else {
+            return (None, Vec::new());
+        };
+        let paths = c.paths();
+        let kinds = paths
+            .iter()
+            .map(|p| {
+                let k = match p.remote_addr() {
+                    iroh::TransportAddr::Ip(_) => "direct",
+                    iroh::TransportAddr::Custom(_) => "passeur",
+                    _ => "serveur d'iroh",
+                };
+                format!("{k}{}", if p.is_selected() { " (employé)" } else { "" })
+            })
+            .collect();
+        (
+            paths.iter().find(|p| p.is_selected()).map(|p| p.is_relay()),
+            kinds,
+        )
+    }
+
+    /// (v304) Sur le vrai réseau (serveurs relais et DNS d'iroh) : un hôte anonyme est
+    /// joint par les serveurs d'iroh quand il n'y a pas de route ; avec une route par un
+    /// passeur, le tunnel passe par le passeur et garde les serveurs d'iroh en secours ;
+    /// le passeur tombé, le tunnel continue par eux sans se refermer.
+    #[test]
+    #[ignore = "réseau"]
+    fn on_the_real_network_a_passeur_route_is_taken_and_iroh_servers_stay_as_a_fallback() {
+        let host = Node::start_private().unwrap();
+        host.serve(echo());
+        // (Le temps que l'hôte soit annoncé chez les serveurs d'iroh.)
+        std::thread::sleep(Duration::from_secs(4));
+        // 1. Sans route.
+        let first = Node::start().unwrap();
+        let at = std::time::Instant::now();
+        let t = first.tunnel(host.id()).unwrap();
+        let mut c1 = std::net::TcpStream::connect(t).unwrap();
+        c1.set_read_timeout(Some(Duration::from_secs(40))).unwrap();
+        assert!(said_back(&mut c1, b"sans1"), "pas de tunnel par les serveurs d'iroh");
+        eprintln!("RESEAU 1 : sans route, ouvert en {:?}", at.elapsed());
+        std::thread::sleep(Duration::from_secs(2));
+        let (relay, paths) = paths_of(host.id(), 0);
+        eprintln!("RESEAU 1 : chemins {paths:?}");
+        assert_eq!(relay, Some(true), "un hôte anonyme joint autrement que par un serveur");
+        let at = std::time::Instant::now();
+        for i in 0..200u32 {
+            assert!(said_back(&mut c1, &[i as u8; 5]));
+        }
+        eprintln!("RESEAU 1 : 200 allers-retours en {:?}", at.elapsed());
+        // 2. Avec une route par un passeur.
+        let (tx, _probes) = std::sync::mpsc::channel();
+        let p = minelib_net::fast::Passeur::start(0, tx).unwrap();
+        give(host.id(), 0x91, &[&p]);
+        let second = Node::start().unwrap();
+        let at = std::time::Instant::now();
+        let t = second.tunnel(host.id()).unwrap();
+        let mut c2 = std::net::TcpStream::connect(t).unwrap();
+        c2.set_read_timeout(Some(Duration::from_secs(40))).unwrap();
+        assert!(said_back(&mut c2, b"avec2"), "pas de tunnel avec une route");
+        eprintln!("RESEAU 2 : avec une route, ouvert en {:?}", at.elapsed());
+        let mut seen = (None, Vec::new());
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(said_back(&mut c2, b"encor"));
+            seen = paths_of(host.id(), 1);
+            if seen.0 == Some(false) && seen.1.len() >= 2 {
+                break;
+            }
+        }
+        eprintln!("RESEAU 2 : chemins {:?}", seen.1);
+        assert_eq!(seen.0, Some(false), "le tunnel n'emploie pas le passeur");
+        assert!(seen.1.iter().any(|k| k.starts_with("passeur (employé)")));
+        let before = p.carried();
+        let at = std::time::Instant::now();
+        for i in 0..200u32 {
+            assert!(said_back(&mut c2, &[i as u8; 5]));
+        }
+        eprintln!(
+            "RESEAU 2 : 200 allers-retours en {:?}, {} paquets par le passeur",
+            at.elapsed(),
+            p.carried() - before
+        );
+        assert!(p.carried() - before >= 200);
+        let backup = seen.1.iter().any(|k| k.starts_with("serveur d'iroh"));
+        eprintln!("RESEAU 2 : serveurs d'iroh gardés en secours : {backup}");
+        // 3. Le passeur tombe.
+        p.clear();
+        let at = std::time::Instant::now();
+        assert!(said_back(&mut c2, b"apres"), "le tunnel s'est refermé");
+        eprintln!("RESEAU 3 : passeur tombé, reprise en {:?}", at.elapsed());
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(said_back(&mut c2, b"suite"));
+        let (relay, paths) = paths_of(host.id(), 1);
+        eprintln!("RESEAU 3 : chemins {paths:?}");
+        assert_eq!(relay, Some(true));
     }
 
     /// Deux nœuds iroh sur cette machine : un relais TCP local joint par le tunnel.

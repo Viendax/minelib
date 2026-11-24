@@ -8873,8 +8873,9 @@ fn handle_locked(
     st.prepared = prepared;
     // (v301) Un hôte annonce le nœud de son relais : les tunnels vers lui peuvent passer
     // par des passeurs.
-    if let Some(node) = passeurs::node_of(&req) {
-        if matches!(&*session, Session::LoggedIn { .. }) {
+    if matches!(&*session, Session::LoggedIn { .. }) {
+        passeurs::greet(st, id);
+        if let Some(node) = passeurs::node_of(&req) {
             passeurs::node_ready(st, id, node);
         }
     }
@@ -8968,10 +8969,12 @@ fn handle_locked(
             | Request::FastWant { .. }
             | Request::FastBad { .. }
             | Request::TunnelWant { .. }
+            | Request::TunnelBad { .. }
     ) {
         if matches!(&*session, Session::LoggedIn { .. }) {
             match req {
                 Request::TunnelWant { node } => passeurs::tunnel_want(st, id, node),
+                Request::TunnelBad { route } => passeurs::tunnel_bad(st, id, route),
                 Request::PasseurOffer { port, external } => {
                     passeurs::offer(st, id, peer, port, external)
                 }

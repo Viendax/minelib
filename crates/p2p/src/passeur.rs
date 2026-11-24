@@ -5,8 +5,9 @@
 //! pour le développement. Ici, les paquets QUIC d'iroh partent aussi en UDP par les
 //! passeurs, ces jeux de joueurs volontaires qui portent déjà la voie rapide des parties
 //! FPS (`minelib_net::fast`) : pas de serveur à payer, pas de limite de débit imposée par
-//! un tiers, et ni le joueur ni l'hôte ne voit l'adresse IP de l'autre (seul le passeur
-//! voit les deux ; il ne peut rien lire, QUIC chiffre de bout en bout).
+//! un tiers, et ni le joueur ni l'hôte ne voit l'adresse IP de l'autre. Le passeur ne
+//! peut rien lire (QUIC chiffre de bout en bout) ; seul, il voit les deux adresses ;
+//! (v304) à deux, mis en chaîne par le relais, chacun n'en voit qu'une.
 //!
 //! iroh choisit lui-même entre ses chemins, et range déjà un transport comme celui-ci
 //! avec les chemins directs : le plus rapide des deux quand il y a les deux, et ses
@@ -30,10 +31,13 @@ use minelib_net::fast;
 pub const TRANSPORT_ID: u64 = 0x4D4C_5041_5353_4555;
 /// Un paquet vide part sur chaque route à ce rythme : le passeur garde notre adresse, la
 /// box garde le passage ouvert.
-const KEEP: Duration = Duration::from_secs(1);
+const KEEP: Duration = Duration::from_millis(500);
 /// Un passeur dont rien n'est venu depuis ce temps est tenu pour muet (l'autre bout lui
 /// envoie, comme nous, un paquet vide toutes les `KEEP`) : on passe par un autre.
-const SILENT: Duration = Duration::from_secs(3);
+const SILENT: Duration = Duration::from_secs(2);
+
+/// Une route muette est redite au relais à ce rythme, tant qu'elle le reste.
+const REPORT_EVERY: Duration = Duration::from_secs(5);
 
 /// Adresse, sur ce transport, du pair au bout de la route `route`.
 pub fn addr(route: u64) -> CustomAddr {
@@ -52,6 +56,8 @@ struct Route {
     vias: Vec<(SocketAddr, [u8; 32], Option<Instant>)>,
     via: usize,
     seq: u64,
+    /// (v304) Dernière fois qu'on a dit au relais que plus rien n'y passait.
+    reported: Option<Instant>,
 }
 
 impl Route {
@@ -91,11 +97,14 @@ fn on_route(r: &fast::TunnelRoute) {
     };
     let vias: Vec<(SocketAddr, [u8; 32])> = r.vias.iter().map(|v| (v.addr, v.seal)).collect();
     for (node, t) in nodes {
+        // (Chaque bout a ses propres passeurs : ce qui est dit à l'hôte ne vaut que pour
+        // le bout hôte de la route, et inversement.)
         let dir = t.0.routes.lock().unwrap().get(&r.route).map(|x| x.dir);
+        let dir = dir.filter(|d| (*d == fast::TO_GUEST) == r.host);
         match dir {
             Some(_) if vias.is_empty() => t.drop_route(r.route),
             Some(dir) => t.set_route(r.route, dir, vias.clone()),
-            None if r.host && node == r.node && !vias.is_empty() => {
+            None if r.host && node == r.node && !vias.is_empty() && !t.has(r.route) => {
                 t.set_route(r.route, fast::TO_GUEST, vias.clone())
             }
             None => {}
@@ -112,6 +121,8 @@ struct Inner {
     /// monde les donne ; et un hôte en a une par joueur, de quoi faire déborder
     /// l'annonce et la faire échouer.
     addrs: n0_watcher::Watchable<Vec<CustomAddr>>,
+    /// Le moteur du nœud (pour ce qui part d'un autre fil que les siens).
+    rt: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for Inner {
@@ -149,10 +160,38 @@ impl Inner {
     /// Un paquet vide sur chaque route, par chacun de ses passeurs.
     fn keep(&self) {
         let mut out = Vec::new();
+        let now = Instant::now();
         for (id, r) in self.routes.lock().unwrap().iter_mut() {
             for (to, seal, _) in &r.vias {
                 r.seq += 1;
                 out.push((*to, fast::raw_pack(*id, r.dir, r.seq, seal, fast::RAW_KEEP, &[])));
+            }
+            // (v304) Elle passait, et plus rien ne vient d'aucun de ses passeurs : on le
+            // dit au relais, qui lui en donne d'autres. Le tunnel attend (iroh garde un
+            // chemin muet 15 s avant d'y renoncer).
+            let silent = |h: Option<Instant>| h.is_some_and(|t| now.duration_since(t) >= SILENT);
+            if r.vias.iter().any(|v| v.2.is_some())
+                && r.vias.iter().all(|v| v.2.is_none() || silent(v.2))
+                && r.reported.is_none_or(|t| now.duration_since(t) >= REPORT_EVERY)
+            {
+                r.reported = Some(now);
+                log::info!("tunnel : plus rien ne passe par ses passeurs, d'autres sont demandés");
+                fast::tunnel_bad(*id);
+            }
+        }
+        for (to, p) in out {
+            let _ = self.sock.try_send_to(&p, to);
+        }
+    }
+
+    /// (v304) Un paquet sans contenu (`kind`) sur la route `route` : par le passeur
+    /// `via`, ou par tous.
+    fn signal(&self, route: u64, kind: u8, via: Option<SocketAddr>) {
+        let mut out = Vec::new();
+        if let Some(r) = self.routes.lock().unwrap().get_mut(&route) {
+            for (to, seal, _) in r.vias.iter().filter(|v| via.is_none_or(|a| a == v.0)) {
+                r.seq += 1;
+                out.push((*to, fast::raw_pack(route, r.dir, r.seq, seal, kind, &[])));
             }
         }
         for (to, p) in out {
@@ -175,6 +214,7 @@ impl PasseurTransport {
             sock: tokio::net::UdpSocket::from_std(sock)?,
             routes: Mutex::new(HashMap::new()),
             addrs: n0_watcher::Watchable::new(Vec::new()),
+            rt: tokio::runtime::Handle::current(),
         });
         let weak = Arc::downgrade(&inner);
         tokio::spawn(async move {
@@ -218,6 +258,7 @@ impl PasseurTransport {
                 .and_then(|r| r.vias.get(r.via))
                 .and_then(|cur| vias.iter().position(|v| v.0 == cur.0))
                 .unwrap_or(0);
+            let reported = old.and_then(|r| r.reported);
             routes.insert(
                 route,
                 Route {
@@ -225,11 +266,26 @@ impl PasseurTransport {
                     vias,
                     via,
                     seq,
+                    reported,
                 },
             );
         }
         // Tout de suite : le passeur ne peut rien nous remettre avant de nous connaître.
-        self.0.keep();
+        // (v304) Et encore quelques fois, de plus en plus espacées, tant que rien n'est
+        // venu : le passeur reçoit sa route du relais en même temps que nous, il a pu ne
+        // pas l'avoir encore à notre premier paquet.
+        self.0.signal(route, fast::RAW_KEEP, None);
+        let weak = Arc::downgrade(&self.0);
+        self.0.rt.spawn(async move {
+            for ms in [30u64, 60, 120, 240, 480] {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                let Some(me) = weak.upgrade() else { return };
+                if PasseurTransport(me.clone()).alive(route) {
+                    return;
+                }
+                me.signal(route, fast::RAW_KEEP, None);
+            }
+        });
     }
 
     pub fn drop_route(&self, route: u64) {
@@ -238,6 +294,21 @@ impl PasseurTransport {
 
     pub fn routes(&self) -> usize {
         self.0.routes.lock().unwrap().len()
+    }
+
+    fn has(&self, route: u64) -> bool {
+        self.0.routes.lock().unwrap().contains_key(&route)
+    }
+
+    /// (v304) La route `route` passe-t-elle de bout en bout ? (Un paquet de l'autre bout
+    /// est venu par un de ses passeurs il y a peu.)
+    pub fn alive(&self, route: u64) -> bool {
+        let routes = self.0.routes.lock().unwrap();
+        routes.get(&route).is_some_and(|r| {
+            r.vias
+                .iter()
+                .any(|v| v.2.is_some_and(|t| t.elapsed() < SILENT))
+        })
     }
 
     /// Passeur employé en ce moment pour la route `route` (essais, journal).
@@ -310,6 +381,13 @@ impl CustomEndpoint for End {
                     if let Some(v) = r.vias.iter_mut().find(|v| v.0 == from) {
                         v.2 = Some(Instant::now());
                     }
+                    // (v304) L'autre bout s'assure que la route passe : on lui répond
+                    // par le même passeur.
+                    if kind == fast::RAW_PING {
+                        drop(routes);
+                        self.0.signal(route, fast::RAW_PONG, Some(from));
+                        continue;
+                    }
                     if kind != fast::RAW_DATA || body.len() > bufs[count].len() {
                         continue;
                     }
@@ -357,26 +435,48 @@ impl CustomSender for Sender {
     }
 }
 
-/// Temps laissé au relais du monde pour donner une route avant d'ouvrir le tunnel sans.
-const ASK_WAIT: Duration = Duration::from_millis(400);
+/// Temps laissé au relais du monde pour donner une route, puis à la route pour répondre
+/// de bout en bout, avant d'ouvrir le tunnel sans elle. (Un relais qui a des passeurs
+/// répond en quelques dizaines de millisecondes ; sans passeur, on n'attend pas du tout.)
+const ASK_WAIT: Duration = Duration::from_millis(1500);
+const CHECK_WAIT: Duration = Duration::from_millis(1500);
 
-/// Demande au relais du monde une route par des passeurs vers le nœud `remote`, et
-/// l'ouvre dans `t` si elle vient à temps. Rien : pas de relais du monde au bout du fil,
-/// ou pas de passeur.
+/// Demande au relais du monde une route par des passeurs vers le nœud `remote`, l'ouvre
+/// dans `t`, et s'assure qu'elle passe de bout en bout. Rien : aucun relais de ce jeu n'a
+/// de passeur, la route n'est pas venue à temps, ou elle ne passe pas.
+///
+/// (v304) Il faut que la route passe **avant** d'ouvrir le tunnel : iroh n'ajoute pas un
+/// chemin comme celui-ci à une connexion déjà ouverte (il n'ouvre de lui-même que des
+/// chemins directs ou par ses serveurs). Le tunnel doit donc partir par le passeur ; les
+/// serveurs d'iroh lui sont ajoutés ensuite, en secours.
 pub(crate) async fn ask(t: &PasseurTransport, remote: [u8; 32]) -> Option<u64> {
+    if !fast::passeurs_known() {
+        return None;
+    }
     fast::tunnel_want(remote);
     let start = Instant::now();
-    loop {
+    let route = loop {
         if let Some(r) = fast::tunnel_route(remote) {
             let vias = r.vias.iter().map(|v| (v.addr, v.seal)).collect();
             t.set_route(r.route, fast::TO_HOST, vias);
-            return Some(r.route);
+            break r.route;
         }
         if start.elapsed() >= ASK_WAIT {
             return None;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let start = Instant::now();
+    while !t.alive(route) {
+        if start.elapsed() >= CHECK_WAIT {
+            log::info!("tunnel : la route par des passeurs ne répond pas, on s'en passe");
+            t.drop_route(route);
+            return None;
+        }
+        t.0.signal(route, fast::RAW_PING, None);
+        tokio::time::sleep(Duration::from_millis(40)).await;
     }
+    Some(route)
 }
 
 /// Tant que le tunnel vers `remote` vit, sa route est redemandée au relais (qui reprend

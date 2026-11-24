@@ -779,6 +779,8 @@ struct Worker {
     /// passeur, les sondes du relais qu'il reçoit, et la réponse attendue de la box à qui
     /// l'ouverture de son port a été demandée.
     passeur: Option<Passeur>,
+    /// (v304) Le relais connecté a des passeurs vérifiés (`Response::PasseursKnown`).
+    relay_passeurs: bool,
     /// (v301) Dernière demande de tunnel (`crate::fast::tunnel_want`) déjà envoyée.
     tunnel_seen: u64,
 }
@@ -829,8 +831,9 @@ impl Worker {
             garant: false,
             fast: None,
             passeur: None,
+            relay_passeurs: false,
             // (Les demandes d'avant cette connexion ne la regardent pas.)
-            tunnel_seen: crate::fast::tunnel_wants(u64::MAX).1,
+            tunnel_seen: crate::fast::tunnel_wants(u64::MAX, "").1,
         }
     }
 
@@ -937,13 +940,23 @@ impl Worker {
     /// (v301) Tunnels iroh : les routes que le nœud du jeu demande partent à ce relais
     /// (seul celui du monde y répond, s'il a des passeurs).
     fn tend_tunnels(&mut self) {
-        let (nodes, last) = crate::fast::tunnel_wants(self.tunnel_seen);
+        if self.chan.is_none() {
+            self.relay_passeurs = false;
+        }
+        if self.relay_passeurs {
+            crate::fast::note_passeurs();
+        }
+        let (nodes, last) = crate::fast::tunnel_wants(self.tunnel_seen, &self.pseudo);
         self.tunnel_seen = last;
         if self.pseudo.is_empty() {
             return;
         }
-        for node in nodes {
-            if self.oneway(&Request::TunnelWant { node }).is_err() {
+        for ask in nodes {
+            let req = match ask {
+                crate::fast::TunnelAsk::Want(node) => Request::TunnelWant { node },
+                crate::fast::TunnelAsk::Bad(route) => Request::TunnelBad { route },
+            };
+            if self.oneway(&req).is_err() {
                 return;
             }
         }
@@ -1158,6 +1171,27 @@ impl Worker {
                     },
                     own,
                 );
+                return;
+            }
+            Response::PasseursKnown { n } => {
+                self.relay_passeurs = n > 0;
+                if n > 0 {
+                    crate::fast::note_passeurs();
+                }
+                return;
+            }
+            Response::PasseurLink {
+                lot,
+                route,
+                seal,
+                dir,
+                addr,
+                port,
+            } => {
+                if let Some(ps) = self.passeur.as_ref().filter(|ps| ps.on) {
+                    let from = std::net::SocketAddr::from((addr, port));
+                    ps.p.set_link(lot, route, seal, dir, from);
+                }
                 return;
             }
             Response::PasseurTask { lot, routes } => {

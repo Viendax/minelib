@@ -926,6 +926,12 @@ pub enum Request {
     TunnelWant {
         node: [u8; 32],
     },
+    /// (v304) D'un bout du tunnel de la route `route` : plus rien n'y passe depuis
+    /// quelques secondes. Le relais écarte ses passeurs pour ce tunnel et en donne
+    /// d'autres, sur la même route.
+    TunnelBad {
+        route: u64,
+    },
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -1035,6 +1041,7 @@ impl Request {
                 | Request::FastBad { .. }
                 | Request::NearbyClose { .. }
                 | Request::TunnelWant { .. }
+                | Request::TunnelBad { .. }
                 | Request::BulkEdit { .. }
                 | Request::Served { .. }
                 | Request::CheatFound { .. }
@@ -1832,6 +1839,24 @@ pub enum Response {
         host: bool,
         own: bool,
         passeurs: Vec<FastHop>,
+    },
+    /// (v304) Ce relais a (`n` > 0) ou n'a plus de passeurs vérifiés : dit à chaque
+    /// connexion ouverte, et quand cela change. Sans passeur, le jeu ouvre ses tunnels
+    /// sans demander de route ni l'attendre.
+    PasseursKnown {
+        n: u32,
+    },
+    /// (v304) À un passeur, pour une chaîne de deux : la route `route` (clé du sceau
+    /// `seal`), qui remplace ce qu'il portait pour l'attribution `lot`. Les paquets du
+    /// sens `dir` lui viennent de l'autre passeur, à cette adresse. Chacun des deux ne
+    /// voit qu'un bout de la route.
+    PasseurLink {
+        lot: u64,
+        route: u64,
+        seal: [u8; 32],
+        dir: u8,
+        addr: [u8; 4],
+        port: u16,
     },
 }
 

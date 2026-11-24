@@ -66,13 +66,12 @@ const BAD_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
 /// l'adresse annoncée : pas question de s'en servir pour arroser quelqu'un).
 const OFFERS_PER_MIN: u8 = 6;
 
-/// (v301) Passeurs d'un tunnel, au plus (le second prend le relais si le premier se tait).
+/// (v301) Passeurs d'un tunnel, au plus. (v304) Quand il y en a deux, ils sont mis en
+/// chaîne : joueur → premier → second → hôte. Chacun ne voit qu'un des deux bouts.
 const TUNNEL_VIAS: usize = 2;
 /// Routes que chaque passeur garde libres pour les parties FPS : les tunnels ne prennent
 /// pas ses dernières places.
 const TUNNEL_ROOM: usize = 8;
-/// Un second passeur n'est donné à un tunnel que s'il est chargé au plus à ce point.
-const TUNNEL_SPARE: usize = 8;
 /// Un tunnel que son joueur ne redemande plus (il le fait toutes les 30 s tant qu'il s'en
 /// sert) est repris après ce temps ; bien plus tard si le joueur n'a plus aucune connexion
 /// à ce relais (endormi au fond d'un pays, il s'en sert encore sans pouvoir le redire).
@@ -81,6 +80,11 @@ const TUNNEL_LEASE: std::time::Duration = std::time::Duration::from_secs(100);
 #[cfg(test)]
 const TUNNEL_LEASE: std::time::Duration = std::time::Duration::from_secs(6);
 const TUNNEL_ORPHAN: std::time::Duration = std::time::Duration::from_secs(900);
+/// (v304) Un tunnel signalé muet ne reçoit pas d'autres passeurs plus souvent que cela.
+#[cfg(not(test))]
+const TUNNEL_BAD_EVERY: std::time::Duration = std::time::Duration::from_secs(4);
+#[cfg(test)]
+const TUNNEL_BAD_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 /// Tunnels d'un même compte, au plus (le plus ancien est repris au-delà).
 const TUNNELS_PER_PLAYER: usize = 12;
 /// Demandes de tunnel acceptées d'une connexion par minute.
@@ -94,9 +98,15 @@ struct Tunnel {
     guest: u64,
     host: u64,
     /// Passeurs retenus (connexion, clé du sceau de la route chez lui) ; `own` : c'est
-    /// celui du jeu de l'hôte lui-même.
+    /// celui du jeu de l'hôte lui-même ; (v304) `chain` : ils sont deux, en chaîne (le
+    /// premier du côté du joueur).
     passeurs: Vec<(u64, [u8; 32])>,
     own: bool,
+    chain: bool,
+    /// (v304) Passeurs par lesquels ce tunnel ne passait plus (signalés par ses bouts) :
+    /// plus jamais pour lui. Et quand ses passeurs lui ont été donnés.
+    bad: Vec<u64>,
+    at: Instant,
     renewed: Instant,
 }
 
@@ -142,6 +152,9 @@ pub(crate) struct Fast {
     nodes: HashMap<[u8; 32], u64>,
     tunnels: HashMap<u64, Tunnel>,
     asks: HashMap<u64, (Instant, u16)>,
+    /// (v304) Connexions à qui on a dit s'il y a des passeurs, et ce qu'on a dit.
+    told: std::collections::HashSet<u64>,
+    said: bool,
 }
 
 impl Fast {
@@ -287,6 +300,7 @@ pub(crate) fn echo(st: &mut State, id: u64, nonce: u64) {
                 for rid in waiting {
                     assign(st, rid);
                 }
+                announce(st);
             }
         }
     }
@@ -296,6 +310,7 @@ pub(crate) fn echo(st: &mut State, id: u64, nonce: u64) {
 pub(crate) fn gone(st: &mut State, id: u64) {
     st.fast.tries.remove(&id);
     st.fast.asks.remove(&id);
+    st.fast.told.remove(&id);
     off(st, id);
     // (v301) Les relais qu'elle hébergeait ne sont plus là : leurs tunnels sont repris.
     st.fast.nodes.retain(|_, c| *c != id);
@@ -318,6 +333,7 @@ pub(crate) fn off(st: &mut State, id: u64) {
         return;
     }
     reassign(st, id);
+    announce(st);
 }
 
 /// Entretien (à chaque battement du relais) : les sondes restées sans réponse sont
@@ -354,9 +370,13 @@ pub(crate) fn upkeep(st: &mut State) {
             o.probed_at = Instant::now();
         }
     }
+    let any_lost = !lost.is_empty();
     for id in lost {
         log::info!("passeur muet : retiré ({} vérifiés)", st.fast.verified());
         reassign(st, id);
+    }
+    if any_lost {
+        announce(st);
     }
     // (v301) Tunnels que leur joueur ne redemande plus.
     let old: Vec<u64> = st
@@ -401,6 +421,29 @@ fn reassign(st: &mut State, id: u64) {
         .collect();
     for route in routes {
         tunnel_assign(st, route);
+    }
+}
+
+/// (v304) Cette connexion vient d'entrer : on lui dit s'il y a des passeurs (une fois).
+pub(crate) fn greet(st: &mut State, id: u64) {
+    if st.fast.told.insert(id) && st.fast.said {
+        if let Some(c) = st.conns.get(&id) {
+            let n = st.fast.verified() as u32;
+            transport::push(&c.tx, &Response::PasseursKnown { n });
+        }
+    }
+}
+
+/// (v304) Il y a maintenant des passeurs, ou il n'y en a plus : dit à tous ceux qui sont
+/// entrés. Sans passeur, leur jeu ouvre ses tunnels sans demander de route.
+fn announce(st: &mut State) {
+    let n = st.fast.verified() as u32;
+    if (n > 0) == st.fast.said {
+        return;
+    }
+    st.fast.said = n > 0;
+    for c in st.conns.values().filter(|c| c.pseudo.is_some()) {
+        transport::push(&c.tx, &Response::PasseursKnown { n });
     }
 }
 
@@ -498,9 +541,32 @@ pub(crate) fn tunnel_want(st: &mut State, id: u64, node: [u8; 32]) {
             host,
             passeurs: Vec::new(),
             own: false,
+            chain: false,
+            bad: Vec::new(),
+            at: Instant::now(),
             renewed: Instant::now(),
         },
     );
+    tunnel_assign(st, route);
+}
+
+/// (v304) `TunnelBad` : un bout du tunnel dit que plus rien ne passe par sa route. Ses
+/// passeurs sont écartés pour lui (on ne sait pas lequel s'est tu) et d'autres lui sont
+/// donnés tout de suite, sans attendre que les sondes du relais trouvent le muet.
+pub(crate) fn tunnel_bad(st: &mut State, id: u64, route: u64) {
+    let pseudo = st.conns.get(&id).and_then(|c| c.pseudo.clone());
+    let Some(t) = st.fast.tunnels.get_mut(&route) else {
+        return;
+    };
+    let mine = t.guest == id || t.host == id || pseudo.as_deref() == Some(t.pseudo.as_str());
+    if !mine || t.at.elapsed() < TUNNEL_BAD_EVERY {
+        return;
+    }
+    let was: Vec<u64> = t.passeurs.iter().map(|(p, _)| *p).collect();
+    t.bad.extend(was);
+    // (Il s'en sert toujours.)
+    t.renewed = Instant::now();
+    log::info!("tunnel : passeurs muets pour un tunnel, d'autres lui sont donnés");
     tunnel_assign(st, route);
 }
 
@@ -511,6 +577,7 @@ fn tunnel_assign(st: &mut State, route: u64) {
         return;
     };
     let (guest, host, node) = (t.guest, t.host, t.node);
+    let bad = t.bad.clone();
     let seals = t.passeurs.clone();
     let before: Vec<u64> = seals.iter().map(|(p, _)| *p).collect();
     let apart = super::machines_apart(st);
@@ -533,7 +600,7 @@ fn tunnel_assign(st: &mut State, route: u64) {
         .fast
         .offers
         .iter()
-        .filter(|(p, _)| **p != guest && **p != host)
+        .filter(|(p, _)| **p != guest && **p != host && !bad.contains(p))
         .filter_map(|(p, o)| usable(p, o))
         .filter(|(_, _, p, _)| {
             let c = &st.conns[p];
@@ -550,14 +617,13 @@ fn tunnel_assign(st: &mut State, route: u64) {
     });
     let mut picked: Vec<(u64, SocketAddrV4)> = Vec::new();
     for (_, _, p, addr) in cands {
-        let spare = before.contains(&p) || st.fast.load(p) <= TUNNEL_SPARE;
-        if picked.len() < TUNNEL_VIAS
-            && (picked.is_empty() || spare)
-            && picked.iter().all(|(_, a)| a.ip() != addr.ip() || !apart)
+        if picked.len() < TUNNEL_VIAS && picked.iter().all(|(_, a)| a.ip() != addr.ip() || !apart)
         {
             picked.push((p, addr));
         }
     }
+    // (v304) Deux passeurs : en chaîne, aucun des deux ne voit les deux bouts.
+    let chain = picked.len() == 2;
     // Sinon le passeur du jeu de l'hôte lui-même, s'il en a un : aussi rapide qu'en
     // direct, et le joueur n'y voit qu'une adresse de passeur comme une autre.
     let mut own = false;
@@ -566,7 +632,7 @@ fn tunnel_assign(st: &mut State, route: u64) {
             let c = st.conns.get(p)?;
             let h = st.conns.get(&host)?;
             let same = *p == host || (apart && super::same_machine(c, h));
-            (same && *p != guest && o.verified).then_some((*p, o.addr))
+            (same && *p != guest && o.verified && !bad.contains(p)).then_some((*p, o.addr))
         });
         if let Some(m) = mine {
             picked.push(m);
@@ -590,15 +656,53 @@ fn tunnel_assign(st: &mut State, route: u64) {
         // (Jamais donnée : rien à reprendre. Le joueur n'attend pas de réponse, d'autres
         // relais à qui il a fait la même demande ne connaissent même pas ce nœud.)
         if !before.is_empty() {
-            tunnel_tell(st, guest, host, node, route, false, &[]);
+            tunnel_tell(st, guest, host, node, route, false, &[], &[]);
         }
         return;
     }
+    if chain {
+        // Le premier parle au joueur, le second à l'hôte ; entre eux, une adresse fixée
+        // ici. Une seule clé de sceau pour toute la route (neuve à chaque attribution).
+        let seal: [u8; 32] = rand::random();
+        let (first, second) = (picked[0], picked[1]);
+        for (me, other, dir) in [
+            (first, second, minelib_net::fast::TO_GUEST),
+            (second, first, minelib_net::fast::TO_HOST),
+        ] {
+            if let Some(c) = st.conns.get(&me.0) {
+                transport::push(
+                    &c.tx,
+                    &Response::PasseurLink {
+                        lot: route,
+                        route,
+                        seal,
+                        dir,
+                        addr: other.1.ip().octets(),
+                        port: other.1.port(),
+                    },
+                );
+            }
+        }
+        let hop = |a: SocketAddrV4| FastHop {
+            addr: a.ip().octets(),
+            port: a.port(),
+            seal,
+        };
+        if let Some(t) = st.fast.tunnels.get_mut(&route) {
+            t.passeurs = vec![(first.0, seal), (second.0, seal)];
+            t.own = false;
+            t.chain = true;
+            t.at = Instant::now();
+        }
+        tunnel_tell(st, guest, host, node, route, false, &[hop(first.1)], &[hop(second.1)]);
+        return;
+    }
     // Un passeur gardé garde sa clé (rien ne change pour lui) ; un nouveau reçoit la route.
+    let was_chain = st.fast.tunnels.get(&route).is_some_and(|t| t.chain);
     let hops: Vec<FastHop> = picked
         .iter()
         .map(|(p, addr)| {
-            let seal = match seals.iter().find(|(q, _)| q == p) {
+            let seal = match seals.iter().find(|(q, _)| q == p).filter(|_| !was_chain) {
                 Some((_, seal)) => *seal,
                 None => {
                     let seal: [u8; 32] = rand::random();
@@ -628,12 +732,16 @@ fn tunnel_assign(st: &mut State, route: u64) {
             .map(|((p, _), h)| (*p, h.seal))
             .collect();
         t.own = own;
+        t.chain = false;
+        t.at = Instant::now();
     }
-    tunnel_tell(st, guest, host, node, route, own, &hops);
+    tunnel_tell(st, guest, host, node, route, own, &hops, &hops);
 }
 
 /// La route du tunnel (ou sa reprise : aucun passeur) est dite à ses deux bouts, l'hôte
-/// d'abord (il doit s'être montré au passeur avant le premier paquet du joueur).
+/// d'abord (il doit s'être montré au passeur avant le premier paquet du joueur). Chaque
+/// bout ne reçoit que les passeurs auxquels il écrit lui-même (`to_guest`, `to_host`).
+#[allow(clippy::too_many_arguments)]
 fn tunnel_tell(
     st: &State,
     guest: u64,
@@ -641,9 +749,10 @@ fn tunnel_tell(
     node: [u8; 32],
     route: u64,
     own: bool,
-    hops: &[FastHop],
+    to_guest: &[FastHop],
+    to_host: &[FastHop],
 ) {
-    for (c, is_host) in [(host, true), (guest, false)] {
+    for (c, is_host, hops) in [(host, true, to_host), (guest, false, to_guest)] {
         if let Some(c) = st.conns.get(&c) {
             transport::push(
                 &c.tx,
@@ -675,7 +784,7 @@ fn tunnel_close(st: &mut State, route: u64) {
             );
         }
     }
-    tunnel_tell(st, t.guest, t.host, t.node, route, false, &[]);
+    tunnel_tell(st, t.guest, t.host, t.node, route, false, &[], &[]);
 }
 
 /// La partie est finie : ses passeurs n'ont plus rien à porter pour elle.
@@ -1135,6 +1244,7 @@ mod tests {
         let (h, login) = relay("tunnel");
         let (_host, hl) = login("HoteTun");
         let (_guest, _) = login("InviteTun");
+        minelib_net::fast::tunnel_asker("InviteTun");
         let (pas, _) = login("PasTun");
         pas.send(Cmd::Passeur(true));
         until(|| h.state.lock().unwrap().fast.verified() == 1);
@@ -1166,6 +1276,7 @@ mod tests {
         let (h, login) = relay("tunnel-hote");
         let (host, hl) = login("HoteOuvert");
         let (_guest, _) = login("InviteOuvert");
+        minelib_net::fast::tunnel_asker("InviteOuvert");
         host.send(Cmd::Passeur(true));
         until(|| h.state.lock().unwrap().fast.verified() == 1);
         let host_node = hosted(&h, &hl);
@@ -1180,6 +1291,102 @@ mod tests {
         assert_eq!(st.fast.load(t.passeurs[0].0), 0);
     }
 
+    /// (v304) Avec deux passeurs, le tunnel passe par les deux à la suite : le joueur
+    /// n'écrit qu'au premier, l'hôte qu'au second, et chacun des deux passeurs ne connaît
+    /// qu'un bout. Quand l'un des deux s'en va, le tunnel continue par celui qui reste.
+    #[test]
+    fn two_passeurs_carry_a_tunnel_in_a_chain() {
+        let (h, login) = relay("tunnel-chaine");
+        let (_host, hl) = login("HoteChaine");
+        let (_guest, _) = login("InviteChaine");
+        minelib_net::fast::tunnel_asker("InviteChaine");
+        let (first, _) = login("PasChaine1");
+        let (second, _) = login("PasChaine2");
+        first.send(Cmd::Passeur(true));
+        second.send(Cmd::Passeur(true));
+        until(|| h.state.lock().unwrap().fast.verified() == 2);
+        let host_node = hosted(&h, &hl);
+        let guest_node = minelib_p2p::Node::start_offline().unwrap();
+        let t = guest_node.tunnel(host_node.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(25))).unwrap();
+        assert!(said_back(&mut c, b"salut"), "le tunnel ne passe pas");
+        for i in 0..300u32 {
+            assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
+        }
+        let route = {
+            let st = h.state.lock().unwrap();
+            let (r, t) = st.fast.tunnels.iter().next().unwrap();
+            assert!(t.chain && t.passeurs.len() == 2 && !t.own);
+            *r
+        };
+        // Chaque bout n'écrit qu'à son passeur, et ce n'est pas le même.
+        let (g, o) = (
+            guest_node.passeurs().via(route).unwrap(),
+            host_node.passeurs().via(route).unwrap(),
+        );
+        assert_ne!(g, o);
+        assert_eq!(minelib_p2p::node_direct(host_node.id()), Some(true));
+        // L'un des deux s'en va : un seul passeur porte la suite.
+        first.send(Cmd::Passeur(false));
+        until(|| h.state.lock().unwrap().fast.verified() == 1);
+        assert!(said_back(&mut c, b"apres"), "le tunnel s'est refermé");
+        let st = h.state.lock().unwrap();
+        let t = &st.fast.tunnels[&route];
+        assert!(!t.chain && t.passeurs.len() == 1);
+    }
+
+    /// (v304) Un passeur se tait sans prévenir (PC éteint, box qui referme le port) : les
+    /// bouts du tunnel le disent au relais, qui leur donne d'autres passeurs sur la même
+    /// route. Le tunnel reprend sans se refermer.
+    #[test]
+    fn a_tunnel_whose_passeurs_fall_silent_gets_others() {
+        let (h, login) = relay("tunnel-muet");
+        let (_host, hl) = login("HoteMuet");
+        let (_guest, _) = login("InviteMuet");
+        minelib_net::fast::tunnel_asker("InviteMuet");
+        let (a, _) = login("PasMuet1");
+        let (b, _) = login("PasMuet2");
+        a.send(Cmd::Passeur(true));
+        b.send(Cmd::Passeur(true));
+        until(|| h.state.lock().unwrap().fast.verified() == 2);
+        let host_node = hosted(&h, &hl);
+        let guest_node = minelib_p2p::Node::start_offline().unwrap();
+        let t = guest_node.tunnel(host_node.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        assert!(said_back(&mut c, b"avant"), "le tunnel ne passe pas");
+        // Deux autres passeurs arrivent ; les deux premiers lâchent la route sans rien
+        // dire au relais.
+        let (c2, _) = login("PasMuet3");
+        let (d2, _) = login("PasMuet4");
+        c2.send(Cmd::Passeur(true));
+        d2.send(Cmd::Passeur(true));
+        until(|| h.state.lock().unwrap().fast.verified() == 4);
+        let (route, before) = {
+            let st = h.state.lock().unwrap();
+            let (r, t) = st.fast.tunnels.iter().next().unwrap();
+            let before: Vec<u64> = t.passeurs.iter().map(|(p, _)| *p).collect();
+            for p in &before {
+                transport::push(
+                    &st.conns[p].tx,
+                    &Response::PasseurTask {
+                        lot: *r,
+                        routes: Vec::new(),
+                    },
+                );
+            }
+            (*r, before)
+        };
+        let fell = Instant::now();
+        assert!(said_back(&mut c, b"apres"), "le tunnel s'est refermé");
+        eprintln!("TUNNEL : passeurs muets, reprise en {:?}", fell.elapsed());
+        assert!(fell.elapsed() < Duration::from_secs(14));
+        let st = h.state.lock().unwrap();
+        let t = &st.fast.tunnels[&route];
+        assert!(t.chain && t.passeurs.iter().all(|(p, _)| !before.contains(p)));
+    }
+
     /// (v301) Le passeur d'un tunnel s'en va : le relais en donne un autre pour la même
     /// route, et le tunnel continue sans se refermer.
     #[test]
@@ -1187,6 +1394,7 @@ mod tests {
         let (h, login) = relay("tunnel-suite");
         let (_host, hl) = login("HoteSuite");
         let (_guest, _) = login("InviteSuite");
+        minelib_net::fast::tunnel_asker("InviteSuite");
         let (first, _) = login("PasSuite1");
         first.send(Cmd::Passeur(true));
         until(|| h.state.lock().unwrap().fast.verified() == 1);

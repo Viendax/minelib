@@ -135,6 +135,10 @@ fn hop_seal(key: &[u8; 32], head: &[u8]) -> [u8; SEAL] {
 /// connaisse notre adresse ; `RAW_DATA` : un paquet), longueur sur 2 octets, contenu.
 pub const RAW_KEEP: u8 = 0;
 pub const RAW_DATA: u8 = 1;
+/// (v304) « Réponds-moi » et sa réponse : un bout s'assure que la route passe de bout en
+/// bout avant d'y ouvrir son tunnel.
+pub const RAW_PING: u8 = 2;
+pub const RAW_PONG: u8 = 3;
 /// Plus gros contenu d'un paquet brut. Un paquet QUIC fait 1 200 octets au départ, puis
 /// QUIC en essaie de plus gros : ils sont jetés ici, il en reste à 1 200. Avec l'en-tête,
 /// le paquet tient ainsi dans 1 232 octets, ce que toute liaison laisse passer sans le
@@ -192,15 +196,27 @@ pub struct TunnelRoute {
 /// Demandes gardées (les connexions au relais les envoient chacune à leur tour).
 const WANTS_KEPT: usize = 64;
 
+/// Ce que le nœud iroh du jeu fait dire au relais du monde.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelAsk {
+    /// Une route vers ce nœud (demande, ou renouvellement).
+    Want([u8; 32]),
+    /// (v304) Plus rien ne passe par cette route depuis quelques secondes : qu'on lui
+    /// donne d'autres passeurs.
+    Bad(u64),
+}
+
 struct Tunnels {
-    /// Demandes récentes : numéro (croissant), nœud.
-    wants: Vec<(u64, [u8; 32])>,
+    /// Demandes récentes : numéro (croissant), demande.
+    wants: Vec<(u64, TunnelAsk)>,
     next: u64,
     /// Routes vers des nœuds distants (une par nœud, la dernière donnée).
     routes: Vec<TunnelRoute>,
     hook: Option<fn(&TunnelRoute)>,
     /// Passeurs de ce jeu : port local, et l'adresse que la box leur a donnée.
     own: Vec<(u16, Option<SocketAddrV4>)>,
+    /// Essais : seuls ces comptes envoient les demandes (vide : tous).
+    askers: Vec<String>,
 }
 
 static TUNNELS: Mutex<Tunnels> = Mutex::new(Tunnels {
@@ -209,16 +225,27 @@ static TUNNELS: Mutex<Tunnels> = Mutex::new(Tunnels {
     routes: Vec::new(),
     hook: None,
     own: Vec::new(),
+    askers: Vec::new(),
 });
 
 /// Ce jeu ouvre (ou garde ouvert) un tunnel vers le nœud `node` : ses connexions au relais
 /// demandent une route par des passeurs. À refaire toutes les `TUNNEL_RENEW` tant que le
 /// tunnel sert : le relais reprend les routes qu'on ne redemande plus.
 pub fn tunnel_want(node: [u8; 32]) {
+    tunnel_ask(TunnelAsk::Want(node));
+}
+
+/// (v304) Plus rien ne passe par la route `route` : ses bouts le disent au relais, qui
+/// lui donne d'autres passeurs (même route : le tunnel reprend sans se refermer).
+pub fn tunnel_bad(route: u64) {
+    tunnel_ask(TunnelAsk::Bad(route));
+}
+
+fn tunnel_ask(ask: TunnelAsk) {
     let mut t = TUNNELS.lock().unwrap();
     let n = t.next;
     t.next += 1;
-    t.wants.push((n, node));
+    t.wants.push((n, ask));
     let extra = t.wants.len().saturating_sub(WANTS_KEPT);
     t.wants.drain(..extra);
 }
@@ -226,16 +253,27 @@ pub fn tunnel_want(node: [u8; 32]) {
 /// Rythme auquel redemander la route d'un tunnel qui sert.
 pub const TUNNEL_RENEW: Duration = Duration::from_secs(30);
 
-/// Demandes faites après la numéro `after` (sans doublon), et le numéro de la dernière.
-pub fn tunnel_wants(after: u64) -> (Vec<[u8; 32]>, u64) {
+/// Demandes faites après la numéro `after` (sans doublon), et le numéro de la dernière,
+/// pour la connexion du compte `pseudo`.
+pub fn tunnel_wants(after: u64, pseudo: &str) -> (Vec<TunnelAsk>, u64) {
     let t = TUNNELS.lock().unwrap();
-    let mut nodes: Vec<[u8; 32]> = Vec::new();
-    for (n, node) in &t.wants {
-        if *n > after && !nodes.contains(node) {
-            nodes.push(*node);
+    let mut nodes: Vec<TunnelAsk> = Vec::new();
+    if t.askers.is_empty() || t.askers.iter().any(|a| a == pseudo) {
+        for (n, node) in &t.wants {
+            if *n > after && !nodes.contains(node) {
+                nodes.push(*node);
+            }
         }
     }
     (nodes, t.next - 1)
+}
+
+/// Essais, où plusieurs jeux vivent dans un même programme : seules les connexions de
+/// ces comptes envoient les demandes de tunnel (dans le jeu, un programme n'a qu'un
+/// compte, et toutes ses connexions les envoient).
+#[doc(hidden)]
+pub fn tunnel_asker(pseudo: &str) {
+    TUNNELS.lock().unwrap().askers.push(pseudo.to_string());
 }
 
 /// Le relais a donné (ou repris) une route. `own` : ses passeurs sont celui de ce jeu
@@ -284,6 +322,25 @@ pub fn tunnel_route(node: [u8; 32]) -> Option<TunnelRoute> {
     t.routes.iter().find(|r| r.node == node).cloned()
 }
 
+
+/// (v304) Un relais auquel ce jeu est connecté a des passeurs en ce moment (redit par ses
+/// connexions tant que c'est vrai) : sans cela, inutile de demander une route et de
+/// l'attendre avant d'ouvrir un tunnel.
+static PASSEURS_AT: AtomicU64 = AtomicU64::new(0);
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+pub fn note_passeurs() {
+    PASSEURS_AT.store(unix_ms(), Ordering::Relaxed);
+}
+
+pub fn passeurs_known() -> bool {
+    unix_ms().saturating_sub(PASSEURS_AT.load(Ordering::Relaxed)) < 3000
+}
 
 /// Un passeur de ce jeu écoute sur le port `local` ; `external` : l'adresse que la box
 /// lui a donnée, si elle a ouvert le port.
@@ -481,6 +538,9 @@ struct Hop {
     since: Instant,
     count: u32,
     bytes: u32,
+    /// (v304) Chaîne de deux passeurs : dans ce sens, les paquets viennent d'un autre
+    /// passeur, à une adresse fixée par le relais (elle ne s'apprend pas).
+    fixed: [bool; 2],
 }
 
 struct PasseurInner {
@@ -573,9 +633,39 @@ impl Passeur {
                     since: Instant::now(),
                     count: 0,
                     bytes: 0,
+                    fixed: [false; 2],
                 },
             );
         }
+    }
+
+    /// (v304) Route d'une chaîne de deux passeurs (elle remplace ce que ce passeur
+    /// portait pour l'attribution `lot`) : les paquets du sens `dir` lui viennent de
+    /// l'autre passeur, à l'adresse `from`, et c'est là qu'il envoie ceux de l'autre
+    /// sens. Il ne voit ainsi qu'un des deux bouts de la route.
+    pub fn set_link(&self, lot: u64, route: u64, seal: [u8; 32], dir: u8, from: SocketAddr) {
+        let mut hops = self.inner.hops.lock().unwrap();
+        hops.retain(|_, h| h.lot != lot);
+        if hops.len() >= ROUTES_MAX || dir > 1 {
+            return;
+        }
+        let mut ends = [None; 2];
+        let mut fixed = [false; 2];
+        ends[dir as usize] = Some(from);
+        fixed[dir as usize] = true;
+        hops.insert(
+            route,
+            Hop {
+                lot,
+                seal,
+                ends,
+                top: [0; 2],
+                since: Instant::now(),
+                count: 0,
+                bytes: 0,
+                fixed,
+            },
+        );
     }
 
     /// Plus aucune route (connexion au relais perdue).
@@ -646,12 +736,20 @@ impl PasseurInner {
                 return;
             }
             let d = x.dir as usize;
-            if x.seq >= h.top[d] {
-                h.top[d] = x.seq + 1;
-                h.ends[d] = Some(from);
-            }
-            if h.ends[d] != Some(from) {
-                return;
+            if h.fixed[d] {
+                // (L'autre passeur de la chaîne : reconnu à son adresse, pas au port d'où
+                // sa box fait sortir ses paquets.)
+                if h.ends[d].map(|a| a.ip()) != Some(from.ip()) {
+                    return;
+                }
+            } else {
+                if x.seq >= h.top[d] {
+                    h.top[d] = x.seq + 1;
+                    h.ends[d] = Some(from);
+                }
+                if h.ends[d] != Some(from) {
+                    return;
+                }
             }
             h.ends[1 - d]
         };
@@ -1596,12 +1694,12 @@ mod tests {
             ]
         );
         // Les demandes : chaque connexion ne voit que celles faites après elle.
-        let (_, start) = tunnel_wants(u64::MAX);
+        let (_, start) = tunnel_wants(u64::MAX, "");
         tunnel_want(node);
         tunnel_want(node);
-        let (nodes, last) = tunnel_wants(start);
-        assert!(nodes.contains(&node) && last >= start + 2);
-        assert!(!tunnel_wants(last).0.contains(&node));
+        let (nodes, last) = tunnel_wants(start, "");
+        assert!(nodes.contains(&TunnelAsk::Want(node)) && last >= start + 2);
+        assert!(!tunnel_wants(last, "").0.contains(&TunnelAsk::Want(node)));
     }
 
     #[test]
