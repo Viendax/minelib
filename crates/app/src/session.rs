@@ -678,6 +678,9 @@ pub struct Session {
     fallen: Vec<crate::corpse::Fallen>,
     fallen_next: u64,
     own_seen: std::cell::Cell<Option<(crate::player_model::Prev, f32)>>,
+    /// (v305) La vue de la caméra F5 à l'image d'avant : la coupe de son corps par l'écran
+    /// (`player_model::cut`) suit l'écran, son mouvement aussi.
+    cut_view: std::cell::Cell<Option<Mat4>>,
     /// (v264) Plaies des joueurs de la partie FPS (« un impact dans le joueur ») : par pseudo
     /// (vide : le joueur local), jusqu'à sa mort ou la fin de la manche, comme les traces sur
     /// les blocs. Dessinées sur son modèle (`player_model::wound_model`).
@@ -1126,6 +1129,7 @@ impl Session {
             fallen: Vec::new(),
             fallen_next: 0,
             own_seen: Default::default(),
+            cut_view: Default::default(),
             // Essais : MINELIB_EVIDE="x,y,z,lacet°[,posture]" pose d'avance un Évidé (figé dans
             // la posture nommée : debout, court, rampe, mord, mange ; vivant sans posture) ;
             // plusieurs séparés par « ; ».
@@ -5568,6 +5572,26 @@ impl Session {
             let phase = *clock * std::f32::consts::TAU / period.max(0.05);
             self.player.yaw = *base + amp.to_radians() * phase.sin();
         }
+        // (v305) Essais : MINELIB_GLISSE=<amplitude blocs>,<période s> : le joueur glisse de
+        // gauche à droite autour de sa place de départ (passer vite à côté d'un bloc : « pas net
+        // quand je passe rapidement à côté »), sans tourner.
+        static SLIDE: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+        static SLIDE_AT: std::sync::Mutex<Option<(Vec3, f32)>> = std::sync::Mutex::new(None);
+        let slide = SLIDE.get_or_init(|| {
+            let v = std::env::var("MINELIB_GLISSE").ok()?;
+            let (a, p) = v.split_once(',')?;
+            Some((a.trim().parse().ok()?, p.trim().parse().ok()?))
+        });
+        if let (Some((amp, period)), Ok(mut at)) = (*slide, SLIDE_AT.lock()) {
+            if self.loading.is_none() {
+                let (base, clock) = at.get_or_insert((self.player.pos, 0.0));
+                *clock += dt;
+                let phase = *clock * std::f32::consts::TAU / period.max(0.05);
+                let right = Vec3::new(self.player.yaw.cos(), 0.0, self.player.yaw.sin());
+                self.player.pos = *base + right * (amp * phase.sin());
+                self.player.vel = Vec3::ZERO;
+            }
+        }
         // (v229) Sur un serveur de construction : les foudres que publient les arbitres.
         self.update_thor();
         // L'éclair tenu : vu de derrière (F5, caméra libre), dans le monde, au poing du
@@ -6394,8 +6418,11 @@ impl Session {
             (eye, self.view_with_punch(), self.player.look_dir())
         } else {
             let eye = self.player.eye();
-            // (v295) Jamais à la verticale sous les yeux (`third_person_dir`).
-            let back = third_person_dir(self.player.yaw, self.player.pitch, third);
+            let look = self.player.look_dir();
+            // (v305) « Je dois pouvoir descendre ma caméra jusqu'au sol en F5 » : plus de limite
+            // (la v295 la gardait à 55° au plus sous les yeux). Ce que l'écran coupe alors du
+            // corps, dans ses jambes, est dessiné plein (`player_model::cut`).
+            let back = if third == 1 { -look } else { look };
             let dist = raycast(&self.world, eye.into(), back.into(), THIRD_PERSON_DIST)
                 .map_or(THIRD_PERSON_DIST, |h| (h.distance - 0.25).max(0.3));
             let cam = eye + back * dist;
@@ -11556,7 +11583,7 @@ impl Session {
         } else {
             self.perspective
         };
-        let (cam, view, _) = self.view_camera();
+        let (cam, view, cam_look) = self.view_camera();
         use crate::player_model::Held;
         let held = self.model_held();
         let (walk, swing) = self.stride();
@@ -11605,6 +11632,9 @@ impl Session {
                 if let Some(w) = self.wounds.get("") {
                     m.extend(crate::player_model::wound_model(p, w));
                 }
+                // (v305) Les genoux et les coudes pleins : vus d'en dessous (la caméra
+                // descendue au sol), plus de fente.
+                m.extend(crate::player_model::joint_sections(p, self.flesh.get("")));
                 m
             };
             let m = body(&pose);
@@ -11642,8 +11672,20 @@ impl Session {
                     .map(|(i, v)| old.as_ref().map_or(v.pos, |o| o[i].pos)),
             );
             moved.extend(m);
+            // (v305) « L'intérieur visible, tu le textures de la texture visible de sa jambe au
+            // niveau de la caméra » : ce que l'écran coupe de son corps (la caméra descendue
+            // au sol, dans ses jambes) est plein, à la couleur de son skin à cet endroit. La
+            // coupe suit l'écran : à l'image d'avant, elle était à la même place devant la
+            // caméra d'avant.
+            let cut = crate::player_model::cut(&pose, self.flesh.get(""), cam, cam_look, CUT_AT);
+            let back = self.cut_view.replace(Some(view)).map(|v| v.inverse() * view);
+            moved_prev.extend(cut.iter().map(|v| {
+                back.map_or(v.pos, |b| b.transform_point3(Vec3::from(v.pos)).to_array())
+            }));
+            moved.extend(cut);
         } else {
             self.own_seen.set(None);
+            self.cut_view.set(None);
         }
         let mut model: Vec<minelib_render::EntityVertex> = Vec::new();
         // (Avant la v290, le corps du joueur local était en tête, sans mouvement : « il suit
@@ -13359,24 +13401,9 @@ fn sun_reaches(world: &World, b: &ShadowBox, sun: [f32; 3]) -> bool {
 /// Recul de la caméra à la 3e personne (F5), en blocs, comme dans Minecraft.
 const THIRD_PERSON_DIST: f32 = 4.0;
 
-/// (v295) La caméra F5 ne descend pas plus bas que ça (degrés sous l'horizontale des yeux) :
-/// sur un sol plat, elle reste alors à un bloc derrière (ou devant) les pieds, hors de portée
-/// des jambes qui balancent en marchant (65° ne suffisait pas : le pied de derrière la
-/// touchait).
-const THIRD_PERSON_MAX_BELOW: f32 = 55.0;
-
-/// (v295) Direction des yeux vers la caméra F5 (`third` : 1 de dos, 2 de face) : à l'opposé du
-/// regard de dos, dans son sens de face, mais jamais plus de `THIRD_PERSON_MAX_BELOW` degrés
-/// sous l'horizontale (derrière le joueur de dos, devant lui de face). « Corrige ce point de
-/// vue » (Viendax, 24 novembre, 21 h 20, capture prise de l'intérieur de ses jambes) : regard
-/// droit vers le haut de dos, ou vers le bas de face, la caméra partait à la verticale sous les
-/// yeux ; le sol la ramenait contre eux, au milieu des jambes du joueur. Plus haut que
-/// l'horizontale (au-dessus de la tête), rien ne change.
-fn third_person_dir(yaw: f32, pitch: f32, third: u8) -> Vec3 {
-    let (side, p) = if third == 1 { (-1.0, -pitch) } else { (1.0, pitch) };
-    let p = p.max(-THIRD_PERSON_MAX_BELOW.to_radians());
-    Vec3::new(side * yaw.sin() * p.cos(), p.sin(), -side * yaw.cos() * p.cos())
-}
+/// (v305) La coupe du corps par l'écran (`player_model::cut`) : à peine au-delà du plan proche
+/// de l'image, où l'écran coupe ce qui est plus près.
+const CUT_AT: f32 = minelib_render::NEAR * 1.04;
 
 /// Scène de démonstration : un mur de briques et toutes les torches colorées devant.
 /// (v198) Démo : un projecteur au-dessus du sol (`ground`) devant le miroir d'en face
@@ -14283,27 +14310,73 @@ mod loading_tests {
 mod f5_camera_tests {
     use super::*;
 
-    /// La case `p` est-elle dans la boîte `b` agrandie de `margin` blocs ?
-    fn inside(b: &minelib_render::ShadowBox, p: Vec3, margin: f32) -> bool {
-        b.to_unit.iter().all(|r| {
-            let u = r[0] * p.x + r[1] * p.y + r[2] * p.z + r[3];
-            let k = margin * (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
-            u >= -k && u <= 1.0 + k
+    /// Le point `p` est-il dans le pavé `b` (`player_model::solid_boxes`), à `margin` blocs au
+    /// moins de ses faces (moins : un peu au-dehors) ?
+    fn in_box(b: &(Mat4, [f32; 3], [f32; 3], usize), p: Vec3, margin: f32) -> bool {
+        let q = b.0.transform_point3(p);
+        let m = margin / crate::player_model::PX_BLOCKS;
+        (0..3).all(|k| q[k] >= b.1[k] + m && q[k] <= b.2[k] - m)
+    }
+
+    /// La couleur `c` (linéaire, ombrée) est-elle celle d'un pixel du skin par défaut ?
+    fn skin_like(c: [f32; 3], colors: &[[f32; 3]]) -> bool {
+        let n = |c: [f32; 3]| {
+            let m = c[0].max(c[1]).max(c[2]).max(1e-6);
+            c.map(|v| v / m)
+        };
+        colors
+            .iter()
+            .any(|&k| (0..3).all(|i| (n(c)[i] - n(k)[i]).abs() < 2e-3))
+    }
+
+    /// Le point de l'écran (`x`, `y` : tangentes du rayon vers la droite et vers le haut) est-il
+    /// couvert par un triangle de `tris` vu de la caméra (`cam`, repère `ahead`, `right`, `up`) ?
+    fn covered(
+        tris: &[minelib_render::EntityVertex],
+        cam: Vec3,
+        [ahead, right, up]: [Vec3; 3],
+        (x, y): (f32, f32),
+    ) -> bool {
+        let screen = |v: &minelib_render::EntityVertex| {
+            let q = Vec3::from(v.pos) - cam;
+            let f = q.dot(ahead);
+            (q.dot(right) / f, q.dot(up) / f)
+        };
+        tris.chunks(3).any(|t| {
+            let [a, b, c] = [screen(&t[0]), screen(&t[1]), screen(&t[2])];
+            let cross = |p: (f32, f32), q: (f32, f32), r: (f32, f32)| {
+                (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+            };
+            let area = cross(a, b, c);
+            if area.abs() < 1e-12 {
+                return false;
+            }
+            let w = [cross(b, c, (x, y)), cross(c, a, (x, y)), cross(a, b, (x, y))];
+            w.iter().all(|&w| w / area >= -1e-4)
         })
     }
 
-    /// (v295) « Corrige ce point de vue » : sa capture était prise de l'intérieur de ses
-    /// jambes (F5 de face, regard vers le bas ; de même de dos, regard vers le haut). Debout ou
-    /// accroupi, immobile ou en marchant, sur un sol plat : la caméra F5 n'est jamais dans le
-    /// corps du joueur, de dos comme de face, quel que soit le regard ; et plus haut que 55°
-    /// sous l'horizontale, elle est là où elle était.
+    /// (v305) « Je dois pouvoir descendre ma caméra jusqu'au sol en F5, c'est les parties du
+    /// skin visibles que tu dois régler, pas bloquer la vue à une hauteur » ; « je verrais son
+    /// corps mais pas l'intérieur : l'intérieur visible, tu le textures de la texture visible
+    /// de sa jambe au niveau de la caméra ». Sur un sol plat, debout ou accroupi, immobile ou
+    /// en marchant, de dos comme de face, quel que soit le regard : la caméra F5 est à l'opposé
+    /// du regard de dos, dans son sens de face, à 4 blocs ou ramenée par le sol (aucune limite :
+    /// regard droit vers le bas de face, ou vers le haut de dos, elle descend jusqu'au sol, dans
+    /// les jambes) ; tout endroit de l'écran d'où elle verrait l'intérieur d'un morceau du corps
+    /// (le plan de la coupe y est dans le morceau) est couvert par la coupe pleine, aux couleurs
+    /// du skin ; la coupe est tout entière dans le corps (cachée vu d'ailleurs), et rien quand
+    /// la caméra est loin de lui.
     #[test]
-    fn the_third_person_camera_never_ends_inside_the_player() {
+    fn the_third_person_camera_goes_down_to_the_ground_without_showing_the_inside_of_the_body() {
         let feet = Vec3::new(8.5, 4.0, 8.5);
-        let mut checked = 0;
+        let colors = crate::player_model::default_colors();
+        // Champ de vision de 70° en hauteur, image en 16/9.
+        let (tan_h, aspect) = (35f32.to_radians().tan(), 16.0 / 9.0);
+        let (mut checked, mut cut_seen, mut inside_seen, mut grounded) = (0, 0, 0, 0);
         for third in [1u8, 2] {
             for yaw_deg in [0.0f32, 37.0, 90.0, 200.0] {
-                for k in -22..=22 {
+                for k in -23..=23 {
                     let pitch = (k as f32 * 4.0).clamp(-89.0, 89.0).to_radians();
                     let yaw = yaw_deg.to_radians();
                     for (crouch, walk, swing) in [
@@ -14315,15 +14388,26 @@ mod f5_camera_tests {
                         (1.0, 1.5, 1.0),
                         (1.0, -1.5, 1.0),
                     ] {
-                        let eye = feet + Vec3::Y * (crate::player::EYE - crate::player::CROUCH_DROP * crouch);
-                        let dir = third_person_dir(yaw, pitch, third);
+                        let eye = feet
+                            + Vec3::Y
+                                * (crate::player::EYE - crate::player::CROUCH_DROP * crouch);
+                        let (sy, cy) = yaw.sin_cos();
+                        let (sp, cp) = pitch.sin_cos();
+                        let look = Vec3::new(sy * cp, sp, -cy * cp);
+                        // Comme `view_camera` : à l'opposé du regard de dos, dans son sens de
+                        // face, sans limite.
+                        let back = if third == 1 { -look } else { look };
                         // Le sol (herbe sous les pieds) ramène la caméra comme `raycast`.
-                        let dist = if dir.y < 0.0 && (eye.y - feet.y) / -dir.y < THIRD_PERSON_DIST {
-                            ((eye.y - feet.y) / -dir.y - 0.25).max(0.3)
+                        let ground = (eye.y - feet.y) / -back.y;
+                        let dist = if back.y < 0.0 && ground < THIRD_PERSON_DIST {
+                            (ground - 0.25).max(0.3)
                         } else {
                             THIRD_PERSON_DIST
                         };
-                        let cam = eye + dir * dist;
+                        let cam = eye + back * dist;
+                        if cam.y - feet.y < 0.3 {
+                            grounded += 1;
+                        }
                         let pose = crate::player_model::Pose {
                             feet,
                             yaw,
@@ -14339,61 +14423,58 @@ mod f5_camera_tests {
                             dir: 0.0,
                             run: 0.0,
                         };
-                        for b in crate::player_model::shadow_boxes(&pose) {
-                            assert!(
-                                !inside(&b, cam, 0.06),
-                                "F5 {third}, cap {yaw_deg}°, regard {:.0}°, accroupi {crouch}, \
-                                 marche {walk} : caméra en {cam} dans le corps",
-                                pitch.to_degrees()
-                            );
+                        let ahead = -back;
+                        let cut = crate::player_model::cut(&pose, None, cam, ahead, CUT_AT);
+                        assert_eq!(cut.len() % 3, 0);
+                        let what = format!(
+                            "F5 {third}, cap {yaw_deg}°, regard {:.0}°, accroupi {crouch}, \
+                             marche {walk} : caméra en {cam}",
+                            pitch.to_degrees()
+                        );
+                        if dist == THIRD_PERSON_DIST {
+                            assert!(cut.is_empty(), "{what} : coupe loin du corps");
                         }
-                        // Au-dessus de 55° sous l'horizontale : comme avant (à l'opposé du
-                        // regard de dos, dans son sens de face).
-                        let (sy, cy) = yaw.sin_cos();
-                        let (sp, cp) = pitch.sin_cos();
-                        let look = Vec3::new(sy * cp, sp, -cy * cp);
-                        let before = if third == 1 { -look } else { look };
-                        if before.y >= -(THIRD_PERSON_MAX_BELOW.to_radians().sin()) + 1e-4 {
-                            assert!((dir - before).length() < 1e-4, "{dir} contre {before}");
-                        } else {
-                            // Plus bas : 55° sous l'horizontale, du même côté qu'avant.
-                            assert!((dir.y + THIRD_PERSON_MAX_BELOW.to_radians().sin()).abs() < 1e-4);
-                            let side = Vec3::new(dir.x, 0.0, dir.z).normalize();
-                            let want = if third == 1 { -Vec3::new(sy, 0.0, -cy) } else { Vec3::new(sy, 0.0, -cy) };
-                            assert!((side - want).length() < 1e-3, "{side} contre {want}");
+                        let boxes = crate::player_model::solid_boxes(&pose);
+                        for v in &cut {
+                            assert!(
+                                boxes.iter().any(|b| in_box(b, Vec3::from(v.pos), -1e-4)),
+                                "{what} : coupe hors du corps en {:?}",
+                                v.pos
+                            );
+                            assert!(skin_like(v.color, &colors), "{what} : {:?}", v.color);
+                        }
+                        // Les endroits de l'écran (13 × 9) où le plan de la coupe est dans le
+                        // corps : couverts.
+                        let right = ahead.cross(Vec3::Y).normalize();
+                        let up = right.cross(ahead);
+                        for a in -6..=6 {
+                            for b in -4..=4 {
+                                let x = a as f32 / 6.0 * tan_h * aspect;
+                                let y = b as f32 / 4.0 * tan_h;
+                                let p = cam + (ahead + right * x + up * y) * CUT_AT;
+                                if !boxes.iter().any(|bx| in_box(bx, p, 2e-3)) {
+                                    continue;
+                                }
+                                inside_seen += 1;
+                                assert!(
+                                    covered(&cut, cam, [ahead, right, up], (x, y)),
+                                    "{what} : l'intérieur du corps se voit en ({a}, {b})"
+                                );
+                            }
+                        }
+                        if !cut.is_empty() {
+                            cut_seen += 1;
                         }
                         checked += 1;
                     }
                 }
             }
         }
-        assert!(checked > 500);
-        // Ce que faisait l'ancienne caméra (à la verticale sous les yeux) : dans les jambes.
-        let pose = crate::player_model::Pose {
-            feet,
-            yaw: 0.0,
-            pitch: (-89.0f32).to_radians(),
-            walk: 0.0,
-            swing: 0.0,
-            crouch: 0.0,
-            light: [1.0; 3],
-            held: None,
-            skin: None,
-            bow: 0.0,
-            air: 0.0,
-            dir: 0.0,
-            run: 0.0,
-        };
-        let eye = feet + Vec3::Y * crate::player::EYE;
-        let (sp, cp) = pose.pitch.sin_cos();
-        let old = Vec3::new(0.0, sp, -cp);
-        let old_cam = eye + old * ((crate::player::EYE / -old.y) - 0.25);
-        assert!(
-            crate::player_model::shadow_boxes(&pose)
-                .iter()
-                .any(|b| inside(b, old_cam, 0.06)),
-            "l'essai ne voit plus le cas de la capture"
-        );
+        assert!(checked > 2500);
+        // La caméra descend jusqu'au sol (regard droit vers le bas de face, vers le haut de
+        // dos), et l'écran y coupe bien le corps : l'essai voit le cas de la capture.
+        assert!(grounded >= 2 * 4 * 7, "{grounded}");
+        assert!(cut_seen > 0 && inside_seen > 0, "{cut_seen} {inside_seen}");
     }
 }
 

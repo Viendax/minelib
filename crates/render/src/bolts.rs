@@ -280,11 +280,31 @@ impl Bolts {
                 module: &shader,
                 entry_point: Some("fs_ball"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: crate::taa::COLOR_FORMAT,
-                    blend: Some(add),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })],
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: crate::taa::COLOR_FORMAT,
+                        blend: Some(add),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    }),
+                    // (v305) Son mouvement, mêlé à celui du fond selon sa part du pixel.
+                    Some(wgpu::ColorTargetState {
+                        format: crate::taa::MOTION_FORMAT,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent::REPLACE,
+                        }),
+                        // (Essais : `MINELIB_BOULE_FIXE=1`, sans son mouvement, pour comparer.)
+                        write_mask: if std::env::var_os("MINELIB_BOULE_FIXE").is_some() {
+                            wgpu::ColorWrites::empty()
+                        } else {
+                            wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN
+                        },
+                    }),
+                ],
             }),
             multiview: None,
             cache: None,

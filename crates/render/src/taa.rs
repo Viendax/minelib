@@ -479,11 +479,9 @@ impl Taa {
                 },
             ],
         });
-        // (v295) Avec la profondeur de la scène de l'image (le ciel : 0), pour `keep_hue` de
-        // present.wgsl.
         let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("copie TAA"),
-            entries: &[tex_entry(0, float), tex_entry(1, wgpu::TextureSampleType::Depth)],
+            entries: &[tex_entry(0, float)],
         });
         let taa_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/taa.wgsl"));
         let present_shader =
@@ -646,21 +644,14 @@ impl Taa {
             })
         };
         let resolve_groups = [resolve_group(0), resolve_group(1)];
-        // (v295) L'historique `i` a été écrit avec la profondeur `i` (voir `resolve`).
         let present_group = |i: usize| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("copie TAA"),
                 layout: &self.present_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&history_views[i]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&depth_views[i]),
-                    },
-                ],
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&history_views[i]),
+                }],
             })
         };
         let present_groups = [present_group(0), present_group(1)];

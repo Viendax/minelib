@@ -53,6 +53,9 @@ struct VOut {
     // des nuages (blocs) ; z = 0 : pas de nuages devant (segment à l'écran), 1 : éclair,
     // 2 : lueur dans le nuage.
     @location(4) @interpolate(flat) cloud: vec3<f32>,
+    // (v305) Boule de lumière : mouvement à l'écran de son centre (pixels, comme `motion_of` de
+    // world.wgsl : position d'avant − position de maintenant). 0 pour le reste.
+    @location(5) @interpolate(flat) mv: vec2<f32>,
 };
 
 /// Plus près que ça de l'œil (w), un bout de segment est ramené devant.
@@ -92,12 +95,26 @@ fn vs_post(@builtin(vertex_index) vi: u32, s: Seg) -> VOut {
 /// sont maintenant ajoutées à l'image du monde avant l'anticrénelage, avec le même décalage,
 /// cachées par la profondeur elle-même : leurs bords sont lissés et immobiles comme ceux des
 /// blocs. Les autres segments (éclairs) restent après lui (nets dès la première image).
+///
+/// (v305) « C'est mieux, mais pas encore net quand je passe rapidement à côté » : la boule
+/// n'avait pas de mouvement à elle ; l'anticrénelage reprenait, pour ses pixels, celui de ce
+/// qu'il y avait derrière (le paysage au loin, le ciel). En passant vite à côté, la boule (à
+/// quelques blocs) file à l'écran bien plus vite que le fond : l'image d'avant était relue au
+/// mauvais endroit et la boule traînait. Elle écrit maintenant le mouvement de son centre là où
+/// elle domine (`fs_ball`).
 @vertex
 fn vs_ball(@builtin(vertex_index) vi: u32, s: Seg) -> VOut {
     if !is_ball(s) {
         return hidden();
     }
-    return place(vi, s, g.view_proj);
+    var o = place(vi, s, g.view_proj);
+    let q = vec4<f32>(s.a.xyz - g.cam_pos.xyz, 1.0);
+    let cur = g.cur_view_proj * q;
+    let prev = g.prev_view_proj * q;
+    if cur.w > 1e-4 && prev.w > 1e-4 {
+        o.mv = (prev.xy / prev.w - cur.xy / cur.w) * vec2<f32>(0.5, -0.5) * g.screen.xy;
+    }
+    return o;
 }
 
 /// (v268) Une boule de lumière (`BOLT_BALL`, dans le monde) ?
@@ -306,9 +323,19 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
 }
 
 /// (v268) Boules de lumière dans l'image du monde, avant l'anticrénelage (voir `vs_ball`).
+/// (v305) Et leur mouvement : là où la boule domine (son éclat, de 0 à 0,5 et plus), il
+/// remplace celui de ce qu'il y a derrière (mélange par l'alpha de la sortie 1) ; au bord du
+/// halo, celui du fond reste.
+struct BallOut {
+    @location(0) color: vec4<f32>,
+    @location(1) motion: vec4<f32>,
+};
+
 @fragment
-fn fs_ball(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(ball(i), 0.0);
+fn fs_ball(i: VOut) -> BallOut {
+    let c = ball(i);
+    let own = clamp(max(c.r, max(c.g, c.b)) * 2.0, 0.0, 1.0);
+    return BallOut(vec4<f32>(c, 0.0), vec4<f32>(i.mv, 0.0, own));
 }
 
 /// Ce pixel de l'éclair est-il derrière le monde ? (Profondeur inversée : plus grand =

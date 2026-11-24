@@ -554,6 +554,83 @@ pub fn flesh_grids() -> [[usize; 3]; crate::flesh::PARTS] {
     std::array::from_fn(|i| ZONES[i].size)
 }
 
+/// (v269) Les six côtés d'un cube d'un pavé (un cube par pixel du skin) : (axe, sens, face
+/// dans l'ordre de `box_faces`), et ces faces.
+const CUBE_SIDES: [(usize, i32, usize); 6] = [
+    (2, -1, 0),
+    (2, 1, 1),
+    (0, 1, 2),
+    (0, -1, 3),
+    (1, 1, 4),
+    (1, -1, 5),
+];
+const CUBE_FACES: [Face; 6] = [
+    Face::Front,
+    Face::Back,
+    Face::Side,
+    Face::Side,
+    Face::Top,
+    Face::Bottom,
+];
+
+/// (v269) Le pixel du skin que montre la face `k` (ordre de `box_faces`) du cube `c` d'un pavé
+/// de la zone `zone` (une grille de `zone.size` cubes) : sa couleur (linéaire) et son grain,
+/// exactement ceux d'`emit_box`.
+fn cube_pixel(
+    zone: Zone,
+    part: Part,
+    tex: Option<&crate::skin::Skin>,
+    k: usize,
+    [x, y, z]: [usize; 3],
+) -> ([f32; 3], f32) {
+    let dims = zone.size;
+    let (u, v) = match k {
+        0 => (dims[0] - 1 - x, dims[1] - 1 - y),
+        1 => (x, dims[1] - 1 - y),
+        2 => (dims[2] - 1 - z, dims[1] - 1 - y),
+        3 => (z, dims[1] - 1 - y),
+        4 => (x, dims[2] - 1 - z),
+        _ => (x, z),
+    };
+    let (su, sv) = zone.pixel(k, u, v);
+    let full = zone.full.map(|n| n as u32);
+    let rgb = tex
+        .and_then(|t| t.color(zone.skin, k, su as u32, sv as u32, full))
+        .unwrap_or_else(|| skin(part, CUBE_FACES[k], su, sv, zone.width(k)));
+    (srgb(rgb), grain(k * 4096 + sv * 64 + su + part as usize * 977))
+}
+
+/// (v269) L'ombrage d'`emit_box` de la face `k` d'un cube dans le repère `xf` (`du × dv` : vers
+/// le dedans pour les quatre faces du tour, vers le dehors pour le dessus et le dessous), pour
+/// que les pixels d'un pavé dessiné cube par cube soient exactement ceux du pavé entier.
+fn cube_shade(xf: Mat4, k: usize) -> f32 {
+    let (axis, sign, _) = CUBE_SIDES[k];
+    let mut normal = Vec3::ZERO;
+    normal[axis] = if axis == 1 { sign as f32 } else { -sign as f32 };
+    face_shade(xf.transform_vector3(normal).normalize_or_zero())
+}
+
+/// (v305) La couleur d'un cube du corps vu en coupe (le corps est plein) : celle du pixel du
+/// skin le plus proche (un cube du bord : le sien ; un cube du dedans : celui du bord le plus
+/// proche, à la même hauteur ; à égalité, le tour avant le dessus et le dessous, dans l'ordre
+/// de `box_faces`), avec l'ombrage de sa face dans le repère `xf` : là où on coupe un morceau,
+/// on voit la texture de son skin à cet endroit.
+fn solid_color(
+    zone: Zone,
+    part: Part,
+    tex: Option<&crate::skin::Skin>,
+    c: [usize; 3],
+    xf: Mat4,
+) -> [f32; 3] {
+    let dims = zone.size;
+    let [x, y, z] = c;
+    let away = [z, dims[2] - 1 - z, dims[0] - 1 - x, x, dims[1] - 1 - y, y];
+    let k = (0..6).min_by_key(|&k| (away[k], k)).unwrap_or(0);
+    let (lin, g) = cube_pixel(zone, part, tex, k, c);
+    let shade = cube_shade(xf, k);
+    lin.map(|v| v * shade * g)
+}
+
 /// (v269) Un pavé mordu, dessiné cube par cube : un cube par pixel du skin, moins ceux que les
 /// morsures ont retirés (`flesh`). Une face tournée vers le dehors garde son pixel du skin
 /// (exactement celui d'`emit_box`) ; une face mise à nu par une morsure prend la couleur de ce
@@ -576,29 +653,11 @@ fn emit_flesh(
 ) {
     // (v299) `bare` : la part du corps d'un mort qui a fondu (0 pour un vivant) ; la peau
     // s'en va aussi de ses os, au même rythme : ils se montrent tels qu'ils sont.
-    // Les six côtés d'un cube : (axe, sens, face dans l'ordre de `box_faces`).
-    const SIDES: [(usize, i32, usize); 6] = [
-        (2, -1, 0),
-        (2, 1, 1),
-        (0, 1, 2),
-        (0, -1, 3),
-        (1, 1, 4),
-        (1, -1, 5),
-    ];
-    const FACES: [Face; 6] = [
-        Face::Front,
-        Face::Back,
-        Face::Side,
-        Face::Side,
-        Face::Top,
-        Face::Bottom,
-    ];
     let zone = ZONES[index];
     let dims = zone.size;
     let (lo, hi) = (Vec3::from(min), Vec3::from(max));
     let step = (hi - lo) / Vec3::new(dims[0] as f32, dims[1] as f32, dims[2] as f32);
     let lit = EntityVertex::light(light, true);
-    let full = zone.full.map(|n| n as u32);
     for z in 0..dims[2] {
         for y in 0..dims[1] {
             for x in 0..dims[0] {
@@ -612,7 +671,7 @@ fn emit_flesh(
                 let stripped = bare > 0.0
                     && flesh.is_hard(index, dims, c)
                     && crate::flesh::melt_draw(index, dims, c) < bare;
-                for (axis, sign, k) in SIDES {
+                for (axis, sign, k) in CUBE_SIDES {
                     // Le voisin de ce côté : dehors (le pixel du skin), mangé (la chair à nu),
                     // ou encore là (pas de face).
                     let n = c[axis] as i32 + sign;
@@ -624,27 +683,9 @@ fn emit_flesh(
                             continue;
                         }
                     }
-                    // L'ombrage d'`emit_box` (`du × dv` : vers le dedans pour les quatre faces
-                    // du tour, vers le dehors pour le dessus et le dessous), pour que les
-                    // pixels qui restent soient exactement ceux du pavé entier.
-                    let mut normal = Vec3::ZERO;
-                    normal[axis] = if axis == 1 { sign as f32 } else { -sign as f32 };
-                    let shade = face_shade(xf.transform_vector3(normal).normalize_or_zero());
+                    let shade = cube_shade(xf, k);
                     let color = if outside && !stripped {
-                        let (u, v) = match k {
-                            0 => (dims[0] - 1 - x, dims[1] - 1 - y),
-                            1 => (x, dims[1] - 1 - y),
-                            2 => (dims[2] - 1 - z, dims[1] - 1 - y),
-                            3 => (z, dims[1] - 1 - y),
-                            4 => (x, dims[2] - 1 - z),
-                            _ => (x, z),
-                        };
-                        let (su, sv) = zone.pixel(k, u, v);
-                        let rgb = tex
-                            .and_then(|t| t.color(zone.skin, k, su as u32, sv as u32, full))
-                            .unwrap_or_else(|| skin(part, FACES[k], su, sv, zone.width(k)));
-                        let g = grain(k * 4096 + sv * 64 + su + part as usize * 977);
-                        let mut lin = srgb(rgb);
+                        let (mut lin, g) = cube_pixel(zone, part, tex, k, c);
                         // (v272) « Fais que du sang en coule » : sur les faces du tour, les
                         // cubes sous un cube mangé rougissent, de moins en moins, sur deux
                         // à cinq cubes selon la colonne.
@@ -2377,6 +2418,204 @@ pub fn build_bitten(pose: &Pose, flesh: Option<&crate::flesh::Flesh>) -> Vec<Ent
     out
 }
 
+/// (v305) La coupe du corps par un plan face à la caméra (`eye`, regard `look`), à `at` blocs
+/// devant elle : juste au-delà du plan proche de l'image (`minelib_render::NEAR`), là où l'écran
+/// coupe ce qui est plus près.
+///
+/// « Je dois pouvoir descendre ma caméra jusqu'au sol en F5, c'est les parties du skin visibles
+/// que tu dois régler, pas bloquer la vue à une hauteur » ; « je verrais son corps mais pas
+/// l'intérieur : l'intérieur visible, tu le textures de la texture visible de sa jambe au
+/// niveau de la caméra » (Viendax, 24 novembre, 22 h 43 et 22 h 48). La caméra F5 ramenée au
+/// sol sous le joueur entre dans ses jambes : l'écran coupe un morceau du corps, et l'on voyait
+/// l'intérieur creux du pavé. Chaque morceau du corps est donc plein : un cube par pixel du
+/// skin (comme pour les morsures, `emit_flesh`), à la couleur du pixel du skin le plus proche,
+/// avec l'ombrage de sa face (un cube du bord : le sien, celui du tour d'abord ; un cube du
+/// dedans : celui du bord le plus proche, à la même hauteur). La coupe de chaque cube par le
+/// plan est dessinée à sa couleur : là où est la caméra, on voit la texture du morceau à cette
+/// hauteur, et tout le reste du corps autour. Elle est dans le corps : vue d'ailleurs (un
+/// miroir), il la cache. Vide quand le plan ne touche pas le corps (la caméra F5 loin de lui,
+/// comme d'habitude). Les cubes mangés par L'Évidé (`flesh`) n'ont pas de coupe.
+pub fn cut(
+    pose: &Pose,
+    flesh: Option<&crate::flesh::Flesh>,
+    eye: Vec3,
+    look: Vec3,
+    at: f32,
+) -> Vec<EntityVertex> {
+    let mut out = Vec::new();
+    let look = look.normalize_or_zero();
+    if look == Vec3::ZERO {
+        return out;
+    }
+    let tex = pose.skin.as_deref();
+    let all = parts(pose);
+    let low = lowers(pose, &all);
+    let lit = EntityVertex::light(pose.light, true);
+    // Deux directions du plan, pour ranger les coins de chaque coupe autour de son milieu.
+    let e1 = look.any_orthonormal_vector();
+    let e2 = look.cross(e1);
+    let unit = |j: usize| Vec3::new((j & 1) as f32, ((j >> 1) & 1) as f32, ((j >> 2) & 1) as f32);
+    for (i, &(xf, min, max, part)) in all.iter().enumerate() {
+        let below = low[i].map(|(m, _)| m);
+        let (lo, hi) = (Vec3::from(min), Vec3::from(max));
+        let zone = ZONES[i];
+        let dims = zone.size;
+        let step = (hi - lo) / Vec3::new(dims[0] as f32, dims[1] as f32, dims[2] as f32);
+        let bitten = flesh.filter(|f| f.bitten(i));
+        // Chaque moitié d'un membre (et chaque morceau) coupée un rien plus loin que la
+        // précédente : là où deux morceaux entrent l'un dans l'autre (le genou plié), leurs
+        // coupes ne sont pas dans le même plan (elles scintilleraient).
+        for half in 0..2 {
+            let m = match (half, below) {
+                (0, _) => xf,
+                (_, Some(b)) => b,
+                _ => continue,
+            };
+            let rows = match below {
+                None => 0..dims[1],
+                Some(_) if half == 0 => dims[1] / 2..dims[1],
+                Some(_) => 0..dims[1] / 2,
+            };
+            let plane = at * (1.0 + (2 * i + half) as f32 * 1e-4);
+            let side = |p: Vec3| (p - eye).dot(look) - plane;
+            // Toute la moitié d'un côté du plan : rien à couper.
+            let (y0, y1) = (lo.y + step.y * rows.start as f32, lo.y + step.y * rows.end as f32);
+            let (blo, bhi) = (Vec3::new(lo.x, y0, lo.z), Vec3::new(hi.x, y1, hi.z));
+            let s: [f32; 8] = std::array::from_fn(|j| side(m.transform_point3(blo + (bhi - blo) * unit(j))));
+            if s.iter().all(|&v| v > 0.0) || s.iter().all(|&v| v < 0.0) {
+                continue;
+            }
+            for z in 0..dims[2] {
+                for y in rows.clone() {
+                    for x in 0..dims[0] {
+                        let c = [x, y, z];
+                        if bitten.is_some_and(|f| f.gone(i, dims, c)) {
+                            continue;
+                        }
+                        let o = lo + Vec3::new(x as f32, y as f32, z as f32) * step;
+                        let w: [Vec3; 8] = std::array::from_fn(|j| m.transform_point3(o + unit(j) * step));
+                        let s = w.map(side);
+                        if s.iter().all(|&v| v > 0.0) || s.iter().all(|&v| v < 0.0) {
+                            continue;
+                        }
+                        // Les points où le plan coupe les arêtes du cube.
+                        let mut pts: Vec<Vec3> = Vec::with_capacity(6);
+                        for a in 0..8 {
+                            for bit in [1, 2, 4] {
+                                let b = a | bit;
+                                if a & bit != 0 || (s[a] > 0.0) == (s[b] > 0.0) {
+                                    continue;
+                                }
+                                let p = w[a] + (w[b] - w[a]) * (s[a] / (s[a] - s[b]));
+                                if pts.iter().all(|q| q.distance_squared(p) > 1e-12) {
+                                    pts.push(p);
+                                }
+                            }
+                        }
+                        if pts.len() < 3 {
+                            continue;
+                        }
+                        let mid = pts.iter().copied().sum::<Vec3>() / pts.len() as f32;
+                        let angle = |p: &Vec3| (*p - mid).dot(e2).atan2((*p - mid).dot(e1));
+                        pts.sort_by(|p, q| angle(p).total_cmp(&angle(q)));
+                        let color = solid_color(zone, part, tex, c, m);
+                        for t in 1..pts.len() - 1 {
+                            for p in [pts[0], pts[t], pts[t + 1]] {
+                                out.push(EntityVertex {
+                                    pos: p.to_array(),
+                                    color,
+                                    uv: [0.0; 2],
+                                    layer: -1,
+                                    light: lit,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// (v305) Les coupes des genoux et des coudes, pleines (`solid_color`), pour le corps du
+/// joueur vu en F5. La moitié du bas d'un membre plié est un rien moins large que celle du
+/// haut (`LOWER_NARROW`), et la face de la coupe, cachée entre les deux moitiés (`halves`),
+/// laissait de chaque côté une fente d'un millimètre et demi sous le haut du membre : la
+/// caméra F5 descendue au sol, sous le joueur, voyait par elle l'intérieur de la cuisse (un
+/// trait de la couleur du ventre de chaque côté de l'entrejambe). Ailleurs, ces coupes sont
+/// dans le membre : cachées.
+pub fn joint_sections(pose: &Pose, flesh: Option<&crate::flesh::Flesh>) -> Vec<EntityVertex> {
+    let mut out = Vec::new();
+    let tex = pose.skin.as_deref();
+    let all = parts(pose);
+    let low = lowers(pose, &all);
+    let lit = EntityVertex::light(pose.light, true);
+    for (i, &(xf, min, max, part)) in all.iter().enumerate() {
+        let Some((below, _)) = low[i] else {
+            continue;
+        };
+        let zone = ZONES[i];
+        let dims = zone.size;
+        let (lo, hi) = (Vec3::from(min), Vec3::from(max));
+        let step = (hi - lo) / Vec3::new(dims[0] as f32, dims[1] as f32, dims[2] as f32);
+        let mid = dims[1] / 2;
+        let at = lo.y + step.y * mid as f32;
+        let bitten = flesh.filter(|f| f.bitten(i));
+        // Le bas de la moitié du haut, le haut de la moitié du bas : une face par cube.
+        for (m, y) in [(xf, mid), (below, mid - 1)] {
+            for z in 0..dims[2] {
+                for x in 0..dims[0] {
+                    let c = [x, y, z];
+                    if bitten.is_some_and(|f| f.gone(i, dims, c)) {
+                        continue;
+                    }
+                    let color = solid_color(zone, part, tex, c, m);
+                    let (x0, z0) = (lo.x + step.x * x as f32, lo.z + step.z * z as f32);
+                    let q = [
+                        Vec3::new(x0, at, z0),
+                        Vec3::new(x0 + step.x, at, z0),
+                        Vec3::new(x0 + step.x, at, z0 + step.z),
+                        Vec3::new(x0, at, z0 + step.z),
+                    ]
+                    .map(|p| m.transform_point3(p));
+                    for p in [q[0], q[1], q[2], q[2], q[3], q[0]] {
+                        out.push(EntityVertex {
+                            pos: p.to_array(),
+                            color,
+                            uv: [0.0; 2],
+                            layer: -1,
+                            light: lit,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// (v305) Pour les essais : la taille d'un pixel du modèle (blocs), et les couleurs (linéaires)
+/// du skin par défaut.
+#[cfg(test)]
+pub(crate) const PX_BLOCKS: f32 = PX;
+#[cfg(test)]
+pub(crate) fn default_colors() -> Vec<[f32; 3]> {
+    [SKIN, SKIN_DARK, HAIR, EYE_WHITE, IRIS, MOUTH, SHIRT, SHIRT_DARK, PANTS, SHOES]
+        .map(srgb)
+        .to_vec()
+}
+
+/// (v305) Pour les essais : les pavés pleins du corps dans cette pose (chaque moitié d'un
+/// membre), comme (monde → repère du pavé, coins en pixels, numéro de `parts`).
+#[cfg(test)]
+pub(crate) fn solid_boxes(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], usize)> {
+    segments(pose)
+        .into_iter()
+        .map(|s| (s.xf.inverse(), s.min, s.max, s.of))
+        .collect()
+}
+
 // (v172) Les autres joueurs sont dessinés par la carte graphique, tous d'un coup : un seul
 // modèle (les six pavés, une face = deux triangles), posé par instance (`instance`) comme
 // `parts` le fait, avec l'image de leur skin cuite par `bake_skin`. Le résultat est celui de
@@ -3172,6 +3411,162 @@ pub(crate) fn irm(
 mod tests {
     use super::*;
     use glam::Vec2;
+
+    /// (v305) Vu d'en dessous, depuis l'entrejambe (la caméra F5 descendue au sol) : par le
+    /// rebord d'un millimètre et demi sous chaque cuisse (la moitié du bas d'un membre plié est
+    /// un rien moins large, `LOWER_NARROW`), on voyait l'intérieur de la cuisse. Debout, en
+    /// marchant, accroupi : un rayon visé juste dans ce rebord, côté entrejambe, s'arrête sur la
+    /// coupe du genou (`joint_sections`), sans traverser le dedans d'un morceau du corps.
+    #[test]
+    fn seen_from_below_the_knees_have_no_slit() {
+        let ray_hit = |tris: &[[Vec3; 3]], o: Vec3, d: Vec3| -> Option<f32> {
+            let mut best: Option<f32> = None;
+            for [a, b, c] in tris {
+                let (e1, e2) = (*b - *a, *c - *a);
+                let p = d.cross(e2);
+                let det = e1.dot(p);
+                if det.abs() < 1e-12 {
+                    continue;
+                }
+                let s = o - *a;
+                let u = s.dot(p) / det;
+                let q = s.cross(e1);
+                let v = d.dot(q) / det;
+                let t = e2.dot(q) / det;
+                if u >= -1e-6 && v >= -1e-6 && u + v <= 1.0 + 1e-6 && t > 1e-6 {
+                    best = Some(best.map_or(t, |b: f32| b.min(t)));
+                }
+            }
+            best
+        };
+        let mut on_section = 0;
+        for (walk, swing, crouch) in [(0.0, 0.0, 0.0), (1.2, 1.0, 0.0), (-0.4, 1.0, 0.0), (0.0, 0.0, 1.0)] {
+            let pose = Pose {
+                feet: Vec3::new(0.5, 10.0, 0.5),
+                yaw: 0.3,
+                pitch: -0.2,
+                walk,
+                swing,
+                crouch,
+                light: [1.0; 3],
+                held: None,
+                skin: None,
+                bow: 0.0,
+                air: 0.0,
+                dir: 0.0,
+                run: 0.0,
+            };
+            let mut mesh = build(&pose);
+            mesh.extend(joint_sections(&pose, None));
+            let tris: Vec<[Vec3; 3]> = mesh
+                .chunks(3)
+                .map(|t| [t[0].pos, t[1].pos, t[2].pos].map(Vec3::from))
+                .collect();
+            let solid = solid_boxes(&pose);
+            let inside = |p: Vec3| {
+                solid.iter().any(|(inv, lo, hi, _)| {
+                    let q = inv.transform_point3(p);
+                    (0..3).all(|k| q[k] > lo[k] + 0.05 && q[k] < hi[k] - 0.05)
+                })
+            };
+            // L'entrejambe, au ras du sol : entre les bas des deux jambes.
+            let eye = (cell_point(&pose, 0, [2, 1, 1]) + cell_point(&pose, 1, [0, 1, 1])) / 2.0;
+            assert!(!inside(eye));
+            let all = parts(&pose);
+            for (leg, side) in [(0usize, 1.0f32), (1, -1.0)] {
+                let (xf, min, max, _) = all[leg];
+                let cut = (min[1] + max[1]) / 2.0;
+                for z in [0.15f32, 0.35, 0.5, 0.65, 0.85] {
+                    let local = Vec3::new(
+                        side * 0.99 * max[0],
+                        cut,
+                        min[2] + (max[2] - min[2]) * z,
+                    );
+                    let target = xf.transform_point3(local);
+                    let d = (target - eye).normalize();
+                    let Some(t) = ray_hit(&tris, eye, d) else {
+                        continue;
+                    };
+                    for k in 1..60 {
+                        let p = eye + d * (t * k as f32 / 60.0);
+                        assert!(
+                            !inside(p),
+                            "marche {walk}, accroupi {crouch}, jambe {leg}, z {z} : \
+                             l'intérieur du corps se voit en {p}"
+                        );
+                    }
+                    if (eye + d * t).distance(target) < 1e-3 {
+                        on_section += 1;
+                    }
+                }
+            }
+        }
+        // L'essai voit bien des rebords (dans au moins deux poses sur quatre).
+        assert!(on_section >= 10, "{on_section}");
+    }
+
+    /// (v305) « L'intérieur visible, tu le textures de la texture visible de sa jambe au niveau
+    /// de la caméra » : la caméra dans la jambe gauche, au niveau du pied puis du genou, qui
+    /// regarde devant elle : là, l'écran montre la coupe de la jambe, à la couleur de la
+    /// chaussure puis du pantalon (le devant de la jambe à cette hauteur) ; la coupe est dans la
+    /// jambe. Loin du corps, aucune coupe.
+    #[test]
+    fn the_cut_shows_the_skin_of_the_leg_at_the_camera_level() {
+        let pose = Pose {
+            feet: Vec3::new(3.5, 70.0, -2.5),
+            yaw: 0.4,
+            pitch: 0.0,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: None,
+            skin: None,
+            bow: 0.0,
+            air: 0.0,
+            dir: 0.0,
+            run: 0.0,
+        };
+        let look = Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos());
+        let at = minelib_render::NEAR * 1.04;
+        let chroma = |c: [f32; 3]| {
+            let m = c[0].max(c[1]).max(c[2]);
+            c.map(|v| v / m)
+        };
+        let same = |a: [f32; 3], b: [f32; 3]| {
+            let (a, b) = (chroma(a), chroma(b));
+            (0..3).all(|i| (a[i] - b[i]).abs() < 2e-3)
+        };
+        // Rangées de cubes de la jambe depuis le bas : 1, la chaussure ; 7, le pantalon.
+        for (row, want) in [(1usize, SHOES), (7, PANTS)] {
+            let eye = cell_point(&pose, 0, [1, row, 1]);
+            let cut = cut(&pose, None, eye, look, at);
+            assert!(!cut.is_empty());
+            // Le triangle droit devant la caméra.
+            let ahead = eye + look * at;
+            let hit = cut.chunks(3).find(|t| {
+                let [a, b, c] = [t[0].pos, t[1].pos, t[2].pos].map(Vec3::from);
+                let n = (b - a).cross(c - a);
+                let inside = |p: Vec3, q: Vec3| (q - p).cross(ahead - p).dot(n) >= -1e-9;
+                n.length() > 0.0 && inside(a, b) && inside(b, c) && inside(c, a)
+            });
+            let hit = hit.expect("la coupe couvre le milieu de l'écran");
+            assert!(same(hit[0].color, srgb(want)), "rangée {row} : {:?}", hit[0].color);
+            for v in &cut {
+                let p = Vec3::from(v.pos);
+                assert!(
+                    solid_boxes(&pose).iter().any(|(inv, lo, hi, _)| {
+                        let q = inv.transform_point3(p);
+                        (0..3).all(|k| q[k] >= lo[k] - 1e-3 && q[k] <= hi[k] + 1e-3)
+                    }),
+                    "coupe hors du corps : {p}"
+                );
+            }
+        }
+        // À quatre blocs derrière : rien.
+        let eye = pose.feet + Vec3::Y * 1.6 - look * 4.0;
+        assert!(cut(&pose, None, eye, look, at).is_empty());
+    }
 
     /// Repère d'une partie dans la pose d'une instance : `part_matrix` de players.wgsl,
     /// ligne pour ligne.

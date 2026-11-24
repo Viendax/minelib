@@ -347,6 +347,10 @@ pub fn camera_motion(prev: Mat4, prev_eye: Vec3, cur: Mat4, eye: Vec3) -> (f32, 
     (step, turn)
 }
 
+/// Plan proche de la vue du monde (blocs devant la caméra) : ce qui est plus près est coupé
+/// par l'écran. (v305) Le jeu dessine plein ce qu'il coupe du corps du joueur en F5.
+pub const NEAR: f32 = 0.05;
+
 /// Nombre maximal de boîtes (morceaux de joueurs) qui font de l'ombre. (v236) 64 au lieu de
 /// 48 (onze ou douze joueurs au lieu de huit ou neuf) : dans une foule, les plus proches de
 /// la caméra et de l'axe de vue ont leur ombre exacte (les autres, celle de l'atlas des
@@ -3402,7 +3406,7 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&Default::default());
 
-        let proj = Mat4::perspective_infinite_reverse_rh(p.fov_y, self.aspect(), 0.05);
+        let proj = Mat4::perspective_infinite_reverse_rh(p.fov_y, self.aspect(), NEAR);
         let view_proj = proj * p.view;
         self.screen.update(&self.queue);
         let (sel_min, sel_max) = selection(p.selected);
@@ -3632,7 +3636,7 @@ impl Renderer {
             self.rebuild_world_groups();
         }
 
-        let proj = Mat4::perspective_infinite_reverse_rh(p.fov_y, self.aspect(), 0.05);
+        let proj = Mat4::perspective_infinite_reverse_rh(p.fov_y, self.aspect(), NEAR);
         let view_proj = proj * p.view;
         self.screen.update(&self.queue);
         let (jx, jy) = taa.jitter();
@@ -3772,10 +3776,27 @@ impl Renderer {
         // caméra ne bouge pas. Sans cela, l'anticrénelage garde l'ancienne image (caméra
         // immobile : moyenne jusqu'à 1/64, historique accepté tant que la géométrie ne
         // change pas) et la lumière semble ne pas suivre.
+        let mesh_changed = taa.scene_changed;
         if self.dyn_changes > 0 || self.dyn_gpu.stats.baked > 0 {
             self.dyn_changes = self.dyn_changes.saturating_sub(1);
             taa.scene_changed = true;
             taa.still_frames = 0;
+        }
+        // (v305) Essais : MINELIB_TAA_JOURNAL=1 : pourquoi l'anticrénelage reprend (ou non)
+        // l'image d'avant, image par image.
+        static TAA_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TAA_LOG.get_or_init(|| std::env::var_os("MINELIB_TAA_JOURNAL").is_some()) {
+            log::info!(
+                "TAA : immobile {} ({} images), pas {:.5}, tour {:.5}, scène changée {} (maillages {}, lumières {}, cartes d'ombre {})",
+                still,
+                taa.still_frames,
+                taa.cam_step,
+                taa.cam_turn,
+                taa.scene_changed,
+                mesh_changed,
+                self.dyn_changes,
+                self.dyn_gpu.stats.baked
+            );
         }
         // Reflets : recalculés à leur rythme, seulement s'il y a des surfaces qui reflètent
         // à l'écran (raytracing activé).
@@ -4075,16 +4096,25 @@ impl Renderer {
         // l'anticrénelage, cachées par sa profondeur (même décalage sous-pixel) : le bord d'un
         // bloc devant elles est lissé et immobile comme les autres (voir `vs_ball`, bolt.wgsl).
         if let Some(t) = taa.targets.as_ref().filter(|_| self.bolts.any_balls()) {
+            let keep = wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("boules de lumière"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                // (v305) Et l'image du mouvement : la boule y met le sien (voir `fs_ball`).
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &t.color_view,
+                        resolve_target: None,
+                        ops: keep,
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &t.motion_view,
+                        resolve_target: None,
+                        ops: keep,
+                    }),
+                ],
                 // Profondeur en lecture seule : celle du monde, relue ensuite par le TAA.
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_views[taa.depth_index()],
@@ -5001,7 +5031,7 @@ mod tests {
         use wgpu::naga;
         // Nom, source, constantes fixées.
         type Variant = (&'static str, String, &'static [(&'static str, f64)]);
-        let cases: [Variant; 14] = [
+        let cases: [Variant; 15] = [
             (
                 "éclairage différé",
                 lights::with_dynlights_glass(include_str!("shaders/dyn_deferred.wgsl")),
@@ -5061,10 +5091,17 @@ mod tests {
                 &[],
             ),
             ("fumée", include_str!("shaders/smoke.wgsl").to_string(), &[]),
-            // (v295) La copie à l'écran lit la profondeur de la scène (`keep_hue`).
             (
                 "copie à l'écran",
                 include_str!("shaders/present.wgsl").to_string(),
+                &[],
+            ),
+            // (v305) L'anticrénelage garde la teinte des couleurs trop fortes (`seen`). (La
+            // boule de lumière, qui écrit maintenant son mouvement, est dans « éclairs » :
+            // `bolts::source`.)
+            (
+                "anticrénelage",
+                include_str!("shaders/taa.wgsl").to_string(),
                 &[],
             ),
         ];

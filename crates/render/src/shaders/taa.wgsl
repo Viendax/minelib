@@ -56,6 +56,38 @@ fn from_ycocg(c: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
 }
 
+/// (v295) « Adapte ce qui ne va pas réalistement, de manière optimisée pour nos FPS » : une
+/// lumière forte et colorée (passée par du verre coloré, ou colorée elle-même) blanchissait
+/// ce qu'elle éclairait. Chaque canal était coupé à 1 : dès que le plus faible dépassait 1,
+/// tout devenait blanc, quelle que soit la couleur. Au-delà de 1, la couleur garde maintenant
+/// sa teinte (le canal le plus fort à 1, les autres dans les mêmes proportions), et ne
+/// blanchit que peu à peu quand la lumière devient très forte, comme pour l'œil ou une
+/// pellicule. Rien ne change jusqu'à 1 ; le passage se fait en douceur entre 1 et 3 (un
+/// blanc à peine trop fort reste comme avant). Quelques opérations par pixel.
+fn keep_hue(c: vec3<f32>) -> vec3<f32> {
+    let m = max(c.r, max(c.g, c.b));
+    if m <= 1.0 {
+        return c;
+    }
+    let white = 1.0 - 1.0 / (1.0 + (m - 1.0) * 0.02);
+    let kept = mix(c / m, vec3<f32>(1.0), white);
+    return mix(min(c, vec3<f32>(1.0)), kept, smoothstep(1.0, 3.0, m));
+}
+
+/// (v305) Un échantillon de l'image du monde tel qu'il sera vu : `keep_hue` pour la scène,
+/// rien pour le ciel (profondeur 0 : le soleil n'est pas touché, l'écran le coupe à 1 comme
+/// avant). En v295, `keep_hue` était fait à la copie à l'écran, après l'anticrénelage, choisi
+/// par la profondeur de l'image courante : au bord d'un trou du feuillage devant le ciel, le
+/// décalage sous-pixel faisait passer le pixel de « scène » à « ciel » d'une image à l'autre,
+/// et une couleur très forte passait du blanc à sa teinte à chaque image (le bloc de feuillage
+/// de sa lumière violette « vibrait »). Fait ici, sur chaque échantillon avec sa propre
+/// profondeur, le choix est moyenné au fil des images comme le reste : le bord est lissé et
+/// immobile. Et une face éclairée des dizaines de fois plus fort que le blanc, à côté d'une
+/// face sombre, ne fait plus sauter la moyenne.
+fn seen(c: vec3<f32>, depth: f32) -> vec3<f32> {
+    return select(c, keep_hue(c), depth > 0.0);
+}
+
 /// Lecture bicubique (Catmull-Rom) en 5 lectures bilinéaires au lieu de 9 : les 4 coins,
 /// de poids presque nul, sont omis et les poids renormalisés. L'historique reste net.
 /// (v204) Rend aussi l'alpha de la lecture du milieu (le marqueur des objets en mouvement,
@@ -143,7 +175,8 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     var center = vec3<f32>(0.0);
     for (var k = 0; k < 9; k++) {
         let q = clamp(p + vec2<i32>(k % 3 - 1, k / 3 - 1), vec2<i32>(0), size - 1);
-        let rgb = textureLoad(cur_color, q, 0).rgb;
+        let d = depths[k];
+        let rgb = seen(textureLoad(cur_color, q, 0).rgb, d);
         if k == 4 {
             center = rgb;
         }
@@ -152,7 +185,6 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
         m2 += c * c;
         cmin = min(cmin, c);
         cmax = max(cmax, c);
-        let d = depths[k];
         if d > best_depth {
             best_depth = d;
             best = q;
@@ -163,7 +195,7 @@ fn fs_resolve(i: FsOut) -> @location(0) vec4<f32> {
     var cur = center;
     if upscale {
         let cur_uv = i.uv + params.jitter.xy / isize;
-        cur = textureSampleLevel(cur_color, lin_sampler, cur_uv, 0.0).rgb;
+        cur = seen(textureSampleLevel(cur_color, lin_sampler, cur_uv, 0.0).rgb, d_cur);
     }
     // (v202) Un objet bouge tout près (joueur, PNJ qui marche, bras qui balance) : un des
     // neuf pixels bouge de plus d'un centième de pixel. (v204) Lu en quatre moyennes de

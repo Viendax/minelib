@@ -56,6 +56,7 @@
 //!                               temps qu'elle a pris (essais : les déplacements d'une image à
 //!                               l'autre d'une machine à <n> FPS, sous un rendu lent)
 //!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
+//!   MINELIB_CAPTURES=<s>,<n>    une capture à chaque image, n de suite à partir de <s> s (tests)
 //!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
 //!   MINELIB_UI=lumieres         éditeur de lumières ouvert en entrant dans le monde (essais)
 //!   MINELIB_UI=settings|graphics paramètres, ou paramètres graphiques, au lancement (essais)
@@ -4275,9 +4276,31 @@ impl GameLoop for Game {
             self.show_debug = !self.show_debug;
         }
         // F2 : capture d'écran (interface comprise), comme dans Minecraft, même tchat ouvert.
-        let auto_shot = self.shot_at.is_some_and(|t| self.time >= t);
+        let mut auto_shot = self.shot_at.is_some_and(|t| self.time >= t);
         if auto_shot {
             self.shot_at = None;
+        }
+        // (v305) Essais : MINELIB_CAPTURES=<s>,<n> : une capture à chaque image, n images de
+        // suite à partir de <s> secondes (ce qui change d'une image à l'autre).
+        static SERIES: std::sync::Mutex<Option<(f32, u32)>> = std::sync::Mutex::new(None);
+        static SERIES_INIT: std::sync::Once = std::sync::Once::new();
+        SERIES_INIT.call_once(|| {
+            let v = std::env::var("MINELIB_CAPTURES").unwrap_or_default();
+            if let Some((a, b)) = v.split_once(',') {
+                if let (Ok(t), Ok(n)) = (a.trim().parse::<f32>(), b.trim().parse::<u32>()) {
+                    if let Ok(mut g) = SERIES.lock() {
+                        *g = Some((t, n));
+                    }
+                }
+            }
+        });
+        if let Ok(mut g) = SERIES.lock() {
+            if let Some((t, n)) = g.as_mut() {
+                if self.time >= *t && *n > 0 {
+                    *n -= 1;
+                    auto_shot = true;
+                }
+            }
         }
         // Mode FPS : la touche de CS (F5) ; sinon celle de Minecraft (F2).
         let fps_mode = self
