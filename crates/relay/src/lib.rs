@@ -8205,6 +8205,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     id,
                     name: pseudo.to_string(),
                     pose,
+                    close: false,
                 });
                 // (v275) Jusqu'à 256 par seconde quand elle part à peu de joueurs, 66 comme
                 // avant sinon (`zones::POS_FEW`).
@@ -8223,6 +8224,29 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     if let Some(rid) = my_room {
                         send_catch_up(st, rid, id, chunk, false);
                     }
+                }
+            }
+            return None;
+        }
+        Request::NearbyClose { chunk, data } => {
+            // (v285) Position rapprochée d'un joueur de construction : aux `POS_CLOSE_TO`
+            // voisins les plus proches seulement, sans attendre le regroupement de 20 ms.
+            // Elle compte dans la même limite que les autres (`pos_due`) ; rien d'autre
+            // n'en dépend (ni la place gardée du joueur, ni les modifications en retard).
+            let (_, pose) = game::pose_of(&data)?;
+            let room = my_room.and_then(|r| st.rooms.get_mut(&r))?;
+            if room.kind != 1 || !room.build.pos_due(id) {
+                return None;
+            }
+            let pose = Arc::new(transport::PoseOf {
+                id,
+                name: pseudo.to_string(),
+                pose,
+                close: true,
+            });
+            for m in room.build.closest(id, chunk, |_| true) {
+                if let Some(c) = st.conns.get(&m) {
+                    transport::push_pose(&c.tx, &pose);
                 }
             }
             return None;
@@ -8793,6 +8817,7 @@ pub(crate) fn handle_prepared(
             | Request::Position { .. }
             | Request::ToZone { .. }
             | Request::Nearby { .. }
+            | Request::NearbyClose { .. }
             | Request::ShardReady { .. }
             | Request::Archive { .. }
             | Request::Ack { .. }

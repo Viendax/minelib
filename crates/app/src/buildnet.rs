@@ -86,11 +86,19 @@ const SPOT_EVERY: f32 = 10.0;
 /// `POS_CLOSE` voisins rien ne change (le relais regroupe les positions par 20 ms : en
 /// envoyer plus de 60 n'arriverait pas), et seul non plus (personne ne les reçoit).
 ///
-/// `hosted` : la position part au relais d'une région ou d'une province, hébergé par un
-/// joueur. Rien ne change là non plus : on ne le joint que par les serveurs relais publics
-/// d'iroh, qui limitent le débit, et c'est ce qui casserait en premier.
-fn pos_every(others: usize, hosted: bool) -> f32 {
-    if !hosted && (1..=POS_CLOSE).contains(&others) {
+/// `slow` : la position part au relais d'une région ou d'une province hébergé par un
+/// joueur, et ce relais n'est joint que par les serveurs relais publics d'iroh (hôte
+/// anonyme, ou box qui ne laisse pas passer le direct). Rien ne change là non plus : ces
+/// serveurs limitent le débit, et c'est ce qui casserait en premier. (v285 : un hôte
+/// joint en direct, `hote_direct=true` chez lui, reçoit les positions comme le relais du
+/// monde.)
+///
+/// (v285) Dans une foule (plus de `POS_CLOSE` voisins), des positions rapprochées partent
+/// entre deux de celles-ci (`Request::NearbyClose`, 256 par seconde en tout) : le relais
+/// ne les remet qu'aux 3 voisins les plus proches. Chacun reçoit alors au plus
+/// `POS_BUDGET` positions comme avant, plus 768 de ses 3 voisins proches.
+fn pos_every(others: usize, slow: bool) -> f32 {
+    if !slow && (1..=POS_CLOSE).contains(&others) {
         return POS_FASTEST;
     }
     let hz = (POS_BUDGET / others.max(1) as f32).clamp(1.0 / POS_EVERY, 1.0 / POS_CROWD);
@@ -273,6 +281,11 @@ pub struct BuildNet {
     pub others: HashMap<String, Other>,
     chunk: Option<[i32; 2]>,
     pos_timer: f32,
+    /// (v285) Prochaine position rapprochée (foule), et si le lien vers le relais qui
+    /// reçoit nos positions est lent (hôte joint par les serveurs relais d'iroh), revu
+    /// une fois par seconde.
+    close_timer: f32,
+    slow_link: (f32, bool),
     /// Rang (ordre du relais du monde) de la dernière modification appliquée à chaque
     /// case, et relais de région qui l'a remise (son numéro de connexion ; aucun : le
     /// relais du monde). Une modification plus ancienne arrivée après (doublon, autre
@@ -548,6 +561,8 @@ impl BuildNet {
             others: HashMap::new(),
             chunk: None,
             pos_timer: 0.0,
+            close_timer: 0.0,
+            slow_link: (0.0, false),
             seen: HashMap::new(),
             names: HashMap::new(),
             served_sent: Vec::new(),
@@ -1302,6 +1317,7 @@ impl BuildNet {
                     | Request::Served { .. }
                     | Request::Spot { .. }
                     | Request::Nearby { .. }
+                    | Request::NearbyClose { .. }
                     | Request::VoiceTo { .. }
             ) {
                 let mut q = self.doze_queue.borrow_mut();
@@ -1968,12 +1984,32 @@ impl BuildNet {
         self.from_shard = None;
         self.pos_timer -= dt;
         self.spot_timer -= dt;
-        if self.pos_timer <= 0.0 && !self.hidden {
+        self.close_timer -= dt;
+        // (v285) Le relais qui reçoit nos positions est-il joint par les serveurs relais
+        // d'iroh ? (Le relais du monde ne compte pas : rien ne change pour lui.)
+        self.slow_link.0 -= dt;
+        if self.slow_link.0 <= 0.0 {
+            let node = match self.shards.conns.get(&proto::region_of(chunk)) {
+                Some(c) if c.link.is_some() => Some(c.info.node),
+                _ => self
+                    .best(proto::region_of(chunk))
+                    .and_then(|i| self.provinces.get(&pkey(i)))
+                    .filter(|c| c.joined && c.link.is_some())
+                    .map(|c| c.info.node),
+            };
+            let slow = node.is_some_and(|n| minelib_p2p::node_direct(n) == Some(false));
+            self.slow_link = (1.0, slow);
+        }
+        // (v285) Jamais plus d'une position par 1/256 s, de l'une ou l'autre sorte
+        // (`close_timer`) : le relais n'en accepte pas davantage.
+        let mut sent = false;
+        if self.pos_timer <= 0.0 && self.close_timer <= 0.0 && !self.hidden {
             // (v275) Le retard pris est reporté sur l'envoi suivant : à 300 images par
             // seconde il en part bien 256, et non une image sur deux (150).
-            let hosted = self.shards.link(proto::region_of(chunk)).is_some()
-                || self.province_link(chunk).is_some();
-            self.pos_timer = (self.pos_timer + pos_every(self.others.len(), hosted)).max(0.0);
+            let slow = self.slow_link.1;
+            self.pos_timer = (self.pos_timer + pos_every(self.others.len(), slow)).max(0.0);
+            self.close_timer = (self.close_timer + POS_FASTEST).max(0.0);
+            sent = true;
             let msg = BuildMsg::Player {
                 pseudo: self.pseudo.clone(),
                 pos: feet.to_array(),
@@ -2008,6 +2044,33 @@ impl BuildNet {
                     None => self.send(spot),
                 }
             }
+        }
+        // (v285) Foule : entre deux positions pour tous, une position rapprochée par image
+        // (256 par seconde au plus), que le relais ne remet qu'aux voisins les plus proches.
+        if !sent
+            && self.close_timer <= 0.0
+            && !self.hidden
+            && !self.slow_link.1
+            && self.others.len() > POS_CLOSE
+        {
+            self.close_timer = (self.close_timer + POS_FASTEST).max(0.0);
+            let msg = BuildMsg::Player {
+                pseudo: self.pseudo.clone(),
+                pos: feet.to_array(),
+                yaw: look.0,
+                pitch: look.1,
+                crouch,
+                speed,
+                ping: self.ping,
+                held: minelib_net::poses::Held::pack(self.held, self.back),
+            };
+            self.send_at(
+                chunk,
+                Request::NearbyClose {
+                    chunk,
+                    data: game::encode(&msg),
+                },
+            );
         }
         for o in self.others.values_mut() {
             o.seen += dt;
@@ -6925,6 +6988,86 @@ mod tests {
         // Avant, 100 au plus en 2 s.
         assert!(frames > 150, "{frames} images : machine trop chargée pour juger");
         assert!(got * 2 >= frames.min(512), "{got} positions pour {frames} images");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v285) Six joueurs au même endroit, par un vrai relais : chacun voit arriver à
+    /// chaque image les positions de ses 3 voisins les plus proches (256 par seconde quand
+    /// la machine suit), et celles des 2 autres au rythme d'avant (60 par seconde).
+    #[test]
+    fn in_a_crowd_the_three_closest_are_seen_at_every_frame() {
+        let dir = std::env::temp_dir().join(format!("minelib-foule-{}", rand_u32()));
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let mut bots = vec![Bot::new(&addr, h.public, "Proprio", false)];
+        bots[0].c.send(Cmd::Host {
+            kind: 1,
+            name: "Essai".into(),
+            map: "essai".into(),
+            map_sig: [7; 32],
+            max_players: 0,
+        });
+        let mut room = None;
+        let t = Instant::now();
+        while room.is_none() {
+            while let Some(e) = bots[0].c.poll() {
+                match e {
+                    Event::Hosted(r) => room = Some(r),
+                    Event::Link(l) => bots[0].link = Some(l),
+                    _ => {}
+                }
+            }
+            assert!(t.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        bots[0].start_net(true);
+        for i in 1..6 {
+            let mut b = Bot::new(&addr, h.public, &format!("Joueur{i}"), false);
+            b.c.send(Cmd::Join(room.unwrap()));
+            b.wait(|e| matches!(e, Event::Joined { .. }));
+            b.start_net(false);
+            bots.push(b);
+        }
+        // Une image toutes les 2 à 4 ms pendant 4 s ; compté sur les 2 dernières : pour
+        // le premier joueur, les images où une position de chacun des autres vient
+        // d'arriver.
+        let mut frames = 0u32;
+        let mut got: HashMap<String, u32> = HashMap::new();
+        let (t, mut last) = (Instant::now(), Instant::now());
+        while t.elapsed() < Duration::from_secs(4) {
+            let dt = last.elapsed().as_secs_f32();
+            last = Instant::now();
+            for (i, b) in bots.iter_mut().enumerate() {
+                b.pos.x += (i as f32 - 2.5) * 0.2 * dt;
+                b.tick(dt);
+            }
+            if t.elapsed() > Duration::from_secs(2) {
+                frames += 1;
+                for (name, o) in &bots[0].net.as_ref().unwrap().others {
+                    *got.entry(name.clone()).or_default() += u32::from(o.seen <= dt);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut counts: Vec<u32> = got.values().copied().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        eprintln!("FOULE {frames} images en 2 s ; positions reçues de chacun : {counts:?}");
+        assert_eq!(counts.len(), 5, "les 5 autres sont vus");
+        assert!(frames > 150, "{frames} images : machine trop chargée pour juger");
+        // Les 3 plus proches : au moins la moitié de ce qui pouvait arriver (une par image,
+        // 256 par seconde au plus). Les 2 autres : 60 par seconde, soit 120 (un peu plus
+        // quand la machine hoquette) ; jugé seulement quand il y a assez d'images pour
+        // les distinguer.
+        assert!(counts[2] * 2 >= frames.min(512), "{counts:?} pour {frames} images");
+        if frames >= 400 {
+            assert!(counts[3] <= 170, "{counts:?} : les autres au rythme d'avant");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

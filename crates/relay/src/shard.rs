@@ -1063,6 +1063,7 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
                 id: from,
                 name,
                 pose,
+                close: false,
             });
             let relays = st.peers.len() + 1;
             for m in st.build.nearby(from, chunk, relays) {
@@ -1174,6 +1175,29 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             }
             None
         }
+        Request::NearbyClose { chunk, data } => {
+            // (v285) Position rapprochée : aux voisins les plus proches que sert ce relais,
+            // sans attendre le regroupement ; pas redite aux autres relais de la région.
+            let data = crate::player_as(&data, logged.as_deref().unwrap_or_default())?;
+            if !st.build.pos_due(id) {
+                return None;
+            }
+            let (name, pose) = game::pose_of(&data)?;
+            let pose = Arc::new(transport::PoseOf {
+                id,
+                name,
+                pose,
+                close: true,
+            });
+            let s = &mut *st;
+            let conns = &s.conns;
+            for m in s.build.closest(id, chunk, |m| conns.contains_key(&m)) {
+                if let Some(c) = conns.get(&m) {
+                    transport::push_pose(&c.tx, &pose);
+                }
+            }
+            None
+        }
         Request::Nearby { chunk, data } => {
             // Le pseudo montré est celui du billet (pas celui que le joueur annonce).
             let data = crate::player_as(&data, logged.as_deref().unwrap_or_default())?;
@@ -1186,7 +1210,12 @@ fn handle(req: Request, state: &Mutex<State>, id: u64) -> Option<Response> {
             // voisins.
             let relays = st.peers.len() + 1;
             let (name, pose) = game::pose_of(&data)?;
-            let pose = Arc::new(transport::PoseOf { id, name, pose });
+            let pose = Arc::new(transport::PoseOf {
+                id,
+                name,
+                pose,
+                close: false,
+            });
             // (v275) Jusqu'à 256 par seconde quand elle part à peu de joueurs ; 66 comme
             // avant sinon, et toujours quand la région a plusieurs relais (une foule :
             // chaque position est aussi redite à chacun d'eux).

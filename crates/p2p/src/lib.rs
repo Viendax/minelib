@@ -224,6 +224,33 @@ pub fn set_hosts_direct(on: bool) {
     HOSTS_DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// (v285) Connexions iroh ouvertes par les tunnels de ce jeu, par nœud distant.
+static TUNNELS: std::sync::Mutex<Vec<([u8; 32], iroh::endpoint::Connection)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn remember_tunnel(remote: [u8; 32], conn: &iroh::endpoint::Connection) {
+    let mut t = TUNNELS.lock().unwrap();
+    t.retain(|(_, c)| c.close_reason().is_none());
+    t.push((remote, conn.clone()));
+}
+
+/// (v285) Ce jeu joint-il le nœud `remote` en direct ? `None` s'il n'y a pas de tunnel
+/// vers lui (réseau local, même machine) ; `Some(false)` tant que tout passe par un
+/// serveur relais d'iroh (hôte anonyme, ou box qui ne laisse pas faire) : ces serveurs
+/// limitent le débit, le jeu n'y envoie pas ses positions 256 fois par seconde.
+pub fn node_direct(remote: [u8; 32]) -> Option<bool> {
+    let t = TUNNELS.lock().unwrap();
+    let mut any = None;
+    for (_, c) in t.iter().filter(|(n, c)| *n == remote && c.close_reason().is_none()) {
+        let direct = c
+            .paths()
+            .iter()
+            .any(|p| matches!(p.remote_addr(), iroh::TransportAddr::Ip(_)));
+        any = Some(any.unwrap_or(false) || direct);
+    }
+    any
+}
+
 /// Nœud iroh de ce jeu (un par processus).
 pub struct Node {
     rt: tokio::runtime::Runtime,
@@ -310,6 +337,7 @@ impl Node {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             anyhow::Ok((conn, listener))
         })?;
+        remember_tunnel(remote, &conn);
         let local = listener.local_addr()?;
         self.rt.spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
@@ -362,10 +390,10 @@ impl Node {
     /// connecter en TCP comme à un relais ordinaire.
     pub fn tunnel(&self, remote: [u8; 32]) -> Result<SocketAddr> {
         let id = iroh::EndpointId::from_bytes(&remote).map_err(|e| anyhow!("{e}"))?;
-        self.tunnel_to(id.into())
+        self.tunnel_to(id.into(), remote)
     }
 
-    fn tunnel_to(&self, id: iroh::EndpointAddr) -> Result<SocketAddr> {
+    fn tunnel_to(&self, id: iroh::EndpointAddr, remote: [u8; 32]) -> Result<SocketAddr> {
         let listener = self
             .rt
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
@@ -384,6 +412,7 @@ impl Node {
                         return;
                     }
                 };
+            remember_tunnel(remote, &conn);
             while let Ok((tcp, _)) = listener.accept().await {
                 let Ok((send, recv)) = conn.open_bi().await else {
                     break;
@@ -473,7 +502,7 @@ mod tests {
         let a = Node::start().unwrap();
         a.serve(local);
         let b = Node::start().unwrap();
-        let t = b.tunnel_to(a.ep.addr()).unwrap();
+        let t = b.tunnel_to(a.ep.addr(), a.id()).unwrap();
         let mut c = std::net::TcpStream::connect(t).unwrap();
         c.write_all(b"salut").unwrap();
         let mut back = [0u8; 5];

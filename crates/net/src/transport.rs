@@ -63,6 +63,9 @@ pub struct PoseOf {
     pub id: u64,
     pub name: String,
     pub pose: crate::poses::Pose,
+    /// (v285) Position rapprochée (`Request::NearbyClose`) : elle part au plus tard
+    /// `FAST_LINGER` après le dernier paquet, même dans une foule.
+    pub close: bool,
 }
 
 /// Ce qui arrive sur un canal : message chiffré reçu du réseau, message (en clair) déposé
@@ -203,6 +206,10 @@ impl Grouper {
     pub fn add_pose(&mut self, p: std::sync::Arc<PoseOf>, at: Instant) -> bool {
         if !self.waiting() {
             self.cells_due = (self.cells_sent + self.linger).max(Instant::now());
+        }
+        if p.close {
+            let soon = (self.cells_sent + FAST_LINGER).max(Instant::now());
+            self.cells_due = self.cells_due.min(soon);
         }
         self.count(p.id);
         self.poses.insert(p.id, (p, at));
@@ -664,6 +671,7 @@ mod tests {
                         let pose = std::sync::Arc::new(PoseOf {
                             id,
                             name: format!("Joueur{id}"),
+                            close: false,
                             pose: Pose {
                                 pos: [id as f32, 64.0, step as f32],
                                 yaw: 1.0,
@@ -742,6 +750,7 @@ mod tests {
                         let pose = std::sync::Arc::new(PoseOf {
                             id,
                             name: format!("Joueur{id}"),
+                            close: false,
                             pose: Pose {
                                 pos: [id as f32, 64.0, step as f32],
                                 yaw: 1.0,

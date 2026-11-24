@@ -300,6 +300,8 @@ const POS_BURST: f32 = 32.0;
 pub const POS_WIDE_HZ: f32 = 66.0;
 const POS_WIDE_BURST: f32 = 8.0;
 pub const POS_FEW: usize = 4;
+/// (v285) Voisins qui reçoivent les positions rapprochées d'un joueur (`closest`).
+pub const POS_CLOSE_TO: usize = 3;
 
 /// Une modification du monde est poussée tout de suite à ce nombre de joueurs au plus ;
 /// au-delà (foule), chacun la reçoit avec sa prochaine position, compactée. Le travail par
@@ -641,6 +643,45 @@ impl Build {
                         );
                     }
                     if out.len() >= limit {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// (v285) Les `POS_CLOSE_TO` voisins les plus proches du joueur `id`, parmi ceux que
+    /// `local` retient (ceux que ce relais sert) : d'abord ceux qui le suivent dans son
+    /// chunk, puis les chunks autour (2 au plus). Comme pour `nearby`, ce sont toujours les
+    /// mêmes, et chacun est le voisin proche d'autant de joueurs : dans une foule, personne
+    /// ne reçoit les positions rapprochées de plus de `POS_CLOSE_TO` joueurs par chunk.
+    pub fn closest(&mut self, id: u64, chunk: [i32; 2], local: impl Fn(u64) -> bool) -> Vec<u64> {
+        self.reindex();
+        let mut out = Vec::new();
+        for d in 0..=2i32 {
+            for dx in -d..=d {
+                for dz in -d..=d {
+                    if dx.abs().max(dz.abs()) != d {
+                        continue;
+                    }
+                    let Some(members) = self.by_chunk.get(&[chunk[0] + dx, chunk[1] + dz]) else {
+                        continue;
+                    };
+                    if members.is_empty() {
+                        continue;
+                    }
+                    let start = members
+                        .iter()
+                        .position(|&m| m == id)
+                        .map_or(id as usize % members.len(), |i| i + 1);
+                    out.extend(
+                        (0..members.len())
+                            .map(|k| members[(start + k) % members.len()])
+                            .filter(|&m| m != id && local(m))
+                            .take(POS_CLOSE_TO - out.len()),
+                    );
+                    if out.len() >= POS_CLOSE_TO {
                         return out;
                     }
                 }
@@ -1677,6 +1718,38 @@ mod tests {
         assert!((60.0..=70.0).contains(&crowd), "{crowd}");
         let crowd = passed(2048, 256);
         assert!((60.0..=70.0).contains(&crowd), "{crowd}");
+    }
+
+    /// (v285) Positions rapprochées : dans une foule, chacun a 3 voisins proches, toujours
+    /// les mêmes, et est le voisin proche de 3 joueurs ; seul dans son chunk, ce sont ceux
+    /// des chunks voisins ; et jamais un joueur que ce relais ne sert pas.
+    #[test]
+    fn close_positions_go_to_three_neighbours_each() {
+        let mut b = Build::default();
+        for id in 1..=40u64 {
+            b.positions.insert(id, [0, 0]);
+        }
+        b.positions.insert(100, [1, 0]);
+        let mut got: HashMap<u64, u32> = HashMap::new();
+        for id in 1..=40u64 {
+            let near = b.closest(id, [0, 0], |_| true);
+            assert_eq!(near.len(), POS_CLOSE_TO);
+            assert_eq!(near, b.closest(id, [0, 0], |_| true), "toujours les mêmes");
+            assert!(!near.contains(&id) && !near.contains(&100));
+            for m in near {
+                *got.entry(m).or_default() += 1;
+            }
+        }
+        assert!((1..=40u64).all(|id| got.get(&id) == Some(&(POS_CLOSE_TO as u32))), "{got:?}");
+        // Seul dans son chunk : ses voisins sont dans le chunk d'à côté.
+        assert_eq!(b.closest(100, [1, 0], |_| true).len(), POS_CLOSE_TO);
+        // Trop loin de tous (plus de 2 chunks) : personne.
+        b.positions.insert(200, [9, 9]);
+        assert!(b.closest(200, [9, 9], |_| true).is_empty());
+        // Ceux que ce relais ne sert pas sont passés.
+        let near = b.closest(1, [0, 0], |m| m % 2 == 0);
+        assert_eq!(near.len(), POS_CLOSE_TO);
+        assert!(near.iter().all(|m| m % 2 == 0));
     }
 
     #[test]

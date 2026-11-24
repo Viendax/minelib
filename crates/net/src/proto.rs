@@ -54,7 +54,8 @@ use serde::{Deserialize, Serialize};
 /// (v283) 72 : les tapis ont une hitbox (un seizième de bloc) et s'empilent (nouveaux blocs, en
 /// fin de registre), on s'enfonce d'une couche dans la neige fine : la simulation des joueurs
 /// d'une partie FPS (et les blocs d'un serveur) doivent être les mêmes chez tous.
-pub const PROTOCOL: u32 = 72;
+/// (v285) 73 : positions rapprochées (`Request::NearbyClose`).
+pub const PROTOCOL: u32 = 73;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -903,6 +904,14 @@ pub enum Request {
         peer: u64,
         via: u8,
     },
+    /// (v285) Construction, dans une foule : une position de plus, pour les seuls voisins
+    /// les plus proches (3 : `POS_CLOSE_TO` côté relais). Avec elles, ces voisins voient le
+    /// joueur 256 fois par seconde ; les autres continuent de recevoir les `Nearby`, au
+    /// rythme d'avant.
+    NearbyClose {
+        chunk: [i32; 2],
+        data: Vec<u8>,
+    },
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -1010,6 +1019,7 @@ impl Request {
                 | Request::PasseurOff
                 | Request::FastWant { .. }
                 | Request::FastBad { .. }
+                | Request::NearbyClose { .. }
                 | Request::BulkEdit { .. }
                 | Request::Served { .. }
                 | Request::CheatFound { .. }
