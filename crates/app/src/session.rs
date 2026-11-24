@@ -39,6 +39,16 @@ fn npc_cry_gain(d: f32) -> Option<f32> {
     (k > 0.0).then_some(0.55 * k * k)
 }
 
+/// (v249) Durée de l'éblouissement par la foudre qu'on prend (s) : l'écran reste blanc
+/// pendant le premier sixième (les arcs en retour), puis la vue revient peu à peu. Une
+/// seconde en tout (« celui qui porte l'éclair peut en jeter dix d'affilée quand même »).
+const DAZZLE_S: f32 = 1.0;
+
+/// (v249) Part de blanc à l'écran pour un éblouissement `d` (1 au coup de foudre … 0).
+fn dazzle_alpha(d: f32) -> f32 {
+    (d.clamp(0.0, 1.0) / 0.84).min(1.0).powf(1.7)
+}
+
 /// (v227) PNJ visé : dans notre foule d'essai, ou dans celle que mène un autre OP (son pseudo).
 #[derive(Clone, Debug)]
 enum NpcTarget {
@@ -179,6 +189,7 @@ pub struct Session {
     /// Essais : temps avant la prochaine fumigène de MINELIB_SMOKE.
     test_smoke_timer: f32,
     test_fire_timer: f32,
+    test_traces_timer: f32,
     /// Objets au sol encore en vol (lancés en cloche) : temps depuis leur apparition.
     ground_fly: std::collections::HashMap<u32, f32>,
     ground_seen: std::collections::HashSet<u32>,
@@ -412,6 +423,8 @@ pub struct Session {
     since_space: f32,
     /// Voile rouge après une blessure (s).
     hurt: f32,
+    /// (v249) Ébloui par la foudre qu'on vient de prendre (1 : l'écran est blanc … 0).
+    dazzle: f32,
     /// Pings (mode FPS) : point visé et âge en secondes.
     pings: Vec<(Vec3, f32)>,
     /// Mode FPS : marcher / s'accroupir actifs (maintenus ou basculés).
@@ -664,6 +677,7 @@ impl Session {
         Ok(Self {
             test_smoke_timer: 0.0,
             test_fire_timer: 0.0,
+            test_traces_timer: 0.0,
             stride: 0.0,
             fall_top: None,
             step_offset: 0.0,
@@ -795,6 +809,7 @@ impl Session {
             fall_from: None,
             since_space: 1.0,
             hurt: 0.0,
+            dazzle: 0.0,
             fps: crate::fps::Fps::new(),
             pings: Vec::new(),
             fps_walk_on: false,
@@ -1156,6 +1171,7 @@ impl Session {
             }
             let editing = self.light_editor.open;
             self.hurt = (self.hurt - dt).max(0.0);
+            self.dazzle = (self.dazzle - dt / DAZZLE_S).max(0.0);
             for p in &mut self.pings {
                 p.1 += dt;
             }
@@ -1777,7 +1793,7 @@ impl Session {
                     }
                     self.bomb_flash = (self.bomb_flash - dt).max(0.0);
                     if hud.bomb == bomb::EXPLODED && self.bomb_last.0 == bomb::PLANTED {
-                        self.fps.bomb_blast(at, eye);
+                        self.fps.bomb_blast(at, eye, &self.world);
                     }
                     self.bomb_last = (
                         hud.bomb,
@@ -4534,6 +4550,11 @@ impl Session {
             },
         );
         if hurt > 0 {
+            // (v249) « On n'est pas assez ébloui quand on prend un éclair, comme dans sa
+            // première version » : la foudre qui nous touche nous éblouit (dans tous les
+            // modes de jeu), comme la première version blanchissait l'image. Celle qui tombe
+            // à côté garde son réglage (on voit l'éclair).
+            self.dazzle = 1.0;
             self.damage(hurt);
         }
         // (v238) La foudre blesse aussi les PNJ de notre foule, comme un joueur (et les fait
@@ -4930,7 +4951,9 @@ impl Session {
                             } else if !own
                                 && (to - (self.player.pos + Vec3::Y * 0.9)).length() < 1.0
                             {
-                                // Celui d'un autre nous touche (à mi-corps).
+                                // Celui d'un autre nous touche (à mi-corps). (v249) Il
+                                // éblouit, moins que la foudre du ciel.
+                                self.dazzle = self.dazzle.max(0.6);
                                 self.damage(crate::zeus::ARC_DAMAGE);
                             }
                         }
@@ -6799,6 +6822,7 @@ impl Session {
                     pos,
                     heard,
                     hits,
+                    dirs,
                 } => {
                     let eye = self.player.eye();
                     // (v209) Spectateur : le tir du joueur regardé se voit dans ses mains.
@@ -6807,10 +6831,12 @@ impl Session {
                     }
                     if heard {
                         self.fps.heard_shot(weapon, pos, eye);
+                        // (v249) Ses impacts sur les blocs (les nôtres sont posés au tir).
+                        self.fps.shot_seen(&self.world, weapon, pos, &dirs);
                     }
                     let knife = weapon >= crate::netgame::KNIFE_HEAVY;
                     for h in hits {
-                        self.fps.blood_at(h, knife, eye);
+                        self.fps.blood_at(h, pos, knife, eye, &self.world);
                     }
                 }
                 Local::Step(pos, kind) => {
@@ -7092,9 +7118,23 @@ impl Session {
                 self.fps.spawn_test_fire(p, &self.world);
             }
         }
+        // (v249) De même MINELIB_SANG=<distance> : du sang, des impacts et de la suie devant
+        // soi (voir `Fps::spawn_test_traces`), 3 s après le départ, une fois.
+        if let Some(d) = std::env::var("MINELIB_SANG")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+        {
+            if self.test_traces_timer < 3.0 {
+                self.test_traces_timer += dt;
+                if self.test_traces_timer >= 3.0 {
+                    let dir = self.player.look_dir();
+                    self.fps.spawn_test_traces(&self.world, eye, dir, d);
+                }
+            }
+        }
         self.fps
             .update(dt, &c, &self.world, eye, self.player.yaw, self.player.pitch);
-        self.fps.tick_effects(dt);
+        self.fps.tick_effects(dt, &self.world);
         // Ses propres pas : en courant (les autres les entendent aussi, voir l'hôte), plus
         // doux en marchant ou accroupi (eux ne les entendent pas).
         let speed = Vec3::new(self.player.vel.x, 0.0, self.player.vel.z).length();
@@ -9566,6 +9606,11 @@ impl Session {
                     [1.0, 1.0, 1.0, 0.9],
                 );
             }
+            // (v249) Ébloui par la foudre : l'écran blanc (un peu bleuté), puis la vue revient.
+            if self.dazzle > 0.0 {
+                let a = dazzle_alpha(self.dazzle);
+                ui.rect(0.0, 0.0, size.0, size.1, [0.93, 0.96, 1.0, a]);
+            }
             // Mode FPS : vie sur 100, munitions, solde, menu d'achat (pas sous l'éditeur de
             // lumières, en FPS solo : son panneau prend la place).
             if self.game.mode == GameMode::Fps {
@@ -10467,6 +10512,7 @@ impl Session {
             hand_bolts: &self.storm.hand_bolts,
             rain: self.storm.rain(self.daylight_shown.min(1.0)),
             flames: &flames,
+            decals: self.fps.decals(),
             ui: Some(ui),
             overlay: show_debug.then_some(&self.overlay),
             mirror_self,

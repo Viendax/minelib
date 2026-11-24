@@ -12,6 +12,7 @@ mod arena;
 pub mod atmosphere;
 mod bolts;
 mod capture;
+mod decals;
 mod entity;
 mod flames;
 mod gpu_timer;
@@ -45,6 +46,10 @@ pub use bolts::{BoltSeg, BOLT, BOLT_CLOUD_GLOW, BOLT_LIGHT, BOLT_TINT};
 pub use entity::draw_offscreen;
 pub use entity::{
     EntityVertex, PlayerInstance, PlayerVertex, FLAME as ENTITY_FLAME, MAX_PLAYERS, PLAYER_SKINS,
+};
+pub use decals::{
+    Decal, KIND_BURN, KIND_DRIP, KIND_HOLE, KIND_SCORCH, KIND_SLASH, KIND_SPLAT, KIND_SPRAY,
+    MAX_DECALS,
 };
 pub use flames::Flame;
 pub use latency::{LowLatencyKind, Marker};
@@ -636,6 +641,10 @@ pub struct FrameParams<'a> {
     pub rain: Rain<'a>,
     /// (v216) Flammes du molotov.
     pub flames: &'a [Flame],
+    /// (v249) Traces sur les blocs en mode FPS (sang, impacts, suie), gardées jusqu'à la fin
+    /// de la manche : la liste, son numéro de révision (elle n'est renvoyée à la carte que
+    /// s'il a changé) et l'horloge de leurs heures de naissance.
+    pub decals: (&'a [Decal], u64, f32),
     /// Interface (inventaire, barre d'objets…) dessinée par-dessus tout.
     pub ui: Option<&'a Ui>,
     /// Main et objet tenu (triangles déjà projetés).
@@ -886,6 +895,7 @@ pub struct Renderer {
     /// l'anticrénelage.
     scene_depth: bolts::SceneDepth,
     flames: flames::Flames,
+    decals: decals::Decals,
     voxels: rt::Voxels,
     /// Lumières dynamiques (éditeur de lumières) : ombres, volumétrique, gobos.
     dyn_gpu: lights::DynGpu,
@@ -1406,6 +1416,7 @@ impl Renderer {
         let scene_depth = bolts::SceneDepth::new(&device);
         let bolts = bolts::Bolts::new(&device, &bgl, &scene_depth.layout, config.format);
         let rain = rain::RainRenderer::new(&device, &bgl, &scene_depth.layout, config.format);
+        let decals = decals::Decals::new(&device, &bgl, &scene_depth.layout, config.format);
         let flames = flames::Flames::new(
             &device,
             &bgl,
@@ -1475,6 +1486,7 @@ impl Renderer {
             rain,
             scene_depth,
             flames,
+            decals,
             voxels,
             dyn_gpu,
             lit: None,
@@ -3361,6 +3373,8 @@ impl Renderer {
         self.rain
             .prepare(&self.queue, &p.rain, [fog[0], fog[1], fog[2]]);
         self.flames.prepare(&self.queue, p.flames, p.eye);
+        self.decals
+            .prepare(&self.queue, p.decals.0, p.decals.1, p.decals.2);
         let mut stats = self.cull(view_proj, p.eye, p.fog_end);
         // (v217) Carte d'ombre du soleil des joueurs (lue aussi dans les miroirs).
         let sun_map = self.prepare_sun_map(p, &mut globals);
@@ -3410,6 +3424,8 @@ impl Renderer {
                 },
                 &mut stats,
             );
+            // (v249) Les traces sur les blocs, avant ce qui flotte devant elles.
+            self.decals.draw(&mut pass, self.world_group(), None);
             self.smokes.draw(&mut pass, self.world_group(), false);
             self.flames.draw(&mut pass, self.world_group(), None);
             self.rain.draw(&mut pass, self.world_group(), None);
@@ -3595,6 +3611,8 @@ impl Renderer {
         self.rain
             .prepare(&self.queue, &p.rain, [fog[0], fog[1], fog[2]]);
         self.flames.prepare(&self.queue, p.flames, p.eye);
+        self.decals
+            .prepare(&self.queue, p.decals.0, p.decals.1, p.decals.2);
         let mut stats = {
             let _c = perf::scope("rendu : tri des chunks");
             self.cull(view_proj, p.eye, p.fog_end)
@@ -3921,7 +3939,8 @@ impl Renderer {
         }
         // (v216) Pluie et éclairs : après l'anticrénelage, sur l'image finale (nets dès la
         // première image, sans traînée) ; la profondeur du monde dit ce qui les cache.
-        let after = self.rain.any() || self.bolts.any() || self.flames.any();
+        let after =
+            self.rain.any() || self.bolts.any() || self.flames.any() || self.decals.any();
         self.scene_depth.prepare(
             &self.device,
             taa.targets
@@ -3958,6 +3977,9 @@ impl Renderer {
             });
             taa.present(&mut pass);
             if let Some(depth) = self.scene_depth.group() {
+                // (v249) Les traces sur les blocs d'abord : le feu, la pluie et les éclairs
+                // passent devant.
+                self.decals.draw(&mut pass, self.world_group(), Some(depth));
                 self.flames.draw(&mut pass, self.world_group(), Some(depth));
                 self.rain.draw(&mut pass, self.world_group(), Some(depth));
                 self.bolts.draw_post(&mut pass, self.world_group(), depth);
@@ -4711,7 +4733,7 @@ mod tests {
         use wgpu::naga;
         // Nom, source, constantes fixées.
         type Variant = (&'static str, String, &'static [(&'static str, f64)]);
-        let cases: [Variant; 12] = [
+        let cases: [Variant; 13] = [
             (
                 "éclairage différé",
                 lights::with_dynlights(include_str!("shaders/dyn_deferred.wgsl")),
@@ -4763,6 +4785,11 @@ mod tests {
             (
                 "flammes",
                 include_str!("shaders/flame.wgsl").to_string(),
+                &[],
+            ),
+            (
+                "traces",
+                include_str!("shaders/decal.wgsl").to_string(),
                 &[],
             ),
             ("fumée", include_str!("shaders/smoke.wgsl").to_string(), &[]),
@@ -4862,6 +4889,7 @@ mod tests {
             ("éclairs", bolts::source()),
             ("pluie", include_str!("shaders/rain.wgsl").to_string()),
             ("flammes", include_str!("shaders/flame.wgsl").to_string()),
+            ("traces", include_str!("shaders/decal.wgsl").to_string()),
         ] {
             let src = src.as_str();
             let module = naga::front::wgsl::parse_str(src)

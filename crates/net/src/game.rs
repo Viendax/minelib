@@ -909,12 +909,14 @@ pub enum ToPeer {
         teams: [u8; 2],
     },
     /// Un joueur tire depuis `pos` (les autres l'entendent) ; `hits` : points où il
-    /// touche un joueur (sang).
+    /// touche un joueur (sang). (v249) `dirs` : la direction de chaque balle (chacun en tire
+    /// les impacts sur les blocs, gardés jusqu'à la fin de la manche).
     Shot {
         who: u64,
         weapon: u8,
         pos: [f32; 3],
         hits: Vec<[f32; 3]>,
+        dirs: Vec<[f32; 3]>,
     },
     /// Bruit d'un joueur proche en `pos` : `STEP_RUN` (il court), `STEP_LAND` (il retombe
     /// d'au moins 1,3 bloc), `STEP_PAIN` (une chute le blesse : cri de douleur).

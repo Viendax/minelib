@@ -176,12 +176,14 @@ pub enum Local {
     /// Pause de la partie commencée / finie (hôte : le dire au relais).
     Paused(bool),
     /// Un joueur a tiré depuis `pos` (`heard` : un autre que soi, à faire entendre) et
-    /// touché des joueurs en `hits` (sang).
+    /// touché des joueurs en `hits` (sang). (v249) `dirs` : la direction de chaque balle
+    /// (les impacts sur les blocs).
     Shot {
         weapon: u8,
         pos: Vec3,
         heard: bool,
         hits: Vec<Vec3>,
+        dirs: Vec<Vec3>,
     },
     /// Bruit d'un joueur en `pos` : pas (`STEP_RUN`), réception d'une chute (`STEP_LAND`),
     /// cri de douleur après une chute (`STEP_PAIN`).
@@ -3669,6 +3671,7 @@ impl Host {
                     weapon,
                     pos: origin.to_array(),
                     hits: Vec::new(),
+                    dirs: Vec::new(),
                 });
                 // (v209) L'hôte l'entend aussi (contre des bots, c'est le seul joueur) : les
                 // mêmes bruits qu'en ligne.
@@ -3678,6 +3681,7 @@ impl Host {
                         pos: origin,
                         heard: who != 0,
                         hits: Vec::new(),
+                        dirs: Vec::new(),
                     }];
                 }
             }
@@ -4219,12 +4223,14 @@ impl Host {
             weapon,
             pos: origin.to_array(),
             hits: hits.iter().map(|p| p.to_array()).collect(),
+            dirs: dirs.iter().take(16).map(|d| d.to_array()).collect(),
         });
         out.push(Local::Shot {
             weapon,
             pos: origin,
             heard: shooter != 0,
             hits,
+            dirs: dirs.to_vec(),
         });
         for (victim, hits) in damage {
             let head = hits
@@ -4433,11 +4439,13 @@ impl Guest {
                 weapon,
                 pos,
                 hits,
+                dirs,
             } => out.push(Local::Shot {
                 weapon,
                 pos: Vec3::from(pos),
                 heard: self.you != Some(who),
                 hits: hits.into_iter().map(Vec3::from).collect(),
+                dirs: dirs.into_iter().take(16).map(Vec3::from).collect(),
             }),
             ToPeer::Step { who, pos, kind } => {
                 if self.you != Some(who) || kind == STEP_PAIN {

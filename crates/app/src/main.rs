@@ -118,6 +118,7 @@ mod spotting;
 mod stick;
 mod storm;
 mod streaming;
+mod traces;
 mod underwater;
 mod update;
 mod voice;

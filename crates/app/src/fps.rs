@@ -8,7 +8,8 @@
 //!   se retrouve à l'écran (la vue remonte) et dans la direction des balles ; il se remet à
 //!   zéro quand on arrête de tirer. Imprécision plus forte en courant et en l'air.
 //! - **Balles** : traçante lumineuse du canon jusqu'au point touché, étincelles à l'impact,
-//!   impact noir sur le bloc (les 64 derniers).
+//!   impact sur le bloc. (v249) Les impacts, le sang et les marques des grenades restent
+//!   jusqu'à la fin de la manche (`traces`).
 
 use glam::{Mat4, Vec3};
 use minelib_platform::Input;
@@ -26,7 +27,6 @@ pub const MAX_HP: u32 = 100;
 const RANGE: f32 = 250.0;
 const BULLET_SPEED: f32 = 300.0;
 const TRACER_LEN: f32 = 3.0;
-const MAX_HOLES: usize = 64;
 /// Champ de vision de la main et de l'arme (comme la main du mode bloc).
 const VIEW_FOV: f32 = 70.0;
 
@@ -241,10 +241,10 @@ pub struct Fps {
     /// Dernière arme achetée (racheter).
     last_bought: Option<usize>,
     tracers: Vec<Tracer>,
-    holes: Vec<(Vec3, Vec3)>,
     sparks: Vec<(Vec3, Vec3, f32)>,
-    /// Gouttes de sang (position, vitesse, âge) : un joueur touché.
-    blood: Vec<(Vec3, Vec3, f32)>,
+    /// (v249) Sang, impacts de balles, marques des grenades : gardés jusqu'à la fin de la
+    /// manche.
+    traces: crate::traces::Traces,
     /// (v209) Flashs éclatées pas encore lues par la minimap (`take_flashes`).
     flashes: Vec<Vec3>,
     flash: f32,
@@ -319,9 +319,8 @@ impl Fps {
             scoped: 0,
             last_bought: None,
             tracers: Vec::new(),
-            holes: Vec::new(),
             sparks: Vec::new(),
-            blood: Vec::new(),
+            traces: Default::default(),
             flashes: Vec::new(),
             flash: 0.0,
             kick: 0.0,
@@ -389,6 +388,44 @@ impl Fps {
         }
         if !clear {
             (self.thrown, self.effects) = world;
+        } else {
+            // (v249) « Fin du round : disparition » : le sang, les impacts de balles et les
+            // marques des grenades de la manche d'avant.
+            self.traces.clear();
+        }
+    }
+
+    /// (v249) Traces sur les blocs, pour le rendu (`FrameParams::decals`).
+    pub fn decals(&self) -> (&[minelib_render::Decal], u64, f32) {
+        self.traces.list()
+    }
+
+    /// (v249) Le tir d'un autre joueur (ou d'un bot), parti de `origin` : ses impacts sur
+    /// les blocs (les nôtres sont posés au moment du tir). Le même calcul que pour les
+    /// dégâts : la balle traverse jusqu'à deux blocs de mur. Un coup de couteau : son
+    /// entaille.
+    pub fn shot_seen(&mut self, world: &World, weapon: u8, origin: Vec3, dirs: &[Vec3]) {
+        let gun = (weapon as usize) < WEAPONS.len();
+        for &dir in dirs.iter().take(16) {
+            if !(dir.is_finite() && origin.is_finite()) || dir.length_squared() < 0.5 {
+                continue;
+            }
+            if gun {
+                for (at, n) in weapons::bullet_path(world, origin, dir, RANGE).impacts {
+                    self.traces.hole(at, n);
+                    for _ in 0..3 {
+                        let v = n * 2.0 + Vec3::new(self.random(), self.random(), self.random()) * 2.5;
+                        self.sparks.push((at + n * 0.02, v, 0.0));
+                    }
+                }
+            } else if let Some(h) = raycast(world, origin.into(), dir.into(), 2.0) {
+                let n = Vec3::new(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
+                self.traces.slash(origin + dir * h.distance, n);
+            }
+        }
+        if self.sparks.len() > 400 {
+            let extra = self.sparks.len() - 400;
+            self.sparks.drain(..extra);
         }
     }
 
@@ -1170,10 +1207,7 @@ impl Fps {
                 travelled: 0.0,
             });
             for (at, n) in path.impacts {
-                if self.holes.len() >= MAX_HOLES {
-                    self.holes.remove(0);
-                }
-                self.holes.push((at + n * 0.004, n));
+                self.traces.hole(at, n);
                 for _ in 0..5 {
                     let v = n * 2.0 + Vec3::new(self.random(), self.random(), self.random()) * 2.5;
                     self.sparks.push((at + n * 0.02, v, 0.0));
@@ -1185,7 +1219,9 @@ impl Fps {
 
     /// (v177) Explosion de la bombe en `pos` : une grosse boule de feu (plusieurs qui
     /// s'enchaînent) et son bruit, fort et entendu de loin.
-    pub fn bomb_blast(&mut self, pos: Vec3, eye: Vec3) {
+    pub fn bomb_blast(&mut self, pos: Vec3, eye: Vec3, world: &World) {
+        // (v249) Sa suie, sur tout ce qui l'entoure.
+        self.traces.scorch(world, pos, 5.0, 1.0);
         for (dx, dy, dz, age) in [
             (0.0, 0.2, 0.0, 0.0),
             (1.1, 0.7, 0.3, -0.06),
@@ -1222,6 +1258,8 @@ impl Fps {
             (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
         };
         let mut blasts = Vec::new();
+        // (v249) Ce que chaque grenade laisse sur les blocs jusqu'à la fin de la manche.
+        let mut marks = Vec::new();
         thrown.retain_mut(|t| {
             equip::step_thrown(t, world, dt, &mut sounds);
             if equip::detonates(t, world) {
@@ -1246,11 +1284,30 @@ impl Fps {
                 if t.kind == Nade::He {
                     blasts.push((t.pos, t.owner));
                 }
+                marks.push((t.kind, t.pos));
                 false
             } else {
                 true
             }
         });
+        for (kind, at) in marks {
+            match kind {
+                // L'explosion : sa suie, large ; la flash : une petite marque.
+                Nade::He => self.traces.scorch(world, at, 2.4, 1.0),
+                Nade::Flash => self.traces.scorch(world, at, 0.6, 0.7),
+                // Le molotov : le sol noircit sous le feu qui vient de prendre.
+                Nade::Molotov => {
+                    for e in &effects {
+                        if let Effect::Fire(cells, age, _) = e {
+                            if *age == 0.0 {
+                                self.traces.burn(cells);
+                            }
+                        }
+                    }
+                }
+                Nade::Smoke | Nade::Decoy => {}
+            }
+        }
         let feet = eye - Vec3::Y * crate::player::EYE;
         equip::tick_effects(&mut effects, dt, feet, &mut sounds, &mut hits, &mut rnd);
         self.rng = seed;
@@ -1302,10 +1359,7 @@ impl Fps {
             Some(h) => {
                 let n = Vec3::new(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
                 let p = eye + dir * h.distance;
-                if self.holes.len() >= MAX_HOLES {
-                    self.holes.remove(0);
-                }
-                self.holes.push((p + n * 0.004, n));
+                self.traces.slash(p, n);
                 for _ in 0..6 {
                     let v = n * 1.5 + Vec3::new(self.random(), self.random(), self.random()) * 2.0;
                     self.sparks.push((p + n * 0.02, v, 0.0));
@@ -1357,8 +1411,10 @@ impl Fps {
         }
     }
 
-    /// Avance les balles et les étincelles (appelé à chaque image).
-    pub fn tick_effects(&mut self, dt: f32) {
+    /// Avance les balles et les étincelles (appelé à chaque image). (v249) Et les gouttes
+    /// de sang : celle qui touche un bloc de `world` y laisse sa tache.
+    pub fn tick_effects(&mut self, dt: f32, world: &World) {
+        self.traces.tick(world, dt);
         for t in &mut self.tracers {
             t.travelled += BULLET_SPEED * dt;
         }
@@ -1369,12 +1425,6 @@ impl Fps {
             s.0 += s.1 * dt;
         }
         self.sparks.retain(|s| s.2 < 0.35);
-        for b in &mut self.blood {
-            b.2 += dt;
-            b.1.y -= 14.0 * dt;
-            b.0 += b.1 * dt;
-        }
-        self.blood.retain(|b| b.2 < 0.6);
     }
 
     /// En ligne : un autre joueur tire depuis `pos` (on l'entend, plus faible de loin).
@@ -1402,15 +1452,10 @@ impl Fps {
     }
 
     /// En ligne : un joueur est touché en `at` (sang ; bruit du couteau dans la chair).
-    pub fn blood_at(&mut self, at: Vec3, knife: bool, eye: Vec3) {
-        for _ in 0..10 {
-            let v = Vec3::new(self.random(), self.random() * 0.5 + 0.6, self.random()) * 1.8;
-            self.blood.push((at, v, 0.0));
-        }
-        if self.blood.len() > 400 {
-            let extra = self.blood.len() - 400;
-            self.blood.drain(..extra);
-        }
+    /// (v249) `from` : d'où le coup est parti (le sang gicle dans son sens, et marque le mur
+    /// ou le sol derrière le joueur touché : `traces::Traces::blood`).
+    pub fn blood_at(&mut self, at: Vec3, from: Vec3, knife: bool, eye: Vec3, world: &World) {
+        self.traces.blood(world, at, from, knife);
         if knife {
             self.sound_at(Sfx::KnifeFlesh, 0.0, at, eye);
         }
@@ -1619,7 +1664,7 @@ impl Fps {
         view_proj: Mat4,
         eye: Vec3,
         world: &World,
-        _daylight: f32,
+        daylight: f32,
     ) -> Vec<VmVertex> {
         let mut out = Vec::new();
         let cam_right = |p: Vec3, d: Vec3| d.cross(p - eye).normalize_or_zero();
@@ -1645,17 +1690,33 @@ impl Fps {
                 [3.0, 2.4, 1.2, 1.0],
             );
         }
-        for (p, v, age) in &self.blood {
-            let s = 0.045 * (1.0 - age / 0.6);
-            let d = v.normalize_or_zero();
-            let w = cam_right(*p, d) * s;
-            let tail = *p - d * s * 2.5;
-            push_tri(
-                &mut out,
-                view_proj,
-                [tail, *p - w, *p + w],
-                [0.55, 0.01, 0.01, 1.0],
-            );
+        // (v249) Gouttes de sang en vol : une larme étirée par sa vitesse (la bruine : un
+        // point qui s'efface), à la lumière du lieu ; cachées derrière un bloc.
+        let lit = 0.22 + 0.78 * daylight.clamp(0.0, 1.0);
+        let red = [0.42 * lit, 0.012 * lit, 0.012 * lit, 1.0];
+        for b in self.traces.drops() {
+            let to = b.pos - eye;
+            let dist = to.length();
+            if dist > 60.0
+                || (dist > 0.4
+                    && raycast_view(world, eye.into(), (to / dist).into(), dist - 0.1).is_some())
+            {
+                continue;
+            }
+            // Cachée par une fumigène (derrière ou dedans).
+            if self
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::Smoke(c) if c.hides(eye, b.pos)))
+            {
+                continue;
+            }
+            let s = b.size * b.fade();
+            let d = b.vel.normalize_or(Vec3::NEG_Y);
+            let w = cam_right(b.pos, d) * s;
+            let tail = b.pos - d * (s * 1.5 + (b.vel.length() * 0.012).min(0.10));
+            push_tri(&mut out, view_proj, [tail, b.pos - w, b.pos + w], red);
+            push_tri(&mut out, view_proj, [b.pos - w, b.pos + d * s * 0.8, b.pos + w], red);
         }
         for (p, v, age) in &self.sparks {
             let s = 0.025 * (1.0 - age / 0.35);
@@ -1728,39 +1789,6 @@ impl Fps {
                 Effect::Fire(..) => {}
                 Effect::Decoy(..) => {}
             }
-        }
-        for (p, n) in &self.holes {
-            // Caché derrière un bloc : on ne le dessine pas (il serait vu à travers).
-            let to = *p - eye;
-            let dist = to.length();
-            if dist > 64.0 {
-                continue;
-            }
-            if let Some(h) = raycast_view(world, eye.into(), (to / dist).into(), dist - 0.05) {
-                if h.distance < dist - 0.06 {
-                    continue;
-                }
-            }
-            // Caché par une fumigène (derrière ou dedans).
-            if self
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::Smoke(c) if c.hides(eye, *p)))
-            {
-                continue;
-            }
-            let u = if n.y.abs() > 0.5 { Vec3::X } else { Vec3::Y };
-            let v = n.cross(u);
-            let s = 0.045;
-            let c = [0.01, 0.01, 0.01, 1.0];
-            let (a, b, cc, d) = (
-                *p - u * s - v * s,
-                *p + u * s - v * s,
-                *p + u * s + v * s,
-                *p - u * s + v * s,
-            );
-            push_tri(&mut out, view_proj, [a, b, cc], c);
-            push_tri(&mut out, view_proj, [cc, d, a], c);
         }
         out
     }
@@ -2141,7 +2169,35 @@ impl Fps {
                 }
             }
         }
+        // (v249) Le sol noircit dessous, comme sous un vrai molotov.
+        self.traces.burn(&cells);
         self.effects.push(Effect::Fire(cells, 0.0, 0));
+    }
+
+    /// (v249) Essais (variable MINELIB_SANG) : devant soi, à `d` blocs le long de `dir`, un
+    /// joueur touché par trois balles puis par un coup de couteau (le sang gicle sur ce
+    /// qu'il y a derrière), une rafale sur les blocs, une entaille, et la suie d'une grenade
+    /// au sol.
+    pub fn spawn_test_traces(&mut self, world: &World, eye: Vec3, dir: Vec3, d: f32) {
+        let side = dir.cross(Vec3::Y).normalize_or(Vec3::X);
+        let at = eye + dir * d;
+        for k in [-1.0f32, 0.0, 1.0] {
+            let hit = at + side * (0.25 * k) + Vec3::Y * (0.1 * k);
+            self.traces.blood(world, hit, eye, false);
+        }
+        self.traces.blood(world, at - side * 1.6, eye - side * 1.6, true);
+        let dirs: Vec<Vec3> = (0..12)
+            .map(|k| {
+                let (a, b) = ((k % 4) as f32 - 1.5, (k / 4) as f32 - 1.0);
+                (dir + side * (0.05 * a + 0.22) + Vec3::Y * (0.05 * b)).normalize()
+            })
+            .collect();
+        self.shot_seen(world, 0, eye, &dirs);
+        self.shot_seen(world, crate::netgame::KNIFE_LIGHT, at + side * 1.2, &[dir]);
+        if let Some(h) = raycast(world, (at - side * 2.5).into(), [0.0, -1.0, 0.0], 12.0) {
+            let ground = at - side * 2.5 - Vec3::Y * (h.distance - 0.1);
+            self.traces.scorch(world, ground, 2.4, 1.0);
+        }
     }
 
     /// Essais : fumigène posée directement en `p` (variable MINELIB_SMOKE).
@@ -2934,7 +2990,7 @@ mod tests {
             },
         );
         assert_eq!(f.sel, Sel::Knife);
-        let holes = f.holes.len();
+        let marks = f.traces.count(minelib_render::KIND_SLASH);
         f.deploy = 0.0;
         f.update(
             1.0 / 60.0,
@@ -2948,7 +3004,12 @@ mod tests {
             0.0,
             -1.4,
         );
-        assert_eq!(f.holes.len(), holes + 1, "coup de couteau sur le sol");
+        assert_eq!(
+            f.traces.count(minelib_render::KIND_SLASH),
+            marks + 1,
+            "coup de couteau sur le sol"
+        );
+        assert_eq!(f.traces.count(minelib_render::KIND_HOLE), 0);
     }
 
     #[test]
@@ -3193,11 +3254,23 @@ mod tests {
         };
         for _ in 0..120 {
             f.update(1.0 / 60.0, &c, &w, eye, 0.0, 0.0);
-            f.tick_effects(1.0 / 60.0);
+            f.tick_effects(1.0 / 60.0, &w);
         }
         let g = f.active().unwrap();
         assert!(g.mag < 30, "des balles tirées");
-        assert!(!f.holes.is_empty(), "impacts sur le mur");
+        let shot = 30 - g.mag as usize;
+        // (v249) Un impact par balle, tous gardés (64 au plus avant), jusqu'à la fin de la
+        // manche ; le tir d'un autre joueur laisse les siens.
+        let holes = f.traces.count(minelib_render::KIND_HOLE);
+        assert!(holes >= shot, "{holes} impacts pour {shot} balles");
+        let (list, rev, _) = f.decals();
+        assert!(list.len() == holes && rev > 0);
+        f.shot_seen(&w, ak as u8, eye, &[Vec3::new(0.0, 0.0, -1.0)]);
+        assert!(f.traces.count(minelib_render::KIND_HOLE) > holes);
+        f.new_round(false, 0, false);
+        assert!(f.traces.count(minelib_render::KIND_HOLE) > holes, "échauffement : gardés");
+        f.new_round(false, 0, true);
+        assert!(f.decals().0.is_empty(), "nouvelle manche : plus de traces");
         assert!(f.punch.0 > 0.5, "la vue remonte");
         // Relâché : le motif et la vue reviennent.
         let idle = Controls {

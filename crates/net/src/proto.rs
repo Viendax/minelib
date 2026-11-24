@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 /// (v247) 65 : la Foudre de Zeus rendue au menu créatif (`ZEUS_RETURN`) ; accroupi plus vite (la posture ne traîne plus à la fin) et plus bas (la tête,
 /// donc sa boîte des coups en partie FPS, reste dans la boîte de 1,5 bloc) : la simulation et
 /// les coups doivent être les mêmes chez l'hôte et ses invités.
-pub const PROTOCOL: u32 = 65;
+/// (v249) 66 : les tirs d'une partie FPS disent la direction de chaque balle
+/// (`game::ToPeer::Shot::dirs`) : chacun voit les impacts des autres sur les blocs.
+pub const PROTOCOL: u32 = 66;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
