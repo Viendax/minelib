@@ -1884,6 +1884,9 @@ impl BuildNet {
                 continue;
             }
             undone += 1;
+            // (v288) Défaite, elle n'est plus « déjà vue » : si un relais qui décide la
+            // remet plus tard (au même rang), elle s'applique.
+            self.seen.remove(&pos);
             dirty.extend(world.set_remote(pos[0], pos[1], pos[2], h.pre));
         }
         #[cfg(test)]
@@ -2582,6 +2585,31 @@ impl BuildNet {
                     self.pseudo,
                     self.seen.get(&pos)
                 );
+            }
+            // (v288) La même modification (même rang, même bloc), remise par un autre
+            // relais de région ou de province que celui par qui on l'a eue : c'est lui
+            // qui en répond maintenant. Sans cela, quitter le premier la mettait en doute
+            // et la défaisait 3 s plus tard, alors que le second, qui sert la zone à sa
+            // place, l'avait bien remise (et ne la redonnerait jamais).
+            if let (Some(new), Some(&(old_seq, Some(old)))) = (source, self.seen.get(&pos)) {
+                let same = self
+                    .heard
+                    .get(&old)
+                    .and_then(|m| m.get(&pos))
+                    .is_some_and(|h| h.seq == seq && h.got == BlockId(block));
+                if old_seq == seq && old != new && same {
+                    if let Some(h) = self.heard.get_mut(&old).and_then(|m| m.remove(&pos)) {
+                        self.heard.entry(new).or_default().insert(pos, h);
+                        self.seen.insert(pos, (seq, Some(new)));
+                        if let Some(c) = self
+                            .from_province
+                            .as_ref()
+                            .and_then(|i| self.provinces.get_mut(&pkey(i)))
+                        {
+                            c.unmarked.push((pos, seq));
+                        }
+                    }
+                }
             }
             return Vec::new();
         }
@@ -7405,6 +7433,51 @@ mod tests {
         }
         assert_eq!(w.get(2, 100, 2), BlockId(7), "confirmé : il reste");
         assert_eq!(w.get(3, 100, 3), fake_before, "jamais confirmé : défait");
+    }
+
+    /// (v288) La même modification remise par deux relais, au même rang (celui qu'on va
+    /// quitter, et celui qui sert la zone à sa place) : quitter le premier ne la défait
+    /// pas, le second en répond. Avant, le doublon était écarté sans rien retenir ; le
+    /// premier relais quitté, elle passait en doute et était défaite 3 s plus tard chez ce
+    /// joueur seulement, et le second relais, qui l'avait déjà remise, ne la redonnait
+    /// jamais : un bloc en moins que chez les autres. Quitté à son tour sans confirmation
+    /// du relais du monde, elle est défaite ; remise plus tard, elle s'applique de nouveau.
+    #[test]
+    fn a_block_also_given_by_the_next_relay_survives_leaving_the_first() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut b = BuildNet::new(tx, "Moi".into(), false);
+        let mut w = World::new(0);
+        w.ensure_chunk(minelib_world::ChunkPos::containing(2, 2));
+        w.journal = Some(Vec::new());
+        let pos = [2, 100, 2];
+        let before = w.get(2, 100, 2);
+        let set = game::encode(&BuildMsg::Set {
+            pos,
+            block: 7,
+            by: "Eve".into(),
+            seq: 1 << 40,
+        });
+        let wait = |b: &mut BuildNet, w: &mut World| {
+            for _ in 0..80 {
+                let _ = b.update(w, Vec3::ZERO, (0.0, 0.0), 0.0, 0.0, 0.0, 0.05);
+            }
+        };
+        b.from_shard = Some(1);
+        b.receive(0, [0, 0], &set, &mut w);
+        b.from_shard = Some(2);
+        b.receive(0, [0, 0], &set, &mut w);
+        b.from_shard = None;
+        assert_eq!(w.get(2, 100, 2), BlockId(7));
+        b.forget_shard(1);
+        wait(&mut b, &mut w);
+        assert_eq!(w.get(2, 100, 2), BlockId(7), "le second relais en répond");
+        // Le second quitté à son tour, jamais confirmée par le relais du monde : défaite.
+        b.forget_shard(2);
+        wait(&mut b, &mut w);
+        assert_eq!(w.get(2, 100, 2), before, "plus personne n'en répond");
+        // Remise plus tard au même rang (par le relais du monde) : elle revient.
+        b.receive(0, [0, 0], &set, &mut w);
+        assert_eq!(w.get(2, 100, 2), BlockId(7), "une modification défaite peut revenir");
     }
 
     #[test]
