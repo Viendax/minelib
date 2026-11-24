@@ -978,7 +978,7 @@ impl Navigateur {
                     self.cotes.insert(id, (w.clamp(64, 3840), h.clamp(64, 2160)));
                 }
                 Cmd::Largeur(id, l) => {
-                    // (v293) Un Short à côté du volet : la page se met en page plus étroite (le
+                    // (v293) Une page à côté du volet (v294 : toute page) : elle se met en page plus étroite (le
                     // jeu la décale à droite du volet), sans redimensionner l'onglet ni sa
                     // capture. Le protocole des outils de développement la place en haut à
                     // gauche de l'onglet.

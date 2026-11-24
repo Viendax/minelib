@@ -978,7 +978,8 @@ impl Displays {
                 tab.scroll = 0;
             }
             // (v293) Un Short ne passe pas sous le volet : sa page se met en page à sa droite
-            // (le jeu la décale d'autant, voir `Tab::coller`).
+            // (le jeu la décale d'autant, voir `Tab::coller`). (v294) Toute page, Twitch
+            // comme les autres sites ; le lecteur se décale lui-même.
             let largeur = tab.largeur_voulue();
             if tab.opened && largeur != tab.largeur {
                 b.send(&format!("largeur {id} {largeur}"));
@@ -1751,7 +1752,8 @@ pub const TWITCH: &str = "https://www.twitch.tv/";
 /// (`0..PANNEAU_U`), et repart vers la gauche ; mêmes règles qu'avant, en miroir. C'est une
 /// page à part (`panneau.html`, son propre onglet du navigateur, voir [`Volet`]) que le jeu
 /// colle sur la gauche de la page de l'écran ; sur le lecteur, la vidéo se décale vers la
-/// droite d'autant (jamais par-dessus), ailleurs le volet passe devant la page.
+/// droite d'autant (jamais par-dessus) ; (v294) ailleurs, la page se met en page plus étroite
+/// et le jeu la décale à droite du volet (voir `Tab::range`).
 const PANNEAU_U: f32 = VOLET_W as f32 / PAGE_W as f32;
 /// (v253) Un peu de marge avant de la refermer en allant vers la vidéo.
 const PANNEAU_MARGE: f32 = 0.02;
@@ -2050,8 +2052,8 @@ struct Tab {
     /// (v291) Celle en cours est en pause (la page partie ailleurs, ou mise en pause).
     pause: bool,
     /// (v293) Largeur de mise en page demandée au navigateur pour la page (pixels de page) :
-    /// moins que `PAGE_W` sur un Short à côté du volet, que le Short se range à sa droite au
-    /// lieu d'être dessous.
+    /// moins que `PAGE_W` à côté du volet (v293 : un Short ; v294 : toute page sauf le
+    /// lecteur), que la page se range à sa droite au lieu d'être dessous.
     largeur: u32,
     en_ligne: bool,
     /// (v257) Où est allé le dernier appui (v289 : la page, la recherche ou le volet).
@@ -2207,15 +2209,18 @@ impl Tab {
         Some((o * b, b, sorti))
     }
 
-    /// (v293) La page est-elle un Short (il se range à droite du volet, jamais dessous) ?
-    fn court(&self) -> bool {
-        crate::watch::is_short(&self.addr)
+    /// (v293) La page se range-t-elle à droite du volet (jamais dessous) ? Un Short ; (v294)
+    /// toute page, demande du propriétaire (« le volet ne doit pas passer par-dessus Twitch,
+    /// c'est Twitch qui réduit sa place ; corrige ailleurs aussi »). Sauf le lecteur, qui
+    /// décale déjà sa vidéo lui-même (`lecteur.html`).
+    fn range(&self) -> bool {
+        !crate::watch::is_player(&self.addr)
     }
 
-    /// (v293) Largeur de mise en page voulue pour la page : un Short avec le volet ouvert
-    /// laisse la place du volet (et de la recherche ouverte).
+    /// (v293) Largeur de mise en page voulue pour la page : avec le volet ouvert, elle laisse
+    /// la place du volet (et de la recherche ouverte).
     fn largeur_voulue(&self) -> u32 {
-        if !(self.court() && self.panel_open) {
+        if !(self.range() && self.panel_open) {
             return PAGE_W;
         }
         let cote = if self.cote.as_ref().is_some_and(|c| c.voulue) { COTE_W } else { 0 };
@@ -2224,12 +2229,13 @@ impl Tab {
 
     /// (v289) Colle le volet sur la gauche de l'image de la page, et la recherche à côté à
     /// sa droite (elle sort de sous lui en glissant : on en voit d'abord la droite). Sans
-    /// image d'eux encore : sombre. (v293) Un Short est d'abord décalé vers la droite d'autant
-    /// que le bloc est sorti (sa page, mise en page plus étroite, y tient).
+    /// image d'eux encore : sombre. (v293) Un Short (v294 : toute page sauf le lecteur) est
+    /// d'abord décalé vers la droite d'autant que le bloc est sorti (la page, mise en page
+    /// plus étroite, y tient).
     fn coller(&mut self) {
         let Some((r, b, sorti)) = self.bloc() else { return };
         let (w, h) = (self.size.0 as usize, self.size.1 as usize);
-        if self.court() && w > 0 && self.pixels.len() >= w * h * 4 {
+        if self.range() && w > 0 && self.pixels.len() >= w * h * 4 {
             let k = w as f32 / PAGE_W as f32;
             let d = ((r * k).round() as usize).min(w);
             let n = (w - d).min((self.largeur as f32 * k).round() as usize);
@@ -2260,8 +2266,8 @@ impl Tab {
         let Some((r, b, sorti)) = self.bloc() else {
             return (Cible::Page, p);
         };
-        // (v293) Un Short décalé à droite du bloc : le point dans sa page.
-        let p = if self.court() {
+        // (v293) Une page décalée à droite du bloc : le point dans la page.
+        let p = if self.range() {
             let x = (uv[0].clamp(0.0, 1.0) * PAGE_W as f32 - r) as i32;
             (x.clamp(0, self.largeur as i32 - 1), p.1)
         } else {
@@ -3075,7 +3081,7 @@ mod tests {
 
     /// (v293) Un Short ne passe pas sous le volet : sa page se met en page plus étroite (la
     /// place du volet, et de la recherche ouverte) et le jeu la décale à droite du volet ; le
-    /// clic suit. Une autre page reste dessous.
+    /// clic suit. (v294) Toute page pareil, sauf le lecteur (il se décale lui-même).
     #[test]
     fn un_short_se_range_a_droite_du_volet() {
         let (w, h) = (PAGE_W as usize, PAGE_H as usize);
@@ -3100,11 +3106,17 @@ mod tests {
         // La recherche ouverte : encore plus étroit.
         t.cote = Some(Cote::new(5, "yt", RECHERCHE_VIDEO));
         assert_eq!(t.largeur_voulue(), PAGE_W - VOLET_W - COTE_W);
-        // Une page ordinaire : le volet passe devant, rien ne bouge.
-        let mut g = Tab::new(RECHERCHE);
-        g.addr = g.url.clone();
-        g.panel_open = true;
-        assert_eq!(g.largeur_voulue(), PAGE_W);
+        // (v294) Toute autre page aussi (Twitch, Google…) ; le lecteur se décale lui-même.
+        for url in [TWITCH.to_string(), RECHERCHE.to_string()] {
+            let mut g = Tab::new(&url);
+            g.addr = url;
+            g.panel_open = true;
+            assert_eq!(g.largeur_voulue(), PAGE_W - VOLET_W);
+        }
+        let mut l = Tab::new(&crate::watch::watch_url("dQw4w9WgXcQ", 0.0));
+        l.addr = l.url.clone();
+        l.panel_open = true;
+        assert_eq!(l.largeur_voulue(), PAGE_W);
         // Volet parti : toute la largeur.
         t.cote = None;
         t.pres = false;
