@@ -412,7 +412,6 @@ const MUSCLE: u32 = 0xa83a34;
 const MUSCLE_DARK: u32 = 0x8c2c2a;
 const FAT: u32 = 0xe2b98a;
 const BONE: u32 = 0xece4d2;
-const MARROW: u32 = 0xc9a58c;
 const BRAIN: u32 = 0xd9a2a6;
 const EYE: u32 = 0xf4f4f0;
 const TEETH: u32 = 0xfaf6ea;
@@ -718,7 +717,7 @@ mod tests {
         assert!(count(CHEST, HEART) >= 4);
         assert!(count(BELLY, GUT) >= 10 && count(BELLY, LIVER) >= 3 && count(BELLY, KIDNEY) == 2);
         for limb in [ARM_L, ARM_R, LEG_L, LEG_R] {
-            assert!(count(limb, BONE) + count(limb, MARROW) >= 12, "{limb}");
+            assert!(count(limb, BONE) >= 12, "{limb}");
             assert!(count(limb, MUSCLE) + count(limb, MUSCLE_DARK) >= 30, "{limb}");
         }
         // Le cœur est à gauche du milieu (x petit : la gauche du personnage).
