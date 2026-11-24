@@ -616,7 +616,7 @@ mod tests {
         // Près d'ici (à portée de charge) : sans porteur, avec lui.
         let near = |all: &[Spot]| {
             all.iter()
-                .filter(|s| (s.x - here.x).hypot(s.z - here.z) <= crate::zeus::CHARGE_REACH)
+                .filter(|s| (s.x - here.x).hypot(s.z - here.z) <= minelib_net::meteo::CHARGE_REACH)
                 .count()
         };
         let held = count(Some(here), here);

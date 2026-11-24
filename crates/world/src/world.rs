@@ -58,6 +58,11 @@ pub struct World {
     /// relevés. En solo, l'eau et la lave changées par le joueur s'y remettent à couler :
     /// une partie enregistrée pendant que l'eau séchait ne la garde plus pour toujours.
     pub fresh: Option<Vec<ChunkPos>>,
+    /// (v283) Piles de tapis de plusieurs couleurs, par chunk : index dans le chunk (celui des
+    /// modifications) → sortes de leurs couches, du dessous au dessus (`CARPET_KINDS`). Une
+    /// pile d'une seule couleur n'en a pas : son bloc dit tout (hauteur et sorte du dessus).
+    /// Gardées avec le monde (`tapis.txt`), comme les modifications.
+    carpets: HashMap<ChunkPos, Arc<HashMap<u32, Vec<u8>>>>,
 }
 
 impl World {
@@ -75,6 +80,7 @@ impl World {
             touched: None,
             probes: HashMap::new(),
             fresh: None,
+            carpets: HashMap::new(),
         }
     }
 
@@ -356,6 +362,85 @@ impl World {
         })
     }
 
+    // ------------------------------------------------------------ tapis empilés
+
+    /// (v283) Sortes des couches (du dessous au dessus) du tapis ou de la pile de tapis en
+    /// `pos` : celles gardées pour une pile de plusieurs couleurs, si elles vont avec son bloc
+    /// (même nombre, même sorte au-dessus) ; sinon toutes de la sorte du dessus. `None` : pas
+    /// un tapis.
+    pub fn carpet_layers(&self, pos: [i32; 3]) -> Option<Vec<u8>> {
+        let [x, y, z] = pos;
+        let Some(crate::registry::Layers::Carpet { n, kind }) =
+            crate::registry::Layers::of(self.get(x, y, z))
+        else {
+            return None;
+        };
+        let (c, i) = Self::cell(pos);
+        match self.carpets.get(&c).and_then(|m| m.get(&i)) {
+            Some(v) if v.len() == n as usize && v.last() == Some(&kind) => Some(v.clone()),
+            _ => Some(vec![kind; n as usize]),
+        }
+    }
+
+    /// (v283) Garde les sortes des couches de la pile de tapis en `pos` (rien à garder si
+    /// elles sont toutes de la même : le bloc suffit). À appeler après avoir posé son bloc.
+    pub fn set_carpet_layers(&mut self, pos: [i32; 3], layers: &[u8]) {
+        let (c, i) = Self::cell(pos);
+        let mixed = layers.len() >= 2 && layers.iter().any(|&k| Some(&k) != layers.last());
+        if mixed {
+            Arc::make_mut(self.carpets.entry(c).or_default()).insert(i, layers.to_vec());
+        } else {
+            self.forget_carpet(pos);
+        }
+    }
+
+    fn forget_carpet(&mut self, pos: [i32; 3]) {
+        let (c, i) = Self::cell(pos);
+        if let Some(m) = self.carpets.get_mut(&c) {
+            if m.contains_key(&i) {
+                Arc::make_mut(m).remove(&i);
+                if m.is_empty() {
+                    self.carpets.remove(&c);
+                }
+            }
+        }
+    }
+
+    /// (v283) Chunk et index dans le chunk de la case `pos`.
+    fn cell(pos: [i32; 3]) -> (ChunkPos, u32) {
+        let c = ChunkPos::containing(pos[0], pos[2]);
+        let i = pos[0].rem_euclid(CHUNK_SIZE as i32) as u32
+            + 16 * pos[2].rem_euclid(CHUNK_SIZE as i32) as u32
+            + 256 * pos[1].clamp(0, CHUNK_HEIGHT as i32 - 1) as u32;
+        (c, i)
+    }
+
+    /// (v283) Piles de tapis de plusieurs couleurs du chunk `pos` (index dans le chunk →
+    /// couches), pour son maillage.
+    pub fn carpets_in(&self, pos: ChunkPos) -> Option<Arc<HashMap<u32, Vec<u8>>>> {
+        self.carpets.get(&pos).cloned()
+    }
+
+    /// (v283) Toutes les piles de tapis de plusieurs couleurs : (case, couches). Pour la
+    /// sauvegarde.
+    pub fn carpets(&self) -> impl Iterator<Item = ([i32; 3], &[u8])> + '_ {
+        self.carpets.iter().flat_map(|(c, m)| {
+            let (ox, oz) = c.origin();
+            m.iter().map(move |(&i, v)| {
+                let (x, z, y) = (i % 16, (i / 16) % 16, i / 256);
+                ([ox + x as i32, y as i32, oz + z as i32], v.as_slice())
+            })
+        })
+    }
+
+    /// (v283) Recharge une pile de tapis enregistrée (avant ou après que son chunk arrive).
+    pub fn load_carpet(&mut self, pos: [i32; 3], layers: Vec<u8>) {
+        if layers.len() >= 2 && layers.len() <= 16 {
+            let (c, i) = Self::cell(pos);
+            Arc::make_mut(self.carpets.entry(c).or_default()).insert(i, layers);
+        }
+    }
+
     /// Recharge des modifications (sauvegarde) avant que les chunks soient générés.
     /// Pose un bloc venu d'un autre joueur (sans le noter au journal) ; chunk pas chargé :
     /// gardé pour sa génération.
@@ -497,6 +582,17 @@ impl World {
         self.edits.entry(pos).or_default().insert(index, id);
         if old.is_torch() && !id.is_torch() {
             self.torches.remove(&[x, y, z]);
+        }
+        // (v283) Plus une pile de tapis : ses couleurs sont oubliées. (Une pile qui change de
+        // hauteur garde les siennes jusqu'à ce que `set_carpet_layers` les remplace ; si elles
+        // ne vont plus avec le bloc, `carpet_layers` ne les prend pas.)
+        if old != id
+            && !matches!(
+                crate::registry::Layers::of(id),
+                Some(crate::registry::Layers::Carpet { n: 2.., .. })
+            )
+        {
+            self.forget_carpet([x, y, z]);
         }
         // Une source de lumière à portée : la lumière change sur toute sa zone d'influence.
         // (v185) Sauf si ni l'ancien ni le nouveau bloc n'arrête la lumière (eau qui coule,
@@ -656,6 +752,44 @@ mod tests {
         w2.load_edit(e[0].0, e[0].1, e[0].2);
         w2.ensure_chunk(pos);
         assert_eq!(w2.get(-5, 120, 40), BlockId::BRICK);
+    }
+
+    /// (v283) Une pile de tapis de plusieurs couleurs garde ses couches ; une d'une seule
+    /// couleur n'a rien à garder ; cassée ou remplacée, elle les oublie ; des couches qui ne
+    /// vont plus avec le bloc (pile changée par un autre joueur) ne sont pas prises.
+    #[test]
+    fn carpet_stacks_keep_the_color_of_each_layer() {
+        use crate::registry::Layers;
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: -1, z: 0 });
+        let p = [-3, 100, 5];
+        let stack = |n, kind| Layers::Carpet { n, kind }.block().unwrap();
+        w.set(p[0], p[1], p[2], stack(1, 14));
+        assert_eq!(w.carpet_layers(p), Some(vec![14]));
+        w.set(p[0], p[1], p[2], stack(3, 2));
+        w.set_carpet_layers(p, &[14, 0, 2]);
+        assert_eq!(w.carpet_layers(p), Some(vec![14, 0, 2]));
+        assert_eq!(w.carpets().count(), 1);
+        let back = w.carpets_in(ChunkPos { x: -1, z: 0 }).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(w.carpets().next().unwrap(), (p, &[14u8, 0, 2][..]));
+        // Toutes pareilles : rien à garder.
+        w.set(p[0], p[1], p[2], stack(4, 2));
+        w.set_carpet_layers(p, &[2, 2, 2, 2]);
+        assert_eq!(w.carpets().count(), 0);
+        assert_eq!(w.carpet_layers(p), Some(vec![2; 4]));
+        // Relue d'une sauvegarde, avant le chunk ; puis un bloc d'une autre hauteur.
+        let mut w2 = World::new(0);
+        w2.load_carpet(p, vec![1, 1, 5]);
+        w2.insert_empty(ChunkPos { x: -1, z: 0 });
+        w2.set(p[0], p[1], p[2], stack(3, 5));
+        assert_eq!(w2.carpet_layers(p), Some(vec![1, 1, 5]));
+        w2.set(p[0], p[1], p[2], stack(5, 5));
+        assert_eq!(w2.carpet_layers(p), Some(vec![5; 5]));
+        // Cassée : oubliée.
+        w2.set(p[0], p[1], p[2], BlockId::AIR);
+        assert_eq!(w2.carpets().count(), 0);
+        assert_eq!(w2.carpet_layers(p), None);
     }
 
     #[test]

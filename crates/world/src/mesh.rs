@@ -391,6 +391,8 @@ pub struct Neighborhood {
     pub lights: Vec<Light>,
     /// Points où mesurer la lumière reçue (voir `MeshData::probes`).
     probes: Option<Arc<Vec<[i32; 3]>>>,
+    /// (v283) Piles de tapis de plusieurs couleurs du chunk central (`World::carpets_in`).
+    carpets: Option<Arc<std::collections::HashMap<u32, Vec<u8>>>>,
 }
 
 impl Neighborhood {
@@ -409,6 +411,7 @@ impl Neighborhood {
             chunks,
             lights: world.lights_near(pos),
             probes: world.probes(pos),
+            carpets: world.carpets_in(pos),
         })
     }
 
@@ -439,6 +442,38 @@ impl Neighborhood {
             None => BlockId::AIR,
         }
     }
+}
+
+/// (v283) Hauteur (seizièmes de bloc) des couches de neige ou de tapis du bloc `id` ; 0 : ce
+/// n'en est pas.
+fn layer_height(id: BlockId) -> u8 {
+    crate::registry::Layers::of(id).map_or(0, |l| l.height())
+}
+
+/// (v283) Suites de couches d'une même sorte de la pile de tapis `id` en `b` (case du chunk
+/// central), de bas en haut : (seizième du bas, du haut, sorte). `None` : pas une pile de
+/// plusieurs couleurs (une seule boîte suffit).
+fn carpet_runs(n: &Neighborhood, b: [i32; 3], id: BlockId) -> Option<Vec<(u8, u8, u8)>> {
+    let crate::registry::Layers::Carpet { n: count, kind } = crate::registry::Layers::of(id)?
+    else {
+        return None;
+    };
+    if count < 2 {
+        return None;
+    }
+    let index = b[0] as u32 + 16 * b[2] as u32 + 256 * b[1] as u32;
+    let layers = n.carpets.as_ref()?.get(&index)?;
+    if layers.len() != count as usize || layers.last() != Some(&kind) {
+        return None;
+    }
+    let mut runs: Vec<(u8, u8, u8)> = Vec::new();
+    for (y, &k) in layers.iter().enumerate() {
+        match runs.last_mut() {
+            Some(r) if r.2 == k => r.1 = y as u8 + 1,
+            _ => runs.push((y as u8, y as u8 + 1, k)),
+        }
+    }
+    (runs.len() > 1).then_some(runs)
 }
 
 /// Lumière colorée autour d'un chunk : propagation en largeur depuis chaque source,
@@ -1870,13 +1905,26 @@ fn mesh_block(
                         // que le bloc, en scintillant).
                         let below = pad.get(x, y - 1, z);
                         let banner_low = banner && !below.is_opaque();
+                        // (v283) Pile de tapis de plusieurs couleurs : une boîte par suite de
+                        // couches de la même sorte, de sa texture, sans faces entre elles.
+                        let runs = carpet_runs(n, b, id);
                         type Part = (([u8; 3], [u8; 3]), i32);
-                        let parts: Vec<Part> = boxes
-                            .iter()
-                            .map(|&bx| (bx, 0))
-                            .chain(boxes.iter().filter(|_| banner_low).map(|&bx| (bx, -1)))
-                            .collect();
-                        for ((mn, mx), dy) in parts {
+                        let parts: Vec<Part> = match &runs {
+                            Some(r) => r.iter().map(|&(y0, y1, _)| (([0, y0, 0], [16, y1, 16]), 0)).collect(),
+                            None => boxes
+                                .iter()
+                                .map(|&bx| (bx, 0))
+                                .chain(boxes.iter().filter(|_| banner_low).map(|&bx| (bx, -1)))
+                                .collect(),
+                        };
+                        let layered = layer_height(id) > 0;
+                        for (part, ((mn, mx), dy)) in parts.into_iter().enumerate() {
+                            // (v283) La sorte de tapis de cette suite, et ses faces du dessous
+                            // et du dessus cachées par les suites voisines.
+                            let run = runs.as_ref().map(|r| {
+                                let last = r.len() - 1;
+                                (r[part].2, part > 0, part < last)
+                            });
                             let b = add(b, [0, dy, 0]);
                             let lit = light_at(b);
                             let wy = wy + dy as f32;
@@ -1910,6 +1958,12 @@ fn mesh_block(
                             // Face sur le bord du bloc et voisin plein : cachée.
                             let skip = |face: usize| {
                                 let (nrm, _, _) = FACES[face];
+                                // (v283) Entre deux suites de couches d'une pile de tapis.
+                                if let Some((_, under, over)) = run {
+                                    if (nrm[1] == -1 && under) || (nrm[1] == 1 && over) {
+                                        return true;
+                                    }
+                                }
                                 // Vitre : bout d'un bras collé à la pièce du milieu.
                                 if pane && (face == 5 && mn[2] == 9 || face == 4 && mx[2] == 7) {
                                     return true;
@@ -1922,13 +1976,43 @@ fn mesh_block(
                                 }
                                 let k = nrm.iter().position(|&c| c != 0).unwrap();
                                 let on_edge = if nrm[k] > 0 { mx[k] == 16 } else { mn[k] == 0 };
+                                // (v283) Un dessus contre le dessous plein de la neige fine ou
+                                // d'un tapis posés dessus : caché.
+                                if on_edge
+                                    && nrm[1] == 1
+                                    && !def.translucent
+                                    && layer_height(pad.get(b[0], b[1] + 1, b[2])) > 0
+                                {
+                                    return true;
+                                }
+                                // (v283) Neige fine, tapis : un côté caché par les couches du
+                                // voisin, au moins aussi hautes (un champ de piles ne dessine que
+                                // ses dessus et son pourtour).
+                                if layered
+                                    && on_edge
+                                    && nrm[1] == 0
+                                    && layer_height(pad.get(b[0] + nrm[0], b[1], b[2] + nrm[2]))
+                                        >= mx[1]
+                                {
+                                    return true;
+                                }
                                 on_edge && opaque(add(b, nrm))
                             };
                             // Bannière : moitié du haut (texture des côtés) ou du bas
                             // (texture du dessous) sur toutes ses faces.
                             let t = id.def().tex;
                             let half = if dy == 0 { t[1] } else { t[2] } as u32;
-                            let tex_of = |f: u32| if banner { half } else { face_tex(id, f) };
+                            let tex_of = |f: u32| match run {
+                                // (v283) Couche de tapis : la texture de sa sorte.
+                                Some((kind, _, _)) => face_tex(
+                                    crate::registry::Layers::Carpet { n: 1, kind }
+                                        .block()
+                                        .unwrap_or(id),
+                                    f,
+                                ),
+                                None if banner => half,
+                                None => face_tex(id, f),
+                            };
                             if let Some((width, high)) = hinge {
                                 emit_door(
                                     out,
@@ -2151,10 +2235,14 @@ fn mesh_block(
                     let glass = |d: &crate::registry::BlockDef| {
                         d.key.starts_with("glass") && matches!(d.shape, Shape::Cube)
                     };
+                    // (v283) Sous de la neige fine ou un tapis : leur dessous, plein et opaque,
+                    // cache le dessus du bloc (le sol d'un champ de tapis n'est pas dessiné).
+                    let under_layers = face == 2 && layer_height(facing) > 0 && !def.translucent;
                     if (opaque(front) && !roofed)
                         || (glass(def) && glass(facing.def()))
                         || (def.cull_same && facing == id)
                         || (covered && !def.translucent && !roofed)
+                        || (under_layers && fluid_here.is_none())
                     {
                         continue;
                     }
@@ -2707,6 +2795,119 @@ mod tests {
         }
     }
 
+    /// (v283) « Plein de piles autour de nous » : un champ de piles de tapis de même hauteur ne
+    /// dessine que ses dessus et son pourtour (ni les côtés entre piles, ni le sol dessous) ;
+    /// une pile plus basse que sa voisine cache son côté contre elle, pas l'inverse ; une pile
+    /// de plusieurs couleurs montre chaque suite de couches de sa texture, sans faces entre
+    /// elles ; un champ de neige fine pareil.
+    #[test]
+    fn layer_stacks_draw_their_tops_and_edges_only() {
+        use crate::registry::Layers;
+        let reg = crate::registry::registry();
+        let mut w = World::new(0);
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                w.insert_empty(ChunkPos { x: dx, z: dz });
+            }
+        }
+        for z in -2..18 {
+            for x in -2..18 {
+                w.set(x, 99, z, BlockId::STONE);
+            }
+        }
+        let carpet = |n, kind| Layers::Carpet { n, kind }.block().unwrap();
+        // Un champ de 4 × 4 piles de 5 tapis.
+        for z in 2..6 {
+            for x in 2..6 {
+                w.set(x, 100, z, carpet(5, 3));
+            }
+        }
+        // Une pile de 3 contre une pile de 7.
+        w.set(8, 100, 8, carpet(3, 0));
+        w.set(9, 100, 8, carpet(7, 0));
+        // Rouge, rouge, blanc, magenta (de bas en haut).
+        w.set(12, 100, 12, carpet(4, 2));
+        w.set_carpet_layers([12, 100, 12], &[14, 14, 0, 2]);
+        // Neige fine : 3 × 1 couches de 3.
+        for x in 2..5 {
+            w.set(x, 100, 12, Layers::Snow(3).block().unwrap());
+        }
+        let n = Neighborhood::from_world(&w, ChunkPos { x: 0, z: 0 }).unwrap();
+        let m = mesh_neighborhood_with(&n, false);
+        // Chaque face : ses quatre sommets à la suite ; jugée sur son centre.
+        struct Quad {
+            c: [f32; 3],
+            face: u32,
+            tex: u32,
+            lo: f32,
+            hi: f32,
+        }
+        let all: Vec<Quad> = m
+            .vertices
+            .chunks(4)
+            .map(|q| {
+                let c = std::array::from_fn(|k| q.iter().map(|v| v.pos[k]).sum::<f32>() / 4.0);
+                let ys = q.iter().map(|v| v.pos[1]);
+                Quad {
+                    c,
+                    face: q[0].face(),
+                    tex: q[0].tex & 0xfff,
+                    lo: ys.clone().fold(f32::MAX, f32::min),
+                    hi: ys.fold(f32::MIN, f32::max),
+                }
+            })
+            .collect();
+        let quads = |f: &dyn Fn(&Quad) -> bool| all.iter().filter(|q| f(q)).count();
+        let inside = |q: &Quad, x0: f32, x1: f32, z0: f32, z1: f32| {
+            (x0..=x1).contains(&q.c[0]) && (z0..=z1).contains(&q.c[2])
+        };
+        let side = |q: &Quad| matches!(q.face, 0 | 1 | 4 | 5);
+        let field = |q: &Quad| inside(q, 2.0, 6.0, 2.0, 6.0) && q.c[1] > 99.99;
+        assert_eq!(quads(&|q| field(q) && q.face == 2 && q.c[1] > 100.3), 16);
+        assert_eq!(quads(&|q| field(q) && side(q)), 16, "seulement le pourtour");
+        assert_eq!(
+            quads(&|q| field(q) && q.face == 2 && q.c[1] < 100.01),
+            0,
+            "pas de sol sous les tapis"
+        );
+        // Le sol autour reste dessiné.
+        assert_eq!(
+            quads(&|q| q.face == 2 && (q.c[1] - 100.0).abs() < 1e-3),
+            256 - 16 - 2 - 1 - 3
+        );
+        // La pile de 3 cache son côté contre celle de 7 ; celle de 7 montre le sien.
+        let at_x9 = |q: &Quad| (q.c[0] - 9.0).abs() < 1e-4 && inside(q, 9.0, 9.0, 8.0, 9.0);
+        assert_eq!(quads(&|q| at_x9(q) && q.face == 0), 0);
+        assert_eq!(quads(&|q| at_x9(q) && q.face == 1), 1);
+        // La pile de plusieurs couleurs : trois suites, chacune sur ses quatre côtés.
+        let stack = |q: &Quad| inside(q, 12.0, 13.0, 12.0, 13.0) && q.c[1] > 99.99;
+        let tex = |key: &str, face| face_tex(reg.by_key(key).unwrap(), face);
+        for (key, y0, y1) in [
+            ("carpet_red", 0.0, 2.0),
+            ("carpet_white", 2.0, 3.0),
+            ("carpet_magenta", 3.0, 4.0),
+        ] {
+            let run = |q: &Quad| {
+                stack(q)
+                    && side(q)
+                    && q.tex == tex(key, q.face)
+                    && (q.lo - (100.0 + y0 / 16.0)).abs() < 1e-4
+                    && (q.hi - (100.0 + y1 / 16.0)).abs() < 1e-4
+            };
+            assert_eq!(quads(&run), 4, "{key}");
+        }
+        assert_eq!(quads(&|q| stack(q) && side(q)), 12);
+        assert_eq!(quads(&|q| stack(q) && matches!(q.face, 2 | 3)), 1, "un seul dessus");
+        assert!(all
+            .iter()
+            .filter(|q| stack(q) && q.face == 2)
+            .all(|q| q.tex == tex("carpet_magenta", 2)));
+        // Neige : les dessus, et le pourtour seulement.
+        let snow = |q: &Quad| inside(q, 2.0, 5.0, 12.0, 13.0) && q.c[1] > 99.99;
+        assert_eq!(quads(&|q| snow(q) && q.face == 2 && q.c[1] > 100.3), 3);
+        assert_eq!(quads(&|q| snow(q) && side(q)), 8);
+    }
+
     #[test]
     fn single_block_has_six_faces_facing_out() {
         let w = empty_world_with_block(4, 100, 4);
@@ -3253,6 +3454,63 @@ mod tests {
 mod bench_empty {
     use super::*;
     use crate::World;
+
+    /// (v283) « Fais des tests de performance pour optimiser s'il y a plein de piles autour de
+    /// nous » : temps de maillage et triangles d'un chunk dont 8 étages de 16 × 16 cases sont
+    /// couverts de piles de tapis de toutes hauteurs et couleurs (le pire cas : aucune pile
+    /// n'a la hauteur de ses voisines), comparés au même chunk de tapis d'une couche.
+    #[test]
+    #[ignore]
+    fn mesh_time_carpet_stacks() {
+        use crate::registry::Layers;
+        let build = |stacked: bool| {
+            let mut w = World::new(0);
+            for cz in -1..=1 {
+                for cx in -1..=1 {
+                    w.insert_empty(ChunkPos { x: cx, z: cz });
+                }
+            }
+            let mut rng = 0x2545_f491_4f6c_dd1du64;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for floor in 0..8 {
+                let y = 100 + floor * 4;
+                for z in -16..32 {
+                    for x in -16..32 {
+                        w.set(x, y - 1, z, BlockId::STONE);
+                        let n = if stacked { 2 + (next() % 15) as u8 } else { 1 };
+                        let layers: Vec<u8> = (0..n).map(|_| (next() % 18) as u8).collect();
+                        let top = *layers.last().unwrap();
+                        let b = Layers::Carpet { n, kind: top }.block().unwrap();
+                        w.set(x, y, z, b);
+                        w.set_carpet_layers([x, y, z], &layers);
+                    }
+                }
+            }
+            w
+        };
+        for stacked in [false, true] {
+            let w = build(stacked);
+            let n = Neighborhood::from_world(&w, ChunkPos { x: 0, z: 0 }).unwrap();
+            let runs = 20;
+            let t = std::time::Instant::now();
+            let mut tris = 0;
+            for _ in 0..runs {
+                let m = mesh_neighborhood(&n);
+                tris = m.indices.len() / 3;
+                std::hint::black_box(m);
+            }
+            println!(
+                "{} : {:?} par chunk, {tris} triangles",
+                if stacked { "piles de 2 à 16 tapis" } else { "tapis d'une couche" },
+                t.elapsed() / runs
+            );
+        }
+    }
 
     /// Temps de maillage d'une carte « flottante » (blocs entre y 90 et 110, vide dessous).
     #[test]

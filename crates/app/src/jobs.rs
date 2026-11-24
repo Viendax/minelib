@@ -65,6 +65,12 @@ pub fn throttle(stolen_ms: f32, loading: bool, dt: f32) {
     minelib_render::perf::gauge("threads de fond actifs", next as f32);
 }
 
+/// (v283) « Optimise aussi qu'on puisse rejoindre plus vite » : derrière l'écran de chargement,
+/// personne ne joue, tous les threads de fond travaillent (pas de régulation).
+pub fn full_speed() {
+    ACTIVE_LIMIT.store(usize::MAX, Ordering::Relaxed);
+}
+
 /// Nombre de threads de fond pour `cores` cœurs.
 pub fn worker_count(cores: usize) -> usize {
     if uniform_sharing() {
@@ -256,8 +262,10 @@ fn worker_loop(
             Job::Generate(pos) => match std::panic::catch_unwind(|| generate(gen, seed, pos)) {
                 Ok(c) => Done::Generated(c),
                 Err(_) => {
-                    log::error!("génération du chunk {pos:?} en erreur : chunk ignoré");
-                    continue;
+                    // (v283) Rendu vide (il en arrive un) : l'écran de chargement, qui attend
+                    // toute la distance de rendu, ne l'attend pas pour toujours.
+                    log::error!("génération du chunk {pos:?} en erreur : chunk laissé vide");
+                    Done::Generated(Chunk::new(pos))
                 }
             },
             Job::Mesh { n, version } => {

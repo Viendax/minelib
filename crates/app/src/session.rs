@@ -135,9 +135,10 @@ fn drop_broken(
     items: &mut crate::drops::Items,
     at: Vec3,
     item: Item,
+    count: u8,
 ) {
     if matches!(item, Item::Head(_)) {
-        inventory.add(item, 1);
+        inventory.add(item, count as u32);
         return;
     }
     let (x, z) = (at.x.floor() as i32, at.z.floor() as i32);
@@ -145,11 +146,105 @@ fn drop_broken(
     while y > 0 && !world.get(x, y - 1, z).is_solid() {
         y -= 1;
     }
+    // (v283) Posé sur le dessus de ce qui le porte (un tapis : un seizième au-dessus de sa
+    // case, pas un bloc plus haut).
+    let top = minelib_world::registry::shape_boxes(world.get(x, y - 1, z), |dx, dy, dz| {
+        world.get(x + dx, y - 1 + dy, z + dz)
+    })
+    .iter()
+    .map(|b| b.1[1])
+    .max()
+    .unwrap_or(16);
+    let rest = (y - 1) as f32 + top as f32 / 16.0;
     let pile = minelib_net::items::Pile {
         item: item.code(),
-        count: 1,
+        count: count.max(1),
     };
-    items.drop_broken(at, Vec3::new(at.x, y as f32, at.z), pile);
+    items.drop_broken(at, Vec3::new(at.x, rest, at.z), pile);
+}
+
+/// (v283) Ce que rend une pile de neige fine ou de tapis cassée : une couche de neige par
+/// couche, un tapis de sa sorte par couche (avant de la casser : ses couleurs sont dans le
+/// monde). `None` : pas une pile.
+fn layer_drops(world: &World, at: [i32; 3], id: BlockId) -> Option<Vec<(Item, u8)>> {
+    use minelib_world::registry::Layers;
+    match Layers::of(id)? {
+        Layers::Snow(h) => Some(vec![(Item::Block(Layers::Snow(1).block()?), h)]),
+        Layers::Carpet { .. } => {
+            let mut out: Vec<(Item, u8)> = Vec::new();
+            for kind in world.carpet_layers(at)? {
+                let item = Item::Block(Layers::Carpet { n: 1, kind }.block()?);
+                match out.iter_mut().find(|e| e.0 == item) {
+                    Some(e) => e.1 += 1,
+                    None => out.push((item, 1)),
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+/// (v283) Neige fine, tapis : où va la couche que l'on pose et ce que devient sa case.
+/// Cliquée sur le dessus d'une pile de la même matière qui a encore de la place, ou dans la
+/// case d'une telle pile (clic sur le côté d'un bloc voisin) : une couche de plus (sa sorte
+/// de tapis en haut). Sinon une première couche, dans la case libre contre la face visée, sur
+/// un bloc qui la porte (la neige : sur un dessus plein). `None` : l'objet n'est pas une
+/// couche ; `Some(None)` : rien à poser là.
+#[allow(clippy::type_complexity)]
+fn layer_placement(
+    world: &World,
+    hit: &Hit,
+    item: BlockId,
+) -> Option<Option<([i32; 3], BlockId, Option<Vec<u8>>)>> {
+    use minelib_world::registry::Layers;
+    let new = Layers::of(item)?;
+    let kind = match new {
+        Layers::Carpet { kind, .. } => kind,
+        Layers::Snow(_) => 0,
+    };
+    let grow = |at: [i32; 3], id: BlockId| {
+        let l = Layers::of(id)?;
+        if !l.same_matter(new) {
+            return None;
+        }
+        let more = l.plus_one(kind)?;
+        let layers = match l {
+            Layers::Carpet { .. } => {
+                let mut v = world.carpet_layers(at)?;
+                v.push(kind);
+                Some(v)
+            }
+            Layers::Snow(_) => None,
+        };
+        Some((at, more.block()?, layers))
+    };
+    if hit.normal == [0, 1, 0] {
+        if let Some(r) = grow(hit.block, hit.id) {
+            return Some(Some(r));
+        }
+    }
+    let p = hit.adjacent();
+    let there = world.get(p[0], p[1], p[2]);
+    if let Some(r) = grow(p, there) {
+        return Some(Some(r));
+    }
+    if there.is_targetable() {
+        return Some(None);
+    }
+    // Une première couche : sur un bloc qui la porte.
+    let below = world.get(p[0], p[1] - 1, p[2]);
+    let top = minelib_world::registry::shape_boxes(below, |dx, dy, dz| {
+        world.get(p[0] + dx, p[1] - 1 + dy, p[2] + dz)
+    })
+    .iter()
+    .map(|b| b.1[1])
+    .max()
+    .unwrap_or(0);
+    let holds = match new {
+        Layers::Snow(_) => below.is_solid() && top == 16,
+        Layers::Carpet { .. } => below.is_solid(),
+    };
+    Some(holds.then_some((p, item, None)))
 }
 
 /// (v281) Seau nommé dans `/give` : `seau` (vide), `seau_eau`, `seau_lave` (aussi en anglais,
@@ -227,20 +322,50 @@ fn crackle_id(pseudo: &str) -> u64 {
 const BREAK_S: f32 = 0.5;
 
 /// (v220) À l'arrivée dans un monde, on n'y apparaît (chez soi comme chez les autres)
-/// qu'une fois affichés les chunks à moins de tant de chunks de soi (au plus la distance de
-/// rendu), et les shaders du monde prêts ; au plus tard après `LOAD_MAX_S` secondes. Au
-/// moins `LOAD_MIN_S` : en ligne, ce que le relais a de changé autour de soi arrive avant.
-const LOAD_RADIUS: i32 = 4;
+/// qu'une fois tout chargé (`loading_done`). Au moins `LOAD_MIN_S` : en ligne, ce que le
+/// relais a de changé autour de soi arrive avant.
+///
+/// (v283) **RÈGLE DE VIENDAX** (24 novembre, 18 h 55 : « je suis encore en jeu alors que le
+/// jeu n'a pas fini d'être chargé : ça ne doit pas être possible ; corrige, note-le bien dans
+/// le projet, fais en sorte que dans le code on ne puisse pas changer ça »). Avant, on entrait
+/// une fois affichés les chunks à 4 chunks de soi (le reste de la distance de rendu
+/// apparaissait sous ses yeux), et de force au bout de 30 s. Maintenant : **toute** la
+/// distance de rendu, aucune sortie au bout d'un temps, une seule porte (`loading_done`,
+/// appelée par `check_loaded`, le seul endroit qui ferme l'écran de chargement). Les essais
+/// `nothing_is_entered_before_everything_is_loaded` échouent si cela change.
 const LOAD_MIN_S: f32 = 0.5;
-const LOAD_MAX_S: f32 = 30.0;
 
 /// (v220) Monde en cours de chargement (voir `Session::loading`).
 struct Loading {
     since: std::time::Instant,
     /// Chunks affichés autour de soi, et combien il en faut.
     shown: (usize, usize),
-    /// Shaders du monde prêts.
+    /// Shaders du monde prêts, et (v283) ceux des lumières si le monde en a (sinon : vrai).
     shaders: bool,
+}
+
+impl Loading {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            shown: (0, 1),
+            shaders: false,
+        }
+    }
+}
+
+/// (v283) La seule porte d'entrée dans le monde (voir `LOAD_MIN_S`) : chaque chunk de toute la
+/// distance de rendu affiché (maillé et envoyé à la carte graphique ; un chunk vide ou refusé
+/// faute de mémoire vidéo compte aussi), les shaders du monde prêts (et ceux des lumières dans
+/// un monde qui en a), en ligne la météo du serveur arrivée (`weather`), et l'écran montré au
+/// moins `LOAD_MIN_S`. Aucune condition de
+/// temps ne l'ouvre : un monde qui ne se charge pas garde son écran (Échap reste possible).
+fn loading_done(l: &Loading, weather: bool) -> bool {
+    l.shaders
+        && weather
+        && l.shown.1 > 0
+        && l.shown.0 >= l.shown.1
+        && l.since.elapsed().as_secs_f32() >= LOAD_MIN_S
 }
 
 /// Réglages de rendu choisis au lancement.
@@ -536,10 +661,11 @@ pub struct Session {
     items: crate::drops::Items,
     /// `items` est-il prêt (sauvegarde relue, ou remise au relais par le propriétaire) ?
     items_ready: bool,
-    /// (v220) Monde pas encore chargé (voir `LOAD_RADIUS`) : on n'y apparaît pas. Ni
-    /// touches ni physique (le joueur reste où il arrive), sa position ne part pas aux autres
-    /// (construction en ligne) et il ne se présente pas à l'hôte (partie FPS) ; l'écran de
-    /// chargement cache le monde.
+    /// (v220) Monde pas encore chargé (voir `LOAD_MIN_S` et `loading_done`, la seule porte) :
+    /// on n'y apparaît pas. Ni touches ni physique (le joueur reste où il arrive), sa position
+    /// ne part pas aux autres (construction en ligne) et il ne se présente pas à l'hôte (partie
+    /// FPS) ; l'écran de chargement cache le monde. (v283) Revient après un téléport ou une
+    /// réapparition là où le monde n'est pas chargé (`arrive_elsewhere`).
     loading: Option<Loading>,
     items_seeded: bool,
     /// Horloge du ciel : n'avance qu'avec l'heure (nuages immobiles à heure fixe).
@@ -985,11 +1111,7 @@ impl Session {
             frame_aim: None,
             items: crate::drops::Items::new(true),
             items_ready: false,
-            loading: Some(Loading {
-                since: std::time::Instant::now(),
-                shown: (0, 1),
-                shaders: false,
-            }),
+            loading: Some(Loading::new()),
             items_seeded: false,
             sky_clock: 0.0,
             overlay: Overlay::default(),
@@ -1274,7 +1396,14 @@ impl Session {
         if self.keys.muted_key.is_some_and(|k| !input.held(k)) {
             self.keys.muted_key = None;
         }
-        crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
+        // (v283) Derrière l'écran de chargement : tous les threads de fond, et les maillages
+        // envoyés au GPU par plus grosses fournées (« qu'on puisse rejoindre plus vite »).
+        if self.loading.is_some() {
+            crate::jobs::full_speed();
+        } else {
+            crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
+        }
+        self.streamer.set_loading(self.loading.is_some());
         // (v220) Monde pas encore chargé : on n'y apparaît pas (voir `loading`).
         self.check_loaded(renderer);
         // Test des touches : il lit le clavier et la souris, le jeu ne reçoit rien.
@@ -3044,7 +3173,7 @@ impl Session {
         if self.game.mode != GameMode::Creative {
             let at = Vec3::from(screen.anchor().center);
             let item = Item::Screen(screen.size);
-            drop_broken(&self.world, &mut self.inventory, &mut self.items, at, item);
+            drop_broken(&self.world, &mut self.inventory, &mut self.items, at, item, 1);
         }
         self.screens_changed(true);
     }
@@ -3902,12 +4031,16 @@ impl Session {
             } else {
                 head.unwrap_or(Item::Block(hit.id))
             };
+            // (v283) Neige fine, tapis : la pile part entière et rend chacune de ses couches.
+            let drops = layer_drops(&self.world, hit.block, hit.id).unwrap_or_else(|| vec![(item, 1)]);
             self.dirty.extend(self.world.set(x, y, z, BlockId::AIR));
             // En créatif, comme dans Minecraft : le bloc cassé ne s'ajoute pas à l'inventaire.
             // (v281) En survie, il tombe en objet au sol, de sa case (`drop_broken`).
             if self.game.mode != GameMode::Creative {
                 let at = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
-                drop_broken(&self.world, &mut self.inventory, &mut self.items, at, item);
+                for (item, count) in drops {
+                    drop_broken(&self.world, &mut self.inventory, &mut self.items, at, item, count);
+                }
             }
             self.break_cooldown = 0.22;
         }
@@ -3984,6 +4117,23 @@ impl Session {
                     return;
                 }
             }
+            // (v283) Neige fine, tapis : sur une pile de la même matière, une couche de plus
+            // (« elle s'empile ») ; les tapis gardent la couleur de chacune.
+            if let Some(Item::Block(b)) = self.inventory.selected_item() {
+                if let Some(r) = layer_placement(&self.world, &hit, b) {
+                    if let Some((p, id, layers)) = r {
+                        if !self.player.overlaps_block(p) || !id.is_solid() {
+                            self.dirty.extend(self.world.set(p[0], p[1], p[2], id));
+                            if let Some(l) = layers {
+                                self.world.set_carpet_layers(p, &l);
+                            }
+                            self.use_selected();
+                        }
+                    }
+                    self.place_cooldown = 0.22;
+                    return;
+                }
+            }
             // Dalles : orientation selon la face visée, et deux dalles du même matériau dans
             // une case font un bloc complet (comme dans Minecraft).
             if let Some(Item::Block(b)) = self.inventory.selected_item() {
@@ -3999,8 +4149,11 @@ impl Session {
                     return;
                 }
             }
-            let [x, y, z] = hit.adjacent();
-            let free = !self.world.get(x, y, z).is_targetable();
+            // (v283) Une seule couche de neige : le bloc posé dessus la remplace.
+            let thin_snow = minelib_world::registry::Layers::of(hit.id)
+                == Some(minelib_world::registry::Layers::Snow(1));
+            let [x, y, z] = if thin_snow { hit.block } else { hit.adjacent() };
+            let free = thin_snow || !self.world.get(x, y, z).is_targetable();
             // Bûche contre un mur : couchée, dans l'axe de la face visée (comme Minecraft).
             if let Some(Item::Block(b)) = self.inventory.selected_item() {
                 let key = &b.def().key;
@@ -4116,6 +4269,14 @@ impl Session {
                         .as_ref()
                         .map_or(crate::heads::HeadSkin::Default, |h| h.skin_at(hit.block)),
                 )
+            } else if let Some(l) = minelib_world::registry::Layers::of(hit.id) {
+                // (v283) Neige fine : une couche ; pile de tapis : un tapis de la sorte du dessus.
+                use minelib_world::registry::Layers;
+                let one = match l {
+                    Layers::Snow(_) => Layers::Snow(1),
+                    Layers::Carpet { kind, .. } => Layers::Carpet { n: 1, kind },
+                };
+                Item::Block(one.block().unwrap_or(hit.id))
             } else {
                 // (v281) Une dalle ou un escalier retiré (déjà posé) : son bloc plein.
                 Item::Block(minelib_world::registry::retired_shape_base(hit.id).unwrap_or(hit.id))
@@ -6533,35 +6694,33 @@ impl Session {
         }
     }
 
-    /// (v220) Chargement du monde : chunks affichés autour de soi (voir `LOAD_RADIUS`),
-    /// shaders du monde ; fini (ou trop long), on apparaît : chez les autres en construction
-    /// en ligne (sa position part), à l'hôte d'une partie FPS (il se présente).
-    fn check_loaded(&mut self, renderer: &Renderer) {
+    /// (v220) Chargement du monde ; fini (`loading_done` : la seule porte, voir `LOAD_MIN_S`),
+    /// on apparaît : chez les autres en construction en ligne (sa position part), à l'hôte
+    /// d'une partie FPS (il se présente).
+    fn check_loaded(&mut self, renderer: &mut Renderer) {
+        // (v283) Un monde qui a des lumières de l'éditeur : leurs shaders aussi (lancés tout
+        // de suite, ils se compilent pendant que le monde se charge).
+        let lights = self.loading.is_some()
+            && !self.lights.scene.is_empty()
+            && !(self.net.is_some() && self.game.mode == GameMode::Fps);
+        if lights {
+            renderer.warm_dyn_lights();
+        }
         if let Some(l) = &mut self.loading {
             let p = self.player.pos;
-            l.shown = self.streamer.shown_within(p.x, p.z, LOAD_RADIUS);
-            l.shaders = renderer.world_ready();
-            let t = l.since.elapsed().as_secs_f32();
+            // (v283) Toute la distance de rendu (avant : 4 chunks autour de soi).
+            l.shown = self.streamer.shown_within(p.x, p.z, self.streamer.radius);
+            l.shaders = renderer.world_ready() && (!lights || renderer.dyn_lights_ready());
             // (v247) « On ne doit pas pouvoir rejoindre tant que tout n'est pas chargé (il y
             // avait un orage et les nuages étaient mal chargés) » : en ligne, aussi la météo du
             // serveur (elle arrive par le relais, juste après l'entrée).
             let weather = self.build.is_none() || self.weather_synced;
-            let ready = l.shaders && l.shown.0 >= l.shown.1 && t >= LOAD_MIN_S && weather;
-            if ready || t >= LOAD_MAX_S {
-                if ready {
-                    log::info!(
-                        "monde chargé en {t:.1} s ({} chunks autour de soi affichés)",
-                        l.shown.1
-                    );
-                } else {
-                    log::warn!(
-                        "monde pas fini de charger après {t:.0} s ({} chunks sur {}, shaders {}) \
-                         : on y entre quand même",
-                        l.shown.0,
-                        l.shown.1,
-                        if l.shaders { "prêts" } else { "pas prêts" }
-                    );
-                }
+            if loading_done(l, weather) {
+                log::info!(
+                    "monde chargé en {:.1} s ({} chunks affichés : toute la distance de rendu)",
+                    l.since.elapsed().as_secs_f32(),
+                    l.shown.1
+                );
                 self.loading = None;
                 if let Some(n) = &mut self.net {
                     n.loaded();
@@ -6572,6 +6731,20 @@ impl Session {
         }
         if let Some(b) = &mut self.build {
             b.hidden = self.loading.is_some();
+        }
+    }
+
+    /// (v283) Arrivé ailleurs (téléporté, réapparu loin) : si le monde n'y est pas tout chargé,
+    /// l'écran de chargement revient jusqu'à ce qu'il le soit (`loading_done`). Pas en partie
+    /// FPS (les départs sont dans la carte, déjà chargée).
+    fn arrive_elsewhere(&mut self) {
+        if self.net.is_some() || self.loading.is_some() {
+            return;
+        }
+        let p = self.player.pos;
+        let (shown, all) = self.streamer.shown_within(p.x, p.z, self.streamer.radius);
+        if shown < all {
+            self.loading = Some(Loading::new());
         }
     }
 
@@ -7090,6 +7263,8 @@ impl Session {
         self.eating = None;
         self.eat_bow = 0.0;
         self.fps.respawn();
+        // (v283) Réapparu loin : pas en jeu tant que le monde n'y est pas chargé.
+        self.arrive_elsewhere();
     }
 
     /// Point d'apparition du monde.
@@ -7166,6 +7341,8 @@ impl Session {
         }
         self.fall_from = None;
         self.fall_top = None;
+        // (v283) Pas en jeu tant que le monde n'y est pas chargé.
+        self.arrive_elsewhere();
     }
 
     /// (v223) `/setspawn` : le point d'apparition là où l'on est. En solo, enregistré avec le
@@ -9290,7 +9467,11 @@ impl Session {
                             .find(|b| b.def().name.to_lowercase() == want)
                     })
                     // (v281) Pas les dalles et escaliers retirés (TNT, eau, lave, minerais…).
-                    .filter(|b| minelib_world::registry::retired_shape_base(*b).is_none());
+                    // (v283) Ni les piles de tapis (elles se font en empilant des tapis).
+                    .filter(|b| {
+                        minelib_world::registry::retired_shape_base(*b).is_none()
+                            && !b.def().key.starts_with("carpet_stack:")
+                    });
                 match found {
                     _ if screen_size(&want).is_some() => {
                         let size = screen_size(&want).unwrap_or(crate::screen::NORMAL);
@@ -13060,7 +13241,10 @@ fn build_voxel_grid(
                             solid_cells[(x + vx * (y + vy * z)) as usize] = true;
                         }
                         if id.0 != 0 && keep.get(id.0 as usize).copied().unwrap_or(false) {
-                            ids[(x + vx * (y + vy * z)) as usize] = id.0;
+                            // (v283) Numéro sur 12 bits : un bloc au-delà de 4096 (les
+                            // dernières piles de tapis) y est un bloc de la même forme.
+                            ids[(x + vx * (y + vy * z)) as usize] =
+                                minelib_world::registry::rt_stand_in(id).0;
                             if is_mirror.get(id.0 as usize).copied().unwrap_or(false) {
                                 mirrors.push([x, y, z]);
                             }
@@ -13516,6 +13700,53 @@ fn side_of_start(start: u8, i: u32) -> u8 {
         start
     } else {
         1 - start
+    }
+}
+
+#[cfg(test)]
+mod loading_tests {
+    use super::*;
+
+    /// (v283) RÈGLE DE VIENDAX : « je suis encore en jeu alors que le jeu n'a pas fini d'être
+    /// chargé : ça ne doit pas être possible ; fais en sorte que dans le code on ne puisse pas
+    /// changer ça ». On n'entre qu'une fois chaque chunk de toute la distance de rendu affiché,
+    /// les shaders prêts et (en ligne) la météo du serveur arrivée, même une heure après ; et
+    /// le code n'a qu'une porte : si quelqu'un ajoute une sortie au bout d'un temps, ferme
+    /// l'écran de chargement ailleurs ou ne compte qu'une partie de la distance de rendu, cet
+    /// essai échoue.
+    #[test]
+    fn nothing_is_entered_before_everything_is_loaded() {
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        let l = |shown, all, shaders| Loading {
+            since: long_ago,
+            shown: (shown, all),
+            shaders,
+        };
+        assert!(!loading_done(&l(4224, 4225, true), true), "un chunk manque");
+        assert!(!loading_done(&l(4225, 4225, false), true), "shaders pas prêts");
+        assert!(!loading_done(&l(4225, 4225, true), false), "météo du serveur pas arrivée");
+        assert!(!loading_done(&l(0, 0, true), true));
+        assert!(loading_done(&l(4225, 4225, true), true));
+        let fresh = Loading {
+            since: std::time::Instant::now(),
+            shown: (81, 81),
+            shaders: true,
+        };
+        assert!(!loading_done(&fresh, true), "l'écran se montre au moins LOAD_MIN_S");
+        // Une seule porte, dans `check_loaded`, qui passe par `loading_done` et compte toute
+        // la distance de rendu.
+        let src = include_str!("session.rs");
+        let close = concat!("self.loading", " = None");
+        assert_eq!(src.matches(close).count(), 1, "l'écran de chargement se ferme ailleurs");
+        assert!(!src.contains(concat!("self.loading", ".take()")));
+        assert!(!src.contains(concat!("LOAD_", "MAX_S")), "une durée maximale est revenue");
+        let check = &src[src.find("fn check_loaded(").unwrap()..];
+        let check = &check[..check.find("\n    }\n").unwrap()];
+        assert!(check.contains(close) && check.contains("loading_done(l, weather)"));
+        assert!(check.contains("shown_within(p.x, p.z, self.streamer.radius)"));
+        let gate = &src[src.find("fn loading_done(").unwrap()..];
+        let gate = &gate[..gate.find("\n}\n").unwrap()];
+        assert!(!gate.contains("||"), "une autre façon d'entrer : {gate}");
     }
 }
 

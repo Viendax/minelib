@@ -11,6 +11,10 @@ use crate::jobs::{Done, Job, Workers};
 
 /// On ne recalcule la sélection que si le joueur a bougé d'au moins autant de blocs.
 const RESELECT_DISTANCE: f32 = 8.0;
+/// Envois au GPU par image, en jeu (µs) : pas de saccade.
+const UPLOAD_US: u64 = 1500;
+/// (v283) Derrière l'écran de chargement (µs) : l'image peut attendre, le monde arrive plus vite.
+const UPLOAD_LOADING_US: u64 = 12_000;
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct StreamStats {
@@ -41,6 +45,9 @@ pub struct Streamer {
     sched_from: usize,
     /// Résultats reçus pas encore envoyés au GPU (envois étalés sur plusieurs images).
     backlog: std::collections::VecDeque<Done>,
+    /// (v283) Temps d'envoi au GPU par image (µs) : 1,5 ms en jeu, davantage derrière l'écran
+    /// de chargement (`set_loading`).
+    upload_us: u64,
     pub stats: StreamStats,
     /// Chunks maillés (et affichés) depuis le dernier relevé : leurs blocs « tête » avec la
     /// lumière reçue, et la lumière à leurs points de mesure (voir `take_heads`).
@@ -96,6 +103,7 @@ impl Streamer {
             idle: false,
             sched_from: 0,
             backlog: std::collections::VecDeque::new(),
+            upload_us: UPLOAD_US,
             stats: StreamStats::default(),
             heads: HashMap::new(),
         }
@@ -115,6 +123,12 @@ impl Streamer {
         let list = select(px, pz, radius.min(self.radius).max(0));
         let shown = list.iter().filter(|c| self.meshed.contains(c)).count();
         (shown, list.len())
+    }
+
+    /// (v283) Écran de chargement : personne ne joue, les maillages partent au GPU par plus
+    /// grosses fournées à chaque image (on rejoint plus vite).
+    pub fn set_loading(&mut self, on: bool) {
+        self.upload_us = if on { UPLOAD_LOADING_US } else { UPLOAD_US };
     }
 
     /// Nouvelle distance de rendu : la sélection sera refaite à l'image suivante.
@@ -196,7 +210,7 @@ impl Streamer {
         let start = std::time::Instant::now();
         let (mut meshes, mut bytes) = (0usize, 0usize);
         while let Some(done) = self.backlog.pop_front() {
-            if meshes > 0 && start.elapsed() > std::time::Duration::from_micros(1500) {
+            if meshes > 0 && start.elapsed() > std::time::Duration::from_micros(self.upload_us) {
                 self.backlog.push_front(done);
                 break;
             }

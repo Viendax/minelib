@@ -395,7 +395,50 @@ pub fn save_world(dir: &Path, d: &SaveData, world: &World) -> Result<()> {
     }
     fs::write(dir.join("edits.bin"), bin)?;
     write_chunks_bin(dir, world)?;
+    write_carpets(dir, world)?;
     write_torches(dir, world)
+}
+
+/// (v283) Fichier des piles de tapis de plusieurs couleurs d'un monde.
+pub const CARPETS_FILE: &str = "tapis.txt";
+
+/// (v283) Ligne d'une pile de tapis : `x,y,z,sorte sorte …` (du dessous au dessus, noms de
+/// `registry::CARPET_KINDS`).
+pub fn carpet_line(p: [i32; 3], layers: &[u8]) -> String {
+    let kinds: Vec<&str> = layers
+        .iter()
+        .filter_map(|&k| minelib_world::registry::CARPET_KINDS.get(k as usize).copied())
+        .collect();
+    format!("{},{},{},{}", p[0], p[1], p[2], kinds.join(" "))
+}
+
+/// (v283) Lit une ligne de `carpet_line`.
+pub fn parse_carpet(line: &str) -> Option<([i32; 3], Vec<u8>)> {
+    let v: Vec<&str> = line.trim().splitn(4, ',').collect();
+    let [x, y, z, kinds] = v.as_slice() else {
+        return None;
+    };
+    let layers: Option<Vec<u8>> = kinds
+        .split_whitespace()
+        .map(minelib_world::registry::carpet_kind)
+        .collect();
+    Some(([x.parse().ok()?, y.parse().ok()?, z.parse().ok()?], layers?))
+}
+
+/// (v283) `tapis.txt` : les piles de tapis de plusieurs couleurs (fichier supprimé s'il n'y
+/// en a plus).
+fn write_carpets(dir: &Path, world: &World) -> Result<()> {
+    let mut lines: Vec<String> = world.carpets().map(|(p, l)| carpet_line(p, l)).collect();
+    let path = dir.join(CARPETS_FILE);
+    if lines.is_empty() {
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        return Ok(());
+    }
+    lines.sort();
+    fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
 }
 
 /// (v209) `chunks.bin` déjà sur le disque pour cet ensemble de chunks importés (dossier →
@@ -614,6 +657,12 @@ pub fn load_world(dir: &Path) -> Result<(SaveData, World)> {
             );
         }
     }
+    // (v283) Les piles de tapis de plusieurs couleurs.
+    if let Ok(text) = fs::read_to_string(dir.join(CARPETS_FILE)) {
+        for (p, layers) in text.lines().filter_map(parse_carpet) {
+            world.load_carpet(p, layers);
+        }
+    }
     Ok((data, world))
 }
 
@@ -742,6 +791,12 @@ mod tests {
         world.place_torch(5, 150, 5, Some(2));
         world.place_torch(6, 150, 5, Some(1));
         world.set_torch_infinite([6, 150, 5]);
+        // (v283) Une pile de tapis rouge, blanc, mousse.
+        let stack = minelib_world::registry::Layers::Carpet { n: 3, kind: 16 }
+            .block()
+            .unwrap();
+        world.set(7, 150, 2, stack);
+        world.set_carpet_layers([7, 150, 2], &[14, 0, 16]);
         world.clock = 99.5;
         data.clock = world.clock;
         data.player = Some(PlayerState {
@@ -762,6 +817,13 @@ mod tests {
         assert_eq!(w.torch([5, 150, 5]).unwrap().chemical, Some(2));
         assert!(!w.torch([5, 150, 5]).unwrap().infinite);
         assert!(w.torch([6, 150, 5]).unwrap().infinite);
+        assert_eq!(w.carpet_layers([7, 150, 2]), Some(vec![14, 0, 16]));
+        assert_eq!(
+            fs::read_to_string(w1.join(CARPETS_FILE)).unwrap(),
+            "7,150,2,red white moss\n"
+        );
+        assert_eq!(parse_carpet("1,2,3,red red"), Some(([1, 2, 3], vec![14, 14])));
+        assert_eq!(parse_carpet("1,2,3,rouge"), None);
         assert_eq!(d2.clock, 99.5);
         assert!(d2.player.unwrap().flying);
         let inv = d2.inventory.unwrap();

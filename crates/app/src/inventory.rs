@@ -604,6 +604,8 @@ pub fn catalogue() -> &'static [(Item, usize)] {
                 || d.key.contains(":upper")
                 // (v281) Dalles et escaliers retirés (TNT, eau, lave, minerais, feuillages…).
                 || minelib_world::registry::retired_shape_base(BlockId(i as u16)).is_some()
+                // (v283) Les piles de tapis se font en empilant des tapis.
+                || d.key.starts_with("carpet_stack:")
             {
                 continue;
             }

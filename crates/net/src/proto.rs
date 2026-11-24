@@ -51,7 +51,10 @@ use serde::{Deserialize, Serialize};
 /// (`game::ToPeer::FastPing`).
 /// (v274) 71 : voie rapide : l'hôte signale un passeur muet ou lent (`FastBad`), les états
 /// complets partent aussi par les passeurs.
-pub const PROTOCOL: u32 = 71;
+/// (v283) 72 : les tapis ont une hitbox (un seizième de bloc) et s'empilent (nouveaux blocs, en
+/// fin de registre), on s'enfonce d'une couche dans la neige fine : la simulation des joueurs
+/// d'une partie FPS (et les blocs d'un serveur) doivent être les mêmes chez tous.
+pub const PROTOCOL: u32 = 72;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.

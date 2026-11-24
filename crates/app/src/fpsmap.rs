@@ -233,6 +233,17 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
             .iter()
             .map(|z| format!("{DOOR_PREFIX}{}", zone_text(z))),
     );
+    // CHANGEMENT DE CARTE (v283) : les piles de tapis de plusieurs couleurs (`tapis.txt`),
+    // avec les torches, préfixées « tapis, » : ceux qui reçoivent la carte (serveur de
+    // construction, partie FPS) voient chaque couche de sa couleur. Une carte qui en a change
+    // de signature ; une carte sans en garde la sienne.
+    torches.extend(
+        fs::read_to_string(dir.join(crate::save::CARPETS_FILE))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(crate::save::parse_carpet)
+            .map(|(p, l)| format!("{CARPET_PREFIX}{}", crate::save::carpet_line(p, &l))),
+    );
     torches.sort();
     torches.dedup();
     Ok(MapPackage {
@@ -251,6 +262,9 @@ const LIGHT_PREFIX: &str = "lumiere,";
 /// (v258) Préfixe des portes posées pour la partie parmi les torches d'un paquet.
 const DOOR_PREFIX: &str = "porte,";
 
+/// (v283) Préfixe des piles de tapis de plusieurs couleurs parmi les torches d'un paquet.
+const CARPET_PREFIX: &str = "tapis,";
+
 /// Signatures déjà calculées : (dossier) → (date des fichiers, signature).
 #[derive(Default)]
 pub struct SigCache {
@@ -267,6 +281,7 @@ pub(crate) fn stamp(dir: &Path) -> u64 {
         TIME_FILE,
         FILE,
         crate::lights::SCENE_FILE,
+        crate::save::CARPETS_FILE,
     ]
     .iter()
     .filter_map(|f| fs::metadata(dir.join(f)).ok())
@@ -365,7 +380,10 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         .torches
         .iter()
         .filter(|l| {
-            !l.starts_with("heure,") && !l.starts_with(LIGHT_PREFIX) && !l.starts_with(DOOR_PREFIX)
+            !l.starts_with("heure,")
+                && !l.starts_with(LIGHT_PREFIX)
+                && !l.starts_with(DOOR_PREFIX)
+                && !l.starts_with(CARPET_PREFIX)
         })
         .partition(|l| l.starts_with("tete,"));
     let mut t = torches
@@ -382,6 +400,19 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         .map(|l| l["tete,".len()..].to_string())
         .collect();
     crate::mcimport::write_heads(&dir, &heads);
+    // (v283) Les piles de tapis de plusieurs couleurs.
+    let carpets: Vec<String> = p
+        .torches
+        .iter()
+        .filter_map(|l| l.strip_prefix(CARPET_PREFIX))
+        .filter_map(crate::save::parse_carpet)
+        .map(|(pos, l)| crate::save::carpet_line(pos, &l))
+        .collect();
+    if carpets.is_empty() {
+        let _ = fs::remove_file(dir.join(crate::save::CARPETS_FILE));
+    } else {
+        fs::write(dir.join(crate::save::CARPETS_FILE), carpets.join("\n") + "\n")?;
+    }
     // (v258) Les portes posées pour la partie : dans les lignes du paquet.
     let mut fps = p.fps.clone();
     fps.door_list = p
@@ -601,6 +632,31 @@ mod tests {
         let mut all = theirs.clone();
         all.set_doors(true);
         assert!(all.door_usable([4, 64, 5]));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// (v283) Les piles de tapis de plusieurs couleurs partent avec la carte : une autre
+    /// signature (une carte sans en garde la sienne), les mêmes couleurs chez qui la reçoit.
+    #[test]
+    fn carpet_stacks_go_with_the_map() {
+        let root = std::env::temp_dir().join(format!("minelib-carte-tapis-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = crate::save::create_world(&root, "Salon", 4).unwrap();
+        let bare = package(&dir).unwrap();
+        fs::write(dir.join(crate::save::CARPETS_FILE), "3,70,4,red white\n-2,71,9,moss blue black\n").unwrap();
+        let with = package(&dir).unwrap();
+        assert_ne!(with.signature(), bare.signature());
+        let copy = unpack(&root.join("maps"), "Copie", &with.to_bytes()).unwrap();
+        let mut lines: Vec<String> = fs::read_to_string(copy.join(crate::save::CARPETS_FILE))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        assert_eq!(lines, ["-2,71,9,moss blue black", "3,70,4,red white"]);
+        let t = fs::read_to_string(copy.join("torches.txt")).unwrap_or_default();
+        assert!(!t.contains(CARPET_PREFIX));
+        assert_eq!(package(&copy).unwrap().signature(), with.signature());
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -1407,6 +1407,19 @@ pub(crate) fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec
     if !def.solid {
         return Vec::new();
     }
+    let o = Vec3::new(x as f32, y as f32, z as f32);
+    // (v283) Neige fine : on s'y enfonce d'une couche (une seule couche ne retient rien, elle
+    // n'est d'ailleurs pas solide ; huit couches arrêtent à 14 seizièmes).
+    if let Some(minelib_world::registry::Layers::Snow(h)) =
+        minelib_world::registry::Layers::of(world.get(x, y, z))
+    {
+        let top = 2 * h.saturating_sub(1);
+        return if top == 0 {
+            Vec::new()
+        } else {
+            vec![(o, o + Vec3::new(1.0, top as f32 / 16.0, 1.0))]
+        };
+    }
     // (v251) La forme dessinée (`shape_boxes`) : une vitre seule, en croix, arrête le joueur
     // sur toute sa croix (avant : seulement sur son poteau du milieu, on passait au travers).
     let mut boxes = minelib_world::registry::shape_boxes(world.get(x, y, z), |dx, dy, dz| {
@@ -1419,7 +1432,6 @@ pub(crate) fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec
             b[1] = 16;
         }
     }
-    let o = Vec3::new(x as f32, y as f32, z as f32);
     boxes
         .into_iter()
         .map(|(a, b)| {

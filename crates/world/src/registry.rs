@@ -1366,6 +1366,7 @@ fn build() -> Registry {
                 ..PART
             },
         );
+        // (v283) « Les tapis : fais leur hitbox » : on marche dessus (un seizième de bloc).
         b.add(
             format!("carpet_{}", DYES[i]),
             format!("tapis {}", DYES_FR[i]),
@@ -1376,7 +1377,7 @@ fn build() -> Registry {
                 y1: 16,
             },
             &[wool[i].clone(), wool[i].clone(), wool[i].clone()],
-            DECOR,
+            PART,
         );
         let TexSrc::Pack(w) = wool[i] else {
             unreachable!()
@@ -1739,10 +1740,11 @@ fn build() -> Registry {
             Props { light, ..props },
         );
     }
+    // (v283) « Couche de neige » : la neige fine, de 1 à 8 couches (8 font un bloc).
     for h in 1u8..=8 {
         b.add(
             format!("snow_layer:{h}"),
-            "neige".into(),
+            "couche de neige".into(),
             Shape::Panel {
                 side: 3,
                 thick: h * 2,
@@ -1942,7 +1944,223 @@ fn build() -> Registry {
     }
     // (v179) Blocs récents des cartes : à la fin (blocs et textures d'avant inchangés).
     recent_blocks(&mut b);
+    // (v283) Piles de tapis : à la fin aussi.
+    carpet_stacks(&mut b);
     b.r
+}
+
+/// (v283) Sortes de tapis : les 16 teintures (`DYES`), puis la mousse et la mousse pâle. Leur
+/// numéro sert de couleur aux couches d'une pile (`Layers::Carpet`, `World::carpet_layers`).
+pub const CARPET_KINDS: [&str; 18] = [
+    "white",
+    "orange",
+    "magenta",
+    "light_blue",
+    "yellow",
+    "lime",
+    "pink",
+    "gray",
+    "silver",
+    "cyan",
+    "purple",
+    "blue",
+    "brown",
+    "green",
+    "red",
+    "black",
+    "moss",
+    "pale_moss",
+];
+
+/// (v283) Bloc d'une seule épaisseur de la sorte de tapis `kind`.
+fn carpet_key(kind: usize) -> String {
+    match CARPET_KINDS[kind] {
+        "moss" => "moss_carpet".into(),
+        "pale_moss" => "pale_moss_carpet".into(),
+        dye => format!("carpet_{dye}"),
+    }
+}
+
+/// (v283) Tapis empilés : « fais qu'on puisse les empiler comme la neige, mais différentes
+/// couleurs sont possibles dans le même bloc ». De 2 à 16 épaisseurs (un tapis fait un
+/// seizième de bloc : 16 font un bloc), une suite par sorte du tapis du dessus. Les sortes des
+/// couches du dessous sont gardées par le monde (`World::carpet_layers`) ; sans elles, la
+/// pile est toute de la sorte du dessus. On marche dessus comme sur les tapis.
+fn carpet_stacks(b: &mut Builder) {
+    // (Par sorte, puis par hauteur : les sortes du début ont leurs piles sous le numéro 4096,
+    // celles que le raytracing voit telles quelles, voir `rt_stand_in`.)
+    for (kind, name) in CARPET_KINDS.iter().enumerate() {
+        for n in 2u8..=16 {
+            let Some(&base) = b.r.keys.get(&carpet_key(kind)) else {
+                continue;
+            };
+            let d = b.r.defs[base as usize].clone();
+            let tex = d.tex.map(|t| b.r.textures[t as usize].clone());
+            b.add(
+                format!("carpet_stack:{n}:{name}"),
+                format!("{} empilés", d.name),
+                Shape::Panel {
+                    side: 3,
+                    thick: n,
+                    y0: 0,
+                    y1: 16,
+                },
+                &tex,
+                PART,
+            );
+        }
+    }
+}
+
+/// (v283) Couches empilées d'un bloc : neige fine (`h` couches de 2 seizièmes, 1 à 8) ou tapis
+/// (`n` couches d'un seizième, 1 à 16, `kind` : la sorte du dessus, voir `CARPET_KINDS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Layers {
+    Snow(u8),
+    Carpet { n: u8, kind: u8 },
+}
+
+impl Layers {
+    /// Les couches du bloc `id`, si c'en est.
+    pub fn of(id: BlockId) -> Option<Layers> {
+        layer_table().0.get(id.0 as usize).copied().flatten()
+    }
+
+    /// Le bloc de ces couches (`None` : trop ou pas assez de couches).
+    pub fn block(self) -> Option<BlockId> {
+        layer_table().1.get(&self).copied()
+    }
+
+    /// Nombre de couches.
+    pub fn count(self) -> u8 {
+        match self {
+            Layers::Snow(h) => h,
+            Layers::Carpet { n, .. } => n,
+        }
+    }
+
+    /// Couches au plus dans un bloc.
+    pub fn max(self) -> u8 {
+        match self {
+            Layers::Snow(_) => 8,
+            Layers::Carpet { .. } => 16,
+        }
+    }
+
+    /// Hauteur (seizièmes de bloc).
+    pub fn height(self) -> u8 {
+        match self {
+            Layers::Snow(h) => 2 * h,
+            Layers::Carpet { n, .. } => n,
+        }
+    }
+
+    /// Les mêmes couches avec une de plus (de la sorte `kind` pour un tapis), si le bloc a
+    /// encore de la place.
+    pub fn plus_one(self, kind: u8) -> Option<Layers> {
+        if self.count() >= self.max() {
+            return None;
+        }
+        Some(match self {
+            Layers::Snow(h) => Layers::Snow(h + 1),
+            Layers::Carpet { n, .. } => Layers::Carpet { n: n + 1, kind },
+        })
+    }
+
+    /// Même matière (neige avec neige, tapis avec tapis).
+    pub fn same_matter(self, other: Layers) -> bool {
+        matches!(
+            (self, other),
+            (Layers::Snow(_), Layers::Snow(_)) | (Layers::Carpet { .. }, Layers::Carpet { .. })
+        )
+    }
+}
+
+/// (v283) Numéros de bloc que le raytracing (reflets, ombres des lumières, rayons) voit tels
+/// quels : sa grille range les blocs sur 12 bits (`minelib_render::rt`).
+pub const RT_IDS: usize = 4096;
+
+/// (v283) Le bloc que le raytracing voit à la place de `id` : lui-même sous `RT_IDS` ; au-delà
+/// (les dernières piles de tapis), un bloc d'avant de la même forme, de la même texture s'il y
+/// en a un (une pile de tapis rouges y est une pile de tapis blancs de la même hauteur : son
+/// ombre est juste, son reflet a la couleur du blanc).
+pub fn rt_stand_in(id: BlockId) -> BlockId {
+    if (id.0 as usize) < RT_IDS {
+        return id;
+    }
+    static T: OnceLock<Vec<BlockId>> = OnceLock::new();
+    let t = T.get_or_init(|| {
+        let reg = registry();
+        let low = &reg.defs[..RT_IDS.min(reg.defs.len())];
+        reg.defs
+            .iter()
+            .skip(RT_IDS)
+            .map(|d| {
+                let boxes = d.boxes();
+                let same = |c: &&BlockDef| {
+                    c.solid == d.solid
+                        && c.full == d.full
+                        && c.translucent == d.translucent
+                        && c.light == d.light
+                        && c.boxes() == boxes
+                };
+                // Même texture, sinon même famille (`carpet_stack:9:…`), sinon même forme.
+                let family = d.key.rsplit_once(':').map_or(d.key.as_str(), |f| f.0);
+                let pick = low
+                    .iter()
+                    .position(|c| same(&c) && c.tex == d.tex)
+                    .or_else(|| {
+                        low.iter().position(|c| {
+                            same(&c) && c.key.rsplit_once(':').is_some_and(|f| f.0 == family)
+                        })
+                    })
+                    .or_else(|| low.iter().position(|c| same(&c)));
+                pick.map_or(BlockId::AIR, |i| BlockId(i as u16))
+            })
+            .collect()
+    });
+    t.get(id.0 as usize - RT_IDS).copied().unwrap_or(BlockId::AIR)
+}
+
+/// (v283) Sorte de tapis de nom `key` (`CARPET_KINDS`).
+pub fn carpet_kind(key: &str) -> Option<u8> {
+    CARPET_KINDS.iter().position(|k| *k == key).map(|i| i as u8)
+}
+
+/// Couches de chaque bloc, et bloc de chaque couche.
+#[allow(clippy::type_complexity)]
+fn layer_table() -> &'static (Vec<Option<Layers>>, HashMap<Layers, BlockId>) {
+    static T: OnceLock<(Vec<Option<Layers>>, HashMap<Layers, BlockId>)> = OnceLock::new();
+    T.get_or_init(|| {
+        let reg = registry();
+        let mut of = vec![None; reg.defs.len()];
+        let mut back = HashMap::new();
+        for (i, d) in reg.defs.iter().enumerate() {
+            let k = d.key.as_str();
+            let l = if let Some(h) = k.strip_prefix("snow_layer:") {
+                h.parse().ok().map(Layers::Snow)
+            } else if let Some(rest) = k.strip_prefix("carpet_stack:") {
+                rest.split_once(':').and_then(|(n, kind)| {
+                    Some(Layers::Carpet {
+                        n: n.parse().ok()?,
+                        kind: carpet_kind(kind)?,
+                    })
+                })
+            } else {
+                (0..CARPET_KINDS.len())
+                    .find(|&kind| carpet_key(kind) == k)
+                    .map(|kind| Layers::Carpet {
+                        n: 1,
+                        kind: kind as u8,
+                    })
+            };
+            if let Some(l) = l {
+                of[i] = Some(l);
+                back.insert(l, BlockId(i as u16));
+            }
+        }
+        (of, back)
+    })
 }
 
 /// Fluide (eau ou lave) d'un bloc et son niveau : 8 source, 1..7 coulant (7 le plus fort,
@@ -3345,6 +3563,7 @@ fn recent_blocks(b: &mut Builder) {
         false,
         false,
     );
+    // (v283) Avec leur hitbox, comme les tapis de laine.
     for (k, n, t) in [
         ("moss_carpet", "tapis de mousse", moss),
         ("pale_moss_carpet", "tapis de mousse pâle", pale_moss),
@@ -3359,7 +3578,7 @@ fn recent_blocks(b: &mut Builder) {
                 y1: 16,
             },
             &t3(t),
-            DECOR,
+            PART,
         );
     }
 
@@ -3921,6 +4140,53 @@ fn recent_blocks(b: &mut Builder) {
 mod tests {
     use super::*;
 
+    /// (v283) Neige fine de 1 à 8 couches, tapis de 1 à 16 couches de chacune des 18 sortes :
+    /// un bloc pour chaque, aller et retour ; les piles sont à la fin du registre (les blocs
+    /// d'avant gardent leur numéro) ; on marche sur les tapis.
+    #[test]
+    fn snow_and_carpets_stack_up_to_a_whole_block() {
+        let reg = registry();
+        for h in 1..=8u8 {
+            let b = Layers::Snow(h).block().unwrap();
+            assert_eq!(reg.defs[b.0 as usize].key, format!("snow_layer:{h}"));
+            assert_eq!(Layers::of(b), Some(Layers::Snow(h)));
+            assert_eq!(Layers::Snow(h).height(), 2 * h);
+        }
+        assert_eq!(Layers::Snow(8).plus_one(0), None);
+        assert_eq!(Layers::Snow(3).plus_one(5), Some(Layers::Snow(4)));
+        let first_stack = reg.by_key("carpet_stack:2:white").unwrap();
+        let last_before = reg.by_key("wall_prismarine").unwrap();
+        assert!(first_stack.0 > last_before.0);
+        for kind in 0..CARPET_KINDS.len() as u8 {
+            for n in 1..=16u8 {
+                let l = Layers::Carpet { n, kind };
+                let b = l.block().unwrap_or_else(|| panic!("{l:?}"));
+                assert_eq!(Layers::of(b), Some(l));
+                assert_eq!(b.def().boxes(), vec![([0, 0, 0], [16, n, 16])]);
+                assert!(b.def().solid && b.def().target, "{}", b.def().key);
+                assert_eq!(l.height(), n);
+            }
+        }
+        assert_eq!(
+            Layers::of(reg.by_key("carpet_red").unwrap()),
+            Some(Layers::Carpet { n: 1, kind: 14 })
+        );
+        assert_eq!(
+            Layers::of(reg.by_key("pale_moss_carpet").unwrap()),
+            Some(Layers::Carpet { n: 1, kind: 17 })
+        );
+        let top = Layers::Carpet { n: 16, kind: 3 };
+        assert_eq!(top.plus_one(4), None);
+        assert_eq!(
+            Layers::Carpet { n: 15, kind: 3 }.plus_one(4),
+            Some(Layers::Carpet { n: 16, kind: 4 })
+        );
+        assert!(Layers::Snow(2).same_matter(Layers::Snow(7)));
+        assert!(!Layers::Snow(2).same_matter(top));
+        assert_eq!(Layers::of(BlockId::STONE), None);
+        assert_eq!(reg.by_key("snow_layer:1").unwrap().def().name, "couche de neige");
+    }
+
     #[test]
     fn flower_pots_hold_plants() {
         let r = registry();
@@ -4020,7 +4286,7 @@ mod tests {
         assert_eq!(r.by_key("wool_white"), Some(BlockId::WOOL));
         assert_eq!(r.by_key("barrier"), Some(BlockId(30)));
         println!("{} blocs, {} textures", r.len(), r.textures.len());
-        assert!(r.len() > 500 && r.len() < 4000, "{} blocs", r.len());
+        assert!(r.len() > 500 && r.len() < 4400, "{} blocs", r.len());
         assert!(r.textures.len() < 1024);
     }
 
@@ -4044,9 +4310,26 @@ mod tests {
 mod count_tests {
     #[test]
     fn registry_fits_the_raytracing_palette() {
-        let n = super::registry().defs.len();
+        let reg = super::registry();
+        let n = reg.defs.len();
         eprintln!("{n} blocs");
-        assert!(n < 4096, "{n} blocs");
+        // (v283) Au-delà de 4096 blocs, chacun a dans la grille du raytracing un bloc d'avant de
+        // la même forme (`rt_stand_in`) : les piles de tapis rouges, des piles de tapis blancs.
+        for i in super::RT_IDS..n {
+            let id = crate::BlockId(i as u16);
+            let s = super::rt_stand_in(id);
+            assert!(
+                s != crate::BlockId::AIR && (s.0 as usize) < super::RT_IDS,
+                "{} sans bloc pour le raytracing",
+                reg.defs[i].key
+            );
+            assert_eq!(s.def().boxes(), id.def().boxes(), "{}", reg.defs[i].key);
+            assert_eq!(s.def().solid, id.def().solid);
+        }
+        assert_eq!(super::rt_stand_in(crate::BlockId::STONE), crate::BlockId::STONE);
+        let red = reg.by_key("carpet_stack:9:red").unwrap();
+        assert!(red.0 as usize >= super::RT_IDS);
+        assert_eq!(super::rt_stand_in(red).def().key, "carpet_stack:9:white");
     }
 }
 

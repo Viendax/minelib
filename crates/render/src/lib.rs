@@ -2035,6 +2035,14 @@ impl Renderer {
         self.planar_lit.is_some() || failed
     }
 
+    /// (v283) Les shaders des lumières sont-ils prêts (ou refusés : le monde s'affiche alors
+    /// sans elles) ? L'écran de chargement d'un monde qui a des lumières les attend.
+    pub fn dyn_lights_ready(&self) -> bool {
+        self.lit
+            .as_ref()
+            .is_some_and(|l| l.try_get().is_some())
+    }
+
     /// Variantes éclairées, si elles sont prêtes.
     fn lit_pipes(&self) -> Option<&LitPipes> {
         self.lit.as_ref()?.try_get()?.as_ref().ok()

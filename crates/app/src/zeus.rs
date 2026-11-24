@@ -36,9 +36,6 @@ pub const SKY_HITS: u8 = minelib_net::proto::ZEUS_SKY_HITS;
 pub const ARC_REACH: f32 = 8.0;
 /// Dégâts de l'arc sans charge : 2,5 fois moins que la foudre du ciel (5).
 pub const ARC_DAMAGE: u8 = 2;
-/// Autour de celui qui le porte (à moins de tant de blocs, à plat), les éclairs des nuages
-/// sont plus fréquents.
-pub const CHARGE_REACH: f32 = minelib_net::meteo::CHARGE_REACH;
 
 /// (v244) Où finit le petit éclair qui ne vise rien à portée : sur le rayon du regard (parti
 /// de `eye` vers `dir`, de longueur 1), au point qui est à `reach` blocs de la pointe `tip`
