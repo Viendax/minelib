@@ -2445,6 +2445,10 @@ impl Session {
         }
         self.displays.hover(aimed);
         self.displays.update(dt);
+        // (v247) L'installation du navigateur des écrans : un mot au joueur.
+        for mot in crate::navigateur::mots() {
+            self.chat.say(format!("Écrans : {mot}"), chat::YELLOW);
+        }
         // Pages refusées par le filtre : un mot au joueur, une fois par raison.
         for (_, raison) in self.displays.take_blocked() {
             let quoi = match raison {

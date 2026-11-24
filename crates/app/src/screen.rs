@@ -778,6 +778,13 @@ impl Displays {
         {
             return;
         }
+        // (v247) Le navigateur des écrans s'installe ou se met à jour tout seul (voir
+        // `navigateur`) ; en attendant, les écrans gardent leur mire.
+        let dossier = minelib_assets::data_dir().join("cef");
+        if crate::navigateur::lancer(dossier, crate::update::VERSION) == crate::navigateur::Etat::EnCours {
+            self.retry_in = 1.0;
+            return;
+        }
         match Browser::start(self.cache, self.filtre, self.volume) {
             Err(Launch::Absent) => {
                 log::info!("écrans vidéo : navigateur absent (dossier « cef »), mires affichées");

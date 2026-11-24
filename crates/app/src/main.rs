@@ -76,6 +76,7 @@ mod debug;
 mod drops;
 mod equip;
 mod filtres;
+mod navigateur;
 mod flashlight;
 mod fluids;
 mod fps;

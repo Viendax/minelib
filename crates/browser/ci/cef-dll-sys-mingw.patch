@@ -1,0 +1,25 @@
+--- a/build.rs
++++ b/build.rs
+@@ -9,6 +9,9 @@
+     println!("cargo::rerun-if-changed=build.rs");
+ 
+     let target = env::var("TARGET")?;
++    // Minelib : les binaires CEF Windows sont les mêmes pour MinGW (on les télécharge
++    // sous le nom MSVC) ; la liaison, elle, suit la vraie cible (voir plus bas).
++    let target = target.replace("-pc-windows-gnu", "-pc-windows-msvc");
+     let os_arch = OsAndArch::try_from(target.as_str())?;
+ 
+     println!("cargo::rerun-if-env-changed=FLATPAK");
+@@ -145,6 +148,12 @@
+ 
+             println!("cargo::rustc-link-lib=dylib=cef");
+         }
++        "windows" if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") => {
++            // Minelib : compilation croisée MinGW. Pas de wrapper C++ (CMake/MSVC) : le
++            // crate Rust n'utilise que l'API C, exportée par libcef.dll, liée directement.
++            copy_cef_runtime_files(&cef_dir, target_dir)?;
++            println!("cargo::rustc-link-lib=dylib=libcef");
++        }
+         "windows" => {
+             // On Windows and Linux the cef files usually have to be next to the main binary.
+             // On macOS it's more complicated so we'll leave it to tools like tauri-cli for now.
