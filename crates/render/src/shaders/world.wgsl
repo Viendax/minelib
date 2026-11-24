@@ -1880,7 +1880,9 @@ fn march(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> RayHit {
         let pal = textureLoad(palette, i32(id), 0);
         let torch = (pal.w >> 8u) & 7u;
         // Case de départ : seules les torches comptent (le rayon part de la surface).
-        if i == 0 && torch == 0u {
+        // (v251) Le verre (bit 11) est dans la grille pour teinter les lumières : les reflets
+        // le traversent, comme avant.
+        if (i == 0 && torch == 0u) || ((pal.w >> 11u) & 1u) == 1u {
             continue;
         }
         if torch != 0u {

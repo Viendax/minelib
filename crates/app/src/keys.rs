@@ -528,6 +528,9 @@ pub struct Bindings {
     /// Boutons de la souris ignorés jusqu'à ce qu'ils soient relâchés (le clic sur
     /// « Reprendre » ne doit pas poser un bloc).
     pub mouse_muted: bool,
+    /// (v251) Touche ignorée jusqu'à ce qu'elle soit relâchée : le C de Ctrl+C qui vient de
+    /// copier une capture ne zoome pas (ni n'ouvre la radio en FPS).
+    pub muted_key: Option<KeyCode>,
 }
 
 impl Default for Bindings {
@@ -535,6 +538,7 @@ impl Default for Bindings {
         Self {
             keys: Action::ALL.map(|a| a.default_bind()),
             mouse_muted: false,
+            muted_key: None,
             walk_toggle: false,
             duck_toggle: false,
         }
@@ -567,14 +571,22 @@ impl Bindings {
 
     pub fn held(&self, input: &Input, a: Action) -> bool {
         self.get(a)
-            .filter(|k| !(self.mouse_muted && matches!(k, Bind::Mouse(_))))
+            .filter(|k| !self.muted(*k))
             .is_some_and(|k| k.held(input))
     }
 
     pub fn pressed(&self, input: &Input, a: Action) -> bool {
         self.get(a)
-            .filter(|k| !(self.mouse_muted && matches!(k, Bind::Mouse(_))))
+            .filter(|k| !self.muted(*k))
             .is_some_and(|k| k.pressed(input))
+    }
+
+    /// Ignorée pour l'instant (`mouse_muted`, `muted_key`).
+    fn muted(&self, k: Bind) -> bool {
+        match k {
+            Bind::Mouse(_) => self.mouse_muted,
+            Bind::Key(k) => self.muted_key == Some(k),
+        }
     }
 
     pub fn load(path: &Path) -> Self {

@@ -77,6 +77,9 @@ pub fn switch(word: &str) -> Option<bool> {
 pub struct Chat {
     pub open: bool,
     input: String,
+    /// (v251) Aide de la commande qu'on tape (`cmdhelp::lines`), montrée au-dessus de la
+    /// saisie ; donnée par la partie.
+    pub hint: Vec<(String, [f32; 4])>,
     /// (texte, couleur, âge en secondes, lien éventuel)
     lines: Vec<(String, [f32; 4], f32, Option<PathBuf>)>,
     /// Zones cliquables affichées à la dernière image : (x, y, largeur, hauteur, lien).
@@ -119,6 +122,7 @@ impl Default for Chat {
         Self {
             open: false,
             input: String::new(),
+            hint: Vec::new(),
             lines: Vec::new(),
             hits: RefCell::new(Vec::new()),
             clicked: None,
@@ -148,6 +152,35 @@ fn reading(a: Spot, b: Spot) -> (Spot, Spot) {
     } else {
         (b, a)
     }
+}
+
+/// (v251) Une ligne de l'aide des commandes coupée entre les mots pour tenir dans `max_w`
+/// pixels (texte à l'échelle `s`) : les suites gardent le retrait de la ligne, plus quatre
+/// espaces. Un mot plus long que la place reste seul sur sa ligne.
+fn wrap_hint(text: &str, s: f32, max_w: f32) -> Vec<String> {
+    if Ui::text_width(text, s) <= max_w {
+        return vec![text.to_string()];
+    }
+    let lead: String = text.chars().take_while(|c| *c == ' ').collect();
+    let cont = format!("{lead}    ");
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.trim_start_matches(' ').split(' ') {
+        if cur.is_empty() {
+            cur = format!("{}{word}", if out.is_empty() { &lead } else { &cont });
+            continue;
+        }
+        let longer = format!("{cur} {word}");
+        if Ui::text_width(&longer, s) > max_w && !word.is_empty() {
+            out.push(std::mem::replace(&mut cur, format!("{cont}{word}")));
+        } else {
+            cur = longer;
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// (v236) Copie `text` dans le presse-papier du système.
@@ -362,6 +395,11 @@ impl Chat {
             self.history.push(text.clone());
         }
         Some(text)
+    }
+
+    /// (v251) Ce qui est tapé dans la saisie.
+    pub fn typed(&self) -> &str {
+        &self.input
     }
 
     /// Saisie quand le tchat est ouvert. Renvoie le texte envoyé (Entrée).
@@ -680,6 +718,33 @@ impl Chat {
                 ui.rect(x + width, y, 2.0 * s, bar, [1.0, 1.0, 1.0, 0.6]);
             }
             let y = size.1 - 13.0 * s;
+            // (v251) Aide de la commande qu'on tape, juste au-dessus de la saisie, sur un fond
+            // plus sombre que les messages.
+            if !self.hint.is_empty() {
+                // Les lignes trop longues pour l'écran continuent à la ligne suivante, en retrait
+                // (avant : coupées au bord).
+                let max_w = size.0 - 16.0 * s;
+                let rows: Vec<(String, [f32; 4])> = self
+                    .hint
+                    .iter()
+                    .flat_map(|(t, c)| wrap_hint(t, s, max_w).into_iter().map(move |l| (l, *c)))
+                    .collect();
+                let w = rows
+                    .iter()
+                    .map(|(t, _)| Ui::text_width(t, s))
+                    .fold(0.0f32, f32::max)
+                    .min(max_w)
+                    + 4.0 * s;
+                let top = y - 2.0 * s - rows.len() as f32 * line_h;
+                ui.rect(x, top - s, w, rows.len() as f32 * line_h + 2.0 * s, [0.02, 0.02, 0.05, 0.88]);
+                for (k, (t, c)) in rows.into_iter().enumerate() {
+                    let mut shown = t;
+                    while shown.chars().count() > 4 && Ui::text_width(&shown, s) > max_w {
+                        shown.pop();
+                    }
+                    ui.text(x + 2.0 * s, top + k as f32 * line_h + s, s, c, shown);
+                }
+            }
             ui.rect(
                 x,
                 y,
@@ -851,6 +916,22 @@ mod tests {
             .iter()
             .all(|l| Ui::text_width(l, s) <= 120.0));
         assert_eq!(wrap("court", s, 120.0), vec!["court".to_string()]);
+    }
+
+    /// (v251) Une ligne de l'aide trop longue continue en retrait, sans rien perdre.
+    #[test]
+    fn long_help_lines_continue_indented() {
+        let s = 1.0;
+        let text = "  /fps set spawn ct | spawn t  -  zone de départ d'une équipe : la sélection faite à la baguette";
+        let max = 200.0;
+        let lines = wrap_hint(text, s, max);
+        assert!(lines.len() > 1, "{lines:?}");
+        assert!(lines.iter().all(|l| Ui::text_width(l, s) <= max), "{lines:?}");
+        assert!(lines[0].starts_with("  /fps"));
+        assert!(lines[1..].iter().all(|l| l.starts_with("      ")), "{lines:?}");
+        let words = |t: &str| t.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(words(&lines.join(" ")), words(text));
+        assert_eq!(wrap_hint("/fps info", s, max), vec!["/fps info".to_string()]);
     }
 }
 

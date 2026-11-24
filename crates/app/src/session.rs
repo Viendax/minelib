@@ -313,6 +313,8 @@ pub struct Session {
     punch_latch: bool,
     /// (v247) Construction en ligne : la météo du serveur est arrivée (le chargement l'attend).
     weather_synced: bool,
+    /// (v251) Saisie du tchat pour laquelle l'aide des commandes a été faite.
+    hint_for: String,
     place_cooldown: f32,
     /// (v220) Survie : bloc qu'on est en train de casser, et depuis combien de temps (voir
     /// `BREAK_S`).
@@ -746,6 +748,7 @@ impl Session {
             break_cooldown: 0.0,
             punch_latch: false,
             weather_synced: false,
+            hint_for: String::new(),
             dig: None,
             gesture: crate::hand::Gesture::None,
             hud_hidden: false,
@@ -1073,6 +1076,10 @@ impl Session {
         {
             self.keys.mouse_muted = false;
         }
+        // (v251) Le C de Ctrl+C (capture copiée) compte de nouveau une fois relâché.
+        if self.keys.muted_key.is_some_and(|k| !input.held(k)) {
+            self.keys.muted_key = None;
+        }
         crate::jobs::throttle(perf::last_unmeasured_ms(), !self.streamer.idle(), dt);
         // (v220) Monde pas encore chargé : on n'y apparaît pas (voir `loading`).
         self.check_loaded(renderer);
@@ -1143,6 +1150,16 @@ impl Session {
             let typing = chat_typing || screen_keys;
             if let Some(text) = sent {
                 self.submit(&text);
+            }
+            // (v251) Aide de la commande qu'on tape (refaite quand la saisie change).
+            let typed = if self.chat.open {
+                self.chat.typed().to_string()
+            } else {
+                String::new()
+            };
+            if typed != self.hint_for {
+                self.chat.hint = crate::cmdhelp::lines(&typed, 14, |name| self.command_state(name));
+                self.hint_for = typed;
             }
             // Éditeur de lumières (touche L) et sa caméra libre (F) ; pas en partie FPS en
             // ligne (rien ne doit éclairer un coin sombre pour un seul joueur). En FPS solo, si.
@@ -4730,6 +4747,22 @@ impl Session {
         // (v222) Ceux des autres joueurs.
         let cam = self.camera_pos();
         self.update_remote_bolts(dt, cam);
+        // (v251) Boules de lumière des lumières ponctuelles (l'éclat de la source, dessiné
+        // comme un éclair : par-dessus l'image, caché par ce qui est devant).
+        if self.lights_allowed() {
+            for (at, r, color, force) in self.lights.balls() {
+                self.storm.bolts.push(minelib_render::BoltSeg {
+                    a: [at[0], at[1], at[2], minelib_render::BOLT_BALL],
+                    b: [at[0], at[1], at[2], minelib_render::BOLT_BALL],
+                    color,
+                    force_a: force,
+                    force_b: force,
+                    width_a: r,
+                    width_b: r,
+                    screen: 0.0,
+                });
+            }
+        }
         // Lumière du jour montrée : moins sous un ciel couvert, plus l'éclat des éclairs.
         // (v235) L'éclat d'un éclair compte d'autant moins qu'il fait déjà clair : en plein
         // soleil, la foudre tombée tout près doublait la lumière du jour, et le sol clair
@@ -7537,6 +7570,81 @@ impl Session {
         }
     }
 
+    /// (v251) Ce qui est enregistré pour une commande (par son premier nom), montré dans son
+    /// aide pendant qu'on la tape (`cmdhelp`).
+    fn command_state(&mut self, name: &str) -> Vec<String> {
+        let on = |b: bool| if b { "oui" } else { "non" };
+        match name {
+            "fps" => {
+                let map = crate::fpsmap::load(&self.dir);
+                let zone = |z: &Option<minelib_net::game::Zone>| if z.is_some() { "posé" } else { "—" };
+                let sites: Vec<String> = map
+                    .sites
+                    .iter()
+                    .enumerate()
+                    .map(|(k, z)| format!("site {} {}", crate::fpsmap::SITE_NAMES[k], zone(z)))
+                    .collect();
+                vec![
+                    format!(
+                        "joueurs : {} ({} contre {})",
+                        map.players(),
+                        map.players() / 2,
+                        map.players() / 2
+                    ),
+                    format!(
+                        "départ CT {}, départ T {}, {}",
+                        zone(&map.ct),
+                        zone(&map.t),
+                        sites.join(", ")
+                    ),
+                    format!(
+                        "portes : {} ; doubles portes : {}",
+                        if map.doors() { "utilisables" } else { "fixes" },
+                        if map.door_sync() { "ensemble" } else { "séparées" }
+                    ),
+                ]
+            }
+            "bot" | "start" | "restart" => {
+                let mut v = vec![format!(
+                    "niveau : {} ; joueurs par partie : {}",
+                    crate::bots::LEVELS[crate::bots::saved_level() as usize],
+                    crate::bots::saved_players()
+                        .map_or_else(|| "ceux de la carte".to_string(), |n| n.to_string())
+                )];
+                if let Some(n) = &self.net {
+                    if n.is_solo() || n.is_build() {
+                        v.push(format!(
+                            "partie en cours : {} joueur(s) et {} bot(s)",
+                            n.human_count(),
+                            n.bot_count()
+                        ));
+                    }
+                }
+                v
+            }
+            "gm" => vec![format!("mode : {}", self.game.mode.label())],
+            "fly" => vec![format!("vol permis : {}", on(self.game.can_fly))],
+            "weather" => vec![format!(
+                "météo : {}{}",
+                self.storm.weather.kind().label(),
+                if self.storm.weather.fixed { " (figée)" } else { "" }
+            )],
+            "timeset" | "timefix" => vec![if self.time_h < 0.0 {
+                "heure : le soleil de Dust2, immobile".to_string()
+            } else {
+                format!(
+                    "il est {}{}",
+                    crate::daytime::format(self.time_h),
+                    if self.time_fixed { " (temps arrêté)" } else { "" }
+                )
+            }],
+            "lumieres" => vec![format!("lumières dans ce monde : {}", self.lights.scene.len())],
+            "npc" => vec![format!("foule d'essai : {}", on(self.crowd_on))],
+            "worldname" => vec![format!("nom : {}", self.meta.name)],
+            _ => Vec::new(),
+        }
+    }
+
     /// `/fps set ct|t spawn`, `/fps set a|b|c site` (zone sélectionnée à la baguette),
     /// `/fps clear …`, `/fps info`.
     fn fps_command(&mut self, args: &[&str]) {
@@ -8535,8 +8643,10 @@ impl Session {
                 let half = (t - row as f32) * 0.9;
                 ui.rect(x - half, y + row as f32, half * 2.0, 1.0, col);
             }
-            let seen = raycast(&self.world, eye.into(), (to / dist.max(1e-3)).into(), dist)
-                .is_none_or(|h| h.distance >= dist - 0.3);
+            // (v251) À travers une vitre ou du verre, on le voit (son pseudo aussi).
+            let seen =
+                crate::fps::raycast_view(&self.world, eye.into(), (to / dist.max(1e-3)).into(), dist)
+                    .is_none_or(|h| h.distance >= dist - 0.3);
             if !seen || dist > 60.0 {
                 continue;
             }

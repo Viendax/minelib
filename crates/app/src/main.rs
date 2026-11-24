@@ -49,6 +49,10 @@
 //!                               dans un monde neuf et dans la démo)
 //!   MINELIB_FPS_START=<x>,<y>,<z>,lacet°  partie FPS : départ du joueur local fixé (essais)
 //!   MINELIB_EXIT_AFTER=<s>      quitter automatiquement (tests)
+//!   MINELIB_TAILLE=<l>x<h>      taille de la fenêtre au lancement (essais ; 1280x720 sinon)
+//!   MINELIB_PAS_FIXE=<n>        chaque image fait avancer le jeu de 1/<n> s, quel que soit le
+//!                               temps qu'elle a pris (essais : les déplacements d'une image à
+//!                               l'autre d'une machine à <n> FPS, sous un rendu lent)
 //!   MINELIB_SHOT_AT=<s>         capture d'écran automatique à <s> secondes (tests)
 //!   MINELIB_UI=lobby            écran FPS avec un lobby d'exemple (essais de l'interface)
 //!   MINELIB_UI=lumieres         éditeur de lumières ouvert en entrant dans le monde (essais)
@@ -69,6 +73,7 @@ mod bot_skin;
 mod bots;
 mod buildnet;
 mod chat;
+mod cmdhelp;
 mod crowd;
 mod cs;
 mod daytime;
@@ -317,6 +322,9 @@ struct Game {
     current_room: Option<u64>,
     /// Curseur de réglage tenu à la souris.
     slider_drag: Option<u32>,
+    /// (v251) Paramètres graphiques : lignes défilées, et la barre tenue à la souris.
+    graphics_scroll: usize,
+    graphics_drag: bool,
     /// Écran Son : sorties et micros du système (lus en l'ouvrant), défilement et barre
     /// tenue de chaque liste.
     sound_devices: (Vec<String>, Vec<String>),
@@ -364,6 +372,9 @@ struct Game {
     started: std::time::Instant,
     /// Capture automatique à ce temps (essais).
     shot_at: Option<f32>,
+    /// (v251) Dernière capture (en mémoire, le PNG s'écrit en tâche de fond) et le moment où
+    /// elle a été prise : Ctrl+C la copie peu après (`SHOT_COPY_S`).
+    last_shot: Option<LastShot>,
     show_debug: bool,
     fps_max: Option<f32>,
     frame_start: Instant,
@@ -485,6 +496,8 @@ impl Game {
             friends_note: None,
             current_room: None,
             slider_drag: None,
+            graphics_scroll: 0,
+            graphics_drag: false,
             sound_devices: (Vec::new(), Vec::new()),
             sound_scan: DeviceScan::started(),
             sound_scan_at: 0.0,
@@ -513,6 +526,7 @@ impl Game {
             title_timer: 0.0,
             exit_after: env_parse("MINELIB_EXIT_AFTER"),
             shot_at: env_parse("MINELIB_SHOT_AT"),
+            last_shot: None,
             frames_drawn: 0,
             started: std::time::Instant::now(),
             show_debug: env_parse::<u8>("MINELIB_DEBUG").is_some_and(|v| v != 0),
@@ -606,25 +620,82 @@ impl Game {
         let name = file_name(&path);
         log::info!("capture d'écran : {}", path.display());
         let target = path.clone();
+        let rgba = std::sync::Arc::new(shot.rgba);
+        let pixels = rgba.clone();
+        let (width, height) = (shot.width, shot.height);
         std::thread::spawn(move || {
             if let Err(e) = image::save_buffer(
                 &target,
-                &shot.rgba,
-                shot.width,
-                shot.height,
+                &pixels,
+                width,
+                height,
                 image::ExtendedColorType::Rgba8,
             ) {
                 log::error!("capture d'écran {} : {e}", target.display());
             }
         });
+        self.last_shot = Some(LastShot {
+            path: path.clone(),
+            rgba,
+            width,
+            height,
+            at: self.time,
+        });
         match &mut self.session {
             Some(s) => s.chat.say_link(
-                format!("Capture enregistrée : {name} (T puis clic : copier)"),
+                format!("Capture enregistrée : {name} (Ctrl+C, ou T puis clic : copier)"),
                 chat::YELLOW,
                 path,
             ),
-            None => self.notify(format!("Capture enregistrée : {name}")),
+            None => self.notify(format!("Capture enregistrée : {name} (Ctrl+C : copier)")),
         }
+    }
+
+    /// (v251) « Ctrl+C dans le jeu pour copier rapidement mon screen après l'avoir pris, avec
+    /// le même message que si on clique » : la dernière capture, prise il y a moins de
+    /// `SHOT_COPY_S`, copiée dans le presse-papier (depuis la mémoire : son PNG est peut-être
+    /// encore en train de s'écrire). Pas tchat ouvert (Ctrl+C y copie le texte choisi), ni
+    /// en écrivant dans la page d'un écran, ni en réglant une touche. « Le C de ce Ctrl+C ne
+    /// déclenche ni le zoom ni la radio ni rien qui pourrait être bind et interférer » : la
+    /// touche C est ignorée par les réglages du jeu et de la partie jusqu'à ce qu'elle soit
+    /// relâchée. Rend vrai si la capture a été copiée (ou a essayé).
+    fn copy_last_shot(&mut self, input: &Input) -> bool {
+        let ctrl = input.held(KeyCode::ControlLeft) || input.held(KeyCode::ControlRight);
+        if !ctrl || !input.pressed(KeyCode::KeyC) || self.binding.is_some() {
+            return false;
+        }
+        let Some(shot) = self.last_shot.as_ref().filter(|s| self.time - s.at < SHOT_COPY_S)
+        else {
+            return false;
+        };
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.chat.open || s.keyboard_on_screen())
+        {
+            return false;
+        }
+        let name = file_name(&shot.path);
+        let (text, color) = match copy_rgba_to_clipboard(shot.width, shot.height, &shot.rgba) {
+            Ok(()) => (
+                format!("Capture copiée dans le presse-papier : {name}"),
+                chat::GREY,
+            ),
+            Err(e) => {
+                log::warn!("presse-papier : {e:#}");
+                (format!("Copie impossible : {e}"), chat::RED)
+            }
+        };
+        // Le C de Ctrl+C ne compte pour rien d'autre tant qu'il est tenu.
+        self.keys.muted_key = Some(KeyCode::KeyC);
+        match &mut self.session {
+            Some(s) => {
+                s.chat.say(text, color);
+                s.keys.muted_key = Some(KeyCode::KeyC);
+            }
+            None => self.notify(text),
+        }
+        true
     }
 
     fn notify(&mut self, text: impl Into<String>) {
@@ -3592,8 +3663,56 @@ impl Game {
         let s = c.s;
         c.text_center("Paramètres graphiques", c.h * 0.14, s * 2.0, WHITE);
         let cx = c.w / 2.0;
-        let mut y = c.h * 0.21;
         let step = 21.5 * s;
+        let ds = (s / 2.0).floor().max(1.0);
+        // (v251) « Dans les paramètres graphiques, deux par ligne les boutons et curseurs si c'est
+        // trop grand pour l'écran, et la barre de défilement à droite, comme celle de
+        // l'inventaire créatif » : les réglages se rangent sur une colonne s'ils tiennent entre
+        // le titre et les notes du bas, sinon sur deux ; s'ils ne tiennent toujours pas, ils
+        // défilent (molette, barre à droite).
+        let several = gpu_report::several_cards();
+        let n = 7 + usize::from(several) + usize::from(low_latency.is_some());
+        let notes = 1 + usize::from(self.options.point_torches) + usize::from(self.optimus.is_some());
+        let top = c.h * 0.21;
+        let bottom = c.h * 0.78 - 14.0 * s - notes as f32 * ds * 10.0 - 4.0 * s;
+        let avail = (bottom - top).max(step);
+        let fit = ((avail / step).floor() as usize).max(1);
+        let cols = if n > fit && c.w >= 640.0 * s { 2 } else { 1 };
+        let rows = n.div_ceil(cols);
+        let vis = fit.min(rows);
+        let col_w = if cols == 2 { 310.0 * s } else { 0.0 };
+        let area_w = if cols == 2 { 620.0 * s } else { 310.0 * s };
+        let over = c.hovered(cx - area_w / 2.0, top, area_w, vis as f32 * step);
+        Ctx::wheel(input, over, rows, vis, &mut self.graphics_scroll);
+        if rows > vis {
+            let bar_x = cx + area_w / 2.0 + 4.0 * s;
+            c.scrollbar(
+                bar_x,
+                top - 2.0 * s,
+                vis as f32 * step,
+                rows,
+                vis,
+                &mut self.graphics_scroll,
+                &mut self.graphics_drag,
+            );
+        } else {
+            self.graphics_scroll = 0;
+        }
+        let scroll = self.graphics_scroll;
+        // Place du réglage n° `k` (de gauche à droite, puis de haut en bas), s'il est visible.
+        let slot = |k: usize| -> Option<(f32, f32)> {
+            let (r, col) = (k / cols, k % cols);
+            if r < scroll || r >= scroll + vis {
+                return None;
+            }
+            let x = cx + (col as f32 - (cols as f32 - 1.0) / 2.0) * col_w;
+            Some((x, top + (r - scroll) as f32 * step))
+        };
+        let mut k = 0;
+        let mut next = || {
+            k += 1;
+            slot(k - 1)
+        };
         // Distance de rendu : 2 à 64 chunks (curseur plus fin aux petites valeurs).
         let max = session::MAX_VIEW_DISTANCE;
         let ram = self.ram_view_limit;
@@ -3605,117 +3724,126 @@ impl Game {
         } else {
             format!("Distance de rendu : {} chunks", cfg.view_distance)
         };
-        let frac = ((cfg.view_distance - 2) as f32 / (max - 2) as f32).sqrt();
-        if let Some(f) = c.slider(1, &mut self.slider_drag, &label, frac, cx, y, 300.0) {
-            cfg.view_distance = 2 + (f * f * (max - 2) as f32).round() as i32;
+        if let Some((x, y)) = next() {
+            let frac = ((cfg.view_distance - 2) as f32 / (max - 2) as f32).sqrt();
+            if let Some(f) = c.slider(1, &mut self.slider_drag, &label, frac, x, y, 300.0) {
+                cfg.view_distance = 2 + (f * f * (max - 2) as f32).round() as i32;
+            }
         }
-        y += step;
         // Échelle de rendu : 50 à 100 % (par pas de 5 %), reconstruite par l'anticrénelage.
-        let label = format!("Échelle de rendu : {} %", (scale * 100.0).round() as i32);
-        if let Some(f) = c.slider(
-            3,
-            &mut self.slider_drag,
-            &label,
-            (scale - 0.5) / 0.5,
-            cx,
-            y,
-            300.0,
-        ) {
-            scale = ((0.5 + f * 0.5) * 20.0).round() / 20.0;
+        if let Some((x, y)) = next() {
+            let label = format!("Échelle de rendu : {} %", (scale * 100.0).round() as i32);
+            if let Some(f) = c.slider(
+                3,
+                &mut self.slider_drag,
+                &label,
+                (scale - 0.5) / 0.5,
+                x,
+                y,
+                300.0,
+            ) {
+                scale = ((0.5 + f * 0.5) * 20.0).round() / 20.0;
+            }
         }
-        y += step;
         // Limite de FPS : 30 à 500 par pas de 10, tout à droite = illimité. Moins d'images,
         // moins de chauffe : les FPS restent stables au lieu de baisser quand le PC chauffe.
-        let cur = self.options.fps_max;
-        let label = if cur == 0 {
-            "Limite de FPS : illimité".to_string()
-        } else {
-            format!("Limite de FPS : {cur}")
-        };
-        let frac = if cur == 0 {
-            1.0
-        } else {
-            (cur.clamp(30, 500) - 30) as f32 / 470.0 * 0.985
-        };
-        if let Some(f) = c.slider(6, &mut self.slider_drag, &label, frac, cx, y, 300.0) {
-            self.options.fps_max = if f > 0.985 {
-                0
+        if let Some((x, y)) = next() {
+            let cur = self.options.fps_max;
+            let label = if cur == 0 {
+                "Limite de FPS : illimité".to_string()
             } else {
-                (30.0 + f / 0.985 * 470.0).round() as u32 / 10 * 10
+                format!("Limite de FPS : {cur}")
             };
+            let frac = if cur == 0 {
+                1.0
+            } else {
+                (cur.clamp(30, 500) - 30) as f32 / 470.0 * 0.985
+            };
+            if let Some(f) = c.slider(6, &mut self.slider_drag, &label, frac, x, y, 300.0) {
+                self.options.fps_max = if f > 0.985 {
+                    0
+                } else {
+                    (30.0 + f / 0.985 * 470.0).round() as u32 / 10 * 10
+                };
+            }
         }
-        y += step;
-        let ds = (s / 2.0).floor().max(1.0);
         // Raytracing des reflets (écrit pour Minelib : marche sur toutes les cartes).
-        let rt_label = if raytracing {
-            "Raytracing (reflets) : activé"
-        } else {
-            "Raytracing (reflets) : désactivé"
-        };
-        if c.button(rt_label, cx, y, 300.0, true) {
-            raytracing = !raytracing;
+        if let Some((x, y)) = next() {
+            let rt_label = if raytracing {
+                "Raytracing (reflets) : activé"
+            } else {
+                "Raytracing (reflets) : désactivé"
+            };
+            if c.button(rt_label, x, y, 300.0, true) {
+                raytracing = !raytracing;
+            }
         }
-        y += step;
         // (v201) Torches en lumières ponctuelles (non par défaut) : autour de soi, chaque
         // torche ou bloc lumineux éclaire comme une lumière ponctuelle de l'éditeur.
-        let pt_label = if self.options.point_torches {
-            "Torches ponctuelles : activé"
-        } else {
-            "Torches ponctuelles : désactivé"
-        };
-        if c.button(pt_label, cx, y, 300.0, true) {
-            self.options.point_torches = !self.options.point_torches;
+        if let Some((x, y)) = next() {
+            let pt_label = if self.options.point_torches {
+                "Torches ponctuelles : activé"
+            } else {
+                "Torches ponctuelles : désactivé"
+            };
+            if c.button(pt_label, x, y, 300.0, true) {
+                self.options.point_torches = !self.options.point_torches;
+            }
         }
-        y += step;
-        let fs_label = if self.options.fullscreen {
-            "Plein écran : oui (F11)"
-        } else {
-            "Plein écran : non (F11)"
-        };
-        if c.button(fs_label, cx, y, 300.0, true) {
-            self.options.fullscreen = !self.options.fullscreen;
+        if let Some((x, y)) = next() {
+            let fs_label = if self.options.fullscreen {
+                "Plein écran : oui (F11)"
+            } else {
+                "Plein écran : non (F11)"
+            };
+            if c.button(fs_label, x, y, 300.0, true) {
+                self.options.fullscreen = !self.options.fullscreen;
+            }
         }
-        y += step;
         // (v228) Carte graphique : la plus puissante ou la partie intégrée au processeur (moins
         // de chaleur et de batterie), quand la machine en a plusieurs ; compte au prochain
         // lancement.
-        if gpu_report::several_cards() {
-            let mut gpu_label = if self.options.igpu {
-                "Carte graphique : partie intégrée".to_string()
-            } else {
-                "Carte graphique : la plus puissante".to_string()
-            };
-            if self.options.igpu != self.igpu_at_start {
-                gpu_label.push_str(" (au prochain lancement)");
+        if several {
+            if let Some((x, y)) = next() {
+                let mut gpu_label = if self.options.igpu {
+                    "Carte graphique : partie intégrée".to_string()
+                } else {
+                    "Carte graphique : la plus puissante".to_string()
+                };
+                if self.options.igpu != self.igpu_at_start {
+                    gpu_label.push_str(" (au prochain lancement)");
+                }
+                if c.button(&gpu_label, x, y, 300.0, true) {
+                    self.options.igpu = !self.options.igpu;
+                }
             }
-            if c.button(&gpu_label, cx, y, 300.0, true) {
-                self.options.igpu = !self.options.igpu;
-            }
-            y += step;
         }
         // Répartition du processeur (prise en compte au prochain monde chargé).
-        let cpu_label = if self.options.cpu_uniform {
-            "Processeur : tous les coeurs"
-        } else {
-            "Processeur : coeurs réservés"
-        };
-        if c.button(cpu_label, cx, y, 300.0, true) {
-            self.options.cpu_uniform = !self.options.cpu_uniform;
-            jobs::set_uniform_sharing(self.options.cpu_uniform);
+        if let Some((x, y)) = next() {
+            let cpu_label = if self.options.cpu_uniform {
+                "Processeur : tous les coeurs"
+            } else {
+                "Processeur : coeurs réservés"
+            };
+            if c.button(cpu_label, x, y, 300.0, true) {
+                self.options.cpu_uniform = !self.options.cpu_uniform;
+                jobs::set_uniform_sharing(self.options.cpu_uniform);
+            }
         }
-        y += step;
         // Mode basse latence : seulement si la carte le propose (NVIDIA Reflex, AMD Anti-Lag 2).
         if let Some((kind, on)) = &mut low_latency {
-            let label = format!(
-                "{} : {}",
-                kind.label(),
-                if *on { "activé" } else { "désactivé" }
-            );
-            if c.button(&label, cx, y, 300.0, true) {
-                *on = !*on;
+            if let Some((x, y)) = next() {
+                let label = format!(
+                    "{} : {}",
+                    kind.label(),
+                    if *on { "activé" } else { "désactivé" }
+                );
+                if c.button(&label, x, y, 300.0, true) {
+                    *on = !*on;
+                }
             }
-            y += step;
         }
+        let y = top + vis as f32 * step;
         c.text_center(
             "Échelle sous 100 % : monde calculé en plus petit puis reconstruit (plus de FPS).",
             y + 4.0 * s,
@@ -3942,8 +4070,24 @@ impl GameLoop for Game {
     }
 
     fn on_frame(&mut self, window: &PlatformWindow, input: &Input, dt: f32) -> bool {
+        // (v251) Essais : MINELIB_PAS_FIXE=<n> (voir plus haut).
+        static FIXED: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        let dt = FIXED
+            .get_or_init(|| {
+                std::env::var("MINELIB_PAS_FIXE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .filter(|n| n.is_finite() && *n >= 1.0)
+            })
+            .map_or(dt, |n| 1.0 / n);
         self.time += dt;
         self.record_frame_time(dt);
+        // (v251) Ctrl+C peu après une capture : copiée. Avant toute autre touche : le C de ce
+        // Ctrl+C ne compte pour rien d'autre tant qu'il est tenu (`muted_key`).
+        if self.keys.muted_key.is_some_and(|k| !input.held(k)) {
+            self.keys.muted_key = None;
+        }
+        self.copy_last_shot(input);
         if self.auto_online.is_some() && self.accounts.link.is_some() {
             if let Some(dir) = self.auto_online.take() {
                 self.host_build(dir);
@@ -4473,14 +4617,34 @@ fn file_name(p: &std::path::Path) -> String {
 fn copy_image_to_clipboard(path: &std::path::Path) -> anyhow::Result<()> {
     let img = image::open(path)?.to_rgba8();
     let (width, height) = img.dimensions();
+    copy_rgba_to_clipboard(width, height, img.as_raw())
+}
+
+/// (v251) Copie une image (RGBA, 8 bits) dans le presse-papier.
+fn copy_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<()> {
     let mut cb = arboard::Clipboard::new()?;
     cb.set_image(arboard::ImageData {
         width: width as usize,
         height: height as usize,
-        bytes: std::borrow::Cow::Owned(img.into_raw()),
+        bytes: std::borrow::Cow::Borrowed(rgba),
     })?;
     Ok(())
 }
+
+/// (v251) Dernière capture d'écran, gardée en mémoire pour Ctrl+C.
+struct LastShot {
+    path: std::path::PathBuf,
+    rgba: std::sync::Arc<Vec<u8>>,
+    width: u32,
+    height: u32,
+    /// Moment de la capture (`Game::time`, s).
+    at: f32,
+}
+
+/// (v251) Ctrl+C copie la dernière capture pendant ce temps après l'avoir prise (s) : assez
+/// pour la copier tout de suite ou après avoir lu le tchat, pas plus (Ctrl et C servent aussi
+/// en jeu : courir et zoomer, s'accroupir et la radio).
+const SHOT_COPY_S: f32 = 60.0;
 
 fn stamp() -> String {
     let secs = std::time::SystemTime::now()

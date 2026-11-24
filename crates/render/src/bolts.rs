@@ -90,6 +90,9 @@ pub const BOLT_LIGHT: [f32; 3] = [0.72, 0.82, 1.0];
 /// (v217) `BoltSeg::a[3]` d'un segment du monde : un éclair, ou sa lueur dans le nuage.
 pub const BOLT: f32 = 1.0;
 pub const BOLT_CLOUD_GLOW: f32 = 2.0;
+/// (v251) Boule de lumière d'une lumière ponctuelle : `a` = `b` = son centre, demi-largeur =
+/// son rayon (blocs), `color` = sa couleur (linéaire).
+pub const BOLT_BALL: f32 = 3.0;
 
 /// Le shader des éclairs, avec le ciel de world.wgsl : il y lit les nuages qui cachent un
 /// éclair entré dans leur couche.

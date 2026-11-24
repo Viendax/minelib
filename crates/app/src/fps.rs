@@ -2791,16 +2791,20 @@ fn quad(out: &mut Vec<VmVertex>, vp: Mat4, c: Vec3, u: Vec3, v: Vec3, color: [f3
 }
 
 /// Premier bloc qui cache la vue le long du rayon : ni les blocs invisibles (barrières),
-/// ni le verre et l'eau (on voit les impacts à travers).
-fn raycast_view(
+/// ni le verre et l'eau (on voit les impacts à travers). (v251) Ni les barreaux : toute leur
+/// forme compte maintenant (plus seulement leur poteau du milieu), et on voit au travers.
+pub(crate) fn raycast_view(
     world: &World,
     origin: [f32; 3],
     dir: [f32; 3],
     max: f32,
 ) -> Option<minelib_world::raycast::Hit> {
+    use minelib_world::registry::{PostKind, Shape};
     minelib_world::raycast::raycast_with(world, origin, dir, max, |id| {
         let d = id.def();
-        d.target && !d.translucent && !matches!(d.shape, minelib_world::registry::Shape::Invisible)
+        d.target
+            && !d.translucent
+            && !matches!(d.shape, Shape::Invisible | Shape::Post(PostKind::Pane))
     })
 }
 

@@ -1775,18 +1775,40 @@ impl Editor {
                         l.edge = v.round();
                         changed = true;
                     }
-                } else if let Some(v) = self.slider(
-                    p,
-                    127,
-                    "Rayon",
-                    l.radius,
-                    0.1,
-                    64.0,
-                    2.0,
-                    &blocks(l.radius, 1),
-                ) {
-                    l.radius = v;
-                    changed = true;
+                } else {
+                    if let Some(v) = self.slider(
+                        p,
+                        127,
+                        "Rayon",
+                        l.radius,
+                        0.1,
+                        64.0,
+                        2.0,
+                        &blocks(l.radius, 1),
+                    ) {
+                        l.radius = v;
+                        changed = true;
+                    }
+                    // (v251) Boule de lumière à son centre (0 : aucune) : l'éclat de la
+                    // source, qui n'éclaire rien.
+                    let label = if l.ball > 0.0 {
+                        blocks(l.ball, 2)
+                    } else {
+                        "aucune".to_string()
+                    };
+                    if let Some(v) = self.slider(
+                        p,
+                        128,
+                        "Boule de lumière",
+                        l.ball,
+                        0.0,
+                        crate::lights::BALL_MAX,
+                        1.5,
+                        &label,
+                    ) {
+                        l.ball = if v < 0.02 { 0.0 } else { (v * 100.0).round() / 100.0 };
+                        changed = true;
+                    }
                 }
             }
             Tab::Volume => {

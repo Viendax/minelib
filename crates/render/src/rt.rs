@@ -130,7 +130,12 @@ impl Voxels {
                 _ => 0,
             };
             let glow = (def.light.is_some() && torch == 0) as u16;
-            data[i * 4 + 3] = glow | (def.reflect.min(15) as u16) << 4 | torch << 8;
+            // (v251) Bit 11 : verre (voir `glass`) : les cartes d'ombre teintent la lumière
+            // qui le traverse ; les reflets et les rayons le traversent.
+            data[i * 4 + 3] = glow
+                | (def.reflect.min(15) as u16) << 4
+                | torch << 8
+                | (glass(def) as u16) << 11;
             let shape = shape_texel(def);
             let j = (PALETTE as usize + i) * 4;
             data[j..j + 4].copy_from_slice(&shape);
@@ -231,7 +236,8 @@ pub fn shape_texel(def: &BlockDef) -> [u16; 4] {
 /// Bloc retenu dans la grille : cubes opaques (et feuillages), blocs non pleins opaques
 /// (dalles, escaliers, clôtures, murets, panneaux, boîtes : leurs boîtes sont retracées
 /// dans le shader, voir `shape_texel`), torches et plantes en croix (elles font de l'ombre
-/// aux lumières de l'éditeur ; les reflets les traversent) ; pas les blocs translucides.
+/// aux lumières de l'éditeur ; les reflets les traversent) ; pas les blocs translucides,
+/// (v251) sauf le verre (`glass`), qui teinte la lumière des lumières de l'éditeur.
 pub fn traced(def: &minelib_world::registry::BlockDef) -> bool {
     (matches!(
         def.shape,
@@ -243,6 +249,24 @@ pub fn traced(def: &minelib_world::registry::BlockDef) -> bool {
             | Shape::Cross
     ) && !def.translucent)
         || matches!(def.shape, Shape::Torch | Shape::WallTorch(_))
+        || glass(def)
+}
+
+/// (v251) Verre : bloc translucide et solide, plein (verre, verre teinté, glace) ou vitre.
+/// « Les blocs comme les vitres colorées doivent affecter la coloration de la lumière » : dans
+/// la grille (bit 11 de la palette), il n'arrête pas la lumière des lumières de l'éditeur, il
+/// la teinte de sa couleur (carte de teinte, voir shadow_bake.wgsl) ; les reflets et les
+/// rayons le traversent comme avant. Pas l'eau (ni solide ni verre).
+pub fn glass(def: &minelib_world::registry::BlockDef) -> bool {
+    def.translucent
+        && def.solid
+        && matches!(def.shape, Shape::Cube | Shape::Post(PostKind::Pane))
+}
+
+/// (v251) Pour chaque identifiant de bloc : est-ce du verre (`glass`) ?
+pub fn glass_ids() -> &'static [bool] {
+    static IDS: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| registry().defs.iter().map(glass).collect())
 }
 
 /// Bloc qui bloque la vue (pour trouver les faces visibles des miroirs).
@@ -351,6 +375,28 @@ mod tests {
         assert!(traced(stairs));
         let cube = reg.defs.iter().find(|d| d.key == "stone").unwrap();
         assert_eq!(shape_texel(cube)[3] & 3, 0);
+    }
+
+    /// (v251) Verre, verre teinté, vitres et glace entrent dans la grille, marqués verre (bit 11
+    /// de la palette) ; l'eau non.
+    #[test]
+    fn glass_is_in_the_grid_and_marked() {
+        let reg = registry();
+        let find = |k: &str| reg.defs.iter().find(|d| d.key == k).unwrap_or_else(|| panic!("{k}"));
+        for k in ["glass", "glass_red", "pane_blue", "pane", "ice"] {
+            let d = find(k);
+            assert!(glass(d) && traced(d), "{k}");
+        }
+        for k in ["water", "stone", "leaves_oak"] {
+            if let Some(d) = reg.defs.iter().find(|d| d.key == k) {
+                assert!(!glass(d), "{k}");
+            }
+        }
+        assert!(!traced(find("water")));
+        let ids = glass_ids();
+        assert_eq!(ids.len(), reg.defs.len());
+        let red = reg.defs.iter().position(|d| d.key == "glass_red").unwrap();
+        assert!(ids[red]);
     }
 
     #[test]

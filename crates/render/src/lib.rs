@@ -41,7 +41,7 @@ mod water_mirror;
 
 pub use capture::Screenshot;
 
-pub use bolts::{BoltSeg, BOLT, BOLT_CLOUD_GLOW, BOLT_LIGHT, BOLT_TINT};
+pub use bolts::{BoltSeg, BOLT, BOLT_BALL, BOLT_CLOUD_GLOW, BOLT_LIGHT, BOLT_TINT};
 #[doc(hidden)]
 pub use entity::draw_offscreen;
 pub use entity::{
@@ -207,6 +207,8 @@ pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth3
 struct LitPipes {
     deferred: lights::DeferredPipes,
     bake: wgpu::RenderPipeline,
+    /// (v251) Cartes de teinte (lumière passée par le verre).
+    tint: wgpu::RenderPipeline,
     vl: lights::VlPipes,
     /// Bras à la première personne éclairé par les lumières.
     arm: wgpu::RenderPipeline,
@@ -1201,6 +1203,8 @@ impl Renderer {
                 dyn_entries[5],
                 dyn_entries[6],
                 dyn_entries[7],
+                // (v251) Atlas des teintes (24).
+                dyn_entries[8],
                 // (v190) Images des miroirs redessinés (voir `planar`).
                 wgpu::BindGroupLayoutEntry {
                     binding: 14,
@@ -2008,7 +2012,7 @@ impl Renderer {
             }
             device.push_error_scope(wgpu::ErrorFilter::Validation);
             device.push_error_scope(wgpu::ErrorFilter::Internal);
-            let (bake, vl, deferred, arm) = lights::light_pipes(
+            let ((bake, tint), vl, deferred, arm) = lights::light_pipes(
                 &device,
                 &bgl,
                 &bake_bgl,
@@ -2033,6 +2037,7 @@ impl Renderer {
             Ok(LitPipes {
                 deferred,
                 bake,
+                tint,
                 vl,
                 arm,
             })
@@ -2688,9 +2693,9 @@ impl Renderer {
         }
     }
 
-    /// Ciel, blocs opaques, blocs qui reflètent, contour du bloc visé, translucides
+    /// Ciel, blocs opaques, blocs qui reflètent, translucides, contour du bloc visé
     /// (pipelines : [ciel, blocs, translucides, contour, reflets]).
-    /// Ciel, blocs, miroirs, entités, puis contour, écrans vidéo et translucides, dans la
+    /// Ciel, blocs, miroirs, entités, puis écrans vidéo, translucides et contour, dans la
     /// même passe (sans l'anticrénelage).
     fn draw_scene<'p>(
         &'p self,
@@ -3232,17 +3237,13 @@ impl Renderer {
         self.entities.draw_water_mirror(&mut pass, group);
     }
 
-    /// Après les opaques (et l'éclairage différé) : contour du bloc visé, écrans vidéo,
-    /// translucides de l'arrière vers l'avant.
+    /// Après les opaques (et l'éclairage différé) : écrans vidéo, translucides de l'arrière
+    /// vers l'avant, puis (v251) contour du bloc visé.
     fn draw_after<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, pipes: &ScenePipes<'p>) {
         let Some(heavy) = pipes.heavy else {
             return;
         };
         pass.set_bind_group(0, self.world_group(), &[]);
-        if self.outline {
-            pass.set_pipeline(pipes.outline);
-            pass.draw(0..24, 0..1);
-        }
         self.screen.draw(pass, pipes.taa);
         // Translucides de l'arrière vers l'avant, par-dessus la scène opaque. (v202) Sans
         // le code du raytracing quand il est coupé.
@@ -3260,6 +3261,14 @@ impl Renderer {
                 pass.set_index_buffer(pg.indices.slice(..), wgpu::IndexFormat::Uint32);
             }
             pass.draw_indexed(first..first + count, vstart, 0..1);
+        }
+        // (v251) Contour du bloc visé après les translucides : dessiné avant, il était recouvert
+        // par les faces du bloc de verre ou de la vitre qu'il entoure (et par l'eau), et on ne
+        // voyait pas quel verre on visait. Toujours caché par les blocs opaques devant lui.
+        if self.outline {
+            pass.set_bind_group(0, self.world_group(), &[]);
+            pass.set_pipeline(pipes.outline);
+            pass.draw(0..24, 0..1);
         }
     }
 
@@ -3706,7 +3715,7 @@ impl Renderer {
                 .gpu_timer
                 .as_ref()
                 .and_then(|t| t.pass(gpu_timer::BAKE));
-            self.dyn_gpu.encode_bake(&mut encoder, &l.bake, ts);
+            self.dyn_gpu.encode_bake(&mut encoder, &l.bake, &l.tint, ts);
         }
         // (v220) Atlas des ombres des joueurs : effacé, puis les joueurs à portée de chaque
         // lumière, dans ses cases (et seulement effacé quand il n'y a plus personne).
@@ -4342,7 +4351,7 @@ fn world_group(
     sky: &sky::Sky,
     psm: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
-    let [d7, d8, d9, d10, d11, d12, d13, d23] = dyn_gpu.bind_entries();
+    let [d7, d8, d9, d10, d11, d12, d13, d23, d24] = dyn_gpu.bind_entries();
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("monde"),
         layout: bgl,
@@ -4383,6 +4392,7 @@ fn world_group(
             d12,
             d13,
             d23,
+            d24,
             wgpu::BindGroupEntry {
                 binding: 14,
                 resource: wgpu::BindingResource::TextureView(mirrors),
@@ -4781,7 +4791,7 @@ mod tests {
                 bolts::source(),
                 &[],
             ),
-            ("pluie", include_str!("shaders/rain.wgsl").to_string(), &[]),
+            ("pluie", rain::source(), &[]),
             (
                 "flammes",
                 include_str!("shaders/flame.wgsl").to_string(),
@@ -4887,7 +4897,7 @@ mod tests {
                 include_str!("shaders/sky_clouds.wgsl").to_string(),
             ),
             ("éclairs", bolts::source()),
-            ("pluie", include_str!("shaders/rain.wgsl").to_string()),
+            ("pluie", rain::source()),
             ("flammes", include_str!("shaders/flame.wgsl").to_string()),
             ("traces", include_str!("shaders/decal.wgsl").to_string()),
         ] {

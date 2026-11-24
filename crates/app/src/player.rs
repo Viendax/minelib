@@ -2,7 +2,7 @@
 //! boîte englobante / voxels (résolues axe par axe).
 
 use glam::{Mat4, Vec3};
-use minelib_world::registry::{post_arms, post_connects, Fluid, Shape};
+use minelib_world::registry::{Fluid, Shape};
 use minelib_world::World;
 
 pub const HALF_WIDTH: f32 = 0.3;
@@ -1360,19 +1360,16 @@ fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec3, Vec3)> {
     if !def.solid {
         return Vec::new();
     }
-    let mut boxes = minelib_world::registry::placed_boxes(world.get(x, y, z), |dx, dy, dz| {
+    // (v251) La forme dessinée (`shape_boxes`) : une vitre seule, en croix, arrête le joueur
+    // sur toute sa croix (avant : seulement sur son poteau du milieu, on passait au travers).
+    let mut boxes = minelib_world::registry::shape_boxes(world.get(x, y, z), |dx, dy, dz| {
         world.get(x + dx, y + dy, z + dz)
     });
-    if let Shape::Post(kind) = def.shape {
-        for (side, dx, dz) in [(0u8, 1, 0), (1, -1, 0), (4, 0, 1), (5, 0, -1)] {
-            if post_connects(kind, world.get(x + dx, y, z + dz)) {
-                // Bras sur toute la hauteur : on ne passe pas entre les barreaux.
-                boxes.extend(post_arms(kind, side).into_iter().map(|(mut a, mut b)| {
-                    a[1] = 0;
-                    b[1] = 16;
-                    (a, b)
-                }));
-            }
+    if let Shape::Post(_) = def.shape {
+        // Bras sur toute la hauteur : on ne passe pas entre les barreaux.
+        for (a, b) in &mut boxes {
+            a[1] = 0;
+            b[1] = 16;
         }
     }
     let o = Vec3::new(x as f32, y as f32, z as f32);
@@ -1743,6 +1740,28 @@ mod tests {
         }
         assert!(p.pos.x <= 10.0 - HALF_WIDTH + 0.01, "x = {}", p.pos.x);
         assert!(p.pos.x > 9.5);
+    }
+
+    /// (v251) Une vitre seule est dessinée en croix : elle arrête le joueur sur toute sa croix
+    /// (avant, seulement sur son poteau du milieu : on passait dans ses bras).
+    #[test]
+    fn a_lone_pane_stops_the_player_on_its_whole_cross() {
+        let pane = minelib_world::registry::registry().by_key("pane").unwrap();
+        let mut w = flat_world();
+        w.set(10, 11, 8, pane);
+        // À z = 8 : la boîte du joueur (z de 7,7 à 8,3) passe à côté du poteau (8,44 à 8,56),
+        // pas à côté du bras nord (x de 10,44 à 10,56, z de 8 à 8,44).
+        let mut p = Player::new(Vec3::new(8.5, 11.0, 8.0));
+        p.yaw = std::f32::consts::FRAC_PI_2; // vers +X
+        let m = MoveInput {
+            forward: 1.0,
+            ..Default::default()
+        };
+        for _ in 0..120 {
+            p.update(&w, &m, 1.0 / 60.0);
+        }
+        assert!(p.pos.x <= 10.4375 - HALF_WIDTH + 1e-3, "x = {}", p.pos.x);
+        assert!(p.pos.x > 10.0, "x = {}", p.pos.x);
     }
 
     #[test]

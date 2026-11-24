@@ -387,6 +387,42 @@ impl Store {
         }
     }
 
+    /// (v251) « Quand un joueur ouvre sa carte sur un serveur de construction, le serveur doit
+    /// être fermé par défaut (liste blanche active, invisible dans la liste des serveurs) ; dis-le
+    /// à la première connexion : /whitelist off pour que tout le monde puisse rejoindre » : son
+    /// créateur ouvre son monde et rien n'est encore réglé : la liste blanche est notée active
+    /// (gardée : il la règle ensuite à sa guise). Rend vrai cette première fois.
+    pub fn whitelist_first(&mut self, server: &str) -> bool {
+        if self.whitelists.contains_key(server) {
+            return false;
+        }
+        self.whitelists.insert(
+            server.to_string(),
+            Whitelist {
+                on: true,
+                names: Vec::new(),
+            },
+        );
+        self.save();
+        true
+    }
+
+    /// (v251) Un ami invité par le créateur ou un OP entre, même liste blanche active : il y
+    /// est ajouté (rien si elle est inactive).
+    pub fn whitelist_invited(&mut self, server: &str, creator: &str, by: &str, who: &str) {
+        if !self.is_op(server, creator, by) {
+            return;
+        }
+        let Some(w) = self.whitelists.get_mut(server).filter(|w| w.on) else {
+            return;
+        };
+        let low = who.to_ascii_lowercase();
+        if !w.names.contains(&low) {
+            w.names.push(low);
+            self.save();
+        }
+    }
+
     /// Liste blanche active sur ce serveur.
     pub fn whitelist_on(&self, server: &str) -> bool {
         self.whitelists.get(server).is_some_and(|w| w.on)

@@ -39,6 +39,8 @@ struct DynLight {
     up: vec4<f32>,
     rect: vec4<f32>,
     box_sphere: vec4<f32>,
+    // (v251) x = 1 : la lumière a sa carte de teinte (du verre à sa portée, `tint_atlas`).
+    tint: vec4<f32>,
 };
 
 struct DynHeader {
@@ -79,6 +81,10 @@ struct DynHeader {
 // (v220) Atlas des ombres des joueurs : leur distance à chaque lumière (rapportée à sa
 // portée ; 1 : personne), dans les mêmes cases que les cartes des blocs (voir `EntJob`).
 @group(0) @binding(23) var ent_atlas: texture_depth_2d;
+// (v251) Atlas des teintes : la lumière passée par le verre (rgb : filtre des verres traversés,
+// a : distance du premier, rapportée à la portée), dans les mêmes cases que les cartes des
+// blocs, deux ou quatre fois plus petites de côté.
+@group(0) @binding(24) var tint_atlas: texture_2d<f32>;
 
 const DL_VL_SHADOWS: u32 = 1u;
 const DL_VL_NOISE: u32 = 2u;
@@ -280,6 +286,23 @@ fn dl_shadow_uv(L: DynLight, fr: DlFrame, d: vec3<f32>) -> vec3<f32> {
         vec2<f32>(rect.z - px * 0.5),
     );
     return vec3<f32>(rect.xy + local, select(0.0, 1.0, ok));
+}
+
+/// (v251) « Les blocs comme les vitres colorées doivent affecter la coloration de la lumière » :
+/// couleur que prend la lumière `L` en arrivant, à la distance `dist` (portée `range`), dans la
+/// direction `d` (de la lumière vers le point) : le filtre des verres qu'elle a traversés si le
+/// point est au-delà du premier, sinon blanc. Sans carte de teinte : blanc.
+fn dl_tint(L: DynLight, fr: DlFrame, d: vec3<f32>, dist: f32, range: f32) -> vec3<f32> {
+    if L.tint.x < 0.5 {
+        return vec3<f32>(1.0);
+    }
+    let su = dl_shadow_uv(L, fr, d);
+    if su.z < 0.5 {
+        return vec3<f32>(1.0);
+    }
+    let dims = vec2<f32>(textureDimensions(tint_atlas));
+    let q = textureLoad(tint_atlas, vec2<i32>(clamp(su.xy * dims, vec2<f32>(0.0), dims - 1.0)), 0);
+    return select(vec3<f32>(1.0), q.rgb, dist / max(range, 1e-3) > q.a + 0.004);
 }
 
 /// Rotation du disque de Vogel d'un échantillon au suivant (angle d'or).
@@ -568,14 +591,16 @@ fn dl_one(
             if toon {
                 diff = dl_toon(diff, dh.surf.z, dh.surf.w);
             }
-            o.diffuse = L.color.rgb * diff;
+            // (v251) Passée par du verre : de sa couleur.
+            let col = L.color.rgb * dl_tint(L, fr, -l, d, r);
+            o.diffuse = col * diff;
             if spec_k > 0.0 {
                 // Blinn-Phong normalisé : tache nette sur un miroir, large et faible
                 // sur un bloc mat.
                 let h = normalize(l + v);
                 let shin = mix(24.0, 1024.0, gloss * gloss);
                 let s = pow(max(dot(n, h), 0.0), shin) * (shin + 8.0) / 25.1327;
-                o.specular = L.color.rgb * (att * ndl * s * mix(0.02, 1.0, gloss) * spec_k);
+                o.specular = col * (att * ndl * s * mix(0.02, 1.0, gloss) * spec_k);
             }
         }
     }

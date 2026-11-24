@@ -340,6 +340,34 @@ pub fn placed_boxes(
     }
 }
 
+/// (v251) Boîtes du bloc `id` placé dans le monde telles que le maillage le dessine : celles
+/// de `placed_boxes`, plus les bras d'un poteau (vitre, barreaux, clôture, muret) vers les
+/// voisins auxquels il se relie ; une vitre (ou des barreaux) sans voisin est dessinée en
+/// croix. Pour viser, le contour du bloc visé, les balles et les collisions : « les vitres
+/// font les hitbox correctement pour la place qu'elles prennent ». Avant, seul le poteau du
+/// milieu (2 pixels) comptait : en visant le verre, on cassait ou posait le bloc de derrière.
+pub fn shape_boxes(
+    id: BlockId,
+    get: impl Fn(i32, i32, i32) -> BlockId,
+) -> Vec<([u8; 3], [u8; 3])> {
+    let mut boxes = placed_boxes(id, &get);
+    if let Shape::Post(kind) = id.def().shape {
+        let mut any = false;
+        for (side, dx, dz) in [(0u8, 1, 0), (1, -1, 0), (4, 0, 1), (5, 0, -1)] {
+            if post_connects(kind, get(dx, 0, dz)) {
+                boxes.extend(post_arms(kind, side));
+                any = true;
+            }
+        }
+        if !any && kind == PostKind::Pane {
+            for side in [0u8, 1, 4, 5] {
+                boxes.extend(post_arms(kind, side));
+            }
+        }
+    }
+    boxes
+}
+
 pub fn post_center(k: PostKind) -> ([u8; 3], [u8; 3]) {
     match k {
         PostKind::Fence => ([6, 0, 6], [10, 16, 10]),

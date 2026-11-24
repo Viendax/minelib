@@ -167,13 +167,14 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
         var k = 1.0;
         // (v225) Foudre de Zeus (bit 19) : le bras levé devant soi, quel que soit le regard
         // (`player_model::parts`).
+        // (v251) Bras levé : balancement de 0,1 (`RAISED_SWING`), comme le bras tendu.
         if (v.skin & 0x80000u) != 0u {
             raise = ZEUS_RAISE;
-            k = 0.3;
+            k = 0.1;
         } else if (v.skin & 0x10000u) != 0u {
             raise = clamp(0.65 + 0.6 * pitch, 0.0, 2.0);
             if raise != 0.0 {
-                k = 0.3;
+                k = 0.1;
             }
         }
         return upper * m_trans(vec3<f32>(ARM_X, SHOULDER_Y, 0.0)) * m_rot_x(swing * k + lean * 0.6 + raise);

@@ -62,6 +62,9 @@ pub const LOADED_MAX: usize = 192;
 /// distance (blocs) de la caméra (plus loin, ni elle ni ses rayons ne se voient).
 pub const LOADED_DIST: f32 = 192.0;
 
+/// (v251) Rayon le plus grand de la boule de lumière (blocs).
+pub const BALL_MAX: f32 = 3.0;
+
 /// Sorte de lumière.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
@@ -131,6 +134,17 @@ pub struct PlacedLight {
     pub gobo_rotation: f32,
     pub gobo_echelle: f32,
     pub gobo_inverse: bool,
+    /// (v251) Lumière ponctuelle : rayon (blocs) d'une boule de lumière à son centre, 0 :
+    /// aucune. « Une petite boule de lumière : elle n'éclaire rien, c'est l'illusion d'une
+    /// lumière très intense au centre ; le curseur part de 0 et augmente son rayon. »
+    /// (Pas écrite sans boule : les lumières d'avant gardent le même texte, et la même
+    /// signature de la carte.)
+    #[serde(rename = "boule", skip_serializing_if = "no_ball")]
+    pub ball: f32,
+}
+
+fn no_ball(v: &f32) -> bool {
+    *v == 0.0
 }
 
 impl Default for PlacedLight {
@@ -161,6 +175,7 @@ impl Default for PlacedLight {
             gobo_rotation: 0.0,
             gobo_echelle: 1.0,
             gobo_inverse: false,
+            ball: 0.0,
         }
     }
 }
@@ -192,6 +207,7 @@ impl PlacedLight {
         self.density = f(self.density, 0.005, 0.5, 0.05);
         self.anisotropy = f(self.anisotropy, -0.95, 0.95, 0.4);
         self.bulb = f(self.bulb, 0.0, 2.0, 0.0);
+        self.ball = f(self.ball, 0.0, BALL_MAX, 0.0);
         self.gobo_rotation = f(self.gobo_rotation, 0.0, 360.0, 0.0);
         self.gobo_echelle = f(self.gobo_echelle, 0.1, 4.0, 1.0);
         if self.entities_only && self.blocks_only {
@@ -1275,6 +1291,20 @@ impl Lights {
         } else {
             n
         }
+    }
+
+    /// (v251) Boules de lumière des lumières ponctuelles chargées et allumées qui en ont une
+    /// (`ball`) : centre, rayon (blocs), couleur (linéaire), force (selon l'intensité).
+    pub fn balls(&self) -> Vec<([f32; 3], f32, [f32; 3], f32)> {
+        self.loaded()
+            .map(|i| &self.scene[i])
+            .filter(|l| l.on && l.kind == Kind::Point && l.ball > 0.0)
+            .map(|l| {
+                let lin = l.color.map(|c| c.powf(2.2));
+                let force = (0.6 + 0.2 * l.intensity).min(2.0);
+                (l.pos().to_array(), l.ball, lin, force)
+            })
+            .collect()
     }
 
     /// Lumières à dessiner : celles du joueur d'abord (elles passent avant pour les ombres),

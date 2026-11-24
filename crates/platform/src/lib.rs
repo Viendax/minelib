@@ -497,9 +497,18 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
         if self.window.is_some() {
             return;
         }
+        // (v251) Essais : MINELIB_TAILLE=<largeur>x<hauteur> (sinon 1280 × 720).
+        let (w, h) = std::env::var("MINELIB_TAILLE")
+            .ok()
+            .and_then(|v| {
+                let (w, h) = v.trim().split_once('x')?;
+                Some((w.parse::<f64>().ok()?, h.parse::<f64>().ok()?))
+            })
+            .filter(|&(w, h)| w >= 320.0 && h >= 200.0)
+            .unwrap_or((1280.0, 720.0));
         let attrs = Window::default_attributes()
             .with_title(self.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+            .with_inner_size(winit::dpi::LogicalSize::new(w, h))
             .with_visible(false);
         let window = Arc::new(
             event_loop

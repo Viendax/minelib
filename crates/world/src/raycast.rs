@@ -91,7 +91,8 @@ pub fn raycast_with(
                 });
             }
             // Bloc partiel (torche, dalle, clôture…) : il faut toucher sa vraie forme.
-            let boxes = crate::registry::placed_boxes(id, |dx, dy, dz| {
+            // (v251) Celle qui est dessinée : une vitre avec ses bras (`shape_boxes`).
+            let boxes = crate::registry::shape_boxes(id, |dx, dy, dz| {
                 world.get(cell[0] + dx, cell[1] + dy, cell[2] + dz)
             });
             if let Some((dist, n)) = hit_boxes(origin, d, cell, &boxes) {
@@ -126,9 +127,10 @@ pub fn raycast_with(
 }
 
 /// Boîte (coins min, max, en coordonnées monde) visée pour un bloc : l'union de ses boîtes.
+/// (v251) Celles qui sont dessinées : une vitre droite a le contour de sa plaque.
 pub fn selection_box(world: &World, block: [i32; 3]) -> ([f32; 3], [f32; 3]) {
     let boxes =
-        crate::registry::placed_boxes(world.get(block[0], block[1], block[2]), |dx, dy, dz| {
+        crate::registry::shape_boxes(world.get(block[0], block[1], block[2]), |dx, dy, dz| {
             world.get(block[0] + dx, block[1] + dy, block[2] + dz)
         });
     let (mut lo, mut hi) = ([16u8; 3], [0u8; 3]);
@@ -220,6 +222,44 @@ mod tests {
         assert!((h.distance - 3.875).abs() < 1e-4, "{}", h.distance);
         let (lo, hi) = selection_box(&w, [5, 100, 2]);
         assert_eq!((lo, hi), ([5.375, 100.0, 2.375], [5.625, 100.8125, 2.625]));
+    }
+
+    /// (v251) « Les vitres font les hitbox correctement pour la place qu'elles prennent » : on
+    /// touche une vitre sur toute sa plaque (pas seulement son poteau du milieu), son contour
+    /// est sa plaque, et une vitre seule se vise sur toute sa croix.
+    #[test]
+    fn a_pane_is_hit_and_outlined_where_it_is_drawn() {
+        let pane = crate::registry::registry().by_key("pane").unwrap();
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        // Vitre de x = 4 à 6 en z = 2, entre deux blocs de pierre ; une pierre derrière.
+        w.set(3, 100, 2, BlockId::STONE);
+        for x in 4..=6 {
+            w.set(x, 100, 2, pane);
+        }
+        w.set(7, 100, 2, BlockId::STONE);
+        w.set(5, 100, 6, BlockId::STONE);
+        // Vers +Z, à 3 pixels du bord de la case (loin du poteau du milieu) : la vitre, pas la
+        // pierre de derrière.
+        let h = raycast(&w, [5.2, 100.5, 0.5], [0.0, 0.0, 1.0], 10.0).unwrap();
+        assert_eq!((h.block, h.normal), ([5, 100, 2], [0, 0, -1]));
+        assert!((h.distance - 1.9375).abs() < 1e-4, "{}", h.distance);
+        assert_eq!(
+            selection_box(&w, [5, 100, 2]),
+            ([5.0, 100.0, 2.4375], [6.0, 101.0, 2.5625])
+        );
+        // Les balles aussi s'y arrêtent (elles passaient à côté du poteau).
+        let b = raycast_solid(&w, [5.2, 100.5, 0.5], [0.0, 0.0, 1.0], 10.0).unwrap();
+        assert_eq!(b.block, [5, 100, 2]);
+        // Vitre seule, dessinée en croix : son bras nord se vise.
+        w.set(10, 100, 10, pane);
+        let h = raycast(&w, [8.5, 100.5, 10.2], [1.0, 0.0, 0.0], 10.0).unwrap();
+        assert_eq!((h.block, h.normal), ([10, 100, 10], [-1, 0, 0]));
+        assert!((h.distance - (10.4375 - 8.5)).abs() < 1e-4, "{}", h.distance);
+        assert_eq!(
+            selection_box(&w, [10, 100, 10]),
+            ([10.0, 100.0, 10.0], [11.0, 101.0, 11.0])
+        );
     }
 
     #[test]

@@ -454,6 +454,10 @@ fn crouch_lean(crouch: f32) -> (f32, f32) {
     (CROUCH_LEAN * c, CROUCH_HIP_DROP * c)
 }
 
+/// (v251) Balancement du bras levé en marchant (part du balancement des jambes) : celui du
+/// bras tendu de la lampe torche. Le même dans `part_matrix` (players.wgsl).
+const RAISED_SWING: f32 = 0.1;
+
 /// Penche du haut du corps accroupi (radians). La même dans `part_matrix` (players.wgsl).
 pub const CROUCH_LEAN: f32 = 0.45;
 
@@ -601,7 +605,10 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         } else {
             0.0
         };
-        let swing_k = if raise != 0.0 { 0.3 } else { 1.0 };
+        // (v251) « Le mouvement du bras quand j'avance avec la lampe torche est mieux ; avec un
+        // objet, on dirait que mon joueur tape » : le bras levé (Foudre de Zeus) se balance
+        // aussi peu que le bras tendu de la lampe (0,1 ; 0,3 avant).
+        let swing_k = if raise != 0.0 { RAISED_SWING } else { 1.0 };
         let xf = upper
             * Mat4::from_translation(Vec3::new(side, SHOULDER_Y, 0.0))
             * Mat4::from_rotation_x(swing * sign * swing_k + lean * 0.6 + raise);
@@ -1832,11 +1839,11 @@ mod tests {
             let (mut raise, mut k) = (0.0, 1.0);
             if p.skin & 0x80000 != 0 {
                 raise = ZEUS_RAISE;
-                k = 0.3;
+                k = RAISED_SWING;
             } else if p.skin & 0x10000 != 0 {
                 raise = (0.65 + 0.6 * pitch).clamp(0.0, 2.0);
                 if raise != 0.0 {
-                    k = 0.3;
+                    k = RAISED_SWING;
                 }
             }
             return upper

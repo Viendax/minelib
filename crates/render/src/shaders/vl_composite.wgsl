@@ -29,6 +29,11 @@ struct VlFrame {
     margin: vec4<f32>,
     size: vec4<f32>,
     jitter: vec4<f32>,
+    // (v251) x = lumières posées à rayons dans `lights` (au plus 8), y = demi-longueur la plus
+    // grande du lissage le long des droites épipolaires (pixels des rayons).
+    epi: vec4<f32>,
+    // (v251) Deux vec4 par lumière : position depuis la caméra et portée ; force (x).
+    lights: array<vec4<f32>, 16>,
 };
 @group(0) @binding(5) var<uniform> vf: VlFrame;
 
@@ -208,6 +213,122 @@ fn vl_keep(ray: vec3<f32>) -> VlTap {
     return out;
 }
 
+/// (v251) Droite épipolaire du pixel `p` (pixels des rayons, centre à l'entier) : celle qui va
+/// au point de l'écran de la lumière posée qui compte le plus le long de son regard (`ray`,
+/// surface à la profondeur `z`, Z inversé). Les ombres d'une lumière sont faites de ses rayons
+/// (des droites qui passent par elle) : vues de la caméra, ce sont des droites de l'écran qui
+/// passent toutes par son point de l'écran. La lumière diffusée change donc doucement le long
+/// de ces droites, et d'un coup en travers (les bords des faisceaux). Rend la direction de la
+/// droite (unitaire) et la demi-longueur du lissage (0 : aucun ; la moitié de la distance au
+/// point de la lumière au plus, pour ne pas mêler les faisceaux qui s'y croisent).
+fn vl_epipolar(ray: vec3<f32>, z: f32, p: vec2<f32>) -> vec3<f32> {
+    let n = u32(vf.epi.x);
+    if n == 0u {
+        return vec3<f32>(0.0);
+    }
+    let len = length(ray);
+    let d = ray / max(len, 1e-6);
+    // Distance de la surface le long du regard (ciel : sans fin).
+    let t_surf = select(1e9, len * vf.cur_rel[3][2] / z, z > 0.0);
+    var best = 0.0;
+    var bi = 0u;
+    for (var i = 0u; i < 8u; i++) {
+        if i >= n {
+            break;
+        }
+        let a = vf.lights[2u * i];
+        let strength = vf.lights[2u * i + 1u].x;
+        let t0 = dot(a.xyz, d);
+        let b2 = max(dot(a.xyz, a.xyz) - t0 * t0, 0.0);
+        let r = max(a.w, 1e-3);
+        if b2 >= r * r {
+            continue;
+        }
+        // Le regard passe dans sa sphère, devant la surface : d'autant plus fort qu'il passe
+        // près d'elle (la lumière tombe en carré de la distance).
+        let h = sqrt(r * r - b2);
+        if t0 + h <= 0.0 || t0 - h >= t_surf {
+            continue;
+        }
+        let k = 1.0 - sqrt(b2) / r;
+        let w = strength * r * k * k * k;
+        if w > best {
+            best = w;
+            bi = i;
+        }
+    }
+    if best <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    // Son point de l'écran, en coordonnées homogènes de pixels des rayons : aussi quand elle est
+    // derrière la caméra (les mêmes droites), ou dans le plan de la caméra (w nul : droites
+    // parallèles).
+    let e = vf.cur_rel * vec4<f32>(vf.lights[2u * bi].xyz, 1.0);
+    let k = max(vf.margin.z, 1.0);
+    let sz = vf.size.xy / k;
+    let ex = (0.5 * e.x + 0.5 * e.w) * sz.x + (vf.margin.x - 0.5) * e.w;
+    let ey = (0.5 * e.w - 0.5 * e.y) * sz.y + (vf.margin.y - 0.5) * e.w;
+    let dir = vec2<f32>(ex - p.x * e.w, ey - p.y * e.w);
+    let dl = length(dir);
+    if dl < 1e-6 {
+        return vec3<f32>(0.0);
+    }
+    let dist = select(1e9, dl / abs(e.w), abs(e.w) > 1e-6);
+    return vec3<f32>(dir / dl, min(vf.epi.y, 0.5 * dist));
+}
+
+/// (v251) Moyenne et variance (pondérées) d'une couche le long de la droite épipolaire.
+struct VlLine {
+    n: vec3<f32>,
+    n_var: vec3<f32>,
+    f: vec3<f32>,
+    f_var: vec3<f32>,
+};
+
+/// (v251) Lissage le long de la droite épipolaire `ep` (direction, demi-longueur) du pixel `c`
+/// de l'image des rayons qu'on vient de marcher : pas d'un pixel, gaussien, chaque couche
+/// pondérée par l'accord de sa profondeur avec celle du pixel (pas de mélange d'un objet proche
+/// et du fond). La moyenne remplace le pixel ; la variance borne l'historique.
+fn vl_line(c: vec2<i32>, s: VlTap, ep: vec3<f32>, margin_now: bool) -> VlLine {
+    let hd = vec2<i32>(textureDimensions(vl_tex));
+    let taps = i32(ceil(ep.z));
+    let inv_2s2 = 2.0 / max(ep.z * ep.z, 1.0);
+    var wn = 0.0;
+    var wf = 0.0;
+    var sn = vec3<f32>(0.0);
+    var sf = vec3<f32>(0.0);
+    var qn = vec3<f32>(0.0);
+    var qf = vec3<f32>(0.0);
+    for (var j = -8; j <= 8; j++) {
+        if abs(j) > taps {
+            continue;
+        }
+        let at = vec2<f32>(c) + ep.xy * f32(j);
+        let qi = clamp(vec2<i32>(floor(at + 0.5)), vec2<i32>(0), hd - 1);
+        if !margin_now && !vl_on_screen(qi) {
+            continue;
+        }
+        let q = vl_tap(qi);
+        let g = exp(-f32(j * j) * inv_2s2);
+        let an = g * exp(-abs(q.dn - s.dn) / max(max(q.dn, s.dn), 1e-6) * 24.0);
+        let af = g * exp(-abs(q.df - s.df) / max(max(q.df, s.df), 1e-6) * 24.0);
+        wn += an;
+        wf += af;
+        sn += q.n * an;
+        sf += q.f * af;
+        qn += q.n * q.n * an;
+        qf += q.f * q.f * af;
+    }
+    let mn = sn / max(wn, 1e-6);
+    let mf = sf / max(wf, 1e-6);
+    return VlLine(
+        mn,
+        max(qn / max(wn, 1e-6) - mn * mn, vec3<f32>(0.0)),
+        mf,
+        max(qf / max(wf, 1e-6) - mf * mf, vec3<f32>(0.0)),
+    );
+}
+
 /// (v223) Sortie de la reprise : l'historique de l'image suivante (lumières posées) et
 /// l'image que lit la recomposition (posées + portées).
 struct TemporalOut {
@@ -303,12 +424,42 @@ fn fs_temporal(@builtin(position) frag: vec4<f32>) -> TemporalOut {
     // Bornée par les voisins d'aujourd'hui (un peu élargis) : pas de traînée.
     let pad_n = (n_hi - n_lo) * 0.25 + vec3<f32>(1e-4);
     let pad_f = (f_hi - f_lo) * 0.25 + vec3<f32>(1e-4);
-    let cn = clamp(hist_n, n_lo - pad_n, n_hi + pad_n);
-    let cf = clamp(hist_f, f_lo - pad_f, f_hi + pad_f);
-    // Historique bon : la nouvelle valeur telle quelle (son échantillon bouge à chaque
-    // image) ; sinon lissée.
-    let out_n = mix(sn, mix(s.n, cn, 1.0 - a), kn);
-    let out_f = mix(sf, mix(s.f, cf, 1.0 - a), kf);
+    var cur_n = s.n;
+    var cur_f = s.f;
+    var smooth_n = sn;
+    var smooth_f = sf;
+    var lo_n = n_lo - pad_n;
+    var hi_n = n_hi + pad_n;
+    var lo_f = f_lo - pad_f;
+    var hi_f = f_hi + pad_f;
+    // (v251) « Les rayons : quand je me déplace, ça doit être fluide ; quand je ne bouge pas, pas
+    // bruité ; quand je bouge la souris non plus » : la nouvelle image est lissée le long de la
+    // droite épipolaire de la lumière qui compte le plus ici (les faisceaux restent nets en
+    // travers), et l'historique est borné par ce qu'elle y montre (moyenne ± 1,5 écart type) :
+    // des rayons d'avant mal repris en se déplaçant ne restent pas à côté des nouveaux.
+    let ep = vl_epipolar(ray, s.dn, vec2<f32>(c));
+    if ep.z >= 1.0 {
+        let line = vl_line(c, s, ep, margin_now);
+        cur_n = line.n;
+        cur_f = line.f;
+        smooth_n = line.n;
+        smooth_f = line.f;
+        let en = 1.5 * sqrt(line.n_var) + vec3<f32>(1e-4) + line.n * 0.05;
+        let ef = 1.5 * sqrt(line.f_var) + vec3<f32>(1e-4) + line.f * 0.05;
+        // Et au moins ce que montrent les voisins 3 × 3 : au bord net d'un faisceau, la droite
+        // le longe d'un seul côté ; bornée par elle seule, l'image d'avant perdait l'autre côté
+        // que l'échantillon qui bouge avait vu, et le bord restait crénelé (marches de 4 pixels).
+        lo_n = min(line.n - en, n_lo);
+        hi_n = max(line.n + en, n_hi);
+        lo_f = min(line.f - ef, f_lo);
+        hi_f = max(line.f + ef, f_hi);
+    }
+    let cn = clamp(hist_n, lo_n, hi_n);
+    let cf = clamp(hist_f, lo_f, hi_f);
+    // Historique bon : la nouvelle valeur (son échantillon bouge à chaque image) ; sinon
+    // lissée.
+    let out_n = mix(smooth_n, mix(cur_n, cn, 1.0 - a), kn);
+    let out_f = mix(smooth_f, mix(cur_f, cf, 1.0 - a), kf);
     o.hist = vl_pack(out_n, s.dn, out_f, s.df);
     o.combined = vl_pack(out_n + sn_d, s.dn, out_f + sf_d, s.df);
     return o;

@@ -63,6 +63,10 @@ struct VlFrame {
     // xy = décalage de l'échantillon dans son carré (pixels du monde) ; z = part de l'image
     // courante quand l'historique est bon ; w = pas de la marge (au plus).
     jitter: vec4<f32>,
+    // (v251) Lissage le long des droites épipolaires (voir `fs_temporal`) : x = lumières dans
+    // `lights`, y = demi-longueur la plus grande.
+    epi: vec4<f32>,
+    lights: array<vec4<f32>, 16>,
 };
 @group(1) @binding(4) var<uniform> vf: VlFrame;
 
@@ -482,7 +486,13 @@ fn dyn_volumetric(o: vec3<f32>, d: vec3<f32>, cut_t: f32, max_t: f32, dither: f3
                                     // densité des pas équiangulaires) en ce point.
                                     let x = t - t0;
                                     let pe = f32(n_e) * bq / (dang * (bq * bq + x * x));
-                                    let cv = col * ins * (ext * tr / (pu + pe));
+                                    // (v251) Passés par du verre, les rayons en prennent la
+                                    // couleur (après lui seulement).
+                                    var colk = col;
+                                    if L.tint.x > 0.5 {
+                                        colk = col * dl_tint(L, fr, -l, dist, range);
+                                    }
+                                    let cv = colk * ins * (ext * tr / (pu + pe));
                                     acc += cv;
                                     let cl = cv.r + cv.g + cv.b;
                                     lw += cl;
@@ -552,9 +562,11 @@ fn vl_voxel_depth(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> f32 {
         }
         let id = textureLoad(voxels, l, 0).r & 4095u;
         if id != 0u && i > 0 {
-            let torch = (textureLoad(palette, i32(id), 0).w >> 8u) & 7u;
+            let pw = textureLoad(palette, i32(id), 0).w;
+            let torch = (pw >> 8u) & 7u;
             let kind = textureLoad(palette, i32(id) + 4096, 0).w & 3u;
-            if torch == 0u && kind != 3u {
+            // (v251) Le verre (bit 11) ne cache rien : les rayons le traversent.
+            if torch == 0u && kind != 3u && ((pw >> 11u) & 1u) == 0u {
                 return t;
             }
         }

@@ -8,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 
 use std::collections::VecDeque;
 
-use crate::registry::{light_cover, post_arms, post_connects, PostKind, Shape};
+use crate::registry::{light_cover, post_arms, PostKind, Shape};
 use crate::world::{Light, LIGHT_RADIUS};
 use crate::{BlockId, Chunk, ChunkPos, World, CHUNK_HEIGHT, CHUNK_SIZE};
 
@@ -1771,29 +1771,14 @@ fn mesh_block(
                         return;
                     }
                     _ => {
-                        // Escalier : relié à ses voisins (coins).
-                        let mut boxes = crate::registry::placed_boxes(id, |dx, dy, dz| {
+                        // Escalier : relié à ses voisins (coins) ; poteau (vitre, clôture,
+                        // muret) : ses bras vers ses voisins, une vitre isolée en croix.
+                        // (v251) La même forme que celle qu'on vise et qui arrête le joueur
+                        // (`shape_boxes`).
+                        let mut boxes = crate::registry::shape_boxes(id, |dx, dy, dz| {
                             pad.get(x + dx, y + dy, z + dz)
                         });
                         if let Shape::Post(kind) = def.shape {
-                            let mut any = false;
-                            for (side, d) in [
-                                (0u8, [1, 0, 0]),
-                                (1, [-1, 0, 0]),
-                                (4, [0, 0, 1]),
-                                (5, [0, 0, -1]),
-                            ] {
-                                if post_connects(kind, pad.get(x + d[0], y, z + d[2])) {
-                                    boxes.extend(post_arms(kind, side));
-                                    any = true;
-                                }
-                            }
-                            // Vitre isolée : en croix.
-                            if !any && kind == PostKind::Pane {
-                                for side in [0u8, 1, 4, 5] {
-                                    boxes.extend(post_arms(kind, side));
-                                }
-                            }
                             // Vitre : une seule pièce par direction (pas de faces internes
                             // visibles à travers le verre entre le centre et les bras).
                             if kind == PostKind::Pane {

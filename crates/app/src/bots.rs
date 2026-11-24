@@ -1267,12 +1267,14 @@ fn keys_for(dir: Vec3, yaw: f32) -> (i8, i8) {
 
 /// Le bloc cache la vue (pas les vitres, les barrières invisibles, les échelles).
 fn blocks_sight(id: BlockId) -> bool {
+    use minelib_world::registry::{PostKind, Shape};
     let d = id.def();
+    // (v251) Ni les vitres ni les barreaux : on vise maintenant toute leur forme (plus
+    // seulement leur poteau du milieu), et on voit au travers.
     d.solid
         && !matches!(
             d.shape,
-            minelib_world::registry::Shape::Invisible
-                | minelib_world::registry::Shape::Panel { thick: 1, .. }
+            Shape::Invisible | Shape::Panel { thick: 1, .. } | Shape::Post(PostKind::Pane)
         )
         && !d.key.contains("glass")
 }

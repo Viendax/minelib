@@ -59,8 +59,12 @@ const VL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
 const VL_MARGIN: f32 = 0.06;
 /// La marge des tuiles de la marge (un peu plus large que `VL_MARGIN` : arrondis).
 const VL_MARGIN_BIN: f32 = 0.09;
-/// Part de la nouvelle image quand l'historique est bon (le reste : l'historique).
-const VL_NEW: f32 = 0.12;
+/// Part de la nouvelle image quand l'historique est bon (le reste : l'historique). (v251) 0,08
+/// (0,12 avant) : la caméra immobile, moins de bruit.
+const VL_NEW: f32 = 0.08;
+/// (v251) Part de la nouvelle image en plus par bloc parcouru d'une image à l'autre (0,5 avant) :
+/// à pied, 2,4 cm par image à 180 images par seconde, 0,22 en tout.
+const VL_MOVE: f32 = 6.0;
 /// Caméra qui saute plus loin que ça d'une image à l'autre (téléportation) : historique oublié.
 const VL_JUMP: f32 = 8.0;
 
@@ -86,6 +90,47 @@ struct VlFrameGpu {
     margin: [f32; 4],
     size: [f32; 4],
     jitter: [f32; 4],
+    /// (v251) x = lumières posées à rayons dans `lights` (au plus `VL_EPI_LIGHTS`) ; y = demi-
+    /// longueur la plus grande du lissage le long des droites épipolaires (pixels des rayons).
+    epi: [f32; 4],
+    /// (v251) Deux vec4 par lumière : position depuis la caméra et portée ; force (x).
+    lights: [[f32; 4]; 2 * VL_EPI_LIGHTS],
+}
+
+/// (v251) Lumières posées à rayons connues de la reprise (les plus fortes vues d'ici) : chaque
+/// pixel est lissé le long de la droite qui va au point de l'écran de celle qui y compte le
+/// plus (voir `fs_temporal`).
+const VL_EPI_LIGHTS: usize = 8;
+/// (v251) Demi-longueur la plus grande de ce lissage (pixels des rayons) : 8, soit 32 pixels de
+/// l'image au quart de la résolution.
+const VL_EPI_HALF: f32 = 8.0;
+
+/// (v251) Les lumières posées à rayons les plus fortes vues de `eye`, pour la reprise : (position
+/// depuis la caméra et portée, force), au plus `VL_EPI_LIGHTS`. Force : luminance de la couleur
+/// × intensité × force des rayons × densité (× la part du ciel qu'éclaire un projecteur) ; les
+/// plus fortes d'abord, la distance de la caméra à leur sphère comptée.
+fn vl_epi_lights(lights: &[DynLight], eye: Vec3) -> Vec<([f32; 4], f32)> {
+    let mut out: Vec<([f32; 4], f32, f32)> = lights
+        .iter()
+        .filter(|l| l.owner == 0 && l.beam > 0.0 && l.intensity > 0.0)
+        .map(|l| {
+            let rel = Vec3::from(l.pos) - eye;
+            let [r, g, b] = l.color;
+            let lum = (0.2126 * r + 0.7152 * g + 0.0722 * b).max(0.05 * r.max(g).max(b));
+            let mut strength = lum * l.intensity * l.beam * l.density.max(1e-3);
+            if l.kind == DynKind::Spot {
+                let half = (l.outer_deg * 0.5).to_radians().clamp(0.0, std::f32::consts::PI);
+                strength *= 0.5 * (1.0 - half.cos());
+            }
+            let range = l.range.max(0.1);
+            let gap = (rel.length() - range).max(0.0);
+            let rank = strength * range * range / (1.0 + gap * gap);
+            ([rel.x, rel.y, rel.z, range], strength, rank)
+        })
+        .collect();
+    out.sort_by(|a, b| b.2.total_cmp(&a.2));
+    out.truncate(VL_EPI_LIGHTS);
+    out.into_iter().map(|(a, s, _)| (a, s)).collect()
 }
 
 /// (v223) Décalage de l'échantillon de la marche dans son carré, image `n` (suite de Halton
@@ -368,6 +413,8 @@ pub(crate) struct GpuLight {
     up: [f32; 4],
     rect: [f32; 4],
     box_sphere: [f32; 4],
+    /// (v251) x = 1 : la lumière a sa carte de teinte (du verre à sa portée).
+    tint: [f32; 4],
 }
 
 #[repr(C)]
@@ -639,7 +686,9 @@ fn box_mask(l: &DynLight, boxes: &[crate::ShadowBox]) -> u64 {
 /// Une lumière dans le format du shader. `tile` : première case d'ombre prête (sinon pas
 /// d'ombre des blocs).
 /// `rect` : coin et taille (uv) de la case d'ombre d'un projecteur ; `box_sphere` : sphère
-/// (centre, rayon ; rayon < 0 : aucune) qui contient les boîtes de `boxes`.
+/// (centre, rayon ; rayon < 0 : aucune) qui contient les boîtes de `boxes`. (v251) `tinted` :
+/// des vitres colorées dans sa portée (sa carte des teintes est prête).
+#[allow(clippy::too_many_arguments)]
 fn pack_light(
     l: &DynLight,
     tile: Option<u32>,
@@ -648,6 +697,7 @@ fn pack_light(
     box_sphere: [f32; 4],
     soft: bool,
     ent: bool,
+    tinted: bool,
 ) -> GpuLight {
     let spot = l.kind == DynKind::Spot;
     let outer = l.outer_deg.clamp(1.0, 179.0);
@@ -724,7 +774,23 @@ fn pack_light(
         },
         rect: [rect[0], rect[1], rect[2], l.gobo_rotation.sin()],
         box_sphere: box_cone(Vec3::from(l.pos), box_sphere).0,
+        tint: [
+            if tinted && tile.is_some() { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
+            0.0,
+        ],
     }
+}
+
+/// (v251) Du verre (un cube de 8 de `bricks`, coin monde) à la portée de la lumière `l` ?
+fn glass_near(bricks: &[[i32; 3]], l: &DynLight) -> bool {
+    let p = Vec3::from(l.pos);
+    let r = l.range.max(0.05) + 0.5;
+    bricks.iter().any(|b| {
+        let lo = Vec3::new(b[0] as f32, b[1] as f32, b[2] as f32);
+        p.clamp(lo, lo + Vec3::splat(8.0)).distance_squared(p) <= r * r
+    })
 }
 
 /// Le cône, vu de la lumière `lp`, qui contient la sphère `s` (centre, rayon ; rayon < 0 :
@@ -833,6 +899,8 @@ struct Slot {
     /// (v247) Ce que la grille de blocs voyait de la lumière quand sa carte a été faite
     /// (`grid_cover`, 0 … 1).
     cover: f32,
+    /// (v251) Sa carte a été faite avec du verre à sa portée : elle a sa carte de teinte.
+    tinted: bool,
 }
 
 impl Slot {
@@ -926,6 +994,7 @@ impl ShadowCache {
                     baked_key: None,
                     placed: l.owner == 0,
                     cover: 0.0,
+                    tinted: false,
                 },
             );
         }
@@ -984,12 +1053,51 @@ impl ShadowCache {
 /// (v203) Empreintes d'une grille de blocs (voir `brick_hashes`), calculées avec elle en
 /// arrière-plan : à son arrivée, l'image n'a plus à parcourir son million de cases (une
 /// demi à plus d'une milliseconde, à chaque grille refaite pendant qu'on se déplace).
-pub struct VoxelBricks(HashMap<[i32; 3], u64>);
+pub struct VoxelBricks {
+    hashes: HashMap<[i32; 3], u64>,
+    /// (v251) Cubes de 8 où il y a du verre (coin monde).
+    glass: Vec<[i32; 3]>,
+}
 
 impl VoxelBricks {
     pub fn new(origin: [i32; 3], ids: &[u16]) -> Self {
-        Self(brick_hashes(origin, ids))
+        Self {
+            hashes: brick_hashes(origin, ids),
+            glass: glass_bricks(origin, ids),
+        }
     }
+}
+
+/// (v251) Cubes de 8 de la grille où il y a du verre (`rt::glass`) : coin monde de chacun.
+fn glass_bricks(origin: [i32; 3], ids: &[u16]) -> Vec<[i32; 3]> {
+    use crate::rt::VOX;
+    let [vx, vy, vz] = VOX.map(|v| v as usize);
+    let mut out = Vec::new();
+    if ids.len() != vx * vy * vz {
+        return out;
+    }
+    let glass = crate::rt::glass_ids();
+    let is_glass = |id: u16| glass.get((id & 0x0fff) as usize).copied().unwrap_or(false);
+    for bz in 0..vz / 8 {
+        for by in 0..vy / 8 {
+            for bx in 0..vx / 8 {
+                let found = (bz * 8..bz * 8 + 8).any(|z| {
+                    (by * 8..by * 8 + 8).any(|y| {
+                        let row = (bx * 8) + vx * (y + vy * z);
+                        ids[row..row + 8].iter().any(|&id| is_glass(id))
+                    })
+                });
+                if found {
+                    out.push([
+                        origin[0] + (bx * 8) as i32,
+                        origin[1] + (by * 8) as i32,
+                        origin[2] + (bz * 8) as i32,
+                    ]);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Empreintes de la grille de blocs par cubes de 8 (coin monde du cube → empreinte), pour
@@ -1090,7 +1198,7 @@ fn grid_cover(origin: [i32; 3], l: &DynLight) -> f32 {
             })
             .product::<f32>()
     };
-    0.5 * part(r.min(8.0).max(0.5)) + 0.5 * part(r.max(0.5))
+    0.5 * part(r.clamp(0.5, 8.0)) + 0.5 * part(r.max(0.5))
 }
 
 /// (v247) Une carte faite avec une grille qui voyait moins de sa lumière que celle
@@ -1364,7 +1472,8 @@ pub(crate) struct DynGpu {
     bake_group: Option<wgpu::BindGroup>,
     jobs_buf: wgpu::Buffer,
     bake_uniform: wgpu::Buffer,
-    jobs: Vec<(u32, BakeJob)>,
+    /// (v251) Case, travail, et sa carte de teinte à faire aussi (du verre à portée).
+    jobs: Vec<(u32, BakeJob, bool)>,
     // Volumétrique.
     pub(crate) vl_bgl: wgpu::BindGroupLayout,
     pub(crate) comp_bgl: wgpu::BindGroupLayout,
@@ -1420,6 +1529,11 @@ pub(crate) struct DynGpu {
     /// carte : toute une foule y fait son ombre, au-delà des boîtes exactes.
     ent_atlas: Option<(wgpu::Texture, wgpu::TextureView)>,
     ent_size: u32,
+    /// (v251) Atlas des teintes (voir `tint_side`) et son côté ; cases de verre de la grille,
+    /// par cubes de 8 (coin monde) : une lumière qui en a un à sa portée a sa carte de teinte.
+    tint_atlas: Option<(wgpu::Texture, wgpu::TextureView)>,
+    tint_size: u32,
+    glass_bricks: Vec<[i32; 3]>,
     /// Cases de l'atlas des joueurs à dessiner à cette image, et leurs joueurs (indices dans
     /// les joueurs donnés à `prepare`).
     pub(crate) ent_jobs: Vec<EntJob>,
@@ -1430,7 +1544,7 @@ pub(crate) struct DynGpu {
 
 /// Entrées du groupe du monde (liaisons 7 à 13, et (v220) 23) pour les lumières
 /// dynamiques.
-pub(crate) fn world_layout_entries() -> [wgpu::BindGroupLayoutEntry; 8] {
+pub(crate) fn world_layout_entries() -> [wgpu::BindGroupLayoutEntry; 9] {
     let frag = wgpu::ShaderStages::FRAGMENT;
     [
         wgpu::BindGroupLayoutEntry {
@@ -1506,10 +1620,55 @@ pub(crate) fn world_layout_entries() -> [wgpu::BindGroupLayoutEntry; 8] {
             },
             count: None,
         },
+        // (v251) Atlas des teintes (lumière passée par le verre), lu texel par texel.
+        wgpu::BindGroupLayoutEntry {
+            binding: 24,
+            visibility: frag,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
     ]
 }
 
 /// (v220) Un atlas des ombres des joueurs de `size` pixels de côté.
+/// (v251) Format de la carte de teinte des lumières près du verre : rgb = filtre des verres
+/// traversés, a = distance du premier (rapportée à la portée).
+pub(crate) const TINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// (v251) Côté de l'atlas des teintes pour un atlas des ombres de `size` pixels : les mêmes
+/// cases, deux fois plus petites de côté (quatre au-delà de 4 096 : au plus 2 048 pixels,
+/// 32 Mo).
+fn tint_side(size: u32) -> u32 {
+    if size > 4096 {
+        (size / 4).max(1)
+    } else {
+        (size / 2).max(1)
+    }
+}
+
+fn tint_atlas(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("teinte des lumières par le verre"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TINT_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    (tex, view)
+}
+
 fn ent_atlas(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ombres des joueurs aux lumières"),
@@ -1588,7 +1747,7 @@ pub(crate) fn light_pipes(
     water_interp_bgl: &wgpu::BindGroupLayout,
     surface: wgpu::TextureFormat,
 ) -> (
-    wgpu::RenderPipeline,
+    (wgpu::RenderPipeline, wgpu::RenderPipeline),
     VlPipes,
     DeferredPipes,
     wgpu::RenderPipeline,
@@ -1863,6 +2022,36 @@ pub(crate) fn light_pipes(
                 })
             })
         });
+        // (v251) Cartes de teinte (lumière passée par le verre) : même calcul, une couleur.
+        let tint = sc.spawn(|| {
+            timed("cartes de teinte", || {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("teinte des lumières par le verre : calcul"),
+                    layout: Some(&bake_layout),
+                    vertex: wgpu::VertexState {
+                        module: &bake_shader,
+                        entry_point: Some("vs_bake"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &bake_shader,
+                        entry_point: Some("fs_tint"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: TINT_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview: None,
+                    cache: None,
+                })
+            })
+        });
         // (v223) Deux images : lumières posées et lumières portées ; l'écran (`vs_tiles`)
         // et la marge (`vs_margin`), avec ou sans le code du bruit.
         let march = sc.spawn(|| {
@@ -1937,7 +2126,10 @@ pub(crate) fn light_pipes(
             })
         });
         (
-            bake.join().expect("pipeline des ombres des lumières"),
+            (
+                bake.join().expect("pipeline des ombres des lumières"),
+                tint.join().expect("pipeline des teintes des lumières"),
+            ),
             VlPipes {
                 march: march.join().expect("pipeline volumétrique"),
                 march_plain: march_plain
@@ -2542,6 +2734,9 @@ impl DynGpu {
             tiles: vec![0; ((TILES_X * TILES_Y + 1) * WORDS) as usize],
             ent_atlas: None,
             ent_size: 0,
+            tint_atlas: None,
+            tint_size: 0,
+            glass_bricks: Vec::new(),
             ent_jobs: Vec::new(),
             ent_casters: Vec::new(),
             ent_dirty: false,
@@ -2575,6 +2770,8 @@ impl DynGpu {
         self.quality = u8::MAX;
         self.ent_atlas = Some(ent_atlas(device, 16));
         self.ent_size = 16;
+        self.tint_atlas = Some(tint_atlas(device, 8));
+        self.tint_size = 8;
         self.ent_dirty = true;
         self.cache.reset(0);
         self.rebind = true;
@@ -2674,15 +2871,20 @@ impl DynGpu {
         let ent = size.min(ENT_ATLAS_MAX);
         self.ent_atlas = Some(ent_atlas(device, ent));
         self.ent_size = ent;
+        // (v251) L'atlas des teintes : mêmes cases, en proportion.
+        let tint = tint_side(size);
+        self.tint_atlas = Some(tint_atlas(device, tint));
+        self.tint_size = tint;
         self.ent_dirty = true;
         let per = (size / tile) as usize;
         self.cache.reset(per * per);
         self.rebind = true;
         log::info!(
-            "ombres des lumières : qualité {} (atlas {size} px, {} cases de {tile} px, {} Mo ; joueurs {ent} px)",
+            "ombres des lumières : qualité {} (atlas {size} px, {} cases de {tile} px, {} Mo ; joueurs {ent} px ; teintes {tint} px)",
             SHADOW_QUALITY_NAMES[q as usize],
             per * per,
-            (size as u64 * size as u64 + ent as u64 * ent as u64) * 4 / (1024 * 1024)
+            (size as u64 * size as u64 * 4 + ent as u64 * ent as u64 * 4 + tint as u64 * tint as u64 * 8)
+                / (1024 * 1024)
         );
     }
 
@@ -2695,10 +2897,11 @@ impl DynGpu {
             .map(|(_, v)| (v, (self.ent_size / per).max(1)))
     }
 
-    /// Liaisons 7 à 13 du groupe du monde, et (v220) 23.
-    pub fn bind_entries(&self) -> [wgpu::BindGroupEntry<'_>; 8] {
+    /// Liaisons 7 à 13 du groupe du monde, (v220) 23 et (v251) 24.
+    pub fn bind_entries(&self) -> [wgpu::BindGroupEntry<'_>; 9] {
         let atlas = &self.atlas.as_ref().expect("atlas des ombres").1;
         let ent = &self.ent_atlas.as_ref().expect("atlas des joueurs").1;
+        let tint = &self.tint_atlas.as_ref().expect("atlas des teintes").1;
         [
             wgpu::BindGroupEntry {
                 binding: 7,
@@ -2732,6 +2935,10 @@ impl DynGpu {
                 binding: 23,
                 resource: wgpu::BindingResource::TextureView(ent),
             },
+            wgpu::BindGroupEntry {
+                binding: 24,
+                resource: wgpu::BindingResource::TextureView(tint),
+            },
         ]
     }
 
@@ -2762,12 +2969,13 @@ impl DynGpu {
     /// Nouvelle grille de blocs (ses empreintes, `VoxelBricks`) : les cartes des lumières près
     /// des blocs qui ont changé sont à refaire.
     pub fn on_voxels(&mut self, bricks: VoxelBricks) {
+        self.glass_bricks = bricks.glass;
         if self.cache.slots.is_empty() && !self.wants_voxels() {
             // Personne n'en a besoin : l'empreinte sera prise à la prochaine grille utile.
             self.bricks.clear();
             return;
         }
-        let new = bricks.0;
+        let new = bricks.hashes;
         if self.bricks.is_empty() {
             self.cache.invalidate_all();
         } else {
@@ -2888,6 +3096,8 @@ impl DynGpu {
                 let p = Vec3::from(l.pos);
                 let range = l.range.max(0.05);
                 let inside = if l.inside_block { 1.0 } else { 0.0 };
+                // (v251) Du verre à sa portée : sa carte de teinte aussi.
+                let tinted = glass_near(&self.glass_bricks, &l);
                 let mut push = |tile: u32, (r, u, f): (Vec3, Vec3, Vec3), tan_half: f32| {
                     self.jobs.push((
                         tile,
@@ -2897,6 +3107,7 @@ impl DynGpu {
                             right: [r.x, r.y, r.z, inside],
                             up: [u.x, u.y, u.z, 0.0],
                         },
+                        tinted,
                     ));
                 };
                 if s.key.kind == 2 {
@@ -2910,6 +3121,7 @@ impl DynGpu {
                 s.baked_key = Some(s.key);
                 s.dirty = false;
                 s.cover = voxels.map_or(0.0, |o| grid_cover(o, &l));
+                s.tinted = tinted;
                 rebaked_beam |= l.owner == 0 && l.beam > 0.0;
             }
         }
@@ -3009,6 +3221,7 @@ impl DynGpu {
             // (Une lumière sans carte prête n'a pas d'ombre des blocs, douce ou non.)
             self.any_soft |= soft && tiles_of[i].is_some();
             self.any_player_shadow |= mask != 0 || ent_of[i];
+            let tinted = self.cache.slots.get(&l.id).is_some_and(|s| s.tinted);
             self.gpu_lights.push(pack_light(
                 l,
                 tiles_of[i],
@@ -3017,6 +3230,7 @@ impl DynGpu {
                 sphere,
                 soft,
                 ent_of[i],
+                tinted,
             ));
         }
         bin_tiles(&self.lights, view_proj, eye, &mut self.tiles);
@@ -3214,11 +3428,13 @@ impl DynGpu {
         }));
     }
 
-    /// Calcule les cases d'ombre préparées par `prepare` (`pipeline` : voir `light_pipes`).
+    /// Calcule les cases d'ombre préparées par `prepare` (`pipeline` : voir `light_pipes`),
+    /// puis (v251) les cartes de teinte des lumières près du verre (`tint`).
     pub fn encode_bake(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         pipeline: &wgpu::RenderPipeline,
+        tint: &wgpu::RenderPipeline,
         timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let (Some(group), Some((_, atlas))) = (&self.bake_group, &self.atlas) else {
@@ -3245,10 +3461,44 @@ impl DynGpu {
         pass.set_bind_group(0, group, &[]);
         let per = (self.atlas_size / self.tile_size.max(1)).max(1);
         let t = self.tile_size;
-        for (k, (tile, _)) in self.jobs.iter().enumerate() {
+        for (k, (tile, _, _)) in self.jobs.iter().enumerate() {
             let (x, y) = ((tile % per) * t, (tile / per) * t);
             pass.set_viewport(x as f32, y as f32, t as f32, t as f32, 0.0, 1.0);
             pass.set_scissor_rect(x, y, t, t);
+            pass.draw(0..3, k as u32..k as u32 + 1);
+        }
+        drop(pass);
+        // (v251) Teintes : les mêmes cases dans l'atlas des teintes (plus petit en proportion).
+        let Some((_, tint_view)) = &self.tint_atlas else {
+            return;
+        };
+        if !self.jobs.iter().any(|j| j.2) {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("teinte des lumières par le verre"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: tint_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(tint);
+        pass.set_bind_group(0, group, &[]);
+        let tt = (self.tint_size / per).max(1);
+        for (k, (tile, _, tinted)) in self.jobs.iter().enumerate() {
+            if !tinted {
+                continue;
+            }
+            let (x, y) = ((tile % per) * tt, (tile / per) * tt);
+            pass.set_viewport(x as f32, y as f32, tt as f32, tt as f32, 0.0, 1.0);
+            pass.set_scissor_rect(x, y, tt, tt);
             pass.draw(0..3, k as u32..k as u32 + 1);
         }
     }
@@ -3797,6 +4047,12 @@ impl DynGpu {
         // La marge, une image sur deux (et toujours quand l'historique repart de zéro).
         let margin_now = self.vl_margin_lights && (!valid || self.frame.is_multiple_of(2));
         let (jx, jy) = vl_jitter(self.frame);
+        let mut epi_lights = [[0.0f32; 4]; 2 * VL_EPI_LIGHTS];
+        let found = vl_epi_lights(&self.lights, eye);
+        for (i, (a, strength)) in found.iter().enumerate() {
+            epi_lights[2 * i] = *a;
+            epi_lights[2 * i + 1] = [*strength, 0.0, 0.0, 0.0];
+        }
         let frame = VlFrameGpu {
             cur_rel: cur_rel.to_cols_array_2d(),
             prev_rel: prev_rel.to_cols_array_2d(),
@@ -3810,12 +4066,19 @@ impl DynGpu {
             size: [size.0 as f32, size.1 as f32, ext.0 as f32, ext.1 as f32],
             // (En se déplaçant vite, la nouvelle image compte un peu plus : les rayons vus
             // d'ailleurs changent, l'image d'avant traînerait.)
+            // (v251) Immobile, l'image d'avant compte plus (moins de bruit) ; en se déplaçant,
+            // la nouvelle compte d'autant plus que la caméra va loin d'une image à l'autre (les
+            // rayons vus d'ailleurs ne se reprennent pas exactement : « le rayon n'est pas
+            // aligné quand je me déplace ») : déjà lissée le long des droites épipolaires, elle
+            // n'est plus bruitée.
             jitter: [
                 jx * k as f32,
                 jy * k as f32,
-                (VL_NEW + delta.length() * 0.5).min(0.5),
+                (VL_NEW + delta.length() * VL_MOVE).min(0.5),
                 (self.settings.vl_steps / 2).max(8) as f32,
             ],
+            epi: [found.len() as f32, VL_EPI_HALF, 0.0, 0.0],
+            lights: epi_lights,
         };
         queue.write_buffer(&self.vl_frame_buf, 0, bytemuck::bytes_of(&frame));
         let Some(t) = &self.vl_targets else {
@@ -4407,7 +4670,10 @@ mod tests {
             [1.0, 2.0, 3.0, 4.0],
             false,
             true,
+            true,
         );
+        // (v251) Carte de teinte (du verre à portée), avec sa carte d'ombre.
+        assert_eq!(g.tint[0], 1.0);
         // Ombres douces décochées : arrêt net par les murs.
         assert_eq!(g.shadow[2], 1.0);
         assert_eq!(g.dir_type, [0.0, 0.0, -1.0, 1.0]);
@@ -4443,7 +4709,10 @@ mod tests {
             [0.0, 0.0, 0.0, -1.0],
             true,
             false,
+            true,
         );
+        // (v251) Sans carte d'ombre, pas de teinte non plus.
+        assert_eq!(p.tint[0], 0.0);
         assert_eq!(p.cookie[0], -1.0);
         assert_eq!(p.boxes[3], 0);
         assert_eq!(p.shadow[2], 0.0);

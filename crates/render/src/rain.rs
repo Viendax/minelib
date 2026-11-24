@@ -43,6 +43,12 @@ struct RainUniform {
     color: [f32; 4],
 }
 
+/// (v251) Le shader de la pluie, avec celui des lumières posées à la suite (elles éclairent les
+/// gouttes et les éclaboussures).
+pub(crate) fn source() -> String {
+    crate::lights::with_dynlights(include_str!("shaders/rain.wgsl"))
+}
+
 pub struct RainRenderer {
     uniform: wgpu::Buffer,
     tops: wgpu::Texture,
@@ -128,7 +134,7 @@ impl RainRenderer {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pluie"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/rain.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(source().into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pluie"),

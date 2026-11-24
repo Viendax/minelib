@@ -105,7 +105,8 @@ fn place(vi: u32, s: Seg, view_proj: mat4x4<f32>) -> VOut {
         o.cloud = vec3<f32>(
             va.y + dot(va.xz, va.xz) / (2.0 * SHELL),
             vb.y + dot(vb.xz, vb.xz) / (2.0 * SHELL),
-            select(1.0, 2.0, s.a.w > 1.5),
+            // (v251) 3 : boule de lumière (`BOLT_BALL`).
+            select(select(1.0, 2.0, s.a.w > 1.5), 3.0, s.a.w > 2.5),
         );
     }
     // Derrière l'œil : rien, ou le bout qui dépasse ramené devant.
@@ -194,6 +195,19 @@ fn glow(i: VOut) -> vec3<f32> {
     return c * edge * force;
 }
 
+/// (v251) Boule de lumière au centre d'une lumière ponctuelle (`BOLT_BALL`) : ronde, tournée
+/// vers l'œil, un cœur blanc très vif et un halo de la couleur de la lumière qui s'éteint au
+/// bord. Elle n'éclaire rien : c'est l'éclat de la source.
+fn ball(i: VOut) -> vec3<f32> {
+    let d2 = dot(i.at, i.at);
+    let edge = max(1.0 - d2, 0.0);
+    let core = exp(-d2 / (0.16 * 0.16));
+    let near = exp(-d2 / (0.38 * 0.38));
+    let halo = exp(-d2 / (0.72 * 0.72));
+    let c = vec3<f32>(1.0) * (core * 3.0 + near * 0.35) + i.color * (near * 1.1 + halo * 0.45);
+    return c * edge * edge * i.seg.y;
+}
+
 /// Direction du regard pour ce point de l'écran, tirée des lignes de la matrice `m` (ni
 /// inversion de matrice ni soustraction de la position de la caméra : voir `sky_dir`,
 /// world.wgsl).
@@ -213,6 +227,9 @@ fn bolt_light(i: VOut, m: mat4x4<f32>) -> vec3<f32> {
     let mode = i.cloud.z;
     if mode < 0.5 {
         return glow(i);
+    }
+    if mode > 2.5 {
+        return ball(i);
     }
     let k = clamp(i.at.x / max(i.seg.x, 1e-5), 0.0, 1.0);
     // Hauteur dans la couche : 0 à sa base … 1 à son sommet.

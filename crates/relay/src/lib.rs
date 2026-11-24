@@ -1876,6 +1876,11 @@ fn taken_elsewhere(req: &Request, state: &Mutex<State>) -> Option<Response> {
         .then(|| err(ErrorCode::PseudoTaken, "pris sur un autre relais"))
 }
 
+/// (v251) Dit au créateur d'un monde ouvert en ligne pour la première fois.
+const WORLD_CLOSED_NOTE: &str = "Ton monde est fermé : seuls toi, tes OP, les joueurs de ta liste \
+     blanche et les amis que tu invites peuvent le rejoindre, et il n'est pas dans la liste des \
+     serveurs. /whitelist off pour que tout le monde puisse le rejoindre.";
+
 /// (v243) Le joueur `id` quitte la partie FPS du serveur de construction `room_id` (il part, ou
 /// change de mode de jeu) : son hôte le sait ; si c'est lui, elle se ferme pour tous.
 fn match_left(st: &mut State, room_id: u64, id: u64) {
@@ -7068,8 +7073,16 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     let (kind, left, fixed) = st.servers.weather(&server);
                     transport::push(&c.tx, &Response::SetWeather { kind, left, fixed });
                 }
+                // (v251) Son créateur l'ouvre en ligne pour la première fois : fermé par défaut
+                // (liste blanche active), et il l'apprend.
+                let first =
+                    pseudo.eq_ignore_ascii_case(&creator) && st.servers.whitelist_first(&server);
                 return Some(Response::ServerAdmin {
-                    text: String::new(),
+                    text: if first {
+                        WORLD_CLOSED_NOTE.to_string()
+                    } else {
+                        String::new()
+                    },
                 });
             }
             let act = match action {
@@ -7476,6 +7489,9 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     "Trop d'invitations : attends un peu.",
                 ));
             }
+            // (v251) Invité par le créateur ou un OP : il entre même liste blanche active.
+            let creator = st.rooms.get(&rid).map(|r| r.creator.clone()).unwrap_or_default();
+            st.servers.whitelist_invited(&server, &creator, pseudo, &who);
             // (v242) Gardée sans limite de temps jusqu'à sa réponse, une par joueur qui
             // l'invite (la plus récente) : dans sa liste d'amis.
             st.invites.add(
@@ -13430,6 +13446,76 @@ mod tests {
                 matches!(&far, Response::Servers { list } if list.iter().any(|e| e.id == room)),
                 "liste blanche retirée : de nouveau pour tous"
             );
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (v251) Un monde ouvert en ligne pour la première fois est fermé (liste blanche active),
+    /// et son créateur l'apprend, une seule fois ; il n'est plus dans la liste des autres, qui
+    /// n'y entrent pas ; un ami qu'il invite y entre ; `/whitelist off` le rouvre à tous.
+    #[test]
+    fn a_world_opened_online_is_closed_by_default() {
+        let (h, dir) = crowd_world("ferme_par_defaut");
+        {
+            let mut guard = h.state.lock().unwrap();
+            let st = &mut *guard;
+            let mut crowd = Crowd::new();
+            let (owner, room) = host_world(&mut crowd, st);
+            let ask_weather = |crowd: &Crowd, st: &mut State, id: u64| match crowd.ask(
+                st,
+                id,
+                Request::ServerAdmin {
+                    action: proto::SERVER_WEATHER,
+                    pseudo: String::new(),
+                    reason: String::new(),
+                },
+            ) {
+                Some(Response::ServerAdmin { text }) => text,
+                r => panic!("{r:?}"),
+            };
+            assert_eq!(ask_weather(&crowd, st, owner), WORLD_CLOSED_NOTE);
+            assert_eq!(ask_weather(&crowd, st, owner), "", "une seule fois");
+            let server = st.rooms[&room].server.clone();
+            assert!(st.servers.whitelist_on(&server));
+            assert!(st.servers.whitelisted_out(&server, "Proprio", "Passant"));
+            let other = crowd.conn(st, "Passant", false);
+            match crowd.ask(st, other, Request::Servers { kind: 1 }) {
+                Some(Response::Servers { list }) => {
+                    assert!(list.iter().all(|e| e.id != room), "pas dans la liste")
+                }
+                r => panic!("{r:?}"),
+            }
+            // Un ami invité par le créateur y entre.
+            let friend = crowd.conn(st, "Ami", false);
+            for (by, to) in [(owner, "Ami"), (friend, "Proprio")] {
+                crowd.ask(
+                    st,
+                    by,
+                    Request::Friend {
+                        pseudo: to.into(),
+                        add: true,
+                    },
+                );
+            }
+            assert!(matches!(
+                crowd.ask(st, owner, Request::Invite { pseudo: "Ami".into() }),
+                Some(Response::Done)
+            ));
+            assert!(!st.servers.whitelisted_out(&server, "Proprio", "Ami"));
+            assert!(st.servers.whitelisted_out(&server, "Proprio", "Passant"));
+            // Rouvert à tous.
+            crowd.ask(
+                st,
+                owner,
+                Request::ServerAdmin {
+                    action: proto::SERVER_WL_OFF,
+                    pseudo: String::new(),
+                    reason: String::new(),
+                },
+            );
+            assert!(!st.servers.whitelisted_out(&server, "Proprio", "Passant"));
+            assert_eq!(ask_weather(&crowd, st, owner), "", "réglé : plus rien à dire");
         }
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
