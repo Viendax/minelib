@@ -1028,9 +1028,21 @@ wrap_app! {
 
         fn on_before_command_line_processing(
             &self,
-            _process_type: Option<&CefString>,
+            process_type: Option<&CefString>,
             command_line: Option<&mut CommandLine>,
         ) {
+            // (v249) Seulement dans le processus du navigateur. Chromium appelle ceci aussi
+            // dans ses sous-processus (réseau, rendu, GPU), qui ne reçoivent pas nos options
+            // (`--restreint`…) et avaient donc les réglages par défaut : le processus réseau
+            // remettait le mode restreint strict de YouTube par le DNS (`MAP www.youtube.com
+            // restrict.youtube.com`), par-dessus le choix du jeu, et c'est lui qui résout
+            // les noms. Trouvé le 24/11/2026 dans le journal réseau du propriétaire : aucune
+            // requête DNS pour www.youtube.com, toutes pour restrict.youtube.com. Les
+            // sous-processus reçoivent du navigateur les options qui les concernent.
+            let navigateur = process_type.is_none_or(|p| p.to_string().is_empty());
+            if !navigateur {
+                return;
+            }
             if let Some(cl) = command_line {
                 // Une vidéo choisie sur l'écran se lance sans second clic.
                 cl.append_switch_with_value(
