@@ -21,6 +21,14 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 pub use winit::keyboard::KeyCode;
 pub use winit::window::Window as PlatformWindow;
 
+/// (v250) Ctrl est tenu sans Alt : la touche appuyée est un raccourci (Ctrl+V…), pas du
+/// texte. Alt Gr arrive sous Windows comme Ctrl + Alt droit : c'est du texte.
+fn raccourci(held: &HashSet<KeyCode>) -> bool {
+    (held.contains(&KeyCode::ControlLeft) || held.contains(&KeyCode::ControlRight))
+        && !held.contains(&KeyCode::AltRight)
+        && !held.contains(&KeyCode::AltLeft)
+}
+
 /// État des entrées pour l'image en cours.
 #[derive(Default)]
 pub struct Input {
@@ -549,7 +557,11 @@ impl<G: GameLoop> ApplicationHandler for App<G> {
                 };
                 match event.state {
                     ElementState::Pressed => {
-                        if let Some(t) = &event.text {
+                        // (v250) Ctrl + touche est un raccourci, pas du texte : winit donne
+                        // quand même la lettre (« v » pour Ctrl+V), qui s'écrivait avant ce
+                        // qu'on collait. Alt Gr (Ctrl + Alt pour Windows) tape bien du texte
+                        // (« @ », « € »…).
+                        if let (Some(t), false) = (&event.text, raccourci(&self.input.held)) {
                             self.input
                                 .text
                                 .extend(t.chars().filter(|c| !c.is_control()));
@@ -1345,6 +1357,18 @@ mod key_repeat {
 
 #[cfg(test)]
 mod tests {
+
+    /// (v250) Ctrl+V colle sans écrire « v » ; Alt Gr tape toujours « @ ».
+    #[test]
+    fn ctrl_plus_une_lettre_n_ecrit_rien_mais_alt_gr_si() {
+        let h = |ks: &[KeyCode]| ks.iter().copied().collect::<HashSet<KeyCode>>();
+        assert!(raccourci(&h(&[KeyCode::ControlLeft])));
+        assert!(raccourci(&h(&[KeyCode::ControlRight, KeyCode::ShiftLeft])));
+        assert!(!raccourci(&h(&[KeyCode::ControlLeft, KeyCode::AltRight])));
+        assert!(!raccourci(&h(&[KeyCode::ControlLeft, KeyCode::AltLeft])));
+        assert!(!raccourci(&h(&[KeyCode::ShiftLeft])));
+        assert!(!raccourci(&h(&[])));
+    }
     use super::*;
 
     #[test]
