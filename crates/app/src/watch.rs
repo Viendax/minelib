@@ -404,6 +404,14 @@ impl Party {
             return;
         };
         if Some(&v) != shared.as_ref() {
+            // (v302) Le site est passé tout seul à une autre vidéo juste après la fin de celle
+            // de l'écran (lecture automatique de YouTube ou de Dailymotion) : c'est la suivante
+            // de la playlist qui vient, s'il y en a une.
+            let finie = prev.as_ref().is_some_and(|s| s.page.ended && s.page.video == shared);
+            if finie && self.tracks.get(&id).is_some_and(|t| !t.video.queue.is_empty()) {
+                self.advance(id, me);
+                return;
+            }
             // Une autre vidéo ouverte sur cette page (clic, vidéo suivante, `/yt`). (v300) Aussi
             // quand la page la montrait déjà mais en attendant (pub, regard, chargement) : la
             // première vidéo lue n'était jamais partagée (ni dans la playlist) si elle avait
@@ -443,7 +451,9 @@ impl Party {
         // la playlist reste (une page Google ou un autre site n'y touchent pas).
         let avant = self.tracks.get(&id).map(|t| &t.video);
         let mut lus = avant.map(|v| v.lus.clone()).unwrap_or_default();
-        if let Some(v) = avant.filter(|v| v.id != video) {
+        // (v302) Glisser d'un Short à l'autre ne remplit pas la playlist de Shorts vus : seul
+        // le dernier reste (celui en cours).
+        if let Some(v) = avant.filter(|v| v.id != video && !(v.short && short)) {
             lus.push(v.id.clone());
         }
         let mut video = Video {
@@ -649,6 +659,14 @@ impl Party {
                     .pages
                     .get(&id)
                     .is_some_and(|s| s.page.video.as_deref() == Some(video.id.as_str()));
+                // (v302) Finie : un clic la relance depuis le début, pour tous.
+                if self.fini(id) {
+                    video.t = 0.0;
+                    video.paused = false;
+                    log::info!("regarder ensemble : écran {id}, {vid} relancée depuis le début");
+                    self.change(id, video);
+                    return None;
+                }
                 if !video.paused && !ici {
                     return Some(Act::Open(id, open_url(&video, t.now())));
                 }
@@ -692,6 +710,17 @@ impl Party {
             }
             Geste::Retire => {
                 if i == pos {
+                    // (v302) Celle en cours retirée : la suivante se lance à sa place (elle ne
+                    // va pas dans les vues). Sans suivante, on ne la retire pas.
+                    if video.queue.is_empty() {
+                        return None;
+                    }
+                    video.id = video.queue.remove(0);
+                    video.t = 0.0;
+                    video.paused = false;
+                    video.short = false;
+                    log::info!("regarder ensemble : écran {id}, {vid} retirée, {} à la place", video.id);
+                    self.give(id, video);
                     return None;
                 }
                 l.remove(i);
@@ -767,11 +796,23 @@ impl Party {
 
     /// (v289) La playlist de l'écran `id`, que son volet montre : (v291) les vues, celle en
     /// cours, celles à suivre, et si celle en cours est en pause. `None` : rien de partagé
-    /// sur l'écran.
-    pub fn liste(&self, id: u32) -> Option<(&[String], &str, &[String], bool)> {
-        self.tracks.get(&id).map(|t| {
-            (&t.video.lus[..], t.video.id.as_str(), &t.video.queue[..], t.video.paused)
+    /// sur l'écran. (v302) Et si elle est finie (la page le dit).
+    pub fn liste(&self, id: u32) -> Option<Liste<'_>> {
+        self.tracks.get(&id).map(|t| Liste {
+            lus: &t.video.lus,
+            id: &t.video.id,
+            queue: &t.video.queue,
+            pause: t.video.paused,
+            fini: self.fini(id),
         })
+    }
+
+    /// (v302) La page de l'écran `id` dit-elle que la vidéo partagée est finie ?
+    fn fini(&self, id: u32) -> bool {
+        let Some(t) = self.tracks.get(&id) else { return false };
+        self.pages
+            .get(&id)
+            .is_some_and(|s| s.page.ended && s.page.video.as_deref() == Some(t.video.id.as_str()))
     }
 
     /// (v253) La même vidéo, au même point, avec une autre file : rien à faire à la page
@@ -1187,6 +1228,20 @@ impl Party {
     }
 }
 
+/// (v302) La playlist d'un écran, pour son volet (voir [`Party::liste`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Liste<'a> {
+    /// Les vues, de la plus ancienne à la dernière.
+    pub lus: &'a [String],
+    /// Celle en cours.
+    pub id: &'a str,
+    /// Celles à suivre.
+    pub queue: &'a [String],
+    /// Celle en cours est en pause, ou finie.
+    pub pause: bool,
+    pub fini: bool,
+}
+
 /// (v291) Un geste sur la playlist d'un écran (voir [`Party::order`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Geste {
@@ -1342,16 +1397,21 @@ pub fn is_player(url: &str) -> bool {
 /// sinon le lecteur du site de YouTube, ou la balise vidéo).
 pub fn control_js(seek: Option<f32>, paused: bool) -> String {
     let seek = seek.map_or(String::new(), |t| {
-        format!("if(p&&p.seekTo)p.seekTo({t:.1},true);else if(v)v.currentTime={t:.1};")
+        format!("if(p&&p.seekTo)p.seekTo({t:.1},true);else if(d)d.seek({t:.1});else if(v)v.currentTime={t:.1};")
     });
     let play = if paused {
-        "if(p&&p.pauseVideo)p.pauseVideo();else if(v)v.pause();"
+        "if(p&&p.pauseVideo)p.pauseVideo();else if(d)d.pause();else if(v)v.pause();"
     } else {
-        "if(p&&p.playVideo)p.playVideo();else if(v)v.play();"
+        "if(p&&p.playVideo)p.playVideo();else if(d)d.play();else if(v)v.play().catch(()=>{});"
     };
+    // (v302) Sur le site de Dailymotion, la vidéo est dans un cadre à part (son lecteur) : la
+    // page n'a pas de balise vidéo. On passe par l'API officielle du lecteur, que le site
+    // donne à la page (`window.dailymotion.getPlayer()`) : sans elle, la pause ne marchait pas.
     format!(
         "(()=>{{const p=window.__mlb||document.getElementById(location.pathname.startsWith('/shorts/')?'shorts-player':'movie_player');\
-         const v=(p&&p.querySelector&&p.querySelector('video'))||document.querySelector('video');{seek}{play}}})()"
+         const v=(p&&p.querySelector&&p.querySelector('video'))||document.querySelector('video');\
+         const go=d=>{{{seek}{play}}};const D=window.dailymotion;\
+         if(!(p&&p.pauseVideo)&&D&&D.getPlayer&&/(^|\\.)dailymotion\\.com$/.test(location.hostname))D.getPlayer().then(go).catch(()=>{{}});else go(null);}})()"
     )
 }
 
@@ -1488,6 +1548,10 @@ mod tests {
 
     #[test]
     fn script_de_controle() {
+        // (v302) Sur le site de Dailymotion : l'API de son lecteur.
+        let js = control_js(Some(3.0), true);
+        assert!(js.contains("d.seek(3.0)") && js.contains("d.pause()"));
+        assert!(js.contains(r"/(^|\.)dailymotion\.com$/.test(location.hostname)"), "{js}");
         let js = control_js(Some(12.0), true);
         assert!(js.contains("seekTo(12.0,true)") && js.contains("pauseVideo"));
         let js = control_js(None, false);
@@ -1773,8 +1837,6 @@ mod tests {
         // de la playlist entière, X en cours au rang 0).
         assert_eq!(ps[0].party.order(id, &format!(r#"{{"retire":1,"v":"{z}"}}"#), A, false), None);
         assert_eq!(ps[0].party.tracks[&id].video.queue.len(), 2);
-        ps[0].party.order(id, &format!(r#"{{"retire":0,"v":"{X}"}}"#), A, false);
-        assert_eq!(ps[0].party.tracks[&id].video.id, X, "pas celle en cours");
         ps[0].party.order(id, &format!(r#"{{"retire":2,"v":"{z}"}}"#), A, false);
         run(&mut ps, 2.0);
         assert_eq!(ps[1].party.tracks[&id].video.queue, vec![Y.to_string()]);
@@ -1789,8 +1851,8 @@ mod tests {
             assert_eq!(p.party.tracks[&id].video.lus, vec![X.to_string()]);
         }
         // (v289) Le volet montre la playlist de l'écran.
-        let empty: &[String] = &[];
-        assert_eq!(ps[0].party.liste(id), Some((&[X.to_string()][..], Y, empty, false)));
+        let l = ps[0].party.liste(id).unwrap();
+        assert_eq!((l.lus, l.id, l.queue.len(), l.pause), (&[X.to_string()][..], Y, 0, false));
         assert!(ps[0].party.liste(id + 1).is_none());
     }
 
@@ -1812,8 +1874,8 @@ mod tests {
             p.order(id, &format!(r#"{{"clic":"{v}"}}"#), A, false);
         }
         let liste = |p: &Party| {
-            let (l, cur, q, _) = p.liste(id).unwrap();
-            (l.to_vec(), cur.to_string(), q.to_vec())
+            let l = p.liste(id).unwrap();
+            (l.lus.to_vec(), l.id.to_string(), l.queue.to_vec())
         };
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(liste(&p), (s(&[]), a.to_string(), s(&[b, c, d])));
@@ -1826,14 +1888,14 @@ mod tests {
         p.update(5.0, &[ecran], &[]);
         p.observe(id, r#"{"u":"https://www.twitch.tv/","t":-1,"p":true,"a":false,"i":"","e":false}"#, A);
         assert_eq!(liste(&p), (s(&[]), a.to_string(), s(&[b, c, d])));
-        assert!(p.liste(id).unwrap().3, "en pause");
+        assert!(p.liste(id).unwrap().pause, "en pause");
         assert!(close(p.tracks[&id].now(), avant, 0.01), "{} / {avant}", p.tracks[&id].now());
         // Un clic sur elle : elle reprend à cet endroit, et la page y revient.
         let reprend = |i: usize, v: &str| format!(r#"{{"reprend":{i},"v":"{v}"}}"#);
         assert_eq!(p.order(id, &reprend(1, b), A, false), None);
-        assert!(p.liste(id).unwrap().3, "pas la bonne : rien");
+        assert!(p.liste(id).unwrap().pause, "pas la bonne : rien");
         p.order(id, &reprend(0, a), A, false);
-        assert!(!p.liste(id).unwrap().3);
+        assert!(!p.liste(id).unwrap().pause);
         let acts = p.update(0.05, &[ecran], &[]);
         assert!(
             acts.iter().any(|x| matches!(x, Act::Open(_, u) if u.contains(a) && u.contains(&format!("t={}", avant as u32)))),
@@ -1872,15 +1934,27 @@ mod tests {
         p.observe(id, &page(b), A);
         p.observe(id, &page(x), A);
         assert_eq!(liste(&p), (s(&[b]), x.to_string(), s(&[a, c, d])));
+        // (v302) × sur celle en cours : la suivante se lance à sa place, sans passer dans les
+        // vues ; sans suivante, rien.
+        p.update(6.0, &[ecran], &[]);
+        p.order(id, &format!(r#"{{"retire":1,"v":"{x}"}}"#), A, false);
+        assert_eq!(liste(&p), (s(&[b]), a.to_string(), s(&[c, d])));
+        let acts = p.update(0.05, &[ecran], &[]);
+        assert!(acts.iter().any(|y| matches!(y, Act::Open(_, u) if u.contains(a))), "{acts:?}");
+        p.order(id, &joue(3, d), A, false);
+        p.order(id, &format!(r#"{{"retire":3,"v":"{d}"}}"#), A, false);
+        assert_eq!(liste(&p).1, d, "pas de suivante : rien");
         // Jamais plus de MAX_LISTE : les plus anciennes vues s'en vont.
         let mut v = p.tracks[&id].video.clone();
         let (l, _) = v.liste();
         let mut grande: Vec<String> = (0..MAX_LISTE + 5).map(|k| format!("{k:011}")).collect();
+        let n = l.len();
         grande.extend(l);
-        let pos = grande.len() - 4;
+        let pos = grande.len() - n;
         v.set_liste(grande, pos);
         assert_eq!(v.lus.len() + v.queue.len(), MAX_LISTE);
         assert!(v.valid());
+        assert_eq!(v.id, b);
         assert_eq!(v.queue, s(&[a, c, d]));
     }
 
@@ -1901,22 +1975,74 @@ mod tests {
         p.observe(id, &etat(0.0, true, true), A);
         assert!(p.liste(id).is_none(), "elle attend le regard");
         p.observe(id, &etat(0.5, false, false), A);
-        assert_eq!(p.liste(id).map(|l| l.1), Some(X), "la première vidéo lue est dans la playlist");
+        assert_eq!(p.liste(id).map(|l| l.id), Some(X), "la première vidéo lue est dans la playlist");
         p.update(0.05, &[ecran], &[]);
         // Un clic sur elle : pause, sans recharger la page.
         let bascule = format!(r#"{{"bascule":0,"v":"{X}"}}"#);
         assert_eq!(p.order(id, &bascule, A, false), None);
-        assert!(p.liste(id).unwrap().3);
+        assert!(p.liste(id).unwrap().pause);
         let acts = p.update(0.05, &[ecran], &[]);
         assert!(matches!(&acts[..], [Act::Eval(_, js)] if js.contains("pauseVideo()")), "{acts:?}");
         p.observe(id, &etat(0.6, true, false), A);
         p.update(2.0, &[ecran], &[]);
-        assert!(p.liste(id).unwrap().3, "toujours en pause");
+        assert!(p.liste(id).unwrap().pause, "toujours en pause");
         // Un autre : reprise.
         assert_eq!(p.order(id, &bascule, A, false), None);
-        assert!(!p.liste(id).unwrap().3);
+        assert!(!p.liste(id).unwrap().pause);
         let acts = p.update(0.05, &[ecran], &[]);
         assert!(matches!(&acts[..], [Act::Eval(_, js)] if js.contains("playVideo()")), "{acts:?}");
+    }
+
+    /// (v302) Les cas de la playlist auxquels on n'avait pas pensé : une vidéo finie se relance
+    /// d'un clic ; le site qui passe tout seul à une autre vidéo après la fin laisse la place
+    /// à la suivante de la playlist ; glisser d'un Short à l'autre ne remplit pas les vues ;
+    /// l'état d'une vidéo sur le site de Dailymotion (son lecteur) est lu.
+    #[test]
+    fn les_cas_oublies_de_la_playlist() {
+        let mut p = Party::new();
+        let ecran = screen_at(0);
+        let id = ecran.id();
+        let etat = |u: &str, i: &str, t: f32, pause: bool, e: bool| {
+            format!(r#"{{"u":"{u}","t":{t},"p":{pause},"a":false,"i":"{i}","e":{e}}}"#)
+        };
+        let lec = watch_url(X, 0.0);
+        p.observe(id, &etat(&lec, X, 1.0, false, false), A);
+        p.update(0.05, &[ecran], &[]);
+        p.observe(id, &etat(&lec, X, 200.0, true, true), A);
+        let l = p.liste(id).unwrap();
+        assert!(l.fini && l.id == X);
+        // Finie : un clic la relance depuis le début.
+        p.order(id, &format!(r#"{{"bascule":0,"v":"{X}"}}"#), A, false);
+        assert!(!p.liste(id).unwrap().pause);
+        let acts = p.update(0.05, &[ecran], &[]);
+        assert!(matches!(&acts[..], [Act::Eval(_, js)] if js.contains("seekTo(0.") && js.contains("playVideo()")), "{acts:?}");
+        // Finie sans suivante, puis une vidéo arrive dans la playlist, et le site passe tout
+        // seul à une recommandation : c'est la suivante de la playlist qui vient.
+        p.update(3.0, &[ecran], &[]);
+        p.observe(id, &etat(&lec, X, 200.0, true, true), A);
+        p.tracks.get_mut(&id).unwrap().video.queue.push(Y.to_string());
+        p.observe(id, &etat(&watch_url("rrrrrrrrrrr", 0.0), "rrrrrrrrrrr", 0.0, false, false), A);
+        let l = p.liste(id).unwrap();
+        assert_eq!((l.lus, l.id), (&[X.to_string()][..], Y));
+        // Glisser d'un Short à l'autre : les Shorts vus ne vont pas dans les vues.
+        let mut p = Party::new();
+        let court = |v: &str| etat(&short_url(v), v, 1.0, false, false);
+        for v in [X, Y, "sssssssssss"] {
+            p.observe(id, &court(v), A);
+        }
+        let l = p.liste(id).unwrap();
+        assert_eq!((l.lus.len(), l.id), (0, "sssssssssss"));
+        // Le site de Dailymotion : temps, pause et pub lus par l'API de son lecteur.
+        let d = parse_page(
+            r#"{"u":"https://www.dailymotion.com/video/xbzlecq?mlb=site&start=5","t":12.3,"p":false,"a":false,"i":"dm:xbzlecq","e":false}"#,
+        )
+        .unwrap();
+        assert_eq!((d.video.as_deref(), d.t, d.paused), (Some("dm:xbzlecq"), 12.3, false));
+        let autre = parse_page(
+            r#"{"u":"https://www.dailymotion.com/video/xbzlecq","t":12.3,"p":false,"a":false,"i":"dm:xautre1","e":false}"#,
+        )
+        .unwrap();
+        assert_eq!(autre.t, -1.0, "le lecteur est déjà sur une autre vidéo : temps pas sûr");
     }
 
     /// (v292) Depuis la recherche ouverte par la playlist, un clic **lance** la vidéo (demande
@@ -1941,8 +2067,8 @@ mod tests {
         assert!(p.tracks.get(&id).is_none());
         assert_eq!(p.order(id, &clic(Y), A, true), None);
         let liste = |p: &Party| {
-            let (l, cur, q, pause) = p.liste(id).unwrap();
-            (l.to_vec(), cur.to_string(), q.to_vec(), pause)
+            let l = p.liste(id).unwrap();
+            (l.lus.to_vec(), l.id.to_string(), l.queue.to_vec(), l.pause)
         };
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(liste(&p), (s(&[X]), Y.to_string(), s(&[]), false));

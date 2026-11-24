@@ -12,7 +12,12 @@
 /// et dit les vidéos cliquées (file d'attente). Voir le navigateur Chromium pour l'histoire.
 /// (v284) Dans la recherche à côté, une vidéo cliquée va dans la file **sur tout site** :
 /// Vimeo se cherche par Google (sa recherche est fermée en Europe), liens `google…/url?q=`
-/// compris.
+/// compris. (v296) Un Short qui repart du début dit qu'il est fini (`e`, 1,6 s) : la
+/// playlist passe à la suivante. (v302) Sur le site de Dailymotion, la vidéo est dans le
+/// cadre de son lecteur : l'état (temps, lecture, pub, fin, vidéo) se lit par l'API
+/// officielle que le site donne à la page (`window.dailymotion.getPlayer()`, `getState`,
+/// évènements `video_end`/`video_start`) ; vérifié dans Chromium sur le site (fin : écran de
+/// fin 6 s, puis le site passe tout seul à une autre vidéo).
 pub const PAGE_JS: &str = r#"(()=>{if(window.top!==window||window.__minelib)return;window.__minelib=1;
 const dit=s=>{try{window.chrome.webview.postMessage(s);}catch(e){}};
 
@@ -80,12 +85,20 @@ document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagN
 if(a&&lec(a.href)){e.preventDefault();e.stopImmediatePropagation();
 dit('__minelib_ordre__'+JSON.stringify({clic:new URL(lec(a.href)).searchParams.get('v')}));}},true);
 setInterval(()=>go(location.href,true),250);go(location.href,true);}
-let s='',fin=0,der=-1,derU='';window.addEventListener('pageshow',()=>{s='';});setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById(SH()?'shorts-player':'movie_player');
+let s='',fin=0,der=-1,derU='',dmS=null,dmQ=0,dmFin=false,dmOn=false;window.addEventListener('pageshow',()=>{s='';});
+const dmh=/(^|\.)dailymotion\.com$/.test(location.hostname);
+setInterval(()=>{focus();if(window.__mlb_lecteur)return;const mp=document.getElementById(SH()?'shorts-player':'movie_player');
 const v=(mp&&mp.querySelector('video'))||document.querySelector('video');
-if(location.href!==derU){derU=location.href;der=-1;fin=0;}
+if(location.href!==derU){derU=location.href;der=-1;fin=0;dmFin=false;}
+if(dmh&&window.dailymotion&&window.dailymotion.getPlayer){const D=window.dailymotion;D.getPlayer().then(x=>{
+if(!dmOn&&x.on&&D.events){dmOn=true;try{x.on(D.events.VIDEO_END,()=>{dmFin=true;});x.on(D.events.VIDEO_START,()=>{dmFin=false;});}catch(e){}}
+return x.getState();}).then(st=>{dmS=st;dmQ=Date.now();}).catch(()=>{});}
 if(SH()&&v&&!v.paused&&v.duration>3){const c=v.currentTime;if(der>v.duration-1.5&&c<1.5)fin=Date.now();der=c;}
 let i='';try{if(mp&&mp.getVideoData)i=mp.getVideoData().video_id||'';}catch(e){}
-const st=JSON.stringify({u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||pubShort(),w:attend(),i:i,e:!!(v&&v.ended)||Date.now()-fin<1600});
+let o={u:location.href,t:v?Math.round(v.currentTime*10)/10:-1,p:v?v.paused:true,a:!!document.querySelector('.ad-showing')||pubShort(),w:attend(),i:i,e:!!(v&&v.ended)||Date.now()-fin<1600};
+if(!v&&dmS&&Date.now()-dmQ<2000){o.t=Math.round((dmS.videoTime||0)*10)/10;o.p=!(dmS.playerIsPlaying||dmS.playerIsBuffering);
+o.a=!!dmS.adIsPlaying;o.e=dmFin||!!dmS.playerIsReplayScreen;o.i=dmS.videoId&&/^[A-Za-z0-9]{5,12}$/.test(dmS.videoId)?'dm:'+dmS.videoId:'';}
+const st=JSON.stringify(o);
 if(st!==s){s=st;dit('__minelib_state__'+st);}},500);})();"#;
 
 /// Dit si la page peut défiler sous la souris (la molette ne va à l'écran que si elle y

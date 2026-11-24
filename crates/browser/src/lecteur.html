@@ -156,7 +156,9 @@ window.onYouTubeIframeAPIReady=()=>{
           mot("Ouverture de la vidéo sur YouTube…");
           location.replace('https://www.youtube.com/watch?v='+id+(t>0?'&t='+t+'s':'')+'&mlb=site');
           return;}
-        mot("Cette vidéo ne peut pas être lue (introuvable, privée ou retirée).");},
+        mot("Cette vidéo ne peut pas être lue (introuvable, privée ou retirée).");
+        // (v302) Dans une playlist, on passe à la suivante au bout de quelques secondes.
+        setTimeout(()=>{fini=true;},4000);},
     }});
 };
 B={jouer:()=>P.playVideo(),arreter:()=>P.pauseVideo(),aller:t=>P.seekTo(t,true),
@@ -235,8 +237,9 @@ setInterval(()=>{
   const now=performance.now();
   if(s!==1||t!==dernier){dernier=t;depuis=now;}
   const fige=s===1&&now-depuis>1200;
-  const a=!permis||fige||pub;
-  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i,e:fini,o:ouvert,r:cote});
+  // (v302) L'attente du regard (`w`) n'est pas une pub (`a`) : le jeu les distingue.
+  const a=fige||pub;
+  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,w:!permis,i:i,e:fini,o:ouvert,r:cote});
   if(st!==etat){etat=st;dit('__minelib_state__'+st);}
 },500);
 })();

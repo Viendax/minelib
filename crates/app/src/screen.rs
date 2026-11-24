@@ -293,7 +293,7 @@ fn etat_volet(t: &Tab) -> String {
     let ici = cur.is_some() && crate::watch::video_of(&t.addr).as_ref() == cur;
     let r = t.cote.as_ref().filter(|c| c.voulue).map_or("", |c| c.site);
     serde_json::json!({
-        "f": file, "c": c, "p": t.pause, "i": ici, "h": t.history, "r": r, "l": t.en_ligne
+        "f": file, "c": c, "p": t.pause, "e": t.fini, "i": ici, "h": t.history, "r": r, "l": t.en_ligne
     })
     .to_string()
 }
@@ -818,21 +818,24 @@ impl Displays {
 
     /// (v289) La playlist de chaque écran (regarder ensemble) et si l'on est en ligne : le
     /// volet les montre. (v291) `liste` : les vues, celle en cours, celles à suivre, et si
-    /// celle en cours est en pause.
+    /// celle en cours est en pause ; (v302) ou finie.
     pub fn set_files<'a>(
         &mut self,
         en_ligne: bool,
-        liste: impl Fn(u32) -> Option<(&'a [String], &'a str, &'a [String], bool)>,
+        liste: impl Fn(u32) -> Option<crate::watch::Liste<'a>>,
     ) {
         for (id, tab) in self.tabs.iter_mut() {
             tab.en_ligne = en_ligne;
-            let Some((lus, cur, queue, pause)) = liste(*id) else {
+            let Some(l) = liste(*id) else {
                 tab.file.clear();
                 tab.pos = None;
                 tab.pause = false;
+                tab.fini = false;
                 continue;
             };
-            tab.pause = pause;
+            let (lus, cur, queue) = (l.lus, l.id, l.queue);
+            tab.pause = l.pause;
+            tab.fini = l.fini;
             let pareil = tab.pos == Some(lus.len())
                 && tab.file.len() == lus.len() + 1 + queue.len()
                 && tab
@@ -2049,8 +2052,10 @@ struct Tab {
     /// en cours, à suivre) et le rang de celle en cours.
     file: Vec<String>,
     pos: Option<usize>,
-    /// (v291) Celle en cours est en pause (la page partie ailleurs, ou mise en pause).
+    /// (v291) Celle en cours est en pause (la page partie ailleurs, ou mise en pause) ;
+    /// (v302) ou finie (un clic la relance).
     pause: bool,
+    fini: bool,
     /// (v293) Largeur de mise en page demandée au navigateur pour la page (pixels de page) :
     /// moins que `PAGE_W` à côté du volet (v293 : un Short ; v294 : toute page sauf le
     /// lecteur), que la page se range à sa droite au lieu d'être dessous.
@@ -2114,6 +2119,7 @@ impl Tab {
             file: Vec::new(),
             pos: None,
             pause: false,
+            fini: false,
             largeur: PAGE_W,
             en_ligne: false,
             appui: Cible::Page,
@@ -3225,7 +3231,15 @@ mod tests {
         d.tabs.insert(5, Tab::new(HOME_URL));
         let lus = vec!["dQw4w9WgXcQ".to_string()];
         let file = vec!["<script>".to_string(), "dm:x8abcd".to_string()];
-        d.set_files(true, |id| (id == 4).then_some((&lus[..], "vm:123456", &file[..], true)));
+        d.set_files(true, |id| {
+            (id == 4).then_some(crate::watch::Liste {
+                lus: &lus[..],
+                id: "vm:123456",
+                queue: &file[..],
+                pause: true,
+                fini: false,
+            })
+        });
         assert_eq!(d.tabs[&4].file.len(), 4);
         assert_eq!(d.tabs[&4].pos, Some(1));
         assert!(d.tabs[&5].file.is_empty() && d.tabs[&5].pos.is_none());

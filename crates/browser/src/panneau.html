@@ -17,10 +17,11 @@
   celle en cours, celles à suivre. Un clic sur une vidéo la lance ; ▲ ▼ la montent ou la
   descendent d'un rang (vues comprises) ; × la retire. Partir sur un autre site met celle en
   cours en pause : un clic sur elle la reprend là où elle en était. (v300) Un clic sur celle
-  en cours la met en pause, un autre la reprend.
+  en cours la met en pause, un autre la reprend. (v302) Finie, un clic la relance ; × sur
+  celle en cours (s'il y a une suivante) la retire et lance la suivante.
 
-  Le jeu lui dit tout par `__mlb.etat({f, c, p, i, h, r, l})` : la playlist (numéros), le
-  rang de celle en cours, si elle est en pause, si la page de l'écran la montre, les pages où
+  Le jeu lui dit tout par `__mlb.etat({f, c, p, e, i, h, r, l})` : la playlist (numéros), le
+  rang de celle en cours, si elle est en pause, (v302) finie, si la page de l'écran la montre, les pages où
   aller (1 retour, 2 suivant), le site de la recherche ouverte, en ligne ou non. Elle répond
   par des ordres : `{"nav":"google"|"twitch"|"retour"|"suivant"}`,
   `{"recherche":"yt"|"dm"|"vm"|false}`,
@@ -70,6 +71,7 @@ h2{font-size:18px;margin:4px 4px 12px;flex:none}
 .v .fl button:disabled{opacity:.25;cursor:default}
 .v .x{flex:none;height:26px;border-radius:50%;font-size:16px}
 .v.cours .x{visibility:hidden}
+.v.cours.saute .x{visibility:visible}
 #vide,#solo{color:#aaa;font-size:14px;line-height:1.4;margin:4px}
 </style>
 </head>
@@ -102,7 +104,7 @@ document.querySelectorAll('#sites button[data-s]').forEach(b=>b.addEventListener
   ()=>ordre({recherche:b.dataset.s})));
 $('ferme').addEventListener('click',()=>ordre({recherche:false}));
 // La playlist : titres et images chargés une fois par vidéo.
-let liste=[],cour=-1,vu='',courId=null,recale=true,pause=false,ici=true;const infos={};
+let liste=[],cour=-1,vu='',courId=null,recale=true,pause=false,ici=true,finie=false;const infos={};
 const info=v=>{if(infos[v]||!ok(v))return;const o=infos[v]={titre:'',image:''};const S=site(v);
   const fin=()=>montre();
   if(S==='yt'){o.image='https://i.ytimg.com/vi/'+v+'/mqdefault.jpg';
@@ -119,7 +121,8 @@ const montre=()=>{const l=$('liste');const haut=l.scrollTop;l.textContent='';
   liste.forEach((v,i)=>{info(v);const o=infos[v]||{titre:'',image:''};
     const d=document.createElement('div');
     const rep=i===cour;
-    d.className='v'+(i<cour?' lu':i===cour?' cours':'')+(i===cour&&pause?' pause':'')+(rep?' reprendre':'');
+    d.className='v'+(i<cour?' lu':i===cour?' cours':'')+(i===cour&&(pause||finie)?' pause':'')+(rep?' reprendre':'')
+      +(i===cour&&cour<liste.length-1?' saute':'');
     const im=document.createElement('div');im.className='im';
     const img=document.createElement(o.image?'img':'div');img.className='img';
     if(o.image){img.src=o.image;img.alt='';}im.append(img);
@@ -128,13 +131,14 @@ const montre=()=>{const l=$('liste');const haut=l.scrollTop;l.textContent='';
     const t=document.createElement('div');t.className='t';
     const nom=document.createElement('div');nom.className='nom';nom.textContent=o.titre||'…';t.append(nom);
     if(i<=cour){const et=document.createElement('div');et.className='et';
-      et.textContent=i<cour?'Déjà vue':pause?'⏸ En pause : clique pour reprendre'
+      et.textContent=i<cour?'Déjà vue':finie?'↻ Terminée : clique pour la revoir'
+        :pause?'⏸ En pause : clique pour reprendre'
         :ici?'▶ En cours : clique pour mettre en pause':'▶ En cours : clique pour y revenir';t.append(et);}
     const fl=document.createElement('div');fl.className='fl';
     const h=bouton('','▲','Monter',()=>ordre({monte:i,v:v}));h.disabled=i===0;
     const b=bouton('','▼','Descendre',()=>ordre({descend:i,v:v}));b.disabled=i===liste.length-1;
     fl.append(h,b);
-    const x=bouton('x','×','Retirer',()=>ordre({retire:i,v:v}));
+    const x=bouton('x','×',i===cour?'Retirer et passer à la suivante':'Retirer',()=>ordre({retire:i,v:v}));
     d.append(im,t,fl,x);
     if(i!==cour)d.addEventListener('click',()=>ordre({joue:i,v:v}));
     else d.addEventListener('click',()=>ordre({bascule:i,v:v}));
@@ -152,9 +156,9 @@ window.__mlb={
   etat:e=>{if(!e||typeof e!=='object')return;
     const f=Array.isArray(e.f)?e.f.slice(0,61).map(v=>ok(v)?v:''):[];
     const c=Number.isInteger(e.c)&&e.c>=0&&e.c<f.length?e.c:-1;
-    const p=e.p===true,a=e.i!==false;
-    const cle=c+'|'+p+'|'+a+'|'+f.join(',');
-    if(cle!==vu){vu=cle;liste=f;cour=c;pause=p;ici=a;const id=c>=0?f[c]:null;
+    const p=e.p===true,a=e.i!==false,fe=e.e===true;
+    const cle=c+'|'+p+'|'+a+'|'+fe+'|'+f.join(',');
+    if(cle!==vu){vu=cle;liste=f;cour=c;pause=p;ici=a;finie=fe;const id=c>=0?f[c]:null;
       if(id!==courId){courId=id;recale=true;}montre();}
     const h=e.h|0;
     $('retour').disabled=!(h&1);
