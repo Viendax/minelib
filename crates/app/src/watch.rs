@@ -452,6 +452,9 @@ impl Party {
         }
         let o: Ordre = serde_json::from_str(json).ok()?;
         if let Some(vid) = o.clic.filter(|v| valid_id(v)) {
+            if cote {
+                return self.file_cote(id, vid, me);
+            }
             let en_cours = self.tracks.get(&id).filter(|t| {
                 let fini = self.pages.get(&id).is_some_and(|s| {
                     s.page.ended && s.page.video.as_deref() == Some(t.video.id.as_str())
@@ -485,6 +488,34 @@ impl Party {
             log::info!("regarder ensemble : écran {id}, {vid} retirée de la file");
             self.put(id, video);
         }
+        None
+    }
+
+    /// (v259) Une vidéo cliquée dans la recherche ouverte depuis la file : **toujours**
+    /// ajoutée au bout de la file, jamais lancée (demande du propriétaire). Rien encore de
+    /// partagé sur l'écran (vidéo pas encore lancée, ou attendant le regard) : la vidéo que
+    /// montre la page devient celle de l'écran, avec cette file. Seule une page sans vidéo du
+    /// tout (rien à quoi ajouter) ouvre la cliquée.
+    fn file_cote(&mut self, id: u32, vid: String, me: &str) -> Option<Act> {
+        if !self.tracks.contains_key(&id) {
+            let page = self.pages.get(&id).map(|s| s.page.clone());
+            let Some((cur, p)) = page.and_then(|p| Some((p.video.clone()?, p))) else {
+                return Some(Act::Open(id, watch_url(&vid, 0.0)));
+            };
+            self.local(id, cur, p.t.max(0.0), p.paused, p.short, me);
+        }
+        let mut video = self.tracks.get(&id)?.at_now();
+        if video.queue.len() >= MAX_FILE || video.queue.last() == Some(&vid) {
+            return None;
+        }
+        video.queue.push(vid.clone());
+        video.seq = self.next_seq(id);
+        video.by = me.chars().take(32).collect();
+        log::info!(
+            "regarder ensemble : écran {id}, {vid} ajoutée à la file depuis la recherche ({} en tout)",
+            video.queue.len()
+        );
+        self.put(id, video);
         None
     }
 
@@ -1315,6 +1346,34 @@ mod tests {
             file_js(&[Y.to_string(), "<script>".to_string()]),
             format!(r#"(()=>{{if(window.__mlb&&window.__mlb.file)window.__mlb.file(["{Y}"]);}})()"#)
         );
+    }
+
+    /// (v259) Depuis la recherche ouverte par la file, un clic ajoute toujours à la file,
+    /// même quand rien n'est encore partagé (vidéo qui attend le regard) : jamais lancé.
+    #[test]
+    fn un_clic_dans_la_recherche_ajoute_toujours_a_la_file() {
+        let mut p = Party::new();
+        let id = 7;
+        let clic = |v: &str| format!(r#"{{"clic":"{v}"}}"#);
+        // Pas même une vidéo sur la page : rien à quoi l'ajouter, elle s'ouvre.
+        assert_eq!(p.order(id, &clic(Y), A, true), Some(Act::Open(id, watch_url(Y, 0.0))));
+        // Le lecteur montre X, pas encore lancée (« en pub » : rien de partagé).
+        let etat = format!(
+            r#"{{"u":"{}","t":0,"p":true,"a":true,"i":"{X}","e":false,"f":"","o":true,"r":true}}"#,
+            watch_url(X, 0.0)
+        );
+        p.observe(id, &etat, A);
+        assert!(p.tracks.get(&id).is_none());
+        assert_eq!(p.order(id, &clic(Y), A, true), None, "pas lancée");
+        assert_eq!(p.tracks[&id].video.id, X);
+        assert_eq!(p.tracks[&id].video.queue, vec![Y.to_string()]);
+        // La même deux fois de suite : une seule fois.
+        assert_eq!(p.order(id, &clic(Y), A, true), None);
+        assert_eq!(p.tracks[&id].video.queue.len(), 1);
+        // Vidéo finie : elle va quand même dans la file (la file passe à la suivante).
+        p.tracks.get_mut(&id).unwrap().video.queue.clear();
+        assert_eq!(p.order(id, &clic(Y), A, true), None);
+        assert_eq!(p.tracks[&id].video.queue, vec![Y.to_string()]);
     }
 
     fn screen_at(x: i32) -> Placed {
