@@ -441,11 +441,11 @@ mod tests {
         // Le temps passe : rien ne revient avant 5 minutes, tout après (une par une).
         let mut jelly = f.clone();
         f.tick(REGROW_S - 1.0, Some(REGROW_S), &DIMS);
-        assert_eq!(f.bites().len(), 12);
+        assert_eq!(f.bites.len(), 12);
         f.tick(2.0, Some(REGROW_S), &DIMS);
         assert!(f.is_whole() && f.eaten(&DIMS) == 0.0);
         jelly.tick(10_000.0, None, &DIMS);
-        assert_eq!(jelly.bites().len(), 12);
+        assert_eq!(jelly.bites.len(), 12);
         // Viser un cube : la morsure est là. Manger jusqu'au bout : plus rien à mordre.
         let mut g = Flesh::default();
         let b = g.bite_at(HEAD, [7, 7, 0], 3, &DIMS).unwrap();
