@@ -715,6 +715,10 @@ pub struct FrameParams<'a> {
     /// Les premiers sommets d'`entities` suivent la caméra (modèle du joueur local) ; les
     /// autres sont fixés dans le monde.
     pub entities_follow: usize,
+    /// (v290) Les derniers sommets d'`entities` disent leur mouvement : pour chacun, dans
+    /// l'ordre, sa place dans le monde à l'image d'avant (L'Évidé, le corps du joueur local
+    /// en F5 : l'anticrénelage les reprend là où ils étaient, sans traînée). Vide : aucun.
+    pub entities_moved: &'a [[f32; 3]],
     /// Entités fixes qui changent rarement (têtes par zone, cadres) : (identifiant,
     /// triangles, version) ; chaque lot n'est renvoyé à la carte graphique que quand sa
     /// version change.
@@ -3450,7 +3454,7 @@ impl Renderer {
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
         self.viewmodel.prepare_arm(&self.queue, p.arm);
         self.entities
-            .prepare(&self.queue, p.entities, p.entities_follow);
+            .prepare(&self.queue, p.entities, p.entities_follow, p.entities_moved);
         self.entities.prepare_players(&self.queue, p.players);
         self.entities
             .prepare_static(&self.device, &self.queue, p.static_entities);
@@ -3708,7 +3712,7 @@ impl Renderer {
             .prepare_with(&self.queue, p.viewmodel, &self.overlay.models);
         self.viewmodel.prepare_arm(&self.queue, p.arm);
         self.entities
-            .prepare(&self.queue, p.entities, p.entities_follow);
+            .prepare(&self.queue, p.entities, p.entities_follow, p.entities_moved);
         self.entities.prepare_players(&self.queue, p.players);
         self.entities
             .prepare_static(&self.device, &self.queue, p.static_entities);

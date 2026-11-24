@@ -143,9 +143,83 @@ const ZEUS_RAISE: f32 = 1.15;
 // `player_model::ITEM_AIM_DROP`.
 const ITEM_AIM_DROP: f32 = 0.367;
 
-/// Repère (pixels → monde) d'une partie du modèle dans la pose de l'instance : le calcul de
-/// `player_model::parts`.
+// (v290) Genoux et coudes (`player_model::bends`, `lowers`) : épaisseur de la jambe, hauteur
+// de la coupe du bras et demi-épaisseur du bras (pixels), plis du coude (repos, marche,
+// accroupi) et du genou (marche, le plus fort), largeur du bas d'un membre plié.
+const LEG_D: f32 = 3.612903;
+const ARM_CUT: f32 = -4.129032;
+const ARM_HALF: f32 = 1.419355;
+const ELBOW_REST: f32 = 0.22;
+const ELBOW_WALK: f32 = 0.45;
+const ELBOW_CROUCH: f32 = 0.3;
+const KNEE_WALK: f32 = 0.9;
+const KNEE_MAX: f32 = 1.45;
+const LOWER_NARROW: f32 = 0.98;
+
+fn m_scale_x(k: f32) -> mat4x4<f32> {
+    return mat4x4<f32>(
+        vec4<f32>(k, 0.0, 0.0, 0.0),
+        vec4<f32>(0.0, 1.0, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, 1.0, 0.0),
+        vec4<f32>(0.0, 0.0, 0.0, 1.0),
+    );
+}
+
+/// (v290) Angle dont la cuisse part en avant quand les hanches descendent de `drop` pixels
+/// (`player_model::squat`) : le genou plie du double, le pied reste sous la hanche, au sol.
+fn squat(drop: f32) -> f32 {
+    let reach = sqrt(LEG * LEG + LEG_D * LEG_D / 4.0);
+    return acos(clamp((LEG - drop) / reach, -1.0, 1.0)) - atan2(LEG_D / 2.0, LEG);
+}
+
+/// Repère (pixels → monde) d'un pavé du modèle dans la pose de l'instance. (v290) Onze
+/// pavés : les sept de `player_model::parts` (les membres : leur moitié du haut), puis les
+/// moitiés du bas (7, 8 : jambes gauche et droite ; 9, 10 : bras gauche et droit), tournées
+/// du pli du genou ou du coude autour de leur charnière (`player_model::lowers`).
 fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
+    if part < 7u {
+        return limb_matrix(part, v);
+    }
+    let crouch = clamp(v.motion.z, 0.0, 1.0);
+    if part < 9u {
+        var sign = 1.0;
+        if part == 8u {
+            sign = -1.0;
+        }
+        let knee = min(
+            2.0 * squat(CROUCH_HIP_DROP * crouch)
+                + KNEE_WALK * v.motion.y * max(cos(v.motion.x) * sign, 0.0),
+            KNEE_MAX,
+        );
+        var narrow = LOWER_NARROW;
+        if knee == 0.0 {
+            narrow = 1.0;
+        }
+        return limb_matrix(part - 7u, v) * m_trans(vec3<f32>(0.0, -LEG / 2.0, -LEG_D / 2.0))
+            * m_rot_x(-knee) * m_trans(vec3<f32>(0.0, LEG / 2.0, LEG_D / 2.0))
+            * m_scale_x(narrow);
+    }
+    // Un bras tendu vers le regard (bit 17 ; le droit : tout objet tenu, bits 16 à 20) reste
+    // droit.
+    var straight = (v.skin & 0x20000u) != 0u;
+    var sign = -1.0;
+    if part == 10u {
+        straight = (v.skin & 0x1f0000u) != 0u;
+        sign = 1.0;
+    }
+    var elbow = 0.0;
+    var narrow = 1.0;
+    if !straight {
+        elbow = ELBOW_REST + ELBOW_WALK * v.motion.y * (0.5 + 0.5 * sin(v.motion.x) * sign)
+            + ELBOW_CROUCH * crouch;
+        narrow = LOWER_NARROW;
+    }
+    return limb_matrix(part - 6u, v) * m_trans(vec3<f32>(0.0, ARM_CUT, ARM_HALF))
+        * m_rot_x(elbow) * m_trans(vec3<f32>(0.0, -ARM_CUT, -ARM_HALF)) * m_scale_x(narrow);
+}
+
+/// Repère des sept pavés de `player_model::parts`.
+fn limb_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     let px = 1.8 / 32.0;
     let base = m_trans(v.feet) * m_rot_y(-v.look.x) * m_scale(px);
     let swing = sin(v.motion.x) * 0.75 * v.motion.y;
@@ -157,14 +231,14 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     let lean = belly + bend;
     let drop = CROUCH_HIP_DROP * crouch;
     let pitch = clamp(v.look.y, -1.4, 1.4);
-    // (v189) Jambe d'un seul morceau : accroupi, elle se tasse de `drop` au lieu de se
-    // faire recouvrir au quart par le bas du corps (pli visible à la hanche). Pieds au sol.
-    let shrink = m_scale_y((LEG - drop) / LEG);
+    // (v290) Accroupi, la jambe ne se tasse plus : la cuisse part en avant de `squat`, le
+    // genou plie du double (pavés 7 et 8).
+    let thigh = squat(drop);
     if part == 0u {
-        return base * m_trans(vec3<f32>(-LEG_X, LEG - drop, 0.0)) * m_rot_x(swing) * shrink;
+        return base * m_trans(vec3<f32>(-LEG_X, LEG - drop, 0.0)) * m_rot_x(swing + thigh);
     }
     if part == 1u {
-        return base * m_trans(vec3<f32>(LEG_X, LEG - drop, 0.0)) * m_rot_x(-swing) * shrink;
+        return base * m_trans(vec3<f32>(LEG_X, LEG - drop, 0.0)) * m_rot_x(-swing + thigh);
     }
     // (v260) Ventre (6) : sous la poitrine, penché autour des hanches.
     if part == 6u {

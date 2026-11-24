@@ -898,7 +898,18 @@ fn translucent_out(i: VOut, s: Shaded) -> TrOut {
     // du ciel, nul en se déplaçant, et s'étalait d'image en image (« de la rémanence quand on se
     // déplace autour »). Ce qu'on voit au travers, s'il est loin derrière, est écarté par
     // l'anticrénelage (profondeurs comparées, voir `conf` dans taa.wgsl).
-    o.motion = motion_of(vec4<f32>(i.world, 1.0));
+    //
+    // (v290) « Le monstre a de la rémanence » (L'Évidé vu derrière un mur de verre, caméra
+    // immobile) : la face, immobile à l'écran, effaçait le mouvement de ce qui bouge derrière
+    // elle (un mob, un joueur, un objet lâché), que l'anticrénelage reprenait alors comme un
+    // mur : des copies de lui, image après image. Le mouvement de la face ne remplace celui
+    // de derrière qu'à la mesure dont elle bouge elle-même à l'écran (`motion.a` : son poids
+    // dans le mélange de l'image des mouvements, voir `translucent_pipeline`) ; immobile, elle
+    // le laisse. Là où elle est opaque (le cadre d'une vitre), elle cache ce qui est
+    // derrière : son mouvement à elle, toujours.
+    let mv = motion_of(vec4<f32>(i.world, 1.0));
+    let own = max(smoothstep(0.0, 0.05, length(mv)), smoothstep(0.9, 1.0, c.a));
+    o.motion = vec4<f32>(mv, 0.0, own);
     // Comme `gb_out`, poids multipliés par l'opacité de la face (mélange : face × a).
     // Albédo en racine carrée (8 bits, plus de nuances dans le sombre).
     o.water = vec4<u32>(
@@ -914,13 +925,14 @@ fn translucent_out(i: VOut, s: Shaded) -> TrOut {
     return o;
 }
 
-/// (v199) Translucides avec l'anticrénelage : couleur, mouvement (celui de ce qui est
-/// derrière, gardé), et la face pour l'éclairage différé des lumières dynamiques (`fs_water`
+/// (v199) Translucides avec l'anticrénelage : couleur, mouvement (v268 : celui de la face ;
+/// v290 : sauf immobile à l'écran, où celui de derrière est gardé), et la face pour l'éclairage différé des lumières dynamiques (`fs_water`
 /// de dyn_deferred.wgsl : eau, verre, glace). La dernière face dessinée d'un pixel
 /// l'emporte (les translucides vont de l'arrière vers l'avant, chunk par chunk).
 struct TrOut {
     @location(0) color: vec4<f32>,
-    @location(1) motion: vec2<f32>,
+    // (v290) xy : le mouvement ; a : sa part dans le mélange avec celui de derrière.
+    @location(1) motion: vec4<f32>,
     @location(2) water: vec4<u32>,
 };
 

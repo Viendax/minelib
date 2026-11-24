@@ -55,7 +55,11 @@ use serde::{Deserialize, Serialize};
 /// fin de registre), on s'enfonce d'une couche dans la neige fine : la simulation des joueurs
 /// d'une partie FPS (et les blocs d'un serveur) doivent être les mêmes chez tous.
 /// (v285) 73 : positions rapprochées (`Request::NearbyClose`).
-pub const PROTOCOL: u32 = 73;
+/// (v290) 74 : le personnage a des genoux : accroupi, ses jambes ne se tassent plus, elles se
+/// plient (cuisse en avant, bas de jambe en arrière) ; ses boîtes des coups en partie FPS, les
+/// pavés du modèle (onze : chaque jambe et chaque bras en deux), doivent être les mêmes chez
+/// l'hôte, ses invités et le vérificateur.
+pub const PROTOCOL: u32 = 74;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.

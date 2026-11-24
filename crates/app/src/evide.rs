@@ -64,22 +64,35 @@ const CRAWL_HOLD: f32 = 0.9;
 /// (v272) Debout, jusqu'où son buste se plie aux hanches pour amener sa bouche à la hauteur
 /// de ce qu'il mord (rad depuis la verticale : plus de π/2, il plonge vers le sol).
 const LEAN_MAX: f32 = 3.0;
-/// (v272) Sa tête quand il mord debout : le visage tourné vers le bas (rad).
+/// (v272) Sa tête quand il mord debout : le visage tourné vers le bas (rad). (v290) Le plus
+/// bas qu'elle se tourne : elle vise le centre de notre corps (`BITE_INWARD`).
 const BITE_PITCH: f32 = -1.2;
+/// (v290) En mordant, sa tête vise le milieu du membre mordu, à la hauteur de l'endroit mordu
+/// ramenée de cette part vers ce milieu.
+const BITE_INWARD: f32 = 0.3;
 /// Une morsure : durée du geste (s), instant où la bouche se referme.
-const BITE_S: f32 = 1.6;
+const BITE_S: f32 = 1.8;
 const BITE_AT: f32 = 1.04;
+/// (v290) À partir de ce moment de la morsure (s), il se redresse et lâche prise : « il revient
+/// à sa position initiale à la fin de la morsure » (d'où une morsure toutes les 1,8 s au lieu
+/// de 1,6 : le temps de se redresser tout à fait avant de se pencher pour la suivante).
+const BITE_BACK: f32 = 1.2;
 /// On peut viser un morceau de lui à manger de cette distance (blocs, depuis nos yeux) :
-/// « de près ». (v272) Il faut ensuite que notre bouche y arrive en se penchant.
+/// « de près ». (v272) Il fallait ensuite que notre bouche y arrive en se penchant ; (v290)
+/// plus maintenant (« je n'arrive plus à manger le monstre […] que ça fonctionne quand je
+/// clique ») : on se penche vers lui autant qu'on peut, et le clic suffit.
 pub const EAT_REACH: f32 = 1.5;
 /// (v272) « Si sa bouche se décolle avant, ça ne nous mange pas » : au moment où elle se
 /// referme, sa bouche doit être à moins de tant de blocs de l'endroit visé.
 pub const TOUCH: f32 = 0.3;
 /// Côté (cubes) du morceau qu'on lui mange à chaque bouchée.
 const OUR_BITE: usize = 4;
-/// Il meurt quand on a mangé cette part de son corps, ou cette part de sa tête.
-const EATEN_DEAD: f32 = 0.5;
-const HEAD_DEAD: f32 = 0.8;
+/// (v290) « Il doit avoir autant de vie que le joueur […] on le tue en 5 morsures » : sa vie
+/// (celle d'un joueur, `save::MAX_HEALTH`), et ce que lui retire chacune de nos bouchées.
+/// (Avant : mort quand on avait mangé la moitié de son corps, ou les quatre cinquièmes de sa
+/// tête.)
+pub const LIFE: u8 = crate::save::MAX_HEALTH;
+pub const OUR_BITE_HURTS: u8 = 4;
 /// Sa fin : il s'affaisse comme une gelée (s).
 const DIE_S: f32 = 0.7;
 /// Au plus tant de monstres à la fois ; au plus tant venus tout seuls.
@@ -166,9 +179,70 @@ pub struct Anim {
     pub sink: f32,
 }
 
+/// (v290) « Ajoute une pliure au niveau des genoux et des coudes de notre perso/npc et de ce
+/// monstre […] adapte les animations » : pli du genou de la jambe qui avance, debout ; plis
+/// du coude (au repos, en plus quand il tend les bras vers nous, en plus quand le bras part en
+/// avant en marchant) ; de combien ses avant-bras se referment sur nous quand il mord ;
+/// largeur du bas d'un membre plié (ses côtés ne se confondent pas avec ceux du haut) ; pli à
+/// partir duquel un membre fait deux pavés d'ombre.
+const KNEE_STEP: f32 = 0.8;
+const ELBOW_REST: f32 = 0.25;
+const ELBOW_REACH: f32 = 0.3;
+const ELBOW_WALK: f32 = 0.4;
+const GRAB_BEND: f32 = 0.9;
+const LOWER_NARROW: f32 = 0.98;
+const SHADOW_BEND: f32 = 0.3;
+
+/// (v290) Son corps dans une posture : ses sept pavés (`parts`), et pour chaque membre le
+/// repère de sa moitié du bas (sous le genou, sous le coude) et l'angle dont il est plié.
+pub struct Limbs {
+    pub parts: [(Mat4, [f32; 3], [f32; 3]); PARTS],
+    pub lower: [Option<Mat4>; PARTS],
+    pub bend: [f32; PARTS],
+}
+
+fn smooth(lo: f32, hi: f32, v: f32) -> f32 {
+    let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Ses pavés dans cette posture : repère (pixels → monde) et coins (pixels), dans l'ordre
-/// du modèle du joueur.
+/// du modèle du joueur. (v290) Un membre : le repère de sa moitié du haut (voir `limbs`).
 pub fn parts(pos: Vec3, yaw: f32, a: &Anim) -> [(Mat4, [f32; 3], [f32; 3]); PARTS] {
+    limbs(pos, yaw, a).parts
+}
+
+/// (v290) Ses morceaux rigides : (pavé, repère, coins). Un membre en donne deux, au-dessus et
+/// au-dessous du genou ou du coude.
+pub fn segments(pos: Vec3, yaw: f32, a: &Anim) -> Vec<(usize, Mat4, [f32; 3], [f32; 3])> {
+    let l = limbs(pos, yaw, a);
+    let mut out = Vec::with_capacity(PARTS + 4);
+    for (i, (xf, lo, hi)) in l.parts.into_iter().enumerate() {
+        match l.lower[i] {
+            Some(low) => {
+                let mid = (lo[1] + hi[1]) / 2.0;
+                out.push((i, xf, [lo[0], mid, lo[2]], hi));
+                out.push((i, low, lo, [hi[0], mid, hi[2]]));
+            }
+            None => out.push((i, xf, lo, hi)),
+        }
+    }
+    out
+}
+
+/// (v290) De combien ses hanches descendent à chaque pas, debout (pixels du modèle) : ses
+/// jambes se balancent raides depuis la hanche ; sans cela, au milieu du pas (les deux jambes
+/// écartées), ses deux pieds quittaient le sol d'un tiers de bloc. La jambe d'appui (tendue)
+/// garde ainsi le pied au sol, l'autre (genou plié) passe au-dessus.
+fn step_drop(a: &Anim) -> f32 {
+    let r = crate::player_model::rig();
+    let (len, half) = (r.leg * TALL, (r.boxes[LEG_L].1[2] - r.boxes[LEG_L].0[2]) / 2.0);
+    let angle = (a.walk.sin() * a.swing * 0.75).abs();
+    let low = (a.crawl * 10.0).min(1.0);
+    (len - (len * angle.cos() + half * angle.sin())).max(0.0) * (1.0 - low)
+}
+
+pub fn limbs(pos: Vec3, yaw: f32, a: &Anim) -> Limbs {
     let r = crate::player_model::rig();
     let tall = |i: usize| {
         let (mut lo, mut hi) = r.boxes[i];
@@ -179,32 +253,119 @@ pub fn parts(pos: Vec3, yaw: f32, a: &Anim) -> [(Mat4, [f32; 3], [f32; 3]); PART
     let c = a.crawl;
     // Penche du buste : voûté debout, à l'horizontale en rampant.
     let pitch = lerp(a.hunch, FRAC_PI_2, c);
-    let hip_y = lerp(r.leg * TALL, CRAWL_HIP / r.px, c);
+    let hip_y = lerp(r.leg * TALL, CRAWL_HIP / r.px, c) - step_drop(a);
     let base = Mat4::from_translation(pos)
         * Mat4::from_rotation_y(-yaw)
         * Mat4::from_scale(Vec3::new(r.px, r.px * (1.0 - 0.94 * a.sink), r.px));
     let hip = base * Mat4::from_translation(Vec3::new(0.0, hip_y, c * CRAWL_BACK / r.px));
     let mut out = [(Mat4::IDENTITY, [0.0; 3], [0.0; 3]); PARTS];
+    let mut lower = [None; PARTS];
+    let mut bend = [0.0f32; PARTS];
+    let narrow = Mat4::from_scale(Vec3::new(LOWER_NARROW, 1.0, 1.0));
     let stride = a.walk.sin() * a.swing;
-    // Jambes : balancées debout ; traînées derrière, presque à plat, en rampant.
-    // (v277) À toute hauteur entre les deux, les pieds restent au sol : la jambe part en
-    // arrière d'autant que la hanche descend.
-    // (L'angle où le coin le plus bas du pied touche juste le sol : la jambe, longue de `len`
-    // et épaisse de deux fois `half`, tournée de t, descend de len·cos t + half·sin t. Pris
-    // peu à peu sur le premier dixième, pour partir sans à-coup de la jambe droite.)
+    // Jambes. Debout : balancées d'avant en arrière, le genou de celle qui avance plié.
+    // (v277) Baissé, les pieds restent au sol. (v290) Il plie les genoux (accroupi sur ses
+    // pieds, les cuisses en avant) au lieu de laisser partir ses jambes raides en arrière ;
+    // plus bas encore, elles s'allongent derrière lui jusqu'à traîner à plat quand il rampe.
+    // (La jambe : longue de `len`, épaisse de deux fois `half` ; le genou à mi-longueur,
+    // charnière au bord avant, le bas part en arrière.)
     let (len, half) = (r.leg * TALL, (r.boxes[LEG_L].1[2] - r.boxes[LEG_L].0[2]) / 2.0);
-    let reach = (len * len + half * half).sqrt();
-    let touch = half.atan2(len) + (hip_y / reach).clamp(0.0, 1.0).acos();
+    let knee = |fold: f32| {
+        Mat4::from_translation(Vec3::new(0.0, -len / 2.0, -half))
+            * Mat4::from_rotation_x(-fold)
+            * Mat4::from_translation(Vec3::new(0.0, len / 2.0, half))
+    };
+    // Les deux coins du dessous du pied (avant, arrière) dans le plan de la jambe (hauteur,
+    // recul ; pixels depuis la hanche, cuisse à la verticale), genou plié de `fold` : le bas
+    // de la jambe tourne autour du bord avant du genou.
+    let sole = |fold: f32| {
+        let (sf, cf) = fold.sin_cos();
+        let (y, z) = (-len / 2.0 - len / 2.0 * cf, -half + len / 2.0 * sf);
+        [(y, z), (y + 2.0 * half * sf, z + 2.0 * half * cf)]
+    };
+    // Le point le plus bas du pied, cuisse tournée de `thigh` (vers l'avant).
+    let foot = |thigh: f32, fold: f32| {
+        let (st, ct) = thigh.sin_cos();
+        let [a, b] = sole(fold);
+        (a.0 * ct - a.1 * st).min(b.0 * ct - b.1 * st)
+    };
+    // L'angle de la cuisse qui pose juste le pied au sol, pour un genou plié de `fold` (le
+    // pied derrière le genou) : le pied descend quand la cuisse avance, jusqu'à passer sous
+    // la hanche ; cherché par moitiés. Jambe trop pliée pour toucher le sol : au plus bas.
+    let grounded = |fold: f32| {
+        let (mut back, mut front) = (fold / 2.0 - 1.65, fold / 2.0 + 0.06);
+        if foot(front, fold) + hip_y > 0.0 {
+            return front;
+        }
+        for _ in 0..18 {
+            let mid = (back + front) / 2.0;
+            if foot(mid, fold) + hip_y > 0.0 {
+                back = mid;
+            } else {
+                front = mid;
+            }
+        }
+        (back + front) / 2.0
+    };
+    // Genou qui garde le pied sous la hanche, à cette hauteur de hanche : le pli pour lequel
+    // le coin du pied le plus loin de la hanche en est à cette distance (cherché par moitiés :
+    // plus le genou plie, plus la jambe est courte) ; part des jambes allongées derrière
+    // (0 : accroupi sur ses pieds … 1 : à plat ventre).
+    let reach = |fold: f32| {
+        let [a, b] = sole(fold);
+        (a.0 * a.0 + a.1 * a.1).max(b.0 * b.0 + b.1 * b.1).sqrt()
+    };
+    let squat = {
+        let (mut less, mut more) = (0.0f32, 3.0f32);
+        for _ in 0..18 {
+            let mid = (less + more) / 2.0;
+            if reach(mid) > hip_y {
+                less = mid;
+            } else {
+                more = mid;
+            }
+        }
+        less
+    };
+    let trail = smooth(0.45, 1.0, c);
     let low = (c * 10.0).min(1.0);
     for (i, side, sign) in [(LEG_L, -r.leg_x, 1.0f32), (LEG_R, r.leg_x, -1.0)] {
-        // Debout, les jambes se balancent d'avant en arrière ; baissé, chacune ne se lève
-        // que vers l'arrière (vers l'avant, le pied passerait sous le sol).
-        let swing = stride * lerp(0.75, 0.1, c) * sign;
+        // La jambe qui avance (sa cuisse part vers l'avant) : son pied se lève.
+        let lifting = (a.walk.cos() * sign).max(0.0) * a.swing;
+        // Debout.
+        let (thigh0, fold0) = (stride * 0.75 * sign, KNEE_STEP * lifting);
+        // Baissé : le pas raccourcit et rallonge le pli (le pied glisse d'avant en arrière),
+        // la cuisse se lève un peu pour le pas ; à plat, la jambe ne se lève que vers
+        // l'arrière, l'une après l'autre.
+        let fold1 = (squat * (1.0 - trail) * (1.0 - 0.22 * stride * sign).min(1.0)).max(0.0);
+        let thigh1 = grounded(fold1) + 0.22 * lifting * (1.0 - trail)
+            - trail * (stride * 0.1 * sign).max(0.0);
+        let (thigh, fold) = (lerp(thigh0, thigh1, low), lerp(fold0, fold1, low));
+        // Jamais le pied sous le sol (entre ses deux façons de marcher, au tout début de la
+        // descente, le mélange des deux l'y mettait d'une dizaine de centimètres) : la cuisse
+        // s'écarte alors, du côté où elle est déjà, juste assez pour le poser.
+        let thigh = if foot(thigh, fold) + hip_y >= 0.0 {
+            thigh
+        } else {
+            let away = if thigh >= fold / 2.0 { 1.65 } else { -1.65 };
+            let (mut under, mut over) = (thigh, thigh + away);
+            for _ in 0..16 {
+                let mid = (under + over) / 2.0;
+                if foot(mid, fold) + hip_y >= 0.0 {
+                    over = mid;
+                } else {
+                    under = mid;
+                }
+            }
+            over
+        };
         let (lo, hi) = tall(i);
         let xf = hip
             * Mat4::from_translation(Vec3::new(side, 0.0, 0.0))
-            * Mat4::from_rotation_x(lerp(swing, -touch - swing.abs(), low));
+            * Mat4::from_rotation_x(thigh);
         out[i] = (xf, lo, hi);
+        lower[i] = Some(xf * knee(fold) * narrow);
+        bend[i] = fold;
     }
     let torso = hip * Mat4::from_rotation_x(-pitch);
     for i in [CHEST, BELLY] {
@@ -225,16 +386,45 @@ pub fn parts(pos: Vec3, yaw: f32, a: &Anim) -> [(Mat4, [f32; 3], [f32; 3]); PART
             * Mat4::from_rotation_x(pitch + lerp(stand, lie, c))
             * Mat4::from_rotation_z(sign * 0.08);
         out[i] = (xf, lo, hi);
+        // (v290) Le coude : à mi-longueur, charnière au bord arrière, l'avant-bras part en
+        // avant. Un peu plié au repos (« comme un humain »), plus quand il tend les bras
+        // vers nous et quand le bras part en avant en marchant ; en rampant, plié quand le
+        // bras tire le corps, tendu quand il repart devant. Quand il mord, ses avant-bras se
+        // referment en plus vers l'intérieur, autour de nous (charnière au bord intérieur).
+        let reach = (a.arms / 1.25).clamp(0.0, 1.0);
+        let ahead = 0.5 - 0.5 * a.walk.sin() * sign;
+        let flex_stand = ELBOW_REST + ELBOW_REACH * reach + ELBOW_WALK * a.swing * ahead * loose;
+        let flex_lie = 0.55 - 0.45 * a.walk.sin() * sign * a.swing;
+        let flex = lerp(flex_stand, flex_lie, c);
+        let inward = GRAB_BEND * a.grab * (1.0 - c);
+        let inner = if sign < 0.0 { hi[0] } else { lo[0] };
+        let corner = Vec3::new(inner, (lo[1] + hi[1]) / 2.0, hi[2]);
+        lower[i] = Some(
+            xf * Mat4::from_translation(corner)
+                * Mat4::from_rotation_x(flex)
+                * Mat4::from_rotation_z(-sign * inward)
+                * Mat4::from_translation(-corner)
+                * narrow,
+        );
+        bend[i] = flex.max(inward);
     }
     // Tête : elle se redresse d'autant que le buste penche, puis regarde où elle veut.
     let (lo, hi) = tall(HEAD);
+    // (v290) Le lacet après avoir défait la penche du buste (avant : dans le repère du buste,
+    // où, plié sur nous, « tourner la tête » la faisait rouler sur le côté ; elle ne tournait
+    // alors jamais en mordant) : la tête se tourne vers le membre qu'il mord.
     let xf = torso
         * Mat4::from_translation(Vec3::new(0.0, r.body_h * TALL, 0.0))
+        * Mat4::from_rotation_x(pitch)
         * Mat4::from_rotation_y(-a.head_yaw)
-        * Mat4::from_rotation_x(pitch + a.head_pitch)
+        * Mat4::from_rotation_x(a.head_pitch)
         * Mat4::from_rotation_z(a.head_roll);
     out[HEAD] = (xf, lo, hi);
-    out
+    Limbs {
+        parts: out,
+        lower,
+        bend,
+    }
 }
 
 /// Le cube `c` de la tête (grille 8 × 16 × 8) est dans le creux de la bouche, ouverte de
@@ -473,7 +663,10 @@ fn emit_part(
     light: [f32; 3],
     flesh: &Flesh,
     open: f32,
+    rows: std::ops::Range<usize>,
 ) {
+    // (v290) `rows` : les rangées de cubes (de bas en haut) dessinées dans ce repère ; un
+    // membre plié est dessiné en deux fois, le bas dans son repère à lui.
     // Les six côtés d'un cube : (axe, sens), dans l'ordre des faces de `skin`.
     const SIDES: [(usize, i32); 6] = [(2, -1), (2, 1), (0, 1), (0, -1), (1, 1), (1, -1)];
     let (lo, hi) = (Vec3::from(min), Vec3::from(max));
@@ -481,7 +674,7 @@ fn emit_part(
     let lit = EntityVertex::light(light, true);
     let hollow = |c: [usize; 3]| part == HEAD && mouth(c, dims, open);
     for z in 0..dims[2] {
-        for y in 0..dims[1] {
+        for y in rows.clone() {
             for x in 0..dims[0] {
                 let c = [x, y, z];
                 if flesh.gone(part, dims, c) || hollow(c) {
@@ -605,7 +798,7 @@ pub fn top_of(crawl: f32) -> f32 {
         ..Anim::default()
     };
     let mut top = 0.0f32;
-    for (xf, lo, hi) in parts(Vec3::ZERO, 0.0, &a) {
+    for (_, xf, lo, hi) in segments(Vec3::ZERO, 0.0, &a) {
         for k in 0..8 {
             let c = Vec3::new(
                 if k & 1 == 0 { lo[0] } else { hi[0] },
@@ -792,6 +985,9 @@ pub struct Prey {
     /// moment (un bras qui se balance bouge) : « il se penche jusqu'à la hauteur où il mord »
     /// et « suit le mouvement du bras, sa hauteur aussi, en le mangeant ».
     pub spot: Option<Vec3>,
+    /// (v290) Le milieu du membre (ou du buste) où est cet endroit : « il tourne la tête vers
+    /// le centre du membre attaqué ».
+    pub limb: Option<Vec3>,
 }
 
 /// Ce qui vient de se passer, pour la partie (sons, blessures).
@@ -867,6 +1063,8 @@ pub struct Evide {
     rng: u32,
     /// Essais : figé dans cette posture (aucun mouvement, aucune pensée).
     frozen: bool,
+    /// (v290) Essais : il va et vient autour de ce point (voir `update`).
+    shuttle: Option<Vec3>,
 }
 
 impl Evide {
@@ -907,6 +1105,7 @@ impl Evide {
             age: 0.0,
             rng: seed.wrapping_mul(0x9e37_79b9) | 1,
             frozen: false,
+            shuttle: None,
         };
         e.voice = 2.0 + 4.0 * e.unit();
         e
@@ -920,6 +1119,16 @@ impl Evide {
         match pose {
             "court" => {
                 (a.walk, a.swing, a.hunch, a.arms, a.mouth) = (1.2, 0.9, 0.38, 1.25, 0.35);
+            }
+            // (v290) « bas25 », « bas50 »… : baissé d'autant (pour cent), en marchant.
+            low if low.starts_with("bas") => {
+                let c = low[3..].parse::<f32>().unwrap_or(50.0).clamp(0.0, 100.0) / 100.0;
+                (a.walk, a.swing, a.crawl, a.mouth) = (1.2, 0.8, c, 0.35);
+                e.tall = lerp(HEIGHT, CRAWL_H, c);
+            }
+            "navette" => {
+                (a.swing, a.hunch, a.arms, a.mouth) = (0.9, 0.38, 1.25, 0.35);
+                e.shuttle = Some(pos);
             }
             "rampe" => {
                 (a.walk, a.swing, a.crawl, a.mouth) = (1.2, 1.0, 1.0, 0.35);
@@ -956,12 +1165,19 @@ impl Evide {
         self.dying.is_some()
     }
 
+    /// (v290) Le milieu de son pavé `part` (monde), dans sa posture du moment : ce vers quoi
+    /// on tourne la tête en le mordant (« le centre du membre attaqué »).
+    pub fn part_point(&self, part: usize) -> Vec3 {
+        let (xf, lo, hi) = parts(self.pos, self.yaw, &self.anim)[part.min(PARTS - 1)];
+        xf.transform_point3((Vec3::from(lo) + Vec3::from(hi)) / 2.0)
+    }
+
     /// Son cou (à peu près) : d'où il regarde, vers où il se penche.
     fn neck(&self) -> Vec3 {
         let r = crate::player_model::rig();
         let c = self.anim.crawl;
         let pitch = lerp(self.anim.hunch, FRAC_PI_2, c);
-        let hip = lerp(r.leg * TALL * r.px, CRAWL_HIP, c);
+        let hip = lerp(r.leg * TALL * r.px, CRAWL_HIP, c) - step_drop(&self.anim) * r.px;
         let len = r.body_h * TALL * r.px;
         self.pos
             + Vec3::Y * (hip + len * pitch.cos())
@@ -972,8 +1188,11 @@ impl Evide {
     /// de lui qu'on vise pour le manger, là où il est maintenant.
     pub fn cell_point(&self, part: usize, cell: [usize; 3]) -> Vec3 {
         let part = part.min(PARTS - 1);
-        let (xf, lo, hi) = parts(self.pos, self.yaw, &self.anim)[part];
+        let l = limbs(self.pos, self.yaw, &self.anim);
+        let (xf, lo, hi) = l.parts[part];
         let d = grids()[part];
+        // (v290) Sous le genou ou le coude : dans le repère du bas du membre.
+        let xf = l.lower[part].filter(|_| cell[1] < d[1] / 2).unwrap_or(xf);
         let (lo, hi) = (Vec3::from(lo), Vec3::from(hi));
         let t = Vec3::new(
             (cell[0] as f32 + 0.5) / d[0] as f32,
@@ -1069,6 +1288,14 @@ impl Evide {
             return events;
         }
         let here = ChunkPos::containing(self.pos.x.floor() as i32, self.pos.z.floor() as i32);
+        // (v290) Essais (posture « navette ») : figé, il va et vient de côté en marchant, à la
+        // vitesse d'une course (captures de la rémanence, caméra immobile).
+        if let (true, Some(from)) = (self.frozen && dt > 0.0, self.shuttle) {
+            self.age += dt;
+            let side = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
+            self.pos = from + side * (3.0 * (self.age * 1.6).sin());
+            self.anim.walk += dt * 9.0;
+        }
         if self.frozen || dt <= 0.0 || !world.contains(here) {
             return events;
         }
@@ -1134,6 +1361,10 @@ impl Evide {
                     }
                     shuffle = Some(if self.crawling {
                         ((flat.length() - CRAWL_HOLD) * 3.0).clamp(-0.6, sneak)
+                    } else if self.feed % BITE_S >= BITE_BACK {
+                        // (v290) Redressé entre deux morsures : il reste où il est (sa bouche
+                        // n'est plus sur nous, il ne court pas après).
+                        0.0
                     } else {
                         let miss = spot - self.mouth_point();
                         (miss.dot(forward(self.yaw)) * 5.0).clamp(-2.0, 3.0)
@@ -1352,6 +1583,8 @@ impl Evide {
             Mode::Wander => 0.06 + 0.05 * (self.age * 1.1).sin(),
         };
         let mut spot = None;
+        let mut limb = None;
+        let mut holding = false;
         if let (true, Some(p)) = (feeding, prey) {
             if !self.aimed {
                 // Où mordre cette fois : la partie nous dira où c'est, image après image.
@@ -1391,8 +1624,16 @@ impl Evide {
                 -0.5 + 0.8 * (t - 1.3) / (BITE_S - 1.3)
             };
             let at = p.spot.unwrap_or(p.feet + Vec3::Y * 1.1);
-            spot = Some(at);
-            if !self.crawling {
+            // (v290) « … et revient à sa position initiale à la fin de la morsure, pareil pour
+            // le monstre » : la bouche refermée, il se redresse, lâche prise et nous regarde
+            // (`BITE_BACK`), avant de se pencher pour la morsure suivante.
+            let back = t >= BITE_BACK;
+            if !back {
+                spot = Some(at);
+                limb = p.limb;
+            }
+            if !self.crawling && !back {
+                holding = true;
                 // (v272) « Il se penche jusqu'à la hauteur où il mord » : son buste se plie
                 // aux hanches de ce qu'il manque à sa bouche pour être à la hauteur visée
                 // (un cran d'un pas de Newton : sa bouche descend d'environ 1,4 bloc par
@@ -1421,9 +1662,22 @@ impl Evide {
             let flat = Vec3::new(to.x, 0.0, to.z).length();
             look_yaw = turn(to.x.atan2(-to.z), self.yaw).clamp(-1.3, 1.3);
             look_pitch = to.y.atan2(flat.max(0.05)).clamp(-1.45, 0.9);
-            if spot.is_some() && !self.crawling {
-                // Debout, plié sur nous : le visage vers le bas, la bouche sur nous.
-                (look_yaw, look_pitch) = (0.0, BITE_PITCH);
+            if let Some(s) = spot {
+                // (v290) « Lui comme moi, la tête doit être tournée vers le centre du corps
+                // quand on mord », « vers le centre du membre attaqué » : son visage, depuis
+                // sa bouche, vers le milieu du membre qu'il mord ; si la partie ne le dit pas,
+                // vers le milieu de notre corps. (Avant : debout, le visage vers le sol, la
+                // bouche sur nous d'en haut.)
+                // (À la hauteur de l'endroit mordu, ramenée d'un tiers vers ce milieu : « il se
+                // penche à la bonne hauteur », le visage vers le membre et non le long de lui.)
+                let mid = limb.unwrap_or(Vec3::new(p.feet.x, (p.feet.y + p.eye.y) / 2.0, p.feet.z));
+                let aim = Vec3::new(mid.x, lerp(s.y, mid.y, BITE_INWARD), mid.z);
+                let to = aim - self.mouth_point();
+                let flat = Vec3::new(to.x, 0.0, to.z).length();
+                if flat > 0.02 {
+                    look_yaw = turn(to.x.atan2(-to.z), self.yaw).clamp(-1.3, 1.3);
+                }
+                look_pitch = to.y.atan2(flat.max(0.05)).clamp(BITE_PITCH, 0.9);
             }
         }
         self.look.0 = approach(self.look.0, look_yaw, dt * 8.0);
@@ -1444,7 +1698,7 @@ impl Evide {
         a.crawl = approach(a.crawl, stoop, dt / 0.3);
         a.hunch = approach(a.hunch, lean, dt * if feeding { 5.0 } else { 3.0 });
         a.arms = approach(a.arms, arms, dt * 5.0);
-        let grab = if feeding && !self.crawling { 1.0 } else { 0.0 };
+        let grab = if holding { 1.0 } else { 0.0 };
         a.grab = approach(a.grab, grab, dt * 4.0);
         a.mouth = approach(a.mouth, mouth, dt * if mouth < a.mouth { 22.0 } else { 5.0 });
         a.head_yaw = self.look.0;
@@ -1461,25 +1715,76 @@ impl Evide {
         events
     }
 
-    /// Son maillage, éclairé par `light`.
-    pub fn mesh(&self, light: [f32; 3]) -> Vec<EntityVertex> {
+    /// (v290) « Le monstre a de la rémanence, ça ne doit pas arriver » : son maillage ajouté
+    /// à `out` et, pour chaque sommet, sa place à l'image d'avant ajoutée à `prev`
+    /// (l'anticrénelage reprend alors son image d'avant là où il était, et pas là où il n'est
+    /// plus). `before` : les repères de ses pavés à l'image d'avant (ce que cette fonction a
+    /// rendu alors) ; `None` s'il n'était pas dessiné : immobile. Rend ses repères
+    /// d'aujourd'hui.
+    pub fn mesh_moved(
+        &self,
+        light: [f32; 3],
+        before: Option<&[Mat4]>,
+        out: &mut Vec<EntityVertex>,
+        prev: &mut Vec<[f32; 3]>,
+    ) -> Vec<Mat4> {
         let dims = grids();
-        let mut out = Vec::with_capacity(20_000);
-        for (i, (xf, lo, hi)) in parts(self.pos, self.yaw, &self.anim).into_iter().enumerate() {
-            emit_part(&mut out, xf, lo, hi, i, dims[i], light, &self.flesh, self.anim.mouth);
+        let l = limbs(self.pos, self.yaw, &self.anim);
+        let mut frames = Vec::with_capacity(2 * PARTS);
+        for (i, (xf, lo, hi)) in l.parts.into_iter().enumerate() {
+            // Deux morceaux rigides par pavé (deux repères rendus, même pour un pavé d'un
+            // seul morceau) : le haut d'un membre, puis son bas, sous le genou ou le coude.
+            let rows = dims[i][1];
+            let pieces = match l.lower[i] {
+                Some(low) => [(xf, rows / 2..rows), (low, 0..rows / 2)],
+                None => [(xf, 0..rows), (xf, 0..0)],
+            };
+            for (k, (m, rows)) in pieces.into_iter().enumerate() {
+                let from = out.len();
+                emit_part(out, m, lo, hi, i, dims[i], light, &self.flesh, self.anim.mouth, rows);
+                // Chaque morceau est rigide : d'où vient un de ses points = repère d'avant ×
+                // (repère d'aujourd'hui)⁻¹. En double précision : en simple, loin du centre
+                // du monde, un morceau immobile aurait un mouvement d'arrondi. Le même
+                // repère : la même place, au bit près.
+                let step = before
+                    .and_then(|b| b.get(2 * i + k))
+                    .filter(|b| **b != m)
+                    .map(|b| b.as_dmat4() * m.as_dmat4().inverse());
+                prev.extend(out[from..].iter().map(|v| match step {
+                    Some(m) => m
+                        .transform_point3(Vec3::from(v.pos).as_dvec3())
+                        .as_vec3()
+                        .to_array(),
+                    None => v.pos,
+                }));
+                frames.push(m);
+            }
         }
-        out
+        frames
     }
 
     /// Les pavés qui font son ombre.
     pub fn shadow_boxes(&self) -> Vec<ShadowBox> {
         let dims = grids();
-        parts(self.pos, self.yaw, &self.anim)
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| self.flesh.eaten_of(*i, dims[*i]) < 0.9)
-            .map(|(_, (xf, lo, hi))| ShadowBox::oriented(xf, Vec3::from(lo), Vec3::from(hi)))
-            .collect()
+        let l = limbs(self.pos, self.yaw, &self.anim);
+        let mut out = Vec::with_capacity(PARTS + 4);
+        for (i, (xf, lo, hi)) in l.parts.into_iter().enumerate() {
+            if self.flesh.eaten_of(i, dims[i]) >= 0.9 {
+                continue;
+            }
+            // (v290) Un membre plié fait deux pavés d'ombre ; presque droit, un seul.
+            match l.lower[i].filter(|_| l.bend[i] >= SHADOW_BEND) {
+                Some(low) => {
+                    let mid = (lo[1] + hi[1]) / 2.0;
+                    let top = Vec3::new(lo[0], mid, lo[2]);
+                    out.push(ShadowBox::oriented(xf, top, Vec3::from(hi)));
+                    let bottom = Vec3::new(hi[0], mid, hi[2]);
+                    out.push(ShadowBox::oriented(low, Vec3::from(lo), bottom));
+                }
+                None => out.push(ShadowBox::oriented(xf, Vec3::from(lo), Vec3::from(hi))),
+            }
+        }
+        out
     }
 
     /// Le pavé et le cube visés par ce rayon, à au plus `reach` blocs : (distance, pavé, cube).
@@ -1489,23 +1794,34 @@ impl Evide {
         }
         let dims = grids();
         let mut best: Option<(f32, usize, [usize; 3])> = None;
-        for (i, (xf, lo, hi)) in parts(self.pos, self.yaw, &self.anim).into_iter().enumerate() {
+        let l = limbs(self.pos, self.yaw, &self.anim);
+        // (v290) Morceau par morceau : le bas d'un membre plié là où il est.
+        for (i, xf, slo, shi) in segments(self.pos, self.yaw, &self.anim) {
             if self.flesh.eaten_of(i, dims[i]) >= 1.0 {
                 continue;
             }
             let inv = xf.inverse();
             let (o, d) = (inv.transform_point3(eye), inv.transform_vector3(dir));
-            let (lo, hi) = (Vec3::from(lo), Vec3::from(hi));
-            let Some(t) = ray_box(o, d, lo, hi) else {
+            let Some(t) = ray_box(o, d, Vec3::from(slo), Vec3::from(shi)) else {
                 continue;
             };
             if t > reach || best.is_some_and(|b| b.0 <= t) {
                 continue;
             }
+            // (Le cube : dans la grille du pavé entier.)
+            let (lo, hi) = (Vec3::from(l.parts[i].1), Vec3::from(l.parts[i].2));
             let p = (o + d * t - lo) / (hi - lo);
-            let cell = [0, 1, 2].map(|a| {
+            let mut cell = [0, 1, 2].map(|a| {
                 ((p[a] * dims[i][a] as f32).floor().max(0.0) as usize).min(dims[i][a] - 1)
             });
+            // (Une rangée du morceau touché : celles du bas sous le pli, celles du haut
+            // au-dessus.)
+            let half = dims[i][1] / 2;
+            if shi[1] < l.parts[i].2[1] {
+                cell[1] = cell[1].min(half.saturating_sub(1));
+            } else if slo[1] > l.parts[i].1[1] {
+                cell[1] = cell[1].max(half);
+            }
             best = Some((t, i, cell));
         }
         best
@@ -1520,12 +1836,19 @@ impl Evide {
         let dims = grids();
         self.flesh.bite_at(part, cell, OUR_BITE, &dims)?;
         self.flinch = 0.25;
-        let dead = self.flesh.eaten(&dims) >= EATEN_DEAD
-            || self.flesh.eaten_of(HEAD, dims[HEAD]) >= HEAD_DEAD;
+        let dead = self.health() == 0;
         if dead {
             self.dying = Some(0.0);
         }
         Some(dead)
+    }
+
+    /// (v290) Ce qu'il lui reste de vie (sur `LIFE`, la vie d'un joueur) : chacune de nos
+    /// bouchées lui en a retiré `OUR_BITE_HURTS` (elles sont enregistrées avec lui, rien ne
+    /// repousse).
+    pub fn health(&self) -> u8 {
+        let bites = self.flesh.bites().len().min(255) as u8;
+        LIFE.saturating_sub(OUR_BITE_HURTS.saturating_mul(bites))
     }
 }
 
@@ -1774,6 +2097,7 @@ mod tests {
             feet: at,
             eye: at + Vec3::Y * 1.62,
             spot: None,
+            limb: None,
         }
     }
 
@@ -1791,7 +2115,7 @@ mod tests {
     fn it_is_three_and_a_half_blocks_tall_and_crawls_one_block_high() {
         let size = |a: &Anim| {
             let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            for (xf, a, b) in parts(Vec3::ZERO, 0.0, a) {
+            for (_, xf, a, b) in segments(Vec3::ZERO, 0.0, a) {
                 for k in 0..8 {
                     let c = Vec3::new(
                         if k & 1 == 0 { a[0] } else { b[0] },
@@ -1941,7 +2265,7 @@ mod tests {
                 e.update(&w, 1.0 / 60.0, Some(p));
                 let mut top = 0.0f32;
                 let mut feet = f32::MAX;
-                for (xf, lo, hi) in parts(e.pos, e.yaw, &e.anim) {
+                for (_, xf, lo, hi) in segments(e.pos, e.yaw, &e.anim) {
                     for k in 0..8 {
                         let c = Vec3::new(
                             if k & 1 == 0 { lo[0] } else { hi[0] },
@@ -2040,17 +2364,23 @@ mod tests {
         let w = flat();
         let p = prey(Vec3::new(0.5, 11.0, -1.6));
         let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 9);
-        let events = run(&mut e, &w, 8.0, Some(p));
-        let bites = events
-            .iter()
-            .filter(|e| matches!(e, Event::Bites { low: false, .. }))
-            .count();
+        let mut events = Vec::new();
+        let mut bites = 0;
+        for _ in 0..(8 * 60) {
+            for ev in e.update(&w, 1.0 / 60.0, Some(p)) {
+                if let Event::Bites { low: false, at, .. } = ev {
+                    bites += 1;
+                    // Au moment où sa bouche se referme : plié sur nous, ses bras autour de
+                    // nous ; sans endroit précis, il vise notre poitrine : sa bouche y est.
+                    assert!(e.anim.hunch > 0.8 && e.anim.grab > 0.9, "{:?}", e.anim);
+                    let miss = at.distance(p.feet + Vec3::Y * 1.1);
+                    assert!(miss < 0.2, "sa bouche à {miss} de notre poitrine");
+                }
+                events.push(ev);
+            }
+        }
         assert!((3..=5).contains(&bites), "{bites} morsures en 8 s");
         assert!(events.iter().any(|e| matches!(e, Event::Voice(_))));
-        assert!(e.anim.hunch > 0.8 && e.anim.grab > 0.9, "{:?}", e.anim);
-        // Sans endroit précis, il vise notre poitrine : sa bouche y est.
-        let miss = e.mouth_point().distance(p.feet + Vec3::Y * 1.1);
-        assert!(miss < 0.2, "sa bouche à {miss} de notre poitrine");
         assert_eq!(
             events.iter().filter(|e| matches!(e, Event::Aims { low: false, .. })).count(),
             bites + 1,
@@ -2061,6 +2391,8 @@ mod tests {
         let dims = grids();
         let mut eaten = 0.0;
         let mut dead = false;
+        let mut bites = 0;
+        assert_eq!(e.health(), crate::save::MAX_HEALTH, "autant de vie qu'un joueur");
         for n in 0..400 {
             // On vise le milieu de chacun de ses pavés, tour à tour.
             let (xf, lo, hi) = parts(e.pos, e.yaw, &e.anim)[n % PARTS];
@@ -2075,12 +2407,15 @@ mod tests {
                 assert!(now > eaten, "bouchée {n} : rien de plus");
                 eaten = now;
                 dead = d;
+                bites += 1;
+                assert_eq!(e.health(), LIFE.saturating_sub(OUR_BITE_HURTS * bites));
                 if dead {
                     break;
                 }
             }
         }
-        assert!(dead && eaten >= 0.3, "mangé à {eaten}");
+        // (v290) « On le tue en 5 morsures. »
+        assert!(dead && bites == 5, "{bites} bouchées, mangé à {eaten}");
         assert!(e.aimed(eye, Vec3::NEG_Z, 6.0).is_none());
         run(&mut e, &w, 1.0, Some(p));
         assert!(e.is_dead());
@@ -2193,6 +2528,144 @@ mod tests {
         img.save(path).unwrap();
     }
 
+    /// (v290) Genoux et coudes : debout, baissé à toute hauteur et à plat ventre, ses pieds
+    /// touchent le sol (ni dessous, ni en l'air quand il ne marche pas) ; ses genoux plient
+    /// quand il se baisse, ses coudes au repos ; à plat ventre, ses jambes sont allongées.
+    #[test]
+    fn its_knees_and_elbows_bend_and_its_feet_stay_on_the_ground() {
+        let feet = |a: &Anim| {
+            segments(Vec3::ZERO, 0.0, a)
+                .into_iter()
+                .filter(|s| s.0 == LEG_L || s.0 == LEG_R)
+                .map(|(i, xf, lo, hi)| {
+                    let mut low = f32::MAX;
+                    for k in 0..8 {
+                        let c = Vec3::new(
+                            if k & 1 == 0 { lo[0] } else { hi[0] },
+                            if k & 2 == 0 { lo[1] } else { hi[1] },
+                            if k & 4 == 0 { lo[2] } else { hi[2] },
+                        );
+                        low = low.min(xf.transform_point3(c).y);
+                    }
+                    (i, low)
+                })
+                .fold([f32::MAX; 2], |mut m, (i, y)| {
+                    m[i] = m[i].min(y);
+                    m
+                })
+        };
+        for i in 0..=20 {
+            let crawl = i as f32 / 20.0;
+            let still = Anim {
+                crawl,
+                hunch: 0.18,
+                ..Anim::default()
+            };
+            let low = feet(&still);
+            // (Au tout début de la descente, entre ses deux façons de marcher, un pied peut
+            // quitter le sol de quelques centimètres : jamais dessous.)
+            for y in low {
+                assert!(y > -0.02 && (i == 1 || y < 0.03), "baissé de {crawl} : un pied à {y}");
+            }
+            let l = limbs(Vec3::ZERO, 0.0, &still);
+            let knee = l.bend[LEG_L];
+            match i {
+                0 => assert!(knee == 0.0, "debout : genou plié de {knee}"),
+                4..=12 => assert!(knee > 0.6, "baissé de {crawl} : genou plié de {knee}"),
+                20 => assert!(knee < 0.05, "à plat ventre : genou plié de {knee}"),
+                _ => {}
+            }
+            assert!(l.bend[ARM_L] > 0.2, "baissé de {crawl} : coude plié de {}", l.bend[ARM_L]);
+            // En marchant : jamais sous le sol, et jamais les deux pieds en l'air.
+            for k in 0..16 {
+                let walking = Anim {
+                    walk: k as f32 * TAU / 16.0,
+                    swing: 0.9,
+                    ..still
+                };
+                let low = feet(&walking);
+                assert!(low[0].min(low[1]) > -0.02, "baissé de {crawl}, pas {k} : {low:?}");
+                assert!(low[0].min(low[1]) < 0.12, "baissé de {crawl}, pas {k} : {low:?}");
+            }
+        }
+        // Debout, la jambe qui avance plie le genou ; celle qui recule reste tendue.
+        let step = Anim {
+            walk: 0.0,
+            swing: 1.0,
+            ..Anim::default()
+        };
+        let l = limbs(Vec3::ZERO, 0.0, &step);
+        assert!(l.bend[LEG_L] > 0.5 && l.bend[LEG_R] == 0.0, "{:?}", l.bend);
+    }
+
+    /// (v290) Planche de ses postures vues de côté (genoux et coudes) : debout, en marchant,
+    /// baissé d'un quart, de moitié, des trois quarts, à plat ventre, penché sur nous pour
+    /// mordre. Écrite dans le fichier nommé par MINELIB_IRM (essai à lancer à la main).
+    #[test]
+    #[ignore]
+    fn postures_seen_from_the_side() {
+        let Ok(path) = std::env::var("MINELIB_IRM") else {
+            return;
+        };
+        let pose = |walk: f32, swing: f32, crawl: f32| Anim {
+            walk,
+            swing,
+            crawl,
+            hunch: 0.18,
+            ..Anim::default()
+        };
+        let poses = [
+            pose(0.0, 0.0, 0.0),
+            pose(0.0, 0.9, 0.0),
+            pose(1.57, 0.9, 0.0),
+            pose(1.2, 0.8, 0.25),
+            pose(1.2, 0.8, 0.5),
+            pose(4.3, 0.8, 0.5),
+            pose(1.2, 0.8, 0.75),
+            pose(1.2, 0.8, 1.0),
+            Anim {
+                hunch: 1.6,
+                arms: 0.5,
+                grab: 1.0,
+                mouth: 1.0,
+                ..Anim::default()
+            },
+            Anim {
+                hunch: 0.38,
+                arms: 1.25,
+                walk: 1.57,
+                swing: 0.9,
+                ..Anim::default()
+            },
+        ];
+        let size = 384u32;
+        let mut img = image::RgbImage::from_pixel(size * poses.len() as u32, size * 2, image::Rgb([40, 44, 52]));
+        for (n, a) in poses.iter().enumerate() {
+            let mut e = Evide::new(Vec3::new(3.0, 70.0, -5.0), 0.0, 7);
+            e.anim = a.clone();
+            let (mut mesh, mut prev) = (Vec::new(), Vec::new());
+            e.mesh_moved([1.0; 3], None, &mut mesh, &mut prev);
+            for (v, angle) in [(0u32, -1.57f32), (1, -0.6)] {
+                let target = e.pos + Vec3::new(0.0, 1.6, 0.6);
+                let eye = target + Vec3::new(angle.sin(), 0.05, -angle.cos()) * 6.2;
+                let proj = Mat4::perspective_infinite_reverse_rh(48f32.to_radians(), 1.0, 0.05);
+                let vp = proj * Mat4::look_at_rh(eye, target, Vec3::Y);
+                let Some([shot, _]) = minelib_render::draw_offscreen(vp, size, &mesh, &[], &[], &[]) else {
+                    eprintln!("pas de carte graphique : essai sauté");
+                    return;
+                };
+                for (i, px) in shot.iter().enumerate() {
+                    if px[3] < 0.5 {
+                        continue;
+                    }
+                    let (x, y) = (i as u32 % size, i as u32 / size);
+                    img.put_pixel(n as u32 * size + x, v * size + y, image::Rgb([225, 222, 210]));
+                }
+            }
+        }
+        img.save(path).unwrap();
+    }
+
     /// (v272) « Il se penche jusqu'à la hauteur où il mord » et « suit le mouvement du bras,
     /// sa hauteur aussi » : sa bouche vient sur l'endroit visé, d'une jambe à une épaule, et
     /// y reste quand cet endroit se balance.
@@ -2203,40 +2676,81 @@ mod tests {
         for (side, height) in [(0.1f32, 0.55f32), (0.36, 0.95), (-0.36, 1.3), (0.0, 1.55)] {
             let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 9);
             let spot = feet + Vec3::new(side, height, 0.0);
+            // (v290) Le milieu du membre : 0,12 bloc derrière l'endroit mordu (il est sur le
+            // devant du membre), un peu plus haut.
+            let limb = spot + Vec3::new(0.0, 0.12, -0.12);
             let p = Prey {
                 spot: Some(spot),
+                limb: Some(limb),
                 ..prey(feet)
             };
-            run(&mut e, &w, 4.0, Some(p));
-            let miss = e.mouth_point().distance(spot);
-            assert!(miss < 0.15, "hauteur {height} : sa bouche à {miss}");
-            // Plus c'est bas, plus il se plie (au-delà de l'horizontale pour une jambe).
-            assert!(e.anim.hunch > 2.9 - 1.1 * height, "hauteur {height} : {}", e.anim.hunch);
-            // Ses mains ne passent pas sous le sol.
-            let low = parts(e.pos, e.yaw, &e.anim)[ARM_L..=ARM_R]
-                .iter()
-                .map(|(xf, lo, _)| xf.transform_point3(Vec3::new(0.0, lo[1], 0.0)).y)
-                .fold(f32::MAX, f32::min);
+            // (v290) Il se redresse entre deux morsures : on regarde au moment où sa bouche
+            // se referme, et entre deux.
+            let (mut bites, mut low, mut straight) = (0, f32::MAX, f32::MAX);
+            for _ in 0..(7 * 60) {
+                let events = e.update(&w, 1.0 / 60.0, Some(p));
+                for ev in events {
+                    let Event::Bites { at, .. } = ev else {
+                        continue;
+                    };
+                    bites += 1;
+                    let miss = at.distance(spot);
+                    assert!(miss < 0.2, "hauteur {height} : sa bouche à {miss}");
+                    // Plus c'est bas, plus il se plie (au-delà de l'horizontale pour une
+                    // jambe).
+                    let hunch = e.anim.hunch;
+                    assert!(hunch > 2.9 - 1.1 * height, "hauteur {height} : {hunch}");
+                    // « La tête tournée vers le centre du membre attaqué » : son visage (le
+                    // devant de sa tête, −z) regarde vers le membre (devant lui, à peu près à
+                    // l'horizontale), et non plus vers le sol.
+                    let (xf, _, _) = parts(e.pos, e.yaw, &e.anim)[HEAD];
+                    let face = xf.transform_vector3(Vec3::NEG_Z).normalize();
+                    let to = (limb - at).normalize();
+                    assert!(face.dot(to) > 0.6, "hauteur {height} : visage à {}", face.dot(to));
+                    assert!(face.y > -0.6, "hauteur {height} : le visage vers le sol ({})", face.y);
+                    // « Il revient à sa position initiale à la fin de la morsure » : depuis
+                    // la morsure d'avant, il s'est redressé.
+                    assert!(
+                        bites == 1 || straight < 0.5,
+                        "hauteur {height} : resté plié de {straight} entre deux morsures"
+                    );
+                    straight = f32::MAX;
+                }
+                if bites > 0 {
+                    straight = straight.min(e.anim.hunch);
+                }
+                // Ses mains ne passent pas sous le sol.
+                low = segments(e.pos, e.yaw, &e.anim)
+                    .iter()
+                    .filter(|s| s.0 == ARM_L || s.0 == ARM_R)
+                    .map(|(_, xf, lo, _)| xf.transform_point3(Vec3::new(0.0, lo[1], 0.0)).y)
+                    .fold(low, f32::min);
+            }
+            assert!(bites >= 3, "hauteur {height} : {bites} morsures en 7 s");
             assert!(low > 10.95, "hauteur {height} : une main à {low}");
         }
         // Un bras qui se balance : 0,25 bloc d'avant en arrière et 0,15 de haut en bas, une
-        // fois et demie par seconde.
+        // fois et demie par seconde. Sa bouche le suit : elle se referme dessus (à moins de
+        // `TOUCH`, sinon elle mord dans le vide) presque à chaque fois.
         let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 9);
-        let mut worst = 0.0f32;
-        for i in 0..(8 * 60) {
+        let mut bites = 0;
+        for i in 0..(10 * 60) {
             let t = i as f32 / 60.0;
             let swing = (t * 1.5 * TAU).sin();
             let spot = feet + Vec3::new(0.36, 1.0 + 0.15 * swing.abs(), 0.25 * swing);
             let p = Prey {
                 spot: Some(spot),
+                limb: Some(feet + Vec3::new(0.3, 1.1, 0.0)),
                 ..prey(feet)
             };
-            e.update(&w, 1.0 / 60.0, Some(p));
-            if t > 3.0 {
-                worst = worst.max(e.mouth_point().distance(spot));
+            for ev in e.update(&w, 1.0 / 60.0, Some(p)) {
+                if let Event::Bites { at, .. } = ev {
+                    assert!(at.distance(spot) <= TOUCH);
+                    bites += 1;
+                }
             }
         }
-        assert!(worst < 0.3, "sa bouche s'écarte du bras jusqu'à {worst}");
+        assert!(bites >= 4, "{bites} morsures en 10 s sur un bras qui bouge");
     }
 
     /// (v272) Un mur entre lui et nous : il en fait le tour par le chemin le plus court au

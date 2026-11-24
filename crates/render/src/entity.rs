@@ -45,6 +45,8 @@ impl EntityVertex {
 
 /// Au plus tant de sommets d'entités par image.
 const MAX_VERTICES: usize = 1_048_576;
+/// (v290) Sommets au plus des entités qui disent leur mouvement (L'Évidé : 20 000 environ).
+const MAX_MOVED: usize = 262_144;
 
 /// (v172) Sommet du modèle des autres joueurs (envoyé une fois) : position en pixels dans le
 /// repère de sa partie, coordonnées dans l'image du skin (0..1), partie (0 jambe gauche,
@@ -149,7 +151,7 @@ const PLAYER_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
 pub const MAX_PLAYERS: usize = 8192;
 pub const PLAYER_SKINS: u32 = 64;
 
-/// Sommets au plus du modèle commun (sept pavés : 252).
+/// Sommets au plus du modèle commun (onze pavés depuis la v290 : 348).
 const MESH_MAX: usize = 512;
 /// (v220) Cases au plus de l'atlas des joueurs à une image, et place des uniformes de
 /// chacune (alignement des décalages dynamiques).
@@ -759,6 +761,9 @@ pub(crate) struct EntityPipes {
     /// Avec : dans la passe des opaques (albédo et surface pour l'éclairage différé).
     taa: wgpu::RenderPipeline,
     taa_world: wgpu::RenderPipeline,
+    /// (v290) Entités qui disent leur mouvement (leur place à l'image d'avant, sommet par
+    /// sommet, dans un deuxième tampon).
+    taa_moved: wgpu::RenderPipeline,
 }
 
 impl EntityPipes {
@@ -784,19 +789,31 @@ impl EntityPipes {
             3 => Sint32,
             4 => Unorm8x4
         ];
+        // (v290) Deuxième tampon des entités qui disent leur mouvement : la place de chaque
+        // sommet à l'image d'avant.
+        const PREV_ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![5 => Float32x3];
+        let buffers = [
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<EntityVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &ATTRS,
+            },
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<[f32; 3]>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &PREV_ATTRS,
+            },
+        ];
         let pipeline = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
+            let moved = entry == "fs_taa_moved";
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(if moved { "vs_moved" } else { "vs_main" }),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<EntityVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &ATTRS,
-                    }],
+                    buffers: if moved { &buffers } else { &buffers[..1] },
                 },
                 primitive: wgpu::PrimitiveState {
                     cull_mode: None,
@@ -837,6 +854,7 @@ impl EntityPipes {
             plain: pipeline("entités", "fs_main", &[target(surface)]),
             taa: pipeline("entités (TAA)", "fs_taa", &taa_targets),
             taa_world: pipeline("entités fixes (TAA)", "fs_taa_world", &taa_targets),
+            taa_moved: pipeline("entités qui bougent (TAA)", "fs_taa_moved", &taa_targets),
         }
     }
 }
@@ -853,6 +871,10 @@ pub struct Entities {
     mirror_extra: u32,
     /// Premiers sommets qui suivent la caméra (modèle du joueur local).
     follow: u32,
+    /// (v290) Les derniers sommets (avant `mirror_extra`) disent leur mouvement : leur place
+    /// à l'image d'avant, dans `prev_buffer` (le premier d'entre eux en tête).
+    moved: u32,
+    prev_buffer: wgpu::Buffer,
     /// Entités fixes qui changent rarement (têtes et cadres des cartes) : gardées sur la
     /// carte graphique, renvoyées seulement quand leur version change.
     statics: std::collections::HashMap<u64, (wgpu::Buffer, u32, u64)>,
@@ -874,6 +896,12 @@ impl Entities {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let prev_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("entités (places à l'image d'avant)"),
+            size: (MAX_MOVED * std::mem::size_of::<[f32; 3]>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             pipes,
             players,
@@ -881,6 +909,8 @@ impl Entities {
             count: 0,
             mirror_extra: 0,
             follow: 0,
+            moved: 0,
+            prev_buffer,
             statics: std::collections::HashMap::new(),
             static_draw: Vec::new(),
         }
@@ -982,13 +1012,29 @@ impl Entities {
     }
 
     /// `follow` : les premiers sommets suivent la caméra (modèle du joueur local), les
-    /// autres sont fixés dans le monde.
-    pub fn prepare(&mut self, queue: &wgpu::Queue, vertices: &[EntityVertex], follow: usize) {
+    /// autres sont fixés dans le monde. (v290) `moved` : la place à l'image d'avant des
+    /// derniers sommets, un par sommet, dans leur ordre ; ceux-là disent leur mouvement.
+    pub fn prepare(
+        &mut self,
+        queue: &wgpu::Queue,
+        vertices: &[EntityVertex],
+        follow: usize,
+        moved: &[[f32; 3]],
+    ) {
         let n = vertices.len().min(MAX_VERTICES) / 3 * 3;
         self.count = n as u32;
         self.follow = (follow.min(n) / 3 * 3) as u32;
+        // Seulement si la liste est entière (sinon ses derniers sommets ne sont plus ceux-là)
+        // et par triangles entiers ; au-delà de `MAX_MOVED`, fixés dans le monde comme avant.
+        let m = moved.len();
+        let fits = n == vertices.len() && m % 3 == 0 && m <= MAX_MOVED;
+        self.moved = if fits { m.min(n - self.follow as usize) as u32 } else { 0 };
         if n > 0 {
             queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&vertices[..n]));
+        }
+        if self.moved > 0 {
+            let from = m - self.moved as usize;
+            queue.write_buffer(&self.prev_buffer, 0, bytemuck::cast_slice(&moved[from..]));
         }
     }
 
@@ -1112,9 +1158,19 @@ impl Entities {
             pass.set_pipeline(&p.taa);
             pass.draw(0..self.follow, 0..1);
         }
-        if self.count > self.follow {
+        let fixed_end = self.count - self.moved;
+        if fixed_end > self.follow {
             pass.set_pipeline(&p.taa_world);
-            pass.draw(self.follow..self.count, 0..1);
+            pass.draw(self.follow..fixed_end, 0..1);
+        }
+        if self.moved > 0 {
+            // (v290) Les derniers : avec leur place à l'image d'avant (deuxième tampon, qui
+            // commence au premier d'entre eux).
+            let stride = std::mem::size_of::<EntityVertex>() as u64;
+            pass.set_pipeline(&p.taa_moved);
+            pass.set_vertex_buffer(0, self.buffer.slice(u64::from(fixed_end) * stride..));
+            pass.set_vertex_buffer(1, self.prev_buffer.slice(..));
+            pass.draw(0..self.moved, 0..1);
         }
     }
 }

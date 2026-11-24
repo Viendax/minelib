@@ -484,6 +484,12 @@ impl Hand {
         self.dip = len;
     }
 
+    /// (v290) Un geste est en cours (arc en frappant ou en posant, coup vers le bas en
+    /// cassant) : la main vide, qui pend le long du corps, se tend le temps du geste.
+    pub fn busy(&self) -> bool {
+        self.swing > 0.0 || self.dip > 0.0 || self.dig_next.is_some()
+    }
+
     /// (v220) Coup vers le bas en cours, de 0 (rien) à 1 (au plus bas) : descente rapide
     /// (le premier tiers), remontée un peu plus douce.
     fn dip_amount(&self) -> f32 {

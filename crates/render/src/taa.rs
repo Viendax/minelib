@@ -198,6 +198,20 @@ fn world_pipeline(
     motion_writes: wgpu::ColorWrites,
     extra: Option<Extra>,
 ) -> wgpu::RenderPipeline {
+    // (v290) Translucides (`Extra::Water`) : leur mouvement est mêlé à celui de ce qui est
+    // derrière, à la part que donne le shader (`translucent_out` de world.wgsl : rien quand
+    // la face est immobile à l'écran, pour ne pas effacer celui d'un mob qui passe derrière).
+    // (Pas le contour du bloc visé, qui n'écrit pas de mouvement et n'en sort que deux
+    // composantes.)
+    let mixed = matches!(extra, Some(Extra::Water(_))) && !motion_writes.is_empty();
+    let motion_blend = mixed.then_some(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent::REPLACE,
+    });
     let mut targets = vec![
         Some(wgpu::ColorTargetState {
             format: COLOR_FORMAT,
@@ -206,7 +220,7 @@ fn world_pipeline(
         }),
         Some(wgpu::ColorTargetState {
             format: MOTION_FORMAT,
-            blend: None,
+            blend: motion_blend,
             write_mask: motion_writes,
         }),
     ];
@@ -319,7 +333,8 @@ pub(crate) fn build_heavy(
 
 /// Translucides (eau, glace, verre teinté) : couleur mélangée. (v268) Leur mouvement remplace
 /// celui de ce qui est derrière (`translucent_out` de world.wgsl : avant, il était gardé, et un
-/// amas de verre devant le ciel s'étalait en se déplaçant). (v199) Ils laissent aussi leur face
+/// amas de verre devant le ciel s'étalait en se déplaçant). (v290) Sauf quand la face est
+/// immobile à l'écran : celui de derrière reste (un mob derrière une vitre traînait). (v199) Ils laissent aussi leur face
 /// (profondeur, albédo, normale, poids) : les lumières dynamiques y sont ajoutées après coup,
 /// comme sur l'opaque.
 fn translucent_pipeline(

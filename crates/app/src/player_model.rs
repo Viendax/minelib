@@ -243,7 +243,9 @@ fn box_faces(
 
 /// Pavé `[min, max]` (pixels, repère du modèle : x droite, y haut, z arrière) transformé
 /// par `xf` (pixels → monde), découpé en pixels colorés.
-/// (v225) `zone` : pixels du skin du pavé (`ZONES`), étirés à sa taille.
+/// (v225) `zone` : pixels du skin du pavé (`ZONES`), étirés à sa taille. (v290) Pour les
+/// essais : le corps est dessiné par segments (`emit_box_faces`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn emit_box(
     out: &mut Vec<EntityVertex>,
@@ -275,6 +277,25 @@ fn emit_box_layer(
     layer: Option<bool>,
     lod: usize,
 ) {
+    emit_box_faces(out, xf, min, max, zone, part, light, tex, layer, lod, 0);
+}
+
+/// (v290) `emit_box_layer` sans les faces de `hide` (bit k : face k de `box_faces`) : la
+/// coupe d'un membre, cachée entre ses deux moitiés.
+#[allow(clippy::too_many_arguments)]
+fn emit_box_faces(
+    out: &mut Vec<EntityVertex>,
+    xf: Mat4,
+    min: [f32; 3],
+    max: [f32; 3],
+    zone: Option<Zone>,
+    part: Part,
+    light: [f32; 3],
+    tex: Option<(&crate::skin::Skin, usize)>,
+    layer: Option<bool>,
+    lod: usize,
+    hide: u8,
+) {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
     let lit = EntityVertex::light(light, true);
@@ -291,6 +312,9 @@ fn emit_box_layer(
     let faces = box_faces(min, max, [w, h, d]);
     let step = Vec3::from(k);
     for (k, (face, o, du, dv, nu, nv)) in faces.into_iter().enumerate() {
+        if hide >> k & 1 == 1 {
+            continue;
+        }
         let (o, du, dv) = (Vec3::from(o), Vec3::from(du) * step, Vec3::from(dv) * step);
         let p = |u: f32, v: f32| xf.transform_point3(o + du * u + dv * v);
         // Ombrage selon l'orientation de la face dans le monde.
@@ -370,6 +394,14 @@ pub fn mouth_point(pose: &Pose) -> Vec3 {
     xf.transform_point3(Vec3::new(0.0, lo[1] + 0.22 * (hi[1] - lo[1]), lo[2]))
 }
 
+/// (v290) Le milieu du pavé `part` du modèle dans cette pose (monde) : « le centre du membre
+/// attaqué », vers lequel L'Évidé tourne la tête en mordant.
+pub fn part_point(pose: &Pose, part: usize) -> Vec3 {
+    let all = parts(pose);
+    let (xf, lo, hi, _) = all[part.min(all.len() - 1)];
+    xf.transform_point3((Vec3::from(lo) + Vec3::from(hi)) / 2.0)
+}
+
 /// (v272) Plié au plus de tant (rad) pour manger.
 pub const BOW_MAX: f32 = 1.9;
 
@@ -413,6 +445,10 @@ pub fn cell_point(pose: &Pose, part: usize, cell: [usize; 3]) -> Vec3 {
     let part = part.min(all.len() - 1);
     let (xf, lo, hi, _) = all[part];
     let d = ZONES[part].size;
+    // (v290) Sous le genou ou le coude : dans le repère du bas du membre.
+    let xf = lowers(pose, &all)[part]
+        .filter(|_| cell[1] < d[1] / 2)
+        .map_or(xf, |(low, _)| low);
     let (lo, hi) = (Vec3::from(lo), Vec3::from(hi));
     let t = Vec3::new(
         (cell[0] as f32 + 0.5) / d[0] as f32,
@@ -464,6 +500,7 @@ pub fn flesh_grids() -> [[usize; 3]; crate::flesh::PARTS] {
 fn emit_flesh(
     out: &mut Vec<EntityVertex>,
     xf: Mat4,
+    below: Option<Mat4>,
     min: [f32; 3],
     max: [f32; 3],
     index: usize,
@@ -503,6 +540,9 @@ fn emit_flesh(
                 if flesh.gone(index, dims, c) {
                     continue;
                 }
+                // (v290) La moitié du bas d'un membre (sous le genou, sous le coude) suit
+                // son pli.
+                let xf = below.filter(|_| y < dims[1] / 2).unwrap_or(xf);
                 for (axis, sign, k) in SIDES {
                     // Le voisin de ce côté : dehors (le pixel du skin), mangé (la chair à nu),
                     // ou encore là (pas de face).
@@ -587,26 +627,38 @@ fn emit_body(
     flesh: Option<&crate::flesh::Flesh>,
     skip: &[usize],
 ) {
-    for (i, (xf, min, max, part)) in parts(pose).into_iter().enumerate() {
+    let tex = pose.skin.as_deref();
+    let all = parts(pose);
+    let low = lowers(pose, &all);
+    // Les pavés mordus : cube par cube, la moitié du bas d'un membre dans son repère.
+    for (i, &(xf, min, max, part)) in all.iter().enumerate() {
         if skip.contains(&i) {
             continue;
         }
-        let tex = pose.skin.as_deref();
-        match flesh.filter(|f| f.bitten(i)) {
-            Some(f) => emit_flesh(
-                out,
-                xf,
-                min,
-                max,
-                i,
-                part,
-                pose.light,
-                tex,
-                f,
-                crate::flesh::organ,
-            ),
-            None => emit_box(out, xf, min, max, ZONES[i], part, pose.light, tex),
+        if let Some(f) = flesh.filter(|f| f.bitten(i)) {
+            let below = low[i].map(|(m, _)| m);
+            emit_flesh(out, xf, below, min, max, i, part, pose.light, tex, f, crate::flesh::organ);
         }
+    }
+    // Les autres : pixel par pixel, (v290) les membres en deux moitiés.
+    for seg in segments(pose) {
+        if skip.contains(&seg.of) || flesh.is_some_and(|f| f.bitten(seg.of)) {
+            continue;
+        }
+        let skin = tex.map(|t| (t, seg.zone.skin));
+        emit_box_faces(
+            out,
+            seg.xf,
+            seg.min,
+            seg.max,
+            Some(seg.zone),
+            seg.part,
+            pose.light,
+            skin,
+            None,
+            1,
+            seg.hide,
+        );
     }
 }
 
@@ -976,6 +1028,151 @@ const ZONES: [Zone; 7] = [
 ];
 
 /// Pavés du modèle dans cette pose : repère (pixels → monde), coins (pixels), partie.
+/// (v290) « Ajoute une pliure au niveau des genoux et des coudes » : chaque membre est
+/// dessiné en deux segments, coupés à mi-hauteur (là où `flesh::organ` met déjà le genou et le
+/// coude : la rangée du milieu de sa zone du skin). Le segment du bas tourne autour d'une
+/// charnière posée sur un bord de la coupe : le bord avant pour le genou (le pied part en
+/// arrière), le bord arrière pour le coude (la main part en avant) ; de ce côté-là les deux
+/// segments restent joints, de l'autre ils entrent l'un dans l'autre : aucun trou.
+///
+/// Coude au repos (rad) : « la posture d'un humain par défaut », les bras ne pendent pas
+/// raides ; et ce qu'il plie de plus quand le bras part en avant en marchant, accroupi.
+pub const ELBOW_REST: f32 = 0.22;
+pub const ELBOW_WALK: f32 = 0.45;
+pub const ELBOW_CROUCH: f32 = 0.3;
+/// (v290) Genou : ce qu'il plie quand la jambe revient vers l'avant en marchant (le pied se
+/// lève), et son pli le plus fort (au-delà, le bas de la jambe ressortirait par-devant).
+pub const KNEE_WALK: f32 = 0.9;
+pub const KNEE_MAX: f32 = 1.45;
+/// (v290) Le segment du bas d'un membre plié est un rien moins large : là où il entre dans
+/// celui du haut, leurs flancs ne sont plus dans le même plan (ils scintilleraient).
+pub const LOWER_NARROW: f32 = 0.98;
+/// (v290) En dessous de ce pli (rad), l'ombre d'un membre reste un seul pavé.
+const SHADOW_BEND: f32 = 0.3;
+
+/// (v290) Accroupi, les jambes ne se tassent plus : elles plient. Angle (rad) dont la cuisse
+/// part en avant quand les hanches descendent de `drop` pixels ; le genou plie du double, le
+/// bas de la jambe penche d'autant en arrière : le pied reste sous la hanche, son coin le
+/// plus bas au sol (la jambe, longue de `LEG`, épaisse de `LEG_D`, descend alors de
+/// LEG·cos a − LEG_D/2·sin a).
+pub fn squat(drop: f32) -> f32 {
+    let reach = (LEG * LEG + LEG_D * LEG_D / 4.0).sqrt();
+    ((LEG - drop) / reach).clamp(-1.0, 1.0).acos() - (LEG_D / 2.0).atan2(LEG)
+}
+
+/// (v290) Les plis des quatre membres dans cette pose : genou gauche, genou droit, coude
+/// gauche, coude droit (rad). Un bras tendu vers le regard ou levé avec un objet reste droit.
+pub fn bends(pose: &Pose) -> [f32; 4] {
+    let crouch = pose.crouch.clamp(0.0, 1.0);
+    let base = 2.0 * squat(crouch_lean(pose.crouch).drop);
+    // Le genou plie pendant que la jambe revient vers l'avant (son angle, `swing × signe`,
+    // grandit : cos(marche) × signe > 0).
+    let knee = |sign: f32| {
+        (base + KNEE_WALK * pose.swing * (pose.walk.cos() * sign).max(0.0)).min(KNEE_MAX)
+    };
+    // Le coude plie d'autant plus que le bras est en avant (le gauche l'est quand la jambe
+    // gauche est en arrière).
+    let aim = aims(pose);
+    let held = pose.held.is_some() || aims_right(pose).is_some();
+    let elbow = |sign: f32, straight: bool| {
+        if straight {
+            0.0
+        } else {
+            let ahead = 0.5 + 0.5 * pose.walk.sin() * sign;
+            ELBOW_REST + ELBOW_WALK * pose.swing * ahead + ELBOW_CROUCH * crouch
+        }
+    };
+    [knee(1.0), knee(-1.0), elbow(-1.0, aim), elbow(1.0, aim || held)]
+}
+
+/// (v290) Le repère du segment du bas de chaque membre (pavés 0, 1, 3, 4 de `parts`), et la
+/// hauteur de la coupe dans le repère du membre (pixels) ; `None` pour les autres pavés.
+fn lowers(pose: &Pose, parts: &[(Mat4, [f32; 3], [f32; 3], Part)]) -> [Option<(Mat4, f32)>; 7] {
+    let b = bends(pose);
+    let mut out = [None; 7];
+    for (i, bend) in [(0usize, b[0]), (1, b[1]), (3, b[2]), (4, b[3])] {
+        let (xf, min, max, part) = parts[i];
+        let cut = (min[1] + max[1]) / 2.0;
+        // Genou : charnière au bord avant (z petit), le bas part en arrière ; coude : au
+        // bord arrière, le bas part en avant.
+        let (edge, angle) = if part == Part::Leg {
+            (min[2], -bend)
+        } else {
+            (max[2], bend)
+        };
+        let hinge = Vec3::new(0.0, cut, edge);
+        let narrow = if bend == 0.0 { 1.0 } else { LOWER_NARROW };
+        let low = xf
+            * Mat4::from_translation(hinge)
+            * Mat4::from_rotation_x(angle)
+            * Mat4::from_translation(-hinge)
+            * Mat4::from_scale(Vec3::new(narrow, 1.0, 1.0));
+        out[i] = Some((low, cut));
+    }
+    out
+}
+
+/// (v290) Un pavé à dessiner : un pavé de `parts`, ou la moitié d'un membre.
+#[derive(Clone, Copy)]
+struct Seg {
+    xf: Mat4,
+    min: [f32; 3],
+    max: [f32; 3],
+    part: Part,
+    /// Le pavé de `parts` dont il est (tout ou moitié), et sa part de la zone du skin.
+    of: usize,
+    zone: Zone,
+    /// Faces à ne pas dessiner (bit k : face k de `box_faces`) : la coupe d'un membre.
+    hide: u8,
+    /// Le pli de son articulation (0 hors des membres).
+    bend: f32,
+}
+
+/// (v290) Les deux moitiés du pavé d'un membre : (haut, bas), chacune avec ses rangées du
+/// skin, sans la face de la coupe.
+fn halves(min: [f32; 3], max: [f32; 3], zone: Zone) -> [([f32; 3], [f32; 3], Zone, u8); 2] {
+    let cut = (min[1] + max[1]) / 2.0;
+    let rows = zone.size[1] / 2;
+    let top = Zone {
+        size: [zone.size[0], rows, zone.size[2]],
+        ..zone
+    };
+    let bottom = Zone {
+        size: [zone.size[0], zone.size[1] - rows, zone.size[2]],
+        row: zone.row + rows,
+        ..zone
+    };
+    [
+        ([min[0], cut, min[2]], max, top, 1 << 5),
+        (min, [max[0], cut, max[2]], bottom, 1 << 4),
+    ]
+}
+
+/// (v290) Les pavés à dessiner dans cette pose : ceux de `parts` dans l'ordre, les membres
+/// réduits à leur moitié du haut, puis les quatre moitiés du bas (jambe gauche, jambe
+/// droite, bras gauche, bras droit) : l'ordre des pavés du modèle de la carte graphique
+/// (`player_mesh`, `players.wgsl`).
+fn segments(pose: &Pose) -> Vec<Seg> {
+    let parts = parts(pose);
+    let low = lowers(pose, &parts);
+    let b = bends(pose);
+    let mut out = Vec::with_capacity(11);
+    let mut below = Vec::with_capacity(4);
+    for (i, &(xf, min, max, part)) in parts.iter().enumerate() {
+        match low[i] {
+            Some((lower, _)) => {
+                let bend = b[[0, 1, 0, 2, 3][i]];
+                let [(tmin, tmax, tz, th), (bmin, bmax, bz, bh)] = halves(min, max, ZONES[i]);
+                out.push(Seg { xf, min: tmin, max: tmax, part, of: i, zone: tz, hide: th, bend });
+                below.push(Seg { xf: lower, min: bmin, max: bmax, part, of: i, zone: bz, hide: bh, bend });
+            }
+            None => out.push(Seg { xf, min, max, part, of: i, zone: ZONES[i], hide: 0, bend: 0.0 }),
+        }
+    }
+    out.extend(below);
+    out
+}
+
 fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     let mut out = Vec::with_capacity(7);
     // Repère du modèle : x à droite, y en haut, z vers l'arrière (le regard est −z).
@@ -990,12 +1187,13 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     // (v189) La jambe reste un seul pavé : elle se tasse de `drop` au lieu de se faire
     // recouvrir au quart par le bas du corps, qui laissait voir un pli à la hanche. Les
     // pieds restent au sol.
-    let shrink = (LEG - drop) / LEG;
+    // (v290) Accroupi, la jambe ne se tasse plus : la cuisse part en avant de `squat`, le
+    // genou plie du double (`bends`, `lowers`).
+    let thigh = squat(drop);
     for (side, sign) in [(-LEG_X, 1.0f32), (LEG_X, -1.0)] {
         let xf = base
             * Mat4::from_translation(Vec3::new(side, LEG - drop, 0.0))
-            * Mat4::from_rotation_x(swing * sign)
-            * Mat4::from_scale(Vec3::new(1.0, shrink, 1.0));
+            * Mat4::from_rotation_x(swing * sign + thigh);
         let (min, max, part) = PARTS[out.len()];
         out.push((xf, min, max, part));
     }
@@ -1096,9 +1294,22 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
 /// bouchait l'écart entre elles dans l'ombre (« entre les deux jambes de mon ombre, l'ombre
 /// des fois se colle alors qu'elle ne devrait pas, devant les projecteurs »).
 pub fn shadow_boxes(pose: &Pose) -> Vec<ShadowBox> {
-    parts(pose)
+    // (v290) Un membre plié fait deux pavés d'ombre (au-dessus de `SHADOW_BEND` : en dessous,
+    // un seul suffit, et il en faut le moins possible, la carte n'en prend que 64).
+    let whole = parts(pose);
+    segments(pose)
         .into_iter()
-        .map(|(xf, mn, mx, _)| ShadowBox::oriented(xf, Vec3::from(mn), Vec3::from(mx)))
+        .filter_map(|s| {
+            if s.hide == 0 || s.bend >= SHADOW_BEND {
+                Some(ShadowBox::oriented(s.xf, Vec3::from(s.min), Vec3::from(s.max)))
+            } else if s.hide == 1 << 5 {
+                // La moitié du haut d'un membre presque droit : le membre entier.
+                let (xf, mn, mx, _) = whole[s.of];
+                Some(ShadowBox::oriented(xf, Vec3::from(mn), Vec3::from(mx)))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -1984,17 +2195,34 @@ fn atlas(i: usize, k: usize, [w, _, d]: [usize; 3]) -> (usize, usize) {
     }
 }
 
-/// Modèle commun des autres joueurs (sept pavés : 252 sommets), à envoyer une fois à la
-/// carte.
+/// Modèle commun des autres joueurs, à envoyer une fois à la carte. (v290) Onze pavés : les
+/// sept de `PARTS`, les membres réduits à leur moitié du haut, puis leurs quatre moitiés du
+/// bas (pavés 7 à 10 : jambe gauche, jambe droite, bras gauche, bras droit), sans les faces
+/// de la coupe : 58 faces, 348 sommets (252 avant).
 pub fn player_mesh() -> Vec<PlayerVertex> {
-    let mut out = Vec::with_capacity(252);
-    for (i, &(min, max, _)) in PARTS.iter().enumerate() {
+    let mut out = Vec::with_capacity(348);
+    // (pavé de la carte, coins, zone du skin, faces cachées)
+    let mut boxes: Vec<(usize, [f32; 3], [f32; 3], Zone, u8)> = Vec::with_capacity(11);
+    let mut below = Vec::with_capacity(4);
+    for (i, &(min, max, part)) in PARTS.iter().enumerate() {
+        if part == Part::Leg || part == Part::Arm {
+            let [(tmin, tmax, tz, th), (bmin, bmax, bz, bh)] = halves(min, max, ZONES[i]);
+            boxes.push((i, tmin, tmax, tz, th));
+            below.push((7 + below.len(), bmin, bmax, bz, bh));
+        } else {
+            boxes.push((i, min, max, ZONES[i], 0));
+        }
+    }
+    boxes.extend(below);
+    for (i, min, max, zone, hide) in boxes {
         // (v225) Les pixels de sa zone du skin, étirés à la taille du pavé. (v256) Un pavé
         // peut n'en montrer qu'un morceau (`Zone`).
-        let zone = ZONES[i];
         let size = zone.size;
         let step = (Vec3::from(max) - Vec3::from(min)) / Vec3::from(size.map(|n| n as f32));
         for (k, (_, o, du, dv, nu, nv)) in box_faces(min, max, size).into_iter().enumerate() {
+            if hide >> k & 1 == 1 {
+                continue;
+            }
             let (o, du, dv) = (
                 Vec3::from(o),
                 Vec3::from(du) * step,
@@ -2319,44 +2547,74 @@ pub fn first_person_ahead(yaw: f32, crouch: f32) -> Vec3 {
 /// jambes, le ventre, la poitrine et le bras gauche du modèle, pixel par pixel de son skin,
 /// avec ses plaies. Ni la tête (la caméra y est), ni le bras droit (il est dessiné tendu, avec
 /// ce qu'il tient : `right_arm_matrix`). `view_proj` : du monde à l'écran.
+///
+/// (v290) `right_arm` : le bras droit aussi, pendant le long du corps (la main vide : « arrête
+/// de pencher mon bras en avant quand je n'ai pas d'item dans les mains »).
 pub fn first_person_body(
     pose: &Pose,
     wounds: &[Wound],
     flesh: Option<&crate::flesh::Flesh>,
     view_proj: Mat4,
+    right_arm: bool,
 ) -> Vec<ArmVertex> {
     let seen = pose.at(first_person_feet(pose));
     let mut out = Vec::with_capacity(6400);
     let mut quads = Vec::with_capacity(1600);
-    for (i, (xf, min, max, part)) in parts(&seen).into_iter().enumerate() {
-        if i == 4 || i == 5 {
-            continue;
+    let tex = seen.skin.as_deref();
+    let all = parts(&seen);
+    let low = lowers(&seen, &all);
+    // (v290) Ce qu'il y a à dessiner, pavé par pavé : un pavé mordu d'un bloc (cube par cube,
+    // avec ce qu'on voit dans le creux), sinon chacun de ses segments (les membres en ont
+    // deux : genou, coude). Avec ses plaies, et le milieu de ce qu'on vient de dessiner.
+    let bitten = |i: usize| flesh.filter(|f| f.bitten(i));
+    let mut units: Vec<(usize, Option<Seg>)> = Vec::new();
+    let drawn = |i: usize| i != 5 && (i != 4 || right_arm);
+    for i in (0..all.len()).filter(|i| drawn(*i)) {
+        if bitten(i).is_some() {
+            units.push((i, None));
         }
+    }
+    for seg in segments(&seen) {
+        if drawn(seg.of) && bitten(seg.of).is_none() {
+            units.push((seg.of, Some(seg)));
+        }
+    }
+    for (i, seg) in units {
         quads.clear();
-        // (v269) Un pavé mordu : cube par cube, avec ce qu'on voit dans le creux.
-        match flesh.filter(|f| f.bitten(i)) {
-            Some(f) => emit_flesh(
-                &mut quads,
-                xf,
-                min,
-                max,
-                i,
-                part,
-                seen.light,
-                seen.skin.as_deref(),
-                f,
-                crate::flesh::organ,
-            ),
+        let (xf, min, max, part) = all[i];
+        let center = match seg {
+            Some(s) => {
+                let skin = tex.map(|t| (t, s.zone.skin));
+                emit_box_faces(
+                    &mut quads,
+                    s.xf,
+                    s.min,
+                    s.max,
+                    Some(s.zone),
+                    s.part,
+                    seen.light,
+                    skin,
+                    None,
+                    1,
+                    s.hide,
+                );
+                s.xf.transform_point3((Vec3::from(s.min) + Vec3::from(s.max)) / 2.0)
+            }
             None => {
-                let tex = seen.skin.as_deref();
-                emit_box(&mut quads, xf, min, max, ZONES[i], part, seen.light, tex)
+                let f = bitten(i).unwrap();
+                let below = low[i].map(|(m, _)| m);
+                let organ = crate::flesh::organ;
+                emit_flesh(&mut quads, xf, below, min, max, i, part, seen.light, tex, f, organ);
+                xf.transform_point3((Vec3::from(min) + Vec3::from(max)) / 2.0)
+            }
+        };
+        // Les plaies du pavé, avec sa moitié du haut (ou avec lui s'il est mordu).
+        if seg.is_none_or(|s| s.hide != 1 << 4) {
+            for w in wounds.iter().filter(|w| w.part as usize == i) {
+                quads.extend(wound_model(&seen, std::slice::from_ref(w)));
             }
         }
-        for w in wounds.iter().filter(|w| w.part as usize == i) {
-            quads.extend(wound_model(&seen, std::slice::from_ref(w)));
-        }
         // La normale de chaque carré, vers le dehors du pavé (pour les lumières).
-        let center = xf.transform_point3((Vec3::from(min) + Vec3::from(max)) / 2.0);
         for q in quads.chunks_exact(6) {
             let (a, b, c) = (Vec3::from(q[0].pos), Vec3::from(q[1].pos), Vec3::from(q[2].pos));
             let mut n = (b - a).cross(c - a).normalize_or_zero();
@@ -2536,11 +2794,14 @@ pub fn wound_model(pose: &Pose, wounds: &[Wound]) -> Vec<EntityVertex> {
         return out;
     }
     let parts = parts(pose);
+    let low = lowers(pose, &parts);
     let lit = EntityVertex::light(pose.light, true);
     for w in wounds {
         let Some(&(xf, min, max, _)) = parts.get(w.part as usize) else {
             continue;
         };
+        // (v290) Sous le genou ou le coude : dans le repère du bas du membre.
+        let below = low[w.part as usize];
         let (axis, sign, a, b) = WOUND_FACES[w.face.min(5) as usize];
         // Juste au-dessus de la face (0,04 pixel : 2 mm).
         let plane = if sign > 0.0 { max[axis] } else { min[axis] } + sign * 0.04;
@@ -2564,7 +2825,10 @@ pub fn wound_model(pose: &Pose, wounds: &[Wound]) -> Vec<EntityVertex> {
                 p[axis] = plane;
                 p[a] = pa;
                 p[b] = pb;
-                xf.transform_point3(p)
+                below
+                    .filter(|(_, cut)| p.y < *cut)
+                    .map_or(xf, |(m, _)| m)
+                    .transform_point3(p)
             };
             let (p0, p1, p2, p3) = (at(a0, b0), at(a1, b0), at(a1, b1), at(a0, b1));
             for q in [p0, p1, p2, p2, p3, p0] {
@@ -2599,7 +2863,7 @@ pub enum HitZone {
 /// corps se penche accroupi, les jambes sont droites (leur balancement n'est qu'un dessin,
 /// propre à chaque écran) et les bras sont tendus vers le regard, comme ceux d'un joueur qui
 /// tient une arme à feu.
-pub fn hit_boxes(feet: Vec3, yaw: f32, pitch: f32, crouch: f32) -> [(Mat4, Vec3, Vec3, HitZone); 7] {
+pub fn hit_boxes(feet: Vec3, yaw: f32, pitch: f32, crouch: f32) -> Vec<(Mat4, Vec3, Vec3, HitZone)> {
     let pose = Pose {
         feet,
         yaw,
@@ -2612,18 +2876,20 @@ pub fn hit_boxes(feet: Vec3, yaw: f32, pitch: f32, crouch: f32) -> [(Mat4, Vec3,
         skin: None,
         bow: 0.0,
     };
-    let p = parts(&pose);
-    std::array::from_fn(|i| {
-        let (xf, min, max, part) = p[i];
-        let zone = match part {
-            Part::Head => HitZone::Head,
-            Part::Arm => HitZone::Arm,
-            Part::Leg => HitZone::Leg,
-            Part::Body if i == BELLY => HitZone::Belly,
-            Part::Body => HitZone::Chest,
-        };
-        (xf.inverse(), Vec3::from(min), Vec3::from(max), zone)
-    })
+    // (v290) Les pavés dessinés : accroupi, chaque jambe en fait deux (cuisse, bas de jambe).
+    segments(&pose)
+        .into_iter()
+        .map(|s| {
+            let zone = match s.part {
+                Part::Head => HitZone::Head,
+                Part::Arm => HitZone::Arm,
+                Part::Leg => HitZone::Leg,
+                Part::Body if s.of == BELLY => HitZone::Belly,
+                Part::Body => HitZone::Chest,
+            };
+            (s.xf.inverse(), Vec3::from(s.min), Vec3::from(s.max), zone)
+        })
+        .collect()
 }
 
 /// Les couches d'un corps vues de face : huit images côte à côte (la tête a huit couches
@@ -2688,6 +2954,56 @@ mod tests {
     /// Repère d'une partie dans la pose d'une instance : `part_matrix` de players.wgsl,
     /// ligne pour ligne.
     fn shader_part_matrix(part: u32, p: &PlayerInstance) -> Mat4 {
+        if part < 7 {
+            return shader_limb_matrix(part, p);
+        }
+        // (v290) Bas des membres (7, 8 : jambes ; 9, 10 : bras) : le repère du membre, tourné
+        // du pli autour de la charnière.
+        let t = |x: f32, y: f32, z: f32| Mat4::from_translation(Vec3::new(x, y, z));
+        let crouch = p.crouch.clamp(0.0, 1.0);
+        let narrow = |bend: f32| {
+            Mat4::from_scale(Vec3::new(if bend == 0.0 { 1.0 } else { LOWER_NARROW }, 1.0, 1.0))
+        };
+        if part < 9 {
+            let sign = if part == 7 { 1.0 } else { -1.0 };
+            let knee = (2.0 * shader_squat(CROUCH_HIP_DROP * crouch)
+                + KNEE_WALK * p.swing * (p.walk.cos() * sign).max(0.0))
+            .min(KNEE_MAX);
+            return shader_limb_matrix(part - 7, p)
+                * t(0.0, -LEG / 2.0, -LEG_D / 2.0)
+                * Mat4::from_rotation_x(-knee)
+                * t(0.0, LEG / 2.0, LEG_D / 2.0)
+                * narrow(knee);
+        }
+        let straight = if part == 9 {
+            p.skin & 0x20000 != 0
+        } else {
+            p.skin & 0x1f0000 != 0
+        };
+        let sign = if part == 9 { -1.0 } else { 1.0 };
+        let elbow = if straight {
+            0.0
+        } else {
+            ELBOW_REST
+                + ELBOW_WALK * p.swing * (0.5 + 0.5 * p.walk.sin() * sign)
+                + ELBOW_CROUCH * crouch
+        };
+        let (cut, edge) = ((ARM_UP - ARM_DOWN) / 2.0, ARM_W / 2.0);
+        shader_limb_matrix(part - 6, p)
+            * t(0.0, cut, edge)
+            * Mat4::from_rotation_x(elbow)
+            * t(0.0, -cut, -edge)
+            * narrow(elbow)
+    }
+
+    /// `squat` de players.wgsl.
+    fn shader_squat(drop: f32) -> f32 {
+        let reach = (LEG * LEG + LEG_D * LEG_D / 4.0).sqrt();
+        ((LEG - drop) / reach).clamp(-1.0, 1.0).acos() - (LEG_D / 2.0).atan2(LEG)
+    }
+
+    /// `limb_matrix` de players.wgsl, ligne pour ligne.
+    fn shader_limb_matrix(part: u32, p: &PlayerInstance) -> Mat4 {
         let px = 1.8 / 32.0;
         let t = |x: f32, y: f32, z: f32| Mat4::from_translation(Vec3::new(x, y, z));
         let base = Mat4::from_translation(Vec3::from(p.feet))
@@ -2700,12 +3016,12 @@ mod tests {
         let lean = belly + bend;
         let drop = CROUCH_HIP_DROP * crouch;
         let pitch = p.pitch.clamp(-1.4, 1.4);
-        let shrink = Mat4::from_scale(Vec3::new(1.0, (LEG - drop) / LEG, 1.0));
+        let thigh = shader_squat(drop);
         if part == 0 {
-            return base * t(-LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(swing) * shrink;
+            return base * t(-LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(swing + thigh);
         }
         if part == 1 {
-            return base * t(LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(-swing) * shrink;
+            return base * t(LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(-swing + thigh);
         }
         if part == 6 {
             return base * t(0.0, LEG - drop, 0.0) * Mat4::from_rotation_x(-belly);
@@ -3053,6 +3369,15 @@ mod tests {
             ("CROUCH_HIP_DROP", CROUCH_HIP_DROP),
             ("ZEUS_RAISE", ZEUS_RAISE),
             ("ITEM_AIM_DROP", ITEM_AIM_DROP),
+            ("LEG_D", LEG_D),
+            ("ARM_CUT", (ARM_UP - ARM_DOWN) / 2.0),
+            ("ARM_HALF", ARM_W / 2.0),
+            ("ELBOW_REST", ELBOW_REST),
+            ("ELBOW_WALK", ELBOW_WALK),
+            ("ELBOW_CROUCH", ELBOW_CROUCH),
+            ("KNEE_WALK", KNEE_WALK),
+            ("KNEE_MAX", KNEE_MAX),
+            ("LOWER_NARROW", LOWER_NARROW),
         ] {
             let line = src
                 .lines()
@@ -3205,7 +3530,7 @@ mod tests {
             emit_box(&mut plain, xf, min, max, ZONES[i], part, pose.light, tex);
             let mut whole = Vec::new();
             let none = Flesh::default();
-            emit_flesh(&mut whole, xf, min, max, i, part, pose.light, tex, &none, organ);
+            emit_flesh(&mut whole, xf, None, min, max, i, part, pose.light, tex, &none, organ);
             let (a, b) = (quads(&plain), quads(&whole));
             assert_eq!(a.len(), b.len(), "pavé {i} : sans morsure");
             assert_eq!((missing(&a, &b), missing(&b, &a)), (0, 0), "pavé {i} : sans morsure");
@@ -3214,7 +3539,7 @@ mod tests {
             let d = grids[i];
             let b = f.bite_at(i, [d[0] - 1, d[1] - 1, 0], 2, &grids).unwrap();
             let mut bitten = Vec::new();
-            emit_flesh(&mut bitten, xf, min, max, i, part, pose.light, tex, &f, organ);
+            emit_flesh(&mut bitten, xf, None, min, max, i, part, pose.light, tex, &f, organ);
             let (before, after) = (quads(&plain), quads(&bitten));
             let (lost, new) = (missing(&before, &after), missing(&after, &before));
             // Le coin de 2 × 2 × 2 cubes : 3 faces de 4 carrés du skin en moins, 3 faces de
@@ -3297,6 +3622,70 @@ mod tests {
         img.save(path).unwrap();
     }
 
+    /// (v290) Planche des poses vues de côté et de trois quarts (genoux et coudes) : le modèle
+    /// des triangles en haut, celui de la carte graphique en dessous. Écrite dans le fichier
+    /// nommé par MINELIB_IRM (essai à lancer à la main).
+    #[test]
+    #[ignore]
+    fn poses_seen_from_the_side() {
+        let Ok(path) = std::env::var("MINELIB_IRM") else {
+            return;
+        };
+        let pose = |walk: f32, swing: f32, crouch: f32, held: Option<Held>| Pose {
+            feet: Vec3::new(3.0, 70.0, -5.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            walk,
+            swing,
+            crouch,
+            light: [1.0; 3],
+            held,
+            skin: None,
+            bow: 0.0,
+        };
+        let poses = [
+            pose(0.0, 0.0, 0.0, None),
+            pose(0.0, 1.0, 0.0, None),
+            pose(1.57, 1.0, 0.0, None),
+            pose(3.14, 1.0, 0.0, None),
+            pose(4.71, 1.0, 0.0, None),
+            pose(0.0, 0.0, 0.5, None),
+            pose(0.0, 0.0, 1.0, None),
+            pose(1.57, 0.6, 1.0, None),
+            pose(0.0, 0.0, 0.0, Some(Held::Block(BlockId::STONE))),
+        ];
+        let (size, mesh) = (256u32, player_mesh());
+        let mut img = image::RgbImage::from_pixel(size * poses.len() as u32, size * 4, image::Rgb([40, 44, 52]));
+        for (n, pose) in poses.iter().enumerate() {
+            let body = build(pose);
+            let skins = vec![(3, bake_skin(None))];
+            let players = [instance(pose, 3, &Prev::still(pose))];
+            // De côté (depuis sa gauche, le devant du joueur à gauche de l'image), puis de
+            // trois quarts devant.
+            for (v, a) in [(0u32, -1.57f32), (1, -0.6)] {
+                let target = pose.feet + Vec3::Y * 0.9;
+                let eye = target + Vec3::new(a.sin(), 0.1, -a.cos()) * 2.6;
+                let proj = Mat4::perspective_infinite_reverse_rh(48f32.to_radians(), 1.0, 0.05);
+                let vp = proj * Mat4::look_at_rh(eye, target, Vec3::Y);
+                let Some(both) = minelib_render::draw_offscreen(vp, size, &body, &mesh, &players, &skins) else {
+                    eprintln!("pas de carte graphique : essai sauté");
+                    return;
+                };
+                for (k, shot) in both.iter().enumerate() {
+                    for (i, px) in shot.iter().enumerate() {
+                        if px[3] < 0.5 {
+                            continue;
+                        }
+                        let c = [0, 1, 2].map(|j| (px[j].clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8);
+                        let (x, y) = (i as u32 % size, i as u32 / size);
+                        img.put_pixel(n as u32 * size + x, (v * 2 + k as u32) * size + y, image::Rgb(c));
+                    }
+                }
+            }
+        }
+        img.save(path).unwrap();
+    }
+
     /// (v267) « On doit voir notre corps dans le jeu » : à la première personne, en baissant
     /// les yeux, on voit sa poitrine, son ventre, ses jambes et son bras gauche ; ni sa tête,
     /// ni son bras droit (dessiné à part). Rien n'est trop près des yeux pour être coupé par
@@ -3330,7 +3719,7 @@ mod tests {
                     16.0 / 9.0,
                     near,
                 );
-                let body = first_person_body(&pose, &test_wounds(), None, proj * view);
+                let body = first_person_body(&pose, &test_wounds(), None, proj * view, false);
                 assert!(body.len() > 5000 && body.len() % 6 == 0, "{}", body.len());
                 // Des carrés dans l'image, devant le plan proche.
                 let seen = body
@@ -3487,7 +3876,7 @@ mod tests {
     #[test]
     fn the_shared_model_draws_what_build_draws() {
         let mesh = player_mesh();
-        assert_eq!(mesh.len(), 252);
+        assert_eq!(mesh.len(), 348);
         for pose in test_poses() {
             let baked = bake_skin(pose.skin.as_deref());
             let inst = instance(&pose, 7, &Prev::still(&pose));
@@ -3597,14 +3986,21 @@ mod tests {
         // (v201) Pas vers la normale des sommets : celle de l'ombrage (`du × dv`) pointe vers
         // l'intérieur pour quatre faces sur six, et l'essai passait quand même.
         let mesh = player_mesh();
+        // (v290) Le milieu de chacun des onze pavés, d'après ses sommets.
+        let mut span = [(Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)); 11];
+        for v in &mesh {
+            let (lo, hi) = &mut span[v.part as usize];
+            *lo = lo.min(Vec3::from(v.pos));
+            *hi = hi.max(Vec3::from(v.pos));
+        }
         for pose in test_poses() {
             let inst = instance(&pose, 0, &Prev::still(&pose));
             for t in mesh.chunks(3) {
                 let xf = shader_part_matrix(t[0].part, &inst);
                 let p = [0, 1, 2].map(|k| xf.transform_point3(Vec3::from(t[k].pos)));
                 let wind = (p[1] - p[0]).cross(p[2] - p[0]);
-                let (mn, mx, _) = PARTS[t[0].part as usize];
-                let center = xf.transform_point3((Vec3::from(mn) + Vec3::from(mx)) / 2.0);
+                let (mn, mx) = span[t[0].part as usize];
+                let center = xf.transform_point3((mn + mx) / 2.0);
                 let out = (p[0] + p[1] + p[2]) / 3.0 - center;
                 assert!(wind.length_squared() > 1e-12, "triangle plat du joueur");
                 assert!(
@@ -3829,7 +4225,9 @@ mod tests {
             lamp,
             false
         ));
-        // En marchant aussi, une boîte par jambe (v256 : sept avec le ventre).
+        // En marchant aussi, une boîte par jambe (v256 : sept avec le ventre). (v290) Deux
+        // pour un membre plié : ici le genou gauche (jambe levée) et le coude droit (bras
+        // devant), neuf boîtes ; jamais plus de onze.
         let walking = Pose {
             feet: Vec3::ZERO,
             yaw: 0.3,
@@ -3842,7 +4240,13 @@ mod tests {
             skin: None,
             bow: 0.0,
         };
-        assert_eq!(shadow_boxes(&walking).len(), 7);
+        assert_eq!(shadow_boxes(&walking).len(), 9);
+        assert_eq!(shadow_boxes(&pose).len(), 7, "immobile : les membres presque droits");
+        let low = Pose {
+            crouch: 1.0,
+            ..walking
+        };
+        assert_eq!(shadow_boxes(&low).len(), 11);
     }
 
     /// (v273) « Entre les deux jambes de mon ombre de joueur, l'ombre des fois se colle alors

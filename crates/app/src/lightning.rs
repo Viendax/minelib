@@ -221,6 +221,9 @@ pub struct Strike {
     /// (v281) Petit éclair qui touche quelqu'un (joueur, PNJ, L'Évidé) : le coup sec part avec
     /// lui (`audio::zeus_hit`).
     pub hit: bool,
+    /// (v290) Arc de l'éclair tenu : de sa pointe à son arrivée, au moment du tir ; il les
+    /// garde quand la pointe bouge (`arc_from`).
+    span: Vec3,
 }
 
 impl Strike {
@@ -282,14 +285,24 @@ impl Strike {
     pub fn arc(from: Vec3, to: Vec3, seed: u32) -> Self {
         let mut rng = Rng::new(seed as u64 | 0x54_0000_0000);
         let main = jagged(from, to, 5, 0.2, &mut rng);
-        Self::build(Kind::Arc, main, to, f32::MAX, seed, 0.0, rng)
+        let mut s = Self::build(Kind::Arc, main, to, f32::MAX, seed, 0.0, rng);
+        s.span = to - from;
+        s
     }
 
     /// (v244) L'arc repart de `from` : la pointe de l'éclair tenu a bougé (elle vit, et la
     /// main fait son geste), et « il doit toujours partir du bout ». Même arrivée, même
     /// graine : la même forme, déplacée ; son âge et ses arcs en retour ne changent pas.
+    ///
+    /// (v290) « Quand je tire devant, ça ne tire pas droit avec l'éclair qui part jusqu'à 8
+    /// blocs, quand je me décale après un tir » (en F5 comme à la première personne) : son
+    /// arrivée restait là où l'on avait visé pendant que son départ suivait la main ; en se
+    /// décalant (en volant vite, surtout), l'arc s'étirait de travers, bien au-delà de ses 8
+    /// blocs. Il part de la pointe et garde la direction et la longueur du tir : son arrivée
+    /// se déplace avec lui.
     pub fn arc_from(&mut self, from: Vec3) {
         if self.kind == Kind::Arc {
+            self.pos = from + self.span;
             self.pieces = Self::arc(from, self.pos, self.seed).pieces;
         }
     }
@@ -407,6 +420,7 @@ impl Strike {
             seed,
             follow: false,
             hit: false,
+            span: Vec3::ZERO,
         }
     }
 
@@ -1439,6 +1453,27 @@ mod tests {
         assert!(top < 72.0, "il ne passe pas par le ciel : {top}");
         // (Aucune lueur dans les nuages.)
         assert!(segs.iter().all(|g| g.a[3] == BOLT));
+    }
+
+    /// (v290) « Quand je me décale après un tir, ça ne tire pas droit » : l'arc parti de
+    /// l'éclair tenu suit sa pointe en gardant la direction et la longueur du tir (son arrivée
+    /// ne reste pas en arrière).
+    #[test]
+    fn the_arc_keeps_its_direction_when_its_tip_moves() {
+        let (from, to) = (Vec3::new(1.0, 65.0, 2.0), Vec3::new(1.5, 64.0, -5.5));
+        let mut s = Strike::arc(from, to, 9);
+        let moved = from + Vec3::new(12.0, 3.0, 1.0);
+        s.arc_from(moved);
+        let main: Vec<_> = s.pieces.iter().take_while(|p| p.level == 0).collect();
+        let end = main[main.len() - 1].b;
+        assert!(main[0].a == moved);
+        assert!((end - (moved + (to - from))).length() < 1e-4, "{end}");
+        assert!((s.pos - end).length() < 1e-4);
+        // Sans bouger : rien ne change.
+        let mut still = Strike::arc(from, to, 9);
+        still.arc_from(from);
+        let main: Vec<_> = still.pieces.iter().take_while(|p| p.level == 0).collect();
+        assert!((main[main.len() - 1].b - to).length() < 1e-4);
     }
 
     /// Dégâts comme dans Minecraft : dans la boîte de 3 blocs autour du point frappé.

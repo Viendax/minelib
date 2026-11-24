@@ -40,8 +40,10 @@ fn npc_cry_gain(d: f32) -> Option<f32> {
 }
 
 /// (v269) Une morsure de L'Évidé : points de vie perdus (sur 20) ; temps entre deux de nos
-/// bouchées (s) ; au-delà de cette distance (blocs) il n'est plus dessiné.
-const EVIDE_BITE: u8 = 3;
+/// bouchées (s) ; au-delà de cette distance (blocs) il n'est plus dessiné. (v290) « Faire 2x
+/// moins mal quand il croque, arrondis un truc cool » : 2 (un cœur) au lieu de 3, la moitié
+/// de ce que lui retire une de nos bouchées (`evide::OUR_BITE_HURTS`).
+const EVIDE_BITE: u8 = 2;
 /// (v272) Une morsure saigne : gouttes du premier jet, puis gouttes par seconde au début,
 /// qui s'espacent (divisées par e toutes les `BLEED_FADE_S` secondes), pendant `BLEED_S`.
 const BLEED_SPURT: usize = 14;
@@ -53,7 +55,8 @@ const BLOOD_ON_GROUND_S: f32 = 300.0;
 
 /// (v272) Où sont l'endroit visé par L'Évidé et les morsures qui saignent, dans la pose
 /// dessinée : (l'endroit visé, (pavé, cube, position) de chaque morsure).
-type BitePoints = (Option<Vec3>, Vec<(usize, [usize; 3], Vec3)>);
+/// (v290) Et le milieu du membre où est l'endroit visé.
+type BitePoints = (Option<Vec3>, Vec<(usize, [usize; 3], Vec3)>, Option<Vec3>);
 
 /// (v272) Les pavés du joueur que L'Évidé peut mordre : tout le tour du corps (jambes,
 /// poitrine, bras, ventre ; pas la tête), ou les jambes seulement quand il rampe.
@@ -64,12 +67,26 @@ fn bite_parts(low: bool) -> &'static [usize] {
         &[0, 1, 2, 3, 4, 6]
     }
 }
-/// (v272) Notre bouchée : on mord à `EAT_IN` s, le geste dure `EAT_S` s ; notre bouche doit
-/// alors être à moins de `EAT_TOUCH` bloc du morceau ; vitesse à laquelle on se plie (rad/s).
+/// (v272) Notre bouchée : on mord à `EAT_IN` s, le geste dure `EAT_S` s ; vitesse à laquelle
+/// on se plie (rad/s). (v290) « Je n'arrive plus à manger le monstre […] que ça fonctionne
+/// quand je clique » : notre bouche n'a plus à arriver sur le morceau (elle n'y arrivait
+/// presque jamais : il est deux fois plus grand que nous, et elle ne fait que descendre en arc
+/// autour de nos hanches) ; il suffit qu'au moment de mordre il soit encore à portée de nos
+/// yeux, à `EAT_SLACK` bloc près.
 const EAT_IN: f32 = 0.2;
 const EAT_S: f32 = 0.38;
-const EAT_TOUCH: f32 = 0.25;
+const EAT_SLACK: f32 = 0.4;
 const BOW_SPEED: f32 = 9.0;
+/// (v290) Vitesse à laquelle notre tête se tourne vers le milieu du membre qu'on mord, et en
+/// revient (rad/s) ; elle ne tourne pas de plus de tant (rad).
+const EAT_TURN_SPEED: f32 = 6.0;
+const EAT_TURN_MAX: f32 = 0.7;
+/// (v290) La main vide à la première personne : temps pour se tendre quand un geste commence,
+/// pour retomber après (s) ; l'angle dont le bras tendu est baissé autour de l'épaule quand il
+/// part du corps ou y revient (rad).
+const HAND_UP_S: f32 = 0.07;
+const HAND_BACK_S: f32 = 0.22;
+const HAND_DOWN: f32 = 1.35;
 const EVIDE_DRAWN: f32 = 160.0;
 
 /// (v249) Durée de l'éblouissement par la foudre qu'on prend (s) : l'écran reste blanc
@@ -592,6 +609,13 @@ pub struct Session {
     eating: Option<(u32, usize, [usize; 3], f32, bool)>,
     /// (v272) De combien le haut de notre corps est plié en avant pour manger (rad).
     eat_bow: f32,
+    /// (v290) La main vide à la première personne : 0, elle pend le long du corps ; 1, le bras
+    /// est tendu devant, le temps d'un geste (frapper, casser, poser).
+    hand_raise: f32,
+    /// (v290) De combien notre tête est tournée (lacet, tangage, rad) vers le milieu du
+    /// membre de L'Évidé qu'on mord, en plus de notre regard : la caméra à la première
+    /// personne et notre modèle ; revient à zéro après la morsure.
+    eat_turn: (f32, f32),
     /// (v272) L'endroit de notre corps que L'Évidé mordra ensuite (pavé, cube) : il le vise,
     /// se penche jusqu'à lui et le suit s'il bouge.
     evide_spot: Option<(usize, [usize; 3])>,
@@ -602,6 +626,11 @@ pub struct Session {
     /// (écrit par `render`, lu à l'image suivante : la pose exacte, objet tenu compris, n'est
     /// connue que là).
     bite_points: std::cell::RefCell<BitePoints>,
+    /// (v290) Pour l'anticrénelage (« le monstre a de la rémanence ») : les repères des pavés
+    /// de chaque Évidé dessiné à l'image d'avant (par numéro), et la pose du joueur local
+    /// dessiné en F5 à l'image d'avant (avec sa révérence), voir `entities_moved`.
+    evide_seen: std::cell::RefCell<HashMap<u32, Vec<Mat4>>>,
+    own_seen: std::cell::Cell<Option<(crate::player_model::Prev, f32)>>,
     /// (v264) Plaies des joueurs de la partie FPS (« un impact dans le joueur ») : par pseudo
     /// (vide : le joueur local), jusqu'à sa mort ou la fin de la manche, comme les traces sur
     /// les blocs. Dessinées sur son modèle (`player_model::wound_model`).
@@ -1036,9 +1065,13 @@ impl Session {
             team_skin: Default::default(),
             eating: None,
             eat_bow: 0.0,
+            hand_raise: 0.0,
+            eat_turn: (0.0, 0.0),
             evide_spot: None,
             bleeding: Vec::new(),
             bite_points: Default::default(),
+            evide_seen: Default::default(),
+            own_seen: Default::default(),
             // Essais : MINELIB_EVIDE="x,y,z,lacet°[,posture]" pose d'avance un Évidé (figé dans
             // la posture nommée : debout, court, rampe, mord, mange ; vivant sans posture) ;
             // plusieurs séparés par « ; ».
@@ -1559,22 +1592,37 @@ impl Session {
             // (« si la bouche se décolle avant, ça ne mange pas, dans les deux sens ») ; puis
             // on se redresse.
             let mut bow = 0.0;
+            let mut turn = (0.0f32, 0.0f32);
             if let Some((id, part, cell, t, done)) = self.eating {
+                // (Le morceau, et le milieu du membre où il est.)
                 let target = self
                     .evides
                     .by_id(id)
                     .filter(|e| !e.is_dying())
-                    .map(|e| e.cell_point(part, cell));
+                    .map(|e| (e.cell_point(part, cell), e.part_point(part)));
                 self.eating = None;
-                if let Some(target) = target {
+                if let Some((target, limb)) = target {
                     let mut pose = self.body_pose();
-                    let reach = crate::player_model::bow_to(&mut pose, target);
+                    crate::player_model::bow_to(&mut pose, target);
                     bow = pose.bow;
+                    // (v290) « Le joueur se penche à la bonne hauteur et tourne la tête vers
+                    // le centre du membre attaqué, et revient à sa position initiale à la fin
+                    // de la morsure » : de combien tourner (lacet, tangage) pour regarder le
+                    // milieu de ce membre depuis notre bouche ; la caméra à la première
+                    // personne et notre modèle (F5, ombre) tournent d'autant, puis reviennent.
+                    let to = limb - crate::player_model::mouth_point(&pose);
+                    let flat = Vec3::new(to.x, 0.0, to.z).length();
+                    if flat > 0.1 {
+                        let yaw = to.x.atan2(-to.z) - self.player.yaw;
+                        turn.0 = yaw.sin().atan2(yaw.cos()).clamp(-EAT_TURN_MAX, EAT_TURN_MAX);
+                    }
+                    let pitch = to.y.atan2(flat.max(0.1)).clamp(-1.3, 1.3) - self.player.pitch;
+                    turn.1 = pitch.clamp(-EAT_TURN_MAX, EAT_TURN_MAX);
                     let (t, mut done) = (t + dt, done);
                     if t >= EAT_IN && !done {
                         done = true;
-                        let mouth = crate::player_model::mouth_point(&self.body_pose());
-                        if reach <= EAT_TOUCH && mouth.distance(target) <= EAT_TOUCH {
+                        let far = crate::evide::EAT_REACH + EAT_SLACK;
+                        if self.player.eye().distance(target) <= far {
                             let eaten = self.evides.by_id(id).and_then(|e| e.eaten_at(part, cell));
                             if let Some(dead) = eaten {
                                 crate::audio::jelly_bite(0.0);
@@ -1590,6 +1638,9 @@ impl Session {
                 }
             }
             self.eat_bow += (bow - self.eat_bow).clamp(-BOW_SPEED * dt, BOW_SPEED * dt);
+            let step = EAT_TURN_SPEED * dt;
+            self.eat_turn.0 += (turn.0 - self.eat_turn.0).clamp(-step, step);
+            self.eat_turn.1 += (turn.1 - self.eat_turn.1).clamp(-step, step);
             // (v269) Les Évidés. (v272) En solo et dans un monde de construction en ligne (là,
             // ceux de ce joueur seulement : rien n'est partagé, le relais n'a rien à valider) ;
             // pas en partie FPS. La nuit, il en vient tout seuls, rarement
@@ -1600,6 +1651,7 @@ impl Session {
                         feet: self.player.pos,
                         eye: self.player.eye(),
                         spot: self.evide_spot.and(self.bite_points.borrow().0),
+                        limb: self.evide_spot.and(self.bite_points.borrow().2),
                     });
                 let night = self.game.mode != GameMode::Fps
                     && self.time_h >= 0.0
@@ -1767,6 +1819,11 @@ impl Session {
                     fps: false,
                 }
             };
+            if test_pose().is_some_and(|p| p.2) {
+                // (En créatif on vole dès qu'on est placé en l'air : posé, pour s'accroupir.)
+                m.sneak = true;
+                self.player.flying = false;
+            }
             // Touche « avancer » qui remonte mal (voir `stick`) : chez un joueur dont elle
             // traîne après chaque course, lâcher « courir » arrête d'avancer tout de suite.
             // (Pas en mode FPS : « marcher » relâchée y veut dire courir, pas s'arrêter.)
@@ -2383,6 +2440,9 @@ impl Session {
                 crate::hand::Gesture::None
             };
             self.hand.update(dt, speed, gesture, held);
+            // (v290) La main vide se tend le temps d'un geste (vite), puis retombe.
+            let raise = if self.hand.busy() { dt / HAND_UP_S } else { -dt / HAND_BACK_S };
+            self.hand_raise = (self.hand_raise + raise).clamp(0.0, 1.0);
             // Balancement des bras et des jambes du modèle (vue F5), et des autres joueurs.
             self.walk_phase = (self.walk_phase + stride_rate(speed) * dt) % std::f32::consts::TAU;
             // (v165, essai) Foule simulée en solo, hors mode FPS. (v185) Seulement si on l'a
@@ -3647,7 +3707,9 @@ impl Session {
         // (v220) Bloc en train d'être cassé (survie) : oublié si on ne le casse plus à cette
         // image (voir plus bas).
         let dig = self.dig.take();
-        if !input.grabbed || self.inventory.open {
+        // (Essais : avec MINELIB_CLIC, sans la souris prise non plus.)
+        let free = !input.grabbed && std::env::var_os("MINELIB_CLIC").is_none();
+        if free || self.inventory.open {
             return;
         }
         // (v220) Clic gauche ou droit : la main frappe (arc), sauf si un bloc se casse (coup
@@ -3723,7 +3785,12 @@ impl Session {
         // rien n'est cassé derrière lui.
         // (v235) Sauf avec la Foudre de Zeus en main : le clic lance la foudre, qui tombe sur
         // lui (plus bas).
-        let attack = keys.pressed(input, Action::Attack);
+        let clicked = test_click(dt);
+        if clicked {
+            // (Essais : le geste de la main part avec le clic simulé.)
+            self.gesture = crate::hand::Gesture::Swing;
+        }
+        let attack = keys.pressed(input, Action::Attack) || clicked;
         let zeus = self.inventory.selected_item() == Some(Item::Zeus);
         // (v269) Un Évidé visé de près : le clic en mange un morceau, quel que soit l'objet tenu
         // (« les épées ne lui font rien : il faut le manger vivant, de près ») ; clic tenu,
@@ -3735,17 +3802,12 @@ impl Session {
                 .filter(|a| hit.as_ref().is_none_or(|b| a.1 <= b.distance));
             if let Some((id, _, part, cell)) = aim {
                 // (v272) « On doit se voir se pencher pour manger le morceau qu'on vise si on
-                // est assez près de lui » : la bouchée ne part que si notre bouche peut
-                // arriver sur ce morceau en pliant le haut du corps ; elle est menée image
-                // après image plus bas (`eating`).
+                // est assez près de lui » : la bouchée est menée image après image plus bas
+                // (`eating`), le haut du corps plié vers ce morceau.
+                // (v290) « Je n'arrive plus à manger le monstre […] que ça fonctionne quand je
+                // clique » : le clic suffit, que notre bouche puisse y arriver ou non.
                 if attack && self.eating.is_none() {
-                    let target = self.evides.by_id(id).map(|e| e.cell_point(part, cell));
-                    if let Some(target) = target {
-                        let mut pose = self.body_pose();
-                        if crate::player_model::bow_to(&mut pose, target) <= EAT_TOUCH {
-                            self.eating = Some((id, part, cell, 0.0, false));
-                        }
-                    }
+                    self.eating = Some((id, part, cell, 0.0, false));
                 }
                 self.punch_latch = true;
                 return;
@@ -5871,16 +5933,22 @@ impl Session {
     }
 
     /// (v272) Notre corps tel qu'il est (sans l'objet tenu), plié de `eat_bow`.
+    /// Où en est notre marche : (moment du pas, ampleur du balancement).
+    fn stride(&self) -> (f32, f32) {
+        test_pose().map_or((self.walk_phase, self.walk_amp), |p| (p.0, p.1))
+    }
+
     fn body_pose(&self) -> crate::player_model::Pose {
+        let (walk, swing) = self.stride();
         crate::player_model::Pose {
             feet: self.player.pos,
-            yaw: self.player.yaw,
-            pitch: self.player.pitch,
-            walk: self.walk_phase,
-            swing: self.walk_amp,
+            yaw: self.player.yaw + self.eat_turn.0,
+            pitch: self.player.pitch + self.eat_turn.1,
+            walk,
+            swing,
             crouch: self.player.crouch,
             light: self.hand_light,
-            // (v281) Le bras tel qu'il est dessiné (la main vide tendue).
+            // (v281) Le bras tel qu'il est dessiné. (v290) La main vide pend.
             held: self.model_held(),
             skin: None,
             bow: self.eat_bow,
@@ -5915,9 +5983,12 @@ impl Session {
                 }
                 // (v281) « Comme quand je tiens un item, mon bras en F5, je dois le voir dans la
                 // même position qu'à la première personne, aussi quand je ne tiens pas d'item » :
-                // la main vide est tendue comme si elle tenait un bloc (un bloc d'air : rien
-                // dedans), en F5, dans les miroirs et à la première personne (v247).
-                None => Some(Held::Block(minelib_world::BlockId::AIR)),
+                // la main vide était tendue comme si elle tenait un bloc, en F5, dans les
+                // miroirs et à la première personne (v247). (v290) « Arrête de pencher mon bras
+                // en avant quand je n'ai pas d'item dans les mains, à la première personne et en
+                // F5 » : la main vide pend le long du corps, partout pareil ; à la première
+                // personne, elle ne se tend que le temps d'un geste (`hand_raise`).
+                None => None,
             }
         } else {
             None
@@ -5925,12 +5996,13 @@ impl Session {
     }
 
     fn own_pose(&self, held: crate::player_model::Held) -> crate::player_model::Pose {
+        let (walk, swing) = self.stride();
         crate::player_model::Pose {
             feet: self.player.pos,
-            yaw: self.player.yaw,
-            pitch: self.player.pitch,
-            walk: self.walk_phase,
-            swing: self.walk_amp,
+            yaw: self.player.yaw + self.eat_turn.0,
+            pitch: self.player.pitch + self.eat_turn.1,
+            walk,
+            swing,
             crouch: self.player.crouch,
             light: self.hand_light,
             held: Some(held),
@@ -6139,6 +6211,14 @@ impl Session {
             } else {
                 self.first_person_eye()
             };
+            // (v290) En mordant L'Évidé, le regard tourne vers le milieu du membre mordu, puis
+            // revient (`eat_turn`).
+            if self.eat_turn != (0.0, 0.0) {
+                let y = self.player.yaw + self.eat_turn.0;
+                let p = (self.player.pitch + self.eat_turn.1).clamp(-1.55, 1.55);
+                let dir = Vec3::new(y.sin() * p.cos(), p.sin(), -y.cos() * p.cos());
+                return (eye, Mat4::look_to_rh(eye, dir, Vec3::Y), dir);
+            }
             (eye, self.view_with_punch(), self.player.look_dir())
         } else {
             let eye = self.player.eye();
@@ -7209,6 +7289,10 @@ impl Session {
                     self.fps.bleed(from, self.player.vel, BLEED_SPURT, true);
                     self.bleeding.push((b.part as usize, cell, 0.0, 0.0));
                 }
+                // (v290) « Notre joueur doit faire le bruit d'avoir mal habituel aussi à une
+                // morsure » : le cri des coups reçus (celui des PNJ frappés, des joueurs
+                // touchés en partie FPS).
+                self.fps.sounds.push((crate::audio::Sfx::Pain, 0.0, 0.7));
                 self.damage(EVIDE_BITE);
             }
         }
@@ -7251,6 +7335,7 @@ impl Session {
         self.evide_spot = None;
         self.eating = None;
         self.eat_bow = 0.0;
+        self.eat_turn = (0.0, 0.0);
         self.fps.respawn();
         // (v283) Réapparu loin : pas en jeu tant que le monde n'y est pas chargé.
         self.arrive_elsewhere();
@@ -11244,12 +11329,13 @@ impl Session {
         let (cam, view, _) = self.view_camera();
         use crate::player_model::Held;
         let held = self.model_held();
+        let (walk, swing) = self.stride();
         let pose = crate::player_model::Pose {
             feet: self.player.pos,
-            yaw: self.player.yaw,
-            pitch: self.player.pitch,
-            walk: self.walk_phase,
-            swing: self.walk_amp,
+            yaw: self.player.yaw + self.eat_turn.0,
+            pitch: self.player.pitch + self.eat_turn.1,
+            walk,
+            swing,
             crouch: self.player.crouch,
             light: self.hand_light,
             held,
@@ -11263,6 +11349,9 @@ impl Session {
             seen.0 = self
                 .evide_spot
                 .map(|(p, c)| crate::player_model::cell_point(&pose, p, c));
+            seen.2 = self
+                .evide_spot
+                .map(|(p, _)| crate::player_model::part_point(&pose, p));
             seen.1 = self
                 .bleeding
                 .iter()
@@ -11270,21 +11359,60 @@ impl Session {
                 .collect();
         }
         let visible = self.game.mode != GameMode::Spectator;
-        let mut model = if third != 0 && visible {
-            // (v269) Avec ce que L'Évidé lui a mangé.
-            let mut m = crate::player_model::build_bitten(&pose, self.flesh.get(""));
-            // (v264) Ses plaies (partie FPS), sur son corps.
-            if let Some(w) = self.wounds.get("") {
-                m.extend(crate::player_model::wound_model(&pose, w));
-            }
-            m
+        // (v290) Ce qui dit son mouvement à l'anticrénelage (sa place à l'image d'avant,
+        // sommet par sommet) : le corps du joueur local en F5, les Évidés. Mis à la fin des
+        // entités de l'image (`entities_moved`).
+        let mut moved: Vec<minelib_render::EntityVertex> = Vec::new();
+        let mut moved_prev: Vec<[f32; 3]> = Vec::new();
+        if third != 0 && visible {
+            let body = |p: &crate::player_model::Pose| {
+                // (v269) Avec ce que L'Évidé lui a mangé.
+                let mut m = crate::player_model::build_bitten(p, self.flesh.get(""));
+                // (v264) Ses plaies (partie FPS), sur son corps.
+                if let Some(w) = self.wounds.get("") {
+                    m.extend(crate::player_model::wound_model(p, w));
+                }
+                m
+            };
+            let m = body(&pose);
+            // (v290) « De la rémanence sur l'intérieur d'un joueur » : son corps n'avait aucun
+            // mouvement (« il suit la caméra »), alors qu'il balance bras et jambes, se penche,
+            // s'accroupit, et que la caméra tourne autour de lui en F5 ; les cubes rouges de
+            // l'intérieur d'un corps mordu traînaient. Le même corps dans la pose de l'image
+            // d'avant donne la place d'avant de chaque sommet (même skin, même objet, mêmes
+            // morsures : les mêmes sommets dans le même ordre ; sinon, immobile).
+            let before = self
+                .own_seen
+                .replace(Some((crate::player_model::Prev::still(&pose), pose.bow)));
+            let old = before
+                .map(|(p, bow)| {
+                    body(&crate::player_model::Pose {
+                        feet: p.feet,
+                        yaw: p.yaw,
+                        pitch: p.pitch,
+                        walk: p.walk,
+                        swing: p.swing,
+                        crouch: p.crouch,
+                        light: pose.light,
+                        held: pose.held,
+                        skin: pose.skin.clone(),
+                        bow,
+                    })
+                })
+                .filter(|o| o.len() == m.len());
+            moved_prev.extend(
+                m.iter()
+                    .enumerate()
+                    .map(|(i, v)| old.as_ref().map_or(v.pos, |o| o[i].pos)),
+            );
+            moved.extend(m);
         } else {
-            Vec::new()
-        };
-        // Jusqu'ici, le modèle du joueur local (il suit la caméra) ; le reste est fixé
-        // dans le monde (vecteurs de mouvement de l'anticrénelage). Avec la caméra libre,
-        // le joueur ne la suit pas.
-        let follow = if free { 0 } else { model.len() };
+            self.own_seen.set(None);
+        }
+        let mut model: Vec<minelib_render::EntityVertex> = Vec::new();
+        // (Avant la v290, le corps du joueur local était en tête, sans mouvement : « il suit
+        // la caméra ».) Le reste est fixé dans le monde.
+        let follow = 0;
         // (v197) Tableaux de l'image repris à l'image d'avant (voir `Scratch`).
         let mut scratch = std::mem::take(&mut *self.scratch.borrow_mut());
         let mut shadows = std::mem::take(&mut scratch.shadows);
@@ -11464,16 +11592,27 @@ impl Session {
             }
         }
         // (v269) Les Évidés : leur corps cube par cube, leur ombre.
+        let evides_before = self.evide_seen.borrow();
+        let mut evides_now = HashMap::new();
         for e in &self.evides.list {
             if e.pos.distance(self.player.pos) > EVIDE_DRAWN {
                 continue;
             }
             let light = sky_light(&self.world, e.eye(), self.daylight_shown);
-            model.extend(e.mesh(light));
+            // (v290) Avec sa place à l'image d'avant (voir `mesh_moved`).
+            let frames = e.mesh_moved(
+                light,
+                evides_before.get(&e.id).map(Vec::as_slice),
+                &mut moved,
+                &mut moved_prev,
+            );
+            evides_now.insert(e.id, frames);
             if !e.is_dying() {
                 shadows.push((e.pos, e.shadow_boxes(), None));
             }
         }
+        drop(evides_before);
+        self.evide_seen.replace(evides_now);
         // Construction en ligne (et, en solo, la foule d'essai : dessinée pareil).
         // (v197) Sa place d'un coup : 4 000 joueurs, c'était une douzaine
         // d'agrandissements et autant de recopies par image.
@@ -11732,9 +11871,12 @@ impl Session {
         // F5 ») : la main vide est le bras du modèle, tendu comme s'il tenait un bloc, sans
         // rien dedans (avant : une main dessinée à part, à l'écran, qui ne suivait pas
         // l'accroupi).
+        // (v290) La main vide pend le long du corps (le bras droit du modèle, dessiné avec le
+        // corps : `first_person_body`) ; le temps d'un geste (frapper, casser, poser), le bras
+        // se tend comme s'il tenait un bloc (un bloc d'air : rien dedans), monté depuis l'épaule
+        // (`hand_raise`), puis retombe.
+        let empty_hand = pose.held.is_none() && !fps_mode;
         let first_hold = match pose.held {
-            // (v281) La main vide (un bloc d'air, comme en F5) : le bras seul.
-            Some(h @ Held::Block(b)) if b == minelib_world::BlockId::AIR => Some((h, false)),
             Some(
                 h @ (Held::Flashlight(_)
                 | Held::Block(_)
@@ -11742,7 +11884,9 @@ impl Session {
                 | Held::Wand(_)
                 | Held::Zeus),
             ) => Some((h, true)),
-            None => Some((Held::Block(minelib_world::BlockId::AIR), false)),
+            None if empty_hand && self.hand_raise > 0.0 => {
+                Some((Held::Block(minelib_world::BlockId::AIR), false))
+            }
             _ => None,
         };
         let first_person_lamp = (third == 0
@@ -11760,7 +11904,20 @@ impl Session {
                 let (p, dip) = self.first_person_hold(held, view);
                 let arm = crate::player_model::right_arm_matrix(&p)?;
                 let lamp = crate::player_model::held_item_matrix(&p).filter(|_| item);
-                Some((lamp.map(|m| dip * m), dip * arm))
+                // (v290) La main vide qui se tend pour un geste, ou retombe après : tournée
+                // vers le bas autour de l'épaule de ce qu'il lui reste à monter.
+                let lift = if empty_hand && self.hand_raise < 1.0 {
+                    let pivot =
+                        view.transform_point3(arm.transform_point3(Vec3::new(0.5, 0.5, 1.0)));
+                    view.inverse()
+                        * Mat4::from_translation(pivot)
+                        * Mat4::from_rotation_x(-HAND_DOWN * (1.0 - self.hand_raise))
+                        * Mat4::from_translation(-pivot)
+                        * view
+                } else {
+                    Mat4::IDENTITY
+                };
+                Some((lamp.map(|m| dip * m), lift * dip * arm))
             });
         let hand = if self.spectating.is_some() && fps_mode {
             // (v209) Spectateur : l'arme du joueur regardé dans ses mains, et ce qui est dans
@@ -11852,6 +12009,7 @@ impl Session {
         } else if third == 0
             && !fps_mode
             && !hud_off
+            && !empty_hand
             && self.spectating.is_none()
             && self.game.mode != GameMode::Spectator
         {
@@ -11883,6 +12041,8 @@ impl Session {
                 wounds,
                 self.flesh.get(""),
                 world_proj * view,
+                // (v290) La main vide au repos : le bras droit pend, avec le corps.
+                empty_hand && self.hand_raise <= 0.0,
             ));
         }
         let smokes = self.fps.smoke_volumes();
@@ -11927,6 +12087,8 @@ impl Session {
         // chargé.
         let far_ground =
             crate::storm::far_ground(&self.world, cam, fog_end, &|layer| renderer.layer_mean(layer));
+        // (v290) Ce qui dit son mouvement : à la fin des entités.
+        model.extend(moved);
         let params = FrameParams {
             ray_boxes: &ray_boxes,
             smokes: &smokes,
@@ -11940,6 +12102,7 @@ impl Session {
             arm: &arm,
             entities: &model,
             entities_follow: follow,
+            entities_moved: &moved_prev,
             static_entities: &statics,
             players: &players,
             eye: cam,
@@ -12711,6 +12874,43 @@ fn light_shadow_score(lights: &[(Vec3, f32)], feet: Vec3) -> f32 {
 }
 
 /// (v202) Le point `p` est-il dans la boîte `b` (alignée sur les axes) agrandie de `margin` ?
+/// (v290) Essais : MINELIB_CLIC=<s>[,<s>…] : un clic d'attaque à ces secondes de jeu (manger
+/// L'Évidé qu'on vise, geste de la main, sans souris).
+fn test_click(dt: f32) -> bool {
+    static AT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    static CLOCK: std::sync::Mutex<f32> = std::sync::Mutex::new(0.0);
+    let at = AT.get_or_init(|| {
+        std::env::var("MINELIB_CLIC")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect()
+    });
+    if at.is_empty() {
+        return false;
+    }
+    let Ok(mut clock) = CLOCK.lock() else {
+        return false;
+    };
+    let before = *clock;
+    *clock += dt;
+    at.iter().any(|t| before < *t && *t <= *clock)
+}
+
+/// (v290) Essais : MINELIB_POSE=<moment du pas, rad>,<ampleur 0 à 1>[,1] : notre corps figé à
+/// ce moment de la marche, sans avancer (captures des genoux et des coudes) ; « ,1 » : la
+/// touche « s'accroupir » comptée tenue.
+fn test_pose() -> Option<(f32, f32, bool)> {
+    static POSE: std::sync::OnceLock<Option<(f32, f32, bool)>> = std::sync::OnceLock::new();
+    *POSE.get_or_init(|| {
+        let v = std::env::var("MINELIB_POSE").ok()?;
+        let mut it = v.split(',').map(str::trim);
+        let walk = it.next()?.parse().ok()?;
+        let swing = it.next()?.parse().ok()?;
+        Some((walk, swing, it.next() == Some("1")))
+    })
+}
+
 fn near_box(b: &ShadowBox, p: Vec3, margin: f32) -> bool {
     let (mn, mx) = (Vec3::from(b.min) - margin, Vec3::from(b.max) + margin);
     p.cmpge(mn).all() && p.cmple(mx).all()

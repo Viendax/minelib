@@ -133,7 +133,9 @@ impl Flesh {
             .is_some_and(|w| w >> (i % 64) & 1 == 1)
     }
 
-    /// Part du corps mangée (0 … 1), `dims` : la grille de chaque pavé.
+    /// Part du corps mangée (0 … 1), `dims` : la grille de chaque pavé. (v290) Pour les
+    /// essais : L'Évidé ne meurt plus de la part mangée, mais de nos cinq bouchées.
+    #[cfg(test)]
     pub fn eaten(&self, dims: &[[usize; 3]; PARTS]) -> f32 {
         let all: usize = dims.iter().map(|d| d[0] * d[1] * d[2]).sum();
         let gone: u32 = self.gone.iter().flatten().map(|w| w.count_ones()).sum();

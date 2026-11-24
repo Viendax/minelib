@@ -105,6 +105,10 @@ fn face_normal(rel: vec3<f32>) -> vec3<f32> {
 
 @vertex
 fn vs_main(v: VIn) -> VOut {
+    return entity_vertex(v);
+}
+
+fn entity_vertex(v: VIn) -> VOut {
     var o: VOut;
     // (v254) Les matrices du jeu sont comptées depuis la caméra (sans sa translation) : le
     // point aussi. Loin du centre du monde (40 000 blocs), deux grands nombres voisins qui se
@@ -178,4 +182,66 @@ fn fs_taa_world(i: VOut) -> TaaOut {
     let prev = g.prev_view_proj * p;
     let d = prev.xy / prev.w - cur.xy / cur.w;
     return taa_out(i, n, d * vec2<f32>(0.5, -0.5) * g.screen.xy + vec2<f32>(0.02, 0.0));
+}
+
+// (v290) Les entités qui disent leur mouvement (L'Évidé, le corps du joueur local vu en F5) :
+// chaque sommet porte en plus sa place dans le monde à l'image d'avant. « Le monstre a de la
+// rémanence », « de la rémanence sur l'intérieur d'un joueur » : sans mouvement à elles,
+// l'anticrénelage reprenait leur image d'avant là où elles ne sont plus.
+struct VInMoved {
+    @location(0) pos: vec3<f32>,
+    @location(1) color: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) layer: i32,
+    @location(4) light: vec4<f32>,
+    @location(5) prev: vec3<f32>,
+};
+
+struct VOutMoved {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) @interpolate(flat) layer: i32,
+    @location(3) world: vec3<f32>,
+    @location(4) light: vec4<f32>,
+    @location(5) rel: vec3<f32>,
+    // Sa place à l'image d'avant, comptée depuis la caméra d'aujourd'hui.
+    @location(6) prev_rel: vec3<f32>,
+};
+
+@vertex
+fn vs_moved(v: VInMoved) -> VOutMoved {
+    let b = entity_vertex(VIn(v.pos, v.color, v.uv, v.layer, v.light));
+    var o: VOutMoved;
+    o.clip = b.clip;
+    o.color = b.color;
+    o.uv = b.uv;
+    o.layer = b.layer;
+    o.world = b.world;
+    o.light = b.light;
+    o.rel = b.rel;
+    o.prev_rel = v.prev - g.cam_pos.xyz;
+    return o;
+}
+
+@fragment
+fn fs_taa_moved(i: VOutMoved) -> TaaOut {
+    let n = face_normal(i.rel);
+    let cur = g.cur_view_proj * vec4<f32>(i.rel, 1.0);
+    let prev = g.prev_view_proj * vec4<f32>(i.prev_rel, 1.0);
+    // Derrière la caméra à l'image d'avant : pas d'image d'avant à reprendre (30 000 pixels :
+    // hors de l'écran, l'image courante seule).
+    var motion = vec2<f32>(30000.0, 30000.0);
+    if prev.w > 1e-6 {
+        let d = prev.xy / prev.w - cur.xy / cur.w;
+        motion = d * vec2<f32>(0.5, -0.5) * g.screen.xy;
+        // Elle a bougé dans le monde mais presque pas à l'écran (elle suit la caméra, elle
+        // tourne sur place) : au moins un cinquantième de pixel, comme `fs_taa_world`, pour
+        // que l'anticrénelage la traite en objet qui bouge (bornes serrées).
+        let step = i.prev_rel - i.rel;
+        if dot(step, step) > 1e-10 && dot(motion, motion) < 4e-4 {
+            motion = vec2<f32>(0.02, 0.0);
+        }
+    }
+    return taa_out(VOut(i.clip, i.color, i.uv, i.layer, i.world, i.light, i.rel), n, motion);
 }
