@@ -77,6 +77,7 @@ mod bucket;
 mod buildnet;
 mod chat;
 mod cmdhelp;
+mod corpse;
 mod crowd;
 mod cs;
 mod daytime;

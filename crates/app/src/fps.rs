@@ -1483,6 +1483,18 @@ impl Fps {
         self.traces.bleed(at, vel, count, spurt);
     }
 
+    /// (v299) Des gouttes de ce liquide (voir `Traces::ooze`).
+    pub fn ooze(
+        &mut self,
+        liquid: crate::corpse::Liquid,
+        at: Vec3,
+        vel: Vec3,
+        count: usize,
+        spurt: bool,
+    ) {
+        self.traces.ooze(liquid, at, vel, count, spurt);
+    }
+
     /// (v272) Hors partie FPS (où `tick_effects` ne tourne pas) : les gouttes de sang
     /// tombent et tachent le sol, et le sang n'y reste que `max_age` secondes.
     pub fn tick_blood(&mut self, dt: f32, world: &World, max_age: f32) {
@@ -1749,8 +1761,15 @@ impl Fps {
             let d = b.vel.normalize_or(Vec3::NEG_Y);
             let w = cam_right(b.pos, d) * s;
             let tail = b.pos - d * (s * 1.5 + (b.vel.length() * 0.012).min(0.10));
-            push_tri(&mut out, view_proj, [tail, b.pos - w, b.pos + w], red);
-            push_tri(&mut out, view_proj, [b.pos - w, b.pos + d * s * 0.8, b.pos + w], red);
+            // (v299) De la couleur de son liquide : le sang, la gelée pâle de L'Évidé, le
+            // violet de ses veines.
+            let color = match b.liquid {
+                crate::corpse::Liquid::Blood => red,
+                crate::corpse::Liquid::Jelly => [0.80 * lit, 0.77 * lit, 0.62 * lit, 1.0],
+                crate::corpse::Liquid::Vein => [0.10 * lit, 0.035 * lit, 0.17 * lit, 1.0],
+            };
+            push_tri(&mut out, view_proj, [tail, b.pos - w, b.pos + w], color);
+            push_tri(&mut out, view_proj, [b.pos - w, b.pos + d * s * 0.8, b.pos + w], color);
         }
         for (p, v, age, c) in &self.sparks {
             let s = 0.025 * (1.0 - age / 0.35);

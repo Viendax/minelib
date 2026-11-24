@@ -30,6 +30,7 @@ use glam::{Mat4, Vec3};
 use minelib_render::{EntityVertex, ShadowBox};
 use minelib_world::{ChunkPos, World};
 
+use crate::corpse::Liquid;
 use crate::flesh::{Flesh, PARTS};
 
 /// Sa taille debout (blocs) et son étirement par rapport au joueur.
@@ -70,6 +71,10 @@ const BITE_PITCH: f32 = -1.2;
 /// (v290) En mordant, sa tête vise le milieu du membre mordu, à la hauteur de l'endroit mordu
 /// ramenée de cette part vers ce milieu.
 const BITE_INWARD: f32 = 0.3;
+/// (v299) Son cri : tant de secondes à faire sa gueule ronde, dont les dernières à la
+/// refermer.
+const SCREAM_S: f32 = 1.5;
+const MAW_SHUT_S: f32 = 0.2;
 /// Une morsure : durée du geste (s), instant où la bouche se referme.
 const BITE_S: f32 = 1.8;
 const BITE_AT: f32 = 1.04;
@@ -93,8 +98,19 @@ const OUR_BITE: usize = 4;
 /// tête.)
 pub const LIFE: u8 = crate::save::MAX_HEALTH;
 pub const OUR_BITE_HURTS: u8 = 4;
-/// Sa fin : il s'affaisse comme une gelée (s).
-const DIE_S: f32 = 0.7;
+/// (v299) Sa fin : mort, il tombe, puis fond dès qu'il ne bouge plus (au plus tard après
+/// `MELT_WAIT` secondes) : sa chair en `MELT_S` secondes, puis ses veines en `VEIN_S` ; au
+/// plus tant de gouttes par image. Vivant, la gelée coule de ce qu'on lui a mangé : gouttes
+/// du jet, puis gouttes par seconde au début, qui s'espacent (divisées par e toutes les
+/// `OOZE_FADE_S` secondes), pendant `OOZE_S`.
+const MELT_WAIT: f32 = 1.6;
+const MELT_S: f32 = 5.0;
+const VEIN_S: f32 = 2.5;
+const MELT_DROPS: usize = 5;
+const OOZE_SPURT: u8 = 12;
+const OOZE_RATE: f32 = 8.0;
+const OOZE_FADE_S: f32 = 3.0;
+const OOZE_S: f32 = 10.0;
 /// Au plus tant de monstres à la fois ; au plus tant venus tout seuls.
 pub const MAX: usize = 16;
 const NATURAL_MAX: usize = 2;
@@ -124,9 +140,14 @@ const WHITE: u32 = 0xf3f1ea;
 const GREY: u32 = 0xdcdad2;
 const YELLOW: u32 = 0xe9e2c4;
 const HOLLOW: u32 = 0xcbc9c1;
-const OUTLINE: u32 = 0xa3a29c;
-const SOCKET: u32 = 0xd9d8d3;
+// (v299) « Les yeux, dissimule-les mieux, en gelée » : leur contour et leur creux ont les
+// teintes de sa gelée (`flesh::JELLY`), à peine plus marquées que ses plaques jaunâtres (ils
+// étaient gris : 0xa3a29c et 0xd9d8d3).
+const OUTLINE: u32 = 0xdcd8bc;
+const SOCKET: u32 = 0xe9e5d0;
 const MOUTH: [u32; 3] = [0x2a1418, 0x160a0d, 0x070304];
+// (v299) Ses dents : l'ivoire de devant, et de côté (dans l'ombre de la bouche).
+const TOOTH: [u32; 2] = [0xd9cc98, 0x9c9068];
 // (v272) Ses veines, dans la gelée.
 const VEIN: [u32; 2] = [0x4d2a68, 0x3a2152];
 
@@ -431,9 +452,232 @@ pub fn limbs(pos: Vec3, yaw: f32, a: &Anim) -> Limbs {
 /// `open` (−0,5 refermée : une fente … 1 grande ouverte). Un ovale creusé dans le bas du
 /// visage, profond de plus de la moitié de la tête.
 pub fn mouth(c: [usize; 3], d: [usize; 3], open: f32) -> bool {
+    mouth_of(MOUTH_STYLE, c, d, open)
+}
+
+/// (v299) « La bouche du monstre : fais-moi plusieurs propositions visuelles » : la forme de
+/// sa bouche. 0 : l'ovale (celle qu'il a) ; 1 : une fente verticale, du menton au front, qui
+/// s'écarte ; 2 : un sourire d'une joue à l'autre, qui s'ouvre vers le bas ; 3 : une gueule
+/// ronde bordée de dents ; 4 : la mâchoire fendue en deux depuis le menton ; 5 : l'ovale avec
+/// des dents en haut et en bas. « Un mix de ces deux-là [le sourire et l'ovale à dents],
+/// quelques propositions, des joues trouées aussi » (`mix`) : 6 : le sourire à dents ; 7 :
+/// l'ovale à dents dont les coins remontent ; 8 : le sourire à dents, les joues trouées (on y
+/// voit ses dents du fond) ; 9 : l'ovale à dents, les joues trouées ; 10 : le sourire fendu
+/// jusqu'aux oreilles, des dents tout le long ; 11 : l'ovale à dents, un coin déchiré sur la
+/// joue. `MOUTH_STYLE` : celle des Évidés du jeu (« lui » : la 8, choisie sur les images).
+pub const MOUTH_STYLES: u8 = 13;
+pub const MOUTH_STYLE: u8 = 8;
+/// (v299) « Il peut faire ce visage aussi [la gueule ronde bordée de dents], mais pas quand il
+/// mord » : la forme 12, la gueule ronde de la forme 3 avec les joues trouées de la sienne ;
+/// il la fait quand il crie (`Evide::maw`).
+pub const MAW_STYLE: u8 = 12;
+
+/// (v299) Ce qu'est un cube de sa tête pour sa bouche.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Jaw {
+    /// De la tête, comme le reste.
+    Flesh,
+    /// Dans le creux : rien, et du noir autour.
+    Hollow,
+    /// Une dent : pleine, couleur d'ivoire.
+    Tooth,
+}
+
+pub fn mouth_of(style: u8, c: [usize; 3], d: [usize; 3], open: f32) -> bool {
+    jaw_of(style, c, d, open) == Jaw::Hollow
+}
+
+pub fn jaw_of(style: u8, c: [usize; 3], d: [usize; 3], open: f32) -> Jaw {
+    if style >= 6 {
+        // Sa place dans une tête de 8 × 16 × 8.
+        let cell = |k: usize, n: usize| ((c[k] * 2 + 1) * n / (d[k].max(1) * 2)) as i32;
+        let (col, row, lay) = (cell(0, 8), cell(1, 16), cell(2, 8));
+        let o = open.clamp(-0.5, 1.0);
+        if style == MAW_STYLE {
+            // Sa gueule ronde (la forme 3) et les trous de ses joues (ceux de la forme 8).
+            if let Some(jaw) = cheeks(col, row, lay, o.max(0.0), None) {
+                return jaw;
+            }
+            return if plain_mouth(3, c, d, open) { Jaw::Hollow } else { Jaw::Flesh };
+        }
+        return mix(style, col, row, lay, o);
+    }
+    if plain_mouth(style, c, d, open) {
+        Jaw::Hollow
+    } else {
+        Jaw::Flesh
+    }
+}
+
+/// (v299) Les mélanges du sourire et de l'ovale à dents (formes 6 à 11), dans une tête de
+/// 8 colonnes × 16 rangées × 8 couches (la couche 0 : le visage). Les dents de devant : en
+/// haut une colonne sur deux, en bas les autres (elles s'emboîtent quand il referme). Les
+/// joues trouées : un trou déchiqueté de chaque côté, et derrière, ses dents du fond.
+fn mix(style: u8, col: i32, row: i32, lay: i32, o: f32) -> Jaw {
+    let wide = o.max(0.0);
+    // 0 au bord de la tête … 3 au milieu.
+    let near = col.min(7 - col);
+    let smile = matches!(style, 6 | 8 | 10);
+    // Le côté déchiré de la forme 11.
+    let torn = style == 11 && col >= 4;
+    // Les lèvres : pour une colonne, ses rangées ouvertes, et si c'est un coin (peu profond).
+    let lips = |col: i32| -> Option<(i32, i32, bool)> {
+        let px = col as f32 - 3.5;
+        let side = px.abs();
+        if smile {
+            // Une bande courbe, plus haute vers les joues ; elle s'ouvre surtout au milieu.
+            let line = 3.0 + 0.24 * px * px;
+            let bulge = 1.0 - (px / 4.2).powi(2);
+            let bottom = (line - 0.55 - 2.8 * wide * bulge).max(1.0);
+            let top = line + 0.5 + 1.2 * wide * bulge;
+            return Some(((bottom - 0.5).ceil() as i32, (top - 0.5).floor() as i32, side > 3.0));
+        }
+        // L'ovale, et ses coins qui remontent d'un cube par colonne.
+        let half = 2.0 + wide;
+        let lo = (3.0 - 2.0 * o).floor() as i32;
+        let hi = ((5.0 + 3.5 * o).floor() as i32).max(lo);
+        let round = hi - lo >= 3;
+        if side < half {
+            let edge = side + 1.0 >= half && round;
+            return Some(if edge { (lo + 1, hi - 1, false) } else { (lo, hi, false) });
+        }
+        let k = (side - half + 0.5).ceil() as i32;
+        let r = hi - round as i32 + k - 1;
+        // (Forme 11 : un coin court d'un côté, large et déchiré de l'autre.)
+        let wide_corner = style == 11 && col >= 4;
+        if style == 11 && !wide_corner && k > 1 {
+            return None;
+        }
+        Some((r - wide_corner as i32, r, true))
+    };
+    let deep = lay as f32 + 0.5 < 5.0 + wide;
+    if matches!(style, 8 | 9) {
+        let rows = match lips(col) {
+            Some((a, b, false)) => Some((a, b)),
+            _ => None,
+        };
+        if let Some(jaw) = cheeks(col, row, lay, wide, rows) {
+            return jaw;
+        }
+    }
+    if style == 10 && lay <= 5 {
+        // La fente continue sur le côté de la tête, en montant vers l'oreille.
+        let line = 5 + (0.34 * lay as f32 + 0.3) as i32;
+        let more = (1.6 * wide * (1.0 - lay as f32 / 6.0)) as i32;
+        if (line - more..=line).contains(&row) {
+            if near == 0 {
+                return Jaw::Hollow;
+            }
+            if near == 1 && lay >= 1 {
+                return if lay % 2 == 1 { Jaw::Tooth } else { Jaw::Hollow };
+            }
+        }
+    }
+    if torn && lay <= 4 {
+        // Le coin déchiré : il se prolonge sur la joue, en montant, large de deux ou trois cubes.
+        if let Some((_, r, true)) = lips(7) {
+            let line = r + (0.45 * lay as f32) as i32;
+            let jit = hash(7, lay as usize, 3, 5) % 3 == 0;
+            if (line - 1 - jit as i32..=line).contains(&row) {
+                if near == 0 {
+                    return Jaw::Hollow;
+                }
+                if near == 1 && lay >= 1 {
+                    return if (lay + row) % 2 == 1 { Jaw::Tooth } else { Jaw::Hollow };
+                }
+            }
+        }
+    }
+    let Some((lo, hi, corner)) = lips(col) else {
+        return Jaw::Flesh;
+    };
+    if !(lo..=hi).contains(&row) || !(if corner { lay < 2 } else { deep }) {
+        return Jaw::Flesh;
+    }
+    if lay == 0 && (smile || !corner) {
+        let tooth = if hi > lo {
+            (row == hi && near % 2 == 1) || (row == lo && near % 2 == 0)
+        } else {
+            // Sur une seule rangée : une dent sur deux ; refermée (le sourire) : toutes, serrées.
+            near % 2 == 1 || (smile && o < -0.25)
+        };
+        if tooth {
+            return Jaw::Tooth;
+        }
+    }
+    Jaw::Hollow
+}
+
+/// (v299) Les joues trouées : sur chaque côté de la tête un trou déchiqueté (pas le même des
+/// deux côtés), et derrière, l'intérieur de la joue : creux, bordé de ses dents du fond
+/// (`lips` : les rangées ouvertes des lèvres à cette colonne, s'il y en a). Rien pour un cube
+/// qui n'est ni l'un ni l'autre.
+fn cheeks(col: i32, row: i32, lay: i32, wide: f32, lips: Option<(i32, i32)>) -> Option<Jaw> {
+    let near = col.min(7 - col);
+    let (cz, cy) = (3.4, 4.4 - 0.4 * wide);
+    let (rz, ry) = (2.2, 1.6 + 0.7 * wide);
+    if near == 0 {
+        let jit = (hash(col as usize, row as usize, lay as usize, 11) % 1000) as f32 / 1000.0;
+        let q = ((lay as f32 + 0.5 - cz) / rz).powi(2) + ((row as f32 + 0.5 - cy) / ry).powi(2);
+        if q <= 0.75 + 0.5 * jit {
+            return Some(Jaw::Hollow);
+        }
+    }
+    if near == 1 && (1..=5).contains(&lay) {
+        let (mut lo, mut hi) = (cy.floor() as i32 - 1, cy.floor() as i32 + 1);
+        if let Some((a, b)) = lips {
+            (lo, hi) = (lo.min(a), hi.max(b));
+        }
+        if (lo..=hi).contains(&row) {
+            let tooth = (row == hi && lay % 2 == 1) || (row == lo && lay % 2 == 0);
+            return Some(if tooth { Jaw::Tooth } else { Jaw::Hollow });
+        }
+    }
+    None
+}
+
+/// Les formes simples (0 à 5).
+fn plain_mouth(style: u8, c: [usize; 3], d: [usize; 3], open: f32) -> bool {
     let o = open.clamp(-0.5, 1.0);
     let (x, y, z) = (c[0] as f32, c[1] as f32, c[2] as f32);
     let (sx, sy, sz) = (d[0] as f32 / 8.0, d[1] as f32 / 16.0, d[2] as f32 / 8.0);
+    if !matches!(style, 0 | 5) {
+        // Le milieu du cube sur une tête de 8 × 16 × 8 (les cubes y sont cubiques).
+        let (px, py, pz) = ((x + 0.5) / sx - 4.0, (y + 0.5) / sy, (z + 0.5) / sz);
+        let wide = o.max(0.0);
+        if pz >= 5.0 + wide {
+            return false;
+        }
+        return match style {
+            // Fente verticale : une ellipse haute et étroite.
+            1 => {
+                let (half, top) = (0.55 + 1.5 * wide + 0.3 * (o + 0.5).min(0.5), 9.0 + 2.5 * wide);
+                let (mid, tall) = ((1.0 + top) / 2.0, (top - 1.0) / 2.0);
+                (px / half).powi(2) + ((py - mid) / tall).powi(2) <= 1.0
+            }
+            // Sourire : une bande courbe, plus haute vers les joues.
+            2 => {
+                let line = 3.2 + 0.26 * px * px;
+                px.abs() <= 3.5 && py >= line - (0.55 + 2.6 * wide) && py <= line + 0.5
+            }
+            // Gueule ronde : un disque ; au bord, à l'entrée, une dent sur deux reste.
+            3 => {
+                let r = 1.35 + 1.75 * wide + 0.8 * o.min(0.0);
+                let (dx, dy) = (px, py - 4.4);
+                let far = (dx * dx + dy * dy).sqrt();
+                let tooth = pz < 1.2
+                    && far > r - 1.0
+                    && r > 1.6
+                    && ((dy.atan2(dx) / TAU * 12.0).floor() as i32).rem_euclid(2) == 0;
+                far <= r && !tooth
+            }
+            // Mâchoire fendue : un coin dont la pointe monte, ouvert jusqu'au menton.
+            _ => {
+                let top = 2.0 + 2.0 * (o.min(0.0) + 0.5) + 4.8 * wide;
+                px.abs() <= 3.3 && py < top - (1.25 - 0.45 * wide) * px.abs()
+            }
+        };
+    }
     // Demi-largeur autour du milieu, rangées du bas et du haut, profondeur.
     let half = (2.0 + o.max(0.0)) * sx;
     let lo = ((3.0 - 2.0 * o) * sy).floor();
@@ -445,7 +689,16 @@ pub fn mouth(c: [usize; 3], d: [usize; 3], open: f32) -> bool {
     }
     // Coins arrondis dès qu'elle est assez ouverte.
     let corner = (x - mid).abs() + 1.0 >= half && (y == lo || y == hi);
-    !(corner && hi - lo >= 3.0)
+    if corner && hi - lo >= 3.0 {
+        return false;
+    }
+    // (v299) Avec des dents : à l'entrée, en haut et en bas, un cube sur deux reste.
+    let tooth = style == 5
+        && z < 1.5 * sz
+        && hi - lo >= 2.0
+        && (y == lo || y == hi)
+        && (c[0] / (sx.round().max(1.0) as usize)) % 2 == 0;
+    !tooth
 }
 
 fn hash(a: usize, b: usize, c: usize, d: usize) -> u32 {
@@ -464,7 +717,7 @@ fn hash(a: usize, b: usize, c: usize, d: usize) -> u32 {
 pub fn skin(part: usize, c: [usize; 3], d: [usize; 3], k: usize) -> u32 {
     let [x, y, _] = c;
     if part == HEAD && k == 0 {
-        // Deux orbites de 3 × 4 cubes au-dessus de la bouche : un contour gris, rien dedans.
+        // Deux orbites de 3 × 4 cubes au-dessus de la bouche : un contour, rien dedans (couleur de sa gelée).
         for x0 in [0usize, d[0] - 3] {
             if (x0..x0 + 3).contains(&x) && (10..=13).contains(&(y * 16 / d[1])) {
                 let row = y * 16 / d[1];
@@ -664,6 +917,7 @@ fn emit_part(
     flesh: &Flesh,
     open: f32,
     rows: std::ops::Range<usize>,
+    style: u8,
 ) {
     // (v290) `rows` : les rangées de cubes (de bas en haut) dessinées dans ce repère ; un
     // membre plié est dessiné en deux fois, le bas dans son repère à lui.
@@ -672,12 +926,20 @@ fn emit_part(
     let (lo, hi) = (Vec3::from(min), Vec3::from(max));
     let step = (hi - lo) / Vec3::new(dims[0] as f32, dims[1] as f32, dims[2] as f32);
     let lit = EntityVertex::light(light, true);
-    let hollow = |c: [usize; 3]| part == HEAD && mouth(c, dims, open);
+    let jaw = |c: [usize; 3]| {
+        if part == HEAD {
+            jaw_of(style, c, dims, open)
+        } else {
+            Jaw::Flesh
+        }
+    };
+    let hollow = |c: [usize; 3]| jaw(c) == Jaw::Hollow;
     for z in 0..dims[2] {
         for y in rows.clone() {
             for x in 0..dims[0] {
                 let c = [x, y, z];
-                if flesh.gone(part, dims, c) || hollow(c) {
+                let own = jaw(c);
+                if flesh.gone(part, dims, c) || own == Jaw::Hollow {
                     continue;
                 }
                 for (k, (axis, sign)) in SIDES.into_iter().enumerate() {
@@ -688,10 +950,19 @@ fn emit_part(
                         nc[axis] = n as usize;
                     }
                     let rgb = if outside {
-                        skin(part, c, dims, k)
+                        if own == Jaw::Tooth {
+                            TOOTH[0]
+                        } else {
+                            skin(part, c, dims, k)
+                        }
                     } else if hollow(nc) {
-                        // Plus noir au fond de la gorge.
-                        MOUTH[(z * 8 / dims[2].max(1)).min(4) / 2]
+                        if own == Jaw::Tooth {
+                            // (v299) Une dent : claire devant, dans l'ombre sur ses côtés.
+                            TOOTH[(axis != 2 || z > 0) as usize]
+                        } else {
+                            // Plus noir au fond de la gorge.
+                            MOUTH[(z * 8 / dims[2].max(1)).min(4) / 2]
+                        }
                     } else if flesh.gone(part, dims, nc) {
                         // De la gelée, ou une veine mise à nu.
                         inside(part, c, dims)
@@ -1000,6 +1271,10 @@ pub enum Event {
     /// (v272) Il choisit où mordre ensuite (`low` : en rampant, nos jambes seulement) : à la
     /// partie de lui dire où c'est (`Prey::spot`).
     Aims { low: bool, seed: u32 },
+    /// (v299) « Quand on mange le monstre, de la gelée coule comme le sang » ; mort, il fond
+    /// en gelée, puis ses veines en gouttes de leur couleur : `count` gouttes de ce liquide
+    /// partent de là (`spurt` : un jet, la bouchée vient d'arracher le morceau).
+    Drips { at: Vec3, liquid: Liquid, count: u8, spurt: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1051,6 +1326,18 @@ pub struct Evide {
     aimed: bool,
     /// Il sursaute quand on le mord (s).
     flinch: f32,
+    /// (v299) La forme de sa bouche (`mouth_of`).
+    mouth_style: u8,
+    /// (v299) Son cri : ce qu'il en reste (s) ; `maw` : il fait sa gueule ronde (`MAW_STYLE`).
+    scream: f32,
+    maw: bool,
+    /// (v299) Mort, il tombe (`corpse::Ragdoll`) puis fond : secondes de fonte écoulées.
+    corpse: Option<crate::corpse::Ragdoll>,
+    melt: f32,
+    /// (v299) La gelée coule de ce qu'on lui a mangé : le morceau qu'on vient d'arracher (un
+    /// jet au pas suivant), puis ses plaies (pavé, cube, âge, gouttes en attente).
+    spurt: Option<(usize, [usize; 3])>,
+    ooze: Vec<(usize, [usize; 3], f32, f32)>,
     /// Sa fin : depuis quand il s'affaisse (s).
     dying: Option<f32>,
     /// Regard : lacet par rapport au corps (positif vers sa droite), tangage.
@@ -1098,6 +1385,13 @@ impl Evide {
             feeding: false,
             aimed: false,
             flinch: 0.0,
+            mouth_style: MOUTH_STYLE,
+            scream: 0.0,
+            maw: false,
+            corpse: None,
+            melt: 0.0,
+            spurt: None,
+            ooze: Vec::new(),
             dying: None,
             look: (0.0, -0.12),
             tic: (0.0, 1.0),
@@ -1138,6 +1432,18 @@ impl Evide {
             "mord" => {
                 (a.hunch, a.arms, a.grab, a.mouth, a.head_pitch) = (1.5, 0.35, 1.0, 1.0, -0.2);
             }
+            // (v299) « bouche3 » : debout, la bouche de la forme 3 grande ouverte ; « bouche3r » :
+            // au repos ; « bouche3f » : refermée.
+            b if b.starts_with("bouche") => {
+                let rest = &b[6..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                e.mouth_style = digits.parse::<u8>().unwrap_or(0) % MOUTH_STYLES;
+                a.mouth = match &rest[digits.len()..] {
+                    "r" => 0.0,
+                    "f" => -0.5,
+                    _ => 1.0,
+                };
+            }
             "mange" => {
                 let grids = grids();
                 for k in 0..9u32 {
@@ -1157,8 +1463,24 @@ impl Evide {
         (self.rng >> 8) as f32 / 16_777_216.0
     }
 
+    /// (v299) Il n'en reste plus rien (tombé, fondu en gelée, ses veines aussi) : à retirer.
     pub fn is_dead(&self) -> bool {
-        self.dying.is_some_and(|t| t >= DIE_S)
+        self.dying.is_some() && self.melt >= MELT_S + VEIN_S + 0.3
+    }
+
+    /// (v299) Son corps là où il est : sa posture vivant ; mort, là où son pantin est tombé.
+    fn body(&self) -> Limbs {
+        let mut l = limbs(self.pos, self.yaw, &self.anim);
+        if let Some(c) = &self.corpse {
+            let f = c.frames();
+            for i in 0..PARTS {
+                l.parts[i].0 = f[i][0];
+                if l.lower[i].is_some() {
+                    l.lower[i] = Some(f[i][1]);
+                }
+            }
+        }
+        l
     }
 
     pub fn is_dying(&self) -> bool {
@@ -1188,7 +1510,7 @@ impl Evide {
     /// de lui qu'on vise pour le manger, là où il est maintenant.
     pub fn cell_point(&self, part: usize, cell: [usize; 3]) -> Vec3 {
         let part = part.min(PARTS - 1);
-        let l = limbs(self.pos, self.yaw, &self.anim);
+        let l = self.body();
         let (xf, lo, hi) = l.parts[part];
         let d = grids()[part];
         // (v290) Sous le genou ou le coude : dans le repère du bas du membre.
@@ -1200,6 +1522,15 @@ impl Evide {
             (cell[2] as f32 + 0.5) / d[2] as f32,
         );
         xf.transform_point3(lo + (hi - lo) * t)
+    }
+
+    /// (v299) La forme de sa bouche en ce moment : la sienne, ou sa gueule ronde quand il crie.
+    pub fn face(&self) -> u8 {
+        if self.maw {
+            MAW_STYLE
+        } else {
+            self.mouth_style
+        }
     }
 
     /// (v272) Le milieu de sa bouche, dans le monde, dans sa posture du moment.
@@ -1282,11 +1613,70 @@ impl Evide {
     pub fn update(&mut self, world: &World, dt: f32, prey: Option<Prey>) -> Vec<Event> {
         let mut events = Vec::new();
         if let Some(t) = &mut self.dying {
+            // (v299) « Quand il meurt il tombe au sol et se transforme progressivement en
+            // gelée partout où il était allongé ; ça finit comme le sang mais en gelée, et on
+            // voit aussi ses veines sous forme de gouttes, de la couleur de ses veines » : il
+            // s'effondre selon les blocs autour de lui (`corpse::Ragdoll`) ; figé (ou au bout
+            // de `MELT_WAIT`), sa chair fond cube par cube pendant `MELT_S`, chaque cube en
+            // gouttes de gelée qui tachent le sol dessous ; puis ses veines, en `VEIN_S`.
+            // (Avant : il s'affaissait sur place en 0,7 s et disparaissait.)
             *t += dt;
-            self.anim.sink = (*t / DIE_S).min(1.0);
+            let age = *t;
             self.anim.mouth = approach(self.anim.mouth, 1.0, dt * 6.0);
+            if let Some(c) = &mut self.corpse {
+                c.update(world, dt);
+            }
+            if age >= MELT_WAIT || self.corpse.as_ref().is_none_or(|c| c.still()) {
+                self.melt += dt;
+                let dims = grids();
+                let mut gone = self.flesh.melt(false, (self.melt / MELT_S).min(1.0), &dims);
+                let mut liquid = Liquid::Jelly;
+                if self.melt > MELT_S {
+                    liquid = Liquid::Vein;
+                    gone = self.flesh.melt(true, ((self.melt - MELT_S) / VEIN_S).min(1.0), &dims);
+                }
+                // Quelques gouttes parmi ce qui vient de fondre (pas une par cube : il y en
+                // a des milliers).
+                let every = gone.len().div_ceil(MELT_DROPS).max(1);
+                for (part, cell) in gone.into_iter().step_by(every) {
+                    events.push(Event::Drips {
+                        at: self.cell_point(part, cell),
+                        liquid,
+                        count: 1,
+                        spurt: false,
+                    });
+                }
+            }
             return events;
         }
+        // (v299) La gelée coule de ce qu'on lui a mangé : un jet quand le morceau part, puis
+        // des gouttes de plus en plus rares pendant `OOZE_S` secondes, de là où est la plaie.
+        if let Some((part, cell)) = self.spurt.take() {
+            events.push(Event::Drips {
+                at: self.cell_point(part, cell),
+                liquid: Liquid::Jelly,
+                count: OOZE_SPURT,
+                spurt: true,
+            });
+            self.ooze.push((part, cell, 0.0, 0.0));
+        }
+        for k in 0..self.ooze.len() {
+            let o = &mut self.ooze[k];
+            o.2 += dt;
+            o.3 += dt * OOZE_RATE * (-o.2 / OOZE_FADE_S).exp();
+            let n = o.3 as u8;
+            o.3 -= f32::from(n);
+            let (part, cell) = (o.0, o.1);
+            if n > 0 {
+                events.push(Event::Drips {
+                    at: self.cell_point(part, cell),
+                    liquid: Liquid::Jelly,
+                    count: n,
+                    spurt: false,
+                });
+            }
+        }
+        self.ooze.retain(|o| o.2 < OOZE_S);
         let here = ChunkPos::containing(self.pos.x.floor() as i32, self.pos.z.floor() as i32);
         // (v290) Essais (posture « navette ») : figé, il va et vient de côté en marchant, à la
         // vitesse d'une course (captures de la rémanence, caméra immobile).
@@ -1329,6 +1719,7 @@ impl Evide {
         if self.voice <= 0.0 {
             self.voice = 6.0 + 8.0 * self.unit();
             events.push(Event::Voice(self.eye()));
+            self.scream = SCREAM_S;
         }
 
         // Ce qu'il veut : un cap, une allure.
@@ -1649,6 +2040,23 @@ impl Evide {
         if self.flinch > 0.0 {
             mouth = 1.0;
         }
+        // (v299) « Il peut faire ce visage aussi, mais pas quand il mord » : quand il crie, il
+        // serre les dents, sa bouche s'arrondit en gueule (`MAW_STYLE`) et s'ouvre en grand,
+        // puis elle se referme et son sourire revient. Jamais en mordant, ni quand on le mord.
+        if feeding || self.flinch > 0.0 {
+            (self.scream, self.maw) = (0.0, false);
+        } else if self.scream > 0.0 {
+            self.scream -= dt;
+            if self.maw {
+                mouth = if self.scream > MAW_SHUT_S { 1.0 } else { -0.5 };
+            } else {
+                mouth = -0.5;
+                self.maw = self.anim.mouth <= -0.3;
+            }
+        } else if self.maw {
+            mouth = -0.5;
+            self.maw = self.anim.mouth > -0.3;
+        }
 
         // Son regard : sur nous s'il nous voit, sinon il balaie.
         let (mut look_yaw, mut look_pitch) = if self.pausing {
@@ -1729,7 +2137,7 @@ impl Evide {
         prev: &mut Vec<[f32; 3]>,
     ) -> Vec<Mat4> {
         let dims = grids();
-        let l = limbs(self.pos, self.yaw, &self.anim);
+        let l = self.body();
         let mut frames = Vec::with_capacity(2 * PARTS);
         for (i, (xf, lo, hi)) in l.parts.into_iter().enumerate() {
             // Deux morceaux rigides par pavé (deux repères rendus, même pour un pavé d'un
@@ -1741,7 +2149,8 @@ impl Evide {
             };
             for (k, (m, rows)) in pieces.into_iter().enumerate() {
                 let from = out.len();
-                emit_part(out, m, lo, hi, i, dims[i], light, &self.flesh, self.anim.mouth, rows);
+                let (flesh, open) = (&self.flesh, self.anim.mouth);
+                emit_part(out, m, lo, hi, i, dims[i], light, flesh, open, rows, self.face());
                 // Chaque morceau est rigide : d'où vient un de ses points = repère d'avant ×
                 // (repère d'aujourd'hui)⁻¹. En double précision : en simple, loin du centre
                 // du monde, un morceau immobile aurait un mouvement d'arrondi. Le même
@@ -1829,16 +2238,28 @@ impl Evide {
 
     /// On lui mange un morceau, là (pavé, cube) : « on mange toujours par les bords », le
     /// morceau ne revient pas. Rend ce qu'on a mangé, et s'il en meurt.
-    pub fn eaten_at(&mut self, part: usize, cell: [usize; 3]) -> Option<bool> {
+    /// (v299) `from` : d'où on le mange (nos yeux) : mort, il tombe à l'opposé.
+    pub fn eaten_at(&mut self, part: usize, cell: [usize; 3], from: Vec3) -> Option<bool> {
         if self.dying.is_some() {
             return None;
         }
         let dims = grids();
         self.flesh.bite_at(part, cell, OUR_BITE, &dims)?;
         self.flinch = 0.25;
+        self.spurt = Some((part, cell));
         let dead = self.health() == 0;
         if dead {
             self.dying = Some(0.0);
+            // Il s'effondre de là où il est, dans sa posture du moment, poussé loin de nous.
+            let l = limbs(self.pos, self.yaw, &self.anim);
+            let stance = crate::corpse::Stance {
+                parts: l.parts,
+                lower: l.lower,
+            };
+            let away = self.pos - from;
+            let push = Vec3::new(away.x, 0.0, away.z).normalize_or(forward(self.yaw + PI)) * 1.6;
+            self.corpse = Some(crate::corpse::Ragdoll::new(&stance, self.vel, push, self.rng));
+            (self.scream, self.maw) = (0.0, false);
         }
         Some(dead)
     }
@@ -2145,14 +2566,52 @@ mod tests {
         assert!(hi.x - lo.x < 1.0, "large de {}", hi.x - lo.x);
     }
 
+    /// (v299) Les formes de bouche proposées : à toute ouverture un creux, qui ne mange ni
+    /// ses orbites ni le haut ni le fond de son crâne ; les mélanges (6 et plus) ont des
+    /// dents ; les joues trouées percent les côtés de sa tête.
+    #[test]
+    fn every_mouth_shape_is_a_hollow_below_the_eyes() {
+        let d = grids()[HEAD];
+        for style in 0..MOUTH_STYLES {
+            for open in [-0.5, 0.0, 0.35, 1.0] {
+                let (mut hollow, mut teeth, mut cheeks) = (0, 0, 0);
+                for z in 0..d[2] {
+                    for y in 0..d[1] {
+                        for x in 0..d[0] {
+                            let side = x == 0 || x + 1 == d[0];
+                            match jaw_of(style, [x, y, z], d, open) {
+                                Jaw::Flesh => continue,
+                                Jaw::Hollow => {
+                                    hollow += 1;
+                                    cheeks += (side && z >= 2) as usize;
+                                }
+                                Jaw::Tooth => teeth += 1,
+                            }
+                            let row = y * 16 / d[1];
+                            let socket = (10..=13).contains(&row) && (x < 3 || x + 3 >= d[0]);
+                            assert!(!socket, "forme {style} ouverte de {open} : dans une orbite");
+                            assert!(row < 14 && z + 1 < d[2], "forme {style} : trop loin");
+                            assert!(style < 6 || row < 10, "forme {style} : jusqu'aux yeux");
+                        }
+                    }
+                }
+                assert!(hollow > 0, "forme {style} ouverte de {open} : pas de creux");
+                assert_eq!(teeth > 0, style >= 6, "forme {style} ouverte de {open} : {teeth} dents");
+                if style >= 8 {
+                    assert!(cheeks > 0, "forme {style} ouverte de {open} : les joues entières");
+                }
+            }
+        }
+    }
+
     /// Sa bouche : un creux toujours là, qui s'agrandit beaucoup et se referme en fente ; sa
     /// peau : presque toute blanche, deux contours d'yeux sans rien dedans.
     #[test]
     fn its_mouth_is_a_hollow_and_its_eyes_are_only_outlines() {
         let d = grids()[HEAD];
-        let count = |open: f32| {
+        let count = |open: f32, deep: usize| {
             let mut n = 0;
-            for z in 0..d[2] {
+            for z in 0..deep {
                 for y in 0..d[1] {
                     for x in 0..d[0] {
                         n += mouth([x, y, z], d, open) as usize;
@@ -2161,8 +2620,12 @@ mod tests {
             }
             n
         };
-        let (shut, rest, wide) = (count(-0.5), count(0.0), count(1.0));
-        assert!(shut > 0 && shut < rest && rest * 3 < wide, "{shut} {rest} {wide}");
+        let (shut, rest, wide) = (count(-0.5, d[2]), count(0.0, d[2]), count(1.0, d[2]));
+        assert!(shut > 0 && shut < rest && rest < wide, "{shut} {rest} {wide}");
+        // (v299) Sur son visage (les trous de ses joues, eux, ne changent guère) : refermée,
+        // ses dents serrées ; ouverte, bien plus grande.
+        let (shut, rest, wide) = (count(-0.5, 1), count(0.0, 1), count(1.0, 1));
+        assert!(shut < rest && rest * 3 < wide, "{shut} {rest} {wide}");
         // Jamais jusqu'au sommet du crâne ni jusqu'aux yeux.
         for x in 0..d[0] {
             for y in 10..d[1] {
@@ -2357,6 +2820,48 @@ mod tests {
         assert!(e.pos.y > 11.9 && e.pos.z < -8.0, "{}", e.pos);
     }
 
+    /// (v299) « Il peut faire ce visage aussi, mais pas quand il mord » : quand il crie, il
+    /// serre les dents puis sa bouche s'arrondit en gueule, grande ouverte, et son sourire
+    /// revient ; jamais pendant qu'il nous mord.
+    #[test]
+    fn it_makes_its_round_maw_when_it_cries_but_never_while_biting() {
+        let w = flat();
+        // Seul : il crie de temps en temps.
+        let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 9);
+        let (mut cries, mut maws, mut shown, mut widest) = (0, 0, 0.0f32, 0.0f32);
+        for _ in 0..(45 * 60) {
+            let was = e.maw;
+            for ev in e.update(&w, 1.0 / 60.0, None) {
+                cries += matches!(ev, Event::Voice(_)) as usize;
+            }
+            assert_eq!(e.face() == MAW_STYLE, e.maw);
+            if e.maw {
+                maws += (!was) as usize;
+                shown += 1.0 / 60.0;
+                widest = widest.max(e.anim.mouth);
+            } else if was {
+                // Elle s'est refermée avant que son sourire revienne.
+                assert!(e.anim.mouth < -0.25, "{}", e.anim.mouth);
+            }
+        }
+        assert!(cries >= 2 && (cries - 1..=cries).contains(&maws), "{cries} cris, {maws} gueules");
+        assert!(widest > 0.95, "ouverte de {widest}");
+        let each = shown / maws as f32;
+        assert!((1.0..1.8).contains(&each), "sa gueule {each} s par cri");
+        // Il nous mord : il crie aussi, mais garde sa bouche à lui.
+        let p = prey(Vec3::new(0.5, 11.0, -1.6));
+        let mut e = Evide::new(Vec3::new(0.5, 11.0, 0.5), 0.0, 9);
+        let (mut bites, mut cries) = (0, 0);
+        for _ in 0..(20 * 60) {
+            for ev in e.update(&w, 1.0 / 60.0, Some(p)) {
+                bites += matches!(ev, Event::Bites { .. }) as usize;
+                cries += matches!(ev, Event::Voice(_)) as usize;
+            }
+            assert!(!(e.feeding && e.maw), "sa gueule ronde en mordant");
+        }
+        assert!(bites >= 5 && cries >= 1, "{bites} morsures, {cries} cris");
+    }
+
     /// Près de nous il s'arrête, se penche, et sa bouche se referme sur nous à intervalles ;
     /// on le mange par morceaux qui ne reviennent pas, et il en meurt.
     #[test]
@@ -2402,7 +2907,7 @@ mod tests {
                 continue;
             };
             assert!((0.0..6.0).contains(&t));
-            if let Some(d) = e.eaten_at(part, cell) {
+            if let Some(d) = e.eaten_at(part, cell, eye) {
                 let now = e.flesh.eaten(&dims);
                 assert!(now > eaten, "bouchée {n} : rien de plus");
                 eaten = now;
@@ -2417,11 +2922,31 @@ mod tests {
         // (v290) « On le tue en 5 morsures. »
         assert!(dead && bites == 5, "{bites} bouchées, mangé à {eaten}");
         assert!(e.aimed(eye, Vec3::NEG_Z, 6.0).is_none());
-        run(&mut e, &w, 1.0, Some(p));
+        // (v299) Mort, il tombe et se fige : couché au sol (son corps ne dépasse plus un
+        // bloc et demi), pas dessous ; puis il fond en gelée, ses veines ensuite, en gouttes
+        // de leur couleur ; à la fin il n'en reste rien.
+        let before = run(&mut e, &w, 3.2, Some(p));
+        assert!(!e.is_dead());
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let (mut mesh, mut prev) = (Vec::new(), Vec::new());
+        e.mesh_moved([1.0; 3], None, &mut mesh, &mut prev);
+        for v in &mesh {
+            (lo, hi) = (lo.min(v.pos[1]), hi.max(v.pos[1]));
+        }
+        assert!(lo > 10.95 && hi < 12.6, "tombé de {lo} à {hi}");
+        let after = run(&mut e, &w, 9.0, Some(p));
+        let drips = |list: &[Event], which: Liquid| {
+            list.iter()
+                .filter(|e| matches!(e, Event::Drips { liquid, .. } if *liquid == which))
+                .count()
+        };
+        // (La gelée a coulé de chaque bouchée, puis de tout le corps ; les veines à la fin.)
+        assert!(drips(&before, Liquid::Jelly) + drips(&after, Liquid::Jelly) > 60);
+        assert!(drips(&after, Liquid::Vein) > 20, "{}", drips(&after, Liquid::Vein));
         assert!(e.is_dead());
-        // Rien ne repousse.
-        e.flesh.tick(600.0, None, &dims);
-        assert_eq!(e.flesh.eaten(&dims), eaten);
+        let mut mesh = Vec::new();
+        e.mesh_moved([1.0; 3], None, &mut mesh, &mut prev);
+        assert!(mesh.is_empty(), "il reste {} sommets", mesh.len());
     }
 
     /// (v272) Ses veines : dans chaque pavé, d'un seul tenant, jamais dans la peau du tour ;

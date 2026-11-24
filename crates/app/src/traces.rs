@@ -18,6 +18,7 @@
 //! Decal`, decal.wgsl) : rien n'est recalculé d'une image à l'autre, la liste ne lui est
 //! renvoyée que quand elle change (`rev`).
 
+use crate::corpse::Liquid;
 use glam::Vec3;
 use minelib_render::{
     Decal, KIND_BURN, KIND_DRIP, KIND_HOLE, KIND_SCORCH, KIND_SLASH, KIND_SPLAT, KIND_SPRAY,
@@ -86,6 +87,16 @@ impl Matter {
     }
 }
 
+/// (v299) Ce que la sorte d'une tache porte en plus pour dire son liquide (seizièmes : 0 le
+/// sang, 1 la gelée, 2 les veines ; lu par decal.wgsl).
+fn liquid_code(liquid: Liquid) -> f32 {
+    match liquid {
+        Liquid::Blood => 0.0,
+        Liquid::Jelly => 1.0 / 16.0,
+        Liquid::Vein => 2.0 / 16.0,
+    }
+}
+
 /// Une goutte de sang en vol.
 #[derive(Clone, Copy, Debug)]
 pub struct Drop {
@@ -97,6 +108,8 @@ pub struct Drop {
     pub size: f32,
     /// Bruine : très fine, vite freinée, elle ne laisse pas de tache.
     mist: bool,
+    /// (v299) Ce qu'elle est : du sang, de la gelée de L'Évidé, ce que portent ses veines.
+    pub liquid: Liquid,
 }
 
 impl Drop {
@@ -344,7 +357,8 @@ impl Traces {
     /// Tache de sang posée en `at` sur une surface de normale `n` par du sang qui arrivait
     /// à la vitesse `vel` : ronde s'il arrive de face, étirée dans son sens s'il arrive en
     /// biais. `half` : demi-largeur. Sur un mur, une grosse tache coule parfois.
-    fn stain(&mut self, at: Vec3, n: Vec3, vel: Vec3, half: f32) {
+    /// (v299) La même tache, de ce liquide (sa sorte porte le liquide : `liquid_code`).
+    fn stain_of(&mut self, liquid: Liquid, at: Vec3, n: Vec3, vel: Vec3, half: f32) {
         let slide = vel - n * vel.dot(n);
         let k = slide.length() / vel.length().max(1e-4);
         let (seed, angle) = (self.unit() * 900.0, self.rnd() * std::f32::consts::PI);
@@ -355,7 +369,7 @@ impl Traces {
         };
         self.push(Decal {
             pos: at.to_array(),
-            kind: KIND_SPLAT,
+            kind: KIND_SPLAT + liquid_code(liquid),
             normal: n.to_array(),
             seed,
             tangent: u.to_array(),
@@ -364,7 +378,7 @@ impl Traces {
             depth: 0.04,
             force: 1.0,
         });
-        if n.y.abs() < 0.5 && half > 0.07 && self.unit() < 0.35 {
+        if liquid == Liquid::Blood && n.y.abs() < 0.5 && half > 0.07 && self.unit() < 0.35 {
             self.drip(at, n, half * 0.3);
         }
     }
@@ -432,6 +446,7 @@ impl Traces {
                 life: 3.0,
                 size,
                 mist: false,
+                liquid: Liquid::Blood,
             });
         }
         for _ in 0..mist {
@@ -444,6 +459,7 @@ impl Traces {
                 life,
                 size,
                 mist: true,
+                liquid: Liquid::Blood,
             });
         }
         // Ce que le sang marque derrière le joueur touché. Comme dans CS : des traits tirés
@@ -514,6 +530,13 @@ impl Traces {
     /// tombent presque droit et tachent le sol où elles arrivent ; `spurt` : un jet (la
     /// morsure vient d'arracher le morceau), elles partent plus fort, tout autour.
     pub fn bleed(&mut self, at: Vec3, vel: Vec3, count: usize, spurt: bool) {
+        self.ooze(Liquid::Blood, at, vel, count, spurt);
+    }
+
+    /// (v299) « Quand on mange le monstre, de la gelée coule comme le sang » : les mêmes
+    /// gouttes, de ce liquide (la gelée de L'Évidé, ce que portent ses veines) ; elles
+    /// tachent le sol de leur couleur.
+    pub fn ooze(&mut self, liquid: Liquid, at: Vec3, vel: Vec3, count: usize, spurt: bool) {
         if !(at.is_finite() && vel.is_finite()) {
             return;
         }
@@ -531,8 +554,9 @@ impl Traces {
                 vel: vel * 0.5 + Vec3::new(out.x, 0.0, out.z) * push + Vec3::Y * up,
                 age: 0.0,
                 life: 4.0,
-                size,
+                size: if liquid == Liquid::Jelly { size * 1.5 } else { size },
                 mist: false,
+                liquid,
             });
         }
     }
@@ -549,7 +573,9 @@ impl Traces {
         let clock = self.clock;
         let before = self.decals.len();
         self.decals.retain(|d| {
-            let blood = d.kind == KIND_SPLAT || d.kind == KIND_SPRAY || d.kind == KIND_DRIP;
+            // (v299) De tout liquide (la sorte porte le liquide en seizièmes).
+            let kind = d.kind.floor();
+            let blood = kind == KIND_SPLAT || kind == KIND_SPRAY || kind == KIND_DRIP;
             !(blood && clock - d.born > max_age)
         });
         if self.decals.len() != before {
@@ -580,7 +606,7 @@ impl Traces {
             if len > 1e-5 {
                 let dir = step / len;
                 if let Some(h) = raycast_solid(world, d.pos.into(), dir.into(), len + 0.01) {
-                    landed.push((d.pos + dir * h.distance, v3(h.normal), d.vel, d.size));
+                    landed.push((d.pos + dir * h.distance, v3(h.normal), d.vel, d.size, d.liquid));
                     d.age = f32::MAX;
                     continue;
                 }
@@ -588,9 +614,9 @@ impl Traces {
             d.pos += step;
         }
         self.drops.retain(|d| d.age < d.life);
-        for (at, n, vel, size) in landed {
+        for (at, n, vel, size, liquid) in landed {
             let half = size * (2.8 + 1.8 * self.unit());
-            self.stain(at, n, vel, half);
+            self.stain_of(liquid, at, n, vel, half);
         }
     }
 }

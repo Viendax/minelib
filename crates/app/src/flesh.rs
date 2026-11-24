@@ -79,6 +79,18 @@ pub struct Flesh {
     hard: Hard,
 }
 
+/// (v299) Le tirage d'un cube (0 … 1, toujours le même) : il fond quand la part fondue du
+/// corps le dépasse (`Flesh::melt`).
+fn draw_of(part: usize, i: usize) -> f32 {
+    let h = (i as u32 ^ (part as u32) << 20).wrapping_mul(0x9e37_79b1);
+    ((h ^ h >> 15).wrapping_mul(0x85eb_ca6b) >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// (v299) Le tirage du cube `c` du pavé `part` (voir `draw_of`).
+pub fn melt_draw(part: usize, dims: [usize; 3], c: [usize; 3]) -> f32 {
+    draw_of(part, index(dims, c))
+}
+
 fn index(dims: [usize; 3], c: [usize; 3]) -> usize {
     (c[2] * dims[1] + c[1]) * dims[0] + c[0]
 }
@@ -123,6 +135,37 @@ impl Flesh {
     /// Ce pavé a-t-il été mordu ?
     pub fn bitten(&self, part: usize) -> bool {
         self.bites.iter().any(|b| b.part as usize == part)
+    }
+
+    /// (v299) Le corps d'un mort fond : chaque cube encore là, mou (`hard` : dur, ses os ou
+    /// ses veines), dont le tirage (un par cube, toujours le même) est sous `part_gone`, s'en
+    /// va. Rend les cubes qui viennent de partir : (pavé, cube). À appeler avec une part qui
+    /// monte de 0 à 1.
+    pub fn melt(
+        &mut self,
+        hard: bool,
+        part_gone: f32,
+        dims: &[[usize; 3]; PARTS],
+    ) -> Vec<(usize, [usize; 3])> {
+        let mut out = Vec::new();
+        for (p, d) in dims.iter().enumerate() {
+            let cells = d[0] * d[1] * d[2];
+            self.gone[p].resize(cells.div_ceil(64), 0);
+            for i in 0..cells {
+                if self.gone[p][i / 64] >> (i % 64) & 1 == 1 {
+                    continue;
+                }
+                let c = [i % d[0], i / d[0] % d[1], i / (d[0] * d[1])];
+                if self.hard.at(p, *d, c) != hard {
+                    continue;
+                }
+                if draw_of(p, i) < part_gone {
+                    self.gone[p][i / 64] |= 1 << (i % 64);
+                    out.push((p, c));
+                }
+            }
+        }
+        out
     }
 
     /// Le cube `c` du pavé `part` (grille `dims`) a-t-il été mangé ?

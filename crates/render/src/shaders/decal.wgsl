@@ -494,7 +494,23 @@ fn trace(i: VOut, uv: vec2<f32>, seen: f32) -> vec4<f32> {
         } else {
             b = drip(uv, seed, age, i.size.y / max(i.size.x, 1e-4));
         }
-        f = blood_tint(b.y, age);
+        // (v299) Le liquide de la tache (seizièmes de sa sorte) : 0 le sang ; 1 la gelée de
+        // L'Évidé (pâle, laiteuse : elle éclaircit ce qu'elle couvre, son bord mouillé le
+        // fonce un peu, et elle sèche en jaunissant) ; 2 ce que portent ses veines (violet
+        // sombre).
+        let liquid = floor(fract(i.at.w + 0.01) * 16.0 + 0.25);
+        if liquid < 0.5 {
+            f = blood_tint(b.y, age);
+        } else if liquid < 1.5 {
+            let dry = smoothstep(20.0, 150.0, age);
+            let body = mix(vec3<f32>(1.75, 1.70, 1.42), vec3<f32>(1.42, 1.34, 1.02), dry);
+            f = mix(vec3<f32>(0.80, 0.79, 0.70), body, clamp(b.y * 1.6, 0.0, 1.0));
+        } else {
+            let dry = smoothstep(8.0, 70.0, age);
+            let thin = mix(vec3<f32>(0.50, 0.26, 0.66), vec3<f32>(0.44, 0.30, 0.50), dry);
+            let deep = mix(vec3<f32>(0.11, 0.035, 0.19), vec3<f32>(0.10, 0.05, 0.13), dry);
+            f = mix(thin, deep, clamp(b.y, 0.0, 1.0));
+        }
         // Rien ne touche le bord de la boîte.
         cov = b.x * (0.80 + 0.20 * b.y) * (1.0 - smoothstep(0.9, 1.0, max(abs(uv.x), abs(uv.y))));
     } else if kind == KIND_HOLE {

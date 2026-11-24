@@ -149,6 +149,10 @@ pub struct Crowd {
     /// ailleurs) : ce que le jeu qui la mène en ligne dit tout de suite (`Outbox`). Vidé à
     /// chaque image.
     pub changed: Vec<u16>,
+    /// (v299) PNJ qui viennent de mourir (avant de repartir d'ailleurs) : où ils étaient, leur
+    /// cap, leur skin, et d'où venait le coup. Le jeu y laisse leur corps (`corpse::Fallen`).
+    /// Vidé par la session.
+    pub fallen: Vec<(Vec3, f32, Option<std::sync::Arc<crate::skin::Skin>>, Vec3)>,
     /// (v234) PNJ partis trop loin qu'on peut encore essayer de ramener à cette image.
     respawns: usize,
     /// (v234) Essais : recherches de sol faites (`spawn`).
@@ -184,6 +188,7 @@ impl Crowd {
             recheck: 0,
             hidden_in: false,
             changed: Vec::new(),
+            fallen: Vec::new(),
             respawns: 0,
             #[cfg(test)]
             tries: 0,
@@ -346,6 +351,10 @@ impl Crowd {
             return false;
         }
         self.changed.push(i as u16);
+        if self.fallen.len() < 8 {
+            let n = &self.npcs[i];
+            self.fallen.push((n.pos, n.yaw, n.skin.clone(), from));
+        }
         self.respawn(world, i, center, from);
         true
     }

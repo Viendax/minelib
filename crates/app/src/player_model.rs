@@ -402,6 +402,59 @@ pub fn part_point(pose: &Pose, part: usize) -> Vec3 {
     xf.transform_point3((Vec3::from(lo) + Vec3::from(hi)) / 2.0)
 }
 
+/// (v299) La posture du modèle (ses sept pavés, le bas de chaque membre) pour le corps qui
+/// tombe (`corpse::Ragdoll`).
+pub fn stance(pose: &Pose) -> crate::corpse::Stance {
+    let all = parts(pose);
+    let low = lowers(pose, &all);
+    let mut s = crate::corpse::Stance {
+        parts: [(Mat4::IDENTITY, [0.0; 3], [0.0; 3]); 7],
+        lower: [None; 7],
+    };
+    for i in 0..7 {
+        s.parts[i] = (all[i].0, all[i].1, all[i].2);
+        s.lower[i] = low[i].map(|(m, _)| m);
+    }
+    s
+}
+
+/// (v299) Où est, dans le monde, le milieu du cube `cell` du pavé `part` d'un mort (`frames` :
+/// `Ragdoll::frames`) : d'où part la goutte de sang quand ce cube fond.
+pub fn fallen_point(frames: &[[Mat4; 2]; 7], part: usize, cell: [usize; 3]) -> Vec3 {
+    let part = part.min(6);
+    let (min, max, kind) = PARTS[part];
+    let d = ZONES[part].size;
+    let limb = kind == Part::Leg || kind == Part::Arm;
+    let xf = frames[part][(limb && cell[1] < d[1] / 2) as usize];
+    let (lo, hi) = (Vec3::from(min), Vec3::from(max));
+    let t = Vec3::new(
+        (cell[0] as f32 + 0.5) / d[0] as f32,
+        (cell[1] as f32 + 0.5) / d[1] as f32,
+        (cell[2] as f32 + 0.5) / d[2] as f32,
+    );
+    xf.transform_point3(lo + (hi - lo) * t)
+}
+
+/// (v299) Le corps d'un mort, cube par cube, là où son pantin est tombé (`frames` : le haut
+/// et le bas de chaque pavé, `Ragdoll::frames`) : sa peau, ce qu'il en reste (`flesh` : ce
+/// qui a fondu en sang est parti), ses os à la fin.
+pub fn fallen_model(
+    frames: &[[Mat4; 2]; 7],
+    flesh: &crate::flesh::Flesh,
+    skin: Option<&crate::skin::Skin>,
+    light: [f32; 3],
+    bare: f32,
+) -> Vec<EntityVertex> {
+    let mut out = Vec::with_capacity(12_000);
+    for (i, &(min, max, part)) in PARTS.iter().enumerate() {
+        let limb = part == Part::Leg || part == Part::Arm;
+        let below = limb.then_some(frames[i][1]);
+        let organ = crate::flesh::organ;
+        emit_flesh(&mut out, frames[i][0], below, min, max, i, part, light, skin, flesh, organ, bare);
+    }
+    out
+}
+
 /// (v272) Plié au plus de tant (rad) pour manger.
 pub const BOW_MAX: f32 = 1.9;
 
@@ -509,7 +562,10 @@ fn emit_flesh(
     tex: Option<&crate::skin::Skin>,
     flesh: &crate::flesh::Flesh,
     inside: fn(usize, [usize; 3], [usize; 3]) -> u32,
+    bare: f32,
 ) {
+    // (v299) `bare` : la part du corps d'un mort qui a fondu (0 pour un vivant) ; la peau
+    // s'en va aussi de ses os, au même rythme : ils se montrent tels qu'ils sont.
     // Les six côtés d'un cube : (axe, sens, face dans l'ordre de `box_faces`).
     const SIDES: [(usize, i32, usize); 6] = [
         (2, -1, 0),
@@ -543,6 +599,9 @@ fn emit_flesh(
                 // (v290) La moitié du bas d'un membre (sous le genou, sous le coude) suit
                 // son pli.
                 let xf = below.filter(|_| y < dims[1] / 2).unwrap_or(xf);
+                let stripped = bare > 0.0
+                    && flesh.is_hard(index, dims, c)
+                    && crate::flesh::melt_draw(index, dims, c) < bare;
                 for (axis, sign, k) in SIDES {
                     // Le voisin de ce côté : dehors (le pixel du skin), mangé (la chair à nu),
                     // ou encore là (pas de face).
@@ -561,7 +620,7 @@ fn emit_flesh(
                     let mut normal = Vec3::ZERO;
                     normal[axis] = if axis == 1 { sign as f32 } else { -sign as f32 };
                     let shade = face_shade(xf.transform_vector3(normal).normalize_or_zero());
-                    let color = if outside {
+                    let color = if outside && !stripped {
                         let (u, v) = match k {
                             0 => (dims[0] - 1 - x, dims[1] - 1 - y),
                             1 => (x, dims[1] - 1 - y),
@@ -637,7 +696,7 @@ fn emit_body(
         }
         if let Some(f) = flesh.filter(|f| f.bitten(i)) {
             let below = low[i].map(|(m, _)| m);
-            emit_flesh(out, xf, below, min, max, i, part, pose.light, tex, f, crate::flesh::organ);
+            emit_flesh(out, xf, below, min, max, i, part, pose.light, tex, f, crate::flesh::organ, 0.0);
         }
     }
     // Les autres : pixel par pixel, (v290) les membres en deux moitiés.
@@ -2604,7 +2663,7 @@ pub fn first_person_body(
                 let f = bitten(i).unwrap();
                 let below = low[i].map(|(m, _)| m);
                 let organ = crate::flesh::organ;
-                emit_flesh(&mut quads, xf, below, min, max, i, part, seen.light, tex, f, organ);
+                emit_flesh(&mut quads, xf, below, min, max, i, part, seen.light, tex, f, organ, 0.0);
                 xf.transform_point3((Vec3::from(min) + Vec3::from(max)) / 2.0)
             }
         };
@@ -3530,7 +3589,7 @@ mod tests {
             emit_box(&mut plain, xf, min, max, ZONES[i], part, pose.light, tex);
             let mut whole = Vec::new();
             let none = Flesh::default();
-            emit_flesh(&mut whole, xf, None, min, max, i, part, pose.light, tex, &none, organ);
+            emit_flesh(&mut whole, xf, None, min, max, i, part, pose.light, tex, &none, organ, 0.0);
             let (a, b) = (quads(&plain), quads(&whole));
             assert_eq!(a.len(), b.len(), "pavé {i} : sans morsure");
             assert_eq!((missing(&a, &b), missing(&b, &a)), (0, 0), "pavé {i} : sans morsure");
@@ -3539,7 +3598,7 @@ mod tests {
             let d = grids[i];
             let b = f.bite_at(i, [d[0] - 1, d[1] - 1, 0], 2, &grids).unwrap();
             let mut bitten = Vec::new();
-            emit_flesh(&mut bitten, xf, None, min, max, i, part, pose.light, tex, &f, organ);
+            emit_flesh(&mut bitten, xf, None, min, max, i, part, pose.light, tex, &f, organ, 0.0);
             let (before, after) = (quads(&plain), quads(&bitten));
             let (lost, new) = (missing(&before, &after), missing(&after, &before));
             // Le coin de 2 × 2 × 2 cubes : 3 faces de 4 carrés du skin en moins, 3 faces de

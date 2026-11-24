@@ -88,6 +88,8 @@ const HAND_UP_S: f32 = 0.07;
 const HAND_BACK_S: f32 = 0.22;
 const HAND_DOWN: f32 = 1.35;
 const EVIDE_DRAWN: f32 = 160.0;
+/// (v299) Au plus tant de morts (joueur, PNJ) laissés au sol à la fois.
+const FALLEN_MAX: usize = 8;
 
 /// (v249) Durée de l'éblouissement par la foudre qu'on prend (s) : l'écran reste blanc
 /// pendant le premier sixième (les arcs en retour), puis la vue revient peu à peu. Une
@@ -671,6 +673,10 @@ pub struct Session {
     /// de chaque Évidé dessiné à l'image d'avant (par numéro), et la pose du joueur local
     /// dessiné en F5 à l'image d'avant (avec sa révérence), voir `entities_moved`.
     evide_seen: std::cell::RefCell<HashMap<u32, Vec<Mat4>>>,
+    /// (v299) Les morts (joueur, PNJ) tombés là, en construction : leur corps fond en sang,
+    /// leurs os restent 5 minutes (`corpse::Fallen`) ; le numéro du prochain.
+    fallen: Vec<crate::corpse::Fallen>,
+    fallen_next: u64,
     own_seen: std::cell::Cell<Option<(crate::player_model::Prev, f32)>>,
     /// (v264) Plaies des joueurs de la partie FPS (« un impact dans le joueur ») : par pseudo
     /// (vide : le joueur local), jusqu'à sa mort ou la fin de la manche, comme les traces sur
@@ -1112,6 +1118,8 @@ impl Session {
             bleeding: Vec::new(),
             bite_points: Default::default(),
             evide_seen: Default::default(),
+            fallen: Vec::new(),
+            fallen_next: 0,
             own_seen: Default::default(),
             // Essais : MINELIB_EVIDE="x,y,z,lacet°[,posture]" pose d'avance un Évidé (figé dans
             // la posture nommée : debout, court, rampe, mord, mange ; vivant sans posture) ;
@@ -1627,6 +1635,60 @@ impl Session {
             }
             if self.game.mode != GameMode::Fps {
                 self.fps.tick_blood(dt, &self.world, BLOOD_ON_GROUND_S);
+                // (v299) Les morts : ils tombent, fondent en sang (des gouttes qui tachent le
+                // sol dessous), leurs os restent.
+                let dead: Vec<_> = self
+                    .crowd
+                    .as_mut()
+                    .map(|c| std::mem::take(&mut c.fallen))
+                    .unwrap_or_default();
+                for (pos, yaw, skin, from) in dead {
+                    let pose = crate::player_model::Pose {
+                        feet: pos,
+                        yaw,
+                        pitch: 0.0,
+                        walk: 0.0,
+                        swing: 0.0,
+                        crouch: 0.0,
+                        light: [1.0; 3],
+                        held: None,
+                        skin: None,
+                        bow: 0.0,
+                    };
+                    let away = pos - from;
+                    let push = Vec3::new(away.x, 0.0, away.z).normalize_or_zero() * 2.2;
+                    self.fall_body(&pose, Vec3::ZERO, push, None, skin);
+                }
+                // Essais : MINELIB_MORT=x,y,z,lacet° : un joueur meurt là, debout, au début.
+                static TRIED: std::sync::Once = std::sync::Once::new();
+                TRIED.call_once(|| {
+                    let n: Vec<f32> = std::env::var("MINELIB_MORT")
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|v| v.trim().parse().ok())
+                        .collect();
+                    if n.len() == 4 {
+                        let pose = crate::player_model::Pose {
+                            feet: Vec3::new(n[0], n[1], n[2]),
+                            yaw: n[3].to_radians(),
+                            ..self.body_pose()
+                        };
+                        let skin = self.worn_skin();
+                        self.fall_body(&pose, Vec3::ZERO, Vec3::new(0.9, 0.0, 0.5), None, skin);
+                    }
+                });
+                let mut drops = Vec::new();
+                for f in &mut self.fallen {
+                    drops.extend(f.update(&self.world, dt));
+                    let light = sky_light(&self.world, f.middle(), self.daylight_shown);
+                    f.refresh(light);
+                }
+                for at in drops {
+                    self.fps.bleed(at, Vec3::ZERO, 1, false);
+                }
+                self.fallen.retain(|f| !f.done());
+            } else if !self.fallen.is_empty() {
+                self.fallen.clear();
             }
             // (v272) Notre bouchée : on se plie vers le morceau visé, là où il est maintenant ;
             // au bout de `EAT_IN` secondes on le mange si notre bouche le touche, sinon rien
@@ -1664,7 +1726,9 @@ impl Session {
                         done = true;
                         let far = crate::evide::EAT_REACH + EAT_SLACK;
                         if self.player.eye().distance(target) <= far {
-                            let eaten = self.evides.by_id(id).and_then(|e| e.eaten_at(part, cell));
+                            let eye = self.player.eye();
+                            let eaten =
+                                self.evides.by_id(id).and_then(|e| e.eaten_at(part, cell, eye));
                             if let Some(dead) = eaten {
                                 crate::audio::jelly_bite(0.0);
                                 if dead {
@@ -7318,6 +7382,14 @@ impl Session {
             // (v272) Il choisit où mordre : partout sur le tour de notre corps (les bras, le
             // torse, le ventre, les jambes ; pas la tête), les jambes seulement s'il rampe.
             // `render` dira où est cet endroit dans notre pose, image après image.
+            // (v299) La gelée qui coule de ce qu'on lui mange, puis de son corps qui fond, et
+            // ce que portent ses veines : des gouttes qui tachent le sol, comme le sang.
+            crate::evide::Event::Drips {
+                at,
+                liquid,
+                count,
+                spurt,
+            } => self.fps.ooze(liquid, at, Vec3::ZERO, usize::from(count), spurt),
             crate::evide::Event::Aims { low, seed } => {
                 let grids = crate::player_model::flesh_grids();
                 self.evide_spot = self
@@ -7373,6 +7445,39 @@ impl Session {
         }
     }
 
+    /// (v299) Un mort tombe là, dans la posture `pose` (en construction seulement) : son corps
+    /// (`flesh` : ce qu'il lui en restait ; rien : entier) s'effondre selon les blocs autour de
+    /// lui, fond en sang, laisse ses os 5 minutes. Au plus `FALLEN_MAX` à la fois (le plus
+    /// vieux s'en va).
+    fn fall_body(
+        &mut self,
+        pose: &crate::player_model::Pose,
+        vel: Vec3,
+        push: Vec3,
+        flesh: Option<crate::flesh::Flesh>,
+        skin: Option<std::sync::Arc<crate::skin::Skin>>,
+    ) {
+        if self.game.mode == GameMode::Fps {
+            return;
+        }
+        if self.fallen.len() >= FALLEN_MAX {
+            self.fallen.remove(0);
+        }
+        self.fallen_next += 1;
+        let flesh =
+            flesh.unwrap_or_else(|| crate::flesh::Flesh::of(crate::flesh::Hard::Bones));
+        self.fallen.push(crate::corpse::Fallen::new(
+            &crate::player_model::stance(pose),
+            vel,
+            push,
+            self.fallen_next as u32 * 7919 + 13,
+            flesh,
+            skin,
+            // (Les lots des têtes sont des numéros de zone, celui des cadres u64::MAX.)
+            (1 << 62) + self.fallen_next,
+        ));
+    }
+
     fn die(&mut self) {
         // En ligne, la mort et la réapparition viennent de l'hôte.
         if self.net.is_some() {
@@ -7380,6 +7485,14 @@ impl Session {
         }
         self.chat
             .say("Vous êtes mort ! Retour au point d'apparition.", chat::RED);
+        // (v299) Son corps reste où il est mort : il tombe, fond en sang, laisse ses os.
+        {
+            let pose = self.body_pose();
+            let (vel, flesh, skin) = (self.player.vel, self.flesh.remove(""), self.worn_skin());
+            let back = -self.player.look_dir();
+            let push = Vec3::new(back.x, 0.0, back.z).normalize_or_zero() * 1.2;
+            self.fall_body(&pose, vel, push, flesh, skin);
+        }
         self.player.pos = self.spawn;
         // Point d'apparition en l'air (monde enregistré en volant) : on réapparaît posé sur
         // le sol en dessous, sinon on retomberait et on mourrait en boucle.
@@ -12119,6 +12232,11 @@ impl Session {
         if let Some(f) = self.frames.as_ref().filter(|f| !f.is_empty()) {
             let (v, gen) = f.current();
             statics.push((u64::MAX, v, gen));
+        }
+        // (v299) Les morts tombés là : leur maillage n'est renvoyé à la carte que quand il
+        // change (ils tombent, ils fondent).
+        if !fps_mode {
+            statics.extend(self.fallen.iter().map(|f| f.lot()));
         }
         let screens: Vec<(u32, minelib_render::ScreenAnchor)> = self
             .shown
