@@ -594,6 +594,12 @@ fn mix(style: u8, col: i32, row: i32, lay: i32, o: f32) -> Jaw {
     if !(lo..=hi).contains(&row) || !(if corner { lay < 2 } else { deep }) {
         return Jaw::Flesh;
     }
+    // (v306) « Bouche juste cette face et celle-là quand il a la bouche ouverte, sinon on dirait
+    // que ce sont ses yeux » : le sourire ouvert, à chaque coin, le cube sombre au-dessus de
+    // la dent du coin est refermé sur son visage (il restait seul, comme un œil).
+    if smile && corner && lay == 0 && row > lo {
+        return Jaw::Flesh;
+    }
     if lay == 0 && (smile || !corner) {
         let tooth = if hi > lo {
             (row == hi && near % 2 == 1) || (row == lo && near % 2 == 0)
@@ -2592,6 +2598,15 @@ mod tests {
                             assert!(!socket, "forme {style} ouverte de {open} : dans une orbite");
                             assert!(row < 14 && z + 1 < d[2], "forme {style} : trop loin");
                             assert!(style < 6 || row < 10, "forme {style} : jusqu'aux yeux");
+                        }
+                    }
+                }
+                // (v306) Le sourire ouvert : sur son visage, rien de sombre aux deux colonnes
+                // du bord (on aurait dit ses yeux), seulement la dent du coin.
+                if matches!(style, 6 | 8) && open >= 0.35 {
+                    for y in 0..d[1] {
+                        for x in [0, d[0] - 1] {
+                            assert_ne!(jaw_of(style, [x, y, 0], d, open), Jaw::Hollow, "{style} {open}");
                         }
                     }
                 }
