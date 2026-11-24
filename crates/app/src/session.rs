@@ -3427,10 +3427,14 @@ impl Session {
         if self.inventory.selected_item() == Some(Item::Wand) {
             if keys.pressed(input, Action::Attack) {
                 self.we.pos1 = Some(hit.block);
-                self.say_selection(1, hit.block);
+                if !self.snap_door_selection() {
+                    self.say_selection(1, hit.block);
+                }
             } else if keys.pressed(input, Action::Use) {
                 self.we.pos2 = Some(hit.block);
-                self.say_selection(2, hit.block);
+                if !self.snap_door_selection() {
+                    self.say_selection(2, hit.block);
+                }
             }
             return;
         }
@@ -4787,15 +4791,17 @@ impl Session {
         // (v251) Boules de lumière des lumières ponctuelles (l'éclat de la source, dessiné
         // comme un éclair : par-dessus l'image, caché par ce qui est devant).
         if self.lights_allowed() {
-            for (at, r, color, force) in self.lights.balls() {
+            for ball in self.lights.balls() {
+                let at = ball.at;
                 self.storm.bolts.push(minelib_render::BoltSeg {
                     a: [at[0], at[1], at[2], minelib_render::BOLT_BALL],
                     b: [at[0], at[1], at[2], minelib_render::BOLT_BALL],
-                    color,
-                    force_a: force,
-                    force_b: force,
-                    width_a: r,
-                    width_b: r,
+                    color: ball.color,
+                    force_a: ball.force,
+                    // (v258) Pour une boule : le fondu de ses bords (`BOLT_BALL`).
+                    force_b: ball.edge,
+                    width_a: ball.radius,
+                    width_b: ball.radius,
                     screen: 0.0,
                 });
             }
@@ -5959,6 +5965,8 @@ impl Session {
                 self.loading = None;
                 if let Some(n) = &mut self.net {
                     n.loaded();
+                    // (v258) Les portes posées pour la partie de la carte (copies de la partie).
+                    n.set_map_doors(crate::fpsmap::load(&self.dir).door_list);
                 }
             }
         }
@@ -6069,6 +6077,7 @@ impl Session {
         });
         let mut n = crate::netgame::NetGame::guest_loading(link, [0; 32]);
         n.loaded();
+        n.set_map_doors(crate::fpsmap::load(&self.dir).door_list);
         self.net = Some(n);
         self.net_dead = false;
         self.player.flying = false;
@@ -6298,7 +6307,7 @@ impl Session {
         // Hors ligne (essai de sa carte) : selon le réglage de la carte ; sur un serveur de
         // construction, toujours (les blocs changés partent comme les autres).
         let map = crate::fpsmap::load(&self.dir);
-        if self.build.is_none() && !map.doors() {
+        if self.build.is_none() && !map.door_usable(h.block) {
             return;
         }
         let world = &self.world;
@@ -7381,6 +7390,9 @@ impl Session {
             dirty: &mut self.dirty,
         };
         let r = self.we.command(&name, &args, &mut ctx);
+        let snapped = r.is_ok()
+            && matches!(name.as_str(), "pos1" | "pos2" | "hpos1" | "hpos2")
+            && self.snap_door_selection();
         if let (Some(b), Some(j)) = (&mut self.build, &mut self.world.journal) {
             let cells: Vec<_> = j.drain(before.min(j.len())..).collect();
             if !cells.is_empty() {
@@ -7388,9 +7400,145 @@ impl Session {
             }
         }
         match r {
+            // (v258) Le coin a pris toute la porte : `snap_door_selection` l'a dit.
+            Ok(_) if snapped => {}
             Ok(msg) => self.chat.say(msg, chat::LIGHT_PURPLE),
             Err(e) => self.chat.say(e, chat::RED),
         }
+    }
+
+    /// (v258) « Même si on sélectionne qu'un bloc, la sélection change quand c'est une porte et
+    /// passe aux deux blocs de la porte, et aux quatre des deux portes » : une sélection tout
+    /// entière dans une porte (un seul de ses blocs, ou un battant d'une double porte) devient
+    /// toute la porte, ou toute la double porte, et le dit. `false` : rien de changé.
+    fn snap_door_selection(&mut self) -> bool {
+        let Some((a, b)) = self.we.region() else {
+            return false;
+        };
+        let world = &self.world;
+        let Some(d) = door_box(&|c| world.get(c[0], c[1], c[2]), a) else {
+            return false;
+        };
+        let inside = (0..3).all(|k| a[k] >= d.min[k] && b[k] <= d.max[k]);
+        if !inside || (a, b) == (d.min, d.max) {
+            return false;
+        }
+        self.we.pos1 = Some(d.min);
+        self.we.pos2 = Some(d.max);
+        self.chat.say(
+            if d.double {
+                "Sélection : la double porte (4 blocs)."
+            } else {
+                "Sélection : la porte (2 blocs)."
+            },
+            chat::LIGHT_PURPLE,
+        );
+        true
+    }
+
+    /// (v258) `/fps set door` (`on`) ou `/fps clear door` : la porte visée, ou celles de la
+    /// sélection, ajoutées à la carte (une boîte par porte, quatre blocs pour une double porte ;
+    /// ce qui la chevauchait est remplacé) ou retirées.
+    fn set_listed_doors(&mut self, map: &mut minelib_net::game::FpsMap, on: bool) {
+        let doors = match self.doors_targeted() {
+            Ok(d) => d,
+            Err(e) => {
+                self.chat.say(e, chat::RED);
+                return;
+            }
+        };
+        if doors.is_empty() {
+            self.chat
+                .say("Aucune porte dans la sélection.", chat::RED);
+            return;
+        }
+        let overlaps = |z: &minelib_net::game::Zone, d: &DoorBox| {
+            (0..3).all(|k| z.min[k] <= d.max[k] && z.max[k] >= d.min[k])
+        };
+        let mut full = 0;
+        for d in &doors {
+            map.door_list.retain(|z| !overlaps(z, d));
+            if on {
+                if map.door_list.len() < crate::fpsmap::MAX_DOORS {
+                    map.door_list.push(minelib_net::game::Zone::new(d.min, d.max));
+                } else {
+                    full += 1;
+                }
+            }
+        }
+        if full > 0 {
+            self.chat.say(
+                format!(
+                    "{full} porte(s) non posée(s) : {} portes au plus par carte.",
+                    crate::fpsmap::MAX_DOORS
+                ),
+                chat::RED,
+            );
+        }
+        let doubles = doors.iter().filter(|d| d.double).count();
+        let text = match (on, doors.len()) {
+            (true, 1) if doubles == 1 => {
+                "Double porte posée pour la partie (vert foncé) : elle s'ouvre en partie.".to_string()
+            }
+            (true, 1) => "Porte posée pour la partie (vert clair) : elle s'ouvre en partie.".to_string(),
+            (true, n) => format!(
+                "{n} portes posées pour la partie ({doubles} doubles) : elles s'ouvrent en partie."
+            ),
+            (false, 1) => "Porte retirée de la partie : elle reste fixe.".to_string(),
+            (false, n) => format!("{n} portes retirées de la partie."),
+        };
+        match crate::fpsmap::save(&self.dir, map) {
+            Ok(()) => {
+                self.chat.say(
+                    format!("{text} Nouvelle signature : c'est une nouvelle carte."),
+                    chat::LIGHT_PURPLE,
+                );
+                // Les éléments affichés le voient tout de suite.
+                if let Some(e) = self.fps_elements.as_mut() {
+                    e.map = map.clone();
+                }
+            }
+            Err(e) => self.chat.say(format!("fps.txt : {e:#}"), chat::RED),
+        }
+    }
+
+    /// (v258) Portes que vise `/fps set door` ou `/fps clear door` : celles de la sélection de
+    /// la baguette, ou celle qu'on vise (« qu'on puisse juste viser les portes pour les
+    /// poser ») si elle n'est pas dans la sélection. `Err` : rien de visé ni de sélectionné, ou
+    /// une sélection trop grande.
+    fn doors_targeted(&self) -> Result<Vec<DoorBox>, &'static str> {
+        let world = &self.world;
+        let get = |c: [i32; 3]| world.get(c[0], c[1], c[2]);
+        let region = self.we.region();
+        let aimed = self.hit.and_then(|h| door_box(&get, h.block));
+        if let Some(d) = aimed {
+            let in_region = region.is_some_and(|(a, b)| {
+                (0..3).all(|k| d.min[k] <= b[k] && d.max[k] >= a[k])
+            });
+            if !in_region {
+                return Ok(vec![d]);
+            }
+        }
+        let Some((a, b)) = region else {
+            return Err("Vise une porte, ou sélectionne-la avec la baguette (un seul de ses blocs suffit).");
+        };
+        let volume = (0..3).map(|k| (b[k] - a[k] + 1) as u64).product::<u64>();
+        if volume > 2_000_000 {
+            return Err("Sélection trop grande pour y chercher des portes (2 millions de blocs au plus).");
+        }
+        let mut out: Vec<DoorBox> = Vec::new();
+        for y in a[1]..=b[1] {
+            for z in a[2]..=b[2] {
+                for x in a[0]..=b[0] {
+                    if let Some(d) = door_box(&get, [x, y, z]) {
+                        if !out.iter().any(|o| o.min == d.min) {
+                            out.push(d);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Vue du joueur avec le recul du mode FPS (la vue remonte pendant une rafale).
@@ -7635,8 +7783,9 @@ impl Session {
                         sites.join(", ")
                     ),
                     format!(
-                        "portes : {} ; doubles portes : {}",
-                        if map.doors() { "utilisables" } else { "fixes" },
+                        "portes : {} ; posées : {} ; doubles portes : {}",
+                        if map.doors() { "toutes utilisables" } else { "fixes" },
+                        map.door_list.len(),
                         if map.door_sync() { "ensemble" } else { "séparées" }
                     ),
                     format!(
@@ -7718,8 +7867,9 @@ impl Session {
                 });
                 self.chat.say(
                     "Éléments de la carte FPS montrés à travers les murs (hors partie) : portes \
-                     simples en vert clair, doubles portes en vert foncé, sites en rouge, départ \
-                     CT en bleu, départ T en jaune. /fps showelements off pour les masquer.",
+                     (posées avec /fps set door, ou toutes avec /fps set door on) en vert clair, \
+                     doubles portes en vert foncé, sites en rouge, départ CT en bleu, départ T en \
+                     jaune. /fps showelements off pour les masquer.",
                     chat::LIGHT_PURPLE,
                 );
             } else {
@@ -7887,10 +8037,17 @@ impl Session {
                 Some("door" | "doors" | "porte" | "portes")
             )
         {
+            // (v258) Sans on/off : la porte visée, ou celles de la sélection, posées pour la
+            // partie (« les portes, c'est avec la baguette aussi qu'on les pose »).
+            if lower.get(2).is_none() {
+                self.set_listed_doors(&mut map, true);
+                return;
+            }
             let Some(on) = lower.get(2).map(String::as_str).and_then(chat::switch) else {
                 self.chat.say(
                     format!(
-                        "Usage : /fps set door on|off (actuellement : {}).",
+                        "Usage : /fps set door (la porte visée ou sélectionnée), /fps set door \
+                         on|off (toutes les portes ; actuellement : {}).",
                         on_off(map.doors())
                     ),
                     chat::GREY,
@@ -7901,9 +8058,11 @@ impl Session {
             match crate::fpsmap::save(&self.dir, &map) {
                 Ok(()) => self.chat.say(
                     if on {
-                        "Portes et trappes : on les ouvre et les ferme en partie (touche                          Utiliser). Nouvelle signature : c'est une nouvelle carte."
+                        "Toutes les portes et trappes s'ouvrent et se ferment en partie (touche \
+                         Utiliser). Nouvelle signature : c'est une nouvelle carte."
                     } else {
-                        "Portes et trappes : fixes en partie. Nouvelle signature : c'est une                          nouvelle carte."
+                        "Portes et trappes fixes en partie, sauf celles posées avec /fps set door. \
+                         Nouvelle signature : c'est une nouvelle carte."
                     },
                     chat::LIGHT_PURPLE,
                 ),
@@ -7926,6 +8085,27 @@ impl Session {
                 };
                 *slot(&mut map, k) = Some(Zone::new(a, b));
             }
+            Some("clear")
+                if matches!(
+                    lower.get(1).map(String::as_str),
+                    Some("door" | "doors" | "porte" | "portes")
+                ) =>
+            {
+                if matches!(lower.get(2).map(String::as_str), Some("all" | "tout" | "toutes")) {
+                    let n = map.door_list.len();
+                    map.door_list.clear();
+                    match crate::fpsmap::save(&self.dir, &map) {
+                        Ok(()) => self.chat.say(
+                            format!("{n} porte(s) retirée(s) de la partie."),
+                            chat::LIGHT_PURPLE,
+                        ),
+                        Err(e) => self.chat.say(format!("fps.txt : {e:#}"), chat::RED),
+                    }
+                } else {
+                    self.set_listed_doors(&mut map, false);
+                }
+                return;
+            }
             Some("clear") => {
                 let Some(k) = what(&lower[1..]) else {
                     self.chat.say(USAGE, chat::GREY);
@@ -7938,8 +8118,9 @@ impl Session {
                     .say(format!("joueurs : {}", map.players()), chat::LIGHT_PURPLE);
                 self.chat.say(
                     format!(
-                        "portes : {}",
-                        if map.doors() { "utilisables" } else { "fixes" }
+                        "portes : {} ; posées pour la partie : {}",
+                        if map.doors() { "toutes utilisables" } else { "fixes" },
+                        map.door_list.len()
                     ),
                     chat::LIGHT_PURPLE,
                 );
@@ -7971,6 +8152,11 @@ impl Session {
         }
         match crate::fpsmap::save(&self.dir, &map) {
             Ok(()) => {
+                // (v258) Les éléments affichés le voient tout de suite (la sélection passe à
+                // sa couleur).
+                if let Some(e) = self.fps_elements.as_mut() {
+                    e.map = map.clone();
+                }
                 let k = what(&lower[1..]).unwrap_or(0);
                 let verb = if lower[0] == "set" {
                     "défini"
@@ -9558,6 +9744,13 @@ impl Session {
             loaded.sort_by_key(|c| std::cmp::Reverse((c.x - me.x).pow(2) + (c.z - me.z).pow(2)));
             e.queue = loaded;
         }
+        // (v258) Les portes trouvées ne se montrent que si toutes s'ouvrent (`/fps set door
+        // on`) ; sinon, seulement celles posées pour la partie (dans la carte).
+        if !e.map.doors() {
+            e.doors.clear();
+            e.queue.clear();
+            return;
+        }
         for _ in 0..ELEMENT_CHUNKS_PER_FRAME {
             let Some(c) = e.queue.pop() else { break };
             let found = chunk_doors(&self.world, c);
@@ -10642,7 +10835,15 @@ impl Session {
                     renderer.aspect(),
                     0.05,
                 );
-                v.extend(selection_lines(&self.we, proj * view, cam));
+                // (v258) `/fps showelements` : une sélection qui est un élément de la carte en
+                // prend la couleur (« si je viens de poser le départ T, je vois la sélection
+                // passer en jaune »).
+                let map = self
+                    .fps_elements
+                    .as_ref()
+                    .filter(|_| self.game.mode != GameMode::Fps)
+                    .map(|e| &e.map);
+                v.extend(selection_lines(&self.we, map, proj * view, cam));
             }
             // (v255) `/fps showelements` : portes, sites et départs, à travers les murs.
             if let Some(e) = &self.fps_elements {
@@ -12079,22 +12280,29 @@ fn build_voxel_grid(
 
 /// Arêtes de la sélection WorldEdit (bleu), coin 1 (rouge) et coin 2 (bleu clair) : traits
 /// fins dessinés avec la main (toujours visibles, comme l'affichage de WorldEdit).
+/// (v258) `map` : les éléments de la carte FPS affichés (`/fps showelements`) ; une sélection
+/// qui en est un en prend la couleur, sans ses coins.
 fn selection_lines(
     we: &crate::worldedit::WorldEdit,
+    map: Option<&minelib_net::game::FpsMap>,
     vp: Mat4,
     eye: Vec3,
 ) -> Vec<minelib_render::VmVertex> {
     let mut out = Vec::new();
     let f = |p: [i32; 3]| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
     if let Some((a, b)) = we.region() {
+        let element = map.and_then(|m| element_color(m, minelib_net::game::Zone::new(a, b)));
         push_box(
             &mut out,
             vp,
             eye,
             f(a) - Vec3::splat(0.01),
             f(b) + Vec3::splat(1.01),
-            [0.1, 0.45, 1.6, 1.0],
+            element.unwrap_or([0.1, 0.45, 1.6, 1.0]),
         );
+        if element.is_some() {
+            return out;
+        }
     }
     if let Some(p) = we.pos1 {
         push_box(
@@ -12225,24 +12433,40 @@ pub(crate) fn chunk_doors(world: &World, pos: ChunkPos) -> Vec<DoorBox> {
                     continue;
                 }
                 let c = [x0 + x as i32, y as i32, z0 + z as i32];
-                match door_partner(&get, &none, c) {
-                    // L'autre battant la range (une seule boîte pour les deux).
-                    Some(q) if (q[0], q[2]) < (c[0], c[2]) => {}
-                    Some(q) => out.push(DoorBox {
-                        min: [c[0].min(q[0]), c[1], c[2].min(q[2])],
-                        max: [c[0].max(q[0]), c[1] + 1, c[2].max(q[2])],
-                        double: true,
-                    }),
-                    None => out.push(DoorBox {
-                        min: c,
-                        max: [c[0], c[1] + 1, c[2]],
-                        double: false,
-                    }),
+                // L'autre battant d'une double porte la range (une seule boîte pour les deux).
+                if door_partner(&get, &none, c).is_some_and(|q| (q[0], q[2]) < (c[0], c[2])) {
+                    continue;
+                }
+                if let Some(d) = door_box(&get, c) {
+                    out.push(d);
                 }
             }
         }
     }
     out
+}
+
+/// (v258) Boîte de la porte dont fait partie le bloc `c` : ses deux blocs, ou les quatre des
+/// deux battants d'une double porte. `None` : pas une porte.
+pub(crate) fn door_box(get: &dyn Fn([i32; 3]) -> BlockId, c: [i32; 3]) -> Option<DoorBox> {
+    let upper = match hinged(get(c))? {
+        Hinged::Door { upper, .. } => upper,
+        Hinged::Trapdoor { .. } => return None,
+    };
+    let low = if upper { [c[0], c[1] - 1, c[2]] } else { c };
+    let none = HashMap::new();
+    Some(match door_partner(get, &none, low) {
+        Some(q) => DoorBox {
+            min: [low[0].min(q[0]), low[1], low[2].min(q[2])],
+            max: [low[0].max(q[0]), low[1] + 1, low[2].max(q[2])],
+            double: true,
+        },
+        None => DoorBox {
+            min: low,
+            max: [low[0], low[1] + 1, low[2]],
+            double: false,
+        },
+    })
 }
 
 /// (v255) Ce que montre `/fps showelements` : les zones de la carte FPS (relues toutes les
@@ -12283,8 +12507,32 @@ fn element_zones(
     out
 }
 
+/// (v258) Couleur de l'élément de la carte FPS qu'est exactement la zone `z` (départ, site, ou
+/// porte posée pour la partie), s'il y en a un.
+fn element_color(
+    map: &minelib_net::game::FpsMap,
+    z: minelib_net::game::Zone,
+) -> Option<[f32; 4]> {
+    if let Some((_, _, c)) = element_zones(map).into_iter().find(|(e, _, _)| *e == z) {
+        return Some(c);
+    }
+    map.door_list.contains(&z).then(|| door_color(z))
+}
+
+/// (v258) Couleur d'une porte posée pour la partie : vert clair, vert foncé pour une double
+/// porte (deux battants côte à côte).
+fn door_color(z: minelib_net::game::Zone) -> [f32; 4] {
+    if z.max[0] > z.min[0] || z.max[2] > z.min[2] {
+        ELEMENT_DOUBLE_DOOR
+    } else {
+        ELEMENT_DOOR
+    }
+}
+
 /// (v255) Traits de `/fps showelements` (voir `push_box`) : la boîte de chaque zone de la
-/// carte, et de chaque porte trouvée (à 192 blocs au plus).
+/// carte, et de chaque porte (à 192 blocs au plus). (v258) Les portes posées pour la partie
+/// (`/fps set door`) ; toutes celles trouvées dans les chunks quand toutes s'ouvrent
+/// (`/fps set door on`).
 fn element_lines(e: &FpsElements, vp: Mat4, eye: Vec3) -> Vec<minelib_render::VmVertex> {
     let mut out = Vec::new();
     let f = |p: [i32; 3]| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
@@ -12298,7 +12546,25 @@ fn element_lines(e: &FpsElements, vp: Mat4, eye: Vec3) -> Vec<minelib_render::Vm
             c,
         );
     }
-    for d in e.doors.values().flatten() {
+    for z in &e.map.door_list {
+        let (lo, hi) = (f(z.min), f(z.max) + Vec3::ONE);
+        if ((lo + hi) * 0.5 - eye).length() > 192.0 {
+            continue;
+        }
+        push_box(
+            &mut out,
+            vp,
+            eye,
+            lo - Vec3::splat(0.03),
+            hi + Vec3::splat(0.03),
+            door_color(*z),
+        );
+    }
+    let all = e.map.doors();
+    for d in e.doors.values().flatten().filter(|_| all) {
+        if e.map.door_listed(d.min) {
+            continue;
+        }
         let (lo, hi) = (f(d.min), f(d.max) + Vec3::ONE);
         if ((lo + hi) * 0.5 - eye).length() > 192.0 {
             continue;
@@ -12775,6 +13041,14 @@ mod slab_tests {
                 },
             ]
         );
+        // (v258) N'importe quel bloc d'une porte donne toute la porte (la sélection d'un seul
+        // bloc devient la porte : deux blocs, quatre pour une double porte).
+        let get = |c: [i32; 3]| w.get(c[0], c[1], c[2]);
+        for c in [[3, 10, 2], [3, 11, 3], [3, 11, 2]] {
+            assert_eq!(door_box(&get, c), Some(doors[0]), "{c:?}");
+        }
+        assert_eq!(door_box(&get, [3, 11, 9]), Some(doors[1]));
+        assert_eq!(door_box(&get, [3, 12, 9]), None);
     }
 
     #[test]

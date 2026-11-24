@@ -57,6 +57,15 @@ pub fn load(dir: &Path) -> FpsMap {
             doors_said = true;
             continue;
         }
+        // (v258) Une porte (ou double porte) posée pour la partie.
+        if k.trim() == "porte" {
+            if let Some(z) = parse_zone(v) {
+                if !m.door_list.contains(&z) {
+                    m.door_list.push(z);
+                }
+            }
+            continue;
+        }
         let z = parse_zone(v);
         match k.trim() {
             "ct" => m.ct = z,
@@ -70,6 +79,10 @@ pub fn load(dir: &Path) -> FpsMap {
     if m.door_sync() && !doors_said {
         m.set_doors(true);
     }
+    // (v258) Toujours dans le même ordre (le paquet de la carte range ses lignes : chez qui
+    // la reçoit, elles arrivent triées), au plus `MAX_DOORS`.
+    m.door_list.sort_by_key(|z| (z.min, z.max));
+    m.door_list.truncate(MAX_DOORS);
     m
 }
 
@@ -97,6 +110,9 @@ pub fn save(dir: &Path, m: &FpsMap) -> Result<()> {
     }
     if m.door_sync() {
         s += "portes_doubles=1\n";
+    }
+    for z in &m.door_list {
+        s += &format!("porte={}\n", zone_text(z));
     }
     fs::write(dir.join(FILE), s)?;
     Ok(())
@@ -208,6 +224,15 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
             .iter()
             .map(|l| format!("{LIGHT_PREFIX}{}", l.to_text())),
     );
+    // CHANGEMENT DE CARTE (v258) : les portes posées pour la partie (`/fps set door`), avec
+    // les torches, préfixées « porte, » (hors de l'encodage de `FpsMap` : les cartes déjà
+    // partagées se lisent toujours). Une carte qui en a change donc de signature.
+    let fps = load(dir);
+    torches.extend(
+        fps.door_list
+            .iter()
+            .map(|z| format!("{DOOR_PREFIX}{}", zone_text(z))),
+    );
     torches.sort();
     torches.dedup();
     Ok(MapPackage {
@@ -216,12 +241,15 @@ pub fn package(dir: &Path) -> Result<MapPackage> {
         edits,
         chunks,
         torches,
-        fps: load(dir),
+        fps,
     })
 }
 
 /// (v224) Préfixe des lumières de l'éditeur parmi les torches d'un paquet.
 const LIGHT_PREFIX: &str = "lumiere,";
+
+/// (v258) Préfixe des portes posées pour la partie parmi les torches d'un paquet.
+const DOOR_PREFIX: &str = "porte,";
 
 /// Signatures déjà calculées : (dossier) → (date des fichiers, signature).
 #[derive(Default)]
@@ -336,7 +364,9 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     let (heads, torches): (Vec<&String>, Vec<&String>) = p
         .torches
         .iter()
-        .filter(|l| !l.starts_with("heure,") && !l.starts_with(LIGHT_PREFIX))
+        .filter(|l| {
+            !l.starts_with("heure,") && !l.starts_with(LIGHT_PREFIX) && !l.starts_with(DOOR_PREFIX)
+        })
         .partition(|l| l.starts_with("tete,"));
     let mut t = torches
         .iter()
@@ -352,9 +382,20 @@ pub fn unpack(maps: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         .map(|l| l["tete,".len()..].to_string())
         .collect();
     crate::mcimport::write_heads(&dir, &heads);
-    save(&dir, &p.fps)?;
+    // (v258) Les portes posées pour la partie : dans les lignes du paquet.
+    let mut fps = p.fps.clone();
+    fps.door_list = p
+        .torches
+        .iter()
+        .filter_map(|l| parse_zone(l.strip_prefix(DOOR_PREFIX)?))
+        .take(MAX_DOORS)
+        .collect();
+    save(&dir, &fps)?;
     Ok(dir)
 }
+
+/// (v258) Portes posées pour la partie, au plus.
+pub const MAX_DOORS: usize = 512;
 
 /// (v232) Fichier d'une copie de carte dans ses mondes : la signature de la carte d'origine
 /// (en hexadécimal), pour ne pas la copier deux fois.
@@ -526,6 +567,40 @@ mod tests {
         // Enregistrées par le propriétaire (avec leurs identifiants) : même carte.
         crate::lights::save_scene(&dir, &mine).unwrap();
         assert_eq!(package(&dir).unwrap().signature(), lit.signature());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// (v258) Les portes posées pour la partie partent avec la carte (dans ses lignes, pas dans
+    /// l'encodage de `FpsMap`) : une autre signature, les mêmes portes chez celui qui la reçoit,
+    /// et elles seules s'ouvrent quand toutes ne le font pas.
+    #[test]
+    fn doors_set_for_the_match_go_with_the_map() {
+        let root = std::env::temp_dir().join(format!("minelib-carte-portes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = crate::save::create_world(&root, "Nuke", 9).unwrap();
+        let bare = package(&dir).unwrap();
+        let mut m = load(&dir);
+        let single = Zone::new([3, 64, 5], [3, 65, 5]);
+        let double = Zone::new([10, 64, 2], [10, 65, 3]);
+        m.door_list = vec![single, double];
+        save(&dir, &m).unwrap();
+        assert_eq!(load(&dir).door_list, vec![single, double]);
+        let with = package(&dir).unwrap();
+        assert_ne!(with.signature(), bare.signature(), "des portes posées : une autre carte");
+        assert_eq!(with.fps.door_list, vec![single, double]);
+        let copy = unpack(&root.join("maps"), "Copie", &with.to_bytes()).unwrap();
+        let theirs = load(&copy);
+        assert_eq!(theirs.door_list, vec![single, double]);
+        assert_eq!(package(&copy).unwrap().signature(), with.signature());
+        let t = fs::read_to_string(copy.join("torches.txt")).unwrap_or_default();
+        assert!(!t.contains(DOOR_PREFIX));
+        // Elles seules s'ouvrent ; avec `/fps set door on`, toutes.
+        assert!(!theirs.doors());
+        assert!(theirs.door_usable([3, 65, 5]) && theirs.door_usable([10, 64, 3]));
+        assert!(!theirs.door_usable([4, 64, 5]));
+        let mut all = theirs.clone();
+        all.set_doors(true);
+        assert!(all.door_usable([4, 64, 5]));
         let _ = fs::remove_dir_all(&root);
     }
 }

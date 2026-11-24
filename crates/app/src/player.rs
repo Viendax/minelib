@@ -883,13 +883,23 @@ impl Player {
 
         // (v254) Le pas que la position peut faire : le reste d'avant compris, arrondi à ce
         // qu'un f32 sait représenter ici ; ce qui manque attend le pas suivant (`settle_rest`).
+        // (v258) Pas en mode FPS : une partie y est rejouée à l'identique chez l'hôte, ses
+        // invités et le vérificateur, depuis l'état envoyé (`net_state`), qui n'a pas ce
+        // reste. Il faisait différer de temps en temps un pas d'un dernier chiffre, puis un
+        // joueur au bord d'un bloc, une balle touchée ou manquée : le vérificateur trouvait
+        // de fausses preuves contre un hôte honnête. Le pas y est celui d'avant la v254.
         let start = self.pos;
-        let target = start.as_dvec3() + self.rest + (self.vel * dt).as_dvec3();
-        let delta = target.as_vec3() - start;
+        let target = (!fps).then(|| start.as_dvec3() + self.rest + (self.vel * dt).as_dvec3());
+        let delta = target.map_or(self.vel * dt, |t| t.as_vec3() - start);
+        if fps {
+            self.rest = glam::DVec3::ZERO;
+        }
         if self.noclip {
             self.pos += delta;
             self.on_ground = false;
-            self.settle_rest(start, target);
+            if let Some(t) = target {
+                self.settle_rest(start, t);
+            }
             return;
         }
         // Petits pas pour ne jamais traverser un bloc à grande vitesse.
@@ -936,7 +946,9 @@ impl Player {
             self.stamina =
                 (self.stamina + cs::STAMINA_LAND_COST * fall_speed / cs::UNIT).min(cs::STAMINA_MAX);
         }
-        self.settle_rest(start, target);
+        if let Some(t) = target {
+            self.settle_rest(start, t);
+        }
     }
 
     /// (v254) Après un pas parti de `start` vers `target` (exact, f64) : sur chaque axe où le
@@ -1777,6 +1789,43 @@ mod tests {
         let far = flown(300_000.3);
         assert!(near > 5.0, "{near}");
         assert!((far - near).abs() < 0.07, "au centre {near}, loin {far}");
+    }
+
+    /// (v258) En mode FPS, les pas ne dépendent que de l'état envoyé (`net_state`) : un joueur
+    /// refait depuis cet état (l'hôte, un invité qui se corrige, le vérificateur qui rejoue les
+    /// coups) fait exactement les mêmes pas, au dernier chiffre près (le reste de la v254
+    /// les faisait différer : fausses preuves contre l'hôte). Hors mode FPS, le reste est gardé.
+    #[test]
+    fn fps_steps_depend_only_on_the_sent_state() {
+        let w = flat_world();
+        let run = |fps: bool| {
+            let mut a = Player::new(Vec3::new(3.3, 11.0, 4.7));
+            a.yaw = 0.61;
+            let walk = |k: usize| MoveInput {
+                forward: if k % 97 < 70 { 1.0 } else { -0.4 },
+                strafe: if k % 53 < 20 { 0.8 } else { 0.0 },
+                jump: k.is_multiple_of(131),
+                jump_pressed: k.is_multiple_of(131),
+                fps,
+                ..Default::default()
+            };
+            for k in 0..300 {
+                a.update(&w, &walk(k), crate::session::SIM_TICK);
+            }
+            let mut b = Player::new(a.pos);
+            b.set_net_state(&a.net_state());
+            b.yaw = a.yaw;
+            b.pitch = a.pitch;
+            let mut same = true;
+            for k in 300..900 {
+                a.update(&w, &walk(k), crate::session::SIM_TICK);
+                b.update(&w, &walk(k), crate::session::SIM_TICK);
+                same &= a.pos == b.pos;
+            }
+            (same, a.rest != glam::DVec3::ZERO)
+        };
+        assert_eq!(run(true), (true, false), "mode FPS : les mêmes pas, sans reste");
+        assert!(run(false).1, "hors mode FPS, le reste est gardé");
     }
 
     #[test]

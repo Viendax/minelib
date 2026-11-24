@@ -124,7 +124,9 @@ impl Garant {
             log::warn!("arbitre : carte illisible");
             return Vec::new();
         };
-        let guilty = crate::netgame::arbitrate(items, &mut world, ensure_around);
+        // (v258) Les portes posées pour la partie (`fps.txt` de la carte).
+        let doors = crate::fpsmap::load(dir).door_list;
+        let guilty = crate::netgame::arbitrate(items, &mut world, &doors, ensure_around);
         log::info!(
             "arbitre : affaire {case} : {}",
             if guilty {
@@ -157,7 +159,10 @@ impl Garant {
         let spawn = Vec3::new(8.5, top as f32 + 1.0, 8.5);
         let map = crate::fpsmap::load(dir);
         let mut net = if self.standby {
-            NetGame::standby(self.link.clone(), self.sig)
+            // (v258) Les portes posées pour la partie, remises dans chaque copie vérifiée.
+            let mut n = NetGame::standby(self.link.clone(), self.sig);
+            n.set_map_doors(map.door_list);
+            n
         } else {
             NetGame::headless(self.link.clone(), self.pseudo.clone(), map, self.sig, spawn)
         };

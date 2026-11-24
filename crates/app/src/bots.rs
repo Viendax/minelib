@@ -2331,7 +2331,8 @@ impl Brain {
             self.stuck_at = self.at;
             match self.stuck_n {
                 // Une porte fermée devant : on l'ouvre (si la carte le permet).
-                1 if m.map.doors() && self.door_cd <= 0.0 => {
+                // (v258) Ou des portes posées pour la partie (celle-ci l'est peut-être).
+                1 if (m.map.doors() || !m.map.door_list.is_empty()) && self.door_cd <= 0.0 => {
                     self.door = door_ahead(world, feet, mv.dir);
                 }
                 // Un saut raté : on recule un peu pour reprendre de l'élan.

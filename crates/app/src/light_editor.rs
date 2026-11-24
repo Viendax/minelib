@@ -1809,6 +1809,28 @@ impl Editor {
                         l.ball = if v < 0.02 { 0.0 } else { (v * 100.0).round() / 100.0 };
                         changed = true;
                     }
+                    // (v258) Fondu de ses bords : plus haut, des bords plus transparents et une
+                    // boule qui prend moins de place, en dégradé (0 : la boule telle quelle).
+                    if l.ball > 0.0 {
+                        let label = if l.ball_edge > 0.0 {
+                            format!("{} %", (l.ball_edge * 100.0).round())
+                        } else {
+                            "aucun".to_string()
+                        };
+                        if let Some(v) = self.slider(
+                            p,
+                            129,
+                            "Fondu des bords",
+                            l.ball_edge,
+                            0.0,
+                            1.0,
+                            1.0,
+                            &label,
+                        ) {
+                            l.ball_edge = if v < 0.01 { 0.0 } else { (v * 100.0).round() / 100.0 };
+                            changed = true;
+                        }
+                    }
                 }
             }
             Tab::Volume => {

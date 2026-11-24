@@ -207,7 +207,15 @@ fn ball(i: VOut) -> vec3<f32> {
     let near = exp(-d2 / (0.38 * 0.38));
     let halo = exp(-d2 / (0.72 * 0.72));
     let c = vec3<f32>(1.0) * (core * 3.0 + near * 0.35) + i.color * (near * 1.1 + halo * 0.45);
-    return c * edge * edge * i.seg.y;
+    // (v258) Fondu des bords (`seg.z`, 0 … 1) : la lueur s'efface en dégradé du rayon
+    // 1 − fondu jusqu'au bord ; plus il est haut, plus les bords sont transparents et plus la
+    // boule paraît petite (à 1, le dégradé part du centre ; le cœur reste vif). Le carré de la
+    // courbe en S : l'image est encodée en sRGB, une lueur faible s'y voit encore, la fin du
+    // dégradé doit tendre doucement vers rien pour ne pas laisser de cercle.
+    let fade = clamp(i.seg.z, 0.0, 1.0);
+    let t = clamp((sqrt(d2) - (1.0 - fade)) / max(fade, 1e-4), 0.0, 1.0);
+    let keep = 1.0 - t * t * (3.0 - 2.0 * t);
+    return c * edge * edge * i.seg.y * keep * keep;
 }
 
 /// Direction du regard pour ce point de l'écran, tirée des lignes de la matrice `m` (ni

@@ -316,6 +316,12 @@ pub struct FpsMap {
     /// Bit `DOORS` : portes et trappes utilisables en partie (`/fps set door true`) ; il
     /// est rangé ici pour que les cartes déjà partagées se lisent toujours.
     pub max_players: u8,
+    /// (v258) Portes posées pour la partie (`/fps set door`, à la baguette ou en visant) : une
+    /// boîte par porte (ses deux blocs) ou double porte (quatre). Hors de l'encodage de la
+    /// carte (les cartes déjà partagées se lisent toujours) : elles voyagent dans les lignes
+    /// du paquet (`porte,…`, comme les lumières de l'éditeur), et dans `fps.txt`.
+    #[serde(skip)]
+    pub door_list: Vec<Zone>,
 }
 
 impl FpsMap {
@@ -366,6 +372,19 @@ impl FpsMap {
         } else {
             self.max_players &= !Self::DOORS;
         }
+    }
+
+    /// (v258) Le bloc `p` fait partie d'une porte posée pour la partie (`door_list`).
+    pub fn door_listed(&self, p: [i32; 3]) -> bool {
+        self.door_list
+            .iter()
+            .any(|z| (0..3).all(|k| p[k] >= z.min[k] && p[k] <= z.max[k]))
+    }
+
+    /// (v258) La porte (ou la trappe) en `p` s'ouvre en partie : toutes le font
+    /// (`/fps set door on`), ou elle a été posée pour la partie.
+    pub fn door_usable(&self, p: [i32; 3]) -> bool {
+        self.doors() || self.door_listed(p)
     }
 }
 

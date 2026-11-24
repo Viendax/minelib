@@ -65,6 +65,21 @@ pub const LOADED_DIST: f32 = 192.0;
 /// (v251) Rayon le plus grand de la boule de lumière (blocs).
 pub const BALL_MAX: f32 = 3.0;
 
+/// (v251) Boule de lumière d'une lumière ponctuelle, à dessiner (`Lights::balls`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ball {
+    /// Centre (la lumière).
+    pub at: [f32; 3],
+    /// Rayon (blocs).
+    pub radius: f32,
+    /// Couleur (linéaire).
+    pub color: [f32; 3],
+    /// Force (selon l'intensité).
+    pub force: f32,
+    /// (v258) Fondu des bords (0 … 1, `PlacedLight::ball_edge`).
+    pub edge: f32,
+}
+
 /// Sorte de lumière.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
@@ -141,6 +156,14 @@ pub struct PlacedLight {
     /// signature de la carte.)
     #[serde(rename = "boule", skip_serializing_if = "no_ball")]
     pub ball: f32,
+    /// (v258) Fondu des bords de la boule de lumière (0 … 1) : « un curseur pour l'opacité de
+    /// ses bords, qui réduit l'opacité et la taille qu'elle prend, et que ce soit
+    /// progressif ». 0 : la boule telle quelle ; plus haut, ses bords deviennent transparents
+    /// et le fondu gagne vers le centre (1 : il part du centre), elle prend moins de place ; le
+    /// cœur reste vif. (Pas écrit à 0 : les lumières d'avant gardent le même texte, et la carte
+    /// la même signature.)
+    #[serde(rename = "bords_boule", skip_serializing_if = "no_ball")]
+    pub ball_edge: f32,
 }
 
 fn no_ball(v: &f32) -> bool {
@@ -176,6 +199,7 @@ impl Default for PlacedLight {
             gobo_echelle: 1.0,
             gobo_inverse: false,
             ball: 0.0,
+            ball_edge: 0.0,
         }
     }
 }
@@ -208,6 +232,7 @@ impl PlacedLight {
         self.anisotropy = f(self.anisotropy, -0.95, 0.95, 0.4);
         self.bulb = f(self.bulb, 0.0, 2.0, 0.0);
         self.ball = f(self.ball, 0.0, BALL_MAX, 0.0);
+        self.ball_edge = f(self.ball_edge, 0.0, 1.0, 0.0);
         self.gobo_rotation = f(self.gobo_rotation, 0.0, 360.0, 0.0);
         self.gobo_echelle = f(self.gobo_echelle, 0.1, 4.0, 1.0);
         if self.entities_only && self.blocks_only {
@@ -1294,15 +1319,17 @@ impl Lights {
     }
 
     /// (v251) Boules de lumière des lumières ponctuelles chargées et allumées qui en ont une
-    /// (`ball`) : centre, rayon (blocs), couleur (linéaire), force (selon l'intensité).
-    pub fn balls(&self) -> Vec<([f32; 3], f32, [f32; 3], f32)> {
+    /// (`ball`).
+    pub fn balls(&self) -> Vec<Ball> {
         self.loaded()
             .map(|i| &self.scene[i])
             .filter(|l| l.on && l.kind == Kind::Point && l.ball > 0.0)
-            .map(|l| {
-                let lin = l.color.map(|c| c.powf(2.2));
-                let force = (0.6 + 0.2 * l.intensity).min(2.0);
-                (l.pos().to_array(), l.ball, lin, force)
+            .map(|l| Ball {
+                at: l.pos().to_array(),
+                radius: l.ball,
+                color: l.color.map(|c| c.powf(2.2)),
+                force: (0.6 + 0.2 * l.intensity).min(2.0),
+                edge: l.ball_edge,
             })
             .collect()
     }
@@ -1484,6 +1511,24 @@ mod tests {
         l.kind = Kind::Point;
         let p = l.to_dyn(Some(4));
         assert_eq!((p.range, p.gobo), (3.0, None));
+    }
+
+    /// (v258) Le fondu des bords de la boule de lumière : gardé avec la lumière, ramené entre
+    /// 0 et 1, pas écrit à 0 (les lumières d'avant gardent le même texte, et la carte la même
+    /// signature).
+    #[test]
+    fn the_ball_edge_fade_is_kept_bounded_and_unwritten_at_zero() {
+        let mut l = PlacedLight::default();
+        assert!(!l.to_text().contains("boule"), "{}", l.to_text());
+        l.ball = 1.25;
+        l.ball_edge = 0.4;
+        let text = l.to_text();
+        assert!(text.contains("\"bords_boule\":0.4"), "{text}");
+        assert_eq!(PlacedLight::from_text(text.as_bytes()), Some(l.clone()));
+        let high = text.replace("\"bords_boule\":0.4", "\"bords_boule\":7.5");
+        assert_eq!(PlacedLight::from_text(high.as_bytes()).unwrap().ball_edge, 1.0);
+        let low = text.replace("\"bords_boule\":0.4", "\"bords_boule\":-2");
+        assert_eq!(PlacedLight::from_text(low.as_bytes()).unwrap().ball_edge, 0.0);
     }
 
     #[test]

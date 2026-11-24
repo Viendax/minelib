@@ -260,6 +260,18 @@ struct Backup {
     burns: Vec<(u64, f32)>,
 }
 
+impl Backup {
+    /// (v258) Les portes posées pour la partie (`FpsMap::door_list`) ne sont pas dans la copie
+    /// (l'encodage de la carte ne les a pas, pour que les cartes déjà partagées se lisent
+    /// toujours) : celui qui la reçoit y remet celles de sa carte, la même que celle de l'hôte
+    /// (sa signature les compte). Sans elles, le vérificateur refusait la porte qu'un joueur
+    /// ouvrait, et prenait l'hôte honnête pour un tricheur.
+    fn with_doors(mut self, doors: &[game::Zone]) -> Self {
+        self.m.map.door_list = doors.to_vec();
+        self
+    }
+}
+
 /// Un coup du journal de la partie. Tout ce qui change la partie y passe, dans l'ordre
 /// où l'hôte l'a fait : le vérificateur rejoue la partie entière à partir de ce journal.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -357,7 +369,8 @@ pub fn use_door(
     side: u8,
 ) -> Vec<([i32; 3], u16)> {
     use minelib_world::BlockId;
-    let Some(feet) = feet.filter(|_| alive && m.map.doors()) else {
+    // (v258) Toutes les portes (`/fps set door on`), ou celles posées pour la partie.
+    let Some(feet) = feet.filter(|_| alive && m.map.door_usable(pos)) else {
         return Vec::new();
     };
     let center = Vec3::new(pos[0] as f32, pos[1] as f32, pos[2] as f32) + Vec3::splat(0.5);
@@ -1243,6 +1256,7 @@ impl Auditor {
 pub fn arbitrate(
     items: &[(Option<u64>, Vec<u8>)],
     world: &mut World,
+    doors: &[game::Zone],
     mut around: impl FnMut(&mut World, Vec3),
 ) -> bool {
     let mut auditor = Auditor {
@@ -1259,7 +1273,8 @@ pub fn arbitrate(
                 }
             }
             None => {
-                let Some(new) = game::decode::<Backup>(data) else {
+                // (v258) Avec les portes posées pour la partie (`Backup::with_doors`).
+                let Some(new) = game::decode::<Backup>(data).map(|b| b.with_doors(doors)) else {
                     continue;
                 };
                 for p in &new.players {
@@ -1475,6 +1490,9 @@ pub struct Guest {
     /// Garant indépendant en attente : vérifie chaque copie en rejouant les coups.
     auditor: bool,
     audit: Auditor,
+    /// (v258) Portes posées pour la partie de la carte (`FpsMap::door_list`, de son
+    /// `fps.txt`) : remises dans chaque copie reçue (`Backup::with_doors`).
+    map_doors: Vec<game::Zone>,
     /// Désaccords trouvés, à envoyer au relais.
     pub conflicts: Vec<Conflict>,
     /// Présentation renvoyée tant que l'hôte n'a pas répondu.
@@ -2157,6 +2175,7 @@ impl NetGame {
             parts: Vec::new(),
             auditor: false,
             audit: Auditor::default(),
+            map_doors: Vec::new(),
             conflicts: Vec::new(),
             hello_timer: 1.0,
             loading: false,
@@ -2269,7 +2288,17 @@ impl NetGame {
         if let NetGame::Host(h) = self {
             let link = h.link.clone();
             let sig = h.map_sig;
+            let doors = h.m.map.door_list.clone();
             *self = NetGame::guest(link, sig);
+            self.set_map_doors(doors);
+        }
+    }
+
+    /// (v258) Portes posées pour la partie de la carte de ce jeu (`FpsMap::door_list`) : un
+    /// invité les remet dans les copies de la partie qu'il reçoit (garant, vérificateur).
+    pub fn set_map_doors(&mut self, doors: Vec<game::Zone>) {
+        if let NetGame::Guest(g) = self {
+            g.map_doors = doors;
         }
     }
 
@@ -2362,8 +2391,13 @@ impl NetGame {
                     }
                     let data = std::mem::take(&mut g.parts).concat();
                     if g.auditor {
-                        let prev = g.backup.as_deref().and_then(game::decode::<Backup>);
-                        let new = game::decode::<Backup>(&data);
+                        let doors = &g.map_doors;
+                        let prev = g
+                            .backup
+                            .as_deref()
+                            .and_then(game::decode::<Backup>)
+                            .map(|b| b.with_doors(doors));
+                        let new = game::decode::<Backup>(&data).map(|b| b.with_doors(doors));
                         match (prev, new) {
                             (Some(p), Some(n)) => g.conflicts.extend(g.audit.audit(&p, &n, world)),
                             _ => g.audit.first_copy(),
@@ -2725,6 +2759,13 @@ impl NetGame {
             return false;
         };
         let mut m = b.m;
+        // (v258) Les portes posées pour la partie (`Backup::with_doors`) : celles de la carte
+        // de ce jeu.
+        m.map.door_list = if map.door_list.is_empty() {
+            g.map_doors.clone()
+        } else {
+            map.door_list.clone()
+        };
         // L'ancien hôte reste au résultat (parti) ; ce jeu devient le joueur 0.
         // Ancien hôte : parti (reste au résultat) ou resté (il devient un invité).
         let gone = old_host.unwrap_or(u64::MAX - 1);
@@ -5422,6 +5463,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// (v258) Une porte posée pour la partie (`/fps set door`), ouverte par un invité alors que
+    /// toutes ne s'ouvrent pas : la copie de la partie n'emporte pas les portes posées
+    /// (l'encodage de la carte ne les a pas) ; le vérificateur et l'arbitre y remettent celles
+    /// de leur carte et n'ont rien à redire. Sans elles, ils refusaient la porte et prenaient
+    /// l'hôte honnête pour un tricheur.
+    #[test]
+    fn a_door_set_for_the_match_is_not_held_against_the_host() {
+        fn run(g: &mut NetGame, world: &World, local: &mut Player, seq: &mut u32, n: usize) {
+            let dt = crate::session::SIM_TICK;
+            let idle = MoveInput {
+                fps: true,
+                ..Default::default()
+            };
+            for _ in 0..n {
+                let NetGame::Host(h) = g else { unreachable!() };
+                *seq += 1;
+                let r = h.peers.get_mut(&7).unwrap();
+                r.queue.push_back((*seq, NetInput::default()));
+                local.update(world, &idle, dt);
+                g.on_tick(world, local, &idle, dt);
+                for l in g.end_frame(world, Vec::new(), 255, NadeOut::default(), dt) {
+                    if let Local::Respawn { state, .. } = l {
+                        local.set_net_state(&state);
+                    }
+                }
+            }
+        }
+        let reg = minelib_world::registry::registry();
+        let lower = reg.by_key("door_wood:lower:1").unwrap();
+        let upper = reg.by_key("door_wood:upper:1").unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut world = floor();
+        let spawn = Vec3::new(8.5, 11.0, 8.5);
+        let mut g = NetGame::host(tx, "Hote".into(), FpsMap::default(), [0; 32], spawn);
+        g.peer_joined(7, "Invite".into());
+        let hello = game::encode(&ToHost::Hello { map_hash: [0; 32] });
+        g.receive(Some(7), &hello, &mut world);
+        host(&mut g).auto_backup = false;
+        let mut local = Player::new(Vec3::new(4.5, 11.0, 4.5));
+        let mut seq = 0;
+        run(&mut g, &world, &mut local, &mut seq, 300);
+        // La porte, à côté de l'invité, posée pour la partie (toutes ne s'ouvrent pas).
+        let at = host(&mut g).peers[&7].player.pos;
+        let d = [at.x.floor() as i32 + 1, at.y.floor() as i32, at.z.floor() as i32];
+        let with_door = |mut w: World| {
+            w.set(d[0], d[1], d[2], lower);
+            w.set(d[0], d[1] + 1, d[2], upper);
+            w
+        };
+        world = with_door(world);
+        let doors = vec![game::Zone::new(d, [d[0], d[1] + 1, d[2]])];
+        host(&mut g).m.map.door_list = doors.clone();
+        assert!(!host(&mut g).m.map.doors());
+        // Les copies, telles qu'elles voyagent (encodées).
+        let sent = |b: Backup| game::decode::<Backup>(&game::encode(&b)).unwrap();
+        let b0 = sent(host(&mut g).make_backup(&local));
+        assert!(b0.m.map.door_list.is_empty(), "la copie n'emporte pas les portes posées");
+        let door = ToHost::Door { pos: d, side: 5 };
+        g.receive(Some(7), &game::encode(&door), &mut world);
+        assert_eq!(host(&mut g).m.doors.len(), 2, "l'hôte ouvre la porte posée");
+        run(&mut g, &world, &mut local, &mut seq, 100);
+        let b1 = sent(host(&mut g).make_backup(&local));
+        let audit = |doors: &[game::Zone]| {
+            let mut a = Auditor {
+                witnessing: true,
+                ..Default::default()
+            };
+            a.witness(7, door.clone());
+            let mut aw = with_door(floor());
+            a.audit(
+                &host_copy(&b0).with_doors(doors),
+                &host_copy(&b1).with_doors(doors),
+                &mut aw,
+            )
+        };
+        let fine = audit(&doors);
+        assert!(fine.is_empty(), "{fine:?}");
+        let wrong = audit(&[]);
+        assert!(wrong.iter().any(|c| c.proof), "sans les portes posées : {wrong:?}");
+        // L'arbitre rejoue les mêmes pièces avec les portes de sa carte : rien à reprocher.
+        let pieces = vec![
+            (None, game::encode(&b0)),
+            (Some(7), game::encode(&door)),
+            (None, game::encode(&b1)),
+        ];
+        assert!(!arbitrate(&pieces, &mut with_door(floor()), &doors, |_, _| {}));
+        assert!(arbitrate(&pieces, &mut with_door(floor()), &[], |_, _| {}));
+    }
+
+    /// Copie d'une copie de la partie (elle n'est pas `Clone`) : encodée puis relue.
+    fn host_copy(b: &Backup) -> Backup {
+        game::decode::<Backup>(&game::encode(b)).unwrap()
+    }
+
     /// Le vérificateur attrape aussi les faux dégâts, les tirs inventés ou ignorés, les
     /// explosions sans grenade et les scores retouchés.
     #[test]
@@ -5503,9 +5638,9 @@ mod tests {
             (None, game::encode(&b1)),
         ];
         let mut w2 = floor();
-        assert!(!arbitrate(&pieces, &mut w2, |_, _| {}));
+        assert!(!arbitrate(&pieces, &mut w2, &[], |_, _| {}));
         pieces.push((None, game::encode(&b2)));
-        assert!(arbitrate(&pieces, &mut w2, |_, _| {}));
+        assert!(arbitrate(&pieces, &mut w2, &[], |_, _| {}));
         // Tir inventé par l'hôte au nom de l'invité (le relais ne l'a jamais vu passer).
         let fake = ToHost::Fire {
             weapon: ak(),
@@ -5889,6 +6024,7 @@ mod tests {
             t: Some(game::Zone::new([1, 11, 1], [3, 11, 3])),
             sites: [Some(game::Zone::new([26, 16, 0], [29, 16, 4])), None, None],
             max_players: 2,
+            door_list: Vec::new(),
         };
         (w, map, Vec3::new(2.5, 11.0, 2.5))
     }
@@ -6131,6 +6267,7 @@ mod tests {
                 None,
             ],
             max_players: 10,
+            door_list: Vec::new(),
         };
         let spawn = Vec3::new(0.5, 11.0, 0.5);
         let mut g = bots_only(&w, map, spawn, false);

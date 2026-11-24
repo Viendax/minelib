@@ -31,7 +31,12 @@ pub const HELP: &[Help] = &[
             ("/fps set site a | site b | site c", "zone d'un site de bombe (sélection)"),
             ("/fps clear <zone>", "efface une zone (spawn ct, site b…)"),
             ("/fps set maxplayer <2-20>", "joueurs de la carte (nombre pair ; seul 10 est classé)"),
-            ("/fps set door on|off", "portes qu'on ouvre en partie, ou fixes"),
+            (
+                "/fps set door",
+                "la porte visée, ou celles de la sélection : elle s'ouvre en partie",
+            ),
+            ("/fps clear door [all]", "la retire (all : toutes)"),
+            ("/fps set door on|off", "toutes les portes s'ouvrent en partie, ou seulement celles posées"),
             ("/fps set doorsync on|off", "doubles portes ensemble ou séparées"),
             ("/fps set time <heure | default>", "heure de la carte en partie"),
             (
