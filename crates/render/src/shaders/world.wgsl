@@ -41,11 +41,13 @@ struct Globals {
     // 0 tête, 1 corps, 2 bras, 3 jambe, 4 bloc tenu, 5 objet tenu, 6 lumineux, 7 bloc lumineux) et max (w = couche de
     // texture du bloc, ou couleur 0xRRGGBB de l'objet).
     ray_info: vec4<f32>,
-    ray_inv: array<mat4x4<f32>, 8>,
-    ray_min: array<vec4<f32>, 8>,
-    ray_max: array<vec4<f32>, 8>,
+    ray_inv: array<mat4x4<f32>, 10>,
+    ray_min: array<vec4<f32>, 10>,
+    ray_max: array<vec4<f32>, 10>,
     // Rectangle de texture (u0, v0, u1, v1) d'un morceau de bloc tenu (sortes 4 et 7).
-    ray_uv: array<vec4<f32>, 8>,
+    // (v256) Pavés du corps (sortes 0 à 3) : taille de la partie entière en pixels du skin
+    // (largeur, hauteur, profondeur) ; le pavé en est un morceau (`RayBox::full`).
+    ray_uv: array<vec4<f32>, 10>,
     // Ombres des joueurs : x = nombre de boîtes, coins min et max (monde). min.w : source de
     // lumière dont la boîte fait l'ombre (partie entière : −1 aucune, −2 la torche tenue),
     // plus 0,5 si le soleil n'atteint pas la boîte (pas d'ombre du soleil).
@@ -1652,7 +1654,7 @@ fn player_hit(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> vec4<f32> {
     var best = vec4<f32>(0.0, 0.0, 0.0, -1.0);
     var bt = max_t;
     let count = i32(g.ray_info.x);
-    for (var k = 0; k < 8; k++) {
+    for (var k = 0; k < 10; k++) {
         if k >= count {
             break;
         }
@@ -1692,6 +1694,25 @@ fn player_hit(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> vec4<f32> {
             v = select(p.z - mn.z, mx.z - p.z, s);
             n = mx.x - mn.x;
         }
+        // (v256) Pavé du corps : son repère est celui des pixels du skin de sa partie
+        // entière (`whole` : largeur, hauteur, profondeur), dont il n'est qu'un morceau (le
+        // ventre : les colonnes 1 à 6 du bas du corps). Le pixel se compte dans la partie.
+        let whole = g.ray_uv[k].xyz;
+        if kind < 4u {
+            if ax == 2 {
+                u = select(whole.x - p.x, p.x, s);
+                v = whole.y - p.y;
+                n = whole.x;
+            } else if ax == 0 {
+                u = select(p.z, whole.z - p.z, s);
+                v = whole.y - p.y;
+                n = whole.z;
+            } else {
+                u = p.x;
+                v = select(p.z, whole.z - p.z, s);
+                n = whole.x;
+            }
+        }
         var albedo: vec3<f32>;
         if kind == 4u || kind == 7u {
             let size = vec2<f32>(n, select(mx.y - mn.y, mx.z - mn.z, ax == 1));
@@ -1714,8 +1735,8 @@ fn player_hit(o: vec3<f32>, d: vec3<f32>, max_t: f32) -> vec4<f32> {
                 } else if ax == 1 {
                     sf = select(5u, 4u, s);
                 }
-                let w = u32(mx.x - mn.x + 0.5);
-                let dd = u32(mx.z - mn.z + 0.5);
+                let w = u32(whole.x + 0.5);
+                let dd = u32(whole.z + 0.5);
                 let px = skin_pixel(part - 1u, sf, iu, iv, w, dd);
                 if px.a >= 0.5 {
                     albedo = lin(px.rgb);

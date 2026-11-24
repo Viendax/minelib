@@ -220,19 +220,20 @@ fn box_faces(
 
 /// Pavé `[min, max]` (pixels, repère du modèle : x droite, y haut, z arrière) transformé
 /// par `xf` (pixels → monde), découpé en pixels colorés.
-/// (v225) `size` : pixels du skin du pavé (`TEX`), étirés à sa taille.
+/// (v225) `zone` : pixels du skin du pavé (`ZONES`), étirés à sa taille.
 #[allow(clippy::too_many_arguments)]
 fn emit_box(
     out: &mut Vec<EntityVertex>,
     xf: Mat4,
     min: [f32; 3],
     max: [f32; 3],
-    size: [usize; 3],
+    zone: Zone,
     part: Part,
     light: [f32; 3],
-    tex: Option<(&crate::skin::Skin, usize)>,
+    tex: Option<&crate::skin::Skin>,
 ) {
-    emit_box_layer(out, xf, min, max, Some(size), part, light, tex, None, 1);
+    let tex = tex.map(|t| (t, zone.skin));
+    emit_box_layer(out, xf, min, max, Some(zone), part, light, tex, None, 1);
 }
 
 /// Comme `emit_box` ; `layer` : pixels transparents laissés vides (têtes des cartes :
@@ -244,7 +245,7 @@ fn emit_box_layer(
     xf: Mat4,
     min: [f32; 3],
     max: [f32; 3],
-    size: Option<[usize; 3]>,
+    zone: Option<Zone>,
     part: Part,
     light: [f32; 3],
     tex: Option<(&crate::skin::Skin, usize)>,
@@ -254,9 +255,11 @@ fn emit_box_layer(
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
     let lit = EntityVertex::light(light, true);
-    // Nombre de pixels du skin par côté : ceux de sa zone du skin (`size`, v225), sinon la
+    // Nombre de pixels du skin par côté : ceux de sa zone du skin (`zone`, v225), sinon la
     // taille du pavé arrondie (une boîte agrandie garde 8 pixels : chacun un peu plus grand).
-    let [w, h, d] = size.unwrap_or_else(|| box_size(min, max));
+    // (v256) `zone` dit aussi où ces pixels sont dans la partie entière du skin.
+    let zone = zone.unwrap_or_else(|| Zone::whole(0, box_size(min, max)));
+    let [w, h, d] = zone.size;
     let k = [
         (x1 - x0) / w.max(1) as f32,
         (y1 - y0) / h.max(1) as f32,
@@ -273,8 +276,10 @@ fn emit_box_layer(
         let lod = lod.max(1);
         for v in (0..nv).step_by(lod) {
             for u in (0..nu).step_by(lod) {
-                let g = grain(k * 4096 + v * 64 + u + part as usize * 977);
-                let size = [w as u32, h as u32, d as u32];
+                // Pixel de la partie entière du skin (le pavé peut n'en montrer qu'un morceau).
+                let (su, sv) = zone.pixel(k, u, v);
+                let g = grain(k * 4096 + sv * 64 + su + part as usize * 977);
+                let size = zone.full.map(|n| n as u32);
                 let rgb = match (tex, layer) {
                     // De loin : un carré par groupe de `lod` × `lod` pixels, à leur couleur
                     // moyenne (vide si la plupart sont transparents).
@@ -283,7 +288,7 @@ fn emit_box_layer(
                         for dv2 in 0..lod.min(nv - v) {
                             for du2 in 0..lod.min(nu - u) {
                                 if let Some(c) =
-                                    t.color(i, k, (u + du2) as u32, (v + dv2) as u32, size)
+                                    t.color(i, k, (su + du2) as u32, (sv + dv2) as u32, size)
                                 {
                                     sum[0] += (c >> 16) & 255;
                                     sum[1] += (c >> 8) & 255;
@@ -299,9 +304,9 @@ fn emit_box_layer(
                     }
                     (Some((t, i)), Some(top)) => {
                         let c = if top {
-                            t.layer_color(i, k, u as u32, v as u32, size, true)
+                            t.layer_color(i, k, su as u32, sv as u32, size, true)
                         } else {
-                            t.color(i, k, u as u32, v as u32, size)
+                            t.color(i, k, su as u32, sv as u32, size)
                         };
                         match c {
                             Some(c) => c,
@@ -309,8 +314,8 @@ fn emit_box_layer(
                         }
                     }
                     _ => tex
-                        .and_then(|(t, i)| t.color(i, k, u as u32, v as u32, size))
-                        .unwrap_or_else(|| skin(part, face, u, v, nu)),
+                        .and_then(|(t, i)| t.color(i, k, su as u32, sv as u32, size))
+                        .unwrap_or_else(|| skin(part, face, su, sv, zone.width(k))),
                 };
                 let c = srgb(rgb);
                 let g = if lod > 1 { 1.0 } else { g };
@@ -411,28 +416,64 @@ const HEAD_S: f32 = 4.5 * 1.075;
 const BODY_K: f32 = (32.0 - HEAD_S) / 27.5;
 /// Hauteur d'une jambe (pixels) : la hanche est à cette hauteur quand on est debout.
 const LEG: f32 = 15.0 * BODY_K;
-/// Épaisseur d'une jambe (largeur et profondeur) ; les deux côte à côte font le corps.
-const LEG_W: f32 = 3.5 * BODY_K;
-/// Corps : hauteur (de la hanche au cou), largeur, profondeur.
+/// Profondeur d'une jambe : les quatre colonnes de son skin.
+const LEG_D: f32 = 3.5 * BODY_K;
+/// (v256) Largeur d'une jambe : trois colonnes de son skin (la colonne extérieure n'est pas
+/// montrée, voir `ZONES`). Avant : quatre (carrée), les deux jambes collées.
+const LEG_W: f32 = 3.0 * COL;
+/// (v256) Écart entre les deux jambes (pixels) : elles ne sont plus collées.
+const LEG_GAP: f32 = 0.8;
+/// Corps : hauteur (de la hanche au cou), largeur (de la poitrine), profondeur.
 const BODY_H: f32 = 12.5 * BODY_K;
 const BODY_W: f32 = 7.0 * BODY_K;
 const BODY_D: f32 = 3.5 * BODY_K;
+// (v256) Demande du 23 novembre : « refais le personnage avec le schéma "CS2", mais avec nos
+// carrés ; les hitbox devront être celles de celui-ci aussi ». Sept pavés au lieu de six : le
+// corps est coupé en une poitrine (large) et un ventre (plus étroit), les jambes sont
+// écartées, et les bras ne tiennent plus au corps que par le coin du haut de l'épaule (« colle
+// à l'épaule la pointe tout en haut de l'épaule, le bras reste placé sinon »). « Un pixel du
+// skin ne doit pas être entre deux parties du corps » : la limite poitrine/ventre tombe entre
+// deux rangées du skin. Choix du 24 novembre (« celui de droite ») : les pixels du ventre et
+// des jambes gardent la taille de ceux de la poitrine et restent alignés du haut en bas ; ce
+// sont les colonnes du bord qui ne sont pas montrées (une de chaque côté du ventre, la colonne
+// extérieure de chaque jambe).
+/// (v256) Une colonne et une rangée du skin sur le corps (pixels du modèle). Les jambes ont
+/// les mêmes colonnes (`LEG_D` / 4).
+const COL: f32 = BODY_W / 8.0;
+const ROW: f32 = BODY_H / 12.0;
+/// (v256) Ventre : les 5 rangées du bas du corps (la poitrine : les 7 du haut), 6 colonnes
+/// de large (la poitrine : 8).
+const BELLY_ROWS: usize = 5;
+const BELLY_H: f32 = BELLY_ROWS as f32 * ROW;
+const BELLY_W: f32 = 6.0 * COL;
 /// Bras : épaisseur, longueur au-dessus du pivot de l'épaule (le haut du bras arrive en haut
 /// du corps) et au-dessous (jusqu'au poing, un peu au-dessus de la hanche).
 const ARM_W: f32 = 2.75 * BODY_K;
 const ARM_UP: f32 = 1.75 * BODY_K;
 const ARM_DOWN: f32 = 9.75 * BODY_K;
-/// Pivot de l'épaule : hauteur au-dessus de la hanche, écart au milieu du corps.
-const SHOULDER_Y: f32 = BODY_H - ARM_UP;
-const ARM_X: f32 = BODY_W / 2.0 + ARM_W / 2.0;
+/// (v256) Écart d'un bras qui pend (radians, autour de l'axe avant-arrière, à l'épaule) : la
+/// main à l'écart du corps, le bras ne le touche que par le coin du haut de l'épaule. Pas le
+/// bras qui vise ou qui tient un objet (il est tendu devant). Son sinus et son cosinus (les
+/// constantes ne savent pas les calculer ; vérifiés par `the_arm_splay_is_six_degrees`).
+pub const ARM_SPLAY: f32 = 0.104_719_76;
+const SPLAY_SIN: f32 = 0.104_528_46;
+const SPLAY_COS: f32 = 0.994_521_9;
+/// Pivot de l'épaule : hauteur au-dessus de la hanche, écart au milieu du corps. (v256) Placé
+/// pour que le coin du haut du bras écarté (côté corps) soit sur le coin du haut de la
+/// poitrine. Avant : `BODY_H - ARM_UP` et `BODY_W / 2 + ARM_W / 2` (bras collé au corps).
+const SHOULDER_Y: f32 = BODY_H + ARM_W / 2.0 * SPLAY_SIN - ARM_UP * SPLAY_COS;
+const ARM_X: f32 = BODY_W / 2.0 + ARM_W / 2.0 * SPLAY_COS + ARM_UP * SPLAY_SIN;
 /// Écart d'une jambe au milieu.
-const LEG_X: f32 = LEG_W / 2.0;
+const LEG_X: f32 = LEG_GAP / 2.0 + LEG_W / 2.0;
 /// Cou (bas de la tête), debout.
 const NECK_Y: f32 = LEG + BODY_H;
 
-/// (v225) Hauteurs du modèle debout, en blocs : hanches, bas de la tête, côté de la tête.
-/// Zones des coups en mode FPS (`netgame::damage_at`), visée des bots.
+/// (v225) Hauteurs du modèle debout, en blocs : hanches, bas de la tête, côté de la tête
+/// (visée des bots, boîte de la tête pour le couteau). (v256) Les zones des coups des balles
+/// sont les pavés du modèle (`hit_boxes`) : les deux premières ne servent plus qu'aux essais.
+#[cfg(test)]
 pub const HIP_BLOCKS: f32 = LEG * PX;
+#[cfg(test)]
 pub const NECK_BLOCKS: f32 = NECK_Y * PX;
 pub const HEAD_BLOCKS: f32 = HEAD_S * PX;
 /// (v225) Épaisseur d'un bras par rapport à sa longueur (le bras à la première personne a
@@ -488,22 +529,22 @@ pub fn head_place(crouch: f32) -> (f32, f32) {
     (-n.z * PX, n.y * PX)
 }
 
-/// Pavés des six parties, dans l'ordre de `parts` et de `Skin::color` (jambe gauche, jambe
-/// droite, corps, bras gauche, bras droit, tête) : coins (pixels, repère de la partie) et
-/// sorte.
-const PARTS: [([f32; 3], [f32; 3], Part); 6] = [
+/// Pavés des sept parties, dans l'ordre de `parts` (jambe gauche, jambe droite, poitrine,
+/// bras gauche, bras droit, tête, ventre) : coins (pixels, repère de la partie) et sorte.
+/// (v256) Le ventre est ajouté à la fin : les six premiers numéros n'ont pas changé.
+const PARTS: [([f32; 3], [f32; 3], Part); 7] = [
     (
-        [-LEG_W / 2.0, -LEG, -LEG_W / 2.0],
-        [LEG_W / 2.0, 0.0, LEG_W / 2.0],
+        [-LEG_W / 2.0, -LEG, -LEG_D / 2.0],
+        [LEG_W / 2.0, 0.0, LEG_D / 2.0],
         Part::Leg,
     ),
     (
-        [-LEG_W / 2.0, -LEG, -LEG_W / 2.0],
-        [LEG_W / 2.0, 0.0, LEG_W / 2.0],
+        [-LEG_W / 2.0, -LEG, -LEG_D / 2.0],
+        [LEG_W / 2.0, 0.0, LEG_D / 2.0],
         Part::Leg,
     ),
     (
-        [-BODY_W / 2.0, 0.0, -BODY_D / 2.0],
+        [-BODY_W / 2.0, BELLY_H, -BODY_D / 2.0],
         [BODY_W / 2.0, BODY_H, BODY_D / 2.0],
         Part::Body,
     ),
@@ -522,23 +563,106 @@ const PARTS: [([f32; 3], [f32; 3], Part); 6] = [
         [HEAD_S / 2.0, HEAD_S, HEAD_S / 2.0],
         Part::Head,
     ),
+    (
+        [-BELLY_W / 2.0, 0.0, -BODY_D / 2.0],
+        [BELLY_W / 2.0, BELLY_H, BODY_D / 2.0],
+        Part::Body,
+    ),
 ];
+/// Numéros de la poitrine et du ventre dans `PARTS`.
+const CHEST: usize = 2;
+const BELLY: usize = 6;
 
-/// (v225) Pixels du skin de chaque pavé (largeur, hauteur, profondeur) : les zones des skins
-/// 64 × 64 (jambes et bras 4 × 12 × 4, corps 8 × 12 × 4, tête 8 × 8 × 8), étirées à la taille
-/// du pavé.
-const TEX: [[usize; 3]; 6] = [
-    [4, 12, 4],
-    [4, 12, 4],
-    [8, 12, 4],
-    [4, 12, 4],
-    [4, 12, 4],
-    [8, 8, 8],
+/// (v256) Ce qu'un pavé montre du skin : la partie du skin (numéro de `Skin::color` : jambe
+/// gauche, jambe droite, corps, bras gauche, bras droit, tête), la taille de sa zone entière
+/// (largeur, hauteur, profondeur en pixels : les zones des skins 64 × 64), les pixels que le
+/// pavé en montre (`size`), à partir de la colonne `col` (comptée vers +x, la droite du
+/// personnage) et de la rangée `row` (depuis le haut). Les pixels montrés sont étirés à la
+/// taille du pavé (v225) ; ceux d'un même corps ont tous la même taille.
+#[derive(Clone, Copy, Debug)]
+struct Zone {
+    skin: usize,
+    full: [usize; 3],
+    size: [usize; 3],
+    col: usize,
+    row: usize,
+}
+
+impl Zone {
+    const fn whole(skin: usize, full: [usize; 3]) -> Self {
+        Zone {
+            skin,
+            full,
+            size: full,
+            col: 0,
+            row: 0,
+        }
+    }
+
+    /// Pixel (`u`, `v`) de la face `k` du pavé (ordre de `box_faces`) → pixel de la même
+    /// face de la partie entière (ce que `Skin::color` attend).
+    fn pixel(&self, k: usize, u: usize, v: usize) -> (usize, usize) {
+        match k {
+            // Devant : u va vers −x depuis le bord +x.
+            0 => (self.full[0] - self.col - self.size[0] + u, self.row + v),
+            1 => (self.col + u, self.row + v),
+            2 | 3 => (u, self.row + v),
+            _ => (self.col + u, v),
+        }
+    }
+
+    /// Largeur de la face `k` de la partie entière (pixels).
+    fn width(&self, k: usize) -> usize {
+        if k == 2 || k == 3 {
+            self.full[2]
+        } else {
+            self.full[0]
+        }
+    }
+}
+
+/// Zones du skin des sept pavés (ordre de `PARTS`). Jambes : trois colonnes sur quatre, sans
+/// la colonne extérieure (la gauche est du côté −x). Poitrine : les 7 rangées du haut du
+/// corps. Ventre : ses 5 rangées du bas, sans les colonnes du bord ; ses côtés montrent le
+/// bas des côtés du corps. Dessous de la poitrine (les deux rebords qui dépassent du ventre) :
+/// le dessous du corps du skin, entier ; dessous du ventre : ses 6 colonnes du milieu.
+const ZONES: [Zone; 7] = [
+    Zone {
+        skin: 0,
+        full: [4, 12, 4],
+        size: [3, 12, 4],
+        col: 1,
+        row: 0,
+    },
+    Zone {
+        skin: 1,
+        full: [4, 12, 4],
+        size: [3, 12, 4],
+        col: 0,
+        row: 0,
+    },
+    Zone {
+        skin: 2,
+        full: [8, 12, 4],
+        size: [8, 12 - BELLY_ROWS, 4],
+        col: 0,
+        row: 0,
+    },
+    Zone::whole(3, [4, 12, 4]),
+    Zone::whole(4, [4, 12, 4]),
+    Zone::whole(5, [8, 8, 8]),
+    Zone {
+        skin: 2,
+        full: [8, 12, 4],
+        size: [6, BELLY_ROWS, 4],
+        col: 1,
+        row: 12 - BELLY_ROWS,
+    },
 ];
 
 /// Pavés du modèle dans cette pose : repère (pixels → monde), coins (pixels), partie.
 fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
-    let mut out = Vec::with_capacity(6);
+    let mut out = Vec::with_capacity(7);
     // Repère du modèle : x à droite, y en haut, z vers l'arrière (le regard est −z).
     let base = Mat4::from_translation(pose.feet)
         * Mat4::from_rotation_y(-pose.yaw)
@@ -562,7 +686,7 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
     let upper = base
         * Mat4::from_translation(Vec3::new(0.0, LEG - drop, 0.0))
         * Mat4::from_rotation_x(-lean);
-    let (min, max, part) = PARTS[2];
+    let (min, max, part) = PARTS[CHEST];
     out.push((upper, min, max, part));
     // Bras : pivot à l'épaule (`SHOULDER_Y` au-dessus de la hanche), balancement inverse
     // des jambes ; le bras droit (x + `ARM_X`) tient l'objet un peu levé devant lui.
@@ -609,8 +733,16 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         // objet, on dirait que mon joueur tape » : le bras levé (Foudre de Zeus) se balance
         // aussi peu que le bras tendu de la lampe (0,1 ; 0,3 avant).
         let swing_k = if raise != 0.0 { RAISED_SWING } else { 1.0 };
+        // (v256) Le bras qui pend est écarté du corps (`ARM_SPLAY`) : il ne le touche que par
+        // le coin du haut de l'épaule. Pas celui qui tient un objet.
+        let splay = if side > 0.0 && pose.held.is_some() {
+            0.0
+        } else {
+            ARM_SPLAY * sign
+        };
         let xf = upper
             * Mat4::from_translation(Vec3::new(side, SHOULDER_Y, 0.0))
+            * Mat4::from_rotation_z(splay)
             * Mat4::from_rotation_x(swing * sign * swing_k + lean * 0.6 + raise);
         let (min, max, part) = PARTS[out.len()];
         out.push((xf, min, max, part));
@@ -622,6 +754,9 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
         * Mat4::from_rotation_x(pose.pitch.clamp(-1.4, 1.4));
     let (min, max, part) = PARTS[5];
     out.push((head, min, max, part));
+    // (v256) Ventre : sous la poitrine, dans le même repère (il se penche avec elle).
+    let (min, max, part) = PARTS[BELLY];
+    out.push((upper, min, max, part));
     out
 }
 
@@ -1467,8 +1602,9 @@ pub fn build_tiny(pose: &Pose) -> Vec<EntityVertex> {
         * Mat4::from_scale(Vec3::splat(PX));
     // (v225) Aux proportions du modèle : jambes, corps et bras, tête.
     let wide = BODY_W / 2.0 + ARM_W;
+    let legs = LEG_X + LEG_W / 2.0;
     for (min, max, c) in [
-        ([-LEG_W, 0.0, -LEG_W / 2.0], [LEG_W, LEG, LEG_W / 2.0], PANTS),
+        ([-legs, 0.0, -LEG_D / 2.0], [legs, LEG, LEG_D / 2.0], PANTS),
         ([-wide, LEG, -BODY_D / 2.0], [wide, NECK_Y, BODY_D / 2.0], SHIRT),
         (
             [-HEAD_S / 2.0, NECK_Y, -HEAD_S / 2.0],
@@ -1485,11 +1621,10 @@ pub fn build_tiny(pose: &Pose) -> Vec<EntityVertex> {
 /// Triangles du modèle du joueur dans cette pose (avec l'objet tenu).
 pub fn build(pose: &Pose) -> Vec<EntityVertex> {
     let mut out = Vec::with_capacity(12_000);
-    // Ordre de `parts` : jambe gauche, jambe droite, corps, bras gauche, bras droit, tête
-    // (les mêmes numéros que `Skin::color`).
+    // Ordre de `parts` : jambe gauche, jambe droite, poitrine, bras gauche, bras droit,
+    // tête, ventre ; `ZONES` dit ce que chacun montre du skin.
     for (i, (xf, min, max, part)) in parts(pose).into_iter().enumerate() {
-        let tex = pose.skin.as_deref().map(|s| (s, i));
-        emit_box(&mut out, xf, min, max, TEX[i], part, pose.light, tex);
+        emit_box(&mut out, xf, min, max, ZONES[i], part, pose.light, pose.skin.as_deref());
     }
     for (xf, min, max, kind) in held_parts(pose) {
         emit_item(&mut out, xf, min, max, kind, pose.light);
@@ -1522,12 +1657,15 @@ fn atlas(i: usize, k: usize, [w, _, d]: [usize; 3]) -> (usize, usize) {
     }
 }
 
-/// Modèle commun des autres joueurs (216 sommets), à envoyer une fois à la carte.
+/// Modèle commun des autres joueurs (sept pavés : 252 sommets), à envoyer une fois à la
+/// carte.
 pub fn player_mesh() -> Vec<PlayerVertex> {
-    let mut out = Vec::with_capacity(216);
+    let mut out = Vec::with_capacity(252);
     for (i, &(min, max, _)) in PARTS.iter().enumerate() {
-        // (v225) Les pixels de sa zone du skin, étirés à la taille du pavé.
-        let size = TEX[i];
+        // (v225) Les pixels de sa zone du skin, étirés à la taille du pavé. (v256) Un pavé
+        // peut n'en montrer qu'un morceau (`Zone`).
+        let zone = ZONES[i];
+        let size = zone.size;
         let step = (Vec3::from(max) - Vec3::from(min)) / Vec3::from(size.map(|n| n as f32));
         for (k, (_, o, du, dv, nu, nv)) in box_faces(min, max, size).into_iter().enumerate() {
             let (o, du, dv) = (
@@ -1535,7 +1673,9 @@ pub fn player_mesh() -> Vec<PlayerVertex> {
                 Vec3::from(du) * step,
                 Vec3::from(dv) * step,
             );
-            let (fx, fy) = atlas(i, k, size);
+            let (ax, ay) = atlas(zone.skin, k, zone.full);
+            let (ou, ov) = zone.pixel(k, 0, 0);
+            let (fx, fy) = (ax + ou, ay + ov);
             let rect = [
                 fx as f32 / 64.0,
                 fy as f32 / 64.0,
@@ -1573,17 +1713,22 @@ pub fn player_mesh() -> Vec<PlayerVertex> {
 pub fn bake_skin(tex: Option<&crate::skin::Skin>) -> Vec<[f32; 3]> {
     let mut out = vec![[0.0; 3]; 64 * 64];
     for (i, &(min, max, part)) in PARTS.iter().enumerate() {
-        let size = TEX[i];
-        let s = size.map(|n| n as u32);
-        for (k, (face, _, _, _, nu, nv)) in box_faces(min, max, size).into_iter().enumerate() {
-            let (fx, fy) = atlas(i, k, size);
+        let zone = ZONES[i];
+        let s = zone.full.map(|n| n as u32);
+        for (k, (face, _, _, _, nu, nv)) in
+            box_faces(min, max, zone.size).into_iter().enumerate()
+        {
+            let (fx, fy) = atlas(zone.skin, k, zone.full);
             for v in 0..nv {
                 for u in 0..nu {
+                    // (v256) À sa place dans la zone de la partie entière : la poitrine et
+                    // le ventre se partagent celle du corps.
+                    let (su, sv) = zone.pixel(k, u, v);
                     let rgb = tex
-                        .and_then(|t| t.color(i, k, u as u32, v as u32, s))
-                        .unwrap_or_else(|| skin(part, face, u, v, nu));
-                    let g = grain(k * 4096 + v * 64 + u + part as usize * 977);
-                    out[(fy + v) * 64 + fx + u] = srgb(rgb).map(|c| c * g);
+                        .and_then(|t| t.color(zone.skin, k, su as u32, sv as u32, s))
+                        .unwrap_or_else(|| skin(part, face, su, sv, zone.width(k)));
+                    let g = grain(k * 4096 + sv * 64 + su + part as usize * 977);
+                    out[(fy + sv) * 64 + fx + su] = srgb(rgb).map(|c| c * g);
                 }
             }
         }
@@ -1744,7 +1889,7 @@ pub fn held_model(pose: &Pose, detail: bool) -> Vec<EntityVertex> {
 
 /// Pavés du joueur (et de l'objet tenu) pour les reflets du raytracing.
 pub fn ray_boxes(pose: &Pose) -> Vec<RayBox> {
-    // Avec un skin : chaque partie le lit (mêmes numéros que `build`, plus un).
+    // Avec un skin : chaque partie le lit (numéro de `Skin::color`, plus un).
     let skinned = pose.skin.is_some();
     let body = parts(pose)
         .into_iter()
@@ -1756,7 +1901,26 @@ pub fn ray_boxes(pose: &Pose) -> Vec<RayBox> {
                 Part::Arm => RayBoxKind::Arm,
                 Part::Leg => RayBoxKind::Leg,
             };
-            (xf, min, max, kind, if skinned { i as u8 + 1 } else { 0 })
+            // (v256) Le repère du pavé est celui des pixels du skin de sa partie entière (x :
+            // colonnes vers +x, y : rangées depuis le bas, z : de l'avant vers l'arrière) ;
+            // le pavé en est le morceau qu'il montre (`Zone`). Avant, c'étaient les pixels du
+            // modèle, qui ne sont plus ceux du skin depuis la v225.
+            let zone = ZONES[i];
+            let (lo, hi) = (Vec3::from(min), Vec3::from(max));
+            let n = Vec3::from(zone.size.map(|v| v as f32));
+            let full = zone.full.map(|v| v as f32);
+            let at = Vec3::new(zone.col as f32, full[1] - zone.row as f32 - n.y, 0.0);
+            let to_skin = Mat4::from_translation(at)
+                * Mat4::from_scale(n / (hi - lo))
+                * Mat4::from_translation(-lo);
+            RayBox {
+                world_to_local: to_skin * xf.inverse(),
+                min: at.to_array(),
+                max: (at + n).to_array(),
+                kind,
+                part: if skinned { zone.skin as u8 + 1 } else { 0 },
+                full,
+            }
         });
     // (v177) Équipement du mode FPS : sa boîte, sombre.
     let gear = gear_frame(pose).map(|(xf, g)| {
@@ -1771,16 +1935,73 @@ pub fn ray_boxes(pose: &Pose) -> Vec<RayBox> {
         held_parts(pose)
             .into_iter()
             .chain(gear)
-            .map(|(xf, min, max, kind)| (xf, min, max, kind, 0)),
+            .map(|(xf, min, max, kind)| RayBox {
+                world_to_local: xf.inverse(),
+                min,
+                max,
+                kind,
+                part: 0,
+                full: [0.0; 3],
+            }),
     )
-    .map(|(xf, min, max, kind, part)| RayBox {
-        world_to_local: xf.inverse(),
-        min,
-        max,
-        kind,
-        part,
-    })
     .collect()
+}
+
+/// (v256) Milieu de la poitrine du modèle (monde), que visent les bots : sur l'axe du corps,
+/// aux six dixièmes de sa hauteur (dans la poitrine, sous les bras tendus), penché avec lui
+/// accroupi. Avant, un point à la verticale des pieds : accroupi, il tombait derrière le dos.
+pub fn chest_point(feet: Vec3, yaw: f32, crouch: f32) -> Vec3 {
+    let (lean, drop) = crouch_lean(crouch);
+    let upper = Mat4::from_translation(feet)
+        * Mat4::from_rotation_y(-yaw)
+        * Mat4::from_scale(Vec3::splat(PX))
+        * Mat4::from_translation(Vec3::new(0.0, LEG - drop, 0.0))
+        * Mat4::from_rotation_x(-lean);
+    upper.transform_point3(Vec3::new(0.0, BODY_H * 0.6, 0.0))
+}
+
+/// (v256) Partie du corps touchée par une balle en partie FPS (`hit_boxes`) : les dégâts en
+/// dépendent (`netgame::damage_at`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitZone {
+    Head,
+    Chest,
+    Arm,
+    Belly,
+    Leg,
+}
+
+/// (v256) Boîtes des coups d'un joueur en partie FPS : les sept pavés du modèle, tournés avec
+/// lui (« les hitbox devront être celles de celui-ci aussi »). Pour chacun : le passage du
+/// monde à son repère, ses coins dans ce repère, sa zone. La pose est celle que tous les
+/// postes connaissent au même pas (pieds, cap, regard, accroupi) : la tête suit le regard, le
+/// corps se penche accroupi, les jambes sont droites (leur balancement n'est qu'un dessin,
+/// propre à chaque écran) et les bras sont tendus vers le regard, comme ceux d'un joueur qui
+/// tient une arme à feu.
+pub fn hit_boxes(feet: Vec3, yaw: f32, pitch: f32, crouch: f32) -> [(Mat4, Vec3, Vec3, HitZone); 7] {
+    let pose = Pose {
+        feet,
+        yaw,
+        pitch,
+        walk: 0.0,
+        swing: 0.0,
+        crouch,
+        light: [1.0; 3],
+        held: Some(Held::Gear(0)),
+        skin: None,
+    };
+    let p = parts(&pose);
+    std::array::from_fn(|i| {
+        let (xf, min, max, part) = p[i];
+        let zone = match part {
+            Part::Head => HitZone::Head,
+            Part::Arm => HitZone::Arm,
+            Part::Leg => HitZone::Leg,
+            Part::Body if i == BELLY => HitZone::Belly,
+            Part::Body => HitZone::Chest,
+        };
+        (xf.inverse(), Vec3::from(min), Vec3::from(max), zone)
+    })
 }
 
 #[cfg(test)]
@@ -1809,7 +2030,7 @@ mod tests {
             return base * t(LEG_X, LEG - drop, 0.0) * Mat4::from_rotation_x(-swing) * shrink;
         }
         let upper = base * t(0.0, LEG - drop, 0.0) * Mat4::from_rotation_x(-lean);
-        if part == 2 {
+        if part == 2 || part == 6 {
             return upper;
         }
         if ((part == 3 || part == 4) && p.skin & 0x20000 != 0)
@@ -1833,7 +2054,10 @@ mod tests {
                 );
         }
         if part == 3 {
-            return upper * t(-ARM_X, SHOULDER_Y, 0.0) * Mat4::from_rotation_x(-swing + lean * 0.6);
+            return upper
+                * t(-ARM_X, SHOULDER_Y, 0.0)
+                * Mat4::from_rotation_z(-ARM_SPLAY)
+                * Mat4::from_rotation_x(-swing + lean * 0.6);
         }
         if part == 4 {
             let (mut raise, mut k) = (0.0, 1.0);
@@ -1846,8 +2070,10 @@ mod tests {
                     k = RAISED_SWING;
                 }
             }
+            let splay = if p.skin & 0x10000 != 0 { 0.0 } else { ARM_SPLAY };
             return upper
                 * t(ARM_X, SHOULDER_Y, 0.0)
+                * Mat4::from_rotation_z(splay)
                 * Mat4::from_rotation_x(swing * k + lean * 0.6 + raise);
         }
         let n = Vec3::new(0.0, LEG - drop + BODY_H * lean.cos(), -BODY_H * lean.sin());
@@ -2126,6 +2352,7 @@ mod tests {
             ("LEG_X", LEG_X),
             ("SHOULDER_Y", SHOULDER_Y),
             ("ARM_X", ARM_X),
+            ("ARM_SPLAY", ARM_SPLAY),
             ("BODY_H", BODY_H),
             ("ZEUS_RAISE", ZEUS_RAISE),
             ("ITEM_AIM_DROP", ITEM_AIM_DROP),
@@ -2148,10 +2375,146 @@ mod tests {
         // (Hauteur, tête, poing : vérifiés à la compilation, sous `ARM_RATIO`.)
     }
 
+    /// (v256) Le modèle en sept pavés du schéma « CS2 » : poitrine large, ventre plus étroit,
+    /// jambes écartées, bras tenus par le seul coin du haut de l'épaule. Moins d'un bloc de
+    /// large (« confirme-moi que notre nouveau modèle ne fait pas plus d'un bloc de large »).
+    #[test]
+    fn the_model_has_a_chest_a_belly_and_parted_legs() {
+        let pose = |held: Option<Held>| Pose {
+            feet: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held,
+            skin: None,
+        };
+        let p = parts(&pose(None));
+        assert_eq!(p.len(), 7);
+        // Coins de chaque pavé dans le monde (blocs), debout de face.
+        let world: Vec<(Vec3, Vec3)> = p
+            .iter()
+            .map(|&(xf, mn, mx, _)| {
+                let (mut lo, mut hi) = (Vec3::splat(1e9), Vec3::splat(-1e9));
+                for k in 0..8 {
+                    let c = Vec3::new(
+                        if k & 1 == 0 { mn[0] } else { mx[0] },
+                        if k & 2 == 0 { mn[1] } else { mx[1] },
+                        if k & 4 == 0 { mn[2] } else { mx[2] },
+                    );
+                    let w = xf.transform_point3(c);
+                    (lo, hi) = (lo.min(w), hi.max(w));
+                }
+                (lo, hi)
+            })
+            .collect();
+        let width = |i: usize| world[i].1.x - world[i].0.x;
+        let (chest, belly) = (world[CHEST], world[BELLY]);
+        // Le ventre sous la poitrine, sans trou ni recouvrement, plus étroit qu'elle d'une
+        // colonne du skin de chaque côté ; les jambes dessous, de trois colonnes chacune.
+        assert!((belly.1.y - chest.0.y).abs() < 1e-5);
+        assert!((belly.0.y - HIP_BLOCKS).abs() < 1e-5 && (chest.1.y - NECK_BLOCKS).abs() < 1e-5);
+        let col = COL * PX;
+        assert!((width(CHEST) - 8.0 * col).abs() < 1e-5, "{}", width(CHEST));
+        assert!((width(BELLY) - 6.0 * col).abs() < 1e-5, "{}", width(BELLY));
+        assert!((width(0) - 3.0 * col).abs() < 1e-5 && (width(1) - 3.0 * col).abs() < 1e-5);
+        // Jambes écartées : la gauche du côté −x, 0,8 pixel entre elles.
+        assert!((world[1].0.x - world[0].1.x - LEG_GAP * PX).abs() < 1e-5);
+        assert!((world[0].1.x + world[1].0.x).abs() < 1e-5, "de part et d'autre du milieu");
+        // Un pixel du skin a la même taille sur la poitrine, le ventre et les jambes, et
+        // aucun n'est à cheval sur deux pavés : chaque pavé fait un nombre entier de pixels.
+        for i in [0, 1, CHEST, BELLY] {
+            let (_, mn, mx, _) = p[i];
+            let z = ZONES[i];
+            assert!(((mx[0] - mn[0]) / z.size[0] as f32 - COL).abs() < 1e-5, "{i}");
+            assert!(((mx[2] - mn[2]) / z.size[2] as f32 - COL).abs() < 1e-5, "{i}");
+        }
+        assert!(((BODY_H - BELLY_H) / ZONES[CHEST].size[1] as f32 - ROW).abs() < 1e-5);
+        assert!((BELLY_H / ZONES[BELLY].size[1] as f32 - ROW).abs() < 1e-5);
+        assert_eq!(ZONES[CHEST].size[1] + ZONES[BELLY].size[1], 12);
+        assert_eq!(ZONES[BELLY].row, ZONES[CHEST].size[1]);
+        // Bras qui pendent : le coin du haut, côté corps, sur le coin du haut de la
+        // poitrine ; le reste du bras s'en écarte (la main à plus d'un pixel du ventre).
+        for (i, sign) in [(3usize, -1.0f32), (4, 1.0)] {
+            let (xf, mn, mx, _) = p[i];
+            let inner = if sign > 0.0 { mn[0] } else { mx[0] };
+            let top = xf.transform_point3(Vec3::new(inner, mx[1], 0.0));
+            let want = Vec3::new(sign * BODY_W / 2.0, NECK_Y, 0.0) * PX;
+            assert!(top.distance(want) < 1e-4, "{i} : {top} au lieu de {want}");
+            let hand = xf.transform_point3(Vec3::new(inner, mn[1], 0.0));
+            assert!(hand.x * sign > (BODY_W / 2.0 + 1.0) * PX, "{i} : {hand}");
+        }
+        // D'une main à l'autre : moins d'un bloc (0,83).
+        let (lo, hi) = world
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), w| (lo.min(w.0.x), hi.max(w.1.x)));
+        assert!(hi - lo < 0.85 && hi - lo > 0.8, "{}", hi - lo);
+        assert!((SPLAY_SIN - ARM_SPLAY.sin()).abs() < 1e-6);
+        assert!((SPLAY_COS - ARM_SPLAY.cos()).abs() < 1e-6);
+        assert!((ARM_SPLAY.to_degrees() - 6.0).abs() < 1e-4);
+        // Un objet en main : ce bras-là n'est plus écarté (il est tendu devant).
+        let (xf, _, _, _) = parts(&pose(Some(Held::Wand([255, 0, 0]))))[4];
+        assert!(xf.transform_vector3(Vec3::X).y.abs() < 1e-6);
+    }
+
+    /// (v256) Ce que chaque pavé montre du skin : la poitrine les 7 rangées du haut du
+    /// corps, le ventre ses 5 rangées du bas sans les colonnes du bord, une jambe trois
+    /// colonnes sur quatre (pas la colonne extérieure) ; les pixels restent alignés du haut
+    /// en bas. Le dessous de la poitrine est le dessous du corps du skin, entier.
+    #[test]
+    fn each_box_shows_its_own_piece_of_the_skin() {
+        let (chest, belly) = (ZONES[CHEST], ZONES[BELLY]);
+        // Devant : (colonne, rangée) du skin du premier et du dernier pixel montrés.
+        assert_eq!((chest.pixel(0, 0, 0), chest.pixel(0, 7, 6)), ((0, 0), (7, 6)));
+        assert_eq!((belly.pixel(0, 0, 0), belly.pixel(0, 5, 4)), ((1, 7), (6, 11)));
+        assert_eq!((belly.pixel(1, 0, 0), belly.pixel(1, 5, 4)), ((1, 7), (6, 11)));
+        // Côtés du ventre : toute la profondeur, les rangées du bas.
+        assert_eq!((belly.pixel(2, 0, 0), belly.pixel(3, 3, 4)), ((0, 7), (3, 11)));
+        // Dessous : celui de la poitrine entier (8 × 4), celui du ventre sans les bords.
+        assert_eq!((chest.pixel(5, 0, 0), chest.pixel(5, 7, 3)), ((0, 0), (7, 3)));
+        assert_eq!((belly.pixel(5, 0, 0), belly.pixel(5, 5, 3)), ((1, 0), (6, 3)));
+        // Jambes, de face : le pixel u = 0 est du côté +x. La jambe droite (+x) cache sa
+        // colonne 0 (extérieure), la gauche sa colonne 3 ; elles gardent celles du milieu,
+        // sous les colonnes 1 à 6 du ventre.
+        let (left, right) = (ZONES[0], ZONES[1]);
+        assert_eq!((right.pixel(0, 0, 0).0, right.pixel(0, 2, 0).0), (1, 3));
+        assert_eq!((left.pixel(0, 0, 0).0, left.pixel(0, 2, 0).0), (0, 2));
+        // De dos (u = 0 du côté −x) : la colonne extérieure aussi.
+        assert_eq!((right.pixel(1, 0, 0).0, right.pixel(1, 2, 0).0), (0, 2));
+        assert_eq!((left.pixel(1, 0, 0).0, left.pixel(1, 2, 0).0), (1, 3));
+        // Dans l'image cuite : chaque pixel du modèle commun lit un pixel de sa partie, et
+        // ceux de la poitrine et du ventre ne se marchent pas dessus (mêmes couleurs là où
+        // ils se recouvrent : dessus et dessous).
+        let skin = test_skin();
+        let baked = bake_skin(Some(&skin));
+        for (i, &(min, max, part)) in PARTS.iter().enumerate() {
+            let z = ZONES[i];
+            for (k, (face, _, _, _, nu, nv)) in box_faces(min, max, z.size).into_iter().enumerate()
+            {
+                let (ax, ay) = atlas(z.skin, k, z.full);
+                for v in 0..nv {
+                    for u in 0..nu {
+                        let (su, sv) = z.pixel(k, u, v);
+                        assert!(su < z.width(k) && sv < 12, "{i} {k} {u} {v}");
+                        let s = z.full.map(|n| n as u32);
+                        let rgb = skin
+                            .color(z.skin, k, su as u32, sv as u32, s)
+                            .unwrap_or_else(|| super::skin(part, face, su, sv, z.width(k)));
+                        let g = grain(k * 4096 + sv * 64 + su + part as usize * 977);
+                        let want = srgb(rgb).map(|c| c * g);
+                        assert_eq!(baked[(ay + sv) * 64 + ax + su], want, "{i} {k} {u} {v}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_shared_model_draws_what_build_draws() {
         let mesh = player_mesh();
-        assert_eq!(mesh.len(), 216);
+        assert_eq!(mesh.len(), 252);
         for pose in test_poses() {
             let baked = bake_skin(pose.skin.as_deref());
             let inst = instance(&pose, 7, &Prev::still(&pose));
@@ -2415,8 +2778,8 @@ mod tests {
                 skin: None,
             };
             let boxes = shadow_boxes(&pose);
-            // Immobile : les deux jambes ne font qu'une boîte.
-            assert_eq!(boxes.len(), 5);
+            // Immobile : les deux jambes ne font qu'une boîte (v256 : six avec le ventre).
+            assert_eq!(boxes.len(), 6);
             // Repère du modèle (pixels) → monde ; l'avant est −z.
             let base = Mat4::from_translation(pose.feet)
                 * Mat4::from_rotation_y(-yaw)
@@ -2490,7 +2853,8 @@ mod tests {
             lamp,
             false
         ));
-        // En marchant, les jambes ne sont plus parallèles : une boîte chacune.
+        // En marchant, les jambes ne sont plus parallèles : une boîte chacune (v256 : sept
+        // avec le ventre).
         let walking = Pose {
             feet: Vec3::ZERO,
             yaw: 0.3,
@@ -2502,7 +2866,7 @@ mod tests {
             held: None,
             skin: None,
         };
-        assert_eq!(shadow_boxes(&walking).len(), 6);
+        assert_eq!(shadow_boxes(&walking).len(), 7);
     }
 }
 

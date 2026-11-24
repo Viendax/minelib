@@ -352,6 +352,23 @@ impl Skins {
         )
     }
 
+    /// (v256) Skin que porte un joueur d'une partie FPS : « en FPS, mets les skins CT et T des
+    /// bots aux joueurs ». Tout le monde, bots et joueurs, porte la tenue de son équipe
+    /// (`bot_skin` : tirée de son pseudo, toujours la même, la même sur tous les écrans) ; son
+    /// skin personnel reste celui de son visage au tableau des scores (`in_match`) et hors
+    /// partie. Sans équipe (spectateur) : comme `in_match`.
+    pub fn worn(&self, pseudo: &str, team: u8) -> Option<Arc<Skin>> {
+        if team != minelib_net::game::CT && team != minelib_net::game::T {
+            return self.in_match(pseudo, team);
+        }
+        let mut bots = self.bots.borrow_mut();
+        Some(
+            bots.entry((pseudo.to_string(), team))
+                .or_insert_with(|| crate::bot_skin::bot_skin(pseudo, team))
+                .clone(),
+        )
+    }
+
     /// Redemande ce skin au relais (il a pu changer), en gardant celui connu d'ici là.
     pub fn refresh(&self, pseudo: &str) {
         if pseudo.is_empty() || pseudo.contains(' ') {

@@ -12,8 +12,8 @@
 
 struct PlayerIn {
     // Sommet du modèle : position (pixels, repère de sa partie), coordonnées dans l'image
-    // du skin, partie (0 jambe gauche, 1 jambe droite, 2 corps, 3 bras gauche, 4 bras
-    // droit, 5 tête) et normale de sa face (repère de la partie).
+    // du skin, partie (0 jambe gauche, 1 jambe droite, 2 poitrine, 3 bras gauche, 4 bras
+    // droit, 5 tête, 6 ventre) et normale de sa face (repère de la partie).
     @location(0) pos: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) part: u32,
@@ -89,6 +89,17 @@ fn m_rot_x(a: f32) -> mat4x4<f32> {
     );
 }
 
+fn m_rot_z(a: f32) -> mat4x4<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    return mat4x4<f32>(
+        vec4<f32>(c, s, 0.0, 0.0),
+        vec4<f32>(-s, c, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, 1.0, 0.0),
+        vec4<f32>(0.0, 0.0, 0.0, 1.0),
+    );
+}
+
 fn m_rot_y(a: f32) -> mat4x4<f32> {
     let c = cos(a);
     let s = sin(a);
@@ -106,9 +117,13 @@ fn m_rot_y(a: f32) -> mat4x4<f32> {
 // garder 32 pixels de haut : les valeurs de la v225 fois 27,1625 / 27,5
 // (`player_model::BODY_K`).
 const LEG: f32 = 14.815909;
-const LEG_X: f32 = 1.728523;
-const SHOULDER_Y: f32 = 10.618068;
-const ARM_X: f32 = 4.815170;
+// (v256) Jambes écartées (trois colonnes du skin de large, 0,8 pixel entre elles).
+const LEG_X: f32 = 1.696392;
+// (v256) Épaule placée pour que le bras écarté de `ARM_SPLAY` (6°) ne touche la poitrine
+// que par le coin du haut.
+const SHOULDER_Y: f32 = 10.769500;
+const ARM_X: f32 = 4.988410;
+const ARM_SPLAY: f32 = 0.104720;
 const BODY_H: f32 = 12.346591;
 // (v225) Foudre de Zeus : le bras droit levé (radians), `player_model::ZEUS_RAISE`.
 const ZEUS_RAISE: f32 = 1.15;
@@ -138,7 +153,8 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
         return base * m_trans(vec3<f32>(LEG_X, LEG - drop, 0.0)) * m_rot_x(-swing) * shrink;
     }
     let upper = base * m_trans(vec3<f32>(0.0, LEG - drop, 0.0)) * m_rot_x(-lean);
-    if part == 2u {
+    // (v256) Poitrine (2) et ventre (6) : le même repère, le ventre sous la poitrine.
+    if part == 2u || part == 6u {
         return upper;
     }
     // (v177) Arme à feu (bit 17) : les deux bras tendus vers le regard, un peu tournés
@@ -162,8 +178,11 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
         return upper * m_trans(vec3<f32>(side, SHOULDER_Y, 0.0)) * m_rot_y(turn)
             * m_rot_x(1.5707964 + max(pitch - down, -1.4) + lean + swing * sign * 0.1);
     }
+    // (v256) Le bras qui pend est écarté du corps (`ARM_SPLAY`) ; pas celui qui tient un
+    // objet (bit 16).
     if part == 3u {
-        return upper * m_trans(vec3<f32>(-ARM_X, SHOULDER_Y, 0.0)) * m_rot_x(-swing + lean * 0.6);
+        return upper * m_trans(vec3<f32>(-ARM_X, SHOULDER_Y, 0.0)) * m_rot_z(-ARM_SPLAY)
+            * m_rot_x(-swing + lean * 0.6);
     }
     if part == 4u {
         var raise = 0.0;
@@ -180,7 +199,12 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
                 k = 0.1;
             }
         }
-        return upper * m_trans(vec3<f32>(ARM_X, SHOULDER_Y, 0.0)) * m_rot_x(swing * k + lean * 0.6 + raise);
+        var splay = ARM_SPLAY;
+        if (v.skin & 0x10000u) != 0u {
+            splay = 0.0;
+        }
+        return upper * m_trans(vec3<f32>(ARM_X, SHOULDER_Y, 0.0)) * m_rot_z(splay)
+            * m_rot_x(swing * k + lean * 0.6 + raise);
     }
     // (v234) Tête posée au milieu du haut du corps (le cou), même penché : elle avance avec
     // lui (`player_model::neck`).

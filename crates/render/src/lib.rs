@@ -499,8 +499,9 @@ fn shadow_globals(
     }
 }
 
-/// Nombre maximal de pavés du joueur vus dans les reflets.
-pub const MAX_RAY_BOXES: usize = 8;
+/// Nombre maximal de pavés du joueur vus dans les reflets. (v256) Dix : le modèle a sept
+/// pavés (huit avant, pour six), il en reste autant qu'avant pour l'objet tenu.
+pub const MAX_RAY_BOXES: usize = 10;
 
 /// Sorte de pavé du joueur dans les reflets (couleurs calculées par le shader).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -537,6 +538,12 @@ pub struct RayBox {
     /// Partie du corps dans le skin (`Renderer::set_skin`) : 1 jambe gauche, 2 jambe
     /// droite, 3 corps, 4 bras gauche, 5 bras droit, 6 tête ; 0 : dessin par défaut.
     pub part: u8,
+    /// (v256) Pavés du corps : taille (largeur, hauteur, profondeur en pixels du skin) de
+    /// la partie entière. Le repère du pavé (`world_to_local`) est celui de ces pixels (x :
+    /// colonnes, y : rangées depuis le bas, z : de l'avant vers l'arrière) et le pavé
+    /// (`min`, `max`) le morceau qu'il en montre : la poitrine et le ventre se partagent le
+    /// corps du skin, une jambe n'en montre que trois colonnes sur quatre.
+    pub full: [f32; 3],
 }
 
 /// Uniformes des pavés du joueur : (nombre et lumière, matrices, coins min, coins max).
@@ -557,10 +564,16 @@ fn ray_globals(boxes: &[RayBox], light: [f32; 3]) -> RayGlobals {
     for (i, b) in boxes.iter().take(n).enumerate() {
         inv[i] = b.world_to_local.to_cols_array_2d();
         let (kind, extra) = match b.kind {
-            RayBoxKind::Head => (0.0, b.part as f32),
-            RayBoxKind::Body => (1.0, b.part as f32),
-            RayBoxKind::Arm => (2.0, b.part as f32),
-            RayBoxKind::Leg => (3.0, b.part as f32),
+            RayBoxKind::Head | RayBoxKind::Body | RayBoxKind::Arm | RayBoxKind::Leg => {
+                uv[i] = [b.full[0], b.full[1], b.full[2], 0.0];
+                let kind = match b.kind {
+                    RayBoxKind::Head => 0.0,
+                    RayBoxKind::Body => 1.0,
+                    RayBoxKind::Arm => 2.0,
+                    _ => 3.0,
+                };
+                (kind, b.part as f32)
+            }
             RayBoxKind::Block {
                 layer,
                 uv: rect,

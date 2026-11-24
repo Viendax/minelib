@@ -356,6 +356,11 @@ pub struct Session {
     heads: Option<crate::heads::Heads>,
     /// Dernière fois que les skins des têtes de joueurs ont été redemandés au relais.
     head_skins_at: Option<std::time::Instant>,
+    /// (v256) Tenue d'équipe du joueur local en partie FPS (équipe, quand elle a été
+    /// cherchée, skin), relue de temps en temps (`worn_skin`).
+    #[allow(clippy::type_complexity)]
+    team_skin:
+        std::cell::RefCell<Option<(u8, std::time::Instant, std::sync::Arc<crate::skin::Skin>)>>,
     /// Points de mesure de la lumière de chaque chunk : combien sont aux têtes d'entités
     /// (les suivants sont aux cadres).
     probe_split: HashMap<ChunkPos, usize>,
@@ -773,6 +778,7 @@ impl Session {
             lava_burn: 0.0,
             heads: None,
             head_skins_at: None,
+            team_skin: Default::default(),
             probe_split: HashMap::new(),
             fps_elements: None,
             frames: None,
@@ -10034,6 +10040,37 @@ impl Session {
         });
     }
 
+    /// (v256) Skin que porte le joueur local : le sien ; en partie FPS, la tenue de son
+    /// équipe, la même que celle que les autres lui voient (`Skins::worn`).
+    fn worn_skin(&self) -> Option<std::sync::Arc<crate::skin::Skin>> {
+        let team = match (&self.net, self.fps.online) {
+            (Some(_), Some(o)) if self.game.mode == GameMode::Fps => o.team,
+            _ => return self.skins.mine(),
+        };
+        if team != minelib_net::game::CT && team != minelib_net::game::T {
+            return self.skins.mine();
+        }
+        // Son pseudo dans la partie (anonyme pendant l'échauffement, puis le sien) : relu
+        // toutes les deux secondes, pas à chaque image.
+        let mut kept = self.team_skin.borrow_mut();
+        if kept
+            .as_ref()
+            .is_none_or(|(t, at, _)| *t != team || at.elapsed().as_secs_f32() > 2.0)
+        {
+            let n = self.net.as_ref()?;
+            let me = n.me();
+            let pseudo = n
+                .rows()
+                .into_iter()
+                .find(|r| r.id == me)
+                .map(|r| r.pseudo)
+                .unwrap_or_default();
+            let skin = self.skins.worn(&pseudo, team)?;
+            *kept = Some((team, std::time::Instant::now(), skin));
+        }
+        kept.as_ref().map(|(_, _, s)| s.clone())
+    }
+
     pub fn render(
         &self,
         renderer: &mut Renderer,
@@ -10099,7 +10136,7 @@ impl Session {
             crouch: self.player.crouch,
             light: self.hand_light,
             held,
-            skin: self.skins.mine(),
+            skin: self.worn_skin(),
         };
         let visible = self.game.mode != GameMode::Spectator;
         let mut model = if third != 0 && visible {
@@ -10193,8 +10230,9 @@ impl Session {
                     crouch: v.crouch,
                     light: sky_light(&self.world, eye_of(v.pos, v.crouch), self.daylight_shown),
                     held,
-                    // (v177) Les bots aussi ont un skin, dessiné pour eux.
-                    skin: self.skins.in_match(&v.pseudo, v.team),
+                    // (v177) Les bots aussi ont un skin, dessiné pour eux. (v256) Les
+                    // joueurs portent la même tenue d'équipe qu'eux.
+                    skin: self.skins.worn(&v.pseudo, v.team),
                 };
                 let layer = layers.layer(other.skin.as_ref(), renderer);
                 let prev = Walk::prev_of(&self.walks, &v.pseudo, &other);
@@ -10495,8 +10533,9 @@ impl Session {
             }
         }
         // Le joueur se voit dans les miroirs (et l'eau, le métal), même à la 1re personne.
-        // Avec son vrai skin (envoyé à la carte quand il change).
-        let skin = self.skins.mine();
+        // Avec son vrai skin (envoyé à la carte quand il change). (v256) En partie FPS : la
+        // tenue de son équipe.
+        let skin = self.worn_skin();
         let key = skin
             .as_ref()
             .map_or(0, |s| std::sync::Arc::as_ptr(s) as usize);

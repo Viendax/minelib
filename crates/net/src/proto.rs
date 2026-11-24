@@ -35,7 +35,10 @@ use serde::{Deserialize, Serialize};
 /// les coups doivent être les mêmes chez l'hôte et ses invités.
 /// (v249) 66 : les tirs d'une partie FPS disent la direction de chaque balle
 /// (`game::ToPeer::Shot::dirs`) : chacun voit les impacts des autres sur les blocs.
-pub const PROTOCOL: u32 = 66;
+/// (v256) 67 : en partie FPS, les balles touchent les sept pavés du modèle du joueur, tournés
+/// avec lui (plus une boîte droite) : l'hôte et le vérificateur doivent compter les mêmes
+/// touches.
+pub const PROTOCOL: u32 = 67;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.

@@ -149,7 +149,7 @@ const PLAYER_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
 pub const MAX_PLAYERS: usize = 8192;
 pub const PLAYER_SKINS: u32 = 64;
 
-/// Sommets au plus du modèle commun (six pavés : 216).
+/// Sommets au plus du modèle commun (sept pavés : 252).
 const MESH_MAX: usize = 512;
 /// (v220) Cases au plus de l'atlas des joueurs à une image, et place des uniformes de
 /// chacune (alignement des décalages dynamiques).

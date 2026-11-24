@@ -728,10 +728,10 @@ impl Body {
         self.feet + fwd * ahead + Vec3::Y * (bottom + crate::player_model::HEAD_BLOCKS / 2.0)
     }
 
-    /// (v225) Milieu du corps du modèle.
+    /// (v225) Milieu du corps du modèle. (v256) Dans sa poitrine, penchée accroupi : les
+    /// balles touchent les pavés du modèle (`netgame::ray_model`).
     fn chest(&self) -> Vec3 {
-        let h = (crate::player_model::HIP_BLOCKS + crate::player_model::NECK_BLOCKS) / 2.0;
-        self.feet + Vec3::Y * (h - 0.15 * self.crouch)
+        crate::player_model::chest_point(self.feet, self.yaw, self.crouch)
     }
 
     fn speed(&self) -> f32 {
