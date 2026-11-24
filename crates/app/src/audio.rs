@@ -730,8 +730,11 @@ fn fresh_seed() -> u32 {
 /// court de la Foudre de Zeus sans charge ne tonne plus, il grésille et claque (décharge
 /// électrique, `synth::zap`), tiré à chaque fois. (v247) « Réduis de 25 % le son de
 /// l'éclair quand c'est le petit éclair de 8 blocs » : 75 % du tonnerre qu'il faisait.
+/// (v266) « Change le son de l'éclair à 8 blocs, mais un son d'éclair, pas celui qu'on a
+/// déjà : un petit coup sec » : le claquement bref d'un éclair tout proche (`synth::crack`),
+/// au même volume.
 pub fn zap() {
-    let (pcm, rate) = synth::zap(fresh_seed());
+    let (pcm, rate) = synth::crack(fresh_seed());
     play_pcm(pcm, rate, ZAP_VOLUME, 2f32.powf(1.5 * jitter() / 12.0));
 }
 
@@ -1407,37 +1410,46 @@ pub mod synth {
         (s.iter().map(|v| (v * k) as i16).collect(), RATE)
     }
 
-    /// (v247) Arc court de la Foudre de Zeus : une décharge électrique. Un claquement sec,
-    /// puis un bourdonnement en dents de scie (95 à 160 Hz) haché d'étincelles, sur un
-    /// grésillement aigu ; tirés de `seed` : hauteur, durée (0,25 à 0,4 s), densité des
-    /// étincelles. Jamais deux fois le même.
-    pub fn zap(seed: u32) -> (Vec<i16>, u32) {
+    /// (v266) Arc court de la Foudre de Zeus (8 blocs) : « un son d'éclair, mais pas celui
+    /// qu'on a déjà : un petit coup sec ». Le claquement d'un éclair tout proche, sans son
+    /// roulement : un coup de fouet (bruit large, très bref), deux ou trois éclats plus
+    /// petits dans les 50 ms qui suivent (l'air qui se déchire), un coup sourd qui lui donne
+    /// du corps et une courte queue de souffle. Un cinquième de seconde ; tirés de `seed` :
+    /// hauteur, place et force des éclats. Jamais deux fois le même. (v247 : une décharge
+    /// qui bourdonnait et grésillait un tiers de seconde.)
+    pub fn crack(seed: u32) -> (Vec<i16>, u32) {
         let mut rng = Noise(seed.wrapping_mul(2_246_822_519) | 1);
-        let base = 95.0 + 65.0 * rng.unit();
-        let secs = 0.25 + 0.15 * rng.unit();
-        let sparks = 60.0 + 80.0 * rng.unit();
+        let secs = 0.17 + 0.05 * rng.unit();
+        let tone = 2400.0 + 1600.0 * rng.unit();
+        let thump = 85.0 + 30.0 * rng.unit();
+        // Éclats secondaires : (instant, force).
+        let mut bursts = [(0.0f32, 0.0f32); 3];
+        let count = 2 + (rng.unit() * 1.99) as usize;
+        for b in bursts.iter_mut().take(count) {
+            *b = (0.008 + 0.047 * rng.unit(), 0.35 + 0.4 * rng.unit());
+        }
         let n = (secs * RATE as f32) as usize;
+        let (mut bright, mut air) = ((0.0f32, 0.0f32), (0.0f32, 0.0f32));
         let mut phase = 0.0f32;
-        let mut hiss = (0.0f32, 0.0f32);
-        let mut spark = 0.0f32;
         let s = (0..n)
             .map(|i| {
                 let t = i as f32 / RATE as f32;
-                // Claquement : 4 ms de bruit plein.
-                let snap = if t < 0.004 { rng.next() * (1.0 - t / 0.004) * 1.6 } else { 0.0 };
-                // Bourdonnement : dents de scie qui glissent un peu vers le grave.
-                let f = base * (1.0 - 0.18 * t / secs);
-                phase = (phase + f / RATE as f32).fract();
-                let saw = 2.0 * phase - 1.0;
-                // Étincelles : des à-coups au hasard qui hachent le bourdonnement.
-                if rng.unit() < sparks / RATE as f32 {
-                    spark = 1.0;
+                let noise = rng.next();
+                // Le coup : plein bruit pendant 1,5 ms, puis il s'éteint en une dizaine de ms.
+                let hit = (t / 0.0004).min(1.0) * (-t / 0.009).exp();
+                let mut env = 1.7 * hit;
+                for &(at, force) in &bursts {
+                    if t >= at {
+                        env += force * (-(t - at) / 0.004).exp();
+                    }
                 }
-                spark *= 0.9985;
-                let env = (t / 0.003).min(1.0) * (-t / (secs * 0.35)).exp();
-                let buzz = saw * (0.35 + 0.65 * spark) * env;
-                let h = svf(&mut hiss, rng.next(), 5200.0 + 1800.0 * spark, 0.9);
-                snap + 0.8 * buzz + 0.9 * h * env * (0.4 + spark)
+                let snap = noise * env * 0.55 + svf(&mut bright, noise, tone, 0.7) * env;
+                // Le corps : un coup sourd qui glisse vers le grave.
+                phase = (phase + thump * (1.0 - 0.35 * (t / secs)) / RATE as f32).fract();
+                let body = (std::f32::consts::TAU * phase).sin() * (-t / 0.028).exp() * 0.75;
+                // La queue : un souffle grave, très court.
+                let tail = svf(&mut air, noise, 520.0, 1.2) * (-t / 0.05).exp() * 0.45;
+                snap + body + tail
             })
             .collect();
         finish_short(s)
@@ -1689,6 +1701,26 @@ pub mod synth {
 
         fn rms(s: &[i16]) -> f32 {
             (s.iter().map(|v| (*v as f32).powi(2)).sum::<f32>() / s.len().max(1) as f32).sqrt()
+        }
+
+        /// (v266) Le petit éclair de 8 blocs : « un petit coup sec ». Un cinquième de seconde
+        /// au plus, le plus fort tout au début, presque toute sa force dans les 60 premières
+        /// millisecondes (pas de roulement, pas de bourdonnement), jamais deux fois le même.
+        #[test]
+        fn the_short_arc_is_a_brief_dry_crack() {
+            let (a, rate) = crack(1);
+            let (b, _) = crack(2);
+            assert_eq!(rate, RATE);
+            let secs = a.len() as f32 / rate as f32;
+            assert!((0.16..=0.23).contains(&secs), "{secs}");
+            let peak = a.iter().map(|v| v.unsigned_abs()).max().unwrap();
+            let at = a.iter().position(|v| v.unsigned_abs() == peak).unwrap();
+            assert!(peak > 28_000 && at < rate as usize / 100, "crête à {at}");
+            let energy = |s: &[i16]| s.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+            let early = energy(&a[..rate as usize * 60 / 1000]) / energy(&a);
+            assert!(early > 0.9, "{early}");
+            assert_ne!(a, b);
+            assert!(a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x != y));
         }
 
         /// Part des aigus : niveau de ce qui change d'un échantillon au suivant, rapporté

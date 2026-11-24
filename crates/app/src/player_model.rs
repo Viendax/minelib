@@ -865,8 +865,15 @@ fn item_frame(pose: &Pose, hand: Mat4, rot: Mat4, fwd: f32) -> Mat4 {
 
 /// (v201) Repère d'une lampe torche tenue : au poing, pointée où l'on regarde (−z).
 fn flashlight_frame(pose: &Pose, hand: Mat4) -> Mat4 {
+    // (v264) Tenue 0,6 pixel sous l'axe du poing : le corps a grandi sous une tête plus
+    // petite, l'épaule est montée de 0,06 bloc vers les yeux ; à la première personne, la
+    // lampe montait devant le viseur.
     item_frame(pose, hand, Mat4::IDENTITY, 2.0)
+        * Mat4::from_translation(Vec3::new(0.0, -FLASHLIGHT_LOW, 0.0))
 }
+
+/// (v264) De combien la lampe torche tenue est sous l'axe du poing (pixels du modèle).
+const FLASHLIGHT_LOW: f32 = 0.6;
 
 /// (v201) Point de la lampe debout (`flashlight::parts`, seizièmes de bloc) dans son repère
 /// tenu (pixels) : couchée vers l'avant, prise au milieu du manche, à la moitié de sa taille
@@ -932,7 +939,9 @@ const FLAT_ITEM: f32 = 6.0;
 /// jusqu'ici), tenue par le haut de son bâton (le bas à `TORCH_LOW` pixels sous le poing).
 /// Entière, ou tenue plus bas, sa flamme montait au-dessus du viseur à la première personne.
 const HELD_TORCH: f32 = 0.5;
-const TORCH_LOW: f32 = 5.0;
+/// (v264) 5,4 (5 avant) : le corps a grandi sous une tête plus petite, l'épaule est montée
+/// de 0,06 bloc vers les yeux et la flamme repassait d'un cheveu au-dessus du viseur.
+const TORCH_LOW: f32 = 5.4;
 
 /// (v239) Repère du maillage de l'objet tenu à la première personne (`hand::item_mesh`), au
 /// monde : là où le modèle le tient, à sa taille (voir `held_parts`). Un bloc ou une tête : son
