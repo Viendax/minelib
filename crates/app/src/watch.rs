@@ -527,7 +527,7 @@ impl Party {
         let o: Ordre = serde_json::from_str(json).ok()?;
         if let Some(vid) = o.clic.filter(|v| valid_id(v)) {
             if cote {
-                return self.file_cote(id, vid, me);
+                return self.lance_cote(id, vid, me);
             }
             let en_cours = self.tracks.get(&id).filter(|t| {
                 let fini = self.pages.get(&id).is_some_and(|s| {
@@ -628,12 +628,13 @@ impl Party {
         None
     }
 
-    /// (v259) Une vidéo cliquée dans la recherche ouverte depuis la file : **toujours**
-    /// ajoutée au bout de la file, jamais lancée (demande du propriétaire). Rien encore de
-    /// partagé sur l'écran (vidéo pas encore lancée, ou attendant le regard) : la vidéo que
-    /// montre la page devient celle de l'écran, avec cette file. Seule une page sans vidéo du
-    /// tout (rien à quoi ajouter) ouvre la cliquée.
-    fn file_cote(&mut self, id: u32, vid: String, me: &str) -> Option<Act> {
+    /// (v259) Une vidéo cliquée dans la recherche ouverte depuis la file allait toujours au
+    /// bout de la file. (v292) Demande du propriétaire : elle **se lance**, pour tous, et
+    /// reste dans la playlist (celle en cours passe dans les vues, les à suivre restent ; si
+    /// elle était déjà à suivre, elle en sort). Rien encore de partagé sur l'écran : la vidéo
+    /// que montre la page devient d'abord celle de l'écran (elle sera dans les vues). Une page
+    /// sans vidéo du tout ouvre simplement la cliquée.
+    fn lance_cote(&mut self, id: u32, vid: String, me: &str) -> Option<Act> {
         if !self.tracks.contains_key(&id) {
             let page = self.pages.get(&id).map(|s| s.page.clone());
             let Some((cur, p)) = page.and_then(|p| Some((p.video.clone()?, p))) else {
@@ -641,18 +642,24 @@ impl Party {
             };
             self.local(id, cur, p.t.max(0.0), p.paused, p.short, me);
         }
-        let mut video = self.tracks.get(&id)?.at_now();
-        if video.queue.len() >= MAX_FILE || video.queue.last() == Some(&vid) {
-            return None;
+        let t = self.tracks.get(&id)?;
+        let mut video = t.at_now();
+        if video.id == vid {
+            // Déjà celle en cours : la page y revient (et elle reprend, si en pause).
+            return self.geste(id, Geste::Reprend, video.lus.len(), &vid, me);
         }
-        video.queue.push(vid.clone());
+        video.lus.push(std::mem::replace(&mut video.id, vid.clone()));
+        if let Some(k) = video.queue.iter().position(|v| *v == vid) {
+            video.queue.remove(k);
+        }
+        video.t = 0.0;
+        video.paused = false;
+        video.short = false;
         video.seq = self.next_seq(id);
         video.by = me.chars().take(32).collect();
-        log::info!(
-            "regarder ensemble : écran {id}, {vid} ajoutée à la file depuis la recherche ({} en tout)",
-            video.queue.len()
-        );
-        self.put(id, video);
+        video.rogne();
+        log::info!("regarder ensemble : écran {id}, {vid} lancée depuis la recherche");
+        self.give(id, video);
         None
     }
 
@@ -1505,8 +1512,10 @@ mod tests {
         let a = ps[1].party.order(id, &format!(r#"{{"clic":"{Y}"}}"#), B, false);
         assert!(matches!(&a, Some(Act::Open(_, u)) if u.contains(X)), "{a:?}");
         let z = "aaaaaaaaaaa";
-        // (v257) Depuis la recherche à côté : dans la file, la page du lecteur ne bouge pas.
-        assert_eq!(ps[1].party.order(id, &format!(r#"{{"clic":"{z}"}}"#), B, true), None);
+        // Un deuxième clic sur le site : dans la file aussi. (v292 : depuis la recherche à côté,
+        // un clic lance la vidéo, voir `un_clic_dans_la_recherche_lance_la_video`.)
+        let a = ps[1].party.order(id, &format!(r#"{{"clic":"{z}"}}"#), B, false);
+        assert!(matches!(&a, Some(Act::Open(_, u)) if u.contains(X)), "{a:?}");
         run(&mut ps, 2.0);
         for p in &ps {
             assert_eq!(p.party.tracks[&id].video.queue, vec![Y.to_string(), z.to_string()]);
@@ -1552,7 +1561,7 @@ mod tests {
         };
         p.observe(id, &page(a), A);
         for v in [b, c, d] {
-            p.order(id, &format!(r#"{{"clic":"{v}"}}"#), A, true);
+            p.order(id, &format!(r#"{{"clic":"{v}"}}"#), A, false);
         }
         let liste = |p: &Party| {
             let (l, cur, q, _) = p.liste(id).unwrap();
@@ -1627,32 +1636,39 @@ mod tests {
         assert_eq!(v.queue, s(&[a, c, d]));
     }
 
-    /// (v259) Depuis la recherche ouverte par la file, un clic ajoute toujours à la file,
-    /// même quand rien n'est encore partagé (vidéo qui attend le regard) : jamais lancé.
+    /// (v292) Depuis la recherche ouverte par la playlist, un clic **lance** la vidéo (demande
+    /// du propriétaire ; v259 : elle allait au bout de la file) : celle en cours passe dans
+    /// les vues, les à suivre restent, et une vidéo déjà à suivre en sort.
     #[test]
-    fn un_clic_dans_la_recherche_ajoute_toujours_a_la_file() {
+    fn un_clic_dans_la_recherche_lance_la_video() {
         let mut p = Party::new();
         let id = 7;
         let clic = |v: &str| format!(r#"{{"clic":"{v}"}}"#);
-        // Pas même une vidéo sur la page : rien à quoi l'ajouter, elle s'ouvre.
+        let z = "zzzzzzzzzzz";
+        // Pas même une vidéo sur la page : elle s'ouvre.
         assert_eq!(p.order(id, &clic(Y), A, true), Some(Act::Open(id, watch_url(Y, 0.0))));
         // Le lecteur montre X, pas encore lancée (« en pub » : rien de partagé).
         let etat = format!(
-            r#"{{"u":"{}","t":0,"p":true,"a":true,"i":"{X}","e":false,"f":"","o":true,"r":true}}"#,
+            r#"{{"u":"{}","t":0,"p":true,"a":true,"i":"{X}","e":false,"o":true,"r":true}}"#,
             watch_url(X, 0.0)
         );
         p.observe(id, &etat, A);
         assert!(p.tracks.get(&id).is_none());
-        assert_eq!(p.order(id, &clic(Y), A, true), None, "pas lancée");
-        assert_eq!(p.tracks[&id].video.id, X);
-        assert_eq!(p.tracks[&id].video.queue, vec![Y.to_string()]);
-        // La même deux fois de suite : une seule fois.
         assert_eq!(p.order(id, &clic(Y), A, true), None);
-        assert_eq!(p.tracks[&id].video.queue.len(), 1);
-        // Vidéo finie : elle va quand même dans la file (la file passe à la suivante).
-        p.tracks.get_mut(&id).unwrap().video.queue.clear();
-        assert_eq!(p.order(id, &clic(Y), A, true), None);
-        assert_eq!(p.tracks[&id].video.queue, vec![Y.to_string()]);
+        let liste = |p: &Party| {
+            let (l, cur, q, pause) = p.liste(id).unwrap();
+            (l.to_vec(), cur.to_string(), q.to_vec(), pause)
+        };
+        assert_eq!(liste(&p), (vec![X.to_string()], Y.to_string(), vec![], false));
+        assert!(p.tracks[&id].applied.is_none(), "la page va l'ouvrir");
+        // Une vidéo déjà à suivre : lancée, et elle n'est plus à suivre.
+        p.order(id, &format!(r#"{{"clic":"{z}"}}"#), A, false);
+        assert_eq!(liste(&p).2, vec![z.to_string()]);
+        assert_eq!(p.order(id, &clic(z), A, true), None);
+        assert_eq!(liste(&p), (vec![X.to_string(), Y.to_string()], z.to_string(), vec![], false));
+        // Celle en cours : la page y revient seulement.
+        assert!(matches!(p.order(id, &clic(z), A, true), Some(Act::Open(_, u)) if u.contains(z)));
+        assert_eq!(liste(&p).1, z);
     }
 
     fn screen_at(x: i32) -> Placed {
