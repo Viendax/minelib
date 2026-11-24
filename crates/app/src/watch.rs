@@ -42,9 +42,6 @@ use crate::screen::Placed;
 pub const MAGIC: [u8; 4] = [0xFF, b'M', b'T', b'4'];
 /// (v253) Au plus tant de vidéos dans la file d'un écran.
 pub const MAX_FILE: usize = 30;
-/// (v253) La file est redonnée à une page qui ne la montre pas au plus une fois par tant
-/// de secondes (le temps qu'elle le dise).
-const FILE_S: f32 = 1.0;
 /// Un écran est montré aux joueurs à moins de tant de blocs de lui.
 pub const RANGE: f32 = 64.0;
 /// Un écran annoncé plus loin que ça de celui qui l'annonce est refusé.
@@ -179,8 +176,6 @@ struct Track {
     guess: bool,
     /// Vidéo ouverte pour elle : la page sera recalée au plus près une fois chargée.
     fine: bool,
-    /// (v253) Depuis la dernière file envoyée à la page (secondes).
-    file_sent: f32,
 }
 
 impl Track {
@@ -375,7 +370,6 @@ impl Party {
                 corrected: CORRECT_S,
                 guess: t < 0.0,
                 fine: false,
-                file_sent: FILE_S,
             },
         );
         self.changed.push(id);
@@ -395,7 +389,6 @@ impl Party {
                 corrected: CORRECT_S,
                 guess: false,
                 fine: false,
-                file_sent: FILE_S,
             },
         );
         self.changed.push(id);
@@ -519,6 +512,12 @@ impl Party {
         None
     }
 
+    /// (v289) La file d'attente de l'écran `id` (vide s'il n'y en a pas) : son volet la
+    /// montre.
+    pub fn file(&self, id: u32) -> &[String] {
+        self.tracks.get(&id).map_or(&[], |t| &t.video.queue)
+    }
+
     /// (v253) La même vidéo, au même point, avec une autre file : rien à faire à la page
     /// que de lui redonner sa file.
     fn put(&mut self, id: u32, video: Video) {
@@ -526,7 +525,6 @@ impl Party {
             t.applied = Some((video.seq, video.by.clone()));
             t.video = video;
             t.age = 0.0;
-            t.file_sent = FILE_S;
             self.changed.push(id);
         }
     }
@@ -615,7 +613,6 @@ impl Party {
                         corrected: CORRECT_S,
                         guess: false,
                         fine: false,
-                        file_sent: FILE_S,
                     },
                 );
             }
@@ -649,7 +646,6 @@ impl Party {
             t.age += dt;
             t.settle -= dt;
             t.corrected += dt;
-            t.file_sent += dt;
         }
         for p in self.pages.values_mut() {
             p.age += dt;
@@ -704,15 +700,8 @@ impl Party {
         let mut acts = Vec::new();
         for (&id, t) in self.tracks.iter_mut() {
             let page = self.pages.get(&id).map(|s| &s.page);
-            // (v253) La page du lecteur montre la file de l'écran.
-            if let Some(p) = page.filter(|p| p.video.as_deref() == Some(t.video.id.as_str())) {
-                if p.file.as_deref().is_some_and(|f| f != t.video.queue.join(","))
-                    && t.file_sent >= FILE_S
-                {
-                    acts.push(Act::Eval(id, file_js(&t.video.queue)));
-                    t.file_sent = 0.0;
-                }
-            }
+            // (v253) La page du lecteur montrait la file de l'écran ; (v289) c'est le volet
+            // de l'écran qui la montre, sur toutes les pages (voir `Party::file`).
             // Depuis combien de temps la page a donné ce temps.
             let page_age = self.pages.get(&id).map_or(0.0, |s| s.age);
             let key = (t.video.seq, t.video.by.clone());
@@ -980,20 +969,6 @@ pub fn is_short(url: &str) -> bool {
         "www.youtube.com" | "youtube.com" | "m.youtube.com"
     ) && path.starts_with("shorts/")
         && video_of(url).is_some()
-}
-
-/// (v253) Script qui donne sa file d'attente à la page du lecteur (des numéros de vidéo
-/// déjà vérifiés : rien d'autre n'entre dans le script).
-pub fn file_js(queue: &[String]) -> String {
-    let ids: Vec<String> = queue
-        .iter()
-        .filter(|v| valid_id(v))
-        .map(|v| format!("\"{v}\""))
-        .collect();
-    format!(
-        "(()=>{{if(window.__mlb&&window.__mlb.file)window.__mlb.file([{}]);}})()",
-        ids.join(",")
-    )
 }
 
 /// (v210) L'adresse est-elle la page du lecteur ?
@@ -1391,11 +1366,9 @@ mod tests {
             assert_eq!(p.page(id).video().as_deref(), Some(Y));
             assert!(p.party.tracks[&id].video.queue.is_empty());
         }
-        // La file part en script vers la page, rien que des numéros vérifiés.
-        assert_eq!(
-            file_js(&[Y.to_string(), "<script>".to_string()]),
-            format!(r#"(()=>{{if(window.__mlb&&window.__mlb.file)window.__mlb.file(["{Y}"]);}})()"#)
-        );
+        // (v289) Le volet montre la file de l'écran.
+        assert!(ps[0].party.file(id).is_empty());
+        assert!(ps[0].party.file(id + 1).is_empty());
     }
 
     /// (v259) Depuis la recherche ouverte par la file, un clic ajoute toujours à la file,

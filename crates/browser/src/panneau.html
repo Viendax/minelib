@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>File d'attente</title>
+<!--
+  (v289) Le volet des écrans : une page à part (son propre onglet du navigateur), que le jeu
+  colle sur la gauche de n'importe quelle page de l'écran. Demande du propriétaire : il
+  s'ouvre depuis le bord gauche, sur toutes les pages (pas seulement pendant une vidéo).
+
+  En haut, les boutons qui étaient dans le coin de l'écran : Google, retour, suivant (pas
+  YouTube : il a son bouton de recherche plus bas). Puis « Chercher une vidéo sur »
+  YouTube, Dailymotion, Vimeo (la recherche à côté, ✕ pour la fermer), puis la file
+  d'attente (en ligne).
+
+  Le jeu lui dit tout par `__mlb.etat({f, h, r, l})` : la file (numéros), les pages où aller
+  (1 retour, 2 suivant), le site de la recherche ouverte, en ligne ou non. Elle répond par
+  des ordres : `{"nav":"google"|"retour"|"suivant"}`, `{"recherche":"yt"|"dm"|"vm"|false}`,
+  `{"retire":rang,"v":numéro}`.
+-->
+<style>
+html,body{margin:0;height:100%;background:#0f0f0f;color:#f1f1f1;overflow:hidden;
+  font:15px system-ui,"Segoe UI",Roboto,Arial,sans-serif}
+body{box-sizing:border-box;padding:16px 14px;border-right:1px solid #272727}
+.rang{display:flex;gap:6px;margin:0 0 14px}
+.rang button{flex:1;min-width:0;padding:9px 2px;border:1px solid #3f3f3f;border-radius:18px;
+  background:#121212;color:#f1f1f1;font:inherit;font-size:13px;cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rang button:disabled{opacity:.35;cursor:default}
+.rang button.actif{background:#f1f1f1;color:#0f0f0f;border-color:#f1f1f1;font-weight:600}
+#ferme{flex:none!important;width:36px;padding:9px 0!important;display:none}
+body.cote #ferme{display:block}
+.titre{margin:0 4px 8px;font-size:13px;color:#aaa}
+h2{font-size:18px;margin:4px 4px 12px}
+#liste{overflow-y:auto;max-height:calc(100vh - 260px)}
+.v{display:flex;gap:10px;align-items:center;margin:0 0 10px;position:relative}
+.v img{width:120px;height:68px;object-fit:cover;border-radius:8px;background:#272727;flex:none}
+.v .n{position:absolute;left:4px;top:3px;font-size:12px;background:rgba(0,0,0,.75);
+  border-radius:4px;padding:0 5px}
+.v .s{position:absolute;left:4px;bottom:3px;font-size:11px;background:rgba(0,0,0,.75);
+  border-radius:4px;padding:0 5px;color:#ddd}
+.v .t{flex:1;min-width:0;font-size:14px;line-height:1.3;max-height:3.9em;overflow:hidden}
+.v .x{flex:none;width:28px;height:28px;border-radius:50%;border:0;background:#272727;
+  color:#f1f1f1;font-size:16px;cursor:pointer}
+#vide,#solo{color:#aaa;font-size:14px;line-height:1.4;margin:0 4px}
+</style>
+</head>
+<body>
+<div class="rang" id="nav"><button id="google">🔍 Google</button><button id="retour"
+disabled>← Retour</button><button id="suivant" disabled>Suivant →</button></div>
+<div class="titre">Chercher une vidéo sur</div>
+<div class="rang" id="sites"><button data-s="yt">YouTube</button><button
+data-s="dm">Dailymotion</button><button data-s="vm">Vimeo</button><button id="ferme"
+title="Fermer la recherche">✕</button></div>
+<div id="partie"><h2>À suivre</h2><div id="liste"></div><div id="vide">Rien à suivre.
+Cherche une vidéo et clique dessus : elle se mettra ici.</div></div>
+<div id="solo" hidden>La file d'attente est pour les parties en ligne. En solo, une vidéo
+cliquée dans la recherche s'ouvre sur l'écran.</div>
+<script>
+(()=>{
+window.__mlb_volet=1;
+const dit=s=>{try{window.chrome.webview.postMessage(s);}catch(_){console.log(s);}};
+const ordre=o=>dit('__minelib_ordre__'+JSON.stringify(o));
+const ok=s=>/^[A-Za-z0-9_-]{11}$/.test(s||'')||/^vm:\d{1,12}$/.test(s||'')
+  ||/^dm:[A-Za-z0-9]{5,12}$/.test(s||'');
+const site=v=>v.startsWith('vm:')?'vm':v.startsWith('dm:')?'dm':'yt';
+const NOMS={yt:'YouTube',dm:'Dailymotion',vm:'Vimeo'};
+document.getElementById('google').addEventListener('click',()=>ordre({nav:'google'}));
+document.getElementById('retour').addEventListener('click',()=>ordre({nav:'retour'}));
+document.getElementById('suivant').addEventListener('click',()=>ordre({nav:'suivant'}));
+document.querySelectorAll('#sites button[data-s]').forEach(b=>b.addEventListener('click',
+  ()=>ordre({recherche:b.dataset.s})));
+document.getElementById('ferme').addEventListener('click',()=>ordre({recherche:false}));
+// La file : titres et images chargés une fois par vidéo.
+let file=[],vu='';const infos={};
+const info=v=>{if(infos[v])return;const o=infos[v]={titre:'',image:''};const S=site(v);
+  const fin=()=>montre();
+  if(S==='yt'){o.image='https://i.ytimg.com/vi/'+v+'/mqdefault.jpg';
+    fetch('https://www.youtube.com/oembed?format=json&url='+encodeURIComponent('https://www.youtube.com/watch?v='+v))
+    .then(r=>r.ok?r.json():null).then(j=>{if(j&&j.title){o.titre=j.title;fin();}}).catch(()=>{});}
+  else if(S==='vm'){
+    fetch('https://vimeo.com/api/oembed.json?url='+encodeURIComponent('https://vimeo.com/'+v.slice(3)))
+    .then(r=>r.ok?r.json():null).then(j=>{if(j){o.titre=j.title||'';o.image=j.thumbnail_url||'';fin();}}).catch(()=>{});}
+  else{fetch('https://api.dailymotion.com/video/'+v.slice(3)+'?fields=title,thumbnail_360_url')
+    .then(r=>r.ok?r.json():null).then(j=>{if(j){o.titre=j.title||'';o.image=j.thumbnail_360_url||'';fin();}}).catch(()=>{});}};
+const montre=()=>{const l=document.getElementById('liste');l.textContent='';
+  file.forEach((v,i)=>{info(v);const o=infos[v];const d=document.createElement('div');d.className='v';
+    const im=document.createElement('img');if(o.image)im.src=o.image;
+    const n=document.createElement('span');n.className='n';n.textContent=String(i+1);
+    const t=document.createElement('div');t.className='t';t.textContent=o.titre||'…';
+    const x=document.createElement('button');x.className='x';x.textContent='×';x.title='Retirer';
+    x.addEventListener('click',e=>{e.stopPropagation();ordre({retire:i,v:v});});
+    d.append(im,n,t,x);
+    if(site(v)!=='yt'){const b=document.createElement('span');b.className='s';b.textContent=NOMS[site(v)];d.append(b);}
+    l.append(d);});
+  document.getElementById('vide').style.display=file.length?'none':'block';};
+montre();
+window.__mlb={
+  etat:e=>{if(!e||typeof e!=='object')return;
+    const f=Array.isArray(e.f)?e.f.filter(ok).slice(0,30):[];
+    if(f.join(',')!==vu){vu=f.join(',');file=f;montre();}
+    const h=e.h|0;
+    document.getElementById('retour').disabled=!(h&1);
+    document.getElementById('suivant').disabled=!(h&2);
+    const r=NOMS[e.r]?e.r:'';
+    document.body.classList.toggle('cote',!!r);
+    document.querySelectorAll('#sites button[data-s]').forEach(b=>b.classList.toggle('actif',b.dataset.s===r));
+    const l=e.l!==false;
+    document.getElementById('partie').hidden=!l;
+    document.getElementById('solo').hidden=l;},
+};
+})();
+</script>
+</body>
+</html>

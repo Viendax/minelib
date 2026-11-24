@@ -253,6 +253,34 @@ fn ordre_recherche(json: &str) -> Option<Option<&'static str>> {
     }
 }
 
+/// (v289) Un bouton du haut du volet : Google, la page précédente, la suivante.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Nav {
+    Google,
+    Retour,
+    Suivant,
+}
+
+/// (v289) L'ordre d'un bouton du haut du volet (`{"nav":"google"|"retour"|"suivant"}`).
+fn ordre_nav(json: &str) -> Option<Nav> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    match v.get("nav")?.as_str()? {
+        "google" => Some(Nav::Google),
+        "retour" => Some(Nav::Retour),
+        "suivant" => Some(Nav::Suivant),
+        _ => None,
+    }
+}
+
+/// (v289) Ce que le volet d'un écran doit montrer (`__mlb.etat` de `panneau.html`) : la file
+/// (`f`, numéros vérifiés), les pages où aller (`h` : 1 retour, 2 suivant), la recherche
+/// ouverte (`r` : son site, ou rien) et si l'on est en ligne (`l`).
+fn etat_volet(t: &Tab) -> String {
+    let file: Vec<&String> = t.file.iter().filter(|v| crate::watch::valid_id(v)).collect();
+    let r = t.cote.as_ref().filter(|c| c.voulue).map_or("", |c| c.site);
+    serde_json::json!({"f": file, "h": t.history, "r": r, "l": t.en_ligne}).to_string()
+}
+
 fn page_playing(json: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return false;
@@ -648,28 +676,14 @@ impl Displays {
             if let Some(c) = tab.cote.as_mut() {
                 c.opened = false;
             }
+            if let Some(v) = tab.volet.as_mut() {
+                v.opened = false;
+            }
         }
-    }
-
-    /// (v206) Apparition des boutons de cet écran (0 à 1 ; v212 : la même pour tous) : le
-    /// rendu la passe au shader, et un clic ne compte comme un clic sur un bouton qu'au-delà
-    /// de `CLIQUABLE`.
-    pub fn reveal(&self, id: u32) -> f32 {
-        self.tabs.get(&id).map_or(0.0, |t| t.reveal)
-    }
-
-    /// Un clic à cet endroit de cet écran est-il un clic sur un bouton (`LOUPE`,
-    /// `VIDEO`, `RETOUR`, `SUIVANT`) ? (Invisibles ou presque, les boutons laissent le clic à
-    /// la page.)
-    pub fn button_clicked(&self, id: u32, uv: [f32; 2]) -> Option<usize> {
-        if self.reveal(id) < CLIQUABLE {
-            return None;
-        }
-        (0..BOUTONS.len()).find(|&b| on_button(uv, b))
     }
 
     /// (v243) Le curseur et l'onde d'un appui de l'écran `id`, pour le shader (voir
-    /// `ScreenAnchor::cursor` et `ripple`) : dessinés au-dessus des boutons.
+    /// `ScreenAnchor::cursor` et `ripple`).
     pub fn marks(&self, id: u32) -> ([f32; 4], [f32; 4]) {
         let Some(t) = self.tabs.get(&id) else {
             return ([0.0; 4], [0.0, 0.0, -1.0, 0.0]);
@@ -684,14 +698,8 @@ impl Displays {
         (cursor, ripple)
     }
 
-    /// (v213) Y a-t-il une page précédente (1), une page suivante (2) ? Le rendu grise les
-    /// boutons qui n'ont nulle part où aller.
-    pub fn history_of(&self, id: u32) -> u8 {
-        self.tabs.get(&id).map_or(0, |t| t.history)
-    }
-
-    /// (v213) La page précédente de cet écran (bouton retour), ou la suivante (`forward`).
-    /// Un bouton grisé ne fait rien.
+    /// (v213) La page précédente de cet écran (bouton retour, v289 : du volet), ou la
+    /// suivante (`forward`). Un bouton grisé ne fait rien.
     pub fn history(&mut self, id: u32, forward: bool) {
         let bit = if forward { 2 } else { 1 };
         if !self.tabs.get(&id).is_some_and(|t| t.opened && t.history & bit != 0) {
@@ -771,18 +779,36 @@ impl Displays {
 
     /// (v257) Un numéro d'onglet libre pour la recherche de l'écran `id`.
     fn cote_bid(&self, id: u32) -> u32 {
+        self.bid_libre(id, COTE_BID)
+    }
+
+    /// (v289) Un numéro d'onglet libre pour un onglet à part de l'écran `id` (sa recherche,
+    /// son volet) : celui de l'écran mêlé à `mele`, ou le suivant libre.
+    fn bid_libre(&self, id: u32, mele: u32) -> u32 {
         let pris = |b: u32| {
             self.tabs.contains_key(&b)
-                || self
-                    .tabs
-                    .iter()
-                    .any(|(i, t)| *i != id && t.cote.as_ref().is_some_and(|c| c.bid == b))
+                || self.tabs.values().any(|t| {
+                    t.cote.as_ref().is_some_and(|c| c.bid == b)
+                        || t.volet.as_ref().is_some_and(|v| v.bid == b)
+                })
         };
-        let mut b = id ^ COTE_BID;
+        let mut b = id ^ mele;
         while pris(b) {
             b = b.wrapping_add(1);
         }
         b
+    }
+
+    /// (v289) La file d'attente de chaque écran (`file`, regarder ensemble) et si l'on est
+    /// en ligne : le volet les montre.
+    pub fn set_files<'a>(&mut self, en_ligne: bool, file: impl Fn(u32) -> &'a [String]) {
+        for (id, tab) in self.tabs.iter_mut() {
+            let f = file(*id);
+            if tab.file != f {
+                tab.file = f.to_vec();
+            }
+            tab.en_ligne = en_ligne;
+        }
     }
 
     /// Volume du son de tous les écrans (0 à 1). (v213) Il ne touche plus aux pages : le
@@ -820,6 +846,11 @@ impl Displays {
                 if let (Some(c), Some(b)) = (tab.cote.as_ref(), self.browser.as_mut()) {
                     if c.opened {
                         b.send(&format!("close {}", c.bid));
+                    }
+                }
+                if let (Some(v), Some(b)) = (tab.volet.as_ref(), self.browser.as_mut()) {
+                    if v.opened {
+                        b.send(&format!("close {}", v.bid));
                     }
                 }
             }
@@ -938,6 +969,26 @@ impl Displays {
                     c.fps_sent = fps;
                 }
             }
+            // (v289) Le volet aussi vit avec la page de l'écran, à sa taille.
+            if let Some(v) = tab.volet.as_mut() {
+                if tab.opened && !v.opened {
+                    b.send(&format!("cote {} {VOLET_W} {PAGE_H}", v.bid));
+                    b.send(&format!("open {} {}", v.bid, crate::edge::scripts::VOLET));
+                    v.opened = true;
+                    v.fps_sent = FPS_DEFAULT;
+                    v.sent = None;
+                    v.etat = None;
+                } else if !tab.opened && v.opened {
+                    b.send(&format!("close {}", v.bid));
+                    v.opened = false;
+                    v.scroll = 0;
+                }
+                let fps = if tab.panel_open { tab.fps_sent.max(FPS_NEAR) } else { FPS_HIDDEN };
+                if v.opened && fps != v.fps_sent {
+                    b.send(&format!("fps {} {fps}", v.bid));
+                    v.fps_sent = fps;
+                }
+            }
         }
     }
 
@@ -1039,23 +1090,24 @@ impl Displays {
             if uv != tab.cursor {
                 tab.cursor = uv;
             }
-            // (v257) Dans la recherche à côté : la souris est à elle.
-            if let Some(q) = uv.and_then(|uv| tab.point_cote(uv)) {
-                if let (Some(c), Some(b)) = (tab.cote.as_mut(), self.browser.as_mut()) {
-                    if c.opened && c.sent != Some(q) {
-                        b.send(&format!("move {} {} {}", c.bid, q.0, q.1));
-                        c.sent = Some(q);
-                    }
-                }
-                continue;
-            }
-            let Some(p) = uv.map(page_point) else {
-                continue;
+            // (v257) Dans la recherche à côté (v289 : ou le volet) : la souris est à eux.
+            let Some(uv) = uv else { continue };
+            let (cible, q) = tab.cible(uv);
+            let (bid, opened, sent) = match cible {
+                Cible::Page => (*id, true, &mut tab.sent),
+                Cible::Cote => match tab.cote.as_mut() {
+                    Some(c) => (c.bid, c.opened, &mut c.sent),
+                    None => continue,
+                },
+                Cible::Volet => match tab.volet.as_mut() {
+                    Some(v) => (v.bid, v.opened, &mut v.sent),
+                    None => continue,
+                },
             };
-            if tab.sent != Some(p) {
+            if opened && *sent != Some(q) {
                 if let Some(b) = self.browser.as_mut() {
-                    b.send(&format!("move {id} {} {}", p.0, p.1));
-                    tab.sent = Some(p);
+                    b.send(&format!("move {bid} {} {}", q.0, q.1));
+                    *sent = Some(q);
                 }
             }
         }
@@ -1067,10 +1119,36 @@ impl Displays {
             return;
         };
         tab.ripple = Some((uv, 0.0));
+        let (cible, q) = tab.cible(uv);
+        tab.appui = cible;
+        // (v289) Dans le volet : le clic est à lui ; il n'a pas de champ de texte, la page et
+        // la recherche perdent le leur.
+        if cible == Cible::Volet {
+            tab.typing_ok = 0.0;
+            let blur_page = std::mem::take(&mut tab.editing);
+            let blur_cote = tab.cote.as_mut().and_then(|c| {
+                c.typing_ok = 0.0;
+                std::mem::take(&mut c.editing).then_some(c.bid)
+            });
+            let Some(v) = tab.volet.as_mut() else { return };
+            if let Some(b) = self.browser.as_mut() {
+                if blur_page {
+                    b.send(&format!("blur {id}"));
+                }
+                if let Some(bid) = blur_cote {
+                    b.send(&format!("blur {bid}"));
+                }
+                if v.opened {
+                    b.send(&format!("move {} {} {}", v.bid, q.0, q.1));
+                    b.send(&format!("down {} {} {}", v.bid, q.0, q.1));
+                    v.sent = Some(q);
+                }
+            }
+            return;
+        }
         // (v257) Dans la recherche à côté : le clic est à elle, et le clavier ne peut plus
         // aller qu'à elle (la page du lecteur perd son champ de texte, et inversement).
-        if let Some(q) = tab.point_cote(uv) {
-            tab.appui_cote = true;
+        if cible == Cible::Cote {
             tab.typing_ok = 0.0;
             let blur_page = std::mem::take(&mut tab.editing);
             let Some(c) = tab.cote.as_mut() else { return };
@@ -1088,7 +1166,6 @@ impl Displays {
             }
             return;
         }
-        tab.appui_cote = false;
         if let Some(c) = tab.cote.as_mut() {
             c.typing_ok = 0.0;
             if std::mem::take(&mut c.editing) {
@@ -1101,7 +1178,7 @@ impl Displays {
         // arrive du navigateur un peu après).
         tab.typing_ok = TYPING_AFTER_CLICK;
         tab.blur_in = None;
-        let p = page_point(uv);
+        let p = q;
         match self.browser.as_mut() {
             Some(b) => {
                 b.send(&format!("move {id} {} {}", p.0, p.1));
@@ -1117,12 +1194,17 @@ impl Displays {
         let Some(tab) = self.tabs.get(&id) else {
             return;
         };
-        // (v257) Un appui dans la recherche à côté finit chez elle.
-        if tab.appui_cote {
-            let Some(c) = tab.cote.as_ref() else { return };
-            let q = uv.and_then(|uv| tab.point_cote(uv)).or(c.sent);
-            if let (Some(q), Some(b), true) = (q, self.browser.as_mut(), c.opened) {
-                b.send(&format!("up {} {} {}", c.bid, q.0, q.1));
+        // (v257) Un appui dans la recherche à côté (v289 : ou le volet) finit chez elle.
+        let ici = uv.map(|uv| tab.cible(uv)).filter(|c| c.0 == tab.appui).map(|c| c.1);
+        let autre = match tab.appui {
+            Cible::Page => None,
+            Cible::Cote => tab.cote.as_ref().map(|c| (c.bid, c.opened, c.sent)),
+            Cible::Volet => tab.volet.as_ref().map(|v| (v.bid, v.opened, v.sent)),
+        };
+        if tab.appui != Cible::Page {
+            let Some((bid, opened, sent)) = autre else { return };
+            if let (Some(q), Some(b), true) = (ici.or(sent), self.browser.as_mut(), opened) {
+                b.send(&format!("up {bid} {} {}", q.0, q.1));
             }
             return;
         }
@@ -1137,12 +1219,15 @@ impl Displays {
     /// Molette sur l'écran `id` : fait défiler sa page (`dy` : crans × 120, positif vers
     /// le haut).
     pub fn wheel(&mut self, id: u32, uv: [f32; 2], dy: i32) {
-        // (v257) Dans la recherche à côté : elle défile.
-        let cote = self.tabs.get(&id).and_then(|t| {
-            let q = t.point_cote(uv)?;
-            Some((t.cote.as_ref()?.bid, q))
-        });
-        let (bid, p) = cote.unwrap_or((id, page_point(uv)));
+        // (v257) Dans la recherche à côté (v289 : ou le volet) : elle défile.
+        let Some(t) = self.tabs.get(&id) else { return };
+        let (cible, p) = t.cible(uv);
+        let bid = match cible {
+            Cible::Page => Some(id),
+            Cible::Cote => t.cote.as_ref().map(|c| c.bid),
+            Cible::Volet => t.volet.as_ref().map(|v| v.bid),
+        };
+        let Some(bid) = bid else { return };
         if let Some(b) = self.browser.as_mut() {
             b.send(&format!("wheel {bid} {} {} {dy}", p.0, p.1));
         }
@@ -1154,8 +1239,13 @@ impl Displays {
         let bit = if up { 1 } else { 2 };
         self.browser.is_some()
             && self.tabs.get(&id).is_some_and(|t| {
-                let cote = t.cursor.and_then(|uv| t.point_cote(uv)).and(t.cote.as_ref());
-                cote.map_or(t.scroll, |c| c.scroll) & bit != 0
+                let cible = t.cursor.map_or(Cible::Page, |uv| t.cible(uv).0);
+                let flags = match cible {
+                    Cible::Page => t.scroll,
+                    Cible::Cote => t.cote.as_ref().map_or(0, |c| c.scroll),
+                    Cible::Volet => t.volet.as_ref().map_or(0, |v| v.scroll),
+                };
+                flags & bit != 0
             })
     }
 
@@ -1353,6 +1443,45 @@ impl Displays {
                 ),
             );
         }
+        // (v289) Le volet d'un écran est créé la première fois qu'on le fait venir ; tant
+        // qu'il est sorti, il reçoit son état (file, historique, recherche ouverte, en ligne)
+        // dès qu'il change, et chaque seconde (sa page a pu se recharger).
+        let nouveaux: Vec<u32> = self
+            .tabs
+            .iter()
+            .filter(|(_, t)| t.panel_open && t.volet.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in nouveaux {
+            let bid = self.bid_libre(id, VOLET_BID);
+            if let Some(t) = self.tabs.get_mut(&id) {
+                t.volet = Some(Volet::new(bid));
+                log::info!("écrans vidéo : écran {id}, volet ouvert (onglet {bid})");
+            }
+        }
+        let mut etats = Vec::new();
+        for tab in self.tabs.values_mut() {
+            let etat = etat_volet(tab);
+            let sorti = tab.o > 0.0;
+            let Some(v) = tab.volet.as_mut().filter(|v| v.opened) else { continue };
+            v.etat_ago += dt;
+            if !sorti {
+                v.etat = None;
+                continue;
+            }
+            if v.etat.as_deref() != Some(etat.as_str()) || v.etat_ago >= 1.0 {
+                v.etat_ago = 0.0;
+                etats.push((v.bid, etat.clone()));
+                v.etat = Some(etat);
+            }
+        }
+        if let Some(b) = self.browser.as_mut() {
+            for (bid, etat) in etats {
+                b.send(&format!(
+                    "eval {bid} (()=>{{if(window.__mlb&&window.__mlb.etat)window.__mlb.etat({etat});}})()"
+                ));
+            }
+        }
         if self.tabs.is_empty() {
             self.idle += dt;
             if self.idle >= IDLE_STOP_S && self.browser.is_some() {
@@ -1374,6 +1503,11 @@ impl Displays {
                         c.editing = false;
                         c.scroll = 0;
                         c.opened = false;
+                    }
+                    if let Some(v) = tab.volet.as_mut() {
+                        v.page.clear();
+                        v.scroll = 0;
+                        v.opened = false;
                     }
                 }
                 if code == Some(crate::edge::SANS_WEBVIEW2) {
@@ -1422,11 +1556,46 @@ impl Displays {
                             c.page = px;
                             c.page_size = (w, h);
                         }
-                        tab.dirty = true;
+                        tab.dirty |= tab.o > 0.0 && tab.s > 0.0;
+                    } else if let Some(tab) = self
+                        .tabs
+                        .values_mut()
+                        .find(|t| t.volet.as_ref().is_some_and(|v| v.bid == id))
+                    {
+                        // (v289) Le volet : recollé dans l'image de l'écran s'il est sorti.
+                        if let Some(v) = tab.volet.as_mut() {
+                            v.page = px;
+                            v.page_size = (w, h);
+                        }
+                        tab.dirty |= tab.o > 0.0;
                     }
                 }
                 let mut recherches = Vec::new();
+                let mut navs = Vec::new();
                 for (id, ev) in events {
+                    // (v289) Un évènement du volet d'un écran : ses ordres (Google, retour,
+                    // suivant, recherche, vidéo retirée de la file) et son défilement.
+                    if let Some((sid, tab)) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|(_, t)| t.volet.as_ref().is_some_and(|v| v.bid == id))
+                    {
+                        match ev {
+                            Event::Scroll(f) => {
+                                if let Some(v) = tab.volet.as_mut() {
+                                    v.scroll = f;
+                                }
+                            }
+                            Event::Blocked(raison) => self.blocked.push((*sid, raison)),
+                            Event::Ordre(o) => match (ordre_recherche(&o), ordre_nav(&o)) {
+                                (Some(site), _) => recherches.push((*sid, site)),
+                                (None, Some(nav)) => navs.push((*sid, nav)),
+                                (None, None) => self.orders.push((*sid, o, false)),
+                            },
+                            Event::Editing(_) | Event::State(_) | Event::History(_) => {}
+                        }
+                        continue;
+                    }
                     let Some(tab) = self.tabs.get_mut(&id) else {
                         // (v257) Un évènement de la recherche à côté d'un écran.
                         let Some((sid, tab)) = self
@@ -1483,6 +1652,15 @@ impl Displays {
                 for (id, site) in recherches {
                     self.recherche(id, site);
                 }
+                for (id, nav) in navs {
+                    match nav {
+                        Nav::Google => {
+                            self.open(id, RECHERCHE);
+                        }
+                        Nav::Retour => self.history(id, false),
+                        Nav::Suivant => self.history(id, true),
+                    }
+                }
             }
         }
         if !self.tabs.is_empty() {
@@ -1500,82 +1678,13 @@ impl Displays {
     }
 }
 
-/// (v211) Les boutons d'un écran, **en haut à gauche** : la loupe (Google), puis à sa
-/// droite la vidéo (la recherche de YouTube), puis (v213) le retour (page précédente) et
-/// le suivant (page suivante). Mêmes mesures que ce que dessine `screen.wgsl` (`BTN_C`,
-/// `BTN2_C`, `BTN3_C`, `BTN4_C`, `BTN_R`) ;
-/// les pages font 1280 × 720, donc une longueur en `u` vaut 16/9 de la même en `v`.
-/// Centres à 38 px du bord, rayon 28 px, 12 px entre deux.
-const BOUTONS: [[f32; 2]; 4] = [
-    [0.030, 0.053],
-    [0.0828, 0.053],
-    [0.1356, 0.053],
-    [0.1884, 0.053],
-];
-const RAYON: f32 = 0.022;
-/// Le bouton de recherche (Google), le bouton vidéo (YouTube), le retour et le suivant.
-pub const LOUPE: usize = 0;
-pub const VIDEO: usize = 1;
-pub const RETOUR: usize = 2;
-pub const SUIVANT: usize = 3;
-
-/// Autour du bouton (en rayons du bouton) : sa surface et un peu plus. Arrivé là, il est
-/// tout à fait visible ; dès qu'on en sort, il s'en va.
-const ZONE: f32 = 2.3;
-
-/// (v207) Le coin, en rayons du bouton : là où l'on peut entrer sur l'écran par le bord et
-/// glisser vers le bouton, qui apparaît de plus en plus en approchant.
-const COIN: f32 = 6.0;
-
-/// Temps pour apparaître et pour disparaître (secondes) : un glissement lent suffit, et
-/// un passage rapide dans le coin ne le fait pas clignoter.
-const PARAIT: f32 = 0.14;
-const SEN_VA: f32 = 0.28;
-
-/// En dessous de ça, le bouton est trop peu visible pour prendre le clic : il part à la
-/// page, comme n'importe quel autre endroit de l'écran.
-const CLIQUABLE: f32 = 0.35;
-
-/// L'adresse où mène la loupe (SafeSearch est imposé par le navigateur).
+/// L'adresse où mène le bouton Google du volet (SafeSearch est imposé par le navigateur).
+/// (v289) Les boutons qui étaient en haut à gauche de l'écran (loupe, vidéo, retour,
+/// suivant) sont partis, demande du propriétaire : Google, retour et suivant sont en haut
+/// du volet de gauche, et la recherche de YouTube y a son bouton parmi les sites.
 pub const RECHERCHE: &str = "https://www.google.com/";
-/// (v211) L'adresse où mène le bouton vidéo : la recherche de YouTube.
+/// (v211) La recherche de YouTube.
 pub const RECHERCHE_VIDEO: &str = "https://www.youtube.com/";
-
-/// Distance au centre du bouton, en mesures de la largeur (le 16/9 des pages est enlevé,
-/// donc un rond est rond).
-fn to_button(uv: [f32; 2], b: usize) -> f32 {
-    let c = BOUTONS[b];
-    let dx = uv[0] - c[0];
-    let dy = (uv[1] - c[1]) * 9.0 / 16.0;
-    (dx * dx + dy * dy).sqrt()
-}
-
-/// Le clic est-il sur le bouton `b` ?
-pub fn on_button(uv: [f32; 2], b: usize) -> bool {
-    to_button(uv, b) <= RAYON
-}
-
-/// (v207) Comment le bouton de recherche se montre. Demande du joueur : il n'apparaît
-/// **que si l'on arrive d'un glissement depuis le bord de l'écran**, dans le coin en bas à
-/// gauche, vers le bouton — pas si l'on est déjà sur l'écran et qu'on descend dans le coin.
-/// Il apparaît de plus en plus en approchant, est tout à fait visible sur lui et un peu
-/// autour, et s'en va dès qu'on en sort ; pour le revoir, il faut ressortir de l'écran et
-/// revenir par le bord.
-///
-/// (v211) Les deux boutons, en haut à gauche, vont ensemble, comme une petite barre : on
-/// entre par le bord gauche ou par le haut, près de l'un d'eux, et on glisse vers eux.
-/// (v212) Ils apparaissent et disparaissent **ensemble**, du même fondu : l'apparition
-/// suit la distance au plus proche des deux.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Corner {
-    /// Entré sur l'écran par le bord, dans le coin, et pas reparti ailleurs depuis.
-    armed: bool,
-    /// Déjà arrivé sur le bouton (ou tout près) depuis cette entrée.
-    reached: bool,
-    /// (v243) Où le regard coupait le plan de l'écran à l'image d'avant, à toute distance
-    /// (hors de l'écran : en dehors de 0..1).
-    prev: Option<[f32; 2]>,
-}
 
 /// (v253) La file d'attente du lecteur YouTube, sur la droite de l'écran (largeur
 /// `PANNEAU_U`..1, 352 px de 1280 dans la page). Comme les boutons, et pour soi seul : elle
@@ -1584,7 +1693,14 @@ struct Corner {
 /// s'éloigne (hors de portée de main ; elle revient en se rapprochant sans quitter la
 /// zone). La page la fait glisser depuis la droite, et la vidéo se réduit à côté (jamais
 /// par-dessus).
-const PANNEAU_U: f32 = 1.0 - 352.0 / 1280.0;
+///
+/// (v289) Le volet est maintenant **à gauche**, sur **toutes les pages** (demande du
+/// propriétaire) : il vient en entrant sur l'écran par son bord gauche, sur sa zone
+/// (`0..PANNEAU_U`), et repart vers la gauche ; mêmes règles qu'avant, en miroir. C'est une
+/// page à part (`panneau.html`, son propre onglet du navigateur, voir [`Volet`]) que le jeu
+/// colle sur la gauche de la page de l'écran ; sur le lecteur, la vidéo se décale vers la
+/// droite d'autant (jamais par-dessus), ailleurs le volet passe devant la page.
+const PANNEAU_U: f32 = VOLET_W as f32 / PAGE_W as f32;
 /// (v253) Un peu de marge avant de la refermer en allant vers la vidéo.
 const PANNEAU_MARGE: f32 = 0.02;
 
@@ -1595,10 +1711,16 @@ const COTE_W: u32 = 464;
 const COTE_FERME_S: f32 = 0.5;
 /// (v257) Numéro de l'onglet de recherche d'un écran : celui de l'écran mêlé à ceci.
 const COTE_BID: u32 = 0x5EA2_C4E5;
+/// (v289) Le volet : largeur de son onglet (pixels de page), numéro de son onglet (celui de
+/// l'écran mêlé à ceci), et temps pour glisser (comme la vidéo du lecteur, `lecteur.html`).
+const VOLET_W: u32 = 352;
+const VOLET_BID: u32 = 0x7C1E_A5E7;
+const GLISSE_S: f32 = 0.28;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Panneau {
-    /// Entré par le bord droit, sur la zone de la file, et pas reparti ailleurs depuis.
+    /// Entré par le bord gauche (v289 ; le droit avant), sur la zone du volet, et pas
+    /// reparti ailleurs depuis.
     armed: bool,
     /// Où le regard coupait le plan de l'écran à l'image d'avant.
     prev: Option<[f32; 2]>,
@@ -1608,7 +1730,7 @@ impl Panneau {
     /// La file doit-elle être ouverte ? (v257) `etendu` : la recherche est ouverte à côté
     /// (demande du joueur) : l'écran entier est à elle, et ni regarder la vidéo ni regarder
     /// ailleurs ne referme rien ; seul s'éloigner (`pres` faux : hors de portée de main) fait
-    /// tout glisser vers la droite, et se rapprocher le rouvre tel quel. Fermer la recherche
+    /// tout glisser vers la gauche, et se rapprocher le rouvre tel quel. Fermer la recherche
     /// remet les règles de la file seule (glisser sur la vidéo la referme).
     fn target(
         &mut self,
@@ -1626,12 +1748,12 @@ impl Panneau {
             return false;
         };
         if !prev.is_some_and(on_screen) {
-            self.armed = prev.is_some_and(|q| q[0] > 1.0) && p[0] >= PANNEAU_U;
+            self.armed = prev.is_some_and(|q| q[0] < 0.0) && p[0] <= PANNEAU_U;
         }
         if !self.armed || cursor.is_none() {
             return false;
         }
-        if p[0] < PANNEAU_U - PANNEAU_MARGE {
+        if p[0] > PANNEAU_U + PANNEAU_MARGE {
             self.armed = false;
             return false;
         }
@@ -1640,9 +1762,9 @@ impl Panneau {
 }
 
 /// (v257) La recherche de YouTube à côté du lecteur d'un écran (demande du joueur) : un
-/// deuxième onglet du navigateur, à elle (`COTE_W` × `PAGE_H`), que le jeu colle dans le
-/// trou que la page du lecteur ouvre entre la vidéo et la file (voir `balise`). Pour soi
-/// seul : rien n'en part aux autres joueurs, sauf les vidéos qu'on y clique (dans la file).
+/// deuxième onglet du navigateur, à elle (`COTE_W` × `PAGE_H`). (v289) Le jeu la colle à
+/// droite du volet, d'où elle sort en glissant (voir `Tab::coller`). Pour soi seul : rien
+/// n'en part aux autres joueurs, sauf les vidéos qu'on y clique (dans la file).
 struct Cote {
     /// Numéro de son onglet dans le navigateur.
     bid: u32,
@@ -1694,70 +1816,112 @@ impl Cote {
     }
 }
 
-/// (v257) Le trou de la recherche dans une image de la page du lecteur : sa première ligne
-/// est magenta et la deuxième cyan (`lecteur.html`). Rend ses colonnes `[x0, x1)`, la plus
-/// longue suite où les deux lignes y sont. Lu dans chaque image, le trou est toujours au
-/// bon endroit, même en plein glissement (la page et le jeu n'ont pas à s'accorder sur le
-/// temps).
-fn balise(px: &[u8], w: usize, h: usize) -> Option<(usize, usize)> {
-    if w == 0 || h < 3 || px.len() < w * h * 4 {
-        return None;
-    }
-    // BGRA.
-    let magenta = |x: usize| {
-        let p = &px[x * 4..x * 4 + 3];
-        p[0] >= 200 && p[1] <= 60 && p[2] >= 200
-    };
-    let cyan = |x: usize| {
-        let p = &px[(w + x) * 4..(w + x) * 4 + 3];
-        p[0] >= 200 && p[1] >= 200 && p[2] <= 60
-    };
-    let mut best: Option<(usize, usize)> = None;
-    let mut x = 0;
-    while x < w {
-        if !(magenta(x) && cyan(x)) {
-            x += 1;
-            continue;
-        }
-        let x0 = x;
-        while x < w && magenta(x) && cyan(x) {
-            x += 1;
-        }
-        if best.is_none_or(|(a, b)| x - x0 > b - a) {
-            best = Some((x0, x));
-        }
-    }
-    best.filter(|(a, b)| b - a >= 2)
+/// (v289) Le volet d'un écran : la page `panneau.html` dans son propre onglet du navigateur
+/// (`VOLET_W` × `PAGE_H`), ouvert la première fois qu'on le fait venir et gardé tant que
+/// la page de l'écran l'est. Le jeu lui dit la file, l'historique et la recherche ouverte
+/// (`__mlb.etat`), elle répond par des ordres (voir `Displays::ordre_volet`).
+struct Volet {
+    /// Numéro de son onglet dans le navigateur.
+    bid: u32,
+    /// Dernière image de son onglet (BGRA) et sa taille ; vide tant qu'il n'y en a pas.
+    page: Vec<u8>,
+    page_size: (u32, u32),
+    /// Onglet ouvert dans le navigateur, et images par seconde demandées.
+    opened: bool,
+    fps_sent: i32,
+    /// Dernier point envoyé au navigateur.
+    sent: Option<(i32, i32)>,
+    /// Sa liste peut défiler sous la souris : vers le haut (1), vers le bas (2).
+    scroll: u8,
+    /// Dernier état donné à la page, et depuis quand (redit chaque seconde tant qu'il est
+    /// visible : la page peut avoir été rechargée).
+    etat: Option<String>,
+    etat_ago: f32,
 }
 
-/// (v257) Colle l'image `src` (`sw` × `sh`) dans les colonnes `[x0, x1)` de `dst` (`w` ×
-/// `h`), son bord gauche contre `x0` (la recherche sort de sous la file en glissant : on en
-/// voit d'abord la gauche). À la même échelle en hauteur ; ce qui dépasse de `src` est
-/// sombre.
-fn incruste(dst: &mut [u8], w: usize, h: usize, x0: usize, x1: usize, src: &[u8], sw: usize, sh: usize) {
-    let x1 = x1.min(w);
-    if x0 >= x1 || sw == 0 || sh == 0 || src.len() < sw * sh * 4 || dst.len() < w * h * 4 {
+impl Volet {
+    fn new(bid: u32) -> Self {
+        Self {
+            bid,
+            page: Vec::new(),
+            page_size: (0, 0),
+            opened: false,
+            fps_sent: 0,
+            sent: None,
+            scroll: 0,
+            etat: None,
+            etat_ago: 0.0,
+        }
+    }
+}
+
+/// (v289) Ce que vise un point de l'écran : la page, la recherche à côté ou le volet.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Cible {
+    #[default]
+    Page,
+    Cote,
+    Volet,
+}
+
+/// (v289) Un glissement de 0 à 1 en douceur (accélère puis ralentit).
+fn doux(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// (v289) Colle l'image `src` (`sw` × `sh`, celle d'un onglet de `PAGE_H` pixels de page de
+/// haut) dans `dst` (`w` × `h`, l'image de la page de l'écran, `PAGE_W` pixels de page de
+/// large) : le bord gauche de `src` à `gauche`, en pixels de page (négatif : sa gauche est
+/// hors de l'écran), et seulement dans les colonnes `[x0, x1)` (pixels de page). Ce qui
+/// dépasse de `src` (ou tout, sans image) est sombre.
+#[allow(clippy::too_many_arguments)]
+fn colle(dst: &mut [u8], w: usize, h: usize, gauche: f32, x0: f32, x1: f32, src: &[u8], sw: usize, sh: usize) {
+    if w == 0 || h == 0 || dst.len() < w * h * 4 {
         return;
     }
     const SOMBRE: [u8; 4] = [15, 15, 15, 255];
+    let k = w as f32 / PAGE_W as f32;
+    let a = ((x0.max(0.0) * k).round() as usize).min(w);
+    let b = ((x1.min(PAGE_W as f32) * k).round() as usize).min(w);
+    if a >= b {
+        return;
+    }
+    let vide = sw == 0 || sh == 0 || src.len() < sw * sh * 4;
+    // Pixels de `src` par pixel de page.
+    let sk = if vide { 1.0 } else { sh as f32 / PAGE_H as f32 };
+    let colonnes: Vec<Option<usize>> = (a..b)
+        .map(|x| {
+            let px = (x as f32 + 0.5) / k - gauche;
+            let sx = (px * sk).floor();
+            (!vide && sx >= 0.0 && (sx as usize) < sw).then_some(sx as usize)
+        })
+        .collect();
+    // Une suite de colonnes qui se suivent (même échelle) : copiée d'un bloc.
+    let suite = colonnes.iter().flatten().count() == colonnes.len()
+        && colonnes.windows(2).all(|c| c[1] == c[0].map(|x| x + 1));
     for y in 0..h {
-        let sy = (y * sh / h).min(sh - 1);
-        let ligne = &mut dst[(y * w + x0) * 4..(y * w + x1) * 4];
-        if sh == h {
-            let n = (x1 - x0).min(sw);
-            ligne[..n * 4].copy_from_slice(&src[sy * sw * 4..(sy * sw + n) * 4]);
-            for p in ligne[n * 4..].chunks_exact_mut(4) {
+        let ligne = &mut dst[(y * w + a) * 4..(y * w + b) * 4];
+        if vide {
+            for p in ligne.chunks_exact_mut(4) {
                 p.copy_from_slice(&SOMBRE);
             }
-        } else {
-            for (i, p) in ligne.chunks_exact_mut(4).enumerate() {
-                let sx = i * sh / h;
-                if sx < sw {
-                    let k = (sy * sw + sx) * 4;
-                    p.copy_from_slice(&src[k..k + 4]);
-                } else {
-                    p.copy_from_slice(&SOMBRE);
+            continue;
+        }
+        let sy = (y * sh / h).min(sh - 1);
+        if suite {
+            let s0 = colonnes[0].unwrap_or(0);
+            let n = colonnes.len();
+            ligne.copy_from_slice(&src[(sy * sw + s0) * 4..(sy * sw + s0 + n) * 4]);
+            continue;
+        }
+        for (p, c) in ligne.chunks_exact_mut(4).zip(&colonnes) {
+            match c {
+                Some(sx) => {
+                    let i = (sy * sw + sx) * 4;
+                    p.copy_from_slice(&src[i..i + 4]);
                 }
+                None => p.copy_from_slice(&SOMBRE),
             }
         }
     }
@@ -1766,58 +1930,6 @@ fn incruste(dst: &mut [u8], w: usize, h: usize, x0: usize, x1: usize, src: &[u8]
 /// Le point est-il sur l'écran ?
 fn on_screen(p: [f32; 2]) -> bool {
     (0.0..=1.0).contains(&p[0]) && (0.0..=1.0).contains(&p[1])
-}
-
-impl Corner {
-    /// L'apparition voulue (0 à 1) des boutons. `ray` : où le regard coupe le plan de
-    /// l'écran, à toute distance (`None` : il ne le coupe pas) ; `cursor` : le réticule sur
-    /// l'écran, seulement à portée de main (`None` sinon).
-    ///
-    /// (v243) L'entrée sur l'écran se juge sur le regard, pas sur la portée : avant, viser
-    /// le coin en marchant vers l'écran faisait « entrer » le réticule là où il arrivait à
-    /// portée de main, dans la bande du bord du haut, et les boutons apparaissaient. Il faut
-    /// maintenant que le regard **franchisse** le bord gauche ou le haut de l'écran.
-    fn target(&mut self, cursor: Option<[f32; 2]>, ray: Option<[f32; 2]>) -> f32 {
-        let prev = std::mem::replace(&mut self.prev, ray);
-        let now_in = ray.is_some_and(on_screen);
-        if !now_in {
-            self.armed = false;
-            self.reached = false;
-            return 0.0;
-        }
-        let Some(p) = ray else { return 0.0 };
-        let d = (0..BOUTONS.len())
-            .map(|b| to_button(p, b))
-            .fold(f32::MAX, f32::min);
-        let r = RAYON;
-        if !prev.is_some_and(on_screen) {
-            // Le regard arrive sur l'écran en franchissant le bord gauche ou le haut, et dans
-            // le coin. Venu de nulle part (dos tourné, écran qui vient d'apparaître), aucun
-            // bord n'a été vu franchi : rien.
-            let par_le_bord = prev.is_some_and(|q| q[0] < 0.0 || q[1] < 0.0);
-            self.armed = par_le_bord && d <= r * COIN;
-            self.reached = false;
-        }
-        if !self.armed {
-            return 0.0;
-        }
-        // Hors de portée de main : rien à montrer (mais l'entrée reste valable).
-        if cursor.is_none() {
-            return 0.0;
-        }
-        if d <= r * ZONE {
-            self.reached = true;
-        } else if self.reached || d > r * COIN {
-            // Sorti de la zone après y être arrivé, ou parti hors du coin en chemin : ils
-            // s'en vont, et il faudra revenir par le bord.
-            self.armed = false;
-            self.reached = false;
-            return 0.0;
-        }
-        // De plus en plus visible en approchant : tout à fait dans la zone. La même pour
-        // tous les boutons.
-        (1.0 - (d - r * ZONE) / (r * (COIN - ZONE))).clamp(0.0, 1.0)
-    }
 }
 
 /// Ce qu'affiche un écran.
@@ -1837,7 +1949,7 @@ struct Tab {
     paused: bool,
     /// Point visé (curseur), s'il y en a un, et dernier point envoyé au navigateur.
     cursor: Option<[f32; 2]>,
-    /// (v243) Où le regard coupe le plan de l'écran, à toute distance (voir `Corner`).
+    /// (v243) Où le regard coupe le plan de l'écran, à toute distance (voir `Panneau`).
     ray: Option<[f32; 2]>,
     /// (v257) L'œil est à portée de main de l'écran (avec une marge pour repartir).
     pres: bool,
@@ -1858,12 +1970,9 @@ struct Tab {
     loading: bool,
     /// La page peut défiler sous le curseur : vers le haut (1), vers le bas (2).
     scroll: u8,
-    /// (v206) Apparition du bouton de recherche, de 0 à 1, et (v207) ce qui la commande :
-    /// une arrivée par le bord, dans le coin en bas à gauche (voir `Corner`).
-    reveal: f32,
-    corner: Corner,
-    /// (v253) La file d'attente du lecteur (bord droit) : voulue ouverte, ce que la page
-    /// dit montrer, dernier ordre envoyé et depuis quand.
+    /// (v253) La file d'attente (v289 : le volet, bord gauche, toutes les pages) : voulue
+    /// ouverte ; sur le lecteur, ce que la page dit montrer (la vidéo décalée), dernier
+    /// ordre envoyé et depuis quand.
     panneau: Panneau,
     panel_open: bool,
     panel_page: Option<(bool, &'static str)>,
@@ -1873,11 +1982,18 @@ struct Tab {
     /// en était quand elle a été fermée (rouverte là).
     cote: Option<Cote>,
     cote_urls: std::collections::HashMap<&'static str, String>,
-    /// (v257) Le trou de la recherche dans l'image affichée : colonnes `[x0, x1)` en pixels
-    /// de page (le curseur y va à la recherche).
-    trou: Option<(i32, i32)>,
-    /// (v257) Le dernier appui est allé à la recherche.
-    appui_cote: bool,
+    /// (v289) Le volet (son onglet), créé la première fois qu'on le fait venir.
+    volet: Option<Volet>,
+    /// (v289) Où en sont les glissements, de 0 à 1 (sans la douceur, voir [`doux`]) : le
+    /// volet (`o`) et la recherche à côté (`s`).
+    o: f32,
+    s: f32,
+    /// (v289) La file d'attente de l'écran (regarder ensemble), et si l'on est en ligne
+    /// (en solo, pas de file : une vidéo cliquée s'ouvre).
+    file: Vec<String>,
+    en_ligne: bool,
+    /// (v257) Où est allé le dernier appui (v289 : la page, la recherche ou le volet).
+    appui: Cible,
     /// (v213) Il y a une page précédente (1), une page suivante (2) : sans elles, les
     /// boutons retour et suivant sont grisés et ne font rien.
     history: u8,
@@ -1921,8 +2037,6 @@ impl Tab {
             blur_in: None,
             loading: false,
             scroll: 0,
-            reveal: 0.0,
-            corner: Corner::default(),
             panneau: Panneau::default(),
             panel_open: false,
             panel_page: None,
@@ -1930,8 +2044,12 @@ impl Tab {
             panel_ago: 0.0,
             cote: None,
             cote_urls: std::collections::HashMap::new(),
-            trou: None,
-            appui_cote: false,
+            volet: None,
+            o: 0.0,
+            s: 0.0,
+            file: Vec::new(),
+            en_ligne: false,
+            appui: Cible::Page,
             history: 0,
             want_awake: true,
             want_fps: FPS_DEFAULT,
@@ -1947,23 +2065,20 @@ impl Tab {
     }
 
     fn update(&mut self, dt: f32) {
-        // (v206) Les boutons apparaissent et disparaissent en fondu ; (v207) seulement
-        // quand on arrive par le bord de l'écran, dans leur coin (voir `Corner`) ; (v211)
-        // chacun le sien, et sur toutes les pages, le lecteur YouTube compris.
-        let vers = self.corner.target(self.cursor, self.ray);
-        // (v253) La file d'attente, sur le lecteur seulement. (v257) Avec la recherche à côté,
-        // tout l'écran la garde ouverte.
+        // (v253) La file d'attente ; (v257) avec la recherche à côté, tout l'écran la garde
+        // ouverte ; (v289) sur toutes les pages, depuis le bord gauche.
         let etendu = self.cote.as_ref().is_some_and(|c| c.voulue);
-        self.panel_open = self.panneau.target(self.cursor, self.ray, etendu, self.pres)
-            && crate::watch::is_player(&self.addr);
+        self.panel_open = self.panneau.target(self.cursor, self.ray, etendu, self.pres);
         self.panel_ago += dt;
-        let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
-        self.reveal = if vers > self.reveal {
-            (self.reveal + pas).min(vers)
-        } else {
-            (self.reveal - pas).max(vers)
-        };
-        // (v243) Les boutons, le curseur et l'onde sont dessinés par le shader : la page
+        // (v289) Le volet et la recherche glissent ; l'image est recollée à chaque pas.
+        let pas = dt / GLISSE_S;
+        let vers = |x: f32, v: bool| if v { (x + pas).min(1.0) } else { (x - pas).max(0.0) };
+        let (o, s) = (vers(self.o, self.panel_open), vers(self.s, etendu));
+        if (o, s) != (self.o, self.s) {
+            (self.o, self.s) = (o, s);
+            self.dirty = true;
+        }
+        // (v243) Le curseur et l'onde sont dessinés par le shader : la page
         // n'est pas redessinée (ni renvoyée à la carte graphique) quand ils bougent.
         if let Some((_, age)) = &mut self.ripple {
             *age += dt;
@@ -1995,10 +2110,8 @@ impl Tab {
             self.size = self.page_size;
             self.pixels.clear();
             self.pixels.extend_from_slice(&self.page);
-            if crate::watch::is_player(&self.addr) {
-                self.incruster();
-            } else {
-                self.trou = None;
+            if !asleep {
+                self.coller();
             }
             if asleep {
                 // En veille : sa dernière image, assombrie.
@@ -2015,65 +2128,67 @@ impl Tab {
         self.version += 1;
     }
 
-    /// (v257) Colle la recherche à côté dans le trou de la page du lecteur, s'il y en a un.
-    /// Sans image d'elle encore, le trou de la page reste (« Chargement… »), sans sa balise.
-    fn incruster(&mut self) {
-        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
-        self.trou = None;
-        let Some((x0, x1)) = balise(&self.pixels, w, h) else {
-            return;
-        };
-        // La balise effacée : les deux premières lignes du trou, et une colonne de chaque
-        // côté (un bord adouci peut en garder un peu), prennent la couleur de la troisième.
-        let efface = |px: &mut [u8], x: usize| {
-            for y in 0..2 {
-                let (a, b) = ((y * w + x) * 4, (2 * w + x) * 4);
-                let c: [u8; 4] = [px[b], px[b + 1], px[b + 2], px[b + 3]];
-                px[a..a + 4].copy_from_slice(&c);
-            }
-        };
-        for x in [x0.checked_sub(1), Some(x1)].into_iter().flatten().filter(|&x| x < w) {
-            efface(&mut self.pixels, x);
-        }
-        match self.cote.as_ref().filter(|c| !c.page.is_empty()) {
-            Some(c) => incruste(
-                &mut self.pixels,
-                w,
-                h,
-                x0,
-                x1,
-                &c.page,
-                c.page_size.0 as usize,
-                c.page_size.1 as usize,
-            ),
-            None => {
-                for x in x0..x1 {
-                    efface(&mut self.pixels, x);
-                }
-            }
-        }
-        let k = PAGE_W as f32 / w as f32;
-        self.trou = Some(((x0 as f32 * k) as i32, (x1 as f32 * k).ceil() as i32));
-    }
-
-    /// (v257) Le point `uv` de l'écran tombe-t-il dans la recherche à côté ? Son point dans
-    /// la page de la recherche.
-    fn point_cote(&self, uv: [f32; 2]) -> Option<(i32, i32)> {
-        let c = self.cote.as_ref()?;
-        let (x0, x1) = self.trou?;
-        let (x, y) = page_point(uv);
-        if x < x0 || x >= x1 {
+    /// (v289) Le bloc du volet et de la recherche, en pixels de page : son bord droit `r`
+    /// (il sort de la gauche jusque-là), sa largeur `b` (le volet, plus la recherche sortie)
+    /// et ce qui est sorti de la recherche. `None` : rentré.
+    fn bloc(&self) -> Option<(f32, f32, f32)> {
+        let o = doux(self.o);
+        if o <= 0.001 {
             return None;
         }
-        let (sw, sh) = if c.page_size.1 > 0 {
-            c.page_size
-        } else {
-            (COTE_W, PAGE_H)
+        let s = if self.cote.is_some() { doux(self.s) } else { 0.0 };
+        let sorti = COTE_W as f32 * s;
+        let b = VOLET_W as f32 + sorti;
+        Some((o * b, b, sorti))
+    }
+
+    /// (v289) Colle le volet sur la gauche de l'image de la page, et la recherche à côté à
+    /// sa droite (elle sort de sous lui en glissant : on en voit d'abord la droite). Sans
+    /// image d'eux encore : sombre.
+    fn coller(&mut self) {
+        let Some((r, b, sorti)) = self.bloc() else { return };
+        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+        if sorti > 0.5 {
+            if let Some(c) = self.cote.as_ref() {
+                let (sw, sh) = (c.page_size.0 as usize, c.page_size.1 as usize);
+                colle(&mut self.pixels, w, h, r - COTE_W as f32, r - sorti, r, &c.page, sw, sh);
+            }
+        }
+        let g = r - b;
+        let (src, sw, sh) = self.volet.as_ref().map_or((&[][..], 0, 0), |v| {
+            (&v.page[..], v.page_size.0 as usize, v.page_size.1 as usize)
+        });
+        colle(&mut self.pixels, w, h, g, g, g + VOLET_W as f32, src, sw, sh);
+    }
+
+    /// (v289) Ce que vise le point `uv` de l'écran (la page, la recherche à côté, le volet),
+    /// et son point dans la page de celui-là.
+    fn cible(&self, uv: [f32; 2]) -> (Cible, (i32, i32)) {
+        let p = page_point(uv);
+        let Some((r, b, sorti)) = self.bloc() else {
+            return (Cible::Page, p);
         };
-        let k = sh as f32 / PAGE_H as f32;
-        let sx = (((x - x0) as f32 * k) as i32).min(sw as i32 - 1);
-        let sy = ((y as f32 * k) as i32).min(sh as i32 - 1);
-        Some((sx, sy))
+        let x = uv[0].clamp(0.0, 1.0) * PAGE_W as f32;
+        // Le point dans un onglet (`larg` pixels de page de large) dont la gauche est à `g`.
+        let dans = |g: f32, larg: u32, taille: (u32, u32)| {
+            let (sw, sh) = if taille.1 > 0 { taille } else { (larg, PAGE_H) };
+            let k = sh as f32 / PAGE_H as f32;
+            let sx = (((x - g) * k) as i32).clamp(0, sw as i32 - 1);
+            let sy = ((p.1 as f32 * k) as i32).clamp(0, sh as i32 - 1);
+            (sx, sy)
+        };
+        let g = r - b;
+        if let Some(v) = self.volet.as_ref() {
+            if x < g + VOLET_W as f32 {
+                return (Cible::Volet, dans(g, VOLET_W, v.page_size));
+            }
+        }
+        if let Some(c) = self.cote.as_ref().filter(|_| sorti > 0.5) {
+            if x >= r - sorti && x < r {
+                return (Cible::Cote, dans(r - COTE_W as f32, COTE_W, c.page_size));
+            }
+        }
+        (Cible::Page, p)
     }
 
     /// Écran en veille sans image : fond sombre et deux barres « pause ».
@@ -2595,223 +2710,6 @@ mod tests {
         assert_eq!(d.regarde, None);
     }
 
-    /// (v206) Les boutons : ronds pour de vrai (les pages sont en 16/9), (v211) **en haut à
-    /// gauche**, (v213) quatre en ligne — loupe, vidéo, retour, suivant — et ils ne mangent
-    /// pas la page.
-    #[test]
-    fn the_buttons_are_round_and_sit_in_the_top_left_corner() {
-        let r = RAYON;
-        for b in [LOUPE, VIDEO, RETOUR, SUIVANT] {
-            let c = BOUTONS[b];
-            assert!(on_button(c, b));
-            // Le bord : à `r` en largeur, à `r * 16/9` en hauteur.
-            assert!(on_button([c[0] + r * 0.95, c[1]], b));
-            assert!(!on_button([c[0] + r * 1.05, c[1]], b));
-            assert!(on_button([c[0], c[1] + r * 16.0 / 9.0 * 0.95], b));
-            assert!(!on_button([c[0], c[1] + r * 16.0 / 9.0 * 1.05], b));
-            // Tient dans l'écran, en haut à gauche.
-            assert!(c[0] - r > 0.0 && c[1] - r * 16.0 / 9.0 > 0.0);
-            assert!(c[1] < 0.5 && c[0] < 0.25);
-            for ailleurs in [[0.5, 0.5], [0.0, 0.5], [0.5, 1.0], [0.03, 0.95], [0.97, 0.05]] {
-                assert!(!on_button(ailleurs, b), "{ailleurs:?}");
-            }
-        }
-        // Chacun à droite du précédent, à la même hauteur, sans se toucher.
-        for b in 1..BOUTONS.len() {
-            let (g, d) = (BOUTONS[b - 1], BOUTONS[b]);
-            assert_eq!(g[1], d[1]);
-            assert!(d[0] - g[0] > 2.0 * r);
-            assert!(!on_button(d, b - 1) && !on_button(g, b));
-        }
-    }
-
-    /// Le réticule glisse de `de` à `vers` en `n` images (une image : 16 ms), puis y reste
-    /// `pause` images.
-    fn glide(t: &mut Tab, de: [f32; 2], vers: [f32; 2], n: usize, pause: usize) {
-        // Partir du bord sans être déjà sur l'écran, c'est arriver de dehors : le regard y
-        // était juste avant.
-        if (de[0] <= 0.0 || de[1] <= 0.0) && !t.ray.is_some_and(on_screen) {
-            t.cursor = None;
-            t.ray = Some([de[0] - 0.02, de[1] - 0.02]);
-            t.update(0.016);
-        }
-        for k in 0..=n {
-            let a = k as f32 / n.max(1) as f32;
-            t.cursor = Some([de[0] + (vers[0] - de[0]) * a, de[1] + (vers[1] - de[1]) * a]);
-            t.ray = t.cursor;
-            t.update(0.016);
-        }
-        for _ in 0..pause {
-            t.update(0.016);
-        }
-    }
-
-    fn leave(t: &mut Tab) {
-        t.cursor = None;
-        t.ray = None;
-        for _ in 0..40 {
-            t.update(0.016);
-        }
-    }
-
-    /// (v207) Les boutons ne se montrent que si l'on arrive sur l'écran **par son bord**,
-    /// près d'eux, et qu'on glisse vers eux — même lentement. (v211) En haut à gauche : par
-    /// le bord gauche ou par le haut. (v212) Tous ensemble, du même fondu.
-    #[test]
-    fn the_buttons_show_up_when_sliding_in_from_the_edge_of_their_corner() {
-        let c = BOUTONS[LOUPE];
-        // Par le bord gauche, lentement (une seconde et demie de glissement).
-        let mut t = Tab::new("x");
-        glide(&mut t, [0.0, 0.20], c, 90, 30);
-        assert!(t.reveal > 0.99, "{}", t.reveal);
-        // Par le haut, vite.
-        let mut t = Tab::new("x");
-        glide(&mut t, [0.10, 0.0], c, 6, 30);
-        assert!(t.reveal > 0.99, "{}", t.reveal);
-        // Au milieu du chemin, ils sont déjà là mais pas tout à fait.
-        let mut t = Tab::new("x");
-        glide(&mut t, [0.0, 0.24], [0.06, 0.18], 20, 40);
-        assert!(t.reveal > 0.05 && t.reveal < 0.95, "{}", t.reveal);
-        // Par le haut, juste au-dessus de chacun des autres boutons.
-        for b in [VIDEO, RETOUR, SUIVANT] {
-            let v = BOUTONS[b];
-            let mut t = Tab::new("x");
-            glide(&mut t, [v[0] + 0.01, 0.0], v, 20, 30);
-            assert_eq!(t.reveal, 1.0, "bouton {b}");
-            // Et en passant de l'un à l'autre, jusqu'à la loupe : ils restent.
-            glide(&mut t, v, BOUTONS[LOUPE], 30, 30);
-            assert_eq!(t.reveal, 1.0, "bouton {b}");
-        }
-    }
-
-    /// (v207) Déjà sur l'écran, monter dans le coin ne les fait pas apparaître ; entrer
-    /// par un bord loin du coin non plus.
-    #[test]
-    fn the_buttons_stay_hidden_when_already_on_the_screen() {
-        for b in [LOUPE, VIDEO, RETOUR, SUIVANT] {
-            let c = BOUTONS[b];
-            let mut t = Tab::new("x");
-            glide(&mut t, [0.5, 0.5], c, 60, 40);
-            assert_eq!(t.reveal, 0.0);
-            // Même en tournant dans le coin.
-            glide(&mut t, c, [0.0, 0.0], 20, 20);
-            glide(&mut t, [0.0, 0.0], c, 20, 20);
-            assert_eq!(t.reveal, 0.0);
-            // Par le bord gauche, mais en bas de l'écran : pas leur coin.
-            let mut t = Tab::new("x");
-            glide(&mut t, [0.0, 0.7], c, 60, 40);
-            assert_eq!(t.reveal, 0.0);
-            // Par le haut, mais à droite : pas leur coin non plus.
-            let mut t = Tab::new("x");
-            glide(&mut t, [0.6, 0.0], c, 60, 40);
-            assert_eq!(t.reveal, 0.0);
-        }
-    }
-
-    /// (v207) Une fois là, ils s'en vont dès qu'on sort de leur zone, et pour les revoir il
-    /// faut ressortir de l'écran et revenir par le bord.
-    #[test]
-    fn the_buttons_fade_away_elsewhere_and_need_a_new_entry() {
-        let c = BOUTONS[LOUPE];
-        let r = RAYON;
-        let mut t = Tab::new("x");
-        glide(&mut t, [0.0, 0.15], c, 30, 30);
-        assert!(t.reveal > 0.99);
-        // Un peu autour du bouton (côté écran) : ils restent.
-        let autour = [c[0], c[1] + r * (ZONE - 0.3) * 16.0 / 9.0];
-        glide(&mut t, c, autour, 10, 20);
-        assert!(t.reveal > 0.99, "{}", t.reveal);
-        // On sort de leur zone, sans quitter l'écran : ils s'en vont en fondu.
-        glide(&mut t, autour, [0.3, 0.4], 10, 0);
-        assert!(t.reveal < 1.0, "{}", t.reveal);
-        for _ in 0..40 {
-            t.update(0.016);
-        }
-        assert_eq!(t.reveal, 0.0);
-        // Revenir dessus sans quitter l'écran : ils ne reviennent pas.
-        glide(&mut t, [0.3, 0.4], c, 30, 30);
-        assert_eq!(t.reveal, 0.0);
-        // Ressortir de l'écran puis revenir par le bord : ils reviennent.
-        leave(&mut t);
-        glide(&mut t, [0.0, 0.15], c, 30, 30);
-        assert!(t.reveal > 0.99, "{}", t.reveal);
-        // Un passage éclair par le bord ne les rend pas cliquables.
-        leave(&mut t);
-        t.ray = Some([-0.02, 0.05]);
-        t.update(0.016);
-        t.cursor = Some([0.0, 0.05]);
-        t.ray = t.cursor;
-        t.update(0.016);
-        t.cursor = Some(c);
-        t.ray = t.cursor;
-        t.update(0.016);
-        assert!(t.reveal < CLIQUABLE, "{}", t.reveal);
-    }
-
-    /// (v243) Marcher vers l'écran en visant ses boutons ne les montre pas : le regard
-    /// était déjà sur l'écran, il n'a franchi aucun bord. Le regard qui franchit le bord
-    /// gauche de loin, puis qu'on approche : ils apparaissent.
-    #[test]
-    fn walking_up_to_the_screen_does_not_show_the_buttons() {
-        let c = BOUTONS[VIDEO];
-        let mut t = Tab::new("x");
-        // De loin (hors de portée de main), le regard sur le coin, puis à portée.
-        t.ray = Some(c);
-        for _ in 0..30 {
-            t.update(0.016);
-        }
-        t.cursor = Some(c);
-        for _ in 0..30 {
-            t.update(0.016);
-        }
-        assert_eq!(t.reveal, 0.0);
-        // Même en bougeant un peu dans le coin, sans franchir de bord.
-        glide(&mut t, c, [0.02, 0.02], 10, 10);
-        assert_eq!(t.reveal, 0.0);
-        // Le regard franchit le bord gauche de loin, puis on s'approche : ils viennent.
-        let mut t = Tab::new("x");
-        t.ray = Some([-0.2, 0.05]);
-        t.update(0.016);
-        t.ray = Some([0.01, 0.05]);
-        t.update(0.016);
-        t.ray = Some(c);
-        t.update(0.016);
-        t.cursor = Some(c);
-        for _ in 0..30 {
-            t.update(0.016);
-        }
-        assert_eq!(t.reveal, 1.0);
-        // Arrivé par la droite, ou par le bas : non.
-        for venu in [[1.2, 0.05], [0.05, 1.2]] {
-            let mut t = Tab::new("x");
-            t.ray = Some(venu);
-            t.update(0.016);
-            glide(&mut t, [0.06, 0.06], c, 10, 30);
-            assert_eq!(t.reveal, 0.0, "{venu:?}");
-        }
-    }
-
-    /// (v211) Sur la page du lecteur YouTube aussi, et le clic va au bon bouton.
-    #[test]
-    fn the_buttons_work_on_the_player_page_and_take_their_own_click() {
-        let mut t = Tab::new(&format!("{}?v=dQw4w9WgXcQ", crate::watch::LECTEUR));
-        let v = BOUTONS[VIDEO];
-        glide(&mut t, [v[0], 0.0], v, 20, 30);
-        assert_eq!(t.reveal, 1.0);
-        let mut d = Displays::new();
-        d.tabs.insert(3, t);
-        for b in [LOUPE, VIDEO, RETOUR, SUIVANT] {
-            assert_eq!(d.button_clicked(3, BOUTONS[b]), Some(b));
-        }
-        // (v213) Sans page précédente ni suivante, retour et suivant sont grisés : le clic
-        // leur revient quand même (il ne part pas à la page), mais ils ne font rien.
-        assert_eq!(d.history_of(3), 0);
-        d.history(3, false);
-        d.history(3, true);
-        // Entre deux ronds, ou ailleurs : à la page.
-        assert_eq!(d.button_clicked(3, [(BOUTONS[LOUPE][0] + v[0]) / 2.0, v[1]]), None);
-        assert_eq!(d.button_clicked(3, [0.5, 0.5]), None);
-    }
     use super::*;
 
     /// Écran sur la face +Z du bloc (0, 1, 0) : regarde vers +Z.
@@ -2941,37 +2839,40 @@ mod tests {
         assert!(!d.tabs[&1].paused && d.tabs[&1].time > t);
     }
 
-    /// (v253) La file d'attente vient en entrant par le bord droit sur sa zone, s'en va en
-    /// regardant la vidéo (il faut revenir par le bord), ou hors de portée (elle revient en
-    /// se rapprochant). S'approcher en la visant déjà ne l'ouvre pas.
+    /// (v253) La file d'attente vient en entrant par le bord (v289 : **gauche**) sur sa
+    /// zone, s'en va en regardant la page (il faut revenir par le bord), ou hors de portée
+    /// (elle revient en se rapprochant). S'approcher en la visant déjà ne l'ouvre pas.
     #[test]
-    fn la_file_vient_du_bord_droit_et_repart() {
+    fn le_volet_vient_du_bord_gauche_et_repart() {
         let mut p = Panneau::default();
-        let z = [0.9, 0.4];
-        // Le regard arrive de la droite.
-        assert!(!p.target(None, Some([1.1, 0.4]), false, true));
+        let z = [0.1, 0.4];
+        // Le regard arrive de la gauche.
+        assert!(!p.target(None, Some([-0.1, 0.4]), false, true));
         assert!(p.target(Some(z), Some(z), false, true));
-        assert!(p.target(Some([0.8, 0.6]), Some([0.8, 0.6]), false, true));
-        // Hors de portée : fermée, mais elle revient en se rapprochant.
+        assert!(p.target(Some([0.2, 0.6]), Some([0.2, 0.6]), false, true));
+        // Hors de portée : fermé, mais il revient en se rapprochant.
         assert!(!p.target(None, Some(z), false, true));
         assert!(p.target(Some(z), Some(z), false, true));
-        // Le regard va sur la vidéo : fermée, et revenir sur la zone ne la rouvre pas.
+        // Le regard va sur la page : fermé, et revenir sur la zone ne le rouvre pas.
         assert!(!p.target(Some([0.5, 0.4]), Some([0.5, 0.4]), false, true));
         assert!(!p.target(Some(z), Some(z), false, true));
-        // Ressortir à droite puis revenir : rouverte.
-        assert!(!p.target(None, Some([1.05, 0.4]), false, true));
+        // Ressortir à gauche puis revenir : rouvert.
+        assert!(!p.target(None, Some([-0.05, 0.4]), false, true));
         assert!(p.target(Some(z), Some(z), false, true));
-        // Regard déjà sur l'écran, ou entrée par le haut : non.
+        // Regard déjà sur l'écran, entrée par le haut, ou par la droite (l'ancien côté) : non.
         let mut p = Panneau::default();
         assert!(!p.target(None, Some(z), false, true));
         assert!(!p.target(Some(z), Some(z), false, true));
         let mut p = Panneau::default();
-        p.target(None, Some([0.9, -0.1]), false, true);
+        p.target(None, Some([0.1, -0.1]), false, true);
         assert!(!p.target(Some(z), Some(z), false, true));
-        // Par le bord droit mais à hauteur de la vidéo (pas dans la zone) : non plus.
         let mut p = Panneau::default();
         p.target(None, Some([1.1, 0.4]), false, true);
-        assert!(!p.target(Some([0.6, 0.4]), Some([0.6, 0.4]), false, true));
+        assert!(!p.target(Some([0.9, 0.4]), Some([0.9, 0.4]), false, true));
+        // Par le bord gauche mais pour aller sur la page (pas dans la zone) : non plus.
+        let mut p = Panneau::default();
+        p.target(None, Some([-0.1, 0.4]), false, true);
+        assert!(!p.target(Some([0.4, 0.4]), Some([0.4, 0.4]), false, true));
     }
 
     /// (v257) Avec la recherche ouverte à côté, regarder la vidéo ou ailleurs ne referme
@@ -2980,13 +2881,13 @@ mod tests {
     #[test]
     fn avec_la_recherche_tout_l_ecran_garde_la_file() {
         let mut p = Panneau::default();
-        let z = [0.9, 0.4];
-        let v = [0.2, 0.5];
-        p.target(None, Some([1.1, 0.4]), false, true);
+        let z = [0.1, 0.4];
+        let v = [0.8, 0.5];
+        p.target(None, Some([-0.1, 0.4]), false, true);
         assert!(p.target(Some(z), Some(z), false, true));
         // La recherche ouverte : la vidéo, ou ailleurs que l'écran, ne referment rien.
-        assert!(p.target(Some(v), Some(v), true, true), "la vidéo, à gauche");
-        assert!(p.target(None, Some([-0.3, 0.5]), true, true), "regard ailleurs");
+        assert!(p.target(Some(v), Some(v), true, true), "la vidéo, à droite");
+        assert!(p.target(None, Some([1.3, 0.5]), true, true), "regard ailleurs");
         assert!(p.target(None, None, true, true), "dos tourné");
         // S'éloigner : tout part ; se rapprocher : tout revient, même sans viser l'écran.
         assert!(!p.target(None, None, true, false), "loin");
@@ -2999,55 +2900,107 @@ mod tests {
         assert!(!p.target(Some(z), Some(z), false, true), "il faut revenir par le bord");
     }
 
-    /// (v257) Le trou de la recherche se lit dans l'image du lecteur (ligne magenta puis
-    /// ligne cyan) et la recherche y est collée par son bord gauche ; la balise disparaît.
-    #[test]
-    fn la_recherche_se_colle_dans_le_trou_de_la_page() {
-        let (w, h) = (40usize, 6usize);
-        let mut px = vec![0u8; w * h * 4];
-        let set = |px: &mut Vec<u8>, x: usize, y: usize, c: [u8; 4]| {
-            px[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&c)
-        };
-        for x in 10..22 {
-            set(&mut px, x, 0, [255, 0, 255, 255]);
-            set(&mut px, x, 1, [255, 255, 0, 255]);
+    /// Le regard entre par le bord gauche et reste sur le volet (`n` images de 16 ms).
+    fn entre_par_la_gauche(t: &mut Tab, n: usize) {
+        t.cursor = None;
+        t.ray = Some([-0.05, 0.4]);
+        t.pres = true;
+        t.update(0.016);
+        for _ in 0..n {
+            t.cursor = Some([0.1, 0.4]);
+            t.ray = t.cursor;
+            t.update(0.016);
         }
-        // Un peu de magenta seul ailleurs (une vidéo) : pas un trou.
-        for x in 30..38 {
-            set(&mut px, x, 0, [255, 0, 255, 255]);
-        }
-        assert_eq!(balise(&px, w, h), Some((10, 22)));
-        let mut t = Tab::new(&crate::watch::watch_url("dQw4w9WgXcQ", 0.0));
-        t.addr = t.url.clone();
-        t.page = px;
-        t.page_size = (w as u32, h as u32);
-        let mut c = Cote::new(9, "yt", RECHERCHE_VIDEO);
-        c.page = vec![7u8; 8 * h * 4];
-        c.page_size = (8, h as u32);
-        t.cote = Some(c);
-        t.draw();
-        let at = |t: &Tab, x: usize, y: usize| t.pixels[(y * w + x) * 4];
-        assert_eq!(at(&t, 10, 0), 7, "la recherche, collée par la gauche");
-        assert_eq!(at(&t, 17, 3), 7);
-        assert_eq!(at(&t, 19, 3), 15, "au-delà de son image : sombre");
-        assert_eq!(at(&t, 9, 3), 0, "la vidéo, à gauche, intacte");
-        assert_eq!(balise(&t.pixels, w, h), None, "plus de balise");
-        let k = PAGE_W as f32 / w as f32;
-        assert_eq!(t.trou, Some(((10.0 * k) as i32, (22.0 * k).ceil() as i32)));
-        // Le curseur dans le trou va à la recherche, à son point à elle.
-        assert!(t.point_cote([0.1, 0.5]).is_none());
-        let q = t.point_cote([12.5 / w as f32, 0.5]).unwrap();
-        assert_eq!(q.0, ((12.5 / w as f32 * PAGE_W as f32) as i32 - (10.0 * k) as i32) * h as i32 / PAGE_H as i32);
-        // Sans image de la recherche : le trou de la page reste, sans sa balise.
-        t.cote.as_mut().unwrap().page.clear();
-        t.draw();
-        assert_eq!(balise(&t.pixels, w, h), None);
-        assert_eq!(at(&t, 12, 0), 0);
     }
 
-    /// (v257) Le bouton de la file ouvre la recherche à côté (un onglet à elle) ; un clic et
-    /// le clavier y vont quand le curseur est dans son trou ; une vidéo cliquée là est un
-    /// ordre de la recherche ; « Fermer la recherche » la fait rentrer puis ferme son onglet.
+    /// (v289) Le volet vient sur **toutes les pages** (pas seulement le lecteur), glisse
+    /// depuis la gauche, et la recherche sort à sa droite ; le jeu colle leurs images sur la
+    /// page, et chaque clic va à qui est dessous.
+    #[test]
+    fn le_volet_glisse_sur_toutes_les_pages_et_prend_son_clic() {
+        let (w, h) = (PAGE_W as usize, PAGE_H as usize);
+        let mut t = Tab::new(HOME_URL);
+        t.page = vec![200u8; w * h * 4];
+        t.page_size = (w as u32, h as u32);
+        t.loading = true;
+        entre_par_la_gauche(&mut t, 4);
+        assert!(t.panel_open, "sur une page qui n'est pas le lecteur");
+        assert!(t.o > 0.0 && t.o < 1.0, "il glisse : {}", t.o);
+        entre_par_la_gauche(&mut t, 30);
+        assert_eq!(t.o, 1.0);
+        let mut v = Volet::new(77);
+        v.page = vec![9u8; VOLET_W as usize * h * 4];
+        v.page_size = (VOLET_W, h as u32);
+        t.volet = Some(v);
+        t.draw();
+        let at = |t: &Tab, x: usize, y: usize| t.pixels[(y * w + x) * 4];
+        assert_eq!(at(&t, 0, 10), 9, "le volet, collé contre le bord gauche");
+        assert_eq!(at(&t, 351, 700), 9);
+        assert_eq!(at(&t, 352, 10), 200, "la page, à sa droite");
+        assert_eq!(t.cible([0.1, 0.5]), (Cible::Volet, (128, 360)));
+        assert_eq!(t.cible([0.5, 0.5]).0, Cible::Page);
+        // La recherche ouverte sort de sous le volet, vers la droite.
+        let mut c = Cote::new(78, "yt", RECHERCHE_VIDEO);
+        c.page = vec![5u8; COTE_W as usize * h * 4];
+        c.page_size = (COTE_W, h as u32);
+        t.cote = Some(c);
+        for _ in 0..30 {
+            t.cursor = Some([0.1, 0.4]);
+            t.ray = t.cursor;
+            t.update(0.016);
+        }
+        assert_eq!(t.s, 1.0);
+        assert_eq!(at(&t, 352, 10), 5, "la recherche, à droite du volet");
+        assert_eq!(at(&t, 815, 10), 5);
+        assert_eq!(at(&t, 816, 10), 200);
+        let x = 400.0 / PAGE_W as f32;
+        assert_eq!(t.cible([x, 0.5]), (Cible::Cote, (48, 360)));
+        // Hors de portée : tout rentre vers la gauche, d'un bloc.
+        t.pres = false;
+        t.cursor = None;
+        for _ in 0..6 {
+            t.update(0.016);
+        }
+        let (r, b, _) = t.bloc().unwrap();
+        assert!(r < b && r > 0.0, "à mi-chemin : {r} / {b}");
+        assert_eq!(at(&t, (r - 1.0) as usize, 10), 5, "la droite de la recherche sort en dernier");
+        assert_eq!(at(&t, r as usize + 2, 10), 200);
+        for _ in 0..30 {
+            t.update(0.016);
+        }
+        assert_eq!(t.o, 0.0);
+        assert!(t.bloc().is_none());
+        assert_eq!(at(&t, 10, 10), 200, "rentré : la page entière");
+        assert_eq!(t.cible([0.1, 0.5]).0, Cible::Page);
+    }
+
+    /// (v289) Le collage suit l'échelle des images (page ou onglet plus petits) et met du
+    /// sombre là où l'onglet n'a pas d'image.
+    #[test]
+    fn le_collage_suit_l_echelle_et_le_sombre_comble() {
+        let (w, h) = (64usize, 36usize);
+        let mut dst = vec![0u8; w * h * 4];
+        // Un onglet de 352 px de page, en image de 176 × 360 (moitié).
+        let src: Vec<u8> = (0..176 * 360).flat_map(|i| [(i % 176) as u8, 0, 0, 255]).collect();
+        colle(&mut dst, w, h, 0.0, 0.0, 352.0, &src, 176, 360);
+        // 352 px de page sur 1280 = 17,6 colonnes de 64.
+        assert_eq!(dst[0], 5, "colonne 0 : 10 px de page, pixel 5 de l'onglet");
+        assert_eq!(dst[(5 * w + 10) * 4], ((10.5 * 20.0) / 2.0) as u8);
+        assert_eq!(dst[(5 * w + 20) * 4 + 3], 0, "au-delà du volet : rien de touché");
+        // Sa gauche hors de l'écran : on en voit la droite.
+        let mut dst = vec![0u8; w * h * 4];
+        colle(&mut dst, w, h, -100.0, 0.0, 252.0, &src, 176, 360);
+        assert_eq!(dst[0], ((0.5 * 20.0 + 100.0) / 2.0) as u8);
+        // Sans image : sombre.
+        let mut dst = vec![0u8; w * h * 4];
+        colle(&mut dst, w, h, 0.0, 0.0, 352.0, &[], 0, 0);
+        assert_eq!(&dst[..4], &[15, 15, 15, 255]);
+    }
+
+    /// (v257) Un bouton de la file ouvre la recherche à côté (un onglet à elle) ; un clic et
+    /// le clavier y vont quand le curseur est dessus ; « Fermer la recherche » la fait
+    /// rentrer puis ferme son onglet. (v289) Le volet prend ses clics, et ses boutons du
+    /// haut (Google, retour, suivant) sont des ordres à lui.
     #[test]
     fn la_recherche_a_cote_s_ouvre_prend_le_clic_et_se_ferme() {
         let mut d = Displays::new();
@@ -3058,22 +3011,33 @@ mod tests {
         d.recherche(1, Some("yt"));
         let bid = d.tabs[&1].cote.as_ref().unwrap().bid;
         assert_ne!(bid, 1);
+        let vbid = d.bid_libre(1, VOLET_BID);
+        assert!(vbid != 1 && vbid != bid);
         let t = d.tabs.get_mut(&1).unwrap();
-        t.trou = Some((464, 928));
+        (t.o, t.s) = (1.0, 1.0);
         t.cote.as_mut().unwrap().opened = true;
-        // Clic dans le trou : à la recherche, qui peut prendre le clavier.
+        let mut v = Volet::new(vbid);
+        v.opened = true;
+        t.volet = Some(v);
+        // Clic sur la recherche (à droite du volet) : à elle, qui peut prendre le clavier.
         d.press(1, [0.5, 0.5]);
         let t = &d.tabs[&1];
-        assert!(t.appui_cote && t.cote.as_ref().unwrap().typing_ok > 0.0 && t.typing_ok == 0.0);
+        assert!(t.appui == Cible::Cote && t.cote.as_ref().unwrap().typing_ok > 0.0 && t.typing_ok == 0.0);
         d.tabs.get_mut(&1).unwrap().cote.as_mut().unwrap().editing = true;
         assert_eq!(d.clavier(1), bid, "le clavier va à la recherche");
         d.key(1, "enter");
         let c = d.tabs[&1].cote.as_ref().unwrap();
         assert!(!c.editing && c.blur_in.is_some());
         assert_eq!(d.clavier(1), 1);
-        // Clic sur la vidéo : à la page.
+        // Clic sur le volet : à lui ; la recherche perd son champ.
+        d.tabs.get_mut(&1).unwrap().cote.as_mut().unwrap().editing = true;
         d.press(1, [0.1, 0.5]);
-        assert!(!d.tabs[&1].appui_cote && d.tabs[&1].typing_ok > 0.0);
+        let t = &d.tabs[&1];
+        assert!(t.appui == Cible::Volet && !t.cote.as_ref().unwrap().editing && t.typing_ok == 0.0);
+        assert_eq!(d.clavier(1), 1);
+        // Clic sur la vidéo (à droite) : à la page.
+        d.press(1, [0.9, 0.5]);
+        assert!(d.tabs[&1].appui == Cible::Page && d.tabs[&1].typing_ok > 0.0);
         assert_eq!(d.clavier(1), 1);
         // Fermée : elle rentre, puis son onglet est fermé ; rouverte là où elle en était.
         d.tabs.get_mut(&1).unwrap().cote.as_mut().unwrap().url = "https://www.youtube.com/results?search_query=x".into();
@@ -3088,9 +3052,41 @@ mod tests {
         assert_eq!(ordre_recherche(r#"{"recherche":"dm"}"#), Some(Some("dm")));
         assert_eq!(ordre_recherche(r#"{"recherche":false}"#), Some(None));
         assert_eq!(ordre_recherche(r#"{"clic":"dQw4w9WgXcQ"}"#), None);
+        assert_eq!(ordre_nav(r#"{"nav":"google"}"#), Some(Nav::Google));
+        assert_eq!(ordre_nav(r#"{"nav":"retour"}"#), Some(Nav::Retour));
+        assert_eq!(ordre_nav(r#"{"nav":"suivant"}"#), Some(Nav::Suivant));
+        assert_eq!(ordre_nav(r#"{"nav":"ailleurs"}"#), None);
+        assert_eq!(ordre_nav(r#"{"retire":0,"v":"dQw4w9WgXcQ"}"#), None);
         assert_eq!(page_panel(r#"{"o":true,"r":true}"#), Some((true, "yt")));
         assert_eq!(page_panel(r#"{"o":true,"r":"vm"}"#), Some((true, "vm")));
         assert_eq!(page_panel(r#"{"o":true}"#), Some((true, "")));
+    }
+
+    /// (v289) Le volet est créé la première fois qu'on le fait venir, et reçoit ce qu'il
+    /// doit montrer : la file (numéros vérifiés), l'historique, la recherche, en ligne.
+    #[test]
+    fn le_volet_se_cree_et_recoit_son_etat() {
+        let mut d = Displays::new();
+        d.tabs.insert(4, Tab::new(HOME_URL));
+        let file = vec!["dQw4w9WgXcQ".to_string(), "<script>".to_string(), "dm:x8abcd".to_string()];
+        d.set_files(true, |id| if id == 4 { &file[..] } else { &[] });
+        d.tabs.get_mut(&4).unwrap().panel_open = true;
+        d.update(0.016);
+        let t = &d.tabs[&4];
+        let v = t.volet.as_ref().expect("volet créé");
+        assert_ne!(v.bid, 4);
+        let mut t = Tab::new(HOME_URL);
+        t.file = file.clone();
+        t.en_ligne = true;
+        t.history = 1;
+        let e: serde_json::Value = serde_json::from_str(&etat_volet(&t)).unwrap();
+        assert_eq!(e["f"], serde_json::json!(["dQw4w9WgXcQ", "dm:x8abcd"]));
+        assert_eq!(e["h"], 1);
+        assert_eq!(e["r"], "");
+        assert_eq!(e["l"], true);
+        t.cote = Some(Cote::new(5, "vm", RECHERCHE_VIDEO));
+        let e: serde_json::Value = serde_json::from_str(&etat_volet(&t)).unwrap();
+        assert_eq!(e["r"], "vm");
     }
 
     /// (v243) Entrée rend le clavier au jeu tout de suite, et le champ perd le focus un

@@ -1214,10 +1214,11 @@ fn ressource(
         // (v210) La page du lecteur, servie sans réseau ; (v284) et la recherche de Vimeo.
         let locale = if filtre::est_lecteur(&url) {
             Some(scripts::LECTEUR_HTML)
-        } else if url.strip_prefix(scripts::RECHERCHE_VIMEO).is_some_and(|r| {
-            r.is_empty() || r.starts_with('?') || r.starts_with('#')
-        }) {
+        } else if scripts::est(&url, scripts::RECHERCHE_VIMEO) {
             Some(scripts::RECHERCHE_VIMEO_HTML)
+        } else if scripts::est(&url, scripts::VOLET) {
+            // (v289) Le volet des écrans.
+            Some(scripts::VOLET_HTML)
         } else {
             None
         };
@@ -1312,6 +1313,7 @@ fn message(id: u32, texte: &str, source: &str, out: &Shared, etat: &Partage) {
             // (v265) Et de Vimeo, de Dailymotion (recherche à côté, clic sur une vidéo) ;
             // (v284) et de Google (la recherche de Vimeo passe par lui).
             let de_confiance = filtre::est_lecteur(source)
+                || scripts::est(source, scripts::VOLET)
                 || filtre::hote(source).is_some_and(|h| {
                     matches!(
                         h.as_str(),

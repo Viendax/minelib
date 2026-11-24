@@ -153,5 +153,18 @@ location.href='https://www.google.com/search?tbm=vid&safe=active&q='+encodeURICo
 /// réseau).
 pub const RECHERCHE_VIMEO: &str = "https://viendax.github.io/minelib/recherche-vimeo";
 
+/// (v289) Le volet des écrans (file d'attente, recherche, Google, retour, suivant), servi
+/// par le navigateur à [`VOLET`] ; le jeu le colle à gauche de toutes les pages.
+pub const VOLET_HTML: &str = include_str!("../../../browser/src/panneau.html");
+
+/// (v289) L'adresse du volet (jamais demandée au réseau).
+pub const VOLET: &str = "https://viendax.github.io/minelib/panneau";
+
+/// (v289) L'adresse est-elle `base`, avec ou sans paramètres ?
+pub fn est(url: &str, base: &str) -> bool {
+    url.strip_prefix(base)
+        .is_some_and(|r| r.is_empty() || r.starts_with('?') || r.starts_with('#'))
+}
+
 /// La page du lecteur des écrans, servie par le navigateur à `filtre::LECTEUR`.
 pub const LECTEUR_HTML: &str = include_str!("../../../browser/src/lecteur.html");

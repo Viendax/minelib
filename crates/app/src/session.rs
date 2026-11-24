@@ -2841,23 +2841,9 @@ impl Session {
                 // En mode FPS, « utiliser » est une lettre : elle va dans le champ de texte.
                 && !(fps && editing)
             {
-                // (v205) Les boutons en haut à gauche : la loupe mène sur Google, (v211) la
-                // vidéo sur la recherche de YouTube ; le reste de l'écran est la page.
-                if let Some(b) = self.displays.button_clicked(ids[i], uv) {
-                    // (v213) Puis le retour et le suivant (pages précédente et suivante).
-                    match b {
-                        crate::screen::VIDEO => {
-                            self.displays.open(ids[i], crate::screen::RECHERCHE_VIDEO);
-                        }
-                        crate::screen::RETOUR => self.displays.history(ids[i], false),
-                        crate::screen::SUIVANT => self.displays.history(ids[i], true),
-                        crate::screen::LOUPE => {
-                            self.displays.open(ids[i], crate::screen::RECHERCHE);
-                        }
-                        _ => {}
-                    }
-                    self.screen_last = Some(ids[i]);
-                } else {
+                // (v289) Plus de boutons en haut à gauche : Google, retour et suivant sont
+                // dans le volet de gauche (un clic comme un autre, voir `Displays::press`).
+                {
                     self.displays.press(ids[i], uv);
                     self.screen_touch = Some(ids[i]);
                 }
@@ -2950,6 +2936,9 @@ impl Session {
     fn watch_together(&mut self, dt: f32) {
         let states = self.displays.take_states();
         let orders = self.displays.take_orders();
+        // (v289) Le volet de chaque écran montre sa file (en ligne seulement).
+        let en_ligne = self.build.is_some();
+        self.displays.set_files(en_ligne, |id| self.party.file(id));
         let Some(b) = &self.build else {
             // (v253) Sans regarder ensemble, une vidéo cliquée s'ouvre, tout simplement.
             for (id, json, cote) in orders {
@@ -11912,12 +11901,9 @@ impl Session {
             .iter()
             .map(|s| {
                 let id = s.0.id();
-                // (v206) L'apparition des boutons voyage avec l'écran.
-                // (v213) En second : les pages où aller (retour 1, suivant 2), pour griser.
-                let reveal = [
-                    self.displays.reveal(id),
-                    f32::from(self.displays.history_of(id)),
-                ];
+                // (v289) Les boutons en haut à gauche sont partis dans le volet : le shader ne
+                // les dessine plus (apparition nulle).
+                let reveal = [0.0, 0.0];
                 // (v243) Le curseur et l'onde d'un appui, dessinés au-dessus des boutons.
                 let (cursor, ripple) = self.displays.marks(id);
                 (

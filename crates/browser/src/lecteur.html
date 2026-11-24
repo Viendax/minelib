@@ -29,6 +29,11 @@
   depuis la droite et la vidéo se réduit à côté (jamais par-dessus). La page dit au jeu ce
   qu'elle montre (`f`, `o`) et quand la vidéo est finie (`e`) : le jeu passe à la suivante.
 
+  (v289) Le volet n'est plus dans cette page : c'est une page à part (`panneau.html`), à
+  gauche de l'écran, sur toutes les pages. Ici, la vidéo se décale seulement vers la droite
+  (`__mlb.panneau(o,r)`), au même rythme que le volet que le jeu colle à sa gauche. Ce qui
+  suit (v253, v257) décrit l'ancienne disposition, à droite.
+
   (v257) La recherche à côté : le bouton de la file le demande au jeu
   (`__minelib_ordre__{"recherche":true}`), qui ouvre la recherche de YouTube dans un
   deuxième onglet et dit `__mlb.panneau(true,true)`. La page sort alors de sous la file un
@@ -49,36 +54,10 @@ body{--o:0;--s:0;transition:--o .28s ease,--s .28s ease}
 body.file{--o:1}
 body.cote{--s:1}
 body.net{transition:none}
-#cadre{position:absolute;top:0;left:0;bottom:0;right:calc(var(--o)*(352px + 464px*var(--s)))}
-#trou{position:absolute;top:0;bottom:0;width:464px;
-  left:calc(100% - var(--o)*(352px + 464px*var(--s)));background:#0f0f0f;color:#aaa;
-  font-size:15px;display:flex;align-items:center;justify-content:center}
-#trou::before,#trou::after{content:'';position:absolute;left:0;right:0;height:1px}
-#trou::before{top:0;background:#f0f}
-#trou::after{top:1px;background:#0ff}
-#file{position:absolute;top:0;bottom:0;width:352px;overflow:hidden;
-  left:calc(100% - var(--o)*(352px + 464px*var(--s)) + 464px*var(--s));
-  box-sizing:border-box;padding:16px 14px;background:#0f0f0f;border-left:1px solid #272727}
-#file h2{margin:2px 4px 12px;font-size:18px;font-weight:600}
-#chercher{margin:0 4px 8px;font-size:13px;color:#aaa}
-#sites{display:flex;gap:6px;margin:0 0 14px}
-#sites button{flex:1;min-width:0;padding:9px 2px;border:1px solid #3f3f3f;border-radius:18px;
-  background:#121212;color:#f1f1f1;font:inherit;font-size:13px;cursor:pointer;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#sites button.actif{background:#f1f1f1;color:#0f0f0f;border-color:#f1f1f1;font-weight:600}
-#sites #ferme{flex:none;width:36px;padding:9px 0;display:none}
-body.cote #sites #ferme{display:block}
+/* (v289) Le volet (file, recherche à côté) sort de la gauche : la vidéo se décale vers la
+   droite et se réduit d'autant ; le jeu colle le volet et la recherche à sa gauche. */
+#cadre{position:absolute;top:0;right:0;bottom:0;left:calc(var(--o)*(352px + 464px*var(--s)))}
 #lecteur{width:100%;height:100%}
-#vide{color:#aaa;font-size:14px;line-height:1.4;margin:4px}
-.v{display:flex;align-items:center;gap:10px;margin-bottom:10px;position:relative}
-.v img{width:120px;height:68px;object-fit:cover;border-radius:6px;flex:none;background:#222}
-.v .n{position:absolute;left:4px;top:3px;font-size:12px;background:rgba(0,0,0,.75);
-  border-radius:4px;padding:0 5px}
-.v .s{position:absolute;left:4px;bottom:3px;font-size:11px;background:rgba(0,0,0,.75);
-  border-radius:4px;padding:0 5px;color:#ddd}
-.v .t{flex:1;font-size:14px;line-height:1.3;max-height:54px;overflow:hidden;color:#f1f1f1}
-.v .x{flex:none;width:30px;height:30px;border-radius:15px;border:0;background:#272727;
-  color:#f1f1f1;font-size:18px;line-height:30px;padding:0;cursor:pointer}
 #cadre iframe{width:100%;height:100%;border:0;display:block}
 #mot{position:absolute;top:0;left:0;right:0;bottom:0;display:none;
   align-items:center;justify-content:center;text-align:center;padding:60px;
@@ -87,12 +66,6 @@ body.cote #sites #ferme{display:block}
 </head>
 <body>
 <div id="cadre"><div id="lecteur"></div></div>
-<div id="trou">Chargement de la recherche…</div>
-<div id="file"><div id="chercher">Chercher une vidéo sur</div>
-<div id="sites"><button data-s="yt">YouTube</button><button data-s="dm">Dailymotion</button><button
-data-s="vm">Vimeo</button><button id="ferme" title="Fermer la recherche">✕</button></div><h2>À suivre</h2>
-<div id="liste"></div><div id="vide">Rien à suivre. Cherche une vidéo et clique dessus : elle se
-mettra ici.</div></div>
 <div id="mot"></div>
 <script>
 (()=>{
@@ -118,46 +91,16 @@ let id=ok(q.get('v'))?q.get('v'):'';
 const debut=Math.max(0,Math.min(360000,parseInt(q.get('t')||'0',10)||0));
 let B=null,pret=false,permis=false,voulu=true,erreur=false,cherche=null;
 let s=-1,dernier=-2,depuis=0,etat='',fini=false;
-// (v253) La file d'attente : numéros, titres et images connus (chargés une fois).
-let file=[];const infos={};
-const info=v=>{if(infos[v])return;const o=infos[v]={titre:'',image:''};const S=site(v);
-  const fin=()=>montre();
-  if(S==='yt'){o.image='https://i.ytimg.com/vi/'+v+'/mqdefault.jpg';
-    fetch('https://www.youtube.com/oembed?format=json&url='+encodeURIComponent('https://www.youtube.com/watch?v='+v))
-    .then(r=>r.ok?r.json():null).then(j=>{if(j&&j.title){o.titre=j.title;fin();}}).catch(()=>{});}
-  else if(S==='vm'){
-    fetch('https://vimeo.com/api/oembed.json?url='+encodeURIComponent('https://vimeo.com/'+v.slice(3)))
-    .then(r=>r.ok?r.json():null).then(j=>{if(j){o.titre=j.title||'';o.image=j.thumbnail_url||'';fin();}}).catch(()=>{});}
-  else{fetch('https://api.dailymotion.com/video/'+v.slice(3)+'?fields=title,thumbnail_360_url')
-    .then(r=>r.ok?r.json():null).then(j=>{if(j){o.titre=j.title||'';o.image=j.thumbnail_360_url||'';fin();}}).catch(()=>{});}};
-const montre=()=>{const l=document.getElementById('liste');l.textContent='';
-  file.forEach((v,i)=>{info(v);const o=infos[v];const d=document.createElement('div');d.className='v';
-    const im=document.createElement('img');if(o.image)im.src=o.image;
-    const n=document.createElement('span');n.className='n';n.textContent=String(i+1);
-    const t=document.createElement('div');t.className='t';t.textContent=o.titre||'…';
-    const x=document.createElement('button');x.className='x';x.textContent='×';x.title='Retirer';
-    x.addEventListener('click',e=>{e.stopPropagation();
-      dit('__minelib_ordre__'+JSON.stringify({retire:i,v:v}));});
-    d.append(im,n,t,x);
-    if(site(v)!=='yt'){const b=document.createElement('span');b.className='s';b.textContent=NOMS[site(v)];d.append(b);}
-    l.append(d);});
-  document.getElementById('vide').style.display=file.length?'none':'block';};
 // (v257) La file (`ouvert`) et la recherche à côté (`cote` : (v265) le site, ou rien), comme
 // le jeu les veut.
 let ouvert=false,cote='';
 const net=r=>r===true?'yt':(typeof r==='string'&&NOMS[r])?r:'';
 const applique=()=>{document.body.classList.toggle('file',ouvert);
-  document.body.classList.toggle('cote',!!cote);
-  document.querySelectorAll('#sites button[data-s]').forEach(b=>b.classList.toggle('actif',b.dataset.s===cote));};
+  document.body.classList.toggle('cote',!!cote);};
 // Rechargée (vidéo suivante) : remise telle quelle, sans glisser.
 try{const m=JSON.parse(sessionStorage.getItem('mlb_panneau')||'null');
   if(Array.isArray(m)){ouvert=!!m[0];cote=net(m[1]);document.body.classList.add('net');applique();
     requestAnimationFrame(()=>requestAnimationFrame(()=>document.body.classList.remove('net')));}}catch(_){}
-// (v265) Un bouton par site : le jeu ouvre la recherche à côté sur ce site (ou la ferme).
-document.querySelectorAll('#sites button[data-s]').forEach(b=>b.addEventListener('click',()=>{
-  dit('__minelib_ordre__'+JSON.stringify({recherche:b.dataset.s}));}));
-document.getElementById('ferme').addEventListener('click',()=>{
-  dit('__minelib_ordre__'+JSON.stringify({recherche:false}));});
 const mot=t=>{document.getElementById('cadre').style.display='none';
   const m=document.getElementById('mot');m.textContent=t;m.style.display='flex';};
 // Commandes du jeu (regarder ensemble, pause de tous les écrans). Lancer la lecture
@@ -169,7 +112,8 @@ window.__mlb={
   playVideo:()=>{voulu=true;if(B&&pret&&permis)B.jouer();},
   pauseVideo:()=>{voulu=false;if(B&&pret)B.arreter();},
   regarde:()=>{if(permis)return;permis=true;if(B&&pret&&voulu)B.jouer();},
-  file:l=>{if(!Array.isArray(l))return;file=l.filter(ok).slice(0,30);montre();},
+  // (v289) La file est dans le volet (page à part) : plus rien à montrer ici.
+  file:()=>{},
   panneau:(o,r)=>{ouvert=!!o;cote=net(r);applique();
     try{sessionStorage.setItem('mlb_panneau',JSON.stringify([ouvert,cote]));}catch(_){}},
 };
@@ -292,7 +236,7 @@ setInterval(()=>{
   if(s!==1||t!==dernier){dernier=t;depuis=now;}
   const fige=s===1&&now-depuis>1200;
   const a=!permis||fige||pub;
-  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i,e:fini,f:file.join(','),o:ouvert,r:cote});
+  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i,e:fini,o:ouvert,r:cote});
   if(st!==etat){etat=st;dit('__minelib_state__'+st);}
 },500);
 })();
