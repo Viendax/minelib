@@ -4448,6 +4448,10 @@ impl GameLoop for Game {
             let mut loading = None;
             let mut hud_off = false;
             if let Some(s) = &mut self.session {
+                // (v273) Tab au tchat : ses amis aussi parmi les pseudos proposés.
+                if s.chat.open && input.pressed(KeyCode::Tab) {
+                    s.chat.known = self.accounts.friends.iter().map(|f| f.0.clone()).collect();
+                }
                 s.update(input, dt, &mut renderer, active);
                 let _ui = minelib_render::perf::scope("interface");
                 loading = s.loading_progress();

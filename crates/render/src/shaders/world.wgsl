@@ -73,6 +73,14 @@ struct Globals {
     // quand elle est à lire, y = son côté (texels), z = marge de profondeur.
     psm_vp: mat4x4<f32>,
     psm_info: vec4<f32>,
+    // (v273) Boîtes exactes des ombres des joueurs : les trois lignes de la matrice monde →
+    // cube unité de chaque boîte (tournée avec son morceau de joueur), comme pour les lumières
+    // dynamiques (`dl_box_shadow`). Avant, le soleil et les torches prenaient la boîte alignée
+    // sur les axes du monde qui la contient : de biais, en marchant ou accroupi, l'ombre était
+    // plus grosse que le joueur et l'écart entre ses jambes bouché.
+    shadow_x: array<vec4<f32>, 64>,
+    shadow_y: array<vec4<f32>, 64>,
+    shadow_z: array<vec4<f32>, 64>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -2105,6 +2113,23 @@ fn psm_shadow(p: vec3<f32>) -> f32 {
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
+/// (v273) Entrée (x) et sortie (y) du rayon `o + t d` dans la boîte exacte n° `k` des ombres
+/// des joueurs : dans le cube unité de son repère (la matrice est affine : même t).
+fn shadow_box_span(k: u32, o: vec3<f32>, d: vec3<f32>) -> vec2<f32> {
+    let o4 = vec4<f32>(o, 1.0);
+    let rx = g.shadow_x[k];
+    let ry = g.shadow_y[k];
+    let rz = g.shadow_z[k];
+    let a = vec3<f32>(dot(rx, o4), dot(ry, o4), dot(rz, o4));
+    let v = vec3<f32>(dot(rx.xyz, d), dot(ry.xyz, d), dot(rz.xyz, d));
+    let inv = 1.0 / select(v, vec3<f32>(1e-6), abs(v) < vec3<f32>(1e-6));
+    let t0 = -a * inv;
+    let t1 = (vec3<f32>(1.0) - a) * inv;
+    let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    return vec2<f32>(near, far);
+}
+
 /// Rayon `o + t d` (0 < t < `tmax`) qui touche une des boîtes des joueurs : 1, sinon 0.
 /// Ne regarde que les boîtes à moins de 24 blocs de `o`.
 fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
@@ -2119,7 +2144,6 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
     if bt < -br || dot(bm, bm) - bt * bt > br * br {
         return 0.0;
     }
-    let inv = 1.0 / select(d, vec3<f32>(1e-6), abs(d) < vec3<f32>(1e-6));
     // (v209) Groupe par groupe (un joueur, en général) : un rayon qui passe loin de la boule
     // d'un groupe ne touche aucune de ses boîtes. Avant, chaque pixel essayait toutes les
     // boîtes (48 avec les bots) dès que le rayon passait dans la boule de toutes.
@@ -2146,11 +2170,9 @@ fn player_shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> f32 {
             if fract(g.shadow_min[k].w) > 0.25 {
                 continue;
             }
-            let t0 = (mn - o) * inv;
-            let t1 = (mx - o) * inv;
-            let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
-            let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
-            if far >= max(near, 0.0) && near < tmax {
+            // (v273) La boîte exacte, tournée avec le morceau de joueur.
+            let s = shadow_box_span(k, o, d);
+            if s.y >= max(s.x, 0.0) && s.x < tmax {
                 return 1.0;
             }
         }
@@ -2202,13 +2224,9 @@ fn torch_shadow(p: vec3<f32>) -> vec4<f32> {
             if d < 0.3 || d > 14.0 {
                 continue;
             }
-            let dir = to_l / d;
-            let inv = 1.0 / select(dir, vec3<f32>(1e-6), abs(dir) < vec3<f32>(1e-6));
-            let t0 = (mn - p) * inv;
-            let t1 = (mx - p) * inv;
-            let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
-            let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
-            if far >= max(near, 0.0) && near < d {
+            // (v273) La boîte exacte, tournée avec le morceau de joueur.
+            let s = shadow_box_span(k, p, to_l / d);
+            if s.y >= max(s.x, 0.0) && s.x < d {
                 if held {
                     c.a = 1.0;
                 } else {

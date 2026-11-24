@@ -56,6 +56,24 @@ pub struct Pose {
     pub bow: f32,
 }
 
+impl Pose {
+    /// (v273) La même pose, les pieds en `feet`.
+    pub fn at(&self, feet: Vec3) -> Pose {
+        Pose {
+            feet,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            walk: self.walk,
+            swing: self.swing,
+            crouch: self.crouch,
+            light: self.light,
+            held: self.held,
+            skin: self.skin.clone(),
+            bow: self.bow,
+        }
+    }
+}
+
 fn srgb(c: u32) -> [f32; 3] {
     [(c >> 16) & 255, (c >> 8) & 255, c & 255].map(|v| (v as f32 / 255.0).powf(2.2))
 }
@@ -1073,35 +1091,15 @@ fn parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], Part)> {
 }
 
 /// Morceaux qui font l'ombre du joueur : jambes, corps, bras, tête, chacun avec sa boîte
-/// exacte (tournée avec lui). Les deux jambes ne font qu'une boîte quand elles sont
-/// parallèles (joueur immobile).
+/// exacte (tournée avec lui). (v273) Une boîte par jambe, même immobile : depuis la v256 les
+/// jambes sont écartées, et la boîte qui prenait les deux quand elles étaient parallèles
+/// bouchait l'écart entre elles dans l'ombre (« entre les deux jambes de mon ombre, l'ombre
+/// des fois se colle alors qu'elle ne devrait pas, devant les projecteurs »).
 pub fn shadow_boxes(pose: &Pose) -> Vec<ShadowBox> {
-    let parts = parts(pose);
-    let mut out: Vec<ShadowBox> = Vec::with_capacity(parts.len());
-    let mut i = 0;
-    while i < parts.len() {
-        let (xf, mn, mx, part) = parts[i];
-        let (mut lo, mut hi) = (Vec3::from(mn), Vec3::from(mx));
-        if part == Part::Leg {
-            if let Some(&(xf2, mn2, mx2, Part::Leg)) = parts.get(i + 1) {
-                // L'autre jambe vue du repère de la première : une simple translation
-                // quand elles sont parallèles.
-                let rel = xf.inverse() * xf2;
-                let parallel = [rel.x_axis, rel.y_axis, rel.z_axis]
-                    .into_iter()
-                    .zip([Vec4::X, Vec4::Y, Vec4::Z])
-                    .all(|(a, b)| a.abs_diff_eq(b, 1e-4));
-                if parallel {
-                    lo = lo.min(rel.transform_point3(Vec3::from(mn2)));
-                    hi = hi.max(rel.transform_point3(Vec3::from(mx2)));
-                    i += 1;
-                }
-            }
-        }
-        out.push(ShadowBox::oriented(xf, lo, hi));
-        i += 1;
-    }
-    out
+    parts(pose)
+        .into_iter()
+        .map(|(xf, mn, mx, _)| ShadowBox::oriented(xf, Vec3::from(mn), Vec3::from(mx)))
+        .collect()
 }
 
 /// Repère de la main droite (pixels → monde) : poing en y = 0, objet devant (−z).
@@ -2298,6 +2296,15 @@ const FIRST_PERSON_BACK_MAX: f32 = 0.3;
 /// corps entre dans l'image : au-dessus, rien n'est construit.
 pub const FIRST_PERSON_PITCH: f32 = -0.15;
 
+/// (v273) Pieds du corps vu de ses propres yeux (`first_person_body`) : reculés de
+/// `FIRST_PERSON_BACK` (plus accroupi). Son ombre y est aussi (« mon ombre au soleil n'est
+/// plus la bonne par rapport à mon joueur ») : sous les pieds qu'on voit, pas 0,15 bloc devant.
+pub fn first_person_feet(pose: &Pose) -> Vec3 {
+    let (ahead, _) = head_place(pose.crouch);
+    let back = (ahead + FIRST_PERSON_BACK).min(FIRST_PERSON_BACK_MAX);
+    pose.feet - Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos()) * back
+}
+
 /// (v267) Le corps du joueur vu de ses propres yeux, à dessiner avec son bras de la première
 /// personne (mêmes sommets, même éclairage : lumière du lieu et lumières dynamiques) : les
 /// jambes, le ventre, la poitrine et le bras gauche du modèle, pixel par pixel de son skin,
@@ -2309,20 +2316,7 @@ pub fn first_person_body(
     flesh: Option<&crate::flesh::Flesh>,
     view_proj: Mat4,
 ) -> Vec<ArmVertex> {
-    let (ahead, _) = head_place(pose.crouch);
-    let back = (ahead + FIRST_PERSON_BACK).min(FIRST_PERSON_BACK_MAX);
-    let seen = Pose {
-        feet: pose.feet - Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos()) * back,
-        yaw: pose.yaw,
-        pitch: pose.pitch,
-        walk: pose.walk,
-        swing: pose.swing,
-        crouch: pose.crouch,
-        light: pose.light,
-        held: pose.held,
-        skin: pose.skin.clone(),
-        bow: pose.bow,
-    };
+    let seen = pose.at(first_person_feet(pose));
     let mut out = Vec::with_capacity(6400);
     let mut quads = Vec::with_capacity(1600);
     for (i, (xf, min, max, part)) in parts(&seen).into_iter().enumerate() {
@@ -3747,8 +3741,9 @@ mod tests {
                 bow: 0.0,
             };
             let boxes = shadow_boxes(&pose);
-            // Immobile : les deux jambes ne font qu'une boîte (v256 : six avec le ventre).
-            assert_eq!(boxes.len(), 6);
+            // (v273) Immobile aussi, une boîte par jambe (elles sont écartées depuis la v256) :
+            // sept avec le ventre.
+            assert_eq!(boxes.len(), 7);
             // Repère du modèle (pixels) → monde ; l'avant est −z.
             let base = Mat4::from_translation(pose.feet)
                 * Mat4::from_rotation_y(-yaw)
@@ -3822,8 +3817,7 @@ mod tests {
             lamp,
             false
         ));
-        // En marchant, les jambes ne sont plus parallèles : une boîte chacune (v256 : sept
-        // avec le ventre).
+        // En marchant aussi, une boîte par jambe (v256 : sept avec le ventre).
         let walking = Pose {
             feet: Vec3::ZERO,
             yaw: 0.3,
@@ -3837,6 +3831,77 @@ mod tests {
             bow: 0.0,
         };
         assert_eq!(shadow_boxes(&walking).len(), 7);
+    }
+
+    /// (v273) « Entre les deux jambes de mon ombre de joueur, l'ombre des fois se colle alors
+    /// qu'elle ne devrait pas, devant les projecteurs » : immobile, les deux jambes (écartées
+    /// depuis la v256) ne faisaient qu'une boîte d'ombre. Un projecteur bas devant le joueur :
+    /// derrière lui, le sol dans l'axe passe la lumière entre ses jambes ; à côté, l'ombre
+    /// d'une jambe.
+    #[test]
+    fn light_passes_between_the_legs_of_a_still_player() {
+        for yaw in [0.0f32, 0.7, 2.4] {
+            let pose = Pose {
+                feet: Vec3::new(-30.0, 70.0, 12.0),
+                yaw,
+                pitch: 0.0,
+                walk: 0.0,
+                swing: 0.0,
+                crouch: 0.0,
+                light: [1.0; 3],
+                held: None,
+                skin: None,
+                bow: 0.0,
+            };
+            let boxes = shadow_boxes(&pose);
+            let base = Mat4::from_translation(pose.feet)
+                * Mat4::from_rotation_y(-yaw)
+                * Mat4::from_scale(Vec3::splat(PX));
+            let at = |x: f32, y: f32, z: f32| base.transform_point3(Vec3::new(x, y, z));
+            // Projecteur devant (−z), bas (5 pixels du modèle), à 70 pixels ; le sol derrière,
+            // à 18 pixels, décollé de 0,02 bloc comme dans le shader.
+            let lamp = at(0.0, 5.0, -70.0);
+            let ground = |x: f32| at(x, 0.0, 18.0) + Vec3::Y * 0.02;
+            assert!(
+                !shadowed_on(&boxes, ground(0.0), lamp, false),
+                "entre les jambes, {yaw}"
+            );
+            assert!(
+                shadowed_on(&boxes, ground(LEG_X), lamp, false),
+                "derrière une jambe, {yaw}"
+            );
+            assert!(
+                shadowed_on(&boxes, ground(-LEG_X), lamp, false),
+                "derrière l'autre, {yaw}"
+            );
+        }
+    }
+
+    /// (v273) À la première personne, le corps est dessiné reculé (`first_person_feet`) : son
+    /// ombre part de là (pas 0,15 bloc devant les pieds qu'on voit).
+    #[test]
+    fn the_first_person_shadow_is_under_the_body_one_sees() {
+        let pose = Pose {
+            feet: Vec3::new(3.0, 64.0, -2.0),
+            yaw: 0.9,
+            pitch: -0.8,
+            walk: 0.0,
+            swing: 0.0,
+            crouch: 0.0,
+            light: [1.0; 3],
+            held: None,
+            skin: None,
+            bow: 0.0,
+        };
+        let seen = first_person_feet(&pose);
+        let forward = Vec3::new(pose.yaw.sin(), 0.0, -pose.yaw.cos());
+        assert!(((pose.feet - seen).dot(forward) - FIRST_PERSON_BACK).abs() < 1e-5);
+        let moved = shadow_boxes(&pose.at(seen));
+        let still = shadow_boxes(&pose);
+        for (a, b) in moved.iter().zip(&still) {
+            let shift = Vec3::from(a.min) - Vec3::from(b.min);
+            assert!((shift - (seen - pose.feet)).length() < 1e-4, "{shift}");
+        }
     }
 }
 

@@ -1260,6 +1260,10 @@ impl Session {
             // Clavier dans la page d'un écran (champ de texte visé) : ni tchat ni commandes.
             let screen_keys = self.keyboard_on_screen();
             let was_open = self.chat.open;
+            // (v273) Tab au tchat : les pseudos des joueurs présents, pris quand il sert.
+            if self.chat.open && input.pressed(KeyCode::Tab) {
+                self.chat.names = self.present_pseudos();
+            }
             let mut sent = self.chat.update(input, dt);
             if !was_open && !self.inventory.open && !screen_keys && !self.light_editor.open {
                 let by_chat = if self.game.mode == GameMode::Fps {
@@ -2151,7 +2155,6 @@ impl Session {
                     can_buy: hud.can_buy,
                     warmup: hud.phase == minelib_net::game::phase::WARMUP,
                 });
-                self.chat.names = n.pseudos();
                 net_locals = locals;
                 for f in &mut self.feed {
                     f.1 += dt;
@@ -5457,6 +5460,22 @@ impl Session {
             return;
         }
         self.chat.say(text, chat::YELLOW);
+    }
+
+    /// (v273) Pseudos des joueurs présents, pour compléter un pseudo avec Tab au tchat : ceux
+    /// de la partie FPS, ceux du monde en ligne, et soi.
+    fn present_pseudos(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(n) = &self.net {
+            out.extend(n.pseudos());
+        }
+        if let Some(b) = &self.build {
+            out.extend(b.others.values().map(|o| o.pseudo.clone()));
+        }
+        if !self.pseudo.is_empty() {
+            out.push(self.pseudo.clone());
+        }
+        out
     }
 
     /// (v201) Pose du joueur qui tient `held`, pour placer la lumière de ce qu'il tient.
@@ -10829,7 +10848,16 @@ impl Session {
         let mut shadows = std::mem::take(&mut scratch.shadows);
         shadows.clear();
         if visible && self.spectating.is_none() {
-            let mut own = crate::player_model::shadow_boxes(&pose);
+            // (v273) « Mon ombre au soleil n'est plus la bonne par rapport à mon joueur » : à la
+            // première personne (hors mode FPS), son corps est dessiné reculé
+            // (`first_person_feet`, v267) ; son ombre l'est aussi, sous les pieds qu'il voit.
+            let mut own = if third == 0 && !free && !fps_mode {
+                crate::player_model::shadow_boxes(
+                    &pose.at(crate::player_model::first_person_feet(&pose)),
+                )
+            } else {
+                crate::player_model::shadow_boxes(&pose)
+            };
             // (v201) Sa lampe torche n'a pas l'ombre de son bras ni de sa tête. (v202) Sa
             // torche tenue, seulement pas celle du morceau tout contre la flamme (sa main).
             // (v237) La Foudre de Zeus : « l'ombre de mon bras qui tient l'éclair ne doit pas
@@ -10916,9 +10944,10 @@ impl Session {
                 let inst = crate::player_model::instance(&other, layer, &prev);
                 // (v217) Jusqu'à la distance réglée ; au-delà des boîtes exactes, dans la
                 // carte du soleil (à 10 contre 10, les derniers n'avaient pas d'ombre).
+                // (v273) Dans l'atlas des joueurs (lumières dynamiques) seulement s'il n'a pas
+                // ses boîtes exactes (voir plus bas, quand elles ne tiennent plus).
                 if v.pos.distance_squared(cam) <= shadow_d2 {
                     shadows.push((v.pos, crate::player_model::shadow_boxes(&other), Some(inst)));
-                    light_casters.push(inst);
                 }
                 if inside == Some(v.pseudo.as_str()) {
                     continue;
@@ -11156,13 +11185,16 @@ impl Session {
                     let inst = crate::player_model::instance(&other, layer, &prev);
                     // (v217) Candidat aux boîtes exactes, sinon dans la carte du soleil,
                     // jusqu'à la distance réglée.
+                    // (v273) L'atlas des joueurs (lumières dynamiques) aussi, seulement sans
+                    // boîtes exactes : un joueur dans les deux avait l'ombre de l'atlas (moins
+                    // fine) par-dessus la sienne, l'écart entre ses jambes bouché.
                     if d2 <= shadow_d2 {
                         if shadow {
                             shadows.push((o.pos, boxes_of(&other), Some(inst)));
                         } else {
                             sun_casters.push(inst);
+                            light_casters.push(inst);
                         }
-                        light_casters.push(inst);
                     }
                     players.push(inst);
                 } else {
@@ -11217,6 +11249,9 @@ impl Session {
                 shadow_boxes.extend_from_slice(boxes);
             } else if let Some(i) = inst {
                 sun_casters.push(*i);
+                // (v273) Ses boîtes ne tiennent plus : l'atlas des joueurs pour les lumières
+                // dynamiques (avant, tous y étaient, boîtes exactes ou non).
+                light_casters.push(*i);
             }
         }
         // Morceau de joueur que des blocs cachent du soleil : pas d'ombre du soleil (on ne
@@ -11397,8 +11432,10 @@ impl Session {
             && self.player.pitch < crate::player_model::FIRST_PERSON_PITCH
         {
             let wounds = self.wounds.get("").map_or(&[][..], Vec::as_slice);
+            // (v273) Pieds remontés comme la caméra et le bras sur une marche (`step_offset`) :
+            // le corps ne saute plus dans l'image quand la caméra monte la marche en douceur.
             arm.extend(crate::player_model::first_person_body(
-                &pose,
+                &pose.at(pose.feet + Vec3::Y * self.step_offset),
                 wounds,
                 self.flesh.get(""),
                 world_proj * view,

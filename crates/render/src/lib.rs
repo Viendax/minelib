@@ -273,6 +273,12 @@ struct Globals {
     /// x = 1 quand elle est à lire, y = son côté (texels), z = marge de profondeur.
     psm_vp: [[f32; 4]; 4],
     psm_info: [f32; 4],
+    /// (v273) Boîtes exactes des ombres des joueurs (tournées avec chaque morceau) : les
+    /// trois lignes de la matrice monde → cube unité de chaque boîte (`ShadowBox::to_unit`),
+    /// pour l'ombre au soleil et aux torches comme pour les lumières dynamiques.
+    shadow_x: [[f32; 4]; MAX_SHADOW_BOXES],
+    shadow_y: [[f32; 4]; MAX_SHADOW_BOXES],
+    shadow_z: [[f32; 4]; MAX_SHADOW_BOXES],
 }
 
 /// Rayon de la caméra qui passe par le point `ndc` de l'écran, à l'échelle d'une unité de
@@ -408,6 +414,8 @@ struct ShadowGlobals {
     max: [[f32; 4]; MAX_SHADOW_BOXES],
     groups: [[f32; 4]; MAX_SHADOW_GROUPS],
     spans: [[u32; 4]; MAX_SHADOW_GROUPS],
+    /// (v273) Lignes de `ShadowBox::to_unit` de chaque boîte (x, y, z).
+    rows: [[[f32; 4]; MAX_SHADOW_BOXES]; 3],
 }
 
 /// (v209) Groupes de boîtes voisines qui se suivent (les morceaux d'un même joueur se
@@ -463,7 +471,11 @@ fn shadow_globals(
     let n = boxes.len().min(MAX_SHADOW_BOXES);
     let mut mn = [[0.0; 4]; MAX_SHADOW_BOXES];
     let mut mx = [[0.0; 4]; MAX_SHADOW_BOXES];
+    let mut rows = [[[0.0; 4]; MAX_SHADOW_BOXES]; 3];
     for (i, b) in boxes.iter().take(n).enumerate() {
+        for (r, row) in rows.iter_mut().zip(b.to_unit) {
+            r[i] = row;
+        }
         let (a, bb) = (b.min, b.max);
         // Source de lumière la plus proche (à moins de 10 blocs) : la seule dont ce
         // morceau de joueur projette l'ombre (−1 : aucune, −2 : la torche tenue en main).
@@ -507,6 +519,7 @@ fn shadow_globals(
         max: mx,
         groups,
         spans,
+        rows,
     }
 }
 
@@ -3416,6 +3429,9 @@ impl Renderer {
             shadow_spans: sg.spans,
             psm_vp: [[0.0; 4]; 4],
             psm_info: [0.0; 4],
+            shadow_x: sg.rows[0],
+            shadow_y: sg.rows[1],
+            shadow_z: sg.rows[2],
         };
         let mut globals = globals;
 
@@ -3673,6 +3689,9 @@ impl Renderer {
             shadow_spans: sg.spans,
             psm_vp: [[0.0; 4]; 4],
             psm_info: [0.0; 4],
+            shadow_x: sg.rows[0],
+            shadow_y: sg.rows[1],
+            shadow_z: sg.rows[2],
         };
         self.overlay
             .prepare(&self.device, &self.queue, p.overlay, p.ui, size);

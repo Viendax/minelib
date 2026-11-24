@@ -109,10 +109,13 @@ pub struct Chat {
     history: Vec<String>,
     history_pos: Option<usize>,
     time: f32,
-    /// Pseudos pour compléter le dernier mot avec Tab (joueurs de la partie).
+    /// Pseudos pour compléter un mot avec Tab : (v273) les joueurs présents (partie FPS,
+    /// monde en ligne, soi), remis par la session quand Tab est pressé.
     pub names: Vec<String>,
-    /// Complétion en cours : (début tapé, rang de la proposition).
-    completing: Option<(String, usize)>,
+    /// (v273) Et ses amis (remis par le jeu), même absents : `/ami retirer`, messages.
+    pub known: Vec<String>,
+    /// Complétion en cours (v271 : avec la liste des propositions).
+    completing: Option<Completion>,
     /// Position du curseur dans la saisie (en caractères), et touche tenue qui se répète
     /// (gauche, droite, effacer) avec son temps.
     cursor: usize,
@@ -151,6 +154,7 @@ impl Default for Chat {
             history_pos: None,
             time: 0.0,
             names: Vec::new(),
+            known: Vec::new(),
             completing: None,
             cursor: 0,
             repeat: None,
@@ -163,6 +167,28 @@ impl Default for Chat {
         }
     }
 }
+
+/// (v273) « Tab pour compléter un pseudo qui a commencé d'être écrit dans le tchat ; si
+/// plusieurs propositions, une liste apparaît ; retab plusieurs fois pour descendre le
+/// surlignage dans la liste au pseudo suivant » (« la liste revient au début à la fin » ;
+/// « tchat et commandes où on doit indiquer un pseudo ») : le mot complété, les propositions
+/// et celle qui est dans la saisie.
+struct Completion {
+    /// Début du pseudo dans la saisie (caractères ; après un `@` tapé devant lui).
+    start: usize,
+    /// Sa longueur (caractères) : un pseudo peut avoir des espaces (« BOT Albert »).
+    len: usize,
+    /// Pseudos qui commencent par ce qui était tapé, dans l'ordre de la liste.
+    found: Vec<String>,
+    /// Celui qui est dans la saisie (surligné dans la liste).
+    rank: usize,
+    /// La saisie telle que la complétion l'a laissée : changée depuis (lettre tapée,
+    /// effacée), Tab repart du mot tapé.
+    input: String,
+}
+
+/// (v273) Au plus autant de propositions montrées à la fois (la liste suit le surlignage).
+const COMPLETION_SHOWN: usize = 8;
 
 /// (v236) Ordre de lecture de deux places dans les messages (de haut en bas, puis de gauche
 /// à droite).
@@ -250,6 +276,7 @@ impl Chat {
     pub fn close(&mut self) {
         self.open = false;
         self.input.clear();
+        self.completing = None;
         self.cursor = 0;
         self.history_pos = None;
         self.scroll = 0;
@@ -381,29 +408,134 @@ impl Chat {
         None
     }
 
-    /// Tab : complète le dernier mot avec un pseudo ; Tab encore, le suivant.
-    fn complete(&mut self) {
-        let start = self.input.rfind(' ').map_or(0, |i| i + 1);
-        let (typed, rank) = match &self.completing {
-            Some((t, r)) => (t.clone(), r + 1),
-            None => (self.input[start..].trim_start_matches('/').to_string(), 0),
-        };
-        let low = typed.to_lowercase();
-        let mut found: Vec<&String> = self
-            .names
-            .iter()
-            .filter(|n| n.to_lowercase().starts_with(&low))
-            .collect();
-        found.sort();
-        found.dedup();
-        if found.is_empty() || start == 0 {
+    /// Tab : complète le pseudo commencé sous le curseur, dans un message ou un argument de
+    /// commande (pas le nom de la commande). (v273) S'il y en a plusieurs, leur liste apparaît
+    /// au-dessus de la saisie ; chaque Tab met le suivant dans la saisie et descend le
+    /// surlignage (`back`, Maj+Tab : le précédent), et la liste revient au début à la fin.
+    fn complete(&mut self, back: bool) {
+        if let Some(c) = &mut self.completing {
+            if c.input == self.input {
+                let n = c.found.len();
+                if n < 2 {
+                    return;
+                }
+                c.rank = if back { (c.rank + n - 1) % n } else { (c.rank + 1) % n };
+                let (start, len, pick) = (c.start, c.len, c.found[c.rank].clone());
+                self.replace_span(start, start + len, &pick);
+                if let Some(c) = &mut self.completing {
+                    c.len = pick.chars().count();
+                    c.input = self.input.clone();
+                }
+                return;
+            }
+        }
+        self.completing = None;
+        let chars: Vec<char> = self.input.chars().collect();
+        let cur = self.cursor.min(chars.len());
+        let command = chars.first() == Some(&'/');
+        let mut word = cur;
+        while word > 0 && chars[word - 1] != ' ' {
+            word -= 1;
+        }
+        // Le nom d'une commande n'est pas un pseudo.
+        if command && word == 0 {
             return;
         }
-        let pick = found[rank % found.len()].clone();
-        self.input.truncate(start);
-        self.input.push_str(&pick);
-        self.cursor = self.input.chars().count();
-        self.completing = Some((typed, rank));
+        let mut end = cur;
+        while end < chars.len() && chars[end] != ' ' {
+            end += 1;
+        }
+        // Les pseudos (une fois chacun, quelle que soit la casse), en minuscules à côté.
+        let mut names: Vec<(String, &String)> = Vec::new();
+        for n in self.names.iter().chain(&self.known) {
+            let low = n.to_lowercase();
+            if !n.is_empty() && !names.iter().any(|(l, _)| *l == low) {
+                names.push((low, n));
+            }
+        }
+        // Débuts possibles : le mot sous le curseur, et jusqu'à deux mots avant (un pseudo peut
+        // avoir des espaces : « BOT A » complète « BOT Albert »), jamais dans le nom d'une
+        // commande ; le plus long qui commence un pseudo.
+        let mut starts = vec![word];
+        while starts.len() < 3 {
+            let s = *starts.last().unwrap_or(&0);
+            if s == 0 {
+                break;
+            }
+            let mut p = s - 1;
+            while p > 0 && chars[p - 1] != ' ' {
+                p -= 1;
+            }
+            if command && p == 0 {
+                break;
+            }
+            starts.push(p);
+        }
+        let skip_at = |s: usize| if chars.get(s) == Some(&'@') && s < cur { s + 1 } else { s };
+        let typed_at = |s: usize| chars[s..cur].iter().collect::<String>().to_lowercase();
+        let mut pick: Option<(usize, Vec<String>)> = None;
+        for &s in starts.iter().rev() {
+            let s = skip_at(s);
+            let typed = typed_at(s);
+            let found: Vec<String> = names
+                .iter()
+                .filter(|(l, _)| l.starts_with(&typed))
+                .map(|(_, n)| (*n).clone())
+                .collect();
+            if !found.is_empty() {
+                pick = Some((s, found));
+                break;
+            }
+        }
+        // Sinon, un des mots du pseudo commence par ce qui est tapé (« alb » : « BOT Albert »).
+        if pick.is_none() {
+            let s = skip_at(word);
+            let typed = typed_at(s);
+            let found: Vec<String> = names
+                .iter()
+                .filter(|(l, _)| l.split(' ').any(|w| w.starts_with(&typed)))
+                .map(|(_, n)| (*n).clone())
+                .collect();
+            if !found.is_empty() {
+                pick = Some((s, found));
+            }
+        }
+        let Some((start, mut found)) = pick else {
+            return;
+        };
+        found.sort_by_key(|n| n.to_lowercase());
+        let first = found[0].clone();
+        self.replace_span(start, end, &first);
+        self.completing = Some(Completion {
+            start,
+            len: first.chars().count(),
+            found,
+            rank: 0,
+            input: self.input.clone(),
+        });
+    }
+
+    /// (v273) Remplace les caractères `start..end` de la saisie par `word` ; le curseur se met
+    /// après.
+    fn replace_span(&mut self, start: usize, end: usize, word: &str) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let start = start.min(chars.len());
+        let end = end.clamp(start, chars.len());
+        let mut out: String = chars[..start].iter().collect();
+        out.push_str(word);
+        out.extend(&chars[end..]);
+        self.input = out;
+        self.cursor = start + word.chars().count();
+        self.anchor = None;
+    }
+
+    /// (v273) La liste des propositions de Tab, quand il y en a plusieurs : (pseudos, rang du
+    /// surligné, début du mot complété en caractères).
+    fn completion_list(&self) -> Option<(&[String], usize, usize)> {
+        self.completing
+            .as_ref()
+            .filter(|c| c.found.len() > 1 && c.input == self.input)
+            .map(|c| (c.found.as_slice(), c.rank, c.start))
     }
 
     fn send(&mut self) -> Option<String> {
@@ -615,7 +747,7 @@ impl Chat {
             self.input.remove(at);
         }
         if input.pressed(KeyCode::Tab) {
-            self.complete();
+            self.complete(shift);
         } else if !input.text.is_empty() || back || del {
             self.completing = None;
         }
@@ -867,6 +999,39 @@ impl Chat {
                 let cx = x + 2.0 * s + width(start, cur);
                 ui.rect(cx, y + 1.0 * s, s.max(1.0), line_h, WHITE);
             }
+            // (v273) Propositions de Tab (plusieurs pseudos) : au-dessus de la saisie, à
+            // l'aplomb du mot complété ; celle qui est dans la saisie est surlignée.
+            if let Some((found, rank, at)) = self.completion_list() {
+                let n = found.len();
+                let shown = n.min(COMPLETION_SHOWN);
+                let first = (rank + 1).saturating_sub(shown).min(n - shown);
+                let w = found
+                    .iter()
+                    .map(|f| Ui::text_width(f, s))
+                    .fold(0.0f32, f32::max)
+                    + 6.0 * s;
+                let wx = x + 2.0 * s + width(start, at.clamp(start, end)) - 3.0 * s;
+                let lx = wx.clamp(x, (size.0 - w - 6.0 * s).max(x));
+                let top = y - 2.0 * s - shown as f32 * line_h;
+                let h = shown as f32 * line_h + 2.0 * s;
+                ui.rect(lx, top - s, w, h, [0.02, 0.02, 0.05, 0.92]);
+                for (k, name) in found.iter().enumerate().skip(first).take(shown) {
+                    let ry = top + (k - first) as f32 * line_h;
+                    let lit = k == rank;
+                    if lit {
+                        ui.rect(lx, ry - s * 0.5, w, line_h, [0.45, 0.6, 1.0, 0.55]);
+                    }
+                    let color = if lit { YELLOW } else { WHITE };
+                    ui.text(lx + 3.0 * s, ry + s, s, color, name.clone());
+                }
+                // Ascenseur : où l'on est dans la liste.
+                if n > shown {
+                    let bar = (h * shown as f32 / n as f32).max(4.0 * s);
+                    let by = top - s + (h - bar) * first as f32 / (n - shown) as f32;
+                    ui.rect(lx + w, top - s, 2.0 * s, h, [1.0, 1.0, 1.0, 0.12]);
+                    ui.rect(lx + w, by, 2.0 * s, bar, [1.0, 1.0, 1.0, 0.6]);
+                }
+            }
             // (v236) « Copié » un instant, au bout de la saisie.
             if self.copied_at.is_some_and(|t| self.time - t < 1.2) {
                 let label = "Copié";
@@ -1063,17 +1228,108 @@ mod cursor_tests {
 mod completion_tests {
     use super::*;
 
+    fn typing(input: &str, names: &[&str]) -> Chat {
+        Chat {
+            open: true,
+            names: names.iter().map(|n| n.to_string()).collect(),
+            input: input.into(),
+            cursor: input.chars().count(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn tab_completes_the_last_word_with_a_pseudo() {
-        let mut c = Chat {
-            names: vec!["Viendax".into(), "Victor".into(), "Bob".into()],
-            input: "/report vi".into(),
-            ..Default::default()
-        };
-        c.complete();
+        let mut c = typing("/report vi", &["Viendax", "Victor", "Bob"]);
+        c.complete(false);
         assert_eq!(c.input, "/report Victor");
-        c.complete();
+        c.complete(false);
         assert_eq!(c.input, "/report Viendax", "Tab encore : le suivant");
+    }
+
+    /// (v273) « Si plusieurs propositions, une liste apparaît ; retab pour descendre le
+    /// surlignage au pseudo suivant ; la liste revient au début à la fin. »
+    #[test]
+    fn tab_shows_the_list_and_goes_down_it_then_back_to_the_top() {
+        let mut c = typing("salut l", &["lside", "Lucie", "Leo", "Bob"]);
+        assert!(c.completion_list().is_none());
+        c.complete(false);
+        let (found, rank, at) = c.completion_list().expect("une liste");
+        assert_eq!(found, ["Leo", "lside", "Lucie"].map(String::from));
+        assert_eq!((rank, at), (0, 6));
+        assert_eq!(c.input, "salut Leo");
+        c.complete(false);
+        assert_eq!(c.input, "salut lside");
+        assert_eq!(c.completion_list().unwrap().1, 1);
+        c.complete(false);
+        assert_eq!(c.input, "salut Lucie");
+        c.complete(false);
+        assert_eq!(c.input, "salut Leo", "revenue au début");
+        assert_eq!(c.completion_list().unwrap().1, 0);
+        // Maj+Tab : en remontant (et du début, à la fin).
+        c.complete(true);
+        assert_eq!(c.input, "salut Lucie");
+        // Une lettre tapée : la liste disparaît, Tab repart de ce qui est tapé.
+        c.input.push('!');
+        assert!(c.completion_list().is_none());
+    }
+
+    /// (v273) Dans un message, le premier mot aussi ; un seul pseudo : pas de liste ; le nom
+    /// d'une commande n'est jamais complété ; ses amis aussi, sans doublon ; `@` gardé ; le
+    /// mot sous le curseur, la suite de la saisie gardée.
+    #[test]
+    fn tab_completes_pseudos_in_messages_and_command_arguments() {
+        let mut c = typing("vie", &["Viendax", "Bob"]);
+        c.complete(false);
+        assert_eq!(c.input, "Viendax");
+        assert!(c.completion_list().is_none(), "un seul : pas de liste");
+        let mut c = typing("/vi", &["Viendax"]);
+        c.complete(false);
+        assert_eq!(c.input, "/vi", "nom de commande");
+        let mut c = typing("/ami retirer ls", &["Bob"]);
+        c.known = vec!["lside".into(), "Bob".into()];
+        c.complete(false);
+        assert_eq!(c.input, "/ami retirer lside");
+        let mut c = typing("merci @b", &["Bob", "bob"]);
+        c.complete(false);
+        assert_eq!(c.input, "merci @Bob");
+        assert!(c.completion_list().is_none(), "Bob et bob : le même");
+        let mut c = typing("/tp vi Bob", &["Viendax", "Bob"]);
+        c.cursor = 6;
+        c.complete(false);
+        assert_eq!(c.input, "/tp Viendax Bob");
+        assert_eq!(c.cursor, 11);
+        let mut c = typing("/tp ", &["Viendax", "Bob"]);
+        c.complete(false);
+        assert_eq!(c.input, "/tp Bob", "rien de tapé : tous");
+        assert_eq!(c.completion_list().unwrap().0.len(), 2);
+    }
+
+    /// (v273) Les pseudos des bots ont une espace (« BOT Albert ») : Tab passe d'un pseudo
+    /// entier à l'autre (avant : seul « BOT » était remplacé, « Albert » restait derrière) ;
+    /// « BOT A » et « alb » complètent aussi.
+    #[test]
+    fn tab_handles_pseudos_with_a_space() {
+        let bots = ["BOT Albert", "BOT Bérénice", "Fox"];
+        let mut c = typing("/report ", &bots);
+        c.complete(false);
+        assert_eq!(c.input, "/report BOT Albert");
+        c.complete(false);
+        assert_eq!(c.input, "/report BOT Bérénice");
+        c.complete(false);
+        assert_eq!(c.input, "/report Fox");
+        c.complete(false);
+        assert_eq!(c.input, "/report BOT Albert");
+        let mut c = typing("/report BOT B", &bots);
+        c.complete(false);
+        assert_eq!(c.input, "/report BOT Bérénice");
+        let mut c = typing("gg alb", &bots);
+        c.complete(false);
+        assert_eq!(c.input, "gg BOT Albert");
+        let mut c = typing("/report bot", &bots);
+        c.complete(false);
+        assert_eq!(c.input, "/report BOT Albert", "« bot » : les deux bots");
+        assert_eq!(c.completion_list().unwrap().0.len(), 2);
     }
 }
 
