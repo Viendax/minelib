@@ -451,8 +451,20 @@ const _: () = assert!(
 /// autour des hanches) et tassement des hanches (pixels).
 fn crouch_lean(crouch: f32) -> (f32, f32) {
     let c = crouch.clamp(0.0, 1.0);
-    (0.45 * c, 0.3 / PX * c * 0.6)
+    (CROUCH_LEAN * c, CROUCH_HIP_DROP * c)
 }
+
+/// Penche du haut du corps accroupi (radians). La même dans `part_matrix` (players.wgsl).
+pub const CROUCH_LEAN: f32 = 0.45;
+
+/// (v247) Tassement des hanches accroupi (pixels). « Mon crâne dépasse dans les blocs du
+/// dessus quand je passe accroupi sous 1,5 bloc ; mon corps ne descend pas assez » : avant,
+/// 3,2 (0,18 bloc), le haut de la tête arrivait à 1,55 bloc (1,58 la tête levée ou baissée),
+/// au-dessus de la boîte accroupie (1,5). Maintenant 4,85 : la tête accroupie, quel que soit le
+/// regard, reste sous 1,49 bloc, et son milieu à la hauteur des yeux (1,32). Debout, elle
+/// arrive à 1,8 (1,83 aux coins la tête penchée : rien ne passe sous 1,8 bloc debout). La même
+/// dans `part_matrix` (players.wgsl).
+pub const CROUCH_HIP_DROP: f32 = 4.85;
 
 /// (v234) Cou (le milieu du haut du corps, sous la tête), dans le repère des pieds (pixels ;
 /// −z : devant). « Quand je me penche en avant, ma tête doit rester au milieu de mon cou » :
@@ -1779,8 +1791,8 @@ mod tests {
             * Mat4::from_scale(Vec3::splat(px));
         let swing = p.walk.sin() * 0.75 * p.swing;
         let crouch = p.crouch.clamp(0.0, 1.0);
-        let lean = 0.45 * crouch;
-        let drop = 0.3 / px * crouch * 0.6;
+        let lean = CROUCH_LEAN * crouch;
+        let drop = CROUCH_HIP_DROP * crouch;
         let pitch = p.pitch.clamp(-1.4, 1.4);
         let shrink = Mat4::from_scale(Vec3::new(1.0, (LEG - drop) / LEG, 1.0));
         if part == 0 {
@@ -2016,6 +2028,49 @@ mod tests {
             let (a, b) = (m.transform_point3(unit), frame.transform_point3(px));
             assert!(a.distance(b) < 1e-4, "{a} {b}");
         }
+    }
+
+    /// (v247) « Mon crâne dépasse dans les blocs du dessus quand je passe accroupi sous
+    /// 1,5 bloc » : accroupi, la tête (et tout le modèle), quel que soit le regard, reste sous
+    /// la boîte accroupie (1,5 bloc) ; debout, regard droit, sa tête arrive à 1,8 bloc.
+    #[test]
+    fn the_crouched_head_stays_inside_the_crouched_box() {
+        let top = |crouch: f32, pitch: f32| {
+            let pose = Pose {
+                feet: Vec3::ZERO,
+                yaw: 0.7,
+                pitch,
+                walk: 0.0,
+                swing: 0.0,
+                crouch,
+                light: [1.0; 3],
+                held: None,
+                skin: None,
+            };
+            let mut hi = f32::MIN;
+            for (xf, mn, mx, _) in parts(&pose) {
+                for k in 0..8 {
+                    let c = Vec3::new(
+                        if k & 1 == 0 { mn[0] } else { mx[0] },
+                        if k & 2 == 0 { mn[1] } else { mx[1] },
+                        if k & 4 == 0 { mn[2] } else { mx[2] },
+                    );
+                    hi = hi.max(xf.transform_point3(c).y);
+                }
+            }
+            hi
+        };
+        let box_h = crate::player::HEIGHT - crate::player::CROUCH_DROP;
+        for i in 0..=28 {
+            let pitch = -1.4 + 0.1 * i as f32;
+            let t = top(1.0, pitch);
+            assert!(t <= box_h - 0.005, "accroupi, regard {pitch} : {t}");
+        }
+        assert!((top(0.0, 0.0) - 1.8).abs() < 1e-3);
+        // Le milieu de la tête accroupie est à la hauteur des yeux (à 3 cm près).
+        let (_, bottom) = head_place(1.0);
+        let mid = bottom + HEAD_BLOCKS / 2.0;
+        assert!((mid - (crate::player::EYE - crate::player::CROUCH_DROP)).abs() < 0.03, "{mid}");
     }
 
     /// (v240) La Foudre de Zeus à la première personne est l'éclair du modèle (`zeus_frame`,

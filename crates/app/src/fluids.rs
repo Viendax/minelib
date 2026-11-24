@@ -61,8 +61,9 @@ pub struct Fluids {
 }
 
 /// (v236) Retard (ticks) des voisines d'une case d'eau qui vient de baisser : de 3 à 7, 5 en
-/// moyenne, tiré d'après la case et le moment (le même d'une partie à l'autre).
-fn dry_delay(q: [i32; 3], tick: u64) -> u64 {
+/// moyenne, tiré d'après la case et le moment (le même d'une partie à l'autre). (v247) « Pareil
+/// pour la lave » : de 18 à 42 ticks, 30 en moyenne (son pas), au lieu de 30 pour toutes.
+fn dry_delay(q: [i32; 3], tick: u64, f: Fluid) -> u64 {
     let mut h = (q[0] as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ (q[1] as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
         ^ (q[2] as u64).wrapping_mul(0x1656_67b1_9e37_79f9)
@@ -70,7 +71,10 @@ fn dry_delay(q: [i32; 3], tick: u64) -> u64 {
     h ^= h >> 29;
     h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     h ^= h >> 32;
-    3 + h % 5
+    match f {
+        Fluid::Water => 3 + h % 5,
+        Fluid::Lava => 18 + h % 25,
+    }
 }
 
 fn delay(f: Fluid) -> u64 {
@@ -170,8 +174,8 @@ impl Fluids {
             if let Some((f, _)) = fluid(world.get(q[0], q[1], q[2])) {
                 if wet_lava(world, q) {
                     self.due.entry(self.tick + 1).or_default().push(q);
-                } else if dried && f == Fluid::Water {
-                    self.schedule_in(q, dry_delay(q, self.tick));
+                } else if dried {
+                    self.schedule_in(q, dry_delay(q, self.tick, f));
                 } else {
                     self.schedule(q, f);
                 }
@@ -208,10 +212,13 @@ impl Fluids {
                             {
                                 self.washed.push((q, old));
                             }
-                            // (v236) Eau qui baisse ou qui part : voir `dry_delay`.
-                            if let Some((Fluid::Water, was)) = fluid(old) {
+                            // (v236) Eau qui baisse ou qui part : voir `dry_delay`. (v247) Lave
+                            // aussi.
+                            if let Some((f_was, was)) = fluid(old) {
                                 let lower = match fluid(id) {
-                                    Some((Fluid::Water, now)) => strength(now) < strength(was),
+                                    Some((f_now, now)) if f_now == f_was => {
+                                        strength(now) < strength(was)
+                                    }
                                     _ => true,
                                 };
                                 if lower {
@@ -734,6 +741,49 @@ mod tests {
             "la dernière couche part en {} fois",
             ends.len()
         );
+    }
+
+    /// (v247) « Pareil que pour l'eau : le dernier état de la lave qui ne peut plus couler,
+    /// rends le motif au sol aléatoire » : une coulée de lave qui s'éteint ne laisse plus un
+    /// damier de niveau 1 ; sa dernière couche part par endroits, au hasard.
+    #[test]
+    fn drying_lava_leaves_no_checkerboard() {
+        let mut w = world();
+        let mut fl = Fluids::default();
+        w.set(8, 10, 8, BlockId::LAVA);
+        run(&mut w, &mut fl, 30.0);
+        let wet = |w: &World| {
+            let mut cells = Vec::new();
+            for x in 0..16 {
+                for z in 0..16 {
+                    if let Some((_, l)) = level(w, x, 10, z) {
+                        cells.push(([x, z], l));
+                    }
+                }
+            }
+            cells
+        };
+        let full = wet(&w).len();
+        assert!(full > 9, "coulée de lave : {full} cases");
+        w.set(8, 10, 8, BlockId::AIR);
+        fl.notify(&w, [8, 10, 8]);
+        // Les moments où des cases s'éteignent : avant, par anneaux entiers (tous les 30
+        // ticks) ; maintenant, çà et là.
+        let (mut t, mut ends, mut most) = (0.0, 0, 0);
+        let mut before = full;
+        while !wet(&w).is_empty() {
+            run(&mut w, &mut fl, TICK);
+            t += TICK;
+            assert!(t < 20.0, "toujours de la lave après {t:.2} s");
+            let now = wet(&w).len();
+            if now < before {
+                ends += 1;
+                most = most.max(before - now);
+            }
+            before = now;
+        }
+        assert!(ends >= 8, "la lave s'éteint en {ends} fois seulement");
+        assert!(most * 3 <= full, "{most} cases sur {full} d'un coup");
     }
 
     /// (v185) L'eau emporte torches et redstone (elles tombent en objets) ; la lave les

@@ -470,7 +470,8 @@ impl Hand {
         self.swing = (self.swing - dt / 0.28).max(0.0);
         let target = (speed / 4.4).min(1.5);
         self.bob_amp += (target - self.bob_amp) * (dt * 8.0).min(1.0);
-        self.bob += dt * speed * 1.9;
+        // (v247) Pas plus vite en courant qu'en marchant (voir `session::stride_rate`).
+        self.bob += dt * speed.min(4.4) * 1.9;
         if item != self.last {
             self.last = item;
             self.equip = 1.0;

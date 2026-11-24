@@ -298,6 +298,10 @@ pub struct Session {
     zeus_pending: Vec<ZeusPending>,
     daylight: f32,
     break_cooldown: f32,
+    /// (v247) Le clic tenu vient de frapper un PNJ : il ne casse rien tant qu'il reste tenu.
+    punch_latch: bool,
+    /// (v247) Construction en ligne : la météo du serveur est arrivée (le chargement l'attend).
+    weather_synced: bool,
     place_cooldown: f32,
     /// (v220) Survie : bloc qu'on est en train de casser, et depuis combien de temps (voir
     /// `BREAK_S`).
@@ -726,6 +730,8 @@ impl Session {
             zeus_pending: Vec::new(),
             daylight: crate::daytime::daylight(time_h),
             break_cooldown: 0.0,
+            punch_latch: false,
+            weather_synced: false,
             dig: None,
             gesture: crate::hand::Gesture::None,
             hud_hidden: false,
@@ -1602,7 +1608,15 @@ impl Session {
                     self.items.drop_item(from, to, pile);
                 }
                 // (v185) En solo, les objets dans l'eau flottent et suivent le courant.
-                self.items.drift(&self.world, dt);
+                // (v247) Un objet tombé dans la lave brûle : son grésillement, selon la
+                // distance.
+                let eye = self.player.eye();
+                for at in self.items.drift(&self.world, dt) {
+                    let d = at.distance(eye);
+                    if d < 32.0 {
+                        crate::audio::burn(1.0 / (1.0 + d / 6.0));
+                    }
+                }
             } else {
                 self.world.touched = None;
                 self.world.fresh = None;
@@ -1810,8 +1824,13 @@ impl Session {
                         })
                         .collect();
                     let smokes = self.fps.smoke_spheres();
+                    // (v247) La bombe posée ou lâchée : les CT ne la voient sur la minimap qu'aux
+                    // conditions d'un ennemi (`Spotting::bomb_shown`).
+                    use minelib_net::game::bomb as bs;
+                    let bomb_at = matches!(hud.bomb, bs::PLANTED | bs::DROPPED)
+                        .then(|| Vec3::from(hud.bomb_pos));
                     self.spotting
-                        .update(dt, &self.world, &observers, &targets, &smokes);
+                        .update(dt, &self.world, &observers, &targets, &smokes, bomb_at);
                 }
                 // Mort : on suit un coéquipier (clic : le suivant).
                 if self.net_dead {
@@ -1914,7 +1933,7 @@ impl Session {
             };
             self.hand.update(dt, speed, gesture, held);
             // Balancement des bras et des jambes du modèle (vue F5), et des autres joueurs.
-            self.walk_phase = (self.walk_phase + speed * dt * 2.6) % std::f32::consts::TAU;
+            self.walk_phase = (self.walk_phase + stride_rate(speed) * dt) % std::f32::consts::TAU;
             // (v165, essai) Foule simulée en solo, hors mode FPS. (v185) Seulement si on l'a
             // demandée (`/npc stresstest true`), et sans message à l'arrivée.
             // (v227) En construction en ligne, un OP la mène aussi pour les joueurs proches.
@@ -1971,6 +1990,7 @@ impl Session {
                         input.cursor,
                         input.mouse_pressed(Mouse::Left),
                         input.mouse_held(Mouse::Left),
+                        input.mouse_held(Mouse::Right),
                     );
                 }
                 if let Some(c) = input.cursor {
@@ -2059,7 +2079,13 @@ impl Session {
                 self.storm.lights(cam, self.daylight * self.storm.light(), &mut list);
             }
             list.truncate(minelib_render::MAX_DYN_LIGHTS);
-            renderer.set_dyn_lights(&list, &self.lights.settings.render);
+            // (v247) « Augmente la distance à laquelle on voit les rayons de lumière, à distance
+            // égale avec celle où elle éclaire » : une lumière éclaire tant que son chunk est
+            // chargé (distance de rendu) ; ses rayons se voient jusque-là aussi (avant : 48 à
+            // 192 blocs selon la qualité). La marche ne coûte que là où passent les lumières.
+            let mut st = self.lights.settings.render;
+            st.vl_max_dist = st.vl_max_dist.max((self.view_distance + 1) as f32 * 16.0);
+            renderer.set_dyn_lights(&list, &st);
             self.shadow_lights.clear();
             self.shadow_lights.extend(
                 list.iter()
@@ -2335,9 +2361,12 @@ impl Session {
         if let Some((id, _)) = aimed {
             self.screen_last = Some(id);
         }
+        // (v247) « Quand je tape l'écran avec l'éclair, ça ne doit pas le casser, et bien jeter
+        // le sort » : la Foudre de Zeus en main, le clic gauche est pour elle (`handle_blocks`).
+        let zeus_held = self.inventory.selected_item() == Some(Item::Zeus);
         if let Some((i, _, uv)) = self.screen_aim {
             let near = !fps;
-            if near && self.keys.pressed(input, Action::Attack) {
+            if near && self.keys.pressed(input, Action::Attack) && !zeus_held {
                 match self.shown.get(i).and_then(|s| s.1.clone()) {
                     Some(owner) => self.chat.say(
                         format!("Cet écran est à {owner} : lui seul peut le retirer."),
@@ -2758,7 +2787,11 @@ impl Session {
                 && !self.inventory.open
                 && self.keys.pressed(input, Action::Drop)
             {
-                let all = input.held(KeyCode::ControlLeft) || input.held(KeyCode::ControlRight);
+                // (v247) « Maj + lâcher : toute la pile d'un coup », comme Ctrl.
+                let all = input.held(KeyCode::ControlLeft)
+                    || input.held(KeyCode::ControlRight)
+                    || input.held(KeyCode::ShiftLeft)
+                    || input.held(KeyCode::ShiftRight);
                 let n = if all { crate::inventory::MAX_STACK } else { 1 };
                 // (v241) La Foudre de Zeus ne se jette pas dans le vide (rien ne la
                 // supprime) : sans sol où tomber, elle reste en main.
@@ -2784,6 +2817,8 @@ impl Session {
                         count: st.count.min(64) as u8,
                     };
                     self.items.throw_item(path, pile);
+                    // (v247) « Mets un son quand on lâche les objets aussi. »
+                    crate::audio::toss();
                 }
             }
             // Ramasser ce qui est à portée, s'il y a de la place ; (v220) pas avant d'être
@@ -3150,7 +3185,11 @@ impl Session {
             let place_through = self.game.mode != GameMode::Fps
                 && self.keys.held(input, Action::Sneak)
                 && !self.keys.held(input, Action::Attack);
-            if !place_through {
+            // (v247) La Foudre de Zeus en main : le clic gauche la lance, même sur un écran.
+            let zeus_blow = self.game.mode != GameMode::Fps
+                && self.inventory.selected_item() == Some(Item::Zeus)
+                && self.keys.held(input, Action::Attack);
+            if !place_through && !zeus_blow {
                 return;
             }
         }
@@ -3206,13 +3245,22 @@ impl Session {
             if let Some((target, _)) = self.npc_aimed().filter(|(_, t)| before_block(*t)) {
                 if attack {
                     self.hit_npc(target);
+                    self.punch_latch = true;
                 }
                 return;
             }
         }
-        // Cadre accroché au mur (carte importée) devant le bloc visé : il se casse.
+        // (v247) « Quand je tape Pistache, ça casse le bloc derrière » : frappé, le PNJ bondit
+        // hors de la vue, et le clic encore tenu cassait le bloc qu'il cachait. Tant que le
+        // clic qui l'a frappé reste tenu, rien n'est cassé.
+        if !keys.held(input, Action::Attack) {
+            self.punch_latch = false;
+        }
+        let breaking = breaking && !self.punch_latch;
+        // Cadre accroché au mur (carte importée) devant le bloc visé : il se casse. (v247) Pas
+        // avec la Foudre de Zeus en main : son clic lance la foudre.
         self.frame_aim = self.aimed_frame();
-        if breaking {
+        if breaking && !zeus {
             if let (Some(i), Some(frames)) = (self.frame_aim.take(), self.frames.as_mut()) {
                 let at = frames.pos(i);
                 frames.remove(i, &self.dir);
@@ -3386,7 +3434,7 @@ impl Session {
                 self.gesture = Gesture::Dip;
             }
             breaking
-        } else if keys.held(input, Action::Attack) && breakable {
+        } else if keys.held(input, Action::Attack) && breakable && !self.punch_latch {
             let t = match dig {
                 Some((b, t)) if b == hit.block => t + dt,
                 _ => 0.0,
@@ -3716,11 +3764,16 @@ impl Session {
         {
             self.inventory.select(i);
         } else if self.game.mode == GameMode::Creative {
-            // Emplacement vide de la barre s'il y en a un, sinon celui en main.
-            let slot = self.inventory.slots[..inventory::HOTBAR]
-                .iter()
-                .position(|s| s.is_none())
-                .unwrap_or(self.inventory.selected);
+            // Emplacement vide de la barre s'il y en a un, sinon celui en main. (v247) Jamais
+            // par-dessus la Foudre de Zeus (« j'ai réussi à supprimer la foudre en copiant un
+            // bloc avec le clic molette ») : la case suivante de la barre qui ne la tient pas.
+            let inv = &self.inventory;
+            let Some(slot) = (0..inventory::HOTBAR)
+                .find(|&i| inv.slots[i].is_none())
+                .or_else(|| inv.replaceable_slot())
+            else {
+                return;
+            };
             self.inventory.slots[slot] = Some(inventory::Stack {
                 item: wanted,
                 count: 64,
@@ -4158,7 +4211,7 @@ impl Session {
     ) {
         use minelib_net::proto::{
             ZEUS_ARC, ZEUS_CLAIM, ZEUS_CLOUD, ZEUS_EMPTY, ZEUS_HOLD, ZEUS_NOT_CREATIVE,
-            ZEUS_NOT_HOLDER, ZEUS_OK, ZEUS_SKY, ZEUS_STRIKE, ZEUS_TAKEN,
+            ZEUS_NOT_HOLDER, ZEUS_OK, ZEUS_RETURN, ZEUS_SKY, ZEUS_STRIKE, ZEUS_TAKEN,
         };
         if self.build.is_none() {
             return;
@@ -4197,6 +4250,17 @@ impl Session {
                 }
             }
             ZEUS_HOLD if seq != 0 => self.zeus_online.holding = false,
+            // (v247) Rendue au menu créatif ; refusée (plus en créatif…), elle nous est remise
+            // (`sync_legend_online`).
+            ZEUS_RETURN if seq != 0 => {
+                self.zeus_online.returning = false;
+                if why == ZEUS_NOT_CREATIVE {
+                    self.chat.say(
+                        "La Foudre de Zeus se rend au menu créatif en créatif seulement.",
+                        chat::RED,
+                    );
+                }
+            }
             ZEUS_SKY | ZEUS_STRIKE | ZEUS_ARC if seq != 0 => {
                 let Some(i) = self.zeus_pending.iter().position(|p| p.seq == seq) else {
                     return;
@@ -4255,7 +4319,7 @@ impl Session {
     /// seulement alors (celui qu'on avait pris en solo sur cette carte : on le dit au
     /// relais, qui ne l'entend que du créateur du monde).
     fn sync_legend_online(&mut self) {
-        use minelib_net::proto::{ZEUS_CLAIM, ZEUS_HOLD, ZEUS_SYNC};
+        use minelib_net::proto::{ZEUS_CLAIM, ZEUS_HOLD, ZEUS_RETURN, ZEUS_SYNC};
         if !self.zeus_online.asked {
             self.zeus_online.asked = true;
             self.zeus_cmd(ZEUS_SYNC, 0);
@@ -4267,12 +4331,22 @@ impl Session {
             self.zeus_online.claiming = true;
             self.zeus_cmd(ZEUS_CLAIM, 0);
         }
+        // (v247) Supprimée dans le menu créatif : elle y retourne, pour tout le serveur (le
+        // relais du monde la rend ; jusque-là, elle ne nous est pas remise).
+        if std::mem::take(&mut self.inventory.legend_returned)
+            && mine
+            && !self.inventory.has_zeus()
+            && !self.zeus_online.returning
+        {
+            self.zeus_online.returning = true;
+            self.zeus_cmd(ZEUS_RETURN, 0);
+        }
         self.inventory.legend_free = self.zeus_online.free() && !self.zeus_online.claiming;
         if self.zeus_online.holder.is_none() {
             return;
         }
         if mine {
-            if !self.inventory.has_zeus() {
+            if !self.inventory.has_zeus() && !self.zeus_online.returning {
                 self.inventory.add(Item::Zeus, 1);
             }
             self.inventory.keep_one_zeus(true);
@@ -4315,6 +4389,14 @@ impl Session {
             if std::mem::take(&mut self.inventory.legend_took) && on {
                 self.legend.taken = true;
                 self.legend.elsewhere = false;
+            }
+            // (v247) Supprimé dans le menu créatif : il y retourne, personne ne l'a plus (ses
+            // charges restent les siennes).
+            if std::mem::take(&mut self.inventory.legend_returned)
+                && on
+                && !self.inventory.has_zeus()
+            {
+                self.legend.taken = false;
             }
             self.inventory.legend_free = on && !self.legend.taken;
         }
@@ -4453,15 +4535,38 @@ impl Session {
         // (v238) La foudre blesse aussi les PNJ de notre foule, comme un joueur (et les fait
         // sauter) ; ceux de la foule d'un autre OP sautent tout de suite (son jeu, où elle
         // tombe aussi, leur ôte la vie). Le plus proche crie.
+        // (v247) La nôtre (Foudre de Zeus, `/thor`) : c'est comme si nous les avions frappés.
+        // Le personnage caché qu'elle touche est trouvé (« Pistache peut être trouvé en tapant
+        // avec la foudre ») ; dans la foule d'un autre OP, le coup part à son jeu, depuis là
+        // où elle est tombée.
         let me = self.player.eye();
         let center = self.player.pos;
-        for at in std::mem::take(&mut self.storm.landed) {
+        for (at, mine) in std::mem::take(&mut self.storm.landed) {
             let mut hit = Vec::new();
+            let mut found = false;
             if let Some(c) = self.crowd.as_mut() {
-                hit.extend(c.struck(&self.world, at, center));
+                let (h, f) = c.struck(&self.world, at, center, mine);
+                hit.extend(h);
+                found |= f;
             }
-            for rc in self.remote_crowds.values_mut() {
-                hit.extend(rc.struck(at));
+            let mut sends = Vec::new();
+            for (owner, rc) in self.remote_crowds.iter_mut() {
+                let (h, hidden) = rc.struck(at, mine);
+                hit.extend(h);
+                if let Some(id) = hidden {
+                    sends.push((owner.clone(), id));
+                }
+            }
+            if let Some(b) = &self.build {
+                for (owner, id) in sends {
+                    b.send_crowd_hit(&owner, id, at.to_array());
+                }
+            }
+            if found {
+                if let (Some(out), Some(b)) = (self.crowd_out.as_mut(), &self.build) {
+                    out.found = Some((b.pseudo().to_string(), at.to_array()));
+                }
+                self.say_found();
             }
             let near = hit.iter().map(|p| p.distance(me)).fold(f32::INFINITY, f32::min);
             if let Some(g) = npc_cry_gain(near) {
@@ -4469,23 +4574,16 @@ impl Session {
             }
         }
         // (v241) Un éclair a couru dans les nuages au-dessus de lui : une charge de plus.
-        // (v244) Sur un serveur, c'est le relais du monde qui l'accorde (`on_zeus`).
+        // (v244) Sur un serveur, c'est le relais du monde qui l'accorde (`on_zeus`). (v247)
+        // Sans le dire dans le tchat (« n'écris pas que les éclairs chargent notre foudre ») :
+        // l'objet le dit, et son icône montre ses charges.
         let charged = if self.build.is_some() {
             0
         } else {
             self.storm.charged
         };
         for _ in 0..charged {
-            if self.legend.charge() {
-                self.chat.say(
-                    format!(
-                        "Un éclair a chargé la Foudre de Zeus ({} / {}).",
-                        self.legend.charges,
-                        crate::zeus::MAX_CHARGES
-                    ),
-                    chat::GREY,
-                );
-            }
+            self.legend.charge();
         }
         // Essais : MINELIB_ZEUS=1 (la Foudre de Zeus en main à l'arrivée), MINELIB_THOR=<s>
         // (la foudre tombe là où l'on regarde, toutes les <s> secondes).
@@ -4752,10 +4850,10 @@ impl Session {
                     if !pos.is_finite() || !dir.is_finite() {
                         continue;
                     }
-                    // La nôtre : l'éclair tenu sursaute vers elle.
-                    let ours = by.eq_ignore_ascii_case(&me)
-                        && seq == self.thor_seq
-                        && self.holding_zeus();
+                    // La nôtre : l'éclair tenu sursaute vers elle. (v247) Ce qu'elle touche,
+                    // nous l'avons frappé.
+                    let mine = by.eq_ignore_ascii_case(&me) && seq == self.thor_seq;
+                    let ours = mine && self.holding_zeus();
                     if up {
                         let eye_y = self.camera_pos().y;
                         self.storm.strike_up_seeded(pos, dir, eye_y, seed);
@@ -4764,6 +4862,9 @@ impl Session {
                         }
                     } else {
                         self.storm.strike_seeded(pos, seed);
+                        if mine {
+                            self.storm.mark_mine();
+                        }
                         if ours {
                             let tip = self.zeus_tip();
                             self.storm
@@ -4804,6 +4905,11 @@ impl Session {
                         }
                         ZEUS_STRIKE => {
                             self.storm.strike_seeded(pos, seed);
+                            // (v247) La nôtre : ce qu'elle touche, nous l'avons frappé
+                            // (« Pistache peut être trouvé en tapant avec la foudre »).
+                            if own {
+                                self.storm.mark_mine();
+                            }
                             if ours {
                                 let tip = self.zeus_tip();
                                 self.storm
@@ -4867,6 +4973,7 @@ impl Session {
         match aim {
             Aim::Ground(pos) => {
                 self.storm.strike(pos);
+                self.storm.mark_mine();
                 if self.holding_zeus() {
                     let tip = self.zeus_tip();
                     self.storm.held.surge(tip, (pos - tip).normalize_or(Vec3::Y));
@@ -5679,7 +5786,12 @@ impl Session {
             && self.held_item() == Some(Item::Zeus);
         let (cam, view, _) = self.view_camera();
         if mine {
-            let hand = crate::flashlight::lens_position(self.player.eye(), self.player.look_dir());
+            // (v247) « Si un objet fait un bruit comme l'éclair, il le fait aussi en F5 » : le
+            // bruit part toujours de l'objet tenu là où il est dans le monde (sa pointe, au
+            // poing du modèle : `zeus_tip`, à la première personne comme en F5), entendu de la
+            // caméra. Avant : d'un point devant les yeux, qu'en F5 la caméra laissait loin
+            // devant elle.
+            let hand = self.zeus_tip();
             let v = view.transform_point3(hand);
             list.push(crate::audio::CrackleAt {
                 id: 1,
@@ -5727,7 +5839,11 @@ impl Session {
             l.shown = self.streamer.shown_within(p.x, p.z, LOAD_RADIUS);
             l.shaders = renderer.world_ready();
             let t = l.since.elapsed().as_secs_f32();
-            let ready = l.shaders && l.shown.0 >= l.shown.1 && t >= LOAD_MIN_S;
+            // (v247) « On ne doit pas pouvoir rejoindre tant que tout n'est pas chargé (il y
+            // avait un orage et les nuages étaient mal chargés) » : en ligne, aussi la météo du
+            // serveur (elle arrive par le relais, juste après l'entrée).
+            let weather = self.build.is_none() || self.weather_synced;
+            let ready = l.shaders && l.shown.0 >= l.shown.1 && t >= LOAD_MIN_S && weather;
             if ready || t >= LOAD_MAX_S {
                 if ready {
                     log::info!(
@@ -6149,7 +6265,9 @@ impl Session {
                         self.die();
                     }
                 }
-            } else if !p.flying && height > SAFE_FALL {
+            } else if !p.flying && !self.game.can_fly && height > SAFE_FALL {
+                // (v247) « Je ne dois pas prendre de dégâts de chute en /fly » : le vol permis,
+                // aucune chute ne blesse (même vol coupé en l'air).
                 self.damage((height - SAFE_FALL).ceil() as u8);
             }
         }
@@ -6429,6 +6547,12 @@ impl Session {
                         (*left >= 0.0).then_some(*left as f64),
                         *fixed,
                     );
+                    // (v247) À l'arrivée, le temps du serveur est là d'un coup (avant : le ciel
+                    // passait du beau temps à l'orage en arrivant, nuages « mal chargés »), et
+                    // le chargement l'attend (`check_loaded`).
+                    if !std::mem::replace(&mut self.weather_synced, true) {
+                        self.storm.weather.resettle();
+                    }
                     return;
                 }
                 // Mode de jeu donné par un OP (ou par défaut du serveur, à l'arrivée).
@@ -7113,8 +7237,12 @@ impl Session {
         let name = parts.next().unwrap_or("").to_lowercase();
         let args: Vec<&str> = parts.collect();
         if name == "wand" {
-            // Baguette dans la main (emplacement actuel de la barre).
-            let i = self.inventory.selected;
+            // Baguette dans la main (emplacement actuel de la barre). (v247) Jamais par-dessus la
+            // Foudre de Zeus : la case suivante.
+            let Some(i) = self.inventory.replaceable_slot() else {
+                return;
+            };
+            self.inventory.select(i);
             self.inventory.slots[i] = Some(inventory::Stack {
                 item: Item::Wand,
                 count: 1,
@@ -8720,8 +8848,13 @@ impl Session {
                     (at, bomb)
                 })
                 .collect();
-            let bomb_at =
-                matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED).then(|| Vec3::from(hud.bomb_pos));
+            // (v247) « La bombe ne peut être vue que sous les mêmes conditions qu'un ennemi pour
+            // les CT, et toujours pour les T. »
+            let bomb_at = if my_team == CT {
+                self.spotting.bomb_shown()
+            } else {
+                matches!(hud.bomb, bomb::PLANTED | bomb::DROPPED).then(|| Vec3::from(hud.bomb_pos))
+            };
             // Son point à sa couleur dans l'équipe, comme les coéquipiers.
             let me_id = n.me();
             let my_color = rows
@@ -10083,32 +10216,39 @@ impl Session {
             Mat4::perspective_infinite_reverse_rh(fov.to_radians(), renderer.aspect(), 0.05);
         // (v220) Interface masquée (F1) : ni main ni objet tenu à la première personne.
         let hud_off = self.hud_off();
+        // (v247) « La main par défaut : change-la par celle qu'on calcule comme avec un objet en
+        // main » (et « accroupi à la première personne, mon bras doit bouger avec moi comme en
+        // F5 ») : la main vide est le bras du modèle, tendu comme s'il tenait un bloc, sans
+        // rien dedans (avant : une main dessinée à part, à l'écran, qui ne suivait pas
+        // l'accroupi).
+        let first_hold = match pose.held {
+            Some(
+                h @ (Held::Flashlight(_)
+                | Held::Block(_)
+                | Held::Torch(_)
+                | Held::Wand(_)
+                | Held::Zeus),
+            ) => Some((h, true)),
+            None => Some((Held::Block(minelib_world::BlockId::AIR), false)),
+            _ => None,
+        };
         let first_person_lamp = (third == 0
             && !fps_mode
             && !hud_off
             && self.spectating.is_none()
-            && self.game.mode != GameMode::Spectator
-            && matches!(
-                pose.held,
-                Some(
-                    Held::Flashlight(_)
-                        | Held::Block(_)
-                        | Held::Torch(_)
-                        | Held::Wand(_)
-                        | Held::Zeus
-                )
-            ))
-        .then(|| {
-            // (v220) Le coup vers le bas de la main (bloc cassé). (v222) La lampe et le bras
-            // tournent ensemble autour de l'épaule (la base du bras, bout z = 1 de sa
-            // boîte), comme la main dessinée autour de la sienne : seul le bout descend.
-            // (v239) Et l'arc en posant ou en frappant, l'objet qui remonte en changeant.
-            let (p, dip) = self.first_person_hold(pose.held?, view);
-            let arm = crate::player_model::right_arm_matrix(&p)?;
-            let lamp = crate::player_model::held_item_matrix(&p);
-            Some((lamp.map(|m| dip * m), dip * arm))
-        })
-        .flatten();
+            && self.game.mode != GameMode::Spectator)
+            .then_some(first_hold)
+            .flatten()
+            .and_then(|(held, item)| {
+                // (v220) Le coup vers le bas de la main (bloc cassé). (v222) La lampe et le bras
+                // tournent ensemble autour de l'épaule (la base du bras, bout z = 1 de sa
+                // boîte), comme la main dessinée autour de la sienne : seul le bout descend.
+                // (v239) Et l'arc en posant ou en frappant, l'objet qui remonte en changeant.
+                let (p, dip) = self.first_person_hold(held, view);
+                let arm = crate::player_model::right_arm_matrix(&p)?;
+                let lamp = crate::player_model::held_item_matrix(&p).filter(|_| item);
+                Some((lamp.map(|m| dip * m), dip * arm))
+            });
         let hand = if self.spectating.is_some() && fps_mode {
             // (v209) Spectateur : l'arme du joueur regardé dans ses mains, et ce qui est dans
             // le monde (balles traçantes, grenades en vol, impacts) comme en jouant.
@@ -11144,11 +11284,23 @@ impl Walk {
         // Téléportation (réapparition) : pas un pas de géant.
         let v = if v > 20.0 { 0.0 } else { v };
         self.speed += (v - self.speed) * (dt * 12.0).min(1.0);
-        self.phase = (self.phase + self.speed * dt * 2.6) % std::f32::consts::TAU;
+        self.phase = (self.phase + stride_rate(self.speed) * dt) % std::f32::consts::TAU;
         let target = (self.speed / 4.3).min(1.0);
         self.amp += (target - self.amp) * (dt * 10.0).min(1.0);
     }
 }
+
+/// (v247) Cadence du balancement des bras et des jambes (radians par seconde) pour une
+/// vitesse au sol (blocs/s), la même pour soi, les autres joueurs et les PNJ : 2,6 par bloc/s
+/// jusqu'à la marche (4,4 blocs/s), plus au-delà. « Les mouvements des bras quand je cours
+/// sont deux fois trop rapides, quand je tiens un objet aussi » : en courant (6,6 blocs/s),
+/// 17,2 avant ; maintenant celle de la marche (11,4), des pas plus grands.
+pub fn stride_rate(speed: f32) -> f32 {
+    2.6 * speed.clamp(0.0, STRIDE_TOP)
+}
+
+/// (v247) Vitesse (blocs/s) au-delà de laquelle la cadence ne monte plus : la marche.
+const STRIDE_TOP: f32 = 4.4;
 
 /// Le soleil (direction `sun`) atteint-il le milieu de la boîte ? Non si un bloc plein et
 /// opaque est sur le chemin, à moins de 64 blocs (comme l'ombre du joueur dans le shader).

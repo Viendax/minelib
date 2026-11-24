@@ -827,6 +827,12 @@ struct Slot {
     seen: u64,
     /// (v222) La lumière telle qu'elle était quand sa carte a été calculée.
     baked_key: Option<ShadowKey>,
+    /// (v247) Lumière posée (pas portée) : sa carte est gardée tant que l'atlas a de la place,
+    /// même quand on ne la voit plus (voir `sweep`).
+    placed: bool,
+    /// (v247) Ce que la grille de blocs voyait de la lumière quand sa carte a été faite
+    /// (`grid_cover`, 0 … 1).
+    cover: f32,
 }
 
 impl Slot {
@@ -918,6 +924,8 @@ impl ShadowCache {
                     dirty: true,
                     seen: frame,
                     baked_key: None,
+                    placed: l.owner == 0,
+                    cover: 0.0,
                 },
             );
         }
@@ -930,12 +938,18 @@ impl ShadowCache {
         Some(s)
     }
 
-    /// Oublie les lumières qui n'ont rien demandé depuis `keep` images.
+    /// Oublie les lumières portées qui n'ont rien demandé depuis `keep` images. (v247) Pas les
+    /// lumières posées : « loin au-dessus ou au-dessous de ma lumière, les ombres des blocs ne
+    /// se chargent plus » — sortie de la vue un instant, sa carte était oubliée, puis refaite
+    /// dans la grille de blocs de là où l'on était, qui ne voyait plus ses blocs (elle ne
+    /// couvre que 32 blocs au-dessus et au-dessous de la caméra) : la lumière traversait tout.
+    /// Elle garde maintenant sa carte tant que l'atlas a de la place (`evict_oldest` libère
+    /// la plus ancienne quand il en manque).
     fn sweep(&mut self, frame: u64, keep: u64) {
         let old: Vec<u64> = self
             .slots
             .iter()
-            .filter(|(_, s)| s.seen + keep < frame)
+            .filter(|(_, s)| !s.placed && s.seen + keep < frame)
             .map(|(&id, _)| id)
             .collect();
         for id in old {
@@ -1047,9 +1061,41 @@ fn changed_bricks(
 /// par des ombres de ce qu'elle éclairait au moment où on l'a allumée. Au-delà de la grille,
 /// rien ne l'arrête. (v222) `baked` : une carte faite pour la lumière telle qu'elle est
 /// (`Slot::current`) ; déplacée, tournée ou changée, elle est refaite.
-fn keeps_old_map(baked: bool, l: &DynLight, voxels: Option<[i32; 3]>) -> bool {
-    baked && l.owner == 0 && voxels.is_some_and(|o| !grid_covers(o, l))
+///
+/// (v247) Une carte gardée note ce que la grille voyait de sa lumière quand elle a été faite
+/// (`Slot::cover`, voir `grid_cover`) : une carte à refaire ne l'est que si la grille d'
+/// aujourd'hui en voit au moins autant (sinon la carte refaite laisserait passer la lumière là
+/// où la grille ne voit plus ses blocs : « la lumière des lumières ponctuelles passe parfois à
+/// travers des blocs pleins quand je m'éloigne et me rapproche ») ; et une carte faite avec une
+/// grille qui en voyait peu (le monde chargé loin d'elle) est refaite dès qu'elle en voit
+/// nettement plus (voir `prepare`).
+fn keeps_old_map(s: &Slot, l: &DynLight, voxels: Option<[i32; 3]>) -> bool {
+    s.current()
+        && l.owner == 0
+        && voxels.is_some_and(|o| !grid_covers(o, l) && grid_cover(o, l) < s.cover - 1e-3)
 }
+
+/// (v247) Part de la lumière que voit la grille de blocs (coin `origin`) : moitié pour le cœur
+/// de la lumière (sa sphère à 8 blocs au plus de son centre : le bloc où elle est et ses
+/// voisins, qui font ses ombres les plus grandes), moitié pour toute sa sphère ; 0 … 1.
+fn grid_cover(origin: [i32; 3], l: &DynLight) -> f32 {
+    use crate::rt::VOX;
+    let (c, r) = bounding_sphere(l);
+    let part = |half: f32| {
+        (0..3)
+            .map(|a| {
+                let (g0, g1) = (origin[a] as f32, (origin[a] + VOX[a] as i32) as f32);
+                let got = ((c[a] + half).min(g1) - (c[a] - half).max(g0)).max(0.0);
+                got / (2.0 * half)
+            })
+            .product::<f32>()
+    };
+    0.5 * part(r.min(8.0).max(0.5)) + 0.5 * part(r.max(0.5))
+}
+
+/// (v247) Une carte faite avec une grille qui voyait moins de sa lumière que celle
+/// d'aujourd'hui (de `REBAKE_GAIN` au moins) est refaite.
+const REBAKE_GAIN: f32 = 0.05;
 
 fn grid_covers(origin: [i32; 3], l: &DynLight) -> bool {
     use crate::rt::VOX;
@@ -2770,6 +2816,15 @@ impl DynGpu {
             for (i, l) in self.lights.iter().enumerate() {
                 match self.cache.request(l, frame) {
                     Some(s) => {
+                        // (v247) Faite avec une grille qui voyait bien moins de la lumière que
+                        // celle d'aujourd'hui : refaite (la lumière n'en traverse plus les
+                        // blocs que la grille ne voyait pas).
+                        if s.baked
+                            && l.owner == 0
+                            && voxels.is_some_and(|o| grid_cover(o, l) > s.cover + REBAKE_GAIN)
+                        {
+                            s.dirty = true;
+                        }
                         if !s.baked {
                             first.push(i);
                         } else if s.dirty {
@@ -2816,7 +2871,7 @@ impl DynGpu {
                 // pour la lumière telle qu'elle est. Déplacée ou tournée, sa carte d'avant ne
                 // vaut plus rien : son ombre ne suivait plus (un projecteur mis tout droit
                 // vers le bas, loin de la caméra, gardait l'ombre de sa direction d'avant).
-                if keeps_old_map(s.current(), &l, voxels) {
+                if keeps_old_map(s, &l, voxels) {
                     continue;
                 }
                 let n = s.count as usize;
@@ -2854,6 +2909,7 @@ impl DynGpu {
                 s.baked = true;
                 s.baked_key = Some(s.key);
                 s.dirty = false;
+                s.cover = voxels.map_or(0.0, |o| grid_cover(o, &l));
                 rebaked_beam |= l.owner == 0 && l.beam > 0.0;
             }
         }
@@ -3850,33 +3906,79 @@ mod tests {
         }
     }
 
+    /// Carte faite (pour la lumière telle qu'elle est) avec une grille qui en voyait `cover`.
+    fn baked_slot(c: &mut ShadowCache, l: &DynLight, cover: f32) {
+        let s = c.request(l, 1).unwrap();
+        s.baked = true;
+        s.baked_key = Some(s.key);
+        s.cover = cover;
+    }
+
     /// (v217) La lampe torche, au milieu de la grille de blocs mais plus longue qu'elle,
     /// refait sa carte à chaque fois qu'elle bouge ; une lumière posée que la grille ne voit
     /// pas toute garde la sienne en attendant.
     #[test]
     fn a_carried_light_always_rebakes_its_map() {
         let origin = [-64, 40, -64];
+        let mut c = ShadowCache::default();
+        c.reset(32);
         let mut lamp = spot(9, [0.5, 72.0, 0.5], [0.0, -0.2, -1.0], 128.0, 45.0);
         assert!(
             !grid_covers(origin, &lamp),
             "la grille ne voit pas toute la lampe"
         );
+        baked_slot(&mut c, &lamp, 1.0);
         assert!(
-            keeps_old_map(true, &lamp, Some(origin)),
+            keeps_old_map(&c.slots[&9], &lamp, Some(origin)),
             "sans porteur : gardée"
         );
         lamp.owner = 1;
         assert!(
-            !keeps_old_map(true, &lamp, Some(origin)),
+            !keeps_old_map(&c.slots[&9], &lamp, Some(origin)),
             "portée : refaite"
         );
-        assert!(!keeps_old_map(false, &lamp, Some(origin)));
         let far = spot(10, [300.0, 72.0, 0.5], [0.0, -1.0, 0.0], 20.0, 45.0);
-        assert!(keeps_old_map(true, &far, Some(origin)));
+        let s = c.request(&far, 1).unwrap();
         assert!(
-            !keeps_old_map(false, &far, Some(origin)),
+            !keeps_old_map(s, &far, Some(origin)),
             "une première carte se calcule"
         );
+        baked_slot(&mut c, &far, 0.5);
+        assert!(keeps_old_map(&c.slots[&10], &far, Some(origin)));
+    }
+
+    /// (v247) « Loin au-dessus ou au-dessous de mon bloc de feuilles, les ombres des blocs ne
+    /// se chargent plus » ; « la lumière passe parfois à travers des blocs pleins quand je
+    /// m'éloigne et me rapproche » : une carte faite près de la lumière (la grille de blocs la
+    /// voit toute) est gardée loin d'elle (la grille ne voit plus ses blocs), même à refaire ;
+    /// faite loin, elle est refaite près (la grille en voit bien plus) ; à grille égale, elle
+    /// peut être refaite.
+    #[test]
+    fn a_map_is_only_rebaked_with_a_grid_that_sees_as_much_of_its_light() {
+        let light = DynLight {
+            id: 3,
+            kind: DynKind::Point,
+            pos: [0.5, 100.5, 0.5],
+            range: 31.7,
+            ..Default::default()
+        };
+        let near = [-64, 68, -64];
+        let below = [-64, 0, -64];
+        let (cn, cb) = (grid_cover(near, &light), grid_cover(below, &light));
+        assert!(cn > 0.99 && cb < 0.01, "{cn} {cb}");
+        // Un peu plus bas : elle en voit moins, mais encore le cœur.
+        let lower = grid_cover([-64, 48, -64], &light);
+        assert!(lower < cn && lower > 0.5, "{lower}");
+        let mut c = ShadowCache::default();
+        c.reset(32);
+        baked_slot(&mut c, &light, cn);
+        c.slots.get_mut(&3).unwrap().dirty = true;
+        assert!(keeps_old_map(&c.slots[&3], &light, Some(below)), "loin : gardée");
+        assert!(!keeps_old_map(&c.slots[&3], &light, Some(near)), "près : refaite");
+        // Faite loin (le monde chargé loin d'elle) : refaite dès que la grille en voit plus.
+        c.slots.get_mut(&3).unwrap().cover = cb;
+        assert!(!keeps_old_map(&c.slots[&3], &light, Some(below)), "pas pire : refaite");
+        assert!(cn > cb + REBAKE_GAIN);
     }
 
     /// (v222) Une lumière posée que la grille ne voit pas toute garde sa carte tant qu'elle
@@ -3888,15 +3990,13 @@ mod tests {
         let mut far = spot(10, [300.0, 72.0, 0.5], [0.13, -0.99, -0.08], 20.0, 45.0);
         let mut c = ShadowCache::default();
         c.reset(16);
-        let s = c.request(&far, 1).unwrap();
-        s.baked = true;
-        s.baked_key = Some(s.key);
-        s.dirty = true; // un bloc a changé près d'elle
-        assert!(keeps_old_map(c.slots[&10].current(), &far, Some(origin)));
+        baked_slot(&mut c, &far, 1.0);
+        c.slots.get_mut(&10).unwrap().dirty = true; // un bloc a changé près d'elle
+        assert!(keeps_old_map(&c.slots[&10], &far, Some(origin)));
         far.dir = [0.0, -1.0, 0.0];
         let s = c.request(&far, 2).unwrap();
         assert!(s.dirty && !s.current());
-        assert!(!keeps_old_map(s.current(), &far, Some(origin)), "refaite");
+        assert!(!keeps_old_map(s, &far, Some(origin)), "refaite");
     }
 
     /// (v222) Le repère d'un projecteur tourne avec son cap jusqu'à la verticale, sans
@@ -4179,6 +4279,14 @@ mod tests {
             used as u32, want,
             "cases occupées = cases des lumières gardées"
         );
+        // (v247) Des lumières posées : leurs cartes restent, même longtemps sans les voir ;
+        // portées, elles partent.
+        let kept = c.slots.len();
+        c.sweep(1000, 120);
+        assert_eq!(c.slots.len(), kept, "lumières posées : cartes gardées");
+        for s in c.slots.values_mut() {
+            s.placed = false;
+        }
         c.sweep(1000, 120);
         assert!(c.slots.is_empty());
         assert!(c.used.iter().all(|u| !u));

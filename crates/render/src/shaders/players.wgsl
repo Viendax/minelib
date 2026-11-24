@@ -120,8 +120,10 @@ fn part_matrix(part: u32, v: PlayerIn) -> mat4x4<f32> {
     let base = m_trans(v.feet) * m_rot_y(-v.look.x) * m_scale(px);
     let swing = sin(v.motion.x) * 0.75 * v.motion.y;
     let crouch = clamp(v.motion.z, 0.0, 1.0);
+    // `CROUCH_LEAN`, `CROUCH_HIP_DROP` de player_model.rs (v247 : hanches tassées de 4,85
+    // pixels, la tête accroupie reste dans la boîte de 1,5 bloc).
     let lean = 0.45 * crouch;
-    let drop = 0.3 / px * crouch * 0.6;
+    let drop = 4.85 * crouch;
     let pitch = clamp(v.look.y, -1.4, 1.4);
     // (v189) Jambe d'un seul morceau : accroupi, elle se tasse de `drop` au lieu de se
     // faire recouvrir au quart par le bas du corps (pli visible à la hanche). Pieds au sol.

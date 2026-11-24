@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 /// joueurs.
 /// (v244) 64 : la Foudre de Zeus légendaire en ligne, tenue par le relais du monde
 /// (`Request::Zeus`, `Response::Zeus`, `BuildMsg::ZeusAsk`, `Zeus`).
-pub const PROTOCOL: u32 = 64;
+/// (v247) 65 : la Foudre de Zeus rendue au menu créatif (`ZEUS_RETURN`) ; accroupi plus vite (la posture ne traîne plus à la fin) et plus bas (la tête,
+/// donc sa boîte des coups en partie FPS, reste dans la boîte de 1,5 bloc) : la simulation et
+/// les coups doivent être les mêmes chez l'hôte et ses invités.
+pub const PROTOCOL: u32 = 65;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -800,6 +803,9 @@ pub const ZEUS_ARC: u8 = 4;
 pub const ZEUS_HOLD: u8 = 5;
 /// (Poussé par le relais seulement) un éclair des nuages vient de la charger.
 pub const ZEUS_CLOUD: u8 = 6;
+/// (v247) La rendre au menu créatif (supprimée en créatif : « la supprimer depuis le créatif la
+/// remet dans l'inventaire créatif ») : personne ne l'a plus, ses charges restent avec elle.
+pub const ZEUS_RETURN: u8 = 7;
 
 /// (v244) Réponses du relais (`Response::Zeus::why`).
 pub const ZEUS_OK: u8 = 0;

@@ -50,6 +50,8 @@ pub struct Target<'a> {
 pub struct Spotting {
     /// Dernière position vue de chaque adversaire, et quand (horloge `time`).
     seen: HashMap<String, (Vec3, f32)>,
+    /// (v247) Bombe lâchée ou posée : dernière position vue par l'équipe, et quand.
+    bomb: Option<(Vec3, f32)>,
     /// Blanc de flash des coéquipiers (secondes, comme `Fps::blind` : écran tout blanc à
     /// partir de 1).
     blind: HashMap<String, f32>,
@@ -62,6 +64,7 @@ impl Spotting {
     pub fn clear(&mut self) {
         self.seen.clear();
         self.blind.clear();
+        self.bomb = None;
     }
 
     /// Une flash éclate en `at` : chaque coéquipier en est aveuglé comme le joueur de ce PC
@@ -84,6 +87,7 @@ impl Spotting {
         observers: &[Observer],
         targets: &[Target],
         smokes: &[(Vec3, f32)],
+        bomb: Option<Vec3>,
     ) {
         self.time += dt;
         for b in self.blind.values_mut() {
@@ -95,11 +99,10 @@ impl Spotting {
         }
         self.next = self.time + PERIOD;
         let cos_view = VIEW_HALF_ANGLE.to_radians().cos();
-        for t in targets {
-            // Tête, torse, genoux : vu dès qu'un des trois l'est.
-            let height = 1.8 - 0.35 * t.crouch;
-            let points = [height - 0.2, height * 0.6, 0.45].map(|y| t.feet + Vec3::Y * y);
-            let spotted = observers.iter().any(|o| {
+        // Un des points est-il vu d'un joueur de l'équipe (champ de vision, ni blocs pleins,
+        // ni fumée, écran pas tout blanc) ?
+        let sees = |points: &[Vec3]| {
+            observers.iter().any(|o| {
                 let blind = o
                     .own_blind
                     .unwrap_or_else(|| self.blind.get(o.pseudo).copied().unwrap_or(0.0));
@@ -116,13 +119,39 @@ impl Spotting {
                         && crate::bots::clear_sight(world, o.eye, p)
                         && !crate::bots::smoked(smokes, o.eye, p)
                 })
-            });
-            if spotted {
-                self.seen.insert(t.pseudo.to_string(), (t.feet, self.time));
+            })
+        };
+        let mut spotted_now = Vec::new();
+        for t in targets {
+            // Tête, torse, genoux : vu dès qu'un des trois l'est.
+            let height = 1.8 - 0.35 * t.crouch;
+            let points = [height - 0.2, height * 0.6, 0.45].map(|y| t.feet + Vec3::Y * y);
+            if sees(&points) {
+                spotted_now.push((t.pseudo.to_string(), t.feet));
             }
         }
+        // (v247) « La bombe ne peut être vue par les CT qu'aux mêmes conditions qu'un ennemi » :
+        // posée ou lâchée, elle est sur leur minimap tant qu'un d'eux la voit, puis 3,5 s à la
+        // dernière place vue (elle ne bouge pas : la même). Partie, ou ramassée : oubliée.
+        let bomb_seen = bomb.filter(|&b| sees(&[b + Vec3::Y * 0.15, b + Vec3::Y * 0.4]));
         let now = self.time;
+        for (pseudo, feet) in spotted_now {
+            self.seen.insert(pseudo, (feet, now));
+        }
         self.seen.retain(|_, (_, at)| now - *at <= HOLD);
+        match (bomb, bomb_seen) {
+            (_, Some(b)) => self.bomb = Some((b, now)),
+            (None, _) => self.bomb = None,
+            _ => {}
+        }
+        if self.bomb.is_some_and(|(p, at)| now - at > HOLD || bomb.is_some_and(|b| b.distance(p) > 0.5)) {
+            self.bomb = None;
+        }
+    }
+
+    /// (v247) Bombe (lâchée ou posée) que l'équipe voit ou vient de voir : sa place.
+    pub fn bomb_shown(&self) -> Option<Vec3> {
+        self.bomb.map(|(p, _)| p)
     }
 
     /// Adversaires à montrer sur la minimap : pseudo et dernière position vue.
@@ -174,10 +203,11 @@ mod tests {
             &[me(Vec3::NEG_X)],
             std::slice::from_ref(&enemy),
             &[],
+            None,
         );
         assert_eq!(s.shown().count(), 0);
         // Face à lui : vu.
-        s.update(0.1, &w, &[me(Vec3::X)], std::slice::from_ref(&enemy), &[]);
+        s.update(0.1, &w, &[me(Vec3::X)], std::slice::from_ref(&enemy), &[], None);
         assert_eq!(s.shown().count(), 1);
         // Un mur plein entre les deux : la dernière position reste 3,5 s, puis plus rien.
         for y in 64..68 {
@@ -185,9 +215,9 @@ mod tests {
                 w.set(5, y, z, BlockId::STONE);
             }
         }
-        s.update(3.0, &w, &[me(Vec3::X)], std::slice::from_ref(&enemy), &[]);
+        s.update(3.0, &w, &[me(Vec3::X)], std::slice::from_ref(&enemy), &[], None);
         assert_eq!(s.shown().count(), 1, "encore là au bout de 3 s");
-        s.update(0.6, &w, &[me(Vec3::X)], std::slice::from_ref(&enemy), &[]);
+        s.update(0.6, &w, &[me(Vec3::X)], std::slice::from_ref(&enemy), &[], None);
         assert_eq!(s.shown().count(), 0, "parti après 3,5 s");
     }
 
@@ -208,7 +238,7 @@ mod tests {
             look: Vec3::X,
             own_blind: Some(0.0),
         };
-        s.update(0.1, &w, &[me], std::slice::from_ref(&enemy), &smoke);
+        s.update(0.1, &w, &[me], std::slice::from_ref(&enemy), &smoke, None);
         assert_eq!(s.shown().count(), 0, "derrière la fumée");
         let blinded = Observer {
             pseudo: "moi",
@@ -216,7 +246,7 @@ mod tests {
             look: Vec3::X,
             own_blind: Some(1.5),
         };
-        s.update(0.1, &w, &[blinded], std::slice::from_ref(&enemy), &[]);
+        s.update(0.1, &w, &[blinded], std::slice::from_ref(&enemy), &[], None);
         assert_eq!(s.shown().count(), 0, "écran tout blanc");
         let half = Observer {
             pseudo: "moi",
@@ -224,7 +254,43 @@ mod tests {
             look: Vec3::X,
             own_blind: Some(0.6),
         };
-        s.update(0.1, &w, &[half], std::slice::from_ref(&enemy), &[]);
+        s.update(0.1, &w, &[half], std::slice::from_ref(&enemy), &[], None);
         assert_eq!(s.shown().count(), 1, "pas tout blanc : vu");
+    }
+
+    /// (v247) La bombe posée ou lâchée, côté CT : sur la minimap seulement quand un joueur de
+    /// l'équipe la voit (champ de vision, pas derrière un mur), puis 3,5 s ; ramassée ou
+    /// déplacée, oubliée.
+    #[test]
+    fn the_bomb_is_shown_only_when_someone_sees_it() {
+        let mut w = flat();
+        let bomb = Vec3::new(10.5, 64.0, 0.5);
+        let me = |look: Vec3| Observer {
+            pseudo: "moi",
+            eye: Vec3::new(0.5, 65.62, 0.5),
+            look,
+            own_blind: Some(0.0),
+        };
+        let mut s = Spotting::default();
+        s.update(0.1, &w, &[me(Vec3::NEG_X)], &[], &[], Some(bomb));
+        assert_eq!(s.bomb_shown(), None, "dos tourné");
+        s.update(0.1, &w, &[me(Vec3::X)], &[], &[], Some(bomb));
+        assert_eq!(s.bomb_shown(), Some(bomb), "vue");
+        for y in 64..68 {
+            for z in -3..4 {
+                w.set(5, y, z, BlockId::STONE);
+            }
+        }
+        s.update(3.0, &w, &[me(Vec3::X)], &[], &[], Some(bomb));
+        assert_eq!(s.bomb_shown(), Some(bomb), "encore là au bout de 3 s");
+        s.update(0.6, &w, &[me(Vec3::X)], &[], &[], Some(bomb));
+        assert_eq!(s.bomb_shown(), None, "partie après 3,5 s");
+        // Vue, puis ramassée : oubliée.
+        let mut s = Spotting::default();
+        let w = flat();
+        s.update(0.1, &w, &[me(Vec3::X)], &[], &[], Some(bomb));
+        assert!(s.bomb_shown().is_some());
+        s.update(0.1, &w, &[me(Vec3::NEG_X)], &[], &[], None);
+        assert_eq!(s.bomb_shown(), None);
     }
 }

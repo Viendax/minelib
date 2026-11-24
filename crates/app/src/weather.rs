@@ -240,6 +240,12 @@ impl Weather {
         self.imposed = Some((kind, left.filter(|l| l.is_finite()), fixed && kind.is_some()));
     }
 
+    /// (v247) Le temps qu'il fait est pris d'un coup, sans transition, à la prochaine mise à
+    /// jour (celui du serveur, à l'arrivée : « l'orage et les nuages étaient mal chargés »).
+    pub fn resettle(&mut self) {
+        self.settled = false;
+    }
+
     /// `/weather fix` : figer le temps qu'il fait (ou le laisser changer de nouveau).
     pub fn fix(&mut self, on: bool) {
         if on {

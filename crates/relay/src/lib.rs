@@ -3385,8 +3385,8 @@ fn zeus_request(
 ) {
     use proto::{
         ZEUS_ARC, ZEUS_BUSY, ZEUS_CLAIM, ZEUS_EMPTY, ZEUS_HOLD, ZEUS_MAX_CHARGES,
-        ZEUS_NOT_CREATIVE, ZEUS_NOT_HOLDER, ZEUS_OK, ZEUS_SKY, ZEUS_SKY_HITS, ZEUS_STRIKE,
-        ZEUS_SYNC, ZEUS_TAKEN,
+        ZEUS_NOT_CREATIVE, ZEUS_NOT_HOLDER, ZEUS_OK, ZEUS_RETURN, ZEUS_SKY, ZEUS_SKY_HITS,
+        ZEUS_STRIKE, ZEUS_SYNC, ZEUS_TAKEN,
     };
     let Some(room) = st.rooms.get(&rid) else {
         return;
@@ -3426,8 +3426,18 @@ fn zeus_request(
         }
         ZEUS_CLAIM if !in_creative(st, &server, &creator, pseudo) => ZEUS_NOT_CREATIVE,
         ZEUS_CLAIM => {
+            // (v247) Avec les charges qu'elle avait (rendue au menu créatif, elle les garde ;
+            // aucune la première fois).
             l.holder = me.clone();
-            l.charges = 0;
+            l.sky_hits = 0;
+            ZEUS_OK
+        }
+        // (v247) Rendue au menu créatif par celui qui l'a, en créatif : personne ne l'a plus
+        // (tout le serveur l'apprend, plus bas), le catalogue la redonne.
+        ZEUS_RETURN if l.holder != me => ZEUS_NOT_HOLDER,
+        ZEUS_RETURN if !in_creative(st, &server, &creator, pseudo) => ZEUS_NOT_CREATIVE,
+        ZEUS_RETURN => {
+            l.holder.clear();
             l.sky_hits = 0;
             ZEUS_OK
         }
@@ -3481,7 +3491,7 @@ fn zeus_request(
         transport::push(&c.tx, &reply(seq));
     }
     // Quelqu'un vient de la prendre : tout le serveur le sait (le catalogue ne la donne
-    // plus).
+    // plus). (v247) Ou de la rendre : le catalogue la redonne.
     if l.holder != before.holder {
         let news = Response::Zeus {
             seq: 0,
@@ -12447,7 +12457,7 @@ mod tests {
     fn the_legendary_bolt_is_held_by_the_world_relay() {
         use proto::{
             ZEUS_CLAIM, ZEUS_EMPTY, ZEUS_HOLD, ZEUS_NOT_CREATIVE, ZEUS_NOT_HOLDER, ZEUS_OK,
-            ZEUS_SKY, ZEUS_STRIKE, ZEUS_SYNC, ZEUS_TAKEN,
+            ZEUS_RETURN, ZEUS_SKY, ZEUS_STRIKE, ZEUS_SYNC, ZEUS_TAKEN,
         };
         let dir = std::env::temp_dir().join(format!("minelib-zeus-{}", rand::random::<u32>()));
         ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -12648,10 +12658,36 @@ mod tests {
         };
         assert_eq!(denied, game::BuildMsg::Denied { seq: 30 });
 
+        // (v247) Rendue au menu créatif : seulement par elle, en créatif ; personne ne l'a
+        // plus, tout le serveur l'apprend ; ses charges restent avec elle, et le créateur la
+        // prend.
+        std::thread::sleep(Duration::from_millis(1100));
+        zeus(&eve, 13, ZEUS_SKY, 0);
+        assert_eq!(zeus(&eve, 14, ZEUS_SKY, 0).2, 1);
+        assert_eq!(zeus(&createur, 15, ZEUS_RETURN, 0).0, ZEUS_NOT_HOLDER);
+        gamemode(&createur, "Eve", "survival");
+        wait(&eve, |e| matches!(e, Event::SetGamemode { .. }));
+        assert_eq!(zeus(&eve, 16, ZEUS_RETURN, 0).0, ZEUS_NOT_CREATIVE);
+        gamemode(&createur, "Eve", "creative");
+        wait(&eve, |e| matches!(e, Event::SetGamemode { .. }));
+        let (why, holder, ..) = zeus(&eve, 17, ZEUS_RETURN, 0);
+        assert_eq!((why, holder.as_str()), (ZEUS_OK, ""));
+        match wait(&createur, |e| matches!(e, Event::Zeus { seq: 0, .. })) {
+            Event::Zeus { holder, .. } => assert_eq!(holder, ""),
+            _ => unreachable!(),
+        }
+        let (why, holder, charges, ..) = zeus(&createur, 18, ZEUS_CLAIM, 0);
+        assert_eq!((why, holder.as_str(), charges), (ZEUS_OK, "createur", 1));
+        assert_eq!(zeus(&eve, 19, ZEUS_CLAIM, 0).0, ZEUS_TAKEN);
+        let (why, holder, ..) = zeus(&createur, 20, ZEUS_RETURN, 0);
+        assert_eq!((why, holder.as_str()), (ZEUS_OK, ""));
+        let (why, holder, charges, ..) = zeus(&eve, 21, ZEUS_CLAIM, 0);
+        assert_eq!((why, holder.as_str(), charges), (ZEUS_OK, "eve", 1));
+
         // Gardée sur le disque du relais : toujours à Eve, avec la graine du monde.
         let l = servers::Store::open(dir.join("serveurs.bin"))
             .legend(&servers::key("Createur", "monde"));
-        assert_eq!((l.holder.as_str(), l.charges, l.seed), ("eve", 0, Some(4242)));
+        assert_eq!((l.holder.as_str(), l.charges, l.seed), ("eve", 1, Some(4242)));
         drop((createur, eve));
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);

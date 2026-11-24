@@ -2186,18 +2186,12 @@ impl Editor {
                     "Au quart, quatre fois moins de calcul pour une image presque identique (les rayons sont flous par nature).",
                     DIM,
                 );
-                if let Some(v) = self.slider(
-                    p,
-                    202,
-                    "Distance max",
-                    r.vl_max_dist,
-                    8.0,
-                    256.0,
-                    1.0,
-                    &blocks(r.vl_max_dist, 0),
-                ) {
-                    r.vl_max_dist = v.round();
-                }
+                // (v247) Plus de « Distance max » : les rayons se voient aussi loin que la
+                // lumière éclaire (la distance de rendu).
+                p.note(
+                    "Les rayons se voient aussi loin que la lumière éclaire (distance de rendu).",
+                    DIM,
+                );
                 if let Some(v) = self.slider(
                     p,
                     203,

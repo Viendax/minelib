@@ -215,6 +215,9 @@ pub struct Strike {
     pub seed: u32,
     /// (v244) Arc parti de l'éclair qu'on tient : il suit sa pointe (`arc_from`).
     pub follow: bool,
+    /// (v247) Lancée par ce joueur (Foudre de Zeus, `/thor`) : ce qu'elle touche, il l'a
+    /// frappé lui-même (« Pistache peut être trouvé en tapant avec la foudre »).
+    pub mine: bool,
 }
 
 impl Strike {
@@ -397,6 +400,7 @@ impl Strike {
             leader_s,
             strokes,
             landed: false,
+            mine: false,
             seed,
             follow: false,
         }

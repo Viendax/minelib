@@ -64,6 +64,9 @@ pub struct Online {
     /// réponse n'est pas encore là.
     pub hold_asked: bool,
     pub holding: bool,
+    /// (v247) On la rend au menu créatif (supprimée en créatif) : réponse attendue ; d'ici
+    /// là, elle ne nous est pas remise.
+    pub returning: bool,
 }
 
 impl Online {

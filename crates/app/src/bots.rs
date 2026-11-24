@@ -119,8 +119,13 @@ const NAMES: [&str; 20] = [
     "Théa",
 ];
 
-/// Le bot voit jusqu'à 60° de chaque côté de son regard.
-const VIEW_COS: f32 = 0.5;
+/// (v247) « Les bots ne peuvent nous voir que si on est sur leur écran (même s'ils n'en ont
+/// pas) » : le champ d'un écran 16:9 au champ de vision du jeu (`session::FOV`, 75° en
+/// hauteur, 107° en largeur), tangentes des demi-angles. Avant : un cône de 60° de chaque côté
+/// (plus haut et plus bas qu'un écran), et un ennemi à moins de 2 blocs était « senti » même
+/// dans le dos.
+const VIEW_TAN_V: f32 = 0.767_327;
+const VIEW_TAN_H: f32 = VIEW_TAN_V * 16.0 / 9.0;
 /// Un regard sur les ennemis tous les 4 pas (64 par seconde), décalé d'un bot à l'autre.
 const LOOK_EVERY: u32 = 4;
 /// Une décision (où aller) tous les 32 pas (8 par seconde).
@@ -1222,6 +1227,16 @@ fn look_dir(yaw: f32, pitch: f32) -> Vec3 {
     Vec3::new(sy * cp, sp, -cy * cp)
 }
 
+/// (v247) Le point `d` (depuis l'œil) est-il sur l'écran d'un joueur qui regarde `look` (lacet
+/// `yaw`) : devant, et dans le champ en largeur comme en hauteur (`VIEW_TAN_H`, `VIEW_TAN_V`) ?
+fn on_screen(yaw: f32, look: Vec3, d: Vec3) -> bool {
+    let (sy, cy) = yaw.sin_cos();
+    let right = Vec3::new(cy, 0.0, sy);
+    let up = right.cross(look);
+    let z = d.dot(look);
+    z > 1e-3 && d.dot(right).abs() <= VIEW_TAN_H * z && d.dot(up).abs() <= VIEW_TAN_V * z
+}
+
 /// Écart d'angle ramené entre −π et π.
 fn wrap(a: f32) -> f32 {
     (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
@@ -1639,13 +1654,16 @@ impl Brain {
             if dist > RANGE {
                 continue;
             }
-            // Devant lui (ou tout près : on le sent).
-            let in_view = dist < 2.0 || d.normalize_or_zero().dot(look) > VIEW_COS;
+            // (v247) Sur son écran, et rien entre eux (blocs pleins, fumée) : une des parties
+            // à la fois dans le champ et à découvert.
+            let parts = [head, e.chest(), e.feet + Vec3::Y * 0.5];
+            let in_view = parts.iter().any(|&p| on_screen(self.yaw, look, p - eye));
             if in_view {
-                let parts = [head, e.chest(), e.feet + Vec3::Y * 0.5];
-                let visible = parts
-                    .iter()
-                    .any(|&p| clear_sight(world, eye, p) && !smoked(s.smokes, eye, p));
+                let visible = parts.iter().any(|&p| {
+                    on_screen(self.yaw, look, p - eye)
+                        && clear_sight(world, eye, p)
+                        && !smoked(s.smokes, eye, p)
+                });
                 if visible {
                     self.seen.insert(e.id, (e.feet, cx.time));
                     let team = &mut cx.intel[team_index(me.team)];
@@ -2798,6 +2816,28 @@ struct Move {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v247) Un bot ne voit que ce qui est sur son écran (75° en hauteur, 107° en largeur) :
+    /// ni dans son dos, même tout près, ni trop sur le côté, ni trop haut.
+    #[test]
+    fn a_bot_sees_only_what_is_on_its_screen() {
+        let yaw = 0.0;
+        let look = look_dir(yaw, 0.0);
+        let at = |deg_h: f32, deg_v: f32| {
+            Vec3::new(10.0 * deg_h.to_radians().tan(), 10.0 * deg_v.to_radians().tan(), -10.0)
+        };
+        assert!(on_screen(yaw, look, at(0.0, 0.0)));
+        assert!(on_screen(yaw, look, at(50.0, 0.0)));
+        assert!(!on_screen(yaw, look, at(56.0, 0.0)), "trop sur le côté");
+        assert!(on_screen(yaw, look, at(0.0, 35.0)));
+        assert!(!on_screen(yaw, look, at(0.0, 40.0)), "trop haut");
+        assert!(!on_screen(yaw, look, Vec3::new(0.0, 0.0, 1.5)), "dans le dos, tout près");
+        // Tourné vers l'est, la tête levée : le champ suit son regard.
+        let (yaw, pitch) = (std::f32::consts::FRAC_PI_2, 0.5);
+        let look = look_dir(yaw, pitch);
+        assert!(on_screen(yaw, look, look * 10.0));
+        assert!(!on_screen(yaw, look, Vec3::new(-10.0, 0.0, 0.0)));
+    }
 
     #[test]
     fn keys_follow_the_wanted_direction_whatever_the_view() {

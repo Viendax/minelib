@@ -144,11 +144,23 @@ impl Item {
         }
     }
 
+    /// (v247) Couleur du nom de l'objet (sRGB), la même partout où il est écrit : dans son
+    /// info-bulle et au-dessus de la barre quand on le choisit (« tout nom d'objet coloré doit
+    /// l'être à cet endroit aussi, de la même couleur ; fais en sorte que ce soit lié dans le
+    /// code »). L'info-bulle (`tooltip`) et la barre (`draw`) la prennent ici : un nom ne peut
+    /// pas avoir une couleur à un endroit et une autre ailleurs.
+    pub fn name_color(self) -> [u8; 3] {
+        match self {
+            Item::Zeus => [170, 205, 255],
+            _ => self.flame().map_or([240, 240, 240], brighten),
+        }
+    }
+
     /// Lignes de l'info-bulle : (texte, couleur sRGB).
     pub fn tooltip(self) -> Vec<(String, [u8; 3])> {
         const WHITE: [u8; 3] = [240, 240, 240];
         const GREY: [u8; 3] = [170, 175, 185];
-        let mut lines = vec![(self.name(), self.flame().map_or(WHITE, brighten))];
+        let mut lines = vec![(self.name(), self.name_color())];
         match self {
             Item::Block(_) => lines.push(("Bloc de construction".into(), GREY)),
             Item::Wand => {
@@ -182,7 +194,6 @@ impl Item {
                 ));
             }
             Item::Zeus => {
-                lines[0].1 = [170, 205, 255];
                 lines.push(("Un éclair tenu en main".into(), WHITE));
                 match crate::zeus::shown() {
                     // (v241) Objet légendaire : ses charges et ce que fait un coup.
@@ -203,8 +214,10 @@ impl Item {
                             ),
                             WHITE,
                         ));
+                        // (v247) « N'écris pas que les éclairs chargent notre foudre, indique-le
+                        // sur l'objet : en tapant le ciel et quand la foudre vient. »
                         lines.push((
-                            "Deux coups vers le ciel, ou un éclair dans les nuages : une charge".into(),
+                            "Se charge en tapant le ciel, et quand la foudre vient".into(),
                             GREY,
                         ));
                     }
@@ -284,6 +297,12 @@ pub struct Inventory {
     pub tab: usize,
     /// Barre de défilement du catalogue tenue à la souris.
     dragging: bool,
+    /// (v247) Pile tenue promenée sur plusieurs cases, bouton tenu : à répartir au relâcher.
+    spread: Option<Spread>,
+    /// (v247) Horloge (s), et la dernière pile prise d'une case par un clic (case, moment) :
+    /// un second clic dessus juste après est un double-clic.
+    clock: f32,
+    last_pick: Option<(usize, f32)>,
     /// Coffre ouvert (sa case) : l'écran montre ses 3 lignes de 10 au-dessus de
     /// l'inventaire. Son contenu (`chest_slots`) est recopié du monde à chaque image.
     pub chest: Option<[i32; 3]>,
@@ -302,6 +321,9 @@ pub struct Inventory {
     /// le relais du monde qui le donne (`legend_wanted` : la partie le lui demande).
     pub legend_ask: bool,
     pub legend_wanted: bool,
+    /// (v247) Il vient d'être supprimé dans le menu créatif : il y retourne (la partie le note
+    /// avec la carte : personne ne l'a plus).
+    pub legend_returned: bool,
     /// (v241) Message à dire dans le tchat (un refus), que la partie reprend.
     pub notice: Option<&'static str>,
 }
@@ -309,8 +331,6 @@ pub struct Inventory {
 /// (v241) Refus du catalogue : l'éclair de la carte a déjà été pris.
 pub const LEGEND_GONE: &str =
     "La Foudre de Zeus de cette carte a déjà été prise : il n'y en a qu'une.";
-/// (v241) Refus de la poubelle.
-pub const LEGEND_KEPT: &str = "La Foudre de Zeus ne peut pas être supprimée.";
 /// (v244) Sur un serveur : déjà prise ; et elle y reste avec celui qui l'a prise.
 pub const LEGEND_GONE_ONLINE: &str =
     "La Foudre de Zeus de ce serveur a déjà été prise : il n'y en a qu'une.";
@@ -763,6 +783,32 @@ fn shade(c: [u8; 3], k: f32) -> [u8; 3] {
     c.map(|v| (v as f32 * k).clamp(0.0, 255.0) as u8)
 }
 
+/// (v247) « Si je prends des objets en main et que je maintiens le clic en glissant sur
+/// plusieurs cases, ça les répartit sur toutes ces cases » : la pile tenue, posée dès l'appui
+/// sur la première case (comme un clic), est reprise quand le curseur passe sur une autre
+/// case (vide, ou du même objet) ; au relâcher, elle est répartie sur toutes, à parts égales
+/// (clic gauche ; le reste reste en main) ou une par case (clic droit).
+struct Spread {
+    right: bool,
+    /// Cases parcourues, dans l'ordre.
+    slots: Vec<usize>,
+    /// La première case et la pile tenue avant l'appui (pour reprendre la pose du clic).
+    first: Option<Stack>,
+    held: Stack,
+}
+
+/// (v247) Double-clic : deux appuis sur la même case en moins de tant (s).
+const DOUBLE_CLICK_S: f32 = 0.35;
+
+/// (v247) Ordre où un double-clic va chercher de quoi compléter sa pile : « de droite à
+/// gauche en commençant par le bas pour aller vers le haut » : la barre (en bas), puis les
+/// lignes du sac, de la plus basse à la plus haute, chacune de droite à gauche.
+fn collect_order() -> impl Iterator<Item = usize> {
+    (0..HOTBAR)
+        .rev()
+        .chain((0..ROWS).rev().flat_map(|r| (0..COLS).rev().map(move |c| HOTBAR + r * COLS + c)))
+}
+
 impl Inventory {
     pub fn empty() -> Self {
         Self {
@@ -776,6 +822,9 @@ impl Inventory {
             scroll_row: 0,
             tab: 0,
             dragging: false,
+            spread: None,
+            clock: 0.0,
+            last_pick: None,
             chest: None,
             chest_slots: [None; CHEST_SLOTS],
             chest_action: None,
@@ -784,8 +833,25 @@ impl Inventory {
             legend_took: false,
             legend_ask: false,
             legend_wanted: false,
+            legend_returned: false,
             notice: None,
         }
+    }
+
+    /// (v247) La Foudre de Zeus a été supprimée dans le menu créatif : elle y retourne (on peut
+    /// l'y reprendre) ; la partie le note avec la carte (`legend_returned`).
+    fn legend_back(&mut self) {
+        self.legend_free = true;
+        self.legend_returned = true;
+    }
+
+    /// (v247) Case de la barre qu'un objet donné d'office (clic molette en créatif, `//wand`)
+    /// peut remplacer : celle en main, sinon la suivante, jamais celle de la Foudre de Zeus (le
+    /// clic molette la supprimait).
+    pub fn replaceable_slot(&self) -> Option<usize> {
+        (0..HOTBAR)
+            .map(|k| (self.selected + k) % HOTBAR)
+            .find(|&i| !self.slots[i].is_some_and(|s| s.item == Item::Zeus))
     }
 
     /// (v241) Cette pile est-elle l'objet légendaire (que rien ne supprime) ?
@@ -835,7 +901,25 @@ impl Inventory {
         cursor: Option<(f32, f32)>,
         pressed: bool,
         held: bool,
+        right_held: bool,
     ) {
+        // (v247) Pile tenue répartie en glissant sur les cases.
+        if self.spread.is_some() {
+            let over = cursor.filter(|_| self.open).and_then(|(x, y)| {
+                if self.creative {
+                    let c = Creative::new(size.0, size.1);
+                    c.hotbar_at(x, y).or_else(|| c.storage_at(x, y).map(|i| HOTBAR + i))
+                } else {
+                    Layout::new(size.0, size.1).slot_at(x, y, true)
+                }
+            });
+            let button = if self.spread.as_ref().is_some_and(|s| s.right) {
+                right_held
+            } else {
+                held
+            };
+            self.spread_pointer(over, button && self.open);
+        }
         if !(self.open && self.creative) {
             self.dragging = false;
             return;
@@ -1058,12 +1142,127 @@ impl Inventory {
 
     pub fn update(&mut self, dt: f32) {
         self.name_timer = (self.name_timer - dt).max(0.0);
+        self.clock += dt;
+    }
+
+    /// (v247) Appui sur la case `i` de son inventaire (barre ou sac, pas Maj) : un double-clic
+    /// sur la pile qu'on vient d'y prendre la complète avec le même objet pris ailleurs
+    /// (`collect_order`) ; sinon c'est un clic (`click_slot`), et une pile tenue posée ici peut
+    /// encore être répartie en glissant (`spread`).
+    fn press_slot(&mut self, i: usize, right: bool, pick: Option<(usize, f32)>) {
+        let double = !right
+            && pick.is_some_and(|(j, t)| j == i && self.clock - t < DOUBLE_CLICK_S)
+            && self.held.is_some_and(|h| {
+                h.count < MAX_STACK && self.slots[i].is_none_or(|s| s.item == h.item)
+            });
+        if double {
+            self.collect_into_held();
+            return;
+        }
+        let before = (self.slots[i], self.held);
+        self.spread = None;
+        if let (Some(h), first) = (before.1, before.0) {
+            if first.is_none_or(|f| f.item == h.item) {
+                self.spread = Some(Spread {
+                    right,
+                    slots: vec![i],
+                    first,
+                    held: h,
+                });
+            }
+        }
+        self.click_slot(i, right);
+        // Une pile prise ici (rien en main avant) : un second clic tout de suite après la
+        // complète.
+        if before.1.is_none() && self.held.is_some() {
+            self.last_pick = Some((i, self.clock));
+        }
+    }
+
+    /// (v247) Double-clic : la pile au bout du curseur se complète avec le même objet pris
+    /// dans les autres cases, jusqu'à 64, dans l'ordre de `collect_order`.
+    fn collect_into_held(&mut self) {
+        let Some(mut h) = self.held else {
+            return;
+        };
+        for k in collect_order() {
+            if h.count >= MAX_STACK {
+                break;
+            }
+            if let Some(s) = self.slots[k].filter(|s| s.item == h.item) {
+                let n = s.count.min(MAX_STACK - h.count);
+                h.count += n;
+                self.slots[k] = (s.count > n).then_some(Stack {
+                    item: s.item,
+                    count: s.count - n,
+                });
+            }
+        }
+        self.held = Some(h);
+    }
+
+    /// (v247) Bouton tenu après un appui qui a posé la pile tenue : la case `over` sous le
+    /// curseur (vide, ou du même objet) s'ajoute à la répartition ; relâché, la pile est
+    /// répartie (`spread_out`).
+    fn spread_pointer(&mut self, over: Option<usize>, held: bool) {
+        let Some(mut sp) = self.spread.take() else {
+            return;
+        };
+        if !held {
+            if sp.slots.len() >= 2 {
+                self.spread_out(sp);
+            }
+            return;
+        }
+        if let Some(j) = over {
+            let fits = self.slots[j].is_none_or(|s| s.item == sp.held.item && s.count < MAX_STACK);
+            // Au moins un objet par case.
+            let enough = sp.held.count as usize > sp.slots.len();
+            if !sp.slots.contains(&j) && fits && enough {
+                if sp.slots.len() == 1 {
+                    // La pose du clic est reprise : tout sera réparti au relâcher.
+                    self.slots[sp.slots[0]] = sp.first;
+                    self.held = Some(sp.held);
+                }
+                sp.slots.push(j);
+            }
+        }
+        self.spread = Some(sp);
+    }
+
+    /// (v247) Répartition au relâcher : à parts égales (clic gauche ; ce qui ne se partage pas
+    /// reste au bout du curseur) ou une par case (clic droit), sans dépasser 64 par case.
+    fn spread_out(&mut self, sp: Spread) {
+        let mut left = sp.held.count;
+        let each = if sp.right {
+            1
+        } else {
+            sp.held.count / sp.slots.len() as u32
+        };
+        for &k in &sp.slots {
+            let have = self.slots[k].map_or(0, |s| s.count);
+            let n = each.min(MAX_STACK - have).min(left);
+            if n == 0 {
+                continue;
+            }
+            self.slots[k] = Some(Stack {
+                item: sp.held.item,
+                count: have + n,
+            });
+            left -= n;
+        }
+        self.held = (left > 0).then_some(Stack {
+            item: sp.held.item,
+            count: left,
+        });
     }
 
     /// Clic dans l'inventaire ouvert. `right` : clic droit (moitié / un seul objet),
     /// `shift` : Maj enfoncée (catalogue : pile directement dans la barre ; poubelle : tout
     /// vider).
     pub fn click(&mut self, size: (f32, f32), cursor: (f32, f32), right: bool, shift: bool) {
+        // (v247) Double-clic : seulement juste après avoir pris une pile (`press_slot`).
+        let pick = self.last_pick.take();
         // Coffre ouvert : un clic prend dans le coffre ou y pose (la partie fait le reste,
         // avec l'arbitre des objets).
         if self.chest.is_some() {
@@ -1077,7 +1276,7 @@ impl Inventory {
             return;
         }
         if self.creative {
-            self.click_creative(size, cursor, right, shift);
+            self.click_creative(size, cursor, right, shift, pick);
             return;
         }
         let layout = Layout::new(size.0, size.1);
@@ -1088,7 +1287,7 @@ impl Inventory {
             self.quick_move(i);
             return;
         }
-        self.click_slot(i, right);
+        self.press_slot(i, right, pick);
     }
 
     /// Maj + clic sur un emplacement (rien en main) : sa pile passe de la barre rapide à
@@ -1124,7 +1323,14 @@ impl Inventory {
         self.slots[i] = Some(s);
     }
 
-    fn click_creative(&mut self, size: (f32, f32), cursor: (f32, f32), right: bool, shift: bool) {
+    fn click_creative(
+        &mut self,
+        size: (f32, f32),
+        cursor: (f32, f32),
+        right: bool,
+        shift: bool,
+        pick: Option<(usize, f32)>,
+    ) {
         let c = Creative::new(size.0, size.1);
         let (x, y) = cursor;
         if let Some(t) = c.tab_at(x, y) {
@@ -1133,35 +1339,41 @@ impl Inventory {
             return;
         }
         // Poubelle : détruit l'objet tenu ; Maj + clic : vide tout l'inventaire.
-        // (v241) Sauf l'objet légendaire : il reste au bout du curseur, ou dans sa case.
+        // (v241) Sauf l'objet légendaire. (v247) En créatif, « je dois pouvoir remettre la
+        // foudre dans le menu créatif » : supprimée ici, elle y retourne (on peut l'y
+        // reprendre) ; en survie, rien ne la supprime (ce menu n'existe pas en survie).
         if Creative::inside(c.trash, c.slot, x, y) {
-            if self.is_legend(self.held) {
-                self.notice = Some(LEGEND_KEPT);
-                return;
-            }
-            if self.held.take().is_none() && shift {
-                for i in 0..SLOTS {
-                    if !self.is_legend(self.slots[i]) {
+            match self.held.take() {
+                Some(h) => {
+                    if self.is_legend(Some(h)) {
+                        self.legend_back();
+                    }
+                }
+                None if shift => {
+                    for i in 0..SLOTS {
+                        if self.is_legend(self.slots[i]) {
+                            self.legend_back();
+                        }
                         self.slots[i] = None;
                     }
                 }
+                None => {}
             }
             return;
         }
         if let Some(k) = c.cell_at(x, y) {
+            // Objet tenu relâché sur le catalogue : il disparaît (comme dans Minecraft), (v247)
+            // sur un objet comme sur une case vide ; la Foudre de Zeus retourne au menu.
+            if let Some(h) = self.held.take() {
+                if self.is_legend(Some(h)) {
+                    self.legend_back();
+                }
+                return;
+            }
             let list = self.filtered();
             let Some(&item) = list.get(self.scroll_row * CAT_COLS + k) else {
                 return;
             };
-            // Objet tenu relâché sur le catalogue : il disparaît (comme dans Minecraft).
-            // (v241) Pas l'objet légendaire.
-            if self.is_legend(self.held) {
-                self.notice = Some(LEGEND_KEPT);
-                return;
-            }
-            if self.held.take().is_some() {
-                return;
-            }
             // (v241) La Foudre de Zeus : un seul exemplaire, une seule fois par carte.
             let legend = self.legend && item == Item::Zeus;
             if legend && !self.legend_free {
@@ -1178,7 +1390,9 @@ impl Inventory {
                 self.legend_wanted = true;
                 return;
             }
-            let count = if right || legend { 1 } else { MAX_STACK };
+            // (v247) « Clic gauche : un seul en main, clic droit : la pile la plus grande
+            // possible » (avant : l'inverse) ; Maj + clic : la pile, dans la barre.
+            let count = if right && !legend { MAX_STACK } else { 1 };
             if shift {
                 // (Jamais par-dessus l'objet légendaire.)
                 let slot = (0..HOTBAR)
@@ -1209,16 +1423,15 @@ impl Inventory {
             .or_else(|| c.storage_at(x, y).map(|i| HOTBAR + i));
         if let Some(i) = slot {
             // Maj + clic sur une case de son inventaire (rien en main) : l'objet est
-            // supprimé, comme dans l'inventaire créatif de Minecraft.
+            // supprimé, comme dans l'inventaire créatif de Minecraft. (v247) La Foudre de Zeus
+            // aussi : elle retourne au menu.
             if shift && self.held.is_none() {
-                // (v241) Pas l'objet légendaire.
                 if self.is_legend(self.slots[i]) {
-                    self.notice = Some(LEGEND_KEPT);
-                } else {
-                    self.slots[i] = None;
+                    self.legend_back();
                 }
+                self.slots[i] = None;
             } else {
-                self.click_slot(i, right);
+                self.press_slot(i, right, pick);
             }
         }
     }
@@ -1336,7 +1549,8 @@ impl Inventory {
                     let name = item.name();
                     let w = Ui::text_width(&name, s);
                     let a = self.name_timer.min(1.0);
-                    let c = item.flame().map_or([240, 240, 240], brighten);
+                    // (v247) La couleur de son info-bulle (Foudre de Zeus comprise).
+                    let c = item.name_color();
                     ui.text(
                         (size.0 - w) / 2.0,
                         l.hotbar.1 - 12.0 * s,
@@ -1817,10 +2031,11 @@ mod tests {
     }
 
     /// (v241) La Foudre de Zeus, objet légendaire : le catalogue en donne un seul exemplaire,
-    /// une seule fois par carte ; ni la poubelle, ni Maj + clic, ni le catalogue ne la
-    /// suppriment ; une carte d'avant qui en a des piles n'en garde qu'une.
+    /// une seule fois par carte ; une carte d'avant qui en a des piles n'en garde qu'une.
+    /// (v247) Supprimée dans le menu créatif (catalogue, poubelle, Maj + clic), elle y
+    /// retourne, et peut y être reprise.
     #[test]
-    fn the_legendary_bolt_is_taken_once_and_never_deleted() {
+    fn the_legendary_bolt_is_taken_once_and_goes_back_to_the_menu() {
         let mut inv = Inventory::empty();
         inv.creative = true;
         inv.open = true;
@@ -1835,11 +2050,17 @@ mod tests {
         inv.click(size, mid(c.cell_pos(0)), false, false);
         assert_eq!(inv.held, Some(Stack { item: Item::Zeus, count: 1 }));
         assert!(inv.legend_took && !inv.legend_free && inv.has_zeus());
-        // Relâché sur le catalogue ou sur la poubelle : il reste au bout du curseur.
-        inv.click(size, mid(c.cell_pos(0)), false, false);
-        assert!(inv.held.is_some() && inv.notice.take() == Some(LEGEND_KEPT));
-        inv.click(size, mid(c.trash), false, false);
-        assert!(inv.held.is_some() && inv.notice.take() == Some(LEGEND_KEPT));
+        // (v247) Relâché sur le catalogue ou sur la poubelle : il retourne au menu, d'où on le
+        // reprend.
+        for back in [mid(c.cell_pos(0)), mid(c.cell_pos(30)), mid(c.trash)] {
+            inv.legend_took = false;
+            inv.click(size, back, false, false);
+            assert!(inv.held.is_none() && inv.legend_free && !inv.has_zeus());
+            assert!(std::mem::take(&mut inv.legend_returned));
+            inv.click(size, mid(c.cell_pos(0)), false, false);
+            assert_eq!(inv.held, Some(Stack { item: Item::Zeus, count: 1 }));
+            assert!(inv.legend_took && !inv.legend_free);
+        }
         // Posé dans la barre ; un second ne se prend pas, même avec Maj.
         inv.click(size, mid(c.hotbar_pos(3)), false, false);
         assert!(inv.held.is_none() && inv.slots[3].is_some());
@@ -1851,12 +2072,22 @@ mod tests {
             inv.slots.iter().flatten().filter(|s| s.item == Item::Zeus).map(|s| s.count).sum::<u32>()
         };
         assert_eq!(zeus(&inv), 1);
-        // Maj + clic sur sa case, Maj + clic sur la poubelle (tout vider) : il reste.
-        inv.slots[5] = Some(Stack { item: Item::Wand, count: 1 });
+        // (v247) Maj + clic sur sa case : supprimé, il retourne au menu ; repris et reposé,
+        // Maj + clic sur la poubelle (tout vider) : de même.
         inv.click(size, mid(c.hotbar_pos(3)), false, true);
-        assert!(inv.slots[3].is_some() && inv.notice.take() == Some(LEGEND_KEPT));
+        assert!(inv.slots[3].is_none() && inv.legend_free && zeus(&inv) == 0);
+        assert!(std::mem::take(&mut inv.legend_returned));
+        inv.click(size, mid(c.cell_pos(0)), false, false);
+        inv.click(size, mid(c.hotbar_pos(3)), false, false);
+        inv.legend_free = false;
+        inv.slots[5] = Some(Stack { item: Item::Wand, count: 1 });
         inv.click(size, mid(c.trash), false, true);
-        assert!(inv.slots[5].is_none() && zeus(&inv) == 1);
+        assert!(inv.slots[5].is_none() && zeus(&inv) == 0 && inv.legend_free);
+        assert!(std::mem::take(&mut inv.legend_returned));
+        inv.click(size, mid(c.cell_pos(0)), false, false);
+        inv.click(size, mid(c.hotbar_pos(3)), false, false);
+        inv.legend_free = false;
+        assert_eq!(zeus(&inv), 1);
         // Maj + clic dans le catalogue, barre pleine : un autre objet ne prend pas sa place.
         inv.search.clear();
         inv.search_input("baguette", false, 0.0);
@@ -1890,7 +2121,7 @@ mod tests {
         net.creative = true;
         net.open = true;
         net.search_input("foudre de zeus", false, 0.0);
-        net.click(size, mid(c.cell_pos(0)), false, false);
+        net.click(size, mid(c.cell_pos(0)), true, false);
         assert_eq!(net.held.map(|h| h.count), Some(MAX_STACK));
         assert!(!net.legend_took);
     }
@@ -1947,11 +2178,23 @@ mod tests {
         inv.search.clear();
         inv.search_input("ESCALIER planche", false, 0.0);
         inv.search.clear();
-        // Prendre une pile dans le catalogue, la poser dans la barre, puis la jeter.
+        // Prendre une pile dans le catalogue, la poser dans la barre, puis la jeter. (v247)
+        // Clic gauche : un seul ; clic droit : la pile ; un objet tenu relâché sur une case
+        // vide du catalogue disparaît aussi.
         let size = (1280.0, 720.0);
         let c = Creative::new(size.0, size.1);
         let mid = |p: (f32, f32)| (p.0 + c.slot / 2.0, p.1 + c.slot / 2.0);
+        inv.search_input("zzzzqqq introuvable", false, 0.0);
+        assert!(inv.filtered().is_empty());
+        inv.held = Some(Stack { item: Item::Wand, count: 1 });
         inv.click(size, mid(c.cell_pos(0)), false, false);
+        assert!(inv.held.is_none());
+        inv.search.clear();
+        inv.click(size, mid(c.cell_pos(0)), false, false);
+        assert_eq!(inv.held.map(|h| h.count), Some(1));
+        inv.click(size, mid(c.cell_pos(0)), true, false);
+        assert!(inv.held.is_none());
+        inv.click(size, mid(c.cell_pos(0)), true, false);
         assert_eq!(inv.held.map(|h| h.count), Some(MAX_STACK));
         inv.click(size, mid(c.hotbar_pos(3)), false, false);
         assert!(inv.slots[3].is_some() && inv.held.is_none());
@@ -1960,12 +2203,12 @@ mod tests {
         assert!(inv.held.is_none() && inv.slots[3].is_none());
         // Barre de défilement : glisser jusqu'en bas affiche la fin de la liste.
         let (bx, by, bw, bh) = c.scrollbar;
-        inv.pointer(size, Some((bx + bw / 2.0, by + 2.0)), true, true);
+        inv.pointer(size, Some((bx + bw / 2.0, by + 2.0)), true, true, false);
         assert_eq!(inv.scroll_row, 0);
-        inv.pointer(size, Some((bx + bw / 2.0, by + bh)), false, true);
+        inv.pointer(size, Some((bx + bw / 2.0, by + bh)), false, true, false);
         let rows = inv.filtered().len().div_ceil(CAT_COLS);
         assert_eq!(inv.scroll_row, rows - CAT_ROWS);
-        inv.pointer(size, Some((0.0, 0.0)), false, false);
+        inv.pointer(size, Some((0.0, 0.0)), false, false, false);
         assert!(!inv.dragging);
         // Maj + clic sur une case de la barre : l'objet est supprimé (les autres restent).
         inv.click(size, mid(c.cell_pos(0)), false, true);
@@ -1981,6 +2224,75 @@ mod tests {
         assert!(inv.slots.iter().any(|s| s.is_some()));
         inv.click(size, mid(c.trash), false, true);
         assert!(inv.slots.iter().all(|s| s.is_none()));
+    }
+
+    /// (v247) « Glisser en maintenant le clic sur plusieurs cases répartit les objets » (clic
+    /// gauche : à parts égales, le reste en main ; clic droit : un par case) ; « double-clic :
+    /// la pile se complète, de droite à gauche, en commençant par le bas » (la barre, puis le
+    /// sac de bas en haut).
+    #[test]
+    fn a_held_stack_spreads_over_dragged_slots_and_a_double_click_fills_it() {
+        let mut inv = Inventory::empty();
+        inv.open = true;
+        let size = (1280.0, 720.0);
+        let l = Layout::new(size.0, size.1);
+        let at = |i: usize| {
+            let (x, y) = l.slot_pos(i, true);
+            (x + l.slot / 2.0, y + l.slot / 2.0)
+        };
+        let stone = Item::Block(minelib_world::BlockId::STONE);
+        let counts = |inv: &Inventory, a: &[usize]| -> Vec<u32> {
+            a.iter().map(|&i| inv.slots[i].map_or(0, |s| s.count)).collect()
+        };
+        inv.held = Some(Stack { item: stone, count: 10 });
+        // L'appui pose la pile, comme un clic...
+        inv.click(size, at(10), false, false);
+        assert_eq!(counts(&inv, &[10]), vec![10]);
+        // ... glissée sur deux autres cases, bouton tenu, elle est reprise et répartie.
+        inv.pointer(size, Some(at(11)), false, true, false);
+        inv.pointer(size, Some(at(12)), false, true, false);
+        inv.pointer(size, Some(at(12)), false, false, false);
+        assert_eq!(counts(&inv, &[10, 11, 12]), vec![3, 3, 3]);
+        assert_eq!(inv.held.map(|h| h.count), Some(1));
+        // Clic droit glissé : une par case.
+        inv.held = Some(Stack { item: stone, count: 5 });
+        inv.click(size, at(13), true, false);
+        inv.pointer(size, Some(at(14)), false, false, true);
+        inv.pointer(size, Some(at(15)), false, false, true);
+        inv.pointer(size, Some(at(15)), false, false, false);
+        assert_eq!(counts(&inv, &[13, 14, 15]), vec![1, 1, 1]);
+        assert_eq!(inv.held.map(|h| h.count), Some(2));
+        inv.held = None;
+        // Un simple clic sans glisser : la pile posée là, rien d'autre.
+        inv.held = Some(Stack { item: stone, count: 4 });
+        inv.click(size, at(20), false, false);
+        inv.pointer(size, Some(at(20)), false, false, false);
+        assert!(inv.held.is_none() && counts(&inv, &[20]) == vec![4]);
+        // Double-clic : la pile prise en 10 (3) se complète jusqu'à 64, la barre d'abord, de
+        // droite à gauche.
+        inv.slots[9] = Some(Stack { item: stone, count: 60 });
+        inv.slots[0] = Some(Stack { item: stone, count: 5 });
+        inv.update(1.0);
+        inv.click(size, at(10), false, false);
+        assert_eq!(inv.held.map(|h| h.count), Some(3));
+        inv.update(0.1);
+        inv.click(size, at(10), false, false);
+        assert_eq!(inv.held.map(|h| h.count), Some(64));
+        assert_eq!(counts(&inv, &[9, 0, 11, 20]), vec![0, 4, 3, 4]);
+    }
+
+    /// (v247) Le nom d'un objet a la même couleur dans son info-bulle et au-dessus de la
+    /// barre (`name_color`, pris aux deux endroits) : la Foudre de Zeus en bleu clair, les
+    /// torches à la couleur de leur flamme.
+    #[test]
+    fn item_names_have_one_color_everywhere() {
+        for &(item, _) in catalogue() {
+            assert_eq!(item.tooltip()[0], (item.name(), item.name_color()), "{}", item.name());
+        }
+        assert_eq!(Item::Zeus.name_color(), [170, 205, 255]);
+        assert!(catalogue()
+            .iter()
+            .any(|(i, _)| matches!(i, Item::Torch(Some(_))) && i.name_color() != [240, 240, 240]));
     }
 
     #[test]

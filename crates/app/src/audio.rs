@@ -292,7 +292,8 @@ fn file_of(sfx: Sfx) -> (&'static str, f32) {
             (STEPS[n % 6], 0.2)
         }
         Sfx::Land => ("land", 0.5),
-        Sfx::Splash => ("splash", 0.8),
+        // (v247) « Tomber dans l'eau : réduis-le de 25 % » (0,8 avant).
+        Sfx::Splash => ("splash", 0.6),
         Sfx::Door(true) => ("door_open", 0.8),
         Sfx::Door(false) => ("door_close", 0.8),
         Sfx::Ladder => ("ladder", 0.7),
@@ -697,6 +698,66 @@ pub fn found() {
 /// (v226) Volume du petit air du personnage caché trouvé.
 const FOUND_VOLUME: f32 = 0.4;
 
+/// (v247) Un son calculé, joué une fois à `volume` (× le volume du jeu), à la vitesse
+/// `speed` (hauteur et durée).
+fn play_pcm(pcm: Vec<i16>, rate: u32, volume: f32, speed: f32) {
+    if master() <= 0.0 || volume <= 0.0 {
+        return;
+    }
+    if let Some(tx) = sender() {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(Cmd {
+                file: "",
+                volume,
+                delay: 0.0,
+                speed,
+                voice: None,
+                reopen: false,
+                pcm: Some((pcm, rate)),
+                rain: None,
+                crackle: None,
+            });
+        }
+    }
+}
+
+/// (v247) Graine au hasard pour un son calculé à chaque fois (jamais deux fois le même).
+fn fresh_seed() -> u32 {
+    ((jitter() + 1.0) * 1e6) as u32 | 1
+}
+
+/// (v247) « Peut-être un autre bruit pour quand on tape avec l'éclair de 8 blocs max » : l'arc
+/// court de la Foudre de Zeus sans charge ne tonne plus, il grésille et claque (décharge
+/// électrique, `synth::zap`), tiré à chaque fois. (v247) « Réduis de 25 % le son de
+/// l'éclair quand c'est le petit éclair de 8 blocs » : 75 % du tonnerre qu'il faisait.
+pub fn zap() {
+    let (pcm, rate) = synth::zap(fresh_seed());
+    play_pcm(pcm, rate, ZAP_VOLUME, 2f32.powf(1.5 * jitter() / 12.0));
+}
+
+/// (v247) Volume de l'arc court : 0,75 × celui du tonnerre qu'il faisait (40 blocs : 0,73).
+const ZAP_VOLUME: f32 = 0.55;
+
+/// (v247) « Mets un son quand on lâche les objets aussi » : un petit souffle d'objet lancé
+/// (`synth::toss`), tiré à chaque fois.
+pub fn toss() {
+    let (pcm, rate) = synth::toss(fresh_seed());
+    play_pcm(pcm, rate, TOSS_VOLUME, 2f32.powf(2.0 * jitter() / 12.0));
+}
+
+/// (v247) Volume du souffle d'un objet lancé.
+const TOSS_VOLUME: f32 = 0.3;
+
+/// (v247) Un objet tombé dans la lave brûle : grésillement et petits craquements
+/// (`synth::sizzle`), tirés à chaque fois ; `gain` : selon la distance.
+pub fn burn(gain: f32) {
+    let (pcm, rate) = synth::sizzle(fresh_seed());
+    play_pcm(pcm, rate, BURN_VOLUME * gain.clamp(0.0, 1.0), 2f32.powf(2.0 * jitter() / 12.0));
+}
+
+/// (v247) Volume d'un objet qui brûle dans la lave, tout près.
+const BURN_VOLUME: f32 = 0.45;
+
 /// (v217) Nombre au hasard entre −1 et 1 (xorshift, pour la hauteur des sons).
 fn jitter() -> f32 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -754,8 +815,9 @@ pub struct CrackleAt {
 }
 
 /// (v220) Volume propre du crépitement (× la distance, × le volume du jeu). (v236) « Augmente
-/// le son du crépitement de l'éclair dans les mains de 50 % » : 0,33 (0,22 avant).
-const CRACKLE_VOLUME: f32 = 0.33;
+/// le son du crépitement de l'éclair dans les mains de 50 % » : 0,33 (0,22 avant). (v247)
+/// « Augmente le bruit du crépitement de l'éclair de 10 % » : 0,363.
+const CRACKLE_VOLUME: f32 = 0.363;
 
 /// (v215) Volume du jeu (Paramètres → Son), à part du volume de chaque son : changé, il
 /// vaut tout de suite pour les sons en cours aussi (feu, bips de la bombe), comme le volume
@@ -1166,7 +1228,7 @@ fn send_rain(volume: f32) {
 /// (un claquement sec tout près, un roulement sourd au loin ; voir `synth::thunder`), il
 /// arrive après le temps que met le son à venir (343 blocs par seconde, comme en vrai).
 /// Le calcul se fait dans un fil à part : le jeu n'attend pas.
-pub fn thunder(distance: f32, seed: u32) {
+pub fn thunder(distance: f32, seed: u32, gain: f32) {
     // (v234) Météo à zéro ou menu ouvert : pas de tonnerre à calculer.
     if master() <= 0.0 || weather_gain() <= 0.0 {
         return;
@@ -1187,7 +1249,7 @@ pub fn thunder(distance: f32, seed: u32) {
             let delay = distance / 343.0 - started.elapsed().as_secs_f32();
             let _ = tx.send(Cmd {
                 file: "",
-                volume: synth::thunder_gain(distance),
+                volume: synth::thunder_gain(distance) * gain,
                 delay: delay.max(0.0),
                 // (v219) Chaque coup de tonnerre un peu plus aigu ou plus grave (déjà
                 // différent par son tirage).
@@ -1320,6 +1382,123 @@ pub mod synth {
         let peak = s.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
         let k = 0.9 * 32767.0 / peak;
         (s.iter().map(|v| (v * k) as i16).collect(), RATE)
+    }
+
+    /// (v247) Filtre passe-bande à état (Chamberlin) : un pas, pour la fréquence `hz` et
+    /// l'amortissement `q` (0,1 : étroit … 1,4 : large). Rend la bande.
+    fn svf(st: &mut (f32, f32), x: f32, hz: f32, q: f32) -> f32 {
+        let f = 2.0 * (std::f32::consts::PI * hz.min(RATE as f32 / 6.0) / RATE as f32).sin();
+        let (low, band) = st;
+        *low += f * *band;
+        let high = x - *low - q * *band;
+        *band += f * high;
+        *band
+    }
+
+    /// (v247) Normalise et convertit un son court (crête à 90 %, fondu des 5 dernières ms).
+    fn finish_short(mut s: Vec<f32>) -> (Vec<i16>, u32) {
+        let n = s.len();
+        let fade = (RATE as usize / 200).min(n);
+        for (i, v) in s[n - fade..].iter_mut().enumerate() {
+            *v *= 1.0 - i as f32 / fade as f32;
+        }
+        let peak = s.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let k = 0.9 * 32767.0 / peak;
+        (s.iter().map(|v| (v * k) as i16).collect(), RATE)
+    }
+
+    /// (v247) Arc court de la Foudre de Zeus : une décharge électrique. Un claquement sec,
+    /// puis un bourdonnement en dents de scie (95 à 160 Hz) haché d'étincelles, sur un
+    /// grésillement aigu ; tirés de `seed` : hauteur, durée (0,25 à 0,4 s), densité des
+    /// étincelles. Jamais deux fois le même.
+    pub fn zap(seed: u32) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed.wrapping_mul(2_246_822_519) | 1);
+        let base = 95.0 + 65.0 * rng.unit();
+        let secs = 0.25 + 0.15 * rng.unit();
+        let sparks = 60.0 + 80.0 * rng.unit();
+        let n = (secs * RATE as f32) as usize;
+        let mut phase = 0.0f32;
+        let mut hiss = (0.0f32, 0.0f32);
+        let mut spark = 0.0f32;
+        let s = (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                // Claquement : 4 ms de bruit plein.
+                let snap = if t < 0.004 { rng.next() * (1.0 - t / 0.004) * 1.6 } else { 0.0 };
+                // Bourdonnement : dents de scie qui glissent un peu vers le grave.
+                let f = base * (1.0 - 0.18 * t / secs);
+                phase = (phase + f / RATE as f32).fract();
+                let saw = 2.0 * phase - 1.0;
+                // Étincelles : des à-coups au hasard qui hachent le bourdonnement.
+                if rng.unit() < sparks / RATE as f32 {
+                    spark = 1.0;
+                }
+                spark *= 0.9985;
+                let env = (t / 0.003).min(1.0) * (-t / (secs * 0.35)).exp();
+                let buzz = saw * (0.35 + 0.65 * spark) * env;
+                let h = svf(&mut hiss, rng.next(), 5200.0 + 1800.0 * spark, 0.9);
+                snap + 0.8 * buzz + 0.9 * h * env * (0.4 + spark)
+            })
+            .collect();
+        finish_short(s)
+    }
+
+    /// (v247) Objet lancé : un petit souffle (bruit en bande qui monte de 700 à 2 200 Hz puis
+    /// redescend), et un léger coup grave au départ ; tirés de `seed` : durée (110 à 170 ms),
+    /// bande, éclat.
+    pub fn toss(seed: u32) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed.wrapping_mul(3_266_489_917) | 1);
+        let secs = 0.11 + 0.06 * rng.unit();
+        let lo = 600.0 + 250.0 * rng.unit();
+        let hi = 1800.0 + 900.0 * rng.unit();
+        let q = 0.5 + 0.4 * rng.unit();
+        let n = (secs * RATE as f32) as usize;
+        let mut st = (0.0f32, 0.0f32);
+        let mut phase = 0.0f32;
+        let s = (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let k = t / secs;
+                // Montée puis descente de la bande, comme l'objet qui passe devant l'oreille.
+                let hump = (std::f32::consts::PI * k).sin();
+                let hz = lo + (hi - lo) * hump;
+                let env = hump.powf(1.5);
+                let whoosh = svf(&mut st, rng.next(), hz, q) * env;
+                phase += TAU * 150.0 / RATE as f32;
+                let thump = phase.sin() * (-t / 0.012).exp() * 0.35;
+                whoosh + thump
+            })
+            .collect();
+        finish_short(s)
+    }
+
+    /// (v247) Objet qui brûle dans la lave : un « pff » grave au départ, puis un grésillement
+    /// aigu qui s'éteint, semé de petits craquements ; tirés de `seed` : durée (0,5 à 0,8 s),
+    /// grain du grésillement, craquements.
+    pub fn sizzle(seed: u32) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed.wrapping_mul(2_654_435_769) | 1);
+        let secs = 0.5 + 0.3 * rng.unit();
+        let hz = 3500.0 + 2500.0 * rng.unit();
+        let pops = 25.0 + 30.0 * rng.unit();
+        let n = (secs * RATE as f32) as usize;
+        let mut st = (0.0f32, 0.0f32);
+        let mut low = (0.0f32, 0.0f32);
+        let mut pop = 0.0f32;
+        let s = (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let env = (t / 0.01).min(1.0) * (-t / (secs * 0.4)).exp();
+                let hiss = svf(&mut st, rng.next(), hz, 1.2) * env;
+                let fwump = svf(&mut low, rng.next(), 180.0, 0.7) * (-t / 0.06).exp() * 2.5;
+                if rng.unit() < pops / RATE as f32 {
+                    pop = 1.0;
+                }
+                pop *= 0.992;
+                let crack = rng.next() * pop * pop * 0.8;
+                hiss + fwump + crack
+            })
+            .collect();
+        finish_short(s)
     }
 
     /// (v226) Petit air joyeux du personnage caché trouvé : quatre ou cinq notes qui montent

@@ -354,14 +354,21 @@ impl Items {
     /// les murs), descend les chutes d'eau ; sorti de l'eau (elle a séché, il est arrivé au
     /// bout), il retombe au sol. En ligne, l'arbitre ne fait pas couler l'eau : les objets
     /// restent où ils sont tombés.
-    pub fn drift(&mut self, world: &World, dt: f32) {
+    /// (v247) « Si je jette un objet dans la lave, il doit brûler et faire un bruit » : un
+    /// objet qui touche la lave disparaît ; rend où (pour le son). Pas l'objet légendaire (la
+    /// Foudre de Zeus), qui flotte à sa surface.
+    pub fn drift(&mut self, world: &World, dt: f32) -> Vec<Vec3> {
         use minelib_world::registry::{fluid, Fluid, FLUID_FALLING};
+        let mut burned = Vec::new();
         if !self.local || dt <= 0.0 {
-            return;
+            return burned;
         }
         let solid = |x: i32, y: i32, z: i32| world.get(x, y, z).is_solid();
         let mut moved = false;
-        for d in self.view.drops.values_mut().flatten() {
+        for slot in self.view.drops.values_mut() {
+            let Some(d) = slot else {
+                continue;
+            };
             let p = Vec3::from(d.pos);
             let (x, z) = (p.x.floor() as i32, p.z.floor() as i32);
             if !world.contains(minelib_world::ChunkPos::containing(x, z)) {
@@ -374,6 +381,16 @@ impl Items {
             let mut y = (p.y + 0.05).floor() as i32;
             if wet(y).is_none() && wet(y - 1).is_some_and(|(_, h)| (y - 1) as f32 + h > p.y) {
                 y -= 1;
+            }
+            let lava = |y: i32| wet(y).is_some_and(|(f, _)| f == Fluid::Lava);
+            let sunk = lava(y - 1) && wet(y - 1).is_some_and(|(_, h)| (y - 1) as f32 + h > p.y);
+            if (lava(y) || sunk)
+                && d.pile.item != minelib_net::items::LEGEND_ITEM
+            {
+                burned.push(p);
+                *slot = None;
+                moved = true;
+                continue;
             }
             let mut next = p;
             if wet(y).is_some() && (falling(y - 1) || (falling(y) && wet(y - 1).is_some())) {
@@ -425,6 +442,7 @@ impl Items {
         if moved {
             self.dirty = true;
         }
+        burned
     }
 }
 
@@ -748,5 +766,40 @@ mod tests {
         );
         it.drift(&w, 0.5);
         assert_eq!(pos(&it), Vec3::new(3.5, 12.0, 8.5));
+    }
+
+    /// (v247) Un objet jeté dans la lave brûle (il disparaît, et la partie joue son
+    /// grésillement là où il était) ; la Foudre de Zeus, objet légendaire, flotte dessus.
+    #[test]
+    fn items_burn_in_lava_but_not_the_legendary_bolt() {
+        use minelib_world::{BlockId, ChunkPos};
+        let lava = BlockId::LAVA;
+        let mut w = World::new(0);
+        w.insert_empty(ChunkPos { x: 0, z: 0 });
+        for x in 0..16 {
+            for z in 0..16 {
+                w.set(x, 9, z, BlockId::STONE);
+                w.set(x, 10, z, lava);
+            }
+        }
+        let mut it = Items::new(true);
+        it.drop_item(Vec3::ZERO, Vec3::new(3.5, 10.0, 8.5), stone(5));
+        let bolt = Pile {
+            item: minelib_net::items::LEGEND_ITEM,
+            count: 1,
+        };
+        it.drop_item(Vec3::ZERO, Vec3::new(6.5, 10.0, 8.5), bolt);
+        it.arbitrate(ME);
+        assert_eq!(it.view.live_drops().count(), 2);
+        let burned = it.drift(&w, 1.0 / 60.0);
+        assert_eq!(burned.len(), 1);
+        assert!(burned[0].distance(Vec3::new(3.5, 10.0, 8.5)) < 0.1);
+        let left: Vec<_> = it.view.live_drops().map(|(_, d)| d.pile.item).collect();
+        assert_eq!(left, vec![minelib_net::items::LEGEND_ITEM]);
+        for _ in 0..120 {
+            assert!(it.drift(&w, 1.0 / 60.0).is_empty());
+        }
+        let p = Vec3::from(it.view.live_drops().next().unwrap().1.pos);
+        assert!(p.y > 10.5, "à la surface de la lave : {p}");
     }
 }

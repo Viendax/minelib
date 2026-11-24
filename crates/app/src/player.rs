@@ -105,6 +105,9 @@ const SPRINT: f32 = 6.6;
 const SNEAK: f32 = 1.3;
 /// Les yeux descendent de 30 cm accroupi.
 pub const CROUCH_DROP: f32 = 0.3;
+/// (v247) La posture accroupie change au moins de `DUCK_FINISH` × sa vitesse par seconde : la
+/// fin n'est plus une approche sans fin (voir `step`).
+const DUCK_FINISH: f32 = 0.25;
 /// Mode FPS : marche (touche « Marcher ») à 62,5 % de la marche du mode Build (réduite de
 /// 50 % puis augmentée de 25 %), course à 75 % du sprint.
 pub const FPS_WALK: f32 = WALK * 0.5 * 1.25;
@@ -631,7 +634,19 @@ impl Player {
         let duck_rate = if fps { self.duck_speed * 1.5 } else { 12.0 };
         let target = if crouching { 1.0 } else { 0.0 };
         let crouch_before = self.crouch;
-        self.crouch += (target - self.crouch) * (dt * duck_rate).min(1.0);
+        // (v247) « La toute fin de l'animation pour se mettre accroupi est trop longue pour
+        // passer vite sous 1,5 bloc quand on est collé » (et en mode FPS « aussi lent ») : la
+        // descente suivait la cible de plus en plus lentement, sans jamais l'atteindre ; la
+        // boîte n'arrivait à 1,5 bloc qu'au bout d'une demi-seconde. Elle ne va plus moins vite
+        // que le quart de sa vitesse de départ : accroupi en 0,2 s (0,48 avant).
+        let gap = target - self.crouch;
+        let step = gap * (dt * duck_rate).min(1.0);
+        let least = duck_rate * DUCK_FINISH * dt;
+        self.crouch += if step.abs() < least {
+            gap.clamp(-least, least)
+        } else {
+            step
+        };
         // (v209) Saut accroupi dans tous les modes de jeu (avant : en mode FPS seulement).
         // Hors mode FPS, pas dans l'eau ni sur une échelle (accroupi, on y descend ou on s'y
         // tient : les jambes n'ont pas à remonter).
@@ -2598,6 +2613,40 @@ mod tests {
                 "toujours accroupi dehors ({fps}) : {}",
                 p.crouch
             );
+        }
+    }
+
+    /// (v247) « La toute fin de l'animation pour se mettre accroupi est trop longue » : en
+    /// construction comme en mode FPS, la boîte arrive à 1,5 bloc en 0,2 à 0,3 s (avant : la posture
+    /// suivait la cible sans jamais l'atteindre, une demi-seconde pour passer sous 1,5 bloc),
+    /// et se relever est aussi court.
+    #[test]
+    fn crouching_ends_quickly_enough_to_pass_under_one_and_a_half_blocks() {
+        let w = flat_world();
+        for fps in [false, true] {
+            let mut p = Player::new(Vec3::new(8.5, 11.0, 8.5));
+            let duck = MoveInput {
+                sneak: true,
+                fps,
+                ..Default::default()
+            };
+            let mut t = 0.0;
+            while p.height() > HEIGHT - CROUCH_DROP {
+                p.update(&w, &duck, TICK);
+                t += TICK;
+                assert!(t < 0.3, "pas encore accroupi ({fps}) : {}", p.crouch);
+            }
+            assert_eq!(p.crouch, 1.0);
+            let stand = MoveInput {
+                fps,
+                ..Default::default()
+            };
+            let mut t = 0.0;
+            while p.crouch > 0.0 {
+                p.update(&w, &stand, TICK);
+                t += TICK;
+                assert!(t < 0.3, "pas encore relevé ({fps}) : {}", p.crouch);
+            }
         }
     }
 

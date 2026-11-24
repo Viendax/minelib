@@ -47,8 +47,10 @@ const RESPAWNS_PER_FRAME: usize = 64;
 /// monter dans le ciel) : vers le haut, 5,5 / √3 au lieu de 5,5, un bond d'un sixième de bloc
 /// de haut au lieu d'un demi, à un bloc en arrière. Pour les garder en l'air, il faut
 /// maintenant près de 5 coups par seconde au lieu de 3, et ils montent bien moins vite.
+/// (v247) « La hauteur gagnée au recul doit être deux fois moins élevée » : 3,175 / √2 (la
+/// hauteur va comme le carré de la vitesse), un bond d'un douzième de bloc.
 const KNOCK: f32 = 5.0;
-const KNOCK_UP: f32 = 3.175;
+const KNOCK_UP: f32 = 3.175 * std::f32::consts::FRAC_1_SQRT_2;
 /// (v238) Pesanteur : celle d'un joueur (`player::GRAVITY`, 30 avant).
 const GRAVITY: f32 = 28.0;
 /// (v238) Vie d'un PNJ : celle d'un joueur. Un coup en ôte `PUNCH` (comme un coup de poing
@@ -387,12 +389,22 @@ impl Crowd {
 
     /// (v238) La foudre tombée en `at` : les PNJ qu'elle touche (comme un joueur, voir
     /// `lightning::hurts_at`) perdent `lightning::DAMAGE` points et sautent loin d'elle (ceux
-    /// qui en meurent réapparaissent ailleurs). Rend où ils étaient.
-    pub fn struck(&mut self, world: &World, at: Vec3, center: Vec3) -> Vec<Vec3> {
+    /// qui en meurent réapparaissent ailleurs). Rend où ils étaient. (v247) `mine` : notre
+    /// foudre, qui frappe comme nous : le personnage caché qu'elle touche est trouvé (et part
+    /// se cacher ailleurs) ; rendu vrai alors.
+    pub fn struck(&mut self, world: &World, at: Vec3, center: Vec3, mine: bool) -> (Vec<Vec3>, bool) {
         let mut hit = Vec::new();
+        let mut found = false;
         for i in 0..self.npcs.len() {
             let n = &self.npcs[i];
-            if n.hidden || !crate::lightning::hurts_at(at, n.pos) {
+            if !crate::lightning::hurts_at(at, n.pos) {
+                continue;
+            }
+            if n.hidden {
+                if mine && !found {
+                    found = true;
+                    self.hide(world, i, center, at);
+                }
                 continue;
             }
             hit.push(n.pos);
@@ -400,7 +412,7 @@ impl Crowd {
             self.npcs[i].knock(at);
             self.hurt(world, i, crate::lightning::DAMAGE as f32, center, at);
         }
-        hit
+        (hit, found)
     }
 
     /// (v226) Le personnage caché `i` part se cacher ailleurs : à un endroit de la foule
@@ -861,15 +873,26 @@ impl RemoteCrowd {
     /// (v238) La foudre tombée en `at` (la même chez tous) : ses PNJ touchés sautent tout de
     /// suite, sans attendre le jeu qui mène la foule (lui leur ôte la vie, et dit la suite).
     /// Rend où ils étaient.
-    pub fn struck(&mut self, at: Vec3) -> Vec<Vec3> {
+    /// (v247) `mine` : notre foudre ; le personnage caché qu'elle touche : son numéro, pour
+    /// que le coup parte au jeu qui mène la foule (il l'a trouvé).
+    pub fn struck(&mut self, at: Vec3, mine: bool) -> (Vec<Vec3>, Option<u16>) {
         let mut hit = Vec::new();
-        for n in &mut self.npcs {
-            if !n.hidden && crate::lightning::hurts_at(at, n.pos) {
-                hit.push(n.pos);
-                n.knock(at);
+        let mut hidden = None;
+        for i in 0..self.npcs.len() {
+            let n = &mut self.npcs[i];
+            if !crate::lightning::hurts_at(at, n.pos) {
+                continue;
             }
+            if n.hidden {
+                if mine && hidden.is_none() {
+                    hidden = Some(i);
+                }
+                continue;
+            }
+            hit.push(n.pos);
+            n.knock(at);
         }
-        hit
+        (hit, hidden.and_then(|i| self.id_of(i)))
     }
 
     /// Coup donné ici au PNJ `i` : il recule tout de suite, sans attendre le jeu qui mène la
@@ -1226,8 +1249,8 @@ mod tests {
         for k in 1..=4 {
             let at = c.npcs[0].pos;
             let strike = at + Vec3::X;
-            let hit = c.struck(&w, strike, Vec3::new(0.5, 11.0, 0.5));
-            assert_eq!(hit, vec![at], "foudre {k}");
+            let hit = c.struck(&w, strike, Vec3::new(0.5, 11.0, 0.5), false);
+            assert_eq!(hit, (vec![at], false), "foudre {k}");
             let n = &c.npcs[0];
             if k < 4 {
                 assert_eq!(n.hp, NPC_HP - 5.0 * k as f32, "foudre {k}");
@@ -1240,8 +1263,21 @@ mod tests {
         }
         // Trop loin d'elle : rien.
         let at = c.npcs[0].pos;
-        assert!(c.struck(&w, at + Vec3::X * 4.0, Vec3::new(0.5, 11.0, 0.5)).is_empty());
+        assert!(c.struck(&w, at + Vec3::X * 4.0, Vec3::new(0.5, 11.0, 0.5), true).0.is_empty());
         assert_eq!(c.npcs[0].hp, NPC_HP);
+        // (v247) Notre foudre sur le personnage caché : trouvé (il part se cacher ailleurs) ;
+        // celle d'un autre, ou la foudre de l'orage : rien.
+        let hidden = c.npcs.len();
+        let mut h = one_at(&w, Vec3::new(3.5, 11.0, 0.5));
+        let mut n = h.npcs.pop().unwrap();
+        n.hidden = true;
+        c.npcs.push(n);
+        let at = c.npcs[hidden].pos;
+        assert!(!c.struck(&w, at + Vec3::X, Vec3::new(0.5, 11.0, 0.5), false).1);
+        assert_eq!(c.npcs[hidden].pos, at, "pas trouvé par la foudre de l'orage");
+        let (_, found) = c.struck(&w, at + Vec3::X, Vec3::new(0.5, 11.0, 0.5), true);
+        assert!(found, "trouvé par notre foudre");
+        assert!(c.npcs[hidden].hidden);
     }
 
     /// (v238) « Les mêmes déplacements possibles » : il saute sur une marche d'un bloc, tombe
@@ -1406,8 +1442,8 @@ mod tests {
             c.update(&w, &skins, eye, 1.0 / 60.0);
             top = top.max(c.npcs[0].pos.y);
         }
-        // (v234) Un sixième de bloc de haut (un demi avant).
-        assert!(top > 11.1 && top < 11.3, "bond : {top}");
+        // (v234) Un sixième de bloc de haut (un demi avant). (v247) Un douzième.
+        assert!(top > 11.04 && top < 11.14, "bond : {top}");
         for _ in 0..30 {
             c.update(&w, &skins, eye, 1.0 / 60.0);
         }

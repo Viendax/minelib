@@ -200,7 +200,8 @@ pub struct Storm {
     /// (v217) Horloge des éclairs posés au sol.
     clock: f32,
     /// (v238) Foudre tombée au sol à cette image (où) : elle blesse aussi les PNJ de la foule.
-    pub landed: Vec<Vec3>,
+    /// (v247) Et si c'est la nôtre (Foudre de Zeus, `/thor` : `Strike::mine`).
+    pub landed: Vec<(Vec3, bool)>,
     /// Œil du joueur à la dernière image.
     eye: Vec3,
     /// (v241) Éclairs des nuages à venir dans ce créneau (`Weather::cloud_bolts`) : temps
@@ -294,22 +295,23 @@ impl Storm {
         for s in &mut self.strikes {
             if s.update(dt) {
                 if s.kind == lightning::Kind::Ground {
-                    self.landed.push(s.pos);
+                    self.landed.push((s.pos, s.mine));
                 }
                 match s.kind {
                     // (Le tonnerre d'un éclair des nuages part avec sa lueur.)
                     lightning::Kind::Cloud => {}
                     // Celle qui part de la main claque tout près.
-                    lightning::Kind::Sky => crate::audio::thunder(25.0, s.seed),
+                    // (v247) « Réduis de 20 % le son de l'éclair que je jette vers le ciel ».
+                    lightning::Kind::Sky => crate::audio::thunder(25.0, s.seed, SKY_THROW_GAIN),
                     // (v241) L'arc court claque sec, et des étincelles jaillissent de ce
-                    // qu'il touche.
+                    // qu'il touche. (v247) Son propre bruit : une décharge, pas un tonnerre.
                     lightning::Kind::Arc => {
-                        crate::audio::thunder(40.0, s.seed);
+                        crate::audio::zap();
                         self.sparks.burst(s.pos, Vec3::Y, 26, 5.0);
                     }
                     lightning::Kind::Ground => {
                         let d = (s.pos - f.eye).length();
-                        crate::audio::thunder(d, s.seed);
+                        crate::audio::thunder(d, s.seed, STORM_GAIN);
                         // (v217) Une gerbe d'étincelles jaillit du point frappé : dense tout
                         // près, et encore visible de loin (elles volent alors plus loin,
                         // pour rester une gerbe à l'écran).
@@ -390,7 +392,7 @@ impl Storm {
                     beats: [1.0, self.rng.range(0.3, 1.0), self.rng.range(0.0, 0.8)],
                 });
                 let far = self.rng.range(450.0, 1500.0);
-                crate::audio::thunder(far, self.rng.next() as u32);
+                crate::audio::thunder(far, self.rng.next() as u32, STORM_GAIN);
                 // (v217) Deux fois sur trois on voit l'éclair lui-même : il court sous la
                 // base des nuages et dedans, de ce côté-là du ciel, sans tomber.
                 if self.rng.unit() < 0.67 {
@@ -436,6 +438,19 @@ impl Storm {
     pub fn strike(&mut self, pos: Vec3) {
         let seed = self.rng.next() as u32;
         self.strike_seeded(pos, seed);
+    }
+
+    /// (v247) La foudre qui vient de partir (`strike`, `strike_seeded`) est la nôtre : ce
+    /// qu'elle touche, nous l'avons frappé.
+    pub fn mark_mine(&mut self) {
+        if let Some(s) = self
+            .strikes
+            .iter_mut()
+            .rev()
+            .find(|s| s.kind == lightning::Kind::Ground)
+        {
+            s.mine = true;
+        }
     }
 
     /// (v241) Foudre de Zeus sans charge : un arc part de sa pointe `from` jusqu'à `to`, sans
@@ -567,7 +582,7 @@ impl Storm {
                 beats: [1.0, self.rng.range(0.3, 1.0), self.rng.range(0.0, 0.8)],
             });
         }
-        crate::audio::thunder(far, spot.seed);
+        crate::audio::thunder(far, spot.seed, STORM_GAIN);
     }
 
     /// (v217) La Foudre de Zeus posée au sol en `at` (objet lâché) : le même éclair qu'en
@@ -761,8 +776,16 @@ impl Storm {
 const SKY_STRIKE_FLASH: f32 = 0.3;
 
 /// (v234) Volume propre de la pluie (avant : 1 ; « 25 % moins fort en général »). Le
-/// curseur « Volume de la météo » (Paramètres → Son) s'y ajoute.
-const RAIN_VOLUME: f32 = 0.75;
+/// curseur « Volume de la météo » (Paramètres → Son) s'y ajoute. (v247) « Réduis le son de la
+/// pluie de 50 % » : 0,375.
+const RAIN_VOLUME: f32 = 0.375;
+
+/// (v247) « Réduis le son de l'orage de 10 % » : le tonnerre de la foudre qui tombe du ciel
+/// (orage, Foudre de Zeus chargée, `/thor`) et des éclairs des nuages.
+const STORM_GAIN: f32 = 0.9;
+
+/// (v247) Foudre lancée vers le ciel (celle qui charge la Foudre de Zeus) : 20 % moins fort.
+const SKY_THROW_GAIN: f32 = 0.8;
 
 /// (v217) Hauteur de la Foudre de Zeus posée au sol (blocs). (v235) Celle de l'éclair tenu
 /// en main (elle valait 0,55).
