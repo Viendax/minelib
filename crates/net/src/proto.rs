@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 /// (`SERVER_MATCH`, `Response::BuildMatch`, `Response::MatchPeer`) ; dans un monde de
 /// construction, `ToHost`, `ToPeer` et `Broadcast` vont entre l'hôte de cette partie et ses
 /// joueurs.
-pub const PROTOCOL: u32 = 63;
+/// (v244) 64 : la Foudre de Zeus légendaire en ligne, tenue par le relais du monde
+/// (`Request::Zeus`, `Response::Zeus`, `BuildMsg::ZeusAsk`, `Zeus`).
+pub const PROTOCOL: u32 = 64;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -767,6 +769,81 @@ pub enum Request {
     PasskeyRemove {
         id: Vec<u8>,
     },
+    /// (v244) Foudre de Zeus légendaire d'un serveur de construction, tenue par le relais du
+    /// monde : `act` (`ZEUS_…`), demande `seq` du jeu. `chunk` : où vise le coup
+    /// (`ZEUS_SKY`, `ZEUS_STRIKE`, `ZEUS_ARC`). `seed` : graine du monde (`ZEUS_SYNC` du
+    /// créateur du monde : le relais en tire les éclairs des nuages qui la chargent).
+    /// `charges` : ses charges en solo (`ZEUS_HOLD`). Réponse : `Response::Done` ; ce qu'en
+    /// dit le relais arrive par `Response::Zeus` (poussé).
+    Zeus {
+        seq: u32,
+        act: u8,
+        chunk: [i32; 2],
+        seed: u32,
+        charges: u8,
+    },
+}
+
+/// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
+/// monde y joint la graine).
+pub const ZEUS_SYNC: u8 = 0;
+/// Le prendre dans le menu créatif ou par `/give` (une seule fois par serveur ; en
+/// créatif d'après le relais).
+pub const ZEUS_CLAIM: u8 = 1;
+/// Un coup vers le ciel : deux font une charge.
+pub const ZEUS_SKY: u8 = 2;
+/// La foudre chargée, du ciel sur ce qu'on vise : une charge de moins.
+pub const ZEUS_STRIKE: u8 = 3;
+/// Le petit éclair sans charge, de sa pointe.
+pub const ZEUS_ARC: u8 = 4;
+/// Le créateur du monde l'a déjà, de son monde en solo (le serveur n'en a pas encore).
+pub const ZEUS_HOLD: u8 = 5;
+/// (Poussé par le relais seulement) un éclair des nuages vient de la charger.
+pub const ZEUS_CLOUD: u8 = 6;
+
+/// (v244) Réponses du relais (`Response::Zeus::why`).
+pub const ZEUS_OK: u8 = 0;
+/// Déjà prise par quelqu'un (`holder`).
+pub const ZEUS_TAKEN: u8 = 1;
+/// Pas en créatif (le catalogue et `/give` sont pour le mode créatif).
+pub const ZEUS_NOT_CREATIVE: u8 = 2;
+/// Ce n'est pas lui qui l'a.
+pub const ZEUS_NOT_HOLDER: u8 = 3;
+/// Pas de charge pour la foudre du ciel.
+pub const ZEUS_EMPTY: u8 = 4;
+/// Trop de coups à la suite, monde en pause, demande absurde.
+pub const ZEUS_BUSY: u8 = 5;
+
+/// (v244) Charges de la Foudre de Zeus au plus, et coups vers le ciel pour une charge
+/// (règles de Viendax : `claude/foudre-de-zeus.md`).
+pub const ZEUS_MAX_CHARGES: u8 = 10;
+pub const ZEUS_SKY_HITS: u8 = 2;
+
+/// (v244) Durée de vie d'un laissez-passer de la Foudre de Zeus (`Response::Zeus::permit`),
+/// en secondes : l'arbitre du chunk visé le refuse ensuite.
+pub const ZEUS_PERMIT_S: u64 = 10;
+
+/// (v244) Ce que signe le relais du monde pour laisser passer un coup de la Foudre de Zeus
+/// (`BuildMsg::ZeusAsk`) chez l'arbitre du chunk visé (lui, ou le relais d'une province, qui
+/// connaît sa clé) : le monde, le joueur, sa demande, la sorte de coup, le chunk, la fin.
+pub fn zeus_permit_msg(
+    room: u64,
+    pseudo: &str,
+    seq: u32,
+    act: u8,
+    chunk: [i32; 2],
+    expires: u64,
+) -> Vec<u8> {
+    let mut m = b"minelib/foudre/v244".to_vec();
+    m.extend_from_slice(&room.to_le_bytes());
+    m.extend_from_slice(pseudo.to_ascii_lowercase().as_bytes());
+    m.push(0);
+    m.extend_from_slice(&seq.to_le_bytes());
+    m.push(act);
+    m.extend_from_slice(&chunk[0].to_le_bytes());
+    m.extend_from_slice(&chunk[1].to_le_bytes());
+    m.extend_from_slice(&expires.to_le_bytes());
+    m
 }
 
 impl Request {
@@ -1554,6 +1631,22 @@ pub enum Response {
     Passkeys {
         list: Vec<PasskeyInfo>,
     },
+    /// (v244) Poussé : la Foudre de Zeus du serveur. En réponse à la demande `seq` d'un
+    /// `Request::Zeus` (`act`, `why` : `ZEUS_OK` ou la raison du refus), à son arrivée, quand
+    /// quelqu'un la prend (`seq` 0, à tous), ou quand un éclair des nuages la charge
+    /// (`ZEUS_CLOUD`, à celui qui l'a). `holder` : celui qui l'a (vide : personne). Pour un
+    /// coup accepté, `permit` (signé par le relais du monde, jusqu'à `expires`, secondes
+    /// Unix) le fait passer chez l'arbitre du chunk visé (`BuildMsg::ZeusAsk`).
+    Zeus {
+        seq: u32,
+        act: u8,
+        why: u8,
+        holder: String,
+        charges: u8,
+        sky_hits: u8,
+        expires: u64,
+        permit: Vec<u8>,
+    },
 }
 
 /// (v240) Clé d'accès d'un compte, telle que le joueur la voit.
@@ -1628,6 +1721,7 @@ impl Response {
                 | Response::Probe { .. }
                 | Response::SetTime { .. }
                 | Response::SetWeather { .. }
+                | Response::Zeus { .. }
                 | Response::BuildSpawn { .. }
                 | Response::Arbitrate { .. }
                 | Response::Evidence { .. }

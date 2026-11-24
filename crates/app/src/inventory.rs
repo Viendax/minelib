@@ -192,7 +192,7 @@ impl Item {
                             [255, 220, 120],
                         ));
                         lines.push((
-                            "Chargé : la foudre tombe du ciel où tu vises (128 blocs)".into(),
+                            "Chargé : la foudre tombe du ciel où tu vises".into(),
                             WHITE,
                         ));
                         lines.push((
@@ -298,6 +298,10 @@ pub struct Inventory {
     pub legend_free: bool,
     /// (v241) Il vient d'être pris dans le catalogue : la partie le note avec la carte.
     pub legend_took: bool,
+    /// (v244) Sur un serveur de construction : le catalogue ne le donne pas lui-même, c'est
+    /// le relais du monde qui le donne (`legend_wanted` : la partie le lui demande).
+    pub legend_ask: bool,
+    pub legend_wanted: bool,
     /// (v241) Message à dire dans le tchat (un refus), que la partie reprend.
     pub notice: Option<&'static str>,
 }
@@ -307,6 +311,11 @@ pub const LEGEND_GONE: &str =
     "La Foudre de Zeus de cette carte a déjà été prise : il n'y en a qu'une.";
 /// (v241) Refus de la poubelle.
 pub const LEGEND_KEPT: &str = "La Foudre de Zeus ne peut pas être supprimée.";
+/// (v244) Sur un serveur : déjà prise ; et elle y reste avec celui qui l'a prise.
+pub const LEGEND_GONE_ONLINE: &str =
+    "La Foudre de Zeus de ce serveur a déjà été prise : il n'y en a qu'une.";
+pub const LEGEND_BOUND: &str =
+    "Sur un serveur, la Foudre de Zeus reste avec celui qui l'a prise.";
 
 /// Emplacements d'un coffre (3 lignes de 10).
 pub const CHEST_SLOTS: usize = minelib_net::items::CHEST_SLOTS;
@@ -773,6 +782,8 @@ impl Inventory {
             legend: false,
             legend_free: false,
             legend_took: false,
+            legend_ask: false,
+            legend_wanted: false,
             notice: None,
         }
     }
@@ -1154,7 +1165,17 @@ impl Inventory {
             // (v241) La Foudre de Zeus : un seul exemplaire, une seule fois par carte.
             let legend = self.legend && item == Item::Zeus;
             if legend && !self.legend_free {
-                self.notice = Some(LEGEND_GONE);
+                self.notice = Some(if self.legend_ask {
+                    LEGEND_GONE_ONLINE
+                } else {
+                    LEGEND_GONE
+                });
+                return;
+            }
+            // (v244) Sur un serveur : demandée au relais du monde, qui la donne (ou non).
+            if legend && self.legend_ask {
+                self.legend_free = false;
+                self.legend_wanted = true;
                 return;
             }
             let count = if right || legend { 1 } else { MAX_STACK };

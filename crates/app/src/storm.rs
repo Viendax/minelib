@@ -442,8 +442,27 @@ impl Storm {
     /// passer par le ciel. L'éclair tenu sursaute vers lui.
     pub fn strike_arc(&mut self, from: Vec3, to: Vec3) {
         let seed = self.rng.next() as u32;
-        self.strikes.push(Strike::arc(from, to, seed));
-        self.held.surge(from, (to - from).normalize_or(Vec3::Y));
+        self.strike_arc_seeded(from, to, seed, true);
+    }
+
+    /// (v244) Le même, de forme tirée de `seed` (sur un serveur de construction, l'arbitre
+    /// le publie avec sa graine). `own` : c'est le sien, parti de l'éclair qu'on tient : il
+    /// sursaute, et l'arc suit sa pointe tant qu'il dure (`follow_arcs`).
+    pub fn strike_arc_seeded(&mut self, from: Vec3, to: Vec3, seed: u32, own: bool) {
+        let mut s = Strike::arc(from, to, seed);
+        s.follow = own;
+        self.strikes.push(s);
+        if own {
+            self.held.surge(from, (to - from).normalize_or(Vec3::Y));
+        }
+    }
+
+    /// (v244) « Il doit toujours partir du bout » : les arcs partis de l'éclair qu'on tient
+    /// repartent de sa pointe, là où elle est à cette image (`tip`, monde).
+    pub fn follow_arcs(&mut self, tip: Vec3) {
+        for s in self.strikes.iter_mut().filter(|s| s.follow) {
+            s.arc_from(tip);
+        }
     }
 
     /// (v229) La même, de forme tirée de `seed` : sur un serveur de construction, l'arbitre

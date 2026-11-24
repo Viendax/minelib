@@ -1535,8 +1535,11 @@ impl BuildNet {
     /// l'arbitre du chunk où elle tombe (le relais du monde, ou le relais de sa province),
     /// qui la publie aux joueurs proches. Arbitre pas prêt : refusée ici (un éclair
     /// n'attend pas).
+    /// (v244) De même pour un coup de la Foudre de Zeus (`BuildMsg::ZeusAsk`, avec le
+    /// laissez-passer du relais du monde).
     pub fn send_thor(&mut self, req: &BuildMsg) {
-        let BuildMsg::ThorAsk { seq, chunk, .. } = req else {
+        let (BuildMsg::ThorAsk { seq, chunk, .. } | BuildMsg::ZeusAsk { seq, chunk, .. }) = req
+        else {
             return;
         };
         let (seq, chunk) = (*seq, *chunk);
@@ -2161,7 +2164,8 @@ impl BuildNet {
             // (v229) Foudre d'un OP, publiée par l'arbitre du chunk où elle tombe : le relais
             // du monde, ou le relais d'une province pour ses zones (jamais un joueur ni un
             // relais de région). Rien à garder : elle part tout de suite.
-            BuildMsg::Thor { chunk: at, .. } => {
+            // (v244) De même un coup de la Foudre de Zeus.
+            BuildMsg::Thor { chunk: at, .. } | BuildMsg::Zeus { chunk: at, .. } => {
                 if peer != 0 || self.from_shard.is_some() {
                     return Vec::new();
                 }
@@ -2196,7 +2200,8 @@ impl BuildNet {
             | BuildMsg::ChestPut { .. }
             | BuildMsg::ChestTake { .. }
             | BuildMsg::LightPut { .. }
-            | BuildMsg::ThorAsk { .. } => Vec::new(),
+            | BuildMsg::ThorAsk { .. }
+            | BuildMsg::ZeusAsk { .. } => Vec::new(),
             // (v227) Foule d'essai d'un OP, coups à la nôtre, refus de la nôtre : remis par un
             // relais (jamais par un joueur, `peer` 0).
             BuildMsg::Crowd { owner, data } => {

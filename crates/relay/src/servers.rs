@@ -10,6 +10,18 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// (v244) La Foudre de Zeus légendaire d'un serveur, tenue par le relais du monde : qui l'a
+/// (minuscules ; vide : personne ne l'a prise), ses charges, les coups vers le ciel en
+/// attente, et la graine du monde (dite par son créateur : le relais en tire les éclairs des
+/// nuages qui la chargent).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Legend {
+    pub holder: String,
+    pub charges: u8,
+    pub sky_hits: u8,
+    pub seed: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Admin {
     /// OP nommés (sans le créateur), en minuscules.
@@ -54,6 +66,8 @@ pub struct Store {
     /// (v238) Serveur → OP nommé (minuscules) → quand il pourra de nouveau nommer un OP
     /// (`OP_WAIT` après en avoir nommé un, ou après l'être devenu). En mémoire seulement.
     op_ready: HashMap<String, HashMap<String, std::time::Instant>>,
+    /// (v244) Foudre de Zeus de chaque serveur (fichier `….foudre`).
+    legends: HashMap<String, Legend>,
 }
 
 /// (v238) Un OP nommé (pas le créateur) nomme un OP au plus une fois toutes les… et pas
@@ -150,6 +164,10 @@ impl Store {
             .ok()
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let legends = std::fs::read(path.with_extension("foudre"))
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
         Self {
             path,
             servers,
@@ -164,6 +182,20 @@ impl Store {
             spawns,
             weathers,
             op_ready: HashMap::new(),
+            legends,
+        }
+    }
+
+    /// (v244) La Foudre de Zeus du serveur (personne ne l'a : la valeur par défaut).
+    pub fn legend(&self, server: &str) -> Legend {
+        self.legends.get(server).cloned().unwrap_or_default()
+    }
+
+    /// (v244) Elle change : gardée dans le fichier.
+    pub fn set_legend(&mut self, server: &str, legend: Legend) {
+        self.legends.insert(server.to_string(), legend);
+        if let Ok(b) = postcard::to_allocvec(&self.legends) {
+            let _ = crate::accounts::write_atomic(&self.path.with_extension("foudre"), &b);
         }
     }
 

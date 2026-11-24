@@ -236,6 +236,15 @@ pub enum Cmd {
     },
     DownloadMap([u8; 32]),
     Caps(crate::proto::GarantCaps),
+    /// (v244) Foudre de Zeus légendaire du serveur de construction (`Request::Zeus`) : ce
+    /// qu'en dit le relais arrive par `Event::Zeus`.
+    Zeus {
+        seq: u32,
+        act: u8,
+        chunk: [i32; 2],
+        seed: u32,
+        charges: u8,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +341,17 @@ pub enum Event {
         kind: u8,
         left: f32,
         fixed: bool,
+    },
+    /// (v244) Foudre de Zeus légendaire du serveur (voir `Response::Zeus`).
+    Zeus {
+        seq: u32,
+        act: u8,
+        why: u8,
+        holder: String,
+        charges: u8,
+        sky_hits: u8,
+        expires: u64,
+        permit: Vec<u8>,
     },
     /// Réponse du relais à des modifications en masse (WorldEdit) : `error` vide si publiées.
     BulkDone {
@@ -921,6 +941,25 @@ impl Worker {
             Response::BulkDone { id, error } => Event::BulkDone { id, error },
             Response::SetTime { hours, fixed } => Event::SetTime { hours, fixed },
             Response::SetWeather { kind, left, fixed } => Event::SetWeather { kind, left, fixed },
+            Response::Zeus {
+                seq,
+                act,
+                why,
+                holder,
+                charges,
+                sky_hits,
+                expires,
+                permit,
+            } => Event::Zeus {
+                seq,
+                act,
+                why,
+                holder,
+                charges,
+                sky_hits,
+                expires,
+                permit,
+            },
             Response::BuildSpawn { pos, yaw, pitch } => Event::BuildSpawn { pos, yaw, pitch },
             Response::Arbitrate { case, map_sig, map } => Event::Arbitrate { case, map_sig, map },
             Response::Evidence {
@@ -1755,6 +1794,22 @@ impl Worker {
                 r => self.unexpected(r),
             },
             Cmd::Presence(hidden) => match self.request(&Request::Presence { hidden })? {
+                Response::Done => Ok(()),
+                r => self.unexpected(r),
+            },
+            Cmd::Zeus {
+                seq,
+                act,
+                chunk,
+                seed,
+                charges,
+            } => match self.request(&Request::Zeus {
+                seq,
+                act,
+                chunk,
+                seed,
+                charges,
+            })? {
                 Response::Done => Ok(()),
                 r => self.unexpected(r),
             },

@@ -78,10 +78,8 @@ impl Kind {
 
 /// Durées de Minecraft, en secondes (tics / 20) : averse, temps sec, tonnerre, sans
 /// tonnerre.
-pub const RAIN_ON_S: (f64, f64) = (600.0, 1200.0);
-pub const RAIN_OFF_S: (f64, f64) = (600.0, 9000.0);
-pub const THUNDER_ON_S: (f64, f64) = (180.0, 780.0);
-pub const THUNDER_OFF_S: (f64, f64) = (600.0, 9000.0);
+/// (v244) Celles de `minelib_net::meteo` (le relais du monde lit les mêmes horloges).
+pub use minelib_net::meteo::{RAIN_OFF_S, RAIN_ON_S, THUNDER_ON_S};
 
 /// Foudre de Minecraft : une chance sur 100 000 par chunk (16 × 16 blocs) et par tic
 /// (20 par seconde). Par bloc carré et par seconde :
@@ -93,7 +91,7 @@ pub const STRIKE_REACH: f32 = 168.0;
 const CELL: i32 = 48;
 
 /// En ligne, l'horloge de la météo compte depuis le 1er janvier 2026 (UTC).
-const ONLINE_EPOCH_S: f64 = 1_767_225_600.0;
+const ONLINE_EPOCH_S: f64 = minelib_net::meteo::ONLINE_EPOCH_S;
 
 fn mix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -108,52 +106,9 @@ fn unit(seed: u64, a: u64, b: u64) -> f64 {
     (h >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// Une des deux horloges : des périodes « sans » puis « avec », l'une après l'autre,
-/// chacune d'une durée tirée de la graine. Elle garde où elle en est : la suivre d'une
-/// image à l'autre ne coûte rien.
-#[derive(Clone, Debug)]
-struct Cycle {
-    seed: u64,
-    on: (f64, f64),
-    off: (f64, f64),
-    /// Rang de la période en cours (paire : sans, impaire : avec) et son début.
-    k: u64,
-    start: f64,
-}
-
-impl Cycle {
-    fn new(seed: u64, on: (f64, f64), off: (f64, f64)) -> Self {
-        Self {
-            seed,
-            on,
-            off,
-            k: 0,
-            start: 0.0,
-        }
-    }
-
-    fn length(&self, k: u64) -> f64 {
-        let (lo, hi) = if k % 2 == 1 { self.on } else { self.off };
-        lo + (hi - lo) * unit(self.seed, k, 0x5eed)
-    }
-
-    /// À l'instant `t` (s) : « avec » ou non, et le temps qu'il reste à cette période.
-    fn at(&mut self, t: f64) -> (bool, f64) {
-        let t = t.max(0.0);
-        if t < self.start {
-            self.k = 0;
-            self.start = 0.0;
-        }
-        loop {
-            let len = self.length(self.k);
-            if t < self.start + len {
-                return (self.k % 2 == 1, self.start + len - t);
-            }
-            self.start += len;
-            self.k += 1;
-        }
-    }
-}
+// (v244) Les deux horloges (pluie, tonnerre) sont celles de `minelib_net::meteo`, que le
+// relais du monde lit aussi (les éclairs des nuages chargent la Foudre de Zeus en ligne).
+use minelib_net::meteo::Cycle;
 
 /// Bruit lisse à une dimension (0 … 1).
 fn noise1(seed: u64, x: f64) -> f32 {
@@ -174,14 +129,10 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 /// eux qui chargent la Foudre de Zeus de celui qui la porte en dessous). Tirés de la graine
 /// et de l'horloge, par zone de `CLOUD_ZONE` blocs de côté et par créneau de `CLOUD_SLOT_S`
 /// secondes : les mêmes pour tous, **quel que soit le nombre de joueurs dans la zone**.
-pub const CLOUD_ZONE: i32 = 256;
-pub const CLOUD_SLOT_S: f64 = 15.0;
-/// Chance par zone et par créneau, orage installé : un toutes les deux minutes en moyenne
-/// au-dessus d'une zone (« ça doit quand même arriver un peu »).
-pub const CLOUD_P: f64 = 1.0 / 8.0;
-/// Autour de celui qui porte la Foudre de Zeus (à moins de `zeus::CHARGE_REACH` blocs de
-/// lui) : trois fois plus souvent.
-pub const CLOUD_BOOST: f64 = 3.0;
+/// (v244) Tirés par `minelib_net::meteo`, le même code que le relais du monde : en ligne,
+/// c'est lui qui accorde les charges qu'ils donnent (chance par zone et par créneau, trois
+/// fois plus près de celui qui porte l'éclair : `meteo::CLOUD_P`, `CLOUD_BOOST`).
+pub use minelib_net::meteo::{CLOUD_SLOT_S, CLOUD_ZONE};
 /// On les tire jusqu'à cette distance de la caméra (blocs) : une dizaine de zones, soit
 /// cinq éclairs par minute environ (et autant des éclairs des nuages d'avant, tirés au
 /// hasard chez chacun : voir `Storm::update`).
@@ -227,8 +178,8 @@ impl Weather {
     pub fn new(seed: u64) -> Self {
         Self {
             seed,
-            rain: Cycle::new(mix64(seed ^ 0x7261_696e), RAIN_ON_S, RAIN_OFF_S),
-            thunder: Cycle::new(mix64(seed ^ 0x7468_756e), THUNDER_ON_S, THUNDER_OFF_S),
+            rain: minelib_net::meteo::clocks(seed).0,
+            thunder: minelib_net::meteo::clocks(seed).1,
             clock: 0.0,
             forced: None,
             fixed: false,
@@ -486,25 +437,15 @@ impl Weather {
         let cell = |v: f32| (v / CLOUD_ZONE as f32).floor() as i32;
         for cz in cell(centre.z - CLOUD_REACH)..=cell(centre.z + CLOUD_REACH) {
             for cx in cell(centre.x - CLOUD_REACH)..=cell(centre.x + CLOUD_REACH) {
-                let key = (cx as u32 as u64) << 32 | cz as u32 as u64;
-                let s = slot as u64;
-                let x = (cx * CLOUD_ZONE) as f32
-                    + unit(self.seed ^ 0xc1, s, key) as f32 * CLOUD_ZONE as f32;
-                let z = (cz * CLOUD_ZONE) as f32
-                    + unit(self.seed ^ 0xc2, s, key) as f32 * CLOUD_ZONE as f32;
-                let near = holder.is_some_and(|h| {
-                    (h.x - x).hypot(h.z - z) <= crate::zeus::CHARGE_REACH
-                });
-                let p = if near { CLOUD_P * CLOUD_BOOST } else { CLOUD_P };
-                if unit(self.seed ^ 0xc10d, s, key) >= p {
-                    continue;
+                let near = holder.map(|h| (h.x, h.z));
+                if let Some(s) = minelib_net::meteo::cloud_spot(self.seed, slot, cx, cz, near) {
+                    out.push(Spot {
+                        x: s.x,
+                        z: s.z,
+                        delay: s.delay,
+                        seed: s.seed,
+                    });
                 }
-                out.push(Spot {
-                    x,
-                    z,
-                    delay: (unit(self.seed ^ 0xc3, s, key) * CLOUD_SLOT_S) as f32,
-                    seed: mix64(self.seed ^ key ^ s << 24 ^ 0xc10d) as u32,
-                });
             }
         }
         out
@@ -588,6 +529,62 @@ pub fn attach(x: i32, z: i32, relief: &dyn Relief) -> Option<(i32, i32, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (v244) Le relais du monde lit le même temps que le jeu (`minelib_net::meteo`), et les
+    /// mêmes éclairs des nuages : c'est lui qui accorde en ligne les charges qu'ils donnent
+    /// à la Foudre de Zeus.
+    #[test]
+    fn the_relay_reads_the_same_weather_and_cloud_bolts() {
+        use minelib_net::meteo;
+        use minelib_net::proto::{WEATHER_CLEAR, WEATHER_RAIN, WEATHER_STORM};
+        for seed in [42u64, 0x5eed_1234, 7] {
+            let mut w = Weather::new(seed);
+            let (mut rain, mut thunder) = meteo::clocks(seed);
+            let mut storms = 0;
+            for k in 0..4000 {
+                let t = k as f64 * 97.3;
+                let (kind, left) = w.natural_at(t);
+                let (code, left2) = meteo::natural_at(&mut rain, &mut thunder, t);
+                let want = match kind {
+                    Kind::Clear => WEATHER_CLEAR,
+                    Kind::Rain => WEATHER_RAIN,
+                    Kind::Storm => WEATHER_STORM,
+                };
+                assert_eq!((code, left2), (want, left));
+                storms += u32::from(kind == Kind::Storm);
+            }
+            assert!(storms > 0);
+        }
+        // Les éclairs des nuages d'un créneau, autour de celui qui porte l'éclair.
+        let mut w = Weather::new(42);
+        w.force(Kind::Storm);
+        w.fix(true);
+        let holder = Vec3::new(40.0, 70.0, -24.0);
+        let mut seen = 0;
+        for k in 0..400 {
+            w.update(CLOUD_SLOT_S as f32, None);
+            let slot = (w.clock / CLOUD_SLOT_S).floor() as i64;
+            let loud = w.thundering();
+            let mine = w.cloud_bolts(holder, Some(holder));
+            // (Le premier appel ne tire rien, ni tant que l'orage n'est pas installé.)
+            if k == 0 || !loud {
+                continue;
+            }
+            let near: Vec<_> = mine
+                .iter()
+                .filter(|s| (s.x - holder.x).hypot(s.z - holder.z) <= meteo::CHARGE_REACH)
+                .map(|s| (s.x, s.z, s.delay, s.seed))
+                .collect();
+            let theirs: Vec<_> = meteo::charging_spots(42, slot, holder.x, holder.z)
+                .iter()
+                .map(|s| (s.x, s.z, s.delay, s.seed))
+                .collect();
+            assert_eq!(near.len(), theirs.len());
+            assert!(near.iter().all(|s| theirs.contains(s)));
+            seen += near.len();
+        }
+        assert!(seen > 20, "{seen}");
+    }
 
     /// (v241) Les éclairs des nuages d'une zone : tirés de la graine et de l'horloge (les
     /// mêmes pour tous, où qu'on soit et combien qu'on soit), une fois par créneau, pendant

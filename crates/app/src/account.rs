@@ -1064,6 +1064,7 @@ impl Accounts {
                 | Event::BulkDone { .. }
                 | Event::SetTime { .. }
                 | Event::SetWeather { .. }
+                | Event::Zeus { .. }
                 | Event::BuildSpawn { .. }
                 | Event::MapProgress(..)
                 | Event::MapUploaded(_)

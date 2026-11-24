@@ -40,9 +40,25 @@ fn npc_cry_gain(d: f32) -> Option<f32> {
 }
 
 /// (v227) PNJ visé : dans notre foule d'essai, ou dans celle que mène un autre OP (son pseudo).
+#[derive(Clone, Debug)]
 enum NpcTarget {
     Mine(usize),
     Theirs(String, usize),
+}
+
+/// (v244) Un coup de la Foudre de Zeus demandé au relais du monde, pas encore publié par
+/// l'arbitre du chunk : ce qu'on lui enverra avec le laissez-passer, et le PNJ visé par le
+/// petit éclair (blessé quand il part).
+#[derive(Clone, Debug)]
+struct ZeusPending {
+    seq: u32,
+    act: u8,
+    chunk: [i32; 2],
+    pos: Vec3,
+    to: Vec3,
+    seed: u32,
+    npc: Option<NpcTarget>,
+    at: std::time::Instant,
 }
 /// Taille d'écran nommée dans `/give` : `ecran` (normal), `petit_ecran`, `grand_ecran`,
 /// `ecran_geant` (aussi en anglais et avec accents, tirets ou espaces).
@@ -276,6 +292,10 @@ pub struct Session {
     /// (v241) La Foudre de Zeus de la carte, objet légendaire : prise ou non, ses charges
     /// (`crate::zeus`). Gardée avec la carte.
     legend: crate::zeus::Legend,
+    /// (v244) Sur un serveur de construction : ce que le relais du monde dit de l'éclair du
+    /// serveur, et nos coups demandés, pas encore publiés.
+    zeus_online: crate::zeus::Online,
+    zeus_pending: Vec<ZeusPending>,
     daylight: f32,
     break_cooldown: f32,
     place_cooldown: f32,
@@ -702,6 +722,8 @@ impl Session {
             thor_seq: 0,
             thor_refused: None,
             legend: crate::zeus::Legend::load(&data.zeus),
+            zeus_online: crate::zeus::Online::default(),
+            zeus_pending: Vec::new(),
             daylight: crate::daytime::daylight(time_h),
             break_cooldown: 0.0,
             dig: None,
@@ -2738,7 +2760,12 @@ impl Session {
                     self.player.look_dir(),
                 );
                 let lost = path.last().is_none_or(|p| p.y < 1.0);
-                if lost && self.legend_on() && self.inventory.selected_item() == Some(Item::Zeus) {
+                let zeus = self.legend_on() && self.inventory.selected_item() == Some(Item::Zeus);
+                if zeus && self.build.is_some() {
+                    // (v244) Sur un serveur, elle reste avec celui qui l'a prise (le relais
+                    // refuserait de la poser).
+                    self.chat.say(crate::inventory::LEGEND_BOUND, chat::GREY);
+                } else if lost && zeus {
                     self.chat.say(
                         "La Foudre de Zeus ne peut pas être jetée dans le vide.",
                         chat::GREY,
@@ -2799,7 +2826,13 @@ impl Session {
                     // Poser : la pile quitte l'inventaire tout de suite (rendue si le
                     // coffre la refuse), sur une pile du même objet ou une case libre.
                     Some(ChestAction::Put { slot, all }) => {
-                        if let Some(st) = self.inventory.slots[slot] {
+                        // (v244) Sur un serveur, la Foudre de Zeus ne se range pas.
+                        let bound = self.build.is_some()
+                            && self.legend_on()
+                            && self.inventory.slots[slot].is_some_and(|s| s.item == Item::Zeus);
+                        if bound {
+                            self.chat.say(crate::inventory::LEGEND_BOUND, chat::GREY);
+                        } else if let Some(st) = self.inventory.slots[slot] {
                             let n = if all { st.count.min(64) } else { 1 };
                             let code = st.item.code();
                             let target = (0..CHEST_SLOTS)
@@ -4034,11 +4067,230 @@ impl Session {
             && !self.holding_zeus()
     }
 
-    /// (v241) Les règles de l'objet légendaire valent-elles ici ? En solo. Sur un serveur de
-    /// construction, le relais ne les tient pas encore (il valide tout : rien n'y est décidé
-    /// par le jeu seul) ; la foudre y reste celle des OP.
+    /// (v241) Les règles de l'objet légendaire valent-elles ici ? En solo. (v244) Sur un
+    /// serveur de construction aussi : le relais du monde les y tient (`zeus_online`).
     fn legend_on(&self) -> bool {
-        self.build.is_none() && self.net.is_none() && self.game.mode != GameMode::Fps
+        self.net.is_none() && self.game.mode != GameMode::Fps
+    }
+
+    /// (v244) Notre pseudo sur le serveur de construction, si l'éclair du serveur est à nous
+    /// d'après le relais du monde.
+    fn zeus_mine_online(&self) -> bool {
+        self.build
+            .as_ref()
+            .is_some_and(|b| self.zeus_online.mine(b.pseudo()))
+    }
+
+    /// (v244) Une demande au relais du monde pour l'éclair du serveur (`Request::Zeus`) :
+    /// son état, le prendre, dire qu'on l'a déjà. La graine du monde l'accompagne (le relais
+    /// ne la retient que de son créateur : il en tire les éclairs des nuages).
+    fn zeus_cmd(&mut self, act: u8, charges: u8) {
+        self.thor_seq = self.thor_seq.wrapping_add(1);
+        let p = self.player.pos;
+        self.relay_cmds.push(minelib_net::client::Cmd::Zeus {
+            seq: self.thor_seq,
+            act,
+            chunk: [
+                (p.x.floor() as i32).div_euclid(16),
+                (p.z.floor() as i32).div_euclid(16),
+            ],
+            seed: self.world.seed,
+            charges,
+        });
+    }
+
+    /// (v244) Un coup demandé au relais du monde : `act` (`proto::ZEUS_SKY`, `ZEUS_STRIKE`,
+    /// `ZEUS_ARC`), de `pos` vers `to` (voir `BuildMsg::ZeusAsk`). S'il l'accorde, son
+    /// laissez-passer part à l'arbitre du chunk (`on_zeus`), qui publie le coup à tous ceux
+    /// qui sont près, nous compris (`update_thor`).
+    fn zeus_ask(&mut self, act: u8, pos: Vec3, to: Vec3, npc: Option<NpcTarget>) {
+        self.thor_seq = self.thor_seq.wrapping_add(1);
+        let seq = self.thor_seq;
+        let chunk = [
+            (pos.x.floor() as i32).div_euclid(16),
+            (pos.z.floor() as i32).div_euclid(16),
+        ];
+        self.zeus_pending
+            .retain(|p| p.at.elapsed().as_secs_f32() < 15.0);
+        if self.zeus_pending.len() >= 8 {
+            self.zeus_pending.remove(0);
+        }
+        self.zeus_pending.push(ZeusPending {
+            seq,
+            act,
+            chunk,
+            pos,
+            to,
+            seed: rand::random::<u32>(),
+            npc,
+            at: std::time::Instant::now(),
+        });
+        self.relay_cmds.push(minelib_net::client::Cmd::Zeus {
+            seq,
+            act,
+            chunk,
+            seed: 0,
+            charges: 0,
+        });
+    }
+
+    /// (v244) Ce que dit le relais du monde de l'éclair du serveur (`Response::Zeus`) : qui
+    /// l'a, ses charges, et sa réponse à nos demandes.
+    #[allow(clippy::too_many_arguments)]
+    fn on_zeus(
+        &mut self,
+        seq: u32,
+        act: u8,
+        why: u8,
+        holder: String,
+        charges: u8,
+        sky_hits: u8,
+        expires: u64,
+        permit: Vec<u8>,
+    ) {
+        use minelib_net::proto::{
+            ZEUS_ARC, ZEUS_CLAIM, ZEUS_CLOUD, ZEUS_EMPTY, ZEUS_HOLD, ZEUS_NOT_CREATIVE,
+            ZEUS_NOT_HOLDER, ZEUS_OK, ZEUS_SKY, ZEUS_STRIKE, ZEUS_TAKEN,
+        };
+        if self.build.is_none() {
+            return;
+        }
+        let before = self.zeus_online.holder.replace(holder.clone());
+        let mine = self.zeus_mine_online();
+        // Ce qu'on garde avec la carte suit le relais.
+        self.legend.taken = !holder.is_empty();
+        self.legend.elsewhere = self.legend.taken && !mine;
+        if !mine {
+            (self.legend.charges, self.legend.sky_hits) = (0, 0);
+        } else if seq != 0 || act == ZEUS_CLOUD {
+            let gained = charges > self.legend.charges;
+            self.legend.charges = charges.min(crate::zeus::MAX_CHARGES);
+            self.legend.sky_hits = sky_hits.min(crate::zeus::SKY_HITS - 1);
+            if act == ZEUS_CLOUD && gained {
+                self.chat.say(
+                    format!(
+                        "Un éclair a chargé la Foudre de Zeus ({} / {}).",
+                        self.legend.charges,
+                        crate::zeus::MAX_CHARGES
+                    ),
+                    chat::GREY,
+                );
+            }
+        }
+        match act {
+            ZEUS_CLAIM if seq != 0 => {
+                self.zeus_online.claiming = false;
+                match why {
+                    ZEUS_OK => self
+                        .chat
+                        .say("La Foudre de Zeus de ce serveur est à toi.", chat::YELLOW),
+                    ZEUS_TAKEN => self.chat.say(
+                        format!("La Foudre de Zeus de ce serveur a déjà été prise par {holder}."),
+                        chat::RED,
+                    ),
+                    ZEUS_NOT_CREATIVE => self
+                        .chat
+                        .say("La Foudre de Zeus se prend en créatif.", chat::RED),
+                    _ => self.chat.say(
+                        "Le relais n'a pas donné la Foudre de Zeus : réessaie.",
+                        chat::GREY,
+                    ),
+                }
+            }
+            ZEUS_HOLD if seq != 0 => self.zeus_online.holding = false,
+            ZEUS_SKY | ZEUS_STRIKE | ZEUS_ARC if seq != 0 => {
+                let Some(i) = self.zeus_pending.iter().position(|p| p.seq == seq) else {
+                    return;
+                };
+                if why == ZEUS_OK {
+                    let p = &self.zeus_pending[i];
+                    let req = minelib_net::game::BuildMsg::ZeusAsk {
+                        seq,
+                        chunk: p.chunk,
+                        act: p.act,
+                        pos: p.pos.to_array(),
+                        to: p.to.to_array(),
+                        seed: p.seed,
+                        expires,
+                        permit,
+                    };
+                    if let Some(b) = self.build.as_mut() {
+                        b.send_thor(&req);
+                    }
+                    return;
+                }
+                self.zeus_pending.remove(i);
+                // (Sans charge d'après le relais : rien à dire, le prochain coup sera le
+                // petit éclair.)
+                let quiet = why == ZEUS_EMPTY
+                    || self
+                        .thor_refused
+                        .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
+                if !quiet {
+                    self.thor_refused = Some(std::time::Instant::now());
+                    self.chat.say(
+                        if why == ZEUS_NOT_HOLDER {
+                            "Cette Foudre de Zeus n'est pas la tienne."
+                        } else {
+                            "La foudre n'est pas partie (relais pas prêt, ou trop de demandes) : réessaie."
+                        },
+                        chat::GREY,
+                    );
+                }
+            }
+            // Une nouvelle : quelqu'un d'autre vient de la prendre.
+            _ => {
+                let news = seq == 0 && act != ZEUS_CLOUD && before.as_deref() != Some(holder.as_str());
+                if news && !holder.is_empty() && !mine {
+                    self.chat.say(
+                        format!("{holder} a pris la Foudre de Zeus de ce serveur."),
+                        chat::GREY,
+                    );
+                }
+            }
+        }
+    }
+
+    /// (v244) Sur un serveur de construction, chaque image : l'état de l'éclair est demandé
+    /// à l'arrivée ; le catalogue le demande au relais ; il est sur nous s'il est à nous, et
+    /// seulement alors (celui qu'on avait pris en solo sur cette carte : on le dit au
+    /// relais, qui ne l'entend que du créateur du monde).
+    fn sync_legend_online(&mut self) {
+        use minelib_net::proto::{ZEUS_CLAIM, ZEUS_HOLD, ZEUS_SYNC};
+        if !self.zeus_online.asked {
+            self.zeus_online.asked = true;
+            self.zeus_cmd(ZEUS_SYNC, 0);
+        }
+        let mine = self.zeus_mine_online();
+        self.inventory.legend_took = false;
+        if std::mem::take(&mut self.inventory.legend_wanted) && !mine && !self.zeus_online.claiming
+        {
+            self.zeus_online.claiming = true;
+            self.zeus_cmd(ZEUS_CLAIM, 0);
+        }
+        self.inventory.legend_free = self.zeus_online.free() && !self.zeus_online.claiming;
+        if self.zeus_online.holder.is_none() {
+            return;
+        }
+        if mine {
+            if !self.inventory.has_zeus() {
+                self.inventory.add(Item::Zeus, 1);
+            }
+            self.inventory.keep_one_zeus(true);
+        } else if self.inventory.has_zeus() && !self.zeus_online.holding {
+            let kept = self.legend.taken && !self.legend.elsewhere;
+            if self.zeus_online.free() && kept && !self.zeus_online.hold_asked {
+                self.zeus_online.hold_asked = true;
+                self.zeus_online.holding = true;
+                self.zeus_cmd(ZEUS_HOLD, self.legend.charges);
+            } else {
+                self.inventory.keep_one_zeus(false);
+                self.chat.say(
+                    "Sur ce serveur, la Foudre de Zeus est légendaire : une seule, à prendre dans le menu créatif. La tienne est retirée.",
+                    chat::GREY,
+                );
+            }
+        }
     }
 
     /// (v241) Ce qu'on garde de l'éclair avec la carte (rien tant qu'il n'a pas été pris).
@@ -4055,15 +4307,23 @@ impl Session {
     /// charges.
     fn sync_legend(&mut self) {
         let on = self.legend_on();
+        let online = on && self.build.is_some();
         self.inventory.legend = on;
-        if std::mem::take(&mut self.inventory.legend_took) && on {
-            self.legend.taken = true;
+        self.inventory.legend_ask = online;
+        if online {
+            self.sync_legend_online();
+        } else {
+            if std::mem::take(&mut self.inventory.legend_took) && on {
+                self.legend.taken = true;
+                self.legend.elsewhere = false;
+            }
+            self.inventory.legend_free = on && !self.legend.taken;
         }
-        self.inventory.legend_free = on && !self.legend.taken;
         if let Some(text) = self.inventory.notice.take() {
             self.chat.say(text, chat::GREY);
         }
-        crate::zeus::show(on.then_some(self.legend.charges));
+        let mine = !online || self.zeus_mine_online();
+        crate::zeus::show(on.then_some(if mine { self.legend.charges } else { 0 }));
     }
 
     /// (v241) Un coup de la Foudre de Zeus, objet légendaire. Vers le ciel : la foudre monte
@@ -4073,62 +4333,66 @@ impl Session {
     /// il part même si l'on ne vise rien (il finit alors en l'air). Rend vrai si un coup est
     /// parti.
     fn zeus_blow(&mut self) -> bool {
-        use crate::zeus::{Blow, ARC_REACH, STRIKE_REACH};
+        use crate::zeus::{Blow, ARC_REACH};
+        use minelib_net::proto::{ZEUS_ARC, ZEUS_SKY, ZEUS_STRIKE};
+        // (v244) Sur un serveur : c'est le relais du monde qui accorde chaque coup, à celui
+        // qui a l'éclair du serveur (sinon l'objet nous est retiré : `sync_legend_online`).
+        let online = self.build.is_some();
+        if online && !self.zeus_mine_online() {
+            return false;
+        }
         let (eye, dir) = (self.player.eye(), self.player.look_dir());
-        let block = raycast(&self.world, eye.into(), dir.into(), STRIKE_REACH);
-        let limit = block.as_ref().map_or(STRIKE_REACH, |h| h.distance);
-        let person = self.aimed_person(limit);
-        // Ce qu'on vise : quelqu'un devant le premier bloc, sinon ce bloc.
-        let target = match (&person, &block) {
-            (Some((feet, _, t)), _) => Some((*feet, *t)),
-            (None, Some(h)) => Some((eye + dir * h.distance, h.distance)),
-            (None, None) => None,
-        };
-        // Rien à moins de 128 blocs : le ciel, si l'on regarde au-dessus de l'horizon.
-        let blow = self
-            .legend
-            .blow(target.is_none() && dir.y > 0.0, target.is_some());
-        let someone = person.is_some();
-        let npc = person.and_then(|(_, npc, t)| Some((npc?, t)));
-        match (blow, target) {
-            (Blow::Sky, _) => {
-                self.throw_lightning(Aim::Sky(dir));
-                self.legend.sky_hit();
+        // (v244) « Enlève la distance max pour taper avec la foudre, c'est comme le /thor » :
+        // ce qu'on vise est ce que vise `/thor` (`aimed`).
+        let aim = self.aimed();
+        let blow = self.legend.blow(matches!(aim, Some(Aim::Sky(_))));
+        match (blow, aim) {
+            (Blow::Sky, Some(Aim::Sky(dir))) => {
+                if online {
+                    let from = self.sky_origin(dir);
+                    self.zeus_ask(ZEUS_SKY, from, dir.normalize_or(Vec3::Y), None);
+                } else {
+                    self.throw_lightning(Aim::Sky(dir));
+                    self.legend.sky_hit();
+                }
             }
             // (La foudre blesse en tombant ceux qu'elle touche, PNJ compris : `storm.landed`.)
-            (Blow::Strike, Some((pos, _))) => {
-                self.legend.spend();
-                self.throw_lightning(Aim::Ground(pos));
+            (Blow::Strike, Some(Aim::Ground(pos))) => {
+                if online {
+                    self.zeus_ask(ZEUS_STRIKE, pos, pos, None);
+                } else {
+                    self.legend.spend();
+                    self.throw_lightning(Aim::Ground(pos));
+                }
             }
             (Blow::Arc, _) => {
+                // (v244) Il part du bout de l'éclair, et sa portée se mesure de là : jusqu'à
+                // ce qu'on vise (« si on vise un bloc précis, ça va jusqu'au bloc » ;
+                // quelqu'un : à mi-corps, pas à ses pieds) s'il est à 8 blocs de la pointe
+                // ou moins, sinon 8 blocs plus loin, en l'air (« il doit vraiment faire les
+                // 8 blocs de trajet »).
                 let tip = self.zeus_tip();
-                match target.filter(|(_, d)| *d <= ARC_REACH) {
-                    // À portée : jusqu'à lui (quelqu'un : à mi-corps, pas à ses pieds).
-                    Some((pos, _)) => {
-                        let to = if someone { pos + Vec3::Y * 0.9 } else { pos };
-                        self.storm.strike_arc(tip, to);
-                        if let Some((target, _)) = npc {
-                            self.hit_npc_for(target, f32::from(crate::zeus::ARC_DAMAGE));
-                        }
+                let far = ARC_REACH + 2.0;
+                let block = raycast(&self.world, eye.into(), dir.into(), far);
+                let limit = block.as_ref().map_or(far, |h| h.distance);
+                let person = self.aimed_person(limit);
+                let reached = |t: f32| (eye + dir * t - tip).length() <= ARC_REACH;
+                let (to, npc) = match (person, &block) {
+                    (Some((feet, npc, t)), _) if reached(t) => (feet + Vec3::Y * 0.9, npc),
+                    (None, Some(h)) if reached(h.distance) => (eye + dir * h.distance, None),
+                    _ => (crate::zeus::arc_end(eye, dir, tip, ARC_REACH), None),
+                };
+                if online {
+                    self.zeus_ask(ZEUS_ARC, tip, to, npc);
+                } else {
+                    self.storm.strike_arc(tip, to);
+                    if let Some(target) = npc {
+                        self.hit_npc_for(target, f32::from(crate::zeus::ARC_DAMAGE));
                     }
-                    // Rien à portée : il part quand même, et finit en l'air 8 blocs plus loin.
-                    None => self.storm.strike_arc(tip, eye + dir * ARC_REACH),
                 }
             }
-            _ => {
-                // Chargée, rien à viser : dit dans le tchat, au plus toutes les 3 s.
-                let quiet = self
-                    .thor_refused
-                    .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
-                if !quiet {
-                    self.thor_refused = Some(std::time::Instant::now());
-                    self.chat.say(
-                        format!("Trop loin : la foudre porte à {STRIKE_REACH:.0} blocs."),
-                        chat::GREY,
-                    );
-                }
-                return false;
-            }
+            // Chargée, rien à viser (rien de chargé par là) : rien ne part.
+            _ => return false,
         }
         self.storm.cooldown = crate::storm::ZEUS_COOLDOWN;
         true
@@ -4168,8 +4432,20 @@ impl Session {
                 online: self.build.is_some(),
                 covered: covered_above(&self.world, eye),
                 // (v241) Celui qui porte l'éclair légendaire : le joueur, s'il l'a sur lui.
-                holder: (self.legend_on() && self.inventory.has_zeus())
-                    .then_some(self.player.pos),
+                // (v244) Sur un serveur : au milieu de son chunk, là où le relais du monde
+                // (qui accorde les charges) le sait.
+                holder: (self.legend_on() && self.inventory.has_zeus()).then(|| {
+                    let p = self.player.pos;
+                    if self.build.is_some() {
+                        Vec3::new(
+                            (p.x / 16.0).floor() * 16.0 + 8.0,
+                            p.y,
+                            (p.z / 16.0).floor() * 16.0 + 8.0,
+                        )
+                    } else {
+                        p
+                    }
+                }),
             },
         );
         if hurt > 0 {
@@ -4194,7 +4470,13 @@ impl Session {
             }
         }
         // (v241) Un éclair a couru dans les nuages au-dessus de lui : une charge de plus.
-        for _ in 0..self.storm.charged {
+        // (v244) Sur un serveur, c'est le relais du monde qui l'accorde (`on_zeus`).
+        let charged = if self.build.is_some() {
+            0
+        } else {
+            self.storm.charged
+        };
+        for _ in 0..charged {
             if self.legend.charge() {
                 self.chat.say(
                     format!(
@@ -4240,6 +4522,7 @@ impl Session {
                     .unwrap_or(0)
                     .min(crate::zeus::MAX_CHARGES),
                 sky_hits: 0,
+                elsewhere: false,
             };
         }
         if let Some(every) = thor {
@@ -4301,6 +4584,12 @@ impl Session {
             let place = crate::player_model::zeus_frame(&pose)
                 .unwrap_or_else(|| Mat4::from_translation(self.player.eye()));
             self.storm.hold(dt, place, None, on);
+        }
+        // (v244) « Il doit toujours partir du bout » : le petit éclair parti de l'éclair
+        // qu'on tient suit sa pointe (elle bouge, et la main fait son geste).
+        if on {
+            let tip = self.zeus_tip();
+            self.storm.follow_arcs(tip);
         }
         // (v241) « On voit l'éclair dans le dos du joueur, comme la bombe en FPS, quand il
         // ne l'a pas en main mais dans son inventaire » : le sien, vu de derrière (à la
@@ -4484,7 +4773,63 @@ impl Session {
                         }
                     }
                 }
-                BuildMsg::ThorDenied { why, .. } => {
+                // (v244) Un coup de la Foudre de Zeus (le nôtre ou celui d'un autre), accordé
+                // par le relais du monde et publié par l'arbitre du chunk.
+                BuildMsg::Zeus {
+                    act,
+                    pos,
+                    to,
+                    seed,
+                    by,
+                    seq,
+                    ..
+                } => {
+                    use minelib_net::proto::{ZEUS_ARC, ZEUS_SKY, ZEUS_STRIKE};
+                    let (pos, to) = (Vec3::from(pos), Vec3::from(to));
+                    if !pos.is_finite() || !to.is_finite() {
+                        continue;
+                    }
+                    let own = by.eq_ignore_ascii_case(&me);
+                    let asked = own
+                        .then(|| self.zeus_pending.iter().position(|p| p.seq == seq))
+                        .flatten()
+                        .map(|i| self.zeus_pending.remove(i));
+                    let ours = own && self.holding_zeus();
+                    match act {
+                        ZEUS_SKY => {
+                            let eye_y = self.camera_pos().y;
+                            self.storm.strike_up_seeded(pos, to, eye_y, seed);
+                            if ours {
+                                self.storm.held.surge(pos, to);
+                            }
+                        }
+                        ZEUS_STRIKE => {
+                            self.storm.strike_seeded(pos, seed);
+                            if ours {
+                                let tip = self.zeus_tip();
+                                self.storm
+                                    .held
+                                    .surge(tip, (pos - tip).normalize_or(Vec3::Y));
+                            }
+                        }
+                        ZEUS_ARC => {
+                            // Le nôtre part de la pointe de l'éclair, là où elle est maintenant.
+                            let from = if ours { self.zeus_tip() } else { pos };
+                            self.storm.strike_arc_seeded(from, to, seed, ours);
+                            if let Some(target) = asked.and_then(|p| p.npc) {
+                                self.hit_npc_for(target, f32::from(crate::zeus::ARC_DAMAGE));
+                            } else if !own
+                                && (to - (self.player.pos + Vec3::Y * 0.9)).length() < 1.0
+                            {
+                                // Celui d'un autre nous touche (à mi-corps).
+                                self.damage(crate::zeus::ARC_DAMAGE);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                BuildMsg::ThorDenied { why, seq } => {
+                    self.zeus_pending.retain(|p| p.seq != seq);
                     // (Dit au plus toutes les 3 s : on clique vite avec l'éclair en main.)
                     let said = self
                         .thor_refused
@@ -4538,7 +4883,8 @@ impl Session {
     /// (v217) Pointe de l'éclair tenu, dans le monde, là où on la voit : au poing du modèle
     /// ((v240) à la première personne aussi, avec les gestes de la main).
     fn zeus_tip(&self) -> Vec3 {
-        let top = Vec3::Y * (crate::lightning::HELD_LEN * 0.5);
+        // (v244) Son bout, là où il est à cette image (il bouge avec l'éclair).
+        let top = self.storm.held.tip();
         let third = if self.game.mode == GameMode::Fps {
             0
         } else {
@@ -6059,6 +6405,25 @@ impl Session {
                 }
                 // (v229) Météo du serveur (à l'arrivée, ou changée par un OP) : le temps
                 // imposé et ce qu'il lui reste, ou celui des horloges du monde.
+                Event::Zeus {
+                    seq,
+                    act,
+                    why,
+                    holder,
+                    charges,
+                    sky_hits,
+                    expires,
+                    permit,
+                } => self.on_zeus(
+                    *seq,
+                    *act,
+                    *why,
+                    holder.clone(),
+                    *charges,
+                    *sky_hits,
+                    *expires,
+                    permit.clone(),
+                ),
                 Event::SetWeather { kind, left, fixed } => {
                     self.storm.weather.impose(
                         crate::weather::Kind::from_byte(*kind),
@@ -7697,8 +8062,22 @@ impl Session {
                         "foudre" | "foudre_de_zeus" | "zeus" | "eclair" | "éclair" | "lightning"
                     ) =>
                     {
+                        // (v244) Sur un serveur : demandé au relais du monde, qui le donne.
+                        if self.legend_on() && self.build.is_some() {
+                            if self.zeus_mine_online() {
+                                self.chat.say(
+                                    "Tu as déjà la Foudre de Zeus de ce serveur.",
+                                    chat::GREY,
+                                );
+                            } else if !self.zeus_online.free() {
+                                self.chat
+                                    .say(crate::inventory::LEGEND_GONE_ONLINE, chat::RED);
+                            } else if !self.zeus_online.claiming {
+                                self.zeus_online.claiming = true;
+                                self.zeus_cmd(minelib_net::proto::ZEUS_CLAIM, 0);
+                            }
                         // (v241) Objet légendaire : un seul par carte, une seule fois.
-                        if self.legend_on() && self.legend.taken {
+                        } else if self.legend_on() && self.legend.taken {
                             self.chat.say(crate::inventory::LEGEND_GONE, chat::RED);
                         } else if self.inventory.add(Item::Zeus, 1) > 0 {
                             self.chat.say("Pas de place dans l'inventaire.", chat::RED);
@@ -11525,7 +11904,9 @@ mod slab_tests {
                 }
             }
         }
-        assert!(dropped > 0 && dropped < poses, "{dropped} poses sur {poses}");
+        // (v244) L'éclair penché de 45° vers l'avant porte sa lumière plus loin encore du
+        // joueur : l'ancienne règle elle-même n'écarterait plus aucun morceau.
+        assert!(dropped < poses, "{dropped} poses sur {poses}");
         // Dans un morceau, la lumière l'écarte toujours (sinon tout serait dans l'ombre).
         let pose = crate::player_model::Pose {
             feet: Vec3::new(3.0, 70.0, -2.0),

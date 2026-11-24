@@ -962,6 +962,9 @@ struct Conn {
     light_rate: (Instant, u32),
     /// (v229) Demandes de foudre dans la seconde en cours (`THOR_RATE`).
     thor_rate: (Instant, u32),
+    /// (v244) Coups de la Foudre de Zeus déjà publiés ici (demande, fin de son
+    /// laissez-passer) : un laissez-passer ne sert qu'une fois.
+    zeus_seen: VecDeque<(u32, u64)>,
     /// (v227) Paquets de la foule d'essai, et coups à ses PNJ, dans la seconde en cours
     /// (`CROWD_RATE`, `CROWD_HIT_RATE`).
     crowd_rate: (Instant, u32),
@@ -1022,6 +1025,7 @@ impl Conn {
             item_rate: (Instant::now(), 0),
             light_rate: (Instant::now(), 0),
             thor_rate: (Instant::now(), 0),
+            zeus_seen: VecDeque::new(),
             crowd_rate: (Instant::now(), 0),
             crowd_hit_rate: (Instant::now(), 0),
             hidden_presence: false,
@@ -1303,6 +1307,9 @@ struct Room {
     /// Relais de province : cette salle sert une province du monde de même numéro d'un
     /// autre relais (le relais du monde).
     province: Option<provinces::ProvinceRoom>,
+    /// (v244) Horloge de la météo en ligne jusqu'où les éclairs des nuages qui chargent la
+    /// Foudre de Zeus ont été comptés (relais du monde ; 0 : pas encore).
+    zeus_clock: f64,
 }
 
 impl Room {
@@ -3189,8 +3196,13 @@ fn item_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &game::Build
     let survival = fresh && in_survival(st, &server, &creator, pseudo);
     let broke = survival
         && spend.is_some_and(|p| !st.bags.can_spend(&server, pseudo, p.item, p.count as u32));
+    // (v244) La Foudre de Zeus légendaire ne se pose ni ne se range en ligne : elle reste
+    // avec celui qui l'a prise (le relais du monde sait qui), et un jeu modifié ne peut pas
+    // en poser une de plus. (Celles posées avant la v244 se ramassent encore : le jeu de
+    // qui la ramasse la lui retire aussitôt, elle n'est pas la sienne.)
+    let legend = spend.is_some_and(|p| p.item == minelib_net::items::LEGEND_ITEM);
     let room = st.rooms.get_mut(&rid).expect("partie");
-    let out = if !near || !calm || broke {
+    let out = if !near || !calm || broke || legend {
         let seq = minelib_net::items::request_seq(m).unwrap_or(0);
         vec![game::BuildMsg::Denied { seq }]
     } else {
@@ -3328,9 +3340,347 @@ pub(crate) fn thor_request(st: &mut State, rid: u64, id: u64, pseudo: &str, m: &
 /// (v229) Refus d'une demande de foudre (arbitre pas prêt, monde en pause), au seul
 /// demandeur.
 pub(crate) fn deny_thor(st: &mut State, id: u64, m: &game::BuildMsg) {
-    if let game::BuildMsg::ThorAsk { seq, .. } = m {
+    if let game::BuildMsg::ThorAsk { seq, .. } | game::BuildMsg::ZeusAsk { seq, .. } = m {
         let why = game::THOR_BUSY;
         push_to(st, id, &game::BuildMsg::ThorDenied { seq: *seq, why });
+    }
+}
+
+/// (v244) Ce joueur est-il en créatif sur ce serveur, d'après le relais (comme
+/// `in_survival` ; sans mode connu : le mode des mondes de construction, le créatif) ?
+fn in_creative(st: &State, server: &str, creator: &str, pseudo: &str) -> bool {
+    let mode = st
+        .bags
+        .mode(server, pseudo)
+        .map(str::to_string)
+        .or_else(|| {
+            (!st.servers.is_op(server, creator, pseudo))
+                .then(|| st.servers.default_gamemode(server))
+                .flatten()
+        });
+    mode.is_none_or(|m| {
+        matches!(
+            m.trim().to_lowercase().as_str(),
+            "1" | "c" | "creative" | "creatif" | "créatif"
+        )
+    })
+}
+
+/// (v244) Foudre de Zeus légendaire d'un serveur (`Request::Zeus`), au relais du monde, qui
+/// la tient : une seule par serveur, prise une fois (en créatif), jamais perdue ; ses
+/// charges (deux coups vers le ciel en font une, la foudre du ciel en prend une) ; et pour
+/// chaque coup accepté, un laissez-passer signé pour l'arbitre du chunk visé (`ZeusAsk`).
+/// La réponse et ce qui change arrivent par `Response::Zeus` (poussé).
+#[allow(clippy::too_many_arguments)]
+fn zeus_request(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    pseudo: &str,
+    seq: u32,
+    act: u8,
+    chunk: [i32; 2],
+    seed: u32,
+    charges: u8,
+) {
+    use proto::{
+        ZEUS_ARC, ZEUS_BUSY, ZEUS_CLAIM, ZEUS_EMPTY, ZEUS_HOLD, ZEUS_MAX_CHARGES,
+        ZEUS_NOT_CREATIVE, ZEUS_NOT_HOLDER, ZEUS_OK, ZEUS_SKY, ZEUS_SKY_HITS, ZEUS_STRIKE,
+        ZEUS_SYNC, ZEUS_TAKEN,
+    };
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let (server, creator) = (room.server.clone(), room.creator.clone());
+    let members: Vec<u64> = room.everyone().collect();
+    let me = pseudo.to_ascii_lowercase();
+    let is_creator = me == creator.to_ascii_lowercase();
+    let mut l = st.servers.legend(&server);
+    let before = l.clone();
+    let blow = matches!(act, ZEUS_SKY | ZEUS_STRIKE | ZEUS_ARC);
+    let calm = !blow
+        || st.conns.get_mut(&id).is_some_and(|c| {
+            if c.thor_rate.0.elapsed() >= Duration::from_secs(1) {
+                c.thor_rate = (Instant::now(), 0);
+            }
+            c.thor_rate.1 += 1;
+            c.thor_rate.1 <= THOR_RATE
+        });
+    let why = match act {
+        ZEUS_SYNC => {
+            // (Le créateur du monde dit sa graine : les éclairs des nuages en viennent.)
+            if is_creator && seed != 0 {
+                l.seed = Some(seed);
+            }
+            ZEUS_OK
+        }
+        ZEUS_HOLD if !is_creator => ZEUS_NOT_HOLDER,
+        ZEUS_HOLD | ZEUS_CLAIM if l.holder == me => ZEUS_OK,
+        ZEUS_HOLD | ZEUS_CLAIM if !l.holder.is_empty() => ZEUS_TAKEN,
+        ZEUS_HOLD => {
+            // Il l'avait déjà dans son monde en solo : elle reste à lui, avec ses charges.
+            l.holder = me.clone();
+            l.charges = charges.min(ZEUS_MAX_CHARGES);
+            l.sky_hits = 0;
+            ZEUS_OK
+        }
+        ZEUS_CLAIM if !in_creative(st, &server, &creator, pseudo) => ZEUS_NOT_CREATIVE,
+        ZEUS_CLAIM => {
+            l.holder = me.clone();
+            l.charges = 0;
+            l.sky_hits = 0;
+            ZEUS_OK
+        }
+        _ if !blow => ZEUS_BUSY,
+        _ if l.holder != me => ZEUS_NOT_HOLDER,
+        _ if !calm || guards::frozen(st, rid) => ZEUS_BUSY,
+        ZEUS_STRIKE if l.charges == 0 => ZEUS_EMPTY,
+        ZEUS_STRIKE => {
+            l.charges -= 1;
+            ZEUS_OK
+        }
+        ZEUS_SKY => {
+            if l.charges < ZEUS_MAX_CHARGES {
+                l.sky_hits += 1;
+                if l.sky_hits >= ZEUS_SKY_HITS {
+                    l.sky_hits = 0;
+                    l.charges += 1;
+                }
+            } else {
+                l.sky_hits = 0;
+            }
+            ZEUS_OK
+        }
+        _ => ZEUS_OK,
+    };
+    let (expires, permit) = if why == ZEUS_OK && blow {
+        use ed25519_dalek::Signer;
+        let expires = now_secs() + proto::ZEUS_PERMIT_S;
+        let msg = proto::zeus_permit_msg(rid, pseudo, seq, act, chunk, expires);
+        (expires, st.cert_key.sign(&msg).to_bytes().to_vec())
+    } else {
+        (0, Vec::new())
+    };
+    if l != before {
+        st.servers.set_legend(&server, l.clone());
+    }
+    if why != ZEUS_OK {
+        log::info!("Foudre de Zeus de « {pseudo} » refusée ({act}, raison {why})");
+    }
+    let reply = |seq: u32| Response::Zeus {
+        seq,
+        act,
+        why,
+        holder: l.holder.clone(),
+        charges: l.charges,
+        sky_hits: l.sky_hits,
+        expires,
+        permit: permit.clone(),
+    };
+    if let Some(c) = st.conns.get(&id) {
+        transport::push(&c.tx, &reply(seq));
+    }
+    // Quelqu'un vient de la prendre : tout le serveur le sait (le catalogue ne la donne
+    // plus).
+    if l.holder != before.holder {
+        let news = Response::Zeus {
+            seq: 0,
+            act,
+            why: ZEUS_OK,
+            holder: l.holder.clone(),
+            charges: 0,
+            sky_hits: 0,
+            expires: 0,
+            permit: Vec::new(),
+        };
+        for m in members.into_iter().filter(|&m| m != id) {
+            if let Some(c) = st.conns.get(&m) {
+                transport::push(&c.tx, &news);
+            }
+        }
+    }
+}
+
+/// (v244) Coup de la Foudre de Zeus (`BuildMsg::ZeusAsk`), à l'arbitre du chunk visé (le
+/// relais du monde, ou le relais d'une province) : publié aux joueurs proches et à celui qui
+/// le donne (`BuildMsg::Zeus`) s'il porte un laissez-passer du relais du monde, signé pour
+/// lui, ce coup et ce chunk, encore valable et pas encore servi ; rien d'absurde ; pas plus
+/// loin de lui que la portée de la foudre. Sinon refusé, à lui seul.
+pub(crate) fn zeus_zone_request(
+    st: &mut State,
+    rid: u64,
+    id: u64,
+    pseudo: &str,
+    m: &game::BuildMsg,
+) {
+    let game::BuildMsg::ZeusAsk {
+        seq,
+        chunk,
+        act,
+        pos,
+        to,
+        seed,
+        expires,
+        permit,
+    } = m
+    else {
+        return;
+    };
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let near = room.build.positions.get(&id).is_none_or(|at| {
+        (at[0] - chunk[0]).abs() <= THOR_REACH && (at[1] - chunk[1]).abs() <= THOR_REACH
+    });
+    let now = now_secs();
+    let signed = *expires >= now
+        && *expires <= now + proto::ZEUS_PERMIT_S + 5
+        && VerifyingKey::from_bytes(&root_of(st, rid)).is_ok_and(|key| {
+            Signature::from_slice(permit).is_ok_and(|sig| {
+                key.verify(
+                    &proto::zeus_permit_msg(rid, pseudo, *seq, *act, *chunk, *expires),
+                    &sig,
+                )
+                .is_ok()
+            })
+        });
+    let valid = signed && near && game::zeus_sane(m);
+    // Servi une fois (un laissez-passer refusé pour une autre raison n'est pas brûlé).
+    let fresh = valid
+        && st.conns.get_mut(&id).is_some_and(|c| {
+            c.zeus_seen.retain(|(_, until)| *until >= now);
+            if c.zeus_seen.iter().any(|(s, _)| s == seq) {
+                return false;
+            }
+            c.zeus_seen.push_back((*seq, *expires));
+            while c.zeus_seen.len() > 64 {
+                c.zeus_seen.pop_front();
+            }
+            true
+        });
+    if !fresh {
+        let why = if signed {
+            game::THOR_BUSY
+        } else {
+            game::THOR_NO_PERMIT
+        };
+        log::info!("coup de la Foudre de Zeus de « {pseudo} » refusé (raison {why})");
+        push_to(st, id, &game::BuildMsg::ThorDenied { seq: *seq, why });
+        return;
+    }
+    let data = game::encode(&game::BuildMsg::Zeus {
+        chunk: *chunk,
+        act: *act,
+        pos: *pos,
+        to: *to,
+        seed: *seed,
+        by: pseudo.chars().take(32).collect(),
+        seq: *seq,
+    });
+    let Some(room) = st.rooms.get(&rid) else {
+        return;
+    };
+    let mut to_ids = vec![id];
+    to_ids.extend(room.build.listeners(*chunk, id));
+    for m in to_ids {
+        if let Some(c) = st.conns.get(&m) {
+            push_zone(&c.tx, *chunk, data.clone());
+        }
+    }
+}
+
+/// (v244) Charges que donnent à la Foudre de Zeus les éclairs des nuages qui passent au-dessus
+/// de celui qui la porte, en (`x`, `z`), entre les instants `from` (exclu) et `to` (inclus) de
+/// l'horloge de la météo en ligne, dans un monde de graine `seed` : ceux de
+/// `meteo::charging_spots`, pendant un orage. `imposed` : la météo imposée par un OP
+/// (`proto::WEATHER_…`), sinon `WEATHER_NATURAL` : celle des horloges du monde.
+pub(crate) fn cloud_charges(seed: u32, x: f32, z: f32, imposed: u8, from: f64, to: f64) -> u32 {
+    use minelib_net::meteo;
+    if to <= from {
+        return 0;
+    }
+    let (mut rain, mut thunder) = meteo::clocks(u64::from(seed));
+    let slot_s = meteo::CLOUD_SLOT_S;
+    let mut n = 0;
+    let first = (from / slot_s).floor() as i64;
+    let last = (to / slot_s).floor() as i64;
+    for slot in first..=last {
+        for s in meteo::charging_spots(u64::from(seed), slot, x, z) {
+            let t = slot as f64 * slot_s + f64::from(s.delay);
+            if t <= from || t > to {
+                continue;
+            }
+            let storm = match imposed {
+                proto::WEATHER_NATURAL => {
+                    meteo::natural_at(&mut rain, &mut thunder, t).0 == proto::WEATHER_STORM
+                }
+                k => k == proto::WEATHER_STORM,
+            };
+            n += u32::from(storm);
+        }
+    }
+    n
+}
+
+/// (v244) Relais du monde, toutes les deux secondes : les éclairs des nuages passés depuis la
+/// dernière fois au-dessus de celui qui porte la Foudre de Zeus de chaque serveur (s'il est
+/// là, d'après sa dernière position connue ici) la chargent ; il l'apprend
+/// (`Response::Zeus`, `ZEUS_CLOUD`).
+fn upkeep_zeus(st: &mut State) {
+    use minelib_net::meteo;
+    let clock = meteo::online_clock(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64()),
+    );
+    let rooms: Vec<u64> = st
+        .rooms
+        .iter()
+        .filter(|(_, r)| r.kind == 1 && r.province.is_none())
+        .map(|(&id, _)| id)
+        .collect();
+    for rid in rooms {
+        let Some(room) = st.rooms.get(&rid) else {
+            continue;
+        };
+        let server = room.server.clone();
+        let since = room.zeus_clock;
+        let l = st.servers.legend(&server);
+        let holder = room.by_pseudo.get(&l.holder).copied().filter(|_| !l.holder.is_empty());
+        let at = holder.and_then(|h| room.build.positions.get(&h).copied());
+        if let Some(r) = st.rooms.get_mut(&rid) {
+            r.zeus_clock = clock;
+        }
+        let (Some(seed), Some(h), Some(at)) = (l.seed, holder, at) else {
+            continue;
+        };
+        if since <= 0.0 || l.charges >= proto::ZEUS_MAX_CHARGES {
+            continue;
+        }
+        let (imposed, _, _) = st.servers.weather(&server);
+        let (x, z) = (at[0] as f32 * 16.0 + 8.0, at[1] as f32 * 16.0 + 8.0);
+        let n = cloud_charges(seed, x, z, imposed, since, clock);
+        if n == 0 {
+            continue;
+        }
+        let mut l = l;
+        l.charges = (u32::from(l.charges) + n).min(u32::from(proto::ZEUS_MAX_CHARGES)) as u8;
+        st.servers.set_legend(&server, l.clone());
+        if let Some(c) = st.conns.get(&h) {
+            transport::push(
+                &c.tx,
+                &Response::Zeus {
+                    seq: 0,
+                    act: proto::ZEUS_CLOUD,
+                    why: proto::ZEUS_OK,
+                    holder: l.holder.clone(),
+                    charges: l.charges,
+                    sky_hits: l.sky_hits,
+                    expires: 0,
+                    permit: Vec::new(),
+                },
+            );
+        }
     }
 }
 
@@ -3699,6 +4049,7 @@ fn upkeep(st: &mut State) {
     probe_links(st);
     upkeep_contacts(st);
     upkeep_build(st);
+    upkeep_zeus(st);
     let rooms: Vec<u64> = st
         .rooms
         .iter()
@@ -5794,6 +6145,7 @@ fn open_room(
             bag_waiting: HashMap::new(),
             bag_deltas: HashMap::new(),
             province: None,
+            zeus_clock: 0.0,
         },
     );
     if let Some(c) = st.conns.get_mut(&id) {
@@ -7174,6 +7526,27 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             }
             Response::Done
         }
+        // (v244) Foudre de Zeus légendaire du serveur : le relais du monde la tient.
+        Request::Zeus {
+            seq,
+            act,
+            chunk,
+            seed,
+            charges,
+        } => {
+            let Some(rid) = my_room.filter(|r| {
+                st.rooms
+                    .get(r)
+                    .is_some_and(|r| r.kind == 1 && r.province.is_none())
+            }) else {
+                return Some(err(
+                    ErrorCode::Refused,
+                    "Seulement sur un serveur de construction.",
+                ));
+            };
+            zeus_request(st, rid, id, pseudo, seq, act, chunk, seed, charges);
+            Response::Done
+        }
         Request::Maps => {
             let mut list = st.maps.entries();
             for r in st.rooms.values().filter(|r| r.kind == 0) {
@@ -7308,6 +7681,15 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                     deny_thor(st, id, m);
                 } else {
                     thor_request(st, rid, id, pseudo, m);
+                }
+                return None;
+            }
+            // (v244) Coup de la Foudre de Zeus (laissez-passer du relais du monde) : de même.
+            if let Some(m @ game::BuildMsg::ZeusAsk { chunk: at, .. }) = &msg {
+                if provinces::delegated(st, rid, proto::region_of(*at)) {
+                    deny_thor(st, id, m);
+                } else {
+                    zeus_zone_request(st, rid, id, pseudo, m);
                 }
                 return None;
             }
@@ -8197,6 +8579,7 @@ fn handle(
             | Request::Invite { .. }
             | Request::InviteReply { .. }
             | Request::Presence { .. }
+            | Request::Zeus { .. }
             | Request::FriendDecline { .. }
             | Request::Party { .. }
             | Request::SkinPut { .. }
@@ -12055,6 +12438,269 @@ mod tests {
         assert!(matches!(next(&bob), game::BuildMsg::Thor { seq: 60, .. }));
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v244) La Foudre de Zeus légendaire en ligne : une seule par serveur, prise une fois en
+    /// créatif, à son seul porteur ; ses charges tenues ici ; un coup n'est publié qu'avec un
+    /// laissez-passer du relais du monde, une fois.
+    #[test]
+    fn the_legendary_bolt_is_held_by_the_world_relay() {
+        use proto::{
+            ZEUS_CLAIM, ZEUS_EMPTY, ZEUS_HOLD, ZEUS_NOT_CREATIVE, ZEUS_NOT_HOLDER, ZEUS_OK,
+            ZEUS_SKY, ZEUS_STRIKE, ZEUS_SYNC, ZEUS_TAKEN,
+        };
+        let dir = std::env::temp_dir().join(format!("minelib-zeus-{}", rand::random::<u32>()));
+        ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = start(Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let addr = h.addr.to_string();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(addr.clone(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        // Une demande, et ce qu'en dit le relais : (raison, porteur, charges, coups vers le
+        // ciel, laissez-passer, sa fin).
+        let zeus = |c: &Client, seq: u32, act: u8, charges: u8| {
+            c.send(Cmd::Zeus {
+                seq,
+                act,
+                chunk: [0, 0],
+                seed: 4242,
+                charges,
+            });
+            match wait(c, |e| matches!(e, Event::Zeus { seq: s, .. } if *s == seq)) {
+                Event::Zeus {
+                    why,
+                    holder,
+                    charges,
+                    sky_hits,
+                    permit,
+                    expires,
+                    ..
+                } => (why, holder, charges, sky_hits, permit, expires),
+                _ => unreachable!(),
+            }
+        };
+        let gamemode = |c: &Client, who: &str, mode: &str| {
+            c.send(Cmd::ServerAdmin {
+                action: proto::SERVER_GAMEMODE,
+                pseudo: who.into(),
+                reason: mode.into(),
+            });
+        };
+        let next = |c: &Client| loop {
+            if let Event::FromZone { peer, data, .. } =
+                wait(c, |e| matches!(e, Event::FromZone { .. }))
+            {
+                assert_eq!(peer, 0, "publié par le relais");
+                match game::decode::<game::BuildMsg>(&data).expect("message") {
+                    m @ (game::BuildMsg::Zeus { .. } | game::BuildMsg::ThorDenied { .. }) => {
+                        return m
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        let ask = |seq: u32, act: u8, expires: u64, permit: &[u8]| Request::ToZone {
+            chunk: [0, 0],
+            data: game::encode(&game::BuildMsg::ZeusAsk {
+                seq,
+                chunk: [0, 0],
+                act,
+                pos: [3.5, 70.0, 4.5],
+                to: [0.0, 1.0, 0.0],
+                seed: 77,
+                expires,
+                permit: permit.to_vec(),
+            }),
+        };
+        let (createur, clink) = login("Createur");
+        createur.send(Cmd::Host {
+            kind: 1,
+            name: "Monde".into(),
+            map: "monde".into(),
+            map_sig: [6; 32],
+            max_players: 0,
+        });
+        let room = match wait(&createur, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        transport::push(&clink, &Request::Position { chunk: [0, 0] });
+        let (eve, elink) = login("Eve");
+        eve.send(Cmd::Join(room));
+        wait(&eve, |e| matches!(e, Event::Joined { .. }));
+        transport::push(&elink, &Request::Position { chunk: [0, 0] });
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Personne ne l'a encore.
+        assert_eq!(zeus(&createur, 1, ZEUS_SYNC, 0).1, "");
+        // Seul le créateur dit l'avoir déjà (de son monde en solo).
+        assert_eq!(zeus(&eve, 2, ZEUS_HOLD, 3).0, ZEUS_NOT_HOLDER);
+        // En survie, on ne la prend pas.
+        gamemode(&createur, "Eve", "survival");
+        wait(&eve, |e| matches!(e, Event::SetGamemode { .. }));
+        assert_eq!(zeus(&eve, 3, ZEUS_CLAIM, 0).0, ZEUS_NOT_CREATIVE);
+        // En créatif : à elle, et tout le serveur l'apprend.
+        gamemode(&createur, "Eve", "creative");
+        wait(&eve, |e| matches!(e, Event::SetGamemode { .. }));
+        let (why, holder, charges, ..) = zeus(&eve, 4, ZEUS_CLAIM, 9);
+        assert_eq!((why, holder.as_str(), charges), (ZEUS_OK, "eve", 0));
+        match wait(&createur, |e| matches!(e, Event::Zeus { seq: 0, .. })) {
+            Event::Zeus { holder, .. } => assert_eq!(holder, "eve"),
+            _ => unreachable!(),
+        }
+        // Une seule : le créateur ne la prend plus, ni ne dit l'avoir.
+        assert_eq!(zeus(&createur, 5, ZEUS_CLAIM, 0).0, ZEUS_TAKEN);
+        assert_eq!(zeus(&createur, 6, ZEUS_HOLD, 5).0, ZEUS_TAKEN);
+        // Elle seule frappe ; sans charge, pas de foudre du ciel.
+        let (why, _, _, _, permit, _) = zeus(&createur, 7, ZEUS_SKY, 0);
+        assert_eq!((why, permit.is_empty()), (ZEUS_NOT_HOLDER, true));
+        assert_eq!(zeus(&eve, 8, ZEUS_STRIKE, 0).0, ZEUS_EMPTY);
+        // Deux coups vers le ciel : une charge.
+        let (why, _, charges, sky_hits, sky_permit, sky_expires) = zeus(&eve, 9, ZEUS_SKY, 0);
+        assert_eq!((why, charges, sky_hits), (ZEUS_OK, 0, 1));
+        assert!(!sky_permit.is_empty());
+        let (why, _, charges, sky_hits, ..) = zeus(&eve, 10, ZEUS_SKY, 0);
+        assert_eq!((why, charges, sky_hits), (ZEUS_OK, 1, 0));
+        // La foudre du ciel la prend.
+        let (why, _, charges, _, permit, expires) = zeus(&eve, 11, ZEUS_STRIKE, 0);
+        assert_eq!((why, charges), (ZEUS_OK, 0));
+        // Avec son laissez-passer : publiée, à elle et au créateur (tout près).
+        transport::push(&elink, &ask(11, ZEUS_STRIKE, expires, &permit));
+        for c in [&eve, &createur] {
+            assert_eq!(next(c), game::BuildMsg::Zeus {
+                chunk: [0, 0],
+                act: ZEUS_STRIKE,
+                pos: [3.5, 70.0, 4.5],
+                to: [0.0, 1.0, 0.0],
+                seed: 77,
+                by: "Eve".into(),
+                seq: 11,
+            });
+        }
+        // Une seule fois.
+        transport::push(&elink, &ask(11, ZEUS_STRIKE, expires, &permit));
+        assert_eq!(next(&eve), game::BuildMsg::ThorDenied {
+            seq: 11,
+            why: game::THOR_BUSY
+        });
+        // Le laissez-passer d'un autre coup, d'une autre sorte, plus long, ou d'un autre
+        // joueur : refusés.
+        transport::push(&elink, &ask(12, ZEUS_STRIKE, expires, &permit));
+        transport::push(&elink, &ask(9, ZEUS_STRIKE, sky_expires, &sky_permit));
+        transport::push(&elink, &ask(9, ZEUS_SKY, sky_expires + 60, &sky_permit));
+        for seq in [12, 9, 9] {
+            assert_eq!(next(&eve), game::BuildMsg::ThorDenied {
+                seq,
+                why: game::THOR_NO_PERMIT
+            });
+        }
+        transport::push(&clink, &ask(9, ZEUS_SKY, sky_expires, &sky_permit));
+        assert_eq!(next(&createur), game::BuildMsg::ThorDenied {
+            seq: 9,
+            why: game::THOR_NO_PERMIT
+        });
+        // Le sien, tel quel : publié.
+        transport::push(&elink, &ask(9, ZEUS_SKY, sky_expires, &sky_permit));
+        assert!(matches!(next(&eve), game::BuildMsg::Zeus { seq: 9, act: ZEUS_SKY, .. }));
+
+        // Elle ne la pose pas, ne la range pas : le relais refuse.
+        transport::push(
+            &elink,
+            &Request::ToZone {
+                chunk: [0, 0],
+                data: game::encode(&game::BuildMsg::DropItem {
+                    seq: 30,
+                    id: 99,
+                    pos: [3.5, 70.0, 4.5],
+                    pile: minelib_net::items::Pile {
+                        item: minelib_net::items::LEGEND_ITEM,
+                        count: 1,
+                    },
+                }),
+            },
+        );
+        let denied = loop {
+            if let Event::FromZone { data, .. } =
+                wait(&eve, |e| matches!(e, Event::FromZone { .. }))
+            {
+                if let Some(m @ game::BuildMsg::Denied { .. }) =
+                    game::decode::<game::BuildMsg>(&data)
+                {
+                    break m;
+                }
+            }
+        };
+        assert_eq!(denied, game::BuildMsg::Denied { seq: 30 });
+
+        // Gardée sur le disque du relais : toujours à Eve, avec la graine du monde.
+        let l = servers::Store::open(dir.join("serveurs.bin"))
+            .legend(&servers::key("Createur", "monde"));
+        assert_eq!((l.holder.as_str(), l.charges, l.seed), ("eve", 0, Some(4242)));
+        drop((createur, eve));
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (v244) Les éclairs des nuages chargent la Foudre de Zeus pendant un orage seulement, au
+    /// plus près de celui qui la porte ; les mêmes que ceux que son jeu voit tomber.
+    #[test]
+    fn cloud_bolts_charge_the_legendary_bolt_during_storms_only() {
+        use minelib_net::meteo;
+        let (x, z) = (40.0, -24.0);
+        let hour = 3600.0;
+        let t0 = 10_000.0;
+        let storm = cloud_charges(4242, x, z, proto::WEATHER_STORM, t0, t0 + hour);
+        let clear = cloud_charges(4242, x, z, proto::WEATHER_CLEAR, t0, t0 + hour);
+        assert!(storm > 0, "{storm}");
+        assert_eq!(clear, 0);
+        // Ceux des créneaux de l'heure, un à un.
+        let mut n = 0;
+        let s = meteo::CLOUD_SLOT_S;
+        for slot in (t0 / s).floor() as i64..=((t0 + hour) / s).floor() as i64 {
+            for c in meteo::charging_spots(4242, slot, x, z) {
+                let t = slot as f64 * s + f64::from(c.delay);
+                n += u32::from(t > t0 && t <= t0 + hour);
+                assert!(((c.x - x).powi(2) + (c.z - z).powi(2)).sqrt() <= meteo::CHARGE_REACH);
+            }
+        }
+        assert_eq!(storm, n);
+        // Comptés une fois : deux moitiés font le tout.
+        let half = cloud_charges(4242, x, z, proto::WEATHER_STORM, t0, t0 + hour / 2.0)
+            + cloud_charges(4242, x, z, proto::WEATHER_STORM, t0 + hour / 2.0, t0 + hour);
+        assert_eq!(half, storm);
+        // Météo naturelle : seulement pendant les orages des horloges du monde.
+        let (mut rain, mut thunder) = meteo::clocks(4242);
+        let day = 86_400.0;
+        let natural = cloud_charges(4242, x, z, proto::WEATHER_NATURAL, t0, t0 + day);
+        let mut m = 0;
+        for slot in (t0 / s).floor() as i64..=((t0 + day) / s).floor() as i64 {
+            for c in meteo::charging_spots(4242, slot, x, z) {
+                let t = slot as f64 * s + f64::from(c.delay);
+                if t > t0 && t <= t0 + day {
+                    m += u32::from(
+                        meteo::natural_at(&mut rain, &mut thunder, t).0 == proto::WEATHER_STORM,
+                    );
+                }
+            }
+        }
+        assert_eq!(natural, m);
+        assert!(natural < cloud_charges(4242, x, z, proto::WEATHER_STORM, t0, t0 + day));
     }
 
     #[test]

@@ -45,6 +45,20 @@ fn shade(n: usize, seed: u32) -> f32 {
 const NEAR_WIDTH: f32 = 0.03;
 /// En deçà (blocs), le canal a aussi ses filaments et ses arcs courts.
 const DETAIL_REACH: f32 = 70.0;
+
+/// (v244) « Agrandis juste la version actuelle de près » : de près, le canal est plus large.
+/// Sa largeur au plus (`NEAR_WIDTH`) est multipliée par 1 + `NEAR_GROW` à moins de
+/// `GROW_FULL` blocs de l'œil, puis revient peu à peu à celle d'avant à `GROW_END` blocs :
+/// les distances moyennes, « parfaites », ne changent pas.
+const NEAR_GROW: f32 = 1.6;
+const GROW_FULL: f32 = 10.0;
+const GROW_END: f32 = 40.0;
+
+/// Demi-largeur du halo d'un morceau du canal au plus, à `d` blocs de l'œil.
+fn near_cap(d: f32) -> f32 {
+    let grow = 1.0 + NEAR_GROW * (1.0 - smooth(GROW_FULL, GROW_END, d));
+    (NEAR_WIDTH * d + 0.012) * grow
+}
 /// (v237) Vu de près, un morceau droit de l'éclair est brisé plus fin pour l'image
 /// (`fine_levels`). Un éclair tombé à quelques blocs était fait de trois ou quatre longs
 /// traits droits (ses morceaux font 3 blocs) ; il garde maintenant le dessin qu'il a aux
@@ -199,6 +213,8 @@ pub struct Strike {
     /// Le premier arc a touché : dégâts, tonnerre et lumière ont été donnés.
     pub landed: bool,
     pub seed: u32,
+    /// (v244) Arc parti de l'éclair qu'on tient : il suit sa pointe (`arc_from`).
+    pub follow: bool,
 }
 
 impl Strike {
@@ -261,6 +277,15 @@ impl Strike {
         let mut rng = Rng::new(seed as u64 | 0x54_0000_0000);
         let main = jagged(from, to, 5, 0.2, &mut rng);
         Self::build(Kind::Arc, main, to, f32::MAX, seed, 0.0, rng)
+    }
+
+    /// (v244) L'arc repart de `from` : la pointe de l'éclair tenu a bougé (elle vit, et la
+    /// main fait son geste), et « il doit toujours partir du bout ». Même arrivée, même
+    /// graine : la même forme, déplacée ; son âge et ses arcs en retour ne changent pas.
+    pub fn arc_from(&mut self, from: Vec3) {
+        if self.kind == Kind::Arc {
+            self.pieces = Self::arc(from, self.pos, self.seed).pieces;
+        }
     }
 
     /// Le canal `main` (du départ du traceur à son arrivée), ses branches et son déroulé.
@@ -373,6 +398,7 @@ impl Strike {
             strokes,
             landed: false,
             seed,
+            follow: false,
         }
     }
 
@@ -438,8 +464,8 @@ impl Strike {
         if self.delay > 0.0 {
             return;
         }
-        // Demi-largeur du halo au plus, à la distance `d` de l'œil.
-        let thin = |p: Vec3| NEAR_WIDTH * (p - eye).length() + 0.012;
+        // Demi-largeur du halo au plus, à la distance `d` de l'œil. (v244) Plus large de près.
+        let thin = |p: Vec3| near_cap((p - eye).length());
         let reach = self.age / self.leader_s;
         // Canal : rallumé par chaque arc, puis une lueur qui traîne.
         let since = self.age - self.leader_s;
@@ -822,6 +848,11 @@ impl Default for HeldBolt {
     }
 }
 
+/// (v244) Écart des pointes de l'éclair tenu (blocs, à peu près au plus), et nombre de points
+/// du canal qu'elles entraînent.
+const TIP_SWAY: f32 = 0.11;
+const TIP_PULL: usize = 6;
+
 /// Étincelles par seconde, et au plus autant en vol.
 const SPARKS_PER_S: f32 = 46.0;
 const MAX_SPARKS: usize = 96;
@@ -840,7 +871,29 @@ impl HeldBolt {
         let mut high = jagged(grip, Vec3::new(0.0, half, 0.0), 4, 0.3, &mut rng);
         let mut pts = low;
         pts.append(&mut high.split_off(1));
+        // (v244) « Que le bout de l'éclair ne soit pas fixe, comme le reste de l'éclair » :
+        // ses deux pointes bougent avec lui, de côté surtout (elles étaient clouées à la
+        // verticale du poing). Les morceaux voisins les suivent, de moins en moins.
+        let mut ends = Rng::new((t * 17.0) as u64 ^ 0x7e_b0);
+        let n = pts.len();
+        for (end, sign) in [(0, -1.0f32), (n - 1, 1.0)] {
+            let d = Vec3::new(
+                ends.bell() * TIP_SWAY,
+                sign * ends.bell() * TIP_SWAY * 0.5,
+                ends.bell() * TIP_SWAY,
+            );
+            for k in 0..TIP_PULL {
+                let i = if end == 0 { k } else { n - 1 - k };
+                pts[i] += d * (1.0 - k as f32 / TIP_PULL as f32).powi(2);
+            }
+        }
         pts
+    }
+
+    /// (v244) La pointe de l'éclair (son bout du haut), maintenant, dans son repère : le
+    /// petit éclair part de là (« il doit toujours partir du bout »).
+    pub fn tip(&self) -> Vec3 {
+        Self::core(self.t).last().copied().unwrap_or(Vec3::Y * (HELD_LEN * 0.5))
     }
 
     /// Avance de `dt` : les étincelles volent, de nouvelles partent de l'éclair. `place` :
@@ -1398,14 +1451,18 @@ mod tests {
     fn the_held_bolt_is_half_a_player_tall_and_alive() {
         let mut h = HeldBolt::default();
         let mut shapes = std::collections::HashSet::new();
+        let mut tips = std::collections::HashSet::new();
         let mut flickers = Vec::new();
         for _ in 0..120 {
             h.update(1.0 / 120.0, Mat4::IDENTITY, true);
             let core = HeldBolt::core(h.t);
             assert_eq!(core.len(), 33);
             let half = HELD_LEN * 0.5;
-            assert!((core[0].y + half).abs() < 1e-5 && (core[32].y - half).abs() < 1e-5);
-            assert!((core[32].y - core[0].y - HELD_LEN).abs() < 1e-5);
+            // (v244) Ses pointes bougent, près de leur place.
+            assert!((core[0].y + half).abs() < 0.07 && (core[32].y - half).abs() < 0.07);
+            assert!((core[32].y - core[0].y - HELD_LEN).abs() < 0.13);
+            assert_eq!(h.tip(), core[32]);
+            tips.insert((core[32].x.to_bits(), core[32].z.to_bits()));
             // (v217) 40 % de plus que la moitié de 1,8 bloc.
             assert!((HELD_LEN - 0.9 * 1.4).abs() < 1e-6);
             assert!(core[16].length() < 0.05, "passe par le poing");
@@ -1421,6 +1478,7 @@ mod tests {
             flickers.push(h.glow());
         }
         assert!(shapes.len() >= 12, "{} formes en une seconde", shapes.len());
+        assert!(tips.len() >= 12, "{} places de la pointe en une seconde", tips.len());
         let (lo, hi) = flickers
             .iter()
             .fold((f32::MAX, 0.0f32), |(l, h), v| (l.min(*v), h.max(*v)));

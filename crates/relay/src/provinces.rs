@@ -4349,7 +4349,11 @@ pub(crate) fn to_zone(
     // (v224) Lumière de l'éditeur : son chunk décide (comme pour un objet). (v229) La
     // foudre aussi.
     let chunk = match &msg {
-        Some(BuildMsg::LightPut { chunk: at, .. } | BuildMsg::ThorAsk { chunk: at, .. }) => *at,
+        Some(
+            BuildMsg::LightPut { chunk: at, .. }
+            | BuildMsg::ThorAsk { chunk: at, .. }
+            | BuildMsg::ZeusAsk { chunk: at, .. },
+        ) => *at,
         _ => chunk,
     };
     let region = proto::region_of(chunk);
@@ -4390,6 +4394,12 @@ pub(crate) fn to_zone(
     // (v229) Foudre d'un OP dans la province : de même.
     if let Some(m @ BuildMsg::ThorAsk { .. }) = &msg {
         super::thor_request(st, rid, id, pseudo, m);
+        return;
+    }
+    // (v244) Coup de la Foudre de Zeus : ce relais vérifie le laissez-passer du relais du
+    // monde (il connaît sa clé), puis le publie.
+    if let Some(m @ BuildMsg::ZeusAsk { .. }) = &msg {
+        super::zeus_zone_request(st, rid, id, pseudo, m);
         return;
     }
     let sovereign = room.sov.get(&region).map(|sv| sv.primary);

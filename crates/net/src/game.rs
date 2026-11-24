@@ -639,12 +639,86 @@ pub enum BuildMsg {
     },
     /// (v229) Demande de foudre `seq` refusée, au seul demandeur. `why` : `THOR_NOT_OP`
     /// (réservée aux OP du serveur), ou `THOR_BUSY` (trop de demandes, arbitre pas prêt,
-    /// monde en pause, point visé trop loin de soi).
+    /// monde en pause, point visé trop loin de soi). (v244) Aussi pour `ZeusAsk`.
     ThorDenied { seq: u32, why: u8 },
+    /// (v244) Coup de la Foudre de Zeus légendaire, à l'arbitre du chunk `chunk` (celui de
+    /// `pos`), avec le laissez-passer du relais du monde (`proto::zeus_permit_msg`, jusqu'à
+    /// `expires`). `act` : `proto::ZEUS_STRIKE` (la foudre tombe du ciel en `pos`),
+    /// `ZEUS_SKY` (elle monte de `pos` dans la direction `to`), `ZEUS_ARC` (le petit
+    /// éclair, de `pos`, la pointe de l'éclair, à `to`).
+    ZeusAsk {
+        seq: u32,
+        chunk: [i32; 2],
+        act: u8,
+        pos: [f32; 3],
+        to: [f32; 3],
+        seed: u32,
+        expires: u64,
+        permit: Vec<u8>,
+    },
+    /// (v244) Coup de la Foudre de Zeus publié par l'arbitre aux joueurs proches (et à celui
+    /// qui l'a donné, `by`, demande `seq`) : il part chez chacun à la réception, comme
+    /// `Thor`. Le petit éclair blesse chez lui le joueur qu'il touche.
+    Zeus {
+        chunk: [i32; 2],
+        act: u8,
+        pos: [f32; 3],
+        to: [f32; 3],
+        seed: u32,
+        by: String,
+        seq: u32,
+    },
 }
 
 pub const THOR_NOT_OP: u8 = 0;
 pub const THOR_BUSY: u8 = 1;
+/// (v244) `ZeusAsk` sans laissez-passer valable du relais du monde.
+pub const THOR_NO_PERMIT: u8 = 2;
+
+/// (v244) Portée du petit éclair de la Foudre de Zeus sans charge (blocs), un peu de jeu
+/// compris (l'arbitre refuse au-delà).
+pub const ZEUS_ARC_MAX: f32 = 9.0;
+
+/// (v244) Le coup de la Foudre de Zeus `m` (`BuildMsg::ZeusAsk`) n'a-t-il rien d'absurde ?
+/// Des nombres finis, un point dans les bornes du monde et dans le chunk annoncé ; vers le
+/// ciel, une direction de longueur 1 vers le haut ; le petit éclair, pas plus long que
+/// `ZEUS_ARC_MAX`.
+pub fn zeus_sane(m: &BuildMsg) -> bool {
+    use crate::proto::{ZEUS_ARC, ZEUS_SKY, ZEUS_STRIKE};
+    let BuildMsg::ZeusAsk {
+        chunk,
+        act,
+        pos,
+        to,
+        permit,
+        ..
+    } = m
+    else {
+        return false;
+    };
+    let finite = pos.iter().chain(to.iter()).all(|v| v.is_finite());
+    if !finite
+        || permit.len() > 128
+        || pos[0].abs() > 3.0e7
+        || pos[2].abs() > 3.0e7
+        || !(-64.0..=4096.0).contains(&pos[1])
+    {
+        return false;
+    }
+    let at = [
+        (pos[0].floor() as i32).div_euclid(16),
+        (pos[2].floor() as i32).div_euclid(16),
+    ];
+    let d = [to[0] - pos[0], to[1] - pos[1], to[2] - pos[2]];
+    let len2 = to.iter().map(|v| v * v).sum::<f32>();
+    at == *chunk
+        && match *act {
+            ZEUS_STRIKE => true,
+            ZEUS_SKY => (0.9..=1.1).contains(&len2) && to[1] > 0.05,
+            ZEUS_ARC => d.iter().map(|v| v * v).sum::<f32>() <= ZEUS_ARC_MAX * ZEUS_ARC_MAX,
+            _ => false,
+        }
+}
 
 /// (v229) La demande de foudre `m` (`BuildMsg::ThorAsk`) n'a-t-elle rien d'absurde ? Des
 /// nombres finis, un point dans les bornes du monde et dans le chunk annoncé, une

@@ -1059,8 +1059,18 @@ fn held_parts(pose: &Pose) -> Vec<(Mat4, [f32; 3], [f32; 3], RayBoxKind)> {
 /// soit le regard. `None` sans bras droit.
 pub fn zeus_frame(pose: &Pose) -> Option<Mat4> {
     let at = hand_frame(pose)?.transform_point3(Vec3::new(0.0, 0.0, -2.0));
-    Some(Mat4::from_translation(at) * Mat4::from_rotation_y(-pose.yaw))
+    Some(
+        Mat4::from_translation(at)
+            * Mat4::from_rotation_y(-pose.yaw)
+            * Mat4::from_rotation_x(-ZEUS_HELD_TILT),
+    )
 }
+
+/// (v244) Penché de la Foudre de Zeus tenue (rad, depuis la verticale, sa pointe vers
+/// l'avant) : « allonge un peu l'éclair vers l'avant en main, qu'on voie son bout ; 45
+/// degrés suffiraient ». Debout, sa pointe sortait de l'écran par le haut à la première
+/// personne, et le petit éclair semblait partir de nulle part.
+pub const ZEUS_HELD_TILT: f32 = std::f32::consts::FRAC_PI_4;
 
 /// Position (monde) de la flamme d'une torche tenue en main : la lumière part de là.
 pub fn torch_tip(pose: &Pose) -> Option<Vec3> {
@@ -1870,11 +1880,12 @@ mod tests {
                 local(m.transform_point3(Vec3::Y * half)),
             );
             assert!(((top - low).length() - crate::lightning::HELD_LEN).abs() < 1e-3);
-            assert!(top.x > 0.2 && low.x < -0.2 && top.y > low.y + 0.6, "{low} {top}");
-            // À 45°, comme son icône (debout).
+            assert!(top.x > 0.15 && low.x < -0.15 && top.y > low.y + 0.6, "{low} {top}");
+            // (v244) À 22,5° de la verticale (la moitié des 45° de son icône), debout.
             if crouch == 0.0 {
                 let d = top - low;
-                assert!((d.x - d.y).abs() < 0.05 && d.z.abs() < 0.05, "{d}");
+                let tilt = std::f32::consts::FRAC_PI_8.tan();
+                assert!((d.x / d.y - tilt).abs() < 0.03 && d.z.abs() < 0.05, "{d}");
             }
             // Derrière le dos (le corps fait 4 pixels d'épaisseur : son dos est à 2 pixels).
             if crouch == 0.0 {
@@ -2508,8 +2519,8 @@ pub fn zeus_back_frame(pose: &Pose) -> Option<Mat4> {
 }
 
 /// (v241) Penché de la Foudre de Zeus dans le dos (rad, depuis la verticale) : celui de son
-/// icône.
-pub const ZEUS_BACK_TILT: f32 = std::f32::consts::FRAC_PI_4;
+/// icône (45°). (v244) « Mets-le à moitié plus droit » : la moitié, 22,5°.
+pub const ZEUS_BACK_TILT: f32 = std::f32::consts::FRAC_PI_8;
 
 /// (v179) Bombe portée sur le dos : debout (sa longueur le long du dos), son dessous contre
 /// le dos du joueur, le clavier vers l'arrière. Le modèle est celui de la main, à la même

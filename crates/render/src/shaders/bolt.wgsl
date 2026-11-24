@@ -59,7 +59,8 @@ struct VOut {
 const NEAR_W: f32 = 0.02;
 /// (v235) Demi-largeur à l'écran (la demi-hauteur de l'écran vaut 1) que le halo d'un coup
 /// de foudre ne dépasse pas, si près de l'œil qu'il passe.
-const NEAR_R: f32 = 0.075;
+/// (v244) 0,16 (0,075 avant) : le canal vu de près est plus large (`lightning::near_cap`).
+const NEAR_R: f32 = 0.16;
 /// Demi-largeur minimale à l'écran (px) : un éclair lointain reste un trait visible.
 const MIN_PX: f32 = 1.3;
 /// Le rectangle dépasse d'autant les deux bouts du segment (en demi-largeurs) : le halo
