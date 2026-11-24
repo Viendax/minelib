@@ -6967,6 +6967,11 @@ impl Session {
             }
             Event::FromPeer { peer, data } => n.receive(Some(*peer), data, &mut self.world),
             Event::FromHost(data) => n.receive(None, data, &mut self.world),
+            // Voie rapide : le bout donné par le relais pour cette partie.
+            Event::Fast(end) => {
+                n.set_fast(end.clone());
+                Vec::new()
+            }
             _ => Vec::new(),
         };
         self.apply_net(locals);

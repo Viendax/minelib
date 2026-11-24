@@ -1212,6 +1212,7 @@ impl Game {
                     | Event::FromPeer { .. }
                     | Event::Witness { .. }
                     | Event::FromHost(_)
+                    | Event::Fast(_)
                     | Event::Promoted { .. }
                     | Event::HostChanged(_)
                     | Event::BackupIs(_) => {
@@ -4773,6 +4774,11 @@ fn main() -> anyhow::Result<()> {
         std::env::consts::ARCH,
         log_path.display()
     );
+    // Voie rapide des parties FPS : quand ce jeu sert de passeur, il demande à la box
+    // d'ouvrir son port (elle a jusqu'à 10 s pour répondre).
+    minelib_net::fast::set_mapper(Box::new(|port| {
+        minelib_p2p::portmap::map_udp(port, std::time::Duration::from_secs(10))
+    }));
     // Plantage Rust : message, endroit et pile d'appels, dans le journal et un rapport.
     {
         let crash_path = crash_path.clone();

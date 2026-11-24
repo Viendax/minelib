@@ -9,6 +9,8 @@ description = "Minelib : relais joignable sans port ouvert (iroh) et rendez-vous
 anyhow = "1"
 iroh = "1.4.1"
 mainline = "8"
+# Ouverture d'un port sur la box (passeurs de la voie rapide) : déjà là avec iroh.
+portmapper = "0.19"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }

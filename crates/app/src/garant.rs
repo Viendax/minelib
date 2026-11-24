@@ -231,6 +231,11 @@ impl Garant {
                 net.host_changed();
                 Vec::new()
             }
+            // Voie rapide : le bout donné par le relais pour la partie servie.
+            Event::Fast(end) => {
+                net.set_fast(end.clone());
+                Vec::new()
+            }
             Event::BackupIs(peer) => {
                 net.designate_backup(*peer);
                 Vec::new()

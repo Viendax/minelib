@@ -45,7 +45,11 @@ use serde::{Deserialize, Serialize};
 /// (v264) 69 : la tête du personnage rapetisse (4 colonnes du skin du corps) et son corps
 /// grandit d'autant : ses boîtes des coups en partie FPS, les pavés du modèle, doivent être
 /// les mêmes chez l'hôte, ses invités et le vérificateur.
-pub const PROTOCOL: u32 = 69;
+/// (v270) 70 : voie rapide des parties FPS (`crate::fast`) : passeurs (`PasseurOffer`,
+/// `PasseurTask`), routes des joueurs (`FastWant`, `FastGuest`, `FastHost`), entrées
+/// envoyées aussi par la voie rapide (`game::ToHost::InputsFast`) et sondes
+/// (`game::ToPeer::FastPing`).
+pub const PROTOCOL: u32 = 70;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -797,6 +801,28 @@ pub enum Request {
         seed: u32,
         charges: u8,
     },
+    /// Voie rapide (`crate::fast`) : ce jeu peut servir de passeur. `port` : son port UDP ;
+    /// `external` : l'adresse publique (IPv4, port) que sa box lui a donnée en ouvrant ce
+    /// port, si elle l'a fait (sinon le relais essaie l'adresse d'où vient la connexion,
+    /// avec `port`). Le relais vérifie en y envoyant une sonde UDP, à laquelle le jeu
+    /// répond par `PasseurEcho` : seul un passeur vérifié reçoit des routes.
+    PasseurOffer {
+        port: u16,
+        external: Option<([u8; 4], u16)>,
+    },
+    /// La sonde UDP du relais est arrivée (même numéro) : le port est joignable.
+    PasseurEcho {
+        nonce: u64,
+    },
+    /// Ce jeu ne sert plus de passeur.
+    PasseurOff,
+    /// Hôte d'une partie FPS : demande des passeurs pour ses joueurs, groupés par équipe
+    /// (un passeur ne porte qu'une équipe par partie). Refaite à chaque changement (début
+    /// de partie, joueur arrivé ou parti, nouvel hôte) : tout est redonné (`FastHost` à
+    /// l'hôte, `FastGuest` à chaque joueur), avec des routes et des clés neuves.
+    FastWant {
+        groups: Vec<Vec<u64>>,
+    },
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -898,6 +924,10 @@ impl Request {
                 | Request::ShardReady { .. }
                 | Request::Rtt { .. }
                 | Request::Echo { .. }
+                | Request::PasseurOffer { .. }
+                | Request::PasseurEcho { .. }
+                | Request::PasseurOff
+                | Request::FastWant { .. }
                 | Request::BulkEdit { .. }
                 | Request::Served { .. }
                 | Request::CheatFound { .. }
@@ -1665,6 +1695,63 @@ pub enum Response {
         expires: u64,
         permit: Vec<u8>,
     },
+    /// Voie rapide, à un passeur : les routes à porter pour l'attribution `lot` (route, clé
+    /// du sceau). Elles remplacent celles qu'il portait pour elle ; liste vide : plus rien.
+    /// Il ne sait ni de quelle partie il s'agit, ni qui sont les joueurs.
+    PasseurTask {
+        lot: u64,
+        routes: Vec<(u64, [u8; 32])>,
+    },
+    /// Voie rapide, à un joueur d'une partie FPS : sa route vers l'hôte (clé qui scelle de
+    /// bout en bout, passeurs de son équipe). Aucun passeur : voie fermée, tout passe par
+    /// le relais comme avant.
+    FastGuest {
+        route: u64,
+        key: [u8; 32],
+        passeurs: Vec<FastHop>,
+    },
+    /// Voie rapide, à l'hôte : les routes de ses joueurs (elles remplacent les précédentes).
+    FastHost {
+        ways: Vec<FastWay>,
+    },
+}
+
+/// Passeur d'une route de la voie rapide : où lui écrire (IPv4, port UDP) et la clé du
+/// sceau qu'il vérifie.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FastHop {
+    pub addr: [u8; 4],
+    pub port: u16,
+    pub seal: [u8; 32],
+}
+
+/// Route de la voie rapide entre l'hôte et le joueur `peer`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FastWay {
+    pub peer: u64,
+    pub route: u64,
+    pub key: [u8; 32],
+    pub passeurs: Vec<FastHop>,
+}
+
+impl FastHop {
+    pub fn via(&self) -> crate::fast::Via {
+        crate::fast::Via {
+            addr: std::net::SocketAddr::from((self.addr, self.port)),
+            seal: self.seal,
+        }
+    }
+}
+
+impl FastWay {
+    pub fn way(&self) -> crate::fast::Way {
+        crate::fast::Way {
+            peer: self.peer,
+            route: self.route,
+            key: self.key,
+            vias: self.passeurs.iter().map(FastHop::via).collect(),
+        }
+    }
 }
 
 /// (v240) Clé d'accès d'un compte, telle que le joueur la voit.
@@ -1715,6 +1802,9 @@ impl Response {
         matches!(
             self,
             Response::PeerJoined { .. }
+                | Response::PasseurTask { .. }
+                | Response::FastGuest { .. }
+                | Response::FastHost { .. }
                 | Response::PartyInvite { .. }
                 | Response::Invited { .. }
                 | Response::InviteDeclined { .. }

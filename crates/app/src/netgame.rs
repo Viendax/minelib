@@ -34,6 +34,18 @@ const SNAPSHOT_EVERY: u32 = 4;
 const MOVES_EVERY: u32 = 1;
 /// Tableau des scores : toutes les demi-secondes.
 const SCOREBOARD_EVERY: u32 = 128;
+/// Voie rapide (`minelib_net::fast`) : pas d'entrées répétés dans chaque paquet (les
+/// derniers, déjà partis par le relais). Un paquet perdu est ainsi couvert par le suivant.
+const FAST_INPUTS: usize = 8;
+/// Voie rapide : messages venus des passeurs que l'invité regarde avant de dire s'il
+/// reçoit plus vite par eux ou par le relais (`Guest::fast_vote`).
+const FAST_VOTES: u8 = 32;
+/// Voie rapide : à un joueur qui reçoit plus vite par le relais, une sonde par les
+/// passeurs tous les tant de pas (16 par seconde), pour savoir quand ce n'est plus vrai.
+const FAST_PING_EVERY: u32 = 16;
+/// Retard (pas) des nouvelles de l'hôte au-delà duquel une image compte comme bloquée
+/// (≈ 23 ms) : la mesure qui dit si la voie rapide sert à quelque chose.
+const STALL_TICKS: f32 = 6.0;
 /// Positions gardées pour rembobiner les tirs : 1 s.
 const HISTORY: usize = 256;
 /// Retard d'affichage des autres joueurs chez l'invité (pas) : ~47 ms.
@@ -1476,10 +1488,39 @@ pub struct Host {
     /// (v243) Partie d'un serveur de construction, menée par un OP : ses bots, les joueurs du
     /// serveur en mode FPS, sans classement ni vérificateur (ni copies, ni journal).
     build: bool,
+    /// Voie rapide (`minelib_net::fast`) : le bout par lequel partent les positions quand
+    /// elle est ouverte (rien : tout passe par le relais), et les équipes pour lesquelles
+    /// des passeurs ont été demandés au relais (`fast_want`).
+    fast: Option<minelib_net::fast::Endpoint>,
+    fast_groups: Vec<Vec<u64>>,
 }
 
 pub struct Guest {
     link: Sender<Inbound>,
+    /// Voie rapide (`minelib_net::fast`) : le bout par lequel les entrées partent aussi.
+    fast: Option<minelib_net::fast::Endpoint>,
+    /// Pas du dernier état de soi pris en compte, et pas le plus récent reçu de l'hôte :
+    /// par la voie rapide, un message peut en doubler un autre ; un plus ancien ne doit ni
+    /// ramener la prédiction en arrière ni passer pour un à-coup du réseau.
+    own_tick: Option<u32>,
+    seen_tick: Option<u32>,
+    /// Voie rapide : messages des passeurs comptés depuis le dernier avis, ceux qui sont
+    /// arrivés après ce qu'ils annonçaient (le relais avait été plus rapide), et l'avis en
+    /// cours : vrai si l'on reçoit plus vite par le relais (dit à l'hôte, qui n'envoie plus
+    /// alors les positions par les passeurs).
+    fast_votes: u8,
+    fast_late: u8,
+    fast_slow: bool,
+    /// Sa vie et s'il est vivant, d'après le dernier état complet reçu.
+    vitals: Option<(u8, bool)>,
+    /// Sa mort vient d'être apprise par un état complet arrivé après des positions plus
+    /// récentes (voie rapide) : les entrées en attente sont à oublier (`reconcile`).
+    died: bool,
+    /// Images jouées, et celles où les nouvelles de l'hôte avaient plus de `STALL_TICKS`
+    /// de retard (dit au journal toutes les 30 s, puis remis à zéro).
+    net_frames: u32,
+    net_stalled: u32,
+    net_since: std::time::Instant,
     you: Option<u64>,
     seq: u32,
     /// Entrées pas encore confirmées par l'hôte, avec l'état prédit après chacune.
@@ -1753,6 +1794,8 @@ impl NetGame {
             bot_seed: 0,
             away: None,
             build: false,
+            fast: None,
+            fast_groups: Vec::new(),
         };
         h.events(ev, &mut out);
         h.out = out;
@@ -2209,6 +2252,17 @@ impl NetGame {
             ping: None,
             ping_timer: 1.0,
             predicted: VecDeque::new(),
+            fast: None,
+            fast_votes: 0,
+            fast_late: 0,
+            fast_slow: false,
+            own_tick: None,
+            seen_tick: None,
+            vitals: None,
+            died: false,
+            net_frames: 0,
+            net_stalled: 0,
+            net_since: std::time::Instant::now(),
         }))
     }
 
@@ -2342,6 +2396,33 @@ impl NetGame {
         matches!(self, NetGame::Host(_))
     }
 
+    /// Voie rapide (`minelib_net::fast`) : le bout que le relais vient de donner à ce jeu
+    /// pour cette partie (rien : voie fermée, tout repasse par le relais).
+    pub fn set_fast(&mut self, end: Option<minelib_net::fast::Endpoint>) {
+        match self {
+            NetGame::Host(h) => h.fast = end,
+            NetGame::Guest(g) => {
+                // Nouvelles routes, nouveaux passeurs : l'avis repart de zéro.
+                g.fast = end;
+                g.fast_votes = 0;
+                g.fast_late = 0;
+                g.fast_slow = false;
+            }
+        }
+    }
+
+    /// La voie rapide est ouverte (invité : vers l'hôte ; hôte : vers au moins un joueur).
+    #[cfg(test)]
+    pub fn fast_open(&self) -> bool {
+        match self {
+            NetGame::Host(h) => h
+                .fast
+                .as_ref()
+                .is_some_and(|f| h.peers.keys().any(|p| f.open(*p))),
+            NetGame::Guest(g) => g.fast.as_ref().is_some_and(|f| f.open(0)),
+        }
+    }
+
     /// Lobby de l'hôte lui-même (ses amis le rejoindront dans son équipe).
     pub fn set_own_party(&mut self, party: u64) {
         if let NetGame::Host(h) = self {
@@ -2443,6 +2524,9 @@ impl NetGame {
     /// prédiction, puis rejoue les entrées qu'il n'a pas encore prises en compte.
     pub fn reconcile(&mut self, local: &mut Player, world: &World, dt: f32) {
         let NetGame::Guest(g) = self else { return };
+        if std::mem::take(&mut g.died) {
+            g.pending.clear();
+        }
         let Some((ack, state, _, alive)) = g.latest.take() else {
             return;
         };
@@ -2595,7 +2679,10 @@ impl NetGame {
                     if g.sent.len() > 512 {
                         g.sent.pop_front();
                     }
+                    // Voie rapide : les derniers pas partent aussi par les passeurs.
+                    g.fast_inputs(weapon);
                 }
+                g.count_stall(dt);
                 // (v165) Son ping, dit à l'hôte chaque seconde (tableau des scores).
                 g.ping_timer -= dt;
                 if g.ping_timer <= 0.0 {
@@ -2876,6 +2963,8 @@ impl NetGame {
             bot_seed: 0,
             away: None,
             build: false,
+            fast: None,
+            fast_groups: Vec::new(),
         }));
         if let NetGame::Host(h) = self {
             h.playing = h.m.players.contains_key(&0);
@@ -2891,6 +2980,10 @@ impl NetGame {
             g.outbox.clear();
             g.latest = None;
             g.snaps.clear();
+            g.own_tick = None;
+            g.seen_tick = None;
+            g.vitals = None;
+            g.died = false;
             g.keys = (false, false);
             g.loadout = (255, 255);
             g.backup = None;
@@ -3032,6 +3125,37 @@ impl NetGame {
 }
 
 impl Host {
+    /// Voie rapide : demande au relais des passeurs pour les joueurs, groupés par équipe,
+    /// une fois la partie commencée, et de nouveau dès que les équipes changent (joueur
+    /// arrivé ou parti, nouvel hôte). Les groupes sont rangés de la même façon quel que
+    /// soit le côté joué : changer de côté à la mi-temps ne redemande rien.
+    fn fast_want(&mut self) {
+        if self.solo || self.build {
+            return;
+        }
+        let mut groups: Vec<Vec<u64>> = Vec::new();
+        if self.m.started() {
+            let mut by_team: BTreeMap<u8, Vec<u64>> = BTreeMap::new();
+            for (&id, r) in &self.peers {
+                if !r.ready {
+                    continue;
+                }
+                if let Some(p) = self.m.players.get(&id) {
+                    by_team.entry(p.team).or_default().push(id);
+                }
+            }
+            groups = by_team.into_values().collect();
+            for g in &mut groups {
+                g.sort_unstable();
+            }
+            groups.sort();
+        }
+        if groups != self.fast_groups {
+            self.fast_groups = groups.clone();
+            send(&self.link, &Request::FastWant { groups });
+        }
+    }
+
     /// (v172) Un bot rejoint la partie solo (prêt tout de suite, comme un invité qui a la
     /// bonne carte).
     fn add_bot(&mut self, id: u64, pseudo: String) {
@@ -3887,8 +4011,29 @@ impl Host {
                     r.weapon = weapon;
                     for (i, n) in inputs.into_iter().enumerate() {
                         let seq = first_seq + i as u32;
-                        if seq > r.ack + r.queue.len() as u32 && r.queue.len() < 512 {
+                        // (Le dernier pas qu'on a : la voie rapide a pu en apporter.)
+                        let top = r.queue.back().map_or(r.ack, |q| q.0);
+                        if seq > top && r.queue.len() < 512 {
                             r.queue.push_back((seq, n));
+                        }
+                    }
+                }
+            }
+            // Par la voie rapide : seulement le pas qui suit exactement le dernier qu'on a.
+            // Jamais de trou (ce qui manque arrive par le relais, dans l'ordre), jamais de
+            // doublon : l'hôte joue exactement les mêmes entrées qu'avant, plus tôt.
+            ToHost::InputsFast {
+                first_seq,
+                inputs,
+                weapon,
+            } => {
+                if let Some(r) = self.peers.get_mut(&peer) {
+                    for (i, n) in inputs.into_iter().enumerate() {
+                        let seq = first_seq.wrapping_add(i as u32);
+                        let top = r.queue.back().map_or(r.ack, |q| q.0);
+                        if seq == top.wrapping_add(1) && r.queue.len() < 512 {
+                            r.queue.push_back((seq, n));
+                            r.weapon = weapon;
                         }
                     }
                 }
@@ -4168,6 +4313,7 @@ impl Host {
             });
         }
         if self.tick.is_multiple_of(SCOREBOARD_EVERY) {
+            self.fast_want();
             self.broadcast(&ToPeer::Scoreboard {
                 rows: self.rows(),
                 history: self.m.history.clone(),
@@ -4302,15 +4448,28 @@ impl Host {
                     .map(|(_, p)| p.clone()),
             );
             if !full {
-                self.send_to(
-                    id,
-                    &ToPeer::Moves {
-                        tick: self.tick,
-                        ack: r.ack,
-                        you: r.player.net_state(),
-                        players: players.iter().map(game::Pose::of).collect(),
-                    },
-                );
+                let moves = ToPeer::Moves {
+                    tick: self.tick,
+                    ack: r.ack,
+                    you: r.player.net_state(),
+                    players: players.iter().map(game::Pose::of).collect(),
+                };
+                // Par un passeur si la voie rapide vers ce joueur est ouverte (un paquet
+                // perdu est remplacé par le suivant, 4 ms après), sinon par le relais.
+                let fast = self
+                    .fast
+                    .as_ref()
+                    .is_some_and(|f| f.send_one(id, &game::encode(&moves)));
+                if !fast {
+                    self.send_to(id, &moves);
+                    // Ce joueur reçoit plus vite par le relais : une sonde de temps en
+                    // temps par les passeurs, pour qu'il dise quand ce n'est plus vrai.
+                    if self.tick % FAST_PING_EVERY == 1 {
+                        if let Some(f) = self.fast.as_ref().filter(|f| f.slow(id)) {
+                            f.send_any(id, &game::encode(&ToPeer::FastPing { tick: self.tick }));
+                        }
+                    }
+                }
                 continue;
             }
             self.send_to(
@@ -4441,6 +4600,113 @@ impl Host {
 }
 
 impl Guest {
+    /// Voie rapide : les derniers pas d'entrées (jusqu'à `FAST_INPUTS`, tous déjà partis par
+    /// le relais) par chaque passeur. L'hôte n'en garde que ce qui lui manque.
+    fn fast_inputs(&self, weapon: u8) {
+        let Some(f) = &self.fast else { return };
+        let k = FAST_INPUTS.min(self.pending.len());
+        if k == 0 {
+            return;
+        }
+        let from = self.pending.len() - k;
+        let msg = ToHost::InputsFast {
+            first_seq: self.pending[from].0,
+            inputs: self.pending.iter().skip(from).map(|p| p.1).collect(),
+            weapon,
+        };
+        f.send_all(0, &game::encode(&msg));
+    }
+
+    /// Une image de plus ; bloquée si les nouvelles de l'hôte ont trop de retard. Dit au
+    /// journal toutes les 30 s : c'est ce qui permet de comparer avec et sans voie rapide.
+    fn count_stall(&mut self, dt: f32) {
+        let Some(seen) = self.seen_tick else { return };
+        self.net_frames += 1;
+        // (L'horloge vient d'avancer d'une image : elle ne compte pas dans le retard.)
+        if self.clock - seen as f32 > STALL_TICKS + dt / crate::session::SIM_TICK {
+            self.net_stalled += 1;
+        }
+        if self.net_since.elapsed() >= std::time::Duration::from_secs(30) {
+            log::info!(
+                "réseau : {} images sur {} avec plus de {:.0} ms de retard sur l'hôte (voie \
+                 rapide {}, ping {:.0} ms)",
+                self.net_stalled,
+                self.net_frames,
+                STALL_TICKS * crate::session::SIM_TICK * 1000.0,
+                if self.fast.as_ref().is_some_and(|f| f.open(0)) {
+                    "ouverte"
+                } else {
+                    "fermée"
+                },
+                self.ping.unwrap_or(0.0)
+            );
+            self.net_frames = 0;
+            self.net_stalled = 0;
+            self.net_since = std::time::Instant::now();
+        }
+    }
+
+    /// Images comptées depuis le dernier relevé, et celles qui étaient bloquées.
+    #[cfg(test)]
+    pub fn stalls(&self) -> (u32, u32) {
+        (self.net_frames, self.net_stalled)
+    }
+
+    /// Voie rapide : un message au pas `tick` vient d'arriver par les passeurs (positions,
+    /// ou sonde `ping` quand on a demandé le relais). S'il arrive alors qu'on a déjà reçu
+    /// ce pas ou un plus récent, le relais a été plus rapide. Tous les `FAST_VOTES`
+    /// messages, l'avis : trois quarts en retard, on demande les positions par le relais ;
+    /// une fois au relais, il faut que trois quarts des sondes soient en avance pour revenir
+    /// aux passeurs (pas d'aller-retour pour quelques millisecondes).
+    fn fast_vote(&mut self, tick: u32, ping: bool) {
+        // (En temps normal ce sont les positions qui votent ; au relais, les sondes.)
+        if self.fast.is_none() || ping != self.fast_slow {
+            return;
+        }
+        self.fast_votes += 1;
+        if self.seen_tick.is_some_and(|s| tick <= s) {
+            self.fast_late += 1;
+        }
+        if self.fast_votes < FAST_VOTES {
+            return;
+        }
+        let slow = if self.fast_slow {
+            self.fast_late > FAST_VOTES / 4
+        } else {
+            self.fast_late >= FAST_VOTES / 4 * 3
+        };
+        if slow != self.fast_slow {
+            self.fast_slow = slow;
+            if let Some(f) = &self.fast {
+                f.set_slow(0, slow);
+            }
+            log::info!(
+                "voie rapide : les positions arrivent plus vite par {}",
+                if slow { "le relais" } else { "les passeurs" }
+            );
+        }
+        self.fast_votes = 0;
+        self.fast_late = 0;
+    }
+
+    /// Un état de l'hôte au pas `tick` vient d'arriver : est-il plus récent que tout ce
+    /// qu'on a reçu ? (Sinon il a été doublé par un autre, par la voie rapide : il ne compte
+    /// pas pour l'horloge.)
+    fn newest(&mut self, tick: u32) -> bool {
+        let new = self.seen_tick.is_none_or(|s| tick > s);
+        if new {
+            self.seen_tick = Some(tick);
+            self.arrived(tick as f32);
+        }
+        new
+    }
+
+    /// Un état de soi au pas `tick` est-il plus récent que le dernier pris en compte ? (Un
+    /// plus ancien ramènerait la prédiction en arrière : ses entrées ne sont plus là.)
+    fn own_fresh(&self, tick: u32) -> bool {
+        self.own_tick.is_none_or(|s| tick > s)
+    }
+
     /// (v165) L'hôte a pris en compte les entrées jusqu'au numéro `ack` : le temps depuis
     /// leur envoi donne le ping (lissé).
     fn acked(&mut self, ack: u32) {
@@ -4484,6 +4750,8 @@ impl Guest {
                 self.hello_timer = f32::INFINITY;
                 self.you = Some(you);
                 self.clock = tick as f32;
+                self.seen_tick = None;
+                self.own_tick = None;
                 if !map_ok {
                     out.push(Local::Notice(
                         "Ta carte est différente de celle de l'hôte : impossible de jouer.".into(),
@@ -4500,10 +4768,11 @@ impl Guest {
                 hud,
             } => {
                 // Horloge : rattrape l'hôte en douceur.
-                let t = tick as f32;
-                self.arrived(t);
+                self.newest(tick);
+                // (Pseudo, vie, arme des autres : toujours ceux du dernier état complet,
+                // même si des positions plus récentes sont déjà là par la voie rapide.)
+                self.full = players.clone();
                 if self.snaps.back().is_none_or(|(s, _)| *s < tick) {
-                    self.full = players.clone();
                     self.snaps.push_back((tick, players));
                     while self.snaps.len() > 128 {
                         self.snaps.pop_front();
@@ -4511,7 +4780,19 @@ impl Guest {
                 }
                 self.hud = hud;
                 let prev_hp = self.latest.map(|l| l.2);
-                self.latest = Some((ack, you, hp, alive));
+                // Sa vie vient toujours d'ici ; son déplacement, seulement s'il est plus
+                // récent que celui qu'on a déjà.
+                self.vitals = Some((hp, alive));
+                match (self.own_fresh(tick), self.latest) {
+                    (false, Some(l)) => self.latest = Some((l.0, l.1, hp, alive)),
+                    // Dépassé par des positions venues par la voie rapide, et déjà prises
+                    // en compte : il ne reste à en retenir que sa vie.
+                    (false, None) if self.fast.is_some() => self.died |= !alive,
+                    _ => {
+                        self.own_tick = Some(tick);
+                        self.latest = Some((ack, you, hp, alive));
+                    }
+                }
                 self.acked(ack);
                 if prev_hp != Some(hp) {
                     out.push(Local::SetHp(hp as u32));
@@ -4523,8 +4804,8 @@ impl Guest {
                 you,
                 players,
             } => {
-                let t = tick as f32;
-                self.arrived(t);
+                self.fast_vote(tick, false);
+                self.newest(tick);
                 if self.snaps.back().is_none_or(|(s, _)| *s < tick) {
                     // Le reste (pseudo, vie, arme…) vient du dernier état complet.
                     let list: Vec<NetPlayer> = players
@@ -4540,11 +4821,23 @@ impl Guest {
                         self.snaps.pop_front();
                     }
                 }
-                if let Some(l) = self.latest {
-                    self.latest = Some((ack, you, l.2, l.3));
+                if self.own_fresh(tick) {
+                    let vitals = match (self.latest, self.vitals) {
+                        (Some(l), _) => Some((l.2, l.3)),
+                        // Voie rapide : ces positions peuvent arriver avant l'état complet
+                        // de leur image. En vie, on se corrige quand même, avec la vie du
+                        // dernier état complet.
+                        (None, Some((hp, true))) if self.fast.is_some() => Some((hp, true)),
+                        _ => None,
+                    };
+                    if let Some((hp, alive)) = vitals {
+                        self.own_tick = Some(tick);
+                        self.latest = Some((ack, you, hp, alive));
+                    }
                 }
                 self.acked(ack);
             }
+            ToPeer::FastPing { tick } => self.fast_vote(tick, true),
             ToPeer::Hit { head, .. } => out.push(Local::Hit { head }),
             ToPeer::Kill {
                 killer,
@@ -4965,6 +5258,334 @@ mod tests {
             "l'invité voit l'hôte"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Ce qu'on a mesuré dans une partie d'essai de la voie rapide (`fast_match`).
+    struct FastRun {
+        /// Écart entre l'invité et ce que l'hôte en voit, en pleine course puis à la fin.
+        mid_gap: f32,
+        end_gap: f32,
+        /// Messages du relais retenus, entrées venues par les passeurs.
+        held: u32,
+        by_fast: u32,
+        /// Route de l'invité chez l'hôte, à la fin.
+        stats: minelib_net::fast::Stats,
+        /// Images de l'invité, et celles où l'hôte avait trop de retard.
+        frames: u32,
+        stalled: u32,
+        /// Passeurs en retard : l'invité a demandé le relais, l'hôte l'a su, et le retard
+        /// des nouvelles de l'hôte (pas) à ce moment-là ; puis, les passeurs redevenus les
+        /// plus rapides, tout le monde y est revenu.
+        asked_relay: bool,
+        host_knew: bool,
+        behind: f32,
+        came_back: bool,
+    }
+
+    /// Voie rapide (`minelib_net::fast`) : une partie à deux par un vrai relais, avec deux
+    /// passeurs. Une fois la voie ouverte et la manche lancée :
+    /// - `passeurs_lag` faux : le relais prend un retard permanent de 40 images (un canal TCP
+    ///   qui cale), les passeurs restent rapides ;
+    /// - `passeurs_lag` vrai : ce sont les passeurs qui ont 40 images de retard (mal placés)
+    ///   pendant 400 images, puis ils redeviennent plus rapides que le relais.
+    ///
+    /// L'invité court pendant 200 images, et on regarde où l'hôte le voit.
+    fn fast_match(passeurs_lag: bool) -> FastRun {
+        const LAG: usize = 40;
+        let dir = std::env::temp_dir().join(format!("minelib-net-rapide-{}", rand_u32()));
+        for p in ["Pas1", "Pas2"] {
+            minelib_relay::test_seed_games(&dir, p, 5);
+        }
+        minelib_relay::ONE_FPS_PER_MACHINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let h = minelib_relay::start(minelib_relay::Config {
+            dir: dir.clone(),
+            bind: "127.0.0.1:0".into(),
+            pow_bits: 4,
+            name: "essai".into(),
+        })
+        .unwrap();
+        let login = |pseudo: &str| {
+            let c = Client::spawn(h.addr.to_string(), Some(h.public));
+            c.send(Cmd::Register {
+                pseudo: pseudo.into(),
+                password: "motdepasse".into(),
+            });
+            let link = match wait(&c, |e| matches!(e, Event::Link(_))) {
+                Event::Link(l) => l,
+                _ => unreachable!(),
+            };
+            wait(&c, |e| matches!(e, Event::LoggedIn { .. }));
+            (c, link)
+        };
+        // Deux joueurs sans lien avec la partie prêtent leur port.
+        let passeurs: Vec<Client> = ["Pas1", "Pas2"]
+            .iter()
+            .map(|p| {
+                let (c, _) = login(p);
+                c.send(Cmd::Passeur(true));
+                c
+            })
+            .collect();
+        let (hc, hl) = login("Hote");
+        let (gc, gl) = login("Invite");
+        hc.send(Cmd::Host {
+            kind: 0,
+            name: String::new(),
+            map: "plat".into(),
+            map_sig: [1; 32],
+            max_players: 2,
+        });
+        let room = match wait(&hc, |e| matches!(e, Event::Hosted(_))) {
+            Event::Hosted(r) => r,
+            _ => unreachable!(),
+        };
+        gc.send(Cmd::Join(room));
+        wait(&gc, |e| matches!(e, Event::Joined { .. }));
+        let mut world = floor();
+        let hash = [1u8; 32];
+        let spawn = Vec3::new(8.5, 11.0, 8.5);
+        // Un contre un : la partie commence dès que l'invité est là.
+        let mut map = FpsMap::default();
+        map.set_players(2);
+        let mut host = NetGame::host(hl, "Hote".into(), map, hash, spawn);
+        let mut host_p = Player::new(Vec3::new(8.5, 11.0, 2.5));
+        let mut guest_p = Player::new(Vec3::new(0.0, 30.0, 0.0));
+        let mut guest: Option<NetGame> = None;
+        let dt = crate::session::SIM_TICK;
+        // Ce qui est retenu en route, et jusqu'à quelle image.
+        let mut late_h: VecDeque<(usize, Event)> = VecDeque::new();
+        let mut late_g: VecDeque<(usize, Event)> = VecDeque::new();
+        let mut slow_from: Option<usize> = None;
+        let (mut held, mut by_fast) = (0u32, 0u32);
+        let mut mid_gap = f32::NAN;
+        let mut hfast: Option<minelib_net::fast::Endpoint> = None;
+        let (mut asked_relay, mut host_knew, mut behind) = (false, false, f32::NAN);
+        let mut done = false;
+        for frame in 0..8000 {
+            // Depuis combien d'images le retard est en place, et sur quel chemin.
+            let since = slow_from.map(|f| frame - f);
+            let healed = passeurs_lag && since.is_some_and(|n| n >= 400);
+            let (lag_relay, lag_fast) = match since {
+                None => (0, 0),
+                Some(_) if !passeurs_lag => (LAG, 0),
+                Some(_) if healed => (3, 0),
+                Some(_) => (0, LAG),
+            };
+            // L'invité demande-t-il le relais en ce moment ? (Alors les positions viennent
+            // du relais et les sondes des passeurs ; sinon les positions viennent des
+            // passeurs.)
+            let via_relay = matches!(&guest, Some(NetGame::Guest(g)) if g.fast_slow);
+            // Hôte.
+            let mut now: Vec<Event> = Vec::new();
+            while late_h.front().is_some_and(|(at, _)| *at <= frame) {
+                now.push(late_h.pop_front().unwrap().1);
+            }
+            while let Some(e) = hc.poll() {
+                let fast = matches!(&e, Event::FromPeer { data, .. }
+                    if matches!(game::decode::<ToHost>(data), Some(ToHost::InputsFast { .. })));
+                if fast {
+                    by_fast += 1;
+                }
+                let lag = match &e {
+                    Event::FromPeer { .. } if fast => lag_fast,
+                    Event::FromPeer { .. } => lag_relay,
+                    _ => 0,
+                };
+                if lag > 0 {
+                    held += 1;
+                    late_h.push_back((frame + lag, e));
+                } else {
+                    now.push(e);
+                }
+            }
+            for e in now {
+                match e {
+                    Event::PeerJoined { peer, pseudo, .. } => {
+                        host.peer_joined(peer, pseudo);
+                        if guest.is_none() {
+                            guest = Some(NetGame::guest(gl.clone(), hash));
+                        }
+                    }
+                    Event::FromPeer { peer, data } => {
+                        host.receive(Some(peer), &data, &mut world);
+                    }
+                    Event::Fast(end) => {
+                        hfast = end.clone();
+                        host.set_fast(end);
+                    }
+                    _ => {}
+                }
+            }
+            // Invité.
+            if let Some(g) = &mut guest {
+                let mut now: Vec<Event> = Vec::new();
+                while late_g.front().is_some_and(|(at, _)| *at <= frame) {
+                    now.push(late_g.pop_front().unwrap().1);
+                }
+                while let Some(e) = gc.poll() {
+                    let fast = match &e {
+                        Event::FromHost(data) => match game::decode::<ToPeer>(data) {
+                            Some(ToPeer::Moves { .. }) => !via_relay,
+                            Some(ToPeer::FastPing { .. }) => true,
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    let lag = match &e {
+                        Event::FromHost(_) if fast => lag_fast,
+                        Event::FromHost(_) => lag_relay,
+                        _ => 0,
+                    };
+                    if lag > 0 {
+                        late_g.push_back((frame + lag, e));
+                    } else {
+                        now.push(e);
+                    }
+                }
+                for e in now {
+                    match e {
+                        Event::FromHost(data) => {
+                            for l in g.receive(None, &data, &mut world) {
+                                if let Local::Respawn { state, .. } = l {
+                                    guest_p.set_net_state(&state);
+                                }
+                            }
+                        }
+                        Event::Fast(end) => g.set_fast(end),
+                        _ => {}
+                    }
+                }
+            }
+            let live = guest
+                .as_ref()
+                .is_some_and(|g| g.phase() == game::phase::LIVE && !g.frozen());
+            // La manche est lancée et la voie ouverte des deux côtés : le retard commence.
+            if slow_from.is_none()
+                && live
+                && host.fast_open()
+                && guest.as_ref().is_some_and(|g| g.fast_open())
+            {
+                slow_from = Some(frame);
+            }
+            // L'invité court de la 80e à la 280e image du retard.
+            let walking = since.is_some_and(|n| (2 * LAG..2 * LAG + 200).contains(&n));
+            let m = MoveInput {
+                strafe: if walking { 1.0 } else { 0.0 },
+                sprint: true,
+                fps: true,
+                ..Default::default()
+            };
+            let idle = MoveInput {
+                fps: true,
+                ..Default::default()
+            };
+            if let Some(g) = &mut guest {
+                g.reconcile(&mut guest_p, &world, dt);
+            }
+            for _ in 0..4 {
+                host_p.update(&world, &idle, dt);
+                host.on_tick(&world, &host_p, &idle, dt);
+                if let Some(g) = &mut guest {
+                    guest_p.yaw = 0.0;
+                    guest_p.update(&world, &m, dt);
+                    g.on_tick(&world, &guest_p, &m, dt);
+                }
+            }
+            for l in host.end_frame(&world, Vec::new(), 255, NadeOut::default(), 4.0 * dt) {
+                if let Local::Respawn { state, .. } = l {
+                    host_p.set_net_state(&state);
+                }
+            }
+            if let Some(g) = &mut guest {
+                g.end_frame(&world, Vec::new(), 255, NadeOut::default(), 4.0 * dt);
+            }
+            let (NetGame::Host(hs), Some(NetGame::Guest(gs))) = (&host, &guest) else {
+                continue;
+            };
+            let Some((&peer, remote)) = hs.peers.iter().next() else {
+                continue;
+            };
+            // En pleine course, 150 images après le départ : où l'hôte voit-il l'invité ?
+            if since == Some(2 * LAG + 150) {
+                mid_gap = (remote.player.pos - guest_p.pos).length();
+            }
+            // Passeurs en retard depuis 390 images : qu'en ont conclu l'invité et l'hôte ?
+            if passeurs_lag && since == Some(390) {
+                asked_relay = gs.fast_slow;
+                host_knew = hfast.as_ref().is_some_and(|f| f.slow(peer));
+                behind = gs.clock - gs.seen_tick.unwrap_or(0) as f32;
+            }
+            // Fin : tout ce qui était retenu est arrivé (et les passeurs ont eu le temps de
+            // redevenir les plus rapides).
+            if since == Some(if passeurs_lag { 1200 } else { 2 * LAG + 200 + 3 * LAG }) {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(done, "la voie rapide ne s'est jamais ouverte");
+        let (NetGame::Host(hs), Some(NetGame::Guest(gs))) = (&host, &guest) else {
+            unreachable!()
+        };
+        let (&peer, remote) = hs.peers.iter().next().expect("invité chez l'hôte");
+        let (frames, stalled) = gs.stalls();
+        let run = FastRun {
+            mid_gap,
+            end_gap: (remote.player.pos - guest_p.pos).length(),
+            held,
+            by_fast,
+            stats: hfast.as_ref().and_then(|f| f.stats(peer)).expect("route"),
+            frames,
+            stalled,
+            asked_relay,
+            host_knew,
+            behind,
+            came_back: !gs.fast_slow && !hfast.as_ref().is_some_and(|f| f.slow(peer)),
+        };
+        drop(passeurs);
+        let _ = std::fs::remove_dir_all(dir);
+        run
+    }
+
+    /// Le relais cale (40 images de retard) : l'hôte suit quand même l'invité de près, parce
+    /// que ses entrées arrivent par les passeurs, et l'invité continue de se corriger sur
+    /// l'hôte. À la fin, quand tout ce qui était retenu est arrivé (en double, donc), l'hôte
+    /// a joué exactement les entrées de l'invité : ni trou, ni doublon.
+    #[test]
+    fn the_fast_way_keeps_up_when_the_relay_lags() {
+        let r = fast_match(false);
+        // L'invité court à plus de 4 blocs par seconde : par le relais seul, l'hôte l'aurait
+        // vu avec 40 images de retard, soit 3 blocs en arrière.
+        assert!(r.mid_gap < 1.0, "en pleine course, l'hôte suit l'invité à {} bloc", r.mid_gap);
+        assert!(r.held > 100, "le relais a bien été retenu ({} messages)", r.held);
+        assert!(r.by_fast > 100, "entrées venues par les passeurs : {}", r.by_fast);
+        // Ni trou ni doublon : la prédiction de l'invité est l'état de l'hôte.
+        assert!(r.end_gap < 0.05, "prédiction de l'invité = hôte (écart {})", r.end_gap);
+        // Les positions sont parties par les passeurs, chacun sa part.
+        assert_eq!(r.stats.heard, 3, "les deux passeurs répondent");
+        assert!(r.stats.sent > 500, "paquets partis par la voie rapide : {}", r.stats.sent);
+        assert!(
+            r.stalled * 10 < r.frames.max(1),
+            "images bloquées chez l'invité : {} sur {}",
+            r.stalled,
+            r.frames
+        );
+    }
+
+    /// Les passeurs sont mal placés (40 images de retard) : la voie rapide ne doit jamais
+    /// faire moins bien que le relais. L'invité s'en aperçoit et demande ses positions par
+    /// le relais, l'hôte suit, et rien n'a de retard ; les entrées, prises à la première
+    /// arrivée, viennent du relais. Puis les passeurs redeviennent les plus rapides : les
+    /// sondes le montrent, et tout le monde y revient.
+    #[test]
+    fn the_relay_takes_over_when_the_passeurs_are_slower() {
+        let r = fast_match(true);
+        assert!(r.asked_relay, "l'invité a demandé ses positions par le relais");
+        assert!(r.host_knew, "l'hôte a su que l'invité préférait le relais");
+        assert!(r.behind < 8.0, "nouvelles de l'hôte en retard de {} pas", r.behind);
+        assert!(r.mid_gap < 1.0, "en pleine course, l'hôte suit l'invité à {} bloc", r.mid_gap);
+        assert!(r.end_gap < 0.05, "prédiction de l'invité = hôte (écart {})", r.end_gap);
+        assert!(r.came_back, "les passeurs redevenus rapides, on y revient");
     }
 
     #[test]

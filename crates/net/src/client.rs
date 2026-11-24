@@ -143,6 +143,11 @@ pub enum Cmd {
     Report(String),
     Unreport(String),
     GarantAvailable(bool),
+    /// Hôte d'une partie FPS : demande des passeurs pour ses joueurs (groupés par équipe).
+    FastWant(Vec<Vec<u64>>),
+    /// Sert (ou non) de passeur aux parties des autres (`crate::fast`), sans s'annoncer
+    /// garant. (`GarantAvailable` le fait aussi : qui peut être garant peut être passeur.)
+    Passeur(bool),
     GarantReady,
     Conflict {
         player: u64,
@@ -602,6 +607,10 @@ pub enum Event {
         data: Vec<u8>,
     },
     FromHost(Vec<u8>),
+    /// Voie rapide de la partie FPS en cours (`crate::fast`) : le bout par lequel envoyer
+    /// (rien : voie fermée). Ce qui en arrive est remis comme le reste, par `FromHost` et
+    /// `FromPeer`.
+    Fast(Option<crate::fast::Endpoint>),
     /// Garant vérificateur : copie d'une demande d'un joueur à l'hôte.
     Witness {
         peer: u64,
@@ -764,6 +773,44 @@ struct Worker {
     relay_pub: [u8; 32],
     /// Connexion de garant (deuxième connexion du compte pendant qu'il joue).
     garant: bool,
+    /// Voie rapide de la partie FPS en cours : sens de ce qu'on envoie, et le bout.
+    fast: Option<(u8, crate::fast::Endpoint)>,
+    /// Ce jeu sert de passeur aux parties des autres (tant qu'il s'annonce garant) : le
+    /// passeur, les sondes du relais qu'il reçoit, et la réponse attendue de la box à qui
+    /// l'ouverture de son port a été demandée.
+    passeur: Option<Passeur>,
+}
+
+/// Passeur tenu par une connexion au relais. Il est gardé quand le jeu cesse de s'annoncer
+/// (même port, même redirection sur la box à la prochaine annonce) ; il ne porte alors rien.
+struct Passeur {
+    p: crate::fast::Passeur,
+    probes: Receiver<u64>,
+    /// Annoncé au relais en ce moment.
+    on: bool,
+    /// Réponse attendue de la box, puis l'adresse qu'elle a donnée.
+    mapped: Option<Receiver<Option<std::net::SocketAddrV4>>>,
+    external: Option<std::net::SocketAddrV4>,
+    /// Dernière sonde du relais reçue (ou dernière annonce) : sans sonde depuis
+    /// `PASSEUR_SILENCE`, le relais ne nous joint plus, on se réannonce.
+    heard: Instant,
+}
+
+/// Le relais sonde ses passeurs toutes les 30 s : après ce temps sans aucune sonde, il ne
+/// nous joint plus (adresse changée, port refermé par la box). On redemande le port à la box
+/// et on se réannonce.
+const PASSEUR_SILENCE: Duration = Duration::from_secs(75);
+
+/// Demande à la box d'ouvrir `port`, dans un fil à part (elle peut mettre plusieurs
+/// secondes à répondre).
+fn ask_box(port: u16) -> Receiver<Option<std::net::SocketAddrV4>> {
+    let (tx, rx) = channel();
+    let _ = std::thread::Builder::new()
+        .name("passeur (box)".into())
+        .spawn(move || {
+            let _ = tx.send(crate::fast::map_port(port));
+        });
+    rx
 }
 
 impl Worker {
@@ -778,6 +825,164 @@ impl Worker {
             pseudo: String::new(),
             relay_pub: [0; 32],
             garant: false,
+            fast: None,
+            passeur: None,
+        }
+    }
+
+    /// Voie rapide : routes données par le relais (aucune : voie fermée). Les messages
+    /// qui en arrivent sont remis au jeu comme ceux du relais.
+    fn set_fast(&mut self, dir: u8, ways: Vec<crate::fast::Way>) {
+        use crate::fast::{Endpoint, TO_HOST};
+        if ways.iter().all(|w| w.vias.is_empty()) {
+            self.close_fast();
+            return;
+        }
+        let end = match &self.fast {
+            Some((d, e)) if *d == dir => e.clone(),
+            _ => {
+                self.close_fast();
+                let out = self.out.clone();
+                let made = Endpoint::start(
+                    dir,
+                    Box::new(move |peer, data| {
+                        let _ = out.send(if dir == TO_HOST {
+                            Event::FromHost(data)
+                        } else {
+                            Event::FromPeer { peer, data }
+                        });
+                    }),
+                );
+                match made {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("voie rapide : {e}");
+                        return;
+                    }
+                }
+            }
+        };
+        log::info!("voie rapide : {} route(s)", ways.len());
+        end.set_ways(ways);
+        self.fast = Some((dir, end.clone()));
+        self.emit(Event::Fast(Some(end)));
+    }
+
+    fn close_fast(&mut self) {
+        if let Some((_, e)) = self.fast.take() {
+            e.close();
+            self.emit(Event::Fast(None));
+        }
+    }
+
+    /// Ce jeu s'annonce (ou non) comme passeur : son port UDP est dit au relais tout de
+    /// suite, puis l'adresse que la box lui donne si elle ouvre le port (demandé dans un
+    /// fil à part : elle peut mettre plusieurs secondes à répondre).
+    fn set_passeur(&mut self, on: bool) -> anyhow::Result<()> {
+        if !on {
+            if let Some(ps) = self.passeur.as_mut().filter(|ps| ps.on) {
+                ps.on = false;
+                ps.p.clear();
+                self.oneway(&Request::PasseurOff)?;
+            }
+            return Ok(());
+        }
+        if self.passeur.as_ref().is_some_and(|ps| ps.on) {
+            return Ok(());
+        }
+        if self.passeur.is_none() {
+            let (tx, probes) = channel();
+            let p = match crate::fast::Passeur::start_any(tx) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("passeur : {e}");
+                    return Ok(());
+                }
+            };
+            let mapped = ask_box(p.port());
+            self.passeur = Some(Passeur {
+                p,
+                probes,
+                on: false,
+                mapped: Some(mapped),
+                external: None,
+                heard: Instant::now(),
+            });
+        }
+        let Some(ps) = self.passeur.as_mut() else {
+            return Ok(());
+        };
+        ps.on = true;
+        ps.heard = Instant::now();
+        let (port, external) = (ps.p.port(), ps.external);
+        self.oneway(&Request::PasseurOffer {
+            port,
+            external: None,
+        })?;
+        // (Déjà ouvert par la box lors d'une annonce précédente.)
+        if let Some(a) = external {
+            self.oneway(&Request::PasseurOffer {
+                port,
+                external: Some((a.ip().octets(), a.port())),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Entretien du passeur : la box a répondu, une sonde du relais est arrivée.
+    fn tend_passeur(&mut self) {
+        let Some(ps) = self.passeur.as_mut() else {
+            return;
+        };
+        let mut offers = Vec::new();
+        if let Some(rx) = &ps.mapped {
+            match rx.try_recv() {
+                Ok(ext) => {
+                    ps.mapped = None;
+                    if let Some(a) = ext {
+                        log::info!("passeur : la box a ouvert le port {}", a.port());
+                        ps.external = Some(a);
+                        if ps.on {
+                            offers.push(Request::PasseurOffer {
+                                port: ps.p.port(),
+                                external: Some((a.ip().octets(), a.port())),
+                            });
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => ps.mapped = None,
+            }
+        }
+        while let Ok(nonce) = ps.probes.try_recv() {
+            ps.heard = Instant::now();
+            if ps.on {
+                offers.push(Request::PasseurEcho { nonce });
+            }
+        }
+        // Plus aucune sonde : le relais ne nous joint plus. On se réannonce, et on
+        // redemande à la box où elle en est.
+        if ps.on && ps.heard.elapsed() >= PASSEUR_SILENCE {
+            ps.heard = Instant::now();
+            let port = ps.p.port();
+            offers.push(Request::PasseurOffer {
+                port,
+                external: None,
+            });
+            if let Some(a) = ps.external {
+                offers.push(Request::PasseurOffer {
+                    port,
+                    external: Some((a.ip().octets(), a.port())),
+                });
+            }
+            if ps.mapped.is_none() {
+                ps.mapped = Some(ask_box(port));
+            }
+        }
+        if let Some(c) = self.chan.as_mut() {
+            for r in &offers {
+                let _ = c.send(r);
+            }
         }
     }
 
@@ -816,6 +1021,12 @@ impl Worker {
                 }
                 continue;
             }
+            // Sans connexion au relais : plus de voie rapide, plus de routes à porter.
+            if self.chan.is_none() {
+                self.close_fast();
+                self.passeur = None;
+            }
+            self.tend_passeur();
             // Messages poussés par le relais, envois déposés par le jeu.
             let Some(chan) = self.chan.as_mut() else {
                 continue;
@@ -878,6 +1089,38 @@ impl Worker {
             }
             return;
         }
+        if matches!(r, Response::RoomClosed | Response::Kicked { .. }) {
+            self.close_fast();
+        }
+        let r = match r {
+            Response::FastGuest {
+                route,
+                key,
+                passeurs,
+            } => {
+                let way = crate::proto::FastWay {
+                    peer: 0,
+                    route,
+                    key,
+                    passeurs,
+                };
+                self.set_fast(crate::fast::TO_HOST, vec![way.way()]);
+                return;
+            }
+            Response::FastHost { ways } => {
+                let ways = ways.iter().map(|w| w.way()).collect();
+                self.set_fast(crate::fast::TO_GUEST, ways);
+                return;
+            }
+            Response::PasseurTask { lot, routes } => {
+                if let Some(ps) = self.passeur.as_ref().filter(|ps| ps.on) {
+                    ps.p.set_lot(lot, &routes);
+                    log::info!("passeur : {} route(s) portée(s)", ps.p.routes());
+                }
+                return;
+            }
+            r => r,
+        };
         let e = match r {
             Response::PeerJoined {
                 peer,
@@ -1204,6 +1447,13 @@ impl Worker {
     }
 
     fn handle(&mut self, cmd: Cmd) -> Result<()> {
+        // On change de partie : la voie rapide de la précédente se ferme.
+        if matches!(
+            cmd,
+            Cmd::Host { .. } | Cmd::Join(_) | Cmd::Search { .. } | Cmd::Leave
+        ) {
+            self.close_fast();
+        }
         match cmd {
             Cmd::Register { pseudo, password } => {
                 if !proto::valid_pseudo(&pseudo) {
@@ -1642,8 +1892,14 @@ impl Worker {
             },
             Cmd::GarantAvailable(on) => {
                 self.oneway(&Request::GarantAvailable { on })?;
+                // Qui peut être garant peut être passeur (`crate::fast`).
+                self.set_passeur(on)
+            }
+            Cmd::FastWant(groups) => {
+                self.oneway(&Request::FastWant { groups })?;
                 Ok(())
             }
+            Cmd::Passeur(on) => self.set_passeur(on),
             Cmd::GarantReady => {
                 self.oneway(&Request::GarantReady)?;
                 Ok(())

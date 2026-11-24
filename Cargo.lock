@@ -2853,6 +2853,7 @@ dependencies = [
  "iroh",
  "log",
  "mainline",
+ "portmapper",
  "postcard",
  "serde",
  "sha2 0.10.9",

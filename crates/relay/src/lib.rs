@@ -14,6 +14,7 @@ mod hardware;
 mod invites;
 mod limits;
 mod maps;
+mod passeurs;
 mod provinces;
 mod registry;
 mod servers;
@@ -1388,6 +1389,8 @@ struct State {
     sov_committed: Arc<std::sync::atomic::AtomicUsize>,
     conns: HashMap<u64, Conn>,
     rooms: HashMap<u64, Room>,
+    /// Passeurs de la voie rapide des parties FPS, et parties qu'ils portent.
+    fast: passeurs::Fast,
     /// Lobbies : n° → connexions (la première est l'hôte du lobby).
     parties: HashMap<u64, Vec<u64>>,
     /// (v242) Invitations dans un monde de construction, gardées (fichier) sans limite de
@@ -1543,6 +1546,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         sov_committed: sov_committed.clone(),
         conns: HashMap::new(),
         rooms: HashMap::new(),
+        fast: passeurs::Fast::default(),
         parties: HashMap::new(),
         invites: invites::Store::open(cfg_dir.join("invitations.bin")),
         next_id: 1,
@@ -1617,7 +1621,10 @@ pub fn start(cfg: Config) -> Result<Handle> {
                         if killed_guards.load(std::sync::atomic::Ordering::Relaxed) {
                             return;
                         }
-                        guards::upkeep(&mut state_for_guards.lock().unwrap());
+                        let mut st = state_for_guards.lock().unwrap();
+                        guards::upkeep(&mut st);
+                        // (Passeurs de la voie rapide : sondes à refaire, passeurs muets.)
+                        passeurs::upkeep(&mut st);
                     }
                 });
                 let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
@@ -2153,6 +2160,7 @@ fn leave_room(st: &mut State, id: u64) {
     }
     if room.host == id {
         let mut room = st.rooms.remove(&room_id).expect("partie");
+        passeurs::room_gone(st, room_id);
         settle_absences(st, &mut room, &[]);
         for m in room.members {
             if let Some(c) = st.conns.get_mut(&m) {
@@ -2482,10 +2490,21 @@ fn garant_ok(st: &State, g: u64, players: &[String]) -> bool {
     if link_bad(c) {
         return false;
     }
+    trusted(st, p) && unrelated(st, p, players)
+}
+
+/// Assez de parties jouées et peu de signalements : on peut lui confier un rôle (garant,
+/// passeur de la voie rapide).
+fn trusted(st: &State, p: &str) -> bool {
     let me = st.stats.get(p).cloned().unwrap_or_default();
-    if me.games < 3 || me.ratio() > 0.25 {
-        return false;
-    }
+    !(me.games < 3 || me.ratio() > 0.25)
+}
+
+/// Aucun lien entre `p` et ces joueurs (amis, signalements, fréquentation), ni entre eux
+/// et les autres comptes de sa machine : ce qu'il faut pour servir leur partie (garant) ou
+/// porter leurs paquets (passeur) sans y avoir d'intérêt.
+fn unrelated(st: &State, p: &str, players: &[String]) -> bool {
+    let me = st.stats.get(p).cloned().unwrap_or_default();
     // Les autres comptes de sa machine comptent comme lui : un compte secondaire ne sert
     // pas à garantir la partie du compte principal, ni celle de ses fréquentations.
     let mine = if machines_apart(st) {
@@ -8668,6 +8687,27 @@ fn handle(
         Request::WitnessLogin { .. } | Request::WitnessProve { .. }
     ) {
         return Some(guards::witness_login(st, session, req));
+    }
+    // Voie rapide des parties FPS : passeurs et routes (`passeurs`).
+    if matches!(
+        req,
+        Request::PasseurOffer { .. }
+            | Request::PasseurEcho { .. }
+            | Request::PasseurOff
+            | Request::FastWant { .. }
+    ) {
+        if matches!(&*session, Session::LoggedIn { .. }) {
+            match req {
+                Request::PasseurOffer { port, external } => {
+                    passeurs::offer(st, id, peer, port, external)
+                }
+                Request::PasseurEcho { nonce } => passeurs::echo(st, id, nonce),
+                Request::PasseurOff => passeurs::off(st, id),
+                Request::FastWant { groups } => passeurs::want(st, id, groups),
+                _ => {}
+            }
+        }
+        return None;
     }
     if room_request {
         let Session::LoggedIn { pseudo } = &*session else {

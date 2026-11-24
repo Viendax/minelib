@@ -343,6 +343,8 @@ pub(crate) async fn serve(stream: TcpStream, state: Arc<Mutex<State>>, peer: Str
     party_leave(&mut st, id);
     leave_room(&mut st, id);
     st.maps.forget(id);
+    // (Passeur de la voie rapide : les parties qu'il portait en reçoivent un autre.)
+    crate::passeurs::gone(&mut st, id);
     st.conns.remove(&id);
     result
 }

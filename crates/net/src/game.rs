@@ -495,6 +495,14 @@ pub enum ToHost {
     Ping(u16),
     /// (v177) Revente d'un achat de cette manche (code d'article comme `Buy`).
     Sell(u16),
+    /// Les derniers pas d'entrées, envoyés aussi par la voie rapide (`crate::fast`) : ils
+    /// sont déjà partis par le relais dans `Inputs`. L'hôte n'en prend que le pas qui suit
+    /// exactement le dernier qu'il a : jamais de trou, ce qui manque arrive par le relais.
+    InputsFast {
+        first_seq: u32,
+        inputs: Vec<NetInput>,
+        weapon: u8,
+    },
 }
 
 /// Messages d'un monde de construction en ligne (passent par les zones du relais).
@@ -961,6 +969,12 @@ pub enum ToPeer {
     Doors {
         cells: Vec<([i32; 3], u16)>,
         at: Option<[f32; 3]>,
+    },
+    /// Voie rapide (`crate::fast`) : sonde envoyée par les passeurs à un joueur qui reçoit
+    /// plus vite par le relais, au pas `tick`. S'il l'a avant l'état de ce pas, les
+    /// passeurs sont redevenus les plus rapides.
+    FastPing {
+        tick: u32,
     },
 }
 

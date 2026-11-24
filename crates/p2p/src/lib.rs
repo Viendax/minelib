@@ -16,6 +16,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+pub mod portmap;
+
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

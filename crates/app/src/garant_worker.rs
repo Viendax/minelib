@@ -1229,6 +1229,7 @@ fn run(
                 | Event::FromPeer { .. }
                 | Event::Witness { .. }
                 | Event::FromHost(_)
+                | Event::Fast(_)
                 | Event::Promoted { .. }
                 | Event::HostChanged(_)
                 | Event::BackupIs(_) => {
