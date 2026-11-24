@@ -59,7 +59,8 @@ use serde::{Deserialize, Serialize};
 /// plient (cuisse en avant, bas de jambe en arrière) ; ses boîtes des coups en partie FPS, les
 /// pavés du modèle (onze : chaque jambe et chaque bras en deux), doivent être les mêmes chez
 /// l'hôte, ses invités et le vérificateur.
-pub const PROTOCOL: u32 = 74;
+/// (v301) 75 : tunnels iroh par les passeurs (`Request::TunnelWant`, `Response::TunnelWay`).
+pub const PROTOCOL: u32 = 75;
 
 /// Région souveraine : l'hôte principal envoie ses lots au relais du monde, et l'autre
 /// hôte sa confirmation, au plus une fois par ce temps (ms) chacun, regroupés.
@@ -916,6 +917,15 @@ pub enum Request {
         chunk: [i32; 2],
         data: Vec<u8>,
     },
+    /// (v301) Ce jeu ouvre, ou garde ouvert, un tunnel iroh vers le relais du nœud `node`
+    /// (région, province, relais de secours, hébergés par d'autres joueurs) : le relais du
+    /// monde lui donne une route par des passeurs (`Response::TunnelWay`, à lui et à
+    /// l'hôte du nœud), s'il en a. Refaite toutes les 30 s tant que le tunnel sert : une
+    /// route qu'on ne redemande plus est reprise. Sans réponse : le tunnel passe, comme
+    /// avant, par les serveurs relais d'iroh.
+    TunnelWant {
+        node: [u8; 32],
+    },
 }
 
 /// (v244) `Request::Zeus` : où en est l'éclair du serveur (rien ne change ; le créateur du
@@ -1024,6 +1034,7 @@ impl Request {
                 | Request::FastWant { .. }
                 | Request::FastBad { .. }
                 | Request::NearbyClose { .. }
+                | Request::TunnelWant { .. }
                 | Request::BulkEdit { .. }
                 | Request::Served { .. }
                 | Request::CheatFound { .. }
@@ -1809,6 +1820,18 @@ pub enum Response {
     /// Voie rapide, à l'hôte : les routes de ses joueurs (elles remplacent les précédentes).
     FastHost {
         ways: Vec<FastWay>,
+    },
+    /// (v301) Route d'un tunnel iroh par des passeurs, entre un joueur et le relais du
+    /// nœud `node` : au joueur qui l'a demandée (`host` faux) et à l'hôte du nœud (`host`
+    /// vrai). Le numéro de route reste le même tant que le tunnel vit ; redonnée avec
+    /// d'autres passeurs quand l'un s'en va ; aucun passeur : route reprise. `own` (à
+    /// l'hôte seulement) : le passeur est celui de son propre jeu.
+    TunnelWay {
+        node: [u8; 32],
+        route: u64,
+        host: bool,
+        own: bool,
+        passeurs: Vec<FastHop>,
     },
 }
 

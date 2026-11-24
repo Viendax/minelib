@@ -7,7 +7,12 @@ description = "Minelib : relais joignable sans port ouvert (iroh) et rendez-vous
 
 [dependencies]
 anyhow = "1"
-iroh = "1.4.1"
+# (v301) Transports sur mesure : les paquets d'iroh passent aussi par les passeurs.
+iroh = { version = "1.4.1", features = ["unstable-custom-transports"] }
+iroh-base = "1"
+minelib-net = { path = "../net" }
+n0-watcher = "1"
+noq-udp = "1.4"
 mainline = "8"
 # Ouverture d'un port sur la box (passeurs de la voie rapide) : déjà là avec iroh.
 portmapper = "0.19"

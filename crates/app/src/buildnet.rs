@@ -91,7 +91,7 @@ const SPOT_EVERY: f32 = 10.0;
 /// anonyme, ou box qui ne laisse pas passer le direct). Rien ne change là non plus : ces
 /// serveurs limitent le débit, et c'est ce qui casserait en premier. (v285 : un hôte
 /// joint en direct, `hote_direct=true` chez lui, reçoit les positions comme le relais du
-/// monde.)
+/// monde. v301 : un hôte joint par un passeur aussi, voir `minelib_p2p::passeur`.)
 ///
 /// (v285) Dans une foule (plus de `POS_CLOSE` voisins), des positions rapprochées partent
 /// entre deux de celles-ci (`Request::NearbyClose`, 256 par seconde en tout) : le relais

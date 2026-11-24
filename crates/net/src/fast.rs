@@ -100,8 +100,13 @@ const KEEP: Duration = Duration::from_millis(100);
 /// Paquets par seconde qu'un passeur accepte pour une route (256 positions et quelques
 /// centaines d'entrées par seconde au plus : au-delà, c'est un abus).
 const RATE_MAX: u32 = 4000;
+/// (v301) Octets par seconde, au plus, pour une route (les deux sens ensemble). Les
+/// routes portent maintenant aussi les tunnels iroh, aux paquets bien plus gros : sans
+/// cette limite, une seule route pourrait prendre tout le débit d'un passeur volontaire.
+/// Ce qui dépasse est perdu, le tunnel ralentit de lui-même.
+const BYTES_MAX: u32 = 1_000_000;
 /// Routes qu'un passeur garde au plus.
-pub const ROUTES_MAX: usize = 64;
+pub const ROUTES_MAX: usize = 256;
 
 fn head(route: u64, dir: u8, seq: u64) -> [u8; HEAD] {
     let mut h = [0u8; HEAD];
@@ -121,6 +126,178 @@ fn hop_seal(key: &[u8; 32], head: &[u8]) -> [u8; SEAL] {
     let mut out = [0u8; SEAL];
     out.copy_from_slice(&full[..SEAL]);
     out
+}
+
+/// (v301) Paquets « bruts » : même en-tête et même sceau de passeur, mais la charge n'est
+/// pas scellée ici. Ils portent les paquets QUIC d'iroh (qui se chiffre et s'authentifie
+/// de bout en bout lui-même) : voir `minelib_p2p::passeur`. Le passeur les transmet comme
+/// les autres, sans rien y lire. Charge : genre (`RAW_KEEP` : rien, pour que le passeur
+/// connaisse notre adresse ; `RAW_DATA` : un paquet), longueur sur 2 octets, contenu.
+pub const RAW_KEEP: u8 = 0;
+pub const RAW_DATA: u8 = 1;
+/// Plus gros contenu d'un paquet brut. Un paquet QUIC fait 1 200 octets au départ, puis
+/// QUIC en essaie de plus gros : ils sont jetés ici, il en reste à 1 200. Avec l'en-tête,
+/// le paquet tient ainsi dans 1 232 octets, ce que toute liaison laisse passer sans le
+/// couper en deux.
+pub const RAW_MAX: usize = 1203;
+
+pub fn raw_pack(route: u64, dir: u8, seq: u64, seal: &[u8; 32], kind: u8, body: &[u8]) -> Vec<u8> {
+    let h = head(route, dir, seq);
+    let mut p = Vec::with_capacity(HEAD + SEAL + 3 + body.len().max(TAG));
+    p.extend_from_slice(&h);
+    p.extend_from_slice(&hop_seal(seal, &h));
+    p.push(kind);
+    p.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    p.extend_from_slice(body);
+    // (Le passeur ne transmet rien de plus court qu'un paquet scellé vide.)
+    while p.len() < HEAD + SEAL + TAG + 1 {
+        p.push(0);
+    }
+    p
+}
+
+/// Paquet brut reçu : route, sens, genre et contenu ; `seal` donne la clé du sceau de la
+/// route (rien si on ne la connaît pas). Rien si le paquet est mal fait ou mal scellé.
+pub fn raw_open(
+    p: &[u8],
+    seal: impl Fn(u64) -> Option<[u8; 32]>,
+) -> Option<(u64, u8, u8, &[u8])> {
+    let x = parse(p)?;
+    if !same(&hop_seal(&seal(x.route)?, x.head), x.seal) {
+        return None;
+    }
+    let (kind, rest) = x.sealed.split_first()?;
+    let len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+    Some((x.route, x.dir, *kind, rest.get(2..2 + len)?))
+}
+
+// ───────────────────────── Tunnels par les passeurs (v301) ─────────────────────────
+//
+// Le jeu joint les relais hébergés par d'autres joueurs (région, province, secours) par un
+// tunnel iroh. Ce qui suit relie trois morceaux qui ne se connaissent pas : le nœud iroh
+// du jeu (`minelib_p2p`), qui dit vers quels nœuds il ouvre un tunnel ; les connexions au
+// relais du monde (`crate::client`), qui le lui demandent (`Request::TunnelWant`) et
+// reçoivent les routes (`Response::TunnelWay`) ; et le passeur de ce jeu, s'il en a un.
+
+/// Route d'un tunnel, donnée par le relais du monde : vers le nœud `node` (`host` faux),
+/// ou vers un joueur qui joint notre nœud `node` (`host` vrai). Aucun passeur : fermée.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TunnelRoute {
+    pub node: [u8; 32],
+    pub route: u64,
+    pub host: bool,
+    pub vias: Vec<Via>,
+}
+
+/// Demandes gardées (les connexions au relais les envoient chacune à leur tour).
+const WANTS_KEPT: usize = 64;
+
+struct Tunnels {
+    /// Demandes récentes : numéro (croissant), nœud.
+    wants: Vec<(u64, [u8; 32])>,
+    next: u64,
+    /// Routes vers des nœuds distants (une par nœud, la dernière donnée).
+    routes: Vec<TunnelRoute>,
+    hook: Option<fn(&TunnelRoute)>,
+    /// Passeurs de ce jeu : port local, et l'adresse que la box leur a donnée.
+    own: Vec<(u16, Option<SocketAddrV4>)>,
+}
+
+static TUNNELS: Mutex<Tunnels> = Mutex::new(Tunnels {
+    wants: Vec::new(),
+    next: 1,
+    routes: Vec::new(),
+    hook: None,
+    own: Vec::new(),
+});
+
+/// Ce jeu ouvre (ou garde ouvert) un tunnel vers le nœud `node` : ses connexions au relais
+/// demandent une route par des passeurs. À refaire toutes les `TUNNEL_RENEW` tant que le
+/// tunnel sert : le relais reprend les routes qu'on ne redemande plus.
+pub fn tunnel_want(node: [u8; 32]) {
+    let mut t = TUNNELS.lock().unwrap();
+    let n = t.next;
+    t.next += 1;
+    t.wants.push((n, node));
+    let extra = t.wants.len().saturating_sub(WANTS_KEPT);
+    t.wants.drain(..extra);
+}
+
+/// Rythme auquel redemander la route d'un tunnel qui sert.
+pub const TUNNEL_RENEW: Duration = Duration::from_secs(30);
+
+/// Demandes faites après la numéro `after` (sans doublon), et le numéro de la dernière.
+pub fn tunnel_wants(after: u64) -> (Vec<[u8; 32]>, u64) {
+    let t = TUNNELS.lock().unwrap();
+    let mut nodes: Vec<[u8; 32]> = Vec::new();
+    for (n, node) in &t.wants {
+        if *n > after && !nodes.contains(node) {
+            nodes.push(*node);
+        }
+    }
+    (nodes, t.next - 1)
+}
+
+/// Le relais a donné (ou repris) une route. `own` : ses passeurs sont celui de ce jeu
+/// même (on lui écrit sans sortir de la machine).
+pub fn tunnel_given(mut r: TunnelRoute, own: bool) {
+    let hook = {
+        let mut t = TUNNELS.lock().unwrap();
+        if own {
+            // Notre propre passeur : on lui écrit sans sortir de la machine (passer par
+            // la box pour se joindre soi-même ne marche pas partout). Si c'est celui d'un
+            // autre jeu de cette machine, on ne le connaît pas : le tunnel garde les
+            // serveurs d'iroh.
+            let mine = &t.own;
+            r.vias = r
+                .vias
+                .iter()
+                .filter_map(|v| {
+                    let (local, _) = mine.iter().find(|(local, ext)| {
+                        v.addr.port() == *local || ext.map(SocketAddr::V4) == Some(v.addr)
+                    })?;
+                    Some(Via {
+                        addr: SocketAddr::from(([127, 0, 0, 1], *local)),
+                        seal: v.seal,
+                    })
+                })
+                .collect();
+        }
+        if !r.host {
+            if r.vias.is_empty() {
+                t.routes.retain(|x| x.route != r.route);
+            } else {
+                t.routes.retain(|x| x.node != r.node);
+                t.routes.push(r.clone());
+            }
+        }
+        t.hook
+    };
+    if let Some(f) = hook {
+        f(&r);
+    }
+}
+
+/// Route connue vers le nœud `node`.
+pub fn tunnel_route(node: [u8; 32]) -> Option<TunnelRoute> {
+    let t = TUNNELS.lock().unwrap();
+    t.routes.iter().find(|r| r.node == node).cloned()
+}
+
+
+/// Un passeur de ce jeu écoute sur le port `local` ; `external` : l'adresse que la box
+/// lui a donnée, si elle a ouvert le port.
+pub fn set_own_passeur(local: u16, external: Option<SocketAddrV4>) {
+    let mut t = TUNNELS.lock().unwrap();
+    t.own.retain(|(l, _)| *l != local);
+    t.own.push((local, external));
+    let extra = t.own.len().saturating_sub(64);
+    t.own.drain(..extra);
+}
+
+/// À appeler à chaque route donnée ou reprise (le nœud iroh du jeu s'y branche).
+pub fn set_tunnel_hook(f: fn(&TunnelRoute)) {
+    TUNNELS.lock().unwrap().hook = Some(f);
 }
 
 fn same(a: &[u8], b: &[u8]) -> bool {
@@ -300,8 +477,10 @@ struct Hop {
     /// Plus grand numéro vu dans chaque sens, plus un : seul un paquet plus récent déplace
     /// une adresse (un vieux paquet copié en chemin ne détourne rien).
     top: [u64; 2],
+    /// Paquets et octets portés depuis `since` (une seconde au plus).
     since: Instant,
     count: u32,
+    bytes: u32,
 }
 
 struct PasseurInner {
@@ -393,6 +572,7 @@ impl Passeur {
                     top: [0; 2],
                     since: Instant::now(),
                     count: 0,
+                    bytes: 0,
                 },
             );
         }
@@ -458,9 +638,11 @@ impl PasseurInner {
             if h.since.elapsed() >= Duration::from_secs(1) {
                 h.since = Instant::now();
                 h.count = 0;
+                h.bytes = 0;
             }
             h.count += 1;
-            if h.count > RATE_MAX {
+            h.bytes += p.len() as u32;
+            if h.count > RATE_MAX || h.bytes > BYTES_MAX {
                 return;
             }
             let d = x.dir as usize;
@@ -1343,10 +1525,90 @@ mod tests {
         }
     }
 
+    /// (v301) Un paquet brut garde son contenu, porte le sceau que vérifie le passeur, et
+    /// n'est lu qu'avec la clé de sa route ; il n'est jamais plus court que ce qu'un
+    /// passeur accepte de transmettre.
+    #[test]
+    fn a_raw_packet_keeps_its_content_and_its_seal() {
+        let seal = key(7);
+        for body in [&b""[..], b"x", &[9u8; RAW_MAX]] {
+            let p = raw_pack(42, TO_HOST, 5, &seal, RAW_DATA, body);
+            assert!(p.len() > HEAD + SEAL + TAG);
+            let x = parse(&p).unwrap();
+            assert!(same(&hop_seal(&seal, x.head), x.seal));
+            let got = raw_open(&p, |r| (r == 42).then_some(seal)).unwrap();
+            assert_eq!(got, (42, TO_HOST, RAW_DATA, body));
+            assert!(raw_open(&p, |_| Some(key(8))).is_none());
+            assert!(raw_open(&p, |_| None).is_none());
+        }
+    }
+
+    /// (v301) Les routes de tunnel données par le relais : celle vers un nœud distant est
+    /// gardée (la dernière), une route reprise est oubliée, et quand le passeur est celui
+    /// de ce jeu, on lui écrit sur cette machine, à son port local.
+    #[test]
+    fn tunnel_routes_given_by_the_relay_are_kept_and_taken_back() {
+        let node = [0xA9; 32];
+        let via = |ip: [u8; 4], port: u16| Via {
+            addr: SocketAddr::from((ip, port)),
+            seal: key(3),
+        };
+        let route = |route: u64, host: bool, vias: Vec<Via>| TunnelRoute {
+            node,
+            route,
+            host,
+            vias,
+        };
+        assert!(tunnel_route(node).is_none());
+        tunnel_given(route(1, false, vec![via([82, 1, 2, 3], 4000)]), false);
+        tunnel_given(route(2, false, vec![via([82, 1, 2, 4], 4001)]), false);
+        assert_eq!(tunnel_route(node).unwrap().route, 2);
+        // Une autre route reprise ne retire pas celle qui sert.
+        tunnel_given(route(1, false, Vec::new()), false);
+        assert_eq!(tunnel_route(node).unwrap().route, 2);
+        tunnel_given(route(2, false, Vec::new()), false);
+        assert!(tunnel_route(node).is_none());
+        // Notre propre passeur : reconnu à son port local, ou à l'adresse de la box.
+        set_own_passeur(47_001, None);
+        set_own_passeur(47_002, Some(SocketAddrV4::new([82, 9, 9, 9].into(), 51_000)));
+        static SEEN: Mutex<Vec<TunnelRoute>> = Mutex::new(Vec::new());
+        fn hook(r: &TunnelRoute) {
+            if r.node == [0xA9; 32] {
+                SEEN.lock().unwrap().push(r.clone());
+            }
+        }
+        let before = TUNNELS.lock().unwrap().hook;
+        set_tunnel_hook(hook);
+        let mine = vec![
+            via([82, 9, 9, 8], 47_001),
+            via([82, 9, 9, 9], 51_000),
+            via([82, 7, 7, 7], 12_345),
+        ];
+        tunnel_given(route(3, true, mine), true);
+        TUNNELS.lock().unwrap().hook = before;
+        let got = SEEN.lock().unwrap().pop().unwrap();
+        let addrs: Vec<SocketAddr> = got.vias.iter().map(|v| v.addr).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                SocketAddr::from(([127, 0, 0, 1], 47_001)),
+                SocketAddr::from(([127, 0, 0, 1], 47_002)),
+            ]
+        );
+        // Les demandes : chaque connexion ne voit que celles faites après elle.
+        let (_, start) = tunnel_wants(u64::MAX);
+        tunnel_want(node);
+        tunnel_want(node);
+        let (nodes, last) = tunnel_wants(start);
+        assert!(nodes.contains(&node) && last >= start + 2);
+        assert!(!tunnel_wants(last).0.contains(&node));
+    }
+
     #[test]
     fn a_passeur_keeps_a_bounded_number_of_routes_per_lot() {
         let (p, _probes) = passeur();
-        let many: Vec<(u64, [u8; 32])> = (0..200).map(|i| (i, key(1))).collect();
+        let many: Vec<(u64, [u8; 32])> =
+            (0..ROUTES_MAX as u64 + 50).map(|i| (i, key(1))).collect();
         p.set_lot(1, &many);
         assert_eq!(p.routes(), ROUTES_MAX);
         p.set_lot(1, &many[..3]);

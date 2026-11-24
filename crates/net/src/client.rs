@@ -779,6 +779,8 @@ struct Worker {
     /// passeur, les sondes du relais qu'il reçoit, et la réponse attendue de la box à qui
     /// l'ouverture de son port a été demandée.
     passeur: Option<Passeur>,
+    /// (v301) Dernière demande de tunnel (`crate::fast::tunnel_want`) déjà envoyée.
+    tunnel_seen: u64,
 }
 
 /// Passeur tenu par une connexion au relais. Il est gardé quand le jeu cesse de s'annoncer
@@ -827,6 +829,8 @@ impl Worker {
             garant: false,
             fast: None,
             passeur: None,
+            // (Les demandes d'avant cette connexion ne la regardent pas.)
+            tunnel_seen: crate::fast::tunnel_wants(u64::MAX).1,
         }
     }
 
@@ -899,6 +903,7 @@ impl Worker {
                     return Ok(());
                 }
             };
+            crate::fast::set_own_passeur(p.port(), None);
             let mapped = ask_box(p.port());
             self.passeur = Some(Passeur {
                 p,
@@ -929,6 +934,21 @@ impl Worker {
         Ok(())
     }
 
+    /// (v301) Tunnels iroh : les routes que le nœud du jeu demande partent à ce relais
+    /// (seul celui du monde y répond, s'il a des passeurs).
+    fn tend_tunnels(&mut self) {
+        let (nodes, last) = crate::fast::tunnel_wants(self.tunnel_seen);
+        self.tunnel_seen = last;
+        if self.pseudo.is_empty() {
+            return;
+        }
+        for node in nodes {
+            if self.oneway(&Request::TunnelWant { node }).is_err() {
+                return;
+            }
+        }
+    }
+
     /// Entretien du passeur : la box a répondu, une sonde du relais est arrivée.
     fn tend_passeur(&mut self) {
         let Some(ps) = self.passeur.as_mut() else {
@@ -942,6 +962,7 @@ impl Worker {
                     if let Some(a) = ext {
                         log::info!("passeur : la box a ouvert le port {}", a.port());
                         ps.external = Some(a);
+                        crate::fast::set_own_passeur(ps.p.port(), Some(a));
                         if ps.on {
                             offers.push(Request::PasseurOffer {
                                 port: ps.p.port(),
@@ -1028,6 +1049,7 @@ impl Worker {
                 self.passeur = None;
             }
             self.tend_passeur();
+            self.tend_tunnels();
             // Messages poussés par le relais, envois déposés par le jeu.
             let Some(chan) = self.chan.as_mut() else {
                 continue;
@@ -1111,6 +1133,31 @@ impl Worker {
             Response::FastHost { ways } => {
                 let ways = ways.iter().map(|w| w.way()).collect();
                 self.set_fast(crate::fast::TO_GUEST, ways);
+                return;
+            }
+            Response::TunnelWay {
+                node,
+                route,
+                host,
+                own,
+                passeurs,
+            } => {
+                let vias = passeurs
+                    .iter()
+                    .map(|h| crate::fast::Via {
+                        addr: std::net::SocketAddr::from((h.addr, h.port)),
+                        seal: h.seal,
+                    })
+                    .collect();
+                crate::fast::tunnel_given(
+                    crate::fast::TunnelRoute {
+                        node,
+                        route,
+                        host,
+                        vias,
+                    },
+                    own,
+                );
                 return;
             }
             Response::PasseurTask { lot, routes } => {

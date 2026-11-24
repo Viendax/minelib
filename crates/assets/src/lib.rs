@@ -141,11 +141,11 @@ pub struct Options {
     /// Au menu, ce jeu peut servir de garant indépendant pour les parties des autres.
     pub garant: bool,
     /// Quand ce jeu héberge le relais d'une région, d'une province ou un relais de secours,
-    /// les joueurs servis le joignent-ils en direct (ils voient son adresse IP) au lieu de
-    /// passer par les serveurs relais publics d'iroh, au débit limité ? (v280)
-    /// `hote_direct=true` ou `false` dans `options.txt` ; (v297) sans la ligne (`auto`) :
-    /// oui seulement quand ce PC sert déjà de passeur (sa box laisse entrer l'UDP, son
-    /// adresse est déjà donnée aux joueurs des parties qu'il porte).
+    /// les joueurs servis le joignent-ils en direct (ils voient son adresse IP) ? (v280)
+    /// `hote_direct=true` dans `options.txt`. (v301) Sans la ligne, `auto` ou `false` :
+    /// non, l'hôte reste anonyme, joint par des passeurs (`minelib_p2p::passeur`) et, s'il
+    /// n'y en a pas, par les serveurs relais publics d'iroh. (La v297 le mettait en direct
+    /// d'elle-même quand sa box était ouverte.)
     pub host_direct: Option<bool>,
     /// (v298) Invitation reçue d'un ami : la ligne de son fichier `invitation.txt` (nœud et
     /// clé de son relais). Ce relais est joint directement, sans la liste du DHT.

@@ -16,6 +16,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+pub mod passeur;
 pub mod portmap;
 
 use anyhow::{anyhow, Result};
@@ -218,9 +219,8 @@ fn remote_key(conn: &iroh::endpoint::Connection, first: Option<std::net::IpAddr>
 
 /// Les relais de région, de province et de secours hébergés par ce jeu sont-ils joignables
 /// en direct ? (v280 : `hote_direct=true` dans `options.txt`.) (v297) Trois réglages :
-/// 1 toujours, 2 jamais, 0 automatique (sans la ligne) : en direct seulement quand ce PC
-/// est un passeur vérifié, c'est-à-dire que sa box laisse entrer l'UDP et que son adresse
-/// est déjà donnée aux joueurs des parties FPS qu'il porte (voir `host_direct`).
+/// 1 toujours, 2 jamais, 0 automatique (sans la ligne). (v301) En automatique, plus jamais
+/// de lui-même : voir `host_direct`.
 static HOSTS_DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn set_hosts_direct(choice: Option<bool>) {
@@ -235,18 +235,15 @@ pub fn set_hosts_direct(choice: Option<bool>) {
 /// (v297) Un relais hébergé par ce jeu doit-il être joignable en direct ? `open_box` : ce
 /// PC est un passeur vérifié en ce moment.
 ///
-/// Anonyme, un hôte n'est joint que par les serveurs relais publics d'iroh : débit limité
-/// sur sa seule connexion, par laquelle passent tous les joueurs qu'il sert. C'est ce qui
-/// sature en premier quand une région se remplit, et ce qui y interdit les positions
-/// rapprochées (256 par seconde aux voisins les plus proches). En direct, les joueurs
-/// servis voient son adresse IP : on ne le fait de soi-même que pour un PC dont l'adresse
-/// est déjà montrée à des joueurs sans lien avec lui (passeur).
-pub fn host_direct(open_box: bool) -> bool {
-    match HOSTS_DIRECT.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => open_box,
-    }
+/// En direct, les joueurs servis voient l'adresse IP de l'hôte, et savent que c'est lui
+/// qui héberge. (v301) Ce n'est plus fait que sur demande (`hote_direct=true`) : un hôte
+/// anonyme est maintenant joint par des passeurs (`passeur`), sans le débit limité des
+/// serveurs relais d'iroh, et celui dont la box est ouverte porte lui-même ses tunnels
+/// quand il n'y a pas d'autre passeur : aussi vite qu'en direct, et les joueurs n'y
+/// voient qu'une adresse de passeur comme une autre. La v297 le mettait en direct de
+/// lui-même dans ce cas.
+pub fn host_direct(_open_box: bool) -> bool {
+    HOSTS_DIRECT.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 
 /// (v285) Connexions iroh ouvertes par les tunnels de ce jeu, par nœud distant.
@@ -267,10 +264,13 @@ pub fn node_direct(remote: [u8; 32]) -> Option<bool> {
     let t = TUNNELS.lock().unwrap();
     let mut any = None;
     for (_, c) in t.iter().filter(|(n, c)| *n == remote && c.close_reason().is_none()) {
-        let direct = c
-            .paths()
-            .iter()
-            .any(|p| matches!(p.remote_addr(), iroh::TransportAddr::Ip(_)));
+        // (v301) Par un passeur, le débit n'est pas limité non plus ; et c'est le chemin
+        // qui sert en ce moment qui compte, pas un chemin direct ouvert à côté.
+        let paths = c.paths();
+        let direct = match paths.iter().find(|p| p.is_selected()) {
+            Some(p) => !p.is_relay(),
+            None => paths.iter().any(|p| !p.is_relay()),
+        };
         any = Some(any.unwrap_or(false) || direct);
     }
     any
@@ -280,6 +280,8 @@ pub fn node_direct(remote: [u8; 32]) -> Option<bool> {
 pub struct Node {
     rt: tokio::runtime::Runtime,
     ep: iroh::Endpoint,
+    /// (v301) Ses routes par les passeurs (voir `passeur`).
+    passeurs: passeur::PasseurTransport,
 }
 
 async fn pipe(
@@ -317,33 +319,62 @@ impl Node {
         Self::build(None, true)
     }
 
-    /// (v297) Nœud d'un relais hébergé par ce jeu (région, province, secours) : anonyme,
-    /// ou joignable en direct selon `host_direct` (les serveurs relais d'iroh ne servent
-    /// alors que si le direct échoue).
+    /// (v297) Nœud d'un relais hébergé par ce jeu (région, province, secours) : anonyme
+    /// (joint par des passeurs, sinon par les serveurs relais d'iroh), ou joignable en
+    /// direct si le joueur l'a demandé (`host_direct`).
     pub fn start_host(open_box: bool) -> Result<Self> {
         Self::build(None, !host_direct(open_box))
     }
 
+    /// (v301) Nœud sans serveur d'iroh ni adresse directe : il n'est joignable, et ne
+    /// joint les autres, que par des passeurs (essais sans réseau).
+    #[doc(hidden)]
+    pub fn start_offline() -> Result<Self> {
+        Self::build_with(None, true, true)
+    }
+
     fn build(secret: Option<[u8; 32]>, private: bool) -> Result<Self> {
+        Self::build_with(secret, private, false)
+    }
+
+    fn build_with(secret: Option<[u8; 32]>, private: bool, offline: bool) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("iroh")
             .enable_all()
             .build()?;
-        let ep = rt
+        let (ep, passeurs) = rt
             .block_on(async {
-                let mut b =
-                    iroh::Endpoint::builder(iroh::endpoint::presets::N0).alpns(vec![ALPN.to_vec()]);
+                // (v301) Trois chemins pour un même nœud : le direct (sauf nœud anonyme),
+                // les passeurs, et les serveurs relais d'iroh en dernier recours.
+                let passeurs = passeur::PasseurTransport::bind()?;
+                let b = if offline {
+                    iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                        .relay_mode(iroh::RelayMode::Disabled)
+                        .clear_address_lookup()
+                } else {
+                    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                };
+                let mut b = b
+                    .alpns(vec![ALPN.to_vec()])
+                    .add_custom_transport(std::sync::Arc::new(passeurs.clone()));
                 if let Some(s) = secret {
                     b = b.secret_key(iroh::SecretKey::from_bytes(&s));
                 }
                 if private {
                     b = b.clear_ip_transports();
                 }
-                b.bind().await
+                let ep = b.bind().await.map_err(|e| anyhow!("{e}"))?;
+                anyhow::Ok((ep, passeurs))
             })
             .map_err(|e| anyhow!("iroh : {e}"))?;
-        Ok(Self { rt, ep })
+        passeurs.register(*ep.id().as_bytes());
+        Ok(Self { rt, ep, passeurs })
+    }
+
+    /// (v301) Ses routes par les passeurs (essais, journal).
+    pub fn passeurs(&self) -> &passeur::PasseurTransport {
+        &self.passeurs
     }
 
     /// Comme [`Node::tunnel`], mais attend que le nœud distant réponde (au plus `wait`) :
@@ -423,7 +454,20 @@ impl Node {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
         let addr = listener.local_addr()?;
         let ep = self.ep.clone();
+        let passeurs = self.passeurs.clone();
         self.rt.spawn(async move {
+            // (v301) Une route par des passeurs est demandée au relais du monde ; si elle
+            // vient à temps, le tunnel y passe. Sinon, comme avant : en direct ou par les
+            // serveurs relais d'iroh.
+            let route = passeur::ask(&passeurs, remote).await;
+            let id = match route {
+                Some(r) => {
+                    let mut addrs: Vec<iroh::TransportAddr> = id.addrs.iter().cloned().collect();
+                    addrs.push(iroh::TransportAddr::Custom(passeur::addr(r)));
+                    iroh::EndpointAddr::from_parts(id.id, addrs)
+                }
+                None => id,
+            };
             let conn =
                 match tokio::time::timeout(Duration::from_secs(20), ep.connect(id, ALPN)).await {
                     Ok(Ok(c)) => c,
@@ -437,6 +481,16 @@ impl Node {
                     }
                 };
             remember_tunnel(remote, &conn);
+            // (Journal : ni adresse ni nœud, seulement par où passe le tunnel.)
+            match route {
+                Some(r) => {
+                    log::info!("tunnel : ouvert, avec une route par des passeurs");
+                    tokio::spawn(passeur::keep(passeurs, remote, r, conn.clone()));
+                }
+                None => log::info!(
+                    "tunnel : ouvert sans passeur (en direct, ou par les serveurs relais d'iroh)"
+                ),
+            }
             while let Ok((tcp, _)) = listener.accept().await {
                 let Ok((send, recv)) = conn.open_bi().await else {
                     break;
@@ -464,12 +518,12 @@ mod tests {
 
     /// (v279) Les relais écrits un par ligne se relisent ; une ligne fausse est ignorée, et
     /// la liste officielle compilée dans le jeu se lit sans erreur.
-    /// (v297) Un hôte est joint en direct quand le joueur l'a demandé, jamais quand il l'a
-    /// refusé, et sinon seulement si son PC est déjà un passeur vérifié.
+    /// (v297, v301) Un hôte n'est joint en direct que si le joueur l'a demandé : jamais de
+    /// lui-même, même quand sa box est ouverte (il porte alors ses tunnels comme passeur).
     #[test]
-    fn a_host_is_direct_when_asked_or_when_its_box_is_already_open() {
+    fn a_host_is_direct_only_when_asked() {
         set_hosts_direct(None);
-        assert!(!host_direct(false) && host_direct(true));
+        assert!(!host_direct(false) && !host_direct(true));
         set_hosts_direct(Some(true));
         assert!(host_direct(false) && host_direct(true));
         set_hosts_direct(Some(false));
@@ -513,6 +567,121 @@ mod tests {
         old.seen = 0;
         let bytes = postcard::to_allocvec(&vec![old]).unwrap();
         assert!(decode_ads(&bytes).is_empty());
+    }
+
+    /// Un petit relais TCP local qui renvoie ce qu'il reçoit (après le préambule du tunnel).
+    fn echo() -> SocketAddr {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = server.accept() {
+                std::thread::spawn(move || {
+                    let mut head = [0u8; 5];
+                    if s.read_exact(&mut head).is_err() {
+                        return;
+                    }
+                    let mut who = vec![0u8; head[4] as usize];
+                    let _ = s.read_exact(&mut who);
+                    let mut b = [0u8; 5];
+                    while s.read_exact(&mut b).is_ok() {
+                        if s.write_all(&b).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        local
+    }
+
+    fn said_back(c: &mut std::net::TcpStream, what: &[u8; 5]) -> bool {
+        use std::io::{Read, Write};
+        let mut back = [0u8; 5];
+        c.write_all(what).is_ok() && c.read_exact(&mut back).is_ok() && &back == what
+    }
+
+    /// Une route par ces passeurs, donnée aux deux bouts comme le fait le relais du monde.
+    fn give(node: [u8; 32], route: u64, passeurs: &[&minelib_net::fast::Passeur]) {
+        use minelib_net::fast::{tunnel_given, TunnelRoute, Via};
+        let vias: Vec<Via> = passeurs
+            .iter()
+            .map(|p| {
+                let seal = [p.port() as u8; 32];
+                p.set_lot(route, &[(route, seal)]);
+                Via {
+                    addr: SocketAddr::from(([127, 0, 0, 1], p.port())),
+                    seal,
+                }
+            })
+            .collect();
+        for host in [true, false] {
+            let r = TunnelRoute {
+                node,
+                route,
+                host,
+                vias: vias.clone(),
+            };
+            tunnel_given(r, false);
+        }
+    }
+
+    /// (v301) Sans aucun serveur d'iroh et sans adresse directe, un tunnel passe par un
+    /// passeur : les deux nœuds ne se joignent que par lui, et le lien compte comme
+    /// rapide (pas de débit limité par un tiers).
+    #[test]
+    fn a_tunnel_goes_through_a_passeur_without_any_server() {
+        let host = Node::start_offline().unwrap();
+        host.serve(echo());
+        let guest = Node::start_offline().unwrap();
+        let (tx, _probes) = std::sync::mpsc::channel();
+        let p = minelib_net::fast::Passeur::start(0, tx).unwrap();
+        give(host.id(), 0x51, &[&p]);
+        assert_eq!(host.passeurs().routes(), 1, "la route de l'hôte est ouverte");
+        let t = guest.tunnel(host.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        assert!(said_back(&mut c, b"salut"));
+        // Un gros envoi : bien plus d'un paquet, dans les deux sens.
+        for i in 0..2000u32 {
+            assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
+        }
+        assert!(p.carried() > 20, "le passeur a porté {} paquets", p.carried());
+        assert_eq!(node_direct(host.id()), Some(true));
+        // Le tunnel fermé, le joueur rend sa route.
+        drop(c);
+        drop(guest);
+    }
+
+    /// (v301) Le premier passeur d'un tunnel tombe : le tunnel continue par le second,
+    /// sans se refermer.
+    #[test]
+    fn a_tunnel_moves_to_its_second_passeur_when_the_first_falls() {
+        let host = Node::start_offline().unwrap();
+        host.serve(echo());
+        let guest = Node::start_offline().unwrap();
+        let (tx, _probes) = std::sync::mpsc::channel();
+        let first = minelib_net::fast::Passeur::start(0, tx.clone()).unwrap();
+        let second = minelib_net::fast::Passeur::start(0, tx).unwrap();
+        give(host.id(), 0x52, &[&first, &second]);
+        let t = guest.tunnel(host.id()).unwrap();
+        let mut c = std::net::TcpStream::connect(t).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(25))).unwrap();
+        assert!(said_back(&mut c, b"avant"));
+        let at = SocketAddr::from(([127, 0, 0, 1], first.port()));
+        assert_eq!(guest.passeurs().via(0x52), Some(at));
+        // Le premier ne porte plus rien.
+        first.clear();
+        let fell = std::time::Instant::now();
+        assert!(said_back(&mut c, b"apres"), "le tunnel s'est refermé");
+        let took = fell.elapsed();
+        eprintln!("TUNNEL : reprise par le second passeur en {took:?}");
+        assert!(took < Duration::from_secs(12), "reprise en {took:?}");
+        let at = SocketAddr::from(([127, 0, 0, 1], second.port()));
+        assert_eq!(guest.passeurs().via(0x52), Some(at));
+        for i in 0..200u32 {
+            assert!(said_back(&mut c, &[i as u8; 5]), "envoi {i}");
+        }
     }
 
     /// Deux nœuds iroh sur cette machine : un relais TCP local joint par le tunnel.

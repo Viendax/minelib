@@ -8827,7 +8827,7 @@ fn health_report(st: &mut State) {
         "relais (santé, {:.0} s) : {} connexions, {fps} parties FPS, {build} mondes ; {} demandes, \
          attente la plus longue {:.0} ms, traitement le plus long {:.0} ms ; {} positions \
          écartées ; {} connexions de compte (refusées {}, relais occupé {}) ; passeurs : \
-         {offers} annoncés, {verified} vérifiés, {carried} parties portées",
+         {offers} annoncés, {verified} vérifiés, {carried} parties portées, {} tunnels portés",
         since.elapsed().as_secs_f32(),
         st.conns.len(),
         h.requests,
@@ -8837,6 +8837,7 @@ fn health_report(st: &mut State) {
         h.logins,
         h.logins_bad,
         h.logins_busy,
+        st.fast.tunnels(),
     );
 }
 
@@ -8870,6 +8871,13 @@ fn handle_locked(
     id: u64,
 ) -> Option<Response> {
     st.prepared = prepared;
+    // (v301) Un hôte annonce le nœud de son relais : les tunnels vers lui peuvent passer
+    // par des passeurs.
+    if let Some(node) = passeurs::node_of(&req) {
+        if matches!(&*session, Session::LoggedIn { .. }) {
+            passeurs::node_ready(st, id, node);
+        }
+    }
     let room_request = matches!(
         req,
         Request::Servers { .. }
@@ -8959,9 +8967,11 @@ fn handle_locked(
             | Request::PasseurOff
             | Request::FastWant { .. }
             | Request::FastBad { .. }
+            | Request::TunnelWant { .. }
     ) {
         if matches!(&*session, Session::LoggedIn { .. }) {
             match req {
+                Request::TunnelWant { node } => passeurs::tunnel_want(st, id, node),
                 Request::PasseurOffer { port, external } => {
                     passeurs::offer(st, id, peer, port, external)
                 }

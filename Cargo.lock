@@ -2851,8 +2851,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "iroh",
+ "iroh-base",
  "log",
  "mainline",
+ "minelib-net",
+ "n0-watcher",
+ "noq-udp",
  "portmapper",
  "postcard",
  "serde",
