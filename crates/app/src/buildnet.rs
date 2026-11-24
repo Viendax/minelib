@@ -286,6 +286,11 @@ pub struct BuildNet {
     /// une fois par seconde.
     close_timer: f32,
     slow_link: (f32, bool),
+    /// (v287) Relevé du réseau, écrit au journal chaque minute sans rien qui désigne un
+    /// joueur : positions parties (pour tous, rapprochées), positions reçues, modifications
+    /// annulées faute de réponse, blocs remis comme avant, et depuis quand on compte.
+    net: [u32; 5],
+    net_since: std::time::Instant,
     /// Rang (ordre du relais du monde) de la dernière modification appliquée à chaque
     /// case, et relais de région qui l'a remise (son numéro de connexion ; aucun : le
     /// relais du monde). Une modification plus ancienne arrivée après (doublon, autre
@@ -563,6 +568,8 @@ impl BuildNet {
             pos_timer: 0.0,
             close_timer: 0.0,
             slow_link: (0.0, false),
+            net: [0; 5],
+            net_since: std::time::Instant::now(),
             seen: HashMap::new(),
             names: HashMap::new(),
             served_sent: Vec::new(),
@@ -1883,6 +1890,7 @@ impl BuildNet {
         {
             self.undone += undone;
         }
+        self.net[4] += undone as u32;
         if undone > 0 {
             log::info!(
                 "construction : {undone} blocs d'un relais de région quitté jamais confirmés par le relais du monde, remis comme avant"
@@ -1894,6 +1902,7 @@ impl BuildNet {
                 continue;
             }
             self.pending.remove(&pos);
+            self.net[3] += 1;
             log::info!("construction : pas de réponse du relais pour {pos:?}, annulé");
             dirty.extend(world.set_remote(pos[0], pos[1], pos[2], old));
         }
@@ -2010,6 +2019,7 @@ impl BuildNet {
             self.pos_timer = (self.pos_timer + pos_every(self.others.len(), slow)).max(0.0);
             self.close_timer = (self.close_timer + POS_FASTEST).max(0.0);
             sent = true;
+            self.net[0] += 1;
             let msg = BuildMsg::Player {
                 pseudo: self.pseudo.clone(),
                 pos: feet.to_array(),
@@ -2054,6 +2064,7 @@ impl BuildNet {
             && self.others.len() > POS_CLOSE
         {
             self.close_timer = (self.close_timer + POS_FASTEST).max(0.0);
+            self.net[1] += 1;
             let msg = BuildMsg::Player {
                 pseudo: self.pseudo.clone(),
                 pos: feet.to_array(),
@@ -2071,6 +2082,37 @@ impl BuildNet {
                     data: game::encode(&msg),
                 },
             );
+        }
+        // (v287) Une ligne par minute au journal : de quoi constater un problème de réseau
+        // (positions qui n'arrivent pas, lien lent, modifications sans réponse).
+        let since = self.net_since.elapsed().as_secs_f32();
+        if since >= 60.0 {
+            let link = if self.shards.link(proto::region_of(chunk)).is_some()
+                || self.province_link(chunk).is_some()
+            {
+                if self.slow_link.1 {
+                    "relais de région ou de province, par les serveurs relais d'iroh"
+                } else {
+                    "relais de région ou de province, en direct"
+                }
+            } else {
+                "relais du monde"
+            };
+            log::info!(
+                "réseau (construction, {since:.0} s) : {:.0} positions envoyées par seconde \
+                 (dont {:.0} rapprochées), {:.0} reçues par seconde de {} voisins ; {link} ; \
+                 {} modifications annulées faute de réponse, {} blocs remis comme avant, {} \
+                 en attente",
+                (self.net[0] + self.net[1]) as f32 / since,
+                self.net[1] as f32 / since,
+                self.net[2] as f32 / since,
+                self.others.len(),
+                self.net[3],
+                self.net[4],
+                self.pending.len(),
+            );
+            self.net = [0; 5];
+            self.net_since = std::time::Instant::now();
         }
         for o in self.others.values_mut() {
             o.seen += dt;
@@ -2386,6 +2428,7 @@ impl BuildNet {
         if !p.sane() {
             return;
         }
+        self.net[2] += 1;
         let target = Vec3::from(p.pos);
         let key: String = pseudo.chars().take(16).collect();
         match self.others.get_mut(&key) {

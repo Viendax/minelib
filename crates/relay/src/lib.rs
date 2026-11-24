@@ -1394,6 +1394,8 @@ struct State {
     rooms: HashMap<u64, Room>,
     /// Passeurs de la voie rapide des parties FPS, et parties qu'ils portent.
     fast: passeurs::Fast,
+    /// (v287) Santé du relais sur la minute en cours (`Health`).
+    health: Health,
     /// (v276) Calcul fait d'avance, hors du verrou, pour la demande en cours (`prepare`),
     /// et places de calcul de ce relais.
     prepared: Option<Prepared>,
@@ -1554,6 +1556,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
         conns: HashMap::new(),
         rooms: HashMap::new(),
         fast: passeurs::Fast::default(),
+        health: Health::default(),
         prepared: None,
         auth_gate: Arc::default(),
         parties: HashMap::new(),
@@ -1634,6 +1637,7 @@ pub fn start(cfg: Config) -> Result<Handle> {
                         guards::upkeep(&mut st);
                         // (Passeurs de la voie rapide : sondes à refaire, passeurs muets.)
                         passeurs::upkeep(&mut st);
+                        health_report(&mut st);
                     }
                 });
                 let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
@@ -8196,6 +8200,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             if let Some(room) = my_room.and_then(|r| st.rooms.get_mut(&r)) {
                 // Plus de positions que le jeu n'en envoie : pas diffusée.
                 if !room.build.pos_due(id) {
+                    st.health.pos_dropped += 1;
                     return None;
                 }
                 // Vers chaque voisin, elle part regroupée avec celles des autres (voir
@@ -8211,6 +8216,7 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
                 // avant sinon (`zones::POS_FEW`).
                 let near = room.build.nearby(id, chunk, 1);
                 if !room.build.pos_fits(id, near.len()) {
+                    st.health.pos_dropped += 1;
                     return None;
                 }
                 for m in near {
@@ -8235,7 +8241,11 @@ fn handle_room(req: Request, st: &mut State, id: u64, pseudo: &str) -> Option<Re
             // n'en dépend (ni la place gardée du joueur, ni les modifications en retard).
             let (_, pose) = game::pose_of(&data)?;
             let room = my_room.and_then(|r| st.rooms.get_mut(&r))?;
-            if room.kind != 1 || !room.build.pos_due(id) {
+            if room.kind != 1 {
+                return None;
+            }
+            if !room.build.pos_due(id) {
+                st.health.pos_dropped += 1;
                 return None;
             }
             let pose = Arc::new(transport::PoseOf {
@@ -8777,6 +8787,56 @@ fn busy() -> Response {
     )
 }
 
+/// (v287) Santé du relais, comptée sur une minute puis écrite au journal (`health_report`).
+/// Rien ici ne désigne un joueur : ni pseudo, ni adresse, ni nœud. C'est ce qui permet de
+/// constater un problème de réseau (relais figé, débordé, positions écartées, passeurs qui
+/// manquent) sans rien savoir de ceux qui jouent.
+#[derive(Default)]
+struct Health {
+    since: Option<Instant>,
+    /// Demandes traitées ; plus longue attente de l'état par une demande, et plus long
+    /// traitement état tenu (ms) : au-delà de quelques millisecondes, tout le monde attend.
+    requests: u64,
+    wait_max_ms: f32,
+    held_max_ms: f32,
+    /// Positions écartées (plus que le jeu n'en envoie).
+    pos_dropped: u64,
+    /// Connexions de compte demandées ; refusées (mauvais identifiants) ; refusées parce
+    /// que trop de mots de passe attendaient d'être vérifiés.
+    logins: u32,
+    logins_bad: u32,
+    logins_busy: u32,
+}
+
+/// (v287) Une ligne par minute au journal du relais, anonyme (voir `Health`).
+fn health_report(st: &mut State) {
+    let since = *st.health.since.get_or_insert_with(Instant::now);
+    if since.elapsed() < Duration::from_secs(60) {
+        return;
+    }
+    let h = std::mem::take(&mut st.health);
+    let (fps, build) = st.rooms.values().fold((0, 0), |(f, b), r| match r.kind {
+        0 => (f + 1, b),
+        _ => (f, b + 1),
+    });
+    let (offers, verified, carried) = st.fast.counts();
+    log::info!(
+        "relais (santé, {:.0} s) : {} connexions, {fps} parties FPS, {build} mondes ; {} demandes, \
+         attente la plus longue {:.0} ms, traitement le plus long {:.0} ms ; {} positions \
+         écartées ; {} connexions de compte (refusées {}, relais occupé {}) ; passeurs : \
+         {offers} annoncés, {verified} vérifiés, {carried} parties portées",
+        since.elapsed().as_secs_f32(),
+        st.conns.len(),
+        h.requests,
+        h.wait_max_ms,
+        h.held_max_ms,
+        h.pos_dropped,
+        h.logins,
+        h.logins_bad,
+        h.logins_busy,
+    );
+}
+
 /// Traite une demande ; `prepared` : ce que `prepare` a calculé d'avance pour elle.
 pub(crate) fn handle_prepared(
     req: Request,
@@ -8786,8 +8846,26 @@ pub(crate) fn handle_prepared(
     peer: &str,
     id: u64,
 ) -> Option<Response> {
+    let asked = Instant::now();
     let mut st = state.lock().unwrap();
-    let st = &mut *st;
+    let got = Instant::now();
+    let r = handle_locked(req, prepared, &mut st, session, peer, id);
+    // (v287) Santé : combien cette demande a attendu l'état, et combien elle l'a tenu.
+    st.health.requests += 1;
+    let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+    st.health.wait_max_ms = st.health.wait_max_ms.max(ms(got - asked));
+    st.health.held_max_ms = st.health.held_max_ms.max(ms(got.elapsed()));
+    r
+}
+
+fn handle_locked(
+    req: Request,
+    prepared: Option<Prepared>,
+    st: &mut State,
+    session: &mut Session,
+    peer: &str,
+    id: u64,
+) -> Option<Response> {
     st.prepared = prepared;
     let room_request = matches!(
         req,
@@ -8995,6 +9073,7 @@ fn handle_account(
             hw,
             device,
         } => {
+            st.health.logins += 1;
             // Par le tunnel iroh, `peer` est la vraie adresse du joueur (préambule).
             let keys = login_keys(&pseudo, peer);
             if let Some(wait) = keys.iter().filter_map(|k| st.limits.wait(k)).max() {
@@ -9009,7 +9088,10 @@ fn handle_account(
             // preuve et ce hachage-là (le mot de passe n'a pas changé entre-temps).
             let hash = record.as_ref().map(|r| r.auth_hash.as_str());
             let ok = match st.prepared.take() {
-                Some(Prepared::Busy) => return busy(),
+                Some(Prepared::Busy) => {
+                    st.health.logins_busy += 1;
+                    return busy();
+                }
                 Some(Prepared::Login {
                     auth: a,
                     hash: h,
@@ -9021,6 +9103,7 @@ fn handle_account(
                 for k in &keys {
                     st.limits.failed(k);
                 }
+                st.health.logins_bad += 1;
                 return err(ErrorCode::WrongCredentials, "");
             };
             if st.registry.is_banned(&record.pubkey) {

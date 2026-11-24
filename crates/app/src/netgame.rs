@@ -1526,6 +1526,7 @@ pub struct Guest {
     /// d'entrées partis par le relais (voir `RELAY_INPUTS_EVERY`).
     held_frames: u8,
     relay_inputs: u32,
+    relay_inputs_logged: u32,
     /// (v274) Pas du dernier état complet pris en compte : ils arrivent par le relais et
     /// par les passeurs, le second (ou un plus ancien) est ignoré.
     snap_tick: Option<u32>,
@@ -2277,6 +2278,7 @@ impl NetGame {
             fast_slow: false,
             held_frames: 0,
             relay_inputs: 0,
+            relay_inputs_logged: 0,
             own_tick: None,
             seen_tick: None,
             snap_tick: None,
@@ -4722,19 +4724,42 @@ impl Guest {
             self.net_stalled += 1;
         }
         if self.net_since.elapsed() >= std::time::Duration::from_secs(30) {
+            // (v287) Chaque passeur : son aller-retour mesuré de bout en bout, ou fermé.
+            let passeurs = self.fast.as_ref().map_or_else(
+                || "aucune".to_string(),
+                |f| {
+                    let p: Vec<String> = f
+                        .paths(0)
+                        .iter()
+                        .map(|p| match (p.open, p.rtt_ms) {
+                            (true, Some(ms)) => format!("{ms:.0} ms"),
+                            (true, None) => "ouvert".to_string(),
+                            (false, _) => "fermé".to_string(),
+                        })
+                        .collect();
+                    if p.is_empty() {
+                        "aucun passeur".to_string()
+                    } else {
+                        p.join(", ")
+                    }
+                },
+            );
             log::info!(
-                "réseau : {} images sur {} avec plus de {:.0} ms de retard sur l'hôte (voie \
-                 rapide {}, ping {:.0} ms)",
+                "réseau (FPS, 30 s) : {} images sur {} avec plus de {:.0} ms de retard sur \
+                 l'hôte ; ping par le relais {:.0} ms ; voie rapide : {passeurs}{} ; {} \
+                 messages d'entrées par le relais",
                 self.net_stalled,
                 self.net_frames,
                 STALL_TICKS * crate::session::SIM_TICK * 1000.0,
-                if self.fast.as_ref().is_some_and(|f| f.open(0)) {
-                    "ouverte"
+                self.ping.unwrap_or(0.0),
+                if self.fast_slow {
+                    " (plus lente que le relais : positions demandées au relais)"
                 } else {
-                    "fermée"
+                    ""
                 },
-                self.ping.unwrap_or(0.0)
+                self.relay_inputs.wrapping_sub(self.relay_inputs_logged),
             );
+            self.relay_inputs_logged = self.relay_inputs;
             self.net_frames = 0;
             self.net_stalled = 0;
             self.net_since = std::time::Instant::now();

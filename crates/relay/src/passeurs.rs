@@ -101,6 +101,15 @@ pub(crate) struct Fast {
 }
 
 impl Fast {
+    /// (v287) Pour le relevé de santé : passeurs annoncés, vérifiés, et parties portées.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.offers.len(),
+            self.offers.values().filter(|o| o.verified).count(),
+            self.rooms.len(),
+        )
+    }
+
     /// Routes confiées en ce moment à ce passeur.
     fn load(&self, id: u64) -> usize {
         self.rooms
