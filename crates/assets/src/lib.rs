@@ -140,6 +140,11 @@ pub struct Options {
     pub relay: String,
     /// Au menu, ce jeu peut servir de garant indépendant pour les parties des autres.
     pub garant: bool,
+    /// (v280) Quand ce jeu héberge le relais d'une région, d'une province ou un relais de
+    /// secours, les joueurs servis le joignent en direct (ils voient son adresse IP) au
+    /// lieu de passer par les serveurs relais publics d'iroh, au débit limité. Faux par
+    /// défaut (`hote_direct=true` dans `options.txt` pour l'activer).
+    pub host_direct: bool,
     /// Clé du relais retenue au premier contact (hexadécimal, vide = pas encore).
     pub relay_key: String,
     /// Dernier pseudo utilisé (prérempli à la connexion).
@@ -183,6 +188,7 @@ impl Default for Options {
             volume_weather: 1.0,
             relay: "auto".into(),
             garant: true,
+            host_direct: false,
             relay_key: String::new(),
             pseudo: String::new(),
         }
@@ -235,6 +241,9 @@ impl Options {
             }
             if let Some(v) = kv.get("garant") {
                 o.garant = v != "false";
+            }
+            if let Some(v) = kv.get("hote_direct") {
+                o.host_direct = v == "true";
             }
             if let Some(v) = kv.get("relay_key") {
                 o.relay_key = v.trim().to_string();
@@ -297,7 +306,7 @@ impl Options {
         fs::write(
             path,
             format!(
-                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\n",
+                "resource_pack={}\nrender_distance={}\nreflex={}\nsensitivity={}\nraytracing={}\nrender_scale={}\ncpu_sharing={}\nfullscreen={}\nvolume={}\naudio_out={}\naudio_in={}\nvolume_mic={}\nvolume_tele={}\nvolume_voice={}\nfps_max={}\nrelay={}\nrelay_key={}\npseudo={}\ngarant={}\nsensitivity_fps={}\nfps_color={}\nlanguage={}\nmute_screens_menu={}\ntorches_ponctuelles={}\ncarte_integree={}\ninvisible={}\nvolume_meteo={}\nhote_direct={}\n",
                 self.resource_pack, self.render_distance, self.low_latency, self.sensitivity, self.raytracing, self.render_scale, if self.cpu_uniform { "uniform" } else { "reserved" }, self.fullscreen,
                 self.volume,
                 self.audio_out.replace('\n', " "),
@@ -317,7 +326,8 @@ impl Options {
                 self.point_torches,
                 self.igpu,
                 self.invisible,
-                self.volume_weather
+                self.volume_weather,
+                self.host_direct
             ),
         )?;
         Ok(())

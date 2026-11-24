@@ -216,6 +216,14 @@ fn remote_key(conn: &iroh::endpoint::Connection, first: Option<std::net::IpAddr>
     }
 }
 
+/// (v280) Les relais de région, de province et de secours hébergés par ce jeu sont joignables
+/// en direct (voir `Node::start_private`). Faux par défaut : l'hôte reste anonyme.
+static HOSTS_DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_hosts_direct(on: bool) {
+    HOSTS_DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Nœud iroh de ce jeu (un par processus).
 pub struct Node {
     rt: tokio::runtime::Runtime,
@@ -253,8 +261,16 @@ impl Node {
     /// Nœud anonyme : joignable seulement par les serveurs relais d'iroh, jamais en direct.
     /// Ceux qui s'y connectent ne voient pas son adresse IP (hôte d'une région d'un monde :
     /// un joueur d'une autre partie qui doit rester anonyme pour les joueurs servis).
+    ///
+    /// (v280) Sauf si le joueur l'a demandé (`hote_direct=true` dans `options.txt`, voir
+    /// `set_hosts_direct`) : le nœud est alors joignable en direct, comme un relais du
+    /// monde, et ne passe par les serveurs relais d'iroh que si le direct échoue. Ces
+    /// serveurs publics limitent le débit de chaque connexion et ne sont prévus que pour
+    /// le développement et les essais ; un hôte anonyme y fait passer tous les joueurs
+    /// qu'il sert. En direct, ces joueurs voient son adresse IP.
     pub fn start_private() -> Result<Self> {
-        Self::build(None, true)
+        let direct = HOSTS_DIRECT.load(std::sync::atomic::Ordering::Relaxed);
+        Self::build(None, !direct)
     }
 
     fn build(secret: Option<[u8; 32]>, private: bool) -> Result<Self> {
