@@ -437,7 +437,10 @@ impl Party {
     ///   cours sur l'écran, la cliquée va au bout de sa file et la page revient à celle en
     ///   cours ; sinon elle s'ouvre ;
     /// - `{"retire":rang,"v":vidéo}` (la croix dans la file) : retirée de la file.
-    pub fn order(&mut self, id: u32, json: &str, me: &str) -> Option<Act> {
+    ///
+    /// (v257) `cote` : l'ordre vient de la recherche à côté du lecteur (un autre onglet) ; la
+    /// page du lecteur n'a pas bougé, rien n'est rouvert quand la vidéo va dans la file.
+    pub fn order(&mut self, id: u32, json: &str, me: &str, cote: bool) -> Option<Act> {
         #[derive(Deserialize)]
         struct Ordre {
             #[serde(default)]
@@ -458,9 +461,9 @@ impl Party {
             let Some(t) = en_cours else {
                 return Some(Act::Open(id, watch_url(&vid, 0.0)));
             };
-            let retour = Act::Open(id, watch_url(&t.video.id, t.now()));
+            let retour = (!cote).then(|| Act::Open(id, watch_url(&t.video.id, t.now())));
             if t.video.queue.len() >= MAX_FILE || t.video.id == vid {
-                return Some(retour);
+                return retour;
             }
             let mut video = t.at_now();
             video.queue.push(vid.clone());
@@ -468,7 +471,7 @@ impl Party {
             video.by = me.chars().take(32).collect();
             log::info!("regarder ensemble : écran {id}, {vid} ajoutée à la file ({} en tout)", video.queue.len());
             self.put(id, video);
-            return Some(retour);
+            return retour;
         }
         if let (Some(i), Some(vid)) = (o.retire, o.v) {
             let t = self.tracks.get(&id)?;
@@ -1277,25 +1280,26 @@ mod tests {
         run(&mut ps, 1.0);
         // Rien en cours : le clic ouvre la vidéo.
         assert_eq!(
-            ps[1].party.order(id, &format!(r#"{{"clic":"{X}"}}"#), B),
+            ps[1].party.order(id, &format!(r#"{{"clic":"{X}"}}"#), B, false),
             Some(Act::Open(id, watch_url(X, 0.0)))
         );
         ps[0].page(id).act(&Act::Open(id, watch_url(X, 0.0)));
         run(&mut ps, 6.0);
         // Bob clique Y : dans la file, et sa page revient à X.
-        let a = ps[1].party.order(id, &format!(r#"{{"clic":"{Y}"}}"#), B);
+        let a = ps[1].party.order(id, &format!(r#"{{"clic":"{Y}"}}"#), B, false);
         assert!(matches!(&a, Some(Act::Open(_, u)) if u.contains(X)), "{a:?}");
         let z = "aaaaaaaaaaa";
-        ps[1].party.order(id, &format!(r#"{{"clic":"{z}"}}"#), B);
+        // (v257) Depuis la recherche à côté : dans la file, la page du lecteur ne bouge pas.
+        assert_eq!(ps[1].party.order(id, &format!(r#"{{"clic":"{z}"}}"#), B, true), None);
         run(&mut ps, 2.0);
         for p in &ps {
             assert_eq!(p.party.tracks[&id].video.queue, vec![Y.to_string(), z.to_string()]);
             assert_eq!(p.party.tracks[&id].video.id, X);
         }
         // Une croix chez Alice retire z (le bon rang et le bon numéro seulement).
-        assert_eq!(ps[0].party.order(id, &format!(r#"{{"retire":0,"v":"{z}"}}"#), A), None);
+        assert_eq!(ps[0].party.order(id, &format!(r#"{{"retire":0,"v":"{z}"}}"#), A, false), None);
         assert_eq!(ps[0].party.tracks[&id].video.queue.len(), 2);
-        ps[0].party.order(id, &format!(r#"{{"retire":1,"v":"{z}"}}"#), A);
+        ps[0].party.order(id, &format!(r#"{{"retire":1,"v":"{z}"}}"#), A, false);
         run(&mut ps, 2.0);
         assert_eq!(ps[1].party.tracks[&id].video.queue, vec![Y.to_string()]);
         // La vidéo d'Alice finit : tout le monde passe à Y, la file se vide.

@@ -28,21 +28,43 @@
   (`__mlb.panneau(true)`, le joueur arrivé par le bord droit de l'écran) : elle glisse
   depuis la droite et la vidéo se réduit à côté (jamais par-dessus). La page dit au jeu ce
   qu'elle montre (`f`, `o`) et quand la vidéo est finie (`e`) : le jeu passe à la suivante.
+
+  (v257) La recherche à côté : le bouton de la file le demande au jeu
+  (`__minelib_ordre__{"recherche":true}`), qui ouvre la recherche de YouTube dans un
+  deuxième onglet et dit `__mlb.panneau(true,true)`. La page sort alors de sous la file un
+  trou de 464 px, en glissant vers le centre ; la vidéo se réduit à sa gauche. Le jeu y
+  colle l'image de l'onglet de recherche : la première ligne du trou est magenta et la
+  deuxième cyan, il trouve le trou dans chaque image, au pixel près, même en plein
+  glissement. À la place du bouton, « Fermer la recherche » (le trou rentre sous la file).
+  Quand la file s'en va, trou et file glissent ensemble vers la droite, d'un bloc ; ils
+  reviennent tels quels. L'état est gardé dans la session de l'onglet : une vidéo suivante
+  (la page rechargée) les montre tout de suite, sans les refaire glisser.
 -->
 <style>
 html,body{margin:0;height:100%;background:#0f0f0f;color:#f1f1f1;
   font:16px "Segoe UI",Roboto,Arial,sans-serif;overflow:hidden}
-#cadre{position:absolute;top:0;left:0;right:0;bottom:0;transition:right .28s ease}
-body.file #cadre{right:352px}
-#file{position:absolute;top:0;right:0;bottom:0;width:352px;overflow:hidden;
-  box-sizing:border-box;padding:16px 14px;background:#0f0f0f;border-left:1px solid #272727;
-  transform:translateX(100%);transition:transform .28s ease}
-body.file #file{transform:none}
+@property --o{syntax:'<number>';inherits:true;initial-value:0}
+@property --s{syntax:'<number>';inherits:true;initial-value:0}
+body{--o:0;--s:0;transition:--o .28s ease,--s .28s ease}
+body.file{--o:1}
+body.cote{--s:1}
+body.net{transition:none}
+#cadre{position:absolute;top:0;left:0;bottom:0;right:calc(var(--o)*(352px + 464px*var(--s)))}
+#trou{position:absolute;top:0;bottom:0;width:464px;
+  left:calc(100% - var(--o)*(352px + 464px*var(--s)));background:#0f0f0f;color:#aaa;
+  font-size:15px;display:flex;align-items:center;justify-content:center}
+#trou::before,#trou::after{content:'';position:absolute;left:0;right:0;height:1px}
+#trou::before{top:0;background:#f0f}
+#trou::after{top:1px;background:#0ff}
+#file{position:absolute;top:0;bottom:0;width:352px;overflow:hidden;
+  left:calc(100% - var(--o)*(352px + 464px*var(--s)) + 464px*var(--s));
+  box-sizing:border-box;padding:16px 14px;background:#0f0f0f;border-left:1px solid #272727}
 #file h2{margin:2px 4px 12px;font-size:18px;font-weight:600}
 #cherche{display:block;width:100%;margin:0 0 14px;padding:10px 14px;border:1px solid #3f3f3f;
   border-radius:20px;background:#121212;color:#f1f1f1;font:inherit;font-size:15px;
   text-align:left;cursor:pointer}
 #cherche::before{content:'🔍  '}
+body.cote #cherche::before{content:'✕  '}
 #vide{color:#aaa;font-size:14px;line-height:1.4;margin:4px}
 .v{display:flex;align-items:center;gap:10px;margin-bottom:10px;position:relative}
 .v img{width:120px;height:68px;object-fit:cover;border-radius:6px;flex:none;background:#222}
@@ -59,6 +81,7 @@ body.file #file{transform:none}
 </head>
 <body>
 <div id="cadre"><div id="lecteur"></div></div>
+<div id="trou">Chargement de YouTube…</div>
 <div id="file"><button id="cherche">Rechercher une vidéo</button><h2>À suivre</h2>
 <div id="liste"></div><div id="vide">Rien à suivre. Cherche une vidéo et clique-la : elle se
 mettra ici.</div></div>
@@ -87,9 +110,18 @@ const montre=()=>{const l=document.getElementById('liste');l.textContent='';
       console.log('__minelib_ordre__'+JSON.stringify({retire:i,v:v}));});
     d.append(im,n,t,x);l.append(d);titre(v);});
   document.getElementById('vide').style.display=file.length?'none':'block';};
-let ouvert=false;
-// Le bouton de recherche : le site de YouTube (une vidéo cliquée là va dans la file).
-document.getElementById('cherche').addEventListener('click',()=>{location.href='https://www.youtube.com/';});
+// (v257) La file (`ouvert`) et la recherche à côté (`cote`), comme le jeu les veut.
+let ouvert=false,cote=false;
+const applique=()=>{document.body.classList.toggle('file',ouvert);
+  document.body.classList.toggle('cote',cote);
+  document.getElementById('cherche').textContent=cote?'Fermer la recherche':'Rechercher une vidéo';};
+// Rechargée (vidéo suivante) : remise telle quelle, sans glisser.
+try{const m=JSON.parse(sessionStorage.getItem('mlb_panneau')||'null');
+  if(Array.isArray(m)){ouvert=!!m[0];cote=!!m[1];document.body.classList.add('net');applique();
+    requestAnimationFrame(()=>requestAnimationFrame(()=>document.body.classList.remove('net')));}}catch(_){}
+// Le bouton de recherche : le jeu ouvre (ou ferme) la recherche à côté.
+document.getElementById('cherche').addEventListener('click',()=>{
+  console.log('__minelib_ordre__'+JSON.stringify({recherche:!cote}));});
 const mot=t=>{document.getElementById('cadre').style.display='none';
   const m=document.getElementById('mot');m.textContent=t;m.style.display='flex';};
 // Commandes du jeu (regarder ensemble, pause de tous les écrans). Lancer la lecture
@@ -102,7 +134,8 @@ window.__mlb={
   pauseVideo:()=>{voulu=false;if(P&&pret)P.pauseVideo();},
   regarde:()=>{if(permis)return;permis=true;if(P&&pret&&voulu)P.playVideo();},
   file:l=>{if(!Array.isArray(l))return;file=l.filter(ok).slice(0,30);montre();},
-  panneau:o=>{ouvert=!!o;document.body.classList.toggle('file',ouvert);},
+  panneau:(o,r)=>{ouvert=!!o;cote=!!r;applique();
+    try{sessionStorage.setItem('mlb_panneau',JSON.stringify([ouvert,cote]));}catch(_){}},
 };
 if(!id){mot("Pas de vidéo à lire.");return;}
 window.onYouTubeIframeAPIReady=()=>{
@@ -157,7 +190,7 @@ setInterval(()=>{
   if(s!==1||t!==dernier){dernier=t;depuis=now;}
   const fige=s===1&&now-depuis>1200;
   const a=!permis||fige;
-  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i,e:fini,f:file.join(','),o:ouvert});
+  const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i,e:fini,f:file.join(','),o:ouvert,r:cote});
   if(st!==etat){etat=st;console.log('__minelib_state__'+st);}
 },500);
 })();

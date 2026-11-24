@@ -12,6 +12,9 @@
 //!   `enter`, `tab`, `left`, `right`, `up`, `down`, `home`, `end`, `ctrl+a`, `ctrl+c`,
 //!   `ctrl+v`, `ctrl+x`, `ctrl+y`, `ctrl+z`), `blur <id>` (le champ de texte perd le
 //!   focus), `eval <id> <javascript>`, `fps <id> <1..60>` (images par seconde de l'onglet) ;
+//! - (v257) `cote <id> <largeur> <hauteur>`, avant `open` : l'onglet `<id>` sera la
+//!   recherche de YouTube à côté du lecteur d'un écran (sa taille à lui ; une vidéo cliquée
+//!   ou ouverte n'y joue pas, elle est dite au jeu pour la file d'attente) ;
 //! - `quit`.
 //!
 //! **Options** : `--width`, `--height`, `--cache <dossier de session>`, `--log <journal>`,
@@ -87,6 +90,9 @@ use cef::*;
 /// (v253) En ligne, un clic sur une vidéo du site ne l'ouvre plus : il le dit au jeu
 /// (`__minelib_ordre__{"clic":numéro}`), qui la met dans la file d'attente de l'écran, ou
 /// l'ouvre s'il n'y a rien en cours. L'état dit aussi si la vidéo est finie (`e`).
+/// (v257) Dans la recherche à côté du lecteur (`window.__mlb_cote`, posé avant), une vidéo
+/// cliquée (Shorts compris) ou une page de vidéo ouverte quand même est dite au jeu
+/// (`{"clic":numéro}`) et l'onglet revient en arrière : rien n'y joue.
 const PAGE_JS: &str = r#"(()=>{if(window.__minelib)return;window.__minelib=1;
 const ed=e=>!!e&&(e.isContentEditable||e.tagName==='TEXTAREA'||(e.tagName==='INPUT'&&!/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/i.test(e.type||'')));
 const deep=()=>{let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a;};
@@ -116,7 +122,18 @@ const r=c&&c.closest&&c.closest('ytd-reel-video-renderer');return !!r&&(!!r.quer
 if(gate){window.__mlb_short=()=>{if(ok)return;ok=true;const v=SV();if(v&&v.paused)v.play().catch(()=>{});};
 document.addEventListener('play',e=>{if(attend()&&e.target&&e.target.pause)e.target.pause();},true);
 setInterval(()=>{const v=SV();if(attend()&&v&&!v.paused)v.pause();},250);}
-if(yt&&!window.__mlb_site){
+const num=u=>{try{const x=new URL(u,location.href);const h=x.hostname.toLowerCase();let i='';
+if(h==='youtu.be')i=x.pathname.split('/')[1]||'';
+else if(/(^|\.)youtube\.com$/.test(h)){if(x.pathname==='/watch')i=x.searchParams.get('v')||'';
+else{const m=x.pathname.match(/^\/(live|shorts)\/([^\/?#]+)/);if(m)i=m[2];}}
+return /^[A-Za-z0-9_-]{11}$/.test(i)?i:'';}catch(e){return '';}};
+const ordre=o=>console.log('__minelib_ordre__'+JSON.stringify(o));
+if(yt&&window.__mlb_cote){let dit='';
+document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagName==='A'&&x.href);const i=a&&num(a.href);
+if(i){e.preventDefault();e.stopImmediatePropagation();ordre({clic:i});}},true);
+setInterval(()=>{const i=num(location.href);if(!i){dit='';return;}if(i===dit)return;dit=i;ordre({clic:i});
+if(history.length>1)history.back();else location.replace('https://www.youtube.com/');},250);}
+else if(yt&&!window.__mlb_site){
 const go=(u,r)=>{const l=vid(u);if(l){if(r)location.replace(l);else location.href=l;return true;}return false;};
 document.addEventListener('click',e=>{const a=e.composedPath().find(x=>x&&x.tagName==='A'&&x.href);
 if(a&&vid(a.href)){e.preventDefault();e.stopImmediatePropagation();
@@ -265,6 +282,8 @@ enum Cmd {
     Eval(u32, String),
     /// Images par seconde de l'onglet (1 à 60).
     Fps(u32, i32),
+    /// (v257) L'onglet à ouvrir sera la recherche à côté d'un lecteur, de cette taille.
+    Cote(u32, i32, i32),
     /// (v213) Volume de tous les sons du navigateur, en pour cent (l'onglet est ignoré).
     Volume(i32),
     /// (v213) Page précédente, page suivante (boutons retour et suivant de l'écran).
@@ -301,6 +320,7 @@ fn parse_cmd(line: &str) -> Option<Cmd> {
         "blur" => Cmd::Blur(id),
         "eval" => Cmd::Eval(id, rest.to_string()),
         "fps" => Cmd::Fps(id, num()?),
+        "cote" => Cmd::Cote(id, num()?, num()?),
         "volume" => Cmd::Volume(num()?),
         "back" => Cmd::Back(id),
         "forward" => Cmd::Forward(id),
@@ -477,6 +497,8 @@ wrap_load_handler! {
         scroll: bool,
         // (v246) Solo : le site complet de YouTube, sans le lecteur embarqué.
         site: bool,
+        // (v257) La recherche à côté du lecteur d'un écran.
+        cote: bool,
         out: Shared,
     }
 
@@ -530,6 +552,9 @@ wrap_load_handler! {
                 } else {
                     if self.site {
                         frame.execute_java_script(Some(&CefString::from("window.__mlb_site=1;")), None, 0);
+                    }
+                    if self.cote {
+                        frame.execute_java_script(Some(&CefString::from("window.__mlb_cote=1;")), None, 0);
                     }
                     frame.execute_java_script(Some(&CefString::from(PAGE_JS)), None, 0);
                     if self.scroll {
@@ -1115,14 +1140,23 @@ struct Tab {
 }
 
 impl Tab {
-    fn open(id: u32, url: &str, opts: &Options, filtre: &Arc<Filtre>, out: &Shared) -> Option<Self> {
+    /// `cote` (v257) : la recherche à côté du lecteur d'un écran, de cette taille.
+    fn open(
+        id: u32,
+        url: &str,
+        cote: Option<(i32, i32)>,
+        opts: &Options,
+        filtre: &Arc<Filtre>,
+        out: &Shared,
+    ) -> Option<Self> {
         let painted = Arc::new(AtomicBool::new(false));
-        let painter = Painter::new(id, (opts.width, opts.height), out.clone(), painted);
+        let size = cote.unwrap_or((opts.width, opts.height));
+        let painter = Painter::new(id, size, out.clone(), painted);
         let console = Console::new(id, out.clone(), Arc::new(AtomicBool::new(false)));
         let mut client = TabClient::new(
             painter,
             console,
-            Loader::new(id, opts.scroll, opts.site, out.clone()),
+            Loader::new(id, opts.scroll, opts.site, cote.is_some(), out.clone()),
             Popups::new(id),
             Dialogs::new(),
             Files::new(),
@@ -1148,7 +1182,10 @@ impl Tab {
             return None;
         };
         let host = browser.host()?;
-        eprintln!("onglet {id} : ouvert ({url})");
+        match cote {
+            Some((w, h)) => eprintln!("onglet {id} : ouvert ({url}), recherche à côté ({w} × {h})"),
+            None => eprintln!("onglet {id} : ouvert ({url})"),
+        }
         host.set_focus(1);
         Some(Tab {
             browser,
@@ -1399,6 +1436,8 @@ fn main() {
     volume.start();
     // Boucle de Chromium sur ce fil (le fil « UI » de CEF) : les commandes y sont jouées.
     let mut tabs: HashMap<u32, Tab> = HashMap::new();
+    // (v257) Onglets annoncés comme recherche à côté d'un lecteur, et leur taille.
+    let mut cotes: HashMap<u32, (i32, i32)> = HashMap::new();
     let left = MouseButtonType::from(sys::cef_mouse_button_type_t::MBT_LEFT);
     // (v214) Prochain moment où Chromium veut travailler. Filet : au moins toutes les
     // `FILET` même sans demande (ce que CEF conseille).
@@ -1441,13 +1480,18 @@ fn main() {
                             if let Ok(mut o) = out.0.lock() {
                                 o.fps.insert(id, opts.fps);
                             }
-                            if let Some(t) = Tab::open(id, &url, &opts, &filtre, &out) {
+                            let cote = cotes.get(&id).copied();
+                            if let Some(t) = Tab::open(id, &url, cote, &opts, &filtre, &out) {
                                 tabs.insert(id, t);
                             }
                         }
                     },
                 },
+                Cmd::Cote(id, w, h) => {
+                    cotes.insert(id, (w.clamp(64, 3840), h.clamp(64, 2160)));
+                }
                 Cmd::Close(id) => {
+                    cotes.remove(&id);
                     if let Some(t) = tabs.remove(&id) {
                         t.host.close_browser(1);
                     }
@@ -1563,6 +1607,8 @@ mod tests {
         );
         assert_eq!(parse_cmd("fps 3 60"), Some(Cmd::Fps(3, 60)));
         assert_eq!(parse_cmd("fps 3"), None);
+        assert_eq!(parse_cmd("cote 9 464 720"), Some(Cmd::Cote(9, 464, 720)));
+        assert_eq!(parse_cmd("cote 9 464"), None);
         assert_eq!(
             parse_cmd("open 7 https://www.youtube.com/watch?v=x"),
             Some(Cmd::Open(7, "https://www.youtube.com/watch?v=x".into()))

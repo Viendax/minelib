@@ -207,11 +207,21 @@ fn page_address(json: &str) -> Option<String> {
 }
 
 /// (v243) Une vidéo joue-t-elle dans la page (temps connu, pas en pause) ?
-/// (v253) La page du lecteur montre-t-elle sa file d'attente (`o`) ? `None` : pas dit.
-fn page_panel(json: &str) -> Option<bool> {
+/// (v253) La page du lecteur montre-t-elle sa file d'attente (`o`) et (v257) la recherche à
+/// côté (`r`) ? `None` : pas dit.
+fn page_panel(json: &str) -> Option<(bool, bool)> {
+    let v = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let o = v.get("o")?.as_bool()?;
+    let r = v.get("r").and_then(|r| r.as_bool()).unwrap_or(false);
+    Some((o, r))
+}
+
+/// (v257) Un ordre de la page du lecteur pour la recherche à côté
+/// (`{"recherche":true|false}`) ; `None` : un autre ordre (pour regarder ensemble).
+fn ordre_recherche(json: &str) -> Option<bool> {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()?
-        .get("o")?
+        .get("recherche")?
         .as_bool()
 }
 
@@ -285,6 +295,17 @@ pub fn ray_uv(a: &ScreenAnchor, eye: Vec3, dir: Vec3) -> Option<[f32; 2]> {
     }
     let p = eye + dir * t - c;
     Some([p.dot(r) / a.size[0] + 0.5, 0.5 - p.dot(u) / a.size[1]])
+}
+
+/// (v257) Distance de l'œil au point de l'écran le plus proche (blocs).
+pub fn screen_dist(a: &ScreenAnchor, eye: Vec3) -> f32 {
+    let c = Vec3::from(a.center);
+    let r = Vec3::from(a.right);
+    let u = Vec3::from(a.up);
+    let d = eye - c;
+    let x = d.dot(r).clamp(-a.size[0] * 0.5, a.size[0] * 0.5);
+    let y = d.dot(u).clamp(-a.size[1] * 0.5, a.size[1] * 0.5);
+    (d - r * x - u * y).length()
 }
 
 pub fn aim(a: &ScreenAnchor, eye: Vec3, dir: Vec3, limit: f32) -> Option<(f32, [f32; 2])> {
@@ -527,8 +548,9 @@ pub struct Displays {
     filtre: &'static str,
     /// Pages refusées depuis le dernier `take_blocked` : (écran, raison).
     blocked: Vec<(u32, u8)>,
-    /// (v253) Ordres des pages depuis le dernier `take_orders` : (écran, JSON).
-    orders: Vec<(u32, String)>,
+    /// (v253) Ordres des pages depuis le dernier `take_orders` : (écran, JSON, (v257) venu
+    /// de la recherche à côté).
+    orders: Vec<(u32, String, bool)>,
     /// (v210) Écran regardé (lecture automatique permise, un seul à la fois), et temps
     /// avant de lui redonner l'accord.
     regarde: Option<u32>,
@@ -595,6 +617,9 @@ impl Displays {
         self.browser = None;
         for tab in self.tabs.values_mut() {
             tab.opened = false;
+            if let Some(c) = tab.cote.as_mut() {
+                c.opened = false;
+            }
         }
     }
 
@@ -621,8 +646,9 @@ impl Displays {
         let Some(t) = self.tabs.get(&id) else {
             return ([0.0; 4], [0.0, 0.0, -1.0, 0.0]);
         };
+        let editing = t.editing || t.cote.as_ref().is_some_and(|c| c.editing);
         let cursor = t.cursor.map_or([0.0; 4], |c| {
-            [c[0], c[1], if t.editing { 2.0 } else { 1.0 }, 0.0]
+            [c[0], c[1], if editing { 2.0 } else { 1.0 }, 0.0]
         });
         let ripple = t.ripple.map_or([0.0, 0.0, -1.0, 0.0], |(uv, age)| {
             [uv[0], uv[1], (age / RIPPLE_S).clamp(0.0, 1.0), 0.0]
@@ -654,10 +680,55 @@ impl Displays {
         std::mem::take(&mut self.blocked)
     }
 
-    /// (v253) Les ordres des pages depuis la dernière fois : (écran, JSON) — vidéo cliquée
-    /// sur le site de YouTube, vidéo retirée de la file d'attente (voir `watch::Party::order`).
-    pub fn take_orders(&mut self) -> Vec<(u32, String)> {
+    /// (v253) Les ordres des pages depuis la dernière fois : (écran, JSON, venu de la
+    /// recherche à côté) — vidéo cliquée sur le site de YouTube, vidéo retirée de la file
+    /// d'attente (voir `watch::Party::order`).
+    pub fn take_orders(&mut self) -> Vec<(u32, String, bool)> {
         std::mem::take(&mut self.orders)
+    }
+
+    /// (v257) Ouvre (`on`) ou ferme la recherche à côté du lecteur de l'écran `id` (le bouton
+    /// de la file). Fermée, elle rentre sous la file, puis son onglet est fermé ; rouverte,
+    /// elle revient là où elle en était.
+    pub fn recherche(&mut self, id: u32, on: bool) {
+        let bid = self.cote_bid(id);
+        let Some(tab) = self.tabs.get_mut(&id) else {
+            return;
+        };
+        match tab.cote.as_mut() {
+            Some(c) => {
+                c.voulue = on;
+                c.fermee = 0.0;
+            }
+            None if on => {
+                let url = tab
+                    .cote_url
+                    .clone()
+                    .unwrap_or_else(|| RECHERCHE_VIDEO.to_string());
+                tab.cote = Some(Cote::new(bid, &url));
+            }
+            None => return,
+        }
+        log::info!(
+            "écrans vidéo : écran {id}, recherche à côté {}",
+            if on { "ouverte" } else { "fermée" }
+        );
+    }
+
+    /// (v257) Un numéro d'onglet libre pour la recherche de l'écran `id`.
+    fn cote_bid(&self, id: u32) -> u32 {
+        let pris = |b: u32| {
+            self.tabs.contains_key(&b)
+                || self
+                    .tabs
+                    .iter()
+                    .any(|(i, t)| *i != id && t.cote.as_ref().is_some_and(|c| c.bid == b))
+        };
+        let mut b = id ^ COTE_BID;
+        while pris(b) {
+            b = b.wrapping_add(1);
+        }
+        b
     }
 
     /// Volume du son de tous les écrans (0 à 1). (v213) Il ne touche plus aux pages : le
@@ -691,6 +762,11 @@ impl Displays {
             if let Some(tab) = self.tabs.remove(&id) {
                 if let (true, Some(b)) = (tab.opened, self.browser.as_mut()) {
                     b.send(&format!("close {id}"));
+                }
+                if let (Some(c), Some(b)) = (tab.cote.as_ref(), self.browser.as_mut()) {
+                    if c.opened {
+                        b.send(&format!("close {}", c.bid));
+                    }
                 }
             }
         }
@@ -782,6 +858,27 @@ impl Displays {
                 b.send(&format!("fps {id} {}", tab.want_fps));
                 tab.fps_sent = tab.want_fps;
             }
+            // (v257) La recherche à côté vit avec la page de l'écran (en veille avec elle), à
+            // sa taille ; cachée (la file partie), elle ne se redessine presque plus.
+            if let Some(c) = tab.cote.as_mut() {
+                if tab.opened && !c.opened {
+                    b.send(&format!("cote {} {COTE_W} {PAGE_H}", c.bid));
+                    b.send(&format!("open {} {}", c.bid, c.url));
+                    c.opened = true;
+                    c.fps_sent = FPS_DEFAULT;
+                    c.sent = None;
+                } else if !tab.opened && c.opened {
+                    b.send(&format!("close {}", c.bid));
+                    c.opened = false;
+                    c.editing = false;
+                    c.scroll = 0;
+                }
+                let fps = if tab.panel_open { tab.fps_sent.max(FPS_NEAR) } else { FPS_HIDDEN };
+                if c.opened && fps != c.fps_sent {
+                    b.send(&format!("fps {} {fps}", c.bid));
+                    c.fps_sent = fps;
+                }
+            }
         }
     }
 
@@ -855,9 +952,16 @@ impl Displays {
     /// Le réticule survole le point `uv` de l'écran `id` (`None` : d'aucun écran).
     /// (v243) Où le regard coupe le plan de chaque écran, à toute distance (pour savoir si
     /// le réticule arrive sur un écran par son bord). Les écrans absents : nulle part.
-    pub fn rays(&mut self, rays: &[(u32, Option<[f32; 2]>)]) {
+    /// (v257) Avec, pour chaque écran, la distance de l'œil à son point le plus proche (voir
+    /// [`screen_dist`]) : la file et sa recherche ouverte ne s'en vont qu'en s'éloignant.
+    pub fn rays(&mut self, rays: &[(u32, Option<[f32; 2]>, f32)]) {
         for (id, tab) in self.tabs.iter_mut() {
-            tab.ray = rays.iter().find(|r| r.0 == *id).and_then(|r| r.1);
+            let r = rays.iter().find(|r| r.0 == *id);
+            tab.ray = r.and_then(|r| r.1);
+            let d = r.map_or(f32::MAX, |r| r.2);
+            // Un peu de marge pour repartir : pas de va-et-vient au bord de la portée.
+            let portee = crate::session::REACH + if tab.pres { 1.0 } else { 0.0 };
+            tab.pres = d <= portee;
         }
     }
 
@@ -866,6 +970,16 @@ impl Displays {
             let uv = aim.filter(|a| a.0 == *id).map(|a| a.1);
             if uv != tab.cursor {
                 tab.cursor = uv;
+            }
+            // (v257) Dans la recherche à côté : la souris est à elle.
+            if let Some(q) = uv.and_then(|uv| tab.point_cote(uv)) {
+                if let (Some(c), Some(b)) = (tab.cote.as_mut(), self.browser.as_mut()) {
+                    if c.opened && c.sent != Some(q) {
+                        b.send(&format!("move {} {} {}", c.bid, q.0, q.1));
+                        c.sent = Some(q);
+                    }
+                }
+                continue;
             }
             let Some(p) = uv.map(page_point) else {
                 continue;
@@ -885,6 +999,36 @@ impl Displays {
             return;
         };
         tab.ripple = Some((uv, 0.0));
+        // (v257) Dans la recherche à côté : le clic est à elle, et le clavier ne peut plus
+        // aller qu'à elle (la page du lecteur perd son champ de texte, et inversement).
+        if let Some(q) = tab.point_cote(uv) {
+            tab.appui_cote = true;
+            tab.typing_ok = 0.0;
+            let blur_page = std::mem::take(&mut tab.editing);
+            let Some(c) = tab.cote.as_mut() else { return };
+            c.typing_ok = TYPING_AFTER_CLICK;
+            c.blur_in = None;
+            if let Some(b) = self.browser.as_mut() {
+                if blur_page {
+                    b.send(&format!("blur {id}"));
+                }
+                if c.opened {
+                    b.send(&format!("move {} {} {}", c.bid, q.0, q.1));
+                    b.send(&format!("down {} {} {}", c.bid, q.0, q.1));
+                    c.sent = Some(q);
+                }
+            }
+            return;
+        }
+        tab.appui_cote = false;
+        if let Some(c) = tab.cote.as_mut() {
+            c.typing_ok = 0.0;
+            if std::mem::take(&mut c.editing) {
+                if let Some(b) = self.browser.as_mut() {
+                    b.send(&format!("blur {}", c.bid));
+                }
+            }
+        }
         // (v243) Un clic dans la page : un champ de texte peut prendre le clavier (son focus
         // arrive du navigateur un peu après).
         tab.typing_ok = TYPING_AFTER_CLICK;
@@ -905,6 +1049,15 @@ impl Displays {
         let Some(tab) = self.tabs.get(&id) else {
             return;
         };
+        // (v257) Un appui dans la recherche à côté finit chez elle.
+        if tab.appui_cote {
+            let Some(c) = tab.cote.as_ref() else { return };
+            let q = uv.and_then(|uv| tab.point_cote(uv)).or(c.sent);
+            if let (Some(q), Some(b), true) = (q, self.browser.as_mut(), c.opened) {
+                b.send(&format!("up {} {} {}", c.bid, q.0, q.1));
+            }
+            return;
+        }
         let Some(p) = uv.map(page_point).or(tab.sent) else {
             return;
         };
@@ -916,9 +1069,14 @@ impl Displays {
     /// Molette sur l'écran `id` : fait défiler sa page (`dy` : crans × 120, positif vers
     /// le haut).
     pub fn wheel(&mut self, id: u32, uv: [f32; 2], dy: i32) {
-        let p = page_point(uv);
+        // (v257) Dans la recherche à côté : elle défile.
+        let cote = self.tabs.get(&id).and_then(|t| {
+            let q = t.point_cote(uv)?;
+            Some((t.cote.as_ref()?.bid, q))
+        });
+        let (bid, p) = cote.unwrap_or((id, page_point(uv)));
         if let Some(b) = self.browser.as_mut() {
-            b.send(&format!("wheel {id} {} {} {dy}", p.0, p.1));
+            b.send(&format!("wheel {bid} {} {} {dy}", p.0, p.1));
         }
     }
 
@@ -926,18 +1084,36 @@ impl Displays {
     /// vers le bas ? Sinon la molette reste au jeu (barre d'objets).
     pub fn page_scrolls(&self, id: u32, up: bool) -> bool {
         let bit = if up { 1 } else { 2 };
-        self.browser.is_some() && self.tabs.get(&id).is_some_and(|t| t.scroll & bit != 0)
+        self.browser.is_some()
+            && self.tabs.get(&id).is_some_and(|t| {
+                let cote = t.cursor.and_then(|uv| t.point_cote(uv)).and(t.cote.as_ref());
+                cote.map_or(t.scroll, |c| c.scroll) & bit != 0
+            })
+    }
+
+    /// (v257) Où va le clavier de l'écran `id` : l'onglet de sa recherche à côté si un de
+    /// ses champs de texte l'a, sinon sa page.
+    fn clavier(&self, id: u32) -> u32 {
+        self.tabs
+            .get(&id)
+            .and_then(|t| t.cote.as_ref())
+            .filter(|c| c.opened && c.editing)
+            .map_or(id, |c| c.bid)
     }
 
     /// Un champ de texte de la page de l'écran `id` a-t-il le focus (le clavier y va) ?
     pub fn editing(&self, id: u32) -> bool {
-        self.browser.is_some() && self.tabs.get(&id).is_some_and(|t| t.opened && t.editing)
+        self.browser.is_some()
+            && self.tabs.get(&id).is_some_and(|t| {
+                t.opened && t.editing || t.cote.as_ref().is_some_and(|c| c.opened && c.editing)
+            })
     }
 
-    /// Texte tapé dans le champ de texte de l'écran `id`.
+    /// Texte tapé dans le champ de texte de l'écran `id` (v254 : ou de sa recherche à côté).
     pub fn text(&mut self, id: u32, text: &str) {
+        let to = self.clavier(id);
         if let Some(b) = self.browser.as_mut() {
-            b.send(&format!("text {id} {text}"));
+            b.send(&format!("text {to} {text}"));
         }
     }
 
@@ -949,25 +1125,44 @@ impl Displays {
     /// les résultats), et le champ perd le focus un instant après, une fois la recherche
     /// partie.
     pub fn key(&mut self, id: u32, name: &str) {
+        let to = self.clavier(id);
         if let Some(b) = self.browser.as_mut() {
-            b.send(&format!("key {id} {name}"));
+            b.send(&format!("key {to} {name}"));
         }
         if name == "enter" {
             if let Some(tab) = self.tabs.get_mut(&id) {
-                tab.editing = false;
-                tab.typing_ok = 0.0;
-                tab.blur_in = Some(BLUR_AFTER_ENTER);
+                match tab.cote.as_mut().filter(|c| c.bid == to && to != id) {
+                    Some(c) => {
+                        c.editing = false;
+                        c.typing_ok = 0.0;
+                        c.blur_in = Some(BLUR_AFTER_ENTER);
+                    }
+                    None => {
+                        tab.editing = false;
+                        tab.typing_ok = 0.0;
+                        tab.blur_in = Some(BLUR_AFTER_ENTER);
+                    }
+                }
             }
         }
     }
 
-    /// Le champ de texte de l'écran `id` perd le focus : le clavier revient au jeu.
+    /// Le champ de texte de l'écran `id` (v254 : et de sa recherche à côté) perd le focus :
+    /// le clavier revient au jeu.
     pub fn blur(&mut self, id: u32) {
+        let mut cote = None;
         if let Some(tab) = self.tabs.get_mut(&id) {
             tab.editing = false;
+            if let Some(c) = tab.cote.as_mut().filter(|c| c.opened) {
+                c.editing = false;
+                cote = Some(c.bid);
+            }
         }
         if let Some(b) = self.browser.as_mut() {
             b.send(&format!("blur {id}"));
+            if let Some(bid) = cote {
+                b.send(&format!("blur {bid}"));
+            }
         }
     }
 
@@ -1030,29 +1225,61 @@ impl Displays {
                 }
             }
         }
+        // (v257) La recherche à côté : saisie, perte du focus après Entrée, et fermeture
+        // (son onglet se ferme une fois qu'elle est rentrée sous la file).
+        let mut fermees = Vec::new();
+        for tab in self.tabs.values_mut() {
+            let Some(c) = tab.cote.as_mut() else { continue };
+            c.typing_ok = (c.typing_ok - dt).max(0.0);
+            if let Some(t) = c.blur_in.as_mut() {
+                *t -= dt;
+                if *t <= 0.0 {
+                    c.blur_in = None;
+                    blur.push(c.bid);
+                }
+            }
+            c.fermee = if c.voulue { 0.0 } else { c.fermee + dt };
+            if !c.voulue && c.fermee >= COTE_FERME_S {
+                if c.opened {
+                    fermees.push(c.bid);
+                }
+                tab.cote_url = Some(c.url.clone());
+                tab.cote = None;
+                tab.dirty = true;
+            }
+        }
         for id in blur {
             if let Some(b) = self.browser.as_mut() {
                 b.send(&format!("blur {id}"));
             }
         }
+        for bid in fermees {
+            if let Some(b) = self.browser.as_mut() {
+                b.send(&format!("close {bid}"));
+            }
+        }
         // (v253) La file d'attente du lecteur s'ouvre ou se ferme (la page la fait glisser) ;
-        // redit au plus une fois par seconde à une page qui ne l'a pas encore fait.
+        // redit au plus une fois par seconde à une page qui ne l'a pas encore fait. (v257) Et
+        // la recherche à côté.
         let mut panneaux = Vec::new();
         for (id, tab) in self.tabs.iter_mut() {
             let sur_lecteur = crate::watch::is_player(&tab.addr);
-            if !tab.opened || !sur_lecteur || tab.panel_page == Some(tab.panel_open) {
+            let voulu = (tab.panel_open, tab.cote.as_ref().is_some_and(|c| c.voulue));
+            if !tab.opened || !sur_lecteur || tab.panel_page == Some(voulu) {
                 continue;
             }
-            if tab.panel_sent != Some(tab.panel_open) || tab.panel_ago >= 1.0 {
-                tab.panel_sent = Some(tab.panel_open);
+            if tab.panel_sent != Some(voulu) || tab.panel_ago >= 1.0 {
+                tab.panel_sent = Some(voulu);
                 tab.panel_ago = 0.0;
-                panneaux.push((*id, tab.panel_open));
+                panneaux.push((*id, voulu));
             }
         }
-        for (id, o) in panneaux {
+        for (id, (o, r)) in panneaux {
             self.eval(
                 id,
-                &format!("(()=>{{if(window.__mlb&&window.__mlb.panneau)window.__mlb.panneau({o});}})()"),
+                &format!(
+                    "(()=>{{if(window.__mlb&&window.__mlb.panneau)window.__mlb.panneau({o},{r});}})()"
+                ),
             );
         }
         if self.tabs.is_empty() {
@@ -1071,6 +1298,12 @@ impl Displays {
                     tab.scroll = 0;
                     tab.opened = false;
                     tab.dirty = true;
+                    if let Some(c) = tab.cote.as_mut() {
+                        c.page.clear();
+                        c.editing = false;
+                        c.scroll = 0;
+                        c.opened = false;
+                    }
                 }
                 if code == Some(2) && ran < 10.0 && self.cache + 1 < MAX_CACHES {
                     // Sa session est tenue par un autre navigateur (un autre jeu ouvert) :
@@ -1099,10 +1332,51 @@ impl Displays {
                         tab.page = px;
                         tab.page_size = (w, h);
                         tab.dirty = true;
+                    } else if let Some(tab) = self
+                        .tabs
+                        .values_mut()
+                        .find(|t| t.cote.as_ref().is_some_and(|c| c.bid == id))
+                    {
+                        // (v257) La recherche à côté : recollée dans l'image de l'écran.
+                        if let Some(c) = tab.cote.as_mut() {
+                            c.page = px;
+                            c.page_size = (w, h);
+                        }
+                        tab.dirty = true;
                     }
                 }
+                let mut recherches = Vec::new();
                 for (id, ev) in events {
                     let Some(tab) = self.tabs.get_mut(&id) else {
+                        // (v257) Un évènement de la recherche à côté d'un écran.
+                        let Some((sid, tab)) = self
+                            .tabs
+                            .iter_mut()
+                            .find(|(_, t)| t.cote.as_ref().is_some_and(|c| c.bid == id))
+                        else {
+                            continue;
+                        };
+                        let Some(c) = tab.cote.as_mut() else { continue };
+                        match ev {
+                            Event::Editing(on) => c.editing = on && c.typing_ok > 0.0,
+                            Event::State(st) => {
+                                let u = page_address(&st).unwrap_or_default();
+                                if crate::watch::is_player(&u) {
+                                    // Une vidéo ouverte là malgré tout (le lecteur) : dans la
+                                    // file, et la recherche revient où elle en était.
+                                    if let Some(v) = crate::watch::video_of(&u) {
+                                        self.orders.push((*sid, format!(r#"{{"clic":"{v}"}}"#), true));
+                                    }
+                                    b.send(&format!("open {id} {}", c.url));
+                                } else if !u.is_empty() {
+                                    c.url = u;
+                                }
+                            }
+                            Event::Scroll(f) => c.scroll = f,
+                            Event::History(_) => {}
+                            Event::Blocked(raison) => self.blocked.push((*sid, raison)),
+                            Event::Ordre(o) => self.orders.push((*sid, o, true)),
+                        }
                         continue;
                     };
                     match ev {
@@ -1119,8 +1393,15 @@ impl Displays {
                         Event::Scroll(f) => tab.scroll = f,
                         Event::History(h) => tab.history = h,
                         Event::Blocked(raison) => self.blocked.push((id, raison)),
-                        Event::Ordre(o) => self.orders.push((id, o)),
+                        // (v257) Le bouton de la file : la recherche à côté, ici même.
+                        Event::Ordre(o) => match ordre_recherche(&o) {
+                            Some(on) => recherches.push((id, on)),
+                            None => self.orders.push((id, o, false)),
+                        },
                     }
+                }
+                for (id, on) in recherches {
+                    self.recherche(id, on);
                 }
             }
         }
@@ -1227,6 +1508,14 @@ const PANNEAU_U: f32 = 1.0 - 352.0 / 1280.0;
 /// (v253) Un peu de marge avant de la refermer en allant vers la vidéo.
 const PANNEAU_MARGE: f32 = 0.02;
 
+/// (v257) La recherche à côté du lecteur : largeur de son onglet (pixels de page ; la
+/// largeur du trou de `lecteur.html`), et temps qu'il reste ouvert après « Fermer la
+/// recherche », le temps qu'elle rentre sous la file.
+const COTE_W: u32 = 464;
+const COTE_FERME_S: f32 = 0.5;
+/// (v257) Numéro de l'onglet de recherche d'un écran : celui de l'écran mêlé à ceci.
+const COTE_BID: u32 = 0x5EA2_C4E5;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Panneau {
     /// Entré par le bord droit, sur la zone de la file, et pas reparti ailleurs depuis.
@@ -1236,9 +1525,22 @@ struct Panneau {
 }
 
 impl Panneau {
-    /// La file doit-elle être ouverte ?
-    fn target(&mut self, cursor: Option<[f32; 2]>, ray: Option<[f32; 2]>) -> bool {
+    /// La file doit-elle être ouverte ? (v257) `etendu` : la recherche est ouverte à côté
+    /// (demande du joueur) : l'écran entier est à elle, et ni regarder la vidéo ni regarder
+    /// ailleurs ne referme rien ; seul s'éloigner (`pres` faux : hors de portée de main) fait
+    /// tout glisser vers la droite, et se rapprocher le rouvre tel quel. Fermer la recherche
+    /// remet les règles de la file seule (glisser sur la vidéo la referme).
+    fn target(
+        &mut self,
+        cursor: Option<[f32; 2]>,
+        ray: Option<[f32; 2]>,
+        etendu: bool,
+        pres: bool,
+    ) -> bool {
         let prev = std::mem::replace(&mut self.prev, ray);
+        if etendu && self.armed {
+            return pres;
+        }
         let Some(p) = ray.filter(|p| on_screen(*p)) else {
             self.armed = false;
             return false;
@@ -1254,6 +1556,124 @@ impl Panneau {
             return false;
         }
         true
+    }
+}
+
+/// (v257) La recherche de YouTube à côté du lecteur d'un écran (demande du joueur) : un
+/// deuxième onglet du navigateur, à elle (`COTE_W` × `PAGE_H`), que le jeu colle dans le
+/// trou que la page du lecteur ouvre entre la vidéo et la file (voir `balise`). Pour soi
+/// seul : rien n'en part aux autres joueurs, sauf les vidéos qu'on y clique (dans la file).
+struct Cote {
+    /// Numéro de son onglet dans le navigateur.
+    bid: u32,
+    /// Voulue ouverte (« Fermer la recherche » la met à faux), et depuis quand elle ne
+    /// l'est plus.
+    voulue: bool,
+    fermee: f32,
+    /// Adresse où elle en est (rouverte là), telle que la page la dit.
+    url: String,
+    /// Dernière image de son onglet (BGRA) et sa taille ; vide tant qu'il n'y en a pas.
+    page: Vec<u8>,
+    page_size: (u32, u32),
+    /// Onglet ouvert dans le navigateur, et images par seconde demandées.
+    opened: bool,
+    fps_sent: i32,
+    /// Dernier point envoyé au navigateur.
+    sent: Option<(i32, i32)>,
+    /// Comme pour la page de l'écran : champ de texte actif, saisie permise après un clic,
+    /// perte du focus après Entrée, défilement sous la souris.
+    editing: bool,
+    typing_ok: f32,
+    blur_in: Option<f32>,
+    scroll: u8,
+}
+
+impl Cote {
+    fn new(bid: u32, url: &str) -> Self {
+        Self {
+            bid,
+            voulue: true,
+            fermee: 0.0,
+            url: url.to_string(),
+            page: Vec::new(),
+            page_size: (0, 0),
+            opened: false,
+            fps_sent: 0,
+            sent: None,
+            editing: false,
+            typing_ok: 0.0,
+            blur_in: None,
+            scroll: 0,
+        }
+    }
+}
+
+/// (v257) Le trou de la recherche dans une image de la page du lecteur : sa première ligne
+/// est magenta et la deuxième cyan (`lecteur.html`). Rend ses colonnes `[x0, x1)`, la plus
+/// longue suite où les deux lignes y sont. Lu dans chaque image, le trou est toujours au
+/// bon endroit, même en plein glissement (la page et le jeu n'ont pas à s'accorder sur le
+/// temps).
+fn balise(px: &[u8], w: usize, h: usize) -> Option<(usize, usize)> {
+    if w == 0 || h < 3 || px.len() < w * h * 4 {
+        return None;
+    }
+    // BGRA.
+    let magenta = |x: usize| {
+        let p = &px[x * 4..x * 4 + 3];
+        p[0] >= 200 && p[1] <= 60 && p[2] >= 200
+    };
+    let cyan = |x: usize| {
+        let p = &px[(w + x) * 4..(w + x) * 4 + 3];
+        p[0] >= 200 && p[1] >= 200 && p[2] <= 60
+    };
+    let mut best: Option<(usize, usize)> = None;
+    let mut x = 0;
+    while x < w {
+        if !(magenta(x) && cyan(x)) {
+            x += 1;
+            continue;
+        }
+        let x0 = x;
+        while x < w && magenta(x) && cyan(x) {
+            x += 1;
+        }
+        if best.is_none_or(|(a, b)| x - x0 > b - a) {
+            best = Some((x0, x));
+        }
+    }
+    best.filter(|(a, b)| b - a >= 2)
+}
+
+/// (v257) Colle l'image `src` (`sw` × `sh`) dans les colonnes `[x0, x1)` de `dst` (`w` ×
+/// `h`), son bord gauche contre `x0` (la recherche sort de sous la file en glissant : on en
+/// voit d'abord la gauche). À la même échelle en hauteur ; ce qui dépasse de `src` est
+/// sombre.
+fn incruste(dst: &mut [u8], w: usize, h: usize, x0: usize, x1: usize, src: &[u8], sw: usize, sh: usize) {
+    let x1 = x1.min(w);
+    if x0 >= x1 || sw == 0 || sh == 0 || src.len() < sw * sh * 4 || dst.len() < w * h * 4 {
+        return;
+    }
+    const SOMBRE: [u8; 4] = [15, 15, 15, 255];
+    for y in 0..h {
+        let sy = (y * sh / h).min(sh - 1);
+        let ligne = &mut dst[(y * w + x0) * 4..(y * w + x1) * 4];
+        if sh == h {
+            let n = (x1 - x0).min(sw);
+            ligne[..n * 4].copy_from_slice(&src[sy * sw * 4..(sy * sw + n) * 4]);
+            for p in ligne[n * 4..].chunks_exact_mut(4) {
+                p.copy_from_slice(&SOMBRE);
+            }
+        } else {
+            for (i, p) in ligne.chunks_exact_mut(4).enumerate() {
+                let sx = i * sh / h;
+                if sx < sw {
+                    let k = (sy * sw + sx) * 4;
+                    p.copy_from_slice(&src[k..k + 4]);
+                } else {
+                    p.copy_from_slice(&SOMBRE);
+                }
+            }
+        }
     }
 }
 
@@ -1333,6 +1753,8 @@ struct Tab {
     cursor: Option<[f32; 2]>,
     /// (v243) Où le regard coupe le plan de l'écran, à toute distance (voir `Corner`).
     ray: Option<[f32; 2]>,
+    /// (v257) L'œil est à portée de main de l'écran (avec une marge pour repartir).
+    pres: bool,
     sent: Option<(i32, i32)>,
     /// Dernier appui : point et âge (secondes).
     ripple: Option<([f32; 2], f32)>,
@@ -1358,9 +1780,18 @@ struct Tab {
     /// dit montrer, dernier ordre envoyé et depuis quand.
     panneau: Panneau,
     panel_open: bool,
-    panel_page: Option<bool>,
-    panel_sent: Option<bool>,
+    panel_page: Option<(bool, bool)>,
+    panel_sent: Option<(bool, bool)>,
     panel_ago: f32,
+    /// (v257) La recherche à côté, si elle est ouverte (ou en train de rentrer), et où elle
+    /// en était quand elle a été fermée (rouverte là).
+    cote: Option<Cote>,
+    cote_url: Option<String>,
+    /// (v257) Le trou de la recherche dans l'image affichée : colonnes `[x0, x1)` en pixels
+    /// de page (le curseur y va à la recherche).
+    trou: Option<(i32, i32)>,
+    /// (v257) Le dernier appui est allé à la recherche.
+    appui_cote: bool,
     /// (v213) Il y a une page précédente (1), une page suivante (2) : sans elles, les
     /// boutons retour et suivant sont grisés et ne font rien.
     history: u8,
@@ -1396,6 +1827,7 @@ impl Tab {
             paused: false,
             cursor: None,
             ray: None,
+            pres: false,
             sent: None,
             ripple: None,
             editing: false,
@@ -1410,6 +1842,10 @@ impl Tab {
             panel_page: None,
             panel_sent: None,
             panel_ago: 0.0,
+            cote: None,
+            cote_url: None,
+            trou: None,
+            appui_cote: false,
             history: 0,
             want_awake: true,
             want_fps: FPS_DEFAULT,
@@ -1429,8 +1865,10 @@ impl Tab {
         // quand on arrive par le bord de l'écran, dans leur coin (voir `Corner`) ; (v211)
         // chacun le sien, et sur toutes les pages, le lecteur YouTube compris.
         let vers = self.corner.target(self.cursor, self.ray);
-        // (v253) La file d'attente, sur le lecteur seulement.
-        self.panel_open = self.panneau.target(self.cursor, self.ray)
+        // (v253) La file d'attente, sur le lecteur seulement. (v257) Avec la recherche à côté,
+        // tout l'écran la garde ouverte.
+        let etendu = self.cote.as_ref().is_some_and(|c| c.voulue);
+        self.panel_open = self.panneau.target(self.cursor, self.ray, etendu, self.pres)
             && crate::watch::is_player(&self.addr);
         self.panel_ago += dt;
         let pas = dt / if vers > self.reveal { PARAIT } else { SEN_VA };
@@ -1471,6 +1909,11 @@ impl Tab {
             self.size = self.page_size;
             self.pixels.clear();
             self.pixels.extend_from_slice(&self.page);
+            if crate::watch::is_player(&self.addr) {
+                self.incruster();
+            } else {
+                self.trou = None;
+            }
             if asleep {
                 // En veille : sa dernière image, assombrie.
                 for px in self.pixels.chunks_exact_mut(4) {
@@ -1484,6 +1927,67 @@ impl Tab {
         // shader, au-dessus des boutons (voir `Displays::marks`).
         self.dirty = false;
         self.version += 1;
+    }
+
+    /// (v257) Colle la recherche à côté dans le trou de la page du lecteur, s'il y en a un.
+    /// Sans image d'elle encore, le trou de la page reste (« Chargement… »), sans sa balise.
+    fn incruster(&mut self) {
+        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+        self.trou = None;
+        let Some((x0, x1)) = balise(&self.pixels, w, h) else {
+            return;
+        };
+        // La balise effacée : les deux premières lignes du trou, et une colonne de chaque
+        // côté (un bord adouci peut en garder un peu), prennent la couleur de la troisième.
+        let efface = |px: &mut [u8], x: usize| {
+            for y in 0..2 {
+                let (a, b) = ((y * w + x) * 4, (2 * w + x) * 4);
+                let c: [u8; 4] = [px[b], px[b + 1], px[b + 2], px[b + 3]];
+                px[a..a + 4].copy_from_slice(&c);
+            }
+        };
+        for x in [x0.checked_sub(1), Some(x1)].into_iter().flatten().filter(|&x| x < w) {
+            efface(&mut self.pixels, x);
+        }
+        match self.cote.as_ref().filter(|c| !c.page.is_empty()) {
+            Some(c) => incruste(
+                &mut self.pixels,
+                w,
+                h,
+                x0,
+                x1,
+                &c.page,
+                c.page_size.0 as usize,
+                c.page_size.1 as usize,
+            ),
+            None => {
+                for x in x0..x1 {
+                    efface(&mut self.pixels, x);
+                }
+            }
+        }
+        let k = PAGE_W as f32 / w as f32;
+        self.trou = Some(((x0 as f32 * k) as i32, (x1 as f32 * k).ceil() as i32));
+    }
+
+    /// (v257) Le point `uv` de l'écran tombe-t-il dans la recherche à côté ? Son point dans
+    /// la page de la recherche.
+    fn point_cote(&self, uv: [f32; 2]) -> Option<(i32, i32)> {
+        let c = self.cote.as_ref()?;
+        let (x0, x1) = self.trou?;
+        let (x, y) = page_point(uv);
+        if x < x0 || x >= x1 {
+            return None;
+        }
+        let (sw, sh) = if c.page_size.1 > 0 {
+            c.page_size
+        } else {
+            (COTE_W, PAGE_H)
+        };
+        let k = sh as f32 / PAGE_H as f32;
+        let sx = (((x - x0) as f32 * k) as i32).min(sw as i32 - 1);
+        let sy = ((y as f32 * k) as i32).min(sh as i32 - 1);
+        Some((sx, sy))
     }
 
     /// Écran en veille sans image : fond sombre et deux barres « pause ».
@@ -2349,29 +2853,145 @@ mod tests {
         let mut p = Panneau::default();
         let z = [0.9, 0.4];
         // Le regard arrive de la droite.
-        assert!(!p.target(None, Some([1.1, 0.4])));
-        assert!(p.target(Some(z), Some(z)));
-        assert!(p.target(Some([0.8, 0.6]), Some([0.8, 0.6])));
+        assert!(!p.target(None, Some([1.1, 0.4]), false, true));
+        assert!(p.target(Some(z), Some(z), false, true));
+        assert!(p.target(Some([0.8, 0.6]), Some([0.8, 0.6]), false, true));
         // Hors de portée : fermée, mais elle revient en se rapprochant.
-        assert!(!p.target(None, Some(z)));
-        assert!(p.target(Some(z), Some(z)));
+        assert!(!p.target(None, Some(z), false, true));
+        assert!(p.target(Some(z), Some(z), false, true));
         // Le regard va sur la vidéo : fermée, et revenir sur la zone ne la rouvre pas.
-        assert!(!p.target(Some([0.5, 0.4]), Some([0.5, 0.4])));
-        assert!(!p.target(Some(z), Some(z)));
+        assert!(!p.target(Some([0.5, 0.4]), Some([0.5, 0.4]), false, true));
+        assert!(!p.target(Some(z), Some(z), false, true));
         // Ressortir à droite puis revenir : rouverte.
-        assert!(!p.target(None, Some([1.05, 0.4])));
-        assert!(p.target(Some(z), Some(z)));
+        assert!(!p.target(None, Some([1.05, 0.4]), false, true));
+        assert!(p.target(Some(z), Some(z), false, true));
         // Regard déjà sur l'écran, ou entrée par le haut : non.
         let mut p = Panneau::default();
-        assert!(!p.target(None, Some(z)));
-        assert!(!p.target(Some(z), Some(z)));
+        assert!(!p.target(None, Some(z), false, true));
+        assert!(!p.target(Some(z), Some(z), false, true));
         let mut p = Panneau::default();
-        p.target(None, Some([0.9, -0.1]));
-        assert!(!p.target(Some(z), Some(z)));
+        p.target(None, Some([0.9, -0.1]), false, true);
+        assert!(!p.target(Some(z), Some(z), false, true));
         // Par le bord droit mais à hauteur de la vidéo (pas dans la zone) : non plus.
         let mut p = Panneau::default();
-        p.target(None, Some([1.1, 0.4]));
-        assert!(!p.target(Some([0.6, 0.4]), Some([0.6, 0.4])));
+        p.target(None, Some([1.1, 0.4]), false, true);
+        assert!(!p.target(Some([0.6, 0.4]), Some([0.6, 0.4]), false, true));
+    }
+
+    /// (v257) Avec la recherche ouverte à côté, regarder la vidéo ou ailleurs ne referme
+    /// rien : seulement s'éloigner (tout revient en se rapprochant), ou fermer la recherche
+    /// puis glisser sur la vidéo.
+    #[test]
+    fn avec_la_recherche_tout_l_ecran_garde_la_file() {
+        let mut p = Panneau::default();
+        let z = [0.9, 0.4];
+        let v = [0.2, 0.5];
+        p.target(None, Some([1.1, 0.4]), false, true);
+        assert!(p.target(Some(z), Some(z), false, true));
+        // La recherche ouverte : la vidéo, ou ailleurs que l'écran, ne referment rien.
+        assert!(p.target(Some(v), Some(v), true, true), "la vidéo, à gauche");
+        assert!(p.target(None, Some([-0.3, 0.5]), true, true), "regard ailleurs");
+        assert!(p.target(None, None, true, true), "dos tourné");
+        // S'éloigner : tout part ; se rapprocher : tout revient, même sans viser l'écran.
+        assert!(!p.target(None, None, true, false), "loin");
+        assert!(p.target(None, None, true, true), "revenu");
+        // On revient sur la file et on ferme la recherche : la file seule, que glisser sur
+        // la vidéo referme.
+        assert!(p.target(Some(z), Some(z), true, true));
+        assert!(p.target(Some(z), Some(z), false, true));
+        assert!(!p.target(Some(v), Some(v), false, true));
+        assert!(!p.target(Some(z), Some(z), false, true), "il faut revenir par le bord");
+    }
+
+    /// (v257) Le trou de la recherche se lit dans l'image du lecteur (ligne magenta puis
+    /// ligne cyan) et la recherche y est collée par son bord gauche ; la balise disparaît.
+    #[test]
+    fn la_recherche_se_colle_dans_le_trou_de_la_page() {
+        let (w, h) = (40usize, 6usize);
+        let mut px = vec![0u8; w * h * 4];
+        let set = |px: &mut Vec<u8>, x: usize, y: usize, c: [u8; 4]| {
+            px[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&c)
+        };
+        for x in 10..22 {
+            set(&mut px, x, 0, [255, 0, 255, 255]);
+            set(&mut px, x, 1, [255, 255, 0, 255]);
+        }
+        // Un peu de magenta seul ailleurs (une vidéo) : pas un trou.
+        for x in 30..38 {
+            set(&mut px, x, 0, [255, 0, 255, 255]);
+        }
+        assert_eq!(balise(&px, w, h), Some((10, 22)));
+        let mut t = Tab::new(&crate::watch::watch_url("dQw4w9WgXcQ", 0.0));
+        t.addr = t.url.clone();
+        t.page = px;
+        t.page_size = (w as u32, h as u32);
+        let mut c = Cote::new(9, RECHERCHE_VIDEO);
+        c.page = vec![7u8; 8 * h * 4];
+        c.page_size = (8, h as u32);
+        t.cote = Some(c);
+        t.draw();
+        let at = |t: &Tab, x: usize, y: usize| t.pixels[(y * w + x) * 4];
+        assert_eq!(at(&t, 10, 0), 7, "la recherche, collée par la gauche");
+        assert_eq!(at(&t, 17, 3), 7);
+        assert_eq!(at(&t, 19, 3), 15, "au-delà de son image : sombre");
+        assert_eq!(at(&t, 9, 3), 0, "la vidéo, à gauche, intacte");
+        assert_eq!(balise(&t.pixels, w, h), None, "plus de balise");
+        let k = PAGE_W as f32 / w as f32;
+        assert_eq!(t.trou, Some(((10.0 * k) as i32, (22.0 * k).ceil() as i32)));
+        // Le curseur dans le trou va à la recherche, à son point à elle.
+        assert!(t.point_cote([0.1, 0.5]).is_none());
+        let q = t.point_cote([12.5 / w as f32, 0.5]).unwrap();
+        assert_eq!(q.0, ((12.5 / w as f32 * PAGE_W as f32) as i32 - (10.0 * k) as i32) * h as i32 / PAGE_H as i32);
+        // Sans image de la recherche : le trou de la page reste, sans sa balise.
+        t.cote.as_mut().unwrap().page.clear();
+        t.draw();
+        assert_eq!(balise(&t.pixels, w, h), None);
+        assert_eq!(at(&t, 12, 0), 0);
+    }
+
+    /// (v257) Le bouton de la file ouvre la recherche à côté (un onglet à elle) ; un clic et
+    /// le clavier y vont quand le curseur est dans son trou ; une vidéo cliquée là est un
+    /// ordre de la recherche ; « Fermer la recherche » la fait rentrer puis ferme son onglet.
+    #[test]
+    fn la_recherche_a_cote_s_ouvre_prend_le_clic_et_se_ferme() {
+        let mut d = Displays::new();
+        let url = crate::watch::watch_url("dQw4w9WgXcQ", 0.0);
+        let mut t = Tab::new(&url);
+        t.addr = url;
+        d.tabs.insert(1, t);
+        d.recherche(1, true);
+        let bid = d.tabs[&1].cote.as_ref().unwrap().bid;
+        assert_ne!(bid, 1);
+        let t = d.tabs.get_mut(&1).unwrap();
+        t.trou = Some((464, 928));
+        t.cote.as_mut().unwrap().opened = true;
+        // Clic dans le trou : à la recherche, qui peut prendre le clavier.
+        d.press(1, [0.5, 0.5]);
+        let t = &d.tabs[&1];
+        assert!(t.appui_cote && t.cote.as_ref().unwrap().typing_ok > 0.0 && t.typing_ok == 0.0);
+        d.tabs.get_mut(&1).unwrap().cote.as_mut().unwrap().editing = true;
+        assert_eq!(d.clavier(1), bid, "le clavier va à la recherche");
+        d.key(1, "enter");
+        let c = d.tabs[&1].cote.as_ref().unwrap();
+        assert!(!c.editing && c.blur_in.is_some());
+        assert_eq!(d.clavier(1), 1);
+        // Clic sur la vidéo : à la page.
+        d.press(1, [0.1, 0.5]);
+        assert!(!d.tabs[&1].appui_cote && d.tabs[&1].typing_ok > 0.0);
+        assert_eq!(d.clavier(1), 1);
+        // Fermée : elle rentre, puis son onglet est fermé ; rouverte là où elle en était.
+        d.tabs.get_mut(&1).unwrap().cote.as_mut().unwrap().url = "https://www.youtube.com/results?search_query=x".into();
+        d.recherche(1, false);
+        d.update(0.2);
+        assert!(d.tabs[&1].cote.is_some());
+        d.update(COTE_FERME_S);
+        assert!(d.tabs[&1].cote.is_none());
+        d.recherche(1, true);
+        assert_eq!(d.tabs[&1].cote.as_ref().unwrap().url, "https://www.youtube.com/results?search_query=x");
+        assert_eq!(ordre_recherche(r#"{"recherche":true}"#), Some(true));
+        assert_eq!(ordre_recherche(r#"{"clic":"dQw4w9WgXcQ"}"#), None);
+        assert_eq!(page_panel(r#"{"o":true,"r":true}"#), Some((true, true)));
+        assert_eq!(page_panel(r#"{"o":true}"#), Some((true, false)));
     }
 
     /// (v243) Entrée rend le clavier au jeu tout de suite, et le champ perd le focus un

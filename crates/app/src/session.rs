@@ -2481,10 +2481,15 @@ impl Session {
         {
             let eye = self.player.eye();
             let dir = self.player.look_dir();
-            let rays: Vec<(u32, Option<[f32; 2]>)> = self
+            // (v257) Et la distance à chacun : la file d'un écran et sa recherche ouverte ne
+            // s'en vont qu'en s'éloignant.
+            let rays: Vec<(u32, Option<[f32; 2]>, f32)> = self
                 .shown
                 .iter()
-                .map(|(s, _)| (s.id(), crate::screen::ray_uv(&s.anchor(), eye, dir)))
+                .map(|(s, _)| {
+                    let a = s.anchor();
+                    (s.id(), crate::screen::ray_uv(&a, eye, dir), crate::screen::screen_dist(&a, eye))
+                })
                 .collect();
             self.displays.rays(&rays);
         }
@@ -2530,9 +2535,9 @@ impl Session {
         let orders = self.displays.take_orders();
         let Some(b) = &self.build else {
             // (v253) Sans regarder ensemble, une vidéo cliquée s'ouvre, tout simplement.
-            for (id, json) in orders {
+            for (id, json, cote) in orders {
                 if let Some(crate::watch::Act::Open(id, url)) =
-                    crate::watch::Party::new().order(id, &json, "")
+                    crate::watch::Party::new().order(id, &json, "", cote)
                 {
                     self.displays.open(id, &url);
                 }
@@ -2540,9 +2545,10 @@ impl Session {
             return;
         };
         let me = b.pseudo().to_string();
-        // (v253) Ordres des pages : vidéo cliquée (file d'attente), vidéo retirée.
-        for (id, json) in orders {
-            match self.party.order(id, &json, &me) {
+        // (v253) Ordres des pages : vidéo cliquée (file d'attente), vidéo retirée. (v257) Une
+        // vidéo cliquée dans la recherche à côté du lecteur va dans la file sans rien rouvrir.
+        for (id, json, cote) in orders {
+            match self.party.order(id, &json, &me, cote) {
                 Some(crate::watch::Act::Open(id, url)) => {
                     self.displays.open(id, &url);
                 }
