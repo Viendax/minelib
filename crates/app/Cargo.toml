@@ -15,7 +15,8 @@ log.workspace = true
 glam.workspace = true
 winit.workspace = true
 flate2 = "1"
-image.workspace = true
+# (v261) JPEG : images de secours du navigateur Edge.
+image = { workspace = true, features = ["jpeg"] }
 # Presse-papier (image de la dernière capture d'écran).
 # Sons (tir, rechargement, lunette) : sortie audio et décodage Ogg Vorbis.
 cpal = "0.15"
@@ -34,6 +35,42 @@ qrcode = { version = "0.14", default-features = false }
 # Fenêtre « Ouvrir » de Windows pour choisir un skin (MIT).
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
+# (v261) Le navigateur des écrans : Edge (WebView2, déjà dans Windows 10 et 11), dans ce
+# même programme (`minelib.exe --navigateur-edge`). Liaisons COM de WebView2 (MIT) et API
+# de Windows : composition, capture des images, Direct3D 11, son.
+webview2-com = "0.39"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "System",
+    "UI_Composition",
+    "UI_Composition_Desktop",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+windows-numerics = "0.3"
 
 [build-dependencies]
 embed-resource = "3"

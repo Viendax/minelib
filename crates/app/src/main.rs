@@ -79,6 +79,7 @@ mod cs;
 mod daytime;
 mod debug;
 mod drops;
+mod edge;
 mod equip;
 mod filtres;
 mod navigateur;
@@ -4698,6 +4699,13 @@ pub static NvOptimusEnablement: u32 = 1;
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 
 fn main() -> anyhow::Result<()> {
+    // (v261) Le navigateur des écrans (Edge), lancé par le jeu : rien d'autre du jeu.
+    {
+        let mut args = std::env::args();
+        if args.nth(1).is_some_and(|a| a == edge::ARG) {
+            std::process::exit(edge::main(args.collect()));
+        }
+    }
     // Version annoncée au relais (parties FPS entre jeux de la même version).
     minelib_net::client::GAME_VERSION.store(update::VERSION, std::sync::atomic::Ordering::Relaxed);
     // Essais : MINELIB_FUSION=0, pas de fusion des faces voisines (voir `mesh::merge_flat_faces`).

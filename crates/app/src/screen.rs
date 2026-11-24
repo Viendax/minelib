@@ -892,12 +892,21 @@ impl Displays {
         {
             return;
         }
-        // (v247) Le navigateur des écrans s'installe ou se met à jour tout seul (voir
-        // `navigateur`) ; en attendant, les écrans gardent leur mire.
-        let dossier = minelib_assets::data_dir().join("cef");
-        if crate::navigateur::lancer(dossier, crate::update::VERSION) == crate::navigateur::Etat::EnCours {
-            self.retry_in = 1.0;
-            return;
+        // (v247) Le navigateur des écrans s'installait ou se mettait à jour tout seul (voir
+        // `navigateur`). (v261) Sous Windows, c'est Edge (WebView2), dans ce programme :
+        // rien à télécharger ; seul WebView2 peut manquer (installé par Microsoft, en
+        // attendant les écrans gardent leur mire).
+        if cfg!(windows) {
+            if crate::navigateur::webview2_en_cours() {
+                self.retry_in = 1.0;
+                return;
+            }
+        } else {
+            let dossier = minelib_assets::data_dir().join("cef");
+            if crate::navigateur::lancer(dossier, crate::update::VERSION) == crate::navigateur::Etat::EnCours {
+                self.retry_in = 1.0;
+                return;
+            }
         }
         match Browser::start(self.cache, self.filtre, self.volume) {
             Err(Launch::Absent) => {
@@ -1305,7 +1314,16 @@ impl Displays {
                         c.opened = false;
                     }
                 }
-                if code == Some(2) && ran < 10.0 && self.cache + 1 < MAX_CACHES {
+                if code == Some(crate::edge::SANS_WEBVIEW2) {
+                    // (v261) Edge WebView2 manque sur ce PC : son installateur officiel, et
+                    // un nouvel essai une fois installé.
+                    log::warn!("écrans vidéo : Edge WebView2 n'est pas installé");
+                    if crate::navigateur::installer_webview2() {
+                        self.retry_in = 2.0;
+                    } else {
+                        self.failed();
+                    }
+                } else if code == Some(2) && ran < 10.0 && self.cache + 1 < MAX_CACHES {
                     // Sa session est tenue par un autre navigateur (un autre jeu ouvert) :
                     // on en prend une autre, tout de suite.
                     self.cache += 1;
@@ -2140,8 +2158,13 @@ enum Launch {
 }
 
 impl Browser {
-    /// Programme du navigateur : dossier `cef` à côté du jeu, sinon dans ses données.
+    /// Programme du navigateur : (v261) sous Windows, ce programme même (Edge, lancé avec
+    /// `--navigateur-edge`) ; ailleurs, l'ancien navigateur Chromium, dossier `cef` à côté
+    /// du jeu, sinon dans ses données.
     fn find() -> Option<std::path::PathBuf> {
+        if cfg!(windows) {
+            return std::env::current_exe().ok();
+        }
         let name = if cfg!(windows) {
             "minelib-browser.exe"
         } else {
@@ -2172,7 +2195,8 @@ impl Browser {
         // joueur a son navigateur, et « regarder ensemble » ne partage qu'un numéro de
         // vidéo ; le compte (et le Premium) ne sert qu'à celui à qui il est.
         let en_ligne = filtre == "en_ligne";
-        let base = "cef-cache";
+        // (v261) La session d'Edge, à part de celle de l'ancien Chromium.
+        let base = if cfg!(windows) { "ecrans-edge" } else { "cef-cache" };
         let session = match cache {
             0 => base.to_string(),
             n => format!("{base}-{}", n + 1),
@@ -2195,6 +2219,10 @@ impl Browser {
             })
             .unwrap_or_else(|_| Stdio::null());
         let mut cmd = Command::new(&exe);
+        // (v261) Le jeu lui-même, en navigateur des écrans (Edge).
+        if cfg!(windows) {
+            cmd.arg(crate::edge::ARG);
+        }
         cmd.arg("--width")
             .arg(PAGE_W.to_string())
             .arg("--height")

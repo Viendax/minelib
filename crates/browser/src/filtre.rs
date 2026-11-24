@@ -88,8 +88,12 @@ pub enum Refus {
     Noire = 4,
     /// (v208) Une page de connexion à un compte, en ligne.
     Compte = 5,
-    /// (v243) Twitch ou Vimeo : leurs vidéos ne se lisent pas dans ce navigateur.
+    /// (v243) Twitch ou Vimeo : leurs vidéos ne se lisaient pas dans Chromium (plus
+    /// utilisé depuis la v260 : Edge les lit).
     Lecture = 6,
+    /// (v261) Refusé par le DNS familial de Cloudflare (adultes, logiciels malveillants),
+    /// que le navigateur Edge interroge lui-même.
+    Famille = 7,
 }
 
 impl Refus {
@@ -104,6 +108,7 @@ impl Refus {
                 "Twitch et Vimeo ne se lisent pas sur les écrans (leurs vidéos demandent des \
                  codecs que le navigateur n'a pas)"
             }
+            Refus::Famille => "site pour adultes ou dangereux",
         }
     }
 }
@@ -145,8 +150,10 @@ const UT1_ENFANTS: &str = include_str!("ut1_enfants.txt");
 /// d'en-tête du module).
 const UT1_NOIRE: &[u8] = include_bytes!("ut1_noire.txt.gz");
 
-/// (v243) Les plateformes dont les vidéos ne se lisent pas ici (H.264 et AAC).
-const SANS_LECTURE: &[&str] = &["twitch.tv", "vimeo.com"];
+/// (v243) Les plateformes dont les vidéos ne se lisaient pas dans Chromium (H.264 et AAC).
+/// (v261) Plus aucune : le navigateur des écrans est Edge, qui a ces codecs (sous licence
+/// de Microsoft). Twitch, Vimeo et Dailymotion s'ouvrent.
+const SANS_LECTURE: &[&str] = &[];
 
 /// (v243) Une liste de domaines rangée en empreintes de 64 bits triées : quelques centaines
 /// de milliers de domaines en quelques Mo de mémoire, au lieu de dizaines.
@@ -631,7 +638,7 @@ mod tests {
         ] {
             assert_eq!(f.juge(ok), Ok(()), "{ok}");
         }
-        assert_eq!(f.juge("https://www.twitch.tv/"), Err(Refus::Lecture));
+        assert_eq!(f.juge("https://www.twitch.tv/"), Err(Refus::HorsBlanche));
         for non in [
             "https://fr.wikipedia.org/",
             "https://www.dailymotion.com/",
@@ -832,8 +839,14 @@ mod tests {
         ] {
             assert_eq!(f.juge(mauvais), Err(Refus::Noire), "{mauvais}");
         }
-        for plateforme in ["https://www.twitch.tv/x", "https://player.vimeo.com/video/1", "https://vimeo.com/1"] {
-            assert_eq!(f.juge(plateforme), Err(Refus::Lecture), "{plateforme}");
+        // (v261) Edge lit leurs vidéos : ouverts.
+        for plateforme in [
+            "https://www.twitch.tv/x",
+            "https://player.vimeo.com/video/1",
+            "https://vimeo.com/1",
+            "https://www.dailymotion.com/video/x8abcde",
+        ] {
+            assert_eq!(f.juge(plateforme), Ok(()), "{plateforme}");
         }
         assert_eq!(f.juge("https://nottwitch.tv/"), Ok(()));
     }

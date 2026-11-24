@@ -433,3 +433,73 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 }
+
+// ----------------------------------------------------------------------------
+// (v261) Edge WebView2 : le navigateur des écrans est Edge, dans le jeu lui-même
+// (`edge`). Il est dans Windows 10 et 11 ; s'il manque sur un PC (rare : une installation
+// ancienne ou dépouillée), l'installateur officiel de Microsoft le pose, sans droits
+// d'administrateur (pour l'utilisateur seul).
+// ----------------------------------------------------------------------------
+
+/// Où en est l'installation de WebView2 : 0 rien, 1 en cours, 2 finie, 3 ratée.
+static WEBVIEW2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// L'installateur « Evergreen Bootstrapper » de Microsoft (adresse documentée par
+/// Microsoft pour les applications qui distribuent WebView2).
+const WEBVIEW2_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+
+/// L'installation de WebView2 est-elle en cours (les écrans attendent) ?
+pub fn webview2_en_cours() -> bool {
+    WEBVIEW2.load(std::sync::atomic::Ordering::Acquire) == 1
+}
+
+/// Le navigateur a dit que WebView2 manque : on l'installe (une fois par lancement du jeu).
+/// Rend `false` si c'est déjà fait ou raté (inutile de relancer le navigateur en boucle).
+pub fn installer_webview2() -> bool {
+    use std::sync::atomic::Ordering;
+    if WEBVIEW2
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return WEBVIEW2.load(Ordering::Acquire) == 1;
+    }
+    dire(
+        "le composant Edge WebView2 de Microsoft manque sur ce PC : installation (une seule \
+         fois, quelques minutes)…"
+            .into(),
+    );
+    std::thread::spawn(|| {
+        let fin = (|| -> anyhow::Result<()> {
+            let dossier = minelib_assets::data_dir().join("edge");
+            std::fs::create_dir_all(&dossier)?;
+            let exe = dossier.join("MicrosoftEdgeWebview2Setup.exe");
+            let mut r = ureq::get(WEBVIEW2_URL).call()?;
+            let octets = r
+                .body_mut()
+                .with_config()
+                .limit(20 * 1024 * 1024)
+                .read_to_vec()?;
+            anyhow::ensure!(octets.starts_with(b"MZ"), "réponse inattendue de Microsoft");
+            std::fs::write(&exe, &octets)?;
+            let statut = std::process::Command::new(&exe)
+                .args(["/silent", "/install"])
+                .status()?;
+            anyhow::ensure!(statut.success(), "l'installateur a rendu {statut}");
+            Ok(())
+        })();
+        match fin {
+            Ok(()) => {
+                WEBVIEW2.store(2, Ordering::Release);
+                dire("Edge WebView2 installé : les écrans démarrent.".into());
+            }
+            Err(e) => {
+                WEBVIEW2.store(3, Ordering::Release);
+                dire(format!(
+                    "Edge WebView2 pas installé ({e:#}). Installe « Microsoft Edge WebView2 \
+                     Runtime » depuis le site de Microsoft, puis relance le jeu."
+                ));
+            }
+        }
+    });
+    true
+}

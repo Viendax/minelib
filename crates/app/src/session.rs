@@ -484,6 +484,8 @@ pub struct Session {
     /// (v205) Mode de filtrage des écrans en solo, retenu une fois pour la session : la
     /// liste noire demande un fichier installé, et on ne va pas le chercher à chaque image.
     solo_filtre: Option<&'static str>,
+    /// (v261) Refus des écrans déjà dits dans le tchat, et quand (pas deux fois de suite).
+    refus_dit: std::collections::HashMap<u8, std::time::Instant>,
     /// (v191) Numéro de l'image en cours, pour oublier les joueurs partis (voir `Walk`).
     walk_stamp: u32,
     /// (v172) Skins des autres joueurs envoyés à la carte (ils sont dessinés par elle) ;
@@ -850,6 +852,7 @@ impl Session {
             walks: HashMap::new(),
             walk_stamp: 0,
             solo_filtre: None,
+            refus_dit: std::collections::HashMap::new(),
             skin_layers: Default::default(),
             scratch: Default::default(),
             sun_seen: Default::default(),
@@ -2500,6 +2503,9 @@ impl Session {
             self.chat.say(format!("Écrans : {mot}"), chat::YELLOW);
         }
         // Pages refusées par le filtre : un mot au joueur, une fois par raison.
+        // (v261) Le même refus plusieurs fois de suite (une page qui insiste, un clic
+        // redirigé) n'est dit qu'une fois en 5 secondes.
+        self.refus_dit.retain(|_, t| t.elapsed().as_secs_f32() < 5.0);
         for (_, raison) in self.displays.take_blocked() {
             let quoi = match raison {
                 1 => "ce genre d'adresse ne s'ouvre pas sur un écran",
@@ -2508,8 +2514,13 @@ impl Session {
                 5 => "pas de connexion à un compte sur les écrans en ligne",
                 6 => "Twitch et Vimeo ne se lisent pas sur les écrans (leurs vidéos demandent \
                       des codecs que le navigateur n'a pas)",
+                7 => "site pour adultes ou dangereux",
                 _ => "site hors de la liste autorisée",
             };
+            if self.refus_dit.contains_key(&raison) {
+                continue;
+            }
+            self.refus_dit.insert(raison, std::time::Instant::now());
             self.chat.say(format!("Écran : {quoi}."), chat::YELLOW);
         }
         self.watch_together(dt);

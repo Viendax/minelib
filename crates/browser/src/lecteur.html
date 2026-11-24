@@ -89,6 +89,13 @@ mettra ici.</div></div>
 <script>
 (()=>{
 window.__mlb_lecteur=1;
+// (v261) Messages au jeu : par Edge (WebView2), sinon par la console (l'ancien navigateur).
+const dit=s=>{try{window.chrome.webview.postMessage(s);}catch(_){console.log(s);}};
+// (v261) Ce que dit le cadre du lecteur officiel (une pub y joue, ce que voit le lecteur) :
+// relayé tel quel, rien d'autre.
+window.addEventListener('message',e=>{
+  if(e.origin==='https://www.youtube-nocookie.com'&&e.data&&typeof e.data.__mlb==='string'
+    &&/^__minelib_(pub|diag)__/.test(e.data.__mlb)&&e.data.__mlb.length<400)dit(e.data.__mlb);});
 const ok=s=>/^[A-Za-z0-9_-]{11}$/.test(s||'');
 const q=new URLSearchParams(location.search);
 let id=ok(q.get('v'))?q.get('v'):'';
@@ -107,7 +114,7 @@ const montre=()=>{const l=document.getElementById('liste');l.textContent='';
     const t=document.createElement('div');t.className='t';t.textContent=titres[v]||'…';
     const x=document.createElement('button');x.className='x';x.textContent='×';x.title='Retirer';
     x.addEventListener('click',e=>{e.stopPropagation();
-      console.log('__minelib_ordre__'+JSON.stringify({retire:i,v:v}));});
+      dit('__minelib_ordre__'+JSON.stringify({retire:i,v:v}));});
     d.append(im,n,t,x);l.append(d);titre(v);});
   document.getElementById('vide').style.display=file.length?'none':'block';};
 // (v257) La file (`ouvert`) et la recherche à côté (`cote`), comme le jeu les veut.
@@ -121,7 +128,7 @@ try{const m=JSON.parse(sessionStorage.getItem('mlb_panneau')||'null');
     requestAnimationFrame(()=>requestAnimationFrame(()=>document.body.classList.remove('net')));}}catch(_){}
 // Le bouton de recherche : le jeu ouvre (ou ferme) la recherche à côté.
 document.getElementById('cherche').addEventListener('click',()=>{
-  console.log('__minelib_ordre__'+JSON.stringify({recherche:!cote}));});
+  dit('__minelib_ordre__'+JSON.stringify({recherche:!cote}));});
 const mot=t=>{document.getElementById('cadre').style.display='none';
   const m=document.getElementById('mot');m.textContent=t;m.style.display='flex';};
 // Commandes du jeu (regarder ensemble, pause de tous les écrans). Lancer la lecture
@@ -191,7 +198,7 @@ setInterval(()=>{
   const fige=s===1&&now-depuis>1200;
   const a=!permis||fige;
   const st=JSON.stringify({u:location.href,t:t,p:p,a:a,i:i,e:fini,f:file.join(','),o:ouvert,r:cote});
-  if(st!==etat){etat=st;console.log('__minelib_state__'+st);}
+  if(st!==etat){etat=st;dit('__minelib_state__'+st);}
 },500);
 })();
 </script>
