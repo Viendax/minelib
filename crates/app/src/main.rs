@@ -86,6 +86,8 @@ mod equip;
 mod filtres;
 mod navigateur;
 mod flashlight;
+mod evide;
+mod flesh;
 mod fluids;
 mod fps;
 mod fpsmap;

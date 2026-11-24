@@ -296,6 +296,7 @@ fn item_code(item: Item) -> String {
         Item::Wand => "wand;-".into(),
         Item::Flashlight => "flashlight;-".into(),
         Item::Zeus => "zeus;-".into(),
+        Item::Egg => "egg;-".into(),
         // (Normal : comme avant les tailles.)
         Item::Screen(1) => "screen;-".into(),
         Item::Screen(n) => format!("screen;{n}"),
@@ -312,6 +313,7 @@ fn parse_item(kind: &str, arg: &str) -> Option<Item> {
         "wand" => Some(Item::Wand),
         "flashlight" => Some(Item::Flashlight),
         "zeus" => Some(Item::Zeus),
+        "egg" => Some(Item::Egg),
         "screen" => Some(Item::Screen(
             arg.parse::<u8>().map_or(crate::screen::NORMAL, |n| n.min(3)),
         )),

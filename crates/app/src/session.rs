@@ -39,6 +39,12 @@ fn npc_cry_gain(d: f32) -> Option<f32> {
     (k > 0.0).then_some(0.55 * k * k)
 }
 
+/// (v269) Une morsure de L'Évidé : points de vie perdus (sur 20) ; temps entre deux de nos
+/// bouchées (s) ; au-delà de cette distance (blocs) il n'est plus dessiné.
+const EVIDE_BITE: u8 = 3;
+const EVIDE_EAT_S: f32 = 0.3;
+const EVIDE_DRAWN: f32 = 160.0;
+
 /// (v249) Durée de l'éblouissement par la foudre qu'on prend (s) : l'écran reste blanc
 /// pendant le premier sixième (les arcs en retour), puis la vue revient peu à peu. Une
 /// seconde en tout (« celui qui porte l'éclair peut en jeter dix d'affilée quand même »).
@@ -356,6 +362,11 @@ pub struct Session {
     heads: Option<crate::heads::Heads>,
     /// Dernière fois que les skins des têtes de joueurs ont été redemandés au relais.
     head_skins_at: Option<std::time::Instant>,
+    /// (v269) Ce que L'Évidé a mangé de chacun (par pseudo ; vide : le joueur local) : les
+    /// morceaux qui manquent à son corps, qui reviennent en cinq minutes (`flesh::Flesh`).
+    flesh: HashMap<String, crate::flesh::Flesh>,
+    /// (v269) Les Évidés du monde (`evide`) : en solo seulement pour l'instant.
+    evides: crate::evide::Horde,
     /// (v264) Plaies des joueurs de la partie FPS (« un impact dans le joueur ») : par pseudo
     /// (vide : le joueur local), jusqu'à sa mort ou la fin de la manche, comme les traces sur
     /// les blocs. Dessinées sur son modèle (`player_model::wound_model`).
@@ -785,6 +796,44 @@ impl Session {
             heads: None,
             head_skins_at: None,
             team_skin: Default::default(),
+            // Essais : MINELIB_EVIDE="x,y,z,lacet°[,posture]" pose d'avance un Évidé (figé dans
+            // la posture nommée : debout, court, rampe, mord, mange ; vivant sans posture) ;
+            // plusieurs séparés par « ; ».
+            evides: {
+                let mut horde = crate::evide::Horde::default();
+                for one in std::env::var("MINELIB_EVIDE").unwrap_or_default().split(';') {
+                    let f: Vec<&str> = one.split(',').map(str::trim).collect();
+                    let n: Vec<f32> = f.iter().take(4).filter_map(|v| v.parse().ok()).collect();
+                    if n.len() < 4 {
+                        continue;
+                    }
+                    let (at, yaw) = (Vec3::new(n[0], n[1], n[2]), n[3].to_radians());
+                    match f.get(4) {
+                        Some(pose) => horde.list.push(crate::evide::Evide::posed(at, yaw, pose)),
+                        None => {
+                            horde.spawn(at, yaw);
+                        }
+                    }
+                }
+                horde
+            },
+            // Essais : MINELIB_MORSURES=<n> mord d'avance n fois le joueur local.
+            flesh: {
+                let mut map = HashMap::new();
+                let n = std::env::var("MINELIB_MORSURES")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0);
+                if n > 0 {
+                    let grids = crate::player_model::flesh_grids();
+                    let mut f = crate::flesh::Flesh::default();
+                    for k in 0..n {
+                        f.bite_somewhere(k * 31 + 7, 2 + (k % 2) as usize, &[0, 1, 2, 3, 5, 6], &grids);
+                    }
+                    map.insert(String::new(), f);
+                }
+                map
+            },
             // Essais : MINELIB_PLAIES=1 pose d'avance des plaies sur le joueur local.
             wounds: if std::env::var_os("MINELIB_PLAIES").is_some() {
                 HashMap::from([(String::new(), crate::player_model::test_wounds())])
@@ -1214,6 +1263,29 @@ impl Session {
             let editing = self.light_editor.open;
             self.hurt = (self.hurt - dt).max(0.0);
             self.dazzle = (self.dazzle - dt / DAZZLE_S).max(0.0);
+            // (v269) Les morceaux mangés par L'Évidé reviennent en cinq minutes.
+            if !self.flesh.is_empty() {
+                let grids = crate::player_model::flesh_grids();
+                for f in self.flesh.values_mut() {
+                    f.tick(dt, Some(crate::flesh::REGROW_S), &grids);
+                }
+                self.flesh.retain(|_, f| !f.is_whole());
+            }
+            // (v269) Les Évidés : en solo seulement pour l'instant (en ligne, le relais devra
+            // tout valider). La nuit, il en vient tout seuls, rarement (`evide::SPAWN_EVERY_S`).
+            if self.net.is_none() && self.build.is_none() {
+                let prey = (self.game.mode != GameMode::Spectator && self.spectating.is_none())
+                    .then(|| crate::evide::Prey {
+                        feet: self.player.pos,
+                        eye: self.player.eye(),
+                    });
+                let night = self.game.mode != GameMode::Fps
+                    && self.time_h >= 0.0
+                    && crate::daytime::daylight(self.time_h) < 0.15;
+                for ev in self.evides.update(&self.world, dt, prey, night) {
+                    self.evide_event(ev);
+                }
+            }
             for p in &mut self.pings {
                 p.1 += dt;
             }
@@ -3337,6 +3409,28 @@ impl Session {
         // lui (plus bas).
         let attack = keys.pressed(input, Action::Attack);
         let zeus = self.inventory.selected_item() == Some(Item::Zeus);
+        // (v269) Un Évidé visé de près : le clic en mange un morceau, quel que soit l'objet tenu
+        // (« les épées ne lui font rien : il faut le manger vivant, de près ») ; clic tenu,
+        // rien n'est cassé derrière lui.
+        if attack || keys.held(input, Action::Attack) {
+            let aim = self
+                .evides
+                .aimed(self.player.eye(), self.player.look_dir(), crate::evide::EAT_REACH)
+                .filter(|a| hit.as_ref().is_none_or(|b| a.1 <= b.distance));
+            if let Some((i, _, part, cell)) = aim {
+                if attack && self.break_cooldown <= 0.0 {
+                    self.break_cooldown = EVIDE_EAT_S;
+                    if let Some(dead) = self.evides.list[i].eaten_at(part, cell) {
+                        crate::audio::jelly_bite(0.0);
+                        if dead {
+                            crate::audio::evide_voice(0.0);
+                        }
+                    }
+                }
+                self.punch_latch = true;
+                return;
+            }
+        }
         if (attack || keys.held(input, Action::Attack)) && !zeus {
             let before_block = |t: f32| hit.as_ref().is_none_or(|b| t <= b.distance);
             if let Some((target, _)) = self.npc_aimed().filter(|(_, t)| before_block(*t)) {
@@ -3432,6 +3526,18 @@ impl Session {
         // (v215) Lampe torche tenue : le clic droit n'allume plus rien (c'est le clic
         // molette) ; il ouvre les portes, trappes et coffres comme d'habitude.
         let Some(hit) = hit else { return };
+
+        // (v269) Œuf de L'Évidé tenu : clic droit, il sort sur la face visée (aucun bloc posé).
+        if self.inventory.selected_item() == Some(Item::Egg) {
+            if keys.pressed(input, Action::Use) {
+                self.hatch_evide(hit);
+                self.place_cooldown = 0.22;
+                return;
+            }
+            if !breaking {
+                return;
+            }
+        }
 
         // Écran vidéo tenu : clic droit le pose sur la face visée (aucun bloc posé).
         if let Some(Item::Screen(size)) = self.inventory.selected_item() {
@@ -6427,6 +6533,52 @@ impl Session {
         }
     }
 
+    /// (v269) Œuf de L'Évidé : il sort là où l'on a cliqué, tourné vers nous.
+    fn hatch_evide(&mut self, hit: minelib_world::raycast::Hit) {
+        if self.net.is_some() || self.build.is_some() || self.game.mode == GameMode::Fps {
+            self.chat
+                .say("L'Évidé n'existe qu'en solo pour l'instant.", chat::RED);
+            return;
+        }
+        let [x, y, z] = hit.adjacent();
+        let at = Vec3::new(x as f32 + 0.5, y as f32, z as f32 + 0.5);
+        let to = self.player.pos - at;
+        if !self.evides.spawn(at, to.x.atan2(-to.z)) {
+            self.chat.say("Il y a déjà trop d'Évidés ici.", chat::RED);
+            return;
+        }
+        if self.game.mode != GameMode::Creative {
+            self.inventory.take_selected();
+        }
+    }
+
+    /// (v269) Ce que vient de faire un Évidé : sa voix (grognement ou rire, d'où il est), sa
+    /// morsure (« il retire un cube de notre corps, depuis les bords » : un morceau de notre
+    /// modèle part, qui reviendra en cinq minutes, et on perd des points de vie).
+    fn evide_event(&mut self, ev: crate::evide::Event) {
+        let ear = self.player.eye();
+        match ev {
+            crate::evide::Event::Voice(at) => crate::audio::evide_voice(at.distance(ear)),
+            crate::evide::Event::Bites { low, at, seed } => {
+                crate::audio::jelly_bite(at.distance(ear));
+                if self.game.mode == GameMode::Spectator {
+                    return;
+                }
+                // En rampant, sa tête est au ras du sol : nos jambes ; debout, penché sur
+                // nous : le haut du corps (pas le bras droit, dessiné à part à la première
+                // personne).
+                let allowed: &[usize] = if low { &[0, 1] } else { &[2, 3, 5, 6] };
+                let size = 2 + (seed >> 9) as usize % 2;
+                let grids = crate::player_model::flesh_grids();
+                self.flesh
+                    .entry(String::new())
+                    .or_default()
+                    .bite_somewhere(seed, size, allowed, &grids);
+                self.damage(EVIDE_BITE);
+            }
+        }
+    }
+
     fn damage(&mut self, amount: u8) {
         if !self.game.mode.mortal() || amount == 0 {
             return;
@@ -6458,6 +6610,8 @@ impl Session {
         self.player.vel = Vec3::ZERO;
         self.game.health = MAX_HEALTH;
         self.fall_from = None;
+        // (v269) Un corps neuf : ce que L'Évidé avait mangé est revenu.
+        self.flesh.remove("");
         self.fps.respawn();
     }
 
@@ -8692,6 +8846,13 @@ impl Session {
                             self.chat.say("Foudre de Zeus donnée.", chat::YELLOW);
                         }
                     }
+                    // (v269) Œuf de L'Évidé.
+                    _ if matches!(want.as_str(), "oeuf" | "oeuf_evide" | "evide" | "egg") => {
+                        let n: u32 = next.and_then(|n| n.parse().ok()).unwrap_or(1).clamp(1, 64);
+                        self.inventory.add(Item::Egg, n);
+                        self.chat
+                            .say(format!("{n} œuf(s) de L'Évidé donné(s)."), chat::YELLOW);
+                    }
                     // (v201) Lampe torche (« /give lampe torche » aussi) : une seule, sauf
                     // nombre donné.
                     _ if matches!(
@@ -10426,6 +10587,7 @@ impl Session {
                 )),
                 Some(Item::Wand) => Some(Held::Wand([70, 60, 90])),
                 Some(Item::Screen(_)) => Some(Held::Wand([30, 30, 36])),
+                Some(Item::Egg) => Some(Held::Wand(crate::evide::EGG_RGB)),
                 // (v201) Lampe torche, verre allumé ou non.
                 Some(Item::Flashlight) => Some(Held::Flashlight(self.flashlight_on)),
                 Some(Item::Zeus) => Some(Held::Zeus),
@@ -10451,7 +10613,8 @@ impl Session {
         };
         let visible = self.game.mode != GameMode::Spectator;
         let mut model = if third != 0 && visible {
-            let mut m = crate::player_model::build(&pose);
+            // (v269) Avec ce que L'Évidé lui a mangé.
+            let mut m = crate::player_model::build_bitten(&pose, self.flesh.get(""));
             // (v264) Ses plaies (partie FPS), sur son corps.
             if let Some(w) = self.wounds.get("") {
                 m.extend(crate::player_model::wound_model(&pose, w));
@@ -10629,6 +10792,17 @@ impl Session {
                 };
                 let light = sky_light(&self.world, at, self.daylight_shown);
                 model.extend(crate::player_model::bomb(at, blink, light));
+            }
+        }
+        // (v269) Les Évidés : leur corps cube par cube, leur ombre.
+        for e in &self.evides.list {
+            if e.pos.distance(self.player.pos) > EVIDE_DRAWN {
+                continue;
+            }
+            let light = sky_light(&self.world, e.eye(), self.daylight_shown);
+            model.extend(e.mesh(light));
+            if !e.is_dying() {
+                shadows.push((e.pos, e.shadow_boxes(), None));
             }
         }
         // Construction en ligne (et, en solo, la foule d'essai : dessinée pareil).
@@ -11017,6 +11191,7 @@ impl Session {
             arm.extend(crate::player_model::first_person_body(
                 &pose,
                 wounds,
+                self.flesh.get(""),
                 world_proj * view,
             ));
         }

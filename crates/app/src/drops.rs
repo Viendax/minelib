@@ -529,6 +529,7 @@ fn icon_kind(item: Item) -> RayBoxKind {
         Item::Flashlight => RayBoxKind::Flat(crate::flashlight::BODY),
         Item::Zeus => RayBoxKind::Glow(ZEUS_GLOW),
         Item::Screen(_) => RayBoxKind::Flat([30, 30, 36]),
+        Item::Egg => RayBoxKind::Flat(crate::evide::EGG_RGB),
         // Tête à skin (au sol, elle devient une tête simple : voir `Item::code`).
         Item::Head(_) => RayBoxKind::Flat([214, 166, 132]),
     }

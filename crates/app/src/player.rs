@@ -1394,9 +1394,13 @@ impl Player {
     }
 }
 
+/// (v269) Les allures du joueur, pour ce qui se déplace comme lui (L'Évidé) : marche, course,
+/// marche accroupie (blocs par seconde), pesanteur et élan du saut.
+pub(crate) const GAIT: [f32; 5] = [WALK, SPRINT, SNEAK, GRAVITY, JUMP_SPEED];
+
 /// Boîtes de collision (coordonnées monde) du bloc en (x, y, z) : la forme réelle
 /// (dalle, escalier, clôture reliée à ses voisins…), pas un cube entier.
-fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec3, Vec3)> {
+pub(crate) fn collision_boxes(world: &World, x: i32, y: i32, z: i32) -> Vec<(Vec3, Vec3)> {
     let def = world.get(x, y, z).def();
     if !def.solid {
         return Vec::new();

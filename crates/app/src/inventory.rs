@@ -35,6 +35,8 @@ pub enum Item {
     /// (v216) Foudre de Zeus : un éclair tenu en main (clic gauche : la foudre tombe là où
     /// l'on vise).
     Zeus,
+    /// (v269) Œuf d'apparition de L'Évidé : clic droit, il sort là où l'on vise.
+    Egg,
 }
 
 impl Item {
@@ -53,6 +55,7 @@ impl Item {
             Item::Head(_) => minelib_world::registry::skull_block(false, 0).0 as u32,
             Item::Flashlight => 0x4_0000,
             Item::Zeus => 0x5_0000,
+            Item::Egg => 0x6_0000,
         }
     }
 
@@ -74,6 +77,7 @@ impl Item {
             },
             Item::Flashlight => "lampe_torche".into(),
             Item::Zeus => "foudre_de_zeus".into(),
+            Item::Egg => "oeuf_evide".into(),
         }
     }
 
@@ -94,6 +98,7 @@ impl Item {
             0x2_0000 => Some(Item::Wand),
             0x4_0000 => Some(Item::Flashlight),
             0x5_0000 => Some(Item::Zeus),
+            0x6_0000 => Some(Item::Egg),
             0x3_0000 => Some(Item::Screen(crate::screen::NORMAL)),
             0x3_0001 => Some(Item::Screen(0)),
             0x3_0002 => Some(Item::Screen(2)),
@@ -114,6 +119,7 @@ impl Item {
             Item::Wand => "Baguette de sélection".into(),
             Item::Flashlight => "Lampe torche".into(),
             Item::Zeus => "Foudre de Zeus".into(),
+            Item::Egg => "Œuf de L'Évidé".into(),
             Item::Screen(n) => crate::screen::size_name(n).into(),
             Item::Head(n) => crate::heads::skin_of(n).item_name(),
             Item::Torch(None) => "Torche".into(),
@@ -140,7 +146,8 @@ impl Item {
             | Item::Screen(_)
             | Item::Head(_)
             | Item::Flashlight
-            | Item::Zeus => None,
+            | Item::Zeus
+            | Item::Egg => None,
         }
     }
 
@@ -226,6 +233,12 @@ impl Item {
                         lines.push(("Elle blesse comme la foudre du ciel".into(), GREY));
                     }
                 }
+            }
+            Item::Egg => {
+                lines.push(("Clic droit : un Évidé sort là où tu vises".into(), WHITE));
+                lines.push(("3,5 blocs de gelée blanche, qui te cherche".into(), GREY));
+                lines.push(("Les épées ne lui font rien : mange-le (clic gauche, de près)".into(), GREY));
+                lines.push(("En solo seulement pour l'instant".into(), GREY));
             }
             Item::Flashlight => {
                 lines.push(("Éclaire comme un projecteur, où tu regardes".into(), WHITE));
@@ -583,6 +596,7 @@ pub fn catalogue() -> &'static [(Item, usize)] {
         items.push((Item::Wand, 6));
         items.push((Item::Flashlight, 6));
         items.push((Item::Zeus, 6));
+        items.push((Item::Egg, 6));
         items.extend((0..crate::screen::SIZES.len() as u8).map(|n| (Item::Screen(n), 6)));
         items.push((Item::Torch(None), 6));
         items.extend((0..CHEMICALS.len()).map(|i| (Item::Torch(Some(i)), 6)));
@@ -971,6 +985,7 @@ impl Inventory {
                         Item::Zeus => {
                             "foudre de zeus eclair lightning thunder tonnerre thor".contains(&q)
                         }
+                        Item::Egg => "oeuf evide spawn egg monstre mob gelee".contains(&q),
                     }
                 }
             })
@@ -1885,6 +1900,14 @@ fn draw_icon(ui: &mut Ui, x: f32, y: f32, slot: f32, s: f32, st: Stack) {
             y + slot / 2.0,
             16.5 * s,
         )),
+        // (v269) Œuf de L'Évidé : image en pixels.
+        Item::Egg => crate::wand::pixel_icon(
+            ui,
+            x + slot / 2.0,
+            y + slot / 2.0,
+            16.0 * s,
+            crate::evide::egg_pixels(),
+        ),
         // Écran vidéo : petite télé en pixels.
         Item::Screen(n) => crate::screen::icon(ui, x + slot / 2.0, y + slot / 2.0, 16.0 * s, n),
         // Barrières (invisibles) : un panneau « interdit », rouge (bleu : à fluides).

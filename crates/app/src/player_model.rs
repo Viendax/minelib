@@ -341,6 +341,182 @@ fn emit_box_layer(
     }
 }
 
+/// (v269) Les mesures du modèle (pixels), pour L'Évidé : le même corps, étiré en hauteur.
+pub(crate) struct Rig {
+    /// Taille d'un pixel, en blocs.
+    pub px: f32,
+    /// Coins de chaque pavé dans son repère (l'ordre de `parts`).
+    pub boxes: [([f32; 3], [f32; 3]); 7],
+    /// Hauteur des hanches, écart des jambes, hauteur des épaules au-dessus des hanches,
+    /// écart des bras, hauteur du cou au-dessus des hanches.
+    pub leg: f32,
+    pub leg_x: f32,
+    pub shoulder_y: f32,
+    pub arm_x: f32,
+    pub body_h: f32,
+}
+
+pub(crate) fn rig() -> Rig {
+    Rig {
+        px: PX,
+        boxes: PARTS.map(|(lo, hi, _)| (lo, hi)),
+        leg: LEG,
+        leg_x: LEG_X,
+        shoulder_y: SHOULDER_Y,
+        arm_x: ARM_X,
+        body_h: BODY_H,
+    }
+}
+
+/// (v269) Grille de cubes de chaque pavé du modèle (un cube par pixel de son skin), dans
+/// l'ordre de `parts` : là où mord L'Évidé (`flesh::Flesh`).
+pub fn flesh_grids() -> [[usize; 3]; crate::flesh::PARTS] {
+    std::array::from_fn(|i| ZONES[i].size)
+}
+
+/// (v269) Un pavé mordu, dessiné cube par cube : un cube par pixel du skin, moins ceux que les
+/// morsures ont retirés (`flesh`). Une face tournée vers le dehors garde son pixel du skin
+/// (exactement celui d'`emit_box`) ; une face mise à nu par une morsure prend la couleur de ce
+/// qu'il y a là dans le corps (`inside` : os, organes, ou la gelée de L'Évidé), un peu dans
+/// l'ombre du creux. « La forme reste carrée. »
+#[allow(clippy::too_many_arguments)]
+fn emit_flesh(
+    out: &mut Vec<EntityVertex>,
+    xf: Mat4,
+    min: [f32; 3],
+    max: [f32; 3],
+    index: usize,
+    part: Part,
+    light: [f32; 3],
+    tex: Option<&crate::skin::Skin>,
+    flesh: &crate::flesh::Flesh,
+    inside: fn(usize, [usize; 3], [usize; 3]) -> u32,
+) {
+    // Les six côtés d'un cube : (axe, sens, face dans l'ordre de `box_faces`).
+    const SIDES: [(usize, i32, usize); 6] = [
+        (2, -1, 0),
+        (2, 1, 1),
+        (0, 1, 2),
+        (0, -1, 3),
+        (1, 1, 4),
+        (1, -1, 5),
+    ];
+    const FACES: [Face; 6] = [
+        Face::Front,
+        Face::Back,
+        Face::Side,
+        Face::Side,
+        Face::Top,
+        Face::Bottom,
+    ];
+    let zone = ZONES[index];
+    let dims = zone.size;
+    let (lo, hi) = (Vec3::from(min), Vec3::from(max));
+    let step = (hi - lo) / Vec3::new(dims[0] as f32, dims[1] as f32, dims[2] as f32);
+    let lit = EntityVertex::light(light, true);
+    let full = zone.full.map(|n| n as u32);
+    for z in 0..dims[2] {
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
+                let c = [x, y, z];
+                if flesh.gone(index, dims, c) {
+                    continue;
+                }
+                for (axis, sign, k) in SIDES {
+                    // Le voisin de ce côté : dehors (le pixel du skin), mangé (la chair à nu),
+                    // ou encore là (pas de face).
+                    let n = c[axis] as i32 + sign;
+                    let outside = n < 0 || n >= dims[axis] as i32;
+                    if !outside {
+                        let mut nc = c;
+                        nc[axis] = n as usize;
+                        if !flesh.gone(index, dims, nc) {
+                            continue;
+                        }
+                    }
+                    // L'ombrage d'`emit_box` (`du × dv` : vers le dedans pour les quatre faces
+                    // du tour, vers le dehors pour le dessus et le dessous), pour que les
+                    // pixels qui restent soient exactement ceux du pavé entier.
+                    let mut normal = Vec3::ZERO;
+                    normal[axis] = if axis == 1 { sign as f32 } else { -sign as f32 };
+                    let shade = face_shade(xf.transform_vector3(normal).normalize_or_zero());
+                    let color = if outside {
+                        let (u, v) = match k {
+                            0 => (dims[0] - 1 - x, dims[1] - 1 - y),
+                            1 => (x, dims[1] - 1 - y),
+                            2 => (dims[2] - 1 - z, dims[1] - 1 - y),
+                            3 => (z, dims[1] - 1 - y),
+                            4 => (x, dims[2] - 1 - z),
+                            _ => (x, z),
+                        };
+                        let (su, sv) = zone.pixel(k, u, v);
+                        let rgb = tex
+                            .and_then(|t| t.color(zone.skin, k, su as u32, sv as u32, full))
+                            .unwrap_or_else(|| skin(part, FACES[k], su, sv, zone.width(k)));
+                        let g = grain(k * 4096 + sv * 64 + su + part as usize * 977);
+                        srgb(rgb).map(|c| c * shade * g)
+                    } else {
+                        let g = grain(index * 7919 + (z * 64 + y) * 64 + x + k * 131);
+                        srgb(inside(index, c, dims)).map(|c| c * shade * g * 0.86)
+                    };
+                    // Les quatre coins de la face.
+                    let mut o = lo + Vec3::new(x as f32, y as f32, z as f32) * step;
+                    if sign > 0 {
+                        o[axis] += step[axis];
+                    }
+                    let (a1, a2) = ((axis + 1) % 3, (axis + 2) % 3);
+                    let (mut e1, mut e2) = (Vec3::ZERO, Vec3::ZERO);
+                    e1[a1] = step[a1];
+                    e2[a2] = step[a2];
+                    let p = |s: f32, t: f32| xf.transform_point3(o + e1 * s + e2 * t);
+                    let q = [p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)];
+                    for v in [q[0], q[1], q[2], q[2], q[3], q[0]] {
+                        out.push(EntityVertex {
+                            pos: v.to_array(),
+                            color,
+                            uv: [0.0; 2],
+                            layer: -1,
+                            light: lit,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// (v269) Les pavés du corps d'un joueur (sans ce qu'il tient), morsures comprises : un pavé
+/// mordu est dessiné cube par cube (`emit_flesh`, l'intérieur d'un joueur : `flesh::organ`),
+/// les autres comme d'habitude. `skip` : les pavés à ne pas dessiner.
+fn emit_body(
+    out: &mut Vec<EntityVertex>,
+    pose: &Pose,
+    flesh: Option<&crate::flesh::Flesh>,
+    skip: &[usize],
+) {
+    for (i, (xf, min, max, part)) in parts(pose).into_iter().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        let tex = pose.skin.as_deref();
+        match flesh.filter(|f| f.bitten(i)) {
+            Some(f) => emit_flesh(
+                out,
+                xf,
+                min,
+                max,
+                i,
+                part,
+                pose.light,
+                tex,
+                f,
+                crate::flesh::organ,
+            ),
+            None => emit_box(out, xf, min, max, ZONES[i], part, pose.light, tex),
+        }
+    }
+}
+
 /// Objet tenu dans la main droite (vu dans les reflets).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Held {
@@ -1680,12 +1856,16 @@ pub fn build_tiny(pose: &Pose) -> Vec<EntityVertex> {
 
 /// Triangles du modèle du joueur dans cette pose (avec l'objet tenu).
 pub fn build(pose: &Pose) -> Vec<EntityVertex> {
+    build_bitten(pose, None)
+}
+
+/// (v269) Comme `build`, avec ce que L'Évidé lui a mangé (`flesh`) : les morceaux qui manquent
+/// et, dans les creux, ses os et ses organes.
+pub fn build_bitten(pose: &Pose, flesh: Option<&crate::flesh::Flesh>) -> Vec<EntityVertex> {
     let mut out = Vec::with_capacity(12_000);
     // Ordre de `parts` : jambe gauche, jambe droite, poitrine, bras gauche, bras droit,
     // tête, ventre ; `ZONES` dit ce que chacun montre du skin.
-    for (i, (xf, min, max, part)) in parts(pose).into_iter().enumerate() {
-        emit_box(&mut out, xf, min, max, ZONES[i], part, pose.light, pose.skin.as_deref());
-    }
+    emit_body(&mut out, pose, flesh, &[]);
     for (xf, min, max, kind) in held_parts(pose) {
         emit_item(&mut out, xf, min, max, kind, pose.light);
     }
@@ -2038,7 +2218,12 @@ pub const FIRST_PERSON_PITCH: f32 = -0.15;
 /// jambes, le ventre, la poitrine et le bras gauche du modèle, pixel par pixel de son skin,
 /// avec ses plaies. Ni la tête (la caméra y est), ni le bras droit (il est dessiné tendu, avec
 /// ce qu'il tient : `right_arm_matrix`). `view_proj` : du monde à l'écran.
-pub fn first_person_body(pose: &Pose, wounds: &[Wound], view_proj: Mat4) -> Vec<ArmVertex> {
+pub fn first_person_body(
+    pose: &Pose,
+    wounds: &[Wound],
+    flesh: Option<&crate::flesh::Flesh>,
+    view_proj: Mat4,
+) -> Vec<ArmVertex> {
     let (ahead, _) = head_place(pose.crouch);
     let back = (ahead + FIRST_PERSON_BACK).min(FIRST_PERSON_BACK_MAX);
     let seen = Pose {
@@ -2059,7 +2244,25 @@ pub fn first_person_body(pose: &Pose, wounds: &[Wound], view_proj: Mat4) -> Vec<
             continue;
         }
         quads.clear();
-        emit_box(&mut quads, xf, min, max, ZONES[i], part, seen.light, seen.skin.as_deref());
+        // (v269) Un pavé mordu : cube par cube, avec ce qu'on voit dans le creux.
+        match flesh.filter(|f| f.bitten(i)) {
+            Some(f) => emit_flesh(
+                &mut quads,
+                xf,
+                min,
+                max,
+                i,
+                part,
+                seen.light,
+                seen.skin.as_deref(),
+                f,
+                crate::flesh::organ,
+            ),
+            None => {
+                let tex = seen.skin.as_deref();
+                emit_box(&mut quads, xf, min, max, ZONES[i], part, seen.light, tex)
+            }
+        }
         for w in wounds.iter().filter(|w| w.part as usize == i) {
             quads.extend(wound_model(&seen, std::slice::from_ref(w)));
         }
@@ -2331,6 +2534,60 @@ pub fn hit_boxes(feet: Vec3, yaw: f32, pitch: f32, crouch: f32) -> [(Mat4, Vec3,
         };
         (xf.inverse(), Vec3::from(min), Vec3::from(max), zone)
     })
+}
+
+/// Les couches d'un corps vues de face : huit images côte à côte (la tête a huit couches
+/// de cubes, le reste quatre : chaque couche du corps y est deux fois). `grids` : la grille de
+/// cubes de chaque pavé ; `inside` : la couleur d'un cube (`None` : un creux) ; `tall` :
+/// hauteur du corps par rapport au joueur.
+#[cfg(test)]
+pub(crate) fn irm(
+    grids: [[usize; 3]; 7],
+    inside: impl Fn(usize, [usize; 3], [usize; 3]) -> Option<u32>,
+    tall: f32,
+) -> image::RgbImage {
+    const S: f32 = 330.0; // pixels par bloc
+    let (w, h) = ((1.0 * S) as u32, ((1.8 * tall + 0.15) * S) as u32);
+    let mut img = image::RgbImage::from_pixel(w * 8, h, image::Rgb([24, 26, 30]));
+    // Debout, de face, bras le long du corps (sans leur écart, pour des cubes droits).
+    let boxes: [(f32, f32); 7] = [
+        (-LEG_X, LEG),
+        (LEG_X, LEG),
+        (0.0, LEG),
+        (-(BODY_W / 2.0 + ARM_W / 2.0 + 0.35), LEG + SHOULDER_Y),
+        (BODY_W / 2.0 + ARM_W / 2.0 + 0.35, LEG + SHOULDER_Y),
+        (0.0, NECK_Y),
+        (0.0, LEG),
+    ];
+    for layer in 0..8usize {
+        for (i, &(min, max, _)) in PARTS.iter().enumerate() {
+            let d = grids[i];
+            let z = layer * d[2] / 8;
+            let (ox, oy) = boxes[i];
+            for y in 0..d[1] {
+                for x in 0..d[0] {
+                    let Some(rgb) = inside(i, [x, y, z], d) else {
+                        continue;
+                    };
+                    let cell = |v: usize, a: usize| {
+                        min[a] + (max[a] - min[a]) * v as f32 / d[a] as f32
+                    };
+                    // De face : la droite du personnage (+x) à gauche de l'image.
+                    let (x0, x1) = (ox + cell(x, 0), ox + cell(x + 1, 0));
+                    let (y0, y1) = ((oy + cell(y, 1)) * tall, (oy + cell(y + 1, 1)) * tall);
+                    let px = |v: f32| ((0.5 - v * PX) * S) as u32;
+                    let py = |v: f32| h - 12 - (v * PX * S) as u32;
+                    for yy in py(y1)..py(y0).saturating_sub(1) {
+                        for xx in px(x1)..px(x0).saturating_sub(1) {
+                            let p = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8];
+                            img.put_pixel(layer as u32 * w + xx.min(w - 1), yy.min(h - 1), image::Rgb(p));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    img
 }
 
 #[cfg(test)]
@@ -2804,6 +3061,91 @@ mod tests {
         assert!(xf.transform_vector3(Vec3::X).y.abs() < 1e-6);
     }
 
+    /// (v269) Le corps cube par cube : sans morsure, exactement les pixels du modèle habituel
+    /// (mêmes carrés, mêmes couleurs) ; mordu, les carrés du dehors qui restent n'ont pas
+    /// changé, ceux de la morsure ont disparu, et le creux montre l'intérieur (os, organes).
+    #[test]
+    fn a_bitten_body_keeps_its_skin_and_shows_its_inside() {
+        use crate::flesh::{organ, Flesh};
+        let skin = test_skin();
+        let pose = Pose {
+            feet: Vec3::new(2.0, 30.0, 5.0),
+            yaw: 0.6,
+            pitch: 0.2,
+            walk: 0.7,
+            swing: 0.8,
+            crouch: 0.3,
+            light: [1.0; 3],
+            held: None,
+            skin: Some(skin),
+        };
+        // Un carré : son milieu et sa couleur ; deux carrés sont les mêmes au centième de
+        // millimètre et au dix-millième de couleur près (les deux dessins ne font pas leurs
+        // additions dans le même ordre).
+        let quads = |v: &[EntityVertex]| -> Vec<(Vec3, Vec3)> {
+            v.chunks_exact(6)
+                .map(|q| {
+                    let c = (Vec3::from(q[0].pos) + Vec3::from(q[2].pos)) / 2.0;
+                    (c, Vec3::from(q[0].color))
+                })
+                .collect()
+        };
+        // Les carrés de `a` qui ne sont pas dans `b`.
+        let missing = |a: &[(Vec3, Vec3)], b: &[(Vec3, Vec3)]| -> usize {
+            a.iter()
+                .filter(|(p, c)| {
+                    !b.iter()
+                        .any(|(q, d)| (*p - *q).abs().max_element() < 1e-5 && (*c - *d).abs().max_element() < 1e-4)
+                })
+                .count()
+        };
+        let grids = flesh_grids();
+        let parts = parts(&pose);
+        for (i, &(xf, min, max, part)) in parts.iter().enumerate() {
+            let tex = pose.skin.as_deref();
+            let mut plain = Vec::new();
+            emit_box(&mut plain, xf, min, max, ZONES[i], part, pose.light, tex);
+            let mut whole = Vec::new();
+            let none = Flesh::default();
+            emit_flesh(&mut whole, xf, min, max, i, part, pose.light, tex, &none, organ);
+            let (a, b) = (quads(&plain), quads(&whole));
+            assert_eq!(a.len(), b.len(), "pavé {i} : sans morsure");
+            assert_eq!((missing(&a, &b), missing(&b, &a)), (0, 0), "pavé {i} : sans morsure");
+            // Une morsure dans un coin du haut, devant.
+            let mut f = Flesh::default();
+            let d = grids[i];
+            let b = f.bite_at(i, [d[0] - 1, d[1] - 1, 0], 2, &grids).unwrap();
+            let mut bitten = Vec::new();
+            emit_flesh(&mut bitten, xf, min, max, i, part, pose.light, tex, &f, organ);
+            let (before, after) = (quads(&plain), quads(&bitten));
+            let (lost, new) = (missing(&before, &after), missing(&after, &before));
+            // Le coin de 2 × 2 × 2 cubes : 3 faces de 4 carrés du skin en moins, 3 faces de
+            // 4 carrés de chair en plus (là où le cube mordu touchait le reste).
+            let size: Vec<usize> = (0..3).map(|a| (b.hi[a] - b.lo[a]) as usize).collect();
+            let outer = size[0] * size[1] + size[1] * size[2] + size[0] * size[2];
+            assert_eq!(lost, outer, "pavé {i} : carrés du skin partis");
+            assert_eq!(new, outer, "pavé {i} : carrés de chair");
+        }
+        // Le modèle entier : `build_bitten` sans morsure est `build`.
+        let (a, b) = (quads(&build(&pose)), quads(&build_bitten(&pose, Some(&Flesh::default()))));
+        assert_eq!(a.len(), b.len());
+        assert_eq!((missing(&a, &b), missing(&b, &a)), (0, 0), "modèle entier sans morsure");
+    }
+
+    /// (v269) « Tu me montreras l'IRM des couches de notre modèle 3D joueur » : les couches du
+    /// corps du joueur, de devant (à gauche) vers le dos, vues de face ; chaque cube à la
+    /// couleur de ce qu'il y a là (`flesh::organ`). Écrit dans le fichier nommé par
+    /// MINELIB_IRM (essai à lancer à la main).
+    #[test]
+    #[ignore]
+    fn irm_of_the_player() {
+        let Ok(path) = std::env::var("MINELIB_IRM") else {
+            return;
+        };
+        let img = irm(flesh_grids(), |p, c, d| Some(crate::flesh::organ(p, c, d)), 1.0);
+        img.save(path).unwrap();
+    }
+
     /// (v267) « On doit voir notre corps dans le jeu » : à la première personne, en baissant
     /// les yeux, on voit sa poitrine, son ventre, ses jambes et son bras gauche ; ni sa tête,
     /// ni son bras droit (dessiné à part). Rien n'est trop près des yeux pour être coupé par
@@ -2834,7 +3176,7 @@ mod tests {
                     16.0 / 9.0,
                     near,
                 );
-                let body = first_person_body(&pose, &test_wounds(), proj * view);
+                let body = first_person_body(&pose, &test_wounds(), None, proj * view);
                 assert!(body.len() > 5000 && body.len() % 6 == 0, "{}", body.len());
                 // Des carrés dans l'image, devant le plan proche.
                 let seen = body

@@ -741,6 +741,31 @@ pub fn zap() {
 /// (v247) Volume de l'arc court : 0,75 × celui du tonnerre qu'il faisait (40 blocs : 0,73).
 const ZAP_VOLUME: f32 = 0.55;
 
+/// (v269) Morsure de L'Évidé, la sienne comme la nôtre : « un bruit de morsure gélatineuse, à
+/// 40 % » ; calculée à chaque fois (`synth::squelch`) : jamais deux fois la même. `distance` :
+/// blocs entre la morsure et nos oreilles.
+pub fn jelly_bite(distance: f32) {
+    let (pcm, rate) = synth::squelch(fresh_seed());
+    play_pcm(pcm, rate, JELLY_BITE_VOLUME * mob_gain(distance), 2f32.powf(2.0 * jitter() / 12.0));
+}
+
+/// (v269) La voix de L'Évidé : « un grognement ou un rire, assez régulièrement, à 80 % » ;
+/// calculée à chaque fois (`synth::growl`).
+pub fn evide_voice(distance: f32) {
+    let (pcm, rate) = synth::growl(fresh_seed());
+    play_pcm(pcm, rate, EVIDE_VOICE_VOLUME * mob_gain(distance), 2f32.powf(1.5 * jitter() / 12.0));
+}
+
+/// (v269) Volumes de la morsure gélatineuse et de la voix de L'Évidé, tout près.
+const JELLY_BITE_VOLUME: f32 = 0.4;
+const EVIDE_VOICE_VOLUME: f32 = 0.8;
+
+/// (v269) Ce qu'il reste du bruit d'un monstre à `d` blocs : la moitié à 10 blocs, un
+/// dixième à 30, presque rien à 50 (sa portée de vue).
+pub fn mob_gain(d: f32) -> f32 {
+    1.0 / (1.0 + (d.max(0.0) / 10.0).powi(2))
+}
+
 /// (v247) « Mets un son quand on lâche les objets aussi » : un petit souffle d'objet lancé
 /// (`synth::toss`), tiré à chaque fois.
 pub fn toss() {
@@ -1455,6 +1480,105 @@ pub mod synth {
         finish_short(s)
     }
 
+    /// (v269) Morsure gélatineuse : un coup de mâchoire mou (un choc grave, étouffé), puis de
+    /// la gelée qui cède et qu'on aspire : des bulles de bruit dans une bande étroite qui
+    /// glisse vers le grave en tremblant, et un sifflement mouillé qui descend avec elles. Un
+    /// tiers à une demi-seconde ; tirés de `seed` : durée, hauteurs, nombre, place et force
+    /// des bulles, vitesse du tremblement. Jamais deux fois la même.
+    pub fn squelch(seed: u32) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed.wrapping_mul(1_597_334_677) | 1);
+        let secs = 0.32 + 0.2 * rng.unit();
+        let thump = 95.0 + 45.0 * rng.unit();
+        let (top, low) = (1100.0 + 600.0 * rng.unit(), 260.0 + 140.0 * rng.unit());
+        let wobble = 9.0 + 9.0 * rng.unit();
+        let slurp = 420.0 + 200.0 * rng.unit();
+        // Bulles : (instant, force, durée).
+        let mut bubbles = [(0.0f32, 0.0f32, 0.0f32); 7];
+        let count = 4 + (rng.unit() * 3.99) as usize;
+        for (k, b) in bubbles.iter_mut().take(count).enumerate() {
+            let at = 0.02 + (k as f32 + rng.unit()) / count as f32 * (secs - 0.1);
+            *b = (at, 0.45 + 0.55 * rng.unit(), 0.025 + 0.04 * rng.unit());
+        }
+        let n = (secs * RATE as f32) as usize;
+        let (mut wet, mut air) = ((0.0f32, 0.0f32), (0.0f32, 0.0f32));
+        let (mut p1, mut p2) = (0.0f32, 0.0f32);
+        let s = (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let k = t / secs;
+                let noise = rng.next();
+                let mut env = 0.0f32;
+                for &(at, force, len) in bubbles.iter().take(count) {
+                    if t >= at {
+                        let u = t - at;
+                        env += force * (u / 0.004).min(1.0) * (-u / len).exp();
+                    }
+                }
+                // La bande glisse du haut vers le bas en tremblant.
+                let shake = 1.0 + 0.35 * (TAU * wobble * t).sin();
+                let hz = (top + (low - top) * k.sqrt()) * shake;
+                let goo = svf(&mut wet, noise, hz, 0.22) * env * 1.6;
+                let hiss = svf(&mut air, noise, 2600.0, 0.9) * env * 0.12;
+                p1 = (p1 + thump * (1.0 - 0.4 * k) / RATE as f32).fract();
+                let chomp = (TAU * p1).sin() * (-t / 0.035).exp() * 0.8;
+                p2 = (p2 + slurp * (1.0 - 0.55 * k) * shake / RATE as f32).fract();
+                let suck = (TAU * p2).sin() * env * 0.22;
+                chomp + goo + hiss + suck
+            })
+            .collect();
+        finish_short(s)
+    }
+
+    /// (v269) La voix de L'Évidé : un grognement (une gorge grave et râpeuse qui enfle,
+    /// tremble et retombe) ou, une fois sur trois, un rire (la même gorge, hachée en cinq à
+    /// huit éclats qui descendent). Une voix de cordes lâches (une dent de scie grave dont
+    /// la hauteur tremble), deux résonances de bouche, un souffle, un gargouillis de gelée.
+    /// Une à deux secondes ; tirés de `seed` : rire ou grognement, hauteur, voyelle, durée,
+    /// rythme. Jamais deux fois la même.
+    pub fn growl(seed: u32) -> (Vec<i16>, u32) {
+        let mut rng = Noise(seed.wrapping_mul(2_891_336_453) | 1);
+        let laugh = rng.unit() < 0.34;
+        let secs = if laugh { 1.0 + 0.7 * rng.unit() } else { 1.1 + 0.9 * rng.unit() };
+        let pitch = if laugh { 105.0 + 45.0 * rng.unit() } else { 52.0 + 30.0 * rng.unit() };
+        let (f1, f2) = (430.0 + 260.0 * rng.unit(), 950.0 + 500.0 * rng.unit());
+        let tremble = 5.0 + 4.0 * rng.unit();
+        let beat = 0.15 + 0.07 * rng.unit();
+        let gurgle = 18.0 + 14.0 * rng.unit();
+        let n = (secs * RATE as f32) as usize;
+        let (mut a, mut b, mut c) = ((0.0f32, 0.0f32), (0.0f32, 0.0f32), (0.0f32, 0.0f32));
+        let (mut phase, mut rough) = (0.0f32, 0.0f32);
+        let s = (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let k = t / secs;
+                let noise = rng.next();
+                // La hauteur tremble (bruit lent) et retombe à la fin.
+                rough += (noise - rough) * pole(40.0);
+                let fall = if laugh { 1.0 - 0.3 * k } else { 1.0 - 0.18 * k * k };
+                let hz = pitch * fall * (1.0 + 0.9 * rough);
+                phase = (phase + hz / RATE as f32).fract();
+                // Dent de scie adoucie + impulsion à chaque fermeture des cordes.
+                let saw = 2.0 * phase - 1.0;
+                let pulse = (-phase * 9.0).exp();
+                let voice = 0.6 * saw + 0.9 * pulse;
+                let env = if laugh {
+                    // Des éclats : « ha, ha, ha », de plus en plus faibles.
+                    let u = (t / beat).fract();
+                    let ha = if u < 0.62 { (std::f32::consts::PI * u / 0.62).sin().powi(2) } else { 0.0 };
+                    ha * (1.0 - 0.55 * k) * (t / 0.03).min(1.0)
+                } else {
+                    let swell = (k / 0.18).min(1.0) * ((1.0 - k) / 0.3).min(1.0);
+                    swell * (0.7 + 0.3 * (TAU * tremble * t).sin())
+                };
+                let mouth = svf(&mut a, voice, f1, 0.35) + 0.7 * svf(&mut b, voice, f2, 0.3);
+                let breath = svf(&mut c, noise, 330.0, 0.5)
+                    * (0.25 + 0.2 * (TAU * gurgle * t).sin().max(0.0));
+                (mouth + 0.25 * voice + breath) * env
+            })
+            .collect();
+        finish_short(s)
+    }
+
     /// (v247) Objet lancé : un petit souffle (bruit en bande qui monte de 700 à 2 200 Hz puis
     /// redescend), et un léger coup grave au départ ; tirés de `seed` : durée (110 à 170 ms),
     /// bande, éclat.
@@ -1721,6 +1845,30 @@ pub mod synth {
             assert!(early > 0.9, "{early}");
             assert_ne!(a, b);
             assert!(a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x != y));
+        }
+
+        /// (v269) La morsure gélatineuse dure un tiers à une demi-seconde, la voix de
+        /// L'Évidé une à deux secondes ; ni l'une ni l'autre n'est deux fois la même, et la
+        /// voix est plus grave que la morsure.
+        #[test]
+        fn the_jelly_bite_and_the_voice_of_the_evide_are_never_the_same_twice() {
+            for seed in 1..40u32 {
+                let (a, rate) = squelch(seed);
+                let (b, _) = squelch(seed + 1000);
+                assert_eq!(rate, RATE);
+                let secs = a.len() as f32 / rate as f32;
+                assert!((0.31..=0.53).contains(&secs), "{secs}");
+                assert!(a.iter().map(|v| v.unsigned_abs()).max().unwrap() > 28_000);
+                assert!(a.len() != b.len() || a != b);
+                let (g, _) = growl(seed);
+                let (h, _) = growl(seed + 1000);
+                let secs = g.len() as f32 / rate as f32;
+                assert!((0.99..=2.01).contains(&secs), "{secs}");
+                assert!(g.iter().map(|v| v.unsigned_abs()).max().unwrap() > 28_000);
+                assert!(g.len() != h.len() || g != h);
+                assert!(rms(&g) > 1500.0, "voix trop faible : {}", rms(&g));
+                assert!(brightness(&g) < brightness(&a), "graine {seed}");
+            }
         }
 
         /// Part des aigus : niveau de ce qui change d'un échantillon au suivant, rapporté
